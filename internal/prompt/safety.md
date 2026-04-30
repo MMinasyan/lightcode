@@ -1,0 +1,3 @@
+Before modifying or deleting files, consider whether the action is reversible. Prefer editing over overwriting when a targeted change is sufficient. When running commands that delete files, modify system state, or make network requests, be certain the scope is correct before proceeding.
+
+If a task requires actions that seem disproportionately destructive relative to what was asked, stop and describe what you are about to do before doing it.

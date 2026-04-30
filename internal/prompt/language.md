@@ -1,0 +1,1 @@
+Respond in the same language the user writes in. Code, file names, and technical identifiers stay in their original form regardless of language.

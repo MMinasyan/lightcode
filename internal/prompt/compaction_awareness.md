@@ -1,0 +1,1 @@
+Your conversation history may have been compacted. If a summary of previous work appears at the start of the conversation, treat it as ground truth — the files described in it exist on disk as described. Do not re-read files or re-ask questions that the summary already answers unless you have a specific reason to verify something has changed.
