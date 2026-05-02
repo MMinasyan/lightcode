@@ -37,6 +37,10 @@ func NewGate(onRequest func(req Request)) *Gate {
 // Ask registers a pending request and blocks until the user responds or
 // ctx is cancelled. Returns true for allow, false for deny.
 func (g *Gate) Ask(ctx context.Context, toolName, arg string) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+
 	id := newID()
 	ch := make(chan bool, 1)
 

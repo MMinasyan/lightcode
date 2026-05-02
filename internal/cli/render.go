@@ -2,152 +2,439 @@ package cli
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
-	"time"
+	"unicode"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 )
 
+const nl = "\r\n"
+
 const (
-	ansiRed    = "\033[31m"
-	ansiYellow = "\033[33m"
-	ansiCyan   = "\033[36m"
-	ansiGreen  = "\033[32m"
-	ansiBold   = "\033[1m"
-	ansiDim    = "\033[2m"
-	ansiReset  = "\033[0m"
+	colorReset  = "\033[0m"
+	colorBold   = "\033[1m"
+	colorDim    = "\033[2m"
+	colorItalic = "\033[3m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorCyan   = "\033[36m"
+	colorGray   = "\033[90m"
+	colorInv    = "\033[7m"
 )
 
-func colorRed(s string) string    { return ansiRed + s + ansiReset }
-func colorYellow(s string) string { return ansiYellow + s + ansiReset }
-func colorCyan(s string) string   { return ansiCyan + s + ansiReset }
-func colorGreen(s string) string  { return ansiGreen + s + ansiReset }
-func bold(s string) string        { return ansiBold + s + ansiReset }
-func dim(s string) string         { return ansiDim + s + ansiReset }
-
-const maxToolOutputLen = 2000
-
-func renderToolStart(toolName, args string) string {
-	return fmt.Sprintf("  %s %s(%s)", colorCyan("▶"), bold(toolName), dim(args))
-}
-
-func renderToolEnd(isError bool, result string) string {
-	out := result
-	if len(out) > maxToolOutputLen {
-		out = out[:maxToolOutputLen] + "... (truncated)"
+func eraseBlock(n int) string {
+	if n <= 0 {
+		return ""
 	}
-	if isError {
-		return fmt.Sprintf("  %s %s", colorRed("✗"), out)
-	}
-	return fmt.Sprintf("  %s %s", colorGreen("✓"), out)
-}
-
-func subagentPrefix(ev agent.Event) string {
-	return fmt.Sprintf("[subagent:task%d:%s]", ev.TaskIndex+1, shortID(ev.SubagentSessionID))
-}
-
-func renderSubagentToolStart(ev agent.Event) string {
-	return fmt.Sprintf("%s %s %s(%s)", subagentPrefix(ev), colorCyan("▶"), bold(ev.ToolName), dim(ev.Args))
-}
-
-func renderSubagentToolEnd(ev agent.Event) string {
-	out := ev.Result
-	if len(out) > maxToolOutputLen {
-		out = out[:maxToolOutputLen] + "... (truncated)"
-	}
-	if ev.IsError {
-		return fmt.Sprintf("%s %s %s", subagentPrefix(ev), colorRed("✗"), out)
-	}
-	return fmt.Sprintf("%s %s %s", subagentPrefix(ev), colorGreen("✓"), out)
-}
-
-func renderPermissionPrompt(toolName, arg string) string {
-	return fmt.Sprintf(
-		"\n%s\n  Tool: %s\n  Arg:  %s\nallow? [y/n/p]: ",
-		colorYellow("Permission required:"),
-		bold(toolName),
-		arg,
-	)
-}
-
-func renderSuggestions(suggestions []agent.PermissionSuggestion) string {
 	var b strings.Builder
-	b.WriteString("  Patterns to allow:\n")
-	for i, s := range suggestions {
-		fmt.Fprintf(&b, "    %d. %s\n", i+1, s.Label)
+	b.WriteString("\r\x1b[2K")
+	for i := 0; i < n-1; i++ {
+		b.WriteString("\x1b[1A\r\x1b[2K")
 	}
-	b.WriteString("Select patterns (e.g. 1,3 or Enter to cancel): ")
 	return b.String()
 }
 
-func renderTurnUsage(u turnUsage) string {
-	prefix := ""
-	if u.estimated {
-		prefix = "~"
+// renderUserMsg renders a user message with horizontal borders.
+func renderUserMsg(content string, width int) string {
+	if width < 20 {
+		width = 20
 	}
-	total := u.cache + u.input + u.output
-	return fmt.Sprintf("Tokens: cache=%s%s input=%s%s output=%s%s total=%s%s",
-		prefix, formatInt(u.cache),
-		prefix, formatInt(u.input),
-		prefix, formatInt(u.output),
-		prefix, formatInt(total),
-	)
+	lines := wrapLine(content, width-4)
+	collapsed := false
+	if len(lines) > 5 {
+		lines = lines[:5]
+		collapsed = true
+	}
+
+	var b strings.Builder
+	b.WriteString(colorDim)
+	b.WriteString(" ")
+	b.WriteString(strings.Repeat("─", width-1))
+	b.WriteString(colorReset)
+	b.WriteString(nl)
+
+	for _, line := range lines {
+		b.WriteString("   ")
+		b.WriteString(line)
+		b.WriteString(nl)
+	}
+
+	if collapsed {
+		b.WriteString(colorDim)
+		b.WriteString("   (more)")
+		b.WriteString(colorReset)
+		b.WriteString(nl)
+	}
+
+	b.WriteString(colorDim)
+	b.WriteString(" ")
+	b.WriteString(strings.Repeat("─", width-1))
+	b.WriteString(colorReset)
+	b.WriteString(nl)
+
+	return b.String()
 }
 
-func renderSessionLine(s agent.SessionSummary, isCurrent bool) string {
-	ts := time.Unix(s.LastActivity, 0).Format("2006-01-02 15:04")
-	cur := ""
-	if isCurrent {
-		cur = "  (current)"
+// renderQueuedMsg renders a queued user message in dim/gray.
+func renderQueuedMsg(content string, width int) string {
+	if width < 20 {
+		width = 20
 	}
-	return fmt.Sprintf("  %s  %s%s", shortID(s.ID), ts, cur)
+	lines := wrapLine(content, width-4)
+	if len(lines) > 3 {
+		lines = lines[:3]
+	}
+
+	var b strings.Builder
+	b.WriteString(colorGray)
+	b.WriteString(" ┌")
+	b.WriteString(strings.Repeat("─", width-2))
+	b.WriteString(nl)
+
+	for _, line := range lines {
+		b.WriteString("   ")
+		b.WriteString(line)
+		b.WriteString(nl)
+	}
+
+	b.WriteString(" └")
+	b.WriteString(strings.Repeat("─", width-2))
+	b.WriteString(colorReset)
+	b.WriteString(nl)
+
+	return b.String()
 }
 
-func shortID(id string) string {
-	if len(id) <= 8 {
-		return id
+// renderAssistantMsg renders assistant text with basic markdown→ANSI.
+func renderAssistantMsg(content string, width int) string {
+	if width < 20 {
+		width = 20
 	}
-	return id[:8]
+	indent := "  "
+	inner := width - 2
+	lines := strings.Split(content, "\n")
+
+	var b strings.Builder
+	prevBlank := false
+	for _, line := range lines {
+		isBlank := strings.TrimSpace(line) == ""
+		if isBlank && prevBlank {
+			continue
+		}
+		prevBlank = isBlank
+		rendered := renderMarkdownLine(line)
+		wrapped := wrapLine(rendered, inner)
+		for _, wl := range wrapped {
+			b.WriteString(indent)
+			b.WriteString(wl)
+			b.WriteString(nl)
+		}
+	}
+	return b.String()
 }
 
-func formatInt(n int) string {
-	s := strconv.Itoa(n)
-	if len(s) <= 3 {
+// renderToolCall renders a tool call header line.
+func renderToolCall(name, args string) string {
+	argDisplay := formatToolArgs(name, args)
+	var b strings.Builder
+	b.WriteString(colorCyan)
+	b.WriteString("  ⟩ ")
+	b.WriteString(name)
+	if argDisplay != "" {
+		b.WriteString("  ")
+		b.WriteString(argDisplay)
+	}
+	b.WriteString(colorReset)
+	b.WriteString(nl)
+	return b.String()
+}
+
+// renderToolResult renders a tool call result.
+func renderToolResult(result string, success bool, expanded bool, width int) string {
+	if width < 20 {
+		width = 20
+	}
+	indent := "     "
+	inner := width - 5
+
+	var b strings.Builder
+	if !success {
+		b.WriteString(colorRed)
+		truncated := truncate(result, inner)
+		b.WriteString(indent)
+		b.WriteString(truncated)
+		b.WriteString(colorReset)
+		b.WriteString(nl)
+		return b.String()
+	}
+
+	lines := strings.Split(result, "\n")
+	if !expanded && len(lines) > 3 {
+		lines = lines[:3]
+	}
+
+	color := colorDim
+	b.WriteString(color)
+	for i, line := range lines {
+		truncated := truncate(line, inner)
+		b.WriteString(indent)
+		b.WriteString(truncated)
+		if i < len(lines)-1 {
+			b.WriteString(nl)
+		}
+	}
+	b.WriteString(colorReset)
+	b.WriteString(nl)
+
+	return b.String()
+}
+
+// renderSubagentMsg renders a subagent event line.
+func renderSubagentMsg(sessionID, content string) string {
+	var b strings.Builder
+	b.WriteString(colorDim)
+	b.WriteString("[subagent:")
+	b.WriteString(sessionID)
+	b.WriteString("] ")
+	b.WriteString(content)
+	b.WriteString(colorReset)
+	b.WriteString(nl)
+	return b.String()
+}
+
+// renderSystemMsg renders a system message (dim italic).
+func renderSystemMsg(content string) string {
+	var b strings.Builder
+	b.WriteString(colorDim)
+	b.WriteString(colorItalic)
+	b.WriteString("  ")
+	b.WriteString(content)
+	b.WriteString(colorReset)
+	b.WriteString(nl)
+	return b.String()
+}
+
+// renderErrorMsg renders an error message.
+func renderErrorMsg(content string) string {
+	var b strings.Builder
+	b.WriteString(colorRed)
+	b.WriteString("  ✕ ")
+	b.WriteString(content)
+	b.WriteString(colorReset)
+	b.WriteString(nl)
+	return b.String()
+}
+
+// renderWarningMsg renders a warning message.
+func renderWarningMsg(content string) string {
+	var b strings.Builder
+	b.WriteString(colorYellow)
+	b.WriteString("  ⚠ ")
+	b.WriteString(content)
+	b.WriteString(colorReset)
+	b.WriteString(nl)
+	return b.String()
+}
+
+func renderMarkdownLine(line string) string {
+	line = replaceInline(line, "**", colorBold, colorReset)
+	line = replaceInline(line, "`", colorDim, colorReset)
+	return line
+}
+
+func replaceInline(s, marker, open, close string) string {
+	for {
+		start := strings.Index(s, marker)
+		if start == -1 {
+			return s
+		}
+		end := strings.Index(s[start+len(marker):], marker)
+		if end == -1 {
+			return s
+		}
+		end += start + len(marker)
+		inner := s[start+len(marker) : end]
+		s = s[:start] + open + inner + close + s[end+len(marker):]
+	}
+}
+
+func formatToolArgs(name, args string) string {
+	switch name {
+	case "read_file", "write_file", "edit_file":
+		return extractJSONString(args, "path")
+	case "run_command":
+		return extractJSONString(args, "command")
+	case "task":
+		return "subagent tasks"
+	default:
+		return truncate(args, 80)
+	}
+}
+
+func extractJSONString(jsonStr, key string) string {
+	search := `"` + key + `"`
+	idx := strings.Index(jsonStr, search)
+	if idx == -1 {
+		return ""
+	}
+	rest := jsonStr[idx+len(search):]
+	rest = strings.TrimLeft(rest, " \t\n\r:")
+	if len(rest) == 0 || rest[0] != '"' {
+		return ""
+	}
+	rest = rest[1:]
+	end := strings.Index(rest, `"`)
+	if end == -1 {
+		return ""
+	}
+	return rest[:end]
+}
+
+type displayEntry struct {
+	typ     string
+	content string
+	turn    int
+	name    string
+	args    string
+	done    bool
+	success bool
+	result  string
+}
+
+func buildDisplayMsgs(msgs []agent.DisplayMessage) []displayEntry {
+	out := make([]displayEntry, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, displayEntry{
+			typ:     m.Type,
+			content: m.Content,
+			turn:    m.Turn,
+			name:    m.Name,
+			args:    m.Args,
+			done:    m.Done,
+			success: m.Success,
+			result:  m.Result,
+		})
+	}
+	return out
+}
+
+func fmtTokens(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	if n < 1_000_000 {
+		return fmt.Sprintf("%.1fK", float64(n)/1000)
+	}
+	if n < 1_000_000_000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+	return fmt.Sprintf("%.1fB", float64(n)/1_000_000_000)
+}
+
+func truncate(s string, maxW int) string {
+	if maxW <= 0 {
+		return ""
+	}
+	w := visibleWidth(s)
+	if w <= maxW {
 		return s
 	}
-	var b strings.Builder
-	offset := len(s) % 3
-	if offset > 0 {
-		b.WriteString(s[:offset])
+	if maxW <= 3 {
+		return s[:maxW]
 	}
-	for i := offset; i < len(s); i += 3 {
-		if b.Len() > 0 {
-			b.WriteByte(',')
+	result := []rune{}
+	currentW := 0
+	for _, r := range s {
+		rw := runeWidth(r)
+		if currentW+rw > maxW-3 {
+			break
 		}
-		b.WriteString(s[i : i+3])
+		result = append(result, r)
+		currentW += rw
+	}
+	return string(result) + "..."
+}
+
+func wrapLine(text string, width int) []string {
+	if width <= 0 {
+		return []string{text}
+	}
+
+	var lines []string
+	current := ""
+	currentW := 0
+
+	words := splitKeepAnsi(text)
+	for _, word := range words {
+		wordW := visibleWidth(word)
+		if currentW+wordW > width && currentW > 0 {
+			lines = append(lines, current)
+			current = ""
+			currentW = 0
+		}
+		current += word
+		currentW += wordW
+	}
+	if current != "" {
+		lines = append(lines, current)
+	}
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
+	return lines
+}
+
+func splitKeepAnsi(text string) []string {
+	words := strings.Split(text, " ")
+	result := make([]string, 0, len(words)*2-1)
+	for i, w := range words {
+		if i > 0 {
+			result = append(result, " ")
+		}
+		result = append(result, w)
+	}
+	return result
+}
+
+func stripAnsi(s string) string {
+	var b strings.Builder
+	inEsc := false
+	for _, r := range s {
+		if r == '\033' {
+			inEsc = true
+			continue
+		}
+		if inEsc {
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+				inEsc = false
+			}
+			continue
+		}
+		b.WriteRune(r)
 	}
 	return b.String()
 }
 
-func parsePatternSelection(input string, max int) ([]int, error) {
-	parts := strings.FieldsFunc(input, func(r rune) bool {
-		return r == ',' || r == ' '
-	})
-	var indices []int
-	seen := make(map[int]bool)
-	for _, p := range parts {
-		n, err := strconv.Atoi(strings.TrimSpace(p))
-		if err != nil || n < 1 || n > max {
-			return nil, fmt.Errorf("invalid number %q (valid: 1-%d)", p, max)
-		}
-		if !seen[n] {
-			indices = append(indices, n-1)
-			seen[n] = true
-		}
+func visibleWidth(s string) int {
+	stripped := stripAnsi(s)
+	w := 0
+	for _, r := range stripped {
+		w += runeWidth(r)
 	}
-	if len(indices) == 0 {
-		return nil, fmt.Errorf("no valid numbers given")
+	return w
+}
+
+func runeWidth(r rune) int {
+	if r == '\t' {
+		return 4
 	}
-	return indices, nil
+	if unicode.IsControl(r) {
+		return 0
+	}
+	if unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hangul, r) ||
+		unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r) {
+		return 2
+	}
+	return 1
 }

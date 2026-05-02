@@ -75,6 +75,8 @@ type Agent struct {
 	taggedEvents   chan TaggedLoopEvent
 	taskToolInst   *taskTool
 	seenSessions   map[string]bool
+
+	loopFlush chan chan struct{}
 }
 
 // New constructs an Agent from the given config. It creates the
@@ -108,6 +110,7 @@ func New(c Config) (*Agent, error) {
 		currentProvider:   c.Cfg.DefaultModel.Provider,
 		currentModel:      modelID,
 		contextWindowSize: resolveContextWindow(client, c.Cfg, c.Cfg.DefaultModel.Provider, modelID, c.Home),
+		loopFlush:         make(chan chan struct{}, 1),
 	}
 
 	gate := permission.NewGate(func(req permission.Request) {
@@ -294,7 +297,21 @@ func (a *Agent) drainLoopEvents(ctx context.Context) {
 				continue
 			}
 			a.dispatchTaggedEvent(tev)
+		case done := <-a.loopFlush:
+			a.drainPendingLoopEvents()
+			close(done)
 		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (a *Agent) drainPendingLoopEvents() {
+	for {
+		select {
+		case ev := <-a.loopEvents:
+			a.dispatchLoopEvent(ev)
+		default:
 			return
 		}
 	}
@@ -812,6 +829,17 @@ func (a *Agent) sendMessages(ctx context.Context, contents []string) (int, error
 		}
 
 		_, err := a.lp.Run(turnCtx, contents...)
+
+		done := make(chan struct{})
+		select {
+		case a.loopFlush <- done:
+			select {
+			case <-done:
+			case <-ctx.Done():
+			}
+		case <-ctx.Done():
+		}
+
 		if err != nil {
 			a.emitEvent(Event{Kind: EventError, Error: err.Error(), Turn: turn})
 		}

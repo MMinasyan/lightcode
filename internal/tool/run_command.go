@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"syscall"
+	"time"
 )
 
 // RunCommand implements the run_command tool. Permission checking is
@@ -36,6 +38,11 @@ func (r *RunCommand) Execute(ctx context.Context, params map[string]any) (string
 	}
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	cmd.SysProcAttr = childProcAttr()
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = 3 * time.Second
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
