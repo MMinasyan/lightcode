@@ -8,6 +8,13 @@ import (
 	"time"
 )
 
+type ExitError struct {
+	Output   string
+	ExitCode int
+}
+
+func (e *ExitError) Error() string { return e.Output }
+
 // RunCommand implements the run_command tool. Permission checking is
 // handled by the PermWrapped wrapper, not by this struct.
 type RunCommand struct{}
@@ -46,7 +53,10 @@ func (r *RunCommand) Execute(ctx context.Context, params map[string]any) (string
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return fmt.Sprintf("%s\nexit status: %d", string(out), exitErr.ExitCode()), nil
+			return "", &ExitError{
+				Output:   fmt.Sprintf("%s\nexit status: %d", string(out), exitErr.ExitCode()),
+				ExitCode: exitErr.ExitCode(),
+			}
 		}
 		return "", fmt.Errorf("run_command: %w", err)
 	}

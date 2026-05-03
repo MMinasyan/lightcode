@@ -266,7 +266,11 @@ func formatToolArgs(name, args string) string {
 	case "run_command":
 		return extractJSONString(args, "command")
 	case "task":
-		return "subagent tasks"
+		prompt := extractJSONString(args, "prompt")
+		if prompt != "" {
+			return truncate(prompt, 80)
+		}
+		return truncate(args, 80)
 	default:
 		return truncate(args, 80)
 	}
@@ -284,11 +288,30 @@ func extractJSONString(jsonStr, key string) string {
 		return ""
 	}
 	rest = rest[1:]
-	end := strings.Index(rest, `"`)
-	if end == -1 {
-		return ""
+	var b strings.Builder
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == '\\' && i+1 < len(rest) {
+			switch rest[i+1] {
+			case '"':
+				b.WriteByte('"')
+			case '\\':
+				b.WriteByte('\\')
+			case 'n':
+				b.WriteByte('\n')
+			case 't':
+				b.WriteByte('\t')
+			default:
+				b.WriteByte(rest[i+1])
+			}
+			i++
+			continue
+		}
+		if rest[i] == '"' {
+			return b.String()
+		}
+		b.WriteByte(rest[i])
 	}
-	return rest[:end]
+	return b.String()
 }
 
 type displayEntry struct {

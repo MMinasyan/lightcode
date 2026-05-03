@@ -58,6 +58,7 @@ type CLI struct {
 	permQueue []*agent.PermissionRequest
 
 	toolExpanded bool
+	promptLines  int
 
 	messages []displayEntry
 
@@ -219,7 +220,12 @@ func (c *CLI) handleKeyIdle(k keyMsg) {
 		text := c.input.String()
 		c.input.Clear()
 		c.mu.Lock()
-		c.writeRaw("\r\x1b[2K")
+		if c.promptLines > 1 {
+			c.writeRaw(eraseBlock(c.promptLines))
+		} else {
+			c.writeRaw("\r\x1b[2K")
+		}
+		c.promptLines = 0
 		c.mu.Unlock()
 
 		if text == "" {
@@ -289,7 +295,11 @@ func (c *CLI) handleKeyStreaming(k keyMsg) {
 		text := c.input.String()
 		if text != "" {
 			c.input.Clear()
-			c.msgQueue = append(c.msgQueue, text)
+			if strings.HasPrefix(text, "/") {
+				c.handleSlashWhileBusy(text)
+			} else {
+				c.msgQueue = append(c.msgQueue, text)
+			}
 		}
 	case keyBackspace:
 		c.input.DeleteBack()
@@ -368,7 +378,7 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 		switch k.Special {
 		case keyEscape, keyCtrlC:
 			c.mu.Lock()
-			c.writeRaw("\r\x1b[2K")
+			c.writeRaw(eraseBlock(len(suggestions) + 3))
 			c.mu.Unlock()
 			c.printPermissionBlock(req)
 			return
@@ -518,8 +528,11 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.state = stateIdle
 		c.streamStarted = false
 		c.permQueue = nil
-		c.printInputPromptLocked()
-		c.flushQueueLocked()
+		if len(c.msgQueue) > 0 {
+			c.flushQueueLocked()
+		} else {
+			c.printInputPromptLocked()
+		}
 
 	case agent.EventError:
 		c.stopAnimationLocked()
@@ -557,22 +570,23 @@ func (c *CLI) handleEvent(ev agent.Event) {
 }
 
 func (c *CLI) handleSubagentEvent(ev agent.Event) {
-	prefix := fmt.Sprintf("[subagent:task%d:%s] ", ev.TaskIndex, ev.SubagentSessionID)
+	tag := fmt.Sprintf("task%d", ev.TaskIndex)
+	prefix := fmt.Sprintf("[%s] ", tag)
 
 	switch ev.Kind {
 	case agent.EventSubagentStart:
-		c.writeRaw(renderSubagentMsg(fmt.Sprintf("task%d:%s", ev.TaskIndex, ev.SubagentSessionID), "started"))
+		c.writeRaw(renderSubagentMsg(tag, "started"))
 	case agent.EventTextDelta:
 		c.writeRaw(prefix + strings.ReplaceAll(ev.Result, "\n", "\r\n"+prefix) + "\r\n")
 	case agent.EventToolCallStart:
-		c.writeRaw(renderSubagentMsg(fmt.Sprintf("task%d:%s", ev.TaskIndex, ev.SubagentSessionID), fmt.Sprintf("⟩ %s  %s", ev.ToolName, formatToolArgs(ev.ToolName, ev.Args))))
+		c.writeRaw(renderSubagentMsg(tag, fmt.Sprintf("⟩ %s  %s", ev.ToolName, formatToolArgs(ev.ToolName, ev.Args))))
 	case agent.EventToolCallEnd:
 		result := truncate(ev.Result, 200)
 		status := "ok"
 		if ev.IsError {
 			status = "error"
 		}
-		c.writeRaw(renderSubagentMsg(fmt.Sprintf("task%d:%s", ev.TaskIndex, ev.SubagentSessionID), fmt.Sprintf("%s: %s", status, result)))
+		c.writeRaw(renderSubagentMsg(tag, fmt.Sprintf("%s: %s", status, result)))
 	}
 }
 
@@ -617,8 +631,20 @@ func (c *CLI) printInputPrompt() {
 }
 
 func (c *CLI) printInputPromptLocked() {
+	if c.promptLines > 1 {
+		c.writeRaw(eraseBlock(c.promptLines))
+	} else {
+		c.writeRaw("\r\x1b[2K")
+	}
 	text := c.input.String()
-	c.writeRaw("\r\x1b[2K> " + text)
+	c.writeRaw("> " + text)
+
+	promptLen := 2 + visibleWidth(text)
+	if c.width > 0 && promptLen > c.width {
+		c.promptLines = (promptLen + c.width - 1) / c.width
+	} else {
+		c.promptLines = 1
+	}
 }
 
 func (c *CLI) printLine(s string) {
@@ -742,6 +768,37 @@ func (c *CLI) refreshSessionLocked() {
 		c.printDisplayEntryLocked(m)
 	}
 	c.printInputPromptLocked()
+}
+
+func (c *CLI) handleSlashWhileBusy(text string) {
+	cmd := strings.Fields(text)[0]
+
+	c.mu.Lock()
+	label := c.animLabel
+	c.stopAnimationLocked()
+	c.writeRaw("\r\x1b[2K")
+
+	switch cmd {
+	case "/help":
+		c.mu.Unlock()
+		c.cmdHelp()
+		c.mu.Lock()
+	case "/context":
+		c.mu.Unlock()
+		c.cmdContext()
+		c.mu.Lock()
+	default:
+		if cmd == "/model" || cmd == "/session" || cmd == "/project" || cmd == "/new" ||
+			cmd == "/resume" || cmd == "/revert" || cmd == "/fork" ||
+			cmd == "/compact" || cmd == "/exit" {
+			c.writeRaw(renderErrorMsg("cannot run this command while a turn is running"))
+		} else {
+			c.writeRaw(renderErrorMsg(fmt.Sprintf("unknown command: %s", cmd)))
+		}
+	}
+
+	c.startAnimationLocked(label)
+	c.mu.Unlock()
 }
 
 func (c *CLI) dispatchCommand(text string) {
@@ -879,8 +936,7 @@ func (c *CLI) cmdCompact() {
 
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
-		} else {
-			c.refreshSession()
+			c.printInputPrompt()
 		}
 	}()
 }

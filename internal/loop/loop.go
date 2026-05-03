@@ -488,6 +488,10 @@ func (l *Loop) dispatch(ctx context.Context, tc openai.ToolCall) (string, bool) 
 		if errors.Is(err, tool.ErrDenied) {
 			return finish("denied by user", true), true
 		}
+		var exitErr *tool.ExitError
+		if errors.As(err, &exitErr) {
+			return finish(exitErr.Output, true), false
+		}
 		return finish("error: "+err.Error(), true), false
 	}
 	return finish(result, false), false
