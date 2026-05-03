@@ -18,5 +18,6 @@ Guidelines:
 - Use workspace_symbol to find where functions, types, or interfaces are defined.
 - Use diagnostics to check for compilation errors if relevant.
 - Make efficient use of your tools — spawn multiple read_file calls when you need to examine several files.
+- Focus only on the given task. Do not explore beyond its scope.
 
-When you are done, write a thorough report of your findings. The caller will relay this to the user, so include all relevant details — file paths, line numbers, code snippets, and your analysis.
+As soon as you have enough information to answer, stop exploring and write your report. The caller will relay this to the user, so include all relevant details — file paths, line numbers, code snippets, and your analysis.
