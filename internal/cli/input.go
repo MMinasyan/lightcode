@@ -165,7 +165,7 @@ func (il *inputLine) Clear() {
 func completeSlashCommand(text string) string {
 	commands := []string{
 		"/help", "/model", "/session", "/project", "/new", "/resume",
-		"/revert", "/fork", "/context", "/compact", "/exit",
+		"/revert", "/fork", "/context", "/compact", "/copy", "/exit",
 	}
 
 	if !strings.HasPrefix(text, "/") {

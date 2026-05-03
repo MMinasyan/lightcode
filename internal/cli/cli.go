@@ -593,6 +593,20 @@ func (c *CLI) handleSubagentEvent(ev agent.Event) {
 func (c *CLI) finalizeStreamBufLocked() {
 	text := c.streamBuf.String()
 	if text != "" {
+		trimmed := strings.TrimRight(text, "\n")
+		rawLines := strings.Split(trimmed, "\n")
+		rows := 0
+		for _, rl := range rawLines {
+			w := visibleWidth(rl)
+			if c.width > 0 && w > c.width {
+				rows += (w + c.width - 1) / c.width
+			} else {
+				rows++
+			}
+		}
+		c.writeRaw(eraseBlock(rows + 1))
+		c.writeRaw(renderAssistantMsg(text, c.width))
+
 		c.messages = append(c.messages, displayEntry{
 			typ:     "assistant",
 			content: text,
@@ -787,6 +801,10 @@ func (c *CLI) handleSlashWhileBusy(text string) {
 		c.mu.Unlock()
 		c.cmdContext()
 		c.mu.Lock()
+	case "/copy":
+		c.mu.Unlock()
+		c.cmdCopy()
+		c.mu.Lock()
 	default:
 		if cmd == "/model" || cmd == "/session" || cmd == "/project" || cmd == "/new" ||
 			cmd == "/resume" || cmd == "/revert" || cmd == "/fork" ||
@@ -830,6 +848,8 @@ func (c *CLI) dispatchCommand(text string) {
 		c.cmdContext()
 	case "/compact":
 		c.cmdCompact()
+	case "/copy":
+		c.cmdCopy()
 	case "/exit":
 		c.restoreTerminal()
 		os.Exit(0)
@@ -851,6 +871,7 @@ func (c *CLI) cmdHelp() {
 	c.printLine("  /fork          same as /revert")
 	c.printLine("  /context       show token usage")
 	c.printLine("  /compact       compact context")
+	c.printLine("  /copy          copy last response to clipboard")
 	c.printLine("  /exit          exit lightcode")
 	c.printLine("")
 	c.printLine(colorDim + "  Keys:" + colorReset)
@@ -939,6 +960,20 @@ func (c *CLI) cmdCompact() {
 			c.printInputPrompt()
 		}
 	}()
+}
+
+func (c *CLI) cmdCopy() {
+	for i := len(c.messages) - 1; i >= 0; i-- {
+		if c.messages[i].typ == "assistant" && c.messages[i].content != "" {
+			if err := writeClipboard(c.out, c.messages[i].content); err != nil {
+				c.printLine(renderErrorMsg(err.Error()))
+				return
+			}
+			c.printLine(renderSystemMsg("copied to clipboard"))
+			return
+		}
+	}
+	c.printLine(renderErrorMsg("no assistant response to copy"))
 }
 
 func (c *CLI) projectSwitch(targetPath string) {

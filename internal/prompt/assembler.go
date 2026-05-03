@@ -102,7 +102,7 @@ func (a *Assembler) Assemble() Result {
 	}
 
 	if projectContent == "" && globalContent == "" {
-		warnings = append(warnings, Warning{Kind: WarnRulesNotFound, Message: "No AGENTS.md or CLAUDE.md found"})
+		warnings = append(warnings, Warning{Kind: WarnRulesNotFound, Message: "No AGENTS.md found"})
 	}
 
 	combined := globalContent + "\x00" + projectContent

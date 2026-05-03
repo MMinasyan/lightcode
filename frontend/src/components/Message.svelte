@@ -16,6 +16,8 @@
   let menuStyle = '';
   const lineHeight = 1.6;
   const maxLines = 5;
+  let copySuccess = false;
+  let copyTimer = null;
 
   function checkOverflow(node) {
     const check = () => {
@@ -77,6 +79,15 @@
     fork: 'Fork from here',
   };
 
+  async function copyMarkdown() {
+    try {
+      await navigator.clipboard.writeText(content);
+      copySuccess = true;
+      clearTimeout(copyTimer);
+      copyTimer = setTimeout(() => { copySuccess = false; }, 1500);
+    } catch (e) {}
+  }
+
   function handleMdClick(e) {
     const a = e.target.closest('a');
     if (!a) return;
@@ -113,6 +124,15 @@
       </div>
     {/if}
   {/if}
+  {#if role === 'assistant' && !partial && content}
+    <button class="copy-icon" on:click={copyMarkdown} title="Copy as markdown">
+      {#if copySuccess}
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+      {:else}
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+      {/if}
+    </button>
+  {/if}
   <div class="body">
     {#if role === 'assistant'}
       <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
@@ -135,6 +155,9 @@
   .revert-icon { position:absolute; top:6px; right:6px; display:flex; align-items:center; background:none; border:none; color:var(--text-dim); cursor:pointer; padding:2px; visibility:hidden; z-index:1; }
   .message.user:hover .revert-icon { visibility:visible; }
   .revert-icon:hover { color:var(--accent); }
+  .copy-icon { position:absolute; bottom:4px; right:4px; display:flex; align-items:center; background:none; border:none; color:var(--text-dim); cursor:pointer; padding:2px; visibility:hidden; z-index:1; }
+  .message.assistant:hover .copy-icon { visibility:visible; }
+  .copy-icon:hover { color:var(--accent); }
   .revert-backdrop { position:fixed; inset:0; z-index:50; }
   .revert-menu { position:fixed; background:var(--bg-elevated); border:1px solid var(--border-strong); min-width:180px; z-index:51; box-shadow:var(--shadow-menu); }
   .menu-item { display:block; width:100%; background:none; border:none; color:var(--text); font-family:var(--font-ui); font-size:calc(12px * var(--scale, 1)); padding:6px 12px; cursor:pointer; text-align:left; }
