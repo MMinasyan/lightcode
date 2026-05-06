@@ -48,10 +48,12 @@ type CLI struct {
 	animStop  chan struct{}
 	animLabel string
 
-	streamStarted bool
-	streamNeedsNL bool
-	streamBuf     strings.Builder
-	afterToolEnd  bool
+	streamStarted       bool
+	streamDisplayActive bool
+	streamNeedsNL       bool
+	streamBuf           strings.Builder
+	streamVisibleBuf    strings.Builder
+	afterToolEnd        bool
 
 	msgQueue []string
 
@@ -797,6 +799,10 @@ func (c *CLI) handleSlashWhileBusy(text string) {
 		c.mu.Unlock()
 		c.cmdHelp()
 		c.mu.Lock()
+	case "/clear":
+		c.mu.Unlock()
+		c.cmdClear()
+		c.mu.Lock()
 	case "/context":
 		c.mu.Unlock()
 		c.cmdContext()
@@ -826,6 +832,8 @@ func (c *CLI) dispatchCommand(text string) {
 	switch cmd {
 	case "/help":
 		c.cmdHelp()
+	case "/clear":
+		c.cmdClear()
 	case "/model":
 		c.showModelMenu()
 	case "/session":
@@ -862,6 +870,7 @@ func (c *CLI) cmdHelp() {
 	c.printLine("")
 	c.printLine(colorDim + "  Commands:" + colorReset)
 	c.printLine("  /help          show this help")
+	c.printLine("  /clear         clear terminal output")
 	c.printLine("  /model         switch model")
 	c.printLine("  /session       list/switch sessions")
 	c.printLine("  /project       switch project")
@@ -878,6 +887,26 @@ func (c *CLI) cmdHelp() {
 	c.printLine("  Ctrl+C/D       exit (idle) / cancel (streaming)")
 	c.printLine("  Escape         cancel (streaming)")
 	c.printLine("  Tab            autocomplete slash command")
+}
+
+func (c *CLI) cmdClear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clearTerminalLocked()
+	c.printHeaderLocked()
+}
+
+func (c *CLI) clearTerminalLocked() {
+	if c.promptLines > 1 {
+		c.writeRaw(eraseBlock(c.promptLines))
+	} else {
+		c.writeRaw("\r\x1b[2K")
+	}
+	c.promptLines = 0
+	c.streamDisplayActive = false
+	c.streamVisibleBuf.Reset()
+	c.streamNeedsNL = false
+	c.writeRaw("\x1b[2J\x1b[3J\x1b[H")
 }
 
 func (c *CLI) cmdResume(parts []string) {
