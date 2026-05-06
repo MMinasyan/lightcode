@@ -82,6 +82,10 @@ type Agent struct {
 	fileTracker *tool.FileTracker
 
 	loopFlush chan chan struct{}
+
+	warningsMu   sync.Mutex
+	warningsSet  bool
+	lastWarnings []PromptWarning
 }
 
 // New constructs an Agent from the given config. It creates the
@@ -319,14 +323,38 @@ func (a *Agent) emitEvent(ev Event) {
 }
 
 func (a *Agent) emitWarnings(warnings []prompt.Warning) {
-	if len(warnings) == 0 {
-		return
-	}
 	pw := make([]PromptWarning, len(warnings))
 	for i, w := range warnings {
 		pw[i] = PromptWarning{Kind: w.Kind, Message: w.Message}
 	}
+
+	a.warningsMu.Lock()
+	if !a.warningsSet && len(pw) == 0 {
+		a.warningsSet = true
+		a.warningsMu.Unlock()
+		return
+	}
+	if a.warningsSet && promptWarningsEqual(a.lastWarnings, pw) {
+		a.warningsMu.Unlock()
+		return
+	}
+	a.warningsSet = true
+	a.lastWarnings = append([]PromptWarning(nil), pw...)
+	a.warningsMu.Unlock()
+
 	a.emitEvent(Event{Kind: EventWarning, Warnings: pw})
+}
+
+func promptWarningsEqual(a, b []PromptWarning) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *Agent) drainLoopEvents(ctx context.Context) {
@@ -1570,7 +1598,10 @@ func resolveContextWindow(client *provider.Client, cfg *config.Config, provName,
 		return fromAPI
 	}
 
-	return fromCfg
+	if fromCfg > 0 {
+		return fromCfg
+	}
+	return 262144
 }
 
 func contextWindowCachePath(home string) string {
