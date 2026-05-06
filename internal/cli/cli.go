@@ -58,7 +58,10 @@ type CLI struct {
 
 	msgQueue []string
 
-	permQueue []*agent.PermissionRequest
+	permQueue       []*agent.PermissionRequest
+	permSelected    int
+	permPromptLines int
+	permFrame       transientMenuFrame
 
 	toolExpanded bool
 	promptLines  int
@@ -366,6 +369,27 @@ func (c *CLI) handleKeyPermission(k keyMsg) {
 
 	req := c.permQueue[0]
 
+	switch k.Special {
+	case keyUp:
+		if c.permSelected > 0 {
+			c.permSelected--
+			c.redrawPermissionBlock(req)
+		}
+		return
+	case keyDown:
+		if c.permSelected < permissionActionCount(req)-1 {
+			c.permSelected++
+			c.redrawPermissionBlock(req)
+		}
+		return
+	case keyEnter:
+		c.choosePermission(req)
+		return
+	case keyCtrlC, keyEscape:
+		c.popAndRespond(req.ID, false)
+		return
+	}
+
 	switch k.Rune {
 	case 'y', 'Y':
 		c.popAndRespond(req.ID, true)
@@ -373,40 +397,85 @@ func (c *CLI) handleKeyPermission(k keyMsg) {
 		c.popAndRespond(req.ID, false)
 	case 'p', 'P':
 		c.showPermissionSuggestions(req)
+	case 'a', 'A':
+		if req.CanAllowAll {
+			c.popAndRespondAction(req.ID, "allow_all")
+		}
 	}
-	switch k.Special {
-	case keyCtrlC, keyEscape:
+}
+
+func (c *CLI) choosePermission(req *agent.PermissionRequest) {
+	actions := permissionActions(req)
+	if c.permSelected < 0 || c.permSelected >= len(actions) {
+		return
+	}
+	action, _ := actions[c.permSelected].extra.(string)
+	switch action {
+	case "allow":
+		c.popAndRespond(req.ID, true)
+	case "deny":
 		c.popAndRespond(req.ID, false)
+	case "project":
+		c.showPermissionSuggestions(req)
+	case "allow_all":
+		c.popAndRespondAction(req.ID, "allow_all")
 	}
 }
 
 func (c *CLI) popAndRespond(id string, allow bool) {
-	c.permQueue = c.permQueue[1:]
-	_ = c.agent.RespondPermission(id, allow)
-
-	if len(c.permQueue) > 0 {
-		c.printPermissionBlock(c.permQueue[0])
-	} else {
-		c.mu.Lock()
-		c.state = stateStreaming
-		c.mu.Unlock()
+	action := "deny"
+	if allow {
+		action = "allow"
 	}
+	c.popAndRespondAction(id, action)
+}
+
+func (c *CLI) popAndRespondAction(id string, action string) {
+	c.mu.Lock()
+	c.erasePermissionBlockLocked()
+	c.advancePermissionQueueLocked()
+	c.mu.Unlock()
+
+	_ = c.agent.RespondPermissionAction(id, action)
 }
 
 func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 	suggestions := c.agent.PermissionSuggest(req.ToolName, req.Arg)
 	if len(suggestions) == 0 {
+		c.mu.Lock()
+		c.erasePermissionBlockLocked()
+		c.mu.Unlock()
 		c.printLine(renderErrorMsg("no suggestions available"))
+		c.printPermissionBlock(req)
 		return
 	}
 
-	c.printLine(nl + colorDim + "  ── Allow for project ──" + colorReset)
-	for i, s := range suggestions {
-		c.printLine(fmt.Sprintf("  %d %s", i+1, s.Label))
-	}
-	c.printLine(colorDim + "  Enter numbers (e.g. 1,3) or Esc to cancel" + colorReset)
+	c.mu.Lock()
+	c.erasePermissionBlockLocked()
+	c.mu.Unlock()
 
-	var input strings.Builder
+	var suggestionFrame transientMenuFrame
+	renderSuggestions := func(selected int) {
+		c.mu.Lock()
+		width := c.currentWidth()
+		suggestionFrame.draw(c.writeRaw, renderPermissionSuggestions(req, suggestions, selected, width), width)
+		c.mu.Unlock()
+	}
+	redrawSuggestions := func(selected int) {
+		c.mu.Lock()
+		width := c.currentWidth()
+		suggestionFrame.draw(c.writeRaw, renderPermissionSuggestions(req, suggestions, selected, width), width)
+		c.mu.Unlock()
+	}
+	eraseSuggestions := func() {
+		c.mu.Lock()
+		suggestionFrame.clear(c.writeRaw)
+		c.mu.Unlock()
+	}
+
+	selected := 0
+	renderSuggestions(selected)
+
 	for {
 		k, err := c.readKeyFn()
 		if err != nil {
@@ -416,50 +485,30 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 
 		switch k.Special {
 		case keyEscape, keyCtrlC:
-			c.mu.Lock()
-			c.writeRaw(eraseBlock(len(suggestions) + 3))
-			c.mu.Unlock()
+			eraseSuggestions()
 			c.printPermissionBlock(req)
 			return
 		case keyEnter:
-			selected := parseSelectionNumbers(input.String(), len(suggestions))
-			if len(selected) == 0 {
-				c.popAndRespond(req.ID, false)
-				return
-			}
-			var patterns []string
-			for _, idx := range selected {
-				patterns = append(patterns, suggestions[idx-1].Rule)
-			}
+			patterns := []string{suggestions[selected].Rule}
+			eraseSuggestions()
 			if err := c.agent.SaveProjectPermission(req.ID, patterns); err != nil {
 				c.printLine(renderErrorMsg(err.Error()))
 				c.printPermissionBlock(req)
 				return
 			}
-			c.permQueue = c.permQueue[1:]
-			if len(c.permQueue) > 0 {
-				c.printPermissionBlock(c.permQueue[0])
-			} else {
-				c.mu.Lock()
-				c.state = stateStreaming
-				c.mu.Unlock()
-			}
+			c.mu.Lock()
+			c.advancePermissionQueueLocked()
+			c.mu.Unlock()
 			return
-		case keyBackspace:
-			s := input.String()
-			if len(s) > 0 {
-				input.Reset()
-				input.WriteString(s[:len(s)-1])
-				c.mu.Lock()
-				c.writeRaw("\r\x1b[2K  " + input.String())
-				c.mu.Unlock()
+		case keyUp:
+			if selected > 0 {
+				selected--
+				redrawSuggestions(selected)
 			}
-		default:
-			if k.Rune != 0 {
-				input.WriteRune(k.Rune)
-				c.mu.Lock()
-				c.writeRaw(string(k.Rune))
-				c.mu.Unlock()
+		case keyDown:
+			if selected < len(suggestions)-1 {
+				selected++
+				redrawSuggestions(selected)
 			}
 		}
 	}
@@ -553,7 +602,8 @@ func (c *CLI) handleEvent(ev agent.Event) {
 
 	case agent.EventTurnEnd:
 		c.stopAnimationLocked()
-		if c.streamStarted && c.streamNeedsNL {
+		c.erasePermissionBlockLocked()
+		if c.streamDisplayActive && c.streamNeedsNL {
 			c.writeRaw("\r\n")
 		}
 		c.writeRaw("\r\x1b[2K")
@@ -566,7 +616,11 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.busy = false
 		c.state = stateIdle
 		c.streamStarted = false
+		c.streamDisplayActive = false
 		c.permQueue = nil
+		c.permSelected = 0
+		c.permPromptLines = 0
+		c.permFrame = transientMenuFrame{}
 		if len(c.msgQueue) > 0 {
 			c.flushQueueLocked()
 		} else {
@@ -575,6 +629,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 
 	case agent.EventError:
 		c.stopAnimationLocked()
+		c.erasePermissionBlockLocked()
 		c.writeRaw("\r\x1b[2K")
 		c.writeRaw(renderErrorMsg(ev.Error))
 		c.busy = false
@@ -582,9 +637,12 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.printInputPromptLocked()
 
 	case agent.EventPermissionRequest:
+		c.stopAnimationLocked()
+		c.writeRaw("\r\x1b[2K")
 		c.permQueue = append(c.permQueue, ev.PermReq)
 		if len(c.permQueue) == 1 {
 			c.state = statePermission
+			c.permSelected = 0
 			c.printPermissionBlockLocked(ev.PermReq)
 		}
 
@@ -658,6 +716,18 @@ func (c *CLI) refreshState() {
 	m := c.agent.CurrentModel()
 	c.provider = m.Provider
 	c.model = m.Model
+}
+
+func (c *CLI) currentWidth() int {
+	if c.rawFd > 0 {
+		if w, _, err := term.GetSize(c.rawFd); err == nil && w > 0 {
+			c.width = w
+		}
+	}
+	if c.width < 30 {
+		return 30
+	}
+	return c.width
 }
 
 func (c *CLI) seedInputHistory() {
@@ -757,14 +827,33 @@ func (c *CLI) printPermissionBlock(req *agent.PermissionRequest) {
 }
 
 func (c *CLI) printPermissionBlockLocked(req *agent.PermissionRequest) {
-	c.writeRaw(nl)
-	c.writeRaw(colorDim + " ┌─ Permission Required ─" + strings.Repeat("─", max(0, c.width-26)) + colorReset + nl)
-	c.writeRaw(colorDim + " │ " + colorCyan + req.ToolName + colorReset + nl)
-	argLine := truncate(req.Arg, c.width-4)
-	c.writeRaw(colorDim + " │ " + colorReset + argLine + nl)
-	c.writeRaw(colorDim + " │" + colorReset + nl)
-	c.writeRaw(colorDim + " │ y — allow  n — deny  p — project rules" + colorReset + nl)
-	c.writeRaw(colorDim + " └" + strings.Repeat("─", c.width-2) + colorReset + nl)
+	width := c.currentWidth()
+	c.permFrame.draw(c.writeRaw, renderPermissionPrompt(req, c.permSelected, width), width)
+	c.permPromptLines = permissionPromptRows(req)
+}
+
+func (c *CLI) erasePermissionBlockLocked() {
+	c.permFrame.clear(c.writeRaw)
+	c.permPromptLines = 0
+}
+
+func (c *CLI) advancePermissionQueueLocked() {
+	if len(c.permQueue) > 0 {
+		c.permQueue = c.permQueue[1:]
+	}
+	c.permSelected = 0
+	if len(c.permQueue) > 0 {
+		c.state = statePermission
+		c.printPermissionBlockLocked(c.permQueue[0])
+		return
+	}
+	c.state = stateStreaming
+}
+
+func (c *CLI) redrawPermissionBlock(req *agent.PermissionRequest) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.printPermissionBlockLocked(req)
 }
 
 func (c *CLI) submitInput(text string) {

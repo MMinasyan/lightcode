@@ -22,112 +22,201 @@ type menuResult struct {
 	action   string
 }
 
+const defaultMenuFooter = "   ↑↓ navigate  Enter select  Esc cancel"
+
+type transientMenuFrame struct {
+	rows int
+}
+
+func (f *transientMenuFrame) draw(out func(string), rendered string, width int) {
+	if f.rows > 0 {
+		out(eraseBlock(f.rows))
+	} else {
+		out("\r\x1b[2K")
+	}
+	out(rendered)
+	out(nl)
+	f.rows = renderedTerminalRows(rendered, width) + 1
+}
+
+func (f *transientMenuFrame) clear(out func(string)) {
+	if f.rows <= 0 {
+		return
+	}
+	out(eraseBlock(f.rows))
+	f.rows = 0
+}
+
+func menuLineWidth(width int) int {
+	if width < 30 {
+		width = 30
+	}
+	lineWidth := width - 12
+	if lineWidth > 56 {
+		lineWidth = 56
+	}
+	if lineWidth < 20 {
+		lineWidth = width - 2
+	}
+	return lineWidth
+}
+
+func renderedTerminalRows(rendered string, width int) int {
+	lineWidth := menuLineWidth(width)
+	rows := 0
+	for _, line := range strings.Split(rendered, nl) {
+		w := visibleWidth(line)
+		if w == 0 {
+			rows++
+			continue
+		}
+		rows += (w + lineWidth - 1) / lineWidth
+	}
+	if rows == 0 {
+		return 1
+	}
+	return rows
+}
+
+func normalizeMenuText(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func menuDisplayText(s string, maxW int) string {
+	return truncate(normalizeMenuText(s), maxW)
+}
+
+func renderMenu(title string, items []menuItem, selected int, width int, footer string) string {
+	if width < 30 {
+		width = 30
+	}
+	if footer == "" {
+		footer = defaultMenuFooter
+	}
+	if selected < 0 || selected >= len(items) || !items[selected].selectable {
+		selected = firstSelectableMenuItem(items)
+	}
+	lineWidth := menuLineWidth(width)
+	var b strings.Builder
+	b.WriteString(colorDim)
+	b.WriteString(menuDisplayText("── "+title+" ──", lineWidth))
+	b.WriteString(colorReset)
+	b.WriteString(nl)
+
+	for i, it := range items {
+		label := normalizeMenuText(it.label)
+		detail := normalizeMenuText(it.detail)
+
+		if !it.selectable {
+			b.WriteString(colorDim)
+			b.WriteString("   ")
+			b.WriteString(truncate(label, lineWidth-3))
+			b.WriteString(colorReset)
+			b.WriteString(nl)
+			continue
+		}
+
+		if i == selected {
+			b.WriteString(colorInv)
+			b.WriteString("❯ ")
+		} else {
+			b.WriteString("  ")
+		}
+
+		if it.current {
+			b.WriteString(colorCyan)
+			b.WriteString("● ")
+			b.WriteString(colorReset)
+			if i == selected {
+				b.WriteString(colorInv)
+			}
+		}
+
+		prefixW := 2
+		if it.current {
+			prefixW = 4
+		}
+		avail := lineWidth - prefixW
+
+		labelW := visibleWidth(label)
+		detailW := 0
+		if detail != "" && labelW < avail-2 {
+			detail = truncate(detail, avail-labelW-2)
+			detailW = visibleWidth(detail) + 2
+		} else {
+			detail = ""
+		}
+
+		if labelW+detailW > avail && detailW > 0 {
+			maxDetail := avail - labelW - 2
+			if maxDetail < 3 || labelW > avail-2 {
+				b.WriteString(truncate(label, avail))
+			} else {
+				b.WriteString(label)
+				b.WriteString(colorDim)
+				b.WriteString("  ")
+				b.WriteString(truncate(detail, maxDetail))
+				b.WriteString(colorReset)
+				if i == selected {
+					b.WriteString(colorInv)
+				}
+			}
+		} else {
+			b.WriteString(truncate(label, avail))
+			if detail != "" {
+				b.WriteString(colorDim)
+				b.WriteString("  ")
+				b.WriteString(detail)
+				b.WriteString(colorReset)
+				if i == selected {
+					b.WriteString(colorInv)
+				}
+			}
+		}
+
+		if i == selected {
+			b.WriteString(colorReset)
+		}
+		b.WriteString(nl)
+	}
+
+	b.WriteString(colorDim)
+	b.WriteString(menuDisplayText(footer, lineWidth))
+	b.WriteString(colorReset)
+
+	return b.String()
+}
+
+func menuRows(items []menuItem) int {
+	return menuRowsForItemCount(len(items))
+}
+
+func menuRowsForItemCount(itemCount int) int {
+	return itemCount + 2
+}
+
+func firstSelectableMenuItem(items []menuItem) int {
+	for i, it := range items {
+		if it.selectable {
+			return i
+		}
+	}
+	return -1
+}
+
 func showMenu(mu *sync.Mutex, out func(string), keyCh chan keyMsg, readKeyFn func() (keyMsg, error), title string, items []menuItem, width int) menuResult {
 	if width < 30 {
 		width = 30
 	}
 
-	sel := 0
-	for i, it := range items {
-		if it.selectable {
-			sel = i
-			break
-		}
-	}
+	sel := firstSelectableMenuItem(items)
 
-	lines := 0
+	var frame transientMenuFrame
 
 	draw := func() {
-		var b strings.Builder
-		b.WriteString(colorDim)
-		b.WriteString("── ")
-		b.WriteString(title)
-		b.WriteString(" ")
-		b.WriteString(strings.Repeat("─", max(0, width-visibleWidth(title)-6)))
-		b.WriteString(colorReset)
-		b.WriteString(nl)
-
-		for i, it := range items {
-			if !it.selectable {
-				b.WriteString(colorDim)
-				b.WriteString("   ")
-				b.WriteString(truncate(it.label, width-5))
-				b.WriteString(colorReset)
-				b.WriteString(nl)
-				continue
-			}
-
-			if i == sel {
-				b.WriteString(colorInv)
-				b.WriteString("❯ ")
-			} else {
-				b.WriteString("  ")
-			}
-
-			if it.current {
-				b.WriteString(colorCyan)
-				b.WriteString("● ")
-				b.WriteString(colorReset)
-				if i == sel {
-					b.WriteString(colorInv)
-				}
-			}
-
-			prefixW := 2
-			if it.current {
-				prefixW = 4
-			}
-			avail := width - prefixW - 2
-
-			labelW := visibleWidth(it.label)
-			detailW := 0
-			if it.detail != "" {
-				detailW = visibleWidth(it.detail) + 2
-			}
-
-			if labelW+detailW > avail && detailW > 0 {
-				maxDetail := avail - labelW - 2
-				if maxDetail < 3 {
-					b.WriteString(truncate(it.label, avail-3))
-				} else {
-					b.WriteString(it.label)
-					b.WriteString(colorDim)
-					b.WriteString("  ")
-					b.WriteString(truncate(it.detail, maxDetail))
-					b.WriteString(colorReset)
-					if i == sel {
-						b.WriteString(colorInv)
-					}
-				}
-			} else {
-				b.WriteString(it.label)
-				if it.detail != "" {
-					b.WriteString(colorDim)
-					b.WriteString("  ")
-					b.WriteString(it.detail)
-					b.WriteString(colorReset)
-					if i == sel {
-						b.WriteString(colorInv)
-					}
-				}
-			}
-
-			if i == sel {
-				b.WriteString(colorReset)
-			}
-			b.WriteString(nl)
-		}
-
-		b.WriteString(colorDim)
-		b.WriteString("   ↑↓ navigate  Enter select  Esc cancel")
-		b.WriteString(colorReset)
-
 		mu.Lock()
-		out(eraseBlock(lines))
-		out(b.String())
+		frame.draw(out, renderMenu(title, items, sel, width, defaultMenuFooter), width)
 		mu.Unlock()
-
-		lines = len(items) + 2
 	}
 
 	draw()
@@ -141,60 +230,54 @@ func showMenu(mu *sync.Mutex, out func(string), keyCh chan keyMsg, readKeyFn fun
 		switch k.Special {
 		case keyEscape, keyCtrlC:
 			mu.Lock()
-			out(eraseBlock(lines))
+			frame.clear(out)
 			mu.Unlock()
 			return menuResult{selected: -1}
 
 		case keyEnter:
 			if sel >= 0 && sel < len(items) && items[sel].selectable {
 				mu.Lock()
-				out(eraseBlock(lines))
+				frame.clear(out)
 				mu.Unlock()
 				return menuResult{selected: sel, extra: items[sel].extra}
 			}
 
 		case keyUp:
+			moved := false
 			for i := sel - 1; i >= 0; i-- {
 				if items[i].selectable {
 					sel = i
+					moved = true
 					break
 				}
 			}
-			draw()
+			if moved {
+				draw()
+			}
 
 		case keyDown:
+			moved := false
 			for i := sel + 1; i < len(items); i++ {
 				if items[i].selectable {
 					sel = i
+					moved = true
 					break
 				}
 			}
-			draw()
+			if moved {
+				draw()
+			}
 		}
 	}
 }
 
-func confirmYN(mu *sync.Mutex, out func(string), readKeyFn func() (keyMsg, error), question string) bool {
-	mu.Lock()
-	out(colorDim + "  " + question + " (y/n)" + colorReset + nl)
-	mu.Unlock()
-
-	for {
-		k, err := readKeyFn()
-		if err != nil {
-			return false
-		}
-		switch k.Rune {
-		case 'y', 'Y':
-			return true
-		case 'n', 'N':
-			return false
-		}
-		switch k.Special {
-		case keyEscape, keyCtrlC:
-			return false
-		}
+func confirmYN(mu *sync.Mutex, out func(string), readKeyFn func() (keyMsg, error), question string, width int) bool {
+	items := []menuItem{
+		{label: "Yes", selectable: true},
+		{label: "No", selectable: true},
 	}
+	result := showMenu(mu, out, nil, readKeyFn, question, items, width)
+	return result.selected == 0
 }
 
 func (c *CLI) showModelMenu() {
@@ -224,7 +307,7 @@ func (c *CLI) showModelMenu() {
 		}
 	}
 
-	result := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, "Model", items, c.width)
+	result := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, "Model", items, c.currentWidth())
 	if result.selected >= 0 {
 		choice := result.extra.(modelChoice)
 		if err := c.agent.SwitchModel(choice.provider, choice.model); err != nil {
@@ -333,117 +416,21 @@ func (c *CLI) showSessionMenuInner(state string) {
 }
 
 func (c *CLI) showSessionMenuWithActions(title string, items []menuItem, state string) menuResult {
-	if c.width < 30 {
-		c.width = 30
-	}
+	sel := firstSelectableMenuItem(items)
 
-	sel := 0
-	for i, it := range items {
-		if it.selectable {
-			sel = i
-			break
-		}
-	}
-
-	lines := 0
+	var frame transientMenuFrame
 
 	draw := func() {
-		var b strings.Builder
-		b.WriteString(colorDim)
-		b.WriteString("── ")
-		b.WriteString(title)
-		b.WriteString(" ")
-		b.WriteString(strings.Repeat("─", max(0, c.width-visibleWidth(title)-6)))
-		b.WriteString(colorReset)
-		b.WriteString(nl)
-
-		for i, it := range items {
-			if !it.selectable {
-				b.WriteString(colorDim)
-				b.WriteString("   ")
-				b.WriteString(truncate(it.label, c.width-5))
-				b.WriteString(colorReset)
-				b.WriteString(nl)
-				continue
-			}
-
-			if i == sel {
-				b.WriteString(colorInv)
-				b.WriteString("❯ ")
-			} else {
-				b.WriteString("  ")
-			}
-
-			if it.current {
-				b.WriteString(colorCyan)
-				b.WriteString("● ")
-				b.WriteString(colorReset)
-				if i == sel {
-					b.WriteString(colorInv)
-				}
-			}
-
-			prefixW := 2
-			if it.current {
-				prefixW = 4
-			}
-			avail := c.width - prefixW - 2
-
-			labelW := visibleWidth(it.label)
-			detailW := 0
-			if it.detail != "" {
-				detailW = visibleWidth(it.detail) + 2
-			}
-
-			if labelW+detailW > avail && detailW > 0 {
-				maxDetail := avail - labelW - 2
-				if maxDetail < 3 {
-					b.WriteString(truncate(it.label, avail-3))
-				} else {
-					b.WriteString(it.label)
-					b.WriteString(colorDim)
-					b.WriteString("  ")
-					b.WriteString(truncate(it.detail, maxDetail))
-					b.WriteString(colorReset)
-					if i == sel {
-						b.WriteString(colorInv)
-					}
-				}
-			} else {
-				b.WriteString(it.label)
-				if it.detail != "" {
-					b.WriteString(colorDim)
-					b.WriteString("  ")
-					b.WriteString(it.detail)
-					b.WriteString(colorReset)
-					if i == sel {
-						b.WriteString(colorInv)
-					}
-				}
-			}
-
-			if i == sel {
-				b.WriteString(colorReset)
-			}
-			b.WriteString(nl)
-		}
-
+		width := c.currentWidth()
 		tabHint := "Tab: archived"
 		if state == "archived" {
 			tabHint = "Tab: active"
 		}
-		b.WriteString(colorDim)
-		b.WriteString("   ↑↓ navigate  Enter select  n:new  a:archive  d:delete  ")
-		b.WriteString(tabHint)
-		b.WriteString("  Esc cancel")
-		b.WriteString(colorReset)
+		footer := "   ↑↓ navigate  Enter select  n:new  a:archive  d:delete  " + tabHint + "  Esc cancel"
 
 		c.mu.Lock()
-		c.writeRaw(eraseBlock(lines))
-		c.writeRaw(b.String())
+		frame.draw(c.writeRaw, renderMenu(title, items, sel, width, footer), width)
 		c.mu.Unlock()
-
-		lines = len(items) + 2
 	}
 
 	draw()
@@ -457,39 +444,47 @@ func (c *CLI) showSessionMenuWithActions(title string, items []menuItem, state s
 		switch k.Special {
 		case keyEscape, keyCtrlC:
 			c.mu.Lock()
-			c.writeRaw(eraseBlock(lines))
+			frame.clear(c.writeRaw)
 			c.mu.Unlock()
 			return menuResult{selected: -1}
 
 		case keyEnter:
 			if sel >= 0 && sel < len(items) && items[sel].selectable {
 				c.mu.Lock()
-				c.writeRaw(eraseBlock(lines))
+				frame.clear(c.writeRaw)
 				c.mu.Unlock()
 				return menuResult{selected: sel, extra: items[sel].extra, action: "select"}
 			}
 
 		case keyUp:
+			moved := false
 			for i := sel - 1; i >= 0; i-- {
 				if items[i].selectable {
 					sel = i
+					moved = true
 					break
 				}
 			}
-			draw()
+			if moved {
+				draw()
+			}
 
 		case keyDown:
+			moved := false
 			for i := sel + 1; i < len(items); i++ {
 				if items[i].selectable {
 					sel = i
+					moved = true
 					break
 				}
 			}
-			draw()
+			if moved {
+				draw()
+			}
 
 		case keyTab:
 			c.mu.Lock()
-			c.writeRaw(eraseBlock(lines))
+			frame.clear(c.writeRaw)
 			c.mu.Unlock()
 			return menuResult{action: "toggle"}
 		}
@@ -497,20 +492,20 @@ func (c *CLI) showSessionMenuWithActions(title string, items []menuItem, state s
 		switch k.Rune {
 		case 'n':
 			c.mu.Lock()
-			c.writeRaw(eraseBlock(lines))
+			frame.clear(c.writeRaw)
 			c.mu.Unlock()
 			return menuResult{action: "new"}
 		case 'a':
 			if sel >= 0 && sel < len(items) && items[sel].selectable {
 				c.mu.Lock()
-				c.writeRaw(eraseBlock(lines))
+				frame.clear(c.writeRaw)
 				c.mu.Unlock()
 				return menuResult{selected: sel, extra: items[sel].extra, action: "archive"}
 			}
 		case 'd':
 			if sel >= 0 && sel < len(items) && items[sel].selectable {
 				c.mu.Lock()
-				c.writeRaw(eraseBlock(lines))
+				frame.clear(c.writeRaw)
 				c.mu.Unlock()
 				return menuResult{selected: sel, extra: items[sel].extra, action: "delete"}
 			}
@@ -546,7 +541,7 @@ func (c *CLI) showProjectMenu() {
 		})
 	}
 
-	result := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, "Project", items, c.width)
+	result := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, "Project", items, c.currentWidth())
 	if result.selected >= 0 {
 		path := result.extra.(string)
 		c.printLine(renderSystemMsg("  switching to " + path + "..."))
@@ -572,11 +567,7 @@ func (c *CLI) showRevertMenu() {
 	var turns []userTurn
 	for _, m := range msgs {
 		if m.Type == "user" && m.Turn > 0 {
-			content := m.Content
-			if len(content) > 60 {
-				content = content[:57] + "..."
-			}
-			turns = append(turns, userTurn{turn: m.Turn, content: content})
+			turns = append(turns, userTurn{turn: m.Turn, content: m.Content})
 		}
 	}
 
@@ -595,7 +586,7 @@ func (c *CLI) showRevertMenu() {
 		})
 	}
 
-	result := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, "Revert — pick turn", items, c.width)
+	result := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, "Revert — pick turn", items, c.currentWidth())
 	if result.selected < 0 {
 		return
 	}
@@ -608,7 +599,7 @@ func (c *CLI) showRevertMenu() {
 		{label: "Back", selectable: true, extra: "back"},
 	}
 
-	actionResult := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, fmt.Sprintf("Turn %d — action", turn), actionItems, c.width)
+	actionResult := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, fmt.Sprintf("Turn %d — action", turn), actionItems, c.currentWidth())
 	if actionResult.selected < 0 {
 		return
 	}
@@ -623,7 +614,7 @@ func (c *CLI) showRevertMenu() {
 		c.printLine(renderSystemMsg(fmt.Sprintf("  reverted code to before turn %d", turn)))
 
 	case "history":
-		alsoCode := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?")
+		alsoCode := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
 		if alsoCode {
 			if err := c.agent.RevertCode(turn - 1); err != nil {
 				c.printLine(renderErrorMsg(err.Error()))
@@ -637,7 +628,7 @@ func (c *CLI) showRevertMenu() {
 		c.refreshSession()
 
 	case "fork":
-		alsoCode := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?")
+		alsoCode := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
 		if alsoCode {
 			if err := c.agent.RevertCode(turn); err != nil {
 				c.printLine(renderErrorMsg(err.Error()))

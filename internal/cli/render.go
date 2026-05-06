@@ -237,6 +237,85 @@ func renderWarningMsg(content string) string {
 	return b.String()
 }
 
+func permissionActions(req *agent.PermissionRequest) []menuItem {
+	items := []menuItem{}
+	if req != nil && req.CanAllowAll {
+		items = append(items, menuItem{label: "Allow all", detail: "remaining staged calls", selectable: true, extra: "allow_all"})
+	}
+	items = append(items,
+		menuItem{label: "Allow", detail: "once", selectable: true, extra: "allow"},
+		menuItem{label: "Deny", detail: "this request", selectable: true, extra: "deny"},
+		menuItem{label: "Allow for project", detail: "save rule", selectable: true, extra: "project"},
+	)
+	return items
+}
+
+func permissionActionCount(req *agent.PermissionRequest) int {
+	return len(permissionActions(req))
+}
+
+func permissionMenuItems(req *agent.PermissionRequest) []menuItem {
+	label := req.Arg
+	if req.CanAllowAll && req.BatchTotal > 0 {
+		label = fmt.Sprintf("%s  (%d/%d)", req.Arg, req.BatchIndex, req.BatchTotal)
+	}
+	items := []menuItem{
+		{label: req.ToolName, selectable: false},
+		{label: label, selectable: false},
+	}
+	if req.CanAllowAll && len(req.BatchFiles) > 0 {
+		items = append(items, menuItem{label: "Staged files:", selectable: false})
+		current := req.Arg
+		for _, file := range req.BatchFiles {
+			prefix := "  "
+			if file == current {
+				prefix = "> "
+			}
+			items = append(items, menuItem{label: prefix + file, selectable: false})
+		}
+	}
+	return append(items, permissionActions(req)...)
+}
+
+func renderPermissionPrompt(req *agent.PermissionRequest, selected int, width int) string {
+	items := permissionMenuItems(req)
+	return renderMenu("Permission Required", items, selected+permissionPromptHeaderRows(req), width, defaultMenuFooter)
+}
+
+func permissionPromptRows(req ...*agent.PermissionRequest) int {
+	var r *agent.PermissionRequest
+	if len(req) > 0 {
+		r = req[0]
+	}
+	return menuRowsForItemCount(permissionPromptHeaderRows(r) + permissionActionCount(r))
+}
+
+func permissionPromptHeaderRows(req *agent.PermissionRequest) int {
+	if req == nil {
+		return 2
+	}
+	rows := 2
+	if req.CanAllowAll && len(req.BatchFiles) > 0 {
+		rows += 1 + len(req.BatchFiles)
+	}
+	return rows
+}
+
+func renderPermissionSuggestions(req *agent.PermissionRequest, suggestions []agent.PermissionSuggestion, selected int, width int) string {
+	items := []menuItem{
+		{label: req.ToolName, selectable: false},
+		{label: req.Arg, selectable: false},
+	}
+	for _, s := range suggestions {
+		items = append(items, menuItem{label: s.Label, selectable: true})
+	}
+	return renderMenu("Allow for project", items, selected+2, width, defaultMenuFooter)
+}
+
+func permissionSuggestionRows(suggestionCount int) int {
+	return menuRowsForItemCount(2 + suggestionCount)
+}
+
 func renderMarkdownLine(line string) string {
 	line = replaceInline(line, "**", colorBold, colorReset)
 	line = replaceInline(line, "`", colorDim, colorReset)
@@ -364,7 +443,17 @@ func truncate(s string, maxW int) string {
 		return s
 	}
 	if maxW <= 3 {
-		return s[:maxW]
+		var result []rune
+		currentW := 0
+		for _, r := range s {
+			rw := runeWidth(r)
+			if currentW+rw > maxW {
+				break
+			}
+			result = append(result, r)
+			currentW += rw
+		}
+		return string(result)
 	}
 	result := []rune{}
 	currentW := 0
