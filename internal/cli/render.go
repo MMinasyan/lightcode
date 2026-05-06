@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"unicode"
@@ -151,7 +152,7 @@ func renderToolCall(name, args string) string {
 }
 
 // renderToolResult renders a tool call result.
-func renderToolResult(result string, success bool, expanded bool, width int) string {
+func renderToolResult(name, args, result string, success bool, expanded bool, width int, metadata map[string]any) string {
 	if width < 20 {
 		width = 20
 	}
@@ -159,22 +160,42 @@ func renderToolResult(result string, success bool, expanded bool, width int) str
 	inner := width - 5
 
 	var b strings.Builder
+
 	if !success {
-		b.WriteString(colorRed)
-		truncated := truncate(result, inner)
-		b.WriteString(indent)
-		b.WriteString(truncated)
-		b.WriteString(colorReset)
-		b.WriteString(nl)
-		return b.String()
+		return renderOutputPreview(result, indent, inner, colorRed, expanded)
 	}
 
-	lines := strings.Split(result, "\n")
+	if name == "read_file" {
+		return ""
+	}
+
+	// Show diff for edit_file.
+	if name == "edit_file" && metadata != nil {
+		if diff, ok := metadata["diff"].(string); ok && diff != "" {
+			b.WriteString(renderDiffPreview(diff, indent, inner))
+		}
+	}
+
+	display := result
+	if name == "write_file" {
+		display = extractWriteContent(args)
+	} else {
+		display = strings.TrimRight(display, "\n")
+	}
+
+	return renderOutputPreview(display, indent, inner, colorDim, expanded)
+}
+
+func renderOutputPreview(display, indent string, inner int, color string, expanded bool) string {
+	if display == "" {
+		return ""
+	}
+	lines := strings.Split(display, "\n")
 	if !expanded && len(lines) > 3 {
 		lines = lines[:3]
 	}
 
-	color := colorDim
+	var b strings.Builder
 	b.WriteString(color)
 	for i, line := range lines {
 		truncated := truncate(line, inner)
@@ -188,6 +209,36 @@ func renderToolResult(result string, success bool, expanded bool, width int) str
 	b.WriteString(nl)
 
 	return b.String()
+}
+
+func renderDiffPreview(diff, indent string, inner int) string {
+	if diff == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(diff, "\n") {
+		color := colorDim
+		if strings.HasPrefix(line, "- ") {
+			color = colorRed
+		} else if strings.HasPrefix(line, "+ ") {
+			color = colorGreen
+		}
+		b.WriteString(color)
+		b.WriteString(indent)
+		b.WriteString(truncate(line, inner))
+		b.WriteString(colorReset)
+		b.WriteString(nl)
+	}
+	return b.String()
+}
+
+func extractWriteContent(args string) string {
+	var params map[string]any
+	if json.Unmarshal([]byte(args), &params) != nil {
+		return ""
+	}
+	content, _ := params["content"].(string)
+	return content
 }
 
 // renderSubagentMsg renders a subagent event line.
@@ -206,6 +257,7 @@ func renderSubagentMsg(sessionID, content string) string {
 // renderSystemMsg renders a system message (dim italic).
 func renderSystemMsg(content string) string {
 	var b strings.Builder
+	content = strings.TrimSpace(content)
 	b.WriteString(colorDim)
 	b.WriteString(colorItalic)
 	b.WriteString("  ")
@@ -219,8 +271,18 @@ func renderSystemMsg(content string) string {
 func renderErrorMsg(content string) string {
 	var b strings.Builder
 	b.WriteString(colorRed)
-	b.WriteString("  ✕ ")
-	b.WriteString(content)
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	for i, line := range lines {
+		if i == 0 {
+			b.WriteString("  ✕ ")
+		} else {
+			b.WriteString("    ")
+		}
+		b.WriteString(line)
+		if i < len(lines)-1 {
+			b.WriteString(nl)
+		}
+	}
 	b.WriteString(colorReset)
 	b.WriteString(nl)
 	return b.String()
@@ -344,6 +406,28 @@ func formatToolArgs(name, args string) string {
 		return extractJSONString(args, "path")
 	case "run_command":
 		return extractJSONString(args, "command")
+	case "execute_pending":
+		act := extractJSONString(args, "action")
+		if act == "discard" {
+			return "discard"
+		}
+		return "apply"
+	case "process":
+		action := extractJSONString(args, "action")
+		id := extractJSONString(args, "id")
+		if action != "" && id != "" {
+			return action + " " + id
+		}
+		if action == "list" {
+			return "list"
+		}
+		return truncate(args, 80)
+	case "sleep":
+		seconds := extractJSONNumber(args, "seconds")
+		if seconds != "" {
+			return seconds + "s"
+		}
+		return truncate(args, 80)
 	case "task":
 		prompt := extractJSONString(args, "prompt")
 		if prompt != "" {
@@ -393,29 +477,54 @@ func extractJSONString(jsonStr, key string) string {
 	return b.String()
 }
 
+func extractJSONNumber(jsonStr, key string) string {
+	search := `"` + key + `"`
+	idx := strings.Index(jsonStr, search)
+	if idx == -1 {
+		return ""
+	}
+	rest := jsonStr[idx+len(search):]
+	rest = strings.TrimLeft(rest, " \t\n\r:")
+	if len(rest) == 0 {
+		return ""
+	}
+	end := 0
+	for end < len(rest) && (rest[end] >= '0' && rest[end] <= '9' || rest[end] == '.' || rest[end] == '-') {
+		end++
+	}
+	if end == 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
 type displayEntry struct {
-	typ     string
-	content string
-	turn    int
-	name    string
-	args    string
-	done    bool
-	success bool
-	result  string
+	typ      string
+	id       string
+	content  string
+	turn     int
+	name     string
+	args     string
+	done     bool
+	success  bool
+	result   string
+	metadata map[string]any
 }
 
 func buildDisplayMsgs(msgs []agent.DisplayMessage) []displayEntry {
 	out := make([]displayEntry, 0, len(msgs))
 	for _, m := range msgs {
 		out = append(out, displayEntry{
-			typ:     m.Type,
-			content: m.Content,
-			turn:    m.Turn,
-			name:    m.Name,
-			args:    m.Args,
-			done:    m.Done,
-			success: m.Success,
-			result:  m.Result,
+			typ:      m.Type,
+			id:       m.ID,
+			content:  m.Content,
+			turn:     m.Turn,
+			name:     m.Name,
+			args:     m.Args,
+			done:     m.Done,
+			success:  m.Success,
+			result:   m.Result,
+			metadata: m.Metadata,
 		})
 	}
 	return out

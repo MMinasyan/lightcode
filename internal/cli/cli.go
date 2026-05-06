@@ -30,18 +30,18 @@ type CLI struct {
 	out   io.Writer
 	mu    *sync.Mutex
 
-	width     int
+	width    int
 	oldState *term.State
 	rawFd    int
 
-	state      cliState
-	busy       bool
-	input      *inputLine
+	state     cliState
+	busy      bool
+	input     *inputLine
 	history   inputHistory
-	keyCh      chan keyMsg
-	events     chan agent.Event
-	readKeyFn  func() (keyMsg, error)
-	ctx        context.Context
+	keyCh     chan keyMsg
+	events    chan agent.Event
+	readKeyFn func() (keyMsg, error)
+	ctx       context.Context
 
 	provider string
 	model    string
@@ -73,14 +73,14 @@ type CLI struct {
 
 func New(a *agent.Agent) *CLI {
 	return &CLI{
-		agent: a,
-		out:   os.Stdout,
-		mu:    &sync.Mutex{},
-		input: newInputLine(),
+		agent:   a,
+		out:     os.Stdout,
+		mu:      &sync.Mutex{},
+		input:   newInputLine(),
 		history: newInputHistory(),
-		keyCh: make(chan keyMsg, 64),
-		events: make(chan agent.Event, 256),
-		width: 80,
+		keyCh:   make(chan keyMsg, 64),
+		events:  make(chan agent.Event, 256),
+		width:   80,
 	}
 }
 
@@ -546,26 +546,30 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.busy = true
 		c.state = stateStreaming
 		c.streamStarted = false
+		c.streamDisplayActive = false
 		c.streamBuf.Reset()
+		c.streamVisibleBuf.Reset()
 		c.afterToolEnd = false
 
 	case agent.EventTextDelta:
-		if !c.streamStarted {
-			c.streamStarted = true
+		if !c.streamDisplayActive {
 			c.stopAnimationLocked()
 			c.writeRaw("\r\x1b[2K")
 			if c.afterToolEnd {
 				c.writeRaw(nl)
 				c.afterToolEnd = false
 			}
+			c.streamDisplayActive = true
 		}
+		c.streamStarted = true
 		text := strings.ReplaceAll(ev.Result, "\n", "\r\n")
 		c.writeRaw(text)
 		c.streamBuf.WriteString(ev.Result)
+		c.streamVisibleBuf.WriteString(ev.Result)
 		c.streamNeedsNL = !strings.HasSuffix(ev.Result, "\n")
 
 	case agent.EventToolCallStart:
-		if c.streamStarted && c.streamNeedsNL {
+		if c.streamDisplayActive && c.streamNeedsNL {
 			c.writeRaw("\r\n")
 		}
 		if c.streamStarted {
@@ -577,6 +581,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		}
 		c.messages = append(c.messages, displayEntry{
 			typ:  "tool",
+			id:   ev.ToolCallID,
 			name: ev.ToolName,
 			args: ev.Args,
 		})
@@ -587,14 +592,21 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.stopAnimationLocked()
 		c.writeRaw("\r\x1b[2K")
 		for i := len(c.messages) - 1; i >= 0; i-- {
-			if c.messages[i].typ == "tool" && c.messages[i].name == ev.ToolName && !c.messages[i].done {
+			if c.messages[i].typ == "tool" && c.messages[i].id == ev.ToolCallID && !c.messages[i].done {
 				c.messages[i].done = true
 				c.messages[i].success = !ev.IsError
 				c.messages[i].result = ev.Result
+				if ev.ToolName != "" {
+					c.messages[i].name = ev.ToolName
+				}
+				if ev.Args != "" {
+					c.messages[i].args = ev.Args
+				}
+				c.messages[i].metadata = ev.Metadata
 				break
 			}
 		}
-		c.writeRaw(renderToolResult(ev.Result, !ev.IsError, c.toolExpanded, c.width))
+		c.writeRaw(renderToolResult(ev.ToolName, ev.Args, ev.Result, !ev.IsError, c.toolExpanded, c.width, ev.Metadata))
 		c.afterToolEnd = true
 		if c.busy {
 			c.startAnimationLocked("Thinking")
@@ -683,25 +695,23 @@ func (c *CLI) handleSubagentEvent(ev agent.Event) {
 		if ev.IsError {
 			status = "error"
 		}
-		c.writeRaw(renderSubagentMsg(tag, fmt.Sprintf("%s: %s", status, result)))
+		line := fmt.Sprintf("%s: %s", status, result)
+		if ev.Metadata != nil {
+			if diff, ok := ev.Metadata["diff"].(string); ok && diff != "" {
+				line += "\n" + diff
+			}
+		}
+		c.writeRaw(renderSubagentMsg(tag, line))
 	}
 }
 
 func (c *CLI) finalizeStreamBufLocked() {
 	text := c.streamBuf.String()
 	if text != "" {
-		trimmed := strings.TrimRight(text, "\n")
-		rawLines := strings.Split(trimmed, "\n")
-		rows := 0
-		for _, rl := range rawLines {
-			w := visibleWidth(rl)
-			if c.width > 0 && w > c.width {
-				rows += (w + c.width - 1) / c.width
-			} else {
-				rows++
-			}
+		rows := terminalRowsForText(c.streamVisibleBuf.String(), c.width)
+		if rows > 0 {
+			c.writeRaw(eraseBlock(rows + 1))
 		}
-		c.writeRaw(eraseBlock(rows + 1))
 		c.writeRaw(renderAssistantMsg(text, c.width))
 
 		c.messages = append(c.messages, displayEntry{
@@ -710,6 +720,29 @@ func (c *CLI) finalizeStreamBufLocked() {
 		})
 	}
 	c.streamBuf.Reset()
+	c.streamVisibleBuf.Reset()
+	c.streamDisplayActive = false
+}
+
+func terminalRowsForText(text string, width int) int {
+	if text == "" {
+		return 0
+	}
+	trimmed := strings.TrimRight(text, "\n")
+	if trimmed == "" {
+		return 1
+	}
+	rawLines := strings.Split(trimmed, "\n")
+	rows := 0
+	for _, rl := range rawLines {
+		w := visibleWidth(rl)
+		if width > 0 && w > width {
+			rows += (w + width - 1) / width
+		} else {
+			rows++
+		}
+	}
+	return rows
 }
 
 func (c *CLI) refreshState() {
@@ -813,7 +846,10 @@ func (c *CLI) printDisplayEntryLocked(e displayEntry) {
 	case "tool":
 		c.printLineLocked(renderToolCall(e.name, e.args))
 		if e.done {
-			c.printLineLocked(renderToolResult(e.result, e.success, c.toolExpanded, c.width))
+			result := renderToolResult(e.name, e.args, e.result, e.success, c.toolExpanded, c.width, e.metadata)
+			if result != "" {
+				c.printLineLocked(result)
+			}
 		}
 	case "system":
 		c.printLineLocked(renderSystemMsg(e.content))

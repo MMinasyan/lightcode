@@ -34,7 +34,7 @@ type Server struct {
 	httpSrv *http.Server
 	srvCtx  context.Context
 
-	permMu    sync.Mutex
+	permMu     sync.Mutex
 	permTimers map[string]*time.Timer
 }
 
@@ -182,7 +182,7 @@ func (s *Server) handleEvent(ev agent.Event) {
 		data = map[string]any{"id": ev.ToolCallID, "name": ev.ToolName, "args": ev.Args}
 	case agent.EventToolCallEnd:
 		name = "tool_result"
-		data = map[string]any{"id": ev.ToolCallID, "success": !ev.IsError, "output": ev.Result}
+		data = map[string]any{"id": ev.ToolCallID, "name": ev.ToolName, "args": ev.Args, "success": !ev.IsError, "output": ev.Result, "metadata": ev.Metadata}
 	case agent.EventUsage:
 		name = "usage"
 		data = s.agent.TokenUsage()
@@ -197,7 +197,15 @@ func (s *Server) handleEvent(ev agent.Event) {
 		data = map[string]any{"message": ev.Error, "turn": ev.Turn}
 	case agent.EventPermissionRequest:
 		name = "permission_request"
-		data = map[string]any{"id": ev.PermReq.ID, "tool": ev.PermReq.ToolName, "arg": ev.PermReq.Arg}
+		data = map[string]any{
+			"id":          ev.PermReq.ID,
+			"tool":        ev.PermReq.ToolName,
+			"arg":         ev.PermReq.Arg,
+			"canAllowAll": ev.PermReq.CanAllowAll,
+			"batchIndex":  ev.PermReq.BatchIndex,
+			"batchTotal":  ev.PermReq.BatchTotal,
+			"batchFiles":  ev.PermReq.BatchFiles,
+		}
 		s.startPermissionTimer(ev.PermReq.ID)
 	case agent.EventCompactionStart:
 		name = "compaction_start"
@@ -322,14 +330,26 @@ func (s *Server) handlePermission(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Allow bool `json:"allow"`
+		Allow  *bool  `json:"allow"`
+		Action string `json:"action"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
 	s.cancelPermissionTimer(id)
-	if err := s.agent.RespondPermission(id, body.Allow); err != nil {
+	if body.Action == "" {
+		if body.Allow == nil {
+			jsonError(w, "missing permission action", http.StatusBadRequest)
+			return
+		}
+		if *body.Allow {
+			body.Action = "allow"
+		} else {
+			body.Action = "deny"
+		}
+	}
+	if err := s.agent.RespondPermissionAction(id, body.Action); err != nil {
 		jsonError(w, err.Error(), http.StatusNotFound)
 		return
 	}

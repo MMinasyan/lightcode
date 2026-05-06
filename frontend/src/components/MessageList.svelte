@@ -31,7 +31,7 @@
     {:else if msg.type === 'assistant'}
       <Message role="assistant" content={msg.content} turn={msg.turn} partial={msg.partial} />
     {:else if msg.type === 'tool'}
-      <ToolCall name={msg.name} args={msg.args} result={msg.result||''} success={msg.success!==false} done={msg.done} subagentSessionIds={msg.subagentSessionIds || []} />
+      <ToolCall name={msg.name} args={msg.args} result={msg.result||''} success={msg.success!==false} done={msg.done} subagentSessionIds={msg.subagentSessionIds || []} metadata={msg.metadata} />
     {:else if msg.type === 'system'}
       <div class="system-msg">{msg.content}</div>
     {:else if msg.type === 'error'}

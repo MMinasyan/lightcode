@@ -119,14 +119,21 @@ func New(c Config) (*Agent, error) {
 	}
 
 	gate := permission.NewGate(func(req permission.Request) {
-		a.emitEvent(Event{
-			Kind: EventPermissionRequest,
-			PermReq: &PermissionRequest{
-				ID:       req.ID,
-				ToolName: req.ToolName,
-				Arg:      req.Arg,
+		select {
+		case events <- loop.Event{
+			Kind:     loop.PermissionRequest,
+			ToolName: req.ToolName,
+			PermID:   req.ID,
+			PermArg:  req.Arg,
+			Metadata: map[string]any{
+				"can_allow_all": req.CanAllowAll,
+				"batch_index":   req.BatchIndex,
+				"batch_total":   req.BatchTotal,
+				"batch_files":   req.BatchFiles,
 			},
-		})
+		}:
+		default:
+		}
 	})
 	a.gate = gate
 
@@ -146,6 +153,10 @@ func New(c Config) (*Agent, error) {
 			return false
 		}
 		return gate.Ask(ctx, toolName, arg)
+	})
+
+	askActionFunc := tool.AskActionFunc(func(ctx context.Context, req permission.Request) permission.ResponseAction {
+		return gate.AskRequest(ctx, req)
 	})
 
 	fileTracker := tool.NewFileTracker()
@@ -248,6 +259,7 @@ func New(c Config) (*Agent, error) {
 	l := loop.New(client, registry, res.Prompt)
 	l.SetEvents(events)
 	l.SetStore(store)
+	l.SetPendingExecutor(tool.NewStagedExecutor(store, fileTracker, c.Cfg.Tools, checkFunc, askActionFunc))
 	a.lp = l
 
 	return a, nil
@@ -365,9 +377,28 @@ func (a *Agent) dispatchLoopEvent(ev loop.Event) {
 		a.emitEvent(Event{
 			Kind:       EventToolCallEnd,
 			ToolCallID: ev.ToolCallID,
+			ToolName:   ev.ToolName,
+			Args:       ev.Args,
 			IsError:    ev.IsError,
 			Result:     ev.Result,
 			Metadata:   ev.Metadata,
+		})
+	case loop.PermissionRequest:
+		canAllowAll, _ := ev.Metadata["can_allow_all"].(bool)
+		batchIndex, _ := ev.Metadata["batch_index"].(int)
+		batchTotal, _ := ev.Metadata["batch_total"].(int)
+		batchFiles, _ := ev.Metadata["batch_files"].([]string)
+		a.emitEvent(Event{
+			Kind: EventPermissionRequest,
+			PermReq: &PermissionRequest{
+				ID:          ev.PermID,
+				ToolName:    ev.ToolName,
+				Arg:         ev.PermArg,
+				CanAllowAll: canAllowAll,
+				BatchIndex:  batchIndex,
+				BatchTotal:  batchTotal,
+				BatchFiles:  batchFiles,
+			},
 		})
 	case loop.Usage:
 		a.recordUsage(ev)
@@ -406,8 +437,11 @@ func (a *Agent) dispatchTaggedEvent(tev TaggedLoopEvent) {
 	case loop.ToolCallEnd:
 		base.Kind = EventToolCallEnd
 		base.ToolCallID = ev.ToolCallID
+		base.ToolName = ev.ToolName
+		base.Args = ev.Args
 		base.IsError = ev.IsError
 		base.Result = ev.Result
+		base.Metadata = ev.Metadata
 	case loop.Usage:
 		a.recordUsage(ev)
 		return
@@ -970,6 +1004,11 @@ func (a *Agent) RespondPermission(id string, allow bool) error {
 	return a.gate.Respond(id, allow)
 }
 
+// RespondPermissionAction answers a pending permission prompt with an action.
+func (a *Agent) RespondPermissionAction(id string, action string) error {
+	return a.gate.RespondAction(id, action)
+}
+
 // PermissionSuggest returns pattern suggestions for the "Allow for project" UI.
 func (a *Agent) PermissionSuggest(toolName, arg string) []PermissionSuggestion {
 	return permission.Suggest(toolName, arg, a.projectRoot)
@@ -1286,10 +1325,11 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 				for _, tc := range m.ToolCalls {
 					toolStubs[tc.ID] = len(out)
 					out = append(out, DisplayMessage{
-						Type: "tool",
-						ID:   tc.ID,
-						Name: tc.Function.Name,
-						Args: tc.Function.Arguments,
+						Type:     "tool",
+						ID:       tc.ID,
+						Name:     tc.Function.Name,
+						Args:     tc.Function.Arguments,
+						Metadata: displayMetadataForToolCall(tc.Function.Name, tc.Function.Arguments),
 					})
 				}
 
@@ -1303,6 +1343,44 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 		}
 	}
 	return out
+}
+
+func displayMetadataForToolCall(name, args string) map[string]any {
+	if name != "edit_file" {
+		return nil
+	}
+	var params map[string]any
+	if json.Unmarshal([]byte(args), &params) != nil {
+		return nil
+	}
+	oldStr, _ := params["old_string"].(string)
+	newStr, _ := params["new_string"].(string)
+	if (oldStr == "" && newStr == "") || oldStr == newStr {
+		return nil
+	}
+	return map[string]any{"diff": displayDiff(oldStr, newStr)}
+}
+
+func displayDiff(old, new string) string {
+	oldLines := strings.Split(old, "\n")
+	newLines := strings.Split(new, "\n")
+	var b strings.Builder
+	for _, line := range oldLines {
+		b.WriteString("- ")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+	for _, line := range newLines {
+		b.WriteString("+ ")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	result := b.String()
+	if len(result) > 0 && result[len(result)-1] == '\n' {
+		result = result[:len(result)-1]
+	}
+	return result
 }
 
 // --- Snapshot / revert operations ---

@@ -29,12 +29,12 @@ func WrapWithPermission(t Tool, check CheckFunc, ask AskFunc) *PermWrapped {
 	return &PermWrapped{inner: t, check: check, ask: ask}
 }
 
-func (p *PermWrapped) Name() string               { return p.inner.Name() }
-func (p *PermWrapped) Description() string         { return p.inner.Description() }
+func (p *PermWrapped) Name() string                     { return p.inner.Name() }
+func (p *PermWrapped) Description() string              { return p.inner.Description() }
 func (p *PermWrapped) ParametersSchema() map[string]any { return p.inner.ParametersSchema() }
 
 func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (string, error) {
-	arg := extractArg(p.inner.Name(), params)
+	arg := PermissionArg(p.inner.Name(), params)
 
 	switch p.check(p.inner.Name(), arg) {
 	case permission.DecisionAllow:
@@ -49,9 +49,9 @@ func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (strin
 	}
 }
 
-// extractArg pulls the permission-relevant argument from the tool params.
+// PermissionArg pulls the permission-relevant argument from the tool params.
 // File paths are resolved to absolute so they match against resolved rule patterns.
-func extractArg(toolName string, params map[string]any) string {
+func PermissionArg(toolName string, params map[string]any) string {
 	switch toolName {
 	case "run_command":
 		s, _ := params["command"].(string)

@@ -22,10 +22,10 @@ type Request struct {
 
 // Response is an outgoing JSON-RPC 2.0 response.
 type Response struct {
-	JSONRPC string     `json:"jsonrpc"`
-	ID      any        `json:"id"`
-	Result  any        `json:"result,omitempty"`
-	Error   *RPCError  `json:"error,omitempty"`
+	JSONRPC string    `json:"jsonrpc"`
+	ID      any       `json:"id"`
+	Result  any       `json:"result,omitempty"`
+	Error   *RPCError `json:"error,omitempty"`
 }
 
 // RPCError is a JSON-RPC 2.0 error object.
@@ -179,7 +179,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 		params = map[string]any{"id": ev.ToolCallID, "name": ev.ToolName, "args": ev.Args}
 	case agent.EventToolCallEnd:
 		method = "agent/tool_result"
-		params = map[string]any{"id": ev.ToolCallID, "success": !ev.IsError, "output": ev.Result}
+		params = map[string]any{"id": ev.ToolCallID, "name": ev.ToolName, "args": ev.Args, "success": !ev.IsError, "output": ev.Result, "metadata": ev.Metadata}
 	case agent.EventUsage:
 		method = "agent/usage"
 		params = r.agent.TokenUsage()
@@ -194,7 +194,15 @@ func (r *Runner) handleEvent(ev agent.Event) {
 		params = map[string]any{"message": ev.Error, "turn": ev.Turn}
 	case agent.EventPermissionRequest:
 		method = "agent/permission_request"
-		params = map[string]any{"id": ev.PermReq.ID, "tool": ev.PermReq.ToolName, "arg": ev.PermReq.Arg}
+		params = map[string]any{
+			"id":          ev.PermReq.ID,
+			"tool":        ev.PermReq.ToolName,
+			"arg":         ev.PermReq.Arg,
+			"canAllowAll": ev.PermReq.CanAllowAll,
+			"batchIndex":  ev.PermReq.BatchIndex,
+			"batchTotal":  ev.PermReq.BatchTotal,
+			"batchFiles":  ev.PermReq.BatchFiles,
+		}
 	case agent.EventCompactionStart:
 		method = "agent/compaction_start"
 	case agent.EventCompactionEnd:
@@ -251,7 +259,6 @@ func (r *Runner) handleSessionPrompt(ctx context.Context, req Request) {
 	}
 	r.respond(req.ID, map[string]any{"turn": turn})
 }
-
 
 func (r *Runner) handleSessionList(req Request) {
 	var params struct {
@@ -434,14 +441,26 @@ func (r *Runner) handlePermissionSave(req Request) {
 
 func (r *Runner) handlePermissionRespond(req Request) {
 	var params struct {
-		ID    string `json:"id"`
-		Allow bool   `json:"allow"`
+		ID     string `json:"id"`
+		Allow  *bool  `json:"allow"`
+		Action string `json:"action"`
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	if err := r.agent.RespondPermission(params.ID, params.Allow); err != nil {
+	if params.Action == "" {
+		if params.Allow == nil {
+			r.respondError(req.ID, -32602, "missing permission action")
+			return
+		}
+		if *params.Allow {
+			params.Action = "allow"
+		} else {
+			params.Action = "deny"
+		}
+	}
+	if err := r.agent.RespondPermissionAction(params.ID, params.Action); err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}

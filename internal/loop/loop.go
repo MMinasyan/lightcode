@@ -9,8 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -44,6 +42,11 @@ type Store interface {
 	CurrentTurn() int
 }
 
+// PendingExecutor applies staged edit/write calls at flush time.
+type PendingExecutor interface {
+	ExecutePending(ctx context.Context, staged []tool.StagedCall) []tool.BatchResult
+}
+
 // EventKind identifies the phase of a tool call being reported.
 type EventKind int
 
@@ -52,6 +55,8 @@ const (
 	ToolCallStart EventKind = iota
 	// ToolCallEnd is emitted after a tool's Execute returns (or errors).
 	ToolCallEnd
+	// PermissionRequest is emitted when a tool is waiting for user approval.
+	PermissionRequest
 	// TextDelta carries an incremental text chunk in Event.Result.
 	TextDelta
 	// Usage carries token counts reported by the server for one
@@ -69,6 +74,8 @@ type Event struct {
 	Args       string
 	Result     string
 	IsError    bool
+	PermID     string
+	PermArg    string
 
 	// Metadata carries extra information for UI rendering (diffs, etc.).
 	Metadata map[string]any
@@ -104,6 +111,8 @@ type Loop struct {
 	// pendingQueue holds staged edit_file/write_file calls for
 	// batch execution. Created fresh per turn.
 	pendingQueue *tool.PendingQueue
+
+	pendingExecutor PendingExecutor
 }
 
 // New returns a Loop pre-seeded with the system prompt.
@@ -137,6 +146,9 @@ func (l *Loop) SetTrace(w io.Writer) {
 
 // SetEvents registers a channel to receive structured tool call events.
 func (l *Loop) SetEvents(ch chan<- Event) { l.events = ch }
+
+// SetPendingExecutor configures the executor used to flush staged edits.
+func (l *Loop) SetPendingExecutor(exec PendingExecutor) { l.pendingExecutor = exec }
 
 func (l *Loop) emit(ev Event) {
 	if l.events == nil {
@@ -493,19 +505,19 @@ func (l *Loop) dispatch(ctx context.Context, tc openai.ToolCall) (string, bool) 
 
 	var params map[string]any
 	parseErr := json.Unmarshal([]byte(tc.Function.Arguments), &params)
+	var resultMetadata map[string]any
 
 	finish := func(result string, isError bool) string {
 		fmt.Fprintf(l.trace, "  ← %s\n", truncate(result, traceMaxChars))
 		ev := Event{Kind: ToolCallEnd, ToolCallID: tc.ID, ToolName: tc.Function.Name, Args: tc.Function.Arguments, Result: result, IsError: isError}
-		if tc.Function.Name == "edit_file" && params != nil {
+		if resultMetadata != nil {
+			ev.Metadata = resultMetadata
+		} else if tc.Function.Name == "edit_file" && params != nil {
 			oldStr, _ := params["old_string"].(string)
 			newStr, _ := params["new_string"].(string)
 			if oldStr != newStr {
 				ev.Metadata = map[string]any{"diff": l.computeDiff(oldStr, newStr)}
 			}
-		} else if tc.Function.Name == "write_file" && params != nil {
-			content, _ := params["content"].(string)
-			ev.Metadata = map[string]any{"diff": l.computeDiff("", content)}
 		}
 		l.emit(ev)
 		return result
@@ -568,8 +580,8 @@ func (l *Loop) dispatch(ctx context.Context, tc openai.ToolCall) (string, bool) 
 }
 
 // flushPendingQueue executes all staged edits/writes and returns the
-// batch result string. Staged edits to the same file are applied to an
-// in-memory buffer with a single disk write per file.
+// batch result string. Individual ToolCallEnd events are emitted for each
+// staged call so the UI shows per-edit results.
 func (l *Loop) flushPendingQueue(ctx context.Context) string {
 	staged := l.pendingQueue.Staged()
 	l.pendingQueue.Discard()
@@ -578,112 +590,58 @@ func (l *Loop) flushPendingQueue(ctx context.Context) string {
 		return "No pending edits to execute."
 	}
 
-	// Group by file path.
-	type fileGroup struct {
-		path  string
-		calls []tool.StagedCall
-	}
-	var groups []*fileGroup
-	groupIdx := make(map[string]*fileGroup)
-	for _, sc := range staged {
-		path, _ := sc.Params["path"].(string)
-		if g, ok := groupIdx[path]; ok {
-			g.calls = append(g.calls, sc)
-		} else {
-			g := &fileGroup{path: path, calls: []tool.StagedCall{sc}}
-			groups = append(groups, g)
-			groupIdx[path] = g
-		}
-	}
-
 	var results []tool.BatchResult
-	for _, g := range groups {
-		// Read file once if edits are needed.
-		path := g.path
-		isWrite := false
-		for _, call := range g.calls {
-			if call.ToolName == "write_file" {
-				isWrite = true
-				break
-			}
-		}
-		if isWrite && len(g.calls) == 1 && g.calls[0].ToolName == "write_file" {
-			// Single write_file: execute directly (no buffer needed).
-			t, ok := l.registry.Get(g.calls[0].ToolName)
-			if !ok {
-				results = append(results, tool.BatchResult{
-					ToolName: g.calls[0].ToolName, ToolCallID: g.calls[0].ToolCallID,
-					Success: false, Error: fmt.Sprintf("unknown tool %q", g.calls[0].ToolName),
-				})
-				continue
-			}
-			result, err := t.Execute(ctx, g.calls[0].Params)
-			if err != nil {
-				results = append(results, tool.BatchResult{
-					ToolName: g.calls[0].ToolName, ToolCallID: g.calls[0].ToolCallID,
-					Success: false, Error: err.Error(),
-				})
-			} else {
-				results = append(results, tool.BatchResult{
-					ToolName: g.calls[0].ToolName, ToolCallID: g.calls[0].ToolCallID,
-					Success: true, Result: result,
-				})
-			}
-			continue
-		}
+	if l.pendingExecutor != nil {
+		results = l.pendingExecutor.ExecutePending(ctx, staged)
+	} else {
+		results = l.executePendingSequential(ctx, staged)
+	}
 
-		// Multiple calls or mixed edits+writes: use running buffer.
-		bufRead, bufErr := os.ReadFile(path)
-		content := ""
-		if bufErr == nil {
-			content = string(bufRead)
+	// Emit individual ToolCallEnd events for each staged call.
+	for _, r := range results {
+		result := r.Result
+		isError := false
+		if r.Error != "" {
+			result = r.Error
+			isError = true
 		}
-
-		for _, call := range g.calls {
-			switch call.ToolName {
-			case "edit_file":
-				oldStr, _ := call.Params["old_string"].(string)
-				newStr, _ := call.Params["new_string"].(string)
-				replaceAll, _ := call.Params["replace_all"].(bool)
-				res, err := tool.ApplyEdit(content, oldStr, newStr, replaceAll, path)
-				if err != nil {
-					results = append(results, tool.BatchResult{
-						ToolName: call.ToolName, ToolCallID: call.ToolCallID,
-						Success: false, Error: err.Error(),
-					})
-				} else {
-					content = res.UpdatedContent
-					results = append(results, tool.BatchResult{
-						ToolName: call.ToolName, ToolCallID: call.ToolCallID,
-						Success: true, Result: res.Summary,
-					})
-				}
-			case "write_file":
-				writeContent, _ := call.Params["content"].(string)
-				content = writeContent
-				results = append(results, tool.BatchResult{
-					ToolName: call.ToolName, ToolCallID: call.ToolCallID,
-					Success: true, Result: fmt.Sprintf("Wrote %s.", path),
-				})
-			default:
-				results = append(results, tool.BatchResult{
-					ToolName: call.ToolName, ToolCallID: call.ToolCallID,
-					Success: false, Error: fmt.Sprintf("cannot stage %q", call.ToolName),
-				})
-			}
+		var metadata map[string]any
+		if r.Diff != "" {
+			metadata = map[string]any{"diff": r.Diff}
 		}
-
-		// Write the final buffer once.
-		if bufErr != nil || len(g.calls) > 0 {
-			dir := filepath.Dir(path)
-			if dir != "" && dir != "." {
-				os.MkdirAll(dir, 0o755)
-			}
-			os.WriteFile(path, []byte(content), 0o644)
-		}
+		l.emit(Event{
+			Kind:       ToolCallEnd,
+			ToolCallID: r.ToolCallID,
+			ToolName:   r.ToolName,
+			Result:     result,
+			IsError:    isError,
+			Metadata:   metadata,
+		})
 	}
 
 	return tool.FormatBatchResult(results)
+}
+
+func (l *Loop) executePendingSequential(ctx context.Context, staged []tool.StagedCall) []tool.BatchResult {
+	results := make([]tool.BatchResult, 0, len(staged))
+	for _, call := range staged {
+		r := tool.BatchResult{ToolName: call.ToolName, ToolCallID: call.ToolCallID}
+		t, ok := l.registry.Get(call.ToolName)
+		if !ok {
+			r.Error = fmt.Sprintf("unknown tool %q", call.ToolName)
+			results = append(results, r)
+			continue
+		}
+		result, err := t.Execute(ctx, call.Params)
+		if err != nil {
+			r.Error = err.Error()
+		} else {
+			r.Success = true
+			r.Result = result
+		}
+		results = append(results, r)
+	}
+	return results
 }
 
 // TurnCount returns the number of completed user turns in this session.

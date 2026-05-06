@@ -68,7 +68,18 @@
     <div class="hdr">Permission Required</div>
     <div class="tool-info">
       <span class="tool-badge">[{permission?.tool || 'tool'}]</span>
+      {#if permission?.canAllowAll && permission?.batchTotal}
+        <span class="batch-badge">{permission.batchIndex}/{permission.batchTotal}</span>
+      {/if}
     </div>
+    {#if permission?.canAllowAll && permission?.batchFiles?.length}
+      <div class="batch-list">
+        <div class="batch-title">Staged files</div>
+        {#each permission.batchFiles as file}
+          <div class:current-file={file === permission.args}>{file}</div>
+        {/each}
+      </div>
+    {/if}
     <pre class="args">{permission?.args || ''}</pre>
     {#if showSuggest}
       <div class="suggest-panel">
@@ -87,9 +98,12 @@
       </div>
     {:else}
       <div class="actions">
+        {#if permission?.canAllowAll}
+          <button class="btn allow" on:click={() => respond('allow_all')}>Allow all</button>
+        {/if}
+        <button class="btn allow" on:click={() => respond('allow')}>Allow</button>
         <button class="btn deny" on:click={() => respond('deny')}>Deny</button>
         <button class="btn project" on:click={openSuggest}>Allow for project</button>
-        <button class="btn allow" on:click={() => respond('allow')}>Allow</button>
       </div>
     {/if}
   </div>
@@ -101,6 +115,10 @@
   .hdr { padding:8px 12px; font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--border); }
   .tool-info { padding:8px 12px 0; }
   .tool-badge { color:var(--text-dim); font-size:12px; font-family:var(--font-mono); }
+  .batch-badge { margin-left:8px; color:var(--accent); font-size:12px; font-family:var(--font-mono); }
+  .batch-list { margin:8px 12px 0; padding:8px; border:1px solid var(--border); max-height:120px; overflow-y:auto; font-family:var(--font-mono); font-size:12px; color:var(--text-dim); }
+  .batch-title { margin-bottom:4px; color:var(--text); font-family:var(--font-ui); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  .current-file { color:var(--accent); }
   .args { margin:8px 12px; padding:8px; font-family:var(--font-mono); font-size:12px; color:var(--text); white-space:pre-wrap; word-break:break-all; max-height:160px; overflow-y:auto; }
   .actions { display:flex; gap:8px; padding:8px 12px; border-top:1px solid var(--border); justify-content:flex-end; }
   .btn { padding:4px 12px; font-size:12px; cursor:pointer; border:1px solid var(--border-button); background:none; color:var(--text-dim); font-family:var(--font-ui); }

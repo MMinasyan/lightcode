@@ -31,7 +31,7 @@ export function appendSubagentEvent(sessionId, event) {
       msgs.push({ type: 'tool', id: event.id, name: event.name, args: event.args, done: false, success: true, result: '' });
     } else if (event.type === 'tool_result') {
       const idx = msgs.findIndex(m => m.type === 'tool' && m.id === event.id);
-      if (idx >= 0) msgs[idx] = { ...msgs[idx], done: true, success: event.success, result: event.output };
+      if (idx >= 0) msgs[idx] = { ...msgs[idx], done: true, success: event.success, result: event.output, name: event.name || msgs[idx].name, args: event.args || msgs[idx].args, metadata: event.metadata || msgs[idx].metadata };
     }
     return { ...v, messages: msgs };
   });

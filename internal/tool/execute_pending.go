@@ -98,4 +98,5 @@ type BatchResult struct {
 	Success    bool
 	Result     string
 	Error      string
+	Diff       string
 }

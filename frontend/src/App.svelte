@@ -138,7 +138,7 @@
     });
 
     EventsOn('tool_result', (data) => {
-      messages = messages.map(m => m.type==='tool' && m.id===data.id ? {...m, done:true, success:data.success, result:data.output} : m);
+      messages = messages.map(m => m.type==='tool' && m.id===data.id ? {...m, done:true, success:data.success, result:data.output, name:data.name || m.name, args:data.args || m.args, metadata:data.metadata || m.metadata} : m);
     });
 
     EventsOn('turn_end', async (data) => {
@@ -182,7 +182,7 @@
       appendSubagentEvent(data.sessionId, { type: 'tool_start', id: data.id, name: data.name, args: data.args });
     });
     EventsOn('subagent_tool_result', (data) => {
-      appendSubagentEvent(data.sessionId, { type: 'tool_result', id: data.id, success: data.success, output: data.output });
+      appendSubagentEvent(data.sessionId, { type: 'tool_result', id: data.id, success: data.success, output: data.output, name: data.name, args: data.args, metadata: data.metadata });
     });
     EventsOn('subagent_session_start', (data) => {
       messages = messages.map(m =>

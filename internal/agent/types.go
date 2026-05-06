@@ -38,13 +38,13 @@ type Event struct {
 	Metadata   map[string]any
 
 	// Agent-level fields:
-	Turn               int
-	Cancelled          bool
-	Error              string
-	PermReq            *PermissionRequest
-	Warnings           []PromptWarning
-	SubagentSessionID  string
-	TaskIndex          int
+	Turn              int
+	Cancelled         bool
+	Error             string
+	PermReq           *PermissionRequest
+	Warnings          []PromptWarning
+	SubagentSessionID string
+	TaskIndex         int
 }
 
 // PromptWarning is a warning from the prompt assembly system.
@@ -55,9 +55,13 @@ type PromptWarning struct {
 
 // PermissionRequest is sent to adapters when a tool needs user approval.
 type PermissionRequest struct {
-	ID       string
-	ToolName string
-	Arg      string
+	ID          string
+	ToolName    string
+	Arg         string
+	CanAllowAll bool
+	BatchIndex  int
+	BatchTotal  int
+	BatchFiles  []string
 }
 
 // TokenEntry holds accumulated token counts for one {provider, model} pair.
@@ -113,12 +117,13 @@ type DisplayMessage struct {
 	Content string `json:"content,omitempty"`
 	Turn    int    `json:"turn,omitempty"`
 
-	ID      string `json:"id,omitempty"`
-	Name    string `json:"name,omitempty"`
-	Args    string `json:"args,omitempty"`
-	Done    bool   `json:"done,omitempty"`
-	Success bool   `json:"success,omitempty"`
-	Result  string `json:"result,omitempty"`
+	ID       string         `json:"id,omitempty"`
+	Name     string         `json:"name,omitempty"`
+	Args     string         `json:"args,omitempty"`
+	Done     bool           `json:"done,omitempty"`
+	Success  bool           `json:"success,omitempty"`
+	Result   string         `json:"result,omitempty"`
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 // ModelInfo holds the active provider and model.

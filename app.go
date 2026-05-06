@@ -47,8 +47,11 @@ func (a *App) handleEvent(ev agent.Event) {
 			wailsRuntime.EventsEmit(a.ctx, "subagent_tool_result", map[string]any{
 				"sessionId": ev.SubagentSessionID,
 				"id":        ev.ToolCallID,
+				"name":      ev.ToolName,
+				"args":      ev.Args,
 				"success":   !ev.IsError,
 				"output":    ev.Result,
+				"metadata":  ev.Metadata,
 			})
 		case agent.EventSubagentStart:
 			wailsRuntime.EventsEmit(a.ctx, "subagent_session_start", map[string]any{
@@ -72,9 +75,12 @@ func (a *App) handleEvent(ev agent.Event) {
 		})
 	case agent.EventToolCallEnd:
 		wailsRuntime.EventsEmit(a.ctx, "tool_result", map[string]any{
-			"id":      ev.ToolCallID,
-			"success": !ev.IsError,
-			"output":  ev.Result,
+			"id":       ev.ToolCallID,
+			"name":     ev.ToolName,
+			"args":     ev.Args,
+			"success":  !ev.IsError,
+			"output":   ev.Result,
+			"metadata": ev.Metadata,
 		})
 	case agent.EventUsage:
 		wailsRuntime.EventsEmit(a.ctx, "usage", a.svc.TokenUsage())
@@ -87,9 +93,13 @@ func (a *App) handleEvent(ev agent.Event) {
 		wailsRuntime.EventsEmit(a.ctx, "error", map[string]any{"message": ev.Error})
 	case agent.EventPermissionRequest:
 		wailsRuntime.EventsEmit(a.ctx, "permission_request", map[string]any{
-			"id":   ev.PermReq.ID,
-			"tool": ev.PermReq.ToolName,
-			"args": ev.PermReq.Arg,
+			"id":          ev.PermReq.ID,
+			"tool":        ev.PermReq.ToolName,
+			"args":        ev.PermReq.Arg,
+			"canAllowAll": ev.PermReq.CanAllowAll,
+			"batchIndex":  ev.PermReq.BatchIndex,
+			"batchTotal":  ev.PermReq.BatchTotal,
+			"batchFiles":  ev.PermReq.BatchFiles,
 		})
 	case agent.EventCompactionStart:
 		wailsRuntime.EventsEmit(a.ctx, "compaction_start", nil)
@@ -150,7 +160,7 @@ func (a *App) ForkSession(turn int) error {
 
 // RespondPermission answers a pending permission prompt.
 func (a *App) RespondPermission(id string, action string) error {
-	return a.svc.RespondPermission(id, action == "allow")
+	return a.svc.RespondPermissionAction(id, action)
 }
 
 // PermissionSuggest returns pattern suggestions for the "Allow for project" UI.
