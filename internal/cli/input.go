@@ -106,6 +106,16 @@ func (il *inputLine) String() string {
 	return string(il.text)
 }
 
+func (il *inputLine) CursorText() string {
+	if il.cursor <= 0 {
+		return ""
+	}
+	if il.cursor >= len(il.text) {
+		return string(il.text)
+	}
+	return string(il.text[:il.cursor])
+}
+
 func (il *inputLine) Insert(r rune) {
 	il.text = append(il.text[:il.cursor], append([]rune{r}, il.text[il.cursor:]...)...)
 	il.cursor++
@@ -160,6 +170,65 @@ func (il *inputLine) Set(text string) {
 func (il *inputLine) Clear() {
 	il.text = nil
 	il.cursor = 0
+}
+
+type inputHistory struct {
+	entries []string
+	pos     int
+	draft   string
+}
+
+func newInputHistory() inputHistory {
+	return inputHistory{pos: 0}
+}
+
+func (h *inputHistory) Reset(entries []string) {
+	h.entries = h.entries[:0]
+	for _, e := range entries {
+		if strings.TrimSpace(e) != "" {
+			h.entries = append(h.entries, e)
+		}
+	}
+	h.pos = len(h.entries)
+	h.draft = ""
+}
+
+func (h *inputHistory) Add(text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	if len(h.entries) == 0 || h.entries[len(h.entries)-1] != text {
+		h.entries = append(h.entries, text)
+	}
+	h.pos = len(h.entries)
+	h.draft = ""
+}
+
+func (h *inputHistory) Prev(current string) (string, bool) {
+	if len(h.entries) == 0 || h.pos == 0 {
+		return "", false
+	}
+	if h.pos == len(h.entries) {
+		h.draft = current
+	}
+	h.pos--
+	return h.entries[h.pos], true
+}
+
+func (h *inputHistory) Next() (string, bool) {
+	if h.pos >= len(h.entries) {
+		return "", false
+	}
+	h.pos++
+	if h.pos == len(h.entries) {
+		return h.draft, true
+	}
+	return h.entries[h.pos], true
+}
+
+func (h *inputHistory) Edited() {
+	h.pos = len(h.entries)
+	h.draft = ""
 }
 
 func completeSlashCommand(text string) string {

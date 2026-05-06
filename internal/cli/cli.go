@@ -37,6 +37,7 @@ type CLI struct {
 	state      cliState
 	busy       bool
 	input      *inputLine
+	history   inputHistory
 	keyCh      chan keyMsg
 	events     chan agent.Event
 	readKeyFn  func() (keyMsg, error)
@@ -73,6 +74,7 @@ func New(a *agent.Agent) *CLI {
 		out:   os.Stdout,
 		mu:    &sync.Mutex{},
 		input: newInputLine(),
+		history: newInputHistory(),
 		keyCh: make(chan keyMsg, 64),
 		events: make(chan agent.Event, 256),
 		width: 80,
@@ -152,6 +154,7 @@ func (c *CLI) Run(ctx context.Context) error {
 
 	msgs := c.agent.SessionMessages()
 	c.messages = buildDisplayMsgs(msgs)
+	c.seedInputHistory()
 
 	c.printHeader()
 
@@ -234,6 +237,7 @@ func (c *CLI) handleKeyIdle(k keyMsg) {
 			c.printInputPrompt()
 			return
 		}
+		c.history.Add(text)
 
 		if strings.HasPrefix(text, "/") {
 			c.printLine(colorDim + "> " + text + colorReset)
@@ -246,17 +250,23 @@ func (c *CLI) handleKeyIdle(k keyMsg) {
 
 	case keyBackspace:
 		if c.input.DeleteBack() {
+			c.history.Edited()
 			c.printInputPrompt()
 		}
 
 	case keyDelete:
 		if c.input.DeleteForward() {
+			c.history.Edited()
 			c.printInputPrompt()
 		}
 
 	case keyTab:
+		before := c.input.String()
 		completed := completeSlashCommand(c.input.String())
 		c.input.Set(completed)
+		if completed != before {
+			c.history.Edited()
+		}
 		c.printInputPrompt()
 
 	case keyLeft:
@@ -277,6 +287,18 @@ func (c *CLI) handleKeyIdle(k keyMsg) {
 		c.input.MoveEnd()
 		c.printInputPrompt()
 
+	case keyUp:
+		if text, ok := c.history.Prev(c.input.String()); ok {
+			c.input.Set(text)
+			c.printInputPrompt()
+		}
+
+	case keyDown:
+		if text, ok := c.history.Next(); ok {
+			c.input.Set(text)
+			c.printInputPrompt()
+		}
+
 	case keyCtrlC, keyCtrlD:
 		c.restoreTerminal()
 		os.Exit(0)
@@ -284,6 +306,7 @@ func (c *CLI) handleKeyIdle(k keyMsg) {
 	default:
 		if k.Rune != 0 {
 			c.input.Insert(k.Rune)
+			c.history.Edited()
 			c.printInputPrompt()
 		}
 	}
@@ -297,6 +320,7 @@ func (c *CLI) handleKeyStreaming(k keyMsg) {
 		text := c.input.String()
 		if text != "" {
 			c.input.Clear()
+			c.history.Add(text)
 			if strings.HasPrefix(text, "/") {
 				c.handleSlashWhileBusy(text)
 			} else {
@@ -304,9 +328,13 @@ func (c *CLI) handleKeyStreaming(k keyMsg) {
 			}
 		}
 	case keyBackspace:
-		c.input.DeleteBack()
+		if c.input.DeleteBack() {
+			c.history.Edited()
+		}
 	case keyDelete:
-		c.input.DeleteForward()
+		if c.input.DeleteForward() {
+			c.history.Edited()
+		}
 	case keyLeft:
 		c.input.MoveLeft()
 	case keyRight:
@@ -315,9 +343,18 @@ func (c *CLI) handleKeyStreaming(k keyMsg) {
 		c.input.MoveHome()
 	case keyEnd:
 		c.input.MoveEnd()
+	case keyUp:
+		if text, ok := c.history.Prev(c.input.String()); ok {
+			c.input.Set(text)
+		}
+	case keyDown:
+		if text, ok := c.history.Next(); ok {
+			c.input.Set(text)
+		}
 	default:
 		if k.Rune != 0 {
 			c.input.Insert(k.Rune)
+			c.history.Edited()
 		}
 	}
 }
@@ -623,6 +660,16 @@ func (c *CLI) refreshState() {
 	c.model = m.Model
 }
 
+func (c *CLI) seedInputHistory() {
+	var entries []string
+	for _, m := range c.messages {
+		if m.typ == "user" && strings.TrimSpace(m.content) != "" {
+			entries = append(entries, m.content)
+		}
+	}
+	c.history.Reset(entries)
+}
+
 func (c *CLI) printHeader() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -654,6 +701,11 @@ func (c *CLI) printInputPromptLocked() {
 	}
 	text := c.input.String()
 	c.writeRaw("> " + text)
+	cursorLen := 2 + visibleWidth(c.input.CursorText())
+	endLen := 2 + visibleWidth(text)
+	if back := endLen - cursorLen; back > 0 {
+		c.writeRaw(fmt.Sprintf("\x1b[%dD", back))
+	}
 
 	promptLen := 2 + visibleWidth(text)
 	if c.width > 0 && promptLen > c.width {
@@ -777,6 +829,7 @@ func (c *CLI) refreshSessionLocked() {
 	c.refreshState()
 	msgs := c.agent.SessionMessages()
 	c.messages = buildDisplayMsgs(msgs)
+	c.seedInputHistory()
 
 	c.printLineLocked("")
 	c.printHeaderLocked()
