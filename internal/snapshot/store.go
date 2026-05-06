@@ -809,10 +809,11 @@ func recoverTurnMessages(dir string) []byte {
 
 	// Parse each line into a structured form.
 	type msgInfo struct {
-		raw       []byte
-		role      string
+		raw        []byte
+		role       string
+		content    string
 		toolCallID string   // for tool messages
-		toolCalls []string // tool call IDs from assistant messages
+		toolCalls  []string // tool call IDs from assistant messages
 	}
 	var msgs []msgInfo
 	for _, line := range lines {
@@ -822,6 +823,7 @@ func recoverTurnMessages(dir string) []byte {
 		}
 		info := msgInfo{raw: line}
 		info.role, _ = raw["role"].(string)
+		info.content, _ = raw["content"].(string)
 		info.toolCallID, _ = raw["tool_call_id"].(string)
 		if tcs, ok := raw["tool_calls"].([]any); ok {
 			for _, tc := range tcs {
@@ -911,14 +913,14 @@ func recoverTurnMessages(dir string) []byte {
 	if len(iters) > 0 {
 		lastIterEnd := iters[len(iters)-1].endIdx
 		for idx := lastIterEnd + 1; idx < len(msgs); idx++ {
-			if msgs[idx].role == "assistant" && len(msgs[idx].toolCalls) == 0 {
+			if msgs[idx].role == "assistant" && len(msgs[idx].toolCalls) == 0 && msgs[idx].content != "" {
 				keep[idx] = true
 			}
 		}
 	} else {
 		// No iterations — keep user messages and any text-only responses.
 		for idx := range msgs {
-			if msgs[idx].role == "assistant" && len(msgs[idx].toolCalls) == 0 {
+			if msgs[idx].role == "assistant" && len(msgs[idx].toolCalls) == 0 && msgs[idx].content != "" {
 				keep[idx] = true
 			}
 		}

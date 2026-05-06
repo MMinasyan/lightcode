@@ -164,6 +164,31 @@ func (l *Loop) emit(ev Event) {
 // system prompt at index 0. Callers must not mutate the returned slice.
 func (l *Loop) Messages() []openai.ChatCompletionMessage { return l.messages }
 
+func assistantMessageHasPayload(msg openai.ChatCompletionMessage) bool {
+	return msg.Content != "" || len(msg.MultiContent) > 0 || len(msg.ToolCalls) > 0
+}
+
+func emptyAssistantResponseError(finishReason openai.FinishReason, sawChoice bool) error {
+	if finishReason != "" && finishReason != openai.FinishReasonNull {
+		return fmt.Errorf("empty assistant response (finish_reason=%s)", finishReason)
+	}
+	if !sawChoice {
+		return fmt.Errorf("empty assistant response (no choices received)")
+	}
+	return fmt.Errorf("empty assistant response")
+}
+
+func filterHistoryTurn(turn []openai.ChatCompletionMessage) []openai.ChatCompletionMessage {
+	out := make([]openai.ChatCompletionMessage, 0, len(turn))
+	for _, msg := range turn {
+		if msg.Role == openai.ChatMessageRoleAssistant && !assistantMessageHasPayload(msg) {
+			continue
+		}
+		out = append(out, msg)
+	}
+	return out
+}
+
 // UpdateSystemPrompt replaces the system prompt (messages[0]).
 func (l *Loop) UpdateSystemPrompt(content string) {
 	if len(l.messages) > 0 && l.messages[0].Role == openai.ChatMessageRoleSystem {
@@ -210,6 +235,7 @@ func (l *Loop) ResetHistory() {
 func (l *Loop) LoadHistory(turns [][]openai.ChatCompletionMessage) {
 	l.ResetHistory()
 	for _, turn := range turns {
+		turn = filterHistoryTurn(turn)
 		if len(turn) == 0 {
 			continue
 		}
@@ -229,6 +255,7 @@ func (l *Loop) LoadHistoryWithSummary(summary string, turns [][]openai.ChatCompl
 	}
 	l.messages = append(l.messages, summaryMsg)
 	for _, turn := range turns {
+		turn = filterHistoryTurn(turn)
 		if len(turn) == 0 {
 			continue
 		}
@@ -257,10 +284,10 @@ func (l *Loop) persistMessage(turn int, msg openai.ChatCompletionMessage) {
 
 // Run runs one full user turn to completion, returning the final
 // assistant text. Conversation history is preserved across turns.
-// If ctx is cancelled mid-stream, the in-flight assistant message is
-// finalized with an interrupted marker and persisted; Run returns
-// cleanly (no error), because the cancel is a user action, not a
-// failure.
+// If ctx is cancelled mid-stream, any non-empty in-flight assistant
+// message is persisted, then an interrupted marker is recorded. Run
+// returns cleanly (no error), because the cancel is a user action, not
+// a failure.
 func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 	turn := 0
 	if l.store != nil {
@@ -295,8 +322,10 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		}
 		if cancelled {
 			msg.ToolCalls = nil
-			l.messages = append(l.messages, msg)
-			l.persistMessage(turn, msg)
+			if assistantMessageHasPayload(msg) {
+				l.messages = append(l.messages, msg)
+				l.persistMessage(turn, msg)
+			}
 			l.pendingQueue.Discard()
 			signalMsg := openai.ChatCompletionMessage{
 				Role:    openai.ChatMessageRoleUser,
@@ -404,11 +433,14 @@ func (l *Loop) runStream(ctx context.Context) (openai.ChatCompletionMessage, boo
 func (l *Loop) consumeStream(ctx context.Context, stream *openai.ChatCompletionStream) (openai.ChatCompletionMessage, bool, error) {
 
 	var (
-		contentBuf strings.Builder
-		toolDeltas map[int]*openai.ToolCall
-		role       string
-		usage      *openai.Usage
-		cancelled  bool
+		contentBuf   strings.Builder
+		refusalBuf   strings.Builder
+		toolDeltas   map[int]*openai.ToolCall
+		role         string
+		finishReason openai.FinishReason
+		usage        *openai.Usage
+		cancelled    bool
+		sawChoice    bool
 	)
 
 	for {
@@ -429,7 +461,12 @@ func (l *Loop) consumeStream(ctx context.Context, stream *openai.ChatCompletionS
 		if len(chunk.Choices) == 0 {
 			continue
 		}
-		delta := chunk.Choices[0].Delta
+		choice := chunk.Choices[0]
+		sawChoice = true
+		if choice.FinishReason != "" && choice.FinishReason != openai.FinishReasonNull {
+			finishReason = choice.FinishReason
+		}
+		delta := choice.Delta
 
 		if delta.Role != "" {
 			role = delta.Role
@@ -437,6 +474,10 @@ func (l *Loop) consumeStream(ctx context.Context, stream *openai.ChatCompletionS
 		if delta.Content != "" {
 			contentBuf.WriteString(delta.Content)
 			l.emit(Event{Kind: TextDelta, Result: delta.Content})
+		}
+		if delta.Refusal != "" {
+			refusalBuf.WriteString(delta.Refusal)
+			l.emit(Event{Kind: TextDelta, Result: delta.Refusal})
 		}
 		for _, tc := range delta.ToolCalls {
 			if tc.Index == nil {
@@ -483,9 +524,13 @@ func (l *Loop) consumeStream(ctx context.Context, stream *openai.ChatCompletionS
 	if role == "" {
 		role = openai.ChatMessageRoleAssistant
 	}
+	content := contentBuf.String()
+	if content == "" && refusalBuf.Len() > 0 {
+		content = refusalBuf.String()
+	}
 	msg := openai.ChatCompletionMessage{
 		Role:    role,
-		Content: contentBuf.String(),
+		Content: content,
 	}
 	if len(toolDeltas) > 0 && !cancelled {
 		calls := make([]openai.ToolCall, len(toolDeltas))
@@ -493,6 +538,9 @@ func (l *Loop) consumeStream(ctx context.Context, stream *openai.ChatCompletionS
 			calls[idx] = *tc
 		}
 		msg.ToolCalls = calls
+	}
+	if !cancelled && !assistantMessageHasPayload(msg) {
+		return msg, false, emptyAssistantResponseError(finishReason, sawChoice)
 	}
 	return msg, cancelled, nil
 }
