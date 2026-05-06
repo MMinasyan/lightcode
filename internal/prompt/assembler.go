@@ -17,9 +17,6 @@ var identitySection string
 //go:embed core_rules.md
 var coreRulesSection string
 
-//go:embed tool_usage.md
-var toolUsageSection string
-
 //go:embed rules_file_guide.md
 var rulesFileGuideSection string
 
@@ -129,7 +126,6 @@ func (a *Assembler) build(globalRules, projectRules string) string {
 	for _, s := range []string{
 		identitySection,
 		coreRulesSection,
-		toolUsageSection,
 		rulesFileGuideSection,
 		compactionAwarenessSection,
 	} {

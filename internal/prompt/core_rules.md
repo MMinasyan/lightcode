@@ -1,5 +1,7 @@
 Complete tasks autonomously. Do not ask clarifying questions unless you are genuinely blocked and there is no reasonable assumption to make.
 
+Tool effects are real — edits modify files on disk, commands execute against the live system.
+
 Never truncate file contents when reading or writing. If a file is large, work with the full content.
 
 When you make a mistake, correct it using the same tools — read the file, identify the error, fix it with edit_file.

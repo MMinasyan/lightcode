@@ -31,7 +31,7 @@
 
 **Providers** — OpenAI, OpenRouter, MiniMax, Z.ai, Ollama, DeepSeek, Mistral, Groq, Google Gemini, llama.cpp, and anything else that speaks the OpenAI API schema. Configure N providers simultaneously, switch mid-session.
 
-**Tools** — `read_file` · `write_file` · `edit_file` · `run_command` · `save_memory` · `search_memory` · `search_history` · `diagnostics` · `workspace_symbol` · `task`
+**Tools** — `read_file` · `write_file` · `edit_file` · `run_command` · `execute_pending` · `process` · `sleep` · `save_memory` · `search_memory` · `search_history` · `diagnostics` · `workspace_symbol` · `task`
 
 **Snapshots** — Every file edit is snapshotted by turn. Revert code, revert history, or fork from any point. Copy-based, no git dependency.
 

@@ -86,6 +86,25 @@ type SubagentsConfig struct {
 	Model         string `json:"model,omitempty"`
 }
 
+// ToolsConfig holds limits and timeouts for built-in tools.
+type ToolsConfig struct {
+	MaxOutputBytes       int `json:"max_output_bytes"`
+	ReadMaxLines         int `json:"read_max_lines"`
+	ReadLineMaxChars     int `json:"read_line_max_chars"`
+	CommandTimeout       int `json:"command_timeout"`
+	MaxBackgroundProcesses int `json:"max_background_processes"`
+}
+
+func defaultToolsConfig() ToolsConfig {
+	return ToolsConfig{
+		MaxOutputBytes:       15360,
+		ReadMaxLines:         500,
+		ReadLineMaxChars:     5000,
+		CommandTimeout:       120,
+		MaxBackgroundProcesses: 10,
+	}
+}
+
 // Config is the full config file.
 type Config struct {
 	Providers    map[string]Provider  `json:"providers"`
@@ -94,6 +113,7 @@ type Config struct {
 	Compaction   CompactionConfig     `json:"compaction,omitempty"`
 	Subagents    SubagentsConfig      `json:"subagents,omitempty"`
 	Permissions  permission.Rules     `json:"permissions,omitempty"`
+	Tools        ToolsConfig          `json:"tools,omitempty"`
 }
 
 // rawSessionConfig is used to detect which sessions fields were
@@ -203,6 +223,34 @@ func Load(path string) (*Config, error) {
 		if raw.Subagents.Model != nil {
 			c.Subagents.Model = *raw.Subagents.Model
 		}
+	}
+
+	type rawToolsConfig struct {
+		MaxOutputBytes       *int `json:"max_output_bytes"`
+		ReadMaxLines         *int `json:"read_max_lines"`
+		ReadLineMaxChars     *int `json:"read_line_max_chars"`
+		CommandTimeout       *int `json:"command_timeout"`
+		MaxBackgroundProcesses *int `json:"max_background_processes"`
+	}
+	var rawTools rawToolsConfig
+	_ = json.Unmarshal(data, &struct {
+		Tools *rawToolsConfig `json:"tools"`
+	}{Tools: &rawTools})
+	c.Tools = defaultToolsConfig()
+	if rawTools.MaxOutputBytes != nil {
+		c.Tools.MaxOutputBytes = *rawTools.MaxOutputBytes
+	}
+	if rawTools.ReadMaxLines != nil {
+		c.Tools.ReadMaxLines = *rawTools.ReadMaxLines
+	}
+	if rawTools.ReadLineMaxChars != nil {
+		c.Tools.ReadLineMaxChars = *rawTools.ReadLineMaxChars
+	}
+	if rawTools.CommandTimeout != nil {
+		c.Tools.CommandTimeout = *rawTools.CommandTimeout
+	}
+	if rawTools.MaxBackgroundProcesses != nil {
+		c.Tools.MaxBackgroundProcesses = *rawTools.MaxBackgroundProcesses
 	}
 
 	if len(c.Providers) == 0 || c.DefaultModel.Provider == "" || c.DefaultModel.Model == "" {

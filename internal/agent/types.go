@@ -35,6 +35,7 @@ type Event struct {
 	Input      int
 	Output     int
 	UsageKnown bool
+	Metadata   map[string]any
 
 	// Agent-level fields:
 	Turn               int

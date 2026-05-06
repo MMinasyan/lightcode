@@ -18,6 +18,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/lsp"
 	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/process"
 	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/prompt"
 	"github.com/MMinasyan/lightcode/internal/provider"
@@ -75,6 +76,10 @@ type Agent struct {
 	taggedEvents   chan TaggedLoopEvent
 	taskToolInst   *taskTool
 	seenSessions   map[string]bool
+
+	procMgr *process.Manager
+
+	fileTracker *tool.FileTracker
 
 	loopFlush chan chan struct{}
 }
@@ -143,11 +148,29 @@ func New(c Config) (*Agent, error) {
 		return gate.Ask(ctx, toolName, arg)
 	})
 
+	fileTracker := tool.NewFileTracker()
+	a.fileTracker = fileTracker
+
 	registry := tool.NewRegistry()
-	registry.Register(tool.WrapWithPermission(tool.ReadFile{}, checkFunc, askFunc))
-	registry.Register(tool.WrapWithPermission(tool.NewWriteFileWithSnapshot(store), checkFunc, askFunc))
-	registry.Register(tool.WrapWithPermission(tool.NewEditFileWithSnapshot(store), checkFunc, askFunc))
-	registry.Register(tool.WrapWithPermission(&tool.RunCommand{}, checkFunc, askFunc))
+	registry.Register(tool.WrapWithPermission(tool.NewReadFile(c.Cfg.Tools, fileTracker), checkFunc, askFunc))
+	registry.Register(tool.WrapWithPermission(tool.NewWriteFileWithSnapshot(store, fileTracker, c.Cfg.Tools), checkFunc, askFunc))
+	registry.Register(tool.WrapWithPermission(tool.NewEditFileWithSnapshot(store, fileTracker, c.Cfg.Tools), checkFunc, askFunc))
+	registry.Register(tool.WrapWithPermission(tool.ExecutePending{}, checkFunc, askFunc))
+
+	procMgr := process.NewManager(c.Cfg.Tools.MaxBackgroundProcesses)
+	a.procMgr = procMgr
+
+	procMgr.SetExitHandler(func(id, command string, exitCode int) {
+		if a.lp != nil {
+			a.lp.AppendSignal(fmt.Sprintf("<system-signal>Background process %s (\"%s\") exited with code %d.</system-signal>", id, command, exitCode))
+		}
+	})
+
+	// Re-create RunCommand with the process manager.
+	rc := tool.NewRunCommand(c.Cfg.Tools, c.Home, procMgr)
+	registry.Register(tool.WrapWithPermission(rc, checkFunc, askFunc))
+	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(procMgr, c.Cfg.Tools, c.Home), checkFunc, askFunc))
+	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkFunc, askFunc))
 
 	embedder, err := memory.NewEmbedder()
 	if err != nil {
@@ -206,6 +229,9 @@ func New(c Config) (*Agent, error) {
 		SubModel:        subModel,
 		SubBaseURL:      subBaseURL,
 		SubAPIKey:       subAPIKey,
+		ToolsConfig:     c.Cfg.Tools,
+		HomeDir:         c.Home,
+		ProcMgr:         procMgr,
 	})
 	registry.Register(tt)
 	a.subagentLoader = loader
@@ -246,6 +272,13 @@ func (a *Agent) Init(ctx context.Context) {
 		fmt.Fprintf(os.Stderr, "lightcode: resume session: %v\n", err)
 	}
 	go a.periodicSweep(ctx)
+
+	if a.procMgr != nil {
+		go func() {
+			<-ctx.Done()
+			a.procMgr.KillAll()
+		}()
+	}
 
 	if a.lspManager != nil {
 		a.lspManager.SetWarningHandler(func(kind, message string) {
@@ -334,6 +367,7 @@ func (a *Agent) dispatchLoopEvent(ev loop.Event) {
 			ToolCallID: ev.ToolCallID,
 			IsError:    ev.IsError,
 			Result:     ev.Result,
+			Metadata:   ev.Metadata,
 		})
 	case loop.Usage:
 		a.recordUsage(ev)
@@ -633,9 +667,74 @@ func (a *Agent) resumeMostRecent() error {
 	if err := a.loadHistoryIntoLoop(); err != nil {
 		return err
 	}
+	a.populateFileTracker()
 	a.loadTokensFromDisk()
 	a.restoreModelFromSession()
 	return nil
+}
+
+func (a *Agent) populateFileTracker() {
+	if a.fileTracker == nil || a.store == nil {
+		return
+	}
+	rec, _ := a.store.LoadCompaction()
+	var raw []snapshot.TurnMessages
+	var err error
+	if rec != nil {
+		raw, err = a.store.LoadCompleteTurnsAfter(rec.BoundaryTurn)
+	} else {
+		raw, err = a.store.LoadCompleteTurns()
+	}
+	if err != nil || len(raw) == 0 {
+		return
+	}
+	var msgs []tool.PersistedMessage
+	// We extract paths from assistant messages' tool_call args,
+	// since tool result messages don't contain the file path.
+	for _, t := range raw {
+		for _, line := range t.Messages {
+			var rawMsg map[string]any
+			if json.Unmarshal(line, &rawMsg) != nil {
+				continue
+			}
+			role, _ := rawMsg["role"].(string)
+			if role != "assistant" {
+				continue
+			}
+			toolCalls, ok := rawMsg["tool_calls"].([]any)
+			if !ok {
+				continue
+			}
+			for _, tc := range toolCalls {
+				tcMap, ok := tc.(map[string]any)
+				if !ok {
+					continue
+				}
+				fn, ok := tcMap["function"].(map[string]any)
+				if !ok {
+					continue
+				}
+				fnName, _ := fn["name"].(string)
+				if fnName != "read_file" {
+					continue
+				}
+				argsStr, _ := fn["arguments"].(string)
+				var args map[string]any
+				if json.Unmarshal([]byte(argsStr), &args) != nil {
+					continue
+				}
+				path, _ := args["path"].(string)
+				if path != "" {
+					msgs = append(msgs, tool.PersistedMessage{
+						Role:     "tool",
+						ToolName: "read_file",
+						Path:     path,
+					})
+				}
+			}
+		}
+	}
+	a.fileTracker.PopulateFromMessages(msgs)
 }
 
 func (a *Agent) restoreModelFromSession() {
@@ -1029,6 +1128,7 @@ func (a *Agent) SessionSwitch(id string) error {
 	if err := a.loadHistoryIntoLoop(); err != nil {
 		return err
 	}
+	a.populateFileTracker()
 	a.loadTokensFromDisk()
 	a.restoreModelFromSession()
 	a.tokensMu.Lock()

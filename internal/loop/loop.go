@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -68,6 +70,9 @@ type Event struct {
 	Result     string
 	IsError    bool
 
+	// Metadata carries extra information for UI rendering (diffs, etc.).
+	Metadata map[string]any
+
 	// Usage fields (Usage kind only).
 	Model      string
 	Cache      int
@@ -95,6 +100,10 @@ type Loop struct {
 
 	trace  io.Writer
 	events chan<- Event
+
+	// pendingQueue holds staged edit_file/write_file calls for
+	// batch execution. Created fresh per turn.
+	pendingQueue *tool.PendingQueue
 }
 
 // New returns a Loop pre-seeded with the system prompt.
@@ -246,6 +255,9 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		turn = l.store.CurrentTurn()
 	}
 
+	// Fresh pending queue per turn.
+	l.pendingQueue = tool.NewPendingQueue()
+
 	l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
 	for _, input := range userInputs {
 		userMsg := openai.ChatCompletionMessage{
@@ -273,6 +285,7 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 			msg.ToolCalls = nil
 			l.messages = append(l.messages, msg)
 			l.persistMessage(turn, msg)
+			l.pendingQueue.Discard()
 			signalMsg := openai.ChatCompletionMessage{
 				Role:    openai.ChatMessageRoleUser,
 				Content: interruptedSignal,
@@ -285,6 +298,16 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		l.persistMessage(turn, msg)
 
 		if len(msg.ToolCalls) == 0 {
+			// Auto-flush pending edits at turn end.
+			if l.pendingQueue.Len() > 0 {
+				result := l.flushPendingQueue(ctx)
+				toolMsg := openai.ChatCompletionMessage{
+					Role:    openai.ChatMessageRoleUser,
+					Content: result,
+				}
+				l.messages = append(l.messages, toolMsg)
+				l.persistMessage(turn, toolMsg)
+			}
 			return msg.Content, nil
 		}
 
@@ -468,33 +491,199 @@ func (l *Loop) dispatch(ctx context.Context, tc openai.ToolCall) (string, bool) 
 	fmt.Fprintf(l.trace, "  → %s %s\n", tc.Function.Name, truncate(tc.Function.Arguments, traceMaxChars))
 	l.emit(Event{Kind: ToolCallStart, ToolCallID: tc.ID, ToolName: tc.Function.Name, Args: tc.Function.Arguments})
 
+	var params map[string]any
+	parseErr := json.Unmarshal([]byte(tc.Function.Arguments), &params)
+
 	finish := func(result string, isError bool) string {
 		fmt.Fprintf(l.trace, "  ← %s\n", truncate(result, traceMaxChars))
-		l.emit(Event{Kind: ToolCallEnd, ToolCallID: tc.ID, ToolName: tc.Function.Name, Args: tc.Function.Arguments, Result: result, IsError: isError})
+		ev := Event{Kind: ToolCallEnd, ToolCallID: tc.ID, ToolName: tc.Function.Name, Args: tc.Function.Arguments, Result: result, IsError: isError}
+		if tc.Function.Name == "edit_file" && params != nil {
+			oldStr, _ := params["old_string"].(string)
+			newStr, _ := params["new_string"].(string)
+			if oldStr != newStr {
+				ev.Metadata = map[string]any{"diff": l.computeDiff(oldStr, newStr)}
+			}
+		} else if tc.Function.Name == "write_file" && params != nil {
+			content, _ := params["content"].(string)
+			ev.Metadata = map[string]any{"diff": l.computeDiff("", content)}
+		}
+		l.emit(ev)
 		return result
 	}
 
-	var params map[string]any
-	if err := json.Unmarshal([]byte(tc.Function.Arguments), &params); err != nil {
-		return finish(fmt.Sprintf("error: invalid JSON arguments: %v", err), true), false
+	if parseErr != nil {
+		return finish(fmt.Sprintf("error: invalid JSON arguments: %v", parseErr), true), false
 	}
+
+	// Handle execute_pending directly to use the current turn's queue.
+	if tc.Function.Name == "execute_pending" {
+		act, _ := params["action"].(string)
+		if act == "discard" {
+			l.pendingQueue.Discard()
+			return finish("Discarded all staged edits.", false), false
+		}
+		result := l.flushPendingQueue(ctx)
+		return finish(result, false), false
+	}
+
 	t, ok := l.registry.Get(tc.Function.Name)
 	if !ok {
 		return finish(fmt.Sprintf("error: unknown tool %q", tc.Function.Name), true), false
 	}
+
 	params["_tool_call_id"] = tc.ID
+
+	// Check for pending flag.
+	pending, _ := params["pending"].(bool)
+	if pending && (tc.Function.Name == "edit_file" || tc.Function.Name == "write_file") {
+		if err := validateStagedCall(tc.Function.Name, params); err != nil {
+			return finish(err.Error(), true), false
+		}
+		l.pendingQueue.Stage(tool.StagedCall{
+			ToolName:   tc.Function.Name,
+			ToolCallID: tc.ID,
+			Params:     params,
+		})
+		return finish("Staged.", false), false
+	}
+
+	// Before executing a non-pending tool, flush the queue.
+	var prefix string
+	if l.pendingQueue.Len() > 0 && tc.Function.Name != "execute_pending" {
+		prefix = l.flushPendingQueue(ctx) + "\n\n"
+	}
+
 	result, err := t.Execute(ctx, params)
 	if err != nil {
 		if errors.Is(err, tool.ErrDenied) {
-			return finish("denied by user", true), true
+			return finish(prefix+"denied by user", true), true
 		}
 		var exitErr *tool.ExitError
 		if errors.As(err, &exitErr) {
-			return finish(exitErr.Output, true), false
+			return finish(prefix+exitErr.Output, true), false
 		}
-		return finish("error: "+err.Error(), true), false
+		return finish(prefix+"error: "+err.Error(), true), false
 	}
-	return finish(result, false), false
+	return finish(prefix+result, false), false
+}
+
+// flushPendingQueue executes all staged edits/writes and returns the
+// batch result string. Staged edits to the same file are applied to an
+// in-memory buffer with a single disk write per file.
+func (l *Loop) flushPendingQueue(ctx context.Context) string {
+	staged := l.pendingQueue.Staged()
+	l.pendingQueue.Discard()
+
+	if len(staged) == 0 {
+		return "No pending edits to execute."
+	}
+
+	// Group by file path.
+	type fileGroup struct {
+		path  string
+		calls []tool.StagedCall
+	}
+	var groups []*fileGroup
+	groupIdx := make(map[string]*fileGroup)
+	for _, sc := range staged {
+		path, _ := sc.Params["path"].(string)
+		if g, ok := groupIdx[path]; ok {
+			g.calls = append(g.calls, sc)
+		} else {
+			g := &fileGroup{path: path, calls: []tool.StagedCall{sc}}
+			groups = append(groups, g)
+			groupIdx[path] = g
+		}
+	}
+
+	var results []tool.BatchResult
+	for _, g := range groups {
+		// Read file once if edits are needed.
+		path := g.path
+		isWrite := false
+		for _, call := range g.calls {
+			if call.ToolName == "write_file" {
+				isWrite = true
+				break
+			}
+		}
+		if isWrite && len(g.calls) == 1 && g.calls[0].ToolName == "write_file" {
+			// Single write_file: execute directly (no buffer needed).
+			t, ok := l.registry.Get(g.calls[0].ToolName)
+			if !ok {
+				results = append(results, tool.BatchResult{
+					ToolName: g.calls[0].ToolName, ToolCallID: g.calls[0].ToolCallID,
+					Success: false, Error: fmt.Sprintf("unknown tool %q", g.calls[0].ToolName),
+				})
+				continue
+			}
+			result, err := t.Execute(ctx, g.calls[0].Params)
+			if err != nil {
+				results = append(results, tool.BatchResult{
+					ToolName: g.calls[0].ToolName, ToolCallID: g.calls[0].ToolCallID,
+					Success: false, Error: err.Error(),
+				})
+			} else {
+				results = append(results, tool.BatchResult{
+					ToolName: g.calls[0].ToolName, ToolCallID: g.calls[0].ToolCallID,
+					Success: true, Result: result,
+				})
+			}
+			continue
+		}
+
+		// Multiple calls or mixed edits+writes: use running buffer.
+		bufRead, bufErr := os.ReadFile(path)
+		content := ""
+		if bufErr == nil {
+			content = string(bufRead)
+		}
+
+		for _, call := range g.calls {
+			switch call.ToolName {
+			case "edit_file":
+				oldStr, _ := call.Params["old_string"].(string)
+				newStr, _ := call.Params["new_string"].(string)
+				replaceAll, _ := call.Params["replace_all"].(bool)
+				res, err := tool.ApplyEdit(content, oldStr, newStr, replaceAll, path)
+				if err != nil {
+					results = append(results, tool.BatchResult{
+						ToolName: call.ToolName, ToolCallID: call.ToolCallID,
+						Success: false, Error: err.Error(),
+					})
+				} else {
+					content = res.UpdatedContent
+					results = append(results, tool.BatchResult{
+						ToolName: call.ToolName, ToolCallID: call.ToolCallID,
+						Success: true, Result: res.Summary,
+					})
+				}
+			case "write_file":
+				writeContent, _ := call.Params["content"].(string)
+				content = writeContent
+				results = append(results, tool.BatchResult{
+					ToolName: call.ToolName, ToolCallID: call.ToolCallID,
+					Success: true, Result: fmt.Sprintf("Wrote %s.", path),
+				})
+			default:
+				results = append(results, tool.BatchResult{
+					ToolName: call.ToolName, ToolCallID: call.ToolCallID,
+					Success: false, Error: fmt.Sprintf("cannot stage %q", call.ToolName),
+				})
+			}
+		}
+
+		// Write the final buffer once.
+		if bufErr != nil || len(g.calls) > 0 {
+			dir := filepath.Dir(path)
+			if dir != "" && dir != "." {
+				os.MkdirAll(dir, 0o755)
+			}
+			os.WriteFile(path, []byte(content), 0o644)
+		}
+	}
+
+	return tool.FormatBatchResult(results)
 }
 
 // TurnCount returns the number of completed user turns in this session.
@@ -520,4 +709,43 @@ func truncate(s string, max int) string {
 		return flat
 	}
 	return flat[:max] + fmt.Sprintf("... (%d bytes total)", len(s))
+}
+
+// computeDiff returns a simple line-based diff between old and new text.
+func (l *Loop) computeDiff(old, new string) string {
+	oldLines := strings.Split(old, "\n")
+	newLines := strings.Split(new, "\n")
+	var b strings.Builder
+	for _, line := range oldLines {
+		b.WriteString("- " + line + "\n")
+	}
+	b.WriteString("\n")
+	for _, line := range newLines {
+		b.WriteString("+ " + line + "\n")
+	}
+	result := b.String()
+	if len(result) > 0 && result[len(result)-1] == '\n' {
+		result = result[:len(result)-1]
+	}
+	return result
+}
+
+// validateStagedCall performs lightweight validation on a pending edit/write
+// before staging, so the model gets immediate error feedback.
+func validateStagedCall(toolName string, params map[string]any) error {
+	path, _ := params["path"].(string)
+	if path == "" {
+		return fmt.Errorf("%s: path is required", toolName)
+	}
+	if toolName == "edit_file" {
+		oldStr, _ := params["old_string"].(string)
+		newStr, _ := params["new_string"].(string)
+		if oldStr == "" {
+			return fmt.Errorf("edit_file: old_string must not be empty")
+		}
+		if oldStr == newStr {
+			return fmt.Errorf("edit_file: old_string and new_string are identical")
+		}
+	}
+	return nil
 }

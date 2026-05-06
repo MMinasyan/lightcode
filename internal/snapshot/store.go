@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -765,10 +766,176 @@ func (s *Store) discardIncompleteTurnsLocked() {
 	}
 	for _, n := range readIntDirs(s.turnsDir) {
 		dir := filepath.Join(s.turnsDir, strconv.Itoa(n))
-		if _, err := os.Stat(filepath.Join(dir, "complete")); err != nil {
+		if _, err := os.Stat(filepath.Join(dir, "complete")); err == nil {
+			continue
+		}
+		// Attempt crash recovery.
+		recovered := recoverTurnMessages(dir)
+		if len(recovered) == 0 {
 			_ = os.RemoveAll(dir)
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(dir, "messages.jsonl"), recovered, 0o600); err != nil {
+			_ = os.RemoveAll(dir)
+			continue
+		}
+		_ = os.WriteFile(filepath.Join(dir, "complete"), nil, 0o600)
+	}
+}
+
+// recoverTurnMessages attempts to recover complete iterations from a
+// partially-written messages.jsonl. Returns the recovered JSONL content
+// or nil if nothing can be recovered.
+func recoverTurnMessages(dir string) []byte {
+	data, err := os.ReadFile(filepath.Join(dir, "messages.jsonl"))
+	if err != nil {
+		return nil
+	}
+	lines := splitJSONL(data)
+
+	if len(lines) == 0 {
+		return nil
+	}
+
+	// Skip malformed last line (crash mid-write guard).
+	var lastCheck map[string]any
+	if json.Unmarshal(lines[len(lines)-1], &lastCheck) != nil {
+		lines = lines[:len(lines)-1]
+	}
+
+	if len(lines) == 0 {
+		return nil
+	}
+
+	// Parse each line into a structured form.
+	type msgInfo struct {
+		raw       []byte
+		role      string
+		toolCallID string   // for tool messages
+		toolCalls []string // tool call IDs from assistant messages
+	}
+	var msgs []msgInfo
+	for _, line := range lines {
+		var raw map[string]any
+		if json.Unmarshal(line, &raw) != nil {
+			continue
+		}
+		info := msgInfo{raw: line}
+		info.role, _ = raw["role"].(string)
+		info.toolCallID, _ = raw["tool_call_id"].(string)
+		if tcs, ok := raw["tool_calls"].([]any); ok {
+			for _, tc := range tcs {
+				if tcMap, ok := tc.(map[string]any); ok {
+					if id, ok := tcMap["id"].(string); ok {
+						info.toolCalls = append(info.toolCalls, id)
+					}
+				}
+			}
+		}
+		msgs = append(msgs, info)
+	}
+
+	// Identify complete iterations: an assistant message with tool calls
+	// followed by matching tool result messages.
+	// Walk through and mark which assistant messages are complete.
+	type iterMark struct {
+		msgIdx   int
+		complete bool
+		endIdx   int // last tool result index for this iteration
+	}
+	var iters []iterMark
+	i := 0
+	for i < len(msgs) {
+		m := msgs[i]
+		if m.role == "assistant" && len(m.toolCalls) > 0 {
+			expected := make(map[string]bool, len(m.toolCalls))
+			for _, id := range m.toolCalls {
+				expected[id] = true
+			}
+			seen := make(map[string]bool)
+			endIdx := i
+			for j := i + 1; j < len(msgs); j++ {
+				if msgs[j].role == "tool" {
+					seen[msgs[j].toolCallID] = true
+					endIdx = j
+				} else {
+					break
+				}
+			}
+			allFound := true
+			for id := range expected {
+				if !seen[id] {
+					allFound = false
+					break
+				}
+			}
+			iters = append(iters, iterMark{msgIdx: i, complete: allFound, endIdx: endIdx})
+			i = endIdx + 1
+		} else {
+			i++
 		}
 	}
+
+	// Discard last incomplete iteration.
+	if len(iters) > 0 && !iters[len(iters)-1].complete {
+		iters = iters[:len(iters)-1]
+	}
+
+	if len(iters) == 0 {
+		return nil
+	}
+
+	// Rebuild: keep user messages and complete iterations, preserving order.
+	// Build a set of indices to keep.
+	keep := make(map[int]bool)
+	for _, it := range iters {
+		if it.complete {
+			keep[it.msgIdx] = true
+			for k := it.msgIdx + 1; k <= it.endIdx; k++ {
+				keep[k] = true
+			}
+		}
+	}
+	for idx, m := range msgs {
+		if m.role == "user" {
+			keep[idx] = true
+		}
+	}
+	// Also keep final text-only assistant messages (no tool calls).
+	for idx := len(msgs) - 1; idx >= 0; idx-- {
+		if !keep[idx] {
+			break
+		}
+	}
+	// Find the last assistant message without tool calls and keep it if it's after the last iteration.
+	if len(iters) > 0 {
+		lastIterEnd := iters[len(iters)-1].endIdx
+		for idx := lastIterEnd + 1; idx < len(msgs); idx++ {
+			if msgs[idx].role == "assistant" && len(msgs[idx].toolCalls) == 0 {
+				keep[idx] = true
+			}
+		}
+	} else {
+		// No iterations — keep user messages and any text-only responses.
+		for idx := range msgs {
+			if msgs[idx].role == "assistant" && len(msgs[idx].toolCalls) == 0 {
+				keep[idx] = true
+			}
+		}
+	}
+
+	var rebuild []byte
+	for idx, m := range msgs {
+		if keep[idx] {
+			rebuild = append(rebuild, m.raw...)
+			rebuild = append(rebuild, '\n')
+		}
+	}
+
+	if len(rebuild) == 0 {
+		return nil
+	}
+	return rebuild
 }
 
 func (s *Store) hasAnyCompleteTurnLocked() bool {

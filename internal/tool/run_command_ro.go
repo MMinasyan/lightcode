@@ -13,15 +13,18 @@ var readOnlyCommands = []string{
 	"git blame", "git branch", "git rev-parse", "git tag",
 }
 
+// ReadOnlyRunCommand wraps RunCommand and restricts commands to a
+// whitelist of non-destructive operations (ls, cat, grep, git log, etc.).
 type ReadOnlyRunCommand struct {
-	inner RunCommand
+	inner *RunCommand
 }
 
-func NewReadOnlyRunCommand() *ReadOnlyRunCommand {
-	return &ReadOnlyRunCommand{}
+// NewReadOnlyRunCommand creates a read-only command tool.
+func NewReadOnlyRunCommand(inner *RunCommand) *ReadOnlyRunCommand {
+	return &ReadOnlyRunCommand{inner: inner}
 }
 
-func (*ReadOnlyRunCommand) Name() string { return "run_command" }
+func (*ReadOnlyRunCommand) Name() string              { return "run_command" }
 func (*ReadOnlyRunCommand) Description() string {
 	return "Execute a read-only shell command and return its output. Only non-destructive commands are allowed (ls, cat, grep, find, git log, git diff, etc.)."
 }

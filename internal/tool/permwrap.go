@@ -64,6 +64,12 @@ func extractArg(toolName string, params map[string]any) string {
 			}
 		}
 		return s
+	case "process":
+		id, _ := params["id"].(string)
+		if id != "" {
+			return "process:" + id
+		}
+		return "process"
 	default:
 		return ""
 	}

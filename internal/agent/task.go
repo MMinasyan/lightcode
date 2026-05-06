@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/loop"
 	"github.com/MMinasyan/lightcode/internal/provider"
 	"github.com/MMinasyan/lightcode/internal/subagent"
@@ -53,6 +54,10 @@ type taskTool struct {
 	subModel        string
 	subBaseURL      string
 	subAPIKey       string
+
+	toolsConfig config.ToolsConfig
+	homeDir     string
+	procMgr     tool.ProcessManager
 }
 
 type taskToolConfig struct {
@@ -71,6 +76,10 @@ type taskToolConfig struct {
 	SubModel        string
 	SubBaseURL      string
 	SubAPIKey       string
+
+	ToolsConfig config.ToolsConfig
+	HomeDir     string
+	ProcMgr     tool.ProcessManager
 }
 
 func newTaskTool(cfg taskToolConfig) *taskTool {
@@ -91,6 +100,9 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		subModel:        cfg.SubModel,
 		subBaseURL:      cfg.SubBaseURL,
 		subAPIKey:       cfg.SubAPIKey,
+		toolsConfig:     cfg.ToolsConfig,
+		homeDir:         cfg.HomeDir,
+		procMgr:         cfg.ProcMgr,
 	}
 }
 
@@ -245,7 +257,8 @@ func (t *taskTool) buildRegistry(at subagent.AgentType) *tool.Registry {
 			continue
 		}
 		if name == "run_command" && isReadOnlyType(at) {
-			reg.Register(tool.NewReadOnlyRunCommand())
+			rc := tool.NewRunCommand(t.toolsConfig, t.homeDir, t.procMgr)
+			reg.Register(tool.NewReadOnlyRunCommand(rc))
 			continue
 		}
 		if tt, ok := t.baseRegistry.Get(name); ok {
