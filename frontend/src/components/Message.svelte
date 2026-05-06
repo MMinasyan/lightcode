@@ -138,8 +138,7 @@
       <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
       <div class="md" class:wrap={$settings.wrapCode} on:click={handleMdClick}>{@html renderedHtml}</div>
     {:else}
-      <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-      <div class="plain" class:collapsed={!expanded} use:checkOverflow on:click={() => expanded = !expanded}>{content}</div>
+      <div class="plain" class:collapsed={!expanded} use:checkOverflow>{content}</div>
       {#if overflows}
         <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
         <div class="expand-hint" on:click={() => expanded = !expanded}>{expanded ? 'less' : 'more'}</div>
@@ -171,9 +170,10 @@
   .confirm-btn.yes-code { border-color:var(--accent); color:var(--accent); }
   .confirm-btn.yes-code:hover { background:var(--accent-soft); }
   .body { font-family:var(--font-ui); font-size:calc(13px * var(--scale, 1)); line-height:1.6; }
-  .plain { white-space:pre-wrap; word-break:break-word; cursor:pointer; }
+  .plain { white-space:pre-wrap; word-break:break-word; }
   .plain.collapsed { max-height:calc(1.6em * 5); overflow:hidden; }
   .expand-hint { font-size:calc(11px * var(--scale, 1)); color:var(--text-dim); cursor:pointer; margin-top:2px; }
+  .expand-hint:hover { color:var(--accent); }
   .md :global(p) { margin:0 0 8px; }
   .md :global(p:last-child) { margin-bottom:0; }
   .md :global(code) { font-family:var(--font-mono); font-size:calc(12px * var(--scale, 1)); color:var(--code-inline); }
