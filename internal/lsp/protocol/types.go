@@ -9,21 +9,32 @@ import (
 // Initialize
 
 type InitializeParams struct {
-	ProcessID    *int               `json:"processId"`
-	RootURI      string             `json:"rootUri"`
-	Capabilities ClientCapabilities `json:"capabilities"`
+	ProcessID        *int               `json:"processId"`
+	RootURI          string             `json:"rootUri"`
+	Capabilities     ClientCapabilities `json:"capabilities"`
+	WorkspaceFolders []WorkspaceFolder  `json:"workspaceFolders,omitempty"`
 }
 
 type ClientCapabilities struct {
 	TextDocument TextDocumentClientCapabilities `json:"textDocument"`
+	Workspace    WorkspaceClientCapabilities    `json:"workspace,omitempty"`
 	Window       WindowClientCapabilities       `json:"window,omitempty"`
 }
 
+type WorkspaceClientCapabilities struct {
+	WorkspaceFolders bool `json:"workspaceFolders,omitempty"`
+}
+
+type WorkspaceFolder struct {
+	URI  string `json:"uri"`
+	Name string `json:"name"`
+}
+
 type TextDocumentClientCapabilities struct {
-	Definition     GenericCapability `json:"definition,omitempty"`
-	References     GenericCapability `json:"references,omitempty"`
-	Hover          GenericCapability `json:"hover,omitempty"`
-	Implementation GenericCapability `json:"implementation,omitempty"`
+	Definition         GenericCapability `json:"definition,omitempty"`
+	References         GenericCapability `json:"references,omitempty"`
+	Hover              GenericCapability `json:"hover,omitempty"`
+	Implementation     GenericCapability `json:"implementation,omitempty"`
 	PublishDiagnostics struct {
 		RelatedInformation bool `json:"relatedInformation,omitempty"`
 	} `json:"publishDiagnostics,omitempty"`
@@ -86,7 +97,7 @@ type TextDocumentPositionParams struct {
 type ReferenceParams struct {
 	TextDocument TextDocumentIdentifier `json:"textDocument"`
 	Position     Position               `json:"position"`
-	Context      ReferenceContext        `json:"context"`
+	Context      ReferenceContext       `json:"context"`
 }
 
 type ReferenceContext struct {

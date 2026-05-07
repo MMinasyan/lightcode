@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -20,10 +21,10 @@ const (
 	stateFailed
 	stateShutdown
 
-	maxRestarts   = 3
-	idleTimeout   = 30 * time.Minute
-	readyTimeout  = 30 * time.Second
-	shutdownWait  = 5 * time.Second
+	maxRestarts  = 3
+	idleTimeout  = 30 * time.Minute
+	readyTimeout = 30 * time.Second
+	shutdownWait = 5 * time.Second
 )
 
 type instance struct {
@@ -108,13 +109,7 @@ func (inst *instance) start(ctx context.Context) error {
 	inst.mu.Unlock()
 
 	pid := os.Getpid()
-	initParams := protocol.InitializeParams{
-		ProcessID: &pid,
-		RootURI:   protocol.URIFromPath(inst.projectRoot),
-		Capabilities: protocol.ClientCapabilities{
-			Window: protocol.WindowClientCapabilities{WorkDoneProgress: true},
-		},
-	}
+	initParams := buildInitializeParams(pid, inst.projectRoot)
 
 	result, err := rpc.Call(ctx, "initialize", initParams)
 	if err != nil {
@@ -137,6 +132,21 @@ func (inst *instance) start(ctx context.Context) error {
 	go inst.watchProcess()
 
 	return nil
+}
+
+func buildInitializeParams(pid int, projectRoot string) protocol.InitializeParams {
+	rootURI := protocol.URIFromPath(projectRoot)
+	return protocol.InitializeParams{
+		ProcessID: &pid,
+		RootURI:   rootURI,
+		Capabilities: protocol.ClientCapabilities{
+			Workspace: protocol.WorkspaceClientCapabilities{WorkspaceFolders: true},
+			Window:    protocol.WindowClientCapabilities{WorkDoneProgress: true},
+		},
+		WorkspaceFolders: []protocol.WorkspaceFolder{
+			{URI: rootURI, Name: filepath.Base(projectRoot)},
+		},
+	}
 }
 
 func (inst *instance) handleNotification(method string, params json.RawMessage) {
