@@ -89,7 +89,7 @@ func NewEditFileWithSnapshot(store SnapshotStore, tracker *FileTracker, cfg conf
 }
 
 func (*EditFileWithSnapshot) Name() string        { return "edit_file" }
-func (*EditFileWithSnapshot) Description() string  { return (&EditFile{}).Description() }
+func (*EditFileWithSnapshot) Description() string { return (&EditFile{}).Description() }
 func (*EditFileWithSnapshot) ParametersSchema() map[string]any {
 	return (&EditFile{}).ParametersSchema()
 }
@@ -165,9 +165,9 @@ func editFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.
 		return nil, fmt.Errorf("edit_file: write: %w", err)
 	}
 
-	// Update mtime tracker after successful write.
+	// Refresh mtime after successful write without creating read authorization.
 	if tracker != nil {
-		tracker.Track(absPath, 0, 0)
+		tracker.UpdateAfterWrite(absPath)
 	}
 
 	diff := computeDiff(content, res.UpdatedContent)

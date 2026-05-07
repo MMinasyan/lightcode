@@ -18,8 +18,8 @@ type ReadRecord struct {
 // It is populated from conversation history on session load and
 // updated by read_file executions.
 type FileTracker struct {
-	mu    sync.Mutex
-	reads []ReadRecord     // ordered by time, earliest first
+	mu     sync.Mutex
+	reads  []ReadRecord         // ordered by time, earliest first
 	mtimes map[string]time.Time // path -> last read mtime
 }
 
@@ -46,6 +46,30 @@ func (t *FileTracker) Track(path string, offset, limit int) {
 		Limit:  limit,
 		Mtime:  mtime,
 	})
+}
+
+// UpdateAfterWrite refreshes the tracked mtime for a file that was already
+// read-authorized. Writes must not create read authorization by themselves.
+func (t *FileTracker) UpdateAfterWrite(path string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.mtimes[path]; !ok {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	t.mtimes[path] = info.ModTime()
+}
+
+// Reset clears all tracked reads. Call this when visible conversation history
+// changes so hidden or old reads cannot authorize future edits.
+func (t *FileTracker) Reset() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.reads = nil
+	t.mtimes = make(map[string]time.Time)
 }
 
 // IsDuplicate checks if path+offset+limit was already read AND

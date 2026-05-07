@@ -650,6 +650,9 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 	}
 
 	a.lp.LoadHistoryWithSummary(result.Summary, nil)
+	if a.fileTracker != nil {
+		a.fileTracker.Reset()
+	}
 
 	a.tokensMu.Lock()
 	a.lastContextUsed = 0
@@ -736,7 +739,11 @@ func (a *Agent) resumeMostRecent() error {
 }
 
 func (a *Agent) populateFileTracker() {
-	if a.fileTracker == nil || a.store == nil {
+	if a.fileTracker == nil {
+		return
+	}
+	a.fileTracker.Reset()
+	if a.store == nil {
 		return
 	}
 	rec, _ := a.store.LoadCompaction()
@@ -899,6 +906,9 @@ func (a *Agent) ensureSession() error {
 	}
 	_ = a.store.SetModel(a.currentProvider, a.currentModel)
 	a.lp.ResetHistory()
+	if a.fileTracker != nil {
+		a.fileTracker.Reset()
+	}
 	a.loadTokensFromDisk()
 	return nil
 }
@@ -1220,6 +1230,9 @@ func (a *Agent) SessionNew() error {
 		return err
 	}
 	a.lp.ResetHistory()
+	if a.fileTracker != nil {
+		a.fileTracker.Reset()
+	}
 	a.tokensMu.Lock()
 	a.tokens = map[string]*TokenEntry{}
 	a.tokensMu.Unlock()
@@ -1245,6 +1258,9 @@ func (a *Agent) SessionArchive(id string) (bool, error) {
 	}
 	if closedCurrent {
 		a.lp.ResetHistory()
+		if a.fileTracker != nil {
+			a.fileTracker.Reset()
+		}
 		a.tokensMu.Lock()
 		a.tokens = map[string]*TokenEntry{}
 		a.tokensMu.Unlock()
@@ -1271,6 +1287,9 @@ func (a *Agent) SessionDelete(id string) (bool, error) {
 	}
 	if closedCurrent {
 		a.lp.ResetHistory()
+		if a.fileTracker != nil {
+			a.fileTracker.Reset()
+		}
 		a.tokensMu.Lock()
 		a.tokens = map[string]*TokenEntry{}
 		a.tokensMu.Unlock()
@@ -1440,7 +1459,11 @@ func (a *Agent) RevertHistory(turn int) error {
 	if err := a.store.RevertHistory(turn); err != nil {
 		return err
 	}
-	return a.loadHistoryIntoLoop()
+	if err := a.loadHistoryIntoLoop(); err != nil {
+		return err
+	}
+	a.populateFileTracker()
+	return nil
 }
 
 // ForkSession creates a new session branched from the given turn.
@@ -1466,6 +1489,7 @@ func (a *Agent) ForkSession(turn int) error {
 	if err := a.loadHistoryIntoLoop(); err != nil {
 		return err
 	}
+	a.populateFileTracker()
 	a.loadTokensFromDisk()
 	return nil
 }

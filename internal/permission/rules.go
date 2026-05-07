@@ -110,11 +110,46 @@ func matchParts(pat, path []string) bool {
 	return len(pat) == 0 && len(path) == 0
 }
 
-// matchCommand matches a command string against a glob pattern using
-// filepath.Match semantics (no path decomposition).
+// matchCommand matches shell command rules. Exact rules are literal strings;
+// rules containing * use * as a command wildcard. Backslashes and other
+// shell characters remain literal command text, not filepath glob escapes.
 func matchCommand(pattern, command string) bool {
-	ok, _ := filepath.Match(pattern, command)
-	return ok
+	if !strings.Contains(pattern, "*") {
+		return pattern == command
+	}
+	return matchCommandWildcard(pattern, command)
+}
+
+func matchCommandWildcard(pattern, command string) bool {
+	p, c := 0, 0
+	star := -1
+	matchedAtStar := 0
+
+	for c < len(command) {
+		if p < len(pattern) && pattern[p] == '*' {
+			star = p
+			matchedAtStar = c
+			p++
+			continue
+		}
+		if p < len(pattern) && pattern[p] == command[c] {
+			p++
+			c++
+			continue
+		}
+		if star >= 0 {
+			p = star + 1
+			matchedAtStar++
+			c = matchedAtStar
+			continue
+		}
+		return false
+	}
+
+	for p < len(pattern) && pattern[p] == '*' {
+		p++
+	}
+	return p == len(pattern)
 }
 
 // DecomposeCommand splits a shell command on &&, ||, ;, and | respecting

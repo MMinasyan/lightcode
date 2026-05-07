@@ -38,6 +38,7 @@ type CommandStarted struct {
 	StartedAt time.Time
 	cmd       *exec.Cmd
 	buf       bytes.Buffer
+	done      chan struct{}
 	mu        sync.Mutex
 	exitCode  int
 	exited    bool
@@ -105,6 +106,7 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 		Command:   command,
 		StartedAt: time.Now(),
 		cmd:       cmd,
+		done:      make(chan struct{}),
 	}
 
 	m.mu.Lock()
@@ -135,6 +137,7 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 
 		// Auto-remove dead process so it doesn't count against the limit.
 		m.Remove(id)
+		close(cs.done)
 	}()
 
 	return id, nil
@@ -193,16 +196,11 @@ func (m *Manager) Kill(id string) error {
 	// SIGTERM to process group.
 	_ = syscall.Kill(-cs.cmd.Process.Pid, syscall.SIGTERM)
 
-	done := make(chan struct{})
-	go func() {
-		cs.cmd.Wait()
-		close(done)
-	}()
 	select {
-	case <-done:
+	case <-cs.done:
 	case <-time.After(500 * time.Millisecond):
 		_ = syscall.Kill(-cs.cmd.Process.Pid, syscall.SIGKILL)
-		<-done
+		<-cs.done
 	}
 	return nil
 }

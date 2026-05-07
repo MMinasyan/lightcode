@@ -168,6 +168,48 @@ func assistantMessageHasPayload(msg openai.ChatCompletionMessage) bool {
 	return msg.Content != "" || len(msg.MultiContent) > 0 || len(msg.ToolCalls) > 0
 }
 
+func normalizeAssistantToolCalls(msg openai.ChatCompletionMessage) openai.ChatCompletionMessage {
+	for i := range msg.ToolCalls {
+		msg.ToolCalls[i] = normalizeToolCall(msg.ToolCalls[i])
+	}
+	return msg
+}
+
+func normalizeToolCall(tc openai.ToolCall) openai.ToolCall {
+	tc.Function.Arguments = normalizeToolCallArgs(tc.Function.Name, tc.Function.Arguments)
+	return tc
+}
+
+func normalizeToolCallArgs(name, args string) string {
+	if name != "sleep" {
+		return args
+	}
+	var params map[string]any
+	if err := json.Unmarshal([]byte(args), &params); err != nil {
+		return args
+	}
+	v, ok := params["seconds"].(float64)
+	if !ok {
+		return args
+	}
+	sec := int(v)
+	if sec < 1 {
+		sec = 1
+	}
+	if sec > 300 {
+		sec = 300
+	}
+	if float64(sec) == v {
+		return args
+	}
+	params["seconds"] = sec
+	data, err := json.Marshal(params)
+	if err != nil {
+		return args
+	}
+	return string(data)
+}
+
 func emptyAssistantResponseError(finishReason openai.FinishReason, sawChoice bool) error {
 	if finishReason != "" && finishReason != openai.FinishReasonNull {
 		return fmt.Errorf("empty assistant response (finish_reason=%s)", finishReason)
@@ -320,6 +362,7 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("chat completion: %w", err)
 		}
+		msg = normalizeAssistantToolCalls(msg)
 		if cancelled {
 			msg.ToolCalls = nil
 			if assistantMessageHasPayload(msg) {
@@ -548,6 +591,7 @@ func (l *Loop) consumeStream(ctx context.Context, stream *openai.ChatCompletionS
 // dispatch executes one tool call and returns the result string plus a
 // bool indicating whether the user denied the operation.
 func (l *Loop) dispatch(ctx context.Context, tc openai.ToolCall) (string, bool) {
+	tc = normalizeToolCall(tc)
 	fmt.Fprintf(l.trace, "  → %s %s\n", tc.Function.Name, truncate(tc.Function.Arguments, traceMaxChars))
 	l.emit(Event{Kind: ToolCallStart, ToolCallID: tc.ID, ToolName: tc.Function.Name, Args: tc.Function.Arguments})
 

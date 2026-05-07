@@ -86,7 +86,7 @@ func NewWriteFileWithSnapshot(store SnapshotStore, tracker *FileTracker, cfg con
 }
 
 func (*WriteFileWithSnapshot) Name() string        { return "write_file" }
-func (*WriteFileWithSnapshot) Description() string  { return (&WriteFile{}).Description() }
+func (*WriteFileWithSnapshot) Description() string { return (&WriteFile{}).Description() }
 func (*WriteFileWithSnapshot) ParametersSchema() map[string]any {
 	return (&WriteFile{}).ParametersSchema()
 }
@@ -150,9 +150,9 @@ func writeFileExecCommon(params map[string]any, tracker *FileTracker, cfg config
 		return nil, fmt.Errorf("write_file: %w", err)
 	}
 
-	// Update mtime tracker after successful write.
+	// Refresh mtime after successful write without creating read authorization.
 	if tracker != nil {
-		tracker.Track(absPath, 0, 0)
+		tracker.UpdateAfterWrite(absPath)
 	}
 
 	diff := computeDiff(prevContent, content)

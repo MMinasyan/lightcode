@@ -223,7 +223,7 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 	}
 
 	if e.tracker != nil {
-		e.tracker.Track(absPath, 0, 0)
+		e.tracker.UpdateAfterWrite(absPath)
 	}
 }
 
