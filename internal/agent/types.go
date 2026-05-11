@@ -1,6 +1,9 @@
 package agent
 
-import "github.com/MMinasyan/lightcode/internal/permission"
+import (
+	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/permission"
+)
 
 // EventKind identifies the type of agent event.
 type EventKind int
@@ -82,10 +85,17 @@ type TokenReport struct {
 	ContextWindow int          `json:"contextWindow"`
 }
 
-// ProviderModels lists the models available from one provider.
-type ProviderModels struct {
-	Provider string   `json:"provider"`
-	Models   []string `json:"models"`
+// ModelListEntry is one flat picker/list entry from the catalog.
+type ModelListEntry struct {
+	Ref           string        `json:"ref"`
+	Provider      string        `json:"provider"`
+	ProviderName  string        `json:"providerName"`
+	Model         string        `json:"model"`
+	DisplayName   string        `json:"displayName"`
+	ContextWindow int           `json:"contextWindow"`
+	Cost          *catalog.Cost `json:"cost,omitempty"`
+	Hidden        bool          `json:"hidden"`
+	Incomplete    bool          `json:"incomplete"`
 }
 
 // Snapshot describes one turn's snapshots.
@@ -126,10 +136,15 @@ type DisplayMessage struct {
 	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
-// ModelInfo holds the active provider and model.
+// ModelInfo holds the active model identity and catalog metadata.
 type ModelInfo struct {
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
+	Ref           string        `json:"ref"`
+	Provider      string        `json:"provider"`
+	Model         string        `json:"model"`
+	DisplayName   string        `json:"displayName"`
+	ContextWindow int           `json:"contextWindow"`
+	Cost          *catalog.Cost `json:"cost,omitempty"`
+	Incomplete    bool          `json:"incomplete"`
 }
 
 // ProjectSummary is the payload for project queries.

@@ -381,14 +381,13 @@ func (r *Runner) handleRevertHistory(req Request) {
 
 func (r *Runner) handleModelSwitch(req Request) {
 	var params struct {
-		Provider string `json:"provider"`
-		Model    string `json:"model"`
+		Ref string `json:"ref"`
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	if err := r.agent.SwitchModel(params.Provider, params.Model); err != nil {
+	if err := r.agent.SwitchModel(params.Ref); err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}

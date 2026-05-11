@@ -21,6 +21,8 @@ type App struct {
 	svc *agent.Agent
 }
 
+type ModelCompletion = agent.ModelCompletion
+
 // startup is called by Wails after the window is created.
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
@@ -130,9 +132,19 @@ func (a *App) AppendUserMessage(content string) (int, error) {
 	return a.svc.AppendUserMessage(content)
 }
 
-// SwitchModel changes the active provider and model.
-func (a *App) SwitchModel(providerName, model string) error {
-	return a.svc.SwitchModel(providerName, model)
+// SwitchModel changes the active model by provider-prefixed catalog ref.
+func (a *App) SwitchModel(ref string) error {
+	return a.svc.SwitchModel(ref)
+}
+
+// Reload reloads config and catalog state for future turns.
+func (a *App) Reload() error {
+	return a.svc.Reload()
+}
+
+// CompleteModelEntry writes missing model metadata and reloads the catalog.
+func (a *App) CompleteModelEntry(ref string, completion ModelCompletion) error {
+	return a.svc.CompleteModelEntry(ref, completion)
 }
 
 // RevertCode restores files to their state at turn N.
@@ -191,8 +203,8 @@ func (a *App) SnapshotList() ([]agent.Snapshot, error) {
 	return a.svc.SnapshotList()
 }
 
-// ModelList returns all configured providers and their models.
-func (a *App) ModelList() ([]agent.ProviderModels, error) {
+// ModelList returns all visible catalog models.
+func (a *App) ModelList() ([]agent.ModelListEntry, error) {
 	return a.svc.ModelList(), nil
 }
 

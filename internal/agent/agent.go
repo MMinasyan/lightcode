@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 
 	openai "github.com/sashabaranov/go-openai"
 
+	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/compact"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/loop"
@@ -39,6 +41,7 @@ type Config struct {
 // Agent is the shared core used by all adapters (Wails, HTTP, ACP).
 type Agent struct {
 	cfg      *config.Config
+	catalog  *catalog.Catalog
 	store    *snapshot.Store
 	projects *project.Resolver
 	lp       *loop.Loop
@@ -56,13 +59,12 @@ type Agent struct {
 	turnCancel context.CancelFunc
 	turnCtx    context.Context
 
-	currentProvider string
-	currentModel    string
-
-	tokensMu          sync.Mutex
-	tokens            map[string]*TokenEntry
-	lastContextUsed   int
+	currentRef        catalog.ModelRef
 	contextWindowSize int
+
+	tokensMu        sync.Mutex
+	tokens          map[string]*TokenEntry
+	lastContextUsed int
 
 	assembler       *prompt.Assembler
 	pendingWarnings []prompt.Warning
@@ -92,11 +94,32 @@ type Agent struct {
 // provider client, tool registry, permission gate, snapshot store,
 // and loop. Call Init after setting up the event handler.
 func New(c Config) (*Agent, error) {
-	prov, modelID, apiKey, err := c.Cfg.ResolveDefault()
+	modelCatalog, catalogWarnings, err := catalog.NewLoader(c.Home, nil).Load()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load model catalog: %w", err)
 	}
-	client := provider.New(prov.BaseURL, apiKey, modelID)
+
+	defaultModelStr := c.Cfg.DefaultModel
+	if defaultModelStr == "" {
+		if ref, ok := autoSelectModel(modelCatalog); ok {
+			defaultModelStr = ref.String()
+		}
+	}
+
+	var defaultRef catalog.ModelRef
+	var client *provider.Client
+	var defaultModel *catalog.Model
+
+	if defaultModelStr != "" {
+		defaultRef, err = catalog.ParseModelRef(defaultModelStr)
+		if err != nil {
+			return nil, fmt.Errorf("default_model: %w", err)
+		}
+		client, defaultModel, err = newProviderClient(modelCatalog, defaultRef)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	resolver, err := project.NewResolver(c.Home, c.ProjectRoot)
 	if err != nil {
@@ -109,16 +132,21 @@ func New(c Config) (*Agent, error) {
 
 	events := make(chan loop.Event, 256)
 
+	var contextWindowSize int
+	if defaultModel != nil {
+		contextWindowSize = defaultModel.ContextWindow
+	}
+
 	a := &Agent{
 		cfg:               c.Cfg,
+		catalog:           modelCatalog,
 		store:             store,
 		projects:          resolver,
 		projectRoot:       c.ProjectRoot,
 		home:              c.Home,
 		loopEvents:        events,
-		currentProvider:   c.Cfg.DefaultModel.Provider,
-		currentModel:      modelID,
-		contextWindowSize: resolveContextWindow(client, c.Cfg, c.Cfg.DefaultModel.Provider, modelID, c.Home),
+		currentRef:        defaultRef,
+		contextWindowSize: contextWindowSize,
 		loopFlush:         make(chan chan struct{}, 1),
 	}
 
@@ -216,37 +244,21 @@ func New(c Config) (*Agent, error) {
 	loader := subagent.NewLoader(c.ProjectRoot, c.Home)
 	taggedEvts := make(chan TaggedLoopEvent, 512)
 
-	var subBaseURL, subAPIKey, subProvName, subModel string
-	if c.Cfg.Subagents.Provider != "" {
-		if sp, ok := c.Cfg.Providers[c.Cfg.Subagents.Provider]; ok {
-			subBaseURL = sp.BaseURL
-			subProvName = c.Cfg.Subagents.Provider
-			if sp.APIKeyEnv != "" {
-				subAPIKey = os.Getenv(sp.APIKeyEnv)
-			}
-		}
-	}
-	if c.Cfg.Subagents.Model != "" {
-		subModel = c.Cfg.Subagents.Model
-	}
+	subModel := c.Cfg.Subagents.Model
 
 	tt := newTaskTool(taskToolConfig{
-		Loader:          loader,
-		ParentStore:     store,
-		BaseRegistry:    registry,
-		MaxConcurrent:   c.Cfg.Subagents.MaxConcurrent,
-		TaggedEvents:    taggedEvts,
-		ProviderName:    c.Cfg.DefaultModel.Provider,
-		Model:           modelID,
-		BaseURL:         prov.BaseURL,
-		APIKey:          apiKey,
-		SubProviderName: subProvName,
-		SubModel:        subModel,
-		SubBaseURL:      subBaseURL,
-		SubAPIKey:       subAPIKey,
-		ToolsConfig:     c.Cfg.Tools,
-		HomeDir:         c.Home,
-		ProcMgr:         procMgr,
+		Loader:        loader,
+		ParentStore:   store,
+		BaseRegistry:  registry,
+		MaxConcurrent: c.Cfg.Subagents.MaxConcurrent,
+		TaggedEvents:  taggedEvts,
+		ModelCatalog:  modelCatalog,
+		ProviderName:  defaultRef.Provider,
+		Model:         defaultRef.Model,
+		SubModel:      subModel,
+		ToolsConfig:   c.Cfg.Tools,
+		HomeDir:       c.Home,
+		ProcMgr:       procMgr,
 	})
 	registry.Register(tt)
 	a.subagentLoader = loader
@@ -258,7 +270,7 @@ func New(c Config) (*Agent, error) {
 	asm := prompt.New(c.ProjectRoot, c.Home)
 	res := asm.Assemble()
 	a.assembler = asm
-	a.pendingWarnings = res.Warnings
+	a.pendingWarnings = append(res.Warnings, catalogWarningsToPromptWarnings(catalogWarnings)...)
 
 	l := loop.New(client, registry, res.Prompt)
 	l.SetEvents(events)
@@ -480,13 +492,15 @@ func (a *Agent) dispatchTaggedEvent(tev TaggedLoopEvent) {
 }
 
 func (a *Agent) recordUsage(ev loop.Event) {
-	a.tokensMu.Lock()
-	prov := a.currentProvider
+	ref := a.currentRef
+	prov := ref.Provider
 	model := ev.Model
 	if model == "" {
-		model = a.currentModel
+		model = ref.Model
 	}
 	key := prov + "/" + model
+
+	a.tokensMu.Lock()
 	if a.tokens == nil {
 		a.tokens = map[string]*TokenEntry{}
 	}
@@ -662,26 +676,22 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 }
 
 func (a *Agent) summarizerClientAndWindow() (*provider.Client, int) {
-	provName := a.cfg.Compaction.SummarizerProvider
-	model := a.cfg.Compaction.SummarizerModel
-	if provName == "" {
-		provName = a.currentProvider
+	ref := a.currentRef
+	if a.cfg.Compaction.SummarizerModel != "" {
+		parsed, err := catalog.ParseModelRef(a.cfg.Compaction.SummarizerModel)
+		if err == nil {
+			ref = parsed
+		}
 	}
-	if model == "" {
-		model = a.currentModel
+
+	client, model, err := newProviderClient(a.catalog, ref)
+	if err != nil && ref != a.currentRef {
+		client, model, err = newProviderClient(a.catalog, a.currentRef)
 	}
-	prov, ok := a.cfg.Providers[provName]
-	if !ok {
-		prov = a.cfg.Providers[a.currentProvider]
-		provName = a.currentProvider
+	if err != nil {
+		return provider.New(nil, nil, ""), 0
 	}
-	var apiKey string
-	if prov.APIKeyEnv != "" {
-		apiKey = os.Getenv(prov.APIKeyEnv)
-	}
-	client := provider.New(prov.BaseURL, apiKey, model)
-	window := resolveContextWindow(client, a.cfg, provName, model, a.home)
-	return client, window
+	return client, model.ContextWindow
 }
 
 // CompactNow triggers manual compaction. Must not be called while busy.
@@ -734,6 +744,14 @@ func (a *Agent) resumeMostRecent() error {
 	}
 	a.populateFileTracker()
 	a.loadTokensFromDisk()
+	a.mu.Lock()
+	if err := a.reloadLocked(); err != nil {
+		a.mu.Unlock()
+		fmt.Fprintf(os.Stderr, "lightcode: reload config on resume: %v\n", err)
+		a.restoreModelFromSession()
+		return nil
+	}
+	a.mu.Unlock()
 	a.restoreModelFromSession()
 	return nil
 }
@@ -811,22 +829,14 @@ func (a *Agent) restoreModelFromSession() {
 	if err != nil || meta.Provider == "" || meta.Model == "" {
 		return
 	}
-	prov, ok := a.cfg.Providers[meta.Provider]
-	if !ok {
+	ref := catalog.ModelRef{Provider: meta.Provider, Model: meta.Model}
+	client, model, err := newProviderClient(a.catalog, ref)
+	if err != nil {
 		return
 	}
-	var apiKey string
-	if prov.APIKeyEnv != "" {
-		apiKey = os.Getenv(prov.APIKeyEnv)
-		if apiKey == "" {
-			return
-		}
-	}
-	client := provider.New(prov.BaseURL, apiKey, meta.Model)
 	a.lp.SetClient(client)
-	a.currentProvider = meta.Provider
-	a.currentModel = meta.Model
-	a.contextWindowSize = resolveContextWindow(client, a.cfg, meta.Provider, meta.Model, a.home)
+	a.currentRef = ref
+	a.contextWindowSize = model.ContextWindow
 }
 
 func (a *Agent) loadHistoryIntoLoop() error {
@@ -894,6 +904,9 @@ func (a *Agent) ensureSession() error {
 	if a.store.Active() {
 		return nil
 	}
+	if err := a.reloadLocked(); err != nil {
+		return err
+	}
 	proj, err := a.projects.Ensure()
 	if err != nil {
 		return err
@@ -904,7 +917,9 @@ func (a *Agent) ensureSession() error {
 	if err := a.store.BeginNewSession(a.projectRoot); err != nil {
 		return err
 	}
-	_ = a.store.SetModel(a.currentProvider, a.currentModel)
+	if err := a.store.SetModel(a.currentRef.Provider, a.currentRef.Model); err != nil {
+		fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)
+	}
 	a.lp.ResetHistory()
 	if a.fileTracker != nil {
 		a.fileTracker.Reset()
@@ -943,6 +958,10 @@ func (a *Agent) sendMessages(ctx context.Context, contents []string) (int, error
 		a.mu.Unlock()
 		return 0, fmt.Errorf("a turn is already in progress")
 	}
+	if err := a.ensureSession(); err != nil {
+		a.mu.Unlock()
+		return 0, err
+	}
 	a.busy = true
 	a.seenSessions = nil
 	turnCtx, cancel := context.WithCancel(ctx)
@@ -950,31 +969,12 @@ func (a *Agent) sendMessages(ctx context.Context, contents []string) (int, error
 	a.turnCtx = turnCtx
 	a.mu.Unlock()
 
-	if err := a.ensureSession(); err != nil {
-		a.mu.Lock()
-		a.busy = false
-		a.turnCancel = nil
-		a.turnCtx = nil
-		a.mu.Unlock()
-		cancel()
-		return 0, err
-	}
-
 	turn := a.store.BeginTurn()
 
 	a.emitEvent(Event{Kind: EventTurnStart, Turn: turn})
 
 	if a.taskToolInst != nil {
-		prov, ok := a.cfg.Providers[a.currentProvider]
-		var ak string
-		if ok && prov.APIKeyEnv != "" {
-			ak = os.Getenv(prov.APIKeyEnv)
-		}
-		var bu string
-		if ok {
-			bu = prov.BaseURL
-		}
-		a.taskToolInst.updateParentState(a.currentProvider, a.currentModel, bu, ak, cancel)
+		a.taskToolInst.updateParentState(a.currentRef.Provider, a.currentRef.Model, cancel)
 	}
 
 	go func() {
@@ -1066,46 +1066,249 @@ func (a *Agent) SaveProjectPermission(id string, patterns []string) error {
 	return a.gate.Respond(id, true)
 }
 
-// SwitchModel changes the active provider and model.
-func (a *Agent) SwitchModel(providerName, model string) error {
+// SwitchModel changes the active model by provider-prefixed catalog ref.
+func (a *Agent) SwitchModel(refStr string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.busy {
 		return fmt.Errorf("cannot switch model while a turn is running")
 	}
-	prov, ok := a.cfg.Providers[providerName]
-	if !ok {
-		return fmt.Errorf("unknown provider %q", providerName)
+	ref, err := catalog.ParseModelRef(refStr)
+	if err != nil {
+		return err
 	}
-	var apiKey string
-	if prov.APIKeyEnv != "" {
-		apiKey = os.Getenv(prov.APIKeyEnv)
-		if apiKey == "" {
-			return fmt.Errorf("env var %s is unset for provider %q", prov.APIKeyEnv, providerName)
+	client, model, err := newProviderClient(a.catalog, ref)
+	if err != nil {
+		if !errors.Is(err, catalog.ErrUnknownModel) || a.refreshDiscoveryLocked(ref.Provider) != nil {
+			return err
+		}
+		client, model, err = newProviderClient(a.catalog, ref)
+		if err != nil {
+			return err
 		}
 	}
-	client := provider.New(prov.BaseURL, apiKey, model)
 	a.lp.SetClient(client)
-	a.currentProvider = providerName
-	a.currentModel = model
-	a.contextWindowSize = resolveContextWindow(client, a.cfg, providerName, model, a.home)
-	a.lp.AppendSignal(fmt.Sprintf("<system-signal>Model switched to %s (%s)</system-signal>", model, providerName))
+	a.currentRef = ref
+	a.contextWindowSize = model.ContextWindow
+	a.lp.AppendSignal(fmt.Sprintf("<system-signal>Model switched to %s</system-signal>", ref.String()))
 	if a.store.Active() {
-		_ = a.store.SetModel(providerName, model)
+		if err := a.store.SetModel(ref.Provider, ref.Model); err != nil {
+			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)
+		}
 	}
 	return nil
 }
 
-// CurrentModel returns the active provider and model.
-func (a *Agent) CurrentModel() ModelInfo {
-	return ModelInfo{Provider: a.currentProvider, Model: a.currentModel}
+// Reload reloads config and catalog state for future turns.
+func (a *Agent) Reload() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.busy {
+		return fmt.Errorf("cannot reload while a turn is running")
+	}
+	return a.reloadLocked()
 }
 
-// ModelList returns all configured providers and their models.
-func (a *Agent) ModelList() []ProviderModels {
-	var result []ProviderModels
-	for name, prov := range a.cfg.Providers {
-		result = append(result, ProviderModels{Provider: name, Models: prov.Models})
+func (a *Agent) reloadLocked() error {
+	cfg, err := config.Load(agentConfigPath(a.home))
+	if err != nil {
+		return err
+	}
+	modelCatalog, catalogWarnings, err := catalog.NewLoader(a.home, nil).Load()
+	if err != nil {
+		return fmt.Errorf("load model catalog: %w", err)
+	}
+
+	ref := a.currentRef
+	if _, _, err := modelCatalog.Lookup(ref); err != nil {
+		ref, err = catalog.ParseModelRef(cfg.DefaultModel)
+		if err != nil {
+			return fmt.Errorf("default_model: %w", err)
+		}
+	}
+	client, model, err := newProviderClient(modelCatalog, ref)
+	if err != nil {
+		return err
+	}
+
+	a.cfg = cfg
+	a.catalog = modelCatalog
+	if a.taskToolInst != nil {
+		a.taskToolInst.setCatalog(modelCatalog)
+		a.taskToolInst.setSubModel(cfg.Subagents.Model)
+	}
+	a.lp.SetClient(client)
+	a.currentRef = ref
+	a.contextWindowSize = model.ContextWindow
+	a.emitWarnings(catalogWarningsToPromptWarnings(catalogWarnings))
+	return nil
+}
+
+type ModelCompletion struct {
+	ContextWindow   int `json:"context_window"`
+	MaxOutputTokens int `json:"max_output_tokens"`
+}
+
+func (a *Agent) CompleteModelEntry(refStr string, completion ModelCompletion) error {
+	ref, err := catalog.ParseModelRef(refStr)
+	if err != nil {
+		return err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.busy {
+		return fmt.Errorf("cannot complete model entry while a turn is running")
+	}
+
+	path := agentConfigPath(a.home)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("parse config %s: %w", path, err)
+	}
+	providers, ok := root["providers"].(map[string]any)
+	if !ok {
+		providers = map[string]any{}
+		root["providers"] = providers
+	}
+	providerRaw, ok := providers[ref.Provider]
+	if !ok {
+		providerRaw = map[string]any{}
+		providers[ref.Provider] = providerRaw
+	}
+	providerMap, ok := providerRaw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("providers.%s must be an object", ref.Provider)
+	}
+	modelsRaw, ok := providerMap["models"]
+	if !ok {
+		modelsRaw = map[string]any{}
+		providerMap["models"] = modelsRaw
+	}
+	modelsMap, ok := modelsRaw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("providers.%s.models must be an object", ref.Provider)
+	}
+	modelRaw, ok := modelsMap[ref.Model]
+	if !ok {
+		modelRaw = map[string]any{}
+		modelsMap[ref.Model] = modelRaw
+	}
+	modelMap, ok := modelRaw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("providers.%s.models.%s must be an object", ref.Provider, ref.Model)
+	}
+	if completion.ContextWindow > 0 {
+		modelMap["context_window"] = completion.ContextWindow
+	}
+	if completion.MaxOutputTokens > 0 {
+		modelMap["max_output_tokens"] = completion.MaxOutputTokens
+	}
+	if err := writeAgentConfigAtomic(path, root); err != nil {
+		return err
+	}
+	return a.reloadLocked()
+}
+
+func agentConfigPath(home string) string {
+	return filepath.Join(home, ".lightcode", "config.json")
+}
+
+func writeAgentConfigAtomic(path string, value any) error {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
+// RefreshDiscovery refreshes live model discovery for one enabled provider.
+func (a *Agent) RefreshDiscovery(provider string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.busy {
+		return fmt.Errorf("cannot refresh discovery while a turn is running")
+	}
+	return a.refreshDiscoveryLocked(provider)
+}
+
+func (a *Agent) refreshDiscoveryLocked(provider string) error {
+	warnings := catalog.RefreshProviderDiscovery(context.Background(), a.home, a.catalog, provider)
+	if len(warnings) == 0 {
+		return nil
+	}
+	a.emitWarnings(catalogWarningsToPromptWarnings(warnings))
+	return fmt.Errorf("refresh discovery for %s: %s", provider, warnings[0].Message)
+}
+
+// CurrentModel returns the active model identity and catalog metadata.
+func (a *Agent) CurrentModel() ModelInfo {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.modelInfo(a.currentRef)
+}
+
+// ModelList returns all visible catalog models as flat enriched entries.
+func (a *Agent) ModelList() []ModelListEntry {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	refs := a.catalog.VisibleModels()
+	result := make([]ModelListEntry, 0, len(refs))
+	for _, ref := range refs {
+		prov, model, err := a.catalog.LookupOrIncomplete(ref)
+		if err != nil {
+			continue
+		}
+		displayName := model.Name
+		if displayName == "" {
+			displayName = model.ID
+		}
+		providerName := prov.Name
+		if providerName == "" {
+			providerName = prov.ID
+		}
+		_, incomplete := model.Incomplete()
+		result = append(result, ModelListEntry{
+			Ref:           ref.String(),
+			Provider:      ref.Provider,
+			ProviderName:  providerName,
+			Model:         ref.Model,
+			DisplayName:   displayName,
+			ContextWindow: model.ContextWindow,
+			Cost:          model.Cost,
+			Hidden:        model.Hidden || prov.Hidden,
+			Incomplete:    incomplete,
+		})
 	}
 	return result
 }
@@ -1207,6 +1410,9 @@ func (a *Agent) SessionSwitch(id string) error {
 	}
 	a.populateFileTracker()
 	a.loadTokensFromDisk()
+	if err := a.reloadLocked(); err != nil {
+		return err
+	}
 	a.restoreModelFromSession()
 	a.tokensMu.Lock()
 	a.lastContextUsed = 0
@@ -1588,77 +1794,52 @@ func (a *Agent) ProjectList() ([]ProjectSummary, error) {
 	return out, nil
 }
 
-func contextWindowFromConfig(cfg *config.Config, provName, model string) int {
-	prov, ok := cfg.Providers[provName]
-	if !ok {
-		return 0
-	}
-	return prov.ContextWindows[model]
-}
-
-func resolveContextWindow(client *provider.Client, cfg *config.Config, provName, model, home string) int {
-	cacheKey := provName + "/" + model
-	fromCfg := contextWindowFromConfig(cfg, provName, model)
-
-	// Check disk cache first.
-	cached := loadCachedContextWindow(home, cacheKey)
-	if cached > 0 {
-		if fromCfg > 0 && fromCfg < cached {
-			return fromCfg
-		}
-		return cached
-	}
-
-	// Try API.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	fromAPI := client.FetchContextWindow(ctx)
-
-	if fromAPI > 0 {
-		saveCachedContextWindow(home, cacheKey, fromAPI)
-		if fromCfg > 0 && fromCfg < fromAPI {
-			return fromCfg
-		}
-		return fromAPI
-	}
-
-	if fromCfg > 0 {
-		return fromCfg
-	}
-	return 262144
-}
-
-func contextWindowCachePath(home string) string {
-	return filepath.Join(home, ".lightcode", "context_windows.json")
-}
-
-func loadCachedContextWindow(home, key string) int {
-	data, err := os.ReadFile(contextWindowCachePath(home))
+func (a *Agent) modelInfo(ref catalog.ModelRef) ModelInfo {
+	info := ModelInfo{Ref: ref.String(), Provider: ref.Provider, Model: ref.Model, Incomplete: true}
+	_, model, err := a.catalog.LookupOrIncomplete(ref)
 	if err != nil {
-		return 0
+		return info
 	}
-	var cache map[string]int
-	if json.Unmarshal(data, &cache) != nil {
-		return 0
+	info.DisplayName = model.Name
+	if info.DisplayName == "" {
+		info.DisplayName = model.ID
 	}
-	return cache[key]
+	info.ContextWindow = model.ContextWindow
+	info.Cost = model.Cost
+	_, info.Incomplete = model.Incomplete()
+	return info
 }
 
-func saveCachedContextWindow(home, key string, value int) {
-	path := contextWindowCachePath(home)
-	var cache map[string]int
-	if data, err := os.ReadFile(path); err == nil {
-		json.Unmarshal(data, &cache)
-	}
-	if cache == nil {
-		cache = map[string]int{}
-	}
-	cache[key] = value
-	data, err := json.MarshalIndent(cache, "", "  ")
+func newProviderClient(cat *catalog.Catalog, ref catalog.ModelRef) (*provider.Client, *catalog.Model, error) {
+	prov, model, err := cat.Lookup(ref)
 	if err != nil {
-		return
+		return nil, nil, err
 	}
-	_ = os.WriteFile(path, append(data, '\n'), 0o600)
+	var apiKey string
+	if prov.Transport.APIKeyEnv != "" {
+		apiKey = os.Getenv(prov.Transport.APIKeyEnv)
+		if apiKey == "" {
+			return nil, nil, fmt.Errorf("%w: %s (for provider %q)", config.ErrMissingEnvVar, prov.Transport.APIKeyEnv, ref.Provider)
+		}
+	}
+	return provider.New(prov, model, apiKey), model, nil
+}
+
+func catalogWarningsToPromptWarnings(warnings []catalog.Warning) []prompt.Warning {
+	out := make([]prompt.Warning, 0, len(warnings))
+	for _, w := range warnings {
+		message := w.Message
+		if message == "" {
+			message = w.Kind
+		}
+		if w.Provider != "" && w.Model != "" {
+			message = fmt.Sprintf("%s/%s: %s", w.Provider, w.Model, message)
+		} else if w.Provider != "" {
+			message = fmt.Sprintf("%s: %s", w.Provider, message)
+		}
+		out = append(out, prompt.Warning{Kind: "catalog_" + w.Kind, Message: message})
+	}
+	return out
 }
 
 func metaState(s string) string {
@@ -1690,4 +1871,15 @@ func (a *snapshotDiagAdapter) ListTurns() ([]tool.DiagTurnEntry, error) {
 		out[i] = tool.DiagTurnEntry{Turn: t.Turn, Files: files}
 	}
 	return out, nil
+}
+
+func autoSelectModel(cat *catalog.Catalog) (catalog.ModelRef, bool) {
+	refs := cat.VisibleModels()
+	if len(refs) == 0 {
+		refs = cat.AllModels()
+	}
+	if len(refs) == 0 {
+		return catalog.ModelRef{}, false
+	}
+	return refs[0], true
 }

@@ -1,0 +1,86 @@
+{
+  "id": "openrouter",
+  "name": "OpenRouter",
+  "transport": {
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "headers": {
+      "HTTP-Referer": "https://github.com/MMinasyan/lightcode",
+      "X-Title": "Lightcode"
+    }
+  },
+  "system_role": "system",
+  "usage_in_stream": true,
+  "discovery": true,
+  "models": {
+    "qwen/qwen3.6-plus": {
+      "name": "Qwen: Qwen3.6 Plus",
+      "context_window": 1000000,
+      "max_output_tokens": 65536,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 0.325,
+        "output": 1.95,
+        "cache_write": 0.4063,
+        "cache_read": 0.0325
+      }
+    },
+    "qwen/qwen3.6-flash": {
+      "name": "Qwen: Qwen3.6 Flash",
+      "context_window": 1000000,
+      "max_output_tokens": 65536,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 0.25,
+        "output": 1.5,
+        "cache_write": 0.3125,
+        "cache_read": 0.025
+      }
+    },
+    "deepseek/deepseek-v4-flash": {
+      "name": "DeepSeek: DeepSeek V4 Flash",
+      "context_window": 1048576,
+      "max_output_tokens": 384000,
+      "input_modalities": [
+        "text"
+      ],
+      "cost": {
+        "input": 0.14,
+        "output": 0.28,
+        "cache_read": 0.0028
+      }
+    },
+    "deepseek/deepseek-v4-pro": {
+      "name": "DeepSeek: DeepSeek V4 Pro",
+      "context_window": 1048576,
+      "max_output_tokens": 384000,
+      "input_modalities": [
+        "text"
+      ],
+      "cost": {
+        "input": 0.435,
+        "output": 0.87,
+        "cache_read": 0.003625
+      }
+    },
+    "z-ai/glm-5.1": {
+      "name": "Z.ai: GLM 5.1",
+      "context_window": 202752,
+      "max_output_tokens": 65535,
+      "input_modalities": [
+        "text"
+      ],
+      "cost": {
+        "input": 1.0499999999999998,
+        "output": 3.5,
+        "cache_read": 0.5249999999999999
+      }
+    }
+  }
+}

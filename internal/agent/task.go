@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/loop"
 	"github.com/MMinasyan/lightcode/internal/provider"
@@ -44,16 +45,12 @@ type taskTool struct {
 	taggedEvents  chan<- TaggedLoopEvent
 
 	mu           sync.Mutex
+	modelCatalog *catalog.Catalog
 	providerName string
 	model        string
-	baseURL      string
-	apiKey       string
 	cancelParent func()
 
-	subProviderName string
-	subModel        string
-	subBaseURL      string
-	subAPIKey       string
+	subModel    string
 
 	toolsConfig config.ToolsConfig
 	homeDir     string
@@ -67,15 +64,11 @@ type taskToolConfig struct {
 	MaxConcurrent int
 	TaggedEvents  chan<- TaggedLoopEvent
 
+	ModelCatalog *catalog.Catalog
 	ProviderName string
 	Model        string
-	BaseURL      string
-	APIKey       string
 
-	SubProviderName string
-	SubModel        string
-	SubBaseURL      string
-	SubAPIKey       string
+	SubModel    string
 
 	ToolsConfig config.ToolsConfig
 	HomeDir     string
@@ -92,14 +85,10 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		baseRegistry:    cfg.BaseRegistry,
 		maxConcurrent:   cfg.MaxConcurrent,
 		taggedEvents:    cfg.TaggedEvents,
+		modelCatalog:    cfg.ModelCatalog,
 		providerName:    cfg.ProviderName,
 		model:           cfg.Model,
-		baseURL:         cfg.BaseURL,
-		apiKey:          cfg.APIKey,
-		subProviderName: cfg.SubProviderName,
 		subModel:        cfg.SubModel,
-		subBaseURL:      cfg.SubBaseURL,
-		subAPIKey:       cfg.SubAPIKey,
 		toolsConfig:     cfg.ToolsConfig,
 		homeDir:         cfg.HomeDir,
 		procMgr:         cfg.ProcMgr,
@@ -217,7 +206,10 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 	}
 
 	registry := t.buildRegistry(at)
-	client := t.resolveClient()
+	client, err := t.resolveClient()
+	if err != nil {
+		return taskResult{index: index, err: err}
+	}
 	sessionID := genSessionID()
 
 	var events chan loop.Event
@@ -277,24 +269,28 @@ func isReadOnlyType(at subagent.AgentType) bool {
 	return true
 }
 
-func (t *taskTool) resolveClient() *provider.Client {
+func (t *taskTool) resolveClient() (*provider.Client, error) {
 	t.mu.Lock()
-	baseURL := t.baseURL
-	apiKey := t.apiKey
-	model := t.model
+	providerName := t.providerName
+	modelID := t.model
+	subModel := t.subModel
+	modelCatalog := t.modelCatalog
 	t.mu.Unlock()
 
-	if t.subBaseURL != "" {
-		baseURL = t.subBaseURL
-	}
-	if t.subAPIKey != "" {
-		apiKey = t.subAPIKey
-	}
-	if t.subModel != "" {
-		model = t.subModel
+	ref := catalog.ModelRef{Provider: providerName, Model: modelID}
+	if subModel != "" {
+		parsed, err := catalog.ParseModelRef(subModel)
+		if err != nil {
+			return nil, err
+		}
+		ref = parsed
 	}
 
-	return provider.New(baseURL, apiKey, model)
+	client, _, err := newProviderClient(modelCatalog, ref)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
 }
 
 func (t *taskTool) forwardEvents(ch <-chan loop.Event, taskIndex int, sessionID, toolCallID string) {
@@ -310,12 +306,22 @@ func (t *taskTool) forwardEvents(ch <-chan loop.Event, taskIndex int, sessionID,
 	}
 }
 
-func (t *taskTool) updateParentState(providerName, model, baseURL, apiKey string, cancelParent func()) {
+func (t *taskTool) updateParentState(providerName, model string, cancelParent func()) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.providerName = providerName
 	t.model = model
-	t.baseURL = baseURL
-	t.apiKey = apiKey
 	t.cancelParent = cancelParent
+}
+
+func (t *taskTool) setCatalog(catalog *catalog.Catalog) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.modelCatalog = catalog
+}
+
+func (t *taskTool) setSubModel(subModel string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.subModel = subModel
 }

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"embed"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -23,21 +22,6 @@ import (
 
 //go:embed all:frontend/dist
 var assets embed.FS
-
-
-const exampleConfigHelp = `Example structure (adjust for your own providers and models):
-
-{
-  "providers": {
-    "openrouter": {
-      "base_url": "https://openrouter.ai/api/v1",
-      "api_key_env": "OPENROUTER_API_KEY",
-      "models": ["openai/gpt-4o-mini"]
-    }
-  },
-  "default_model": { "provider": "openrouter", "model": "openai/gpt-4o-mini" }
-}
-`
 
 func main() {
 	// Subcommand dispatch — serve and acp run in the foreground.
@@ -110,9 +94,6 @@ func buildAgent() (*agent.Agent, error) {
 	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		if errors.Is(err, config.ErrEmptyConfig) {
-			return nil, fmt.Errorf("%w\n\n%s\nEdit %s and run lightcode again", err, exampleConfigHelp, cfgPath)
-		}
 		return nil, err
 	}
 

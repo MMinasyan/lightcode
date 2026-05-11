@@ -1,8 +1,10 @@
-// Package config loads the Lightcode config file and resolves the default
-// model to a provider + API key at request time.
+// Package config loads the Lightcode config file and resolves process-level
+// settings. Provider/model metadata is owned by internal/catalog; this package
+// keeps only the non-provider sections plus provider-prefixed model refs.
 //
-// Phase 1 uses plain JSON per DESIGN.md §5.4. Secrets are read from the
-// environment at request time — never stored on disk, never logged.
+// Secrets are env vars. They are loaded at startup from ~/.lightcode/.env (if
+// present) or inherited from the shell. They are never written to config.json
+// and never logged.
 package config
 
 import (
@@ -11,20 +13,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/permission"
 )
 
-// ErrMissingEnvVar is returned (wrapped) by ResolveDefault when a provider's
-// API key environment variable is required but unset. Callers can use
-// errors.Is(err, ErrMissingEnvVar) to surface a friendlier hint that
-// points at the .env file.
+// ErrMissingEnvVar is returned (wrapped) when a provider's API key environment
+// variable is required but unset. Callers can use errors.Is(err,
+// ErrMissingEnvVar) to surface a friendlier hint that points at the .env file.
 var ErrMissingEnvVar = errors.New("provider API key env var is unset")
 
-// ErrEmptyConfig is returned (wrapped) by Load when the config file has
-// no providers or no default_model set. The user must populate the file
-// before lightcode can run.
-var ErrEmptyConfig = errors.New("config is empty — providers and default_model must be set")
+// ErrEmptyConfig is returned (wrapped) by Load when the config file has no
+// default_model set. The catalog can still provide bundled providers, but the
+// runtime needs an explicit starting model.
+var ErrEmptyConfig = errors.New("config is empty — default_model must be set")
 
 // ConfigPath returns the path where Lightcode expects its main config file.
 // The user owns this file; it is auto-created as an empty skeleton on first
@@ -37,31 +39,14 @@ func ConfigPath() (string, error) {
 	return filepath.Join(home, ".lightcode", "config.json"), nil
 }
 
-// emptyConfigTemplate is written to ~/.lightcode/config.json the first
-// time Lightcode runs. It is a valid but empty skeleton — the user must
-// fill it in with their own providers and default model.
+// emptyConfigTemplate is written to ~/.lightcode/config.json the first time
+// Lightcode runs. It is a valid but empty skeleton — the user must set a
+// provider-prefixed default model before the runtime can start.
 const emptyConfigTemplate = `{
   "providers": {},
-  "default_model": { "provider": "", "model": "" }
+  "default_model": ""
 }
 `
-
-// Provider is one entry in the "providers" map: a base URL, the env var
-// holding its API key, and the list of model IDs available under it.
-type Provider struct {
-	BaseURL        string         `json:"base_url"`
-	APIKeyEnv      string         `json:"api_key_env"`
-	Models         []string       `json:"models"`
-	ContextWindows map[string]int `json:"context_windows,omitempty"`
-}
-
-// ModelRef uniquely identifies a model by the (provider, model) tuple.
-// The same model string can legitimately appear under multiple providers,
-// so neither field alone is a stable identifier.
-type ModelRef struct {
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
-}
 
 // SessionConfig governs the session lifecycle sweep. Defaults: auto_archive
 // on, 7 days → archived, +7 days → deleted.
@@ -73,52 +58,51 @@ type SessionConfig struct {
 
 // CompactionConfig controls context lifecycle management.
 type CompactionConfig struct {
-	Enabled            bool    `json:"enabled"`
-	ThresholdPct       float64 `json:"threshold_pct"`
-	SummarizerProvider string  `json:"summarizer_provider,omitempty"`
-	SummarizerModel    string  `json:"summarizer_model,omitempty"`
+	Enabled         bool    `json:"enabled"`
+	ThresholdPct    float64 `json:"threshold_pct"`
+	SummarizerModel string  `json:"summarizer_model,omitempty"`
 }
 
 // SubagentsConfig controls subagent orchestration.
 type SubagentsConfig struct {
 	MaxConcurrent int    `json:"max_concurrent,omitempty"`
-	Provider      string `json:"provider,omitempty"`
 	Model         string `json:"model,omitempty"`
 }
 
 // ToolsConfig holds limits and timeouts for built-in tools.
 type ToolsConfig struct {
-	MaxOutputBytes       int `json:"max_output_bytes"`
-	ReadMaxLines         int `json:"read_max_lines"`
-	ReadLineMaxChars     int `json:"read_line_max_chars"`
-	CommandTimeout       int `json:"command_timeout"`
+	MaxOutputBytes         int `json:"max_output_bytes"`
+	ReadMaxLines           int `json:"read_max_lines"`
+	ReadLineMaxChars       int `json:"read_line_max_chars"`
+	CommandTimeout         int `json:"command_timeout"`
 	MaxBackgroundProcesses int `json:"max_background_processes"`
 }
 
 func defaultToolsConfig() ToolsConfig {
 	return ToolsConfig{
-		MaxOutputBytes:       15360,
-		ReadMaxLines:         500,
-		ReadLineMaxChars:     5000,
-		CommandTimeout:       120,
+		MaxOutputBytes:         15360,
+		ReadMaxLines:           500,
+		ReadLineMaxChars:       5000,
+		CommandTimeout:         120,
 		MaxBackgroundProcesses: 10,
 	}
 }
 
-// Config is the full config file.
+// Config is the full config file. Providers are retained as raw JSON-ish data
+// so config consumers can round-trip the section, but catalog.Loader is the
+// only code that interprets provider/model metadata.
 type Config struct {
-	Providers    map[string]Provider  `json:"providers"`
-	DefaultModel ModelRef             `json:"default_model"`
-	Sessions     SessionConfig        `json:"sessions"`
-	Compaction   CompactionConfig     `json:"compaction,omitempty"`
-	Subagents    SubagentsConfig      `json:"subagents,omitempty"`
-	Permissions  permission.Rules     `json:"permissions,omitempty"`
-	Tools        ToolsConfig          `json:"tools,omitempty"`
+	Providers    map[string]any   `json:"providers,omitempty"`
+	DefaultModel string           `json:"default_model"`
+	Sessions     SessionConfig    `json:"sessions"`
+	Compaction   CompactionConfig `json:"compaction,omitempty"`
+	Subagents    SubagentsConfig  `json:"subagents,omitempty"`
+	Permissions  permission.Rules `json:"permissions,omitempty"`
+	Tools        ToolsConfig      `json:"tools,omitempty"`
 }
 
-// rawSessionConfig is used to detect which sessions fields were
-// present in the on-disk JSON, so absent fields get defaults rather
-// than zero values (e.g., 0 days would archive sessions instantly).
+// rawSessionConfig is used to detect which sessions fields were present in the
+// on-disk JSON, so absent fields get defaults rather than zero values.
 type rawSessionConfig struct {
 	AutoArchive            *bool `json:"auto_archive"`
 	ArchiveAfterDays       *int  `json:"archive_after_days"`
@@ -135,10 +119,9 @@ func defaultSessionConfig() SessionConfig {
 }
 
 type rawCompactionConfig struct {
-	Enabled            *bool    `json:"enabled"`
-	ThresholdPct       *float64 `json:"threshold_pct"`
-	SummarizerProvider *string  `json:"summarizer_provider"`
-	SummarizerModel    *string  `json:"summarizer_model"`
+	Enabled         *bool    `json:"enabled"`
+	ThresholdPct    *float64 `json:"threshold_pct"`
+	SummarizerModel *string  `json:"summarizer_model"`
 }
 
 func defaultCompactionConfig() CompactionConfig {
@@ -148,10 +131,10 @@ func defaultCompactionConfig() CompactionConfig {
 	}
 }
 
-// Load reads and parses the config file at path. If the file does not
-// exist, Load creates it with an empty skeleton and returns ErrEmptyConfig
-// so the caller can show the user what to put in it. If the file exists
-// but has no providers or no default_model, ErrEmptyConfig is returned too.
+// Load reads and parses the config file at path. If the file does not exist,
+// Load creates it with an empty skeleton and returns ErrEmptyConfig so the
+// caller can show the user what to put in it. Old provider/model tuple config
+// shapes are rejected with explicit cutover errors; no migration is attempted.
 func Load(path string) (*Config, error) {
 	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -166,24 +149,30 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
+	if err := rejectOldShape(data); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+
 	var c Config
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
+	if c.Providers == nil {
+		c.Providers = map[string]any{}
+	}
 
 	type rawSubagentsConfig struct {
 		MaxConcurrent *int    `json:"max_concurrent"`
-		Provider      *string `json:"provider"`
 		Model         *string `json:"model"`
 	}
 
-	// Apply sessions defaults for any absent fields.
 	var raw struct {
-		Sessions   *rawSessionConfig   `json:"sessions"`
+		Sessions   *rawSessionConfig    `json:"sessions"`
 		Compaction *rawCompactionConfig `json:"compaction"`
 		Subagents  *rawSubagentsConfig  `json:"subagents"`
 	}
 	_ = json.Unmarshal(data, &raw)
+
 	c.Sessions = defaultSessionConfig()
 	if raw.Sessions != nil {
 		if raw.Sessions.AutoArchive != nil {
@@ -196,6 +185,7 @@ func Load(path string) (*Config, error) {
 			c.Sessions.DeleteAfterArchiveDays = *raw.Sessions.DeleteAfterArchiveDays
 		}
 	}
+
 	c.Compaction = defaultCompactionConfig()
 	if raw.Compaction != nil {
 		if raw.Compaction.Enabled != nil {
@@ -203,9 +193,6 @@ func Load(path string) (*Config, error) {
 		}
 		if raw.Compaction.ThresholdPct != nil {
 			c.Compaction.ThresholdPct = *raw.Compaction.ThresholdPct
-		}
-		if raw.Compaction.SummarizerProvider != nil {
-			c.Compaction.SummarizerProvider = *raw.Compaction.SummarizerProvider
 		}
 		if raw.Compaction.SummarizerModel != nil {
 			c.Compaction.SummarizerModel = *raw.Compaction.SummarizerModel
@@ -217,79 +204,136 @@ func Load(path string) (*Config, error) {
 		if raw.Subagents.MaxConcurrent != nil {
 			c.Subagents.MaxConcurrent = *raw.Subagents.MaxConcurrent
 		}
-		if raw.Subagents.Provider != nil {
-			c.Subagents.Provider = *raw.Subagents.Provider
-		}
 		if raw.Subagents.Model != nil {
 			c.Subagents.Model = *raw.Subagents.Model
 		}
 	}
 
 	type rawToolsConfig struct {
-		MaxOutputBytes       *int `json:"max_output_bytes"`
-		ReadMaxLines         *int `json:"read_max_lines"`
-		ReadLineMaxChars     *int `json:"read_line_max_chars"`
-		CommandTimeout       *int `json:"command_timeout"`
+		MaxOutputBytes         *int `json:"max_output_bytes"`
+		ReadMaxLines           *int `json:"read_max_lines"`
+		ReadLineMaxChars       *int `json:"read_line_max_chars"`
+		CommandTimeout         *int `json:"command_timeout"`
 		MaxBackgroundProcesses *int `json:"max_background_processes"`
 	}
-	var rawTools rawToolsConfig
-	_ = json.Unmarshal(data, &struct {
+	var rawToolsRoot struct {
 		Tools *rawToolsConfig `json:"tools"`
-	}{Tools: &rawTools})
+	}
+	_ = json.Unmarshal(data, &rawToolsRoot)
 	c.Tools = defaultToolsConfig()
-	if rawTools.MaxOutputBytes != nil {
-		c.Tools.MaxOutputBytes = *rawTools.MaxOutputBytes
-	}
-	if rawTools.ReadMaxLines != nil {
-		c.Tools.ReadMaxLines = *rawTools.ReadMaxLines
-	}
-	if rawTools.ReadLineMaxChars != nil {
-		c.Tools.ReadLineMaxChars = *rawTools.ReadLineMaxChars
-	}
-	if rawTools.CommandTimeout != nil {
-		c.Tools.CommandTimeout = *rawTools.CommandTimeout
-	}
-	if rawTools.MaxBackgroundProcesses != nil {
-		c.Tools.MaxBackgroundProcesses = *rawTools.MaxBackgroundProcesses
-	}
-
-	if len(c.Providers) == 0 || c.DefaultModel.Provider == "" || c.DefaultModel.Model == "" {
-		return &c, fmt.Errorf("%w: %s", ErrEmptyConfig, path)
+	if rawToolsRoot.Tools != nil {
+		if rawToolsRoot.Tools.MaxOutputBytes != nil {
+			c.Tools.MaxOutputBytes = *rawToolsRoot.Tools.MaxOutputBytes
+		}
+		if rawToolsRoot.Tools.ReadMaxLines != nil {
+			c.Tools.ReadMaxLines = *rawToolsRoot.Tools.ReadMaxLines
+		}
+		if rawToolsRoot.Tools.ReadLineMaxChars != nil {
+			c.Tools.ReadLineMaxChars = *rawToolsRoot.Tools.ReadLineMaxChars
+		}
+		if rawToolsRoot.Tools.CommandTimeout != nil {
+			c.Tools.CommandTimeout = *rawToolsRoot.Tools.CommandTimeout
+		}
+		if rawToolsRoot.Tools.MaxBackgroundProcesses != nil {
+			c.Tools.MaxBackgroundProcesses = *rawToolsRoot.Tools.MaxBackgroundProcesses
+		}
 	}
 
 	return &c, nil
 }
 
-// ResolveDefault looks up the default model, validates it against the
-// provider's model list, and reads the API key from the environment.
-// Returns the provider config, the model ID to pass to the API, and the
-// resolved API key.
-func (c *Config) ResolveDefault() (Provider, string, string, error) {
-	ref := c.DefaultModel
-
-	prov, ok := c.Providers[ref.Provider]
-	if !ok {
-		return Provider{}, "", "", fmt.Errorf("default_model.provider %q is not defined in providers", ref.Provider)
+func rejectOldShape(data []byte) error {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil
 	}
 
-	found := false
-	for _, m := range prov.Models {
-		if m == ref.Model {
-			found = true
-			break
+	if raw, ok := root["default_model"]; ok {
+		model, err := stringField(raw)
+		if err != nil {
+			return fmt.Errorf("default_model must be a provider-prefixed string like %q; old {provider, model} object shape is no longer supported", "openai/gpt-5.4-mini")
 		}
-	}
-	if !found {
-		return Provider{}, "", "", fmt.Errorf("default_model.model %q is not listed under provider %q", ref.Model, ref.Provider)
-	}
-
-	var apiKey string
-	if prov.APIKeyEnv != "" {
-		apiKey = os.Getenv(prov.APIKeyEnv)
-		if apiKey == "" {
-			return Provider{}, "", "", fmt.Errorf("%w: %s (for provider %q)", ErrMissingEnvVar, prov.APIKeyEnv, ref.Provider)
+		if err := validateModelRefField("default_model", model); err != nil {
+			return err
 		}
 	}
 
-	return prov, ref.Model, apiKey, nil
+	if raw, ok := root["compaction"]; ok {
+		var compaction map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &compaction); err == nil && compaction != nil {
+			if _, exists := compaction["summarizer_provider"]; exists {
+				return fmt.Errorf("compaction.summarizer_provider is no longer supported; use compaction.summarizer_model as a provider-prefixed string like %q", "openai/gpt-5.4-mini")
+			}
+			if rawModel, exists := compaction["summarizer_model"]; exists {
+				model, err := stringField(rawModel)
+				if err != nil {
+					return fmt.Errorf("compaction.summarizer_model must be a provider-prefixed string like %q", "openai/gpt-5.4-mini")
+				}
+				if err := validateModelRefField("compaction.summarizer_model", model); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	if raw, ok := root["subagents"]; ok {
+		var subagents map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &subagents); err == nil && subagents != nil {
+			if _, exists := subagents["provider"]; exists {
+				return fmt.Errorf("subagents.provider is no longer supported; use subagents.model as a provider-prefixed string like %q", "openai/gpt-5.4-mini")
+			}
+			if rawModel, exists := subagents["model"]; exists {
+				model, err := stringField(rawModel)
+				if err != nil {
+					return fmt.Errorf("subagents.model must be a provider-prefixed string like %q", "openai/gpt-5.4-mini")
+				}
+				if err := validateModelRefField("subagents.model", model); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	if raw, ok := root["providers"]; ok {
+		var providers map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &providers); err == nil {
+			for providerID, providerRaw := range providers {
+				var provider map[string]json.RawMessage
+				if err := json.Unmarshal(providerRaw, &provider); err != nil || provider == nil {
+					continue
+				}
+				if _, exists := provider["context_windows"]; exists {
+					return fmt.Errorf("providers.%s.context_windows is no longer supported; put context_window on each model entry", providerID)
+				}
+				if modelsRaw, exists := provider["models"]; exists && !isJSONObject(modelsRaw) {
+					return fmt.Errorf("providers.%s.models must be an object keyed by model id, not the old array shape", providerID)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func stringField(raw json.RawMessage) (string, error) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", err
+	}
+	return s, nil
+}
+
+func validateModelRefField(field, value string) error {
+	if value == "" {
+		return nil
+	}
+	provider, model, ok := strings.Cut(value, "/")
+	if !ok || provider == "" || model == "" {
+		return fmt.Errorf("%s must be a provider-prefixed string like %q", field, "openai/gpt-5.4-mini")
+	}
+	return nil
+}
+
+func isJSONObject(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	return strings.HasPrefix(trimmed, "{")
 }

@@ -1,0 +1,47 @@
+{
+  "id": "openai",
+  "name": "OpenAI",
+  "transport": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY"
+  },
+  "system_role": "system",
+  "usage_in_stream": true,
+  "max_tokens_field": "max_completion_tokens",
+  "discovery": true,
+  "models": {
+    "gpt-5.5": {
+      "name": "GPT-5.5",
+      "context_window": 1050000,
+      "max_output_tokens": 128000,
+      "input_modalities": ["text", "image"],
+      "cost": {
+        "input": 5.00,
+        "output": 30.00,
+        "cache_read": 0.50
+      }
+    },
+    "gpt-5.4": {
+      "name": "GPT-5.4",
+      "context_window": 1050000,
+      "max_output_tokens": 128000,
+      "input_modalities": ["text", "image"],
+      "cost": {
+        "input": 2.50,
+        "output": 15.00,
+        "cache_read": 0.25
+      }
+    },
+    "gpt-5.4-mini": {
+      "name": "GPT-5.4 mini",
+      "context_window": 400000,
+      "max_output_tokens": 128000,
+      "input_modalities": ["text", "image"],
+      "cost": {
+        "input": 0.75,
+        "output": 4.50,
+        "cache_read": 0.075
+      }
+    }
+  }
+}

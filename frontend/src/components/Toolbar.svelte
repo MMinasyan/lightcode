@@ -1,7 +1,5 @@
 <script>
   import { createEventDispatcher } from 'svelte';
-  export let provider = '';
-  export let model = '';
   export let sessionId = '';
   export let projectName = '';
   export let tokens = { total: { cache:0, input:0, output:0, known:true }, perModel: [], contextUsed: 0, contextWindow: 0 };

@@ -531,14 +531,13 @@ func (s *Server) handleModelCurrent(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleModelSwitch(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Provider string `json:"provider"`
-		Model    string `json:"model"`
+		Ref string `json:"ref"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	if err := s.agent.SwitchModel(body.Provider, body.Model); err != nil {
+	if err := s.agent.SwitchModel(body.Ref); err != nil {
 		jsonError(w, err.Error(), http.StatusConflict)
 		return
 	}

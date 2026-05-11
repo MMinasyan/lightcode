@@ -43,8 +43,7 @@ type CLI struct {
 	readKeyFn func() (keyMsg, error)
 	ctx       context.Context
 
-	provider string
-	model    string
+	modelRef string
 
 	animStop  chan struct{}
 	animLabel string
@@ -747,8 +746,10 @@ func terminalRowsForText(text string, width int) int {
 
 func (c *CLI) refreshState() {
 	m := c.agent.CurrentModel()
-	c.provider = m.Provider
-	c.model = m.Model
+	c.modelRef = m.Ref
+	if c.modelRef == "" && m.Provider != "" && m.Model != "" {
+		c.modelRef = m.Provider + "/" + m.Model
+	}
 }
 
 func (c *CLI) currentWidth() int {
@@ -785,7 +786,7 @@ func (c *CLI) printHeaderLocked() {
 	if sid == "" {
 		sid = "(no session)"
 	}
-	header := fmt.Sprintf("  %s  %s  %s", c.agent.ProjectName(), sid, c.model)
+	header := fmt.Sprintf("  %s  %s  %s", c.agent.ProjectName(), sid, c.modelRef)
 	c.printLineLocked(colorDim + header + colorReset)
 	c.printLineLocked("")
 }

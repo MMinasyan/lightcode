@@ -53,8 +53,7 @@
   let messageQueue = [];
   let busy = false;
   let status = 'idle';
-  let provider = '';
-  let model = '';
+  let modelRef = '';
   let sessionId = '';
   let projectName = '';
   let currentTurn = 0;
@@ -87,8 +86,7 @@
   onMount(async () => {
     try {
       const r = await CurrentModel();
-      provider = r.provider || '';
-      model = r.model || '';
+      modelRef = r.ref || ((r.provider && r.model) ? `${r.provider}/${r.model}` : '');
     } catch (e) { console.error(e); }
 
     try { projectName = await ProjectName(); } catch (e) { console.error(e); }
@@ -236,7 +234,7 @@
     catch (err) { messages = [...messages, { _id: mid(), type: 'error', content: err.toString() }]; busy = false; }
   }
 
-  function handleModelSwitched(e) { provider = e.detail.provider; model = e.detail.model; showModelSelector = false; }
+  function handleModelSwitched(e) { modelRef = e.detail.ref; showModelSelector = false; }
 
   async function handleRevertCode(e) {
     const { turn, alsoRevertCode } = e.detail;
@@ -277,7 +275,7 @@
 <svelte:window on:keydown={handleKeydown} />
 
 <main class="app" style="--scale:{$settings.fontScale / 100}">
-  <Toolbar {provider} {model} {sessionId} {projectName} {tokens} {compacting} {busy} {warnings}
+  <Toolbar {sessionId} {projectName} {tokens} {compacting} {busy} {warnings}
     on:openModelSelector={() => showModelSelector=true}
     on:openTokens={() => showTokens=true}
     on:compact={handleCompact}
@@ -301,10 +299,10 @@
     {/if}
   </div>
   <InputArea bind:this={inputArea} {busy} on:submit={handleSubmit}>
-    <StatusBar {provider} {model} on:openModelSelector={() => showModelSelector=true} />
+    <StatusBar {modelRef} on:openModelSelector={() => showModelSelector=true} />
   </InputArea>
   {#if showModelSelector}
-    <ModelSelector currentProvider={provider} currentModel={model} on:switched={handleModelSwitched} on:close={() => showModelSelector=false} />
+    <ModelSelector currentRef={modelRef} on:switched={handleModelSwitched} on:close={() => showModelSelector=false} />
   {/if}
 
   {#if currentPermission}

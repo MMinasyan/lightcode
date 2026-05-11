@@ -294,35 +294,45 @@ func (c *CLI) showModelMenu() {
 	cur := c.agent.CurrentModel()
 
 	var items []menuItem
-	for _, pm := range models {
-		items = append(items, menuItem{label: pm.Provider, selectable: false})
-		for _, m := range pm.Models {
-			items = append(items, menuItem{
-				label:      m,
-				selectable: true,
-				current:    pm.Provider == cur.Provider && m == cur.Model,
-				group:      pm.Provider,
-				extra:      modelChoice{provider: pm.Provider, model: m},
-			})
+	lastProvider := ""
+	for _, entry := range models {
+		providerLabel := entry.ProviderName
+		if providerLabel == "" {
+			providerLabel = entry.Provider
 		}
+		if entry.Provider != lastProvider {
+			items = append(items, menuItem{label: providerLabel, selectable: false})
+			lastProvider = entry.Provider
+		}
+		label := entry.DisplayName
+		if label == "" {
+			label = entry.Model
+		}
+		items = append(items, menuItem{
+			label:      label,
+			detail:     entry.Ref,
+			selectable: true,
+			current:    entry.Ref == cur.Ref,
+			group:      entry.Provider,
+			extra:      modelChoice{ref: entry.Ref, label: label},
+		})
 	}
 
 	result := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, "Model", items, c.currentWidth())
 	if result.selected >= 0 {
 		choice := result.extra.(modelChoice)
-		if err := c.agent.SwitchModel(choice.provider, choice.model); err != nil {
+		if err := c.agent.SwitchModel(choice.ref); err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
-		c.provider = choice.provider
-		c.model = choice.model
-		c.printLine(renderSystemMsg(fmt.Sprintf("  model switched to %s (%s)", choice.model, choice.provider)))
+		c.modelRef = choice.ref
+		c.printLine(renderSystemMsg(fmt.Sprintf("  model switched to %s", choice.ref)))
 	}
 }
 
 type modelChoice struct {
-	provider string
-	model    string
+	ref   string
+	label string
 }
 
 func (c *CLI) showSessionMenu() {

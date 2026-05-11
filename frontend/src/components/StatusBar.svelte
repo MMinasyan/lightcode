@@ -1,13 +1,14 @@
 <script>
   import { createEventDispatcher } from 'svelte';
-  export let provider = '';
-  export let model = '';
+  export let modelRef = '';
   const dispatch = createEventDispatcher();
+  $: label = modelRef || '-';
+  $: shortLabel = label.length > 30 ? label.slice(0, 30) + '...' : label;
 </script>
 
 <div class="status-bar">
-  <button class="item" on:click={() => dispatch('openModelSelector')}>
-    {(model + ' (' + provider + ')').length > 30 ? (model + ' (' + provider + ')').slice(0, 30) + '...' : model + ' (' + provider + ')'}
+  <button class="item" on:click={() => dispatch('openModelSelector')} title={label}>
+    {shortLabel}
   </button>
 </div>
 

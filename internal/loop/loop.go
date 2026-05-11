@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -424,18 +425,17 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 // text + tool deltas have accumulated with cancelled=true and err=nil,
 // so the caller can persist the partial and exit the turn gracefully.
 func isRetryable(err error) bool {
-	var apiErr *openai.APIError
-	if errors.As(err, &apiErr) {
-		return apiErr.HTTPStatusCode == 429 || apiErr.HTTPStatusCode >= 500
-	}
-	var reqErr *openai.RequestError
-	if errors.As(err, &reqErr) {
-		return reqErr.HTTPStatusCode == 429 || reqErr.HTTPStatusCode >= 500
+	var statusErr *provider.HTTPStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.Retryable()
 	}
 	return false
 }
 
 func (l *Loop) runStream(ctx context.Context) (openai.ChatCompletionMessage, bool, error) {
+	if l.client == nil {
+		return openai.ChatCompletionMessage{}, false, fmt.Errorf("no model configured — set default_model in ~/.lightcode/config.json and an API key in ~/.lightcode/.env")
+	}
 	const maxRetries = 3
 	backoff := 2 * time.Second
 
@@ -449,9 +449,9 @@ func (l *Loop) runStream(ctx context.Context) (openai.ChatCompletionMessage, boo
 			}
 			backoff *= 2
 		}
-		var stream *openai.ChatCompletionStream
+		var stream *provider.Stream
 		var err error
-		stream, err = l.client.ChatStream(ctx, l.messages, l.registry.OpenAITools())
+		stream, err = l.client.ChatStream(ctx, l.messages, l.registry.OpenAITools(), nil)
 		if err != nil {
 			if ctx.Err() != nil {
 				return openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant}, true, nil
@@ -473,7 +473,7 @@ func (l *Loop) runStream(ctx context.Context) (openai.ChatCompletionMessage, boo
 	return openai.ChatCompletionMessage{}, false, lastErr
 }
 
-func (l *Loop) consumeStream(ctx context.Context, stream *openai.ChatCompletionStream) (openai.ChatCompletionMessage, bool, error) {
+func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (openai.ChatCompletionMessage, bool, error) {
 
 	var (
 		contentBuf   strings.Builder
@@ -576,9 +576,16 @@ func (l *Loop) consumeStream(ctx context.Context, stream *openai.ChatCompletionS
 		Content: content,
 	}
 	if len(toolDeltas) > 0 && !cancelled {
-		calls := make([]openai.ToolCall, len(toolDeltas))
-		for idx, tc := range toolDeltas {
-			calls[idx] = *tc
+		indices := make([]int, 0, len(toolDeltas))
+		for idx := range toolDeltas {
+			indices = append(indices, idx)
+		}
+		sort.Ints(indices)
+		calls := make([]openai.ToolCall, 0, len(indices))
+		for _, idx := range indices {
+			if tc := toolDeltas[idx]; tc != nil {
+				calls = append(calls, *tc)
+			}
 		}
 		msg.ToolCalls = calls
 	}
