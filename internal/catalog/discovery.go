@@ -23,8 +23,9 @@ type discoveryResponse struct {
 }
 
 type discoveryCacheFile struct {
-	FetchedAt time.Time                      `json:"fetched_at"`
-	Models    map[string]discoveryCacheModel `json:"models"`
+	FetchedAt   time.Time                      `json:"fetched_at,omitempty"`
+	AttemptedAt time.Time                      `json:"attempted_at,omitempty"`
+	Models      map[string]discoveryCacheModel `json:"models"`
 }
 
 type discoveryCacheModel struct {
@@ -259,38 +260,92 @@ func rawObject(value any) (map[string]any, bool) {
 	return object, ok
 }
 
-// ReadDiscoveryCache reads all on-disk discovery cache files. Stale files are still loaded
-// and their provider IDs are returned so callers can schedule a background refresh.
-func ReadDiscoveryCache(home string) (map[string]DiscoveredProvider, []Warning, []string) {
+// ReadDiscoveryCache reads all on-disk discovery cache files and last-attempt
+// timestamps. Old cache files without attempted_at use fetched_at as the
+// attempt time for backwards compatibility.
+func ReadDiscoveryCache(home string) (map[string]DiscoveredProvider, map[string]time.Time, []Warning) {
 	cache := map[string]DiscoveredProvider{}
+	attempts := map[string]time.Time{}
 	dir := discoveryCacheDir(home)
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
-		return cache, nil, nil
+		return cache, attempts, nil
 	}
 	if err != nil {
-		return cache, []Warning{{Kind: "discovery_failure", Message: fmt.Sprintf("read discovery cache dir: %v", err)}}, nil
+		return cache, attempts, []Warning{{Kind: "discovery_failure", Message: fmt.Sprintf("read discovery cache dir: %v", err)}}
 	}
 	var warnings []Warning
-	var stale []string
-	now := time.Now()
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
 		providerID := strings.TrimSuffix(entry.Name(), ".json")
-		fileCache, fetchedAt, err := readDiscoveryCacheFile(filepath.Join(dir, entry.Name()))
+		fileCache, attemptedAt, err := readDiscoveryCacheFile(filepath.Join(dir, entry.Name()))
 		if err != nil {
 			warnings = append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("read discovery cache: %v", err)})
 			continue
 		}
 		cache[providerID] = fileCache
-		if !fetchedAt.IsZero() && now.Sub(fetchedAt) > discoveryCacheTTL {
-			warnings = append(warnings, Warning{Kind: "discovery_stale", Provider: providerID, Message: fmt.Sprintf("discovery cache older than %v", discoveryCacheTTL)})
-			stale = append(stale, providerID)
+		if !attemptedAt.IsZero() {
+			attempts[providerID] = attemptedAt
 		}
 	}
-	return cache, warnings, stale
+	return cache, attempts, warnings
+}
+
+// DiscoveryAttemptRecent reports whether provider discovery had a real network
+// attempt inside the cache TTL.
+func DiscoveryAttemptRecent(home, providerID string, now time.Time) (bool, error) {
+	if !safeProviderID(providerID) {
+		return false, fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	_, attemptedAt, err := readDiscoveryCacheFile(filepath.Join(discoveryCacheDir(home), providerID+".json"))
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !discoveryAttemptDue(attemptedAt, now), nil
+}
+
+func discoveryAttemptDue(attemptedAt, now time.Time) bool {
+	if attemptedAt.IsZero() {
+		return true
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return now.Sub(attemptedAt) >= discoveryCacheTTL
+}
+
+// WriteDiscoveryAttempt records a real discovery network attempt without
+// changing any cached model metadata.
+func WriteDiscoveryAttempt(home, providerID string, attemptedAt time.Time) error {
+	if !safeProviderID(providerID) {
+		return fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
+	}
+	if attemptedAt.IsZero() {
+		attemptedAt = time.Now().UTC()
+	}
+	path := filepath.Join(discoveryCacheDir(home), providerID+".json")
+	raw := discoveryCacheFile{Models: map[string]discoveryCacheModel{}}
+	data, err := os.ReadFile(path)
+	if err == nil {
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return err
+		}
+		if raw.Models == nil {
+			raw.Models = map[string]discoveryCacheModel{}
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	raw.AttemptedAt = attemptedAt.UTC()
+	return writeDiscoveryCacheFile(path, raw)
 }
 
 // WriteDiscoveryCache writes one provider's discovery cache file.
@@ -301,7 +356,7 @@ func WriteDiscoveryCache(home, providerID string, discovered DiscoveredProvider,
 	if fetchedAt.IsZero() {
 		fetchedAt = time.Now().UTC()
 	}
-	raw := discoveryCacheFile{FetchedAt: fetchedAt.UTC(), Models: map[string]discoveryCacheModel{}}
+	raw := discoveryCacheFile{FetchedAt: fetchedAt.UTC(), AttemptedAt: fetchedAt.UTC(), Models: map[string]discoveryCacheModel{}}
 	for modelID, model := range discovered.Models {
 		raw.Models[modelID] = discoveryCacheModel{
 			ID:              modelID,
@@ -311,16 +366,7 @@ func WriteDiscoveryCache(home, providerID string, discovered DiscoveredProvider,
 			Cost:            model.Cost,
 		}
 	}
-	data, err := json.MarshalIndent(raw, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	dir := discoveryCacheDir(home)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(dir, providerID+".json"), data, 0o600)
+	return writeDiscoveryCacheFile(filepath.Join(discoveryCacheDir(home), providerID+".json"), raw)
 }
 
 func readDiscoveryCacheFile(path string) (DiscoveredProvider, time.Time, error) {
@@ -332,6 +378,10 @@ func readDiscoveryCacheFile(path string) (DiscoveredProvider, time.Time, error) 
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return DiscoveredProvider{}, time.Time{}, err
 	}
+	attemptedAt := raw.AttemptedAt
+	if attemptedAt.IsZero() {
+		attemptedAt = raw.FetchedAt
+	}
 	models := map[string]DiscoveredModel{}
 	for modelID, model := range raw.Models {
 		models[modelID] = DiscoveredModel{
@@ -341,7 +391,22 @@ func readDiscoveryCacheFile(path string) (DiscoveredProvider, time.Time, error) 
 			Cost:            model.Cost,
 		}
 	}
-	return DiscoveredProvider{Models: models}, raw.FetchedAt, nil
+	return DiscoveredProvider{Models: models}, attemptedAt, nil
+}
+
+func writeDiscoveryCacheFile(path string, raw discoveryCacheFile) error {
+	if raw.Models == nil {
+		raw.Models = map[string]discoveryCacheModel{}
+	}
+	data, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
 }
 
 func safeProviderID(providerID string) bool {

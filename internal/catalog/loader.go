@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // bundledFS contains Lightcode's hand-curated built-in provider catalog files.
@@ -43,32 +44,17 @@ func (l *Loader) Load() (*Catalog, []Warning, error) {
 		return nil, nil, fmt.Errorf("read bundled catalog: %w", err)
 	}
 	userRaw, warnings := readUserConfigProviders(home)
-	cache, cacheWarnings, staleProviders := ReadDiscoveryCache(home)
+	cache, attempts, cacheWarnings := ReadDiscoveryCache(home)
 	warnings = append(warnings, cacheWarnings...)
 
 	result := Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Cache: cache})
-	candidates := DiscoveryRefreshCandidates(result.Catalog)
-	for _, id := range staleProviders {
-		if _, inCatalog := result.Catalog.Providers[id]; inCatalog {
-			if !sliceContains(candidates, id) {
-				candidates = append(candidates, id)
-			}
-		}
-	}
-	for id, provider := range result.Catalog.Providers {
-		if provider != nil && provider.Discovery {
-			if _, cached := cache[id]; !cached && !sliceContains(candidates, id) {
-				candidates = append(candidates, id)
-			}
-		}
-	}
-	discoveryWarnings, discoveryChanged, refreshedProviders := refreshDiscoveryCandidatesFor(home, candidates, result.Catalog)
+	candidates := DiscoveryRefreshCandidates(result.Catalog, attempts, time.Now().UTC())
+	discoveryWarnings, discoveryChanged, _ := refreshDiscoveryCandidatesFor(home, candidates, result.Catalog)
 	warnings = append(warnings, discoveryWarnings...)
 	if discoveryChanged {
-		cache, cacheWarnings, _ = ReadDiscoveryCache(home)
+		cache, _, cacheWarnings = ReadDiscoveryCache(home)
 		warnings = append(warnings, cacheWarnings...)
 		result = Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Cache: cache})
-		warnings = removeStaleFor(warnings, refreshedProviders)
 	}
 	warnings = append(warnings, result.Warnings...)
 	return result.Catalog, warnings, nil
@@ -82,35 +68,17 @@ func refreshDiscoveryCandidatesFor(home string, candidateIDs []string, cat *Cata
 		return warnings, changed, refreshed
 	}
 	for _, providerID := range candidateIDs {
-		providerWarnings := RefreshProviderDiscovery(context.Background(), home, cat, providerID)
+		refreshedProvider, providerWarnings := RefreshProviderDiscovery(context.Background(), home, cat, providerID)
 		if len(providerWarnings) != 0 {
 			warnings = append(warnings, providerWarnings...)
 			continue
 		}
-		changed = true
-		refreshed = append(refreshed, providerID)
+		if refreshedProvider {
+			changed = true
+			refreshed = append(refreshed, providerID)
+		}
 	}
 	return warnings, changed, refreshed
-}
-
-func removeStaleFor(warnings []Warning, providers []string) []Warning {
-	out := make([]Warning, 0, len(warnings))
-	for _, w := range warnings {
-		if w.Kind == "discovery_stale" && sliceContains(providers, w.Provider) {
-			continue
-		}
-		out = append(out, w)
-	}
-	return out
-}
-
-func sliceContains(s []string, v string) bool {
-	for _, e := range s {
-		if e == v {
-			return true
-		}
-	}
-	return false
 }
 
 func (l *Loader) resolvedHome() (string, error) {

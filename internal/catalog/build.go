@@ -55,15 +55,16 @@ func Build(inputs BuildInputs) BuildResult {
 	}
 
 	for providerID := range providerIDs {
+		_, bundledProvider := bundled[providerID]
 		merged := DeepMergeCatalog(bundled[providerID], user[providerID])
 		applyProviderDefaults(providerID, merged)
-		applyDiscovery(providerID, merged, inputs.Cache[providerID], user[providerID])
+		applyDiscovery(providerID, merged, inputs.Cache[providerID], user[providerID], bundledProvider)
 		errs := ValidateRaw(providerID, merged, true)
 		if len(errs) != 0 {
 			result.Warnings = append(result.Warnings, validationWarning(providerID, "", warningKind(providerID, user), errs))
 			continue
 		}
-		provider := rawToProvider(providerID, merged)
+		provider := rawToProvider(providerID, merged, bundledProvider)
 		errs = ValidateEffective(provider)
 		if len(errs) != 0 {
 			result.Warnings = append(result.Warnings, validationWarning(providerID, "", warningKind(providerID, user), errs))
@@ -199,7 +200,7 @@ func applyProviderDefaults(providerID string, raw map[string]any) {
 	}
 }
 
-func applyDiscovery(providerID string, raw map[string]any, discovered DiscoveredProvider, userRaw map[string]any) {
+func applyDiscovery(providerID string, raw map[string]any, discovered DiscoveredProvider, userRaw map[string]any, bundledProvider bool) {
 	if len(discovered.Models) == 0 {
 		return
 	}
@@ -218,8 +219,22 @@ func applyDiscovery(providerID string, raw map[string]any, discovered Discovered
 	for modelID, modelDiscovery := range discovered.Models {
 		modelRaw, ok := models[modelID].(map[string]any)
 		if !ok {
+			if !bundledProvider {
+				continue
+			}
 			modelRaw = map[string]any{}
 			models[modelID] = modelRaw
+		}
+		if !bundledProvider {
+			if modelDiscovery.Cost != nil {
+				existingCost, _ := modelRaw["cost"].(map[string]any)
+				if existingCost == nil {
+					existingCost = map[string]any{}
+					modelRaw["cost"] = existingCost
+				}
+				mergeCostRawFields(existingCost, modelDiscovery.Cost, nil)
+			}
+			continue
 		}
 		if _, ok := modelRaw["name"]; !ok && modelDiscovery.Name != "" {
 			modelRaw["name"] = modelDiscovery.Name
@@ -302,7 +317,7 @@ func userCostFields(userRaw map[string]any, modelID string) map[string]bool {
 	return protected
 }
 
-func rawToProvider(providerID string, raw map[string]any) *Provider {
+func rawToProvider(providerID string, raw map[string]any, bundledProvider bool) *Provider {
 	transportRaw := raw["transport"].(map[string]any)
 	provider := &Provider{
 		ID:             stringValue(raw["id"], providerID),
@@ -315,6 +330,7 @@ func rawToProvider(providerID string, raw map[string]any) *Provider {
 		Discovery:      boolValue(raw["discovery"], true),
 		Hidden:         boolValue(raw["hidden"], false),
 		Models:         map[string]*Model{},
+		Builtin:        bundledProvider,
 	}
 	modelsRaw := raw["models"].(map[string]any)
 	for modelID, value := range modelsRaw {

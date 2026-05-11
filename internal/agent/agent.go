@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1142,13 +1141,7 @@ func (a *Agent) SwitchModel(refStr string) error {
 	}
 	client, model, err := newProviderClient(a.catalog, ref)
 	if err != nil {
-		if !errors.Is(err, catalog.ErrUnknownModel) || a.refreshDiscoveryLocked(ref.Provider) != nil {
-			return err
-		}
-		client, model, err = newProviderClient(a.catalog, ref)
-		if err != nil {
-			return err
-		}
+		return err
 	}
 	a.lp.SetClient(client)
 	a.currentRef = ref
@@ -1326,7 +1319,7 @@ func (a *Agent) RefreshDiscovery(provider string) error {
 }
 
 func (a *Agent) refreshDiscoveryLocked(provider string) error {
-	warnings := catalog.RefreshProviderDiscovery(context.Background(), a.home, a.catalog, provider)
+	_, warnings := catalog.RefreshProviderDiscovery(context.Background(), a.home, a.catalog, provider)
 	if len(warnings) == 0 {
 		return nil
 	}

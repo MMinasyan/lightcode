@@ -121,6 +121,7 @@ type Provider struct {
 	Discovery      bool              `json:"discovery"`
 	Hidden         bool              `json:"hidden,omitempty"`
 	Models         map[string]*Model `json:"models"`
+	Builtin        bool              `json:"-"`
 }
 
 // Catalog is the in-memory effective catalog.

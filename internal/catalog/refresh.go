@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"time"
 )
@@ -12,36 +13,50 @@ const discoveryFetchTimeout = 10 * time.Second
 
 // RefreshProviderDiscovery fetches one provider's live discovery data, merges it into
 // the in-memory catalog, and writes the discovery cache. Discovery failures are
-// returned as warnings so callers can continue startup or model switching.
-func RefreshProviderDiscovery(ctx context.Context, home string, cat *Catalog, providerID string) []Warning {
+// returned as warnings so callers can continue startup.
+func RefreshProviderDiscovery(ctx context.Context, home string, cat *Catalog, providerID string) (bool, []Warning) {
 	provider := catalogProvider(cat, providerID)
 	if provider == nil {
-		return []Warning{{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("unknown provider %q", providerID)}}
+		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("unknown provider %q", providerID)}}
 	}
 	if !provider.Discovery {
-		return nil
+		return false, nil
+	}
+	if provider.Transport.APIKeyEnv != "" && os.Getenv(provider.Transport.APIKeyEnv) == "" {
+		return false, nil
+	}
+	now := time.Now().UTC()
+	recent, err := DiscoveryAttemptRecent(home, providerID, now)
+	if err != nil {
+		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("read discovery attempt: %v", err)}}
+	}
+	if recent {
+		return false, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	ctx, cancel := context.WithTimeout(ctx, discoveryFetchTimeout)
 	defer cancel()
+	if err := WriteDiscoveryAttempt(home, providerID, now); err != nil {
+		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery attempt: %v", err)}}
+	}
 	discovered, err := FetchDiscovery(ctx, http.DefaultClient, provider)
 	if err != nil {
-		return []Warning{{Kind: "discovery_failure", Provider: providerID, Message: err.Error()}}
+		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: err.Error()}}
 	}
-	if err := WriteDiscoveryCache(home, providerID, discovered, time.Now().UTC()); err != nil {
-		return []Warning{{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)}}
+	if err := WriteDiscoveryCache(home, providerID, discovered, now); err != nil {
+		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)}}
 	}
 	if err := cat.MergeDiscoveredProvider(providerID, discovered); err != nil {
-		return []Warning{{Kind: "discovery_failure", Provider: providerID, Message: err.Error()}}
+		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: err.Error()}}
 	}
-	return nil
+	return true, nil
 }
 
-// DiscoveryRefreshCandidates returns enabled discovery providers that need live
-// discovery because the model list is empty or at least one model is incomplete.
-func DiscoveryRefreshCandidates(cat *Catalog) []string {
+// DiscoveryRefreshCandidates returns enabled discovery providers that have not
+// had a real discovery attempt in the last 24 hours.
+func DiscoveryRefreshCandidates(cat *Catalog, attempts map[string]time.Time, now time.Time) []string {
 	if cat == nil {
 		return nil
 	}
@@ -50,7 +65,7 @@ func DiscoveryRefreshCandidates(cat *Catalog) []string {
 		if provider == nil || !provider.Discovery {
 			continue
 		}
-		if len(provider.Models) == 0 || providerHasIncompleteModel(provider) {
+		if discoveryAttemptDue(attempts[providerID], now) {
 			ids = append(ids, providerID)
 		}
 	}
@@ -70,6 +85,9 @@ func (c *Catalog) MergeDiscoveredProvider(providerID string, discovered Discover
 	for modelID, discoveredModel := range discovered.Models {
 		model := provider.Models[modelID]
 		if model == nil {
+			if !provider.Builtin {
+				continue
+			}
 			name := discoveredModel.Name
 			if name == "" {
 				name = modelID
@@ -83,6 +101,15 @@ func (c *Catalog) MergeDiscoveredProvider(providerID string, discovered Discover
 				ExtraBody:       map[string]any{},
 			}
 			provider.Models[modelID] = model
+		}
+		if !provider.Builtin {
+			if discoveredModel.Cost != nil {
+				if model.Cost == nil {
+					model.Cost = &Cost{}
+				}
+				mergeCostPointers(model.Cost, discoveredModel.Cost)
+			}
+			continue
 		}
 		if model.ID == "" {
 			model.ID = modelID
@@ -145,16 +172,4 @@ func mergeCostPointers(existing, discovered *Cost) {
 	if discovered.CacheWrite != nil {
 		existing.CacheWrite = discovered.CacheWrite
 	}
-}
-
-func providerHasIncompleteModel(provider *Provider) bool {
-	for _, model := range provider.Models {
-		if model == nil {
-			return true
-		}
-		if _, incomplete := model.Incomplete(); incomplete {
-			return true
-		}
-	}
-	return false
 }
