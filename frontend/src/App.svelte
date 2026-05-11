@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { EventsOn } from '../wailsjs/runtime/runtime';
-  import { SendPrompt, AppendUserMessage, CurrentModel, RespondPermission, TokenUsage, ProjectName, SessionCurrent, SessionMessages, RevertCode, RevertHistory, ForkSession, CompactNow } from '../wailsjs/go/main/App';
+  import { SendPrompt, AppendUserMessage, CurrentModel, CurrentWarnings, RespondPermission, TokenUsage, ProjectName, SessionCurrent, SessionMessages, RevertCode, RevertHistory, ForkSession, CompactNow } from '../wailsjs/go/main/App';
   import Toolbar from './components/Toolbar.svelte';
   import MessageList from './components/MessageList.svelte';
   import InputArea from './components/InputArea.svelte';
@@ -84,6 +84,12 @@
   }
 
   onMount(async () => {
+    EventsOn('warnings', (data) => { if (data) warnings = data; });
+    try {
+      const currentWarnings = await CurrentWarnings();
+      if (currentWarnings) warnings = currentWarnings;
+    } catch (e) { console.error(e); }
+
     try {
       const r = await CurrentModel();
       modelRef = r.ref || ((r.provider && r.model) ? `${r.provider}/${r.model}` : '');
@@ -170,8 +176,6 @@
 
     EventsOn('compaction_start', () => { compacting = true; });
     EventsOn('compaction_end', () => { compacting = false; });
-
-    EventsOn('warnings', (data) => { if (data) warnings = data; });
 
     EventsOn('subagent_token', (data) => {
       appendSubagentEvent(data.sessionId, { type: 'token', content: data.content });

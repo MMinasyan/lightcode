@@ -122,6 +122,11 @@ func (a *App) emitSessionChanged() {
 	})
 }
 
+// CurrentWarnings returns the backend-owned warning snapshot.
+func (a *App) CurrentWarnings() []agent.PromptWarning {
+	return a.svc.CurrentWarnings()
+}
+
 // SendPrompt sends a user message and starts the agentic loop.
 func (a *App) SendPrompt(content string) (int, error) {
 	return a.svc.SendPrompt(a.ctx, content)

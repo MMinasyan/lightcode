@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -66,8 +67,9 @@ type Agent struct {
 	tokens          map[string]*TokenEntry
 	lastContextUsed int
 
-	assembler       *prompt.Assembler
-	pendingWarnings []prompt.Warning
+	assembler              *prompt.Assembler
+	pendingPromptWarnings  []prompt.Warning
+	pendingCatalogWarnings []prompt.Warning
 
 	memoryStore *memory.Store
 
@@ -85,9 +87,9 @@ type Agent struct {
 
 	loopFlush chan chan struct{}
 
-	warningsMu   sync.Mutex
-	warningsSet  bool
-	lastWarnings []PromptWarning
+	warningsMu      sync.Mutex
+	warningGroups   map[string][]PromptWarning
+	warningSnapshot []PromptWarning
 }
 
 // New constructs an Agent from the given config. It creates the
@@ -148,6 +150,7 @@ func New(c Config) (*Agent, error) {
 		currentRef:        defaultRef,
 		contextWindowSize: contextWindowSize,
 		loopFlush:         make(chan chan struct{}, 1),
+		warningGroups:     make(map[string][]PromptWarning),
 	}
 
 	gate := permission.NewGate(func(req permission.Request) {
@@ -270,7 +273,8 @@ func New(c Config) (*Agent, error) {
 	asm := prompt.New(c.ProjectRoot, c.Home)
 	res := asm.Assemble()
 	a.assembler = asm
-	a.pendingWarnings = append(res.Warnings, catalogWarningsToPromptWarnings(catalogWarnings)...)
+	a.pendingPromptWarnings = res.Warnings
+	a.pendingCatalogWarnings = catalogWarningsToPromptWarnings(catalogWarnings)
 
 	l := loop.New(client, registry, res.Prompt)
 	l.SetEvents(events)
@@ -310,7 +314,7 @@ func (a *Agent) Init(ctx context.Context) {
 
 	if a.lspManager != nil {
 		a.lspManager.SetWarningHandler(func(kind, message string) {
-			a.emitWarnings([]prompt.Warning{{Kind: kind, Message: message}})
+			a.addWarning("lsp", prompt.Warning{Kind: kind, Message: message})
 		})
 		a.lspManager.SetSignalHandler(func(content string) {
 			if a.lp != nil {
@@ -324,8 +328,10 @@ func (a *Agent) Init(ctx context.Context) {
 		}()
 	}
 
-	a.emitWarnings(a.pendingWarnings)
-	a.pendingWarnings = nil
+	a.setWarningGroup("prompt", a.pendingPromptWarnings)
+	a.pendingPromptWarnings = nil
+	a.setWarningGroup("catalog", a.pendingCatalogWarnings)
+	a.pendingCatalogWarnings = nil
 }
 
 func (a *Agent) emitEvent(ev Event) {
@@ -334,27 +340,84 @@ func (a *Agent) emitEvent(ev Event) {
 	}
 }
 
-func (a *Agent) emitWarnings(warnings []prompt.Warning) {
-	pw := make([]PromptWarning, len(warnings))
-	for i, w := range warnings {
-		pw[i] = PromptWarning{Kind: w.Kind, Message: w.Message}
-	}
+func (a *Agent) setWarningGroup(group string, warnings []prompt.Warning) {
+	a.updateWarningGroup(group, promptWarnings(warnings), false)
+}
 
+func (a *Agent) addWarning(group string, warning prompt.Warning) {
+	a.updateWarningGroup(group, []PromptWarning{{Kind: warning.Kind, Message: warning.Message}}, true)
+}
+
+func (a *Agent) updateWarningGroup(group string, warnings []PromptWarning, appendOnly bool) {
 	a.warningsMu.Lock()
-	if !a.warningsSet && len(pw) == 0 {
-		a.warningsSet = true
+	if a.warningGroups == nil {
+		a.warningGroups = make(map[string][]PromptWarning)
+	}
+	if appendOnly {
+		warnings = appendUniquePromptWarnings(a.warningGroups[group], warnings)
+	}
+	sort.Slice(warnings, func(i, j int) bool {
+		return promptWarningSortKey(warnings[i]) < promptWarningSortKey(warnings[j])
+	})
+	if len(warnings) == 0 {
+		delete(a.warningGroups, group)
+	} else {
+		a.warningGroups[group] = append([]PromptWarning(nil), warnings...)
+	}
+	next := a.warningSnapshotLocked()
+	if promptWarningsEqual(a.warningSnapshot, next) {
 		a.warningsMu.Unlock()
 		return
 	}
-	if a.warningsSet && promptWarningsEqual(a.lastWarnings, pw) {
-		a.warningsMu.Unlock()
-		return
-	}
-	a.warningsSet = true
-	a.lastWarnings = append([]PromptWarning(nil), pw...)
+	a.warningSnapshot = append([]PromptWarning(nil), next...)
 	a.warningsMu.Unlock()
 
-	a.emitEvent(Event{Kind: EventWarning, Warnings: pw})
+	a.emitEvent(Event{Kind: EventWarning, Warnings: next})
+}
+
+// CurrentWarnings returns the current warning snapshot for adapters that need
+// to hydrate UI state after startup events may already have fired.
+func (a *Agent) CurrentWarnings() []PromptWarning {
+	a.warningsMu.Lock()
+	defer a.warningsMu.Unlock()
+	return append([]PromptWarning(nil), a.warningSnapshot...)
+}
+
+func (a *Agent) warningSnapshotLocked() []PromptWarning {
+	var out []PromptWarning
+	for _, group := range []string{"prompt", "catalog", "lsp"} {
+		out = append(out, a.warningGroups[group]...)
+	}
+	return out
+}
+
+func promptWarnings(warnings []prompt.Warning) []PromptWarning {
+	out := make([]PromptWarning, len(warnings))
+	for i, w := range warnings {
+		out[i] = PromptWarning{Kind: w.Kind, Message: w.Message}
+	}
+	return out
+}
+
+func appendUniquePromptWarnings(dst, src []PromptWarning) []PromptWarning {
+	out := append([]PromptWarning(nil), dst...)
+	for _, w := range src {
+		seen := false
+		for _, existing := range out {
+			if existing == w {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+func promptWarningSortKey(w PromptWarning) string {
+	return w.Kind + "\x00" + w.Message
 }
 
 func promptWarningsEqual(a, b []PromptWarning) bool {
@@ -991,7 +1054,7 @@ func (a *Agent) sendMessages(ctx context.Context, contents []string) (int, error
 		if res.Rebuilt {
 			a.lp.UpdateSystemPrompt(res.Prompt)
 		}
-		a.emitWarnings(res.Warnings)
+		a.setWarningGroup("prompt", res.Warnings)
 
 		if a.shouldAutoCompact() {
 			if err := a.runCompaction(turnCtx, true); err != nil {
@@ -1140,7 +1203,7 @@ func (a *Agent) reloadLocked() error {
 	a.lp.SetClient(client)
 	a.currentRef = ref
 	a.contextWindowSize = model.ContextWindow
-	a.emitWarnings(catalogWarningsToPromptWarnings(catalogWarnings))
+	a.setWarningGroup("catalog", catalogWarningsToPromptWarnings(catalogWarnings))
 	return nil
 }
 
@@ -1267,7 +1330,7 @@ func (a *Agent) refreshDiscoveryLocked(provider string) error {
 	if len(warnings) == 0 {
 		return nil
 	}
-	a.emitWarnings(catalogWarningsToPromptWarnings(warnings))
+	a.setWarningGroup("catalog", catalogWarningsToPromptWarnings(warnings))
 	return fmt.Errorf("refresh discovery for %s: %s", provider, warnings[0].Message)
 }
 

@@ -19,7 +19,7 @@ const (
 	EventPermissionRequest                  // A tool needs user approval.
 	EventCompactionStart                    // Compaction beginning.
 	EventCompactionEnd                      // Compaction finished.
-	EventWarning                            // Prompt assembly warnings.
+	EventWarning                            // Current warning snapshot changed.
 	EventSubagentStart                      // A subagent session started.
 )
 
@@ -50,7 +50,7 @@ type Event struct {
 	TaskIndex         int
 }
 
-// PromptWarning is a warning from the prompt assembly system.
+// PromptWarning is a user-visible warning from prompt, catalog, LSP, or related systems.
 type PromptWarning struct {
 	Kind    string `json:"kind"`
 	Message string `json:"message"`

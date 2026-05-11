@@ -67,19 +67,21 @@ type CLI struct {
 
 	messages []displayEntry
 
-	compacting bool
+	compacting          bool
+	lastWarningSnapshot map[string]bool
 }
 
 func New(a *agent.Agent) *CLI {
 	return &CLI{
-		agent:   a,
-		out:     os.Stdout,
-		mu:      &sync.Mutex{},
-		input:   newInputLine(),
-		history: newInputHistory(),
-		keyCh:   make(chan keyMsg, 64),
-		events:  make(chan agent.Event, 256),
-		width:   80,
+		agent:               a,
+		out:                 os.Stdout,
+		mu:                  &sync.Mutex{},
+		input:               newInputLine(),
+		history:             newInputHistory(),
+		keyCh:               make(chan keyMsg, 64),
+		events:              make(chan agent.Event, 256),
+		width:               80,
+		lastWarningSnapshot: make(map[string]bool),
 	}
 }
 
@@ -668,13 +670,24 @@ func (c *CLI) handleEvent(ev agent.Event) {
 
 	case agent.EventWarning:
 		c.writeRaw("\r\x1b[2K")
+		current := make(map[string]bool, len(ev.Warnings))
 		for _, w := range ev.Warnings {
+			key := warningKey(w)
+			current[key] = true
+			if c.lastWarningSnapshot[key] {
+				continue
+			}
 			c.writeRaw(renderWarningMsg(w.Kind + ": " + w.Message))
 		}
+		c.lastWarningSnapshot = current
 		if c.state == stateIdle {
 			c.printInputPromptLocked()
 		}
 	}
+}
+
+func warningKey(w agent.PromptWarning) string {
+	return w.Kind + "\x00" + w.Message
 }
 
 func (c *CLI) handleSubagentEvent(ev agent.Event) {
