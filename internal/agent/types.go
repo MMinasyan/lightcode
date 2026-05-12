@@ -87,15 +87,16 @@ type TokenReport struct {
 
 // ModelListEntry is one flat picker/list entry from the catalog.
 type ModelListEntry struct {
-	Ref           string        `json:"ref"`
-	Provider      string        `json:"provider"`
-	ProviderName  string        `json:"providerName"`
-	Model         string        `json:"model"`
-	DisplayName   string        `json:"displayName"`
-	ContextWindow int           `json:"contextWindow"`
-	Cost          *catalog.Cost `json:"cost,omitempty"`
-	Hidden        bool          `json:"hidden"`
-	Incomplete    bool          `json:"incomplete"`
+	Ref            string        `json:"ref"`
+	Provider       string        `json:"provider"`
+	ProviderName   string        `json:"providerName"`
+	Model          string        `json:"model"`
+	DisplayName    string        `json:"displayName"`
+	ContextWindow  int           `json:"contextWindow"`
+	Cost           *catalog.Cost `json:"cost,omitempty"`
+	Hidden         bool          `json:"hidden"`
+	ProviderHidden bool          `json:"providerHidden"`
+	Incomplete     bool          `json:"incomplete"`
 }
 
 // Snapshot describes one turn's snapshots.

@@ -218,6 +218,21 @@ func (a *App) CurrentModel() agent.ModelInfo {
 	return a.svc.CurrentModel()
 }
 
+// AllModelList returns every catalog model including hidden ones.
+func (a *App) AllModelList() ([]agent.ModelListEntry, error) {
+	return a.svc.AllModelList(), nil
+}
+
+// SetModelHidden writes the hidden flag for a model to config and reloads.
+func (a *App) SetModelHidden(ref string, hidden bool) error {
+	return a.svc.SetModelHidden(ref, hidden)
+}
+
+// SetProviderHidden writes the hidden flag for a provider to config and reloads.
+func (a *App) SetProviderHidden(providerID string, hidden bool) error {
+	return a.svc.SetProviderHidden(providerID, hidden)
+}
+
 // ProjectName returns the basename of the project directory.
 func (a *App) ProjectName() string {
 	return a.svc.ProjectName()

@@ -1,8 +1,8 @@
 <script>
   import { createEventDispatcher } from 'svelte';
-  export let modelRef = '';
+  export let modelName = '';
   const dispatch = createEventDispatcher();
-  $: label = modelRef || '-';
+  $: label = modelName || '-';
   $: shortLabel = label.length > 30 ? label.slice(0, 30) + '...' : label;
 </script>
 

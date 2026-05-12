@@ -54,6 +54,7 @@
   let busy = false;
   let status = 'idle';
   let modelRef = '';
+  let modelName = '';
   let sessionId = '';
   let projectName = '';
   let currentTurn = 0;
@@ -63,6 +64,7 @@
   let showSessionSelector = false;
   let showProjectSelector = false;
   let showSettings = false;
+  let settingsSection = 'appearance';
   let permissionQueue = [];
   $: currentPermission = permissionQueue[0] || null;
   let inputArea;
@@ -93,6 +95,7 @@
     try {
       const r = await CurrentModel();
       modelRef = r.ref || ((r.provider && r.model) ? `${r.provider}/${r.model}` : '');
+      modelName = r.displayName || modelRef;
     } catch (e) { console.error(e); }
 
     try { projectName = await ProjectName(); } catch (e) { console.error(e); }
@@ -238,7 +241,8 @@
     catch (err) { messages = [...messages, { _id: mid(), type: 'error', content: err.toString() }]; busy = false; }
   }
 
-  function handleModelSwitched(e) { modelRef = e.detail.ref; showModelSelector = false; }
+  function handleManageSettings() { showModelSelector = false; settingsSection = 'models'; showSettings = true; }
+  function handleModelSwitched(e) { modelRef = e.detail.ref; modelName = e.detail.displayName || e.detail.ref; showModelSelector = false; }
 
   async function handleRevertCode(e) {
     const { turn, alsoRevertCode } = e.detail;
@@ -285,7 +289,7 @@
     on:compact={handleCompact}
     on:openSessionSelector={() => showSessionSelector=true}
     on:openProjectSelector={() => showProjectSelector=true}
-    on:openSettings={() => showSettings=true}
+    on:openSettings={() => { settingsSection = 'appearance'; showSettings = true; }}
     on:openWarnings={() => showWarnings=true} />
   <div class="content" bind:this={contentEl} bind:clientWidth={contentWidth}>
     <MessageList {messages} {busy} {compacting} {messageQueue}
@@ -303,10 +307,10 @@
     {/if}
   </div>
   <InputArea bind:this={inputArea} {busy} on:submit={handleSubmit}>
-    <StatusBar {modelRef} on:openModelSelector={() => showModelSelector=true} />
+    <StatusBar {modelName} on:openModelSelector={() => showModelSelector=true} />
   </InputArea>
   {#if showModelSelector}
-    <ModelSelector currentRef={modelRef} on:switched={handleModelSwitched} on:close={() => showModelSelector=false} />
+    <ModelSelector currentRef={modelRef} on:switched={handleModelSwitched} on:close={() => showModelSelector=false} on:manageSettings={handleManageSettings} />
   {/if}
 
   {#if currentPermission}
@@ -322,7 +326,7 @@
     <ProjectSelector on:close={() => showProjectSelector=false} />
   {/if}
   {#if showSettings}
-    <Settings on:close={() => showSettings=false} />
+    <Settings initialSection={settingsSection} on:close={() => showSettings=false} />
   {/if}
   {#if showWarnings}
     <WarningDetails {warnings} on:close={() => showWarnings=false} />

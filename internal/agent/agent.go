@@ -1355,18 +1355,156 @@ func (a *Agent) ModelList() []ModelListEntry {
 		}
 		_, incomplete := model.Incomplete()
 		result = append(result, ModelListEntry{
-			Ref:           ref.String(),
-			Provider:      ref.Provider,
-			ProviderName:  providerName,
-			Model:         ref.Model,
-			DisplayName:   displayName,
-			ContextWindow: model.ContextWindow,
-			Cost:          model.Cost,
-			Hidden:        model.Hidden || prov.Hidden,
-			Incomplete:    incomplete,
+			Ref:            ref.String(),
+			Provider:       ref.Provider,
+			ProviderName:   providerName,
+			Model:          ref.Model,
+			DisplayName:    displayName,
+			ContextWindow:  model.ContextWindow,
+			Cost:           model.Cost,
+			Hidden:         model.Hidden || prov.Hidden,
+			ProviderHidden: prov.Hidden,
+			Incomplete:     incomplete,
 		})
 	}
 	return result
+}
+
+func (a *Agent) AllModelList() []ModelListEntry {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	refs := a.catalog.AllModels()
+	result := make([]ModelListEntry, 0, len(refs))
+	for _, ref := range refs {
+		prov, model, err := a.catalog.LookupOrIncomplete(ref)
+		if err != nil {
+			continue
+		}
+		displayName := model.Name
+		if displayName == "" {
+			displayName = model.ID
+		}
+		providerName := prov.Name
+		if providerName == "" {
+			providerName = prov.ID
+		}
+		_, incomplete := model.Incomplete()
+		result = append(result, ModelListEntry{
+			Ref:            ref.String(),
+			Provider:       ref.Provider,
+			ProviderName:   providerName,
+			Model:          ref.Model,
+			DisplayName:    displayName,
+			ContextWindow:  model.ContextWindow,
+			Cost:           model.Cost,
+			Hidden:         model.Hidden || prov.Hidden,
+			ProviderHidden: prov.Hidden,
+			Incomplete:     incomplete,
+		})
+	}
+	return result
+}
+
+func (a *Agent) SetModelHidden(refStr string, hidden bool) error {
+	ref, err := catalog.ParseModelRef(refStr)
+	if err != nil {
+		return err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.busy {
+		return fmt.Errorf("cannot change model visibility while a turn is running")
+	}
+	path := agentConfigPath(a.home)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("parse config %s: %w", path, err)
+	}
+	providers, ok := root["providers"].(map[string]any)
+	if !ok {
+		providers = map[string]any{}
+		root["providers"] = providers
+	}
+	providerRaw, ok := providers[ref.Provider]
+	if !ok {
+		providerRaw = map[string]any{}
+		providers[ref.Provider] = providerRaw
+	}
+	providerMap, ok := providerRaw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("providers.%s must be an object", ref.Provider)
+	}
+	modelsRaw, ok := providerMap["models"]
+	if !ok {
+		modelsRaw = map[string]any{}
+		providerMap["models"] = modelsRaw
+	}
+	modelsMap, ok := modelsRaw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("providers.%s.models must be an object", ref.Provider)
+	}
+	modelRaw, ok := modelsMap[ref.Model]
+	if !ok {
+		modelRaw = map[string]any{}
+		modelsMap[ref.Model] = modelRaw
+	}
+	modelMap, ok := modelRaw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("providers.%s.models.%s must be an object", ref.Provider, ref.Model)
+	}
+	modelMap["hidden"] = hidden
+	if err := writeAgentConfigAtomic(path, root); err != nil {
+		return err
+	}
+	if prov := a.catalog.Providers[ref.Provider]; prov != nil {
+		if model := prov.Models[ref.Model]; model != nil {
+			model.Hidden = hidden
+		}
+	}
+	return nil
+}
+
+func (a *Agent) SetProviderHidden(providerID string, hidden bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.busy {
+		return fmt.Errorf("cannot change provider visibility while a turn is running")
+	}
+	path := agentConfigPath(a.home)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("parse config %s: %w", path, err)
+	}
+	providers, ok := root["providers"].(map[string]any)
+	if !ok {
+		providers = map[string]any{}
+		root["providers"] = providers
+	}
+	providerRaw, ok := providers[providerID]
+	if !ok {
+		providerRaw = map[string]any{}
+		providers[providerID] = providerRaw
+	}
+	providerMap, ok := providerRaw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("providers.%s must be an object", providerID)
+	}
+	providerMap["hidden"] = hidden
+	if err := writeAgentConfigAtomic(path, root); err != nil {
+		return err
+	}
+	if prov := a.catalog.Providers[providerID]; prov != nil {
+		prov.Hidden = hidden
+	}
+	return nil
 }
 
 // TokenUsage returns cumulative token usage for the session.

@@ -42,7 +42,7 @@
   }
 
   async function select(entry) {
-    try { await SwitchModel(entry.ref); dispatch('switched', { ref: entry.ref }); }
+    try { await SwitchModel(entry.ref); dispatch('switched', { ref: entry.ref, displayName: entry.displayName || entry.model || entry.ref }); }
     catch (e) { console.error(e); }
   }
 
@@ -54,7 +54,7 @@
 <div class="backdrop" on:click={() => dispatch('close')}>
   <!-- svelte-ignore a11y-click-events-have-key-events -->
   <div class="selector" on:click|stopPropagation>
-    <div class="hdr">Select Model</div>
+    <div class="hdr"><span>Select Model</span><button class="manage" on:click={() => dispatch('manageSettings')}>Models</button></div>
     <input class="search" type="text" placeholder="Search models..." bind:value={query} />
     <div class="list">
       {#if loading}<div class="loading">Loading...</div>
@@ -78,7 +78,9 @@
 <style>
   .backdrop { position:fixed; inset:0; z-index:100; }
   .selector { position:absolute; bottom:60px; left:12px; background:var(--bg-elevated); border:1px solid var(--border-strong); border-radius:var(--radius); min-width:320px; max-height:400px; overflow:hidden; box-shadow:var(--shadow-lg); display:flex; flex-direction:column; }
-  .hdr { padding:8px 12px; font-size:12px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--border); flex-shrink:0; }
+  .hdr { display:flex; justify-content:space-between; align-items:center; padding:8px 12px; font-size:12px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--border); flex-shrink:0; }
+  .manage { background:none; border:none; padding:0; font-family:var(--font-ui); font-size:12px; color:var(--text-dim); text-transform:none; letter-spacing:normal; cursor:pointer; }
+  .manage:hover { color:var(--accent); }
   .search { width:100%; padding:6px 12px; background:var(--bg-input); border:none; border-bottom:1px solid var(--border); color:var(--text); font-family:var(--font-ui); font-size:13px; outline:none; box-sizing:border-box; flex-shrink:0; }
   .search::placeholder { color:var(--text-dim); }
   .search:focus { background:var(--bg-input-focus); }
