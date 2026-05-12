@@ -12,6 +12,7 @@ import (
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v2/pkg/options/linux"
 
 	"github.com/MMinasyan/lightcode/internal/acp"
 	"github.com/MMinasyan/lightcode/internal/agent"
@@ -161,6 +162,9 @@ func runWails() error {
 		Title:  "Lightcode — " + svc.ProjectName(),
 		Width:  900,
 		Height: 700,
+		Linux: &linux.Options{
+			WebviewGpuPolicy: linux.WebviewGpuPolicyAlways,
+		},
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
