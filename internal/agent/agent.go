@@ -16,6 +16,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/compact"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/editpreview"
 	"github.com/MMinasyan/lightcode/internal/loop"
 	"github.com/MMinasyan/lightcode/internal/lsp"
 	"github.com/MMinasyan/lightcode/internal/memory"
@@ -1772,11 +1773,10 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 				for _, tc := range m.ToolCalls {
 					toolStubs[tc.ID] = len(out)
 					out = append(out, DisplayMessage{
-						Type:     "tool",
-						ID:       tc.ID,
-						Name:     tc.Function.Name,
-						Args:     tc.Function.Arguments,
-						Metadata: displayMetadataForToolCall(tc.Function.Name, tc.Function.Arguments),
+						Type: "tool",
+						ID:   tc.ID,
+						Name: tc.Function.Name,
+						Args: tc.Function.Arguments,
 					})
 				}
 
@@ -1785,6 +1785,9 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 					out[idx].Done = true
 					out[idx].Success = m.Content != "denied by user" && !strings.HasPrefix(m.Content, "error: ")
 					out[idx].Result = m.Content
+					if out[idx].Success {
+						out[idx].Metadata = displayMetadataForToolCall(out[idx].Name, out[idx].Args, m.Content)
+					}
 				}
 			}
 		}
@@ -1792,42 +1795,14 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 	return out
 }
 
-func displayMetadataForToolCall(name, args string) map[string]any {
+func displayMetadataForToolCall(name, args, result string) map[string]any {
 	if name != "edit_file" {
 		return nil
 	}
-	var params map[string]any
-	if json.Unmarshal([]byte(args), &params) != nil {
+	if !strings.Contains(result, "lines ") {
 		return nil
 	}
-	oldStr, _ := params["old_string"].(string)
-	newStr, _ := params["new_string"].(string)
-	if (oldStr == "" && newStr == "") || oldStr == newStr {
-		return nil
-	}
-	return map[string]any{"diff": displayDiff(oldStr, newStr)}
-}
-
-func displayDiff(old, new string) string {
-	oldLines := strings.Split(old, "\n")
-	newLines := strings.Split(new, "\n")
-	var b strings.Builder
-	for _, line := range oldLines {
-		b.WriteString("- ")
-		b.WriteString(line)
-		b.WriteString("\n")
-	}
-	b.WriteString("\n")
-	for _, line := range newLines {
-		b.WriteString("+ ")
-		b.WriteString(line)
-		b.WriteString("\n")
-	}
-	result := b.String()
-	if len(result) > 0 && result[len(result)-1] == '\n' {
-		result = result[:len(result)-1]
-	}
-	return result
+	return editpreview.MetadataFromArgs(args, result)
 }
 
 // --- Snapshot / revert operations ---

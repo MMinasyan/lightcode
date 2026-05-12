@@ -7,9 +7,13 @@ import (
 	"unicode"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
+	"github.com/MMinasyan/lightcode/internal/editpreview"
 )
 
 const nl = "\r\n"
+
+const collapsedPreviewLines = 5
+const collapsedEditPreviewLines = collapsedPreviewLines * 2
 
 const (
 	colorReset  = "\033[0m"
@@ -83,8 +87,8 @@ func renderQueuedMsg(content string, width int) string {
 		width = 20
 	}
 	lines := wrapLine(content, width-4)
-	if len(lines) > 3 {
-		lines = lines[:3]
+	if len(lines) > collapsedPreviewLines {
+		lines = lines[:collapsedPreviewLines]
 	}
 
 	var b strings.Builder
@@ -136,19 +140,71 @@ func renderAssistantMsg(content string, width int) string {
 }
 
 // renderToolCall renders a tool call header line.
-func renderToolCall(name, args string) string {
+func renderToolCall(name, args string, metadata map[string]any) string {
 	argDisplay := formatToolArgs(name, args)
+	summary, hasSummary := toolChangeSummary(name, args, metadata)
 	var b strings.Builder
 	b.WriteString(colorCyan)
-	b.WriteString("  ⟩ ")
+	b.WriteString("  ▸ ")
 	b.WriteString(name)
 	if argDisplay != "" {
+		argLines := strings.Split(argDisplay, "\n")
 		b.WriteString("  ")
-		b.WriteString(argDisplay)
+		b.WriteString(argLines[0])
+		for _, line := range argLines[1:] {
+			b.WriteString(nl)
+			b.WriteString("     ")
+			b.WriteString(line)
+		}
+	}
+	if hasSummary {
+		b.WriteString("  ")
+		writeToolChangeSummary(&b, summary)
 	}
 	b.WriteString(colorReset)
 	b.WriteString(nl)
 	return b.String()
+}
+
+type toolChangeCounts struct {
+	added   int
+	removed int
+}
+
+func toolChangeSummary(name, args string, metadata map[string]any) (toolChangeCounts, bool) {
+	switch name {
+	case "edit_file":
+		preview, ok := editpreview.FromMetadata(metadata)
+		if !ok {
+			return toolChangeCounts{}, false
+		}
+		counts := editPreviewChangeCounts(preview)
+		return counts, counts.added > 0 || counts.removed > 0
+	case "write_file":
+		lines := countContentLines(extractWriteContent(args))
+		if lines <= 0 {
+			return toolChangeCounts{}, false
+		}
+		return toolChangeCounts{added: lines}, true
+	default:
+		return toolChangeCounts{}, false
+	}
+}
+
+func writeToolChangeSummary(b *strings.Builder, counts toolChangeCounts) {
+	if counts.added > 0 {
+		b.WriteString(colorGreen)
+		b.WriteString(fmt.Sprintf("+%d", counts.added))
+		b.WriteString(colorCyan)
+	}
+	if counts.removed > 0 {
+		if counts.added > 0 {
+			b.WriteString(" ")
+		}
+		b.WriteString(colorRed)
+		b.WriteString(fmt.Sprintf("-%d", counts.removed))
+		b.WriteString(colorCyan)
+	}
 }
 
 // renderToolResult renders a tool call result.
@@ -169,11 +225,13 @@ func renderToolResult(name, args, result string, success bool, expanded bool, wi
 		return ""
 	}
 
-	// Show diff for edit_file.
-	if name == "edit_file" && metadata != nil {
-		if diff, ok := metadata["diff"].(string); ok && diff != "" {
-			b.WriteString(renderDiffPreview(diff, indent, inner))
+	// edit_file success output is user-facing metadata, not the model-facing summary.
+	if name == "edit_file" {
+		if preview, ok := editpreview.FromMetadata(metadata); ok {
+			b.WriteString(renderEditPreview(preview, indent, inner, expanded))
+			return b.String()
 		}
+		return ""
 	}
 
 	display := result
@@ -186,13 +244,120 @@ func renderToolResult(name, args, result string, success bool, expanded bool, wi
 	return renderOutputPreview(display, indent, inner, colorDim, expanded)
 }
 
+func renderEditPreview(preview *editpreview.Preview, indent string, inner int, expanded bool) string {
+	if preview == nil || len(preview.Hunks) == 0 {
+		return ""
+	}
+	width := 1
+	for _, hunk := range preview.Hunks {
+		for _, row := range hunk.Rows {
+			line := editpreview.DisplayLine(row)
+			if line <= 0 {
+				continue
+			}
+			if n := len(fmt.Sprintf("%d", line)); n > width {
+				width = n
+			}
+		}
+	}
+
+	var b strings.Builder
+	rowsWritten := 0
+	totalRows := editPreviewRowCount(preview)
+	limit := totalRows
+	collapsed := !expanded && totalRows > collapsedEditPreviewLines
+	if collapsed {
+		limit = collapsedEditPreviewLines
+	}
+
+	for hunkIdx, hunk := range preview.Hunks {
+		if rowsWritten >= limit {
+			break
+		}
+		if len(hunk.Rows) == 0 {
+			continue
+		}
+		if expanded && hunkIdx > 0 && rowsWritten > 0 {
+			b.WriteString(nl)
+		}
+		for _, row := range hunk.Rows {
+			if rowsWritten >= limit {
+				break
+			}
+			line := editpreview.DisplayLine(row)
+			marker := editpreview.Marker(row)
+			gutterColor := colorDim
+			if row.Kind == editpreview.KindRemove {
+				gutterColor = colorRed
+			} else if row.Kind == editpreview.KindAdd {
+				gutterColor = colorGreen
+			}
+
+			gutter := fmt.Sprintf("%*d %s", width, line, marker)
+			codeWidth := inner - len(gutter)
+			if codeWidth < 1 {
+				codeWidth = 1
+			}
+
+			b.WriteString(indent)
+			b.WriteString(gutterColor)
+			b.WriteString(gutter)
+			b.WriteString(colorReset)
+			b.WriteString(colorDim)
+			b.WriteString(truncate(row.Text, codeWidth))
+			b.WriteString(colorReset)
+			b.WriteString(nl)
+			rowsWritten++
+		}
+	}
+	if collapsed {
+		b.WriteString(colorDim)
+		b.WriteString(indent)
+		b.WriteString(moreLinesLabel(totalRows - limit))
+		b.WriteString(colorReset)
+		b.WriteString(nl)
+	}
+	return b.String()
+}
+
+func editPreviewRowCount(preview *editpreview.Preview) int {
+	if preview == nil {
+		return 0
+	}
+	total := 0
+	for _, hunk := range preview.Hunks {
+		total += len(hunk.Rows)
+	}
+	return total
+}
+
+func editPreviewChangeCounts(preview *editpreview.Preview) toolChangeCounts {
+	var counts toolChangeCounts
+	if preview == nil {
+		return counts
+	}
+	for _, hunk := range preview.Hunks {
+		for _, row := range hunk.Rows {
+			switch row.Kind {
+			case editpreview.KindAdd:
+				counts.added++
+			case editpreview.KindRemove:
+				counts.removed++
+			}
+		}
+	}
+	return counts
+}
+
 func renderOutputPreview(display, indent string, inner int, color string, expanded bool) string {
 	if display == "" {
 		return ""
 	}
-	lines := strings.Split(display, "\n")
-	if !expanded && len(lines) > 3 {
-		lines = lines[:3]
+	allLines := strings.Split(display, "\n")
+	lines := allLines
+	collapsed := !expanded && len(allLines) > collapsedPreviewLines
+	if collapsed {
+		lines = lines[:collapsedPreviewLines]
 	}
 
 	var b strings.Builder
@@ -206,30 +371,23 @@ func renderOutputPreview(display, indent string, inner int, color string, expand
 		}
 	}
 	b.WriteString(colorReset)
+	if collapsed {
+		b.WriteString(nl)
+		b.WriteString(colorDim)
+		b.WriteString(indent)
+		b.WriteString(moreLinesLabel(len(allLines) - len(lines)))
+		b.WriteString(colorReset)
+	}
 	b.WriteString(nl)
 
 	return b.String()
 }
 
-func renderDiffPreview(diff, indent string, inner int) string {
-	if diff == "" {
-		return ""
+func moreLinesLabel(n int) string {
+	if n == 1 {
+		return "(1 more line)"
 	}
-	var b strings.Builder
-	for _, line := range strings.Split(diff, "\n") {
-		color := colorDim
-		if strings.HasPrefix(line, "- ") {
-			color = colorRed
-		} else if strings.HasPrefix(line, "+ ") {
-			color = colorGreen
-		}
-		b.WriteString(color)
-		b.WriteString(indent)
-		b.WriteString(truncate(line, inner))
-		b.WriteString(colorReset)
-		b.WriteString(nl)
-	}
-	return b.String()
+	return fmt.Sprintf("(%d more lines)", n)
 }
 
 func extractWriteContent(args string) string {
@@ -239,6 +397,17 @@ func extractWriteContent(args string) string {
 	}
 	content, _ := params["content"].(string)
 	return content
+}
+
+func countContentLines(content string) int {
+	if content == "" {
+		return 0
+	}
+	lines := strings.Count(content, "\n")
+	if !strings.HasSuffix(content, "\n") {
+		lines++
+	}
+	return lines
 }
 
 // renderSubagentMsg renders a subagent event line.
@@ -403,9 +572,13 @@ func replaceInline(s, marker, open, close string) string {
 func formatToolArgs(name, args string) string {
 	switch name {
 	case "read_file", "write_file", "edit_file":
-		return extractJSONString(args, "path")
+		return formatHeaderArg(extractJSONString(args, "path"), 80)
 	case "run_command":
-		return extractJSONString(args, "command")
+		command := formatMultilineHeaderArg(extractJSONString(args, "command"))
+		if command == "" {
+			return "$"
+		}
+		return "$ " + command
 	case "execute_pending":
 		act := extractJSONString(args, "action")
 		if act == "discard" {
@@ -413,30 +586,65 @@ func formatToolArgs(name, args string) string {
 		}
 		return "apply"
 	case "process":
-		action := extractJSONString(args, "action")
-		id := extractJSONString(args, "id")
+		action := formatHeaderArg(extractJSONString(args, "action"), 80)
+		id := formatHeaderArg(extractJSONString(args, "id"), 80)
 		if action != "" && id != "" {
 			return action + " " + id
 		}
 		if action == "list" {
 			return "list"
 		}
-		return truncate(args, 80)
+		return formatHeaderArg(args, 80)
 	case "sleep":
 		seconds := extractJSONNumber(args, "seconds")
 		if seconds != "" {
 			return seconds + "s"
 		}
-		return truncate(args, 80)
+		return formatHeaderArg(args, 80)
 	case "task":
 		prompt := extractJSONString(args, "prompt")
 		if prompt != "" {
-			return truncate(prompt, 80)
+			return formatHeaderArg(prompt, 80)
 		}
-		return truncate(args, 80)
+		return formatHeaderArg(args, 80)
+	case "save_memory":
+		t := extractJSONString(args, "title")
+		if t != "" {
+			return formatHeaderArg(t, 80)
+		}
+		return formatHeaderArg(args, 80)
+	case "search_memory", "search_history":
+		q := extractJSONString(args, "query")
+		if q != "" {
+			return formatHeaderArg(q, 80)
+		}
+		return formatHeaderArg(args, 80)
+	case "diagnostics":
+		return ""
+	case "workspace_symbol":
+		q := extractJSONString(args, "query")
+		if q != "" {
+			return formatHeaderArg(q, 80)
+		}
+		return formatHeaderArg(args, 80)
 	default:
-		return truncate(args, 80)
+		return formatHeaderArg(args, 80)
 	}
+}
+
+func formatHeaderArg(s string, maxW int) string {
+	return truncate(strings.Join(strings.Fields(s), " "), maxW)
+}
+
+func formatMultilineHeaderArg(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	trimmed := strings.TrimRight(s, "\n")
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) <= 1 {
+		return s
+	}
+	return lines[0] + "\n" + moreLinesLabel(len(lines)-1)
 }
 
 func extractJSONString(jsonStr, key string) string {

@@ -14,6 +14,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
+	"github.com/MMinasyan/lightcode/internal/editpreview"
 )
 
 type cliState int
@@ -53,7 +54,6 @@ type CLI struct {
 	streamNeedsNL       bool
 	streamBuf           strings.Builder
 	streamVisibleBuf    strings.Builder
-	afterToolEnd        bool
 
 	msgQueue []string
 
@@ -550,16 +550,11 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.streamDisplayActive = false
 		c.streamBuf.Reset()
 		c.streamVisibleBuf.Reset()
-		c.afterToolEnd = false
 
 	case agent.EventTextDelta:
 		if !c.streamDisplayActive {
 			c.stopAnimationLocked()
 			c.writeRaw("\r\x1b[2K")
-			if c.afterToolEnd {
-				c.writeRaw(nl)
-				c.afterToolEnd = false
-			}
 			c.streamDisplayActive = true
 		}
 		c.streamStarted = true
@@ -586,7 +581,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			name: ev.ToolName,
 			args: ev.Args,
 		})
-		c.writeRaw(renderToolCall(ev.ToolName, ev.Args))
+		c.writeRaw(renderToolCall(ev.ToolName, ev.Args, nil))
 		c.startAnimationLocked("Running")
 
 	case agent.EventToolCallEnd:
@@ -607,8 +602,14 @@ func (c *CLI) handleEvent(ev agent.Event) {
 				break
 			}
 		}
+		if ev.ToolName == "edit_file" {
+			if _, hasSummary := toolChangeSummary(ev.ToolName, ev.Args, ev.Metadata); hasSummary {
+				c.writeRaw("\x1b[1A\r\x1b[2K")
+				c.writeRaw(renderToolCall(ev.ToolName, ev.Args, ev.Metadata))
+			}
+		}
 		c.writeRaw(renderToolResult(ev.ToolName, ev.Args, ev.Result, !ev.IsError, c.toolExpanded, c.width, ev.Metadata))
-		c.afterToolEnd = true
+		c.writeRaw(nl)
 		if c.busy {
 			c.startAnimationLocked("Thinking")
 		}
@@ -700,7 +701,7 @@ func (c *CLI) handleSubagentEvent(ev agent.Event) {
 	case agent.EventTextDelta:
 		c.writeRaw(prefix + strings.ReplaceAll(ev.Result, "\n", "\r\n"+prefix) + "\r\n")
 	case agent.EventToolCallStart:
-		c.writeRaw(renderSubagentMsg(tag, fmt.Sprintf("⟩ %s  %s", ev.ToolName, formatToolArgs(ev.ToolName, ev.Args))))
+		c.writeRaw(renderSubagentMsg(tag, fmt.Sprintf("▸ %s  %s", ev.ToolName, formatToolArgs(ev.ToolName, ev.Args))))
 	case agent.EventToolCallEnd:
 		result := truncate(ev.Result, 200)
 		status := "ok"
@@ -708,9 +709,10 @@ func (c *CLI) handleSubagentEvent(ev agent.Event) {
 			status = "error"
 		}
 		line := fmt.Sprintf("%s: %s", status, result)
-		if ev.Metadata != nil {
-			if diff, ok := ev.Metadata["diff"].(string); ok && diff != "" {
-				line += "\n" + diff
+		if !ev.IsError && ev.ToolName == "edit_file" {
+			line = status
+			if preview, ok := editpreview.FromMetadata(ev.Metadata); ok {
+				line += "\n" + strings.TrimRight(renderEditPreview(preview, "", c.width, false), "\r\n")
 			}
 		}
 		c.writeRaw(renderSubagentMsg(tag, line))
@@ -858,12 +860,13 @@ func (c *CLI) printDisplayEntryLocked(e displayEntry) {
 	case "assistant":
 		c.printLineLocked(renderAssistantMsg(e.content, c.width))
 	case "tool":
-		c.printLineLocked(renderToolCall(e.name, e.args))
+		c.printLineLocked(renderToolCall(e.name, e.args, e.metadata))
 		if e.done {
 			result := renderToolResult(e.name, e.args, e.result, e.success, c.toolExpanded, c.width, e.metadata)
 			if result != "" {
 				c.printLineLocked(result)
 			}
+			c.writeRaw(nl)
 		}
 	case "system":
 		c.printLineLocked(renderSystemMsg(e.content))

@@ -15,6 +15,7 @@ import (
 
 	openai "github.com/sashabaranov/go-openai"
 
+	"github.com/MMinasyan/lightcode/internal/editpreview"
 	"github.com/MMinasyan/lightcode/internal/provider"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
@@ -604,19 +605,12 @@ func (l *Loop) dispatch(ctx context.Context, tc openai.ToolCall) (string, bool) 
 
 	var params map[string]any
 	parseErr := json.Unmarshal([]byte(tc.Function.Arguments), &params)
-	var resultMetadata map[string]any
 
 	finish := func(result string, isError bool) string {
 		fmt.Fprintf(l.trace, "  ← %s\n", truncate(result, traceMaxChars))
 		ev := Event{Kind: ToolCallEnd, ToolCallID: tc.ID, ToolName: tc.Function.Name, Args: tc.Function.Arguments, Result: result, IsError: isError}
-		if resultMetadata != nil {
-			ev.Metadata = resultMetadata
-		} else if tc.Function.Name == "edit_file" && params != nil {
-			oldStr, _ := params["old_string"].(string)
-			newStr, _ := params["new_string"].(string)
-			if oldStr != newStr {
-				ev.Metadata = map[string]any{"diff": l.computeDiff(oldStr, newStr)}
-			}
+		if !isError && tc.Function.Name == "edit_file" && params != nil {
+			ev.Metadata = editpreview.MetadataFromParams(params, result)
 		}
 		l.emit(ev)
 		return result
@@ -697,7 +691,7 @@ func (l *Loop) flushPendingQueue(ctx context.Context) string {
 	}
 
 	// Emit individual ToolCallEnd events for each staged call.
-	for _, r := range results {
+	for i, r := range results {
 		result := r.Result
 		isError := false
 		if r.Error != "" {
@@ -705,8 +699,8 @@ func (l *Loop) flushPendingQueue(ctx context.Context) string {
 			isError = true
 		}
 		var metadata map[string]any
-		if r.Diff != "" {
-			metadata = map[string]any{"diff": r.Diff}
+		if !isError && r.ToolName == "edit_file" && i < len(staged) {
+			metadata = editpreview.MetadataFromParams(staged[i].Params, result)
 		}
 		l.emit(Event{
 			Kind:       ToolCallEnd,
@@ -766,25 +760,6 @@ func truncate(s string, max int) string {
 		return flat
 	}
 	return flat[:max] + fmt.Sprintf("... (%d bytes total)", len(s))
-}
-
-// computeDiff returns a simple line-based diff between old and new text.
-func (l *Loop) computeDiff(old, new string) string {
-	oldLines := strings.Split(old, "\n")
-	newLines := strings.Split(new, "\n")
-	var b strings.Builder
-	for _, line := range oldLines {
-		b.WriteString("- " + line + "\n")
-	}
-	b.WriteString("\n")
-	for _, line := range newLines {
-		b.WriteString("+ " + line + "\n")
-	}
-	result := b.String()
-	if len(result) > 0 && result[len(result)-1] == '\n' {
-		result = result[:len(result)-1]
-	}
-	return result
 }
 
 // validateStagedCall performs lightweight validation on a pending edit/write

@@ -1,11 +1,15 @@
 import { writable } from 'svelte/store';
 
 // viewer holds the currently displayed full-screen content.
-// Shape: { title, content } | { title, sessionId, live, messages } | null
+// Shape: { title, content } | { title, editPreview, hunks } | { title, sessionId, live, messages } | null
 export const viewer = writable(null);
 
 export function openViewer(title, content) {
   viewer.set({ title, content });
+}
+
+export function openEditPreview(title, hunks) {
+  viewer.set({ title, editPreview: true, hunks: hunks || [] });
 }
 
 export function openSubagentViewer(title, sessionId) {

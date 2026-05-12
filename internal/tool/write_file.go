@@ -61,7 +61,6 @@ func (w *WriteFile) ParametersSchema() map[string]any {
 
 type writeResult struct {
 	Result string
-	Diff   string
 }
 
 func (w *WriteFile) Execute(_ context.Context, params map[string]any) (string, error) {
@@ -123,11 +122,9 @@ func writeFileExecCommon(params map[string]any, tracker *FileTracker, cfg config
 		return nil, fmt.Errorf("write_file: resolve path: %w", err)
 	}
 
-	// Read existing content for diff (if file exists).
-	var prevContent string
+	// Check whether the target exists for read-before-write enforcement.
 	fileExists := false
-	if data, err := os.ReadFile(absPath); err == nil {
-		prevContent = string(data)
+	if _, err := os.ReadFile(absPath); err == nil {
 		fileExists = true
 	} else if _, err := os.Stat(absPath); err == nil {
 		// File exists but couldn't be read (permissions, etc.).
@@ -155,10 +152,7 @@ func writeFileExecCommon(params map[string]any, tracker *FileTracker, cfg config
 		tracker.UpdateAfterWrite(absPath)
 	}
 
-	diff := computeDiff(prevContent, content)
-
 	return &writeResult{
 		Result: fmt.Sprintf("Wrote %s.", path),
-		Diff:   diff,
 	}, nil
 }

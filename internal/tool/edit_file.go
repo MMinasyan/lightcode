@@ -68,7 +68,6 @@ type editResult struct {
 	Result     string
 	LineRanges string
 	Count      int
-	Diff       string
 }
 
 func (e *EditFile) Execute(_ context.Context, params map[string]any) (string, error) {
@@ -170,13 +169,10 @@ func editFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.
 		tracker.UpdateAfterWrite(absPath)
 	}
 
-	diff := computeDiff(content, res.UpdatedContent)
-
 	return &editResult{
 		Result:     res.Summary,
 		LineRanges: res.LineRanges,
 		Count:      res.Count,
-		Diff:       diff,
 	}, nil
 }
 
@@ -272,24 +268,4 @@ func countNewlinesIn(s string) int {
 		}
 	}
 	return count
-}
-
-func computeDiff(old, new string) string {
-	// Simple line-based diff: show removed and added lines.
-	oldLines := strings.Split(old, "\n")
-	newLines := strings.Split(new, "\n")
-
-	var b strings.Builder
-	for _, l := range oldLines {
-		b.WriteString("- ")
-		b.WriteString(l)
-		b.WriteString("\n")
-	}
-	b.WriteString("\n")
-	for _, l := range newLines {
-		b.WriteString("+ ")
-		b.WriteString(l)
-		b.WriteString("\n")
-	}
-	return strings.TrimSuffix(b.String(), "\n")
 }

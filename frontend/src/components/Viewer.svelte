@@ -1,6 +1,7 @@
 <script>
   import { viewer, closeViewer } from '../lib/viewer.js';
   import { settings } from '../lib/settings.js';
+  import EditPreview from './EditPreview.svelte';
   import ToolCall from './ToolCall.svelte';
 </script>
 
@@ -17,9 +18,13 @@
           {#if msg.type === 'assistant'}
             <div class="sa-text">{msg.content}</div>
           {:else if msg.type === 'tool'}
-            <ToolCall name={msg.name} args={msg.args} result={msg.result} success={msg.success} done={msg.done} />
+            <ToolCall name={msg.name} args={msg.args} result={msg.result} success={msg.success} done={msg.done} metadata={msg.metadata} />
           {/if}
         {/each}
+      </div>
+    {:else if $viewer.editPreview}
+      <div class="edit-content">
+        <EditPreview hunks={$viewer.hunks || []} />
       </div>
     {:else}
       <pre class="content" class:wrap={$settings.wrapCode}>{$viewer.content}</pre>
@@ -35,6 +40,7 @@
   .close { background:none; border:none; color:var(--text-dim); cursor:pointer; padding:2px 8px; font-family:var(--font-ui); font-size:calc(16px * var(--scale, 1)); line-height:1; }
   .close:hover { color:var(--accent); }
   .content { flex:1; overflow:auto; padding:12px; margin:0; background:var(--bg-code); color:var(--text); font-family:var(--font-mono); font-size:calc(12px * var(--scale, 1)); white-space:pre; }
+  .edit-content { flex:1; overflow:auto; padding:12px; margin:0; background:var(--bg-code); }
   .content.wrap { white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere; }
   .live-content { flex:1; overflow:auto; padding:8px 12px; }
   .sa-text { color:var(--text); font-family:var(--font-mono); font-size:calc(12px * var(--scale, 1)); white-space:pre-wrap; word-break:break-word; padding:4px 0; }

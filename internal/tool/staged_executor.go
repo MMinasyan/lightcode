@@ -181,7 +181,6 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 			content = res.UpdatedContent
 			results[idx].Success = true
 			results[idx].Result = res.Summary
-			results[idx].Diff = computeDiff(oldStr, newStr)
 			successes++
 		case "write_file":
 			writeContent, _ := call.Params["content"].(string)
