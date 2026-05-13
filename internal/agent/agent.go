@@ -11,8 +11,6 @@ import (
 	"sync"
 	"time"
 
-	openai "github.com/sashabaranov/go-openai"
-
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/compact"
 	"github.com/MMinasyan/lightcode/internal/config"
@@ -682,10 +680,7 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 		return fmt.Errorf("nothing to compact")
 	}
 	// Skip system prompt at index 0.
-	toSummarize := make([]openai.ChatCompletionMessage, 0, len(messages)-1)
-	for _, msg := range messages[1:] {
-		toSummarize = append(toSummarize, provider.CanonicalToOpenAI(msg))
-	}
+	toSummarize := messages[1:]
 
 	client, summarizerWindow := a.summarizerClientAndWindow()
 	if summarizerWindow <= 0 {

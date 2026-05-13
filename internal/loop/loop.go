@@ -165,14 +165,6 @@ func (l *Loop) emit(ev Event) {
 // system prompt at index 0. Callers must not mutate the returned slice.
 func (l *Loop) Messages() []message.Message { return l.messages }
 
-func openAIMessages(messages []message.Message) []openai.ChatCompletionMessage {
-	out := make([]openai.ChatCompletionMessage, len(messages))
-	for i, msg := range messages {
-		out[i] = provider.CanonicalToOpenAI(msg)
-	}
-	return out
-}
-
 func assistantMessageHasPayload(msg message.Message) bool {
 	return len(msg.Content) > 0 || msg.Refusal != "" || len(msg.ToolCalls) > 0 || len(msg.Extra) > 0
 }
@@ -445,7 +437,7 @@ func (l *Loop) runStream(ctx context.Context) (message.Message, bool, error) {
 		}
 		var stream *provider.Stream
 		var err error
-		stream, err = l.client.ChatStream(ctx, openAIMessages(l.messages), l.registry.OpenAITools(), nil)
+		stream, err = l.client.ChatStream(ctx, l.messages, l.registry.OpenAITools(), nil)
 		if err != nil {
 			if ctx.Err() != nil {
 				return message.Message{Role: message.RoleAssistant}, true, nil
