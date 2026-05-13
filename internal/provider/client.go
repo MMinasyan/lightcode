@@ -83,6 +83,15 @@ func (c *Client) Model() string {
 	return c.ModelID()
 }
 
+// ModelRef returns the resolved provider/model identity for messages produced
+// by this client.
+func (c *Client) ModelRef() catalog.ModelRef {
+	if c == nil || c.provider == nil || c.model == nil {
+		return catalog.ModelRef{}
+	}
+	return catalog.ModelRef{Provider: c.provider.ID, Model: c.model.ID}
+}
+
 func (c *Client) postStream(ctx context.Context, body map[string]any) (*Stream, error) {
 	resp, err := c.postJSON(ctx, body)
 	if err != nil {
