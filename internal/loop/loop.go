@@ -499,13 +499,14 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (open
 			}
 			return openai.ChatCompletionMessage{}, false, fmt.Errorf("stream recv: %w", err)
 		}
-		if chunk.Usage != nil {
-			usage = chunk.Usage
+		typed := chunk.Typed
+		if typed.Usage != nil {
+			usage = typed.Usage
 		}
-		if len(chunk.Choices) == 0 {
+		if len(typed.Choices) == 0 {
 			continue
 		}
-		choice := chunk.Choices[0]
+		choice := typed.Choices[0]
 		sawChoice = true
 		if choice.FinishReason != "" && choice.FinishReason != openai.FinishReasonNull {
 			finishReason = choice.FinishReason

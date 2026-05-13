@@ -31,6 +31,7 @@ const (
 type Message struct {
 	Role       Role
 	Content    []ContentPart
+	Refusal    string
 	ToolCalls  []ToolCall
 	ToolCallID string
 	Name       string
@@ -116,6 +117,9 @@ func (m Message) MarshalJSON() ([]byte, error) {
 		}
 		obj["content"] = content
 	}
+	if m.Refusal != "" {
+		mustSet(obj, "refusal", m.Refusal)
+	}
 	if len(m.ToolCalls) > 0 {
 		data, err := json.Marshal(m.ToolCalls)
 		if err != nil {
@@ -157,6 +161,10 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 				return fieldError(key, err)
 			}
 			out.Content = content
+		case "refusal":
+			if err := json.Unmarshal(value, &out.Refusal); err != nil {
+				return fieldError(key, err)
+			}
 		case "tool_calls":
 			if err := json.Unmarshal(value, &out.ToolCalls); err != nil {
 				return fieldError(key, err)
@@ -388,7 +396,7 @@ func fieldError(field string, err error) error {
 
 func isMessageField(key string) bool {
 	switch key {
-	case "role", "content", "tool_calls", "tool_call_id", "name", "_lightcode_source":
+	case "role", "content", "refusal", "tool_calls", "tool_call_id", "name", "_lightcode_source":
 		return true
 	default:
 		return false

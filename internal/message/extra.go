@@ -147,6 +147,11 @@ func accumulateSameKind(kind jsonKind, previous, next json.RawMessage) (json.Raw
 	}
 }
 
+// CloneRaw returns a copy of a raw JSON value.
+func CloneRaw(raw json.RawMessage) json.RawMessage {
+	return cloneRaw(raw)
+}
+
 func cloneRaw(raw json.RawMessage) json.RawMessage {
 	if raw == nil {
 		return nil
