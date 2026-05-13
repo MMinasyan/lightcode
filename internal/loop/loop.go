@@ -16,6 +16,7 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 
 	"github.com/MMinasyan/lightcode/internal/editpreview"
+	"github.com/MMinasyan/lightcode/internal/message"
 	"github.com/MMinasyan/lightcode/internal/provider"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
@@ -95,7 +96,7 @@ type Event struct {
 type Loop struct {
 	client   *provider.Client
 	registry *tool.Registry
-	messages []openai.ChatCompletionMessage
+	messages []message.Message
 
 	// turnBoundaries records the index of each user message in
 	// l.messages as it is appended. turnBoundaries[i] is the index of
@@ -122,10 +123,8 @@ func New(client *provider.Client, registry *tool.Registry, systemPrompt string) 
 	return &Loop{
 		client:   client,
 		registry: registry,
-		messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
-		},
-		trace: io.Discard,
+		messages: []message.Message{message.NewText(message.RoleSystem, systemPrompt)},
+		trace:    io.Discard,
 	}
 }
 
@@ -164,20 +163,35 @@ func (l *Loop) emit(ev Event) {
 
 // Messages returns the current in-memory conversation, including the
 // system prompt at index 0. Callers must not mutate the returned slice.
-func (l *Loop) Messages() []openai.ChatCompletionMessage { return l.messages }
+func (l *Loop) Messages() []message.Message { return l.messages }
 
-func assistantMessageHasPayload(msg openai.ChatCompletionMessage) bool {
-	return msg.Content != "" || len(msg.MultiContent) > 0 || len(msg.ToolCalls) > 0
+func openAIMessages(messages []message.Message) []openai.ChatCompletionMessage {
+	out := make([]openai.ChatCompletionMessage, len(messages))
+	for i, msg := range messages {
+		out[i] = provider.CanonicalToOpenAI(msg)
+	}
+	return out
 }
 
-func normalizeAssistantToolCalls(msg openai.ChatCompletionMessage) openai.ChatCompletionMessage {
+func assistantMessageHasPayload(msg message.Message) bool {
+	return len(msg.Content) > 0 || msg.Refusal != "" || len(msg.ToolCalls) > 0 || len(msg.Extra) > 0
+}
+
+func assistantVisibleText(msg message.Message) string {
+	if text := msg.TextContent(); text != "" {
+		return text
+	}
+	return msg.Refusal
+}
+
+func normalizeAssistantToolCalls(msg message.Message) message.Message {
 	for i := range msg.ToolCalls {
 		msg.ToolCalls[i] = normalizeToolCall(msg.ToolCalls[i])
 	}
 	return msg
 }
 
-func normalizeToolCall(tc openai.ToolCall) openai.ToolCall {
+func normalizeToolCall(tc message.ToolCall) message.ToolCall {
 	tc.Function.Arguments = normalizeToolCallArgs(tc.Function.Name, tc.Function.Arguments)
 	return tc
 }
@@ -222,10 +236,10 @@ func emptyAssistantResponseError(finishReason openai.FinishReason, sawChoice boo
 	return fmt.Errorf("empty assistant response")
 }
 
-func filterHistoryTurn(turn []openai.ChatCompletionMessage) []openai.ChatCompletionMessage {
-	out := make([]openai.ChatCompletionMessage, 0, len(turn))
+func filterHistoryTurn(turn []message.Message) []message.Message {
+	out := make([]message.Message, 0, len(turn))
 	for _, msg := range turn {
-		if msg.Role == openai.ChatMessageRoleAssistant && !assistantMessageHasPayload(msg) {
+		if msg.Role == message.RoleAssistant && !assistantMessageHasPayload(msg) {
 			continue
 		}
 		out = append(out, msg)
@@ -235,8 +249,8 @@ func filterHistoryTurn(turn []openai.ChatCompletionMessage) []openai.ChatComplet
 
 // UpdateSystemPrompt replaces the system prompt (messages[0]).
 func (l *Loop) UpdateSystemPrompt(content string) {
-	if len(l.messages) > 0 && l.messages[0].Role == openai.ChatMessageRoleSystem {
-		l.messages[0].Content = content
+	if len(l.messages) > 0 && l.messages[0].Role == message.RoleSystem {
+		l.messages[0] = message.NewText(message.RoleSystem, content)
 	}
 }
 
@@ -244,10 +258,7 @@ func (l *Loop) UpdateSystemPrompt(content string) {
 // it under the given turn. Does not run the model.
 func (l *Loop) AppendUserMessage(turn int, content string) {
 	l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
-	msg := openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
-		Content: content,
-	}
+	msg := message.NewText(message.RoleUser, content)
 	l.messages = append(l.messages, msg)
 	l.persistMessage(turn, msg)
 }
@@ -255,16 +266,13 @@ func (l *Loop) AppendUserMessage(turn int, content string) {
 // AppendSignal appends a user-role system signal message to the
 // conversation history. Not persisted and not counted as a turn boundary.
 func (l *Loop) AppendSignal(content string) {
-	l.messages = append(l.messages, openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
-		Content: content,
-	})
+	l.messages = append(l.messages, message.NewText(message.RoleUser, content))
 }
 
 // ResetHistory drops all messages and turn boundaries, leaving only
 // the system prompt. Used when switching sessions.
 func (l *Loop) ResetHistory() {
-	if len(l.messages) > 0 && l.messages[0].Role == openai.ChatMessageRoleSystem {
+	if len(l.messages) > 0 && l.messages[0].Role == message.RoleSystem {
 		l.messages = l.messages[:1]
 	} else {
 		l.messages = nil
@@ -276,7 +284,7 @@ func (l *Loop) ResetHistory() {
 // turn's messages are appended in order. The first message of each
 // turn is assumed to be the user message (defines the turn boundary).
 // The existing system prompt is preserved.
-func (l *Loop) LoadHistory(turns [][]openai.ChatCompletionMessage) {
+func (l *Loop) LoadHistory(turns [][]message.Message) {
 	l.ResetHistory()
 	for _, turn := range turns {
 		turn = filterHistoryTurn(turn)
@@ -291,12 +299,9 @@ func (l *Loop) LoadHistory(turns [][]openai.ChatCompletionMessage) {
 // LoadHistoryWithSummary restores a conversation that went through
 // compaction. A synthetic user message containing the summary is
 // injected before any post-compaction turns.
-func (l *Loop) LoadHistoryWithSummary(summary string, turns [][]openai.ChatCompletionMessage) {
+func (l *Loop) LoadHistoryWithSummary(summary string, turns [][]message.Message) {
 	l.ResetHistory()
-	summaryMsg := openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
-		Content: "[Previous conversation summary]\n\n" + summary + "\n\n[End of summary. Continue from here.]",
-	}
+	summaryMsg := message.NewText(message.RoleUser, "[Previous conversation summary]\n\n"+summary+"\n\n[End of summary. Continue from here.]")
 	l.messages = append(l.messages, summaryMsg)
 	for _, turn := range turns {
 		turn = filterHistoryTurn(turn)
@@ -312,7 +317,7 @@ func (l *Loop) LoadHistoryWithSummary(summary string, turns [][]openai.ChatCompl
 // messages.jsonl via the store. Errors are traced but do not fail the
 // turn — persistence is best-effort so model interaction never stalls
 // on disk issues.
-func (l *Loop) persistMessage(turn int, msg openai.ChatCompletionMessage) {
+func (l *Loop) persistMessage(turn int, msg message.Message) {
 	if l.store == nil {
 		return
 	}
@@ -343,10 +348,7 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 
 	l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
 	for _, input := range userInputs {
-		userMsg := openai.ChatCompletionMessage{
-			Role:    openai.ChatMessageRoleUser,
-			Content: input,
-		}
+		userMsg := message.NewText(message.RoleUser, input)
 		l.messages = append(l.messages, userMsg)
 		l.persistMessage(turn, userMsg)
 	}
@@ -372,13 +374,10 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 				l.persistMessage(turn, msg)
 			}
 			l.pendingQueue.Discard()
-			signalMsg := openai.ChatCompletionMessage{
-				Role:    openai.ChatMessageRoleUser,
-				Content: interruptedSignal,
-			}
+			signalMsg := message.NewText(message.RoleUser, interruptedSignal)
 			l.messages = append(l.messages, signalMsg)
 			l.persistMessage(turn, signalMsg)
-			return msg.Content, nil
+			return assistantVisibleText(msg), nil
 		}
 		l.messages = append(l.messages, msg)
 		l.persistMessage(turn, msg)
@@ -387,25 +386,19 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 			// Auto-flush pending edits at turn end.
 			if l.pendingQueue.Len() > 0 {
 				result := l.flushPendingQueue(ctx)
-				toolMsg := openai.ChatCompletionMessage{
-					Role:    openai.ChatMessageRoleUser,
-					Content: result,
-				}
+				toolMsg := message.NewText(message.RoleUser, result)
 				l.messages = append(l.messages, toolMsg)
 				l.persistMessage(turn, toolMsg)
 			}
-			return msg.Content, nil
+			return assistantVisibleText(msg), nil
 		}
 
 		denied := false
 		for _, tc := range msg.ToolCalls {
 			result, d := l.dispatch(ctx, tc)
-			toolMsg := openai.ChatCompletionMessage{
-				Role:       openai.ChatMessageRoleTool,
-				Content:    result,
-				ToolCallID: tc.ID,
-				Name:       tc.Function.Name,
-			}
+			toolMsg := message.NewText(message.RoleTool, result)
+			toolMsg.ToolCallID = tc.ID
+			toolMsg.Name = tc.Function.Name
 			l.messages = append(l.messages, toolMsg)
 			l.persistMessage(turn, toolMsg)
 			if d {
@@ -433,9 +426,9 @@ func isRetryable(err error) bool {
 	return false
 }
 
-func (l *Loop) runStream(ctx context.Context) (openai.ChatCompletionMessage, bool, error) {
+func (l *Loop) runStream(ctx context.Context) (message.Message, bool, error) {
 	if l.client == nil {
-		return openai.ChatCompletionMessage{}, false, fmt.Errorf("no model configured — set default_model in ~/.lightcode/config.json and an API key in ~/.lightcode/.env")
+		return message.Message{}, false, fmt.Errorf("no model configured — set default_model in ~/.lightcode/config.json and an API key in ~/.lightcode/.env")
 	}
 	const maxRetries = 3
 	backoff := 2 * time.Second
@@ -445,23 +438,23 @@ func (l *Loop) runStream(ctx context.Context) (openai.ChatCompletionMessage, boo
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant}, true, nil
+				return message.Message{Role: message.RoleAssistant}, true, nil
 			case <-time.After(backoff):
 			}
 			backoff *= 2
 		}
 		var stream *provider.Stream
 		var err error
-		stream, err = l.client.ChatStream(ctx, l.messages, l.registry.OpenAITools(), nil)
+		stream, err = l.client.ChatStream(ctx, openAIMessages(l.messages), l.registry.OpenAITools(), nil)
 		if err != nil {
 			if ctx.Err() != nil {
-				return openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant}, true, nil
+				return message.Message{Role: message.RoleAssistant}, true, nil
 			}
 			if isRetryable(err) && attempt < maxRetries {
 				lastErr = err
 				continue
 			}
-			return openai.ChatCompletionMessage{}, false, err
+			return message.Message{}, false, err
 		}
 		msg, cancelled, err := l.consumeStream(ctx, stream)
 		stream.Close()
@@ -471,15 +464,15 @@ func (l *Loop) runStream(ctx context.Context) (openai.ChatCompletionMessage, boo
 		}
 		return msg, cancelled, err
 	}
-	return openai.ChatCompletionMessage{}, false, lastErr
+	return message.Message{}, false, lastErr
 }
 
-func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (openai.ChatCompletionMessage, bool, error) {
+func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (message.Message, bool, error) {
 
 	var (
 		contentBuf   strings.Builder
 		refusalBuf   strings.Builder
-		toolDeltas   map[int]*openai.ToolCall
+		toolDeltas   map[int]*message.ToolCall
 		role         string
 		finishReason openai.FinishReason
 		usage        *openai.Usage
@@ -497,7 +490,7 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (open
 				cancelled = true
 				break
 			}
-			return openai.ChatCompletionMessage{}, false, fmt.Errorf("stream recv: %w", err)
+			return message.Message{}, false, fmt.Errorf("stream recv: %w", err)
 		}
 		typed := chunk.Typed
 		if typed.Usage != nil {
@@ -530,11 +523,11 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (open
 			}
 			idx := *tc.Index
 			if toolDeltas == nil {
-				toolDeltas = make(map[int]*openai.ToolCall)
+				toolDeltas = make(map[int]*message.ToolCall)
 			}
 			entry, ok := toolDeltas[idx]
 			if !ok {
-				entry = &openai.ToolCall{Index: tc.Index, Type: tc.Type}
+				entry = &message.ToolCall{Type: string(tc.Type)}
 				toolDeltas[idx] = entry
 			}
 			if tc.ID != "" {
@@ -567,23 +560,21 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (open
 	}
 
 	if role == "" {
-		role = openai.ChatMessageRoleAssistant
+		role = string(message.RoleAssistant)
 	}
 	content := contentBuf.String()
-	if content == "" && refusalBuf.Len() > 0 {
-		content = refusalBuf.String()
+	msg := message.Message{Role: message.Role(role), Refusal: refusalBuf.String()}
+	if l.client != nil {
+		msg.Source = l.client.ModelRef()
 	}
-	msg := openai.ChatCompletionMessage{
-		Role:    role,
-		Content: content,
-	}
+	msg.AppendText(content)
 	if len(toolDeltas) > 0 && !cancelled {
 		indices := make([]int, 0, len(toolDeltas))
 		for idx := range toolDeltas {
 			indices = append(indices, idx)
 		}
 		sort.Ints(indices)
-		calls := make([]openai.ToolCall, 0, len(indices))
+		calls := make([]message.ToolCall, 0, len(indices))
 		for _, idx := range indices {
 			if tc := toolDeltas[idx]; tc != nil {
 				calls = append(calls, *tc)
@@ -599,7 +590,7 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (open
 
 // dispatch executes one tool call and returns the result string plus a
 // bool indicating whether the user denied the operation.
-func (l *Loop) dispatch(ctx context.Context, tc openai.ToolCall) (string, bool) {
+func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) (string, bool) {
 	tc = normalizeToolCall(tc)
 	fmt.Fprintf(l.trace, "  → %s %s\n", tc.Function.Name, truncate(tc.Function.Arguments, traceMaxChars))
 	l.emit(Event{Kind: ToolCallStart, ToolCallID: tc.ID, ToolName: tc.Function.Name, Args: tc.Function.Arguments})

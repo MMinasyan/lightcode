@@ -20,6 +20,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/loop"
 	"github.com/MMinasyan/lightcode/internal/lsp"
 	"github.com/MMinasyan/lightcode/internal/memory"
+	"github.com/MMinasyan/lightcode/internal/message"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/process"
 	"github.com/MMinasyan/lightcode/internal/project"
@@ -681,7 +682,10 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 		return fmt.Errorf("nothing to compact")
 	}
 	// Skip system prompt at index 0.
-	toSummarize := messages[1:]
+	toSummarize := make([]openai.ChatCompletionMessage, 0, len(messages)-1)
+	for _, msg := range messages[1:] {
+		toSummarize = append(toSummarize, provider.CanonicalToOpenAI(msg))
+	}
 
 	client, summarizerWindow := a.summarizerClientAndWindow()
 	if summarizerWindow <= 0 {
@@ -918,11 +922,11 @@ func (a *Agent) loadHistoryIntoLoop() error {
 		return err
 	}
 
-	decoded := make([][]openai.ChatCompletionMessage, 0, len(raw))
+	decoded := make([][]message.Message, 0, len(raw))
 	for _, t := range raw {
-		var turnMsgs []openai.ChatCompletionMessage
+		var turnMsgs []message.Message
 		for _, line := range t.Messages {
-			var m openai.ChatCompletionMessage
+			var m message.Message
 			if err := json.Unmarshal(line, &m); err != nil {
 				continue
 			}
@@ -1746,15 +1750,15 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 
 	for _, t := range raw {
 		for _, line := range t.Messages {
-			var m openai.ChatCompletionMessage
+			var m message.Message
 			if json.Unmarshal(line, &m) != nil {
 				continue
 			}
 			switch m.Role {
-			case openai.ChatMessageRoleSystem:
+			case message.RoleSystem:
 
-			case openai.ChatMessageRoleUser:
-				c := m.Content
+			case message.RoleUser:
+				c := m.TextContent()
 				if strings.HasPrefix(c, "<system-signal>") && strings.HasSuffix(c, "</system-signal>") {
 					signal := c[len("<system-signal>") : len(c)-len("</system-signal>")]
 					if strings.Contains(signal, "interrupted") {
@@ -1766,9 +1770,13 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 					out = append(out, DisplayMessage{Type: "user", Content: c, Turn: t.Turn})
 				}
 
-			case openai.ChatMessageRoleAssistant:
-				if m.Content != "" {
-					out = append(out, DisplayMessage{Type: "assistant", Content: m.Content, Turn: t.Turn})
+			case message.RoleAssistant:
+				content := m.TextContent()
+				if content == "" {
+					content = m.Refusal
+				}
+				if content != "" {
+					out = append(out, DisplayMessage{Type: "assistant", Content: content, Turn: t.Turn})
 				}
 				for _, tc := range m.ToolCalls {
 					toolStubs[tc.ID] = len(out)
@@ -1780,13 +1788,14 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 					})
 				}
 
-			case openai.ChatMessageRoleTool:
+			case message.RoleTool:
 				if idx, ok := toolStubs[m.ToolCallID]; ok {
 					out[idx].Done = true
-					out[idx].Success = m.Content != "denied by user" && !strings.HasPrefix(m.Content, "error: ")
-					out[idx].Result = m.Content
+					content := m.TextContent()
+					out[idx].Success = content != "denied by user" && !strings.HasPrefix(content, "error: ")
+					out[idx].Result = content
 					if out[idx].Success {
-						out[idx].Metadata = displayMetadataForToolCall(out[idx].Name, out[idx].Args, m.Content)
+						out[idx].Metadata = displayMetadataForToolCall(out[idx].Name, out[idx].Args, content)
 					}
 				}
 			}
