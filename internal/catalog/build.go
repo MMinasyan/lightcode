@@ -245,9 +245,6 @@ func applyDiscovery(providerID string, raw map[string]any, discovered Discovered
 		if shouldFillInt(modelRaw["max_output_tokens"]) && modelDiscovery.MaxOutputTokens > 0 {
 			modelRaw["max_output_tokens"] = float64(modelDiscovery.MaxOutputTokens)
 		}
-		if shouldFillInt(modelRaw["max_output_tokens"]) && !shouldFillInt(modelRaw["context_window"]) {
-			modelRaw["max_output_tokens"] = modelRaw["context_window"]
-		}
 		if modelDiscovery.Cost != nil {
 			existingCost, _ := modelRaw["cost"].(map[string]any)
 			if existingCost == nil {

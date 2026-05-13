@@ -126,9 +126,6 @@ func (c *Catalog) MergeDiscoveredProvider(providerID string, discovered Discover
 		if model.MaxOutputTokens == 0 && discoveredModel.MaxOutputTokens > 0 {
 			model.MaxOutputTokens = discoveredModel.MaxOutputTokens
 		}
-		if model.MaxOutputTokens == 0 && model.ContextWindow > 0 {
-			model.MaxOutputTokens = model.ContextWindow
-		}
 		if discoveredModel.Cost != nil {
 			if model.Cost == nil {
 				model.Cost = &Cost{}

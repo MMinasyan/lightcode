@@ -6,8 +6,6 @@ type IncompleteReason int
 const (
 	// ReasonMissingContextWindow means context_window is unset.
 	ReasonMissingContextWindow IncompleteReason = iota
-	// ReasonMissingMaxOutputTokens means max_output_tokens is unset.
-	ReasonMissingMaxOutputTokens
 )
 
 // Incomplete describes a model entry missing required capacity metadata.
@@ -16,7 +14,9 @@ type Incomplete struct {
 	Reasons []IncompleteReason
 }
 
-// Incomplete returns capacity fields missing from the model.
+// Incomplete returns capacity fields missing from the model. Only
+// context_window is required; max_output_tokens is optional and only acts
+// as a request cap when set, so missing it does not block use.
 func (m *Model) Incomplete() (Incomplete, bool) {
 	if m == nil {
 		return Incomplete{}, false
@@ -24,9 +24,6 @@ func (m *Model) Incomplete() (Incomplete, bool) {
 	var reasons []IncompleteReason
 	if m.ContextWindow == 0 {
 		reasons = append(reasons, ReasonMissingContextWindow)
-	}
-	if m.MaxOutputTokens == 0 {
-		reasons = append(reasons, ReasonMissingMaxOutputTokens)
 	}
 	if len(reasons) == 0 {
 		return Incomplete{}, false
