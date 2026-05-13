@@ -463,8 +463,11 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 
 	var (
 		contentBuf   strings.Builder
+		contentParts []message.ContentPart
 		refusalBuf   strings.Builder
 		toolDeltas   map[int]*message.ToolCall
+		msgExtra     = message.NewExtraAccumulator()
+		toolExtra    map[int]*message.ExtraAccumulator
 		role         string
 		finishReason openai.FinishReason
 		usage        *openai.Usage
@@ -484,19 +487,21 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 			}
 			return message.Message{}, false, fmt.Errorf("stream recv: %w", err)
 		}
-		typed := chunk.Typed
-		if typed.Usage != nil {
-			usage = typed.Usage
-		}
-		if len(typed.Choices) == 0 {
+		delta, err := provider.ParseChunk(chunk.Raw)
+		if err != nil {
+			fmt.Fprintf(l.trace, "  !! protocol chunk parse: %v\n", err)
 			continue
 		}
-		choice := typed.Choices[0]
-		sawChoice = true
-		if choice.FinishReason != "" && choice.FinishReason != openai.FinishReasonNull {
-			finishReason = choice.FinishReason
+		if delta.Usage != nil {
+			usage = delta.Usage
 		}
-		delta := choice.Delta
+		if !delta.HasChoice {
+			continue
+		}
+		sawChoice = true
+		if delta.FinishReason != "" && delta.FinishReason != openai.FinishReasonNull {
+			finishReason = delta.FinishReason
+		}
 
 		if delta.Role != "" {
 			role = delta.Role
@@ -505,9 +510,35 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 			contentBuf.WriteString(delta.Content)
 			l.emit(Event{Kind: TextDelta, Result: delta.Content})
 		}
+		for _, part := range delta.ContentParts {
+			contentParts = append(contentParts, part)
+			if part.Type == message.ContentPartText && part.Text != "" {
+				l.emit(Event{Kind: TextDelta, Result: part.Text})
+			}
+		}
 		if delta.Refusal != "" {
 			refusalBuf.WriteString(delta.Refusal)
 			l.emit(Event{Kind: TextDelta, Result: delta.Refusal})
+		}
+		for key, value := range delta.MessageExtra {
+			if err := msgExtra.Add(key, value); err != nil {
+				fmt.Fprintf(l.trace, "  !! protocol message extra: %v\n", err)
+			}
+		}
+		for idx, extra := range delta.ToolCallExtra {
+			if toolExtra == nil {
+				toolExtra = map[int]*message.ExtraAccumulator{}
+			}
+			acc := toolExtra[idx]
+			if acc == nil {
+				acc = message.NewExtraAccumulator()
+				toolExtra[idx] = acc
+			}
+			for key, value := range extra {
+				if err := acc.Add(key, value); err != nil {
+					fmt.Fprintf(l.trace, "  !! protocol tool extra: %v\n", err)
+				}
+			}
 		}
 		for _, tc := range delta.ToolCalls {
 			if tc.Index == nil {
@@ -560,6 +591,10 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 		msg.Source = l.client.ModelRef()
 	}
 	msg.AppendText(content)
+	if len(contentParts) > 0 {
+		msg.Content = append(msg.Content, contentParts...)
+	}
+	msg.Extra = msgExtra.Extra()
 	if len(toolDeltas) > 0 && !cancelled {
 		indices := make([]int, 0, len(toolDeltas))
 		for idx := range toolDeltas {
@@ -569,6 +604,9 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 		calls := make([]message.ToolCall, 0, len(indices))
 		for _, idx := range indices {
 			if tc := toolDeltas[idx]; tc != nil {
+				if acc := toolExtra[idx]; acc != nil {
+					tc.Extra = acc.Extra()
+				}
 				calls = append(calls, *tc)
 			}
 		}

@@ -113,9 +113,13 @@ func decodeSSEData(data []string) (StreamChunk, error) {
 	if strings.TrimSpace(payload) == "[DONE]" {
 		return StreamChunk{}, io.EOF
 	}
-	var out openai.ChatCompletionStreamResponse
-	if err := json.Unmarshal([]byte(payload), &out); err != nil {
-		return StreamChunk{}, err
+	raw := json.RawMessage(payload)
+	if !json.Valid(raw) {
+		return StreamChunk{}, json.Unmarshal([]byte(payload), &struct{}{})
 	}
-	return StreamChunk{Typed: out, Raw: json.RawMessage(payload)}, nil
+	var out openai.ChatCompletionStreamResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return StreamChunk{Raw: raw}, nil
+	}
+	return StreamChunk{Typed: out, Raw: raw}, nil
 }
