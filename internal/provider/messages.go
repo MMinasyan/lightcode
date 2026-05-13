@@ -1,12 +1,10 @@
 package provider
 
 import (
-	"encoding/json"
 	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/message"
-	openai "github.com/sashabaranov/go-openai"
 )
 
 // SerializeMessages converts canonical messages to the OpenAI-compatible
@@ -22,90 +20,6 @@ func SerializeMessages(history []message.Message, target *catalog.Model, provide
 		out = append(out, obj)
 	}
 	return out, nil
-}
-
-// OpenAIToCanonical converts an SDK message into Lightcode's canonical shape.
-// It is a temporary shim for packages that still hold go-openai messages.
-func OpenAIToCanonical(msg openai.ChatCompletionMessage) message.Message {
-	out := message.Message{
-		Role:       message.Role(msg.Role),
-		Refusal:    msg.Refusal,
-		ToolCallID: msg.ToolCallID,
-		Name:       msg.Name,
-	}
-	if len(msg.MultiContent) > 0 {
-		for _, part := range msg.MultiContent {
-			switch part.Type {
-			case openai.ChatMessagePartTypeText:
-				out.Content = append(out.Content, message.ContentPart{Type: message.ContentPartText, Text: part.Text})
-			case openai.ChatMessagePartTypeImageURL:
-				url := ""
-				if part.ImageURL != nil {
-					url = part.ImageURL.URL
-				}
-				out.Content = append(out.Content, message.ContentPart{Type: message.ContentPartImageURL, URL: url})
-			default:
-				out.Content = append(out.Content, message.ContentPart{
-					Type: message.ContentPartOpaque,
-					Extra: message.Extra{
-						"type": mustRaw(string(part.Type)),
-					},
-				})
-			}
-		}
-	} else if msg.Content != "" {
-		out.Content = []message.ContentPart{{Type: message.ContentPartText, Text: msg.Content}}
-	}
-	if len(msg.ToolCalls) > 0 {
-		out.ToolCalls = make([]message.ToolCall, 0, len(msg.ToolCalls))
-		for _, tc := range msg.ToolCalls {
-			out.ToolCalls = append(out.ToolCalls, openAIToolCallToCanonical(tc))
-		}
-	}
-	if msg.ReasoningContent != "" {
-		out.Extra = message.Extra{"reasoning_content": mustRaw(msg.ReasoningContent)}
-	}
-	return out
-}
-
-// CanonicalToOpenAI converts a canonical message into the SDK message shape.
-// It is a temporary shim for packages that have not moved to message.Message.
-func CanonicalToOpenAI(msg message.Message) openai.ChatCompletionMessage {
-	out := openai.ChatCompletionMessage{
-		Role:       string(msg.Role),
-		Refusal:    msg.Refusal,
-		ToolCallID: msg.ToolCallID,
-		Name:       msg.Name,
-	}
-	if len(msg.Content) == 1 && msg.Content[0].Type == message.ContentPartText && len(msg.Content[0].Extra) == 0 {
-		out.Content = msg.Content[0].Text
-	} else if len(msg.Content) > 0 {
-		out.MultiContent = make([]openai.ChatMessagePart, 0, len(msg.Content))
-		for _, part := range msg.Content {
-			switch part.Type {
-			case message.ContentPartText:
-				out.MultiContent = append(out.MultiContent, openai.ChatMessagePart{Type: openai.ChatMessagePartTypeText, Text: part.Text})
-			case message.ContentPartImageURL:
-				out.MultiContent = append(out.MultiContent, openai.ChatMessagePart{
-					Type:     openai.ChatMessagePartTypeImageURL,
-					ImageURL: &openai.ChatMessageImageURL{URL: part.URL},
-				})
-			}
-		}
-	}
-	if len(msg.ToolCalls) > 0 {
-		out.ToolCalls = make([]openai.ToolCall, 0, len(msg.ToolCalls))
-		for _, tc := range msg.ToolCalls {
-			out.ToolCalls = append(out.ToolCalls, canonicalToolCallToOpenAI(tc))
-		}
-	}
-	if raw := msg.Extra["reasoning_content"]; len(raw) > 0 {
-		var reasoning string
-		if json.Unmarshal(raw, &reasoning) == nil {
-			out.ReasoningContent = reasoning
-		}
-	}
-	return out
 }
 
 func serializeMessage(msg message.Message, systemRole catalog.SystemRole) (map[string]any, error) {
@@ -198,34 +112,4 @@ func rawExtraMap(extra message.Extra) map[string]any {
 		out[key] = message.CloneRaw(value)
 	}
 	return out
-}
-
-func openAIToolCallToCanonical(tc openai.ToolCall) message.ToolCall {
-	return message.ToolCall{
-		ID:   tc.ID,
-		Type: string(tc.Type),
-		Function: message.FunctionCall{
-			Name:      tc.Function.Name,
-			Arguments: tc.Function.Arguments,
-		},
-	}
-}
-
-func canonicalToolCallToOpenAI(tc message.ToolCall) openai.ToolCall {
-	return openai.ToolCall{
-		ID:   tc.ID,
-		Type: openai.ToolType(tc.Type),
-		Function: openai.FunctionCall{
-			Name:      tc.Function.Name,
-			Arguments: tc.Function.Arguments,
-		},
-	}
-}
-
-func mustRaw(value any) json.RawMessage {
-	data, err := json.Marshal(value)
-	if err != nil {
-		panic(err)
-	}
-	return data
 }

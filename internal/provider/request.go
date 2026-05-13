@@ -1,9 +1,11 @@
 package provider
 
 import (
+	"encoding/json"
 	"net/http"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/message"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -11,28 +13,74 @@ import (
 type requestConfig struct {
 	provider      *catalog.Provider
 	model         *catalog.Model
-	messages      []openai.ChatCompletionMessage
+	messages      []message.Message
 	tools         []openai.Tool
 	runtimeExtras map[string]any
 }
 
-// applySystemRole walks messages and rewrites system-role messages to use
-// the effective system role from model/provider defaults.
-func applySystemRole(messages []openai.ChatCompletionMessage, role catalog.SystemRole) []openai.ChatCompletionMessage {
+// requestMessages converts canonical messages to the current OpenAI-compatible
+// request shape. Broad opaque Extra replay stays out of this path until Phase 5.
+func requestMessages(messages []message.Message, role catalog.SystemRole) []openai.ChatCompletionMessage {
 	if len(messages) == 0 {
 		return []openai.ChatCompletionMessage{}
 	}
 	if role == "" {
 		role = catalog.RoleSystem
 	}
-	adjusted := make([]openai.ChatCompletionMessage, len(messages))
-	copy(adjusted, messages)
-	for i := range adjusted {
-		if adjusted[i].Role == "system" {
-			adjusted[i].Role = string(role)
+	out := make([]openai.ChatCompletionMessage, 0, len(messages))
+	for _, msg := range messages {
+		wire := canonicalRequestMessage(msg)
+		if wire.Role == string(message.RoleSystem) {
+			wire.Role = string(role)
+		}
+		out = append(out, wire)
+	}
+	return out
+}
+
+func canonicalRequestMessage(msg message.Message) openai.ChatCompletionMessage {
+	out := openai.ChatCompletionMessage{
+		Role:       string(msg.Role),
+		Refusal:    msg.Refusal,
+		ToolCallID: msg.ToolCallID,
+		Name:       msg.Name,
+	}
+	if len(msg.Content) == 1 && msg.Content[0].Type == message.ContentPartText && len(msg.Content[0].Extra) == 0 {
+		out.Content = msg.Content[0].Text
+	} else if len(msg.Content) > 0 {
+		out.MultiContent = make([]openai.ChatMessagePart, 0, len(msg.Content))
+		for _, part := range msg.Content {
+			switch part.Type {
+			case message.ContentPartText:
+				out.MultiContent = append(out.MultiContent, openai.ChatMessagePart{Type: openai.ChatMessagePartTypeText, Text: part.Text})
+			case message.ContentPartImageURL:
+				out.MultiContent = append(out.MultiContent, openai.ChatMessagePart{
+					Type:     openai.ChatMessagePartTypeImageURL,
+					ImageURL: &openai.ChatMessageImageURL{URL: part.URL},
+				})
+			}
 		}
 	}
-	return adjusted
+	if len(msg.ToolCalls) > 0 {
+		out.ToolCalls = make([]openai.ToolCall, 0, len(msg.ToolCalls))
+		for _, tc := range msg.ToolCalls {
+			out.ToolCalls = append(out.ToolCalls, openai.ToolCall{
+				ID:   tc.ID,
+				Type: openai.ToolType(tc.Type),
+				Function: openai.FunctionCall{
+					Name:      tc.Function.Name,
+					Arguments: tc.Function.Arguments,
+				},
+			})
+		}
+	}
+	if raw := msg.Extra["reasoning_content"]; len(raw) > 0 {
+		var reasoning string
+		if json.Unmarshal(raw, &reasoning) == nil {
+			out.ReasoningContent = reasoning
+		}
+	}
+	return out
 }
 
 // buildRequestBody assembles the JSON body for a streaming chat completion.
@@ -49,7 +97,7 @@ func buildRequestBody(cfg requestConfig) (map[string]any, error) {
 
 	body := map[string]any{
 		"model":    cfg.model.ID,
-		"messages": applySystemRole(cfg.messages, effectiveSystemRole(cfg.provider, cfg.model)),
+		"messages": requestMessages(cfg.messages, effectiveSystemRole(cfg.provider, cfg.model)),
 		"stream":   true,
 		"n":        1,
 	}

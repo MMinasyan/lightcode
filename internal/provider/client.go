@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/message"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -27,7 +28,7 @@ func New(provider *catalog.Provider, model *catalog.Model, apiKey string) *Clien
 
 // ChatStream opens a streaming chat completion request and returns a Stream.
 // The caller must call Stream.Close() when done.
-func (c *Client) ChatStream(ctx context.Context, messages []openai.ChatCompletionMessage, tools []openai.Tool, runtimeExtras map[string]any) (*Stream, error) {
+func (c *Client) ChatStream(ctx context.Context, messages []message.Message, tools []openai.Tool, runtimeExtras map[string]any) (*Stream, error) {
 	body, err := buildRequestBody(requestConfig{
 		provider:      c.provider,
 		model:         c.model,
@@ -43,7 +44,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []openai.ChatCompletio
 
 // Chat performs a single non-streaming chat completion request. It is kept for
 // compaction while the rest of the runtime moves to the streaming client.
-func (c *Client) Chat(ctx context.Context, messages []openai.ChatCompletionMessage, tools []openai.Tool) (openai.ChatCompletionResponse, error) {
+func (c *Client) Chat(ctx context.Context, messages []message.Message, tools []openai.Tool) (openai.ChatCompletionResponse, error) {
 	body, err := buildRequestBody(requestConfig{
 		provider: c.provider,
 		model:    c.model,

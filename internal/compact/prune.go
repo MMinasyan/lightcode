@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	openai "github.com/sashabaranov/go-openai"
+	"github.com/MMinasyan/lightcode/internal/message"
 )
 
 const (
@@ -16,24 +16,25 @@ const (
 // 1. All tool result contents replaced with placeholder.
 // 2. For read_file calls, the last read of each path is restored.
 // 3. Restored outputs truncated if over maxOutputChars.
-func Prune(messages []openai.ChatCompletionMessage) []openai.ChatCompletionMessage {
-	out := make([]openai.ChatCompletionMessage, len(messages))
+func Prune(messages []message.Message) []message.Message {
+	out := make([]message.Message, len(messages))
 	copy(out, messages)
 
 	toolCallIndex := buildToolCallIndex(out)
 	lastReadIndex := lastFileReadIndexes(out, toolCallIndex)
 
 	for i := range out {
-		if out[i].Role != openai.ChatMessageRoleTool {
+		if out[i].Role != message.RoleTool {
 			continue
 		}
 		if _, keep := lastReadIndex[i]; keep {
-			if len(out[i].Content) > maxOutputChars {
-				out[i].Content = out[i].Content[:maxOutputChars] + fmt.Sprintf("\n[truncated — %d chars total]", len(messages[i].Content))
+			content := out[i].TextContent()
+			if len(content) > maxOutputChars {
+				setTextContent(&out[i], content[:maxOutputChars]+fmt.Sprintf("\n[truncated — %d chars total]", len(messages[i].TextContent())))
 			}
 			continue
 		}
-		out[i].Content = placeholder
+		setTextContent(&out[i], placeholder)
 	}
 
 	return out
@@ -44,10 +45,10 @@ type toolCallInfo struct {
 	Args string
 }
 
-func buildToolCallIndex(msgs []openai.ChatCompletionMessage) map[string]toolCallInfo {
+func buildToolCallIndex(msgs []message.Message) map[string]toolCallInfo {
 	idx := map[string]toolCallInfo{}
 	for _, m := range msgs {
-		if m.Role != openai.ChatMessageRoleAssistant {
+		if m.Role != message.RoleAssistant {
 			continue
 		}
 		for _, tc := range m.ToolCalls {
@@ -57,10 +58,10 @@ func buildToolCallIndex(msgs []openai.ChatCompletionMessage) map[string]toolCall
 	return idx
 }
 
-func lastFileReadIndexes(msgs []openai.ChatCompletionMessage, tcIndex map[string]toolCallInfo) map[int]bool {
+func lastFileReadIndexes(msgs []message.Message, tcIndex map[string]toolCallInfo) map[int]bool {
 	lastByPath := map[string]int{}
 	for i, m := range msgs {
-		if m.Role != openai.ChatMessageRoleTool {
+		if m.Role != message.RoleTool {
 			continue
 		}
 		info, ok := tcIndex[m.ToolCallID]
@@ -80,4 +81,9 @@ func lastFileReadIndexes(msgs []openai.ChatCompletionMessage, tcIndex map[string
 		keep[idx] = true
 	}
 	return keep
+}
+
+func setTextContent(msg *message.Message, content string) {
+	msg.Content = nil
+	msg.AppendText(content)
 }

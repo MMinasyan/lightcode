@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	openai "github.com/sashabaranov/go-openai"
+	"github.com/MMinasyan/lightcode/internal/message"
 )
 
 // DefaultSummarizerPrompt is the default system prompt for the summarizer.
@@ -36,7 +36,7 @@ const summaryBudget = 20_000
 // Run prunes messages and produces a summary, using single-shot or
 // iterative summarization depending on whether the pruned conversation
 // fits in the summarizer's context window.
-func Run(ctx context.Context, messages []openai.ChatCompletionMessage, cfg Config) (Result, error) {
+func Run(ctx context.Context, messages []message.Message, cfg Config) (Result, error) {
 	pruned := Prune(messages)
 	prunedTokens := CountTokens(pruned)
 
@@ -60,16 +60,16 @@ func Run(ctx context.Context, messages []openai.ChatCompletionMessage, cfg Confi
 	return Result{Summary: summary, SummarizerModel: cfg.SummarizerClient.Model()}, nil
 }
 
-func summarizeOnce(ctx context.Context, cfg Config, systemPrompt, previousSummary string, messages []openai.ChatCompletionMessage) (string, error) {
+func summarizeOnce(ctx context.Context, cfg Config, systemPrompt, previousSummary string, messages []message.Message) (string, error) {
 	userContent := ""
 	if previousSummary != "" {
 		userContent = "Previous summary:\n" + previousSummary + "\n\nContinuation:\n"
 	}
 	userContent += serializeMessages(messages)
 
-	resp, err := cfg.SummarizerClient.Chat(ctx, []openai.ChatCompletionMessage{
-		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
-		{Role: openai.ChatMessageRoleUser, Content: userContent},
+	resp, err := cfg.SummarizerClient.Chat(ctx, []message.Message{
+		message.NewText(message.RoleSystem, systemPrompt),
+		message.NewText(message.RoleUser, userContent),
 	}, nil)
 	if err != nil {
 		return "", fmt.Errorf("summarizer call failed: %w", err)
@@ -80,7 +80,7 @@ func summarizeOnce(ctx context.Context, cfg Config, systemPrompt, previousSummar
 	return resp.Choices[0].Message.Content, nil
 }
 
-func summarizeIterative(ctx context.Context, cfg Config, systemPrompt string, pruned []openai.ChatCompletionMessage) (string, error) {
+func summarizeIterative(ctx context.Context, cfg Config, systemPrompt string, pruned []message.Message) (string, error) {
 	maxPieceTokens := int(float64(cfg.ContextWindow-summaryBudget*2) / safetyMargin)
 	if maxPieceTokens < 1000 {
 		maxPieceTokens = 1000
@@ -101,10 +101,10 @@ func summarizeIterative(ctx context.Context, cfg Config, systemPrompt string, pr
 // splitIntoPieces splits messages into groups that fit within maxTokens.
 // Never splits between an assistant message with ToolCalls and the
 // subsequent tool result messages.
-func splitIntoPieces(messages []openai.ChatCompletionMessage, maxTokens int) [][]openai.ChatCompletionMessage {
+func splitIntoPieces(messages []message.Message, maxTokens int) [][]message.Message {
 	groups := groupByToolPairs(messages)
-	var pieces [][]openai.ChatCompletionMessage
-	var current []openai.ChatCompletionMessage
+	var pieces [][]message.Message
+	var current []message.Message
 	currentTokens := 0
 
 	for _, group := range groups {
@@ -125,51 +125,51 @@ func splitIntoPieces(messages []openai.ChatCompletionMessage, maxTokens int) [][
 
 // groupByToolPairs groups messages so that an assistant message with
 // ToolCalls and its subsequent tool result messages are never separated.
-func groupByToolPairs(messages []openai.ChatCompletionMessage) [][]openai.ChatCompletionMessage {
-	var groups [][]openai.ChatCompletionMessage
+func groupByToolPairs(messages []message.Message) [][]message.Message {
+	var groups [][]message.Message
 	i := 0
 	for i < len(messages) {
 		m := messages[i]
-		if m.Role == openai.ChatMessageRoleAssistant && len(m.ToolCalls) > 0 {
-			group := []openai.ChatCompletionMessage{m}
+		if m.Role == message.RoleAssistant && len(m.ToolCalls) > 0 {
+			group := []message.Message{m}
 			i++
-			for i < len(messages) && messages[i].Role == openai.ChatMessageRoleTool {
+			for i < len(messages) && messages[i].Role == message.RoleTool {
 				group = append(group, messages[i])
 				i++
 			}
 			groups = append(groups, group)
 		} else {
-			groups = append(groups, []openai.ChatCompletionMessage{m})
+			groups = append(groups, []message.Message{m})
 			i++
 		}
 	}
 	return groups
 }
 
-func serializeMessages(messages []openai.ChatCompletionMessage) string {
+func serializeMessages(messages []message.Message) string {
 	var b strings.Builder
 	for _, m := range messages {
 		switch m.Role {
-		case openai.ChatMessageRoleUser:
-			fmt.Fprintf(&b, "User: %s\n\n", m.Content)
-		case openai.ChatMessageRoleAssistant:
+		case message.RoleUser:
+			fmt.Fprintf(&b, "User: %s\n\n", m.TextContent())
+		case message.RoleAssistant:
 			if len(m.ToolCalls) > 0 {
-				if m.Content != "" {
-					fmt.Fprintf(&b, "Assistant: %s\n", m.Content)
+				if content := m.TextContent(); content != "" {
+					fmt.Fprintf(&b, "Assistant: %s\n", content)
 				}
 				for _, tc := range m.ToolCalls {
 					fmt.Fprintf(&b, "Assistant [tool_call]: %s(%s)\n", tc.Function.Name, tc.Function.Arguments)
 				}
 				b.WriteString("\n")
 			} else {
-				fmt.Fprintf(&b, "Assistant: %s\n\n", m.Content)
+				fmt.Fprintf(&b, "Assistant: %s\n\n", m.TextContent())
 			}
-		case openai.ChatMessageRoleTool:
+		case message.RoleTool:
 			name := m.Name
 			if name == "" {
 				name = "tool"
 			}
-			fmt.Fprintf(&b, "Tool [%s]: %s\n\n", name, m.Content)
+			fmt.Fprintf(&b, "Tool [%s]: %s\n\n", name, m.TextContent())
 		}
 	}
 	return b.String()
