@@ -57,7 +57,7 @@ func (c *Client) Chat(ctx context.Context, messages []message.Message, tools []o
 	delete(body, "stream")
 	delete(body, "stream_options")
 
-	resp, err := c.postJSON(ctx, body)
+	resp, _, err := c.postJSON(ctx, body)
 	if err != nil {
 		return openai.ChatCompletionResponse{}, err
 	}
@@ -94,21 +94,27 @@ func (c *Client) ModelRef() catalog.ModelRef {
 }
 
 func (c *Client) postStream(ctx context.Context, body map[string]any) (*Stream, error) {
-	resp, err := c.postJSON(ctx, body)
+	resp, chunkPath, err := c.postJSON(ctx, body)
 	if err != nil {
 		return nil, err
 	}
-	return NewStream(resp.Body), nil
+	stream := NewStream(resp.Body)
+	stream.SetDebugChunkPath(chunkPath)
+	return stream, nil
 }
 
-func (c *Client) postJSON(ctx context.Context, body map[string]any) (*http.Response, error) {
+// postJSON marshals body, dumps it to the debug wire dir when enabled, and
+// posts the request. The second return value is the chunks file path for the
+// matching SSE response, or "" when wire-debug is off.
+func (c *Client) postJSON(ctx context.Context, body map[string]any) (*http.Response, string, error) {
 	buf, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("marshal chat completion request: %w", err)
+		return nil, "", fmt.Errorf("marshal chat completion request: %w", err)
 	}
+	chunkPath := debugDumpRequest(buf)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, completionURL(c.provider), bytes.NewReader(buf))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req.Header = buildHeaders(c.provider, c.apiKey)
 
@@ -118,17 +124,17 @@ func (c *Client) postJSON(ctx context.Context, body map[string]any) (*http.Respo
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return resp, nil
+		return resp, chunkPath, nil
 	}
 	defer resp.Body.Close()
 	statusErr := statusError(resp)
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, errors.Join(ErrAuthFailed, statusErr)
+		return nil, "", errors.Join(ErrAuthFailed, statusErr)
 	}
-	return nil, statusErr
+	return nil, "", statusErr
 }
 
 func completionURL(provider *catalog.Provider) string {
