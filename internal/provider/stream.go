@@ -13,9 +13,10 @@ import (
 // It yields typed chunks with the raw JSON payload and returns io.EOF on
 // data:[DONE] or stream end.
 type Stream struct {
-	body   io.ReadCloser
-	reader *bufio.Reader
-	done   bool
+	body      io.ReadCloser
+	reader    *bufio.Reader
+	done      bool
+	chunkPath string
 }
 
 // StreamChunk is one SSE payload decoded into the SDK type while preserving
@@ -28,6 +29,15 @@ type StreamChunk struct {
 // NewStream creates a Stream from a response body.
 func NewStream(body io.ReadCloser) *Stream {
 	return &Stream{body: body, reader: bufio.NewReader(body)}
+}
+
+// SetDebugChunkPath wires a file path that each raw SSE chunk is appended to.
+// Pass "" to disable. Used by the provider's wire-debug toggle.
+func (s *Stream) SetDebugChunkPath(path string) {
+	if s == nil {
+		return
+	}
+	s.chunkPath = path
 }
 
 // Recv reads the next SSE event and returns it as a StreamChunk.
@@ -56,7 +66,7 @@ func (s *Stream) Recv() (StreamChunk, error) {
 				}
 				continue
 			}
-			return decodeSSEData(data)
+			return s.decode(data)
 		}
 
 		if strings.HasPrefix(line, ":") {
@@ -73,7 +83,7 @@ func (s *Stream) Recv() (StreamChunk, error) {
 		}
 		if err != nil {
 			if len(data) > 0 {
-				return decodeSSEData(data)
+				return s.decode(data)
 			}
 			s.done = true
 			return StreamChunk{}, err
@@ -88,6 +98,14 @@ func (s *Stream) Close() error {
 	}
 	s.done = true
 	return s.body.Close()
+}
+
+func (s *Stream) decode(data []string) (StreamChunk, error) {
+	chunk, err := decodeSSEData(data)
+	if err == nil {
+		debugAppendChunk(s.chunkPath, chunk.Raw)
+	}
+	return chunk, err
 }
 
 func decodeSSEData(data []string) (StreamChunk, error) {
