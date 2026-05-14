@@ -15,6 +15,7 @@ import (
 
 	openai "github.com/sashabaranov/go-openai"
 
+	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
 	"github.com/MMinasyan/lightcode/internal/message"
 	"github.com/MMinasyan/lightcode/internal/provider"
@@ -291,11 +292,13 @@ func (l *Loop) LoadHistory(turns [][]message.Message) {
 }
 
 // LoadHistoryWithSummary restores a conversation that went through
-// compaction. A synthetic user message containing the summary is
-// injected before any post-compaction turns.
-func (l *Loop) LoadHistoryWithSummary(summary string, turns [][]message.Message) {
+// compaction. A synthetic assistant message containing the summary is
+// injected before any post-compaction turns, attributed to the
+// summarizer model so its provenance is preserved.
+func (l *Loop) LoadHistoryWithSummary(summary string, summarizer catalog.ModelRef, turns [][]message.Message) {
 	l.ResetHistory()
-	summaryMsg := message.NewText(message.RoleUser, "[Previous conversation summary]\n\n"+summary+"\n\n[End of summary. Continue from here.]")
+	summaryMsg := message.NewText(message.RoleAssistant, "[Previous conversation summary]\n\n"+summary+"\n\n[End of summary. Continue from here.]")
+	summaryMsg.Source = summarizer
 	l.messages = append(l.messages, summaryMsg)
 	for _, turn := range turns {
 		turn = filterHistoryTurn(turn)

@@ -1,6 +1,9 @@
 package compact
 
-import "github.com/MMinasyan/lightcode/internal/provider"
+import (
+	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/provider"
+)
 
 // Config holds parameters for a compaction run.
 type Config struct {
@@ -13,4 +16,5 @@ type Config struct {
 type Result struct {
 	Summary         string
 	SummarizerModel string
+	SummarizerRef   catalog.ModelRef
 }

@@ -50,7 +50,7 @@ func Run(ctx context.Context, messages []message.Message, cfg Config) (Result, e
 		if err != nil {
 			return Result{}, err
 		}
-		return Result{Summary: summary, SummarizerModel: cfg.SummarizerClient.Model()}, nil
+		return Result{Summary: summary, SummarizerModel: cfg.SummarizerClient.Model(), SummarizerRef: cfg.SummarizerClient.ModelRef()}, nil
 	}
 
 	summary, err := summarizeIterative(ctx, cfg, prompt, pruned)

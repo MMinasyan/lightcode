@@ -718,10 +718,11 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 		boundaryTurn--
 	}
 	rec := snapshot.CompactionRecord{
-		Summary:         result.Summary,
-		BoundaryTurn:    boundaryTurn,
-		CompactedAt:     time.Now().UTC().Format(time.RFC3339),
-		SummarizerModel: result.SummarizerModel,
+		Summary:            result.Summary,
+		BoundaryTurn:       boundaryTurn,
+		CompactedAt:        time.Now().UTC().Format(time.RFC3339),
+		SummarizerModel:    result.SummarizerModel,
+		SummarizerProvider: result.SummarizerRef.Provider,
 	}
 	if err := a.store.SaveCompaction(rec); err != nil {
 		return fmt.Errorf("save compaction: %w", err)
@@ -738,7 +739,7 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 		a.memoryStore.IndexSummary(sessionID, projID, projName, result.Summary, rec.CompactedAt, compactionPath)
 	}
 
-	a.lp.LoadHistoryWithSummary(result.Summary, nil)
+	a.lp.LoadHistoryWithSummary(result.Summary, result.SummarizerRef, nil)
 	if a.fileTracker != nil {
 		a.fileTracker.Reset()
 	}
@@ -946,7 +947,7 @@ func (a *Agent) loadHistoryIntoLoop() error {
 	}
 
 	if rec != nil {
-		a.lp.LoadHistoryWithSummary(rec.Summary, decoded)
+		a.lp.LoadHistoryWithSummary(rec.Summary, catalog.ModelRef{Provider: rec.SummarizerProvider, Model: rec.SummarizerModel}, decoded)
 	} else {
 		a.lp.LoadHistory(decoded)
 	}

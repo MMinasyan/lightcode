@@ -66,10 +66,11 @@ type SnapshotMeta struct {
 // CompactionRecord is persisted to compaction.json when context
 // lifecycle management summarizes the conversation.
 type CompactionRecord struct {
-	Summary         string `json:"summary"`
-	BoundaryTurn    int    `json:"boundary_turn"`
-	CompactedAt     string `json:"compacted_at"`
-	SummarizerModel string `json:"summarizer_model"`
+	Summary            string `json:"summary"`
+	BoundaryTurn       int    `json:"boundary_turn"`
+	CompactedAt        string `json:"compacted_at"`
+	SummarizerModel    string `json:"summarizer_model"`
+	SummarizerProvider string `json:"summarizer_provider,omitempty"`
 }
 
 // writeJSON serializes v to path with 0o600 permissions and a trailing
