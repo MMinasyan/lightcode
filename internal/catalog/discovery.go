@@ -116,7 +116,7 @@ func parseDiscoveredModel(raw RawDiscoveredModel) (string, DiscoveredModel) {
 		Name:          stringField(raw, "name"),
 		ContextWindow: firstPositiveInt(raw, "context_length", "context_window", "max_context_length"),
 		MaxOutputTokens: firstPositiveIntMulti(
-			[]map[string]any{raw, tp},
+			[]map[string]any{tp, raw},
 			"max_completion_tokens", "max_output_tokens",
 		),
 		Cost: extractCostIfPresent(raw),
