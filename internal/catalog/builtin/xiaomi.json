@@ -1,0 +1,47 @@
+{
+  "id": "xiaomi",
+  "name": "Xiaomi MiMo",
+  "transport": {
+    "base_url": "https://api.xiaomimimo.com/v1",
+    "api_key_env": "MIMO_API_KEY"
+  },
+  "system_role": "system",
+  "usage_in_stream": true,
+  "discovery": true,
+  "protocol_metadata": {
+    "family": "mimo-native",
+    "must_preserve": ["reasoning_content"]
+  },
+  "models": {
+    "mimo-v2.5-pro": {
+      "name": "MiMo V2.5 Pro",
+      "context_window": 1048576,
+      "max_output_tokens": 16384,
+      "input_modalities": ["text"]
+    },
+    "mimo-v2.5": {
+      "name": "MiMo V2.5",
+      "context_window": 1048576,
+      "max_output_tokens": 131072,
+      "input_modalities": ["text", "image", "audio"]
+    },
+    "mimo-v2-pro": {
+      "name": "MiMo V2 Pro",
+      "context_window": 1048576,
+      "max_output_tokens": 131072,
+      "input_modalities": ["text"]
+    },
+    "mimo-v2-omni": {
+      "name": "MiMo V2 Omni",
+      "context_window": 262144,
+      "max_output_tokens": 65536,
+      "input_modalities": ["text", "image", "audio"]
+    },
+    "mimo-v2-flash": {
+      "name": "MiMo V2 Flash",
+      "context_window": 262144,
+      "max_output_tokens": 65536,
+      "input_modalities": ["text"]
+    }
+  }
+}

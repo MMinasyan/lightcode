@@ -8,5 +8,31 @@
   "system_role": "system",
   "usage_in_stream": true,
   "discovery": true,
-  "models": {}
+  "models": {
+    "mistral-large-latest": {
+      "name": "Mistral Large",
+      "context_window": 262144,
+      "input_modalities": ["text", "image"]
+    },
+    "mistral-medium-latest": {
+      "name": "Mistral Medium",
+      "context_window": 262144,
+      "input_modalities": ["text", "image"]
+    },
+    "mistral-small-latest": {
+      "name": "Mistral Small",
+      "context_window": 262144,
+      "input_modalities": ["text", "image"]
+    },
+    "devstral-medium-latest": {
+      "name": "Devstral Medium",
+      "context_window": 131072,
+      "input_modalities": ["text"]
+    },
+    "magistral-medium-latest": {
+      "name": "Magistral Medium",
+      "context_window": 131072,
+      "input_modalities": ["text"]
+    }
+  }
 }

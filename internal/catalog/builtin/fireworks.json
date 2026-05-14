@@ -8,5 +8,31 @@
   "system_role": "system",
   "usage_in_stream": true,
   "discovery": true,
-  "models": {}
+  "models": {
+    "accounts/fireworks/models/deepseek-v4-pro": {
+      "name": "DeepSeek V4 Pro",
+      "context_window": 1048576,
+      "input_modalities": ["text"]
+    },
+    "accounts/fireworks/models/deepseek-v3p2": {
+      "name": "DeepSeek V3.2",
+      "context_window": 163840,
+      "input_modalities": ["text"]
+    },
+    "accounts/fireworks/models/kimi-k2-thinking": {
+      "name": "Kimi K2 Thinking",
+      "context_window": 262144,
+      "input_modalities": ["text"]
+    },
+    "accounts/fireworks/models/llama-v3p3-70b-instruct": {
+      "name": "Llama 3.3 70B Instruct",
+      "context_window": 131072,
+      "input_modalities": ["text"]
+    },
+    "accounts/fireworks/models/gpt-oss-120b": {
+      "name": "gpt-oss-120B",
+      "context_window": 131072,
+      "input_modalities": ["text"]
+    }
+  }
 }
