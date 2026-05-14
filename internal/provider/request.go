@@ -46,9 +46,9 @@ func buildRequestBody(cfg requestConfig) (map[string]any, error) {
 	if cfg.model.UsageInStream {
 		body["stream_options"] = map[string]any{"include_usage": true}
 	}
-	if cfg.model.MaxOutputTokens > 0 {
-		body[maxTokensField(cfg.provider)] = cfg.model.MaxOutputTokens
-	}
+	// max_tokens is not auto-emitted from catalog.MaxOutputTokens. The catalog
+	// value is informational (UI, budgeting), and completion-token caps remain
+	// reserved keys rather than sidecar/runtime escape hatches.
 	return catalog.ShallowMergeBody(body, cfg.provider.ExtraBody, cfg.model.ExtraBody, cfg.runtimeExtras), nil
 }
 
