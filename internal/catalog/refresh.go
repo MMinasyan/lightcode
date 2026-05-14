@@ -93,12 +93,13 @@ func (c *Catalog) MergeDiscoveredProvider(providerID string, discovered Discover
 				name = modelID
 			}
 			model = &Model{
-				ID:              modelID,
-				Name:            name,
-				InputModalities: []Modality{ModalityText},
-				SystemRole:      provider.SystemRole,
-				UsageInStream:   provider.UsageInStream,
-				ExtraBody:       map[string]any{},
+				ID:               modelID,
+				Name:             name,
+				InputModalities:  []Modality{ModalityText},
+				SystemRole:       provider.SystemRole,
+				UsageInStream:    provider.UsageInStream,
+				ExtraBody:        map[string]any{},
+				ProtocolMetadata: cloneProtocolMetadata(provider.ProtocolMetadata),
 			}
 			provider.Models[modelID] = model
 		}
@@ -140,6 +141,9 @@ func (c *Catalog) MergeDiscoveredProvider(providerID string, discovered Discover
 		}
 		if model.ExtraBody == nil {
 			model.ExtraBody = map[string]any{}
+		}
+		if model.ProtocolMetadata == nil {
+			model.ProtocolMetadata = cloneProtocolMetadata(provider.ProtocolMetadata)
 		}
 	}
 	return nil

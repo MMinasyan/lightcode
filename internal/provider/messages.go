@@ -1,11 +1,22 @@
 package provider
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/message"
 )
+
+// ProtocolWarning describes a non-fatal protocol metadata diagnostic.
+type ProtocolWarning struct {
+	Kind         string
+	Message      string
+	Provider     string
+	Model        string
+	Field        string
+	MessageIndex int
+}
 
 // SerializeMessages converts canonical messages to the OpenAI-compatible
 // message maps used in provider request bodies.
@@ -13,7 +24,8 @@ func SerializeMessages(history []message.Message, target *catalog.Model, provide
 	out := make([]map[string]any, 0, len(history))
 	systemRole := effectiveSystemRole(provider, target)
 	for _, msg := range history {
-		obj, err := serializeMessage(msg, systemRole, shouldReplayExtra(msg, target, provider))
+		policy := replayPolicyFor(msg, target, provider)
+		obj, err := serializeMessage(msg, systemRole, policy)
 		if err != nil {
 			return nil, err
 		}
@@ -22,8 +34,39 @@ func SerializeMessages(history []message.Message, target *catalog.Model, provide
 	return out, nil
 }
 
-func serializeMessage(msg message.Message, systemRole catalog.SystemRole, keepExtra bool) (map[string]any, error) {
-	obj := rawExtraMap(msg.Extra, keepExtra, messageExtraAllowed)
+// ProtocolWarnings returns request-build diagnostics for protocol metadata.
+func ProtocolWarnings(history []message.Message, target *catalog.Model, provider *catalog.Provider) []ProtocolWarning {
+	meta := protocolMetadata(target)
+	if meta == nil || len(meta.MustPreserve) == 0 || provider == nil || target == nil {
+		return nil
+	}
+	var out []ProtocolWarning
+	for i, msg := range history {
+		if msg.Role != message.RoleAssistant || len(msg.ToolCalls) == 0 {
+			continue
+		}
+		if !replayPolicyFor(msg, target, provider).keep {
+			continue
+		}
+		for _, field := range meta.MustPreserve {
+			if _, ok := msg.Extra[field]; ok {
+				continue
+			}
+			out = append(out, ProtocolWarning{
+				Kind:         "protocol_must_preserve_missing",
+				Provider:     provider.ID,
+				Model:        target.ID,
+				Field:        field,
+				MessageIndex: i,
+				Message:      fmt.Sprintf("%s/%s assistant message %d has tool calls but is missing protocol metadata field %q", provider.ID, target.ID, i, field),
+			})
+		}
+	}
+	return out
+}
+
+func serializeMessage(msg message.Message, systemRole catalog.SystemRole, policy replayPolicy) (map[string]any, error) {
+	obj := rawExtraMap(msg.Extra, policy, messageExtraAllowed)
 	role := string(msg.Role)
 	if msg.Role == message.RoleSystem {
 		if systemRole == "" {
@@ -35,7 +78,7 @@ func serializeMessage(msg message.Message, systemRole catalog.SystemRole, keepEx
 		obj["role"] = role
 	}
 	if len(msg.Content) > 0 {
-		content, ok, err := serializeContent(msg.Content, keepExtra)
+		content, ok, err := serializeContent(msg.Content, policy)
 		if err != nil {
 			return nil, err
 		}
@@ -49,7 +92,7 @@ func serializeMessage(msg message.Message, systemRole catalog.SystemRole, keepEx
 	if len(msg.ToolCalls) > 0 {
 		toolCalls := make([]map[string]any, 0, len(msg.ToolCalls))
 		for _, tc := range msg.ToolCalls {
-			toolCalls = append(toolCalls, serializeToolCall(tc, keepExtra))
+			toolCalls = append(toolCalls, serializeToolCall(tc, policy))
 		}
 		obj["tool_calls"] = toolCalls
 	}
@@ -62,9 +105,9 @@ func serializeMessage(msg message.Message, systemRole catalog.SystemRole, keepEx
 	return obj, nil
 }
 
-func serializeContent(parts []message.ContentPart, keepExtra bool) (any, bool, error) {
+func serializeContent(parts []message.ContentPart, policy replayPolicy) (any, bool, error) {
 	if len(parts) == 1 && parts[0].Type == message.ContentPartText {
-		extra := rawExtraMap(parts[0].Extra, keepExtra, contentPartExtraAllowed)
+		extra := rawExtraMap(parts[0].Extra, policy, contentPartExtraAllowed)
 		if len(extra) == 0 {
 			return parts[0].Text, true, nil
 		}
@@ -75,7 +118,7 @@ func serializeContent(parts []message.ContentPart, keepExtra bool) (any, bool, e
 		if part.Type == message.ContentPartOpaque {
 			allowed = opaqueContentPartExtraAllowed
 		}
-		obj := rawExtraMap(part.Extra, keepExtra, allowed)
+		obj := rawExtraMap(part.Extra, policy, allowed)
 		switch part.Type {
 		case message.ContentPartText:
 			obj["type"] = string(message.ContentPartText)
@@ -90,7 +133,7 @@ func serializeContent(parts []message.ContentPart, keepExtra bool) (any, bool, e
 		default:
 			obj["type"] = string(part.Type)
 		}
-		if part.Type == message.ContentPartOpaque && !keepExtra {
+		if part.Type == message.ContentPartOpaque && !policy.keep {
 			continue
 		}
 		out = append(out, obj)
@@ -101,8 +144,8 @@ func serializeContent(parts []message.ContentPart, keepExtra bool) (any, bool, e
 	return out, true, nil
 }
 
-func serializeToolCall(tc message.ToolCall, keepExtra bool) map[string]any {
-	obj := rawExtraMap(tc.Extra, keepExtra, toolCallExtraAllowed)
+func serializeToolCall(tc message.ToolCall, policy replayPolicy) map[string]any {
+	obj := rawExtraMap(tc.Extra, policy, toolCallExtraAllowed)
 	if tc.ID != "" {
 		obj["id"] = tc.ID
 	}
@@ -118,22 +161,66 @@ func serializeToolCall(tc message.ToolCall, keepExtra bool) map[string]any {
 	return obj
 }
 
-func shouldReplayExtra(msg message.Message, target *catalog.Model, provider *catalog.Provider) bool {
-	if target == nil || provider == nil {
-		return false
-	}
-	return msg.Source.Provider != "" &&
-		msg.Source.Provider == provider.ID &&
-		msg.Source.Model == target.ID
+type replayPolicy struct {
+	keep bool
+	drop map[string]bool
 }
 
-func rawExtraMap(extra message.Extra, keep bool, allowed func(string) bool) map[string]any {
+func replayPolicyFor(msg message.Message, target *catalog.Model, provider *catalog.Provider) replayPolicy {
+	policy := replayPolicy{drop: protocolDropSet(target)}
+	if target == nil || provider == nil {
+		return policy
+	}
+	if msg.Source.Provider == "" || msg.Source.Provider != provider.ID {
+		return policy
+	}
+	if msg.Source.Model == target.ID {
+		policy.keep = true
+		return policy
+	}
+	source := provider.Models[msg.Source.Model]
+	sourceFamily := protocolFamily(source)
+	targetFamily := protocolFamily(target)
+	if sourceFamily != "" && sourceFamily == targetFamily {
+		policy.keep = true
+	}
+	return policy
+}
+
+func protocolMetadata(model *catalog.Model) *catalog.ProtocolMetadata {
+	if model == nil {
+		return nil
+	}
+	return model.ProtocolMetadata
+}
+
+func protocolFamily(model *catalog.Model) string {
+	meta := protocolMetadata(model)
+	if meta == nil {
+		return ""
+	}
+	return meta.Family
+}
+
+func protocolDropSet(model *catalog.Model) map[string]bool {
+	meta := protocolMetadata(model)
+	if meta == nil || len(meta.Drop) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(meta.Drop))
+	for _, key := range meta.Drop {
+		out[key] = true
+	}
+	return out
+}
+
+func rawExtraMap(extra message.Extra, policy replayPolicy, allowed func(string) bool) map[string]any {
 	out := map[string]any{}
-	if !keep {
+	if !policy.keep {
 		return out
 	}
 	for key, value := range extra {
-		if !allowed(key) {
+		if policy.drop[key] || !allowed(key) {
 			continue
 		}
 		out[key] = message.CloneRaw(value)

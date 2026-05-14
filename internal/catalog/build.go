@@ -316,33 +316,36 @@ func userCostFields(userRaw map[string]any, modelID string) map[string]bool {
 
 func rawToProvider(providerID string, raw map[string]any, bundledProvider bool) *Provider {
 	transportRaw := raw["transport"].(map[string]any)
+	protocolMetadata := effectiveProtocolMetadata(nil, raw["protocol_metadata"])
 	provider := &Provider{
-		ID:             stringValue(raw["id"], providerID),
-		Name:           stringValue(raw["name"], providerID),
-		Transport:      rawToTransport(transportRaw),
-		SystemRole:     SystemRole(stringValue(raw["system_role"], string(RoleSystem))),
-		UsageInStream:  boolValue(raw["usage_in_stream"], true),
-		MaxTokensField: stringValue(raw["max_tokens_field"], "max_tokens"),
-		ExtraBody:      anyMapValue(raw["extra_body"]),
-		Discovery:      boolValue(raw["discovery"], true),
-		Hidden:         boolValue(raw["hidden"], false),
-		Models:         map[string]*Model{},
-		Builtin:        bundledProvider,
+		ID:               stringValue(raw["id"], providerID),
+		Name:             stringValue(raw["name"], providerID),
+		Transport:        rawToTransport(transportRaw),
+		SystemRole:       SystemRole(stringValue(raw["system_role"], string(RoleSystem))),
+		UsageInStream:    boolValue(raw["usage_in_stream"], true),
+		MaxTokensField:   stringValue(raw["max_tokens_field"], "max_tokens"),
+		ExtraBody:        anyMapValue(raw["extra_body"]),
+		Discovery:        boolValue(raw["discovery"], true),
+		Hidden:           boolValue(raw["hidden"], false),
+		ProtocolMetadata: protocolMetadata,
+		Models:           map[string]*Model{},
+		Builtin:          bundledProvider,
 	}
 	modelsRaw := raw["models"].(map[string]any)
 	for modelID, value := range modelsRaw {
 		modelRaw := value.(map[string]any)
 		model := &Model{
-			ID:              modelID,
-			Name:            stringValue(modelRaw["name"], modelID),
-			ContextWindow:   intValue(modelRaw["context_window"], 0),
-			MaxOutputTokens: intValue(modelRaw["max_output_tokens"], 0),
-			InputModalities: modalitiesValue(modelRaw["input_modalities"]),
-			SystemRole:      SystemRole(stringValue(modelRaw["system_role"], string(provider.SystemRole))),
-			UsageInStream:   boolValue(modelRaw["usage_in_stream"], provider.UsageInStream),
-			Hidden:          boolValue(modelRaw["hidden"], false),
-			ExtraBody:       anyMapValue(modelRaw["extra_body"]),
-			Cost:            costValue(modelRaw["cost"]),
+			ID:               modelID,
+			Name:             stringValue(modelRaw["name"], modelID),
+			ContextWindow:    intValue(modelRaw["context_window"], 0),
+			MaxOutputTokens:  intValue(modelRaw["max_output_tokens"], 0),
+			InputModalities:  modalitiesValue(modelRaw["input_modalities"]),
+			SystemRole:       SystemRole(stringValue(modelRaw["system_role"], string(provider.SystemRole))),
+			UsageInStream:    boolValue(modelRaw["usage_in_stream"], provider.UsageInStream),
+			Hidden:           boolValue(modelRaw["hidden"], false),
+			ExtraBody:        anyMapValue(modelRaw["extra_body"]),
+			Cost:             costValue(modelRaw["cost"]),
+			ProtocolMetadata: effectiveProtocolMetadata(raw["protocol_metadata"], modelRaw["protocol_metadata"]),
 		}
 		provider.Models[modelID] = model
 	}
@@ -415,6 +418,62 @@ func modalitiesValue(v any) []Modality {
 		return []Modality{ModalityText}
 	}
 	return modalities
+}
+
+func effectiveProtocolMetadata(providerValue, modelValue any) *ProtocolMetadata {
+	providerRaw, _ := providerValue.(map[string]any)
+	modelRaw, _ := modelValue.(map[string]any)
+	if providerRaw == nil && modelRaw == nil {
+		return nil
+	}
+	meta := &ProtocolMetadata{}
+	if family, ok := providerRaw["family"].(string); ok && family != "" {
+		meta.Family = family
+	}
+	if family, ok := modelRaw["family"].(string); ok && family != "" {
+		meta.Family = family
+	}
+	if values, ok := stringSliceValue(providerRaw["must_preserve"]); ok {
+		meta.MustPreserve = values
+	}
+	if values, ok := stringSliceValue(modelRaw["must_preserve"]); ok {
+		meta.MustPreserve = values
+	}
+	if values, ok := stringSliceValue(providerRaw["drop"]); ok {
+		meta.Drop = values
+	}
+	if values, ok := stringSliceValue(modelRaw["drop"]); ok {
+		meta.Drop = values
+	}
+	if meta.Family == "" && len(meta.MustPreserve) == 0 && len(meta.Drop) == 0 {
+		return nil
+	}
+	return meta
+}
+
+func cloneProtocolMetadata(meta *ProtocolMetadata) *ProtocolMetadata {
+	if meta == nil {
+		return nil
+	}
+	return &ProtocolMetadata{
+		Family:       meta.Family,
+		MustPreserve: append([]string(nil), meta.MustPreserve...),
+		Drop:         append([]string(nil), meta.Drop...),
+	}
+}
+
+func stringSliceValue(v any) ([]string, bool) {
+	items, ok := v.([]any)
+	if !ok {
+		return nil, false
+	}
+	values := make([]string, 0, len(items))
+	for _, item := range items {
+		if s, ok := item.(string); ok {
+			values = append(values, s)
+		}
+	}
+	return values, true
 }
 
 func costValue(v any) *Cost {

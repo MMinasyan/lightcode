@@ -9,6 +9,7 @@ import (
 )
 
 var envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var protocolFamilyPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
 
 // ValidationError describes a catalog validation failure.
 type ValidationError struct {
@@ -85,6 +86,7 @@ func ValidateRaw(provID string, raw map[string]any, strict bool) []ValidationErr
 	validateRawBool(add, "", "discovery", raw["discovery"])
 	validateRawBool(add, "", "hidden", raw["hidden"])
 	validateRawExtraBody(add, "", "extra_body", raw["extra_body"])
+	validateRawProtocolMetadata(add, "", "protocol_metadata", raw["protocol_metadata"])
 
 	if modelsVal, exists := raw["models"]; exists {
 		models, ok := validationObject(modelsVal)
@@ -142,6 +144,7 @@ func ValidateEffective(p *Provider) []ValidationError {
 	for _, key := range CheckReservedKeys(p.ExtraBody) {
 		add("", "extra_body."+key, "reserved request body key")
 	}
+	validateEffectiveProtocolMetadata(add, "", "protocol_metadata", p.ProtocolMetadata)
 	for modelID, model := range p.Models {
 		if model == nil {
 			add(modelID, "models."+modelID, "model is nil")
@@ -164,6 +167,7 @@ func ValidateEffective(p *Provider) []ValidationError {
 		for _, key := range CheckReservedKeys(model.ExtraBody) {
 			add(modelID, "models."+modelID+".extra_body."+key, "reserved request body key")
 		}
+		validateEffectiveProtocolMetadata(add, modelID, "models."+modelID+".protocol_metadata", model.ProtocolMetadata)
 	}
 	return errs
 }
@@ -236,6 +240,7 @@ func validateRawModel(add func(string, string, string), modelID string, raw map[
 	validateRawBool(add, modelID, "models."+modelID+".hidden", raw["hidden"])
 	validateRawExtraBody(add, modelID, "models."+modelID+".extra_body", raw["extra_body"])
 	validateRawCost(add, modelID, raw["cost"])
+	validateRawProtocolMetadata(add, modelID, "models."+modelID+".protocol_metadata", raw["protocol_metadata"])
 }
 
 func validateRawSystemRole(add func(string, string, string), model, field string, value any) {
@@ -322,6 +327,94 @@ func validateRawCost(add func(string, string, string), model string, value any) 
 	}
 }
 
+func validateRawProtocolMetadata(add func(string, string, string), model, field string, value any) {
+	if value == nil {
+		return
+	}
+	meta, ok := validationObject(value)
+	if !ok {
+		add(model, field, "must be an object")
+		return
+	}
+	for key := range meta {
+		switch key {
+		case "family", "must_preserve", "drop":
+		default:
+			add(model, field+"."+key, "unknown protocol metadata field")
+		}
+	}
+	if family, ok := meta["family"]; ok {
+		s, ok := family.(string)
+		if !ok {
+			add(model, field+".family", "must be a string")
+		} else if s != "" && !protocolFamilyPattern.MatchString(s) {
+			add(model, field+".family", "must match ^[a-z][a-z0-9_-]*$")
+		}
+	}
+	validateRawProtocolFieldList(add, model, field+".must_preserve", meta["must_preserve"])
+	validateRawProtocolFieldList(add, model, field+".drop", meta["drop"])
+}
+
+func validateRawProtocolFieldList(add func(string, string, string), model, field string, value any) {
+	if value == nil {
+		return
+	}
+	items, ok := value.([]any)
+	if !ok {
+		add(model, field, "must be an array")
+		return
+	}
+	for i, item := range items {
+		s, ok := item.(string)
+		itemField := fmt.Sprintf("%s[%d]", field, i)
+		if !ok {
+			add(model, itemField, "must be a string")
+			continue
+		}
+		validateProtocolFieldName(add, model, itemField, s)
+	}
+}
+
+func validateEffectiveProtocolMetadata(add func(string, string, string), model, field string, meta *ProtocolMetadata) {
+	if meta == nil {
+		return
+	}
+	if meta.Family != "" && !protocolFamilyPattern.MatchString(meta.Family) {
+		add(model, field+".family", "must match ^[a-z][a-z0-9_-]*$")
+	}
+	for i, name := range meta.MustPreserve {
+		validateProtocolFieldName(add, model, fmt.Sprintf("%s.must_preserve[%d]", field, i), name)
+	}
+	for i, name := range meta.Drop {
+		validateProtocolFieldName(add, model, fmt.Sprintf("%s.drop[%d]", field, i), name)
+	}
+}
+
+func validateProtocolFieldName(add func(string, string, string), model, field, name string) {
+	if name == "" {
+		add(model, field, "must not be empty")
+		return
+	}
+	if protocolFieldReserved(name) {
+		add(model, field, "must not name a reserved or canonical field")
+	}
+}
+
+func protocolFieldReserved(name string) bool {
+	for _, reserved := range ReservedKeys {
+		if name == reserved {
+			return true
+		}
+	}
+	switch name {
+	case "role", "content", "refusal", "tool_calls", "tool_call_id", "name", "function_call",
+		"id", "type", "function", "index", "text", "image_url":
+		return true
+	default:
+		return false
+	}
+}
+
 func validateURL(add func(string, string, string), model, field, raw string) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" || u.Host == "" {
@@ -331,7 +424,7 @@ func validateURL(add func(string, string, string), model, field, raw string) {
 
 func allowedRawProviderKey(key string) bool {
 	switch key {
-	case "id", "name", "transport", "system_role", "usage_in_stream", "max_tokens_field", "extra_body", "discovery", "hidden", "models":
+	case "id", "name", "transport", "system_role", "usage_in_stream", "max_tokens_field", "extra_body", "discovery", "hidden", "protocol_metadata", "models":
 		return true
 	default:
 		return false
@@ -340,7 +433,7 @@ func allowedRawProviderKey(key string) bool {
 
 func allowedRawModelKey(key string) bool {
 	switch key {
-	case "name", "context_window", "max_output_tokens", "input_modalities", "system_role", "usage_in_stream", "extra_body", "cost", "hidden":
+	case "name", "context_window", "max_output_tokens", "input_modalities", "system_role", "usage_in_stream", "extra_body", "cost", "hidden", "protocol_metadata":
 		return true
 	default:
 		return false
