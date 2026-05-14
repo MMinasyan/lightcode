@@ -1,0 +1,16 @@
+{
+  "id": "moonshot",
+  "name": "Moonshot AI (Kimi)",
+  "transport": {
+    "base_url": "https://api.moonshot.ai/v1",
+    "api_key_env": "MOONSHOT_API_KEY"
+  },
+  "system_role": "system",
+  "usage_in_stream": true,
+  "discovery": true,
+  "protocol_metadata": {
+    "family": "moonshot-native",
+    "must_preserve": ["reasoning_content"]
+  },
+  "models": {}
+}

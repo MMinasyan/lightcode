@@ -1,0 +1,12 @@
+{
+  "id": "together",
+  "name": "Together AI",
+  "transport": {
+    "base_url": "https://api.together.xyz/v1",
+    "api_key_env": "TOGETHER_API_KEY"
+  },
+  "system_role": "system",
+  "usage_in_stream": true,
+  "discovery": true,
+  "models": {}
+}

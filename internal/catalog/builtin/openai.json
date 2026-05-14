@@ -16,16 +16,34 @@
       "max_output_tokens": 128000,
       "input_modalities": ["text", "image"]
     },
-    "gpt-5.4": {
-      "name": "GPT-5.4",
+    "gpt-5.5-pro": {
+      "name": "GPT-5.5 Pro",
       "context_window": 1050000,
       "max_output_tokens": 128000,
       "input_modalities": ["text", "image"]
     },
-    "gpt-5.4-mini": {
-      "name": "GPT-5.4 mini",
+    "gpt-5": {
+      "name": "GPT-5",
       "context_window": 400000,
       "max_output_tokens": 128000,
+      "input_modalities": ["text", "image"]
+    },
+    "gpt-5-mini": {
+      "name": "GPT-5 mini",
+      "context_window": 400000,
+      "max_output_tokens": 128000,
+      "input_modalities": ["text", "image"]
+    },
+    "o4-mini": {
+      "name": "o4-mini",
+      "context_window": 200000,
+      "max_output_tokens": 100000,
+      "input_modalities": ["text", "image"]
+    },
+    "o3": {
+      "name": "o3",
+      "context_window": 200000,
+      "max_output_tokens": 100000,
       "input_modalities": ["text", "image"]
     }
   }

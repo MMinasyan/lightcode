@@ -1,0 +1,12 @@
+{
+  "id": "mistral",
+  "name": "Mistral AI",
+  "transport": {
+    "base_url": "https://api.mistral.ai/v1",
+    "api_key_env": "MISTRAL_API_KEY"
+  },
+  "system_role": "system",
+  "usage_in_stream": true,
+  "discovery": true,
+  "models": {}
+}

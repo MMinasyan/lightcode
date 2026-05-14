@@ -1,0 +1,35 @@
+{
+  "id": "deepseek",
+  "name": "DeepSeek",
+  "transport": {
+    "base_url": "https://api.deepseek.com",
+    "api_key_env": "DEEPSEEK_API_KEY"
+  },
+  "system_role": "system",
+  "usage_in_stream": true,
+  "discovery": true,
+  "protocol_metadata": {
+    "family": "deepseek-native",
+    "must_preserve": ["reasoning_content"]
+  },
+  "models": {
+    "deepseek-v4-pro": {
+      "name": "DeepSeek V4 Pro",
+      "context_window": 1048576,
+      "max_output_tokens": 384000,
+      "input_modalities": ["text"]
+    },
+    "deepseek-v4-flash": {
+      "name": "DeepSeek V4 Flash",
+      "context_window": 1048576,
+      "max_output_tokens": 131072,
+      "input_modalities": ["text"]
+    },
+    "deepseek-v3.2": {
+      "name": "DeepSeek V3.2",
+      "context_window": 131072,
+      "max_output_tokens": 65536,
+      "input_modalities": ["text"]
+    }
+  }
+}

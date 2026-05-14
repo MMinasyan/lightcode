@@ -12,96 +12,87 @@
   "system_role": "system",
   "usage_in_stream": true,
   "discovery": true,
+  "protocol_metadata": {
+    "family": "openrouter-normalized"
+  },
   "models": {
     "anthropic/claude-opus-4.6": {
       "name": "Anthropic: Claude Opus 4.6",
       "context_window": 1000000,
       "max_output_tokens": 128000,
-      "input_modalities": [
-        "text",
-        "image"
-      ],
+      "input_modalities": ["text", "image"],
       "protocol_metadata": {
-        "family": "anthropic-thinking"
+        "family": "anthropic-thinking",
+        "must_preserve": ["reasoning_details"]
       }
     },
     "anthropic/claude-opus-4.7": {
       "name": "Anthropic: Claude Opus 4.7",
       "context_window": 1000000,
       "max_output_tokens": 128000,
-      "input_modalities": [
-        "text",
-        "image"
-      ],
+      "input_modalities": ["text", "image"],
       "protocol_metadata": {
-        "family": "anthropic-thinking"
+        "family": "anthropic-thinking",
+        "must_preserve": ["reasoning_details"]
       }
     },
     "anthropic/claude-sonnet-4.5": {
       "name": "Anthropic: Claude Sonnet 4.5",
       "context_window": 1000000,
       "max_output_tokens": 64000,
-      "input_modalities": [
-        "text",
-        "image"
-      ],
+      "input_modalities": ["text", "image"],
       "protocol_metadata": {
-        "family": "anthropic-thinking"
+        "family": "anthropic-thinking",
+        "must_preserve": ["reasoning_details"]
       }
     },
     "anthropic/claude-sonnet-4.6": {
       "name": "Anthropic: Claude Sonnet 4.6",
       "context_window": 1000000,
       "max_output_tokens": 128000,
-      "input_modalities": [
-        "text",
-        "image"
-      ],
+      "input_modalities": ["text", "image"],
       "protocol_metadata": {
-        "family": "anthropic-thinking"
+        "family": "anthropic-thinking",
+        "must_preserve": ["reasoning_details"]
       }
     },
-    "qwen/qwen3.6-plus": {
-      "name": "Qwen: Qwen3.6 Plus",
-      "context_window": 1000000,
-      "max_output_tokens": 65536,
-      "input_modalities": [
-        "text",
-        "image"
-      ]
+    "z-ai/glm-4.6": {
+      "name": "Z.ai: GLM-4.6",
+      "context_window": 202752,
+      "max_output_tokens": 131072,
+      "input_modalities": ["text"],
+      "protocol_metadata": {
+        "family": "zai-thinking",
+        "must_preserve": ["reasoning_details"]
+      }
     },
-    "qwen/qwen3.6-flash": {
-      "name": "Qwen: Qwen3.6 Flash",
-      "context_window": 1000000,
-      "max_output_tokens": 65536,
-      "input_modalities": [
-        "text",
-        "image"
-      ]
+    "z-ai/glm-4.7": {
+      "name": "Z.ai: GLM-4.7",
+      "context_window": 202752,
+      "max_output_tokens": 131072,
+      "input_modalities": ["text"],
+      "protocol_metadata": {
+        "family": "zai-thinking",
+        "must_preserve": ["reasoning_details"]
+      }
     },
-    "deepseek/deepseek-v4-flash": {
-      "name": "DeepSeek: DeepSeek V4 Flash",
-      "context_window": 1048576,
-      "max_output_tokens": 384000,
-      "input_modalities": [
-        "text"
-      ]
-    },
-    "deepseek/deepseek-v4-pro": {
-      "name": "DeepSeek: DeepSeek V4 Pro",
-      "context_window": 1048576,
-      "max_output_tokens": 384000,
-      "input_modalities": [
-        "text"
-      ]
+    "z-ai/glm-5": {
+      "name": "Z.ai: GLM-5",
+      "context_window": 202752,
+      "input_modalities": ["text"],
+      "protocol_metadata": {
+        "family": "zai-thinking",
+        "must_preserve": ["reasoning_details"]
+      }
     },
     "z-ai/glm-5.1": {
-      "name": "Z.ai: GLM 5.1",
+      "name": "Z.ai: GLM-5.1",
       "context_window": 202752,
-      "max_output_tokens": 65535,
-      "input_modalities": [
-        "text"
-      ]
+      "input_modalities": ["text"],
+      "protocol_metadata": {
+        "family": "zai-thinking",
+        "must_preserve": ["reasoning_details"]
+      }
     }
   }
 }
