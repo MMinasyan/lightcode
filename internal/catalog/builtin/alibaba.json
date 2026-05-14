@@ -1,0 +1,35 @@
+{
+  "id": "alibaba",
+  "name": "Alibaba Model Studio (DashScope)",
+  "transport": {
+    "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    "api_key_env": "DASHSCOPE_API_KEY"
+  },
+  "system_role": "system",
+  "usage_in_stream": true,
+  "discovery": true,
+  "protocol_metadata": {
+    "family": "qwen-dashscope",
+    "drop": ["reasoning_content"]
+  },
+  "models": {
+    "qwen3.6-max-preview": {
+      "name": "Qwen3.6-Max (preview)",
+      "context_window": 262144,
+      "max_output_tokens": 65536,
+      "input_modalities": ["text"]
+    },
+    "qwen3.6-plus": {
+      "name": "Qwen3.6-Plus",
+      "context_window": 1000000,
+      "max_output_tokens": 65536,
+      "input_modalities": ["text", "image"]
+    },
+    "qwen3.6-flash": {
+      "name": "Qwen3.6-Flash",
+      "context_window": 1000000,
+      "max_output_tokens": 65536,
+      "input_modalities": ["text", "image"]
+    }
+  }
+}

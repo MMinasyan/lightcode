@@ -1,0 +1,12 @@
+{
+  "id": "groq",
+  "name": "Groq",
+  "transport": {
+    "base_url": "https://api.groq.com/openai/v1",
+    "api_key_env": "GROQ_API_KEY"
+  },
+  "system_role": "system",
+  "usage_in_stream": true,
+  "discovery": true,
+  "models": {}
+}

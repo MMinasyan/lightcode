@@ -1,0 +1,12 @@
+{
+  "id": "fireworks",
+  "name": "Fireworks AI",
+  "transport": {
+    "base_url": "https://api.fireworks.ai/inference/v1",
+    "api_key_env": "FIREWORKS_API_KEY"
+  },
+  "system_role": "system",
+  "usage_in_stream": true,
+  "discovery": true,
+  "models": {}
+}

@@ -1,0 +1,34 @@
+{
+  "id": "google",
+  "name": "Google Gemini (OpenAI-compat)",
+  "transport": {
+    "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "api_key_env": "GEMINI_API_KEY"
+  },
+  "system_role": "system",
+  "usage_in_stream": true,
+  "discovery": true,
+  "protocol_metadata": {
+    "family": "gemini-signed-thought"
+  },
+  "models": {
+    "gemini-3-flash-preview": {
+      "name": "Gemini 3 Flash (preview)",
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
+      "input_modalities": ["text", "image", "audio"]
+    },
+    "gemini-3.1-pro-preview": {
+      "name": "Gemini 3.1 Pro (preview)",
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
+      "input_modalities": ["text", "image", "audio"]
+    },
+    "gemini-3.1-flash-lite": {
+      "name": "Gemini 3.1 Flash Lite",
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
+      "input_modalities": ["text", "image", "audio"]
+    }
+  }
+}
