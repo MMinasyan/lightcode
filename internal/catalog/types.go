@@ -95,33 +95,42 @@ type Cost struct {
 	CacheWrite *float64 `json:"cache_write,omitempty"`
 }
 
+// ProtocolMetadata describes provider-specific protocol-state policy.
+type ProtocolMetadata struct {
+	Family       string   `json:"family,omitempty"`
+	MustPreserve []string `json:"must_preserve,omitempty"`
+	Drop         []string `json:"drop,omitempty"`
+}
+
 // Model is a resolved model entry in the effective catalog.
 type Model struct {
-	ID              string         `json:"id"`
-	Name            string         `json:"name"`
-	ContextWindow   int            `json:"context_window"`
-	MaxOutputTokens int            `json:"max_output_tokens"`
-	InputModalities []Modality     `json:"input_modalities"`
-	SystemRole      SystemRole     `json:"system_role"`
-	UsageInStream   bool           `json:"usage_in_stream"`
-	Hidden          bool           `json:"hidden,omitempty"`
-	ExtraBody       map[string]any `json:"extra_body,omitempty"`
-	Cost            *Cost          `json:"cost,omitempty"`
+	ID               string            `json:"id"`
+	Name             string            `json:"name"`
+	ContextWindow    int               `json:"context_window"`
+	MaxOutputTokens  int               `json:"max_output_tokens"`
+	InputModalities  []Modality        `json:"input_modalities"`
+	SystemRole       SystemRole        `json:"system_role"`
+	UsageInStream    bool              `json:"usage_in_stream"`
+	Hidden           bool              `json:"hidden,omitempty"`
+	ExtraBody        map[string]any    `json:"extra_body,omitempty"`
+	Cost             *Cost             `json:"cost,omitempty"`
+	ProtocolMetadata *ProtocolMetadata `json:"protocol_metadata,omitempty"`
 }
 
 // Provider is a resolved provider entry in the effective catalog.
 type Provider struct {
-	ID             string            `json:"id"`
-	Name           string            `json:"name"`
-	Transport      Transport         `json:"transport"`
-	SystemRole     SystemRole        `json:"system_role"`
-	UsageInStream  bool              `json:"usage_in_stream"`
-	MaxTokensField string            `json:"max_tokens_field"`
-	ExtraBody      map[string]any    `json:"extra_body,omitempty"`
-	Discovery      bool              `json:"discovery"`
-	Hidden         bool              `json:"hidden,omitempty"`
-	Models         map[string]*Model `json:"models"`
-	Builtin        bool              `json:"-"`
+	ID               string            `json:"id"`
+	Name             string            `json:"name"`
+	Transport        Transport         `json:"transport"`
+	SystemRole       SystemRole        `json:"system_role"`
+	UsageInStream    bool              `json:"usage_in_stream"`
+	MaxTokensField   string            `json:"max_tokens_field"`
+	ExtraBody        map[string]any    `json:"extra_body,omitempty"`
+	Discovery        bool              `json:"discovery"`
+	Hidden           bool              `json:"hidden,omitempty"`
+	ProtocolMetadata *ProtocolMetadata `json:"protocol_metadata,omitempty"`
+	Models           map[string]*Model `json:"models"`
+	Builtin          bool              `json:"-"`
 }
 
 // Catalog is the in-memory effective catalog.

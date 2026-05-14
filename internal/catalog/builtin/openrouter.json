@@ -13,6 +13,54 @@
   "usage_in_stream": true,
   "discovery": true,
   "models": {
+    "anthropic/claude-opus-4.6": {
+      "name": "Anthropic: Claude Opus 4.6",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "protocol_metadata": {
+        "family": "anthropic-thinking"
+      }
+    },
+    "anthropic/claude-opus-4.7": {
+      "name": "Anthropic: Claude Opus 4.7",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "protocol_metadata": {
+        "family": "anthropic-thinking"
+      }
+    },
+    "anthropic/claude-sonnet-4.5": {
+      "name": "Anthropic: Claude Sonnet 4.5",
+      "context_window": 1000000,
+      "max_output_tokens": 64000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "protocol_metadata": {
+        "family": "anthropic-thinking"
+      }
+    },
+    "anthropic/claude-sonnet-4.6": {
+      "name": "Anthropic: Claude Sonnet 4.6",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "protocol_metadata": {
+        "family": "anthropic-thinking"
+      }
+    },
     "qwen/qwen3.6-plus": {
       "name": "Qwen: Qwen3.6 Plus",
       "context_window": 1000000,

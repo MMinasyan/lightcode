@@ -70,6 +70,15 @@ func (c *Client) Chat(ctx context.Context, messages []message.Message, tools []o
 	return out, nil
 }
 
+// ProtocolWarnings returns non-fatal protocol metadata diagnostics for the
+// next request body this client would build.
+func (c *Client) ProtocolWarnings(messages []message.Message) []ProtocolWarning {
+	if c == nil {
+		return nil
+	}
+	return ProtocolWarnings(messages, c.model, c.provider)
+}
+
 // ModelID returns the catalog model ID string.
 func (c *Client) ModelID() string {
 	if c == nil || c.model == nil {

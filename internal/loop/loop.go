@@ -66,6 +66,8 @@ const (
 	// completed streaming response. Known is false when the server
 	// did not return usage data.
 	Usage
+	// Warning carries a non-fatal runtime warning in Result.
+	Warning
 )
 
 // Event is a structured tool-call event for UIs that want to render tool
@@ -422,6 +424,7 @@ func (l *Loop) runStream(ctx context.Context) (message.Message, bool, error) {
 	if l.client == nil {
 		return message.Message{}, false, fmt.Errorf("no model configured — set default_model in ~/.lightcode/config.json and an API key in ~/.lightcode/.env")
 	}
+	l.emitProtocolWarnings(l.client.ProtocolWarnings(l.messages))
 	const maxRetries = 3
 	backoff := 2 * time.Second
 
@@ -457,6 +460,22 @@ func (l *Loop) runStream(ctx context.Context) (message.Message, bool, error) {
 		return msg, cancelled, err
 	}
 	return message.Message{}, false, lastErr
+}
+
+func (l *Loop) emitProtocolWarnings(warnings []provider.ProtocolWarning) {
+	for _, warning := range warnings {
+		l.emit(Event{
+			Kind:   Warning,
+			Result: warning.Message,
+			Metadata: map[string]any{
+				"kind":          warning.Kind,
+				"provider":      warning.Provider,
+				"model":         warning.Model,
+				"field":         warning.Field,
+				"message_index": warning.MessageIndex,
+			},
+		})
+	}
 }
 
 func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (message.Message, bool, error) {

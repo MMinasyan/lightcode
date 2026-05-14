@@ -384,7 +384,7 @@ func (a *Agent) CurrentWarnings() []PromptWarning {
 
 func (a *Agent) warningSnapshotLocked() []PromptWarning {
 	var out []PromptWarning
-	for _, group := range []string{"prompt", "catalog", "lsp"} {
+	for _, group := range []string{"prompt", "catalog", "lsp", "protocol"} {
 		out = append(out, a.warningGroups[group]...)
 	}
 	return out
@@ -504,6 +504,12 @@ func (a *Agent) dispatchLoopEvent(ev loop.Event) {
 		})
 	case loop.Usage:
 		a.recordUsage(ev)
+	case loop.Warning:
+		kind, _ := ev.Metadata["kind"].(string)
+		if kind == "" {
+			kind = "protocol_warning"
+		}
+		a.addWarning("protocol", prompt.Warning{Kind: kind, Message: ev.Result})
 	}
 }
 
@@ -546,6 +552,13 @@ func (a *Agent) dispatchTaggedEvent(tev TaggedLoopEvent) {
 		base.Metadata = ev.Metadata
 	case loop.Usage:
 		a.recordUsage(ev)
+		return
+	case loop.Warning:
+		kind, _ := ev.Metadata["kind"].(string)
+		if kind == "" {
+			kind = "protocol_warning"
+		}
+		a.addWarning("protocol", prompt.Warning{Kind: kind, Message: ev.Result})
 		return
 	default:
 		return
