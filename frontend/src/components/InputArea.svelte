@@ -20,7 +20,7 @@
   }
 
   async function cancel() {
-    try { await Cancel(); } catch (err) { console.error('Cancel failed:', err); }
+    try { await Cancel(); } catch (err) { dispatch('error', err?.message || err?.toString?.() || String(err)); }
   }
 
   function autoResize() {

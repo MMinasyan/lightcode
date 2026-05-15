@@ -1,6 +1,7 @@
 <script>
   import { SessionList, SessionSwitch, SessionNew, SessionCurrent, SessionArchive, SessionDelete } from '../../wailsjs/go/main/App';
   import { createEventDispatcher, onMount } from 'svelte';
+  import { errorText } from '../lib/errors.js';
   const dispatch = createEventDispatcher();
 
   let state = 'active';
@@ -14,7 +15,7 @@
       sessions = await SessionList(state) || [];
       const cur = await SessionCurrent();
       currentId = cur?.id || '';
-    } catch (e) { console.error(e); }
+    } catch (e) { dispatch('error', errorText(e)); }
     loading = false;
   }
 
@@ -24,22 +25,22 @@
 
   async function pick(id) {
     try { await SessionSwitch(id); dispatch('close'); }
-    catch (e) { console.error(e); }
+    catch (e) { dispatch('error', errorText(e)); }
   }
 
   async function newSession() {
     try { await SessionNew(); dispatch('close'); }
-    catch (e) { console.error(e); }
+    catch (e) { dispatch('error', errorText(e)); }
   }
 
   async function archive(id) {
     try { await SessionArchive(id); await load(); }
-    catch (e) { console.error(e); }
+    catch (e) { dispatch('error', errorText(e)); }
   }
 
   async function remove(id) {
     try { await SessionDelete(id); await load(); }
-    catch (e) { console.error(e); }
+    catch (e) { dispatch('error', errorText(e)); }
   }
 
   function fmtTs(unix) {

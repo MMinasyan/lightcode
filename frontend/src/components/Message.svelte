@@ -66,9 +66,9 @@
     if (confirmAction === 'revertcode') {
       dispatch('revertcode', detail);
     } else if (confirmAction === 'reverthistory') {
-      dispatch('reverthistory', { ...detail, turn: turn - 1 });
+      dispatch('reverthistory', detail);
     } else if (confirmAction === 'fork') {
-      dispatch('fork', { ...detail, turn: turn - 1 });
+      dispatch('fork', detail);
     }
     closeMenu();
   }

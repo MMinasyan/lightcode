@@ -1,6 +1,7 @@
 <script>
   import { createEventDispatcher, onMount } from 'svelte';
   import { settings } from '../lib/settings.js';
+  import { errorText } from '../lib/errors.js';
   import { AllModelList, SetModelHidden, SetProviderHidden } from '../../wailsjs/go/main/App';
   const dispatch = createEventDispatcher();
   export let initialSection = 'appearance';
@@ -56,7 +57,7 @@
   });
 
   async function refreshModels() {
-    try { allModels = await AllModelList(); } catch (e) { console.error(e); allModels = []; }
+    try { allModels = await AllModelList(); } catch (e) { dispatch('error', errorText(e)); allModels = []; }
     modelGroups = groupByProvider(allModels);
   }
 
@@ -83,7 +84,7 @@
     try {
       await SetModelHidden(entry.ref, hidden);
       await refreshModels();
-    } catch (err) { console.error(err); }
+    } catch (err) { dispatch('error', errorText(err)); }
   }
 
   async function toggleProvider(group, e) {
@@ -91,7 +92,7 @@
     try {
       await SetProviderHidden(group.provider, hidden);
       await refreshModels();
-    } catch (err) { console.error(err); }
+    } catch (err) { dispatch('error', errorText(err)); }
   }
 </script>
 

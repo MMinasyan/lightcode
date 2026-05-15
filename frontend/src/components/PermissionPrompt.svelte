@@ -1,7 +1,10 @@
 <script>
   import { RespondPermission, PermissionSuggest, SaveProjectPermission } from '../../wailsjs/go/main/App';
+  import { createEventDispatcher } from 'svelte';
+  import { errorText } from '../lib/errors.js';
   export let permission = null;
   export let onDone = () => {};
+  const dispatch = createEventDispatcher();
 
   let showSuggest = false;
   let suggestions = [];
@@ -12,10 +15,10 @@
     if (!permission) return;
     try {
       await RespondPermission(permission.id, action);
+      reset();
     } catch (e) {
-      console.error(e);
+      dispatch('error', errorText(e));
     }
-    reset();
   }
 
   async function openSuggest() {
@@ -25,7 +28,7 @@
       selected = {};
       showSuggest = true;
     } catch (e) {
-      console.error(e);
+      dispatch('error', errorText(e));
     }
   }
 
@@ -46,10 +49,11 @@
     saving = true;
     try {
       await SaveProjectPermission(permission.id, patterns);
+      reset();
     } catch (e) {
-      console.error(e);
+      saving = false;
+      dispatch('error', errorText(e));
     }
-    reset();
   }
 
   function reset() {

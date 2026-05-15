@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { EventsOn } from '../wailsjs/runtime/runtime';
-  import { SendPrompt, AppendUserMessage, CurrentModel, CurrentWarnings, RespondPermission, TokenUsage, ProjectName, SessionCurrent, SessionMessages, RevertCode, RevertHistory, ForkSession, CompactNow } from '../wailsjs/go/main/App';
+  import { SendPrompt, SendQueuedMessages, ApplyTurnAction, CurrentModel, CurrentWarnings, TokenUsage, ProjectName, SessionCurrent, SessionMessages, CompactNow } from '../wailsjs/go/main/App';
   import Toolbar from './components/Toolbar.svelte';
   import MessageList from './components/MessageList.svelte';
   import InputArea from './components/InputArea.svelte';
@@ -17,6 +17,7 @@
   import Viewer from './components/Viewer.svelte';
   import { viewer, appendSubagentEvent } from './lib/viewer.js';
   import { settings } from './lib/settings.js';
+  import { errorText } from './lib/errors.js';
 
   const VIEWER_THRESHOLD = 1100;
   const VIEWER_MIN_SIDE = VIEWER_THRESHOLD / 2;
@@ -77,6 +78,11 @@
 
   function mid() { return nextId++; }
 
+  function showError(err, prefix = '') {
+    const text = errorText(err);
+    messages = [...messages, { _id: mid(), type: 'error', content: prefix ? `${prefix}: ${text}` : text }];
+  }
+
   function rebuildFromHistory(persisted) {
     currentTurn = 0;
     return (persisted || []).map(m => {
@@ -85,20 +91,30 @@
     });
   }
 
+  function applySessionPayload(result) {
+    if (!result?.sessionChanged) return;
+    sessionId = result.session?.id || sessionId;
+    if (result.tokens) tokens = result.tokens;
+    else tokens = { total: { cache:0, input:0, output:0, known:true }, perModel: [], contextUsed: 0, contextWindow: 0 };
+    messages = rebuildFromHistory(result.messages || []);
+    messageQueue = [];
+    streamingIdx = -1;
+  }
+
   onMount(async () => {
     EventsOn('warnings', (data) => { if (data) warnings = data; });
     try {
       const currentWarnings = await CurrentWarnings();
       if (currentWarnings) warnings = currentWarnings;
-    } catch (e) { console.error(e); }
+    } catch (e) { showError(e, 'Load warnings failed'); }
 
     try {
       const r = await CurrentModel();
       modelRef = r.ref || ((r.provider && r.model) ? `${r.provider}/${r.model}` : '');
       modelName = r.displayName || modelRef;
-    } catch (e) { console.error(e); }
+    } catch (e) { showError(e, 'Load model failed'); }
 
-    try { projectName = await ProjectName(); } catch (e) { console.error(e); }
+    try { projectName = await ProjectName(); } catch (e) { showError(e, 'Load project failed'); }
 
     try {
       const cur = await SessionCurrent();
@@ -107,12 +123,12 @@
         const hist = await SessionMessages();
         messages = rebuildFromHistory(hist || []);
       }
-    } catch (e) { console.error(e); }
+    } catch (e) { showError(e, 'Load session failed'); }
 
     try {
       const t = await TokenUsage();
       if (t) tokens = t;
-    } catch (e) { console.error(e); }
+    } catch (e) { showError(e, 'Load token usage failed'); }
 
     EventsOn('usage', (data) => { if (data) tokens = data; });
 
@@ -168,7 +184,7 @@
     });
 
     EventsOn('error', (data) => {
-      messages = [...messages, { _id:mid(), type:'error', content:data.message }];
+      showError(data?.message || data);
       busy = false;
       messageQueue = [];
     });
@@ -201,7 +217,7 @@
   async function handleCompact() {
     busy = true;
     try { await CompactNow(); }
-    catch (err) { messages = [...messages, { _id:mid(), type:'error', content:'Compaction failed: ' + err.toString() }]; messageQueue = []; }
+    catch (err) { showError(err, 'Compaction failed'); messageQueue = []; }
     finally { busy = false; }
     await flushQueue();
   }
@@ -219,7 +235,7 @@
       currentTurn = turn;
       messages = [...messages, { _id:mid(), type:'user', content, turn }];
     }
-    catch (err) { messages = [...messages, { _id:mid(), type:'error', content:err.toString() }]; busy = false; }
+    catch (err) { showError(err); busy = false; }
   }
 
   async function flushQueue() {
@@ -229,49 +245,46 @@
     busy = true;
     streamingIdx = -1;
     try {
-      for (let i = 0; i < queued.length - 1; i++) {
-        const turn = await AppendUserMessage(queued[i].content);
-        messages = [...messages, { _id: queued[i]._id, type: 'user', content: queued[i].content, turn }];
+      const result = await SendQueuedMessages(queued.map(q => q.content));
+      const appended = result?.appended || [];
+      for (let i = 0; i < appended.length; i++) {
+        const queuedMessage = queued[i];
+        messages = [...messages, { _id: queuedMessage._id, type: 'user', content: queuedMessage.content, turn: appended[i].turn }];
       }
       const last = queued[queued.length - 1];
-      const turn = await SendPrompt(last.content);
+      const turn = result?.started?.turn || 0;
       currentTurn = turn;
       messages = [...messages, { _id: last._id, type: 'user', content: last.content, turn }];
     }
-    catch (err) { messages = [...messages, { _id: mid(), type: 'error', content: err.toString() }]; busy = false; }
+    catch (err) { showError(err); busy = false; }
   }
 
   function handleManageSettings() { showModelSelector = false; settingsSection = 'models'; showSettings = true; }
   function handleModelSwitched(e) { modelRef = e.detail.ref; modelName = e.detail.displayName || e.detail.ref; showModelSelector = false; }
 
   async function handleRevertCode(e) {
-    const { turn, alsoRevertCode } = e.detail;
-    try { await RevertCode(turn); }
-    catch (err) { messages = [...messages, { _id:mid(), type:'error', content:err.toString() }]; }
+    const { turn } = e.detail;
+    try { await ApplyTurnAction(turn, 'revert_code', false); }
+    catch (err) { showError(err); }
   }
 
   async function handleRevertHistory(e) {
-    const { turn, content: msgContent, alsoRevertCode } = e.detail;
+    const { turn, alsoRevertCode } = e.detail;
     try {
-      if (alsoRevertCode) await RevertCode(turn);
-      await RevertHistory(turn);
-      const hist = await SessionMessages();
-      messages = rebuildFromHistory(hist || []);
-      inputArea?.prefill(msgContent || '');
+      const result = await ApplyTurnAction(turn, 'revert_history', !!alsoRevertCode);
+      applySessionPayload(result);
+      inputArea?.prefill(result?.prefill || '');
     }
-    catch (err) { messages = [...messages, { _id:mid(), type:'error', content:err.toString() }]; }
+    catch (err) { showError(err); }
   }
 
   async function handleFork(e) {
-    const { turn, content: msgContent, alsoRevertCode } = e.detail;
+    const { turn, alsoRevertCode } = e.detail;
     try {
-      if (alsoRevertCode) await RevertCode(turn + 1);
-      await ForkSession(turn);
-      const hist = await SessionMessages();
-      messages = rebuildFromHistory(hist || []);
-      inputArea?.prefill(msgContent || '');
+      const result = await ApplyTurnAction(turn, 'fork', !!alsoRevertCode);
+      applySessionPayload(result);
     }
-    catch (err) { messages = [...messages, { _id:mid(), type:'error', content:err.toString() }]; }
+    catch (err) { showError(err); }
   }
   function handleKeydown(e) {
     if ((e.ctrlKey||e.metaKey) && e.key==='m') { e.preventDefault(); showModelSelector = !showModelSelector; }
@@ -306,27 +319,27 @@
       {/if}
     {/if}
   </div>
-  <InputArea bind:this={inputArea} {busy} on:submit={handleSubmit}>
+  <InputArea bind:this={inputArea} {busy} on:submit={handleSubmit} on:error={(e) => showError(e.detail)}>
     <StatusBar {modelName} on:openModelSelector={() => showModelSelector=true} />
   </InputArea>
   {#if showModelSelector}
-    <ModelSelector currentRef={modelRef} on:switched={handleModelSwitched} on:close={() => showModelSelector=false} on:manageSettings={handleManageSettings} />
+    <ModelSelector currentRef={modelRef} on:switched={handleModelSwitched} on:close={() => showModelSelector=false} on:manageSettings={handleManageSettings} on:error={(e) => showError(e.detail)} />
   {/if}
 
   {#if currentPermission}
-    <PermissionPrompt permission={currentPermission} onDone={() => { permissionQueue = permissionQueue.slice(1); }} />
+    <PermissionPrompt permission={currentPermission} onDone={() => { permissionQueue = permissionQueue.slice(1); }} on:error={(e) => showError(e.detail)} />
   {/if}
   {#if showTokens}
     <TokenDetails {tokens} on:close={() => showTokens=false} />
   {/if}
   {#if showSessionSelector}
-    <SessionSelector on:close={() => showSessionSelector=false} />
+    <SessionSelector on:close={() => showSessionSelector=false} on:error={(e) => showError(e.detail)} />
   {/if}
   {#if showProjectSelector}
-    <ProjectSelector on:close={() => showProjectSelector=false} />
+    <ProjectSelector on:close={() => showProjectSelector=false} on:error={(e) => showError(e.detail)} />
   {/if}
   {#if showSettings}
-    <Settings initialSection={settingsSection} on:close={() => showSettings=false} />
+    <Settings initialSection={settingsSection} on:close={() => showSettings=false} on:error={(e) => showError(e.detail)} />
   {/if}
   {#if showWarnings}
     <WarningDetails {warnings} on:close={() => showWarnings=false} />

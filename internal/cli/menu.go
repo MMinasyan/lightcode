@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/agent"
 )
 
 type menuItem struct {
@@ -617,7 +619,7 @@ func (c *CLI) showRevertMenu() {
 	action := actionResult.extra.(string)
 	switch action {
 	case "code":
-		if err := c.agent.RevertCode(turn - 1); err != nil {
+		if _, err := c.agent.ApplyTurnAction(turn, agent.TurnActionRevertCode, false); err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
@@ -625,13 +627,7 @@ func (c *CLI) showRevertMenu() {
 
 	case "history":
 		alsoCode := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
-		if alsoCode {
-			if err := c.agent.RevertCode(turn - 1); err != nil {
-				c.printLine(renderErrorMsg(err.Error()))
-				return
-			}
-		}
-		if err := c.agent.RevertHistory(turn - 1); err != nil {
+		if _, err := c.agent.ApplyTurnAction(turn, agent.TurnActionRevertHistory, alsoCode); err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
@@ -639,13 +635,7 @@ func (c *CLI) showRevertMenu() {
 
 	case "fork":
 		alsoCode := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
-		if alsoCode {
-			if err := c.agent.RevertCode(turn); err != nil {
-				c.printLine(renderErrorMsg(err.Error()))
-				return
-			}
-		}
-		if err := c.agent.ForkSession(turn); err != nil {
+		if _, err := c.agent.ApplyTurnAction(turn, agent.TurnActionFork, alsoCode); err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}

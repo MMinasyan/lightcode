@@ -1,6 +1,7 @@
 <script>
   import { ModelList, SwitchModel } from '../../wailsjs/go/main/App';
   import { createEventDispatcher, onMount } from 'svelte';
+  import { errorText } from '../lib/errors.js';
   export let currentRef = '';
   const dispatch = createEventDispatcher();
   let entries = [];
@@ -8,7 +9,7 @@
   let query = '';
 
   onMount(async () => {
-    try { entries = await ModelList(); } catch (e) { console.error(e); }
+    try { entries = await ModelList(); } catch (e) { dispatch('error', errorText(e)); }
     loading = false;
   });
 
@@ -43,7 +44,7 @@
 
   async function select(entry) {
     try { await SwitchModel(entry.ref); dispatch('switched', { ref: entry.ref, displayName: entry.displayName || entry.model || entry.ref }); }
-    catch (e) { console.error(e); }
+    catch (e) { dispatch('error', errorText(e)); }
   }
 
   function isActive(entry) { return entry.ref === currentRef; }

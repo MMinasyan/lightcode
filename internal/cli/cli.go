@@ -950,15 +950,25 @@ func (c *CLI) flushQueueLocked() {
 	queue := c.msgQueue
 	c.msgQueue = nil
 
-	for _, text := range queue[:len(queue)-1] {
+	for _, text := range queue {
 		c.printLineLocked(renderUserMsg(text, c.width))
-		if _, err := c.agent.AppendUserMessage(text); err != nil {
-			c.printLineLocked(renderErrorMsg(err.Error()))
-		}
 	}
+	c.busy = true
+	c.state = stateStreaming
+	c.startAnimationLocked("Thinking")
 
-	last := queue[len(queue)-1]
-	c.submitInputLocked(last)
+	go func() {
+		if _, err := c.agent.SendQueuedMessages(c.ctx, queue); err != nil {
+			c.mu.Lock()
+			c.stopAnimationLocked()
+			c.writeRaw("\r\x1b[2K")
+			c.writeRaw(renderErrorMsg(err.Error()))
+			c.busy = false
+			c.state = stateIdle
+			c.printInputPromptLocked()
+			c.mu.Unlock()
+		}
+	}()
 }
 
 func (c *CLI) refreshSession() {

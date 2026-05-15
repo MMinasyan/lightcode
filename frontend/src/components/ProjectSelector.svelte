@@ -1,6 +1,7 @@
 <script>
   import { ProjectList, ProjectSwitch, ProjectPickAndSwitch, ProjectCurrent } from '../../wailsjs/go/main/App';
   import { createEventDispatcher, onMount } from 'svelte';
+  import { errorText } from '../lib/errors.js';
   const dispatch = createEventDispatcher();
 
   let projects = [];
@@ -13,7 +14,7 @@
       projects = await ProjectList() || [];
       const cur = await ProjectCurrent();
       currentPath = cur?.path || '';
-    } catch (e) { console.error(e); }
+    } catch (e) { dispatch('error', errorText(e)); }
     loading = false;
   }
 
@@ -21,12 +22,12 @@
 
   async function pick(path) {
     try { await ProjectSwitch(path); dispatch('close'); }
-    catch (e) { console.error(e); }
+    catch (e) { dispatch('error', errorText(e)); }
   }
 
   async function addProject() {
     try { await ProjectPickAndSwitch(); dispatch('close'); }
-    catch (e) { console.error(e); }
+    catch (e) { dispatch('error', errorText(e)); }
   }
 </script>
 

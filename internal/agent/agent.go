@@ -1011,6 +1011,30 @@ func (a *Agent) SendPrompt(ctx context.Context, content string) (int, error) {
 	return a.sendMessages(ctx, []string{content})
 }
 
+// SendQueuedMessages flushes messages submitted while a turn was busy: all
+// but the last are persisted as user-only turns, then the last starts the
+// next model turn.
+func (a *Agent) SendQueuedMessages(ctx context.Context, contents []string) (QueuedMessagesResult, error) {
+	var result QueuedMessagesResult
+	if len(contents) == 0 {
+		return result, fmt.Errorf("no queued messages")
+	}
+	for _, content := range contents[:len(contents)-1] {
+		turn, err := a.AppendUserMessage(content)
+		if err != nil {
+			return result, err
+		}
+		result.Appended = append(result.Appended, QueuedMessageTurn{Content: content, Turn: turn})
+	}
+	last := contents[len(contents)-1]
+	turn, err := a.SendPrompt(ctx, last)
+	if err != nil {
+		return result, err
+	}
+	result.Started = QueuedMessageTurn{Content: last, Turn: turn}
+	return result, nil
+}
+
 // AppendUserMessage persists a user message as its own complete turn
 // without running the model.
 func (a *Agent) AppendUserMessage(content string) (int, error) {
@@ -1824,6 +1848,111 @@ func displayMetadataForToolCall(name, args, result string) map[string]any {
 }
 
 // --- Snapshot / revert operations ---
+
+// ApplyTurnAction applies a revert/fork action selected from a user message.
+// The turn argument is the clicked user turn; this method owns the conversion
+// to the lower-level snapshot/history cut points so adapters do not duplicate it.
+func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (TurnActionResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.busy {
+		return TurnActionResult{}, fmt.Errorf("cannot %s while a turn is running", turnActionVerb(action))
+	}
+	if !a.store.Active() {
+		return TurnActionResult{}, fmt.Errorf("no session open")
+	}
+	if turn < 1 {
+		return TurnActionResult{}, fmt.Errorf("turn must be >= 1")
+	}
+
+	prefill := a.userMessageContentForTurn(turn)
+	result := TurnActionResult{Action: action, Turn: turn}
+
+	switch action {
+	case TurnActionRevertCode:
+		target := turn - 1
+		result.TargetTurn = target
+		if _, err := a.store.RevertCode(target); err != nil {
+			return TurnActionResult{}, err
+		}
+		return result, nil
+
+	case TurnActionRevertHistory:
+		target := turn - 1
+		result.TargetTurn = target
+		result.Prefill = prefill
+		result.SessionChanged = true
+		if alsoRevertCode {
+			if _, err := a.store.RevertCode(target); err != nil {
+				return TurnActionResult{}, err
+			}
+		}
+		if err := a.store.RevertHistory(target); err != nil {
+			return TurnActionResult{}, err
+		}
+		if err := a.loadHistoryIntoLoop(); err != nil {
+			return TurnActionResult{}, err
+		}
+		a.populateFileTracker()
+		return a.populateTurnActionResult(result), nil
+
+	case TurnActionFork:
+		target := turn
+		result.TargetTurn = target
+		result.SessionChanged = true
+		if alsoRevertCode {
+			if _, err := a.store.RevertCode(target); err != nil {
+				return TurnActionResult{}, err
+			}
+		}
+		newID, _, err := a.store.ForkInto(target)
+		if err != nil {
+			return TurnActionResult{}, err
+		}
+		if _, err := a.store.Close(); err != nil {
+			return TurnActionResult{}, err
+		}
+		if err := a.store.LoadSession(newID); err != nil {
+			return TurnActionResult{}, err
+		}
+		if err := a.loadHistoryIntoLoop(); err != nil {
+			return TurnActionResult{}, err
+		}
+		a.populateFileTracker()
+		a.loadTokensFromDisk()
+		return a.populateTurnActionResult(result), nil
+
+	default:
+		return TurnActionResult{}, fmt.Errorf("unknown turn action %q", action)
+	}
+}
+
+func turnActionVerb(action string) string {
+	switch action {
+	case TurnActionRevertCode, TurnActionRevertHistory:
+		return "revert"
+	case TurnActionFork:
+		return "fork"
+	default:
+		return "apply turn action"
+	}
+}
+
+func (a *Agent) populateTurnActionResult(result TurnActionResult) TurnActionResult {
+	result.Session = a.SessionCurrent()
+	result.Messages = a.messagesForFrontend()
+	result.Tokens = a.TokenUsage()
+	return result
+}
+
+func (a *Agent) userMessageContentForTurn(turn int) string {
+	for _, msg := range a.messagesForFrontend() {
+		if msg.Type == "user" && msg.Turn == turn {
+			return msg.Content
+		}
+	}
+	return ""
+}
 
 // RevertCode restores files to their state at the given turn.
 func (a *Agent) RevertCode(turn int) error {

@@ -137,6 +137,36 @@ type DisplayMessage struct {
 	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
+const (
+	TurnActionRevertCode    = "revert_code"
+	TurnActionRevertHistory = "revert_history"
+	TurnActionFork          = "fork"
+)
+
+// QueuedMessageTurn reports the turn assigned to one queued user message.
+type QueuedMessageTurn struct {
+	Content string `json:"content"`
+	Turn    int    `json:"turn"`
+}
+
+// QueuedMessagesResult reports the turns created while flushing queued input.
+type QueuedMessagesResult struct {
+	Appended []QueuedMessageTurn `json:"appended,omitempty"`
+	Started  QueuedMessageTurn   `json:"started"`
+}
+
+// TurnActionResult is returned after a user-message revert/fork action.
+type TurnActionResult struct {
+	Action         string           `json:"action"`
+	Turn           int              `json:"turn"`
+	TargetTurn     int              `json:"targetTurn"`
+	SessionChanged bool             `json:"sessionChanged"`
+	Prefill        string           `json:"prefill,omitempty"`
+	Session        SessionSummary   `json:"session"`
+	Messages       []DisplayMessage `json:"messages,omitempty"`
+	Tokens         TokenReport      `json:"tokens"`
+}
+
 // ModelInfo holds the active model identity and catalog metadata.
 type ModelInfo struct {
 	Ref           string        `json:"ref"`

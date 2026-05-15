@@ -137,6 +137,11 @@ func (a *App) AppendUserMessage(content string) (int, error) {
 	return a.svc.AppendUserMessage(content)
 }
 
+// SendQueuedMessages flushes queued user messages through the shared backend.
+func (a *App) SendQueuedMessages(contents []string) (agent.QueuedMessagesResult, error) {
+	return a.svc.SendQueuedMessages(a.ctx, contents)
+}
+
 // SwitchModel changes the active model by provider-prefixed catalog ref.
 func (a *App) SwitchModel(ref string) error {
 	return a.svc.SwitchModel(ref)
@@ -173,6 +178,18 @@ func (a *App) ForkSession(turn int) error {
 	}
 	a.emitSessionChanged()
 	return nil
+}
+
+// ApplyTurnAction applies a user-message revert/fork action.
+func (a *App) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (agent.TurnActionResult, error) {
+	result, err := a.svc.ApplyTurnAction(turn, action, alsoRevertCode)
+	if err != nil {
+		return result, err
+	}
+	if result.SessionChanged {
+		a.emitSessionChanged()
+	}
+	return result, nil
 }
 
 // RespondPermission answers a pending permission prompt.
