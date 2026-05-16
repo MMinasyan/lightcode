@@ -153,8 +153,7 @@ func New(c Config) (*Agent, error) {
 	}
 
 	gate := permission.NewGate(func(req permission.Request) {
-		select {
-		case events <- loop.Event{
+		events <- loop.Event{
 			Kind:     loop.PermissionRequest,
 			ToolName: req.ToolName,
 			PermID:   req.ID,
@@ -165,8 +164,6 @@ func New(c Config) (*Agent, error) {
 				"batch_total":   req.BatchTotal,
 				"batch_files":   req.BatchFiles,
 			},
-		}:
-		default:
 		}
 	})
 	a.gate = gate
@@ -1123,9 +1120,13 @@ func (a *Agent) sendMessages(ctx context.Context, contents []string) (int, error
 // Cancel aborts the current turn.
 func (a *Agent) Cancel() error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.turnCancel != nil {
-		a.turnCancel()
+	cancel := a.turnCancel
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if a.gate != nil {
+		a.gate.CancelAll()
 	}
 	return nil
 }

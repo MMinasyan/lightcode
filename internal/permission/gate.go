@@ -77,10 +77,37 @@ func (g *Gate) AskRequest(ctx context.Context, req Request) ResponseAction {
 	case result := <-ch:
 		return result
 	case <-ctx.Done():
+		select {
+		case result := <-ch:
+			return result
+		default:
+		}
 		g.mu.Lock()
-		delete(g.pending, id)
+		select {
+		case result := <-ch:
+			delete(g.pending, id)
+			g.mu.Unlock()
+			return result
+		default:
+		}
+		if current, ok := g.pending[id]; ok && current == ch {
+			delete(g.pending, id)
+		}
 		g.mu.Unlock()
 		return ResponseDeny
+	}
+}
+
+// CancelAll resolves every pending request as denied and clears the pending set.
+func (g *Gate) CancelAll() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for id, ch := range g.pending {
+		select {
+		case ch <- ResponseDeny:
+		default:
+		}
+		delete(g.pending, id)
 	}
 }
 
@@ -103,15 +130,13 @@ func (g *Gate) RespondAction(id string, action string) error {
 
 	g.mu.Lock()
 	ch, ok := g.pending[id]
-	if ok {
-		delete(g.pending, id)
-	}
-	g.mu.Unlock()
-
 	if !ok {
+		g.mu.Unlock()
 		return fmt.Errorf("no pending permission request with id %q", id)
 	}
 	ch <- response
+	delete(g.pending, id)
+	g.mu.Unlock()
 	return nil
 }
 
