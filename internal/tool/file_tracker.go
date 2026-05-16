@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+var statFile = os.Stat
+
 // ReadRecord records a read_file call for deduplication and edit enforcement.
 type ReadRecord struct {
 	Path   string
@@ -18,9 +20,10 @@ type ReadRecord struct {
 // It is populated from conversation history on session load and
 // updated by read_file executions.
 type FileTracker struct {
-	mu     sync.Mutex
-	reads  []ReadRecord         // ordered by time, earliest first
-	mtimes map[string]time.Time // path -> last read mtime
+	mu         sync.Mutex
+	generation uint64
+	reads      []ReadRecord         // ordered by time, earliest first
+	mtimes     map[string]time.Time // path -> last read mtime
 }
 
 // NewFileTracker returns an empty FileTracker.
@@ -33,11 +36,19 @@ func NewFileTracker() *FileTracker {
 // Track records that a file was read at the given mtime.
 func (t *FileTracker) Track(path string, offset, limit int) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	info, err := os.Stat(path)
+	generation := t.generation
+	t.mu.Unlock()
+
+	info, err := statFile(path)
 	mtime := time.Time{}
 	if err == nil {
 		mtime = info.ModTime()
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if generation != t.generation {
+		return
 	}
 	t.mtimes[path] = mtime
 	t.reads = append(t.reads, ReadRecord{
@@ -52,12 +63,24 @@ func (t *FileTracker) Track(path string, offset, limit int) {
 // read-authorized. Writes must not create read authorization by themselves.
 func (t *FileTracker) UpdateAfterWrite(path string) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	generation := t.generation
 	if _, ok := t.mtimes[path]; !ok {
+		t.mu.Unlock()
 		return
 	}
-	info, err := os.Stat(path)
+	t.mu.Unlock()
+
+	info, err := statFile(path)
 	if err != nil {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if generation != t.generation {
+		return
+	}
+	if _, ok := t.mtimes[path]; !ok {
 		return
 	}
 	t.mtimes[path] = info.ModTime()
@@ -68,6 +91,7 @@ func (t *FileTracker) UpdateAfterWrite(path string) {
 func (t *FileTracker) Reset() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.generation++
 	t.reads = nil
 	t.mtimes = make(map[string]time.Time)
 }
@@ -75,13 +99,14 @@ func (t *FileTracker) Reset() {
 // IsDuplicate checks if path+offset+limit was already read AND
 // the file hasn't changed on disk since that read.
 func (t *FileTracker) IsDuplicate(path string, offset, limit int) (bool, ReadRecord) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	info, err := os.Stat(path)
+	info, err := statFile(path)
 	if err != nil {
 		return false, ReadRecord{}
 	}
 	currentMtime := info.ModTime()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	for i := len(t.reads) - 1; i >= 0; i-- {
 		r := t.reads[i]
 		if r.Path == path && r.Offset == offset && r.Limit == limit {
@@ -112,7 +137,7 @@ func (t *FileTracker) WasReadCheck(path string) error {
 	if !wasRead {
 		return &ReadRequiredError{Path: path}
 	}
-	info, err := os.Stat(path)
+	info, err := statFile(path)
 	if err != nil {
 		return &FileChangedError{Path: path}
 	}
