@@ -514,23 +514,21 @@ func (s *Store) ListTurns() ([]TurnEntry, error) {
 // and turn dirs are NOT touched — conversation stays intact.
 func (s *Store) RevertCode(toTurn int) ([]string, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.active {
-		s.mu.Unlock()
 		return nil, ErrNoSession
 	}
-	snapshotsDir := s.snapshotsDir
-	s.mu.Unlock()
 	if toTurn < 0 {
 		toTurn = 0
 	}
-	turns := readIntDirs(snapshotsDir)
+	turns := readIntDirs(s.snapshotsDir)
 	var affected []string
 	for i := len(turns) - 1; i >= 0; i-- {
 		turn := turns[i]
 		if turn <= toTurn {
 			break
 		}
-		turnDir := filepath.Join(snapshotsDir, strconv.Itoa(turn))
+		turnDir := filepath.Join(s.snapshotsDir, strconv.Itoa(turn))
 		paths, err := revertOneTurn(turnDir)
 		if err != nil {
 			return affected, fmt.Errorf("snapshot: revert turn %d: %w", turn, err)
@@ -547,26 +545,22 @@ func (s *Store) RevertCode(toTurn int) ([]string, error) {
 // and updates currentTurn. Files on disk are NOT touched.
 func (s *Store) RevertHistory(toTurn int) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.active {
-		s.mu.Unlock()
 		return ErrNoSession
 	}
-	turnsDir := s.turnsDir
-	s.mu.Unlock()
 	if toTurn < 0 {
 		toTurn = 0
 	}
-	msgTurns := readIntDirs(turnsDir)
+	msgTurns := readIntDirs(s.turnsDir)
 	for _, t := range msgTurns {
 		if t > toTurn {
-			_ = os.RemoveAll(filepath.Join(turnsDir, strconv.Itoa(t)))
+			_ = os.RemoveAll(filepath.Join(s.turnsDir, strconv.Itoa(t)))
 		}
 	}
-	s.mu.Lock()
 	if toTurn >= 0 && toTurn < s.currentTurn {
 		s.currentTurn = toTurn
 	}
-	s.mu.Unlock()
 	return nil
 }
 
@@ -618,6 +612,15 @@ func (s *Store) ForkInto(toTurn int) (string, string, error) {
 	srcTokens := filepath.Join(srcDir, "tokens.json")
 	if _, err := os.Stat(srcTokens); err == nil {
 		_ = copyFile(srcTokens, filepath.Join(newDir, "tokens.json"))
+	}
+
+	// Copy compaction.json only when its boundary exists in the forked history.
+	srcCompaction := filepath.Join(srcDir, "compaction.json")
+	if _, err := os.Stat(srcCompaction); err == nil {
+		var rec CompactionRecord
+		if err := readJSON(srcCompaction, &rec); err == nil && rec.BoundaryTurn <= toTurn {
+			_ = copyFile(srcCompaction, filepath.Join(newDir, "compaction.json"))
+		}
 	}
 
 	// Read source meta to carry over model fields.
