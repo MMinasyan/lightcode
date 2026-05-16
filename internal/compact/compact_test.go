@@ -1,11 +1,17 @@
 package compact
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/provider"
 )
 
 func TestPruneCanonicalToolOutputsKeepsLastRead(t *testing.T) {
@@ -99,6 +105,53 @@ func TestCountTokensIgnoresHiddenMetadata(t *testing.T) {
 
 	if got, want := CountTokens(withExtra), CountTokens(base); got != want {
 		t.Fatalf("CountTokens with hidden metadata = %d, want %d", got, want)
+	}
+}
+
+func TestSummarizeIterativeResultHasSummarizerRef(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"chat-1","model":"summarizer-model","choices":[{"index":0,"message":{"role":"assistant","content":"summary"},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+
+	prov := &catalog.Provider{
+		ID:             "test-provider",
+		Name:           "Test Provider",
+		MaxTokensField: "max_tokens",
+		Transport: catalog.Transport{
+			BaseURL: server.URL,
+		},
+		SystemRole:    catalog.RoleSystem,
+		UsageInStream: true,
+		ExtraBody:     map[string]any{},
+		Models: map[string]*catalog.Model{
+			"summarizer-model": {
+				ID:              "summarizer-model",
+				Name:            "Summarizer Model",
+				ContextWindow:   128000,
+				MaxOutputTokens: 4096,
+				InputModalities: []catalog.Modality{catalog.ModalityText},
+				SystemRole:      catalog.RoleSystem,
+				UsageInStream:   true,
+				ExtraBody:       map[string]any{},
+			},
+		},
+	}
+	client := provider.New(prov, prov.Models["summarizer-model"], "")
+
+	result, err := Run(context.Background(), []message.Message{message.NewText(message.RoleUser, "please summarize")}, Config{
+		SummarizerClient: client,
+		ContextWindow:    1,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Summary != "summary" {
+		t.Fatalf("Summary = %q, want summary", result.Summary)
+	}
+	if got, want := result.SummarizerRef, (catalog.ModelRef{Provider: "test-provider", Model: "summarizer-model"}); got != want {
+		t.Fatalf("SummarizerRef = %#v, want %#v", got, want)
 	}
 }
 

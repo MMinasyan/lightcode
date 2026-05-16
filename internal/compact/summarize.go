@@ -57,7 +57,7 @@ func Run(ctx context.Context, messages []message.Message, cfg Config) (Result, e
 	if err != nil {
 		return Result{}, err
 	}
-	return Result{Summary: summary, SummarizerModel: cfg.SummarizerClient.Model()}, nil
+	return Result{Summary: summary, SummarizerModel: cfg.SummarizerClient.Model(), SummarizerRef: cfg.SummarizerClient.ModelRef()}, nil
 }
 
 func summarizeOnce(ctx context.Context, cfg Config, systemPrompt, previousSummary string, messages []message.Message) (string, error) {
