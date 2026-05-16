@@ -24,7 +24,7 @@ func NewReadOnlyRunCommand(inner *RunCommand) *ReadOnlyRunCommand {
 	return &ReadOnlyRunCommand{inner: inner}
 }
 
-func (*ReadOnlyRunCommand) Name() string              { return "run_command" }
+func (*ReadOnlyRunCommand) Name() string { return "run_command" }
 func (*ReadOnlyRunCommand) Description() string {
 	return "Execute a read-only shell command and return its output. Only non-destructive commands are allowed (ls, cat, grep, find, git log, git diff, etc.)."
 }

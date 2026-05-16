@@ -50,7 +50,7 @@ type taskTool struct {
 	model        string
 	cancelParent func()
 
-	subModel    string
+	subModel string
 
 	toolsConfig config.ToolsConfig
 	homeDir     string
@@ -68,7 +68,7 @@ type taskToolConfig struct {
 	ProviderName string
 	Model        string
 
-	SubModel    string
+	SubModel string
 
 	ToolsConfig config.ToolsConfig
 	HomeDir     string
@@ -80,18 +80,18 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		cfg.MaxConcurrent = 4
 	}
 	return &taskTool{
-		loader:          cfg.Loader,
-		parentStore:     cfg.ParentStore,
-		baseRegistry:    cfg.BaseRegistry,
-		maxConcurrent:   cfg.MaxConcurrent,
-		taggedEvents:    cfg.TaggedEvents,
-		modelCatalog:    cfg.ModelCatalog,
-		providerName:    cfg.ProviderName,
-		model:           cfg.Model,
-		subModel:        cfg.SubModel,
-		toolsConfig:     cfg.ToolsConfig,
-		homeDir:         cfg.HomeDir,
-		procMgr:         cfg.ProcMgr,
+		loader:        cfg.Loader,
+		parentStore:   cfg.ParentStore,
+		baseRegistry:  cfg.BaseRegistry,
+		maxConcurrent: cfg.MaxConcurrent,
+		taggedEvents:  cfg.TaggedEvents,
+		modelCatalog:  cfg.ModelCatalog,
+		providerName:  cfg.ProviderName,
+		model:         cfg.Model,
+		subModel:      cfg.SubModel,
+		toolsConfig:   cfg.ToolsConfig,
+		homeDir:       cfg.HomeDir,
+		procMgr:       cfg.ProcMgr,
 	}
 }
 

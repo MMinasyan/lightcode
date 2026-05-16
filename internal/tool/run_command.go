@@ -31,9 +31,9 @@ func (e *ExitError) Error() string { return e.Output }
 
 // RunCommand implements the run_command tool.
 type RunCommand struct {
-	cfg       config.ToolsConfig
-	homeDir   string
-	procMgr   ProcessManager
+	cfg     config.ToolsConfig
+	homeDir string
+	procMgr ProcessManager
 }
 
 // NewRunCommand creates a RunCommand tool.

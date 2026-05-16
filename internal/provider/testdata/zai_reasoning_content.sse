@@ -1,0 +1,3 @@
+# https://docs.z.ai/guides/capabilities/thinking-mode
+{"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"I should inspect "}}]}
+{"choices":[{"index":0,"delta":{"reasoning_content":"the file first.","tool_calls":[{"index":0,"id":"call_read","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}]}
