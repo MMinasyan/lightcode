@@ -488,8 +488,11 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 		contentParts []message.ContentPart
 		refusalBuf   strings.Builder
 		toolDeltas   map[int]*message.ToolCall
+		toolIDs      map[string]int
 		msgExtra     = message.NewExtraAccumulator()
 		toolExtra    map[int]*message.ExtraAccumulator
+		nextToolIdx  int
+		lastToolIdx  = -1
 		role         string
 		finishReason openai.FinishReason
 		usage        *openai.Usage
@@ -547,28 +550,61 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 				fmt.Fprintf(l.trace, "  !! protocol message extra: %v\n", err)
 			}
 		}
-		for idx, extra := range delta.ToolCallExtra {
-			if toolExtra == nil {
-				toolExtra = map[int]*message.ExtraAccumulator{}
-			}
-			acc := toolExtra[idx]
-			if acc == nil {
-				acc = message.NewExtraAccumulator()
-				toolExtra[idx] = acc
-			}
-			for key, value := range extra {
-				if err := acc.Add(key, value); err != nil {
-					fmt.Fprintf(l.trace, "  !! protocol tool extra: %v\n", err)
-				}
-			}
-		}
-		for _, tc := range delta.ToolCalls {
-			if tc.Index == nil {
-				continue
-			}
-			idx := *tc.Index
+		for pos, tc := range delta.ToolCalls {
 			if toolDeltas == nil {
 				toolDeltas = make(map[int]*message.ToolCall)
+			}
+			idx := -1
+			if tc.Index != nil {
+				idx = *tc.Index
+			} else if tc.ID != "" && toolIDs != nil {
+				if existing, ok := toolIDs[tc.ID]; ok {
+					idx = existing
+				}
+			} else if tc.ID == "" && tc.Function.Name == "" {
+				if len(delta.ToolCalls) == 1 && lastToolIdx >= 0 {
+					idx = lastToolIdx
+				} else if _, exists := toolDeltas[pos]; exists {
+					idx = pos
+				} else if lastToolIdx >= 0 {
+					idx = lastToolIdx
+				}
+			}
+			if idx < 0 {
+				for {
+					if _, exists := toolDeltas[nextToolIdx]; !exists {
+						idx = nextToolIdx
+						nextToolIdx++
+						break
+					}
+					nextToolIdx++
+				}
+			}
+			if tc.ID != "" {
+				if toolIDs == nil {
+					toolIDs = make(map[string]int)
+				}
+				toolIDs[tc.ID] = idx
+			}
+			lastToolIdx = idx
+			extraKey := pos
+			if tc.Index != nil {
+				extraKey = idx
+			}
+			if extra := delta.ToolCallExtra[extraKey]; len(extra) > 0 {
+				if toolExtra == nil {
+					toolExtra = map[int]*message.ExtraAccumulator{}
+				}
+				acc := toolExtra[idx]
+				if acc == nil {
+					acc = message.NewExtraAccumulator()
+					toolExtra[idx] = acc
+				}
+				for key, value := range extra {
+					if err := acc.Add(key, value); err != nil {
+						fmt.Fprintf(l.trace, "  !! protocol tool extra: %v\n", err)
+					}
+				}
 			}
 			entry, ok := toolDeltas[idx]
 			if !ok {

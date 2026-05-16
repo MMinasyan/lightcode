@@ -81,7 +81,6 @@ func ParseChunk(raw json.RawMessage) (StreamDelta, error) {
 		if err := json.Unmarshal(rawToolCalls, &calls); err != nil {
 			return StreamDelta{}, err
 		}
-		ensureToolCallIndexes(calls)
 		out.ToolCalls = calls
 		var rawCalls []map[string]json.RawMessage
 		if err := json.Unmarshal(rawToolCalls, &rawCalls); err != nil {
@@ -100,16 +99,6 @@ func ParseChunk(raw json.RawMessage) (StreamDelta, error) {
 		}
 	}
 	return out, nil
-}
-
-func ensureToolCallIndexes(calls []openai.ToolCall) {
-	for i := range calls {
-		if calls[i].Index != nil {
-			continue
-		}
-		idx := i
-		calls[i].Index = &idx
-	}
 }
 
 func toolCallIndex(raw map[string]json.RawMessage, fallback int) int {

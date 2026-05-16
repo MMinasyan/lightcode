@@ -58,6 +58,95 @@ func TestConsumeStreamHandlesSparseToolCallIndices(t *testing.T) {
 	}
 }
 
+func TestConsumeStreamDoesNotMergeToolCallsWhenProviderOmitsIndices(t *testing.T) {
+	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
+		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"A.md\"}"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_2","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"B.md\",\"content\":\"hi\"}"}}]}}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n"))))
+	loop := &Loop{}
+
+	msg, cancelled, err := loop.consumeStream(context.Background(), stream)
+	if err != nil {
+		t.Fatalf("consume stream: %v", err)
+	}
+	if cancelled {
+		t.Fatal("did not expect cancellation")
+	}
+	if len(msg.ToolCalls) != 2 {
+		t.Fatalf("expected 2 tool calls, got %d: %#v", len(msg.ToolCalls), msg.ToolCalls)
+	}
+	if got := msg.ToolCalls[0]; got.ID != "call_1" || got.Function.Name != "read_file" || got.Function.Arguments != `{"path":"A.md"}` {
+		t.Fatalf("first tool call = %#v", got)
+	}
+	if got := msg.ToolCalls[1]; got.ID != "call_2" || got.Function.Name != "write_file" || got.Function.Arguments != `{"path":"B.md","content":"hi"}` {
+		t.Fatalf("second tool call = %#v", got)
+	}
+}
+
+func TestConsumeStreamUsesPositionForAnonymousToolCallContinuations(t *testing.T) {
+	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
+		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\""}},{"id":"call_2","type":"function","function":{"name":"write_file","arguments":"{\"path\":\""}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"A.md\"}"}},{"function":{"arguments":"B.md\",\"content\":\"hi\"}"}}]}}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n"))))
+	loop := &Loop{}
+
+	msg, cancelled, err := loop.consumeStream(context.Background(), stream)
+	if err != nil {
+		t.Fatalf("consume stream: %v", err)
+	}
+	if cancelled {
+		t.Fatal("did not expect cancellation")
+	}
+	if len(msg.ToolCalls) != 2 {
+		t.Fatalf("expected 2 tool calls, got %d: %#v", len(msg.ToolCalls), msg.ToolCalls)
+	}
+	if got := msg.ToolCalls[0]; got.ID != "call_1" || got.Function.Name != "read_file" || got.Function.Arguments != `{"path":"A.md"}` {
+		t.Fatalf("first tool call = %#v", got)
+	}
+	if got := msg.ToolCalls[1]; got.ID != "call_2" || got.Function.Name != "write_file" || got.Function.Arguments != `{"path":"B.md","content":"hi"}` {
+		t.Fatalf("second tool call = %#v", got)
+	}
+}
+
+func TestConsumeStreamUsesLastToolForSingletonAnonymousContinuation(t *testing.T) {
+	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
+		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"A.md\"}"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_2","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"B.md\",\"content\":\""}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"hi\"}"}}]}}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n"))))
+	loop := &Loop{}
+
+	msg, cancelled, err := loop.consumeStream(context.Background(), stream)
+	if err != nil {
+		t.Fatalf("consume stream: %v", err)
+	}
+	if cancelled {
+		t.Fatal("did not expect cancellation")
+	}
+	if len(msg.ToolCalls) != 2 {
+		t.Fatalf("expected 2 tool calls, got %d: %#v", len(msg.ToolCalls), msg.ToolCalls)
+	}
+	if got := msg.ToolCalls[0]; got.ID != "call_1" || got.Function.Name != "read_file" || got.Function.Arguments != `{"path":"A.md"}` {
+		t.Fatalf("first tool call = %#v", got)
+	}
+	if got := msg.ToolCalls[1]; got.ID != "call_2" || got.Function.Name != "write_file" || got.Function.Arguments != `{"path":"B.md","content":"hi"}` {
+		t.Fatalf("second tool call = %#v", got)
+	}
+}
+
 func TestConsumeStreamCapturesMessageAndToolExtras(t *testing.T) {
 	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"think "}}]}`,
@@ -88,6 +177,37 @@ func TestConsumeStreamCapturesMessageAndToolExtras(t *testing.T) {
 	}
 	if got := string(msg.ToolCalls[0].Extra["extra_content"]); got != `{"google":{"thought_signature":"sig"}}` {
 		t.Fatalf("tool extra = %s", got)
+	}
+}
+
+func TestConsumeStreamRemapsToolExtraForOmittedIndexContinuation(t *testing.T) {
+	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
+		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"A.md\"}"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_2","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"B.md\",\"content\":\""}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"hi\"}"},"extra_content":{"google":{"thought_signature":"sig2"}}}]}}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n"))))
+	loop := &Loop{trace: io.Discard}
+
+	msg, cancelled, err := loop.consumeStream(context.Background(), stream)
+	if err != nil {
+		t.Fatalf("consume stream: %v", err)
+	}
+	if cancelled {
+		t.Fatal("did not expect cancellation")
+	}
+	if len(msg.ToolCalls) != 2 {
+		t.Fatalf("expected 2 tool calls, got %d: %#v", len(msg.ToolCalls), msg.ToolCalls)
+	}
+	if _, ok := msg.ToolCalls[0].Extra["extra_content"]; ok {
+		t.Fatalf("first tool call got continuation extra: %#v", msg.ToolCalls[0].Extra)
+	}
+	if got := string(msg.ToolCalls[1].Extra["extra_content"]); got != `{"google":{"thought_signature":"sig2"}}` {
+		t.Fatalf("second tool extra = %s", got)
 	}
 }
 
