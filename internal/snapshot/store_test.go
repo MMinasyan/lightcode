@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -199,4 +200,283 @@ func newTestStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	return store
+}
+
+func TestBeginTurnCreatesAndIncrementsTurnDirs(t *testing.T) {
+	store := newTestStore(t)
+
+	first := store.BeginTurn()
+	second := store.BeginTurn()
+
+	if first != 1 || second != 2 {
+		t.Fatalf("turns = %d, %d; want 1, 2", first, second)
+	}
+	for _, dir := range []string{
+		filepath.Join(store.snapshotsDir, "1"),
+		filepath.Join(store.turnsDir, "1"),
+		filepath.Join(store.snapshotsDir, "2"),
+		filepath.Join(store.turnsDir, "2"),
+	} {
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			t.Fatalf("turn dir %s stat = %v, isDir = %v; want existing dir", dir, err, err == nil && info.IsDir())
+		}
+	}
+	if got := store.CurrentTurn(); got != 2 {
+		t.Fatalf("CurrentTurn = %d, want 2", got)
+	}
+}
+
+func TestBeginTurnReturnsZeroWithoutSession(t *testing.T) {
+	store, err := NewForSessionsRoot(t.TempDir(), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.BeginTurn(); got != 0 {
+		t.Fatalf("BeginTurn without session = %d, want 0", got)
+	}
+}
+
+func TestMarkTurnCompleteCreatesMarkerAndRejectsInvalidState(t *testing.T) {
+	store := newTestStore(t)
+	turn := store.BeginTurn()
+
+	if err := store.MarkTurnComplete(turn); err != nil {
+		t.Fatalf("MarkTurnComplete = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(store.turnsDir, "1", "complete")); err != nil {
+		t.Fatalf("complete marker missing: %v", err)
+	}
+	if err := store.MarkTurnComplete(0); err == nil {
+		t.Fatalf("MarkTurnComplete(0) error = nil, want error")
+	}
+	if _, err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkTurnComplete(turn); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("MarkTurnComplete without session = %v, want ErrNoSession", err)
+	}
+}
+
+func TestLoadCompleteTurnsReturnsMessagesInOrderAndDeletesIncomplete(t *testing.T) {
+	store := newTestStore(t)
+	turn1 := store.BeginTurn()
+	mustAppendMessage(t, store, turn1, `{"role":"user","content":"one"}`)
+	mustAppendMessage(t, store, turn1, `{"role":"assistant","content":"two"}`)
+	if err := store.MarkTurnComplete(turn1); err != nil {
+		t.Fatal(err)
+	}
+	turn2 := store.BeginTurn()
+	mustAppendMessage(t, store, turn2, `{"role":"user","content":"incomplete"}`)
+
+	turns, err := store.LoadCompleteTurns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 1 || turns[0].Turn != 1 || len(turns[0].Messages) != 2 {
+		t.Fatalf("turns = %+v, want one complete turn with two messages", turns)
+	}
+	if string(turns[0].Messages[0]) != `{"role":"user","content":"one"}` || string(turns[0].Messages[1]) != `{"role":"assistant","content":"two"}` {
+		t.Fatalf("messages = %q, want append order", turns[0].Messages)
+	}
+	if _, err := os.Stat(filepath.Join(store.turnsDir, "2")); !os.IsNotExist(err) {
+		t.Fatalf("incomplete turn should be deleted, stat err = %v", err)
+	}
+}
+
+func TestLoadCompleteTurnsWithoutSessionReturnsErrNoSession(t *testing.T) {
+	store, err := NewForSessionsRoot(t.TempDir(), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadCompleteTurns(); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("LoadCompleteTurns without session = %v, want ErrNoSession", err)
+	}
+}
+
+func TestForkIntoCopiesTurnsUpToTargetAndCanBeLoaded(t *testing.T) {
+	store := newTestStore(t)
+	if err := store.SetModel("openrouter", "test/model"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		turn := store.BeginTurn()
+		mustAppendMessage(t, store, turn, `{"role":"user","content":"turn"}`)
+		if err := store.MarkTurnComplete(turn); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	newID, newDir, err := store.ForkInto(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readIntDirs(filepath.Join(newDir, "turns")); !reflect.DeepEqual(got, []int{1, 2}) {
+		t.Fatalf("forked turns = %v, want [1 2]", got)
+	}
+	if got := readIntDirs(filepath.Join(newDir, "snapshots")); len(got) > 2 {
+		t.Fatalf("forked snapshots = %v, want no turns after 2", got)
+	}
+	forked, err := NewForSessionsRoot(store.Root(), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := forked.LoadSession(newID); err != nil {
+		t.Fatal(err)
+	}
+	if got := forked.CurrentTurn(); got != 2 {
+		t.Fatalf("forked CurrentTurn = %d, want 2", got)
+	}
+	meta, err := forked.Meta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Provider != "openrouter" || meta.Model != "test/model" {
+		t.Fatalf("forked model = %q/%q, want openrouter/test/model", meta.Provider, meta.Model)
+	}
+}
+
+func TestSnapshotFirstWriteWinsAndNewFileDeletesOnRevert(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	existing := filepath.Join(projectDir, "existing.txt")
+	created := filepath.Join(projectDir, "created.txt")
+	if err := os.WriteFile(existing, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	turn := store.BeginTurn()
+	if err := store.Snapshot(turn, existing); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(existing, []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Snapshot(turn, existing); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Snapshot(turn, created); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(created, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.RevertCode(0); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(existing); err != nil || string(got) != "v1" {
+		t.Fatalf("existing content = %q, err = %v; want v1", got, err)
+	}
+	if _, err := os.Stat(created); !os.IsNotExist(err) {
+		t.Fatalf("created file should be removed, stat err = %v", err)
+	}
+}
+
+func TestSnapshotRejectsInvalidTurnAndNoSession(t *testing.T) {
+	store := newTestStore(t)
+	path := filepath.Join(t.TempDir(), "file.txt")
+	if err := store.Snapshot(0, path); err == nil {
+		t.Fatalf("Snapshot(0) error = nil, want error")
+	}
+	if _, err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Snapshot(1, path); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("Snapshot without session = %v, want ErrNoSession", err)
+	}
+}
+
+func TestRevertHistoryNegativeTurnClearsHistory(t *testing.T) {
+	store := newTestStore(t)
+	for i := 0; i < 2; i++ {
+		turn := store.BeginTurn()
+		mustAppendMessage(t, store, turn, `{"role":"user","content":"msg"}`)
+		if err := store.MarkTurnComplete(turn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.RevertHistory(-1); err != nil {
+		t.Fatal(err)
+	}
+	if got := readIntDirs(store.turnsDir); len(got) != 0 {
+		t.Fatalf("turn dirs after RevertHistory(-1) = %v, want none", got)
+	}
+	if got := store.CurrentTurn(); got != 0 {
+		t.Fatalf("CurrentTurn = %d, want 0", got)
+	}
+}
+
+func TestRevertCodeWithoutSessionReturnsErrNoSession(t *testing.T) {
+	store, err := NewForSessionsRoot(t.TempDir(), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RevertCode(0); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("RevertCode without session = %v, want ErrNoSession", err)
+	}
+}
+
+func TestCloseDiscardsEmptySessionAndKeepsCompleteSession(t *testing.T) {
+	empty := newTestStore(t)
+	emptyDir := empty.Dir()
+	discarded, err := empty.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !discarded {
+		t.Fatalf("Close empty discarded = false, want true")
+	}
+	if _, err := os.Stat(emptyDir); !os.IsNotExist(err) {
+		t.Fatalf("empty session dir should be removed, stat err = %v", err)
+	}
+
+	kept := newTestStore(t)
+	keptDir := kept.Dir()
+	turn := kept.BeginTurn()
+	mustAppendMessage(t, kept, turn, `{"role":"user","content":"msg"}`)
+	if err := kept.MarkTurnComplete(turn); err != nil {
+		t.Fatal(err)
+	}
+	discarded, err = kept.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if discarded {
+		t.Fatalf("Close complete session discarded = true, want false")
+	}
+	if info, err := os.Stat(keptDir); err != nil || !info.IsDir() {
+		t.Fatalf("complete session dir stat = %v, isDir = %v; want kept", err, err == nil && info.IsDir())
+	}
+	discarded, err = kept.Close()
+	if err != nil || discarded {
+		t.Fatalf("second Close = (%v, %v), want no-op false nil", discarded, err)
+	}
+}
+
+func TestSaveAndLoadCompactionRoundTripAndAbsent(t *testing.T) {
+	store := newTestStore(t)
+	got, err := store.LoadCompaction()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("LoadCompaction absent = %+v, want nil", got)
+	}
+	want := CompactionRecord{Summary: "summary", BoundaryTurn: 1, CompactedAt: "2026-01-02T03:04:05Z", SummarizerModel: "model", SummarizerProvider: "provider"}
+	if err := store.SaveCompaction(want); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.LoadCompaction()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || !reflect.DeepEqual(*got, want) {
+		t.Fatalf("LoadCompaction = %+v, want %+v", got, want)
+	}
+}
+
+func mustAppendMessage(t *testing.T, store *Store, turn int, msg string) {
+	t.Helper()
+	if err := store.AppendMessage(turn, []byte(msg)); err != nil {
+		t.Fatal(err)
+	}
 }
