@@ -43,3 +43,6 @@ jobs:
 
       - name: Test
         run: go test -race ./...
+
+      - name: Frontend tests
+        run: cd frontend && npm run test
