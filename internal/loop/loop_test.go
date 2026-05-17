@@ -58,6 +58,62 @@ func TestConsumeStreamHandlesSparseToolCallIndices(t *testing.T) {
 	}
 }
 
+func TestConsumeStreamAvoidsOmittedIndexCollisionWithExplicitIndex(t *testing.T) {
+	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
+		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_omitted","type":"function","function":{"name":"read_file","arguments":"{}"}},{"index":0,"id":"call_explicit","type":"function","function":{"name":"write_file","arguments":"{}"}}]}}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n"))))
+	loop := &Loop{}
+
+	msg, cancelled, err := loop.consumeStream(context.Background(), stream)
+	if err != nil {
+		t.Fatalf("consume stream: %v", err)
+	}
+	if cancelled {
+		t.Fatal("did not expect cancellation")
+	}
+	if len(msg.ToolCalls) != 2 {
+		t.Fatalf("expected 2 tool calls, got %d: %#v", len(msg.ToolCalls), msg.ToolCalls)
+	}
+	ids := map[string]bool{}
+	for _, call := range msg.ToolCalls {
+		ids[call.ID] = true
+	}
+	if !ids["call_omitted"] || !ids["call_explicit"] {
+		t.Fatalf("tool call IDs not preserved separately: %#v", msg.ToolCalls)
+	}
+}
+
+func TestEmitDropsTelemetryWhenChannelFull(t *testing.T) {
+	ch := make(chan Event, 1)
+	ch <- Event{Kind: TextDelta, Result: "already full"}
+	loop := &Loop{}
+	loop.SetEvents(ch)
+
+	for i := 0; i < 10; i++ {
+		loop.emit(Event{Kind: TextDelta, Result: "drop"})
+	}
+	if loop.droppedEvents != 10 {
+		t.Fatalf("droppedEvents = %d, want 10", loop.droppedEvents)
+	}
+
+	<-ch
+	loop.emit(Event{Kind: TextDelta, Result: "next"})
+	if loop.droppedEvents != 1 {
+		t.Fatalf("droppedEvents after warning = %d, want 1", loop.droppedEvents)
+	}
+	select {
+	case ev := <-ch:
+		if ev.Kind != Warning || !strings.Contains(ev.Result, "dropped 10 events") {
+			t.Fatalf("warning event = %#v", ev)
+		}
+	default:
+		t.Fatal("expected dropped-event warning")
+	}
+}
+
 func TestConsumeStreamDoesNotMergeToolCallsWhenProviderOmitsIndices(t *testing.T) {
 	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"A.md\"}"}}]}}]}`,

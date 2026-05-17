@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -152,8 +153,8 @@ func New(c Config) (*Agent, error) {
 		warningGroups:     make(map[string][]PromptWarning),
 	}
 
-	gate := permission.NewGate(func(req permission.Request) {
-		events <- loop.Event{
+	gate := permission.NewGate(func(ctx context.Context, req permission.Request) {
+		ev := loop.Event{
 			Kind:     loop.PermissionRequest,
 			ToolName: req.ToolName,
 			PermID:   req.ID,
@@ -164,6 +165,10 @@ func New(c Config) (*Agent, error) {
 				"batch_total":   req.BatchTotal,
 				"batch_files":   req.BatchFiles,
 			},
+		}
+		select {
+		case events <- ev:
+		case <-ctx.Done():
 		}
 	})
 	a.gate = gate
@@ -1164,7 +1169,13 @@ func (a *Agent) SaveProjectPermission(id string, patterns []string) error {
 	if err := permission.SaveLocal(a.projects.Root(), proj.ID, add); err != nil {
 		return err
 	}
-	return a.gate.Respond(id, true)
+	if err := a.gate.Respond(id, true); err != nil {
+		if errors.Is(err, permission.ErrUnknownRequest) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // SwitchModel changes the active model by provider-prefixed catalog ref.

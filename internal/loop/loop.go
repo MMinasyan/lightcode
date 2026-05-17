@@ -114,6 +114,8 @@ type Loop struct {
 	trace  io.Writer
 	events chan<- Event
 
+	droppedEvents int
+
 	// pendingQueue holds staged edit_file/write_file calls for
 	// batch execution. Created fresh per turn.
 	pendingQueue *tool.PendingQueue
@@ -158,9 +160,18 @@ func (l *Loop) emit(ev Event) {
 	if l.events == nil {
 		return
 	}
+	if l.droppedEvents > 0 && ev.Kind != Warning {
+		warning := Event{Kind: Warning, Result: fmt.Sprintf("dropped %d events because event channel was full", l.droppedEvents)}
+		select {
+		case l.events <- warning:
+			l.droppedEvents = 0
+		default:
+		}
+	}
 	select {
 	case l.events <- ev:
 	default:
+		l.droppedEvents++
 	}
 }
 
@@ -555,19 +566,22 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 				toolDeltas = make(map[int]*message.ToolCall)
 			}
 			idx := -1
-			if tc.Index != nil {
-				idx = *tc.Index
-			} else if tc.ID != "" && toolIDs != nil {
-				if existing, ok := toolIDs[tc.ID]; ok {
-					idx = existing
-				}
-			} else if tc.ID == "" && tc.Function.Name == "" {
+			if tc.ID == "" && tc.Function.Name == "" {
 				if len(delta.ToolCalls) == 1 && lastToolIdx >= 0 {
 					idx = lastToolIdx
 				} else if _, exists := toolDeltas[pos]; exists {
 					idx = pos
 				} else if lastToolIdx >= 0 {
 					idx = lastToolIdx
+				}
+			} else if tc.Index != nil {
+				candidate := *tc.Index
+				if existing, ok := toolDeltas[candidate]; !ok || existing.ID == "" || existing.ID == tc.ID {
+					idx = candidate
+				}
+			} else if tc.ID != "" && toolIDs != nil {
+				if existing, ok := toolIDs[tc.ID]; ok {
+					idx = existing
 				}
 			}
 			if idx < 0 {
@@ -588,7 +602,7 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 			}
 			lastToolIdx = idx
 			extraKey := pos
-			if tc.Index != nil {
+			if tc.Index != nil && !(tc.ID == "" && tc.Function.Name == "") {
 				extraKey = idx
 			}
 			if extra := delta.ToolCallExtra[extraKey]; len(extra) > 0 {

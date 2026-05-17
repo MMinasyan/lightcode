@@ -91,6 +91,65 @@ func TestRevertHistoryDeletesLaterTurnsAndUpdatesCurrentTurn(t *testing.T) {
 	}
 }
 
+func TestSnapshotDeduplicatesSymlinkAndRealPath(t *testing.T) {
+	for _, symlinkFirst := range []bool{true, false} {
+		name := "real-first"
+		if symlinkFirst {
+			name = "symlink-first"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newTestStore(t)
+			projectDir := t.TempDir()
+			realPath := filepath.Join(projectDir, "file.txt")
+			linkPath := filepath.Join(projectDir, "link.txt")
+			if err := os.WriteFile(realPath, []byte("v1"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(realPath, linkPath); err != nil {
+				t.Fatal(err)
+			}
+
+			turn := store.BeginTurn()
+			first, second := realPath, linkPath
+			if symlinkFirst {
+				first, second = linkPath, realPath
+			}
+			if err := store.Snapshot(turn, first); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Snapshot(turn, second); err != nil {
+				t.Fatal(err)
+			}
+
+			entries, err := os.ReadDir(filepath.Join(store.snapshotsDir, "1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("snapshot entries = %d, want 1", len(entries))
+			}
+
+			if err := os.WriteFile(realPath, []byte("v2"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			affected, err := store.RevertCode(0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(affected) != 1 {
+				t.Fatalf("affected = %v, want one path", affected)
+			}
+			got, err := os.ReadFile(realPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "v1" {
+				t.Fatalf("content = %q, want v1", got)
+			}
+		})
+	}
+}
+
 func TestRevertCodeRestoresLaterSnapshotsAndDeletesLaterSnapshotDirs(t *testing.T) {
 	store := newTestStore(t)
 	projectDir := t.TempDir()

@@ -293,7 +293,11 @@ func (s *Store) Snapshot(turn int, absPath string) error {
 	if turn < 1 {
 		return fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
 	}
-	pathHash := hashString(absPath)
+	realPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		realPath = absPath
+	}
+	pathHash := hashString(realPath)
 	entryDir := filepath.Join(snapshotsDir, strconv.Itoa(turn), pathHash)
 	metaPath := filepath.Join(entryDir, "meta.json")
 	if _, err := os.Stat(metaPath); err == nil {

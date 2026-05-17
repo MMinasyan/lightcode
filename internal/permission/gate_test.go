@@ -6,6 +6,51 @@ import (
 	"time"
 )
 
+func TestOnRequestBlocksUntilEventDrainsOrContextCancels(t *testing.T) {
+	events := make(chan Request, 1)
+	events <- Request{}
+	gate := NewGate(func(ctx context.Context, req Request) {
+		select {
+		case events <- req:
+		case <-ctx.Done():
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan ResponseAction, 1)
+	go func() {
+		result <- gate.AskRequest(ctx, Request{ToolName: "write_file", Arg: "{}"})
+	}()
+	waitForPending(t, gate, 1)
+
+	select {
+	case <-result:
+		t.Fatal("AskRequest returned while permission event channel was full")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	<-events
+	select {
+	case req := <-events:
+		if req.ID == "" {
+			t.Fatal("permission request was emitted without id")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("permission request did not emit after channel drained")
+	}
+
+	cancel()
+	select {
+	case got := <-result:
+		if got != ResponseDeny {
+			t.Fatalf("AskRequest = %q, want deny", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AskRequest did not return after context cancellation")
+	}
+}
+
 func TestGateCancelAllResolvesAllPending(t *testing.T) {
 	gate := NewGate(nil)
 	ctx := context.Background()
@@ -41,7 +86,7 @@ func TestGateCancelAllResolvesAllPending(t *testing.T) {
 
 func TestGateCancelAllMakesResponsesStale(t *testing.T) {
 	idCh := make(chan string, 1)
-	gate := NewGate(func(req Request) { idCh <- req.ID })
+	gate := NewGate(func(ctx context.Context, req Request) { idCh <- req.ID })
 
 	result := make(chan ResponseAction, 1)
 	go func() {
@@ -63,7 +108,7 @@ func TestGateAskRequestPrefersQueuedResponseOverCancelledContext(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
 		idCh := make(chan string, 1)
-		gate := NewGate(func(req Request) { idCh <- req.ID })
+		gate := NewGate(func(ctx context.Context, req Request) { idCh <- req.ID })
 
 		result := make(chan ResponseAction, 1)
 		go func() {

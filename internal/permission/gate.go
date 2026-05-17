@@ -4,9 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 )
+
+var ErrUnknownRequest = errors.New("no pending permission request")
 
 // Request is the structured payload sent to the frontend when the gate
 // needs to ask the user for permission.
@@ -36,11 +39,11 @@ type Gate struct {
 	pending map[string]chan ResponseAction
 
 	// OnRequest is called when a new permission request is registered.
-	OnRequest func(req Request)
+	OnRequest func(ctx context.Context, req Request)
 }
 
 // NewGate returns a Gate that calls onRequest for each new permission request.
-func NewGate(onRequest func(req Request)) *Gate {
+func NewGate(onRequest func(ctx context.Context, req Request)) *Gate {
 	return &Gate{
 		pending:   make(map[string]chan ResponseAction),
 		OnRequest: onRequest,
@@ -70,7 +73,7 @@ func (g *Gate) AskRequest(ctx context.Context, req Request) ResponseAction {
 	g.mu.Unlock()
 
 	if g.OnRequest != nil {
-		g.OnRequest(req)
+		g.OnRequest(ctx, req)
 	}
 
 	select {
@@ -132,7 +135,7 @@ func (g *Gate) RespondAction(id string, action string) error {
 	ch, ok := g.pending[id]
 	if !ok {
 		g.mu.Unlock()
-		return fmt.Errorf("no pending permission request with id %q", id)
+		return fmt.Errorf("%w: id %q", ErrUnknownRequest, id)
 	}
 	ch <- response
 	delete(g.pending, id)

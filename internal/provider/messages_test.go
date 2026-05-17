@@ -259,6 +259,34 @@ func TestParseChunkCapturesReasoningAndToolCallExtras(t *testing.T) {
 	}
 }
 
+func TestParseChunkToolCallExtraIndexingAvoidsExplicitCollision(t *testing.T) {
+	raw := json.RawMessage(`{"choices":[{"delta":{"tool_calls":[{"id":"call_omitted","type":"function","function":{"name":"read_file","arguments":"{}"},"extra_content":{"source":"omitted"}},{"index":0,"id":"call_explicit","type":"function","function":{"name":"write_file","arguments":"{}"},"extra_content":{"source":"explicit"}}]}}]}`)
+
+	delta, err := ParseChunk(raw)
+	if err != nil {
+		t.Fatalf("ParseChunk returned error: %v", err)
+	}
+	if len(delta.ToolCalls) != 2 {
+		t.Fatalf("tool calls = %#v", delta.ToolCalls)
+	}
+	if delta.ToolCalls[0].Index == nil || delta.ToolCalls[1].Index == nil {
+		t.Fatalf("tool call indexes were not assigned: %#v", delta.ToolCalls)
+	}
+	first, second := *delta.ToolCalls[0].Index, *delta.ToolCalls[1].Index
+	if first == second {
+		t.Fatalf("indexes collided: %#v", delta.ToolCalls)
+	}
+	if first != 1 || second != 0 {
+		t.Fatalf("indexes = {%d, %d}, want {1, 0}", first, second)
+	}
+	if string(delta.ToolCallExtra[1]["extra_content"]) != `{"source":"omitted"}` {
+		t.Fatalf("omitted-index extra = %#v", delta.ToolCallExtra)
+	}
+	if string(delta.ToolCallExtra[0]["extra_content"]) != `{"source":"explicit"}` {
+		t.Fatalf("explicit-index extra = %#v", delta.ToolCallExtra)
+	}
+}
+
 func TestParseChunkCapturesContentPartExtras(t *testing.T) {
 	raw := json.RawMessage(`{"choices":[{"delta":{"content":[{"type":"text","text":"visible","signature":"text-sig"},{"type":"thinking","thinking":"hidden","signature":"opaque-sig"}]}}]}`)
 
