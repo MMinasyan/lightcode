@@ -3,8 +3,6 @@ package tool
 import (
 	"context"
 	"sync"
-
-	"github.com/MMinasyan/lightcode/internal/lsp"
 )
 
 type DiagFileMeta struct {
@@ -21,15 +19,19 @@ type DiagStore interface {
 	ListTurns() ([]DiagTurnEntry, error)
 }
 
+type DiagnosticsClient interface {
+	GetDiagnostics(ctx context.Context, paths []string) (string, error)
+}
+
 type LSPDiagnostics struct {
-	client *lsp.Client
+	client DiagnosticsClient
 	store  DiagStore
 
 	mu              sync.Mutex
 	lastCheckedTurn int
 }
 
-func NewLSPDiagnostics(client *lsp.Client, store DiagStore) *LSPDiagnostics {
+func NewLSPDiagnostics(client DiagnosticsClient, store DiagStore) *LSPDiagnostics {
 	return &LSPDiagnostics{client: client, store: store}
 }
 

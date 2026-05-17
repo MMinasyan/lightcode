@@ -1,14 +1,14 @@
 package tool
 
-import (
-	"context"
+import "context"
 
-	"github.com/MMinasyan/lightcode/internal/lsp"
-)
+type WorkspaceSymbolClient interface {
+	WorkspaceSymbol(ctx context.Context, query string) (string, error)
+}
 
-type WorkspaceSymbol struct{ client *lsp.Client }
+type WorkspaceSymbol struct{ client WorkspaceSymbolClient }
 
-func NewWorkspaceSymbol(client *lsp.Client) *WorkspaceSymbol {
+func NewWorkspaceSymbol(client WorkspaceSymbolClient) *WorkspaceSymbol {
 	return &WorkspaceSymbol{client: client}
 }
 
