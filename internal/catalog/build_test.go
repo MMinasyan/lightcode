@@ -606,6 +606,23 @@ func TestBuildDiscoveryPreservesExistingCostFieldsItDoesNotProvide(t *testing.T)
 
 func ptrFloat64(v float64) *float64 { return &v }
 
+func BenchmarkBuildCatalog(b *testing.B) {
+	bundled, err := readBundledProviders(bundledFS)
+	if err != nil {
+		b.Fatalf("read bundled providers: %v", err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		result := Build(BuildInputs{Bundled: bundled})
+		if len(result.Warnings) != 0 {
+			b.Fatalf("Build warnings = %#v", result.Warnings)
+		}
+		if len(result.Catalog.Providers) == 0 {
+			b.Fatal("built catalog has no providers")
+		}
+	}
+}
+
 func rawProviderJSON(s string) json.RawMessage {
 	return json.RawMessage(s)
 }

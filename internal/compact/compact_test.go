@@ -155,6 +155,30 @@ func TestSummarizeIterativeResultHasSummarizerRef(t *testing.T) {
 	}
 }
 
+func BenchmarkPruneCanonicalToolOutputs(b *testing.B) {
+	messages := make([]message.Message, 0, 300)
+	for i := 0; i < 100; i++ {
+		readID := fmt.Sprintf("call_read_%d", i)
+		runID := fmt.Sprintf("call_run_%d", i)
+		path := fmt.Sprintf("file_%d.txt", i%10)
+		messages = append(messages,
+			message.Message{Role: message.RoleAssistant, ToolCalls: []message.ToolCall{
+				{ID: readID, Type: "function", Function: message.FunctionCall{Name: "read_file", Arguments: fmt.Sprintf(`{"path":"%s"}`, path)}},
+				{ID: runID, Type: "function", Function: message.FunctionCall{Name: "run_command", Arguments: `{"command":"go test ./..."}`}},
+			}},
+			toolMessage(readID, "read_file", strings.Repeat("read output ", 200)),
+			toolMessage(runID, "run_command", strings.Repeat("command output ", 200)),
+		)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pruned := Prune(messages)
+		if len(pruned) != len(messages) {
+			b.Fatalf("pruned len = %d, want %d", len(pruned), len(messages))
+		}
+	}
+}
+
 func toolMessage(id, name, content string) message.Message {
 	msg := message.NewText(message.RoleTool, content)
 	msg.ToolCallID = id

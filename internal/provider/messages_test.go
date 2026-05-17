@@ -2,6 +2,7 @@ package provider
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -397,4 +398,44 @@ func parseFixtureExtras(t *testing.T, path string) (message.Extra, map[int]messa
 		tools[idx] = acc.Extra()
 	}
 	return msgAcc.Extra(), tools
+}
+
+func BenchmarkSerializeMessages(b *testing.B) {
+	prov := testProvider("https://example.com/v1", "KEY_ENV", "model-a")
+	model := prov.Models["model-a"]
+	model.ProtocolMetadata = &catalog.ProtocolMetadata{Family: "reasoning-family", Drop: []string{"drop_me"}}
+	history := make([]message.Message, 0, 100)
+	source := catalog.ModelRef{Provider: "test", Model: "model-a"}
+	for i := 0; i < 25; i++ {
+		history = append(history,
+			message.NewText(message.RoleUser, fmt.Sprintf("request %d", i)),
+			message.Message{
+				Role:    message.RoleAssistant,
+				Content: []message.ContentPart{{Type: message.ContentPartText, Text: fmt.Sprintf("answer %d", i)}},
+				ToolCalls: []message.ToolCall{{
+					ID:       fmt.Sprintf("call_%d", i),
+					Type:     "function",
+					Function: message.FunctionCall{Name: "read_file", Arguments: fmt.Sprintf(`{"path":"file_%d.go"}`, i)},
+					Extra:    message.Extra{"extra_content": json.RawMessage(`{"google":{"thought_signature":"sig"}}`)},
+				}},
+				Extra:  message.Extra{"reasoning_content": json.RawMessage(`"thinking"`)},
+				Source: source,
+			},
+			message.Message{Role: message.RoleTool, ToolCallID: fmt.Sprintf("call_%d", i), Name: "read_file", Content: []message.ContentPart{{Type: message.ContentPartText, Text: "file contents"}}},
+			message.NewText(message.RoleAssistant, fmt.Sprintf("done %d", i)),
+		)
+	}
+	if len(history) != 100 {
+		b.Fatalf("history len = %d, want 100", len(history))
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, err := SerializeMessages(history, model, prov)
+		if err != nil {
+			b.Fatalf("SerializeMessages: %v", err)
+		}
+		if len(out) != len(history) {
+			b.Fatalf("serialized len = %d, want %d", len(out), len(history))
+		}
+	}
 }
