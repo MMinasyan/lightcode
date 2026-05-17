@@ -8,12 +8,16 @@ import (
 	"github.com/MMinasyan/lightcode/internal/memory"
 )
 
+type HistorySearcher interface {
+	SearchHistory(query, projectID string, allProjects bool, limit int) ([]memory.HistoryResult, error)
+}
+
 type SearchHistory struct {
-	store     *memory.Store
+	store     HistorySearcher
 	projectID string
 }
 
-func NewSearchHistory(store *memory.Store, projectID string) *SearchHistory {
+func NewSearchHistory(store HistorySearcher, projectID string) *SearchHistory {
 	return &SearchHistory{store: store, projectID: projectID}
 }
 
