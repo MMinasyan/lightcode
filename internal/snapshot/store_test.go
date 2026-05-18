@@ -151,6 +151,44 @@ func TestSnapshotDeduplicatesSymlinkAndRealPath(t *testing.T) {
 	}
 }
 
+func TestSnapshotResolvedPreservesOriginalPathForListing(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	realPath := filepath.Join(projectDir, "file.txt")
+	linkPath := filepath.Join(projectDir, "link.txt")
+	if err := os.WriteFile(realPath, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	if err := store.SnapshotResolved(turn, linkPath, realPath); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := store.ListTurns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || len(entries[0].Files) != 1 {
+		t.Fatalf("ListTurns = %+v, want one snapshotted file", entries)
+	}
+	if got := entries[0].Files[0].OriginalPath; got != linkPath {
+		t.Fatalf("OriginalPath = %q, want requested path %q", got, linkPath)
+	}
+	if err := os.WriteFile(realPath, []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RevertCode(0); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(realPath); err != nil || string(got) != "v1" {
+		t.Fatalf("real file after revert = %q, %v; want v1", got, err)
+	}
+}
+
 func TestRevertCodeRestoresLaterSnapshotsAndDeletesLaterSnapshotDirs(t *testing.T) {
 	store := newTestStore(t)
 	projectDir := t.TempDir()

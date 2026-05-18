@@ -283,6 +283,12 @@ func (s *Store) CurrentTurn() int {
 // Snapshot captures the pre-turn state of absPath. First-write-wins per
 // (turn, path).
 func (s *Store) Snapshot(turn int, absPath string) error {
+	return s.SnapshotResolved(turn, absPath, absPath)
+}
+
+// SnapshotResolved captures canonicalPath while preserving originalPath for
+// UI/history display. First-write-wins per canonical path.
+func (s *Store) SnapshotResolved(turn int, originalPath, canonicalPath string) error {
 	s.mu.Lock()
 	if !s.active {
 		s.mu.Unlock()
@@ -293,9 +299,9 @@ func (s *Store) Snapshot(turn int, absPath string) error {
 	if turn < 1 {
 		return fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
 	}
-	realPath, err := filepath.EvalSymlinks(absPath)
+	realPath, err := filepath.EvalSymlinks(canonicalPath)
 	if err != nil {
-		realPath = absPath
+		realPath = canonicalPath
 	}
 	pathHash := hashString(realPath)
 	entryDir := filepath.Join(snapshotsDir, strconv.Itoa(turn), pathHash)
@@ -307,21 +313,21 @@ func (s *Store) Snapshot(turn int, absPath string) error {
 		return fmt.Errorf("snapshot: mkdir %s: %w", entryDir, err)
 	}
 	existed := true
-	info, statErr := os.Stat(absPath)
+	info, statErr := os.Stat(canonicalPath)
 	if statErr != nil {
 		if !errors.Is(statErr, os.ErrNotExist) {
-			return fmt.Errorf("snapshot: stat %s: %w", absPath, statErr)
+			return fmt.Errorf("snapshot: stat %s: %w", canonicalPath, statErr)
 		}
 		existed = false
 	} else if info.IsDir() {
 		existed = false
 	}
 	if existed {
-		if err := copyFile(absPath, filepath.Join(entryDir, "original")); err != nil {
-			return fmt.Errorf("snapshot: copy %s: %w", absPath, err)
+		if err := copyFile(canonicalPath, filepath.Join(entryDir, "original")); err != nil {
+			return fmt.Errorf("snapshot: copy %s: %w", canonicalPath, err)
 		}
 	}
-	meta := SnapshotMeta{OriginalPath: absPath, Existed: existed}
+	meta := SnapshotMeta{OriginalPath: originalPath, Existed: existed}
 	if err := writeJSON(metaPath, meta); err != nil {
 		return fmt.Errorf("snapshot: write meta: %w", err)
 	}

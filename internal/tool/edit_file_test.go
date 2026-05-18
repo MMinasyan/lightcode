@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -191,6 +192,47 @@ func TestEditFileWithSnapshotSnapshotsBeforeEdit(t *testing.T) {
 		t.Fatalf("snapshot saw %q, want pre-edit content", store.before[path])
 	}
 	assertFileContent(t, path, "after")
+}
+
+func TestEditFileWithSnapshotUsesCanonicalTargetAndRequestedResult(t *testing.T) {
+	root := t.TempDir()
+	realDir := t.TempDir()
+	target := filepath.Join(realDir, "file.txt")
+	if err := os.WriteFile(target, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(root, "linked")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Fatal(err)
+	}
+	requested := filepath.Join(linkDir, "file.txt")
+	tracker := NewFileTracker()
+	tracker.Track(target, 1, 100)
+	store := &recordingSnapshotStore{turn: 12, before: map[string]string{}}
+	tool := NewEditFileWithSnapshot(store, tracker, config.ToolsConfig{})
+
+	result, err := tool.Execute(context.Background(), map[string]any{
+		"path":       requested,
+		"old_string": "before",
+		"new_string": "after",
+	})
+
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
+	}
+	if result != "Edited "+requested+" (1 replacement, lines 1-1)." {
+		t.Fatalf("Execute result = %q, want requested path in edit summary", result)
+	}
+	if len(store.calls) != 1 {
+		t.Fatalf("snapshot calls = %d, want 1", len(store.calls))
+	}
+	if store.calls[0].path != requested || store.calls[0].canonical != target {
+		t.Fatalf("snapshot call = %+v, want original=%q canonical=%q", store.calls[0], requested, target)
+	}
+	if store.before[target] != "before" {
+		t.Fatalf("snapshot saw %q, want pre-edit content", store.before[target])
+	}
+	assertFileContent(t, target, "after")
 }
 
 func TestApplyEditAndApplyWritePureHelpers(t *testing.T) {

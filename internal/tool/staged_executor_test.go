@@ -167,6 +167,53 @@ func TestStagedExecutorSnapshotsBeforeFinalWrite(t *testing.T) {
 	assertFileContent(t, path, "after")
 }
 
+func TestStagedExecutorGroupsAliasesInternallyAndDisplaysRequestedPaths(t *testing.T) {
+	realPath := stagedExecutorFile(t, "file.txt", "alpha beta")
+	dir := filepath.Dir(realPath)
+	alias1 := filepath.Join(dir, "alias1.txt")
+	alias2 := filepath.Join(dir, "alias2.txt")
+	if err := os.Symlink(realPath, alias1); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realPath, alias2); err != nil {
+		t.Fatal(err)
+	}
+	tracker := NewFileTracker()
+	tracker.Track(realPath, 1, 100)
+	store := &recordingSnapshotStore{turn: 8, before: map[string]string{}}
+	var batchFiles []string
+	executor := NewStagedExecutor(store, tracker, config.ToolsConfig{}, func(string, string) permission.Decision {
+		return permission.DecisionAsk
+	}, func(_ context.Context, req permission.Request) permission.ResponseAction {
+		batchFiles = append([]string(nil), req.BatchFiles...)
+		return permission.ResponseAllowAll
+	})
+
+	results := executor.ExecutePending(context.Background(), []StagedCall{
+		stagedEdit(alias1, "call-1", "alpha", "one", false),
+		stagedEdit(alias2, "call-2", "one beta", "done", false),
+	})
+
+	assertBatchSuccess(t, results, 0, "edit_file", "call-1")
+	assertBatchSuccess(t, results, 1, "edit_file", "call-2")
+	assertFileContent(t, realPath, "done")
+	if results[0].Result != "Edited "+alias1+" (1 replacement, lines 1-1)." {
+		t.Fatalf("result[0] = %q, want requested alias", results[0].Result)
+	}
+	if results[1].Result != "Edited "+alias2+" (1 replacement, lines 1-1)." {
+		t.Fatalf("result[1] = %q, want requested alias", results[1].Result)
+	}
+	if len(batchFiles) != 2 || batchFiles[0] != alias1 || batchFiles[1] != alias2 {
+		t.Fatalf("BatchFiles = %v, want requested aliases [%s %s]", batchFiles, alias1, alias2)
+	}
+	if len(store.calls) != 1 {
+		t.Fatalf("snapshot calls = %d, want 1", len(store.calls))
+	}
+	if store.calls[0].path != alias1 || store.calls[0].canonical != realPath {
+		t.Fatalf("snapshot call = %+v, want original=%q canonical=%q", store.calls[0], alias1, realPath)
+	}
+}
+
 func TestStagedExecutorCancelledContextFailsAllCalls(t *testing.T) {
 	path := stagedExecutorFile(t, "file.txt", "before")
 	tracker := NewFileTracker()
@@ -192,8 +239,9 @@ func TestStagedExecutorCancelledContextFailsAllCalls(t *testing.T) {
 }
 
 type snapshotCall struct {
-	turn int
-	path string
+	turn      int
+	path      string
+	canonical string
 }
 
 type recordingSnapshotStore struct {
@@ -203,12 +251,16 @@ type recordingSnapshotStore struct {
 }
 
 func (s *recordingSnapshotStore) Snapshot(turn int, absPath string) error {
-	data, err := os.ReadFile(absPath)
+	return s.SnapshotResolved(turn, absPath, absPath)
+}
+
+func (s *recordingSnapshotStore) SnapshotResolved(turn int, originalPath, canonicalPath string) error {
+	data, err := os.ReadFile(canonicalPath)
 	if err != nil {
 		return err
 	}
-	s.calls = append(s.calls, snapshotCall{turn: turn, path: absPath})
-	s.before[absPath] = string(data)
+	s.calls = append(s.calls, snapshotCall{turn: turn, path: originalPath, canonical: canonicalPath})
+	s.before[canonicalPath] = string(data)
 	return nil
 }
 

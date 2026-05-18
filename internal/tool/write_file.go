@@ -16,6 +16,17 @@ type SnapshotStore interface {
 	CurrentTurn() int
 }
 
+type resolvedSnapshotStore interface {
+	SnapshotResolved(turn int, originalPath, canonicalPath string) error
+}
+
+func snapshotFile(store SnapshotStore, turn int, originalPath, canonicalPath string) error {
+	if resolved, ok := store.(resolvedSnapshotStore); ok {
+		return resolved.SnapshotResolved(turn, originalPath, canonicalPath)
+	}
+	return store.Snapshot(turn, canonicalPath)
+}
+
 // WriteFile implements the write_file tool with mtime enforcement
 // and pending support.
 type WriteFile struct {
@@ -95,11 +106,15 @@ func (w *WriteFileWithSnapshot) Execute(_ context.Context, params map[string]any
 	if path == "" {
 		return "", fmt.Errorf("write_file: path is required")
 	}
-	absPath, err := filepath.Abs(path)
+	displayAbsPath, err := fileDisplayAbsPath(path)
 	if err != nil {
 		return "", fmt.Errorf("write_file: resolve path: %w", err)
 	}
-	if err := w.store.Snapshot(w.store.CurrentTurn(), absPath); err != nil {
+	securityPath, err := fileSecurityPath(params, path)
+	if err != nil {
+		return "", fmt.Errorf("write_file: resolve path: %w", err)
+	}
+	if err := snapshotFile(w.store, w.store.CurrentTurn(), displayAbsPath, securityPath); err != nil {
 		return "", fmt.Errorf("write_file: snapshot: %w", err)
 	}
 	res, err := writeFileExecCommon(params, w.tracker, w.cfg)
@@ -117,7 +132,7 @@ func writeFileExecCommon(params map[string]any, tracker *FileTracker, cfg config
 	}
 	content, _ := params["content"].(string)
 
-	absPath, err := filepath.Abs(path)
+	absPath, err := fileSecurityPath(params, path)
 	if err != nil {
 		return nil, fmt.Errorf("write_file: resolve path: %w", err)
 	}

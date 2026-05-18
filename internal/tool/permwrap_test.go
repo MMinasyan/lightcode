@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -167,6 +168,76 @@ func TestPermWrappedNoRuleDefaultsToAsk(t *testing.T) {
 	}
 	if inner.calls != 0 {
 		t.Fatalf("inner calls = %d, want 0", inner.calls)
+	}
+}
+
+func TestPermWrappedChecksCanonicalPathButPromptsRequestedPath(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, ".env")
+	if err := os.WriteFile(target, []byte("SECRET=1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "notes.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	inner := &recordingTool{name: "read_file", result: "should not run"}
+	var checkedArg string
+	var askedArg string
+	wrapped := WrapWithPermission(inner, func(toolName, arg string) permission.Decision {
+		checkedArg = arg
+		return permission.Check(permission.Rules{
+			Allow: []string{"read_file(/**)"},
+		}, permission.Rules{}, toolName, arg, root, root, root)
+	}, func(toolName, arg string) bool {
+		askedArg = arg
+		return false
+	})
+
+	_, err := wrapped.Execute(context.Background(), map[string]any{"path": link})
+
+	if !errors.Is(err, ErrDenied) {
+		t.Fatalf("Execute error = %v, want ErrDenied", err)
+	}
+	if checkedArg != target {
+		t.Fatalf("check arg = %q, want canonical target %q", checkedArg, target)
+	}
+	if askedArg != link {
+		t.Fatalf("ask arg = %q, want requested path %q", askedArg, link)
+	}
+	if inner.calls != 0 {
+		t.Fatalf("inner calls = %d, want 0", inner.calls)
+	}
+}
+
+func TestPermWrappedInjectsCanonicalPathForInnerFileTool(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	if err := os.WriteFile(target, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	inner := &recordingTool{name: "read_file", result: "read"}
+	wrapped := WrapWithPermission(inner, func(toolName, arg string) permission.Decision {
+		if arg != target {
+			t.Fatalf("check arg = %q, want %q", arg, target)
+		}
+		return permission.DecisionAllow
+	}, denyIfAsked(t))
+
+	_, err := wrapped.Execute(context.Background(), map[string]any{"path": link})
+
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
+	}
+	if inner.lastParams["path"] != link {
+		t.Fatalf("inner path = %v, want requested path %q", inner.lastParams["path"], link)
+	}
+	if inner.lastParams[canonicalPathParam] != target {
+		t.Fatalf("inner canonical path = %v, want %q", inner.lastParams[canonicalPathParam], target)
 	}
 }
 

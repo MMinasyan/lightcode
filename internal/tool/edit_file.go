@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/config"
@@ -98,11 +97,15 @@ func (e *EditFileWithSnapshot) Execute(_ context.Context, params map[string]any)
 	if path == "" {
 		return "", fmt.Errorf("edit_file: path is required")
 	}
-	absPath, err := filepath.Abs(path)
+	displayAbsPath, err := fileDisplayAbsPath(path)
 	if err != nil {
 		return "", fmt.Errorf("edit_file: resolve path: %w", err)
 	}
-	if err := e.store.Snapshot(e.store.CurrentTurn(), absPath); err != nil {
+	securityPath, err := fileSecurityPath(params, path)
+	if err != nil {
+		return "", fmt.Errorf("edit_file: resolve path: %w", err)
+	}
+	if err := snapshotFile(e.store, e.store.CurrentTurn(), displayAbsPath, securityPath); err != nil {
 		return "", fmt.Errorf("edit_file: snapshot: %w", err)
 	}
 	res, err := editFileExecCommon(params, e.tracker, e.cfg)
@@ -137,7 +140,7 @@ func editFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.
 		return nil, fmt.Errorf("edit_file: old_string and new_string are identical")
 	}
 
-	absPath, err := filepath.Abs(path)
+	absPath, err := fileSecurityPath(params, path)
 	if err != nil {
 		return nil, fmt.Errorf("edit_file: resolve path: %w", err)
 	}

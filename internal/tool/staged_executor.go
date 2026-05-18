@@ -40,16 +40,25 @@ func NewStagedExecutor(store SnapshotStore, tracker *FileTracker, cfg config.Too
 func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall) []BatchResult {
 	results := make([]BatchResult, len(staged))
 	allowed := make([]bool, len(staged))
+	resolvedStaged := make([]StagedCall, len(staged))
 	allowAll := false
 	batchFiles := stagedBatchFiles(staged)
 
 	for i, call := range staged {
+		resolvedStaged[i] = call
 		results[i].ToolName = call.ToolName
 		results[i].ToolCallID = call.ToolCallID
 
+		execParams, err := resolveFileToolParams(call.ToolName, call.Params)
+		if err != nil {
+			results[i].Error = fmt.Sprintf("%s: resolve path: %v", call.ToolName, err)
+			continue
+		}
+		resolvedStaged[i].Params = execParams
+
 		decision := permission.DecisionAsk
 		if e.check != nil {
-			decision = e.check(call.ToolName, PermissionArg(call.ToolName, call.Params))
+			decision = e.check(call.ToolName, PermissionCheckArg(call.ToolName, execParams))
 		}
 		switch decision {
 		case permission.DecisionAllow:
@@ -91,12 +100,12 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 	}
 	var groups []*fileGroup
 	groupIdx := map[string]*fileGroup{}
-	for i, call := range staged {
+	for i, call := range resolvedStaged {
 		if !allowed[i] {
 			continue
 		}
 		path, _ := call.Params["path"].(string)
-		absPath, err := filepath.Abs(path)
+		absPath, err := fileSecurityPath(call.Params, path)
 		if err != nil {
 			results[i].Error = fmt.Sprintf("%s: resolve path: %v", call.ToolName, err)
 			continue
@@ -111,7 +120,7 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 	}
 
 	for _, g := range groups {
-		e.executeFileGroup(ctx, staged, results, g.absPath, g.indexes)
+		e.executeFileGroup(ctx, resolvedStaged, results, g.absPath, g.indexes)
 	}
 
 	return results
@@ -198,7 +207,12 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 	}
 
 	if e.store != nil {
-		if err := e.store.Snapshot(e.store.CurrentTurn(), absPath); err != nil {
+		displayPath, _ := staged[indexes[0]].Params["path"].(string)
+		displayAbsPath, err := fileDisplayAbsPath(displayPath)
+		if err == nil {
+			err = snapshotFile(e.store, e.store.CurrentTurn(), displayAbsPath, absPath)
+		}
+		if err != nil {
 			for _, idx := range indexes {
 				if results[idx].Success {
 					results[idx].Success = false

@@ -80,7 +80,11 @@ func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, er
 		limit = r.cfg.ReadMaxLines
 	}
 
-	absPath, err := filepath.Abs(path)
+	displayAbsPath, err := fileDisplayAbsPath(path)
+	if err != nil {
+		return "", fmt.Errorf("read_file: resolve path: %w", err)
+	}
+	absPath, err := fileSecurityPath(params, path)
 	if err != nil {
 		return "", fmt.Errorf("read_file: resolve path: %w", err)
 	}
@@ -92,25 +96,12 @@ func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, er
 		}
 	}
 
-	info, err := os.Lstat(absPath)
+	info, err := os.Stat(absPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return r.fileNotFound(absPath), nil
+			return r.fileNotFound(displayAbsPath), nil
 		}
 		return "", fmt.Errorf("read_file: %w", err)
-	}
-
-	// Follow symlinks.
-	if info.Mode()&os.ModeSymlink != 0 {
-		realPath, err := filepath.EvalSymlinks(absPath)
-		if err != nil {
-			return "", fmt.Errorf("read_file: symlink: %w", err)
-		}
-		absPath = realPath
-		info, err = os.Stat(absPath)
-		if err != nil {
-			return "", fmt.Errorf("read_file: %w", err)
-		}
 	}
 
 	if info.IsDir() {

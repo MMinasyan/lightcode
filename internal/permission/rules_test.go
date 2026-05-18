@@ -1,6 +1,8 @@
 package permission
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -236,6 +238,73 @@ func TestCheckLocalExplicitAskPreventsGlobal(t *testing.T) {
 	d := Check(local, global, "write_file", "/project/src/main.go", "/project", "/home/user", "/project")
 	if d != DecisionAsk {
 		t.Fatalf("Check = %d, want DecisionAsk", d)
+	}
+}
+
+func TestCheckCanonicalProjectRootLocalDenyOverridesGlobalAllow(t *testing.T) {
+	realRoot := t.TempDir()
+	linkRoot := filepath.Join(t.TempDir(), "project-link")
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(realRoot, "src", "secret.txt")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	local := Rules{Deny: []string{"read_file(/src/secret.txt)"}}
+	global := Rules{Allow: []string{"read_file(/src/**)"}}
+
+	d := Check(local, global, "read_file", path, linkRoot, linkRoot, linkRoot)
+	if d != DecisionDeny {
+		t.Fatalf("Check = %d, want DecisionDeny", d)
+	}
+}
+
+func TestCheckCanonicalProjectRootExplicitAskBlocksGlobalAllow(t *testing.T) {
+	realRoot := t.TempDir()
+	linkRoot := filepath.Join(t.TempDir(), "project-link")
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(linkRoot, "src", "file.txt")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	local := Rules{Ask: []string{"read_file(/src/file.txt)"}}
+	global := Rules{Allow: []string{"read_file(/src/**)"}}
+
+	d := Check(local, global, "read_file", path, linkRoot, linkRoot, linkRoot)
+	if d != DecisionAsk {
+		t.Fatalf("Check = %d, want DecisionAsk", d)
+	}
+}
+
+func TestEvaluateProjectRuleDoesNotAllowSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	allowedDir := filepath.Join(root, "allowed")
+	if err := os.MkdirAll(allowedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(allowedDir, "link")
+	if err := os.Symlink(outside, linkDir); err != nil {
+		t.Fatal(err)
+	}
+	requested := filepath.Join(linkDir, "new.txt")
+
+	d := Evaluate(Rules{
+		Allow: []string{"write_file(/allowed/**)"},
+	}, "write_file", requested, root, root, root)
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate = %d, want DecisionAsk", d)
 	}
 }
 

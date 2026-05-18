@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+
+	"github.com/MMinasyan/lightcode/internal/pathutil"
 )
 
 // Rules is the shape of both global permissions (in config.json) and
@@ -48,6 +50,10 @@ func parseRule(s string) (parsedRule, error) {
 //	//foo   → /foo                (absolute)
 //	foo     → <cwd>/foo           (cwd-relative)
 func resolvePath(pattern, projectRoot, home, cwd string) string {
+	projectRoot = canonicalBase(projectRoot)
+	home = canonicalBase(home)
+	cwd = canonicalBase(cwd)
+
 	switch {
 	case strings.HasPrefix(pattern, "//"):
 		return pattern[1:] // "//etc/passwd" → "/etc/passwd"
@@ -58,6 +64,21 @@ func resolvePath(pattern, projectRoot, home, cwd string) string {
 	default:
 		return filepath.Join(cwd, pattern)
 	}
+}
+
+func canonicalBase(path string) string {
+	if path == "" {
+		return path
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	resolved, _, err := pathutil.ResolveAbsPath(absPath)
+	if err != nil {
+		return filepath.Clean(absPath)
+	}
+	return resolved
 }
 
 // matchGlob matches path against pattern, supporting ** for zero or more
@@ -228,8 +249,11 @@ func ruleMatches(r parsedRule, toolName, arg, projectRoot, home, cwd string) boo
 	if toolName == "run_command" {
 		return matchCommand(r.pattern, arg)
 	}
-	// File tools: resolve the pattern to an absolute glob and match.
 	absPattern := resolvePath(r.pattern, projectRoot, home, cwd)
+	if isFiletool(toolName) {
+		absPattern = pathutil.ResolvePathPattern(absPattern)
+		arg = pathutil.ResolvePathPattern(arg)
+	}
 	return matchGlob(absPattern, arg)
 }
 
@@ -260,13 +284,17 @@ func Evaluate(rules Rules, toolName, arg, projectRoot, home, cwd string) Decisio
 }
 
 func evaluateSingle(rules Rules, toolName, arg, projectRoot, home, cwd string) Decision {
+	sensitiveArg := arg
+	if isFiletool(toolName) {
+		sensitiveArg = pathutil.ResolvePathPattern(arg)
+	}
 	if evaluateRules(rules.Deny, toolName, arg, projectRoot, home, cwd) {
 		return DecisionDeny
 	}
 	if evaluateRules(rules.Ask, toolName, arg, projectRoot, home, cwd) {
 		return DecisionAsk
 	}
-	if isFiletool(toolName) && isSensitivePath(arg) {
+	if isFiletool(toolName) && isSensitivePath(sensitiveArg) {
 		return DecisionAsk
 	}
 	if evaluateRules(rules.Allow, toolName, arg, projectRoot, home, cwd) {
