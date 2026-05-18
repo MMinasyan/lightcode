@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -35,6 +36,38 @@ func TestProcessToolReadReturnsAndTruncatesOutput(t *testing.T) {
 	}
 	if !strings.Contains(result, "Full output (16 bytes) saved to: "+home+"/.lightcode/proc_output_") {
 		t.Fatalf("Execute result = %q, want process spill path", result)
+	}
+}
+
+func TestProcessToolReadTruncatesManyLinesAndSpillsFullOutput(t *testing.T) {
+	home := t.TempDir()
+	var b strings.Builder
+	for i := 1; i <= 25; i++ {
+		b.WriteString("line ")
+		b.WriteString(string(rune('A' + i - 1)))
+		b.WriteByte('\n')
+	}
+	fullOutput := b.String()
+	mgr := &mockProcessController{readOutput: fullOutput}
+	tool := NewProcessTool(mgr, config.ToolsConfig{MaxOutputBytes: 100}, home)
+
+	result, err := tool.Execute(context.Background(), map[string]any{"action": "read", "id": "proc-1"})
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
+	}
+	if !strings.Contains(result, "line A") || !strings.Contains(result, "line Y") {
+		t.Fatalf("Execute result = %q, want first and last lines", result)
+	}
+	spillPath := extractSpillPath(t, result)
+	if !strings.HasPrefix(spillPath, home+"/.lightcode/proc_output_") {
+		t.Fatalf("spill path = %q, want process spill path under home %q", spillPath, home)
+	}
+	data, err := os.ReadFile(spillPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", spillPath, err)
+	}
+	if string(data) != fullOutput {
+		t.Fatalf("spill file content = %q, want full output %q", string(data), fullOutput)
 	}
 }
 
@@ -120,4 +153,18 @@ func (m *mockProcessController) Kill(id string) error {
 func (m *mockProcessController) List() string {
 	m.listCalls++
 	return m.listOutput
+}
+
+func extractSpillPath(t *testing.T, result string) string {
+	t.Helper()
+	marker := "saved to: "
+	idx := strings.LastIndex(result, marker)
+	if idx < 0 {
+		t.Fatalf("result = %q, missing spill marker", result)
+	}
+	path := result[idx+len(marker):]
+	if end := strings.IndexAny(path, "]\n"); end >= 0 {
+		path = path[:end]
+	}
+	return strings.TrimSpace(path)
 }

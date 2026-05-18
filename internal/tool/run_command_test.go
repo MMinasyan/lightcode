@@ -3,6 +3,8 @@ package tool
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -152,6 +154,83 @@ func TestRunCommandTruncatesLargeOutputAndSpillsFullOutput(t *testing.T) {
 	}
 	if !strings.Contains(result, "Full output (16 bytes) saved to: "+home+"/.lightcode/cmd_output_") {
 		t.Fatalf("Execute result = %q, want spill path under home", result)
+	}
+}
+
+func TestRunCommandTruncatesManyLinesAndSpillsFullOutput(t *testing.T) {
+	home := t.TempDir()
+	tool := NewRunCommand(config.ToolsConfig{
+		CommandTimeout: 2,
+		MaxOutputBytes: 100,
+	}, home, nil)
+
+	var b strings.Builder
+	for i := 1; i <= 25; i++ {
+		b.WriteString("line ")
+		b.WriteString(string(rune('A' + i - 1)))
+		b.WriteByte('\n')
+	}
+	fullOutput := b.String()
+
+	result, err := tool.Execute(context.Background(), map[string]any{"command": "cat <<'EOF'\n" + fullOutput + "EOF"})
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
+	}
+	if !strings.Contains(result, "line A") || !strings.Contains(result, "line Y") {
+		t.Fatalf("Execute result = %q, want first and last lines", result)
+	}
+	spillPath := extractSpillPath(t, result)
+	if !strings.HasPrefix(spillPath, home+"/.lightcode/cmd_output_") {
+		t.Fatalf("spill path = %q, want command spill path under home %q", spillPath, home)
+	}
+	data, err := os.ReadFile(spillPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", spillPath, err)
+	}
+	if string(data) != fullOutput {
+		t.Fatalf("spill file content = %q, want full output %q", string(data), fullOutput)
+	}
+}
+
+func TestRunCommandTimeoutSendsTERMBeforeKILL(t *testing.T) {
+	tool := NewRunCommand(config.ToolsConfig{CommandTimeout: 5}, t.TempDir(), nil)
+
+	output, err := tool.Execute(context.Background(), map[string]any{
+		"command": "trap 'echo got-term; exit 0' TERM; sleep 10",
+		"timeout": float64(1),
+	})
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("Execute error = %T %v, want *ExitError", err, err)
+	}
+	if !strings.Contains(output, "got-term") || !strings.Contains(exitErr.Output, "got-term") {
+		t.Fatalf("output=%q exitErr.Output=%q, want SIGTERM trap output before timeout error", output, exitErr.Output)
+	}
+}
+
+func TestRunCommandTerminateProcessUsesExistingWaitChannel(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "trap '' TERM; sleep 10")
+	cmd.SysProcAttr = childProcAttr()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	done := make(chan error, 1)
+	waitDone := make(chan struct{})
+	go func() {
+		done <- cmd.Wait()
+		close(waitDone)
+	}()
+
+	tool := NewRunCommand(config.ToolsConfig{}, t.TempDir(), nil)
+	tool.terminateProcess(cmd, waitDone)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		t.Fatal("terminateProcess did not wait for the existing cmd.Wait channel")
 	}
 }
 

@@ -116,7 +116,7 @@ func (r *RunCommand) runForeground(ctx context.Context, command string, timeoutS
 		defer cancel()
 	}
 
-	cmd := exec.CommandContext(cmdCtx, "sh", "-c", command)
+	cmd := exec.Command("sh", "-c", command)
 	cmd.SysProcAttr = childProcAttr()
 
 	var stdout, stderr bytes.Buffer
@@ -129,8 +129,10 @@ func (r *RunCommand) runForeground(ctx context.Context, command string, timeoutS
 	}
 
 	done := make(chan error, 1)
+	waitDone := make(chan struct{})
 	go func() {
 		done <- cmd.Wait()
+		close(waitDone)
 	}()
 
 	var waitErr error
@@ -138,7 +140,7 @@ func (r *RunCommand) runForeground(ctx context.Context, command string, timeoutS
 	case waitErr = <-done:
 	case <-ctx.Done():
 		// User cancelled — send SIGTERM, wait 500ms, then SIGKILL.
-		r.terminateProcess(cmd)
+		r.terminateProcess(cmd, waitDone)
 		<-done
 		return string(stdout.Bytes()) + string(stderr.Bytes()), &ExitError{
 			Output:   "command cancelled",
@@ -146,7 +148,7 @@ func (r *RunCommand) runForeground(ctx context.Context, command string, timeoutS
 		}
 	case <-cmdCtx.Done():
 		// Timeout.
-		r.terminateProcess(cmd)
+		r.terminateProcess(cmd, waitDone)
 		<-done
 		output := string(stdout.Bytes()) + string(stderr.Bytes())
 		return output, &ExitError{
@@ -241,7 +243,7 @@ func (r *RunCommand) spillFile() string {
 	return filepath.Join(r.homeDir, ".lightcode", fmt.Sprintf("cmd_output_%d_%x.txt", ts, ts%65536))
 }
 
-func (r *RunCommand) terminateProcess(cmd *exec.Cmd) {
+func (r *RunCommand) terminateProcess(cmd *exec.Cmd, done <-chan struct{}) {
 	if cmd.Process == nil {
 		return
 	}
@@ -249,11 +251,6 @@ func (r *RunCommand) terminateProcess(cmd *exec.Cmd) {
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 
 	// Wait 500ms grace period.
-	done := make(chan struct{})
-	go func() {
-		_, _ = cmd.Process.Wait()
-		close(done)
-	}()
 	select {
 	case <-done:
 		return

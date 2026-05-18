@@ -114,7 +114,7 @@ func (p *ProcessTool) truncateOutput(output string) string {
 		buf.WriteString(truncateLine(l, p.cfg.ReadLineMaxChars))
 		buf.WriteByte('\n')
 	}
-	buf.WriteString(fmt.Sprintf("[Output truncated. Full output (%d bytes) saved to: %s]\n", len(output), p.spillFile()))
+	buf.WriteString(fmt.Sprintf("[Output truncated. Full output (%d bytes) saved to: %s]\n", len(output), p.spillAndSave(output)))
 	for _, l := range lastLines {
 		buf.WriteString(truncateLine(l, p.cfg.ReadLineMaxChars))
 		buf.WriteByte('\n')
@@ -129,6 +129,13 @@ func (p *ProcessTool) truncateOutput(output string) string {
 func (p *ProcessTool) spillFile() string {
 	ts := time.Now().UnixNano()
 	return filepath.Join(p.homeDir, ".lightcode", fmt.Sprintf("proc_output_%d_%x.txt", ts, ts%65536))
+}
+
+func (p *ProcessTool) spillAndSave(output string) string {
+	spillPath := p.spillFile()
+	_ = os.MkdirAll(filepath.Dir(spillPath), 0o700)
+	_ = os.WriteFile(spillPath, []byte(output), 0o600)
+	return spillPath
 }
 
 func (p *ProcessTool) perLineTruncate(s string) string {
