@@ -738,7 +738,9 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 			projName = proj.Name
 		}
 		compactionPath := filepath.Join(a.store.Dir(), "compaction.json")
-		_ = a.memoryStore.IndexSummary(sessionID, projID, projName, result.Summary, rec.CompactedAt, compactionPath)
+		if err := a.memoryStore.IndexSummary(sessionID, projID, projName, result.Summary, rec.CompactedAt, compactionPath); err != nil {
+			fmt.Fprintf(os.Stderr, "lightcode: memory index summary: %v\n", err)
+		}
 	}
 
 	a.lp.LoadHistoryWithSummary(result.Summary, result.SummarizerRef, nil)
