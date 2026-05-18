@@ -133,7 +133,7 @@ func runACP() error {
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	port := fs.Int("port", 0, "listen port (0 = OS-assigned)")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	svc, err := buildAgent()
 	if err != nil {

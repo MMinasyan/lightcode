@@ -33,21 +33,21 @@ func NewEmbedder() (*Embedder, error) {
 		return nil, err
 	}
 	if err := os.WriteFile(filepath.Join(dir, "model.onnx"), modelOnnx, 0644); err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		return nil, err
 	}
 	if err := os.WriteFile(filepath.Join(dir, "tokenizer.json"), modelTokenizer, 0644); err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		return nil, err
 	}
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), modelConfig, 0644); err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		return nil, err
 	}
 
 	session, err := hugot.NewGoSession(context.Background())
 	if err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		return nil, err
 	}
 
@@ -61,8 +61,8 @@ func NewEmbedder() (*Embedder, error) {
 	}
 	pipeline, err := hugot.NewPipeline(session, config)
 	if err != nil {
-		session.Destroy()
-		os.RemoveAll(dir)
+		_ = session.Destroy()
+		_ = os.RemoveAll(dir)
 		return nil, err
 	}
 
@@ -85,9 +85,9 @@ func (e *Embedder) Embed(text string) ([]float32, error) {
 
 func (e *Embedder) Close() {
 	if e.session != nil {
-		e.session.Destroy()
+		_ = e.session.Destroy()
 	}
 	if e.modelDir != "" {
-		os.RemoveAll(e.modelDir)
+		_ = os.RemoveAll(e.modelDir)
 	}
 }

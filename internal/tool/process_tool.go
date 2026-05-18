@@ -100,8 +100,8 @@ func (p *ProcessTool) truncateOutput(output string) string {
 
 	if totalLines <= 20 {
 		spillPath := p.spillFile()
-		os.MkdirAll(filepath.Dir(spillPath), 0o700)
-		os.WriteFile(spillPath, []byte(output), 0o600)
+		_ = os.MkdirAll(filepath.Dir(spillPath), 0o700)
+		_ = os.WriteFile(spillPath, []byte(output), 0o600)
 		result := p.perLineTruncate(output)
 		return result + fmt.Sprintf("\n[Output truncated. Full output (%d bytes) saved to: %s]", len(output), spillPath)
 	}

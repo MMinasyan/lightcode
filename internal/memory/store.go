@@ -41,12 +41,12 @@ func (s *Store) SaveMemory(memoriesDir, title, content string) (string, error) {
 	}
 	vec, err := s.embedder.Embed(content)
 	if err != nil {
-		os.Remove(fp)
+		_ = os.Remove(fp)
 		return "", fmt.Errorf("embed memory: %w", err)
 	}
 	vecPath := strings.TrimSuffix(fp, ".md") + ".vec"
 	if err := WriteVec(vecPath, vec); err != nil {
-		os.Remove(fp)
+		_ = os.Remove(fp)
 		return "", err
 	}
 	return fp, nil
@@ -292,7 +292,7 @@ func (s *Store) Reconcile() error {
 			if err != nil {
 				continue
 			}
-			WriteVec(vecPath, vec)
+			_ = WriteVec(vecPath, vec)
 		}
 	}
 	return nil
@@ -312,7 +312,7 @@ func readProjectName(metaPath string) string {
 	var m struct {
 		Name string `json:"name"`
 	}
-	json.Unmarshal(data, &m)
+	_ = json.Unmarshal(data, &m)
 	return m.Name
 }
 
@@ -322,6 +322,6 @@ func readSummaryMeta(path string) summaryMeta {
 		return summaryMeta{}
 	}
 	var m summaryMeta
-	json.Unmarshal(data, &m)
+	_ = json.Unmarshal(data, &m)
 	return m
 }

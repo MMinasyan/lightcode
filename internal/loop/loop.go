@@ -466,7 +466,7 @@ func (l *Loop) runStream(ctx context.Context) (message.Message, bool, error) {
 			return message.Message{}, false, err
 		}
 		msg, cancelled, err := l.consumeStream(ctx, stream)
-		stream.Close()
+		_ = stream.Close()
 		if err != nil && isRetryable(err) && attempt < maxRetries {
 			lastErr = err
 			continue

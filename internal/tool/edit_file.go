@@ -160,6 +160,7 @@ func editFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.
 		return nil, err
 	}
 
+	// #nosec G703 -- path is permission-gated by PermWrapped (internal/tool/permwrap.go); user approves each call before execution.
 	if err := os.WriteFile(absPath, []byte(res.UpdatedContent), 0o644); err != nil {
 		return nil, fmt.Errorf("edit_file: write: %w", err)
 	}

@@ -298,7 +298,7 @@ func (a *Agent) SetEventHandler(fn func(Event)) {
 func (a *Agent) Init(ctx context.Context) {
 	go a.drainLoopEvents(ctx)
 	if a.memoryStore != nil {
-		a.memoryStore.Reconcile()
+		_ = a.memoryStore.Reconcile()
 	}
 	a.runSweep()
 	if err := a.resumeMostRecent(); err != nil {
@@ -649,7 +649,7 @@ func (a *Agent) runSweep() {
 	}
 	var onDelete func(string)
 	if a.memoryStore != nil {
-		onDelete = func(sessionID string) { a.memoryStore.DeleteSessionSummaries(sessionID) }
+		onDelete = func(sessionID string) { _ = a.memoryStore.DeleteSessionSummaries(sessionID) }
 	}
 	if _, _, err := snapshot.SweepAllProjects(a.projects.Root(), cfg, onDelete); err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: sweep: %v\n", err)
@@ -738,7 +738,9 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 			projName = proj.Name
 		}
 		compactionPath := filepath.Join(a.store.Dir(), "compaction.json")
-		a.memoryStore.IndexSummary(sessionID, projID, projName, result.Summary, rec.CompactedAt, compactionPath)
+		if err := a.memoryStore.IndexSummary(sessionID, projID, projName, result.Summary, rec.CompactedAt, compactionPath); err != nil {
+			fmt.Fprintf(os.Stderr, "lightcode: memory index summary: %v\n", err)
+		}
 	}
 
 	a.lp.LoadHistoryWithSummary(result.Summary, result.SummarizerRef, nil)
@@ -1730,7 +1732,7 @@ func (a *Agent) SessionDelete(id string) (bool, error) {
 		return false, err
 	}
 	if a.memoryStore != nil {
-		a.memoryStore.DeleteSessionSummaries(id)
+		_ = a.memoryStore.DeleteSessionSummaries(id)
 	}
 	if err := snapshot.DeleteSession(sessionsRoot, id); err != nil {
 		return false, err

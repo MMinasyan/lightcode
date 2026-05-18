@@ -84,8 +84,8 @@ var definitions = []Definition{
 			}
 			src := strings.TrimSpace(string(out))
 			dst := filepath.Join(cacheDir, "rust-analyzer")
-			os.MkdirAll(cacheDir, 0755)
-			os.Remove(dst)
+			_ = os.MkdirAll(cacheDir, 0755)
+			_ = os.Remove(dst)
 			return os.Symlink(src, dst)
 		},
 	},
@@ -176,7 +176,7 @@ func runWithTimeout(cmd *exec.Cmd, timeout time.Duration) error {
 	case err := <-done:
 		return err
 	case <-time.After(timeout):
-		cmd.Process.Kill()
+		_ = cmd.Process.Kill()
 		return fmt.Errorf("install timed out after %v", timeout)
 	}
 }

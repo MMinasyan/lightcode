@@ -216,6 +216,7 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 			return
 		}
 	}
+	// #nosec G703 -- path is permission-gated by PermWrapped (internal/tool/permwrap.go); user approves each call before execution.
 	if err := os.WriteFile(absPath, []byte(content), 0o644); err != nil {
 		e.failSuccessful(results, indexes, fmt.Sprintf("write %s: %v", absPath, err))
 		return
