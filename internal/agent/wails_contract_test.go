@@ -3,6 +3,8 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -111,4 +113,121 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 	if strings.Contains(menu, "RevertCode(turn - 1)") || strings.Contains(menu, "ForkSession(turn") {
 		t.Fatalf("CLI revert menu still performs adapter-local turn action logic")
 	}
+}
+
+func TestWailsBindingsCoverExportedAppMethods(t *testing.T) {
+	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
+	binding := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "wailsjs", "go", "main", "App.d.ts"))
+
+	methods := extractUniqueMatches(app, `func \(a \*App\) ([A-Z]\w*)\(`)
+	exports := stringSet(extractUniqueMatches(binding, `export function (\w+)\(`))
+	if len(methods) == 0 {
+		t.Fatal("no exported App methods found in app.go")
+	}
+	var missing []string
+	for _, name := range methods {
+		if !exports[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("App.d.ts missing Wails bindings for exported App methods: %s", strings.Join(missing, ", "))
+	}
+}
+
+func TestBackendEmittedEventsAreListenedToByFrontend(t *testing.T) {
+	emitted := collectContractMatches(t, filepath.Join("..", ".."), ".go", `EventsEmit\([^,]+,\s*["']([^"']+)["']`)
+	listened := stringSet(collectContractMatches(t, filepath.Join("..", "..", "frontend", "src"), ".svelte", `EventsOn\(["']([^"']+)["']`))
+	if len(emitted) == 0 {
+		t.Fatal("no runtime.EventsEmit calls found")
+	}
+	var missing []string
+	for _, name := range emitted {
+		if !listened[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("backend events emitted without frontend EventsOn listener: %s", strings.Join(missing, ", "))
+	}
+}
+
+func TestFrontendEventListenersHaveBackendEmitters(t *testing.T) {
+	listened := collectContractMatches(t, filepath.Join("..", "..", "frontend", "src"), ".svelte", `EventsOn\(["']([^"']+)["']`)
+	emitted := stringSet(collectContractMatches(t, filepath.Join("..", ".."), ".go", `EventsEmit\([^,]+,\s*["']([^"']+)["']`))
+	if len(listened) == 0 {
+		t.Fatal("no frontend EventsOn calls found")
+	}
+	var missing []string
+	for _, name := range listened {
+		if !emitted[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("frontend EventsOn listeners without backend EventsEmit source: %s", strings.Join(missing, ", "))
+	}
+}
+
+func mustReadContractFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
+func collectContractMatches(t *testing.T, root, ext, pattern string) []string {
+	t.Helper()
+	seen := map[string]bool{}
+	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" || d.Name() == "build" || d.Name() == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ext {
+			return nil
+		}
+		for _, match := range extractUniqueMatches(mustReadContractFile(t, path), pattern) {
+			seen[match] = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+	return sortedKeys(seen)
+}
+
+func extractUniqueMatches(content, pattern string) []string {
+	re := regexp.MustCompile(pattern)
+	seen := map[string]bool{}
+	for _, match := range re.FindAllStringSubmatch(content, -1) {
+		if len(match) > 1 {
+			seen[match[1]] = true
+		}
+	}
+	return sortedKeys(seen)
+}
+
+func stringSet(values []string) map[string]bool {
+	set := make(map[string]bool, len(values))
+	for _, value := range values {
+		set[value] = true
+	}
+	return set
+}
+
+func sortedKeys(values map[string]bool) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }

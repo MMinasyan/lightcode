@@ -8,12 +8,16 @@ import (
 	"github.com/MMinasyan/lightcode/internal/memory"
 )
 
+type MemorySearcher interface {
+	SearchMemory(query, projectID string, allProjects bool, limit int) ([]memory.MemoryResult, error)
+}
+
 type SearchMemory struct {
-	store     *memory.Store
+	store     MemorySearcher
 	projectID string
 }
 
-func NewSearchMemory(store *memory.Store, projectID string) *SearchMemory {
+func NewSearchMemory(store MemorySearcher, projectID string) *SearchMemory {
 	return &SearchMemory{store: store, projectID: projectID}
 }
 

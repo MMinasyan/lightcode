@@ -45,11 +45,6 @@ func isReadOnlyCommand(command string) bool {
 	if strings.ContainsAny(command, ">") {
 		return false
 	}
-	for _, allowed := range readOnlyCommands {
-		if command == allowed || strings.HasPrefix(command, allowed+" ") || strings.HasPrefix(command, allowed+"\t") {
-			return true
-		}
-	}
 	for _, sep := range []string{"&&", "||", ";", "|"} {
 		if strings.Contains(command, sep) {
 			parts := strings.Split(command, sep)
@@ -58,6 +53,11 @@ func isReadOnlyCommand(command string) bool {
 					return false
 				}
 			}
+			return true
+		}
+	}
+	for _, allowed := range readOnlyCommands {
+		if command == allowed || strings.HasPrefix(command, allowed+" ") || strings.HasPrefix(command, allowed+"\t") {
 			return true
 		}
 	}

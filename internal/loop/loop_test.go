@@ -358,3 +358,43 @@ func TestPersistMessageWritesCanonicalShapeWithSource(t *testing.T) {
 		t.Fatalf("_lightcode_source = %s, want test-provider/test-model", raw["_lightcode_source"])
 	}
 }
+
+func BenchmarkConsumeStream(b *testing.B) {
+	fixture := largeSSEFixture()
+	loop := &Loop{trace: io.Discard}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		stream := provider.NewStream(io.NopCloser(strings.NewReader(fixture)))
+		msg, cancelled, err := loop.consumeStream(context.Background(), stream)
+		if err != nil {
+			b.Fatalf("consume stream: %v", err)
+		}
+		if cancelled {
+			b.Fatal("did not expect cancellation")
+		}
+		if got, want := len(msg.ToolCalls), 40; got != want {
+			b.Fatalf("tool calls = %d, want %d", got, want)
+		}
+	}
+}
+
+func largeSSEFixture() string {
+	var b strings.Builder
+	b.WriteString(`data: {"choices":[{"delta":{"role":"assistant","content":"start"}}]}`)
+	b.WriteString("\n\n")
+	for i := 0; i < 40; i++ {
+		suffix := string([]rune{rune('a' + i/26), rune('a' + i%26)})
+		b.WriteString(`data: {"choices":[{"delta":{"content":" chunk","tool_calls":[{"id":"call_`)
+		b.WriteString(suffix)
+		b.WriteString(`","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"file_`)
+		b.WriteString(suffix)
+		b.WriteString(`.go\"}"}}]}}]}`)
+		b.WriteString("\n\n")
+	}
+	for i := 0; i < 120; i++ {
+		b.WriteString(`data: {"choices":[{"delta":{"content":" more text"}}]}`)
+		b.WriteString("\n\n")
+	}
+	b.WriteString("data: [DONE]\n\n")
+	return b.String()
+}

@@ -3,16 +3,18 @@ package tool
 import (
 	"context"
 	"fmt"
-
-	"github.com/MMinasyan/lightcode/internal/memory"
 )
 
+type MemorySaver interface {
+	SaveMemory(memoriesDir, title, content string) (string, error)
+}
+
 type SaveMemory struct {
-	store       *memory.Store
+	store       MemorySaver
 	memoriesDir string
 }
 
-func NewSaveMemory(store *memory.Store, memoriesDir string) *SaveMemory {
+func NewSaveMemory(store MemorySaver, memoriesDir string) *SaveMemory {
 	return &SaveMemory{store: store, memoriesDir: memoriesDir}
 }
 

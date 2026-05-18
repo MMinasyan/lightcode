@@ -10,18 +10,23 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/process"
 )
+
+type ProcessController interface {
+	Read(id string) (string, error)
+	Kill(id string) error
+	List() string
+}
 
 // ProcessTool implements the process management tool for background commands.
 type ProcessTool struct {
-	mgr     *process.Manager
+	mgr     ProcessController
 	cfg     config.ToolsConfig
 	homeDir string
 }
 
 // NewProcessTool creates a process management tool.
-func NewProcessTool(mgr *process.Manager, cfg config.ToolsConfig, homeDir string) *ProcessTool {
+func NewProcessTool(mgr ProcessController, cfg config.ToolsConfig, homeDir string) *ProcessTool {
 	return &ProcessTool{mgr: mgr, cfg: cfg, homeDir: homeDir}
 }
 
