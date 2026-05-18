@@ -36,7 +36,7 @@ func TestPendingQueueStagedReturnsCopy(t *testing.T) {
 
 	staged := queue.Staged()
 	staged[0] = pendingCall("write_file", "mutated", "b.txt")
-	staged = append(staged, pendingCall("edit_file", "extra", "c.txt"))
+	_ = append(staged, pendingCall("edit_file", "extra", "c.txt"))
 
 	again := queue.Staged()
 	if queue.Len() != 1 || len(again) != 1 {

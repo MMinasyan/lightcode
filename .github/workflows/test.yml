@@ -47,5 +47,18 @@ jobs:
       - name: Fuzz seed corpus
         run: go test -run=Fuzz ./internal/provider/... ./internal/catalog/... ./internal/message/...
 
+      - name: Install lint tools
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.26.1
+          go install github.com/gordonklaus/ineffassign@v0.2.0
+
+      - name: gosec
+        # G204/G304/G306/G302/G301 describe patterns inherent to a
+        # file-IO + command-runner tool; see Makefile GOSEC_EXCLUDE.
+        run: $(go env GOPATH)/bin/gosec -quiet -exclude=G204,G301,G302,G304,G306 ./...
+
+      - name: ineffassign
+        run: $(go env GOPATH)/bin/ineffassign ./...
+
       - name: Frontend tests
         run: cd frontend && npm run test
