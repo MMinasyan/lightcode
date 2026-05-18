@@ -129,6 +129,7 @@ func (inst *instance) start(ctx context.Context) error {
 
 	inst.resetIdle()
 
+	// #nosec G118 -- watchProcess is tied to the LSP process lifetime (cmd.Wait), not the start ctx; cleanup is via instance shutdown.
 	go inst.watchProcess()
 
 	return nil

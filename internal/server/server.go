@@ -101,7 +101,10 @@ func (s *Server) Serve(ctx context.Context, home, projectID string) error {
 
 	s.httpSrv = &http.Server{Handler: mux}
 
-	// Shutdown goroutine.
+	// Shutdown goroutine. Uses context.Background for the Shutdown timeout
+	// because the parent ctx has already been cancelled by the time we get
+	// here; deriving from it would give Shutdown zero time to drain.
+	// #nosec G118 -- parent ctx is already cancelled; Shutdown needs its own 5s budget.
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
