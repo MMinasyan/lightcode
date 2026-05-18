@@ -42,7 +42,10 @@ func (r *ReadOnlyRunCommand) Execute(ctx context.Context, params map[string]any)
 
 func isReadOnlyCommand(command string) bool {
 	command = strings.TrimSpace(command)
-	if strings.ContainsAny(command, ">") {
+	if command == "" {
+		return false
+	}
+	if strings.ContainsAny(command, "\n\r>`") || strings.Contains(command, "$(") {
 		return false
 	}
 	for _, sep := range []string{"&&", "||", ";", "|"} {
@@ -56,8 +59,34 @@ func isReadOnlyCommand(command string) bool {
 			return true
 		}
 	}
+	if isDestructiveReadOnlyMode(command) {
+		return false
+	}
 	for _, allowed := range readOnlyCommands {
 		if command == allowed || strings.HasPrefix(command, allowed+" ") || strings.HasPrefix(command, allowed+"\t") {
+			return true
+		}
+	}
+	return false
+}
+
+func isDestructiveReadOnlyMode(command string) bool {
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return true
+	}
+	switch fields[0] {
+	case "find":
+		for _, field := range fields[1:] {
+			if field == "-delete" || field == "-exec" || field == "-execdir" {
+				return true
+			}
+		}
+	case "git":
+		if len(fields) >= 4 && fields[1] == "branch" && (fields[2] == "-d" || fields[2] == "-D") {
+			return true
+		}
+		if len(fields) >= 4 && fields[1] == "tag" && fields[2] == "-d" {
 			return true
 		}
 	}

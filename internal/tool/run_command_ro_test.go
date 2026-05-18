@@ -19,7 +19,12 @@ func TestReadOnlyRunCommandAllowsWhitelistedCommands(t *testing.T) {
 		{name: "with args", command: "echo allowed", want: "allowed"},
 		{name: "tab args", command: "echo\tallowed", want: "allowed"},
 		{name: "pipeline", command: "echo beta | grep beta", want: "beta"},
+		{name: "cat", command: "cat run_command_ro_test.go", want: "package tool"},
 		{name: "git read only", command: "git status --short", want: ""},
+		{name: "git log", command: "git log --oneline -5", want: ""},
+		{name: "git branch list", command: "git branch", want: ""},
+		{name: "git tag list", command: "git tag", want: ""},
+		{name: "find name", command: "find . -name '*.go'", want: ".go"},
 	}
 
 	for _, tt := range tests {
@@ -41,8 +46,18 @@ func TestReadOnlyRunCommandRejectsUnsafeCommands(t *testing.T) {
 		"",
 		"rm -rf file",
 		"echo unsafe > file.txt",
+		"echo $(touch /tmp/x)",
+		"echo `touch /tmp/x`",
+		"echo allowed\nrm -rf file",
+		"echo allowed\rrm -rf file",
 		"echo allowed && rm -rf file",
 		"cat missing.txt || rm -rf file",
+		"find . -delete",
+		"find . -exec rm {} +",
+		"find . -execdir rm {} +",
+		"git branch -d old",
+		"git branch -D main",
+		"git tag -d v1",
 		"lsx",
 	}
 
@@ -65,6 +80,7 @@ func TestIsReadOnlyCommandClassifiesChainsBeforePrefixAllow(t *testing.T) {
 		{command: "echo allowed && rm -rf file", want: false},
 		{command: "git log --oneline | head -1", want: true},
 		{command: "git log --oneline | xargs rm", want: false},
+		{command: "rg package .", want: true},
 		{command: " echo trimmed ", want: true},
 		{command: "echo unsafe > file", want: false},
 	}
