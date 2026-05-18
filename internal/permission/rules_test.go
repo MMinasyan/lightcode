@@ -163,6 +163,74 @@ func TestEvaluateCompoundCommand(t *testing.T) {
 	}
 }
 
+func TestEvaluateMultilineCommandRequiresEachLineAllowed(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(cat *)"},
+	}
+
+	d := Evaluate(rules, "run_command", "cat README.md\nrm -rf ~/", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate multiline = %d, want DecisionAsk", d)
+	}
+}
+
+func TestEvaluateNewlineSeparatedCommandsIndependently(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(npm run *)"},
+		Deny:  []string{"run_command(rm *)"},
+	}
+
+	d := Evaluate(rules, "run_command", "npm run build\nrm -rf /tmp/junk", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate LF-separated = %d, want DecisionDeny", d)
+	}
+
+	d = Evaluate(rules, "run_command", "npm run build\nnpm run test", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate LF-separated all-allow = %d, want DecisionAllow", d)
+	}
+}
+
+func TestEvaluateCarriageReturnSeparatedCommandsIndependently(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(npm run *)"},
+		Deny:  []string{"run_command(rm *)"},
+	}
+
+	d := Evaluate(rules, "run_command", "npm run build\rrm -rf /tmp/junk", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate CR-separated = %d, want DecisionDeny", d)
+	}
+
+	d = Evaluate(rules, "run_command", "npm run build\rnpm run test", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate CR-separated all-allow = %d, want DecisionAllow", d)
+	}
+}
+
+func TestEvaluateQuotedNewlineExactRuleStaysSingleCommand(t *testing.T) {
+	command := "printf 'a\nb'"
+	rules := Rules{
+		Allow: []string{"run_command(" + command + ")"},
+	}
+
+	d := Evaluate(rules, "run_command", command, "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate quoted newline exact = %d, want DecisionAllow", d)
+	}
+}
+
+func TestEvaluateQuotedNewlineWildcardRuleStaysSingleCommand(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(printf *)"},
+	}
+
+	d := Evaluate(rules, "run_command", "printf \"a\nb\"", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate quoted newline wildcard = %d, want DecisionAllow", d)
+	}
+}
+
 func TestEvaluateCommandWithSubstitutionReturnsAsk(t *testing.T) {
 	rules := Rules{
 		Allow: []string{"run_command(*)"},
@@ -361,6 +429,8 @@ func TestDecomposeCommandCompound(t *testing.T) {
 		{"a || b", []string{"a", "b"}},
 		{"a ; b", []string{"a", "b"}},
 		{"a | b", []string{"a", "b"}},
+		{"a\nb", []string{"a", "b"}},
+		{"a\rb", []string{"a", "b"}},
 		{"a && b || c ; d | e", []string{"a", "b", "c", "d", "e"}},
 	}
 	for _, tt := range tests {
@@ -398,6 +468,24 @@ func TestDecomposeCommandQuotedSemicolon(t *testing.T) {
 	}
 	if len(parts) != 1 {
 		t.Fatalf("quoted semicolon should not split, got %v", parts)
+	}
+}
+
+func TestDecomposeCommandQuotedNewline(t *testing.T) {
+	parts, err := DecomposeCommand("printf 'a\nb'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 1 || parts[0] != "printf 'a\nb'" {
+		t.Fatalf("quoted single newline should not split, got %q", parts)
+	}
+
+	parts, err = DecomposeCommand("printf \"a\nb\"")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 1 || parts[0] != "printf \"a\nb\"" {
+		t.Fatalf("quoted double newline should not split, got %q", parts)
 	}
 }
 

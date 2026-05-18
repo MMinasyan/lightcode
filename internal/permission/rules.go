@@ -173,9 +173,10 @@ func matchCommandWildcard(pattern, command string) bool {
 	return p == len(pattern)
 }
 
-// DecomposeCommand splits a shell command on &&, ||, ;, and | respecting
-// single and double quotes. Returns an error if $( or backticks are found
-// outside single quotes (command substitution cannot be safely pattern-matched).
+// DecomposeCommand splits a shell command on &&, ||, ;, |, LF, and CR
+// respecting single and double quotes. Returns an error if $( or backticks are
+// found outside single quotes (command substitution cannot be safely
+// pattern-matched).
 func DecomposeCommand(cmd string) ([]string, error) {
 	var parts []string
 	var current strings.Builder
@@ -220,8 +221,8 @@ func DecomposeCommand(cmd string) ([]string, error) {
 				i++ // skip second char of operator
 				continue
 			}
-			// ; or |
-			if r == ';' || r == '|' {
+			// ;, |, LF, or CR
+			if r == ';' || r == '|' || r == '\n' || r == '\r' {
 				s := strings.TrimSpace(current.String())
 				if s != "" {
 					parts = append(parts, s)
