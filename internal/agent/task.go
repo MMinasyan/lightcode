@@ -13,6 +13,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/loop"
+	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/provider"
 	"github.com/MMinasyan/lightcode/internal/subagent"
 	"github.com/MMinasyan/lightcode/internal/tool"
@@ -55,6 +56,8 @@ type taskTool struct {
 	toolsConfig config.ToolsConfig
 	homeDir     string
 	procMgr     tool.ProcessManager
+	check       tool.CheckFunc
+	ask         tool.AskFunc
 }
 
 type taskToolConfig struct {
@@ -73,6 +76,8 @@ type taskToolConfig struct {
 	ToolsConfig config.ToolsConfig
 	HomeDir     string
 	ProcMgr     tool.ProcessManager
+	Check       tool.CheckFunc
+	Ask         tool.AskFunc
 }
 
 func newTaskTool(cfg taskToolConfig) *taskTool {
@@ -92,6 +97,8 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		toolsConfig:   cfg.ToolsConfig,
 		homeDir:       cfg.HomeDir,
 		procMgr:       cfg.ProcMgr,
+		check:         cfg.Check,
+		ask:           cfg.Ask,
 	}
 }
 
@@ -250,7 +257,8 @@ func (t *taskTool) buildRegistry(at subagent.AgentType) *tool.Registry {
 		}
 		if name == "run_command" && isReadOnlyType(at) {
 			rc := tool.NewRunCommand(t.toolsConfig, t.homeDir, t.procMgr)
-			reg.Register(tool.NewReadOnlyRunCommand(rc))
+			readOnly := tool.NewReadOnlyRunCommand(rc)
+			reg.Register(tool.WrapWithPermission(readOnly, t.permissionCheck(), t.permissionAsk()))
 			continue
 		}
 		if tt, ok := t.baseRegistry.Get(name); ok {
@@ -258,6 +266,24 @@ func (t *taskTool) buildRegistry(at subagent.AgentType) *tool.Registry {
 		}
 	}
 	return reg
+}
+
+func (t *taskTool) permissionCheck() tool.CheckFunc {
+	if t.check != nil {
+		return t.check
+	}
+	return func(string, string) permission.Decision {
+		return permission.DecisionDeny
+	}
+}
+
+func (t *taskTool) permissionAsk() tool.AskFunc {
+	if t.ask != nil {
+		return t.ask
+	}
+	return func(string, string) bool {
+		return false
+	}
 }
 
 func isReadOnlyType(at subagent.AgentType) bool {

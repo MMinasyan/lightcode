@@ -2,12 +2,14 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/loop"
+	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/subagent"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
@@ -146,6 +148,88 @@ func TestTaskToolReadOnlyAndRegistryRouting(t *testing.T) {
 	}
 	if _, ok := registry.Get("task"); ok {
 		t.Fatal("buildRegistry included recursive task tool")
+	}
+}
+
+func TestTaskToolWrapsReadOnlyRunCommandWithParentPermission(t *testing.T) {
+	var checkedTool, checkedArg string
+	var asked bool
+	task := &taskTool{
+		check: func(toolName, arg string) permission.Decision {
+			checkedTool, checkedArg = toolName, arg
+			return permission.DecisionDeny
+		},
+		ask: func(string, string) bool {
+			asked = true
+			return true
+		},
+	}
+
+	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"run_command"}})
+	runCommand, ok := registry.Get("run_command")
+	if !ok {
+		t.Fatal("buildRegistry missing run_command")
+	}
+
+	_, err := runCommand.Execute(context.Background(), map[string]any{"command": "echo allowed"})
+	if !errors.Is(err, tool.ErrDenied) {
+		t.Fatalf("Execute error = %v, want ErrDenied", err)
+	}
+	if checkedTool != "run_command" || checkedArg != "echo allowed" {
+		t.Fatalf("permission check = %q/%q, want run_command/echo allowed", checkedTool, checkedArg)
+	}
+	if asked {
+		t.Fatal("ask called after explicit deny")
+	}
+}
+
+func TestTaskToolReadOnlyRunCommandCanAskAndExecute(t *testing.T) {
+	var checkedTool, checkedArg string
+	var askedTool, askedArg string
+	task := &taskTool{
+		check: func(toolName, arg string) permission.Decision {
+			checkedTool, checkedArg = toolName, arg
+			return permission.DecisionAsk
+		},
+		ask: func(toolName, arg string) bool {
+			askedTool, askedArg = toolName, arg
+			return true
+		},
+	}
+
+	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"run_command"}})
+	runCommand, ok := registry.Get("run_command")
+	if !ok {
+		t.Fatal("buildRegistry missing run_command")
+	}
+
+	result, err := runCommand.Execute(context.Background(), map[string]any{"command": "echo subagent-ok"})
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
+	}
+	if !strings.Contains(result, "subagent-ok") {
+		t.Fatalf("Execute result = %q, want command output", result)
+	}
+	if checkedTool != "run_command" || checkedArg != "echo subagent-ok" {
+		t.Fatalf("permission check = %q/%q, want run_command/echo subagent-ok", checkedTool, checkedArg)
+	}
+	if askedTool != checkedTool || askedArg != checkedArg {
+		t.Fatalf("ask = %q/%q, want %q/%q", askedTool, askedArg, checkedTool, checkedArg)
+	}
+}
+
+func TestTaskToolReadOnlyRunCommandFailsClosedWithoutPermissionGate(t *testing.T) {
+	task := &taskTool{}
+
+	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"run_command"}})
+	runCommand, ok := registry.Get("run_command")
+	if !ok {
+		t.Fatal("buildRegistry missing run_command")
+	}
+
+	_, err := runCommand.Execute(context.Background(), map[string]any{"command": "echo allowed"})
+	if !errors.Is(err, tool.ErrDenied) {
+		t.Fatalf("Execute error = %v, want ErrDenied", err)
 	}
 }
 

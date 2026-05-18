@@ -263,6 +263,8 @@ func New(c Config) (*Agent, error) {
 		ToolsConfig:   c.Cfg.Tools,
 		HomeDir:       c.Home,
 		ProcMgr:       procMgr,
+		Check:         checkFunc,
+		Ask:           askFunc,
 	})
 	registry.Register(tt)
 	a.subagentLoader = loader
