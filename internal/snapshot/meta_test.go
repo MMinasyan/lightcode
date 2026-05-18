@@ -71,7 +71,7 @@ func TestSessionMetaBackwardsCompatibleWithOldMetaFiles(t *testing.T) {
 }
 
 func TestSnapshotMetaJSONRoundTrip(t *testing.T) {
-	want := SnapshotMeta{OriginalPath: "/project/file.go", Existed: true}
+	want := SnapshotMeta{OriginalPath: "/project/link.go", CanonicalPath: "/real/file.go", Existed: true}
 	data, err := json.Marshal(want)
 	if err != nil {
 		t.Fatal(err)
@@ -82,5 +82,15 @@ func TestSnapshotMetaJSONRoundTrip(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("round-trip snapshot meta = %+v, want %+v", got, want)
+	}
+}
+
+func TestSnapshotMetaBackwardsCompatibleWithoutCanonicalPath(t *testing.T) {
+	var got SnapshotMeta
+	if err := json.Unmarshal([]byte(`{"original_path":"/project/file.go","existed":true}`), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.OriginalPath != "/project/file.go" || got.CanonicalPath != "" || !got.Existed {
+		t.Fatalf("old snapshot meta decode = %+v, want original path with empty canonical path", got)
 	}
 }

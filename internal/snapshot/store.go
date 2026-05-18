@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/pathutil"
 )
 
 // lightcodeVersion is written into each new session's meta.json. Bump
@@ -327,7 +329,7 @@ func (s *Store) SnapshotResolved(turn int, originalPath, canonicalPath string) e
 			return fmt.Errorf("snapshot: copy %s: %w", canonicalPath, err)
 		}
 	}
-	meta := SnapshotMeta{OriginalPath: originalPath, Existed: existed}
+	meta := SnapshotMeta{OriginalPath: originalPath, CanonicalPath: realPath, Existed: existed}
 	if err := writeJSON(metaPath, meta); err != nil {
 		return fmt.Errorf("snapshot: write meta: %w", err)
 	}
@@ -1004,19 +1006,37 @@ func revertOneTurn(turnDir string) ([]string, error) {
 }
 
 func restoreOne(entryDir string, meta SnapshotMeta) error {
+	restorePath, err := validateRestorePath(meta)
+	if err != nil {
+		return err
+	}
 	if !meta.Existed {
-		if err := os.Remove(meta.OriginalPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(restorePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		return nil
 	}
-	if parent := filepath.Dir(meta.OriginalPath); parent != "" && parent != "." {
+	if parent := filepath.Dir(restorePath); parent != "" && parent != "." {
 		if err := os.MkdirAll(parent, 0o755); err != nil {
 			return fmt.Errorf("mkdir parent %s: %w", parent, err)
 		}
 	}
 	src := filepath.Join(entryDir, "original")
-	return copyFile(src, meta.OriginalPath)
+	return copyFile(src, restorePath)
+}
+
+func validateRestorePath(meta SnapshotMeta) (string, error) {
+	if meta.CanonicalPath == "" {
+		return meta.OriginalPath, nil
+	}
+	resolved, err := pathutil.ResolveFilePath(meta.OriginalPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve restore path %s: %w", meta.OriginalPath, err)
+	}
+	if resolved.CanonicalPath != meta.CanonicalPath {
+		return "", fmt.Errorf("canonical path changed from %s to %s", meta.CanonicalPath, resolved.CanonicalPath)
+	}
+	return meta.CanonicalPath, nil
 }
 
 func readIntDirs(dir string) []int {
