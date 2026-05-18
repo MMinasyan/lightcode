@@ -102,7 +102,7 @@ func (r *Runner) dispatch(ctx context.Context, req Request) {
 	case "session/prompt":
 		r.handleSessionPrompt(ctx, req)
 	case "session/cancel":
-		r.agent.Cancel()
+		_ = r.agent.Cancel()
 	case "session/current":
 		r.respond(req.ID, r.agent.SessionCurrent())
 	case "session/list":
@@ -265,7 +265,7 @@ func (r *Runner) handleSessionList(req Request) {
 		State string `json:"state"`
 	}
 	if req.Params != nil {
-		json.Unmarshal(req.Params, &params)
+		_ = json.Unmarshal(req.Params, &params)
 	}
 	if params.State == "" {
 		params.State = "active"
@@ -505,7 +505,7 @@ func (r *Runner) sendResponse(resp Response) {
 		return
 	}
 	data = append(data, '\n')
-	r.out.Write(data)
+	_, _ = r.out.Write(data)
 }
 
 func (r *Runner) sendNotification(n Notification) {
@@ -516,5 +516,5 @@ func (r *Runner) sendNotification(n Notification) {
 		return
 	}
 	data = append(data, '\n')
-	r.out.Write(data)
+	_, _ = r.out.Write(data)
 }

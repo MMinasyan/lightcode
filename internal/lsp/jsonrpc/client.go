@@ -110,7 +110,7 @@ func (c *Client) respondToRequest(id int, method string) {
 	}
 	body, _ := json.Marshal(resp)
 	c.writeMu.Lock()
-	WriteMessage(c.stdin, body)
+	_ = WriteMessage(c.stdin, body)
 	c.writeMu.Unlock()
 }
 
@@ -211,7 +211,7 @@ func (c *Client) Close() {
 		delete(c.pending, id)
 	}
 	c.mu.Unlock()
-	c.stdin.Close()
+	_ = c.stdin.Close()
 }
 
 func (c *Client) IsClosed() bool {

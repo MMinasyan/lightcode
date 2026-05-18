@@ -123,12 +123,12 @@ func (c *CLI) Run(ctx context.Context) error {
 					if st == stateStreaming || st == statePermission {
 						_ = c.agent.Cancel()
 					} else {
-						term.Restore(rawFd, oldState)
+						_ = term.Restore(rawFd, oldState)
 						fmt.Fprint(os.Stdout, "\r\n\x1b[?25h")
 						os.Exit(130)
 					}
 				case syscall.SIGTERM:
-					term.Restore(rawFd, oldState)
+					_ = term.Restore(rawFd, oldState)
 					fmt.Fprint(os.Stdout, "\r\n\x1b[?25h")
 					os.Exit(130)
 				}
@@ -1220,7 +1220,7 @@ func (c *CLI) projectSwitch(targetPath string) {
 	}
 
 	if c.agent.Store().Active() {
-		c.agent.Store().Close()
+		_, _ = c.agent.Store().Close()
 	}
 
 	c.restoreTerminal()
@@ -1235,7 +1235,7 @@ func (c *CLI) restoreTerminal() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.oldState != nil {
-		term.Restore(c.rawFd, c.oldState)
+		_ = term.Restore(c.rawFd, c.oldState)
 		c.oldState = nil
 	}
 	c.writeRaw("\x1b[?25h")

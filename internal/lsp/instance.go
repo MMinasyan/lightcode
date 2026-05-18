@@ -114,16 +114,16 @@ func (inst *instance) start(ctx context.Context) error {
 	result, err := rpc.Call(ctx, "initialize", initParams)
 	if err != nil {
 		rpc.Close()
-		cmd.Process.Kill()
-		cmd.Wait()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return fmt.Errorf("initialize %s: %w", inst.def.Name, err)
 	}
 	_ = result
 
 	if err := rpc.Notify("initialized", struct{}{}); err != nil {
 		rpc.Close()
-		cmd.Process.Kill()
-		cmd.Wait()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return fmt.Errorf("initialized notification: %w", err)
 	}
 
@@ -197,7 +197,7 @@ func (inst *instance) watchProcess() {
 	if cmd == nil {
 		return
 	}
-	cmd.Wait()
+	_ = cmd.Wait()
 
 	inst.mu.Lock()
 	close(procDone)
@@ -390,15 +390,15 @@ func (inst *instance) shutdown() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownWait)
 	defer cancel()
-	rpc.Call(ctx, "shutdown", nil)
-	rpc.Notify("exit", nil)
+	_, _ = rpc.Call(ctx, "shutdown", nil)
+	_ = rpc.Notify("exit", nil)
 	rpc.Close()
 
 	if cmd != nil && cmd.Process != nil {
 		select {
 		case <-procDone:
 		case <-time.After(shutdownWait):
-			cmd.Process.Kill()
+			_ = cmd.Process.Kill()
 			<-procDone
 		}
 	}

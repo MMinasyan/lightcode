@@ -84,7 +84,7 @@ func (s *Server) Serve(ctx context.Context, home, projectID string) error {
 	// Write lockfile.
 	lf := LockFile{Port: port, Token: s.token, PID: os.Getpid()}
 	if err := Write(home, projectID, lf); err != nil {
-		ln.Close()
+		_ = ln.Close()
 		return fmt.Errorf("write lockfile: %w", err)
 	}
 	defer Remove(home, projectID)
@@ -99,7 +99,7 @@ func (s *Server) Serve(ctx context.Context, home, projectID string) error {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 
-	s.httpSrv = &http.Server{Handler: mux}
+	s.httpSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 
 	// Shutdown goroutine. Uses context.Background for the Shutdown timeout
 	// because the parent ctx has already been cancelled by the time we get
@@ -109,7 +109,7 @@ func (s *Server) Serve(ctx context.Context, home, projectID string) error {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		s.httpSrv.Shutdown(shutCtx)
+		_ = s.httpSrv.Shutdown(shutCtx)
 	}()
 
 	slog.Info("lightcode serve", "port", port, "pid", os.Getpid())
@@ -286,7 +286,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			w.Write(msg)
+			_, _ = w.Write(msg)
 			flusher.Flush()
 		case <-r.Context().Done():
 			return
@@ -322,7 +322,7 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
-	s.agent.Cancel()
+	_ = s.agent.Cancel()
 	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -636,11 +636,11 @@ func (h *sseHub) broadcast(eventName string, data any) {
 func jsonResp(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func jsonError(w http.ResponseWriter, msg string, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
