@@ -1220,7 +1220,11 @@ func (c *CLI) projectSwitch(targetPath string) {
 	}
 
 	if c.agent.Store().Active() {
-		_, _ = c.agent.Store().Close()
+		if _, err := c.agent.Store().Close(); err != nil {
+			c.restoreTerminal()
+			fmt.Fprintf(os.Stderr, "close current session: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	c.restoreTerminal()

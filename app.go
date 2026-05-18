@@ -362,7 +362,9 @@ func (a *App) ProjectSwitch(targetPath string) error {
 
 	// Close session via store (need direct access for this Wails-specific flow).
 	if a.svc.Store().Active() {
-		_, _ = a.svc.Store().Close()
+		if _, err := a.svc.Store().Close(); err != nil {
+			return fmt.Errorf("close current session: %w", err)
+		}
 	}
 
 	if err := a.relaunchIn(abs); err != nil {

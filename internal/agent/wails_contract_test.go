@@ -115,6 +115,24 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 	}
 }
 
+func TestProjectSwitchHandlesStoreCloseErrors(t *testing.T) {
+	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
+	if strings.Contains(app, "_, _ = a.svc.Store().Close()") {
+		t.Fatalf("ProjectSwitch must not ignore Store().Close errors")
+	}
+	if !strings.Contains(app, "close current session") {
+		t.Fatalf("ProjectSwitch must return close-session errors with context")
+	}
+
+	cli := mustReadContractFile(t, filepath.Join("..", "cli", "cli.go"))
+	if strings.Contains(cli, "_, _ = c.agent.Store().Close()") {
+		t.Fatalf("CLI projectSwitch must not ignore Store().Close errors")
+	}
+	if !strings.Contains(cli, "close current session") {
+		t.Fatalf("CLI projectSwitch must report close-session errors with context")
+	}
+}
+
 func TestWailsBindingsCoverExportedAppMethods(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
 	binding := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "wailsjs", "go", "main", "App.d.ts"))
