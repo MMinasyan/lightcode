@@ -31,6 +31,14 @@ var readOnlyFindValueFlags = map[string]bool{
 	"-mtime": true, "-mmin": true, "-newer": true,
 }
 
+var dangerousReadOnlyFlags = []string{
+	"--output",
+	"--pre",
+	"--pre-glob",
+	"--ext-diff",
+	"--textconv",
+}
+
 // ReadOnlyRunCommand wraps RunCommand and restricts commands to a
 // whitelist of non-destructive operations (ls, cat, grep, git log, etc.).
 type ReadOnlyRunCommand struct {
@@ -83,6 +91,9 @@ func isReadOnlySimpleCommand(command string) bool {
 	if err != nil || len(fields) == 0 {
 		return false
 	}
+	if hasDangerousReadOnlyFlag(fields) {
+		return false
+	}
 	switch fields[0] {
 	case "git":
 		return isReadOnlyGit(fields[1:])
@@ -91,6 +102,20 @@ func isReadOnlySimpleCommand(command string) bool {
 	default:
 		return simpleReadOnlyCommands[fields[0]]
 	}
+}
+
+func hasDangerousReadOnlyFlag(fields []string) bool {
+	for _, arg := range fields {
+		if arg == "--" {
+			return false
+		}
+		for _, flag := range dangerousReadOnlyFlags {
+			if arg == flag || strings.HasPrefix(arg, flag+"=") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isReadOnlyGit(args []string) bool {
@@ -196,12 +221,13 @@ func shellFields(s string) ([]string, error) {
 	inDouble := false
 	hadChars := false
 
-	for _, r := range s {
+	runes := []rune(s)
+	for i, r := range runes {
 		switch {
-		case r == '\'' && !inDouble:
+		case r == '\'' && !inDouble && (inSingle || !isShellEscaped(runes, i)):
 			inSingle = !inSingle
 			hadChars = true
-		case r == '"' && !inSingle:
+		case r == '"' && !inSingle && !isShellEscaped(runes, i):
 			inDouble = !inDouble
 			hadChars = true
 		case unicode.IsSpace(r) && !inSingle && !inDouble:
@@ -222,4 +248,12 @@ func shellFields(s string) ([]string, error) {
 		fields = append(fields, current.String())
 	}
 	return fields, nil
+}
+
+func isShellEscaped(runes []rune, i int) bool {
+	backslashes := 0
+	for j := i - 1; j >= 0 && runes[j] == '\\'; j-- {
+		backslashes++
+	}
+	return backslashes%2 == 1
 }

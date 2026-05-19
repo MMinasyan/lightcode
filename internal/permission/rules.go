@@ -187,13 +187,14 @@ func DecomposeCommand(cmd string) ([]string, error) {
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
 
-		// Track quote state.
-		if r == '\'' && !inDouble {
+		// Track quote state. Outside single quotes, a backslash-escaped quote
+		// is literal shell text and must not hide following operators.
+		if r == '\'' && !inDouble && (inSingle || !isEscaped(runes, i)) {
 			inSingle = !inSingle
 			current.WriteRune(r)
 			continue
 		}
-		if r == '"' && !inSingle {
+		if r == '"' && !inSingle && !isEscaped(runes, i) {
 			inDouble = !inDouble
 			current.WriteRune(r)
 			continue
@@ -258,6 +259,14 @@ func isAmpersandCommandSeparator(runes []rune, i int) bool {
 		return false
 	}
 	return true
+}
+
+func isEscaped(runes []rune, i int) bool {
+	backslashes := 0
+	for j := i - 1; j >= 0 && runes[j] == '\\'; j-- {
+		backslashes++
+	}
+	return backslashes%2 == 1
 }
 
 // ruleMatches checks whether a single parsed rule matches the given tool call.

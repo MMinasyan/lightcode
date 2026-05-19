@@ -499,6 +499,41 @@ func TestDecomposeCommandCompound(t *testing.T) {
 	}
 }
 
+func TestDecomposeCommandEscapedQuotesDoNotHideOperators(t *testing.T) {
+	cmd := `echo \" && touch /tmp/lightcode-owned \"`
+	got, err := DecomposeCommand(cmd)
+	if err != nil {
+		t.Fatalf("DecomposeCommand(%q): %v", cmd, err)
+	}
+	want := []string{`echo \"`, `touch /tmp/lightcode-owned \"`}
+	if len(got) != len(want) {
+		t.Fatalf("DecomposeCommand(%q) = %v, want %v", cmd, got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("DecomposeCommand(%q)[%d] = %q, want %q", cmd, i, got[i], want[i])
+		}
+	}
+}
+
+func TestEvaluateEscapedQuotesDoNotHideOperators(t *testing.T) {
+	cmd := `echo \" && touch /tmp/lightcode-owned \"`
+	d := Evaluate(Rules{
+		Allow: []string{"run_command(echo *)"},
+	}, "run_command", cmd, "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate escaped quote command = %d, want DecisionAsk", d)
+	}
+
+	d = Evaluate(Rules{
+		Allow: []string{"run_command(echo *)"},
+		Deny:  []string{"run_command(touch *)"},
+	}, "run_command", cmd, "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate escaped quote denied command = %d, want DecisionDeny", d)
+	}
+}
+
 func TestDecomposeCommandRejectsSubstitution(t *testing.T) {
 	_, err := DecomposeCommand("echo $(whoami)")
 	if err == nil {
