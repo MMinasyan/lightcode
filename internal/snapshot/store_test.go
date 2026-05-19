@@ -279,6 +279,62 @@ func TestRevertOldSnapshotMetaFallsBackToOriginalPath(t *testing.T) {
 	}
 }
 
+func TestRevertOldSnapshotMetaRefusesCurrentSymlinkPath(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	originalTarget := filepath.Join(projectDir, "original.txt")
+	repointedTarget := filepath.Join(projectDir, "repointed.txt")
+	linkPath := filepath.Join(projectDir, "link.txt")
+	if err := os.WriteFile(originalTarget, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(repointedTarget, []byte("other"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(originalTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	entryDir := filepath.Join(store.snapshotsDir, "1", "old-entry")
+	if err := os.MkdirAll(entryDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(originalTarget, filepath.Join(entryDir, "original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: linkPath, Existed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if turn != 1 {
+		t.Fatalf("turn = %d, want 1", turn)
+	}
+	if err := os.WriteFile(originalTarget, []byte("after"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(linkPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(repointedTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+
+	if err == nil || !strings.Contains(err.Error(), "legacy snapshot restore through symlink refused") {
+		t.Fatalf("RevertCode error = %v, want legacy symlink refusal", err)
+	}
+	if len(affected) != 0 {
+		t.Fatalf("affected = %v, want none on refused restore", affected)
+	}
+	if got, err := os.ReadFile(originalTarget); err != nil || string(got) != "after" {
+		t.Fatalf("original target = %q, %v; want after", got, err)
+	}
+	if got, err := os.ReadFile(repointedTarget); err != nil || string(got) != "other" {
+		t.Fatalf("repointed target = %q, %v; want other", got, err)
+	}
+}
+
 func TestRevertCodeRestoresLaterSnapshotsAndDeletesLaterSnapshotDirs(t *testing.T) {
 	store := newTestStore(t)
 	projectDir := t.TempDir()

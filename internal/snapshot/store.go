@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -1027,6 +1028,9 @@ func restoreOne(entryDir string, meta SnapshotMeta) error {
 
 func validateRestorePath(meta SnapshotMeta) (string, error) {
 	if meta.CanonicalPath == "" {
+		if err := validateLegacyRestorePath(meta.OriginalPath); err != nil {
+			return "", err
+		}
 		return meta.OriginalPath, nil
 	}
 	resolved, err := pathutil.ResolveFilePath(meta.OriginalPath)
@@ -1037,6 +1041,45 @@ func validateRestorePath(meta SnapshotMeta) (string, error) {
 		return "", fmt.Errorf("canonical path changed from %s to %s", meta.CanonicalPath, resolved.CanonicalPath)
 	}
 	return meta.CanonicalPath, nil
+}
+
+func validateLegacyRestorePath(path string) error {
+	if path == "" {
+		return fmt.Errorf("legacy restore path is empty")
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve legacy restore path %s: %w", path, err)
+	}
+	clean := filepath.Clean(absPath)
+	volume := filepath.VolumeName(clean)
+	rest := strings.TrimPrefix(clean, volume)
+	rest = strings.TrimPrefix(rest, string(filepath.Separator))
+	current := volume + string(filepath.Separator)
+	if volume == "" && !filepath.IsAbs(clean) {
+		current = "."
+	}
+	for _, part := range strings.Split(rest, string(filepath.Separator)) {
+		if part == "" {
+			continue
+		}
+		if current == "" || current == string(filepath.Separator) || strings.HasSuffix(current, string(filepath.Separator)) {
+			current = current + part
+		} else {
+			current = filepath.Join(current, part)
+		}
+		info, err := os.Lstat(current)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("check legacy restore path %s: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("legacy snapshot restore through symlink refused: %s", current)
+		}
+	}
+	return nil
 }
 
 func readIntDirs(dir string) []int {
