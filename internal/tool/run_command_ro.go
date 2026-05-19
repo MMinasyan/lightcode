@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+
+	"github.com/MMinasyan/lightcode/internal/permission"
 )
 
 var simpleReadOnlyCommands = map[string]bool{
 	"ls": true, "cat": true, "grep": true, "rg": true, "head": true,
 	"tail": true, "wc": true, "file": true, "stat": true, "which": true,
-	"pwd": true, "echo": true, "tree": true,
+	"pwd": true, "echo": true, "printf": true, "tree": true,
 }
 
 var readOnlyGitSubcommands = map[string]bool{
@@ -64,19 +66,14 @@ func isReadOnlyCommand(command string) bool {
 	if strings.ContainsAny(command, "\n\r>`") || strings.Contains(command, "$(") {
 		return false
 	}
-	for _, sep := range []string{"&&", "||", ";", "|"} {
-		if strings.Contains(command, sep) {
-			parts := strings.Split(command, sep)
-			for _, part := range parts {
-				if !isReadOnlyCommand(strings.TrimSpace(part)) {
-					return false
-				}
-			}
-			return true
-		}
-	}
-	if !isReadOnlySimpleCommand(command) {
+	parts, err := permission.DecomposeCommand(command)
+	if err != nil || len(parts) == 0 {
 		return false
+	}
+	for _, part := range parts {
+		if !isReadOnlySimpleCommand(part) {
+			return false
+		}
 	}
 	return true
 }
