@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/pathutil"
+	"github.com/MMinasyan/lightcode/internal/safefs"
 )
 
 // lightcodeVersion is written into each new session's meta.json. Bump
@@ -286,7 +287,11 @@ func (s *Store) CurrentTurn() int {
 // Snapshot captures the pre-turn state of absPath. First-write-wins per
 // (turn, path).
 func (s *Store) Snapshot(turn int, absPath string) error {
-	return s.SnapshotResolved(turn, absPath, absPath)
+	resolved, err := pathutil.ResolveFilePath(absPath)
+	if err != nil {
+		return err
+	}
+	return s.SnapshotResolved(turn, absPath, resolved.CanonicalPath)
 }
 
 // SnapshotResolved captures canonicalPath while preserving originalPath for
@@ -316,17 +321,25 @@ func (s *Store) SnapshotResolved(turn int, originalPath, canonicalPath string) e
 		return fmt.Errorf("snapshot: mkdir %s: %w", entryDir, err)
 	}
 	existed := true
-	info, statErr := os.Stat(canonicalPath)
-	if statErr != nil {
-		if !errors.Is(statErr, os.ErrNotExist) {
-			return fmt.Errorf("snapshot: stat %s: %w", canonicalPath, statErr)
+	file, openErr := safefs.OpenExisting(canonicalPath, os.O_RDONLY)
+	if openErr != nil {
+		if !errors.Is(openErr, os.ErrNotExist) {
+			return fmt.Errorf("snapshot: open %s: %w", canonicalPath, openErr)
 		}
-		existed = false
-	} else if info.IsDir() {
 		existed = false
 	}
 	if existed {
-		if err := copyFile(canonicalPath, filepath.Join(entryDir, "original")); err != nil {
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil {
+			return fmt.Errorf("snapshot: stat %s: %w", canonicalPath, err)
+		}
+		if info.IsDir() {
+			existed = false
+		}
+	}
+	if existed {
+		if err := copyFromFile(file, filepath.Join(entryDir, "original")); err != nil {
 			return fmt.Errorf("snapshot: copy %s: %w", canonicalPath, err)
 		}
 	}
@@ -1146,6 +1159,10 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
+	return copyFromFile(in, dst)
+}
+
+func copyFromFile(in *os.File, dst string) error {
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err

@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/safefs"
 )
 
 // AskActionFunc blocks until the user answers a staged permission prompt.
@@ -110,17 +113,21 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 			continue
 		}
 		path, _ := call.Params["path"].(string)
-		absPath, err := fileSecurityPath(call.Params, path)
-		if err != nil {
-			results[i].Error = fmt.Sprintf("%s: resolve path: %v", call.ToolName, err)
-			continue
+		groupPath := canonicalPathFromParams(call.Params)
+		if groupPath == "" {
+			absPath, err := fileSecurityPath(call.Params, path)
+			if err != nil {
+				results[i].Error = fmt.Sprintf("%s: resolve path: %v", call.ToolName, err)
+				continue
+			}
+			groupPath = absPath
 		}
-		if g, ok := groupIdx[absPath]; ok {
+		if g, ok := groupIdx[groupPath]; ok {
 			g.indexes = append(g.indexes, i)
 		} else {
-			g := &fileGroup{absPath: absPath, indexes: []int{i}}
+			g := &fileGroup{absPath: groupPath, indexes: []int{i}}
 			groups = append(groups, g)
-			groupIdx[absPath] = g
+			groupIdx[groupPath] = g
 		}
 	}
 
@@ -158,9 +165,35 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 		}
 		return
 	}
+	if !e.validateFileGroup(staged, results, absPath, indexes) {
+		return
+	}
 
-	data, readErr := os.ReadFile(absPath)
-	exists := readErr == nil
+	var data []byte
+	var initialMtime time.Time
+	exists := false
+	readFile, readErr := safefs.OpenExisting(absPath, os.O_RDONLY)
+	if readErr == nil {
+		exists = true
+		info, err := readFile.Stat()
+		if err != nil {
+			readFile.Close()
+			for _, idx := range indexes {
+				results[idx].Error = fmt.Sprintf("stat %s: %v", absPath, err)
+			}
+			return
+		}
+		if info.IsDir() {
+			readFile.Close()
+			for _, idx := range indexes {
+				results[idx].Error = fmt.Sprintf("read %s: is a directory", absPath)
+			}
+			return
+		}
+		initialMtime = info.ModTime()
+		data, readErr = io.ReadAll(readFile)
+		readFile.Close()
+	}
 	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
 		for _, idx := range indexes {
 			results[idx].Error = fmt.Sprintf("read %s: %v", absPath, readErr)
@@ -169,7 +202,7 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 	}
 
 	if exists && e.tracker != nil {
-		if err := e.tracker.WasReadCheck(absPath); err != nil {
+		if err := e.tracker.WasReadCheckMtime(absPath, initialMtime); err != nil {
 			for _, idx := range indexes {
 				results[idx].Error = err.Error()
 			}
@@ -214,6 +247,9 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 	if successes == 0 {
 		return
 	}
+	if !e.validateFileGroup(staged, results, absPath, indexes) {
+		return
+	}
 
 	if e.store != nil {
 		displayPath, _ := staged[indexes[0]].Params["path"].(string)
@@ -232,22 +268,73 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 			return
 		}
 	}
+	if !e.validateFileGroup(staged, results, absPath, indexes) {
+		return
+	}
 
-	if dir := filepath.Dir(absPath); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			e.failSuccessful(results, indexes, fmt.Sprintf("mkdir %s: %v", dir, err))
+	writeFile, existedAtWrite, err := safefs.OpenForWrite(absPath, 0o644)
+	if err != nil {
+		e.failSuccessful(results, indexes, fmt.Sprintf("write %s: %v", absPath, err))
+		return
+	}
+	defer writeFile.Close()
+	if existedAtWrite && e.tracker != nil {
+		info, err := writeFile.Stat()
+		if err != nil {
+			e.failSuccessful(results, indexes, fmt.Sprintf("stat %s: %v", absPath, err))
+			return
+		}
+		if err := e.tracker.WasReadCheckMtime(absPath, info.ModTime()); err != nil {
+			e.failSuccessful(results, indexes, err.Error())
 			return
 		}
 	}
-	// #nosec G703 -- path is permission-gated by PermWrapped (internal/tool/permwrap.go); user approves each call before execution.
-	if err := os.WriteFile(absPath, []byte(content), 0o644); err != nil {
+	if err := writeFile.Truncate(0); err != nil {
+		e.failSuccessful(results, indexes, fmt.Sprintf("truncate %s: %v", absPath, err))
+		return
+	}
+	if _, err := writeFile.Seek(0, io.SeekStart); err != nil {
+		e.failSuccessful(results, indexes, fmt.Sprintf("seek %s: %v", absPath, err))
+		return
+	}
+	if _, err := writeFile.Write([]byte(content)); err != nil {
 		e.failSuccessful(results, indexes, fmt.Sprintf("write %s: %v", absPath, err))
+		return
+	}
+	if err := writeFile.Sync(); err != nil {
+		e.failSuccessful(results, indexes, fmt.Sprintf("sync %s: %v", absPath, err))
 		return
 	}
 
 	if e.tracker != nil {
-		e.tracker.UpdateAfterWrite(absPath)
+		if info, err := writeFile.Stat(); err == nil {
+			e.tracker.UpdateAfterWriteMtime(absPath, info.ModTime())
+		}
 	}
+}
+
+func (e *StagedExecutor) validateFileGroup(staged []StagedCall, results []BatchResult, absPath string, indexes []int) bool {
+	for _, idx := range indexes {
+		call := staged[idx]
+		path, _ := call.Params["path"].(string)
+		current, err := fileSecurityPath(call.Params, path)
+		if err == nil && current == absPath {
+			continue
+		}
+		msg := fmt.Sprintf("approved canonical path changed for %s", path)
+		if err != nil {
+			msg = fmt.Sprintf("%s: %v", msg, err)
+		}
+		for _, failIdx := range indexes {
+			if results[failIdx].Success {
+				results[failIdx].Success = false
+				results[failIdx].Result = ""
+			}
+			results[failIdx].Error = msg
+		}
+		return false
+	}
+	return true
 }
 
 func (e *StagedExecutor) failSuccessful(results []BatchResult, indexes []int, msg string) {

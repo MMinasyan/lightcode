@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 
 	"github.com/MMinasyan/lightcode/internal/pathutil"
@@ -158,6 +159,13 @@ func canonicalPathFromParams(params map[string]any) string {
 
 func fileSecurityPath(params map[string]any, path string) (string, error) {
 	if canonicalPath := canonicalPathFromParams(params); canonicalPath != "" {
+		resolved, err := pathutil.ResolveFilePath(path)
+		if err != nil {
+			return "", err
+		}
+		if resolved.CanonicalPath != canonicalPath {
+			return "", fmt.Errorf("approved canonical path changed from %s to %s", canonicalPath, resolved.CanonicalPath)
+		}
 		return canonicalPath, nil
 	}
 	resolved, err := pathutil.ResolveFilePath(path)

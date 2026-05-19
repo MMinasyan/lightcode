@@ -45,6 +45,18 @@ func (t *FileTracker) Track(path string, offset, limit int) {
 		mtime = info.ModTime()
 	}
 
+	t.trackMtime(path, offset, limit, mtime, generation)
+}
+
+// TrackMtime records a read using metadata from the already-opened file.
+func (t *FileTracker) TrackMtime(path string, offset, limit int, mtime time.Time) {
+	t.mu.Lock()
+	generation := t.generation
+	t.mu.Unlock()
+	t.trackMtime(path, offset, limit, mtime, generation)
+}
+
+func (t *FileTracker) trackMtime(path string, offset, limit int, mtime time.Time, generation uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if generation != t.generation {
@@ -75,6 +87,19 @@ func (t *FileTracker) UpdateAfterWrite(path string) {
 		return
 	}
 
+	t.updateAfterWriteMtime(path, info.ModTime(), generation)
+}
+
+// UpdateAfterWriteMtime refreshes the tracked mtime using metadata from the
+// already-opened file after a successful write.
+func (t *FileTracker) UpdateAfterWriteMtime(path string, mtime time.Time) {
+	t.mu.Lock()
+	generation := t.generation
+	t.mu.Unlock()
+	t.updateAfterWriteMtime(path, mtime, generation)
+}
+
+func (t *FileTracker) updateAfterWriteMtime(path string, mtime time.Time, generation uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if generation != t.generation {
@@ -83,7 +108,7 @@ func (t *FileTracker) UpdateAfterWrite(path string) {
 	if _, ok := t.mtimes[path]; !ok {
 		return
 	}
-	t.mtimes[path] = info.ModTime()
+	t.mtimes[path] = mtime
 }
 
 // Reset clears all tracked reads. Call this when visible conversation history
@@ -103,8 +128,11 @@ func (t *FileTracker) IsDuplicate(path string, offset, limit int) (bool, ReadRec
 	if err != nil {
 		return false, ReadRecord{}
 	}
-	currentMtime := info.ModTime()
+	return t.IsDuplicateMtime(path, offset, limit, info.ModTime())
+}
 
+// IsDuplicateMtime checks duplicate status against metadata from an already-opened file.
+func (t *FileTracker) IsDuplicateMtime(path string, offset, limit int, currentMtime time.Time) (bool, ReadRecord) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for i := len(t.reads) - 1; i >= 0; i-- {
@@ -142,6 +170,20 @@ func (t *FileTracker) WasReadCheck(path string) error {
 		return &FileChangedError{Path: path}
 	}
 	if !info.ModTime().Equal(lastReadMtime) {
+		return &FileChangedError{Path: path}
+	}
+	return nil
+}
+
+// WasReadCheckMtime checks read authorization against metadata from an already-opened file.
+func (t *FileTracker) WasReadCheckMtime(path string, currentMtime time.Time) error {
+	t.mu.Lock()
+	lastReadMtime, wasRead := t.mtimes[path]
+	t.mu.Unlock()
+	if !wasRead {
+		return &ReadRequiredError{Path: path}
+	}
+	if !currentMtime.Equal(lastReadMtime) {
 		return &FileChangedError{Path: path}
 	}
 	return nil

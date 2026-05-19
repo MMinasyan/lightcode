@@ -3,10 +3,10 @@ package tool
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
+	"io"
 
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/safefs"
 )
 
 // SnapshotStore is the minimum surface WriteFileWithSnapshot and
@@ -137,34 +137,41 @@ func writeFileExecCommon(params map[string]any, tracker *FileTracker, cfg config
 		return nil, fmt.Errorf("write_file: resolve path: %w", err)
 	}
 
-	// Check whether the target exists for read-before-write enforcement.
-	fileExists := false
-	if _, err := os.ReadFile(absPath); err == nil {
-		fileExists = true
-	} else if _, err := os.Stat(absPath); err == nil {
-		// File exists but couldn't be read (permissions, etc.).
-		// Don't block on this — if the file can't be read, write will fail anyway.
+	f, existed, err := safefs.OpenForWrite(absPath, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("write_file: %w", err)
 	}
+	defer f.Close()
 
 	// Mtime enforcement for existing files (overwrite requires read).
-	if fileExists && tracker != nil {
-		if err := tracker.WasReadCheck(absPath); err != nil {
+	if existed && tracker != nil {
+		info, err := f.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("write_file: stat: %w", err)
+		}
+		if err := tracker.WasReadCheckMtime(absPath, info.ModTime()); err != nil {
 			return nil, err
 		}
 	}
 
-	if dir := filepath.Dir(absPath); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("write_file: mkdir %s: %w", dir, err)
-		}
+	if err := f.Truncate(0); err != nil {
+		return nil, fmt.Errorf("write_file: truncate: %w", err)
 	}
-	if err := os.WriteFile(absPath, []byte(content), 0o644); err != nil {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("write_file: seek: %w", err)
+	}
+	if _, err := f.Write([]byte(content)); err != nil {
 		return nil, fmt.Errorf("write_file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return nil, fmt.Errorf("write_file: sync: %w", err)
 	}
 
 	// Refresh mtime after successful write without creating read authorization.
 	if tracker != nil {
-		tracker.UpdateAfterWrite(absPath)
+		if info, err := f.Stat(); err == nil {
+			tracker.UpdateAfterWriteMtime(absPath, info.ModTime())
+		}
 	}
 
 	return &writeResult{

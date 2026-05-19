@@ -3,10 +3,12 @@ package tool
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/safefs"
 )
 
 // EditFile implements the edit_file tool with mtime enforcement,
@@ -146,13 +148,25 @@ func editFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.
 	}
 
 	// Mtime enforcement.
+	f, err := safefs.OpenExisting(absPath, os.O_RDWR)
+	if err != nil {
+		return nil, fmt.Errorf("edit_file: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("edit_file: stat: %w", err)
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("edit_file: %s is a directory", path)
+	}
 	if tracker != nil {
-		if err := tracker.WasReadCheck(absPath); err != nil {
+		if err := tracker.WasReadCheckMtime(absPath, info.ModTime()); err != nil {
 			return nil, err
 		}
 	}
 
-	data, err := os.ReadFile(absPath)
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return nil, fmt.Errorf("edit_file: %w", err)
 	}
@@ -163,14 +177,24 @@ func editFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.
 		return nil, err
 	}
 
-	// #nosec G703 -- path is permission-gated by PermWrapped (internal/tool/permwrap.go); user approves each call before execution.
-	if err := os.WriteFile(absPath, []byte(res.UpdatedContent), 0o644); err != nil {
+	if err := f.Truncate(0); err != nil {
+		return nil, fmt.Errorf("edit_file: truncate: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("edit_file: seek: %w", err)
+	}
+	if _, err := f.Write([]byte(res.UpdatedContent)); err != nil {
 		return nil, fmt.Errorf("edit_file: write: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return nil, fmt.Errorf("edit_file: sync: %w", err)
 	}
 
 	// Refresh mtime after successful write without creating read authorization.
 	if tracker != nil {
-		tracker.UpdateAfterWrite(absPath)
+		if info, err := f.Stat(); err == nil {
+			tracker.UpdateAfterWriteMtime(absPath, info.ModTime())
+		}
 	}
 
 	return &editResult{

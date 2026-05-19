@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/safefs"
 )
 
 // ReadFile implements the read_file tool with line-numbered output,
@@ -89,21 +91,31 @@ func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, er
 		return "", fmt.Errorf("read_file: resolve path: %w", err)
 	}
 
-	// Deduplication check.
-	if r.tracker != nil {
-		if dup, _ := r.tracker.IsDuplicate(absPath, offset, limit); dup {
-			return "File unchanged since last read. The content from the earlier read in this conversation is still current.", nil
-		}
-	}
-
-	data, err := os.ReadFile(absPath)
+	f, err := safefs.OpenExisting(absPath, os.O_RDONLY)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return r.fileNotFound(displayAbsPath), nil
 		}
-		if info, statErr := os.Stat(absPath); statErr == nil && info.IsDir() {
-			return "", fmt.Errorf("read_file: %s is a directory", path)
+		return "", fmt.Errorf("read_file: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("read_file: stat: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("read_file: %s is a directory", path)
+	}
+
+	// Deduplication check.
+	if r.tracker != nil {
+		if dup, _ := r.tracker.IsDuplicateMtime(absPath, offset, limit, info.ModTime()); dup {
+			return "File unchanged since last read. The content from the earlier read in this conversation is still current.", nil
 		}
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
 		return "", fmt.Errorf("read_file: %w", err)
 	}
 
@@ -114,7 +126,7 @@ func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, er
 
 	// Track the read for mtime enforcement.
 	if r.tracker != nil {
-		r.tracker.Track(absPath, offset, limit)
+		r.tracker.TrackMtime(absPath, offset, limit, info.ModTime())
 	}
 
 	result, totalLines := r.formatOutput(data, offset, limit)
