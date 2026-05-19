@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/MMinasyan/lightcode/internal/pathutil"
 )
 
 // Suggestion is a pattern choice shown in the "Allow for project" UI.
@@ -113,15 +115,46 @@ func suggestFile(toolName, absPath, projectRoot string) []Suggestion {
 // filePrefix returns the appropriate prefix (/, ~/, //) and the relative
 // path for use in rule patterns.
 func filePrefix(absPath, projectRoot string) (prefix, rel string) {
+	absPath = cleanAbs(absPath)
 	if projectRoot != "" {
-		if r, err := filepath.Rel(projectRoot, absPath); err == nil && !strings.HasPrefix(r, "..") {
-			return "/", r
+		for _, root := range suggestionRoots(projectRoot) {
+			if r, ok := relInside(root, absPath); ok {
+				return "/", r
+			}
 		}
 	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		if r, err := filepath.Rel(home, absPath); err == nil && !strings.HasPrefix(r, "..") {
+		if r, ok := relInside(cleanAbs(home), absPath); ok {
 			return "~/", r
 		}
 	}
 	return "//", absPath
+}
+
+func suggestionRoots(projectRoot string) []string {
+	raw := cleanAbs(projectRoot)
+	roots := []string{raw}
+	if canonical, _, err := pathutil.ResolveAbsPath(raw); err == nil && canonical != raw {
+		roots = append(roots, canonical)
+	}
+	return roots
+}
+
+func cleanAbs(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(abs)
+}
+
+func relInside(root, path string) (string, bool) {
+	r, err := filepath.Rel(root, path)
+	if err != nil {
+		return "", false
+	}
+	if r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return r, true
 }

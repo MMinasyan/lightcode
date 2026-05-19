@@ -124,6 +124,61 @@ func TestSuggestReadFile(t *testing.T) {
 	}
 }
 
+func TestSuggestCanonicalProjectRootForResolvedTarget(t *testing.T) {
+	tmp := t.TempDir()
+	realRoot := filepath.Join(tmp, "real-project")
+	linkRoot := filepath.Join(tmp, "link-project")
+	target := filepath.Join(realRoot, "src", "file.go")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+
+	suggestions := Suggest("read_file", target, linkRoot)
+	if len(suggestions) == 0 {
+		t.Fatal("Suggest returned no suggestions")
+	}
+	if suggestions[0].Rule != "read_file(/src/file.go)" {
+		t.Fatalf("first = %q, want read_file(/src/file.go)", suggestions[0].Rule)
+	}
+	found := false
+	for _, suggestion := range suggestions {
+		if suggestion.Rule == "read_file(/src/**)" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("suggestions = %+v, want project-relative wildcard", suggestions)
+	}
+}
+
+func TestSuggestVisibleProjectRootStillWorks(t *testing.T) {
+	tmp := t.TempDir()
+	realRoot := filepath.Join(tmp, "real-project")
+	linkRoot := filepath.Join(tmp, "link-project")
+	if err := os.MkdirAll(filepath.Join(realRoot, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+	visiblePath := filepath.Join(linkRoot, "src", "file.go")
+
+	suggestions := Suggest("write_file", visiblePath, linkRoot)
+	if len(suggestions) == 0 {
+		t.Fatal("Suggest returned no suggestions")
+	}
+	if suggestions[0].Rule != "write_file(/src/file.go)" {
+		t.Fatalf("first = %q, want write_file(/src/file.go)", suggestions[0].Rule)
+	}
+}
+
 func TestSuggestHomeRelativePath(t *testing.T) {
 	// Use a path under the actual home directory (os.UserHomeDir())
 	home, err := os.UserHomeDir()
