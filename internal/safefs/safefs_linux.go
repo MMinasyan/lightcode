@@ -18,7 +18,7 @@ func OpenExisting(path string, flag int) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer unix.Close(parent)
+	defer closeFD(parent)
 	fd, err := unix.Openat(parent, base, flag|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, &os.PathError{Op: "openat", Path: path, Err: err}
@@ -34,7 +34,7 @@ func OpenForWrite(path string, perm os.FileMode) (*os.File, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	defer unix.Close(parent)
+	defer closeFD(parent)
 
 	fd, err := unix.Openat(parent, base, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err == nil {
@@ -69,7 +69,7 @@ func RemoveLeaf(path string) error {
 		}
 		return err
 	}
-	defer unix.Close(parent)
+	defer closeFD(parent)
 	if err := unix.Unlinkat(parent, base, 0); err != nil {
 		return &os.PathError{Op: "unlinkat", Path: path, Err: err}
 	}
@@ -98,21 +98,25 @@ func openParent(path string, createDirs bool, dirPerm os.FileMode) (int, string,
 		next, err := unix.Openat(fd, part, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 		if err == unix.ENOENT && createDirs {
 			if mkErr := unix.Mkdirat(fd, part, uint32(dirPerm.Perm())); mkErr != nil && mkErr != unix.EEXIST {
-				unix.Close(fd)
+				closeFD(fd)
 				return -1, "", &os.PathError{Op: "mkdirat", Path: filepath.Join(current, part), Err: mkErr}
 			}
 			next, err = unix.Openat(fd, part, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 		}
 		if err != nil {
-			unix.Close(fd)
+			closeFD(fd)
 			return -1, "", &os.PathError{Op: "openat", Path: filepath.Join(current, part), Err: err}
 		}
-		unix.Close(fd)
+		closeFD(fd)
 		fd = next
 		current = filepath.Join(current, part)
 	}
 
 	return fd, base, nil
+}
+
+func closeFD(fd int) {
+	_ = unix.Close(fd)
 }
 
 func splitAbs(path string) []string {

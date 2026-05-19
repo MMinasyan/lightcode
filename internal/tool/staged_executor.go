@@ -177,14 +177,14 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 		exists = true
 		info, err := readFile.Stat()
 		if err != nil {
-			readFile.Close()
+			_ = readFile.Close()
 			for _, idx := range indexes {
 				results[idx].Error = fmt.Sprintf("stat %s: %v", absPath, err)
 			}
 			return
 		}
 		if info.IsDir() {
-			readFile.Close()
+			_ = readFile.Close()
 			for _, idx := range indexes {
 				results[idx].Error = fmt.Sprintf("read %s: is a directory", absPath)
 			}
@@ -192,7 +192,7 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 		}
 		initialMtime = info.ModTime()
 		data, readErr = io.ReadAll(readFile)
-		readFile.Close()
+		_ = readFile.Close()
 	}
 	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
 		for _, idx := range indexes {
