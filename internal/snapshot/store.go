@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -1020,31 +1019,27 @@ func revertOneTurn(turnDir string) ([]string, error) {
 }
 
 func restoreOne(entryDir string, meta SnapshotMeta) error {
-	restorePath, err := validateRestorePath(meta)
+	entryID := filepath.Base(entryDir)
+	restorePath, err := validateRestorePath(entryID, meta)
 	if err != nil {
 		return err
 	}
 	if !meta.Existed {
-		if err := os.Remove(restorePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := safefs.RemoveLeaf(restorePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		return nil
 	}
-	if parent := filepath.Dir(restorePath); parent != "" && parent != "." {
-		if err := os.MkdirAll(parent, 0o755); err != nil {
-			return fmt.Errorf("mkdir parent %s: %w", parent, err)
-		}
-	}
 	src := filepath.Join(entryDir, "original")
-	return copyFile(src, restorePath)
+	return restoreFile(src, restorePath)
 }
 
-func validateRestorePath(meta SnapshotMeta) (string, error) {
+func validateRestorePath(entryID string, meta SnapshotMeta) (string, error) {
+	if !meta.Existed {
+		return validateDeletePath(entryID, meta)
+	}
 	if meta.CanonicalPath == "" {
-		if err := validateLegacyRestorePath(meta.OriginalPath); err != nil {
-			return "", err
-		}
-		return meta.OriginalPath, nil
+		return validateLegacyRestorePath(entryID, meta.OriginalPath)
 	}
 	resolved, err := pathutil.ResolveFilePath(meta.OriginalPath)
 	if err != nil {
@@ -1056,43 +1051,60 @@ func validateRestorePath(meta SnapshotMeta) (string, error) {
 	return meta.CanonicalPath, nil
 }
 
-func validateLegacyRestorePath(path string) error {
+func validateDeletePath(entryID string, meta SnapshotMeta) (string, error) {
+	if meta.CanonicalPath != "" {
+		return meta.CanonicalPath, nil
+	}
+	if !isLegacyEntryID(entryID) {
+		return "", fmt.Errorf("legacy snapshot entry id %q is invalid", entryID)
+	}
+	absPath, err := filepath.Abs(meta.OriginalPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve legacy restore path %s: %w", meta.OriginalPath, err)
+	}
+	return filepath.Clean(absPath), nil
+}
+
+func validateLegacyRestorePath(entryID, path string) (string, error) {
 	if path == "" {
-		return fmt.Errorf("legacy restore path is empty")
+		return "", fmt.Errorf("legacy restore path is empty")
+	}
+	if !isLegacyEntryID(entryID) {
+		return "", fmt.Errorf("legacy snapshot entry id %q is invalid", entryID)
 	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return fmt.Errorf("resolve legacy restore path %s: %w", path, err)
+		return "", fmt.Errorf("resolve legacy restore path %s: %w", path, err)
 	}
-	clean := filepath.Clean(absPath)
-	volume := filepath.VolumeName(clean)
-	rest := strings.TrimPrefix(clean, volume)
-	rest = strings.TrimPrefix(rest, string(filepath.Separator))
-	current := volume + string(filepath.Separator)
-	if volume == "" && !filepath.IsAbs(clean) {
-		current = "."
+
+	resolved, err := pathutil.ResolveFilePath(absPath)
+	if err == nil && resolved.LeafExists {
+		if got := hashString(resolved.CanonicalPath); got != entryID {
+			return "", fmt.Errorf("legacy snapshot target hash changed from %s to %s", entryID, got)
+		}
+		return resolved.CanonicalPath, nil
 	}
-	for _, part := range strings.Split(rest, string(filepath.Separator)) {
-		if part == "" {
-			continue
-		}
-		if current == "" || current == string(filepath.Separator) || strings.HasSuffix(current, string(filepath.Separator)) {
-			current = current + part
-		} else {
-			current = filepath.Join(current, part)
-		}
-		info, err := os.Lstat(current)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
-			return fmt.Errorf("check legacy restore path %s: %w", current, err)
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("legacy snapshot restore through symlink refused: %s", current)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("resolve legacy restore path %s: %w", path, err)
+	}
+
+	cleanAbs := filepath.Clean(absPath)
+	if got := hashString(cleanAbs); got == entryID {
+		return cleanAbs, nil
+	}
+	return "", fmt.Errorf("legacy snapshot target missing and cannot be proven for %s", path)
+}
+
+func isLegacyEntryID(id string) bool {
+	if len(id) != 16 {
+		return false
+	}
+	for _, r := range id {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
 		}
 	}
-	return nil
+	return true
 }
 
 func readIntDirs(dir string) []int {
@@ -1168,6 +1180,30 @@ func copyFromFile(in *os.File, dst string) error {
 		return err
 	}
 	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
+func restoreFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, _, err := safefs.OpenForWrite(dst, 0o644)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if err := out.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := out.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 	if _, err := io.Copy(out, in); err != nil {
 		return err
 	}
