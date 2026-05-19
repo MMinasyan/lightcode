@@ -96,20 +96,14 @@ func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, er
 		}
 	}
 
-	info, err := os.Stat(absPath)
+	data, err := os.ReadFile(absPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return r.fileNotFound(displayAbsPath), nil
 		}
-		return "", fmt.Errorf("read_file: %w", err)
-	}
-
-	if info.IsDir() {
-		return "", fmt.Errorf("read_file: %s is a directory", path)
-	}
-
-	data, err := os.ReadFile(absPath)
-	if err != nil {
+		if info, statErr := os.Stat(absPath); statErr == nil && info.IsDir() {
+			return "", fmt.Errorf("read_file: %s is a directory", path)
+		}
 		return "", fmt.Errorf("read_file: %w", err)
 	}
 

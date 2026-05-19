@@ -10,6 +10,18 @@ import (
 
 const canonicalPathParam = "_lightcode_canonical_path"
 
+type canonicalPathValue struct {
+	path string
+}
+
+func (canonicalPathValue) String() string {
+	return "<internal canonical path>"
+}
+
+func (canonicalPathValue) GoString() string {
+	return "canonicalPathValue{}"
+}
+
 // CheckFunc evaluates rules for a tool call and returns a Decision.
 type CheckFunc func(toolName, arg string) permission.Decision
 
@@ -49,7 +61,7 @@ func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (strin
 	case permission.DecisionDeny:
 		return "", ErrDenied
 	default: // DecisionAsk
-		if p.ask != nil && permissionAllows(p.ask(ctx, PermissionRequest(p.inner.Name(), params, execParams))) {
+		if p.ask != nil && permissionAllows(p.ask(ctx, permissionRequest(p.inner.Name(), params, execParams))) {
 			return p.inner.Execute(ctx, execParams)
 		}
 		return "", ErrDenied
@@ -60,7 +72,7 @@ func permissionAllows(action permission.ResponseAction) bool {
 	return action == permission.ResponseAllow || action == permission.ResponseAllowAll
 }
 
-func PermissionRequest(toolName string, params, execParams map[string]any) permission.Request {
+func permissionRequest(toolName string, params, execParams map[string]any) permission.Request {
 	arg := PermissionArg(toolName, params)
 	req := permission.Request{ToolName: toolName, Arg: arg}
 	if isFileTool(toolName) {
@@ -130,15 +142,18 @@ func resolveFileToolParams(toolName string, params map[string]any) (map[string]a
 func withCanonicalPathParam(params map[string]any, canonicalPath string) map[string]any {
 	next := make(map[string]any, len(params)+1)
 	for k, v := range params {
+		if k == canonicalPathParam {
+			continue
+		}
 		next[k] = v
 	}
-	next[canonicalPathParam] = canonicalPath
+	next[canonicalPathParam] = canonicalPathValue{path: canonicalPath}
 	return next
 }
 
 func canonicalPathFromParams(params map[string]any) string {
-	canonicalPath, _ := params[canonicalPathParam].(string)
-	return canonicalPath
+	canonicalPath, _ := params[canonicalPathParam].(canonicalPathValue)
+	return canonicalPath.path
 }
 
 func fileSecurityPath(params map[string]any, path string) (string, error) {

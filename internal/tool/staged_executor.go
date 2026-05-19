@@ -81,7 +81,7 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 				results[i].Error = "denied by user"
 				continue
 			}
-			req := PermissionRequest(call.ToolName, call.Params, execParams)
+			req := permissionRequest(call.ToolName, call.Params, execParams)
 			req.CanAllowAll = len(staged) > 1
 			req.BatchIndex = i + 1
 			req.BatchTotal = len(staged)

@@ -194,7 +194,11 @@ func TestPermWrappedChecksCanonicalPathAndPromptsWithResolvedTarget(t *testing.T
 		return permission.ResponseDeny
 	})
 
-	_, err := wrapped.Execute(context.Background(), map[string]any{"path": link})
+	_, err := wrapped.Execute(context.Background(), map[string]any{
+		"path":               link,
+		canonicalPathParam:   filepath.Join(root, "spoofed.txt"),
+		"unrelated_metadata": "kept",
+	})
 
 	if !errors.Is(err, ErrDenied) {
 		t.Fatalf("Execute error = %v, want ErrDenied", err)
@@ -231,7 +235,11 @@ func TestPermWrappedInjectsCanonicalPathForInnerFileTool(t *testing.T) {
 		return permission.DecisionAllow
 	}, denyIfAsked(t))
 
-	_, err := wrapped.Execute(context.Background(), map[string]any{"path": link})
+	_, err := wrapped.Execute(context.Background(), map[string]any{
+		"path":               link,
+		canonicalPathParam:   filepath.Join(root, "spoofed.txt"),
+		"unrelated_metadata": "kept",
+	})
 
 	if err != nil {
 		t.Fatalf("Execute error = %v", err)
@@ -239,8 +247,38 @@ func TestPermWrappedInjectsCanonicalPathForInnerFileTool(t *testing.T) {
 	if inner.lastParams["path"] != link {
 		t.Fatalf("inner path = %v, want requested path %q", inner.lastParams["path"], link)
 	}
-	if inner.lastParams[canonicalPathParam] != target {
-		t.Fatalf("inner canonical path = %v, want %q", inner.lastParams[canonicalPathParam], target)
+	if got := canonicalPathFromParams(inner.lastParams); got != target {
+		t.Fatalf("inner canonical path = %q, want %q", got, target)
+	}
+	if _, ok := inner.lastParams[canonicalPathParam].(canonicalPathValue); !ok {
+		t.Fatalf("inner canonical metadata type = %T, want canonicalPathValue", inner.lastParams[canonicalPathParam])
+	}
+	if inner.lastParams["unrelated_metadata"] != "kept" {
+		t.Fatalf("inner unrelated metadata = %v, want kept", inner.lastParams["unrelated_metadata"])
+	}
+}
+
+func TestModelSuppliedCanonicalPathParamIsIgnored(t *testing.T) {
+	root := t.TempDir()
+	realPath := filepath.Join(root, "real.txt")
+	if err := os.WriteFile(realPath, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spoofedPath := filepath.Join(root, "spoofed.txt")
+	params := map[string]any{
+		"path":             realPath,
+		canonicalPathParam: spoofedPath,
+	}
+
+	if got := PermissionCheckArg("read_file", params); got != realPath {
+		t.Fatalf("PermissionCheckArg = %q, want real path %q", got, realPath)
+	}
+	got, err := fileSecurityPath(params, realPath)
+	if err != nil {
+		t.Fatalf("fileSecurityPath error = %v", err)
+	}
+	if got != realPath {
+		t.Fatalf("fileSecurityPath = %q, want real path %q", got, realPath)
 	}
 }
 

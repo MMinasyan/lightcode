@@ -141,6 +141,16 @@ func TestReadFileRejectsBinaryFiles(t *testing.T) {
 	}
 }
 
+func TestReadFileRejectsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	tool := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, nil)
+
+	_, err := tool.Execute(context.Background(), map[string]any{"path": dir})
+	if err == nil || !strings.Contains(err.Error(), "is a directory") {
+		t.Fatalf("Execute error = %v, want directory error", err)
+	}
+}
+
 func TestReadFileToleratesInvalidUTF8Text(t *testing.T) {
 	path := readFileTestFileBytes(t, "invalid.txt", []byte{'o', 'k', 0xff, '\n', 'n', 'e', 'x', 't'})
 	tool := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, nil)

@@ -50,19 +50,33 @@ func parseRule(s string) (parsedRule, error) {
 //	//foo   → /foo                (absolute)
 //	foo     → <cwd>/foo           (cwd-relative)
 func resolvePath(pattern, projectRoot, home, cwd string) string {
-	projectRoot = canonicalBase(projectRoot)
-	home = canonicalBase(home)
-	cwd = canonicalBase(cwd)
+	return newEvalContext(projectRoot, home, cwd).resolvePath(pattern)
+}
 
+type evalContext struct {
+	projectRoot string
+	home        string
+	cwd         string
+}
+
+func newEvalContext(projectRoot, home, cwd string) evalContext {
+	return evalContext{
+		projectRoot: canonicalBase(projectRoot),
+		home:        canonicalBase(home),
+		cwd:         canonicalBase(cwd),
+	}
+}
+
+func (ctx evalContext) resolvePath(pattern string) string {
 	switch {
 	case strings.HasPrefix(pattern, "//"):
 		return pattern[1:] // "//etc/passwd" → "/etc/passwd"
 	case strings.HasPrefix(pattern, "~/"):
-		return filepath.Join(home, pattern[2:])
+		return filepath.Join(ctx.home, pattern[2:])
 	case strings.HasPrefix(pattern, "/"):
-		return filepath.Join(projectRoot, pattern[1:])
+		return filepath.Join(ctx.projectRoot, pattern[1:])
 	default:
-		return filepath.Join(cwd, pattern)
+		return filepath.Join(ctx.cwd, pattern)
 	}
 }
 
@@ -270,14 +284,14 @@ func isEscaped(runes []rune, i int) bool {
 }
 
 // ruleMatches checks whether a single parsed rule matches the given tool call.
-func ruleMatches(r parsedRule, toolName, arg, projectRoot, home, cwd string) bool {
+func ruleMatches(r parsedRule, toolName, arg string, ctx evalContext) bool {
 	if r.tool != toolName {
 		return false
 	}
 	if toolName == "run_command" {
 		return matchCommand(r.pattern, arg)
 	}
-	absPattern := resolvePath(r.pattern, projectRoot, home, cwd)
+	absPattern := ctx.resolvePath(r.pattern)
 	if isFiletool(toolName) {
 		absPattern = pathutil.ResolvePathPattern(absPattern)
 		arg = pathutil.ResolvePathPattern(arg)
@@ -286,13 +300,13 @@ func ruleMatches(r parsedRule, toolName, arg, projectRoot, home, cwd string) boo
 }
 
 // evaluateRules checks all rules in one bucket (allow/deny/ask) for a match.
-func evaluateRules(rules []string, toolName, arg, projectRoot, home, cwd string) bool {
+func evaluateRules(rules []string, toolName, arg string, ctx evalContext) bool {
 	for _, s := range rules {
 		r, err := parseRule(s)
 		if err != nil {
 			continue
 		}
-		if ruleMatches(r, toolName, arg, projectRoot, home, cwd) {
+		if ruleMatches(r, toolName, arg, ctx) {
 			return true
 		}
 	}
@@ -305,27 +319,32 @@ func evaluateRules(rules []string, toolName, arg, projectRoot, home, cwd string)
 // For run_command, the command is decomposed first. Each subcommand is
 // evaluated independently: any deny → deny, any ask → ask, all allow → allow.
 func Evaluate(rules Rules, toolName, arg, projectRoot, home, cwd string) Decision {
-	if toolName == "run_command" {
-		return evaluateCommand(rules, arg, projectRoot, home, cwd)
-	}
-	return evaluateSingle(rules, toolName, arg, projectRoot, home, cwd)
+	ctx := newEvalContext(projectRoot, home, cwd)
+	return evaluate(rules, toolName, arg, ctx)
 }
 
-func evaluateSingle(rules Rules, toolName, arg, projectRoot, home, cwd string) Decision {
+func evaluate(rules Rules, toolName, arg string, ctx evalContext) Decision {
+	if toolName == "run_command" {
+		return evaluateCommand(rules, arg, ctx)
+	}
+	return evaluateSingle(rules, toolName, arg, ctx)
+}
+
+func evaluateSingle(rules Rules, toolName, arg string, ctx evalContext) Decision {
 	sensitiveArg := arg
 	if isFiletool(toolName) {
 		sensitiveArg = pathutil.ResolvePathPattern(arg)
 	}
-	if evaluateRules(rules.Deny, toolName, arg, projectRoot, home, cwd) {
+	if evaluateRules(rules.Deny, toolName, arg, ctx) {
 		return DecisionDeny
 	}
-	if evaluateRules(rules.Ask, toolName, arg, projectRoot, home, cwd) {
+	if evaluateRules(rules.Ask, toolName, arg, ctx) {
 		return DecisionAsk
 	}
 	if isFiletool(toolName) && isSensitivePath(sensitiveArg) {
 		return DecisionAsk
 	}
-	if evaluateRules(rules.Allow, toolName, arg, projectRoot, home, cwd) {
+	if evaluateRules(rules.Allow, toolName, arg, ctx) {
 		return DecisionAllow
 	}
 	return DecisionAsk
@@ -376,7 +395,7 @@ func isSensitivePath(path string) bool {
 	return false
 }
 
-func evaluateCommand(rules Rules, command, projectRoot, home, cwd string) Decision {
+func evaluateCommand(rules Rules, command string, ctx evalContext) Decision {
 	subs, err := DecomposeCommand(command)
 	if err != nil {
 		return DecisionAsk // substitution detected → always ask
@@ -387,7 +406,7 @@ func evaluateCommand(rules Rules, command, projectRoot, home, cwd string) Decisi
 
 	worst := DecisionAllow
 	for _, sub := range subs {
-		d := evaluateSingle(rules, "run_command", sub, projectRoot, home, cwd)
+		d := evaluateSingle(rules, "run_command", sub, ctx)
 		if d == DecisionDeny {
 			return DecisionDeny
 		}
@@ -402,22 +421,23 @@ func evaluateCommand(rules Rules, command, projectRoot, home, cwd string) Decisi
 // if any rule matches in local, that decision is final. If no local rule
 // matches, global is checked. If neither matches, the default is DecisionAsk.
 func Check(local, global Rules, toolName, arg, projectRoot, home, cwd string) Decision {
-	d := Evaluate(local, toolName, arg, projectRoot, home, cwd)
+	ctx := newEvalContext(projectRoot, home, cwd)
+	d := evaluate(local, toolName, arg, ctx)
 	if d != DecisionAsk {
 		return d
 	}
 	// Local had no matching rule (returned default ask). Check if any local
 	// rule explicitly matched as ask vs. simply no-match.
-	if hasExplicitMatch(local, toolName, arg, projectRoot, home, cwd) {
+	if hasExplicitMatch(local, toolName, arg, ctx) {
 		return DecisionAsk
 	}
-	return Evaluate(global, toolName, arg, projectRoot, home, cwd)
+	return evaluate(global, toolName, arg, ctx)
 }
 
 // hasExplicitMatch returns true if any rule in the set (allow, deny, or ask)
 // matches the tool call. This distinguishes "explicitly asked" from "no match".
-func hasExplicitMatch(rules Rules, toolName, arg, projectRoot, home, cwd string) bool {
-	return evaluateRules(rules.Allow, toolName, arg, projectRoot, home, cwd) ||
-		evaluateRules(rules.Deny, toolName, arg, projectRoot, home, cwd) ||
-		evaluateRules(rules.Ask, toolName, arg, projectRoot, home, cwd)
+func hasExplicitMatch(rules Rules, toolName, arg string, ctx evalContext) bool {
+	return evaluateRules(rules.Allow, toolName, arg, ctx) ||
+		evaluateRules(rules.Deny, toolName, arg, ctx) ||
+		evaluateRules(rules.Ask, toolName, arg, ctx)
 }
