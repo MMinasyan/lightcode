@@ -4,9 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"unicode"
 
-	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/shellparse"
 )
 
 var simpleReadOnlyCommands = map[string]bool{
@@ -71,24 +70,23 @@ func isReadOnlyCommand(command string) bool {
 	if command == "" {
 		return false
 	}
-	if strings.ContainsAny(command, "\n\r>`") || strings.Contains(command, "$(") {
+	segments, err := shellparse.Parse(command)
+	if err != nil || len(segments) == 0 {
 		return false
 	}
-	parts, err := permission.DecomposeCommand(command)
-	if err != nil || len(parts) == 0 {
-		return false
-	}
-	for _, part := range parts {
-		if !isReadOnlySimpleCommand(part) {
+	for _, segment := range segments {
+		if segment.UnsafeExpansion || len(segment.Redirections) > 0 {
+			return false
+		}
+		if !isReadOnlySimpleCommand(segment.Argv) {
 			return false
 		}
 	}
 	return true
 }
 
-func isReadOnlySimpleCommand(command string) bool {
-	fields, err := shellFields(command)
-	if err != nil || len(fields) == 0 {
+func isReadOnlySimpleCommand(fields []string) bool {
+	if len(fields) == 0 {
 		return false
 	}
 	if hasDangerousReadOnlyFlag(fields) {
@@ -212,48 +210,4 @@ func isReadOnlyFind(args []string) bool {
 		}
 	}
 	return true
-}
-
-func shellFields(s string) ([]string, error) {
-	var fields []string
-	var current strings.Builder
-	inSingle := false
-	inDouble := false
-	hadChars := false
-
-	runes := []rune(s)
-	for i, r := range runes {
-		switch {
-		case r == '\'' && !inDouble && (inSingle || !isShellEscaped(runes, i)):
-			inSingle = !inSingle
-			hadChars = true
-		case r == '"' && !inSingle && !isShellEscaped(runes, i):
-			inDouble = !inDouble
-			hadChars = true
-		case unicode.IsSpace(r) && !inSingle && !inDouble:
-			if hadChars {
-				fields = append(fields, current.String())
-				current.Reset()
-				hadChars = false
-			}
-		default:
-			current.WriteRune(r)
-			hadChars = true
-		}
-	}
-	if inSingle || inDouble {
-		return nil, fmt.Errorf("unterminated quote")
-	}
-	if hadChars {
-		fields = append(fields, current.String())
-	}
-	return fields, nil
-}
-
-func isShellEscaped(runes []rune, i int) bool {
-	backslashes := 0
-	for j := i - 1; j >= 0 && runes[j] == '\\'; j-- {
-		backslashes++
-	}
-	return backslashes%2 == 1
 }

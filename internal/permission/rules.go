@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/pathutil"
+	"github.com/MMinasyan/lightcode/internal/shellparse"
 )
 
 // Rules is the shape of both global permissions (in config.json) and
@@ -192,95 +193,17 @@ func matchCommandWildcard(pattern, command string) bool {
 // found outside single quotes (command substitution cannot be safely
 // pattern-matched).
 func DecomposeCommand(cmd string) ([]string, error) {
-	var parts []string
-	var current strings.Builder
-	inSingle := false
-	inDouble := false
-
-	runes := []rune(cmd)
-	for i := 0; i < len(runes); i++ {
-		r := runes[i]
-
-		// Track quote state. Outside single quotes, a backslash-escaped quote
-		// is literal shell text and must not hide following operators.
-		if r == '\'' && !inDouble && (inSingle || !isEscaped(runes, i)) {
-			inSingle = !inSingle
-			current.WriteRune(r)
-			continue
-		}
-		if r == '"' && !inSingle && !isEscaped(runes, i) {
-			inDouble = !inDouble
-			current.WriteRune(r)
-			continue
-		}
-
-		// Reject command substitution outside single quotes.
-		if !inSingle {
-			if r == '`' {
-				return nil, fmt.Errorf("backtick command substitution not allowed")
-			}
-			if r == '$' && i+1 < len(runes) && runes[i+1] == '(' {
-				return nil, fmt.Errorf("$() command substitution not allowed")
-			}
-		}
-
-		// Outside quotes, check for operators.
-		if !inSingle && !inDouble {
-			// && or ||
-			if i+1 < len(runes) && ((r == '&' && runes[i+1] == '&') || (r == '|' && runes[i+1] == '|')) {
-				s := strings.TrimSpace(current.String())
-				if s != "" {
-					parts = append(parts, s)
-				}
-				current.Reset()
-				i++ // skip second char of operator
-				continue
-			}
-			if r == '&' && isAmpersandCommandSeparator(runes, i) {
-				s := strings.TrimSpace(current.String())
-				if s != "" {
-					parts = append(parts, s)
-				}
-				current.Reset()
-				continue
-			}
-			// ;, |, LF, or CR
-			if r == ';' || r == '|' || r == '\n' || r == '\r' {
-				s := strings.TrimSpace(current.String())
-				if s != "" {
-					parts = append(parts, s)
-				}
-				current.Reset()
-				continue
-			}
-		}
-
-		current.WriteRune(r)
+	segments, err := shellparse.Parse(cmd)
+	if err != nil {
+		return nil, err
 	}
-
-	s := strings.TrimSpace(current.String())
-	if s != "" {
-		parts = append(parts, s)
+	parts := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		if segment.Text != "" {
+			parts = append(parts, segment.Text)
+		}
 	}
 	return parts, nil
-}
-
-func isAmpersandCommandSeparator(runes []rune, i int) bool {
-	if i+1 < len(runes) && runes[i+1] == '>' {
-		return false
-	}
-	if i > 0 && (runes[i-1] == '>' || runes[i-1] == '<') {
-		return false
-	}
-	return true
-}
-
-func isEscaped(runes []rune, i int) bool {
-	backslashes := 0
-	for j := i - 1; j >= 0 && runes[j] == '\\'; j-- {
-		backslashes++
-	}
-	return backslashes%2 == 1
 }
 
 // ruleMatches checks whether a single parsed rule matches the given tool call.
@@ -396,25 +319,34 @@ func isSensitivePath(path string) bool {
 }
 
 func evaluateCommand(rules Rules, command string, ctx evalContext) Decision {
-	subs, err := DecomposeCommand(command)
+	segments, err := shellparse.Parse(command)
 	if err != nil {
 		return DecisionAsk // substitution detected → always ask
 	}
-	if len(subs) == 0 {
+	if len(segments) == 0 {
 		return DecisionAsk
 	}
 
 	worst := DecisionAllow
-	for _, sub := range subs {
-		d := evaluateSingle(rules, "run_command", sub, ctx)
+	for _, segment := range segments {
+		d := evaluateSingle(rules, "run_command", segment.Text, ctx)
 		if d == DecisionDeny {
 			return DecisionDeny
 		}
-		if d == DecisionAsk {
+		if d == DecisionAsk || hasUnsafeRedirection(segment) {
 			worst = DecisionAsk
 		}
 	}
 	return worst
+}
+
+func hasUnsafeRedirection(segment shellparse.Segment) bool {
+	for _, redirect := range segment.Redirections {
+		if !redirect.SafeFDDup {
+			return true
+		}
+	}
+	return false
 }
 
 // Check evaluates local rules first, then global. Local overrides global:

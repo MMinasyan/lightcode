@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 
@@ -10,6 +11,12 @@ import (
 
 func TestReadOnlyRunCommandAllowsWhitelistedCommands(t *testing.T) {
 	tool := NewReadOnlyRunCommand(NewRunCommand(config.ToolsConfig{CommandTimeout: 2}, t.TempDir(), nil))
+	literalFile := "literal-backtick-pattern.txt"
+	if err := os.WriteFile(literalFile, []byte("`code`\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(literalFile)
+
 	tests := []struct {
 		name    string
 		command string
@@ -27,9 +34,12 @@ func TestReadOnlyRunCommandAllowsWhitelistedCommands(t *testing.T) {
 		{name: "git branch list", command: "git branch", want: ""},
 		{name: "git branch list option", command: "git branch --list", want: ""},
 		{name: "git branch list pattern", command: "git branch --list '*'", want: ""},
+		{name: "literal single quoted substitution", command: "echo '$(whoami)'", want: "$(whoami)"},
+		{name: "literal single quoted backticks", command: "grep '`code`' " + literalFile, want: "`code`"},
 		{name: "git tag list", command: "git tag", want: ""},
 		{name: "git tag list pattern", command: "git tag -l 'v*'", want: ""},
 		{name: "find name", command: "find . -name '*.go'", want: ".go"},
+		{name: "literal redirection character", command: "echo '>'", want: ">"},
 	}
 
 	for _, tt := range tests {
@@ -64,7 +74,9 @@ func TestReadOnlyRunCommandRejectsUnsafeCommands(t *testing.T) {
 		"find . -exec rm {} +",
 		"find . -execdir rm {} +",
 		"git diff --output=/tmp/lightcode-out",
+		`git diff --out\put=/tmp/lightcode-out`,
 		"git log --output /tmp/lightcode-out -1",
+		`git log --out\put /tmp/lightcode-out -1`,
 		"git show --output=/tmp/lightcode-out HEAD",
 		"git diff --ext-diff",
 		"git show --textconv HEAD:README.md",
@@ -77,8 +89,16 @@ func TestReadOnlyRunCommandRejectsUnsafeCommands(t *testing.T) {
 		"git tag -f v1",
 		"git tag --delete v1",
 		"rg --pre=touch package .",
+		`rg --pre\=touch package .`,
 		"rg --pre touch package .",
 		"rg --pre-glob=*.go package .",
+		"git diff --out*",
+		"echo *",
+		"echo ?",
+		"echo [abc]",
+		"echo {a,b}",
+		"echo $HOME",
+		"echo ~/file",
 		"lsx",
 	}
 
@@ -117,9 +137,15 @@ func TestIsReadOnlyCommandClassifiesChainsBeforePrefixAllow(t *testing.T) {
 		{command: "rg package .", want: true},
 		{command: "rg -- --pre run_command_ro_test.go", want: true},
 		{command: "rg --pre=touch package .", want: false},
+		{command: `rg --pre\=touch package .`, want: false},
 		{command: "git log --output=/tmp/lightcode-out -1", want: false},
+		{command: `git log --out\put /tmp/lightcode-out -1`, want: false},
 		{command: " echo trimmed ", want: true},
 		{command: "echo unsafe > file", want: false},
+		{command: "echo '$(whoami)'", want: true},
+		{command: "grep '`code`' README.md", want: true},
+		{command: "echo '>'", want: true},
+		{command: "echo *", want: false},
 	}
 
 	for _, tt := range tests {

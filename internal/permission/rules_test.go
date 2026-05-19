@@ -204,12 +204,46 @@ func TestEvaluateRedirectionAmpersandStaysSingleCommand(t *testing.T) {
 	for _, command := range []string{
 		"echo ok 2>&1",
 		"echo ok >&2",
-		"echo ok &>out.txt",
+		"echo ok 2>&-",
 	} {
 		d := Evaluate(rules, "run_command", command, "/project", "/home/user", "/project")
 		if d != DecisionAllow {
 			t.Fatalf("Evaluate %q = %d, want DecisionAllow", command, d)
 		}
+	}
+}
+
+func TestEvaluateUnsafeRedirectionDowngradesAllowToAsk(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(echo *)", "run_command(cat *)"},
+	}
+	for _, command := range []string{
+		"echo ok > file",
+		"echo ok >> file",
+		"echo ok 1>file",
+		"echo ok 2>err",
+		"echo ok >&file",
+		"echo ok &> file",
+		"cat < file",
+		"cat <<EOF",
+		"cat <<<EOF",
+		"cat <> file",
+	} {
+		t.Run(command, func(t *testing.T) {
+			d := Evaluate(rules, "run_command", command, "/project", "/home/user", "/project")
+			if d != DecisionAsk {
+				t.Fatalf("Evaluate %q = %d, want DecisionAsk", command, d)
+			}
+		})
+	}
+}
+
+func TestEvaluateQuotedRedirectionIsLiteral(t *testing.T) {
+	d := Evaluate(Rules{
+		Allow: []string{"run_command(echo *)", "run_command(grep *)"},
+	}, "run_command", "echo '>' && grep -E 'foo|bar' file", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate quoted redirection command = %d, want DecisionAllow", d)
 	}
 }
 
