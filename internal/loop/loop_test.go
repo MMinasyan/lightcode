@@ -114,6 +114,44 @@ func TestEmitDropsTelemetryWhenChannelFull(t *testing.T) {
 	}
 }
 
+func TestValidateStagedWriteRequiresStringContent(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		params map[string]any
+	}{
+		{
+			name: "missing",
+			params: map[string]any{
+				"path": "file.txt",
+			},
+		},
+		{
+			name: "non-string",
+			params: map[string]any{
+				"path":    "file.txt",
+				"content": 12,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateStagedCall("write_file", tc.params)
+			if err == nil || err.Error() != "write_file: content must be a string" {
+				t.Fatalf("validateStagedCall error = %v, want content type error", err)
+			}
+		})
+	}
+}
+
+func TestValidateStagedWriteAllowsEmptyContent(t *testing.T) {
+	err := validateStagedCall("write_file", map[string]any{
+		"path":    "file.txt",
+		"content": "",
+	})
+	if err != nil {
+		t.Fatalf("validateStagedCall returned error for empty content: %v", err)
+	}
+}
+
 func TestConsumeStreamDoesNotMergeToolCallsWhenProviderOmitsIndices(t *testing.T) {
 	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"A.md\"}"}}]}}]}`,

@@ -49,6 +49,13 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 		results[i].ToolName = call.ToolName
 		results[i].ToolCallID = call.ToolCallID
 
+		if call.ToolName == "write_file" {
+			if _, ok := call.Params["content"].(string); !ok {
+				results[i].Error = "write_file: content must be a string"
+				continue
+			}
+		}
+
 		execParams, err := resolveFileToolParams(call.ToolName, call.Params)
 		if err != nil {
 			results[i].Error = fmt.Sprintf("%s: resolve path: %v", call.ToolName, err)
@@ -190,7 +197,11 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 			results[idx].Result = res.Summary
 			successes++
 		case "write_file":
-			writeContent, _ := call.Params["content"].(string)
+			writeContent, ok := call.Params["content"].(string)
+			if !ok {
+				results[idx].Error = "write_file: content must be a string"
+				continue
+			}
 			content = writeContent
 			results[idx].Success = true
 			results[idx].Result = fmt.Sprintf("Wrote %s.", displayPath)

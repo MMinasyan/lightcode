@@ -100,6 +100,70 @@ func TestStagedExecutorWriteReplacesRunningBuffer(t *testing.T) {
 	assertFileContent(t, path, "fresh result")
 }
 
+func TestStagedExecutorRejectsMalformedWriteContent(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		params map[string]any
+	}{
+		{
+			name: "missing",
+			params: map[string]any{
+				"path": "",
+			},
+		},
+		{
+			name: "non-string",
+			params: map[string]any{
+				"path":    "",
+				"content": 12,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := stagedExecutorFile(t, "file.txt", "before")
+			tc.params["path"] = path
+			askCalls := 0
+			executor := NewStagedExecutor(nil, NewFileTracker(), config.ToolsConfig{}, func(string, string) permission.Decision {
+				return permission.DecisionAsk
+			}, func(context.Context, permission.Request) permission.ResponseAction {
+				askCalls++
+				return permission.ResponseAllow
+			})
+
+			results := executor.ExecutePending(context.Background(), []StagedCall{{
+				ToolName:   "write_file",
+				ToolCallID: "call-1",
+				Params:     tc.params,
+			}})
+
+			if len(results) != 1 {
+				t.Fatalf("results length = %d, want 1", len(results))
+			}
+			if results[0].Success || results[0].Error != "write_file: content must be a string" {
+				t.Fatalf("result = %+v, want content type error", results[0])
+			}
+			if askCalls != 0 {
+				t.Fatalf("ask calls = %d, want 0", askCalls)
+			}
+			assertFileContent(t, path, "before")
+		})
+	}
+}
+
+func TestStagedExecutorAllowsEmptyWriteContent(t *testing.T) {
+	path := stagedExecutorFile(t, "file.txt", "before")
+	tracker := NewFileTracker()
+	tracker.Track(path, 1, 100)
+	executor := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowStagedCall, nil)
+
+	results := executor.ExecutePending(context.Background(), []StagedCall{
+		stagedWrite(path, "call-1", ""),
+	})
+
+	assertBatchSuccess(t, results, 0, "write_file", "call-1")
+	assertFileContent(t, path, "")
+}
+
 func TestStagedExecutorAttributesEditErrorsPerCall(t *testing.T) {
 	path := stagedExecutorFile(t, "file.txt", "same same unique")
 	tracker := NewFileTracker()
