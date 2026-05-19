@@ -24,7 +24,7 @@
   async function openSuggest() {
     if (!permission) return;
     try {
-      suggestions = await PermissionSuggest(permission.tool, permission.args) || [];
+      suggestions = await PermissionSuggest(permission.tool, permission.resolvedArg || permission.args) || [];
       selected = {};
       showSuggest = true;
     } catch (e) {
@@ -85,6 +85,12 @@
       </div>
     {/if}
     <pre class="args">{permission?.args || ''}</pre>
+    {#if permission?.resolvedArg && permission.resolvedArg !== permission.args}
+      <div class="resolved">
+        <div class="resolved-label">Resolves to</div>
+        <pre class="resolved-arg">{permission.resolvedArg}</pre>
+      </div>
+    {/if}
     {#if showSuggest}
       <div class="suggest-panel">
         <div class="suggest-hdr">Allow for this project:</div>
@@ -124,6 +130,9 @@
   .batch-title { margin-bottom:4px; color:var(--text); font-family:var(--font-ui); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
   .current-file { color:var(--accent); }
   .args { margin:8px 12px; padding:8px; font-family:var(--font-mono); font-size:12px; color:var(--text); white-space:pre-wrap; word-break:break-all; max-height:160px; overflow-y:auto; }
+  .resolved { margin:0 12px 8px; }
+  .resolved-label { margin-bottom:4px; font-size:11px; color:var(--text-dim); font-family:var(--font-ui); text-transform:uppercase; letter-spacing:.5px; }
+  .resolved-arg { margin:0; padding:8px; font-family:var(--font-mono); font-size:12px; color:var(--warn); background:var(--bg-input); border:1px solid var(--border); white-space:pre-wrap; word-break:break-all; max-height:120px; overflow-y:auto; }
   .actions { display:flex; gap:8px; padding:8px 12px; border-top:1px solid var(--border); justify-content:flex-end; }
   .btn { padding:4px 12px; font-size:12px; cursor:pointer; border:1px solid var(--border-button); background:none; color:var(--text-dim); font-family:var(--font-ui); }
   .deny:hover { border-color:var(--warn); color:var(--warn); }

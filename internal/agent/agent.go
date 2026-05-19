@@ -160,6 +160,7 @@ func New(c Config) (*Agent, error) {
 			PermID:   req.ID,
 			PermArg:  req.Arg,
 			Metadata: map[string]any{
+				"resolved_arg":  req.ResolvedArg,
 				"can_allow_all": req.CanAllowAll,
 				"batch_index":   req.BatchIndex,
 				"batch_total":   req.BatchTotal,
@@ -181,14 +182,14 @@ func New(c Config) (*Agent, error) {
 		return permission.Check(local, c.Cfg.Permissions, toolName, arg, c.ProjectRoot, c.Home, c.ProjectRoot)
 	})
 
-	askFunc := tool.AskFunc(func(toolName, arg string) bool {
+	askFunc := tool.AskFunc(func(ctx context.Context, req permission.Request) permission.ResponseAction {
 		a.mu.Lock()
-		ctx := a.turnCtx
+		turnCtx := a.turnCtx
 		a.mu.Unlock()
-		if ctx == nil {
-			return false
+		if turnCtx == nil {
+			return permission.ResponseDeny
 		}
-		return gate.Ask(ctx, toolName, arg)
+		return gate.AskRequest(turnCtx, req)
 	})
 
 	askActionFunc := tool.AskActionFunc(func(ctx context.Context, req permission.Request) permission.ResponseAction {
@@ -494,12 +495,14 @@ func (a *Agent) dispatchLoopEvent(ev loop.Event) {
 		batchIndex, _ := ev.Metadata["batch_index"].(int)
 		batchTotal, _ := ev.Metadata["batch_total"].(int)
 		batchFiles, _ := ev.Metadata["batch_files"].([]string)
+		resolvedArg, _ := ev.Metadata["resolved_arg"].(string)
 		a.emitEvent(Event{
 			Kind: EventPermissionRequest,
 			PermReq: &PermissionRequest{
 				ID:          ev.PermID,
 				ToolName:    ev.ToolName,
 				Arg:         ev.PermArg,
+				ResolvedArg: resolvedArg,
 				CanAllowAll: canAllowAll,
 				BatchIndex:  batchIndex,
 				BatchTotal:  batchTotal,

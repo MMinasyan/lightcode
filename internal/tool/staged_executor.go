@@ -74,14 +74,12 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 				results[i].Error = "denied by user"
 				continue
 			}
-			action := e.ask(ctx, permission.Request{
-				ToolName:    call.ToolName,
-				Arg:         PermissionArg(call.ToolName, call.Params),
-				CanAllowAll: len(staged) > 1,
-				BatchIndex:  i + 1,
-				BatchTotal:  len(staged),
-				BatchFiles:  batchFiles,
-			})
+			req := PermissionRequest(call.ToolName, call.Params, execParams)
+			req.CanAllowAll = len(staged) > 1
+			req.BatchIndex = i + 1
+			req.BatchTotal = len(staged)
+			req.BatchFiles = batchFiles
+			action := e.ask(ctx, req)
 			switch action {
 			case permission.ResponseAllow:
 				allowed[i] = true

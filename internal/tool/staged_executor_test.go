@@ -182,9 +182,11 @@ func TestStagedExecutorGroupsAliasesInternallyAndDisplaysRequestedPaths(t *testi
 	tracker.Track(realPath, 1, 100)
 	store := &recordingSnapshotStore{turn: 8, before: map[string]string{}}
 	var batchFiles []string
+	var request permission.Request
 	executor := NewStagedExecutor(store, tracker, config.ToolsConfig{}, func(string, string) permission.Decision {
 		return permission.DecisionAsk
 	}, func(_ context.Context, req permission.Request) permission.ResponseAction {
+		request = req
 		batchFiles = append([]string(nil), req.BatchFiles...)
 		return permission.ResponseAllowAll
 	})
@@ -205,6 +207,12 @@ func TestStagedExecutorGroupsAliasesInternallyAndDisplaysRequestedPaths(t *testi
 	}
 	if len(batchFiles) != 2 || batchFiles[0] != alias1 || batchFiles[1] != alias2 {
 		t.Fatalf("BatchFiles = %v, want requested aliases [%s %s]", batchFiles, alias1, alias2)
+	}
+	if request.Arg != alias1 {
+		t.Fatalf("request arg = %q, want requested alias %q", request.Arg, alias1)
+	}
+	if request.ResolvedArg != realPath {
+		t.Fatalf("request resolved arg = %q, want canonical %q", request.ResolvedArg, realPath)
 	}
 	if len(store.calls) != 1 {
 		t.Fatalf("snapshot calls = %d, want 1", len(store.calls))

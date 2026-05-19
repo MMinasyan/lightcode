@@ -63,9 +63,9 @@ func TestPermWrappedDenyShortCircuitsInnerAndAsk(t *testing.T) {
 	wrapped := WrapWithPermission(inner, rulesCheck(root, permission.Rules{
 		Allow: []string{"write_file(/blocked.txt)"},
 		Deny:  []string{"write_file(/blocked.txt)"},
-	}), func(string, string) bool {
+	}), func(context.Context, permission.Request) permission.ResponseAction {
 		askCalls++
-		return true
+		return permission.ResponseAllow
 	})
 
 	result, err := wrapped.Execute(context.Background(), map[string]any{"path": path})
@@ -91,12 +91,12 @@ func TestPermWrappedAskAllowsExecution(t *testing.T) {
 	askCalls := 0
 	wrapped := WrapWithPermission(inner, rulesCheck(root, permission.Rules{
 		Ask: []string{"edit_file(/ask.txt)"},
-	}), func(toolName, arg string) bool {
+	}), func(_ context.Context, req permission.Request) permission.ResponseAction {
 		askCalls++
-		if toolName != "edit_file" || arg != path {
-			t.Fatalf("ask got (%q, %q), want (edit_file, %q)", toolName, arg, path)
+		if req.ToolName != "edit_file" || req.Arg != path {
+			t.Fatalf("ask got (%q, %q), want (edit_file, %q)", req.ToolName, req.Arg, path)
 		}
-		return true
+		return permission.ResponseAllow
 	})
 
 	result, err := wrapped.Execute(context.Background(), map[string]any{"path": path})
@@ -122,9 +122,9 @@ func TestPermWrappedAskDenySkipsInner(t *testing.T) {
 	askCalls := 0
 	wrapped := WrapWithPermission(inner, rulesCheck(root, permission.Rules{
 		Ask: []string{"edit_file(/ask.txt)"},
-	}), func(string, string) bool {
+	}), func(context.Context, permission.Request) permission.ResponseAction {
 		askCalls++
-		return false
+		return permission.ResponseDeny
 	})
 
 	result, err := wrapped.Execute(context.Background(), map[string]any{"path": path})
@@ -150,12 +150,12 @@ func TestPermWrappedNoRuleDefaultsToAsk(t *testing.T) {
 	askCalls := 0
 	wrapped := WrapWithPermission(inner, rulesCheck(root, permission.Rules{
 		Allow: []string{"read_file(/other.txt)"},
-	}), func(toolName, arg string) bool {
+	}), func(_ context.Context, req permission.Request) permission.ResponseAction {
 		askCalls++
-		if toolName != "read_file" || arg != path {
-			t.Fatalf("ask got (%q, %q), want (read_file, %q)", toolName, arg, path)
+		if req.ToolName != "read_file" || req.Arg != path {
+			t.Fatalf("ask got (%q, %q), want (read_file, %q)", req.ToolName, req.Arg, path)
 		}
-		return false
+		return permission.ResponseDeny
 	})
 
 	_, err := wrapped.Execute(context.Background(), map[string]any{"path": path})
@@ -171,7 +171,7 @@ func TestPermWrappedNoRuleDefaultsToAsk(t *testing.T) {
 	}
 }
 
-func TestPermWrappedChecksCanonicalPathButPromptsRequestedPath(t *testing.T) {
+func TestPermWrappedChecksCanonicalPathAndPromptsWithResolvedTarget(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, ".env")
 	if err := os.WriteFile(target, []byte("SECRET=1"), 0o600); err != nil {
@@ -183,15 +183,15 @@ func TestPermWrappedChecksCanonicalPathButPromptsRequestedPath(t *testing.T) {
 	}
 	inner := &recordingTool{name: "read_file", result: "should not run"}
 	var checkedArg string
-	var askedArg string
+	var request permission.Request
 	wrapped := WrapWithPermission(inner, func(toolName, arg string) permission.Decision {
 		checkedArg = arg
 		return permission.Check(permission.Rules{
 			Allow: []string{"read_file(/**)"},
 		}, permission.Rules{}, toolName, arg, root, root, root)
-	}, func(toolName, arg string) bool {
-		askedArg = arg
-		return false
+	}, func(_ context.Context, req permission.Request) permission.ResponseAction {
+		request = req
+		return permission.ResponseDeny
 	})
 
 	_, err := wrapped.Execute(context.Background(), map[string]any{"path": link})
@@ -202,8 +202,11 @@ func TestPermWrappedChecksCanonicalPathButPromptsRequestedPath(t *testing.T) {
 	if checkedArg != target {
 		t.Fatalf("check arg = %q, want canonical target %q", checkedArg, target)
 	}
-	if askedArg != link {
-		t.Fatalf("ask arg = %q, want requested path %q", askedArg, link)
+	if request.Arg != link {
+		t.Fatalf("request arg = %q, want requested path %q", request.Arg, link)
+	}
+	if request.ResolvedArg != target {
+		t.Fatalf("request resolved arg = %q, want canonical target %q", request.ResolvedArg, target)
 	}
 	if inner.calls != 0 {
 		t.Fatalf("inner calls = %d, want 0", inner.calls)
@@ -327,8 +330,8 @@ func rulesCheck(root string, rules permission.Rules) CheckFunc {
 
 func denyIfAsked(t *testing.T) AskFunc {
 	t.Helper()
-	return func(toolName, arg string) bool {
-		t.Fatalf("ask called for %s %s", toolName, arg)
-		return false
+	return func(_ context.Context, req permission.Request) permission.ResponseAction {
+		t.Fatalf("ask called for %s %s", req.ToolName, req.Arg)
+		return permission.ResponseDeny
 	}
 }

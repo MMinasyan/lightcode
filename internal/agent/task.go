@@ -281,8 +281,8 @@ func (t *taskTool) permissionAsk() tool.AskFunc {
 	if t.ask != nil {
 		return t.ask
 	}
-	return func(string, string) bool {
-		return false
+	return func(context.Context, permission.Request) permission.ResponseAction {
+		return permission.ResponseDeny
 	}
 }
 

@@ -14,8 +14,8 @@ const canonicalPathParam = "_lightcode_canonical_path"
 type CheckFunc func(toolName, arg string) permission.Decision
 
 // AskFunc blocks until the user responds to a permission prompt.
-// Returns true for allow, false for deny.
-type AskFunc func(toolName, arg string) bool
+// Returns a response action from the user.
+type AskFunc func(ctx context.Context, req permission.Request) permission.ResponseAction
 
 // PermWrapped wraps a Tool with permission enforcement. The wrapped
 // tool's Execute is only called if the check allows it or the user
@@ -41,7 +41,6 @@ func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (strin
 	if err != nil {
 		return "", err
 	}
-	arg := PermissionArg(p.inner.Name(), params)
 	checkArg := PermissionCheckArg(p.inner.Name(), execParams)
 
 	switch p.check(p.inner.Name(), checkArg) {
@@ -50,11 +49,26 @@ func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (strin
 	case permission.DecisionDeny:
 		return "", ErrDenied
 	default: // DecisionAsk
-		if p.ask(p.inner.Name(), arg) {
+		if p.ask != nil && permissionAllows(p.ask(ctx, PermissionRequest(p.inner.Name(), params, execParams))) {
 			return p.inner.Execute(ctx, execParams)
 		}
 		return "", ErrDenied
 	}
+}
+
+func permissionAllows(action permission.ResponseAction) bool {
+	return action == permission.ResponseAllow || action == permission.ResponseAllowAll
+}
+
+func PermissionRequest(toolName string, params, execParams map[string]any) permission.Request {
+	arg := PermissionArg(toolName, params)
+	req := permission.Request{ToolName: toolName, Arg: arg}
+	if isFileTool(toolName) {
+		if resolved := PermissionCheckArg(toolName, execParams); resolved != "" && resolved != arg {
+			req.ResolvedArg = resolved
+		}
+	}
+	return req
 }
 
 // PermissionArg pulls the permission-relevant argument from the tool params.

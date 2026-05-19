@@ -159,9 +159,9 @@ func TestTaskToolWrapsReadOnlyRunCommandWithParentPermission(t *testing.T) {
 			checkedTool, checkedArg = toolName, arg
 			return permission.DecisionDeny
 		},
-		ask: func(string, string) bool {
+		ask: func(context.Context, permission.Request) permission.ResponseAction {
 			asked = true
-			return true
+			return permission.ResponseAllow
 		},
 	}
 
@@ -191,9 +191,9 @@ func TestTaskToolReadOnlyRunCommandCanAskAndExecute(t *testing.T) {
 			checkedTool, checkedArg = toolName, arg
 			return permission.DecisionAsk
 		},
-		ask: func(toolName, arg string) bool {
-			askedTool, askedArg = toolName, arg
-			return true
+		ask: func(_ context.Context, req permission.Request) permission.ResponseAction {
+			askedTool, askedArg = req.ToolName, req.Arg
+			return permission.ResponseAllow
 		},
 	}
 

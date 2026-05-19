@@ -17,6 +17,7 @@ type Request struct {
 	ID          string   `json:"id"`
 	ToolName    string   `json:"tool"`
 	Arg         string   `json:"args"`
+	ResolvedArg string   `json:"resolved_arg,omitempty"`
 	CanAllowAll bool     `json:"can_allow_all,omitempty"`
 	BatchIndex  int      `json:"batch_index,omitempty"`
 	BatchTotal  int      `json:"batch_total,omitempty"`

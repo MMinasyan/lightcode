@@ -61,6 +61,7 @@ type PermissionRequest struct {
 	ID          string
 	ToolName    string
 	Arg         string
+	ResolvedArg string
 	CanAllowAll bool
 	BatchIndex  int
 	BatchTotal  int
