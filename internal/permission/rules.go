@@ -173,7 +173,7 @@ func matchCommandWildcard(pattern, command string) bool {
 	return p == len(pattern)
 }
 
-// DecomposeCommand splits a shell command on &&, ||, ;, |, LF, and CR
+// DecomposeCommand splits a shell command on &&, ||, &, ;, |, LF, and CR
 // respecting single and double quotes. Returns an error if $( or backticks are
 // found outside single quotes (command substitution cannot be safely
 // pattern-matched).
@@ -221,6 +221,14 @@ func DecomposeCommand(cmd string) ([]string, error) {
 				i++ // skip second char of operator
 				continue
 			}
+			if r == '&' && isAmpersandCommandSeparator(runes, i) {
+				s := strings.TrimSpace(current.String())
+				if s != "" {
+					parts = append(parts, s)
+				}
+				current.Reset()
+				continue
+			}
 			// ;, |, LF, or CR
 			if r == ';' || r == '|' || r == '\n' || r == '\r' {
 				s := strings.TrimSpace(current.String())
@@ -240,6 +248,16 @@ func DecomposeCommand(cmd string) ([]string, error) {
 		parts = append(parts, s)
 	}
 	return parts, nil
+}
+
+func isAmpersandCommandSeparator(runes []rune, i int) bool {
+	if i+1 < len(runes) && runes[i+1] == '>' {
+		return false
+	}
+	if i > 0 && (runes[i-1] == '>' || runes[i-1] == '<') {
+		return false
+	}
+	return true
 }
 
 // ruleMatches checks whether a single parsed rule matches the given tool call.

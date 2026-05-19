@@ -163,6 +163,56 @@ func TestEvaluateCompoundCommand(t *testing.T) {
 	}
 }
 
+func TestEvaluateBackgroundCommandRequiresEachSideAllowed(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(echo *)"},
+		Deny:  []string{"run_command(rm *)"},
+	}
+
+	d := Evaluate(rules, "run_command", "echo ok & rm -rf /tmp/lightcode-review-victim", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate background command = %d, want DecisionDeny", d)
+	}
+
+	d = Evaluate(rules, "run_command", "echo one & echo two", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate allowed background command = %d, want DecisionAllow", d)
+	}
+}
+
+func TestEvaluateQuotedAmpersandStaysSingleCommand(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(echo *)"},
+	}
+
+	d := Evaluate(rules, "run_command", "echo 'a & b'", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate single-quoted ampersand = %d, want DecisionAllow", d)
+	}
+
+	d = Evaluate(rules, "run_command", "echo \"a & b\"", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate double-quoted ampersand = %d, want DecisionAllow", d)
+	}
+}
+
+func TestEvaluateRedirectionAmpersandStaysSingleCommand(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(echo *)"},
+	}
+
+	for _, command := range []string{
+		"echo ok 2>&1",
+		"echo ok >&2",
+		"echo ok &>out.txt",
+	} {
+		d := Evaluate(rules, "run_command", command, "/project", "/home/user", "/project")
+		if d != DecisionAllow {
+			t.Fatalf("Evaluate %q = %d, want DecisionAllow", command, d)
+		}
+	}
+}
+
 func TestEvaluateMultilineCommandRequiresEachLineAllowed(t *testing.T) {
 	rules := Rules{
 		Allow: []string{"run_command(cat *)"},
