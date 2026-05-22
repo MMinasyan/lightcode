@@ -173,6 +173,10 @@ func writeFileExecCommon(params map[string]any, tracker *FileTracker, cfg config
 }
 
 func openWriteTarget(absPath string, tracker *FileTracker) (*os.File, bool, error) {
+	existed, err := ensureRegularExistingTarget(absPath)
+	if err != nil {
+		return nil, false, err
+	}
 	if tracker != nil && tracker.HasRead(absPath) {
 		f, err := safefs.OpenExisting(absPath, os.O_RDWR)
 		if err != nil {
@@ -188,23 +192,40 @@ func openWriteTarget(absPath string, tracker *FileTracker) (*os.File, bool, erro
 		return f, true, nil
 	}
 
-	f, existed, err := safefs.OpenForWrite(absPath, 0o644)
+	f, openedExisting, err := safefs.OpenForWrite(absPath, 0o644)
 	if err != nil {
 		return nil, false, err
 	}
-	if existed && tracker != nil {
-		if err := validateWriteIdentity(f, absPath, tracker); err != nil {
+	if openedExisting {
+		info, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return nil, false, fmt.Errorf("stat: %w", err)
+		}
+		if err := ensureRegularFileInfo(absPath, info); err != nil {
 			_ = f.Close()
 			return nil, false, err
 		}
+		if tracker != nil {
+			if err := validateWriteIdentity(f, absPath, tracker); err != nil {
+				_ = f.Close()
+				return nil, false, err
+			}
+		}
+	} else if existed {
+		_ = f.Close()
+		return nil, false, &FileChangedError{Path: absPath}
 	}
-	return f, existed, nil
+	return f, openedExisting, nil
 }
 
 func validateWriteIdentity(f *os.File, absPath string, tracker *FileTracker) error {
 	info, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("stat: %w", err)
+	}
+	if err := ensureRegularFileInfo(absPath, info); err != nil {
+		return err
 	}
 	identity, err := FileIdentityFromOpenFile(f, info)
 	if err != nil {
@@ -214,6 +235,17 @@ func validateWriteIdentity(f *os.File, absPath string, tracker *FileTracker) err
 }
 
 func preflightWriteSnapshotTarget(absPath string, tracker *FileTracker) error {
+	existed, err := ensureRegularExistingTarget(absPath)
+	if err != nil {
+		return fmt.Errorf("write_file: %w", err)
+	}
+	if !existed {
+		if tracker != nil && tracker.HasRead(absPath) {
+			return &FileChangedError{Path: absPath}
+		}
+		return nil
+	}
+
 	if tracker != nil && tracker.HasRead(absPath) {
 		f, err := safefs.OpenExisting(absPath, os.O_RDWR)
 		if err != nil {
@@ -228,12 +260,16 @@ func preflightWriteSnapshotTarget(absPath string, tracker *FileTracker) error {
 
 	f, err := safefs.OpenExisting(absPath, os.O_RDWR)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
 		return fmt.Errorf("write_file: %w", err)
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("write_file: stat: %w", err)
+	}
+	if err := ensureRegularFileInfo(absPath, info); err != nil {
+		return fmt.Errorf("write_file: %w", err)
+	}
 	if tracker == nil {
 		return nil
 	}

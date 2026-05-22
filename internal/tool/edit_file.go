@@ -129,6 +129,9 @@ func (e *EditFile) editFileExec(params map[string]any) (string, error) {
 }
 
 func preflightEditSnapshotTarget(absPath string, tracker *FileTracker) error {
+	if _, err := ensureRegularExistingTarget(absPath); err != nil {
+		return fmt.Errorf("edit_file: %w", err)
+	}
 	f, err := safefs.OpenExisting(absPath, os.O_RDWR)
 	if err != nil {
 		return fmt.Errorf("edit_file: %w", err)
@@ -137,6 +140,9 @@ func preflightEditSnapshotTarget(absPath string, tracker *FileTracker) error {
 	info, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("edit_file: stat: %w", err)
+	}
+	if err := ensureRegularFileInfo(absPath, info); err != nil {
+		return fmt.Errorf("edit_file: %w", err)
 	}
 	if tracker == nil {
 		return nil
@@ -170,6 +176,10 @@ func editFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.
 		return nil, fmt.Errorf("edit_file: resolve path: %w", err)
 	}
 
+	if _, err := ensureRegularExistingTarget(absPath); err != nil {
+		return nil, fmt.Errorf("edit_file: %w", err)
+	}
+
 	// Mtime enforcement.
 	f, err := safefs.OpenExisting(absPath, os.O_RDWR)
 	if err != nil {
@@ -180,8 +190,8 @@ func editFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.
 	if err != nil {
 		return nil, fmt.Errorf("edit_file: stat: %w", err)
 	}
-	if info.IsDir() {
-		return nil, fmt.Errorf("edit_file: %s is a directory", path)
+	if err := ensureRegularFileInfo(absPath, info); err != nil {
+		return nil, fmt.Errorf("edit_file: %w", err)
 	}
 
 	data, err := io.ReadAll(f)

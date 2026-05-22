@@ -146,8 +146,8 @@ func TestReadFileRejectsDirectory(t *testing.T) {
 	tool := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, nil)
 
 	_, err := tool.Execute(context.Background(), map[string]any{"path": dir})
-	if err == nil || !strings.Contains(err.Error(), "is a directory") {
-		t.Fatalf("Execute error = %v, want directory error", err)
+	if err == nil || !strings.Contains(err.Error(), "non-regular") {
+		t.Fatalf("Execute error = %v, want non-regular target error", err)
 	}
 }
 

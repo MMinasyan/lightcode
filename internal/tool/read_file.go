@@ -13,6 +13,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/safefs"
+	"golang.org/x/sys/unix"
 )
 
 // ReadFile implements the read_file tool with line-numbered output,
@@ -91,7 +92,11 @@ func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, er
 		return "", fmt.Errorf("read_file: resolve path: %w", err)
 	}
 
-	f, err := safefs.OpenExisting(absPath, os.O_RDONLY)
+	if _, err := ensureRegularExistingTarget(absPath); err != nil {
+		return "", fmt.Errorf("read_file: %w", err)
+	}
+
+	f, err := safefs.OpenExisting(absPath, os.O_RDONLY|unix.O_NONBLOCK)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return r.fileNotFound(displayAbsPath), nil
@@ -103,8 +108,8 @@ func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, er
 	if err != nil {
 		return "", fmt.Errorf("read_file: stat: %w", err)
 	}
-	if info.IsDir() {
-		return "", fmt.Errorf("read_file: %s is a directory", path)
+	if err := ensureRegularFileInfo(absPath, info); err != nil {
+		return "", fmt.Errorf("read_file: %w", err)
 	}
 
 	data, err := io.ReadAll(f)

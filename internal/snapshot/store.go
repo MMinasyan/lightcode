@@ -17,6 +17,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/safefs"
+	"golang.org/x/sys/unix"
 )
 
 // lightcodeVersion is written into each new session's meta.json. Bump
@@ -310,6 +311,13 @@ func (s *Store) SnapshotResolved(turn int, originalPath, canonicalPath string) e
 	if err != nil {
 		realPath = canonicalPath
 	}
+	if info, err := os.Lstat(canonicalPath); err == nil {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("snapshot: non-regular file target: %s (mode %s)", canonicalPath, info.Mode())
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("snapshot: stat %s: %w", canonicalPath, err)
+	}
 	pathHash := hashString(realPath)
 	entryDir := filepath.Join(snapshotsDir, strconv.Itoa(turn), pathHash)
 	metaPath := filepath.Join(entryDir, "meta.json")
@@ -320,7 +328,7 @@ func (s *Store) SnapshotResolved(turn int, originalPath, canonicalPath string) e
 		return fmt.Errorf("snapshot: mkdir %s: %w", entryDir, err)
 	}
 	existed := true
-	file, openErr := safefs.OpenExisting(canonicalPath, os.O_RDONLY)
+	file, openErr := safefs.OpenExisting(canonicalPath, os.O_RDONLY|unix.O_NONBLOCK)
 	if openErr != nil {
 		if !errors.Is(openErr, os.ErrNotExist) {
 			return fmt.Errorf("snapshot: open %s: %w", canonicalPath, openErr)
@@ -333,8 +341,8 @@ func (s *Store) SnapshotResolved(turn int, originalPath, canonicalPath string) e
 		if err != nil {
 			return fmt.Errorf("snapshot: stat %s: %w", canonicalPath, err)
 		}
-		if info.IsDir() {
-			existed = false
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("snapshot: non-regular file target: %s (mode %s)", canonicalPath, info.Mode())
 		}
 	}
 	if existed {

@@ -2,7 +2,6 @@ package tool
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +10,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/safefs"
+	"golang.org/x/sys/unix"
 )
 
 // AskActionFunc blocks until the user answers a staged permission prompt.
@@ -175,8 +175,21 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 	}
 
 	var data []byte
-	readFile, readErr := safefs.OpenExisting(absPath, os.O_RDONLY)
-	if readErr == nil {
+	existed, shapeErr := ensureRegularExistingTarget(absPath)
+	if shapeErr != nil {
+		for _, idx := range indexes {
+			results[idx].Error = fmt.Sprintf("read %s: %v", absPath, shapeErr)
+		}
+		return
+	}
+	if existed {
+		readFile, openErr := safefs.OpenExisting(absPath, os.O_RDONLY|unix.O_NONBLOCK)
+		if openErr != nil {
+			for _, idx := range indexes {
+				results[idx].Error = fmt.Sprintf("read %s: %v", absPath, openErr)
+			}
+			return
+		}
 		info, err := readFile.Stat()
 		if err != nil {
 			_ = readFile.Close()
@@ -185,13 +198,14 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 			}
 			return
 		}
-		if info.IsDir() {
+		if err := ensureRegularFileInfo(absPath, info); err != nil {
 			_ = readFile.Close()
 			for _, idx := range indexes {
-				results[idx].Error = fmt.Sprintf("read %s: is a directory", absPath)
+				results[idx].Error = fmt.Sprintf("read %s: %v", absPath, err)
 			}
 			return
 		}
+		var readErr error
 		data, readErr = io.ReadAll(readFile)
 		if readErr == nil && e.tracker != nil {
 			if err := e.tracker.WasReadCheckIdentity(absPath, FileIdentityFromFileInfoAndData(info, data)); err != nil {
@@ -203,14 +217,14 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 			}
 		}
 		_ = readFile.Close()
-	}
-	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-		for _, idx := range indexes {
-			results[idx].Error = fmt.Sprintf("read %s: %v", absPath, readErr)
+		if readErr != nil {
+			for _, idx := range indexes {
+				results[idx].Error = fmt.Sprintf("read %s: %v", absPath, readErr)
+			}
+			return
 		}
-		return
 	}
-	if readErr != nil && errors.Is(readErr, os.ErrNotExist) && e.tracker != nil && e.tracker.HasRead(absPath) {
+	if !existed && e.tracker != nil && e.tracker.HasRead(absPath) {
 		for _, idx := range indexes {
 			results[idx].Error = (&FileChangedError{Path: absPath}).Error()
 		}
@@ -266,6 +280,10 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 			if !e.validateFileGroup(staged, results, absPath, indexes) {
 				return
 			}
+			if _, shapeErr := ensureRegularExistingTarget(absPath); shapeErr != nil {
+				e.failSuccessful(results, indexes, fmt.Sprintf("snapshot %s: %v", absPath, shapeErr))
+				return
+			}
 			err = snapshotFile(e.store, turn, displayAbsPath, absPath)
 		}
 		if err != nil {
@@ -280,6 +298,10 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 		}
 	}
 	if !e.validateFileGroup(staged, results, absPath, indexes) {
+		return
+	}
+	if _, shapeErr := ensureRegularExistingTarget(absPath); shapeErr != nil {
+		e.failSuccessful(results, indexes, fmt.Sprintf("write %s: %v", absPath, shapeErr))
 		return
 	}
 
