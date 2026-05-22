@@ -319,25 +319,333 @@ func isSensitivePath(path string) bool {
 }
 
 func evaluateCommand(rules Rules, command string, ctx evalContext) Decision {
-	segments, err := shellparse.Parse(command)
-	if err != nil {
-		return DecisionAsk // substitution detected → always ask
-	}
-	if len(segments) == 0 {
+	analysis := analyzeCommand(command)
+	return evaluateCommandAnalysis(rules, analysis, ctx)
+}
+
+type commandAnalysis struct {
+	segments []commandSegmentAnalysis
+}
+
+type commandSegmentAnalysis struct {
+	variants    []string
+	children    []commandSegmentAnalysis
+	transparent bool
+	unsupported bool
+}
+
+func evaluateCommandAnalysis(rules Rules, analysis commandAnalysis, ctx evalContext) Decision {
+	if len(analysis.segments) == 0 {
 		return DecisionAsk
 	}
+	if commandRulesMatch(rules.Deny, analysis, ctx) {
+		return DecisionDeny
+	}
+	if commandRulesMatch(rules.Ask, analysis, ctx) {
+		return DecisionAsk
+	}
+	if commandAnalysisUnsupported(analysis) {
+		return DecisionAsk
+	}
+	if commandAnalysisAllowed(rules.Allow, analysis, ctx) {
+		return DecisionAllow
+	}
+	return DecisionAsk
+}
 
-	worst := DecisionAllow
-	for _, segment := range segments {
-		d := evaluateSingle(rules, "run_command", segment.Text, ctx)
-		if d == DecisionDeny {
-			return DecisionDeny
-		}
-		if d == DecisionAsk || hasUnsafeRedirection(segment) {
-			worst = DecisionAsk
+func analyzeCommand(command string) commandAnalysis {
+	segments, err := shellparse.Parse(command)
+	if err != nil {
+		return commandAnalysis{
+			segments: []commandSegmentAnalysis{{
+				variants:    commandVariants(command),
+				unsupported: true,
+			}},
 		}
 	}
-	return worst
+	analysis := commandAnalysis{
+		segments: make([]commandSegmentAnalysis, 0, len(segments)),
+	}
+	for _, segment := range segments {
+		analysis.segments = append(analysis.segments, analyzeCommandSegment(segment))
+	}
+	return analysis
+}
+
+func analyzeCommandSegment(segment shellparse.Segment) commandSegmentAnalysis {
+	analysis := commandSegmentAnalysis{
+		variants: commandVariants(segment.Text, segment.Normalized),
+	}
+	if segment.UnsafeExpansion || hasUnsafeRedirection(segment) {
+		analysis.unsupported = true
+	}
+	if len(segment.Argv) == 0 {
+		return analysis
+	}
+	effective := analyzeArgvCommand(segment.Argv)
+	analysis.variants = mergeCommandVariants(analysis.variants, effective.variants...)
+	analysis.children = append(analysis.children, effective.children...)
+	analysis.transparent = effective.transparent
+	if effective.unsupported {
+		analysis.unsupported = true
+	}
+	return analysis
+}
+
+func analyzeArgvCommand(argv []string) commandSegmentAnalysis {
+	var analysis commandSegmentAnalysis
+	if len(argv) == 0 {
+		return analysis
+	}
+	if stripped := stripLeadingAssignments(argv); len(stripped) != len(argv) {
+		analysis.transparent = true
+		if len(stripped) == 0 {
+			return analysis
+		}
+		analysis.variants = append(analysis.variants, normalizedArgv(stripped))
+		analysis.merge(analyzeArgvCommand(stripped))
+		return analysis
+	}
+
+	name := argv[0]
+	if isUnsupportedShellCommand(name) || hasUnsupportedShellCommandSpelling(name) {
+		analysis.unsupported = true
+		return analysis
+	}
+	switch name {
+	case "command":
+		analysis.transparent = true
+		if len(argv) < 2 {
+			return analysis
+		}
+		next := argv[1:]
+		if next[0] == "--" {
+			next = next[1:]
+		} else if strings.HasPrefix(next[0], "-") {
+			analysis.unsupported = true
+			return analysis
+		}
+		if len(next) == 0 {
+			return analysis
+		}
+		analysis.variants = append(analysis.variants, normalizedArgv(next))
+		analysis.merge(analyzeArgvCommand(next))
+	case "env":
+		analysis.transparent = true
+		next, ok := unwrapEnvArgv(argv[1:])
+		if !ok {
+			analysis.unsupported = true
+			return analysis
+		}
+		if len(next) == 0 {
+			return analysis
+		}
+		analysis.variants = append(analysis.variants, normalizedArgv(next))
+		analysis.merge(analyzeArgvCommand(next))
+	case "sh", "bash", "dash", "zsh":
+		analysis.transparent = true
+		script, ok := shellScriptArg(argv)
+		if !ok {
+			analysis.unsupported = true
+			return analysis
+		}
+		child := analyzeCommand(script)
+		analysis.children = append(analysis.children, child.segments...)
+	default:
+		if isShellReservedWord(name) {
+			analysis.unsupported = true
+		}
+	}
+	return analysis
+}
+
+func (analysis *commandSegmentAnalysis) merge(other commandSegmentAnalysis) {
+	analysis.variants = mergeCommandVariants(analysis.variants, other.variants...)
+	analysis.children = append(analysis.children, other.children...)
+	if other.transparent {
+		analysis.transparent = true
+	}
+	if other.unsupported {
+		analysis.unsupported = true
+	}
+}
+
+func stripLeadingAssignments(argv []string) []string {
+	for len(argv) > 0 && isShellAssignment(argv[0]) {
+		argv = argv[1:]
+	}
+	return argv
+}
+
+func unwrapEnvArgv(argv []string) ([]string, bool) {
+	for len(argv) > 0 {
+		arg := argv[0]
+		if strings.HasPrefix(arg, "-") {
+			return nil, false
+		}
+		if !isShellAssignment(arg) {
+			break
+		}
+		argv = argv[1:]
+	}
+	return argv, true
+}
+
+func shellScriptArg(argv []string) (string, bool) {
+	if len(argv) < 3 || argv[1] != "-c" {
+		return "", false
+	}
+	return argv[2], true
+}
+
+func isShellAssignment(arg string) bool {
+	idx := strings.IndexByte(arg, '=')
+	if idx <= 0 {
+		return false
+	}
+	for i, r := range arg[:idx] {
+		if i == 0 {
+			if r != '_' && (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') {
+				return false
+			}
+			continue
+		}
+		if r != '_' && (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func isUnsupportedShellCommand(name string) bool {
+	switch name {
+	case "eval", "exec", "time", ".", "source", "trap", "alias", "builtin",
+		"busybox", "nohup", "nice", "timeout", "setsid", "chroot", "unshare",
+		"sudo", "doas":
+		return true
+	default:
+		return false
+	}
+}
+
+func isShellReservedWord(name string) bool {
+	switch name {
+	case "!", "{", "}", "if", "then", "else", "elif", "fi", "for", "select",
+		"while", "until", "do", "done", "case", "esac", "in", "function":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasUnsupportedShellCommandSpelling(name string) bool {
+	return strings.HasPrefix(name, "(") || name == ")" || strings.HasSuffix(name, ")")
+}
+
+func normalizedArgv(argv []string) string {
+	return strings.Join(argv, " ")
+}
+
+func commandVariants(values ...string) []string {
+	var variants []string
+	return mergeCommandVariants(variants, values...)
+}
+
+func mergeCommandVariants(existing []string, values ...string) []string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		seen := false
+		for _, current := range existing {
+			if current == value {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			existing = append(existing, value)
+		}
+	}
+	return existing
+}
+
+func commandRulesMatch(rules []string, analysis commandAnalysis, ctx evalContext) bool {
+	for _, segment := range analysis.segments {
+		if commandSegmentRulesMatch(rules, segment, ctx) {
+			return true
+		}
+	}
+	return false
+}
+
+func commandSegmentRulesMatch(rules []string, segment commandSegmentAnalysis, ctx evalContext) bool {
+	if commandVariantsMatchRules(rules, segment.variants, ctx) {
+		return true
+	}
+	for _, child := range segment.children {
+		if commandSegmentRulesMatch(rules, child, ctx) {
+			return true
+		}
+	}
+	return false
+}
+
+func commandVariantsMatchRules(rules []string, variants []string, ctx evalContext) bool {
+	for _, variant := range variants {
+		if evaluateRules(rules, "run_command", variant, ctx) {
+			return true
+		}
+	}
+	return false
+}
+
+func commandAnalysisUnsupported(analysis commandAnalysis) bool {
+	for _, segment := range analysis.segments {
+		if commandSegmentUnsupported(segment) {
+			return true
+		}
+	}
+	return false
+}
+
+func commandSegmentUnsupported(segment commandSegmentAnalysis) bool {
+	if segment.unsupported {
+		return true
+	}
+	for _, child := range segment.children {
+		if commandSegmentUnsupported(child) {
+			return true
+		}
+	}
+	return false
+}
+
+func commandAnalysisAllowed(rules []string, analysis commandAnalysis, ctx evalContext) bool {
+	for _, segment := range analysis.segments {
+		if !commandSegmentAllowed(rules, segment, ctx) {
+			return false
+		}
+	}
+	return true
+}
+
+func commandSegmentAllowed(rules []string, segment commandSegmentAnalysis, ctx evalContext) bool {
+	if segment.unsupported {
+		return false
+	}
+	if len(segment.children) > 0 {
+		for _, child := range segment.children {
+			if !commandSegmentAllowed(rules, child, ctx) {
+				return false
+			}
+		}
+		if segment.transparent {
+			return true
+		}
+	}
+	return commandVariantsMatchRules(rules, segment.variants, ctx)
 }
 
 func hasUnsafeRedirection(segment shellparse.Segment) bool {
@@ -369,6 +677,12 @@ func Check(local, global Rules, toolName, arg, projectRoot, home, cwd string) De
 // hasExplicitMatch returns true if any rule in the set (allow, deny, or ask)
 // matches the tool call. This distinguishes "explicitly asked" from "no match".
 func hasExplicitMatch(rules Rules, toolName, arg string, ctx evalContext) bool {
+	if toolName == "run_command" {
+		analysis := analyzeCommand(arg)
+		return commandRulesMatch(rules.Allow, analysis, ctx) ||
+			commandRulesMatch(rules.Deny, analysis, ctx) ||
+			commandRulesMatch(rules.Ask, analysis, ctx)
+	}
 	return evaluateRules(rules.Allow, toolName, arg, ctx) ||
 		evaluateRules(rules.Deny, toolName, arg, ctx) ||
 		evaluateRules(rules.Ask, toolName, arg, ctx)

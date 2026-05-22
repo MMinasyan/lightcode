@@ -9,6 +9,7 @@ import (
 // Segment is one shell command segment split on control operators.
 type Segment struct {
 	Text            string
+	Normalized      string
 	Argv            []string
 	Redirections    []Redirection
 	UnsafeExpansion bool
@@ -164,6 +165,7 @@ func (p *parser) emitSegment() {
 	text := strings.TrimSpace(p.raw.String())
 	if text != "" || len(p.segment.Argv) > 0 || len(p.segment.Redirections) > 0 {
 		p.segment.Text = text
+		p.segment.Normalized = strings.Join(p.segment.Argv, " ")
 		p.segments = append(p.segments, p.segment)
 	}
 	p.segment = Segment{}
