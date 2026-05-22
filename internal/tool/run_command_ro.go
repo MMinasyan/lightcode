@@ -27,7 +27,7 @@ var readOnlyFindFlags = map[string]bool{
 var readOnlyFindValueFlags = map[string]bool{
 	"-name": true, "-iname": true, "-type": true, "-maxdepth": true, "-mindepth": true,
 	"-path": true, "-ipath": true, "-regex": true, "-iregex": true, "-size": true,
-	"-mtime": true, "-mmin": true, "-newer": true,
+	"-mtime": true, "-mmin": true,
 }
 
 var dangerousReadOnlyFlags = []string{
@@ -113,6 +113,9 @@ func readOnlyArgv(fields []string) ([]string, bool) {
 	}
 	switch fields[0] {
 	case "git":
+		if hasGitConfigFlag(fields[1:]) {
+			return nil, false
+		}
 		if !isReadOnlyGit(fields[1:]) {
 			return nil, false
 		}
@@ -149,6 +152,18 @@ func hasDangerousReadOnlyFlag(fields []string) bool {
 			if arg == flag || strings.HasPrefix(arg, flag+"=") {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func hasGitConfigFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if arg == "-c" || strings.HasPrefix(arg, "-c") || arg == "--config-env" || strings.HasPrefix(arg, "--config-env=") {
+			return true
 		}
 	}
 	return false

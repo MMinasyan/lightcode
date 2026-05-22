@@ -34,6 +34,11 @@ func TestReadOnlyRunCommandAllowsWhitelistedCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.Remove(literalFile)
+	countFile := "literal-grep-count-pattern.txt"
+	if err := os.WriteFile(countFile, []byte("alpha\npackage\nomega\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(countFile)
 
 	tests := []struct {
 		name    string
@@ -44,6 +49,7 @@ func TestReadOnlyRunCommandAllowsWhitelistedCommands(t *testing.T) {
 		{name: "with args", command: "echo allowed", want: "allowed"},
 		{name: "tab args", command: "echo\tallowed", want: "allowed"},
 		{name: "pipeline", command: "echo beta | grep beta", want: "beta"},
+		{name: "grep count", command: "grep -c package " + countFile, want: "1"},
 		{name: "quoted pipe", command: "grep -E 'package|func' run_command_ro_test.go", want: "package"},
 		{name: "quoted semicolon", command: "printf 'a;b\\n'", want: "a;b"},
 		{name: "cat", command: "cat run_command_ro_test.go", want: "package tool"},
@@ -118,8 +124,11 @@ func TestReadOnlyRunCommandRejectsUnsafeCommands(t *testing.T) {
 		"cat missing.txt || rm -rf file",
 		"find . -delete",
 		"find . '-delete'",
+		"find . -newer /etc/shadow",
 		"find . -exec rm {} +",
 		"find . -execdir rm {} +",
+		"git diff -c diff.external=/tmp/lightcode-helper",
+		"git log --config-env=core.pager=HOME -1",
 		"git diff --output=/tmp/lightcode-out",
 		`git diff --out\put=/tmp/lightcode-out`,
 		"git log --output /tmp/lightcode-out -1",
@@ -198,6 +207,7 @@ func TestIsReadOnlyCommandClassifiesChainsBeforePrefixAllow(t *testing.T) {
 		{command: "git tag v1", want: false},
 		{command: "find . -maxdepth 2 -type f -name '*.go'", want: true},
 		{command: "find . '-delete'", want: false},
+		{command: "find . -newer /etc/shadow", want: false},
 		{command: "rg package .", want: true},
 		{command: "rg -- --pre run_command_ro_test.go", want: true},
 		{command: "rg -- --search-zip run_command_ro_test.go", want: true},
@@ -209,6 +219,9 @@ func TestIsReadOnlyCommandClassifiesChainsBeforePrefixAllow(t *testing.T) {
 		{command: "rg -zS package .", want: false},
 		{command: "git log --output=/tmp/lightcode-out -1", want: false},
 		{command: `git log --out\put /tmp/lightcode-out -1`, want: false},
+		{command: "git diff -c diff.external=/tmp/lightcode-helper", want: false},
+		{command: "git log --config-env=core.pager=HOME -1", want: false},
+		{command: "git diff -- -c", want: true},
 		{command: "tree -o /tmp/lightcode-ro-tree", want: false},
 		{command: " echo trimmed ", want: true},
 		{command: "echo unsafe > file", want: false},
@@ -224,6 +237,24 @@ func TestIsReadOnlyCommandClassifiesChainsBeforePrefixAllow(t *testing.T) {
 				t.Fatalf("isReadOnlyCommand(%q) = %v, want %v", tt.command, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestReadOnlyRunCommandRejectsAmbiguousGitConfigFlags(t *testing.T) {
+	for _, command := range []string{
+		"git diff -c diff.external=/tmp/lightcode-helper",
+		"git diff -cfoo.bar=/tmp/lightcode-helper",
+		"git log --config-env=core.pager=HOME -1",
+		"git show --config-env core.pager=HOME HEAD",
+	} {
+		t.Run(command, func(t *testing.T) {
+			if isReadOnlyCommand(command) {
+				t.Fatalf("isReadOnlyCommand(%q) = true, want false", command)
+			}
+		})
+	}
+	if !isReadOnlyCommand("git diff -- -c") {
+		t.Fatal("isReadOnlyCommand(\"git diff -- -c\") = false, want true for literal path after --")
 	}
 }
 
