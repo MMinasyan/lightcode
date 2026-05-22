@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -342,6 +343,86 @@ func TestPR11Closure_HardlinkRefusedOnSnapshotRestore(t *testing.T) {
 	}
 }
 
+// A modern Existed:false snapshot must refuse to delete a current hardlinked
+// regular-file leaf. This closes the created-file delete branch, which does
+// not go through restoreFile's OpenForWrite nlink check.
+func TestPR11Closure_HardlinkRefusedOnSnapshotCreatedDelete(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	createdPath := filepath.Join(projectDir, "created.txt")
+
+	turn := store.BeginTurn()
+	if err := store.Snapshot(turn, createdPath); err != nil {
+		t.Fatal(err)
+	}
+
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(outside, createdPath); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := store.RevertCode(0)
+	if err == nil {
+		t.Fatal("RevertCode succeeded deleting hardlinked created-file leaf; want refusal")
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "hardlink") && !strings.Contains(msg, "link count") && !strings.Contains(msg, "nlink") {
+		t.Fatalf("error %v does not mention hardlink/link count/nlink", err)
+	}
+	if _, err := os.Lstat(createdPath); err != nil {
+		t.Fatalf("created hardlink lstat = %v; want preserved", err)
+	}
+	if got, err := os.ReadFile(outside); err != nil || string(got) != "outside-content" {
+		t.Fatalf("outside file = %q, %v; want unchanged", got, err)
+	}
+}
+
+func TestPR11Closure_HardlinkedSymlinkRefusedOnSnapshotCreatedDelete(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	createdPath := filepath.Join(projectDir, "created-link")
+
+	turn := store.BeginTurn()
+	if err := store.Snapshot(turn, createdPath); err != nil {
+		t.Fatal(err)
+	}
+
+	target := filepath.Join(t.TempDir(), "outside-target.txt")
+	if err := os.WriteFile(target, []byte("outside-target"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	originalLink := filepath.Join(t.TempDir(), "original-link")
+	if err := os.Symlink(target, originalLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(originalLink, createdPath); err != nil {
+		t.Fatal(err)
+	}
+	assertHardlinkedSymlink(t, originalLink)
+	assertHardlinkedSymlink(t, createdPath)
+
+	_, err := store.RevertCode(0)
+	if err == nil {
+		t.Fatal("RevertCode succeeded deleting hardlinked symlink created leaf; want refusal")
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "hardlink") && !strings.Contains(msg, "link count") && !strings.Contains(msg, "nlink") {
+		t.Fatalf("error %v does not mention hardlink/link count/nlink", err)
+	}
+	if _, err := os.Lstat(originalLink); err != nil {
+		t.Fatalf("original symlink lstat = %v; want preserved", err)
+	}
+	if _, err := os.Lstat(createdPath); err != nil {
+		t.Fatalf("created hardlinked symlink lstat = %v; want preserved", err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "outside-target" {
+		t.Fatalf("target file = %q, %v; want unchanged", got, err)
+	}
+}
+
 // A modern Existed:false snapshot must be bound to the entry directory ID
 // (hashString(realPath)). A meta.json content rewrite alone that redirects
 // CanonicalPath must be refused because hashString(new path) no longer
@@ -378,4 +459,22 @@ func TestPR11Closure_ModernDeleteBoundToEntryID(t *testing.T) {
 		t.Fatalf("victim file = %q, %v; want unchanged", got, readErr)
 	}
 	_ = turn
+}
+
+func assertHardlinkedSymlink(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", path, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%s mode = %s, want symlink", path, info.Mode())
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("%s stat type = %T, want *syscall.Stat_t", path, info.Sys())
+	}
+	if st.Nlink <= 1 {
+		t.Fatalf("%s symlink nlink = %d, want > 1", path, st.Nlink)
+	}
 }

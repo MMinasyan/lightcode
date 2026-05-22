@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -117,6 +119,69 @@ func TestRemoveLeafUnlinksSymlinkItself(t *testing.T) {
 	}
 }
 
+func TestRemoveLeafRefusesHardlinkedRegularLeafAndPreservesLinks(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hardlinked := filepath.Join(root, "hardlinked.txt")
+	if err := os.Link(outside, hardlinked); err != nil {
+		t.Fatal(err)
+	}
+
+	err := RemoveLeaf(hardlinked)
+	if err == nil {
+		t.Fatal("RemoveLeaf succeeded on hardlinked regular leaf; want refusal")
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "hardlink") && !strings.Contains(msg, "link count") && !strings.Contains(msg, "nlink") {
+		t.Fatalf("error %v does not mention hardlink/link count/nlink", err)
+	}
+	if _, err := os.Lstat(hardlinked); err != nil {
+		t.Fatalf("hardlinked leaf lstat = %v; want preserved", err)
+	}
+	if got, err := os.ReadFile(outside); err != nil || string(got) != "outside-content" {
+		t.Fatalf("outside file = %q, %v; want unchanged", got, err)
+	}
+}
+
+func TestRemoveLeafRefusesHardlinkedSymlinkLeafAndPreservesLinks(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	if err := os.WriteFile(target, []byte("target-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	hardlinkedSymlink := filepath.Join(root, "hardlinked-link.txt")
+	if err := os.Link(link, hardlinkedSymlink); err != nil {
+		t.Fatal(err)
+	}
+	assertHardlinkedSymlink(t, link)
+	assertHardlinkedSymlink(t, hardlinkedSymlink)
+
+	err := RemoveLeaf(hardlinkedSymlink)
+	if err == nil {
+		t.Fatal("RemoveLeaf succeeded on hardlinked symlink leaf; want refusal")
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "hardlink") && !strings.Contains(msg, "link count") && !strings.Contains(msg, "nlink") {
+		t.Fatalf("error %v does not mention hardlink/link count/nlink", err)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("original symlink lstat = %v; want preserved", err)
+	}
+	if _, err := os.Lstat(hardlinkedSymlink); err != nil {
+		t.Fatalf("hardlinked symlink lstat = %v; want preserved", err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "target-content" {
+		t.Fatalf("target file = %q, %v; want unchanged", got, err)
+	}
+}
+
 func TestRemoveLeafRemovesEmptyDirectory(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "empty")
 	if err := os.Mkdir(dir, 0o755); err != nil {
@@ -148,5 +213,23 @@ func TestRemoveLeafRefusesNonEmptyDirectoryAndPreservesChild(t *testing.T) {
 	data, err := os.ReadFile(child)
 	if err != nil || string(data) != "content" {
 		t.Fatalf("non-empty dir child content = %q, %v; want unchanged", data, err)
+	}
+}
+
+func assertHardlinkedSymlink(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", path, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%s mode = %s, want symlink", path, info.Mode())
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("%s stat type = %T, want *syscall.Stat_t", path, info.Sys())
+	}
+	if st.Nlink <= 1 {
+		t.Fatalf("%s symlink nlink = %d, want > 1", path, st.Nlink)
 	}
 }

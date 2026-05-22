@@ -74,7 +74,9 @@ func OpenForWrite(path string, perm os.FileMode) (*os.File, bool, error) {
 }
 
 // RemoveLeaf removes only the final path entry. A symlink leaf is unlinked as
-// a symlink; it is never followed.
+// a symlink; it is never followed. Hardlinked regular and symlink leaves are
+// refused so snapshot-created-file deletes cannot mutate outside-boundary link
+// state.
 func RemoveLeaf(path string) error {
 	parent, base, err := openParent(path, false, 0)
 	if err != nil {
@@ -84,6 +86,9 @@ func RemoveLeaf(path string) error {
 		return err
 	}
 	defer closeFD(parent)
+	if err := requireRemovableLeaf(parent, base, path); err != nil {
+		return err
+	}
 	if err := unix.Unlinkat(parent, base, 0); err != nil {
 		if err == unix.EISDIR {
 			return removeDirectoryLeaf(parent, base, path)
@@ -100,6 +105,24 @@ func RemoveLeaf(path string) error {
 		return &os.PathError{Op: "unlinkat", Path: path, Err: err}
 	}
 	return nil
+}
+
+func requireRemovableLeaf(parent int, base, path string) error {
+	var st unix.Stat_t
+	if err := unix.Fstatat(parent, base, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return &os.PathError{Op: "fstatat", Path: path, Err: err}
+	}
+	switch st.Mode & unix.S_IFMT {
+	case unix.S_IFREG, unix.S_IFLNK:
+		if st.Nlink > 1 {
+			return fmt.Errorf("safefs: hardlinked target (link count > 1): %s", path)
+		}
+		return nil
+	case unix.S_IFDIR:
+		return nil
+	default:
+		return fmt.Errorf("safefs: non-regular leaf target: %s", path)
+	}
 }
 
 func removeDirectoryLeaf(parent int, base, path string) error {
