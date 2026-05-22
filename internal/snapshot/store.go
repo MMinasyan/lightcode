@@ -56,6 +56,11 @@ type Store struct {
 	projectRoot  string
 	projectHash  string
 	currentTurn  int
+	snapshotTx   map[string]*snapshotTxState
+}
+
+type snapshotTxState struct {
+	refs int
 }
 
 // NewForSessionsRoot returns a Store rooted at an explicit sessions
@@ -211,6 +216,7 @@ func (s *Store) clearLocked() {
 	s.projectRoot = ""
 	s.projectHash = ""
 	s.currentTurn = 0
+	s.snapshotTx = nil
 }
 
 // Active reports whether a session is currently open.
@@ -297,15 +303,26 @@ func (s *Store) Snapshot(turn int, absPath string) error {
 // SnapshotResolved captures canonicalPath while preserving originalPath for
 // UI/history display. First-write-wins per canonical path.
 func (s *Store) SnapshotResolved(turn int, originalPath, canonicalPath string) error {
+	entryID, _, err := s.SnapshotResolvedEntry(turn, originalPath, canonicalPath)
+	if err != nil {
+		return err
+	}
+	s.RetainSnapshotEntry(turn, entryID)
+	return nil
+}
+
+// SnapshotResolvedEntry is SnapshotResolved plus the concrete entry id and a
+// created flag. Mutation callers must either retain the entry once mutation
+// starts or discard their pre-mutation claim if validation fails first.
+func (s *Store) SnapshotResolvedEntry(turn int, originalPath, canonicalPath string) (string, bool, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.active {
-		s.mu.Unlock()
-		return ErrNoSession
+		return "", false, ErrNoSession
 	}
 	snapshotsDir := s.snapshotsDir
-	s.mu.Unlock()
 	if turn < 1 {
-		return fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
+		return "", false, fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
 	}
 	realPath, err := filepath.EvalSymlinks(canonicalPath)
 	if err != nil {
@@ -313,25 +330,34 @@ func (s *Store) SnapshotResolved(turn int, originalPath, canonicalPath string) e
 	}
 	if info, err := os.Lstat(canonicalPath); err == nil {
 		if !info.Mode().IsRegular() {
-			return fmt.Errorf("snapshot: non-regular file target: %s (mode %s)", canonicalPath, info.Mode())
+			return "", false, fmt.Errorf("snapshot: non-regular file target: %s (mode %s)", canonicalPath, info.Mode())
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("snapshot: stat %s: %w", canonicalPath, err)
+		return "", false, fmt.Errorf("snapshot: stat %s: %w", canonicalPath, err)
 	}
 	pathHash := hashString(realPath)
 	entryDir := filepath.Join(snapshotsDir, strconv.Itoa(turn), pathHash)
 	metaPath := filepath.Join(entryDir, "meta.json")
 	if _, err := os.Stat(metaPath); err == nil {
-		return nil
+		if state := s.snapshotTxStateLocked(turn, pathHash, false); state != nil {
+			state.refs++
+		}
+		return pathHash, false, nil
 	}
 	if err := os.MkdirAll(entryDir, 0o700); err != nil {
-		return fmt.Errorf("snapshot: mkdir %s: %w", entryDir, err)
+		return pathHash, false, fmt.Errorf("snapshot: mkdir %s: %w", entryDir, err)
 	}
+	created := false
+	defer func() {
+		if !created {
+			_ = os.RemoveAll(entryDir)
+		}
+	}()
 	existed := true
 	file, openErr := safefs.OpenExisting(canonicalPath, os.O_RDONLY|unix.O_NONBLOCK)
 	if openErr != nil {
 		if !errors.Is(openErr, os.ErrNotExist) {
-			return fmt.Errorf("snapshot: open %s: %w", canonicalPath, openErr)
+			return pathHash, false, fmt.Errorf("snapshot: open %s: %w", canonicalPath, openErr)
 		}
 		existed = false
 	}
@@ -339,22 +365,93 @@ func (s *Store) SnapshotResolved(turn int, originalPath, canonicalPath string) e
 		defer file.Close()
 		info, err := file.Stat()
 		if err != nil {
-			return fmt.Errorf("snapshot: stat %s: %w", canonicalPath, err)
+			return pathHash, false, fmt.Errorf("snapshot: stat %s: %w", canonicalPath, err)
 		}
 		if !info.Mode().IsRegular() {
-			return fmt.Errorf("snapshot: non-regular file target: %s (mode %s)", canonicalPath, info.Mode())
+			return pathHash, false, fmt.Errorf("snapshot: non-regular file target: %s (mode %s)", canonicalPath, info.Mode())
 		}
 	}
 	if existed {
 		if err := copyFromFile(file, filepath.Join(entryDir, "original")); err != nil {
-			return fmt.Errorf("snapshot: copy %s: %w", canonicalPath, err)
+			return pathHash, false, fmt.Errorf("snapshot: copy %s: %w", canonicalPath, err)
 		}
 	}
 	meta := SnapshotMeta{OriginalPath: originalPath, CanonicalPath: realPath, Existed: existed}
 	if err := writeJSON(metaPath, meta); err != nil {
-		return fmt.Errorf("snapshot: write meta: %w", err)
+		return pathHash, false, fmt.Errorf("snapshot: write meta: %w", err)
+	}
+	created = true
+	state := s.snapshotTxStateLocked(turn, pathHash, true)
+	state.refs++
+	return pathHash, true, nil
+}
+
+// DiscardSnapshotEntry releases a pre-mutation snapshot user. The entry is
+// removed only if no concurrent user retained it or still depends on it.
+func (s *Store) DiscardSnapshotEntry(turn int, entryID string) error {
+	if turn < 1 {
+		return fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
+	}
+	if !isLegacyEntryID(entryID) {
+		return fmt.Errorf("snapshot: invalid entry id %q", entryID)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active {
+		return ErrNoSession
+	}
+	key := snapshotTxKey(turn, entryID)
+	state := s.snapshotTx[key]
+	if state == nil {
+		return nil
+	}
+	if state.refs > 0 {
+		state.refs--
+	}
+	if state.refs > 0 {
+		return nil
+	}
+	delete(s.snapshotTx, key)
+	entryDir := filepath.Join(s.snapshotsDir, strconv.Itoa(turn), entryID)
+	if err := os.RemoveAll(entryDir); err != nil {
+		return fmt.Errorf("snapshot: discard %s: %w", entryDir, err)
 	}
 	return nil
+}
+
+// RetainSnapshotEntry keeps a snapshot entry once any user starts mutating.
+func (s *Store) RetainSnapshotEntry(turn int, entryID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active {
+		return
+	}
+	key := snapshotTxKey(turn, entryID)
+	state := s.snapshotTx[key]
+	if state == nil {
+		return
+	}
+	delete(s.snapshotTx, key)
+}
+
+func (s *Store) snapshotTxStateLocked(turn int, entryID string, create bool) *snapshotTxState {
+	key := snapshotTxKey(turn, entryID)
+	if s.snapshotTx == nil {
+		if !create {
+			return nil
+		}
+		s.snapshotTx = make(map[string]*snapshotTxState)
+	}
+	state := s.snapshotTx[key]
+	if state == nil && create {
+		state = &snapshotTxState{}
+		s.snapshotTx[key] = state
+	}
+	return state
+}
+
+func snapshotTxKey(turn int, entryID string) string {
+	return strconv.Itoa(turn) + "/" + entryID
 }
 
 // AppendMessage appends one serialized message (one JSON object + \n)

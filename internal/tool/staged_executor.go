@@ -272,6 +272,7 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 		return
 	}
 
+	var snapshot snapshotEntry
 	if e.store != nil {
 		displayPath, _ := staged[indexes[0]].Params["path"].(string)
 		displayAbsPath, err := fileDisplayAbsPath(displayPath)
@@ -284,7 +285,7 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 				e.failSuccessful(results, indexes, fmt.Sprintf("snapshot %s: %v", absPath, shapeErr))
 				return
 			}
-			err = snapshotFile(e.store, turn, displayAbsPath, absPath)
+			snapshot, err = snapshotFileForMutation(e.store, turn, displayAbsPath, absPath)
 		}
 		if err != nil {
 			for _, idx := range indexes {
@@ -298,19 +299,34 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 		}
 	}
 	if !e.validateFileGroup(staged, results, absPath, indexes) {
+		if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
+			e.failSuccessful(results, indexes, fmt.Sprintf("discard snapshot: %v", discardErr))
+		}
 		return
 	}
 	if _, shapeErr := ensureRegularExistingTarget(absPath); shapeErr != nil {
-		e.failSuccessful(results, indexes, fmt.Sprintf("write %s: %v", absPath, shapeErr))
+		msg := fmt.Sprintf("write %s: %v", absPath, shapeErr)
+		if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
+			msg = fmt.Sprintf("%s; additionally failed to discard snapshot: %v", msg, discardErr)
+		}
+		e.failSuccessful(results, indexes, msg)
 		return
 	}
 
-	writeFile, _, err := openWriteTarget(absPath, e.tracker)
+	writeFile, _, mutationStarted, err := openWriteTargetForMutation(absPath, e.tracker)
 	if err != nil {
+		if !mutationStarted {
+			if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
+				err = fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
+			}
+		} else {
+			retainMutatedSnapshot(snapshot)
+		}
 		e.failSuccessful(results, indexes, fmt.Sprintf("write %s: %v", absPath, err))
 		return
 	}
 	defer writeFile.Close()
+	retainMutatedSnapshot(snapshot)
 	if err := writeFile.Truncate(0); err != nil {
 		e.failSuccessful(results, indexes, fmt.Sprintf("truncate %s: %v", absPath, err))
 		return

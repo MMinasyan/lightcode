@@ -194,6 +194,99 @@ func TestSnapshotResolvedPreservesOriginalPathForListing(t *testing.T) {
 	}
 }
 
+func TestSnapshotResolvedEntryReportsCreatedOnlyForNewEntry(t *testing.T) {
+	store := newTestStore(t)
+	turn := store.BeginTurn()
+	path := filepath.Join(t.TempDir(), "file.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entryID, created, err := store.SnapshotResolvedEntry(turn, path, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entryID == "" || !created {
+		t.Fatalf("first SnapshotResolvedEntry = (%q, %v), want non-empty created entry", entryID, created)
+	}
+	entryID2, created, err := store.SnapshotResolvedEntry(turn, path, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entryID2 != entryID || created {
+		t.Fatalf("second SnapshotResolvedEntry = (%q, %v), want same existing entry %q", entryID2, created, entryID)
+	}
+	if err := store.DiscardSnapshotEntry(turn, entryID); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(filepath.Join(store.snapshotsDir, "1")); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 1 {
+		t.Fatalf("snapshot entries after one discard = %d, want one retained by second user", len(entries))
+	}
+	if err := store.DiscardSnapshotEntry(turn, entryID2); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(filepath.Join(store.snapshotsDir, "1")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("snapshot entries after discard = %d, want none", len(entries))
+	}
+}
+
+func TestSnapshotResolvedEntryRetainPreventsConcurrentDiscard(t *testing.T) {
+	store := newTestStore(t)
+	turn := store.BeginTurn()
+	path := filepath.Join(t.TempDir(), "file.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entryID, created, err := store.SnapshotResolvedEntry(turn, path, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("first SnapshotResolvedEntry was not created")
+	}
+	entryID2, created, err := store.SnapshotResolvedEntry(turn, path, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entryID2 != entryID || created {
+		t.Fatalf("second SnapshotResolvedEntry = (%q, %v), want same existing entry %q", entryID2, created, entryID)
+	}
+	store.RetainSnapshotEntry(turn, entryID2)
+	if err := store.DiscardSnapshotEntry(turn, entryID); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(filepath.Join(store.snapshotsDir, "1")); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 1 {
+		t.Fatalf("snapshot entries after retained discard = %d, want one", len(entries))
+	}
+}
+
+func TestSnapshotResolvedRetainsEntryAgainstLaterDiscard(t *testing.T) {
+	store := newTestStore(t)
+	turn := store.BeginTurn()
+	path := filepath.Join(t.TempDir(), "file.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SnapshotResolved(turn, path, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DiscardSnapshotEntry(turn, hashString(path)); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(filepath.Join(store.snapshotsDir, "1")); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 1 {
+		t.Fatalf("snapshot entries after discard of retained snapshot = %d, want one", len(entries))
+	}
+}
+
 func TestRevertRefusesCanonicalPathReplacedBySymlink(t *testing.T) {
 	store := newTestStore(t)
 	projectDir := t.TempDir()
