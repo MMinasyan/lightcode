@@ -129,18 +129,25 @@ func resolveFileToolParams(toolName string, params map[string]any) (map[string]a
 	if !isFileTool(toolName) {
 		return params, nil
 	}
-	path, _ := params["path"].(string)
+	cleanParams := withoutCanonicalPathParam(params)
+	path, _ := cleanParams["path"].(string)
 	if path == "" {
-		return params, nil
+		return cleanParams, nil
 	}
 	resolved, err := pathutil.ResolveFilePath(path)
 	if err != nil {
 		return nil, err
 	}
-	return withCanonicalPathParam(params, resolved.CanonicalPath), nil
+	return withCanonicalPathParam(cleanParams, resolved.CanonicalPath), nil
 }
 
 func withCanonicalPathParam(params map[string]any, canonicalPath string) map[string]any {
+	next := withoutCanonicalPathParam(params)
+	next[canonicalPathParam] = canonicalPathValue{path: canonicalPath}
+	return next
+}
+
+func withoutCanonicalPathParam(params map[string]any) map[string]any {
 	next := make(map[string]any, len(params)+1)
 	for k, v := range params {
 		if k == canonicalPathParam {
@@ -148,7 +155,6 @@ func withCanonicalPathParam(params map[string]any, canonicalPath string) map[str
 		}
 		next[k] = v
 	}
-	next[canonicalPathParam] = canonicalPathValue{path: canonicalPath}
 	return next
 }
 

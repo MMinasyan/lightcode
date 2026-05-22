@@ -164,6 +164,119 @@ func TestStagedExecutorAllowsEmptyWriteContent(t *testing.T) {
 	assertFileContent(t, path, "")
 }
 
+func TestStagedExecutorAllowAllFreezesLaterTargetsBeforePrompt(t *testing.T) {
+	root := t.TempDir()
+	target1 := stagedExecutorPath(t, root, "target1.txt", "one")
+	target2 := stagedExecutorPath(t, root, "target2.txt", "two")
+	secret := stagedExecutorPath(t, root, "secret.txt", "secret")
+	alias1 := filepath.Join(root, "alias1.txt")
+	alias2 := filepath.Join(root, "alias2.txt")
+	if err := os.Symlink(target1, alias1); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target2, alias2); err != nil {
+		t.Fatal(err)
+	}
+
+	tracker := NewFileTracker()
+	tracker.Track(target1, 1, 100)
+	tracker.Track(target2, 1, 100)
+	tracker.Track(secret, 1, 100)
+	store := &recordingSnapshotStore{turn: 9, before: map[string]string{}}
+	askCalls := 0
+	executor := NewStagedExecutor(store, tracker, config.ToolsConfig{}, func(string, string) permission.Decision {
+		return permission.DecisionAsk
+	}, func(_ context.Context, req permission.Request) permission.ResponseAction {
+		askCalls++
+		if req.BatchIndex != 1 || !req.CanAllowAll {
+			t.Fatalf("permission request = %+v, want first allow-all request", req)
+		}
+		repointStagedSymlink(t, alias2, secret)
+		return permission.ResponseAllowAll
+	})
+
+	results := executor.ExecutePending(context.Background(), []StagedCall{
+		stagedWrite(alias1, "call-1", "updated-one"),
+		stagedWrite(alias2, "call-2", "updated-two"),
+	})
+
+	if askCalls != 1 {
+		t.Fatalf("ask calls = %d, want 1", askCalls)
+	}
+	assertBatchSuccess(t, results, 0, "write_file", "call-1")
+	if len(results) != 2 || results[1].Success || !strings.Contains(results[1].Error, "approved canonical path changed") {
+		t.Fatalf("result[1] = %+v, want repointed target failure", results[1])
+	}
+	assertFileContent(t, target1, "updated-one")
+	assertFileContent(t, target2, "two")
+	assertFileContent(t, secret, "secret")
+	if len(store.calls) != 1 || store.calls[0].canonical != target1 {
+		t.Fatalf("snapshot calls = %+v, want only first frozen target %q", store.calls, target1)
+	}
+}
+
+func TestStagedExecutorRevalidatesFrozenTargetBeforeSnapshot(t *testing.T) {
+	root := t.TempDir()
+	target := stagedExecutorPath(t, root, "target.txt", "before")
+	secret := stagedExecutorPath(t, root, "secret.txt", "secret")
+	alias := filepath.Join(root, "alias.txt")
+	if err := os.Symlink(target, alias); err != nil {
+		t.Fatal(err)
+	}
+
+	tracker := NewFileTracker()
+	tracker.Track(target, 1, 100)
+	store := &stagedHookSnapshotStore{
+		turn: 10,
+		onCurrentTurn: func() {
+			repointStagedSymlink(t, alias, secret)
+		},
+	}
+	executor := NewStagedExecutor(store, tracker, config.ToolsConfig{}, allowStagedCall, nil)
+
+	results := executor.ExecutePending(context.Background(), []StagedCall{
+		stagedWrite(alias, "call-1", "after"),
+	})
+
+	assertStagedCanonicalChange(t, results, 0)
+	if len(store.calls) != 0 {
+		t.Fatalf("snapshot calls = %+v, want none after pre-snapshot target change", store.calls)
+	}
+	assertFileContent(t, target, "before")
+	assertFileContent(t, secret, "secret")
+}
+
+func TestStagedExecutorRevalidatesFrozenTargetBeforeFinalWrite(t *testing.T) {
+	root := t.TempDir()
+	target := stagedExecutorPath(t, root, "target.txt", "before")
+	secret := stagedExecutorPath(t, root, "secret.txt", "secret")
+	alias := filepath.Join(root, "alias.txt")
+	if err := os.Symlink(target, alias); err != nil {
+		t.Fatal(err)
+	}
+
+	tracker := NewFileTracker()
+	tracker.Track(target, 1, 100)
+	store := &stagedHookSnapshotStore{
+		turn: 11,
+		onSnapshot: func() {
+			repointStagedSymlink(t, alias, secret)
+		},
+	}
+	executor := NewStagedExecutor(store, tracker, config.ToolsConfig{}, allowStagedCall, nil)
+
+	results := executor.ExecutePending(context.Background(), []StagedCall{
+		stagedWrite(alias, "call-1", "after"),
+	})
+
+	assertStagedCanonicalChange(t, results, 0)
+	if len(store.calls) != 1 || store.calls[0].canonical != target {
+		t.Fatalf("snapshot calls = %+v, want one snapshot of frozen target %q", store.calls, target)
+	}
+	assertFileContent(t, target, "before")
+	assertFileContent(t, secret, "secret")
+}
+
 func TestStagedExecutorAttributesEditErrorsPerCall(t *testing.T) {
 	path := stagedExecutorFile(t, "file.txt", "same same unique")
 	tracker := NewFileTracker()
@@ -340,13 +453,48 @@ func (s *recordingSnapshotStore) CurrentTurn() int {
 	return s.turn
 }
 
+type stagedHookSnapshotStore struct {
+	turn          int
+	calls         []snapshotCall
+	onCurrentTurn func()
+	onSnapshot    func()
+}
+
+func (s *stagedHookSnapshotStore) Snapshot(turn int, absPath string) error {
+	return s.SnapshotResolved(turn, absPath, absPath)
+}
+
+func (s *stagedHookSnapshotStore) SnapshotResolved(turn int, originalPath, canonicalPath string) error {
+	s.calls = append(s.calls, snapshotCall{turn: turn, path: originalPath, canonical: canonicalPath})
+	if s.onSnapshot != nil {
+		onSnapshot := s.onSnapshot
+		s.onSnapshot = nil
+		onSnapshot()
+	}
+	return nil
+}
+
+func (s *stagedHookSnapshotStore) CurrentTurn() int {
+	if s.onCurrentTurn != nil {
+		onCurrentTurn := s.onCurrentTurn
+		s.onCurrentTurn = nil
+		onCurrentTurn()
+	}
+	return s.turn
+}
+
 func allowStagedCall(string, string) permission.Decision {
 	return permission.DecisionAllow
 }
 
 func stagedExecutorFile(t *testing.T, name, content string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), name)
+	return stagedExecutorPath(t, t.TempDir(), name, content)
+}
+
+func stagedExecutorPath(t *testing.T, dir, name, content string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -394,6 +542,16 @@ func assertBatchSuccess(t *testing.T, results []BatchResult, idx int, toolName, 
 	}
 }
 
+func assertStagedCanonicalChange(t *testing.T, results []BatchResult, idx int) {
+	t.Helper()
+	if idx >= len(results) {
+		t.Fatalf("result index %d out of range len=%d", idx, len(results))
+	}
+	if results[idx].Success || !strings.Contains(results[idx].Error, "approved canonical path changed") {
+		t.Fatalf("result[%d] = %+v, want frozen canonical target-change refusal", idx, results[idx])
+	}
+}
+
 func assertFileContent(t *testing.T, path, want string) {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -402,5 +560,15 @@ func assertFileContent(t *testing.T, path, want string) {
 	}
 	if got := string(data); got != want {
 		t.Fatalf("content of %s = %q, want %q", path, got, want)
+	}
+}
+
+func repointStagedSymlink(t *testing.T, link, target string) {
+	t.Helper()
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
 	}
 }

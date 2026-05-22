@@ -65,7 +65,13 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 			continue
 		}
 		resolvedStaged[i].Params = execParams
+	}
 
+	for i, call := range resolvedStaged {
+		if results[i].Error != "" {
+			continue
+		}
+		execParams := call.Params
 		decision := permission.DecisionAsk
 		if e.check != nil {
 			decision = e.check(call.ToolName, PermissionCheckArg(call.ToolName, execParams))
@@ -84,7 +90,7 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 				results[i].Error = "denied by user"
 				continue
 			}
-			req := permissionRequest(call.ToolName, call.Params, execParams)
+			req := permissionRequest(call.ToolName, staged[i].Params, execParams)
 			req.CanAllowAll = len(staged) > 1
 			req.BatchIndex = i + 1
 			req.BatchTotal = len(staged)
@@ -255,7 +261,11 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 		displayPath, _ := staged[indexes[0]].Params["path"].(string)
 		displayAbsPath, err := fileDisplayAbsPath(displayPath)
 		if err == nil {
-			err = snapshotFile(e.store, e.store.CurrentTurn(), displayAbsPath, absPath)
+			turn := e.store.CurrentTurn()
+			if !e.validateFileGroup(staged, results, absPath, indexes) {
+				return
+			}
+			err = snapshotFile(e.store, turn, displayAbsPath, absPath)
 		}
 		if err != nil {
 			for _, idx := range indexes {
