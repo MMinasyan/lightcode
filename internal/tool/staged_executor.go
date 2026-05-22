@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/permission"
@@ -176,11 +175,8 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 	}
 
 	var data []byte
-	var initialMtime time.Time
-	exists := false
 	readFile, readErr := safefs.OpenExisting(absPath, os.O_RDONLY)
 	if readErr == nil {
-		exists = true
 		info, err := readFile.Stat()
 		if err != nil {
 			_ = readFile.Close()
@@ -196,8 +192,16 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 			}
 			return
 		}
-		initialMtime = info.ModTime()
 		data, readErr = io.ReadAll(readFile)
+		if readErr == nil && e.tracker != nil {
+			if err := e.tracker.WasReadCheckIdentity(absPath, FileIdentityFromFileInfoAndData(info, data)); err != nil {
+				_ = readFile.Close()
+				for _, idx := range indexes {
+					results[idx].Error = err.Error()
+				}
+				return
+			}
+		}
 		_ = readFile.Close()
 	}
 	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
@@ -206,14 +210,11 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 		}
 		return
 	}
-
-	if exists && e.tracker != nil {
-		if err := e.tracker.WasReadCheckMtime(absPath, initialMtime); err != nil {
-			for _, idx := range indexes {
-				results[idx].Error = err.Error()
-			}
-			return
+	if readErr != nil && errors.Is(readErr, os.ErrNotExist) && e.tracker != nil && e.tracker.HasRead(absPath) {
+		for _, idx := range indexes {
+			results[idx].Error = (&FileChangedError{Path: absPath}).Error()
 		}
+		return
 	}
 
 	content := string(data)
@@ -282,23 +283,12 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 		return
 	}
 
-	writeFile, existedAtWrite, err := safefs.OpenForWrite(absPath, 0o644)
+	writeFile, _, err := openWriteTarget(absPath, e.tracker)
 	if err != nil {
 		e.failSuccessful(results, indexes, fmt.Sprintf("write %s: %v", absPath, err))
 		return
 	}
 	defer writeFile.Close()
-	if existedAtWrite && e.tracker != nil {
-		info, err := writeFile.Stat()
-		if err != nil {
-			e.failSuccessful(results, indexes, fmt.Sprintf("stat %s: %v", absPath, err))
-			return
-		}
-		if err := e.tracker.WasReadCheckMtime(absPath, info.ModTime()); err != nil {
-			e.failSuccessful(results, indexes, err.Error())
-			return
-		}
-	}
 	if err := writeFile.Truncate(0); err != nil {
 		e.failSuccessful(results, indexes, fmt.Sprintf("truncate %s: %v", absPath, err))
 		return
@@ -318,7 +308,7 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 
 	if e.tracker != nil {
 		if info, err := writeFile.Stat(); err == nil {
-			e.tracker.UpdateAfterWriteMtime(absPath, info.ModTime())
+			e.tracker.UpdateAfterWriteIdentity(absPath, FileIdentityFromFileInfoAndData(info, []byte(content)))
 		}
 	}
 }

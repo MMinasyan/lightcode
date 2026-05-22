@@ -107,6 +107,9 @@ func (e *EditFileWithSnapshot) Execute(_ context.Context, params map[string]any)
 	if err != nil {
 		return "", fmt.Errorf("edit_file: resolve path: %w", err)
 	}
+	if err := preflightEditSnapshotTarget(securityPath, e.tracker); err != nil {
+		return "", err
+	}
 	if err := snapshotFile(e.store, e.store.CurrentTurn(), displayAbsPath, securityPath); err != nil {
 		return "", fmt.Errorf("edit_file: snapshot: %w", err)
 	}
@@ -123,6 +126,26 @@ func (e *EditFile) editFileExec(params map[string]any) (string, error) {
 		return "", err
 	}
 	return res.Result, nil
+}
+
+func preflightEditSnapshotTarget(absPath string, tracker *FileTracker) error {
+	f, err := safefs.OpenExisting(absPath, os.O_RDWR)
+	if err != nil {
+		return fmt.Errorf("edit_file: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("edit_file: stat: %w", err)
+	}
+	if tracker == nil {
+		return nil
+	}
+	identity, err := FileIdentityFromOpenFile(f, info)
+	if err != nil {
+		return fmt.Errorf("edit_file: read identity: %w", err)
+	}
+	return tracker.WasReadCheckIdentity(absPath, identity)
 }
 
 // editFileExecCommon is the shared implementation.
@@ -160,15 +183,15 @@ func editFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.
 	if info.IsDir() {
 		return nil, fmt.Errorf("edit_file: %s is a directory", path)
 	}
-	if tracker != nil {
-		if err := tracker.WasReadCheckMtime(absPath, info.ModTime()); err != nil {
-			return nil, err
-		}
-	}
 
 	data, err := io.ReadAll(f)
 	if err != nil {
 		return nil, fmt.Errorf("edit_file: %w", err)
+	}
+	if tracker != nil {
+		if err := tracker.WasReadCheckIdentity(absPath, FileIdentityFromFileInfoAndData(info, data)); err != nil {
+			return nil, err
+		}
 	}
 	content := string(data)
 
@@ -193,7 +216,7 @@ func editFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.
 	// Refresh mtime after successful write without creating read authorization.
 	if tracker != nil {
 		if info, err := f.Stat(); err == nil {
-			tracker.UpdateAfterWriteMtime(absPath, info.ModTime())
+			tracker.UpdateAfterWriteIdentity(absPath, FileIdentityFromFileInfoAndData(info, []byte(res.UpdatedContent)))
 		}
 	}
 

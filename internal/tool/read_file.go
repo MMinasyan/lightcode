@@ -107,16 +107,17 @@ func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, er
 		return "", fmt.Errorf("read_file: %s is a directory", path)
 	}
 
-	// Deduplication check.
-	if r.tracker != nil {
-		if dup, _ := r.tracker.IsDuplicateMtime(absPath, offset, limit, info.ModTime()); dup {
-			return "File unchanged since last read. The content from the earlier read in this conversation is still current.", nil
-		}
-	}
-
 	data, err := io.ReadAll(f)
 	if err != nil {
 		return "", fmt.Errorf("read_file: %w", err)
+	}
+	identity := FileIdentityFromFileInfoAndData(info, data)
+
+	// Deduplication check.
+	if r.tracker != nil {
+		if dup, _ := r.tracker.IsDuplicateIdentity(absPath, offset, limit, identity); dup {
+			return "File unchanged since last read. The content from the earlier read in this conversation is still current.", nil
+		}
 	}
 
 	// Binary detection.
@@ -126,7 +127,7 @@ func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, er
 
 	// Track the read for mtime enforcement.
 	if r.tracker != nil {
-		r.tracker.TrackMtime(absPath, offset, limit, info.ModTime())
+		r.tracker.TrackIdentity(absPath, offset, limit, identity)
 	}
 
 	result, totalLines := r.formatOutput(data, offset, limit)
