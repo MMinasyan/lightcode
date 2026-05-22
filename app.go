@@ -98,6 +98,7 @@ func (a *App) handleEvent(ev agent.Event) {
 			"id":          ev.PermReq.ID,
 			"tool":        ev.PermReq.ToolName,
 			"args":        ev.PermReq.Arg,
+			"resolvedArg": ev.PermReq.ResolvedArg,
 			"canAllowAll": ev.PermReq.CanAllowAll,
 			"batchIndex":  ev.PermReq.BatchIndex,
 			"batchTotal":  ev.PermReq.BatchTotal,

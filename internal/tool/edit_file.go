@@ -3,11 +3,12 @@ package tool
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/safefs"
 )
 
 // EditFile implements the edit_file tool with mtime enforcement,
@@ -98,17 +99,36 @@ func (e *EditFileWithSnapshot) Execute(_ context.Context, params map[string]any)
 	if path == "" {
 		return "", fmt.Errorf("edit_file: path is required")
 	}
-	absPath, err := filepath.Abs(path)
+	displayAbsPath, err := fileDisplayAbsPath(path)
 	if err != nil {
 		return "", fmt.Errorf("edit_file: resolve path: %w", err)
 	}
-	if err := e.store.Snapshot(e.store.CurrentTurn(), absPath); err != nil {
-		return "", fmt.Errorf("edit_file: snapshot: %w", err)
-	}
-	res, err := editFileExecCommon(params, e.tracker, e.cfg)
+	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
+	securityPath, err := fileSecurityPath(params, path)
 	if err != nil {
+		return "", fmt.Errorf("edit_file: resolve path: %w", err)
+	}
+	if err := preflightEditSnapshotTarget(securityPath, e.tracker); err != nil {
 		return "", err
 	}
+	// The edit path revalidates and applies the textual match after snapshotting;
+	// if that fails before truncation, release only this tool's snapshot claim.
+	snapshot, err := snapshotFileForMutation(e.store, e.store.CurrentTurn(), displayAbsPath, securityPath)
+	if err != nil {
+		return "", fmt.Errorf("edit_file: snapshot: %w", err)
+	}
+	res, mutationStarted, err := editFileExecCommonForSnapshot(params, e.tracker, e.cfg)
+	if err != nil {
+		if !mutationStarted {
+			if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
+				return "", fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
+			}
+		} else {
+			retainMutatedSnapshot(snapshot)
+		}
+		return "", err
+	}
+	retainMutatedSnapshot(snapshot)
 	return res.Result, nil
 }
 
@@ -120,61 +140,120 @@ func (e *EditFile) editFileExec(params map[string]any) (string, error) {
 	return res.Result, nil
 }
 
+func preflightEditSnapshotTarget(absPath string, tracker *FileTracker) error {
+	if _, err := ensureRegularExistingTarget(absPath); err != nil {
+		return fmt.Errorf("edit_file: %w", err)
+	}
+	f, err := safefs.OpenExisting(absPath, os.O_RDWR)
+	if err != nil {
+		return fmt.Errorf("edit_file: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("edit_file: stat: %w", err)
+	}
+	if err := ensureRegularFileInfo(absPath, info); err != nil {
+		return fmt.Errorf("edit_file: %w", err)
+	}
+	if tracker == nil {
+		return nil
+	}
+	identity, err := FileIdentityFromOpenFile(f, info)
+	if err != nil {
+		return fmt.Errorf("edit_file: read identity: %w", err)
+	}
+	return tracker.WasReadCheckIdentity(absPath, identity)
+}
+
 // editFileExecCommon is the shared implementation.
 func editFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig) (*editResult, error) {
+	res, _, err := editFileExecCommonForSnapshot(params, tracker, cfg)
+	return res, err
+}
+
+func editFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig) (*editResult, bool, error) {
 	path, _ := params["path"].(string)
 	if path == "" {
-		return nil, fmt.Errorf("edit_file: path is required")
+		return nil, false, fmt.Errorf("edit_file: path is required")
 	}
 	oldString, _ := params["old_string"].(string)
 	newString, _ := params["new_string"].(string)
 	replaceAll, _ := params["replace_all"].(bool)
 
 	if oldString == "" {
-		return nil, fmt.Errorf("edit_file: old_string must not be empty")
+		return nil, false, fmt.Errorf("edit_file: old_string must not be empty")
 	}
 	if oldString == newString {
-		return nil, fmt.Errorf("edit_file: old_string and new_string are identical")
+		return nil, false, fmt.Errorf("edit_file: old_string and new_string are identical")
 	}
 
-	absPath, err := filepath.Abs(path)
+	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
+	absPath, err := fileSecurityPath(params, path)
 	if err != nil {
-		return nil, fmt.Errorf("edit_file: resolve path: %w", err)
+		return nil, false, fmt.Errorf("edit_file: resolve path: %w", err)
+	}
+
+	if _, err := ensureRegularExistingTarget(absPath); err != nil {
+		return nil, false, fmt.Errorf("edit_file: %w", err)
 	}
 
 	// Mtime enforcement.
-	if tracker != nil {
-		if err := tracker.WasReadCheck(absPath); err != nil {
-			return nil, err
-		}
+	f, err := safefs.OpenExisting(absPath, os.O_RDWR)
+	if err != nil {
+		return nil, false, fmt.Errorf("edit_file: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, false, fmt.Errorf("edit_file: stat: %w", err)
+	}
+	if err := ensureRegularFileInfo(absPath, info); err != nil {
+		return nil, false, fmt.Errorf("edit_file: %w", err)
 	}
 
-	data, err := os.ReadFile(absPath)
+	data, err := io.ReadAll(f)
 	if err != nil {
-		return nil, fmt.Errorf("edit_file: %w", err)
+		return nil, false, fmt.Errorf("edit_file: %w", err)
+	}
+	if tracker != nil {
+		if err := tracker.WasReadCheckIdentity(absPath, FileIdentityFromFileInfoAndData(info, data)); err != nil {
+			return nil, false, err
+		}
 	}
 	content := string(data)
 
 	res, err := ApplyEdit(content, oldString, newString, replaceAll, path)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	// #nosec G703 -- path is permission-gated by PermWrapped (internal/tool/permwrap.go); user approves each call before execution.
-	if err := os.WriteFile(absPath, []byte(res.UpdatedContent), 0o644); err != nil {
-		return nil, fmt.Errorf("edit_file: write: %w", err)
+	mutationStarted := true
+	if err := f.Truncate(0); err != nil {
+		return nil, mutationStarted, fmt.Errorf("edit_file: truncate: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, mutationStarted, fmt.Errorf("edit_file: seek: %w", err)
+	}
+	if _, err := f.Write([]byte(res.UpdatedContent)); err != nil {
+		return nil, mutationStarted, fmt.Errorf("edit_file: write: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return nil, mutationStarted, fmt.Errorf("edit_file: sync: %w", err)
 	}
 
 	// Refresh mtime after successful write without creating read authorization.
 	if tracker != nil {
-		tracker.UpdateAfterWrite(absPath)
+		if info, err := f.Stat(); err == nil {
+			tracker.UpdateAfterWriteIdentity(absPath, FileIdentityFromFileInfoAndData(info, []byte(res.UpdatedContent)))
+		}
 	}
 
 	return &editResult{
 		Result:     res.Summary,
 		LineRanges: res.LineRanges,
 		Count:      res.Count,
-	}, nil
+	}, mutationStarted, nil
 }
 
 // EditBufferResult holds the result of an edit applied to a string buffer.

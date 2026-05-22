@@ -2,17 +2,33 @@ package tool
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 
+	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/permission"
 )
+
+const canonicalPathParam = "_lightcode_canonical_path"
+
+type canonicalPathValue struct {
+	path string
+}
+
+func (canonicalPathValue) String() string {
+	return "<internal canonical path>"
+}
+
+func (canonicalPathValue) GoString() string {
+	return "canonicalPathValue{}"
+}
 
 // CheckFunc evaluates rules for a tool call and returns a Decision.
 type CheckFunc func(toolName, arg string) permission.Decision
 
 // AskFunc blocks until the user responds to a permission prompt.
-// Returns true for allow, false for deny.
-type AskFunc func(toolName, arg string) bool
+// Returns a response action from the user.
+type AskFunc func(ctx context.Context, req permission.Request) permission.ResponseAction
 
 // PermWrapped wraps a Tool with permission enforcement. The wrapped
 // tool's Execute is only called if the check allows it or the user
@@ -34,19 +50,38 @@ func (p *PermWrapped) Description() string              { return p.inner.Descrip
 func (p *PermWrapped) ParametersSchema() map[string]any { return p.inner.ParametersSchema() }
 
 func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (string, error) {
-	arg := PermissionArg(p.inner.Name(), params)
+	execParams, err := resolveFileToolParams(p.inner.Name(), params)
+	if err != nil {
+		return "", err
+	}
+	checkArg := PermissionCheckArg(p.inner.Name(), execParams)
 
-	switch p.check(p.inner.Name(), arg) {
+	switch p.check(p.inner.Name(), checkArg) {
 	case permission.DecisionAllow:
-		return p.inner.Execute(ctx, params)
+		return p.inner.Execute(ctx, execParams)
 	case permission.DecisionDeny:
 		return "", ErrDenied
 	default: // DecisionAsk
-		if p.ask(p.inner.Name(), arg) {
-			return p.inner.Execute(ctx, params)
+		if p.ask != nil && permissionAllows(p.ask(ctx, permissionRequest(p.inner.Name(), params, execParams))) {
+			return p.inner.Execute(ctx, execParams)
 		}
 		return "", ErrDenied
 	}
+}
+
+func permissionAllows(action permission.ResponseAction) bool {
+	return action == permission.ResponseAllow || action == permission.ResponseAllowAll
+}
+
+func permissionRequest(toolName string, params, execParams map[string]any) permission.Request {
+	arg := PermissionArg(toolName, params)
+	req := permission.Request{ToolName: toolName, Arg: arg}
+	if isFileTool(toolName) {
+		if resolved := PermissionCheckArg(toolName, execParams); resolved != "" && resolved != arg {
+			req.ResolvedArg = resolved
+		}
+	}
+	return req
 }
 
 // PermissionArg pulls the permission-relevant argument from the tool params.
@@ -73,4 +108,87 @@ func PermissionArg(toolName string, params map[string]any) string {
 	default:
 		return ""
 	}
+}
+
+func PermissionCheckArg(toolName string, params map[string]any) string {
+	if isFileTool(toolName) {
+		if canonicalPath := canonicalPathFromParams(params); canonicalPath != "" {
+			return canonicalPath
+		}
+		path, _ := params["path"].(string)
+		if path != "" {
+			if resolved, err := pathutil.ResolveFilePath(path); err == nil {
+				return resolved.CanonicalPath
+			}
+		}
+	}
+	return PermissionArg(toolName, params)
+}
+
+func resolveFileToolParams(toolName string, params map[string]any) (map[string]any, error) {
+	if !isFileTool(toolName) {
+		return params, nil
+	}
+	cleanParams := withoutCanonicalPathParam(params)
+	path, _ := cleanParams["path"].(string)
+	if path == "" {
+		return cleanParams, nil
+	}
+	resolved, err := pathutil.ResolveFilePath(path)
+	if err != nil {
+		return nil, err
+	}
+	return withCanonicalPathParam(cleanParams, resolved.CanonicalPath), nil
+}
+
+func withCanonicalPathParam(params map[string]any, canonicalPath string) map[string]any {
+	next := withoutCanonicalPathParam(params)
+	next[canonicalPathParam] = canonicalPathValue{path: canonicalPath}
+	return next
+}
+
+func withoutCanonicalPathParam(params map[string]any) map[string]any {
+	next := make(map[string]any, len(params)+1)
+	for k, v := range params {
+		if k == canonicalPathParam {
+			continue
+		}
+		next[k] = v
+	}
+	return next
+}
+
+func canonicalPathFromParams(params map[string]any) string {
+	canonicalPath, _ := params[canonicalPathParam].(canonicalPathValue)
+	return canonicalPath.path
+}
+
+func fileSecurityPath(params map[string]any, path string) (string, error) {
+	if canonicalPath := canonicalPathFromParams(params); canonicalPath != "" {
+		resolved, err := pathutil.ResolveFilePath(path)
+		if err != nil {
+			return "", err
+		}
+		if resolved.CanonicalPath != canonicalPath {
+			return "", fmt.Errorf("approved canonical path changed from %s to %s", canonicalPath, resolved.CanonicalPath)
+		}
+		return canonicalPath, nil
+	}
+	resolved, err := pathutil.ResolveFilePath(path)
+	if err != nil {
+		return "", err
+	}
+	return resolved.CanonicalPath, nil
+}
+
+func fileDisplayAbsPath(path string) (string, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return absPath, nil
+}
+
+func isFileTool(toolName string) bool {
+	return toolName == "read_file" || toolName == "write_file" || toolName == "edit_file"
 }

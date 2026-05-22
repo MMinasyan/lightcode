@@ -10,12 +10,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/permission"
 )
 
 type integrationRequest struct {
@@ -548,4 +550,125 @@ func TestIntegrationSubagentSpawnTagsEventsAndReturnsResult(t *testing.T) {
 		t.Fatalf("turn cancelled: %+v", ev)
 	}
 	assertAssistantMessageContains(t, a, "parent got subagent result")
+}
+
+func TestIntegrationReadOnlySubagentRunCommandUsesParentPermission(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req := readIntegrationRequest(t, r)
+		call := calls.Add(1)
+		switch call {
+		case 1:
+			args := `{"tasks":[{"prompt":"inspect with command","subagent_type":"explore"}]}`
+			writeSSE(w, toolCallChunk("task-1", "test-model", "call_task", "task", args), stopChunk("task-1", "test-model"), "[DONE]")
+		case 2:
+			if !strings.Contains(messageContent(req), "inspect with command") {
+				t.Fatalf("subagent request messages = %#v", req.Messages)
+			}
+			writeSSE(w, toolCallChunk("task-sub-1", "test-model", "call_cmd", "run_command", `{"command":"echo subagent-ok"}`), stopChunk("task-sub-1", "test-model"), "[DONE]")
+		case 3:
+			if !strings.Contains(messageContent(req), "subagent-ok") {
+				t.Fatalf("subagent follow-up messages = %#v, want command output", req.Messages)
+			}
+			writeSSE(w, textChunk("task-sub-2", "test-model", "subagent command complete"), stopChunk("task-sub-2", "test-model"), "[DONE]")
+		case 4:
+			if !strings.Contains(messageContent(req), "subagent command complete") {
+				t.Fatalf("parent follow-up messages = %#v, want subagent result", req.Messages)
+			}
+			writeSSE(w, textChunk("task-2", "test-model", "parent got command result"), stopChunk("task-2", "test-model"), "[DONE]")
+		case 5:
+			writeSSE(w, toolCallChunk("main-cmd-1", "test-model", "call_main_cmd", "run_command", `{"command":"echo subagent-ok"}`), stopChunk("main-cmd-1", "test-model"), "[DONE]")
+		case 6:
+			if !strings.Contains(messageContent(req), "subagent-ok") {
+				t.Fatalf("main-agent follow-up messages = %#v, want command output", req.Messages)
+			}
+			writeSSE(w, textChunk("main-cmd-2", "test-model", "main command complete"), stopChunk("main-cmd-2", "test-model"), "[DONE]")
+		default:
+			t.Fatalf("unexpected provider call %d", call)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	a := newIntegrationAgent(t, server.URL)
+	log := newIntegrationEventLog()
+	var permissionRequests atomic.Int32
+	a.SetEventHandler(func(ev Event) {
+		log.collect(ev)
+		if ev.Kind == EventPermissionRequest && ev.PermReq != nil {
+			permissionRequests.Add(1)
+			if ev.PermReq.ToolName == "task" {
+				t.Errorf("permission tool = task, want task launch to stay unprompted")
+			}
+			if ev.PermReq.ToolName != "run_command" {
+				t.Errorf("permission tool = %q, want run_command", ev.PermReq.ToolName)
+			}
+			if ev.PermReq.Arg != "echo subagent-ok" {
+				t.Errorf("permission arg = %q, want command", ev.PermReq.Arg)
+			}
+			suggestions := a.PermissionSuggest(ev.PermReq.ToolName, ev.PermReq.Arg)
+			mainSuggestions := a.PermissionSuggest("run_command", "echo subagent-ok")
+			if !reflect.DeepEqual(suggestions, mainSuggestions) {
+				t.Errorf("subagent suggestions = %#v, want main-agent suggestions %#v", suggestions, mainSuggestions)
+			}
+			if len(suggestions) == 0 || suggestions[0].Rule != "run_command(echo subagent-ok)" {
+				t.Errorf("suggestions = %#v, want exact run_command rule first", suggestions)
+			}
+			if len(suggestions) == 0 {
+				if err := a.RespondPermission(ev.PermReq.ID, false); err != nil {
+					t.Errorf("RespondPermission deny after missing suggestions: %v", err)
+				}
+				return
+			}
+			if err := a.SaveProjectPermission(ev.PermReq.ID, []string{suggestions[0].Rule}); err != nil {
+				t.Errorf("SaveProjectPermission run_command: %v", err)
+			}
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Init(ctx)
+
+	if _, err := a.SendPrompt(ctx, "delegate with command"); err != nil {
+		t.Fatalf("SendPrompt: %v", err)
+	}
+	subEv := log.waitFor(t, EventSubagentStart)
+	if subEv.SubagentSessionID == "" || subEv.TaskIndex != 0 || subEv.ToolCallID != "call_task" {
+		t.Fatalf("subagent event = %+v", subEv)
+	}
+	cmdEv := log.waitForMatching(t, func(ev Event) bool {
+		return ev.Kind == EventToolCallStart && ev.SubagentSessionID != "" && ev.ToolName == "run_command"
+	})
+	if cmdEv.ToolCallID != "call_cmd" {
+		t.Fatalf("subagent command event = %+v, want call_cmd", cmdEv)
+	}
+	if ev := log.waitFor(t, EventTurnEnd); ev.Cancelled {
+		t.Fatalf("turn cancelled: %+v", ev)
+	}
+	if permissionRequests.Load() != 1 {
+		t.Fatalf("permission requests = %d, want exactly one run_command request", permissionRequests.Load())
+	}
+	assertAssistantMessageContains(t, a, "parent got command result")
+
+	proj, err := a.projects.Current()
+	if err != nil {
+		t.Fatalf("current project: %v", err)
+	}
+	rules, err := permission.LoadLocal(a.projects.Root(), proj.ID)
+	if err != nil {
+		t.Fatalf("load local permissions: %v", err)
+	}
+	if len(rules.Allow) != 1 || rules.Allow[0] != "run_command(echo subagent-ok)" {
+		t.Fatalf("saved allow rules = %#v, want exact run_command rule", rules.Allow)
+	}
+
+	if _, err := a.SendPrompt(ctx, "run same command in main agent"); err != nil {
+		t.Fatalf("SendPrompt main command: %v", err)
+	}
+	if ev := log.waitFor(t, EventTurnEnd); ev.Cancelled {
+		t.Fatalf("main command turn cancelled: %+v", ev)
+	}
+	if permissionRequests.Load() != 1 {
+		t.Fatalf("permission requests after saved main command = %d, want still 1", permissionRequests.Load())
+	}
+	assertAssistantMessageContains(t, a, "main command complete")
 }

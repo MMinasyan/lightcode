@@ -873,5 +873,10 @@ func validateStagedCall(toolName string, params map[string]any) error {
 			return fmt.Errorf("edit_file: old_string and new_string are identical")
 		}
 	}
+	if toolName == "write_file" {
+		if _, ok := params["content"].(string); !ok {
+			return fmt.Errorf("write_file: content must be a string")
+		}
+	}
 	return nil
 }

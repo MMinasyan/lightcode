@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,6 +12,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/safefs"
+	"golang.org/x/sys/unix"
 )
 
 // ReadFile implements the read_file tool with line-numbered output,
@@ -80,46 +83,46 @@ func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, er
 		limit = r.cfg.ReadMaxLines
 	}
 
-	absPath, err := filepath.Abs(path)
+	displayAbsPath, err := fileDisplayAbsPath(path)
+	if err != nil {
+		return "", fmt.Errorf("read_file: resolve path: %w", err)
+	}
+	absPath, err := fileSecurityPath(params, path)
 	if err != nil {
 		return "", fmt.Errorf("read_file: resolve path: %w", err)
 	}
 
-	// Deduplication check.
-	if r.tracker != nil {
-		if dup, _ := r.tracker.IsDuplicate(absPath, offset, limit); dup {
-			return "File unchanged since last read. The content from the earlier read in this conversation is still current.", nil
-		}
+	if _, err := ensureRegularExistingTarget(absPath); err != nil {
+		return "", fmt.Errorf("read_file: %w", err)
 	}
 
-	info, err := os.Lstat(absPath)
+	f, err := safefs.OpenExisting(absPath, os.O_RDONLY|unix.O_NONBLOCK)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return r.fileNotFound(absPath), nil
+			return r.fileNotFound(displayAbsPath), nil
 		}
 		return "", fmt.Errorf("read_file: %w", err)
 	}
-
-	// Follow symlinks.
-	if info.Mode()&os.ModeSymlink != 0 {
-		realPath, err := filepath.EvalSymlinks(absPath)
-		if err != nil {
-			return "", fmt.Errorf("read_file: symlink: %w", err)
-		}
-		absPath = realPath
-		info, err = os.Stat(absPath)
-		if err != nil {
-			return "", fmt.Errorf("read_file: %w", err)
-		}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("read_file: stat: %w", err)
+	}
+	if err := ensureRegularFileInfo(absPath, info); err != nil {
+		return "", fmt.Errorf("read_file: %w", err)
 	}
 
-	if info.IsDir() {
-		return "", fmt.Errorf("read_file: %s is a directory", path)
-	}
-
-	data, err := os.ReadFile(absPath)
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return "", fmt.Errorf("read_file: %w", err)
+	}
+	identity := FileIdentityFromFileInfoAndData(info, data)
+
+	// Deduplication check.
+	if r.tracker != nil {
+		if dup, _ := r.tracker.IsDuplicateIdentity(absPath, offset, limit, identity); dup {
+			return "File unchanged since last read. The content from the earlier read in this conversation is still current.", nil
+		}
 	}
 
 	// Binary detection.
@@ -129,7 +132,7 @@ func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, er
 
 	// Track the read for mtime enforcement.
 	if r.tracker != nil {
-		r.tracker.Track(absPath, offset, limit)
+		r.tracker.TrackIdentity(absPath, offset, limit, identity)
 	}
 
 	result, totalLines := r.formatOutput(data, offset, limit)

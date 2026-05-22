@@ -16,6 +16,9 @@ func TestSuggestRunCommandBash(t *testing.T) {
 	if suggestions[0].Rule != "run_command(bash -c 'echo hello')" {
 		t.Fatalf("first suggestion = %q", suggestions[0].Rule)
 	}
+	if got := Evaluate(Rules{Allow: []string{suggestions[0].Rule}}, "run_command", "bash -c 'echo hello'", "/project", "/home/user", "/project"); got != DecisionAllow {
+		t.Fatalf("Evaluate with first suggestion = %d, want DecisionAllow", got)
+	}
 
 	// Should have progressive wildcards
 	lastIdx := len(suggestions) - 1
@@ -121,6 +124,61 @@ func TestSuggestReadFile(t *testing.T) {
 
 	if suggestions[0].Rule != "read_file(/README.md)" {
 		t.Fatalf("first = %q", suggestions[0].Rule)
+	}
+}
+
+func TestSuggestCanonicalProjectRootForResolvedTarget(t *testing.T) {
+	tmp := t.TempDir()
+	realRoot := filepath.Join(tmp, "real-project")
+	linkRoot := filepath.Join(tmp, "link-project")
+	target := filepath.Join(realRoot, "src", "file.go")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+
+	suggestions := Suggest("read_file", target, linkRoot)
+	if len(suggestions) == 0 {
+		t.Fatal("Suggest returned no suggestions")
+	}
+	if suggestions[0].Rule != "read_file(/src/file.go)" {
+		t.Fatalf("first = %q, want read_file(/src/file.go)", suggestions[0].Rule)
+	}
+	found := false
+	for _, suggestion := range suggestions {
+		if suggestion.Rule == "read_file(/src/**)" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("suggestions = %+v, want project-relative wildcard", suggestions)
+	}
+}
+
+func TestSuggestVisibleProjectRootStillWorks(t *testing.T) {
+	tmp := t.TempDir()
+	realRoot := filepath.Join(tmp, "real-project")
+	linkRoot := filepath.Join(tmp, "link-project")
+	if err := os.MkdirAll(filepath.Join(realRoot, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+	visiblePath := filepath.Join(linkRoot, "src", "file.go")
+
+	suggestions := Suggest("write_file", visiblePath, linkRoot)
+	if len(suggestions) == 0 {
+		t.Fatal("Suggest returned no suggestions")
+	}
+	if suggestions[0].Rule != "write_file(/src/file.go)" {
+		t.Fatalf("first = %q, want write_file(/src/file.go)", suggestions[0].Rule)
 	}
 }
 
@@ -271,5 +329,62 @@ func TestSuggestFileWithSubdirectory(t *testing.T) {
 		if !foundRules[e] {
 			t.Fatalf("missing suggestion: %q", e)
 		}
+	}
+}
+
+// TestPR11Closure_ProcessSuggestRoundTrip asserts that every suggestion
+// emitted for a `process` permission prompt, when saved as an allow rule,
+// round-trips through the matcher to DecisionAllow for the original arg.
+// The prior implementation routed `process` through the file-suggestion
+// path, producing path-style rules the direct-glob process matcher could
+// not match — breaking the "Allow for project" UX entirely for the
+// process tool.
+func TestPR11Closure_ProcessSuggestRoundTrip(t *testing.T) {
+	cases := []struct {
+		name    string
+		arg     string
+		wantHas []string
+	}{
+		{
+			name:    "id_arg_has_exact_and_wildcard",
+			arg:     "process:abc123",
+			wantHas: []string{"process(process:abc123)", "process(process:*)"},
+		},
+		{
+			name:    "bare_arg_has_literal",
+			arg:     "process",
+			wantHas: []string{"process(process)"},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			suggestions := Suggest("process", tc.arg, "/project")
+			if len(suggestions) == 0 {
+				t.Fatalf("Suggest(process, %q) returned no suggestions", tc.arg)
+			}
+
+			rules := make(map[string]bool)
+			for _, s := range suggestions {
+				rules[s.Rule] = true
+			}
+			for _, want := range tc.wantHas {
+				if !rules[want] {
+					t.Fatalf("Suggest(process, %q) missing %q; got %v", tc.arg, want, suggestions)
+				}
+			}
+
+			// Each suggestion must round-trip: saving it as an Allow rule
+			// must produce DecisionAllow for the original arg.
+			for _, s := range suggestions {
+				d := Evaluate(Rules{Allow: []string{s.Rule}}, "process", tc.arg,
+					"/project", "/home/user", "/project")
+				if d != DecisionAllow {
+					t.Fatalf("Evaluate with saved suggestion %q against arg %q = %d, want DecisionAllow",
+						s.Rule, tc.arg, d)
+				}
+			}
+		})
 	}
 }

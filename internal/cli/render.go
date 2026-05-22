@@ -494,6 +494,9 @@ func permissionMenuItems(req *agent.PermissionRequest) []menuItem {
 		{label: req.ToolName, selectable: false},
 		{label: label, selectable: false},
 	}
+	if req.ResolvedArg != "" && req.ResolvedArg != req.Arg {
+		items = append(items, menuItem{label: "resolves to " + req.ResolvedArg, selectable: false})
+	}
 	if req.CanAllowAll && len(req.BatchFiles) > 0 {
 		items = append(items, menuItem{label: "Staged files:", selectable: false})
 		current := req.Arg
@@ -526,6 +529,9 @@ func permissionPromptHeaderRows(req *agent.PermissionRequest) int {
 		return 2
 	}
 	rows := 2
+	if req.ResolvedArg != "" && req.ResolvedArg != req.Arg {
+		rows++
+	}
 	if req.CanAllowAll && len(req.BatchFiles) > 0 {
 		rows += 1 + len(req.BatchFiles)
 	}
@@ -537,10 +543,15 @@ func renderPermissionSuggestions(req *agent.PermissionRequest, suggestions []age
 		{label: req.ToolName, selectable: false},
 		{label: req.Arg, selectable: false},
 	}
+	offset := 2
+	if req.ResolvedArg != "" && req.ResolvedArg != req.Arg {
+		items = append(items, menuItem{label: "resolves to " + req.ResolvedArg, selectable: false})
+		offset++
+	}
 	for _, s := range suggestions {
 		items = append(items, menuItem{label: s.Label, selectable: true})
 	}
-	return renderMenu("Allow for project", items, selected+2, width, defaultMenuFooter)
+	return renderMenu("Allow for project", items, selected+offset, width, defaultMenuFooter)
 }
 
 func permissionSuggestionRows(suggestionCount int) int {

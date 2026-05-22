@@ -2,13 +2,15 @@ package tool
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/safefs"
+	"golang.org/x/sys/unix"
 )
 
 // AskActionFunc blocks until the user answers a staged permission prompt.
@@ -40,16 +42,38 @@ func NewStagedExecutor(store SnapshotStore, tracker *FileTracker, cfg config.Too
 func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall) []BatchResult {
 	results := make([]BatchResult, len(staged))
 	allowed := make([]bool, len(staged))
+	resolvedStaged := make([]StagedCall, len(staged))
 	allowAll := false
 	batchFiles := stagedBatchFiles(staged)
 
 	for i, call := range staged {
+		resolvedStaged[i] = call
 		results[i].ToolName = call.ToolName
 		results[i].ToolCallID = call.ToolCallID
 
+		if call.ToolName == "write_file" {
+			if _, ok := call.Params["content"].(string); !ok {
+				results[i].Error = "write_file: content must be a string"
+				continue
+			}
+		}
+
+		execParams, err := resolveFileToolParams(call.ToolName, call.Params)
+		if err != nil {
+			results[i].Error = fmt.Sprintf("%s: resolve path: %v", call.ToolName, err)
+			continue
+		}
+		resolvedStaged[i].Params = execParams
+	}
+
+	for i, call := range resolvedStaged {
+		if results[i].Error != "" {
+			continue
+		}
+		execParams := call.Params
 		decision := permission.DecisionAsk
 		if e.check != nil {
-			decision = e.check(call.ToolName, PermissionArg(call.ToolName, call.Params))
+			decision = e.check(call.ToolName, PermissionCheckArg(call.ToolName, execParams))
 		}
 		switch decision {
 		case permission.DecisionAllow:
@@ -65,14 +89,12 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 				results[i].Error = "denied by user"
 				continue
 			}
-			action := e.ask(ctx, permission.Request{
-				ToolName:    call.ToolName,
-				Arg:         PermissionArg(call.ToolName, call.Params),
-				CanAllowAll: len(staged) > 1,
-				BatchIndex:  i + 1,
-				BatchTotal:  len(staged),
-				BatchFiles:  batchFiles,
-			})
+			req := permissionRequest(call.ToolName, staged[i].Params, execParams)
+			req.CanAllowAll = len(staged) > 1
+			req.BatchIndex = i + 1
+			req.BatchTotal = len(staged)
+			req.BatchFiles = batchFiles
+			action := e.ask(ctx, req)
 			switch action {
 			case permission.ResponseAllow:
 				allowed[i] = true
@@ -91,27 +113,31 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 	}
 	var groups []*fileGroup
 	groupIdx := map[string]*fileGroup{}
-	for i, call := range staged {
+	for i, call := range resolvedStaged {
 		if !allowed[i] {
 			continue
 		}
 		path, _ := call.Params["path"].(string)
-		absPath, err := filepath.Abs(path)
-		if err != nil {
-			results[i].Error = fmt.Sprintf("%s: resolve path: %v", call.ToolName, err)
-			continue
+		groupPath := canonicalPathFromParams(call.Params)
+		if groupPath == "" {
+			absPath, err := fileSecurityPath(call.Params, path)
+			if err != nil {
+				results[i].Error = fmt.Sprintf("%s: resolve path: %v", call.ToolName, err)
+				continue
+			}
+			groupPath = absPath
 		}
-		if g, ok := groupIdx[absPath]; ok {
+		if g, ok := groupIdx[groupPath]; ok {
 			g.indexes = append(g.indexes, i)
 		} else {
-			g := &fileGroup{absPath: absPath, indexes: []int{i}}
+			g := &fileGroup{absPath: groupPath, indexes: []int{i}}
 			groups = append(groups, g)
-			groupIdx[absPath] = g
+			groupIdx[groupPath] = g
 		}
 	}
 
 	for _, g := range groups {
-		e.executeFileGroup(ctx, staged, results, g.absPath, g.indexes)
+		e.executeFileGroup(ctx, resolvedStaged, results, g.absPath, g.indexes)
 	}
 
 	return results
@@ -144,23 +170,66 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 		}
 		return
 	}
-
-	data, readErr := os.ReadFile(absPath)
-	exists := readErr == nil
-	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-		for _, idx := range indexes {
-			results[idx].Error = fmt.Sprintf("read %s: %v", absPath, readErr)
-		}
+	// re-validate canonical: read-phase guard against approved-target swap before any I/O
+	if !e.validateFileGroup(staged, results, absPath, indexes) {
 		return
 	}
 
-	if exists && e.tracker != nil {
-		if err := e.tracker.WasReadCheck(absPath); err != nil {
+	var data []byte
+	existed, shapeErr := ensureRegularExistingTarget(absPath)
+	if shapeErr != nil {
+		for _, idx := range indexes {
+			results[idx].Error = fmt.Sprintf("read %s: %v", absPath, shapeErr)
+		}
+		return
+	}
+	if existed {
+		readFile, openErr := safefs.OpenExisting(absPath, os.O_RDONLY|unix.O_NONBLOCK)
+		if openErr != nil {
 			for _, idx := range indexes {
-				results[idx].Error = err.Error()
+				results[idx].Error = fmt.Sprintf("read %s: %v", absPath, openErr)
 			}
 			return
 		}
+		info, err := readFile.Stat()
+		if err != nil {
+			_ = readFile.Close()
+			for _, idx := range indexes {
+				results[idx].Error = fmt.Sprintf("stat %s: %v", absPath, err)
+			}
+			return
+		}
+		if err := ensureRegularFileInfo(absPath, info); err != nil {
+			_ = readFile.Close()
+			for _, idx := range indexes {
+				results[idx].Error = fmt.Sprintf("read %s: %v", absPath, err)
+			}
+			return
+		}
+		var readErr error
+		data, readErr = io.ReadAll(readFile)
+		if readErr == nil && e.tracker != nil {
+			if err := e.tracker.WasReadCheckIdentity(absPath, FileIdentityFromFileInfoAndData(info, data)); err != nil {
+				_ = readFile.Close()
+				for _, idx := range indexes {
+					results[idx].Error = err.Error()
+				}
+				return
+			}
+		}
+		_ = readFile.Close()
+		if readErr != nil {
+			for _, idx := range indexes {
+				results[idx].Error = fmt.Sprintf("read %s: %v", absPath, readErr)
+			}
+			return
+		}
+	}
+	if !existed && e.tracker != nil && e.tracker.HasRead(absPath) {
+		for _, idx := range indexes {
+			results[idx].Error = (&FileChangedError{Path: absPath}).Error()
+		}
+		return
 	}
 
 	content := string(data)
@@ -183,7 +252,11 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 			results[idx].Result = res.Summary
 			successes++
 		case "write_file":
-			writeContent, _ := call.Params["content"].(string)
+			writeContent, ok := call.Params["content"].(string)
+			if !ok {
+				results[idx].Error = "write_file: content must be a string"
+				continue
+			}
 			content = writeContent
 			results[idx].Success = true
 			results[idx].Result = fmt.Sprintf("Wrote %s.", displayPath)
@@ -196,9 +269,28 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 	if successes == 0 {
 		return
 	}
+	// re-validate canonical: post-edit-buffer guard before entering the snapshot block
+	if !e.validateFileGroup(staged, results, absPath, indexes) {
+		return
+	}
 
+	var snapshot snapshotEntry
 	if e.store != nil {
-		if err := e.store.Snapshot(e.store.CurrentTurn(), absPath); err != nil {
+		displayPath, _ := staged[indexes[0]].Params["path"].(string)
+		displayAbsPath, err := fileDisplayAbsPath(displayPath)
+		if err == nil {
+			turn := e.store.CurrentTurn()
+			// re-validate canonical: pre-snapshot guard against approved-target swap
+			if !e.validateFileGroup(staged, results, absPath, indexes) {
+				return
+			}
+			if _, shapeErr := ensureRegularExistingTarget(absPath); shapeErr != nil {
+				e.failSuccessful(results, indexes, fmt.Sprintf("snapshot %s: %v", absPath, shapeErr))
+				return
+			}
+			snapshot, err = snapshotFileForMutation(e.store, turn, displayAbsPath, absPath)
+		}
+		if err != nil {
 			for _, idx := range indexes {
 				if results[idx].Success {
 					results[idx].Success = false
@@ -209,22 +301,82 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 			return
 		}
 	}
-
-	if dir := filepath.Dir(absPath); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			e.failSuccessful(results, indexes, fmt.Sprintf("mkdir %s: %v", dir, err))
-			return
+	// re-validate canonical: post-snapshot, pre-write guard against approved-target swap
+	if !e.validateFileGroup(staged, results, absPath, indexes) {
+		if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
+			e.failSuccessful(results, indexes, fmt.Sprintf("discard snapshot: %v", discardErr))
 		}
+		return
 	}
-	// #nosec G703 -- path is permission-gated by PermWrapped (internal/tool/permwrap.go); user approves each call before execution.
-	if err := os.WriteFile(absPath, []byte(content), 0o644); err != nil {
+	if _, shapeErr := ensureRegularExistingTarget(absPath); shapeErr != nil {
+		msg := fmt.Sprintf("write %s: %v", absPath, shapeErr)
+		if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
+			msg = fmt.Sprintf("%s; additionally failed to discard snapshot: %v", msg, discardErr)
+		}
+		e.failSuccessful(results, indexes, msg)
+		return
+	}
+
+	writeFile, _, mutationStarted, err := openWriteTargetForMutation(absPath, e.tracker)
+	if err != nil {
+		if !mutationStarted {
+			if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
+				err = fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
+			}
+		} else {
+			retainMutatedSnapshot(snapshot)
+		}
 		e.failSuccessful(results, indexes, fmt.Sprintf("write %s: %v", absPath, err))
+		return
+	}
+	defer writeFile.Close()
+	retainMutatedSnapshot(snapshot)
+	if err := writeFile.Truncate(0); err != nil {
+		e.failSuccessful(results, indexes, fmt.Sprintf("truncate %s: %v", absPath, err))
+		return
+	}
+	if _, err := writeFile.Seek(0, io.SeekStart); err != nil {
+		e.failSuccessful(results, indexes, fmt.Sprintf("seek %s: %v", absPath, err))
+		return
+	}
+	if _, err := writeFile.Write([]byte(content)); err != nil {
+		e.failSuccessful(results, indexes, fmt.Sprintf("write %s: %v", absPath, err))
+		return
+	}
+	if err := writeFile.Sync(); err != nil {
+		e.failSuccessful(results, indexes, fmt.Sprintf("sync %s: %v", absPath, err))
 		return
 	}
 
 	if e.tracker != nil {
-		e.tracker.UpdateAfterWrite(absPath)
+		if info, err := writeFile.Stat(); err == nil {
+			e.tracker.UpdateAfterWriteIdentity(absPath, FileIdentityFromFileInfoAndData(info, []byte(content)))
+		}
 	}
+}
+
+func (e *StagedExecutor) validateFileGroup(staged []StagedCall, results []BatchResult, absPath string, indexes []int) bool {
+	for _, idx := range indexes {
+		call := staged[idx]
+		path, _ := call.Params["path"].(string)
+		current, err := fileSecurityPath(call.Params, path)
+		if err == nil && current == absPath {
+			continue
+		}
+		msg := fmt.Sprintf("approved canonical path changed for %s", path)
+		if err != nil {
+			msg = fmt.Sprintf("%s: %v", msg, err)
+		}
+		for _, failIdx := range indexes {
+			if results[failIdx].Success {
+				results[failIdx].Success = false
+				results[failIdx].Result = ""
+			}
+			results[failIdx].Error = msg
+		}
+		return false
+	}
+	return true
 }
 
 func (e *StagedExecutor) failSuccessful(results []BatchResult, indexes []int, msg string) {

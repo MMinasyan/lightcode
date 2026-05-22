@@ -197,3 +197,22 @@ func TestPermissionPromptShowsAllowAllForBatch(t *testing.T) {
 		t.Fatalf("second permission action = %q, want Allow", got)
 	}
 }
+
+func TestPermissionPromptShowsResolvedTarget(t *testing.T) {
+	req := &agent.PermissionRequest{
+		ToolName:    "read_file",
+		Arg:         "/tmp/project/notes.txt",
+		ResolvedArg: "/tmp/project/.env",
+	}
+
+	rendered := renderPermissionPrompt(req, 0, 80)
+	if !strings.Contains(rendered, "/tmp/project/notes.txt") {
+		t.Fatalf("permission prompt missing requested path:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "resolves to /tmp/project/.env") {
+		t.Fatalf("permission prompt missing resolved path:\n%s", rendered)
+	}
+	if got, want := strings.Count(rendered, nl)+1, permissionPromptRows(req); got != want {
+		t.Fatalf("rendered rows = %d, permissionPromptRows = %d\n%s", got, want, rendered)
+	}
+}

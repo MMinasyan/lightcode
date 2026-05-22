@@ -441,7 +441,11 @@ func (c *CLI) popAndRespondAction(id string, action string) {
 }
 
 func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
-	suggestions := c.agent.PermissionSuggest(req.ToolName, req.Arg)
+	suggestArg := req.Arg
+	if req.ResolvedArg != "" {
+		suggestArg = req.ResolvedArg
+	}
+	suggestions := c.agent.PermissionSuggest(req.ToolName, suggestArg)
 	if len(suggestions) == 0 {
 		c.mu.Lock()
 		c.erasePermissionBlockLocked()

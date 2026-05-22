@@ -14,6 +14,10 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/pathutil"
+	"github.com/MMinasyan/lightcode/internal/safefs"
+	"golang.org/x/sys/unix"
 )
 
 // lightcodeVersion is written into each new session's meta.json. Bump
@@ -23,6 +27,16 @@ const lightcodeVersion = "0.3.0"
 // ErrNoSession is returned by any Store method that needs an active
 // session when none is open.
 var ErrNoSession = errors.New("snapshot: no session open")
+
+// copyDirFunc is the outer-loop directory copy used by ForkInto. Tests
+// override it to coordinate timing inside the fork copy loop; production
+// always uses the real copyDir.
+var copyDirFunc = copyDir
+
+// forkIntoLockReleasedHook fires immediately before ForkInto releases
+// s.mu. Production no-op; tests use it to detect early release of the
+// lock from the fork copy region.
+var forkIntoLockReleasedHook = func() {}
 
 // Store owns one session directory at a time. Its session may be
 // swapped (Close + BeginNewSession / LoadSession) while tool and loop
@@ -52,6 +66,11 @@ type Store struct {
 	projectRoot  string
 	projectHash  string
 	currentTurn  int
+	snapshotTx   map[string]*snapshotTxState
+}
+
+type snapshotTxState struct {
+	refs int
 }
 
 // NewForSessionsRoot returns a Store rooted at an explicit sessions
@@ -207,6 +226,7 @@ func (s *Store) clearLocked() {
 	s.projectRoot = ""
 	s.projectHash = ""
 	s.currentTurn = 0
+	s.snapshotTx = nil
 }
 
 // Active reports whether a session is currently open.
@@ -283,49 +303,165 @@ func (s *Store) CurrentTurn() int {
 // Snapshot captures the pre-turn state of absPath. First-write-wins per
 // (turn, path).
 func (s *Store) Snapshot(turn int, absPath string) error {
+	resolved, err := pathutil.ResolveFilePath(absPath)
+	if err != nil {
+		return err
+	}
+	return s.SnapshotResolved(turn, absPath, resolved.CanonicalPath)
+}
+
+// SnapshotResolved captures canonicalPath while preserving originalPath for
+// UI/history display. First-write-wins per canonical path.
+func (s *Store) SnapshotResolved(turn int, originalPath, canonicalPath string) error {
+	entryID, _, err := s.SnapshotResolvedEntry(turn, originalPath, canonicalPath)
+	if err != nil {
+		return err
+	}
+	s.RetainSnapshotEntry(turn, entryID)
+	return nil
+}
+
+// SnapshotResolvedEntry is SnapshotResolved plus the concrete entry id and a
+// created flag. Mutation callers must either retain the entry once mutation
+// starts or discard their pre-mutation claim if validation fails first.
+func (s *Store) SnapshotResolvedEntry(turn int, originalPath, canonicalPath string) (string, bool, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.active {
-		s.mu.Unlock()
-		return ErrNoSession
+		return "", false, ErrNoSession
 	}
 	snapshotsDir := s.snapshotsDir
-	s.mu.Unlock()
 	if turn < 1 {
-		return fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
+		return "", false, fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
 	}
-	realPath, err := filepath.EvalSymlinks(absPath)
+	realPath, err := filepath.EvalSymlinks(canonicalPath)
 	if err != nil {
-		realPath = absPath
+		realPath = canonicalPath
+	}
+	if info, err := os.Lstat(canonicalPath); err == nil {
+		if !info.Mode().IsRegular() {
+			return "", false, fmt.Errorf("snapshot: non-regular file target: %s (mode %s)", canonicalPath, info.Mode())
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", false, fmt.Errorf("snapshot: stat %s: %w", canonicalPath, err)
 	}
 	pathHash := hashString(realPath)
 	entryDir := filepath.Join(snapshotsDir, strconv.Itoa(turn), pathHash)
 	metaPath := filepath.Join(entryDir, "meta.json")
 	if _, err := os.Stat(metaPath); err == nil {
-		return nil
+		if state := s.snapshotTxStateLocked(turn, pathHash, false); state != nil {
+			state.refs++
+		}
+		return pathHash, false, nil
 	}
 	if err := os.MkdirAll(entryDir, 0o700); err != nil {
-		return fmt.Errorf("snapshot: mkdir %s: %w", entryDir, err)
+		return pathHash, false, fmt.Errorf("snapshot: mkdir %s: %w", entryDir, err)
 	}
-	existed := true
-	info, statErr := os.Stat(absPath)
-	if statErr != nil {
-		if !errors.Is(statErr, os.ErrNotExist) {
-			return fmt.Errorf("snapshot: stat %s: %w", absPath, statErr)
+	created := false
+	defer func() {
+		if !created {
+			_ = os.RemoveAll(entryDir)
 		}
-		existed = false
-	} else if info.IsDir() {
+	}()
+	existed := true
+	file, openErr := safefs.OpenExisting(canonicalPath, os.O_RDONLY|unix.O_NONBLOCK)
+	if openErr != nil {
+		if !errors.Is(openErr, os.ErrNotExist) {
+			return pathHash, false, fmt.Errorf("snapshot: open %s: %w", canonicalPath, openErr)
+		}
 		existed = false
 	}
 	if existed {
-		if err := copyFile(absPath, filepath.Join(entryDir, "original")); err != nil {
-			return fmt.Errorf("snapshot: copy %s: %w", absPath, err)
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil {
+			return pathHash, false, fmt.Errorf("snapshot: stat %s: %w", canonicalPath, err)
+		}
+		if !info.Mode().IsRegular() {
+			return pathHash, false, fmt.Errorf("snapshot: non-regular file target: %s (mode %s)", canonicalPath, info.Mode())
 		}
 	}
-	meta := SnapshotMeta{OriginalPath: absPath, Existed: existed}
+	if existed {
+		if err := copyFromFile(file, filepath.Join(entryDir, "original")); err != nil {
+			return pathHash, false, fmt.Errorf("snapshot: copy %s: %w", canonicalPath, err)
+		}
+	}
+	meta := SnapshotMeta{OriginalPath: originalPath, CanonicalPath: realPath, Existed: existed}
 	if err := writeJSON(metaPath, meta); err != nil {
-		return fmt.Errorf("snapshot: write meta: %w", err)
+		return pathHash, false, fmt.Errorf("snapshot: write meta: %w", err)
+	}
+	created = true
+	state := s.snapshotTxStateLocked(turn, pathHash, true)
+	state.refs++
+	return pathHash, true, nil
+}
+
+// DiscardSnapshotEntry releases a pre-mutation snapshot user. The entry is
+// removed only if no concurrent user retained it or still depends on it.
+func (s *Store) DiscardSnapshotEntry(turn int, entryID string) error {
+	if turn < 1 {
+		return fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
+	}
+	if !isLegacyEntryID(entryID) {
+		return fmt.Errorf("snapshot: invalid entry id %q", entryID)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active {
+		return ErrNoSession
+	}
+	key := snapshotTxKey(turn, entryID)
+	state := s.snapshotTx[key]
+	if state == nil {
+		return nil
+	}
+	if state.refs > 0 {
+		state.refs--
+	}
+	if state.refs > 0 {
+		return nil
+	}
+	delete(s.snapshotTx, key)
+	entryDir := filepath.Join(s.snapshotsDir, strconv.Itoa(turn), entryID)
+	if err := os.RemoveAll(entryDir); err != nil {
+		return fmt.Errorf("snapshot: discard %s: %w", entryDir, err)
 	}
 	return nil
+}
+
+// RetainSnapshotEntry keeps a snapshot entry once any user starts mutating.
+func (s *Store) RetainSnapshotEntry(turn int, entryID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active {
+		return
+	}
+	key := snapshotTxKey(turn, entryID)
+	state := s.snapshotTx[key]
+	if state == nil {
+		return
+	}
+	delete(s.snapshotTx, key)
+}
+
+func (s *Store) snapshotTxStateLocked(turn int, entryID string, create bool) *snapshotTxState {
+	key := snapshotTxKey(turn, entryID)
+	if s.snapshotTx == nil {
+		if !create {
+			return nil
+		}
+		s.snapshotTx = make(map[string]*snapshotTxState)
+	}
+	state := s.snapshotTx[key]
+	if state == nil && create {
+		state = &snapshotTxState{}
+		s.snapshotTx[key] = state
+	}
+	return state
+}
+
+func snapshotTxKey(turn int, entryID string) string {
+	return strconv.Itoa(turn) + "/" + entryID
 }
 
 // AppendMessage appends one serialized message (one JSON object + \n)
@@ -534,10 +670,10 @@ func (s *Store) RevertCode(toTurn int) ([]string, error) {
 		}
 		turnDir := filepath.Join(s.snapshotsDir, strconv.Itoa(turn))
 		paths, err := revertOneTurn(turnDir)
+		affected = append(affected, paths...)
 		if err != nil {
 			return affected, fmt.Errorf("snapshot: revert turn %d: %w", turn, err)
 		}
-		affected = append(affected, paths...)
 		if err := os.RemoveAll(turnDir); err != nil {
 			return affected, fmt.Errorf("snapshot: remove %s: %w", turnDir, err)
 		}
@@ -573,14 +709,16 @@ func (s *Store) RevertHistory(toTurn int) error {
 // path of the new session dir. Caller is responsible for switching to it.
 func (s *Store) ForkInto(toTurn int) (string, string, error) {
 	s.mu.Lock()
-	if !s.active {
+	defer func() {
+		forkIntoLockReleasedHook()
 		s.mu.Unlock()
+	}()
+	if !s.active {
 		return "", "", ErrNoSession
 	}
 	srcDir := s.dir
 	root := s.root
 	projectRoot := s.projectRoot
-	s.mu.Unlock()
 
 	newID, err := newSessionID()
 	if err != nil {
@@ -600,13 +738,13 @@ func (s *Store) ForkInto(toTurn int) (string, string, error) {
 		ts := strconv.Itoa(turn)
 		srcSnap := filepath.Join(srcDir, "snapshots", ts)
 		if info, err := os.Stat(srcSnap); err == nil && info.IsDir() {
-			if err := copyDir(srcSnap, filepath.Join(newSnapshots, ts)); err != nil {
+			if err := copyDirFunc(srcSnap, filepath.Join(newSnapshots, ts)); err != nil {
 				return "", "", fmt.Errorf("snapshot: fork: copy snapshots/%d: %w", turn, err)
 			}
 		}
 		srcTurn := filepath.Join(srcDir, "turns", ts)
 		if info, err := os.Stat(srcTurn); err == nil && info.IsDir() {
-			if err := copyDir(srcTurn, filepath.Join(newTurns, ts)); err != nil {
+			if err := copyDirFunc(srcTurn, filepath.Join(newTurns, ts)); err != nil {
 				return "", "", fmt.Errorf("snapshot: fork: copy turns/%d: %w", turn, err)
 			}
 		}
@@ -998,19 +1136,105 @@ func revertOneTurn(turnDir string) ([]string, error) {
 }
 
 func restoreOne(entryDir string, meta SnapshotMeta) error {
+	entryID := filepath.Base(entryDir)
+	restorePath, err := validateRestorePath(entryID, meta)
+	if err != nil {
+		return err
+	}
 	if !meta.Existed {
-		if err := os.Remove(meta.OriginalPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := safefs.RemoveLeaf(restorePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		return nil
 	}
-	if parent := filepath.Dir(meta.OriginalPath); parent != "" && parent != "." {
-		if err := os.MkdirAll(parent, 0o755); err != nil {
-			return fmt.Errorf("mkdir parent %s: %w", parent, err)
+	src := filepath.Join(entryDir, "original")
+	return restoreFile(src, restorePath)
+}
+
+func validateRestorePath(entryID string, meta SnapshotMeta) (string, error) {
+	if !meta.Existed {
+		return validateDeletePath(entryID, meta)
+	}
+	if meta.CanonicalPath == "" {
+		return validateLegacyRestorePath(entryID, meta.OriginalPath)
+	}
+	resolved, err := pathutil.ResolveFilePath(meta.OriginalPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve restore path %s: %w", meta.OriginalPath, err)
+	}
+	if resolved.CanonicalPath != meta.CanonicalPath {
+		return "", fmt.Errorf("canonical path changed from %s to %s", meta.CanonicalPath, resolved.CanonicalPath)
+	}
+	return meta.CanonicalPath, nil
+}
+
+func validateDeletePath(entryID string, meta SnapshotMeta) (string, error) {
+	if meta.CanonicalPath != "" {
+		return validateModernDeletePath(entryID, meta)
+	}
+	return "", fmt.Errorf("legacy delete refused: %s has no canonical proof", meta.OriginalPath)
+}
+
+func validateModernDeletePath(entryID string, meta SnapshotMeta) (string, error) {
+	if hashString(meta.CanonicalPath) != entryID {
+		return "", fmt.Errorf("modern delete refused: meta canonical path %q does not match entry id %s", meta.CanonicalPath, entryID)
+	}
+	absOriginal, err := filepath.Abs(meta.OriginalPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve delete path %s: %w", meta.OriginalPath, err)
+	}
+	resolvedParent, _, err := pathutil.ResolveAbsPath(filepath.Dir(absOriginal))
+	if err != nil {
+		return "", fmt.Errorf("resolve delete parent %s: %w", filepath.Dir(absOriginal), err)
+	}
+	resolvedPath := filepath.Join(resolvedParent, filepath.Base(absOriginal))
+	if resolvedPath != meta.CanonicalPath {
+		return "", fmt.Errorf("canonical path changed from %s to %s", meta.CanonicalPath, resolvedPath)
+	}
+	return meta.CanonicalPath, nil
+}
+
+func validateLegacyRestorePath(entryID, path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("legacy restore path is empty")
+	}
+	if !isLegacyEntryID(entryID) {
+		return "", fmt.Errorf("legacy snapshot entry id %q is invalid", entryID)
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve legacy restore path %s: %w", path, err)
+	}
+
+	resolved, err := pathutil.ResolveFilePath(absPath)
+	if err == nil {
+		if got := hashString(resolved.CanonicalPath); got == entryID {
+			return resolved.CanonicalPath, nil
+		} else if resolved.LeafExists {
+			return "", fmt.Errorf("legacy snapshot target hash changed from %s to %s", entryID, got)
 		}
 	}
-	src := filepath.Join(entryDir, "original")
-	return copyFile(src, meta.OriginalPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("resolve legacy restore path %s: %w", path, err)
+	}
+
+	cleanAbs := filepath.Clean(absPath)
+	if got := hashString(cleanAbs); got == entryID {
+		return cleanAbs, nil
+	}
+	return "", fmt.Errorf("legacy snapshot target missing and cannot be proven for %s", path)
+}
+
+func isLegacyEntryID(id string) bool {
+	if len(id) != 16 {
+		return false
+	}
+	for _, r := range id {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func readIntDirs(dir string) []int {
@@ -1077,11 +1301,47 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
+	return copyFromFile(in, dst)
+}
+
+func copyFromFile(in *os.File, dst string) error {
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
+func restoreFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	if info, err := os.Lstat(dst); err == nil {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("restore target is non-regular: %s (mode %s)", dst, info.Mode())
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat restore target %s: %w", dst, err)
+	}
+
+	out, _, err := safefs.OpenForWrite(dst, 0o644)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if err := out.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := out.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 	if _, err := io.Copy(out, in); err != nil {
 		return err
 	}

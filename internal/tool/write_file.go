@@ -3,10 +3,11 @@ package tool
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
 
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/safefs"
 )
 
 // SnapshotStore is the minimum surface WriteFileWithSnapshot and
@@ -14,6 +15,54 @@ import (
 type SnapshotStore interface {
 	Snapshot(turn int, absPath string) error
 	CurrentTurn() int
+}
+
+type resolvedSnapshotStore interface {
+	SnapshotResolved(turn int, originalPath, canonicalPath string) error
+}
+
+type transactionalSnapshotStore interface {
+	SnapshotResolvedEntry(turn int, originalPath, canonicalPath string) (entryID string, created bool, err error)
+	DiscardSnapshotEntry(turn int, entryID string) error
+	RetainSnapshotEntry(turn int, entryID string)
+}
+
+type snapshotEntry struct {
+	turn    int
+	entryID string
+	store   transactionalSnapshotStore
+}
+
+func snapshotFile(store SnapshotStore, turn int, originalPath, canonicalPath string) error {
+	if resolved, ok := store.(resolvedSnapshotStore); ok {
+		return resolved.SnapshotResolved(turn, originalPath, canonicalPath)
+	}
+	return store.Snapshot(turn, canonicalPath)
+}
+
+func snapshotFileForMutation(store SnapshotStore, turn int, originalPath, canonicalPath string) (snapshotEntry, error) {
+	if transactional, ok := store.(transactionalSnapshotStore); ok {
+		entryID, _, err := transactional.SnapshotResolvedEntry(turn, originalPath, canonicalPath)
+		if err != nil {
+			return snapshotEntry{}, err
+		}
+		return snapshotEntry{turn: turn, entryID: entryID, store: transactional}, nil
+	}
+	return snapshotEntry{}, snapshotFile(store, turn, originalPath, canonicalPath)
+}
+
+func discardUnmutatedSnapshot(entry snapshotEntry) error {
+	if entry.store == nil || entry.entryID == "" {
+		return nil
+	}
+	return entry.store.DiscardSnapshotEntry(entry.turn, entry.entryID)
+}
+
+func retainMutatedSnapshot(entry snapshotEntry) {
+	if entry.store == nil || entry.entryID == "" {
+		return
+	}
+	entry.store.RetainSnapshotEntry(entry.turn, entry.entryID)
 }
 
 // WriteFile implements the write_file tool with mtime enforcement
@@ -95,64 +144,197 @@ func (w *WriteFileWithSnapshot) Execute(_ context.Context, params map[string]any
 	if path == "" {
 		return "", fmt.Errorf("write_file: path is required")
 	}
-	absPath, err := filepath.Abs(path)
+	displayAbsPath, err := fileDisplayAbsPath(path)
 	if err != nil {
 		return "", fmt.Errorf("write_file: resolve path: %w", err)
 	}
-	if err := w.store.Snapshot(w.store.CurrentTurn(), absPath); err != nil {
-		return "", fmt.Errorf("write_file: snapshot: %w", err)
-	}
-	res, err := writeFileExecCommon(params, w.tracker, w.cfg)
+	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
+	securityPath, err := fileSecurityPath(params, path)
 	if err != nil {
+		return "", fmt.Errorf("write_file: resolve path: %w", err)
+	}
+	if err := preflightWriteSnapshotTarget(securityPath, w.tracker); err != nil {
 		return "", err
 	}
+	// The write path revalidates the approved target after snapshotting; if
+	// that pre-mutation validation fails, release only this tool's snapshot claim.
+	snapshot, err := snapshotFileForMutation(w.store, w.store.CurrentTurn(), displayAbsPath, securityPath)
+	if err != nil {
+		return "", fmt.Errorf("write_file: snapshot: %w", err)
+	}
+	res, mutationStarted, err := writeFileExecCommonForSnapshot(params, w.tracker, w.cfg)
+	if err != nil {
+		if !mutationStarted {
+			if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
+				return "", fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
+			}
+		} else {
+			retainMutatedSnapshot(snapshot)
+		}
+		return "", err
+	}
+	retainMutatedSnapshot(snapshot)
 	return res.Result, nil
 }
 
 // writeFileExecCommon is the shared implementation.
 func writeFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig) (*writeResult, error) {
+	res, _, err := writeFileExecCommonForSnapshot(params, tracker, cfg)
+	return res, err
+}
+
+func writeFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig) (*writeResult, bool, error) {
 	path, _ := params["path"].(string)
 	if path == "" {
-		return nil, fmt.Errorf("write_file: path is required")
+		return nil, false, fmt.Errorf("write_file: path is required")
 	}
 	content, _ := params["content"].(string)
 
-	absPath, err := filepath.Abs(path)
+	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
+	absPath, err := fileSecurityPath(params, path)
 	if err != nil {
-		return nil, fmt.Errorf("write_file: resolve path: %w", err)
+		return nil, false, fmt.Errorf("write_file: resolve path: %w", err)
 	}
 
-	// Check whether the target exists for read-before-write enforcement.
-	fileExists := false
-	if _, err := os.ReadFile(absPath); err == nil {
-		fileExists = true
-	} else if _, err := os.Stat(absPath); err == nil {
-		// File exists but couldn't be read (permissions, etc.).
-		// Don't block on this — if the file can't be read, write will fail anyway.
+	f, openedExisting, mutationStarted, err := openWriteTargetForMutation(absPath, tracker)
+	if err != nil {
+		return nil, mutationStarted, fmt.Errorf("write_file: %w", err)
 	}
+	defer f.Close()
 
-	// Mtime enforcement for existing files (overwrite requires read).
-	if fileExists && tracker != nil {
-		if err := tracker.WasReadCheck(absPath); err != nil {
-			return nil, err
-		}
+	if openedExisting {
+		mutationStarted = true
 	}
-
-	if dir := filepath.Dir(absPath); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("write_file: mkdir %s: %w", dir, err)
-		}
+	if err := f.Truncate(0); err != nil {
+		return nil, mutationStarted, fmt.Errorf("write_file: truncate: %w", err)
 	}
-	if err := os.WriteFile(absPath, []byte(content), 0o644); err != nil {
-		return nil, fmt.Errorf("write_file: %w", err)
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, mutationStarted, fmt.Errorf("write_file: seek: %w", err)
+	}
+	if _, err := f.Write([]byte(content)); err != nil {
+		return nil, mutationStarted, fmt.Errorf("write_file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return nil, mutationStarted, fmt.Errorf("write_file: sync: %w", err)
 	}
 
 	// Refresh mtime after successful write without creating read authorization.
 	if tracker != nil {
-		tracker.UpdateAfterWrite(absPath)
+		if info, err := f.Stat(); err == nil {
+			tracker.UpdateAfterWriteIdentity(absPath, FileIdentityFromFileInfoAndData(info, []byte(content)))
+		}
 	}
 
 	return &writeResult{
 		Result: fmt.Sprintf("Wrote %s.", path),
-	}, nil
+	}, mutationStarted, nil
+}
+
+func openWriteTarget(absPath string, tracker *FileTracker) (*os.File, bool, error) {
+	f, openedExisting, _, err := openWriteTargetForMutation(absPath, tracker)
+	return f, openedExisting, err
+}
+
+func openWriteTargetForMutation(absPath string, tracker *FileTracker) (*os.File, bool, bool, error) {
+	existed, err := ensureRegularExistingTarget(absPath)
+	if err != nil {
+		return nil, false, false, err
+	}
+	if tracker != nil && tracker.HasRead(absPath) {
+		f, err := safefs.OpenExisting(absPath, os.O_RDWR)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, false, false, &FileChangedError{Path: absPath}
+			}
+			return nil, false, false, err
+		}
+		if err := validateWriteIdentity(f, absPath, tracker); err != nil {
+			_ = f.Close()
+			return nil, false, false, err
+		}
+		return f, true, false, nil
+	}
+
+	f, openedExisting, err := safefs.OpenForWrite(absPath, 0o644)
+	if err != nil {
+		return nil, false, false, err
+	}
+	if openedExisting {
+		info, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return nil, false, false, fmt.Errorf("stat: %w", err)
+		}
+		if err := ensureRegularFileInfo(absPath, info); err != nil {
+			_ = f.Close()
+			return nil, false, false, err
+		}
+		if tracker != nil {
+			if err := validateWriteIdentity(f, absPath, tracker); err != nil {
+				_ = f.Close()
+				return nil, false, false, err
+			}
+		}
+	} else if existed {
+		_ = f.Close()
+		return nil, false, true, &FileChangedError{Path: absPath}
+	}
+	return f, openedExisting, !openedExisting, nil
+}
+
+func validateWriteIdentity(f *os.File, absPath string, tracker *FileTracker) error {
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat: %w", err)
+	}
+	if err := ensureRegularFileInfo(absPath, info); err != nil {
+		return err
+	}
+	identity, err := FileIdentityFromOpenFile(f, info)
+	if err != nil {
+		return fmt.Errorf("read identity: %w", err)
+	}
+	return tracker.WasReadCheckIdentity(absPath, identity)
+}
+
+func preflightWriteSnapshotTarget(absPath string, tracker *FileTracker) error {
+	existed, err := ensureRegularExistingTarget(absPath)
+	if err != nil {
+		return fmt.Errorf("write_file: %w", err)
+	}
+	if !existed {
+		if tracker != nil && tracker.HasRead(absPath) {
+			return &FileChangedError{Path: absPath}
+		}
+		return nil
+	}
+
+	if tracker != nil && tracker.HasRead(absPath) {
+		f, err := safefs.OpenExisting(absPath, os.O_RDWR)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return &FileChangedError{Path: absPath}
+			}
+			return fmt.Errorf("write_file: %w", err)
+		}
+		defer f.Close()
+		return validateWriteIdentity(f, absPath, tracker)
+	}
+
+	f, err := safefs.OpenExisting(absPath, os.O_RDWR)
+	if err != nil {
+		return fmt.Errorf("write_file: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("write_file: stat: %w", err)
+	}
+	if err := ensureRegularFileInfo(absPath, info); err != nil {
+		return fmt.Errorf("write_file: %w", err)
+	}
+	if tracker == nil {
+		return nil
+	}
+	return validateWriteIdentity(f, absPath, tracker)
 }

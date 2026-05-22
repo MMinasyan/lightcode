@@ -2,9 +2,12 @@ package snapshot
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -148,6 +151,524 @@ func TestSnapshotDeduplicatesSymlinkAndRealPath(t *testing.T) {
 				t.Fatalf("content = %q, want v1", got)
 			}
 		})
+	}
+}
+
+func TestSnapshotResolvedPreservesOriginalPathForListing(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	realPath := filepath.Join(projectDir, "file.txt")
+	linkPath := filepath.Join(projectDir, "link.txt")
+	if err := os.WriteFile(realPath, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	if err := store.SnapshotResolved(turn, linkPath, realPath); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := store.ListTurns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || len(entries[0].Files) != 1 {
+		t.Fatalf("ListTurns = %+v, want one snapshotted file", entries)
+	}
+	if got := entries[0].Files[0].OriginalPath; got != linkPath {
+		t.Fatalf("OriginalPath = %q, want requested path %q", got, linkPath)
+	}
+	if err := os.WriteFile(realPath, []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	affected, err := store.RevertCode(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(affected, []string{linkPath}) {
+		t.Fatalf("affected = %v, want original requested path %q", affected, linkPath)
+	}
+	if got, err := os.ReadFile(realPath); err != nil || string(got) != "v1" {
+		t.Fatalf("real file after revert = %q, %v; want v1", got, err)
+	}
+}
+
+func TestSnapshotResolvedEntryReportsCreatedOnlyForNewEntry(t *testing.T) {
+	store := newTestStore(t)
+	turn := store.BeginTurn()
+	path := filepath.Join(t.TempDir(), "file.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entryID, created, err := store.SnapshotResolvedEntry(turn, path, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entryID == "" || !created {
+		t.Fatalf("first SnapshotResolvedEntry = (%q, %v), want non-empty created entry", entryID, created)
+	}
+	entryID2, created, err := store.SnapshotResolvedEntry(turn, path, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entryID2 != entryID || created {
+		t.Fatalf("second SnapshotResolvedEntry = (%q, %v), want same existing entry %q", entryID2, created, entryID)
+	}
+	if err := store.DiscardSnapshotEntry(turn, entryID); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(filepath.Join(store.snapshotsDir, "1")); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 1 {
+		t.Fatalf("snapshot entries after one discard = %d, want one retained by second user", len(entries))
+	}
+	if err := store.DiscardSnapshotEntry(turn, entryID2); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(filepath.Join(store.snapshotsDir, "1")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("snapshot entries after discard = %d, want none", len(entries))
+	}
+}
+
+func TestSnapshotResolvedEntryRetainPreventsConcurrentDiscard(t *testing.T) {
+	store := newTestStore(t)
+	turn := store.BeginTurn()
+	path := filepath.Join(t.TempDir(), "file.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entryID, created, err := store.SnapshotResolvedEntry(turn, path, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("first SnapshotResolvedEntry was not created")
+	}
+	entryID2, created, err := store.SnapshotResolvedEntry(turn, path, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entryID2 != entryID || created {
+		t.Fatalf("second SnapshotResolvedEntry = (%q, %v), want same existing entry %q", entryID2, created, entryID)
+	}
+	store.RetainSnapshotEntry(turn, entryID2)
+	if err := store.DiscardSnapshotEntry(turn, entryID); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(filepath.Join(store.snapshotsDir, "1")); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 1 {
+		t.Fatalf("snapshot entries after retained discard = %d, want one", len(entries))
+	}
+}
+
+func TestSnapshotResolvedRetainsEntryAgainstLaterDiscard(t *testing.T) {
+	store := newTestStore(t)
+	turn := store.BeginTurn()
+	path := filepath.Join(t.TempDir(), "file.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SnapshotResolved(turn, path, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DiscardSnapshotEntry(turn, hashString(path)); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(filepath.Join(store.snapshotsDir, "1")); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 1 {
+		t.Fatalf("snapshot entries after discard of retained snapshot = %d, want one", len(entries))
+	}
+}
+
+func TestRevertRefusesCanonicalPathReplacedBySymlink(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	originalTarget := filepath.Join(projectDir, "original.txt")
+	repointedTarget := filepath.Join(projectDir, "repointed.txt")
+	linkPath := filepath.Join(projectDir, "link.txt")
+	if err := os.WriteFile(originalTarget, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(repointedTarget, []byte("other"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(originalTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	if err := store.SnapshotResolved(turn, linkPath, originalTarget); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(originalTarget, []byte("after"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(linkPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(repointedTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+
+	if err == nil || !strings.Contains(err.Error(), "canonical path changed") {
+		t.Fatalf("RevertCode error = %v, want canonical path changed error", err)
+	}
+	if len(affected) != 0 {
+		t.Fatalf("affected = %v, want none on refused restore", affected)
+	}
+	if got, err := os.ReadFile(originalTarget); err != nil || string(got) != "after" {
+		t.Fatalf("original target = %q, %v; want after", got, err)
+	}
+	if got, err := os.ReadFile(repointedTarget); err != nil || string(got) != "other" {
+		t.Fatalf("repointed target = %q, %v; want other", got, err)
+	}
+}
+
+func TestRevertOldSnapshotMetaFallsBackToOriginalPath(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	path := filepath.Join(projectDir, "file.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	entryDir := filepath.Join(store.snapshotsDir, "1", hashString(path))
+	if err := os.MkdirAll(entryDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(path, filepath.Join(entryDir, "original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: path, Existed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if turn != 1 {
+		t.Fatalf("turn = %d, want 1", turn)
+	}
+	if err := os.WriteFile(path, []byte("after"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(affected, []string{path}) {
+		t.Fatalf("affected = %v, want [%s]", affected, path)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "before" {
+		t.Fatalf("restored content = %q, %v; want before", got, err)
+	}
+}
+
+func TestRevertOldSnapshotMetaRestoresMissingRegularPathWithOldHash(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	path := filepath.Join(projectDir, "file.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	entryDir := filepath.Join(store.snapshotsDir, "1", hashString(path))
+	if err := os.MkdirAll(entryDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(path, filepath.Join(entryDir, "original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: path, Existed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if turn != 1 {
+		t.Fatalf("turn = %d, want 1", turn)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(affected, []string{path}) {
+		t.Fatalf("affected = %v, want [%s]", affected, path)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "before" {
+		t.Fatalf("restored content = %q, %v; want before", got, err)
+	}
+}
+
+func TestRevertOldSnapshotMetaRestoresCurrentSymlinkTargetWhenHashMatches(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	originalTarget := filepath.Join(projectDir, "original.txt")
+	linkPath := filepath.Join(projectDir, "link.txt")
+	if err := os.WriteFile(originalTarget, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(originalTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	entryDir := filepath.Join(store.snapshotsDir, "1", hashString(originalTarget))
+	if err := os.MkdirAll(entryDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(originalTarget, filepath.Join(entryDir, "original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: linkPath, Existed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if turn != 1 {
+		t.Fatalf("turn = %d, want 1", turn)
+	}
+	if err := os.WriteFile(originalTarget, []byte("after"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(affected, []string{linkPath}) {
+		t.Fatalf("affected = %v, want [%s]", affected, linkPath)
+	}
+	if got, err := os.ReadFile(originalTarget); err != nil || string(got) != "before" {
+		t.Fatalf("restored content = %q, %v; want before", got, err)
+	}
+}
+
+func TestRevertOldSnapshotMetaRefusesGoneSymlinkTarget(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	originalTarget := filepath.Join(projectDir, "original.txt")
+	linkPath := filepath.Join(projectDir, "link.txt")
+	if err := os.WriteFile(originalTarget, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(originalTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	entryDir := filepath.Join(store.snapshotsDir, "1", hashString(originalTarget))
+	if err := os.MkdirAll(entryDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(originalTarget, filepath.Join(entryDir, "original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: linkPath, Existed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if turn != 1 {
+		t.Fatalf("turn = %d, want 1", turn)
+	}
+	if err := os.Remove(linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+
+	if err == nil || !strings.Contains(err.Error(), "target missing and cannot be proven") {
+		t.Fatalf("RevertCode error = %v, want missing legacy target refusal", err)
+	}
+	if len(affected) != 0 {
+		t.Fatalf("affected = %v, want none on refused restore", affected)
+	}
+}
+
+func TestRevertOldSnapshotMetaRefusesCurrentSymlinkPath(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	originalTarget := filepath.Join(projectDir, "original.txt")
+	repointedTarget := filepath.Join(projectDir, "repointed.txt")
+	linkPath := filepath.Join(projectDir, "link.txt")
+	if err := os.WriteFile(originalTarget, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(repointedTarget, []byte("other"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(originalTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	entryDir := filepath.Join(store.snapshotsDir, "1", hashString(originalTarget))
+	if err := os.MkdirAll(entryDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(originalTarget, filepath.Join(entryDir, "original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: linkPath, Existed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if turn != 1 {
+		t.Fatalf("turn = %d, want 1", turn)
+	}
+	if err := os.WriteFile(originalTarget, []byte("after"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(linkPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(repointedTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+
+	if err == nil || !strings.Contains(err.Error(), "legacy snapshot target hash changed") {
+		t.Fatalf("RevertCode error = %v, want legacy hash-change refusal", err)
+	}
+	if len(affected) != 0 {
+		t.Fatalf("affected = %v, want none on refused restore", affected)
+	}
+	if got, err := os.ReadFile(originalTarget); err != nil || string(got) != "after" {
+		t.Fatalf("original target = %q, %v; want after", got, err)
+	}
+	if got, err := os.ReadFile(repointedTarget); err != nil || string(got) != "other" {
+		t.Fatalf("repointed target = %q, %v; want other", got, err)
+	}
+}
+
+func TestRevertModernSnapshotRefusesFinalTargetSwappedToSymlink(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	target := filepath.Join(projectDir, "target.txt")
+	secret := filepath.Join(projectDir, "secret.txt")
+	if err := os.WriteFile(target, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	if err := store.SnapshotResolved(turn, target, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, target); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+
+	if err == nil || !strings.Contains(err.Error(), "canonical path changed") {
+		t.Fatalf("RevertCode error = %v, want canonical path changed error", err)
+	}
+	if len(affected) != 0 {
+		t.Fatalf("affected = %v, want none on refused restore", affected)
+	}
+	if got, err := os.ReadFile(secret); err != nil || string(got) != "secret" {
+		t.Fatalf("secret target = %q, %v; want unchanged", got, err)
+	}
+}
+
+func TestRevertExistedFalseRemovesSymlinkLeafOnly(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	createdPath := filepath.Join(projectDir, "created.txt")
+	secret := filepath.Join(projectDir, "secret.txt")
+	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	if err := store.Snapshot(turn, createdPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, createdPath); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(affected, []string{createdPath}) {
+		t.Fatalf("affected = %v, want [%s]", affected, createdPath)
+	}
+	if _, err := os.Lstat(createdPath); !os.IsNotExist(err) {
+		t.Fatalf("created symlink should be removed, lstat err = %v", err)
+	}
+	if got, err := os.ReadFile(secret); err != nil || string(got) != "secret" {
+		t.Fatalf("secret target = %q, %v; want unchanged", got, err)
+	}
+}
+
+func TestRevertExistedFalseRefusesRepointedParent(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	originalRoot := filepath.Join(projectDir, "original")
+	repointedRoot := filepath.Join(projectDir, "repointed")
+	linkRoot := filepath.Join(projectDir, "link")
+	for _, dir := range []string{originalRoot, repointedRoot} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(originalRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+	requestedPath := filepath.Join(linkRoot, "created.txt")
+	originalTarget := filepath.Join(originalRoot, "created.txt")
+	repointedTarget := filepath.Join(repointedRoot, "created.txt")
+
+	turn := store.BeginTurn()
+	if err := store.SnapshotResolved(turn, requestedPath, originalTarget); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(originalTarget, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(repointedTarget, []byte("repointed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(linkRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(repointedRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+
+	if err == nil || !strings.Contains(err.Error(), "canonical path changed") {
+		t.Fatalf("RevertCode error = %v, want canonical path changed error", err)
+	}
+	if len(affected) != 0 {
+		t.Fatalf("affected = %v, want none on refused delete", affected)
+	}
+	if got, err := os.ReadFile(originalTarget); err != nil || string(got) != "original" {
+		t.Fatalf("original target = %q, %v; want preserved", got, err)
+	}
+	if got, err := os.ReadFile(repointedTarget); err != nil || string(got) != "repointed" {
+		t.Fatalf("repointed target = %q, %v; want preserved", got, err)
 	}
 }
 
@@ -479,4 +1000,252 @@ func mustAppendMessage(t *testing.T, store *Store, turn int, msg string) {
 	if err := store.AppendMessage(turn, []byte(msg)); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// When revertOneTurn fails mid-turn, RevertCode must include the
+// already-restored paths from that turn in the affected list so callers
+// can surface accurate partial-state reporting.
+func TestPR11Closure_RevertCodePartialStateIsReported(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	validPath := filepath.Join(projectDir, "valid.txt")
+	invalidPath := filepath.Join(projectDir, "invalid.txt")
+	secret := filepath.Join(projectDir, "secret.txt")
+	if err := os.WriteFile(validPath, []byte("valid-before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(invalidPath, []byte("invalid-before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	turnDir := filepath.Join(store.snapshotsDir, fmt.Sprintf("%d", turn))
+
+	// Hand-construct two entries with controlled IDs so the "valid" one
+	// sorts first lexically and revertOneTurn processes it before the
+	// "invalid" one.
+	entryValid := filepath.Join(turnDir, "0000000000000001")
+	if err := os.MkdirAll(entryValid, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(validPath, filepath.Join(entryValid, "original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(entryValid, "meta.json"),
+		SnapshotMeta{OriginalPath: validPath, CanonicalPath: validPath, Existed: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	entryInvalid := filepath.Join(turnDir, "ffffffffffffffff")
+	if err := os.MkdirAll(entryInvalid, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(invalidPath, filepath.Join(entryInvalid, "original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(entryInvalid, "meta.json"),
+		SnapshotMeta{OriginalPath: invalidPath, CanonicalPath: invalidPath, Existed: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mutate invalidPath so its restore fails validateRestorePath.
+	if err := os.Remove(invalidPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, invalidPath); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+	if err == nil {
+		t.Fatal("RevertCode succeeded; want partial-restore error")
+	}
+	containsValid := false
+	for _, p := range affected {
+		if p == validPath {
+			containsValid = true
+			break
+		}
+	}
+	if !containsValid {
+		t.Fatalf("affected = %v, want to include %q (already-restored entry before mid-turn failure)", affected, validPath)
+	}
+}
+
+// ForkInto must hold s.mu through the copy loop so a concurrent
+// RevertCode or Close cannot mutate the source mid-copy and produce a
+// fork inconsistent with the locked snapshot. The copyDirFunc package
+// variable is the test seam used to deterministically pause ForkInto
+// inside the locked copy region.
+func TestPR11Closure_ForkIntoSerializesWithConcurrentMutation(t *testing.T) {
+	t.Run("revert_concurrent", func(t *testing.T) {
+		store := newTestStore(t)
+		for i := 0; i < 5; i++ {
+			turn := store.BeginTurn()
+			target := filepath.Join(t.TempDir(), fmt.Sprintf("turn%d.txt", turn))
+			if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SnapshotResolved(turn, target, target); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.MarkTurnComplete(turn); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		firstCopyStarted := make(chan struct{})
+		resumeFirstCopy := make(chan struct{})
+		var once sync.Once
+		origCopyDir := copyDirFunc
+		defer func() { copyDirFunc = origCopyDir }()
+		copyDirFunc = func(src, dst string) error {
+			once.Do(func() {
+				close(firstCopyStarted)
+				<-resumeFirstCopy
+			})
+			return origCopyDir(src, dst)
+		}
+
+		forkUnlockedSig := make(chan struct{}, 1)
+		prevUnlockHook := forkIntoLockReleasedHook
+		defer func() { forkIntoLockReleasedHook = prevUnlockHook }()
+		forkIntoLockReleasedHook = func() {
+			select {
+			case forkUnlockedSig <- struct{}{}:
+			default:
+			}
+		}
+
+		type forkResult struct {
+			newDir string
+			err    error
+		}
+		forkResults := make(chan forkResult, 1)
+		go func() {
+			_, newDir, err := store.ForkInto(5)
+			forkResults <- forkResult{newDir, err}
+		}()
+		<-firstCopyStarted
+
+		// Deterministic blocking check: under the bug, ForkInto unlocks
+		// s.mu before entering the copy loop, so by the time the copy hook
+		// fires the unlock-hook has already signaled forkUnlockedSig. Under
+		// the fix, the unlock happens only after the copy completes, so
+		// forkUnlockedSig is empty here.
+		select {
+		case <-forkUnlockedSig:
+			t.Fatal("ForkInto released s.mu before copy completed — lock not held through copy loop")
+		default:
+		}
+
+		revertDone := make(chan error, 1)
+		go func() {
+			_, err := store.RevertCode(2)
+			revertDone <- err
+		}()
+
+		close(resumeFirstCopy)
+		fr := <-forkResults
+		if fr.err != nil {
+			t.Fatalf("ForkInto error: %v", fr.err)
+		}
+		if revErr := <-revertDone; revErr != nil {
+			t.Fatalf("RevertCode error: %v", revErr)
+		}
+
+		// Fork output must be consistent with the pre-revert source state.
+		wantTurns := []int{1, 2, 3, 4, 5}
+		if got := readIntDirs(filepath.Join(fr.newDir, "snapshots")); !reflect.DeepEqual(got, wantTurns) {
+			t.Fatalf("forked snapshots = %v, want %v (RevertCode-concurrent fork lost turns)", got, wantTurns)
+		}
+		if got := readIntDirs(filepath.Join(fr.newDir, "turns")); !reflect.DeepEqual(got, wantTurns) {
+			t.Fatalf("forked turns = %v, want %v (RevertCode-concurrent fork lost turns)", got, wantTurns)
+		}
+	})
+
+	t.Run("close_concurrent", func(t *testing.T) {
+		store := newTestStore(t)
+		// Begin some turns but do not mark complete so Close's RemoveAll
+		// branch fires (Close removes the session dir when no complete
+		// turn exists).
+		for i := 0; i < 3; i++ {
+			turn := store.BeginTurn()
+			target := filepath.Join(t.TempDir(), fmt.Sprintf("turn%d.txt", turn))
+			if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SnapshotResolved(turn, target, target); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		firstCopyStarted := make(chan struct{})
+		resumeFirstCopy := make(chan struct{})
+		var once sync.Once
+		origCopyDir := copyDirFunc
+		defer func() { copyDirFunc = origCopyDir }()
+		copyDirFunc = func(src, dst string) error {
+			once.Do(func() {
+				close(firstCopyStarted)
+				<-resumeFirstCopy
+			})
+			return origCopyDir(src, dst)
+		}
+
+		forkUnlockedSig := make(chan struct{}, 1)
+		prevUnlockHook := forkIntoLockReleasedHook
+		defer func() { forkIntoLockReleasedHook = prevUnlockHook }()
+		forkIntoLockReleasedHook = func() {
+			select {
+			case forkUnlockedSig <- struct{}{}:
+			default:
+			}
+		}
+
+		type forkResult struct {
+			newDir string
+			err    error
+		}
+		forkResults := make(chan forkResult, 1)
+		go func() {
+			_, newDir, err := store.ForkInto(3)
+			forkResults <- forkResult{newDir, err}
+		}()
+		<-firstCopyStarted
+
+		select {
+		case <-forkUnlockedSig:
+			t.Fatal("ForkInto released s.mu before copy completed — lock not held through copy loop")
+		default:
+		}
+
+		closeDone := make(chan error, 1)
+		go func() {
+			_, err := store.Close()
+			closeDone <- err
+		}()
+
+		close(resumeFirstCopy)
+		fr := <-forkResults
+		if fr.err != nil {
+			t.Fatalf("ForkInto error: %v", fr.err)
+		}
+		if closeErr := <-closeDone; closeErr != nil {
+			t.Fatalf("Close error: %v", closeErr)
+		}
+
+		// Fork output must reflect the pre-Close source state; Close's
+		// RemoveAll of the source dir must not corrupt the forked session.
+		wantTurns := []int{1, 2, 3}
+		if got := readIntDirs(filepath.Join(fr.newDir, "snapshots")); !reflect.DeepEqual(got, wantTurns) {
+			t.Fatalf("forked snapshots = %v, want %v (Close-concurrent fork lost turns)", got, wantTurns)
+		}
+		if got := readIntDirs(filepath.Join(fr.newDir, "turns")); !reflect.DeepEqual(got, wantTurns) {
+			t.Fatalf("forked turns = %v, want %v (Close-concurrent fork lost turns)", got, wantTurns)
+		}
+	})
 }

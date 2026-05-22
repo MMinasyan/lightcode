@@ -1,6 +1,8 @@
 package permission
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -161,6 +163,158 @@ func TestEvaluateCompoundCommand(t *testing.T) {
 	}
 }
 
+func TestEvaluateBackgroundCommandRequiresEachSideAllowed(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(echo *)"},
+		Deny:  []string{"run_command(rm *)"},
+	}
+
+	d := Evaluate(rules, "run_command", "echo ok & rm -rf /tmp/lightcode-review-victim", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate background command = %d, want DecisionDeny", d)
+	}
+
+	d = Evaluate(rules, "run_command", "echo one & echo two", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate allowed background command = %d, want DecisionAsk (bare & forces prompt)", d)
+	}
+}
+
+func TestEvaluateQuotedAmpersandStaysSingleCommand(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(echo *)"},
+	}
+
+	d := Evaluate(rules, "run_command", "echo 'a & b'", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate single-quoted ampersand = %d, want DecisionAllow", d)
+	}
+
+	d = Evaluate(rules, "run_command", "echo \"a & b\"", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate double-quoted ampersand = %d, want DecisionAllow", d)
+	}
+}
+
+func TestEvaluateRedirectionAmpersandStaysSingleCommand(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(echo *)"},
+	}
+
+	for _, command := range []string{
+		"echo ok 2>&1",
+		"echo ok >&2",
+		"echo ok 2>&-",
+	} {
+		d := Evaluate(rules, "run_command", command, "/project", "/home/user", "/project")
+		if d != DecisionAllow {
+			t.Fatalf("Evaluate %q = %d, want DecisionAllow", command, d)
+		}
+	}
+}
+
+func TestEvaluateUnsafeRedirectionDowngradesAllowToAsk(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(echo *)", "run_command(cat *)"},
+	}
+	for _, command := range []string{
+		"echo ok > file",
+		"echo ok >> file",
+		"echo ok 1>file",
+		"echo ok 2>err",
+		"echo ok >&file",
+		"echo ok &> file",
+		"cat < file",
+		"cat <<EOF",
+		"cat <<<EOF",
+		"cat <> file",
+	} {
+		t.Run(command, func(t *testing.T) {
+			d := Evaluate(rules, "run_command", command, "/project", "/home/user", "/project")
+			if d != DecisionAsk {
+				t.Fatalf("Evaluate %q = %d, want DecisionAsk", command, d)
+			}
+		})
+	}
+}
+
+func TestEvaluateQuotedRedirectionIsLiteral(t *testing.T) {
+	d := Evaluate(Rules{
+		Allow: []string{"run_command(echo *)", "run_command(grep *)"},
+	}, "run_command", "echo '>' && grep -E 'foo|bar' file", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate quoted redirection command = %d, want DecisionAllow", d)
+	}
+}
+
+func TestEvaluateMultilineCommandRequiresEachLineAllowed(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(cat *)"},
+	}
+
+	d := Evaluate(rules, "run_command", "cat README.md\nrm -rf ~/", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate multiline = %d, want DecisionAsk", d)
+	}
+}
+
+func TestEvaluateNewlineSeparatedCommandsIndependently(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(npm run *)"},
+		Deny:  []string{"run_command(rm *)"},
+	}
+
+	d := Evaluate(rules, "run_command", "npm run build\nrm -rf /tmp/junk", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate LF-separated = %d, want DecisionDeny", d)
+	}
+
+	d = Evaluate(rules, "run_command", "npm run build\nnpm run test", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate LF-separated all-allow = %d, want DecisionAllow", d)
+	}
+}
+
+func TestEvaluateCarriageReturnSeparatedCommandsIndependently(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(npm run *)"},
+		Deny:  []string{"run_command(rm *)"},
+	}
+
+	d := Evaluate(rules, "run_command", "npm run build\rrm -rf /tmp/junk", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate CR-separated = %d, want DecisionDeny", d)
+	}
+
+	d = Evaluate(rules, "run_command", "npm run build\rnpm run test", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate CR-separated all-allow = %d, want DecisionAllow", d)
+	}
+}
+
+func TestEvaluateQuotedNewlineExactRuleStaysSingleCommand(t *testing.T) {
+	command := "printf 'a\nb'"
+	rules := Rules{
+		Allow: []string{"run_command(" + command + ")"},
+	}
+
+	d := Evaluate(rules, "run_command", command, "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate quoted newline exact = %d, want DecisionAllow", d)
+	}
+}
+
+func TestEvaluateQuotedNewlineWildcardRuleStaysSingleCommand(t *testing.T) {
+	rules := Rules{
+		Allow: []string{"run_command(printf *)"},
+	}
+
+	d := Evaluate(rules, "run_command", "printf \"a\nb\"", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate quoted newline wildcard = %d, want DecisionAllow", d)
+	}
+}
+
 func TestEvaluateCommandWithSubstitutionReturnsAsk(t *testing.T) {
 	rules := Rules{
 		Allow: []string{"run_command(*)"},
@@ -239,6 +393,73 @@ func TestCheckLocalExplicitAskPreventsGlobal(t *testing.T) {
 	}
 }
 
+func TestCheckCanonicalProjectRootLocalDenyOverridesGlobalAllow(t *testing.T) {
+	realRoot := t.TempDir()
+	linkRoot := filepath.Join(t.TempDir(), "project-link")
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(realRoot, "src", "secret.txt")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	local := Rules{Deny: []string{"read_file(/src/secret.txt)"}}
+	global := Rules{Allow: []string{"read_file(/src/**)"}}
+
+	d := Check(local, global, "read_file", path, linkRoot, linkRoot, linkRoot)
+	if d != DecisionDeny {
+		t.Fatalf("Check = %d, want DecisionDeny", d)
+	}
+}
+
+func TestCheckCanonicalProjectRootExplicitAskBlocksGlobalAllow(t *testing.T) {
+	realRoot := t.TempDir()
+	linkRoot := filepath.Join(t.TempDir(), "project-link")
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(linkRoot, "src", "file.txt")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	local := Rules{Ask: []string{"read_file(/src/file.txt)"}}
+	global := Rules{Allow: []string{"read_file(/src/**)"}}
+
+	d := Check(local, global, "read_file", path, linkRoot, linkRoot, linkRoot)
+	if d != DecisionAsk {
+		t.Fatalf("Check = %d, want DecisionAsk", d)
+	}
+}
+
+func TestEvaluateProjectRuleDoesNotAllowSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	allowedDir := filepath.Join(root, "allowed")
+	if err := os.MkdirAll(allowedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(allowedDir, "link")
+	if err := os.Symlink(outside, linkDir); err != nil {
+		t.Fatal(err)
+	}
+	requested := filepath.Join(linkDir, "new.txt")
+
+	d := Evaluate(Rules{
+		Allow: []string{"write_file(/allowed/**)"},
+	}, "write_file", requested, root, root, root)
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate = %d, want DecisionAsk", d)
+	}
+}
+
 func TestCheckBothEmptyDefaultsToAsk(t *testing.T) {
 	d := Check(Rules{}, Rules{}, "write_file", "/any", "/project", "/home", "/project")
 	if d != DecisionAsk {
@@ -292,6 +513,8 @@ func TestDecomposeCommandCompound(t *testing.T) {
 		{"a || b", []string{"a", "b"}},
 		{"a ; b", []string{"a", "b"}},
 		{"a | b", []string{"a", "b"}},
+		{"a\nb", []string{"a", "b"}},
+		{"a\rb", []string{"a", "b"}},
 		{"a && b || c ; d | e", []string{"a", "b", "c", "d", "e"}},
 	}
 	for _, tt := range tests {
@@ -307,6 +530,41 @@ func TestDecomposeCommandCompound(t *testing.T) {
 				t.Fatalf("DecomposeCommand(%q)[%d] = %q, want %q", tt.cmd, i, got[i], tt.want[i])
 			}
 		}
+	}
+}
+
+func TestDecomposeCommandEscapedQuotesDoNotHideOperators(t *testing.T) {
+	cmd := `echo \" && touch /tmp/lightcode-owned \"`
+	got, err := DecomposeCommand(cmd)
+	if err != nil {
+		t.Fatalf("DecomposeCommand(%q): %v", cmd, err)
+	}
+	want := []string{`echo \"`, `touch /tmp/lightcode-owned \"`}
+	if len(got) != len(want) {
+		t.Fatalf("DecomposeCommand(%q) = %v, want %v", cmd, got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("DecomposeCommand(%q)[%d] = %q, want %q", cmd, i, got[i], want[i])
+		}
+	}
+}
+
+func TestEvaluateEscapedQuotesDoNotHideOperators(t *testing.T) {
+	cmd := `echo \" && touch /tmp/lightcode-owned \"`
+	d := Evaluate(Rules{
+		Allow: []string{"run_command(echo *)"},
+	}, "run_command", cmd, "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate escaped quote command = %d, want DecisionAsk", d)
+	}
+
+	d = Evaluate(Rules{
+		Allow: []string{"run_command(echo *)"},
+		Deny:  []string{"run_command(touch *)"},
+	}, "run_command", cmd, "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate escaped quote denied command = %d, want DecisionDeny", d)
 	}
 }
 
@@ -329,6 +587,24 @@ func TestDecomposeCommandQuotedSemicolon(t *testing.T) {
 	}
 	if len(parts) != 1 {
 		t.Fatalf("quoted semicolon should not split, got %v", parts)
+	}
+}
+
+func TestDecomposeCommandQuotedNewline(t *testing.T) {
+	parts, err := DecomposeCommand("printf 'a\nb'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 1 || parts[0] != "printf 'a\nb'" {
+		t.Fatalf("quoted single newline should not split, got %q", parts)
+	}
+
+	parts, err = DecomposeCommand("printf \"a\nb\"")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 1 || parts[0] != "printf \"a\nb\"" {
+		t.Fatalf("quoted double newline should not split, got %q", parts)
 	}
 }
 
@@ -427,6 +703,167 @@ func TestResolvePathCwdRelative(t *testing.T) {
 	}
 }
 
+func TestPR11Closure_BareAmpersandRequiresPrompt(t *testing.T) {
+	allowEcho := Rules{Allow: []string{"run_command(echo *)"}}
+	for _, command := range []string{
+		"echo one & echo two",
+		"echo one &",
+		"echo one & echo two & echo three",
+	} {
+		d := Evaluate(allowEcho, "run_command", command, "/project", "/home/user", "/project")
+		if d != DecisionAsk {
+			t.Fatalf("Evaluate %q = %d, want DecisionAsk (bare & forces prompt)", command, d)
+		}
+	}
+
+	withDeny := Rules{
+		Allow: []string{"run_command(echo *)"},
+		Deny:  []string{"run_command(rm *)"},
+	}
+	d := Evaluate(withDeny, "run_command", "echo ok & rm -rf x", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate %q with inner deny = %d, want DecisionDeny", "echo ok & rm -rf x", d)
+	}
+
+	withAsk := Rules{
+		Allow: []string{"run_command(echo *)"},
+		Ask:   []string{"run_command(rm *)"},
+	}
+	d = Evaluate(withAsk, "run_command", "echo ok & rm -rf x", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate %q with inner ask = %d, want DecisionAsk", "echo ok & rm -rf x", d)
+	}
+}
+
+func TestPR11Closure_MalformedDenyOrAskFailsClosed(t *testing.T) {
+	denyMalformed := Rules{
+		Deny:  []string{"this is not a valid rule"},
+		Allow: []string{"run_command(*)"},
+	}
+	d := Evaluate(denyMalformed, "run_command", "rm -rf x", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate with malformed Deny = %d, want DecisionDeny (fail-closed)", d)
+	}
+
+	askMalformed := Rules{
+		Ask:   []string{"this is not a valid rule"},
+		Allow: []string{"run_command(*)"},
+	}
+	d = Evaluate(askMalformed, "run_command", "rm -rf x", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate with malformed Ask = %d, want DecisionAsk (fail-closed)", d)
+	}
+
+	// Two-level Check: a malformed local deny/ask must NOT silently fall
+	// through to a broad global allow. Fail-closed at the local level wins.
+	localMalformedDeny := Rules{Deny: []string{"this is not a valid rule"}}
+	globalBroadAllow := Rules{Allow: []string{"run_command(*)"}}
+	d = Check(localMalformedDeny, globalBroadAllow,
+		"run_command", "rm -rf x", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Check local-malformed-deny + global allow = %d, want DecisionDeny", d)
+	}
+
+	localMalformedAsk := Rules{Ask: []string{"this is not a valid rule"}}
+	d = Check(localMalformedAsk, globalBroadAllow,
+		"run_command", "rm -rf x", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Check local-malformed-ask + global allow = %d, want DecisionAsk", d)
+	}
+}
+
+func TestPR11Closure_PipeAmpersandPermissionRespectsBothSides(t *testing.T) {
+	// |& must behave as | for permission analysis: both sides required to allow.
+	rules := Rules{Allow: []string{"run_command(echo *)"}}
+	d := Evaluate(rules, "run_command", "echo a |& cat", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate %q = %d, want DecisionAsk (cat unallowed)", "echo a |& cat", d)
+	}
+
+	bothAllowed := Rules{Allow: []string{"run_command(echo *)", "run_command(cat)"}}
+	d = Evaluate(bothAllowed, "run_command", "echo a |& cat", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate %q with both sides allowed = %d, want DecisionAllow", "echo a |& cat", d)
+	}
+
+	denyRight := Rules{
+		Allow: []string{"run_command(echo *)", "run_command(cat)"},
+		Deny:  []string{"run_command(cat)"},
+	}
+	d = Evaluate(denyRight, "run_command", "echo a |& cat", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate %q with denied right side = %d, want DecisionDeny", "echo a |& cat", d)
+	}
+
+	// Baseline: ordinary | with the same rules must give the same decisions,
+	// proving |& is semantically treated as | (not just parsed into segments).
+	d = Evaluate(bothAllowed, "run_command", "echo a | cat", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate %q baseline | with both sides allowed = %d, want DecisionAllow", "echo a | cat", d)
+	}
+	d = Evaluate(denyRight, "run_command", "echo a | cat", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate %q baseline | with denied right side = %d, want DecisionDeny", "echo a | cat", d)
+	}
+}
+
+func TestPR11Closure_ProcessPermissionRulesRoundTrip(t *testing.T) {
+	literal := Rules{Allow: []string{"process(process:abc)"}}
+	d := Evaluate(literal, "process", "process:abc", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate literal process rule = %d, want DecisionAllow", d)
+	}
+
+	wildcard := Rules{Allow: []string{"process(process:*)"}}
+	d = Evaluate(wildcard, "process", "process:abc", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate wildcard process rule = %d, want DecisionAllow", d)
+	}
+
+	deny := Rules{
+		Allow: []string{"process(process:*)"},
+		Deny:  []string{"process(process:abc)"},
+	}
+	d = Evaluate(deny, "process", "process:abc", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate deny precedence = %d, want DecisionDeny", d)
+	}
+
+	ask := Rules{
+		Allow: []string{"process(process:*)"},
+		Ask:   []string{"process(process:abc)"},
+	}
+	d = Evaluate(ask, "process", "process:abc", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate ask precedence = %d, want DecisionAsk", d)
+	}
+
+	// The list action carries no id and uses the bare arg "process".
+	bareAllow := Rules{Allow: []string{"process(process)"}}
+	d = Evaluate(bareAllow, "process", "process", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate bare process allow = %d, want DecisionAllow", d)
+	}
+
+	bareDeny := Rules{
+		Allow: []string{"process(*)"},
+		Deny:  []string{"process(process)"},
+	}
+	d = Evaluate(bareDeny, "process", "process", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate bare process deny precedence = %d, want DecisionDeny", d)
+	}
+
+	bareAsk := Rules{
+		Allow: []string{"process(*)"},
+		Ask:   []string{"process(process)"},
+	}
+	d = Evaluate(bareAsk, "process", "process", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate bare process ask precedence = %d, want DecisionAsk", d)
+	}
+}
+
 func TestIsSensitivePath(t *testing.T) {
 	sensitive := []string{
 		"/home/user/.env",
@@ -438,8 +875,8 @@ func TestIsSensitivePath(t *testing.T) {
 		"/home/user/credentials.yaml",
 	}
 	for _, p := range sensitive {
-		if !isSensitivePath(p) {
-			t.Fatalf("isSensitivePath(%q) = false, want true", p)
+		if !IsSensitivePath(p) {
+			t.Fatalf("IsSensitivePath(%q) = false, want true", p)
 		}
 	}
 
@@ -449,8 +886,8 @@ func TestIsSensitivePath(t *testing.T) {
 		"/home/user/.gitignore",
 	}
 	for _, p := range normal {
-		if isSensitivePath(p) {
-			t.Fatalf("isSensitivePath(%q) = true, want false", p)
+		if IsSensitivePath(p) {
+			t.Fatalf("IsSensitivePath(%q) = true, want false", p)
 		}
 	}
 }

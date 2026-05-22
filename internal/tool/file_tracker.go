@@ -1,19 +1,34 @@
 package tool
 
 import (
+	"crypto/sha256"
+	"io"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 )
 
-var statFile = os.Stat
-
 // ReadRecord records a read_file call for deduplication and edit enforcement.
 type ReadRecord struct {
-	Path   string
-	Offset int
-	Limit  int
-	Mtime  time.Time
+	Path     string
+	Offset   int
+	Limit    int
+	Identity FileIdentity
+	Mtime    time.Time
+}
+
+// FileIdentity records the kernel identity of a file observed through an
+// already-open descriptor.
+type FileIdentity struct {
+	Mtime   time.Time
+	Ctime   time.Time
+	Dev     uint64
+	Ino     uint64
+	Mode    os.FileMode
+	Hash    [32]byte
+	Valid   bool
+	HasHash bool
 }
 
 // FileTracker tracks which files have been read and their mtimes.
@@ -22,68 +37,60 @@ type ReadRecord struct {
 type FileTracker struct {
 	mu         sync.Mutex
 	generation uint64
-	reads      []ReadRecord         // ordered by time, earliest first
-	mtimes     map[string]time.Time // path -> last read mtime
+	reads      []ReadRecord            // ordered by time, earliest first
+	identities map[string]FileIdentity // path -> last read identity
 }
 
 // NewFileTracker returns an empty FileTracker.
 func NewFileTracker() *FileTracker {
 	return &FileTracker{
-		mtimes: make(map[string]time.Time),
+		identities: make(map[string]FileIdentity),
 	}
 }
 
-// Track records that a file was read at the given mtime.
-func (t *FileTracker) Track(path string, offset, limit int) {
+// TrackIdentity records a read using identity metadata from the already-opened file.
+func (t *FileTracker) TrackIdentity(path string, offset, limit int, identity FileIdentity) {
 	t.mu.Lock()
 	generation := t.generation
 	t.mu.Unlock()
+	t.trackIdentity(path, offset, limit, identity, generation)
+}
 
-	info, err := statFile(path)
-	mtime := time.Time{}
-	if err == nil {
-		mtime = info.ModTime()
-	}
-
+func (t *FileTracker) trackIdentity(path string, offset, limit int, identity FileIdentity, generation uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if generation != t.generation {
 		return
 	}
-	t.mtimes[path] = mtime
+	t.identities[path] = identity
 	t.reads = append(t.reads, ReadRecord{
-		Path:   path,
-		Offset: offset,
-		Limit:  limit,
-		Mtime:  mtime,
+		Path:     path,
+		Offset:   offset,
+		Limit:    limit,
+		Identity: identity,
+		Mtime:    identity.Mtime,
 	})
 }
 
-// UpdateAfterWrite refreshes the tracked mtime for a file that was already
-// read-authorized. Writes must not create read authorization by themselves.
-func (t *FileTracker) UpdateAfterWrite(path string) {
+// UpdateAfterWriteIdentity refreshes the tracked identity using metadata from
+// the already-opened file after a successful write.
+func (t *FileTracker) UpdateAfterWriteIdentity(path string, identity FileIdentity) {
 	t.mu.Lock()
 	generation := t.generation
-	if _, ok := t.mtimes[path]; !ok {
-		t.mu.Unlock()
-		return
-	}
 	t.mu.Unlock()
+	t.updateAfterWriteIdentity(path, identity, generation)
+}
 
-	info, err := statFile(path)
-	if err != nil {
-		return
-	}
-
+func (t *FileTracker) updateAfterWriteIdentity(path string, identity FileIdentity, generation uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if generation != t.generation {
 		return
 	}
-	if _, ok := t.mtimes[path]; !ok {
+	if _, ok := t.identities[path]; !ok {
 		return
 	}
-	t.mtimes[path] = info.ModTime()
+	t.identities[path] = identity
 }
 
 // Reset clears all tracked reads. Call this when visible conversation history
@@ -93,24 +100,22 @@ func (t *FileTracker) Reset() {
 	defer t.mu.Unlock()
 	t.generation++
 	t.reads = nil
-	t.mtimes = make(map[string]time.Time)
+	t.identities = make(map[string]FileIdentity)
 }
 
-// IsDuplicate checks if path+offset+limit was already read AND
-// the file hasn't changed on disk since that read.
-func (t *FileTracker) IsDuplicate(path string, offset, limit int) (bool, ReadRecord) {
-	info, err := statFile(path)
-	if err != nil {
-		return false, ReadRecord{}
-	}
-	currentMtime := info.ModTime()
+// IsDuplicateMtime checks duplicate status against metadata from an already-opened file.
+func (t *FileTracker) IsDuplicateMtime(path string, offset, limit int, currentMtime time.Time) (bool, ReadRecord) {
+	return t.IsDuplicateIdentity(path, offset, limit, FileIdentity{Mtime: currentMtime})
+}
 
+// IsDuplicateIdentity checks duplicate status against identity metadata from an already-opened file.
+func (t *FileTracker) IsDuplicateIdentity(path string, offset, limit int, current FileIdentity) (bool, ReadRecord) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for i := len(t.reads) - 1; i >= 0; i-- {
 		r := t.reads[i]
 		if r.Path == path && r.Offset == offset && r.Limit == limit {
-			if r.Mtime.Equal(currentMtime) {
+			if identityMatches(r.Identity, current) {
 				return true, r
 			}
 			return false, ReadRecord{}
@@ -124,24 +129,31 @@ func (t *FileTracker) IsDuplicate(path string, offset, limit int) (bool, ReadRec
 func (t *FileTracker) WasRead(path string) (time.Time, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	mtime, ok := t.mtimes[path]
-	return mtime, ok
+	identity, ok := t.identities[path]
+	return identity.Mtime, ok
 }
 
-// WasReadCheck checks if path was read and hasn't changed since.
-// Returns nil if OK, or an error describing the problem.
-func (t *FileTracker) WasReadCheck(path string) error {
+func (t *FileTracker) HasRead(path string) bool {
 	t.mu.Lock()
-	lastReadMtime, wasRead := t.mtimes[path]
+	defer t.mu.Unlock()
+	_, ok := t.identities[path]
+	return ok
+}
+
+// WasReadCheckMtime checks read authorization against metadata from an already-opened file.
+func (t *FileTracker) WasReadCheckMtime(path string, currentMtime time.Time) error {
+	return t.WasReadCheckIdentity(path, FileIdentity{Mtime: currentMtime})
+}
+
+// WasReadCheckIdentity checks read authorization against identity metadata from an already-opened file.
+func (t *FileTracker) WasReadCheckIdentity(path string, current FileIdentity) error {
+	t.mu.Lock()
+	lastReadIdentity, wasRead := t.identities[path]
 	t.mu.Unlock()
 	if !wasRead {
 		return &ReadRequiredError{Path: path}
 	}
-	info, err := statFile(path)
-	if err != nil {
-		return &FileChangedError{Path: path}
-	}
-	if !info.ModTime().Equal(lastReadMtime) {
+	if !identityMatches(lastReadIdentity, current) {
 		return &FileChangedError{Path: path}
 	}
 	return nil
@@ -157,11 +169,69 @@ func (t *FileTracker) PopulateFromMessages(messages []PersistedMessage) {
 	defer t.mu.Unlock()
 	for _, m := range messages {
 		if m.Role == "tool" && m.ToolName == "read_file" && m.Path != "" {
-			if _, exists := t.mtimes[m.Path]; !exists {
-				t.mtimes[m.Path] = time.Time{} // zero = "was read, but not in this session"
+			if _, exists := t.identities[m.Path]; !exists {
+				t.identities[m.Path] = FileIdentity{} // no identity = force reread
 			}
 		}
 	}
+}
+
+func FileIdentityFromFileInfo(info os.FileInfo) FileIdentity {
+	if info == nil {
+		return FileIdentity{}
+	}
+	identity := FileIdentity{
+		Mtime: info.ModTime(),
+		Mode:  info.Mode(),
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		identity.Dev = uint64(stat.Dev)
+		identity.Ino = uint64(stat.Ino)
+		identity.Ctime = time.Unix(stat.Ctim.Sec, stat.Ctim.Nsec)
+		identity.Valid = true
+	}
+	return identity
+}
+
+func FileIdentityFromFileInfoAndData(info os.FileInfo, data []byte) FileIdentity {
+	identity := FileIdentityFromFileInfo(info)
+	identity.Hash = sha256.Sum256(data)
+	identity.HasHash = true
+	return identity
+}
+
+func FileIdentityFromOpenFile(f *os.File, info os.FileInfo) (FileIdentity, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return FileIdentity{}, err
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return FileIdentity{}, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return FileIdentity{}, err
+	}
+	return FileIdentityFromFileInfoAndData(info, data), nil
+}
+
+func identityMatches(expected, current FileIdentity) bool {
+	if expected.Valid || current.Valid {
+		if !(expected.Valid &&
+			current.Valid &&
+			expected.Dev == current.Dev &&
+			expected.Ino == current.Ino &&
+			expected.Mode == current.Mode &&
+			expected.Mtime.Equal(current.Mtime) &&
+			expected.Ctime.Equal(current.Ctime) &&
+			current.Mode.IsRegular()) {
+			return false
+		}
+		if expected.HasHash {
+			return current.HasHash && expected.Hash == current.Hash
+		}
+		return true
+	}
+	return expected.Mtime.Equal(current.Mtime)
 }
 
 // PersistedMessage is a simplified message for tracker population.

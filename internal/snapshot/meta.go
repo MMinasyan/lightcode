@@ -55,12 +55,15 @@ type SessionMeta struct {
 }
 
 // SnapshotMeta is written alongside each snapshotted file. OriginalPath
-// is stored so Revert can restore the file without reversing the path
-// hash. Existed is false when the snapshot represents a file that did
-// not exist before the turn — on revert, that file is deleted.
+// is the user-facing path shown in history and affected-file output.
+// CanonicalPath is the hidden restore target for new snapshots. Old
+// metadata without CanonicalPath falls back to OriginalPath.
+// Existed is false when the snapshot represents a file that did not
+// exist before the turn — on revert, that file is deleted.
 type SnapshotMeta struct {
-	OriginalPath string `json:"original_path"`
-	Existed      bool   `json:"existed"`
+	OriginalPath  string `json:"original_path"`
+	CanonicalPath string `json:"canonical_path,omitempty"`
+	Existed       bool   `json:"existed"`
 }
 
 // CompactionRecord is persisted to compaction.json when context

@@ -3,7 +3,10 @@ package tool
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/permission"
@@ -62,9 +65,9 @@ func TestPermWrappedDenyShortCircuitsInnerAndAsk(t *testing.T) {
 	wrapped := WrapWithPermission(inner, rulesCheck(root, permission.Rules{
 		Allow: []string{"write_file(/blocked.txt)"},
 		Deny:  []string{"write_file(/blocked.txt)"},
-	}), func(string, string) bool {
+	}), func(context.Context, permission.Request) permission.ResponseAction {
 		askCalls++
-		return true
+		return permission.ResponseAllow
 	})
 
 	result, err := wrapped.Execute(context.Background(), map[string]any{"path": path})
@@ -90,12 +93,12 @@ func TestPermWrappedAskAllowsExecution(t *testing.T) {
 	askCalls := 0
 	wrapped := WrapWithPermission(inner, rulesCheck(root, permission.Rules{
 		Ask: []string{"edit_file(/ask.txt)"},
-	}), func(toolName, arg string) bool {
+	}), func(_ context.Context, req permission.Request) permission.ResponseAction {
 		askCalls++
-		if toolName != "edit_file" || arg != path {
-			t.Fatalf("ask got (%q, %q), want (edit_file, %q)", toolName, arg, path)
+		if req.ToolName != "edit_file" || req.Arg != path {
+			t.Fatalf("ask got (%q, %q), want (edit_file, %q)", req.ToolName, req.Arg, path)
 		}
-		return true
+		return permission.ResponseAllow
 	})
 
 	result, err := wrapped.Execute(context.Background(), map[string]any{"path": path})
@@ -121,9 +124,9 @@ func TestPermWrappedAskDenySkipsInner(t *testing.T) {
 	askCalls := 0
 	wrapped := WrapWithPermission(inner, rulesCheck(root, permission.Rules{
 		Ask: []string{"edit_file(/ask.txt)"},
-	}), func(string, string) bool {
+	}), func(context.Context, permission.Request) permission.ResponseAction {
 		askCalls++
-		return false
+		return permission.ResponseDeny
 	})
 
 	result, err := wrapped.Execute(context.Background(), map[string]any{"path": path})
@@ -149,12 +152,12 @@ func TestPermWrappedNoRuleDefaultsToAsk(t *testing.T) {
 	askCalls := 0
 	wrapped := WrapWithPermission(inner, rulesCheck(root, permission.Rules{
 		Allow: []string{"read_file(/other.txt)"},
-	}), func(toolName, arg string) bool {
+	}), func(_ context.Context, req permission.Request) permission.ResponseAction {
 		askCalls++
-		if toolName != "read_file" || arg != path {
-			t.Fatalf("ask got (%q, %q), want (read_file, %q)", toolName, arg, path)
+		if req.ToolName != "read_file" || req.Arg != path {
+			t.Fatalf("ask got (%q, %q), want (read_file, %q)", req.ToolName, req.Arg, path)
 		}
-		return false
+		return permission.ResponseDeny
 	})
 
 	_, err := wrapped.Execute(context.Background(), map[string]any{"path": path})
@@ -167,6 +170,117 @@ func TestPermWrappedNoRuleDefaultsToAsk(t *testing.T) {
 	}
 	if inner.calls != 0 {
 		t.Fatalf("inner calls = %d, want 0", inner.calls)
+	}
+}
+
+func TestPermWrappedChecksCanonicalPathAndPromptsWithResolvedTarget(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, ".env")
+	if err := os.WriteFile(target, []byte("SECRET=1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "notes.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	inner := &recordingTool{name: "read_file", result: "should not run"}
+	var checkedArg string
+	var request permission.Request
+	wrapped := WrapWithPermission(inner, func(toolName, arg string) permission.Decision {
+		checkedArg = arg
+		return permission.Check(permission.Rules{
+			Allow: []string{"read_file(/**)"},
+		}, permission.Rules{}, toolName, arg, root, root, root)
+	}, func(_ context.Context, req permission.Request) permission.ResponseAction {
+		request = req
+		return permission.ResponseDeny
+	})
+
+	_, err := wrapped.Execute(context.Background(), map[string]any{
+		"path":               link,
+		canonicalPathParam:   filepath.Join(root, "spoofed.txt"),
+		"unrelated_metadata": "kept",
+	})
+
+	if !errors.Is(err, ErrDenied) {
+		t.Fatalf("Execute error = %v, want ErrDenied", err)
+	}
+	if checkedArg != target {
+		t.Fatalf("check arg = %q, want canonical target %q", checkedArg, target)
+	}
+	if request.Arg != link {
+		t.Fatalf("request arg = %q, want requested path %q", request.Arg, link)
+	}
+	if request.ResolvedArg != target {
+		t.Fatalf("request resolved arg = %q, want canonical target %q", request.ResolvedArg, target)
+	}
+	if inner.calls != 0 {
+		t.Fatalf("inner calls = %d, want 0", inner.calls)
+	}
+}
+
+func TestPermWrappedInjectsCanonicalPathForInnerFileTool(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	if err := os.WriteFile(target, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	inner := &recordingTool{name: "read_file", result: "read"}
+	wrapped := WrapWithPermission(inner, func(toolName, arg string) permission.Decision {
+		if arg != target {
+			t.Fatalf("check arg = %q, want %q", arg, target)
+		}
+		return permission.DecisionAllow
+	}, denyIfAsked(t))
+
+	_, err := wrapped.Execute(context.Background(), map[string]any{
+		"path":               link,
+		canonicalPathParam:   filepath.Join(root, "spoofed.txt"),
+		"unrelated_metadata": "kept",
+	})
+
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
+	}
+	if inner.lastParams["path"] != link {
+		t.Fatalf("inner path = %v, want requested path %q", inner.lastParams["path"], link)
+	}
+	if got := canonicalPathFromParams(inner.lastParams); got != target {
+		t.Fatalf("inner canonical path = %q, want %q", got, target)
+	}
+	if _, ok := inner.lastParams[canonicalPathParam].(canonicalPathValue); !ok {
+		t.Fatalf("inner canonical metadata type = %T, want canonicalPathValue", inner.lastParams[canonicalPathParam])
+	}
+	if inner.lastParams["unrelated_metadata"] != "kept" {
+		t.Fatalf("inner unrelated metadata = %v, want kept", inner.lastParams["unrelated_metadata"])
+	}
+}
+
+func TestModelSuppliedCanonicalPathParamIsIgnored(t *testing.T) {
+	root := t.TempDir()
+	realPath := filepath.Join(root, "real.txt")
+	if err := os.WriteFile(realPath, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spoofedPath := filepath.Join(root, "spoofed.txt")
+	params := map[string]any{
+		"path":             realPath,
+		canonicalPathParam: spoofedPath,
+	}
+
+	if got := PermissionCheckArg("read_file", params); got != realPath {
+		t.Fatalf("PermissionCheckArg = %q, want real path %q", got, realPath)
+	}
+	got, err := fileSecurityPath(params, realPath)
+	if err != nil {
+		t.Fatalf("fileSecurityPath error = %v", err)
+	}
+	if got != realPath {
+		t.Fatalf("fileSecurityPath = %q, want real path %q", got, realPath)
 	}
 }
 
@@ -256,8 +370,53 @@ func rulesCheck(root string, rules permission.Rules) CheckFunc {
 
 func denyIfAsked(t *testing.T) AskFunc {
 	t.Helper()
-	return func(toolName, arg string) bool {
-		t.Fatalf("ask called for %s %s", toolName, arg)
-		return false
+	return func(_ context.Context, req permission.Request) permission.ResponseAction {
+		t.Fatalf("ask called for %s %s", req.ToolName, req.Arg)
+		return permission.ResponseDeny
+	}
+}
+
+// Every fileSecurityPath call site in write_file.go and edit_file.go must
+// be preceded within 3 lines by a comment containing "re-resolve canonical"
+// so the defense-in-depth intent is documented at each call site and a
+// future refactor cannot silently elide the re-resolution.
+func TestPR11Closure_FileSecurityPathDoubleValidationCommented(t *testing.T) {
+	_, file, _, _ := runtime.Caller(0)
+	dir := filepath.Dir(file)
+	totalSites := 0
+	for _, src := range []string{"write_file.go", "edit_file.go"} {
+		path := filepath.Join(dir, src)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(string(data), "\n")
+		var callSites []int
+		for i, line := range lines {
+			if strings.Contains(line, "fileSecurityPath(params") {
+				callSites = append(callSites, i)
+			}
+		}
+		if len(callSites) != 2 {
+			t.Errorf("%s: expected 2 fileSecurityPath call sites, got %d", src, len(callSites))
+			continue
+		}
+		totalSites += len(callSites)
+		for _, idx := range callSites {
+			commented := false
+			for j := idx - 3; j < idx && j >= 0; j++ {
+				if strings.Contains(lines[j], "re-resolve canonical") {
+					commented = true
+					break
+				}
+			}
+			if !commented {
+				t.Errorf("fileSecurityPath at %s:%d lacks // re-resolve canonical comment in preceding 3 lines: %q",
+					src, idx+1, strings.TrimSpace(lines[idx]))
+			}
+		}
+	}
+	if totalSites != 4 {
+		t.Fatalf("expected 4 fileSecurityPath call sites total across write_file.go + edit_file.go, got %d", totalSites)
 	}
 }
