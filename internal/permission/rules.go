@@ -328,10 +328,10 @@ type commandAnalysis struct {
 }
 
 type commandSegmentAnalysis struct {
-	variants    []string
-	children    []commandSegmentAnalysis
-	transparent bool
-	unsupported bool
+	variants      []string
+	allowVariants []string
+	children      []commandSegmentAnalysis
+	unsupported   bool
 }
 
 func evaluateCommandAnalysis(rules Rules, analysis commandAnalysis, ctx evalContext) Decision {
@@ -373,8 +373,10 @@ func analyzeCommand(command string) commandAnalysis {
 }
 
 func analyzeCommandSegment(segment shellparse.Segment) commandSegmentAnalysis {
+	surfaceVariants := commandVariants(segment.Text, segment.Normalized)
 	analysis := commandSegmentAnalysis{
-		variants: commandVariants(segment.Text, segment.Normalized),
+		variants:      surfaceVariants,
+		allowVariants: surfaceVariants,
 	}
 	if segment.UnsafeExpansion || hasUnsafeRedirection(segment) {
 		analysis.unsupported = true
@@ -384,8 +386,8 @@ func analyzeCommandSegment(segment shellparse.Segment) commandSegmentAnalysis {
 	}
 	effective := analyzeArgvCommand(segment.Argv)
 	analysis.variants = mergeCommandVariants(analysis.variants, effective.variants...)
+	analysis.allowVariants = mergeCommandVariants(analysis.allowVariants, effective.allowVariants...)
 	analysis.children = append(analysis.children, effective.children...)
-	analysis.transparent = effective.transparent
 	if effective.unsupported {
 		analysis.unsupported = true
 	}
@@ -398,12 +400,11 @@ func analyzeArgvCommand(argv []string) commandSegmentAnalysis {
 		return analysis
 	}
 	if stripped := stripLeadingAssignments(argv); len(stripped) != len(argv) {
-		analysis.transparent = true
 		if len(stripped) == 0 {
 			return analysis
 		}
 		analysis.variants = append(analysis.variants, normalizedArgv(stripped))
-		analysis.merge(analyzeArgvCommand(stripped))
+		analysis.mergeInspection(analyzeArgvCommand(stripped))
 		return analysis
 	}
 
@@ -414,7 +415,6 @@ func analyzeArgvCommand(argv []string) commandSegmentAnalysis {
 	}
 	switch name {
 	case "command":
-		analysis.transparent = true
 		if len(argv) < 2 {
 			return analysis
 		}
@@ -429,9 +429,9 @@ func analyzeArgvCommand(argv []string) commandSegmentAnalysis {
 			return analysis
 		}
 		analysis.variants = append(analysis.variants, normalizedArgv(next))
+		analysis.allowVariants = append(analysis.allowVariants, normalizedArgv(next))
 		analysis.merge(analyzeArgvCommand(next))
 	case "env":
-		analysis.transparent = true
 		next, ok := unwrapEnvArgv(argv[1:])
 		if !ok {
 			analysis.unsupported = true
@@ -441,9 +441,8 @@ func analyzeArgvCommand(argv []string) commandSegmentAnalysis {
 			return analysis
 		}
 		analysis.variants = append(analysis.variants, normalizedArgv(next))
-		analysis.merge(analyzeArgvCommand(next))
+		analysis.mergeInspection(analyzeArgvCommand(next))
 	case "sh", "bash", "dash", "zsh":
-		analysis.transparent = true
 		script, ok := shellScriptArg(argv)
 		if !ok {
 			analysis.unsupported = true
@@ -461,10 +460,16 @@ func analyzeArgvCommand(argv []string) commandSegmentAnalysis {
 
 func (analysis *commandSegmentAnalysis) merge(other commandSegmentAnalysis) {
 	analysis.variants = mergeCommandVariants(analysis.variants, other.variants...)
+	analysis.allowVariants = mergeCommandVariants(analysis.allowVariants, other.allowVariants...)
 	analysis.children = append(analysis.children, other.children...)
-	if other.transparent {
-		analysis.transparent = true
+	if other.unsupported {
+		analysis.unsupported = true
 	}
+}
+
+func (analysis *commandSegmentAnalysis) mergeInspection(other commandSegmentAnalysis) {
+	analysis.variants = mergeCommandVariants(analysis.variants, other.variants...)
+	analysis.children = append(analysis.children, other.children...)
 	if other.unsupported {
 		analysis.unsupported = true
 	}
@@ -635,17 +640,10 @@ func commandSegmentAllowed(rules []string, segment commandSegmentAnalysis, ctx e
 	if segment.unsupported {
 		return false
 	}
-	if len(segment.children) > 0 {
-		for _, child := range segment.children {
-			if !commandSegmentAllowed(rules, child, ctx) {
-				return false
-			}
-		}
-		if segment.transparent {
-			return true
-		}
+	if commandVariantsMatchRules(rules, segment.allowVariants, ctx) {
+		return true
 	}
-	return commandVariantsMatchRules(rules, segment.variants, ctx)
+	return false
 }
 
 func hasUnsafeRedirection(segment shellparse.Segment) bool {

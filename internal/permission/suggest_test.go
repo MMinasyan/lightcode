@@ -16,6 +16,9 @@ func TestSuggestRunCommandBash(t *testing.T) {
 	if suggestions[0].Rule != "run_command(bash -c 'echo hello')" {
 		t.Fatalf("first suggestion = %q", suggestions[0].Rule)
 	}
+	if got := Evaluate(Rules{Allow: []string{suggestions[0].Rule}}, "run_command", "bash -c 'echo hello'", "/project", "/home/user", "/project"); got != DecisionAllow {
+		t.Fatalf("Evaluate with first suggestion = %d, want DecisionAllow", got)
+	}
 
 	// Should have progressive wildcards
 	lastIdx := len(suggestions) - 1
