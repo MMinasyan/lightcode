@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestOpenExistingRefusesSymlinkLeaf(t *testing.T) {
@@ -50,6 +52,18 @@ func TestOpenForWriteCreatesParentsAndRefusesSymlinkParent(t *testing.T) {
 	}
 }
 
+func TestOpenForWriteRefusesFIFOLeaf(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fifo")
+	if err := unix.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+	f, _, err := OpenForWrite(path, 0o644)
+	if err == nil {
+		f.Close()
+		t.Fatal("OpenForWrite succeeded on FIFO leaf")
+	}
+}
+
 func TestRemoveLeafUnlinksSymlinkItself(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target.txt")
@@ -69,5 +83,39 @@ func TestRemoveLeafUnlinksSymlinkItself(t *testing.T) {
 	data, err := os.ReadFile(target)
 	if err != nil || string(data) != "content" {
 		t.Fatalf("target content = %q, %v; want unchanged", data, err)
+	}
+}
+
+func TestRemoveLeafRemovesEmptyDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "empty")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveLeaf(dir); err != nil {
+		t.Fatalf("RemoveLeaf(empty dir) = %v, want nil", err)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty dir lstat err = %v, want not exist", err)
+	}
+}
+
+func TestRemoveLeafRefusesNonEmptyDirectoryAndPreservesChild(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nonempty")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(dir, "file.txt")
+	if err := os.WriteFile(child, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveLeaf(dir); err == nil {
+		t.Fatal("RemoveLeaf(non-empty dir) = nil, want refusal")
+	}
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		t.Fatalf("non-empty dir stat = %v, isDir = %v; want intact directory", err, err == nil && info.IsDir())
+	}
+	data, err := os.ReadFile(child)
+	if err != nil || string(data) != "content" {
+		t.Fatalf("non-empty dir child content = %q, %v; want unchanged", data, err)
 	}
 }

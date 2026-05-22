@@ -36,8 +36,12 @@ func OpenForWrite(path string, perm os.FileMode) (*os.File, bool, error) {
 	}
 	defer closeFD(parent)
 
-	fd, err := unix.Openat(parent, base, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(parent, base, unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err == nil {
+		if err := requireRegularFD(fd, path); err != nil {
+			closeFD(fd)
+			return nil, false, err
+		}
 		return os.NewFile(uintptr(fd), path), true, nil
 	}
 	if err != unix.ENOENT {
@@ -52,9 +56,13 @@ func OpenForWrite(path string, perm os.FileMode) (*os.File, bool, error) {
 		return nil, false, &os.PathError{Op: "openat", Path: path, Err: err}
 	}
 
-	fd, err = unix.Openat(parent, base, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err = unix.Openat(parent, base, unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, false, &os.PathError{Op: "openat", Path: path, Err: err}
+	}
+	if err := requireRegularFD(fd, path); err != nil {
+		closeFD(fd)
+		return nil, false, err
 	}
 	return os.NewFile(uintptr(fd), path), true, nil
 }
@@ -71,6 +79,12 @@ func RemoveLeaf(path string) error {
 	}
 	defer closeFD(parent)
 	if err := unix.Unlinkat(parent, base, 0); err != nil {
+		if err == unix.EISDIR || err == unix.EPERM {
+			if dirErr := unix.Unlinkat(parent, base, unix.AT_REMOVEDIR); dirErr != nil {
+				return &os.PathError{Op: "unlinkat", Path: path, Err: dirErr}
+			}
+			return nil
+		}
 		return &os.PathError{Op: "unlinkat", Path: path, Err: err}
 	}
 	return nil
@@ -117,6 +131,17 @@ func openParent(path string, createDirs bool, dirPerm os.FileMode) (int, string,
 
 func closeFD(fd int) {
 	_ = unix.Close(fd)
+}
+
+func requireRegularFD(fd int, path string) error {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return &os.PathError{Op: "fstat", Path: path, Err: err}
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("safefs: non-regular file target: %s", path)
+	}
+	return nil
 }
 
 func splitAbs(path string) []string {

@@ -1070,7 +1070,11 @@ func validateDeletePath(entryID string, meta SnapshotMeta) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve legacy restore path %s: %w", meta.OriginalPath, err)
 	}
-	return filepath.Clean(absPath), nil
+	cleanAbs := filepath.Clean(absPath)
+	if got := hashString(cleanAbs); got != entryID {
+		return "", fmt.Errorf("legacy snapshot target hash changed from %s to %s", entryID, got)
+	}
+	return cleanAbs, nil
 }
 
 func validateLegacyRestorePath(entryID, path string) (string, error) {
@@ -1086,11 +1090,12 @@ func validateLegacyRestorePath(entryID, path string) (string, error) {
 	}
 
 	resolved, err := pathutil.ResolveFilePath(absPath)
-	if err == nil && resolved.LeafExists {
-		if got := hashString(resolved.CanonicalPath); got != entryID {
+	if err == nil {
+		if got := hashString(resolved.CanonicalPath); got == entryID {
+			return resolved.CanonicalPath, nil
+		} else if resolved.LeafExists {
 			return "", fmt.Errorf("legacy snapshot target hash changed from %s to %s", entryID, got)
 		}
-		return resolved.CanonicalPath, nil
 	}
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("resolve legacy restore path %s: %w", path, err)
@@ -1200,6 +1205,14 @@ func restoreFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
+
+	if info, err := os.Lstat(dst); err == nil {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("restore target is non-regular: %s (mode %s)", dst, info.Mode())
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat restore target %s: %w", dst, err)
+	}
 
 	out, _, err := safefs.OpenForWrite(dst, 0o644)
 	if err != nil {
