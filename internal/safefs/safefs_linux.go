@@ -79,15 +79,36 @@ func RemoveLeaf(path string) error {
 	}
 	defer closeFD(parent)
 	if err := unix.Unlinkat(parent, base, 0); err != nil {
-		if err == unix.EISDIR || err == unix.EPERM {
-			if dirErr := unix.Unlinkat(parent, base, unix.AT_REMOVEDIR); dirErr != nil {
-				return &os.PathError{Op: "unlinkat", Path: path, Err: dirErr}
+		if err == unix.EISDIR {
+			return removeDirectoryLeaf(parent, base, path)
+		}
+		if err == unix.EPERM {
+			isDir, statErr := isDirectoryLeaf(parent, base, path)
+			if statErr != nil {
+				return statErr
 			}
-			return nil
+			if isDir {
+				return removeDirectoryLeaf(parent, base, path)
+			}
 		}
 		return &os.PathError{Op: "unlinkat", Path: path, Err: err}
 	}
 	return nil
+}
+
+func removeDirectoryLeaf(parent int, base, path string) error {
+	if err := unix.Unlinkat(parent, base, unix.AT_REMOVEDIR); err != nil {
+		return &os.PathError{Op: "unlinkat", Path: path, Err: err}
+	}
+	return nil
+}
+
+func isDirectoryLeaf(parent int, base, path string) (bool, error) {
+	var st unix.Stat_t
+	if err := unix.Fstatat(parent, base, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return false, &os.PathError{Op: "fstatat", Path: path, Err: err}
+	}
+	return st.Mode&unix.S_IFMT == unix.S_IFDIR, nil
 }
 
 func openParent(path string, createDirs bool, dirPerm os.FileMode) (int, string, error) {

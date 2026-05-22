@@ -215,9 +215,8 @@ func ruleMatches(r parsedRule, toolName, arg string, ctx evalContext) bool {
 		return matchCommand(r.pattern, arg)
 	}
 	absPattern := ctx.resolvePath(r.pattern)
-	if isFiletool(toolName) {
+	if isFileTool(toolName) {
 		absPattern = pathutil.ResolvePathPattern(absPattern)
-		arg = pathutil.ResolvePathPattern(arg)
 	}
 	return matchGlob(absPattern, arg)
 }
@@ -255,8 +254,9 @@ func evaluate(rules Rules, toolName, arg string, ctx evalContext) Decision {
 
 func evaluateSingle(rules Rules, toolName, arg string, ctx evalContext) Decision {
 	sensitiveArg := arg
-	if isFiletool(toolName) {
+	if isFileTool(toolName) {
 		sensitiveArg = pathutil.ResolvePathPattern(arg)
+		arg = sensitiveArg
 	}
 	if evaluateRules(rules.Deny, toolName, arg, ctx) {
 		return DecisionDeny
@@ -264,7 +264,7 @@ func evaluateSingle(rules Rules, toolName, arg string, ctx evalContext) Decision
 	if evaluateRules(rules.Ask, toolName, arg, ctx) {
 		return DecisionAsk
 	}
-	if isFiletool(toolName) && isSensitivePath(sensitiveArg) {
+	if isFileTool(toolName) && isSensitivePath(sensitiveArg) {
 		return DecisionAsk
 	}
 	if evaluateRules(rules.Allow, toolName, arg, ctx) {
@@ -273,7 +273,7 @@ func evaluateSingle(rules Rules, toolName, arg string, ctx evalContext) Decision
 	return DecisionAsk
 }
 
-func isFiletool(toolName string) bool {
+func isFileTool(toolName string) bool {
 	return toolName == "read_file" || toolName == "write_file" || toolName == "edit_file"
 }
 
@@ -680,6 +680,9 @@ func hasExplicitMatch(rules Rules, toolName, arg string, ctx evalContext) bool {
 		return commandRulesMatch(rules.Allow, analysis, ctx) ||
 			commandRulesMatch(rules.Deny, analysis, ctx) ||
 			commandRulesMatch(rules.Ask, analysis, ctx)
+	}
+	if isFileTool(toolName) {
+		arg = pathutil.ResolvePathPattern(arg)
 	}
 	return evaluateRules(rules.Allow, toolName, arg, ctx) ||
 		evaluateRules(rules.Deny, toolName, arg, ctx) ||
