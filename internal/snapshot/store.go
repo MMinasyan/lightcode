@@ -1158,7 +1158,7 @@ func validateRestorePath(entryID string, meta SnapshotMeta) (string, error) {
 
 func validateDeletePath(entryID string, meta SnapshotMeta) (string, error) {
 	if meta.CanonicalPath != "" {
-		return meta.CanonicalPath, nil
+		return validateModernDeletePath(meta)
 	}
 	if !isLegacyEntryID(entryID) {
 		return "", fmt.Errorf("legacy snapshot entry id %q is invalid", entryID)
@@ -1172,6 +1172,22 @@ func validateDeletePath(entryID string, meta SnapshotMeta) (string, error) {
 		return "", fmt.Errorf("legacy snapshot target hash changed from %s to %s", entryID, got)
 	}
 	return cleanAbs, nil
+}
+
+func validateModernDeletePath(meta SnapshotMeta) (string, error) {
+	absOriginal, err := filepath.Abs(meta.OriginalPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve delete path %s: %w", meta.OriginalPath, err)
+	}
+	resolvedParent, _, err := pathutil.ResolveAbsPath(filepath.Dir(absOriginal))
+	if err != nil {
+		return "", fmt.Errorf("resolve delete parent %s: %w", filepath.Dir(absOriginal), err)
+	}
+	resolvedPath := filepath.Join(resolvedParent, filepath.Base(absOriginal))
+	if resolvedPath != meta.CanonicalPath {
+		return "", fmt.Errorf("canonical path changed from %s to %s", meta.CanonicalPath, resolvedPath)
+	}
+	return meta.CanonicalPath, nil
 }
 
 func validateLegacyRestorePath(entryID, path string) (string, error) {

@@ -619,6 +619,57 @@ func TestRevertExistedFalseRemovesSymlinkLeafOnly(t *testing.T) {
 	}
 }
 
+func TestRevertExistedFalseRefusesRepointedParent(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	originalRoot := filepath.Join(projectDir, "original")
+	repointedRoot := filepath.Join(projectDir, "repointed")
+	linkRoot := filepath.Join(projectDir, "link")
+	for _, dir := range []string{originalRoot, repointedRoot} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(originalRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+	requestedPath := filepath.Join(linkRoot, "created.txt")
+	originalTarget := filepath.Join(originalRoot, "created.txt")
+	repointedTarget := filepath.Join(repointedRoot, "created.txt")
+
+	turn := store.BeginTurn()
+	if err := store.SnapshotResolved(turn, requestedPath, originalTarget); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(originalTarget, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(repointedTarget, []byte("repointed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(linkRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(repointedRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+
+	if err == nil || !strings.Contains(err.Error(), "canonical path changed") {
+		t.Fatalf("RevertCode error = %v, want canonical path changed error", err)
+	}
+	if len(affected) != 0 {
+		t.Fatalf("affected = %v, want none on refused delete", affected)
+	}
+	if got, err := os.ReadFile(originalTarget); err != nil || string(got) != "original" {
+		t.Fatalf("original target = %q, %v; want preserved", got, err)
+	}
+	if got, err := os.ReadFile(repointedTarget); err != nil || string(got) != "repointed" {
+		t.Fatalf("repointed target = %q, %v; want preserved", got, err)
+	}
+}
+
 func TestRevertCodeRestoresLaterSnapshotsAndDeletesLaterSnapshotDirs(t *testing.T) {
 	store := newTestStore(t)
 	projectDir := t.TempDir()
