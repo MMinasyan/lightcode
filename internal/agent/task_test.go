@@ -264,3 +264,70 @@ func (s stubTaskTool) ParametersSchema() map[string]any { return map[string]any{
 func (s stubTaskTool) Execute(context.Context, map[string]any) (string, error) {
 	return "ok", nil
 }
+
+// A non-read-only subagent type that includes "run_command" must resolve
+// to the parent's permission-wrapped run_command from baseRegistry, not
+// an unwrapped instance.
+func TestPR11Closure_NonReadOnlySubagentRunCommandIsPermissionWrapped(t *testing.T) {
+	var sentinelCheckCalled bool
+	sentinel := stubTaskTool{name: "run_command"}
+	wrapped := tool.WrapWithPermission(
+		sentinel,
+		func(toolName, arg string) permission.Decision {
+			sentinelCheckCalled = true
+			return permission.DecisionAllow
+		},
+		func(context.Context, permission.Request) permission.ResponseAction {
+			return permission.ResponseDeny
+		},
+	)
+
+	base := tool.NewRegistry()
+	base.Register(wrapped)
+	base.Register(stubTaskTool{name: "write_file"})
+
+	task := &taskTool{baseRegistry: base}
+	// Non-read-only type: tool list includes write_file.
+	at := subagent.AgentType{Tools: []string{"run_command", "write_file"}}
+	if isReadOnlyType(at) {
+		t.Fatal("test setup: at must be non-read-only")
+	}
+	registry := task.buildRegistry(at)
+	runCommand, ok := registry.Get("run_command")
+	if !ok {
+		t.Fatal("buildRegistry missing run_command for non-read-only subagent")
+	}
+
+	_, err := runCommand.Execute(context.Background(), map[string]any{"command": "echo ok"})
+	if err != nil {
+		// We don't care whether the inner sentinel succeeds; we just need its
+		// permission gate to have run.
+		_ = err
+	}
+	if !sentinelCheckCalled {
+		t.Fatal("permission check on wrapped run_command was not invoked; resolved tool was not the baseRegistry-wrapped variant")
+	}
+}
+
+// Agent.seenSessions must be safe under concurrent dispatch + reset.
+func TestPR11Closure_SeenSessionsNoRace(t *testing.T) {
+	agent := &Agent{seenSessions: map[string]bool{}}
+	var wg sync.WaitGroup
+	const N = 100
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < N; i++ {
+			agent.dispatchTaggedEvent(TaggedLoopEvent{SessionID: "sub", Event: loop.Event{Kind: loop.ToolCallStart}})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < N; i++ {
+			agent.mu.Lock()
+			agent.seenSessions = map[string]bool{}
+			agent.mu.Unlock()
+		}
+	}()
+	wg.Wait()
+}

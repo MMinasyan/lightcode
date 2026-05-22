@@ -38,7 +38,7 @@ func TestFileToolsRefuseRepointedApprovedSymlink(t *testing.T) {
 	}
 
 	tracker := NewFileTracker()
-	tracker.Track(safe, 1, 100)
+	trackIdentityForPath(t, tracker, safe, 1, 100)
 	writeParams := withCanonicalPathParam(map[string]any{"path": link, "content": "after"}, safe)
 	if _, err := NewWriteFile(tracker, config.ToolsConfig{}).Execute(context.Background(), writeParams); err == nil || !strings.Contains(err.Error(), "approved canonical path changed") {
 		t.Fatalf("write_file error = %v, want canonical change refusal", err)
@@ -79,7 +79,7 @@ func TestFileToolsRefuseFinalTargetReplacedBySymlink(t *testing.T) {
 	}
 
 	tracker := NewFileTracker()
-	tracker.TrackMtime(target, 1, 100, mustStat(t, secret).ModTime())
+	tracker.TrackIdentity(target, 1, 100, FileIdentity{Mtime: mustStat(t, secret).ModTime()})
 	writeParams := withCanonicalPathParam(map[string]any{"path": target, "content": "after"}, target)
 	if _, err := NewWriteFile(tracker, config.ToolsConfig{}).Execute(context.Background(), writeParams); err == nil || !strings.Contains(err.Error(), "approved canonical path changed") {
 		t.Fatalf("write_file error = %v, want canonical change refusal", err)
@@ -115,7 +115,7 @@ func TestStagedAliasGroupFailsWhenAliasRepointedAfterApproval(t *testing.T) {
 	}
 
 	tracker := NewFileTracker()
-	tracker.Track(target, 1, 100)
+	trackIdentityForPath(t, tracker, target, 1, 100)
 	checks := 0
 	executor := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, func(toolName, arg string) permission.Decision {
 		checks++

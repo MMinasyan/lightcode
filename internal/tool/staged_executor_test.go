@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -67,7 +68,7 @@ func TestStagedExecutorDeniedCallReturnsError(t *testing.T) {
 func TestStagedExecutorAppliesEditsInEmissionOrder(t *testing.T) {
 	path := stagedExecutorFile(t, "file.txt", "alpha beta gamma")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	executor := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowStagedCall, nil)
 
 	results := executor.ExecutePending(context.Background(), []StagedCall{
@@ -85,7 +86,7 @@ func TestStagedExecutorAppliesEditsInEmissionOrder(t *testing.T) {
 func TestStagedExecutorWriteReplacesRunningBuffer(t *testing.T) {
 	path := stagedExecutorFile(t, "file.txt", "before")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	executor := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowStagedCall, nil)
 
 	results := executor.ExecutePending(context.Background(), []StagedCall{
@@ -153,7 +154,7 @@ func TestStagedExecutorRejectsMalformedWriteContent(t *testing.T) {
 func TestStagedExecutorAllowsEmptyWriteContent(t *testing.T) {
 	path := stagedExecutorFile(t, "file.txt", "before")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	executor := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowStagedCall, nil)
 
 	results := executor.ExecutePending(context.Background(), []StagedCall{
@@ -179,9 +180,9 @@ func TestStagedExecutorAllowAllFreezesLaterTargetsBeforePrompt(t *testing.T) {
 	}
 
 	tracker := NewFileTracker()
-	tracker.Track(target1, 1, 100)
-	tracker.Track(target2, 1, 100)
-	tracker.Track(secret, 1, 100)
+	trackIdentityForPath(t, tracker, target1, 1, 100)
+	trackIdentityForPath(t, tracker, target2, 1, 100)
+	trackIdentityForPath(t, tracker, secret, 1, 100)
 	store := &recordingSnapshotStore{turn: 9, before: map[string]string{}}
 	askCalls := 0
 	executor := NewStagedExecutor(store, tracker, config.ToolsConfig{}, func(string, string) permission.Decision {
@@ -225,7 +226,7 @@ func TestStagedExecutorRevalidatesFrozenTargetBeforeSnapshot(t *testing.T) {
 	}
 
 	tracker := NewFileTracker()
-	tracker.Track(target, 1, 100)
+	trackIdentityForPath(t, tracker, target, 1, 100)
 	store := &stagedHookSnapshotStore{
 		turn: 10,
 		onCurrentTurn: func() {
@@ -256,7 +257,7 @@ func TestStagedExecutorRevalidatesFrozenTargetBeforeFinalWrite(t *testing.T) {
 	}
 
 	tracker := NewFileTracker()
-	tracker.Track(target, 1, 100)
+	trackIdentityForPath(t, tracker, target, 1, 100)
 	store := &stagedHookSnapshotStore{
 		turn: 11,
 		onSnapshot: func() {
@@ -280,7 +281,7 @@ func TestStagedExecutorRevalidatesFrozenTargetBeforeFinalWrite(t *testing.T) {
 func TestStagedExecutorAttributesEditErrorsPerCall(t *testing.T) {
 	path := stagedExecutorFile(t, "file.txt", "same same unique")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	executor := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowStagedCall, nil)
 
 	results := executor.ExecutePending(context.Background(), []StagedCall{
@@ -323,7 +324,7 @@ func TestStagedExecutorFileAppearingBeforeFlushRequiresRead(t *testing.T) {
 func TestStagedExecutorSnapshotsBeforeFinalWrite(t *testing.T) {
 	path := stagedExecutorFile(t, "file.txt", "before")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	store := &recordingSnapshotStore{turn: 7, before: map[string]string{}}
 	executor := NewStagedExecutor(store, tracker, config.ToolsConfig{}, allowStagedCall, nil)
 
@@ -356,7 +357,7 @@ func TestStagedExecutorGroupsAliasesInternallyAndDisplaysRequestedPaths(t *testi
 		t.Fatal(err)
 	}
 	tracker := NewFileTracker()
-	tracker.Track(realPath, 1, 100)
+	trackIdentityForPath(t, tracker, realPath, 1, 100)
 	store := &recordingSnapshotStore{turn: 8, before: map[string]string{}}
 	var batchFiles []string
 	var request permission.Request
@@ -402,7 +403,7 @@ func TestStagedExecutorGroupsAliasesInternallyAndDisplaysRequestedPaths(t *testi
 func TestStagedExecutorCancelledContextFailsAllCalls(t *testing.T) {
 	path := stagedExecutorFile(t, "file.txt", "before")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	executor := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowStagedCall, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -570,5 +571,41 @@ func repointStagedSymlink(t *testing.T, link, target string) {
 	}
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Every e.validateFileGroup call site must be preceded within 3 lines by a
+// comment containing "re-validate canonical" so the TOCTOU re-validation
+// intent is documented at each site and a future refactor cannot silently
+// collapse the checkpoints.
+func TestPR11Closure_StagedExecutorCheckpointsCommented(t *testing.T) {
+	_, file, _, _ := runtime.Caller(0)
+	src := filepath.Join(filepath.Dir(file), "staged_executor.go")
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(data), "\n")
+	var callSites []int
+	for i, line := range lines {
+		if strings.Contains(line, "e.validateFileGroup(staged") {
+			callSites = append(callSites, i)
+		}
+	}
+	if len(callSites) != 4 {
+		t.Fatalf("expected 4 e.validateFileGroup call sites in %s, got %d", src, len(callSites))
+	}
+	for _, idx := range callSites {
+		commented := false
+		for j := idx - 3; j < idx && j >= 0; j++ {
+			if strings.Contains(lines[j], "re-validate canonical") {
+				commented = true
+				break
+			}
+		}
+		if !commented {
+			t.Errorf("validateFileGroup at %s:%d lacks // re-validate canonical comment in preceding 3 lines: %q",
+				src, idx+1, strings.TrimSpace(lines[idx]))
+		}
 	}
 }

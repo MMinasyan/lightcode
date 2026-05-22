@@ -2,10 +2,12 @@ package snapshot
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -998,4 +1000,252 @@ func mustAppendMessage(t *testing.T, store *Store, turn int, msg string) {
 	if err := store.AppendMessage(turn, []byte(msg)); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// When revertOneTurn fails mid-turn, RevertCode must include the
+// already-restored paths from that turn in the affected list so callers
+// can surface accurate partial-state reporting.
+func TestPR11Closure_RevertCodePartialStateIsReported(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	validPath := filepath.Join(projectDir, "valid.txt")
+	invalidPath := filepath.Join(projectDir, "invalid.txt")
+	secret := filepath.Join(projectDir, "secret.txt")
+	if err := os.WriteFile(validPath, []byte("valid-before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(invalidPath, []byte("invalid-before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	turnDir := filepath.Join(store.snapshotsDir, fmt.Sprintf("%d", turn))
+
+	// Hand-construct two entries with controlled IDs so the "valid" one
+	// sorts first lexically and revertOneTurn processes it before the
+	// "invalid" one.
+	entryValid := filepath.Join(turnDir, "0000000000000001")
+	if err := os.MkdirAll(entryValid, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(validPath, filepath.Join(entryValid, "original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(entryValid, "meta.json"),
+		SnapshotMeta{OriginalPath: validPath, CanonicalPath: validPath, Existed: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	entryInvalid := filepath.Join(turnDir, "ffffffffffffffff")
+	if err := os.MkdirAll(entryInvalid, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(invalidPath, filepath.Join(entryInvalid, "original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(entryInvalid, "meta.json"),
+		SnapshotMeta{OriginalPath: invalidPath, CanonicalPath: invalidPath, Existed: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mutate invalidPath so its restore fails validateRestorePath.
+	if err := os.Remove(invalidPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, invalidPath); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+	if err == nil {
+		t.Fatal("RevertCode succeeded; want partial-restore error")
+	}
+	containsValid := false
+	for _, p := range affected {
+		if p == validPath {
+			containsValid = true
+			break
+		}
+	}
+	if !containsValid {
+		t.Fatalf("affected = %v, want to include %q (already-restored entry before mid-turn failure)", affected, validPath)
+	}
+}
+
+// ForkInto must hold s.mu through the copy loop so a concurrent
+// RevertCode or Close cannot mutate the source mid-copy and produce a
+// fork inconsistent with the locked snapshot. The copyDirFunc package
+// variable is the test seam used to deterministically pause ForkInto
+// inside the locked copy region.
+func TestPR11Closure_ForkIntoSerializesWithConcurrentMutation(t *testing.T) {
+	t.Run("revert_concurrent", func(t *testing.T) {
+		store := newTestStore(t)
+		for i := 0; i < 5; i++ {
+			turn := store.BeginTurn()
+			target := filepath.Join(t.TempDir(), fmt.Sprintf("turn%d.txt", turn))
+			if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SnapshotResolved(turn, target, target); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.MarkTurnComplete(turn); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		firstCopyStarted := make(chan struct{})
+		resumeFirstCopy := make(chan struct{})
+		var once sync.Once
+		origCopyDir := copyDirFunc
+		defer func() { copyDirFunc = origCopyDir }()
+		copyDirFunc = func(src, dst string) error {
+			once.Do(func() {
+				close(firstCopyStarted)
+				<-resumeFirstCopy
+			})
+			return origCopyDir(src, dst)
+		}
+
+		forkUnlockedSig := make(chan struct{}, 1)
+		prevUnlockHook := forkIntoLockReleasedHook
+		defer func() { forkIntoLockReleasedHook = prevUnlockHook }()
+		forkIntoLockReleasedHook = func() {
+			select {
+			case forkUnlockedSig <- struct{}{}:
+			default:
+			}
+		}
+
+		type forkResult struct {
+			newDir string
+			err    error
+		}
+		forkResults := make(chan forkResult, 1)
+		go func() {
+			_, newDir, err := store.ForkInto(5)
+			forkResults <- forkResult{newDir, err}
+		}()
+		<-firstCopyStarted
+
+		// Deterministic blocking check: under the bug, ForkInto unlocks
+		// s.mu before entering the copy loop, so by the time the copy hook
+		// fires the unlock-hook has already signaled forkUnlockedSig. Under
+		// the fix, the unlock happens only after the copy completes, so
+		// forkUnlockedSig is empty here.
+		select {
+		case <-forkUnlockedSig:
+			t.Fatal("ForkInto released s.mu before copy completed — lock not held through copy loop")
+		default:
+		}
+
+		revertDone := make(chan error, 1)
+		go func() {
+			_, err := store.RevertCode(2)
+			revertDone <- err
+		}()
+
+		close(resumeFirstCopy)
+		fr := <-forkResults
+		if fr.err != nil {
+			t.Fatalf("ForkInto error: %v", fr.err)
+		}
+		if revErr := <-revertDone; revErr != nil {
+			t.Fatalf("RevertCode error: %v", revErr)
+		}
+
+		// Fork output must be consistent with the pre-revert source state.
+		wantTurns := []int{1, 2, 3, 4, 5}
+		if got := readIntDirs(filepath.Join(fr.newDir, "snapshots")); !reflect.DeepEqual(got, wantTurns) {
+			t.Fatalf("forked snapshots = %v, want %v (RevertCode-concurrent fork lost turns)", got, wantTurns)
+		}
+		if got := readIntDirs(filepath.Join(fr.newDir, "turns")); !reflect.DeepEqual(got, wantTurns) {
+			t.Fatalf("forked turns = %v, want %v (RevertCode-concurrent fork lost turns)", got, wantTurns)
+		}
+	})
+
+	t.Run("close_concurrent", func(t *testing.T) {
+		store := newTestStore(t)
+		// Begin some turns but do not mark complete so Close's RemoveAll
+		// branch fires (Close removes the session dir when no complete
+		// turn exists).
+		for i := 0; i < 3; i++ {
+			turn := store.BeginTurn()
+			target := filepath.Join(t.TempDir(), fmt.Sprintf("turn%d.txt", turn))
+			if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SnapshotResolved(turn, target, target); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		firstCopyStarted := make(chan struct{})
+		resumeFirstCopy := make(chan struct{})
+		var once sync.Once
+		origCopyDir := copyDirFunc
+		defer func() { copyDirFunc = origCopyDir }()
+		copyDirFunc = func(src, dst string) error {
+			once.Do(func() {
+				close(firstCopyStarted)
+				<-resumeFirstCopy
+			})
+			return origCopyDir(src, dst)
+		}
+
+		forkUnlockedSig := make(chan struct{}, 1)
+		prevUnlockHook := forkIntoLockReleasedHook
+		defer func() { forkIntoLockReleasedHook = prevUnlockHook }()
+		forkIntoLockReleasedHook = func() {
+			select {
+			case forkUnlockedSig <- struct{}{}:
+			default:
+			}
+		}
+
+		type forkResult struct {
+			newDir string
+			err    error
+		}
+		forkResults := make(chan forkResult, 1)
+		go func() {
+			_, newDir, err := store.ForkInto(3)
+			forkResults <- forkResult{newDir, err}
+		}()
+		<-firstCopyStarted
+
+		select {
+		case <-forkUnlockedSig:
+			t.Fatal("ForkInto released s.mu before copy completed — lock not held through copy loop")
+		default:
+		}
+
+		closeDone := make(chan error, 1)
+		go func() {
+			_, err := store.Close()
+			closeDone <- err
+		}()
+
+		close(resumeFirstCopy)
+		fr := <-forkResults
+		if fr.err != nil {
+			t.Fatalf("ForkInto error: %v", fr.err)
+		}
+		if closeErr := <-closeDone; closeErr != nil {
+			t.Fatalf("Close error: %v", closeErr)
+		}
+
+		// Fork output must reflect the pre-Close source state; Close's
+		// RemoveAll of the source dir must not corrupt the forked session.
+		wantTurns := []int{1, 2, 3}
+		if got := readIntDirs(filepath.Join(fr.newDir, "snapshots")); !reflect.DeepEqual(got, wantTurns) {
+			t.Fatalf("forked snapshots = %v, want %v (Close-concurrent fork lost turns)", got, wantTurns)
+		}
+		if got := readIntDirs(filepath.Join(fr.newDir, "turns")); !reflect.DeepEqual(got, wantTurns) {
+			t.Fatalf("forked turns = %v, want %v (Close-concurrent fork lost turns)", got, wantTurns)
+		}
+	})
 }

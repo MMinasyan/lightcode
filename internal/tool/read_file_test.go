@@ -76,7 +76,7 @@ func TestReadFileTracksSuccessfulReadsAndDeduplicatesUnchangedRange(t *testing.T
 	if !strings.Contains(result, "1\talpha") {
 		t.Fatalf("first Execute result = %q, want file content", result)
 	}
-	if err := tracker.WasReadCheck(path); err != nil {
+	if err := wasReadCheckForPath(t, tracker, path); err != nil {
 		t.Fatalf("WasReadCheck after read = %v", err)
 	}
 
@@ -114,7 +114,7 @@ func TestReadFileChangedFileBypassesDedupAndRetracks(t *testing.T) {
 	if result != "1\tafter" {
 		t.Fatalf("second Execute result = %q, want changed content", result)
 	}
-	if err := tracker.WasReadCheck(path); err != nil {
+	if err := wasReadCheckForPath(t, tracker, path); err != nil {
 		t.Fatalf("WasReadCheck after changed read = %v", err)
 	}
 }
@@ -204,11 +204,11 @@ func TestReadFileFollowsSymlinkAndTracksRealPath(t *testing.T) {
 	if result != "1\ttarget" {
 		t.Fatalf("Execute result = %q, want symlink target content", result)
 	}
-	if err := tracker.WasReadCheck(realPath); err != nil {
+	if err := wasReadCheckForPath(t, tracker, realPath); err != nil {
 		t.Fatalf("real path WasReadCheck = %v", err)
 	}
 	var readErr *ReadRequiredError
-	if err := tracker.WasReadCheck(linkPath); !errors.As(err, &readErr) {
+	if err := wasReadCheckForPath(t, tracker, linkPath); !errors.As(err, &readErr) {
 		t.Fatalf("link path WasReadCheck = %T %v, want *ReadRequiredError", err, err)
 	}
 }

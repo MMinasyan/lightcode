@@ -148,9 +148,12 @@ func (p *parser) scan() error {
 		case isBoundaryStart(p.runes, i):
 			p.emitArg()
 			separator := string(r)
-			if i+1 < len(p.runes) && ((r == '&' && p.runes[i+1] == '&') || (r == '|' && p.runes[i+1] == '|')) {
-				separator += string(p.runes[i+1])
-				i++
+			if i+1 < len(p.runes) {
+				next := p.runes[i+1]
+				if (r == '&' && next == '&') || (r == '|' && (next == '|' || next == '&')) {
+					separator += string(next)
+					i++
+				}
 			}
 			p.emitSegment(separator)
 		case r == '`':
@@ -164,7 +167,11 @@ func (p *parser) scan() error {
 			p.arg.WriteRune(r)
 			p.hadArg = true
 		case isRedirectionStart(p.runes, i):
-			i = p.consumeRedirection(i)
+			next, err := p.consumeRedirection(i)
+			if err != nil {
+				return err
+			}
+			i = next
 		default:
 			if isUnsafeExpansionRune(r) || (r == '~' && !p.hadArg) {
 				p.segment.UnsafeExpansion = true
@@ -206,7 +213,7 @@ func (p *parser) emitSegment(separator string) {
 	p.hadArg = false
 }
 
-func (p *parser) consumeRedirection(i int) int {
+func (p *parser) consumeRedirection(i int) (int, error) {
 	if p.hadArg {
 		if allDigits(p.arg.String()) {
 			p.arg.Reset()
@@ -229,8 +236,53 @@ func (p *parser) consumeRedirection(i int) int {
 	targetEnd := targetStart
 	for targetEnd < len(p.runes) {
 		r := p.runes[targetEnd]
+		if p.inSingle {
+			p.raw.WriteRune(r)
+			if r == '\'' {
+				p.inSingle = false
+			}
+			targetEnd++
+			continue
+		}
+		if p.inDouble {
+			switch r {
+			case '"':
+				p.inDouble = false
+			case '`':
+				return targetEnd, fmt.Errorf("backtick command substitution not allowed")
+			case '$':
+				if targetEnd+1 < len(p.runes) && p.runes[targetEnd+1] == '(' {
+					return targetEnd, fmt.Errorf("$() command substitution not allowed")
+				}
+				p.segment.UnsafeExpansion = true
+			}
+			p.raw.WriteRune(r)
+			targetEnd++
+			continue
+		}
 		if unicode.IsSpace(r) || isBoundaryStart(p.runes, targetEnd) {
 			break
+		}
+		if r == '\'' {
+			p.inSingle = true
+			p.raw.WriteRune(r)
+			targetEnd++
+			continue
+		}
+		if r == '"' {
+			p.inDouble = true
+			p.raw.WriteRune(r)
+			targetEnd++
+			continue
+		}
+		if r == '`' {
+			return targetEnd, fmt.Errorf("backtick command substitution not allowed")
+		}
+		if r == '$' && targetEnd+1 < len(p.runes) && p.runes[targetEnd+1] == '(' {
+			return targetEnd, fmt.Errorf("$() command substitution not allowed")
+		}
+		if isUnsafeExpansionRune(r) || r == '$' || (r == '~' && targetEnd == targetStart) {
+			p.segment.UnsafeExpansion = true
 		}
 		p.raw.WriteRune(r)
 		targetEnd++
@@ -244,7 +296,7 @@ func (p *parser) consumeRedirection(i int) int {
 		Raw:       raw,
 		SafeFDDup: isSafeFDDup(raw),
 	})
-	return targetEnd - 1
+	return targetEnd - 1, nil
 }
 
 func isBoundaryStart(runes []rune, i int) bool {

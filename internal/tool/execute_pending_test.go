@@ -14,8 +14,8 @@ func TestExecutePendingFlushesMultipleFileGroups(t *testing.T) {
 	first := stagedExecutorFile(t, "first.txt", "one")
 	second := stagedExecutorFile(t, "second.txt", "two")
 	tracker := NewFileTracker()
-	tracker.Track(first, 1, 100)
-	tracker.Track(second, 1, 100)
+	trackIdentityForPath(t, tracker, first, 1, 100)
+	trackIdentityForPath(t, tracker, second, 1, 100)
 	executor := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowStagedCall, nil)
 
 	results := executor.ExecutePending(context.Background(), []StagedCall{
@@ -35,7 +35,7 @@ func TestExecutePendingFlushesMultipleFileGroups(t *testing.T) {
 func TestExecutePendingReturnsPartialSuccessForEditError(t *testing.T) {
 	path := stagedExecutorFile(t, "file.txt", "same\nsame\nlast")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	executor := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowStagedCall, nil)
 
 	results := executor.ExecutePending(context.Background(), []StagedCall{
@@ -56,7 +56,7 @@ func TestExecutePendingReturnsPartialSuccessForEditError(t *testing.T) {
 func TestExecutePendingUnknownToolNameReturnsPerCallError(t *testing.T) {
 	path := stagedExecutorFile(t, "file.txt", "before")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	executor := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowStagedCall, nil)
 
 	results := executor.ExecutePending(context.Background(), []StagedCall{{
@@ -79,7 +79,7 @@ func TestExecutePendingUnknownToolNameReturnsPerCallError(t *testing.T) {
 func TestExecutePendingSnapshotErrorMarksAllSuccessfulCallsFailed(t *testing.T) {
 	path := stagedExecutorFile(t, "file.txt", "before")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	store := &failingSnapshotStore{err: errors.New("snapshot failed")}
 	executor := NewStagedExecutor(store, tracker, config.ToolsConfig{}, allowStagedCall, nil)
 
@@ -102,7 +102,7 @@ func TestExecutePendingSnapshotErrorMarksAllSuccessfulCallsFailed(t *testing.T) 
 func TestExecutePendingSingleAskCannotAllowAll(t *testing.T) {
 	path := stagedExecutorFile(t, "file.txt", "before")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	var gotCanAllowAll bool
 	executor := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, func(string, string) permission.Decision {
 		return permission.DecisionAsk

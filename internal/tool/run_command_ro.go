@@ -30,6 +30,11 @@ var readOnlyFindValueFlags = map[string]bool{
 	"-mtime": true, "-mmin": true,
 }
 
+// dangerousReadOnlyFlags is the chokepoint for read-only safety filtering.
+// Escaped spellings (--pre\=, --out\put, --ext-\diff, etc.) are unescaped by
+// shellparse argv normalization before any per-command code runs, so a single
+// shared denial list catches every variant. Per-command locality would add
+// parser complexity without coverage gain.
 var dangerousReadOnlyFlags = []string{
 	"--output",
 	"--pre",

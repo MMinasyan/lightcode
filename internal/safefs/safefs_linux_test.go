@@ -64,6 +64,37 @@ func TestOpenForWriteRefusesFIFOLeaf(t *testing.T) {
 	}
 }
 
+// OpenExisting and OpenForWrite must refuse a leaf whose hardlink count
+// > 1 so a hardlinked path inside the project cannot read or mutate an
+// inode shared with locations outside the project boundary.
+func TestPR11Closure_OpenExistingAndOpenForWriteRefuseHardlinkLeaf(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hardlinked := filepath.Join(root, "hardlinked.txt")
+	if err := os.Link(outside, hardlinked); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("OpenExisting", func(t *testing.T) {
+		f, err := OpenExisting(hardlinked, os.O_RDONLY)
+		if err == nil {
+			f.Close()
+			t.Fatal("OpenExisting succeeded on hardlinked leaf; want refusal")
+		}
+	})
+
+	t.Run("OpenForWrite", func(t *testing.T) {
+		f, _, err := OpenForWrite(hardlinked, 0o644)
+		if err == nil {
+			f.Close()
+			t.Fatal("OpenForWrite succeeded on hardlinked leaf; want refusal")
+		}
+	})
+}
+
 func TestRemoveLeafUnlinksSymlinkItself(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target.txt")

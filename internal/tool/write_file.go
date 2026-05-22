@@ -148,6 +148,7 @@ func (w *WriteFileWithSnapshot) Execute(_ context.Context, params map[string]any
 	if err != nil {
 		return "", fmt.Errorf("write_file: resolve path: %w", err)
 	}
+	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
 	securityPath, err := fileSecurityPath(params, path)
 	if err != nil {
 		return "", fmt.Errorf("write_file: resolve path: %w", err)
@@ -189,6 +190,7 @@ func writeFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker,
 	}
 	content, _ := params["content"].(string)
 
+	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
 	absPath, err := fileSecurityPath(params, path)
 	if err != nil {
 		return nil, false, fmt.Errorf("write_file: resolve path: %w", err)

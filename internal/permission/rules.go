@@ -214,6 +214,9 @@ func ruleMatches(r parsedRule, toolName, arg string, ctx evalContext) bool {
 	if toolName == "run_command" {
 		return matchCommand(r.pattern, arg)
 	}
+	if toolName == "process" {
+		return matchGlob(r.pattern, arg)
+	}
 	absPattern := ctx.resolvePath(r.pattern)
 	if isFileTool(toolName) {
 		absPattern = pathutil.ResolvePathPattern(absPattern)
@@ -229,6 +232,20 @@ func evaluateRules(rules []string, toolName, arg string, ctx evalContext) bool {
 			continue
 		}
 		if ruleMatches(r, toolName, arg, ctx) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasMalformedRule reports whether the bucket contains any rule that fails
+// to parse. Used by the deny/ask buckets to fail closed: a malformed rule
+// in those buckets forces the bucket to "match" so it cannot be skipped
+// past a broad allow. Allow callers do not consult this — malformed allow
+// rules stay skipped so they cannot silently authorize.
+func hasMalformedRule(rules []string) bool {
+	for _, s := range rules {
+		if _, err := parseRule(s); err != nil {
 			return true
 		}
 	}
@@ -258,13 +275,13 @@ func evaluateSingle(rules Rules, toolName, arg string, ctx evalContext) Decision
 		sensitiveArg = pathutil.ResolvePathPattern(arg)
 		arg = sensitiveArg
 	}
-	if evaluateRules(rules.Deny, toolName, arg, ctx) {
+	if hasMalformedRule(rules.Deny) || evaluateRules(rules.Deny, toolName, arg, ctx) {
 		return DecisionDeny
 	}
-	if evaluateRules(rules.Ask, toolName, arg, ctx) {
+	if hasMalformedRule(rules.Ask) || evaluateRules(rules.Ask, toolName, arg, ctx) {
 		return DecisionAsk
 	}
-	if isFileTool(toolName) && isSensitivePath(sensitiveArg) {
+	if isFileTool(toolName) && IsSensitivePath(sensitiveArg) {
 		return DecisionAsk
 	}
 	if evaluateRules(rules.Allow, toolName, arg, ctx) {
@@ -305,7 +322,7 @@ var sensitiveGlobs = []string{
 	"credentials*.yml",
 }
 
-func isSensitivePath(path string) bool {
+func IsSensitivePath(path string) bool {
 	base := filepath.Base(path)
 	if sensitiveNames[base] {
 		return true
@@ -338,10 +355,10 @@ func evaluateCommandAnalysis(rules Rules, analysis commandAnalysis, ctx evalCont
 	if len(analysis.segments) == 0 {
 		return DecisionAsk
 	}
-	if commandRulesMatch(rules.Deny, analysis, ctx) {
+	if hasMalformedRule(rules.Deny) || commandRulesMatch(rules.Deny, analysis, ctx) {
 		return DecisionDeny
 	}
-	if commandRulesMatch(rules.Ask, analysis, ctx) {
+	if hasMalformedRule(rules.Ask) || commandRulesMatch(rules.Ask, analysis, ctx) {
 		return DecisionAsk
 	}
 	if commandAnalysisUnsupported(analysis) {
@@ -366,8 +383,23 @@ func analyzeCommand(command string) commandAnalysis {
 	analysis := commandAnalysis{
 		segments: make([]commandSegmentAnalysis, 0, len(segments)),
 	}
+	// Bare `&` (segment backgrounding) flags the segment plus the one that
+	// follows as unsupported so allow rules cannot authorize them. Inner
+	// deny/ask rules still match through commandRulesMatch, preserving
+	// precedence. `&&` and `|&` are different separators and unaffected.
+	prevBackground := false
 	for _, segment := range segments {
-		analysis.segments = append(analysis.segments, analyzeCommandSegment(segment))
+		seg := analyzeCommandSegment(segment)
+		if prevBackground {
+			seg.unsupported = true
+		}
+		if segment.Separator == "&" {
+			seg.unsupported = true
+			prevBackground = true
+		} else {
+			prevBackground = false
+		}
+		analysis.segments = append(analysis.segments, seg)
 	}
 	return analysis
 }
@@ -640,10 +672,64 @@ func commandSegmentAllowed(rules []string, segment commandSegmentAnalysis, ctx e
 	if segment.unsupported {
 		return false
 	}
-	if commandVariantsMatchRules(rules, segment.allowVariants, ctx) {
+	hasExactMatch, hasWildcardMatch := false, false
+	for _, s := range rules {
+		r, err := parseRule(s)
+		if err != nil || r.tool != "run_command" {
+			continue
+		}
+		for _, v := range segment.allowVariants {
+			if !matchCommand(r.pattern, v) {
+				continue
+			}
+			if wrapperScriptHasWildcard(r.pattern) {
+				hasWildcardMatch = true
+			} else {
+				hasExactMatch = true
+			}
+			break
+		}
+		if hasExactMatch {
+			break
+		}
+	}
+	if !hasExactMatch && !hasWildcardMatch {
+		return false
+	}
+	if hasExactMatch {
 		return true
 	}
-	return false
+	for _, child := range segment.children {
+		if !commandSegmentAllowed(rules, child, ctx) {
+			return false
+		}
+	}
+	return true
+}
+
+// wrapperScriptHasWildcard reports whether pattern is a shell-wrapper rule
+// of the form `sh|bash|dash|zsh -c <body>` where <body> contains a literal
+// `*`. Such wildcard wrappers must additionally require every parsed child
+// segment to be independently allowed; exact-wrapper rules (no `*` in the
+// script body) keep the round-trip behavior of allowing on outer match.
+func wrapperScriptHasWildcard(pattern string) bool {
+	segments, err := shellparse.Parse(pattern)
+	if err != nil || len(segments) == 0 {
+		return false
+	}
+	argv := segments[0].Argv
+	if len(argv) < 3 {
+		return false
+	}
+	switch argv[0] {
+	case "sh", "bash", "dash", "zsh":
+	default:
+		return false
+	}
+	if argv[1] != "-c" {
+		return false
+	}
+	return strings.ContainsRune(argv[2], '*')
 }
 
 func hasUnsafeRedirection(segment shellparse.Segment) bool {
@@ -674,7 +760,12 @@ func Check(local, global Rules, toolName, arg, projectRoot, home, cwd string) De
 
 // hasExplicitMatch returns true if any rule in the set (allow, deny, or ask)
 // matches the tool call. This distinguishes "explicitly asked" from "no match".
+// A malformed deny/ask rule in the local set also counts as an explicit match
+// so the fail-closed semantics do not silently fall through to the global set.
 func hasExplicitMatch(rules Rules, toolName, arg string, ctx evalContext) bool {
+	if hasMalformedRule(rules.Deny) || hasMalformedRule(rules.Ask) {
+		return true
+	}
 	if toolName == "run_command" {
 		analysis := analyzeCommand(arg)
 		return commandRulesMatch(rules.Allow, analysis, ctx) ||

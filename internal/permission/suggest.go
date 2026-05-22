@@ -21,7 +21,29 @@ func Suggest(toolName, arg, projectRoot string) []Suggestion {
 	if toolName == "run_command" {
 		return suggestCommand(arg)
 	}
+	if toolName == "process" {
+		return suggestProcess(arg)
+	}
 	return suggestFile(toolName, arg, projectRoot)
+}
+
+// suggestProcess returns suggestions for the process tool. The arg is
+// either "process:<id>" (read/kill actions) or the bare "process" (list
+// action). Process patterns are literal/glob strings, not paths — path
+// resolution would break the matcher round-trip.
+func suggestProcess(arg string) []Suggestion {
+	var suggestions []Suggestion
+	suggestions = append(suggestions, Suggestion{
+		Rule:  "process(" + arg + ")",
+		Label: arg,
+	})
+	if strings.HasPrefix(arg, "process:") && arg != "process:*" {
+		suggestions = append(suggestions, Suggestion{
+			Rule:  "process(process:*)",
+			Label: "process:*",
+		})
+	}
+	return suggestions
 }
 
 // SuggestForSubcommands returns suggestions grouped by subcommand.

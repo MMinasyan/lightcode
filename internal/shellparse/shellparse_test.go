@@ -161,3 +161,102 @@ func TestParseMarksUnsafeExpansions(t *testing.T) {
 		})
 	}
 }
+
+func TestPR11Closure_RedirectionTargetMarksOrRejectsSubstitution(t *testing.T) {
+	t.Run("substitution_rejects", func(t *testing.T) {
+		for _, command := range []string{
+			"echo ok >$(id)",
+			"echo ok > `id`",
+		} {
+			if _, err := Parse(command); err == nil {
+				t.Fatalf("Parse(%q) returned nil error; want non-nil (redirection-target substitution must reject)", command)
+			}
+		}
+	})
+
+	t.Run("expansion_marks_unsafe", func(t *testing.T) {
+		for _, command := range []string{
+			"echo ok >$VAR",
+			"echo ok >*",
+			"echo ok >?",
+			"echo ok >[abc]",
+			"echo ok >~/file",
+		} {
+			segments, err := Parse(command)
+			if err != nil {
+				t.Fatalf("Parse(%q) = error %v; want nil error + UnsafeExpansion=true", command, err)
+			}
+			if len(segments) != 1 || !segments[0].UnsafeExpansion {
+				t.Fatalf("Parse(%q) segments = %#v; want one segment with UnsafeExpansion=true", command, segments)
+			}
+		}
+	})
+
+	t.Run("single_quoted_literal_is_safe", func(t *testing.T) {
+		for _, command := range []string{
+			"echo ok >'$VAR'",
+			"echo ok >'$(id)'",
+			"echo ok >'`id`'",
+			"echo ok >'*'",
+			"echo ok >'~'",
+		} {
+			segments, err := Parse(command)
+			if err != nil {
+				t.Fatalf("Parse(%q) = error %v; want nil error (single-quoted target is literal)", command, err)
+			}
+			if len(segments) != 1 || segments[0].UnsafeExpansion {
+				t.Fatalf("Parse(%q) segments = %#v; want one segment with UnsafeExpansion=false", command, segments)
+			}
+			if len(segments[0].Redirections) != 1 {
+				t.Fatalf("Parse(%q) redirections = %#v; want exactly one redirection entry", command, segments[0].Redirections)
+			}
+		}
+	})
+
+	t.Run("double_quoted_substitution_rejected", func(t *testing.T) {
+		for _, command := range []string{
+			`echo ok >"$(id)"`,
+			"echo ok >\"`id`\"",
+		} {
+			if _, err := Parse(command); err == nil {
+				t.Fatalf("Parse(%q) returned nil error; want non-nil (double-quoted substitution must reject)", command)
+			}
+		}
+	})
+
+	t.Run("double_quoted_dollar_marks_unsafe", func(t *testing.T) {
+		for _, command := range []string{
+			`echo ok >"$VAR"`,
+			`echo ok >"text $VAR"`,
+		} {
+			segments, err := Parse(command)
+			if err != nil {
+				t.Fatalf("Parse(%q) = error %v; want nil error + UnsafeExpansion=true", command, err)
+			}
+			if len(segments) != 1 || !segments[0].UnsafeExpansion {
+				t.Fatalf("Parse(%q) segments = %#v; want one segment with UnsafeExpansion=true", command, segments)
+			}
+		}
+		// Glob chars inside double-quotes are literal — not unsafe.
+		segments, err := Parse(`echo ok >"foo*"`)
+		if err != nil {
+			t.Fatalf("Parse double-quoted glob = error %v; want nil", err)
+		}
+		if len(segments) != 1 || segments[0].UnsafeExpansion {
+			t.Fatalf(`Parse "echo ok >\"foo*\"" segments = %#v; want UnsafeExpansion=false (literal inside double-quote)`, segments)
+		}
+	})
+}
+
+func TestPR11Closure_PipeAmpersandIsSingleOperator(t *testing.T) {
+	segments, err := Parse("echo a |& cat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 2 {
+		t.Fatalf("segments count = %d, want 2 (|& is one separator)", len(segments))
+	}
+	if segments[0].Separator != "|&" {
+		t.Fatalf("segments[0].Separator = %q, want %q", segments[0].Separator, "|&")
+	}
+}

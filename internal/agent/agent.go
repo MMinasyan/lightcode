@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,11 +21,13 @@ import (
 	"github.com/MMinasyan/lightcode/internal/lsp"
 	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/process"
 	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/prompt"
 	"github.com/MMinasyan/lightcode/internal/provider"
+	"github.com/MMinasyan/lightcode/internal/safefs"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/subagent"
 	"github.com/MMinasyan/lightcode/internal/tool"
@@ -521,11 +524,16 @@ func (a *Agent) dispatchLoopEvent(ev loop.Event) {
 }
 
 func (a *Agent) dispatchTaggedEvent(tev TaggedLoopEvent) {
+	a.mu.Lock()
 	if a.seenSessions == nil {
 		a.seenSessions = make(map[string]bool)
 	}
-	if tev.SessionID != "" && !a.seenSessions[tev.SessionID] {
+	isNew := tev.SessionID != "" && !a.seenSessions[tev.SessionID]
+	if isNew {
 		a.seenSessions[tev.SessionID] = true
+	}
+	a.mu.Unlock()
+	if isNew {
 		a.emitEvent(Event{
 			Kind:              EventSubagentStart,
 			SubagentSessionID: tev.SessionID,
@@ -1894,6 +1902,7 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 		if _, err := a.store.RevertCode(target); err != nil {
 			return TurnActionResult{}, err
 		}
+		a.populateFileTracker()
 		return result, nil
 
 	case TurnActionRevertHistory:
@@ -1973,7 +1982,12 @@ func (a *Agent) userMessageContentForTurn(turn int) string {
 	return ""
 }
 
-// RevertCode restores files to their state at the given turn.
+// RevertCode restores files to their state at the given turn. After the
+// store revert lands the file tracker is repopulated from conversation
+// history: stale per-path identities are cleared while paths visible in
+// messages keep their "read happened" marker, forcing a re-read on the
+// next edit until read_file observes the current disk state. Symmetric
+// with RevertHistory.
 func (a *Agent) RevertCode(turn int) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -1983,8 +1997,11 @@ func (a *Agent) RevertCode(turn int) error {
 	if !a.store.Active() {
 		return fmt.Errorf("no session open")
 	}
-	_, err := a.store.RevertCode(turn)
-	return err
+	if _, err := a.store.RevertCode(turn); err != nil {
+		return err
+	}
+	a.populateFileTracker()
+	return nil
 }
 
 // RevertHistory truncates conversation after the given turn.
@@ -2057,16 +2074,56 @@ func (a *Agent) SnapshotList() ([]Snapshot, error) {
 
 // --- File / project operations ---
 
-// ReadFileContent reads a file for the inline viewer. Relative paths
-// resolve against the project root.
-func (a *Agent) ReadFileContent(path string) (string, error) {
+// viewerReadAllowed validates that path is safe to read for the inline
+// viewer. Returns the canonical path on success, or an error explaining
+// the boundary violation.
+//
+// Boundary rules: (a) only canonical project root is allowed; (b)
+// relative paths resolve against project root; (c) absolute paths must
+// canonical-resolve inside; (d) ".." allowed only if cleaning +
+// canonical resolution stays inside; (e) symlinks resolved and must
+// stay inside; (f) hardlinks rejected at safefs FD layer via
+// requireRegularFD; (g) sensitive-name leaves rejected.
+func (a *Agent) viewerReadAllowed(path string) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("empty path")
 	}
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(a.projectRoot, path)
 	}
-	b, err := os.ReadFile(path)
+	canonicalRoot, _, err := pathutil.ResolveAbsPath(a.projectRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve project root: %w", err)
+	}
+	canonicalPath, _, err := pathutil.ResolveAbsPath(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve viewer path: %w", err)
+	}
+	rel, err := filepath.Rel(canonicalRoot, canonicalPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("viewer path outside project root")
+	}
+	if permission.IsSensitivePath(canonicalPath) {
+		return "", fmt.Errorf("viewer path is sensitive")
+	}
+	return canonicalPath, nil
+}
+
+// ReadFileContent reads a file for the inline viewer. Enforces the
+// viewer file-read boundary: paths outside canonical project root,
+// escaping symlinks, hardlinks to outside-boundary inodes, and
+// sensitive-name leaves are refused before any byte is read.
+func (a *Agent) ReadFileContent(path string) (string, error) {
+	canonicalPath, err := a.viewerReadAllowed(path)
+	if err != nil {
+		return "", err
+	}
+	f, err := safefs.OpenExisting(canonicalPath, os.O_RDONLY)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(f)
 	if err != nil {
 		return "", err
 	}

@@ -331,3 +331,60 @@ func TestSuggestFileWithSubdirectory(t *testing.T) {
 		}
 	}
 }
+
+// TestPR11Closure_ProcessSuggestRoundTrip asserts that every suggestion
+// emitted for a `process` permission prompt, when saved as an allow rule,
+// round-trips through the matcher to DecisionAllow for the original arg.
+// The prior implementation routed `process` through the file-suggestion
+// path, producing path-style rules the direct-glob process matcher could
+// not match — breaking the "Allow for project" UX entirely for the
+// process tool.
+func TestPR11Closure_ProcessSuggestRoundTrip(t *testing.T) {
+	cases := []struct {
+		name    string
+		arg     string
+		wantHas []string
+	}{
+		{
+			name:    "id_arg_has_exact_and_wildcard",
+			arg:     "process:abc123",
+			wantHas: []string{"process(process:abc123)", "process(process:*)"},
+		},
+		{
+			name:    "bare_arg_has_literal",
+			arg:     "process",
+			wantHas: []string{"process(process)"},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			suggestions := Suggest("process", tc.arg, "/project")
+			if len(suggestions) == 0 {
+				t.Fatalf("Suggest(process, %q) returned no suggestions", tc.arg)
+			}
+
+			rules := make(map[string]bool)
+			for _, s := range suggestions {
+				rules[s.Rule] = true
+			}
+			for _, want := range tc.wantHas {
+				if !rules[want] {
+					t.Fatalf("Suggest(process, %q) missing %q; got %v", tc.arg, want, suggestions)
+				}
+			}
+
+			// Each suggestion must round-trip: saving it as an Allow rule
+			// must produce DecisionAllow for the original arg.
+			for _, s := range suggestions {
+				d := Evaluate(Rules{Allow: []string{s.Rule}}, "process", tc.arg,
+					"/project", "/home/user", "/project")
+				if d != DecisionAllow {
+					t.Fatalf("Evaluate with saved suggestion %q against arg %q = %d, want DecisionAllow",
+						s.Rule, tc.arg, d)
+				}
+			}
+		})
+	}
+}

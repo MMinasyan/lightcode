@@ -175,8 +175,8 @@ func TestEvaluateBackgroundCommandRequiresEachSideAllowed(t *testing.T) {
 	}
 
 	d = Evaluate(rules, "run_command", "echo one & echo two", "/project", "/home/user", "/project")
-	if d != DecisionAllow {
-		t.Fatalf("Evaluate allowed background command = %d, want DecisionAllow", d)
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate allowed background command = %d, want DecisionAsk (bare & forces prompt)", d)
 	}
 }
 
@@ -703,6 +703,167 @@ func TestResolvePathCwdRelative(t *testing.T) {
 	}
 }
 
+func TestPR11Closure_BareAmpersandRequiresPrompt(t *testing.T) {
+	allowEcho := Rules{Allow: []string{"run_command(echo *)"}}
+	for _, command := range []string{
+		"echo one & echo two",
+		"echo one &",
+		"echo one & echo two & echo three",
+	} {
+		d := Evaluate(allowEcho, "run_command", command, "/project", "/home/user", "/project")
+		if d != DecisionAsk {
+			t.Fatalf("Evaluate %q = %d, want DecisionAsk (bare & forces prompt)", command, d)
+		}
+	}
+
+	withDeny := Rules{
+		Allow: []string{"run_command(echo *)"},
+		Deny:  []string{"run_command(rm *)"},
+	}
+	d := Evaluate(withDeny, "run_command", "echo ok & rm -rf x", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate %q with inner deny = %d, want DecisionDeny", "echo ok & rm -rf x", d)
+	}
+
+	withAsk := Rules{
+		Allow: []string{"run_command(echo *)"},
+		Ask:   []string{"run_command(rm *)"},
+	}
+	d = Evaluate(withAsk, "run_command", "echo ok & rm -rf x", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate %q with inner ask = %d, want DecisionAsk", "echo ok & rm -rf x", d)
+	}
+}
+
+func TestPR11Closure_MalformedDenyOrAskFailsClosed(t *testing.T) {
+	denyMalformed := Rules{
+		Deny:  []string{"this is not a valid rule"},
+		Allow: []string{"run_command(*)"},
+	}
+	d := Evaluate(denyMalformed, "run_command", "rm -rf x", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate with malformed Deny = %d, want DecisionDeny (fail-closed)", d)
+	}
+
+	askMalformed := Rules{
+		Ask:   []string{"this is not a valid rule"},
+		Allow: []string{"run_command(*)"},
+	}
+	d = Evaluate(askMalformed, "run_command", "rm -rf x", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate with malformed Ask = %d, want DecisionAsk (fail-closed)", d)
+	}
+
+	// Two-level Check: a malformed local deny/ask must NOT silently fall
+	// through to a broad global allow. Fail-closed at the local level wins.
+	localMalformedDeny := Rules{Deny: []string{"this is not a valid rule"}}
+	globalBroadAllow := Rules{Allow: []string{"run_command(*)"}}
+	d = Check(localMalformedDeny, globalBroadAllow,
+		"run_command", "rm -rf x", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Check local-malformed-deny + global allow = %d, want DecisionDeny", d)
+	}
+
+	localMalformedAsk := Rules{Ask: []string{"this is not a valid rule"}}
+	d = Check(localMalformedAsk, globalBroadAllow,
+		"run_command", "rm -rf x", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Check local-malformed-ask + global allow = %d, want DecisionAsk", d)
+	}
+}
+
+func TestPR11Closure_PipeAmpersandPermissionRespectsBothSides(t *testing.T) {
+	// |& must behave as | for permission analysis: both sides required to allow.
+	rules := Rules{Allow: []string{"run_command(echo *)"}}
+	d := Evaluate(rules, "run_command", "echo a |& cat", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate %q = %d, want DecisionAsk (cat unallowed)", "echo a |& cat", d)
+	}
+
+	bothAllowed := Rules{Allow: []string{"run_command(echo *)", "run_command(cat)"}}
+	d = Evaluate(bothAllowed, "run_command", "echo a |& cat", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate %q with both sides allowed = %d, want DecisionAllow", "echo a |& cat", d)
+	}
+
+	denyRight := Rules{
+		Allow: []string{"run_command(echo *)", "run_command(cat)"},
+		Deny:  []string{"run_command(cat)"},
+	}
+	d = Evaluate(denyRight, "run_command", "echo a |& cat", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate %q with denied right side = %d, want DecisionDeny", "echo a |& cat", d)
+	}
+
+	// Baseline: ordinary | with the same rules must give the same decisions,
+	// proving |& is semantically treated as | (not just parsed into segments).
+	d = Evaluate(bothAllowed, "run_command", "echo a | cat", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate %q baseline | with both sides allowed = %d, want DecisionAllow", "echo a | cat", d)
+	}
+	d = Evaluate(denyRight, "run_command", "echo a | cat", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate %q baseline | with denied right side = %d, want DecisionDeny", "echo a | cat", d)
+	}
+}
+
+func TestPR11Closure_ProcessPermissionRulesRoundTrip(t *testing.T) {
+	literal := Rules{Allow: []string{"process(process:abc)"}}
+	d := Evaluate(literal, "process", "process:abc", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate literal process rule = %d, want DecisionAllow", d)
+	}
+
+	wildcard := Rules{Allow: []string{"process(process:*)"}}
+	d = Evaluate(wildcard, "process", "process:abc", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate wildcard process rule = %d, want DecisionAllow", d)
+	}
+
+	deny := Rules{
+		Allow: []string{"process(process:*)"},
+		Deny:  []string{"process(process:abc)"},
+	}
+	d = Evaluate(deny, "process", "process:abc", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate deny precedence = %d, want DecisionDeny", d)
+	}
+
+	ask := Rules{
+		Allow: []string{"process(process:*)"},
+		Ask:   []string{"process(process:abc)"},
+	}
+	d = Evaluate(ask, "process", "process:abc", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate ask precedence = %d, want DecisionAsk", d)
+	}
+
+	// The list action carries no id and uses the bare arg "process".
+	bareAllow := Rules{Allow: []string{"process(process)"}}
+	d = Evaluate(bareAllow, "process", "process", "/project", "/home/user", "/project")
+	if d != DecisionAllow {
+		t.Fatalf("Evaluate bare process allow = %d, want DecisionAllow", d)
+	}
+
+	bareDeny := Rules{
+		Allow: []string{"process(*)"},
+		Deny:  []string{"process(process)"},
+	}
+	d = Evaluate(bareDeny, "process", "process", "/project", "/home/user", "/project")
+	if d != DecisionDeny {
+		t.Fatalf("Evaluate bare process deny precedence = %d, want DecisionDeny", d)
+	}
+
+	bareAsk := Rules{
+		Allow: []string{"process(*)"},
+		Ask:   []string{"process(process)"},
+	}
+	d = Evaluate(bareAsk, "process", "process", "/project", "/home/user", "/project")
+	if d != DecisionAsk {
+		t.Fatalf("Evaluate bare process ask precedence = %d, want DecisionAsk", d)
+	}
+}
+
 func TestIsSensitivePath(t *testing.T) {
 	sensitive := []string{
 		"/home/user/.env",
@@ -714,8 +875,8 @@ func TestIsSensitivePath(t *testing.T) {
 		"/home/user/credentials.yaml",
 	}
 	for _, p := range sensitive {
-		if !isSensitivePath(p) {
-			t.Fatalf("isSensitivePath(%q) = false, want true", p)
+		if !IsSensitivePath(p) {
+			t.Fatalf("IsSensitivePath(%q) = false, want true", p)
 		}
 	}
 
@@ -725,8 +886,8 @@ func TestIsSensitivePath(t *testing.T) {
 		"/home/user/.gitignore",
 	}
 	for _, p := range normal {
-		if isSensitivePath(p) {
-			t.Fatalf("isSensitivePath(%q) = true, want false", p)
+		if IsSensitivePath(p) {
+			t.Fatalf("IsSensitivePath(%q) = true, want false", p)
 		}
 	}
 }

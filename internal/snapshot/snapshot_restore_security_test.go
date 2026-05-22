@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -62,7 +63,10 @@ func TestRevertHandlesCreatedDirectoryLeaves(t *testing.T) {
 }
 
 func TestLegacyCreatedDeleteRequiresCleanPathHash(t *testing.T) {
-	t.Run("hash match deletes clean original path", func(t *testing.T) {
+	// Hash match or mismatch, the legacy Existed:false branch must refuse —
+	// legacy snapshots carry no capture-time canonical witness, so the
+	// restore cannot prove the current path matches what was observed-as-missing.
+	t.Run("hash match still refuses", func(t *testing.T) {
 		store := newTestStore(t)
 		projectDir := t.TempDir()
 		if err := os.Mkdir(filepath.Join(projectDir, "sub"), 0o755); err != nil {
@@ -85,15 +89,15 @@ func TestLegacyCreatedDeleteRequiresCleanPathHash(t *testing.T) {
 			t.Fatalf("turn = %d, want 1", turn)
 		}
 
-		affected, err := store.RevertCode(0)
-		if err != nil {
-			t.Fatal(err)
+		_, err := store.RevertCode(0)
+		if err == nil {
+			t.Fatal("RevertCode succeeded for legacy Existed:false with hash match; want unconditional refusal")
 		}
-		if !reflect.DeepEqual(affected, []string{dirtyPath}) {
-			t.Fatalf("affected = %v, want [%s]", affected, dirtyPath)
+		if !strings.Contains(err.Error(), "legacy delete refused") {
+			t.Fatalf("error %v does not mention legacy delete refused", err)
 		}
-		if _, err := os.Stat(cleanPath); !os.IsNotExist(err) {
-			t.Fatalf("created file stat err = %v, want not exist", err)
+		if got, readErr := os.ReadFile(cleanPath); readErr != nil || string(got) != "created" {
+			t.Fatalf("file content = %q, %v; want unchanged after refused legacy delete", got, readErr)
 		}
 	})
 
@@ -232,4 +236,146 @@ func writeLegacySnapshotForMissingLeafProof(t *testing.T, store *Store, requeste
 	if turn != 1 {
 		t.Fatalf("turn = %d, want 1", turn)
 	}
+}
+
+// Legacy Existed:false snapshots (no meta.CanonicalPath) must be refused
+// at restore time — they carry no capture-time canonical witness, so the
+// restore cannot prove the current path matches what was observed-as-missing.
+func TestPR11Closure_LegacyExistedFalseDeletesAreRefused(t *testing.T) {
+	t.Run("file present at OriginalPath", func(t *testing.T) {
+		store := newTestStore(t)
+		projectDir := t.TempDir()
+		createdPath := filepath.Join(projectDir, "victim.txt")
+		if err := os.WriteFile(createdPath, []byte("victim-content"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		turn := store.BeginTurn()
+		entryDir := filepath.Join(store.snapshotsDir, "1", hashString(filepath.Clean(createdPath)))
+		if err := os.MkdirAll(entryDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeJSON(filepath.Join(entryDir, "meta.json"),
+			SnapshotMeta{OriginalPath: createdPath, Existed: false}); err != nil {
+			t.Fatal(err)
+		}
+		if turn != 1 {
+			t.Fatalf("turn = %d, want 1", turn)
+		}
+
+		_, err := store.RevertCode(0)
+		if err == nil {
+			t.Fatal("RevertCode succeeded for legacy Existed:false, want refusal")
+		}
+		if !strings.Contains(err.Error(), "legacy delete refused") {
+			t.Fatalf("error %v does not mention legacy delete refused", err)
+		}
+		if got, err := os.ReadFile(createdPath); err != nil || string(got) != "victim-content" {
+			t.Fatalf("file content = %q, %v; want unchanged", got, err)
+		}
+	})
+
+	t.Run("target absent at OriginalPath", func(t *testing.T) {
+		store := newTestStore(t)
+		projectDir := t.TempDir()
+		absentPath := filepath.Join(projectDir, "absent.txt")
+		turn := store.BeginTurn()
+		entryDir := filepath.Join(store.snapshotsDir, "1", hashString(filepath.Clean(absentPath)))
+		if err := os.MkdirAll(entryDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeJSON(filepath.Join(entryDir, "meta.json"),
+			SnapshotMeta{OriginalPath: absentPath, Existed: false}); err != nil {
+			t.Fatal(err)
+		}
+		if turn != 1 {
+			t.Fatalf("turn = %d, want 1", turn)
+		}
+
+		_, err := store.RevertCode(0)
+		if err == nil {
+			t.Fatal("RevertCode succeeded for legacy Existed:false with absent target, want refusal")
+		}
+		if !strings.Contains(err.Error(), "legacy delete refused") {
+			t.Fatalf("error %v does not mention legacy delete refused", err)
+		}
+	})
+}
+
+// A modern snapshot whose current on-disk leaf is a hardlink to an
+// outside-boundary inode must be refused by restore so the FD-acquisition
+// nlink check stops the mutation before it crosses the project boundary.
+func TestPR11Closure_HardlinkRefusedOnSnapshotRestore(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	target := filepath.Join(projectDir, "target.txt")
+	if err := os.WriteFile(target, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	if err := store.SnapshotResolved(turn, target, target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Replace target with a hardlink to an outside-boundary file.
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(outside, target); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := store.RevertCode(0)
+	if err == nil {
+		t.Fatal("RevertCode succeeded with hardlinked restore target; want refusal")
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "hardlink") && !strings.Contains(msg, "link count") && !strings.Contains(msg, "nlink") {
+		t.Fatalf("error %v does not mention hardlink/link count/nlink", err)
+	}
+	if got, err := os.ReadFile(outside); err != nil || string(got) != "outside-content" {
+		t.Fatalf("outside file = %q, %v; want unchanged", got, err)
+	}
+}
+
+// A modern Existed:false snapshot must be bound to the entry directory ID
+// (hashString(realPath)). A meta.json content rewrite alone that redirects
+// CanonicalPath must be refused because hashString(new path) no longer
+// matches the on-disk entry directory name.
+func TestPR11Closure_ModernDeleteBoundToEntryID(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	originalPath := filepath.Join(projectDir, "created.txt")
+	victimPath := filepath.Join(projectDir, "victim.txt")
+	if err := os.WriteFile(victimPath, []byte("victim-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	if err := store.Snapshot(turn, originalPath); err != nil {
+		t.Fatal(err)
+	}
+	// store.Snapshot writes meta with CanonicalPath=originalPath, entryDir=hashString(originalPath).
+	// Tamper meta.json to redirect CanonicalPath (and OriginalPath) to victimPath.
+	entryDir := filepath.Join(store.snapshotsDir, "1", hashString(filepath.Clean(originalPath)))
+	if _, err := os.Stat(entryDir); err != nil {
+		t.Fatalf("expected snapshot entry dir at %s: %v", entryDir, err)
+	}
+	if err := writeJSON(filepath.Join(entryDir, "meta.json"),
+		SnapshotMeta{OriginalPath: victimPath, CanonicalPath: victimPath, Existed: false}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := store.RevertCode(0)
+	if err == nil {
+		t.Fatal("RevertCode succeeded with tampered meta.json; want refusal")
+	}
+	if got, readErr := os.ReadFile(victimPath); readErr != nil || string(got) != "victim-content" {
+		t.Fatalf("victim file = %q, %v; want unchanged", got, readErr)
+	}
+	_ = turn
 }

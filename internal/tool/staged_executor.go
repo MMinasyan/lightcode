@@ -170,6 +170,7 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 		}
 		return
 	}
+	// re-validate canonical: read-phase guard against approved-target swap before any I/O
 	if !e.validateFileGroup(staged, results, absPath, indexes) {
 		return
 	}
@@ -268,6 +269,7 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 	if successes == 0 {
 		return
 	}
+	// re-validate canonical: post-edit-buffer guard before entering the snapshot block
 	if !e.validateFileGroup(staged, results, absPath, indexes) {
 		return
 	}
@@ -278,6 +280,7 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 		displayAbsPath, err := fileDisplayAbsPath(displayPath)
 		if err == nil {
 			turn := e.store.CurrentTurn()
+			// re-validate canonical: pre-snapshot guard against approved-target swap
 			if !e.validateFileGroup(staged, results, absPath, indexes) {
 				return
 			}
@@ -298,6 +301,7 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 			return
 		}
 	}
+	// re-validate canonical: post-snapshot, pre-write guard against approved-target swap
 	if !e.validateFileGroup(staged, results, absPath, indexes) {
 		if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
 			e.failSuccessful(results, indexes, fmt.Sprintf("discard snapshot: %v", discardErr))

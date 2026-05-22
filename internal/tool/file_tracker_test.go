@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,7 +16,7 @@ func TestFileTrackerTrackRecordsReadAndMtime(t *testing.T) {
 	mtime := time.Unix(100, 0)
 	setTrackerFileMtime(t, path, mtime)
 
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 
 	got, ok := tracker.WasRead(path)
 	if !ok {
@@ -24,7 +25,7 @@ func TestFileTrackerTrackRecordsReadAndMtime(t *testing.T) {
 	if !got.Equal(mtime) {
 		t.Fatalf("WasRead mtime = %v, want %v", got, mtime)
 	}
-	if err := tracker.WasReadCheck(path); err != nil {
+	if err := wasReadCheckForPath(t, tracker, path); err != nil {
 		t.Fatalf("WasReadCheck after unchanged Track = %v", err)
 	}
 }
@@ -33,7 +34,7 @@ func TestFileTrackerWasReadCheckRequiresPriorRead(t *testing.T) {
 	tracker := NewFileTracker()
 	path := testTrackerFile(t, "content")
 
-	err := tracker.WasReadCheck(path)
+	err := wasReadCheckForPath(t, tracker, path)
 	var readErr *ReadRequiredError
 	if !errors.As(err, &readErr) {
 		t.Fatalf("WasReadCheck error = %T %v, want *ReadRequiredError", err, err)
@@ -47,14 +48,14 @@ func TestFileTrackerWasReadCheckDetectsChangedFile(t *testing.T) {
 	tracker := NewFileTracker()
 	path := testTrackerFile(t, "before")
 	setTrackerFileMtime(t, path, time.Unix(100, 0))
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 
 	if err := os.WriteFile(path, []byte("after"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	setTrackerFileMtime(t, path, time.Unix(200, 0))
 
-	err := tracker.WasReadCheck(path)
+	err := wasReadCheckForPath(t, tracker, path)
 	var changedErr *FileChangedError
 	if !errors.As(err, &changedErr) {
 		t.Fatalf("WasReadCheck error = %T %v, want *FileChangedError", err, err)
@@ -67,56 +68,33 @@ func TestFileTrackerWasReadCheckDetectsChangedFile(t *testing.T) {
 func TestFileTrackerWasReadCheckDetectsDeletedFile(t *testing.T) {
 	tracker := NewFileTracker()
 	path := testTrackerFile(t, "content")
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
 
-	err := tracker.WasReadCheck(path)
+	err := wasReadCheckForPath(t, tracker, path)
 	var changedErr *FileChangedError
 	if !errors.As(err, &changedErr) {
 		t.Fatalf("WasReadCheck error = %T %v, want *FileChangedError", err, err)
 	}
 }
 
-func TestFileTrackerUpdateAfterWriteRefreshesTrackedMtime(t *testing.T) {
-	tracker := NewFileTracker()
-	path := testTrackerFile(t, "before")
-	initialMtime := time.Unix(100, 0)
-	updatedMtime := time.Unix(200, 0)
-	setTrackerFileMtime(t, path, initialMtime)
-	tracker.Track(path, 1, 100)
-
-	if err := os.WriteFile(path, []byte("after"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	setTrackerFileMtime(t, path, updatedMtime)
-
-	tracker.UpdateAfterWrite(path)
-
-	got, ok := tracker.WasRead(path)
-	if !ok {
-		t.Fatal("WasRead returned false after UpdateAfterWrite")
-	}
-	if !got.Equal(updatedMtime) {
-		t.Fatalf("mtime after UpdateAfterWrite = %v, want %v", got, updatedMtime)
-	}
-	if err := tracker.WasReadCheck(path); err != nil {
-		t.Fatalf("WasReadCheck after UpdateAfterWrite = %v", err)
-	}
-}
-
-func TestFileTrackerUpdateAfterWriteDoesNotAuthorizeUnreadFile(t *testing.T) {
+func TestFileTrackerUpdateAfterWriteIdentityDoesNotAuthorizeUnreadFile(t *testing.T) {
 	tracker := NewFileTracker()
 	path := testTrackerFile(t, "content")
 
-	tracker.UpdateAfterWrite(path)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracker.UpdateAfterWriteIdentity(path, FileIdentityFromFileInfo(info))
 
 	if _, ok := tracker.WasRead(path); ok {
-		t.Fatal("UpdateAfterWrite created read authorization for unread file")
+		t.Fatal("UpdateAfterWriteIdentity created read authorization for unread file")
 	}
-	err := tracker.WasReadCheck(path)
+	err = wasReadCheckForPath(t, tracker, path)
 	var readErr *ReadRequiredError
 	if !errors.As(err, &readErr) {
 		t.Fatalf("WasReadCheck error = %T %v, want *ReadRequiredError", err, err)
@@ -129,11 +107,11 @@ func TestFileTrackerIsDuplicateMatchesMostRecentSameRange(t *testing.T) {
 	mtime := time.Unix(100, 0)
 	setTrackerFileMtime(t, path, mtime)
 
-	tracker.Track(path, 1, 100)
-	tracker.Track(path, 2, 50)
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 2, 50)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 
-	dup, record := tracker.IsDuplicate(path, 1, 100)
+	dup, record := isDuplicateForPath(t, tracker, path, 1, 100)
 	if !dup {
 		t.Fatal("IsDuplicate returned false for same path/range/mtime")
 	}
@@ -148,12 +126,12 @@ func TestFileTrackerIsDuplicateMatchesMostRecentSameRange(t *testing.T) {
 func TestFileTrackerIsDuplicateRejectsDifferentRange(t *testing.T) {
 	tracker := NewFileTracker()
 	path := testTrackerFile(t, "content")
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 
-	if dup, record := tracker.IsDuplicate(path, 2, 100); dup {
+	if dup, record := isDuplicateForPath(t, tracker, path, 2, 100); dup {
 		t.Fatalf("IsDuplicate returned true for different offset, record=%+v", record)
 	}
-	if dup, record := tracker.IsDuplicate(path, 1, 50); dup {
+	if dup, record := isDuplicateForPath(t, tracker, path, 1, 50); dup {
 		t.Fatalf("IsDuplicate returned true for different limit, record=%+v", record)
 	}
 }
@@ -162,22 +140,22 @@ func TestFileTrackerIsDuplicateRejectsChangedOrDeletedFile(t *testing.T) {
 	tracker := NewFileTracker()
 	path := testTrackerFile(t, "before")
 	setTrackerFileMtime(t, path, time.Unix(100, 0))
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 
 	if err := os.WriteFile(path, []byte("after"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	setTrackerFileMtime(t, path, time.Unix(200, 0))
 
-	if dup, record := tracker.IsDuplicate(path, 1, 100); dup {
+	if dup, record := isDuplicateForPath(t, tracker, path, 1, 100); dup {
 		t.Fatalf("IsDuplicate returned true after mtime changed, record=%+v", record)
 	}
 
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	if dup, record := tracker.IsDuplicate(path, 1, 100); dup {
+	if dup, record := isDuplicateForPath(t, tracker, path, 1, 100); dup {
 		t.Fatalf("IsDuplicate returned true after file deletion, record=%+v", record)
 	}
 }
@@ -185,17 +163,17 @@ func TestFileTrackerIsDuplicateRejectsChangedOrDeletedFile(t *testing.T) {
 func TestFileTrackerResetClearsReadAndDuplicateState(t *testing.T) {
 	tracker := NewFileTracker()
 	path := testTrackerFile(t, "content")
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 
 	tracker.Reset()
 
 	if _, ok := tracker.WasRead(path); ok {
 		t.Fatal("WasRead returned true after Reset")
 	}
-	if dup, record := tracker.IsDuplicate(path, 1, 100); dup {
+	if dup, record := isDuplicateForPath(t, tracker, path, 1, 100); dup {
 		t.Fatalf("IsDuplicate returned true after Reset, record=%+v", record)
 	}
-	err := tracker.WasReadCheck(path)
+	err := wasReadCheckForPath(t, tracker, path)
 	var readErr *ReadRequiredError
 	if !errors.As(err, &readErr) {
 		t.Fatalf("WasReadCheck error after Reset = %T %v, want *ReadRequiredError", err, err)
@@ -205,23 +183,28 @@ func TestFileTrackerResetClearsReadAndDuplicateState(t *testing.T) {
 func TestFileTrackerConcurrentTrackAndWasReadCheck(t *testing.T) {
 	tracker := NewFileTracker()
 	path := testTrackerFile(t, "content")
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 
 	const iterations = 200
 	var tracks int32
 	var checks int32
 	done := make(chan struct{})
 
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := FileIdentityFromFileInfo(info)
 	go func() {
 		defer close(done)
 		for i := 0; i < iterations; i++ {
-			tracker.Track(path, i, 100)
+			tracker.TrackIdentity(path, i, 100, id)
 			atomic.AddInt32(&tracks, 1)
 		}
 	}()
 
 	for i := 0; i < iterations; i++ {
-		if err := tracker.WasReadCheck(path); err != nil {
+		if err := wasReadCheckForPath(t, tracker, path); err != nil {
 			t.Fatalf("WasReadCheck during concurrent Track = %v", err)
 		}
 		atomic.AddInt32(&checks, 1)
@@ -240,83 +223,6 @@ func TestFileTrackerConcurrentTrackAndWasReadCheck(t *testing.T) {
 	}
 }
 
-func TestTrackDoesNotHoldLockWhileStatPending(t *testing.T) {
-	tracker := NewFileTracker()
-	path := testTrackerFile(t, "content")
-
-	origStatFile := statFile
-	statStarted := make(chan struct{})
-	releaseStat := make(chan struct{})
-	statDone := make(chan struct{})
-	statFile = func(name string) (os.FileInfo, error) {
-		close(statStarted)
-		<-releaseStat
-		info, err := origStatFile(name)
-		close(statDone)
-		return info, err
-	}
-	t.Cleanup(func() {
-		statFile = origStatFile
-	})
-
-	trackDone := make(chan struct{})
-	go func() {
-		tracker.Track(path, 1, 100)
-		close(trackDone)
-	}()
-
-	<-statStarted
-
-	resetDone := make(chan struct{})
-	go func() {
-		tracker.Reset()
-		close(resetDone)
-	}()
-
-	select {
-	case <-resetDone:
-	case <-time.After(200 * time.Millisecond):
-		close(releaseStat)
-		<-statDone
-		t.Fatal("Reset blocked while Track was waiting in os.Stat")
-	}
-
-	close(releaseStat)
-	<-trackDone
-}
-
-func TestTrackDoesNotRecordReadStartedBeforeReset(t *testing.T) {
-	tracker := NewFileTracker()
-	path := testTrackerFile(t, "content")
-
-	origStatFile := statFile
-	statStarted := make(chan struct{})
-	releaseStat := make(chan struct{})
-	statFile = func(name string) (os.FileInfo, error) {
-		close(statStarted)
-		<-releaseStat
-		return origStatFile(name)
-	}
-	t.Cleanup(func() {
-		statFile = origStatFile
-	})
-
-	trackDone := make(chan struct{})
-	go func() {
-		tracker.Track(path, 1, 100)
-		close(trackDone)
-	}()
-
-	<-statStarted
-	tracker.Reset()
-	close(releaseStat)
-	<-trackDone
-
-	if err := tracker.WasReadCheck(path); err == nil {
-		t.Fatal("WasReadCheck succeeded for a read that started before Reset")
-	}
-}
-
 func testTrackerFile(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "file.txt")
@@ -326,9 +232,71 @@ func testTrackerFile(t *testing.T, content string) string {
 	return path
 }
 
+// trackIdentityForPath stat-reads the file and records the identity on
+// the tracker. Mirrors what the production read_file path does after
+// opening a descriptor.
+func trackIdentityForPath(t *testing.T, tracker *FileTracker, path string, offset, limit int) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracker.TrackIdentity(path, offset, limit, FileIdentityFromFileInfo(info))
+}
+
+// isDuplicateForPath constructs the current on-disk identity for path
+// and delegates to IsDuplicateIdentity. Returns false on stat/read
+// failure (e.g. deleted file) so test callers that rely on the
+// "deleted file is not a duplicate" semantic continue to work.
+func isDuplicateForPath(t *testing.T, tracker *FileTracker, path string, offset, limit int) (bool, ReadRecord) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, ReadRecord{}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, ReadRecord{}
+	}
+	return tracker.IsDuplicateIdentity(path, offset, limit, FileIdentityFromFileInfoAndData(info, data))
+}
+
+// wasReadCheckForPath constructs the current on-disk identity for path
+// and delegates to WasReadCheckIdentity. On stat/read failure it passes
+// an empty identity so a previously-read path produces
+// FileChangedError, matching the semantic test callers depended on.
+func wasReadCheckForPath(t *testing.T, tracker *FileTracker, path string) error {
+	t.Helper()
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return tracker.WasReadCheckIdentity(path, FileIdentity{})
+	}
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		return tracker.WasReadCheckIdentity(path, FileIdentity{})
+	}
+	return tracker.WasReadCheckIdentity(path, FileIdentityFromFileInfoAndData(info, data))
+}
+
 func setTrackerFileMtime(t *testing.T, path string, mtime time.Time) {
 	t.Helper()
 	if err := os.Chtimes(path, mtime, mtime); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Path-opening tracker helpers must not be exported. Production code uses
+// the *Identity variants which take identity from an already-open
+// descriptor instead of opening a path (and following any symlinks).
+func TestPR11Closure_DeadHelpersRemoved(t *testing.T) {
+	typ := reflect.TypeOf(&FileTracker{})
+	for _, name := range []string{
+		"Track", "TrackMtime",
+		"UpdateAfterWrite", "UpdateAfterWriteMtime",
+		"IsDuplicate", "WasReadCheck",
+	} {
+		if _, ok := typ.MethodByName(name); ok {
+			t.Errorf("forbidden helper %s still exported on *FileTracker", name)
+		}
 	}
 }

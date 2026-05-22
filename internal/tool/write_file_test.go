@@ -28,7 +28,7 @@ func TestWriteFileCreatesNewFileAndParentDirs(t *testing.T) {
 	}
 	assertFileContent(t, path, "created")
 	var readErr *ReadRequiredError
-	if err := tracker.WasReadCheck(path); !errors.As(err, &readErr) {
+	if err := wasReadCheckForPath(t, tracker, path); !errors.As(err, &readErr) {
 		t.Fatalf("WasReadCheck after new-file write = %T %v, want *ReadRequiredError", err, err)
 	}
 }
@@ -37,7 +37,7 @@ func TestWriteFileOverwritesAfterRecentReadAndRefreshesTracker(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "before")
 	setTrackerFileMtime(t, path, time.Unix(100, 0))
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	tool := NewWriteFile(tracker, config.ToolsConfig{})
 
 	result, err := tool.Execute(context.Background(), map[string]any{
@@ -51,7 +51,7 @@ func TestWriteFileOverwritesAfterRecentReadAndRefreshesTracker(t *testing.T) {
 		t.Fatalf("Execute result = %q, want original path in success message", result)
 	}
 	assertFileContent(t, path, "after")
-	if err := tracker.WasReadCheck(path); err != nil {
+	if err := wasReadCheckForPath(t, tracker, path); err != nil {
 		t.Fatalf("WasReadCheck after overwrite = %v", err)
 	}
 }
@@ -75,7 +75,7 @@ func TestWriteFileRejectsOverwriteAfterExternalModification(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "before")
 	setTrackerFileMtime(t, path, time.Unix(100, 0))
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	if err := os.WriteFile(path, []byte("external"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestWriteFileWritesContentExactlyIncludingTrailingNewline(t *testing.T) {
 func TestWriteFileWithSnapshotSnapshotsBeforeWrite(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "before")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	store := &recordingSnapshotStore{turn: 9, before: map[string]string{}}
 	tool := NewWriteFileWithSnapshot(store, tracker, config.ToolsConfig{})
 
@@ -156,7 +156,7 @@ func TestWriteFileWithSnapshotUsesCanonicalTargetAndRequestedResult(t *testing.T
 	}
 	requested := filepath.Join(linkDir, "file.txt")
 	tracker := NewFileTracker()
-	tracker.Track(target, 1, 100)
+	trackIdentityForPath(t, tracker, target, 1, 100)
 	store := &recordingSnapshotStore{turn: 10, before: map[string]string{}}
 	tool := NewWriteFileWithSnapshot(store, tracker, config.ToolsConfig{})
 
@@ -181,7 +181,7 @@ func TestWriteFileWithSnapshotUsesCanonicalTargetAndRequestedResult(t *testing.T
 		t.Fatalf("snapshot saw %q, want pre-write content", store.before[target])
 	}
 	assertFileContent(t, target, "after")
-	if err := tracker.WasReadCheck(target); err != nil {
+	if err := wasReadCheckForPath(t, tracker, target); err != nil {
 		t.Fatalf("canonical target WasReadCheck = %v", err)
 	}
 }

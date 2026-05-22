@@ -8,11 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"golang.org/x/sys/unix"
 )
 
@@ -445,4 +447,129 @@ func nonRegularUnixSocket(t *testing.T) string {
 		_ = ln.Close()
 	})
 	return path
+}
+
+// A hardlink inside the project pointing to an outside-boundary inode
+// must be refused at every file-tool entry point: read_file, write_file,
+// edit_file, the staged executor (write + edit), and snapshot capture.
+func TestPR11Closure_HardlinkRefusedAcrossAllOperations(t *testing.T) {
+	makeHardlink := func(t *testing.T) (hardlinked, outside string) {
+		t.Helper()
+		project := t.TempDir()
+		outsideDir := t.TempDir()
+		outside = filepath.Join(outsideDir, "outside.txt")
+		if err := os.WriteFile(outside, []byte("outside-content"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		hardlinked = filepath.Join(project, "hardlinked.txt")
+		if err := os.Link(outside, hardlinked); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(hardlinked)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || st.Nlink < 2 {
+			t.Fatalf("setup: hardlinked target nlink = %d, want >= 2", st.Nlink)
+		}
+		return hardlinked, outside
+	}
+
+	assertHardlinkRefusal := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("operation succeeded on hardlinked target; want refusal")
+		}
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "hardlink") && !strings.Contains(msg, "link count") && !strings.Contains(msg, "nlink") {
+			t.Fatalf("error %v does not mention hardlink/link count/nlink", err)
+		}
+	}
+
+	preTrack := func(t *testing.T, tracker *FileTracker, path string) {
+		t.Helper()
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tracker.TrackIdentity(path, 0, 500, FileIdentityFromFileInfoAndData(info, data))
+	}
+
+	t.Run("read_file", func(t *testing.T) {
+		hardlinked, _ := makeHardlink(t)
+		_, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, NewFileTracker()).Execute(
+			context.Background(), map[string]any{"path": hardlinked})
+		assertHardlinkRefusal(t, err)
+	})
+
+	t.Run("write_file", func(t *testing.T) {
+		hardlinked, _ := makeHardlink(t)
+		tracker := NewFileTracker()
+		preTrack(t, tracker, hardlinked)
+		_, err := NewWriteFile(tracker, config.ToolsConfig{}).Execute(
+			context.Background(), map[string]any{"path": hardlinked, "content": "mutated"})
+		assertHardlinkRefusal(t, err)
+	})
+
+	t.Run("edit_file", func(t *testing.T) {
+		hardlinked, _ := makeHardlink(t)
+		tracker := NewFileTracker()
+		preTrack(t, tracker, hardlinked)
+		_, err := NewEditFile(tracker, config.ToolsConfig{}).Execute(
+			context.Background(), map[string]any{
+				"path":       hardlinked,
+				"old_string": "outside-content",
+				"new_string": "tampered",
+			})
+		assertHardlinkRefusal(t, err)
+	})
+
+	t.Run("staged_write", func(t *testing.T) {
+		hardlinked, _ := makeHardlink(t)
+		results := NewStagedExecutor(nil, nil, config.ToolsConfig{}, allowNonRegularStagedCall, nil).ExecutePending(
+			context.Background(), []StagedCall{stagedNonRegularWrite(hardlinked, "call-1", "mutated")})
+		assertHardlinkRefusal(t, singleNonRegularBatchError(results))
+	})
+
+	t.Run("staged_edit", func(t *testing.T) {
+		hardlinked, _ := makeHardlink(t)
+		tracker := NewFileTracker()
+		preTrack(t, tracker, hardlinked)
+		call := StagedCall{
+			ToolName:   "edit_file",
+			ToolCallID: "call-1",
+			Params: map[string]any{
+				"path":       hardlinked,
+				"old_string": "outside-content",
+				"new_string": "tampered",
+			},
+		}
+		results := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowNonRegularStagedCall, nil).ExecutePending(
+			context.Background(), []StagedCall{call})
+		assertHardlinkRefusal(t, singleNonRegularBatchError(results))
+	})
+
+	t.Run("snapshot_capture", func(t *testing.T) {
+		hardlinked, _ := makeHardlink(t)
+		store, err := snapshot.NewForSessionsRoot(t.TempDir(), "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.BeginNewSession(t.TempDir()); err != nil {
+			t.Fatal(err)
+		}
+		if turn := store.BeginTurn(); turn != 1 {
+			t.Fatalf("BeginTurn = %d, want 1", turn)
+		}
+		tracker := NewFileTracker()
+		preTrack(t, tracker, hardlinked)
+		_, err = NewWriteFileWithSnapshot(store, tracker, config.ToolsConfig{}).Execute(
+			context.Background(), map[string]any{"path": hardlinked, "content": "mutated"})
+		assertHardlinkRefusal(t, err)
+	})
 }

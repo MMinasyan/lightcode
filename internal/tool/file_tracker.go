@@ -9,8 +9,6 @@ import (
 	"time"
 )
 
-var statFile = os.Stat
-
 // ReadRecord records a read_file call for deduplication and edit enforcement.
 type ReadRecord struct {
 	Path     string
@@ -50,26 +48,6 @@ func NewFileTracker() *FileTracker {
 	}
 }
 
-// Track records that a file was read at the given mtime.
-func (t *FileTracker) Track(path string, offset, limit int) {
-	t.mu.Lock()
-	generation := t.generation
-	t.mu.Unlock()
-
-	info, err := statFile(path)
-	identity := FileIdentity{}
-	if err == nil {
-		identity = FileIdentityFromFileInfo(info)
-	}
-
-	t.trackIdentity(path, offset, limit, identity, generation)
-}
-
-// TrackMtime records a read using metadata from the already-opened file.
-func (t *FileTracker) TrackMtime(path string, offset, limit int, mtime time.Time) {
-	t.TrackIdentity(path, offset, limit, FileIdentity{Mtime: mtime})
-}
-
 // TrackIdentity records a read using identity metadata from the already-opened file.
 func (t *FileTracker) TrackIdentity(path string, offset, limit int, identity FileIdentity) {
 	t.mu.Lock()
@@ -92,41 +70,6 @@ func (t *FileTracker) trackIdentity(path string, offset, limit int, identity Fil
 		Identity: identity,
 		Mtime:    identity.Mtime,
 	})
-}
-
-// UpdateAfterWrite refreshes the tracked mtime for a file that was already
-// read-authorized. Writes must not create read authorization by themselves.
-func (t *FileTracker) UpdateAfterWrite(path string) {
-	t.mu.Lock()
-	generation := t.generation
-	if _, ok := t.identities[path]; !ok {
-		t.mu.Unlock()
-		return
-	}
-	t.mu.Unlock()
-
-	info, err := statFile(path)
-	if err != nil {
-		return
-	}
-
-	identity := FileIdentityFromFileInfo(info)
-	if f, err := os.Open(path); err == nil {
-		if stat, statErr := f.Stat(); statErr == nil {
-			if current, idErr := FileIdentityFromOpenFile(f, stat); idErr == nil {
-				identity = current
-			}
-		}
-		_ = f.Close()
-	}
-
-	t.updateAfterWriteIdentity(path, identity, generation)
-}
-
-// UpdateAfterWriteMtime refreshes the tracked mtime using metadata from the
-// already-opened file after a successful write.
-func (t *FileTracker) UpdateAfterWriteMtime(path string, mtime time.Time) {
-	t.UpdateAfterWriteIdentity(path, FileIdentity{Mtime: mtime})
 }
 
 // UpdateAfterWriteIdentity refreshes the tracked identity using metadata from
@@ -158,16 +101,6 @@ func (t *FileTracker) Reset() {
 	t.generation++
 	t.reads = nil
 	t.identities = make(map[string]FileIdentity)
-}
-
-// IsDuplicate checks if path+offset+limit was already read AND
-// the file hasn't changed on disk since that read.
-func (t *FileTracker) IsDuplicate(path string, offset, limit int) (bool, ReadRecord) {
-	identity, err := fileIdentityFromPath(path)
-	if err != nil {
-		return false, ReadRecord{}
-	}
-	return t.IsDuplicateIdentity(path, offset, limit, identity)
 }
 
 // IsDuplicateMtime checks duplicate status against metadata from an already-opened file.
@@ -205,22 +138,6 @@ func (t *FileTracker) HasRead(path string) bool {
 	defer t.mu.Unlock()
 	_, ok := t.identities[path]
 	return ok
-}
-
-// WasReadCheck checks if path was read and hasn't changed since.
-// Returns nil if OK, or an error describing the problem.
-func (t *FileTracker) WasReadCheck(path string) error {
-	t.mu.Lock()
-	_, wasRead := t.identities[path]
-	t.mu.Unlock()
-	if !wasRead {
-		return &ReadRequiredError{Path: path}
-	}
-	identity, err := fileIdentityFromPath(path)
-	if err != nil {
-		return &FileChangedError{Path: path}
-	}
-	return t.WasReadCheckIdentity(path, identity)
 }
 
 // WasReadCheckMtime checks read authorization against metadata from an already-opened file.
@@ -295,19 +212,6 @@ func FileIdentityFromOpenFile(f *os.File, info os.FileInfo) (FileIdentity, error
 		return FileIdentity{}, err
 	}
 	return FileIdentityFromFileInfoAndData(info, data), nil
-}
-
-func fileIdentityFromPath(path string) (FileIdentity, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return FileIdentity{}, err
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return FileIdentity{}, err
-	}
-	return FileIdentityFromOpenFile(f, info)
 }
 
 func identityMatches(expected, current FileIdentity) bool {

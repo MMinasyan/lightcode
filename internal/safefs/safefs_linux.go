@@ -12,7 +12,9 @@ import (
 )
 
 // OpenExisting opens path without following any symlink in the parent
-// components or final leaf.
+// components or final leaf. Refuses non-regular and hardlinked leaves
+// via requireRegularFD so reads through this entry point cannot cross
+// the file-tool boundary onto an outside-of-project inode.
 func OpenExisting(path string, flag int) (*os.File, error) {
 	parent, base, err := openParent(path, false, 0)
 	if err != nil {
@@ -22,6 +24,10 @@ func OpenExisting(path string, flag int) (*os.File, error) {
 	fd, err := unix.Openat(parent, base, flag|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, &os.PathError{Op: "openat", Path: path, Err: err}
+	}
+	if err := requireRegularFD(fd, path); err != nil {
+		closeFD(fd)
+		return nil, err
 	}
 	return os.NewFile(uintptr(fd), path), nil
 }
@@ -161,6 +167,9 @@ func requireRegularFD(fd int, path string) error {
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return fmt.Errorf("safefs: non-regular file target: %s", path)
+	}
+	if st.Nlink > 1 {
+		return fmt.Errorf("safefs: hardlinked target (link count > 1): %s", path)
 	}
 	return nil
 }

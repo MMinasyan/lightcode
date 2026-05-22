@@ -222,3 +222,86 @@ func assertEvaluateDecision(t *testing.T, rules Rules, command string, want Deci
 		t.Fatalf("Evaluate(%q) = %d, want %d", command, got, want)
 	}
 }
+
+func TestPR11Closure_ShellWrapperWildcardDoesNotAuthorizeChildren(t *testing.T) {
+	for _, wrapper := range []string{"sh", "bash", "dash", "zsh"} {
+		wrapper := wrapper
+		t.Run(wrapper, func(t *testing.T) {
+			outerOnly := Rules{Allow: []string{"run_command(" + wrapper + " -c *)"}}
+			assertEvaluateDecision(t, outerOnly,
+				wrapper+" -c 'rm -rf x'",
+				DecisionAsk,
+			)
+
+			withDeny := Rules{
+				Allow: []string{"run_command(" + wrapper + " -c *)"},
+				Deny:  []string{"run_command(rm *)"},
+			}
+			assertEvaluateDecision(t, withDeny,
+				wrapper+" -c 'echo ok && rm -rf x'",
+				DecisionDeny,
+			)
+
+			withAsk := Rules{
+				Allow: []string{"run_command(" + wrapper + " -c *)"},
+				Ask:   []string{"run_command(rm *)"},
+			}
+			assertEvaluateDecision(t, withAsk,
+				wrapper+" -c 'echo ok && rm -rf x'",
+				DecisionAsk,
+			)
+
+			positive := Rules{Allow: []string{
+				"run_command(" + wrapper + " -c *)",
+				"run_command(echo *)",
+			}}
+			assertEvaluateDecision(t, positive,
+				wrapper+" -c 'echo a && echo b'",
+				DecisionAllow,
+			)
+
+			exact := Rules{Allow: []string{"run_command(" + wrapper + " -c 'echo hello')"}}
+			assertEvaluateDecision(t, exact,
+				wrapper+" -c 'echo hello'",
+				DecisionAllow,
+			)
+
+			// Mixed-rules order independence: an exact-wrapper rule must
+			// still allow even when a wildcard-wrapper rule is saved in the
+			// same set, regardless of which one comes first.
+			mixedWildcardFirst := Rules{Allow: []string{
+				"run_command(" + wrapper + " -c *)",
+				"run_command(" + wrapper + " -c 'echo hello')",
+			}}
+			assertEvaluateDecision(t, mixedWildcardFirst,
+				wrapper+" -c 'echo hello'",
+				DecisionAllow,
+			)
+
+			mixedExactFirst := Rules{Allow: []string{
+				"run_command(" + wrapper + " -c 'echo hello')",
+				"run_command(" + wrapper + " -c *)",
+			}}
+			assertEvaluateDecision(t, mixedExactFirst,
+				wrapper+" -c 'echo hello'",
+				DecisionAllow,
+			)
+		})
+	}
+}
+
+func TestPR11Closure_CommandEnvAsymmetryIsIntentional(t *testing.T) {
+	commandAllow := Rules{Allow: []string{"run_command(ls)"}}
+	assertEvaluateDecision(t, commandAllow, "command ls", DecisionAllow)
+	assertEvaluateDecision(t, commandAllow, "env FOO=bar ls", DecisionAsk)
+	assertEvaluateDecision(t, commandAllow, "command -p ls", DecisionAsk)
+
+	for _, command := range []string{
+		"env -i ls",
+		"env -u VAR ls",
+		"env -C /tmp ls",
+		"env -S 'ls' ls",
+	} {
+		assertEvaluateDecision(t, commandAllow, command, DecisionAsk)
+	}
+}

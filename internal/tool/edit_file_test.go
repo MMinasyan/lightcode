@@ -15,7 +15,7 @@ import (
 func TestEditFileReplacesUniqueStringAndReportsLineRange(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "alpha\nbeta\ngamma")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	tool := NewEditFile(tracker, config.ToolsConfig{})
 
 	result, err := tool.Execute(context.Background(), map[string]any{
@@ -30,7 +30,7 @@ func TestEditFileReplacesUniqueStringAndReportsLineRange(t *testing.T) {
 		t.Fatalf("Execute result = %q, want one-replacement summary", result)
 	}
 	assertFileContent(t, path, "alpha\ndelta\ngamma")
-	if err := tracker.WasReadCheck(path); err != nil {
+	if err := wasReadCheckForPath(t, tracker, path); err != nil {
 		t.Fatalf("WasReadCheck after edit = %v", err)
 	}
 }
@@ -38,7 +38,7 @@ func TestEditFileReplacesUniqueStringAndReportsLineRange(t *testing.T) {
 func TestEditFileReplaceAllReportsAllLineRanges(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "same\nother\nsame")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	tool := NewEditFile(tracker, config.ToolsConfig{})
 
 	result, err := tool.Execute(context.Background(), map[string]any{
@@ -59,7 +59,7 @@ func TestEditFileReplaceAllReportsAllLineRanges(t *testing.T) {
 func TestEditFileRejectsAmbiguousMatchWithoutReplaceAll(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "same\nsame")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	tool := NewEditFile(tracker, config.ToolsConfig{})
 
 	_, err := tool.Execute(context.Background(), map[string]any{
@@ -76,7 +76,7 @@ func TestEditFileRejectsAmbiguousMatchWithoutReplaceAll(t *testing.T) {
 func TestEditFileValidatesOldString(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "content")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	tool := NewEditFile(tracker, config.ToolsConfig{})
 
 	tests := []struct {
@@ -125,7 +125,7 @@ func TestEditFileRejectsEditAfterExternalModification(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "before")
 	setTrackerFileMtime(t, path, time.Unix(100, 0))
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	if err := os.WriteFile(path, []byte("external"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestEditFileRejectsEditAfterExternalModification(t *testing.T) {
 func TestEditFileMultilineReplacementLineRange(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "start\nold\nend")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	tool := NewEditFile(tracker, config.ToolsConfig{})
 
 	result, err := tool.Execute(context.Background(), map[string]any{
@@ -167,7 +167,7 @@ func TestEditFileMultilineReplacementLineRange(t *testing.T) {
 func TestEditFileWithSnapshotSnapshotsBeforeEdit(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "before")
 	tracker := NewFileTracker()
-	tracker.Track(path, 1, 100)
+	trackIdentityForPath(t, tracker, path, 1, 100)
 	store := &recordingSnapshotStore{turn: 11, before: map[string]string{}}
 	tool := NewEditFileWithSnapshot(store, tracker, config.ToolsConfig{})
 
@@ -207,7 +207,7 @@ func TestEditFileWithSnapshotUsesCanonicalTargetAndRequestedResult(t *testing.T)
 	}
 	requested := filepath.Join(linkDir, "file.txt")
 	tracker := NewFileTracker()
-	tracker.Track(target, 1, 100)
+	trackIdentityForPath(t, tracker, target, 1, 100)
 	store := &recordingSnapshotStore{turn: 12, before: map[string]string{}}
 	tool := NewEditFileWithSnapshot(store, tracker, config.ToolsConfig{})
 

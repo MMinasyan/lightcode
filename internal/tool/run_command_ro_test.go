@@ -327,3 +327,34 @@ func writeExecutableForReadOnlyTest(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+func TestPR11Closure_GitSubcommandLocalDashCDeliberatelyBlocked(t *testing.T) {
+	for _, command := range []string{
+		"git diff -c HEAD",
+		"git log -c HEAD",
+		"git show -c HEAD",
+	} {
+		t.Run(command, func(t *testing.T) {
+			if isReadOnlyCommand(command) {
+				t.Fatalf("isReadOnlyCommand(%q) = true, want false (subcommand-local -c is deliberately blocked)", command)
+			}
+		})
+	}
+	if !isReadOnlyCommand("git diff -- -c") {
+		t.Fatal("isReadOnlyCommand(\"git diff -- -c\") = false, want true (literal -- escape must still work)")
+	}
+}
+
+func TestPR11Closure_ReadOnlyRejectsHeredocAndHereString(t *testing.T) {
+	for _, command := range []string{
+		"cat <<EOF",
+		"cat <<<input",
+		`grep pattern <<<"$var"`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			if isReadOnlyCommand(command) {
+				t.Fatalf("isReadOnlyCommand(%q) = true, want false (heredoc/here-string redirection must be rejected)", command)
+			}
+		})
+	}
+}

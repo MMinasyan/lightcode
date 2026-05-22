@@ -103,6 +103,7 @@ func (e *EditFileWithSnapshot) Execute(_ context.Context, params map[string]any)
 	if err != nil {
 		return "", fmt.Errorf("edit_file: resolve path: %w", err)
 	}
+	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
 	securityPath, err := fileSecurityPath(params, path)
 	if err != nil {
 		return "", fmt.Errorf("edit_file: resolve path: %w", err)
@@ -187,6 +188,7 @@ func editFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker, 
 		return nil, false, fmt.Errorf("edit_file: old_string and new_string are identical")
 	}
 
+	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
 	absPath, err := fileSecurityPath(params, path)
 	if err != nil {
 		return nil, false, fmt.Errorf("edit_file: resolve path: %w", err)

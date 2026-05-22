@@ -28,6 +28,16 @@ const lightcodeVersion = "0.3.0"
 // session when none is open.
 var ErrNoSession = errors.New("snapshot: no session open")
 
+// copyDirFunc is the outer-loop directory copy used by ForkInto. Tests
+// override it to coordinate timing inside the fork copy loop; production
+// always uses the real copyDir.
+var copyDirFunc = copyDir
+
+// forkIntoLockReleasedHook fires immediately before ForkInto releases
+// s.mu. Production no-op; tests use it to detect early release of the
+// lock from the fork copy region.
+var forkIntoLockReleasedHook = func() {}
+
 // Store owns one session directory at a time. Its session may be
 // swapped (Close + BeginNewSession / LoadSession) while tool and loop
 // references to the Store remain valid — they call methods on the same
@@ -660,10 +670,10 @@ func (s *Store) RevertCode(toTurn int) ([]string, error) {
 		}
 		turnDir := filepath.Join(s.snapshotsDir, strconv.Itoa(turn))
 		paths, err := revertOneTurn(turnDir)
+		affected = append(affected, paths...)
 		if err != nil {
 			return affected, fmt.Errorf("snapshot: revert turn %d: %w", turn, err)
 		}
-		affected = append(affected, paths...)
 		if err := os.RemoveAll(turnDir); err != nil {
 			return affected, fmt.Errorf("snapshot: remove %s: %w", turnDir, err)
 		}
@@ -699,14 +709,16 @@ func (s *Store) RevertHistory(toTurn int) error {
 // path of the new session dir. Caller is responsible for switching to it.
 func (s *Store) ForkInto(toTurn int) (string, string, error) {
 	s.mu.Lock()
-	if !s.active {
+	defer func() {
+		forkIntoLockReleasedHook()
 		s.mu.Unlock()
+	}()
+	if !s.active {
 		return "", "", ErrNoSession
 	}
 	srcDir := s.dir
 	root := s.root
 	projectRoot := s.projectRoot
-	s.mu.Unlock()
 
 	newID, err := newSessionID()
 	if err != nil {
@@ -726,13 +738,13 @@ func (s *Store) ForkInto(toTurn int) (string, string, error) {
 		ts := strconv.Itoa(turn)
 		srcSnap := filepath.Join(srcDir, "snapshots", ts)
 		if info, err := os.Stat(srcSnap); err == nil && info.IsDir() {
-			if err := copyDir(srcSnap, filepath.Join(newSnapshots, ts)); err != nil {
+			if err := copyDirFunc(srcSnap, filepath.Join(newSnapshots, ts)); err != nil {
 				return "", "", fmt.Errorf("snapshot: fork: copy snapshots/%d: %w", turn, err)
 			}
 		}
 		srcTurn := filepath.Join(srcDir, "turns", ts)
 		if info, err := os.Stat(srcTurn); err == nil && info.IsDir() {
-			if err := copyDir(srcTurn, filepath.Join(newTurns, ts)); err != nil {
+			if err := copyDirFunc(srcTurn, filepath.Join(newTurns, ts)); err != nil {
 				return "", "", fmt.Errorf("snapshot: fork: copy turns/%d: %w", turn, err)
 			}
 		}
@@ -1158,23 +1170,15 @@ func validateRestorePath(entryID string, meta SnapshotMeta) (string, error) {
 
 func validateDeletePath(entryID string, meta SnapshotMeta) (string, error) {
 	if meta.CanonicalPath != "" {
-		return validateModernDeletePath(meta)
+		return validateModernDeletePath(entryID, meta)
 	}
-	if !isLegacyEntryID(entryID) {
-		return "", fmt.Errorf("legacy snapshot entry id %q is invalid", entryID)
-	}
-	absPath, err := filepath.Abs(meta.OriginalPath)
-	if err != nil {
-		return "", fmt.Errorf("resolve legacy restore path %s: %w", meta.OriginalPath, err)
-	}
-	cleanAbs := filepath.Clean(absPath)
-	if got := hashString(cleanAbs); got != entryID {
-		return "", fmt.Errorf("legacy snapshot target hash changed from %s to %s", entryID, got)
-	}
-	return cleanAbs, nil
+	return "", fmt.Errorf("legacy delete refused: %s has no canonical proof", meta.OriginalPath)
 }
 
-func validateModernDeletePath(meta SnapshotMeta) (string, error) {
+func validateModernDeletePath(entryID string, meta SnapshotMeta) (string, error) {
+	if hashString(meta.CanonicalPath) != entryID {
+		return "", fmt.Errorf("modern delete refused: meta canonical path %q does not match entry id %s", meta.CanonicalPath, entryID)
+	}
 	absOriginal, err := filepath.Abs(meta.OriginalPath)
 	if err != nil {
 		return "", fmt.Errorf("resolve delete path %s: %w", meta.OriginalPath, err)
