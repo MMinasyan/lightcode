@@ -2,12 +2,30 @@ package tool
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
 )
+
+func TestReadOnlyRunCommandRejectsBackgroundParamBeforeProcessManager(t *testing.T) {
+	procMgr := &recordingProcessManager{id: "proc-1"}
+	tool := NewReadOnlyRunCommand(NewRunCommand(config.ToolsConfig{CommandTimeout: 2}, t.TempDir(), procMgr))
+
+	_, err := tool.Execute(context.Background(), map[string]any{"command": "pwd", "background": true})
+	if err == nil || !strings.Contains(err.Error(), "background") || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("Execute background error = %v, want read-only background rejection", err)
+	}
+	if procMgr.command != "" {
+		t.Fatalf("background command started as %q, want no process start", procMgr.command)
+	}
+}
 
 func TestReadOnlyRunCommandAllowsWhitelistedCommands(t *testing.T) {
 	tool := NewReadOnlyRunCommand(NewRunCommand(config.ToolsConfig{CommandTimeout: 2}, t.TempDir(), nil))
@@ -40,6 +58,7 @@ func TestReadOnlyRunCommandAllowsWhitelistedCommands(t *testing.T) {
 		{name: "git tag list pattern", command: "git tag -l 'v*'", want: ""},
 		{name: "find name", command: "find . -name '*.go'", want: ".go"},
 		{name: "literal redirection character", command: "echo '>'", want: ">"},
+		{name: "double quoted regex backslash", command: `printf '%s\n' "foo\.bar"`, want: `foo\.bar`},
 	}
 
 	for _, tt := range tests {
@@ -55,17 +74,45 @@ func TestReadOnlyRunCommandAllowsWhitelistedCommands(t *testing.T) {
 	}
 }
 
+func TestReadOnlyRunCommandIgnoresModelSuppliedTimeout(t *testing.T) {
+	tempDir := t.TempDir()
+	target := filepath.Join(tempDir, "log.txt")
+	if err := os.WriteFile(target, []byte("line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewReadOnlyRunCommand(NewRunCommand(config.ToolsConfig{CommandTimeout: 1}, tempDir, nil))
+
+	start := time.Now()
+	_, err := tool.Execute(context.Background(), map[string]any{
+		"command": "tail -f " + quoteShellArg(target),
+		"timeout": float64(30),
+	})
+	if err == nil {
+		t.Fatal("Execute succeeded, want configured timeout")
+	}
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) || !strings.Contains(exitErr.Output, "timeout") {
+		t.Fatalf("Execute error = %v, want configured timeout ExitError", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("Execute elapsed %s, model-supplied timeout was not ignored", elapsed)
+	}
+}
+
 func TestReadOnlyRunCommandRejectsUnsafeCommands(t *testing.T) {
 	tool := NewReadOnlyRunCommand(NewRunCommand(config.ToolsConfig{CommandTimeout: 2}, t.TempDir(), nil))
 	tests := []string{
 		"",
 		"rm -rf file",
 		"echo unsafe > file.txt",
+		"cat <(echo ok)",
 		"echo $(touch /tmp/x)",
 		"echo `touch /tmp/x`",
 		"echo allowed\nrm -rf file",
 		"echo allowed\rrm -rf file",
 		"echo ok & rm -rf file",
+		"&& pwd",
+		"echo ok && && pwd",
 		"echo allowed && rm -rf file",
 		`echo \" && touch /tmp/lightcode-owned \"`,
 		"cat missing.txt || rm -rf file",
@@ -79,7 +126,9 @@ func TestReadOnlyRunCommandRejectsUnsafeCommands(t *testing.T) {
 		`git log --out\put /tmp/lightcode-out -1`,
 		"git show --output=/tmp/lightcode-out HEAD",
 		"git diff --ext-diff",
+		`git diff --ext-\diff`,
 		"git show --textconv HEAD:README.md",
+		`git show --text\conv HEAD:README.md`,
 		"git branch -d old",
 		"git branch -D main",
 		"git branch -m old new",
@@ -88,10 +137,23 @@ func TestReadOnlyRunCommandRejectsUnsafeCommands(t *testing.T) {
 		"git tag v1",
 		"git tag -f v1",
 		"git tag --delete v1",
+		"tree -o /tmp/lightcode-ro-tree",
+		"file README.md",
+		"file -z README.md",
+		"file --uncompress README.md",
+		"file -Z README.md",
+		"file --uncompress-noreport README.md",
+		"file -S README.md",
+		"file --no-sandbox README.md",
 		"rg --pre=touch package .",
 		`rg --pre\=touch package .`,
 		"rg --pre touch package .",
 		"rg --pre-glob=*.go package .",
+		`rg --pre-\glob=*.go package .`,
+		"rg -z package .",
+		"rg --search-zip package .",
+		`rg --search-\zip package .`,
+		"rg -zS package .",
 		"git diff --out*",
 		"echo *",
 		"echo ?",
@@ -118,6 +180,8 @@ func TestIsReadOnlyCommandClassifiesChainsBeforePrefixAllow(t *testing.T) {
 		want    bool
 	}{
 		{command: "echo allowed && pwd", want: true},
+		{command: "&& pwd", want: false},
+		{command: "echo ok && && pwd", want: false},
 		{command: "echo allowed && rm -rf file", want: false},
 		{command: "echo \"a && b\"", want: true},
 		{command: `echo \" && touch /tmp/lightcode-owned \"`, want: false},
@@ -136,10 +200,16 @@ func TestIsReadOnlyCommandClassifiesChainsBeforePrefixAllow(t *testing.T) {
 		{command: "find . '-delete'", want: false},
 		{command: "rg package .", want: true},
 		{command: "rg -- --pre run_command_ro_test.go", want: true},
+		{command: "rg -- --search-zip run_command_ro_test.go", want: true},
 		{command: "rg --pre=touch package .", want: false},
 		{command: `rg --pre\=touch package .`, want: false},
+		{command: "rg -z package .", want: false},
+		{command: "rg --search-zip package .", want: false},
+		{command: `rg --search-\zip package .`, want: false},
+		{command: "rg -zS package .", want: false},
 		{command: "git log --output=/tmp/lightcode-out -1", want: false},
 		{command: `git log --out\put /tmp/lightcode-out -1`, want: false},
+		{command: "tree -o /tmp/lightcode-ro-tree", want: false},
 		{command: " echo trimmed ", want: true},
 		{command: "echo unsafe > file", want: false},
 		{command: "echo '$(whoami)'", want: true},
@@ -154,5 +224,75 @@ func TestIsReadOnlyCommandClassifiesChainsBeforePrefixAllow(t *testing.T) {
 				t.Fatalf("isReadOnlyCommand(%q) = %v, want %v", tt.command, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestReadOnlyRunCommandSuppressesGitContentHelpers(t *testing.T) {
+	repo := t.TempDir()
+	runGitForReadOnlyTest(t, repo, "init")
+	runGitForReadOnlyTest(t, repo, "config", "user.email", "test@example.invalid")
+	runGitForReadOnlyTest(t, repo, "config", "user.name", "Test User")
+
+	marker := filepath.Join(repo, "helper-ran")
+	textconv := filepath.Join(repo, "textconv.sh")
+	external := filepath.Join(repo, "external.sh")
+	writeExecutableForReadOnlyTest(t, textconv, fmt.Sprintf("#!/bin/sh\nprintf textconv >> %q\ncat \"$1\"\n", marker))
+	writeExecutableForReadOnlyTest(t, external, fmt.Sprintf("#!/bin/sh\nprintf external >> %q\nexit 0\n", marker))
+
+	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("*.secret diff=secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "file.secret"), []byte("one\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitForReadOnlyTest(t, repo, "add", ".")
+	runGitForReadOnlyTest(t, repo, "commit", "-m", "initial")
+	runGitForReadOnlyTest(t, repo, "config", "diff.secret.textconv", textconv)
+	runGitForReadOnlyTest(t, repo, "config", "diff.external", external)
+	if err := os.WriteFile(filepath.Join(repo, "file.secret"), []byte("two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitForReadOnlyTest(t, repo, "add", "file.secret")
+	runGitForReadOnlyTest(t, repo, "commit", "-m", "second")
+	if err := os.WriteFile(filepath.Join(repo, "file.secret"), []byte("three\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Chdir(repo)
+	tool := NewReadOnlyRunCommand(NewRunCommand(config.ToolsConfig{CommandTimeout: 5}, repo, nil))
+	for _, command := range []string{
+		"git diff -- file.secret",
+		"git log -p -1 -- file.secret",
+		"git show HEAD -- file.secret",
+		"git show HEAD:file.secret",
+		"git blame -- file.secret",
+	} {
+		t.Run(command, func(t *testing.T) {
+			_ = os.Remove(marker)
+			if _, err := tool.Execute(context.Background(), map[string]any{"command": command}); err != nil {
+				t.Fatalf("Execute(%q) error = %v", command, err)
+			}
+			if data, err := os.ReadFile(marker); err == nil {
+				t.Fatalf("Execute(%q) ran configured helper: %q", command, data)
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("marker read error = %v", err)
+			}
+		})
+	}
+}
+
+func runGitForReadOnlyTest(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, output)
+	}
+}
+
+func writeExecutableForReadOnlyTest(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
 	}
 }

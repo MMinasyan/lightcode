@@ -10,6 +10,7 @@ import (
 type Segment struct {
 	Text            string
 	Normalized      string
+	Separator       string
 	Argv            []string
 	Redirections    []Redirection
 	UnsafeExpansion bool
@@ -62,7 +63,57 @@ func (p *parser) scan() error {
 			continue
 		}
 
+		if p.inDouble {
+			if r == '\\' {
+				if p.skipLineContinuation(&i) {
+					continue
+				}
+				p.raw.WriteRune(r)
+				if i+1 >= len(p.runes) {
+					p.arg.WriteRune(r)
+					p.hadArg = true
+					continue
+				}
+				next := p.runes[i+1]
+				if isDoubleQuoteEscapedRune(next) {
+					i++
+					p.raw.WriteRune(next)
+					p.arg.WriteRune(next)
+					p.hadArg = true
+					continue
+				}
+				p.arg.WriteRune(r)
+				p.hadArg = true
+				continue
+			}
+
+			switch r {
+			case '"':
+				p.raw.WriteRune(r)
+				p.inDouble = false
+				p.hadArg = true
+			case '`':
+				return fmt.Errorf("backtick command substitution not allowed")
+			case '$':
+				p.raw.WriteRune(r)
+				if i+1 < len(p.runes) && p.runes[i+1] == '(' {
+					return fmt.Errorf("$() command substitution not allowed")
+				}
+				p.segment.UnsafeExpansion = true
+				p.arg.WriteRune(r)
+				p.hadArg = true
+			default:
+				p.raw.WriteRune(r)
+				p.arg.WriteRune(r)
+				p.hadArg = true
+			}
+			continue
+		}
+
 		if r == '\\' {
+			if p.skipLineContinuation(&i) {
+				continue
+			}
 			p.raw.WriteRune(r)
 			if i+1 >= len(p.runes) {
 				p.arg.WriteRune(r)
@@ -74,28 +125,6 @@ func (p *parser) scan() error {
 			p.raw.WriteRune(next)
 			p.arg.WriteRune(next)
 			p.hadArg = true
-			continue
-		}
-
-		if p.inDouble {
-			p.raw.WriteRune(r)
-			switch r {
-			case '"':
-				p.inDouble = false
-				p.hadArg = true
-			case '`':
-				return fmt.Errorf("backtick command substitution not allowed")
-			case '$':
-				if i+1 < len(p.runes) && p.runes[i+1] == '(' {
-					return fmt.Errorf("$() command substitution not allowed")
-				}
-				p.segment.UnsafeExpansion = true
-				p.arg.WriteRune(r)
-				p.hadArg = true
-			default:
-				p.arg.WriteRune(r)
-				p.hadArg = true
-			}
 			continue
 		}
 
@@ -111,17 +140,19 @@ func (p *parser) scan() error {
 		case unicode.IsSpace(r):
 			if r == '\n' || r == '\r' {
 				p.emitArg()
-				p.emitSegment()
+				p.emitSegment(string(r))
 				continue
 			}
 			p.raw.WriteRune(r)
 			p.emitArg()
 		case isBoundaryStart(p.runes, i):
 			p.emitArg()
-			p.emitSegment()
+			separator := string(r)
 			if i+1 < len(p.runes) && ((r == '&' && p.runes[i+1] == '&') || (r == '|' && p.runes[i+1] == '|')) {
+				separator += string(p.runes[i+1])
 				i++
 			}
+			p.emitSegment(separator)
 		case r == '`':
 			return fmt.Errorf("backtick command substitution not allowed")
 		case r == '$':
@@ -148,7 +179,7 @@ func (p *parser) scan() error {
 		return fmt.Errorf("unterminated quote")
 	}
 	p.emitArg()
-	p.emitSegment()
+	p.emitSegment("")
 	return nil
 }
 
@@ -161,11 +192,12 @@ func (p *parser) emitArg() {
 	p.hadArg = false
 }
 
-func (p *parser) emitSegment() {
+func (p *parser) emitSegment(separator string) {
 	text := strings.TrimSpace(p.raw.String())
-	if text != "" || len(p.segment.Argv) > 0 || len(p.segment.Redirections) > 0 {
+	if text != "" || len(p.segment.Argv) > 0 || len(p.segment.Redirections) > 0 || separator != "" {
 		p.segment.Text = text
 		p.segment.Normalized = strings.Join(p.segment.Argv, " ")
+		p.segment.Separator = separator
 		p.segments = append(p.segments, p.segment)
 	}
 	p.segment = Segment{}
@@ -301,6 +333,35 @@ func allDigits(s string) bool {
 func isUnsafeExpansionRune(r rune) bool {
 	switch r {
 	case '*', '?', '[', '{':
+		return true
+	default:
+		return false
+	}
+}
+
+func isDoubleQuoteEscapedRune(r rune) bool {
+	switch r {
+	case '$', '`', '"', '\\':
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *parser) skipLineContinuation(i *int) bool {
+	if *i+1 >= len(p.runes) {
+		return false
+	}
+	next := p.runes[*i+1]
+	switch next {
+	case '\n':
+		*i = *i + 1
+		return true
+	case '\r':
+		*i = *i + 1
+		if *i+1 < len(p.runes) && p.runes[*i+1] == '\n' {
+			*i = *i + 1
+		}
 		return true
 	default:
 		return false

@@ -18,6 +18,55 @@ func TestParseNormalizesShellArgv(t *testing.T) {
 	}
 }
 
+func TestParseNormalizesShellLineContinuation(t *testing.T) {
+	segments, err := Parse("r\\\nm -rf x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 1 || segments[0].Text != "rm -rf x" || segments[0].Normalized != "rm -rf x" {
+		t.Fatalf("segments = %#v, want shell-effective rm segment", segments)
+	}
+
+	segments, err = Parse("r\\\r\nm -rf x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 1 || segments[0].Text != "rm -rf x" || segments[0].Normalized != "rm -rf x" {
+		t.Fatalf("CRLF segments = %#v, want shell-effective rm segment", segments)
+	}
+
+	segments, err = Parse("echo \"a\\\nb\"")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 1 || len(segments[0].Argv) != 2 || segments[0].Argv[1] != "ab" {
+		t.Fatalf("double-quoted line continuation segments = %#v, want ab arg", segments)
+	}
+}
+
+func TestParseDoubleQuotedBackslashSemantics(t *testing.T) {
+	tests := []struct {
+		command string
+		want    string
+	}{
+		{`echo "foo\.bar"`, `foo\.bar`},
+		{`echo "\$HOME"`, "$HOME"},
+		{`echo "\\path"`, `\path`},
+		{`echo "\"quoted\""`, `"quoted"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			segments, err := Parse(tt.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(segments) != 1 || len(segments[0].Argv) != 2 || segments[0].Argv[1] != tt.want {
+				t.Fatalf("segments = %#v, want second argv %q", segments, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseAllowsLiteralSingleQuotedSubstitution(t *testing.T) {
 	segments, err := Parse("echo '$(whoami)'")
 	if err != nil {

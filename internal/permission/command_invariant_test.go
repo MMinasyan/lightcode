@@ -67,6 +67,8 @@ func TestRunCommandExistingRawRulesAndSafeFDDupStillWork(t *testing.T) {
 func extractedRMCommands() []string {
 	return []string{
 		`r\m -rf x`,
+		"r\\\nm -rf x",
+		"r\\\r\nm -rf x",
 		"VAR=1 rm -rf x",
 		"VAR=1 VAR2=2 rm -rf x",
 		"command rm -rf x",
