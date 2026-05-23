@@ -1008,54 +1008,45 @@ func mustAppendMessage(t *testing.T, store *Store, turn int, msg string) {
 func TestPR11Closure_RevertCodePartialStateIsReported(t *testing.T) {
 	store := newTestStore(t)
 	projectDir := t.TempDir()
-	validPath := filepath.Join(projectDir, "valid.txt")
-	invalidPath := filepath.Join(projectDir, "invalid.txt")
+	pathA := filepath.Join(projectDir, "fileA.txt")
+	pathB := filepath.Join(projectDir, "fileB.txt")
 	secret := filepath.Join(projectDir, "secret.txt")
-	if err := os.WriteFile(validPath, []byte("valid-before"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(invalidPath, []byte("invalid-before"), 0o644); err != nil {
-		t.Fatal(err)
+	for _, p := range []string{pathA, pathB} {
+		if err := os.WriteFile(p, []byte("before"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	turn := store.BeginTurn()
-	turnDir := filepath.Join(store.snapshotsDir, fmt.Sprintf("%d", turn))
-
-	// Hand-construct two entries with controlled IDs so the "valid" one
-	// sorts first lexically and revertOneTurn processes it before the
-	// "invalid" one.
-	entryValid := filepath.Join(turnDir, "0000000000000001")
-	if err := os.MkdirAll(entryValid, 0o700); err != nil {
+	if err := store.Snapshot(turn, pathA); err != nil {
 		t.Fatal(err)
 	}
-	if err := copyFile(validPath, filepath.Join(entryValid, "original")); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeJSON(filepath.Join(entryValid, "meta.json"),
-		SnapshotMeta{OriginalPath: validPath, CanonicalPath: validPath, Existed: true}); err != nil {
+	if err := store.Snapshot(turn, pathB); err != nil {
 		t.Fatal(err)
 	}
 
-	entryInvalid := filepath.Join(turnDir, "ffffffffffffffff")
-	if err := os.MkdirAll(entryInvalid, 0o700); err != nil {
+	// revertOneTurn processes entries in os.ReadDir order (lexical by entry
+	// dir name = hashString(EvalSymlinks(canonicalPath))). Resolve symlinks
+	// before hashing so the prediction holds when TMPDIR itself is symlinked.
+	realA, err := filepath.EvalSymlinks(pathA)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := copyFile(invalidPath, filepath.Join(entryInvalid, "original")); err != nil {
+	realB, err := filepath.EvalSymlinks(pathB)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(entryInvalid, "meta.json"),
-		SnapshotMeta{OriginalPath: invalidPath, CanonicalPath: invalidPath, Existed: true}); err != nil {
+	firstPath, secondPath := pathA, pathB
+	if hashString(realA) > hashString(realB) {
+		firstPath, secondPath = pathB, pathA
+	}
+	if err := os.Remove(secondPath); err != nil {
 		t.Fatal(err)
 	}
-
-	// Mutate invalidPath so its restore fails validateRestorePath.
-	if err := os.Remove(invalidPath); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(secret, invalidPath); err != nil {
+	if err := os.Symlink(secret, secondPath); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1063,15 +1054,15 @@ func TestPR11Closure_RevertCodePartialStateIsReported(t *testing.T) {
 	if err == nil {
 		t.Fatal("RevertCode succeeded; want partial-restore error")
 	}
-	containsValid := false
+	containsFirst := false
 	for _, p := range affected {
-		if p == validPath {
-			containsValid = true
+		if p == firstPath {
+			containsFirst = true
 			break
 		}
 	}
-	if !containsValid {
-		t.Fatalf("affected = %v, want to include %q (already-restored entry before mid-turn failure)", affected, validPath)
+	if !containsFirst {
+		t.Fatalf("affected = %v, want to include %q (already-restored entry before mid-turn failure)", affected, firstPath)
 	}
 }
 

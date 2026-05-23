@@ -380,6 +380,118 @@ func TestPR11Closure_ApplyTurnActionRevertCodeRepopulatesTracker(t *testing.T) {
 	}
 }
 
+// TestPR11Closure_RevertHistoryThenRevertCodeTrackerStaysTruncated exercises
+// the sequence: RevertHistory truncates later turns, then a *separate*
+// RevertCode is applied. populateFileTracker runs at both steps and must
+// rebuild from the truncated store only, so a read recorded in a removed
+// turn does not silently authorize a future edit.
+func TestPR11Closure_RevertHistoryThenRevertCodeTrackerStaysTruncated(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession: %v", err)
+	}
+
+	pathA := filepath.Join(a.projectRoot, "trackedA.txt")
+	pathB := filepath.Join(a.projectRoot, "trackedB.txt")
+	if err := os.WriteFile(pathA, []byte("a-v1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pathB, []byte("b-v1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Turn 1: read_file pathA in assistant tool_calls.
+	turn1 := a.store.BeginTurn()
+	appendReadFileTurn(t, a, turn1, "read A", pathA, "a-v1", "call_a")
+
+	// Turn 2: snapshot pathA + write v2, so RevertCode has work to do.
+	turn2 := appendUserTurnWithSnapshot(t, a, "modify A", pathA, "a-v2")
+
+	// Turn 3: read_file pathB. This turn will be truncated by RevertHistory.
+	turn3 := a.store.BeginTurn()
+	appendReadFileTurn(t, a, turn3, "read B", pathB, "b-v1", "call_b")
+
+	// Seed the in-memory tracker as if a real read_file in turn 3 had
+	// authorized pathB. The revert sequence must clear this — replaying
+	// only on-disk history is not enough; in-memory state for the
+	// truncated turn must not silently survive.
+	bInfo, err := os.Stat(pathB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bData, err := os.ReadFile(pathB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bIdentity := tool.FileIdentityFromFileInfoAndData(bInfo, bData)
+	a.fileTracker.TrackIdentity(pathB, 0, 500, bIdentity)
+	if a.fileTracker.WasReadCheckIdentity(pathB, bIdentity) != nil {
+		t.Fatal("setup: tracker should accept pathB identity before revert")
+	}
+
+	// RevertHistory at turn 3 → target=2, keeps turns 1 and 2, drops turn 3.
+	if _, err := a.ApplyTurnAction(turn3, TurnActionRevertHistory, false); err != nil {
+		t.Fatalf("ApplyTurnAction revert_history: %v", err)
+	}
+	if !a.fileTracker.HasRead(pathA) {
+		t.Fatal("after revert_history: tracker missing pathA (visible read in turn 1)")
+	}
+	if a.fileTracker.HasRead(pathB) {
+		t.Fatal("after revert_history: tracker still has pathB (read was in truncated turn 3)")
+	}
+	if a.fileTracker.WasReadCheckIdentity(pathB, bIdentity) == nil {
+		t.Fatal("after revert_history: tracker still authorizes pathB identity from truncated turn")
+	}
+
+	// RevertCode at turn 2 → target=1, restores pathA to v1.
+	// populateFileTracker runs again; the truncated read of pathB must not
+	// reappear (neither on disk nor in memory).
+	if _, err := a.ApplyTurnAction(turn2, TurnActionRevertCode, false); err != nil {
+		t.Fatalf("ApplyTurnAction revert_code: %v", err)
+	}
+	if got, err := os.ReadFile(pathA); err != nil || string(got) != "a-v1" {
+		t.Fatalf("pathA after revert_code = %q, %v; want a-v1", got, err)
+	}
+	if !a.fileTracker.HasRead(pathA) {
+		t.Fatal("after revert_code: tracker missing pathA (visible read in turn 1)")
+	}
+	if a.fileTracker.HasRead(pathB) {
+		t.Fatal("after revert_code: tracker has pathB; populateFileTracker reintroduced a truncated read")
+	}
+	if a.fileTracker.WasReadCheckIdentity(pathB, bIdentity) == nil {
+		t.Fatal("after revert_code: tracker still authorizes pathB identity from truncated turn")
+	}
+}
+
+func appendReadFileTurn(t *testing.T, a *Agent, turn int, userText, path, content, callID string) {
+	t.Helper()
+	msgs := []message.Message{
+		message.NewText(message.RoleUser, userText),
+		{
+			Role:    message.RoleAssistant,
+			Content: []message.ContentPart{{Type: message.ContentPartText, Text: "reading"}},
+			ToolCalls: []message.ToolCall{{
+				ID:       callID,
+				Type:     "function",
+				Function: message.FunctionCall{Name: "read_file", Arguments: `{"path":"` + path + `"}`},
+			}},
+		},
+		toolResult(callID, "read_file", content),
+	}
+	for _, msg := range msgs {
+		data, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("marshal message: %v", err)
+		}
+		if err := a.store.AppendMessage(turn, data); err != nil {
+			t.Fatalf("AppendMessage: %v", err)
+		}
+	}
+	if err := a.store.MarkTurnComplete(turn); err != nil {
+		t.Fatalf("MarkTurnComplete: %v", err)
+	}
+}
+
 func waitUntilIdle(t *testing.T, a *Agent) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

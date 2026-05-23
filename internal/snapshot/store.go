@@ -1158,6 +1158,13 @@ func validateRestorePath(entryID string, meta SnapshotMeta) (string, error) {
 	if meta.CanonicalPath == "" {
 		return validateLegacyRestorePath(entryID, meta.OriginalPath)
 	}
+	return validateModernRestorePath(entryID, meta)
+}
+
+func validateModernRestorePath(entryID string, meta SnapshotMeta) (string, error) {
+	if hashString(meta.CanonicalPath) != entryID {
+		return "", fmt.Errorf("modern restore refused: meta canonical path %q does not match entry id %s", meta.CanonicalPath, entryID)
+	}
 	resolved, err := pathutil.ResolveFilePath(meta.OriginalPath)
 	if err != nil {
 		return "", fmt.Errorf("resolve restore path %s: %w", meta.OriginalPath, err)

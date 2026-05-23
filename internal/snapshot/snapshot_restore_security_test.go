@@ -461,6 +461,63 @@ func TestPR11Closure_ModernDeleteBoundToEntryID(t *testing.T) {
 	_ = turn
 }
 
+// A modern Existed:true snapshot must be bound to the entry directory ID
+// (hashString(realPath)). A meta.json content rewrite alone that redirects
+// CanonicalPath must be refused because hashString(new path) no longer
+// matches the on-disk entry directory name. Symmetric with the modern delete
+// binding in TestPR11Closure_ModernDeleteBoundToEntryID.
+func TestPR11Closure_ModernRestoreBoundToEntryID(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	originalPath := filepath.Join(projectDir, "original.txt")
+	victimPath := filepath.Join(projectDir, "victim.txt")
+	if err := os.WriteFile(originalPath, []byte("original-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(victimPath, []byte("victim-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	if err := store.Snapshot(turn, originalPath); err != nil {
+		t.Fatal(err)
+	}
+	// Snapshot names the entry dir after hashString(EvalSymlinks(canonicalPath)),
+	// so resolve symlinks before hashing in case TMPDIR itself is symlinked.
+	realOriginal, err := filepath.EvalSymlinks(originalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realVictim, err := filepath.EvalSymlinks(victimPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entryDir := filepath.Join(store.snapshotsDir, "1", hashString(realOriginal))
+	if _, err := os.Stat(entryDir); err != nil {
+		t.Fatalf("expected snapshot entry dir at %s: %v", entryDir, err)
+	}
+	// Redirect meta to victimPath, but write its canonical-resolved form so
+	// the tampered entry is self-consistent under ResolveFilePath. Without
+	// the new entry-id binding, the redirect would slip through; with it,
+	// hashString(realVictim) != entryID is the only line of defense.
+	if err := writeJSON(filepath.Join(entryDir, "meta.json"),
+		SnapshotMeta{OriginalPath: victimPath, CanonicalPath: realVictim, Existed: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = store.RevertCode(0)
+	if err == nil {
+		t.Fatal("RevertCode succeeded with tampered modern restore meta.json; want refusal")
+	}
+	if !strings.Contains(err.Error(), "modern restore refused") {
+		t.Fatalf("error %v does not mention modern restore refusal", err)
+	}
+	if got, readErr := os.ReadFile(victimPath); readErr != nil || string(got) != "victim-content" {
+		t.Fatalf("victim file = %q, %v; want unchanged", got, readErr)
+	}
+	_ = turn
+}
+
 func assertHardlinkedSymlink(t *testing.T, path string) {
 	t.Helper()
 	info, err := os.Lstat(path)
