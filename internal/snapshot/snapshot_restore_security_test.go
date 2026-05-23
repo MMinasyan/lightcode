@@ -488,13 +488,20 @@ func TestPR11Closure_ModernRestoreBoundToEntryID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	realVictim, err := filepath.EvalSymlinks(victimPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	entryDir := filepath.Join(store.snapshotsDir, "1", hashString(realOriginal))
 	if _, err := os.Stat(entryDir); err != nil {
 		t.Fatalf("expected snapshot entry dir at %s: %v", entryDir, err)
 	}
-	// Redirect meta to victimPath without renaming the entry directory.
+	// Redirect meta to victimPath, but write its canonical-resolved form so
+	// the tampered entry is self-consistent under ResolveFilePath. Without
+	// the new entry-id binding, the redirect would slip through; with it,
+	// hashString(realVictim) != entryID is the only line of defense.
 	if err := writeJSON(filepath.Join(entryDir, "meta.json"),
-		SnapshotMeta{OriginalPath: victimPath, CanonicalPath: victimPath, Existed: true}); err != nil {
+		SnapshotMeta{OriginalPath: victimPath, CanonicalPath: realVictim, Existed: true}); err != nil {
 		t.Fatal(err)
 	}
 
