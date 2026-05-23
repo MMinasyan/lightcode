@@ -29,7 +29,9 @@
 
 ### Features
 
-**Providers** — OpenAI, OpenRouter, MiniMax, Z.ai, Ollama, DeepSeek, Mistral, Groq, Google Gemini, llama.cpp, and anything else that speaks the OpenAI API schema. Configure N providers simultaneously, switch mid-session.
+**Providers** — Bundled metadata for OpenAI, OpenRouter, Alibaba/Qwen, Google Gemini, xAI/Grok, DeepSeek, Moonshot/Kimi, Mistral, MiniMax, Z.ai, Together, Groq, Fireworks, and Xiaomi MiMo. Add Ollama, llama.cpp, or any other OpenAI-compatible endpoint through config. Configure N providers simultaneously, switch mid-session.
+
+Lightcode uses the OpenAI Chat Completions shape with streaming and tool calls. Provider compatibility still varies: some OpenAI-compatible models stream text correctly but do not reliably support streamed tool calls. Test a new provider/model with a real tool call before relying on it.
 
 **Tools** — `read_file` · `write_file` · `edit_file` · `run_command` · `execute_pending` · `process` · `sleep` · `save_memory` · `search_memory` · `search_history` · `diagnostics` · `workspace_symbol` · `task`
 
@@ -39,7 +41,7 @@
 
 **Context compaction** — Automatic pruning and summarization when approaching the context window limit.
 
-**LSP** — Diagnostics and symbol search across Go, Python, TypeScript/JS, Rust, C/C++, C#. Auto-detected, auto-installed.
+**LSP** — Diagnostics and symbol search across Go, Python, TypeScript/JS, Rust, C/C++, C#. Auto-detected; servers auto-installed where supported.
 
 **Subagents** — Delegate tasks to concurrent LLM loops with scoped tools and independent context.
 
@@ -55,6 +57,8 @@
 - Node.js
 - [Wails v2](https://wails.io/docs/gettingstarted/installation)
 - Git LFS
+
+Linux is the primary tested and documented platform today. Wails can target macOS and Windows too, but this README documents the Linux build/run path for now.
 
 <details>
 <summary>Linux: install WebKitGTK</summary>
@@ -82,29 +86,82 @@ wails build
 
 Binary: `build/bin/lightcode`
 
+Optional install:
+
+```bash
+install -Dm755 build/bin/lightcode ~/.local/bin/lightcode
+```
+
 #### Configure
 
-Lightcode ships with no providers. On first run it creates `~/.lightcode/config.json` with an empty skeleton. API keys live in environment variables (or `~/.lightcode/.env`), referenced by name:
+Lightcode ships with bundled provider metadata, but no credentials and no preset default model. On first run it creates `~/.lightcode/config.json` with an empty skeleton. API keys live in environment variables (or `~/.lightcode/.env`), referenced by name from provider `transport.api_key_env` fields:
 
 ```json
 {
   "providers": {
     "openrouter": {
-      "base_url": "https://openrouter.ai/api/v1",
-      "api_key_env": "OPENROUTER_API_KEY",
-      "models": ["openai/gpt-5.5", "xiaomi/mimo-v2.5-pro"]
+      "transport": {
+        "headers": {
+          "HTTP-Referer": "https://my-app.example"
+        }
+      },
+      "models": {
+        "z-ai/glm-5.1": {
+          "name": "Z.ai GLM-5.1"
+        }
+      }
     },
-    "llama-cpp": {
-      "base_url": "http://localhost:8080/v1",
-      "api_key_env": "",
-      "models": ["qwen3.6-35b-a3b"]
+    "ollama": {
+      "transport": {
+        "base_url": "http://localhost:11434/v1",
+        "api_key_env": ""
+      },
+      "models": {
+        "qwen3.6:27b": {
+          "name": "Qwen3.6 27B",
+          "context_window": 262144,
+          "max_output_tokens": 65536
+        }
+      }
     }
   },
-  "default_model": { "provider": "openrouter", "model": "openai/gpt-5.5" }
+  "default_model": "openrouter/z-ai/glm-5.1"
 }
 ```
 
+Example key setup:
+
+```bash
+mkdir -p ~/.lightcode
+printf 'OPENROUTER_API_KEY=...\n' >> ~/.lightcode/.env
+```
+
+Shell-exported environment variables take precedence over values in `~/.lightcode/.env`.
+
+#### Permissions
+
+Global permissions live in `~/.lightcode/config.json`. Project permissions are saved per project when you choose "Allow for project" in a permission prompt.
+
+```json
+{
+  "permissions": {
+    "allow": ["read_file(/src/**)", "run_command(git status *)"],
+    "deny": ["read_file(**/.env)", "write_file(**/.env)"],
+    "ask": ["run_command(git push *)"]
+  }
+}
+```
+
+Path prefixes in permission rules:
+
+- `/foo` — project-relative
+- `~/foo` — home-relative
+- `//foo` — absolute
+- no matching rule — ask
+
 #### Run
+
+Run Lightcode from the project directory you want it to work on:
 
 ```bash
 lightcode                       # Desktop GUI
@@ -112,6 +169,28 @@ lightcode cli                   # Terminal REPL
 lightcode serve --port 8080     # HTTP+SSE daemon
 lightcode acp                   # JSON-RPC over stdio
 ```
+
+Useful CLI commands:
+
+- `/model` — switch model
+- `/session` — list or switch sessions
+- `/project` — switch project
+- `/revert` — revert code, revert history, or fork
+- `/fork` — open the fork/revert menu
+- `/context` — show token usage
+- `/compact` — compact context now
+- `/copy` — copy the last assistant response
+- `/exit` — exit
+
+`lightcode serve` writes a daemon lockfile under `~/.lightcode/daemon/` containing the port and token. HTTP clients use Bearer auth; ACP clients use newline-delimited JSON-RPC over stdio.
+
+#### Data locations
+
+- `~/.lightcode/config.json` — user config
+- `~/.lightcode/.env` — local API keys
+- `~/.lightcode/projects/` — project metadata, sessions, snapshots, memories, and project permissions
+- `~/.lightcode/cache/` — discovery and runtime caches
+- `~/.lightcode/daemon/` — localhost daemon lockfiles
 
 ---
 
