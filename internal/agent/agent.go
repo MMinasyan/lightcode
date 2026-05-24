@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 	"github.com/MMinasyan/lightcode/internal/compact"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
@@ -208,19 +209,28 @@ func New(c Config) (*Agent, error) {
 	registry.Register(tool.WrapWithPermission(tool.NewEditFileWithSnapshot(store, fileTracker, c.Cfg.Tools), checkFunc, askFunc))
 	registry.Register(tool.WrapWithPermission(tool.ExecutePending{}, checkFunc, askFunc))
 
-	procMgr := process.NewManager(c.Cfg.Tools.MaxBackgroundProcesses)
+	procMgr := process.NewManager(c.Cfg.Tools.MaxBackgroundProcesses, cmdoutput.Options{
+		HomeDir:      c.Home,
+		SpillPrefix:  "proc_output_",
+		MaxBytes:     c.Cfg.Tools.MaxOutputBytes,
+		MaxLineChars: c.Cfg.Tools.ReadLineMaxChars,
+	})
 	a.procMgr = procMgr
 
-	procMgr.SetExitHandler(func(id, command string, exitCode int) {
+	procMgr.SetExitHandler(func(event process.ExitEvent) {
 		if a.lp != nil {
-			a.lp.AppendSignal(fmt.Sprintf("<system-signal>Background process %s (\"%s\") exited with code %d.</system-signal>", id, command, exitCode))
+			output := event.Output
+			if output == "" {
+				output = "(No output)"
+			}
+			a.lp.AppendSignalPayload(fmt.Sprintf("Background process %s (\"%s\") exited with code %d.\nOutput:\n%s", event.ID, event.Command, event.ExitCode, output))
 		}
 	})
 
 	// Re-create RunCommand with the process manager.
 	rc := tool.NewRunCommand(c.Cfg.Tools, c.Home, procMgr)
 	registry.Register(tool.WrapWithPermission(rc, checkFunc, askFunc))
-	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(procMgr, c.Cfg.Tools, c.Home), checkFunc, askFunc))
+	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(procMgr), checkFunc, askFunc))
 	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkFunc, askFunc))
 
 	embedder, err := memory.NewEmbedder()
@@ -325,7 +335,7 @@ func (a *Agent) Init(ctx context.Context) {
 		})
 		a.lspManager.SetSignalHandler(func(content string) {
 			if a.lp != nil {
-				a.lp.AppendSignal(content)
+				a.lp.AppendSignalPayload(content)
 			}
 		})
 		go a.lspManager.Detect(ctx)
@@ -1211,7 +1221,7 @@ func (a *Agent) SwitchModel(refStr string) error {
 	a.lp.SetClient(client)
 	a.currentRef = ref
 	a.contextWindowSize = model.ContextWindow
-	a.lp.AppendSignal(fmt.Sprintf("<system-signal>Model switched to %s</system-signal>", ref.String()))
+	a.lp.AppendSignalPayload(fmt.Sprintf("Model switched to %s", ref.String()))
 	if a.store.Active() {
 		if err := a.store.SetModel(ref.Provider, ref.Model); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)

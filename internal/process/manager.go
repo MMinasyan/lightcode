@@ -3,7 +3,6 @@
 package process
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -11,25 +10,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 )
-
-// lockedBuffer wraps bytes.Buffer with a mutex for thread-safe access.
-type lockedBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *lockedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
 
 // CommandStarted represents a running background process.
 type CommandStarted struct {
@@ -37,7 +20,7 @@ type CommandStarted struct {
 	Command   string
 	StartedAt time.Time
 	cmd       *exec.Cmd
-	buf       bytes.Buffer
+	capture   *cmdoutput.Capture
 	done      chan struct{}
 	mu        sync.Mutex
 	exitCode  int
@@ -47,24 +30,33 @@ type CommandStarted struct {
 
 // Manager tracks background processes.
 type Manager struct {
-	mu       sync.Mutex
-	procs    map[string]*CommandStarted
-	onExit   func(id, command string, exitCode int)
-	maxProcs int
+	mu            sync.Mutex
+	procs         map[string]*CommandStarted
+	onExit        func(ExitEvent)
+	maxProcs      int
+	outputOptions cmdoutput.Options
+}
+
+type ExitEvent struct {
+	ID       string
+	Command  string
+	ExitCode int
+	Output   string
 }
 
 // NewManager creates a new process Manager. maxProcs limits concurrent
 // background processes (0 = unlimited).
-func NewManager(maxProcs int) *Manager {
+func NewManager(maxProcs int, outputOptions cmdoutput.Options) *Manager {
 	return &Manager{
-		procs:    make(map[string]*CommandStarted),
-		maxProcs: maxProcs,
+		procs:         make(map[string]*CommandStarted),
+		maxProcs:      maxProcs,
+		outputOptions: outputOptions,
 	}
 }
 
 // SetExitHandler sets a callback invoked when a background process exits.
 // The callback should append a system signal to the loop.
-func (m *Manager) SetExitHandler(handler func(id, command string, exitCode int)) {
+func (m *Manager) SetExitHandler(handler func(ExitEvent)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onExit = handler
@@ -94,10 +86,12 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 	}
 	cmd := exec.Command("sh", "-c", command)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Stdout = &lockedBuffer{}
-	cmd.Stderr = &lockedBuffer{}
+	capture := cmdoutput.NewCapture(m.outputOptions)
+	cmd.Stdout = capture.Stdout()
+	cmd.Stderr = capture.Stderr()
 
 	if err := cmd.Start(); err != nil {
+		capture.Close()
 		return "", err
 	}
 
@@ -106,6 +100,7 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 		Command:   command,
 		StartedAt: time.Now(),
 		cmd:       cmd,
+		capture:   capture,
 		done:      make(chan struct{}),
 	}
 
@@ -126,24 +121,29 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 				cs.exitCode = -1
 			}
 		}
+		code := cs.exitCode
 		cs.mu.Unlock()
 
 		if handler != nil {
-			cs.mu.Lock()
-			code := cs.exitCode
-			cs.mu.Unlock()
-			handler(id, command, code)
+			output := capture.Format()
+			handler(ExitEvent{
+				ID:       id,
+				Command:  command,
+				ExitCode: code,
+				Output:   output,
+			})
 		}
 
 		// Auto-remove dead process so it doesn't count against the limit.
 		m.Remove(id)
 		close(cs.done)
+		capture.Close()
 	}()
 
 	return id, nil
 }
 
-// Read returns all output accumulated so far for a background process.
+// Read returns output accumulated so far for a running background process.
 func (m *Manager) Read(id string) (string, error) {
 	m.mu.Lock()
 	cs, ok := m.procs[id]
@@ -153,27 +153,16 @@ func (m *Manager) Read(id string) (string, error) {
 	}
 
 	cs.mu.Lock()
-	defer cs.mu.Unlock()
+	if cs.exited {
+		cs.mu.Unlock()
+		return "", fmt.Errorf("process: no process with ID %q", id)
+	}
+	cs.mu.Unlock()
 
-	stdout := cs.cmd.Stdout.(*lockedBuffer).String()
-	stderr := cs.cmd.Stderr.(*lockedBuffer).String()
-	output := stdout + stderr
-
-	if output == "" && !cs.exited {
+	if cs.capture.Len() == 0 {
 		return "(No output yet)", nil
 	}
-	if output == "" && cs.exited {
-		return "(No output)", nil
-	}
-
-	if cs.exited {
-		prefix := ""
-		if cs.exitCode != 0 {
-			prefix = fmt.Sprintf("Error: Exit code %d\n", cs.exitCode)
-		}
-		return prefix + output, nil
-	}
-	return output, nil
+	return cs.capture.Format(), nil
 }
 
 // Kill terminates a background process. Sends SIGTERM, waits 500ms,

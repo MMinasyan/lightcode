@@ -146,6 +146,6 @@ func (m *Manager) emitWarning(kind, message string) {
 
 func (m *Manager) emitSignal(content string) {
 	if m.onSignal != nil {
-		m.onSignal(fmt.Sprintf("<system-signal>%s</system-signal>", content))
+		m.onSignal(content)
 	}
 }

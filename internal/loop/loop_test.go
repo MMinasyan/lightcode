@@ -114,6 +114,40 @@ func TestEmitDropsTelemetryWhenChannelFull(t *testing.T) {
 	}
 }
 
+func TestSystemSignalEscapesAndWrapsPayload(t *testing.T) {
+	got := SystemSignal(`a & b < c > d`)
+	want := `<system-signal>a &amp; b &lt; c &gt; d</system-signal>`
+	if got != want {
+		t.Fatalf("SystemSignal() = %q, want %q", got, want)
+	}
+}
+
+func TestSystemSignalEscapesLiteralClosingTag(t *testing.T) {
+	got := SystemSignal(`before </system-signal> after`)
+	inner := strings.TrimPrefix(strings.TrimSuffix(got, "</system-signal>"), "<system-signal>")
+	if strings.Contains(inner, "</system-signal>") {
+		t.Fatalf("SystemSignal() = %q, contains unescaped closing tag inside wrapper", got)
+	}
+	if !strings.Contains(inner, "&lt;/system-signal&gt;") {
+		t.Fatalf("SystemSignal() = %q, missing escaped closing tag", got)
+	}
+}
+
+func TestAppendSignalPayloadWrapsRawPayload(t *testing.T) {
+	lp := New(nil, nil, "system")
+	lp.AppendSignalPayload(`raw <payload> & data`)
+
+	msgs := lp.Messages()
+	if len(msgs) != 2 {
+		t.Fatalf("messages len = %d, want system plus signal", len(msgs))
+	}
+	got := msgs[1].TextContent()
+	want := `<system-signal>raw &lt;payload&gt; &amp; data</system-signal>`
+	if got != want {
+		t.Fatalf("signal message = %q, want %q", got, want)
+	}
+}
+
 func TestValidateStagedWriteRequiresStringContent(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

@@ -33,7 +33,18 @@ const traceMaxChars = 200
 
 // interruptedSignal is injected as a user-role message when the user
 // cancels a turn. User-role works across all OpenAI-compatible providers.
-const interruptedSignal = "<system-signal>Request interrupted by user</system-signal>"
+var interruptedSignal = SystemSignal("Request interrupted by user")
+
+var systemSignalEscaper = strings.NewReplacer(
+	"&", "&amp;",
+	"<", "&lt;",
+	">", "&gt;",
+)
+
+// SystemSignal escapes payload and wraps it as a user-role system signal.
+func SystemSignal(payload string) string {
+	return "<system-signal>" + systemSignalEscaper.Replace(payload) + "</system-signal>"
+}
 
 // Store is the minimum surface the loop needs from the snapshot
 // package: turn-scoped message persistence, turn completion, and
@@ -269,10 +280,10 @@ func (l *Loop) AppendUserMessage(turn int, content string) {
 	l.persistMessage(turn, msg)
 }
 
-// AppendSignal appends a user-role system signal message to the
+// AppendSignalPayload appends a user-role system signal message to the
 // conversation history. Not persisted and not counted as a turn boundary.
-func (l *Loop) AppendSignal(content string) {
-	l.messages = append(l.messages, message.NewText(message.RoleUser, content))
+func (l *Loop) AppendSignalPayload(payload string) {
+	l.messages = append(l.messages, message.NewText(message.RoleUser, SystemSignal(payload)))
 }
 
 // ResetHistory drops all messages and turn boundaries, leaving only

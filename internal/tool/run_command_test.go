@@ -373,3 +373,17 @@ func (m *recordingProcessManager) Start(command string, timeoutSec int) (string,
 	m.timeoutSec = timeoutSec
 	return m.id, m.err
 }
+
+func extractSpillPath(t *testing.T, result string) string {
+	t.Helper()
+	marker := "saved to: "
+	idx := strings.LastIndex(result, marker)
+	if idx < 0 {
+		t.Fatalf("result = %q, missing spill marker", result)
+	}
+	path := result[idx+len(marker):]
+	if end := strings.IndexAny(path, "]\n"); end >= 0 {
+		path = path[:end]
+	}
+	return strings.TrimSpace(path)
+}

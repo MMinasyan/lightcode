@@ -1,11 +1,9 @@
 package tool
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os/exec"
-	"strings"
 	"syscall"
 	"time"
 
@@ -208,32 +206,4 @@ func (r *RunCommand) terminateProcess(cmd *exec.Cmd, done <-chan struct{}) {
 		// SIGKILL if still running.
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
-}
-
-func truncateLine(s string, maxChars int) string {
-	if maxChars <= 0 {
-		return s
-	}
-	runes := []rune(s)
-	if len(runes) <= maxChars {
-		return s
-	}
-	return string(runes[:maxChars]) + fmt.Sprintf("... [truncated %d chars]", len(runes))
-}
-
-func perLineTruncate(s string, maxChars int) string {
-	if maxChars <= 0 {
-		return s
-	}
-	lines := strings.Split(s, "\n")
-	var buf bytes.Buffer
-	for _, l := range lines {
-		buf.WriteString(truncateLine(l, maxChars))
-		buf.WriteByte('\n')
-	}
-	result := buf.String()
-	if len(result) > 0 && result[len(result)-1] == '\n' {
-		result = result[:len(result)-1]
-	}
-	return result
 }

@@ -1,15 +1,8 @@
 package tool
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
-	"time"
-
-	"github.com/MMinasyan/lightcode/internal/config"
 )
 
 type ProcessController interface {
@@ -20,14 +13,12 @@ type ProcessController interface {
 
 // ProcessTool implements the process management tool for background commands.
 type ProcessTool struct {
-	mgr     ProcessController
-	cfg     config.ToolsConfig
-	homeDir string
+	mgr ProcessController
 }
 
 // NewProcessTool creates a process management tool.
-func NewProcessTool(mgr ProcessController, cfg config.ToolsConfig, homeDir string) *ProcessTool {
-	return &ProcessTool{mgr: mgr, cfg: cfg, homeDir: homeDir}
+func NewProcessTool(mgr ProcessController) *ProcessTool {
+	return &ProcessTool{mgr: mgr}
 }
 
 func (*ProcessTool) Name() string { return "process" }
@@ -68,7 +59,7 @@ func (p *ProcessTool) Execute(_ context.Context, params map[string]any) (string,
 		if err != nil {
 			return "", err
 		}
-		return p.truncateOutput(output), nil
+		return output, nil
 	case "kill":
 		id, _ := params["id"].(string)
 		if id == "" {
@@ -83,74 +74,4 @@ func (p *ProcessTool) Execute(_ context.Context, params map[string]any) (string,
 	default:
 		return "", fmt.Errorf("process: unknown action %q", action)
 	}
-}
-
-func (p *ProcessTool) truncateOutput(output string) string {
-	maxBytes := p.cfg.MaxOutputBytes
-	if maxBytes <= 0 || len(output) <= maxBytes {
-		return output
-	}
-
-	lines := strings.Split(output, "\n")
-	totalLines := len(lines)
-	if totalLines > 0 && lines[totalLines-1] == "" {
-		lines = lines[:totalLines-1]
-		totalLines--
-	}
-
-	if totalLines <= 20 {
-		spillPath := p.spillFile()
-		_ = os.MkdirAll(filepath.Dir(spillPath), 0o700)
-		_ = os.WriteFile(spillPath, []byte(output), 0o600)
-		result := p.perLineTruncate(output)
-		return result + fmt.Sprintf("\n[Output truncated. Full output (%d bytes) saved to: %s]", len(output), spillPath)
-	}
-
-	firstLines := lines[:10]
-	lastLines := lines[totalLines-10:]
-
-	var buf bytes.Buffer
-	for _, l := range firstLines {
-		buf.WriteString(truncateLine(l, p.cfg.ReadLineMaxChars))
-		buf.WriteByte('\n')
-	}
-	buf.WriteString(fmt.Sprintf("[Output truncated. Full output (%d bytes) saved to: %s]\n", len(output), p.spillAndSave(output)))
-	for _, l := range lastLines {
-		buf.WriteString(truncateLine(l, p.cfg.ReadLineMaxChars))
-		buf.WriteByte('\n')
-	}
-	result := buf.String()
-	if len(result) > 0 && result[len(result)-1] == '\n' {
-		result = result[:len(result)-1]
-	}
-	return result
-}
-
-func (p *ProcessTool) spillFile() string {
-	ts := time.Now().UnixNano()
-	return filepath.Join(p.homeDir, ".lightcode", fmt.Sprintf("proc_output_%d_%x.txt", ts, ts%65536))
-}
-
-func (p *ProcessTool) spillAndSave(output string) string {
-	spillPath := p.spillFile()
-	_ = os.MkdirAll(filepath.Dir(spillPath), 0o700)
-	_ = os.WriteFile(spillPath, []byte(output), 0o600)
-	return spillPath
-}
-
-func (p *ProcessTool) perLineTruncate(s string) string {
-	if p.cfg.ReadLineMaxChars <= 0 {
-		return s
-	}
-	lines := strings.Split(s, "\n")
-	var buf bytes.Buffer
-	for _, l := range lines {
-		buf.WriteString(truncateLine(l, p.cfg.ReadLineMaxChars))
-		buf.WriteByte('\n')
-	}
-	result := buf.String()
-	if len(result) > 0 && result[len(result)-1] == '\n' {
-		result = result[:len(result)-1]
-	}
-	return result
 }
