@@ -85,6 +85,30 @@ func TestRunCommandNonZeroExitReturnsExitErrorWithOutput(t *testing.T) {
 	}
 }
 
+func TestRunCommandNonZeroExitLargeOutputIsBounded(t *testing.T) {
+	home := t.TempDir()
+	tool := NewRunCommand(config.ToolsConfig{
+		CommandTimeout:   2,
+		MaxOutputBytes:   12,
+		ReadLineMaxChars: 5,
+	}, home, nil)
+
+	output, err := tool.Execute(context.Background(), map[string]any{"command": "printf 'abcdefg\\n1234567\\n' && exit 7"})
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("Execute error = %T %v, want *ExitError", err, err)
+	}
+	if output == "abcdefg\n1234567\n" {
+		t.Fatalf("output = %q, want bounded output", output)
+	}
+	if !strings.Contains(exitErr.Output, "Error: Exit code 7\n") {
+		t.Fatalf("ExitError.Output = %q, missing exit header", exitErr.Output)
+	}
+	if !strings.Contains(exitErr.Output, "Full output (16 bytes) saved to: "+home+"/.lightcode/cmd_output_") {
+		t.Fatalf("ExitError.Output = %q, want spill marker", exitErr.Output)
+	}
+}
+
 func TestRunCommandTimeoutUsesOverrideAndReturnsExitError(t *testing.T) {
 	tool := NewRunCommand(config.ToolsConfig{CommandTimeout: 5}, t.TempDir(), nil)
 	start := time.Now()
@@ -103,6 +127,109 @@ func TestRunCommandTimeoutUsesOverrideAndReturnsExitError(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
 		t.Fatalf("timeout elapsed %s, want command killed close to override", elapsed)
 	}
+}
+
+func TestRunCommandTimeoutLargeOutputIsBounded(t *testing.T) {
+	home := t.TempDir()
+	tool := NewRunCommand(config.ToolsConfig{
+		CommandTimeout:   5,
+		MaxOutputBytes:   12,
+		ReadLineMaxChars: 5,
+	}, home, nil)
+
+	output, err := tool.Execute(context.Background(), map[string]any{
+		"command": "printf 'abcdefg\\n1234567\\n'; sleep 5",
+		"timeout": float64(1),
+	})
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("Execute error = %T %v, want *ExitError", err, err)
+	}
+	if output == "abcdefg\n1234567\n" {
+		t.Fatalf("output = %q, want bounded output", output)
+	}
+	if !strings.Contains(exitErr.Output, "Error: Exit code -1 (timeout)\n") {
+		t.Fatalf("ExitError.Output = %q, missing timeout header", exitErr.Output)
+	}
+	if !strings.Contains(exitErr.Output, "Full output (16 bytes) saved to: "+home+"/.lightcode/cmd_output_") {
+		t.Fatalf("ExitError.Output = %q, want spill marker", exitErr.Output)
+	}
+}
+
+func TestRunCommandCancellationOutput(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		tool := NewRunCommand(config.ToolsConfig{CommandTimeout: 5}, t.TempDir(), nil)
+		errCh := make(chan error, 1)
+		go func() {
+			_, err := tool.Execute(ctx, map[string]any{"command": "sleep 5"})
+			errCh <- err
+		}()
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+		var exitErr *ExitError
+		select {
+		case err := <-errCh:
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("Execute error = %T %v, want *ExitError", err, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("cancelled command did not return")
+		}
+		if exitErr.Output != "command cancelled" {
+			t.Fatalf("ExitError.Output = %q, want exact cancellation marker", exitErr.Output)
+		}
+	})
+
+	t.Run("non-empty", func(t *testing.T) {
+		home := t.TempDir()
+		ready := home + "/ready"
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		tool := NewRunCommand(config.ToolsConfig{
+			CommandTimeout:   5,
+			MaxOutputBytes:   12,
+			ReadLineMaxChars: 5,
+		}, home, nil)
+		errCh := make(chan error, 1)
+		outCh := make(chan string, 1)
+		command := "printf 'abcdefg\\n1234567\\n'; touch " + ready + "; sleep 5"
+		go func() {
+			output, err := tool.Execute(ctx, map[string]any{"command": command})
+			outCh <- output
+			errCh <- err
+		}()
+		for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+			if _, err := os.Stat(ready); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if _, err := os.Stat(ready); err != nil {
+			t.Fatalf("command did not reach ready marker: %v", err)
+		}
+		cancel()
+		var exitErr *ExitError
+		select {
+		case err := <-errCh:
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("Execute error = %T %v, want *ExitError", err, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("cancelled command did not return")
+		}
+		output := <-outCh
+		if !strings.HasPrefix(exitErr.Output, "command cancelled\n") {
+			t.Fatalf("ExitError.Output = %q, want cancellation header plus output", exitErr.Output)
+		}
+		if !strings.Contains(exitErr.Output, "Full output (16 bytes) saved to: "+home+"/.lightcode/cmd_output_") {
+			t.Fatalf("ExitError.Output = %q, want spill marker", exitErr.Output)
+		}
+		if output == "abcdefg\n1234567\n" {
+			t.Fatalf("output = %q, want bounded output", output)
+		}
+	})
 }
 
 func TestRunCommandBackgroundDelegatesToProcessManager(t *testing.T) {
