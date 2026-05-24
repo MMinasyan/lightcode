@@ -3,13 +3,18 @@ package loop
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/message"
 	"github.com/MMinasyan/lightcode/internal/provider"
+	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
 type fakeStore struct {
@@ -133,9 +138,10 @@ func TestSystemSignalEscapesLiteralClosingTag(t *testing.T) {
 	}
 }
 
-func TestAppendSignalPayloadWrapsRawPayload(t *testing.T) {
+func TestQueueSignalPayloadWrapsRawPayloadWhenDrained(t *testing.T) {
 	lp := New(nil, nil, "system")
-	lp.AppendSignalPayload(`raw <payload> & data`)
+	lp.QueueSignalPayload(`raw <payload> & data`)
+	lp.DrainQueuedSignals()
 
 	msgs := lp.Messages()
 	if len(msgs) != 2 {
@@ -145,6 +151,137 @@ func TestAppendSignalPayloadWrapsRawPayload(t *testing.T) {
 	want := `<system-signal>raw &lt;payload&gt; &amp; data</system-signal>`
 	if got != want {
 		t.Fatalf("signal message = %q, want %q", got, want)
+	}
+}
+
+func TestResetHistoryClearsQueuedSignals(t *testing.T) {
+	lp := New(nil, nil, "system")
+	lp.QueueSignalPayload("old session signal")
+	lp.ResetHistory()
+	lp.DrainQueuedSignals()
+
+	msgs := lp.Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("messages len = %d, want only system after reset: %#v", len(msgs), msgs)
+	}
+}
+
+func TestAppendUserMessageDrainsQueuedSignalsBeforeUserTurn(t *testing.T) {
+	lp := New(nil, nil, "system")
+	lp.QueueSignalPayload("idle signal")
+	lp.AppendUserMessage(1, "next prompt")
+
+	msgs := lp.Messages()
+	if len(msgs) != 3 {
+		t.Fatalf("messages len = %d, want system, signal, user: %#v", len(msgs), msgs)
+	}
+	if msgs[1].Role != message.RoleUser || msgs[1].TextContent() != `<system-signal>idle signal</system-signal>` {
+		t.Fatalf("messages[1] = %#v, want queued signal before user turn", msgs[1])
+	}
+	if msgs[2].Role != message.RoleUser || msgs[2].TextContent() != "next prompt" {
+		t.Fatalf("messages[2] = %#v, want user prompt after queued signal", msgs[2])
+	}
+}
+
+func TestQueuedSignalDuringToolExecutionDrainsAfterToolResult(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests []map[string]any
+		count    int
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, body)
+		n := count
+		count++
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch n {
+		case 0:
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"queue_signal","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		case 1:
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		default:
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	prov := &catalog.Provider{
+		ID: "test",
+		Transport: catalog.Transport{
+			BaseURL: server.URL + "/v1",
+		},
+		Models: map[string]*catalog.Model{
+			"model-a": {ID: "model-a"},
+		},
+	}
+	client := provider.New(prov, prov.Models["model-a"], "")
+	registry := tool.NewRegistry()
+	var lp *Loop
+	registry.Register(queueSignalTool{queue: func() {
+		lp.QueueSignalPayload("async <event>")
+	}})
+	lp = New(client, registry, "system")
+
+	got, err := lp.Run(context.Background(), "start")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != "done" {
+		t.Fatalf("Run returned %q, want done", got)
+	}
+
+	msgs := lp.Messages()
+	if len(msgs) != 6 {
+		t.Fatalf("messages len = %d, want 6: %#v", len(msgs), msgs)
+	}
+	if msgs[2].Role != message.RoleAssistant || len(msgs[2].ToolCalls) != 1 {
+		t.Fatalf("messages[2] = %#v, want assistant tool call", msgs[2])
+	}
+	if msgs[3].Role != message.RoleTool || msgs[3].ToolCallID != "call_1" {
+		t.Fatalf("messages[3] = %#v, want tool result for call_1", msgs[3])
+	}
+	if msgs[4].Role != message.RoleUser {
+		t.Fatalf("messages[4] role = %q, want user system signal", msgs[4].Role)
+	}
+	wantSignal := `<system-signal>async &lt;event&gt;</system-signal>`
+	if gotSignal := msgs[4].TextContent(); gotSignal != wantSignal {
+		t.Fatalf("messages[4] = %q, want %q", gotSignal, wantSignal)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 2 {
+		t.Fatalf("requests len = %d, want 2", len(requests))
+	}
+	wireMessages, ok := requests[1]["messages"].([]any)
+	if !ok {
+		t.Fatalf("second request messages = %#v", requests[1]["messages"])
+	}
+	if len(wireMessages) < 5 {
+		t.Fatalf("second request messages len = %d, want at least 5", len(wireMessages))
+	}
+	assistantMsg := wireMessages[len(wireMessages)-3].(map[string]any)
+	toolMsg := wireMessages[len(wireMessages)-2].(map[string]any)
+	signalMsg := wireMessages[len(wireMessages)-1].(map[string]any)
+	if assistantMsg["role"] != "assistant" || assistantMsg["tool_calls"] == nil {
+		t.Fatalf("wire assistant message = %#v, want tool call", assistantMsg)
+	}
+	if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "call_1" {
+		t.Fatalf("wire tool message = %#v, want tool result", toolMsg)
+	}
+	if signalMsg["role"] != "user" || signalMsg["content"] != wantSignal {
+		t.Fatalf("wire signal message = %#v, want queued signal after tool result", signalMsg)
 	}
 }
 
@@ -174,6 +311,23 @@ func TestValidateStagedWriteRequiresStringContent(t *testing.T) {
 			}
 		})
 	}
+}
+
+type queueSignalTool struct {
+	queue func()
+}
+
+func (queueSignalTool) Name() string { return "queue_signal" }
+
+func (queueSignalTool) Description() string { return "queue a signal" }
+
+func (queueSignalTool) ParametersSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+
+func (t queueSignalTool) Execute(context.Context, map[string]any) (string, error) {
+	t.queue()
+	return "tool result", nil
 }
 
 func TestValidateStagedWriteAllowsEmptyContent(t *testing.T) {

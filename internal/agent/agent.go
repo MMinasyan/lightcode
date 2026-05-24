@@ -217,13 +217,22 @@ func New(c Config) (*Agent, error) {
 	})
 	a.procMgr = procMgr
 
+	procMgr.SetSessionProvider(func() string {
+		if a.store == nil {
+			return ""
+		}
+		return a.store.SessionID()
+	})
 	procMgr.SetExitHandler(func(event process.ExitEvent) {
 		if a.lp != nil {
+			if event.SessionID != "" && a.store.SessionID() != event.SessionID {
+				return
+			}
 			output := event.Output
 			if output == "" {
 				output = "(No output)"
 			}
-			a.lp.AppendSignalPayload(fmt.Sprintf("Background process %s (\"%s\") exited with code %d.\nOutput:\n%s", event.ID, event.Command, event.ExitCode, output))
+			a.lp.QueueSignalPayload(fmt.Sprintf("Background process %s (\"%s\") exited with code %d.\nOutput:\n%s", event.ID, event.Command, event.ExitCode, output))
 		}
 	})
 
@@ -335,7 +344,7 @@ func (a *Agent) Init(ctx context.Context) {
 		})
 		a.lspManager.SetSignalHandler(func(content string) {
 			if a.lp != nil {
-				a.lp.AppendSignalPayload(content)
+				a.lp.QueueSignalPayload(content)
 			}
 		})
 		go a.lspManager.Detect(ctx)
@@ -713,6 +722,7 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 	a.emitEvent(Event{Kind: EventCompactionStart})
 	defer a.emitEvent(Event{Kind: EventCompactionEnd})
 
+	a.lp.DrainQueuedSignals()
 	messages := a.lp.Messages()
 	if len(messages) <= 1 {
 		return fmt.Errorf("nothing to compact")
@@ -1221,7 +1231,7 @@ func (a *Agent) SwitchModel(refStr string) error {
 	a.lp.SetClient(client)
 	a.currentRef = ref
 	a.contextWindowSize = model.ContextWindow
-	a.lp.AppendSignalPayload(fmt.Sprintf("Model switched to %s", ref.String()))
+	a.lp.QueueSignalPayload(fmt.Sprintf("Model switched to %s", ref.String()))
 	if a.store.Active() {
 		if err := a.store.SetModel(ref.Provider, ref.Model); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)

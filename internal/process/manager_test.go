@@ -101,6 +101,28 @@ func TestManagerExitHandlerReceivesFinalOutput(t *testing.T) {
 	}
 }
 
+func TestManagerExitEventIncludesStartSessionID(t *testing.T) {
+	m := NewManager(1, cmdoutput.Options{})
+	sessionID := "session-a"
+	m.SetSessionProvider(func() string { return sessionID })
+	exitCh := make(chan ExitEvent, 1)
+	m.SetExitHandler(func(event ExitEvent) { exitCh <- event })
+	id, err := m.Start("printf final", 0)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	sessionID = "session-b"
+
+	select {
+	case event := <-exitCh:
+		if event.ID != id || event.SessionID != "session-a" {
+			t.Fatalf("exit event = %+v, want start session id", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exit handler not called")
+	}
+}
+
 func TestManagerLargeBackgroundOutputSpillsAndReadReusesPath(t *testing.T) {
 	home := t.TempDir()
 	m := NewManager(1, cmdoutput.Options{
@@ -155,6 +177,55 @@ func TestManagerReadAfterExitReturnsMissingProcess(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("no process with ID %q", id)) {
 		t.Fatalf("Read after exit error = %v, want missing process", err)
 	}
+}
+
+func TestManagerReadWhileExitHandlerPendingReturnsFinalOutput(t *testing.T) {
+	m := NewManager(1, cmdoutput.Options{})
+	handlerStarted := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	handlerDone := make(chan ExitEvent, 1)
+	m.SetExitHandler(func(event ExitEvent) {
+		close(handlerStarted)
+		<-releaseHandler
+		handlerDone <- event
+	})
+
+	id, err := m.Start("printf final", 0)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-handlerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("exit handler not called")
+	}
+
+	output, err := m.Read(id)
+	if err != nil {
+		t.Fatalf("Read while handler pending: %v", err)
+	}
+	if output != "final" {
+		t.Fatalf("Read while handler pending = %q, want final", output)
+	}
+
+	close(releaseHandler)
+	select {
+	case event := <-handlerDone:
+		if event.ID != id || event.Output != "final" {
+			t.Fatalf("exit event = %+v, want id and final output", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exit handler did not complete")
+	}
+
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		_, err = m.Read(id)
+		if err != nil && strings.Contains(err.Error(), fmt.Sprintf("no process with ID %q", id)) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("Read after handler completion error = %v, want missing process", err)
 }
 
 func TestManagerWithoutExitHandlerDoesNotKeepUnreferencedSpill(t *testing.T) {

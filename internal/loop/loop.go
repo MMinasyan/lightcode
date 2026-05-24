@@ -11,6 +11,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -132,6 +133,9 @@ type Loop struct {
 	pendingQueue *tool.PendingQueue
 
 	pendingExecutor PendingExecutor
+
+	signalMu      sync.Mutex
+	queuedSignals []string
 }
 
 // New returns a Loop pre-seeded with the system prompt.
@@ -274,21 +278,49 @@ func (l *Loop) UpdateSystemPrompt(content string) {
 // AppendUserMessage adds a user message to the conversation and persists
 // it under the given turn. Does not run the model.
 func (l *Loop) AppendUserMessage(turn int, content string) {
+	l.DrainQueuedSignals()
 	l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
 	msg := message.NewText(message.RoleUser, content)
 	l.messages = append(l.messages, msg)
 	l.persistMessage(turn, msg)
 }
 
-// AppendSignalPayload appends a user-role system signal message to the
-// conversation history. Not persisted and not counted as a turn boundary.
-func (l *Loop) AppendSignalPayload(payload string) {
+// QueueSignalPayload queues a user-role system signal message. The loop drains
+// queued signals only at protocol-safe points, so async events cannot split an
+// assistant tool call from its required tool result messages.
+func (l *Loop) QueueSignalPayload(payload string) {
+	l.signalMu.Lock()
+	defer l.signalMu.Unlock()
+	l.queuedSignals = append(l.queuedSignals, payload)
+}
+
+// DrainQueuedSignals appends queued system signals to the conversation history.
+// Signals are not persisted and do not count as turn boundaries. Call this only
+// at protocol-safe history boundaries.
+func (l *Loop) DrainQueuedSignals() {
+	l.signalMu.Lock()
+	payloads := append([]string(nil), l.queuedSignals...)
+	l.queuedSignals = nil
+	l.signalMu.Unlock()
+	for _, payload := range payloads {
+		l.appendSignalPayload(payload)
+	}
+}
+
+func (l *Loop) appendSignalPayload(payload string) {
 	l.messages = append(l.messages, message.NewText(message.RoleUser, SystemSignal(payload)))
+}
+
+func (l *Loop) clearQueuedSignals() {
+	l.signalMu.Lock()
+	defer l.signalMu.Unlock()
+	l.queuedSignals = nil
 }
 
 // ResetHistory drops all messages and turn boundaries, leaving only
 // the system prompt. Used when switching sessions.
 func (l *Loop) ResetHistory() {
+	l.clearQueuedSignals()
 	if len(l.messages) > 0 && l.messages[0].Role == message.RoleSystem {
 		l.messages = l.messages[:1]
 	} else {
@@ -362,6 +394,8 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		turn = l.store.CurrentTurn()
 	}
 
+	l.DrainQueuedSignals()
+
 	// Fresh pending queue per turn.
 	l.pendingQueue = tool.NewPendingQueue()
 
@@ -381,6 +415,7 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 	}()
 
 	for iter := 0; iter < maxIterations; iter++ {
+		l.DrainQueuedSignals()
 		msg, cancelled, err := l.runStream(ctx)
 		if err != nil {
 			return "", fmt.Errorf("chat completion: %w", err)
@@ -409,6 +444,7 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 				l.messages = append(l.messages, toolMsg)
 				l.persistMessage(turn, toolMsg)
 			}
+			l.DrainQueuedSignals()
 			return assistantVisibleText(msg), nil
 		}
 
@@ -425,6 +461,7 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 				break
 			}
 		}
+		l.DrainQueuedSignals()
 		if denied {
 			return "Tool denied by user.", nil
 		}

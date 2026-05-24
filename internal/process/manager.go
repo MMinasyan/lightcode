@@ -18,6 +18,7 @@ import (
 type CommandStarted struct {
 	ID        string
 	Command   string
+	SessionID string
 	StartedAt time.Time
 	cmd       *exec.Cmd
 	capture   *cmdoutput.Capture
@@ -25,6 +26,7 @@ type CommandStarted struct {
 	mu        sync.Mutex
 	exitCode  int
 	exited    bool
+	finalized bool
 	exitErr   error
 }
 
@@ -33,15 +35,17 @@ type Manager struct {
 	mu            sync.Mutex
 	procs         map[string]*CommandStarted
 	onExit        func(ExitEvent)
+	sessionID     func() string
 	maxProcs      int
 	outputOptions cmdoutput.Options
 }
 
 type ExitEvent struct {
-	ID       string
-	Command  string
-	ExitCode int
-	Output   string
+	ID        string
+	Command   string
+	SessionID string
+	ExitCode  int
+	Output    string
 }
 
 // NewManager creates a new process Manager. maxProcs limits concurrent
@@ -60,6 +64,14 @@ func (m *Manager) SetExitHandler(handler func(ExitEvent)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onExit = handler
+}
+
+// SetSessionProvider sets a callback used to tag newly started background
+// processes with the session that launched them.
+func (m *Manager) SetSessionProvider(provider func() string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessionID = provider
 }
 
 // Start launches a background process and returns its ID.
@@ -84,6 +96,7 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	sessionID := m.currentSessionID()
 	cmd := exec.Command("sh", "-c", command)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	capture := cmdoutput.NewCapture(m.outputOptions)
@@ -98,6 +111,7 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 	cs := &CommandStarted{
 		ID:        id,
 		Command:   command,
+		SessionID: sessionID,
 		StartedAt: time.Now(),
 		cmd:       cmd,
 		capture:   capture,
@@ -127,14 +141,19 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 		if handler != nil {
 			output := capture.Format()
 			handler(ExitEvent{
-				ID:       id,
-				Command:  command,
-				ExitCode: code,
-				Output:   output,
+				ID:        id,
+				Command:   command,
+				SessionID: sessionID,
+				ExitCode:  code,
+				Output:    output,
 			})
 		}
 
-		// Auto-remove dead process so it doesn't count against the limit.
+		cs.mu.Lock()
+		cs.finalized = true
+		cs.mu.Unlock()
+
+		// Auto-remove finalized process so it doesn't count against the limit.
 		m.Remove(id)
 		close(cs.done)
 		capture.Close()
@@ -153,7 +172,7 @@ func (m *Manager) Read(id string) (string, error) {
 	}
 
 	cs.mu.Lock()
-	if cs.exited {
+	if cs.finalized {
 		cs.mu.Unlock()
 		return "", fmt.Errorf("process: no process with ID %q", id)
 	}
@@ -236,6 +255,16 @@ func (m *Manager) Remove(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.procs, id)
+}
+
+func (m *Manager) currentSessionID() string {
+	m.mu.Lock()
+	provider := m.sessionID
+	m.mu.Unlock()
+	if provider == nil {
+		return ""
+	}
+	return provider()
 }
 
 func newProcessID() (string, error) {

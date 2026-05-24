@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,6 +117,114 @@ func TestSendQueuedMessagesReturnsAllTurnNumbers(t *testing.T) {
 	waitUntilIdle(t, a)
 	if got := userContents(a.SessionMessages()); !equalStrings(got, []string{"first", "second", "third"}) {
 		t.Fatalf("queued history = %q, want all user turns", got)
+	}
+}
+
+func TestSendQueuedMessagesDrainsQueuedSignalsBeforeIntermediateTurns(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	a.lp.SetClient(nil)
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession returned error: %v", err)
+	}
+	a.lp.QueueSignalPayload("idle signal")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if _, err := a.SendQueuedMessages(ctx, []string{"first", "second"}); err != nil {
+		t.Fatalf("SendQueuedMessages returned error: %v", err)
+	}
+	cancel()
+	waitUntilIdle(t, a)
+
+	msgs := a.lp.Messages()
+	if len(msgs) < 4 {
+		t.Fatalf("messages len = %d, want system, signal, first, second: %#v", len(msgs), msgs)
+	}
+	if msgs[1].Role != message.RoleUser || msgs[1].TextContent() != `<system-signal>idle signal</system-signal>` {
+		t.Fatalf("messages[1] = %#v, want queued signal before first queued turn", msgs[1])
+	}
+	if msgs[2].Role != message.RoleUser || msgs[2].TextContent() != "first" {
+		t.Fatalf("messages[2] = %#v, want first queued turn after signal", msgs[2])
+	}
+	if msgs[3].Role != message.RoleUser || msgs[3].TextContent() != "second" {
+		t.Fatalf("messages[3] = %#v, want final queued turn", msgs[3])
+	}
+}
+
+func TestRunCompactionDrainsQueuedSignalsBeforeReload(t *testing.T) {
+	var sawSignal bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		messages, ok := body["messages"].([]any)
+		if !ok || len(messages) != 2 {
+			t.Fatalf("summarizer messages = %#v, want system and user", body["messages"])
+		}
+		userMsg, ok := messages[1].(map[string]any)
+		if !ok {
+			t.Fatalf("summarizer user message = %#v", messages[1])
+		}
+		content, _ := userMsg["content"].(string)
+		sawSignal = strings.Contains(content, `<system-signal>idle signal</system-signal>`)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"summary"},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+
+	a := newCatalogBackedTestAgent(t)
+	appendUserTurn(t, a, "first")
+	a.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
+	a.lp.QueueSignalPayload("idle signal")
+
+	if err := a.runCompaction(context.Background(), false); err != nil {
+		t.Fatalf("runCompaction returned error: %v", err)
+	}
+	if !sawSignal {
+		t.Fatal("summarizer request did not include queued system signal")
+	}
+	for _, msg := range a.lp.Messages() {
+		if strings.Contains(msg.TextContent(), "idle signal") {
+			t.Fatalf("queued signal survived compaction reload as a separate message: %#v", msg)
+		}
+	}
+}
+
+func TestBackgroundExitSignalAfterSessionNewDoesNotDrainIntoNewSession(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	appendUserTurn(t, a, "old session prompt")
+
+	id, err := a.procMgr.Start("sleep 0.1; printf old-output", 0)
+	if err != nil {
+		t.Fatalf("Start background process: %v", err)
+	}
+	if err := a.SessionNew(); err != nil {
+		t.Fatalf("SessionNew returned error: %v", err)
+	}
+	appendUserTurn(t, a, "new session prompt")
+
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		_, err = a.procMgr.Read(id)
+		if err != nil && strings.Contains(err.Error(), fmt.Sprintf("no process with ID %q", id)) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("no process with ID %q", id)) {
+		t.Fatalf("background process did not finalize; last read error = %v", err)
+	}
+
+	a.lp.DrainQueuedSignals()
+	for _, msg := range a.lp.Messages() {
+		content := msg.TextContent()
+		if strings.Contains(content, "old-output") || strings.Contains(content, "Background process") {
+			t.Fatalf("old session background signal leaked into new session: %#v", msg)
+		}
+	}
+	if got := userContents(a.SessionMessages()); !equalStrings(got, []string{"new session prompt"}) {
+		t.Fatalf("new session history = %q, want only new session prompt", got)
 	}
 }
 
