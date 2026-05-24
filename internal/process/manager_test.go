@@ -240,24 +240,41 @@ func TestManagerWithoutExitHandlerDoesNotKeepUnreferencedSpill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	removed := false
 	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
-		if _, err := m.Read(id); err != nil && strings.Contains(err.Error(), "no process with ID") {
+		m.mu.Lock()
+		_, ok := m.procs[id]
+		m.mu.Unlock()
+		if !ok {
+			removed = true
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	entries, err := os.ReadDir(filepath.Join(home, ".lightcode"))
-	if os.IsNotExist(err) {
-		return
+	if !removed {
+		t.Fatal("process did not finish")
 	}
-	if err != nil {
-		t.Fatalf("ReadDir spill dir: %v", err)
-	}
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), "proc_output_") {
-			t.Fatalf("unexpected unreferenced spill file kept: %s", entry.Name())
+	var leftovers []string
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		leftovers = nil
+		entries, err := os.ReadDir(filepath.Join(home, ".lightcode"))
+		if os.IsNotExist(err) {
+			return
 		}
+		if err != nil {
+			t.Fatalf("ReadDir spill dir: %v", err)
+		}
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), "proc_output_") {
+				leftovers = append(leftovers, entry.Name())
+			}
+		}
+		if len(leftovers) == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatalf("unexpected unreferenced spill files kept: %v", leftovers)
 }
 
 func TestManagerEmptyRunningReadMarker(t *testing.T) {
