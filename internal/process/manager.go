@@ -14,20 +14,31 @@ import (
 	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 )
 
+type ExitReason string
+
+const (
+	ExitReasonCompleted ExitReason = "completed"
+	ExitReasonError     ExitReason = "error"
+	ExitReasonTimeout   ExitReason = "timeout"
+	ExitReasonKilled    ExitReason = "killed"
+)
+
 // CommandStarted represents a running background process.
 type CommandStarted struct {
-	ID        string
-	Command   string
-	SessionID string
-	StartedAt time.Time
-	cmd       *exec.Cmd
-	capture   *cmdoutput.Capture
-	done      chan struct{}
-	mu        sync.Mutex
-	exitCode  int
-	exited    bool
-	finalized bool
-	exitErr   error
+	ID         string
+	Command    string
+	SessionID  string
+	StartedAt  time.Time
+	cmd        *exec.Cmd
+	capture    *cmdoutput.Capture
+	done       chan struct{}
+	mu         sync.Mutex
+	exitCode   int
+	exited     bool
+	finalized  bool
+	exitErr    error
+	reason     ExitReason
+	timeoutSec int
 }
 
 // Manager tracks background processes.
@@ -41,11 +52,13 @@ type Manager struct {
 }
 
 type ExitEvent struct {
-	ID        string
-	Command   string
-	SessionID string
-	ExitCode  int
-	Output    string
+	ID         string
+	Command    string
+	SessionID  string
+	ExitCode   int
+	Reason     ExitReason
+	TimeoutSec int
+	Output     string
 }
 
 // NewManager creates a new process Manager. maxProcs limits concurrent
@@ -109,13 +122,14 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 	}
 
 	cs := &CommandStarted{
-		ID:        id,
-		Command:   command,
-		SessionID: sessionID,
-		StartedAt: time.Now(),
-		cmd:       cmd,
-		capture:   capture,
-		done:      make(chan struct{}),
+		ID:         id,
+		Command:    command,
+		SessionID:  sessionID,
+		StartedAt:  time.Now(),
+		cmd:        cmd,
+		capture:    capture,
+		done:       make(chan struct{}),
+		timeoutSec: timeoutSec,
 	}
 
 	m.mu.Lock()
@@ -134,18 +148,26 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 			} else {
 				cs.exitCode = -1
 			}
+			if cs.reason == "" {
+				cs.reason = ExitReasonError
+			}
+		} else if cs.reason == "" {
+			cs.reason = ExitReasonCompleted
 		}
 		code := cs.exitCode
+		reason := cs.reason
 		cs.mu.Unlock()
 
 		if handler != nil {
 			output := capture.Format()
 			handler(ExitEvent{
-				ID:        id,
-				Command:   command,
-				SessionID: sessionID,
-				ExitCode:  code,
-				Output:    output,
+				ID:         id,
+				Command:    command,
+				SessionID:  sessionID,
+				ExitCode:   code,
+				Reason:     reason,
+				TimeoutSec: timeoutSec,
+				Output:     output,
 			})
 		}
 
@@ -158,6 +180,25 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 		close(cs.done)
 		capture.Close()
 	}()
+
+	if timeoutSec > 0 {
+		go func() {
+			timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
+			defer timer.Stop()
+			select {
+			case <-cs.done:
+			case <-timer.C:
+				if cs.markReason(ExitReasonTimeout) {
+					terminateProcessGroup(cmd.Process.Pid)
+					select {
+					case <-cs.done:
+					case <-time.After(500 * time.Millisecond):
+						_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+					}
+				}
+			}
+		}()
+	}
 
 	return id, nil
 }
@@ -201,8 +242,8 @@ func (m *Manager) Kill(id string) error {
 	}
 	cs.mu.Unlock()
 
-	// SIGTERM to process group.
-	_ = syscall.Kill(-cs.cmd.Process.Pid, syscall.SIGTERM)
+	cs.markReason(ExitReasonKilled)
+	terminateProcessGroup(cs.cmd.Process.Pid)
 
 	select {
 	case <-cs.done:
@@ -211,6 +252,20 @@ func (m *Manager) Kill(id string) error {
 		<-cs.done
 	}
 	return nil
+}
+
+func (cs *CommandStarted) markReason(reason ExitReason) bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if cs.exited || cs.reason != "" {
+		return false
+	}
+	cs.reason = reason
+	return true
+}
+
+func terminateProcessGroup(pid int) {
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
 }
 
 // List returns a formatted list of all background processes.

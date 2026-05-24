@@ -47,7 +47,7 @@ func (*RunCommand) Name() string { return "run_command" }
 func (*RunCommand) Description() string {
 	return `Executes a shell command and returns combined stdout and stderr.
 - Each call starts a fresh shell in the project root. Environment variables, aliases, and working directory do not persist between calls. Use "cd /path && command" if you need a different working directory.
-- Default timeout is 120 seconds. Use the timeout parameter to override for commands that need more time.
+- Foreground commands use the default timeout. Background commands run until they exit, are killed, or reach an explicit timeout parameter.
 - For long-running commands like dev servers, file watchers, or test suites that run continuously, set background=true. The command returns immediately with a process ID. Use the sleep tool to wait, then the process tool to read output or kill the process.
 - Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use edit_file or write_file.`
 }
@@ -80,16 +80,19 @@ func (r *RunCommand) Execute(ctx context.Context, params map[string]any) (string
 	}
 
 	background, _ := params["background"].(bool)
-	timeoutSec := r.cfg.CommandTimeout
+	timeoutSec := 0
 	if v, ok := params["timeout"].(float64); ok {
 		timeoutSec = int(v)
 	}
-	if timeoutSec < 1 {
-		timeoutSec = r.cfg.CommandTimeout
-	}
 
 	if background {
+		if timeoutSec < 1 {
+			timeoutSec = 0
+		}
 		return r.runBackground(ctx, command, timeoutSec)
+	}
+	if timeoutSec < 1 {
+		timeoutSec = r.cfg.CommandTimeout
 	}
 	return r.runForeground(ctx, command, timeoutSec)
 }

@@ -138,10 +138,10 @@ func TestSystemSignalEscapesLiteralClosingTag(t *testing.T) {
 	}
 }
 
-func TestQueueSignalPayloadWrapsRawPayloadWhenDrained(t *testing.T) {
+func TestPendingSignalWrapsRawPayloadWhenDrained(t *testing.T) {
 	lp := New(nil, nil, "system")
-	lp.QueueSignalPayload(`raw <payload> & data`)
-	lp.DrainQueuedSignals()
+	lp.AddPendingSignal(PendingSignal{Payload: `raw <payload> & data`})
+	lp.DrainPendingSignalsForModel(0)
 
 	msgs := lp.Messages()
 	if len(msgs) != 2 {
@@ -154,11 +154,11 @@ func TestQueueSignalPayloadWrapsRawPayloadWhenDrained(t *testing.T) {
 	}
 }
 
-func TestResetHistoryClearsQueuedSignals(t *testing.T) {
+func TestResetHistoryClearsPendingSignals(t *testing.T) {
 	lp := New(nil, nil, "system")
-	lp.QueueSignalPayload("old session signal")
+	lp.AddPendingSignal(PendingSignal{Payload: "old session signal", Wake: true})
 	lp.ResetHistory()
-	lp.DrainQueuedSignals()
+	lp.DrainPendingSignalsForModel(0)
 
 	msgs := lp.Messages()
 	if len(msgs) != 1 {
@@ -166,24 +166,24 @@ func TestResetHistoryClearsQueuedSignals(t *testing.T) {
 	}
 }
 
-func TestAppendUserMessageDrainsQueuedSignalsBeforeUserTurn(t *testing.T) {
+func TestAppendUserMessageDoesNotDrainPendingSignals(t *testing.T) {
 	lp := New(nil, nil, "system")
-	lp.QueueSignalPayload("idle signal")
+	lp.AddPendingSignal(PendingSignal{Payload: "idle signal", Wake: true})
 	lp.AppendUserMessage(1, "next prompt")
 
 	msgs := lp.Messages()
-	if len(msgs) != 3 {
-		t.Fatalf("messages len = %d, want system, signal, user: %#v", len(msgs), msgs)
+	if len(msgs) != 2 {
+		t.Fatalf("messages len = %d, want system plus user only: %#v", len(msgs), msgs)
 	}
-	if msgs[1].Role != message.RoleUser || msgs[1].TextContent() != `<system-signal>idle signal</system-signal>` {
-		t.Fatalf("messages[1] = %#v, want queued signal before user turn", msgs[1])
+	if msgs[1].Role != message.RoleUser || msgs[1].TextContent() != "next prompt" {
+		t.Fatalf("messages[1] = %#v, want user prompt", msgs[1])
 	}
-	if msgs[2].Role != message.RoleUser || msgs[2].TextContent() != "next prompt" {
-		t.Fatalf("messages[2] = %#v, want user prompt after queued signal", msgs[2])
+	if !lp.HasPendingWakeSignal() {
+		t.Fatal("pending wake signal was drained by AppendUserMessage")
 	}
 }
 
-func TestQueuedSignalDuringToolExecutionDrainsAfterToolResult(t *testing.T) {
+func TestPendingSignalDuringToolExecutionDrainsAfterToolResult(t *testing.T) {
 	var (
 		mu       sync.Mutex
 		requests []map[string]any
@@ -229,7 +229,7 @@ func TestQueuedSignalDuringToolExecutionDrainsAfterToolResult(t *testing.T) {
 	registry := tool.NewRegistry()
 	var lp *Loop
 	registry.Register(queueSignalTool{queue: func() {
-		lp.QueueSignalPayload("async <event>")
+		lp.AddPendingSignal(PendingSignal{Payload: "async <event>", Wake: true})
 	}})
 	lp = New(client, registry, "system")
 
@@ -281,7 +281,77 @@ func TestQueuedSignalDuringToolExecutionDrainsAfterToolResult(t *testing.T) {
 		t.Fatalf("wire tool message = %#v, want tool result", toolMsg)
 	}
 	if signalMsg["role"] != "user" || signalMsg["content"] != wantSignal {
-		t.Fatalf("wire signal message = %#v, want queued signal after tool result", signalMsg)
+		t.Fatalf("wire signal message = %#v, want pending signal after tool result", signalMsg)
+	}
+}
+
+func TestWakeSignalDuringTextModelCallStartsNextModelRequest(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests []map[string]any
+		count    int
+		lp       *Loop
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, body)
+		n := count
+		count++
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch n {
+		case 0:
+			lp.AddPendingSignal(PendingSignal{Payload: "background complete", Wake: true})
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","content":"initial"},"finish_reason":"stop"}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		case 1:
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","content":"after signal"},"finish_reason":"stop"}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		default:
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	prov := &catalog.Provider{
+		ID: "test",
+		Transport: catalog.Transport{
+			BaseURL: server.URL + "/v1",
+		},
+		Models: map[string]*catalog.Model{
+			"model-a": {ID: "model-a"},
+		},
+	}
+	client := provider.New(prov, prov.Models["model-a"], "")
+	lp = New(client, tool.NewRegistry(), "system")
+
+	got, err := lp.Run(context.Background(), "start")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != "after signal" {
+		t.Fatalf("Run returned %q, want after signal", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 2 {
+		t.Fatalf("requests len = %d, want 2", len(requests))
+	}
+	wireMessages, ok := requests[1]["messages"].([]any)
+	if !ok || len(wireMessages) == 0 {
+		t.Fatalf("second request messages = %#v", requests[1]["messages"])
+	}
+	last := wireMessages[len(wireMessages)-1].(map[string]any)
+	if last["role"] != "user" || last["content"] != `<system-signal>background complete</system-signal>` {
+		t.Fatalf("second request last message = %#v, want wake signal", last)
 	}
 }
 

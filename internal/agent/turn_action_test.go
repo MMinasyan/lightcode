@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/loop"
 	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/provider"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
@@ -120,13 +122,13 @@ func TestSendQueuedMessagesReturnsAllTurnNumbers(t *testing.T) {
 	}
 }
 
-func TestSendQueuedMessagesDrainsQueuedSignalsBeforeIntermediateTurns(t *testing.T) {
+func TestSendQueuedMessagesDoesNotDrainSignalsBeforeIntermediateTurns(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	a.lp.SetClient(nil)
 	if err := a.ensureSession(); err != nil {
 		t.Fatalf("ensureSession returned error: %v", err)
 	}
-	a.lp.QueueSignalPayload("idle signal")
+	a.lp.AddPendingSignal(loop.PendingSignal{Payload: "idle signal", Wake: true})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -139,20 +141,43 @@ func TestSendQueuedMessagesDrainsQueuedSignalsBeforeIntermediateTurns(t *testing
 
 	msgs := a.lp.Messages()
 	if len(msgs) < 4 {
-		t.Fatalf("messages len = %d, want system, signal, first, second: %#v", len(msgs), msgs)
+		t.Fatalf("messages len = %d, want system, first, signal, second: %#v", len(msgs), msgs)
 	}
-	if msgs[1].Role != message.RoleUser || msgs[1].TextContent() != `<system-signal>idle signal</system-signal>` {
-		t.Fatalf("messages[1] = %#v, want queued signal before first queued turn", msgs[1])
+	if msgs[1].Role != message.RoleUser || msgs[1].TextContent() != "first" {
+		t.Fatalf("messages[1] = %#v, want first queued turn before signal", msgs[1])
 	}
-	if msgs[2].Role != message.RoleUser || msgs[2].TextContent() != "first" {
-		t.Fatalf("messages[2] = %#v, want first queued turn after signal", msgs[2])
+	if msgs[2].Role != message.RoleUser || msgs[2].TextContent() != `<system-signal>idle signal</system-signal>` {
+		t.Fatalf("messages[2] = %#v, want pending signal in started turn", msgs[2])
 	}
 	if msgs[3].Role != message.RoleUser || msgs[3].TextContent() != "second" {
-		t.Fatalf("messages[3] = %#v, want final queued turn", msgs[3])
+		t.Fatalf("messages[3] = %#v, want final queued turn after signal", msgs[3])
 	}
 }
 
-func TestRunCompactionDrainsQueuedSignalsBeforeReload(t *testing.T) {
+func TestSendQueuedMessagesWhileBusyDoesNotAppendQueuedTurns(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession returned error: %v", err)
+	}
+	a.mu.Lock()
+	a.busy = true
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.busy = false
+		a.mu.Unlock()
+	}()
+
+	_, err := a.SendQueuedMessages(context.Background(), []string{"first", "second"})
+	if err == nil || !strings.Contains(err.Error(), "turn is already in progress") {
+		t.Fatalf("SendQueuedMessages error = %v, want busy error", err)
+	}
+	if got := userContents(a.SessionMessages()); len(got) != 0 {
+		t.Fatalf("queued messages were appended despite busy error: %q", got)
+	}
+}
+
+func TestRunCompactionPreservesPendingSignalsForMainModel(t *testing.T) {
 	var sawSignal bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
@@ -177,18 +202,21 @@ func TestRunCompactionDrainsQueuedSignalsBeforeReload(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	appendUserTurn(t, a, "first")
 	a.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
-	a.lp.QueueSignalPayload("idle signal")
+	a.lp.AddPendingSignal(loop.PendingSignal{Payload: "idle signal", Wake: true})
 
 	if err := a.runCompaction(context.Background(), false); err != nil {
 		t.Fatalf("runCompaction returned error: %v", err)
 	}
-	if !sawSignal {
-		t.Fatal("summarizer request did not include queued system signal")
+	if sawSignal {
+		t.Fatal("summarizer request included pending signal; want main-model delivery only")
 	}
 	for _, msg := range a.lp.Messages() {
 		if strings.Contains(msg.TextContent(), "idle signal") {
-			t.Fatalf("queued signal survived compaction reload as a separate message: %#v", msg)
+			t.Fatalf("pending signal was appended during compaction reload: %#v", msg)
 		}
+	}
+	if !a.lp.HasPendingWakeSignal() {
+		t.Fatal("pending wake signal was lost during compaction reload")
 	}
 }
 
@@ -216,7 +244,9 @@ func TestBackgroundExitSignalAfterSessionNewDoesNotDrainIntoNewSession(t *testin
 		t.Fatalf("background process did not finalize; last read error = %v", err)
 	}
 
-	a.lp.DrainQueuedSignals()
+	if a.lp.HasPendingSignal() {
+		a.lp.DrainPendingSignalsForModel(a.store.CurrentTurn())
+	}
 	for _, msg := range a.lp.Messages() {
 		content := msg.TextContent()
 		if strings.Contains(content, "old-output") || strings.Contains(content, "Background process") {
@@ -225,6 +255,67 @@ func TestBackgroundExitSignalAfterSessionNewDoesNotDrainIntoNewSession(t *testin
 	}
 	if got := userContents(a.SessionMessages()); !equalStrings(got, []string{"new session prompt"}) {
 		t.Fatalf("new session history = %q, want only new session prompt", got)
+	}
+}
+
+func TestIdleBackgroundTerminalSignalStartsAgentTurn(t *testing.T) {
+	requests := make(chan []map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		requests <- body.Messages
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","content":"handled background exit"},"finish_reason":"stop"}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	a := newCatalogBackedTestAgent(t)
+	events := make(chan Event, 16)
+	a.SetEventHandler(func(ev Event) {
+		events <- ev
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.Init(ctx)
+	appendUserTurn(t, a, "existing turn")
+	prov := a.catalog.Providers["test"]
+	prov.Transport.BaseURL = server.URL + "/v1"
+	a.lp.SetClient(provider.New(prov, prov.Models["test-model"], ""))
+
+	if _, err := a.procMgr.Start("printf final-output", 0); err != nil {
+		t.Fatalf("Start background process: %v", err)
+	}
+
+	var sawEnd bool
+	for deadline := time.After(2 * time.Second); !sawEnd; {
+		select {
+		case ev := <-events:
+			if ev.Kind == EventTurnEnd {
+				sawEnd = true
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for autonomous signal turn")
+		}
+	}
+
+	var messages []map[string]any
+	select {
+	case messages = <-requests:
+	case <-time.After(time.Second):
+		t.Fatal("model request was not sent for idle background exit")
+	}
+	if len(messages) == 0 {
+		t.Fatal("model request had no messages")
+	}
+	last := messages[len(messages)-1]
+	content, _ := last["content"].(string)
+	if last["role"] != "user" || !strings.Contains(content, "Background process") || !strings.Contains(content, "final-output") {
+		t.Fatalf("last model message = %#v, want background terminal signal with output", last)
 	}
 }
 

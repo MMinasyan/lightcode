@@ -920,6 +920,11 @@ func (c *CLI) submitInput(text string) {
 }
 
 func (c *CLI) submitInputLocked(text string) {
+	if len(c.msgQueue) > 0 {
+		c.msgQueue = append(c.msgQueue, text)
+		c.flushQueueLocked()
+		return
+	}
 	c.printLineLocked(renderUserMsg(text, c.width))
 	c.startAnimationLocked("Thinking")
 
@@ -951,12 +956,7 @@ func (c *CLI) flushQueueLocked() {
 		return
 	}
 
-	queue := c.msgQueue
-	c.msgQueue = nil
-
-	for _, text := range queue {
-		c.printLineLocked(renderUserMsg(text, c.width))
-	}
+	queue := append([]string(nil), c.msgQueue...)
 	c.busy = true
 	c.state = stateStreaming
 	c.startAnimationLocked("Thinking")
@@ -964,6 +964,14 @@ func (c *CLI) flushQueueLocked() {
 	go func() {
 		if _, err := c.agent.SendQueuedMessages(c.ctx, queue); err != nil {
 			c.mu.Lock()
+			if strings.Contains(err.Error(), "turn is already in progress") {
+				c.stopAnimationLocked()
+				c.writeRaw("\r\x1b[2K")
+				c.busy = true
+				c.state = stateStreaming
+				c.mu.Unlock()
+				return
+			}
 			c.stopAnimationLocked()
 			c.writeRaw("\r\x1b[2K")
 			c.writeRaw(renderErrorMsg(err.Error()))
@@ -971,7 +979,24 @@ func (c *CLI) flushQueueLocked() {
 			c.state = stateIdle
 			c.printInputPromptLocked()
 			c.mu.Unlock()
+			return
 		}
+		c.mu.Lock()
+		for range queue {
+			if len(c.msgQueue) == 0 {
+				break
+			}
+			c.msgQueue = c.msgQueue[1:]
+		}
+		c.stopAnimationLocked()
+		c.writeRaw("\r\x1b[2K")
+		for _, text := range queue {
+			c.printLineLocked(renderUserMsg(text, c.width))
+		}
+		if c.busy {
+			c.startAnimationLocked("Thinking")
+		}
+		c.mu.Unlock()
 	}()
 }
 

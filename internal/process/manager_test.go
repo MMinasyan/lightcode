@@ -61,6 +61,9 @@ func TestManagerStartReadExitHandlerAndLimit(t *testing.T) {
 		if event.ExitCode == 0 {
 			t.Fatalf("exit code = %d after kill, want non-zero", event.ExitCode)
 		}
+		if event.Reason != ExitReasonKilled {
+			t.Fatalf("exit reason = %q after kill, want %q", event.Reason, ExitReasonKilled)
+		}
 		if event.ID != id || event.Command != "printf hello; sleep 1" {
 			t.Fatalf("exit event = %+v, want id and command", event)
 		}
@@ -93,12 +96,54 @@ func TestManagerExitHandlerReceivesFinalOutput(t *testing.T) {
 	}
 	select {
 	case event := <-exitCh:
-		if event.ID != id || event.Command != "printf final" || event.ExitCode != 0 || event.Output != "final" {
-			t.Fatalf("exit event = %+v, want id, command, code 0, output final", event)
+		if event.ID != id || event.Command != "printf final" || event.ExitCode != 0 || event.Reason != ExitReasonCompleted || event.Output != "final" {
+			t.Fatalf("exit event = %+v, want id, command, completed code 0, output final", event)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("exit handler not called")
 	}
+}
+
+func TestManagerExitEventReasonsForErrorAndTimeout(t *testing.T) {
+	t.Run("error", func(t *testing.T) {
+		m := NewManager(1, cmdoutput.Options{})
+		exitCh := make(chan ExitEvent, 1)
+		m.SetExitHandler(func(event ExitEvent) { exitCh <- event })
+		if _, err := m.Start("printf fail; exit 7", 0); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		select {
+		case event := <-exitCh:
+			if event.Reason != ExitReasonError || event.ExitCode != 7 || event.Output != "fail" {
+				t.Fatalf("exit event = %+v, want error code 7 with output", event)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("exit handler not called")
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		m := NewManager(1, cmdoutput.Options{})
+		exitCh := make(chan ExitEvent, 1)
+		m.SetExitHandler(func(event ExitEvent) { exitCh <- event })
+		if _, err := m.Start("printf start; sleep 5", 1); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		select {
+		case event := <-exitCh:
+			if event.Reason != ExitReasonTimeout || event.TimeoutSec != 1 {
+				t.Fatalf("exit event = %+v, want timeout reason and timeoutSec", event)
+			}
+			if event.ExitCode == 0 {
+				t.Fatalf("timeout exit code = %d, want non-zero", event.ExitCode)
+			}
+			if !strings.Contains(event.Output, "start") {
+				t.Fatalf("timeout output = %q, want captured output", event.Output)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("exit handler not called")
+		}
+	})
 }
 
 func TestManagerExitEventIncludesStartSessionID(t *testing.T) {
@@ -240,20 +285,26 @@ func TestManagerWithoutExitHandlerDoesNotKeepUnreferencedSpill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	removed := false
+	waitForProcessRemoval(t, m, id)
+	assertNoProcOutputSpills(t, home)
+}
+
+func waitForProcessRemoval(t *testing.T, m *Manager, id string) {
+	t.Helper()
 	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
 		m.mu.Lock()
 		_, ok := m.procs[id]
 		m.mu.Unlock()
 		if !ok {
-			removed = true
-			break
+			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !removed {
-		t.Fatal("process did not finish")
-	}
+	t.Fatalf("process %s did not finish", id)
+}
+
+func assertNoProcOutputSpills(t *testing.T, home string) {
+	t.Helper()
 	var leftovers []string
 	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
 		leftovers = nil

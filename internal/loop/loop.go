@@ -104,6 +104,18 @@ type Event struct {
 	Input      int
 	Output     int
 	UsageKnown bool
+
+	// Turn is set when the event belongs to a persisted conversation turn.
+	Turn int
+}
+
+// PendingSignal is async model input owned by the loop. Wake signals ask the
+// agent scheduler to start a model turn when idle. Persist controls whether
+// the wrapped user-role signal is written to the current turn.
+type PendingSignal struct {
+	Payload string
+	Wake    bool
+	Persist bool
 }
 
 // Loop owns the conversation history for a single session and drives
@@ -134,8 +146,8 @@ type Loop struct {
 
 	pendingExecutor PendingExecutor
 
-	signalMu      sync.Mutex
-	queuedSignals []string
+	signalMu       sync.Mutex
+	pendingSignals []PendingSignal
 }
 
 // New returns a Loop pre-seeded with the system prompt.
@@ -278,55 +290,85 @@ func (l *Loop) UpdateSystemPrompt(content string) {
 // AppendUserMessage adds a user message to the conversation and persists
 // it under the given turn. Does not run the model.
 func (l *Loop) AppendUserMessage(turn int, content string) {
-	l.DrainQueuedSignals()
 	l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
 	msg := message.NewText(message.RoleUser, content)
 	l.messages = append(l.messages, msg)
 	l.persistMessage(turn, msg)
 }
 
-// QueueSignalPayload queues a user-role system signal message. The loop drains
-// queued signals only at protocol-safe points, so async events cannot split an
-// assistant tool call from its required tool result messages.
-func (l *Loop) QueueSignalPayload(payload string) {
+// AddPendingSignal records async model input. The loop drains pending signals
+// only when the next model request can legally include them.
+func (l *Loop) AddPendingSignal(signal PendingSignal) {
+	if signal.Payload == "" {
+		return
+	}
 	l.signalMu.Lock()
 	defer l.signalMu.Unlock()
-	l.queuedSignals = append(l.queuedSignals, payload)
+	l.pendingSignals = append(l.pendingSignals, signal)
 }
 
-// DrainQueuedSignals appends queued system signals to the conversation history.
-// Signals are not persisted and do not count as turn boundaries. Call this only
-// at protocol-safe history boundaries.
-func (l *Loop) DrainQueuedSignals() {
+// HasPendingWakeSignal reports whether any pending signal should wake the model
+// when no turn is active.
+func (l *Loop) HasPendingWakeSignal() bool {
 	l.signalMu.Lock()
-	payloads := append([]string(nil), l.queuedSignals...)
-	l.queuedSignals = nil
+	defer l.signalMu.Unlock()
+	for _, signal := range l.pendingSignals {
+		if signal.Wake {
+			return true
+		}
+	}
+	return false
+}
+
+// HasPendingSignal reports whether any async model input is pending.
+func (l *Loop) HasPendingSignal() bool {
+	l.signalMu.Lock()
+	defer l.signalMu.Unlock()
+	return len(l.pendingSignals) > 0
+}
+
+// DrainPendingSignalsForModel appends pending system signals to history so the
+// next model request sees them. Signals do not create turn boundaries.
+func (l *Loop) DrainPendingSignalsForModel(turn int) {
+	l.signalMu.Lock()
+	signals := append([]PendingSignal(nil), l.pendingSignals...)
+	l.pendingSignals = nil
 	l.signalMu.Unlock()
-	for _, payload := range payloads {
-		l.appendSignalPayload(payload)
+	for _, signal := range signals {
+		l.appendSignal(signal, turn)
 	}
 }
 
-func (l *Loop) appendSignalPayload(payload string) {
-	l.messages = append(l.messages, message.NewText(message.RoleUser, SystemSignal(payload)))
+func (l *Loop) appendSignal(signal PendingSignal, turn int) {
+	msg := message.NewText(message.RoleUser, SystemSignal(signal.Payload))
+	l.messages = append(l.messages, msg)
+	if signal.Persist {
+		l.persistMessage(turn, msg)
+	}
 }
 
-func (l *Loop) clearQueuedSignals() {
+func (l *Loop) clearPendingSignals() {
 	l.signalMu.Lock()
 	defer l.signalMu.Unlock()
-	l.queuedSignals = nil
+	l.pendingSignals = nil
 }
 
-// ResetHistory drops all messages and turn boundaries, leaving only
-// the system prompt. Used when switching sessions.
-func (l *Loop) ResetHistory() {
-	l.clearQueuedSignals()
+func (l *Loop) resetHistory(clearSignals bool) {
+	if clearSignals {
+		l.clearPendingSignals()
+	}
 	if len(l.messages) > 0 && l.messages[0].Role == message.RoleSystem {
 		l.messages = l.messages[:1]
 	} else {
 		l.messages = nil
 	}
 	l.turnBoundaries = nil
+}
+
+// ResetHistory drops all messages and turn boundaries, leaving only
+// the system prompt. Used when switching sessions.
+func (l *Loop) ResetHistory() {
+	l.resetHistory(true)
 }
 
 // LoadHistory restores a conversation from persisted turns. Each
@@ -350,7 +392,17 @@ func (l *Loop) LoadHistory(turns [][]message.Message) {
 // injected before any post-compaction turns, attributed to the
 // summarizer model so its provenance is preserved.
 func (l *Loop) LoadHistoryWithSummary(summary string, summarizer catalog.ModelRef, turns [][]message.Message) {
-	l.ResetHistory()
+	l.loadHistoryWithSummary(summary, summarizer, turns, true)
+}
+
+// LoadHistoryWithSummaryPreservePending restores compacted history without
+// dropping pending async model input. Used by compaction in the active turn.
+func (l *Loop) LoadHistoryWithSummaryPreservePending(summary string, summarizer catalog.ModelRef, turns [][]message.Message) {
+	l.loadHistoryWithSummary(summary, summarizer, turns, false)
+}
+
+func (l *Loop) loadHistoryWithSummary(summary string, summarizer catalog.ModelRef, turns [][]message.Message, clearSignals bool) {
+	l.resetHistory(clearSignals)
 	summaryMsg := message.NewText(message.RoleAssistant, "[Previous conversation summary]\n\n"+summary+"\n\n[End of summary. Continue from here.]")
 	summaryMsg.Source = summarizer
 	l.messages = append(l.messages, summaryMsg)
@@ -394,12 +446,11 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		turn = l.store.CurrentTurn()
 	}
 
-	l.DrainQueuedSignals()
-
 	// Fresh pending queue per turn.
 	l.pendingQueue = tool.NewPendingQueue()
 
 	l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
+	l.DrainPendingSignalsForModel(turn)
 	for _, input := range userInputs {
 		userMsg := message.NewText(message.RoleUser, input)
 		l.messages = append(l.messages, userMsg)
@@ -415,7 +466,7 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 	}()
 
 	for iter := 0; iter < maxIterations; iter++ {
-		l.DrainQueuedSignals()
+		l.DrainPendingSignalsForModel(turn)
 		msg, cancelled, err := l.runStream(ctx)
 		if err != nil {
 			return "", fmt.Errorf("chat completion: %w", err)
@@ -444,7 +495,9 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 				l.messages = append(l.messages, toolMsg)
 				l.persistMessage(turn, toolMsg)
 			}
-			l.DrainQueuedSignals()
+			if l.HasPendingWakeSignal() {
+				continue
+			}
 			return assistantVisibleText(msg), nil
 		}
 
@@ -461,7 +514,6 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 				break
 			}
 		}
-		l.DrainQueuedSignals()
 		if denied {
 			return "Tool denied by user.", nil
 		}

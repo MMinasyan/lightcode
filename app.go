@@ -87,6 +87,7 @@ func (a *App) handleEvent(ev agent.Event) {
 	case agent.EventUsage:
 		wailsRuntime.EventsEmit(a.ctx, "usage", a.svc.TokenUsage())
 	case agent.EventTurnStart:
+		wailsRuntime.EventsEmit(a.ctx, "turn_start", map[string]any{"turn": ev.Turn})
 		wailsRuntime.EventsEmit(a.ctx, "status", map[string]any{"state": "streaming"})
 	case agent.EventTurnEnd:
 		wailsRuntime.EventsEmit(a.ctx, "turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})

@@ -89,7 +89,8 @@ type Agent struct {
 
 	fileTracker *tool.FileTracker
 
-	loopFlush chan chan struct{}
+	loopFlush  chan chan struct{}
+	signalWake chan struct{}
 
 	warningsMu      sync.Mutex
 	warningGroups   map[string][]PromptWarning
@@ -154,6 +155,7 @@ func New(c Config) (*Agent, error) {
 		currentRef:        defaultRef,
 		contextWindowSize: contextWindowSize,
 		loopFlush:         make(chan chan struct{}, 1),
+		signalWake:        make(chan struct{}, 1),
 		warningGroups:     make(map[string][]PromptWarning),
 	}
 
@@ -232,7 +234,13 @@ func New(c Config) (*Agent, error) {
 			if output == "" {
 				output = "(No output)"
 			}
-			a.lp.QueueSignalPayload(fmt.Sprintf("Background process %s (\"%s\") exited with code %d.\nOutput:\n%s", event.ID, event.Command, event.ExitCode, output))
+			payload := backgroundTerminalPayload(event, output)
+			a.lp.AddPendingSignal(loop.PendingSignal{
+				Payload: payload,
+				Wake:    true,
+				Persist: true,
+			})
+			a.nudgeSignalScheduler()
 		}
 	})
 
@@ -322,6 +330,7 @@ func (a *Agent) SetEventHandler(fn func(Event)) {
 // agent's lifetime.
 func (a *Agent) Init(ctx context.Context) {
 	go a.drainLoopEvents(ctx)
+	go a.runSignalScheduler(ctx)
 	if a.memoryStore != nil {
 		_ = a.memoryStore.Reconcile()
 	}
@@ -344,7 +353,7 @@ func (a *Agent) Init(ctx context.Context) {
 		})
 		a.lspManager.SetSignalHandler(func(content string) {
 			if a.lp != nil {
-				a.lp.QueueSignalPayload(content)
+				a.lp.AddPendingSignal(loop.PendingSignal{Payload: content})
 			}
 		})
 		go a.lspManager.Detect(ctx)
@@ -363,6 +372,40 @@ func (a *Agent) Init(ctx context.Context) {
 func (a *Agent) emitEvent(ev Event) {
 	if a.onEvent != nil {
 		a.onEvent(ev)
+	}
+}
+
+func (a *Agent) nudgeSignalScheduler() {
+	select {
+	case a.signalWake <- struct{}{}:
+	default:
+	}
+}
+
+func (a *Agent) runSignalScheduler(ctx context.Context) {
+	for {
+		select {
+		case <-a.signalWake:
+			a.tryStartSignalTurn(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (a *Agent) tryStartSignalTurn(ctx context.Context) {
+	if a.lp == nil || !a.lp.HasPendingWakeSignal() {
+		return
+	}
+	a.mu.Lock()
+	busy := a.busy
+	active := a.store != nil && a.store.Active()
+	a.mu.Unlock()
+	if busy || !active {
+		return
+	}
+	if _, err := a.startTurn(ctx, nil); err != nil && !strings.Contains(err.Error(), "turn is already in progress") {
+		a.emitEvent(Event{Kind: EventError, Error: err.Error()})
 	}
 }
 
@@ -456,6 +499,14 @@ func promptWarningsEqual(a, b []PromptWarning) bool {
 		}
 	}
 	return true
+}
+
+func backgroundTerminalPayload(event process.ExitEvent, output string) string {
+	reason := event.Reason
+	if reason == "" {
+		reason = process.ExitReasonCompleted
+	}
+	return fmt.Sprintf("Background process %s (%q) finished: %s, exit code %d.\nOutput:\n%s", event.ID, event.Command, reason, event.ExitCode, output)
 }
 
 func (a *Agent) drainLoopEvents(ctx context.Context) {
@@ -722,7 +773,6 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 	a.emitEvent(Event{Kind: EventCompactionStart})
 	defer a.emitEvent(Event{Kind: EventCompactionEnd})
 
-	a.lp.DrainQueuedSignals()
 	messages := a.lp.Messages()
 	if len(messages) <= 1 {
 		return fmt.Errorf("nothing to compact")
@@ -776,7 +826,7 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 		}
 	}
 
-	a.lp.LoadHistoryWithSummary(result.Summary, result.SummarizerRef, nil)
+	a.lp.LoadHistoryWithSummaryPreservePending(result.Summary, result.SummarizerRef, nil)
 	if a.fileTracker != nil {
 		a.fileTracker.Reset()
 	}
@@ -831,6 +881,9 @@ func (a *Agent) CompactNow(ctx context.Context) error {
 		a.turnCtx = nil
 		a.mu.Unlock()
 		cancel()
+		if a.lp != nil && a.lp.HasPendingWakeSignal() {
+			a.nudgeSignalScheduler()
+		}
 	}()
 
 	return a.runCompaction(compactCtx, false)
@@ -1056,18 +1109,30 @@ func (a *Agent) SendQueuedMessages(ctx context.Context, contents []string) (Queu
 	if len(contents) == 0 {
 		return result, fmt.Errorf("no queued messages")
 	}
-	for _, content := range contents[:len(contents)-1] {
-		turn, err := a.AppendUserMessage(content)
-		if err != nil {
-			return result, err
-		}
-		result.Appended = append(result.Appended, QueuedMessageTurn{Content: content, Turn: turn})
+	a.mu.Lock()
+	if a.busy {
+		a.mu.Unlock()
+		return result, fmt.Errorf("a turn is already in progress")
 	}
-	last := contents[len(contents)-1]
-	turn, err := a.SendPrompt(ctx, last)
-	if err != nil {
+	if err := a.ensureSession(); err != nil {
+		a.mu.Unlock()
 		return result, err
 	}
+	for _, content := range contents[:len(contents)-1] {
+		turn := a.store.BeginTurn()
+		a.lp.AppendUserMessage(turn, content)
+		_ = a.store.MarkTurnComplete(turn)
+		result.Appended = append(result.Appended, QueuedMessageTurn{Content: content, Turn: turn})
+	}
+	a.busy = true
+	a.seenSessions = nil
+	turnCtx, cancel := context.WithCancel(ctx)
+	a.turnCancel = cancel
+	a.turnCtx = turnCtx
+	a.mu.Unlock()
+
+	last := contents[len(contents)-1]
+	turn := a.launchTurn(ctx, turnCtx, cancel, []string{last})
 	result.Started = QueuedMessageTurn{Content: last, Turn: turn}
 	return result, nil
 }
@@ -1090,6 +1155,10 @@ func (a *Agent) AppendUserMessage(content string) (int, error) {
 }
 
 func (a *Agent) sendMessages(ctx context.Context, contents []string) (int, error) {
+	return a.startTurn(ctx, contents)
+}
+
+func (a *Agent) startTurn(ctx context.Context, contents []string) (int, error) {
 	a.mu.Lock()
 	if a.busy {
 		a.mu.Unlock()
@@ -1106,6 +1175,10 @@ func (a *Agent) sendMessages(ctx context.Context, contents []string) (int, error
 	a.turnCtx = turnCtx
 	a.mu.Unlock()
 
+	return a.launchTurn(ctx, turnCtx, cancel, contents), nil
+}
+
+func (a *Agent) launchTurn(ctx context.Context, turnCtx context.Context, cancel context.CancelFunc, contents []string) int {
 	turn := a.store.BeginTurn()
 
 	a.emitEvent(Event{Kind: EventTurnStart, Turn: turn})
@@ -1122,6 +1195,9 @@ func (a *Agent) sendMessages(ctx context.Context, contents []string) (int, error
 			a.turnCtx = nil
 			a.mu.Unlock()
 			cancel()
+			if a.lp != nil && a.lp.HasPendingWakeSignal() {
+				a.nudgeSignalScheduler()
+			}
 		}()
 
 		res := a.assembler.Assemble()
@@ -1154,7 +1230,7 @@ func (a *Agent) sendMessages(ctx context.Context, contents []string) (int, error
 		a.emitEvent(Event{Kind: EventTurnEnd, Turn: turn, Cancelled: turnCtx.Err() != nil})
 	}()
 
-	return turn, nil
+	return turn
 }
 
 // Cancel aborts the current turn.
@@ -1231,7 +1307,7 @@ func (a *Agent) SwitchModel(refStr string) error {
 	a.lp.SetClient(client)
 	a.currentRef = ref
 	a.contextWindowSize = model.ContextWindow
-	a.lp.QueueSignalPayload(fmt.Sprintf("Model switched to %s", ref.String()))
+	a.lp.AddPendingSignal(loop.PendingSignal{Payload: fmt.Sprintf("Model switched to %s", ref.String())})
 	if a.store.Active() {
 		if err := a.store.SetModel(ref.Provider, ref.Model); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)

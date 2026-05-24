@@ -252,6 +252,21 @@ func TestRunCommandBackgroundDelegatesToProcessManager(t *testing.T) {
 	}
 }
 
+func TestRunCommandBackgroundWithoutTimeoutDoesNotUseForegroundDefault(t *testing.T) {
+	procMgr := &recordingProcessManager{id: "proc-1"}
+	tool := NewRunCommand(config.ToolsConfig{CommandTimeout: 3}, t.TempDir(), procMgr)
+
+	if _, err := tool.Execute(context.Background(), map[string]any{
+		"command":    "sleep 10",
+		"background": true,
+	}); err != nil {
+		t.Fatalf("Execute error = %v", err)
+	}
+	if procMgr.timeoutSec != 0 {
+		t.Fatalf("background timeout = %d, want no implicit foreground default", procMgr.timeoutSec)
+	}
+}
+
 func TestRunCommandBackgroundWithoutProcessManagerErrors(t *testing.T) {
 	tool := NewRunCommand(config.ToolsConfig{CommandTimeout: 3}, t.TempDir(), nil)
 

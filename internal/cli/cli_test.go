@@ -2,10 +2,16 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/config"
@@ -91,7 +97,64 @@ func TestToolDisplayEntryEndsWithBlankLineWithResult(t *testing.T) {
 	}
 }
 
+func TestFlushQueueKeepsQueuedMessagesWhenBackendBusy(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+	defer close(release)
+
+	a, _ := newTestAgentWithBaseURL(t, server.URL+"/v1")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := a.SendPrompt(ctx, "hold backend busy"); err != nil {
+		t.Fatalf("SendPrompt returned error: %v", err)
+	}
+	waitUntilAgentBusy(t, a)
+
+	c := New(a)
+	c.ctx = context.Background()
+	c.out = io.Discard
+	c.msgQueue = []string{"queued while busy"}
+
+	c.mu.Lock()
+	c.flushQueueLocked()
+	c.mu.Unlock()
+
+	waitUntilCLIAnimationStopped(t, c)
+	c.mu.Lock()
+	got := append([]string(nil), c.msgQueue...)
+	c.mu.Unlock()
+	if !equalStringSlices(got, []string{"queued while busy"}) {
+		t.Fatalf("queue after busy backend response = %q, want retained queued text", got)
+	}
+}
+
+func TestFlushQueueRemovesQueuedMessagesAfterBackendAccepts(t *testing.T) {
+	a, _ := newTestAgent(t)
+	c := New(a)
+	c.ctx = context.Background()
+	c.out = io.Discard
+	c.msgQueue = []string{"first queued", "second queued"}
+
+	c.mu.Lock()
+	c.flushQueueLocked()
+	c.mu.Unlock()
+
+	waitUntilCLIQueueLen(t, c, 0)
+	c.mu.Lock()
+	c.stopAnimationLocked()
+	c.mu.Unlock()
+}
+
 func newTestAgent(t *testing.T) (*agent.Agent, string) {
+	return newTestAgentWithBaseURL(t, "http://127.0.0.1:9/v1")
+}
+
+func newTestAgentWithBaseURL(t *testing.T, baseURL string) (*agent.Agent, string) {
 	t.Helper()
 
 	home := t.TempDir()
@@ -103,11 +166,11 @@ func newTestAgent(t *testing.T) (*agent.Agent, string) {
 	}
 	t.Setenv("LIGHTCODE_TEST_KEY", "test")
 	configPath := filepath.Join(lightcodeDir, "config.json")
-	if err := os.WriteFile(configPath, []byte(`{
+	configJSON := fmt.Sprintf(`{
   "providers": {
     "test": {
       "name": "Test Provider",
-      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_TEST_KEY" },
+      "transport": { "base_url": %q, "api_key_env": "LIGHTCODE_TEST_KEY" },
       "discovery": false,
       "models": {
         "test-model": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 }
@@ -115,7 +178,8 @@ func newTestAgent(t *testing.T) (*agent.Agent, string) {
     }
   },
   "default_model": "test/test-model"
-}`), 0o600); err != nil {
+}`, baseURL)
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := config.Load(configPath)
@@ -132,4 +196,61 @@ func newTestAgent(t *testing.T) (*agent.Agent, string) {
 		t.Fatal(err)
 	}
 	return a, projectName
+}
+
+func waitUntilAgentBusy(t *testing.T, a *agent.Agent) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if a.Busy() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("agent did not become busy")
+}
+
+func waitUntilCLIQueueLen(t *testing.T, c *CLI, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		got := len(c.msgQueue)
+		c.mu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c.mu.Lock()
+	got := len(c.msgQueue)
+	c.mu.Unlock()
+	t.Fatalf("CLI queue len = %d, want %d", got, want)
+}
+
+func waitUntilCLIAnimationStopped(t *testing.T, c *CLI) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		stopped := c.animStop == nil
+		c.mu.Unlock()
+		if stopped {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("CLI animation did not stop")
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
