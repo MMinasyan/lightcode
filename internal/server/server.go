@@ -608,9 +608,15 @@ func warningSnapshot(warnings []agent.PromptWarning) []agent.PromptWarning {
 
 // --- SSE hub ---
 
+type sseClient struct {
+	mu     sync.Mutex
+	ch     chan []byte
+	closed bool
+}
+
 type sseHub struct {
 	mu      sync.Mutex
-	clients []chan []byte
+	clients []*sseClient
 }
 
 func newSSEHub() *sseHub {
@@ -618,20 +624,25 @@ func newSSEHub() *sseHub {
 }
 
 func (h *sseHub) subscribe() (<-chan []byte, func()) {
-	ch := make(chan []byte, 64)
+	client := &sseClient{ch: make(chan []byte, 64)}
 	h.mu.Lock()
-	h.clients = append(h.clients, ch)
+	h.clients = append(h.clients, client)
 	h.mu.Unlock()
-	return ch, func() {
+	return client.ch, func() {
 		h.mu.Lock()
-		defer h.mu.Unlock()
 		for i, c := range h.clients {
-			if c == ch {
+			if c == client {
 				h.clients = append(h.clients[:i], h.clients[i+1:]...)
-				close(ch)
-				return
+				break
 			}
 		}
+		h.mu.Unlock()
+		client.mu.Lock()
+		if !client.closed {
+			client.closed = true
+			close(client.ch)
+		}
+		client.mu.Unlock()
 	}
 }
 
@@ -642,12 +653,19 @@ func (h *sseHub) broadcast(eventName string, data any) {
 	}
 	msg := fmt.Appendf(nil, "event: %s\ndata: %s\n\n", eventName, payload)
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	for _, ch := range h.clients {
+	clients := append([]*sseClient(nil), h.clients...)
+	h.mu.Unlock()
+	for _, client := range clients {
+		client.mu.Lock()
+		if client.closed {
+			client.mu.Unlock()
+			continue
+		}
 		select {
-		case ch <- msg:
+		case client.ch <- msg:
 		default:
 		}
+		client.mu.Unlock()
 	}
 }
 

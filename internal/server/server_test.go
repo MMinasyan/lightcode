@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,6 +92,81 @@ func TestSSEHubDropsForFullClientWithoutBlocking(t *testing.T) {
 	}
 	if count != 64 {
 		t.Fatalf("buffered messages = %d, want 64", count)
+	}
+}
+
+func TestSSEHubBroadcastDoesNotHoldHubLockDuringFanout(t *testing.T) {
+	hub := newSSEHub()
+	_, unsub := hub.subscribe()
+	defer unsub()
+
+	hub.mu.Lock()
+	client := hub.clients[0]
+	hub.mu.Unlock()
+
+	client.mu.Lock()
+	broadcastDone := make(chan struct{})
+	go func() {
+		hub.broadcast("event", map[string]any{"n": 1})
+		close(broadcastDone)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	select {
+	case <-broadcastDone:
+		client.mu.Unlock()
+		t.Fatal("broadcast finished while client lock was held")
+	default:
+	}
+
+	subscribeDone := make(chan func(), 1)
+	go func() {
+		_, unsubscribe := hub.subscribe()
+		subscribeDone <- unsubscribe
+	}()
+
+	select {
+	case unsubscribe := <-subscribeDone:
+		unsubscribe()
+	case <-time.After(200 * time.Millisecond):
+		client.mu.Unlock()
+		t.Fatal("subscribe blocked while broadcast fan-out was blocked on a client")
+	}
+
+	client.mu.Unlock()
+	select {
+	case <-broadcastDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("broadcast did not finish after client lock was released")
+	}
+}
+
+func TestSSEHubConcurrentBroadcastUnsubscribeNoPanic(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		hub := newSSEHub()
+		_, unsubscribe := hub.subscribe()
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				hub.broadcast("event", map[string]any{"n": j})
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			unsubscribe()
+		}()
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("broadcast/unsubscribe deadlocked")
+		}
 	}
 }
 
