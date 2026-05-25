@@ -85,6 +85,35 @@ func TestMessageJSONLoadsOldSessionWithoutSource(t *testing.T) {
 	}
 }
 
+func TestMessageJSONOmitsPartialSource(t *testing.T) {
+	msg := Message{
+		Role:    RoleAssistant,
+		Content: []ContentPart{{Type: ContentPartText, Text: "done"}},
+		Source:  catalog.ModelRef{Provider: "openai"},
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("Unmarshal marshaled message: %v", err)
+	}
+	if _, ok := raw["_lightcode_source"]; ok {
+		t.Fatalf("_lightcode_source present for partial source: %#v", raw)
+	}
+
+	var decoded Message
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if decoded.Source != (catalog.ModelRef{}) {
+		t.Fatalf("decoded Source = %#v, want zero", decoded.Source)
+	}
+}
+
 func TestContentPartJSONShapes(t *testing.T) {
 	msg := Message{
 		Role: RoleUser,

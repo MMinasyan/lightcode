@@ -3,6 +3,7 @@ package memory
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -47,5 +48,25 @@ func TestStoreDeleteSessionSummaries(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("summary dir stat error = %v, want not exist", err)
+	}
+}
+
+func TestIndexSummaryReturnsMetaWriteErrorBeforeSections(t *testing.T) {
+	home := t.TempDir()
+	store := NewStore(nil, t.TempDir(), home)
+	dir := filepath.Join(home, ".lightcode", "summaries", "session-1")
+	if err := os.MkdirAll(filepath.Join(dir, "meta.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	err := store.IndexSummary("session-1", "project-1", "Project", "## Goal\nbody", "now", "/tmp/compaction.json")
+	if err == nil || !strings.Contains(err.Error(), "write summary meta") {
+		t.Fatalf("IndexSummary error = %v, want write summary meta", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "00-goal.md")); !os.IsNotExist(err) {
+		t.Fatalf("00-goal.md stat error = %v, want not exist", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "00-goal.vec")); !os.IsNotExist(err) {
+		t.Fatalf("00-goal.vec stat error = %v, want not exist", err)
 	}
 }

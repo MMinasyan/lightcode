@@ -19,7 +19,7 @@ type ModelRef struct {
 
 // String returns the provider-prefixed model reference.
 func (r ModelRef) String() string {
-	if r.Provider == "" && r.Model == "" {
+	if r.Provider == "" || r.Model == "" {
 		return ""
 	}
 	return r.Provider + "/" + r.Model

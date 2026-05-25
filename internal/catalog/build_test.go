@@ -298,6 +298,54 @@ func TestBuildConfigOnlyDiscoveryCacheOnlyUpdatesKnownModelCost(t *testing.T) {
 	}
 }
 
+func TestBuildConfigOnlyDiscoveryDoesNotOverrideUserCostFields(t *testing.T) {
+	result := Build(BuildInputs{
+		UserRaw: map[string]any{
+			"local": map[string]any{
+				"transport": map[string]any{"base_url": "http://localhost:11434/v1", "api_key_env": ""},
+				"models": map[string]any{
+					"known": map[string]any{
+						"name":              "Configured",
+						"context_window":    float64(1000),
+						"max_output_tokens": float64(100),
+						"cost":              map[string]any{"input": float64(99)},
+					},
+				},
+			},
+		},
+		Cache: map[string]DiscoveredProvider{
+			"local": {
+				Models: map[string]DiscoveredModel{
+					"known": {Name: "Discovered", ContextWindow: 32768, MaxOutputTokens: 8192, Cost: &Cost{Input: ptrFloat64(0.2), Output: ptrFloat64(0.4)}},
+					"new":   {Name: "New Model", ContextWindow: 65536, MaxOutputTokens: 4096, Cost: &Cost{Input: ptrFloat64(0.8), Output: ptrFloat64(1.2)}},
+				},
+			},
+		},
+	})
+	if len(result.Warnings) != 0 {
+		t.Fatalf("Build warnings = %#v, want none", result.Warnings)
+	}
+	_, known, err := result.Catalog.Lookup(ModelRef{Provider: "local", Model: "known"})
+	if err != nil {
+		t.Fatalf("Lookup known returned error: %v", err)
+	}
+	if known.Name != "Configured" || known.ContextWindow != 1000 || known.MaxOutputTokens != 100 {
+		t.Fatalf("known metadata = %#v, want configured metadata unchanged", known)
+	}
+	if known.Cost == nil {
+		t.Fatalf("known cost = nil")
+	}
+	if known.Cost.Input == nil || *known.Cost.Input != 99 {
+		t.Fatalf("known cost input = %v, want user value 99", known.Cost.Input)
+	}
+	if known.Cost.Output == nil || *known.Cost.Output != 0.4 {
+		t.Fatalf("known cost output = %v, want discovered value 0.4", known.Cost.Output)
+	}
+	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "local", Model: "new"}); !errors.Is(err, ErrUnknownModel) {
+		t.Fatalf("Lookup new error = %v, want ErrUnknownModel", err)
+	}
+}
+
 func TestBuildBundledDiscoveryCacheCanAddModels(t *testing.T) {
 	result := Build(BuildInputs{
 		Bundled: map[string]json.RawMessage{
