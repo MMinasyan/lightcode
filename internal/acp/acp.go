@@ -41,6 +41,11 @@ type Notification struct {
 	Params  any    `json:"params,omitempty"`
 }
 
+type turnActionParams struct {
+	Turn           int  `json:"turn"`
+	AlsoRevertCode bool `json:"alsoRevertCode"`
+}
+
 // Runner drives the ACP stdio protocol.
 type Runner struct {
 	agent *agent.Agent
@@ -346,50 +351,35 @@ func (r *Runner) handleSessionDelete(req Request) {
 }
 
 func (r *Runner) handleSessionFork(req Request) {
-	var params struct {
-		Turn int `json:"turn"`
-	}
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		r.respondError(req.ID, -32602, "invalid params")
-		return
-	}
-	if err := r.agent.ForkSession(params.Turn); err != nil {
-		r.respondError(req.ID, -32000, err.Error())
-		return
-	}
-	r.pushSessionChanged()
-	r.respond(req.ID, r.agent.SessionCurrent())
+	r.handleTurnAction(req, agent.TurnActionFork)
 }
 
 func (r *Runner) handleRevertCode(req Request) {
-	var params struct {
-		Turn int `json:"turn"`
-	}
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		r.respondError(req.ID, -32602, "invalid params")
-		return
-	}
-	if err := r.agent.RevertCode(params.Turn); err != nil {
-		r.respondError(req.ID, -32000, err.Error())
-		return
-	}
-	r.respond(req.ID, map[string]any{"ok": true})
+	r.handleTurnAction(req, agent.TurnActionRevertCode)
 }
 
 func (r *Runner) handleRevertHistory(req Request) {
-	var params struct {
-		Turn int `json:"turn"`
-	}
+	r.handleTurnAction(req, agent.TurnActionRevertHistory)
+}
+
+func (r *Runner) handleTurnAction(req Request, action string) {
+	var params turnActionParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	if err := r.agent.RevertHistory(params.Turn); err != nil {
+	if action == agent.TurnActionRevertCode {
+		params.AlsoRevertCode = false
+	}
+	result, err := r.agent.ApplyTurnAction(params.Turn, action, params.AlsoRevertCode)
+	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	r.pushSessionChanged()
-	r.respond(req.ID, map[string]any{"ok": true})
+	if result.SessionChanged {
+		r.pushSessionChanged()
+	}
+	r.respond(req.ID, result)
 }
 
 func (r *Runner) handleModelSwitch(req Request) {
