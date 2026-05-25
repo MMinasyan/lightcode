@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -132,6 +133,27 @@ func TestHandleEventBroadcastsAndSkipsSubagents(t *testing.T) {
 	case msg := <-ch:
 		t.Fatalf("subagent event was broadcast: %q", msg)
 	default:
+	}
+
+	warning := agent.PromptWarning{Kind: "catalog_discovery_failure", Message: "test: failed"}
+	s.handleEvent(agent.Event{Kind: agent.EventWarning, Warnings: []agent.PromptWarning{warning}})
+	select {
+	case msg := <-ch:
+		text := string(msg)
+		if !strings.Contains(text, "event: warnings") || !strings.Contains(text, `"kind":"catalog_discovery_failure"`) || !strings.Contains(text, `"message":"test: failed"`) {
+			t.Fatalf("warning event = %q", msg)
+		}
+	default:
+		t.Fatal("warning event not broadcast")
+	}
+	s.handleEvent(agent.Event{Kind: agent.EventWarning})
+	select {
+	case msg := <-ch:
+		if !strings.Contains(string(msg), "event: warnings") || !strings.Contains(string(msg), "data: []") {
+			t.Fatalf("empty warning event = %q, want empty array", msg)
+		}
+	default:
+		t.Fatal("empty warning event not broadcast")
 	}
 }
 
@@ -266,6 +288,41 @@ func TestHandleTurnActionInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestHandleWarningsReturnsCurrentWarningSnapshot(t *testing.T) {
+	a := newServerWarningTestAgent(t)
+	if len(a.CurrentWarnings()) == 0 {
+		t.Fatal("warning test agent has empty startup warning snapshot")
+	}
+	s := &Server{agent: a, hub: newSSEHub()}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/warnings", nil)
+	s.handleWarnings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var warnings []agent.PromptWarning
+	if err := json.NewDecoder(rec.Body).Decode(&warnings); err != nil {
+		t.Fatalf("decode warnings: %v", err)
+	}
+	if !hasPromptWarningKind(warnings, "catalog_discovery_failure") {
+		t.Fatalf("warnings = %#v, want catalog_discovery_failure", warnings)
+	}
+}
+
+func TestHandleWarningsReturnsEmptyArrayForNoWarnings(t *testing.T) {
+	s := &Server{agent: newServerTestAgent(t), hub: newSSEHub()}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/warnings", nil)
+	s.handleWarnings(rec, req)
+
+	if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != "[]" {
+		t.Fatalf("empty warnings response = %d %q, want 200 []", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHTTPHandlersUseSharedTurnActionContract(t *testing.T) {
 	src := mustReadServerSource(t)
 	helper := extractSourceFunc(t, src, "func (s *Server) handleTurnAction(")
@@ -306,6 +363,24 @@ func TestJSONHelpers(t *testing.T) {
 
 func newServerTestAgent(t *testing.T) *agent.Agent {
 	t.Helper()
+	return newServerTestAgentWithProvider(t, "http://127.0.0.1:9/v1", false)
+}
+
+func newServerWarningTestAgent(t *testing.T) *agent.Agent {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	a := newServerTestAgentWithProvider(t, server.URL+"/v1", true)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Init(ctx)
+	return a
+}
+
+func newServerTestAgentWithProvider(t *testing.T, baseURL string, discovery bool) *agent.Agent {
+	t.Helper()
 	home := t.TempDir()
 	projectRoot := t.TempDir()
 	lightcodeDir := filepath.Join(home, ".lightcode")
@@ -318,8 +393,8 @@ func newServerTestAgent(t *testing.T) *agent.Agent {
   "providers": {
     "test": {
       "name": "Test Provider",
-      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_TEST_KEY" },
-      "discovery": false,
+      "transport": { "base_url": "`+baseURL+`", "api_key_env": "LIGHTCODE_TEST_KEY" },
+      "discovery": `+strconv.FormatBool(discovery)+`,
       "models": {
         "test-model": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 }
       }
@@ -393,6 +468,15 @@ func userMessageContents(messages []agent.DisplayMessage) []string {
 		}
 	}
 	return out
+}
+
+func hasPromptWarningKind(warnings []agent.PromptWarning, kind string) bool {
+	for _, warning := range warnings {
+		if warning.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func equalStringSlices(a, b []string) bool {

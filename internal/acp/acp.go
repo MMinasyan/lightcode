@@ -160,6 +160,8 @@ func (r *Runner) dispatch(ctx context.Context, req Request) {
 		r.handlePermissionSave(req)
 	case "compact":
 		r.handleCompact(ctx, req)
+	case "warnings/current":
+		r.respond(req.ID, warningSnapshot(r.agent.CurrentWarnings()))
 	default:
 		r.respondError(req.ID, -32601, fmt.Sprintf("method not found: %s", req.Method))
 	}
@@ -225,6 +227,9 @@ func (r *Runner) handleEvent(ev agent.Event) {
 		method = "agent/compaction_start"
 	case agent.EventCompactionEnd:
 		method = "agent/compaction_end"
+	case agent.EventWarning:
+		method = "agent/warnings"
+		params = warningSnapshot(ev.Warnings)
 	default:
 		return
 	}
@@ -476,6 +481,13 @@ func (r *Runner) handleCompact(ctx context.Context, req Request) {
 	}
 	r.pushSessionChanged()
 	r.respond(req.ID, map[string]any{"ok": true})
+}
+
+func warningSnapshot(warnings []agent.PromptWarning) []agent.PromptWarning {
+	if warnings == nil {
+		return []agent.PromptWarning{}
+	}
+	return warnings
 }
 
 func (r *Runner) pushSessionChanged() {

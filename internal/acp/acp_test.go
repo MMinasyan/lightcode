@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -87,10 +89,12 @@ func TestHandleEventNotifications(t *testing.T) {
 			Output:   "done",
 		},
 	})
+	r.handleEvent(agent.Event{Kind: agent.EventWarning, Warnings: []agent.PromptWarning{{Kind: "catalog_discovery_failure", Message: "test: failed"}}})
+	r.handleEvent(agent.Event{Kind: agent.EventWarning})
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, Result: "skip", SubagentSessionID: "sub"})
 
-	lines := responseLines(t, out.String(), 4)
-	wantMethods := []string{"agent/message_chunk", "agent/tool_start", "agent/tool_result", "agent/background_process_complete"}
+	lines := responseLines(t, out.String(), 6)
+	wantMethods := []string{"agent/message_chunk", "agent/tool_start", "agent/tool_result", "agent/background_process_complete", "agent/warnings", "agent/warnings"}
 	for i, want := range wantMethods {
 		var got Notification
 		if err := json.Unmarshal([]byte(lines[i]), &got); err != nil {
@@ -99,6 +103,72 @@ func TestHandleEventNotifications(t *testing.T) {
 		if got.Method != want {
 			t.Fatalf("notification[%d].Method = %q, want %q", i, got.Method, want)
 		}
+		if got.Method == "agent/warnings" && i == 4 {
+			data, err := json.Marshal(got.Params)
+			if err != nil {
+				t.Fatalf("warning params marshal: %v", err)
+			}
+			var warnings []agent.PromptWarning
+			if err := json.Unmarshal(data, &warnings); err != nil {
+				t.Fatalf("warning params json: %v", err)
+			}
+			if len(warnings) != 1 || warnings[0].Kind != "catalog_discovery_failure" || warnings[0].Message != "test: failed" {
+				t.Fatalf("warning params = %#v, want kind/message", warnings)
+			}
+		}
+		if got.Method == "agent/warnings" && i == 5 {
+			data, err := json.Marshal(got.Params)
+			if err != nil {
+				t.Fatalf("empty warning params marshal: %v", err)
+			}
+			if string(data) != "[]" {
+				t.Fatalf("empty warning params = %s, want []", data)
+			}
+		}
+	}
+}
+
+func TestDispatchWarningsCurrentReturnsCurrentWarningSnapshot(t *testing.T) {
+	a := newACPWarningTestAgent(t)
+	if len(a.CurrentWarnings()) == 0 {
+		t.Fatal("warning test agent has empty startup warning snapshot")
+	}
+	var out bytes.Buffer
+	r := &Runner{agent: a, out: &out}
+
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "warnings", Method: "warnings/current"})
+
+	lines := responseLines(t, out.String(), 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("warnings/current error = %+v", resp.Error)
+	}
+	warnings := promptWarningsFromResponse(t, resp)
+	if !hasPromptWarningKind(warnings, "catalog_discovery_failure") {
+		t.Fatalf("warnings = %#v, want catalog_discovery_failure", warnings)
+	}
+}
+
+func TestDispatchWarningsCurrentReturnsEmptyArrayForNoWarnings(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{agent: newACPTestAgent(t), out: &out}
+
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "warnings", Method: "warnings/current"})
+
+	lines := responseLines(t, out.String(), 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	if string(data) != "[]" {
+		t.Fatalf("empty warnings result = %s, want []", data)
 	}
 }
 
@@ -265,6 +335,24 @@ func responseLines(t *testing.T, output string, want int) []string {
 
 func newACPTestAgent(t *testing.T) *agent.Agent {
 	t.Helper()
+	return newACPTestAgentWithProvider(t, "http://127.0.0.1:9/v1", false)
+}
+
+func newACPWarningTestAgent(t *testing.T) *agent.Agent {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	a := newACPTestAgentWithProvider(t, server.URL+"/v1", true)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Init(ctx)
+	return a
+}
+
+func newACPTestAgentWithProvider(t *testing.T, baseURL string, discovery bool) *agent.Agent {
+	t.Helper()
 	home := t.TempDir()
 	projectRoot := t.TempDir()
 	lightcodeDir := filepath.Join(home, ".lightcode")
@@ -277,8 +365,8 @@ func newACPTestAgent(t *testing.T) *agent.Agent {
   "providers": {
     "test": {
       "name": "Test Provider",
-      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_TEST_KEY" },
-      "discovery": false,
+      "transport": { "base_url": "`+baseURL+`", "api_key_env": "LIGHTCODE_TEST_KEY" },
+      "discovery": `+strconv.FormatBool(discovery)+`,
       "models": {
         "test-model": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 }
       }
@@ -347,6 +435,19 @@ func turnActionResultFromResponse(t *testing.T, resp Response) agent.TurnActionR
 	return result
 }
 
+func promptWarningsFromResponse(t *testing.T, resp Response) []agent.PromptWarning {
+	t.Helper()
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	var warnings []agent.PromptWarning
+	if err := json.Unmarshal(data, &warnings); err != nil {
+		t.Fatalf("unmarshal warnings: %v", err)
+	}
+	return warnings
+}
+
 func acpUserMessageContents(messages []agent.DisplayMessage) []string {
 	var out []string
 	for _, msg := range messages {
@@ -355,6 +456,15 @@ func acpUserMessageContents(messages []agent.DisplayMessage) []string {
 		}
 	}
 	return out
+}
+
+func hasPromptWarningKind(warnings []agent.PromptWarning, kind string) bool {
+	for _, warning := range warnings {
+		if warning.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func equalStringSlices(a, b []string) bool {
