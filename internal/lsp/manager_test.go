@@ -1,7 +1,6 @@
 package lsp
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/lsp/server"
@@ -42,7 +41,7 @@ func TestManagerWarningAndSignalHandlers(t *testing.T) {
 		t.Fatalf("warning = %q/%q", warningKind, warningMessage)
 	}
 	m.emitSignal("hello")
-	if !strings.Contains(signal, "<system-signal>hello</system-signal>") {
-		t.Fatalf("signal = %q", signal)
+	if signal != "hello" {
+		t.Fatalf("signal = %q, want raw payload", signal)
 	}
 }

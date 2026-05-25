@@ -84,9 +84,21 @@ func (a *App) handleEvent(ev agent.Event) {
 			"output":   ev.Result,
 			"metadata": ev.Metadata,
 		})
+	case agent.EventBackgroundProcessComplete:
+		if ev.BackgroundProcess != nil {
+			wailsRuntime.EventsEmit(a.ctx, "background_process_complete", map[string]any{
+				"id":       ev.BackgroundProcess.ID,
+				"command":  ev.BackgroundProcess.Command,
+				"reason":   ev.BackgroundProcess.Reason,
+				"exitCode": ev.BackgroundProcess.ExitCode,
+				"success":  !ev.IsError,
+				"output":   ev.Result,
+			})
+		}
 	case agent.EventUsage:
 		wailsRuntime.EventsEmit(a.ctx, "usage", a.svc.TokenUsage())
 	case agent.EventTurnStart:
+		wailsRuntime.EventsEmit(a.ctx, "turn_start", map[string]any{"turn": ev.Turn})
 		wailsRuntime.EventsEmit(a.ctx, "status", map[string]any{"state": "streaming"})
 	case agent.EventTurnEnd:
 		wailsRuntime.EventsEmit(a.ctx, "turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})

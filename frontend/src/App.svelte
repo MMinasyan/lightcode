@@ -83,6 +83,10 @@
     messages = [...messages, { _id: mid(), type: 'error', content: prefix ? `${prefix}: ${text}` : text }];
   }
 
+  function isTurnBusyError(err) {
+    return errorText(err).includes('turn is already in progress');
+  }
+
   function rebuildFromHistory(persisted) {
     currentTurn = 0;
     return (persisted || []).map(m => {
@@ -91,13 +95,17 @@
     });
   }
 
+  function applySessionId(nextSessionId) {
+    if (nextSessionId !== sessionId) messageQueue = [];
+    sessionId = nextSessionId;
+  }
+
   function applySessionPayload(result) {
     if (!result?.sessionChanged) return;
-    sessionId = result.session?.id || sessionId;
+    applySessionId(result.session?.id || sessionId);
     if (result.tokens) tokens = result.tokens;
     else tokens = { total: { cache:0, input:0, output:0, known:true }, perModel: [], contextUsed: 0, contextWindow: 0 };
     messages = rebuildFromHistory(result.messages || []);
-    messageQueue = [];
     streamingIdx = -1;
   }
 
@@ -134,11 +142,10 @@
 
     EventsOn('session_changed', (data) => {
       if (!data) return;
-      sessionId = data.session?.id || '';
+      applySessionId(data.session?.id || '');
       if (data.tokens) tokens = data.tokens;
       else tokens = { total: { cache:0, input:0, output:0, known:true }, perModel: [], contextUsed: 0, contextWindow: 0 };
       messages = rebuildFromHistory(data.messages || []);
-      messageQueue = [];
       streamingIdx = -1;
     });
 
@@ -164,6 +171,36 @@
       messages = messages.map(m => m.type==='tool' && m.id===data.id ? {...m, done:true, success:data.success, result:data.output, name:data.name || m.name, args:data.args || m.args, metadata:data.metadata || m.metadata} : m);
     });
 
+    EventsOn('background_process_complete', (data) => {
+      if (!data) return;
+      if (streamingIdx !== -1 && messages[streamingIdx]) {
+        messages[streamingIdx] = { ...messages[streamingIdx], partial:false };
+      }
+      streamingIdx = -1;
+      const backgroundProcess = {
+        id: data.id || '',
+        command: data.command || '',
+        reason: data.reason || '',
+        exitCode: data.exitCode || 0,
+        output: data.output || '',
+      };
+      messages = [...messages, {
+        _id: mid(),
+        type: 'background_process',
+        id: backgroundProcess.id,
+        done: true,
+        success: data.success !== false,
+        result: backgroundProcess.output,
+        backgroundProcess,
+      }];
+    });
+
+    EventsOn('turn_start', (data) => {
+      busy = true;
+      streamingIdx = -1;
+      if (data?.turn) currentTurn = data.turn;
+    });
+
     EventsOn('turn_end', async (data) => {
       if (streamingIdx !== -1 && messages[streamingIdx]) {
         messages[streamingIdx] = { ...messages[streamingIdx], partial:false };
@@ -186,7 +223,6 @@
     EventsOn('error', (data) => {
       showError(data?.message || data);
       busy = false;
-      messageQueue = [];
     });
 
     EventsOn('status', (data) => { status = data.state; });
@@ -224,8 +260,9 @@
 
   async function handleSubmit(e) {
     const content = e.detail;
-    if (busy) {
+    if (busy || messageQueue.length > 0) {
       messageQueue = [...messageQueue, { _id: mid(), content }];
+      if (!busy) await flushQueue();
       return;
     }
     busy = true;
@@ -240,12 +277,13 @@
 
   async function flushQueue() {
     if (messageQueue.length === 0) return;
+    if (busy) return;
     const queued = messageQueue;
-    messageQueue = [];
     busy = true;
     streamingIdx = -1;
     try {
       const result = await SendQueuedMessages(queued.map(q => q.content));
+      messageQueue = messageQueue.slice(queued.length);
       const appended = result?.appended || [];
       for (let i = 0; i < appended.length; i++) {
         const queuedMessage = queued[i];
@@ -256,7 +294,14 @@
       currentTurn = turn;
       messages = [...messages, { _id: last._id, type: 'user', content: last.content, turn }];
     }
-    catch (err) { showError(err); busy = false; }
+    catch (err) {
+      if (isTurnBusyError(err)) {
+        busy = true;
+        return;
+      }
+      showError(err);
+      busy = false;
+    }
   }
 
   function handleManageSettings() { showModelSelector = false; settingsSection = 'models'; showSettings = true; }

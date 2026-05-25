@@ -166,6 +166,44 @@ func renderToolCall(name, args string, metadata map[string]any) string {
 	return b.String()
 }
 
+func renderBackgroundProcessCall(bg *agent.BackgroundProcessDisplay, success bool) string {
+	var b strings.Builder
+	if success {
+		b.WriteString(colorCyan)
+	} else {
+		b.WriteString(colorRed)
+	}
+	b.WriteString("  ▸ background_process")
+	if bg != nil {
+		if bg.ID != "" {
+			b.WriteString("  ")
+			b.WriteString(formatHeaderArg(bg.ID, 80))
+		}
+		reason := bg.Reason
+		if reason == "" {
+			reason = "completed"
+		}
+		b.WriteString("  ")
+		b.WriteString(reason)
+		b.WriteString(fmt.Sprintf(" exit %d", bg.ExitCode))
+		command := formatMultilineHeaderArg(bg.Command)
+		if command != "" {
+			lines := strings.Split(command, "\n")
+			b.WriteString(nl)
+			b.WriteString("     $ ")
+			b.WriteString(lines[0])
+			for _, line := range lines[1:] {
+				b.WriteString(nl)
+				b.WriteString("       ")
+				b.WriteString(line)
+			}
+		}
+	}
+	b.WriteString(colorReset)
+	b.WriteString(nl)
+	return b.String()
+}
+
 type toolChangeCounts struct {
 	added   int
 	removed int
@@ -728,6 +766,7 @@ type displayEntry struct {
 	success  bool
 	result   string
 	metadata map[string]any
+	bg       *agent.BackgroundProcessDisplay
 }
 
 func buildDisplayMsgs(msgs []agent.DisplayMessage) []displayEntry {
@@ -744,6 +783,7 @@ func buildDisplayMsgs(msgs []agent.DisplayMessage) []displayEntry {
 			success:  m.Success,
 			result:   m.Result,
 			metadata: m.Metadata,
+			bg:       m.BackgroundProcess,
 		})
 	}
 	return out

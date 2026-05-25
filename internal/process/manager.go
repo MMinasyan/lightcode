@@ -3,7 +3,6 @@
 package process
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -11,71 +10,93 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 )
 
-// lockedBuffer wraps bytes.Buffer with a mutex for thread-safe access.
-type lockedBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
+type ExitReason string
 
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *lockedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
+const (
+	ExitReasonCompleted ExitReason = "completed"
+	ExitReasonError     ExitReason = "error"
+	ExitReasonTimeout   ExitReason = "timeout"
+	ExitReasonKilled    ExitReason = "killed"
+)
 
 // CommandStarted represents a running background process.
 type CommandStarted struct {
-	ID        string
-	Command   string
-	StartedAt time.Time
-	cmd       *exec.Cmd
-	buf       bytes.Buffer
-	done      chan struct{}
-	mu        sync.Mutex
-	exitCode  int
-	exited    bool
-	exitErr   error
+	ID         string
+	Command    string
+	SessionID  string
+	StartedAt  time.Time
+	cmd        *exec.Cmd
+	capture    *cmdoutput.Capture
+	done       chan struct{}
+	mu         sync.Mutex
+	exitCode   int
+	exited     bool
+	finalized  bool
+	exitErr    error
+	reason     ExitReason
+	timeoutSec int
 }
 
 // Manager tracks background processes.
 type Manager struct {
-	mu       sync.Mutex
-	procs    map[string]*CommandStarted
-	onExit   func(id, command string, exitCode int)
-	maxProcs int
+	mu            sync.Mutex
+	procs         map[string]*CommandStarted
+	onExit        func(ExitEvent)
+	sessionID     func() string
+	maxProcs      int
+	outputOptions cmdoutput.Options
+}
+
+type ExitEvent struct {
+	ID           string
+	Command      string
+	SessionID    string
+	ExitCode     int
+	Reason       ExitReason
+	TimeoutSec   int
+	FormatOutput func() string
 }
 
 // NewManager creates a new process Manager. maxProcs limits concurrent
 // background processes (0 = unlimited).
-func NewManager(maxProcs int) *Manager {
+func NewManager(maxProcs int, outputOptions cmdoutput.Options) *Manager {
 	return &Manager{
-		procs:    make(map[string]*CommandStarted),
-		maxProcs: maxProcs,
+		procs:         make(map[string]*CommandStarted),
+		maxProcs:      maxProcs,
+		outputOptions: outputOptions,
 	}
 }
 
 // SetExitHandler sets a callback invoked when a background process exits.
 // The callback should append a system signal to the loop.
-func (m *Manager) SetExitHandler(handler func(id, command string, exitCode int)) {
+func (m *Manager) SetExitHandler(handler func(ExitEvent)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onExit = handler
 }
 
+// SetSessionProvider sets a callback used to tag newly started background
+// processes with the session that launched them.
+func (m *Manager) SetSessionProvider(provider func() string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessionID = provider
+}
+
 // Start launches a background process and returns its ID.
 func (m *Manager) Start(command string, timeoutSec int) (string, error) {
+	sessionID := m.currentSessionID()
 	if m.maxProcs > 0 {
 		running := 0
 		m.mu.Lock()
 		for _, cs := range m.procs {
+			if cs.SessionID != sessionID {
+				continue
+			}
 			cs.mu.Lock()
 			if !cs.exited {
 				running++
@@ -94,19 +115,24 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 	}
 	cmd := exec.Command("sh", "-c", command)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Stdout = &lockedBuffer{}
-	cmd.Stderr = &lockedBuffer{}
+	capture := cmdoutput.NewCapture(m.outputOptions)
+	cmd.Stdout = capture.Stdout()
+	cmd.Stderr = capture.Stderr()
 
 	if err := cmd.Start(); err != nil {
+		capture.Close()
 		return "", err
 	}
 
 	cs := &CommandStarted{
-		ID:        id,
-		Command:   command,
-		StartedAt: time.Now(),
-		cmd:       cmd,
-		done:      make(chan struct{}),
+		ID:         id,
+		Command:    command,
+		SessionID:  sessionID,
+		StartedAt:  time.Now(),
+		cmd:        cmd,
+		capture:    capture,
+		done:       make(chan struct{}),
+		timeoutSec: timeoutSec,
 	}
 
 	m.mu.Lock()
@@ -125,64 +151,98 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 			} else {
 				cs.exitCode = -1
 			}
+			if cs.reason == "" {
+				cs.reason = ExitReasonError
+			}
+		} else if cs.reason == "" {
+			cs.reason = ExitReasonCompleted
 		}
+		code := cs.exitCode
+		reason := cs.reason
 		cs.mu.Unlock()
 
 		if handler != nil {
-			cs.mu.Lock()
-			code := cs.exitCode
-			cs.mu.Unlock()
-			handler(id, command, code)
+			handler(ExitEvent{
+				ID:           id,
+				Command:      command,
+				SessionID:    sessionID,
+				ExitCode:     code,
+				Reason:       reason,
+				TimeoutSec:   timeoutSec,
+				FormatOutput: capture.Format,
+			})
 		}
 
-		// Auto-remove dead process so it doesn't count against the limit.
+		cs.mu.Lock()
+		cs.finalized = true
+		cs.mu.Unlock()
+
+		// Auto-remove finalized process so it doesn't count against the limit.
 		m.Remove(id)
 		close(cs.done)
+		capture.Close()
 	}()
+
+	if timeoutSec > 0 {
+		go func() {
+			timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
+			defer timer.Stop()
+			select {
+			case <-cs.done:
+			case <-timer.C:
+				if cs.markReason(ExitReasonTimeout) {
+					terminateProcessGroup(cmd.Process.Pid)
+					select {
+					case <-cs.done:
+					case <-time.After(500 * time.Millisecond):
+						_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+					}
+				}
+			}
+		}()
+	}
 
 	return id, nil
 }
 
-// Read returns all output accumulated so far for a background process.
+// Read returns output accumulated so far for a running background process.
 func (m *Manager) Read(id string) (string, error) {
+	sessionID := m.currentSessionID()
 	m.mu.Lock()
 	cs, ok := m.procs[id]
 	m.mu.Unlock()
-	if !ok {
+	if !ok || cs.SessionID != sessionID {
 		return "", fmt.Errorf("process: no process with ID %q", id)
 	}
 
 	cs.mu.Lock()
-	defer cs.mu.Unlock()
+	if cs.finalized {
+		cs.mu.Unlock()
+		return "", fmt.Errorf("process: no process with ID %q", id)
+	}
+	cs.mu.Unlock()
 
-	stdout := cs.cmd.Stdout.(*lockedBuffer).String()
-	stderr := cs.cmd.Stderr.(*lockedBuffer).String()
-	output := stdout + stderr
-
-	if output == "" && !cs.exited {
+	if cs.capture.Len() == 0 {
 		return "(No output yet)", nil
 	}
-	if output == "" && cs.exited {
-		return "(No output)", nil
-	}
-
-	if cs.exited {
-		prefix := ""
-		if cs.exitCode != 0 {
-			prefix = fmt.Sprintf("Error: Exit code %d\n", cs.exitCode)
-		}
-		return prefix + output, nil
-	}
-	return output, nil
+	return cs.capture.Format(), nil
 }
 
 // Kill terminates a background process. Sends SIGTERM, waits 500ms,
 // then SIGKILL.
 func (m *Manager) Kill(id string) error {
+	return m.kill(id, true)
+}
+
+func (m *Manager) kill(id string, enforceSession bool) error {
+	sessionID := ""
+	if enforceSession {
+		sessionID = m.currentSessionID()
+	}
 	m.mu.Lock()
 	cs, ok := m.procs[id]
 	m.mu.Unlock()
-	if !ok {
+	if !ok || (enforceSession && cs.SessionID != sessionID) {
 		return fmt.Errorf("process: no process with ID %q", id)
 	}
 
@@ -193,8 +253,8 @@ func (m *Manager) Kill(id string) error {
 	}
 	cs.mu.Unlock()
 
-	// SIGTERM to process group.
-	_ = syscall.Kill(-cs.cmd.Process.Pid, syscall.SIGTERM)
+	cs.markReason(ExitReasonKilled)
+	terminateProcessGroup(cs.cmd.Process.Pid)
 
 	select {
 	case <-cs.done:
@@ -205,15 +265,30 @@ func (m *Manager) Kill(id string) error {
 	return nil
 }
 
-// List returns a formatted list of all background processes.
+func (cs *CommandStarted) markReason(reason ExitReason) bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if cs.exited || cs.reason != "" {
+		return false
+	}
+	cs.reason = reason
+	return true
+}
+
+func terminateProcessGroup(pid int) {
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+}
+
+// List returns a formatted list of background processes for the current session.
 func (m *Manager) List() string {
+	sessionID := m.currentSessionID()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.procs) == 0 {
-		return "No background processes."
-	}
 	var result string
 	for _, cs := range m.procs {
+		if cs.SessionID != sessionID {
+			continue
+		}
 		cs.mu.Lock()
 		dur := time.Since(cs.StartedAt).Round(time.Second)
 		status := ""
@@ -225,6 +300,9 @@ func (m *Manager) List() string {
 	}
 	if len(result) > 0 && result[len(result)-1] == '\n' {
 		result = result[:len(result)-1]
+	}
+	if result == "" {
+		return "No background processes."
 	}
 	return result
 }
@@ -238,7 +316,7 @@ func (m *Manager) KillAll() {
 	}
 	m.mu.Unlock()
 	for _, id := range ids {
-		_ = m.Kill(id)
+		_ = m.kill(id, false)
 	}
 }
 
@@ -247,6 +325,16 @@ func (m *Manager) Remove(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.procs, id)
+}
+
+func (m *Manager) currentSessionID() string {
+	m.mu.Lock()
+	provider := m.sessionID
+	m.mu.Unlock()
+	if provider == nil {
+		return ""
+	}
+	return provider()
 }
 
 func newProcessID() (string, error) {

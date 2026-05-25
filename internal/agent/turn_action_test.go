@@ -4,12 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/loop"
 	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/provider"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
@@ -113,6 +119,316 @@ func TestSendQueuedMessagesReturnsAllTurnNumbers(t *testing.T) {
 	waitUntilIdle(t, a)
 	if got := userContents(a.SessionMessages()); !equalStrings(got, []string{"first", "second", "third"}) {
 		t.Fatalf("queued history = %q, want all user turns", got)
+	}
+}
+
+func TestSendQueuedMessagesDoesNotDrainSignalsBeforeIntermediateTurns(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	a.lp.SetClient(nil)
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession returned error: %v", err)
+	}
+	a.lp.AddPendingSignal(loop.PendingSignal{Payload: "idle signal", Wake: true})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if _, err := a.SendQueuedMessages(ctx, []string{"first", "second"}); err != nil {
+		t.Fatalf("SendQueuedMessages returned error: %v", err)
+	}
+	cancel()
+	waitUntilIdle(t, a)
+
+	msgs := a.lp.Messages()
+	if len(msgs) < 4 {
+		t.Fatalf("messages len = %d, want system, first, signal, second: %#v", len(msgs), msgs)
+	}
+	if msgs[1].Role != message.RoleUser || msgs[1].TextContent() != "first" {
+		t.Fatalf("messages[1] = %#v, want first queued turn before signal", msgs[1])
+	}
+	if msgs[2].Role != message.RoleUser || msgs[2].TextContent() != `<system-signal>idle signal</system-signal>` {
+		t.Fatalf("messages[2] = %#v, want pending signal in started turn", msgs[2])
+	}
+	if msgs[3].Role != message.RoleUser || msgs[3].TextContent() != "second" {
+		t.Fatalf("messages[3] = %#v, want final queued turn after signal", msgs[3])
+	}
+}
+
+func TestSendQueuedMessagesWhileBusyDoesNotAppendQueuedTurns(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession returned error: %v", err)
+	}
+	a.mu.Lock()
+	a.busy = true
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.busy = false
+		a.mu.Unlock()
+	}()
+
+	_, err := a.SendQueuedMessages(context.Background(), []string{"first", "second"})
+	if err == nil || !strings.Contains(err.Error(), "turn is already in progress") {
+		t.Fatalf("SendQueuedMessages error = %v, want busy error", err)
+	}
+	if got := userContents(a.SessionMessages()); len(got) != 0 {
+		t.Fatalf("queued messages were appended despite busy error: %q", got)
+	}
+}
+
+func TestRunCompactionPreservesPendingSignalsForMainModel(t *testing.T) {
+	var sawSignal bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		messages, ok := body["messages"].([]any)
+		if !ok || len(messages) != 2 {
+			t.Fatalf("summarizer messages = %#v, want system and user", body["messages"])
+		}
+		userMsg, ok := messages[1].(map[string]any)
+		if !ok {
+			t.Fatalf("summarizer user message = %#v", messages[1])
+		}
+		content, _ := userMsg["content"].(string)
+		sawSignal = strings.Contains(content, `<system-signal>idle signal</system-signal>`)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"summary"},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+
+	a := newCatalogBackedTestAgent(t)
+	appendUserTurn(t, a, "first")
+	a.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
+	a.lp.AddPendingSignal(loop.PendingSignal{Payload: "idle signal", Wake: true})
+
+	if err := a.runCompaction(context.Background(), false); err != nil {
+		t.Fatalf("runCompaction returned error: %v", err)
+	}
+	if sawSignal {
+		t.Fatal("summarizer request included pending signal; want main-model delivery only")
+	}
+	for _, msg := range a.lp.Messages() {
+		if strings.Contains(msg.TextContent(), "idle signal") {
+			t.Fatalf("pending signal was appended during compaction reload: %#v", msg)
+		}
+	}
+	if !a.lp.HasPendingWakeSignal() {
+		t.Fatal("pending wake signal was lost during compaction reload")
+	}
+}
+
+func TestBackgroundExitSignalAfterSessionNewDoesNotDrainIntoNewSession(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	appendUserTurn(t, a, "old session prompt")
+	oldSessionID := a.store.SessionID()
+
+	id, err := a.procMgr.Start("sleep 0.1; i=0; while [ $i -lt 3000 ]; do printf 'old-output-%04d\n' \"$i\"; i=$((i+1)); done", 0)
+	if err != nil {
+		t.Fatalf("Start background process: %v", err)
+	}
+	if err := a.SessionNew(); err != nil {
+		t.Fatalf("SessionNew returned error: %v", err)
+	}
+	appendUserTurn(t, a, "new session prompt")
+
+	waitUntilProcessRemovedFromSession(t, a, oldSessionID, id)
+	assertNoProcessOutputFiles(t, a)
+
+	if a.lp.HasPendingSignal() {
+		a.lp.DrainPendingSignalsForModel(a.store.CurrentTurn())
+	}
+	for _, msg := range a.lp.Messages() {
+		content := msg.TextContent()
+		if strings.Contains(content, "old-output") || strings.Contains(content, "Background process") {
+			t.Fatalf("old session background signal leaked into new session: %#v", msg)
+		}
+	}
+	if got := userContents(a.SessionMessages()); !equalStrings(got, []string{"new session prompt"}) {
+		t.Fatalf("new session history = %q, want only new session prompt", got)
+	}
+}
+
+func waitUntilProcessRemovedFromSession(t *testing.T, a *Agent, sessionID, id string) {
+	t.Helper()
+	a.procMgr.SetSessionProvider(func() string { return sessionID })
+	defer a.procMgr.SetSessionProvider(func() string {
+		return a.store.SessionID()
+	})
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if !strings.Contains(a.procMgr.List(), id) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("background process %s did not finalize", id)
+}
+
+func assertNoProcessOutputFiles(t *testing.T, a *Agent) {
+	t.Helper()
+	spillDir := filepath.Dir(a.projects.Root())
+	var leftovers []string
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		leftovers = nil
+		entries, err := os.ReadDir(spillDir)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("ReadDir(%q): %v", spillDir, err)
+		}
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), "proc_output_") {
+				leftovers = append(leftovers, entry.Name())
+			}
+		}
+		if len(leftovers) == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("stale-session background exit kept proc_output files: %v", leftovers)
+}
+
+func TestIdleBackgroundTerminalSignalStartsAgentTurn(t *testing.T) {
+	requests := make(chan []map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		requests <- body.Messages
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","content":"handled background exit"},"finish_reason":"stop"}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	a := newCatalogBackedTestAgent(t)
+	events := make(chan Event, 16)
+	a.SetEventHandler(func(ev Event) {
+		events <- ev
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.Init(ctx)
+	appendUserTurn(t, a, "existing turn")
+	prov := a.catalog.Providers["test"]
+	prov.Transport.BaseURL = server.URL + "/v1"
+	a.lp.SetClient(provider.New(prov, prov.Models["test-model"], ""))
+
+	if _, err := a.procMgr.Start("printf final-output", 0); err != nil {
+		t.Fatalf("Start background process: %v", err)
+	}
+
+	var sawEnd bool
+	var bgEvent *Event
+	for deadline := time.After(2 * time.Second); !sawEnd; {
+		select {
+		case ev := <-events:
+			if ev.Kind == EventBackgroundProcessComplete {
+				copy := ev
+				bgEvent = &copy
+			}
+			if ev.Kind == EventTurnEnd {
+				sawEnd = true
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for autonomous signal turn")
+		}
+	}
+
+	var messages []map[string]any
+	select {
+	case messages = <-requests:
+	case <-time.After(time.Second):
+		t.Fatal("model request was not sent for idle background exit")
+	}
+	if len(messages) == 0 {
+		t.Fatal("model request had no messages")
+	}
+	last := messages[len(messages)-1]
+	content, _ := last["content"].(string)
+	if last["role"] != "user" || !strings.Contains(content, "Background process") || !strings.Contains(content, "final-output") {
+		t.Fatalf("last model message = %#v, want background terminal signal with output", last)
+	}
+	if bgEvent == nil {
+		t.Fatal("background completion display event was not emitted")
+	}
+	if bgEvent.BackgroundProcess == nil {
+		t.Fatalf("background event missing payload: %#v", bgEvent)
+	}
+	if bgEvent.BackgroundProcess.Command != "printf final-output" || bgEvent.BackgroundProcess.Reason != "completed" || bgEvent.BackgroundProcess.ExitCode != 0 || bgEvent.Result != "final-output" || bgEvent.IsError {
+		t.Fatalf("background event = %#v", bgEvent)
+	}
+}
+
+func TestBackgroundTerminalDisplayEventsForErrorAndTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","content":"handled"},"finish_reason":"stop"}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	a := newCatalogBackedTestAgent(t)
+	events := make(chan Event, 32)
+	a.SetEventHandler(func(ev Event) {
+		events <- ev
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.Init(ctx)
+	appendUserTurn(t, a, "existing turn")
+	prov := a.catalog.Providers["test"]
+	prov.Transport.BaseURL = server.URL + "/v1"
+	a.lp.SetClient(provider.New(prov, prov.Models["test-model"], ""))
+
+	if _, err := a.procMgr.Start("printf failed; exit 7", 0); err != nil {
+		t.Fatalf("Start error background process: %v", err)
+	}
+	errEvent := waitBackgroundProcessDisplayEvent(t, events, "printf failed; exit 7")
+	if errEvent.BackgroundProcess.Reason != "error" || errEvent.BackgroundProcess.ExitCode != 7 || errEvent.Result != "failed" || !errEvent.IsError {
+		t.Fatalf("error background event = %#v", errEvent)
+	}
+	waitAgentEventKind(t, events, EventTurnEnd)
+
+	if _, err := a.procMgr.Start("printf start; sleep 5", 1); err != nil {
+		t.Fatalf("Start timeout background process: %v", err)
+	}
+	timeoutEvent := waitBackgroundProcessDisplayEvent(t, events, "printf start; sleep 5")
+	if timeoutEvent.BackgroundProcess.Reason != "timeout" || timeoutEvent.BackgroundProcess.ExitCode == 0 || !strings.Contains(timeoutEvent.Result, "start") || !timeoutEvent.IsError {
+		t.Fatalf("timeout background event = %#v", timeoutEvent)
+	}
+	waitAgentEventKind(t, events, EventTurnEnd)
+}
+
+func waitBackgroundProcessDisplayEvent(t *testing.T, events <-chan Event, command string) Event {
+	t.Helper()
+	for deadline := time.After(3 * time.Second); ; {
+		select {
+		case ev := <-events:
+			if ev.Kind == EventBackgroundProcessComplete && ev.BackgroundProcess != nil && ev.BackgroundProcess.Command == command {
+				return ev
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for background display event for %q", command)
+		}
+	}
+}
+
+func waitAgentEventKind(t *testing.T, events <-chan Event, kind EventKind) Event {
+	t.Helper()
+	for deadline := time.After(3 * time.Second); ; {
+		select {
+		case ev := <-events:
+			if ev.Kind == kind {
+				return ev
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for event kind %v", kind)
+		}
 	}
 }
 

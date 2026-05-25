@@ -9,18 +9,19 @@ import (
 type EventKind int
 
 const (
-	EventTextDelta         EventKind = iota // Streamed text chunk from the model.
-	EventToolCallStart                      // Tool call begins.
-	EventToolCallEnd                        // Tool call completes.
-	EventUsage                              // Token usage report from the model.
-	EventTurnStart                          // Agent starts processing a turn.
-	EventTurnEnd                            // Agent finished processing a turn.
-	EventError                              // The agentic loop returned an error.
-	EventPermissionRequest                  // A tool needs user approval.
-	EventCompactionStart                    // Compaction beginning.
-	EventCompactionEnd                      // Compaction finished.
-	EventWarning                            // Current warning snapshot changed.
-	EventSubagentStart                      // A subagent session started.
+	EventTextDelta                 EventKind = iota // Streamed text chunk from the model.
+	EventToolCallStart                              // Tool call begins.
+	EventToolCallEnd                                // Tool call completes.
+	EventUsage                                      // Token usage report from the model.
+	EventTurnStart                                  // Agent starts processing a turn.
+	EventTurnEnd                                    // Agent finished processing a turn.
+	EventError                                      // The agentic loop returned an error.
+	EventPermissionRequest                          // A tool needs user approval.
+	EventCompactionStart                            // Compaction beginning.
+	EventCompactionEnd                              // Compaction finished.
+	EventWarning                                    // Current warning snapshot changed.
+	EventSubagentStart                              // A subagent session started.
+	EventBackgroundProcessComplete                  // A background process completion was delivered to the model.
 )
 
 // Event is the unified event type emitted by the Agent to adapters.
@@ -48,6 +49,17 @@ type Event struct {
 	Warnings          []PromptWarning
 	SubagentSessionID string
 	TaskIndex         int
+	BackgroundProcess *BackgroundProcessDisplay
+}
+
+// BackgroundProcessDisplay is the adapter-facing display payload for a
+// background process completion delivered as model input.
+type BackgroundProcessDisplay struct {
+	ID       string `json:"id"`
+	Command  string `json:"command"`
+	Reason   string `json:"reason"`
+	ExitCode int    `json:"exitCode"`
+	Output   string `json:"output"`
 }
 
 // PromptWarning is a user-visible warning from prompt, catalog, LSP, or related systems.
@@ -136,6 +148,8 @@ type DisplayMessage struct {
 	Success  bool           `json:"success,omitempty"`
 	Result   string         `json:"result,omitempty"`
 	Metadata map[string]any `json:"metadata,omitempty"`
+
+	BackgroundProcess *BackgroundProcessDisplay `json:"backgroundProcess,omitempty"`
 }
 
 const (

@@ -111,6 +111,23 @@ func TestRenderOutputPreviewShowsMoreLinesMarker(t *testing.T) {
 	}
 }
 
+func TestRenderBackgroundProcessUsesDedicatedHeaderAndOutputPreview(t *testing.T) {
+	bg := &agent.BackgroundProcessDisplay{
+		ID:       "bg-1",
+		Command:  "printf 'one\ntwo'",
+		Reason:   "completed",
+		ExitCode: 0,
+	}
+	header := renderBackgroundProcessCall(bg, true)
+	if !strings.Contains(header, "background_process") || !strings.Contains(header, "bg-1") || !strings.Contains(header, "completed exit 0") || !strings.Contains(header, "$ printf 'one") {
+		t.Fatalf("background process header missing details: %q", header)
+	}
+	output := renderToolResult("background_process", "", "1\n2\n3\n4\n5\n6", true, false, 80, nil)
+	if strings.Contains(output, "6") || !strings.Contains(output, "(1 more line)") {
+		t.Fatalf("background process output should use collapsed preview: %q", output)
+	}
+}
+
 func TestRenderToolCallShowsWriteLineCount(t *testing.T) {
 	rendered := renderToolCall("write_file", `{"path":"x.go","content":"one\ntwo\n"}`, nil)
 	if !strings.Contains(rendered, colorGreen+"+2"+colorCyan) {

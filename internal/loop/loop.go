@@ -11,6 +11,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -33,7 +34,18 @@ const traceMaxChars = 200
 
 // interruptedSignal is injected as a user-role message when the user
 // cancels a turn. User-role works across all OpenAI-compatible providers.
-const interruptedSignal = "<system-signal>Request interrupted by user</system-signal>"
+var interruptedSignal = SystemSignal("Request interrupted by user")
+
+var systemSignalEscaper = strings.NewReplacer(
+	"&", "&amp;",
+	"<", "&lt;",
+	">", "&gt;",
+)
+
+// SystemSignal escapes payload and wraps it as a user-role system signal.
+func SystemSignal(payload string) string {
+	return "<system-signal>" + systemSignalEscaper.Replace(payload) + "</system-signal>"
+}
 
 // Store is the minimum surface the loop needs from the snapshot
 // package: turn-scoped message persistence, turn completion, and
@@ -69,6 +81,8 @@ const (
 	Usage
 	// Warning carries a non-fatal runtime warning in Result.
 	Warning
+	// BackgroundProcessComplete carries a background process completion display item.
+	BackgroundProcessComplete
 )
 
 // Event is a structured tool-call event for UIs that want to render tool
@@ -92,6 +106,31 @@ type Event struct {
 	Input      int
 	Output     int
 	UsageKnown bool
+
+	// Turn is set when the event belongs to a persisted conversation turn.
+	Turn int
+
+	BackgroundProcess *BackgroundProcessDisplay
+}
+
+// BackgroundProcessDisplay is the user-visible sidecar for a background
+// terminal completion signal after it is added to model-visible history.
+type BackgroundProcessDisplay struct {
+	ID       string
+	Command  string
+	Reason   string
+	ExitCode int
+	Output   string
+}
+
+// PendingSignal is async model input owned by the loop. Wake signals ask the
+// agent scheduler to start a model turn when idle. Persist controls whether
+// the wrapped user-role signal is written to the current turn.
+type PendingSignal struct {
+	Payload           string
+	Wake              bool
+	Persist           bool
+	BackgroundProcess *BackgroundProcessDisplay
 }
 
 // Loop owns the conversation history for a single session and drives
@@ -121,6 +160,9 @@ type Loop struct {
 	pendingQueue *tool.PendingQueue
 
 	pendingExecutor PendingExecutor
+
+	signalMu       sync.Mutex
+	pendingSignals []PendingSignal
 }
 
 // New returns a Loop pre-seeded with the system prompt.
@@ -269,21 +311,89 @@ func (l *Loop) AppendUserMessage(turn int, content string) {
 	l.persistMessage(turn, msg)
 }
 
-// AppendSignal appends a user-role system signal message to the
-// conversation history. Not persisted and not counted as a turn boundary.
-func (l *Loop) AppendSignal(content string) {
-	l.messages = append(l.messages, message.NewText(message.RoleUser, content))
+// AddPendingSignal records async model input. The loop drains pending signals
+// only when the next model request can legally include them.
+func (l *Loop) AddPendingSignal(signal PendingSignal) {
+	if signal.Payload == "" {
+		return
+	}
+	l.signalMu.Lock()
+	defer l.signalMu.Unlock()
+	l.pendingSignals = append(l.pendingSignals, signal)
 }
 
-// ResetHistory drops all messages and turn boundaries, leaving only
-// the system prompt. Used when switching sessions.
-func (l *Loop) ResetHistory() {
+// HasPendingWakeSignal reports whether any pending signal should wake the model
+// when no turn is active.
+func (l *Loop) HasPendingWakeSignal() bool {
+	l.signalMu.Lock()
+	defer l.signalMu.Unlock()
+	for _, signal := range l.pendingSignals {
+		if signal.Wake {
+			return true
+		}
+	}
+	return false
+}
+
+// HasPendingSignal reports whether any async model input is pending.
+func (l *Loop) HasPendingSignal() bool {
+	l.signalMu.Lock()
+	defer l.signalMu.Unlock()
+	return len(l.pendingSignals) > 0
+}
+
+// DrainPendingSignalsForModel appends pending system signals to history so the
+// next model request sees them. Signals do not create turn boundaries.
+func (l *Loop) DrainPendingSignalsForModel(turn int) {
+	l.signalMu.Lock()
+	signals := append([]PendingSignal(nil), l.pendingSignals...)
+	l.pendingSignals = nil
+	l.signalMu.Unlock()
+	for _, signal := range signals {
+		l.appendSignal(signal, turn)
+		if signal.BackgroundProcess != nil {
+			bg := signal.BackgroundProcess
+			l.emit(Event{
+				Kind:              BackgroundProcessComplete,
+				Result:            bg.Output,
+				IsError:           !(bg.Reason == "completed" && bg.ExitCode == 0),
+				Turn:              turn,
+				BackgroundProcess: bg,
+			})
+		}
+	}
+}
+
+func (l *Loop) appendSignal(signal PendingSignal, turn int) {
+	msg := message.NewText(message.RoleUser, SystemSignal(signal.Payload))
+	l.messages = append(l.messages, msg)
+	if signal.Persist {
+		l.persistMessage(turn, msg)
+	}
+}
+
+func (l *Loop) clearPendingSignals() {
+	l.signalMu.Lock()
+	defer l.signalMu.Unlock()
+	l.pendingSignals = nil
+}
+
+func (l *Loop) resetHistory(clearSignals bool) {
+	if clearSignals {
+		l.clearPendingSignals()
+	}
 	if len(l.messages) > 0 && l.messages[0].Role == message.RoleSystem {
 		l.messages = l.messages[:1]
 	} else {
 		l.messages = nil
 	}
 	l.turnBoundaries = nil
+}
+
+// ResetHistory drops all messages and turn boundaries, leaving only
+// the system prompt. Used when switching sessions.
+func (l *Loop) ResetHistory() {
+	l.resetHistory(true)
 }
 
 // LoadHistory restores a conversation from persisted turns. Each
@@ -307,7 +417,17 @@ func (l *Loop) LoadHistory(turns [][]message.Message) {
 // injected before any post-compaction turns, attributed to the
 // summarizer model so its provenance is preserved.
 func (l *Loop) LoadHistoryWithSummary(summary string, summarizer catalog.ModelRef, turns [][]message.Message) {
-	l.ResetHistory()
+	l.loadHistoryWithSummary(summary, summarizer, turns, true)
+}
+
+// LoadHistoryWithSummaryPreservePending restores compacted history without
+// dropping pending async model input. Used by compaction in the active turn.
+func (l *Loop) LoadHistoryWithSummaryPreservePending(summary string, summarizer catalog.ModelRef, turns [][]message.Message) {
+	l.loadHistoryWithSummary(summary, summarizer, turns, false)
+}
+
+func (l *Loop) loadHistoryWithSummary(summary string, summarizer catalog.ModelRef, turns [][]message.Message, clearSignals bool) {
+	l.resetHistory(clearSignals)
 	summaryMsg := message.NewText(message.RoleAssistant, "[Previous conversation summary]\n\n"+summary+"\n\n[End of summary. Continue from here.]")
 	summaryMsg.Source = summarizer
 	l.messages = append(l.messages, summaryMsg)
@@ -355,6 +475,7 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 	l.pendingQueue = tool.NewPendingQueue()
 
 	l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
+	l.DrainPendingSignalsForModel(turn)
 	for _, input := range userInputs {
 		userMsg := message.NewText(message.RoleUser, input)
 		l.messages = append(l.messages, userMsg)
@@ -370,6 +491,7 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 	}()
 
 	for iter := 0; iter < maxIterations; iter++ {
+		l.DrainPendingSignalsForModel(turn)
 		msg, cancelled, err := l.runStream(ctx)
 		if err != nil {
 			return "", fmt.Errorf("chat completion: %w", err)
@@ -397,6 +519,9 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 				toolMsg := message.NewText(message.RoleUser, result)
 				l.messages = append(l.messages, toolMsg)
 				l.persistMessage(turn, toolMsg)
+			}
+			if l.HasPendingWakeSignal() {
+				continue
 			}
 			return assistantVisibleText(msg), nil
 		}

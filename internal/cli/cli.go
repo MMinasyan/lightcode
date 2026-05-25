@@ -618,6 +618,39 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			c.startAnimationLocked("Thinking")
 		}
 
+	case agent.EventBackgroundProcessComplete:
+		if c.streamDisplayActive && c.streamNeedsNL {
+			c.writeRaw("\r\n")
+		}
+		if c.streamStarted {
+			c.finalizeStreamBufLocked()
+			c.streamStarted = false
+		} else {
+			c.stopAnimationLocked()
+			c.writeRaw("\r\x1b[2K")
+		}
+		success := !ev.IsError
+		id := ""
+		if ev.BackgroundProcess != nil {
+			id = ev.BackgroundProcess.ID
+		}
+		c.messages = append(c.messages, displayEntry{
+			typ:     "background_process",
+			id:      id,
+			done:    true,
+			success: success,
+			result:  ev.Result,
+			bg:      ev.BackgroundProcess,
+		})
+		c.writeRaw(renderBackgroundProcessCall(ev.BackgroundProcess, success))
+		if result := renderToolResult("background_process", "", ev.Result, success, c.toolExpanded, c.width, nil); result != "" {
+			c.writeRaw(result)
+			c.writeRaw(nl)
+		}
+		if c.busy {
+			c.startAnimationLocked("Thinking")
+		}
+
 	case agent.EventTurnEnd:
 		c.stopAnimationLocked()
 		c.erasePermissionBlockLocked()
@@ -872,6 +905,15 @@ func (c *CLI) printDisplayEntryLocked(e displayEntry) {
 			}
 			c.writeRaw(nl)
 		}
+	case "background_process":
+		c.printLineLocked(renderBackgroundProcessCall(e.bg, e.success))
+		if e.done {
+			result := renderToolResult("background_process", "", e.result, e.success, c.toolExpanded, c.width, nil)
+			if result != "" {
+				c.printLineLocked(result)
+			}
+			c.writeRaw(nl)
+		}
 	case "system":
 		c.printLineLocked(renderSystemMsg(e.content))
 	}
@@ -920,6 +962,11 @@ func (c *CLI) submitInput(text string) {
 }
 
 func (c *CLI) submitInputLocked(text string) {
+	if len(c.msgQueue) > 0 {
+		c.msgQueue = append(c.msgQueue, text)
+		c.flushQueueLocked()
+		return
+	}
 	c.printLineLocked(renderUserMsg(text, c.width))
 	c.startAnimationLocked("Thinking")
 
@@ -951,12 +998,7 @@ func (c *CLI) flushQueueLocked() {
 		return
 	}
 
-	queue := c.msgQueue
-	c.msgQueue = nil
-
-	for _, text := range queue {
-		c.printLineLocked(renderUserMsg(text, c.width))
-	}
+	queue := append([]string(nil), c.msgQueue...)
 	c.busy = true
 	c.state = stateStreaming
 	c.startAnimationLocked("Thinking")
@@ -964,6 +1006,14 @@ func (c *CLI) flushQueueLocked() {
 	go func() {
 		if _, err := c.agent.SendQueuedMessages(c.ctx, queue); err != nil {
 			c.mu.Lock()
+			if strings.Contains(err.Error(), "turn is already in progress") {
+				c.stopAnimationLocked()
+				c.writeRaw("\r\x1b[2K")
+				c.busy = true
+				c.state = stateStreaming
+				c.mu.Unlock()
+				return
+			}
 			c.stopAnimationLocked()
 			c.writeRaw("\r\x1b[2K")
 			c.writeRaw(renderErrorMsg(err.Error()))
@@ -971,7 +1021,24 @@ func (c *CLI) flushQueueLocked() {
 			c.state = stateIdle
 			c.printInputPromptLocked()
 			c.mu.Unlock()
+			return
 		}
+		c.mu.Lock()
+		for range queue {
+			if len(c.msgQueue) == 0 {
+				break
+			}
+			c.msgQueue = c.msgQueue[1:]
+		}
+		c.stopAnimationLocked()
+		c.writeRaw("\r\x1b[2K")
+		for _, text := range queue {
+			c.printLineLocked(renderUserMsg(text, c.width))
+		}
+		if c.busy {
+			c.startAnimationLocked("Thinking")
+		}
+		c.mu.Unlock()
 	}()
 }
 

@@ -86,6 +86,21 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 	if !strings.Contains(app, "SendQueuedMessages(queued.map(q => q.content))") {
 		t.Fatalf("App.svelte must flush queued messages through SendQueuedMessages")
 	}
+	if !strings.Contains(app, "if (busy) return;") {
+		t.Fatalf("App.svelte queued-message flush must not run while the adapter is busy")
+	}
+	if !strings.Contains(app, "messageQueue = messageQueue.slice(queued.length)") {
+		t.Fatalf("App.svelte must keep queued messages until SendQueuedMessages succeeds")
+	}
+	if strings.Contains(app, "const queued = messageQueue;\n    messageQueue = []") {
+		t.Fatalf("App.svelte must not clear queued messages before SendQueuedMessages succeeds")
+	}
+	if strings.Contains(app, "showError(data?.message || data);\n      busy = false;\n      messageQueue = []") {
+		t.Fatalf("App.svelte generic error event must not clear queued user messages")
+	}
+	if !strings.Contains(app, "if (nextSessionId !== sessionId) messageQueue = [];") {
+		t.Fatalf("App.svelte same-session refreshes must not clear queued user messages")
+	}
 	if strings.Contains(app, "AppendUserMessage(") {
 		t.Fatalf("App.svelte still flushes queued messages one turn at a time")
 	}

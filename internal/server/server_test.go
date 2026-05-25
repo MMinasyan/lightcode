@@ -100,6 +100,26 @@ func TestHandleEventBroadcastsAndSkipsSubagents(t *testing.T) {
 	default:
 		t.Fatal("message event not broadcast")
 	}
+	s.handleEvent(agent.Event{
+		Kind:    agent.EventBackgroundProcessComplete,
+		Result:  "done",
+		IsError: false,
+		BackgroundProcess: &agent.BackgroundProcessDisplay{
+			ID:       "bg-1",
+			Command:  "printf done",
+			Reason:   "completed",
+			ExitCode: 0,
+			Output:   "done",
+		},
+	})
+	select {
+	case msg := <-ch:
+		if !strings.Contains(string(msg), "event: background_process_complete") || !strings.Contains(string(msg), `"id":"bg-1"`) || !strings.Contains(string(msg), `"output":"done"`) {
+			t.Fatalf("background event = %q", msg)
+		}
+	default:
+		t.Fatal("background event not broadcast")
+	}
 	s.handleEvent(agent.Event{Kind: agent.EventTextDelta, Result: "skip", SubagentSessionID: "sub"})
 	select {
 	case msg := <-ch:

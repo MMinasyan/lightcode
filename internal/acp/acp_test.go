@@ -71,10 +71,21 @@ func TestHandleEventNotifications(t *testing.T) {
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, Result: "hello"})
 	r.handleEvent(agent.Event{Kind: agent.EventToolCallStart, ToolCallID: "tc1", ToolName: "read_file", Args: `{"path":"x"}`})
 	r.handleEvent(agent.Event{Kind: agent.EventToolCallEnd, ToolCallID: "tc1", ToolName: "read_file", Result: "done"})
+	r.handleEvent(agent.Event{
+		Kind:   agent.EventBackgroundProcessComplete,
+		Result: "done",
+		BackgroundProcess: &agent.BackgroundProcessDisplay{
+			ID:       "bg-1",
+			Command:  "printf done",
+			Reason:   "completed",
+			ExitCode: 0,
+			Output:   "done",
+		},
+	})
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, Result: "skip", SubagentSessionID: "sub"})
 
-	lines := responseLines(t, out.String(), 3)
-	wantMethods := []string{"agent/message_chunk", "agent/tool_start", "agent/tool_result"}
+	lines := responseLines(t, out.String(), 4)
+	wantMethods := []string{"agent/message_chunk", "agent/tool_start", "agent/tool_result", "agent/background_process_complete"}
 	for i, want := range wantMethods {
 		var got Notification
 		if err := json.Unmarshal([]byte(lines[i]), &got); err != nil {

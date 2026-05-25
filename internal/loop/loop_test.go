@@ -3,13 +3,18 @@ package loop
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/message"
 	"github.com/MMinasyan/lightcode/internal/provider"
+	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
 type fakeStore struct {
@@ -114,6 +119,330 @@ func TestEmitDropsTelemetryWhenChannelFull(t *testing.T) {
 	}
 }
 
+func TestSystemSignalEscapesAndWrapsPayload(t *testing.T) {
+	got := SystemSignal(`a & b < c > d`)
+	want := `<system-signal>a &amp; b &lt; c &gt; d</system-signal>`
+	if got != want {
+		t.Fatalf("SystemSignal() = %q, want %q", got, want)
+	}
+}
+
+func TestSystemSignalEscapesLiteralClosingTag(t *testing.T) {
+	got := SystemSignal(`before </system-signal> after`)
+	inner := strings.TrimPrefix(strings.TrimSuffix(got, "</system-signal>"), "<system-signal>")
+	if strings.Contains(inner, "</system-signal>") {
+		t.Fatalf("SystemSignal() = %q, contains unescaped closing tag inside wrapper", got)
+	}
+	if !strings.Contains(inner, "&lt;/system-signal&gt;") {
+		t.Fatalf("SystemSignal() = %q, missing escaped closing tag", got)
+	}
+}
+
+func TestPendingSignalWrapsRawPayloadWhenDrained(t *testing.T) {
+	lp := New(nil, nil, "system")
+	lp.AddPendingSignal(PendingSignal{Payload: `raw <payload> & data`})
+	lp.DrainPendingSignalsForModel(0)
+
+	msgs := lp.Messages()
+	if len(msgs) != 2 {
+		t.Fatalf("messages len = %d, want system plus signal", len(msgs))
+	}
+	got := msgs[1].TextContent()
+	want := `<system-signal>raw &lt;payload&gt; &amp; data</system-signal>`
+	if got != want {
+		t.Fatalf("signal message = %q, want %q", got, want)
+	}
+}
+
+func TestPendingBackgroundProcessSignalEmitsDisplayWhenDrained(t *testing.T) {
+	lp := New(nil, nil, "system")
+	events := make(chan Event, 4)
+	lp.SetEvents(events)
+	lp.AddPendingSignal(PendingSignal{
+		Payload: "Background process bg-1 finished",
+		BackgroundProcess: &BackgroundProcessDisplay{
+			ID:       "bg-1",
+			Command:  "printf ok",
+			Reason:   "completed",
+			ExitCode: 0,
+			Output:   "ok",
+		},
+	})
+	lp.DrainPendingSignalsForModel(7)
+
+	msgs := lp.Messages()
+	if len(msgs) != 2 {
+		t.Fatalf("messages len = %d, want system plus signal", len(msgs))
+	}
+	if got := msgs[1].TextContent(); got != `<system-signal>Background process bg-1 finished</system-signal>` {
+		t.Fatalf("signal message = %q", got)
+	}
+	select {
+	case ev := <-events:
+		if ev.Kind != BackgroundProcessComplete {
+			t.Fatalf("event kind = %v, want BackgroundProcessComplete", ev.Kind)
+		}
+		if ev.Turn != 7 || ev.IsError || ev.Result != "ok" {
+			t.Fatalf("event = %#v, want turn 7 success output ok", ev)
+		}
+		if ev.BackgroundProcess == nil || ev.BackgroundProcess.ID != "bg-1" || ev.BackgroundProcess.Command != "printf ok" || ev.BackgroundProcess.Reason != "completed" || ev.BackgroundProcess.ExitCode != 0 || ev.BackgroundProcess.Output != "ok" {
+			t.Fatalf("background process event = %#v", ev.BackgroundProcess)
+		}
+	default:
+		t.Fatal("expected background process display event")
+	}
+}
+
+func TestPlainPendingSignalDoesNotEmitBackgroundDisplay(t *testing.T) {
+	lp := New(nil, nil, "system")
+	events := make(chan Event, 1)
+	lp.SetEvents(events)
+	lp.AddPendingSignal(PendingSignal{Payload: "plain signal"})
+	lp.DrainPendingSignalsForModel(0)
+
+	select {
+	case ev := <-events:
+		t.Fatalf("unexpected event for plain signal: %#v", ev)
+	default:
+	}
+}
+
+func TestResetHistoryClearsPendingSignals(t *testing.T) {
+	lp := New(nil, nil, "system")
+	lp.AddPendingSignal(PendingSignal{Payload: "old session signal", Wake: true})
+	lp.ResetHistory()
+	lp.DrainPendingSignalsForModel(0)
+
+	msgs := lp.Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("messages len = %d, want only system after reset: %#v", len(msgs), msgs)
+	}
+}
+
+func TestAppendUserMessageDoesNotDrainPendingSignals(t *testing.T) {
+	lp := New(nil, nil, "system")
+	lp.AddPendingSignal(PendingSignal{Payload: "idle signal", Wake: true})
+	lp.AppendUserMessage(1, "next prompt")
+
+	msgs := lp.Messages()
+	if len(msgs) != 2 {
+		t.Fatalf("messages len = %d, want system plus user only: %#v", len(msgs), msgs)
+	}
+	if msgs[1].Role != message.RoleUser || msgs[1].TextContent() != "next prompt" {
+		t.Fatalf("messages[1] = %#v, want user prompt", msgs[1])
+	}
+	if !lp.HasPendingWakeSignal() {
+		t.Fatal("pending wake signal was drained by AppendUserMessage")
+	}
+}
+
+func TestPendingSignalDuringToolExecutionDrainsAfterToolResult(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests []map[string]any
+		count    int
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, body)
+		n := count
+		count++
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch n {
+		case 0:
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"queue_signal","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		case 1:
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		default:
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	prov := &catalog.Provider{
+		ID: "test",
+		Transport: catalog.Transport{
+			BaseURL: server.URL + "/v1",
+		},
+		Models: map[string]*catalog.Model{
+			"model-a": {ID: "model-a"},
+		},
+	}
+	client := provider.New(prov, prov.Models["model-a"], "")
+	registry := tool.NewRegistry()
+	var lp *Loop
+	registry.Register(queueSignalTool{queue: func() {
+		lp.AddPendingSignal(PendingSignal{
+			Payload: "async <event>",
+			Wake:    true,
+			BackgroundProcess: &BackgroundProcessDisplay{
+				ID:       "bg-1",
+				Command:  "printf async",
+				Reason:   "completed",
+				ExitCode: 0,
+				Output:   "async",
+			},
+		})
+	}})
+	lp = New(client, registry, "system")
+	events := make(chan Event, 16)
+	lp.SetEvents(events)
+
+	got, err := lp.Run(context.Background(), "start")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != "done" {
+		t.Fatalf("Run returned %q, want done", got)
+	}
+
+	msgs := lp.Messages()
+	if len(msgs) != 6 {
+		t.Fatalf("messages len = %d, want 6: %#v", len(msgs), msgs)
+	}
+	if msgs[2].Role != message.RoleAssistant || len(msgs[2].ToolCalls) != 1 {
+		t.Fatalf("messages[2] = %#v, want assistant tool call", msgs[2])
+	}
+	if msgs[3].Role != message.RoleTool || msgs[3].ToolCallID != "call_1" {
+		t.Fatalf("messages[3] = %#v, want tool result for call_1", msgs[3])
+	}
+	if msgs[4].Role != message.RoleUser {
+		t.Fatalf("messages[4] role = %q, want user system signal", msgs[4].Role)
+	}
+	wantSignal := `<system-signal>async &lt;event&gt;</system-signal>`
+	if gotSignal := msgs[4].TextContent(); gotSignal != wantSignal {
+		t.Fatalf("messages[4] = %q, want %q", gotSignal, wantSignal)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 2 {
+		t.Fatalf("requests len = %d, want 2", len(requests))
+	}
+	wireMessages, ok := requests[1]["messages"].([]any)
+	if !ok {
+		t.Fatalf("second request messages = %#v", requests[1]["messages"])
+	}
+	if len(wireMessages) < 5 {
+		t.Fatalf("second request messages len = %d, want at least 5", len(wireMessages))
+	}
+	assistantMsg := wireMessages[len(wireMessages)-3].(map[string]any)
+	toolMsg := wireMessages[len(wireMessages)-2].(map[string]any)
+	signalMsg := wireMessages[len(wireMessages)-1].(map[string]any)
+	if assistantMsg["role"] != "assistant" || assistantMsg["tool_calls"] == nil {
+		t.Fatalf("wire assistant message = %#v, want tool call", assistantMsg)
+	}
+	if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "call_1" {
+		t.Fatalf("wire tool message = %#v, want tool result", toolMsg)
+	}
+	if signalMsg["role"] != "user" || signalMsg["content"] != wantSignal {
+		t.Fatalf("wire signal message = %#v, want pending signal after tool result", signalMsg)
+	}
+
+	var (
+		toolEndIndex = -1
+		bgIndex      = -1
+		eventIndex   int
+	)
+	for {
+		select {
+		case ev := <-events:
+			if ev.Kind == ToolCallEnd {
+				toolEndIndex = eventIndex
+			}
+			if ev.Kind == BackgroundProcessComplete {
+				bgIndex = eventIndex
+			}
+			eventIndex++
+		default:
+			if toolEndIndex < 0 || bgIndex < 0 || bgIndex <= toolEndIndex {
+				t.Fatalf("event order toolEnd=%d background=%d", toolEndIndex, bgIndex)
+			}
+			return
+		}
+	}
+}
+
+func TestWakeSignalDuringTextModelCallStartsNextModelRequest(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests []map[string]any
+		count    int
+		lp       *Loop
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, body)
+		n := count
+		count++
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch n {
+		case 0:
+			lp.AddPendingSignal(PendingSignal{Payload: "background complete", Wake: true})
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","content":"initial"},"finish_reason":"stop"}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		case 1:
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","content":"after signal"},"finish_reason":"stop"}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		default:
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	prov := &catalog.Provider{
+		ID: "test",
+		Transport: catalog.Transport{
+			BaseURL: server.URL + "/v1",
+		},
+		Models: map[string]*catalog.Model{
+			"model-a": {ID: "model-a"},
+		},
+	}
+	client := provider.New(prov, prov.Models["model-a"], "")
+	lp = New(client, tool.NewRegistry(), "system")
+
+	got, err := lp.Run(context.Background(), "start")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != "after signal" {
+		t.Fatalf("Run returned %q, want after signal", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 2 {
+		t.Fatalf("requests len = %d, want 2", len(requests))
+	}
+	wireMessages, ok := requests[1]["messages"].([]any)
+	if !ok || len(wireMessages) == 0 {
+		t.Fatalf("second request messages = %#v", requests[1]["messages"])
+	}
+	last := wireMessages[len(wireMessages)-1].(map[string]any)
+	if last["role"] != "user" || last["content"] != `<system-signal>background complete</system-signal>` {
+		t.Fatalf("second request last message = %#v, want wake signal", last)
+	}
+}
+
 func TestValidateStagedWriteRequiresStringContent(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -140,6 +469,23 @@ func TestValidateStagedWriteRequiresStringContent(t *testing.T) {
 			}
 		})
 	}
+}
+
+type queueSignalTool struct {
+	queue func()
+}
+
+func (queueSignalTool) Name() string { return "queue_signal" }
+
+func (queueSignalTool) Description() string { return "queue a signal" }
+
+func (queueSignalTool) ParametersSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+
+func (t queueSignalTool) Execute(context.Context, map[string]any) (string, error) {
+	t.queue()
+	return "tool result", nil
 }
 
 func TestValidateStagedWriteAllowsEmptyContent(t *testing.T) {

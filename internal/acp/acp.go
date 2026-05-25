@@ -180,6 +180,18 @@ func (r *Runner) handleEvent(ev agent.Event) {
 	case agent.EventToolCallEnd:
 		method = "agent/tool_result"
 		params = map[string]any{"id": ev.ToolCallID, "name": ev.ToolName, "args": ev.Args, "success": !ev.IsError, "output": ev.Result, "metadata": ev.Metadata}
+	case agent.EventBackgroundProcessComplete:
+		method = "agent/background_process_complete"
+		if ev.BackgroundProcess != nil {
+			params = map[string]any{
+				"id":       ev.BackgroundProcess.ID,
+				"command":  ev.BackgroundProcess.Command,
+				"reason":   ev.BackgroundProcess.Reason,
+				"exitCode": ev.BackgroundProcess.ExitCode,
+				"success":  !ev.IsError,
+				"output":   ev.Result,
+			}
+		}
 	case agent.EventUsage:
 		method = "agent/usage"
 		params = r.agent.TokenUsage()

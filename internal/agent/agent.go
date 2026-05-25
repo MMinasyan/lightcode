@@ -5,15 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 	"github.com/MMinasyan/lightcode/internal/compact"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
@@ -88,7 +91,8 @@ type Agent struct {
 
 	fileTracker *tool.FileTracker
 
-	loopFlush chan chan struct{}
+	loopFlush  chan chan struct{}
+	signalWake chan struct{}
 
 	warningsMu      sync.Mutex
 	warningGroups   map[string][]PromptWarning
@@ -153,6 +157,7 @@ func New(c Config) (*Agent, error) {
 		currentRef:        defaultRef,
 		contextWindowSize: contextWindowSize,
 		loopFlush:         make(chan chan struct{}, 1),
+		signalWake:        make(chan struct{}, 1),
 		warningGroups:     make(map[string][]PromptWarning),
 	}
 
@@ -208,19 +213,59 @@ func New(c Config) (*Agent, error) {
 	registry.Register(tool.WrapWithPermission(tool.NewEditFileWithSnapshot(store, fileTracker, c.Cfg.Tools), checkFunc, askFunc))
 	registry.Register(tool.WrapWithPermission(tool.ExecutePending{}, checkFunc, askFunc))
 
-	procMgr := process.NewManager(c.Cfg.Tools.MaxBackgroundProcesses)
+	procMgr := process.NewManager(c.Cfg.Tools.MaxBackgroundProcesses, cmdoutput.Options{
+		HomeDir:      c.Home,
+		SpillPrefix:  "proc_output_",
+		MaxBytes:     c.Cfg.Tools.MaxOutputBytes,
+		MaxLineChars: c.Cfg.Tools.ReadLineMaxChars,
+	})
 	a.procMgr = procMgr
 
-	procMgr.SetExitHandler(func(id, command string, exitCode int) {
+	procMgr.SetSessionProvider(func() string {
+		if a.store == nil {
+			return ""
+		}
+		return a.store.SessionID()
+	})
+	procMgr.SetExitHandler(func(event process.ExitEvent) {
 		if a.lp != nil {
-			a.lp.AppendSignal(fmt.Sprintf("<system-signal>Background process %s (\"%s\") exited with code %d.</system-signal>", id, command, exitCode))
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			if event.SessionID != "" && a.store.SessionID() != event.SessionID {
+				return
+			}
+			output := ""
+			if event.FormatOutput != nil {
+				output = event.FormatOutput()
+			}
+			if output == "" {
+				output = "(No output)"
+			}
+			reason := event.Reason
+			if reason == "" {
+				reason = process.ExitReasonCompleted
+			}
+			payload := backgroundTerminalPayload(event, output)
+			a.lp.AddPendingSignal(loop.PendingSignal{
+				Payload: payload,
+				Wake:    true,
+				Persist: true,
+				BackgroundProcess: &loop.BackgroundProcessDisplay{
+					ID:       event.ID,
+					Command:  event.Command,
+					Reason:   string(reason),
+					ExitCode: event.ExitCode,
+					Output:   output,
+				},
+			})
+			a.nudgeSignalScheduler()
 		}
 	})
 
 	// Re-create RunCommand with the process manager.
 	rc := tool.NewRunCommand(c.Cfg.Tools, c.Home, procMgr)
 	registry.Register(tool.WrapWithPermission(rc, checkFunc, askFunc))
-	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(procMgr, c.Cfg.Tools, c.Home), checkFunc, askFunc))
+	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(procMgr), checkFunc, askFunc))
 	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkFunc, askFunc))
 
 	embedder, err := memory.NewEmbedder()
@@ -303,6 +348,7 @@ func (a *Agent) SetEventHandler(fn func(Event)) {
 // agent's lifetime.
 func (a *Agent) Init(ctx context.Context) {
 	go a.drainLoopEvents(ctx)
+	go a.runSignalScheduler(ctx)
 	if a.memoryStore != nil {
 		_ = a.memoryStore.Reconcile()
 	}
@@ -325,7 +371,7 @@ func (a *Agent) Init(ctx context.Context) {
 		})
 		a.lspManager.SetSignalHandler(func(content string) {
 			if a.lp != nil {
-				a.lp.AppendSignal(content)
+				a.lp.AddPendingSignal(loop.PendingSignal{Payload: content})
 			}
 		})
 		go a.lspManager.Detect(ctx)
@@ -344,6 +390,40 @@ func (a *Agent) Init(ctx context.Context) {
 func (a *Agent) emitEvent(ev Event) {
 	if a.onEvent != nil {
 		a.onEvent(ev)
+	}
+}
+
+func (a *Agent) nudgeSignalScheduler() {
+	select {
+	case a.signalWake <- struct{}{}:
+	default:
+	}
+}
+
+func (a *Agent) runSignalScheduler(ctx context.Context) {
+	for {
+		select {
+		case <-a.signalWake:
+			a.tryStartSignalTurn(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (a *Agent) tryStartSignalTurn(ctx context.Context) {
+	if a.lp == nil || !a.lp.HasPendingWakeSignal() {
+		return
+	}
+	a.mu.Lock()
+	busy := a.busy
+	active := a.store != nil && a.store.Active()
+	a.mu.Unlock()
+	if busy || !active {
+		return
+	}
+	if _, err := a.startTurn(ctx, nil); err != nil && !strings.Contains(err.Error(), "turn is already in progress") {
+		a.emitEvent(Event{Kind: EventError, Error: err.Error()})
 	}
 }
 
@@ -439,6 +519,27 @@ func promptWarningsEqual(a, b []PromptWarning) bool {
 	return true
 }
 
+func backgroundTerminalPayload(event process.ExitEvent, output string) string {
+	reason := event.Reason
+	if reason == "" {
+		reason = process.ExitReasonCompleted
+	}
+	return fmt.Sprintf("Background process %s (%q) finished: %s, exit code %d.\nOutput:\n%s", event.ID, event.Command, reason, event.ExitCode, output)
+}
+
+func agentBackgroundProcessDisplay(bg *loop.BackgroundProcessDisplay) *BackgroundProcessDisplay {
+	if bg == nil {
+		return nil
+	}
+	return &BackgroundProcessDisplay{
+		ID:       bg.ID,
+		Command:  bg.Command,
+		Reason:   bg.Reason,
+		ExitCode: bg.ExitCode,
+		Output:   bg.Output,
+	}
+}
+
 func (a *Agent) drainLoopEvents(ctx context.Context) {
 	for {
 		select {
@@ -492,6 +593,14 @@ func (a *Agent) dispatchLoopEvent(ev loop.Event) {
 			IsError:    ev.IsError,
 			Result:     ev.Result,
 			Metadata:   ev.Metadata,
+		})
+	case loop.BackgroundProcessComplete:
+		a.emitEvent(Event{
+			Kind:              EventBackgroundProcessComplete,
+			Result:            ev.Result,
+			IsError:           ev.IsError,
+			Turn:              ev.Turn,
+			BackgroundProcess: agentBackgroundProcessDisplay(ev.BackgroundProcess),
 		})
 	case loop.PermissionRequest:
 		canAllowAll, _ := ev.Metadata["can_allow_all"].(bool)
@@ -756,7 +865,7 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 		}
 	}
 
-	a.lp.LoadHistoryWithSummary(result.Summary, result.SummarizerRef, nil)
+	a.lp.LoadHistoryWithSummaryPreservePending(result.Summary, result.SummarizerRef, nil)
 	if a.fileTracker != nil {
 		a.fileTracker.Reset()
 	}
@@ -811,6 +920,9 @@ func (a *Agent) CompactNow(ctx context.Context) error {
 		a.turnCtx = nil
 		a.mu.Unlock()
 		cancel()
+		if a.lp != nil && a.lp.HasPendingWakeSignal() {
+			a.nudgeSignalScheduler()
+		}
 	}()
 
 	return a.runCompaction(compactCtx, false)
@@ -1036,18 +1148,30 @@ func (a *Agent) SendQueuedMessages(ctx context.Context, contents []string) (Queu
 	if len(contents) == 0 {
 		return result, fmt.Errorf("no queued messages")
 	}
-	for _, content := range contents[:len(contents)-1] {
-		turn, err := a.AppendUserMessage(content)
-		if err != nil {
-			return result, err
-		}
-		result.Appended = append(result.Appended, QueuedMessageTurn{Content: content, Turn: turn})
+	a.mu.Lock()
+	if a.busy {
+		a.mu.Unlock()
+		return result, fmt.Errorf("a turn is already in progress")
 	}
-	last := contents[len(contents)-1]
-	turn, err := a.SendPrompt(ctx, last)
-	if err != nil {
+	if err := a.ensureSession(); err != nil {
+		a.mu.Unlock()
 		return result, err
 	}
+	for _, content := range contents[:len(contents)-1] {
+		turn := a.store.BeginTurn()
+		a.lp.AppendUserMessage(turn, content)
+		_ = a.store.MarkTurnComplete(turn)
+		result.Appended = append(result.Appended, QueuedMessageTurn{Content: content, Turn: turn})
+	}
+	a.busy = true
+	a.seenSessions = nil
+	turnCtx, cancel := context.WithCancel(ctx)
+	a.turnCancel = cancel
+	a.turnCtx = turnCtx
+	a.mu.Unlock()
+
+	last := contents[len(contents)-1]
+	turn := a.launchTurn(ctx, turnCtx, cancel, []string{last})
 	result.Started = QueuedMessageTurn{Content: last, Turn: turn}
 	return result, nil
 }
@@ -1070,6 +1194,10 @@ func (a *Agent) AppendUserMessage(content string) (int, error) {
 }
 
 func (a *Agent) sendMessages(ctx context.Context, contents []string) (int, error) {
+	return a.startTurn(ctx, contents)
+}
+
+func (a *Agent) startTurn(ctx context.Context, contents []string) (int, error) {
 	a.mu.Lock()
 	if a.busy {
 		a.mu.Unlock()
@@ -1086,6 +1214,10 @@ func (a *Agent) sendMessages(ctx context.Context, contents []string) (int, error
 	a.turnCtx = turnCtx
 	a.mu.Unlock()
 
+	return a.launchTurn(ctx, turnCtx, cancel, contents), nil
+}
+
+func (a *Agent) launchTurn(ctx context.Context, turnCtx context.Context, cancel context.CancelFunc, contents []string) int {
 	turn := a.store.BeginTurn()
 
 	a.emitEvent(Event{Kind: EventTurnStart, Turn: turn})
@@ -1102,6 +1234,9 @@ func (a *Agent) sendMessages(ctx context.Context, contents []string) (int, error
 			a.turnCtx = nil
 			a.mu.Unlock()
 			cancel()
+			if a.lp != nil && a.lp.HasPendingWakeSignal() {
+				a.nudgeSignalScheduler()
+			}
 		}()
 
 		res := a.assembler.Assemble()
@@ -1134,7 +1269,7 @@ func (a *Agent) sendMessages(ctx context.Context, contents []string) (int, error
 		a.emitEvent(Event{Kind: EventTurnEnd, Turn: turn, Cancelled: turnCtx.Err() != nil})
 	}()
 
-	return turn, nil
+	return turn
 }
 
 // Cancel aborts the current turn.
@@ -1211,7 +1346,7 @@ func (a *Agent) SwitchModel(refStr string) error {
 	a.lp.SetClient(client)
 	a.currentRef = ref
 	a.contextWindowSize = model.ContextWindow
-	a.lp.AppendSignal(fmt.Sprintf("<system-signal>Model switched to %s</system-signal>", ref.String()))
+	a.lp.AddPendingSignal(loop.PendingSignal{Payload: fmt.Sprintf("Model switched to %s", ref.String())})
 	if a.store.Active() {
 		if err := a.store.SetModel(ref.Provider, ref.Model); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)
@@ -1821,7 +1956,16 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 				c := m.TextContent()
 				if strings.HasPrefix(c, "<system-signal>") && strings.HasSuffix(c, "</system-signal>") {
 					signal := c[len("<system-signal>") : len(c)-len("</system-signal>")]
-					if strings.Contains(signal, "interrupted") {
+					if bg, ok := parseBackgroundTerminalSignal(html.UnescapeString(signal)); ok {
+						out = append(out, DisplayMessage{
+							Type:              "background_process",
+							ID:                bg.ID,
+							Done:              true,
+							Success:           backgroundProcessSuccess(bg),
+							Result:            bg.Output,
+							BackgroundProcess: bg,
+						})
+					} else if strings.Contains(signal, "interrupted") {
 						out = append(out, DisplayMessage{Type: "system", Content: "interrupted"})
 					} else if strings.HasPrefix(signal, "Model switched") {
 						out = append(out, DisplayMessage{Type: "system", Content: signal})
@@ -1862,6 +2006,81 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 		}
 	}
 	return out
+}
+
+func parseBackgroundTerminalSignal(payload string) (*BackgroundProcessDisplay, bool) {
+	const prefix = "Background process "
+	if !strings.HasPrefix(payload, prefix) {
+		return nil, false
+	}
+	rest := strings.TrimPrefix(payload, prefix)
+	idEnd := strings.Index(rest, " (")
+	if idEnd <= 0 {
+		return nil, false
+	}
+	id := rest[:idEnd]
+	rest = rest[idEnd+2:]
+	if !strings.HasPrefix(rest, "\"") {
+		return nil, false
+	}
+	quoteEnd := endQuotedString(rest)
+	if quoteEnd < 0 {
+		return nil, false
+	}
+	command, err := strconv.Unquote(rest[:quoteEnd+1])
+	if err != nil {
+		return nil, false
+	}
+	rest = rest[quoteEnd+1:]
+	const afterCommand = ") finished: "
+	if !strings.HasPrefix(rest, afterCommand) {
+		return nil, false
+	}
+	rest = strings.TrimPrefix(rest, afterCommand)
+	const exitMarker = ", exit code "
+	reasonEnd := strings.Index(rest, exitMarker)
+	if reasonEnd <= 0 {
+		return nil, false
+	}
+	reason := rest[:reasonEnd]
+	rest = rest[reasonEnd+len(exitMarker):]
+	const outputMarker = ".\nOutput:\n"
+	codeEnd := strings.Index(rest, outputMarker)
+	if codeEnd <= 0 {
+		return nil, false
+	}
+	exitCode, err := strconv.Atoi(rest[:codeEnd])
+	if err != nil {
+		return nil, false
+	}
+	output := rest[codeEnd+len(outputMarker):]
+	return &BackgroundProcessDisplay{
+		ID:       id,
+		Command:  command,
+		Reason:   reason,
+		ExitCode: exitCode,
+		Output:   output,
+	}, true
+}
+
+func endQuotedString(s string) int {
+	for i := 1; i < len(s); i++ {
+		if s[i] != '"' {
+			continue
+		}
+		backslashes := 0
+		for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+			backslashes++
+		}
+		if backslashes%2 == 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+func backgroundProcessSuccess(bg *BackgroundProcessDisplay) bool {
+	return bg != nil && bg.Reason == string(process.ExitReasonCompleted) && bg.ExitCode == 0
 }
 
 func displayMetadataForToolCall(name, args, result string) map[string]any {

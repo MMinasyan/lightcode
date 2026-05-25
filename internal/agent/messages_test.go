@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/loop"
 	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/process"
 )
 
 func TestSessionMessagesRendersCanonicalMessagesWithoutExtra(t *testing.T) {
@@ -59,6 +61,47 @@ func TestSessionMessagesRendersCanonicalMessagesWithoutExtra(t *testing.T) {
 		if item.Content == "hidden thought" || item.Result == "hidden thought" {
 			t.Fatalf("hidden metadata leaked into display: %#v", display)
 		}
+	}
+}
+
+func TestSessionMessagesRendersBackgroundProcessSystemSignal(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession returned error: %v", err)
+	}
+	turn := a.store.BeginTurn()
+	output := "final <output> & marker"
+	payload := backgroundTerminalPayload(process.ExitEvent{
+		ID:       "bg-abc",
+		Command:  `printf "a < b"`,
+		Reason:   process.ExitReasonError,
+		ExitCode: 7,
+	}, output)
+	msg := message.NewText(message.RoleUser, loop.SystemSignal(payload))
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal message: %v", err)
+	}
+	if err := a.store.AppendMessage(turn, data); err != nil {
+		t.Fatalf("AppendMessage returned error: %v", err)
+	}
+	if err := a.store.MarkTurnComplete(turn); err != nil {
+		t.Fatalf("MarkTurnComplete returned error: %v", err)
+	}
+
+	display := a.SessionMessages()
+	if len(display) != 1 {
+		t.Fatalf("display messages len = %d, want 1: %#v", len(display), display)
+	}
+	got := display[0]
+	if got.Type != "background_process" || got.ID != "bg-abc" || !got.Done || got.Success {
+		t.Fatalf("background display basics = %#v", got)
+	}
+	if got.Result != output || got.BackgroundProcess == nil {
+		t.Fatalf("background display output/payload = %#v", got)
+	}
+	if got.BackgroundProcess.Command != `printf "a < b"` || got.BackgroundProcess.Reason != "error" || got.BackgroundProcess.ExitCode != 7 || got.BackgroundProcess.Output != output {
+		t.Fatalf("background display payload = %#v", got.BackgroundProcess)
 	}
 }
 

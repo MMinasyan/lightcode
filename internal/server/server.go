@@ -186,6 +186,18 @@ func (s *Server) handleEvent(ev agent.Event) {
 	case agent.EventToolCallEnd:
 		name = "tool_result"
 		data = map[string]any{"id": ev.ToolCallID, "name": ev.ToolName, "args": ev.Args, "success": !ev.IsError, "output": ev.Result, "metadata": ev.Metadata}
+	case agent.EventBackgroundProcessComplete:
+		name = "background_process_complete"
+		if ev.BackgroundProcess != nil {
+			data = map[string]any{
+				"id":       ev.BackgroundProcess.ID,
+				"command":  ev.BackgroundProcess.Command,
+				"reason":   ev.BackgroundProcess.Reason,
+				"exitCode": ev.BackgroundProcess.ExitCode,
+				"success":  !ev.IsError,
+				"output":   ev.Result,
+			}
+		}
 	case agent.EventUsage:
 		name = "usage"
 		data = s.agent.TokenUsage()
