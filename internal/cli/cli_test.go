@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -99,18 +100,21 @@ func TestToolDisplayEntryEndsWithBlankLineWithResult(t *testing.T) {
 
 func TestFlushQueueKeepsQueuedMessagesWhenBackendBusy(t *testing.T) {
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseBackend := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-release
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	defer server.Close()
-	defer close(release)
+	defer releaseBackend()
 
 	a, _ := newTestAgentWithBaseURL(t, server.URL+"/v1")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if _, err := a.SendPrompt(ctx, "hold backend busy"); err != nil {
+	agentCtx := startTestAgent(t, a)
+	if _, err := a.SendPrompt(agentCtx, "hold backend busy"); err != nil {
 		t.Fatalf("SendPrompt returned error: %v", err)
 	}
 	waitUntilAgentBusy(t, a)
@@ -131,12 +135,15 @@ func TestFlushQueueKeepsQueuedMessagesWhenBackendBusy(t *testing.T) {
 	if !equalStringSlices(got, []string{"queued while busy"}) {
 		t.Fatalf("queue after busy backend response = %q, want retained queued text", got)
 	}
+	releaseBackend()
+	waitUntilAgentIdle(t, a)
 }
 
 func TestFlushQueueRemovesQueuedMessagesAfterBackendAccepts(t *testing.T) {
 	a, _ := newTestAgent(t)
+	agentCtx := startTestAgent(t, a)
 	c := New(a)
-	c.ctx = context.Background()
+	c.ctx = agentCtx
 	c.out = io.Discard
 	c.msgQueue = []string{"first queued", "second queued"}
 
@@ -148,6 +155,7 @@ func TestFlushQueueRemovesQueuedMessagesAfterBackendAccepts(t *testing.T) {
 	c.mu.Lock()
 	c.stopAnimationLocked()
 	c.mu.Unlock()
+	waitUntilAgentIdle(t, a)
 }
 
 func newTestAgent(t *testing.T) (*agent.Agent, string) {
@@ -198,6 +206,14 @@ func newTestAgentWithBaseURL(t *testing.T, baseURL string) (*agent.Agent, string
 	return a, projectName
 }
 
+func startTestAgent(t *testing.T, a *agent.Agent) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	a.Init(ctx)
+	t.Cleanup(cancel)
+	return ctx
+}
+
 func waitUntilAgentBusy(t *testing.T, a *agent.Agent) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -208,6 +224,18 @@ func waitUntilAgentBusy(t *testing.T, a *agent.Agent) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("agent did not become busy")
+}
+
+func waitUntilAgentIdle(t *testing.T, a *agent.Agent) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if !a.Busy() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("agent did not become idle")
 }
 
 func waitUntilCLIQueueLen(t *testing.T, c *CLI, want int) {
