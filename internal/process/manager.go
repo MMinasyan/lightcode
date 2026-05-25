@@ -52,13 +52,13 @@ type Manager struct {
 }
 
 type ExitEvent struct {
-	ID         string
-	Command    string
-	SessionID  string
-	ExitCode   int
-	Reason     ExitReason
-	TimeoutSec int
-	Output     string
+	ID           string
+	Command      string
+	SessionID    string
+	ExitCode     int
+	Reason       ExitReason
+	TimeoutSec   int
+	FormatOutput func() string
 }
 
 // NewManager creates a new process Manager. maxProcs limits concurrent
@@ -159,15 +159,14 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 		cs.mu.Unlock()
 
 		if handler != nil {
-			output := capture.Format()
 			handler(ExitEvent{
-				ID:         id,
-				Command:    command,
-				SessionID:  sessionID,
-				ExitCode:   code,
-				Reason:     reason,
-				TimeoutSec: timeoutSec,
-				Output:     output,
+				ID:           id,
+				Command:      command,
+				SessionID:    sessionID,
+				ExitCode:     code,
+				Reason:       reason,
+				TimeoutSec:   timeoutSec,
+				FormatOutput: capture.Format,
 			})
 		}
 

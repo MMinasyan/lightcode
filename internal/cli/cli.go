@@ -618,6 +618,39 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			c.startAnimationLocked("Thinking")
 		}
 
+	case agent.EventBackgroundProcessComplete:
+		if c.streamDisplayActive && c.streamNeedsNL {
+			c.writeRaw("\r\n")
+		}
+		if c.streamStarted {
+			c.finalizeStreamBufLocked()
+			c.streamStarted = false
+		} else {
+			c.stopAnimationLocked()
+			c.writeRaw("\r\x1b[2K")
+		}
+		success := !ev.IsError
+		id := ""
+		if ev.BackgroundProcess != nil {
+			id = ev.BackgroundProcess.ID
+		}
+		c.messages = append(c.messages, displayEntry{
+			typ:     "background_process",
+			id:      id,
+			done:    true,
+			success: success,
+			result:  ev.Result,
+			bg:      ev.BackgroundProcess,
+		})
+		c.writeRaw(renderBackgroundProcessCall(ev.BackgroundProcess, success))
+		if result := renderToolResult("background_process", "", ev.Result, success, c.toolExpanded, c.width, nil); result != "" {
+			c.writeRaw(result)
+			c.writeRaw(nl)
+		}
+		if c.busy {
+			c.startAnimationLocked("Thinking")
+		}
+
 	case agent.EventTurnEnd:
 		c.stopAnimationLocked()
 		c.erasePermissionBlockLocked()
@@ -867,6 +900,15 @@ func (c *CLI) printDisplayEntryLocked(e displayEntry) {
 		c.printLineLocked(renderToolCall(e.name, e.args, e.metadata))
 		if e.done {
 			result := renderToolResult(e.name, e.args, e.result, e.success, c.toolExpanded, c.width, e.metadata)
+			if result != "" {
+				c.printLineLocked(result)
+			}
+			c.writeRaw(nl)
+		}
+	case "background_process":
+		c.printLineLocked(renderBackgroundProcessCall(e.bg, e.success))
+		if e.done {
+			result := renderToolResult("background_process", "", e.result, e.success, c.toolExpanded, c.width, nil)
 			if result != "" {
 				c.printLineLocked(result)
 			}

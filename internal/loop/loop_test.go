@@ -154,6 +154,59 @@ func TestPendingSignalWrapsRawPayloadWhenDrained(t *testing.T) {
 	}
 }
 
+func TestPendingBackgroundProcessSignalEmitsDisplayWhenDrained(t *testing.T) {
+	lp := New(nil, nil, "system")
+	events := make(chan Event, 4)
+	lp.SetEvents(events)
+	lp.AddPendingSignal(PendingSignal{
+		Payload: "Background process bg-1 finished",
+		BackgroundProcess: &BackgroundProcessDisplay{
+			ID:       "bg-1",
+			Command:  "printf ok",
+			Reason:   "completed",
+			ExitCode: 0,
+			Output:   "ok",
+		},
+	})
+	lp.DrainPendingSignalsForModel(7)
+
+	msgs := lp.Messages()
+	if len(msgs) != 2 {
+		t.Fatalf("messages len = %d, want system plus signal", len(msgs))
+	}
+	if got := msgs[1].TextContent(); got != `<system-signal>Background process bg-1 finished</system-signal>` {
+		t.Fatalf("signal message = %q", got)
+	}
+	select {
+	case ev := <-events:
+		if ev.Kind != BackgroundProcessComplete {
+			t.Fatalf("event kind = %v, want BackgroundProcessComplete", ev.Kind)
+		}
+		if ev.Turn != 7 || ev.IsError || ev.Result != "ok" {
+			t.Fatalf("event = %#v, want turn 7 success output ok", ev)
+		}
+		if ev.BackgroundProcess == nil || ev.BackgroundProcess.ID != "bg-1" || ev.BackgroundProcess.Command != "printf ok" || ev.BackgroundProcess.Reason != "completed" || ev.BackgroundProcess.ExitCode != 0 || ev.BackgroundProcess.Output != "ok" {
+			t.Fatalf("background process event = %#v", ev.BackgroundProcess)
+		}
+	default:
+		t.Fatal("expected background process display event")
+	}
+}
+
+func TestPlainPendingSignalDoesNotEmitBackgroundDisplay(t *testing.T) {
+	lp := New(nil, nil, "system")
+	events := make(chan Event, 1)
+	lp.SetEvents(events)
+	lp.AddPendingSignal(PendingSignal{Payload: "plain signal"})
+	lp.DrainPendingSignalsForModel(0)
+
+	select {
+	case ev := <-events:
+		t.Fatalf("unexpected event for plain signal: %#v", ev)
+	default:
+	}
+}
+
 func TestResetHistoryClearsPendingSignals(t *testing.T) {
 	lp := New(nil, nil, "system")
 	lp.AddPendingSignal(PendingSignal{Payload: "old session signal", Wake: true})
@@ -229,9 +282,21 @@ func TestPendingSignalDuringToolExecutionDrainsAfterToolResult(t *testing.T) {
 	registry := tool.NewRegistry()
 	var lp *Loop
 	registry.Register(queueSignalTool{queue: func() {
-		lp.AddPendingSignal(PendingSignal{Payload: "async <event>", Wake: true})
+		lp.AddPendingSignal(PendingSignal{
+			Payload: "async <event>",
+			Wake:    true,
+			BackgroundProcess: &BackgroundProcessDisplay{
+				ID:       "bg-1",
+				Command:  "printf async",
+				Reason:   "completed",
+				ExitCode: 0,
+				Output:   "async",
+			},
+		})
 	}})
 	lp = New(client, registry, "system")
+	events := make(chan Event, 16)
+	lp.SetEvents(events)
 
 	got, err := lp.Run(context.Background(), "start")
 	if err != nil {
@@ -282,6 +347,29 @@ func TestPendingSignalDuringToolExecutionDrainsAfterToolResult(t *testing.T) {
 	}
 	if signalMsg["role"] != "user" || signalMsg["content"] != wantSignal {
 		t.Fatalf("wire signal message = %#v, want pending signal after tool result", signalMsg)
+	}
+
+	var (
+		toolEndIndex = -1
+		bgIndex      = -1
+		eventIndex   int
+	)
+	for {
+		select {
+		case ev := <-events:
+			if ev.Kind == ToolCallEnd {
+				toolEndIndex = eventIndex
+			}
+			if ev.Kind == BackgroundProcessComplete {
+				bgIndex = eventIndex
+			}
+			eventIndex++
+		default:
+			if toolEndIndex < 0 || bgIndex < 0 || bgIndex <= toolEndIndex {
+				t.Fatalf("event order toolEnd=%d background=%d", toolEndIndex, bgIndex)
+			}
+			return
+		}
 	}
 }
 

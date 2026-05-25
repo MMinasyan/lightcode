@@ -171,6 +171,30 @@
       messages = messages.map(m => m.type==='tool' && m.id===data.id ? {...m, done:true, success:data.success, result:data.output, name:data.name || m.name, args:data.args || m.args, metadata:data.metadata || m.metadata} : m);
     });
 
+    EventsOn('background_process_complete', (data) => {
+      if (!data) return;
+      if (streamingIdx !== -1 && messages[streamingIdx]) {
+        messages[streamingIdx] = { ...messages[streamingIdx], partial:false };
+      }
+      streamingIdx = -1;
+      const backgroundProcess = {
+        id: data.id || '',
+        command: data.command || '',
+        reason: data.reason || '',
+        exitCode: data.exitCode || 0,
+        output: data.output || '',
+      };
+      messages = [...messages, {
+        _id: mid(),
+        type: 'background_process',
+        id: backgroundProcess.id,
+        done: true,
+        success: data.success !== false,
+        result: backgroundProcess.output,
+        backgroundProcess,
+      }];
+    });
+
     EventsOn('turn_start', (data) => {
       busy = true;
       streamingIdx = -1;

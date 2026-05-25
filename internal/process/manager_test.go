@@ -12,6 +12,19 @@ import (
 	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 )
 
+type observedExit struct {
+	Event  ExitEvent
+	Output string
+}
+
+func observeExit(event ExitEvent) observedExit {
+	output := ""
+	if event.FormatOutput != nil {
+		output = event.FormatOutput()
+	}
+	return observedExit{Event: event, Output: output}
+}
+
 func TestManagerListRemoveAndIDs(t *testing.T) {
 	m := NewManager(2, cmdoutput.Options{})
 	if got := m.List(); got != "No background processes." {
@@ -36,8 +49,8 @@ func TestManagerListRemoveAndIDs(t *testing.T) {
 
 func TestManagerStartReadExitHandlerAndLimit(t *testing.T) {
 	m := NewManager(1, cmdoutput.Options{})
-	exitCh := make(chan ExitEvent, 1)
-	m.SetExitHandler(func(event ExitEvent) { exitCh <- event })
+	exitCh := make(chan observedExit, 1)
+	m.SetExitHandler(func(event ExitEvent) { exitCh <- observeExit(event) })
 	id, err := m.Start("printf hello; sleep 1", 0)
 	if err != nil {
 		t.Fatalf("Start printf: %v", err)
@@ -57,7 +70,8 @@ func TestManagerStartReadExitHandlerAndLimit(t *testing.T) {
 		t.Fatalf("Kill(%s): %v", id, err)
 	}
 	select {
-	case event := <-exitCh:
+	case observed := <-exitCh:
+		event := observed.Event
 		if event.ExitCode == 0 {
 			t.Fatalf("exit code = %d after kill, want non-zero", event.ExitCode)
 		}
@@ -67,8 +81,8 @@ func TestManagerStartReadExitHandlerAndLimit(t *testing.T) {
 		if event.ID != id || event.Command != "printf hello; sleep 1" {
 			t.Fatalf("exit event = %+v, want id and command", event)
 		}
-		if !strings.Contains(event.Output, "hello") {
-			t.Fatalf("exit output = %q, want final output", event.Output)
+		if !strings.Contains(observed.Output, "hello") {
+			t.Fatalf("exit output = %q, want final output", observed.Output)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("exit handler not called")
@@ -88,16 +102,17 @@ func TestManagerStartReadExitHandlerAndLimit(t *testing.T) {
 
 func TestManagerExitHandlerReceivesFinalOutput(t *testing.T) {
 	m := NewManager(1, cmdoutput.Options{})
-	exitCh := make(chan ExitEvent, 1)
-	m.SetExitHandler(func(event ExitEvent) { exitCh <- event })
+	exitCh := make(chan observedExit, 1)
+	m.SetExitHandler(func(event ExitEvent) { exitCh <- observeExit(event) })
 	id, err := m.Start("printf final", 0)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	select {
-	case event := <-exitCh:
-		if event.ID != id || event.Command != "printf final" || event.ExitCode != 0 || event.Reason != ExitReasonCompleted || event.Output != "final" {
-			t.Fatalf("exit event = %+v, want id, command, completed code 0, output final", event)
+	case observed := <-exitCh:
+		event := observed.Event
+		if event.ID != id || event.Command != "printf final" || event.ExitCode != 0 || event.Reason != ExitReasonCompleted || observed.Output != "final" {
+			t.Fatalf("exit event = %+v output = %q, want id, command, completed code 0, output final", event, observed.Output)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("exit handler not called")
@@ -107,15 +122,16 @@ func TestManagerExitHandlerReceivesFinalOutput(t *testing.T) {
 func TestManagerExitEventReasonsForErrorAndTimeout(t *testing.T) {
 	t.Run("error", func(t *testing.T) {
 		m := NewManager(1, cmdoutput.Options{})
-		exitCh := make(chan ExitEvent, 1)
-		m.SetExitHandler(func(event ExitEvent) { exitCh <- event })
+		exitCh := make(chan observedExit, 1)
+		m.SetExitHandler(func(event ExitEvent) { exitCh <- observeExit(event) })
 		if _, err := m.Start("printf fail; exit 7", 0); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
 		select {
-		case event := <-exitCh:
-			if event.Reason != ExitReasonError || event.ExitCode != 7 || event.Output != "fail" {
-				t.Fatalf("exit event = %+v, want error code 7 with output", event)
+		case observed := <-exitCh:
+			event := observed.Event
+			if event.Reason != ExitReasonError || event.ExitCode != 7 || observed.Output != "fail" {
+				t.Fatalf("exit event = %+v output = %q, want error code 7 with output", event, observed.Output)
 			}
 		case <-time.After(time.Second):
 			t.Fatal("exit handler not called")
@@ -124,21 +140,22 @@ func TestManagerExitEventReasonsForErrorAndTimeout(t *testing.T) {
 
 	t.Run("timeout", func(t *testing.T) {
 		m := NewManager(1, cmdoutput.Options{})
-		exitCh := make(chan ExitEvent, 1)
-		m.SetExitHandler(func(event ExitEvent) { exitCh <- event })
+		exitCh := make(chan observedExit, 1)
+		m.SetExitHandler(func(event ExitEvent) { exitCh <- observeExit(event) })
 		if _, err := m.Start("printf start; sleep 5", 1); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
 		select {
-		case event := <-exitCh:
+		case observed := <-exitCh:
+			event := observed.Event
 			if event.Reason != ExitReasonTimeout || event.TimeoutSec != 1 {
 				t.Fatalf("exit event = %+v, want timeout reason and timeoutSec", event)
 			}
 			if event.ExitCode == 0 {
 				t.Fatalf("timeout exit code = %d, want non-zero", event.ExitCode)
 			}
-			if !strings.Contains(event.Output, "start") {
-				t.Fatalf("timeout output = %q, want captured output", event.Output)
+			if !strings.Contains(observed.Output, "start") {
+				t.Fatalf("timeout output = %q, want captured output", observed.Output)
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatal("exit handler not called")
@@ -207,8 +224,8 @@ func TestManagerLargeBackgroundOutputSpillsAndReadReusesPath(t *testing.T) {
 
 func TestManagerReadAfterExitReturnsMissingProcess(t *testing.T) {
 	m := NewManager(1, cmdoutput.Options{})
-	exitCh := make(chan ExitEvent, 1)
-	m.SetExitHandler(func(event ExitEvent) { exitCh <- event })
+	exitCh := make(chan struct{}, 1)
+	m.SetExitHandler(func(event ExitEvent) { exitCh <- struct{}{} })
 	id, err := m.Start("printf done", 0)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -228,11 +245,11 @@ func TestManagerReadWhileExitHandlerPendingReturnsFinalOutput(t *testing.T) {
 	m := NewManager(1, cmdoutput.Options{})
 	handlerStarted := make(chan struct{})
 	releaseHandler := make(chan struct{})
-	handlerDone := make(chan ExitEvent, 1)
+	handlerDone := make(chan observedExit, 1)
 	m.SetExitHandler(func(event ExitEvent) {
 		close(handlerStarted)
 		<-releaseHandler
-		handlerDone <- event
+		handlerDone <- observeExit(event)
 	})
 
 	id, err := m.Start("printf final", 0)
@@ -255,9 +272,9 @@ func TestManagerReadWhileExitHandlerPendingReturnsFinalOutput(t *testing.T) {
 
 	close(releaseHandler)
 	select {
-	case event := <-handlerDone:
-		if event.ID != id || event.Output != "final" {
-			t.Fatalf("exit event = %+v, want id and final output", event)
+	case observed := <-handlerDone:
+		if observed.Event.ID != id || observed.Output != "final" {
+			t.Fatalf("exit event = %+v output = %q, want id and final output", observed.Event, observed.Output)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("exit handler did not complete")
@@ -284,6 +301,34 @@ func TestManagerWithoutExitHandlerDoesNotKeepUnreferencedSpill(t *testing.T) {
 	id, err := m.Start("printf 'abcdefghijklmnopqrstuvwxyz'", 0)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
+	}
+	waitForProcessRemoval(t, m, id)
+	assertNoProcOutputSpills(t, home)
+}
+
+func TestManagerDroppedExitHandlerDoesNotKeepUnreferencedSpill(t *testing.T) {
+	home := t.TempDir()
+	m := NewManager(1, cmdoutput.Options{
+		HomeDir:      home,
+		SpillPrefix:  "proc_output_",
+		MaxBytes:     8,
+		MaxLineChars: 80,
+	})
+	exitCh := make(chan ExitEvent, 1)
+	m.SetExitHandler(func(event ExitEvent) {
+		exitCh <- event
+	})
+	id, err := m.Start("printf 'abcdefghijklmnopqrstuvwxyz'", 0)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case event := <-exitCh:
+		if event.FormatOutput == nil {
+			t.Fatal("exit event FormatOutput = nil")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exit handler not called")
 	}
 	waitForProcessRemoval(t, m, id)
 	assertNoProcOutputSpills(t, home)

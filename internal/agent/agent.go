@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -227,18 +229,34 @@ func New(c Config) (*Agent, error) {
 	})
 	procMgr.SetExitHandler(func(event process.ExitEvent) {
 		if a.lp != nil {
+			a.mu.Lock()
+			defer a.mu.Unlock()
 			if event.SessionID != "" && a.store.SessionID() != event.SessionID {
 				return
 			}
-			output := event.Output
+			output := ""
+			if event.FormatOutput != nil {
+				output = event.FormatOutput()
+			}
 			if output == "" {
 				output = "(No output)"
+			}
+			reason := event.Reason
+			if reason == "" {
+				reason = process.ExitReasonCompleted
 			}
 			payload := backgroundTerminalPayload(event, output)
 			a.lp.AddPendingSignal(loop.PendingSignal{
 				Payload: payload,
 				Wake:    true,
 				Persist: true,
+				BackgroundProcess: &loop.BackgroundProcessDisplay{
+					ID:       event.ID,
+					Command:  event.Command,
+					Reason:   string(reason),
+					ExitCode: event.ExitCode,
+					Output:   output,
+				},
 			})
 			a.nudgeSignalScheduler()
 		}
@@ -509,6 +527,19 @@ func backgroundTerminalPayload(event process.ExitEvent, output string) string {
 	return fmt.Sprintf("Background process %s (%q) finished: %s, exit code %d.\nOutput:\n%s", event.ID, event.Command, reason, event.ExitCode, output)
 }
 
+func agentBackgroundProcessDisplay(bg *loop.BackgroundProcessDisplay) *BackgroundProcessDisplay {
+	if bg == nil {
+		return nil
+	}
+	return &BackgroundProcessDisplay{
+		ID:       bg.ID,
+		Command:  bg.Command,
+		Reason:   bg.Reason,
+		ExitCode: bg.ExitCode,
+		Output:   bg.Output,
+	}
+}
+
 func (a *Agent) drainLoopEvents(ctx context.Context) {
 	for {
 		select {
@@ -562,6 +593,14 @@ func (a *Agent) dispatchLoopEvent(ev loop.Event) {
 			IsError:    ev.IsError,
 			Result:     ev.Result,
 			Metadata:   ev.Metadata,
+		})
+	case loop.BackgroundProcessComplete:
+		a.emitEvent(Event{
+			Kind:              EventBackgroundProcessComplete,
+			Result:            ev.Result,
+			IsError:           ev.IsError,
+			Turn:              ev.Turn,
+			BackgroundProcess: agentBackgroundProcessDisplay(ev.BackgroundProcess),
 		})
 	case loop.PermissionRequest:
 		canAllowAll, _ := ev.Metadata["can_allow_all"].(bool)
@@ -1917,7 +1956,16 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 				c := m.TextContent()
 				if strings.HasPrefix(c, "<system-signal>") && strings.HasSuffix(c, "</system-signal>") {
 					signal := c[len("<system-signal>") : len(c)-len("</system-signal>")]
-					if strings.Contains(signal, "interrupted") {
+					if bg, ok := parseBackgroundTerminalSignal(html.UnescapeString(signal)); ok {
+						out = append(out, DisplayMessage{
+							Type:              "background_process",
+							ID:                bg.ID,
+							Done:              true,
+							Success:           backgroundProcessSuccess(bg),
+							Result:            bg.Output,
+							BackgroundProcess: bg,
+						})
+					} else if strings.Contains(signal, "interrupted") {
 						out = append(out, DisplayMessage{Type: "system", Content: "interrupted"})
 					} else if strings.HasPrefix(signal, "Model switched") {
 						out = append(out, DisplayMessage{Type: "system", Content: signal})
@@ -1958,6 +2006,81 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 		}
 	}
 	return out
+}
+
+func parseBackgroundTerminalSignal(payload string) (*BackgroundProcessDisplay, bool) {
+	const prefix = "Background process "
+	if !strings.HasPrefix(payload, prefix) {
+		return nil, false
+	}
+	rest := strings.TrimPrefix(payload, prefix)
+	idEnd := strings.Index(rest, " (")
+	if idEnd <= 0 {
+		return nil, false
+	}
+	id := rest[:idEnd]
+	rest = rest[idEnd+2:]
+	if !strings.HasPrefix(rest, "\"") {
+		return nil, false
+	}
+	quoteEnd := endQuotedString(rest)
+	if quoteEnd < 0 {
+		return nil, false
+	}
+	command, err := strconv.Unquote(rest[:quoteEnd+1])
+	if err != nil {
+		return nil, false
+	}
+	rest = rest[quoteEnd+1:]
+	const afterCommand = ") finished: "
+	if !strings.HasPrefix(rest, afterCommand) {
+		return nil, false
+	}
+	rest = strings.TrimPrefix(rest, afterCommand)
+	const exitMarker = ", exit code "
+	reasonEnd := strings.Index(rest, exitMarker)
+	if reasonEnd <= 0 {
+		return nil, false
+	}
+	reason := rest[:reasonEnd]
+	rest = rest[reasonEnd+len(exitMarker):]
+	const outputMarker = ".\nOutput:\n"
+	codeEnd := strings.Index(rest, outputMarker)
+	if codeEnd <= 0 {
+		return nil, false
+	}
+	exitCode, err := strconv.Atoi(rest[:codeEnd])
+	if err != nil {
+		return nil, false
+	}
+	output := rest[codeEnd+len(outputMarker):]
+	return &BackgroundProcessDisplay{
+		ID:       id,
+		Command:  command,
+		Reason:   reason,
+		ExitCode: exitCode,
+		Output:   output,
+	}, true
+}
+
+func endQuotedString(s string) int {
+	for i := 1; i < len(s); i++ {
+		if s[i] != '"' {
+			continue
+		}
+		backslashes := 0
+		for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+			backslashes++
+		}
+		if backslashes%2 == 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+func backgroundProcessSuccess(bg *BackgroundProcessDisplay) bool {
+	return bg != nil && bg.Reason == string(process.ExitReasonCompleted) && bg.ExitCode == 0
 }
 
 func displayMetadataForToolCall(name, args, result string) map[string]any {

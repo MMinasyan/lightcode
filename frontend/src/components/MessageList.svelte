@@ -32,6 +32,8 @@
       <Message role="assistant" content={msg.content} turn={msg.turn} partial={msg.partial} />
     {:else if msg.type === 'tool'}
       <ToolCall name={msg.name} args={msg.args} result={msg.result||''} success={msg.success!==false} done={msg.done} subagentSessionIds={msg.subagentSessionIds || []} metadata={msg.metadata} />
+    {:else if msg.type === 'background_process'}
+      <ToolCall name="background_process" args={JSON.stringify(msg.backgroundProcess || {})} result={msg.result||''} success={msg.success === false ? false : ((msg.backgroundProcess?.reason || '') === 'completed' && (msg.backgroundProcess?.exitCode || 0) === 0)} done={true} />
     {:else if msg.type === 'system'}
       <div class="system-msg">{msg.content}</div>
     {:else if msg.type === 'error'}

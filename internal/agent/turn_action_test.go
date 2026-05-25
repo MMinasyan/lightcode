@@ -224,7 +224,7 @@ func TestBackgroundExitSignalAfterSessionNewDoesNotDrainIntoNewSession(t *testin
 	a := newCatalogBackedTestAgent(t)
 	appendUserTurn(t, a, "old session prompt")
 
-	id, err := a.procMgr.Start("sleep 0.1; printf old-output", 0)
+	id, err := a.procMgr.Start("sleep 0.1; i=0; while [ $i -lt 3000 ]; do printf 'old-output-%04d\n' \"$i\"; i=$((i+1)); done", 0)
 	if err != nil {
 		t.Fatalf("Start background process: %v", err)
 	}
@@ -233,16 +233,8 @@ func TestBackgroundExitSignalAfterSessionNewDoesNotDrainIntoNewSession(t *testin
 	}
 	appendUserTurn(t, a, "new session prompt")
 
-	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
-		_, err = a.procMgr.Read(id)
-		if err != nil && strings.Contains(err.Error(), fmt.Sprintf("no process with ID %q", id)) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("no process with ID %q", id)) {
-		t.Fatalf("background process did not finalize; last read error = %v", err)
-	}
+	waitUntilProcessNotListed(t, a, id)
+	assertNoProcessOutputFiles(t, a)
 
 	if a.lp.HasPendingSignal() {
 		a.lp.DrainPendingSignalsForModel(a.store.CurrentTurn())
@@ -256,6 +248,40 @@ func TestBackgroundExitSignalAfterSessionNewDoesNotDrainIntoNewSession(t *testin
 	if got := userContents(a.SessionMessages()); !equalStrings(got, []string{"new session prompt"}) {
 		t.Fatalf("new session history = %q, want only new session prompt", got)
 	}
+}
+
+func waitUntilProcessNotListed(t *testing.T, a *Agent, id string) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if !strings.Contains(a.procMgr.List(), id) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("background process %s did not finalize", id)
+}
+
+func assertNoProcessOutputFiles(t *testing.T, a *Agent) {
+	t.Helper()
+	spillDir := filepath.Dir(a.projects.Root())
+	var leftovers []string
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		leftovers = nil
+		entries, err := os.ReadDir(spillDir)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("ReadDir(%q): %v", spillDir, err)
+		}
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), "proc_output_") {
+				leftovers = append(leftovers, entry.Name())
+			}
+		}
+		if len(leftovers) == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("stale-session background exit kept proc_output files: %v", leftovers)
 }
 
 func TestIdleBackgroundTerminalSignalStartsAgentTurn(t *testing.T) {
@@ -292,9 +318,14 @@ func TestIdleBackgroundTerminalSignalStartsAgentTurn(t *testing.T) {
 	}
 
 	var sawEnd bool
+	var bgEvent *Event
 	for deadline := time.After(2 * time.Second); !sawEnd; {
 		select {
 		case ev := <-events:
+			if ev.Kind == EventBackgroundProcessComplete {
+				copy := ev
+				bgEvent = &copy
+			}
 			if ev.Kind == EventTurnEnd {
 				sawEnd = true
 			}
@@ -316,6 +347,83 @@ func TestIdleBackgroundTerminalSignalStartsAgentTurn(t *testing.T) {
 	content, _ := last["content"].(string)
 	if last["role"] != "user" || !strings.Contains(content, "Background process") || !strings.Contains(content, "final-output") {
 		t.Fatalf("last model message = %#v, want background terminal signal with output", last)
+	}
+	if bgEvent == nil {
+		t.Fatal("background completion display event was not emitted")
+	}
+	if bgEvent.BackgroundProcess == nil {
+		t.Fatalf("background event missing payload: %#v", bgEvent)
+	}
+	if bgEvent.BackgroundProcess.Command != "printf final-output" || bgEvent.BackgroundProcess.Reason != "completed" || bgEvent.BackgroundProcess.ExitCode != 0 || bgEvent.Result != "final-output" || bgEvent.IsError {
+		t.Fatalf("background event = %#v", bgEvent)
+	}
+}
+
+func TestBackgroundTerminalDisplayEventsForErrorAndTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","content":"handled"},"finish_reason":"stop"}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	a := newCatalogBackedTestAgent(t)
+	events := make(chan Event, 32)
+	a.SetEventHandler(func(ev Event) {
+		events <- ev
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.Init(ctx)
+	appendUserTurn(t, a, "existing turn")
+	prov := a.catalog.Providers["test"]
+	prov.Transport.BaseURL = server.URL + "/v1"
+	a.lp.SetClient(provider.New(prov, prov.Models["test-model"], ""))
+
+	if _, err := a.procMgr.Start("printf failed; exit 7", 0); err != nil {
+		t.Fatalf("Start error background process: %v", err)
+	}
+	errEvent := waitBackgroundProcessDisplayEvent(t, events, "printf failed; exit 7")
+	if errEvent.BackgroundProcess.Reason != "error" || errEvent.BackgroundProcess.ExitCode != 7 || errEvent.Result != "failed" || !errEvent.IsError {
+		t.Fatalf("error background event = %#v", errEvent)
+	}
+	waitAgentEventKind(t, events, EventTurnEnd)
+
+	if _, err := a.procMgr.Start("printf start; sleep 5", 1); err != nil {
+		t.Fatalf("Start timeout background process: %v", err)
+	}
+	timeoutEvent := waitBackgroundProcessDisplayEvent(t, events, "printf start; sleep 5")
+	if timeoutEvent.BackgroundProcess.Reason != "timeout" || timeoutEvent.BackgroundProcess.ExitCode == 0 || !strings.Contains(timeoutEvent.Result, "start") || !timeoutEvent.IsError {
+		t.Fatalf("timeout background event = %#v", timeoutEvent)
+	}
+	waitAgentEventKind(t, events, EventTurnEnd)
+}
+
+func waitBackgroundProcessDisplayEvent(t *testing.T, events <-chan Event, command string) Event {
+	t.Helper()
+	for deadline := time.After(3 * time.Second); ; {
+		select {
+		case ev := <-events:
+			if ev.Kind == EventBackgroundProcessComplete && ev.BackgroundProcess != nil && ev.BackgroundProcess.Command == command {
+				return ev
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for background display event for %q", command)
+		}
+	}
+}
+
+func waitAgentEventKind(t *testing.T, events <-chan Event, kind EventKind) Event {
+	t.Helper()
+	for deadline := time.After(3 * time.Second); ; {
+		select {
+		case ev := <-events:
+			if ev.Kind == kind {
+				return ev
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for event kind %v", kind)
+		}
 	}
 }
 

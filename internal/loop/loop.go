@@ -81,6 +81,8 @@ const (
 	Usage
 	// Warning carries a non-fatal runtime warning in Result.
 	Warning
+	// BackgroundProcessComplete carries a background process completion display item.
+	BackgroundProcessComplete
 )
 
 // Event is a structured tool-call event for UIs that want to render tool
@@ -107,15 +109,28 @@ type Event struct {
 
 	// Turn is set when the event belongs to a persisted conversation turn.
 	Turn int
+
+	BackgroundProcess *BackgroundProcessDisplay
+}
+
+// BackgroundProcessDisplay is the user-visible sidecar for a background
+// terminal completion signal after it is added to model-visible history.
+type BackgroundProcessDisplay struct {
+	ID       string
+	Command  string
+	Reason   string
+	ExitCode int
+	Output   string
 }
 
 // PendingSignal is async model input owned by the loop. Wake signals ask the
 // agent scheduler to start a model turn when idle. Persist controls whether
 // the wrapped user-role signal is written to the current turn.
 type PendingSignal struct {
-	Payload string
-	Wake    bool
-	Persist bool
+	Payload           string
+	Wake              bool
+	Persist           bool
+	BackgroundProcess *BackgroundProcessDisplay
 }
 
 // Loop owns the conversation history for a single session and drives
@@ -336,6 +351,16 @@ func (l *Loop) DrainPendingSignalsForModel(turn int) {
 	l.signalMu.Unlock()
 	for _, signal := range signals {
 		l.appendSignal(signal, turn)
+		if signal.BackgroundProcess != nil {
+			bg := signal.BackgroundProcess
+			l.emit(Event{
+				Kind:              BackgroundProcessComplete,
+				Result:            bg.Output,
+				IsError:           !(bg.Reason == "completed" && bg.ExitCode == 0),
+				Turn:              turn,
+				BackgroundProcess: bg,
+			})
+		}
 	}
 }
 
