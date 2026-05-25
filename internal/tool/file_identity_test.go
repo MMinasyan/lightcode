@@ -344,7 +344,7 @@ func TestNewMissingWriteWithoutReadRecordStillCreatesFile(t *testing.T) {
 	}
 
 	assertFileContent(t, path, "created")
-	if _, ok := tracker.WasRead(path); ok {
+	if tracker.HasRead(path) {
 		t.Fatal("new write created read authorization, want no read record")
 	}
 }

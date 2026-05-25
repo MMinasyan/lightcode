@@ -143,11 +143,6 @@ func readOnlyArgv(fields []string) ([]string, bool) {
 	}
 }
 
-func isReadOnlySimpleCommand(fields []string) bool {
-	_, ok := readOnlyArgv(fields)
-	return ok
-}
-
 func hasDangerousReadOnlyFlag(fields []string) bool {
 	for _, arg := range fields {
 		if arg == "--" {
