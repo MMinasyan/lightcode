@@ -18,6 +18,37 @@ func TestParseModelRefSplitsOnFirstSlash(t *testing.T) {
 	}
 }
 
+func TestModelRefStringIsParseableWhenNonEmpty(t *testing.T) {
+	cases := []struct {
+		name string
+		ref  ModelRef
+		want string
+	}{
+		{name: "zero", ref: ModelRef{}, want: ""},
+		{name: "provider only", ref: ModelRef{Provider: "openai"}, want: ""},
+		{name: "model only", ref: ModelRef{Model: "gpt-5.4-mini"}, want: ""},
+		{name: "model with slash", ref: ModelRef{Provider: "openrouter", Model: "openai/gpt-5.4-mini"}, want: "openrouter/openai/gpt-5.4-mini"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.ref.String()
+			if got != tc.want {
+				t.Fatalf("String() = %q, want %q", got, tc.want)
+			}
+			if got == "" {
+				return
+			}
+			parsed, err := ParseModelRef(got)
+			if err != nil {
+				t.Fatalf("ParseModelRef(%q) returned error: %v", got, err)
+			}
+			if parsed != tc.ref {
+				t.Fatalf("parsed = %#v, want %#v", parsed, tc.ref)
+			}
+		})
+	}
+}
+
 func TestModelRefJSONUsesPrefixString(t *testing.T) {
 	ref := ModelRef{Provider: "openai", Model: "gpt-5.4-mini"}
 	b, err := json.Marshal(ref)

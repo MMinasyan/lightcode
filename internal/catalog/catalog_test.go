@@ -140,6 +140,88 @@ func TestMergeDiscoveredProviderPreservesCostFieldsDiscoveryDoesNotProvide(t *te
 	}
 }
 
+func TestMergeDiscoveredProviderWithCostProtectionPreservesUserFields(t *testing.T) {
+	cat := &Catalog{Providers: map[string]*Provider{
+		"openai": {
+			ID:            "openai",
+			Name:          "OpenAI",
+			Transport:     Transport{BaseURL: "https://api.openai.com/v1"},
+			SystemRole:    RoleSystem,
+			UsageInStream: true,
+			ExtraBody:     map[string]any{},
+			Builtin:       true,
+			Models: map[string]*Model{
+				"gpt-5.4-mini": {
+					ID:              "gpt-5.4-mini",
+					Name:            "GPT-5.4 mini",
+					InputModalities: []Modality{ModalityText},
+					SystemRole:      RoleSystem,
+					UsageInStream:   true,
+					ExtraBody:       map[string]any{},
+					Cost:            &Cost{Input: ptrFloat64(99), Output: ptrFloat64(20), CacheRead: ptrFloat64(3), CacheWrite: ptrFloat64(7)},
+				},
+				"omitted-costs": {
+					ID:              "omitted-costs",
+					Name:            "Omitted Costs",
+					InputModalities: []Modality{ModalityText},
+					SystemRole:      RoleSystem,
+					UsageInStream:   true,
+					ExtraBody:       map[string]any{},
+					Cost:            &Cost{Input: ptrFloat64(10), Output: ptrFloat64(11), CacheRead: ptrFloat64(12), CacheWrite: ptrFloat64(13)},
+				},
+			},
+		},
+	}}
+	err := cat.MergeDiscoveredProviderWithCostProtection("openai", DiscoveredProvider{
+		Models: map[string]DiscoveredModel{
+			"gpt-5.4-mini": {
+				Cost: &Cost{
+					Input:      ptrFloat64(1),
+					Output:     ptrFloat64(2),
+					CacheRead:  ptrFloat64(4),
+					CacheWrite: ptrFloat64(5),
+				},
+			},
+			"omitted-costs": {
+				Cost: &Cost{Input: ptrFloat64(15)},
+			},
+		},
+	}, map[string]map[string]bool{
+		"gpt-5.4-mini": {"input": true},
+	})
+	if err != nil {
+		t.Fatalf("MergeDiscoveredProviderWithCostProtection error: %v", err)
+	}
+
+	protected := cat.Providers["openai"].Models["gpt-5.4-mini"].Cost
+	if protected.Input == nil || *protected.Input != 99 {
+		t.Fatalf("protected input = %v, want 99", protected.Input)
+	}
+	if protected.Output == nil || *protected.Output != 2 {
+		t.Fatalf("unprotected output = %v, want 2", protected.Output)
+	}
+	if protected.CacheRead == nil || *protected.CacheRead != 4 {
+		t.Fatalf("unprotected cache_read = %v, want 4", protected.CacheRead)
+	}
+	if protected.CacheWrite == nil || *protected.CacheWrite != 5 {
+		t.Fatalf("unprotected cache_write = %v, want 5", protected.CacheWrite)
+	}
+
+	omitted := cat.Providers["openai"].Models["omitted-costs"].Cost
+	if omitted.Input == nil || *omitted.Input != 15 {
+		t.Fatalf("omitted input = %v, want updated 15", omitted.Input)
+	}
+	if omitted.Output == nil || *omitted.Output != 11 {
+		t.Fatalf("omitted output = %v, want preserved 11", omitted.Output)
+	}
+	if omitted.CacheRead == nil || *omitted.CacheRead != 12 {
+		t.Fatalf("omitted cache_read = %v, want preserved 12", omitted.CacheRead)
+	}
+	if omitted.CacheWrite == nil || *omitted.CacheWrite != 13 {
+		t.Fatalf("omitted cache_write = %v, want preserved 13", omitted.CacheWrite)
+	}
+}
+
 func TestMergeDiscoveredProviderAddsCostWhenPreviouslyNil(t *testing.T) {
 	// Model has no cost. Discovery provides cost. Should set it.
 	cat := &Catalog{Providers: map[string]*Provider{

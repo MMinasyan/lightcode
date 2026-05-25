@@ -48,10 +48,31 @@ func RefreshProviderDiscovery(ctx context.Context, home string, cat *Catalog, pr
 	if err := WriteDiscoveryCache(home, providerID, discovered, now); err != nil {
 		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)}}
 	}
-	if err := cat.MergeDiscoveredProvider(providerID, discovered); err != nil {
+	protected := userCostProtectionForProvider(home, providerID)
+	if err := cat.MergeDiscoveredProviderWithCostProtection(providerID, discovered, protected); err != nil {
 		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: err.Error()}}
 	}
 	return true, nil
+}
+
+func userCostProtectionForProvider(home, providerID string) map[string]map[string]bool {
+	userRaw, _ := readUserConfigProviders(home)
+	providerRaw, _ := userRaw[providerID].(map[string]any)
+	if providerRaw == nil {
+		return nil
+	}
+	modelsRaw, _ := providerRaw["models"].(map[string]any)
+	if len(modelsRaw) == 0 {
+		return nil
+	}
+	protected := map[string]map[string]bool{}
+	for modelID := range modelsRaw {
+		fields := userCostFields(providerRaw, modelID)
+		if len(fields) != 0 {
+			protected[modelID] = fields
+		}
+	}
+	return protected
 }
 
 // DiscoveryRefreshCandidates returns enabled discovery providers that have not
@@ -75,6 +96,12 @@ func DiscoveryRefreshCandidates(cat *Catalog, attempts map[string]time.Time, now
 
 // MergeDiscoveredProvider gap-fills provider models from discovery data.
 func (c *Catalog) MergeDiscoveredProvider(providerID string, discovered DiscoveredProvider) error {
+	return c.MergeDiscoveredProviderWithCostProtection(providerID, discovered, nil)
+}
+
+// MergeDiscoveredProviderWithCostProtection gap-fills provider models from
+// discovery data while preserving user-declared cost subfields.
+func (c *Catalog) MergeDiscoveredProviderWithCostProtection(providerID string, discovered DiscoveredProvider, protected map[string]map[string]bool) error {
 	provider := catalogProvider(c, providerID)
 	if provider == nil {
 		return fmt.Errorf("%w: %s", ErrUnknownProvider, providerID)
@@ -108,7 +135,7 @@ func (c *Catalog) MergeDiscoveredProvider(providerID string, discovered Discover
 				if model.Cost == nil {
 					model.Cost = &Cost{}
 				}
-				mergeCostPointers(model.Cost, discoveredModel.Cost)
+				mergeCostPointersProtected(model.Cost, discoveredModel.Cost, protected[modelID])
 			}
 			continue
 		}
@@ -131,7 +158,7 @@ func (c *Catalog) MergeDiscoveredProvider(providerID string, discovered Discover
 			if model.Cost == nil {
 				model.Cost = &Cost{}
 			}
-			mergeCostPointers(model.Cost, discoveredModel.Cost)
+			mergeCostPointersProtected(model.Cost, discoveredModel.Cost, protected[modelID])
 		}
 		if len(model.InputModalities) == 0 {
 			model.InputModalities = []Modality{ModalityText}
@@ -161,16 +188,20 @@ func catalogProvider(cat *Catalog, providerID string) *Provider {
 // are preserved. This allows discovery to update prices without inventing missing
 // cost fields.
 func mergeCostPointers(existing, discovered *Cost) {
-	if discovered.Input != nil {
+	mergeCostPointersProtected(existing, discovered, nil)
+}
+
+func mergeCostPointersProtected(existing, discovered *Cost, protected map[string]bool) {
+	if discovered.Input != nil && !protected["input"] {
 		existing.Input = discovered.Input
 	}
-	if discovered.Output != nil {
+	if discovered.Output != nil && !protected["output"] {
 		existing.Output = discovered.Output
 	}
-	if discovered.CacheRead != nil {
+	if discovered.CacheRead != nil && !protected["cache_read"] {
 		existing.CacheRead = discovered.CacheRead
 	}
-	if discovered.CacheWrite != nil {
+	if discovered.CacheWrite != nil && !protected["cache_write"] {
 		existing.CacheWrite = discovered.CacheWrite
 	}
 }

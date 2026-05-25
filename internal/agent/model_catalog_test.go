@@ -150,6 +150,63 @@ func TestAgentRefreshDiscoveryUpdatesCatalog(t *testing.T) {
 	t.Fatalf("ModelList missing test/fresh-model after RefreshDiscovery; entries=%#v", entries)
 }
 
+func TestAgentRefreshDiscoveryPreservesUserCostFields(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected discovery path %s", r.URL.Path)
+		}
+		_, _ = fmt.Fprint(w, `{"data":[{"id":"test-model","name":"Discovered Test Model","context_window":24576,"max_output_tokens":4096,"cost":{"input":1,"output":2}}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	a := newCatalogBackedTestAgent(t)
+	writeCatalogTestConfig(t, a.home, `{
+  "providers": {
+    "test": {
+      "name": "Test Provider",
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_TEST_KEY" },
+      "discovery": false,
+      "models": {
+        "test-model": {
+          "name": "Test Model",
+          "context_window": 8192,
+          "max_output_tokens": 1024,
+          "cost": {"input": 99}
+        }
+      }
+    }
+  },
+  "default_model": "test/test-model"
+}`)
+	if err := a.Reload(); err != nil {
+		t.Fatalf("Reload returned error: %v", err)
+	}
+	a.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
+	a.catalog.Providers["test"].Discovery = true
+	a.catalog.Providers["test"].Builtin = true
+
+	if err := a.RefreshDiscovery("test"); err != nil {
+		t.Fatalf("RefreshDiscovery returned error: %v", err)
+	}
+	entries := a.ModelList()
+	for _, entry := range entries {
+		if entry.Ref != "test/test-model" {
+			continue
+		}
+		if entry.Cost == nil {
+			t.Fatalf("test-model cost = nil")
+		}
+		if entry.Cost.Output == nil || *entry.Cost.Output != 2 {
+			t.Fatalf("test-model output cost = %v, want discovered value 2", entry.Cost.Output)
+		}
+		if entry.Cost.Input == nil || *entry.Cost.Input != 99 {
+			t.Fatalf("test-model input cost = %v, want user value 99", entry.Cost.Input)
+		}
+		return
+	}
+	t.Fatalf("ModelList missing test/test-model after RefreshDiscovery; entries=%#v", entries)
+}
+
 func TestAgentRefreshDiscoveryFailureEmitsWarningEvent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)

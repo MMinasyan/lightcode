@@ -232,7 +232,7 @@ func applyDiscovery(providerID string, raw map[string]any, discovered Discovered
 					existingCost = map[string]any{}
 					modelRaw["cost"] = existingCost
 				}
-				mergeCostRawFields(existingCost, modelDiscovery.Cost, nil)
+				mergeCostRawFields(existingCost, modelDiscovery.Cost, userCostFields(userRaw, modelID))
 			}
 			continue
 		}
