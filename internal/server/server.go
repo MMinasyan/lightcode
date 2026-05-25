@@ -151,6 +151,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/project/list", s.auth(s.handleProjectList))
 	mux.HandleFunc("GET /v1/file", s.auth(s.handleFile))
 	mux.HandleFunc("POST /v1/compact", s.auth(s.handleCompact))
+	mux.HandleFunc("GET /v1/warnings", s.auth(s.handleWarnings))
 }
 
 // --- Auth middleware ---
@@ -226,7 +227,12 @@ func (s *Server) handleEvent(ev agent.Event) {
 	case agent.EventCompactionStart:
 		name = "compaction_start"
 	case agent.EventCompactionEnd:
-		name = "compaction_end"
+		s.hub.broadcast("compaction_end", nil)
+		s.broadcastSessionChanged()
+		return
+	case agent.EventWarning:
+		name = "warnings"
+		data = warningSnapshot(ev.Warnings)
 	default:
 		return
 	}
@@ -317,6 +323,11 @@ func (s *Server) broadcastSessionChanged() {
 }
 
 // --- Route handlers ---
+
+type turnActionRequest struct {
+	Turn           int  `json:"turn"`
+	AlsoRevertCode bool `json:"alsoRevertCode"`
+}
 
 func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -486,50 +497,35 @@ func (s *Server) handleSessionMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSessionFork(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Turn int `json:"turn"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		jsonError(w, "invalid body", http.StatusBadRequest)
-		return
-	}
-	if err := s.agent.ForkSession(body.Turn); err != nil {
-		jsonError(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	s.broadcastSessionChanged()
-	jsonResp(w, http.StatusOK, s.agent.SessionCurrent())
+	s.handleTurnAction(w, r, agent.TurnActionFork, http.StatusInternalServerError)
 }
 
 func (s *Server) handleRevertCode(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Turn int `json:"turn"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		jsonError(w, "invalid body", http.StatusBadRequest)
-		return
-	}
-	if err := s.agent.RevertCode(body.Turn); err != nil {
-		jsonError(w, err.Error(), http.StatusConflict)
-		return
-	}
-	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
+	s.handleTurnAction(w, r, agent.TurnActionRevertCode, http.StatusConflict)
 }
 
 func (s *Server) handleRevertHistory(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Turn int `json:"turn"`
-	}
+	s.handleTurnAction(w, r, agent.TurnActionRevertHistory, http.StatusConflict)
+}
+
+func (s *Server) handleTurnAction(w http.ResponseWriter, r *http.Request, action string, actionErrorStatus int) {
+	var body turnActionRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	if err := s.agent.RevertHistory(body.Turn); err != nil {
-		jsonError(w, err.Error(), http.StatusConflict)
+	if action == agent.TurnActionRevertCode {
+		body.AlsoRevertCode = false
+	}
+	result, err := s.agent.ApplyTurnAction(body.Turn, action, body.AlsoRevertCode)
+	if err != nil {
+		jsonError(w, err.Error(), actionErrorStatus)
 		return
 	}
-	s.broadcastSessionChanged()
-	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
+	if result.SessionChanged {
+		s.broadcastSessionChanged()
+	}
+	jsonResp(w, http.StatusOK, result)
 }
 
 func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
@@ -597,6 +593,17 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleWarnings(w http.ResponseWriter, r *http.Request) {
+	jsonResp(w, http.StatusOK, warningSnapshot(s.agent.CurrentWarnings()))
+}
+
+func warningSnapshot(warnings []agent.PromptWarning) []agent.PromptWarning {
+	if warnings == nil {
+		return []agent.PromptWarning{}
+	}
+	return warnings
 }
 
 // --- SSE hub ---
