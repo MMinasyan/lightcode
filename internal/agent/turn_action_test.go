@@ -223,6 +223,7 @@ func TestRunCompactionPreservesPendingSignalsForMainModel(t *testing.T) {
 func TestBackgroundExitSignalAfterSessionNewDoesNotDrainIntoNewSession(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	appendUserTurn(t, a, "old session prompt")
+	oldSessionID := a.store.SessionID()
 
 	id, err := a.procMgr.Start("sleep 0.1; i=0; while [ $i -lt 3000 ]; do printf 'old-output-%04d\n' \"$i\"; i=$((i+1)); done", 0)
 	if err != nil {
@@ -233,7 +234,7 @@ func TestBackgroundExitSignalAfterSessionNewDoesNotDrainIntoNewSession(t *testin
 	}
 	appendUserTurn(t, a, "new session prompt")
 
-	waitUntilProcessNotListed(t, a, id)
+	waitUntilProcessRemovedFromSession(t, a, oldSessionID, id)
 	assertNoProcessOutputFiles(t, a)
 
 	if a.lp.HasPendingSignal() {
@@ -250,8 +251,12 @@ func TestBackgroundExitSignalAfterSessionNewDoesNotDrainIntoNewSession(t *testin
 	}
 }
 
-func waitUntilProcessNotListed(t *testing.T, a *Agent, id string) {
+func waitUntilProcessRemovedFromSession(t *testing.T, a *Agent, sessionID, id string) {
 	t.Helper()
+	a.procMgr.SetSessionProvider(func() string { return sessionID })
+	defer a.procMgr.SetSessionProvider(func() string {
+		return a.store.SessionID()
+	})
 	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
 		if !strings.Contains(a.procMgr.List(), id) {
 			return
