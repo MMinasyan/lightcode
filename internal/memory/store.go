@@ -137,7 +137,7 @@ func (s *Store) IndexSummary(sessionID, projectID, projectName, summary, created
 	}
 	metaData, _ := json.Marshal(meta)
 	if err := os.WriteFile(filepath.Join(dir, "meta.json"), metaData, 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "lightcode: memory index meta: %v\n", err)
+		return fmt.Errorf("write summary meta: %w", err)
 	}
 
 	for i, sec := range sections {
