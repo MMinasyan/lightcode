@@ -185,6 +185,76 @@ func TestManagerExitEventIncludesStartSessionID(t *testing.T) {
 	}
 }
 
+func TestManagerFiltersProcessOperationsByCurrentSession(t *testing.T) {
+	m := NewManager(2, cmdoutput.Options{})
+	sessionID := "session-a"
+	m.SetSessionProvider(func() string { return sessionID })
+
+	id, err := m.Start("printf secret; sleep 2", 0)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		sessionID = "session-a"
+		_ = m.Kill(id)
+	}()
+
+	waitForReadContaining(t, m, id, "secret")
+	if got := m.List(); !strings.Contains(got, id) || !strings.Contains(got, "printf secret") {
+		t.Fatalf("session-a List = %q, want started process", got)
+	}
+
+	sessionID = "session-b"
+	if got := m.List(); got != "No background processes." {
+		t.Fatalf("session-b List = %q, want no visible processes", got)
+	}
+	if _, err := m.Read(id); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("no process with ID %q", id)) {
+		t.Fatalf("session-b Read error = %v, want missing process", err)
+	}
+	if err := m.Kill(id); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("no process with ID %q", id)) {
+		t.Fatalf("session-b Kill error = %v, want missing process", err)
+	}
+
+	sessionID = "session-a"
+	if got := m.List(); !strings.Contains(got, id) {
+		t.Fatalf("session-a List after blocked kill = %q, want original process still running", got)
+	}
+	if err := m.Kill(id); err != nil {
+		t.Fatalf("session-a Kill: %v", err)
+	}
+}
+
+func TestManagerLimitAppliesPerSession(t *testing.T) {
+	m := NewManager(1, cmdoutput.Options{})
+	sessionID := "session-a"
+	m.SetSessionProvider(func() string { return sessionID })
+
+	idA, err := m.Start("sleep 2", 0)
+	if err != nil {
+		t.Fatalf("Start session-a: %v", err)
+	}
+	defer func() {
+		sessionID = "session-a"
+		_ = m.Kill(idA)
+	}()
+	if _, err := m.Start("sleep 2", 0); err == nil {
+		t.Fatal("Start second session-a process error = nil, want limit error")
+	}
+
+	sessionID = "session-b"
+	idB, err := m.Start("sleep 2", 0)
+	if err != nil {
+		t.Fatalf("Start session-b with session-a process running: %v", err)
+	}
+	defer func() {
+		sessionID = "session-b"
+		_ = m.Kill(idB)
+	}()
+	if _, err := m.Start("sleep 2", 0); err == nil {
+		t.Fatal("Start second session-b process error = nil, want limit error")
+	}
+}
+
 func TestManagerLargeBackgroundOutputSpillsAndReadReusesPath(t *testing.T) {
 	home := t.TempDir()
 	m := NewManager(1, cmdoutput.Options{

@@ -89,10 +89,14 @@ func (m *Manager) SetSessionProvider(provider func() string) {
 
 // Start launches a background process and returns its ID.
 func (m *Manager) Start(command string, timeoutSec int) (string, error) {
+	sessionID := m.currentSessionID()
 	if m.maxProcs > 0 {
 		running := 0
 		m.mu.Lock()
 		for _, cs := range m.procs {
+			if cs.SessionID != sessionID {
+				continue
+			}
 			cs.mu.Lock()
 			if !cs.exited {
 				running++
@@ -109,7 +113,6 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	sessionID := m.currentSessionID()
 	cmd := exec.Command("sh", "-c", command)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	capture := cmdoutput.NewCapture(m.outputOptions)
@@ -204,10 +207,11 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 
 // Read returns output accumulated so far for a running background process.
 func (m *Manager) Read(id string) (string, error) {
+	sessionID := m.currentSessionID()
 	m.mu.Lock()
 	cs, ok := m.procs[id]
 	m.mu.Unlock()
-	if !ok {
+	if !ok || cs.SessionID != sessionID {
 		return "", fmt.Errorf("process: no process with ID %q", id)
 	}
 
@@ -227,10 +231,18 @@ func (m *Manager) Read(id string) (string, error) {
 // Kill terminates a background process. Sends SIGTERM, waits 500ms,
 // then SIGKILL.
 func (m *Manager) Kill(id string) error {
+	return m.kill(id, true)
+}
+
+func (m *Manager) kill(id string, enforceSession bool) error {
+	sessionID := ""
+	if enforceSession {
+		sessionID = m.currentSessionID()
+	}
 	m.mu.Lock()
 	cs, ok := m.procs[id]
 	m.mu.Unlock()
-	if !ok {
+	if !ok || (enforceSession && cs.SessionID != sessionID) {
 		return fmt.Errorf("process: no process with ID %q", id)
 	}
 
@@ -267,15 +279,16 @@ func terminateProcessGroup(pid int) {
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 }
 
-// List returns a formatted list of all background processes.
+// List returns a formatted list of background processes for the current session.
 func (m *Manager) List() string {
+	sessionID := m.currentSessionID()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.procs) == 0 {
-		return "No background processes."
-	}
 	var result string
 	for _, cs := range m.procs {
+		if cs.SessionID != sessionID {
+			continue
+		}
 		cs.mu.Lock()
 		dur := time.Since(cs.StartedAt).Round(time.Second)
 		status := ""
@@ -287,6 +300,9 @@ func (m *Manager) List() string {
 	}
 	if len(result) > 0 && result[len(result)-1] == '\n' {
 		result = result[:len(result)-1]
+	}
+	if result == "" {
+		return "No background processes."
 	}
 	return result
 }
@@ -300,7 +316,7 @@ func (m *Manager) KillAll() {
 	}
 	m.mu.Unlock()
 	for _, id := range ids {
-		_ = m.Kill(id)
+		_ = m.kill(id, false)
 	}
 }
 

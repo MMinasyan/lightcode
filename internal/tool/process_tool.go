@@ -25,9 +25,9 @@ func (*ProcessTool) Name() string { return "process" }
 
 func (*ProcessTool) Description() string {
 	return `Manage background processes started by run_command with background=true.
-- Use action "read" with id to read the output of a running background process.
-- Use action "kill" with id to terminate a background process.
-- Use action "list" to list all background processes and their status.`
+	- Use action "read" with id to read the output of a running background process.
+	- Use action "kill" with id to terminate a background process.
+	- Use action "list" to list background processes in the current session and their status.`
 }
 
 func (*ProcessTool) ParametersSchema() map[string]any {
@@ -36,7 +36,7 @@ func (*ProcessTool) ParametersSchema() map[string]any {
 		"properties": map[string]any{
 			"action": map[string]any{
 				"type":        "string",
-				"description": "Action to perform: \"read\" to get output, \"kill\" to terminate, \"list\" to list all processes.",
+				"description": "Action to perform: \"read\" to get output, \"kill\" to terminate, \"list\" to list processes in the current session.",
 			},
 			"id": map[string]any{
 				"type":        "string",
