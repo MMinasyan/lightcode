@@ -226,7 +226,12 @@ func (r *Runner) handleEvent(ev agent.Event) {
 	case agent.EventCompactionStart:
 		method = "agent/compaction_start"
 	case agent.EventCompactionEnd:
-		method = "agent/compaction_end"
+		r.sendNotification(Notification{
+			JSONRPC: "2.0",
+			Method:  "agent/compaction_end",
+		})
+		r.pushSessionChanged()
+		return
 	case agent.EventWarning:
 		method = "agent/warnings"
 		params = warningSnapshot(ev.Warnings)
@@ -479,7 +484,6 @@ func (r *Runner) handleCompact(ctx context.Context, req Request) {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	r.pushSessionChanged()
 	r.respond(req.ID, map[string]any{"ok": true})
 }
 

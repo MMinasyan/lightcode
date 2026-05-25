@@ -157,6 +157,19 @@ func TestHandleEventBroadcastsAndSkipsSubagents(t *testing.T) {
 	}
 }
 
+func TestHandleEventCompactionEndBroadcastsSessionChanged(t *testing.T) {
+	a := newServerTestAgent(t)
+	s := &Server{agent: a, hub: newSSEHub()}
+	ch, unsub := s.hub.subscribe()
+	defer unsub()
+
+	s.handleEvent(agent.Event{Kind: agent.EventCompactionEnd})
+
+	assertSSEEvent(t, ch, "compaction_end")
+	assertSSEEvent(t, ch, "session_changed")
+	assertNoSSEMessage(t, ch)
+}
+
 func TestHandleTurnActionRevertCodeReturnsResultWithoutSessionChanged(t *testing.T) {
 	a := newServerTestAgent(t)
 	s := &Server{agent: a, hub: newSSEHub()}

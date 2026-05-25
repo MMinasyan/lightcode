@@ -128,6 +128,17 @@ func TestHandleEventNotifications(t *testing.T) {
 	}
 }
 
+func TestHandleEventCompactionEndPushesSessionChanged(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{agent: newACPTestAgent(t), out: &out}
+
+	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd})
+
+	lines := responseLines(t, out.String(), 2)
+	assertACPNotificationMethod(t, lines[0], "agent/compaction_end")
+	assertACPNotificationMethod(t, lines[1], "agent/session_changed")
+}
+
 func TestDispatchWarningsCurrentReturnsCurrentWarningSnapshot(t *testing.T) {
 	a := newACPWarningTestAgent(t)
 	if len(a.CurrentWarnings()) == 0 {
@@ -321,6 +332,11 @@ func TestACPHandlersUseSharedTurnActionContract(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("%s must delegate with %q; body:\n%s", signature, want, body)
 		}
+	}
+
+	compact := extractSourceFunc(t, src, "func (r *Runner) handleCompact(")
+	if strings.Contains(compact, "pushSessionChanged(") {
+		t.Fatalf("handleCompact must leave session refresh to EventCompactionEnd; body:\n%s", compact)
 	}
 }
 

@@ -227,7 +227,9 @@ func (s *Server) handleEvent(ev agent.Event) {
 	case agent.EventCompactionStart:
 		name = "compaction_start"
 	case agent.EventCompactionEnd:
-		name = "compaction_end"
+		s.hub.broadcast("compaction_end", nil)
+		s.broadcastSessionChanged()
+		return
 	case agent.EventWarning:
 		name = "warnings"
 		data = warningSnapshot(ev.Warnings)
