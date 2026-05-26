@@ -230,11 +230,6 @@ func writeFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker,
 	}, mutationStarted, nil
 }
 
-func openWriteTarget(absPath string, tracker *FileTracker) (*os.File, bool, error) {
-	f, openedExisting, _, err := openWriteTargetForMutation(absPath, tracker)
-	return f, openedExisting, err
-}
-
 func openWriteTargetForMutation(absPath string, tracker *FileTracker) (*os.File, bool, bool, error) {
 	existed, err := ensureRegularExistingTarget(absPath)
 	if err != nil {

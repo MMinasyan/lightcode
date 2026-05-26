@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func TestFileTrackerTrackRecordsReadAndMtime(t *testing.T) {
+func TestFileTrackerTrackRecordsReadAndAllowsUnchangedIdentity(t *testing.T) {
 	tracker := NewFileTracker()
 	path := testTrackerFile(t, "content")
 	mtime := time.Unix(100, 0)
@@ -18,12 +18,8 @@ func TestFileTrackerTrackRecordsReadAndMtime(t *testing.T) {
 
 	trackIdentityForPath(t, tracker, path, 1, 100)
 
-	got, ok := tracker.WasRead(path)
-	if !ok {
-		t.Fatal("WasRead returned false after Track")
-	}
-	if !got.Equal(mtime) {
-		t.Fatalf("WasRead mtime = %v, want %v", got, mtime)
+	if !tracker.HasRead(path) {
+		t.Fatal("HasRead returned false after Track")
 	}
 	if err := wasReadCheckForPath(t, tracker, path); err != nil {
 		t.Fatalf("WasReadCheck after unchanged Track = %v", err)
@@ -91,7 +87,7 @@ func TestFileTrackerUpdateAfterWriteIdentityDoesNotAuthorizeUnreadFile(t *testin
 	}
 	tracker.UpdateAfterWriteIdentity(path, FileIdentityFromFileInfo(info))
 
-	if _, ok := tracker.WasRead(path); ok {
+	if tracker.HasRead(path) {
 		t.Fatal("UpdateAfterWriteIdentity created read authorization for unread file")
 	}
 	err = wasReadCheckForPath(t, tracker, path)
@@ -167,8 +163,8 @@ func TestFileTrackerResetClearsReadAndDuplicateState(t *testing.T) {
 
 	tracker.Reset()
 
-	if _, ok := tracker.WasRead(path); ok {
-		t.Fatal("WasRead returned true after Reset")
+	if tracker.HasRead(path) {
+		t.Fatal("HasRead returned true after Reset")
 	}
 	if dup, record := isDuplicateForPath(t, tracker, path, 1, 100); dup {
 		t.Fatalf("IsDuplicate returned true after Reset, record=%+v", record)
@@ -294,6 +290,7 @@ func TestPR11Closure_DeadHelpersRemoved(t *testing.T) {
 		"Track", "TrackMtime",
 		"UpdateAfterWrite", "UpdateAfterWriteMtime",
 		"IsDuplicate", "WasReadCheck",
+		"IsDuplicateMtime", "WasRead", "WasReadCheckMtime",
 	} {
 		if _, ok := typ.MethodByName(name); ok {
 			t.Errorf("forbidden helper %s still exported on *FileTracker", name)

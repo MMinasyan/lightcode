@@ -103,11 +103,6 @@ func (t *FileTracker) Reset() {
 	t.identities = make(map[string]FileIdentity)
 }
 
-// IsDuplicateMtime checks duplicate status against metadata from an already-opened file.
-func (t *FileTracker) IsDuplicateMtime(path string, offset, limit int, currentMtime time.Time) (bool, ReadRecord) {
-	return t.IsDuplicateIdentity(path, offset, limit, FileIdentity{Mtime: currentMtime})
-}
-
 // IsDuplicateIdentity checks duplicate status against identity metadata from an already-opened file.
 func (t *FileTracker) IsDuplicateIdentity(path string, offset, limit int, current FileIdentity) (bool, ReadRecord) {
 	t.mu.Lock()
@@ -124,25 +119,11 @@ func (t *FileTracker) IsDuplicateIdentity(path string, offset, limit int, curren
 	return false, ReadRecord{}
 }
 
-// WasRead returns the mtime from the most recent read of path.
-// If the file was never read, returns (zero, false).
-func (t *FileTracker) WasRead(path string) (time.Time, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	identity, ok := t.identities[path]
-	return identity.Mtime, ok
-}
-
 func (t *FileTracker) HasRead(path string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	_, ok := t.identities[path]
 	return ok
-}
-
-// WasReadCheckMtime checks read authorization against metadata from an already-opened file.
-func (t *FileTracker) WasReadCheckMtime(path string, currentMtime time.Time) error {
-	return t.WasReadCheckIdentity(path, FileIdentity{Mtime: currentMtime})
 }
 
 // WasReadCheckIdentity checks read authorization against identity metadata from an already-opened file.
