@@ -1817,6 +1817,28 @@ func (a *Agent) SessionSwitch(id string) error {
 	return nil
 }
 
+// resetCurrentSessionStateLocked resets loop history, file tracker, tokens,
+// and LSP diagnostics. Caller must hold a.mu.
+func (a *Agent) resetCurrentSessionStateLocked() {
+	a.lp.ResetHistory()
+	if a.fileTracker != nil {
+		a.fileTracker.Reset()
+	}
+	a.tokensMu.Lock()
+	a.tokens = map[string]*TokenEntry{}
+	a.tokensMu.Unlock()
+	if a.lspDiagnostics != nil {
+		a.lspDiagnostics.Reset()
+	}
+}
+
+// resetCurrentSessionState acquires a.mu and resets session state.
+func (a *Agent) resetCurrentSessionState() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.resetCurrentSessionStateLocked()
+}
+
 // SessionNew closes the current session and starts fresh.
 func (a *Agent) SessionNew() error {
 	a.mu.Lock()
@@ -1829,16 +1851,7 @@ func (a *Agent) SessionNew() error {
 	if _, err := a.store.Close(); err != nil {
 		return err
 	}
-	a.lp.ResetHistory()
-	if a.fileTracker != nil {
-		a.fileTracker.Reset()
-	}
-	a.tokensMu.Lock()
-	a.tokens = map[string]*TokenEntry{}
-	a.tokensMu.Unlock()
-	if a.lspDiagnostics != nil {
-		a.lspDiagnostics.Reset()
-	}
+	a.resetCurrentSessionStateLocked()
 	return nil
 }
 
@@ -1857,13 +1870,7 @@ func (a *Agent) SessionArchive(id string) (bool, error) {
 		return false, err
 	}
 	if closedCurrent {
-		a.lp.ResetHistory()
-		if a.fileTracker != nil {
-			a.fileTracker.Reset()
-		}
-		a.tokensMu.Lock()
-		a.tokens = map[string]*TokenEntry{}
-		a.tokensMu.Unlock()
+		a.resetCurrentSessionState()
 	}
 	return closedCurrent, nil
 }
@@ -1886,13 +1893,7 @@ func (a *Agent) SessionDelete(id string) (bool, error) {
 		return false, err
 	}
 	if closedCurrent {
-		a.lp.ResetHistory()
-		if a.fileTracker != nil {
-			a.fileTracker.Reset()
-		}
-		a.tokensMu.Lock()
-		a.tokens = map[string]*TokenEntry{}
-		a.tokensMu.Unlock()
+		a.resetCurrentSessionState()
 	}
 	return closedCurrent, nil
 }

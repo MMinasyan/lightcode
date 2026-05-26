@@ -76,7 +76,7 @@ func permissionAllows(action permission.ResponseAction) bool {
 func permissionRequest(toolName string, params, execParams map[string]any) permission.Request {
 	arg := PermissionArg(toolName, params)
 	req := permission.Request{ToolName: toolName, Arg: arg}
-	if isFileTool(toolName) {
+	if permission.IsFileTool(toolName) {
 		if resolved := PermissionCheckArg(toolName, execParams); resolved != "" && resolved != arg {
 			req.ResolvedArg = resolved
 		}
@@ -111,7 +111,7 @@ func PermissionArg(toolName string, params map[string]any) string {
 }
 
 func PermissionCheckArg(toolName string, params map[string]any) string {
-	if isFileTool(toolName) {
+	if permission.IsFileTool(toolName) {
 		if canonicalPath := canonicalPathFromParams(params); canonicalPath != "" {
 			return canonicalPath
 		}
@@ -126,7 +126,7 @@ func PermissionCheckArg(toolName string, params map[string]any) string {
 }
 
 func resolveFileToolParams(toolName string, params map[string]any) (map[string]any, error) {
-	if !isFileTool(toolName) {
+	if !permission.IsFileTool(toolName) {
 		return params, nil
 	}
 	cleanParams := withoutCanonicalPathParam(params)
@@ -187,8 +187,4 @@ func fileDisplayAbsPath(path string) (string, error) {
 		return "", err
 	}
 	return absPath, nil
-}
-
-func isFileTool(toolName string) bool {
-	return toolName == "read_file" || toolName == "write_file" || toolName == "edit_file"
 }
