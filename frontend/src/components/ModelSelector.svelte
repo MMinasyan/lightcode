@@ -2,6 +2,7 @@
   import { ModelList, SwitchModel } from '../../wailsjs/go/main/App';
   import { createEventDispatcher, onMount } from 'svelte';
   import { errorText } from '../lib/errors.js';
+  import { groupByProvider } from '../lib/format.js';
   export let currentRef = '';
   const dispatch = createEventDispatcher();
   let entries = [];
@@ -25,21 +26,6 @@
       (e.model || '').toLowerCase().includes(lq) ||
       (e.ref || '').toLowerCase().includes(lq)
     );
-  }
-
-  function groupByProvider(list) {
-    const grouped = [];
-    const byProvider = new Map();
-    for (const entry of list) {
-      const provider = entry.provider || '';
-      if (!byProvider.has(provider)) {
-        const group = { provider, providerName: entry.providerName || provider, models: [] };
-        byProvider.set(provider, group);
-        grouped.push(group);
-      }
-      byProvider.get(provider).models.push(entry);
-    }
-    return grouped;
   }
 
   async function select(entry) {

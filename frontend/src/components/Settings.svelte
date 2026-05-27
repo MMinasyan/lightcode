@@ -2,6 +2,7 @@
   import { createEventDispatcher, onMount } from 'svelte';
   import { settings } from '../lib/settings.js';
   import { errorText } from '../lib/errors.js';
+  import { groupByProvider } from '../lib/format.js';
   import { AllModelList, SetModelHidden, SetProviderHidden } from '../../wailsjs/go/main/App';
   const dispatch = createEventDispatcher();
   export let initialSection = 'appearance';
@@ -59,20 +60,6 @@
   async function refreshModels() {
     try { allModels = await AllModelList(); } catch (e) { dispatch('error', errorText(e)); allModels = []; }
     modelGroups = groupByProvider(allModels);
-  }
-
-  function groupByProvider(list) {
-    const grouped = [];
-    const byProvider = new Map();
-    for (const entry of list) {
-      if (!byProvider.has(entry.provider)) {
-        const group = { provider: entry.provider, providerName: entry.providerName || entry.provider, providerHidden: entry.providerHidden, models: [] };
-        byProvider.set(entry.provider, group);
-        grouped.push(group);
-      }
-      byProvider.get(entry.provider).models.push(entry);
-    }
-    return grouped;
   }
 
   function modelDisplayName(entry) {
