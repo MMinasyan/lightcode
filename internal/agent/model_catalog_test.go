@@ -1,11 +1,13 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -416,6 +418,217 @@ func TestAgentSessionSwitchReloadsExternalConfigEdit(t *testing.T) {
 		}
 	}
 	t.Fatalf("ModelList missing test/switch-model after SessionSwitch reload; entries=%#v", entries)
+}
+
+func TestAgentAllModelListIncludesHiddenModels(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+
+	entries := a.AllModelList()
+
+	byRef := map[string]ModelListEntry{}
+	for _, entry := range entries {
+		byRef[entry.Ref] = entry
+	}
+	hiddenEntry, ok := byRef["test/hidden-model"]
+	if !ok {
+		t.Fatalf("AllModelList missing test/hidden-model; entries=%#v", entries)
+	}
+	if !hiddenEntry.Hidden {
+		t.Fatalf("hidden-model entry Hidden = %v, want true", hiddenEntry.Hidden)
+	}
+	testEntry, ok := byRef["test/test-model"]
+	if !ok {
+		t.Fatalf("AllModelList missing test/test-model; entries=%#v", entries)
+	}
+	if testEntry.Hidden {
+		t.Fatalf("test-model entry Hidden = %v, want false", testEntry.Hidden)
+	}
+	if testEntry.Provider != "test" || testEntry.ProviderName != "Test Provider" || testEntry.Model != "test-model" || testEntry.DisplayName != "Test Model" {
+		t.Fatalf("test-model entry identity/display = %#v", testEntry)
+	}
+	if testEntry.ContextWindow != 8192 {
+		t.Fatalf("test-model entry ContextWindow = %d, want 8192", testEntry.ContextWindow)
+	}
+}
+
+func TestAgentSetModelHiddenWritesConfigAndUpdatesCatalog(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+
+	if err := a.SetModelHidden("test/test-model", true); err != nil {
+		t.Fatalf("SetModelHidden returned error: %v", err)
+	}
+	if !a.catalog.Providers["test"].Models["test-model"].Hidden {
+		t.Fatalf("in-memory catalog not updated: test-model.Hidden = %v, want true", a.catalog.Providers["test"].Models["test-model"].Hidden)
+	}
+
+	data, err := os.ReadFile(agentConfigPath(a.home))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("unmarshal config: %v", err)
+	}
+	providers := root["providers"].(map[string]any)
+	testProv := providers["test"].(map[string]any)
+	models := testProv["models"].(map[string]any)
+	testModel := models["test-model"].(map[string]any)
+	if hidden, ok := testModel["hidden"].(bool); !ok || !hidden {
+		t.Fatalf("config test-model.hidden = %v, want true", testModel["hidden"])
+	}
+
+	visibleEntries := a.ModelList()
+	for _, entry := range visibleEntries {
+		if entry.Ref == "test/test-model" {
+			t.Fatalf("test/test-model appeared in ModelList after SetModelHidden(true)")
+		}
+	}
+
+	allEntries := a.AllModelList()
+	found := false
+	for _, entry := range allEntries {
+		if entry.Ref == "test/test-model" {
+			found = true
+			if !entry.Hidden {
+				t.Fatalf("AllModelList test/test-model Hidden = %v, want true", entry.Hidden)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("AllModelList missing test/test-model after SetModelHidden(true)")
+	}
+
+	if err := a.SetModelHidden("test/test-model", false); err != nil {
+		t.Fatalf("SetModelHidden(false) returned error: %v", err)
+	}
+	visibleEntries = a.ModelList()
+	found = false
+	for _, entry := range visibleEntries {
+		if entry.Ref == "test/test-model" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("test/test-model did not reappear in ModelList after SetModelHidden(false)")
+	}
+}
+
+func TestAgentSetProviderHiddenWritesConfigAndUpdatesCatalog(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+
+	if err := a.SetProviderHidden("test", true); err != nil {
+		t.Fatalf("SetProviderHidden returned error: %v", err)
+	}
+	if !a.catalog.Providers["test"].Hidden {
+		t.Fatalf("in-memory catalog not updated: test.Hidden = %v, want true", a.catalog.Providers["test"].Hidden)
+	}
+
+	data, err := os.ReadFile(agentConfigPath(a.home))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("unmarshal config: %v", err)
+	}
+	providers := root["providers"].(map[string]any)
+	testProv := providers["test"].(map[string]any)
+	if hidden, ok := testProv["hidden"].(bool); !ok || !hidden {
+		t.Fatalf("config test.hidden = %v, want true", testProv["hidden"])
+	}
+
+	visibleEntries := a.ModelList()
+	for _, entry := range visibleEntries {
+		if entry.Provider == "test" {
+			t.Fatalf("provider test models appeared in ModelList after SetProviderHidden(true)")
+		}
+	}
+
+	allEntries := a.AllModelList()
+	for _, entry := range allEntries {
+		if entry.Provider == "test" {
+			if !entry.ProviderHidden {
+				t.Fatalf("AllModelList test entry ProviderHidden = %v, want true", entry.ProviderHidden)
+			}
+			if !entry.Hidden {
+				t.Fatalf("AllModelList test entry Hidden = %v, want true", entry.Hidden)
+			}
+		}
+	}
+
+	if err := a.SetProviderHidden("test", false); err != nil {
+		t.Fatalf("SetProviderHidden(false) returned error: %v", err)
+	}
+	visibleEntries = a.ModelList()
+	found := false
+	for _, entry := range visibleEntries {
+		if entry.Ref == "test/test-model" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("test/test-model did not reappear in ModelList after SetProviderHidden(false)")
+	}
+	for _, entry := range visibleEntries {
+		if entry.Ref == "test/hidden-model" {
+			t.Fatalf("test/hidden-model appeared in ModelList after SetProviderHidden(false) (model-level hidden still true)")
+		}
+	}
+}
+
+func TestAgentMutateConfigRejectsMalformedShapes(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+
+	writeCatalogTestConfig(t, a.home, `{
+  "providers": {
+    "test": "not-an-object"
+  },
+  "default_model": "test/test-model"
+}`)
+	if err := a.SetProviderHidden("test", true); err == nil {
+		t.Fatal("SetProviderHidden returned nil for malformed provider")
+	} else if !strings.Contains(err.Error(), "providers.test must be an object") {
+		t.Fatalf("SetProviderHidden error = %v, want providers.test must be an object", err)
+	}
+
+	writeCatalogTestConfig(t, a.home, `{
+  "providers": {
+    "test": {
+      "name": "Test Provider",
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_TEST_KEY" },
+      "discovery": false,
+      "models": "not-an-object"
+    }
+  },
+  "default_model": "test/test-model"
+}`)
+	if err := a.SetModelHidden("test/test-model", true); err == nil {
+		t.Fatal("SetModelHidden returned nil for malformed models")
+	} else if !strings.Contains(err.Error(), "providers.test.models must be an object") {
+		t.Fatalf("SetModelHidden error = %v, want providers.test.models must be an object", err)
+	}
+
+	writeCatalogTestConfig(t, a.home, `{
+  "providers": {
+    "test": {
+      "name": "Test Provider",
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_TEST_KEY" },
+      "discovery": false,
+      "models": {
+        "test-model": "not-an-object"
+      }
+    }
+  },
+  "default_model": "test/test-model"
+}`)
+	if err := a.SetModelHidden("test/test-model", true); err == nil {
+		t.Fatal("SetModelHidden returned nil for malformed model")
+	} else if !strings.Contains(err.Error(), "providers.test.models.test-model must be an object") {
+		t.Fatalf("SetModelHidden error = %v, want providers.test.models.test-model must be an object", err)
+	}
 }
 
 func writeCatalogTestConfig(t *testing.T, home, content string) {

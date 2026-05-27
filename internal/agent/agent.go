@@ -1415,55 +1415,15 @@ func (a *Agent) CompleteModelEntry(refStr string, completion ModelCompletion) er
 	if a.busy {
 		return fmt.Errorf("cannot complete model entry while a turn is running")
 	}
-
-	path := agentConfigPath(a.home)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
-		return fmt.Errorf("parse config %s: %w", path, err)
-	}
-	providers, ok := root["providers"].(map[string]any)
-	if !ok {
-		providers = map[string]any{}
-		root["providers"] = providers
-	}
-	providerRaw, ok := providers[ref.Provider]
-	if !ok {
-		providerRaw = map[string]any{}
-		providers[ref.Provider] = providerRaw
-	}
-	providerMap, ok := providerRaw.(map[string]any)
-	if !ok {
-		return fmt.Errorf("providers.%s must be an object", ref.Provider)
-	}
-	modelsRaw, ok := providerMap["models"]
-	if !ok {
-		modelsRaw = map[string]any{}
-		providerMap["models"] = modelsRaw
-	}
-	modelsMap, ok := modelsRaw.(map[string]any)
-	if !ok {
-		return fmt.Errorf("providers.%s.models must be an object", ref.Provider)
-	}
-	modelRaw, ok := modelsMap[ref.Model]
-	if !ok {
-		modelRaw = map[string]any{}
-		modelsMap[ref.Model] = modelRaw
-	}
-	modelMap, ok := modelRaw.(map[string]any)
-	if !ok {
-		return fmt.Errorf("providers.%s.models.%s must be an object", ref.Provider, ref.Model)
-	}
-	if completion.ContextWindow > 0 {
-		modelMap["context_window"] = completion.ContextWindow
-	}
-	if completion.MaxOutputTokens > 0 {
-		modelMap["max_output_tokens"] = completion.MaxOutputTokens
-	}
-	if err := writeAgentConfigAtomic(path, root); err != nil {
+	if err := a.mutateModelConfig(ref, func(modelMap map[string]any) error {
+		if completion.ContextWindow > 0 {
+			modelMap["context_window"] = completion.ContextWindow
+		}
+		if completion.MaxOutputTokens > 0 {
+			modelMap["max_output_tokens"] = completion.MaxOutputTokens
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	return a.reloadLocked()
@@ -1508,6 +1468,66 @@ func writeAgentConfigAtomic(path string, value any) error {
 	return nil
 }
 
+// mutateProviderConfig reads the agent config, navigates to the specified
+// provider map, calls mutate, and writes the config atomically.
+// Caller must hold a.mu.
+func (a *Agent) mutateProviderConfig(providerID string, mutate func(providerMap map[string]any) error) error {
+	path := agentConfigPath(a.home)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("parse config %s: %w", path, err)
+	}
+	providers, ok := root["providers"].(map[string]any)
+	if !ok {
+		providers = map[string]any{}
+		root["providers"] = providers
+	}
+	providerRaw, ok := providers[providerID]
+	if !ok {
+		providerRaw = map[string]any{}
+		providers[providerID] = providerRaw
+	}
+	providerMap, ok := providerRaw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("providers.%s must be an object", providerID)
+	}
+	if err := mutate(providerMap); err != nil {
+		return err
+	}
+	return writeAgentConfigAtomic(path, root)
+}
+
+// mutateModelConfig reads the agent config, navigates to the specified
+// model map, calls mutate, and writes the config atomically.
+// Caller must hold a.mu.
+func (a *Agent) mutateModelConfig(ref catalog.ModelRef, mutate func(modelMap map[string]any) error) error {
+	return a.mutateProviderConfig(ref.Provider, func(providerMap map[string]any) error {
+		modelsRaw, ok := providerMap["models"]
+		if !ok {
+			modelsRaw = map[string]any{}
+			providerMap["models"] = modelsRaw
+		}
+		modelsMap, ok := modelsRaw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("providers.%s.models must be an object", ref.Provider)
+		}
+		modelRaw, ok := modelsMap[ref.Model]
+		if !ok {
+			modelRaw = map[string]any{}
+			modelsMap[ref.Model] = modelRaw
+		}
+		modelMap, ok := modelRaw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("providers.%s.models.%s must be an object", ref.Provider, ref.Model)
+		}
+		return mutate(modelMap)
+	})
+}
+
 // RefreshDiscovery refreshes live model discovery for one enabled provider.
 func (a *Agent) RefreshDiscovery(provider string) error {
 	a.mu.Lock()
@@ -1534,11 +1554,9 @@ func (a *Agent) CurrentModel() ModelInfo {
 	return a.modelInfo(a.currentRef)
 }
 
-// ModelList returns all visible catalog models as flat enriched entries.
-func (a *Agent) ModelList() []ModelListEntry {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	refs := a.catalog.VisibleModels()
+// modelListFrom builds enriched model list entries from the given refs.
+// Caller must hold a.mu.
+func (a *Agent) modelListFrom(refs []catalog.ModelRef) []ModelListEntry {
 	result := make([]ModelListEntry, 0, len(refs))
 	for _, ref := range refs {
 		prov, model, err := a.catalog.LookupOrIncomplete(ref)
@@ -1570,39 +1588,17 @@ func (a *Agent) ModelList() []ModelListEntry {
 	return result
 }
 
+// ModelList returns all visible catalog models as flat enriched entries.
+func (a *Agent) ModelList() []ModelListEntry {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.modelListFrom(a.catalog.VisibleModels())
+}
+
 func (a *Agent) AllModelList() []ModelListEntry {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	refs := a.catalog.AllModels()
-	result := make([]ModelListEntry, 0, len(refs))
-	for _, ref := range refs {
-		prov, model, err := a.catalog.LookupOrIncomplete(ref)
-		if err != nil {
-			continue
-		}
-		displayName := model.Name
-		if displayName == "" {
-			displayName = model.ID
-		}
-		providerName := prov.Name
-		if providerName == "" {
-			providerName = prov.ID
-		}
-		_, incomplete := model.Incomplete()
-		result = append(result, ModelListEntry{
-			Ref:            ref.String(),
-			Provider:       ref.Provider,
-			ProviderName:   providerName,
-			Model:          ref.Model,
-			DisplayName:    displayName,
-			ContextWindow:  model.ContextWindow,
-			Cost:           model.Cost,
-			Hidden:         model.Hidden || prov.Hidden,
-			ProviderHidden: prov.Hidden,
-			Incomplete:     incomplete,
-		})
-	}
-	return result
+	return a.modelListFrom(a.catalog.AllModels())
 }
 
 func (a *Agent) SetModelHidden(refStr string, hidden bool) error {
@@ -1615,49 +1611,10 @@ func (a *Agent) SetModelHidden(refStr string, hidden bool) error {
 	if a.busy {
 		return fmt.Errorf("cannot change model visibility while a turn is running")
 	}
-	path := agentConfigPath(a.home)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
-		return fmt.Errorf("parse config %s: %w", path, err)
-	}
-	providers, ok := root["providers"].(map[string]any)
-	if !ok {
-		providers = map[string]any{}
-		root["providers"] = providers
-	}
-	providerRaw, ok := providers[ref.Provider]
-	if !ok {
-		providerRaw = map[string]any{}
-		providers[ref.Provider] = providerRaw
-	}
-	providerMap, ok := providerRaw.(map[string]any)
-	if !ok {
-		return fmt.Errorf("providers.%s must be an object", ref.Provider)
-	}
-	modelsRaw, ok := providerMap["models"]
-	if !ok {
-		modelsRaw = map[string]any{}
-		providerMap["models"] = modelsRaw
-	}
-	modelsMap, ok := modelsRaw.(map[string]any)
-	if !ok {
-		return fmt.Errorf("providers.%s.models must be an object", ref.Provider)
-	}
-	modelRaw, ok := modelsMap[ref.Model]
-	if !ok {
-		modelRaw = map[string]any{}
-		modelsMap[ref.Model] = modelRaw
-	}
-	modelMap, ok := modelRaw.(map[string]any)
-	if !ok {
-		return fmt.Errorf("providers.%s.models.%s must be an object", ref.Provider, ref.Model)
-	}
-	modelMap["hidden"] = hidden
-	if err := writeAgentConfigAtomic(path, root); err != nil {
+	if err := a.mutateModelConfig(ref, func(modelMap map[string]any) error {
+		modelMap["hidden"] = hidden
+		return nil
+	}); err != nil {
 		return err
 	}
 	if prov := a.catalog.Providers[ref.Provider]; prov != nil {
@@ -1674,31 +1631,10 @@ func (a *Agent) SetProviderHidden(providerID string, hidden bool) error {
 	if a.busy {
 		return fmt.Errorf("cannot change provider visibility while a turn is running")
 	}
-	path := agentConfigPath(a.home)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
-		return fmt.Errorf("parse config %s: %w", path, err)
-	}
-	providers, ok := root["providers"].(map[string]any)
-	if !ok {
-		providers = map[string]any{}
-		root["providers"] = providers
-	}
-	providerRaw, ok := providers[providerID]
-	if !ok {
-		providerRaw = map[string]any{}
-		providers[providerID] = providerRaw
-	}
-	providerMap, ok := providerRaw.(map[string]any)
-	if !ok {
-		return fmt.Errorf("providers.%s must be an object", providerID)
-	}
-	providerMap["hidden"] = hidden
-	if err := writeAgentConfigAtomic(path, root); err != nil {
+	if err := a.mutateProviderConfig(providerID, func(providerMap map[string]any) error {
+		providerMap["hidden"] = hidden
+		return nil
+	}); err != nil {
 		return err
 	}
 	if prov := a.catalog.Providers[providerID]; prov != nil {
