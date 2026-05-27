@@ -201,14 +201,21 @@
       if (data?.turn) currentTurn = data.turn;
     });
 
+    EventsOn('system_signal', (data) => {
+      if (!data) return;
+      if (streamingIdx !== -1 && messages[streamingIdx]) {
+        messages[streamingIdx] = { ...messages[streamingIdx], partial:false };
+      }
+      streamingIdx = -1;
+      messages = [...messages, { _id:mid(), type:'system', content:data.content }];
+    });
+
     EventsOn('turn_end', async (data) => {
       if (streamingIdx !== -1 && messages[streamingIdx]) {
         messages[streamingIdx] = { ...messages[streamingIdx], partial:false };
       }
       if (data?.cancelled) {
-        messages = [...messages, { _id:mid(), type:'system', content:'interrupted' }];
-      } else {
-        messages = messages;
+        messages = [...messages, { _id:mid(), type:'system', content:'System: Request interrupted by user' }];
       }
       streamingIdx = -1;
       busy = false;

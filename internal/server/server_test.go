@@ -233,6 +233,54 @@ func TestHandleEventBroadcastsAndSkipsSubagents(t *testing.T) {
 	}
 }
 
+func TestHandleEventGenericSystemSignalBroadcastsSystemSignal(t *testing.T) {
+	hub := newSSEHub()
+	ch, unsub := hub.subscribe()
+	defer unsub()
+	s := &Server{hub: hub}
+
+	s.handleEvent(agent.Event{Kind: agent.EventGenericSystemSignal, Result: "Model switched to openai/x"})
+
+	select {
+	case msg := <-ch:
+		text := string(msg)
+		if !strings.Contains(text, "event: system_signal") || !strings.Contains(text, `"content":"System: Model switched to openai/x"`) {
+			t.Fatalf("system_signal event = %q", text)
+		}
+	default:
+		t.Fatal("system_signal event not broadcast")
+	}
+}
+
+func TestHandleEventTurnEndIncludesCancelledFlag(t *testing.T) {
+	hub := newSSEHub()
+	ch, unsub := hub.subscribe()
+	defer unsub()
+	s := &Server{hub: hub}
+
+	s.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 7, Cancelled: true})
+	select {
+	case msg := <-ch:
+		text := string(msg)
+		if !strings.Contains(text, "event: turn_end") || !strings.Contains(text, `"cancelled":true`) || !strings.Contains(text, `"turn":7`) {
+			t.Fatalf("turn_end cancelled event = %q", text)
+		}
+	default:
+		t.Fatal("turn_end cancelled event not broadcast")
+	}
+
+	s.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 8, Cancelled: false})
+	select {
+	case msg := <-ch:
+		text := string(msg)
+		if !strings.Contains(text, "event: turn_end") || !strings.Contains(text, `"cancelled":false`) || !strings.Contains(text, `"turn":8`) {
+			t.Fatalf("turn_end normal event = %q", text)
+		}
+	default:
+		t.Fatal("turn_end normal event not broadcast")
+	}
+}
+
 func TestHandleEventCompactionEndBroadcastsSessionChanged(t *testing.T) {
 	a := newServerTestAgent(t)
 	s := &Server{agent: a, hub: newSSEHub()}

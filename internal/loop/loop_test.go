@@ -193,17 +193,176 @@ func TestPendingBackgroundProcessSignalEmitsDisplayWhenDrained(t *testing.T) {
 	}
 }
 
-func TestPlainPendingSignalDoesNotEmitBackgroundDisplay(t *testing.T) {
+func TestPlainPendingSignalEmitsGenericSystemSignalDisplay(t *testing.T) {
 	lp := New(nil, nil, "system")
-	events := make(chan Event, 1)
+	events := make(chan Event, 4)
 	lp.SetEvents(events)
-	lp.AddPendingSignal(PendingSignal{Payload: "plain signal"})
-	lp.DrainPendingSignalsForModel(0)
+	lp.AddPendingSignal(PendingSignal{Payload: "Model switched to openai/gpt-4o"})
+	lp.DrainPendingSignalsForModel(3)
 
 	select {
 	case ev := <-events:
-		t.Fatalf("unexpected event for plain signal: %#v", ev)
+		if ev.Kind != GenericSystemSignalDisplay {
+			t.Fatalf("event kind = %v, want GenericSystemSignalDisplay", ev.Kind)
+		}
+		if ev.Turn != 3 || ev.Result != "Model switched to openai/gpt-4o" {
+			t.Fatalf("event = %#v, want turn 3 and collapsed payload", ev)
+		}
 	default:
+		t.Fatal("expected GenericSystemSignalDisplay event")
+	}
+	select {
+	case ev := <-events:
+		t.Fatalf("unexpected extra event after plain signal: %#v", ev)
+	default:
+	}
+}
+
+func TestDrainEmitsGenericForPassiveAndBackgroundForSidecar(t *testing.T) {
+	lp := New(nil, nil, "system")
+	events := make(chan Event, 8)
+	lp.SetEvents(events)
+	lp.AddPendingSignal(PendingSignal{Payload: "Model switched to openai/x"})
+	lp.AddPendingSignal(PendingSignal{
+		Payload:           "Background process bg-9 finished",
+		BackgroundProcess: &BackgroundProcessDisplay{ID: "bg-9", Reason: "completed", ExitCode: 0, Output: "ok"},
+	})
+	lp.DrainPendingSignalsForModel(5)
+
+	var kinds []EventKind
+	for {
+		select {
+		case ev := <-events:
+			kinds = append(kinds, ev.Kind)
+			continue
+		default:
+		}
+		break
+	}
+	want := []EventKind{GenericSystemSignalDisplay, BackgroundProcessComplete}
+	if len(kinds) != len(want) || kinds[0] != want[0] || kinds[1] != want[1] {
+		t.Fatalf("event kinds = %v, want %v", kinds, want)
+	}
+}
+
+func TestDrainCollapsesMultilinePayloadOnGenericDisplay(t *testing.T) {
+	lp := New(nil, nil, "system")
+	events := make(chan Event, 2)
+	lp.SetEvents(events)
+	lp.AddPendingSignal(PendingSignal{Payload: "line one\n\tline two   spaces\nline three"})
+	lp.DrainPendingSignalsForModel(0)
+
+	ev := <-events
+	if ev.Kind != GenericSystemSignalDisplay {
+		t.Fatalf("event kind = %v", ev.Kind)
+	}
+	if ev.Result != "line one line two spaces line three" {
+		t.Fatalf("collapsed payload = %q", ev.Result)
+	}
+}
+
+func TestEnsureInterruptedSignalAppendsAndPersistsWhenMissing(t *testing.T) {
+	store := &fakeStore{turn: 2}
+	lp := New(nil, nil, "system")
+	lp.SetStore(store)
+	lp.AppendUserMessage(2, "hello")
+
+	lp.EnsureInterruptedSignal(2)
+
+	msgs := lp.Messages()
+	if len(msgs) != 3 {
+		t.Fatalf("messages len = %d, want system+user+signal", len(msgs))
+	}
+	if got := msgs[2].TextContent(); got != interruptedSignal {
+		t.Fatalf("last message = %q, want interruptedSignal", got)
+	}
+	if len(store.messages) != 2 {
+		t.Fatalf("persisted message count = %d, want user+signal", len(store.messages))
+	}
+}
+
+func TestEnsureInterruptedSignalIsNoOpWhenAlreadyPresent(t *testing.T) {
+	store := &fakeStore{turn: 2}
+	lp := New(nil, nil, "system")
+	lp.SetStore(store)
+	lp.AppendUserMessage(2, "hello")
+	lp.EnsureInterruptedSignal(2)
+	before := len(lp.Messages())
+	persistedBefore := len(store.messages)
+
+	lp.EnsureInterruptedSignal(2)
+
+	if got := len(lp.Messages()); got != before {
+		t.Fatalf("messages len = %d, want unchanged %d", got, before)
+	}
+	if got := len(store.messages); got != persistedBefore {
+		t.Fatalf("persisted len = %d, want unchanged %d", got, persistedBefore)
+	}
+}
+
+type cancelAndDenyTool struct {
+	cancel context.CancelFunc
+}
+
+func (cancelAndDenyTool) Name() string                     { return "cancel_and_deny" }
+func (cancelAndDenyTool) Description() string              { return "simulates cancel during permission prompt" }
+func (cancelAndDenyTool) ParametersSchema() map[string]any { return map[string]any{"type": "object"} }
+func (t cancelAndDenyTool) Execute(_ context.Context, _ map[string]any) (string, error) {
+	t.cancel()
+	return "", tool.ErrDenied
+}
+
+func TestRunDeniedPathWithCancelledContextPersistsInterruptedSignal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"cancel_and_deny","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	prov := &catalog.Provider{
+		ID:        "test",
+		Transport: catalog.Transport{BaseURL: server.URL + "/v1"},
+		Models:    map[string]*catalog.Model{"model-a": {ID: "model-a"}},
+	}
+	client := provider.New(prov, prov.Models["model-a"], "")
+	store := &fakeStore{turn: 1}
+	registry := tool.NewRegistry()
+	ctx, cancel := context.WithCancel(context.Background())
+	registry.Register(cancelAndDenyTool{cancel: cancel})
+	lp := New(client, registry, "system")
+	lp.SetStore(store)
+
+	if _, err := lp.Run(ctx, "go"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	msgs := lp.Messages()
+	last := msgs[len(msgs)-1]
+	if last.Role != message.RoleUser || last.TextContent() != interruptedSignal {
+		t.Fatalf("last message = %#v, want interrupted signal", last)
+	}
+	signalCount := 0
+	for _, m := range msgs {
+		if m.Role == message.RoleUser && m.TextContent() == interruptedSignal {
+			signalCount++
+		}
+	}
+	if signalCount != 1 {
+		t.Fatalf("interrupted signal count in history = %d, want 1", signalCount)
+	}
+	persistedSignals := 0
+	for _, raw := range store.messages {
+		var m message.Message
+		if err := json.Unmarshal(raw, &m); err != nil {
+			continue
+		}
+		if m.Role == message.RoleUser && m.TextContent() == interruptedSignal {
+			persistedSignals++
+		}
+	}
+	if persistedSignals != 1 {
+		t.Fatalf("persisted interrupted signal count = %d, want 1", persistedSignals)
 	}
 }
 

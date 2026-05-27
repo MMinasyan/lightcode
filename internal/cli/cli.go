@@ -663,7 +663,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			c.finalizeStreamBufLocked()
 		}
 		if ev.Cancelled {
-			c.writeRaw(renderSystemMsg("  interrupted"))
+			c.writeRaw(renderSystemMsg("System: Request interrupted by user"))
 		}
 		c.busy = false
 		c.state = stateIdle
@@ -721,6 +721,24 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.lastWarningSnapshot = current
 		if c.state == stateIdle {
 			c.printInputPromptLocked()
+		}
+
+	case agent.EventGenericSystemSignal:
+		if c.streamDisplayActive && c.streamNeedsNL {
+			c.writeRaw("\r\n")
+		}
+		if c.streamStarted {
+			c.finalizeStreamBufLocked()
+			c.streamStarted = false
+		} else {
+			c.stopAnimationLocked()
+			c.writeRaw("\r\x1b[2K")
+		}
+		content := "System: " + ev.Result
+		c.messages = append(c.messages, displayEntry{typ: "system", content: content})
+		c.writeRaw(renderSystemMsg(content))
+		if c.busy {
+			c.startAnimationLocked("Thinking")
 		}
 	}
 }

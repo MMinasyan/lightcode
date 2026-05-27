@@ -199,6 +199,9 @@ func (s *Server) handleEvent(ev agent.Event) {
 				"output":   ev.Result,
 			}
 		}
+	case agent.EventGenericSystemSignal:
+		name = "system_signal"
+		data = map[string]any{"content": "System: " + ev.Result}
 	case agent.EventUsage:
 		name = "usage"
 		data = s.agent.TokenUsage()
@@ -207,7 +210,7 @@ func (s *Server) handleEvent(ev agent.Event) {
 		data = map[string]any{"turn": ev.Turn}
 	case agent.EventTurnEnd:
 		name = "turn_end"
-		data = map[string]any{"turn": ev.Turn}
+		data = map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled}
 	case agent.EventError:
 		name = "error"
 		data = map[string]any{"message": ev.Error, "turn": ev.Turn}

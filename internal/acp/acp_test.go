@@ -128,6 +128,51 @@ func TestHandleEventNotifications(t *testing.T) {
 	}
 }
 
+func TestHandleEventGenericSystemSignalPushesSystemSignal(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	r.handleEvent(agent.Event{Kind: agent.EventGenericSystemSignal, Result: "LSP ready"})
+
+	lines := responseLines(t, out.String(), 1)
+	var got Notification
+	if err := json.Unmarshal([]byte(lines[0]), &got); err != nil {
+		t.Fatalf("notification json: %v", err)
+	}
+	if got.Method != "agent/system_signal" {
+		t.Fatalf("method = %q, want agent/system_signal", got.Method)
+	}
+	data, err := json.Marshal(got.Params)
+	if err != nil {
+		t.Fatalf("params marshal: %v", err)
+	}
+	var params map[string]string
+	if err := json.Unmarshal(data, &params); err != nil {
+		t.Fatalf("params json: %v", err)
+	}
+	if params["content"] != "System: LSP ready" {
+		t.Fatalf("content = %q, want System: LSP ready", params["content"])
+	}
+}
+
+func TestHandleEventTurnEndIncludesCancelledFlag(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 4, Cancelled: true})
+
+	lines := responseLines(t, out.String(), 1)
+	var got Notification
+	if err := json.Unmarshal([]byte(lines[0]), &got); err != nil {
+		t.Fatalf("notification json: %v", err)
+	}
+	if got.Method != "agent/turn_end" {
+		t.Fatalf("method = %q", got.Method)
+	}
+	data, _ := json.Marshal(got.Params)
+	if !strings.Contains(string(data), `"cancelled":true`) || !strings.Contains(string(data), `"turn":4`) {
+		t.Fatalf("params = %s, want cancelled true and turn 4", data)
+	}
+}
+
 func TestHandleEventCompactionEndPushesSessionChanged(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{agent: newACPTestAgent(t), out: &out}

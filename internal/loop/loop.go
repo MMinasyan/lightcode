@@ -83,6 +83,9 @@ const (
 	Warning
 	// BackgroundProcessComplete carries a background process completion display item.
 	BackgroundProcessComplete
+	// GenericSystemSignalDisplay carries a non-background pending signal as
+	// a display event so adapters can render it as a system message.
+	GenericSystemSignalDisplay
 )
 
 // Event is a structured tool-call event for UIs that want to render tool
@@ -311,6 +314,24 @@ func (l *Loop) AppendUserMessage(turn int, content string) {
 	l.persistMessage(turn, msg)
 }
 
+// EnsureInterruptedSignal appends and persists the interrupted system signal
+// for the given turn unless the last user-role message is already that signal.
+// Idempotent: safe to call after the streaming-cancel fast path has already
+// recorded the signal, and after a permission-prompt cancellation that did not.
+func (l *Loop) EnsureInterruptedSignal(turn int) {
+	for i := len(l.messages) - 1; i >= 0; i-- {
+		if l.messages[i].Role == message.RoleUser {
+			if l.messages[i].TextContent() == interruptedSignal {
+				return
+			}
+			break
+		}
+	}
+	signalMsg := message.NewText(message.RoleUser, interruptedSignal)
+	l.messages = append(l.messages, signalMsg)
+	l.persistMessage(turn, signalMsg)
+}
+
 // AddPendingSignal records async model input. The loop drains pending signals
 // only when the next model request can legally include them.
 func (l *Loop) AddPendingSignal(signal PendingSignal) {
@@ -360,9 +381,17 @@ func (l *Loop) DrainPendingSignalsForModel(turn int) {
 				Turn:              turn,
 				BackgroundProcess: bg,
 			})
+		} else {
+			l.emit(Event{
+				Kind:   GenericSystemSignalDisplay,
+				Result: collapseOneLine(signal.Payload),
+				Turn:   turn,
+			})
 		}
 	}
 }
+
+func collapseOneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
 
 func (l *Loop) appendSignal(signal PendingSignal, turn int) {
 	msg := message.NewText(message.RoleUser, SystemSignal(signal.Payload))
@@ -485,6 +514,9 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		_ = l.store.TouchActivity()
 	}
 	defer func() {
+		if ctx.Err() != nil {
+			l.EnsureInterruptedSignal(turn)
+		}
 		if l.store != nil && turn > 0 {
 			_ = l.store.MarkTurnComplete(turn)
 		}

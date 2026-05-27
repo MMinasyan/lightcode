@@ -74,6 +74,57 @@ func TestWarningSnapshotPrintsOnlyNewWarnings(t *testing.T) {
 	}
 }
 
+func TestHandleGenericSystemSignalIdleRendersAndAppends(t *testing.T) {
+	c := New(nil)
+	var out bytes.Buffer
+	c.out = &out
+
+	c.handleEvent(agent.Event{Kind: agent.EventGenericSystemSignal, Result: "LSP gopls ready"})
+
+	rendered := out.String()
+	if !strings.Contains(rendered, "System: LSP gopls ready") {
+		t.Fatalf("system signal not rendered: %q", rendered)
+	}
+	if len(c.messages) != 1 || c.messages[0].typ != "system" || c.messages[0].content != "System: LSP gopls ready" {
+		t.Fatalf("display entry = %#v", c.messages)
+	}
+}
+
+func TestHandleGenericSystemSignalBusyRestartsThinking(t *testing.T) {
+	c := New(nil)
+	var out bytes.Buffer
+	c.out = &out
+	c.busy = true
+
+	c.handleEvent(agent.Event{Kind: agent.EventGenericSystemSignal, Result: "Model switched to openai/x"})
+
+	rendered := out.String()
+	if !strings.Contains(rendered, "System: Model switched to openai/x") {
+		t.Fatalf("system signal not rendered: %q", rendered)
+	}
+	if len(c.messages) != 1 || c.messages[0].typ != "system" {
+		t.Fatalf("display entry = %#v", c.messages)
+	}
+}
+
+func TestTurnEndCancelledRendersSystemPrefixedInterrupted(t *testing.T) {
+	c := New(nil)
+	var out bytes.Buffer
+	c.out = &out
+	c.busy = true
+	c.state = stateStreaming
+
+	c.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Cancelled: true})
+
+	rendered := out.String()
+	if !strings.Contains(rendered, "System: Request interrupted by user") {
+		t.Fatalf("interrupted message not rendered with System prefix: %q", rendered)
+	}
+	if strings.Contains(rendered, "  interrupted") {
+		t.Fatalf("legacy `  interrupted` text still present: %q", rendered)
+	}
+}
+
 func TestToolDisplayEntryEndsWithBlankLineWithoutResult(t *testing.T) {
 	c := New(nil)
 	var out bytes.Buffer

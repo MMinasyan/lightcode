@@ -95,6 +95,8 @@ func (a *App) handleEvent(ev agent.Event) {
 				"output":   ev.Result,
 			})
 		}
+	case agent.EventGenericSystemSignal:
+		wailsRuntime.EventsEmit(a.ctx, "system_signal", map[string]any{"content": "System: " + ev.Result})
 	case agent.EventUsage:
 		wailsRuntime.EventsEmit(a.ctx, "usage", a.svc.TokenUsage())
 	case agent.EventTurnStart:
