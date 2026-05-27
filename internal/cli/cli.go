@@ -223,7 +223,83 @@ func (c *CLI) handleKey(k keyMsg) {
 	}
 }
 
+func (c *CLI) handleInputEdit(k keyMsg, redrawPrompt bool) bool {
+	switch k.Special {
+	case keyBackspace:
+		if c.input.DeleteBack() {
+			c.history.Edited()
+			if redrawPrompt {
+				c.printInputPrompt()
+			}
+		}
+		return true
+	case keyDelete:
+		if c.input.DeleteForward() {
+			c.history.Edited()
+			if redrawPrompt {
+				c.printInputPrompt()
+			}
+		}
+		return true
+	case keyLeft:
+		if c.input.MoveLeft() {
+			if redrawPrompt {
+				c.printInputPrompt()
+			}
+		}
+		return true
+	case keyRight:
+		if c.input.MoveRight() {
+			if redrawPrompt {
+				c.printInputPrompt()
+			}
+		}
+		return true
+	case keyHome:
+		c.input.MoveHome()
+		if redrawPrompt {
+			c.printInputPrompt()
+		}
+		return true
+	case keyEnd:
+		c.input.MoveEnd()
+		if redrawPrompt {
+			c.printInputPrompt()
+		}
+		return true
+	case keyUp:
+		if text, ok := c.history.Prev(c.input.String()); ok {
+			c.input.Set(text)
+			if redrawPrompt {
+				c.printInputPrompt()
+			}
+		}
+		return true
+	case keyDown:
+		if text, ok := c.history.Next(); ok {
+			c.input.Set(text)
+			if redrawPrompt {
+				c.printInputPrompt()
+			}
+		}
+		return true
+	default:
+		if k.Rune != 0 {
+			c.input.Insert(k.Rune)
+			c.history.Edited()
+			if redrawPrompt {
+				c.printInputPrompt()
+			}
+			return true
+		}
+		return false
+	}
+}
+
 func (c *CLI) handleKeyIdle(k keyMsg) {
+	if c.handleInputEdit(k, true) {
+		return
+	}
 	switch k.Special {
 	case keyEnter:
 		text := c.input.String()
@@ -252,18 +328,6 @@ func (c *CLI) handleKeyIdle(k keyMsg) {
 
 		c.submitInput(text)
 
-	case keyBackspace:
-		if c.input.DeleteBack() {
-			c.history.Edited()
-			c.printInputPrompt()
-		}
-
-	case keyDelete:
-		if c.input.DeleteForward() {
-			c.history.Edited()
-			c.printInputPrompt()
-		}
-
 	case keyTab:
 		before := c.input.String()
 		completed := completeSlashCommand(c.input.String())
@@ -273,50 +337,16 @@ func (c *CLI) handleKeyIdle(k keyMsg) {
 		}
 		c.printInputPrompt()
 
-	case keyLeft:
-		if c.input.MoveLeft() {
-			c.printInputPrompt()
-		}
-
-	case keyRight:
-		if c.input.MoveRight() {
-			c.printInputPrompt()
-		}
-
-	case keyHome:
-		c.input.MoveHome()
-		c.printInputPrompt()
-
-	case keyEnd:
-		c.input.MoveEnd()
-		c.printInputPrompt()
-
-	case keyUp:
-		if text, ok := c.history.Prev(c.input.String()); ok {
-			c.input.Set(text)
-			c.printInputPrompt()
-		}
-
-	case keyDown:
-		if text, ok := c.history.Next(); ok {
-			c.input.Set(text)
-			c.printInputPrompt()
-		}
-
 	case keyCtrlC, keyCtrlD:
 		c.restoreTerminal()
 		os.Exit(0)
-
-	default:
-		if k.Rune != 0 {
-			c.input.Insert(k.Rune)
-			c.history.Edited()
-			c.printInputPrompt()
-		}
 	}
 }
 
 func (c *CLI) handleKeyStreaming(k keyMsg) {
+	if c.handleInputEdit(k, false) {
+		return
+	}
 	switch k.Special {
 	case keyCtrlC, keyEscape:
 		_ = c.agent.Cancel()
@@ -330,35 +360,6 @@ func (c *CLI) handleKeyStreaming(k keyMsg) {
 			} else {
 				c.msgQueue = append(c.msgQueue, text)
 			}
-		}
-	case keyBackspace:
-		if c.input.DeleteBack() {
-			c.history.Edited()
-		}
-	case keyDelete:
-		if c.input.DeleteForward() {
-			c.history.Edited()
-		}
-	case keyLeft:
-		c.input.MoveLeft()
-	case keyRight:
-		c.input.MoveRight()
-	case keyHome:
-		c.input.MoveHome()
-	case keyEnd:
-		c.input.MoveEnd()
-	case keyUp:
-		if text, ok := c.history.Prev(c.input.String()); ok {
-			c.input.Set(text)
-		}
-	case keyDown:
-		if text, ok := c.history.Next(); ok {
-			c.input.Set(text)
-		}
-	default:
-		if k.Rune != 0 {
-			c.input.Insert(k.Rune)
-			c.history.Edited()
 		}
 	}
 }

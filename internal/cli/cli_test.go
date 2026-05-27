@@ -282,3 +282,140 @@ func equalStringSlices(a, b []string) bool {
 	}
 	return true
 }
+
+func TestHandleKeyIdleInputEditing(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{
+		out:     &buf,
+		mu:      &sync.Mutex{},
+		input:   newInputLine(),
+		history: newInputHistory(),
+	}
+
+	// Rune insertion redraws prompt in idle
+	c.handleKeyIdle(keyMsg{Rune: 'a'})
+	if got := c.input.String(); got != "a" {
+		t.Fatalf("input = %q, want %q", got, "a")
+	}
+	if !strings.Contains(buf.String(), "> a") {
+		t.Fatal("idle rune should redraw prompt")
+	}
+
+	// Backspace
+	buf.Reset()
+	c.handleKeyIdle(keyMsg{Special: keyBackspace})
+	if got := c.input.String(); got != "" {
+		t.Fatalf("input = %q, want empty after backspace", got)
+	}
+
+	// Navigation: insert "xy", move left, move home, move end
+	buf.Reset()
+	c.handleKeyIdle(keyMsg{Rune: 'x'})
+	c.handleKeyIdle(keyMsg{Rune: 'y'})
+	buf.Reset()
+	c.handleKeyIdle(keyMsg{Special: keyLeft})
+	if c.input.cursor != 1 {
+		t.Fatalf("cursor = %d, want 1 after left", c.input.cursor)
+	}
+	c.handleKeyIdle(keyMsg{Special: keyHome})
+	if c.input.cursor != 0 {
+		t.Fatalf("cursor = %d, want 0 after home", c.input.cursor)
+	}
+	c.handleKeyIdle(keyMsg{Special: keyEnd})
+	if c.input.cursor != 2 {
+		t.Fatalf("cursor = %d, want 2 after end", c.input.cursor)
+	}
+
+	// Delete: clear, insert "xy", move home, delete forward
+	buf.Reset()
+	c.input.Clear()
+	c.handleKeyIdle(keyMsg{Rune: 'x'})
+	c.handleKeyIdle(keyMsg{Rune: 'y'})
+	c.handleKeyIdle(keyMsg{Special: keyHome})
+	c.handleKeyIdle(keyMsg{Special: keyDelete})
+	if got := c.input.String(); got != "y" {
+		t.Fatalf("input = %q, want %q after delete", got, "y")
+	}
+
+	// Right: cursor at 0 (from Home above), move right
+	c.handleKeyIdle(keyMsg{Special: keyHome})
+	c.handleKeyIdle(keyMsg{Special: keyRight})
+	if c.input.cursor != 1 {
+		t.Fatalf("cursor = %d, want 1 after right", c.input.cursor)
+	}
+
+	// History: clear input first so Prev stores empty draft,
+	// then Next restores empty
+	c.input.Clear()
+	c.history.Add("prev")
+	c.handleKeyIdle(keyMsg{Special: keyUp})
+	if got := c.input.String(); got != "prev" {
+		t.Fatalf("input = %q, want %q after up", got, "prev")
+	}
+	c.handleKeyIdle(keyMsg{Special: keyDown})
+	if got := c.input.String(); got != "" {
+		t.Fatalf("input = %q, want empty after down", got)
+	}
+}
+
+func TestHandleKeyStreamingInputEditing(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{
+		out:     &buf,
+		mu:      &sync.Mutex{},
+		input:   newInputLine(),
+		history: newInputHistory(),
+	}
+
+	// Rune insertion does NOT redraw prompt in streaming
+	c.handleKeyStreaming(keyMsg{Rune: 'a'})
+	if got := c.input.String(); got != "a" {
+		t.Fatalf("input = %q, want %q", got, "a")
+	}
+	if strings.Contains(buf.String(), "> a") {
+		t.Fatal("streaming rune should not redraw prompt")
+	}
+
+	// Backspace
+	c.handleKeyStreaming(keyMsg{Special: keyBackspace})
+	if got := c.input.String(); got != "" {
+		t.Fatalf("input = %q, want empty after backspace", got)
+	}
+
+	// Navigation
+	c.handleKeyStreaming(keyMsg{Rune: 'x'})
+	c.handleKeyStreaming(keyMsg{Rune: 'y'})
+	c.handleKeyStreaming(keyMsg{Special: keyLeft})
+	if c.input.cursor != 1 {
+		t.Fatalf("cursor = %d, want 1 after left", c.input.cursor)
+	}
+	c.handleKeyStreaming(keyMsg{Special: keyRight})
+	if c.input.cursor != 2 {
+		t.Fatalf("cursor = %d, want 2 after right", c.input.cursor)
+	}
+	c.handleKeyStreaming(keyMsg{Special: keyHome})
+	if c.input.cursor != 0 {
+		t.Fatalf("cursor = %d, want 0 after home", c.input.cursor)
+	}
+	c.handleKeyStreaming(keyMsg{Special: keyDelete})
+	if got := c.input.String(); got != "y" {
+		t.Fatalf("input = %q, want %q after delete", got, "y")
+	}
+	c.handleKeyStreaming(keyMsg{Special: keyEnd})
+	if c.input.cursor != 1 {
+		t.Fatalf("cursor = %d, want 1 after end", c.input.cursor)
+	}
+
+	// History: clear input first so Prev stores empty draft,
+	// then Next restores empty
+	c.input.Clear()
+	c.history.Add("prev")
+	c.handleKeyStreaming(keyMsg{Special: keyUp})
+	if got := c.input.String(); got != "prev" {
+		t.Fatalf("input = %q, want %q after up", got, "prev")
+	}
+	c.handleKeyStreaming(keyMsg{Special: keyDown})
+	if got := c.input.String(); got != "" {
+		t.Fatalf("input = %q, want empty after down", got)
+	}
+}

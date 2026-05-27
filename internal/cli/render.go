@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -697,62 +698,34 @@ func formatMultilineHeaderArg(s string) string {
 }
 
 func extractJSONString(jsonStr, key string) string {
-	search := `"` + key + `"`
-	idx := strings.Index(jsonStr, search)
-	if idx == -1 {
+	var m map[string]any
+	if json.Unmarshal([]byte(jsonStr), &m) != nil {
 		return ""
 	}
-	rest := jsonStr[idx+len(search):]
-	rest = strings.TrimLeft(rest, " \t\n\r:")
-	if len(rest) == 0 || rest[0] != '"' {
-		return ""
-	}
-	rest = rest[1:]
-	var b strings.Builder
-	for i := 0; i < len(rest); i++ {
-		if rest[i] == '\\' && i+1 < len(rest) {
-			switch rest[i+1] {
-			case '"':
-				b.WriteByte('"')
-			case '\\':
-				b.WriteByte('\\')
-			case 'n':
-				b.WriteByte('\n')
-			case 't':
-				b.WriteByte('\t')
-			default:
-				b.WriteByte(rest[i+1])
-			}
-			i++
-			continue
-		}
-		if rest[i] == '"' {
-			return b.String()
-		}
-		b.WriteByte(rest[i])
-	}
-	return b.String()
+	s, _ := m[key].(string)
+	return s
 }
 
 func extractJSONNumber(jsonStr, key string) string {
-	search := `"` + key + `"`
-	idx := strings.Index(jsonStr, search)
-	if idx == -1 {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal([]byte(jsonStr), &raw) != nil {
 		return ""
 	}
-	rest := jsonStr[idx+len(search):]
-	rest = strings.TrimLeft(rest, " \t\n\r:")
-	if len(rest) == 0 {
+	v, ok := raw[key]
+	if !ok {
 		return ""
 	}
-	end := 0
-	for end < len(rest) && (rest[end] >= '0' && rest[end] <= '9' || rest[end] == '.' || rest[end] == '-') {
-		end++
-	}
-	if end == 0 {
+	v = bytes.TrimSpace(v)
+	if len(v) == 0 || v[0] == '"' {
 		return ""
 	}
-	return rest[:end]
+	dec := json.NewDecoder(bytes.NewReader(v))
+	dec.UseNumber()
+	var n json.Number
+	if dec.Decode(&n) != nil {
+		return ""
+	}
+	return n.String()
 }
 
 type displayEntry struct {

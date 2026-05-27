@@ -1,5 +1,6 @@
 <script>
   import { createEventDispatcher } from 'svelte';
+  import { fmtTokens } from '../lib/format.js';
   export let sessionId = '';
   export let projectName = '';
   export let tokens = { total: { cache:0, input:0, output:0, known:true }, perModel: [], contextUsed: 0, contextWindow: 0 };
@@ -8,21 +9,13 @@
   export let warnings = [];
   const dispatch = createEventDispatcher();
 
-  function fmt(n, known) {
-    if (!known) return '-';
-    if (n < 1000) return String(n);
-    if (n < 1_000_000) return (n/1000).toFixed(1).replace(/\.0$/, '') + 'k';
-    if (n < 1_000_000_000) return (n/1_000_000).toFixed(1).replace(/\.0$/, '') + 'M';
-    return (n/1_000_000_000).toFixed(1).replace(/\.0$/, '') + 'B';
-  }
-
   $: contextUsed = tokens.contextUsed || 0;
   $: contextWindow = tokens.contextWindow || 0;
   $: pct = contextWindow > 0 ? contextUsed / contextWindow : 0;
   $: showContext = contextWindow > 0;
   $: canCompact = !busy && !compacting && contextUsed > 0;
   $: contextTitle = showContext
-    ? fmt(contextUsed, true) + '/' + fmt(contextWindow, true) + ' context used\n' + (compacting ? 'compacting...' : 'click to compact session')
+    ? fmtTokens(contextUsed, true) + '/' + fmtTokens(contextWindow, true) + ' context used\n' + (compacting ? 'compacting...' : 'click to compact session')
     : '';
 
   // SVG circle math: radius=8, circumference=2*pi*8≈50.27
@@ -73,9 +66,9 @@
   <div class="tokens"
     on:click={() => dispatch('openTokens')}
     role="button" tabindex="0">
-    <span class="tok">⚡ {fmt(tokens.total.cache, tokens.total.known)}</span>
-    <span class="tok">↑ {fmt(tokens.total.input, tokens.total.known)}</span>
-    <span class="tok">↓ {fmt(tokens.total.output, tokens.total.known)}</span>
+    <span class="tok">⚡ {fmtTokens(tokens.total.cache, tokens.total.known)}</span>
+    <span class="tok">↑ {fmtTokens(tokens.total.input, tokens.total.known)}</span>
+    <span class="tok">↓ {fmtTokens(tokens.total.output, tokens.total.known)}</span>
   </div>
   <!-- svelte-ignore a11y-click-events-have-key-events -->
   <button class="settings-btn" on:click={() => dispatch('openSettings')} title="Settings">

@@ -233,3 +233,59 @@ func TestPermissionPromptShowsResolvedTarget(t *testing.T) {
 		t.Fatalf("rendered rows = %d, permissionPromptRows = %d\n%s", got, want, rendered)
 	}
 }
+
+func TestExtractJSONString(t *testing.T) {
+	cases := []struct{ json, key, want string }{
+		{`{"path":"/tmp/x.go"}`, "path", "/tmp/x.go"},
+		{`{"command":"echo \"hello\""}`, "command", `echo "hello"`},
+		{`{"path":"a\nb"}`, "path", "a\nb"},
+		{`{"path":"a\rb"}`, "path", "a\rb"},
+		{`{"path":"a\tb"}`, "path", "a\tb"},
+		{`{"path":"a\\b"}`, "path", `a\b`},
+		{`{"path":"\u0041\u0042\u0043"}`, "path", "ABC"},
+		{`{"path":"\u00e9"}`, "path", "\u00e9"},
+		{`{}`, "path", ""},
+		{`not json`, "path", ""},
+		{`{"other":1}`, "path", ""},
+		{`{"path":"ok"} trailing`, "path", ""},
+	}
+	for _, tc := range cases {
+		got := extractJSONString(tc.json, tc.key)
+		if got != tc.want {
+			t.Errorf("extractJSONString(%q, %q) = %q, want %q", tc.json, tc.key, got, tc.want)
+		}
+	}
+}
+
+func TestExtractJSONNumber(t *testing.T) {
+	cases := []struct{ json, key, want string }{
+		{`{"seconds":5}`, "seconds", "5"},
+		{`{"seconds":1.5}`, "seconds", "1.5"},
+		{`{"seconds":1e3}`, "seconds", "1e3"},
+		{`{"seconds":1.5e2}`, "seconds", "1.5e2"},
+		{`{}`, "seconds", ""},
+		{`not json`, "seconds", ""},
+		{`{"other":"text"}`, "seconds", ""},
+		{`{"seconds":5} trailing`, "seconds", ""},
+		{`{"seconds":"5"}`, "seconds", ""},
+		{`{"seconds":"1.5"}`, "seconds", ""},
+	}
+	for _, tc := range cases {
+		got := extractJSONNumber(tc.json, tc.key)
+		if got != tc.want {
+			t.Errorf("extractJSONNumber(%q, %q) = %q, want %q", tc.json, tc.key, got, tc.want)
+		}
+	}
+}
+
+func TestFormatToolArgsSleepQuotedNumberFallback(t *testing.T) {
+	got := formatToolArgs("sleep", `{"seconds":"5"}`)
+	if got != `{"seconds":"5"}` {
+		t.Errorf("formatToolArgs sleep with quoted number = %q, want raw args fallback", got)
+	}
+
+	got = formatToolArgs("sleep", `{"seconds":5}`)
+	if got != "5s" {
+		t.Errorf("formatToolArgs sleep with real number = %q, want %q", got, "5s")
+	}
+}

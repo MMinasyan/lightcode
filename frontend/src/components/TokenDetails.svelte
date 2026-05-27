@@ -1,15 +1,8 @@
 <script>
   import { createEventDispatcher } from 'svelte';
+  import { fmtTokens } from '../lib/format.js';
   export let tokens = { total: { cache:0, input:0, output:0, known:true }, perModel: [] };
   const dispatch = createEventDispatcher();
-
-  function fmt(n, known) {
-    if (!known) return '-';
-    if (n < 1000) return String(n);
-    if (n < 1_000_000) return (n/1000).toFixed(1).replace(/\.0$/, '') + 'k';
-    if (n < 1_000_000_000) return (n/1_000_000).toFixed(1).replace(/\.0$/, '') + 'M';
-    return (n/1_000_000_000).toFixed(1).replace(/\.0$/, '') + 'B';
-  }
 
   function pad(s, w) { s = String(s); return s.length >= w ? s : s + ' '.repeat(w - s.length); }
   function padL(s, w) { s = String(s); return s.length >= w ? s : ' '.repeat(w - s.length) + s; }
@@ -17,12 +10,12 @@
   $: lines = (() => {
     const per = tokens?.perModel || [];
     const items = per.flatMap(e => [
-      { col0: e.model, c1: fmt(e.cache, e.known), c2: fmt(e.input, e.known), c3: fmt(e.output, e.known) },
+      { col0: e.model, c1: fmtTokens(e.cache, e.known), c2: fmtTokens(e.input, e.known), c3: fmtTokens(e.output, e.known) },
       { col0: e.provider, c1: '', c2: '', c3: '' },
     ]);
     const showTotal = per.length > 1;
     if (showTotal) {
-      items.push({ col0: 'total', c1: fmt(tokens.total.cache, tokens.total.known), c2: fmt(tokens.total.input, tokens.total.known), c3: fmt(tokens.total.output, tokens.total.known) });
+      items.push({ col0: 'total', c1: fmtTokens(tokens.total.cache, tokens.total.known), c2: fmtTokens(tokens.total.input, tokens.total.known), c3: fmtTokens(tokens.total.output, tokens.total.known) });
     }
     const w0 = Math.max(5, ...items.map(r => r.col0.length));
     const w1 = Math.max(7, ...items.map(r => r.c1.length));
