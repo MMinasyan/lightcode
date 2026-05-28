@@ -652,6 +652,48 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			c.startAnimationLocked("Thinking")
 		}
 
+	case agent.EventUserMessageDisplay:
+		if c.streamDisplayActive && c.streamNeedsNL {
+			c.writeRaw("\r\n")
+		}
+		if c.streamStarted {
+			c.finalizeStreamBufLocked()
+			c.streamStarted = false
+		} else {
+			c.stopAnimationLocked()
+			c.writeRaw("\r\x1b[2K")
+		}
+		c.messages = append(c.messages, displayEntry{
+			typ:     "user",
+			content: ev.Result,
+			turn:    ev.Turn,
+		})
+		c.printLineLocked(renderUserMsg(ev.Result, c.width))
+		if c.busy {
+			c.startAnimationLocked("Thinking")
+		}
+
+	case agent.EventGenericSystemSignal:
+		if c.streamDisplayActive && c.streamNeedsNL {
+			c.writeRaw("\r\n")
+		}
+		if c.streamStarted {
+			c.finalizeStreamBufLocked()
+			c.streamStarted = false
+		} else {
+			c.stopAnimationLocked()
+			c.writeRaw("\r\x1b[2K")
+		}
+		content := "System: " + ev.Result
+		c.messages = append(c.messages, displayEntry{
+			typ:     "system",
+			content: content,
+		})
+		c.printLineLocked(renderSystemMsg(content))
+		if c.busy {
+			c.startAnimationLocked("Thinking")
+		}
+
 	case agent.EventTurnEnd:
 		c.stopAnimationLocked()
 		c.erasePermissionBlockLocked()
@@ -661,9 +703,6 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.writeRaw("\r\x1b[2K")
 		if c.streamStarted {
 			c.finalizeStreamBufLocked()
-		}
-		if ev.Cancelled {
-			c.writeRaw(renderSystemMsg("  interrupted"))
 		}
 		c.busy = false
 		c.state = stateIdle
@@ -968,7 +1007,6 @@ func (c *CLI) submitInputLocked(text string) {
 		c.flushQueueLocked()
 		return
 	}
-	c.printLineLocked(renderUserMsg(text, c.width))
 	c.startAnimationLocked("Thinking")
 
 	go func() {
@@ -1030,14 +1068,6 @@ func (c *CLI) flushQueueLocked() {
 				break
 			}
 			c.msgQueue = c.msgQueue[1:]
-		}
-		c.stopAnimationLocked()
-		c.writeRaw("\r\x1b[2K")
-		for _, text := range queue {
-			c.printLineLocked(renderUserMsg(text, c.width))
-		}
-		if c.busy {
-			c.startAnimationLocked("Thinking")
 		}
 		c.mu.Unlock()
 	}()

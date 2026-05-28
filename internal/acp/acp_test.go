@@ -128,6 +128,66 @@ func TestHandleEventNotifications(t *testing.T) {
 	}
 }
 
+func TestHandleEventNotifiesUserMessageAndSystemSignal(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+
+	r.handleEvent(agent.Event{Kind: agent.EventUserMessageDisplay, Turn: 4, Result: "hello"})
+	r.handleEvent(agent.Event{Kind: agent.EventGenericSystemSignal, Turn: 4, Result: "Model switched to x/y"})
+
+	lines := responseLines(t, out.String(), 2)
+	var um Notification
+	if err := json.Unmarshal([]byte(lines[0]), &um); err != nil {
+		t.Fatalf("user_message json: %v", err)
+	}
+	if um.Method != "agent/user_message" {
+		t.Fatalf("user_message method = %q", um.Method)
+	}
+	umData, _ := json.Marshal(um.Params)
+	if !strings.Contains(string(umData), `"content":"hello"`) || !strings.Contains(string(umData), `"turn":4`) {
+		t.Fatalf("user_message params = %s", umData)
+	}
+
+	var ss Notification
+	if err := json.Unmarshal([]byte(lines[1]), &ss); err != nil {
+		t.Fatalf("system_signal json: %v", err)
+	}
+	if ss.Method != "agent/system_signal" {
+		t.Fatalf("system_signal method = %q", ss.Method)
+	}
+	ssData, _ := json.Marshal(ss.Params)
+	if !strings.Contains(string(ssData), `"content":"System: Model switched to x/y"`) {
+		t.Fatalf("system_signal params = %s", ssData)
+	}
+}
+
+func TestHandleEventTurnEndIncludesCancelled(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+
+	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 3, Cancelled: true})
+	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 5, Cancelled: false})
+
+	lines := responseLines(t, out.String(), 2)
+	for i, expectCancelled := range []bool{true, false} {
+		var n Notification
+		if err := json.Unmarshal([]byte(lines[i]), &n); err != nil {
+			t.Fatalf("turn_end[%d] json: %v", i, err)
+		}
+		if n.Method != "agent/turn_end" {
+			t.Fatalf("turn_end[%d] method = %q", i, n.Method)
+		}
+		data, _ := json.Marshal(n.Params)
+		want := `"cancelled":false`
+		if expectCancelled {
+			want = `"cancelled":true`
+		}
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("turn_end[%d] params = %s, want %s", i, data, want)
+		}
+	}
+}
+
 func TestHandleEventCompactionEndPushesSessionChanged(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{agent: newACPTestAgent(t), out: &out}

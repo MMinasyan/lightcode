@@ -83,6 +83,15 @@ const (
 	Warning
 	// BackgroundProcessComplete carries a background process completion display item.
 	BackgroundProcessComplete
+	// UserMessageDisplay is emitted whenever a user-role message is appended
+	// to history. Carries the persisted content and the owning turn so adapters
+	// can render user messages in the same order they appear in reload.
+	UserMessageDisplay
+	// GenericSystemSignalDisplay is emitted whenever a non-background
+	// <system-signal> entry is appended to history. Result carries the
+	// already-collapsed one-line payload (no <system-signal> wrapper, no
+	// HTML escapes, no newlines) so adapters can prefix and render directly.
+	GenericSystemSignalDisplay
 )
 
 // Event is a structured tool-call event for UIs that want to render tool
@@ -202,6 +211,16 @@ func (l *Loop) emit(ev Event) {
 	if l.events == nil {
 		return
 	}
+	if isTranscriptEvent(ev.Kind) {
+		// Transcript display events back the backend-owned display-order
+		// invariant: every persisted display item must produce exactly
+		// one live event in the same position. Dropping any of them
+		// makes the live UI disagree with reload, so block until the
+		// adapter has drained instead.
+		l.flushDroppedWarningLocked()
+		l.events <- ev
+		return
+	}
 	if l.droppedEvents > 0 && ev.Kind != Warning {
 		warning := Event{Kind: Warning, Result: fmt.Sprintf("dropped %d events because event channel was full", l.droppedEvents)}
 		select {
@@ -215,6 +234,38 @@ func (l *Loop) emit(ev Event) {
 	default:
 		l.droppedEvents++
 	}
+}
+
+// flushDroppedWarningLocked emits the pending dropped-events warning before a
+// non-droppable event so chronological ordering is preserved. The warning
+// itself is still droppable.
+func (l *Loop) flushDroppedWarningLocked() {
+	if l.droppedEvents == 0 {
+		return
+	}
+	warning := Event{Kind: Warning, Result: fmt.Sprintf("dropped %d events because event channel was full", l.droppedEvents)}
+	select {
+	case l.events <- warning:
+		l.droppedEvents = 0
+	default:
+	}
+}
+
+// isTranscriptEvent reports whether ev.Kind contributes a row to the live or
+// persisted transcript and therefore must not be dropped from the event
+// stream. Keep this in sync with the projection rules in the
+// TestEventOrderEqualsMessagesForFrontend invariant test.
+func isTranscriptEvent(kind EventKind) bool {
+	switch kind {
+	case TextDelta,
+		ToolCallStart,
+		ToolCallEnd,
+		BackgroundProcessComplete,
+		UserMessageDisplay,
+		GenericSystemSignalDisplay:
+		return true
+	}
+	return false
 }
 
 // Messages returns the current in-memory conversation, including the
@@ -306,9 +357,24 @@ func (l *Loop) UpdateSystemPrompt(content string) {
 // it under the given turn. Does not run the model.
 func (l *Loop) AppendUserMessage(turn int, content string) {
 	l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
+	l.persistAndEmitUserMessage(turn, content)
+}
+
+// persistAndEmitUserMessage is the single chokepoint for appending a user-role
+// message into history: it appends to l.messages, persists to the store, and
+// emits a UserMessageDisplay event. Callers own turnBoundaries.
+func (l *Loop) persistAndEmitUserMessage(turn int, content string) {
 	msg := message.NewText(message.RoleUser, content)
 	l.messages = append(l.messages, msg)
 	l.persistMessage(turn, msg)
+	l.emit(Event{Kind: UserMessageDisplay, Turn: turn, Result: content})
+}
+
+// collapseOneLine flattens runs of whitespace (including newlines) to single
+// spaces and trims leading/trailing whitespace. Used for system-signal payload
+// rendering so display strings have no embedded line breaks.
+func collapseOneLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // AddPendingSignal records async model input. The loop drains pending signals
@@ -360,8 +426,35 @@ func (l *Loop) DrainPendingSignalsForModel(turn int) {
 				Turn:              turn,
 				BackgroundProcess: bg,
 			})
+			continue
+		}
+		l.emit(Event{
+			Kind:   GenericSystemSignalDisplay,
+			Result: collapseOneLine(signal.Payload),
+			Turn:   turn,
+		})
+	}
+}
+
+// EnsureInterruptedSignal appends and persists the interrupted-signal entry
+// idempotently. If the last message is already that signal, it returns without
+// appending or emitting. Otherwise it appends, persists, and emits a
+// GenericSystemSignalDisplay event so adapters can render the transcript line.
+func (l *Loop) EnsureInterruptedSignal(turn int) {
+	if len(l.messages) > 0 {
+		last := l.messages[len(l.messages)-1]
+		if last.Role == message.RoleUser && last.TextContent() == interruptedSignal {
+			return
 		}
 	}
+	signalMsg := message.NewText(message.RoleUser, interruptedSignal)
+	l.messages = append(l.messages, signalMsg)
+	l.persistMessage(turn, signalMsg)
+	l.emit(Event{
+		Kind:   GenericSystemSignalDisplay,
+		Result: "Request interrupted by user",
+		Turn:   turn,
+	})
 }
 
 func (l *Loop) appendSignal(signal PendingSignal, turn int) {
@@ -477,14 +570,15 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 	l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
 	l.DrainPendingSignalsForModel(turn)
 	for _, input := range userInputs {
-		userMsg := message.NewText(message.RoleUser, input)
-		l.messages = append(l.messages, userMsg)
-		l.persistMessage(turn, userMsg)
+		l.persistAndEmitUserMessage(turn, input)
 	}
 	if l.store != nil {
 		_ = l.store.TouchActivity()
 	}
 	defer func() {
+		if ctx.Err() != nil {
+			l.EnsureInterruptedSignal(turn)
+		}
 		if l.store != nil && turn > 0 {
 			_ = l.store.MarkTurnComplete(turn)
 		}
@@ -504,9 +598,7 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 				l.persistMessage(turn, msg)
 			}
 			l.pendingQueue.Discard()
-			signalMsg := message.NewText(message.RoleUser, interruptedSignal)
-			l.messages = append(l.messages, signalMsg)
-			l.persistMessage(turn, signalMsg)
+			l.EnsureInterruptedSignal(turn)
 			return assistantVisibleText(msg), nil
 		}
 		l.messages = append(l.messages, msg)
