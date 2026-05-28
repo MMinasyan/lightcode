@@ -233,6 +233,64 @@ func TestHandleEventBroadcastsAndSkipsSubagents(t *testing.T) {
 	}
 }
 
+func TestHandleEventBroadcastsUserMessageAndSystemSignal(t *testing.T) {
+	hub := newSSEHub()
+	ch, unsub := hub.subscribe()
+	defer unsub()
+	s := &Server{hub: hub}
+
+	s.handleEvent(agent.Event{Kind: agent.EventUserMessageDisplay, Turn: 4, Result: "hello"})
+	select {
+	case msg := <-ch:
+		text := string(msg)
+		if !strings.Contains(text, "event: user_message") || !strings.Contains(text, `"content":"hello"`) || !strings.Contains(text, `"turn":4`) {
+			t.Fatalf("user_message event = %q", msg)
+		}
+	default:
+		t.Fatal("user_message event not broadcast")
+	}
+
+	s.handleEvent(agent.Event{Kind: agent.EventGenericSystemSignal, Turn: 4, Result: "Model switched to x/y"})
+	select {
+	case msg := <-ch:
+		text := string(msg)
+		if !strings.Contains(text, "event: system_signal") || !strings.Contains(text, `"content":"System: Model switched to x/y"`) {
+			t.Fatalf("system_signal event = %q", msg)
+		}
+	default:
+		t.Fatal("system_signal event not broadcast")
+	}
+}
+
+func TestHandleEventTurnEndIncludesCancelled(t *testing.T) {
+	hub := newSSEHub()
+	ch, unsub := hub.subscribe()
+	defer unsub()
+	s := &Server{hub: hub}
+
+	s.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 3, Cancelled: true})
+	select {
+	case msg := <-ch:
+		text := string(msg)
+		if !strings.Contains(text, "event: turn_end") || !strings.Contains(text, `"cancelled":true`) || !strings.Contains(text, `"turn":3`) {
+			t.Fatalf("turn_end event = %q", msg)
+		}
+	default:
+		t.Fatal("turn_end event not broadcast")
+	}
+
+	s.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 5, Cancelled: false})
+	select {
+	case msg := <-ch:
+		text := string(msg)
+		if !strings.Contains(text, "event: turn_end") || !strings.Contains(text, `"cancelled":false`) || !strings.Contains(text, `"turn":5`) {
+			t.Fatalf("turn_end non-cancelled event = %q", msg)
+		}
+	default:
+		t.Fatal("turn_end event not broadcast")
+	}
+}
+
 func TestHandleEventCompactionEndBroadcastsSessionChanged(t *testing.T) {
 	a := newServerTestAgent(t)
 	s := &Server{agent: a, hub: newSSEHub()}

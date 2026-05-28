@@ -98,6 +98,111 @@ func TestToolDisplayEntryEndsWithBlankLineWithResult(t *testing.T) {
 	}
 }
 
+func TestHandleUserMessageDisplayAppendsAndRenders(t *testing.T) {
+	c := New(nil)
+	var out bytes.Buffer
+	c.out = &out
+	c.width = 80
+
+	c.handleEvent(agent.Event{Kind: agent.EventUserMessageDisplay, Result: "hello world", Turn: 4})
+
+	if len(c.messages) != 1 || c.messages[0].typ != "user" || c.messages[0].content != "hello world" || c.messages[0].turn != 4 {
+		t.Fatalf("messages = %#v, want one user entry with content + turn", c.messages)
+	}
+	if rendered := out.String(); !strings.Contains(rendered, "hello world") {
+		t.Fatalf("user render missing content: %q", rendered)
+	}
+}
+
+func TestHandleGenericSystemSignalAppendsAndRenders(t *testing.T) {
+	c := New(nil)
+	var out bytes.Buffer
+	c.out = &out
+	c.width = 80
+
+	c.handleEvent(agent.Event{Kind: agent.EventGenericSystemSignal, Result: "Model switched to test/test-model", Turn: 2})
+
+	if len(c.messages) != 1 || c.messages[0].typ != "system" || c.messages[0].content != "System: Model switched to test/test-model" {
+		t.Fatalf("messages = %#v, want one system entry with System: prefix", c.messages)
+	}
+	if rendered := out.String(); !strings.Contains(rendered, "System: Model switched") {
+		t.Fatalf("system render missing prefixed payload: %q", rendered)
+	}
+}
+
+func TestHandleTurnEndCancelledDoesNotAppendTranscriptEntry(t *testing.T) {
+	c := New(nil)
+	var out bytes.Buffer
+	c.out = &out
+
+	c.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 3, Cancelled: true})
+
+	for _, m := range c.messages {
+		if m.typ == "system" {
+			t.Fatalf("turn_end cancelled appended a system entry: %#v", c.messages)
+		}
+	}
+	if strings.Contains(out.String(), "interrupted") {
+		t.Fatalf("turn_end cancelled rendered interrupted text directly: %q", out.String())
+	}
+}
+
+func TestSubmitAndFlushDoNotRenderUserMessagesLocally(t *testing.T) {
+	source, err := os.ReadFile("cli.go")
+	if err != nil {
+		t.Fatalf("read cli.go: %v", err)
+	}
+	body, ok := extractFunctionBody(string(source), "func (c *CLI) submitInputLocked(")
+	if !ok {
+		t.Fatal("submitInputLocked not found in cli.go")
+	}
+	if strings.Contains(body, "renderUserMsg(") {
+		t.Fatalf("submitInputLocked must not call renderUserMsg; user transcript entries arrive via EventUserMessageDisplay")
+	}
+	if strings.Contains(body, "typ:  \"user\"") || strings.Contains(body, "typ: \"user\"") {
+		t.Fatalf("submitInputLocked must not append a user displayEntry locally")
+	}
+
+	body, ok = extractFunctionBody(string(source), "func (c *CLI) flushQueueLocked(")
+	if !ok {
+		t.Fatal("flushQueueLocked not found in cli.go")
+	}
+	if strings.Contains(body, "renderUserMsg(") {
+		t.Fatalf("flushQueueLocked must not call renderUserMsg; user transcript entries arrive via EventUserMessageDisplay")
+	}
+	if strings.Contains(body, "typ:  \"user\"") || strings.Contains(body, "typ: \"user\"") {
+		t.Fatalf("flushQueueLocked must not append a user displayEntry locally")
+	}
+}
+
+// extractFunctionBody returns the brace-delimited body of the first function
+// whose definition line starts with prefix. It does not understand strings or
+// comments containing braces, so callers should pass production code only.
+func extractFunctionBody(source, prefix string) (string, bool) {
+	idx := strings.Index(source, prefix)
+	if idx < 0 {
+		return "", false
+	}
+	rest := source[idx:]
+	open := strings.Index(rest, "{")
+	if open < 0 {
+		return "", false
+	}
+	depth := 1
+	for i := open + 1; i < len(rest); i++ {
+		switch rest[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return rest[open+1 : i], true
+			}
+		}
+	}
+	return "", false
+}
+
 func TestFlushQueueKeepsQueuedMessagesWhenBackendBusy(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once

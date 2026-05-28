@@ -371,7 +371,7 @@ func (a *Agent) Init(ctx context.Context) {
 		})
 		a.lspManager.SetSignalHandler(func(content string) {
 			if a.lp != nil {
-				a.lp.AddPendingSignal(loop.PendingSignal{Payload: content})
+				a.lp.AddPendingSignal(loop.PendingSignal{Payload: content, Persist: true})
 			}
 		})
 		go a.lspManager.Detect(ctx)
@@ -601,6 +601,18 @@ func (a *Agent) dispatchLoopEvent(ev loop.Event) {
 			IsError:           ev.IsError,
 			Turn:              ev.Turn,
 			BackgroundProcess: agentBackgroundProcessDisplay(ev.BackgroundProcess),
+		})
+	case loop.UserMessageDisplay:
+		a.emitEvent(Event{
+			Kind:   EventUserMessageDisplay,
+			Turn:   ev.Turn,
+			Result: ev.Result,
+		})
+	case loop.GenericSystemSignalDisplay:
+		a.emitEvent(Event{
+			Kind:   EventGenericSystemSignal,
+			Turn:   ev.Turn,
+			Result: ev.Result,
 		})
 	case loop.PermissionRequest:
 		canAllowAll, _ := ev.Metadata["can_allow_all"].(bool)
@@ -1346,7 +1358,7 @@ func (a *Agent) SwitchModel(refStr string) error {
 	a.lp.SetClient(client)
 	a.currentRef = ref
 	a.contextWindowSize = model.ContextWindow
-	a.lp.AddPendingSignal(loop.PendingSignal{Payload: fmt.Sprintf("Model switched to %s", ref.String())})
+	a.lp.AddPendingSignal(loop.PendingSignal{Payload: fmt.Sprintf("Model switched to %s", ref.String()), Persist: true})
 	if a.store.Active() {
 		if err := a.store.SetModel(ref.Provider, ref.Model); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)
@@ -1893,7 +1905,8 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 				c := m.TextContent()
 				if strings.HasPrefix(c, "<system-signal>") && strings.HasSuffix(c, "</system-signal>") {
 					signal := c[len("<system-signal>") : len(c)-len("</system-signal>")]
-					if bg, ok := parseBackgroundTerminalSignal(html.UnescapeString(signal)); ok {
+					unescaped := html.UnescapeString(signal)
+					if bg, ok := parseBackgroundTerminalSignal(unescaped); ok {
 						out = append(out, DisplayMessage{
 							Type:              "background_process",
 							ID:                bg.ID,
@@ -1902,10 +1915,11 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 							Result:            bg.Output,
 							BackgroundProcess: bg,
 						})
-					} else if strings.Contains(signal, "interrupted") {
-						out = append(out, DisplayMessage{Type: "system", Content: "interrupted"})
-					} else if strings.HasPrefix(signal, "Model switched") {
-						out = append(out, DisplayMessage{Type: "system", Content: signal})
+					} else {
+						out = append(out, DisplayMessage{
+							Type:    "system",
+							Content: "System: " + collapseOneLine(unescaped),
+						})
 					}
 				} else {
 					out = append(out, DisplayMessage{Type: "user", Content: c, Turn: t.Turn})
@@ -1943,6 +1957,13 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 		}
 	}
 	return out
+}
+
+// collapseOneLine flattens runs of whitespace (including newlines) to single
+// spaces and trims leading/trailing whitespace. Mirrors the loop helper so
+// reload-derived system-signal strings match live-event strings byte for byte.
+func collapseOneLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 func parseBackgroundTerminalSignal(payload string) (*BackgroundProcessDisplay, bool) {

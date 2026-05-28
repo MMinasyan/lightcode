@@ -199,6 +199,12 @@ func (r *Runner) handleEvent(ev agent.Event) {
 				"output":   ev.Result,
 			}
 		}
+	case agent.EventUserMessageDisplay:
+		method = "agent/user_message"
+		params = map[string]any{"turn": ev.Turn, "content": ev.Result}
+	case agent.EventGenericSystemSignal:
+		method = "agent/system_signal"
+		params = map[string]any{"content": "System: " + ev.Result}
 	case agent.EventUsage:
 		method = "agent/usage"
 		params = r.agent.TokenUsage()
@@ -207,7 +213,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 		params = map[string]any{"turn": ev.Turn}
 	case agent.EventTurnEnd:
 		method = "agent/turn_end"
-		params = map[string]any{"turn": ev.Turn}
+		params = map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled}
 	case agent.EventError:
 		method = "agent/error"
 		params = map[string]any{"message": ev.Error, "turn": ev.Turn}

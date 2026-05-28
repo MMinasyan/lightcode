@@ -22,6 +22,8 @@ const (
 	EventWarning                                    // Current warning snapshot changed.
 	EventSubagentStart                              // A subagent session started.
 	EventBackgroundProcessComplete                  // A background process completion was delivered to the model.
+	EventUserMessageDisplay                         // A user-role message was appended to history.
+	EventGenericSystemSignal                        // A non-background <system-signal> was appended to history.
 )
 
 // Event is the unified event type emitted by the Agent to adapters.

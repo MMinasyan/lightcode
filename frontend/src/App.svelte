@@ -195,6 +195,24 @@
       }];
     });
 
+    EventsOn('user_message', (data) => {
+      if (!data) return;
+      if (streamingIdx !== -1 && messages[streamingIdx]) {
+        messages[streamingIdx] = { ...messages[streamingIdx], partial:false };
+      }
+      streamingIdx = -1;
+      messages = [...messages, { _id: mid(), type: 'user', content: data.content || '', turn: data.turn || 0 }];
+    });
+
+    EventsOn('system_signal', (data) => {
+      if (!data) return;
+      if (streamingIdx !== -1 && messages[streamingIdx]) {
+        messages[streamingIdx] = { ...messages[streamingIdx], partial:false };
+      }
+      streamingIdx = -1;
+      messages = [...messages, { _id: mid(), type: 'system', content: data.content || '' }];
+    });
+
     EventsOn('turn_start', (data) => {
       busy = true;
       streamingIdx = -1;
@@ -204,11 +222,6 @@
     EventsOn('turn_end', async (data) => {
       if (streamingIdx !== -1 && messages[streamingIdx]) {
         messages[streamingIdx] = { ...messages[streamingIdx], partial:false };
-      }
-      if (data?.cancelled) {
-        messages = [...messages, { _id:mid(), type:'system', content:'interrupted' }];
-      } else {
-        messages = messages;
       }
       streamingIdx = -1;
       busy = false;
@@ -270,7 +283,6 @@
     try {
       const turn = await SendPrompt(content);
       currentTurn = turn;
-      messages = [...messages, { _id:mid(), type:'user', content, turn }];
     }
     catch (err) { showError(err); busy = false; }
   }
@@ -284,15 +296,8 @@
     try {
       const result = await SendQueuedMessages(queued.map(q => q.content));
       messageQueue = messageQueue.slice(queued.length);
-      const appended = result?.appended || [];
-      for (let i = 0; i < appended.length; i++) {
-        const queuedMessage = queued[i];
-        messages = [...messages, { _id: queuedMessage._id, type: 'user', content: queuedMessage.content, turn: appended[i].turn }];
-      }
-      const last = queued[queued.length - 1];
       const turn = result?.started?.turn || 0;
       currentTurn = turn;
-      messages = [...messages, { _id: last._id, type: 'user', content: last.content, turn }];
     }
     catch (err) {
       if (isTurnBusyError(err)) {

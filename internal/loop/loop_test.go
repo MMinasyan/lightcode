@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/message"
@@ -91,21 +92,82 @@ func TestConsumeStreamAvoidsOmittedIndexCollisionWithExplicitIndex(t *testing.T)
 	}
 }
 
+func TestEmitBlocksOnFullChannelForTranscriptEvents(t *testing.T) {
+	ch := make(chan Event, 1)
+	lp := &Loop{}
+	lp.SetEvents(ch)
+
+	transcriptKinds := []EventKind{
+		TextDelta,
+		ToolCallStart,
+		ToolCallEnd,
+		BackgroundProcessComplete,
+		UserMessageDisplay,
+		GenericSystemSignalDisplay,
+	}
+	for _, kind := range transcriptKinds {
+		ch <- Event{Kind: Warning, Result: "filler"}
+		done := make(chan struct{})
+		go func(k EventKind) {
+			lp.emit(Event{Kind: k, Result: "transcript"})
+			close(done)
+		}(kind)
+		select {
+		case <-done:
+			t.Fatalf("emit(%v) returned while channel full — transcript event was dropped instead of blocking", kind)
+		case <-time.After(20 * time.Millisecond):
+		}
+		<-ch
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("emit(%v) did not unblock after channel drained", kind)
+		}
+		got := <-ch
+		if got.Kind != kind || got.Result != "transcript" {
+			t.Fatalf("delivered event = %#v, want kind %v", got, kind)
+		}
+	}
+	if lp.droppedEvents != 0 {
+		t.Fatalf("droppedEvents = %d, want 0 for transcript-only emits", lp.droppedEvents)
+	}
+}
+
+func TestEmitFlushesDroppedWarningBeforeTranscriptEvent(t *testing.T) {
+	ch := make(chan Event, 4)
+	lp := &Loop{droppedEvents: 7}
+	lp.SetEvents(ch)
+
+	lp.emit(Event{Kind: UserMessageDisplay, Turn: 5, Result: "hello"})
+
+	first := <-ch
+	if first.Kind != Warning || !strings.Contains(first.Result, "dropped 7 events") {
+		t.Fatalf("expected dropped-events warning first, got %#v", first)
+	}
+	second := <-ch
+	if second.Kind != UserMessageDisplay || second.Result != "hello" {
+		t.Fatalf("expected transcript event second, got %#v", second)
+	}
+	if lp.droppedEvents != 0 {
+		t.Fatalf("droppedEvents not reset after flush: %d", lp.droppedEvents)
+	}
+}
+
 func TestEmitDropsTelemetryWhenChannelFull(t *testing.T) {
 	ch := make(chan Event, 1)
-	ch <- Event{Kind: TextDelta, Result: "already full"}
+	ch <- Event{Kind: Usage, Model: "filler"}
 	loop := &Loop{}
 	loop.SetEvents(ch)
 
 	for i := 0; i < 10; i++ {
-		loop.emit(Event{Kind: TextDelta, Result: "drop"})
+		loop.emit(Event{Kind: Usage, Model: "drop"})
 	}
 	if loop.droppedEvents != 10 {
 		t.Fatalf("droppedEvents = %d, want 10", loop.droppedEvents)
 	}
 
 	<-ch
-	loop.emit(Event{Kind: TextDelta, Result: "next"})
+	loop.emit(Event{Kind: Usage, Model: "next"})
 	if loop.droppedEvents != 1 {
 		t.Fatalf("droppedEvents after warning = %d, want 1", loop.droppedEvents)
 	}
@@ -193,16 +255,32 @@ func TestPendingBackgroundProcessSignalEmitsDisplayWhenDrained(t *testing.T) {
 	}
 }
 
-func TestPlainPendingSignalDoesNotEmitBackgroundDisplay(t *testing.T) {
+func TestPlainPendingSignalEmitsGenericSystemSignalDisplay(t *testing.T) {
 	lp := New(nil, nil, "system")
-	events := make(chan Event, 1)
+	events := make(chan Event, 4)
 	lp.SetEvents(events)
-	lp.AddPendingSignal(PendingSignal{Payload: "plain signal"})
-	lp.DrainPendingSignalsForModel(0)
+	lp.AddPendingSignal(PendingSignal{Payload: "Model switched to test/test-model"})
+	lp.DrainPendingSignalsForModel(3)
 
 	select {
 	case ev := <-events:
-		t.Fatalf("unexpected event for plain signal: %#v", ev)
+		if ev.Kind != GenericSystemSignalDisplay {
+			t.Fatalf("event kind = %v, want GenericSystemSignalDisplay", ev.Kind)
+		}
+		if ev.Turn != 3 {
+			t.Fatalf("event turn = %d, want 3", ev.Turn)
+		}
+		if ev.Result != "Model switched to test/test-model" {
+			t.Fatalf("event result = %q, want collapsed payload", ev.Result)
+		}
+	default:
+		t.Fatal("expected GenericSystemSignalDisplay for plain pending signal")
+	}
+	select {
+	case ev := <-events:
+		if ev.Kind == BackgroundProcessComplete {
+			t.Fatalf("unexpected background-process event for plain signal: %#v", ev)
+		}
 	default:
 	}
 }
@@ -216,6 +294,93 @@ func TestResetHistoryClearsPendingSignals(t *testing.T) {
 	msgs := lp.Messages()
 	if len(msgs) != 1 {
 		t.Fatalf("messages len = %d, want only system after reset: %#v", len(msgs), msgs)
+	}
+}
+
+func TestAppendUserMessageEmitsUserMessageDisplay(t *testing.T) {
+	lp := New(nil, nil, "system")
+	events := make(chan Event, 4)
+	lp.SetEvents(events)
+	lp.AppendUserMessage(7, "hi there")
+
+	select {
+	case ev := <-events:
+		if ev.Kind != UserMessageDisplay || ev.Turn != 7 || ev.Result != "hi there" {
+			t.Fatalf("event = %#v, want UserMessageDisplay turn=7 result=hi there", ev)
+		}
+	default:
+		t.Fatal("expected UserMessageDisplay event")
+	}
+}
+
+func TestRunEmitsUserMessageDisplayAfterDrain(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+	prov := &catalog.Provider{
+		ID:        "test",
+		Transport: catalog.Transport{BaseURL: server.URL + "/v1"},
+		Models:    map[string]*catalog.Model{"model-a": {ID: "model-a"}},
+	}
+	client := provider.New(prov, prov.Models["model-a"], "")
+	lp := New(client, tool.NewRegistry(), "system")
+	events := make(chan Event, 32)
+	lp.SetEvents(events)
+	lp.AddPendingSignal(PendingSignal{Payload: "Model switched to test/model-a"})
+
+	if _, err := lp.Run(context.Background(), "hello"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var order []EventKind
+	for {
+		select {
+		case ev := <-events:
+			if ev.Kind == GenericSystemSignalDisplay || ev.Kind == UserMessageDisplay {
+				order = append(order, ev.Kind)
+			}
+		default:
+			if len(order) != 2 || order[0] != GenericSystemSignalDisplay || order[1] != UserMessageDisplay {
+				t.Fatalf("display event order = %v, want signal then user", order)
+			}
+			return
+		}
+	}
+}
+
+func TestEnsureInterruptedSignalIsIdempotentAndEmitsOnce(t *testing.T) {
+	lp := New(nil, nil, "system")
+	events := make(chan Event, 4)
+	lp.SetEvents(events)
+
+	lp.EnsureInterruptedSignal(2)
+	lp.EnsureInterruptedSignal(2)
+	lp.EnsureInterruptedSignal(2)
+
+	msgs := lp.Messages()
+	if len(msgs) != 2 {
+		t.Fatalf("messages len = %d, want one system + one signal", len(msgs))
+	}
+	if msgs[1].TextContent() != interruptedSignal {
+		t.Fatalf("last message = %q, want interrupted signal", msgs[1].TextContent())
+	}
+
+	count := 0
+	for {
+		select {
+		case ev := <-events:
+			if ev.Kind == GenericSystemSignalDisplay && ev.Result == "Request interrupted by user" && ev.Turn == 2 {
+				count++
+			}
+		default:
+			if count != 1 {
+				t.Fatalf("GenericSystemSignalDisplay emit count = %d, want 1", count)
+			}
+			return
+		}
 	}
 }
 

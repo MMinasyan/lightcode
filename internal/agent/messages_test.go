@@ -105,6 +105,48 @@ func TestSessionMessagesRendersBackgroundProcessSystemSignal(t *testing.T) {
 	}
 }
 
+func TestSessionMessagesRendersGenericSystemSignalWithPrefix(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession returned error: %v", err)
+	}
+	turn := a.store.BeginTurn()
+
+	cases := []struct {
+		payload string
+		want    string
+	}{
+		{"Request interrupted by user", "System: Request interrupted by user"},
+		{`Model switched to openai/gpt-5`, "System: Model switched to openai/gpt-5"},
+		{"LSP \"gopls\" is now available\nfor *.go files", "System: LSP \"gopls\" is now available for *.go files"},
+		{"a <special> & b", "System: a <special> & b"},
+	}
+	for _, c := range cases {
+		msg := message.NewText(message.RoleUser, loop.SystemSignal(c.payload))
+		data, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := a.store.AppendMessage(turn, data); err != nil {
+			t.Fatalf("AppendMessage: %v", err)
+		}
+	}
+	if err := a.store.MarkTurnComplete(turn); err != nil {
+		t.Fatalf("MarkTurnComplete: %v", err)
+	}
+
+	display := a.SessionMessages()
+	if len(display) != len(cases) {
+		t.Fatalf("display len = %d, want %d: %#v", len(display), len(cases), display)
+	}
+	for i, c := range cases {
+		got := display[i]
+		if got.Type != "system" || got.Content != c.want {
+			t.Fatalf("case %d: display = %#v, want type=system content=%q", i, got, c.want)
+		}
+	}
+}
+
 func toolResult(id, name, content string) message.Message {
 	msg := message.NewText(message.RoleTool, content)
 	msg.ToolCallID = id

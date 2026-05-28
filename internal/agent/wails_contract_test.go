@@ -168,6 +168,64 @@ func TestWailsBindingsCoverExportedAppMethods(t *testing.T) {
 	}
 }
 
+func TestFrontendUserAndSystemTranscriptEntriesArriveViaBackendEvents(t *testing.T) {
+	app := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+
+	if !strings.Contains(app, "EventsOn('user_message',") {
+		t.Fatalf("App.svelte must subscribe to the user_message event so transcript order matches backend ordering")
+	}
+	if !strings.Contains(app, "EventsOn('system_signal',") {
+		t.Fatalf("App.svelte must subscribe to the system_signal event so transcript order matches backend ordering")
+	}
+
+	handleSubmit, ok := extractSvelteFunctionBody(app, "async function handleSubmit(")
+	if !ok {
+		t.Fatal("handleSubmit not found in App.svelte")
+	}
+	if strings.Contains(handleSubmit, "type:'user'") || strings.Contains(handleSubmit, "type: 'user'") {
+		t.Fatalf("handleSubmit must not push a user message into messages locally; ordering is owned by the backend")
+	}
+
+	flushQueue, ok := extractSvelteFunctionBody(app, "async function flushQueue(")
+	if !ok {
+		t.Fatal("flushQueue not found in App.svelte")
+	}
+	if strings.Contains(flushQueue, "type:'user'") || strings.Contains(flushQueue, "type: 'user'") {
+		t.Fatalf("flushQueue must not push queued user messages into messages locally; ordering is owned by the backend")
+	}
+
+	if strings.Contains(app, "type:'system', content:'interrupted'") || strings.Contains(app, "type: 'system', content: 'interrupted'") {
+		t.Fatalf("App.svelte must not synthesize an 'interrupted' transcript entry from turn_end; system_signal carries that text now")
+	}
+}
+
+// extractSvelteFunctionBody returns the brace-balanced body of the first JS
+// function in source whose definition begins with prefix.
+func extractSvelteFunctionBody(source, prefix string) (string, bool) {
+	idx := strings.Index(source, prefix)
+	if idx < 0 {
+		return "", false
+	}
+	rest := source[idx:]
+	open := strings.Index(rest, "{")
+	if open < 0 {
+		return "", false
+	}
+	depth := 1
+	for i := open + 1; i < len(rest); i++ {
+		switch rest[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return rest[open+1 : i], true
+			}
+		}
+	}
+	return "", false
+}
+
 func TestBackendEmittedEventsAreListenedToByFrontend(t *testing.T) {
 	emitted := collectContractMatches(t, filepath.Join("..", ".."), ".go", `EventsEmit\([^,]+,\s*["']([^"']+)["']`)
 	listened := stringSet(collectContractMatches(t, filepath.Join("..", "..", "frontend", "src"), ".svelte", `EventsOn\(["']([^"']+)["']`))
