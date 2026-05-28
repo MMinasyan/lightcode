@@ -16,6 +16,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/editpreview"
 )
 
 func TestCmdClearClearsTerminalRedrawsHeaderAndKeepsMessages(t *testing.T) {
@@ -172,6 +173,89 @@ func TestSubmitAndFlushDoNotRenderUserMessagesLocally(t *testing.T) {
 	}
 	if strings.Contains(body, "typ:  \"user\"") || strings.Contains(body, "typ: \"user\"") {
 		t.Fatalf("flushQueueLocked must not append a user displayEntry locally")
+	}
+}
+
+func TestStagedFlushTerminalLateEndNoCursorUpAndLastEndWins(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{out: &buf, mu: &sync.Mutex{}}
+	args := `{"path":"x.go","old_string":"a","new_string":"b"}`
+
+	// State as if ToolCallStart already rendered the staged tool's header and
+	// its stage-time "Staged." end already completed it in the model — i.e. the
+	// row is far above and activeToolID was consumed (a later, non-matching end
+	// is the staged-flush "late" case).
+	c.messages = []displayEntry{
+		{typ: "assistant", content: "intro"},
+		{typ: "tool", id: "call_1", name: "edit_file", args: args, done: true, success: true, result: "Staged."},
+		{typ: "assistant", content: "more text below the tool row"},
+	}
+	c.activeToolID = ""
+
+	meta := editpreview.MetadataFromArgs(args, "Edited x.go (1 replacement, lines 1-2).")
+	if meta == nil {
+		t.Fatal("test setup: expected non-nil edit_preview metadata")
+	}
+	// Production: the staged-flush ToolCallEnd carries NO Args (flushPendingQueue
+	// emits only id/name/result/metadata). The CLI must still render the path
+	// from the model row, matching reload.
+	c.handleEvent(agent.Event{
+		Kind:       agent.EventToolCallEnd,
+		ToolCallID: "call_1",
+		ToolName:   "edit_file",
+		Result:     "Edited x.go (1 replacement, lines 1-2).",
+		Metadata:   meta,
+	})
+
+	// Late end must NOT emit a cursor-up against the (far-below) current line.
+	if strings.Contains(buf.String(), "\x1b[1A") {
+		t.Fatalf("late staged-flush end performed a cursor-up against the wrong line: %q", buf.String())
+	}
+	// The rendered header must still show the path even though the event had no
+	// Args (rendered from the model row's retained args) — no live/reload drift.
+	if !strings.Contains(buf.String(), "x.go") {
+		t.Fatalf("late staged-flush header dropped the path: %q", buf.String())
+	}
+	// Model is last-end-wins: the row now holds the real result, not "Staged.".
+	var row *displayEntry
+	for i := range c.messages {
+		if c.messages[i].typ == "tool" && c.messages[i].id == "call_1" {
+			row = &c.messages[i]
+		}
+	}
+	if row == nil || row.result != "Edited x.go (1 replacement, lines 1-2)." {
+		t.Fatalf("tool row not overwritten with real result: %#v", row)
+	}
+}
+
+func TestInlineToolEndStillRewritesInPlace(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{out: &buf, mu: &sync.Mutex{}}
+	args := `{"path":"x.go","old_string":"a","new_string":"b"}`
+
+	// Inline completion: the tool's header is the most-recently-rendered line.
+	c.messages = []displayEntry{{typ: "tool", id: "call_1", name: "edit_file", args: args, done: false}}
+	c.activeToolID = "call_1"
+
+	meta := editpreview.MetadataFromArgs(args, "Edited x.go (1 replacement, lines 1-2).")
+	if meta == nil {
+		t.Fatal("test setup: expected non-nil edit_preview metadata")
+	}
+	c.handleEvent(agent.Event{
+		Kind:       agent.EventToolCallEnd,
+		ToolCallID: "call_1",
+		ToolName:   "edit_file",
+		Args:       args,
+		Result:     "Edited x.go (1 replacement, lines 1-2).",
+		Metadata:   meta,
+	})
+
+	// Inline edit_file with a summary upgrades the header in place via cursor-up.
+	if !strings.Contains(buf.String(), "\x1b[1A") {
+		t.Fatalf("inline edit_file end should rewrite the header in place (cursor-up): %q", buf.String())
+	}
+	if c.activeToolID != "" {
+		t.Fatalf("activeToolID should be consumed by its end, got %q", c.activeToolID)
 	}
 }
 

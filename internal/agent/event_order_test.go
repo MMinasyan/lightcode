@@ -69,8 +69,12 @@ func projectEvents(events []Event) []transcriptRow {
 			flush()
 			rows = append(rows, transcriptRow{Type: "tool", ID: ev.ToolCallID, Name: ev.ToolName, Args: ev.Args})
 		case EventToolCallEnd:
+			// Last-end-wins: a staged edit emits a second ToolCallEnd (the real
+			// result, at flush) after its stage-time "Staged." end; the later end
+			// overwrites the row (no !Done guard), matching the live UIs and the
+			// reload <staged-flush> overlay.
 			for i := len(rows) - 1; i >= 0; i-- {
-				if rows[i].Type == "tool" && rows[i].ID == ev.ToolCallID && !rows[i].Done {
+				if rows[i].Type == "tool" && rows[i].ID == ev.ToolCallID {
 					rows[i].Done = true
 					rows[i].Success = !ev.IsError
 					rows[i].Result = ev.Result

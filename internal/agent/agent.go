@@ -1903,7 +1903,26 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 
 			case message.RoleUser:
 				c := m.TextContent()
-				if strings.HasPrefix(c, "<system-signal>") && strings.HasSuffix(c, "</system-signal>") {
+				if entries, ok := loop.ParseStagedFlush(c); ok {
+					// <staged-flush> wrapper: overlay the real per-staged results
+					// onto the tool stubs (which currently hold "Staged."), so
+					// reload matches the live per-tool ToolCallEnd events. Produces
+					// no transcript row. Metadata is recomputed from args+result.
+					for _, e := range entries {
+						idx, found := toolStubs[e.ID]
+						if !found {
+							continue
+						}
+						out[idx].Done = true
+						out[idx].Success = !e.IsError
+						out[idx].Result = e.Result
+						if out[idx].Success {
+							out[idx].Metadata = displayMetadataForToolCall(out[idx].Name, out[idx].Args, e.Result)
+						} else {
+							out[idx].Metadata = nil
+						}
+					}
+				} else if strings.HasPrefix(c, "<system-signal>") && strings.HasSuffix(c, "</system-signal>") {
 					signal := c[len("<system-signal>") : len(c)-len("</system-signal>")]
 					unescaped := html.UnescapeString(signal)
 					if bg, ok := parseBackgroundTerminalSignal(unescaped); ok {

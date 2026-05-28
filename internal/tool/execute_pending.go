@@ -2,8 +2,6 @@ package tool
 
 import (
 	"context"
-	"fmt"
-	"strings"
 )
 
 // StagedCall represents a pending edit_file or write_file call.
@@ -72,23 +70,6 @@ func (ExecutePending) ParametersSchema() map[string]any {
 
 func (ExecutePending) Execute(_ context.Context, params map[string]any) (string, error) {
 	return "No pending edits to execute.", nil
-}
-
-// FormatBatchResult formats the results of a batch execution.
-func FormatBatchResult(results []BatchResult) string {
-	if len(results) == 0 {
-		return "No pending edits to execute."
-	}
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Executed %d staged edits:\n", len(results)))
-	for i, r := range results {
-		if r.Error != "" {
-			sb.WriteString(fmt.Sprintf("%d. %s: %s\n", i+1, r.ToolName, r.Error))
-		} else {
-			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, r.Result))
-		}
-	}
-	return strings.TrimSuffix(sb.String(), "\n")
 }
 
 // BatchResult is the outcome of a single staged call.

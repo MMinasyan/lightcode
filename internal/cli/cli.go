@@ -55,6 +55,14 @@ type CLI struct {
 	streamBuf           strings.Builder
 	streamVisibleBuf    strings.Builder
 
+	// activeToolID is the tool whose header is the most-recently-rendered
+	// terminal line (set on ToolCallStart, consumed by its ToolCallEnd,
+	// cleared by any other terminal-writing event). A ToolCallEnd matching it
+	// is an inline completion (safe to rewrite in place with a cursor-up);
+	// a non-matching end (e.g. a staged-flush result arriving at turn end,
+	// far below its row) is rendered as a fresh block instead.
+	activeToolID string
+
 	msgQueue []string
 
 	permQueue       []*agent.PermissionRequest
@@ -557,6 +565,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.streamVisibleBuf.Reset()
 
 	case agent.EventTextDelta:
+		c.activeToolID = ""
 		if !c.streamDisplayActive {
 			c.stopAnimationLocked()
 			c.writeRaw("\r\x1b[2K")
@@ -586,14 +595,20 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			name: ev.ToolName,
 			args: ev.Args,
 		})
+		c.activeToolID = ev.ToolCallID
 		c.writeRaw(renderToolCall(ev.ToolName, ev.Args, nil))
 		c.startAnimationLocked("Running")
 
 	case agent.EventToolCallEnd:
 		c.stopAnimationLocked()
-		c.writeRaw("\r\x1b[2K")
+		inline := ev.ToolCallID == c.activeToolID
+		c.activeToolID = ""
+		// Model update is last-end-wins (no !done guard): a staged edit emits
+		// a second ToolCallEnd (the real result, at flush) after its stage-time
+		// "Staged." end; the real result must overwrite the row to match reload.
+		var row *displayEntry
 		for i := len(c.messages) - 1; i >= 0; i-- {
-			if c.messages[i].typ == "tool" && c.messages[i].id == ev.ToolCallID && !c.messages[i].done {
+			if c.messages[i].typ == "tool" && c.messages[i].id == ev.ToolCallID {
 				c.messages[i].done = true
 				c.messages[i].success = !ev.IsError
 				c.messages[i].result = ev.Result
@@ -604,22 +619,41 @@ func (c *CLI) handleEvent(ev agent.Event) {
 					c.messages[i].args = ev.Args
 				}
 				c.messages[i].metadata = ev.Metadata
+				row = &c.messages[i]
 				break
 			}
 		}
-		if ev.ToolName == "edit_file" {
-			if _, hasSummary := toolChangeSummary(ev.ToolName, ev.Args, ev.Metadata); hasSummary {
-				c.writeRaw("\x1b[1A\r\x1b[2K")
-				c.writeRaw(renderToolCall(ev.ToolName, ev.Args, ev.Metadata))
+		if inline {
+			// The tool header is the line just rendered: rewrite it in place.
+			c.writeRaw("\r\x1b[2K")
+			if ev.ToolName == "edit_file" {
+				if _, hasSummary := toolChangeSummary(ev.ToolName, ev.Args, ev.Metadata); hasSummary {
+					c.writeRaw("\x1b[1A\r\x1b[2K")
+					c.writeRaw(renderToolCall(ev.ToolName, ev.Args, ev.Metadata))
+				}
 			}
+			c.writeRaw(renderToolResult(ev.ToolName, ev.Args, ev.Result, !ev.IsError, c.toolExpanded, c.width, ev.Metadata))
+		} else {
+			// Late completion (e.g. a staged-flush result arriving at turn end,
+			// far below its row): render a fresh block without cursor-relative
+			// rewrite. Render the header from the MODEL row (the reload-equivalent
+			// source), since the staged-flush ToolCallEnd carries no Args and the
+			// row retains the original path from ToolCallStart.
+			name, args, meta := ev.ToolName, ev.Args, ev.Metadata
+			if row != nil {
+				name, args, meta = row.name, row.args, row.metadata
+			}
+			c.writeRaw("\r\x1b[2K")
+			c.writeRaw(renderToolCall(name, args, meta))
+			c.writeRaw(renderToolResult(name, args, ev.Result, !ev.IsError, c.toolExpanded, c.width, meta))
 		}
-		c.writeRaw(renderToolResult(ev.ToolName, ev.Args, ev.Result, !ev.IsError, c.toolExpanded, c.width, ev.Metadata))
 		c.writeRaw(nl)
 		if c.busy {
 			c.startAnimationLocked("Thinking")
 		}
 
 	case agent.EventBackgroundProcessComplete:
+		c.activeToolID = ""
 		if c.streamDisplayActive && c.streamNeedsNL {
 			c.writeRaw("\r\n")
 		}
@@ -653,6 +687,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		}
 
 	case agent.EventUserMessageDisplay:
+		c.activeToolID = ""
 		if c.streamDisplayActive && c.streamNeedsNL {
 			c.writeRaw("\r\n")
 		}
@@ -674,6 +709,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		}
 
 	case agent.EventGenericSystemSignal:
+		c.activeToolID = ""
 		if c.streamDisplayActive && c.streamNeedsNL {
 			c.writeRaw("\r\n")
 		}
@@ -695,6 +731,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		}
 
 	case agent.EventTurnEnd:
+		c.activeToolID = ""
 		c.stopAnimationLocked()
 		c.erasePermissionBlockLocked()
 		if c.streamDisplayActive && c.streamNeedsNL {
@@ -719,6 +756,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		}
 
 	case agent.EventError:
+		c.activeToolID = ""
 		c.stopAnimationLocked()
 		c.erasePermissionBlockLocked()
 		c.writeRaw("\r\x1b[2K")
@@ -728,6 +766,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.printInputPromptLocked()
 
 	case agent.EventPermissionRequest:
+		c.activeToolID = ""
 		c.stopAnimationLocked()
 		c.writeRaw("\r\x1b[2K")
 		c.permQueue = append(c.permQueue, ev.PermReq)
@@ -747,6 +786,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.refreshSessionLocked()
 
 	case agent.EventWarning:
+		c.activeToolID = ""
 		c.writeRaw("\r\x1b[2K")
 		current := make(map[string]bool, len(ev.Warnings))
 		for _, w := range ev.Warnings {
