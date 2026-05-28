@@ -104,6 +104,11 @@ func (a *App) handleEvent(ev agent.Event) {
 		wailsRuntime.EventsEmit(a.ctx, "system_signal", map[string]any{
 			"content": "System: " + ev.Result,
 		})
+	case agent.EventQueueChanged:
+		wailsRuntime.EventsEmit(a.ctx, "queue_changed", map[string]any{
+			"items":   ev.Queue,
+			"version": ev.QueueVersion,
+		})
 	case agent.EventUsage:
 		wailsRuntime.EventsEmit(a.ctx, "usage", a.svc.TokenUsage())
 	case agent.EventTurnStart:
@@ -149,19 +154,17 @@ func (a *App) CurrentWarnings() []agent.PromptWarning {
 	return a.svc.CurrentWarnings()
 }
 
-// SendPrompt sends a user message and starts the agentic loop.
-func (a *App) SendPrompt(content string) (int, error) {
-	return a.svc.SendPrompt(a.ctx, content)
+// Submit is the single entry point for user input: it starts a turn when idle
+// or queues the input in the backend, returning whether it started and a
+// versioned queue snapshot.
+func (a *App) Submit(content string) (agent.SubmitResult, error) {
+	return a.svc.Submit(a.ctx, content)
 }
 
-// AppendUserMessage adds a user message as a complete turn without running the model.
-func (a *App) AppendUserMessage(content string) (int, error) {
-	return a.svc.AppendUserMessage(content)
-}
-
-// SendQueuedMessages flushes queued user messages through the shared backend.
-func (a *App) SendQueuedMessages(contents []string) (agent.QueuedMessagesResult, error) {
-	return a.svc.SendQueuedMessages(a.ctx, contents)
+// QueueSnapshot returns the backend's versioned input-queue snapshot for
+// frontend hydration (register the queue_changed listener before calling).
+func (a *App) QueueSnapshot() agent.QueueState {
+	return a.svc.QueueSnapshot()
 }
 
 // SwitchModel changes the active model by provider-prefixed catalog ref.

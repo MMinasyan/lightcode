@@ -161,6 +161,29 @@ func TestHandleEventNotifiesUserMessageAndSystemSignal(t *testing.T) {
 	}
 }
 
+func TestHandleEventNotifiesQueueChanged(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+
+	r.handleEvent(agent.Event{
+		Kind:         agent.EventQueueChanged,
+		Queue:        []agent.QueuedItem{{ID: "q-1", Content: "hi"}},
+		QueueVersion: 2,
+	})
+	lines := responseLines(t, out.String(), 1)
+	var qc Notification
+	if err := json.Unmarshal([]byte(lines[0]), &qc); err != nil {
+		t.Fatalf("queue_changed json: %v", err)
+	}
+	if qc.Method != "agent/queue_changed" {
+		t.Fatalf("queue_changed method = %q", qc.Method)
+	}
+	data, _ := json.Marshal(qc.Params)
+	if !strings.Contains(string(data), `"version":2`) || !strings.Contains(string(data), `"content":"hi"`) {
+		t.Fatalf("queue_changed params = %s", data)
+	}
+}
+
 func TestHandleEventTurnEndIncludesCancelled(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{out: &out}

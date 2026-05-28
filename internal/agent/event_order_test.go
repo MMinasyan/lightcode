@@ -214,6 +214,28 @@ func waitUntilEventOrderAgentIdle(t *testing.T, a *Agent) {
 	t.Fatal("agent did not become idle")
 }
 
+// waitUntilFullyDrained waits until the agent is idle AND its backend queue is
+// empty, sustained briefly so a pending auto-drain cannot still be about to
+// start a turn. Used by queued scenarios where Submit enqueues and the backend
+// drains across multiple turns.
+func waitUntilFullyDrained(t *testing.T, a *Agent) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	stable := 0
+	for time.Now().Before(deadline) {
+		if !a.Busy() && len(a.QueueSnapshot().Items) == 0 {
+			stable++
+			if stable >= 5 {
+				return
+			}
+		} else {
+			stable = 0
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("agent did not fully drain")
+}
+
 func waitUntilEventOrderTurnEndCount(t *testing.T, cap *eventCapture, want int) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -260,8 +282,8 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		a := newEventOrderAgent(t, server.URL+"/v1")
 		cap := &eventCapture{}
 		ctx := startEventOrderAgent(t, a, cap)
-		if _, err := a.SendPrompt(ctx, "hello"); err != nil {
-			t.Fatalf("SendPrompt: %v", err)
+		if _, err := a.Submit(ctx, "hello"); err != nil {
+			t.Fatalf("Submit: %v", err)
 		}
 		waitUntilEventOrderTurnEndCount(t, cap, 1)
 		assertProjectionsMatch(t, a, cap)
@@ -280,8 +302,8 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 			t.Fatalf("ensureSession: %v", err)
 		}
 		a.lp.AddPendingSignal(loop.PendingSignal{Payload: "Model switched to test/test-model", Persist: true})
-		if _, err := a.SendPrompt(ctx, "after switch"); err != nil {
-			t.Fatalf("SendPrompt: %v", err)
+		if _, err := a.Submit(ctx, "after switch"); err != nil {
+			t.Fatalf("Submit: %v", err)
 		}
 		waitUntilEventOrderTurnEndCount(t, cap, 1)
 		assertProjectionsMatch(t, a, cap)
@@ -296,10 +318,12 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		a := newEventOrderAgent(t, server.URL+"/v1")
 		cap := &eventCapture{}
 		ctx := startEventOrderAgent(t, a, cap)
-		if _, err := a.SendQueuedMessages(ctx, []string{"first", "second", "third"}); err != nil {
-			t.Fatalf("SendQueuedMessages: %v", err)
+		for _, m := range []string{"first", "second", "third"} {
+			if _, err := a.Submit(ctx, m); err != nil {
+				t.Fatalf("Submit: %v", err)
+			}
 		}
-		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		waitUntilFullyDrained(t, a)
 		assertProjectionsMatch(t, a, cap)
 	})
 
@@ -316,10 +340,12 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 			t.Fatalf("ensureSession: %v", err)
 		}
 		a.lp.AddPendingSignal(loop.PendingSignal{Payload: "Model switched to test/test-model", Persist: true})
-		if _, err := a.SendQueuedMessages(ctx, []string{"alpha", "beta"}); err != nil {
-			t.Fatalf("SendQueuedMessages: %v", err)
+		for _, m := range []string{"alpha", "beta"} {
+			if _, err := a.Submit(ctx, m); err != nil {
+				t.Fatalf("Submit: %v", err)
+			}
 		}
-		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		waitUntilFullyDrained(t, a)
 		assertProjectionsMatch(t, a, cap)
 	})
 
@@ -347,10 +373,12 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 			Persist:           true,
 			BackgroundProcess: bg,
 		})
-		if _, err := a.SendQueuedMessages(ctx, []string{"first", "next"}); err != nil {
-			t.Fatalf("SendQueuedMessages: %v", err)
+		for _, m := range []string{"first", "next"} {
+			if _, err := a.Submit(ctx, m); err != nil {
+				t.Fatalf("Submit: %v", err)
+			}
 		}
-		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		waitUntilFullyDrained(t, a)
 		assertProjectionsMatch(t, a, cap)
 	})
 
@@ -364,8 +392,8 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		cap := &eventCapture{}
 		ctx := startEventOrderAgent(t, a, cap)
 		a.addWarning("test", promptWarning("test_kind", "test warning"))
-		if _, err := a.SendPrompt(ctx, "hi"); err != nil {
-			t.Fatalf("SendPrompt: %v", err)
+		if _, err := a.Submit(ctx, "hi"); err != nil {
+			t.Fatalf("Submit: %v", err)
 		}
 		waitUntilEventOrderTurnEndCount(t, cap, 1)
 		assertProjectionsMatch(t, a, cap)
@@ -382,8 +410,8 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		a := newEventOrderAgent(t, server.URL+"/v1")
 		cap := &eventCapture{}
 		ctx := startEventOrderAgent(t, a, cap)
-		if _, err := a.SendPrompt(ctx, "long task"); err != nil {
-			t.Fatalf("SendPrompt: %v", err)
+		if _, err := a.Submit(ctx, "long task"); err != nil {
+			t.Fatalf("Submit: %v", err)
 		}
 		// Give the request a moment to reach the server, then cancel.
 		deadline := time.Now().Add(2 * time.Second)
@@ -400,14 +428,13 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		assertProjectionsMatch(t, a, cap)
 	})
 
-	t.Run("busy_retry_no_transcript_on_rejected_attempt", func(t *testing.T) {
+	t.Run("submit_while_busy_enqueues_then_drains", func(t *testing.T) {
 		var holdReq atomic.Int32
 		holdReq.Store(1)
 		release := make(chan struct{})
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if holdReq.Load() == 1 {
-				holdReq.Store(0)
-				<-release
+			if holdReq.Swap(0) == 1 {
+				<-release // hold the first turn open while we enqueue
 			}
 			writeTextResponse(w, "answer")
 		}))
@@ -418,10 +445,14 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		cap := &eventCapture{}
 		ctx := startEventOrderAgent(t, a, cap)
 
-		if _, err := a.SendPrompt(ctx, "first"); err != nil {
-			t.Fatalf("SendPrompt: %v", err)
+		// "first" starts a turn that hangs on the server.
+		r1, err := a.Submit(ctx, "first")
+		if err != nil {
+			t.Fatalf("Submit first: %v", err)
 		}
-		// Wait for the agent to be busy on the first turn.
+		if !r1.Started {
+			t.Fatalf("first submit should start a turn: %#v", r1)
+		}
 		deadline := time.Now().Add(time.Second)
 		for time.Now().Before(deadline) {
 			if a.Busy() {
@@ -429,19 +460,17 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 			}
 			time.Sleep(2 * time.Millisecond)
 		}
-		// Second submission must be rejected as busy.
-		if _, err := a.SendQueuedMessages(ctx, []string{"rejected attempt"}); err == nil {
-			t.Fatal("SendQueuedMessages while busy must error")
+		// "second" arrives while busy: it must enqueue (not start, not error).
+		r2, err := a.Submit(ctx, "second")
+		if err != nil {
+			t.Fatalf("Submit second while busy: %v", err)
 		}
-		// Release the first turn and retry the second.
+		if r2.Started || len(r2.Queue) != 1 {
+			t.Fatalf("second submit while busy should enqueue: %#v", r2)
+		}
+		// Release the first turn; the backend then auto-drains "second".
 		release <- struct{}{}
-		waitUntilEventOrderTurnEndCount(t, cap, 1)
-		waitUntilEventOrderAgentIdle(t, a)
-		if _, err := a.SendQueuedMessages(ctx, []string{"rejected attempt"}); err != nil {
-			t.Fatalf("retry SendQueuedMessages: %v", err)
-		}
-		waitUntilEventOrderTurnEndCount(t, cap, 2)
-		waitUntilEventOrderAgentIdle(t, a)
+		waitUntilFullyDrained(t, a)
 		assertProjectionsMatch(t, a, cap)
 	})
 }

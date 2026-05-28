@@ -6,10 +6,6 @@ export function AllModelList() {
   return window['go']['main']['App']['AllModelList']();
 }
 
-export function AppendUserMessage(arg1) {
-  return window['go']['main']['App']['AppendUserMessage'](arg1);
-}
-
 export function ApplyTurnAction(arg1, arg2, arg3) {
   return window['go']['main']['App']['ApplyTurnAction'](arg1, arg2, arg3);
 }
@@ -66,6 +62,10 @@ export function ProjectSwitch(arg1) {
   return window['go']['main']['App']['ProjectSwitch'](arg1);
 }
 
+export function QueueSnapshot() {
+  return window['go']['main']['App']['QueueSnapshot']();
+}
+
 export function ReadFileContent(arg1) {
   return window['go']['main']['App']['ReadFileContent'](arg1);
 }
@@ -88,14 +88,6 @@ export function RevertHistory(arg1) {
 
 export function SaveProjectPermission(arg1, arg2) {
   return window['go']['main']['App']['SaveProjectPermission'](arg1, arg2);
-}
-
-export function SendPrompt(arg1) {
-  return window['go']['main']['App']['SendPrompt'](arg1);
-}
-
-export function SendQueuedMessages(arg1) {
-  return window['go']['main']['App']['SendQueuedMessages'](arg1);
 }
 
 export function SessionArchive(arg1) {
@@ -136,6 +128,10 @@ export function SetProviderHidden(arg1, arg2) {
 
 export function SnapshotList() {
   return window['go']['main']['App']['SnapshotList']();
+}
+
+export function Submit(arg1) {
+  return window['go']['main']['App']['Submit'](arg1);
 }
 
 export function SwitchModel(arg1) {

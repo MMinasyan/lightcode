@@ -24,6 +24,7 @@ const (
 	EventBackgroundProcessComplete                  // A background process completion was delivered to the model.
 	EventUserMessageDisplay                         // A user-role message was appended to history.
 	EventGenericSystemSignal                        // A non-background <system-signal> was appended to history.
+	EventQueueChanged                               // The backend-owned input queue changed; carries a versioned snapshot.
 )
 
 // Event is the unified event type emitted by the Agent to adapters.
@@ -52,6 +53,10 @@ type Event struct {
 	SubagentSessionID string
 	TaskIndex         int
 	BackgroundProcess *BackgroundProcessDisplay
+
+	// Queue fields (EventQueueChanged): a versioned snapshot of the input queue.
+	Queue        []QueuedItem
+	QueueVersion int
 }
 
 // BackgroundProcessDisplay is the adapter-facing display payload for a
@@ -160,16 +165,27 @@ const (
 	TurnActionFork          = "fork"
 )
 
-// QueuedMessageTurn reports the turn assigned to one queued user message.
-type QueuedMessageTurn struct {
+// QueuedItem is one user message awaiting backend drain. ID is stable per
+// session (for keyed rendering); the queue is in-memory and volatile.
+type QueuedItem struct {
+	ID      string `json:"id"`
 	Content string `json:"content"`
-	Turn    int    `json:"turn"`
 }
 
-// QueuedMessagesResult reports the turns created while flushing queued input.
-type QueuedMessagesResult struct {
-	Appended []QueuedMessageTurn `json:"appended,omitempty"`
-	Started  QueuedMessageTurn   `json:"started"`
+// QueueState is a versioned snapshot of the input queue, returned by
+// QueueSnapshot for hydration. Version is monotonic for the agent's lifetime;
+// adapters drop snapshots whose version <= the last they applied.
+type QueueState struct {
+	Items   []QueuedItem `json:"items"`
+	Version int          `json:"version"`
+}
+
+// SubmitResult reports whether submitted input started a turn or was queued.
+type SubmitResult struct {
+	Started bool         `json:"started"`
+	Turn    int          `json:"turn,omitempty"`
+	Queue   []QueuedItem `json:"queue"`
+	Version int          `json:"version"`
 }
 
 // TurnActionResult is returned after a user-message revert/fork action.

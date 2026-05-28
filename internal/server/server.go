@@ -139,6 +139,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/session/archive", s.auth(s.handleSessionArchive))
 	mux.HandleFunc("POST /v1/session/delete", s.auth(s.handleSessionDelete))
 	mux.HandleFunc("GET /v1/session/messages", s.auth(s.handleSessionMessages))
+	mux.HandleFunc("GET /v1/queue", s.auth(s.handleQueue))
 	mux.HandleFunc("POST /v1/session/fork", s.auth(s.handleSessionFork))
 	mux.HandleFunc("POST /v1/revert/code", s.auth(s.handleRevertCode))
 	mux.HandleFunc("POST /v1/revert/history", s.auth(s.handleRevertHistory))
@@ -205,6 +206,11 @@ func (s *Server) handleEvent(ev agent.Event) {
 	case agent.EventGenericSystemSignal:
 		name = "system_signal"
 		data = map[string]any{"content": "System: " + ev.Result}
+	case agent.EventQueueChanged:
+		// Best-effort broadcast (like all hub events); clients reconcile the
+		// queue via the versioned GET /v1/queue on connect/reconnect.
+		name = "queue_changed"
+		data = map[string]any{"items": ev.Queue, "version": ev.QueueVersion}
 	case agent.EventUsage:
 		name = "usage"
 		data = s.agent.TokenUsage()
@@ -343,12 +349,23 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	turn, err := s.agent.SendPrompt(s.srvCtx, body.Content)
+	// srvCtx (not the request ctx) so the started/queued turn outlives the HTTP
+	// response.
+	res, err := s.agent.Submit(s.srvCtx, body.Content)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusConflict)
 		return
 	}
-	jsonResp(w, http.StatusAccepted, map[string]any{"turn": turn})
+	jsonResp(w, http.StatusAccepted, map[string]any{
+		"started": res.Started,
+		"turn":    res.Turn,
+		"queue":   res.Queue,
+		"version": res.Version,
+	})
+}
+
+func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
+	jsonResp(w, http.StatusOK, s.agent.QueueSnapshot())
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {

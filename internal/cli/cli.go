@@ -63,7 +63,10 @@ type CLI struct {
 	// far below its row) is rendered as a fresh block instead.
 	activeToolID string
 
-	msgQueue []string
+	// queueDisplay mirrors the backend-owned input queue (updated from
+	// EventQueueChanged / QueueSnapshot); lastQueueVersion drops stale snapshots.
+	queueDisplay     []agent.QueuedItem
+	lastQueueVersion int
 
 	permQueue       []*agent.PermissionRequest
 	permSelected    int
@@ -366,7 +369,8 @@ func (c *CLI) handleKeyStreaming(k keyMsg) {
 			if strings.HasPrefix(text, "/") {
 				c.handleSlashWhileBusy(text)
 			} else {
-				c.msgQueue = append(c.msgQueue, text)
+				// Queue via the backend; it appends and emits queue_changed.
+				c.submitToBackend(text)
 			}
 		}
 	}
@@ -730,6 +734,14 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			c.startAnimationLocked("Thinking")
 		}
 
+	case agent.EventQueueChanged:
+		// Backend-owned queue: keep the display mirror current (drop stale
+		// snapshots by version). The CLI does not render the queue inline.
+		if ev.QueueVersion > c.lastQueueVersion {
+			c.queueDisplay = ev.Queue
+			c.lastQueueVersion = ev.QueueVersion
+		}
+
 	case agent.EventTurnEnd:
 		c.activeToolID = ""
 		c.stopAnimationLocked()
@@ -749,11 +761,9 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.permSelected = 0
 		c.permPromptLines = 0
 		c.permFrame = transientMenuFrame{}
-		if len(c.msgQueue) > 0 {
-			c.flushQueueLocked()
-		} else {
-			c.printInputPromptLocked()
-		}
+		// Queue draining is backend-owned: the agent auto-drains after the turn
+		// ends and emits turn_start for the next turn. The CLI just re-prompts.
+		c.printInputPromptLocked()
 
 	case agent.EventError:
 		c.activeToolID = ""
@@ -1042,74 +1052,28 @@ func (c *CLI) submitInput(text string) {
 }
 
 func (c *CLI) submitInputLocked(text string) {
-	if len(c.msgQueue) > 0 {
-		c.msgQueue = append(c.msgQueue, text)
-		c.flushQueueLocked()
-		return
-	}
+	// Idle submit: the backend starts the turn immediately (direct start).
 	c.startAnimationLocked("Thinking")
+	c.submitToBackend(text)
+}
 
+// submitToBackend routes input through the agent's single Submit entry point.
+// The agent decides whether to start a turn or enqueue and emits queue_changed;
+// the CLI does not own the queue. On error it renders the message and, if idle,
+// restores the input prompt. Runs the call off the lock in a goroutine.
+func (c *CLI) submitToBackend(text string) {
 	go func() {
-		turn, err := c.agent.SendPrompt(c.ctx, text)
-		if err != nil {
+		if _, err := c.agent.Submit(c.ctx, text); err != nil {
 			c.mu.Lock()
 			c.stopAnimationLocked()
 			c.writeRaw("\r\x1b[2K")
 			c.writeRaw(renderErrorMsg(err.Error()))
-			c.busy = false
-			c.state = stateIdle
-			c.printInputPromptLocked()
-			c.mu.Unlock()
-			return
-		}
-		_ = turn
-	}()
-}
-
-func (c *CLI) flushQueue() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.flushQueueLocked()
-}
-
-func (c *CLI) flushQueueLocked() {
-	if len(c.msgQueue) == 0 {
-		return
-	}
-
-	queue := append([]string(nil), c.msgQueue...)
-	c.busy = true
-	c.state = stateStreaming
-	c.startAnimationLocked("Thinking")
-
-	go func() {
-		if _, err := c.agent.SendQueuedMessages(c.ctx, queue); err != nil {
-			c.mu.Lock()
-			if strings.Contains(err.Error(), "turn is already in progress") {
-				c.stopAnimationLocked()
-				c.writeRaw("\r\x1b[2K")
-				c.busy = true
-				c.state = stateStreaming
-				c.mu.Unlock()
-				return
+			if !c.busy {
+				c.state = stateIdle
+				c.printInputPromptLocked()
 			}
-			c.stopAnimationLocked()
-			c.writeRaw("\r\x1b[2K")
-			c.writeRaw(renderErrorMsg(err.Error()))
-			c.busy = false
-			c.state = stateIdle
-			c.printInputPromptLocked()
 			c.mu.Unlock()
-			return
 		}
-		c.mu.Lock()
-		for range queue {
-			if len(c.msgQueue) == 0 {
-				break
-			}
-			c.msgQueue = c.msgQueue[1:]
-		}
-		c.mu.Unlock()
 	}()
 }
 
@@ -1123,6 +1087,9 @@ func (c *CLI) refreshSessionLocked() {
 	c.refreshState()
 	msgs := c.agent.SessionMessages()
 	c.messages = buildDisplayMsgs(msgs)
+	q := c.agent.QueueSnapshot()
+	c.queueDisplay = q.Items
+	c.lastQueueVersion = q.Version
 	c.seedInputHistory()
 
 	c.printLineLocked("")

@@ -262,6 +262,28 @@ func TestHandleEventBroadcastsUserMessageAndSystemSignal(t *testing.T) {
 	}
 }
 
+func TestHandleEventQueueChangedBroadcasts(t *testing.T) {
+	hub := newSSEHub()
+	ch, unsub := hub.subscribe()
+	defer unsub()
+	s := &Server{hub: hub}
+
+	s.handleEvent(agent.Event{
+		Kind:         agent.EventQueueChanged,
+		Queue:        []agent.QueuedItem{{ID: "q-1", Content: "hi"}},
+		QueueVersion: 3,
+	})
+	select {
+	case msg := <-ch:
+		text := string(msg)
+		if !strings.Contains(text, "event: queue_changed") || !strings.Contains(text, `"version":3`) || !strings.Contains(text, `"content":"hi"`) {
+			t.Fatalf("queue_changed event = %q", msg)
+		}
+	default:
+		t.Fatal("queue_changed event not broadcast")
+	}
+}
+
 func TestHandleEventTurnEndIncludesCancelled(t *testing.T) {
 	hub := newSSEHub()
 	ch, unsub := hub.subscribe()

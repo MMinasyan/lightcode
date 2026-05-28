@@ -4,9 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -164,15 +161,19 @@ func TestSubmitAndFlushDoNotRenderUserMessagesLocally(t *testing.T) {
 		t.Fatalf("submitInputLocked must not append a user displayEntry locally")
 	}
 
-	body, ok = extractFunctionBody(string(source), "func (c *CLI) flushQueueLocked(")
+	body, ok = extractFunctionBody(string(source), "func (c *CLI) submitToBackend(")
 	if !ok {
-		t.Fatal("flushQueueLocked not found in cli.go")
+		t.Fatal("submitToBackend not found in cli.go")
 	}
 	if strings.Contains(body, "renderUserMsg(") {
-		t.Fatalf("flushQueueLocked must not call renderUserMsg; user transcript entries arrive via EventUserMessageDisplay")
+		t.Fatalf("submitToBackend must not call renderUserMsg; user transcript entries arrive via EventUserMessageDisplay")
 	}
 	if strings.Contains(body, "typ:  \"user\"") || strings.Contains(body, "typ: \"user\"") {
-		t.Fatalf("flushQueueLocked must not append a user displayEntry locally")
+		t.Fatalf("submitToBackend must not append a user displayEntry locally")
+	}
+	// The CLI must route input through the backend Submit entry point.
+	if !strings.Contains(string(source), "c.agent.Submit(c.ctx") {
+		t.Fatalf("CLI must submit input through agent.Submit")
 	}
 }
 
@@ -287,66 +288,6 @@ func extractFunctionBody(source, prefix string) (string, bool) {
 	return "", false
 }
 
-func TestFlushQueueKeepsQueuedMessagesWhenBackendBusy(t *testing.T) {
-	release := make(chan struct{})
-	var releaseOnce sync.Once
-	releaseBackend := func() {
-		releaseOnce.Do(func() { close(release) })
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-release
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer server.Close()
-	defer releaseBackend()
-
-	a, _ := newTestAgentWithBaseURL(t, server.URL+"/v1")
-	agentCtx := startTestAgent(t, a)
-	if _, err := a.SendPrompt(agentCtx, "hold backend busy"); err != nil {
-		t.Fatalf("SendPrompt returned error: %v", err)
-	}
-	waitUntilAgentBusy(t, a)
-
-	c := New(a)
-	c.ctx = context.Background()
-	c.out = io.Discard
-	c.msgQueue = []string{"queued while busy"}
-
-	c.mu.Lock()
-	c.flushQueueLocked()
-	c.mu.Unlock()
-
-	waitUntilCLIAnimationStopped(t, c)
-	c.mu.Lock()
-	got := append([]string(nil), c.msgQueue...)
-	c.mu.Unlock()
-	if !equalStringSlices(got, []string{"queued while busy"}) {
-		t.Fatalf("queue after busy backend response = %q, want retained queued text", got)
-	}
-	releaseBackend()
-	waitUntilAgentIdle(t, a)
-}
-
-func TestFlushQueueRemovesQueuedMessagesAfterBackendAccepts(t *testing.T) {
-	a, _ := newTestAgent(t)
-	agentCtx := startTestAgent(t, a)
-	c := New(a)
-	c.ctx = agentCtx
-	c.out = io.Discard
-	c.msgQueue = []string{"first queued", "second queued"}
-
-	c.mu.Lock()
-	c.flushQueueLocked()
-	c.mu.Unlock()
-
-	waitUntilCLIQueueLen(t, c, 0)
-	c.mu.Lock()
-	c.stopAnimationLocked()
-	c.mu.Unlock()
-	waitUntilAgentIdle(t, a)
-}
-
 func newTestAgent(t *testing.T) (*agent.Agent, string) {
 	return newTestAgentWithBaseURL(t, "http://127.0.0.1:9/v1")
 }
@@ -403,18 +344,6 @@ func startTestAgent(t *testing.T, a *agent.Agent) context.Context {
 	return ctx
 }
 
-func waitUntilAgentBusy(t *testing.T, a *agent.Agent) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if a.Busy() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("agent did not become busy")
-}
-
 func waitUntilAgentIdle(t *testing.T, a *agent.Agent) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -425,51 +354,6 @@ func waitUntilAgentIdle(t *testing.T, a *agent.Agent) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("agent did not become idle")
-}
-
-func waitUntilCLIQueueLen(t *testing.T, c *CLI, want int) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		c.mu.Lock()
-		got := len(c.msgQueue)
-		c.mu.Unlock()
-		if got == want {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	c.mu.Lock()
-	got := len(c.msgQueue)
-	c.mu.Unlock()
-	t.Fatalf("CLI queue len = %d, want %d", got, want)
-}
-
-func waitUntilCLIAnimationStopped(t *testing.T, c *CLI) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		c.mu.Lock()
-		stopped := c.animStop == nil
-		c.mu.Unlock()
-		if stopped {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("CLI animation did not stop")
-}
-
-func equalStringSlices(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func TestHandleKeyIdleInputEditing(t *testing.T) {

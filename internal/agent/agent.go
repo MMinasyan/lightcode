@@ -93,6 +93,17 @@ type Agent struct {
 
 	loopFlush  chan chan struct{}
 	signalWake chan struct{}
+	queueWake  chan struct{}
+
+	// Backend-owned input queue: in-memory, volatile, session-scoped. Guarded
+	// by mu. queueVersion is monotonic for the agent's lifetime and is NEVER
+	// reset (adapters drop snapshots whose version <= the last applied);
+	// queueSeq (item-ID source) resets on session change. transitioning is true
+	// while a cancel-and-wait session change holds its window open.
+	queue         []QueuedItem
+	queueVersion  int
+	queueSeq      int
+	transitioning bool
 
 	warningsMu      sync.Mutex
 	warningGroups   map[string][]PromptWarning
@@ -158,6 +169,7 @@ func New(c Config) (*Agent, error) {
 		contextWindowSize: contextWindowSize,
 		loopFlush:         make(chan chan struct{}, 1),
 		signalWake:        make(chan struct{}, 1),
+		queueWake:         make(chan struct{}, 1),
 		warningGroups:     make(map[string][]PromptWarning),
 	}
 
@@ -349,6 +361,7 @@ func (a *Agent) SetEventHandler(fn func(Event)) {
 func (a *Agent) Init(ctx context.Context) {
 	go a.drainLoopEvents(ctx)
 	go a.runSignalScheduler(ctx)
+	go a.runQueueDrainer(ctx)
 	if a.memoryStore != nil {
 		_ = a.memoryStore.Reconcile()
 	}
@@ -416,15 +429,23 @@ func (a *Agent) tryStartSignalTurn(ctx context.Context) {
 		return
 	}
 	a.mu.Lock()
-	busy := a.busy
-	active := a.store != nil && a.store.Active()
-	a.mu.Unlock()
-	if busy || !active {
+	// Queued user input takes priority over a bare signal turn, and a session
+	// change in flight must block it. The gate and the busy-claim share one
+	// lock hold so nothing can slip a signal turn in between (claimTurnLocked
+	// is called while still holding a.mu).
+	if a.busy || a.transitioning || len(a.queue) > 0 || a.store == nil || !a.store.Active() || !a.lp.HasPendingWakeSignal() {
+		a.mu.Unlock()
 		return
 	}
-	if _, err := a.startTurn(ctx, nil); err != nil && !strings.Contains(err.Error(), "turn is already in progress") {
-		a.emitEvent(Event{Kind: EventError, Error: err.Error()})
+	turnCtx, cancel, err := a.claimTurnLocked(ctx)
+	a.mu.Unlock()
+	if err != nil {
+		if !strings.Contains(err.Error(), "turn is already in progress") {
+			a.emitEvent(Event{Kind: EventError, Error: err.Error()})
+		}
+		return
 	}
+	a.launchTurn(ctx, turnCtx, cancel, nil)
 }
 
 func (a *Agent) setWarningGroup(group string, warnings []prompt.Warning) {
@@ -1147,49 +1168,54 @@ func (a *Agent) ensureSession() error {
 
 // --- Public methods (the service API) ---
 
-// SendPrompt starts a turn with a single user message.
-func (a *Agent) SendPrompt(ctx context.Context, content string) (int, error) {
-	return a.sendMessages(ctx, []string{content})
-}
-
-// SendQueuedMessages flushes messages submitted while a turn was busy: all
-// but the last are persisted as user-only turns, then the last starts the
-// next model turn.
-func (a *Agent) SendQueuedMessages(ctx context.Context, contents []string) (QueuedMessagesResult, error) {
-	var result QueuedMessagesResult
-	if len(contents) == 0 {
-		return result, fmt.Errorf("no queued messages")
-	}
+// Submit is the single entry point for new user input. If the agent is idle
+// with an empty queue it starts a turn immediately; otherwise it appends to the
+// backend-owned in-memory queue (drained automatically after the active turn
+// ends). It rejects with an error while a session change is in flight rather
+// than accepting input it would then discard. Any queue mutation emits a
+// versioned EventQueueChanged.
+func (a *Agent) Submit(ctx context.Context, content string) (SubmitResult, error) {
 	a.mu.Lock()
-	if a.busy {
+	if a.transitioning {
 		a.mu.Unlock()
-		return result, fmt.Errorf("a turn is already in progress")
+		return SubmitResult{}, fmt.Errorf("session is changing; retry")
 	}
-	if err := a.ensureSession(); err != nil {
+	if !a.busy && len(a.queue) == 0 {
+		turnCtx, cancel, err := a.claimTurnLocked(ctx)
+		if err != nil {
+			a.mu.Unlock()
+			return SubmitResult{}, err
+		}
+		version := a.queueVersion
 		a.mu.Unlock()
-		return result, err
+		turn := a.launchTurn(ctx, turnCtx, cancel, []string{content})
+		return SubmitResult{Started: true, Turn: turn, Version: version}, nil
 	}
-	for _, content := range contents[:len(contents)-1] {
-		turn := a.store.BeginTurn()
-		a.lp.AppendUserMessage(turn, content)
-		_ = a.store.MarkTurnComplete(turn)
-		result.Appended = append(result.Appended, QueuedMessageTurn{Content: content, Turn: turn})
-	}
-	a.busy = true
-	a.seenSessions = nil
-	turnCtx, cancel := context.WithCancel(ctx)
-	a.turnCancel = cancel
-	a.turnCtx = turnCtx
+	// Busy or queue non-empty: enqueue and let the drainer pick it up.
+	a.queueSeq++
+	a.queue = append(a.queue, QueuedItem{ID: fmt.Sprintf("q-%d", a.queueSeq), Content: content})
+	a.queueVersion++
+	items := append([]QueuedItem(nil), a.queue...)
+	version := a.queueVersion
 	a.mu.Unlock()
-
-	last := contents[len(contents)-1]
-	turn := a.launchTurn(ctx, turnCtx, cancel, []string{last})
-	result.Started = QueuedMessageTurn{Content: last, Turn: turn}
-	return result, nil
+	a.nudgeQueueDrainer()
+	a.emitEvent(Event{Kind: EventQueueChanged, Queue: items, QueueVersion: version})
+	return SubmitResult{Started: false, Queue: items, Version: version}, nil
 }
 
-// AppendUserMessage persists a user message as its own complete turn
-// without running the model.
+// QueueSnapshot returns a versioned copy of the current queue, for adapter
+// hydration (subscribe-then-GET: register the queue_changed handler first).
+func (a *Agent) QueueSnapshot() QueueState {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return QueueState{Items: append([]QueuedItem(nil), a.queue...), Version: a.queueVersion}
+}
+
+// AppendUserMessage persists a user message as its own complete turn WITHOUT
+// running the model. It is a history-seeding primitive (used to script/seed
+// conversation state), not a user-input path — live input goes through Submit.
+// It still routes through the loop's emit chokepoint, so it is display-ordered.
+// Not exposed in the Wails layer.
 func (a *Agent) AppendUserMessage(content string) (int, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -1205,19 +1231,112 @@ func (a *Agent) AppendUserMessage(content string) (int, error) {
 	return turn, nil
 }
 
-func (a *Agent) sendMessages(ctx context.Context, contents []string) (int, error) {
-	return a.startTurn(ctx, contents)
-}
-
-func (a *Agent) startTurn(ctx context.Context, contents []string) (int, error) {
-	a.mu.Lock()
+// claimTurnLocked checks the busy gate and claims a turn (sets busy, builds the
+// per-turn context). Caller must hold a.mu. Returns a non-nil error if a turn
+// is already in progress or ensureSession fails; on error it leaves busy
+// unchanged (never half-claims). launchTurn must be called AFTER unlocking.
+func (a *Agent) claimTurnLocked(ctx context.Context) (context.Context, context.CancelFunc, error) {
 	if a.busy {
-		a.mu.Unlock()
-		return 0, fmt.Errorf("a turn is already in progress")
+		return nil, nil, fmt.Errorf("a turn is already in progress")
 	}
 	if err := a.ensureSession(); err != nil {
+		return nil, nil, err
+	}
+	a.busy = true
+	a.seenSessions = nil
+	turnCtx, cancel := context.WithCancel(ctx)
+	a.turnCancel = cancel
+	a.turnCtx = turnCtx
+	return turnCtx, cancel, nil
+}
+
+// nudgeQueueDrainer wakes the drain goroutine (non-blocking; coalesced).
+func (a *Agent) nudgeQueueDrainer() {
+	select {
+	case a.queueWake <- struct{}{}:
+	default:
+	}
+}
+
+// clearQueueLocked empties the queue and resets per-session item IDs, bumping
+// the monotonic version when the queue was non-empty. Caller holds a.mu.
+// Returns the empty snapshot, its version, and whether the queue changed.
+func (a *Agent) clearQueueLocked() ([]QueuedItem, int, bool) {
+	a.queueSeq = 0
+	if len(a.queue) == 0 {
+		return nil, a.queueVersion, false
+	}
+	a.queue = nil
+	a.queueVersion++
+	return nil, a.queueVersion, true
+}
+
+// beginTransition marks a cancel-and-wait session change in flight. While set,
+// Submit rejects and the drainer/signal-scheduler will not start a turn, so no
+// queued input can launch against the session being swapped. Must be paired
+// with a deferred endTransition registered BEFORE cancelAndWaitIdle so it fires
+// even on the pre-lock error return.
+func (a *Agent) beginTransition() {
+	a.mu.Lock()
+	a.transitioning = true
+	a.mu.Unlock()
+}
+
+// endTransition clears the transitioning flag and emits the current queue
+// snapshot (adapters dedup by version, so this is harmless when unchanged and
+// delivers the emptied snapshot when the swap cleared the queue). If the queue
+// survived (a no-op or failed transition) and a session is active, it re-nudges
+// the drainer — a nudge token may have been consumed while transitioning
+// blocked the drain, which would otherwise strand the intact queue.
+func (a *Agent) endTransition() {
+	a.mu.Lock()
+	a.transitioning = false
+	items := append([]QueuedItem(nil), a.queue...)
+	version := a.queueVersion
+	active := a.store != nil && a.store.Active()
+	a.mu.Unlock()
+	a.emitEvent(Event{Kind: EventQueueChanged, Queue: items, QueueVersion: version})
+	if len(items) > 0 && active {
+		a.nudgeQueueDrainer()
+	}
+}
+
+// runQueueDrainer drains the backend queue after a turn ends. It is woken by
+// nudgeQueueDrainer (every Submit-append and every turn-end) and ctx is the
+// agent lifetime context from Init.
+func (a *Agent) runQueueDrainer(ctx context.Context) {
+	for {
+		select {
+		case <-a.queueWake:
+			a.tryDrainQueue(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// tryDrainQueue starts a turn from the whole queue when the agent is idle, not
+// transitioning, and a session is active. All but the last queued message
+// become user-only turns; the last starts the model turn (mirrors the former
+// SendQueuedMessages). The gate + busy-claim share one lock hold so it can
+// never double-start or launch against a session being swapped.
+func (a *Agent) tryDrainQueue(ctx context.Context) {
+	a.mu.Lock()
+	if a.busy || a.transitioning || a.store == nil || !a.store.Active() || len(a.queue) == 0 {
 		a.mu.Unlock()
-		return 0, err
+		return
+	}
+	contents := make([]string, len(a.queue))
+	for i, it := range a.queue {
+		contents[i] = it.Content
+	}
+	a.queue = nil
+	a.queueVersion++
+	version := a.queueVersion
+	for _, content := range contents[:len(contents)-1] {
+		turn := a.store.BeginTurn()
+		a.lp.AppendUserMessage(turn, content)
+		_ = a.store.MarkTurnComplete(turn)
 	}
 	a.busy = true
 	a.seenSessions = nil
@@ -1226,7 +1345,8 @@ func (a *Agent) startTurn(ctx context.Context, contents []string) (int, error) {
 	a.turnCtx = turnCtx
 	a.mu.Unlock()
 
-	return a.launchTurn(ctx, turnCtx, cancel, contents), nil
+	a.emitEvent(Event{Kind: EventQueueChanged, Queue: nil, QueueVersion: version})
+	a.launchTurn(ctx, turnCtx, cancel, []string{contents[len(contents)-1]})
 }
 
 func (a *Agent) launchTurn(ctx context.Context, turnCtx context.Context, cancel context.CancelFunc, contents []string) int {
@@ -1246,6 +1366,12 @@ func (a *Agent) launchTurn(ctx context.Context, turnCtx context.Context, cancel 
 			a.turnCtx = nil
 			a.mu.Unlock()
 			cancel()
+			// Unconditionally nudge the queue drainer after every turn end: it
+			// no-ops on an empty queue, and the unconditional nudge is the
+			// reliable retry that defeats cap-1 channel coalescing for items
+			// queued mid-turn. The signal scheduler still defers to a non-empty
+			// queue (see tryStartSignalTurn).
+			a.nudgeQueueDrainer()
 			if a.lp != nil && a.lp.HasPendingWakeSignal() {
 				a.nudgeSignalScheduler()
 			}
@@ -1727,6 +1853,11 @@ func (a *Agent) cancelAndWaitIdle() error {
 
 // SessionSwitch closes the current session and loads another.
 func (a *Agent) SessionSwitch(id string) error {
+	// Mark the transition and register the clear BEFORE cancelAndWaitIdle so it
+	// fires on every return — including the pre-lock error return below — and
+	// never leaves transitioning stuck true.
+	a.beginTransition()
+	defer a.endTransition()
 	if err := a.cancelAndWaitIdle(); err != nil {
 		return err
 	}
@@ -1734,11 +1865,15 @@ func (a *Agent) SessionSwitch(id string) error {
 	defer a.mu.Unlock()
 
 	if a.store.Active() && a.store.SessionID() == id {
-		return nil
+		return nil // same-session no-op: queue is preserved
 	}
 	if _, err := a.store.Close(); err != nil {
 		return err
 	}
+	// The old session is now irreversibly detached: clear the queue here, not
+	// after LoadSession — a LoadSession failure must not leave the queue bound
+	// to a closed (inactive) session, which endTransition could not drain.
+	a.clearQueueLocked()
 	if err := a.store.LoadSession(id); err != nil {
 		return err
 	}
@@ -1789,6 +1924,14 @@ func (a *Agent) resetCurrentSessionState() {
 
 // SessionNew closes the current session and starts fresh.
 func (a *Agent) SessionNew() error {
+	// Registered before the lock so it emits after unlock (defer LIFO).
+	var clearedVersion int
+	var queueCleared bool
+	defer func() {
+		if queueCleared {
+			a.emitEvent(Event{Kind: EventQueueChanged, Queue: nil, QueueVersion: clearedVersion})
+		}
+	}()
 	a.mu.Lock()
 	if a.busy {
 		a.mu.Unlock()
@@ -1799,6 +1942,7 @@ func (a *Agent) SessionNew() error {
 	if _, err := a.store.Close(); err != nil {
 		return err
 	}
+	_, clearedVersion, queueCleared = a.clearQueueLocked()
 	a.resetCurrentSessionStateLocked()
 	return nil
 }
@@ -1867,8 +2011,12 @@ func (a *Agent) currentSessionsRoot() (string, error) {
 
 func (a *Agent) closeIfCurrent(id string) (bool, error) {
 	if !a.store.Active() || a.store.SessionID() != id {
-		return false, nil
+		return false, nil // not the current session: not a transition, queue untouched
 	}
+	// Transition begins only once we've decided to actually close the current
+	// session; clear registered before cancelAndWaitIdle covers its error path.
+	a.beginTransition()
+	defer a.endTransition()
 	if err := a.cancelAndWaitIdle(); err != nil {
 		return false, err
 	}
@@ -1877,6 +2025,9 @@ func (a *Agent) closeIfCurrent(id string) (bool, error) {
 	if _, err := a.store.Close(); err != nil {
 		return false, err
 	}
+	// Close (no LoadSession follows for archive/delete) is the irreversible
+	// change: clear the queue now.
+	a.clearQueueLocked()
 	return true, nil
 }
 
@@ -2076,6 +2227,15 @@ func displayMetadataForToolCall(name, args, result string) map[string]any {
 // The turn argument is the clicked user turn; this method owns the conversion
 // to the lower-level snapshot/history cut points so adapters do not duplicate it.
 func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (TurnActionResult, error) {
+	// fork / revert_history change the session; clear the queue at the
+	// irreversible store mutation and emit after unlock (defer LIFO).
+	var clearedVersion int
+	var queueCleared bool
+	defer func() {
+		if queueCleared {
+			a.emitEvent(Event{Kind: EventQueueChanged, Queue: nil, QueueVersion: clearedVersion})
+		}
+	}()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.busy {
@@ -2114,6 +2274,8 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 		if err := a.store.RevertHistory(target); err != nil {
 			return TurnActionResult{}, err
 		}
+		// History irreversibly truncated: the queued input no longer applies.
+		_, clearedVersion, queueCleared = a.clearQueueLocked()
 		if err := a.loadHistoryIntoLoop(); err != nil {
 			return TurnActionResult{}, err
 		}
@@ -2136,6 +2298,9 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 		if _, err := a.store.Close(); err != nil {
 			return TurnActionResult{}, err
 		}
+		// Old session irreversibly detached by the fork's Close: clear here,
+		// before LoadSession (which may fail and leave no active session).
+		_, clearedVersion, queueCleared = a.clearQueueLocked()
 		if err := a.store.LoadSession(newID); err != nil {
 			return TurnActionResult{}, err
 		}
@@ -2202,6 +2367,13 @@ func (a *Agent) RevertCode(turn int) error {
 
 // RevertHistory truncates conversation after the given turn.
 func (a *Agent) RevertHistory(turn int) error {
+	var clearedVersion int
+	var queueCleared bool
+	defer func() {
+		if queueCleared {
+			a.emitEvent(Event{Kind: EventQueueChanged, Queue: nil, QueueVersion: clearedVersion})
+		}
+	}()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.busy {
@@ -2213,6 +2385,7 @@ func (a *Agent) RevertHistory(turn int) error {
 	if err := a.store.RevertHistory(turn); err != nil {
 		return err
 	}
+	_, clearedVersion, queueCleared = a.clearQueueLocked()
 	if err := a.loadHistoryIntoLoop(); err != nil {
 		return err
 	}
@@ -2222,6 +2395,13 @@ func (a *Agent) RevertHistory(turn int) error {
 
 // ForkSession creates a new session branched from the given turn.
 func (a *Agent) ForkSession(turn int) error {
+	var clearedVersion int
+	var queueCleared bool
+	defer func() {
+		if queueCleared {
+			a.emitEvent(Event{Kind: EventQueueChanged, Queue: nil, QueueVersion: clearedVersion})
+		}
+	}()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.busy {
@@ -2237,6 +2417,7 @@ func (a *Agent) ForkSession(turn int) error {
 	if _, err := a.store.Close(); err != nil {
 		return err
 	}
+	_, clearedVersion, queueCleared = a.clearQueueLocked()
 	if err := a.store.LoadSession(newID); err != nil {
 		return err
 	}
