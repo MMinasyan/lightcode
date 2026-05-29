@@ -208,8 +208,12 @@ func (r *Runner) handleEvent(ev agent.Event) {
 		method = "agent/system_signal"
 		params = map[string]any{"content": "System: " + ev.Result}
 	case agent.EventQueueChanged:
+		queue := ev.Queue
+		if queue == nil {
+			queue = []agent.QueuedItem{}
+		}
 		method = "agent/queue_changed"
-		params = map[string]any{"items": ev.Queue, "version": ev.QueueVersion}
+		params = map[string]any{"items": queue, "version": ev.QueueVersion}
 	case agent.EventUsage:
 		method = "agent/usage"
 		params = r.agent.TokenUsage()

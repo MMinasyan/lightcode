@@ -8,6 +8,7 @@ import (
 type StagedCall struct {
 	ToolName   string
 	ToolCallID string
+	Args       string
 	Params     map[string]any
 }
 

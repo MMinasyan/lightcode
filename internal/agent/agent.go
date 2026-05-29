@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"io"
 	"os"
 	"path/filepath"
@@ -838,9 +837,9 @@ func (a *Agent) shouldAutoCompact() bool {
 	return float64(used)/float64(window) >= a.cfg.Compaction.ThresholdPct
 }
 
-// runCompaction summarizes the current conversation. turnInProgress
-// should be true when called from inside SendPrompt (a BeginTurn was
-// just issued for a not-yet-executed turn), false for manual compaction.
+// runCompaction summarizes the current conversation. turnInProgress should be
+// true when called from inside an active turn (a BeginTurn was just issued for a
+// not-yet-executed turn), false for manual compaction.
 func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 	a.emitEvent(Event{Kind: EventCompactionStart})
 	defer a.emitEvent(Event{Kind: EventCompactionEnd})
@@ -868,7 +867,7 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 		return err
 	}
 
-	// When called from SendPrompt, CurrentTurn() is the just-begun
+	// When called from inside an active turn, CurrentTurn() is the just-begun
 	// empty turn; the boundary is the previous (last completed) turn.
 	boundaryTurn := a.store.CurrentTurn()
 	if turnInProgress {
@@ -953,6 +952,10 @@ func (a *Agent) CompactNow(ctx context.Context) error {
 		a.turnCtx = nil
 		a.mu.Unlock()
 		cancel()
+		// Manual compaction uses the same busy gate as a turn. If input was
+		// queued while compaction was running, wake the backend drainer now that
+		// the gate is open again.
+		a.nudgeQueueDrainer()
 		if a.lp != nil && a.lp.HasPendingWakeSignal() {
 			a.nudgeSignalScheduler()
 		}
@@ -1189,13 +1192,13 @@ func (a *Agent) Submit(ctx context.Context, content string) (SubmitResult, error
 		version := a.queueVersion
 		a.mu.Unlock()
 		turn := a.launchTurn(ctx, turnCtx, cancel, []string{content})
-		return SubmitResult{Started: true, Turn: turn, Version: version}, nil
+		return SubmitResult{Started: true, Turn: turn, Queue: emptyQueue(), Version: version}, nil
 	}
 	// Busy or queue non-empty: enqueue and let the drainer pick it up.
 	a.queueSeq++
 	a.queue = append(a.queue, QueuedItem{ID: fmt.Sprintf("q-%d", a.queueSeq), Content: content})
 	a.queueVersion++
-	items := append([]QueuedItem(nil), a.queue...)
+	items := copyQueue(a.queue)
 	version := a.queueVersion
 	a.mu.Unlock()
 	a.nudgeQueueDrainer()
@@ -1208,7 +1211,7 @@ func (a *Agent) Submit(ctx context.Context, content string) (SubmitResult, error
 func (a *Agent) QueueSnapshot() QueueState {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return QueueState{Items: append([]QueuedItem(nil), a.queue...), Version: a.queueVersion}
+	return QueueState{Items: copyQueue(a.queue), Version: a.queueVersion}
 }
 
 // AppendUserMessage persists a user message as its own complete turn WITHOUT
@@ -1236,6 +1239,9 @@ func (a *Agent) AppendUserMessage(content string) (int, error) {
 // is already in progress or ensureSession fails; on error it leaves busy
 // unchanged (never half-claims). launchTurn must be called AFTER unlocking.
 func (a *Agent) claimTurnLocked(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if a.busy {
 		return nil, nil, fmt.Errorf("a turn is already in progress")
 	}
@@ -1258,17 +1264,28 @@ func (a *Agent) nudgeQueueDrainer() {
 	}
 }
 
+func emptyQueue() []QueuedItem {
+	return []QueuedItem{}
+}
+
+func copyQueue(items []QueuedItem) []QueuedItem {
+	if len(items) == 0 {
+		return emptyQueue()
+	}
+	return append([]QueuedItem(nil), items...)
+}
+
 // clearQueueLocked empties the queue and resets per-session item IDs, bumping
 // the monotonic version when the queue was non-empty. Caller holds a.mu.
 // Returns the empty snapshot, its version, and whether the queue changed.
 func (a *Agent) clearQueueLocked() ([]QueuedItem, int, bool) {
 	a.queueSeq = 0
 	if len(a.queue) == 0 {
-		return nil, a.queueVersion, false
+		return emptyQueue(), a.queueVersion, false
 	}
 	a.queue = nil
 	a.queueVersion++
-	return nil, a.queueVersion, true
+	return emptyQueue(), a.queueVersion, true
 }
 
 // beginTransition marks a cancel-and-wait session change in flight. While set,
@@ -1291,7 +1308,7 @@ func (a *Agent) beginTransition() {
 func (a *Agent) endTransition() {
 	a.mu.Lock()
 	a.transitioning = false
-	items := append([]QueuedItem(nil), a.queue...)
+	items := copyQueue(a.queue)
 	version := a.queueVersion
 	active := a.store != nil && a.store.Active()
 	a.mu.Unlock()
@@ -1307,7 +1324,15 @@ func (a *Agent) endTransition() {
 func (a *Agent) runQueueDrainer(ctx context.Context) {
 	for {
 		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		select {
 		case <-a.queueWake:
+			if ctx.Err() != nil {
+				return
+			}
 			a.tryDrainQueue(ctx)
 		case <-ctx.Done():
 			return
@@ -1317,12 +1342,15 @@ func (a *Agent) runQueueDrainer(ctx context.Context) {
 
 // tryDrainQueue starts a turn from the whole queue when the agent is idle, not
 // transitioning, and a session is active. All but the last queued message
-// become user-only turns; the last starts the model turn (mirrors the former
-// SendQueuedMessages). The gate + busy-claim share one lock hold so it can
-// never double-start or launch against a session being swapped.
+// become user-only turns; the last starts the model turn. The gate + busy-claim
+// share one lock hold so it can never double-start or launch against a session
+// being swapped.
 func (a *Agent) tryDrainQueue(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	a.mu.Lock()
-	if a.busy || a.transitioning || a.store == nil || !a.store.Active() || len(a.queue) == 0 {
+	if ctx.Err() != nil || a.busy || a.transitioning || a.store == nil || !a.store.Active() || len(a.queue) == 0 {
 		a.mu.Unlock()
 		return
 	}
@@ -1334,9 +1362,17 @@ func (a *Agent) tryDrainQueue(ctx context.Context) {
 	a.queueVersion++
 	version := a.queueVersion
 	for _, content := range contents[:len(contents)-1] {
+		if ctx.Err() != nil {
+			a.mu.Unlock()
+			return
+		}
 		turn := a.store.BeginTurn()
 		a.lp.AppendUserMessage(turn, content)
 		_ = a.store.MarkTurnComplete(turn)
+	}
+	if ctx.Err() != nil {
+		a.mu.Unlock()
+		return
 	}
 	a.busy = true
 	a.seenSessions = nil
@@ -1345,7 +1381,7 @@ func (a *Agent) tryDrainQueue(ctx context.Context) {
 	a.turnCtx = turnCtx
 	a.mu.Unlock()
 
-	a.emitEvent(Event{Kind: EventQueueChanged, Queue: nil, QueueVersion: version})
+	a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: version})
 	a.launchTurn(ctx, turnCtx, cancel, []string{contents[len(contents)-1]})
 }
 
@@ -1377,6 +1413,9 @@ func (a *Agent) launchTurn(ctx context.Context, turnCtx context.Context, cancel 
 			}
 		}()
 
+		if ctx.Err() != nil {
+			return
+		}
 		res := a.assembler.Assemble()
 		if res.Rebuilt {
 			a.lp.UpdateSystemPrompt(res.Prompt)
@@ -1389,6 +1428,9 @@ func (a *Agent) launchTurn(ctx context.Context, turnCtx context.Context, cancel 
 			}
 		}
 
+		if ctx.Err() != nil {
+			return
+		}
 		_, err := a.lp.Run(turnCtx, contents...)
 
 		done := make(chan struct{})
@@ -1851,6 +1893,27 @@ func (a *Agent) cancelAndWaitIdle() error {
 	return fmt.Errorf("timed out waiting for current turn to end")
 }
 
+// CloseForProjectSwitch cancels any active turn, closes the current session, and
+// clears queued input under the backend transition guard before adapters relaunch
+// the process in another project.
+func (a *Agent) CloseForProjectSwitch() error {
+	a.beginTransition()
+	defer a.endTransition()
+	if err := a.cancelAndWaitIdle(); err != nil {
+		return err
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.store.Active() {
+		if _, err := a.store.Close(); err != nil {
+			return err
+		}
+	}
+	a.clearQueueLocked()
+	return nil
+}
+
 // SessionSwitch closes the current session and loads another.
 func (a *Agent) SessionSwitch(id string) error {
 	// Mark the transition and register the clear BEFORE cancelAndWaitIdle so it
@@ -1929,7 +1992,7 @@ func (a *Agent) SessionNew() error {
 	var queueCleared bool
 	defer func() {
 		if queueCleared {
-			a.emitEvent(Event{Kind: EventQueueChanged, Queue: nil, QueueVersion: clearedVersion})
+			a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: clearedVersion})
 		}
 	}()
 	a.mu.Lock()
@@ -2041,9 +2104,10 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 	}
 
 	var out []DisplayMessage
-	toolStubs := make(map[string]int)
 
 	for _, t := range raw {
+		toolStubs := make(map[string]int)
+		legacyStagedFlushAllowed := false
 		for _, line := range t.Messages {
 			var m message.Message
 			if json.Unmarshal(line, &m) != nil {
@@ -2054,7 +2118,15 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 
 			case message.RoleUser:
 				c := m.TextContent()
-				if entries, ok := loop.ParseStagedFlush(c); ok {
+				entries, ok := loop.ParseStagedFlushMessage(m)
+				if !ok && legacyStagedFlushAllowed {
+					// Compatibility for sessions persisted by the short-lived
+					// unmarked wrapper format on this branch. Real typed user
+					// prompts are turn-leading messages, so only allow the old
+					// text marker after a staged tool result in the same turn.
+					entries, ok = loop.ParseStagedFlush(c)
+				}
+				if ok {
 					// <staged-flush> wrapper: overlay the real per-staged results
 					// onto the tool stubs (which currently hold "Staged."), so
 					// reload matches the live per-tool ToolCallEnd events. Produces
@@ -2073,10 +2145,8 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 							out[idx].Metadata = nil
 						}
 					}
-				} else if strings.HasPrefix(c, "<system-signal>") && strings.HasSuffix(c, "</system-signal>") {
-					signal := c[len("<system-signal>") : len(c)-len("</system-signal>")]
-					unescaped := html.UnescapeString(signal)
-					if bg, ok := parseBackgroundTerminalSignal(unescaped); ok {
+				} else if signal, ok := loop.ParseSystemSignalMessage(m); ok {
+					if bg, ok := parseBackgroundTerminalSignal(signal); ok {
 						out = append(out, DisplayMessage{
 							Type:              "background_process",
 							ID:                bg.ID,
@@ -2088,7 +2158,7 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 					} else {
 						out = append(out, DisplayMessage{
 							Type:    "system",
-							Content: "System: " + collapseOneLine(unescaped),
+							Content: "System: " + collapseOneLine(signal),
 						})
 					}
 				} else {
@@ -2117,7 +2187,10 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 				if idx, ok := toolStubs[m.ToolCallID]; ok {
 					out[idx].Done = true
 					content := m.TextContent()
-					out[idx].Success = content != "denied by user" && !strings.HasPrefix(content, "error: ")
+					if content == "Staged." {
+						legacyStagedFlushAllowed = true
+					}
+					out[idx].Success = !displayToolResultIsError(m, out[idx].Name, content)
 					out[idx].Result = content
 					if out[idx].Success {
 						out[idx].Metadata = displayMetadataForToolCall(out[idx].Name, out[idx].Args, content)
@@ -2134,6 +2207,20 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 // reload-derived system-signal strings match live-event strings byte for byte.
 func collapseOneLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
+}
+
+func displayToolResultIsError(msg message.Message, toolName, content string) bool {
+	if loop.IsToolResultErrorMessage(msg) {
+		return true
+	}
+	if content == "denied by user" || strings.HasPrefix(content, "error: ") {
+		return true
+	}
+	if toolName == "execute_pending" {
+		return strings.HasPrefix(content, "Failed to apply ") ||
+			(strings.HasPrefix(content, "Applied ") && strings.Contains(content, " failed."))
+	}
+	return false
 }
 
 func parseBackgroundTerminalSignal(payload string) (*BackgroundProcessDisplay, bool) {
@@ -2233,7 +2320,7 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 	var queueCleared bool
 	defer func() {
 		if queueCleared {
-			a.emitEvent(Event{Kind: EventQueueChanged, Queue: nil, QueueVersion: clearedVersion})
+			a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: clearedVersion})
 		}
 	}()
 	a.mu.Lock()
@@ -2371,7 +2458,7 @@ func (a *Agent) RevertHistory(turn int) error {
 	var queueCleared bool
 	defer func() {
 		if queueCleared {
-			a.emitEvent(Event{Kind: EventQueueChanged, Queue: nil, QueueVersion: clearedVersion})
+			a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: clearedVersion})
 		}
 	}()
 	a.mu.Lock()
@@ -2399,7 +2486,7 @@ func (a *Agent) ForkSession(turn int) error {
 	var queueCleared bool
 	defer func() {
 		if queueCleared {
-			a.emitEvent(Event{Kind: EventQueueChanged, Queue: nil, QueueVersion: clearedVersion})
+			a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: clearedVersion})
 		}
 	}()
 	a.mu.Lock()

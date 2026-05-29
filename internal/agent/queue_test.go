@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -50,9 +51,15 @@ func TestSubmitIdleStartsTurnNoQueueEvent(t *testing.T) {
 	if !res.Started || res.Turn == 0 {
 		t.Fatalf("idle submit should start a turn: %#v", res)
 	}
+	if res.Queue == nil {
+		t.Fatalf("idle direct-start queue snapshot is nil, want empty slice")
+	}
 	waitUntilFullyDrained(t, a)
 	if n := countQueueChanged(cap); n != 0 {
 		t.Fatalf("idle direct-start should emit no queue_changed; got %d", n)
+	}
+	if got := a.QueueSnapshot(); got.Items == nil {
+		t.Fatalf("empty QueueSnapshot items is nil, want empty slice")
 	}
 }
 
@@ -93,6 +100,49 @@ func TestSubmitWhileBusyEnqueuesAndEmits(t *testing.T) {
 	waitUntilFullyDrained(t, a)
 }
 
+func TestQueueDrainEmitsEmptyArraySnapshot(t *testing.T) {
+	var reqs int
+	var mu sync.Mutex
+	hold := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n := reqs
+		reqs++
+		mu.Unlock()
+		if n == 0 {
+			<-hold
+		}
+		writeTextResponse(w, "ok")
+	}))
+	defer server.Close()
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+
+	if _, err := a.Submit(ctx, "start"); err != nil {
+		t.Fatalf("Submit start: %v", err)
+	}
+	waitUntilBusy(t, a)
+	if _, err := a.Submit(ctx, "queued"); err != nil {
+		t.Fatalf("Submit queued: %v", err)
+	}
+	close(hold)
+	waitUntilFullyDrained(t, a)
+
+	var sawEmpty bool
+	for _, ev := range cap.snapshot() {
+		if ev.Kind == EventQueueChanged && ev.QueueVersion > 0 && len(ev.Queue) == 0 {
+			if ev.Queue == nil {
+				t.Fatalf("empty queue_changed payload is nil, want empty slice")
+			}
+			sawEmpty = true
+		}
+	}
+	if !sawEmpty {
+		t.Fatalf("did not observe empty queue_changed event: %#v", cap.snapshot())
+	}
+}
+
 func TestSubmitRejectsDuringTransition(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
 	cap := &eventCapture{}
@@ -114,6 +164,68 @@ func TestSubmitRejectsDuringTransition(t *testing.T) {
 	a.mu.Lock()
 	a.transitioning = false
 	a.mu.Unlock()
+}
+
+func TestTryDrainQueueCanceledContextDoesNotPersistQueuedDraft(t *testing.T) {
+	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession: %v", err)
+	}
+	a.mu.Lock()
+	a.queue = []QueuedItem{{ID: "q-1", Content: "queued draft"}}
+	a.queueVersion = 1
+	a.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	a.tryDrainQueue(ctx)
+
+	if got := a.QueueSnapshot(); len(got.Items) != 1 || got.Items[0].Content != "queued draft" {
+		t.Fatalf("canceled drain must leave volatile queue untouched; got %#v", got.Items)
+	}
+	if got := userContents(a.SessionMessages()); contains(got, "queued draft") {
+		t.Fatalf("canceled drain persisted queued draft: user turns=%q", got)
+	}
+}
+
+func TestCloseForProjectSwitchClearsQueueUnderTransition(t *testing.T) {
+	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
+	cap := &eventCapture{}
+	_ = startEventOrderAgent(t, a, cap)
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession: %v", err)
+	}
+	a.mu.Lock()
+	a.queue = []QueuedItem{{ID: "q-1", Content: "stale"}}
+	a.queueSeq = 1
+	a.queueVersion = 4
+	a.mu.Unlock()
+
+	if err := a.CloseForProjectSwitch(); err != nil {
+		t.Fatalf("CloseForProjectSwitch: %v", err)
+	}
+	if a.store.Active() {
+		t.Fatal("project switch close should detach the active session")
+	}
+	got := a.QueueSnapshot()
+	if len(got.Items) != 0 || got.Items == nil {
+		t.Fatalf("queue after project switch = %#v, want empty non-nil slice", got.Items)
+	}
+	if got.Version <= 4 {
+		t.Fatalf("queue version = %d, want > 4", got.Version)
+	}
+	var sawEmpty bool
+	for _, ev := range cap.snapshot() {
+		if ev.Kind == EventQueueChanged && ev.QueueVersion == got.Version {
+			if len(ev.Queue) != 0 || ev.Queue == nil {
+				t.Fatalf("project switch event queue = %#v, want empty non-nil slice", ev.Queue)
+			}
+			sawEmpty = true
+		}
+	}
+	if !sawEmpty {
+		t.Fatalf("missing project switch queue_changed event: %#v", cap.snapshot())
+	}
 }
 
 func TestSessionNewClearsQueueAndBumpsVersionMonotonically(t *testing.T) {
@@ -183,6 +295,86 @@ func TestCancelPreservesQueueThenDrains(t *testing.T) {
 	waitUntilFullyDrained(t, a)
 	if got := userContents(a.SessionMessages()); !contains(got, "queued") {
 		t.Fatalf("queued message should have drained after cancel; user turns=%q", got)
+	}
+}
+
+func TestCompactNowNudgesQueueDrainer(t *testing.T) {
+	summaryStarted := make(chan struct{})
+	releaseSummary := make(chan struct{})
+	var startedOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseSummary) })
+	}
+	t.Cleanup(release)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Stream bool `json:"stream"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if !body.Stream {
+			startedOnce.Do(func() { close(summaryStarted) })
+			select {
+			case <-releaseSummary:
+			case <-r.Context().Done():
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"compact summary"},"finish_reason":"stop"}]}`))
+			return
+		}
+		writeTextResponse(w, "drained")
+	}))
+	defer server.Close()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	a.memoryStore = nil
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+	appendUserTurn(t, a, "before compaction")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- a.CompactNow(ctx)
+	}()
+
+	select {
+	case <-summaryStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("manual compaction did not start")
+	}
+
+	res, err := a.Submit(ctx, "queued during compaction")
+	if err != nil {
+		t.Fatalf("Submit while compacting: %v", err)
+	}
+	if res.Started {
+		t.Fatalf("Submit while compacting should enqueue, not start: %#v", res)
+	}
+	if got := a.QueueSnapshot(); len(got.Items) != 1 {
+		t.Fatalf("queued item should be present during compaction; got %#v", got.Items)
+	}
+
+	release()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("CompactNow returned error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("CompactNow did not finish")
+	}
+
+	waitUntilFullyDrained(t, a)
+	if got := a.QueueSnapshot(); len(got.Items) != 0 {
+		t.Fatalf("queue should drain after compaction; got %#v", got.Items)
+	}
+	if got := userContents(a.SessionMessages()); !contains(got, "queued during compaction") {
+		t.Fatalf("queued message should have drained after compaction; user turns=%q", got)
 	}
 }
 

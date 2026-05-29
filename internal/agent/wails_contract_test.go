@@ -104,6 +104,16 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 	if strings.Contains(app, "AppendUserMessage(") {
 		t.Fatalf("App.svelte must not use the removed AppendUserMessage API")
 	}
+	handleCompact, ok := extractSvelteFunctionBody(app, "async function handleCompact(")
+	if !ok {
+		t.Fatal("handleCompact not found in App.svelte")
+	}
+	if strings.Contains(handleCompact, "busy = false") {
+		t.Fatalf("handleCompact must not locally clear busy; a queued post-compaction turn_start can arrive before CompactNow returns")
+	}
+	if !strings.Contains(app, "busy={busy || compacting}") {
+		t.Fatalf("InputArea must treat compaction as busy without mutating the backend-driven busy flag")
+	}
 
 	messagePath := filepath.Join("..", "..", "frontend", "src", "components", "Message.svelte")
 	messageBytes, err := os.ReadFile(messagePath)
@@ -135,6 +145,12 @@ func TestProjectSwitchHandlesStoreCloseErrors(t *testing.T) {
 	if strings.Contains(app, "_, _ = a.svc.Store().Close()") {
 		t.Fatalf("ProjectSwitch must not ignore Store().Close errors")
 	}
+	if strings.Contains(app, "a.svc.Store().Close()") {
+		t.Fatalf("ProjectSwitch must route session close through Agent.CloseForProjectSwitch")
+	}
+	if !strings.Contains(app, "a.svc.CloseForProjectSwitch()") {
+		t.Fatalf("ProjectSwitch must use Agent.CloseForProjectSwitch")
+	}
 	if !strings.Contains(app, "close current session") {
 		t.Fatalf("ProjectSwitch must return close-session errors with context")
 	}
@@ -142,6 +158,12 @@ func TestProjectSwitchHandlesStoreCloseErrors(t *testing.T) {
 	cli := mustReadContractFile(t, filepath.Join("..", "cli", "cli.go"))
 	if strings.Contains(cli, "_, _ = c.agent.Store().Close()") {
 		t.Fatalf("CLI projectSwitch must not ignore Store().Close errors")
+	}
+	if strings.Contains(cli, "c.agent.Store().Close()") {
+		t.Fatalf("CLI projectSwitch must route session close through Agent.CloseForProjectSwitch")
+	}
+	if !strings.Contains(cli, "c.agent.CloseForProjectSwitch()") {
+		t.Fatalf("CLI projectSwitch must use Agent.CloseForProjectSwitch")
 	}
 	if !strings.Contains(cli, "close current session") {
 		t.Fatalf("CLI projectSwitch must report close-session errors with context")

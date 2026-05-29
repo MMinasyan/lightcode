@@ -279,10 +279,10 @@
   });
 
   async function handleCompact() {
-    busy = true;
+    compacting = true;
     try { await CompactNow(); }
     catch (err) { showError(err, 'Compaction failed'); }
-    finally { busy = false; }
+    finally { compacting = false; }
     // Compaction does not change the queue (backend-owned); nothing to flush.
   }
 
@@ -366,7 +366,7 @@
       {/if}
     {/if}
   </div>
-  <InputArea bind:this={inputArea} {busy} on:submit={handleSubmit} on:error={(e) => showError(e.detail)}>
+  <InputArea bind:this={inputArea} busy={busy || compacting} on:submit={handleSubmit} on:error={(e) => showError(e.detail)}>
     <StatusBar {modelName} on:openModelSelector={() => showModelSelector=true} />
   </InputArea>
   {#if showModelSelector}

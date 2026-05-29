@@ -209,8 +209,12 @@ func (s *Server) handleEvent(ev agent.Event) {
 	case agent.EventQueueChanged:
 		// Best-effort broadcast (like all hub events); clients reconcile the
 		// queue via the versioned GET /v1/queue on connect/reconnect.
+		queue := ev.Queue
+		if queue == nil {
+			queue = []agent.QueuedItem{}
+		}
 		name = "queue_changed"
-		data = map[string]any{"items": ev.Queue, "version": ev.QueueVersion}
+		data = map[string]any{"items": queue, "version": ev.QueueVersion}
 	case agent.EventUsage:
 		name = "usage"
 		data = s.agent.TokenUsage()

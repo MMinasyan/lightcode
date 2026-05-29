@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"sort"
 	"strings"
@@ -32,9 +33,12 @@ const maxIterations = 25
 // the agent reads large files.
 const traceMaxChars = 200
 
-// interruptedSignal is injected as a user-role message when the user
-// cancels a turn. User-role works across all OpenAI-compatible providers.
-var interruptedSignal = SystemSignal("Request interrupted by user")
+const (
+	systemSignalOpen         = "<system-signal>"
+	systemSignalClose        = "</system-signal>"
+	systemSignalInternalKind = "system_signal"
+	toolResultErrorKind      = "tool_result_error"
+)
 
 var systemSignalEscaper = strings.NewReplacer(
 	"&", "&amp;",
@@ -42,9 +46,47 @@ var systemSignalEscaper = strings.NewReplacer(
 	">", "&gt;",
 )
 
+// interruptedSignal is injected as a user-role message when the user
+// cancels a turn. User-role works across all OpenAI-compatible providers.
+var interruptedSignal = SystemSignal("Request interrupted by user")
+
 // SystemSignal escapes payload and wraps it as a user-role system signal.
 func SystemSignal(payload string) string {
-	return "<system-signal>" + systemSignalEscaper.Replace(payload) + "</system-signal>"
+	return systemSignalOpen + systemSignalEscaper.Replace(payload) + systemSignalClose
+}
+
+// NewSystemSignalMessage returns a backend-owned system signal message. The
+// private marker distinguishes internal signals from literal user input.
+func NewSystemSignalMessage(payload string) message.Message {
+	msg := message.NewText(message.RoleUser, SystemSignal(payload))
+	msg.InternalKind = systemSignalInternalKind
+	return msg
+}
+
+// ParseSystemSignalMessage parses only backend-marked system-signal messages.
+func ParseSystemSignalMessage(msg message.Message) (payload string, ok bool) {
+	if msg.Role != message.RoleUser || msg.InternalKind != systemSignalInternalKind {
+		return "", false
+	}
+	content := msg.TextContent()
+	if !strings.HasPrefix(content, systemSignalOpen) || !strings.HasSuffix(content, systemSignalClose) {
+		return "", false
+	}
+	inner := content[len(systemSignalOpen) : len(content)-len(systemSignalClose)]
+	return html.UnescapeString(inner), true
+}
+
+// MarkToolResultError persists the live ToolCallEnd error bit on a tool result.
+func MarkToolResultError(msg *message.Message) {
+	if msg != nil {
+		msg.InternalKind = toolResultErrorKind
+	}
+}
+
+// IsToolResultErrorMessage reports whether a persisted tool result was
+// live-rendered as an error.
+func IsToolResultErrorMessage(msg message.Message) bool {
+	return msg.Role == message.RoleTool && msg.InternalKind == toolResultErrorKind
 }
 
 // Store is the minimum surface the loop needs from the snapshot
@@ -449,11 +491,11 @@ func (l *Loop) DrainPendingSignalsForModel(turn int) {
 func (l *Loop) EnsureInterruptedSignal(turn int) {
 	if len(l.messages) > 0 {
 		last := l.messages[len(l.messages)-1]
-		if last.Role == message.RoleUser && last.TextContent() == interruptedSignal {
+		if last.Role == message.RoleUser && last.InternalKind == systemSignalInternalKind && last.TextContent() == interruptedSignal {
 			return
 		}
 	}
-	signalMsg := message.NewText(message.RoleUser, interruptedSignal)
+	signalMsg := NewSystemSignalMessage("Request interrupted by user")
 	l.messages = append(l.messages, signalMsg)
 	l.persistMessage(turn, signalMsg)
 	l.emit(Event{
@@ -464,7 +506,7 @@ func (l *Loop) EnsureInterruptedSignal(turn int) {
 }
 
 func (l *Loop) appendSignal(signal PendingSignal, turn int) {
-	msg := message.NewText(message.RoleUser, SystemSignal(signal.Payload))
+	msg := NewSystemSignalMessage(signal.Payload)
 	l.messages = append(l.messages, msg)
 	if signal.Persist {
 		l.persistMessage(turn, msg)
@@ -625,13 +667,16 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 
 		denied := false
 		for _, tc := range msg.ToolCalls {
-			result, d := l.dispatch(ctx, tc)
-			toolMsg := message.NewText(message.RoleTool, result)
+			result := l.dispatch(ctx, tc)
+			toolMsg := message.NewText(message.RoleTool, result.Content)
 			toolMsg.ToolCallID = tc.ID
 			toolMsg.Name = tc.Function.Name
+			if result.IsError {
+				MarkToolResultError(&toolMsg)
+			}
 			l.messages = append(l.messages, toolMsg)
 			l.persistMessage(turn, toolMsg)
-			if d {
+			if result.Denied {
 				denied = true
 				break
 			}
@@ -920,9 +965,15 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 	return msg, cancelled, nil
 }
 
-// dispatch executes one tool call and returns the result string plus a
-// bool indicating whether the user denied the operation.
-func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) (string, bool) {
+type dispatchResult struct {
+	Content string
+	Denied  bool
+	IsError bool
+}
+
+// dispatch executes one tool call and returns the result string plus display
+// state that must be persisted with the tool response.
+func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) dispatchResult {
 	tc = normalizeToolCall(tc)
 	fmt.Fprintf(l.trace, "  → %s %s\n", tc.Function.Name, truncate(tc.Function.Arguments, traceMaxChars))
 	l.emit(Event{Kind: ToolCallStart, ToolCallID: tc.ID, ToolName: tc.Function.Name, Args: tc.Function.Arguments})
@@ -930,18 +981,18 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) (string, bool)
 	var params map[string]any
 	parseErr := json.Unmarshal([]byte(tc.Function.Arguments), &params)
 
-	finish := func(result string, isError bool) string {
+	finish := func(result string, isError bool) dispatchResult {
 		fmt.Fprintf(l.trace, "  ← %s\n", truncate(result, traceMaxChars))
 		ev := Event{Kind: ToolCallEnd, ToolCallID: tc.ID, ToolName: tc.Function.Name, Args: tc.Function.Arguments, Result: result, IsError: isError}
 		if !isError && tc.Function.Name == "edit_file" && params != nil {
 			ev.Metadata = editpreview.MetadataFromParams(params, result)
 		}
 		l.emit(ev)
-		return result
+		return dispatchResult{Content: result, IsError: isError}
 	}
 
 	if parseErr != nil {
-		return finish(fmt.Sprintf("error: invalid JSON arguments: %v", parseErr), true), false
+		return finish(fmt.Sprintf("error: invalid JSON arguments: %v", parseErr), true)
 	}
 
 	// Handle execute_pending directly to use the current turn's queue.
@@ -949,23 +1000,24 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) (string, bool)
 		act, _ := params["action"].(string)
 		if act == "discard" {
 			l.pendingQueue.Discard()
-			return finish("Discarded all staged edits.", false), false
+			return finish("Discarded all staged edits.", false)
 		}
 		results := l.flushPendingQueue(ctx)
 		if len(results) == 0 {
-			return finish("No pending edits to execute.", false), false
+			return finish("No pending edits to execute.", false)
 		}
 		// The per-staged ToolCallEnd events (emitted by flushPendingQueue)
 		// carry the real results live; the <staged-flush> wrapper (persisted
 		// from consumedFlushResults after the dispatch loop) reconstructs them
 		// on reload. This tool's own result is a short summary.
 		l.consumedFlushResults = append(l.consumedFlushResults, results...)
-		return finish(fmt.Sprintf("Applied %d staged edits.", len(results)), false), false
+		summary, isError := stagedFlushSummary(results)
+		return finish(summary, isError)
 	}
 
 	t, ok := l.registry.Get(tc.Function.Name)
 	if !ok {
-		return finish(fmt.Sprintf("error: unknown tool %q", tc.Function.Name), true), false
+		return finish(fmt.Sprintf("error: unknown tool %q", tc.Function.Name), true)
 	}
 
 	params["_tool_call_id"] = tc.ID
@@ -974,14 +1026,15 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) (string, bool)
 	pending, _ := params["pending"].(bool)
 	if pending && (tc.Function.Name == "edit_file" || tc.Function.Name == "write_file") {
 		if err := validateStagedCall(tc.Function.Name, params); err != nil {
-			return finish(err.Error(), true), false
+			return finish(err.Error(), true)
 		}
 		l.pendingQueue.Stage(tool.StagedCall{
 			ToolName:   tc.Function.Name,
 			ToolCallID: tc.ID,
+			Args:       tc.Function.Arguments,
 			Params:     params,
 		})
-		return finish("Staged.", false), false
+		return finish("Staged.", false)
 	}
 
 	// Before executing a non-pending tool, flush the queue. The flushed
@@ -995,15 +1048,17 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) (string, bool)
 	result, err := t.Execute(ctx, params)
 	if err != nil {
 		if errors.Is(err, tool.ErrDenied) {
-			return finish("denied by user", true), true
+			result := finish("denied by user", true)
+			result.Denied = true
+			return result
 		}
 		var exitErr *tool.ExitError
 		if errors.As(err, &exitErr) {
-			return finish(exitErr.Output, true), false
+			return finish(exitErr.Output, true)
 		}
-		return finish("error: "+err.Error(), true), false
+		return finish("error: "+err.Error(), true)
 	}
-	return finish(result, false), false
+	return finish(result, false)
 }
 
 // flushPendingQueue executes all staged edits/writes and returns the
@@ -1025,8 +1080,13 @@ func (l *Loop) flushPendingQueue(ctx context.Context) []tool.BatchResult {
 		results = l.executePendingSequential(ctx, staged)
 	}
 
+	stagedByID := make(map[string]tool.StagedCall, len(staged))
+	for _, call := range staged {
+		stagedByID[call.ToolCallID] = call
+	}
+
 	// Emit individual ToolCallEnd events for each staged call.
-	for i, r := range results {
+	for _, r := range results {
 		result := r.Result
 		isError := false
 		if r.Error != "" {
@@ -1034,13 +1094,15 @@ func (l *Loop) flushPendingQueue(ctx context.Context) []tool.BatchResult {
 			isError = true
 		}
 		var metadata map[string]any
-		if !isError && r.ToolName == "edit_file" && i < len(staged) {
-			metadata = editpreview.MetadataFromParams(staged[i].Params, result)
+		stagedCall := stagedByID[r.ToolCallID]
+		if !isError && r.ToolName == "edit_file" && stagedCall.Params != nil {
+			metadata = editpreview.MetadataFromParams(stagedCall.Params, result)
 		}
 		l.emit(Event{
 			Kind:       ToolCallEnd,
 			ToolCallID: r.ToolCallID,
 			ToolName:   r.ToolName,
+			Args:       stagedCall.Args,
 			Result:     result,
 			IsError:    isError,
 			Metadata:   metadata,
@@ -1050,9 +1112,27 @@ func (l *Loop) flushPendingQueue(ctx context.Context) []tool.BatchResult {
 	return results
 }
 
+func stagedFlushSummary(results []tool.BatchResult) (string, bool) {
+	failed := 0
+	for _, r := range results {
+		if r.Error != "" {
+			failed++
+		}
+	}
+	applied := len(results) - failed
+	if failed == 0 {
+		return fmt.Sprintf("Applied %d staged edits.", applied), false
+	}
+	if applied == 0 {
+		return fmt.Sprintf("Failed to apply %d staged edits.", failed), true
+	}
+	return fmt.Sprintf("Applied %d staged edits; %d failed.", applied, failed), true
+}
+
 const (
-	stagedFlushOpen  = "<staged-flush>"
-	stagedFlushClose = "</staged-flush>"
+	stagedFlushOpen         = "<staged-flush>"
+	stagedFlushClose        = "</staged-flush>"
+	stagedFlushInternalKind = "staged_flush"
 )
 
 // StagedFlushEntry is one staged tool's final result, carried in the
@@ -1090,10 +1170,22 @@ func BuildStagedFlush(results []tool.BatchResult) string {
 	return stagedFlushOpen + string(data) + stagedFlushClose
 }
 
-// ParseStagedFlush reports whether content is a <staged-flush> wrapper and, if
-// so, returns its entries. The bool is true for any content bounded by the
-// markers — including malformed inner JSON, where entries is nil so callers
-// suppress the row without updating tool stubs.
+// NewStagedFlushMessage renders a backend-owned staged-flush wrapper message.
+// The private marker distinguishes internal wrappers from literal user input
+// with the same text.
+func NewStagedFlushMessage(results []tool.BatchResult) (message.Message, bool) {
+	wrapper := BuildStagedFlush(results)
+	if wrapper == "" {
+		return message.Message{}, false
+	}
+	msg := message.NewText(message.RoleUser, wrapper)
+	msg.InternalKind = stagedFlushInternalKind
+	return msg, true
+}
+
+// ParseStagedFlush reports whether trusted content is a <staged-flush> wrapper
+// and, if so, returns its entries. The bool is true for any content bounded by
+// the markers, including malformed inner JSON where entries is nil.
 func ParseStagedFlush(content string) (entries []StagedFlushEntry, isWrapper bool) {
 	if !strings.HasPrefix(content, stagedFlushOpen) || !strings.HasSuffix(content, stagedFlushClose) {
 		return nil, false
@@ -1106,6 +1198,14 @@ func ParseStagedFlush(content string) (entries []StagedFlushEntry, isWrapper boo
 	return payload.Results, true
 }
 
+// ParseStagedFlushMessage parses only backend-marked staged-flush messages.
+func ParseStagedFlushMessage(msg message.Message) (entries []StagedFlushEntry, isWrapper bool) {
+	if msg.Role != message.RoleUser || msg.InternalKind != stagedFlushInternalKind {
+		return nil, false
+	}
+	return ParseStagedFlush(msg.TextContent())
+}
+
 // appendStagedFlushWrapper persists exactly one <staged-flush> wrapper for the
 // given flush results: it appends a RoleUser message to in-memory history AND
 // persists it. The in-memory append is required so the running loop includes
@@ -1113,11 +1213,10 @@ func ParseStagedFlush(content string) (entries []StagedFlushEntry, isWrapper boo
 // No display event is emitted — the per-tool ToolCallEnd events already carried
 // the results to the live display; the wrapper is for reload + model context.
 func (l *Loop) appendStagedFlushWrapper(turn int, results []tool.BatchResult) {
-	wrapper := BuildStagedFlush(results)
-	if wrapper == "" {
+	msg, ok := NewStagedFlushMessage(results)
+	if !ok {
 		return
 	}
-	msg := message.NewText(message.RoleUser, wrapper)
 	l.messages = append(l.messages, msg)
 	l.persistMessage(turn, msg)
 }

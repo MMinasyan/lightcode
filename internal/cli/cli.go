@@ -1065,16 +1065,23 @@ func (c *CLI) submitToBackend(text string) {
 	go func() {
 		if _, err := c.agent.Submit(c.ctx, text); err != nil {
 			c.mu.Lock()
-			c.stopAnimationLocked()
-			c.writeRaw("\r\x1b[2K")
-			c.writeRaw(renderErrorMsg(err.Error()))
-			if !c.busy {
-				c.state = stateIdle
-				c.printInputPromptLocked()
-			}
+			c.handleSubmitErrorLocked(text, err)
 			c.mu.Unlock()
 		}
 	}()
+}
+
+func (c *CLI) handleSubmitErrorLocked(text string, err error) {
+	c.stopAnimationLocked()
+	c.writeRaw("\r\x1b[2K")
+	c.writeRaw(renderErrorMsg(err.Error()))
+	if c.input != nil && c.input.String() == "" {
+		c.input.Set(text)
+	}
+	if !c.busy {
+		c.state = stateIdle
+		c.printInputPromptLocked()
+	}
 }
 
 func (c *CLI) refreshSession() {
@@ -1283,7 +1290,7 @@ func (c *CLI) cmdCompact() {
 	}
 
 	c.mu.Lock()
-	c.busy = true
+	c.compacting = true
 	c.state = stateStreaming
 	c.mu.Unlock()
 
@@ -1292,17 +1299,27 @@ func (c *CLI) cmdCompact() {
 	go func() {
 		err := c.agent.CompactNow(c.ctx)
 		c.mu.Lock()
-		c.stopAnimationLocked()
-		c.writeRaw("\r\x1b[2K")
-		c.busy = false
-		c.state = stateIdle
+		idle := c.finishCompactLocked()
 		c.mu.Unlock()
 
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
-			c.printInputPrompt()
+			if idle {
+				c.printInputPrompt()
+			}
 		}
 	}()
+}
+
+func (c *CLI) finishCompactLocked() bool {
+	c.stopAnimationLocked()
+	c.writeRaw("\r\x1b[2K")
+	c.compacting = false
+	if c.busy {
+		return false
+	}
+	c.state = stateIdle
+	return true
 }
 
 func (c *CLI) cmdCopy() {
@@ -1320,20 +1337,10 @@ func (c *CLI) cmdCopy() {
 }
 
 func (c *CLI) projectSwitch(targetPath string) {
-	_ = c.agent.Cancel()
-	for i := 0; i < 200; i++ {
-		if !c.agent.Busy() {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	if c.agent.Store().Active() {
-		if _, err := c.agent.Store().Close(); err != nil {
-			c.restoreTerminal()
-			fmt.Fprintf(os.Stderr, "close current session: %v\n", err)
-			os.Exit(1)
-		}
+	if err := c.agent.CloseForProjectSwitch(); err != nil {
+		c.restoreTerminal()
+		fmt.Fprintf(os.Stderr, "close current session: %v\n", err)
+		os.Exit(1)
 	}
 
 	c.restoreTerminal()

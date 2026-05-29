@@ -109,6 +109,15 @@ func twoToolCallChunk(id1, name1, args1, id2, name2, args2 string) string {
 		"data: [DONE]\n\n"
 }
 
+func threeToolCallChunk(id1, name1, args1, id2, name2, args2, id3, name3, args3 string) string {
+	return `data: {"choices":[{"delta":{"role":"assistant","tool_calls":[` +
+		`{"index":0,"id":"` + id1 + `","type":"function","function":{"name":"` + name1 + `","arguments":"` + args1 + `"}},` +
+		`{"index":1,"id":"` + id2 + `","type":"function","function":{"name":"` + name2 + `","arguments":"` + args2 + `"}},` +
+		`{"index":2,"id":"` + id3 + `","type":"function","function":{"name":"` + name3 + `","arguments":"` + args3 + `"}}` +
+		`]},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+}
+
 func textChunk(content string) string {
 	return `data: {"choices":[{"delta":{"role":"assistant","content":"` + content + `"},"finish_reason":"stop"}]}` + "\n\n" +
 		"data: [DONE]\n\n"
@@ -152,10 +161,8 @@ func TestStagedAutoFlushPersistsWrapperAndEmitsRealResults(t *testing.T) {
 		if m.Role == message.RoleTool && m.ToolCallID == "call_1" {
 			stagedTool = &msgs[i]
 		}
-		if m.Role == message.RoleUser {
-			if _, ok := ParseStagedFlush(m.TextContent()); ok {
-				wrapper = &msgs[i]
-			}
+		if _, ok := ParseStagedFlushMessage(m); ok {
+			wrapper = &msgs[i]
 		}
 	}
 	if stagedTool == nil || stagedTool.TextContent() != "Staged." {
@@ -164,10 +171,13 @@ func TestStagedAutoFlushPersistsWrapperAndEmitsRealResults(t *testing.T) {
 	if wrapper == nil {
 		t.Fatalf("expected a <staged-flush> RoleUser wrapper in history: %#v", msgs)
 	}
-	entries, ok := ParseStagedFlush(wrapper.TextContent())
+	entries, ok := ParseStagedFlushMessage(*wrapper)
 	if !ok || len(entries) != 1 || entries[0].ID != "call_1" ||
 		entries[0].Result != "Edited file.txt (1 replacement, lines 1-2)." || entries[0].IsError {
 		t.Fatalf("wrapper entries = %#v", entries)
+	}
+	if wrapper.InternalKind != stagedFlushInternalKind {
+		t.Fatalf("wrapper InternalKind = %q, want %q", wrapper.InternalKind, stagedFlushInternalKind)
 	}
 
 	// Live events: ToolCallStart, then the "Staged." end, then the real end.
@@ -193,6 +203,9 @@ func TestStagedAutoFlushPersistsWrapperAndEmitsRealResults(t *testing.T) {
 	}
 	if ends[1].Result != "Edited file.txt (1 replacement, lines 1-2)." {
 		t.Fatalf("second (flush) end = %q, want real result", ends[1].Result)
+	}
+	if ends[1].Args == "" || ends[1].Args != ends[0].Args {
+		t.Fatalf("late staged-flush args = %q, want original args %q", ends[1].Args, ends[0].Args)
 	}
 }
 
@@ -227,7 +240,7 @@ func TestStagedFlushSchemaValidMessageSequence(t *testing.T) {
 	// The wrapper is RoleUser, never a RoleTool (so it is not mistaken for a
 	// tool response for any tool_call_id).
 	for _, m := range msgs {
-		if _, ok := ParseStagedFlush(m.TextContent()); ok && m.Role != message.RoleUser {
+		if _, ok := ParseStagedFlushMessage(m); ok && m.Role != message.RoleUser {
 			t.Fatalf("staged-flush wrapper has role %q, want user", m.Role)
 		}
 	}
@@ -254,20 +267,118 @@ func TestExecutePendingReturnsSummaryAndPersistsWrapper(t *testing.T) {
 
 	msgs := lp.Messages()
 	var execResult string
+	var execInternalKind string
 	var wrapperFound bool
 	for _, m := range msgs {
 		if m.Role == message.RoleTool && m.ToolCallID == "call_2" {
 			execResult = m.TextContent()
+			execInternalKind = m.InternalKind
 		}
-		if _, ok := ParseStagedFlush(m.TextContent()); ok {
+		if _, ok := ParseStagedFlushMessage(m); ok {
 			wrapperFound = true
 		}
 	}
 	if execResult != "Applied 1 staged edits." {
 		t.Fatalf("execute_pending result = %q, want \"Applied 1 staged edits.\"", execResult)
 	}
+	if execInternalKind != "" {
+		t.Fatalf("successful execute_pending InternalKind = %q, want empty", execInternalKind)
+	}
 	if !wrapperFound {
 		t.Fatalf("expected a <staged-flush> wrapper after execute_pending: %#v", msgs)
+	}
+}
+
+func TestExecutePendingAllFailedReturnsErrorSummary(t *testing.T) {
+	body := twoToolCallChunk(
+		"call_1", "edit_file", `{\"path\":\"file.txt\",\"old_string\":\"a\",\"new_string\":\"b\",\"pending\":true}`,
+		"call_2", "execute_pending", `{}`,
+	)
+	srv := sseServer(t, body, textChunk("done"))
+	registry := tool.NewRegistry()
+	registry.Register(stagedStubTool{name: "edit_file"})
+	registry.Register(tool.ExecutePending{})
+	lp := loopForServer(srv, registry)
+	lp.SetPendingExecutor(fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
+		"call_1": {Error: "edit failed"},
+	}})
+	events := make(chan Event, 32)
+	lp.SetEvents(events)
+	if _, err := lp.Run(context.Background(), "go"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	msgs := lp.Messages()
+	var execResult string
+	var execInternalKind string
+	for _, m := range msgs {
+		if m.Role == message.RoleTool && m.ToolCallID == "call_2" {
+			execResult = m.TextContent()
+			execInternalKind = m.InternalKind
+		}
+	}
+	if execResult != "Failed to apply 1 staged edits." {
+		t.Fatalf("execute_pending result = %q, want failure summary", execResult)
+	}
+	if execInternalKind != toolResultErrorKind {
+		t.Fatalf("failed execute_pending InternalKind = %q, want %q", execInternalKind, toolResultErrorKind)
+	}
+	var sawExecuteError bool
+	for _, ev := range drainEvents(events) {
+		if ev.Kind == ToolCallEnd && ev.ToolCallID == "call_2" {
+			sawExecuteError = ev.IsError && ev.Result == "Failed to apply 1 staged edits."
+		}
+	}
+	if !sawExecuteError {
+		t.Fatal("execute_pending ToolCallEnd should be marked error for an all-failed batch")
+	}
+}
+
+func TestExecutePendingMixedResultsReturnsErrorSummary(t *testing.T) {
+	body := threeToolCallChunk(
+		"call_1", "edit_file", `{\"path\":\"file.txt\",\"old_string\":\"a\",\"new_string\":\"b\",\"pending\":true}`,
+		"call_2", "write_file", `{\"path\":\"other.txt\",\"content\":\"x\",\"pending\":true}`,
+		"call_3", "execute_pending", `{}`,
+	)
+	srv := sseServer(t, body, textChunk("done"))
+	registry := tool.NewRegistry()
+	registry.Register(stagedStubTool{name: "edit_file"})
+	registry.Register(stagedStubTool{name: "write_file"})
+	registry.Register(tool.ExecutePending{})
+	lp := loopForServer(srv, registry)
+	lp.SetPendingExecutor(fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
+		"call_1": {Success: true, Result: "Edited file.txt (1 replacement, lines 1-2)."},
+		"call_2": {Error: "write failed"},
+	}})
+	events := make(chan Event, 32)
+	lp.SetEvents(events)
+	if _, err := lp.Run(context.Background(), "go"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	msgs := lp.Messages()
+	var execResult string
+	var execInternalKind string
+	for _, m := range msgs {
+		if m.Role == message.RoleTool && m.ToolCallID == "call_3" {
+			execResult = m.TextContent()
+			execInternalKind = m.InternalKind
+		}
+	}
+	if execResult != "Applied 1 staged edits; 1 failed." {
+		t.Fatalf("execute_pending result = %q, want mixed summary", execResult)
+	}
+	if execInternalKind != toolResultErrorKind {
+		t.Fatalf("mixed execute_pending InternalKind = %q, want %q", execInternalKind, toolResultErrorKind)
+	}
+	var sawExecuteError bool
+	for _, ev := range drainEvents(events) {
+		if ev.Kind == ToolCallEnd && ev.ToolCallID == "call_3" {
+			sawExecuteError = ev.IsError && ev.Result == "Applied 1 staged edits; 1 failed."
+		}
+	}
+	if !sawExecuteError {
+		t.Fatal("execute_pending ToolCallEnd should be marked error for a mixed batch")
 	}
 }
 
@@ -296,7 +407,7 @@ func TestFlushBeforeNonPendingToolHasNoPrefix(t *testing.T) {
 		if m.Role == message.RoleTool && m.ToolCallID == "call_2" {
 			noopResult = m.TextContent()
 		}
-		if _, ok := ParseStagedFlush(m.TextContent()); ok {
+		if _, ok := ParseStagedFlushMessage(m); ok {
 			wrapperFound = true
 		}
 	}
@@ -337,7 +448,7 @@ func TestStagedFlushWrapperPersistedBeforeDeniedReturn(t *testing.T) {
 	msgs := lp.Messages()
 	var entries []StagedFlushEntry
 	for _, m := range msgs {
-		if e, ok := ParseStagedFlush(m.TextContent()); ok {
+		if e, ok := ParseStagedFlushMessage(m); ok {
 			entries = e
 		}
 	}
@@ -394,7 +505,7 @@ func TestEmptyExecutePendingKeepsNoPendingMessageAndNoWrapper(t *testing.T) {
 		if m.Role == message.RoleTool && m.ToolCallID == "call_1" {
 			execResult = m.TextContent()
 		}
-		if _, ok := ParseStagedFlush(m.TextContent()); ok {
+		if _, ok := ParseStagedFlushMessage(m); ok {
 			t.Fatalf("no wrapper expected for empty execute_pending: %#v", msgs)
 		}
 	}

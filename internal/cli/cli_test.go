@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -174,6 +175,93 @@ func TestSubmitAndFlushDoNotRenderUserMessagesLocally(t *testing.T) {
 	// The CLI must route input through the backend Submit entry point.
 	if !strings.Contains(string(source), "c.agent.Submit(c.ctx") {
 		t.Fatalf("CLI must submit input through agent.Submit")
+	}
+}
+
+func TestSubmitErrorRestoresDraftWhenInputEmpty(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{
+		out:     &buf,
+		mu:      &sync.Mutex{},
+		input:   newInputLine(),
+		history: newInputHistory(),
+	}
+
+	c.mu.Lock()
+	c.handleSubmitErrorLocked("retry this", errors.New("session is changing; retry"))
+	c.mu.Unlock()
+
+	if got := c.input.String(); got != "retry this" {
+		t.Fatalf("input = %q, want rejected text restored", got)
+	}
+}
+
+func TestSubmitErrorDoesNotOverwriteNewDraft(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{
+		out:     &buf,
+		mu:      &sync.Mutex{},
+		input:   newInputLine(),
+		history: newInputHistory(),
+	}
+	c.input.Set("new draft")
+
+	c.mu.Lock()
+	c.handleSubmitErrorLocked("old rejected text", errors.New("session is changing; retry"))
+	c.mu.Unlock()
+
+	if got := c.input.String(); got != "new draft" {
+		t.Fatalf("input = %q, want newer draft preserved", got)
+	}
+}
+
+func TestFinishCompactDoesNotOverwriteRunningQueuedTurn(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{
+		out:        &buf,
+		mu:         &sync.Mutex{},
+		input:      newInputLine(),
+		history:    newInputHistory(),
+		busy:       true,
+		compacting: true,
+		state:      stateStreaming,
+	}
+
+	c.mu.Lock()
+	idle := c.finishCompactLocked()
+	c.mu.Unlock()
+
+	if idle {
+		t.Fatal("finishCompactLocked reported idle while a queued turn was running")
+	}
+	if !c.busy || c.state != stateStreaming {
+		t.Fatalf("finishCompactLocked overwrote queued turn state: busy=%v state=%v", c.busy, c.state)
+	}
+	if c.compacting {
+		t.Fatal("finishCompactLocked should clear compacting")
+	}
+}
+
+func TestFinishCompactReturnsIdleWhenNoTurnRunning(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{
+		out:        &buf,
+		mu:         &sync.Mutex{},
+		input:      newInputLine(),
+		history:    newInputHistory(),
+		compacting: true,
+		state:      stateStreaming,
+	}
+
+	c.mu.Lock()
+	idle := c.finishCompactLocked()
+	c.mu.Unlock()
+
+	if !idle || c.busy || c.state != stateIdle {
+		t.Fatalf("finishCompactLocked should restore idle state: idle=%v busy=%v state=%v", idle, c.busy, c.state)
+	}
+	if c.compacting {
+		t.Fatal("finishCompactLocked should clear compacting")
 	}
 }
 

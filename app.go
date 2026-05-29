@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"time"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -105,8 +104,12 @@ func (a *App) handleEvent(ev agent.Event) {
 			"content": "System: " + ev.Result,
 		})
 	case agent.EventQueueChanged:
+		queue := ev.Queue
+		if queue == nil {
+			queue = []agent.QueuedItem{}
+		}
 		wailsRuntime.EventsEmit(a.ctx, "queue_changed", map[string]any{
-			"items":   ev.Queue,
+			"items":   queue,
 			"version": ev.QueueVersion,
 		})
 	case agent.EventUsage:
@@ -377,19 +380,8 @@ func (a *App) ProjectSwitch(targetPath string) error {
 		return nil
 	}
 
-	_ = a.svc.Cancel()
-	for i := 0; i < 200; i++ {
-		if !a.svc.Busy() {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	// Close session via store (need direct access for this Wails-specific flow).
-	if a.svc.Store().Active() {
-		if _, err := a.svc.Store().Close(); err != nil {
-			return fmt.Errorf("close current session: %w", err)
-		}
+	if err := a.svc.CloseForProjectSwitch(); err != nil {
+		return fmt.Errorf("close current session: %w", err)
 	}
 
 	if err := a.relaunchIn(abs); err != nil {

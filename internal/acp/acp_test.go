@@ -77,7 +77,7 @@ func TestHandleEventNotifications(t *testing.T) {
 	r := &Runner{out: &out}
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, Result: "hello"})
 	r.handleEvent(agent.Event{Kind: agent.EventToolCallStart, ToolCallID: "tc1", ToolName: "read_file", Args: `{"path":"x"}`})
-	r.handleEvent(agent.Event{Kind: agent.EventToolCallEnd, ToolCallID: "tc1", ToolName: "read_file", Result: "done"})
+	r.handleEvent(agent.Event{Kind: agent.EventToolCallEnd, ToolCallID: "tc1", ToolName: "read_file", Args: `{"path":"x"}`, Result: "done"})
 	r.handleEvent(agent.Event{
 		Kind:   agent.EventBackgroundProcessComplete,
 		Result: "done",
@@ -114,6 +114,12 @@ func TestHandleEventNotifications(t *testing.T) {
 			}
 			if len(warnings) != 1 || warnings[0].Kind != "catalog_discovery_failure" || warnings[0].Message != "test: failed" {
 				t.Fatalf("warning params = %#v, want kind/message", warnings)
+			}
+		}
+		if got.Method == "agent/tool_result" {
+			params, ok := got.Params.(map[string]any)
+			if !ok || params["args"] != `{"path":"x"}` {
+				t.Fatalf("tool_result params = %#v, want args", got.Params)
 			}
 		}
 		if got.Method == "agent/warnings" && i == 5 {
@@ -170,7 +176,11 @@ func TestHandleEventNotifiesQueueChanged(t *testing.T) {
 		Queue:        []agent.QueuedItem{{ID: "q-1", Content: "hi"}},
 		QueueVersion: 2,
 	})
-	lines := responseLines(t, out.String(), 1)
+	r.handleEvent(agent.Event{
+		Kind:         agent.EventQueueChanged,
+		QueueVersion: 3,
+	})
+	lines := responseLines(t, out.String(), 2)
 	var qc Notification
 	if err := json.Unmarshal([]byte(lines[0]), &qc); err != nil {
 		t.Fatalf("queue_changed json: %v", err)
@@ -181,6 +191,14 @@ func TestHandleEventNotifiesQueueChanged(t *testing.T) {
 	data, _ := json.Marshal(qc.Params)
 	if !strings.Contains(string(data), `"version":2`) || !strings.Contains(string(data), `"content":"hi"`) {
 		t.Fatalf("queue_changed params = %s", data)
+	}
+	var empty Notification
+	if err := json.Unmarshal([]byte(lines[1]), &empty); err != nil {
+		t.Fatalf("empty queue_changed json: %v", err)
+	}
+	emptyData, _ := json.Marshal(empty.Params)
+	if !strings.Contains(string(emptyData), `"version":3`) || !strings.Contains(string(emptyData), `"items":[]`) {
+		t.Fatalf("empty queue_changed params = %s", emptyData)
 	}
 }
 
