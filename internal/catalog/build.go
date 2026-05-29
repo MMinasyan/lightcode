@@ -24,6 +24,22 @@ type DiscoveredModel struct {
 	ContextWindow   int
 	MaxOutputTokens int
 	Cost            *Cost
+	metadata        *discoveryModelMetadata
+}
+
+// discoveryModelMetadata is provider-neutral metadata preserved from one
+// discovered /models item for conservative catalog admission filtering.
+type discoveryModelMetadata struct {
+	Type                         string          `json:"type,omitempty"`
+	Task                         string          `json:"task,omitempty"`
+	InputModalities              []string        `json:"input_modalities,omitempty"`
+	OutputModalities             []string        `json:"output_modalities,omitempty"`
+	Modalities                   []string        `json:"modalities,omitempty"`
+	ArchitectureInputModalities  []string        `json:"architecture_input_modalities,omitempty"`
+	ArchitectureOutputModalities []string        `json:"architecture_output_modalities,omitempty"`
+	ArchitectureModality         string          `json:"architecture_modality,omitempty"`
+	Capabilities                 map[string]bool `json:"capabilities,omitempty"`
+	SupportedParameters          []string        `json:"supported_parameters,omitempty"`
 }
 
 // BuildResult contains the effective catalog and non-fatal warnings.
@@ -220,6 +236,9 @@ func applyDiscovery(providerID string, raw map[string]any, discovered Discovered
 		modelRaw, ok := models[modelID].(map[string]any)
 		if !ok {
 			if !bundledProvider {
+				continue
+			}
+			if !discoveredModelAllowed(modelDiscovery) {
 				continue
 			}
 			modelRaw = map[string]any{}

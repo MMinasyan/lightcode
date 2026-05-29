@@ -29,11 +29,12 @@ type discoveryCacheFile struct {
 }
 
 type discoveryCacheModel struct {
-	ID              string `json:"id,omitempty"`
-	Name            string `json:"name,omitempty"`
-	ContextWindow   int    `json:"context_window,omitempty"`
-	MaxOutputTokens int    `json:"max_output_tokens,omitempty"`
-	Cost            *Cost  `json:"cost,omitempty"`
+	ID              string                  `json:"id,omitempty"`
+	Name            string                  `json:"name,omitempty"`
+	ContextWindow   int                     `json:"context_window,omitempty"`
+	MaxOutputTokens int                     `json:"max_output_tokens,omitempty"`
+	Cost            *Cost                   `json:"cost,omitempty"`
+	Metadata        *discoveryModelMetadata `json:"metadata,omitempty"`
 }
 
 // FetchDiscovery fetches and parses a provider's OpenAI-compatible /models list.
@@ -119,9 +120,107 @@ func parseDiscoveredModel(raw RawDiscoveredModel) (string, DiscoveredModel) {
 			[]map[string]any{tp, raw},
 			"max_completion_tokens", "max_output_tokens",
 		),
-		Cost: extractCostIfPresent(raw),
+		Cost:     extractCostIfPresent(raw),
+		metadata: extractDiscoveryMetadata(raw),
 	}
 	return modelID, model
+}
+
+func extractDiscoveryMetadata(raw RawDiscoveredModel) *discoveryModelMetadata {
+	arch, _ := rawObject(raw["architecture"])
+	meta := &discoveryModelMetadata{
+		Type:                         normalizeDiscoveryToken(stringField(raw, "type")),
+		Task:                         normalizeDiscoveryToken(stringField(raw, "task")),
+		InputModalities:              normalizedDiscoveryStringList(raw["input_modalities"]),
+		OutputModalities:             normalizedDiscoveryStringList(raw["output_modalities"]),
+		Modalities:                   normalizedDiscoveryStringList(raw["modalities"]),
+		ArchitectureInputModalities:  normalizedDiscoveryStringList(arch["input_modalities"]),
+		ArchitectureOutputModalities: normalizedDiscoveryStringList(arch["output_modalities"]),
+		ArchitectureModality:         normalizeDiscoveryModality(stringField(arch, "modality")),
+		Capabilities:                 normalizedDiscoveryCapabilities(raw["capabilities"]),
+		SupportedParameters:          normalizedDiscoveryStringList(raw["supported_parameters"]),
+	}
+	if discoveryMetadataEmpty(meta) {
+		return nil
+	}
+	return meta
+}
+
+func normalizedDiscoveryStringList(value any) []string {
+	var raw []string
+	switch v := value.(type) {
+	case string:
+		raw = append(raw, v)
+	case []string:
+		raw = append(raw, v...)
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				raw = append(raw, s)
+			}
+		}
+	}
+	return normalizeDiscoveryTokens(raw)
+}
+
+func normalizedDiscoveryCapabilities(value any) map[string]bool {
+	out := map[string]bool{}
+	switch v := value.(type) {
+	case string:
+		if key := normalizeDiscoveryToken(v); key != "" {
+			out[key] = true
+		}
+	case []string:
+		for _, item := range v {
+			if key := normalizeDiscoveryToken(item); key != "" {
+				out[key] = true
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				if key := normalizeDiscoveryToken(s); key != "" {
+					out[key] = true
+				}
+			}
+		}
+	case map[string]bool:
+		for key, enabled := range v {
+			if normalized := normalizeDiscoveryToken(key); normalized != "" {
+				out[normalized] = enabled
+			}
+		}
+	case map[string]any:
+		for key, rawEnabled := range v {
+			enabled, ok := rawEnabled.(bool)
+			if !ok {
+				continue
+			}
+			if normalized := normalizeDiscoveryToken(key); normalized != "" {
+				out[normalized] = enabled
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func discoveryMetadataEmpty(meta *discoveryModelMetadata) bool {
+	if meta == nil {
+		return true
+	}
+	return meta.Type == "" &&
+		meta.Task == "" &&
+		len(meta.InputModalities) == 0 &&
+		len(meta.OutputModalities) == 0 &&
+		len(meta.Modalities) == 0 &&
+		len(meta.ArchitectureInputModalities) == 0 &&
+		len(meta.ArchitectureOutputModalities) == 0 &&
+		meta.ArchitectureModality == "" &&
+		len(meta.Capabilities) == 0 &&
+		len(meta.SupportedParameters) == 0
 }
 
 func stringField(raw map[string]any, key string) string {
@@ -364,6 +463,7 @@ func WriteDiscoveryCache(home, providerID string, discovered DiscoveredProvider,
 			ContextWindow:   model.ContextWindow,
 			MaxOutputTokens: model.MaxOutputTokens,
 			Cost:            model.Cost,
+			Metadata:        model.metadata,
 		}
 	}
 	return writeDiscoveryCacheFile(filepath.Join(discoveryCacheDir(home), providerID+".json"), raw)
@@ -389,6 +489,7 @@ func readDiscoveryCacheFile(path string) (DiscoveredProvider, time.Time, error) 
 			ContextWindow:   model.ContextWindow,
 			MaxOutputTokens: model.MaxOutputTokens,
 			Cost:            model.Cost,
+			metadata:        model.Metadata,
 		}
 	}
 	return DiscoveredProvider{Models: models}, attemptedAt, nil

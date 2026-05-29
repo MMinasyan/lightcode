@@ -115,6 +115,9 @@ func (c *Catalog) MergeDiscoveredProviderWithCostProtection(providerID string, d
 			if !provider.Builtin {
 				continue
 			}
+			if !discoveredModelAllowed(discoveredModel) {
+				continue
+			}
 			name := discoveredModel.Name
 			if name == "" {
 				name = modelID
