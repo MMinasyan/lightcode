@@ -44,8 +44,11 @@ func TestWailsModelSelectorUsesPrefixRefContract(t *testing.T) {
 	if !strings.Contains(binding, "ApplyTurnAction(arg1:number,arg2:string,arg3:boolean):Promise<agent.TurnActionResult>;") {
 		t.Fatalf("Wails binding must expose ApplyTurnAction for adapter-neutral turn actions")
 	}
-	if !strings.Contains(binding, "SendQueuedMessages(arg1:Array<string>):Promise<agent.QueuedMessagesResult>;") {
-		t.Fatalf("Wails binding must expose SendQueuedMessages for shared queue flushing")
+	if !strings.Contains(binding, "Submit(arg1:string):Promise<agent.SubmitResult>;") {
+		t.Fatalf("Wails binding must expose Submit as the single backend input entry point")
+	}
+	if !strings.Contains(binding, "QueueSnapshot():Promise<agent.QueueState>;") {
+		t.Fatalf("Wails binding must expose QueueSnapshot for queue hydration")
 	}
 
 	modelsPath := filepath.Join("..", "..", "frontend", "wailsjs", "go", "models.ts")
@@ -83,26 +86,33 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 	if strings.Contains(app, "await RevertCode(") || strings.Contains(app, "await RevertHistory(") || strings.Contains(app, "await ForkSession(") {
 		t.Fatalf("App.svelte still calls low-level turn actions directly")
 	}
-	if !strings.Contains(app, "SendQueuedMessages(queued.map(q => q.content))") {
-		t.Fatalf("App.svelte must flush queued messages through SendQueuedMessages")
+	if !strings.Contains(app, "await Submit(content)") {
+		t.Fatalf("App.svelte must submit input through the backend Submit entry point")
 	}
-	if !strings.Contains(app, "if (busy) return;") {
-		t.Fatalf("App.svelte queued-message flush must not run while the adapter is busy")
+	if !strings.Contains(app, "EventsOn('queue_changed'") {
+		t.Fatalf("App.svelte must render the queue from the backend queue_changed event")
 	}
-	if !strings.Contains(app, "messageQueue = messageQueue.slice(queued.length)") {
-		t.Fatalf("App.svelte must keep queued messages until SendQueuedMessages succeeds")
+	if strings.Contains(app, "SendQueuedMessages(") || strings.Contains(app, "SendPrompt(") {
+		t.Fatalf("App.svelte must not use the removed SendPrompt/SendQueuedMessages APIs")
 	}
-	if strings.Contains(app, "const queued = messageQueue;\n    messageQueue = []") {
-		t.Fatalf("App.svelte must not clear queued messages before SendQueuedMessages succeeds")
+	if strings.Contains(app, "messageQueue = [...messageQueue") {
+		t.Fatalf("App.svelte must not push to a local queue; the backend owns queue state")
 	}
-	if strings.Contains(app, "showError(data?.message || data);\n      busy = false;\n      messageQueue = []") {
-		t.Fatalf("App.svelte generic error event must not clear queued user messages")
-	}
-	if !strings.Contains(app, "if (nextSessionId !== sessionId) messageQueue = [];") {
-		t.Fatalf("App.svelte same-session refreshes must not clear queued user messages")
+	if strings.Contains(app, "nextSessionId !== sessionId) messageQueue = [];") {
+		t.Fatalf("App.svelte must not clear the queue locally; the backend clears it and emits queue_changed")
 	}
 	if strings.Contains(app, "AppendUserMessage(") {
-		t.Fatalf("App.svelte still flushes queued messages one turn at a time")
+		t.Fatalf("App.svelte must not use the removed AppendUserMessage API")
+	}
+	handleCompact, ok := extractSvelteFunctionBody(app, "async function handleCompact(")
+	if !ok {
+		t.Fatal("handleCompact not found in App.svelte")
+	}
+	if strings.Contains(handleCompact, "busy = false") {
+		t.Fatalf("handleCompact must not locally clear busy; a queued post-compaction turn_start can arrive before CompactNow returns")
+	}
+	if !strings.Contains(app, "busy={busy || compacting}") {
+		t.Fatalf("InputArea must treat compaction as busy without mutating the backend-driven busy flag")
 	}
 
 	messagePath := filepath.Join("..", "..", "frontend", "src", "components", "Message.svelte")
@@ -135,6 +145,12 @@ func TestProjectSwitchHandlesStoreCloseErrors(t *testing.T) {
 	if strings.Contains(app, "_, _ = a.svc.Store().Close()") {
 		t.Fatalf("ProjectSwitch must not ignore Store().Close errors")
 	}
+	if strings.Contains(app, "a.svc.Store().Close()") {
+		t.Fatalf("ProjectSwitch must route session close through Agent.CloseForProjectSwitch")
+	}
+	if !strings.Contains(app, "a.svc.CloseForProjectSwitch()") {
+		t.Fatalf("ProjectSwitch must use Agent.CloseForProjectSwitch")
+	}
 	if !strings.Contains(app, "close current session") {
 		t.Fatalf("ProjectSwitch must return close-session errors with context")
 	}
@@ -142,6 +158,12 @@ func TestProjectSwitchHandlesStoreCloseErrors(t *testing.T) {
 	cli := mustReadContractFile(t, filepath.Join("..", "cli", "cli.go"))
 	if strings.Contains(cli, "_, _ = c.agent.Store().Close()") {
 		t.Fatalf("CLI projectSwitch must not ignore Store().Close errors")
+	}
+	if strings.Contains(cli, "c.agent.Store().Close()") {
+		t.Fatalf("CLI projectSwitch must route session close through Agent.CloseForProjectSwitch")
+	}
+	if !strings.Contains(cli, "c.agent.CloseForProjectSwitch()") {
+		t.Fatalf("CLI projectSwitch must use Agent.CloseForProjectSwitch")
 	}
 	if !strings.Contains(cli, "close current session") {
 		t.Fatalf("CLI projectSwitch must report close-session errors with context")
@@ -186,12 +208,8 @@ func TestFrontendUserAndSystemTranscriptEntriesArriveViaBackendEvents(t *testing
 		t.Fatalf("handleSubmit must not push a user message into messages locally; ordering is owned by the backend")
 	}
 
-	flushQueue, ok := extractSvelteFunctionBody(app, "async function flushQueue(")
-	if !ok {
-		t.Fatal("flushQueue not found in App.svelte")
-	}
-	if strings.Contains(flushQueue, "type:'user'") || strings.Contains(flushQueue, "type: 'user'") {
-		t.Fatalf("flushQueue must not push queued user messages into messages locally; ordering is owned by the backend")
+	if strings.Contains(app, "function flushQueue(") {
+		t.Fatalf("App.svelte must not keep a local flushQueue; queue draining is backend-owned")
 	}
 
 	if strings.Contains(app, "type:'system', content:'interrupted'") || strings.Contains(app, "type: 'system', content: 'interrupted'") {

@@ -15,7 +15,11 @@ import (
 func TestSerializeMessagesEmitsExtrasAndSystemRole(t *testing.T) {
 	source := catalog.ModelRef{Provider: "test", Model: "model-a"}
 	history := []message.Message{
-		message.NewText(message.RoleSystem, "instructions"),
+		func() message.Message {
+			msg := message.NewText(message.RoleSystem, "instructions")
+			msg.InternalKind = "staged_flush"
+			return msg
+		}(),
 		{
 			Role:    message.RoleAssistant,
 			Content: []message.ContentPart{{Type: message.ContentPartText, Text: "using tool"}},
@@ -47,6 +51,9 @@ func TestSerializeMessagesEmitsExtrasAndSystemRole(t *testing.T) {
 	if out[0]["role"] != "developer" || out[0]["content"] != "instructions" {
 		t.Fatalf("system message = %#v", out[0])
 	}
+	if _, ok := out[0]["_lightcode_internal"]; ok {
+		t.Fatalf("private internal kind leaked: %#v", out[0])
+	}
 	assistant := out[1]
 	if string(assistant["reasoning_content"].(json.RawMessage)) != `"think"` {
 		t.Fatalf("reasoning_content = %#v", assistant["reasoning_content"])
@@ -61,6 +68,35 @@ func TestSerializeMessagesEmitsExtrasAndSystemRole(t *testing.T) {
 	extra := toolCalls[0]["extra_content"].(json.RawMessage)
 	if string(extra) != `{"google":{"thought_signature":"sig"}}` {
 		t.Fatalf("tool extra = %s", extra)
+	}
+}
+
+func TestSerializeMessagesStripsInternalKindFromUserAndToolMessages(t *testing.T) {
+	prov := testProvider("https://example.com/v1", "KEY_ENV", "model-a")
+	model := prov.Models["model-a"]
+	history := []message.Message{
+		{
+			Role:         message.RoleUser,
+			Content:      []message.ContentPart{{Type: message.ContentPartText, Text: "<system-signal>payload</system-signal>"}},
+			InternalKind: "system_signal",
+		},
+		{
+			Role:         message.RoleTool,
+			Content:      []message.ContentPart{{Type: message.ContentPartText, Text: "plain failure output"}},
+			ToolCallID:   "call_1",
+			Name:         "run_command",
+			InternalKind: "tool_result_error",
+		},
+	}
+
+	out, err := SerializeMessages(history, model, prov)
+	if err != nil {
+		t.Fatalf("SerializeMessages returned error: %v", err)
+	}
+	for i, msg := range out {
+		if _, ok := msg["_lightcode_internal"]; ok {
+			t.Fatalf("private internal kind leaked from message %d: %#v", i, msg)
+		}
 	}
 }
 

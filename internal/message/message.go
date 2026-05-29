@@ -29,14 +29,15 @@ const (
 
 // Message is Lightcode's provider-independent message shape.
 type Message struct {
-	Role       Role
-	Content    []ContentPart
-	Refusal    string
-	ToolCalls  []ToolCall
-	ToolCallID string
-	Name       string
-	Extra      Extra
-	Source     catalog.ModelRef
+	Role         Role
+	Content      []ContentPart
+	Refusal      string
+	ToolCalls    []ToolCall
+	ToolCallID   string
+	Name         string
+	Extra        Extra
+	Source       catalog.ModelRef
+	InternalKind string
 }
 
 // ContentPart is one canonical content item. Opaque parts preserve the full
@@ -96,7 +97,7 @@ func (m *Message) AppendText(text string) {
 }
 
 // MarshalJSON serializes messages in the OpenAI-compatible shape, with Extra
-// flattened as provider wire siblings and Lightcode source kept private.
+// flattened as provider wire siblings and Lightcode private fields persisted.
 func (m Message) MarshalJSON() ([]byte, error) {
 	obj := map[string]json.RawMessage{}
 	if m.Extra != nil {
@@ -135,6 +136,9 @@ func (m Message) MarshalJSON() ([]byte, error) {
 	}
 	if m.Source.String() != "" {
 		mustSet(obj, "_lightcode_source", m.Source.String())
+	}
+	if m.InternalKind != "" {
+		mustSet(obj, "_lightcode_internal", m.InternalKind)
 	}
 	return json.Marshal(obj)
 }
@@ -188,6 +192,10 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 					return fieldError(key, err)
 				}
 				out.Source = ref
+			}
+		case "_lightcode_internal":
+			if err := json.Unmarshal(value, &out.InternalKind); err != nil {
+				return fieldError(key, err)
 			}
 		default:
 			if isLightcodeField(key) {
@@ -396,7 +404,7 @@ func fieldError(field string, err error) error {
 
 func isMessageField(key string) bool {
 	switch key {
-	case "role", "content", "refusal", "tool_calls", "tool_call_id", "name", "_lightcode_source":
+	case "role", "content", "refusal", "tool_calls", "tool_call_id", "name", "_lightcode_source", "_lightcode_internal":
 		return true
 	default:
 		return false

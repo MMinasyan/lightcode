@@ -200,6 +200,19 @@ func TestSystemSignalEscapesLiteralClosingTag(t *testing.T) {
 	}
 }
 
+func TestParseSystemSignalMessageRequiresInternalMarker(t *testing.T) {
+	marked := NewSystemSignalMessage(`raw <payload> & data`)
+	payload, ok := ParseSystemSignalMessage(marked)
+	if !ok || payload != `raw <payload> & data` {
+		t.Fatalf("marked system signal parse = %q, %v", payload, ok)
+	}
+
+	literal := message.NewText(message.RoleUser, SystemSignal(`raw <payload> & data`))
+	if payload, ok := ParseSystemSignalMessage(literal); ok {
+		t.Fatalf("literal user text parsed as system signal: %q", payload)
+	}
+}
+
 func TestPendingSignalWrapsRawPayloadWhenDrained(t *testing.T) {
 	lp := New(nil, nil, "system")
 	lp.AddPendingSignal(PendingSignal{Payload: `raw <payload> & data`})
@@ -213,6 +226,9 @@ func TestPendingSignalWrapsRawPayloadWhenDrained(t *testing.T) {
 	want := `<system-signal>raw &lt;payload&gt; &amp; data</system-signal>`
 	if got != want {
 		t.Fatalf("signal message = %q, want %q", got, want)
+	}
+	if msgs[1].InternalKind != systemSignalInternalKind {
+		t.Fatalf("signal InternalKind = %q, want %q", msgs[1].InternalKind, systemSignalInternalKind)
 	}
 }
 
@@ -238,6 +254,9 @@ func TestPendingBackgroundProcessSignalEmitsDisplayWhenDrained(t *testing.T) {
 	}
 	if got := msgs[1].TextContent(); got != `<system-signal>Background process bg-1 finished</system-signal>` {
 		t.Fatalf("signal message = %q", got)
+	}
+	if msgs[1].InternalKind != systemSignalInternalKind {
+		t.Fatalf("signal InternalKind = %q, want %q", msgs[1].InternalKind, systemSignalInternalKind)
 	}
 	select {
 	case ev := <-events:
@@ -367,6 +386,9 @@ func TestEnsureInterruptedSignalIsIdempotentAndEmitsOnce(t *testing.T) {
 	if msgs[1].TextContent() != interruptedSignal {
 		t.Fatalf("last message = %q, want interrupted signal", msgs[1].TextContent())
 	}
+	if msgs[1].InternalKind != systemSignalInternalKind {
+		t.Fatalf("interrupted signal InternalKind = %q, want %q", msgs[1].InternalKind, systemSignalInternalKind)
+	}
 
 	count := 0
 	for {
@@ -381,6 +403,25 @@ func TestEnsureInterruptedSignalIsIdempotentAndEmitsOnce(t *testing.T) {
 			}
 			return
 		}
+	}
+}
+
+func TestEnsureInterruptedSignalIgnoresLiteralInterruptedWrapper(t *testing.T) {
+	lp := New(nil, nil, "system")
+	literal := message.NewText(message.RoleUser, interruptedSignal)
+	lp.messages = append(lp.messages, literal)
+
+	lp.EnsureInterruptedSignal(2)
+
+	msgs := lp.Messages()
+	if len(msgs) != 3 {
+		t.Fatalf("messages len = %d, want system plus literal plus real signal", len(msgs))
+	}
+	if msgs[1].InternalKind != "" {
+		t.Fatalf("literal InternalKind = %q, want empty", msgs[1].InternalKind)
+	}
+	if msgs[2].TextContent() != interruptedSignal || msgs[2].InternalKind != systemSignalInternalKind {
+		t.Fatalf("real interrupted signal = %#v", msgs[2])
 	}
 }
 
@@ -487,6 +528,9 @@ func TestPendingSignalDuringToolExecutionDrainsAfterToolResult(t *testing.T) {
 	wantSignal := `<system-signal>async &lt;event&gt;</system-signal>`
 	if gotSignal := msgs[4].TextContent(); gotSignal != wantSignal {
 		t.Fatalf("messages[4] = %q, want %q", gotSignal, wantSignal)
+	}
+	if msgs[4].InternalKind != systemSignalInternalKind {
+		t.Fatalf("messages[4] InternalKind = %q, want %q", msgs[4].InternalKind, systemSignalInternalKind)
 	}
 
 	mu.Lock()

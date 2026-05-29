@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { EventsOn } from '../wailsjs/runtime/runtime';
-  import { SendPrompt, SendQueuedMessages, ApplyTurnAction, CurrentModel, CurrentWarnings, TokenUsage, ProjectName, SessionCurrent, SessionMessages, CompactNow } from '../wailsjs/go/main/App';
+  import { Submit, QueueSnapshot, ApplyTurnAction, CurrentModel, CurrentWarnings, TokenUsage, ProjectName, SessionCurrent, SessionMessages, CompactNow } from '../wailsjs/go/main/App';
   import Toolbar from './components/Toolbar.svelte';
   import MessageList from './components/MessageList.svelte';
   import InputArea from './components/InputArea.svelte';
@@ -51,7 +51,8 @@
   }
 
   let messages = [];
-  let messageQueue = [];
+  let messageQueue = [];      // backend-owned: set only from queue_changed + hydration
+  let lastQueueVersion = 0;   // drops stale/reordered queue snapshots
   let busy = false;
   let status = 'idle';
   let modelRef = '';
@@ -83,10 +84,6 @@
     messages = [...messages, { _id: mid(), type: 'error', content: prefix ? `${prefix}: ${text}` : text }];
   }
 
-  function isTurnBusyError(err) {
-    return errorText(err).includes('turn is already in progress');
-  }
-
   function rebuildFromHistory(persisted) {
     currentTurn = 0;
     return (persisted || []).map(m => {
@@ -96,7 +93,8 @@
   }
 
   function applySessionId(nextSessionId) {
-    if (nextSessionId !== sessionId) messageQueue = [];
+    // Queue is backend-owned: session changes clear it server-side and emit
+    // queue_changed; no local reset here.
     sessionId = nextSessionId;
   }
 
@@ -213,6 +211,22 @@
       messages = [...messages, { _id: mid(), type: 'system', content: data.content || '' }];
     });
 
+    EventsOn('queue_changed', (data) => {
+      if (!data) return;
+      const version = data.version || 0;
+      if (version <= lastQueueVersion) return; // drop stale/reordered snapshots
+      lastQueueVersion = version;
+      messageQueue = (data.items || []).map(it => ({ _id: it.id, content: it.content }));
+    });
+    // Subscribe-then-GET: hydrate the queue only after the listener is registered.
+    try {
+      const q = await QueueSnapshot();
+      if (q && (q.version || 0) >= lastQueueVersion) {
+        lastQueueVersion = q.version || 0;
+        messageQueue = (q.items || []).map(it => ({ _id: it.id, content: it.content }));
+      }
+    } catch (e) {}
+
     EventsOn('turn_start', (data) => {
       busy = true;
       streamingIdx = -1;
@@ -230,7 +244,8 @@
         const cur = await SessionCurrent();
         if (cur?.id) sessionId = cur.id;
       } catch (e) {}
-      await flushQueue();
+      // Queue draining is backend-owned: the agent auto-drains after the turn
+      // ends and emits turn_start + queue_changed. No frontend flush.
     });
 
     EventsOn('error', (data) => {
@@ -264,48 +279,30 @@
   });
 
   async function handleCompact() {
-    busy = true;
+    compacting = true;
     try { await CompactNow(); }
-    catch (err) { showError(err, 'Compaction failed'); messageQueue = []; }
-    finally { busy = false; }
-    await flushQueue();
+    catch (err) { showError(err, 'Compaction failed'); }
+    finally { compacting = false; }
+    // Compaction does not change the queue (backend-owned); nothing to flush.
   }
 
   async function handleSubmit(e) {
     const content = e.detail;
-    if (busy || messageQueue.length > 0) {
-      messageQueue = [...messageQueue, { _id: mid(), content }];
-      if (!busy) await flushQueue();
-      return;
-    }
-    busy = true;
-    streamingIdx = -1;
     try {
-      const turn = await SendPrompt(content);
-      currentTurn = turn;
-    }
-    catch (err) { showError(err); busy = false; }
-  }
-
-  async function flushQueue() {
-    if (messageQueue.length === 0) return;
-    if (busy) return;
-    const queued = messageQueue;
-    busy = true;
-    streamingIdx = -1;
-    try {
-      const result = await SendQueuedMessages(queued.map(q => q.content));
-      messageQueue = messageQueue.slice(queued.length);
-      const turn = result?.started?.turn || 0;
-      currentTurn = turn;
+      const r = await Submit(content);
+      if (r?.started) {
+        busy = true;
+        streamingIdx = -1;
+        currentTurn = r.turn || currentTurn;
+      }
+      // If queued (!started), the queue_changed event drives the dimmed
+      // indicator; do not touch busy here.
     }
     catch (err) {
-      if (isTurnBusyError(err)) {
-        busy = true;
-        return;
-      }
+      // Rejected (e.g. a session change is in flight): keep the draft so the
+      // user can resubmit. InputArea cleared its text on dispatch.
       showError(err);
-      busy = false;
+      inputArea?.prefill(content);
     }
   }
 
@@ -369,7 +366,7 @@
       {/if}
     {/if}
   </div>
-  <InputArea bind:this={inputArea} {busy} on:submit={handleSubmit} on:error={(e) => showError(e.detail)}>
+  <InputArea bind:this={inputArea} busy={busy || compacting} on:submit={handleSubmit} on:error={(e) => showError(e.detail)}>
     <StatusBar {modelName} on:openModelSelector={() => showModelSelector=true} />
   </InputArea>
   {#if showModelSelector}

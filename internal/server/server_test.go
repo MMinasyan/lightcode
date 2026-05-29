@@ -184,6 +184,16 @@ func TestHandleEventBroadcastsAndSkipsSubagents(t *testing.T) {
 	default:
 		t.Fatal("message event not broadcast")
 	}
+	s.handleEvent(agent.Event{Kind: agent.EventToolCallEnd, ToolCallID: "tc1", ToolName: "read_file", Args: `{"path":"x"}`, Result: "done"})
+	select {
+	case msg := <-ch:
+		text := string(msg)
+		if !strings.Contains(text, "event: tool_result") || !strings.Contains(text, `"args":"{\"path\":\"x\"}"`) {
+			t.Fatalf("tool_result event = %q", msg)
+		}
+	default:
+		t.Fatal("tool_result event not broadcast")
+	}
 	s.handleEvent(agent.Event{
 		Kind:    agent.EventBackgroundProcessComplete,
 		Result:  "done",
@@ -259,6 +269,39 @@ func TestHandleEventBroadcastsUserMessageAndSystemSignal(t *testing.T) {
 		}
 	default:
 		t.Fatal("system_signal event not broadcast")
+	}
+}
+
+func TestHandleEventQueueChangedBroadcasts(t *testing.T) {
+	hub := newSSEHub()
+	ch, unsub := hub.subscribe()
+	defer unsub()
+	s := &Server{hub: hub}
+
+	s.handleEvent(agent.Event{
+		Kind:         agent.EventQueueChanged,
+		Queue:        []agent.QueuedItem{{ID: "q-1", Content: "hi"}},
+		QueueVersion: 3,
+	})
+	select {
+	case msg := <-ch:
+		text := string(msg)
+		if !strings.Contains(text, "event: queue_changed") || !strings.Contains(text, `"version":3`) || !strings.Contains(text, `"content":"hi"`) {
+			t.Fatalf("queue_changed event = %q", msg)
+		}
+	default:
+		t.Fatal("queue_changed event not broadcast")
+	}
+
+	s.handleEvent(agent.Event{Kind: agent.EventQueueChanged, QueueVersion: 4})
+	select {
+	case msg := <-ch:
+		text := string(msg)
+		if !strings.Contains(text, "event: queue_changed") || !strings.Contains(text, `"version":4`) || !strings.Contains(text, `"items":[]`) {
+			t.Fatalf("empty queue_changed event = %q", msg)
+		}
+	default:
+		t.Fatal("empty queue_changed event not broadcast")
 	}
 }
 

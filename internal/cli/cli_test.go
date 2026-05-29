@@ -3,10 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +14,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/editpreview"
 )
 
 func TestCmdClearClearsTerminalRedrawsHeaderAndKeepsMessages(t *testing.T) {
@@ -163,15 +162,189 @@ func TestSubmitAndFlushDoNotRenderUserMessagesLocally(t *testing.T) {
 		t.Fatalf("submitInputLocked must not append a user displayEntry locally")
 	}
 
-	body, ok = extractFunctionBody(string(source), "func (c *CLI) flushQueueLocked(")
+	body, ok = extractFunctionBody(string(source), "func (c *CLI) submitToBackend(")
 	if !ok {
-		t.Fatal("flushQueueLocked not found in cli.go")
+		t.Fatal("submitToBackend not found in cli.go")
 	}
 	if strings.Contains(body, "renderUserMsg(") {
-		t.Fatalf("flushQueueLocked must not call renderUserMsg; user transcript entries arrive via EventUserMessageDisplay")
+		t.Fatalf("submitToBackend must not call renderUserMsg; user transcript entries arrive via EventUserMessageDisplay")
 	}
 	if strings.Contains(body, "typ:  \"user\"") || strings.Contains(body, "typ: \"user\"") {
-		t.Fatalf("flushQueueLocked must not append a user displayEntry locally")
+		t.Fatalf("submitToBackend must not append a user displayEntry locally")
+	}
+	// The CLI must route input through the backend Submit entry point.
+	if !strings.Contains(string(source), "c.agent.Submit(c.ctx") {
+		t.Fatalf("CLI must submit input through agent.Submit")
+	}
+}
+
+func TestSubmitErrorRestoresDraftWhenInputEmpty(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{
+		out:     &buf,
+		mu:      &sync.Mutex{},
+		input:   newInputLine(),
+		history: newInputHistory(),
+	}
+
+	c.mu.Lock()
+	c.handleSubmitErrorLocked("retry this", errors.New("session is changing; retry"))
+	c.mu.Unlock()
+
+	if got := c.input.String(); got != "retry this" {
+		t.Fatalf("input = %q, want rejected text restored", got)
+	}
+}
+
+func TestSubmitErrorDoesNotOverwriteNewDraft(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{
+		out:     &buf,
+		mu:      &sync.Mutex{},
+		input:   newInputLine(),
+		history: newInputHistory(),
+	}
+	c.input.Set("new draft")
+
+	c.mu.Lock()
+	c.handleSubmitErrorLocked("old rejected text", errors.New("session is changing; retry"))
+	c.mu.Unlock()
+
+	if got := c.input.String(); got != "new draft" {
+		t.Fatalf("input = %q, want newer draft preserved", got)
+	}
+}
+
+func TestFinishCompactDoesNotOverwriteRunningQueuedTurn(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{
+		out:        &buf,
+		mu:         &sync.Mutex{},
+		input:      newInputLine(),
+		history:    newInputHistory(),
+		busy:       true,
+		compacting: true,
+		state:      stateStreaming,
+	}
+
+	c.mu.Lock()
+	idle := c.finishCompactLocked()
+	c.mu.Unlock()
+
+	if idle {
+		t.Fatal("finishCompactLocked reported idle while a queued turn was running")
+	}
+	if !c.busy || c.state != stateStreaming {
+		t.Fatalf("finishCompactLocked overwrote queued turn state: busy=%v state=%v", c.busy, c.state)
+	}
+	if c.compacting {
+		t.Fatal("finishCompactLocked should clear compacting")
+	}
+}
+
+func TestFinishCompactReturnsIdleWhenNoTurnRunning(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{
+		out:        &buf,
+		mu:         &sync.Mutex{},
+		input:      newInputLine(),
+		history:    newInputHistory(),
+		compacting: true,
+		state:      stateStreaming,
+	}
+
+	c.mu.Lock()
+	idle := c.finishCompactLocked()
+	c.mu.Unlock()
+
+	if !idle || c.busy || c.state != stateIdle {
+		t.Fatalf("finishCompactLocked should restore idle state: idle=%v busy=%v state=%v", idle, c.busy, c.state)
+	}
+	if c.compacting {
+		t.Fatal("finishCompactLocked should clear compacting")
+	}
+}
+
+func TestStagedFlushTerminalLateEndNoCursorUpAndLastEndWins(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{out: &buf, mu: &sync.Mutex{}}
+	args := `{"path":"x.go","old_string":"a","new_string":"b"}`
+
+	// State as if ToolCallStart already rendered the staged tool's header and
+	// its stage-time "Staged." end already completed it in the model — i.e. the
+	// row is far above and activeToolID was consumed (a later, non-matching end
+	// is the staged-flush "late" case).
+	c.messages = []displayEntry{
+		{typ: "assistant", content: "intro"},
+		{typ: "tool", id: "call_1", name: "edit_file", args: args, done: true, success: true, result: "Staged."},
+		{typ: "assistant", content: "more text below the tool row"},
+	}
+	c.activeToolID = ""
+
+	meta := editpreview.MetadataFromArgs(args, "Edited x.go (1 replacement, lines 1-2).")
+	if meta == nil {
+		t.Fatal("test setup: expected non-nil edit_preview metadata")
+	}
+	// Production: the staged-flush ToolCallEnd carries NO Args (flushPendingQueue
+	// emits only id/name/result/metadata). The CLI must still render the path
+	// from the model row, matching reload.
+	c.handleEvent(agent.Event{
+		Kind:       agent.EventToolCallEnd,
+		ToolCallID: "call_1",
+		ToolName:   "edit_file",
+		Result:     "Edited x.go (1 replacement, lines 1-2).",
+		Metadata:   meta,
+	})
+
+	// Late end must NOT emit a cursor-up against the (far-below) current line.
+	if strings.Contains(buf.String(), "\x1b[1A") {
+		t.Fatalf("late staged-flush end performed a cursor-up against the wrong line: %q", buf.String())
+	}
+	// The rendered header must still show the path even though the event had no
+	// Args (rendered from the model row's retained args) — no live/reload drift.
+	if !strings.Contains(buf.String(), "x.go") {
+		t.Fatalf("late staged-flush header dropped the path: %q", buf.String())
+	}
+	// Model is last-end-wins: the row now holds the real result, not "Staged.".
+	var row *displayEntry
+	for i := range c.messages {
+		if c.messages[i].typ == "tool" && c.messages[i].id == "call_1" {
+			row = &c.messages[i]
+		}
+	}
+	if row == nil || row.result != "Edited x.go (1 replacement, lines 1-2)." {
+		t.Fatalf("tool row not overwritten with real result: %#v", row)
+	}
+}
+
+func TestInlineToolEndStillRewritesInPlace(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{out: &buf, mu: &sync.Mutex{}}
+	args := `{"path":"x.go","old_string":"a","new_string":"b"}`
+
+	// Inline completion: the tool's header is the most-recently-rendered line.
+	c.messages = []displayEntry{{typ: "tool", id: "call_1", name: "edit_file", args: args, done: false}}
+	c.activeToolID = "call_1"
+
+	meta := editpreview.MetadataFromArgs(args, "Edited x.go (1 replacement, lines 1-2).")
+	if meta == nil {
+		t.Fatal("test setup: expected non-nil edit_preview metadata")
+	}
+	c.handleEvent(agent.Event{
+		Kind:       agent.EventToolCallEnd,
+		ToolCallID: "call_1",
+		ToolName:   "edit_file",
+		Args:       args,
+		Result:     "Edited x.go (1 replacement, lines 1-2).",
+		Metadata:   meta,
+	})
+
+	// Inline edit_file with a summary upgrades the header in place via cursor-up.
+	if !strings.Contains(buf.String(), "\x1b[1A") {
+		t.Fatalf("inline edit_file end should rewrite the header in place (cursor-up): %q", buf.String())
+	}
+	if c.activeToolID != "" {
+		t.Fatalf("activeToolID should be consumed by its end, got %q", c.activeToolID)
 	}
 }
 
@@ -201,66 +374,6 @@ func extractFunctionBody(source, prefix string) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-func TestFlushQueueKeepsQueuedMessagesWhenBackendBusy(t *testing.T) {
-	release := make(chan struct{})
-	var releaseOnce sync.Once
-	releaseBackend := func() {
-		releaseOnce.Do(func() { close(release) })
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-release
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer server.Close()
-	defer releaseBackend()
-
-	a, _ := newTestAgentWithBaseURL(t, server.URL+"/v1")
-	agentCtx := startTestAgent(t, a)
-	if _, err := a.SendPrompt(agentCtx, "hold backend busy"); err != nil {
-		t.Fatalf("SendPrompt returned error: %v", err)
-	}
-	waitUntilAgentBusy(t, a)
-
-	c := New(a)
-	c.ctx = context.Background()
-	c.out = io.Discard
-	c.msgQueue = []string{"queued while busy"}
-
-	c.mu.Lock()
-	c.flushQueueLocked()
-	c.mu.Unlock()
-
-	waitUntilCLIAnimationStopped(t, c)
-	c.mu.Lock()
-	got := append([]string(nil), c.msgQueue...)
-	c.mu.Unlock()
-	if !equalStringSlices(got, []string{"queued while busy"}) {
-		t.Fatalf("queue after busy backend response = %q, want retained queued text", got)
-	}
-	releaseBackend()
-	waitUntilAgentIdle(t, a)
-}
-
-func TestFlushQueueRemovesQueuedMessagesAfterBackendAccepts(t *testing.T) {
-	a, _ := newTestAgent(t)
-	agentCtx := startTestAgent(t, a)
-	c := New(a)
-	c.ctx = agentCtx
-	c.out = io.Discard
-	c.msgQueue = []string{"first queued", "second queued"}
-
-	c.mu.Lock()
-	c.flushQueueLocked()
-	c.mu.Unlock()
-
-	waitUntilCLIQueueLen(t, c, 0)
-	c.mu.Lock()
-	c.stopAnimationLocked()
-	c.mu.Unlock()
-	waitUntilAgentIdle(t, a)
 }
 
 func newTestAgent(t *testing.T) (*agent.Agent, string) {
@@ -319,18 +432,6 @@ func startTestAgent(t *testing.T, a *agent.Agent) context.Context {
 	return ctx
 }
 
-func waitUntilAgentBusy(t *testing.T, a *agent.Agent) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if a.Busy() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("agent did not become busy")
-}
-
 func waitUntilAgentIdle(t *testing.T, a *agent.Agent) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -341,51 +442,6 @@ func waitUntilAgentIdle(t *testing.T, a *agent.Agent) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("agent did not become idle")
-}
-
-func waitUntilCLIQueueLen(t *testing.T, c *CLI, want int) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		c.mu.Lock()
-		got := len(c.msgQueue)
-		c.mu.Unlock()
-		if got == want {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	c.mu.Lock()
-	got := len(c.msgQueue)
-	c.mu.Unlock()
-	t.Fatalf("CLI queue len = %d, want %d", got, want)
-}
-
-func waitUntilCLIAnimationStopped(t *testing.T, c *CLI) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		c.mu.Lock()
-		stopped := c.animStop == nil
-		c.mu.Unlock()
-		if stopped {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("CLI animation did not stop")
-}
-
-func equalStringSlices(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func TestHandleKeyIdleInputEditing(t *testing.T) {

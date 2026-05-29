@@ -29,8 +29,9 @@ func TestMessageJSONFlattensExtraAndSource(t *testing.T) {
 			Function: FunctionCall{Name: "read_file", Arguments: `{"path":"foo.txt"}`},
 			Extra:    Extra{"extra_content": json.RawMessage(`{"google":{"thought_signature":"sig"}}`)},
 		}},
-		Extra:  Extra{"reasoning_content": json.RawMessage(`"thinking"`)},
-		Source: catalog.ModelRef{Provider: "xiaomi", Model: "mimo-v2.5-pro"},
+		Extra:        Extra{"reasoning_content": json.RawMessage(`"thinking"`)},
+		Source:       catalog.ModelRef{Provider: "xiaomi", Model: "mimo-v2.5-pro"},
+		InternalKind: "staged_flush",
 	}
 
 	data, err := json.Marshal(msg)
@@ -48,6 +49,9 @@ func TestMessageJSONFlattensExtraAndSource(t *testing.T) {
 	if raw["_lightcode_source"] != "xiaomi/mimo-v2.5-pro" {
 		t.Fatalf("_lightcode_source = %#v", raw["_lightcode_source"])
 	}
+	if raw["_lightcode_internal"] != "staged_flush" {
+		t.Fatalf("_lightcode_internal = %#v", raw["_lightcode_internal"])
+	}
 	toolCalls := raw["tool_calls"].([]any)
 	firstTool := toolCalls[0].(map[string]any)
 	if _, ok := firstTool["extra_content"].(map[string]any); !ok {
@@ -60,6 +64,9 @@ func TestMessageJSONFlattensExtraAndSource(t *testing.T) {
 	}
 	if decoded.Source != msg.Source {
 		t.Fatalf("Source = %#v, want %#v", decoded.Source, msg.Source)
+	}
+	if decoded.InternalKind != "staged_flush" {
+		t.Fatalf("InternalKind = %q, want staged_flush", decoded.InternalKind)
 	}
 	if decoded.Refusal != "cannot" {
 		t.Fatalf("Refusal = %q, want cannot", decoded.Refusal)

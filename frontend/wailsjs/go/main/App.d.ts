@@ -5,8 +5,6 @@ import {permission} from '../models';
 
 export function AllModelList():Promise<Array<agent.ModelListEntry>>;
 
-export function AppendUserMessage(arg1:string):Promise<number>;
-
 export function ApplyTurnAction(arg1:number,arg2:string,arg3:boolean):Promise<agent.TurnActionResult>;
 
 export function Cancel():Promise<void>;
@@ -35,6 +33,8 @@ export function ProjectPickAndSwitch():Promise<void>;
 
 export function ProjectSwitch(arg1:string):Promise<void>;
 
+export function QueueSnapshot():Promise<agent.QueueState>;
+
 export function ReadFileContent(arg1:string):Promise<string>;
 
 export function Reload():Promise<void>;
@@ -46,10 +46,6 @@ export function RevertCode(arg1:number):Promise<void>;
 export function RevertHistory(arg1:number):Promise<void>;
 
 export function SaveProjectPermission(arg1:string,arg2:Array<string>):Promise<void>;
-
-export function SendPrompt(arg1:string):Promise<number>;
-
-export function SendQueuedMessages(arg1:Array<string>):Promise<agent.QueuedMessagesResult>;
 
 export function SessionArchive(arg1:string):Promise<void>;
 
@@ -70,6 +66,8 @@ export function SetModelHidden(arg1:string,arg2:boolean):Promise<void>;
 export function SetProviderHidden(arg1:string,arg2:boolean):Promise<void>;
 
 export function SnapshotList():Promise<Array<agent.Snapshot>>;
+
+export function Submit(arg1:string):Promise<agent.SubmitResult>;
 
 export function SwitchModel(arg1:string):Promise<void>;
 

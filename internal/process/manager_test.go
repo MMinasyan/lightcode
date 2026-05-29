@@ -305,6 +305,7 @@ func TestManagerReadAfterExitReturnsMissingProcess(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("exit handler not called")
 	}
+	waitForProcessRemoval(t, m, id)
 	_, err = m.Read(id)
 	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("no process with ID %q", id)) {
 		t.Fatalf("Read after exit error = %v, want missing process", err)

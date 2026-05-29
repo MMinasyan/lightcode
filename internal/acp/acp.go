@@ -116,6 +116,8 @@ func (r *Runner) dispatch(ctx context.Context, req Request) {
 		r.handleSessionSwitch(req)
 	case "session/messages":
 		r.respond(req.ID, r.agent.SessionMessages())
+	case "queue/list":
+		r.handleQueueList(req)
 	case "session/archive":
 		r.handleSessionArchive(req)
 	case "session/delete":
@@ -205,6 +207,13 @@ func (r *Runner) handleEvent(ev agent.Event) {
 	case agent.EventGenericSystemSignal:
 		method = "agent/system_signal"
 		params = map[string]any{"content": "System: " + ev.Result}
+	case agent.EventQueueChanged:
+		queue := ev.Queue
+		if queue == nil {
+			queue = []agent.QueuedItem{}
+		}
+		method = "agent/queue_changed"
+		params = map[string]any{"items": queue, "version": ev.QueueVersion}
 	case agent.EventUsage:
 		method = "agent/usage"
 		params = r.agent.TokenUsage()
@@ -286,12 +295,21 @@ func (r *Runner) handleSessionPrompt(ctx context.Context, req Request) {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	turn, err := r.agent.SendPrompt(ctx, params.Content)
+	res, err := r.agent.Submit(ctx, params.Content)
 	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	r.respond(req.ID, map[string]any{"turn": turn})
+	r.respond(req.ID, map[string]any{
+		"started": res.Started,
+		"turn":    res.Turn,
+		"queue":   res.Queue,
+		"version": res.Version,
+	})
+}
+
+func (r *Runner) handleQueueList(req Request) {
+	r.respond(req.ID, r.agent.QueueSnapshot())
 }
 
 func (r *Runner) handleSessionList(req Request) {

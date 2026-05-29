@@ -232,13 +232,13 @@ func TestIntegrationHappyPathTurn(t *testing.T) {
 
 	a := newIntegrationAgent(t, server.URL)
 	log, ctx := startIntegrationAgent(t, a)
-	turn, err := a.SendPrompt(ctx, "say hello")
+	res, err := a.Submit(ctx, "say hello")
 	if err != nil {
-		t.Fatalf("SendPrompt: %v", err)
+		t.Fatalf("Submit: %v", err)
 	}
 	ev := log.waitFor(t, EventTurnEnd)
-	if ev.Turn != turn || ev.Cancelled {
-		t.Fatalf("turn end = %+v, want turn %d not cancelled", ev, turn)
+	if ev.Turn != res.Turn || ev.Cancelled {
+		t.Fatalf("turn end = %+v, want turn %d not cancelled", ev, res.Turn)
 	}
 	if !saw.Load() {
 		t.Fatal("mock provider was not called")
@@ -282,8 +282,8 @@ func TestIntegrationToolCallPermissionAllowContinues(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	a.Init(ctx)
-	if _, err := a.SendPrompt(ctx, "read the file"); err != nil {
-		t.Fatalf("SendPrompt: %v", err)
+	if _, err := a.Submit(ctx, "read the file"); err != nil {
+		t.Fatalf("Submit: %v", err)
 	}
 	if ev := log.waitFor(t, EventTurnEnd); ev.Cancelled {
 		t.Fatalf("turn cancelled: %+v", ev)
@@ -322,8 +322,8 @@ func TestIntegrationToolCallPermissionDenyCompletes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	a.Init(ctx)
-	if _, err := a.SendPrompt(ctx, "try denied read"); err != nil {
-		t.Fatalf("SendPrompt: %v", err)
+	if _, err := a.Submit(ctx, "try denied read"); err != nil {
+		t.Fatalf("Submit: %v", err)
 	}
 	if ev := log.waitFor(t, EventTurnEnd); ev.Cancelled {
 		t.Fatalf("turn cancelled: %+v", ev)
@@ -353,8 +353,8 @@ func TestIntegrationCancelMidStreamThenNextTurnStartsCleanly(t *testing.T) {
 
 	a := newIntegrationAgent(t, server.URL)
 	log, ctx := startIntegrationAgent(t, a)
-	if _, err := a.SendPrompt(ctx, "start slow stream"); err != nil {
-		t.Fatalf("SendPrompt slow: %v", err)
+	if _, err := a.Submit(ctx, "start slow stream"); err != nil {
+		t.Fatalf("Submit slow: %v", err)
 	}
 	log.waitForMatching(t, func(ev Event) bool { return ev.Kind == EventTextDelta && ev.Result == "partial" })
 	if err := a.Cancel(); err != nil {
@@ -363,8 +363,8 @@ func TestIntegrationCancelMidStreamThenNextTurnStartsCleanly(t *testing.T) {
 	if ev := log.waitFor(t, EventTurnEnd); !ev.Cancelled {
 		t.Fatalf("turn end = %+v, want cancelled", ev)
 	}
-	if _, err := a.SendPrompt(ctx, "next"); err != nil {
-		t.Fatalf("SendPrompt next: %v", err)
+	if _, err := a.Submit(ctx, "next"); err != nil {
+		t.Fatalf("Submit next: %v", err)
 	}
 	if ev := log.waitFor(t, EventTurnEnd); ev.Cancelled {
 		t.Fatalf("next turn cancelled: %+v", ev)
@@ -383,21 +383,21 @@ func TestIntegrationForkSessionContinuesConversation(t *testing.T) {
 
 	a := newIntegrationAgent(t, server.URL)
 	log, ctx := startIntegrationAgent(t, a)
-	turn, err := a.SendPrompt(ctx, "before fork")
+	res, err := a.Submit(ctx, "before fork")
 	if err != nil {
-		t.Fatalf("SendPrompt before: %v", err)
+		t.Fatalf("Submit before: %v", err)
 	}
 	log.waitFor(t, EventTurnEnd)
 	before := a.SessionCurrent().ID
-	result, err := a.ApplyTurnAction(turn, TurnActionFork, false)
+	result, err := a.ApplyTurnAction(res.Turn, TurnActionFork, false)
 	if err != nil {
 		t.Fatalf("ApplyTurnAction fork: %v", err)
 	}
 	if result.Session.ID == "" || result.Session.ID == before {
 		t.Fatalf("fork session ID = %q, before %q", result.Session.ID, before)
 	}
-	if _, err := a.SendPrompt(ctx, "after fork"); err != nil {
-		t.Fatalf("SendPrompt after: %v", err)
+	if _, err := a.Submit(ctx, "after fork"); err != nil {
+		t.Fatalf("Submit after: %v", err)
 	}
 	log.waitFor(t, EventTurnEnd)
 	assertAssistantMessageContains(t, a, "answer 2")
@@ -420,12 +420,12 @@ func TestIntegrationCompactionTriggerSavesSummary(t *testing.T) {
 
 	a := newIntegrationAgent(t, server.URL, withIntegrationCompaction(0.50))
 	log, ctx := startIntegrationAgent(t, a)
-	if _, err := a.SendPrompt(ctx, "first"); err != nil {
-		t.Fatalf("SendPrompt first: %v", err)
+	if _, err := a.Submit(ctx, "first"); err != nil {
+		t.Fatalf("Submit first: %v", err)
 	}
 	log.waitFor(t, EventTurnEnd)
-	if _, err := a.SendPrompt(ctx, "second triggers compaction"); err != nil {
-		t.Fatalf("SendPrompt second: %v", err)
+	if _, err := a.Submit(ctx, "second triggers compaction"); err != nil {
+		t.Fatalf("Submit second: %v", err)
 	}
 	log.waitFor(t, EventCompactionStart)
 	log.waitFor(t, EventCompactionEnd)
@@ -466,15 +466,15 @@ func TestIntegrationModelSwitchStripsPriorExtraFields(t *testing.T) {
 
 	a := newIntegrationAgent(t, server.URL)
 	log, ctx := startIntegrationAgent(t, a)
-	if _, err := a.SendPrompt(ctx, "first"); err != nil {
-		t.Fatalf("SendPrompt first: %v", err)
+	if _, err := a.Submit(ctx, "first"); err != nil {
+		t.Fatalf("Submit first: %v", err)
 	}
 	log.waitFor(t, EventTurnEnd)
 	if err := a.SwitchModel("test/alt-model"); err != nil {
 		t.Fatalf("SwitchModel: %v", err)
 	}
-	if _, err := a.SendPrompt(ctx, "after switch"); err != nil {
-		t.Fatalf("SendPrompt after switch: %v", err)
+	if _, err := a.Submit(ctx, "after switch"); err != nil {
+		t.Fatalf("Submit after switch: %v", err)
 	}
 	log.waitFor(t, EventTurnEnd)
 	if strings.Contains(secondBody, "secret-state") || strings.Contains(secondBody, "reasoning_content") {
@@ -496,8 +496,8 @@ func TestIntegrationCrashRecoveryLoadsCleanHistory(t *testing.T) {
 
 	a1 := newIntegrationAgentWithRoots(t, home, projectRoot, server.URL, opts)
 	log1, ctx1 := startIntegrationAgent(t, a1)
-	if _, err := a1.SendPrompt(ctx1, "persist before restart"); err != nil {
-		t.Fatalf("SendPrompt first agent: %v", err)
+	if _, err := a1.Submit(ctx1, "persist before restart"); err != nil {
+		t.Fatalf("Submit first agent: %v", err)
 	}
 	log1.waitFor(t, EventTurnEnd)
 	firstSession := a1.SessionCurrent().ID
@@ -508,8 +508,8 @@ func TestIntegrationCrashRecoveryLoadsCleanHistory(t *testing.T) {
 		t.Fatalf("resumed session = %q, want %q", got, firstSession)
 	}
 	assertAssistantMessageContains(t, a2, "persisted 1")
-	if _, err := a2.SendPrompt(ctx2, "continue after restart"); err != nil {
-		t.Fatalf("SendPrompt second agent: %v", err)
+	if _, err := a2.Submit(ctx2, "continue after restart"); err != nil {
+		t.Fatalf("Submit second agent: %v", err)
 	}
 	log2.waitFor(t, EventTurnEnd)
 	assertAssistantMessageContains(t, a2, "persisted 2")
@@ -539,8 +539,8 @@ func TestIntegrationSubagentSpawnTagsEventsAndReturnsResult(t *testing.T) {
 
 	a := newIntegrationAgent(t, server.URL)
 	log, ctx := startIntegrationAgent(t, a)
-	if _, err := a.SendPrompt(ctx, "delegate"); err != nil {
-		t.Fatalf("SendPrompt: %v", err)
+	if _, err := a.Submit(ctx, "delegate"); err != nil {
+		t.Fatalf("Submit: %v", err)
 	}
 	subEv := log.waitFor(t, EventSubagentStart)
 	if subEv.SubagentSessionID == "" || subEv.TaskIndex != 0 || subEv.ToolCallID != "call_task" {
@@ -628,8 +628,8 @@ func TestIntegrationReadOnlySubagentRunCommandUsesParentPermission(t *testing.T)
 	t.Cleanup(cancel)
 	a.Init(ctx)
 
-	if _, err := a.SendPrompt(ctx, "delegate with command"); err != nil {
-		t.Fatalf("SendPrompt: %v", err)
+	if _, err := a.Submit(ctx, "delegate with command"); err != nil {
+		t.Fatalf("Submit: %v", err)
 	}
 	subEv := log.waitFor(t, EventSubagentStart)
 	if subEv.SubagentSessionID == "" || subEv.TaskIndex != 0 || subEv.ToolCallID != "call_task" {
@@ -661,8 +661,8 @@ func TestIntegrationReadOnlySubagentRunCommandUsesParentPermission(t *testing.T)
 		t.Fatalf("saved allow rules = %#v, want exact run_command rule", rules.Allow)
 	}
 
-	if _, err := a.SendPrompt(ctx, "run same command in main agent"); err != nil {
-		t.Fatalf("SendPrompt main command: %v", err)
+	if _, err := a.Submit(ctx, "run same command in main agent"); err != nil {
+		t.Fatalf("Submit main command: %v", err)
 	}
 	if ev := log.waitFor(t, EventTurnEnd); ev.Cancelled {
 		t.Fatalf("main command turn cancelled: %+v", ev)

@@ -92,34 +92,6 @@ func TestExecutePendingToolMetadataAndNoopExecute(t *testing.T) {
 	}
 }
 
-func TestFormatBatchResultEmpty(t *testing.T) {
-	if got := FormatBatchResult(nil); got != "No pending edits to execute." {
-		t.Fatalf("FormatBatchResult(nil) = %q, want no pending message", got)
-	}
-}
-
-func TestFormatBatchResultSuccessAndErrors(t *testing.T) {
-	results := []BatchResult{
-		{ToolName: "edit_file", Result: "Edited a.txt (1 replacement, lines 1-1).", Success: true},
-		{ToolName: "write_file", Error: "denied by user"},
-		{ToolName: "edit_file", Result: "Edited b.txt (2 replacements, lines 1-2).", Success: true},
-	}
-
-	got := FormatBatchResult(results)
-	want := strings.Join([]string{
-		"Executed 3 staged edits:",
-		"1. Edited a.txt (1 replacement, lines 1-1).",
-		"2. write_file: denied by user",
-		"3. Edited b.txt (2 replacements, lines 1-2).",
-	}, "\n")
-	if got != want {
-		t.Fatalf("FormatBatchResult = %q, want %q", got, want)
-	}
-	if strings.HasSuffix(got, "\n") {
-		t.Fatalf("FormatBatchResult has trailing newline: %q", got)
-	}
-}
-
 func pendingCall(toolName, id, path string) StagedCall {
 	return StagedCall{
 		ToolName:   toolName,

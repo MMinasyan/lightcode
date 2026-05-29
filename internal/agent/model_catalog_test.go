@@ -356,9 +356,7 @@ func TestAgentEnsureSessionReloadsExternalConfigEdit(t *testing.T) {
   "default_model": "test/test-model"
 }`)
 
-	if _, err := a.AppendUserMessage("hello"); err != nil {
-		t.Fatalf("AppendUserMessage returned error: %v", err)
-	}
+	appendUserTurn(t, a, "hello")
 
 	cur := a.CurrentModel()
 	if cur.DisplayName != "Edited Model" || cur.ContextWindow != 24576 {
@@ -375,9 +373,7 @@ func TestAgentEnsureSessionReloadsExternalConfigEdit(t *testing.T) {
 
 func TestAgentSessionSwitchReloadsExternalConfigEdit(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if _, err := a.AppendUserMessage("first"); err != nil {
-		t.Fatalf("AppendUserMessage first returned error: %v", err)
-	}
+	appendUserTurn(t, a, "first")
 	firstID := a.SessionCurrent().ID
 	if firstID == "" {
 		t.Fatal("first session id is empty")
@@ -385,9 +381,7 @@ func TestAgentSessionSwitchReloadsExternalConfigEdit(t *testing.T) {
 	if err := a.SessionNew(); err != nil {
 		t.Fatalf("SessionNew returned error: %v", err)
 	}
-	if _, err := a.AppendUserMessage("second"); err != nil {
-		t.Fatalf("AppendUserMessage second returned error: %v", err)
-	}
+	appendUserTurn(t, a, "second")
 	writeCatalogTestConfig(t, a.home, `{
   "providers": {
     "test": {
