@@ -305,6 +305,43 @@ func TestMergeDiscoveredProviderLeavesMaxOutputUnsetWhenDiscoveryOmits(t *testin
 	}
 }
 
+func TestMergeDiscoveredProviderFiltersRejectedDiscoveredOnlyModels(t *testing.T) {
+	cat := &Catalog{Providers: map[string]*Provider{
+		"openrouter": {
+			ID:            "openrouter",
+			Name:          "openrouter",
+			Transport:     Transport{BaseURL: "https://openrouter.ai/api/v1"},
+			SystemRole:    RoleSystem,
+			UsageInStream: true,
+			ExtraBody:     map[string]any{},
+			Builtin:       true,
+			Models:        map[string]*Model{},
+		},
+	}}
+	err := cat.MergeDiscoveredProvider("openrouter", DiscoveredProvider{
+		Models: map[string]DiscoveredModel{
+			"image-only": {
+				Name:          "Image Only",
+				ContextWindow: 200000,
+				metadata:      &discoveryModelMetadata{ArchitectureOutputModalities: []string{"image"}},
+			},
+			"unknown": {
+				Name:          "Unknown",
+				ContextWindow: 200000,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("MergeDiscoveredProvider error: %v", err)
+	}
+	if _, ok := cat.Providers["openrouter"].Models["image-only"]; ok {
+		t.Fatalf("rejected discovered model was added: %#v", cat.Providers["openrouter"].Models["image-only"])
+	}
+	if _, ok := cat.Providers["openrouter"].Models["unknown"]; !ok {
+		t.Fatalf("unknown discovered model without metadata was not added")
+	}
+}
+
 func TestMergeDiscoveredProviderConfigOnlyDoesNotAddModels(t *testing.T) {
 	cat := &Catalog{Providers: map[string]*Provider{
 		"local": {

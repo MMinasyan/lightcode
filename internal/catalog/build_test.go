@@ -375,6 +375,101 @@ func TestBuildBundledDiscoveryCacheCanAddModels(t *testing.T) {
 	}
 }
 
+func TestBuildFiltersRejectedDiscoveredOnlyModels(t *testing.T) {
+	result := Build(BuildInputs{
+		Bundled: map[string]json.RawMessage{
+			"openrouter": rawProviderJSON(`{
+				"id": "openrouter",
+				"name": "OpenRouter",
+				"transport": {"base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY"},
+				"discovery": true,
+				"models": {}
+			}`),
+		},
+		Cache: map[string]DiscoveredProvider{
+			"openrouter": {
+				Models: map[string]DiscoveredModel{
+					"image-only": {
+						Name:          "Image Only",
+						ContextWindow: 32768,
+						metadata:      &discoveryModelMetadata{ArchitectureOutputModalities: []string{"image"}},
+					},
+					"old-cache": {
+						Name:          "Old Cache",
+						ContextWindow: 32768,
+					},
+					"vision-chat": {
+						Name:          "Vision Chat",
+						ContextWindow: 32768,
+						metadata: &discoveryModelMetadata{
+							ArchitectureInputModalities:  []string{"image", "text"},
+							ArchitectureOutputModalities: []string{"text"},
+						},
+					},
+				},
+			},
+		},
+	})
+	if len(result.Warnings) != 0 {
+		t.Fatalf("Build warnings = %#v, want none", result.Warnings)
+	}
+	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "openrouter", Model: "image-only"}); !errors.Is(err, ErrUnknownModel) {
+		t.Fatalf("Lookup image-only error = %v, want ErrUnknownModel", err)
+	}
+	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "openrouter", Model: "old-cache"}); err != nil {
+		t.Fatalf("Lookup old-cache returned error: %v", err)
+	}
+	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "openrouter", Model: "vision-chat"}); err != nil {
+		t.Fatalf("Lookup vision-chat returned error: %v", err)
+	}
+	for _, ref := range result.Catalog.AllModels() {
+		if ref.String() == "openrouter/image-only" {
+			t.Fatalf("rejected discovered model appeared in AllModels")
+		}
+	}
+}
+
+func TestBuildDoesNotDeleteConfiguredModelRejectedByDiscoveryMetadata(t *testing.T) {
+	result := Build(BuildInputs{
+		Bundled: map[string]json.RawMessage{
+			"openrouter": rawProviderJSON(`{
+				"id": "openrouter",
+				"name": "OpenRouter",
+				"transport": {"base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY"},
+				"discovery": true,
+				"models": {
+					"configured": {"name": "Configured", "context_window": 1000, "max_output_tokens": 100}
+				}
+			}`),
+		},
+		Cache: map[string]DiscoveredProvider{
+			"openrouter": {
+				Models: map[string]DiscoveredModel{
+					"configured": {
+						Name:          "Discovered",
+						ContextWindow: 2000,
+						Cost:          &Cost{Input: ptrFloat64(0.5)},
+						metadata:      &discoveryModelMetadata{ArchitectureOutputModalities: []string{"image"}},
+					},
+				},
+			},
+		},
+	})
+	if len(result.Warnings) != 0 {
+		t.Fatalf("Build warnings = %#v, want none", result.Warnings)
+	}
+	_, model, err := result.Catalog.Lookup(ModelRef{Provider: "openrouter", Model: "configured"})
+	if err != nil {
+		t.Fatalf("Lookup configured returned error: %v", err)
+	}
+	if model.Name != "Configured" || model.ContextWindow != 1000 {
+		t.Fatalf("configured model = %#v, want bundled metadata preserved", model)
+	}
+	if model.Cost == nil || model.Cost.Input == nil || *model.Cost.Input != 0.5 {
+		t.Fatalf("configured cost = %#v, want discovery cost still merged", model.Cost)
+	}
+}
+
 func TestBuildKeepsIncompleteModelsAndWarns(t *testing.T) {
 	result := Build(BuildInputs{
 		UserRaw: map[string]any{
