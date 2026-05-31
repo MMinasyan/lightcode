@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/coremodel"
 )
 
 func TestTextHelpers(t *testing.T) {
@@ -30,7 +30,7 @@ func TestMessageJSONFlattensExtraAndSource(t *testing.T) {
 			Extra:    Extra{"extra_content": json.RawMessage(`{"google":{"thought_signature":"sig"}}`)},
 		}},
 		Extra:        Extra{"reasoning_content": json.RawMessage(`"thinking"`)},
-		Source:       catalog.ModelRef{Provider: "xiaomi", Model: "mimo-v2.5-pro"},
+		Source:       coremodel.ModelRef{Provider: "xiaomi", Model: "mimo-v2.5-pro"},
 		InternalKind: "staged_flush",
 	}
 
@@ -84,7 +84,7 @@ func TestMessageJSONLoadsOldSessionWithoutSource(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"role":"assistant","content":"old"}`), &msg); err != nil {
 		t.Fatalf("Unmarshal returned error: %v", err)
 	}
-	if msg.Source != (catalog.ModelRef{}) {
+	if msg.Source != (coremodel.ModelRef{}) {
 		t.Fatalf("Source = %#v, want zero", msg.Source)
 	}
 	if got := msg.TextContent(); got != "old" {
@@ -96,7 +96,7 @@ func TestMessageJSONOmitsPartialSource(t *testing.T) {
 	msg := Message{
 		Role:    RoleAssistant,
 		Content: []ContentPart{{Type: ContentPartText, Text: "done"}},
-		Source:  catalog.ModelRef{Provider: "openai"},
+		Source:  coremodel.ModelRef{Provider: "openai"},
 	}
 
 	data, err := json.Marshal(msg)
@@ -116,7 +116,7 @@ func TestMessageJSONOmitsPartialSource(t *testing.T) {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatalf("Unmarshal returned error: %v", err)
 	}
-	if decoded.Source != (catalog.ModelRef{}) {
+	if decoded.Source != (coremodel.ModelRef{}) {
 		t.Fatalf("decoded Source = %#v, want zero", decoded.Source)
 	}
 }

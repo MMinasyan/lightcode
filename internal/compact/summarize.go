@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/modelclient"
 )
 
 // DefaultSummarizerPrompt is the default system prompt for the summarizer.
@@ -67,17 +68,19 @@ func summarizeOnce(ctx context.Context, cfg Config, systemPrompt, previousSummar
 	}
 	userContent += serializeMessages(messages)
 
-	resp, err := cfg.SummarizerClient.Chat(ctx, []message.Message{
-		message.NewText(message.RoleSystem, systemPrompt),
-		message.NewText(message.RoleUser, userContent),
-	}, nil)
+	resp, err := cfg.SummarizerClient.Chat(ctx, modelclient.ChatRequest{
+		Messages: []message.Message{
+			message.NewText(message.RoleSystem, systemPrompt),
+			message.NewText(message.RoleUser, userContent),
+		},
+	})
 	if err != nil {
 		return "", fmt.Errorf("summarizer call failed: %w", err)
 	}
-	if len(resp.Choices) == 0 {
+	if !resp.HasChoice {
 		return "", fmt.Errorf("summarizer returned no choices")
 	}
-	return resp.Choices[0].Message.Content, nil
+	return resp.Content, nil
 }
 
 func summarizeIterative(ctx context.Context, cfg Config, systemPrompt string, pruned []message.Message) (string, error) {

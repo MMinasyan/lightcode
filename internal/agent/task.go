@@ -12,6 +12,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/coremodel"
 	"github.com/MMinasyan/lightcode/internal/loop"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/provider"
@@ -226,7 +227,7 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		go t.forwardEvents(events, index, sessionID, parentToolCallID)
 	}
 
-	lp := loop.New(client, registry, at.Prompt)
+	lp := loop.New(provider.NewAdapter(client), registry, at.Prompt)
 	if events != nil {
 		lp.SetEvents(events)
 	}
@@ -303,9 +304,9 @@ func (t *taskTool) resolveClient() (*provider.Client, error) {
 	modelCatalog := t.modelCatalog
 	t.mu.Unlock()
 
-	ref := catalog.ModelRef{Provider: providerName, Model: modelID}
+	ref := coremodel.ModelRef{Provider: providerName, Model: modelID}
 	if subModel != "" {
-		parsed, err := catalog.ParseModelRef(subModel)
+		parsed, err := coremodel.Parse(subModel)
 		if err != nil {
 			return nil, err
 		}

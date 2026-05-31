@@ -4,15 +4,30 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/coremodel"
 	"github.com/MMinasyan/lightcode/internal/message"
-	"github.com/MMinasyan/lightcode/internal/provider"
+	"github.com/MMinasyan/lightcode/internal/modelclient"
 )
+
+type fakeSummarizer struct {
+	ref     coremodel.ModelRef
+	content string
+}
+
+func (f fakeSummarizer) Chat(context.Context, modelclient.ChatRequest) (modelclient.ChatResponse, error) {
+	return modelclient.ChatResponse{Content: f.content, HasChoice: true}, nil
+}
+
+func (f fakeSummarizer) Model() string {
+	return f.ref.Model
+}
+
+func (f fakeSummarizer) ModelRef() coremodel.ModelRef {
+	return f.ref
+}
 
 func TestPruneCanonicalToolOutputsKeepsLastRead(t *testing.T) {
 	messages := []message.Message{
@@ -109,36 +124,10 @@ func TestCountTokensIgnoresHiddenMetadata(t *testing.T) {
 }
 
 func TestSummarizeIterativeResultHasSummarizerRef(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":"chat-1","model":"summarizer-model","choices":[{"index":0,"message":{"role":"assistant","content":"summary"},"finish_reason":"stop"}]}`)
-	}))
-	defer server.Close()
-
-	prov := &catalog.Provider{
-		ID:             "test-provider",
-		Name:           "Test Provider",
-		MaxTokensField: "max_tokens",
-		Transport: catalog.Transport{
-			BaseURL: server.URL,
-		},
-		SystemRole:    catalog.RoleSystem,
-		UsageInStream: true,
-		ExtraBody:     map[string]any{},
-		Models: map[string]*catalog.Model{
-			"summarizer-model": {
-				ID:              "summarizer-model",
-				Name:            "Summarizer Model",
-				ContextWindow:   128000,
-				MaxOutputTokens: 4096,
-				InputModalities: []catalog.Modality{catalog.ModalityText},
-				SystemRole:      catalog.RoleSystem,
-				UsageInStream:   true,
-				ExtraBody:       map[string]any{},
-			},
-		},
+	client := fakeSummarizer{
+		ref:     coremodel.ModelRef{Provider: "test-provider", Model: "summarizer-model"},
+		content: "summary",
 	}
-	client := provider.New(prov, prov.Models["summarizer-model"], "")
 
 	result, err := Run(context.Background(), []message.Message{message.NewText(message.RoleUser, "please summarize")}, Config{
 		SummarizerClient: client,
@@ -150,7 +139,7 @@ func TestSummarizeIterativeResultHasSummarizerRef(t *testing.T) {
 	if result.Summary != "summary" {
 		t.Fatalf("Summary = %q, want summary", result.Summary)
 	}
-	if got, want := result.SummarizerRef, (catalog.ModelRef{Provider: "test-provider", Model: "summarizer-model"}); got != want {
+	if got, want := result.SummarizerRef, (coremodel.ModelRef{Provider: "test-provider", Model: "summarizer-model"}); got != want {
 		t.Fatalf("SummarizerRef = %#v, want %#v", got, want)
 	}
 }

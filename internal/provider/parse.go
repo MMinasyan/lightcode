@@ -4,24 +4,12 @@ import (
 	"encoding/json"
 
 	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/modelclient"
 	openai "github.com/sashabaranov/go-openai"
 )
 
 // StreamDelta is the provider-owned parsed view of one streaming chunk.
-type StreamDelta struct {
-	Role         string
-	Content      string
-	Refusal      string
-	ToolCalls    []openai.ToolCall
-	FinishReason openai.FinishReason
-	Usage        *openai.Usage
-	HasChoice    bool
-
-	MessageExtra     message.Extra
-	ToolCallExtra    map[int]message.Extra
-	ContentPartExtra map[int]message.Extra
-	ContentParts     []message.ContentPart
-}
+type StreamDelta = modelclient.StreamDelta
 
 type rawStreamResponse struct {
 	Choices []rawStreamChoice `json:"choices"`

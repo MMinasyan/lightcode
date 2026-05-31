@@ -18,6 +18,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 	"github.com/MMinasyan/lightcode/internal/compact"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/coremodel"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
 	"github.com/MMinasyan/lightcode/internal/loop"
 	"github.com/MMinasyan/lightcode/internal/lsp"
@@ -65,7 +66,7 @@ type Agent struct {
 	turnCancel context.CancelFunc
 	turnCtx    context.Context
 
-	currentRef        catalog.ModelRef
+	currentRef        coremodel.ModelRef
 	contextWindowSize int
 
 	tokensMu        sync.Mutex
@@ -125,12 +126,12 @@ func New(c Config) (*Agent, error) {
 		}
 	}
 
-	var defaultRef catalog.ModelRef
+	var defaultRef coremodel.ModelRef
 	var client *provider.Client
 	var defaultModel *catalog.Model
 
 	if defaultModelStr != "" {
-		defaultRef, err = catalog.ParseModelRef(defaultModelStr)
+		defaultRef, err = coremodel.Parse(defaultModelStr)
 		if err != nil {
 			return nil, fmt.Errorf("default_model: %w", err)
 		}
@@ -339,7 +340,7 @@ func New(c Config) (*Agent, error) {
 	a.pendingPromptWarnings = res.Warnings
 	a.pendingCatalogWarnings = catalogWarningsToPromptWarnings(catalogWarnings)
 
-	l := loop.New(client, registry, res.Prompt)
+	l := loop.New(provider.NewAdapter(client), registry, res.Prompt)
 	l.SetEvents(events)
 	l.SetStore(store)
 	l.SetPendingExecutor(tool.NewStagedExecutor(store, fileTracker, c.Cfg.Tools, checkFunc, askActionFunc))
@@ -724,6 +725,9 @@ func (a *Agent) dispatchTaggedEvent(tev TaggedLoopEvent) {
 
 func (a *Agent) recordUsage(ev loop.Event) {
 	ref := a.currentRef
+	if !ev.ModelRef.IsZero() {
+		ref = ev.ModelRef
+	}
 	prov := ref.Provider
 	model := ev.Model
 	if model == "" {
@@ -909,10 +913,10 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 	return nil
 }
 
-func (a *Agent) summarizerClientAndWindow() (*provider.Client, int) {
+func (a *Agent) summarizerClientAndWindow() (*provider.Adapter, int) {
 	ref := a.currentRef
 	if a.cfg.Compaction.SummarizerModel != "" {
-		parsed, err := catalog.ParseModelRef(a.cfg.Compaction.SummarizerModel)
+		parsed, err := coremodel.Parse(a.cfg.Compaction.SummarizerModel)
 		if err == nil {
 			ref = parsed
 		}
@@ -923,9 +927,9 @@ func (a *Agent) summarizerClientAndWindow() (*provider.Client, int) {
 		client, model, err = newProviderClient(a.catalog, a.currentRef)
 	}
 	if err != nil {
-		return provider.New(nil, nil, ""), 0
+		return provider.NewAdapter(provider.New(nil, nil, "")), 0
 	}
-	return client, model.ContextWindow
+	return provider.NewAdapter(client), model.ContextWindow
 }
 
 // CompactNow triggers manual compaction. Must not be called while busy.
@@ -1070,12 +1074,12 @@ func (a *Agent) restoreModelFromSession() {
 	if err != nil || meta.Provider == "" || meta.Model == "" {
 		return
 	}
-	ref := catalog.ModelRef{Provider: meta.Provider, Model: meta.Model}
+	ref := coremodel.ModelRef{Provider: meta.Provider, Model: meta.Model}
 	client, model, err := newProviderClient(a.catalog, ref)
 	if err != nil {
 		return
 	}
-	a.lp.SetClient(client)
+	a.lp.SetClient(provider.NewAdapter(client))
 	a.currentRef = ref
 	a.contextWindowSize = model.ContextWindow
 }
@@ -1112,7 +1116,7 @@ func (a *Agent) loadHistoryIntoLoop() error {
 	}
 
 	if rec != nil {
-		a.lp.LoadHistoryWithSummary(rec.Summary, catalog.ModelRef{Provider: rec.SummarizerProvider, Model: rec.SummarizerModel}, decoded)
+		a.lp.LoadHistoryWithSummary(rec.Summary, coremodel.ModelRef{Provider: rec.SummarizerProvider, Model: rec.SummarizerModel}, decoded)
 	} else {
 		a.lp.LoadHistory(decoded)
 	}
@@ -1515,7 +1519,7 @@ func (a *Agent) SwitchModel(refStr string) error {
 	if a.busy {
 		return fmt.Errorf("cannot switch model while a turn is running")
 	}
-	ref, err := catalog.ParseModelRef(refStr)
+	ref, err := coremodel.Parse(refStr)
 	if err != nil {
 		return err
 	}
@@ -1523,7 +1527,7 @@ func (a *Agent) SwitchModel(refStr string) error {
 	if err != nil {
 		return err
 	}
-	a.lp.SetClient(client)
+	a.lp.SetClient(provider.NewAdapter(client))
 	a.currentRef = ref
 	a.contextWindowSize = model.ContextWindow
 	a.lp.AddPendingSignal(loop.PendingSignal{Payload: fmt.Sprintf("Model switched to %s", ref.String()), Persist: true})
@@ -1557,7 +1561,7 @@ func (a *Agent) reloadLocked() error {
 
 	ref := a.currentRef
 	if _, _, err := modelCatalog.Lookup(ref); err != nil {
-		ref, err = catalog.ParseModelRef(cfg.DefaultModel)
+		ref, err = coremodel.Parse(cfg.DefaultModel)
 		if err != nil {
 			return fmt.Errorf("default_model: %w", err)
 		}
@@ -1573,7 +1577,7 @@ func (a *Agent) reloadLocked() error {
 		a.taskToolInst.setCatalog(modelCatalog)
 		a.taskToolInst.setSubModel(cfg.Subagents.Model)
 	}
-	a.lp.SetClient(client)
+	a.lp.SetClient(provider.NewAdapter(client))
 	a.currentRef = ref
 	a.contextWindowSize = model.ContextWindow
 	a.setWarningGroup("catalog", catalogWarningsToPromptWarnings(catalogWarnings))
@@ -1586,7 +1590,7 @@ type ModelCompletion struct {
 }
 
 func (a *Agent) CompleteModelEntry(refStr string, completion ModelCompletion) error {
-	ref, err := catalog.ParseModelRef(refStr)
+	ref, err := coremodel.Parse(refStr)
 	if err != nil {
 		return err
 	}
@@ -1684,7 +1688,7 @@ func (a *Agent) mutateProviderConfig(providerID string, mutate func(providerMap 
 // mutateModelConfig reads the agent config, navigates to the specified
 // model map, calls mutate, and writes the config atomically.
 // Caller must hold a.mu.
-func (a *Agent) mutateModelConfig(ref catalog.ModelRef, mutate func(modelMap map[string]any) error) error {
+func (a *Agent) mutateModelConfig(ref coremodel.ModelRef, mutate func(modelMap map[string]any) error) error {
 	return a.mutateProviderConfig(ref.Provider, func(providerMap map[string]any) error {
 		modelsRaw, ok := providerMap["models"]
 		if !ok {
@@ -1782,7 +1786,7 @@ func (a *Agent) AllModelList() []ModelListEntry {
 }
 
 func (a *Agent) SetModelHidden(refStr string, hidden bool) error {
-	ref, err := catalog.ParseModelRef(refStr)
+	ref, err := coremodel.Parse(refStr)
 	if err != nil {
 		return err
 	}
@@ -2650,7 +2654,7 @@ func (a *Agent) ProjectList() ([]ProjectSummary, error) {
 	return out, nil
 }
 
-func (a *Agent) modelInfo(ref catalog.ModelRef) ModelInfo {
+func (a *Agent) modelInfo(ref coremodel.ModelRef) ModelInfo {
 	info := ModelInfo{Ref: ref.String(), Provider: ref.Provider, Model: ref.Model, Incomplete: true}
 	_, model, err := a.catalog.LookupOrIncomplete(ref)
 	if err != nil {
@@ -2666,7 +2670,7 @@ func (a *Agent) modelInfo(ref catalog.ModelRef) ModelInfo {
 	return info
 }
 
-func newProviderClient(cat *catalog.Catalog, ref catalog.ModelRef) (*provider.Client, *catalog.Model, error) {
+func newProviderClient(cat *catalog.Catalog, ref coremodel.ModelRef) (*provider.Client, *catalog.Model, error) {
 	prov, model, err := cat.Lookup(ref)
 	if err != nil {
 		return nil, nil, err
@@ -2729,13 +2733,13 @@ func (a *snapshotDiagAdapter) ListTurns() ([]tool.DiagTurnEntry, error) {
 	return out, nil
 }
 
-func autoSelectModel(cat *catalog.Catalog) (catalog.ModelRef, bool) {
+func autoSelectModel(cat *catalog.Catalog) (coremodel.ModelRef, bool) {
 	refs := cat.VisibleModels()
 	if len(refs) == 0 {
 		refs = cat.AllModels()
 	}
 	if len(refs) == 0 {
-		return catalog.ModelRef{}, false
+		return coremodel.ModelRef{}, false
 	}
 	return refs[0], true
 }

@@ -1,56 +1,17 @@
 // Package catalog builds and validates Lightcode's provider/model catalog.
 package catalog
 
-import (
-	"encoding/json"
-	"errors"
-	"fmt"
-	"strings"
-)
+import "github.com/MMinasyan/lightcode/internal/coremodel"
 
 // ErrInvalidModelRef is returned when a provider-prefixed model reference is malformed.
-var ErrInvalidModelRef = errors.New("catalog: invalid model ref")
+var ErrInvalidModelRef = coremodel.ErrInvalidModelRef
 
 // ModelRef is the canonical internal identity of a model.
-type ModelRef struct {
-	Provider string
-	Model    string
-}
-
-// String returns the provider-prefixed model reference.
-func (r ModelRef) String() string {
-	if r.Provider == "" || r.Model == "" {
-		return ""
-	}
-	return r.Provider + "/" + r.Model
-}
-
-// MarshalJSON serializes ModelRef as the provider-prefixed string form.
-func (r ModelRef) MarshalJSON() ([]byte, error) {
-	return json.Marshal(r.String())
-}
-
-// UnmarshalJSON parses a provider-prefixed model reference from JSON.
-func (r *ModelRef) UnmarshalJSON(b []byte) error {
-	var s string
-	if err := json.Unmarshal(b, &s); err != nil {
-		return err
-	}
-	ref, err := ParseModelRef(s)
-	if err != nil {
-		return err
-	}
-	*r = ref
-	return nil
-}
+type ModelRef = coremodel.ModelRef
 
 // ParseModelRef parses a provider-prefixed model reference.
 func ParseModelRef(s string) (ModelRef, error) {
-	provider, model, ok := strings.Cut(s, "/")
-	if !ok || provider == "" || model == "" {
-		return ModelRef{}, fmt.Errorf("%w: %q", ErrInvalidModelRef, s)
-	}
-	return ModelRef{Provider: provider, Model: model}, nil
+	return coremodel.Parse(s)
 }
 
 // SystemRole is the request role used for the system prompt.

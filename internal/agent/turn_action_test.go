@@ -236,7 +236,7 @@ func TestIdleBackgroundTerminalSignalStartsAgentTurn(t *testing.T) {
 	appendUserTurn(t, a, "existing turn")
 	prov := a.catalog.Providers["test"]
 	prov.Transport.BaseURL = server.URL + "/v1"
-	a.lp.SetClient(provider.New(prov, prov.Models["test-model"], ""))
+	a.lp.SetClient(provider.NewAdapter(provider.New(prov, prov.Models["test-model"], "")))
 
 	if _, err := a.procMgr.Start("printf final-output", 0); err != nil {
 		t.Fatalf("Start background process: %v", err)
@@ -303,7 +303,7 @@ func TestBackgroundTerminalDisplayEventsForErrorAndTimeout(t *testing.T) {
 	appendUserTurn(t, a, "existing turn")
 	prov := a.catalog.Providers["test"]
 	prov.Transport.BaseURL = server.URL + "/v1"
-	a.lp.SetClient(provider.New(prov, prov.Models["test-model"], ""))
+	a.lp.SetClient(provider.NewAdapter(provider.New(prov, prov.Models["test-model"], "")))
 
 	if _, err := a.procMgr.Start("printf failed; exit 7", 0); err != nil {
 		t.Fatalf("Start error background process: %v", err)

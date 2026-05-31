@@ -82,7 +82,7 @@ func loopForServer(srv *httptest.Server, registry *tool.Registry) *Loop {
 		Models:    map[string]*catalog.Model{"model-a": {ID: "model-a"}},
 	}
 	client := provider.New(prov, prov.Models["model-a"], "")
-	return New(client, registry, "system")
+	return New(provider.NewAdapter(client), registry, "system")
 }
 
 // editToolCallChunk renders an assistant SSE chunk that calls edit_file with

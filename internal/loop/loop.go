@@ -17,10 +17,10 @@ import (
 
 	openai "github.com/sashabaranov/go-openai"
 
-	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/coremodel"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
 	"github.com/MMinasyan/lightcode/internal/message"
-	"github.com/MMinasyan/lightcode/internal/provider"
+	"github.com/MMinasyan/lightcode/internal/modelclient"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
@@ -153,6 +153,7 @@ type Event struct {
 
 	// Usage fields (Usage kind only).
 	Model      string
+	ModelRef   coremodel.ModelRef
 	Cache      int
 	Input      int
 	Output     int
@@ -187,7 +188,7 @@ type PendingSignal struct {
 // Loop owns the conversation history for a single session and drives
 // the agentic loop on each user turn.
 type Loop struct {
-	client   *provider.Client
+	client   modelclient.ChatStreamer
 	registry *tool.Registry
 	messages []message.Message
 
@@ -223,7 +224,7 @@ type Loop struct {
 }
 
 // New returns a Loop pre-seeded with the system prompt.
-func New(client *provider.Client, registry *tool.Registry, systemPrompt string) *Loop {
+func New(client modelclient.ChatStreamer, registry *tool.Registry, systemPrompt string) *Loop {
 	return &Loop{
 		client:   client,
 		registry: registry,
@@ -233,7 +234,7 @@ func New(client *provider.Client, registry *tool.Registry, systemPrompt string) 
 }
 
 // SetClient replaces the provider client used for subsequent turns.
-func (l *Loop) SetClient(c *provider.Client) { l.client = c }
+func (l *Loop) SetClient(c modelclient.ChatStreamer) { l.client = c }
 
 // SetStore wires a persistence store into the loop. Messages appended
 // after this call are persisted via store.AppendMessage.
@@ -557,17 +558,17 @@ func (l *Loop) LoadHistory(turns [][]message.Message) {
 // compaction. A synthetic assistant message containing the summary is
 // injected before any post-compaction turns, attributed to the
 // summarizer model so its provenance is preserved.
-func (l *Loop) LoadHistoryWithSummary(summary string, summarizer catalog.ModelRef, turns [][]message.Message) {
+func (l *Loop) LoadHistoryWithSummary(summary string, summarizer coremodel.ModelRef, turns [][]message.Message) {
 	l.loadHistoryWithSummary(summary, summarizer, turns, true)
 }
 
 // LoadHistoryWithSummaryPreservePending restores compacted history without
 // dropping pending async model input. Used by compaction in the active turn.
-func (l *Loop) LoadHistoryWithSummaryPreservePending(summary string, summarizer catalog.ModelRef, turns [][]message.Message) {
+func (l *Loop) LoadHistoryWithSummaryPreservePending(summary string, summarizer coremodel.ModelRef, turns [][]message.Message) {
 	l.loadHistoryWithSummary(summary, summarizer, turns, false)
 }
 
-func (l *Loop) loadHistoryWithSummary(summary string, summarizer catalog.ModelRef, turns [][]message.Message, clearSignals bool) {
+func (l *Loop) loadHistoryWithSummary(summary string, summarizer coremodel.ModelRef, turns [][]message.Message, clearSignals bool) {
 	l.resetHistory(clearSignals)
 	summaryMsg := message.NewText(message.RoleAssistant, "[Previous conversation summary]\n\n"+summary+"\n\n[End of summary. Continue from here.]")
 	summaryMsg.Source = summarizer
@@ -702,9 +703,11 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 // text + tool deltas have accumulated with cancelled=true and err=nil,
 // so the caller can persist the partial and exit the turn gracefully.
 func isRetryable(err error) bool {
-	var statusErr *provider.HTTPStatusError
-	if errors.As(err, &statusErr) {
-		return statusErr.Retryable()
+	var retryable interface {
+		Retryable() bool
+	}
+	if errors.As(err, &retryable) {
+		return retryable.Retryable()
 	}
 	return false
 }
@@ -727,9 +730,10 @@ func (l *Loop) runStream(ctx context.Context) (message.Message, bool, error) {
 			}
 			backoff *= 2
 		}
-		var stream *provider.Stream
-		var err error
-		stream, err = l.client.ChatStream(ctx, l.messages, l.registry.OpenAITools(), nil)
+		stream, err := l.client.ChatStream(ctx, modelclient.ChatRequest{
+			Messages: l.messages,
+			Tools:    l.registry.OpenAITools(),
+		})
 		if err != nil {
 			if ctx.Err() != nil {
 				return message.Message{Role: message.RoleAssistant}, true, nil
@@ -751,7 +755,7 @@ func (l *Loop) runStream(ctx context.Context) (message.Message, bool, error) {
 	return message.Message{}, false, lastErr
 }
 
-func (l *Loop) emitProtocolWarnings(warnings []provider.ProtocolWarning) {
+func (l *Loop) emitProtocolWarnings(warnings []modelclient.ProtocolWarning) {
 	for _, warning := range warnings {
 		l.emit(Event{
 			Kind:   Warning,
@@ -767,7 +771,7 @@ func (l *Loop) emitProtocolWarnings(warnings []provider.ProtocolWarning) {
 	}
 }
 
-func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (message.Message, bool, error) {
+func (l *Loop) consumeStream(ctx context.Context, stream modelclient.ChatStream) (message.Message, bool, error) {
 
 	var (
 		contentBuf   strings.Builder
@@ -787,21 +791,21 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 	)
 
 	for {
-		chunk, err := stream.Recv()
+		delta, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
+			var parseErr modelclient.ChunkParseError
+			if errors.As(err, &parseErr) {
+				fmt.Fprintf(l.trace, "  !! protocol chunk parse: %v\n", parseErr.Err)
+				continue
+			}
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				cancelled = true
 				break
 			}
 			return message.Message{}, false, fmt.Errorf("stream recv: %w", err)
-		}
-		delta, err := provider.ParseChunk(chunk.Raw)
-		if err != nil {
-			fmt.Fprintf(l.trace, "  !! protocol chunk parse: %v\n", err)
-			continue
 		}
 		if delta.Usage != nil {
 			usage = delta.Usage
@@ -922,6 +926,7 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 		l.emit(Event{
 			Kind:       Usage,
 			Model:      l.client.Model(),
+			ModelRef:   l.client.ModelRef(),
 			UsageKnown: true,
 			Cache:      cached,
 			Input:      input,

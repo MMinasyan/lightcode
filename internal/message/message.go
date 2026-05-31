@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/coremodel"
 )
 
 // Role is a canonical conversation role.
@@ -36,7 +36,7 @@ type Message struct {
 	ToolCallID   string
 	Name         string
 	Extra        Extra
-	Source       catalog.ModelRef
+	Source       coremodel.ModelRef
 	InternalKind string
 }
 
@@ -187,7 +187,7 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 				return fieldError(key, err)
 			}
 			if source != "" {
-				ref, err := catalog.ParseModelRef(source)
+				ref, err := coremodel.Parse(source)
 				if err != nil {
 					return fieldError(key, err)
 				}
