@@ -294,9 +294,9 @@ func TestAgentReloadRebuildsCatalogAndFallsBackToDefault(t *testing.T) {
 
 func TestAgentReloadRefusesWhileBusy(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	a.mu.Lock()
-	a.busy = true
-	a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	a.ensureRuntime().busy = true
+	a.ensureRuntime().mu.Unlock()
 
 	if err := a.Reload(); err == nil {
 		t.Fatal("Reload returned nil while busy")

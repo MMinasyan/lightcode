@@ -54,11 +54,12 @@ type taskTool struct {
 
 	subModel string
 
-	toolsConfig config.ToolsConfig
-	homeDir     string
-	procMgr     tool.ProcessManager
-	check       tool.CheckFunc
-	ask         tool.AskFunc
+	toolsConfig   config.ToolsConfig
+	homeDir       string
+	workspaceRoot string
+	procMgr       tool.ProcessManager
+	check         tool.CheckFunc
+	ask           tool.AskFunc
 }
 
 type taskToolConfig struct {
@@ -74,11 +75,12 @@ type taskToolConfig struct {
 
 	SubModel string
 
-	ToolsConfig config.ToolsConfig
-	HomeDir     string
-	ProcMgr     tool.ProcessManager
-	Check       tool.CheckFunc
-	Ask         tool.AskFunc
+	ToolsConfig   config.ToolsConfig
+	HomeDir       string
+	WorkspaceRoot string
+	ProcMgr       tool.ProcessManager
+	Check         tool.CheckFunc
+	Ask           tool.AskFunc
 }
 
 func newTaskTool(cfg taskToolConfig) *taskTool {
@@ -97,6 +99,7 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		subModel:      cfg.SubModel,
 		toolsConfig:   cfg.ToolsConfig,
 		homeDir:       cfg.HomeDir,
+		workspaceRoot: cfg.WorkspaceRoot,
 		procMgr:       cfg.ProcMgr,
 		check:         cfg.Check,
 		ask:           cfg.Ask,
@@ -257,7 +260,7 @@ func (t *taskTool) buildRegistry(at subagent.AgentType) *tool.Registry {
 			continue
 		}
 		if name == "run_command" && isReadOnlyType(at) {
-			rc := tool.NewRunCommand(t.toolsConfig, t.homeDir, t.procMgr)
+			rc := tool.NewRunCommandAtRoot(t.toolsConfig, t.homeDir, t.workspaceRoot, t.procMgr)
 			readOnly := tool.NewReadOnlyRunCommand(rc)
 			reg.Register(tool.WrapWithPermission(readOnly, t.permissionCheck(), t.permissionAsk()))
 			continue

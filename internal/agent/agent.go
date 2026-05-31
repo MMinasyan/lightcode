@@ -46,6 +46,8 @@ type Config struct {
 
 // Agent is the shared core used by all adapters (Wails, HTTP, ACP).
 type Agent struct {
+	rt *runtime
+
 	cfg      *config.Config
 	catalog  *catalog.Catalog
 	store    *snapshot.Store
@@ -56,14 +58,6 @@ type Agent struct {
 
 	projectRoot string
 	home        string
-
-	loopEvents chan loop.Event
-	onEvent    func(Event)
-
-	mu         sync.Mutex
-	busy       bool
-	turnCancel context.CancelFunc
-	turnCtx    context.Context
 
 	currentRef        coremodel.ModelRef
 	contextWindowSize int
@@ -83,28 +77,11 @@ type Agent struct {
 	lspDiagnostics *tool.LSPDiagnostics
 
 	subagentLoader *subagent.Loader
-	taggedEvents   chan TaggedLoopEvent
 	taskToolInst   *taskTool
-	seenSessions   map[string]bool
 
 	procMgr *process.Manager
 
 	fileTracker *tool.FileTracker
-
-	loopFlush  chan chan struct{}
-	signalWake chan struct{}
-	queueWake  chan struct{}
-	signalSink agentSignalSink
-
-	// Backend-owned input queue: in-memory, volatile, session-scoped. Guarded
-	// by mu. queueVersion is monotonic for the agent's lifetime and is NEVER
-	// reset (adapters drop snapshots whose version <= the last applied);
-	// queueSeq (item-ID source) resets on session change. transitioning is true
-	// while a cancel-and-wait session change holds its window open.
-	queue         []QueuedItem
-	queueVersion  int
-	queueSeq      int
-	transitioning bool
 
 	warningsMu      sync.Mutex
 	warningGroups   map[string][]PromptWarning
@@ -127,7 +104,7 @@ func (s loopSignalSink) AddSignal(signal loop.PendingSignal) {
 	}
 	s.agent.lp.AddPendingSignal(signal)
 	if signal.Wake {
-		s.agent.nudgeSignalScheduler()
+		s.agent.ensureRuntime().nudgeSignalScheduler()
 	}
 }
 
@@ -195,8 +172,6 @@ func New(c Config) (*Agent, error) {
 		return nil, fmt.Errorf("init snapshot store: %w", err)
 	}
 
-	events := make(chan loop.Event, 256)
-
 	var contextWindowSize int
 	if defaultModel != nil {
 		contextWindowSize = defaultModel.ContextWindow
@@ -209,15 +184,13 @@ func New(c Config) (*Agent, error) {
 		projects:          resolver,
 		projectRoot:       c.ProjectRoot,
 		home:              c.Home,
-		loopEvents:        events,
 		currentRef:        defaultRef,
 		contextWindowSize: contextWindowSize,
-		loopFlush:         make(chan chan struct{}, 1),
-		signalWake:        make(chan struct{}, 1),
-		queueWake:         make(chan struct{}, 1),
 		warningGroups:     make(map[string][]PromptWarning),
 	}
-	a.signalSink = loopSignalSink{agent: a}
+	a.rt = newRuntime(a, runtimeOptions{WorkspaceRoot: c.ProjectRoot})
+	rt := a.ensureRuntime()
+	events := rt.loopEvents
 
 	gate := permission.NewGate(func(ctx context.Context, req permission.Request) {
 		ev := loop.Event{
@@ -249,9 +222,9 @@ func New(c Config) (*Agent, error) {
 	})
 
 	askFunc := tool.AskFunc(func(ctx context.Context, req permission.Request) permission.ResponseAction {
-		a.mu.Lock()
-		turnCtx := a.turnCtx
-		a.mu.Unlock()
+		a.ensureRuntime().mu.Lock()
+		turnCtx := a.ensureRuntime().turnCtx
+		a.ensureRuntime().mu.Unlock()
 		if turnCtx == nil {
 			return permission.ResponseDeny
 		}
@@ -261,22 +234,26 @@ func New(c Config) (*Agent, error) {
 	askActionFunc := tool.AskActionFunc(func(ctx context.Context, req permission.Request) permission.ResponseAction {
 		return gate.AskRequest(ctx, req)
 	})
+	rt.permissionPolicy = runtimePermissionPolicy{Check: checkFunc, Ask: askFunc, AskAction: askActionFunc}
+	checkPolicy := rt.permissionPolicy.checkFunc()
+	askPolicy := rt.permissionPolicy.askFunc()
+	askActionPolicy := rt.permissionPolicy.askActionFunc()
 
 	fileTracker := tool.NewFileTracker()
 	a.fileTracker = fileTracker
 
 	registry := tool.NewRegistry()
-	registry.Register(tool.WrapWithPermission(tool.NewReadFile(c.Cfg.Tools, fileTracker), checkFunc, askFunc))
-	registry.Register(tool.WrapWithPermission(tool.NewWriteFileWithSnapshot(store, fileTracker, c.Cfg.Tools), checkFunc, askFunc))
-	registry.Register(tool.WrapWithPermission(tool.NewEditFileWithSnapshot(store, fileTracker, c.Cfg.Tools), checkFunc, askFunc))
-	registry.Register(tool.WrapWithPermission(tool.ExecutePending{}, checkFunc, askFunc))
+	registry.Register(tool.WrapWithPermissionAtRoot(tool.NewReadFileAtRoot(c.Cfg.Tools, fileTracker, rt.workspaceRoot), rt.workspaceRoot, checkPolicy, askPolicy))
+	registry.Register(tool.WrapWithPermissionAtRoot(tool.NewWriteFileWithSnapshotAtRoot(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot), rt.workspaceRoot, checkPolicy, askPolicy))
+	registry.Register(tool.WrapWithPermissionAtRoot(tool.NewEditFileWithSnapshotAtRoot(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot), rt.workspaceRoot, checkPolicy, askPolicy))
+	registry.Register(tool.WrapWithPermission(tool.ExecutePending{}, checkPolicy, askPolicy))
 
-	procMgr := process.NewManager(c.Cfg.Tools.MaxBackgroundProcesses, cmdoutput.Options{
+	procMgr := process.NewManagerAtRoot(c.Cfg.Tools.MaxBackgroundProcesses, cmdoutput.Options{
 		HomeDir:      c.Home,
 		SpillPrefix:  "proc_output_",
 		MaxBytes:     c.Cfg.Tools.MaxOutputBytes,
 		MaxLineChars: c.Cfg.Tools.ReadLineMaxChars,
-	})
+	}, rt.workspaceRoot)
 	a.procMgr = procMgr
 
 	procMgr.SetSessionProvider(func() string {
@@ -287,8 +264,8 @@ func New(c Config) (*Agent, error) {
 	})
 	procMgr.SetExitHandler(func(event process.ExitEvent) {
 		if a.lp != nil {
-			a.mu.Lock()
-			defer a.mu.Unlock()
+			a.ensureRuntime().mu.Lock()
+			defer a.ensureRuntime().mu.Unlock()
 			if event.SessionID != "" && a.store.SessionID() != event.SessionID {
 				return
 			}
@@ -304,7 +281,7 @@ func New(c Config) (*Agent, error) {
 				reason = process.ExitReasonCompleted
 			}
 			payload := backgroundTerminalPayload(event, output)
-			a.signalSink.AddSignal(loop.PendingSignal{
+			a.ensureRuntime().signalSink.AddSignal(loop.PendingSignal{
 				Payload: payload,
 				Wake:    true,
 				Persist: true,
@@ -320,10 +297,10 @@ func New(c Config) (*Agent, error) {
 	})
 
 	// Re-create RunCommand with the process manager.
-	rc := tool.NewRunCommand(c.Cfg.Tools, c.Home, procMgr)
-	registry.Register(tool.WrapWithPermission(rc, checkFunc, askFunc))
-	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(procMgr), checkFunc, askFunc))
-	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkFunc, askFunc))
+	rc := tool.NewRunCommandAtRoot(c.Cfg.Tools, c.Home, rt.workspaceRoot, procMgr)
+	registry.Register(tool.WrapWithPermission(rc, checkPolicy, askPolicy))
+	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(procMgr), checkPolicy, askPolicy))
+	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkPolicy, askPolicy))
 
 	embedder, err := memory.NewEmbedder()
 	if err != nil {
@@ -338,9 +315,9 @@ func New(c Config) (*Agent, error) {
 		projectID = proj.ID
 		memoriesDir = filepath.Join(resolver.Root(), proj.ID, "memories")
 	}
-	registry.Register(tool.WrapWithPermission(tool.NewSaveMemory(memStore, memoriesDir), checkFunc, askFunc))
-	registry.Register(tool.WrapWithPermission(tool.NewSearchMemory(memStore, projectID), checkFunc, askFunc))
-	registry.Register(tool.WrapWithPermission(tool.NewSearchHistory(memStore, projectID), checkFunc, askFunc))
+	registry.Register(tool.WrapWithPermission(tool.NewSaveMemory(memStore, memoriesDir), checkPolicy, askPolicy))
+	registry.Register(tool.WrapWithPermission(tool.NewSearchMemory(memStore, projectID), checkPolicy, askPolicy))
+	registry.Register(tool.WrapWithPermission(tool.NewSearchHistory(memStore, projectID), checkPolicy, askPolicy))
 
 	lspMgr := lsp.NewManager(c.ProjectRoot, c.Home)
 	a.lspManager = lspMgr
@@ -369,13 +346,14 @@ func New(c Config) (*Agent, error) {
 		SubModel:      subModel,
 		ToolsConfig:   c.Cfg.Tools,
 		HomeDir:       c.Home,
+		WorkspaceRoot: rt.workspaceRoot,
 		ProcMgr:       procMgr,
-		Check:         checkFunc,
-		Ask:           askFunc,
+		Check:         checkPolicy,
+		Ask:           askPolicy,
 	})
 	registry.Register(tt)
 	a.subagentLoader = loader
-	a.taggedEvents = taggedEvts
+	rt.taggedEvents = taggedEvts
 	a.taskToolInst = tt
 
 	a.registry = registry
@@ -391,7 +369,7 @@ func New(c Config) (*Agent, error) {
 	l.SetStore(store)
 	l.SetContextTransformer(a)
 	l.SetUsageRecorder(agentUsageRecorder{agent: a})
-	l.SetPendingExecutor(tool.NewStagedExecutor(store, fileTracker, c.Cfg.Tools, checkFunc, askActionFunc))
+	l.SetPendingExecutor(tool.NewStagedExecutorAtRoot(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askActionPolicy))
 	a.lp = l
 
 	return a, nil
@@ -400,16 +378,25 @@ func New(c Config) (*Agent, error) {
 // SetEventHandler sets the callback for agent events. Must be called
 // before Init.
 func (a *Agent) SetEventHandler(fn func(Event)) {
-	a.onEvent = fn
+	a.ensureRuntime().setEventHandler(fn)
+}
+
+func (rt *runtime) setEventHandler(fn func(Event)) {
+	rt.onEvent = fn
 }
 
 // Init starts background goroutines, runs the session sweep, and
 // resumes the most recent session if one exists. ctx controls the
 // agent's lifetime.
 func (a *Agent) Init(ctx context.Context) {
-	go a.drainLoopEvents(ctx)
-	go a.runSignalScheduler(ctx)
-	go a.runQueueDrainer(ctx)
+	a.ensureRuntime().init(ctx)
+}
+
+func (rt *runtime) init(ctx context.Context) {
+	a := rt.agent
+	go rt.drainLoopEvents(ctx)
+	go rt.runSignalScheduler(ctx)
+	go rt.runQueueDrainer(ctx)
 	if a.memoryHooks != nil {
 		_ = a.memoryHooks.Reconcile()
 	}
@@ -431,7 +418,7 @@ func (a *Agent) Init(ctx context.Context) {
 			a.addWarning("lsp", prompt.Warning{Kind: kind, Message: message})
 		})
 		a.lspManager.SetSignalHandler(func(content string) {
-			a.signalSink.AddSignal(loop.PendingSignal{Payload: content, Persist: true})
+			a.ensureRuntime().signalSink.AddSignal(loop.PendingSignal{Payload: content, Persist: true})
 		})
 		go a.lspManager.Detect(ctx)
 		go func() {
@@ -447,51 +434,60 @@ func (a *Agent) Init(ctx context.Context) {
 }
 
 func (a *Agent) emitEvent(ev Event) {
-	if a.onEvent != nil {
-		a.onEvent(ev)
+	a.ensureRuntime().emitEvent(ev)
+}
+
+func (rt *runtime) emitEvent(ev Event) {
+	if rt.onEvent != nil {
+		rt.onEvent(ev)
 	}
 }
 
 func (a *Agent) nudgeSignalScheduler() {
+	a.ensureRuntime().nudgeSignalScheduler()
+}
+
+func (rt *runtime) nudgeSignalScheduler() {
 	select {
-	case a.signalWake <- struct{}{}:
+	case rt.signalWake <- struct{}{}:
 	default:
 	}
 }
 
-func (a *Agent) runSignalScheduler(ctx context.Context) {
+func (rt *runtime) runSignalScheduler(ctx context.Context) {
 	for {
 		select {
-		case <-a.signalWake:
-			a.tryStartSignalTurn(ctx)
+		case <-rt.signalWake:
+			rt.tryStartSignalTurn(ctx)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (a *Agent) tryStartSignalTurn(ctx context.Context) {
-	if a.signalSink == nil || !a.signalSink.HasWakeSignal() {
+func (rt *runtime) tryStartSignalTurn(ctx context.Context) {
+	a := rt.agent
+	if rt.signalSink == nil || !rt.signalSink.HasWakeSignal() {
 		return
 	}
-	a.mu.Lock()
+	rt.mu.Lock()
 	// Queued user input takes priority over a bare signal turn, and a session
 	// change in flight must block it. The gate and the busy-claim share one
 	// lock hold so nothing can slip a signal turn in between (claimTurnLocked
-	// is called while still holding a.mu).
-	if a.busy || a.transitioning || len(a.queue) > 0 || a.store == nil || !a.store.Active() || !a.signalSink.HasWakeSignal() {
-		a.mu.Unlock()
+	// is called while still holding the runtime mutex).
+	if rt.busy || rt.transitioning || len(rt.queue) > 0 || a.store == nil || !a.store.Active() || !rt.signalSink.HasWakeSignal() {
+		rt.mu.Unlock()
 		return
 	}
-	turnCtx, cancel, err := a.claimTurnLocked(ctx)
-	a.mu.Unlock()
+	turnCtx, cancel, err := rt.claimTurnLocked(ctx)
+	rt.mu.Unlock()
 	if err != nil {
 		if !strings.Contains(err.Error(), "turn is already in progress") {
 			a.emitEvent(Event{Kind: EventError, Error: err.Error()})
 		}
 		return
 	}
-	a.launchTurn(ctx, turnCtx, cancel, nil)
+	rt.launchTurn(ctx, turnCtx, cancel, nil)
 }
 
 func (a *Agent) setWarningGroup(group string, warnings []prompt.Warning) {
@@ -608,20 +604,24 @@ func agentBackgroundProcessDisplay(bg *loop.BackgroundProcessDisplay) *Backgroun
 }
 
 func (a *Agent) drainLoopEvents(ctx context.Context) {
+	a.ensureRuntime().drainLoopEvents(ctx)
+}
+
+func (rt *runtime) drainLoopEvents(ctx context.Context) {
 	for {
 		select {
-		case ev, ok := <-a.loopEvents:
+		case ev, ok := <-rt.loopEvents:
 			if !ok {
 				return
 			}
-			a.dispatchLoopEvent(ev)
-		case tev, ok := <-a.taggedEvents:
+			rt.dispatchLoopEvent(ev)
+		case tev, ok := <-rt.taggedEvents:
 			if !ok {
 				continue
 			}
-			a.dispatchTaggedEvent(tev)
-		case done := <-a.loopFlush:
-			a.drainPendingLoopEvents()
+			rt.dispatchTaggedEvent(tev)
+		case done := <-rt.loopFlush:
+			rt.drainPendingLoopEvents()
 			close(done)
 		case <-ctx.Done():
 			return
@@ -630,10 +630,14 @@ func (a *Agent) drainLoopEvents(ctx context.Context) {
 }
 
 func (a *Agent) drainPendingLoopEvents() {
+	a.ensureRuntime().drainPendingLoopEvents()
+}
+
+func (rt *runtime) drainPendingLoopEvents() {
 	for {
 		select {
-		case ev := <-a.loopEvents:
-			a.dispatchLoopEvent(ev)
+		case ev := <-rt.loopEvents:
+			rt.dispatchLoopEvent(ev)
 		default:
 			return
 		}
@@ -641,6 +645,11 @@ func (a *Agent) drainPendingLoopEvents() {
 }
 
 func (a *Agent) dispatchLoopEvent(ev loop.Event) {
+	a.ensureRuntime().dispatchLoopEvent(ev)
+}
+
+func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
+	a := rt.agent
 	switch ev.Kind {
 	case loop.TextDelta:
 		a.emitEvent(Event{Kind: EventTextDelta, Result: ev.Result})
@@ -712,15 +721,20 @@ func (a *Agent) dispatchLoopEvent(ev loop.Event) {
 }
 
 func (a *Agent) dispatchTaggedEvent(tev TaggedLoopEvent) {
-	a.mu.Lock()
-	if a.seenSessions == nil {
-		a.seenSessions = make(map[string]bool)
+	a.ensureRuntime().dispatchTaggedEvent(tev)
+}
+
+func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
+	a := rt.agent
+	rt.mu.Lock()
+	if rt.seenSessions == nil {
+		rt.seenSessions = make(map[string]bool)
 	}
-	isNew := tev.SessionID != "" && !a.seenSessions[tev.SessionID]
+	isNew := tev.SessionID != "" && !rt.seenSessions[tev.SessionID]
 	if isNew {
-		a.seenSessions[tev.SessionID] = true
+		rt.seenSessions[tev.SessionID] = true
 	}
-	a.mu.Unlock()
+	rt.mu.Unlock()
 	if isNew {
 		a.emitEvent(Event{
 			Kind:              EventSubagentStart,
@@ -1089,34 +1103,39 @@ func (a *Agent) summarizerClientAndWindow() (*provider.Adapter, int) {
 
 // CompactNow triggers manual compaction. Must not be called while busy.
 func (a *Agent) CompactNow(ctx context.Context) error {
-	a.mu.Lock()
-	if a.busy {
-		a.mu.Unlock()
+	return a.ensureRuntime().compactNow(ctx)
+}
+
+func (rt *runtime) compactNow(ctx context.Context) error {
+	a := rt.agent
+	rt.mu.Lock()
+	if rt.busy {
+		rt.mu.Unlock()
 		return fmt.Errorf("cannot compact while a turn is running")
 	}
 	if !a.store.Active() {
-		a.mu.Unlock()
+		rt.mu.Unlock()
 		return fmt.Errorf("no session open")
 	}
-	a.busy = true
+	rt.busy = true
 	compactCtx, cancel := context.WithCancel(ctx)
-	a.turnCancel = cancel
-	a.turnCtx = compactCtx
-	a.mu.Unlock()
+	rt.turnCancel = cancel
+	rt.turnCtx = compactCtx
+	rt.mu.Unlock()
 
 	defer func() {
-		a.mu.Lock()
-		a.busy = false
-		a.turnCancel = nil
-		a.turnCtx = nil
-		a.mu.Unlock()
+		rt.mu.Lock()
+		rt.busy = false
+		rt.turnCancel = nil
+		rt.turnCtx = nil
+		rt.mu.Unlock()
 		cancel()
 		// Manual compaction uses the same busy gate as a turn. If input was
 		// queued while compaction was running, wake the backend drainer now that
 		// the gate is open again.
-		a.nudgeQueueDrainer()
-		if a.signalSink != nil && a.signalSink.HasWakeSignal() {
-			a.nudgeSignalScheduler()
+		rt.nudgeQueueDrainer()
+		if rt.signalSink != nil && rt.signalSink.HasWakeSignal() {
+			rt.nudgeSignalScheduler()
 		}
 	}()
 
@@ -1144,14 +1163,14 @@ func (a *Agent) resumeMostRecent() error {
 	}
 	a.populateFileTracker()
 	a.loadTokensFromDisk()
-	a.mu.Lock()
+	a.ensureRuntime().mu.Lock()
 	if err := a.reloadLocked(); err != nil {
-		a.mu.Unlock()
+		a.ensureRuntime().mu.Unlock()
 		fmt.Fprintf(os.Stderr, "lightcode: reload config on resume: %v\n", err)
 		a.restoreModelFromSession()
 		return nil
 	}
-	a.mu.Unlock()
+	a.ensureRuntime().mu.Unlock()
 	a.restoreModelFromSession()
 	return nil
 }
@@ -1337,30 +1356,35 @@ func (a *Agent) ensureSession() error {
 // than accepting input it would then discard. Any queue mutation emits a
 // versioned EventQueueChanged.
 func (a *Agent) Submit(ctx context.Context, content string) (SubmitResult, error) {
-	a.mu.Lock()
-	if a.transitioning {
-		a.mu.Unlock()
+	return a.ensureRuntime().submit(ctx, content)
+}
+
+func (rt *runtime) submit(ctx context.Context, content string) (SubmitResult, error) {
+	a := rt.agent
+	rt.mu.Lock()
+	if rt.transitioning {
+		rt.mu.Unlock()
 		return SubmitResult{}, fmt.Errorf("session is changing; retry")
 	}
-	if !a.busy && len(a.queue) == 0 {
-		turnCtx, cancel, err := a.claimTurnLocked(ctx)
+	if !rt.busy && len(rt.queue) == 0 {
+		turnCtx, cancel, err := rt.claimTurnLocked(ctx)
 		if err != nil {
-			a.mu.Unlock()
+			rt.mu.Unlock()
 			return SubmitResult{}, err
 		}
-		version := a.queueVersion
-		a.mu.Unlock()
-		turn := a.launchTurn(ctx, turnCtx, cancel, []string{content})
+		version := rt.queueVersion
+		rt.mu.Unlock()
+		turn := rt.launchTurn(ctx, turnCtx, cancel, []string{content})
 		return SubmitResult{Started: true, Turn: turn, Queue: emptyQueue(), Version: version}, nil
 	}
 	// Busy or queue non-empty: enqueue and let the drainer pick it up.
-	a.queueSeq++
-	a.queue = append(a.queue, QueuedItem{ID: fmt.Sprintf("q-%d", a.queueSeq), Content: content})
-	a.queueVersion++
-	items := copyQueue(a.queue)
-	version := a.queueVersion
-	a.mu.Unlock()
-	a.nudgeQueueDrainer()
+	rt.queueSeq++
+	rt.queue = append(rt.queue, QueuedItem{ID: fmt.Sprintf("q-%d", rt.queueSeq), Content: content})
+	rt.queueVersion++
+	items := copyQueue(rt.queue)
+	version := rt.queueVersion
+	rt.mu.Unlock()
+	rt.nudgeQueueDrainer()
 	a.emitEvent(Event{Kind: EventQueueChanged, Queue: items, QueueVersion: version})
 	return SubmitResult{Started: false, Queue: items, Version: version}, nil
 }
@@ -1368,9 +1392,13 @@ func (a *Agent) Submit(ctx context.Context, content string) (SubmitResult, error
 // QueueSnapshot returns a versioned copy of the current queue, for adapter
 // hydration (subscribe-then-GET: register the queue_changed handler first).
 func (a *Agent) QueueSnapshot() QueueState {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return QueueState{Items: copyQueue(a.queue), Version: a.queueVersion}
+	return a.ensureRuntime().queueSnapshot()
+}
+
+func (rt *runtime) queueSnapshot() QueueState {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return QueueState{Items: copyQueue(rt.queue), Version: rt.queueVersion}
 }
 
 // AppendUserMessage persists a user message as its own complete turn WITHOUT
@@ -1379,9 +1407,14 @@ func (a *Agent) QueueSnapshot() QueueState {
 // It still routes through the loop's emit chokepoint, so it is display-ordered.
 // Not exposed in the Wails layer.
 func (a *Agent) AppendUserMessage(content string) (int, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.busy {
+	return a.ensureRuntime().appendUserMessage(content)
+}
+
+func (rt *runtime) appendUserMessage(content string) (int, error) {
+	a := rt.agent
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.busy {
 		return 0, fmt.Errorf("a turn is already in progress")
 	}
 	if err := a.ensureSession(); err != nil {
@@ -1394,31 +1427,36 @@ func (a *Agent) AppendUserMessage(content string) (int, error) {
 }
 
 // claimTurnLocked checks the busy gate and claims a turn (sets busy, builds the
-// per-turn context). Caller must hold a.mu. Returns a non-nil error if a turn
+// per-turn context). Caller must hold the runtime mutex. Returns a non-nil error if a turn
 // is already in progress or ensureSession fails; on error it leaves busy
 // unchanged (never half-claims). launchTurn must be called AFTER unlocking.
-func (a *Agent) claimTurnLocked(ctx context.Context) (context.Context, context.CancelFunc, error) {
+func (rt *runtime) claimTurnLocked(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	a := rt.agent
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	if a.busy {
+	if rt.busy {
 		return nil, nil, fmt.Errorf("a turn is already in progress")
 	}
 	if err := a.ensureSession(); err != nil {
 		return nil, nil, err
 	}
-	a.busy = true
-	a.seenSessions = nil
+	rt.busy = true
+	rt.seenSessions = nil
 	turnCtx, cancel := context.WithCancel(ctx)
-	a.turnCancel = cancel
-	a.turnCtx = turnCtx
+	rt.turnCancel = cancel
+	rt.turnCtx = turnCtx
 	return turnCtx, cancel, nil
 }
 
 // nudgeQueueDrainer wakes the drain goroutine (non-blocking; coalesced).
 func (a *Agent) nudgeQueueDrainer() {
+	a.ensureRuntime().nudgeQueueDrainer()
+}
+
+func (rt *runtime) nudgeQueueDrainer() {
 	select {
-	case a.queueWake <- struct{}{}:
+	case rt.queueWake <- struct{}{}:
 	default:
 	}
 }
@@ -1435,16 +1473,16 @@ func copyQueue(items []QueuedItem) []QueuedItem {
 }
 
 // clearQueueLocked empties the queue and resets per-session item IDs, bumping
-// the monotonic version when the queue was non-empty. Caller holds a.mu.
+// the monotonic version when the queue was non-empty. Caller holds the runtime mutex.
 // Returns the empty snapshot, its version, and whether the queue changed.
-func (a *Agent) clearQueueLocked() ([]QueuedItem, int, bool) {
-	a.queueSeq = 0
-	if len(a.queue) == 0 {
-		return emptyQueue(), a.queueVersion, false
+func (rt *runtime) clearQueueLocked() ([]QueuedItem, int, bool) {
+	rt.queueSeq = 0
+	if len(rt.queue) == 0 {
+		return emptyQueue(), rt.queueVersion, false
 	}
-	a.queue = nil
-	a.queueVersion++
-	return emptyQueue(), a.queueVersion, true
+	rt.queue = nil
+	rt.queueVersion++
+	return emptyQueue(), rt.queueVersion, true
 }
 
 // beginTransition marks a cancel-and-wait session change in flight. While set,
@@ -1452,10 +1490,10 @@ func (a *Agent) clearQueueLocked() ([]QueuedItem, int, bool) {
 // queued input can launch against the session being swapped. Must be paired
 // with a deferred endTransition registered BEFORE cancelAndWaitIdle so it fires
 // even on the pre-lock error return.
-func (a *Agent) beginTransition() {
-	a.mu.Lock()
-	a.transitioning = true
-	a.mu.Unlock()
+func (rt *runtime) beginTransition() {
+	rt.mu.Lock()
+	rt.transitioning = true
+	rt.mu.Unlock()
 }
 
 // endTransition clears the transitioning flag and emits the current queue
@@ -1464,23 +1502,24 @@ func (a *Agent) beginTransition() {
 // survived (a no-op or failed transition) and a session is active, it re-nudges
 // the drainer — a nudge token may have been consumed while transitioning
 // blocked the drain, which would otherwise strand the intact queue.
-func (a *Agent) endTransition() {
-	a.mu.Lock()
-	a.transitioning = false
-	items := copyQueue(a.queue)
-	version := a.queueVersion
+func (rt *runtime) endTransition() {
+	a := rt.agent
+	rt.mu.Lock()
+	rt.transitioning = false
+	items := copyQueue(rt.queue)
+	version := rt.queueVersion
 	active := a.store != nil && a.store.Active()
-	a.mu.Unlock()
+	rt.mu.Unlock()
 	a.emitEvent(Event{Kind: EventQueueChanged, Queue: items, QueueVersion: version})
 	if len(items) > 0 && active {
-		a.nudgeQueueDrainer()
+		rt.nudgeQueueDrainer()
 	}
 }
 
 // runQueueDrainer drains the backend queue after a turn ends. It is woken by
 // nudgeQueueDrainer (every Submit-append and every turn-end) and ctx is the
 // agent lifetime context from Init.
-func (a *Agent) runQueueDrainer(ctx context.Context) {
+func (rt *runtime) runQueueDrainer(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -1488,11 +1527,11 @@ func (a *Agent) runQueueDrainer(ctx context.Context) {
 		default:
 		}
 		select {
-		case <-a.queueWake:
+		case <-rt.queueWake:
 			if ctx.Err() != nil {
 				return
 			}
-			a.tryDrainQueue(ctx)
+			rt.tryDrainQueue(ctx)
 		case <-ctx.Done():
 			return
 		}
@@ -1504,25 +1543,26 @@ func (a *Agent) runQueueDrainer(ctx context.Context) {
 // become user-only turns; the last starts the model turn. The gate + busy-claim
 // share one lock hold so it can never double-start or launch against a session
 // being swapped.
-func (a *Agent) tryDrainQueue(ctx context.Context) {
+func (rt *runtime) tryDrainQueue(ctx context.Context) {
+	a := rt.agent
 	if ctx.Err() != nil {
 		return
 	}
-	a.mu.Lock()
-	if ctx.Err() != nil || a.busy || a.transitioning || a.store == nil || !a.store.Active() || len(a.queue) == 0 {
-		a.mu.Unlock()
+	rt.mu.Lock()
+	if ctx.Err() != nil || rt.busy || rt.transitioning || a.store == nil || !a.store.Active() || len(rt.queue) == 0 {
+		rt.mu.Unlock()
 		return
 	}
-	contents := make([]string, len(a.queue))
-	for i, it := range a.queue {
+	contents := make([]string, len(rt.queue))
+	for i, it := range rt.queue {
 		contents[i] = it.Content
 	}
-	a.queue = nil
-	a.queueVersion++
-	version := a.queueVersion
+	rt.queue = nil
+	rt.queueVersion++
+	version := rt.queueVersion
 	for _, content := range contents[:len(contents)-1] {
 		if ctx.Err() != nil {
-			a.mu.Unlock()
+			rt.mu.Unlock()
 			return
 		}
 		turn := a.store.BeginTurn()
@@ -1530,21 +1570,22 @@ func (a *Agent) tryDrainQueue(ctx context.Context) {
 		_ = a.store.MarkTurnComplete(turn)
 	}
 	if ctx.Err() != nil {
-		a.mu.Unlock()
+		rt.mu.Unlock()
 		return
 	}
-	a.busy = true
-	a.seenSessions = nil
+	rt.busy = true
+	rt.seenSessions = nil
 	turnCtx, cancel := context.WithCancel(ctx)
-	a.turnCancel = cancel
-	a.turnCtx = turnCtx
-	a.mu.Unlock()
+	rt.turnCancel = cancel
+	rt.turnCtx = turnCtx
+	rt.mu.Unlock()
 
 	a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: version})
-	a.launchTurn(ctx, turnCtx, cancel, []string{contents[len(contents)-1]})
+	rt.launchTurn(ctx, turnCtx, cancel, []string{contents[len(contents)-1]})
 }
 
-func (a *Agent) launchTurn(ctx context.Context, turnCtx context.Context, cancel context.CancelFunc, contents []string) int {
+func (rt *runtime) launchTurn(ctx context.Context, turnCtx context.Context, cancel context.CancelFunc, contents []string) int {
+	a := rt.agent
 	turn := a.store.BeginTurn()
 
 	a.emitEvent(Event{Kind: EventTurnStart, Turn: turn})
@@ -1555,20 +1596,20 @@ func (a *Agent) launchTurn(ctx context.Context, turnCtx context.Context, cancel 
 
 	go func() {
 		defer func() {
-			a.mu.Lock()
-			a.busy = false
-			a.turnCancel = nil
-			a.turnCtx = nil
-			a.mu.Unlock()
+			rt.mu.Lock()
+			rt.busy = false
+			rt.turnCancel = nil
+			rt.turnCtx = nil
+			rt.mu.Unlock()
 			cancel()
 			// Unconditionally nudge the queue drainer after every turn end: it
 			// no-ops on an empty queue, and the unconditional nudge is the
 			// reliable retry that defeats cap-1 channel coalescing for items
 			// queued mid-turn. The signal scheduler still defers to a non-empty
 			// queue (see tryStartSignalTurn).
-			a.nudgeQueueDrainer()
-			if a.signalSink != nil && a.signalSink.HasWakeSignal() {
-				a.nudgeSignalScheduler()
+			rt.nudgeQueueDrainer()
+			if rt.signalSink != nil && rt.signalSink.HasWakeSignal() {
+				rt.nudgeSignalScheduler()
 			}
 		}()
 
@@ -1588,7 +1629,7 @@ func (a *Agent) launchTurn(ctx context.Context, turnCtx context.Context, cancel 
 
 		done := make(chan struct{})
 		select {
-		case a.loopFlush <- done:
+		case rt.loopFlush <- done:
 			select {
 			case <-done:
 			case <-ctx.Done():
@@ -1607,9 +1648,7 @@ func (a *Agent) launchTurn(ctx context.Context, turnCtx context.Context, cancel 
 
 // Cancel aborts the current turn.
 func (a *Agent) Cancel() error {
-	a.mu.Lock()
-	cancel := a.turnCancel
-	a.mu.Unlock()
+	cancel := a.ensureRuntime().turnCancelSnapshot()
 	if cancel != nil {
 		cancel()
 	}
@@ -1621,9 +1660,19 @@ func (a *Agent) Cancel() error {
 
 // Busy reports whether a turn is in progress.
 func (a *Agent) Busy() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.busy
+	return a.ensureRuntime().busySnapshot()
+}
+
+func (rt *runtime) turnCancelSnapshot() context.CancelFunc {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.turnCancel
+}
+
+func (rt *runtime) busySnapshot() bool {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.busy
 }
 
 // RespondPermission answers a pending permission prompt.
@@ -1663,9 +1712,9 @@ func (a *Agent) SaveProjectPermission(id string, patterns []string) error {
 
 // SwitchModel changes the active model by provider-prefixed catalog ref.
 func (a *Agent) SwitchModel(refStr string) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.busy {
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	if a.ensureRuntime().busy {
 		return fmt.Errorf("cannot switch model while a turn is running")
 	}
 	ref, err := coremodel.Parse(refStr)
@@ -1679,7 +1728,7 @@ func (a *Agent) SwitchModel(refStr string) error {
 	a.lp.SetClient(provider.NewAdapter(client))
 	a.currentRef = ref
 	a.contextWindowSize = model.ContextWindow
-	a.signalSink.AddSignal(loop.PendingSignal{Payload: fmt.Sprintf("Model switched to %s", ref.String()), Persist: true})
+	a.ensureRuntime().signalSink.AddSignal(loop.PendingSignal{Payload: fmt.Sprintf("Model switched to %s", ref.String()), Persist: true})
 	if a.store.Active() {
 		if err := a.store.SetModel(ref.Provider, ref.Model); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)
@@ -1690,9 +1739,9 @@ func (a *Agent) SwitchModel(refStr string) error {
 
 // Reload reloads config and catalog state for future turns.
 func (a *Agent) Reload() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.busy {
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	if a.ensureRuntime().busy {
 		return fmt.Errorf("cannot reload while a turn is running")
 	}
 	return a.reloadLocked()
@@ -1743,9 +1792,9 @@ func (a *Agent) CompleteModelEntry(refStr string, completion ModelCompletion) er
 	if err != nil {
 		return err
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.busy {
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	if a.ensureRuntime().busy {
 		return fmt.Errorf("cannot complete model entry while a turn is running")
 	}
 	if err := a.mutateModelConfig(ref, func(modelMap map[string]any) error {
@@ -1803,7 +1852,7 @@ func writeAgentConfigAtomic(path string, value any) error {
 
 // mutateProviderConfig reads the agent config, navigates to the specified
 // provider map, calls mutate, and writes the config atomically.
-// Caller must hold a.mu.
+// Caller must hold the runtime mutex.
 func (a *Agent) mutateProviderConfig(providerID string, mutate func(providerMap map[string]any) error) error {
 	path := agentConfigPath(a.home)
 	data, err := os.ReadFile(path)
@@ -1836,7 +1885,7 @@ func (a *Agent) mutateProviderConfig(providerID string, mutate func(providerMap 
 
 // mutateModelConfig reads the agent config, navigates to the specified
 // model map, calls mutate, and writes the config atomically.
-// Caller must hold a.mu.
+// Caller must hold the runtime mutex.
 func (a *Agent) mutateModelConfig(ref coremodel.ModelRef, mutate func(modelMap map[string]any) error) error {
 	return a.mutateProviderConfig(ref.Provider, func(providerMap map[string]any) error {
 		modelsRaw, ok := providerMap["models"]
@@ -1863,9 +1912,9 @@ func (a *Agent) mutateModelConfig(ref coremodel.ModelRef, mutate func(modelMap m
 
 // RefreshDiscovery refreshes live model discovery for one enabled provider.
 func (a *Agent) RefreshDiscovery(provider string) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.busy {
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	if a.ensureRuntime().busy {
 		return fmt.Errorf("cannot refresh discovery while a turn is running")
 	}
 	return a.refreshDiscoveryLocked(provider)
@@ -1882,13 +1931,13 @@ func (a *Agent) refreshDiscoveryLocked(provider string) error {
 
 // CurrentModel returns the active model identity and catalog metadata.
 func (a *Agent) CurrentModel() ModelInfo {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
 	return a.modelInfo(a.currentRef)
 }
 
 // modelListFrom builds enriched model list entries from the given refs.
-// Caller must hold a.mu.
+// Caller must hold the runtime mutex.
 func (a *Agent) modelListFrom(refs []catalog.ModelRef) []ModelListEntry {
 	result := make([]ModelListEntry, 0, len(refs))
 	for _, ref := range refs {
@@ -1923,14 +1972,14 @@ func (a *Agent) modelListFrom(refs []catalog.ModelRef) []ModelListEntry {
 
 // ModelList returns all visible catalog models as flat enriched entries.
 func (a *Agent) ModelList() []ModelListEntry {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
 	return a.modelListFrom(a.catalog.VisibleModels())
 }
 
 func (a *Agent) AllModelList() []ModelListEntry {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
 	return a.modelListFrom(a.catalog.AllModels())
 }
 
@@ -1939,9 +1988,9 @@ func (a *Agent) SetModelHidden(refStr string, hidden bool) error {
 	if err != nil {
 		return err
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.busy {
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	if a.ensureRuntime().busy {
 		return fmt.Errorf("cannot change model visibility while a turn is running")
 	}
 	if err := a.mutateModelConfig(ref, func(modelMap map[string]any) error {
@@ -1959,9 +2008,9 @@ func (a *Agent) SetModelHidden(refStr string, hidden bool) error {
 }
 
 func (a *Agent) SetProviderHidden(providerID string, hidden bool) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.busy {
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	if a.ensureRuntime().busy {
 		return fmt.Errorf("cannot change provider visibility while a turn is running")
 	}
 	if err := a.mutateProviderConfig(providerID, func(providerMap map[string]any) error {
@@ -2028,16 +2077,16 @@ func (a *Agent) SessionList(state string) ([]SessionSummary, error) {
 }
 
 func (a *Agent) cancelAndWaitIdle() error {
-	a.mu.Lock()
-	cancel := a.turnCancel
-	a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	cancel := a.ensureRuntime().turnCancel
+	a.ensureRuntime().mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	for i := 0; i < 200; i++ {
-		a.mu.Lock()
-		busy := a.busy
-		a.mu.Unlock()
+		a.ensureRuntime().mu.Lock()
+		busy := a.ensureRuntime().busy
+		a.ensureRuntime().mu.Unlock()
 		if !busy {
 			return nil
 		}
@@ -2050,20 +2099,20 @@ func (a *Agent) cancelAndWaitIdle() error {
 // clears queued input under the backend transition guard before adapters relaunch
 // the process in another project.
 func (a *Agent) CloseForProjectSwitch() error {
-	a.beginTransition()
-	defer a.endTransition()
+	a.ensureRuntime().beginTransition()
+	defer a.ensureRuntime().endTransition()
 	if err := a.cancelAndWaitIdle(); err != nil {
 		return err
 	}
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
 	if a.store.Active() {
 		if _, err := a.store.Close(); err != nil {
 			return err
 		}
 	}
-	a.clearQueueLocked()
+	a.ensureRuntime().clearQueueLocked()
 	return nil
 }
 
@@ -2072,13 +2121,13 @@ func (a *Agent) SessionSwitch(id string) error {
 	// Mark the transition and register the clear BEFORE cancelAndWaitIdle so it
 	// fires on every return — including the pre-lock error return below — and
 	// never leaves transitioning stuck true.
-	a.beginTransition()
-	defer a.endTransition()
+	a.ensureRuntime().beginTransition()
+	defer a.ensureRuntime().endTransition()
 	if err := a.cancelAndWaitIdle(); err != nil {
 		return err
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
 
 	if a.store.Active() && a.store.SessionID() == id {
 		return nil // same-session no-op: queue is preserved
@@ -2089,7 +2138,7 @@ func (a *Agent) SessionSwitch(id string) error {
 	// The old session is now irreversibly detached: clear the queue here, not
 	// after LoadSession — a LoadSession failure must not leave the queue bound
 	// to a closed (inactive) session, which endTransition could not drain.
-	a.clearQueueLocked()
+	a.ensureRuntime().clearQueueLocked()
 	if err := a.store.LoadSession(id); err != nil {
 		return err
 	}
@@ -2117,7 +2166,7 @@ func (a *Agent) SessionSwitch(id string) error {
 }
 
 // resetCurrentSessionStateLocked resets loop history, file tracker, tokens,
-// and LSP diagnostics. Caller must hold a.mu.
+// and LSP diagnostics. Caller must hold the runtime mutex.
 func (a *Agent) resetCurrentSessionStateLocked() {
 	a.lp.ResetHistory()
 	if a.fileTracker != nil {
@@ -2131,10 +2180,10 @@ func (a *Agent) resetCurrentSessionStateLocked() {
 	}
 }
 
-// resetCurrentSessionState acquires a.mu and resets session state.
+// resetCurrentSessionState acquires the runtime mutex and resets session state.
 func (a *Agent) resetCurrentSessionState() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
 	a.resetCurrentSessionStateLocked()
 }
 
@@ -2148,17 +2197,17 @@ func (a *Agent) SessionNew() error {
 			a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: clearedVersion})
 		}
 	}()
-	a.mu.Lock()
-	if a.busy {
-		a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	if a.ensureRuntime().busy {
+		a.ensureRuntime().mu.Unlock()
 		return fmt.Errorf("cannot start new session while a turn is running")
 	}
-	defer a.mu.Unlock()
+	defer a.ensureRuntime().mu.Unlock()
 
 	if _, err := a.store.Close(); err != nil {
 		return err
 	}
-	_, clearedVersion, queueCleared = a.clearQueueLocked()
+	_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLocked()
 	a.resetCurrentSessionStateLocked()
 	return nil
 }
@@ -2231,19 +2280,19 @@ func (a *Agent) closeIfCurrent(id string) (bool, error) {
 	}
 	// Transition begins only once we've decided to actually close the current
 	// session; clear registered before cancelAndWaitIdle covers its error path.
-	a.beginTransition()
-	defer a.endTransition()
+	a.ensureRuntime().beginTransition()
+	defer a.ensureRuntime().endTransition()
 	if err := a.cancelAndWaitIdle(); err != nil {
 		return false, err
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
 	if _, err := a.store.Close(); err != nil {
 		return false, err
 	}
 	// Close (no LoadSession follows for archive/delete) is the irreversible
 	// change: clear the queue now.
-	a.clearQueueLocked()
+	a.ensureRuntime().clearQueueLocked()
 	return true, nil
 }
 
@@ -2480,9 +2529,9 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 			a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: clearedVersion})
 		}
 	}()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.busy {
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	if a.ensureRuntime().busy {
 		return TurnActionResult{}, fmt.Errorf("cannot %s while a turn is running", turnActionVerb(action))
 	}
 	if !a.store.Active() {
@@ -2519,7 +2568,7 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 			return TurnActionResult{}, err
 		}
 		// History irreversibly truncated: the queued input no longer applies.
-		_, clearedVersion, queueCleared = a.clearQueueLocked()
+		_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLocked()
 		if err := a.loadHistoryIntoLoop(); err != nil {
 			return TurnActionResult{}, err
 		}
@@ -2544,7 +2593,7 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 		}
 		// Old session irreversibly detached by the fork's Close: clear here,
 		// before LoadSession (which may fail and leave no active session).
-		_, clearedVersion, queueCleared = a.clearQueueLocked()
+		_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLocked()
 		if err := a.store.LoadSession(newID); err != nil {
 			return TurnActionResult{}, err
 		}
@@ -2594,9 +2643,9 @@ func (a *Agent) userMessageContentForTurn(turn int) string {
 // next edit until read_file observes the current disk state. Symmetric
 // with RevertHistory.
 func (a *Agent) RevertCode(turn int) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.busy {
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	if a.ensureRuntime().busy {
 		return fmt.Errorf("cannot revert while a turn is running")
 	}
 	if !a.store.Active() {
@@ -2618,9 +2667,9 @@ func (a *Agent) RevertHistory(turn int) error {
 			a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: clearedVersion})
 		}
 	}()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.busy {
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	if a.ensureRuntime().busy {
 		return fmt.Errorf("cannot revert while a turn is running")
 	}
 	if !a.store.Active() {
@@ -2629,7 +2678,7 @@ func (a *Agent) RevertHistory(turn int) error {
 	if err := a.store.RevertHistory(turn); err != nil {
 		return err
 	}
-	_, clearedVersion, queueCleared = a.clearQueueLocked()
+	_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLocked()
 	if err := a.loadHistoryIntoLoop(); err != nil {
 		return err
 	}
@@ -2646,9 +2695,9 @@ func (a *Agent) ForkSession(turn int) error {
 			a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: clearedVersion})
 		}
 	}()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.busy {
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	if a.ensureRuntime().busy {
 		return fmt.Errorf("cannot fork while a turn is running")
 	}
 	if !a.store.Active() {
@@ -2661,7 +2710,7 @@ func (a *Agent) ForkSession(turn int) error {
 	if _, err := a.store.Close(); err != nil {
 		return err
 	}
-	_, clearedVersion, queueCleared = a.clearQueueLocked()
+	_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLocked()
 	if err := a.store.LoadSession(newID); err != nil {
 		return err
 	}

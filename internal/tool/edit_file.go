@@ -16,13 +16,18 @@ import (
 // EditFile implements the edit_file tool with mtime enforcement,
 // O(1) results with line ranges, and pending support.
 type EditFile struct {
-	tracker *FileTracker
-	cfg     config.ToolsConfig
+	tracker       *FileTracker
+	cfg           config.ToolsConfig
+	workspaceRoot string
 }
 
 // NewEditFile creates an EditFile tool.
 func NewEditFile(tracker *FileTracker, cfg config.ToolsConfig) *EditFile {
 	return &EditFile{tracker: tracker, cfg: cfg}
+}
+
+func NewEditFileAtRoot(tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) *EditFile {
+	return &EditFile{tracker: tracker, cfg: cfg, workspaceRoot: workspaceRoot}
 }
 
 func (e *EditFile) Name() string { return "edit_file" }
@@ -90,14 +95,19 @@ func (e *EditFile) DisplayMetadata(_ context.Context, args json.RawMessage, resu
 // EditFileWithSnapshot wraps EditFile so the pre-edit file content is
 // captured by the snapshot store before the edit is applied.
 type EditFileWithSnapshot struct {
-	store   SnapshotStore
-	tracker *FileTracker
-	cfg     config.ToolsConfig
+	store         SnapshotStore
+	tracker       *FileTracker
+	cfg           config.ToolsConfig
+	workspaceRoot string
 }
 
 // NewEditFileWithSnapshot returns a snapshot-aware edit_file tool.
 func NewEditFileWithSnapshot(store SnapshotStore, tracker *FileTracker, cfg config.ToolsConfig) *EditFileWithSnapshot {
 	return &EditFileWithSnapshot{store: store, tracker: tracker, cfg: cfg}
+}
+
+func NewEditFileWithSnapshotAtRoot(store SnapshotStore, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) *EditFileWithSnapshot {
+	return &EditFileWithSnapshot{store: store, tracker: tracker, cfg: cfg, workspaceRoot: workspaceRoot}
 }
 
 func (*EditFileWithSnapshot) Name() string        { return "edit_file" }
@@ -121,12 +131,12 @@ func (e *EditFileWithSnapshot) Execute(_ context.Context, params map[string]any)
 	if path == "" {
 		return "", fmt.Errorf("edit_file: path is required")
 	}
-	displayAbsPath, err := fileDisplayAbsPath(path)
+	displayAbsPath, err := fileDisplayAbsPathAtRoot(e.workspaceRoot, path)
 	if err != nil {
 		return "", fmt.Errorf("edit_file: resolve path: %w", err)
 	}
 	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
-	securityPath, err := fileSecurityPath(params, path)
+	securityPath, err := fileSecurityPathAtRoot(e.workspaceRoot, params, path)
 	if err != nil {
 		return "", fmt.Errorf("edit_file: resolve path: %w", err)
 	}
@@ -139,7 +149,7 @@ func (e *EditFileWithSnapshot) Execute(_ context.Context, params map[string]any)
 	if err != nil {
 		return "", fmt.Errorf("edit_file: snapshot: %w", err)
 	}
-	res, mutationStarted, err := editFileExecCommonForSnapshot(params, e.tracker, e.cfg)
+	res, mutationStarted, err := editFileExecCommonForSnapshot(params, e.tracker, e.cfg, e.workspaceRoot)
 	if err != nil {
 		if !mutationStarted {
 			if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
@@ -182,7 +192,7 @@ func editMetadataFromArgs(args json.RawMessage, result string) map[string]any {
 }
 
 func (e *EditFile) editFileExec(params map[string]any) (string, error) {
-	res, err := editFileExecCommon(params, e.tracker, e.cfg)
+	res, err := editFileExecCommon(params, e.tracker, e.cfg, e.workspaceRoot)
 	if err != nil {
 		return "", err
 	}
@@ -216,12 +226,12 @@ func preflightEditSnapshotTarget(absPath string, tracker *FileTracker) error {
 }
 
 // editFileExecCommon is the shared implementation.
-func editFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig) (*editResult, error) {
-	res, _, err := editFileExecCommonForSnapshot(params, tracker, cfg)
+func editFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) (*editResult, error) {
+	res, _, err := editFileExecCommonForSnapshot(params, tracker, cfg, workspaceRoot)
 	return res, err
 }
 
-func editFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig) (*editResult, bool, error) {
+func editFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) (*editResult, bool, error) {
 	path, _ := params["path"].(string)
 	if path == "" {
 		return nil, false, fmt.Errorf("edit_file: path is required")
@@ -238,7 +248,7 @@ func editFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker, 
 	}
 
 	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
-	absPath, err := fileSecurityPath(params, path)
+	absPath, err := fileSecurityPathAtRoot(workspaceRoot, params, path)
 	if err != nil {
 		return nil, false, fmt.Errorf("edit_file: resolve path: %w", err)
 	}

@@ -196,11 +196,11 @@ func TestQueuedInputWinsOverPendingWakeSignal(t *testing.T) {
 	}
 
 	a.lp.AddPendingSignal(loop.PendingSignal{Payload: "wake signal", Persist: true, Wake: true})
-	a.mu.Lock()
-	a.queue = []QueuedItem{{ID: "q-1", Content: "queued user"}}
-	a.queueSeq = 1
-	a.queueVersion = 1
-	a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	a.ensureRuntime().queue = []QueuedItem{{ID: "q-1", Content: "queued user"}}
+	a.ensureRuntime().queueSeq = 1
+	a.ensureRuntime().queueVersion = 1
+	a.ensureRuntime().mu.Unlock()
 
 	a.nudgeSignalScheduler()
 	a.nudgeQueueDrainer()
@@ -236,9 +236,9 @@ func TestSubmitRejectsDuringTransition(t *testing.T) {
 	cap := &eventCapture{}
 	_ = startEventOrderAgent(t, a, cap)
 
-	a.mu.Lock()
-	a.transitioning = true
-	a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	a.ensureRuntime().transitioning = true
+	a.ensureRuntime().mu.Unlock()
 
 	_, err := a.Submit(context.Background(), "during switch")
 	if err == nil {
@@ -249,9 +249,9 @@ func TestSubmitRejectsDuringTransition(t *testing.T) {
 	}
 
 	// Clearing transitioning lets submits proceed again.
-	a.mu.Lock()
-	a.transitioning = false
-	a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	a.ensureRuntime().transitioning = false
+	a.ensureRuntime().mu.Unlock()
 }
 
 func TestTryDrainQueueCanceledContextDoesNotPersistQueuedDraft(t *testing.T) {
@@ -259,14 +259,14 @@ func TestTryDrainQueueCanceledContextDoesNotPersistQueuedDraft(t *testing.T) {
 	if err := a.ensureSession(); err != nil {
 		t.Fatalf("ensureSession: %v", err)
 	}
-	a.mu.Lock()
-	a.queue = []QueuedItem{{ID: "q-1", Content: "queued draft"}}
-	a.queueVersion = 1
-	a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	a.ensureRuntime().queue = []QueuedItem{{ID: "q-1", Content: "queued draft"}}
+	a.ensureRuntime().queueVersion = 1
+	a.ensureRuntime().mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	a.tryDrainQueue(ctx)
+	a.ensureRuntime().tryDrainQueue(ctx)
 
 	if got := a.QueueSnapshot(); len(got.Items) != 1 || got.Items[0].Content != "queued draft" {
 		t.Fatalf("canceled drain must leave volatile queue untouched; got %#v", got.Items)
@@ -283,11 +283,11 @@ func TestCloseForProjectSwitchClearsQueueUnderTransition(t *testing.T) {
 	if err := a.ensureSession(); err != nil {
 		t.Fatalf("ensureSession: %v", err)
 	}
-	a.mu.Lock()
-	a.queue = []QueuedItem{{ID: "q-1", Content: "stale"}}
-	a.queueSeq = 1
-	a.queueVersion = 4
-	a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	a.ensureRuntime().queue = []QueuedItem{{ID: "q-1", Content: "stale"}}
+	a.ensureRuntime().queueSeq = 1
+	a.ensureRuntime().queueVersion = 4
+	a.ensureRuntime().mu.Unlock()
 
 	if err := a.CloseForProjectSwitch(); err != nil {
 		t.Fatalf("CloseForProjectSwitch: %v", err)
@@ -325,11 +325,11 @@ func TestSessionNewClearsQueueAndBumpsVersionMonotonically(t *testing.T) {
 	}
 
 	// White-box: seed a non-empty queue at a known version.
-	a.mu.Lock()
-	a.queue = []QueuedItem{{ID: "q-1", Content: "stale"}}
-	a.queueSeq = 1
-	a.queueVersion = 7
-	a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	a.ensureRuntime().queue = []QueuedItem{{ID: "q-1", Content: "stale"}}
+	a.ensureRuntime().queueSeq = 1
+	a.ensureRuntime().queueVersion = 7
+	a.ensureRuntime().mu.Unlock()
 
 	if err := a.SessionNew(); err != nil {
 		t.Fatalf("SessionNew: %v", err)
@@ -833,10 +833,10 @@ func TestActiveTailReadRecordsKeepsOnlyNewestMatchingRead(t *testing.T) {
 
 func TestQueueSnapshotReturnsCopy(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
-	a.mu.Lock()
-	a.queue = []QueuedItem{{ID: "q-1", Content: "a"}}
-	a.queueVersion = 3
-	a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	a.ensureRuntime().queue = []QueuedItem{{ID: "q-1", Content: "a"}}
+	a.ensureRuntime().queueVersion = 3
+	a.ensureRuntime().mu.Unlock()
 
 	snap := a.QueueSnapshot()
 	if len(snap.Items) != 1 || snap.Version != 3 {
@@ -923,11 +923,11 @@ func contains(ss []string, want string) bool {
 
 func seedQueue(t *testing.T, a *Agent, version int, content string) {
 	t.Helper()
-	a.mu.Lock()
-	a.queue = []QueuedItem{{ID: "q-1", Content: content}}
-	a.queueSeq = 1
-	a.queueVersion = version
-	a.mu.Unlock()
+	a.ensureRuntime().mu.Lock()
+	a.ensureRuntime().queue = []QueuedItem{{ID: "q-1", Content: content}}
+	a.ensureRuntime().queueSeq = 1
+	a.ensureRuntime().queueVersion = version
+	a.ensureRuntime().mu.Unlock()
 }
 
 func assertQueueClearedAfterVersion(t *testing.T, a *Agent, cap *eventCapture, previousVersion int) {

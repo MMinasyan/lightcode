@@ -19,21 +19,27 @@ type AskActionFunc func(ctx context.Context, req permission.Request) permission.
 // StagedExecutor executes pending edit/write calls as a batch while
 // preserving the normal permission, snapshot, and read-before-edit rules.
 type StagedExecutor struct {
-	store   SnapshotStore
-	tracker *FileTracker
-	cfg     config.ToolsConfig
-	check   CheckFunc
-	ask     AskActionFunc
+	store         SnapshotStore
+	tracker       *FileTracker
+	cfg           config.ToolsConfig
+	check         CheckFunc
+	ask           AskActionFunc
+	workspaceRoot string
 }
 
 // NewStagedExecutor creates a staged batch executor.
 func NewStagedExecutor(store SnapshotStore, tracker *FileTracker, cfg config.ToolsConfig, check CheckFunc, ask AskActionFunc) *StagedExecutor {
+	return NewStagedExecutorAtRoot(store, tracker, cfg, "", check, ask)
+}
+
+func NewStagedExecutorAtRoot(store SnapshotStore, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string, check CheckFunc, ask AskActionFunc) *StagedExecutor {
 	return &StagedExecutor{
-		store:   store,
-		tracker: tracker,
-		cfg:     cfg,
-		check:   check,
-		ask:     ask,
+		store:         store,
+		tracker:       tracker,
+		cfg:           cfg,
+		check:         check,
+		ask:           ask,
+		workspaceRoot: workspaceRoot,
 	}
 }
 
@@ -44,7 +50,7 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 	allowed := make([]bool, len(staged))
 	resolvedStaged := make([]StagedCall, len(staged))
 	allowAll := false
-	batchFiles := stagedBatchFiles(staged)
+	batchFiles := stagedBatchFilesAtRoot(e.workspaceRoot, staged)
 
 	for i, call := range staged {
 		resolvedStaged[i] = call
@@ -58,7 +64,7 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 			}
 		}
 
-		execParams, err := resolveFileToolParams(call.ToolName, call.Params)
+		execParams, err := resolveFileToolParamsAtRoot(e.workspaceRoot, call.ToolName, call.Params)
 		if err != nil {
 			results[i].Error = fmt.Sprintf("%s: resolve path: %v", call.ToolName, err)
 			continue
@@ -73,7 +79,7 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 		execParams := call.Params
 		decision := permission.DecisionAsk
 		if e.check != nil {
-			decision = e.check(call.ToolName, PermissionCheckArg(call.ToolName, execParams))
+			decision = e.check(call.ToolName, PermissionCheckArgAtRoot(e.workspaceRoot, call.ToolName, execParams))
 		}
 		switch decision {
 		case permission.DecisionAllow:
@@ -89,7 +95,7 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 				results[i].Error = "denied by user"
 				continue
 			}
-			req := permissionRequest(call.ToolName, staged[i].Params, execParams)
+			req := permissionRequestAtRoot(e.workspaceRoot, call.ToolName, staged[i].Params, execParams)
 			req.CanAllowAll = len(staged) > 1
 			req.BatchIndex = i + 1
 			req.BatchTotal = len(staged)
@@ -120,7 +126,7 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 		path, _ := call.Params["path"].(string)
 		groupPath := canonicalPathFromParams(call.Params)
 		if groupPath == "" {
-			absPath, err := fileSecurityPath(call.Params, path)
+			absPath, err := fileSecurityPathAtRoot(e.workspaceRoot, call.Params, path)
 			if err != nil {
 				results[i].Error = fmt.Sprintf("%s: resolve path: %v", call.ToolName, err)
 				continue
@@ -144,12 +150,19 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 }
 
 func stagedBatchFiles(staged []StagedCall) []string {
+	return stagedBatchFilesAtRoot("", staged)
+}
+
+func stagedBatchFilesAtRoot(root string, staged []StagedCall) []string {
 	files := make([]string, 0, len(staged))
 	seen := map[string]bool{}
 	for _, call := range staged {
 		path, _ := call.Params["path"].(string)
 		if path == "" {
 			continue
+		}
+		if root != "" && !filepath.IsAbs(path) {
+			path = filepath.Join(root, path)
 		}
 		if abs, err := filepath.Abs(path); err == nil {
 			path = abs
@@ -277,7 +290,7 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 	var snapshot snapshotEntry
 	if e.store != nil {
 		displayPath, _ := staged[indexes[0]].Params["path"].(string)
-		displayAbsPath, err := fileDisplayAbsPath(displayPath)
+		displayAbsPath, err := fileDisplayAbsPathAtRoot(e.workspaceRoot, displayPath)
 		if err == nil {
 			turn := e.store.CurrentTurn()
 			// re-validate canonical: pre-snapshot guard against approved-target swap
@@ -359,7 +372,7 @@ func (e *StagedExecutor) validateFileGroup(staged []StagedCall, results []BatchR
 	for _, idx := range indexes {
 		call := staged[idx]
 		path, _ := call.Params["path"].(string)
-		current, err := fileSecurityPath(call.Params, path)
+		current, err := fileSecurityPathAtRoot(e.workspaceRoot, call.Params, path)
 		if err == nil && current == absPath {
 			continue
 		}

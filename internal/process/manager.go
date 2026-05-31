@@ -49,6 +49,7 @@ type Manager struct {
 	sessionID     func() string
 	maxProcs      int
 	outputOptions cmdoutput.Options
+	workspaceRoot string
 }
 
 type ExitEvent struct {
@@ -64,10 +65,15 @@ type ExitEvent struct {
 // NewManager creates a new process Manager. maxProcs limits concurrent
 // background processes (0 = unlimited).
 func NewManager(maxProcs int, outputOptions cmdoutput.Options) *Manager {
+	return NewManagerAtRoot(maxProcs, outputOptions, "")
+}
+
+func NewManagerAtRoot(maxProcs int, outputOptions cmdoutput.Options, workspaceRoot string) *Manager {
 	return &Manager{
 		procs:         make(map[string]*CommandStarted),
 		maxProcs:      maxProcs,
 		outputOptions: outputOptions,
+		workspaceRoot: workspaceRoot,
 	}
 }
 
@@ -114,6 +120,9 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 		return "", err
 	}
 	cmd := exec.Command("sh", "-c", command)
+	if m.workspaceRoot != "" {
+		cmd.Dir = m.workspaceRoot
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	capture := cmdoutput.NewCapture(m.outputOptions)
 	cmd.Stdout = capture.Stdout()

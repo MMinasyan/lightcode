@@ -28,17 +28,23 @@ func (e *ExitError) Error() string { return e.Output }
 
 // RunCommand implements the run_command tool.
 type RunCommand struct {
-	cfg     config.ToolsConfig
-	homeDir string
-	procMgr ProcessManager
+	cfg           config.ToolsConfig
+	homeDir       string
+	workspaceRoot string
+	procMgr       ProcessManager
 }
 
 // NewRunCommand creates a RunCommand tool.
 func NewRunCommand(cfg config.ToolsConfig, homeDir string, procMgr ProcessManager) *RunCommand {
+	return NewRunCommandAtRoot(cfg, homeDir, "", procMgr)
+}
+
+func NewRunCommandAtRoot(cfg config.ToolsConfig, homeDir, workspaceRoot string, procMgr ProcessManager) *RunCommand {
 	return &RunCommand{
-		cfg:     cfg,
-		homeDir: homeDir,
-		procMgr: procMgr,
+		cfg:           cfg,
+		homeDir:       homeDir,
+		workspaceRoot: workspaceRoot,
+		procMgr:       procMgr,
 	}
 }
 
@@ -117,6 +123,9 @@ func (r *RunCommand) runForeground(ctx context.Context, command string, timeoutS
 	}
 
 	cmd := exec.Command("sh", "-c", command)
+	if r.workspaceRoot != "" {
+		cmd.Dir = r.workspaceRoot
+	}
 	cmd.SysProcAttr = childProcAttr()
 
 	capture := cmdoutput.NewCapture(cmdoutput.Options{

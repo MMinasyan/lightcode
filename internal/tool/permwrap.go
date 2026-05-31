@@ -34,9 +34,10 @@ type AskFunc func(ctx context.Context, req permission.Request) permission.Respon
 // tool's Execute is only called if the check allows it or the user
 // approves via ask.
 type PermWrapped struct {
-	inner Tool
-	check CheckFunc
-	ask   AskFunc
+	inner         Tool
+	check         CheckFunc
+	ask           AskFunc
+	workspaceRoot string
 }
 
 // WrapWithPermission wraps t so that every Execute call is gated by
@@ -45,17 +46,21 @@ func WrapWithPermission(t Tool, check CheckFunc, ask AskFunc) *PermWrapped {
 	return &PermWrapped{inner: t, check: check, ask: ask}
 }
 
+func WrapWithPermissionAtRoot(t Tool, workspaceRoot string, check CheckFunc, ask AskFunc) *PermWrapped {
+	return &PermWrapped{inner: t, check: check, ask: ask, workspaceRoot: workspaceRoot}
+}
+
 func (p *PermWrapped) Name() string                     { return p.inner.Name() }
 func (p *PermWrapped) Description() string              { return p.inner.Description() }
 func (p *PermWrapped) ParametersSchema() map[string]any { return p.inner.ParametersSchema() }
 func (p *PermWrapped) WrappedTool() Tool                { return p.inner }
 
 func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (string, error) {
-	execParams, err := resolveFileToolParams(p.inner.Name(), params)
+	execParams, err := resolveFileToolParamsAtRoot(p.workspaceRoot, p.inner.Name(), params)
 	if err != nil {
 		return "", err
 	}
-	checkArg := PermissionCheckArg(p.inner.Name(), execParams)
+	checkArg := PermissionCheckArgAtRoot(p.workspaceRoot, p.inner.Name(), execParams)
 
 	switch p.check(p.inner.Name(), checkArg) {
 	case permission.DecisionAllow:
@@ -63,7 +68,7 @@ func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (strin
 	case permission.DecisionDeny:
 		return "", ErrDenied
 	default: // DecisionAsk
-		if p.ask != nil && permissionAllows(p.ask(ctx, permissionRequest(p.inner.Name(), params, execParams))) {
+		if p.ask != nil && permissionAllows(p.ask(ctx, permissionRequestAtRoot(p.workspaceRoot, p.inner.Name(), params, execParams))) {
 			return p.inner.Execute(ctx, execParams)
 		}
 		return "", ErrDenied
@@ -75,10 +80,14 @@ func permissionAllows(action permission.ResponseAction) bool {
 }
 
 func permissionRequest(toolName string, params, execParams map[string]any) permission.Request {
-	arg := PermissionArg(toolName, params)
+	return permissionRequestAtRoot("", toolName, params, execParams)
+}
+
+func permissionRequestAtRoot(root, toolName string, params, execParams map[string]any) permission.Request {
+	arg := PermissionArgAtRoot(root, toolName, params)
 	req := permission.Request{ToolName: toolName, Arg: arg}
 	if permission.IsFileTool(toolName) {
-		if resolved := PermissionCheckArg(toolName, execParams); resolved != "" && resolved != arg {
+		if resolved := PermissionCheckArgAtRoot(root, toolName, execParams); resolved != "" && resolved != arg {
 			req.ResolvedArg = resolved
 		}
 	}
@@ -88,6 +97,10 @@ func permissionRequest(toolName string, params, execParams map[string]any) permi
 // PermissionArg pulls the permission-relevant argument from the tool params.
 // File paths are resolved to absolute so they match against resolved rule patterns.
 func PermissionArg(toolName string, params map[string]any) string {
+	return PermissionArgAtRoot("", toolName, params)
+}
+
+func PermissionArgAtRoot(root, toolName string, params map[string]any) string {
 	switch toolName {
 	case "run_command":
 		s, _ := params["command"].(string)
@@ -95,6 +108,9 @@ func PermissionArg(toolName string, params map[string]any) string {
 	case "read_file", "write_file", "edit_file":
 		s, _ := params["path"].(string)
 		if s != "" {
+			if root != "" && !filepath.IsAbs(s) {
+				s = filepath.Join(root, s)
+			}
 			if abs, err := filepath.Abs(s); err == nil {
 				return abs
 			}
@@ -112,13 +128,17 @@ func PermissionArg(toolName string, params map[string]any) string {
 }
 
 func PermissionCheckArg(toolName string, params map[string]any) string {
+	return PermissionCheckArgAtRoot("", toolName, params)
+}
+
+func PermissionCheckArgAtRoot(root, toolName string, params map[string]any) string {
 	if permission.IsFileTool(toolName) {
 		if canonicalPath := canonicalPathFromParams(params); canonicalPath != "" {
 			return canonicalPath
 		}
 		path, _ := params["path"].(string)
 		if path != "" {
-			if resolved, err := pathutil.ResolveFilePath(path); err == nil {
+			if resolved, err := pathutil.ResolveFilePathFrom(root, path); err == nil {
 				return resolved.CanonicalPath
 			}
 		}
@@ -127,6 +147,10 @@ func PermissionCheckArg(toolName string, params map[string]any) string {
 }
 
 func resolveFileToolParams(toolName string, params map[string]any) (map[string]any, error) {
+	return resolveFileToolParamsAtRoot("", toolName, params)
+}
+
+func resolveFileToolParamsAtRoot(root, toolName string, params map[string]any) (map[string]any, error) {
 	if !permission.IsFileTool(toolName) {
 		return params, nil
 	}
@@ -135,7 +159,7 @@ func resolveFileToolParams(toolName string, params map[string]any) (map[string]a
 	if path == "" {
 		return cleanParams, nil
 	}
-	resolved, err := pathutil.ResolveFilePath(path)
+	resolved, err := pathutil.ResolveFilePathFrom(root, path)
 	if err != nil {
 		return nil, err
 	}
@@ -165,8 +189,12 @@ func canonicalPathFromParams(params map[string]any) string {
 }
 
 func fileSecurityPath(params map[string]any, path string) (string, error) {
+	return fileSecurityPathAtRoot("", params, path)
+}
+
+func fileSecurityPathAtRoot(root string, params map[string]any, path string) (string, error) {
 	if canonicalPath := canonicalPathFromParams(params); canonicalPath != "" {
-		resolved, err := pathutil.ResolveFilePath(path)
+		resolved, err := pathutil.ResolveFilePathFrom(root, path)
 		if err != nil {
 			return "", err
 		}
@@ -175,7 +203,7 @@ func fileSecurityPath(params map[string]any, path string) (string, error) {
 		}
 		return canonicalPath, nil
 	}
-	resolved, err := pathutil.ResolveFilePath(path)
+	resolved, err := pathutil.ResolveFilePathFrom(root, path)
 	if err != nil {
 		return "", err
 	}
@@ -183,6 +211,13 @@ func fileSecurityPath(params map[string]any, path string) (string, error) {
 }
 
 func fileDisplayAbsPath(path string) (string, error) {
+	return fileDisplayAbsPathAtRoot("", path)
+}
+
+func fileDisplayAbsPathAtRoot(root, path string) (string, error) {
+	if root != "" && !filepath.IsAbs(path) {
+		path = filepath.Join(root, path)
+	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return "", err

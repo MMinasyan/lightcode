@@ -408,7 +408,7 @@ func denyIfAsked(t *testing.T) AskFunc {
 	}
 }
 
-// Every fileSecurityPath call site in write_file.go and edit_file.go must
+// Every fileSecurityPathAtRoot call site in write_file.go and edit_file.go must
 // be preceded within 3 lines by a comment containing "re-resolve canonical"
 // so the defense-in-depth intent is documented at each call site and a
 // future refactor cannot silently elide the re-resolution.
@@ -425,7 +425,7 @@ func TestPR11Closure_FileSecurityPathDoubleValidationCommented(t *testing.T) {
 		lines := strings.Split(string(data), "\n")
 		var callSites []int
 		for i, line := range lines {
-			if strings.Contains(line, "fileSecurityPath(params") {
+			if strings.Contains(line, "fileSecurityPathAtRoot(") {
 				callSites = append(callSites, i)
 			}
 		}
