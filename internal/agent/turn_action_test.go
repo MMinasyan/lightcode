@@ -19,6 +19,29 @@ import (
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
+type fakeMemoryHooks struct {
+	reconcileCalls int
+	indexCalls     int
+	deleteCalls    int
+	lastSummary    string
+}
+
+func (h *fakeMemoryHooks) Reconcile() error {
+	h.reconcileCalls++
+	return nil
+}
+
+func (h *fakeMemoryHooks) IndexSummary(sessionID, projectID, projectName, summary, createdAt, compactionPath string) error {
+	h.indexCalls++
+	h.lastSummary = summary
+	return nil
+}
+
+func (h *fakeMemoryHooks) DeleteSessionSummaries(sessionID string) error {
+	h.deleteCalls++
+	return nil
+}
+
 func TestApplyTurnActionRevertCodeUsesClickedTurn(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	path := filepath.Join(a.projectRoot, "created.txt")
@@ -138,6 +161,49 @@ func TestRunCompactionPreservesPendingSignalsForMainModel(t *testing.T) {
 	if !a.lp.HasPendingWakeSignal() {
 		t.Fatal("pending wake signal was lost during compaction reload")
 	}
+}
+
+func TestCompactionMemoryHookRunsOnlyAfterSuccessfulSummary(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"hook summary"},"finish_reason":"stop"}]}`)
+		}))
+		defer server.Close()
+
+		a := newCatalogBackedTestAgent(t)
+		appendUserTurn(t, a, "first")
+		a.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
+		hooks := &fakeMemoryHooks{}
+		a.memoryHooks = hooks
+
+		if err := a.runCompaction(context.Background(), false); err != nil {
+			t.Fatalf("runCompaction returned error: %v", err)
+		}
+		if hooks.indexCalls != 1 || hooks.lastSummary != "hook summary" {
+			t.Fatalf("memory hook calls=%d summary=%q, want one successful summary index", hooks.indexCalls, hooks.lastSummary)
+		}
+	})
+
+	t.Run("summarizer failure", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "summary failed", http.StatusInternalServerError)
+		}))
+		defer server.Close()
+
+		a := newCatalogBackedTestAgent(t)
+		appendUserTurn(t, a, "first")
+		a.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
+		hooks := &fakeMemoryHooks{}
+		a.memoryHooks = hooks
+
+		if err := a.runCompaction(context.Background(), false); err == nil {
+			t.Fatal("runCompaction returned nil error for failed summarizer")
+		}
+		if hooks.indexCalls != 0 {
+			t.Fatalf("memory hook index calls=%d, want 0 on failed compaction", hooks.indexCalls)
+		}
+	})
 }
 
 func TestBackgroundExitSignalAfterSessionNewDoesNotDrainIntoNewSession(t *testing.T) {

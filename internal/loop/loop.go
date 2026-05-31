@@ -179,12 +179,40 @@ type PendingSignal struct {
 	BackgroundProcess *BackgroundProcessDisplay
 }
 
+// ContextTransformCheckpoint describes a model-request checkpoint where the
+// caller may transform conversation history before the request is sent.
+type ContextTransformCheckpoint struct {
+	Turn            int
+	ActiveTurnStart int
+	Force           bool
+}
+
+// ContextTransformResult reports whether history was transformed and where the
+// current in-progress turn now starts after the transform.
+type ContextTransformResult struct {
+	Transformed     bool
+	ActiveTurnStart int
+}
+
+// ContextTransformer runs at model-request checkpoints.
+type ContextTransformer interface {
+	BeforeModelRequest(ctx context.Context, checkpoint ContextTransformCheckpoint) (ContextTransformResult, error)
+}
+
+// UsageRecorder observes usage synchronously before usage events are forwarded
+// to asynchronous subscribers.
+type UsageRecorder interface {
+	RecordUsage(Event)
+}
+
 // Loop owns the conversation history for a single session and drives
 // the agentic loop on each user turn.
 type Loop struct {
-	client   modelclient.ChatStreamer
-	registry *tool.Registry
-	messages []message.Message
+	client             modelclient.ChatStreamer
+	registry           *tool.Registry
+	messages           []message.Message
+	contextTransformer ContextTransformer
+	usageRecorder      UsageRecorder
 
 	// turnBoundaries records the index of each user message in
 	// l.messages as it is appended. turnBoundaries[i] is the index of
@@ -247,6 +275,12 @@ func (l *Loop) SetTrace(w io.Writer) {
 // SetEvents registers a channel to receive structured tool call events.
 func (l *Loop) SetEvents(ch chan<- Event) { l.events = ch }
 
+// SetContextTransformer configures the before-model-request transform hook.
+func (l *Loop) SetContextTransformer(t ContextTransformer) { l.contextTransformer = t }
+
+// SetUsageRecorder configures synchronous usage observation.
+func (l *Loop) SetUsageRecorder(r UsageRecorder) { l.usageRecorder = r }
+
 // SetPendingExecutor configures the executor used to flush staged calls.
 func (l *Loop) SetPendingExecutor(exec tool.PendingExecutor) {
 	l.pendingExecutor = exec
@@ -256,6 +290,10 @@ func (l *Loop) SetPendingExecutor(exec tool.PendingExecutor) {
 }
 
 func (l *Loop) emit(ev Event) {
+	if ev.Kind == Usage && l.usageRecorder != nil {
+		l.usageRecorder.RecordUsage(ev)
+		return
+	}
 	if l.events == nil {
 		return
 	}
@@ -393,9 +431,17 @@ func (l *Loop) AppendUserMessage(turn int, content string) {
 // message into history: it appends to l.messages, persists to the store, and
 // emits a UserMessageDisplay event. Callers own turnBoundaries.
 func (l *Loop) persistAndEmitUserMessage(turn int, content string) {
+	l.persistUserMessage(turn, content)
+	l.emitUserMessageDisplay(turn, content)
+}
+
+func (l *Loop) persistUserMessage(turn int, content string) {
 	msg := message.NewText(message.RoleUser, content)
 	l.messages = append(l.messages, msg)
 	l.persistMessage(turn, msg)
+}
+
+func (l *Loop) emitUserMessageDisplay(turn int, content string) {
 	l.emit(Event{Kind: UserMessageDisplay, Turn: turn, Result: content})
 }
 
@@ -563,6 +609,26 @@ func (l *Loop) loadHistoryWithSummary(summary string, summarizer coremodel.Model
 	}
 }
 
+// LoadHistoryWithSummaryAndActiveTail compacts completed prior turns into a
+// summary while preserving the active in-progress turn tail byte-for-byte.
+// It returns the new message index where the active turn starts.
+func (l *Loop) LoadHistoryWithSummaryAndActiveTail(summary string, summarizer coremodel.ModelRef, activeTurnStart int) int {
+	if activeTurnStart < 0 {
+		activeTurnStart = 0
+	}
+	if activeTurnStart > len(l.messages) {
+		activeTurnStart = len(l.messages)
+	}
+	tail := append([]message.Message(nil), l.messages[activeTurnStart:]...)
+	l.loadHistoryWithSummary(summary, summarizer, nil, false)
+	newActiveTurnStart := len(l.messages)
+	if len(tail) > 0 {
+		l.turnBoundaries = append(l.turnBoundaries, newActiveTurnStart)
+		l.messages = append(l.messages, tail...)
+	}
+	return newActiveTurnStart
+}
+
 // persistMessage serializes msg and appends it to the current turn's
 // messages.jsonl via the store. Errors are traced but do not fail the
 // turn — persistence is best-effort so model interaction never stalls
@@ -597,10 +663,11 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 	l.pendingQueue = tool.NewPendingQueue()
 	l.consumedFlushResults = nil
 
-	l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
+	activeTurnStart := len(l.messages)
+	l.turnBoundaries = append(l.turnBoundaries, activeTurnStart)
 	l.DrainPendingSignalsForModel(turn)
 	for _, input := range userInputs {
-		l.persistAndEmitUserMessage(turn, input)
+		l.persistUserMessage(turn, input)
 	}
 	if l.store != nil {
 		_ = l.store.TouchActivity()
@@ -614,8 +681,30 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		}
 	}()
 
+	userDisplaysEmitted := false
+	emitDeferredUserDisplays := func() {
+		if userDisplaysEmitted {
+			return
+		}
+		for _, input := range userInputs {
+			l.emitUserMessageDisplay(turn, input)
+		}
+		userDisplaysEmitted = true
+	}
+
 	for iter := 0; iter < maxIterations; iter++ {
-		l.DrainPendingSignalsForModel(turn)
+		if iter > 0 {
+			l.DrainPendingSignalsForModel(turn)
+		}
+		if result, err := l.beforeModelRequest(ctx, turn, activeTurnStart); err != nil {
+			emitDeferredUserDisplays()
+			return "", err
+		} else if result.Transformed {
+			activeTurnStart = result.ActiveTurnStart
+		}
+		if iter == 0 {
+			emitDeferredUserDisplays()
+		}
 		msg, cancelled, err := l.runStream(ctx)
 		if err != nil {
 			return "", fmt.Errorf("chat completion: %w", err)
@@ -678,6 +767,16 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 	}
 
 	return "", fmt.Errorf("agent loop exceeded %d iterations without a final text response; the model may be stuck in a tool-call cycle", maxIterations)
+}
+
+func (l *Loop) beforeModelRequest(ctx context.Context, turn, activeTurnStart int) (ContextTransformResult, error) {
+	if l == nil || l.contextTransformer == nil {
+		return ContextTransformResult{}, nil
+	}
+	return l.contextTransformer.BeforeModelRequest(ctx, ContextTransformCheckpoint{
+		Turn:            turn,
+		ActiveTurnStart: activeTurnStart,
+	})
 }
 
 // runStream performs one streaming chat completion. Returns (msg,

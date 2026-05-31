@@ -85,6 +85,30 @@ func (c *fakeModelClient) ModelRef() coremodel.ModelRef {
 	return c.ref
 }
 
+type sequenceModelClient struct {
+	ref      coremodel.ModelRef
+	streams  []modelclient.ChatStream
+	requests []modelclient.ChatRequest
+}
+
+func (c *sequenceModelClient) ChatStream(_ context.Context, req modelclient.ChatRequest) (modelclient.ChatStream, error) {
+	c.requests = append(c.requests, req)
+	if len(c.streams) == 0 {
+		return nil, fmt.Errorf("unexpected model request")
+	}
+	stream := c.streams[0]
+	c.streams = c.streams[1:]
+	return stream, nil
+}
+
+func (c *sequenceModelClient) ProtocolWarnings([]message.Message) []modelclient.ProtocolWarning {
+	return nil
+}
+
+func (c *sequenceModelClient) Model() string { return c.ref.Model }
+
+func (c *sequenceModelClient) ModelRef() coremodel.ModelRef { return c.ref }
+
 type sliceModelStream struct {
 	deltas []modelclient.StreamDelta
 	next   int
@@ -100,6 +124,18 @@ func (s *sliceModelStream) Recv() (modelclient.StreamDelta, error) {
 }
 
 func (*sliceModelStream) Close() error { return nil }
+
+type checkpointRecorder struct {
+	loop  *Loop
+	calls []ContextTransformCheckpoint
+	seen  [][]message.Message
+}
+
+func (r *checkpointRecorder) BeforeModelRequest(_ context.Context, checkpoint ContextTransformCheckpoint) (ContextTransformResult, error) {
+	r.calls = append(r.calls, checkpoint)
+	r.seen = append(r.seen, append([]message.Message(nil), r.loop.Messages()...))
+	return ContextTransformResult{}, nil
+}
 
 func TestRunStreamUsesModelClientInterface(t *testing.T) {
 	ref := coremodel.ModelRef{Provider: "fake-provider", Model: "fake-chat"}
@@ -165,6 +201,58 @@ func TestRunStreamUsesModelClientInterface(t *testing.T) {
 	}
 	if !sawUsage {
 		t.Fatal("did not receive usage event with full ModelRef")
+	}
+}
+
+func TestContextTransformerRunsBeforeFollowUpModelRequest(t *testing.T) {
+	ref := coremodel.ModelRef{Provider: "fake-provider", Model: "fake-chat"}
+	client := &sequenceModelClient{
+		ref: ref,
+		streams: []modelclient.ChatStream{
+			&sliceModelStream{deltas: []modelclient.StreamDelta{{
+				Role: string(message.RoleAssistant),
+				ToolCalls: []openai.ToolCall{{
+					ID:   "call_1",
+					Type: openai.ToolTypeFunction,
+					Function: openai.FunctionCall{
+						Name:      "queue_signal",
+						Arguments: `{}`,
+					},
+				}},
+				FinishReason: openai.FinishReasonToolCalls,
+				HasChoice:    true,
+			}}},
+			&sliceModelStream{deltas: []modelclient.StreamDelta{{
+				Role:      string(message.RoleAssistant),
+				Content:   "done",
+				HasChoice: true,
+			}}},
+		},
+	}
+	registry := tool.NewRegistry()
+	registry.Register(queueSignalTool{queue: func() {}})
+	lp := New(client, registry, "system")
+	recorder := &checkpointRecorder{loop: lp}
+	lp.SetContextTransformer(recorder)
+
+	if _, err := lp.Run(context.Background(), "use tool"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("model requests = %d, want 2", len(client.requests))
+	}
+	if len(recorder.calls) < 2 {
+		t.Fatalf("transformer calls = %d, want at least initial and follow-up", len(recorder.calls))
+	}
+	followUpSeen := recorder.seen[len(recorder.seen)-1]
+	var sawToolResult bool
+	for _, msg := range followUpSeen {
+		if msg.Role == message.RoleTool && msg.ToolCallID == "call_1" && msg.TextContent() == "tool result" {
+			sawToolResult = true
+		}
+	}
+	if !sawToolResult {
+		t.Fatalf("follow-up checkpoint did not see tool result; messages=%#v", followUpSeen)
 	}
 }
 

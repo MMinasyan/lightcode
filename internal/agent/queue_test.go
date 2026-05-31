@@ -3,15 +3,35 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/loop"
 	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/pathutil"
+	"github.com/MMinasyan/lightcode/internal/tool"
 )
+
+type compactionCheckpointTool struct{}
+
+func (compactionCheckpointTool) Name() string { return "checkpoint_tool" }
+
+func (compactionCheckpointTool) Description() string { return "checkpoint tool" }
+
+func (compactionCheckpointTool) ParametersSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+
+func (compactionCheckpointTool) Execute(context.Context, map[string]any) (string, error) {
+	return "tool result", nil
+}
 
 // waitUntilBusy waits until the agent reports busy.
 func waitUntilBusy(t *testing.T, a *Agent) {
@@ -630,6 +650,184 @@ func TestAutoCompactionEventOrderInsideTurn(t *testing.T) {
 	}
 	if !(turnStart < compactStart && compactStart < compactEnd && compactEnd < userDisplay && userDisplay < textDelta && textDelta < turnEnd) {
 		t.Fatalf("unexpected auto-compaction event order: turnStart=%d compactStart=%d compactEnd=%d userDisplay=%d textDelta=%d turnEnd=%d events=%#v", turnStart, compactStart, compactEnd, userDisplay, textDelta, turnEnd, events)
+	}
+}
+
+func TestAutoCompactionBeforeFollowUpPreservesActiveToolTail(t *testing.T) {
+	var (
+		streamCalls       int
+		summaryInput      string
+		secondReqMessages []any
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if stream, _ := body["stream"].(bool); !stream {
+			messages, _ := body["messages"].([]any)
+			if len(messages) > 1 {
+				if msg, ok := messages[1].(map[string]any); ok {
+					summaryInput, _ = msg["content"].(string)
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"summary after tool"},"finish_reason":"stop"}]}`))
+			return
+		}
+		streamCalls++
+		if streamCalls == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, `data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"checkpoint_tool","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`+"\n\n")
+			fmt.Fprint(w, `data: {"choices":[],"usage":{"prompt_tokens":8000,"completion_tokens":1}}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		secondReqMessages, _ = body["messages"].([]any)
+		writeTextResponse(w, "done")
+	}))
+	defer server.Close()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	a.registry.Register(compactionCheckpointTool{})
+	a.memoryHooks = nil
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+
+	appendUserTurn(t, a, "completed prior turn")
+	a.cfg.Compaction.Enabled = true
+	a.cfg.Compaction.ThresholdPct = 0.50
+
+	if _, err := a.Submit(ctx, "current request"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	waitUntilEventOrderTurnEndCount(t, cap, 1)
+
+	if streamCalls != 2 {
+		t.Fatalf("stream calls = %d, want 2", streamCalls)
+	}
+	if !strings.Contains(summaryInput, "completed prior turn") {
+		t.Fatalf("summary input did not include completed prior turn:\n%s", summaryInput)
+	}
+	for _, active := range []string{"current request", "checkpoint_tool", "tool result"} {
+		if strings.Contains(summaryInput, active) {
+			t.Fatalf("summary input included active turn %q:\n%s", active, summaryInput)
+		}
+	}
+
+	userIdx := -1
+	for i, raw := range secondReqMessages {
+		msg, _ := raw.(map[string]any)
+		if msg["role"] == "user" && strings.Contains(fmt.Sprint(msg["content"]), "current request") {
+			userIdx = i
+			break
+		}
+	}
+	if userIdx < 0 {
+		t.Fatalf("follow-up request missing current user message: %#v", secondReqMessages)
+	}
+	if userIdx+2 >= len(secondReqMessages) {
+		t.Fatalf("follow-up request active tail too short from user index %d: %#v", userIdx, secondReqMessages)
+	}
+	assistantMsg, _ := secondReqMessages[userIdx+1].(map[string]any)
+	toolMsg, _ := secondReqMessages[userIdx+2].(map[string]any)
+	if assistantMsg["role"] != "assistant" || !strings.Contains(fmt.Sprint(assistantMsg["tool_calls"]), "checkpoint_tool") {
+		t.Fatalf("assistant tool-call message after current user = %#v", assistantMsg)
+	}
+	if toolMsg["role"] != "tool" || !strings.Contains(fmt.Sprint(toolMsg["content"]), "tool result") {
+		t.Fatalf("tool result message after assistant call = %#v", toolMsg)
+	}
+}
+
+func TestAutoCompactionBeforeFollowUpPreservesActiveReadTracker(t *testing.T) {
+	filePath := ""
+	streamCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if stream, _ := body["stream"].(bool); !stream {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"summary after read"},"finish_reason":"stop"}]}`))
+			return
+		}
+		streamCalls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch streamCalls {
+		case 1:
+			args := fmt.Sprintf(`{"path":%q}`, filePath)
+			fmt.Fprintf(w, `data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_read","type":"function","function":{"name":"read_file","arguments":%q}}]},"finish_reason":"tool_calls"}]}`+"\n\n", args)
+			fmt.Fprint(w, `data: {"choices":[],"usage":{"prompt_tokens":8000,"completion_tokens":1}}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		case 2:
+			args := fmt.Sprintf(`{"path":%q,"old_string":"hello","new_string":"goodbye"}`, filePath)
+			fmt.Fprintf(w, `data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_edit","type":"function","function":{"name":"edit_file","arguments":%q}}]},"finish_reason":"tool_calls"}]}`+"\n\n", args)
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		default:
+			fmt.Fprintf(w, `data: {"choices":[{"delta":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		}
+	}))
+	defer server.Close()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	filePath = filepath.Join(a.projectRoot, "tracked.txt")
+	if err := os.WriteFile(filePath, []byte("hello\n"), 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+	rulePath := "//" + strings.TrimPrefix(filePath, "/")
+	a.cfg.Permissions.Allow = []string{"read_file(" + rulePath + ")", "edit_file(" + rulePath + ")"}
+	a.memoryHooks = nil
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+
+	appendUserTurn(t, a, "completed prior turn")
+	a.cfg.Compaction.Enabled = true
+	a.cfg.Compaction.ThresholdPct = 0.50
+
+	if _, err := a.Submit(ctx, "read then edit"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	waitUntilEventOrderTurnEndCount(t, cap, 1)
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read edited file: %v", err)
+	}
+	if got := string(data); got != "goodbye\n" {
+		t.Fatalf("file content after read -> compaction -> edit = %q, want goodbye", got)
+	}
+}
+
+func TestActiveTailReadRecordsKeepsOnlyNewestMatchingRead(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "tracked.txt")
+	if err := os.WriteFile(filePath, []byte("hello\n"), 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+	resolved, err := pathutil.ResolveFilePath(filePath)
+	if err != nil {
+		t.Fatalf("resolve file: %v", err)
+	}
+	oldRead := tool.ReadRecord{Path: resolved.CanonicalPath, Offset: 1, Limit: 500, Identity: tool.FileIdentity{Mtime: time.Unix(1, 0)}}
+	activeRead := tool.ReadRecord{Path: resolved.CanonicalPath, Offset: 1, Limit: 500, Identity: tool.FileIdentity{Mtime: time.Unix(2, 0)}}
+	tail := []message.Message{{
+		Role: message.RoleAssistant,
+		ToolCalls: []message.ToolCall{{
+			ID:       "call_read",
+			Type:     "function",
+			Function: message.FunctionCall{Name: "read_file", Arguments: fmt.Sprintf(`{"path":%q}`, filePath)},
+		}},
+	}}
+
+	got := activeTailReadRecords(tail, []tool.ReadRecord{oldRead, activeRead}, 500)
+	if len(got) != 1 {
+		t.Fatalf("active read records len = %d, want 1: %#v", len(got), got)
+	}
+	if !got[0].Identity.Mtime.Equal(activeRead.Identity.Mtime) {
+		t.Fatalf("restored read mtime = %v, want newest active read %v", got[0].Identity.Mtime, activeRead.Identity.Mtime)
 	}
 }
 

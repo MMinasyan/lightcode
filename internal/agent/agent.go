@@ -77,6 +77,7 @@ type Agent struct {
 	pendingCatalogWarnings []prompt.Warning
 
 	memoryStore *memory.Store
+	memoryHooks agentMemoryHooks
 
 	lspManager     *lsp.Manager
 	lspDiagnostics *tool.LSPDiagnostics
@@ -93,6 +94,7 @@ type Agent struct {
 	loopFlush  chan chan struct{}
 	signalWake chan struct{}
 	queueWake  chan struct{}
+	signalSink agentSignalSink
 
 	// Backend-owned input queue: in-memory, volatile, session-scoped. Guarded
 	// by mu. queueVersion is monotonic for the agent's lifetime and is NEVER
@@ -107,6 +109,50 @@ type Agent struct {
 	warningsMu      sync.Mutex
 	warningGroups   map[string][]PromptWarning
 	warningSnapshot []PromptWarning
+}
+
+type agentSignalSink interface {
+	AddSignal(loop.PendingSignal)
+	HasWakeSignal() bool
+	HasSignal() bool
+}
+
+type loopSignalSink struct {
+	agent *Agent
+}
+
+func (s loopSignalSink) AddSignal(signal loop.PendingSignal) {
+	if s.agent == nil || s.agent.lp == nil {
+		return
+	}
+	s.agent.lp.AddPendingSignal(signal)
+	if signal.Wake {
+		s.agent.nudgeSignalScheduler()
+	}
+}
+
+func (s loopSignalSink) HasWakeSignal() bool {
+	return s.agent != nil && s.agent.lp != nil && s.agent.lp.HasPendingWakeSignal()
+}
+
+func (s loopSignalSink) HasSignal() bool {
+	return s.agent != nil && s.agent.lp != nil && s.agent.lp.HasPendingSignal()
+}
+
+type agentMemoryHooks interface {
+	Reconcile() error
+	IndexSummary(sessionID, projectID, projectName, summary, createdAt, compactionPath string) error
+	DeleteSessionSummaries(sessionID string) error
+}
+
+type agentUsageRecorder struct {
+	agent *Agent
+}
+
+func (r agentUsageRecorder) RecordUsage(ev loop.Event) {
+	if r.agent != nil {
+		r.agent.recordUsage(ev)
+	}
 }
 
 // New constructs an Agent from the given config. It creates the
@@ -171,6 +217,7 @@ func New(c Config) (*Agent, error) {
 		queueWake:         make(chan struct{}, 1),
 		warningGroups:     make(map[string][]PromptWarning),
 	}
+	a.signalSink = loopSignalSink{agent: a}
 
 	gate := permission.NewGate(func(ctx context.Context, req permission.Request) {
 		ev := loop.Event{
@@ -257,7 +304,7 @@ func New(c Config) (*Agent, error) {
 				reason = process.ExitReasonCompleted
 			}
 			payload := backgroundTerminalPayload(event, output)
-			a.lp.AddPendingSignal(loop.PendingSignal{
+			a.signalSink.AddSignal(loop.PendingSignal{
 				Payload: payload,
 				Wake:    true,
 				Persist: true,
@@ -269,7 +316,6 @@ func New(c Config) (*Agent, error) {
 					Output:   output,
 				},
 			})
-			a.nudgeSignalScheduler()
 		}
 	})
 
@@ -285,6 +331,7 @@ func New(c Config) (*Agent, error) {
 	}
 	memStore := memory.NewStore(embedder, resolver.Root(), c.Home)
 	a.memoryStore = memStore
+	a.memoryHooks = memStore
 
 	var projectID, memoriesDir string
 	if proj, err := resolver.Current(); err == nil && proj != nil {
@@ -342,6 +389,8 @@ func New(c Config) (*Agent, error) {
 	l := loop.New(provider.NewAdapter(client), registry, res.Prompt)
 	l.SetEvents(events)
 	l.SetStore(store)
+	l.SetContextTransformer(a)
+	l.SetUsageRecorder(agentUsageRecorder{agent: a})
 	l.SetPendingExecutor(tool.NewStagedExecutor(store, fileTracker, c.Cfg.Tools, checkFunc, askActionFunc))
 	a.lp = l
 
@@ -361,8 +410,8 @@ func (a *Agent) Init(ctx context.Context) {
 	go a.drainLoopEvents(ctx)
 	go a.runSignalScheduler(ctx)
 	go a.runQueueDrainer(ctx)
-	if a.memoryStore != nil {
-		_ = a.memoryStore.Reconcile()
+	if a.memoryHooks != nil {
+		_ = a.memoryHooks.Reconcile()
 	}
 	a.runSweep()
 	if err := a.resumeMostRecent(); err != nil {
@@ -382,9 +431,7 @@ func (a *Agent) Init(ctx context.Context) {
 			a.addWarning("lsp", prompt.Warning{Kind: kind, Message: message})
 		})
 		a.lspManager.SetSignalHandler(func(content string) {
-			if a.lp != nil {
-				a.lp.AddPendingSignal(loop.PendingSignal{Payload: content, Persist: true})
-			}
+			a.signalSink.AddSignal(loop.PendingSignal{Payload: content, Persist: true})
 		})
 		go a.lspManager.Detect(ctx)
 		go func() {
@@ -424,7 +471,7 @@ func (a *Agent) runSignalScheduler(ctx context.Context) {
 }
 
 func (a *Agent) tryStartSignalTurn(ctx context.Context) {
-	if a.lp == nil || !a.lp.HasPendingWakeSignal() {
+	if a.signalSink == nil || !a.signalSink.HasWakeSignal() {
 		return
 	}
 	a.mu.Lock()
@@ -432,7 +479,7 @@ func (a *Agent) tryStartSignalTurn(ctx context.Context) {
 	// change in flight must block it. The gate and the busy-claim share one
 	// lock hold so nothing can slip a signal turn in between (claimTurnLocked
 	// is called while still holding a.mu).
-	if a.busy || a.transitioning || len(a.queue) > 0 || a.store == nil || !a.store.Active() || !a.lp.HasPendingWakeSignal() {
+	if a.busy || a.transitioning || len(a.queue) > 0 || a.store == nil || !a.store.Active() || !a.signalSink.HasWakeSignal() {
 		a.mu.Unlock()
 		return
 	}
@@ -805,8 +852,8 @@ func (a *Agent) runSweep() {
 		DeleteAfterArchiveDays: a.cfg.Sessions.DeleteAfterArchiveDays,
 	}
 	var onDelete func(string)
-	if a.memoryStore != nil {
-		onDelete = func(sessionID string) { _ = a.memoryStore.DeleteSessionSummaries(sessionID) }
+	if a.memoryHooks != nil {
+		onDelete = func(sessionID string) { _ = a.memoryHooks.DeleteSessionSummaries(sessionID) }
 	}
 	if _, _, err := snapshot.SweepAllProjects(a.projects.Root(), cfg, onDelete); err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: sweep: %v\n", err)
@@ -840,19 +887,52 @@ func (a *Agent) shouldAutoCompact() bool {
 	return float64(used)/float64(window) >= a.cfg.Compaction.ThresholdPct
 }
 
-// runCompaction summarizes the current conversation. turnInProgress should be
-// true when called from inside an active turn (a BeginTurn was just issued for a
-// not-yet-executed turn), false for manual compaction.
+// BeforeModelRequest implements the loop context-transform checkpoint.
+func (a *Agent) BeforeModelRequest(ctx context.Context, checkpoint loop.ContextTransformCheckpoint) (loop.ContextTransformResult, error) {
+	if !checkpoint.Force && !a.shouldAutoCompact() {
+		return loop.ContextTransformResult{}, nil
+	}
+	activeStart, err := a.compactAtCheckpoint(ctx, checkpoint)
+	if err != nil {
+		if checkpoint.Force {
+			return loop.ContextTransformResult{}, err
+		}
+		a.emitEvent(Event{Kind: EventError, Error: fmt.Sprintf("compaction: %v", err), Turn: checkpoint.Turn})
+		return loop.ContextTransformResult{}, nil
+	}
+	return loop.ContextTransformResult{Transformed: true, ActiveTurnStart: activeStart}, nil
+}
+
+// runCompaction summarizes the current conversation through the same context
+// transform hook used by model-request checkpoints. It is kept for existing
+// focused tests and manual compaction plumbing.
 func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
+	activeStart := len(a.lp.Messages())
+	checkpoint := loop.ContextTransformCheckpoint{
+		Turn:            a.store.CurrentTurn(),
+		ActiveTurnStart: activeStart,
+		Force:           true,
+	}
+	if turnInProgress && activeStart > 0 {
+		checkpoint.ActiveTurnStart = activeStart
+	}
+	_, err := a.BeforeModelRequest(ctx, checkpoint)
+	return err
+}
+
+func (a *Agent) compactAtCheckpoint(ctx context.Context, checkpoint loop.ContextTransformCheckpoint) (int, error) {
 	a.emitEvent(Event{Kind: EventCompactionStart})
 	defer a.emitEvent(Event{Kind: EventCompactionEnd})
 
 	messages := a.lp.Messages()
-	if len(messages) <= 1 {
-		return fmt.Errorf("nothing to compact")
+	activeStart := checkpoint.ActiveTurnStart
+	if activeStart <= 0 || activeStart > len(messages) {
+		activeStart = len(messages)
 	}
-	// Skip system prompt at index 0.
-	toSummarize := messages[1:]
+	if activeStart <= 1 {
+		return activeStart, fmt.Errorf("nothing to compact")
+	}
+	toSummarize := append([]message.Message(nil), messages[1:activeStart]...)
 
 	client, summarizerWindow := a.summarizerClientAndWindow()
 	if summarizerWindow <= 0 {
@@ -867,13 +947,13 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 		SummarizerPrompt: prompt,
 	})
 	if err != nil {
-		return err
+		return activeStart, err
 	}
 
-	// When called from inside an active turn, CurrentTurn() is the just-begun
-	// empty turn; the boundary is the previous (last completed) turn.
 	boundaryTurn := a.store.CurrentTurn()
-	if turnInProgress {
+	if !checkpoint.Force && checkpoint.Turn > 0 {
+		boundaryTurn = checkpoint.Turn - 1
+	} else if checkpoint.Force && activeStart < len(messages) && checkpoint.Turn > 0 {
 		boundaryTurn--
 	}
 	rec := snapshot.CompactionRecord{
@@ -884,10 +964,15 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 		SummarizerProvider: result.SummarizerRef.Provider,
 	}
 	if err := a.store.SaveCompaction(rec); err != nil {
-		return fmt.Errorf("save compaction: %w", err)
+		return activeStart, fmt.Errorf("save compaction: %w", err)
 	}
 
-	if a.memoryStore != nil {
+	var activeReads []tool.ReadRecord
+	if a.fileTracker != nil && activeStart < len(messages) {
+		activeReads = activeTailReadRecords(messages[activeStart:], a.fileTracker.Snapshot(), a.cfg.Tools.ReadMaxLines)
+	}
+
+	if a.memoryHooks != nil {
 		sessionID := a.store.SessionID()
 		var projID, projName string
 		if proj, pErr := a.projects.Current(); pErr == nil && proj != nil {
@@ -895,21 +980,92 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 			projName = proj.Name
 		}
 		compactionPath := filepath.Join(a.store.Dir(), "compaction.json")
-		if err := a.memoryStore.IndexSummary(sessionID, projID, projName, result.Summary, rec.CompactedAt, compactionPath); err != nil {
+		if err := a.memoryHooks.IndexSummary(sessionID, projID, projName, result.Summary, rec.CompactedAt, compactionPath); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: memory index summary: %v\n", err)
 		}
 	}
 
-	a.lp.LoadHistoryWithSummaryPreservePending(result.Summary, result.SummarizerRef, nil)
+	newActiveStart := a.lp.LoadHistoryWithSummaryAndActiveTail(result.Summary, result.SummarizerRef, activeStart)
 	if a.fileTracker != nil {
-		a.fileTracker.Reset()
+		if len(activeReads) > 0 {
+			a.fileTracker.Restore(activeReads)
+		} else {
+			a.fileTracker.Reset()
+		}
 	}
 
 	a.tokensMu.Lock()
 	a.lastContextUsed = 0
 	a.tokensMu.Unlock()
 
-	return nil
+	return newActiveStart, nil
+}
+
+func activeTailReadRecords(tail []message.Message, reads []tool.ReadRecord, defaultLimit int) []tool.ReadRecord {
+	if len(tail) == 0 || len(reads) == 0 {
+		return nil
+	}
+	type readKey struct {
+		path   string
+		offset int
+		limit  int
+	}
+	wanted := map[readKey]bool{}
+	for _, msg := range tail {
+		if msg.Role != message.RoleAssistant {
+			continue
+		}
+		for _, tc := range msg.ToolCalls {
+			if tc.Function.Name != "read_file" {
+				continue
+			}
+			var params map[string]any
+			if json.Unmarshal([]byte(tc.Function.Arguments), &params) != nil {
+				continue
+			}
+			path, _ := params["path"].(string)
+			if path == "" {
+				continue
+			}
+			resolved, err := pathutil.ResolveFilePath(path)
+			if err != nil {
+				continue
+			}
+			offset := 1
+			if v, ok := params["offset"].(float64); ok {
+				offset = int(v)
+			}
+			if offset < 1 {
+				offset = 1
+			}
+			limit := defaultLimit
+			if v, ok := params["limit"].(float64); ok {
+				limit = int(v)
+			}
+			if limit < 1 {
+				limit = defaultLimit
+			}
+			wanted[readKey{path: resolved.CanonicalPath, offset: offset, limit: limit}] = true
+		}
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+	reversed := make([]tool.ReadRecord, 0, len(wanted))
+	seen := map[readKey]bool{}
+	for i := len(reads) - 1; i >= 0; i-- {
+		read := reads[i]
+		key := readKey{path: read.Path, offset: read.Offset, limit: read.Limit}
+		if wanted[key] && !seen[key] {
+			reversed = append(reversed, read)
+			seen[key] = true
+		}
+	}
+	out := make([]tool.ReadRecord, 0, len(reversed))
+	for i := len(reversed) - 1; i >= 0; i-- {
+		out = append(out, reversed[i])
+	}
+	return out
 }
 
 func (a *Agent) summarizerClientAndWindow() (*provider.Adapter, int) {
@@ -959,7 +1115,7 @@ func (a *Agent) CompactNow(ctx context.Context) error {
 		// queued while compaction was running, wake the backend drainer now that
 		// the gate is open again.
 		a.nudgeQueueDrainer()
-		if a.lp != nil && a.lp.HasPendingWakeSignal() {
+		if a.signalSink != nil && a.signalSink.HasWakeSignal() {
 			a.nudgeSignalScheduler()
 		}
 	}()
@@ -1411,7 +1567,7 @@ func (a *Agent) launchTurn(ctx context.Context, turnCtx context.Context, cancel 
 			// queued mid-turn. The signal scheduler still defers to a non-empty
 			// queue (see tryStartSignalTurn).
 			a.nudgeQueueDrainer()
-			if a.lp != nil && a.lp.HasPendingWakeSignal() {
+			if a.signalSink != nil && a.signalSink.HasWakeSignal() {
 				a.nudgeSignalScheduler()
 			}
 		}()
@@ -1424,12 +1580,6 @@ func (a *Agent) launchTurn(ctx context.Context, turnCtx context.Context, cancel 
 			a.lp.UpdateSystemPrompt(res.Prompt)
 		}
 		a.setWarningGroup("prompt", res.Warnings)
-
-		if a.shouldAutoCompact() {
-			if err := a.runCompaction(turnCtx, true); err != nil {
-				a.emitEvent(Event{Kind: EventError, Error: fmt.Sprintf("compaction: %v", err), Turn: turn})
-			}
-		}
 
 		if ctx.Err() != nil {
 			return
@@ -1529,7 +1679,7 @@ func (a *Agent) SwitchModel(refStr string) error {
 	a.lp.SetClient(provider.NewAdapter(client))
 	a.currentRef = ref
 	a.contextWindowSize = model.ContextWindow
-	a.lp.AddPendingSignal(loop.PendingSignal{Payload: fmt.Sprintf("Model switched to %s", ref.String()), Persist: true})
+	a.signalSink.AddSignal(loop.PendingSignal{Payload: fmt.Sprintf("Model switched to %s", ref.String()), Persist: true})
 	if a.store.Active() {
 		if err := a.store.SetModel(ref.Provider, ref.Model); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)
@@ -2044,8 +2194,8 @@ func (a *Agent) SessionDelete(id string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if a.memoryStore != nil {
-		_ = a.memoryStore.DeleteSessionSummaries(id)
+	if a.memoryHooks != nil {
+		_ = a.memoryHooks.DeleteSessionSummaries(id)
 	}
 	if err := snapshot.DeleteSession(sessionsRoot, id); err != nil {
 		return false, err

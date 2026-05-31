@@ -121,6 +121,7 @@ func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, er
 	// Deduplication check.
 	if r.tracker != nil {
 		if dup, _ := r.tracker.IsDuplicateIdentity(absPath, offset, limit, identity); dup {
+			r.tracker.TrackIdentity(absPath, offset, limit, identity)
 			return "File unchanged since last read. The content from the earlier read in this conversation is still current.", nil
 		}
 	}
