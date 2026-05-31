@@ -10,12 +10,13 @@ import (
 
 // SessionInfo is the summary returned by List for the session switcher.
 type SessionInfo struct {
-	ID           string `json:"id"`
-	CreatedAt    string `json:"createdAt"`
-	LastActivity int64  `json:"lastActivity"`
-	State        string `json:"state"`
-	ArchivedAt   int64  `json:"archivedAt"`
-	ProjectPath  string `json:"projectPath"`
+	ID              string `json:"id"`
+	CreatedAt       string `json:"createdAt"`
+	LastActivity    int64  `json:"lastActivity"`
+	State           string `json:"state"`
+	ArchivedAt      int64  `json:"archivedAt"`
+	ProjectPath     string `json:"projectPath"`
+	ParentSessionID string `json:"parentSessionId,omitempty"`
 }
 
 // LifecycleConfig controls Sweep's archive/delete thresholds. Days are
@@ -60,12 +61,13 @@ func List(root, projectPath, state string) ([]SessionInfo, error) {
 			}
 		}
 		out = append(out, SessionInfo{
-			ID:           meta.ID,
-			CreatedAt:    meta.CreatedAt,
-			LastActivity: meta.LastActivity,
-			State:        effectiveState(meta.State),
-			ArchivedAt:   meta.ArchivedAt,
-			ProjectPath:  meta.ProjectPath,
+			ID:              meta.ID,
+			CreatedAt:       meta.CreatedAt,
+			LastActivity:    meta.LastActivity,
+			State:           effectiveState(meta.State),
+			ArchivedAt:      meta.ArchivedAt,
+			ProjectPath:     meta.ProjectPath,
+			ParentSessionID: meta.ParentSessionID,
 		})
 	}
 	sortByActivityDesc(out)
@@ -82,7 +84,12 @@ func LoadMostRecent(root, projectPath string) (string, error) {
 	if len(infos) == 0 {
 		return "", nil
 	}
-	return infos[0].ID, nil
+	for _, info := range infos {
+		if info.ParentSessionID == "" {
+			return info.ID, nil
+		}
+	}
+	return "", nil
 }
 
 // SweepAllProjects runs Sweep over every project's sessions/ dir under

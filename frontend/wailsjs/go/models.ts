@@ -262,6 +262,7 @@ export namespace agent {
 	    state: string;
 	    archivedAt: number;
 	    projectPath: string;
+	    parentSessionId?: string;
 
 	    static createFrom(source: any = {}) {
 	        return new SessionSummary(source);
@@ -275,6 +276,7 @@ export namespace agent {
 	        this.state = source["state"];
 	        this.archivedAt = source["archivedAt"];
 	        this.projectPath = source["projectPath"];
+	        this.parentSessionId = source["parentSessionId"];
 	    }
 	}
 	export class SnapshotFile {

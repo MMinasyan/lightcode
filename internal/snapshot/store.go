@@ -118,10 +118,20 @@ func (s *Store) BeginNewSession(projectRoot string) error {
 	if s.active {
 		return fmt.Errorf("snapshot: session %q already open", s.sessionID)
 	}
-	return s.beginNewSessionLocked(projectRoot)
+	return s.beginNewSessionLocked(projectRoot, "")
 }
 
-func (s *Store) beginNewSessionLocked(projectRoot string) error {
+// BeginChildSession creates a fresh session linked to a parent session.
+func (s *Store) BeginChildSession(projectRoot, parentSessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active {
+		return fmt.Errorf("snapshot: session %q already open", s.sessionID)
+	}
+	return s.beginNewSessionLocked(projectRoot, parentSessionID)
+}
+
+func (s *Store) beginNewSessionLocked(projectRoot, parentSessionID string) error {
 	absProject, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return fmt.Errorf("snapshot: resolve project root: %w", err)
@@ -148,6 +158,7 @@ func (s *Store) beginNewSessionLocked(projectRoot string) error {
 		LightcodeVersion: lightcodeVersion,
 		State:            StateActive,
 		LastActivity:     now,
+		ParentSessionID:  parentSessionID,
 	}
 	if err := writeJSON(filepath.Join(dir, "meta.json"), meta); err != nil {
 		return fmt.Errorf("snapshot: write session meta: %w", err)

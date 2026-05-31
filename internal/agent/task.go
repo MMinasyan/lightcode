@@ -2,20 +2,21 @@ package agent
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/coremodel"
 	"github.com/MMinasyan/lightcode/internal/loop"
+	"github.com/MMinasyan/lightcode/internal/lsp"
+	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/process"
 	"github.com/MMinasyan/lightcode/internal/provider"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/subagent"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
@@ -41,8 +42,8 @@ type TaggedLoopEvent struct {
 
 type taskTool struct {
 	loader        *subagent.Loader
-	parentStore   tool.SnapshotStore
-	baseRegistry  *tool.Registry
+	parentStore   *snapshot.Store
+	parentTracker *tool.FileTracker
 	maxConcurrent int
 	taggedEvents  chan<- TaggedLoopEvent
 
@@ -57,15 +58,21 @@ type taskTool struct {
 	toolsConfig   config.ToolsConfig
 	homeDir       string
 	workspaceRoot string
-	procMgr       tool.ProcessManager
+	procMgr       *process.Manager
+	memoryStore   *memory.Store
+	projectID     string
+	memoriesDir   string
+	lspManager    *lsp.Manager
 	check         tool.CheckFunc
 	ask           tool.AskFunc
+	askAction     tool.AskActionFunc
+	usageRecorder loop.UsageRecorder
 }
 
 type taskToolConfig struct {
 	Loader        *subagent.Loader
-	ParentStore   tool.SnapshotStore
-	BaseRegistry  *tool.Registry
+	ParentStore   *snapshot.Store
+	ParentTracker *tool.FileTracker
 	MaxConcurrent int
 	TaggedEvents  chan<- TaggedLoopEvent
 
@@ -78,9 +85,15 @@ type taskToolConfig struct {
 	ToolsConfig   config.ToolsConfig
 	HomeDir       string
 	WorkspaceRoot string
-	ProcMgr       tool.ProcessManager
+	ProcMgr       *process.Manager
+	MemoryStore   *memory.Store
+	ProjectID     string
+	MemoriesDir   string
+	LSPManager    *lsp.Manager
 	Check         tool.CheckFunc
 	Ask           tool.AskFunc
+	AskAction     tool.AskActionFunc
+	UsageRecorder loop.UsageRecorder
 }
 
 func newTaskTool(cfg taskToolConfig) *taskTool {
@@ -90,7 +103,7 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 	return &taskTool{
 		loader:        cfg.Loader,
 		parentStore:   cfg.ParentStore,
-		baseRegistry:  cfg.BaseRegistry,
+		parentTracker: cfg.ParentTracker,
 		maxConcurrent: cfg.MaxConcurrent,
 		taggedEvents:  cfg.TaggedEvents,
 		modelCatalog:  cfg.ModelCatalog,
@@ -101,8 +114,14 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		homeDir:       cfg.HomeDir,
 		workspaceRoot: cfg.WorkspaceRoot,
 		procMgr:       cfg.ProcMgr,
+		memoryStore:   cfg.MemoryStore,
+		projectID:     cfg.ProjectID,
+		memoriesDir:   cfg.MemoriesDir,
+		lspManager:    cfg.LSPManager,
 		check:         cfg.Check,
 		ask:           cfg.Ask,
+		askAction:     cfg.AskAction,
+		usageRecorder: cfg.UsageRecorder,
 	}
 }
 
@@ -216,12 +235,41 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		return taskResult{index: index, err: fmt.Errorf("unknown subagent type %q: %w", td.SubagentType, err)}
 	}
 
-	registry := t.buildRegistry(at)
-	client, err := t.resolveClient()
+	client, ref, err := t.resolveClient()
 	if err != nil {
 		return taskResult{index: index, err: err}
 	}
-	sessionID := genSessionID()
+	if t.parentStore == nil {
+		return taskResult{index: index, err: fmt.Errorf("subagent: parent session store is not configured")}
+	}
+	parentSessionID := t.parentStore.SessionID()
+	parentTurn := t.parentStore.CurrentTurn()
+	if parentSessionID == "" || parentTurn == 0 {
+		return taskResult{index: index, err: fmt.Errorf("subagent: parent turn is not active")}
+	}
+
+	childStore, err := snapshot.NewForSessionsRoot(t.parentStore.Root(), "", "")
+	if err != nil {
+		return taskResult{index: index, err: err}
+	}
+	if err := childStore.BeginChildSession(t.workspaceRoot, parentSessionID); err != nil {
+		return taskResult{index: index, err: err}
+	}
+	defer func() {
+		_, _ = childStore.Close()
+	}()
+	if err := childStore.SetModel(ref.Provider, ref.Model); err != nil {
+		return taskResult{index: index, err: err}
+	}
+	sessionID := childStore.SessionID()
+
+	scope := parentMutationScope{
+		store:         t.parentStore,
+		turn:          parentTurn,
+		tracker:       t.parentTracker,
+		workspaceRoot: t.workspaceRoot,
+	}
+	registry := t.buildRegistry(at, scope)
 
 	var events chan loop.Event
 	if t.taggedEvents != nil {
@@ -234,8 +282,14 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 	if events != nil {
 		lp.SetEvents(events)
 	}
+	lp.SetStore(childStore)
+	lp.SetUsageRecorder(t.usageRecorder)
+	lp.SetPendingExecutor(tool.NewStagedExecutorAtRoot(scope.snapshotStore(), scope.tracker, t.toolsConfig, scope.workspaceRoot, t.permissionCheck(), t.permissionAskAction()))
 
-	result, err := subagent.Run(ctx, lp, td.Prompt)
+	if turn := childStore.BeginTurn(); turn == 0 {
+		return taskResult{index: index, err: fmt.Errorf("subagent: child session is not active")}
+	}
+	result, err := lp.Run(ctx, td.Prompt)
 	if err != nil {
 		if result == "Tool denied by user." {
 			return taskResult{index: index, result: result, denied: true}
@@ -245,31 +299,113 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 	return taskResult{index: index, result: result}
 }
 
-func genSessionID() string {
-	var b [4]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Sprintf("%08x", time.Now().UnixNano())
-	}
-	return hex.EncodeToString(b[:])
-}
-
-func (t *taskTool) buildRegistry(at subagent.AgentType) *tool.Registry {
+func (t *taskTool) buildRegistry(at subagent.AgentType, scope parentMutationScope) *tool.Registry {
 	reg := tool.NewRegistry()
 	for _, name := range at.Tools {
 		if name == "task" {
 			continue
 		}
-		if name == "run_command" && isReadOnlyType(at) {
-			rc := tool.NewRunCommandAtRoot(t.toolsConfig, t.homeDir, t.workspaceRoot, t.procMgr)
-			readOnly := tool.NewReadOnlyRunCommand(rc)
-			reg.Register(tool.WrapWithPermission(readOnly, t.permissionCheck(), t.permissionAsk()))
-			continue
-		}
-		if tt, ok := t.baseRegistry.Get(name); ok {
+		if tt := t.newChildTool(name, at, scope); tt != nil {
 			reg.Register(tt)
 		}
 	}
 	return reg
+}
+
+type parentMutationScope struct {
+	store         *snapshot.Store
+	turn          int
+	tracker       *tool.FileTracker
+	workspaceRoot string
+}
+
+func (s parentMutationScope) snapshotStore() tool.SnapshotStore {
+	return parentTurnSnapshotStore{store: s.store, turn: s.turn}
+}
+
+type parentTurnSnapshotStore struct {
+	store *snapshot.Store
+	turn  int
+}
+
+func (s parentTurnSnapshotStore) Snapshot(_ int, absPath string) error {
+	return s.store.Snapshot(s.turn, absPath)
+}
+
+func (s parentTurnSnapshotStore) CurrentTurn() int {
+	return s.turn
+}
+
+func (s parentTurnSnapshotStore) SnapshotResolved(_ int, originalPath, canonicalPath string) error {
+	return s.store.SnapshotResolved(s.turn, originalPath, canonicalPath)
+}
+
+func (s parentTurnSnapshotStore) SnapshotResolvedEntry(_ int, originalPath, canonicalPath string) (string, bool, error) {
+	return s.store.SnapshotResolvedEntry(s.turn, originalPath, canonicalPath)
+}
+
+func (s parentTurnSnapshotStore) DiscardSnapshotEntry(_ int, entryID string) error {
+	return s.store.DiscardSnapshotEntry(s.turn, entryID)
+}
+
+func (s parentTurnSnapshotStore) RetainSnapshotEntry(_ int, entryID string) {
+	s.store.RetainSnapshotEntry(s.turn, entryID)
+}
+
+func (t *taskTool) newChildTool(name string, at subagent.AgentType, scope parentMutationScope) tool.Tool {
+	check := t.permissionCheck()
+	ask := t.permissionAsk()
+	root := scope.workspaceRoot
+	switch name {
+	case "read_file":
+		return tool.WrapWithPermissionAtRoot(tool.NewReadFileAtRoot(t.toolsConfig, scope.tracker, root), root, check, ask)
+	case "write_file":
+		return tool.WrapWithPermissionAtRoot(tool.NewWriteFileWithSnapshotAtRoot(scope.snapshotStore(), scope.tracker, t.toolsConfig, root), root, check, ask)
+	case "edit_file":
+		return tool.WrapWithPermissionAtRoot(tool.NewEditFileWithSnapshotAtRoot(scope.snapshotStore(), scope.tracker, t.toolsConfig, root), root, check, ask)
+	case "execute_pending":
+		return tool.WrapWithPermission(tool.ExecutePending{}, check, ask)
+	case "run_command":
+		rc := tool.NewRunCommandAtRoot(t.toolsConfig, t.homeDir, root, t.procMgr)
+		if isReadOnlyType(at) {
+			return tool.WrapWithPermission(tool.NewReadOnlyRunCommand(rc), check, ask)
+		}
+		return tool.WrapWithPermission(rc, check, ask)
+	case "process":
+		if t.procMgr == nil {
+			return nil
+		}
+		return tool.WrapWithPermission(tool.NewProcessTool(t.procMgr), check, ask)
+	case "sleep":
+		return tool.WrapWithPermission(tool.Sleep{}, check, ask)
+	case "save_memory":
+		if t.memoryStore == nil {
+			return nil
+		}
+		return tool.WrapWithPermission(tool.NewSaveMemory(t.memoryStore, t.memoriesDir), check, ask)
+	case "search_memory":
+		if t.memoryStore == nil {
+			return nil
+		}
+		return tool.WrapWithPermission(tool.NewSearchMemory(t.memoryStore, t.projectID), check, ask)
+	case "search_history":
+		if t.memoryStore == nil {
+			return nil
+		}
+		return tool.WrapWithPermission(tool.NewSearchHistory(t.memoryStore, t.projectID), check, ask)
+	case "diagnostics":
+		if t.lspManager == nil {
+			return nil
+		}
+		return tool.NewLSPDiagnostics(lsp.NewClient(t.lspManager), &snapshotDiagAdapter{store: t.parentStore})
+	case "workspace_symbol":
+		if t.lspManager == nil {
+			return nil
+		}
+		return tool.NewWorkspaceSymbol(lsp.NewClient(t.lspManager))
+	default:
+		return nil
+	}
 }
 
 func (t *taskTool) permissionCheck() tool.CheckFunc {
@@ -290,6 +426,15 @@ func (t *taskTool) permissionAsk() tool.AskFunc {
 	}
 }
 
+func (t *taskTool) permissionAskAction() tool.AskActionFunc {
+	if t.askAction != nil {
+		return t.askAction
+	}
+	return func(context.Context, permission.Request) permission.ResponseAction {
+		return permission.ResponseDeny
+	}
+}
+
 func isReadOnlyType(at subagent.AgentType) bool {
 	for _, name := range at.Tools {
 		if name == "write_file" || name == "edit_file" {
@@ -299,7 +444,7 @@ func isReadOnlyType(at subagent.AgentType) bool {
 	return true
 }
 
-func (t *taskTool) resolveClient() (*provider.Client, error) {
+func (t *taskTool) resolveClient() (*provider.Client, coremodel.ModelRef, error) {
 	t.mu.Lock()
 	providerName := t.providerName
 	modelID := t.model
@@ -311,16 +456,16 @@ func (t *taskTool) resolveClient() (*provider.Client, error) {
 	if subModel != "" {
 		parsed, err := coremodel.Parse(subModel)
 		if err != nil {
-			return nil, err
+			return nil, coremodel.ModelRef{}, err
 		}
 		ref = parsed
 	}
 
 	client, _, err := newProviderClient(modelCatalog, ref)
 	if err != nil {
-		return nil, err
+		return nil, coremodel.ModelRef{}, err
 	}
-	return client, nil
+	return client, ref, nil
 }
 
 func (t *taskTool) forwardEvents(ch <-chan loop.Event, taskIndex int, sessionID, toolCallID string) {

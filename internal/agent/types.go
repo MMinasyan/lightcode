@@ -133,12 +133,13 @@ type SnapshotFile struct {
 
 // SessionSummary is the payload for session queries.
 type SessionSummary struct {
-	ID           string `json:"id"`
-	CreatedAt    string `json:"createdAt"`
-	LastActivity int64  `json:"lastActivity"`
-	State        string `json:"state"`
-	ArchivedAt   int64  `json:"archivedAt"`
-	ProjectPath  string `json:"projectPath"`
+	ID              string `json:"id"`
+	CreatedAt       string `json:"createdAt"`
+	LastActivity    int64  `json:"lastActivity"`
+	State           string `json:"state"`
+	ArchivedAt      int64  `json:"archivedAt"`
+	ProjectPath     string `json:"projectPath"`
+	ParentSessionID string `json:"parentSessionId,omitempty"`
 }
 
 // DisplayMessage is the pre-assembled, display-ready message returned by

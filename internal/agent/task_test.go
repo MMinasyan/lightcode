@@ -3,9 +3,15 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/loop"
@@ -138,11 +144,8 @@ func TestTaskToolReadOnlyAndRegistryRouting(t *testing.T) {
 		})
 	}
 
-	base := tool.NewRegistry()
-	base.Register(stubTaskTool{name: "read_file"})
-	base.Register(stubTaskTool{name: "task"})
-	task := &taskTool{baseRegistry: base}
-	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"read_file", "task"}})
+	task := &taskTool{}
+	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"read_file", "task"}}, parentMutationScope{})
 	if _, ok := registry.Get("read_file"); !ok {
 		t.Fatal("buildRegistry missing allowed read_file tool")
 	}
@@ -165,7 +168,7 @@ func TestTaskToolWrapsReadOnlyRunCommandWithParentPermission(t *testing.T) {
 		},
 	}
 
-	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"run_command"}})
+	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"run_command"}}, parentMutationScope{})
 	runCommand, ok := registry.Get("run_command")
 	if !ok {
 		t.Fatal("buildRegistry missing run_command")
@@ -197,7 +200,7 @@ func TestTaskToolReadOnlyRunCommandCanAskAndExecute(t *testing.T) {
 		},
 	}
 
-	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"run_command"}})
+	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"run_command"}}, parentMutationScope{})
 	runCommand, ok := registry.Get("run_command")
 	if !ok {
 		t.Fatal("buildRegistry missing run_command")
@@ -221,7 +224,7 @@ func TestTaskToolReadOnlyRunCommandCanAskAndExecute(t *testing.T) {
 func TestTaskToolReadOnlyRunCommandFailsClosedWithoutPermissionGate(t *testing.T) {
 	task := &taskTool{}
 
-	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"run_command"}})
+	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"run_command"}}, parentMutationScope{})
 	runCommand, ok := registry.Get("run_command")
 	if !ok {
 		t.Fatal("buildRegistry missing run_command")
@@ -249,10 +252,166 @@ func TestTaskToolStateAndSessionID(t *testing.T) {
 	if !cancelled {
 		t.Fatal("cancelParent was not preserved")
 	}
+}
 
-	id1, id2 := genSessionID(), genSessionID()
-	if len(id1) != 8 || len(id2) != 8 || id1 == id2 {
-		t.Fatalf("genSessionID = %q, %q; want distinct 8-char IDs", id1, id2)
+func TestTaskToolPersistsInspectableChildSession(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch calls.Add(1) {
+		case 1:
+			writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"inspect child","subagent_type":"explore"}]}`)
+		case 2:
+			writeTextResponse(w, "CHILD_ONLY")
+		case 3:
+			writeTextResponse(w, "PARENT_DONE")
+		default:
+			t.Fatalf("unexpected provider call")
+		}
+	}))
+	defer server.Close()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+	if _, err := a.Submit(ctx, "delegate"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	waitUntilEventOrderTurnEndCount(t, cap, 1)
+
+	parentID := a.SessionCurrent().ID
+	subEv := findSubagentStart(t, cap)
+	if subEv.SubagentSessionID == "" || subEv.SubagentSessionID == parentID {
+		t.Fatalf("subagent session id = %q, parent = %q", subEv.SubagentSessionID, parentID)
+	}
+
+	sessions, err := a.SessionList("active")
+	if err != nil {
+		t.Fatalf("SessionList: %v", err)
+	}
+	var foundChild bool
+	for _, s := range sessions {
+		if s.ID == subEv.SubagentSessionID {
+			foundChild = true
+			if s.ParentSessionID != parentID {
+				t.Fatalf("child ParentSessionID = %q, want %q", s.ParentSessionID, parentID)
+			}
+		}
+	}
+	if !foundChild {
+		t.Fatalf("child session %q not listed in active sessions: %#v", subEv.SubagentSessionID, sessions)
+	}
+
+	for _, msg := range a.SessionMessages() {
+		if msg.Type == "user" && msg.Content == "inspect child" {
+			t.Fatal("parent transcript contains child user prompt")
+		}
+		if msg.Type == "assistant" && msg.Content == "CHILD_ONLY" {
+			t.Fatal("parent transcript contains child assistant row")
+		}
+	}
+
+	if err := a.SessionSwitch(subEv.SubagentSessionID); err != nil {
+		t.Fatalf("SessionSwitch child: %v", err)
+	}
+	child := a.SessionCurrent()
+	if child.ParentSessionID != parentID {
+		t.Fatalf("current child ParentSessionID = %q, want %q", child.ParentSessionID, parentID)
+	}
+	childMsgs := a.SessionMessages()
+	if !hasDisplayMessage(childMsgs, "user", "inspect child") {
+		t.Fatalf("child transcript missing task prompt: %#v", childMsgs)
+	}
+	if !hasDisplayMessage(childMsgs, "assistant", "CHILD_ONLY") {
+		t.Fatalf("child transcript missing assistant result: %#v", childMsgs)
+	}
+}
+
+func TestTaskToolChildStagedEditUsesParentTurnSnapshot(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch calls.Add(1) {
+		case 1:
+			writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"edit target","subagent_type":"editor"}]}`)
+		case 2:
+			writeTaskToolCallResponse(w, "call_read", "read_file", `{"path":"target.txt"}`)
+		case 3:
+			writeTaskToolCallResponse(w, "call_edit", "edit_file", `{"path":"target.txt","old_string":"old","new_string":"new","pending":true}`)
+		case 4:
+			writeTextResponse(w, "child edited")
+		case 5:
+			writeTextResponse(w, "parent done")
+		default:
+			t.Fatalf("unexpected provider call")
+		}
+	}))
+	defer server.Close()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	a.cfg.Permissions.Allow = []string{"read_file(/**)", "edit_file(/**)", "write_file(/**)"}
+	writeProjectSubagentType(t, a.projectRoot, "editor", []string{"read_file", "edit_file", "execute_pending"})
+	target := filepath.Join(a.projectRoot, "target.txt")
+	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+	res, err := a.Submit(ctx, "delegate edit")
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	waitUntilEventOrderTurnEndCount(t, cap, 1)
+	if got, err := os.ReadFile(target); err != nil || string(got) != "new" {
+		t.Fatalf("target after child staged edit = %q, %v; want new", got, err)
+	}
+	if _, err := a.ApplyTurnAction(res.Turn, TurnActionRevertCode, false); err != nil {
+		t.Fatalf("ApplyTurnAction revert_code: %v", err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "old" {
+		t.Fatalf("target after parent revert = %q, %v; want old", got, err)
+	}
+}
+
+func writeTaskToolCallResponse(w http.ResponseWriter, callID, name, args string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	fmt.Fprintf(w, `data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":%q,"type":"function","function":{"name":%q,"arguments":%q}}]},"finish_reason":"tool_calls"}]}`+"\n\n", callID, name, args)
+	fmt.Fprint(w, "data: [DONE]\n\n")
+}
+
+func findSubagentStart(t *testing.T, cap *eventCapture) Event {
+	t.Helper()
+	for _, ev := range cap.snapshot() {
+		if ev.Kind == EventSubagentStart {
+			return ev
+		}
+	}
+	t.Fatalf("missing subagent start event: %#v", cap.snapshot())
+	return Event{}
+}
+
+func hasDisplayMessage(msgs []DisplayMessage, typ, content string) bool {
+	for _, msg := range msgs {
+		if msg.Type == typ && msg.Content == content {
+			return true
+		}
+	}
+	return false
+}
+
+func writeProjectSubagentType(t *testing.T, projectRoot, name string, tools []string) {
+	t.Helper()
+	dir := filepath.Join(projectRoot, ".lightcode", "agents")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir agents: %v", err)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "---\nname: %s\ndescription: test %s\ntools:\n", name, name)
+	for _, toolName := range tools {
+		fmt.Fprintf(&b, "  - %s\n", toolName)
+	}
+	fmt.Fprint(&b, "---\nTest subagent.")
+	if err := os.WriteFile(filepath.Join(dir, name+".md"), []byte(b.String()), 0o644); err != nil {
+		t.Fatalf("write subagent type: %v", err)
 	}
 }
 
@@ -265,34 +424,22 @@ func (s stubTaskTool) Execute(context.Context, map[string]any) (string, error) {
 	return "ok", nil
 }
 
-// A non-read-only subagent type that includes "run_command" must resolve
-// to the parent's permission-wrapped run_command from baseRegistry, not
-// an unwrapped instance.
-func TestPR11Closure_NonReadOnlySubagentRunCommandIsPermissionWrapped(t *testing.T) {
-	var sentinelCheckCalled bool
-	sentinel := stubTaskTool{name: "run_command"}
-	wrapped := tool.WrapWithPermission(
-		sentinel,
-		func(toolName, arg string) permission.Decision {
-			sentinelCheckCalled = true
+// A non-read-only subagent type that includes "run_command" must build a
+// fresh permission-wrapped run_command, not reuse a parent registry object.
+func TestSubagentRunCommandUsesFreshPermissionWrappedTool(t *testing.T) {
+	var checkedTool, checkedArg string
+	task := &taskTool{
+		check: func(toolName, arg string) permission.Decision {
+			checkedTool, checkedArg = toolName, arg
 			return permission.DecisionAllow
 		},
-		func(context.Context, permission.Request) permission.ResponseAction {
-			return permission.ResponseDeny
-		},
-	)
+	}
 
-	base := tool.NewRegistry()
-	base.Register(wrapped)
-	base.Register(stubTaskTool{name: "write_file"})
-
-	task := &taskTool{baseRegistry: base}
-	// Non-read-only type: tool list includes write_file.
 	at := subagent.AgentType{Tools: []string{"run_command", "write_file"}}
 	if isReadOnlyType(at) {
 		t.Fatal("test setup: at must be non-read-only")
 	}
-	registry := task.buildRegistry(at)
+	registry := task.buildRegistry(at, parentMutationScope{})
 	runCommand, ok := registry.Get("run_command")
 	if !ok {
 		t.Fatal("buildRegistry missing run_command for non-read-only subagent")
@@ -300,12 +447,10 @@ func TestPR11Closure_NonReadOnlySubagentRunCommandIsPermissionWrapped(t *testing
 
 	_, err := runCommand.Execute(context.Background(), map[string]any{"command": "echo ok"})
 	if err != nil {
-		// We don't care whether the inner sentinel succeeds; we just need its
-		// permission gate to have run.
-		_ = err
+		t.Fatalf("run_command Execute: %v", err)
 	}
-	if !sentinelCheckCalled {
-		t.Fatal("permission check on wrapped run_command was not invoked; resolved tool was not the baseRegistry-wrapped variant")
+	if checkedTool != "run_command" || checkedArg != "echo ok" {
+		t.Fatalf("permission check = %q/%q, want run_command/echo ok", checkedTool, checkedArg)
 	}
 }
 

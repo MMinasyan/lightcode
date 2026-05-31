@@ -337,7 +337,7 @@ func New(c Config) (*Agent, error) {
 	tt := newTaskTool(taskToolConfig{
 		Loader:        loader,
 		ParentStore:   store,
-		BaseRegistry:  registry,
+		ParentTracker: fileTracker,
 		MaxConcurrent: c.Cfg.Subagents.MaxConcurrent,
 		TaggedEvents:  taggedEvts,
 		ModelCatalog:  modelCatalog,
@@ -348,8 +348,14 @@ func New(c Config) (*Agent, error) {
 		HomeDir:       c.Home,
 		WorkspaceRoot: rt.workspaceRoot,
 		ProcMgr:       procMgr,
+		MemoryStore:   memStore,
+		ProjectID:     projectID,
+		MemoriesDir:   memoriesDir,
+		LSPManager:    lspMgr,
 		Check:         checkPolicy,
 		Ask:           askPolicy,
+		AskAction:     askActionPolicy,
+		UsageRecorder: agentUsageRecorder{agent: a},
 	})
 	registry.Register(tt)
 	a.subagentLoader = loader
@@ -2044,12 +2050,13 @@ func (a *Agent) SessionCurrent() SessionSummary {
 		return SessionSummary{ID: a.store.SessionID()}
 	}
 	return SessionSummary{
-		ID:           meta.ID,
-		CreatedAt:    meta.CreatedAt,
-		LastActivity: meta.LastActivity,
-		State:        metaState(meta.State),
-		ArchivedAt:   meta.ArchivedAt,
-		ProjectPath:  meta.ProjectPath,
+		ID:              meta.ID,
+		CreatedAt:       meta.CreatedAt,
+		LastActivity:    meta.LastActivity,
+		State:           metaState(meta.State),
+		ArchivedAt:      meta.ArchivedAt,
+		ProjectPath:     meta.ProjectPath,
+		ParentSessionID: meta.ParentSessionID,
 	}
 }
 
@@ -2065,12 +2072,13 @@ func (a *Agent) SessionList(state string) ([]SessionSummary, error) {
 	out := make([]SessionSummary, len(infos))
 	for i, info := range infos {
 		out[i] = SessionSummary{
-			ID:           info.ID,
-			CreatedAt:    info.CreatedAt,
-			LastActivity: info.LastActivity,
-			State:        info.State,
-			ArchivedAt:   info.ArchivedAt,
-			ProjectPath:  info.ProjectPath,
+			ID:              info.ID,
+			CreatedAt:       info.CreatedAt,
+			LastActivity:    info.LastActivity,
+			State:           info.State,
+			ArchivedAt:      info.ArchivedAt,
+			ProjectPath:     info.ProjectPath,
+			ParentSessionID: info.ParentSessionID,
 		}
 	}
 	return out, nil
