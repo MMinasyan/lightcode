@@ -48,6 +48,7 @@ func WrapWithPermission(t Tool, check CheckFunc, ask AskFunc) *PermWrapped {
 func (p *PermWrapped) Name() string                     { return p.inner.Name() }
 func (p *PermWrapped) Description() string              { return p.inner.Description() }
 func (p *PermWrapped) ParametersSchema() map[string]any { return p.inner.ParametersSchema() }
+func (p *PermWrapped) WrappedTool() Tool                { return p.inner }
 
 func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (string, error) {
 	execParams, err := resolveFileToolParams(p.inner.Name(), params)

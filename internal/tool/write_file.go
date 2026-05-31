@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -120,6 +121,12 @@ func (w *WriteFile) Execute(_ context.Context, params map[string]any) (string, e
 	return res.Result, nil
 }
 
+func (w *WriteFile) ValidateStaged(_ context.Context, args json.RawMessage) error {
+	return validateWriteStagedArgs(args)
+}
+
+func (w *WriteFile) StagedResultMessage() string { return "Staged." }
+
 // WriteFileWithSnapshot wraps WriteFile so that every successful write
 // is preceded by a call to the snapshot store.
 type WriteFileWithSnapshot struct {
@@ -138,6 +145,12 @@ func (*WriteFileWithSnapshot) Description() string { return (&WriteFile{}).Descr
 func (*WriteFileWithSnapshot) ParametersSchema() map[string]any {
 	return (&WriteFile{}).ParametersSchema()
 }
+
+func (*WriteFileWithSnapshot) ValidateStaged(_ context.Context, args json.RawMessage) error {
+	return validateWriteStagedArgs(args)
+}
+
+func (*WriteFileWithSnapshot) StagedResultMessage() string { return "Staged." }
 
 func (w *WriteFileWithSnapshot) Execute(_ context.Context, params map[string]any) (string, error) {
 	path, _ := params["path"].(string)
@@ -175,6 +188,21 @@ func (w *WriteFileWithSnapshot) Execute(_ context.Context, params map[string]any
 	}
 	retainMutatedSnapshot(snapshot)
 	return res.Result, nil
+}
+
+func validateWriteStagedArgs(args json.RawMessage) error {
+	var params map[string]any
+	if err := json.Unmarshal(args, &params); err != nil {
+		return fmt.Errorf("write_file: invalid staged arguments: %w", err)
+	}
+	path, _ := params["path"].(string)
+	if path == "" {
+		return fmt.Errorf("write_file: path is required")
+	}
+	if _, ok := params["content"].(string); !ok {
+		return fmt.Errorf("write_file: content must be a string")
+	}
+	return nil
 }
 
 // writeFileExecCommon is the shared implementation.

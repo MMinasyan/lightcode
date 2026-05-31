@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/coremodel"
 	"github.com/MMinasyan/lightcode/internal/message"
 	"github.com/MMinasyan/lightcode/internal/modelclient"
@@ -164,6 +165,25 @@ func TestRunStreamUsesModelClientInterface(t *testing.T) {
 	}
 	if !sawUsage {
 		t.Fatal("did not receive usage event with full ModelRef")
+	}
+}
+
+func TestNormalizeAssistantToolCallsUsesRegisteredNormalizer(t *testing.T) {
+	registry := tool.NewRegistry()
+	registry.Register(tool.Sleep{})
+	lp := &Loop{registry: registry}
+	msg := message.Message{
+		Role: message.RoleAssistant,
+		ToolCalls: []message.ToolCall{{
+			ID:       "call_sleep",
+			Type:     "function",
+			Function: message.FunctionCall{Name: "sleep", Arguments: `{"seconds":0}`},
+		}},
+	}
+
+	got := lp.normalizeAssistantToolCalls(msg)
+	if got.ToolCalls[0].Function.Arguments != `{"seconds":1}` {
+		t.Fatalf("normalized args = %q, want seconds clamped", got.ToolCalls[0].Function.Arguments)
 	}
 }
 
@@ -787,7 +807,8 @@ func TestWakeSignalDuringTextModelCallStartsNextModelRequest(t *testing.T) {
 	}
 }
 
-func TestValidateStagedWriteRequiresStringContent(t *testing.T) {
+func TestStageableWriteRequiresStringContent(t *testing.T) {
+	writer := tool.NewWriteFile(nil, config.ToolsConfig{})
 	for _, tc := range []struct {
 		name   string
 		params map[string]any
@@ -807,9 +828,13 @@ func TestValidateStagedWriteRequiresStringContent(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateStagedCall("write_file", tc.params)
+			args, err := json.Marshal(tc.params)
+			if err != nil {
+				t.Fatalf("marshal args: %v", err)
+			}
+			err = writer.ValidateStaged(context.Background(), args)
 			if err == nil || err.Error() != "write_file: content must be a string" {
-				t.Fatalf("validateStagedCall error = %v, want content type error", err)
+				t.Fatalf("ValidateStaged error = %v, want content type error", err)
 			}
 		})
 	}
@@ -832,13 +857,17 @@ func (t queueSignalTool) Execute(context.Context, map[string]any) (string, error
 	return "tool result", nil
 }
 
-func TestValidateStagedWriteAllowsEmptyContent(t *testing.T) {
-	err := validateStagedCall("write_file", map[string]any{
+func TestStageableWriteAllowsEmptyContent(t *testing.T) {
+	writer := tool.NewWriteFile(nil, config.ToolsConfig{})
+	args, err := json.Marshal(map[string]any{
 		"path":    "file.txt",
 		"content": "",
 	})
 	if err != nil {
-		t.Fatalf("validateStagedCall returned error for empty content: %v", err)
+		t.Fatalf("marshal args: %v", err)
+	}
+	if err := writer.ValidateStaged(context.Background(), args); err != nil {
+		t.Fatalf("ValidateStaged returned error for empty content: %v", err)
 	}
 }
 

@@ -333,7 +333,12 @@ func TestSessionMessagesAppliesStagedFlushOverlayToToolStub(t *testing.T) {
 	}
 	args := `{"path":"file.txt","old_string":"a","new_string":"b"}`
 	realResult := "Edited file.txt (1 replacement, lines 1-2)."
-	appendStagedEditTurn(t, a, args, []tool.BatchResult{{ToolCallID: "call_1", Result: realResult}})
+	wantMeta := editpreview.MetadataFromArgs(args, realResult)
+	if wantMeta == nil {
+		t.Fatal("test setup: expected non-nil edit_preview metadata for this args+result")
+	}
+	wantMeta["source"] = "persisted"
+	appendStagedEditTurn(t, a, args, []tool.BatchResult{{ToolCallID: "call_1", Result: realResult, Metadata: wantMeta}})
 
 	display := a.SessionMessages()
 	// Expect exactly: user "do edit", then the tool row with the REAL result —
@@ -351,13 +356,19 @@ func TestSessionMessagesAppliesStagedFlushOverlayToToolStub(t *testing.T) {
 	if tr.Result != realResult {
 		t.Fatalf("tool row result = %q, want real result (not \"Staged.\")", tr.Result)
 	}
-	// Metadata is recomputed from args+result and must equal the live path's.
-	wantMeta := editpreview.MetadataFromArgs(args, realResult)
-	if wantMeta == nil {
-		t.Fatal("test setup: expected non-nil edit_preview metadata for this args+result")
+	if tr.Metadata["source"] != "persisted" {
+		t.Fatalf("tool row metadata source = %#v, want persisted wrapper metadata", tr.Metadata["source"])
 	}
-	if !reflect.DeepEqual(tr.Metadata, wantMeta) {
-		t.Fatalf("tool row metadata = %#v, want %#v (recomputed equals live)", tr.Metadata, wantMeta)
+	wantPreview, ok := editpreview.FromMetadata(wantMeta)
+	if !ok {
+		t.Fatal("test setup: expected preview from metadata")
+	}
+	gotPreview, ok := editpreview.FromMetadata(tr.Metadata)
+	if !ok {
+		t.Fatalf("tool row metadata did not contain edit preview: %#v", tr.Metadata)
+	}
+	if !reflect.DeepEqual(gotPreview, wantPreview) {
+		t.Fatalf("tool row preview = %#v, want %#v", gotPreview, wantPreview)
 	}
 	// No row should be a fake user bubble from the wrapper.
 	for _, m := range display {

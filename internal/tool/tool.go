@@ -5,6 +5,7 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -32,12 +33,50 @@ type Tool interface {
 	Execute(ctx context.Context, params map[string]any) (string, error)
 }
 
+// ArgumentNormalizer can rewrite raw model arguments before persistence,
+// display, and execution.
+type ArgumentNormalizer interface {
+	NormalizeArguments(json.RawMessage) (json.RawMessage, error)
+}
+
+// DisplayMetadataProvider can derive UI metadata from tool args and result.
+type DisplayMetadataProvider interface {
+	DisplayMetadata(ctx context.Context, args json.RawMessage, result string) map[string]any
+}
+
+// StageableTool can stage a call for later batch execution.
+type StageableTool interface {
+	ValidateStaged(ctx context.Context, args json.RawMessage) error
+	StagedResultMessage() string
+}
+
+// ToolCall is the generic identity of a model-requested tool call.
+type ToolCall struct {
+	Name      string
+	ID        string
+	Arguments json.RawMessage
+}
+
+// PendingExecutor applies staged calls at flush time.
+type PendingExecutor interface {
+	ExecutePending(ctx context.Context, staged []StagedCall) []BatchResult
+}
+
+// PendingCoordinator owns pending-queue flush policy.
+type PendingCoordinator interface {
+	ExplicitFlushToolName() string
+	FlushPending(ctx context.Context, q *PendingQueue) ([]BatchResult, bool, error)
+	AutoFlushBefore(ctx context.Context, next ToolCall, q *PendingQueue) ([]BatchResult, bool, error)
+	FlushAtTurnEnd(ctx context.Context, q *PendingQueue) ([]BatchResult, bool, error)
+}
+
 // Registry holds all registered tools. Registration order is preserved
 // so that OpenAITools() emits a stable sequence, which helps with logging
 // and debugging across runs.
 type Registry struct {
-	tools map[string]Tool
-	order []string
+	tools              map[string]Tool
+	order              []string
+	pendingCoordinator PendingCoordinator
 }
 
 // NewRegistry returns an empty Registry.
@@ -58,6 +97,66 @@ func (r *Registry) Register(t Tool) {
 func (r *Registry) Get(name string) (Tool, bool) {
 	t, ok := r.tools[name]
 	return t, ok
+}
+
+func (r *Registry) capabilityTool(name string) (Tool, bool) {
+	t, ok := r.Get(name)
+	if !ok {
+		return nil, false
+	}
+	for {
+		wrapped, ok := t.(interface{ WrappedTool() Tool })
+		if !ok {
+			return t, true
+		}
+		t = wrapped.WrappedTool()
+		if t == nil {
+			return nil, false
+		}
+	}
+}
+
+// ArgumentNormalizer returns a registered tool's argument normalizer.
+func (r *Registry) ArgumentNormalizer(name string) (ArgumentNormalizer, bool) {
+	t, ok := r.capabilityTool(name)
+	if !ok {
+		return nil, false
+	}
+	n, ok := t.(ArgumentNormalizer)
+	return n, ok
+}
+
+// DisplayMetadataProvider returns a registered tool's display metadata provider.
+func (r *Registry) DisplayMetadataProvider(name string) (DisplayMetadataProvider, bool) {
+	t, ok := r.capabilityTool(name)
+	if !ok {
+		return nil, false
+	}
+	p, ok := t.(DisplayMetadataProvider)
+	return p, ok
+}
+
+// StageableTool returns a registered tool's staging capability.
+func (r *Registry) StageableTool(name string) (StageableTool, bool) {
+	t, ok := r.capabilityTool(name)
+	if !ok {
+		return nil, false
+	}
+	s, ok := t.(StageableTool)
+	return s, ok
+}
+
+// RegisterPendingCoordinator wires pending-queue behavior for this registry.
+func (r *Registry) RegisterPendingCoordinator(c PendingCoordinator) {
+	r.pendingCoordinator = c
+}
+
+// PendingCoordinator returns the registry-level pending coordinator.
+func (r *Registry) PendingCoordinator() (PendingCoordinator, bool) {
+	if r == nil || r.pendingCoordinator == nil {
+		return nil, false
+	}
+	return r.pendingCoordinator, true
 }
 
 // OpenAITools returns the tool definitions in the shape every OpenAI-

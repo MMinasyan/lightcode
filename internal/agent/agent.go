@@ -19,7 +19,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/compact"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/coremodel"
-	"github.com/MMinasyan/lightcode/internal/editpreview"
 	"github.com/MMinasyan/lightcode/internal/loop"
 	"github.com/MMinasyan/lightcode/internal/lsp"
 	"github.com/MMinasyan/lightcode/internal/memory"
@@ -2134,7 +2133,8 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 					// <staged-flush> wrapper: overlay the real per-staged results
 					// onto the tool stubs (which currently hold "Staged."), so
 					// reload matches the live per-tool ToolCallEnd events. Produces
-					// no transcript row. Metadata is recomputed from args+result.
+					// no transcript row. New wrappers carry metadata; old wrappers
+					// fall back to registry-derived metadata from args+result.
 					for _, e := range entries {
 						idx, found := toolStubs[e.ID]
 						if !found {
@@ -2143,8 +2143,10 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 						out[idx].Done = true
 						out[idx].Success = !e.IsError
 						out[idx].Result = e.Result
-						if out[idx].Success {
-							out[idx].Metadata = displayMetadataForToolCall(out[idx].Name, out[idx].Args, e.Result)
+						if out[idx].Success && e.Metadata != nil {
+							out[idx].Metadata = e.Metadata
+						} else if out[idx].Success {
+							out[idx].Metadata = a.displayMetadataForToolCall(out[idx].Name, out[idx].Args, e.Result)
 						} else {
 							out[idx].Metadata = nil
 						}
@@ -2197,7 +2199,7 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 					out[idx].Success = !displayToolResultIsError(m, out[idx].Name, content)
 					out[idx].Result = content
 					if out[idx].Success {
-						out[idx].Metadata = displayMetadataForToolCall(out[idx].Name, out[idx].Args, content)
+						out[idx].Metadata = a.displayMetadataForToolCall(out[idx].Name, out[idx].Args, content)
 					}
 				}
 			}
@@ -2302,14 +2304,15 @@ func backgroundProcessSuccess(bg *BackgroundProcessDisplay) bool {
 	return bg != nil && bg.Reason == string(process.ExitReasonCompleted) && bg.ExitCode == 0
 }
 
-func displayMetadataForToolCall(name, args, result string) map[string]any {
-	if name != "edit_file" {
+func (a *Agent) displayMetadataForToolCall(name, args, result string) map[string]any {
+	if a == nil || a.registry == nil {
 		return nil
 	}
-	if !strings.Contains(result, "lines ") {
+	provider, ok := a.registry.DisplayMetadataProvider(name)
+	if !ok {
 		return nil
 	}
-	return editpreview.MetadataFromArgs(args, result)
+	return provider.DisplayMetadata(context.Background(), json.RawMessage(args), result)
 }
 
 // --- Snapshot / revert operations ---

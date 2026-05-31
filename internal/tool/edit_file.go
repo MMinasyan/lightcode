@@ -2,12 +2,14 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/editpreview"
 	"github.com/MMinasyan/lightcode/internal/safefs"
 )
 
@@ -75,6 +77,16 @@ func (e *EditFile) Execute(_ context.Context, params map[string]any) (string, er
 	return e.editFileExec(params)
 }
 
+func (e *EditFile) ValidateStaged(_ context.Context, args json.RawMessage) error {
+	return validateEditStagedArgs(args)
+}
+
+func (e *EditFile) StagedResultMessage() string { return "Staged." }
+
+func (e *EditFile) DisplayMetadata(_ context.Context, args json.RawMessage, result string) map[string]any {
+	return editMetadataFromArgs(args, result)
+}
+
 // EditFileWithSnapshot wraps EditFile so the pre-edit file content is
 // captured by the snapshot store before the edit is applied.
 type EditFileWithSnapshot struct {
@@ -92,6 +104,16 @@ func (*EditFileWithSnapshot) Name() string        { return "edit_file" }
 func (*EditFileWithSnapshot) Description() string { return (&EditFile{}).Description() }
 func (*EditFileWithSnapshot) ParametersSchema() map[string]any {
 	return (&EditFile{}).ParametersSchema()
+}
+
+func (*EditFileWithSnapshot) ValidateStaged(_ context.Context, args json.RawMessage) error {
+	return validateEditStagedArgs(args)
+}
+
+func (*EditFileWithSnapshot) StagedResultMessage() string { return "Staged." }
+
+func (*EditFileWithSnapshot) DisplayMetadata(_ context.Context, args json.RawMessage, result string) map[string]any {
+	return editMetadataFromArgs(args, result)
 }
 
 func (e *EditFileWithSnapshot) Execute(_ context.Context, params map[string]any) (string, error) {
@@ -130,6 +152,33 @@ func (e *EditFileWithSnapshot) Execute(_ context.Context, params map[string]any)
 	}
 	retainMutatedSnapshot(snapshot)
 	return res.Result, nil
+}
+
+func validateEditStagedArgs(args json.RawMessage) error {
+	var params map[string]any
+	if err := json.Unmarshal(args, &params); err != nil {
+		return fmt.Errorf("edit_file: invalid staged arguments: %w", err)
+	}
+	path, _ := params["path"].(string)
+	if path == "" {
+		return fmt.Errorf("edit_file: path is required")
+	}
+	oldStr, _ := params["old_string"].(string)
+	newStr, _ := params["new_string"].(string)
+	if oldStr == "" {
+		return fmt.Errorf("edit_file: old_string must not be empty")
+	}
+	if oldStr == newStr {
+		return fmt.Errorf("edit_file: old_string and new_string are identical")
+	}
+	return nil
+}
+
+func editMetadataFromArgs(args json.RawMessage, result string) map[string]any {
+	if !strings.Contains(result, "lines ") {
+		return nil
+	}
+	return editpreview.MetadataFromArgs(string(args), result)
 }
 
 func (e *EditFile) editFileExec(params map[string]any) (string, error) {
