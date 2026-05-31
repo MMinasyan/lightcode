@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/coremodel"
-	"github.com/MMinasyan/lightcode/internal/message"
-	"github.com/MMinasyan/lightcode/internal/modelclient"
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
+	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
 )
 
 type fakeSummarizer struct {

@@ -18,11 +18,11 @@ import (
 	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 	"github.com/MMinasyan/lightcode/internal/compact"
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/coremodel"
-	"github.com/MMinasyan/lightcode/internal/loop"
+	loop "github.com/MMinasyan/lightcode/internal/engine"
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/lsp"
 	"github.com/MMinasyan/lightcode/internal/memory"
-	"github.com/MMinasyan/lightcode/internal/message"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/process"
@@ -375,7 +375,9 @@ func New(c Config) (*Agent, error) {
 	l.SetStore(store)
 	l.SetContextTransformer(a)
 	l.SetUsageRecorder(agentUsageRecorder{agent: a})
-	l.SetPendingExecutor(tool.NewStagedExecutorAtRoot(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askActionPolicy))
+	pendingExecutor := tool.NewStagedExecutorAtRoot(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askActionPolicy)
+	l.SetPendingExecutor(pendingExecutor)
+	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 	a.lp = l
 
 	return a, nil
@@ -388,6 +390,8 @@ func (a *Agent) SetEventHandler(fn func(Event)) {
 }
 
 func (rt *runtime) setEventHandler(fn func(Event)) {
+	rt.eventMu.Lock()
+	defer rt.eventMu.Unlock()
 	rt.onEvent = fn
 }
 
@@ -444,8 +448,11 @@ func (a *Agent) emitEvent(ev Event) {
 }
 
 func (rt *runtime) emitEvent(ev Event) {
-	if rt.onEvent != nil {
-		rt.onEvent(ev)
+	rt.eventMu.RLock()
+	fn := rt.onEvent
+	rt.eventMu.RUnlock()
+	if fn != nil {
+		fn(ev)
 	}
 }
 
@@ -615,6 +622,9 @@ func (a *Agent) drainLoopEvents(ctx context.Context) {
 
 func (rt *runtime) drainLoopEvents(ctx context.Context) {
 	for {
+		if rt.drainOneTaggedEvent() {
+			continue
+		}
 		select {
 		case ev, ok := <-rt.loopEvents:
 			if !ok {
@@ -635,15 +645,35 @@ func (rt *runtime) drainLoopEvents(ctx context.Context) {
 	}
 }
 
+func (rt *runtime) drainOneTaggedEvent() bool {
+	select {
+	case tev, ok := <-rt.taggedEvents:
+		if !ok {
+			return false
+		}
+		rt.dispatchTaggedEvent(tev)
+		return true
+	default:
+		return false
+	}
+}
+
 func (a *Agent) drainPendingLoopEvents() {
 	a.ensureRuntime().drainPendingLoopEvents()
 }
 
 func (rt *runtime) drainPendingLoopEvents() {
 	for {
+		if rt.drainOneTaggedEvent() {
+			continue
+		}
 		select {
 		case ev := <-rt.loopEvents:
 			rt.dispatchLoopEvent(ev)
+		case tev, ok := <-rt.taggedEvents:
+			if ok {
+				rt.dispatchTaggedEvent(tev)
+			}
 		default:
 			return
 		}
@@ -773,6 +803,19 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 		base.IsError = ev.IsError
 		base.Result = ev.Result
 		base.Metadata = ev.Metadata
+	case loop.BackgroundProcessComplete:
+		base.Kind = EventBackgroundProcessComplete
+		base.Result = ev.Result
+		base.IsError = ev.IsError
+		if ev.BackgroundProcess != nil {
+			base.BackgroundProcess = &BackgroundProcessDisplay{
+				ID:       ev.BackgroundProcess.ID,
+				Command:  ev.BackgroundProcess.Command,
+				Reason:   ev.BackgroundProcess.Reason,
+				ExitCode: ev.BackgroundProcess.ExitCode,
+				Output:   ev.BackgroundProcess.Output,
+			}
+		}
 	case loop.Usage:
 		a.recordUsage(ev)
 		return
@@ -942,7 +985,10 @@ func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
 
 func (a *Agent) compactAtCheckpoint(ctx context.Context, checkpoint loop.ContextTransformCheckpoint) (int, error) {
 	a.emitEvent(Event{Kind: EventCompactionStart})
-	defer a.emitEvent(Event{Kind: EventCompactionEnd})
+	refreshSessionNow := false
+	defer func() {
+		a.emitEvent(Event{Kind: EventCompactionEnd, RefreshSession: refreshSessionNow})
+	}()
 
 	messages := a.lp.Messages()
 	activeStart := checkpoint.ActiveTurnStart
@@ -952,6 +998,7 @@ func (a *Agent) compactAtCheckpoint(ctx context.Context, checkpoint loop.Context
 	if activeStart <= 1 {
 		return activeStart, fmt.Errorf("nothing to compact")
 	}
+	activeTail := activeStart < len(messages)
 	toSummarize := append([]message.Message(nil), messages[1:activeStart]...)
 
 	client, summarizerWindow := a.summarizerClientAndWindow()
@@ -989,7 +1036,7 @@ func (a *Agent) compactAtCheckpoint(ctx context.Context, checkpoint loop.Context
 
 	var activeReads []tool.ReadRecord
 	if a.fileTracker != nil && activeStart < len(messages) {
-		activeReads = activeTailReadRecords(messages[activeStart:], a.fileTracker.Snapshot(), a.cfg.Tools.ReadMaxLines)
+		activeReads = activeTailReadRecords(messages[activeStart:], a.fileTracker.Snapshot(), a.cfg.Tools.ReadMaxLines, a.ensureRuntime().workspaceRoot)
 	}
 
 	if a.memoryHooks != nil {
@@ -1013,6 +1060,11 @@ func (a *Agent) compactAtCheckpoint(ctx context.Context, checkpoint loop.Context
 			a.fileTracker.Reset()
 		}
 	}
+	if activeTail {
+		a.ensureRuntime().deferSessionRefreshAfterTurn()
+	} else {
+		refreshSessionNow = true
+	}
 
 	a.tokensMu.Lock()
 	a.lastContextUsed = 0
@@ -1021,7 +1073,21 @@ func (a *Agent) compactAtCheckpoint(ctx context.Context, checkpoint loop.Context
 	return newActiveStart, nil
 }
 
-func activeTailReadRecords(tail []message.Message, reads []tool.ReadRecord, defaultLimit int) []tool.ReadRecord {
+func (rt *runtime) deferSessionRefreshAfterTurn() {
+	rt.mu.Lock()
+	rt.sessionRefreshAfterTurn = true
+	rt.mu.Unlock()
+}
+
+func (rt *runtime) takeDeferredSessionRefreshAfterTurn() bool {
+	rt.mu.Lock()
+	refresh := rt.sessionRefreshAfterTurn
+	rt.sessionRefreshAfterTurn = false
+	rt.mu.Unlock()
+	return refresh
+}
+
+func activeTailReadRecords(tail []message.Message, reads []tool.ReadRecord, defaultLimit int, workspaceRoot string) []tool.ReadRecord {
 	if len(tail) == 0 || len(reads) == 0 {
 		return nil
 	}
@@ -1047,7 +1113,7 @@ func activeTailReadRecords(tail []message.Message, reads []tool.ReadRecord, defa
 			if path == "" {
 				continue
 			}
-			resolved, err := pathutil.ResolveFilePath(path)
+			resolved, err := pathutil.ResolveFilePathFrom(workspaceRoot, path)
 			if err != nil {
 				continue
 			}
@@ -1644,12 +1710,19 @@ func (rt *runtime) launchTurn(ctx context.Context, turnCtx context.Context, canc
 		}
 
 		if err != nil {
-			a.emitEvent(Event{Kind: EventError, Error: err.Error(), Turn: turn})
+			a.emitEvent(Event{Kind: EventError, Error: a.turnErrorMessage(err), Turn: turn})
 		}
-		a.emitEvent(Event{Kind: EventTurnEnd, Turn: turn, Cancelled: turnCtx.Err() != nil})
+		a.emitEvent(Event{Kind: EventTurnEnd, Turn: turn, Cancelled: turnCtx.Err() != nil, RefreshSession: rt.takeDeferredSessionRefreshAfterTurn()})
 	}()
 
 	return turn
+}
+
+func (a *Agent) turnErrorMessage(err error) string {
+	if errors.Is(err, loop.ErrNoModelConfigured) {
+		return "no model configured — set default_model in ~/.lightcode/config.json and an API key in ~/.lightcode/.env"
+	}
+	return err.Error()
 }
 
 // Cancel aborts the current turn.
@@ -2268,7 +2341,20 @@ func (a *Agent) SessionMessages() []DisplayMessage {
 	if a.store == nil || !a.store.Active() {
 		return nil
 	}
-	return a.messagesForFrontend()
+	msgs, _ := a.messagesForFrontendForSession("")
+	return msgs
+}
+
+// SessionMessagesFor returns persisted messages for a session without
+// switching the active session.
+func (a *Agent) SessionMessagesFor(id string) ([]DisplayMessage, error) {
+	if a.store == nil {
+		return nil, snapshot.ErrNoSession
+	}
+	if id == "" {
+		return a.SessionMessages(), nil
+	}
+	return a.messagesForFrontendForSession(id)
 }
 
 func (a *Agent) currentSessionsRoot() (string, error) {
@@ -2305,12 +2391,35 @@ func (a *Agent) closeIfCurrent(id string) (bool, error) {
 }
 
 func (a *Agent) messagesForFrontend() []DisplayMessage {
-	rec, _ := a.store.LoadCompaction()
-	var raw []snapshot.TurnMessages
-	if rec != nil {
-		raw, _ = a.store.LoadCompleteTurnsAfter(rec.BoundaryTurn)
+	msgs, _ := a.messagesForFrontendForSession("")
+	return msgs
+}
+
+func (a *Agent) messagesForFrontendForSession(sessionID string) ([]DisplayMessage, error) {
+	var rec *snapshot.CompactionRecord
+	var err error
+	if sessionID == "" {
+		rec, err = a.store.LoadCompaction()
 	} else {
-		raw, _ = a.store.LoadCompleteTurns()
+		rec, err = a.store.LoadCompactionForSession(sessionID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	var raw []snapshot.TurnMessages
+	if sessionID == "" {
+		if rec != nil {
+			raw, err = a.store.LoadCompleteTurnsAfterReadOnly(rec.BoundaryTurn)
+		} else {
+			raw, err = a.store.LoadCompleteTurnsReadOnly()
+		}
+	} else if rec != nil {
+		raw, err = a.store.LoadCompleteTurnsAfterForSessionReadOnly(sessionID, rec.BoundaryTurn)
+	} else {
+		raw, err = a.store.LoadCompleteTurnsForSessionReadOnly(sessionID)
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	var out []DisplayMessage
@@ -2406,13 +2515,17 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 					out[idx].Success = !displayToolResultIsError(m, out[idx].Name, content)
 					out[idx].Result = content
 					if out[idx].Success {
-						out[idx].Metadata = a.displayMetadataForToolCall(out[idx].Name, out[idx].Args, content)
+						out[idx].Metadata = m.DisplayMetadata
+						if out[idx].Metadata == nil {
+							out[idx].Metadata = a.displayMetadataForToolCall(out[idx].Name, out[idx].Args, content)
+						}
+						out[idx].SubagentSessionIDs = subagentSessionLinksFromMetadata(out[idx].Metadata)
 					}
 				}
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 // collapseOneLine flattens runs of whitespace (including newlines) to single
@@ -2434,6 +2547,25 @@ func displayToolResultIsError(msg message.Message, toolName, content string) boo
 			(strings.HasPrefix(content, "Applied ") && strings.Contains(content, " failed."))
 	}
 	return false
+}
+
+func subagentSessionLinksFromMetadata(metadata map[string]any) []SubagentSessionLink {
+	if len(metadata) == 0 {
+		return nil
+	}
+	raw, ok := metadata["subagent_session_ids"]
+	if !ok {
+		return nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var links []SubagentSessionLink
+	if err := json.Unmarshal(data, &links); err != nil {
+		return nil
+	}
+	return links
 }
 
 func parseBackgroundTerminalSignal(payload string) (*BackgroundProcessDisplay, bool) {

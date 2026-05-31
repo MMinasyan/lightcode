@@ -804,6 +804,33 @@ func TestLoadCompleteTurnsReturnsMessagesInOrderAndDeletesIncomplete(t *testing.
 	}
 }
 
+func TestLoadCompleteTurnsReadOnlyDoesNotRecoverOrDeleteIncomplete(t *testing.T) {
+	store := newTestStore(t)
+	turn1 := store.BeginTurn()
+	mustAppendMessage(t, store, turn1, `{"role":"user","content":"one"}`)
+	if err := store.MarkTurnComplete(turn1); err != nil {
+		t.Fatal(err)
+	}
+	turn2 := store.BeginTurn()
+	mustAppendMessage(t, store, turn2, `{"role":"user","content":"incomplete"}`)
+	mustAppendMessage(t, store, turn2, `{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}`)
+	mustAppendMessage(t, store, turn2, `{"role":"tool","tool_call_id":"call_1","content":"ok"}`)
+
+	turns, err := store.LoadCompleteTurnsReadOnly()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 1 || turns[0].Turn != 1 {
+		t.Fatalf("turns = %+v, want only complete turn 1", turns)
+	}
+	if _, err := os.Stat(filepath.Join(store.turnsDir, "2")); err != nil {
+		t.Fatalf("incomplete turn dir was removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(store.turnsDir, "2", "complete")); !os.IsNotExist(err) {
+		t.Fatalf("read-only load wrote complete marker, stat err = %v", err)
+	}
+}
+
 func TestLoadCompleteTurnsWithoutSessionReturnsErrNoSession(t *testing.T) {
 	store, err := NewForSessionsRoot(t.TempDir(), "", "")
 	if err != nil {

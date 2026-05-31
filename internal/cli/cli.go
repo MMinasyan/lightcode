@@ -763,7 +763,11 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.permFrame = transientMenuFrame{}
 		// Queue draining is backend-owned: the agent auto-drains after the turn
 		// ends and emits turn_start for the next turn. The CLI just re-prompts.
-		c.printInputPromptLocked()
+		if ev.RefreshSession {
+			c.refreshSessionLocked()
+		} else {
+			c.printInputPromptLocked()
+		}
 
 	case agent.EventError:
 		c.activeToolID = ""
@@ -793,7 +797,9 @@ func (c *CLI) handleEvent(ev agent.Event) {
 
 	case agent.EventCompactionEnd:
 		c.compacting = false
-		c.refreshSessionLocked()
+		if ev.RefreshSession {
+			c.refreshSessionLocked()
+		}
 
 	case agent.EventWarning:
 		c.activeToolID = ""
@@ -842,6 +848,25 @@ func (c *CLI) handleSubagentEvent(ev agent.Event) {
 				line += "\n" + strings.TrimRight(renderEditPreview(preview, "", c.width, false), "\r\n")
 			}
 		}
+		c.writeRaw(renderSubagentMsg(tag, line))
+	case agent.EventBackgroundProcessComplete:
+		result := truncate(ev.Result, 200)
+		status := "ok"
+		if ev.IsError {
+			status = "error"
+		}
+		if ev.BackgroundProcess == nil {
+			c.writeRaw(renderSubagentMsg(tag, fmt.Sprintf("background_process %s: %s", status, result)))
+			return
+		}
+		line := fmt.Sprintf(
+			"background_process %s %s %s exit %d: %s",
+			ev.BackgroundProcess.ID,
+			status,
+			ev.BackgroundProcess.Reason,
+			ev.BackgroundProcess.ExitCode,
+			result,
+		)
 		c.writeRaw(renderSubagentMsg(tag, line))
 	}
 }

@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/loop"
-	"github.com/MMinasyan/lightcode/internal/message"
+	loop "github.com/MMinasyan/lightcode/internal/engine"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
@@ -592,7 +592,7 @@ func TestAutoCompactionEventOrderInsideTurn(t *testing.T) {
 	defer server.Close()
 
 	a := newEventOrderAgent(t, server.URL+"/v1")
-	a.memoryStore = nil
+	a.memoryHooks = nil
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	a.SetEventHandler(func(Event) {})
@@ -650,6 +650,12 @@ func TestAutoCompactionEventOrderInsideTurn(t *testing.T) {
 	}
 	if !(turnStart < compactStart && compactStart < compactEnd && compactEnd < userDisplay && userDisplay < textDelta && textDelta < turnEnd) {
 		t.Fatalf("unexpected auto-compaction event order: turnStart=%d compactStart=%d compactEnd=%d userDisplay=%d textDelta=%d turnEnd=%d events=%#v", turnStart, compactStart, compactEnd, userDisplay, textDelta, turnEnd, events)
+	}
+	if events[compactEnd].RefreshSession {
+		t.Fatalf("active-turn compaction_end must not request immediate history refresh: %#v", events[compactEnd])
+	}
+	if !events[turnEnd].RefreshSession {
+		t.Fatalf("active-turn compaction must request deferred history refresh on turn_end: %#v", events[turnEnd])
 	}
 }
 
@@ -822,12 +828,44 @@ func TestActiveTailReadRecordsKeepsOnlyNewestMatchingRead(t *testing.T) {
 		}},
 	}}
 
-	got := activeTailReadRecords(tail, []tool.ReadRecord{oldRead, activeRead}, 500)
+	got := activeTailReadRecords(tail, []tool.ReadRecord{oldRead, activeRead}, 500, "")
 	if len(got) != 1 {
 		t.Fatalf("active read records len = %d, want 1: %#v", len(got), got)
 	}
 	if !got[0].Identity.Mtime.Equal(activeRead.Identity.Mtime) {
 		t.Fatalf("restored read mtime = %v, want newest active read %v", got[0].Identity.Mtime, activeRead.Identity.Mtime)
+	}
+}
+
+func TestActiveTailReadRecordsResolveRelativePathFromWorkspaceRoot(t *testing.T) {
+	projectRoot := t.TempDir()
+	otherCWD := t.TempDir()
+	t.Chdir(otherCWD)
+
+	filePath := filepath.Join(projectRoot, "tracked.txt")
+	if err := os.WriteFile(filePath, []byte("hello\n"), 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+	resolved, err := pathutil.ResolveFilePathFrom(projectRoot, "tracked.txt")
+	if err != nil {
+		t.Fatalf("resolve file: %v", err)
+	}
+	activeRead := tool.ReadRecord{Path: resolved.CanonicalPath, Offset: 1, Limit: 500, Identity: tool.FileIdentity{Mtime: time.Unix(2, 0)}}
+	tail := []message.Message{{
+		Role: message.RoleAssistant,
+		ToolCalls: []message.ToolCall{{
+			ID:       "call_read",
+			Type:     "function",
+			Function: message.FunctionCall{Name: "read_file", Arguments: `{"path":"tracked.txt"}`},
+		}},
+	}}
+
+	got := activeTailReadRecords(tail, []tool.ReadRecord{activeRead}, 500, projectRoot)
+	if len(got) != 1 {
+		t.Fatalf("active read records len = %d, want 1: %#v", len(got), got)
+	}
+	if got[0].Path != resolved.CanonicalPath {
+		t.Fatalf("restored path = %q, want %q", got[0].Path, resolved.CanonicalPath)
 	}
 }
 

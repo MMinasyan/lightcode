@@ -57,6 +57,8 @@ export function SessionList(arg1:string):Promise<Array<agent.SessionSummary>>;
 
 export function SessionMessages():Promise<Array<agent.DisplayMessage>>;
 
+export function SessionMessagesFor(arg1:string):Promise<Array<agent.DisplayMessage>>;
+
 export function SessionNew():Promise<void>;
 
 export function SessionSwitch(arg1:string):Promise<void>;

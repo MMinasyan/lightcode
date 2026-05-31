@@ -11,8 +11,8 @@ import (
 	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/coremodel"
-	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
 	openai "github.com/sashabaranov/go-openai"
 )
 

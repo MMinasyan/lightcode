@@ -543,21 +543,21 @@ func (s *Store) LoadCompleteTurns() ([]TurnMessages, error) {
 	}
 	s.discardIncompleteTurnsLocked()
 	turnsDir := s.turnsDir
-	turns := readIntDirs(turnsDir)
 	s.mu.Unlock()
-	var out []TurnMessages
-	for _, n := range turns {
-		data, err := os.ReadFile(filepath.Join(turnsDir, strconv.Itoa(n), "messages.jsonl"))
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return nil, fmt.Errorf("snapshot: read turn %d: %w", n, err)
-		}
-		lines := splitJSONL(data)
-		out = append(out, TurnMessages{Turn: n, Messages: lines})
+	return loadCompleteTurnsFromDir(turnsDir, 0, false)
+}
+
+// LoadCompleteTurnsReadOnly returns complete turns without attempting crash
+// recovery. It is safe for display reads while a turn is still in progress.
+func (s *Store) LoadCompleteTurnsReadOnly() ([]TurnMessages, error) {
+	s.mu.Lock()
+	if !s.active {
+		s.mu.Unlock()
+		return nil, ErrNoSession
 	}
-	return out, nil
+	turnsDir := s.turnsDir
+	s.mu.Unlock()
+	return loadCompleteTurnsFromDir(turnsDir, 0, false)
 }
 
 // SaveCompaction writes a compaction record to the session directory.
@@ -581,6 +581,20 @@ func (s *Store) LoadCompaction() (*CompactionRecord, error) {
 	}
 	dir := s.dir
 	s.mu.Unlock()
+	return loadCompactionFromDir(dir)
+}
+
+// LoadCompactionForSession reads another session's compaction record without
+// switching the active session.
+func (s *Store) LoadCompactionForSession(id string) (*CompactionRecord, error) {
+	dir, _, err := s.sessionReadDirs(id)
+	if err != nil {
+		return nil, err
+	}
+	return loadCompactionFromDir(dir)
+}
+
+func loadCompactionFromDir(dir string) (*CompactionRecord, error) {
 	path := filepath.Join(dir, "compaction.json")
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return nil, nil
@@ -601,11 +615,53 @@ func (s *Store) LoadCompleteTurnsAfter(after int) ([]TurnMessages, error) {
 	}
 	s.discardIncompleteTurnsLocked()
 	turnsDir := s.turnsDir
-	turns := readIntDirs(turnsDir)
 	s.mu.Unlock()
+	return loadCompleteTurnsFromDir(turnsDir, after, true)
+}
+
+// LoadCompleteTurnsAfterReadOnly returns complete turns after the boundary
+// without attempting crash recovery. It is safe for display reads while a turn
+// is still in progress.
+func (s *Store) LoadCompleteTurnsAfterReadOnly(after int) ([]TurnMessages, error) {
+	s.mu.Lock()
+	if !s.active {
+		s.mu.Unlock()
+		return nil, ErrNoSession
+	}
+	turnsDir := s.turnsDir
+	s.mu.Unlock()
+	return loadCompleteTurnsFromDir(turnsDir, after, true)
+}
+
+// LoadCompleteTurnsForSessionReadOnly returns another session's complete turns
+// without switching the active session or attempting crash recovery.
+func (s *Store) LoadCompleteTurnsForSessionReadOnly(id string) ([]TurnMessages, error) {
+	_, turnsDir, err := s.sessionReadDirs(id)
+	if err != nil {
+		return nil, err
+	}
+	return loadCompleteTurnsFromDir(turnsDir, 0, false)
+}
+
+// LoadCompleteTurnsAfterForSessionReadOnly returns another session's complete
+// turns after the boundary without switching the active session or attempting
+// crash recovery.
+func (s *Store) LoadCompleteTurnsAfterForSessionReadOnly(id string, after int) ([]TurnMessages, error) {
+	_, turnsDir, err := s.sessionReadDirs(id)
+	if err != nil {
+		return nil, err
+	}
+	return loadCompleteTurnsFromDir(turnsDir, after, true)
+}
+
+func loadCompleteTurnsFromDir(turnsDir string, after int, filterAfter bool) ([]TurnMessages, error) {
+	turns := readIntDirs(turnsDir)
 	var out []TurnMessages
 	for _, n := range turns {
-		if n <= after {
+		if filterAfter && n <= after {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(turnsDir, strconv.Itoa(n), "complete")); err != nil {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(turnsDir, strconv.Itoa(n), "messages.jsonl"))
@@ -619,6 +675,23 @@ func (s *Store) LoadCompleteTurnsAfter(after int) ([]TurnMessages, error) {
 		out = append(out, TurnMessages{Turn: n, Messages: lines})
 	}
 	return out, nil
+}
+
+func (s *Store) sessionReadDirs(id string) (string, string, error) {
+	if id == "" || id == "." || id == ".." || filepath.Base(id) != id {
+		return "", "", fmt.Errorf("snapshot: invalid session id %q", id)
+	}
+	s.mu.Lock()
+	root := s.root
+	s.mu.Unlock()
+	if root == "" {
+		return "", "", ErrNoSession
+	}
+	dir := filepath.Join(root, id)
+	if _, err := os.Stat(filepath.Join(dir, "meta.json")); err != nil {
+		return "", "", fmt.Errorf("snapshot: load %s: %w", id, err)
+	}
+	return dir, filepath.Join(dir, "turns"), nil
 }
 
 // TurnEntry describes one snapshot turn for UI display.

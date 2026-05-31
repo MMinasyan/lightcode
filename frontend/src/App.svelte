@@ -18,6 +18,12 @@
   import { viewer, appendSubagentEvent } from './lib/viewer.js';
   import { settings } from './lib/settings.js';
   import { errorText } from './lib/errors.js';
+  import {
+    mergeSubagentLinks,
+    rememberSubagentLink,
+    subagentLinksFromMetadata,
+    takePendingSubagentLinks,
+  } from './lib/subagentLinks.js';
 
   const VIEWER_THRESHOLD = 1100;
   const VIEWER_MIN_SIDE = VIEWER_THRESHOLD / 2;
@@ -76,6 +82,7 @@
   let showTokens = false;
   let warnings = [];
   let showWarnings = false;
+  let pendingSubagentSessionLinks = {};
 
   function mid() { return nextId++; }
 
@@ -86,6 +93,7 @@
 
   function rebuildFromHistory(persisted) {
     currentTurn = 0;
+    pendingSubagentSessionLinks = {};
     return (persisted || []).map(m => {
       if ((m.turn || 0) > currentTurn) currentTurn = m.turn;
       return { ...m, _id: mid() };
@@ -162,11 +170,25 @@
         messages[streamingIdx] = { ...messages[streamingIdx], partial:false };
       }
       streamingIdx = -1;
-      messages = [...messages, { _id:mid(), type:'tool', id:data.id, name:data.name, args:data.args, done:false, success:true, result:'' }];
+      const pending = takePendingSubagentLinks(pendingSubagentSessionLinks, data.id);
+      pendingSubagentSessionLinks = pending.pending;
+      const subagentSessionIds = pending.links;
+      messages = [...messages, { _id:mid(), type:'tool', id:data.id, name:data.name, args:data.args, done:false, success:true, result:'', subagentSessionIds }];
     });
 
     EventsOn('tool_result', (data) => {
-      messages = messages.map(m => m.type==='tool' && m.id===data.id ? {...m, done:true, success:data.success, result:data.output, name:data.name || m.name, args:data.args || m.args, metadata:data.metadata || m.metadata} : m);
+      const metadata = data.metadata || null;
+      const metadataLinks = subagentLinksFromMetadata(metadata);
+      messages = messages.map(m => m.type==='tool' && m.id===data.id ? {
+        ...m,
+        done:true,
+        success:data.success,
+        result:data.output,
+        name:data.name || m.name,
+        args:data.args || m.args,
+        metadata:metadata || m.metadata,
+        subagentSessionIds:mergeSubagentLinks(m.subagentSessionIds, metadataLinks),
+      } : m);
     });
 
     EventsOn('background_process_complete', (data) => {
@@ -269,10 +291,16 @@
     EventsOn('subagent_tool_result', (data) => {
       appendSubagentEvent(data.sessionId, { type: 'tool_result', id: data.id, success: data.success, output: data.output, name: data.name, args: data.args, metadata: data.metadata });
     });
+    EventsOn('subagent_background_process_complete', (data) => {
+      appendSubagentEvent(data.sessionId, { type: 'background_process_complete', id: data.id, command: data.command, reason: data.reason, exitCode: data.exitCode, success: data.success, output: data.output });
+    });
     EventsOn('subagent_session_start', (data) => {
+      const link = { index: Number(data.taskIndex), sessionId: data.sessionId };
+      const rowExists = messages.some(m => m.type === 'tool' && m.id === data.taskToolCallId);
+      if (!rowExists) pendingSubagentSessionLinks = rememberSubagentLink(pendingSubagentSessionLinks, data.taskToolCallId, link);
       messages = messages.map(m =>
         m.type === 'tool' && m.id === data.taskToolCallId
-          ? { ...m, subagentSessionIds: [...(m.subagentSessionIds || []), { index: data.taskIndex, sessionId: data.sessionId }] }
+          ? { ...m, subagentSessionIds: mergeSubagentLinks(m.subagentSessionIds, [link]) }
           : m
       );
     });

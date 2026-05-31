@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/MMinasyan/lightcode/internal/loop"
+	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
@@ -60,6 +60,7 @@ type runtime struct {
 	queueWake    chan struct{}
 	signalSink   agentSignalSink
 
+	eventMu sync.RWMutex
 	onEvent func(Event)
 
 	mu         sync.Mutex
@@ -72,6 +73,8 @@ type runtime struct {
 	queueSeq      int
 	transitioning bool
 	seenSessions  map[string]bool
+
+	sessionRefreshAfterTurn bool
 }
 
 func newRuntime(a *Agent, opts runtimeOptions) *runtime {

@@ -1,7 +1,7 @@
 package compact
 
 import (
-	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/pkoukk/tiktoken-go"
 )
 

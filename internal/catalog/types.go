@@ -1,7 +1,7 @@
 // Package catalog builds and validates Lightcode's provider/model catalog.
 package catalog
 
-import "github.com/MMinasyan/lightcode/internal/coremodel"
+import "github.com/MMinasyan/lightcode/internal/engine/coremodel"
 
 // ErrInvalidModelRef is returned when a provider-prefixed model reference is malformed.
 var ErrInvalidModelRef = coremodel.ErrInvalidModelRef

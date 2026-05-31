@@ -18,14 +18,6 @@ type ProcessManager interface {
 	Start(command string, timeoutSec int) (id string, err error)
 }
 
-// ExitError carries the combined output and exit code from a failed command.
-type ExitError struct {
-	Output   string
-	ExitCode int
-}
-
-func (e *ExitError) Error() string { return e.Output }
-
 // RunCommand implements the run_command tool.
 type RunCommand struct {
 	cfg           config.ToolsConfig

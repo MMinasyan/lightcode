@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/MMinasyan/lightcode/internal/coremodel"
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 )
 
 // Role is a canonical conversation role.
@@ -29,15 +29,16 @@ const (
 
 // Message is Lightcode's provider-independent message shape.
 type Message struct {
-	Role         Role
-	Content      []ContentPart
-	Refusal      string
-	ToolCalls    []ToolCall
-	ToolCallID   string
-	Name         string
-	Extra        Extra
-	Source       coremodel.ModelRef
-	InternalKind string
+	Role            Role
+	Content         []ContentPart
+	Refusal         string
+	ToolCalls       []ToolCall
+	ToolCallID      string
+	Name            string
+	Extra           Extra
+	Source          coremodel.ModelRef
+	InternalKind    string
+	DisplayMetadata map[string]any
 }
 
 // ContentPart is one canonical content item. Opaque parts preserve the full
@@ -140,6 +141,13 @@ func (m Message) MarshalJSON() ([]byte, error) {
 	if m.InternalKind != "" {
 		mustSet(obj, "_lightcode_internal", m.InternalKind)
 	}
+	if len(m.DisplayMetadata) > 0 {
+		data, err := json.Marshal(m.DisplayMetadata)
+		if err != nil {
+			return nil, err
+		}
+		obj["_lightcode_display_metadata"] = data
+	}
 	return json.Marshal(obj)
 }
 
@@ -195,6 +203,10 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 			}
 		case "_lightcode_internal":
 			if err := json.Unmarshal(value, &out.InternalKind); err != nil {
+				return fieldError(key, err)
+			}
+		case "_lightcode_display_metadata":
+			if err := json.Unmarshal(value, &out.DisplayMetadata); err != nil {
 				return fieldError(key, err)
 			}
 		default:
@@ -404,7 +416,7 @@ func fieldError(field string, err error) error {
 
 func isMessageField(key string) bool {
 	switch key {
-	case "role", "content", "refusal", "tool_calls", "tool_call_id", "name", "_lightcode_source", "_lightcode_internal":
+	case "role", "content", "refusal", "tool_calls", "tool_call_id", "name", "_lightcode_source", "_lightcode_internal", "_lightcode_display_metadata":
 		return true
 	default:
 		return false

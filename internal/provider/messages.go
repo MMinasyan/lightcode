@@ -5,8 +5,8 @@ import (
 	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/message"
-	"github.com/MMinasyan/lightcode/internal/modelclient"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
+	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
 )
 
 // ProtocolWarning describes a non-fatal protocol metadata diagnostic.

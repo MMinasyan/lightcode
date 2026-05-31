@@ -48,6 +48,7 @@ type Event struct {
 	Turn              int
 	Cancelled         bool
 	Error             string
+	RefreshSession    bool
 	PermReq           *PermissionRequest
 	Warnings          []PromptWarning
 	SubagentSessionID string
@@ -157,7 +158,13 @@ type DisplayMessage struct {
 	Result   string         `json:"result,omitempty"`
 	Metadata map[string]any `json:"metadata,omitempty"`
 
-	BackgroundProcess *BackgroundProcessDisplay `json:"backgroundProcess,omitempty"`
+	SubagentSessionIDs []SubagentSessionLink     `json:"subagentSessionIds,omitempty"`
+	BackgroundProcess  *BackgroundProcessDisplay `json:"backgroundProcess,omitempty"`
+}
+
+type SubagentSessionLink struct {
+	Index     int    `json:"index"`
+	SessionID string `json:"sessionId"`
 }
 
 const (

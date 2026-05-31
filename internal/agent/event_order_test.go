@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/loop"
+	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/process"
 	"github.com/MMinasyan/lightcode/internal/prompt"
 	"github.com/MMinasyan/lightcode/internal/tool"

@@ -1,7 +1,7 @@
-// Package loop implements the agentic loop: user message → model →
+// Package engine implements the agentic loop: user message → model →
 // text or tool calls → execute → feed result back → repeat until the
 // model returns a text-only response.
-package loop
+package engine
 
 import (
 	"context"
@@ -17,10 +17,10 @@ import (
 
 	openai "github.com/sashabaranov/go-openai"
 
-	"github.com/MMinasyan/lightcode/internal/coremodel"
-	"github.com/MMinasyan/lightcode/internal/message"
-	"github.com/MMinasyan/lightcode/internal/modelclient"
-	"github.com/MMinasyan/lightcode/internal/tool"
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
+	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
+	"github.com/MMinasyan/lightcode/internal/engine/tool"
 )
 
 // maxIterations caps how many model→tool→model rounds a single user turn
@@ -38,6 +38,10 @@ const (
 	systemSignalInternalKind = "system_signal"
 	toolResultErrorKind      = "tool_result_error"
 )
+
+// ErrNoModelConfigured is returned when the engine has no model client for a
+// turn. Runtime/harness code owns user-facing setup guidance.
+var ErrNoModelConfigured = errors.New("no model configured")
 
 var systemSignalEscaper = strings.NewReplacer(
 	"&", "&amp;",
@@ -91,7 +95,7 @@ func IsToolResultErrorMessage(msg message.Message) bool {
 // Store is the minimum surface the loop needs from the snapshot
 // package: turn-scoped message persistence, turn completion, and
 // activity touch. Declared here so loop has no import dependency on
-// internal/snapshot. app.go wires the concrete *snapshot.Store.
+// snapshot storage. app.go wires the concrete implementation.
 type Store interface {
 	AppendMessage(turn int, msg []byte) error
 	MarkTurnComplete(turn int) error
@@ -285,7 +289,11 @@ func (l *Loop) SetUsageRecorder(r UsageRecorder) { l.usageRecorder = r }
 func (l *Loop) SetPendingExecutor(exec tool.PendingExecutor) {
 	l.pendingExecutor = exec
 	if l.registry != nil {
-		l.registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(exec))
+		if coordinator, ok := l.registry.PendingCoordinator(); ok {
+			if setter, ok := coordinator.(interface{ SetPendingExecutor(tool.PendingExecutor) }); ok {
+				setter.SetPendingExecutor(exec)
+			}
+		}
 	}
 }
 
@@ -705,6 +713,7 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		if iter == 0 {
 			emitDeferredUserDisplays()
 		}
+		l.DrainPendingSignalsForModel(turn)
 		msg, cancelled, err := l.runStream(ctx)
 		if err != nil {
 			return "", fmt.Errorf("chat completion: %w", err)
@@ -743,6 +752,9 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 			toolMsg := message.NewText(message.RoleTool, result.Content)
 			toolMsg.ToolCallID = tc.ID
 			toolMsg.Name = tc.Function.Name
+			if len(result.Metadata) > 0 {
+				toolMsg.DisplayMetadata = result.Metadata
+			}
 			if result.IsError {
 				MarkToolResultError(&toolMsg)
 			}
@@ -795,7 +807,7 @@ func isRetryable(err error) bool {
 
 func (l *Loop) runStream(ctx context.Context) (message.Message, bool, error) {
 	if l.client == nil {
-		return message.Message{}, false, fmt.Errorf("no model configured — set default_model in ~/.lightcode/config.json and an API key in ~/.lightcode/.env")
+		return message.Message{}, false, ErrNoModelConfigured
 	}
 	l.emitProtocolWarnings(l.client.ProtocolWarnings(l.messages))
 	const maxRetries = 3
@@ -1052,9 +1064,10 @@ func (l *Loop) consumeStream(ctx context.Context, stream modelclient.ChatStream)
 }
 
 type dispatchResult struct {
-	Content string
-	Denied  bool
-	IsError bool
+	Content  string
+	Denied   bool
+	IsError  bool
+	Metadata map[string]any
 }
 
 // dispatch executes one tool call and returns the result string plus display
@@ -1067,32 +1080,36 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) dispatchResult
 	var params map[string]any
 	parseErr := json.Unmarshal([]byte(tc.Function.Arguments), &params)
 
-	finish := func(result string, isError bool) dispatchResult {
+	finish := func(result string, isError bool, metadataArgs string) dispatchResult {
 		fmt.Fprintf(l.trace, "  ← %s\n", truncate(result, traceMaxChars))
 		ev := Event{Kind: ToolCallEnd, ToolCallID: tc.ID, ToolName: tc.Function.Name, Args: tc.Function.Arguments, Result: result, IsError: isError}
+		var metadata map[string]any
 		if !isError {
-			ev.Metadata = l.displayMetadata(ctx, tc.Function.Name, tc.Function.Arguments, result)
+			metadata = l.displayMetadata(ctx, tc.Function.Name, metadataArgs, result)
+			ev.Metadata = metadata
 		}
 		l.emit(ev)
-		return dispatchResult{Content: result, IsError: isError}
+		return dispatchResult{Content: result, IsError: isError, Metadata: metadata}
 	}
 
 	if parseErr != nil {
-		return finish(fmt.Sprintf("error: invalid JSON arguments: %v", parseErr), true)
+		return finish(fmt.Sprintf("error: invalid JSON arguments: %v", parseErr), true, tc.Function.Arguments)
 	}
+
+	metadataArgs := tc.Function.Arguments
 
 	if coordinator, ok := l.pendingCoordinatorForTool(tc.Function.Name); ok {
 		act, _ := params["action"].(string)
 		if act == "discard" {
 			l.pendingQueue.Discard()
-			return finish("Discarded all staged edits.", false)
+			return finish("Discarded all staged edits.", false, metadataArgs)
 		}
 		results, err := l.flushPendingQueue(ctx, coordinator)
 		if err != nil {
-			return finish("error: "+err.Error(), true)
+			return finish("error: "+err.Error(), true, metadataArgs)
 		}
 		if len(results) == 0 {
-			return finish("No pending edits to execute.", false)
+			return finish("No pending edits to execute.", false, metadataArgs)
 		}
 		// The per-staged ToolCallEnd events (emitted by flushPendingQueue)
 		// carry the real results live; the <staged-flush> wrapper (persisted
@@ -1100,22 +1117,25 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) dispatchResult
 		// on reload. This tool's own result is a short summary.
 		l.consumedFlushResults = append(l.consumedFlushResults, results...)
 		summary, isError := stagedFlushSummary(results)
-		return finish(summary, isError)
+		return finish(summary, isError, metadataArgs)
 	}
 
 	t, ok := l.registry.Get(tc.Function.Name)
 	if !ok {
-		return finish(fmt.Sprintf("error: unknown tool %q", tc.Function.Name), true)
+		return finish(fmt.Sprintf("error: unknown tool %q", tc.Function.Name), true, metadataArgs)
 	}
 
 	params["_tool_call_id"] = tc.ID
+	if data, err := json.Marshal(params); err == nil {
+		metadataArgs = string(data)
+	}
 
 	pending, _ := params["pending"].(bool)
 	if pending {
 		stageable, ok := l.stageableTool(tc.Function.Name)
 		if ok {
 			if err := stageable.ValidateStaged(ctx, json.RawMessage(tc.Function.Arguments)); err != nil {
-				return finish(err.Error(), true)
+				return finish(err.Error(), true, metadataArgs)
 			}
 			l.pendingQueue.Stage(tool.StagedCall{
 				ToolName:   tc.Function.Name,
@@ -1123,12 +1143,12 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) dispatchResult
 				Args:       tc.Function.Arguments,
 				Params:     params,
 			})
-			return finish(stageable.StagedResultMessage(), false)
+			return finish(stageable.StagedResultMessage(), false, metadataArgs)
 		}
 	}
 
 	if results, flushed, err := l.autoFlushBefore(ctx, tc); err != nil {
-		return finish("error: "+err.Error(), true)
+		return finish("error: "+err.Error(), true, metadataArgs)
 	} else if flushed {
 		l.consumedFlushResults = append(l.consumedFlushResults, results...)
 	}
@@ -1136,17 +1156,17 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) dispatchResult
 	result, err := t.Execute(ctx, params)
 	if err != nil {
 		if errors.Is(err, tool.ErrDenied) {
-			result := finish("denied by user", true)
+			result := finish("denied by user", true, metadataArgs)
 			result.Denied = true
 			return result
 		}
 		var exitErr *tool.ExitError
 		if errors.As(err, &exitErr) {
-			return finish(exitErr.Output, true)
+			return finish(exitErr.Output, true, metadataArgs)
 		}
-		return finish("error: "+err.Error(), true)
+		return finish("error: "+err.Error(), true, metadataArgs)
 	}
-	return finish(result, false)
+	return finish(result, false, metadataArgs)
 }
 
 func (l *Loop) stageableTool(name string) (tool.StageableTool, bool) {
@@ -1162,7 +1182,7 @@ func (l *Loop) pendingCoordinator() tool.PendingCoordinator {
 			return coordinator
 		}
 	}
-	return tool.NewPendingCoordinator(l.pendingExecutorOrFallback())
+	return tool.NewPendingCoordinator("", l.pendingExecutorOrFallback())
 }
 
 func (l *Loop) pendingCoordinatorForTool(name string) (tool.PendingCoordinator, bool) {

@@ -3,8 +3,8 @@ package provider
 import (
 	"encoding/json"
 
-	"github.com/MMinasyan/lightcode/internal/message"
-	"github.com/MMinasyan/lightcode/internal/modelclient"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
+	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
 	openai "github.com/sashabaranov/go-openai"
 )
 

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/internal/message"
-	"github.com/MMinasyan/lightcode/internal/modelclient"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
+	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
 )
 
 // DefaultSummarizerPrompt is the default system prompt for the summarizer.

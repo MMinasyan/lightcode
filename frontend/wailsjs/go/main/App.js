@@ -110,6 +110,10 @@ export function SessionMessages() {
   return window['go']['main']['App']['SessionMessages']();
 }
 
+export function SessionMessagesFor(arg1) {
+  return window['go']['main']['App']['SessionMessagesFor'](arg1);
+}
+
 export function SessionNew() {
   return window['go']['main']['App']['SessionNew']();
 }

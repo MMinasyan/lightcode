@@ -1,4 +1,4 @@
-package loop
+package engine
 
 import (
 	"context"
@@ -14,11 +14,12 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/coremodel"
-	"github.com/MMinasyan/lightcode/internal/message"
-	"github.com/MMinasyan/lightcode/internal/modelclient"
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
+	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
+	"github.com/MMinasyan/lightcode/internal/engine/tool"
 	"github.com/MMinasyan/lightcode/internal/provider"
-	"github.com/MMinasyan/lightcode/internal/tool"
+	runtimetool "github.com/MMinasyan/lightcode/internal/tool"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -137,6 +138,20 @@ func (r *checkpointRecorder) BeforeModelRequest(_ context.Context, checkpoint Co
 	return ContextTransformResult{}, nil
 }
 
+type checkpointSignalTransformer struct {
+	loop    *Loop
+	payload string
+	sent    bool
+}
+
+func (t *checkpointSignalTransformer) BeforeModelRequest(_ context.Context, _ ContextTransformCheckpoint) (ContextTransformResult, error) {
+	if !t.sent {
+		t.sent = true
+		t.loop.AddPendingSignal(PendingSignal{Payload: t.payload, Persist: true})
+	}
+	return ContextTransformResult{}, nil
+}
+
 func TestRunStreamUsesModelClientInterface(t *testing.T) {
 	ref := coremodel.ModelRef{Provider: "fake-provider", Model: "fake-chat"}
 	client := &fakeModelClient{
@@ -204,6 +219,79 @@ func TestRunStreamUsesModelClientInterface(t *testing.T) {
 	}
 }
 
+func TestRunDrainsCheckpointSignalsImmediatelyBeforeModelRequest(t *testing.T) {
+	ref := coremodel.ModelRef{Provider: "fake-provider", Model: "fake-chat"}
+	client := &fakeModelClient{
+		ref:   ref,
+		model: ref.Model,
+		stream: &sliceModelStream{deltas: []modelclient.StreamDelta{{
+			Role:      string(message.RoleAssistant),
+			Content:   "ok",
+			HasChoice: true,
+		}}},
+	}
+	lp := New(client, tool.NewRegistry(), "system")
+	lp.AddPendingSignal(PendingSignal{Payload: "pre-existing signal", Persist: true})
+	lp.SetContextTransformer(&checkpointSignalTransformer{
+		loop:    lp,
+		payload: "checkpoint signal",
+	})
+	events := make(chan Event, 16)
+	lp.SetEvents(events)
+
+	if _, err := lp.Run(context.Background(), "hello"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(client.requests) != 1 {
+		t.Fatalf("model requests = %d, want 1", len(client.requests))
+	}
+	got := client.requests[0].Messages
+	if len(got) != 4 {
+		t.Fatalf("request messages len = %d, want system + pre-signal + user + checkpoint-signal: %#v", len(got), got)
+	}
+	want := []struct {
+		role    message.Role
+		content string
+	}{
+		{message.RoleSystem, "system"},
+		{message.RoleUser, `<system-signal>pre-existing signal</system-signal>`},
+		{message.RoleUser, "hello"},
+		{message.RoleUser, `<system-signal>checkpoint signal</system-signal>`},
+	}
+	for i, wantMsg := range want {
+		if got[i].Role != wantMsg.role || got[i].TextContent() != wantMsg.content {
+			t.Fatalf("request message %d = role %q content %q, want role %q content %q", i, got[i].Role, got[i].TextContent(), wantMsg.role, wantMsg.content)
+		}
+	}
+
+	var order []EventKind
+	var payloads []string
+	for {
+		select {
+		case ev := <-events:
+			if ev.Kind == GenericSystemSignalDisplay || ev.Kind == UserMessageDisplay {
+				order = append(order, ev.Kind)
+				payloads = append(payloads, ev.Result)
+			}
+		default:
+			wantOrder := []EventKind{GenericSystemSignalDisplay, UserMessageDisplay, GenericSystemSignalDisplay}
+			if len(order) != len(wantOrder) {
+				t.Fatalf("display event order = %v payloads=%v, want %v", order, payloads, wantOrder)
+			}
+			for i := range wantOrder {
+				if order[i] != wantOrder[i] {
+					t.Fatalf("display event order = %v payloads=%v, want %v", order, payloads, wantOrder)
+				}
+			}
+			if strings.Join(payloads, "|") != "pre-existing signal|hello|checkpoint signal" {
+				t.Fatalf("display payloads = %v", payloads)
+			}
+			return
+		}
+	}
+}
+
 func TestContextTransformerRunsBeforeFollowUpModelRequest(t *testing.T) {
 	ref := coremodel.ModelRef{Provider: "fake-provider", Model: "fake-chat"}
 	client := &sequenceModelClient{
@@ -258,7 +346,7 @@ func TestContextTransformerRunsBeforeFollowUpModelRequest(t *testing.T) {
 
 func TestNormalizeAssistantToolCallsUsesRegisteredNormalizer(t *testing.T) {
 	registry := tool.NewRegistry()
-	registry.Register(tool.Sleep{})
+	registry.Register(runtimetool.Sleep{})
 	lp := &Loop{registry: registry}
 	msg := message.Message{
 		Role: message.RoleAssistant,
@@ -896,7 +984,7 @@ func TestWakeSignalDuringTextModelCallStartsNextModelRequest(t *testing.T) {
 }
 
 func TestStageableWriteRequiresStringContent(t *testing.T) {
-	writer := tool.NewWriteFile(nil, config.ToolsConfig{})
+	writer := runtimetool.NewWriteFile(nil, config.ToolsConfig{})
 	for _, tc := range []struct {
 		name   string
 		params map[string]any
@@ -946,7 +1034,7 @@ func (t queueSignalTool) Execute(context.Context, map[string]any) (string, error
 }
 
 func TestStageableWriteAllowsEmptyContent(t *testing.T) {
-	writer := tool.NewWriteFile(nil, config.ToolsConfig{})
+	writer := runtimetool.NewWriteFile(nil, config.ToolsConfig{})
 	args, err := json.Marshal(map[string]any{
 		"path":    "file.txt",
 		"content": "",

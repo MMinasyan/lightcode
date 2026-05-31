@@ -10,7 +10,7 @@ import (
 )
 
 // ErrInvalidModelRef is returned when a provider-prefixed model reference is malformed.
-var ErrInvalidModelRef = errors.New("catalog: invalid model ref")
+var ErrInvalidModelRef = errors.New("invalid model ref")
 
 // ModelRef is the canonical internal identity of a model.
 type ModelRef struct {

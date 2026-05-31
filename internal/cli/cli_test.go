@@ -146,6 +146,46 @@ func TestHandleTurnEndCancelledDoesNotAppendTranscriptEntry(t *testing.T) {
 	}
 }
 
+func TestActiveCompactionRefreshDeferredUntilTurnEnd(t *testing.T) {
+	a, _ := newTestAgent(t)
+	if _, err := a.AppendUserMessage("persisted before compaction"); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+
+	c := New(a)
+	var out bytes.Buffer
+	c.out = &out
+	c.messages = []displayEntry{{typ: "system", content: "System: live signal before compaction"}}
+	c.compacting = true
+	c.busy = true
+	c.state = stateStreaming
+
+	c.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, RefreshSession: false})
+
+	if c.compacting {
+		t.Fatal("compaction_end should clear compacting state")
+	}
+	if got := len(c.messages); got != 1 || c.messages[0].content != "System: live signal before compaction" {
+		t.Fatalf("compaction_end without RefreshSession rebuilt active live rows: %#v", c.messages)
+	}
+	if strings.Contains(out.String(), "persisted before compaction") {
+		t.Fatalf("compaction_end without RefreshSession refreshed persisted history: %q", out.String())
+	}
+
+	out.Reset()
+	c.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 2, RefreshSession: true})
+
+	if c.busy || c.state != stateIdle {
+		t.Fatalf("turn_end should leave CLI idle: busy=%v state=%v", c.busy, c.state)
+	}
+	if got := len(c.messages); got != 1 || c.messages[0].typ != "user" || c.messages[0].content != "persisted before compaction" {
+		t.Fatalf("turn_end with RefreshSession should rebuild from persisted history: %#v", c.messages)
+	}
+	if !strings.Contains(out.String(), "persisted before compaction") {
+		t.Fatalf("turn_end with RefreshSession did not render refreshed history: %q", out.String())
+	}
+}
+
 func TestSubmitAndFlushDoNotRenderUserMessagesLocally(t *testing.T) {
 	source, err := os.ReadFile("cli.go")
 	if err != nil {
@@ -345,6 +385,32 @@ func TestInlineToolEndStillRewritesInPlace(t *testing.T) {
 	}
 	if c.activeToolID != "" {
 		t.Fatalf("activeToolID should be consumed by its end, got %q", c.activeToolID)
+	}
+}
+
+func TestSubagentBackgroundProcessCompletionRenders(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{out: &buf, mu: &sync.Mutex{}}
+
+	c.handleEvent(agent.Event{
+		Kind:              agent.EventBackgroundProcessComplete,
+		SubagentSessionID: "child-1",
+		TaskIndex:         2,
+		Result:            "background done",
+		BackgroundProcess: &agent.BackgroundProcessDisplay{
+			ID:       "bg-1",
+			Command:  "printf done",
+			Reason:   "completed",
+			ExitCode: 0,
+			Output:   "background done",
+		},
+	})
+
+	rendered := buf.String()
+	for _, want := range []string{"[subagent:task2]", "background_process", "bg-1", "completed exit 0", "background done"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("subagent background render missing %q: %q", want, rendered)
+		}
 	}
 }
 

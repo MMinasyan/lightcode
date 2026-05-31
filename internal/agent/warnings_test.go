@@ -3,7 +3,7 @@ package agent
 import (
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/loop"
+	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/prompt"
 )
 

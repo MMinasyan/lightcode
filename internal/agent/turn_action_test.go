@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/loop"
-	"github.com/MMinasyan/lightcode/internal/message"
+	loop "github.com/MMinasyan/lightcode/internal/engine"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/provider"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )

@@ -3,8 +3,8 @@ package agent
 import (
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/coremodel"
-	"github.com/MMinasyan/lightcode/internal/loop"
+	loop "github.com/MMinasyan/lightcode/internal/engine"
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 )
 
 func TestRecordUsagePrefersEventModelRef(t *testing.T) {

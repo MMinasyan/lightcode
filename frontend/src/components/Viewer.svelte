@@ -17,8 +17,16 @@
         {#each $viewer.messages as msg, i (i)}
           {#if msg.type === 'assistant'}
             <div class="sa-text">{msg.content}</div>
+          {:else if msg.type === 'user'}
+            <div class="sa-user">{msg.content}</div>
           {:else if msg.type === 'tool'}
-            <ToolCall name={msg.name} args={msg.args} result={msg.result} success={msg.success} done={msg.done} metadata={msg.metadata} />
+            <ToolCall name={msg.name} args={msg.args} result={msg.result} success={msg.success} done={msg.done} metadata={msg.metadata} subagentSessionIds={msg.subagentSessionIds || []} />
+          {:else if msg.type === 'background_process'}
+            <ToolCall name="background_process" args={JSON.stringify(msg.backgroundProcess || {})} result={msg.result || ''} success={msg.success !== false} done={true} />
+          {:else if msg.type === 'system'}
+            <div class="sa-system">{msg.content}</div>
+          {:else if msg.type === 'error'}
+            <div class="sa-error">{msg.content}</div>
           {/if}
         {/each}
       </div>
@@ -44,4 +52,7 @@
   .content.wrap { white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere; }
   .live-content { flex:1; overflow:auto; padding:8px 12px; }
   .sa-text { color:var(--text); font-family:var(--font-mono); font-size:calc(12px * var(--scale, 1)); white-space:pre-wrap; word-break:break-word; padding:4px 0; }
+  .sa-user { color:var(--text); background:var(--bg-user-msg); border:1px solid var(--border); border-radius:var(--radius); font-family:var(--font-mono); font-size:calc(12px * var(--scale, 1)); white-space:pre-wrap; word-break:break-word; padding:6px 8px; margin:4px 0; }
+  .sa-system { color:var(--text-dim); font-family:var(--font-ui); font-size:calc(12px * var(--scale, 1)); font-style:italic; padding:4px 0; }
+  .sa-error { color:var(--error); border-left:3px solid var(--error); padding:6px 8px; margin:4px 0; white-space:pre-wrap; word-break:break-word; }
 </style>

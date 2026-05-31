@@ -222,8 +222,11 @@ func (s *Server) handleEvent(ev agent.Event) {
 		name = "turn_start"
 		data = map[string]any{"turn": ev.Turn}
 	case agent.EventTurnEnd:
-		name = "turn_end"
-		data = map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled}
+		s.hub.broadcast("turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
+		if ev.RefreshSession {
+			s.broadcastSessionChanged()
+		}
+		return
 	case agent.EventError:
 		name = "error"
 		data = map[string]any{"message": ev.Error, "turn": ev.Turn}
@@ -244,7 +247,9 @@ func (s *Server) handleEvent(ev agent.Event) {
 		name = "compaction_start"
 	case agent.EventCompactionEnd:
 		s.hub.broadcast("compaction_end", nil)
-		s.broadcastSessionChanged()
+		if ev.RefreshSession {
+			s.broadcastSessionChanged()
+		}
 		return
 	case agent.EventWarning:
 		name = "warnings"
@@ -520,6 +525,15 @@ func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSessionMessages(w http.ResponseWriter, r *http.Request) {
+	if id := r.URL.Query().Get("id"); id != "" {
+		msgs, err := s.agent.SessionMessagesFor(id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		jsonResp(w, http.StatusOK, msgs)
+		return
+	}
 	jsonResp(w, http.StatusOK, s.agent.SessionMessages())
 }
 

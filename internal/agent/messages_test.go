@@ -2,15 +2,181 @@ package agent
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/editpreview"
-	"github.com/MMinasyan/lightcode/internal/loop"
-	"github.com/MMinasyan/lightcode/internal/message"
+	loop "github.com/MMinasyan/lightcode/internal/engine"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/process"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
+
+func TestSessionMessagesDoesNotRecoverCompleteActiveTurn(t *testing.T) {
+	a := newEventOrderAgent(t, "http://127.0.0.1")
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession: %v", err)
+	}
+	turn := a.store.BeginTurn()
+	if turn == 0 {
+		t.Fatal("BeginTurn returned 0")
+	}
+	msgs := []message.Message{
+		message.NewText(message.RoleUser, "active prompt"),
+		{
+			Role: message.RoleAssistant,
+			ToolCalls: []message.ToolCall{{
+				ID:   "call_1",
+				Type: "function",
+				Function: message.FunctionCall{
+					Name:      "read_file",
+					Arguments: `{"path":"x.txt"}`,
+				},
+			}},
+		},
+		toolResult("call_1", "read_file", "ok"),
+	}
+	for _, msg := range msgs {
+		data, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := a.store.AppendMessage(turn, data); err != nil {
+			t.Fatalf("AppendMessage: %v", err)
+		}
+	}
+
+	display := a.SessionMessages()
+	for _, m := range display {
+		if m.Type == "user" && m.Content == "active prompt" {
+			t.Fatalf("SessionMessages returned active incomplete turn: %#v", display)
+		}
+	}
+	completePath := filepath.Join(a.store.Dir(), "turns", "1", "complete")
+	if _, err := os.Stat(completePath); !os.IsNotExist(err) {
+		t.Fatalf("SessionMessages mutated active turn complete marker, stat err = %v", err)
+	}
+}
+
+func TestSessionMessagesReadOnlyAfterCompactionBoundaryDoesNotRecoverActiveTurn(t *testing.T) {
+	a := newEventOrderAgent(t, "http://127.0.0.1")
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession: %v", err)
+	}
+	turn1 := a.store.BeginTurn()
+	completeMsg := message.NewText(message.RoleUser, "before compaction")
+	data, err := json.Marshal(completeMsg)
+	if err != nil {
+		t.Fatalf("marshal complete: %v", err)
+	}
+	if err := a.store.AppendMessage(turn1, data); err != nil {
+		t.Fatalf("AppendMessage complete: %v", err)
+	}
+	if err := a.store.MarkTurnComplete(turn1); err != nil {
+		t.Fatalf("MarkTurnComplete: %v", err)
+	}
+	if err := a.store.SaveCompaction(snapshot.CompactionRecord{BoundaryTurn: turn1, Summary: "summary"}); err != nil {
+		t.Fatalf("SaveCompaction: %v", err)
+	}
+
+	turn2 := a.store.BeginTurn()
+	msgs := []message.Message{
+		message.NewText(message.RoleUser, "active after compaction"),
+		{
+			Role: message.RoleAssistant,
+			ToolCalls: []message.ToolCall{{
+				ID:   "call_1",
+				Type: "function",
+				Function: message.FunctionCall{
+					Name:      "read_file",
+					Arguments: `{"path":"x.txt"}`,
+				},
+			}},
+		},
+		toolResult("call_1", "read_file", "ok"),
+	}
+	for _, msg := range msgs {
+		data, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("marshal active: %v", err)
+		}
+		if err := a.store.AppendMessage(turn2, data); err != nil {
+			t.Fatalf("AppendMessage active: %v", err)
+		}
+	}
+
+	display := a.SessionMessages()
+	for _, m := range display {
+		if m.Type == "user" && m.Content == "active after compaction" {
+			t.Fatalf("SessionMessages returned active incomplete post-compaction turn: %#v", display)
+		}
+	}
+	completePath := filepath.Join(a.store.Dir(), "turns", "2", "complete")
+	if _, err := os.Stat(completePath); !os.IsNotExist(err) {
+		t.Fatalf("SessionMessages mutated active post-compaction turn complete marker, stat err = %v", err)
+	}
+}
+
+func TestSessionMessagesForReadOnlyDoesNotRecoverIncompleteOtherSession(t *testing.T) {
+	a := newEventOrderAgent(t, "http://127.0.0.1")
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession: %v", err)
+	}
+	parentID := a.SessionCurrent().ID
+	childStore, err := snapshot.NewForSessionsRoot(a.store.Root(), "", "")
+	if err != nil {
+		t.Fatalf("NewForSessionsRoot: %v", err)
+	}
+	if err := childStore.BeginChildSession(a.ProjectRoot(), parentID); err != nil {
+		t.Fatalf("BeginChildSession: %v", err)
+	}
+	childID := childStore.SessionID()
+	turn := childStore.BeginTurn()
+	msgs := []message.Message{
+		message.NewText(message.RoleUser, "incomplete child prompt"),
+		{
+			Role: message.RoleAssistant,
+			ToolCalls: []message.ToolCall{{
+				ID:   "call_1",
+				Type: "function",
+				Function: message.FunctionCall{
+					Name:      "read_file",
+					Arguments: `{"path":"child.txt"}`,
+				},
+			}},
+		},
+		toolResult("call_1", "read_file", "ok"),
+	}
+	for _, msg := range msgs {
+		data, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("marshal child active: %v", err)
+		}
+		if err := childStore.AppendMessage(turn, data); err != nil {
+			t.Fatalf("AppendMessage child active: %v", err)
+		}
+	}
+
+	display, err := a.SessionMessagesFor(childID)
+	if err != nil {
+		t.Fatalf("SessionMessagesFor child: %v", err)
+	}
+	for _, m := range display {
+		if m.Type == "user" && m.Content == "incomplete child prompt" {
+			t.Fatalf("SessionMessagesFor returned incomplete child turn: %#v", display)
+		}
+	}
+	completePath := filepath.Join(childStore.Dir(), "turns", "1", "complete")
+	if _, err := os.Stat(completePath); !os.IsNotExist(err) {
+		t.Fatalf("SessionMessagesFor mutated child incomplete turn complete marker, stat err = %v", err)
+	}
+	if got := a.SessionCurrent().ID; got != parentID {
+		t.Fatalf("SessionMessagesFor switched current session to %q, want %q", got, parentID)
+	}
+}
 
 // appendStagedEditTurn persists one turn that stages an edit_file call (RoleTool
 // "Staged.") and then records a <staged-flush> wrapper carrying the real result,

@@ -1,8 +1,8 @@
 package compact
 
 import (
-	"github.com/MMinasyan/lightcode/internal/coremodel"
-	"github.com/MMinasyan/lightcode/internal/modelclient"
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
 )
 
 // Config holds parameters for a compaction run.

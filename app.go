@@ -60,6 +60,18 @@ func (a *App) handleEvent(ev agent.Event) {
 				"taskToolCallId": ev.ToolCallID,
 				"taskIndex":      ev.TaskIndex,
 			})
+		case agent.EventBackgroundProcessComplete:
+			if ev.BackgroundProcess != nil {
+				wailsRuntime.EventsEmit(a.ctx, "subagent_background_process_complete", map[string]any{
+					"sessionId": ev.SubagentSessionID,
+					"id":        ev.BackgroundProcess.ID,
+					"command":   ev.BackgroundProcess.Command,
+					"reason":    ev.BackgroundProcess.Reason,
+					"exitCode":  ev.BackgroundProcess.ExitCode,
+					"success":   !ev.IsError,
+					"output":    ev.Result,
+				})
+			}
 		}
 		return
 	}
@@ -120,6 +132,9 @@ func (a *App) handleEvent(ev agent.Event) {
 	case agent.EventTurnEnd:
 		wailsRuntime.EventsEmit(a.ctx, "turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
 		wailsRuntime.EventsEmit(a.ctx, "status", map[string]any{"state": "idle"})
+		if ev.RefreshSession {
+			a.emitSessionChanged()
+		}
 	case agent.EventError:
 		wailsRuntime.EventsEmit(a.ctx, "error", map[string]any{"message": ev.Error})
 	case agent.EventPermissionRequest:
@@ -137,7 +152,9 @@ func (a *App) handleEvent(ev agent.Event) {
 		wailsRuntime.EventsEmit(a.ctx, "compaction_start", nil)
 	case agent.EventCompactionEnd:
 		wailsRuntime.EventsEmit(a.ctx, "compaction_end", nil)
-		a.emitSessionChanged()
+		if ev.RefreshSession {
+			a.emitSessionChanged()
+		}
 	case agent.EventWarning:
 		wailsRuntime.EventsEmit(a.ctx, "warnings", ev.Warnings)
 	}
@@ -348,6 +365,11 @@ func (a *App) SessionNew() error {
 // SessionMessages returns persisted history for the current session.
 func (a *App) SessionMessages() []agent.DisplayMessage {
 	return a.svc.SessionMessages()
+}
+
+// SessionMessagesFor returns persisted history for a session without switching.
+func (a *App) SessionMessagesFor(id string) ([]agent.DisplayMessage, error) {
+	return a.svc.SessionMessagesFor(id)
 }
 
 // ProjectList returns every known project sorted by last activity.

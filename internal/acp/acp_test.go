@@ -233,11 +233,44 @@ func TestHandleEventCompactionEndPushesSessionChanged(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{agent: newACPTestAgent(t), out: &out}
 
-	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd})
+	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, RefreshSession: true})
 
 	lines := responseLines(t, out.String(), 2)
 	assertACPNotificationMethod(t, lines[0], "agent/compaction_end")
 	assertACPNotificationMethod(t, lines[1], "agent/session_changed")
+}
+
+func TestHandleEventActiveCompactionDefersSessionChangedUntilTurnEnd(t *testing.T) {
+	a := newACPTestAgent(t)
+	_ = appendACPUserTurn(t, a, "complete before compaction")
+	turn := a.Store().BeginTurn()
+	for _, raw := range []string{
+		`{"role":"user","content":"active prompt"}`,
+		`{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}`,
+		`{"role":"tool","tool_call_id":"call_1","name":"read_file","content":"ok"}`,
+	} {
+		if err := a.Store().AppendMessage(turn, []byte(raw)); err != nil {
+			t.Fatalf("AppendMessage active: %v", err)
+		}
+	}
+	var out bytes.Buffer
+	r := &Runner{agent: a, out: &out}
+
+	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd})
+	lines := responseLines(t, out.String(), 1)
+	assertACPNotificationMethod(t, lines[0], "agent/compaction_end")
+
+	if err := a.Store().MarkTurnComplete(turn); err != nil {
+		t.Fatalf("MarkTurnComplete active: %v", err)
+	}
+	out.Reset()
+	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: turn, RefreshSession: true})
+	lines = responseLines(t, out.String(), 2)
+	assertACPNotificationMethod(t, lines[0], "agent/turn_end")
+	assertACPNotificationMethod(t, lines[1], "agent/session_changed")
+	if !strings.Contains(lines[1], "active prompt") {
+		t.Fatalf("session_changed after turn_end omitted completed active turn: %s", lines[1])
+	}
 }
 
 func TestDispatchWarningsCurrentReturnsCurrentWarningSnapshot(t *testing.T) {
@@ -411,6 +444,61 @@ func TestHandleTurnActionACPInvalidParams(t *testing.T) {
 	}
 }
 
+func TestHandleSessionMessagesByIDDoesNotSwitchCurrentSession(t *testing.T) {
+	a := newACPTestAgent(t)
+	firstTurn := appendACPUserTurn(t, a, "first session")
+	firstID := a.SessionCurrent().ID
+	if firstID == "" || firstTurn == 0 {
+		t.Fatalf("first session id/turn = %q/%d", firstID, firstTurn)
+	}
+	if err := a.SessionNew(); err != nil {
+		t.Fatalf("SessionNew: %v", err)
+	}
+	appendACPUserTurn(t, a, "second session")
+	currentID := a.SessionCurrent().ID
+	if currentID == "" || currentID == firstID {
+		t.Fatalf("current session id = %q, first = %q", currentID, firstID)
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: a, out: &out}
+	r.handleSessionMessages(Request{
+		JSONRPC: "2.0",
+		ID:      "messages-by-id",
+		Params:  json.RawMessage(`{"id":"` + firstID + `"}`),
+	})
+
+	lines := responseLines(t, out.String(), 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("session/messages by id error = %+v", resp.Error)
+	}
+	msgs := displayMessagesFromResponse(t, resp)
+	if got := acpUserMessageContents(msgs); !equalStringSlices(got, []string{"first session"}) {
+		t.Fatalf("messages for first session = %q", got)
+	}
+	if got := a.SessionCurrent().ID; got != currentID {
+		t.Fatalf("SessionMessagesFor switched current session to %q, want %q", got, currentID)
+	}
+
+	out.Reset()
+	r.handleSessionMessages(Request{JSONRPC: "2.0", ID: "current-messages"})
+	lines = responseLines(t, out.String(), 1)
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("current response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("session/messages current error = %+v", resp.Error)
+	}
+	msgs = displayMessagesFromResponse(t, resp)
+	if got := acpUserMessageContents(msgs); !equalStringSlices(got, []string{"second session"}) {
+		t.Fatalf("current messages = %q", got)
+	}
+}
+
 func TestACPHandlersUseSharedTurnActionContract(t *testing.T) {
 	src := mustReadACPSource(t)
 	helper := extractSourceFunc(t, src, "func (r *Runner) handleTurnAction(")
@@ -550,6 +638,19 @@ func turnActionResultFromResponse(t *testing.T, resp Response) agent.TurnActionR
 		t.Fatalf("unmarshal turn action result: %v", err)
 	}
 	return result
+}
+
+func displayMessagesFromResponse(t *testing.T, resp Response) []agent.DisplayMessage {
+	t.Helper()
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	var messages []agent.DisplayMessage
+	if err := json.Unmarshal(data, &messages); err != nil {
+		t.Fatalf("unmarshal display messages: %v", err)
+	}
+	return messages
 }
 
 func promptWarningsFromResponse(t *testing.T, resp Response) []agent.PromptWarning {

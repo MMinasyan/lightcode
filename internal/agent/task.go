@@ -8,9 +8,10 @@ import (
 	"sync"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/coremodel"
-	"github.com/MMinasyan/lightcode/internal/loop"
+	loop "github.com/MMinasyan/lightcode/internal/engine"
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 	"github.com/MMinasyan/lightcode/internal/lsp"
 	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
@@ -27,10 +28,11 @@ type taskDef struct {
 }
 
 type taskResult struct {
-	index  int
-	result string
-	denied bool
-	err    error
+	index     int
+	result    string
+	sessionID string
+	denied    bool
+	err       error
 }
 
 type TaggedLoopEvent struct {
@@ -67,6 +69,8 @@ type taskTool struct {
 	ask           tool.AskFunc
 	askAction     tool.AskActionFunc
 	usageRecorder loop.UsageRecorder
+
+	resultMetadata map[string]map[string]any
 }
 
 type taskToolConfig struct {
@@ -200,12 +204,16 @@ func (t *taskTool) Execute(ctx context.Context, params map[string]any) (string, 
 	wg.Wait()
 
 	var b strings.Builder
+	links := make([]SubagentSessionLink, 0, len(results))
 	allDenied := true
 	for i, r := range results {
 		if i > 0 {
 			b.WriteString("\n\n")
 		}
 		fmt.Fprintf(&b, "## Task %d (%s)\n\n", i+1, tasks[i].SubagentType)
+		if r.sessionID != "" {
+			links = append(links, SubagentSessionLink{Index: i, SessionID: r.sessionID})
+		}
 		if r.err != nil {
 			fmt.Fprintf(&b, "Error: %v", r.err)
 			allDenied = false
@@ -218,6 +226,14 @@ func (t *taskTool) Execute(ctx context.Context, params map[string]any) (string, 
 	}
 
 	output := b.String()
+	if toolCallID != "" && len(links) > 0 {
+		t.mu.Lock()
+		if t.resultMetadata == nil {
+			t.resultMetadata = map[string]map[string]any{}
+		}
+		t.resultMetadata[toolCallID] = map[string]any{"subagent_session_ids": links}
+		t.mu.Unlock()
+	}
 	if allDenied {
 		t.mu.Lock()
 		cancel := t.cancelParent
@@ -227,6 +243,22 @@ func (t *taskTool) Execute(ctx context.Context, params map[string]any) (string, 
 		}
 	}
 	return output, nil
+}
+
+func (t *taskTool) DisplayMetadata(_ context.Context, args json.RawMessage, _ string) map[string]any {
+	var params map[string]any
+	if err := json.Unmarshal(args, &params); err != nil {
+		return nil
+	}
+	toolCallID, _ := params["_tool_call_id"].(string)
+	if toolCallID == "" {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	metadata := t.resultMetadata[toolCallID]
+	delete(t.resultMetadata, toolCallID)
+	return metadata
 }
 
 func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, parentToolCallID string) taskResult {
@@ -269,43 +301,67 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		tracker:       t.parentTracker,
 		workspaceRoot: t.workspaceRoot,
 	}
-	registry := t.buildRegistry(at, scope)
+
+	var lp *loop.Loop
+	childProcMgr := t.newChildProcessManager(sessionID, func(signal loop.PendingSignal) {
+		if lp != nil {
+			lp.AddPendingSignal(signal)
+		}
+	})
+	registry := t.buildRegistry(at, scope, childProcMgr)
 
 	var events chan loop.Event
+	var forwardDone chan struct{}
 	if t.taggedEvents != nil {
 		events = make(chan loop.Event, 128)
-		defer close(events)
-		go t.forwardEvents(events, index, sessionID, parentToolCallID)
+		forwardDone = make(chan struct{})
+		go func() {
+			defer close(forwardDone)
+			t.forwardEvents(events, index, sessionID, parentToolCallID)
+		}()
+	}
+	finish := func(result taskResult) taskResult {
+		result.sessionID = sessionID
+		if childProcMgr != nil {
+			childProcMgr.KillAll()
+		}
+		if events != nil {
+			close(events)
+			<-forwardDone
+		}
+		return result
 	}
 
-	lp := loop.New(provider.NewAdapter(client), registry, at.Prompt)
+	lp = loop.New(provider.NewAdapter(client), registry, at.Prompt)
 	if events != nil {
 		lp.SetEvents(events)
 	}
 	lp.SetStore(childStore)
 	lp.SetUsageRecorder(t.usageRecorder)
-	lp.SetPendingExecutor(tool.NewStagedExecutorAtRoot(scope.snapshotStore(), scope.tracker, t.toolsConfig, scope.workspaceRoot, t.permissionCheck(), t.permissionAskAction()))
+	pendingExecutor := tool.NewStagedExecutorAtRoot(scope.snapshotStore(), scope.tracker, t.toolsConfig, scope.workspaceRoot, t.permissionCheck(), t.permissionAskAction())
+	lp.SetPendingExecutor(pendingExecutor)
+	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 
 	if turn := childStore.BeginTurn(); turn == 0 {
-		return taskResult{index: index, err: fmt.Errorf("subagent: child session is not active")}
+		return finish(taskResult{index: index, err: fmt.Errorf("subagent: child session is not active")})
 	}
 	result, err := lp.Run(ctx, td.Prompt)
-	if err != nil {
-		if result == "Tool denied by user." {
-			return taskResult{index: index, result: result, denied: true}
-		}
-		return taskResult{index: index, err: err}
+	if result == "Tool denied by user." {
+		return finish(taskResult{index: index, result: result, denied: true})
 	}
-	return taskResult{index: index, result: result}
+	if err != nil {
+		return finish(taskResult{index: index, err: err})
+	}
+	return finish(taskResult{index: index, result: result})
 }
 
-func (t *taskTool) buildRegistry(at subagent.AgentType, scope parentMutationScope) *tool.Registry {
+func (t *taskTool) buildRegistry(at subagent.AgentType, scope parentMutationScope, procMgr *process.Manager) *tool.Registry {
 	reg := tool.NewRegistry()
 	for _, name := range at.Tools {
 		if name == "task" {
 			continue
 		}
-		if tt := t.newChildTool(name, at, scope); tt != nil {
+		if tt := t.newChildTool(name, at, scope, procMgr); tt != nil {
 			reg.Register(tt)
 		}
 	}
@@ -352,7 +408,7 @@ func (s parentTurnSnapshotStore) RetainSnapshotEntry(_ int, entryID string) {
 	s.store.RetainSnapshotEntry(s.turn, entryID)
 }
 
-func (t *taskTool) newChildTool(name string, at subagent.AgentType, scope parentMutationScope) tool.Tool {
+func (t *taskTool) newChildTool(name string, at subagent.AgentType, scope parentMutationScope, procMgr *process.Manager) tool.Tool {
 	check := t.permissionCheck()
 	ask := t.permissionAsk()
 	root := scope.workspaceRoot
@@ -366,16 +422,16 @@ func (t *taskTool) newChildTool(name string, at subagent.AgentType, scope parent
 	case "execute_pending":
 		return tool.WrapWithPermission(tool.ExecutePending{}, check, ask)
 	case "run_command":
-		rc := tool.NewRunCommandAtRoot(t.toolsConfig, t.homeDir, root, t.procMgr)
+		rc := tool.NewRunCommandAtRoot(t.toolsConfig, t.homeDir, root, procMgr)
 		if isReadOnlyType(at) {
 			return tool.WrapWithPermission(tool.NewReadOnlyRunCommand(rc), check, ask)
 		}
 		return tool.WrapWithPermission(rc, check, ask)
 	case "process":
-		if t.procMgr == nil {
+		if procMgr == nil {
 			return nil
 		}
-		return tool.WrapWithPermission(tool.NewProcessTool(t.procMgr), check, ask)
+		return tool.WrapWithPermission(tool.NewProcessTool(procMgr), check, ask)
 	case "sleep":
 		return tool.WrapWithPermission(tool.Sleep{}, check, ask)
 	case "save_memory":
@@ -406,6 +462,51 @@ func (t *taskTool) newChildTool(name string, at subagent.AgentType, scope parent
 	default:
 		return nil
 	}
+}
+
+func (t *taskTool) newChildProcessManager(sessionID string, addSignal func(loop.PendingSignal)) *process.Manager {
+	if t.procMgr == nil {
+		return nil
+	}
+	mgr := process.NewManagerAtRoot(t.toolsConfig.MaxBackgroundProcesses, cmdoutput.Options{
+		HomeDir:      t.homeDir,
+		SpillPrefix:  "proc_output_",
+		MaxBytes:     t.toolsConfig.MaxOutputBytes,
+		MaxLineChars: t.toolsConfig.ReadLineMaxChars,
+	}, t.workspaceRoot)
+	mgr.SetSessionProvider(func() string { return sessionID })
+	mgr.SetExitHandler(func(event process.ExitEvent) {
+		if addSignal == nil {
+			return
+		}
+		if event.SessionID != "" && event.SessionID != sessionID {
+			return
+		}
+		output := ""
+		if event.FormatOutput != nil {
+			output = event.FormatOutput()
+		}
+		if output == "" {
+			output = "(No output)"
+		}
+		reason := event.Reason
+		if reason == "" {
+			reason = process.ExitReasonCompleted
+		}
+		addSignal(loop.PendingSignal{
+			Payload: backgroundTerminalPayload(event, output),
+			Wake:    true,
+			Persist: true,
+			BackgroundProcess: &loop.BackgroundProcessDisplay{
+				ID:       event.ID,
+				Command:  event.Command,
+				Reason:   string(reason),
+				ExitCode: event.ExitCode,
+				Output:   output,
+			},
+		})
+	})
+	return mgr
 }
 
 func (t *taskTool) permissionCheck() tool.CheckFunc {

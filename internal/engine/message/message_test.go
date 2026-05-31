@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/coremodel"
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 )
 
 func TestTextHelpers(t *testing.T) {
@@ -32,6 +32,9 @@ func TestMessageJSONFlattensExtraAndSource(t *testing.T) {
 		Extra:        Extra{"reasoning_content": json.RawMessage(`"thinking"`)},
 		Source:       coremodel.ModelRef{Provider: "xiaomi", Model: "mimo-v2.5-pro"},
 		InternalKind: "staged_flush",
+		DisplayMetadata: map[string]any{
+			"subagent_session_ids": []map[string]any{{"index": 0, "sessionId": "child"}},
+		},
 	}
 
 	data, err := json.Marshal(msg)
@@ -52,6 +55,9 @@ func TestMessageJSONFlattensExtraAndSource(t *testing.T) {
 	if raw["_lightcode_internal"] != "staged_flush" {
 		t.Fatalf("_lightcode_internal = %#v", raw["_lightcode_internal"])
 	}
+	if _, ok := raw["_lightcode_display_metadata"].(map[string]any); !ok {
+		t.Fatalf("_lightcode_display_metadata missing: %#v", raw)
+	}
 	toolCalls := raw["tool_calls"].([]any)
 	firstTool := toolCalls[0].(map[string]any)
 	if _, ok := firstTool["extra_content"].(map[string]any); !ok {
@@ -67,6 +73,9 @@ func TestMessageJSONFlattensExtraAndSource(t *testing.T) {
 	}
 	if decoded.InternalKind != "staged_flush" {
 		t.Fatalf("InternalKind = %q, want staged_flush", decoded.InternalKind)
+	}
+	if decoded.DisplayMetadata["subagent_session_ids"] == nil {
+		t.Fatalf("DisplayMetadata = %#v, want subagent links", decoded.DisplayMetadata)
 	}
 	if decoded.Refusal != "cannot" {
 		t.Fatalf("Refusal = %q, want cannot", decoded.Refusal)
