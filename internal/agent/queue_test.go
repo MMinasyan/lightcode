@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/loop"
 	"github.com/MMinasyan/lightcode/internal/message"
 )
 
@@ -143,6 +144,73 @@ func TestQueueDrainEmitsEmptyArraySnapshot(t *testing.T) {
 	}
 }
 
+func TestQueuedInputWinsOverPendingWakeSignal(t *testing.T) {
+	type requestBody struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+	}
+
+	var mu sync.Mutex
+	var requests []requestBody
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body requestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, body)
+		mu.Unlock()
+		writeTextResponse(w, "ok")
+	}))
+	defer server.Close()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	_ = startEventOrderAgent(t, a, cap)
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession: %v", err)
+	}
+
+	a.lp.AddPendingSignal(loop.PendingSignal{Payload: "wake signal", Persist: true, Wake: true})
+	a.mu.Lock()
+	a.queue = []QueuedItem{{ID: "q-1", Content: "queued user"}}
+	a.queueSeq = 1
+	a.queueVersion = 1
+	a.mu.Unlock()
+
+	a.nudgeSignalScheduler()
+	a.nudgeQueueDrainer()
+	waitUntilFullyDrained(t, a)
+
+	mu.Lock()
+	gotRequests := append([]requestBody(nil), requests...)
+	mu.Unlock()
+	if got := len(gotRequests); got != 1 {
+		t.Fatalf("model request count = %d, want 1 queued turn and no separate signal-only turn", got)
+	}
+
+	var secondUsers []string
+	for _, msg := range gotRequests[0].Messages {
+		if msg.Role != "user" {
+			continue
+		}
+		if content, ok := msg.Content.(string); ok {
+			secondUsers = append(secondUsers, content)
+		}
+	}
+	if !contains(secondUsers, `<system-signal>wake signal</system-signal>`) {
+		t.Fatalf("request user messages = %#v, want pending wake signal drained into queued turn", secondUsers)
+	}
+	if !contains(secondUsers, "queued user") {
+		t.Fatalf("request user messages = %#v, want queued user input", secondUsers)
+	}
+	assertProjectionsMatch(t, a, cap)
+}
+
 func TestSubmitRejectsDuringTransition(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
 	cap := &eventCapture{}
@@ -253,6 +321,110 @@ func TestSessionNewClearsQueueAndBumpsVersionMonotonically(t *testing.T) {
 	if got.Version <= 7 {
 		t.Fatalf("queueVersion must be monotonic (bumped), got %d want > 7", got.Version)
 	}
+}
+
+func TestSessionSwitchClearsQueueAndBumpsVersionMonotonically(t *testing.T) {
+	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
+	cap := &eventCapture{}
+	_ = startEventOrderAgent(t, a, cap)
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession: %v", err)
+	}
+	appendUserTurn(t, a, "first session turn")
+	firstID := a.store.SessionID()
+	if err := a.SessionNew(); err != nil {
+		t.Fatalf("SessionNew: %v", err)
+	}
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensure second session: %v", err)
+	}
+	appendUserTurn(t, a, "second session turn")
+	secondID := a.store.SessionID()
+	if secondID == "" || secondID == firstID {
+		t.Fatalf("second session id = %q, first = %q", secondID, firstID)
+	}
+
+	seedQueue(t, a, 12, "stale for switched session")
+	if err := a.SessionSwitch(firstID); err != nil {
+		t.Fatalf("SessionSwitch: %v", err)
+	}
+	if got := a.SessionCurrent().ID; got != firstID {
+		t.Fatalf("current session = %q, want switched session %q", got, firstID)
+	}
+	assertQueueClearedAfterVersion(t, a, cap, 12)
+}
+
+func TestApplyTurnActionSessionChangesClearQueueAndBumpVersionMonotonically(t *testing.T) {
+	t.Run("revert_history", func(t *testing.T) {
+		a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
+		cap := &eventCapture{}
+		_ = startEventOrderAgent(t, a, cap)
+		appendUserTurn(t, a, "turn one")
+		appendUserTurn(t, a, "turn two")
+
+		seedQueue(t, a, 20, "stale after revert")
+		res, err := a.ApplyTurnAction(2, TurnActionRevertHistory, false)
+		if err != nil {
+			t.Fatalf("ApplyTurnAction revert_history: %v", err)
+		}
+		if !res.SessionChanged {
+			t.Fatalf("revert_history result = %#v, want SessionChanged", res)
+		}
+		assertQueueClearedAfterVersion(t, a, cap, 20)
+	})
+
+	t.Run("fork", func(t *testing.T) {
+		a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
+		cap := &eventCapture{}
+		_ = startEventOrderAgent(t, a, cap)
+		appendUserTurn(t, a, "turn one")
+		appendUserTurn(t, a, "turn two")
+		before := a.SessionCurrent().ID
+
+		seedQueue(t, a, 30, "stale after fork")
+		res, err := a.ApplyTurnAction(2, TurnActionFork, false)
+		if err != nil {
+			t.Fatalf("ApplyTurnAction fork: %v", err)
+		}
+		if !res.SessionChanged || res.Session.ID == "" || res.Session.ID == before {
+			t.Fatalf("fork result = %#v, before session %q", res, before)
+		}
+		assertQueueClearedAfterVersion(t, a, cap, 30)
+	})
+}
+
+func TestDirectRevertAndForkClearQueueAndBumpVersionMonotonically(t *testing.T) {
+	t.Run("revert_history", func(t *testing.T) {
+		a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
+		cap := &eventCapture{}
+		_ = startEventOrderAgent(t, a, cap)
+		appendUserTurn(t, a, "turn one")
+		appendUserTurn(t, a, "turn two")
+
+		seedQueue(t, a, 40, "stale after direct revert")
+		if err := a.RevertHistory(1); err != nil {
+			t.Fatalf("RevertHistory: %v", err)
+		}
+		assertQueueClearedAfterVersion(t, a, cap, 40)
+	})
+
+	t.Run("fork", func(t *testing.T) {
+		a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
+		cap := &eventCapture{}
+		_ = startEventOrderAgent(t, a, cap)
+		appendUserTurn(t, a, "turn one")
+		appendUserTurn(t, a, "turn two")
+		before := a.SessionCurrent().ID
+
+		seedQueue(t, a, 50, "stale after direct fork")
+		if err := a.ForkSession(2); err != nil {
+			t.Fatalf("ForkSession: %v", err)
+		}
+		if got := a.SessionCurrent().ID; got == "" || got == before {
+			t.Fatalf("current session after ForkSession = %q, before %q", got, before)
+		}
+		assertQueueClearedAfterVersion(t, a, cap, 50)
+	})
 }
 
 func TestCancelPreservesQueueThenDrains(t *testing.T) {
@@ -378,6 +550,89 @@ func TestCompactNowNudgesQueueDrainer(t *testing.T) {
 	}
 }
 
+func TestAutoCompactionEventOrderInsideTurn(t *testing.T) {
+	summaryRequest := make(chan struct{})
+	var summaryOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Stream bool `json:"stream"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if !body.Stream {
+			summaryOnce.Do(func() { close(summaryRequest) })
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"compact summary"},"finish_reason":"stop"}]}`))
+			return
+		}
+		writeTextResponse(w, "after compaction")
+	}))
+	defer server.Close()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	a.memoryStore = nil
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.SetEventHandler(func(Event) {})
+	a.Init(ctx)
+
+	appendUserTurn(t, a, "completed prior turn")
+	a.cfg.Compaction.Enabled = true
+	a.cfg.Compaction.ThresholdPct = 0.50
+	a.tokensMu.Lock()
+	a.lastContextUsed = 5000
+	a.contextWindowSize = 8192
+	a.tokensMu.Unlock()
+	if !a.shouldAutoCompact() {
+		t.Fatal("test setup did not cross auto-compaction threshold")
+	}
+
+	cap := &eventCapture{}
+	a.SetEventHandler(cap.handler)
+	if _, err := a.Submit(ctx, "turn that compacts first"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	waitUntilEventOrderTurnEndCount(t, cap, 1)
+	select {
+	case <-summaryRequest:
+	default:
+		t.Fatal("auto-compaction did not call summarizer")
+	}
+
+	events := cap.snapshot()
+	index := func(match func(Event) bool) int {
+		for i, ev := range events {
+			if match(ev) {
+				return i
+			}
+		}
+		return -1
+	}
+	turnStart := index(func(ev Event) bool { return ev.Kind == EventTurnStart && ev.Turn == 2 })
+	compactStart := index(func(ev Event) bool { return ev.Kind == EventCompactionStart })
+	compactEnd := index(func(ev Event) bool { return ev.Kind == EventCompactionEnd })
+	userDisplay := index(func(ev Event) bool { return ev.Kind == EventUserMessageDisplay && ev.Turn == 2 })
+	textDelta := index(func(ev Event) bool { return ev.Kind == EventTextDelta })
+	turnEnd := index(func(ev Event) bool { return ev.Kind == EventTurnEnd && ev.Turn == 2 })
+	for name, idx := range map[string]int{
+		"turn start":       turnStart,
+		"compaction start": compactStart,
+		"compaction end":   compactEnd,
+		"user display":     userDisplay,
+		"text delta":       textDelta,
+		"turn end":         turnEnd,
+	} {
+		if idx < 0 {
+			t.Fatalf("missing %s event in %#v", name, events)
+		}
+	}
+	if !(turnStart < compactStart && compactStart < compactEnd && compactEnd < userDisplay && userDisplay < textDelta && textDelta < turnEnd) {
+		t.Fatalf("unexpected auto-compaction event order: turnStart=%d compactStart=%d compactEnd=%d userDisplay=%d textDelta=%d turnEnd=%d events=%#v", turnStart, compactStart, compactEnd, userDisplay, textDelta, turnEnd, events)
+	}
+}
+
 func TestQueueSnapshotReturnsCopy(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
 	a.mu.Lock()
@@ -466,4 +721,36 @@ func contains(ss []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func seedQueue(t *testing.T, a *Agent, version int, content string) {
+	t.Helper()
+	a.mu.Lock()
+	a.queue = []QueuedItem{{ID: "q-1", Content: content}}
+	a.queueSeq = 1
+	a.queueVersion = version
+	a.mu.Unlock()
+}
+
+func assertQueueClearedAfterVersion(t *testing.T, a *Agent, cap *eventCapture, previousVersion int) {
+	t.Helper()
+	got := a.QueueSnapshot()
+	if len(got.Items) != 0 || got.Items == nil {
+		t.Fatalf("queue snapshot = %#v, want empty non-nil slice", got.Items)
+	}
+	if got.Version <= previousVersion {
+		t.Fatalf("queue version = %d, want > %d", got.Version, previousVersion)
+	}
+	var sawEvent bool
+	for _, ev := range cap.snapshot() {
+		if ev.Kind == EventQueueChanged && ev.QueueVersion == got.Version {
+			if len(ev.Queue) != 0 || ev.Queue == nil {
+				t.Fatalf("queue_changed payload = %#v, want empty non-nil slice", ev.Queue)
+			}
+			sawEvent = true
+		}
+	}
+	if !sawEvent {
+		t.Fatalf("missing queue_changed event for version %d: %#v", got.Version, cap.snapshot())
+	}
 }

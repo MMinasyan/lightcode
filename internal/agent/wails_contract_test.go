@@ -190,6 +190,43 @@ func TestWailsBindingsCoverExportedAppMethods(t *testing.T) {
 	}
 }
 
+func TestWailsLifecycleSurfaceContract(t *testing.T) {
+	binding := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "wailsjs", "go", "main", "App.d.ts"))
+	required := []string{
+		"export function Submit(arg1:string):Promise<agent.SubmitResult>;",
+		"export function QueueSnapshot():Promise<agent.QueueState>;",
+		"export function CompactNow():Promise<void>;",
+		"export function ProjectSwitch(arg1:string):Promise<void>;",
+		"export function SessionNew():Promise<void>;",
+		"export function SessionSwitch(arg1:string):Promise<void>;",
+		"export function ApplyTurnAction(arg1:number,arg2:string,arg3:boolean):Promise<agent.TurnActionResult>;",
+		"export function TokenUsage():Promise<agent.TokenReport>;",
+		"export function CurrentWarnings():Promise<Array<agent.PromptWarning>>;",
+	}
+	for _, want := range required {
+		if !strings.Contains(binding, want) {
+			t.Fatalf("Wails binding missing lifecycle surface: %s", want)
+		}
+	}
+
+	app := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	for _, eventName := range []string{
+		"queue_changed",
+		"turn_start",
+		"turn_end",
+		"user_message",
+		"system_signal",
+		"compaction_start",
+		"compaction_end",
+		"usage",
+		"warnings",
+	} {
+		if !strings.Contains(app, "EventsOn('"+eventName+"'") {
+			t.Fatalf("App.svelte must listen for backend lifecycle event %q", eventName)
+		}
+	}
+}
+
 func TestFrontendUserAndSystemTranscriptEntriesArriveViaBackendEvents(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
 

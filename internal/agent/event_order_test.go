@@ -18,6 +18,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/loop"
 	"github.com/MMinasyan/lightcode/internal/process"
 	"github.com/MMinasyan/lightcode/internal/prompt"
+	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
 // transcriptRow is the projection used by both projectEvents and
@@ -262,6 +263,13 @@ func writeTextResponse(w http.ResponseWriter, content string) {
 	fmt.Fprint(w, "data: [DONE]\n\n")
 }
 
+func writePendingEditToolCallResponse(w http.ResponseWriter, id string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	args := `{"path":"file.txt","old_string":"a","new_string":"b","pending":true}`
+	fmt.Fprintf(w, `data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":%q,"type":"function","function":{"name":"edit_file","arguments":%q}}]},"finish_reason":"tool_calls"}]}`+"\n\n", id, args)
+	fmt.Fprint(w, "data: [DONE]\n\n")
+}
+
 // writeHangingResponse holds the connection until ctx is cancelled to simulate
 // a cancellable mid-stream model call.
 func writeHangingResponse(w http.ResponseWriter, ctx context.Context) {
@@ -473,6 +481,77 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		waitUntilFullyDrained(t, a)
 		assertProjectionsMatch(t, a, cap)
 	})
+
+	t.Run("staged_edit", func(t *testing.T) {
+		var reqs atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if reqs.Add(1) == 1 {
+				writePendingEditToolCallResponse(w, "call_1")
+				return
+			}
+			writeTextResponse(w, "done")
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		a.lp.SetPendingExecutor(fakeAgentPendingExecutor{results: map[string]tool.BatchResult{
+			"call_1": {Success: true, Result: "Edited file.txt (1 replacement, lines 1-1)."},
+		}})
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		if _, err := a.Submit(ctx, "stage edit"); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		assertProjectionsMatch(t, a, cap)
+	})
+
+	t.Run("failed_staged_edit", func(t *testing.T) {
+		var reqs atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if reqs.Add(1) == 1 {
+				writePendingEditToolCallResponse(w, "call_1")
+				return
+			}
+			writeTextResponse(w, "done")
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		a.lp.SetPendingExecutor(fakeAgentPendingExecutor{results: map[string]tool.BatchResult{
+			"call_1": {Success: false, Error: "error: no match"},
+		}})
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		if _, err := a.Submit(ctx, "stage edit"); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		assertProjectionsMatch(t, a, cap)
+	})
+}
+
+type fakeAgentPendingExecutor struct {
+	results map[string]tool.BatchResult
+}
+
+func (f fakeAgentPendingExecutor) ExecutePending(_ context.Context, staged []tool.StagedCall) []tool.BatchResult {
+	out := make([]tool.BatchResult, 0, len(staged))
+	for _, call := range staged {
+		if res, ok := f.results[call.ToolCallID]; ok {
+			res.ToolName = call.ToolName
+			res.ToolCallID = call.ToolCallID
+			out = append(out, res)
+			continue
+		}
+		out = append(out, tool.BatchResult{
+			ToolName:   call.ToolName,
+			ToolCallID: call.ToolCallID,
+			Success:    true,
+			Result:     "applied " + call.ToolCallID,
+		})
+	}
+	return out
 }
 
 func assertProjectionsMatch(t *testing.T, a *Agent, cap *eventCapture) {
