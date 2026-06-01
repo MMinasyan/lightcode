@@ -20,6 +20,20 @@ export namespace agent {
 	        this.output = source["output"];
 	    }
 	}
+	export class SubagentSessionLink {
+	    index: number;
+	    sessionId: string;
+
+	    static createFrom(source: any = {}) {
+	        return new SubagentSessionLink(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.index = source["index"];
+	        this.sessionId = source["sessionId"];
+	    }
+	}
 	export class DisplayMessage {
 	    type: string;
 	    content?: string;
@@ -31,6 +45,7 @@ export namespace agent {
 	    success?: boolean;
 	    result?: string;
 	    metadata?: Record<string, any>;
+	    subagentSessionIds?: SubagentSessionLink[];
 	    backgroundProcess?: BackgroundProcessDisplay;
 
 	    static createFrom(source: any = {}) {
@@ -49,6 +64,7 @@ export namespace agent {
 	        this.success = source["success"];
 	        this.result = source["result"];
 	        this.metadata = source["metadata"];
+	        this.subagentSessionIds = this.convertValues(source["subagentSessionIds"], SubagentSessionLink);
 	        this.backgroundProcess = this.convertValues(source["backgroundProcess"], BackgroundProcessDisplay);
 	    }
 
@@ -262,6 +278,7 @@ export namespace agent {
 	    state: string;
 	    archivedAt: number;
 	    projectPath: string;
+	    parentSessionId?: string;
 
 	    static createFrom(source: any = {}) {
 	        return new SessionSummary(source);
@@ -275,6 +292,7 @@ export namespace agent {
 	        this.state = source["state"];
 	        this.archivedAt = source["archivedAt"];
 	        this.projectPath = source["projectPath"];
+	        this.parentSessionId = source["parentSessionId"];
 	    }
 	}
 	export class SnapshotFile {

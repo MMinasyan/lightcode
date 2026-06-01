@@ -115,7 +115,7 @@ func (r *Runner) dispatch(ctx context.Context, req Request) {
 	case "session/switch":
 		r.handleSessionSwitch(req)
 	case "session/messages":
-		r.respond(req.ID, r.agent.SessionMessages())
+		r.handleSessionMessages(req)
 	case "queue/list":
 		r.handleQueueList(req)
 	case "session/archive":
@@ -221,8 +221,15 @@ func (r *Runner) handleEvent(ev agent.Event) {
 		method = "agent/turn_start"
 		params = map[string]any{"turn": ev.Turn}
 	case agent.EventTurnEnd:
-		method = "agent/turn_end"
-		params = map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled}
+		r.sendNotification(Notification{
+			JSONRPC: "2.0",
+			Method:  "agent/turn_end",
+			Params:  map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled},
+		})
+		if ev.RefreshSession {
+			r.pushSessionChanged()
+		}
+		return
 	case agent.EventError:
 		method = "agent/error"
 		params = map[string]any{"message": ev.Error, "turn": ev.Turn}
@@ -245,7 +252,9 @@ func (r *Runner) handleEvent(ev agent.Event) {
 			JSONRPC: "2.0",
 			Method:  "agent/compaction_end",
 		})
-		r.pushSessionChanged()
+		if ev.RefreshSession {
+			r.pushSessionChanged()
+		}
 		return
 	case agent.EventWarning:
 		method = "agent/warnings"
@@ -328,6 +337,28 @@ func (r *Runner) handleSessionList(req Request) {
 		return
 	}
 	r.respond(req.ID, list)
+}
+
+func (r *Runner) handleSessionMessages(req Request) {
+	var params struct {
+		ID string `json:"id"`
+	}
+	if req.Params != nil {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			r.respondError(req.ID, -32602, "invalid params")
+			return
+		}
+	}
+	if params.ID == "" {
+		r.respond(req.ID, r.agent.SessionMessages())
+		return
+	}
+	msgs, err := r.agent.SessionMessagesFor(params.ID)
+	if err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	r.respond(req.ID, msgs)
 }
 
 func (r *Runner) handleSessionSwitch(req Request) {

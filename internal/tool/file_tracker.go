@@ -103,6 +103,31 @@ func (t *FileTracker) Reset() {
 	t.identities = make(map[string]FileIdentity)
 }
 
+// Snapshot returns a copy of the tracked read state.
+func (t *FileTracker) Snapshot() []ReadRecord {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]ReadRecord(nil), t.reads...)
+}
+
+// Restore resets the tracker to a prior read snapshot.
+func (t *FileTracker) Restore(reads []ReadRecord) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.generation++
+	t.reads = append([]ReadRecord(nil), reads...)
+	t.identities = make(map[string]FileIdentity, len(reads))
+	for _, r := range reads {
+		t.identities[r.Path] = r.Identity
+	}
+}
+
 // IsDuplicateIdentity checks duplicate status against identity metadata from an already-opened file.
 func (t *FileTracker) IsDuplicateIdentity(path string, offset, limit int, current FileIdentity) (bool, ReadRecord) {
 	t.mu.Lock()

@@ -5,18 +5,12 @@ import (
 	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
+	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
 )
 
 // ProtocolWarning describes a non-fatal protocol metadata diagnostic.
-type ProtocolWarning struct {
-	Kind         string
-	Message      string
-	Provider     string
-	Model        string
-	Field        string
-	MessageIndex int
-}
+type ProtocolWarning = modelclient.ProtocolWarning
 
 // SerializeMessages converts canonical messages to the OpenAI-compatible
 // message maps used in provider request bodies.

@@ -190,6 +190,63 @@ func TestWailsBindingsCoverExportedAppMethods(t *testing.T) {
 	}
 }
 
+func TestWailsLifecycleSurfaceContract(t *testing.T) {
+	binding := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "wailsjs", "go", "main", "App.d.ts"))
+	required := []string{
+		"export function Submit(arg1:string):Promise<agent.SubmitResult>;",
+		"export function QueueSnapshot():Promise<agent.QueueState>;",
+		"export function CompactNow():Promise<void>;",
+		"export function ProjectSwitch(arg1:string):Promise<void>;",
+		"export function SessionNew():Promise<void>;",
+		"export function SessionSwitch(arg1:string):Promise<void>;",
+		"export function SessionMessagesFor(arg1:string):Promise<Array<agent.DisplayMessage>>;",
+		"export function ApplyTurnAction(arg1:number,arg2:string,arg3:boolean):Promise<agent.TurnActionResult>;",
+		"export function TokenUsage():Promise<agent.TokenReport>;",
+		"export function CurrentWarnings():Promise<Array<agent.PromptWarning>>;",
+	}
+	for _, want := range required {
+		if !strings.Contains(binding, want) {
+			t.Fatalf("Wails binding missing lifecycle surface: %s", want)
+		}
+	}
+
+	app := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	for _, eventName := range []string{
+		"queue_changed",
+		"turn_start",
+		"turn_end",
+		"user_message",
+		"system_signal",
+		"compaction_start",
+		"compaction_end",
+		"usage",
+		"warnings",
+		"subagent_background_process_complete",
+	} {
+		if !strings.Contains(app, "EventsOn('"+eventName+"'") {
+			t.Fatalf("App.svelte must listen for backend lifecycle event %q", eventName)
+		}
+	}
+}
+
+func TestWailsDefersActiveCompactionSessionRefreshUntilTurnEnd(t *testing.T) {
+	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
+	compactionEnd := extractSwitchCase(t, app, "case agent.EventCompactionEnd:")
+	if !strings.Contains(compactionEnd, `EventsEmit(a.ctx, "compaction_end"`) {
+		t.Fatalf("EventCompactionEnd must still emit compaction_end; case:\n%s", compactionEnd)
+	}
+	if !strings.Contains(compactionEnd, "if ev.RefreshSession") || !strings.Contains(compactionEnd, "a.emitSessionChanged()") {
+		t.Fatalf("EventCompactionEnd must refresh history only when backend marks it safe; case:\n%s", compactionEnd)
+	}
+	turnEnd := extractSwitchCase(t, app, "case agent.EventTurnEnd:")
+	if !strings.Contains(turnEnd, `EventsEmit(a.ctx, "turn_end"`) {
+		t.Fatalf("EventTurnEnd must still emit turn_end; case:\n%s", turnEnd)
+	}
+	if !strings.Contains(turnEnd, "if ev.RefreshSession") || !strings.Contains(turnEnd, "a.emitSessionChanged()") {
+		t.Fatalf("EventTurnEnd must perform deferred compaction history refresh; case:\n%s", turnEnd)
+	}
+}
+
 func TestFrontendUserAndSystemTranscriptEntriesArriveViaBackendEvents(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
 
@@ -214,6 +271,60 @@ func TestFrontendUserAndSystemTranscriptEntriesArriveViaBackendEvents(t *testing
 
 	if strings.Contains(app, "type:'system', content:'interrupted'") || strings.Contains(app, "type: 'system', content: 'interrupted'") {
 		t.Fatalf("App.svelte must not synthesize an 'interrupted' transcript entry from turn_end; system_signal carries that text now")
+	}
+}
+
+func TestWailsSubagentTaskLinksAreOrderIndependent(t *testing.T) {
+	app := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	for _, want := range []string{
+		"pendingSubagentSessionLinks",
+		"rememberSubagentLink(pendingSubagentSessionLinks, data.taskToolCallId",
+		"takePendingSubagentLinks(pendingSubagentSessionLinks, data.id",
+		"subagentLinksFromMetadata(metadata)",
+	} {
+		if !strings.Contains(app, want) {
+			t.Fatalf("App.svelte missing subagent task-link ordering guard %q", want)
+		}
+	}
+
+	helpers := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "lib", "subagentLinks.js"))
+	for _, want := range []string{"metadata.subagent_session_ids", "metadata.subagentSessionIds"} {
+		if !strings.Contains(helpers, want) {
+			t.Fatalf("subagentLinks.js missing metadata recovery path %q", want)
+		}
+	}
+}
+
+func TestFrontendTaskSubagentLinksRemainClickableAfterCompletion(t *testing.T) {
+	toolCall := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "components", "ToolCall.svelte"))
+	taskStart := strings.Index(toolCall, "{:else if name === 'task'}")
+	if taskStart < 0 {
+		t.Fatal("ToolCall.svelte task branch not found")
+	}
+	taskEnd := strings.Index(toolCall[taskStart:], "{:else if name === 'save_memory'}")
+	if taskEnd < 0 {
+		t.Fatal("ToolCall.svelte task branch end not found")
+	}
+	taskBlock := toolCall[taskStart : taskStart+taskEnd]
+
+	for _, want := range []string{"subtask-row", "subagentSessionIds", "openSubagentTranscript"} {
+		if !strings.Contains(taskBlock, want) {
+			t.Fatalf("task branch missing persisted child-session affordance path %q", want)
+		}
+	}
+	for _, want := range []string{"SessionMessagesFor", "hydrateSubagentViewer"} {
+		if !strings.Contains(toolCall, want) {
+			t.Fatalf("ToolCall.svelte missing persisted child-session hydration path %q", want)
+		}
+	}
+	if strings.Contains(taskBlock, "openSubagentViewer(t.subagent_type") {
+		t.Fatalf("task subagent rows must hydrate persisted child history, not open an empty live-only viewer")
+	}
+	if strings.Contains(taskBlock, "{#if !done}") {
+		t.Fatalf("task subagent rows must not be gated by !done; completed and reloaded rows still need backend-provided child links")
+	}
+	if !strings.Contains(taskBlock, "{#if done}") || !strings.Contains(taskBlock, "toggleOrOpenOutput('task results')") {
+		t.Fatalf("task branch must still gate task output on done while keeping subtask rows visible")
 	}
 }
 
@@ -322,6 +433,23 @@ func extractUniqueMatches(content, pattern string) []string {
 		}
 	}
 	return sortedKeys(seen)
+}
+
+func extractSwitchCase(t *testing.T, content, marker string) string {
+	t.Helper()
+	start := strings.Index(content, marker)
+	if start < 0 {
+		t.Fatalf("switch case %q not found", marker)
+	}
+	rest := content[start+len(marker):]
+	next := strings.Index(rest, "\n\tcase ")
+	if next < 0 {
+		next = strings.Index(rest, "\n\tdefault:")
+	}
+	if next < 0 {
+		return rest
+	}
+	return rest[:next]
 }
 
 func stringSet(values []string) map[string]bool {

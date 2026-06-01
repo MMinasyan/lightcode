@@ -1,7 +1,7 @@
-// Package loop implements the agentic loop: user message → model →
+// Package engine implements the agentic loop: user message → model →
 // text or tool calls → execute → feed result back → repeat until the
 // model returns a text-only response.
-package loop
+package engine
 
 import (
 	"context"
@@ -17,11 +17,10 @@ import (
 
 	openai "github.com/sashabaranov/go-openai"
 
-	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/editpreview"
-	"github.com/MMinasyan/lightcode/internal/message"
-	"github.com/MMinasyan/lightcode/internal/provider"
-	"github.com/MMinasyan/lightcode/internal/tool"
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
+	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
+	"github.com/MMinasyan/lightcode/internal/engine/tool"
 )
 
 // maxIterations caps how many model→tool→model rounds a single user turn
@@ -39,6 +38,10 @@ const (
 	systemSignalInternalKind = "system_signal"
 	toolResultErrorKind      = "tool_result_error"
 )
+
+// ErrNoModelConfigured is returned when the engine has no model client for a
+// turn. Runtime/harness code owns user-facing setup guidance.
+var ErrNoModelConfigured = errors.New("no model configured")
 
 var systemSignalEscaper = strings.NewReplacer(
 	"&", "&amp;",
@@ -92,17 +95,12 @@ func IsToolResultErrorMessage(msg message.Message) bool {
 // Store is the minimum surface the loop needs from the snapshot
 // package: turn-scoped message persistence, turn completion, and
 // activity touch. Declared here so loop has no import dependency on
-// internal/snapshot. app.go wires the concrete *snapshot.Store.
+// snapshot storage. app.go wires the concrete implementation.
 type Store interface {
 	AppendMessage(turn int, msg []byte) error
 	MarkTurnComplete(turn int) error
 	TouchActivity() error
 	CurrentTurn() int
-}
-
-// PendingExecutor applies staged edit/write calls at flush time.
-type PendingExecutor interface {
-	ExecutePending(ctx context.Context, staged []tool.StagedCall) []tool.BatchResult
 }
 
 // EventKind identifies the phase of a tool call being reported.
@@ -153,6 +151,7 @@ type Event struct {
 
 	// Usage fields (Usage kind only).
 	Model      string
+	ModelRef   coremodel.ModelRef
 	Cache      int
 	Input      int
 	Output     int
@@ -184,12 +183,40 @@ type PendingSignal struct {
 	BackgroundProcess *BackgroundProcessDisplay
 }
 
+// ContextTransformCheckpoint describes a model-request checkpoint where the
+// caller may transform conversation history before the request is sent.
+type ContextTransformCheckpoint struct {
+	Turn            int
+	ActiveTurnStart int
+	Force           bool
+}
+
+// ContextTransformResult reports whether history was transformed and where the
+// current in-progress turn now starts after the transform.
+type ContextTransformResult struct {
+	Transformed     bool
+	ActiveTurnStart int
+}
+
+// ContextTransformer runs at model-request checkpoints.
+type ContextTransformer interface {
+	BeforeModelRequest(ctx context.Context, checkpoint ContextTransformCheckpoint) (ContextTransformResult, error)
+}
+
+// UsageRecorder observes usage synchronously before usage events are forwarded
+// to asynchronous subscribers.
+type UsageRecorder interface {
+	RecordUsage(Event)
+}
+
 // Loop owns the conversation history for a single session and drives
 // the agentic loop on each user turn.
 type Loop struct {
-	client   *provider.Client
-	registry *tool.Registry
-	messages []message.Message
+	client             modelclient.ChatStreamer
+	registry           *tool.Registry
+	messages           []message.Message
+	contextTransformer ContextTransformer
+	usageRecorder      UsageRecorder
 
 	// turnBoundaries records the index of each user message in
 	// l.messages as it is appended. turnBoundaries[i] is the index of
@@ -206,24 +233,24 @@ type Loop struct {
 
 	droppedEvents int
 
-	// pendingQueue holds staged edit_file/write_file calls for
-	// batch execution. Created fresh per turn.
+	// pendingQueue holds staged tool calls for batch execution. Created fresh
+	// per turn.
 	pendingQueue *tool.PendingQueue
 
 	// consumedFlushResults accumulates the BatchResults of staged flushes
-	// triggered during one assistant message's tool dispatch (execute_pending
+	// triggered during one assistant message's tool dispatch (explicit flush
 	// or a flush-before-a-non-pending-tool). The Run dispatch loop persists a
 	// single <staged-flush> wrapper from these after the loop and resets it.
 	consumedFlushResults []tool.BatchResult
 
-	pendingExecutor PendingExecutor
+	pendingExecutor tool.PendingExecutor
 
 	signalMu       sync.Mutex
 	pendingSignals []PendingSignal
 }
 
 // New returns a Loop pre-seeded with the system prompt.
-func New(client *provider.Client, registry *tool.Registry, systemPrompt string) *Loop {
+func New(client modelclient.ChatStreamer, registry *tool.Registry, systemPrompt string) *Loop {
 	return &Loop{
 		client:   client,
 		registry: registry,
@@ -233,7 +260,7 @@ func New(client *provider.Client, registry *tool.Registry, systemPrompt string) 
 }
 
 // SetClient replaces the provider client used for subsequent turns.
-func (l *Loop) SetClient(c *provider.Client) { l.client = c }
+func (l *Loop) SetClient(c modelclient.ChatStreamer) { l.client = c }
 
 // SetStore wires a persistence store into the loop. Messages appended
 // after this call are persisted via store.AppendMessage.
@@ -252,10 +279,29 @@ func (l *Loop) SetTrace(w io.Writer) {
 // SetEvents registers a channel to receive structured tool call events.
 func (l *Loop) SetEvents(ch chan<- Event) { l.events = ch }
 
-// SetPendingExecutor configures the executor used to flush staged edits.
-func (l *Loop) SetPendingExecutor(exec PendingExecutor) { l.pendingExecutor = exec }
+// SetContextTransformer configures the before-model-request transform hook.
+func (l *Loop) SetContextTransformer(t ContextTransformer) { l.contextTransformer = t }
+
+// SetUsageRecorder configures synchronous usage observation.
+func (l *Loop) SetUsageRecorder(r UsageRecorder) { l.usageRecorder = r }
+
+// SetPendingExecutor configures the executor used to flush staged calls.
+func (l *Loop) SetPendingExecutor(exec tool.PendingExecutor) {
+	l.pendingExecutor = exec
+	if l.registry != nil {
+		if coordinator, ok := l.registry.PendingCoordinator(); ok {
+			if setter, ok := coordinator.(interface{ SetPendingExecutor(tool.PendingExecutor) }); ok {
+				setter.SetPendingExecutor(exec)
+			}
+		}
+	}
+}
 
 func (l *Loop) emit(ev Event) {
+	if ev.Kind == Usage && l.usageRecorder != nil {
+		l.usageRecorder.RecordUsage(ev)
+		return
+	}
 	if l.events == nil {
 		return
 	}
@@ -331,46 +377,27 @@ func assistantVisibleText(msg message.Message) string {
 	return msg.Refusal
 }
 
-func normalizeAssistantToolCalls(msg message.Message) message.Message {
+func (l *Loop) normalizeAssistantToolCalls(msg message.Message) message.Message {
 	for i := range msg.ToolCalls {
-		msg.ToolCalls[i] = normalizeToolCall(msg.ToolCalls[i])
+		msg.ToolCalls[i] = l.normalizeToolCall(msg.ToolCalls[i])
 	}
 	return msg
 }
 
-func normalizeToolCall(tc message.ToolCall) message.ToolCall {
-	tc.Function.Arguments = normalizeToolCallArgs(tc.Function.Name, tc.Function.Arguments)
-	return tc
-}
-
-func normalizeToolCallArgs(name, args string) string {
-	if name != "sleep" {
-		return args
+func (l *Loop) normalizeToolCall(tc message.ToolCall) message.ToolCall {
+	if l == nil || l.registry == nil {
+		return tc
 	}
-	var params map[string]any
-	if err := json.Unmarshal([]byte(args), &params); err != nil {
-		return args
-	}
-	v, ok := params["seconds"].(float64)
+	normalizer, ok := l.registry.ArgumentNormalizer(tc.Function.Name)
 	if !ok {
-		return args
+		return tc
 	}
-	sec := int(v)
-	if sec < 1 {
-		sec = 1
+	normalized, err := normalizer.NormalizeArguments(json.RawMessage(tc.Function.Arguments))
+	if err != nil || len(normalized) == 0 {
+		return tc
 	}
-	if sec > 300 {
-		sec = 300
-	}
-	if float64(sec) == v {
-		return args
-	}
-	params["seconds"] = sec
-	data, err := json.Marshal(params)
-	if err != nil {
-		return args
-	}
-	return string(data)
+	tc.Function.Arguments = string(normalized)
+	return tc
 }
 
 func emptyAssistantResponseError(finishReason openai.FinishReason, sawChoice bool) error {
@@ -412,9 +439,17 @@ func (l *Loop) AppendUserMessage(turn int, content string) {
 // message into history: it appends to l.messages, persists to the store, and
 // emits a UserMessageDisplay event. Callers own turnBoundaries.
 func (l *Loop) persistAndEmitUserMessage(turn int, content string) {
+	l.persistUserMessage(turn, content)
+	l.emitUserMessageDisplay(turn, content)
+}
+
+func (l *Loop) persistUserMessage(turn int, content string) {
 	msg := message.NewText(message.RoleUser, content)
 	l.messages = append(l.messages, msg)
 	l.persistMessage(turn, msg)
+}
+
+func (l *Loop) emitUserMessageDisplay(turn int, content string) {
 	l.emit(Event{Kind: UserMessageDisplay, Turn: turn, Result: content})
 }
 
@@ -557,17 +592,17 @@ func (l *Loop) LoadHistory(turns [][]message.Message) {
 // compaction. A synthetic assistant message containing the summary is
 // injected before any post-compaction turns, attributed to the
 // summarizer model so its provenance is preserved.
-func (l *Loop) LoadHistoryWithSummary(summary string, summarizer catalog.ModelRef, turns [][]message.Message) {
+func (l *Loop) LoadHistoryWithSummary(summary string, summarizer coremodel.ModelRef, turns [][]message.Message) {
 	l.loadHistoryWithSummary(summary, summarizer, turns, true)
 }
 
 // LoadHistoryWithSummaryPreservePending restores compacted history without
 // dropping pending async model input. Used by compaction in the active turn.
-func (l *Loop) LoadHistoryWithSummaryPreservePending(summary string, summarizer catalog.ModelRef, turns [][]message.Message) {
+func (l *Loop) LoadHistoryWithSummaryPreservePending(summary string, summarizer coremodel.ModelRef, turns [][]message.Message) {
 	l.loadHistoryWithSummary(summary, summarizer, turns, false)
 }
 
-func (l *Loop) loadHistoryWithSummary(summary string, summarizer catalog.ModelRef, turns [][]message.Message, clearSignals bool) {
+func (l *Loop) loadHistoryWithSummary(summary string, summarizer coremodel.ModelRef, turns [][]message.Message, clearSignals bool) {
 	l.resetHistory(clearSignals)
 	summaryMsg := message.NewText(message.RoleAssistant, "[Previous conversation summary]\n\n"+summary+"\n\n[End of summary. Continue from here.]")
 	summaryMsg.Source = summarizer
@@ -580,6 +615,26 @@ func (l *Loop) loadHistoryWithSummary(summary string, summarizer catalog.ModelRe
 		l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
 		l.messages = append(l.messages, turn...)
 	}
+}
+
+// LoadHistoryWithSummaryAndActiveTail compacts completed prior turns into a
+// summary while preserving the active in-progress turn tail byte-for-byte.
+// It returns the new message index where the active turn starts.
+func (l *Loop) LoadHistoryWithSummaryAndActiveTail(summary string, summarizer coremodel.ModelRef, activeTurnStart int) int {
+	if activeTurnStart < 0 {
+		activeTurnStart = 0
+	}
+	if activeTurnStart > len(l.messages) {
+		activeTurnStart = len(l.messages)
+	}
+	tail := append([]message.Message(nil), l.messages[activeTurnStart:]...)
+	l.loadHistoryWithSummary(summary, summarizer, nil, false)
+	newActiveTurnStart := len(l.messages)
+	if len(tail) > 0 {
+		l.turnBoundaries = append(l.turnBoundaries, newActiveTurnStart)
+		l.messages = append(l.messages, tail...)
+	}
+	return newActiveTurnStart
 }
 
 // persistMessage serializes msg and appends it to the current turn's
@@ -616,10 +671,11 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 	l.pendingQueue = tool.NewPendingQueue()
 	l.consumedFlushResults = nil
 
-	l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
+	activeTurnStart := len(l.messages)
+	l.turnBoundaries = append(l.turnBoundaries, activeTurnStart)
 	l.DrainPendingSignalsForModel(turn)
 	for _, input := range userInputs {
-		l.persistAndEmitUserMessage(turn, input)
+		l.persistUserMessage(turn, input)
 	}
 	if l.store != nil {
 		_ = l.store.TouchActivity()
@@ -633,13 +689,36 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		}
 	}()
 
+	userDisplaysEmitted := false
+	emitDeferredUserDisplays := func() {
+		if userDisplaysEmitted {
+			return
+		}
+		for _, input := range userInputs {
+			l.emitUserMessageDisplay(turn, input)
+		}
+		userDisplaysEmitted = true
+	}
+
 	for iter := 0; iter < maxIterations; iter++ {
+		if iter > 0 {
+			l.DrainPendingSignalsForModel(turn)
+		}
+		if result, err := l.beforeModelRequest(ctx, turn, activeTurnStart); err != nil {
+			emitDeferredUserDisplays()
+			return "", err
+		} else if result.Transformed {
+			activeTurnStart = result.ActiveTurnStart
+		}
+		if iter == 0 {
+			emitDeferredUserDisplays()
+		}
 		l.DrainPendingSignalsForModel(turn)
 		msg, cancelled, err := l.runStream(ctx)
 		if err != nil {
 			return "", fmt.Errorf("chat completion: %w", err)
 		}
-		msg = normalizeAssistantToolCalls(msg)
+		msg = l.normalizeAssistantToolCalls(msg)
 		if cancelled {
 			msg.ToolCalls = nil
 			if assistantMessageHasPayload(msg) {
@@ -654,9 +733,11 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		l.persistMessage(turn, msg)
 
 		if len(msg.ToolCalls) == 0 {
-			// Auto-flush pending edits at turn end.
 			if l.pendingQueue.Len() > 0 {
-				results := l.flushPendingQueue(ctx)
+				results, err := l.flushPendingAtTurnEnd(ctx)
+				if err != nil {
+					return "", fmt.Errorf("flush pending at turn end: %w", err)
+				}
 				l.appendStagedFlushWrapper(turn, results)
 			}
 			if l.HasPendingWakeSignal() {
@@ -671,6 +752,9 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 			toolMsg := message.NewText(message.RoleTool, result.Content)
 			toolMsg.ToolCallID = tc.ID
 			toolMsg.Name = tc.Function.Name
+			if len(result.Metadata) > 0 {
+				toolMsg.DisplayMetadata = result.Metadata
+			}
 			if result.IsError {
 				MarkToolResultError(&toolMsg)
 			}
@@ -697,21 +781,33 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 	return "", fmt.Errorf("agent loop exceeded %d iterations without a final text response; the model may be stuck in a tool-call cycle", maxIterations)
 }
 
+func (l *Loop) beforeModelRequest(ctx context.Context, turn, activeTurnStart int) (ContextTransformResult, error) {
+	if l == nil || l.contextTransformer == nil {
+		return ContextTransformResult{}, nil
+	}
+	return l.contextTransformer.BeforeModelRequest(ctx, ContextTransformCheckpoint{
+		Turn:            turn,
+		ActiveTurnStart: activeTurnStart,
+	})
+}
+
 // runStream performs one streaming chat completion. Returns (msg,
 // cancelled, err). On context cancellation it returns whatever partial
 // text + tool deltas have accumulated with cancelled=true and err=nil,
 // so the caller can persist the partial and exit the turn gracefully.
 func isRetryable(err error) bool {
-	var statusErr *provider.HTTPStatusError
-	if errors.As(err, &statusErr) {
-		return statusErr.Retryable()
+	var retryable interface {
+		Retryable() bool
+	}
+	if errors.As(err, &retryable) {
+		return retryable.Retryable()
 	}
 	return false
 }
 
 func (l *Loop) runStream(ctx context.Context) (message.Message, bool, error) {
 	if l.client == nil {
-		return message.Message{}, false, fmt.Errorf("no model configured — set default_model in ~/.lightcode/config.json and an API key in ~/.lightcode/.env")
+		return message.Message{}, false, ErrNoModelConfigured
 	}
 	l.emitProtocolWarnings(l.client.ProtocolWarnings(l.messages))
 	const maxRetries = 3
@@ -727,9 +823,10 @@ func (l *Loop) runStream(ctx context.Context) (message.Message, bool, error) {
 			}
 			backoff *= 2
 		}
-		var stream *provider.Stream
-		var err error
-		stream, err = l.client.ChatStream(ctx, l.messages, l.registry.OpenAITools(), nil)
+		stream, err := l.client.ChatStream(ctx, modelclient.ChatRequest{
+			Messages: l.messages,
+			Tools:    l.registry.OpenAITools(),
+		})
 		if err != nil {
 			if ctx.Err() != nil {
 				return message.Message{Role: message.RoleAssistant}, true, nil
@@ -751,7 +848,7 @@ func (l *Loop) runStream(ctx context.Context) (message.Message, bool, error) {
 	return message.Message{}, false, lastErr
 }
 
-func (l *Loop) emitProtocolWarnings(warnings []provider.ProtocolWarning) {
+func (l *Loop) emitProtocolWarnings(warnings []modelclient.ProtocolWarning) {
 	for _, warning := range warnings {
 		l.emit(Event{
 			Kind:   Warning,
@@ -767,7 +864,7 @@ func (l *Loop) emitProtocolWarnings(warnings []provider.ProtocolWarning) {
 	}
 }
 
-func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (message.Message, bool, error) {
+func (l *Loop) consumeStream(ctx context.Context, stream modelclient.ChatStream) (message.Message, bool, error) {
 
 	var (
 		contentBuf   strings.Builder
@@ -787,21 +884,21 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 	)
 
 	for {
-		chunk, err := stream.Recv()
+		delta, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
+			var parseErr modelclient.ChunkParseError
+			if errors.As(err, &parseErr) {
+				fmt.Fprintf(l.trace, "  !! protocol chunk parse: %v\n", parseErr.Err)
+				continue
+			}
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				cancelled = true
 				break
 			}
 			return message.Message{}, false, fmt.Errorf("stream recv: %w", err)
-		}
-		delta, err := provider.ParseChunk(chunk.Raw)
-		if err != nil {
-			fmt.Fprintf(l.trace, "  !! protocol chunk parse: %v\n", err)
-			continue
 		}
 		if delta.Usage != nil {
 			usage = delta.Usage
@@ -922,6 +1019,7 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 		l.emit(Event{
 			Kind:       Usage,
 			Model:      l.client.Model(),
+			ModelRef:   l.client.ModelRef(),
 			UsageKnown: true,
 			Cache:      cached,
 			Input:      input,
@@ -966,45 +1064,52 @@ func (l *Loop) consumeStream(ctx context.Context, stream *provider.Stream) (mess
 }
 
 type dispatchResult struct {
-	Content string
-	Denied  bool
-	IsError bool
+	Content  string
+	Denied   bool
+	IsError  bool
+	Metadata map[string]any
 }
 
 // dispatch executes one tool call and returns the result string plus display
 // state that must be persisted with the tool response.
 func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) dispatchResult {
-	tc = normalizeToolCall(tc)
+	tc = l.normalizeToolCall(tc)
 	fmt.Fprintf(l.trace, "  → %s %s\n", tc.Function.Name, truncate(tc.Function.Arguments, traceMaxChars))
 	l.emit(Event{Kind: ToolCallStart, ToolCallID: tc.ID, ToolName: tc.Function.Name, Args: tc.Function.Arguments})
 
 	var params map[string]any
 	parseErr := json.Unmarshal([]byte(tc.Function.Arguments), &params)
 
-	finish := func(result string, isError bool) dispatchResult {
+	finish := func(result string, isError bool, metadataArgs string) dispatchResult {
 		fmt.Fprintf(l.trace, "  ← %s\n", truncate(result, traceMaxChars))
 		ev := Event{Kind: ToolCallEnd, ToolCallID: tc.ID, ToolName: tc.Function.Name, Args: tc.Function.Arguments, Result: result, IsError: isError}
-		if !isError && tc.Function.Name == "edit_file" && params != nil {
-			ev.Metadata = editpreview.MetadataFromParams(params, result)
+		var metadata map[string]any
+		if !isError {
+			metadata = l.displayMetadata(ctx, tc.Function.Name, metadataArgs, result)
+			ev.Metadata = metadata
 		}
 		l.emit(ev)
-		return dispatchResult{Content: result, IsError: isError}
+		return dispatchResult{Content: result, IsError: isError, Metadata: metadata}
 	}
 
 	if parseErr != nil {
-		return finish(fmt.Sprintf("error: invalid JSON arguments: %v", parseErr), true)
+		return finish(fmt.Sprintf("error: invalid JSON arguments: %v", parseErr), true, tc.Function.Arguments)
 	}
 
-	// Handle execute_pending directly to use the current turn's queue.
-	if tc.Function.Name == "execute_pending" {
+	metadataArgs := tc.Function.Arguments
+
+	if coordinator, ok := l.pendingCoordinatorForTool(tc.Function.Name); ok {
 		act, _ := params["action"].(string)
 		if act == "discard" {
 			l.pendingQueue.Discard()
-			return finish("Discarded all staged edits.", false)
+			return finish("Discarded all staged edits.", false, metadataArgs)
 		}
-		results := l.flushPendingQueue(ctx)
+		results, err := l.flushPendingQueue(ctx, coordinator)
+		if err != nil {
+			return finish("error: "+err.Error(), true, metadataArgs)
+		}
 		if len(results) == 0 {
-			return finish("No pending edits to execute.", false)
+			return finish("No pending edits to execute.", false, metadataArgs)
 		}
 		// The per-staged ToolCallEnd events (emitted by flushPendingQueue)
 		// carry the real results live; the <staged-flush> wrapper (persisted
@@ -1012,91 +1117,184 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) dispatchResult
 		// on reload. This tool's own result is a short summary.
 		l.consumedFlushResults = append(l.consumedFlushResults, results...)
 		summary, isError := stagedFlushSummary(results)
-		return finish(summary, isError)
+		return finish(summary, isError, metadataArgs)
 	}
 
 	t, ok := l.registry.Get(tc.Function.Name)
 	if !ok {
-		return finish(fmt.Sprintf("error: unknown tool %q", tc.Function.Name), true)
+		return finish(fmt.Sprintf("error: unknown tool %q", tc.Function.Name), true, metadataArgs)
 	}
 
 	params["_tool_call_id"] = tc.ID
-
-	// Check for pending flag.
-	pending, _ := params["pending"].(bool)
-	if pending && (tc.Function.Name == "edit_file" || tc.Function.Name == "write_file") {
-		if err := validateStagedCall(tc.Function.Name, params); err != nil {
-			return finish(err.Error(), true)
-		}
-		l.pendingQueue.Stage(tool.StagedCall{
-			ToolName:   tc.Function.Name,
-			ToolCallID: tc.ID,
-			Args:       tc.Function.Arguments,
-			Params:     params,
-		})
-		return finish("Staged.", false)
+	if data, err := json.Marshal(params); err == nil {
+		metadataArgs = string(data)
 	}
 
-	// Before executing a non-pending tool, flush the queue. The flushed
-	// results are carried in consumedFlushResults (persisted as a single
-	// <staged-flush> wrapper after the dispatch loop); the non-pending tool's
-	// own result carries no batch prefix.
-	if l.pendingQueue.Len() > 0 && tc.Function.Name != "execute_pending" {
-		l.consumedFlushResults = append(l.consumedFlushResults, l.flushPendingQueue(ctx)...)
+	pending, _ := params["pending"].(bool)
+	if pending {
+		stageable, ok := l.stageableTool(tc.Function.Name)
+		if ok {
+			if err := stageable.ValidateStaged(ctx, json.RawMessage(tc.Function.Arguments)); err != nil {
+				return finish(err.Error(), true, metadataArgs)
+			}
+			l.pendingQueue.Stage(tool.StagedCall{
+				ToolName:   tc.Function.Name,
+				ToolCallID: tc.ID,
+				Args:       tc.Function.Arguments,
+				Params:     params,
+			})
+			return finish(stageable.StagedResultMessage(), false, metadataArgs)
+		}
+	}
+
+	if results, flushed, err := l.autoFlushBefore(ctx, tc); err != nil {
+		return finish("error: "+err.Error(), true, metadataArgs)
+	} else if flushed {
+		l.consumedFlushResults = append(l.consumedFlushResults, results...)
 	}
 
 	result, err := t.Execute(ctx, params)
 	if err != nil {
 		if errors.Is(err, tool.ErrDenied) {
-			result := finish("denied by user", true)
+			result := finish("denied by user", true, metadataArgs)
 			result.Denied = true
 			return result
 		}
 		var exitErr *tool.ExitError
 		if errors.As(err, &exitErr) {
-			return finish(exitErr.Output, true)
+			return finish(exitErr.Output, true, metadataArgs)
 		}
-		return finish("error: "+err.Error(), true)
+		return finish("error: "+err.Error(), true, metadataArgs)
 	}
-	return finish(result, false)
+	return finish(result, false, metadataArgs)
 }
 
-// flushPendingQueue executes all staged edits/writes and returns the
-// per-call BatchResults. Individual ToolCallEnd events are emitted for each
-// staged call so the live UI shows per-edit results; the caller persists a
-// <staged-flush> wrapper from the returned results for reload reconstruction.
-func (l *Loop) flushPendingQueue(ctx context.Context) []tool.BatchResult {
-	staged := l.pendingQueue.Staged()
-	l.pendingQueue.Discard()
+func (l *Loop) stageableTool(name string) (tool.StageableTool, bool) {
+	if l == nil || l.registry == nil {
+		return nil, false
+	}
+	return l.registry.StageableTool(name)
+}
 
-	if len(staged) == 0 {
+func (l *Loop) pendingCoordinator() tool.PendingCoordinator {
+	if l != nil && l.registry != nil {
+		if coordinator, ok := l.registry.PendingCoordinator(); ok {
+			return coordinator
+		}
+	}
+	return tool.NewPendingCoordinator("", l.pendingExecutorOrFallback())
+}
+
+func (l *Loop) pendingCoordinatorForTool(name string) (tool.PendingCoordinator, bool) {
+	coordinator := l.pendingCoordinator()
+	if coordinator == nil || coordinator.ExplicitFlushToolName() != name {
+		return nil, false
+	}
+	return coordinator, true
+}
+
+func (l *Loop) pendingExecutorOrFallback() tool.PendingExecutor {
+	if l.pendingExecutor != nil {
+		return l.pendingExecutor
+	}
+	return loopPendingExecutor{loop: l}
+}
+
+type loopPendingExecutor struct {
+	loop *Loop
+}
+
+func (e loopPendingExecutor) ExecutePending(ctx context.Context, staged []tool.StagedCall) []tool.BatchResult {
+	if e.loop == nil {
 		return nil
 	}
+	return e.loop.executePendingSequential(ctx, staged)
+}
 
-	var results []tool.BatchResult
-	if l.pendingExecutor != nil {
-		results = l.pendingExecutor.ExecutePending(ctx, staged)
-	} else {
-		results = l.executePendingSequential(ctx, staged)
+func (l *Loop) autoFlushBefore(ctx context.Context, tc message.ToolCall) ([]tool.BatchResult, bool, error) {
+	if l.pendingQueue == nil || l.pendingQueue.Len() == 0 {
+		return nil, false, nil
 	}
+	coordinator := l.pendingCoordinator()
+	if coordinator == nil {
+		return nil, false, nil
+	}
+	staged := l.pendingQueue.Staged()
+	results, flushed, err := coordinator.AutoFlushBefore(ctx, tool.ToolCall{
+		Name:      tc.Function.Name,
+		ID:        tc.ID,
+		Arguments: json.RawMessage(tc.Function.Arguments),
+	}, l.pendingQueue)
+	if err != nil || !flushed {
+		return results, flushed, err
+	}
+	l.emitPendingResults(ctx, results, staged)
+	return results, true, nil
+}
 
+func (l *Loop) flushPendingAtTurnEnd(ctx context.Context) ([]tool.BatchResult, error) {
+	if l.pendingQueue == nil || l.pendingQueue.Len() == 0 {
+		return nil, nil
+	}
+	staged := l.pendingQueue.Staged()
+	results, flushed, err := l.pendingCoordinator().FlushAtTurnEnd(ctx, l.pendingQueue)
+	if err != nil || !flushed {
+		return results, err
+	}
+	l.emitPendingResults(ctx, results, staged)
+	return results, nil
+}
+
+func (l *Loop) displayMetadata(ctx context.Context, name, args, result string) map[string]any {
+	if l == nil || l.registry == nil {
+		return nil
+	}
+	provider, ok := l.registry.DisplayMetadataProvider(name)
+	if !ok {
+		return nil
+	}
+	return provider.DisplayMetadata(ctx, json.RawMessage(args), result)
+}
+
+func (l *Loop) flushPendingQueue(ctx context.Context, coordinator tool.PendingCoordinator) ([]tool.BatchResult, error) {
+	if coordinator == nil {
+		coordinator = l.pendingCoordinator()
+	}
+	if l.pendingQueue == nil || l.pendingQueue.Len() == 0 {
+		return nil, nil
+	}
+	staged := l.pendingQueue.Staged()
+	results, flushed, err := coordinator.FlushPending(ctx, l.pendingQueue)
+	if err != nil || !flushed {
+		return results, err
+	}
+	l.emitPendingResults(ctx, results, staged)
+	return results, nil
+}
+
+func (l *Loop) emitPendingResults(ctx context.Context, results []tool.BatchResult, staged []tool.StagedCall) {
 	stagedByID := make(map[string]tool.StagedCall, len(staged))
 	for _, call := range staged {
 		stagedByID[call.ToolCallID] = call
 	}
 
-	// Emit individual ToolCallEnd events for each staged call.
-	for _, r := range results {
+	for i := range results {
+		r := &results[i]
 		result := r.Result
 		isError := false
 		if r.Error != "" {
 			result = r.Error
 			isError = true
 		}
-		var metadata map[string]any
 		stagedCall := stagedByID[r.ToolCallID]
-		if !isError && r.ToolName == "edit_file" && stagedCall.Params != nil {
-			metadata = editpreview.MetadataFromParams(stagedCall.Params, result)
+		metadata := r.Metadata
+		if !isError {
+			if metadata == nil {
+				metadata = l.displayMetadata(ctx, r.ToolName, stagedCall.Args, result)
+			}
+			r.Metadata = metadata
+		} else {
+			r.Metadata = nil
 		}
 		l.emit(Event{
 			Kind:       ToolCallEnd,
@@ -1108,8 +1306,6 @@ func (l *Loop) flushPendingQueue(ctx context.Context) []tool.BatchResult {
 			Metadata:   metadata,
 		})
 	}
-
-	return results
 }
 
 func stagedFlushSummary(results []tool.BatchResult) (string, bool) {
@@ -1138,9 +1334,10 @@ const (
 // StagedFlushEntry is one staged tool's final result, carried in the
 // <staged-flush> reload wrapper.
 type StagedFlushEntry struct {
-	ID      string `json:"id"`
-	Result  string `json:"result"`
-	IsError bool   `json:"isError"`
+	ID       string         `json:"id"`
+	Result   string         `json:"result"`
+	IsError  bool           `json:"isError"`
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 type stagedFlushPayload struct {
@@ -1156,10 +1353,11 @@ func BuildStagedFlush(results []tool.BatchResult) string {
 	}
 	payload := stagedFlushPayload{Results: make([]StagedFlushEntry, 0, len(results))}
 	for _, r := range results {
-		e := StagedFlushEntry{ID: r.ToolCallID, Result: r.Result}
+		e := StagedFlushEntry{ID: r.ToolCallID, Result: r.Result, Metadata: r.Metadata}
 		if r.Error != "" {
 			e.Result = r.Error
 			e.IsError = true
+			e.Metadata = nil
 		}
 		payload.Results = append(payload.Results, e)
 	}
@@ -1266,29 +1464,4 @@ func truncate(s string, max int) string {
 		return flat
 	}
 	return flat[:max] + fmt.Sprintf("... (%d bytes total)", len(s))
-}
-
-// validateStagedCall performs lightweight validation on a pending edit/write
-// before staging, so the model gets immediate error feedback.
-func validateStagedCall(toolName string, params map[string]any) error {
-	path, _ := params["path"].(string)
-	if path == "" {
-		return fmt.Errorf("%s: path is required", toolName)
-	}
-	if toolName == "edit_file" {
-		oldStr, _ := params["old_string"].(string)
-		newStr, _ := params["new_string"].(string)
-		if oldStr == "" {
-			return fmt.Errorf("edit_file: old_string must not be empty")
-		}
-		if oldStr == newStr {
-			return fmt.Errorf("edit_file: old_string and new_string are identical")
-		}
-	}
-	if toolName == "write_file" {
-		if _, ok := params["content"].(string); !ok {
-			return fmt.Errorf("write_file: content must be a string")
-		}
-	}
-	return nil
 }

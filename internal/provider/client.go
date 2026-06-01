@@ -11,7 +11,8 @@ import (
 	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -95,11 +96,11 @@ func (c *Client) Model() string {
 
 // ModelRef returns the resolved provider/model identity for messages produced
 // by this client.
-func (c *Client) ModelRef() catalog.ModelRef {
+func (c *Client) ModelRef() coremodel.ModelRef {
 	if c == nil || c.provider == nil || c.model == nil {
-		return catalog.ModelRef{}
+		return coremodel.ModelRef{}
 	}
-	return catalog.ModelRef{Provider: c.provider.ID, Model: c.model.ID}
+	return coremodel.ModelRef{Provider: c.provider.ID, Model: c.model.ID}
 }
 
 func (c *Client) postStream(ctx context.Context, body map[string]any) (*Stream, error) {

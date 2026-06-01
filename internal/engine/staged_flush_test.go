@@ -1,7 +1,8 @@
-package loop
+package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,9 +10,12 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/editpreview"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
+	"github.com/MMinasyan/lightcode/internal/engine/tool"
 	"github.com/MMinasyan/lightcode/internal/provider"
-	"github.com/MMinasyan/lightcode/internal/tool"
+	runtimetool "github.com/MMinasyan/lightcode/internal/tool"
 )
 
 // --- test doubles ---------------------------------------------------------
@@ -36,6 +40,9 @@ func (s stagedStubTool) Execute(context.Context, map[string]any) (string, error)
 	return s.result, nil
 }
 
+func (s stagedStubTool) ValidateStaged(context.Context, json.RawMessage) error { return nil }
+func (s stagedStubTool) StagedResultMessage() string                           { return "Staged." }
+
 // fakeFlushExecutor returns canned BatchResults for staged calls, mapping each
 // staged ToolCallID to a configured result so flushPendingQueue emits real
 // per-tool ToolCallEnd events without touching the filesystem.
@@ -55,6 +62,29 @@ func (f fakeFlushExecutor) ExecutePending(_ context.Context, staged []tool.Stage
 		out = append(out, tool.BatchResult{ToolName: s.ToolName, ToolCallID: s.ToolCallID, Success: true, Result: "applied " + s.ToolCallID})
 	}
 	return out
+}
+
+type namedFlushCoordinator struct {
+	name  string
+	inner tool.PendingCoordinator
+}
+
+func newNamedFlushCoordinator(name string, exec tool.PendingExecutor) namedFlushCoordinator {
+	return namedFlushCoordinator{name: name, inner: tool.NewPendingCoordinator(name, exec)}
+}
+
+func (c namedFlushCoordinator) ExplicitFlushToolName() string { return c.name }
+func (c namedFlushCoordinator) FlushPending(ctx context.Context, q *tool.PendingQueue) ([]tool.BatchResult, bool, error) {
+	return c.inner.FlushPending(ctx, q)
+}
+func (c namedFlushCoordinator) AutoFlushBefore(ctx context.Context, next tool.ToolCall, q *tool.PendingQueue) ([]tool.BatchResult, bool, error) {
+	if next.Name == c.name {
+		return nil, false, nil
+	}
+	return c.inner.FlushPending(ctx, q)
+}
+func (c namedFlushCoordinator) FlushAtTurnEnd(ctx context.Context, q *tool.PendingQueue) ([]tool.BatchResult, bool, error) {
+	return c.inner.FlushAtTurnEnd(ctx, q)
 }
 
 // sseServer serves one SSE body per request, indexed by call count.
@@ -82,7 +112,12 @@ func loopForServer(srv *httptest.Server, registry *tool.Registry) *Loop {
 		Models:    map[string]*catalog.Model{"model-a": {ID: "model-a"}},
 	}
 	client := provider.New(prov, prov.Models["model-a"], "")
-	return New(client, registry, "system")
+	return New(provider.NewAdapter(client), registry, "system")
+}
+
+func setTestPendingExecutor(lp *Loop, registry *tool.Registry, exec tool.PendingExecutor) {
+	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator("execute_pending", exec))
+	lp.SetPendingExecutor(exec)
 }
 
 // editToolCallChunk renders an assistant SSE chunk that calls edit_file with
@@ -140,9 +175,11 @@ func drainEvents(ch chan Event) []Event {
 func TestStagedAutoFlushPersistsWrapperAndEmitsRealResults(t *testing.T) {
 	srv := sseServer(t, editToolCallChunk("call_1"), textChunk("done"))
 	registry := tool.NewRegistry()
-	registry.Register(stagedStubTool{name: "edit_file"})
+	registry.Register(runtimetool.NewEditFile(nil, config.ToolsConfig{}))
 	lp := loopForServer(srv, registry)
-	lp.SetPendingExecutor(fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
+	store := &fakeStore{}
+	lp.SetStore(store)
+	setTestPendingExecutor(lp, registry, fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
 		"call_1": {Success: true, Result: "Edited file.txt (1 replacement, lines 1-2)."},
 	}})
 	events := make(chan Event, 32)
@@ -179,6 +216,25 @@ func TestStagedAutoFlushPersistsWrapperAndEmitsRealResults(t *testing.T) {
 	if wrapper.InternalKind != stagedFlushInternalKind {
 		t.Fatalf("wrapper InternalKind = %q, want %q", wrapper.InternalKind, stagedFlushInternalKind)
 	}
+	if _, ok := editpreview.FromMetadata(entries[0].Metadata); !ok {
+		t.Fatalf("wrapper entry metadata lacks edit preview: %#v", entries[0].Metadata)
+	}
+	var persistedEntries []StagedFlushEntry
+	for _, raw := range store.messages {
+		var m message.Message
+		if json.Unmarshal(raw, &m) != nil {
+			continue
+		}
+		if e, ok := ParseStagedFlushMessage(m); ok {
+			persistedEntries = e
+		}
+	}
+	if len(persistedEntries) != 1 {
+		t.Fatalf("persisted staged-flush entries = %#v", persistedEntries)
+	}
+	if _, ok := editpreview.FromMetadata(persistedEntries[0].Metadata); !ok {
+		t.Fatalf("persisted wrapper metadata lacks edit preview: %#v", persistedEntries[0].Metadata)
+	}
 
 	// Live events: ToolCallStart, then the "Staged." end, then the real end.
 	evs := drainEvents(events)
@@ -207,6 +263,9 @@ func TestStagedAutoFlushPersistsWrapperAndEmitsRealResults(t *testing.T) {
 	if ends[1].Args == "" || ends[1].Args != ends[0].Args {
 		t.Fatalf("late staged-flush args = %q, want original args %q", ends[1].Args, ends[0].Args)
 	}
+	if _, ok := editpreview.FromMetadata(ends[1].Metadata); !ok {
+		t.Fatalf("late staged-flush metadata lacks edit preview: %#v", ends[1].Metadata)
+	}
 }
 
 func TestStagedFlushSchemaValidMessageSequence(t *testing.T) {
@@ -214,7 +273,7 @@ func TestStagedFlushSchemaValidMessageSequence(t *testing.T) {
 	registry := tool.NewRegistry()
 	registry.Register(stagedStubTool{name: "edit_file"})
 	lp := loopForServer(srv, registry)
-	lp.SetPendingExecutor(fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
+	setTestPendingExecutor(lp, registry, fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
 		"call_1": {Success: true, Result: "Edited file.txt (1 replacement, lines 1-2)."},
 	}})
 	lp.SetEvents(make(chan Event, 32))
@@ -255,9 +314,9 @@ func TestExecutePendingReturnsSummaryAndPersistsWrapper(t *testing.T) {
 	srv := sseServer(t, body, textChunk("done"))
 	registry := tool.NewRegistry()
 	registry.Register(stagedStubTool{name: "edit_file"})
-	registry.Register(tool.ExecutePending{})
+	registry.Register(runtimetool.ExecutePending{})
 	lp := loopForServer(srv, registry)
-	lp.SetPendingExecutor(fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
+	setTestPendingExecutor(lp, registry, fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
 		"call_1": {Success: true, Result: "Edited file.txt (1 replacement, lines 1-2)."},
 	}})
 	lp.SetEvents(make(chan Event, 32))
@@ -297,9 +356,9 @@ func TestExecutePendingAllFailedReturnsErrorSummary(t *testing.T) {
 	srv := sseServer(t, body, textChunk("done"))
 	registry := tool.NewRegistry()
 	registry.Register(stagedStubTool{name: "edit_file"})
-	registry.Register(tool.ExecutePending{})
+	registry.Register(runtimetool.ExecutePending{})
 	lp := loopForServer(srv, registry)
-	lp.SetPendingExecutor(fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
+	setTestPendingExecutor(lp, registry, fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
 		"call_1": {Error: "edit failed"},
 	}})
 	events := make(chan Event, 32)
@@ -344,9 +403,9 @@ func TestExecutePendingMixedResultsReturnsErrorSummary(t *testing.T) {
 	registry := tool.NewRegistry()
 	registry.Register(stagedStubTool{name: "edit_file"})
 	registry.Register(stagedStubTool{name: "write_file"})
-	registry.Register(tool.ExecutePending{})
+	registry.Register(runtimetool.ExecutePending{})
 	lp := loopForServer(srv, registry)
-	lp.SetPendingExecutor(fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
+	setTestPendingExecutor(lp, registry, fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
 		"call_1": {Success: true, Result: "Edited file.txt (1 replacement, lines 1-2)."},
 		"call_2": {Error: "write failed"},
 	}})
@@ -392,7 +451,7 @@ func TestFlushBeforeNonPendingToolHasNoPrefix(t *testing.T) {
 	registry.Register(stagedStubTool{name: "edit_file"})
 	registry.Register(stagedStubTool{name: "noop", result: "noop output"})
 	lp := loopForServer(srv, registry)
-	lp.SetPendingExecutor(fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
+	setTestPendingExecutor(lp, registry, fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
 		"call_1": {Success: true, Result: "Edited file.txt (1 replacement, lines 1-2)."},
 	}})
 	lp.SetEvents(make(chan Event, 32))
@@ -419,6 +478,78 @@ func TestFlushBeforeNonPendingToolHasNoPrefix(t *testing.T) {
 	}
 }
 
+func TestStagingUsesToolCapabilityForNonFileToolName(t *testing.T) {
+	body := twoToolCallChunk(
+		"call_1", "stage_patch", `{\"path\":\"file.txt\",\"pending\":true}`,
+		"call_2", "noop", `{}`,
+	)
+	srv := sseServer(t, body, textChunk("done"))
+	registry := tool.NewRegistry()
+	registry.Register(stagedStubTool{name: "stage_patch"})
+	registry.Register(stagedStubTool{name: "noop", result: "noop output"})
+	lp := loopForServer(srv, registry)
+	setTestPendingExecutor(lp, registry, fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
+		"call_1": {Success: true, Result: "generic staged result"},
+	}})
+	lp.SetEvents(make(chan Event, 32))
+	if _, err := lp.Run(context.Background(), "go"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var stagedEnd, realEnd bool
+	msgs := lp.Messages()
+	for _, m := range msgs {
+		if m.Role == message.RoleTool && m.ToolCallID == "call_1" && m.TextContent() == "Staged." {
+			stagedEnd = true
+		}
+		if entries, ok := ParseStagedFlushMessage(m); ok && len(entries) == 1 && entries[0].ID == "call_1" && entries[0].Result == "generic staged result" {
+			realEnd = true
+		}
+	}
+	if !stagedEnd {
+		t.Fatalf("generic stageable tool was not staged in history: %#v", msgs)
+	}
+	if !realEnd {
+		t.Fatalf("generic stageable result was not flushed through wrapper: %#v", msgs)
+	}
+}
+
+func TestExplicitFlushUsesRegisteredCoordinatorName(t *testing.T) {
+	body := twoToolCallChunk(
+		"call_1", "stage_patch", `{\"path\":\"file.txt\",\"pending\":true}`,
+		"call_2", "flush_now", `{}`,
+	)
+	srv := sseServer(t, body, textChunk("done"))
+	registry := tool.NewRegistry()
+	registry.Register(stagedStubTool{name: "stage_patch"})
+	registry.Register(stagedStubTool{name: "flush_now"})
+	registry.RegisterPendingCoordinator(newNamedFlushCoordinator("flush_now", fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
+		"call_1": {Success: true, Result: "custom flush result"},
+	}}))
+	lp := loopForServer(srv, registry)
+	lp.SetEvents(make(chan Event, 32))
+	if _, err := lp.Run(context.Background(), "go"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var flushResult string
+	var wrapperFound bool
+	for _, m := range lp.Messages() {
+		if m.Role == message.RoleTool && m.ToolCallID == "call_2" {
+			flushResult = m.TextContent()
+		}
+		if entries, ok := ParseStagedFlushMessage(m); ok && len(entries) == 1 && entries[0].Result == "custom flush result" {
+			wrapperFound = true
+		}
+	}
+	if flushResult != "Applied 1 staged edits." {
+		t.Fatalf("custom explicit flush result = %q, want summary", flushResult)
+	}
+	if !wrapperFound {
+		t.Fatalf("custom explicit flush did not persist staged wrapper: %#v", lp.Messages())
+	}
+}
+
 func TestStagedFlushWrapperPersistedBeforeDeniedReturn(t *testing.T) {
 	body := twoToolCallChunk(
 		"call_1", "edit_file", `{\"path\":\"file.txt\",\"old_string\":\"a\",\"new_string\":\"b\",\"pending\":true}`,
@@ -429,7 +560,7 @@ func TestStagedFlushWrapperPersistedBeforeDeniedReturn(t *testing.T) {
 	registry.Register(stagedStubTool{name: "edit_file"})
 	registry.Register(stagedStubTool{name: "danger", denied: true})
 	lp := loopForServer(srv, registry)
-	lp.SetPendingExecutor(fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
+	setTestPendingExecutor(lp, registry, fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
 		"call_1": {Success: true, Result: "Edited file.txt (1 replacement, lines 1-2)."},
 	}})
 	lp.SetEvents(make(chan Event, 32))
@@ -459,7 +590,7 @@ func TestStagedFlushWrapperPersistedBeforeDeniedReturn(t *testing.T) {
 
 func TestBuildAndParseStagedFlushRoundTrip(t *testing.T) {
 	results := []tool.BatchResult{
-		{ToolCallID: "a", Result: "ok a"},
+		{ToolCallID: "a", Result: "ok a", Metadata: map[string]any{"kind": "preview"}},
 		{ToolCallID: "b", Error: "boom"},
 	}
 	wrapper := BuildStagedFlush(results)
@@ -470,11 +601,17 @@ func TestBuildAndParseStagedFlushRoundTrip(t *testing.T) {
 	if !ok || len(entries) != 2 {
 		t.Fatalf("parse round-trip: ok=%v entries=%#v", ok, entries)
 	}
-	if entries[0] != (StagedFlushEntry{ID: "a", Result: "ok a", IsError: false}) {
+	if entries[0].ID != "a" || entries[0].Result != "ok a" || entries[0].IsError {
 		t.Fatalf("entry[0] = %#v", entries[0])
 	}
-	if entries[1] != (StagedFlushEntry{ID: "b", Result: "boom", IsError: true}) {
+	if entries[0].Metadata["kind"] != "preview" {
+		t.Fatalf("entry[0] metadata = %#v", entries[0].Metadata)
+	}
+	if entries[1].ID != "b" || entries[1].Result != "boom" || !entries[1].IsError {
 		t.Fatalf("entry[1] = %#v (error string should win, IsError true)", entries[1])
+	}
+	if entries[1].Metadata != nil {
+		t.Fatalf("entry[1] metadata = %#v, want nil for error result", entries[1].Metadata)
 	}
 
 	// Empty results render no wrapper.
@@ -493,7 +630,7 @@ func TestBuildAndParseStagedFlushRoundTrip(t *testing.T) {
 func TestEmptyExecutePendingKeepsNoPendingMessageAndNoWrapper(t *testing.T) {
 	srv := sseServer(t, toolCallChunk("call_1", "execute_pending"), textChunk("done"))
 	registry := tool.NewRegistry()
-	registry.Register(tool.ExecutePending{})
+	registry.Register(runtimetool.ExecutePending{})
 	lp := loopForServer(srv, registry)
 	lp.SetEvents(make(chan Event, 16))
 	if _, err := lp.Run(context.Background(), "go"); err != nil {

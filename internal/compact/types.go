@@ -1,13 +1,13 @@
 package compact
 
 import (
-	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/provider"
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
 )
 
 // Config holds parameters for a compaction run.
 type Config struct {
-	SummarizerClient *provider.Client
+	SummarizerClient modelclient.Summarizer
 	ContextWindow    int
 	SummarizerPrompt string
 }
@@ -16,5 +16,5 @@ type Config struct {
 type Result struct {
 	Summary         string
 	SummarizerModel string
-	SummarizerRef   catalog.ModelRef
+	SummarizerRef   coremodel.ModelRef
 }

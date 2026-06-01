@@ -1,6 +1,6 @@
 <script>
-  import { ReadFileContent } from '../../wailsjs/go/main/App';
-  import { openViewer, openEditPreview, openSubagentViewer } from '../lib/viewer.js';
+  import { ReadFileContent, SessionMessagesFor } from '../../wailsjs/go/main/App';
+  import { openViewer, openEditPreview, openSubagentViewer, hydrateSubagentViewer } from '../lib/viewer.js';
   import { settings } from '../lib/settings.js';
   import { collapsedPreviewLines, maxInlineExpandLines } from '../lib/uiConstants.js';
   import EditPreview from './EditPreview.svelte';
@@ -60,6 +60,17 @@
     if (!editHasMore) return;
     if (editCanExpandInline) expanded = !expanded;
     else openEditPreview(title, editHunks);
+  }
+
+  async function openSubagentTranscript(title, sessionId) {
+    if (!sessionId) return;
+    openSubagentViewer(title, sessionId, []);
+    try {
+      const messages = await SessionMessagesFor(sessionId);
+      hydrateSubagentViewer(sessionId, messages || []);
+    } catch (e) {
+      hydrateSubagentViewer(sessionId, [{ type: 'error', content: 'Error: ' + (e?.message || e) }]);
+    }
   }
 
   function normalizeEditPreview(preview) {
@@ -183,15 +194,14 @@
       <span class="tool-name">task</span>
       <span class="arg">{(parsed.tasks || []).length} subagent{(parsed.tasks || []).length !== 1 ? 's' : ''}</span>
     </div>
-    {#if !done}
-      {#each (parsed.tasks || []) as t, i}
-        <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-        <div class="subtask-row" on:click={() => { const s = (subagentSessionIds || []).find(x => x.index === i); if (s) openSubagentViewer(t.subagent_type + ': ' + (t.prompt || '').slice(0, 60), s.sessionId); }}>
-          <span class="subtask-type">{t.subagent_type}</span>
-          <span class="subtask-prompt">{(t.prompt || '').slice(0, 80)}</span>
-        </div>
-      {/each}
-    {:else}
+    {#each (parsed.tasks || []) as t, i}
+      <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+      <div class="subtask-row" on:click={() => { const s = (subagentSessionIds || []).find(x => x.index === i); if (s) openSubagentTranscript(t.subagent_type + ': ' + (t.prompt || '').slice(0, 60), s.sessionId); }}>
+        <span class="subtask-type">{t.subagent_type}</span>
+        <span class="subtask-prompt">{(t.prompt || '').slice(0, 80)}</span>
+      </div>
+    {/each}
+    {#if done}
       <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
       <div class="output-block" class:expandable={hasMore} on:click={() => toggleOrOpenOutput('task results')}>
         <pre class="output">{shownOutput}</pre>

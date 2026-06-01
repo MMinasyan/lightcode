@@ -4,7 +4,7 @@ import (
 	"net/http"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
 	openai "github.com/sashabaranov/go-openai"
 )
 

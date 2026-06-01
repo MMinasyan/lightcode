@@ -91,6 +91,9 @@ func TestReadFileTracksSuccessfulReadsAndDeduplicatesUnchangedRange(t *testing.T
 	if result != "File unchanged since last read. The content from the earlier read in this conversation is still current." {
 		t.Fatalf("second Execute result = %q, want dedup notice", result)
 	}
+	if got := len(tracker.Snapshot()); got != 2 {
+		t.Fatalf("tracked reads after duplicate = %d, want duplicate read recorded for active-turn state", got)
+	}
 }
 
 func TestReadFileChangedFileBypassesDedupAndRetracks(t *testing.T) {

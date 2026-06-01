@@ -20,13 +20,18 @@ import (
 // pagination, byte caps, binary detection, mtime tracking, and
 // re-read deduplication.
 type ReadFile struct {
-	cfg     config.ToolsConfig
-	tracker *FileTracker
+	cfg           config.ToolsConfig
+	tracker       *FileTracker
+	workspaceRoot string
 }
 
 // NewReadFile creates a ReadFile tool with the given config and tracker.
 func NewReadFile(cfg config.ToolsConfig, tracker *FileTracker) *ReadFile {
 	return &ReadFile{cfg: cfg, tracker: tracker}
+}
+
+func NewReadFileAtRoot(cfg config.ToolsConfig, tracker *FileTracker, workspaceRoot string) *ReadFile {
+	return &ReadFile{cfg: cfg, tracker: tracker, workspaceRoot: workspaceRoot}
 }
 
 func (r *ReadFile) Name() string { return "read_file" }
@@ -83,11 +88,11 @@ func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, er
 		limit = r.cfg.ReadMaxLines
 	}
 
-	displayAbsPath, err := fileDisplayAbsPath(path)
+	displayAbsPath, err := fileDisplayAbsPathAtRoot(r.workspaceRoot, path)
 	if err != nil {
 		return "", fmt.Errorf("read_file: resolve path: %w", err)
 	}
-	absPath, err := fileSecurityPath(params, path)
+	absPath, err := fileSecurityPathAtRoot(r.workspaceRoot, params, path)
 	if err != nil {
 		return "", fmt.Errorf("read_file: resolve path: %w", err)
 	}
@@ -121,6 +126,7 @@ func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, er
 	// Deduplication check.
 	if r.tracker != nil {
 		if dup, _ := r.tracker.IsDuplicateIdentity(absPath, offset, limit, identity); dup {
+			r.tracker.TrackIdentity(absPath, offset, limit, identity)
 			return "File unchanged since last read. The content from the earlier read in this conversation is still current.", nil
 		}
 	}

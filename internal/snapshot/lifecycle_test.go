@@ -148,3 +148,48 @@ func TestListAndLoadMostRecentUseCompletedSessionMetadata(t *testing.T) {
 		t.Fatalf("LoadMostRecent = %q, want %q", mostRecent, newerID)
 	}
 }
+
+func TestLoadMostRecentSkipsChildSessions(t *testing.T) {
+	root := t.TempDir()
+	project := t.TempDir()
+	parent, err := NewForSessionsRoot(root, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.BeginNewSession(project); err != nil {
+		t.Fatal(err)
+	}
+	parentID := parent.SessionID()
+	parentMeta, err := parent.Meta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentMeta.LastActivity = 10
+	if err := writeJSON(filepath.Join(parent.Dir(), "meta.json"), parentMeta); err != nil {
+		t.Fatal(err)
+	}
+
+	child, err := NewForSessionsRoot(root, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.BeginChildSession(project, parentID); err != nil {
+		t.Fatal(err)
+	}
+	childMeta, err := child.Meta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	childMeta.LastActivity = 20
+	if err := writeJSON(filepath.Join(child.Dir(), "meta.json"), childMeta); err != nil {
+		t.Fatal(err)
+	}
+
+	mostRecent, err := LoadMostRecent(root, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mostRecent != parentID {
+		t.Fatalf("LoadMostRecent = %q, want parent %q", mostRecent, parentID)
+	}
+}

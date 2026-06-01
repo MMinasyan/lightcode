@@ -1,4 +1,4 @@
-package loop
+package engine
 
 import (
 	"context"
@@ -13,9 +13,14 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/message"
+	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
+	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
+	"github.com/MMinasyan/lightcode/internal/engine/tool"
 	"github.com/MMinasyan/lightcode/internal/provider"
-	"github.com/MMinasyan/lightcode/internal/tool"
+	runtimetool "github.com/MMinasyan/lightcode/internal/tool"
+	openai "github.com/sashabaranov/go-openai"
 )
 
 type fakeStore struct {
@@ -32,15 +37,341 @@ func (s *fakeStore) MarkTurnComplete(turn int) error { return nil }
 func (s *fakeStore) TouchActivity() error            { return nil }
 func (s *fakeStore) CurrentTurn() int                { return s.turn }
 
+type parsedTestStream struct {
+	stream *provider.Stream
+}
+
+func newParsedTestStream(body string) parsedTestStream {
+	return parsedTestStream{stream: provider.NewStream(io.NopCloser(strings.NewReader(body)))}
+}
+
+func (s parsedTestStream) Recv() (modelclient.StreamDelta, error) {
+	chunk, err := s.stream.Recv()
+	if err != nil {
+		return modelclient.StreamDelta{}, err
+	}
+	delta, err := provider.ParseChunk(chunk.Raw)
+	if err != nil {
+		return modelclient.StreamDelta{}, modelclient.ChunkParseError{Err: err}
+	}
+	return delta, nil
+}
+
+func (s parsedTestStream) Close() error {
+	return s.stream.Close()
+}
+
+type fakeModelClient struct {
+	ref      coremodel.ModelRef
+	model    string
+	stream   modelclient.ChatStream
+	warnings []modelclient.ProtocolWarning
+	requests []modelclient.ChatRequest
+}
+
+func (c *fakeModelClient) ChatStream(_ context.Context, req modelclient.ChatRequest) (modelclient.ChatStream, error) {
+	c.requests = append(c.requests, req)
+	return c.stream, nil
+}
+
+func (c *fakeModelClient) ProtocolWarnings([]message.Message) []modelclient.ProtocolWarning {
+	return c.warnings
+}
+
+func (c *fakeModelClient) Model() string {
+	return c.model
+}
+
+func (c *fakeModelClient) ModelRef() coremodel.ModelRef {
+	return c.ref
+}
+
+type sequenceModelClient struct {
+	ref      coremodel.ModelRef
+	streams  []modelclient.ChatStream
+	requests []modelclient.ChatRequest
+}
+
+func (c *sequenceModelClient) ChatStream(_ context.Context, req modelclient.ChatRequest) (modelclient.ChatStream, error) {
+	c.requests = append(c.requests, req)
+	if len(c.streams) == 0 {
+		return nil, fmt.Errorf("unexpected model request")
+	}
+	stream := c.streams[0]
+	c.streams = c.streams[1:]
+	return stream, nil
+}
+
+func (c *sequenceModelClient) ProtocolWarnings([]message.Message) []modelclient.ProtocolWarning {
+	return nil
+}
+
+func (c *sequenceModelClient) Model() string { return c.ref.Model }
+
+func (c *sequenceModelClient) ModelRef() coremodel.ModelRef { return c.ref }
+
+type sliceModelStream struct {
+	deltas []modelclient.StreamDelta
+	next   int
+}
+
+func (s *sliceModelStream) Recv() (modelclient.StreamDelta, error) {
+	if s.next >= len(s.deltas) {
+		return modelclient.StreamDelta{}, io.EOF
+	}
+	delta := s.deltas[s.next]
+	s.next++
+	return delta, nil
+}
+
+func (*sliceModelStream) Close() error { return nil }
+
+type checkpointRecorder struct {
+	loop  *Loop
+	calls []ContextTransformCheckpoint
+	seen  [][]message.Message
+}
+
+func (r *checkpointRecorder) BeforeModelRequest(_ context.Context, checkpoint ContextTransformCheckpoint) (ContextTransformResult, error) {
+	r.calls = append(r.calls, checkpoint)
+	r.seen = append(r.seen, append([]message.Message(nil), r.loop.Messages()...))
+	return ContextTransformResult{}, nil
+}
+
+type checkpointSignalTransformer struct {
+	loop    *Loop
+	payload string
+	sent    bool
+}
+
+func (t *checkpointSignalTransformer) BeforeModelRequest(_ context.Context, _ ContextTransformCheckpoint) (ContextTransformResult, error) {
+	if !t.sent {
+		t.sent = true
+		t.loop.AddPendingSignal(PendingSignal{Payload: t.payload, Persist: true})
+	}
+	return ContextTransformResult{}, nil
+}
+
+func TestRunStreamUsesModelClientInterface(t *testing.T) {
+	ref := coremodel.ModelRef{Provider: "fake-provider", Model: "fake-chat"}
+	client := &fakeModelClient{
+		ref:   ref,
+		model: ref.Model,
+		warnings: []modelclient.ProtocolWarning{{
+			Kind:     "test_warning",
+			Message:  "warning text",
+			Provider: ref.Provider,
+			Model:    ref.Model,
+		}},
+		stream: &sliceModelStream{deltas: []modelclient.StreamDelta{{
+			Role:      string(message.RoleAssistant),
+			Content:   "hello",
+			HasChoice: true,
+			Usage: &openai.Usage{
+				PromptTokens:     7,
+				CompletionTokens: 3,
+			},
+		}}},
+	}
+	lp := New(client, tool.NewRegistry(), "system")
+	events := make(chan Event, 4)
+	lp.SetEvents(events)
+
+	msg, cancelled, err := lp.runStream(context.Background())
+	if err != nil {
+		t.Fatalf("runStream returned error: %v", err)
+	}
+	if cancelled {
+		t.Fatal("runStream returned cancelled")
+	}
+	if got := msg.TextContent(); got != "hello" {
+		t.Fatalf("assistant text = %q, want hello", got)
+	}
+	if msg.Source != ref {
+		t.Fatalf("source = %#v, want %#v", msg.Source, ref)
+	}
+	if len(client.requests) != 1 {
+		t.Fatalf("model requests = %d, want 1", len(client.requests))
+	}
+	if len(client.requests[0].Messages) != 1 || client.requests[0].Messages[0].Role != message.RoleSystem {
+		t.Fatalf("request messages = %#v", client.requests[0].Messages)
+	}
+
+	var sawWarning, sawUsage bool
+	for i := 0; i < cap(events); i++ {
+		select {
+		case ev := <-events:
+			switch ev.Kind {
+			case Warning:
+				sawWarning = ev.Result == "warning text"
+			case Usage:
+				sawUsage = ev.Model == ref.Model && ev.ModelRef == ref && ev.Input == 7 && ev.Output == 3
+			}
+		default:
+			i = cap(events)
+		}
+	}
+	if !sawWarning {
+		t.Fatal("did not receive protocol warning event from model client")
+	}
+	if !sawUsage {
+		t.Fatal("did not receive usage event with full ModelRef")
+	}
+}
+
+func TestRunDrainsCheckpointSignalsImmediatelyBeforeModelRequest(t *testing.T) {
+	ref := coremodel.ModelRef{Provider: "fake-provider", Model: "fake-chat"}
+	client := &fakeModelClient{
+		ref:   ref,
+		model: ref.Model,
+		stream: &sliceModelStream{deltas: []modelclient.StreamDelta{{
+			Role:      string(message.RoleAssistant),
+			Content:   "ok",
+			HasChoice: true,
+		}}},
+	}
+	lp := New(client, tool.NewRegistry(), "system")
+	lp.AddPendingSignal(PendingSignal{Payload: "pre-existing signal", Persist: true})
+	lp.SetContextTransformer(&checkpointSignalTransformer{
+		loop:    lp,
+		payload: "checkpoint signal",
+	})
+	events := make(chan Event, 16)
+	lp.SetEvents(events)
+
+	if _, err := lp.Run(context.Background(), "hello"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(client.requests) != 1 {
+		t.Fatalf("model requests = %d, want 1", len(client.requests))
+	}
+	got := client.requests[0].Messages
+	if len(got) != 4 {
+		t.Fatalf("request messages len = %d, want system + pre-signal + user + checkpoint-signal: %#v", len(got), got)
+	}
+	want := []struct {
+		role    message.Role
+		content string
+	}{
+		{message.RoleSystem, "system"},
+		{message.RoleUser, `<system-signal>pre-existing signal</system-signal>`},
+		{message.RoleUser, "hello"},
+		{message.RoleUser, `<system-signal>checkpoint signal</system-signal>`},
+	}
+	for i, wantMsg := range want {
+		if got[i].Role != wantMsg.role || got[i].TextContent() != wantMsg.content {
+			t.Fatalf("request message %d = role %q content %q, want role %q content %q", i, got[i].Role, got[i].TextContent(), wantMsg.role, wantMsg.content)
+		}
+	}
+
+	var order []EventKind
+	var payloads []string
+	for {
+		select {
+		case ev := <-events:
+			if ev.Kind == GenericSystemSignalDisplay || ev.Kind == UserMessageDisplay {
+				order = append(order, ev.Kind)
+				payloads = append(payloads, ev.Result)
+			}
+		default:
+			wantOrder := []EventKind{GenericSystemSignalDisplay, UserMessageDisplay, GenericSystemSignalDisplay}
+			if len(order) != len(wantOrder) {
+				t.Fatalf("display event order = %v payloads=%v, want %v", order, payloads, wantOrder)
+			}
+			for i := range wantOrder {
+				if order[i] != wantOrder[i] {
+					t.Fatalf("display event order = %v payloads=%v, want %v", order, payloads, wantOrder)
+				}
+			}
+			if strings.Join(payloads, "|") != "pre-existing signal|hello|checkpoint signal" {
+				t.Fatalf("display payloads = %v", payloads)
+			}
+			return
+		}
+	}
+}
+
+func TestContextTransformerRunsBeforeFollowUpModelRequest(t *testing.T) {
+	ref := coremodel.ModelRef{Provider: "fake-provider", Model: "fake-chat"}
+	client := &sequenceModelClient{
+		ref: ref,
+		streams: []modelclient.ChatStream{
+			&sliceModelStream{deltas: []modelclient.StreamDelta{{
+				Role: string(message.RoleAssistant),
+				ToolCalls: []openai.ToolCall{{
+					ID:   "call_1",
+					Type: openai.ToolTypeFunction,
+					Function: openai.FunctionCall{
+						Name:      "queue_signal",
+						Arguments: `{}`,
+					},
+				}},
+				FinishReason: openai.FinishReasonToolCalls,
+				HasChoice:    true,
+			}}},
+			&sliceModelStream{deltas: []modelclient.StreamDelta{{
+				Role:      string(message.RoleAssistant),
+				Content:   "done",
+				HasChoice: true,
+			}}},
+		},
+	}
+	registry := tool.NewRegistry()
+	registry.Register(queueSignalTool{queue: func() {}})
+	lp := New(client, registry, "system")
+	recorder := &checkpointRecorder{loop: lp}
+	lp.SetContextTransformer(recorder)
+
+	if _, err := lp.Run(context.Background(), "use tool"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("model requests = %d, want 2", len(client.requests))
+	}
+	if len(recorder.calls) < 2 {
+		t.Fatalf("transformer calls = %d, want at least initial and follow-up", len(recorder.calls))
+	}
+	followUpSeen := recorder.seen[len(recorder.seen)-1]
+	var sawToolResult bool
+	for _, msg := range followUpSeen {
+		if msg.Role == message.RoleTool && msg.ToolCallID == "call_1" && msg.TextContent() == "tool result" {
+			sawToolResult = true
+		}
+	}
+	if !sawToolResult {
+		t.Fatalf("follow-up checkpoint did not see tool result; messages=%#v", followUpSeen)
+	}
+}
+
+func TestNormalizeAssistantToolCallsUsesRegisteredNormalizer(t *testing.T) {
+	registry := tool.NewRegistry()
+	registry.Register(runtimetool.Sleep{})
+	lp := &Loop{registry: registry}
+	msg := message.Message{
+		Role: message.RoleAssistant,
+		ToolCalls: []message.ToolCall{{
+			ID:       "call_sleep",
+			Type:     "function",
+			Function: message.FunctionCall{Name: "sleep", Arguments: `{"seconds":0}`},
+		}},
+	}
+
+	got := lp.normalizeAssistantToolCalls(msg)
+	if got.ToolCalls[0].Function.Arguments != `{"seconds":1}` {
+		t.Fatalf("normalized args = %q, want seconds clamped", got.ToolCalls[0].Function.Arguments)
+	}
+}
+
 func TestConsumeStreamHandlesSparseToolCallIndices(t *testing.T) {
-	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
+	stream := newParsedTestStream(strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"first","arguments":"{}"}}]}}]}`,
 		``,
 		`data: {"choices":[{"delta":{"tool_calls":[{"index":2,"id":"call_2","type":"function","function":{"name":"third","arguments":"{}"}}]}}]}`,
 		``,
 		`data: [DONE]`,
 		``,
-	}, "\n"))))
+	}, "\n"))
 	loop := &Loop{}
 
 	defer func() {
@@ -65,12 +396,12 @@ func TestConsumeStreamHandlesSparseToolCallIndices(t *testing.T) {
 }
 
 func TestConsumeStreamAvoidsOmittedIndexCollisionWithExplicitIndex(t *testing.T) {
-	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
+	stream := newParsedTestStream(strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_omitted","type":"function","function":{"name":"read_file","arguments":"{}"}},{"index":0,"id":"call_explicit","type":"function","function":{"name":"write_file","arguments":"{}"}}]}}]}`,
 		``,
 		`data: [DONE]`,
 		``,
-	}, "\n"))))
+	}, "\n"))
 	loop := &Loop{}
 
 	msg, cancelled, err := loop.consumeStream(context.Background(), stream)
@@ -345,7 +676,7 @@ func TestRunEmitsUserMessageDisplayAfterDrain(t *testing.T) {
 		Models:    map[string]*catalog.Model{"model-a": {ID: "model-a"}},
 	}
 	client := provider.New(prov, prov.Models["model-a"], "")
-	lp := New(client, tool.NewRegistry(), "system")
+	lp := New(provider.NewAdapter(client), tool.NewRegistry(), "system")
 	events := make(chan Event, 32)
 	lp.SetEvents(events)
 	lp.AddPendingSignal(PendingSignal{Payload: "Model switched to test/model-a"})
@@ -500,7 +831,7 @@ func TestPendingSignalDuringToolExecutionDrainsAfterToolResult(t *testing.T) {
 			},
 		})
 	}})
-	lp = New(client, registry, "system")
+	lp = New(provider.NewAdapter(client), registry, "system")
 	events := make(chan Event, 16)
 	lp.SetEvents(events)
 
@@ -627,7 +958,7 @@ func TestWakeSignalDuringTextModelCallStartsNextModelRequest(t *testing.T) {
 		},
 	}
 	client := provider.New(prov, prov.Models["model-a"], "")
-	lp = New(client, tool.NewRegistry(), "system")
+	lp = New(provider.NewAdapter(client), tool.NewRegistry(), "system")
 
 	got, err := lp.Run(context.Background(), "start")
 	if err != nil {
@@ -652,7 +983,8 @@ func TestWakeSignalDuringTextModelCallStartsNextModelRequest(t *testing.T) {
 	}
 }
 
-func TestValidateStagedWriteRequiresStringContent(t *testing.T) {
+func TestStageableWriteRequiresStringContent(t *testing.T) {
+	writer := runtimetool.NewWriteFile(nil, config.ToolsConfig{})
 	for _, tc := range []struct {
 		name   string
 		params map[string]any
@@ -672,9 +1004,13 @@ func TestValidateStagedWriteRequiresStringContent(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateStagedCall("write_file", tc.params)
+			args, err := json.Marshal(tc.params)
+			if err != nil {
+				t.Fatalf("marshal args: %v", err)
+			}
+			err = writer.ValidateStaged(context.Background(), args)
 			if err == nil || err.Error() != "write_file: content must be a string" {
-				t.Fatalf("validateStagedCall error = %v, want content type error", err)
+				t.Fatalf("ValidateStaged error = %v, want content type error", err)
 			}
 		})
 	}
@@ -697,25 +1033,29 @@ func (t queueSignalTool) Execute(context.Context, map[string]any) (string, error
 	return "tool result", nil
 }
 
-func TestValidateStagedWriteAllowsEmptyContent(t *testing.T) {
-	err := validateStagedCall("write_file", map[string]any{
+func TestStageableWriteAllowsEmptyContent(t *testing.T) {
+	writer := runtimetool.NewWriteFile(nil, config.ToolsConfig{})
+	args, err := json.Marshal(map[string]any{
 		"path":    "file.txt",
 		"content": "",
 	})
 	if err != nil {
-		t.Fatalf("validateStagedCall returned error for empty content: %v", err)
+		t.Fatalf("marshal args: %v", err)
+	}
+	if err := writer.ValidateStaged(context.Background(), args); err != nil {
+		t.Fatalf("ValidateStaged returned error for empty content: %v", err)
 	}
 }
 
 func TestConsumeStreamDoesNotMergeToolCallsWhenProviderOmitsIndices(t *testing.T) {
-	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
+	stream := newParsedTestStream(strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"A.md\"}"}}]}}]}`,
 		``,
 		`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_2","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"B.md\",\"content\":\"hi\"}"}}]}}]}`,
 		``,
 		`data: [DONE]`,
 		``,
-	}, "\n"))))
+	}, "\n"))
 	loop := &Loop{}
 
 	msg, cancelled, err := loop.consumeStream(context.Background(), stream)
@@ -737,14 +1077,14 @@ func TestConsumeStreamDoesNotMergeToolCallsWhenProviderOmitsIndices(t *testing.T
 }
 
 func TestConsumeStreamUsesPositionForAnonymousToolCallContinuations(t *testing.T) {
-	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
+	stream := newParsedTestStream(strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\""}},{"id":"call_2","type":"function","function":{"name":"write_file","arguments":"{\"path\":\""}}]}}]}`,
 		``,
 		`data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"A.md\"}"}},{"function":{"arguments":"B.md\",\"content\":\"hi\"}"}}]}}]}`,
 		``,
 		`data: [DONE]`,
 		``,
-	}, "\n"))))
+	}, "\n"))
 	loop := &Loop{}
 
 	msg, cancelled, err := loop.consumeStream(context.Background(), stream)
@@ -766,7 +1106,7 @@ func TestConsumeStreamUsesPositionForAnonymousToolCallContinuations(t *testing.T
 }
 
 func TestConsumeStreamUsesLastToolForSingletonAnonymousContinuation(t *testing.T) {
-	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
+	stream := newParsedTestStream(strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"A.md\"}"}}]}}]}`,
 		``,
 		`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_2","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"B.md\",\"content\":\""}}]}}]}`,
@@ -775,7 +1115,7 @@ func TestConsumeStreamUsesLastToolForSingletonAnonymousContinuation(t *testing.T
 		``,
 		`data: [DONE]`,
 		``,
-	}, "\n"))))
+	}, "\n"))
 	loop := &Loop{}
 
 	msg, cancelled, err := loop.consumeStream(context.Background(), stream)
@@ -797,16 +1137,16 @@ func TestConsumeStreamUsesLastToolForSingletonAnonymousContinuation(t *testing.T
 }
 
 func TestConsumeStreamCapturesMessageAndToolExtras(t *testing.T) {
-	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
+	stream := newParsedTestStream(strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"think "}}]}`,
 		``,
 		`data: {"choices":[{"delta":{"reasoning_content":"more","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"},"extra_content":{"google":{"thought_signature":"sig"}}}]}}]}`,
 		``,
 		`data: [DONE]`,
 		``,
-	}, "\n"))))
+	}, "\n"))
 	client := provider.New(&catalog.Provider{ID: "test"}, &catalog.Model{ID: "model-a"}, "")
-	loop := &Loop{client: client, trace: io.Discard}
+	loop := &Loop{client: provider.NewAdapter(client), trace: io.Discard}
 
 	msg, cancelled, err := loop.consumeStream(context.Background(), stream)
 	if err != nil {
@@ -815,7 +1155,7 @@ func TestConsumeStreamCapturesMessageAndToolExtras(t *testing.T) {
 	if cancelled {
 		t.Fatal("did not expect cancellation")
 	}
-	if msg.Source != (catalog.ModelRef{Provider: "test", Model: "model-a"}) {
+	if msg.Source != (coremodel.ModelRef{Provider: "test", Model: "model-a"}) {
 		t.Fatalf("source = %#v", msg.Source)
 	}
 	if got := string(msg.Extra["reasoning_content"]); got != `"think more"` {
@@ -830,7 +1170,7 @@ func TestConsumeStreamCapturesMessageAndToolExtras(t *testing.T) {
 }
 
 func TestConsumeStreamRemapsToolExtraForOmittedIndexContinuation(t *testing.T) {
-	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
+	stream := newParsedTestStream(strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"A.md\"}"}}]}}]}`,
 		``,
 		`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_2","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"B.md\",\"content\":\""}}]}}]}`,
@@ -839,7 +1179,7 @@ func TestConsumeStreamRemapsToolExtraForOmittedIndexContinuation(t *testing.T) {
 		``,
 		`data: [DONE]`,
 		``,
-	}, "\n"))))
+	}, "\n"))
 	loop := &Loop{trace: io.Discard}
 
 	msg, cancelled, err := loop.consumeStream(context.Background(), stream)
@@ -861,12 +1201,12 @@ func TestConsumeStreamRemapsToolExtraForOmittedIndexContinuation(t *testing.T) {
 }
 
 func TestConsumeStreamAcceptsExtraOnlyAssistantMessage(t *testing.T) {
-	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
+	stream := newParsedTestStream(strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","reasoning_details":[{"type":"reasoning.text","text":"hidden"}]}}]}`,
 		``,
 		`data: [DONE]`,
 		``,
-	}, "\n"))))
+	}, "\n"))
 	loop := &Loop{trace: io.Discard}
 
 	msg, cancelled, err := loop.consumeStream(context.Background(), stream)
@@ -889,7 +1229,7 @@ func TestLoadHistoryAcceptsOldMessageJSONWithEmptySource(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"role":"assistant","content":"old text","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]}`), &old); err != nil {
 		t.Fatalf("unmarshal old message: %v", err)
 	}
-	if old.Source != (catalog.ModelRef{}) {
+	if old.Source != (coremodel.ModelRef{}) {
 		t.Fatalf("old message source = %#v, want empty", old.Source)
 	}
 
@@ -904,7 +1244,7 @@ func TestLoadHistoryAcceptsOldMessageJSONWithEmptySource(t *testing.T) {
 	if got.TextContent() != "old text" {
 		t.Fatalf("assistant text = %q, want old text", got.TextContent())
 	}
-	if got.Source != (catalog.ModelRef{}) {
+	if got.Source != (coremodel.ModelRef{}) {
 		t.Fatalf("loaded source = %#v, want empty", got.Source)
 	}
 	if len(got.ToolCalls) != 1 || got.ToolCalls[0].Function.Name != "read_file" {
@@ -914,16 +1254,16 @@ func TestLoadHistoryAcceptsOldMessageJSONWithEmptySource(t *testing.T) {
 
 func TestPersistMessageWritesCanonicalShapeWithSource(t *testing.T) {
 	client := provider.New(&catalog.Provider{ID: "test-provider"}, &catalog.Model{ID: "test-model"}, "")
-	lp := New(client, nil, "system")
+	lp := New(provider.NewAdapter(client), nil, "system")
 	store := &fakeStore{turn: 4}
 	lp.SetStore(store)
 
-	stream := provider.NewStream(io.NopCloser(strings.NewReader(strings.Join([]string{
+	stream := newParsedTestStream(strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","content":"ok"}}]}`,
 		``,
 		`data: [DONE]`,
 		``,
-	}, "\n"))))
+	}, "\n"))
 	msg, cancelled, err := lp.consumeStream(context.Background(), stream)
 	if err != nil {
 		t.Fatalf("consume stream: %v", err)
@@ -957,7 +1297,7 @@ func BenchmarkConsumeStream(b *testing.B) {
 	loop := &Loop{trace: io.Discard}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		stream := provider.NewStream(io.NopCloser(strings.NewReader(fixture)))
+		stream := newParsedTestStream(fixture)
 		msg, cancelled, err := loop.consumeStream(context.Background(), stream)
 		if err != nil {
 			b.Fatalf("consume stream: %v", err)

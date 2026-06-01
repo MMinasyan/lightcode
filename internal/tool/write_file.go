@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -68,13 +69,18 @@ func retainMutatedSnapshot(entry snapshotEntry) {
 // WriteFile implements the write_file tool with mtime enforcement
 // and pending support.
 type WriteFile struct {
-	tracker *FileTracker
-	cfg     config.ToolsConfig
+	tracker       *FileTracker
+	cfg           config.ToolsConfig
+	workspaceRoot string
 }
 
 // NewWriteFile creates a WriteFile tool.
 func NewWriteFile(tracker *FileTracker, cfg config.ToolsConfig) *WriteFile {
 	return &WriteFile{tracker: tracker, cfg: cfg}
+}
+
+func NewWriteFileAtRoot(tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) *WriteFile {
+	return &WriteFile{tracker: tracker, cfg: cfg, workspaceRoot: workspaceRoot}
 }
 
 func (w *WriteFile) Name() string { return "write_file" }
@@ -113,24 +119,35 @@ type writeResult struct {
 }
 
 func (w *WriteFile) Execute(_ context.Context, params map[string]any) (string, error) {
-	res, err := writeFileExecCommon(params, w.tracker, w.cfg)
+	res, err := writeFileExecCommon(params, w.tracker, w.cfg, w.workspaceRoot)
 	if err != nil {
 		return "", err
 	}
 	return res.Result, nil
 }
 
+func (w *WriteFile) ValidateStaged(_ context.Context, args json.RawMessage) error {
+	return validateWriteStagedArgs(args)
+}
+
+func (w *WriteFile) StagedResultMessage() string { return "Staged." }
+
 // WriteFileWithSnapshot wraps WriteFile so that every successful write
 // is preceded by a call to the snapshot store.
 type WriteFileWithSnapshot struct {
-	store   SnapshotStore
-	tracker *FileTracker
-	cfg     config.ToolsConfig
+	store         SnapshotStore
+	tracker       *FileTracker
+	cfg           config.ToolsConfig
+	workspaceRoot string
 }
 
 // NewWriteFileWithSnapshot returns a snapshot-aware write_file tool.
 func NewWriteFileWithSnapshot(store SnapshotStore, tracker *FileTracker, cfg config.ToolsConfig) *WriteFileWithSnapshot {
 	return &WriteFileWithSnapshot{store: store, tracker: tracker, cfg: cfg}
+}
+
+func NewWriteFileWithSnapshotAtRoot(store SnapshotStore, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) *WriteFileWithSnapshot {
+	return &WriteFileWithSnapshot{store: store, tracker: tracker, cfg: cfg, workspaceRoot: workspaceRoot}
 }
 
 func (*WriteFileWithSnapshot) Name() string        { return "write_file" }
@@ -139,17 +156,23 @@ func (*WriteFileWithSnapshot) ParametersSchema() map[string]any {
 	return (&WriteFile{}).ParametersSchema()
 }
 
+func (*WriteFileWithSnapshot) ValidateStaged(_ context.Context, args json.RawMessage) error {
+	return validateWriteStagedArgs(args)
+}
+
+func (*WriteFileWithSnapshot) StagedResultMessage() string { return "Staged." }
+
 func (w *WriteFileWithSnapshot) Execute(_ context.Context, params map[string]any) (string, error) {
 	path, _ := params["path"].(string)
 	if path == "" {
 		return "", fmt.Errorf("write_file: path is required")
 	}
-	displayAbsPath, err := fileDisplayAbsPath(path)
+	displayAbsPath, err := fileDisplayAbsPathAtRoot(w.workspaceRoot, path)
 	if err != nil {
 		return "", fmt.Errorf("write_file: resolve path: %w", err)
 	}
 	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
-	securityPath, err := fileSecurityPath(params, path)
+	securityPath, err := fileSecurityPathAtRoot(w.workspaceRoot, params, path)
 	if err != nil {
 		return "", fmt.Errorf("write_file: resolve path: %w", err)
 	}
@@ -162,7 +185,7 @@ func (w *WriteFileWithSnapshot) Execute(_ context.Context, params map[string]any
 	if err != nil {
 		return "", fmt.Errorf("write_file: snapshot: %w", err)
 	}
-	res, mutationStarted, err := writeFileExecCommonForSnapshot(params, w.tracker, w.cfg)
+	res, mutationStarted, err := writeFileExecCommonForSnapshot(params, w.tracker, w.cfg, w.workspaceRoot)
 	if err != nil {
 		if !mutationStarted {
 			if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
@@ -177,13 +200,28 @@ func (w *WriteFileWithSnapshot) Execute(_ context.Context, params map[string]any
 	return res.Result, nil
 }
 
+func validateWriteStagedArgs(args json.RawMessage) error {
+	var params map[string]any
+	if err := json.Unmarshal(args, &params); err != nil {
+		return fmt.Errorf("write_file: invalid staged arguments: %w", err)
+	}
+	path, _ := params["path"].(string)
+	if path == "" {
+		return fmt.Errorf("write_file: path is required")
+	}
+	if _, ok := params["content"].(string); !ok {
+		return fmt.Errorf("write_file: content must be a string")
+	}
+	return nil
+}
+
 // writeFileExecCommon is the shared implementation.
-func writeFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig) (*writeResult, error) {
-	res, _, err := writeFileExecCommonForSnapshot(params, tracker, cfg)
+func writeFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) (*writeResult, error) {
+	res, _, err := writeFileExecCommonForSnapshot(params, tracker, cfg, workspaceRoot)
 	return res, err
 }
 
-func writeFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig) (*writeResult, bool, error) {
+func writeFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) (*writeResult, bool, error) {
 	path, _ := params["path"].(string)
 	if path == "" {
 		return nil, false, fmt.Errorf("write_file: path is required")
@@ -191,7 +229,7 @@ func writeFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker,
 	content, _ := params["content"].(string)
 
 	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
-	absPath, err := fileSecurityPath(params, path)
+	absPath, err := fileSecurityPathAtRoot(workspaceRoot, params, path)
 	if err != nil {
 		return nil, false, fmt.Errorf("write_file: resolve path: %w", err)
 	}

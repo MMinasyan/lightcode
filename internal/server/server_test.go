@@ -340,11 +340,59 @@ func TestHandleEventCompactionEndBroadcastsSessionChanged(t *testing.T) {
 	ch, unsub := s.hub.subscribe()
 	defer unsub()
 
-	s.handleEvent(agent.Event{Kind: agent.EventCompactionEnd})
+	s.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, RefreshSession: true})
 
 	assertSSEEvent(t, ch, "compaction_end")
 	assertSSEEvent(t, ch, "session_changed")
 	assertNoSSEMessage(t, ch)
+}
+
+func TestHandleEventActiveCompactionRefreshesSessionAfterTurnEnd(t *testing.T) {
+	a := newServerTestAgent(t)
+	_ = appendServerUserTurn(t, a, "complete before compaction")
+	turn := a.Store().BeginTurn()
+	if turn == 0 {
+		t.Fatal("BeginTurn returned 0")
+	}
+	for _, raw := range []string{
+		`{"role":"user","content":"active prompt"}`,
+		`{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}`,
+		`{"role":"tool","tool_call_id":"call_1","name":"read_file","content":"ok"}`,
+	} {
+		if err := a.Store().AppendMessage(turn, []byte(raw)); err != nil {
+			t.Fatalf("AppendMessage active: %v", err)
+		}
+	}
+	s := &Server{agent: a, hub: newSSEHub()}
+	ch, unsub := s.hub.subscribe()
+	defer unsub()
+
+	s.handleEvent(agent.Event{Kind: agent.EventCompactionEnd})
+
+	assertSSEEvent(t, ch, "compaction_end")
+	assertNoSSEMessage(t, ch)
+	completePath := filepath.Join(a.Store().Dir(), "turns", strconv.Itoa(turn), "complete")
+	if _, err := os.Stat(completePath); !os.IsNotExist(err) {
+		t.Fatalf("compaction refresh mutated active turn complete marker, stat err = %v", err)
+	}
+
+	if err := a.Store().MarkTurnComplete(turn); err != nil {
+		t.Fatalf("MarkTurnComplete active: %v", err)
+	}
+	s.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: turn, RefreshSession: true})
+	assertSSEEvent(t, ch, "turn_end")
+	select {
+	case msg := <-ch:
+		text := string(msg)
+		if !strings.Contains(text, "event: session_changed") {
+			t.Fatalf("SSE message = %q, want session_changed", msg)
+		}
+		if !strings.Contains(text, "active prompt") {
+			t.Fatalf("session_changed after turn_end omitted completed active turn: %q", msg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for session_changed")
+	}
 }
 
 func TestHandleTurnActionRevertCodeReturnsResultWithoutSessionChanged(t *testing.T) {
@@ -510,6 +558,56 @@ func TestHandleWarningsReturnsEmptyArrayForNoWarnings(t *testing.T) {
 
 	if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != "[]" {
 		t.Fatalf("empty warnings response = %d %q, want 200 []", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleSessionMessagesByIDDoesNotSwitchCurrentSession(t *testing.T) {
+	a := newServerTestAgent(t)
+	firstTurn := appendServerUserTurn(t, a, "first session")
+	firstID := a.SessionCurrent().ID
+	if firstID == "" || firstTurn == 0 {
+		t.Fatalf("first session id/turn = %q/%d", firstID, firstTurn)
+	}
+	if err := a.SessionNew(); err != nil {
+		t.Fatalf("SessionNew: %v", err)
+	}
+	appendServerUserTurn(t, a, "second session")
+	currentID := a.SessionCurrent().ID
+	if currentID == "" || currentID == firstID {
+		t.Fatalf("current session id = %q, first = %q", currentID, firstID)
+	}
+	s := &Server{agent: a, hub: newSSEHub()}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/session/messages?id="+firstID, nil)
+	s.handleSessionMessages(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var msgs []agent.DisplayMessage
+	if err := json.NewDecoder(rec.Body).Decode(&msgs); err != nil {
+		t.Fatalf("decode messages: %v", err)
+	}
+	if got := userMessageContents(msgs); !equalStringSlices(got, []string{"first session"}) {
+		t.Fatalf("messages for first session = %q", got)
+	}
+	if got := a.SessionCurrent().ID; got != currentID {
+		t.Fatalf("SessionMessagesFor switched current session to %q, want %q", got, currentID)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/session/messages", nil)
+	s.handleSessionMessages(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("current status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	msgs = nil
+	if err := json.NewDecoder(rec.Body).Decode(&msgs); err != nil {
+		t.Fatalf("decode current messages: %v", err)
+	}
+	if got := userMessageContents(msgs); !equalStringSlices(got, []string{"second session"}) {
+		t.Fatalf("current messages = %q", got)
 	}
 }
 

@@ -14,6 +14,13 @@ type ResolvedPath struct {
 }
 
 func ResolveFilePath(path string) (ResolvedPath, error) {
+	return ResolveFilePathFrom("", path)
+}
+
+func ResolveFilePathFrom(root, path string) (ResolvedPath, error) {
+	if root != "" && !filepath.IsAbs(path) {
+		path = filepath.Join(root, path)
+	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return ResolvedPath{}, err

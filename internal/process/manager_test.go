@@ -185,6 +185,28 @@ func TestManagerExitEventIncludesStartSessionID(t *testing.T) {
 	}
 }
 
+func TestManagerStartUsesWorkspaceRoot(t *testing.T) {
+	root := t.TempDir()
+	other := t.TempDir()
+	t.Chdir(other)
+
+	m := NewManagerAtRoot(1, cmdoutput.Options{}, root)
+	exitCh := make(chan observedExit, 1)
+	m.SetExitHandler(func(event ExitEvent) { exitCh <- observeExit(event) })
+	if _, err := m.Start("pwd", 0); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	select {
+	case observed := <-exitCh:
+		if strings.TrimSpace(observed.Output) != root {
+			t.Fatalf("background pwd = %q, want workspace root %q", observed.Output, root)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exit handler not called")
+	}
+}
+
 func TestManagerFiltersProcessOperationsByCurrentSession(t *testing.T) {
 	m := NewManager(2, cmdoutput.Options{})
 	sessionID := "session-a"

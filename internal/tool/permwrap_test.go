@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/permission"
 )
 
@@ -335,6 +337,36 @@ func TestPermissionArgExtractsPermissionRelevantArguments(t *testing.T) {
 	}
 }
 
+func TestRegistryCapabilitiesUnwrapPermissionWrapper(t *testing.T) {
+	registry := NewRegistry()
+	allow := func(string, string) permission.Decision { return permission.DecisionAllow }
+	registry.Register(WrapWithPermission(Sleep{}, allow, nil))
+	registry.Register(WrapWithPermission(NewEditFile(nil, config.ToolsConfig{}), allow, nil))
+	registry.Register(WrapWithPermission(NewWriteFile(nil, config.ToolsConfig{}), allow, nil))
+
+	normalizer, ok := registry.ArgumentNormalizer("sleep")
+	if !ok {
+		t.Fatal("wrapped sleep did not expose ArgumentNormalizer")
+	}
+	normalized, err := normalizer.NormalizeArguments(json.RawMessage(`{"seconds":0}`))
+	if err != nil {
+		t.Fatalf("NormalizeArguments: %v", err)
+	}
+	if string(normalized) != `{"seconds":1}` {
+		t.Fatalf("normalized sleep args = %s, want seconds clamped", normalized)
+	}
+
+	if _, ok := registry.StageableTool("edit_file"); !ok {
+		t.Fatal("wrapped edit_file did not expose StageableTool")
+	}
+	if _, ok := registry.DisplayMetadataProvider("edit_file"); !ok {
+		t.Fatal("wrapped edit_file did not expose DisplayMetadataProvider")
+	}
+	if _, ok := registry.StageableTool("write_file"); !ok {
+		t.Fatal("wrapped write_file did not expose StageableTool")
+	}
+}
+
 type recordingTool struct {
 	name        string
 	description string
@@ -376,7 +408,7 @@ func denyIfAsked(t *testing.T) AskFunc {
 	}
 }
 
-// Every fileSecurityPath call site in write_file.go and edit_file.go must
+// Every fileSecurityPathAtRoot call site in write_file.go and edit_file.go must
 // be preceded within 3 lines by a comment containing "re-resolve canonical"
 // so the defense-in-depth intent is documented at each call site and a
 // future refactor cannot silently elide the re-resolution.
@@ -393,7 +425,7 @@ func TestPR11Closure_FileSecurityPathDoubleValidationCommented(t *testing.T) {
 		lines := strings.Split(string(data), "\n")
 		var callSites []int
 		for i, line := range lines {
-			if strings.Contains(line, "fileSecurityPath(params") {
+			if strings.Contains(line, "fileSecurityPathAtRoot(") {
 				callSites = append(callSites, i)
 			}
 		}

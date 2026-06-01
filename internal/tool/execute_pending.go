@@ -2,45 +2,9 @@ package tool
 
 import (
 	"context"
+
+	enginetool "github.com/MMinasyan/lightcode/internal/engine/tool"
 )
-
-// StagedCall represents a pending edit_file or write_file call.
-type StagedCall struct {
-	ToolName   string
-	ToolCallID string
-	Args       string
-	Params     map[string]any
-}
-
-// PendingQueue manages the staged execution of edits and writes.
-type PendingQueue struct {
-	staged []StagedCall
-}
-
-// NewPendingQueue creates an empty PendingQueue.
-func NewPendingQueue() *PendingQueue {
-	return &PendingQueue{}
-}
-
-// Stage adds a call to the pending queue.
-func (q *PendingQueue) Stage(call StagedCall) {
-	q.staged = append(q.staged, call)
-}
-
-// Discard clears all staged calls without executing.
-func (q *PendingQueue) Discard() {
-	q.staged = nil
-}
-
-// Len returns the number of staged calls.
-func (q *PendingQueue) Len() int {
-	return len(q.staged)
-}
-
-// Staged returns a copy of the staged calls.
-func (q *PendingQueue) Staged() []StagedCall {
-	return append([]StagedCall(nil), q.staged...)
-}
 
 // ExecutePending implements the execute_pending tool.
 // The actual flush is handled by the loop's dispatch; this tool
@@ -73,11 +37,7 @@ func (ExecutePending) Execute(_ context.Context, params map[string]any) (string,
 	return "No pending edits to execute.", nil
 }
 
-// BatchResult is the outcome of a single staged call.
-type BatchResult struct {
-	ToolName   string
-	ToolCallID string
-	Success    bool
-	Result     string
-	Error      string
+// NewPendingCoordinator returns the default pending flush coordinator.
+func NewPendingCoordinator(executor PendingExecutor) *DefaultPendingCoordinator {
+	return enginetool.NewPendingCoordinator((ExecutePending{}).Name(), executor)
 }
