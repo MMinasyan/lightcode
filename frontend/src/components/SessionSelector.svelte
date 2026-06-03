@@ -52,10 +52,10 @@
   }
 </script>
 
-<!-- svelte-ignore a11y-click-events-have-key-events -->
-<div class="backdrop" on:click={() => dispatch('close')}>
-  <!-- svelte-ignore a11y-click-events-have-key-events -->
-  <div class="menu" on:click|stopPropagation>
+<div class="layer">
+  <button type="button" class="backdrop" tabindex="-1" aria-label="Close session selector" on:click={() => dispatch('close')}></button>
+  <div class="menu" role="dialog" aria-modal="true" aria-labelledby="session-selector-title" tabindex="-1">
+    <div id="session-selector-title" class="sr-only">Sessions</div>
     <div class="tabs">
       <button class="tab" class:sel={state==='active'} on:click={() => setState('active')}>Active</button>
       <button class="tab" class:sel={state==='archived'} on:click={() => setState('archived')}>Archived</button>
@@ -101,8 +101,10 @@
 </div>
 
 <style>
-  .backdrop { position:fixed; inset:0; z-index:100; }
-  .menu { position:absolute; top:40px; left:160px; background:var(--bg-elevated); border:1px solid var(--border-strong); min-width:260px; max-height:360px; display:flex; flex-direction:column; box-shadow:var(--shadow-menu); }
+  .layer { position:fixed; inset:0; z-index:100; }
+  .backdrop { position:absolute; inset:0; border:0; padding:0; margin:0; background:transparent; cursor:default; }
+  .menu { position:absolute; z-index:1; top:40px; left:160px; background:var(--bg-elevated); border:1px solid var(--border-strong); min-width:260px; max-height:360px; display:flex; flex-direction:column; box-shadow:var(--shadow-menu); }
+  .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0, 0, 0, 0); white-space:nowrap; border:0; }
   .tabs { display:flex; align-items:center; gap:0; border-bottom:1px solid var(--border); }
   .tab { background:none; border:none; border-right:1px solid var(--border); color:var(--text-dim); font-family:var(--font-ui); font-size:12px; padding:6px 14px; cursor:pointer; }
   .tab.sel { background:var(--text-dim); color:var(--bg-elevated); }

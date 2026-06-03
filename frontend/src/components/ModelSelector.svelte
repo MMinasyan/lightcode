@@ -37,11 +37,10 @@
   function displayName(entry) { return entry.displayName || entry.model || entry.ref; }
 </script>
 
-<!-- svelte-ignore a11y-click-events-have-key-events -->
-<div class="backdrop" on:click={() => dispatch('close')}>
-  <!-- svelte-ignore a11y-click-events-have-key-events -->
-  <div class="selector" on:click|stopPropagation>
-    <div class="hdr"><span>Select Model</span><button class="manage" on:click={() => dispatch('manageSettings')}>Models</button></div>
+<div class="layer">
+  <button type="button" class="backdrop" tabindex="-1" aria-label="Close model selector" on:click={() => dispatch('close')}></button>
+  <div class="selector" role="dialog" aria-modal="true" aria-labelledby="model-selector-title" tabindex="-1">
+    <div class="hdr"><span id="model-selector-title">Select Model</span><button class="manage" on:click={() => dispatch('manageSettings')}>Models</button></div>
     <input class="search" type="text" placeholder="Search models..." bind:value={query} />
     <div class="list">
       {#if loading}<div class="loading">Loading...</div>
@@ -63,8 +62,9 @@
 </div>
 
 <style>
-  .backdrop { position:fixed; inset:0; z-index:100; }
-  .selector { position:absolute; bottom:60px; left:12px; background:var(--bg-elevated); border:1px solid var(--border-strong); border-radius:var(--radius); min-width:320px; max-height:400px; overflow:hidden; box-shadow:var(--shadow-lg); display:flex; flex-direction:column; }
+  .layer { position:fixed; inset:0; z-index:100; }
+  .backdrop { position:absolute; inset:0; border:0; padding:0; margin:0; background:transparent; cursor:default; }
+  .selector { position:absolute; z-index:1; bottom:60px; left:12px; background:var(--bg-elevated); border:1px solid var(--border-strong); border-radius:var(--radius); min-width:320px; max-height:400px; overflow:hidden; box-shadow:var(--shadow-lg); display:flex; flex-direction:column; }
   .hdr { display:flex; justify-content:space-between; align-items:center; padding:8px 12px; font-size:12px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--border); flex-shrink:0; }
   .manage { background:none; border:none; padding:0; font-family:var(--font-ui); font-size:12px; color:var(--text-dim); text-transform:none; letter-spacing:normal; cursor:pointer; }
   .manage:hover { color:var(--accent); }

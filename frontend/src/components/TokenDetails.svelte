@@ -27,11 +27,10 @@
   })();
 </script>
 
-<!-- svelte-ignore a11y-click-events-have-key-events -->
-<div class="backdrop" on:click={() => dispatch('close')}>
-  <!-- svelte-ignore a11y-click-events-have-key-events -->
-  <div class="prompt" on:click|stopPropagation>
-    <div class="hdr">Token Usage</div>
+<div class="layer">
+  <button type="button" class="backdrop" tabindex="-1" aria-label="Close token usage" on:click={() => dispatch('close')}></button>
+  <div class="prompt" role="dialog" aria-modal="true" aria-labelledby="token-details-title" tabindex="-1">
+    <div class="hdr" id="token-details-title">Token Usage</div>
     <pre class="args">{lines}</pre>
     <div class="actions">
       <button class="btn" on:click={() => dispatch('close')}>Close</button>
@@ -40,8 +39,9 @@
 </div>
 
 <style>
-  .backdrop { position:fixed; inset:0; background:var(--overlay); z-index:300; display:flex; align-items:center; justify-content:center; }
-  .prompt { background:var(--bg-elevated); border:1px solid var(--border-strong); min-width:480px; max-width:720px; }
+  .layer { position:fixed; inset:0; z-index:300; display:flex; align-items:center; justify-content:center; }
+  .backdrop { position:absolute; inset:0; border:0; padding:0; margin:0; background:var(--overlay); cursor:default; }
+  .prompt { position:relative; z-index:1; background:var(--bg-elevated); border:1px solid var(--border-strong); min-width:480px; max-width:720px; }
   .hdr { padding:8px 12px; font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--border); }
   .args { margin:8px 12px; padding:8px; font-family:var(--font-mono); font-size:12px; color:var(--text); white-space:pre; max-height:320px; overflow:auto; }
   .actions { display:flex; gap:8px; padding:8px 12px; border-top:1px solid var(--border); justify-content:flex-end; }

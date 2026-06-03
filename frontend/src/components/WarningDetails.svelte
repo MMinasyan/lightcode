@@ -12,11 +12,10 @@
   };
 </script>
 
-<!-- svelte-ignore a11y-click-events-have-key-events -->
-<div class="backdrop" on:click={() => dispatch('close')}>
-  <!-- svelte-ignore a11y-click-events-have-key-events -->
-  <div class="prompt" on:click|stopPropagation>
-    <div class="hdr">Warnings</div>
+<div class="layer">
+  <button type="button" class="backdrop" tabindex="-1" aria-label="Close warnings" on:click={() => dispatch('close')}></button>
+  <div class="prompt" role="dialog" aria-modal="true" aria-labelledby="warning-details-title" tabindex="-1">
+    <div class="hdr" id="warning-details-title">Warnings</div>
     <div class="list">
       {#each warnings as w}
         <div class="warn-item">
@@ -37,8 +36,9 @@
 </div>
 
 <style>
-  .backdrop { position:fixed; inset:0; background:var(--overlay); z-index:300; display:flex; align-items:center; justify-content:center; }
-  .prompt { background:var(--bg-elevated); border:1px solid var(--border-strong); min-width:400px; max-width:600px; }
+  .layer { position:fixed; inset:0; z-index:300; display:flex; align-items:center; justify-content:center; }
+  .backdrop { position:absolute; inset:0; border:0; padding:0; margin:0; background:var(--overlay); cursor:default; }
+  .prompt { position:relative; z-index:1; background:var(--bg-elevated); border:1px solid var(--border-strong); min-width:400px; max-width:600px; }
   .hdr { padding:8px 12px; font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--border); }
   .list { padding:8px 12px; max-height:320px; overflow:auto; }
   .warn-item { padding:6px 0; border-bottom:1px solid var(--border); }
