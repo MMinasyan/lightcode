@@ -103,10 +103,8 @@
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
     </button>
     {#if showMenu}
-      <!-- svelte-ignore a11y-click-events-have-key-events -->
-      <div class="revert-backdrop" on:click={closeMenu}></div>
-      <!-- svelte-ignore a11y-click-events-have-key-events -->
-      <div class="revert-menu" style={menuStyle} on:click|stopPropagation>
+      <button type="button" class="revert-backdrop" tabindex="-1" aria-label="Close revert options" on:click={closeMenu}></button>
+      <div class="revert-menu" style={menuStyle}>
         {#if !confirmAction}
           <button class="menu-item" on:click={() => pickAction('revertcode')}>Revert code</button>
           <button class="menu-item" on:click={() => pickAction('reverthistory')}>Revert history</button>
@@ -157,7 +155,7 @@
   .copy-icon { position:absolute; bottom:4px; right:4px; display:flex; align-items:center; background:none; border:none; color:var(--text-dim); cursor:pointer; padding:2px; visibility:hidden; z-index:1; }
   .message.assistant:hover .copy-icon { visibility:visible; }
   .copy-icon:hover { color:var(--accent); }
-  .revert-backdrop { position:fixed; inset:0; z-index:50; }
+  .revert-backdrop { position:fixed; inset:0; z-index:50; border:0; padding:0; margin:0; background:transparent; cursor:default; }
   .revert-menu { position:fixed; background:var(--bg-elevated); border:1px solid var(--border-strong); min-width:180px; z-index:51; box-shadow:var(--shadow-menu); }
   .menu-item { display:block; width:100%; background:none; border:none; color:var(--text); font-family:var(--font-ui); font-size:calc(12px * var(--scale, 1)); padding:6px 12px; cursor:pointer; text-align:left; }
   .menu-item:hover { background:var(--accent-soft); color:var(--accent); }

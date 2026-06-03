@@ -31,12 +31,11 @@
   }
 </script>
 
-<!-- svelte-ignore a11y-click-events-have-key-events -->
-<div class="backdrop" on:click={() => dispatch('close')}>
-  <!-- svelte-ignore a11y-click-events-have-key-events -->
-  <div class="menu" on:click|stopPropagation>
+<div class="layer">
+  <button type="button" class="backdrop" tabindex="-1" aria-label="Close project selector" on:click={() => dispatch('close')}></button>
+  <div class="menu" role="dialog" aria-modal="true" aria-labelledby="project-selector-title" tabindex="-1">
     <div class="tabs">
-      <div class="title">Projects</div>
+      <div class="title" id="project-selector-title">Projects</div>
       <button class="new" on:click={addProject} title="Open directory">+</button>
     </div>
     <div class="list">
@@ -58,8 +57,9 @@
 </div>
 
 <style>
-  .backdrop { position:fixed; inset:0; z-index:100; }
-  .menu { position:absolute; top:40px; left:12px; background:var(--bg-elevated); border:1px solid var(--border-strong); min-width:360px; max-width:560px; max-height:360px; display:flex; flex-direction:column; box-shadow:var(--shadow-menu); }
+  .layer { position:fixed; inset:0; z-index:100; }
+  .backdrop { position:absolute; inset:0; border:0; padding:0; margin:0; background:transparent; cursor:default; }
+  .menu { position:absolute; z-index:1; top:40px; left:12px; background:var(--bg-elevated); border:1px solid var(--border-strong); min-width:360px; max-width:560px; max-height:360px; display:flex; flex-direction:column; box-shadow:var(--shadow-menu); }
   .tabs { display:flex; align-items:center; gap:0; border-bottom:1px solid var(--border); }
   .title { color:var(--text-dim); font-family:var(--font-ui); font-size:12px; padding:6px 14px; }
   .new { margin-left:auto; background:none; border:none; color:var(--text-dim); font-family:var(--font-ui); font-size:14px; padding:4px 10px; cursor:pointer; }

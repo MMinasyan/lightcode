@@ -65,11 +65,9 @@
   }
 </script>
 
-<!-- svelte-ignore a11y-click-events-have-key-events -->
 <div class="backdrop">
-  <!-- svelte-ignore a11y-click-events-have-key-events -->
-  <div class="prompt" on:click|stopPropagation>
-    <div class="hdr">Permission Required</div>
+  <div class="prompt" role="dialog" aria-modal="true" aria-labelledby="permission-prompt-title" tabindex="-1">
+    <div class="hdr" id="permission-prompt-title">Permission Required</div>
     <div class="tool-info">
       <span class="tool-badge">[{permission?.tool || 'tool'}]</span>
       {#if permission?.canAllowAll && permission?.batchTotal}
@@ -95,8 +93,7 @@
       <div class="suggest-panel">
         <div class="suggest-hdr">Allow for this project:</div>
         {#each suggestions as s}
-          <!-- svelte-ignore a11y-click-events-have-key-events -->
-          <label class="suggest-row" on:click|stopPropagation>
+          <label class="suggest-row">
             <input type="checkbox" checked={!!selected[s.rule]} on:change={() => toggleSuggestion(s.rule)} />
             <span class="suggest-label">{s.label}</span>
           </label>
