@@ -7,12 +7,17 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           lfs: true
+
+      - name: Installer tests
+        run: |
+          sh -n scripts/install.sh
+          scripts/test-install.sh
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -25,16 +30,16 @@ jobs:
           node-version: '22'
 
       - name: Install Wails native dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
 
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
 
       - name: Build Wails app
-        run: $(go env GOPATH)/bin/wails build
+        run: $(go env GOPATH)/bin/wails build -tags webkit2_41
 
       - name: Vet
-        run: go vet ./...
+        run: go vet -tags webkit2_41 ./...
 
       - name: Check formatting
         run: |
@@ -42,10 +47,10 @@ jobs:
           [ ! -s /tmp/gofmt-out ]
 
       - name: Test
-        run: go test -race ./...
+        run: go test -race -tags webkit2_41 ./...
 
       - name: Fuzz seed corpus
-        run: go test -run=Fuzz ./internal/provider/... ./internal/catalog/... ./internal/engine/message/...
+        run: go test -tags webkit2_41 -run=Fuzz ./internal/provider/... ./internal/catalog/... ./internal/engine/message/...
 
       - name: Install lint tools
         run: |
@@ -55,10 +60,10 @@ jobs:
       - name: gosec
         # G204/G304/G306/G302/G301 describe patterns inherent to a
         # file-IO + command-runner tool; see Makefile GOSEC_EXCLUDE.
-        run: $(go env GOPATH)/bin/gosec -quiet -exclude=G204,G301,G302,G304,G306 ./...
+        run: GOFLAGS=-tags=webkit2_41 $(go env GOPATH)/bin/gosec -quiet -exclude=G204,G301,G302,G304,G306 ./...
 
       - name: ineffassign
-        run: $(go env GOPATH)/bin/ineffassign ./...
+        run: GOFLAGS=-tags=webkit2_41 $(go env GOPATH)/bin/ineffassign ./...
 
       - name: Frontend tests
         run: cd frontend && npm run test

@@ -1,0 +1,212 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing v* tag to publish'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'MMinasyan/lightcode'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.release_ref.outputs.tag }}
+    steps:
+      - name: Resolve tag
+        id: release_ref
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$REF_NAME"
+          fi
+          if [ -z "$tag" ]; then
+            echo "release tag is required" >&2
+            exit 1
+          fi
+          if printf '%s' "$tag" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+            echo "release tag must not contain control characters" >&2
+            exit 1
+          fi
+          case "$tag" in
+            v*) ;;
+            *) echo "release tag must start with v" >&2; exit 1 ;;
+          esac
+          git check-ref-format "refs/tags/$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=refs/tags/$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.release_ref.outputs.ref }}
+          fetch-depth: 0
+          lfs: true
+          persist-credentials: false
+
+      - name: Verify tag checkout
+        env:
+          EXPECTED_TAG: ${{ steps.release_ref.outputs.tag }}
+        run: test "$(git describe --tags --exact-match)" = "$EXPECTED_TAG"
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Install Wails native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Installer tests
+        run: |
+          sh -n scripts/install.sh
+          scripts/test-install.sh
+
+      - name: Build Wails app
+        run: $(go env GOPATH)/bin/wails build -tags webkit2_41
+
+      - name: Check formatting
+        run: |
+          gofmt -l . | tee /tmp/gofmt-out
+          [ ! -s /tmp/gofmt-out ]
+
+      - name: Vet
+        run: go vet -tags webkit2_41 ./...
+
+      - name: Test
+        run: go test -race -tags webkit2_41 ./...
+
+      - name: Fuzz seed corpus
+        run: go test -tags webkit2_41 -run=Fuzz ./internal/provider/... ./internal/catalog/... ./internal/engine/message/...
+
+      - name: Frontend tests
+        run: cd frontend && npm run test
+
+      - name: Check binary linkage
+        run: |
+          file build/bin/lightcode
+          ldd build/bin/lightcode
+          ! ldd build/bin/lightcode | grep 'not found'
+          ldd build/bin/lightcode | grep 'libwebkit2gtk-4.1.so.0'
+          ldd build/bin/lightcode | grep 'libsoup-3.0.so.0'
+
+      - name: Package release assets
+        run: |
+          mkdir -p dist/pkg
+          cp build/bin/lightcode dist/pkg/lightcode
+          chmod 755 dist/pkg/lightcode
+          tar -C dist/pkg -czf dist/lightcode-linux-amd64.tar.gz lightcode
+          cp scripts/install.sh dist/install.sh
+          chmod 644 dist/install.sh
+          (cd dist && sha256sum install.sh lightcode-linux-amd64.tar.gz > SHA256SUMS)
+          tar -tzf dist/lightcode-linux-amd64.tar.gz
+          (cd dist && sha256sum -c SHA256SUMS)
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: lightcode-release-assets
+          path: |
+            dist/install.sh
+            dist/lightcode-linux-amd64.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    if: github.repository == 'MMinasyan/lightcode'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: lightcode-release-assets
+          path: dist
+
+      - name: Verify release assets
+        run: |
+          test -f dist/install.sh
+          test -f dist/lightcode-linux-amd64.tar.gz
+          test -f dist/SHA256SUMS
+          tar -tzf dist/lightcode-linux-amd64.tar.gz
+          (cd dist && sha256sum -c SHA256SUMS)
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          notes=dist/release-notes.md
+          cat >"$notes" <<'EOF'
+          ## Lightcode Linux amd64 installer
+
+          This release adds the Linux amd64 prebuilt installer path for Lightcode.
+
+          Assets:
+
+          - `install.sh`
+          - `lightcode-linux-amd64.tar.gz`
+          - `SHA256SUMS`
+
+          The installer verifies the tarball checksum from `SHA256SUMS` before extraction and install.
+
+          Runtime requirements:
+
+          - WebKitGTK 4.1
+          - GTK 3
+
+          Source build instructions remain available in the README for development workflows.
+          EOF
+          sed -i 's/^          //' "$notes"
+
+          git ls-remote --exit-code --tags "https://github.com/$GH_REPO.git" "refs/tags/$RELEASE_TAG" >/dev/null
+
+          if release_id=$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq .id 2>/dev/null); then
+            gh release upload "$RELEASE_TAG" \
+              dist/install.sh \
+              dist/lightcode-linux-amd64.tar.gz \
+              dist/SHA256SUMS \
+              --clobber \
+              --repo "$GH_REPO"
+            gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
+              -F name="$RELEASE_TAG" \
+              -F body=@"$notes" \
+              --silent
+          else
+            gh release create "$RELEASE_TAG" \
+              dist/install.sh \
+              dist/lightcode-linux-amd64.tar.gz \
+              dist/SHA256SUMS \
+              --title "$RELEASE_TAG" \
+              --notes-file "$notes" \
+              --repo "$GH_REPO"
+          fi

@@ -51,37 +51,35 @@ Lightcode uses the OpenAI Chat Completions shape with streaming and tool calls. 
 
 ### Quick start
 
-#### Prerequisites
+#### Install
 
-- Go 1.26+
-- Node.js
-- [Wails v2](https://wails.io/docs/gettingstarted/installation)
-- Git LFS
-
-Linux is the primary tested and documented platform today. Wails can target macOS and Windows too, but this README documents the Linux build/run path for now.
-
-<details>
-<summary>Linux: install WebKitGTK</summary>
+Linux amd64 is the first supported release target. Install the prebuilt binary from the latest GitHub Release:
 
 ```bash
-# Debian / Ubuntu
-sudo apt install libwebkit2gtk-4.1-dev
-
-# Fedora
-sudo dnf install webkit2gtk4.1-devel
-
-# Arch
-sudo pacman -S webkit2gtk-4.1
+curl -fsSL https://github.com/MMinasyan/lightcode/releases/latest/download/install.sh | sh
 ```
 
-macOS and Windows have the webview engine built in.
-</details>
+Run Lightcode:
 
-#### Build
+```bash
+lightcode
+```
+
+Linux amd64 on Debian/Ubuntu and Fedora is the first supported release target. macOS, Windows, Linux arm64, and package-manager formats are not part of this first release target.
+
+#### Build from source
+
+Source builds are for development. They require Go 1.26+, Node.js, [Wails v2](https://wails.io/docs/gettingstarted/installation), Git LFS, and WebKitGTK development headers.
+
+```bash
+# Debian / Ubuntu build dependencies
+sudo apt update
+sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev
+```
 
 ```bash
 git lfs pull
-wails build
+wails build -tags webkit2_41
 ```
 
 Binary: `build/bin/lightcode`
