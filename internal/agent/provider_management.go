@@ -16,6 +16,15 @@ import (
 	"github.com/MMinasyan/lightcode/internal/config"
 )
 
+// discoveryTimeout bounds connect-time discovery HTTP calls so a stalled
+// endpoint cannot block the runtime lock (and therefore every adapter call)
+// indefinitely.
+const discoveryTimeout = 30 * time.Second
+
+// discoveryHTTPClient is a shared, timeout-bounded client used for connect-time
+// discovery. It deliberately replaces http.DefaultClient, which has no timeout.
+var discoveryHTTPClient = &http.Client{Timeout: discoveryTimeout}
+
 // ProviderList returns all effective providers with live connection/key-source status.
 func (a *Agent) ProviderList() []ProviderStatus {
 	a.ensureRuntime().mu.Lock()
@@ -143,59 +152,104 @@ func upperSnake(s string) string {
 // ConnectProvider connects an existing catalog provider. Providers that already
 // have usable models only need credential persistence; empty discovery-backed
 // providers run a one-shot connect-time discovery before any secret is persisted.
+// The network fetch runs outside runtime.mu so a stalled endpoint cannot block
+// other adapter calls.
 func (a *Agent) ConnectProvider(providerID, apiKey string) error {
+	// Phase 1: snapshot provider state and resolve key under the lock.
+	type connectPlan struct {
+		needsDiscovery bool
+		apiKeyEnv      string
+		key            string
+		shouldPersist  bool
+		prov           *catalog.Provider
+	}
+	var plan connectPlan
 	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
 	if a.ensureRuntime().busy {
+		a.ensureRuntime().mu.Unlock()
 		return fmt.Errorf("cannot connect provider while a turn is running")
 	}
 	prov := a.catalog.Providers[providerID]
 	if prov == nil {
+		a.ensureRuntime().mu.Unlock()
 		return fmt.Errorf("provider %q not found", providerID)
 	}
 	if prov.Transport.APIKeyEnv == "" {
-		return a.reloadLocked()
+		err := a.reloadLockedNoRefresh()
+		a.ensureRuntime().mu.Unlock()
+		return err
 	}
 	if usableModelCount(prov) == 0 {
 		if !prov.Discovery {
+			a.ensureRuntime().mu.Unlock()
 			return fmt.Errorf("provider %q has no usable models and discovery is disabled", providerID)
 		}
 		key, shouldPersist, err := a.resolveConnectKeyLocked(prov.Transport.APIKeyEnv, apiKey)
 		if err != nil {
+			a.ensureRuntime().mu.Unlock()
 			return err
 		}
-		discovered, err := fetchConnectDiscovery(context.Background(), http.DefaultClient, prov, key)
+		plan = connectPlan{needsDiscovery: true, apiKeyEnv: prov.Transport.APIKeyEnv, key: key, shouldPersist: shouldPersist, prov: prov}
+	} else {
+		plan = connectPlan{apiKeyEnv: prov.Transport.APIKeyEnv, prov: prov}
+	}
+	a.ensureRuntime().mu.Unlock()
+
+	// Phase 2: network call without holding runtime.mu.
+	if plan.needsDiscovery {
+		ctx, cancel := context.WithTimeout(context.Background(), discoveryTimeout)
+		defer cancel()
+		discovered, err := fetchConnectDiscovery(ctx, discoveryHTTPClient, plan.prov, plan.key)
 		if err != nil {
 			return err
 		}
 		if usableDiscoveredModelCount(discovered) == 0 {
 			return fmt.Errorf("provider %q discovery returned no usable models", providerID)
 		}
-		if err := catalog.WriteDiscoveryCache(a.home, providerID, discovered, time.Now().UTC()); err != nil {
+		// Phase 3: re-acquire lock, re-validate, persist.
+		a.ensureRuntime().mu.Lock()
+		defer a.ensureRuntime().mu.Unlock()
+		if a.ensureRuntime().busy {
+			return fmt.Errorf("cannot connect provider while a turn is running")
+		}
+		current := a.catalog.Providers[providerID]
+		if current == nil {
+			return fmt.Errorf("provider %q not found", providerID)
+		}
+		if usableModelCount(current) > 0 {
+			// Another path populated models while we were fetching; skip cache write.
+		} else if err := catalog.WriteDiscoveryCache(a.home, providerID, discovered, time.Now().UTC()); err != nil {
 			return err
 		}
-		if shouldPersist {
-			if err := a.setManagedKeyLocked(prov.Transport.APIKeyEnv, apiKey); err != nil {
+		if plan.shouldPersist {
+			if err := a.setManagedKeyLocked(plan.apiKeyEnv, apiKey); err != nil {
 				return err
 			}
 		}
-		return a.reloadLocked()
+		return a.reloadLockedNoRefresh()
+	}
+
+	// Non-discovery path: persist key and reload.
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	if a.ensureRuntime().busy {
+		return fmt.Errorf("cannot connect provider while a turn is running")
 	}
 	if apiKey != "" {
-		if err := a.setManagedKeyLocked(prov.Transport.APIKeyEnv, apiKey); err != nil {
+		if err := a.setManagedKeyLocked(plan.apiKeyEnv, apiKey); err != nil {
 			if !errors.Is(err, config.ErrExternalKey) {
 				return err
 			}
-			if os.Getenv(prov.Transport.APIKeyEnv) == "" {
-				return fmt.Errorf("provider %q env var %s is externally set but empty", providerID, prov.Transport.APIKeyEnv)
+			if os.Getenv(plan.apiKeyEnv) == "" {
+				return fmt.Errorf("provider %q env var %s is externally set but empty", providerID, plan.apiKeyEnv)
 			}
 		}
-		return a.reloadLocked()
+		return a.reloadLockedNoRefresh()
 	}
-	if os.Getenv(prov.Transport.APIKeyEnv) == "" {
-		return fmt.Errorf("provider requires API key env var %s", prov.Transport.APIKeyEnv)
+	if os.Getenv(plan.apiKeyEnv) == "" {
+		return fmt.Errorf("provider requires API key env var %s", plan.apiKeyEnv)
 	}
-	return a.reloadLocked()
+	return a.reloadLockedNoRefresh()
 }
 
 func (a *Agent) resolveConnectKeyLocked(apiKeyEnv, apiKey string) (key string, shouldPersist bool, err error) {
@@ -256,11 +310,13 @@ func cloneHeaders(in map[string]string) map[string]string {
 }
 
 // DiscoverCustomProvider runs one-shot discovery for an unsaved custom provider.
-// It persists nothing.
+// It persists nothing. The network fetch runs outside runtime.mu so a stalled
+// endpoint cannot block other adapter calls.
 func (a *Agent) DiscoverCustomProvider(req CustomProviderRequest) ([]DiscoveryModelCandidate, error) {
+	// Phase 1: validate inputs under the lock.
 	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
 	if a.ensureRuntime().busy {
+		a.ensureRuntime().mu.Unlock()
 		return nil, fmt.Errorf("cannot discover provider while a turn is running")
 	}
 	providerID := strings.TrimSpace(req.ID)
@@ -268,6 +324,7 @@ func (a *Agent) DiscoverCustomProvider(req CustomProviderRequest) ([]DiscoveryMo
 		providerID = "custom"
 	}
 	if err := validateCustomHeaders(req.Headers); err != nil {
+		a.ensureRuntime().mu.Unlock()
 		return nil, err
 	}
 	prov := &catalog.Provider{ID: providerID, Name: req.Name, Transport: catalog.Transport{BaseURL: strings.TrimSpace(req.BaseURL), Headers: req.Headers, Options: req.Options}, Discovery: true, Models: map[string]*catalog.Model{}}
@@ -275,12 +332,18 @@ func (a *Agent) DiscoverCustomProvider(req CustomProviderRequest) ([]DiscoveryMo
 	if apiKeyEnv := strings.TrimSpace(req.APIKeyEnv); apiKeyEnv != "" {
 		if external, exists := os.LookupEnv(apiKeyEnv); exists {
 			if external == "" {
+				a.ensureRuntime().mu.Unlock()
 				return nil, fmt.Errorf("provider env var %s is externally set but empty", apiKeyEnv)
 			}
 			key = external
 		}
 	}
-	discovered, err := fetchConnectDiscovery(context.Background(), http.DefaultClient, prov, key)
+	a.ensureRuntime().mu.Unlock()
+
+	// Phase 2: network call without holding runtime.mu.
+	ctx, cancel := context.WithTimeout(context.Background(), discoveryTimeout)
+	defer cancel()
+	discovered, err := fetchConnectDiscovery(ctx, discoveryHTTPClient, prov, key)
 	if err != nil {
 		return nil, err
 	}
@@ -406,7 +469,7 @@ func (a *Agent) AddCustomProvider(req CustomProviderRequest) error {
 			return err
 		}
 	}
-	return a.reloadLocked()
+	return a.reloadLockedNoRefresh()
 }
 
 func customModelsMap(inputs []CustomProviderModelInput) (map[string]any, int, error) {
@@ -482,7 +545,7 @@ func (a *Agent) DisconnectProvider(providerID string) error {
 	if err := a.env.Remove(apiKeyEnv); err != nil {
 		return err
 	}
-	return a.reloadLocked()
+	return a.reloadLockedNoRefresh()
 }
 
 // RemoveProvider deletes a custom provider entry from config.json.
@@ -512,7 +575,7 @@ func (a *Agent) RemoveProvider(providerID string) error {
 	}); err != nil {
 		return err
 	}
-	return a.reloadLocked()
+	return a.reloadLockedNoRefresh()
 }
 
 func (a *Agent) apiKeyEnvInUseLocked(apiKeyEnv, providerID string) bool {

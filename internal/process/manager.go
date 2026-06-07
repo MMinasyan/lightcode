@@ -77,6 +77,13 @@ func NewManagerAtRoot(maxProcs int, outputOptions cmdoutput.Options, workspaceRo
 	}
 }
 
+func (m *Manager) SetLimits(maxProcs int, outputOptions cmdoutput.Options) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.maxProcs = maxProcs
+	m.outputOptions = outputOptions
+}
+
 // SetExitHandler sets a callback invoked when a background process exits.
 // The callback should append a system signal to the loop.
 func (m *Manager) SetExitHandler(handler func(ExitEvent)) {

@@ -30,6 +30,8 @@ func NewEditFileAtRoot(tracker *FileTracker, cfg config.ToolsConfig, workspaceRo
 	return &EditFile{tracker: tracker, cfg: cfg, workspaceRoot: workspaceRoot}
 }
 
+func (e *EditFile) SetToolsConfig(cfg config.ToolsConfig) { e.cfg = cfg }
+
 func (e *EditFile) Name() string { return "edit_file" }
 
 func (e *EditFile) Description() string {
@@ -109,6 +111,8 @@ func NewEditFileWithSnapshot(store SnapshotStore, tracker *FileTracker, cfg conf
 func NewEditFileWithSnapshotAtRoot(store SnapshotStore, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) *EditFileWithSnapshot {
 	return &EditFileWithSnapshot{store: store, tracker: tracker, cfg: cfg, workspaceRoot: workspaceRoot}
 }
+
+func (e *EditFileWithSnapshot) SetToolsConfig(cfg config.ToolsConfig) { e.cfg = cfg }
 
 func (*EditFileWithSnapshot) Name() string        { return "edit_file" }
 func (*EditFileWithSnapshot) Description() string { return (&EditFile{}).Description() }

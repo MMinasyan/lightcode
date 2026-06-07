@@ -121,6 +121,36 @@ type ModelListEntry struct {
 	Default        bool          `json:"default"`
 }
 
+type RuntimeConfigSettings struct {
+	Sessions   RuntimeSessionsConfig   `json:"sessions"`
+	Compaction RuntimeCompactionConfig `json:"compaction"`
+	Subagents  RuntimeSubagentsConfig  `json:"subagents"`
+	Tools      RuntimeToolsConfig      `json:"tools"`
+}
+
+type RuntimeSessionsConfig struct {
+	ArchiveAfterDays       int `json:"archive_after_days"`
+	DeleteAfterArchiveDays int `json:"delete_after_archive_days"`
+}
+
+type RuntimeCompactionConfig struct {
+	ThresholdPct    float64 `json:"threshold_pct"`
+	SummarizerModel string  `json:"summarizer_model"`
+}
+
+type RuntimeSubagentsConfig struct {
+	MaxConcurrent int    `json:"max_concurrent"`
+	Model         string `json:"model"`
+}
+
+type RuntimeToolsConfig struct {
+	MaxOutputBytes         int `json:"max_output_bytes"`
+	ReadMaxLines           int `json:"read_max_lines"`
+	ReadLineMaxChars       int `json:"read_line_max_chars"`
+	CommandTimeout         int `json:"command_timeout"`
+	MaxBackgroundProcesses int `json:"max_background_processes"`
+}
+
 const (
 	ProviderKeySourceNone     = "none"
 	ProviderKeySourceKeyless  = "keyless"

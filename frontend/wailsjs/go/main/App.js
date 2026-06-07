@@ -54,6 +54,10 @@ export function GenerateAPIKeyEnvName(arg1) {
   return window['go']['main']['App']['GenerateAPIKeyEnvName'](arg1);
 }
 
+export function GetRuntimeConfig() {
+  return window['go']['main']['App']['GetRuntimeConfig']();
+}
+
 export function ModelList() {
   return window['go']['main']['App']['ModelList']();
 }
@@ -160,6 +164,10 @@ export function SetModelHidden(arg1, arg2) {
 
 export function SetProviderHidden(arg1, arg2) {
   return window['go']['main']['App']['SetProviderHidden'](arg1, arg2);
+}
+
+export function SetRuntimeConfig(arg1) {
+  return window['go']['main']['App']['SetRuntimeConfig'](arg1);
 }
 
 export function SnapshotList() {

@@ -190,6 +190,20 @@ func TestWailsBindingsCoverExportedAppMethods(t *testing.T) {
 	}
 }
 
+func TestFrontendRuntimeConfigTabExcludesMasterTogglesAndPermissions(t *testing.T) {
+	settings := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "components", "Settings.svelte"))
+	for _, want := range []string{"GetRuntimeConfig", "SetRuntimeConfig", "active === 'runtime'", "archive_after_days", "delete_after_archive_days", "threshold_pct", "summarizer_model", "max_concurrent", "max_output_bytes", "max_background_processes"} {
+		if !strings.Contains(settings, want) {
+			t.Fatalf("Settings.svelte runtime config tab missing %q", want)
+		}
+	}
+	for _, excluded := range []string{"auto_archive", "auto-archive", "compaction.enabled", "master enable", "permissions"} {
+		if strings.Contains(strings.ToLower(settings), excluded) {
+			t.Fatalf("Settings.svelte runtime config tab must not expose %q", excluded)
+		}
+	}
+}
+
 func TestFrontendNoActiveModelSendGate(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
 	input := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "components", "InputArea.svelte"))
@@ -218,6 +232,8 @@ func TestWailsLifecycleSurfaceContract(t *testing.T) {
 		"export function TokenUsage():Promise<agent.TokenReport>;",
 		"export function CurrentWarnings():Promise<Array<agent.PromptWarning>>;",
 		"export function SetDefaultModel(arg1:string):Promise<void>;",
+		"export function GetRuntimeConfig():Promise<agent.RuntimeConfigSettings>;",
+		"export function SetRuntimeConfig(arg1:agent.RuntimeConfigSettings):Promise<void>;",
 	}
 	for _, want := range required {
 		if !strings.Contains(binding, want) {

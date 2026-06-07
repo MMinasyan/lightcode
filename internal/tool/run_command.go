@@ -40,6 +40,8 @@ func NewRunCommandAtRoot(cfg config.ToolsConfig, homeDir, workspaceRoot string, 
 	}
 }
 
+func (r *RunCommand) SetToolsConfig(cfg config.ToolsConfig) { r.cfg = cfg }
+
 func (*RunCommand) Name() string { return "run_command" }
 
 func (*RunCommand) Description() string {

@@ -335,6 +335,16 @@ func (a *App) SetDefaultModel(ref string) error {
 	return a.svc.SetDefaultModel(ref)
 }
 
+// GetRuntimeConfig returns GUI-editable runtime settings.
+func (a *App) GetRuntimeConfig() agent.RuntimeConfigSettings {
+	return a.svc.GetRuntimeConfig()
+}
+
+// SetRuntimeConfig writes GUI-editable runtime settings to config.
+func (a *App) SetRuntimeConfig(settings agent.RuntimeConfigSettings) error {
+	return a.svc.SetRuntimeConfig(settings)
+}
+
 // ProjectName returns the basename of the project directory.
 func (a *App) ProjectName() string {
 	return a.svc.ProjectName()
