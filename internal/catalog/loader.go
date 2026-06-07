@@ -21,8 +21,9 @@ var bundledFS embed.FS
 
 // Loader reads catalog inputs from disk and delegates assembly to Build.
 type Loader struct {
-	home    string
-	bundled fs.FS
+	home       string
+	configPath string
+	bundled    fs.FS
 }
 
 // NewLoader constructs a catalog loader rooted at the user's home directory.
@@ -31,6 +32,14 @@ func NewLoader(home string, bundled fs.FS) *Loader {
 		bundled = bundledFS
 	}
 	return &Loader{home: home, bundled: bundled}
+}
+
+// NewLoaderWithConfigPath constructs a catalog loader that reads user provider
+// overlays from the same config file the agent loaded at startup.
+func NewLoaderWithConfigPath(home string, bundled fs.FS, configPath string) *Loader {
+	loader := NewLoader(home, bundled)
+	loader.configPath = configPath
+	return loader
 }
 
 // Load reads the bundled catalog, user config, and discovery cache, then calls Build.
@@ -43,13 +52,13 @@ func (l *Loader) Load() (*Catalog, []Warning, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("read bundled catalog: %w", err)
 	}
-	userRaw, warnings := readUserConfigProviders(home)
+	userRaw, warnings := readUserConfigProvidersAt(home, l.configPath)
 	cache, attempts, cacheWarnings := ReadDiscoveryCache(home)
 	warnings = append(warnings, cacheWarnings...)
 
 	result := Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Cache: cache})
 	candidates := DiscoveryRefreshCandidates(result.Catalog, attempts, time.Now().UTC())
-	discoveryWarnings, discoveryChanged, _ := refreshDiscoveryCandidatesFor(home, candidates, result.Catalog)
+	discoveryWarnings, discoveryChanged, _ := refreshDiscoveryCandidatesFor(home, l.configPath, candidates, result.Catalog)
 	warnings = append(warnings, discoveryWarnings...)
 	if discoveryChanged {
 		cache, _, cacheWarnings = ReadDiscoveryCache(home)
@@ -60,7 +69,7 @@ func (l *Loader) Load() (*Catalog, []Warning, error) {
 	return result.Catalog, warnings, nil
 }
 
-func refreshDiscoveryCandidatesFor(home string, candidateIDs []string, cat *Catalog) ([]Warning, bool, []string) {
+func refreshDiscoveryCandidatesFor(home, configPath string, candidateIDs []string, cat *Catalog) ([]Warning, bool, []string) {
 	var warnings []Warning
 	var refreshed []string
 	changed := false
@@ -68,7 +77,7 @@ func refreshDiscoveryCandidatesFor(home string, candidateIDs []string, cat *Cata
 		return warnings, changed, refreshed
 	}
 	for _, providerID := range candidateIDs {
-		refreshedProvider, providerWarnings := RefreshProviderDiscovery(context.Background(), home, cat, providerID)
+		refreshedProvider, providerWarnings := RefreshProviderDiscoveryWithConfigPath(context.Background(), home, configPath, cat, providerID)
 		if len(providerWarnings) != 0 {
 			warnings = append(warnings, providerWarnings...)
 			continue
@@ -118,7 +127,13 @@ const catalogEmptyConfigTemplate = `{
 `
 
 func readUserConfigProviders(home string) (map[string]any, []Warning) {
-	configPath := filepath.Join(lightcodeDir(home), "config.json")
+	return readUserConfigProvidersAt(home, "")
+}
+
+func readUserConfigProvidersAt(home, configPath string) (map[string]any, []Warning) {
+	if configPath == "" {
+		configPath = filepath.Join(lightcodeDir(home), "config.json")
+	}
 	data, err := os.ReadFile(configPath)
 	if os.IsNotExist(err) {
 		if writeErr := writeEmptyCatalogConfig(configPath); writeErr != nil {
