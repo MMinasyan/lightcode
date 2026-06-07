@@ -15,6 +15,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
 func newCatalogBackedTestAgent(t *testing.T) *Agent {
@@ -224,6 +225,171 @@ func TestAgentSetDefaultModelWritesConfigAndUpdatesWarnings(t *testing.T) {
 	cur := a.CurrentModel()
 	if cur.Ref != "test/test-model" {
 		t.Fatalf("CurrentModel after SetDefaultModel = %#v, want lazy default activation", cur)
+	}
+}
+
+func TestAgentRuntimeConfigRoundTripWritesReloadsAndExcludesMasterBooleans(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	settings := a.GetRuntimeConfig()
+	settings.Sessions.ArchiveAfterDays = 14
+	settings.Sessions.DeleteAfterArchiveDays = 21
+	settings.Compaction.ThresholdPct = 0.75
+	settings.Compaction.SummarizerModel = "test/test-model"
+	settings.Subagents.MaxConcurrent = 3
+	settings.Subagents.Model = "test/alt-model"
+	settings.Tools.MaxOutputBytes = 32768
+	settings.Tools.ReadMaxLines = 10
+	settings.Tools.ReadLineMaxChars = 7000
+	settings.Tools.CommandTimeout = 90
+	settings.Tools.MaxBackgroundProcesses = 1
+
+	if err := a.SetRuntimeConfig(settings); err != nil {
+		t.Fatalf("SetRuntimeConfig returned error: %v", err)
+	}
+	got := a.GetRuntimeConfig()
+	if got.Sessions.ArchiveAfterDays != 14 || got.Sessions.DeleteAfterArchiveDays != 21 || got.Compaction.ThresholdPct != 0.75 || got.Compaction.SummarizerModel != "test/test-model" {
+		t.Fatalf("runtime config after set = %#v", got)
+	}
+	if got.Subagents.MaxConcurrent != 3 || got.Subagents.Model != "test/alt-model" || got.Tools.CommandTimeout != 90 || got.Tools.MaxBackgroundProcesses != 1 {
+		t.Fatalf("runtime tool/subagent config after set = %#v", got)
+	}
+	data, err := os.ReadFile(a.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{`"archive_after_days": 14`, `"delete_after_archive_days": 21`, `"threshold_pct": 0.75`, `"summarizer_model": "test/test-model"`, `"max_concurrent": 3`, `"model": "test/alt-model"`, `"command_timeout": 90`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("config missing %s:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, `"auto_archive"`) || strings.Contains(text, `"enabled"`) || strings.Contains(text, `"permissions"`) {
+		t.Fatalf("config write should not add excluded runtime fields:\n%s", text)
+	}
+	filePath := filepath.Join(a.projectRoot, "many-lines.txt")
+	var lines strings.Builder
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&lines, "line-%03d\n", i)
+	}
+	if err := os.WriteFile(filePath, []byte(lines.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readTool, ok := a.registry.Get("read_file")
+	if !ok {
+		t.Fatal("read_file tool not registered")
+	}
+	if wrapped, ok := readTool.(interface{ WrappedTool() tool.Tool }); ok {
+		readTool = wrapped.WrappedTool()
+	}
+	readOutput, err := readTool.Execute(context.Background(), map[string]any{"path": filePath})
+	if err != nil {
+		t.Fatalf("read_file Execute returned error: %v", err)
+	}
+	if !strings.Contains(readOutput, "line-010") || strings.Contains(readOutput, "line-011") {
+		t.Fatalf("read_file did not use updated read_max_lines=10; output=%q", readOutput)
+	}
+	defer a.procMgr.KillAll()
+	if _, err := a.procMgr.Start("sleep 5", 0); err != nil {
+		t.Fatalf("first background process start returned error: %v", err)
+	}
+	if _, err := a.procMgr.Start("sleep 5", 0); err == nil {
+		t.Fatal("second background process start returned nil with updated max_background_processes=1")
+	}
+	if err := a.Reload(); err != nil {
+		t.Fatalf("Reload returned error: %v", err)
+	}
+	if got := a.GetRuntimeConfig(); got.Tools.CommandTimeout != 90 || got.Subagents.Model != "test/alt-model" {
+		t.Fatalf("runtime config after reload = %#v", got)
+	}
+}
+
+func TestAgentSetRuntimeConfigDoesNotTriggerDiscoveryHTTP(t *testing.T) {
+	var discoveryCalls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		discoveryCalls.Add(1)
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected discovery path %s", r.URL.Path)
+		}
+		_, _ = fmt.Fprint(w, `{"data":[{"id":"remote-model","name":"Remote Model","context_window":12288,"max_output_tokens":3072}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	lightcodeDir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keyEnv := "LIGHTCODE_RUNTIME_DISCOVERY_KEY"
+	t.Setenv(keyEnv, "")
+	configPath := filepath.Join(lightcodeDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf(`{
+  "providers": {
+    "test": {
+      "name": "Test Provider",
+      "transport": { "base_url": %q, "api_key_env": %q },
+      "discovery": true,
+      "models": {
+        "test-model": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 }
+      }
+    }
+  },
+  "default_model": "test/test-model"
+}`, server.URL+"/v1", keyEnv)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+	if calls := discoveryCalls.Load(); calls != 0 {
+		t.Fatalf("discovery calls during disconnected startup = %d, want 0", calls)
+	}
+
+	t.Setenv(keyEnv, "test-key")
+	settings := a.GetRuntimeConfig()
+	settings.Tools.CommandTimeout = 91
+	if err := a.SetRuntimeConfig(settings); err != nil {
+		t.Fatalf("SetRuntimeConfig returned error: %v", err)
+	}
+	if calls := discoveryCalls.Load(); calls != 0 {
+		t.Fatalf("discovery calls during SetRuntimeConfig = %d, want 0", calls)
+	}
+	if got := a.GetRuntimeConfig(); got.Tools.CommandTimeout != 91 {
+		t.Fatalf("runtime config after SetRuntimeConfig = %#v, want command_timeout=91", got)
+	}
+}
+
+func TestAgentSetRuntimeConfigRejectsInvalidValues(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	settings := a.GetRuntimeConfig()
+	settings.Compaction.ThresholdPct = 1
+	if err := a.SetRuntimeConfig(settings); err == nil {
+		t.Fatal("SetRuntimeConfig returned nil for invalid threshold")
+	}
+	settings = a.GetRuntimeConfig()
+	settings.Subagents.Model = "badref"
+	if err := a.SetRuntimeConfig(settings); err == nil {
+		t.Fatal("SetRuntimeConfig returned nil for invalid subagent model ref")
+	}
+	settings = a.GetRuntimeConfig()
+	settings.Tools.CommandTimeout = 0
+	if err := a.SetRuntimeConfig(settings); err == nil {
+		t.Fatal("SetRuntimeConfig returned nil for invalid command timeout")
+	}
+}
+
+func TestAgentSetRuntimeConfigRefusesWhileBusy(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	a.ensureRuntime().mu.Lock()
+	a.ensureRuntime().busy = true
+	a.ensureRuntime().mu.Unlock()
+	if err := a.SetRuntimeConfig(a.GetRuntimeConfig()); err == nil {
+		t.Fatal("SetRuntimeConfig returned nil while busy")
 	}
 }
 

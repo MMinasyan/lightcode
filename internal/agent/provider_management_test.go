@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
@@ -543,5 +544,127 @@ func TestManagedEnvSetErrorStillExternalFriendly(t *testing.T) {
 	// Regression guard for the error type used by ConnectProvider's external path.
 	if !errors.Is(config.ErrExternalKey, config.ErrExternalKey) {
 		t.Fatal("ErrExternalKey should compare with errors.Is")
+	}
+}
+
+func TestAddCustomProviderAdvancedModelFieldsPersisted(t *testing.T) {
+	a := newProviderManagementAgent(t, `{"providers": {}, "default_model": ""}`)
+	usageFalse := false
+	if err := a.AddCustomProvider(CustomProviderRequest{
+		ID:        "adv",
+		Name:      "Advanced",
+		BaseURL:   "http://127.0.0.1:9/v1",
+		APIKeyEnv: "LIGHTCODE_ADV_KEY",
+		APIKey:    "secret",
+		Models: []CustomProviderModelInput{{
+			ID:            "m1",
+			ContextWindow: 2000,
+			SystemRole:    "developer",
+			UsageInStream: &usageFalse,
+			Hidden:        true,
+		}},
+	}); err != nil {
+		t.Fatalf("AddCustomProvider: %v", err)
+	}
+	data, err := os.ReadFile(a.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatal(err)
+	}
+	providers := root["providers"].(map[string]any)
+	adv := providers["adv"].(map[string]any)
+	models := adv["models"].(map[string]any)
+	m1 := models["m1"].(map[string]any)
+	if m1["system_role"] != "developer" {
+		t.Fatalf("model system_role = %v, want developer", m1["system_role"])
+	}
+	if m1["usage_in_stream"] != false {
+		t.Fatalf("model usage_in_stream = %v, want false", m1["usage_in_stream"])
+	}
+	if m1["hidden"] != true {
+		t.Fatalf("model hidden = %v, want true", m1["hidden"])
+	}
+}
+
+func TestConnectProviderDiscoveryTimeoutReturnsPromptly(t *testing.T) {
+	// A stalled discovery endpoint must return within the bounded timeout, not
+	// hang indefinitely. We override discoveryTimeout via a short-lived server
+	// that never responds and verify the call fails fast.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Never respond — simulate a stalled endpoint.
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	a := newProviderManagementAgent(t, `{
+  "providers": {
+    "stalled": {
+      "transport": { "base_url": "`+server.URL+`/v1", "api_key_env": "LIGHTCODE_STALLED_KEY" }
+    }
+  },
+  "default_model": ""
+}`)
+	// Temporarily shorten the timeout for this test.
+	origClient := discoveryHTTPClient
+	discoveryHTTPClient = &http.Client{Timeout: 500 * time.Millisecond}
+	t.Cleanup(func() { discoveryHTTPClient = origClient })
+
+	start := time.Now()
+	err := a.ConnectProvider("stalled", "secret")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("ConnectProvider returned nil for stalled discovery")
+	}
+	if elapsed > 10*time.Second {
+		t.Fatalf("ConnectProvider took %v, want bounded timeout", elapsed)
+	}
+}
+
+func TestDiscoverCustomProviderDoesNotHoldRuntimeLockDuringFetch(t *testing.T) {
+	// Prove the runtime lock is released during the network fetch: a slow
+	// discovery server must not block a concurrent ProviderList call.
+	gate := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-gate
+		_, _ = w.Write([]byte(`{"data":[{"id":"m","context_window":1000}]}`))
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(gate) })
+	a := newProviderManagementAgent(t, `{"providers": {}, "default_model": ""}`)
+
+	// Start discovery in a goroutine; it will block on the server gate.
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.DiscoverCustomProvider(CustomProviderRequest{ID: "slow", BaseURL: server.URL + "/v1", APIKey: "k"})
+		done <- err
+	}()
+
+	// Give the goroutine time to enter the network call.
+	time.Sleep(50 * time.Millisecond)
+
+	// ProviderList must return promptly even while discovery is in flight.
+	listDone := make(chan struct{})
+	go func() {
+		_ = a.ProviderList()
+		close(listDone)
+	}()
+	select {
+	case <-listDone:
+		// good
+	case <-time.After(2 * time.Second):
+		t.Fatal("ProviderList blocked while DiscoverCustomProvider held the lock")
+	}
+
+	// Unblock the discovery server.
+	gate <- struct{}{}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("DiscoverCustomProvider: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("DiscoverCustomProvider did not return after unblocking server")
 	}
 }

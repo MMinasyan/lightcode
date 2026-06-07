@@ -86,7 +86,8 @@ type Agent struct {
 	subagentLoader *subagent.Loader
 	taskToolInst   *taskTool
 
-	procMgr *process.Manager
+	procMgr         *process.Manager
+	pendingExecutor *tool.StagedExecutor
 
 	fileTracker *tool.FileTracker
 
@@ -369,6 +370,7 @@ func New(c Config) (*Agent, error) {
 	l.SetContextTransformer(a)
 	l.SetUsageRecorder(agentUsageRecorder{agent: a})
 	pendingExecutor := tool.NewStagedExecutorAtRoot(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askActionPolicy)
+	a.pendingExecutor = pendingExecutor
 	l.SetPendingExecutor(pendingExecutor)
 	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 	a.lp = l
@@ -1833,12 +1835,23 @@ func (a *Agent) Reload() error {
 }
 
 func (a *Agent) reloadLocked() error {
+	return a.reloadLockedWithRefresh(true)
+}
+
+func (a *Agent) reloadLockedNoRefresh() error {
+	return a.reloadLockedWithRefresh(false)
+}
+
+func (a *Agent) reloadLockedWithRefresh(allowBackgroundDiscovery bool) error {
 	cfg, err := config.Load(a.configPath)
 	if err != nil {
 		return err
 	}
 	modelLoader := catalog.NewLoaderWithConfigPath(a.home, nil, a.configPath)
 	modelLoader.AllowRefresh = func(_ string, prov *catalog.Provider) bool {
+		if !allowBackgroundDiscovery {
+			return false
+		}
 		return providerConnected(prov)
 	}
 	modelCatalog, catalogWarnings, err := modelLoader.Load()
@@ -1851,7 +1864,18 @@ func (a *Agent) reloadLocked() error {
 	if a.taskToolInst != nil {
 		a.taskToolInst.setCatalog(modelCatalog)
 		a.taskToolInst.setSubModel(cfg.Subagents.Model)
+		a.taskToolInst.setMaxConcurrent(cfg.Subagents.MaxConcurrent)
+		a.taskToolInst.setToolsConfig(cfg.Tools)
 	}
+	if a.procMgr != nil {
+		a.procMgr.SetLimits(cfg.Tools.MaxBackgroundProcesses, cmdoutput.Options{
+			HomeDir:      a.home,
+			SpillPrefix:  "proc_output_",
+			MaxBytes:     cfg.Tools.MaxOutputBytes,
+			MaxLineChars: cfg.Tools.ReadLineMaxChars,
+		})
+	}
+	a.updateRegisteredToolsConfigLocked(cfg.Tools)
 	if !a.modelRefConnected(a.currentRef) {
 		a.currentRef = coremodel.ModelRef{}
 		a.contextWindowSize = 0
@@ -2108,6 +2132,168 @@ func (a *Agent) SetProviderHidden(providerID string, hidden bool) error {
 	}
 	if prov := a.catalog.Providers[providerID]; prov != nil {
 		prov.Hidden = hidden
+	}
+	return nil
+}
+
+type toolsConfigSetter interface {
+	SetToolsConfig(config.ToolsConfig)
+}
+
+func (a *Agent) updateRegisteredToolsConfigLocked(cfg config.ToolsConfig) {
+	if a.registry != nil {
+		for _, name := range []string{"read_file", "write_file", "edit_file", "run_command"} {
+			if t, ok := a.registry.Get(name); ok {
+				setRegisteredToolConfig(t, cfg)
+			}
+		}
+	}
+	if a.pendingExecutor != nil {
+		a.pendingExecutor.SetToolsConfig(cfg)
+	}
+}
+
+func setRegisteredToolConfig(t tool.Tool, cfg config.ToolsConfig) {
+	for t != nil {
+		if setter, ok := t.(toolsConfigSetter); ok {
+			setter.SetToolsConfig(cfg)
+			return
+		}
+		wrapped, ok := t.(interface{ WrappedTool() tool.Tool })
+		if !ok {
+			return
+		}
+		t = wrapped.WrappedTool()
+	}
+}
+
+func (a *Agent) GetRuntimeConfig() RuntimeConfigSettings {
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	return runtimeConfigFromConfig(a.cfg)
+}
+
+func runtimeConfigFromConfig(cfg *config.Config) RuntimeConfigSettings {
+	if cfg == nil {
+		return RuntimeConfigSettings{}
+	}
+	return RuntimeConfigSettings{
+		Sessions: RuntimeSessionsConfig{
+			ArchiveAfterDays:       cfg.Sessions.ArchiveAfterDays,
+			DeleteAfterArchiveDays: cfg.Sessions.DeleteAfterArchiveDays,
+		},
+		Compaction: RuntimeCompactionConfig{
+			ThresholdPct:    cfg.Compaction.ThresholdPct,
+			SummarizerModel: cfg.Compaction.SummarizerModel,
+		},
+		Subagents: RuntimeSubagentsConfig{
+			MaxConcurrent: cfg.Subagents.MaxConcurrent,
+			Model:         cfg.Subagents.Model,
+		},
+		Tools: RuntimeToolsConfig{
+			MaxOutputBytes:         cfg.Tools.MaxOutputBytes,
+			ReadMaxLines:           cfg.Tools.ReadMaxLines,
+			ReadLineMaxChars:       cfg.Tools.ReadLineMaxChars,
+			CommandTimeout:         cfg.Tools.CommandTimeout,
+			MaxBackgroundProcesses: cfg.Tools.MaxBackgroundProcesses,
+		},
+	}
+}
+
+func (a *Agent) SetRuntimeConfig(settings RuntimeConfigSettings) error {
+	if err := validateRuntimeConfig(settings); err != nil {
+		return err
+	}
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	if a.ensureRuntime().busy {
+		return fmt.Errorf("cannot change runtime config while a turn is running")
+	}
+	data, err := os.ReadFile(a.configPath)
+	if err != nil {
+		return err
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("parse config %s: %w", a.configPath, err)
+	}
+	sessions := objectMap(root, "sessions")
+	sessions["archive_after_days"] = settings.Sessions.ArchiveAfterDays
+	sessions["delete_after_archive_days"] = settings.Sessions.DeleteAfterArchiveDays
+	compaction := objectMap(root, "compaction")
+	compaction["threshold_pct"] = settings.Compaction.ThresholdPct
+	if settings.Compaction.SummarizerModel == "" {
+		delete(compaction, "summarizer_model")
+	} else {
+		compaction["summarizer_model"] = settings.Compaction.SummarizerModel
+	}
+	subagents := objectMap(root, "subagents")
+	subagents["max_concurrent"] = settings.Subagents.MaxConcurrent
+	if settings.Subagents.Model == "" {
+		delete(subagents, "model")
+	} else {
+		subagents["model"] = settings.Subagents.Model
+	}
+	tools := objectMap(root, "tools")
+	tools["max_output_bytes"] = settings.Tools.MaxOutputBytes
+	tools["read_max_lines"] = settings.Tools.ReadMaxLines
+	tools["read_line_max_chars"] = settings.Tools.ReadLineMaxChars
+	tools["command_timeout"] = settings.Tools.CommandTimeout
+	tools["max_background_processes"] = settings.Tools.MaxBackgroundProcesses
+	if err := writeAgentConfigAtomic(a.configPath, root); err != nil {
+		return err
+	}
+	return a.reloadLockedNoRefresh()
+}
+
+func objectMap(root map[string]any, key string) map[string]any {
+	if raw, ok := root[key]; ok {
+		if m, ok := raw.(map[string]any); ok {
+			return m
+		}
+	}
+	m := map[string]any{}
+	root[key] = m
+	return m
+}
+
+func validateRuntimeConfig(settings RuntimeConfigSettings) error {
+	if settings.Sessions.ArchiveAfterDays < 1 || settings.Sessions.ArchiveAfterDays > 365 {
+		return fmt.Errorf("sessions.archive_after_days must be between 1 and 365")
+	}
+	if settings.Sessions.DeleteAfterArchiveDays < 1 || settings.Sessions.DeleteAfterArchiveDays > 365 {
+		return fmt.Errorf("sessions.delete_after_archive_days must be between 1 and 365")
+	}
+	if settings.Compaction.ThresholdPct < 0.1 || settings.Compaction.ThresholdPct > 0.99 {
+		return fmt.Errorf("compaction.threshold_pct must be between 0.1 and 0.99")
+	}
+	if settings.Compaction.SummarizerModel != "" {
+		if _, err := coremodel.Parse(settings.Compaction.SummarizerModel); err != nil {
+			return fmt.Errorf("compaction.summarizer_model: %w", err)
+		}
+	}
+	if settings.Subagents.MaxConcurrent < 1 || settings.Subagents.MaxConcurrent > 20 {
+		return fmt.Errorf("subagents.max_concurrent must be between 1 and 20")
+	}
+	if settings.Subagents.Model != "" {
+		if _, err := coremodel.Parse(settings.Subagents.Model); err != nil {
+			return fmt.Errorf("subagents.model: %w", err)
+		}
+	}
+	if settings.Tools.MaxOutputBytes < 1024 || settings.Tools.MaxOutputBytes > 1048576 {
+		return fmt.Errorf("tools.max_output_bytes must be between 1024 and 1048576")
+	}
+	if settings.Tools.ReadMaxLines < 10 || settings.Tools.ReadMaxLines > 10000 {
+		return fmt.Errorf("tools.read_max_lines must be between 10 and 10000")
+	}
+	if settings.Tools.ReadLineMaxChars < 100 || settings.Tools.ReadLineMaxChars > 100000 {
+		return fmt.Errorf("tools.read_line_max_chars must be between 100 and 100000")
+	}
+	if settings.Tools.CommandTimeout < 5 || settings.Tools.CommandTimeout > 600 {
+		return fmt.Errorf("tools.command_timeout must be between 5 and 600")
+	}
+	if settings.Tools.MaxBackgroundProcesses < 1 || settings.Tools.MaxBackgroundProcesses > 50 {
+		return fmt.Errorf("tools.max_background_processes must be between 1 and 50")
 	}
 	return nil
 }

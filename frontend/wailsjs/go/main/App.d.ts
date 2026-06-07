@@ -29,6 +29,8 @@ export function ForkSession(arg1:number):Promise<void>;
 
 export function GenerateAPIKeyEnvName(arg1:string):Promise<string>;
 
+export function GetRuntimeConfig():Promise<agent.RuntimeConfigSettings>;
+
 export function ModelList():Promise<Array<agent.ModelListEntry>>;
 
 export function PermissionSuggest(arg1:string,arg2:string):Promise<Array<permission.Suggestion>>;
@@ -82,6 +84,8 @@ export function SetDefaultModel(arg1:string):Promise<void>;
 export function SetModelHidden(arg1:string,arg2:boolean):Promise<void>;
 
 export function SetProviderHidden(arg1:string,arg2:boolean):Promise<void>;
+
+export function SetRuntimeConfig(arg1:agent.RuntimeConfigSettings):Promise<void>;
 
 export function SnapshotList():Promise<Array<agent.Snapshot>>;
 

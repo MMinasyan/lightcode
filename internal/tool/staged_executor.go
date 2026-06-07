@@ -43,6 +43,8 @@ func NewStagedExecutorAtRoot(store SnapshotStore, tracker *FileTracker, cfg conf
 	}
 }
 
+func (e *StagedExecutor) SetToolsConfig(cfg config.ToolsConfig) { e.cfg = cfg }
+
 // ExecutePending applies staged calls in emission order, using a running
 // buffer per file and a single final disk write per changed file.
 func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall) []BatchResult {
