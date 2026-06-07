@@ -75,7 +75,8 @@ func main() {
 // buildAgent performs shared setup (dotenv, logging, config) and
 // constructs the Agent that all adapters share.
 func buildAgent() (*agent.Agent, error) {
-	if err := config.LoadDotEnv(); err != nil {
+	managedEnv, err := config.LoadDotEnv()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: .env: %v\n", err)
 	}
 
@@ -112,6 +113,7 @@ func buildAgent() (*agent.Agent, error) {
 		ConfigPath:  cfgPath,
 		ProjectRoot: projectRoot,
 		Home:        home,
+		Env:         managedEnv,
 	})
 }
 
