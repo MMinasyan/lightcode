@@ -202,6 +202,41 @@ func (a *App) CompleteModelEntry(ref string, completion ModelCompletion) error {
 	return a.svc.CompleteModelEntry(ref, completion)
 }
 
+// ProviderList returns provider setup status for Settings.
+func (a *App) ProviderList() []agent.ProviderStatus {
+	return a.svc.ProviderList()
+}
+
+// ConnectProvider connects an existing provider with an optional API key.
+func (a *App) ConnectProvider(providerID string, apiKey string) error {
+	return a.svc.ConnectProvider(providerID, apiKey)
+}
+
+// DiscoverCustomProvider runs one-shot discovery for an unsaved custom provider.
+func (a *App) DiscoverCustomProvider(req agent.CustomProviderRequest) ([]agent.DiscoveryModelCandidate, error) {
+	return a.svc.DiscoverCustomProvider(req)
+}
+
+// AddCustomProvider persists a custom provider and selected models.
+func (a *App) AddCustomProvider(req agent.CustomProviderRequest) error {
+	return a.svc.AddCustomProvider(req)
+}
+
+// DisconnectProvider removes a Lightcode-managed provider key.
+func (a *App) DisconnectProvider(providerID string) error {
+	return a.svc.DisconnectProvider(providerID)
+}
+
+// RemoveProvider deletes a custom provider entry.
+func (a *App) RemoveProvider(providerID string) error {
+	return a.svc.RemoveProvider(providerID)
+}
+
+// GenerateAPIKeyEnvName returns a unique env var name for a provider id.
+func (a *App) GenerateAPIKeyEnvName(providerID string) string {
+	return a.svc.GenerateAPIKeyEnvName(providerID)
+}
+
 // RevertCode restores files to their state at turn N.
 func (a *App) RevertCode(turn int) error {
 	return a.svc.RevertCode(turn)
