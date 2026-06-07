@@ -109,6 +109,7 @@ func buildAgent() (*agent.Agent, error) {
 
 	return agent.New(agent.Config{
 		Cfg:         cfg,
+		ConfigPath:  cfgPath,
 		ProjectRoot: projectRoot,
 		Home:        home,
 	})

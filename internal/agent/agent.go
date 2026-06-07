@@ -40,6 +40,7 @@ const tokensFileName = "tokens.json"
 // Config carries constructor parameters for New.
 type Config struct {
 	Cfg         *config.Config
+	ConfigPath  string // absolute path the config was loaded from; used for reloads and writes
 	ProjectRoot string
 	Home        string
 }
@@ -58,6 +59,7 @@ type Agent struct {
 
 	projectRoot string
 	home        string
+	configPath  string // resolved config path (env override or default)
 
 	currentRef        coremodel.ModelRef
 	contextWindowSize int
@@ -69,6 +71,9 @@ type Agent struct {
 	assembler              *prompt.Assembler
 	pendingPromptWarnings  []prompt.Warning
 	pendingCatalogWarnings []prompt.Warning
+	pendingSetupWarnings   []prompt.Warning
+
+	embedderDegraded bool // true when memory embedder failed to initialize
 
 	memoryStore *memory.Store
 	memoryHooks agentMemoryHooks
@@ -139,31 +144,13 @@ func (r agentUsageRecorder) RecordUsage(ev loop.Event) {
 // provider client, tool registry, permission gate, snapshot store,
 // and loop. Call Init after setting up the event handler.
 func New(c Config) (*Agent, error) {
-	modelCatalog, catalogWarnings, err := catalog.NewLoader(c.Home, nil).Load()
+	configPath := c.ConfigPath
+	if configPath == "" {
+		configPath = agentConfigPath(c.Home)
+	}
+	modelCatalog, catalogWarnings, err := catalog.NewLoaderWithConfigPath(c.Home, nil, configPath).Load()
 	if err != nil {
 		return nil, fmt.Errorf("load model catalog: %w", err)
-	}
-
-	defaultModelStr := c.Cfg.DefaultModel
-	if defaultModelStr == "" {
-		if ref, ok := autoSelectModel(modelCatalog); ok {
-			defaultModelStr = ref.String()
-		}
-	}
-
-	var defaultRef coremodel.ModelRef
-	var client *provider.Client
-	var defaultModel *catalog.Model
-
-	if defaultModelStr != "" {
-		defaultRef, err = coremodel.Parse(defaultModelStr)
-		if err != nil {
-			return nil, fmt.Errorf("default_model: %w", err)
-		}
-		client, defaultModel, err = newProviderClient(modelCatalog, defaultRef)
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	resolver, err := project.NewResolver(c.Home, c.ProjectRoot)
@@ -175,21 +162,15 @@ func New(c Config) (*Agent, error) {
 		return nil, fmt.Errorf("init snapshot store: %w", err)
 	}
 
-	var contextWindowSize int
-	if defaultModel != nil {
-		contextWindowSize = defaultModel.ContextWindow
-	}
-
 	a := &Agent{
-		cfg:               c.Cfg,
-		catalog:           modelCatalog,
-		store:             store,
-		projects:          resolver,
-		projectRoot:       c.ProjectRoot,
-		home:              c.Home,
-		currentRef:        defaultRef,
-		contextWindowSize: contextWindowSize,
-		warningGroups:     make(map[string][]PromptWarning),
+		cfg:           c.Cfg,
+		catalog:       modelCatalog,
+		store:         store,
+		projects:      resolver,
+		projectRoot:   c.ProjectRoot,
+		home:          c.Home,
+		configPath:    configPath,
+		warningGroups: make(map[string][]PromptWarning),
 	}
 	a.rt = newRuntime(a, runtimeOptions{WorkspaceRoot: c.ProjectRoot})
 	rt := a.ensureRuntime()
@@ -307,7 +288,9 @@ func New(c Config) (*Agent, error) {
 
 	embedder, err := memory.NewEmbedder(c.Home)
 	if err != nil {
-		return nil, fmt.Errorf("init embedder: %w", err)
+		// Embedder failure is non-fatal: semantic memory search will be disabled.
+		a.embedderDegraded = true
+		embedder = nil
 	}
 	memStore := memory.NewStore(embedder, resolver.Root(), c.Home)
 	a.memoryStore = memStore
@@ -344,8 +327,8 @@ func New(c Config) (*Agent, error) {
 		MaxConcurrent: c.Cfg.Subagents.MaxConcurrent,
 		TaggedEvents:  taggedEvts,
 		ModelCatalog:  modelCatalog,
-		ProviderName:  defaultRef.Provider,
-		Model:         defaultRef.Model,
+		ProviderName:  "",
+		Model:         "",
 		SubModel:      subModel,
 		ToolsConfig:   c.Cfg.Tools,
 		HomeDir:       c.Home,
@@ -373,7 +356,7 @@ func New(c Config) (*Agent, error) {
 	a.pendingPromptWarnings = res.Warnings
 	a.pendingCatalogWarnings = catalogWarningsToPromptWarnings(catalogWarnings)
 
-	l := loop.New(provider.NewAdapter(client), registry, res.Prompt)
+	l := loop.New(nil, registry, res.Prompt)
 	l.SetEvents(events)
 	l.SetStore(store)
 	l.SetContextTransformer(a)
@@ -444,6 +427,9 @@ func (rt *runtime) init(ctx context.Context) {
 	a.pendingPromptWarnings = nil
 	a.setWarningGroup("catalog", a.pendingCatalogWarnings)
 	a.pendingCatalogWarnings = nil
+	a.ensureRuntime().mu.Lock()
+	a.setWarningGroup("setup", a.setupWarningsLocked())
+	a.ensureRuntime().mu.Unlock()
 }
 
 func (a *Agent) emitEvent(ev Event) {
@@ -551,7 +537,7 @@ func (a *Agent) CurrentWarnings() []PromptWarning {
 
 func (a *Agent) warningSnapshotLocked() []PromptWarning {
 	var out []PromptWarning
-	for _, group := range []string{"prompt", "catalog", "lsp", "protocol"} {
+	for _, group := range []string{"setup", "prompt", "catalog", "lsp", "protocol"} {
 		out = append(out, a.warningGroups[group]...)
 	}
 	return out
@@ -1411,8 +1397,10 @@ func (a *Agent) ensureSession() error {
 	if err := a.store.BeginNewSession(a.projectRoot); err != nil {
 		return err
 	}
-	if err := a.store.SetModel(a.currentRef.Provider, a.currentRef.Model); err != nil {
-		fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)
+	if a.currentRef.Provider != "" && a.currentRef.Model != "" {
+		if err := a.store.SetModel(a.currentRef.Provider, a.currentRef.Model); err != nil {
+			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)
+		}
 	}
 	a.lp.ResetHistory()
 	if a.fileTracker != nil {
@@ -1516,6 +1504,8 @@ func (rt *runtime) claimTurnLocked(ctx context.Context) (context.Context, contex
 	if err := a.ensureSession(); err != nil {
 		return nil, nil, err
 	}
+	a.ensureActiveModelLocked()
+	a.setWarningGroup("setup", a.setupWarningsLocked())
 	rt.busy = true
 	rt.seenSessions = nil
 	turnCtx, cancel := context.WithCancel(ctx)
@@ -1665,8 +1655,14 @@ func (rt *runtime) launchTurn(ctx context.Context, turnCtx context.Context, canc
 
 	a.emitEvent(Event{Kind: EventTurnStart, Turn: turn})
 
+	rt.mu.Lock()
+	a.ensureActiveModelLocked()
+	a.setWarningGroup("setup", a.setupWarningsLocked())
+	currentRef := a.currentRef
+	rt.mu.Unlock()
+
 	if a.taskToolInst != nil {
-		a.taskToolInst.updateParentState(a.currentRef.Provider, a.currentRef.Model, cancel)
+		a.taskToolInst.updateParentState(currentRef.Provider, currentRef.Model, cancel)
 	}
 
 	go func() {
@@ -1830,25 +1826,13 @@ func (a *Agent) Reload() error {
 }
 
 func (a *Agent) reloadLocked() error {
-	cfg, err := config.Load(agentConfigPath(a.home))
+	cfg, err := config.Load(a.configPath)
 	if err != nil {
 		return err
 	}
-	modelCatalog, catalogWarnings, err := catalog.NewLoader(a.home, nil).Load()
+	modelCatalog, catalogWarnings, err := catalog.NewLoaderWithConfigPath(a.home, nil, a.configPath).Load()
 	if err != nil {
 		return fmt.Errorf("load model catalog: %w", err)
-	}
-
-	ref := a.currentRef
-	if _, _, err := modelCatalog.Lookup(ref); err != nil {
-		ref, err = coremodel.Parse(cfg.DefaultModel)
-		if err != nil {
-			return fmt.Errorf("default_model: %w", err)
-		}
-	}
-	client, model, err := newProviderClient(modelCatalog, ref)
-	if err != nil {
-		return err
 	}
 
 	a.cfg = cfg
@@ -1857,10 +1841,14 @@ func (a *Agent) reloadLocked() error {
 		a.taskToolInst.setCatalog(modelCatalog)
 		a.taskToolInst.setSubModel(cfg.Subagents.Model)
 	}
-	a.lp.SetClient(provider.NewAdapter(client))
-	a.currentRef = ref
-	a.contextWindowSize = model.ContextWindow
+	if !a.modelRefConnected(a.currentRef) {
+		a.currentRef = coremodel.ModelRef{}
+		a.contextWindowSize = 0
+		a.lp.SetClient(nil)
+	}
+	a.ensureActiveModelLocked()
 	a.setWarningGroup("catalog", catalogWarningsToPromptWarnings(catalogWarnings))
+	a.setWarningGroup("setup", a.setupWarningsLocked())
 	return nil
 }
 
@@ -1936,7 +1924,7 @@ func writeAgentConfigAtomic(path string, value any) error {
 // provider map, calls mutate, and writes the config atomically.
 // Caller must hold the runtime mutex.
 func (a *Agent) mutateProviderConfig(providerID string, mutate func(providerMap map[string]any) error) error {
-	path := agentConfigPath(a.home)
+	path := a.configPath
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -2003,7 +1991,7 @@ func (a *Agent) RefreshDiscovery(provider string) error {
 }
 
 func (a *Agent) refreshDiscoveryLocked(provider string) error {
-	_, warnings := catalog.RefreshProviderDiscovery(context.Background(), a.home, a.catalog, provider)
+	_, warnings := catalog.RefreshProviderDiscoveryWithConfigPath(context.Background(), a.home, a.configPath, a.catalog, provider)
 	if len(warnings) == 0 {
 		return nil
 	}
@@ -2015,6 +2003,8 @@ func (a *Agent) refreshDiscoveryLocked(provider string) error {
 func (a *Agent) CurrentModel() ModelInfo {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
+	a.ensureActiveModelLocked()
+	a.setWarningGroup("setup", a.setupWarningsLocked())
 	return a.modelInfo(a.currentRef)
 }
 
@@ -3104,13 +3094,113 @@ func (a *snapshotDiagAdapter) ListTurns() ([]tool.DiagTurnEntry, error) {
 	return out, nil
 }
 
-func autoSelectModel(cat *catalog.Catalog) (coremodel.ModelRef, bool) {
-	refs := cat.VisibleModels()
-	if len(refs) == 0 {
-		refs = cat.AllModels()
+// providerConnected reports whether the catalog has at least one connected provider.
+// It is a runtime predicate — there is no stored connection flag.
+func (a *Agent) providerConnected() bool {
+	if a.catalog == nil {
+		return false
 	}
-	if len(refs) == 0 {
-		return coremodel.ModelRef{}, false
+	for _, prov := range a.catalog.Providers {
+		if providerConnected(prov) {
+			return true
+		}
 	}
-	return refs[0], true
+	return false
+}
+
+func providerConnected(prov *catalog.Provider) bool {
+	if prov == nil || !providerHasUsableModel(prov) {
+		return false
+	}
+	if prov.Transport.APIKeyEnv != "" {
+		return os.Getenv(prov.Transport.APIKeyEnv) != ""
+	}
+	return prov.Transport.BaseURL != ""
+}
+
+func providerHasUsableModel(prov *catalog.Provider) bool {
+	if prov == nil {
+		return false
+	}
+	for _, model := range prov.Models {
+		if model != nil && model.ContextWindow > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Agent) modelRefConnected(ref coremodel.ModelRef) bool {
+	if a.catalog == nil || ref.Provider == "" || ref.Model == "" {
+		return false
+	}
+	prov, model, err := a.catalog.Lookup(ref)
+	if err != nil || model == nil || model.ContextWindow <= 0 {
+		return false
+	}
+	return providerConnected(prov)
+}
+
+// ensureActiveModelLocked resolves the active model lazily from cfg.DefaultModel
+// only if the default provider is connected. Caller must hold the runtime mutex.
+// If no active model can be resolved, it leaves currentRef empty and returns false.
+func (a *Agent) ensureActiveModelLocked() bool {
+	if a.modelRefConnected(a.currentRef) {
+		return true
+	}
+	a.currentRef = coremodel.ModelRef{}
+	a.contextWindowSize = 0
+	if a.lp != nil {
+		a.lp.SetClient(nil)
+	}
+	if a.cfg == nil || a.cfg.DefaultModel == "" {
+		return false
+	}
+	ref, err := coremodel.Parse(a.cfg.DefaultModel)
+	if err != nil || !a.modelRefConnected(ref) {
+		return false
+	}
+	client, model, err := newProviderClient(a.catalog, ref)
+	if err != nil {
+		return false
+	}
+	a.currentRef = ref
+	a.contextWindowSize = model.ContextWindow
+	if a.lp != nil {
+		a.lp.SetClient(provider.NewAdapter(client))
+	}
+	return true
+}
+
+// setupWarningsLocked returns the current setup-state warnings based on runtime state.
+// Caller must hold the runtime mutex if concurrent mutation is possible.
+func (a *Agent) setupWarningsLocked() []prompt.Warning {
+	var out []prompt.Warning
+	if !a.providerConnected() {
+		out = append(out, prompt.Warning{
+			Kind:    "setup_no_provider",
+			Message: "No provider connected — configure a provider with credentials and at least one usable model.",
+		})
+	}
+	if a.cfg == nil || a.cfg.DefaultModel == "" {
+		out = append(out, prompt.Warning{
+			Kind:    "setup_no_default_model",
+			Message: "No default model configured — choose a default model in Settings.",
+		})
+	} else {
+		ref, err := coremodel.Parse(a.cfg.DefaultModel)
+		if err != nil || !a.modelRefConnected(ref) {
+			out = append(out, prompt.Warning{
+				Kind:    "setup_default_model_unavailable",
+				Message: fmt.Sprintf("Default model %q is unavailable because its provider is not connected or the model is incomplete.", a.cfg.DefaultModel),
+			})
+		}
+	}
+	if a.embedderDegraded {
+		out = append(out, prompt.Warning{
+			Kind:    "setup_embedder_degraded",
+			Message: "Memory embedder failed to initialize; semantic memory search is disabled.",
+		})
+	}
+	return out
 }

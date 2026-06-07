@@ -15,6 +15,12 @@ const discoveryFetchTimeout = 10 * time.Second
 // the in-memory catalog, and writes the discovery cache. Discovery failures are
 // returned as warnings so callers can continue startup.
 func RefreshProviderDiscovery(ctx context.Context, home string, cat *Catalog, providerID string) (bool, []Warning) {
+	return RefreshProviderDiscoveryWithConfigPath(ctx, home, "", cat, providerID)
+}
+
+// RefreshProviderDiscoveryWithConfigPath is RefreshProviderDiscovery with an
+// explicit config path for preserving user-owned cost fields during merges.
+func RefreshProviderDiscoveryWithConfigPath(ctx context.Context, home, configPath string, cat *Catalog, providerID string) (bool, []Warning) {
 	provider := catalogProvider(cat, providerID)
 	if provider == nil {
 		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("unknown provider %q", providerID)}}
@@ -48,7 +54,7 @@ func RefreshProviderDiscovery(ctx context.Context, home string, cat *Catalog, pr
 	if err := WriteDiscoveryCache(home, providerID, discovered, now); err != nil {
 		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)}}
 	}
-	protected := userCostProtectionForProvider(home, providerID)
+	protected := userCostProtectionForProviderAt(home, configPath, providerID)
 	if err := cat.MergeDiscoveredProviderWithCostProtection(providerID, discovered, protected); err != nil {
 		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: err.Error()}}
 	}
@@ -56,7 +62,11 @@ func RefreshProviderDiscovery(ctx context.Context, home string, cat *Catalog, pr
 }
 
 func userCostProtectionForProvider(home, providerID string) map[string]map[string]bool {
-	userRaw, _ := readUserConfigProviders(home)
+	return userCostProtectionForProviderAt(home, "", providerID)
+}
+
+func userCostProtectionForProviderAt(home, configPath, providerID string) map[string]map[string]bool {
+	userRaw, _ := readUserConfigProvidersAt(home, configPath)
 	providerRaw, _ := userRaw[providerID].(map[string]any)
 	if providerRaw == nil {
 		return nil
