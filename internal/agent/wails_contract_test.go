@@ -190,6 +190,20 @@ func TestWailsBindingsCoverExportedAppMethods(t *testing.T) {
 	}
 }
 
+func TestFrontendNoActiveModelSendGate(t *testing.T) {
+	app := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	input := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "components", "InputArea.svelte"))
+	if !strings.Contains(app, "hasActiveModel={!!modelRef}") {
+		t.Fatalf("App.svelte must pass active-model state into InputArea")
+	}
+	if !strings.Contains(app, "Connect a provider or pick a model before sending.") {
+		t.Fatalf("handleSubmit must gate sends when no active model is available")
+	}
+	if !strings.Contains(input, "Connect a provider or pick a model") || !strings.Contains(input, "!hasActiveModel") {
+		t.Fatalf("InputArea must surface and disable the no-active-model send state")
+	}
+}
+
 func TestWailsLifecycleSurfaceContract(t *testing.T) {
 	binding := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "wailsjs", "go", "main", "App.d.ts"))
 	required := []string{
@@ -203,6 +217,7 @@ func TestWailsLifecycleSurfaceContract(t *testing.T) {
 		"export function ApplyTurnAction(arg1:number,arg2:string,arg3:boolean):Promise<agent.TurnActionResult>;",
 		"export function TokenUsage():Promise<agent.TokenReport>;",
 		"export function CurrentWarnings():Promise<Array<agent.PromptWarning>>;",
+		"export function SetDefaultModel(arg1:string):Promise<void>;",
 	}
 	for _, want := range required {
 		if !strings.Contains(binding, want) {

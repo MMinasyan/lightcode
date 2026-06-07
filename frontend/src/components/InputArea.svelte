@@ -2,6 +2,7 @@
   import { Cancel } from '../../wailsjs/go/main/App';
   import { createEventDispatcher } from 'svelte';
   export let busy = false;
+  export let hasActiveModel = true;
   const dispatch = createEventDispatcher();
   let text = '';
   let textarea;
@@ -13,7 +14,7 @@
 
   function submit() {
     const t = text.trim();
-    if (!t) return;
+    if (!t || !hasActiveModel) return;
     dispatch('submit', t);
     text = '';
     if (textarea) textarea.style.height = 'auto';
@@ -36,13 +37,13 @@
 <div class="input-area">
   <div class="input-row">
     <textarea bind:this={textarea} bind:value={text} on:keydown={handleKeydown} on:input={autoResize}
-      placeholder={busy ? 'Queue a message...' : 'Type your message...'} rows="1"></textarea>
+      placeholder={busy ? 'Queue a message...' : (hasActiveModel ? 'Type your message...' : 'Connect a provider or pick a model...')} rows="1"></textarea>
     {#if busy && !text.trim()}
       <button class="icon-btn cancel" on:click={cancel} title="Stop (Esc)">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
       </button>
     {:else}
-      <button class="icon-btn send" on:click={submit} disabled={!text.trim()} title={busy ? 'Queue message (Enter)' : 'Send (Enter)'}>
+      <button class="icon-btn send" on:click={submit} disabled={!text.trim() || !hasActiveModel} title={!hasActiveModel ? 'Connect a provider or pick a model' : (busy ? 'Queue message (Enter)' : 'Send (Enter)')}>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
       </button>
     {/if}

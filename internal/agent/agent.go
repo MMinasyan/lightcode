@@ -2051,6 +2051,7 @@ func (a *Agent) modelListFrom(refs []catalog.ModelRef) []ModelListEntry {
 			Hidden:         model.Hidden || prov.Hidden,
 			ProviderHidden: prov.Hidden,
 			Incomplete:     incomplete,
+			Default:        ref.String() == a.cfg.DefaultModel,
 		})
 	}
 	return result
@@ -2108,6 +2109,40 @@ func (a *Agent) SetProviderHidden(providerID string, hidden bool) error {
 	if prov := a.catalog.Providers[providerID]; prov != nil {
 		prov.Hidden = hidden
 	}
+	return nil
+}
+
+func (a *Agent) SetDefaultModel(refStr string) error {
+	ref, err := coremodel.Parse(refStr)
+	if err != nil {
+		return err
+	}
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	if a.ensureRuntime().busy {
+		return fmt.Errorf("cannot set default model while a turn is running")
+	}
+	if _, _, err := a.catalog.LookupOrIncomplete(ref); err != nil {
+		return err
+	}
+	path := a.configPath
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("parse config %s: %w", path, err)
+	}
+	root["default_model"] = refStr
+	if err := writeAgentConfigAtomic(path, root); err != nil {
+		return err
+	}
+	a.cfg.DefaultModel = refStr
+	if a.currentRef.Provider == "" && a.currentRef.Model == "" {
+		a.ensureActiveModelLocked()
+	}
+	a.setWarningGroup("setup", a.setupWarningsLocked())
 	return nil
 }
 

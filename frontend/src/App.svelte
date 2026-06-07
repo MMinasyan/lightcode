@@ -316,6 +316,11 @@
 
   async function handleSubmit(e) {
     const content = e.detail;
+    if (!modelRef) {
+      showError("Connect a provider or pick a model before sending.");
+      inputArea?.prefill(content);
+      return;
+    }
     try {
       const r = await Submit(content);
       if (r?.started) {
@@ -336,6 +341,13 @@
 
   function handleManageSettings() { showModelSelector = false; settingsSection = 'models'; showSettings = true; }
   function handleModelSwitched(e) { modelRef = e.detail.ref; modelName = e.detail.displayName || e.detail.ref; showModelSelector = false; }
+  async function refreshCurrentModel() {
+    try {
+      const r = await CurrentModel();
+      modelRef = r.ref || ((r.provider && r.model) ? `${r.provider}/${r.model}` : '');
+      modelName = r.displayName || modelRef;
+    } catch (e) { showError(e, 'Load model failed'); }
+  }
 
   async function handleRevertCode(e) {
     const { turn } = e.detail;
@@ -394,7 +406,7 @@
       {/if}
     {/if}
   </div>
-  <InputArea bind:this={inputArea} busy={busy || compacting} on:submit={handleSubmit} on:error={(e) => showError(e.detail)}>
+  <InputArea bind:this={inputArea} busy={busy || compacting} hasActiveModel={!!modelRef} on:submit={handleSubmit} on:error={(e) => showError(e.detail)}>
     <StatusBar {modelName} on:openModelSelector={() => showModelSelector=true} />
   </InputArea>
   {#if showModelSelector}
@@ -414,7 +426,7 @@
     <ProjectSelector on:close={() => showProjectSelector=false} on:error={(e) => showError(e.detail)} />
   {/if}
   {#if showSettings}
-    <Settings initialSection={settingsSection} on:close={() => showSettings=false} on:error={(e) => showError(e.detail)} />
+    <Settings initialSection={settingsSection} on:close={() => { showSettings=false; refreshCurrentModel(); }} on:error={(e) => showError(e.detail)} />
   {/if}
   {#if showWarnings}
     <WarningDetails {warnings} on:close={() => showWarnings=false} />

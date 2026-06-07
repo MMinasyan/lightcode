@@ -301,6 +301,7 @@ export namespace agent {
 	    hidden: boolean;
 	    providerHidden: boolean;
 	    incomplete: boolean;
+	    default: boolean;
 
 	    static createFrom(source: any = {}) {
 	        return new ModelListEntry(source);
@@ -318,6 +319,7 @@ export namespace agent {
 	        this.hidden = source["hidden"];
 	        this.providerHidden = source["providerHidden"];
 	        this.incomplete = source["incomplete"];
+	        this.default = source["default"];
 	    }
 
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

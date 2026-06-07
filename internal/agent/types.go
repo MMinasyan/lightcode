@@ -118,6 +118,7 @@ type ModelListEntry struct {
 	Hidden         bool          `json:"hidden"`
 	ProviderHidden bool          `json:"providerHidden"`
 	Incomplete     bool          `json:"incomplete"`
+	Default        bool          `json:"default"`
 }
 
 const (

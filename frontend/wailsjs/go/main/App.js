@@ -150,6 +150,10 @@ export function SessionSwitch(arg1) {
   return window['go']['main']['App']['SessionSwitch'](arg1);
 }
 
+export function SetDefaultModel(arg1) {
+  return window['go']['main']['App']['SetDefaultModel'](arg1);
+}
+
 export function SetModelHidden(arg1, arg2) {
   return window['go']['main']['App']['SetModelHidden'](arg1, arg2);
 }

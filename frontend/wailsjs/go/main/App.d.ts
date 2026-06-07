@@ -77,6 +77,8 @@ export function SessionNew():Promise<void>;
 
 export function SessionSwitch(arg1:string):Promise<void>;
 
+export function SetDefaultModel(arg1:string):Promise<void>;
+
 export function SetModelHidden(arg1:string,arg2:boolean):Promise<void>;
 
 export function SetProviderHidden(arg1:string,arg2:boolean):Promise<void>;
