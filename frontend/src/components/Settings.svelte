@@ -12,6 +12,7 @@
     GenerateAPIKeyEnvName,
     ProviderList,
     RemoveProvider,
+    SetDefaultModel,
     SetModelHidden,
     SetProviderHidden,
   } from '../../wailsjs/go/main/App';
@@ -116,6 +117,13 @@
     const hidden = !e.target.checked;
     try {
       await SetProviderHidden(group.provider, hidden);
+      await refreshModels();
+    } catch (err) { dispatch('error', errorText(err)); }
+  }
+
+  async function setDefaultModel(entry) {
+    try {
+      await SetDefaultModel(entry.ref);
       await refreshModels();
     } catch (err) { dispatch('error', errorText(err)); }
   }
@@ -363,13 +371,19 @@
                 </span>
               </label>
               {#each group.models as entry (entry.ref)}
-                <label class="option model-row" class:dimmed={group.providerHidden}>
-                  <span>{modelDisplayName(entry)}</span>
-                  <span class="switch">
-                    <input type="checkbox" checked={!entry.hidden} disabled={group.providerHidden} on:change={(e) => toggleModel(entry, e)} />
-                    <span class="track"><span class="thumb"></span></span>
+                <div class="option model-row" class:dimmed={group.providerHidden}>
+                  <span>
+                    {modelDisplayName(entry)}
+                    {#if entry.default}<small class="default-tag">Default</small>{/if}
                   </span>
-                </label>
+                  <span class="model-actions">
+                    <button class="btn compact" type="button" disabled={entry.default} on:click={() => setDefaultModel(entry)}>Set default</button>
+                    <span class="switch">
+                      <input type="checkbox" checked={!entry.hidden} disabled={group.providerHidden} on:change={(e) => toggleModel(entry, e)} />
+                      <span class="track"><span class="thumb"></span></span>
+                    </span>
+                  </span>
+                </div>
               {/each}
             </div>
           {/each}
@@ -514,6 +528,9 @@
   .provider-row { color:var(--text); font-weight:600; border-top:1px solid var(--border); }
   .model-row { padding-left:16px; }
   .model-row.dimmed { opacity:.4; }
+  .model-actions { display:inline-flex; align-items:center; gap:8px; }
+  .btn.compact { padding:2px 8px; }
+  .default-tag { color:var(--accent); margin-left:8px; font-size:11px; }
   .switch { position:relative; display:inline-block; width:32px; height:18px; flex-shrink:0; }
   .switch input { position:absolute; inset:0; opacity:0; cursor:pointer; margin:0; }
   .switch .track { position:absolute; inset:0; background:var(--bg-input); border:1px solid var(--border-button); border-radius:999px; transition:background .15s, border-color .15s; }

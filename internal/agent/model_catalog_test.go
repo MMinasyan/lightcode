@@ -169,6 +169,71 @@ func TestAgentSetupWarningsForUnconfiguredStartup(t *testing.T) {
 	}
 }
 
+func TestAgentSetDefaultModelWritesConfigAndUpdatesWarnings(t *testing.T) {
+	t.Setenv("LIGHTCODE_SET_DEFAULT_KEY", "test-key")
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	configPath := filepath.Join(home, ".lightcode", "config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{
+  "providers": {
+    "test": {
+      "name": "Test Provider",
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_SET_DEFAULT_KEY" },
+      "discovery": false,
+      "models": { "test-model": { "name": "Test Model", "context_window": 8192 } }
+    }
+  },
+  "default_model": ""
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.Init(ctx)
+	if !hasWarningKind(a.CurrentWarnings(), "setup_no_default_model") {
+		t.Fatalf("warnings before SetDefaultModel = %#v, want setup_no_default_model", a.CurrentWarnings())
+	}
+	if err := a.SetDefaultModel("test/test-model"); err != nil {
+		t.Fatalf("SetDefaultModel returned error: %v", err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"default_model": "test/test-model"`) {
+		t.Fatalf("config after SetDefaultModel = %s, want default_model", data)
+	}
+	if hasWarningKind(a.CurrentWarnings(), "setup_no_default_model") {
+		t.Fatalf("warnings after SetDefaultModel = %#v, did not expect setup_no_default_model", a.CurrentWarnings())
+	}
+	entries := a.AllModelList()
+	if len(entries) != 1 || entries[0].Ref != "test/test-model" || !entries[0].Default {
+		t.Fatalf("AllModelList after SetDefaultModel = %#v, want default flag on test/test-model", entries)
+	}
+	cur := a.CurrentModel()
+	if cur.Ref != "test/test-model" {
+		t.Fatalf("CurrentModel after SetDefaultModel = %#v, want lazy default activation", cur)
+	}
+}
+
+func TestAgentSetDefaultModelRejectsInvalidRef(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	if err := a.SetDefaultModel("not-a-ref"); err == nil {
+		t.Fatal("SetDefaultModel returned nil for invalid ref")
+	}
+}
+
 func TestAgentUsesConfiguredConfigPathForWrites(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := t.TempDir()
