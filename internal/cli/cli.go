@@ -136,12 +136,12 @@ func (c *CLI) Run(ctx context.Context) error {
 					} else {
 						_ = term.Restore(rawFd, oldState)
 						fmt.Fprint(os.Stdout, "\r\n\x1b[?25h")
-						os.Exit(130)
+						c.exit(130)
 					}
 				case syscall.SIGTERM:
 					_ = term.Restore(rawFd, oldState)
 					fmt.Fprint(os.Stdout, "\r\n\x1b[?25h")
-					os.Exit(130)
+					c.exit(130)
 				}
 			case <-ctx.Done():
 				return
@@ -350,7 +350,7 @@ func (c *CLI) handleKeyIdle(k keyMsg) {
 
 	case keyCtrlC, keyCtrlD:
 		c.restoreTerminal()
-		os.Exit(0)
+		c.exit(0)
 	}
 }
 
@@ -1206,7 +1206,7 @@ func (c *CLI) dispatchCommand(text string) {
 		c.cmdCopy()
 	case "/exit":
 		c.restoreTerminal()
-		os.Exit(0)
+		c.exit(0)
 	default:
 		c.printLine(renderErrorMsg(fmt.Sprintf("unknown command: %s", cmd)))
 	}
@@ -1384,6 +1384,18 @@ func (c *CLI) restoreTerminal() {
 		c.oldState = nil
 	}
 	c.writeRaw("\x1b[?25h")
+}
+
+// exit restores the terminal, closes the agent, and terminates the process
+// with the given exit code. Every CLI exit path (signals, /exit, idle
+// Ctrl-C/Ctrl-D) routes through this helper so the agent's process-wide
+// resources are released before the process terminates.
+func (c *CLI) exit(code int) {
+	c.restoreTerminal()
+	if err := c.agent.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "lightcode: shutdown: %v\n", err)
+	}
+	os.Exit(code)
 }
 
 func (c *CLI) startAnimation(label string) {

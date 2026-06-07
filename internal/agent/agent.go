@@ -86,6 +86,9 @@ type Agent struct {
 	warningsMu      sync.Mutex
 	warningGroups   map[string][]PromptWarning
 	warningSnapshot []PromptWarning
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 type agentSignalSink interface {
@@ -302,7 +305,7 @@ func New(c Config) (*Agent, error) {
 	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(procMgr), checkPolicy, askPolicy))
 	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkPolicy, askPolicy))
 
-	embedder, err := memory.NewEmbedder()
+	embedder, err := memory.NewEmbedder(c.Home)
 	if err != nil {
 		return nil, fmt.Errorf("init embedder: %w", err)
 	}
@@ -2174,6 +2177,32 @@ func (a *Agent) cancelAndWaitIdle() error {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return fmt.Errorf("timed out waiting for current turn to end")
+}
+
+// Close releases the agent's process-wide resources (snapshot store, memory
+// store / embedder, background processes, LSP servers). It is idempotent and
+// safe to call from adapter shutdown hooks and CLI signal handlers.
+func (a *Agent) Close() error {
+	a.closeOnce.Do(func() {
+		if err := a.cancelAndWaitIdle(); err != nil {
+			a.closeErr = err
+		}
+		if a.store != nil && a.store.Active() {
+			if _, err := a.store.Close(); err != nil && a.closeErr == nil {
+				a.closeErr = err
+			}
+		}
+		if a.memoryStore != nil {
+			a.memoryStore.Close()
+		}
+		if a.procMgr != nil {
+			a.procMgr.KillAll()
+		}
+		if a.lspManager != nil {
+			a.lspManager.ShutdownAll()
+		}
+	})
+	return a.closeErr
 }
 
 // CloseForProjectSwitch cancels any active turn, closes the current session, and

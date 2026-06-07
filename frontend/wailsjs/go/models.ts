@@ -1,16 +1,16 @@
 export namespace agent {
-
+	
 	export class BackgroundProcessDisplay {
 	    id: string;
 	    command: string;
 	    reason: string;
 	    exitCode: number;
 	    output: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new BackgroundProcessDisplay(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -23,11 +23,11 @@ export namespace agent {
 	export class SubagentSessionLink {
 	    index: number;
 	    sessionId: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new SubagentSessionLink(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.index = source["index"];
@@ -47,11 +47,11 @@ export namespace agent {
 	    metadata?: Record<string, any>;
 	    subagentSessionIds?: SubagentSessionLink[];
 	    backgroundProcess?: BackgroundProcessDisplay;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new DisplayMessage(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.type = source["type"];
@@ -67,7 +67,7 @@ export namespace agent {
 	        this.subagentSessionIds = this.convertValues(source["subagentSessionIds"], SubagentSessionLink);
 	        this.backgroundProcess = this.convertValues(source["backgroundProcess"], BackgroundProcessDisplay);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -89,11 +89,11 @@ export namespace agent {
 	export class ModelCompletion {
 	    context_window: number;
 	    max_output_tokens: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ModelCompletion(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.context_window = source["context_window"];
@@ -108,11 +108,11 @@ export namespace agent {
 	    contextWindow: number;
 	    cost?: catalog.Cost;
 	    incomplete: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ModelInfo(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ref = source["ref"];
@@ -123,7 +123,7 @@ export namespace agent {
 	        this.cost = this.convertValues(source["cost"], catalog.Cost);
 	        this.incomplete = source["incomplete"];
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -153,11 +153,11 @@ export namespace agent {
 	    hidden: boolean;
 	    providerHidden: boolean;
 	    incomplete: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ModelListEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ref = source["ref"];
@@ -171,7 +171,7 @@ export namespace agent {
 	        this.providerHidden = source["providerHidden"];
 	        this.incomplete = source["incomplete"];
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -196,11 +196,11 @@ export namespace agent {
 	    path: string;
 	    createdAt: string;
 	    lastActivity: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ProjectSummary(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -213,11 +213,11 @@ export namespace agent {
 	export class PromptWarning {
 	    kind: string;
 	    message: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new PromptWarning(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.kind = source["kind"];
@@ -227,11 +227,11 @@ export namespace agent {
 	export class QueuedItem {
 	    id: string;
 	    content: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new QueuedItem(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -241,17 +241,17 @@ export namespace agent {
 	export class QueueState {
 	    items: QueuedItem[];
 	    version: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new QueueState(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.items = this.convertValues(source["items"], QueuedItem);
 	        this.version = source["version"];
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -270,7 +270,7 @@ export namespace agent {
 		    return a;
 		}
 	}
-
+	
 	export class SessionSummary {
 	    id: string;
 	    createdAt: string;
@@ -279,11 +279,11 @@ export namespace agent {
 	    archivedAt: number;
 	    projectPath: string;
 	    parentSessionId?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new SessionSummary(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -298,11 +298,11 @@ export namespace agent {
 	export class SnapshotFile {
 	    path: string;
 	    existed: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new SnapshotFile(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.path = source["path"];
@@ -312,17 +312,17 @@ export namespace agent {
 	export class Snapshot {
 	    turn: number;
 	    files: SnapshotFile[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new Snapshot(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.turn = source["turn"];
 	        this.files = this.convertValues(source["files"], SnapshotFile);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -341,17 +341,18 @@ export namespace agent {
 		    return a;
 		}
 	}
-
+	
+	
 	export class SubmitResult {
 	    started: boolean;
 	    turn?: number;
 	    queue: QueuedItem[];
 	    version: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new SubmitResult(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.started = source["started"];
@@ -359,7 +360,7 @@ export namespace agent {
 	        this.queue = this.convertValues(source["queue"], QueuedItem);
 	        this.version = source["version"];
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -385,11 +386,11 @@ export namespace agent {
 	    input: number;
 	    output: number;
 	    known: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new TokenEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.provider = source["provider"];
@@ -405,11 +406,11 @@ export namespace agent {
 	    perModel: TokenEntry[];
 	    contextUsed: number;
 	    contextWindow: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new TokenReport(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.total = this.convertValues(source["total"], TokenEntry);
@@ -417,7 +418,7 @@ export namespace agent {
 	        this.contextUsed = source["contextUsed"];
 	        this.contextWindow = source["contextWindow"];
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -445,11 +446,11 @@ export namespace agent {
 	    session: SessionSummary;
 	    messages?: DisplayMessage[];
 	    tokens: TokenReport;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new TurnActionResult(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.action = source["action"];
@@ -461,7 +462,7 @@ export namespace agent {
 	        this.messages = this.convertValues(source["messages"], DisplayMessage);
 	        this.tokens = this.convertValues(source["tokens"], TokenReport);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -484,17 +485,17 @@ export namespace agent {
 }
 
 export namespace catalog {
-
+	
 	export class Cost {
 	    input?: number;
 	    output?: number;
 	    cache_read?: number;
 	    cache_write?: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new Cost(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.input = source["input"];
@@ -507,15 +508,15 @@ export namespace catalog {
 }
 
 export namespace permission {
-
+	
 	export class Suggestion {
 	    rule: string;
 	    label: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new Suggestion(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.rule = source["rule"];
@@ -524,3 +525,4 @@ export namespace permission {
 	}
 
 }
+
