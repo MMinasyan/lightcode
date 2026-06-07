@@ -148,7 +148,11 @@ func New(c Config) (*Agent, error) {
 	if configPath == "" {
 		configPath = agentConfigPath(c.Home)
 	}
-	modelCatalog, catalogWarnings, err := catalog.NewLoaderWithConfigPath(c.Home, nil, configPath).Load()
+	modelLoader := catalog.NewLoaderWithConfigPath(c.Home, nil, configPath)
+	modelLoader.AllowRefresh = func(_ string, prov *catalog.Provider) bool {
+		return providerConnected(prov)
+	}
+	modelCatalog, catalogWarnings, err := modelLoader.Load()
 	if err != nil {
 		return nil, fmt.Errorf("load model catalog: %w", err)
 	}
@@ -1830,7 +1834,11 @@ func (a *Agent) reloadLocked() error {
 	if err != nil {
 		return err
 	}
-	modelCatalog, catalogWarnings, err := catalog.NewLoaderWithConfigPath(a.home, nil, a.configPath).Load()
+	modelLoader := catalog.NewLoaderWithConfigPath(a.home, nil, a.configPath)
+	modelLoader.AllowRefresh = func(_ string, prov *catalog.Provider) bool {
+		return providerConnected(prov)
+	}
+	modelCatalog, catalogWarnings, err := modelLoader.Load()
 	if err != nil {
 		return fmt.Errorf("load model catalog: %w", err)
 	}
@@ -2015,6 +2023,9 @@ func (a *Agent) modelListFrom(refs []catalog.ModelRef) []ModelListEntry {
 	for _, ref := range refs {
 		prov, model, err := a.catalog.LookupOrIncomplete(ref)
 		if err != nil {
+			continue
+		}
+		if !providerConnected(prov) {
 			continue
 		}
 		displayName := model.Name

@@ -819,6 +819,118 @@ func TestAgentMutateConfigRejectsMalformedShapes(t *testing.T) {
 	}
 }
 
+func TestAgentModelListOmitsUnconnectedProviders(t *testing.T) {
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	lightcodeDir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LIGHTCODE_CONNECTED_KEY", "test-key")
+	// "connected" has the key set; "disconnected" references a missing env var.
+	configPath := filepath.Join(lightcodeDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{
+  "providers": {
+    "connected": {
+      "name": "Connected Provider",
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_CONNECTED_KEY" },
+      "discovery": false,
+      "models": {
+        "vis-model": { "name": "Visible Model", "context_window": 8192, "max_output_tokens": 1024 }
+      }
+    },
+    "disconnected": {
+      "name": "Disconnected Provider",
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_NEVER_SET" },
+      "discovery": false,
+      "models": {
+        "ghost-model": { "name": "Ghost Model", "context_window": 8192, "max_output_tokens": 1024 }
+      }
+    }
+  },
+  "default_model": "connected/vis-model"
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+
+	for _, entry := range a.ModelList() {
+		if entry.Provider == "disconnected" {
+			t.Fatalf("ModelList includes model from unconnected provider: %#v", entry)
+		}
+	}
+	for _, entry := range a.AllModelList() {
+		if entry.Provider == "disconnected" {
+			t.Fatalf("AllModelList includes model from unconnected provider: %#v", entry)
+		}
+	}
+
+	found := false
+	for _, entry := range a.ModelList() {
+		if entry.Ref == "connected/vis-model" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("ModelList missing connected/vis-model; entries=%#v", a.ModelList())
+	}
+}
+
+func TestAgentModelListFreshInstallListsNothing(t *testing.T) {
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	lightcodeDir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Clear any env vars that bundled providers might pick up.
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("OPENROUTER_API_KEY", "")
+	configPath := filepath.Join(lightcodeDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"providers": {}, "default_model": ""}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+	if entries := a.ModelList(); len(entries) != 0 {
+		t.Fatalf("fresh install ModelList = %#v, want empty", entries)
+	}
+	if entries := a.AllModelList(); len(entries) != 0 {
+		t.Fatalf("fresh install AllModelList = %#v, want empty", entries)
+	}
+}
+
+func TestHTTPAndACPSeeSameConnectedOnlyList(t *testing.T) {
+	// HTTP server and ACP both call agent.ModelList(); verify that the
+	// connected-only filter is applied uniformly through that single path.
+	a := newCatalogBackedTestAgent(t)
+	// The test agent's provider is connected (LIGHTCODE_TEST_KEY is set).
+	direct := a.ModelList()
+	if len(direct) == 0 {
+		t.Fatal("direct ModelList empty; expected connected test provider")
+	}
+	// Simulate disconnecting the provider by clearing the env var.
+	t.Setenv("LIGHTCODE_TEST_KEY", "")
+	afterDisconnect := a.ModelList()
+	if len(afterDisconnect) != 0 {
+		t.Fatalf("ModelList after disconnect = %#v, want empty", afterDisconnect)
+	}
+}
+
 func writeCatalogTestConfig(t *testing.T, home, content string) {
 	t.Helper()
 	path := filepath.Join(home, ".lightcode", "config.json")
