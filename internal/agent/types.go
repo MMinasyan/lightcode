@@ -120,6 +120,74 @@ type ModelListEntry struct {
 	Incomplete     bool          `json:"incomplete"`
 }
 
+const (
+	ProviderKeySourceNone     = "none"
+	ProviderKeySourceKeyless  = "keyless"
+	ProviderKeySourceManaged  = "managed"
+	ProviderKeySourceExternal = "external"
+)
+
+// ProviderStatus describes a provider's setup state for adapter-neutral settings surfaces.
+type ProviderStatus struct {
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	Builtin         bool   `json:"builtin"`
+	Connected       bool   `json:"connected"`
+	KeySource       string `json:"keySource"`
+	Disconnectable  bool   `json:"disconnectable"`
+	Removable       bool   `json:"removable"`
+	APIKeyEnv       string `json:"apiKeyEnv"`
+	GeneratedKeyEnv string `json:"generatedKeyEnv,omitempty"`
+	BaseURL         string `json:"baseURL"`
+	Discovery       bool   `json:"discovery"`
+	ModelCount      int    `json:"modelCount"`
+	UsableModels    int    `json:"usableModels"`
+}
+
+// DiscoveryModelCandidate is model metadata returned by connect-time discovery.
+type DiscoveryModelCandidate struct {
+	ID              string        `json:"id"`
+	Name            string        `json:"name"`
+	ContextWindow   int           `json:"contextWindow"`
+	MaxOutputTokens int           `json:"maxOutputTokens"`
+	Cost            *catalog.Cost `json:"cost,omitempty"`
+	Usable          bool          `json:"usable"`
+}
+
+// CustomProviderModelInput is one model selected by the user for a custom provider.
+type CustomProviderModelInput struct {
+	ID               string                    `json:"id"`
+	Name             string                    `json:"name"`
+	ContextWindow    int                       `json:"contextWindow"`
+	MaxOutputTokens  int                       `json:"maxOutputTokens"`
+	InputModalities  []catalog.Modality        `json:"inputModalities,omitempty"`
+	SystemRole       catalog.SystemRole        `json:"systemRole,omitempty"`
+	UsageInStream    *bool                     `json:"usageInStream,omitempty"`
+	ExtraBody        map[string]any            `json:"extraBody,omitempty"`
+	Cost             *catalog.Cost             `json:"cost,omitempty"`
+	ProtocolMetadata *catalog.ProtocolMetadata `json:"protocolMetadata,omitempty"`
+	Hidden           bool                      `json:"hidden,omitempty"`
+}
+
+// CustomProviderRequest is the adapter-neutral payload for adding a custom provider.
+type CustomProviderRequest struct {
+	ID               string                     `json:"id"`
+	Name             string                     `json:"name"`
+	BaseURL          string                     `json:"baseURL"`
+	APIKeyEnv        string                     `json:"apiKeyEnv"`
+	APIKey           string                     `json:"apiKey"`
+	Headers          map[string]string          `json:"headers,omitempty"`
+	Options          map[string]any             `json:"options,omitempty"`
+	SystemRole       catalog.SystemRole         `json:"systemRole,omitempty"`
+	UsageInStream    *bool                      `json:"usageInStream,omitempty"`
+	MaxTokensField   string                     `json:"maxTokensField,omitempty"`
+	ExtraBody        map[string]any             `json:"extraBody,omitempty"`
+	ProtocolMetadata *catalog.ProtocolMetadata  `json:"protocolMetadata,omitempty"`
+	Hidden           bool                       `json:"hidden,omitempty"`
+	Discovery        bool                       `json:"discovery"`
+	Models           []CustomProviderModelInput `json:"models"`
+}
+
 // Snapshot describes one turn's snapshots.
 type Snapshot struct {
 	Turn  int            `json:"turn"`

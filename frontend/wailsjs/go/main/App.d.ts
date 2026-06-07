@@ -3,6 +3,8 @@
 import {agent} from '../models';
 import {permission} from '../models';
 
+export function AddCustomProvider(arg1:agent.CustomProviderRequest):Promise<void>;
+
 export function AllModelList():Promise<Array<agent.ModelListEntry>>;
 
 export function ApplyTurnAction(arg1:number,arg2:string,arg3:boolean):Promise<agent.TurnActionResult>;
@@ -13,11 +15,19 @@ export function CompactNow():Promise<void>;
 
 export function CompleteModelEntry(arg1:string,arg2:agent.ModelCompletion):Promise<void>;
 
+export function ConnectProvider(arg1:string,arg2:string):Promise<void>;
+
 export function CurrentModel():Promise<agent.ModelInfo>;
 
 export function CurrentWarnings():Promise<Array<agent.PromptWarning>>;
 
+export function DisconnectProvider(arg1:string):Promise<void>;
+
+export function DiscoverCustomProvider(arg1:agent.CustomProviderRequest):Promise<Array<agent.DiscoveryModelCandidate>>;
+
 export function ForkSession(arg1:number):Promise<void>;
+
+export function GenerateAPIKeyEnvName(arg1:string):Promise<string>;
 
 export function ModelList():Promise<Array<agent.ModelListEntry>>;
 
@@ -33,11 +43,15 @@ export function ProjectPickAndSwitch():Promise<void>;
 
 export function ProjectSwitch(arg1:string):Promise<void>;
 
+export function ProviderList():Promise<Array<agent.ProviderStatus>>;
+
 export function QueueSnapshot():Promise<agent.QueueState>;
 
 export function ReadFileContent(arg1:string):Promise<string>;
 
 export function Reload():Promise<void>;
+
+export function RemoveProvider(arg1:string):Promise<void>;
 
 export function RespondPermission(arg1:string,arg2:string):Promise<void>;
 
