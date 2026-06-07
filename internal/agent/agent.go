@@ -43,6 +43,7 @@ type Config struct {
 	ConfigPath  string // absolute path the config was loaded from; used for reloads and writes
 	ProjectRoot string
 	Home        string
+	Env         *config.ManagedEnv // live .env state; may be nil in tests
 }
 
 // Agent is the shared core used by all adapters (Wails, HTTP, ACP).
@@ -60,6 +61,7 @@ type Agent struct {
 	projectRoot string
 	home        string
 	configPath  string // resolved config path (env override or default)
+	env         *config.ManagedEnv
 
 	currentRef        coremodel.ModelRef
 	contextWindowSize int
@@ -174,6 +176,7 @@ func New(c Config) (*Agent, error) {
 		projectRoot:   c.ProjectRoot,
 		home:          c.Home,
 		configPath:    configPath,
+		env:           c.Env,
 		warningGroups: make(map[string][]PromptWarning),
 	}
 	a.rt = newRuntime(a, runtimeOptions{WorkspaceRoot: c.ProjectRoot})
@@ -2978,6 +2981,12 @@ func (a *Agent) ProjectName() string {
 // ProjectRoot returns the absolute project directory path.
 func (a *Agent) ProjectRoot() string {
 	return a.projectRoot
+}
+
+// ManagedEnv returns the live .env state for this agent. It is safe for
+// concurrent use. May return nil in tests that did not wire one up.
+func (a *Agent) ManagedEnv() *config.ManagedEnv {
+	return a.env
 }
 
 // Projects returns the project resolver (needed by Wails adapter for
