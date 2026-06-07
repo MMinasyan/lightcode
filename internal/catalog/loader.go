@@ -21,9 +21,10 @@ var bundledFS embed.FS
 
 // Loader reads catalog inputs from disk and delegates assembly to Build.
 type Loader struct {
-	home       string
-	configPath string
-	bundled    fs.FS
+	home         string
+	configPath   string
+	bundled      fs.FS
+	AllowRefresh func(providerID string, provider *Provider) bool
 }
 
 // NewLoader constructs a catalog loader rooted at the user's home directory.
@@ -58,6 +59,7 @@ func (l *Loader) Load() (*Catalog, []Warning, error) {
 
 	result := Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Cache: cache})
 	candidates := DiscoveryRefreshCandidates(result.Catalog, attempts, time.Now().UTC())
+	candidates = l.filterRefreshCandidates(candidates, result.Catalog)
 	discoveryWarnings, discoveryChanged, _ := refreshDiscoveryCandidatesFor(home, l.configPath, candidates, result.Catalog)
 	warnings = append(warnings, discoveryWarnings...)
 	if discoveryChanged {
@@ -67,6 +69,19 @@ func (l *Loader) Load() (*Catalog, []Warning, error) {
 	}
 	warnings = append(warnings, result.Warnings...)
 	return result.Catalog, warnings, nil
+}
+
+func (l *Loader) filterRefreshCandidates(candidateIDs []string, cat *Catalog) []string {
+	if l == nil || l.AllowRefresh == nil || cat == nil || len(candidateIDs) == 0 {
+		return candidateIDs
+	}
+	filtered := candidateIDs[:0]
+	for _, providerID := range candidateIDs {
+		if l.AllowRefresh(providerID, cat.Providers[providerID]) {
+			filtered = append(filtered, providerID)
+		}
+	}
+	return filtered
 }
 
 func refreshDiscoveryCandidatesFor(home, configPath string, candidateIDs []string, cat *Catalog) ([]Warning, bool, []string) {

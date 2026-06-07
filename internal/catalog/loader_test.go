@@ -322,3 +322,157 @@ func disableBuiltinDiscoveryKeys(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("OPENROUTER_API_KEY", "")
 }
+
+func TestLoaderAllowRefreshGateExcludesUnconnected(t *testing.T) {
+	home := t.TempDir()
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"data":[{"id":"remote-model","context_window":16384,"max_output_tokens":2048}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	// Provider is due for discovery (stale cache) but AllowRefresh will reject it.
+	writeLoaderFile(t, filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"), `{
+		"fetched_at": "`+time.Now().Add(-48*time.Hour).UTC().Format(time.RFC3339)+`",
+		"attempted_at": "`+time.Now().Add(-48*time.Hour).UTC().Format(time.RFC3339)+`",
+		"models": {}
+	}`)
+	fsys := fstest.MapFS{
+		"builtin/remote.json": {Data: []byte(`{
+			"id": "remote",
+			"name": "Remote",
+			"transport": {"base_url": "` + server.URL + `/v1", "api_key_env": ""},
+			"discovery": true,
+			"models": {"known": {"context_window": 1000, "max_output_tokens": 100}}
+		}`)},
+	}
+
+	loader := NewLoader(home, fsys)
+	loader.AllowRefresh = func(_ string, _ *Provider) bool { return false }
+	cat, _, err := loader.Load()
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("discovery calls = %d, want 0 (gate rejected unconnected)", calls)
+	}
+	if _, _, err := cat.Lookup(ModelRef{Provider: "remote", Model: "remote-model"}); err == nil {
+		t.Fatal("discovered model appeared despite AllowRefresh=false")
+	}
+}
+
+func TestLoaderAllowRefreshGateIncludesConnected(t *testing.T) {
+	home := t.TempDir()
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"data":[{"id":"remote-model","context_window":16384,"max_output_tokens":2048}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	writeLoaderFile(t, filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"), `{
+		"fetched_at": "`+time.Now().Add(-48*time.Hour).UTC().Format(time.RFC3339)+`",
+		"attempted_at": "`+time.Now().Add(-48*time.Hour).UTC().Format(time.RFC3339)+`",
+		"models": {}
+	}`)
+	fsys := fstest.MapFS{
+		"builtin/remote.json": {Data: []byte(`{
+			"id": "remote",
+			"name": "Remote",
+			"transport": {"base_url": "` + server.URL + `/v1", "api_key_env": ""},
+			"discovery": true,
+			"models": {"known": {"context_window": 1000, "max_output_tokens": 100}}
+		}`)},
+	}
+
+	loader := NewLoader(home, fsys)
+	loader.AllowRefresh = func(_ string, _ *Provider) bool { return true }
+	cat, _, err := loader.Load()
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("discovery calls = %d, want 1 (gate allowed connected)", calls)
+	}
+	if _, _, err := cat.Lookup(ModelRef{Provider: "remote", Model: "remote-model"}); err != nil {
+		t.Fatalf("discovered model missing after allowed refresh: %v", err)
+	}
+}
+
+func TestLoaderNoAllowRefreshRefreshesAllCandidates(t *testing.T) {
+	home := t.TempDir()
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"data":[{"id":"remote-model","context_window":16384,"max_output_tokens":2048}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	writeLoaderFile(t, filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"), `{
+		"fetched_at": "`+time.Now().Add(-48*time.Hour).UTC().Format(time.RFC3339)+`",
+		"attempted_at": "`+time.Now().Add(-48*time.Hour).UTC().Format(time.RFC3339)+`",
+		"models": {}
+	}`)
+	fsys := fstest.MapFS{
+		"builtin/remote.json": {Data: []byte(`{
+			"id": "remote",
+			"name": "Remote",
+			"transport": {"base_url": "` + server.URL + `/v1", "api_key_env": ""},
+			"discovery": true,
+			"models": {"known": {"context_window": 1000, "max_output_tokens": 100}}
+		}`)},
+	}
+
+	// No AllowRefresh set — should behave as before and refresh all candidates.
+	cat, _, err := NewLoader(home, fsys).Load()
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("discovery calls = %d, want 1 (no gate = refresh all)", calls)
+	}
+	if _, _, err := cat.Lookup(ModelRef{Provider: "remote", Model: "remote-model"}); err != nil {
+		t.Fatalf("discovered model missing: %v", err)
+	}
+}
+
+func TestDiscoveryRefreshCandidatesIsMechanical(t *testing.T) {
+	// DiscoveryRefreshCandidates must not consult connection state; it only
+	// checks the discovery flag and TTL. Connection gating is the loader's job.
+	cat := &Catalog{
+		Providers: map[string]*Provider{
+			"unconnected": {
+				ID:        "unconnected",
+				Discovery: true,
+				Transport: Transport{APIKeyEnv: "DEFINITELY_NOT_SET"},
+				Models:    map[string]*Model{"m": {ID: "m", ContextWindow: 1000}},
+			},
+			"connected": {
+				ID:        "connected",
+				Discovery: true,
+				Transport: Transport{BaseURL: "http://127.0.0.1:9/v1"},
+				Models:    map[string]*Model{"m": {ID: "m", ContextWindow: 1000}},
+			},
+			"no-discovery": {
+				ID:        "no-discovery",
+				Discovery: false,
+				Models:    map[string]*Model{"m": {ID: "m", ContextWindow: 1000}},
+			},
+		},
+	}
+	candidates := DiscoveryRefreshCandidates(cat, nil, time.Now().UTC())
+	want := map[string]bool{"unconnected": true, "connected": true}
+	got := map[string]bool{}
+	for _, id := range candidates {
+		got[id] = true
+	}
+	for id := range want {
+		if !got[id] {
+			t.Fatalf("candidate %q missing; got %v", id, candidates)
+		}
+	}
+	if got["no-discovery"] {
+		t.Fatalf("no-discovery provider should not be a candidate; got %v", candidates)
+	}
+}
