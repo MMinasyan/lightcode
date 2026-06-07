@@ -190,6 +190,34 @@ func TestWailsBindingsCoverExportedAppMethods(t *testing.T) {
 	}
 }
 
+func TestFrontendRuntimeConfigTabExcludesMasterTogglesAndPermissions(t *testing.T) {
+	settings := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "components", "Settings.svelte"))
+	for _, want := range []string{"GetRuntimeConfig", "SetRuntimeConfig", "active === 'runtime'", "archive_after_days", "delete_after_archive_days", "threshold_pct", "summarizer_model", "max_concurrent", "max_output_bytes", "max_background_processes"} {
+		if !strings.Contains(settings, want) {
+			t.Fatalf("Settings.svelte runtime config tab missing %q", want)
+		}
+	}
+	for _, excluded := range []string{"auto_archive", "auto-archive", "compaction.enabled", "master enable", "permissions"} {
+		if strings.Contains(strings.ToLower(settings), excluded) {
+			t.Fatalf("Settings.svelte runtime config tab must not expose %q", excluded)
+		}
+	}
+}
+
+func TestFrontendNoActiveModelSendGate(t *testing.T) {
+	app := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	input := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "components", "InputArea.svelte"))
+	if !strings.Contains(app, "hasActiveModel={!!modelRef}") {
+		t.Fatalf("App.svelte must pass active-model state into InputArea")
+	}
+	if !strings.Contains(app, "Connect a provider or pick a model before sending.") {
+		t.Fatalf("handleSubmit must gate sends when no active model is available")
+	}
+	if !strings.Contains(input, "Connect a provider or pick a model") || !strings.Contains(input, "!hasActiveModel") {
+		t.Fatalf("InputArea must surface and disable the no-active-model send state")
+	}
+}
+
 func TestWailsLifecycleSurfaceContract(t *testing.T) {
 	binding := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "wailsjs", "go", "main", "App.d.ts"))
 	required := []string{
@@ -203,6 +231,9 @@ func TestWailsLifecycleSurfaceContract(t *testing.T) {
 		"export function ApplyTurnAction(arg1:number,arg2:string,arg3:boolean):Promise<agent.TurnActionResult>;",
 		"export function TokenUsage():Promise<agent.TokenReport>;",
 		"export function CurrentWarnings():Promise<Array<agent.PromptWarning>>;",
+		"export function SetDefaultModel(arg1:string):Promise<void>;",
+		"export function GetRuntimeConfig():Promise<agent.RuntimeConfigSettings>;",
+		"export function SetRuntimeConfig(arg1:agent.RuntimeConfigSettings):Promise<void>;",
 	}
 	for _, want := range required {
 		if !strings.Contains(binding, want) {
@@ -467,4 +498,106 @@ func sortedKeys(values map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func TestMainAdaptersCloseAgent(t *testing.T) {
+	mainBytes, err := os.ReadFile(filepath.Join("..", "..", "main.go"))
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	main := string(mainBytes)
+
+	// runCLI, runACP, runServe each defer svc.Close() after buildAgent.
+	for _, fn := range []string{"func runCLI()", "func runACP()", "func runServe("} {
+		body := extractFuncBody(t, main, fn)
+		if !strings.Contains(body, "defer func() { _ = svc.Close() }()") {
+			t.Fatalf("%s must defer svc.Close() after buildAgent; body:\n%s", fn, body)
+		}
+	}
+
+	// runWails wires OnShutdown to svc.Close().
+	wailsBody := extractFuncBody(t, main, "func runWails()")
+	if !strings.Contains(wailsBody, "OnShutdown:") || !strings.Contains(wailsBody, "svc.Close()") {
+		t.Fatalf("runWails must wire OnShutdown to svc.Close(); body:\n%s", wailsBody)
+	}
+}
+
+func TestCLIExitPathsCloseAgent(t *testing.T) {
+	cliBytes, err := os.ReadFile(filepath.Join("..", "cli", "cli.go"))
+	if err != nil {
+		t.Fatalf("read cli.go: %v", err)
+	}
+	cli := string(cliBytes)
+
+	if !strings.Contains(cli, "func (c *CLI) exit(code int)") {
+		t.Fatalf("CLI must expose an exit(code int) helper")
+	}
+
+	exitBody := extractMethodBody(t, cli, "func (c *CLI) exit(code int)")
+	if !strings.Contains(exitBody, "c.agent.Close()") {
+		t.Fatalf("CLI.exit must call c.agent.Close(); body:\n%s", exitBody)
+	}
+
+	// /exit and idle Ctrl-C/Ctrl-D exit with code 0; idle SIGINT and SIGTERM exit with 130.
+	if !strings.Contains(cli, "c.exit(0)") {
+		t.Fatalf("CLI must route at least one exit path through c.exit(0)")
+	}
+	if !strings.Contains(cli, "c.exit(130)") {
+		t.Fatalf("CLI must route signal exit paths through c.exit(130)")
+	}
+
+	// Spot-check each exit site still routes through the helper.
+	exitCmd := extractSwitchCase(t, cli, "case \"/exit\":")
+	if !strings.Contains(exitCmd, "c.exit(0)") {
+		t.Fatalf("/exit must call c.exit(0); case:\n%s", exitCmd)
+	}
+	idleCtrlC := extractSwitchCase(t, cli, "case keyCtrlC, keyCtrlD:")
+	if !strings.Contains(idleCtrlC, "c.exit(0)") {
+		t.Fatalf("idle Ctrl-C/Ctrl-D must call c.exit(0); case:\n%s", idleCtrlC)
+	}
+	if !strings.Contains(cli, "c.exit(130)") {
+		t.Fatalf("idle SIGINT/SIGTERM must call c.exit(130)")
+	}
+}
+
+// extractFuncBody returns the brace-balanced body of a top-level function
+// whose declaration begins with prefix (e.g. "func runCLI()").
+func extractFuncBody(t *testing.T, source, prefix string) string {
+	t.Helper()
+	idx := strings.Index(source, prefix)
+	if idx < 0 {
+		t.Fatalf("function %q not found", prefix)
+	}
+	return braceBalancedBody(source[idx:])
+}
+
+// extractMethodBody returns the brace-balanced body of a method whose
+// declaration begins with prefix (e.g. "func (c *CLI) exit(code int)").
+func extractMethodBody(t *testing.T, source, prefix string) string {
+	t.Helper()
+	idx := strings.Index(source, prefix)
+	if idx < 0 {
+		t.Fatalf("method %q not found", prefix)
+	}
+	return braceBalancedBody(source[idx:])
+}
+
+func braceBalancedBody(fromOpenBrace string) string {
+	open := strings.Index(fromOpenBrace, "{")
+	if open < 0 {
+		return fromOpenBrace
+	}
+	depth := 1
+	for i := open + 1; i < len(fromOpenBrace); i++ {
+		switch fromOpenBrace[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return fromOpenBrace[open+1 : i]
+			}
+		}
+	}
+	return fromOpenBrace[open+1:]
 }

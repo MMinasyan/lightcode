@@ -34,6 +34,8 @@ func NewReadFileAtRoot(cfg config.ToolsConfig, tracker *FileTracker, workspaceRo
 	return &ReadFile{cfg: cfg, tracker: tracker, workspaceRoot: workspaceRoot}
 }
 
+func (r *ReadFile) SetToolsConfig(cfg config.ToolsConfig) { r.cfg = cfg }
+
 func (r *ReadFile) Name() string { return "read_file" }
 
 func (r *ReadFile) Description() string {

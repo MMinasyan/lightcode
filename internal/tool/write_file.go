@@ -83,6 +83,8 @@ func NewWriteFileAtRoot(tracker *FileTracker, cfg config.ToolsConfig, workspaceR
 	return &WriteFile{tracker: tracker, cfg: cfg, workspaceRoot: workspaceRoot}
 }
 
+func (w *WriteFile) SetToolsConfig(cfg config.ToolsConfig) { w.cfg = cfg }
+
 func (w *WriteFile) Name() string { return "write_file" }
 
 func (w *WriteFile) Description() string {
@@ -149,6 +151,8 @@ func NewWriteFileWithSnapshot(store SnapshotStore, tracker *FileTracker, cfg con
 func NewWriteFileWithSnapshotAtRoot(store SnapshotStore, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) *WriteFileWithSnapshot {
 	return &WriteFileWithSnapshot{store: store, tracker: tracker, cfg: cfg, workspaceRoot: workspaceRoot}
 }
+
+func (w *WriteFileWithSnapshot) SetToolsConfig(cfg config.ToolsConfig) { w.cfg = cfg }
 
 func (*WriteFileWithSnapshot) Name() string        { return "write_file" }
 func (*WriteFileWithSnapshot) Description() string { return (&WriteFile{}).Description() }

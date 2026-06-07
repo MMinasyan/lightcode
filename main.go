@@ -75,7 +75,8 @@ func main() {
 // buildAgent performs shared setup (dotenv, logging, config) and
 // constructs the Agent that all adapters share.
 func buildAgent() (*agent.Agent, error) {
-	if err := config.LoadDotEnv(); err != nil {
+	managedEnv, err := config.LoadDotEnv()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: .env: %v\n", err)
 	}
 
@@ -109,8 +110,10 @@ func buildAgent() (*agent.Agent, error) {
 
 	return agent.New(agent.Config{
 		Cfg:         cfg,
+		ConfigPath:  cfgPath,
 		ProjectRoot: projectRoot,
 		Home:        home,
+		Env:         managedEnv,
 	})
 }
 
@@ -119,6 +122,7 @@ func runCLI() error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = svc.Close() }()
 	return cli.New(svc).Run(context.Background())
 }
 
@@ -127,6 +131,7 @@ func runACP() error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = svc.Close() }()
 	return acp.New(svc).Run(context.Background())
 }
 
@@ -139,6 +144,7 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = svc.Close() }()
 
 	home, _ := os.UserHomeDir()
 	proj, err := svc.Projects().Ensure()
@@ -169,6 +175,9 @@ func runWails() error {
 			Assets: assets,
 		},
 		OnStartup: app.startup,
-		Bind:      []interface{}{app},
+		OnShutdown: func(ctx context.Context) {
+			_ = svc.Close()
+		},
+		Bind: []interface{}{app},
 	})
 }

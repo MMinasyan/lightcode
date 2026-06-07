@@ -20,6 +20,154 @@ export namespace agent {
 	        this.output = source["output"];
 	    }
 	}
+	export class CustomProviderModelInput {
+	    id: string;
+	    name: string;
+	    contextWindow: number;
+	    maxOutputTokens: number;
+	    inputModalities?: string[];
+	    systemRole?: string;
+	    usageInStream?: boolean;
+	    extraBody?: Record<string, any>;
+	    cost?: catalog.Cost;
+	    protocolMetadata?: catalog.ProtocolMetadata;
+	    hidden?: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new CustomProviderModelInput(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.contextWindow = source["contextWindow"];
+	        this.maxOutputTokens = source["maxOutputTokens"];
+	        this.inputModalities = source["inputModalities"];
+	        this.systemRole = source["systemRole"];
+	        this.usageInStream = source["usageInStream"];
+	        this.extraBody = source["extraBody"];
+	        this.cost = this.convertValues(source["cost"], catalog.Cost);
+	        this.protocolMetadata = this.convertValues(source["protocolMetadata"], catalog.ProtocolMetadata);
+	        this.hidden = source["hidden"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class CustomProviderRequest {
+	    id: string;
+	    name: string;
+	    baseURL: string;
+	    apiKeyEnv: string;
+	    apiKey: string;
+	    headers?: Record<string, string>;
+	    options?: Record<string, any>;
+	    systemRole?: string;
+	    usageInStream?: boolean;
+	    maxTokensField?: string;
+	    extraBody?: Record<string, any>;
+	    protocolMetadata?: catalog.ProtocolMetadata;
+	    hidden?: boolean;
+	    discovery: boolean;
+	    models: CustomProviderModelInput[];
+
+	    static createFrom(source: any = {}) {
+	        return new CustomProviderRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.baseURL = source["baseURL"];
+	        this.apiKeyEnv = source["apiKeyEnv"];
+	        this.apiKey = source["apiKey"];
+	        this.headers = source["headers"];
+	        this.options = source["options"];
+	        this.systemRole = source["systemRole"];
+	        this.usageInStream = source["usageInStream"];
+	        this.maxTokensField = source["maxTokensField"];
+	        this.extraBody = source["extraBody"];
+	        this.protocolMetadata = this.convertValues(source["protocolMetadata"], catalog.ProtocolMetadata);
+	        this.hidden = source["hidden"];
+	        this.discovery = source["discovery"];
+	        this.models = this.convertValues(source["models"], CustomProviderModelInput);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class DiscoveryModelCandidate {
+	    id: string;
+	    name: string;
+	    contextWindow: number;
+	    maxOutputTokens: number;
+	    cost?: catalog.Cost;
+	    usable: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new DiscoveryModelCandidate(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.contextWindow = source["contextWindow"];
+	        this.maxOutputTokens = source["maxOutputTokens"];
+	        this.cost = this.convertValues(source["cost"], catalog.Cost);
+	        this.usable = source["usable"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class SubagentSessionLink {
 	    index: number;
 	    sessionId: string;
@@ -153,6 +301,7 @@ export namespace agent {
 	    hidden: boolean;
 	    providerHidden: boolean;
 	    incomplete: boolean;
+	    default: boolean;
 
 	    static createFrom(source: any = {}) {
 	        return new ModelListEntry(source);
@@ -170,6 +319,7 @@ export namespace agent {
 	        this.hidden = source["hidden"];
 	        this.providerHidden = source["providerHidden"];
 	        this.incomplete = source["incomplete"];
+	        this.default = source["default"];
 	    }
 
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -224,6 +374,42 @@ export namespace agent {
 	        this.message = source["message"];
 	    }
 	}
+	export class ProviderStatus {
+	    id: string;
+	    name: string;
+	    builtin: boolean;
+	    connected: boolean;
+	    keySource: string;
+	    disconnectable: boolean;
+	    removable: boolean;
+	    apiKeyEnv: string;
+	    generatedKeyEnv?: string;
+	    baseURL: string;
+	    discovery: boolean;
+	    modelCount: number;
+	    usableModels: number;
+
+	    static createFrom(source: any = {}) {
+	        return new ProviderStatus(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.builtin = source["builtin"];
+	        this.connected = source["connected"];
+	        this.keySource = source["keySource"];
+	        this.disconnectable = source["disconnectable"];
+	        this.removable = source["removable"];
+	        this.apiKeyEnv = source["apiKeyEnv"];
+	        this.generatedKeyEnv = source["generatedKeyEnv"];
+	        this.baseURL = source["baseURL"];
+	        this.discovery = source["discovery"];
+	        this.modelCount = source["modelCount"];
+	        this.usableModels = source["usableModels"];
+	    }
+	}
 	export class QueuedItem {
 	    id: string;
 	    content: string;
@@ -270,6 +456,107 @@ export namespace agent {
 		    return a;
 		}
 	}
+
+	export class RuntimeCompactionConfig {
+	    threshold_pct: number;
+	    summarizer_model: string;
+
+	    static createFrom(source: any = {}) {
+	        return new RuntimeCompactionConfig(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.threshold_pct = source["threshold_pct"];
+	        this.summarizer_model = source["summarizer_model"];
+	    }
+	}
+	export class RuntimeToolsConfig {
+	    max_output_bytes: number;
+	    read_max_lines: number;
+	    read_line_max_chars: number;
+	    command_timeout: number;
+	    max_background_processes: number;
+
+	    static createFrom(source: any = {}) {
+	        return new RuntimeToolsConfig(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.max_output_bytes = source["max_output_bytes"];
+	        this.read_max_lines = source["read_max_lines"];
+	        this.read_line_max_chars = source["read_line_max_chars"];
+	        this.command_timeout = source["command_timeout"];
+	        this.max_background_processes = source["max_background_processes"];
+	    }
+	}
+	export class RuntimeSubagentsConfig {
+	    max_concurrent: number;
+	    model: string;
+
+	    static createFrom(source: any = {}) {
+	        return new RuntimeSubagentsConfig(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.max_concurrent = source["max_concurrent"];
+	        this.model = source["model"];
+	    }
+	}
+	export class RuntimeSessionsConfig {
+	    archive_after_days: number;
+	    delete_after_archive_days: number;
+
+	    static createFrom(source: any = {}) {
+	        return new RuntimeSessionsConfig(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.archive_after_days = source["archive_after_days"];
+	        this.delete_after_archive_days = source["delete_after_archive_days"];
+	    }
+	}
+	export class RuntimeConfigSettings {
+	    sessions: RuntimeSessionsConfig;
+	    compaction: RuntimeCompactionConfig;
+	    subagents: RuntimeSubagentsConfig;
+	    tools: RuntimeToolsConfig;
+
+	    static createFrom(source: any = {}) {
+	        return new RuntimeConfigSettings(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.sessions = this.convertValues(source["sessions"], RuntimeSessionsConfig);
+	        this.compaction = this.convertValues(source["compaction"], RuntimeCompactionConfig);
+	        this.subagents = this.convertValues(source["subagents"], RuntimeSubagentsConfig);
+	        this.tools = this.convertValues(source["tools"], RuntimeToolsConfig);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+
+
 
 	export class SessionSummary {
 	    id: string;
@@ -341,6 +628,7 @@ export namespace agent {
 		    return a;
 		}
 	}
+
 
 	export class SubmitResult {
 	    started: boolean;
@@ -501,6 +789,22 @@ export namespace catalog {
 	        this.output = source["output"];
 	        this.cache_read = source["cache_read"];
 	        this.cache_write = source["cache_write"];
+	    }
+	}
+	export class ProtocolMetadata {
+	    family?: string;
+	    must_preserve?: string[];
+	    drop?: string[];
+
+	    static createFrom(source: any = {}) {
+	        return new ProtocolMetadata(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.family = source["family"];
+	        this.must_preserve = source["must_preserve"];
+	        this.drop = source["drop"];
 	    }
 	}
 

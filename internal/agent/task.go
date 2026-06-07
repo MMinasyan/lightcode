@@ -169,6 +169,21 @@ func (*taskTool) ParametersSchema() map[string]any {
 	}
 }
 
+func (t *taskTool) setMaxConcurrent(maxConcurrent int) {
+	if maxConcurrent <= 0 {
+		maxConcurrent = 4
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.maxConcurrent = maxConcurrent
+}
+
+func (t *taskTool) setToolsConfig(cfg config.ToolsConfig) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.toolsConfig = cfg
+}
+
 func (t *taskTool) Execute(ctx context.Context, params map[string]any) (string, error) {
 	tasksRaw, ok := params["tasks"]
 	if !ok {
@@ -188,7 +203,10 @@ func (t *taskTool) Execute(ctx context.Context, params map[string]any) (string, 
 
 	toolCallID, _ := params["_tool_call_id"].(string)
 
-	sem := make(chan struct{}, t.maxConcurrent)
+	t.mu.Lock()
+	maxConcurrent := t.maxConcurrent
+	t.mu.Unlock()
+	sem := make(chan struct{}, maxConcurrent)
 	results := make([]taskResult, len(tasks))
 	var wg sync.WaitGroup
 

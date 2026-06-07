@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,7 +13,9 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
 func newCatalogBackedTestAgent(t *testing.T) *Agent {
@@ -46,11 +49,433 @@ func newCatalogBackedTestAgent(t *testing.T) *Agent {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
 	return a
+}
+
+func TestAgentNewAllowsUnconfiguredAndDisconnectedDefaults(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  string
+	}{
+		{
+			name: "empty config",
+			cfg:  `{"providers": {}, "default_model": ""}`,
+		},
+		{
+			name: "default provider missing key",
+			cfg: `{
+  "providers": {
+    "test": {
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_MISSING_KEY" },
+      "discovery": false,
+      "models": { "test-model": { "context_window": 8192 } }
+    }
+  },
+  "default_model": "test/test-model"
+}`,
+		},
+		{
+			name: "mistyped default model",
+			cfg: `{
+  "providers": {
+    "test": {
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "" },
+      "discovery": false,
+      "models": { "test-model": { "context_window": 8192 } }
+    }
+  },
+  "default_model": "test/missing-model"
+}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			projectRoot := t.TempDir()
+			configPath := filepath.Join(home, ".lightcode", "config.json")
+			if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(configPath, []byte(tc.cfg), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(configPath)
+			if err != nil {
+				t.Fatalf("load config: %v", err)
+			}
+			a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+			if err != nil {
+				t.Fatalf("New returned error: %v", err)
+			}
+			cur := a.CurrentModel()
+			if cur.Ref != "" || cur.Provider != "" || cur.Model != "" {
+				t.Fatalf("CurrentModel = %#v, want no active model", cur)
+			}
+		})
+	}
+}
+
+func TestProviderConnectedPredicate(t *testing.T) {
+	t.Setenv("LIGHTCODE_CONNECTED_KEY", "test-key")
+	if providerConnected(nil) {
+		t.Fatal("nil provider connected")
+	}
+	keyed := &catalog.Provider{Transport: catalog.Transport{APIKeyEnv: "LIGHTCODE_CONNECTED_KEY"}, Models: map[string]*catalog.Model{"m": {ContextWindow: 8192}}}
+	if !providerConnected(keyed) {
+		t.Fatal("keyed provider with usable model and key should be connected")
+	}
+	keyedMissing := &catalog.Provider{Transport: catalog.Transport{APIKeyEnv: "LIGHTCODE_MISSING_KEY"}, Models: map[string]*catalog.Model{"m": {ContextWindow: 8192}}}
+	if providerConnected(keyedMissing) {
+		t.Fatal("keyed provider without key should not be connected")
+	}
+	keyless := &catalog.Provider{Transport: catalog.Transport{BaseURL: "http://127.0.0.1:9/v1"}, Models: map[string]*catalog.Model{"m": {ContextWindow: 8192}}}
+	if !providerConnected(keyless) {
+		t.Fatal("keyless provider with base_url and usable model should be connected")
+	}
+	incomplete := &catalog.Provider{Transport: catalog.Transport{BaseURL: "http://127.0.0.1:9/v1"}, Models: map[string]*catalog.Model{"m": {ContextWindow: 0}}}
+	if providerConnected(incomplete) {
+		t.Fatal("provider with only incomplete models should not be connected")
+	}
+}
+
+func TestAgentSetupWarningsForUnconfiguredStartup(t *testing.T) {
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	configPath := filepath.Join(home, ".lightcode", "config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"providers": {}, "default_model": ""}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.Init(ctx)
+	warnings := a.CurrentWarnings()
+	if !hasWarningKind(warnings, "setup_no_provider") || !hasWarningKind(warnings, "setup_no_default_model") {
+		t.Fatalf("warnings = %#v, want setup provider/default warnings", warnings)
+	}
+}
+
+func TestAgentSetDefaultModelWritesConfigAndUpdatesWarnings(t *testing.T) {
+	t.Setenv("LIGHTCODE_SET_DEFAULT_KEY", "test-key")
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	configPath := filepath.Join(home, ".lightcode", "config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{
+  "providers": {
+    "test": {
+      "name": "Test Provider",
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_SET_DEFAULT_KEY" },
+      "discovery": false,
+      "models": { "test-model": { "name": "Test Model", "context_window": 8192 } }
+    }
+  },
+  "default_model": ""
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.Init(ctx)
+	if !hasWarningKind(a.CurrentWarnings(), "setup_no_default_model") {
+		t.Fatalf("warnings before SetDefaultModel = %#v, want setup_no_default_model", a.CurrentWarnings())
+	}
+	if err := a.SetDefaultModel("test/test-model"); err != nil {
+		t.Fatalf("SetDefaultModel returned error: %v", err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"default_model": "test/test-model"`) {
+		t.Fatalf("config after SetDefaultModel = %s, want default_model", data)
+	}
+	if hasWarningKind(a.CurrentWarnings(), "setup_no_default_model") {
+		t.Fatalf("warnings after SetDefaultModel = %#v, did not expect setup_no_default_model", a.CurrentWarnings())
+	}
+	entries := a.AllModelList()
+	if len(entries) != 1 || entries[0].Ref != "test/test-model" || !entries[0].Default {
+		t.Fatalf("AllModelList after SetDefaultModel = %#v, want default flag on test/test-model", entries)
+	}
+	cur := a.CurrentModel()
+	if cur.Ref != "test/test-model" {
+		t.Fatalf("CurrentModel after SetDefaultModel = %#v, want lazy default activation", cur)
+	}
+}
+
+func TestAgentRuntimeConfigRoundTripWritesReloadsAndExcludesMasterBooleans(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	settings := a.GetRuntimeConfig()
+	settings.Sessions.ArchiveAfterDays = 14
+	settings.Sessions.DeleteAfterArchiveDays = 21
+	settings.Compaction.ThresholdPct = 0.75
+	settings.Compaction.SummarizerModel = "test/test-model"
+	settings.Subagents.MaxConcurrent = 3
+	settings.Subagents.Model = "test/alt-model"
+	settings.Tools.MaxOutputBytes = 32768
+	settings.Tools.ReadMaxLines = 10
+	settings.Tools.ReadLineMaxChars = 7000
+	settings.Tools.CommandTimeout = 90
+	settings.Tools.MaxBackgroundProcesses = 1
+
+	if err := a.SetRuntimeConfig(settings); err != nil {
+		t.Fatalf("SetRuntimeConfig returned error: %v", err)
+	}
+	got := a.GetRuntimeConfig()
+	if got.Sessions.ArchiveAfterDays != 14 || got.Sessions.DeleteAfterArchiveDays != 21 || got.Compaction.ThresholdPct != 0.75 || got.Compaction.SummarizerModel != "test/test-model" {
+		t.Fatalf("runtime config after set = %#v", got)
+	}
+	if got.Subagents.MaxConcurrent != 3 || got.Subagents.Model != "test/alt-model" || got.Tools.CommandTimeout != 90 || got.Tools.MaxBackgroundProcesses != 1 {
+		t.Fatalf("runtime tool/subagent config after set = %#v", got)
+	}
+	data, err := os.ReadFile(a.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{`"archive_after_days": 14`, `"delete_after_archive_days": 21`, `"threshold_pct": 0.75`, `"summarizer_model": "test/test-model"`, `"max_concurrent": 3`, `"model": "test/alt-model"`, `"command_timeout": 90`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("config missing %s:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, `"auto_archive"`) || strings.Contains(text, `"enabled"`) || strings.Contains(text, `"permissions"`) {
+		t.Fatalf("config write should not add excluded runtime fields:\n%s", text)
+	}
+	filePath := filepath.Join(a.projectRoot, "many-lines.txt")
+	var lines strings.Builder
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&lines, "line-%03d\n", i)
+	}
+	if err := os.WriteFile(filePath, []byte(lines.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readTool, ok := a.registry.Get("read_file")
+	if !ok {
+		t.Fatal("read_file tool not registered")
+	}
+	if wrapped, ok := readTool.(interface{ WrappedTool() tool.Tool }); ok {
+		readTool = wrapped.WrappedTool()
+	}
+	readOutput, err := readTool.Execute(context.Background(), map[string]any{"path": filePath})
+	if err != nil {
+		t.Fatalf("read_file Execute returned error: %v", err)
+	}
+	if !strings.Contains(readOutput, "line-010") || strings.Contains(readOutput, "line-011") {
+		t.Fatalf("read_file did not use updated read_max_lines=10; output=%q", readOutput)
+	}
+	defer a.procMgr.KillAll()
+	if _, err := a.procMgr.Start("sleep 5", 0); err != nil {
+		t.Fatalf("first background process start returned error: %v", err)
+	}
+	if _, err := a.procMgr.Start("sleep 5", 0); err == nil {
+		t.Fatal("second background process start returned nil with updated max_background_processes=1")
+	}
+	if err := a.Reload(); err != nil {
+		t.Fatalf("Reload returned error: %v", err)
+	}
+	if got := a.GetRuntimeConfig(); got.Tools.CommandTimeout != 90 || got.Subagents.Model != "test/alt-model" {
+		t.Fatalf("runtime config after reload = %#v", got)
+	}
+}
+
+func TestAgentSetRuntimeConfigDoesNotTriggerDiscoveryHTTP(t *testing.T) {
+	var discoveryCalls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		discoveryCalls.Add(1)
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected discovery path %s", r.URL.Path)
+		}
+		_, _ = fmt.Fprint(w, `{"data":[{"id":"remote-model","name":"Remote Model","context_window":12288,"max_output_tokens":3072}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	lightcodeDir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keyEnv := "LIGHTCODE_RUNTIME_DISCOVERY_KEY"
+	t.Setenv(keyEnv, "")
+	configPath := filepath.Join(lightcodeDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf(`{
+  "providers": {
+    "test": {
+      "name": "Test Provider",
+      "transport": { "base_url": %q, "api_key_env": %q },
+      "discovery": true,
+      "models": {
+        "test-model": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 }
+      }
+    }
+  },
+  "default_model": "test/test-model"
+}`, server.URL+"/v1", keyEnv)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+	if calls := discoveryCalls.Load(); calls != 0 {
+		t.Fatalf("discovery calls during disconnected startup = %d, want 0", calls)
+	}
+
+	t.Setenv(keyEnv, "test-key")
+	settings := a.GetRuntimeConfig()
+	settings.Tools.CommandTimeout = 91
+	if err := a.SetRuntimeConfig(settings); err != nil {
+		t.Fatalf("SetRuntimeConfig returned error: %v", err)
+	}
+	if calls := discoveryCalls.Load(); calls != 0 {
+		t.Fatalf("discovery calls during SetRuntimeConfig = %d, want 0", calls)
+	}
+	if got := a.GetRuntimeConfig(); got.Tools.CommandTimeout != 91 {
+		t.Fatalf("runtime config after SetRuntimeConfig = %#v, want command_timeout=91", got)
+	}
+}
+
+func TestAgentSetRuntimeConfigRejectsInvalidValues(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	settings := a.GetRuntimeConfig()
+	settings.Compaction.ThresholdPct = 1
+	if err := a.SetRuntimeConfig(settings); err == nil {
+		t.Fatal("SetRuntimeConfig returned nil for invalid threshold")
+	}
+	settings = a.GetRuntimeConfig()
+	settings.Subagents.Model = "badref"
+	if err := a.SetRuntimeConfig(settings); err == nil {
+		t.Fatal("SetRuntimeConfig returned nil for invalid subagent model ref")
+	}
+	settings = a.GetRuntimeConfig()
+	settings.Tools.CommandTimeout = 0
+	if err := a.SetRuntimeConfig(settings); err == nil {
+		t.Fatal("SetRuntimeConfig returned nil for invalid command timeout")
+	}
+}
+
+func TestAgentSetRuntimeConfigRefusesWhileBusy(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	a.ensureRuntime().mu.Lock()
+	a.ensureRuntime().busy = true
+	a.ensureRuntime().mu.Unlock()
+	if err := a.SetRuntimeConfig(a.GetRuntimeConfig()); err == nil {
+		t.Fatal("SetRuntimeConfig returned nil while busy")
+	}
+}
+
+func TestAgentSetDefaultModelRejectsInvalidRef(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	if err := a.SetDefaultModel("not-a-ref"); err == nil {
+		t.Fatal("SetDefaultModel returned nil for invalid ref")
+	}
+}
+
+func TestAgentUsesConfiguredConfigPathForWrites(t *testing.T) {
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "custom-config.json")
+	if err := os.WriteFile(configPath, []byte(`{
+  "providers": {
+    "test": {
+      "name": "Test Provider",
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_TEST_KEY" },
+      "discovery": false,
+      "models": { "incomplete-model": { "name": "Incomplete Model" } }
+    }
+  },
+  "default_model": ""
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LIGHTCODE_TEST_KEY", "test-key")
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	if err := a.CompleteModelEntry("test/incomplete-model", ModelCompletion{ContextWindow: 32768}); err != nil {
+		t.Fatalf("CompleteModelEntry returned error: %v", err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"context_window": 32768`) {
+		t.Fatalf("custom config was not updated: %s", data)
+	}
+	defaultPath := filepath.Join(home, ".lightcode", "config.json")
+	if _, err := os.Stat(defaultPath); !os.IsNotExist(err) {
+		t.Fatalf("default config path exists/err=%v; writer should use override path", err)
+	}
+}
+
+func hasWarningKind(warnings []PromptWarning, kind string) bool {
+	for _, warning := range warnings {
+		if warning.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func TestAgentInitDoesNotWarnForConnectedDefaultModel(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.Init(ctx)
+	warnings := a.CurrentWarnings()
+	if hasWarningKind(warnings, "setup_default_model_unavailable") {
+		t.Fatalf("warnings = %#v, did not expect default unavailable for connected default", warnings)
+	}
+	if hasWarningKind(warnings, "setup_no_provider") || hasWarningKind(warnings, "setup_no_default_model") {
+		t.Fatalf("warnings = %#v, did not expect setup missing warnings for connected default", warnings)
+	}
+}
+
+func TestAgentInitDoesNotActivateDefaultModel(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.Init(ctx)
+	a.ensureRuntime().mu.Lock()
+	current := a.currentRef
+	a.ensureRuntime().mu.Unlock()
+	if current.Provider != "" || current.Model != "" {
+		t.Fatalf("Init activated model %#v; want lazy activation", current)
+	}
 }
 
 func TestAgentCurrentModelUsesCatalogDefaultRef(t *testing.T) {
@@ -622,6 +1047,118 @@ func TestAgentMutateConfigRejectsMalformedShapes(t *testing.T) {
 		t.Fatal("SetModelHidden returned nil for malformed model")
 	} else if !strings.Contains(err.Error(), "providers.test.models.test-model must be an object") {
 		t.Fatalf("SetModelHidden error = %v, want providers.test.models.test-model must be an object", err)
+	}
+}
+
+func TestAgentModelListOmitsUnconnectedProviders(t *testing.T) {
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	lightcodeDir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LIGHTCODE_CONNECTED_KEY", "test-key")
+	// "connected" has the key set; "disconnected" references a missing env var.
+	configPath := filepath.Join(lightcodeDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{
+  "providers": {
+    "connected": {
+      "name": "Connected Provider",
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_CONNECTED_KEY" },
+      "discovery": false,
+      "models": {
+        "vis-model": { "name": "Visible Model", "context_window": 8192, "max_output_tokens": 1024 }
+      }
+    },
+    "disconnected": {
+      "name": "Disconnected Provider",
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_NEVER_SET" },
+      "discovery": false,
+      "models": {
+        "ghost-model": { "name": "Ghost Model", "context_window": 8192, "max_output_tokens": 1024 }
+      }
+    }
+  },
+  "default_model": "connected/vis-model"
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+
+	for _, entry := range a.ModelList() {
+		if entry.Provider == "disconnected" {
+			t.Fatalf("ModelList includes model from unconnected provider: %#v", entry)
+		}
+	}
+	for _, entry := range a.AllModelList() {
+		if entry.Provider == "disconnected" {
+			t.Fatalf("AllModelList includes model from unconnected provider: %#v", entry)
+		}
+	}
+
+	found := false
+	for _, entry := range a.ModelList() {
+		if entry.Ref == "connected/vis-model" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("ModelList missing connected/vis-model; entries=%#v", a.ModelList())
+	}
+}
+
+func TestAgentModelListFreshInstallListsNothing(t *testing.T) {
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	lightcodeDir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Clear any env vars that bundled providers might pick up.
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("OPENROUTER_API_KEY", "")
+	configPath := filepath.Join(lightcodeDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"providers": {}, "default_model": ""}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+	if entries := a.ModelList(); len(entries) != 0 {
+		t.Fatalf("fresh install ModelList = %#v, want empty", entries)
+	}
+	if entries := a.AllModelList(); len(entries) != 0 {
+		t.Fatalf("fresh install AllModelList = %#v, want empty", entries)
+	}
+}
+
+func TestHTTPAndACPSeeSameConnectedOnlyList(t *testing.T) {
+	// HTTP server and ACP both call agent.ModelList(); verify that the
+	// connected-only filter is applied uniformly through that single path.
+	a := newCatalogBackedTestAgent(t)
+	// The test agent's provider is connected (LIGHTCODE_TEST_KEY is set).
+	direct := a.ModelList()
+	if len(direct) == 0 {
+		t.Fatal("direct ModelList empty; expected connected test provider")
+	}
+	// Simulate disconnecting the provider by clearing the env var.
+	t.Setenv("LIGHTCODE_TEST_KEY", "")
+	afterDisconnect := a.ModelList()
+	if len(afterDisconnect) != 0 {
+		t.Fatalf("ModelList after disconnect = %#v, want empty", afterDisconnect)
 	}
 }
 
