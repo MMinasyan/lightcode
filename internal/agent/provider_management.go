@@ -458,6 +458,9 @@ func (a *Agent) AddCustomProvider(req CustomProviderRequest) error {
 		if req.Hidden {
 			providerMap["hidden"] = true
 		}
+		if err := validateRawProviderConfig(providerID, providerMap); err != nil {
+			return err
+		}
 		providers[providerID] = providerMap
 		return nil
 	}); err != nil {

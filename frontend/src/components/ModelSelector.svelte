@@ -14,7 +14,7 @@
     loading = false;
   });
 
-  $: filtered = filterEntries(entries || [], query);
+  $: filtered = filterEntries((entries || []).filter(e => !e.incomplete), query);
   $: groups = groupByProvider(filtered);
 
   function filterEntries(list, q) {

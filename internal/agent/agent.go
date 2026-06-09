@@ -63,6 +63,8 @@ type Agent struct {
 	configPath  string // resolved config path (env override or default)
 	env         *config.ManagedEnv
 
+	bundledModels map[string]map[string]struct{} // lazily loaded bundled provider→model id sets, for provenance
+
 	currentRef        coremodel.ModelRef
 	contextWindowSize int
 
@@ -94,9 +96,6 @@ type Agent struct {
 	warningsMu      sync.Mutex
 	warningGroups   map[string][]PromptWarning
 	warningSnapshot []PromptWarning
-
-	closeOnce sync.Once
-	closeErr  error
 }
 
 type agentSignalSink interface {
@@ -294,7 +293,7 @@ func New(c Config) (*Agent, error) {
 	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(procMgr), checkPolicy, askPolicy))
 	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkPolicy, askPolicy))
 
-	embedder, err := memory.NewEmbedder(c.Home)
+	embedder, err := memory.NewEmbedder()
 	if err != nil {
 		// Embedder failure is non-fatal: semantic memory search will be disabled.
 		a.embedderDegraded = true
@@ -1985,7 +1984,27 @@ func (a *Agent) mutateProviderConfig(providerID string, mutate func(providerMap 
 	if err := mutate(providerMap); err != nil {
 		return err
 	}
+	if prov := a.catalog.Providers[providerID]; prov != nil && !prov.Builtin {
+		if err := validateRawProviderConfig(providerID, providerMap); err != nil {
+			return err
+		}
+	}
 	return writeAgentConfigAtomic(path, root)
+}
+
+func validateRawProviderConfig(providerID string, providerMap map[string]any) error {
+	providerForValidation := map[string]any{}
+	encoded, err := json.Marshal(providerMap)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(encoded, &providerForValidation); err != nil {
+		return err
+	}
+	if errs := catalog.ValidateRaw(providerID, providerForValidation, true); len(errs) != 0 {
+		return fmt.Errorf("invalid provider config: %s", errs[0].Error())
+	}
+	return nil
 }
 
 // mutateModelConfig reads the agent config, navigates to the specified
@@ -2046,6 +2065,8 @@ func (a *Agent) CurrentModel() ModelInfo {
 // modelListFrom builds enriched model list entries from the given refs.
 // Caller must hold the runtime mutex.
 func (a *Agent) modelListFrom(refs []catalog.ModelRef) []ModelListEntry {
+	bundled := a.bundledModelIDsLocked()
+	disc := a.discoveryCacheLocked()
 	result := make([]ModelListEntry, 0, len(refs))
 	for _, ref := range refs {
 		prov, model, err := a.catalog.LookupOrIncomplete(ref)
@@ -2065,17 +2086,19 @@ func (a *Agent) modelListFrom(refs []catalog.ModelRef) []ModelListEntry {
 		}
 		_, incomplete := model.Incomplete()
 		result = append(result, ModelListEntry{
-			Ref:            ref.String(),
-			Provider:       ref.Provider,
-			ProviderName:   providerName,
-			Model:          ref.Model,
-			DisplayName:    displayName,
-			ContextWindow:  model.ContextWindow,
-			Cost:           model.Cost,
-			Hidden:         model.Hidden || prov.Hidden,
-			ProviderHidden: prov.Hidden,
-			Incomplete:     incomplete,
-			Default:        ref.String() == a.cfg.DefaultModel,
+			Ref:             ref.String(),
+			Provider:        ref.Provider,
+			ProviderName:    providerName,
+			Model:           ref.Model,
+			DisplayName:     displayName,
+			ContextWindow:   model.ContextWindow,
+			MaxOutputTokens: model.MaxOutputTokens,
+			Cost:            model.Cost,
+			Hidden:          model.Hidden || prov.Hidden,
+			ProviderHidden:  prov.Hidden,
+			Incomplete:      incomplete,
+			Default:         ref.String() == a.cfg.DefaultModel,
+			Source:          classifyModelSource(prov, ref.Model, bundled, disc),
 		})
 	}
 	return result
@@ -2402,32 +2425,6 @@ func (a *Agent) cancelAndWaitIdle() error {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return fmt.Errorf("timed out waiting for current turn to end")
-}
-
-// Close releases the agent's process-wide resources (snapshot store, memory
-// store / embedder, background processes, LSP servers). It is idempotent and
-// safe to call from adapter shutdown hooks and CLI signal handlers.
-func (a *Agent) Close() error {
-	a.closeOnce.Do(func() {
-		if err := a.cancelAndWaitIdle(); err != nil {
-			a.closeErr = err
-		}
-		if a.store != nil && a.store.Active() {
-			if _, err := a.store.Close(); err != nil && a.closeErr == nil {
-				a.closeErr = err
-			}
-		}
-		if a.memoryStore != nil {
-			a.memoryStore.Close()
-		}
-		if a.procMgr != nil {
-			a.procMgr.KillAll()
-		}
-		if a.lspManager != nil {
-			a.lspManager.ShutdownAll()
-		}
-	})
-	return a.closeErr
 }
 
 // CloseForProjectSwitch cancels any active turn, closes the current session, and

@@ -38,6 +38,10 @@ export function CurrentWarnings() {
   return window['go']['main']['App']['CurrentWarnings']();
 }
 
+export function DeleteModel(arg1, arg2) {
+  return window['go']['main']['App']['DeleteModel'](arg1, arg2);
+}
+
 export function DisconnectProvider(arg1) {
   return window['go']['main']['App']['DisconnectProvider'](arg1);
 }
@@ -46,12 +50,20 @@ export function DiscoverCustomProvider(arg1) {
   return window['go']['main']['App']['DiscoverCustomProvider'](arg1);
 }
 
+export function DiscoverableModels(arg1) {
+  return window['go']['main']['App']['DiscoverableModels'](arg1);
+}
+
 export function ForkSession(arg1) {
   return window['go']['main']['App']['ForkSession'](arg1);
 }
 
 export function GenerateAPIKeyEnvName(arg1) {
   return window['go']['main']['App']['GenerateAPIKeyEnvName'](arg1);
+}
+
+export function GetProviderConfig(arg1) {
+  return window['go']['main']['App']['GetProviderConfig'](arg1);
 }
 
 export function GetRuntimeConfig() {
@@ -106,6 +118,14 @@ export function RemoveProvider(arg1) {
   return window['go']['main']['App']['RemoveProvider'](arg1);
 }
 
+export function ResetModelField(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ResetModelField'](arg1, arg2, arg3);
+}
+
+export function ResetProviderField(arg1, arg2) {
+  return window['go']['main']['App']['ResetProviderField'](arg1, arg2);
+}
+
 export function RespondPermission(arg1, arg2) {
   return window['go']['main']['App']['RespondPermission'](arg1, arg2);
 }
@@ -116,6 +136,10 @@ export function RevertCode(arg1) {
 
 export function RevertHistory(arg1) {
   return window['go']['main']['App']['RevertHistory'](arg1);
+}
+
+export function SaveModel(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SaveModel'](arg1, arg2, arg3);
 }
 
 export function SaveProjectPermission(arg1, arg2) {
@@ -160,6 +184,10 @@ export function SetDefaultModel(arg1) {
 
 export function SetModelHidden(arg1, arg2) {
   return window['go']['main']['App']['SetModelHidden'](arg1, arg2);
+}
+
+export function SetProviderConfig(arg1, arg2) {
+  return window['go']['main']['App']['SetProviderConfig'](arg1, arg2);
 }
 
 export function SetProviderHidden(arg1, arg2) {

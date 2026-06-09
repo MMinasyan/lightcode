@@ -237,6 +237,41 @@ func (a *App) GenerateAPIKeyEnvName(providerID string) string {
 	return a.svc.GenerateAPIKeyEnvName(providerID)
 }
 
+// GetProviderConfig returns the merged effective config of a provider for editing.
+func (a *App) GetProviderConfig(providerID string) (agent.ProviderConfigView, error) {
+	return a.svc.GetProviderConfig(providerID)
+}
+
+// DiscoverableModels returns the provider's discovered-but-not-included models.
+func (a *App) DiscoverableModels(providerID string) ([]agent.DiscoveryModelCandidate, error) {
+	return a.svc.DiscoverableModels(providerID)
+}
+
+// SetProviderConfig edits an existing provider's transport/provider-level config.
+func (a *App) SetProviderConfig(providerID string, cfg agent.ProviderConfigInput) error {
+	return a.svc.SetProviderConfig(providerID, cfg)
+}
+
+// ResetProviderField reverts one provider config field to the bundled default.
+func (a *App) ResetProviderField(providerID string, field string) error {
+	return a.svc.ResetProviderField(providerID, field)
+}
+
+// SaveModel adds or edits one model's config fields under a provider.
+func (a *App) SaveModel(providerID string, modelID string, cfg agent.ModelConfigInput) error {
+	return a.svc.SaveModel(providerID, modelID, cfg)
+}
+
+// DeleteModel removes a user-added model from config.
+func (a *App) DeleteModel(providerID string, modelID string) error {
+	return a.svc.DeleteModel(providerID, modelID)
+}
+
+// ResetModelField reverts one model config field to the bundled/discovery default.
+func (a *App) ResetModelField(providerID string, modelID string, field string) error {
+	return a.svc.ResetModelField(providerID, modelID, field)
+}
+
 // RevertCode restores files to their state at turn N.
 func (a *App) RevertCode(turn int) error {
 	return a.svc.RevertCode(turn)

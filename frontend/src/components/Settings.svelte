@@ -1,711 +1,334 @@
 <script>
   import { createEventDispatcher, onMount } from 'svelte';
-  import { settings } from '../lib/settings.js';
   import { errorText } from '../lib/errors.js';
   import { groupByProvider } from '../lib/format.js';
+  import { settings } from '../lib/settings.js';
+  import ModelPicker from './ModelPicker.svelte';
+  import AddProvider from './AddProvider.svelte';
+  import ProviderConfig from './ProviderConfig.svelte';
   import {
-    AddCustomProvider,
-    AllModelList,
-    ConnectProvider,
-    DisconnectProvider,
-    DiscoverCustomProvider,
-    GenerateAPIKeyEnvName,
-    GetRuntimeConfig,
-    ProviderList,
-    RemoveProvider,
-    SetDefaultModel,
-    SetModelHidden,
-    SetProviderHidden,
-    SetRuntimeConfig,
+    ProviderList, AllModelList, GetRuntimeConfig, SetRuntimeConfig,
+    SetModelHidden, SetProviderHidden, SetDefaultModel,
+    ConnectProvider, DisconnectProvider, RemoveProvider,
   } from '../../wailsjs/go/main/App';
+
+  export let initialSection = 'providers';
   const dispatch = createEventDispatcher();
-  export let initialSection = 'appearance';
 
-  const sections = [
+  const TABS = [
     { id: 'appearance', label: 'Appearance' },
-    { id: 'models', label: 'Models' },
     { id: 'providers', label: 'Providers' },
-    { id: 'runtime', label: 'Runtime' },
+    { id: 'models', label: 'Models' },
+    { id: 'agent', label: 'Agent' },
   ];
-  let active = initialSection;
-
-  let prevInitial = initialSection;
-  $: if (initialSection !== prevInitial) { active = initialSection; prevInitial = initialSection; }
-
-  function toggleWrap(e) {
-    settings.update((s) => ({ ...s, wrapCode: e.target.checked }));
-  }
-
-  function setFontScale(e) {
-    const n = parseInt(e.target.value, 10);
-    if (!Number.isFinite(n)) return;
-    const clamped = Math.max(50, Math.min(200, n));
-    settings.update((s) => ({ ...s, fontScale: clamped }));
-  }
-
-  function stepFontScale(delta) {
-    settings.update((s) => {
-      const next = Math.max(50, Math.min(200, (s.fontScale || 100) + delta));
-      return { ...s, fontScale: next };
-    });
-  }
-
-  let allModels = [];
-  let modelGroups = [];
-  let modelQuery = '';
+  let active = TABS.some((t) => t.id === initialSection) ? initialSection : 'providers';
 
   let providers = [];
-  let providersLoading = false;
+  let models = [];
+  let runtime = null;
+  let loading = true;
+  let showAdd = false;
   let connectTarget = null;
   let connectKey = '';
   let connectBusy = false;
+  let savingRuntime = false;
+  let runtimeSaveQueue = Promise.resolve();
+  let runtimeSavesPending = 0;
 
-  let showCustomModal = false;
-  let customBusy = false;
-  let customError = '';
-  let customForm = emptyCustomForm();
-  let customHeadersText = '{}';
-  let customOptionsText = '{}';
-  let customExtraBodyText = '{}';
-  let candidates = [];
-  let selectedModels = [];
+  function fail(e) { dispatch('error', errorText(e)); }
 
-  let runtimeForm = emptyRuntimeForm();
-  let runtimeLoading = false;
-  let runtimeSaving = false;
-
-  $: filteredGroups = filterModelGroups(modelGroups, modelQuery);
-
-  function filterModelGroups(groups, q) {
-    if (!q.trim()) return groups;
-    const lq = q.toLowerCase();
-    return groups.map(g => {
-      const models = g.models.filter(e =>
-        (e.displayName || '').toLowerCase().includes(lq) ||
-        (e.model || '').toLowerCase().includes(lq) ||
-        (e.ref || '').toLowerCase().includes(lq)
-      );
-      return { ...g, models };
-    }).filter(g => g.models.length > 0);
-  }
-
-  onMount(async () => {
-    await Promise.all([refreshModels(), refreshProviders(), refreshRuntimeConfig()]);
-  });
-
-  async function refreshModels() {
-    try { allModels = await AllModelList(); } catch (e) { dispatch('error', errorText(e)); allModels = []; }
-    modelGroups = groupByProvider(allModels);
-  }
-
-  async function refreshProviders() {
-    providersLoading = true;
-    try { providers = await ProviderList(); } catch (e) { dispatch('error', errorText(e)); providers = []; }
-    providersLoading = false;
-  }
-
-  async function refreshConfigurationViews() {
-    await Promise.all([refreshProviders(), refreshModels()]);
-  }
-
-  function modelDisplayName(entry) {
-    return entry.displayName || entry.model || entry.ref;
-  }
-
-  async function toggleModel(entry, e) {
-    const hidden = !e.target.checked;
+  async function loadAll() {
     try {
-      await SetModelHidden(entry.ref, hidden);
-      await refreshModels();
-    } catch (err) { dispatch('error', errorText(err)); }
+      const [p, m] = await Promise.all([ProviderList(), AllModelList()]);
+      providers = p || [];
+      models = m || [];
+      if (!runtime) runtime = await GetRuntimeConfig();
+    } catch (e) { fail(e); }
   }
 
-  async function toggleProvider(group, e) {
-    const hidden = !e.target.checked;
-    try {
-      await SetProviderHidden(group.provider, hidden);
-      await refreshModels();
-    } catch (err) { dispatch('error', errorText(err)); }
-  }
+  onMount(async () => { loading = true; await loadAll(); loading = false; });
 
-  async function setDefaultModel(entry) {
-    try {
-      await SetDefaultModel(entry.ref);
-      await refreshModels();
-    } catch (err) { dispatch('error', errorText(err)); }
-  }
+  let openProvider = null;
+  function toggleFold(id) { openProvider = openProvider === id ? null : id; }
 
-  function emptyRuntimeForm() {
-    return {
-      sessions: { archive_after_days: 7, delete_after_archive_days: 7 },
-      compaction: { threshold_pct: 0.9, summarizer_model: '' },
-      subagents: { max_concurrent: 4, model: '' },
-      tools: {
-        max_output_bytes: 15360,
-        read_max_lines: 500,
-        read_line_max_chars: 5000,
-        command_timeout: 120,
-        max_background_processes: 10,
-      },
-    };
-  }
+  $: managedProviders = providers.filter((p) => p.connected || !p.builtin);
+  $: usableModels = models.filter((m) => !m.incomplete);
+  $: modelGroups = groupByProvider(usableModels);
+  $: configuredDefault = models.find((m) => m.default);
+  $: currentDefault = (usableModels.find((m) => m.default) || {}).ref || '';
+  $: unavailableDefault = configuredDefault && configuredDefault.incomplete ? configuredDefault.ref : '';
 
-  async function refreshRuntimeConfig() {
-    runtimeLoading = true;
-    try { runtimeForm = await GetRuntimeConfig(); }
-    catch (err) { dispatch('error', errorText(err)); runtimeForm = emptyRuntimeForm(); }
-    runtimeLoading = false;
-  }
-
-  function setRuntimeNumber(section, field, value, float = false) {
-    const n = float ? parseFloat(value) : parseInt(value, 10);
-    runtimeForm = {
-      ...runtimeForm,
-      [section]: { ...runtimeForm[section], [field]: Number.isFinite(n) ? n : 0 },
-    };
-  }
-
-  function setRuntimeText(section, field, value) {
-    runtimeForm = { ...runtimeForm, [section]: { ...runtimeForm[section], [field]: value } };
-  }
-
-  async function saveRuntimeConfig() {
-    runtimeSaving = true;
-    try {
-      await SetRuntimeConfig(runtimeForm);
-      await refreshRuntimeConfig();
-    } catch (err) { dispatch('error', errorText(err)); }
-    runtimeSaving = false;
-  }
-
-  function providerStatusText(provider) {
-    if (provider.connected) {
-      if (provider.keySource === 'managed') return 'Connected · Lightcode-managed key';
-      if (provider.keySource === 'external') return 'Connected · environment key';
-      if (provider.keySource === 'keyless') return 'Connected · keyless';
-      return 'Connected';
-    }
-    if (provider.keySource === 'external') return 'Environment key available · discovery needed';
-    if (provider.keySource === 'keyless') return 'Keyless, not connected';
-    return 'Not connected';
-  }
-
-  function providerActionNote(provider) {
-    if (provider.keySource === 'external') return `Key comes from ${provider.apiKeyEnv}; unset it outside Lightcode to disconnect.`;
-    if (provider.keySource === 'none' && provider.apiKeyEnv) return `Uses ${provider.apiKeyEnv}. Keys are write-only and never displayed.`;
-    if (provider.keySource === 'managed') return `Uses ${provider.apiKeyEnv}.`;
-    if (provider.keySource === 'keyless') return 'No API key required.';
-    return '';
-  }
-
-  function openConnect(provider) {
-    connectTarget = provider;
-    connectKey = '';
-  }
-
-  function cancelConnect() {
-    connectTarget = null;
-    connectKey = '';
-    connectBusy = false;
-  }
-
-  async function submitConnect() {
-    if (!connectTarget) return;
+  async function disconnect(p) { try { await DisconnectProvider(p.id); } catch (e) { fail(e); } finally { await loadAll(); } }
+  function openConnect(p) { connectTarget = p; connectKey = ''; }
+  async function connectProvider() {
+    if (!connectTarget || connectBusy) return;
     connectBusy = true;
-    try {
-      await ConnectProvider(connectTarget.id, connectKey);
-      cancelConnect();
-      await refreshConfigurationViews();
-    } catch (err) {
-      dispatch('error', errorText(err));
-      connectKey = '';
-      connectBusy = false;
-    }
+    try { await ConnectProvider(connectTarget.id, connectKey.trim()); connectTarget = null; connectKey = ''; }
+    catch (e) { fail(e); }
+    finally { connectBusy = false; await loadAll(); }
   }
+  async function remove(p) { try { await RemoveProvider(p.id); } catch (e) { fail(e); } finally { await loadAll(); } }
+  async function toggleModel(entry) { try { await SetModelHidden(entry.ref, !entry.hidden); } catch (e) { fail(e); } finally { await loadAll(); } }
+  async function toggleProvider(group) { try { await SetProviderHidden(group.provider, !group.providerHidden); } catch (e) { fail(e); } finally { await loadAll(); } }
+  async function pickDefault(ref) { if (!ref) return; try { await SetDefaultModel(ref); } catch (e) { fail(e); } finally { await loadAll(); } }
 
-  async function connectKeyless(provider) {
-    try {
-      await ConnectProvider(provider.id, '');
-      await refreshConfigurationViews();
-    } catch (err) { dispatch('error', errorText(err)); }
+  function cloneRuntimeConfig(value) {
+    return JSON.parse(JSON.stringify(value));
   }
-
-  async function connectWithExistingKey(provider) {
-    try {
-      await ConnectProvider(provider.id, '');
-      await refreshConfigurationViews();
-    } catch (err) { dispatch('error', errorText(err)); }
+  function clampInt(value, min, max, fallback) {
+    let n = Math.round(Number(value));
+    if (!Number.isFinite(n)) n = fallback;
+    return Math.max(min, Math.min(max, n));
   }
-
-  async function disconnect(provider) {
-    try {
-      await DisconnectProvider(provider.id);
-      await refreshConfigurationViews();
-    } catch (err) { dispatch('error', errorText(err)); }
-  }
-
-  async function remove(provider) {
-    try {
-      await RemoveProvider(provider.id);
-      await refreshConfigurationViews();
-    } catch (err) { dispatch('error', errorText(err)); }
-  }
-
-  function emptyCustomForm() {
-    return { id: '', name: '', baseURL: '', apiKeyEnv: '', apiKey: '', discovery: true, systemRole: '', usageInStream: null, maxTokensField: '', hidden: false };
-  }
-
-  function openCustomModal() {
-    customForm = emptyCustomForm();
-    customHeadersText = '{}';
-    customOptionsText = '{}';
-    customExtraBodyText = '{}';
-    candidates = [];
-    selectedModels = [];
-    customError = '';
-    customBusy = false;
-    showCustomModal = true;
-  }
-
-  function cancelCustom() {
-    showCustomModal = false;
-    customForm.apiKey = '';
-    customForm = emptyCustomForm();
-    customHeadersText = '{}';
-    customOptionsText = '{}';
-    customExtraBodyText = '{}';
-    candidates = [];
-    selectedModels = [];
-    customError = '';
-    customBusy = false;
-  }
-
-  async function fillGeneratedEnvName() {
-    if (!customForm.id.trim()) return;
-    try { customForm.apiKeyEnv = await GenerateAPIKeyEnvName(customForm.id.trim()); }
-    catch (err) { dispatch('error', errorText(err)); }
-  }
-
-  function parseJSONObject(text, label) {
-    const trimmed = text.trim();
-    if (!trimmed) return {};
-    let parsed;
-    try { parsed = JSON.parse(trimmed); }
-    catch (err) { throw new Error(`${label} must be valid JSON`); }
-    if (parsed === null || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error(`${label} must be a JSON object`);
-    return parsed;
-  }
-
-  function customRequest(models = selectedModels) {
-    const req = {
-      id: customForm.id.trim(),
-      name: customForm.name.trim(),
-      baseURL: customForm.baseURL.trim(),
-      apiKeyEnv: customForm.apiKeyEnv.trim(),
-      apiKey: customForm.apiKey,
-      discovery: customForm.discovery,
-      models,
-    };
-    const headers = parseJSONObject(customHeadersText, 'Headers');
-    const options = parseJSONObject(customOptionsText, 'Transport options');
-    const extraBody = parseJSONObject(customExtraBodyText, 'Extra body');
-    if (Object.keys(headers).length) req.headers = headers;
-    if (Object.keys(options).length) req.options = options;
-    if (Object.keys(extraBody).length) req.extraBody = extraBody;
-    if (customForm.systemRole.trim()) req.systemRole = customForm.systemRole.trim();
-    if (customForm.usageInStream !== null && customForm.usageInStream !== undefined) req.usageInStream = customForm.usageInStream;
-    if (customForm.maxTokensField.trim()) req.maxTokensField = customForm.maxTokensField.trim();
-    if (customForm.hidden) req.hidden = true;
-    return req;
-  }
-
-  async function runDiscovery() {
-    customError = '';
-    customBusy = true;
-    try {
-      const discovered = await DiscoverCustomProvider(customRequest([]));
-      candidates = discovered || [];
-      selectedModels = candidates.filter(c => c.usable).map(candidateToModel);
-    } catch (err) {
-      customError = errorText(err);
-      customForm.apiKey = '';
-    }
-    customBusy = false;
-  }
-
-  function candidateToModel(candidate) {
-    return {
-      id: candidate.id || '',
-      name: candidate.name || candidate.id || '',
-      contextWindow: candidate.contextWindow || 0,
-      maxOutputTokens: candidate.maxOutputTokens || 0,
-      cost: candidate.cost,
-      systemRole: '',
-      usageInStream: null,
-      hidden: false,
-    };
-  }
-
-  function addCandidate(candidate) {
-    if (selectedModels.some(m => m.id === candidate.id)) return;
-    selectedModels = [...selectedModels, candidateToModel(candidate)];
-  }
-
-  function addBlankModel() {
-    selectedModels = [...selectedModels, { id: '', name: '', contextWindow: 0, maxOutputTokens: 0, systemRole: '', usageInStream: null, hidden: false }];
-  }
-
-  function removeSelectedModel(index) {
-    selectedModels = selectedModels.filter((_, i) => i !== index);
-  }
-
-  function updateSelectedModel(index, field, value) {
-    selectedModels = selectedModels.map((model, i) => {
-      if (i !== index) return model;
-      if (field === 'contextWindow' || field === 'maxOutputTokens') {
-        const n = parseInt(value, 10);
-        return { ...model, [field]: Number.isFinite(n) ? n : 0 };
-      }
-      if (field === 'hidden') {
-        return { ...model, hidden: !!value };
-      }
-      if (field === 'usageInStream') {
-        return { ...model, usageInStream: value };
-      }
-      return { ...model, [field]: value };
+  async function saveRuntime() {
+    if (!runtime) return;
+    const snapshot = cloneRuntimeConfig(runtime);
+    runtimeSavesPending += 1;
+    savingRuntime = true;
+    runtimeSaveQueue = runtimeSaveQueue.catch(() => {}).then(async () => {
+      try { await SetRuntimeConfig(snapshot); }
+      catch (e) { fail(e); }
+      finally { runtime = await GetRuntimeConfig(); }
+    }).finally(() => {
+      runtimeSavesPending -= 1;
+      savingRuntime = runtimeSavesPending > 0;
     });
+    await runtimeSaveQueue;
+  }
+  async function setRuntimeInt(section, key, min, max, fallback, e) {
+    runtime[section][key] = clampInt(e.target.value, min, max, fallback);
+    await saveRuntime();
+  }
+  async function setThreshold(e) {
+    runtime.compaction.threshold_pct = clampInt(e.target.value, 10, 99, 90) / 100;
+    await saveRuntime();
+  }
+  async function setRuntimeModel(section, key, ref) {
+    runtime[section][key] = ref;
+    await saveRuntime();
   }
 
-  async function submitCustom() {
-    customError = '';
-    customBusy = true;
-    try {
-      await AddCustomProvider(customRequest(selectedModels));
-      cancelCustom();
-      await refreshConfigurationViews();
-    } catch (err) {
-      customError = errorText(err);
-      customForm.apiKey = '';
-      customBusy = false;
-    }
-  }
+  async function onProviderAdded() { showAdd = false; await loadAll(); }
+  function close() { dispatch('close'); }
 </script>
 
 <div class="layer">
-  <button type="button" class="backdrop" tabindex="-1" aria-label="Close settings" on:click={() => dispatch('close')}></button>
-  <div class="prompt" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabindex="-1">
-    <div class="hdr" id="settings-title">Settings</div>
-    <div class="body">
-      <div class="sidebar">
-        {#each sections as s}
-          <button class="nav-item" class:active={active === s.id} on:click={() => active = s.id}>{s.label}</button>
-        {/each}
-      </div>
+  <button type="button" class="backdrop" tabindex="-1" aria-label="Close settings" on:click={close}></button>
+  <div class="panel" role="dialog" aria-modal="true" aria-label="Settings" tabindex="-1">
+    <nav class="sidebar">
+      <div class="brand">Settings</div>
+      {#each TABS as t}
+        <button class="navitem" class:active={active === t.id} on:click={() => (active = t.id)}>{t.label}</button>
+      {/each}
+    </nav>
+
+    <section class="main">
+      <header class="bar">
+        <span class="bar-title">{TABS.find((t) => t.id === active).label}</span>
+        <button class="x" on:click={close} aria-label="Close">&#x2715;</button>
+      </header>
+
       <div class="content">
-        {#if active === 'appearance'}
-          <div class="section-title">Appearance</div>
-          <label class="option">
-            <span>Wrap code lines</span>
-            <span class="switch">
-              <input type="checkbox" checked={$settings.wrapCode} on:change={toggleWrap} />
-              <span class="track"><span class="thumb"></span></span>
-            </span>
-          </label>
-          <div class="option">
-            <span>Message font scale (%)</span>
-            <span class="stepper">
-              <button type="button" class="step" on:click={() => stepFontScale(-10)} disabled={$settings.fontScale <= 50}>−</button>
-              <input type="number" min="50" max="200" step="10" value={$settings.fontScale} on:change={setFontScale} class="num" />
-              <button type="button" class="step" on:click={() => stepFontScale(10)} disabled={$settings.fontScale >= 200}>+</button>
-            </span>
-          </div>
-        {/if}
-        {#if active === 'models'}
-          <div class="section-title">Models</div>
-          <p class="placeholder">Toggle model visibility in the model selector. Hidden models are still available by ref.</p>
-          <input class="model-search" type="text" placeholder="Filter models..." bind:value={modelQuery} />
-          {#each filteredGroups as group (group.provider)}
-            <div class="models-group">
-              <label class="option provider-row">
-                <span>{group.providerName}</span>
-                <span class="switch">
-                  <input type="checkbox" checked={!group.providerHidden} on:change={(e) => toggleProvider(group, e)} />
-                  <span class="track"><span class="thumb"></span></span>
-                </span>
-              </label>
-              {#each group.models as entry (entry.ref)}
-                <div class="option model-row" class:dimmed={group.providerHidden}>
-                  <span>
-                    {modelDisplayName(entry)}
-                    {#if entry.default}<small class="default-tag">Default</small>{/if}
-                  </span>
-                  <span class="model-actions">
-                    <button class="btn compact" type="button" disabled={entry.default} on:click={() => setDefaultModel(entry)}>Set default</button>
-                    <span class="switch">
-                      <input type="checkbox" checked={!entry.hidden} disabled={group.providerHidden} on:change={(e) => toggleModel(entry, e)} />
-                      <span class="track"><span class="thumb"></span></span>
-                    </span>
-                  </span>
+        {#if loading}
+          <div class="muted">Loading...</div>
+
+        {:else if active === 'providers'}
+          {#if managedProviders.length === 0}
+            <div class="empty">No providers connected</div>
+          {:else}
+            <div class="cards">
+              {#each managedProviders as p}
+                <div class="pcard" class:open={openProvider === p.id}>
+                  <div class="card">
+                    <button class="card-main" on:click={() => toggleFold(p.id)}>
+                      <span class="caret" class:open={openProvider === p.id}>›</span>
+                      <span>
+                        <span class="card-name">{p.name}</span>
+                        <span class="card-sub">{p.connected ? `${p.usableModels} model${p.usableModels === 1 ? '' : 's'}` : 'Disconnected'}{p.builtin ? '' : ' (custom)'}</span>
+                      </span>
+                    </button>
+                    <div class="card-actions">
+                      {#if !p.connected && p.apiKeyEnv}<button class="ghost" on:click={() => openConnect(p)}>Connect</button>{/if}
+                      {#if p.disconnectable}<button class="ghost" on:click={() => disconnect(p)}>Disconnect</button>{/if}
+                      {#if p.removable}<button class="ghost danger" on:click={() => remove(p)}>Remove</button>{/if}
+                    </div>
+                  </div>
+                  {#if openProvider === p.id}
+                    <div class="pfold">
+                      <ProviderConfig providerId={p.id} on:changed={loadAll} on:error={(e) => fail(e.detail)} />
+                    </div>
+                  {/if}
                 </div>
               {/each}
             </div>
-          {/each}
-        {/if}
-        {#if active === 'providers'}
-          <div class="section-heading">
-            <div>
-              <div class="section-title">Providers</div>
-              <p class="placeholder">Connect providers and manage custom OpenAI-compatible endpoints. API keys are write-only.</p>
-            </div>
-            <button class="btn" type="button" on:click={openCustomModal}>Add custom provider</button>
+          {/if}
+          <div class="addrow">
+            <button class="primary" on:click={() => (showAdd = true)}>+ Add provider</button>
           </div>
-          {#if providersLoading}
-            <p class="placeholder">Loading providers...</p>
+
+        {:else if active === 'models'}
+          {#if modelGroups.length === 0}
+            <div class="empty">No models yet</div>
           {:else}
-            {#each providers as provider (provider.id)}
-              <div class="provider-card">
-                <div class="provider-main">
-                  <div>
-                    <div class="provider-name">{provider.name || provider.id}</div>
-                    <div class="provider-id">{provider.id}{provider.builtin ? ' · built-in' : ' · custom'}</div>
+            {#each modelGroups as group}
+              <div class="mgroup">
+                <div class="mgroup-hdr">
+                  <span class="mgroup-name">{group.providerName}</span>
+                  <label class="switch">
+                    <input type="checkbox" checked={!group.providerHidden} on:change={() => toggleProvider(group)} />
+                    <span class="track"></span>
+                  </label>
+                </div>
+                {#each group.models as entry}
+                  <div class="mrow" class:dim={group.providerHidden}>
+                    <span class="mname">{entry.displayName || entry.model}</span>
+                    <label class="switch">
+                      <input type="checkbox" checked={!entry.hidden} disabled={group.providerHidden} on:change={() => toggleModel(entry)} />
+                      <span class="track"></span>
+                    </label>
                   </div>
-                  <span class:ok={provider.connected} class="status-pill">{providerStatusText(provider)}</span>
-                </div>
-                <div class="provider-meta">
-                  <span>{provider.usableModels} usable / {provider.modelCount} models</span>
-                  {#if provider.baseURL}<span>{provider.baseURL}</span>{/if}
-                </div>
-                {#if providerActionNote(provider)}<p class="provider-note">{providerActionNote(provider)}</p>{/if}
-                <div class="provider-actions">
-                  {#if provider.apiKeyEnv}
-                    {#if !provider.connected && (provider.keySource === 'managed' || provider.keySource === 'external')}
-                      <button class="btn" type="button" on:click={() => connectWithExistingKey(provider)}>Connect</button>
-                    {:else}
-                      <button class="btn" type="button" disabled={provider.connected && provider.keySource !== 'none'} on:click={() => openConnect(provider)}>Connect</button>
-                    {/if}
-                  {:else}
-                    <button class="btn" type="button" disabled={provider.connected} on:click={() => connectKeyless(provider)}>Connect</button>
-                  {/if}
-                  <button class="btn" type="button" disabled={!provider.disconnectable} on:click={() => disconnect(provider)}>Disconnect</button>
-                  <button class="btn" type="button" disabled={!provider.removable} on:click={() => remove(provider)}>Remove</button>
-                </div>
+                {/each}
               </div>
             {/each}
           {/if}
-        {/if}
-        {#if active === 'runtime'}
-          <div class="section-heading">
-            <div>
-              <div class="section-title">Runtime</div>
-              <p class="placeholder">Edit runtime settings stored in config.json.</p>
+
+        {:else if active === 'agent'}
+          <div class="field">
+            <span class="flabel">Default model</span>
+            <div class="stack">
+              <ModelPicker value={currentDefault} models={usableModels} placeholder="Select a model" on:change={(e) => pickDefault(e.detail)} />
+              {#if unavailableDefault}<span class="hint warn">Configured default is unavailable: {unavailableDefault}</span>{/if}
             </div>
-            <button class="btn" type="button" disabled={runtimeSaving || runtimeLoading} on:click={saveRuntimeConfig}>Save</button>
           </div>
-          {#if runtimeLoading}
-            <p class="placeholder">Loading runtime config...</p>
-          {:else}
-            <div class="runtime-group">
-              <div class="provider-row runtime-title">Sessions</div>
-              <label class="runtime-field">Archive after days<input class="model-search" type="number" min="1" max="365" value={runtimeForm.sessions.archive_after_days} on:input={(e) => setRuntimeNumber('sessions', 'archive_after_days', e.target.value)} /></label>
-              <label class="runtime-field">Delete after archive days<input class="model-search" type="number" min="1" max="365" value={runtimeForm.sessions.delete_after_archive_days} on:input={(e) => setRuntimeNumber('sessions', 'delete_after_archive_days', e.target.value)} /></label>
-            </div>
-            <div class="runtime-group">
-              <div class="provider-row runtime-title">Compaction</div>
-              <label class="runtime-field">Threshold percent<input class="model-search" type="number" min="0.1" max="0.99" step="0.01" value={runtimeForm.compaction.threshold_pct} on:input={(e) => setRuntimeNumber('compaction', 'threshold_pct', e.target.value, true)} /></label>
-              <label class="runtime-field">Summarizer model<input class="model-search" type="text" placeholder="provider/model or empty" value={runtimeForm.compaction.summarizer_model} on:input={(e) => setRuntimeText('compaction', 'summarizer_model', e.target.value)} /></label>
-            </div>
-            <div class="runtime-group">
-              <div class="provider-row runtime-title">Subagents</div>
-              <label class="runtime-field">Max concurrent<input class="model-search" type="number" min="1" max="20" value={runtimeForm.subagents.max_concurrent} on:input={(e) => setRuntimeNumber('subagents', 'max_concurrent', e.target.value)} /></label>
-              <label class="runtime-field">Model<input class="model-search" type="text" placeholder="provider/model or empty" value={runtimeForm.subagents.model} on:input={(e) => setRuntimeText('subagents', 'model', e.target.value)} /></label>
-            </div>
-            <div class="runtime-group">
-              <div class="provider-row runtime-title">Tools</div>
-              <label class="runtime-field">Max output bytes<input class="model-search" type="number" min="1024" max="1048576" value={runtimeForm.tools.max_output_bytes} on:input={(e) => setRuntimeNumber('tools', 'max_output_bytes', e.target.value)} /></label>
-              <label class="runtime-field">Read max lines<input class="model-search" type="number" min="10" max="10000" value={runtimeForm.tools.read_max_lines} on:input={(e) => setRuntimeNumber('tools', 'read_max_lines', e.target.value)} /></label>
-              <label class="runtime-field">Read line max chars<input class="model-search" type="number" min="100" max="100000" value={runtimeForm.tools.read_line_max_chars} on:input={(e) => setRuntimeNumber('tools', 'read_line_max_chars', e.target.value)} /></label>
-              <label class="runtime-field">Command timeout seconds<input class="model-search" type="number" min="5" max="600" value={runtimeForm.tools.command_timeout} on:input={(e) => setRuntimeNumber('tools', 'command_timeout', e.target.value)} /></label>
-              <label class="runtime-field">Max background processes<input class="model-search" type="number" min="1" max="50" value={runtimeForm.tools.max_background_processes} on:input={(e) => setRuntimeNumber('tools', 'max_background_processes', e.target.value)} /></label>
-            </div>
+
+          {#if runtime}
+            <div class="sec">Sessions</div>
+            <label class="field"><span class="flabel">Archive after (days)</span><input type="number" min="1" max="365" disabled={savingRuntime} value={runtime.sessions.archive_after_days} on:change={(e) => setRuntimeInt('sessions', 'archive_after_days', 1, 365, 30, e)} /></label>
+            <label class="field"><span class="flabel">Delete after archive (days)</span><input type="number" min="1" max="365" disabled={savingRuntime} value={runtime.sessions.delete_after_archive_days} on:change={(e) => setRuntimeInt('sessions', 'delete_after_archive_days', 1, 365, 90, e)} /></label>
+
+            <div class="sec">Compaction</div>
+            <label class="field"><span class="flabel">Threshold (%)</span><input type="number" min="10" max="99" disabled={savingRuntime} value={Math.round(runtime.compaction.threshold_pct * 100)} on:change={setThreshold} /></label>
+            <div class="field"><span class="flabel">Summarizer model</span><ModelPicker value={runtime.compaction.summarizer_model} models={usableModels} defaultLabel="Same as default" on:change={(e) => setRuntimeModel('compaction', 'summarizer_model', e.detail)} /></div>
+
+            <div class="sec">Subagents</div>
+            <label class="field"><span class="flabel">Max concurrent</span><input type="number" min="1" max="20" disabled={savingRuntime} value={runtime.subagents.max_concurrent} on:change={(e) => setRuntimeInt('subagents', 'max_concurrent', 1, 20, 4, e)} /></label>
+            <div class="field"><span class="flabel">Subagent model</span><ModelPicker value={runtime.subagents.model} models={usableModels} defaultLabel="Same as default" on:change={(e) => setRuntimeModel('subagents', 'model', e.detail)} /></div>
+
+            <div class="sec">Tools</div>
+            <label class="field"><span class="flabel">Max output (bytes)</span><input type="number" min="1024" max="1048576" disabled={savingRuntime} value={runtime.tools.max_output_bytes} on:change={(e) => setRuntimeInt('tools', 'max_output_bytes', 1024, 1048576, 65536, e)} /></label>
+            <label class="field"><span class="flabel">Read max lines</span><input type="number" min="10" max="10000" disabled={savingRuntime} value={runtime.tools.read_max_lines} on:change={(e) => setRuntimeInt('tools', 'read_max_lines', 10, 10000, 500, e)} /></label>
+            <label class="field"><span class="flabel">Read line max chars</span><input type="number" min="100" max="100000" disabled={savingRuntime} value={runtime.tools.read_line_max_chars} on:change={(e) => setRuntimeInt('tools', 'read_line_max_chars', 100, 100000, 2000, e)} /></label>
+            <label class="field"><span class="flabel">Command timeout (s)</span><input type="number" min="5" max="600" disabled={savingRuntime} value={runtime.tools.command_timeout} on:change={(e) => setRuntimeInt('tools', 'command_timeout', 5, 600, 180, e)} /></label>
+            <label class="field"><span class="flabel">Max background processes</span><input type="number" min="1" max="50" disabled={savingRuntime} value={runtime.tools.max_background_processes} on:change={(e) => setRuntimeInt('tools', 'max_background_processes', 1, 50, 10, e)} /></label>
           {/if}
+
+        {:else if active === 'appearance'}
+          <div class="mrow">
+            <span class="mname">Wrap code blocks</span>
+            <label class="switch">
+              <input type="checkbox" checked={$settings.wrapCode} on:change={(e) => settings.update((s) => ({ ...s, wrapCode: e.target.checked }))} />
+              <span class="track"></span>
+            </label>
+          </div>
+          <label class="field"><span class="flabel">Font scale (%)</span>
+            <input type="number" min="50" max="200" step="5" value={$settings.fontScale}
+              on:change={(e) => settings.update((s) => ({ ...s, fontScale: Math.max(50, Math.min(200, Number(e.target.value) || 100)) }))} />
+          </label>
         {/if}
       </div>
-    </div>
-    <div class="actions">
-      <button class="btn" on:click={() => dispatch('close')}>Close</button>
+    </section>
+  </div>
+</div>
+
+{#if showAdd}
+  <AddProvider {providers} on:added={onProviderAdded} on:close={() => (showAdd = false)} on:error={(e) => fail(e.detail)} />
+{/if}
+
+{#if connectTarget}
+  <div class="layer top">
+    <button type="button" class="backdrop" tabindex="-1" aria-label="Close connect provider" on:click={() => (connectTarget = null)}></button>
+    <div class="connect-prompt" role="dialog" aria-modal="true" aria-label="Connect provider">
+      <header class="bar"><span class="bar-title">Connect {connectTarget.name}</span></header>
+      <div class="connect-body">
+        <label class="field"><span class="flabel">API key</span><input type="password" autocomplete="off" placeholder={connectTarget.apiKeyEnv} bind:value={connectKey} /></label>
+        <div class="card-actions right">
+          <button class="ghost" disabled={connectBusy} on:click={() => (connectTarget = null)}>Cancel</button>
+          <button class="primary" disabled={connectBusy} on:click={connectProvider}>{connectBusy ? 'Connecting...' : 'Connect'}</button>
+        </div>
+      </div>
     </div>
   </div>
-
-  {#if connectTarget}
-    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="connect-title">
-      <div class="hdr" id="connect-title">Connect {connectTarget.name || connectTarget.id}</div>
-      <div class="modal-body">
-        <p class="placeholder">Enter the API key for {connectTarget.apiKeyEnv}. It will not be displayed again.</p>
-        <input class="model-search" type="password" autocomplete="off" placeholder="API key" bind:value={connectKey} />
-      </div>
-      <div class="actions">
-        <button class="btn" type="button" on:click={cancelConnect}>Cancel</button>
-        <button class="btn" type="button" disabled={connectBusy || !connectKey.trim()} on:click={submitConnect}>Connect</button>
-      </div>
-    </div>
-  {/if}
-
-  {#if showCustomModal}
-    <div class="modal-card custom-modal" role="dialog" aria-modal="true" aria-labelledby="custom-title">
-      <div class="hdr" id="custom-title">Add custom provider</div>
-      <div class="modal-body custom-body">
-        {#if customError}<p class="error-text">{customError}</p>{/if}
-        <div class="form-grid">
-          <label>Provider ID<input class="model-search" type="text" bind:value={customForm.id} placeholder="my-provider" /></label>
-          <label>Name<input class="model-search" type="text" bind:value={customForm.name} placeholder="My Provider" /></label>
-          <label>Base URL<input class="model-search" type="text" bind:value={customForm.baseURL} placeholder="https://example.com/v1" /></label>
-          <label>API key env<input class="model-search" type="text" bind:value={customForm.apiKeyEnv} placeholder="LIGHTCODE_MY_PROVIDER_API_KEY" /></label>
-        </div>
-        <div class="inline-actions">
-          <button class="btn" type="button" on:click={fillGeneratedEnvName} disabled={!customForm.id.trim()}>Generate env name</button>
-        </div>
-        <label>API key<input class="model-search" type="password" autocomplete="off" bind:value={customForm.apiKey} placeholder="Write-only key value" /></label>
-        <details class="advanced">
-          <summary>Advanced provider fields</summary>
-          <label>System role<select class="model-search" bind:value={customForm.systemRole}>
-            <option value="">Default (system)</option>
-            <option value="system">system</option>
-            <option value="developer">developer</option>
-          </select></label>
-          <label>Usage in stream<select class="model-search" value={customForm.usageInStream === null ? 'auto' : String(customForm.usageInStream)} on:change={(e) => { customForm.usageInStream = e.target.value === 'auto' ? null : e.target.value === 'true'; }}>
-            <option value="auto">Auto-detect</option>
-            <option value="true">true</option>
-            <option value="false">false</option>
-          </select></label>
-          <label>Max tokens field<input class="model-search" type="text" bind:value={customForm.maxTokensField} placeholder="max_completion_tokens" /></label>
-          <label class="option"><span>Hidden</span><input type="checkbox" bind:checked={customForm.hidden} /></label>
-          <label>Transport headers JSON<textarea bind:value={customHeadersText}></textarea></label>
-          <label>Transport options JSON<textarea bind:value={customOptionsText}></textarea></label>
-          <label>Provider extra_body JSON<textarea bind:value={customExtraBodyText}></textarea></label>
-        </details>
-        <div class="inline-actions">
-          <button class="btn" type="button" disabled={customBusy || !customForm.baseURL.trim()} on:click={runDiscovery}>Discover models</button>
-          <button class="btn" type="button" on:click={addBlankModel}>Add model manually</button>
-        </div>
-        {#if candidates.length}
-          <div class="section-title nested-title">Discovered models</div>
-          {#each candidates as candidate (candidate.id)}
-            <div class="candidate-row">
-              <span>{candidate.name || candidate.id}<small>{candidate.contextWindow || 0} context</small></span>
-              <button class="btn" type="button" disabled={!candidate.usable || selectedModels.some(m => m.id === candidate.id)} on:click={() => addCandidate(candidate)}>+</button>
-            </div>
-          {/each}
-        {/if}
-        <div class="section-title nested-title">Models</div>
-        {#if !selectedModels.length}<p class="placeholder">Add at least one usable model.</p>{/if}
-        {#each selectedModels as model, index}
-          <div class="model-editor">
-            <input class="model-search" type="text" placeholder="model id" value={model.id} on:input={(e) => updateSelectedModel(index, 'id', e.target.value)} />
-            <input class="model-search" type="text" placeholder="display name" value={model.name} on:input={(e) => updateSelectedModel(index, 'name', e.target.value)} />
-            <input class="model-search" type="number" min="0" placeholder="context" value={model.contextWindow} on:input={(e) => updateSelectedModel(index, 'contextWindow', e.target.value)} />
-            <input class="model-search" type="number" min="0" placeholder="max output" value={model.maxOutputTokens} on:input={(e) => updateSelectedModel(index, 'maxOutputTokens', e.target.value)} />
-            <details class="model-advanced">
-              <summary>Advanced</summary>
-              <select class="model-search" value={model.systemRole || ''} on:change={(e) => updateSelectedModel(index, 'systemRole', e.target.value)}>
-                <option value="">Default system role</option>
-                <option value="system">system</option>
-                <option value="developer">developer</option>
-              </select>
-              <select class="model-search" value={model.usageInStream === null ? 'auto' : String(model.usageInStream)} on:change={(e) => updateSelectedModel(index, 'usageInStream', e.target.value === 'auto' ? null : e.target.value === 'true')}>
-                <option value="auto">Usage in stream: auto</option>
-                <option value="true">Usage in stream: true</option>
-                <option value="false">Usage in stream: false</option>
-              </select>
-              <label class="option"><span>Hidden</span><input type="checkbox" checked={model.hidden || false} on:change={(e) => updateSelectedModel(index, 'hidden', e.target.checked)} /></label>
-            </details>
-            <button class="btn" type="button" on:click={() => removeSelectedModel(index)}>Remove</button>
-          </div>
-        {/each}
-      </div>
-      <div class="actions">
-        <button class="btn" type="button" on:click={cancelCustom}>Cancel</button>
-        <button class="btn" type="button" disabled={customBusy || !selectedModels.some(m => m.id.trim() && m.contextWindow > 0)} on:click={submitCustom}>Add provider</button>
-      </div>
-    </div>
-  {/if}
-</div>
+{/if}
 
 <style>
   .layer { position:fixed; inset:0; z-index:300; display:flex; align-items:center; justify-content:center; }
+  .layer.top { z-index:340; }
   .backdrop { position:absolute; inset:0; border:0; padding:0; margin:0; background:var(--overlay); cursor:default; }
-  .prompt { position:relative; z-index:1; background:var(--bg-elevated); border:1px solid var(--border-strong); min-width:560px; max-width:720px; height:88vh; max-height:88vh; display:flex; flex-direction:column; }
-  .hdr { padding:8px 12px; font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--border); }
-  .body { display:flex; flex:1; min-height:0; }
-  .sidebar { width:140px; border-right:1px solid var(--border); padding:8px 0; display:flex; flex-direction:column; overflow-y:auto; }
-  .nav-item { background:none; border:none; color:var(--text-dim); font-family:var(--font-ui); font-size:12px; padding:6px 12px; cursor:pointer; text-align:left; }
-  .nav-item:hover { color:var(--text); }
-  .nav-item.active { color:var(--accent); background:var(--accent-soft); }
-  .content { flex:1; padding:12px; overflow-y:auto; }
-  .section-title { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; color:var(--text); margin-bottom:8px; }
-  .section-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:8px; }
-  .placeholder { font-family:var(--font-ui); font-size:12px; color:var(--text-dim); margin:0 0 8px; }
-  .model-search { width:100%; padding:6px 12px; background:var(--bg-input); border:none; border-bottom:1px solid var(--border); color:var(--text); font-family:var(--font-ui); font-size:12px; outline:none; box-sizing:border-box; margin-bottom:8px; }
-  .model-search::placeholder { color:var(--text-dim); }
-  .model-search:focus { background:var(--bg-input-focus); }
-  .option { display:flex; align-items:center; justify-content:space-between; font-family:var(--font-ui); font-size:12px; color:var(--text); cursor:pointer; padding:6px 0; min-height:28px; }
-  .option + .option { border-top:1px solid var(--border); }
-  .models-group + .models-group { margin-top:12px; }
-  .provider-row { color:var(--text); font-weight:600; border-top:1px solid var(--border); }
-  .model-row { padding-left:16px; }
-  .model-row.dimmed { opacity:.4; }
-  .model-actions { display:inline-flex; align-items:center; gap:8px; }
-  .btn.compact { padding:2px 8px; }
-  .default-tag { color:var(--accent); margin-left:8px; font-size:11px; }
-  .switch { position:relative; display:inline-block; width:32px; height:18px; flex-shrink:0; }
-  .switch input { position:absolute; inset:0; opacity:0; cursor:pointer; margin:0; }
-  .switch .track { position:absolute; inset:0; background:var(--bg-input); border:1px solid var(--border-button); border-radius:999px; transition:background .15s, border-color .15s; }
-  .switch .thumb { position:absolute; top:2px; left:2px; width:12px; height:12px; background:var(--text-dim); border-radius:50%; transition:transform .15s, background .15s; }
-  .switch input:hover + .track { border-color:var(--accent); }
-  .switch input:disabled + .track { cursor:default; }
-  .switch input:disabled:hover + .track { border-color:var(--border-button); }
-  .switch input:checked + .track { background:var(--accent-soft); border-color:var(--accent); }
-  .switch input:checked + .track .thumb { transform:translateX(14px); background:var(--accent); }
-  .stepper { display:inline-flex; align-items:stretch; }
-  .stepper .step { width:22px; background:transparent; border:1px solid var(--border-button); color:var(--text-dim); font-family:var(--font-ui); font-size:13px; line-height:1; cursor:pointer; padding:0; }
-  .stepper .step:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
-  .stepper .step:disabled { opacity:.4; cursor:default; }
-  .stepper .step:first-child { border-right:none; }
-  .stepper .step:last-child { border-left:none; }
-  .option .num { width:48px; background:transparent; border:1px solid var(--border-button); color:var(--text); font-family:var(--font-ui); font-size:12px; padding:2px 6px; text-align:center; appearance:textfield; -moz-appearance:textfield; }
-  .option .num::-webkit-outer-spin-button, .option .num::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
-  .option .num:focus { outline:none; border-color:var(--accent); position:relative; z-index:1; }
-  .actions { display:flex; gap:8px; padding:8px 12px; border-top:1px solid var(--border); justify-content:flex-end; }
-  .btn { padding:4px 12px; font-size:12px; cursor:pointer; border:1px solid var(--border-button); background:none; color:var(--text-dim); font-family:var(--font-ui); }
-  .btn:hover:not(:disabled) { border-color:var(--accent); color:var(--text); }
-  .btn:disabled { opacity:.4; cursor:default; }
-  .provider-card { border-top:1px solid var(--border); padding:10px 0; font-family:var(--font-ui); font-size:12px; }
-  .provider-main { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
-  .provider-name { color:var(--text); font-weight:600; }
-  .provider-id, .provider-meta, .provider-note { color:var(--text-dim); }
-  .provider-meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
-  .provider-note { margin:6px 0 0; }
-  .provider-actions { display:flex; gap:8px; margin-top:8px; }
-  .runtime-group { border-top:1px solid var(--border); padding-top:8px; margin-top:12px; }
-  .runtime-title { padding-bottom:6px; }
-  .runtime-field { margin-bottom:8px; }
-  .status-pill { color:var(--text-dim); border:1px solid var(--border); padding:2px 6px; white-space:nowrap; }
-  .status-pill.ok { color:var(--accent); border-color:var(--accent); background:var(--accent-soft); }
-  .modal-card { position:absolute; z-index:2; width:420px; max-width:calc(100vw - 32px); max-height:86vh; display:flex; flex-direction:column; background:var(--bg-elevated); border:1px solid var(--border-strong); box-shadow:0 12px 32px rgba(0,0,0,.35); }
-  .custom-modal { width:640px; }
-  .modal-body { padding:12px; overflow-y:auto; }
-  .custom-body { max-height:70vh; }
-  .form-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-  .model-advanced { margin:4px 0; }
-  .model-advanced summary { font-size:11px; color:var(--text-dim); cursor:pointer; }
-  label { display:block; font-family:var(--font-ui); font-size:12px; color:var(--text-dim); }
-  .inline-actions { display:flex; gap:8px; margin:0 0 8px; }
-  .advanced { border-top:1px solid var(--border); border-bottom:1px solid var(--border); padding:8px 0; margin-bottom:8px; font-family:var(--font-ui); font-size:12px; color:var(--text-dim); }
-  .advanced summary { cursor:pointer; color:var(--text); margin-bottom:8px; }
-  textarea { width:100%; min-height:52px; margin:4px 0 8px; box-sizing:border-box; resize:vertical; background:var(--bg-input); border:1px solid var(--border); color:var(--text); font-family:var(--font-mono); font-size:12px; }
-  .nested-title { margin-top:12px; }
-  .candidate-row, .model-editor { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; border-top:1px solid var(--border); padding:6px 0; font-family:var(--font-ui); font-size:12px; color:var(--text); }
-  .candidate-row small { display:block; color:var(--text-dim); }
-  .model-editor { grid-template-columns:1fr 1fr 90px 90px auto; }
-  .model-editor .model-search { margin-bottom:0; }
-  .error-text { color:var(--accent); font-family:var(--font-ui); font-size:12px; margin:0 0 8px; }
+  .connect-prompt { position:relative; z-index:1; width:420px; max-width:92vw; background:var(--bg-elevated); border:1px solid var(--border-strong); border-radius:var(--radius); box-shadow:var(--shadow-lg); overflow:hidden; }
+  .connect-body { padding:16px; }
+  .right { justify-content:flex-end; }
+  .panel { position:relative; z-index:1; display:flex; width:720px; max-width:92vw; height:540px; max-height:88vh; background:var(--bg-elevated); border:1px solid var(--border-strong); border-radius:var(--radius); box-shadow:var(--shadow-lg); overflow:hidden; }
+
+  .sidebar { flex:0 0 160px; display:flex; flex-direction:column; padding:12px 8px; gap:2px; background:var(--bg); border-right:1px solid var(--border); }
+  .brand { padding:6px 10px 12px; font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--text-dim); }
+  .navitem { text-align:left; padding:8px 10px; border:0; border-radius:var(--radius); background:none; color:var(--text-dim); font-family:var(--font-ui); font-size:13px; cursor:pointer; }
+  .navitem:hover { background:var(--accent-soft); color:var(--text); }
+  .navitem.active { background:var(--accent-soft); color:var(--accent); }
+
+  .main { flex:1; display:flex; flex-direction:column; min-width:0; }
+  .bar { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--border); flex-shrink:0; }
+  .bar-title { font-size:13px; font-weight:600; }
+  .x { background:none; border:0; color:var(--text-dim); font-size:13px; cursor:pointer; padding:2px 6px; border-radius:var(--radius); }
+  .x:hover { color:var(--text); background:var(--accent-soft); }
+  .content { padding:16px; overflow-y:auto; min-height:0; }
+
+  .muted { color:var(--text-dim); font-size:13px; }
+  .empty { color:var(--text-dim); font-size:13px; padding:32px 0; text-align:center; }
+  .addrow { display:flex; margin-top:12px; }
+
+  .primary { padding:6px 12px; border:1px solid var(--border-button); border-radius:var(--radius); background:none; color:var(--text); font-family:var(--font-ui); font-size:13px; cursor:pointer; white-space:nowrap; }
+  .primary:hover { border-color:var(--accent); color:var(--accent); }
+
+  .cards { display:flex; flex-direction:column; gap:8px; }
+  .pcard { border:1px solid var(--border); border-radius:var(--radius); background:var(--bg); overflow:hidden; }
+  .pcard.open { border-color:var(--border-strong); }
+  .card { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; }
+  .card-main { display:flex; align-items:center; gap:10px; flex:1; min-width:0; background:none; border:0; padding:0; cursor:pointer; text-align:left; font-family:var(--font-ui); }
+  .caret { color:var(--text-dim); font-size:14px; transition:transform .12s; flex-shrink:0; }
+  .caret.open { transform:rotate(90deg); }
+  .card-name { display:block; font-size:14px; color:var(--text); }
+  .card-sub { display:block; font-size:12px; color:var(--text-dim); margin-top:2px; }
+  .card-actions { display:flex; gap:6px; flex-shrink:0; }
+  .pfold { border-top:1px solid var(--border); padding:10px 14px 14px; }
+  .ghost { padding:5px 10px; border:1px solid var(--border-button); border-radius:var(--radius); background:none; color:var(--text-dim); font-family:var(--font-ui); font-size:12px; cursor:pointer; }
+  .ghost:hover { border-color:var(--accent); color:var(--text); }
+  .ghost.danger:hover { border-color:var(--error); color:var(--error); }
+
+  .mgroup { margin-bottom:18px; }
+  .mgroup-hdr { display:flex; align-items:center; justify-content:space-between; padding:0 0 6px; border-bottom:1px solid var(--border); margin-bottom:6px; }
+  .mgroup-name { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--text-dim); }
+  .mrow { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:7px 2px; }
+  .mrow.dim { opacity:.45; }
+  .mname { font-size:13px; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  .switch { position:relative; display:inline-flex; flex-shrink:0; cursor:pointer; }
+  .switch input { position:absolute; opacity:0; width:0; height:0; }
+  .track { width:34px; height:18px; border-radius:9px; background:var(--border-button); transition:background .12s; position:relative; }
+  .track::after { content:''; position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%; background:var(--text-dim); transition:transform .12s, background .12s; }
+  .switch input:checked + .track { background:var(--accent); }
+  .switch input:checked + .track::after { transform:translateX(16px); background:#fff; }
+  .switch input:disabled + .track { opacity:.4; }
+
+  .field { display:grid; grid-template-columns:170px 1fr; align-items:center; gap:0 12px; margin-bottom:12px; }
+  .flabel { font-size:12px; color:var(--text-dim); }
+  .field input { width:100%; box-sizing:border-box; padding:7px 10px; border:1px solid var(--border-button); border-radius:var(--radius); background:var(--bg-input); color:var(--text); font-family:var(--font-ui); font-size:13px; outline:none; }
+  .field input:focus { border-color:var(--accent); background:var(--bg-input-focus); }
+  .field input:disabled { opacity:.55; cursor:not-allowed; }
+  .stack { display:flex; flex-direction:column; gap:4px; min-width:0; }
+  .hint { font-size:11px; color:var(--text-dim); }
+  .hint.warn { color:var(--error); }
+  .field input[type=number] { -moz-appearance:textfield; appearance:textfield; }
+  .field input[type=number]::-webkit-outer-spin-button,
+  .field input[type=number]::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
+  .sec { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--text-dim); margin:4px 0 12px; padding-top:10px; border-top:1px solid var(--border); }
 </style>
