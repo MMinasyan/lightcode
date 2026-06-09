@@ -7,12 +7,12 @@
   import InputArea from './components/InputArea.svelte';
   import StatusBar from './components/StatusBar.svelte';
   import ModelSelector from './components/ModelSelector.svelte';
+  import Settings from './components/Settings.svelte';
 
   import PermissionPrompt from './components/PermissionPrompt.svelte';
   import TokenDetails from './components/TokenDetails.svelte';
   import SessionSelector from './components/SessionSelector.svelte';
   import ProjectSelector from './components/ProjectSelector.svelte';
-  import Settings from './components/Settings.svelte';
   import WarningDetails from './components/WarningDetails.svelte';
   import Viewer from './components/Viewer.svelte';
   import { viewer, appendSubagentEvent } from './lib/viewer.js';
@@ -389,7 +389,7 @@
     on:compact={handleCompact}
     on:openSessionSelector={() => showSessionSelector=true}
     on:openProjectSelector={() => showProjectSelector=true}
-    on:openSettings={() => { settingsSection = 'appearance'; showSettings = true; }}
+    on:openSettings={() => { settingsSection = 'providers'; showSettings = true; }}
     on:openWarnings={() => showWarnings=true} />
   <div class="content" bind:this={contentEl} bind:clientWidth={contentWidth}>
     <MessageList {messages} {busy} {compacting} {messageQueue}
@@ -413,6 +413,10 @@
     <ModelSelector currentRef={modelRef} on:switched={handleModelSwitched} on:close={() => showModelSelector=false} on:manageSettings={handleManageSettings} on:error={(e) => showError(e.detail)} />
   {/if}
 
+  {#if showSettings}
+    <Settings initialSection={settingsSection} on:close={() => { showSettings = false; refreshCurrentModel(); }} on:error={(e) => showError(e.detail)} />
+  {/if}
+
   {#if currentPermission}
     <PermissionPrompt permission={currentPermission} onDone={() => { permissionQueue = permissionQueue.slice(1); }} on:error={(e) => showError(e.detail)} />
   {/if}
@@ -424,9 +428,6 @@
   {/if}
   {#if showProjectSelector}
     <ProjectSelector on:close={() => showProjectSelector=false} on:error={(e) => showError(e.detail)} />
-  {/if}
-  {#if showSettings}
-    <Settings initialSection={settingsSection} on:close={() => { showSettings=false; refreshCurrentModel(); }} on:error={(e) => showError(e.detail)} />
   {/if}
   {#if showWarnings}
     <WarningDetails {warnings} on:close={() => showWarnings=false} />

@@ -21,13 +21,19 @@ export function CurrentModel():Promise<agent.ModelInfo>;
 
 export function CurrentWarnings():Promise<Array<agent.PromptWarning>>;
 
+export function DeleteModel(arg1:string,arg2:string):Promise<void>;
+
 export function DisconnectProvider(arg1:string):Promise<void>;
 
 export function DiscoverCustomProvider(arg1:agent.CustomProviderRequest):Promise<Array<agent.DiscoveryModelCandidate>>;
 
+export function DiscoverableModels(arg1:string):Promise<Array<agent.DiscoveryModelCandidate>>;
+
 export function ForkSession(arg1:number):Promise<void>;
 
 export function GenerateAPIKeyEnvName(arg1:string):Promise<string>;
+
+export function GetProviderConfig(arg1:string):Promise<agent.ProviderConfigView>;
 
 export function GetRuntimeConfig():Promise<agent.RuntimeConfigSettings>;
 
@@ -55,11 +61,17 @@ export function Reload():Promise<void>;
 
 export function RemoveProvider(arg1:string):Promise<void>;
 
+export function ResetModelField(arg1:string,arg2:string,arg3:string):Promise<void>;
+
+export function ResetProviderField(arg1:string,arg2:string):Promise<void>;
+
 export function RespondPermission(arg1:string,arg2:string):Promise<void>;
 
 export function RevertCode(arg1:number):Promise<void>;
 
 export function RevertHistory(arg1:number):Promise<void>;
+
+export function SaveModel(arg1:string,arg2:string,arg3:agent.ModelConfigInput):Promise<void>;
 
 export function SaveProjectPermission(arg1:string,arg2:Array<string>):Promise<void>;
 
@@ -82,6 +94,8 @@ export function SessionSwitch(arg1:string):Promise<void>;
 export function SetDefaultModel(arg1:string):Promise<void>;
 
 export function SetModelHidden(arg1:string,arg2:boolean):Promise<void>;
+
+export function SetProviderConfig(arg1:string,arg2:agent.ProviderConfigInput):Promise<void>;
 
 export function SetProviderHidden(arg1:string,arg2:boolean):Promise<void>;
 

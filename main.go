@@ -122,7 +122,6 @@ func runCLI() error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = svc.Close() }()
 	return cli.New(svc).Run(context.Background())
 }
 
@@ -131,7 +130,6 @@ func runACP() error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = svc.Close() }()
 	return acp.New(svc).Run(context.Background())
 }
 
@@ -144,7 +142,6 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = svc.Close() }()
 
 	home, _ := os.UserHomeDir()
 	proj, err := svc.Projects().Ensure()
@@ -175,9 +172,6 @@ func runWails() error {
 			Assets: assets,
 		},
 		OnStartup: app.startup,
-		OnShutdown: func(ctx context.Context) {
-			_ = svc.Close()
-		},
-		Bind: []interface{}{app},
+		Bind:      []interface{}{app},
 	})
 }

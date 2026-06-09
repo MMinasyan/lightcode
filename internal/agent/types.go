@@ -108,17 +108,93 @@ type TokenReport struct {
 
 // ModelListEntry is one flat picker/list entry from the catalog.
 type ModelListEntry struct {
-	Ref            string        `json:"ref"`
-	Provider       string        `json:"provider"`
-	ProviderName   string        `json:"providerName"`
-	Model          string        `json:"model"`
-	DisplayName    string        `json:"displayName"`
-	ContextWindow  int           `json:"contextWindow"`
-	Cost           *catalog.Cost `json:"cost,omitempty"`
-	Hidden         bool          `json:"hidden"`
-	ProviderHidden bool          `json:"providerHidden"`
-	Incomplete     bool          `json:"incomplete"`
-	Default        bool          `json:"default"`
+	Ref             string        `json:"ref"`
+	Provider        string        `json:"provider"`
+	ProviderName    string        `json:"providerName"`
+	Model           string        `json:"model"`
+	DisplayName     string        `json:"displayName"`
+	ContextWindow   int           `json:"contextWindow"`
+	MaxOutputTokens int           `json:"maxOutputTokens"`
+	Cost            *catalog.Cost `json:"cost,omitempty"`
+	Hidden          bool          `json:"hidden"`
+	ProviderHidden  bool          `json:"providerHidden"`
+	Incomplete      bool          `json:"incomplete"`
+	Default         bool          `json:"default"`
+	// Source is the model's provenance: "bundled", "discovered", or "user".
+	// Only "user" models can be truly deleted from config; the others can be
+	// hidden or have individual field overrides reset.
+	Source string `json:"source"`
+}
+
+// ProviderConfigInput is the adapter-neutral payload for editing an existing
+// provider's config (transport + provider-level fields). It carries only set
+// fields; absent fields are left untouched. The API key value is never carried
+// here — secrets flow through ConnectProvider, write-only.
+type ProviderConfigInput struct {
+	Name             string                    `json:"name"`
+	BaseURL          string                    `json:"baseURL"`
+	APIKeyEnv        string                    `json:"apiKeyEnv"`
+	Headers          map[string]string         `json:"headers,omitempty"`
+	Options          map[string]any            `json:"options,omitempty"`
+	SystemRole       catalog.SystemRole        `json:"systemRole,omitempty"`
+	UsageInStream    *bool                     `json:"usageInStream,omitempty"`
+	MaxTokensField   string                    `json:"maxTokensField,omitempty"`
+	ExtraBody        map[string]any            `json:"extraBody,omitempty"`
+	Discovery        *bool                     `json:"discovery,omitempty"`
+	ProtocolMetadata *catalog.ProtocolMetadata `json:"protocolMetadata,omitempty"`
+}
+
+// ModelConfigInput is the adapter-neutral payload for adding or editing one
+// model's fields under a provider. Only set fields are written; absent fields
+// are left untouched (use ResetModelField to drop an override).
+type ModelConfigInput struct {
+	Name             string                    `json:"name"`
+	ContextWindow    int                       `json:"contextWindow"`
+	MaxOutputTokens  int                       `json:"maxOutputTokens"`
+	InputModalities  []catalog.Modality        `json:"inputModalities,omitempty"`
+	SystemRole       catalog.SystemRole        `json:"systemRole,omitempty"`
+	UsageInStream    *bool                     `json:"usageInStream,omitempty"`
+	ExtraBody        map[string]any            `json:"extraBody,omitempty"`
+	Cost             *catalog.Cost             `json:"cost,omitempty"`
+	ProtocolMetadata *catalog.ProtocolMetadata `json:"protocolMetadata,omitempty"`
+}
+
+// ProviderConfigView is the merged, effective config of one provider for the
+// config editor. Values reflect bundled+user+discovery; edits write overrides.
+type ProviderConfigView struct {
+	ID               string                    `json:"id"`
+	Name             string                    `json:"name"`
+	Builtin          bool                      `json:"builtin"`
+	Connected        bool                      `json:"connected"`
+	BaseURL          string                    `json:"baseURL"`
+	APIKeyEnv        string                    `json:"apiKeyEnv"`
+	GeneratedKeyEnv  string                    `json:"generatedKeyEnv"`
+	Headers          map[string]string         `json:"headers"`
+	UserHeaders      map[string]string         `json:"userHeaders"`
+	Options          map[string]any            `json:"options"`
+	SystemRole       string                    `json:"systemRole"`
+	UsageInStream    bool                      `json:"usageInStream"`
+	MaxTokensField   string                    `json:"maxTokensField"`
+	ExtraBody        map[string]any            `json:"extraBody"`
+	Discovery        bool                      `json:"discovery"`
+	ProtocolMetadata *catalog.ProtocolMetadata `json:"protocolMetadata"`
+	Models           []ModelConfigView         `json:"models"`
+}
+
+// ModelConfigView is the merged, effective config of one model for the editor.
+type ModelConfigView struct {
+	ID               string                    `json:"id"`
+	Name             string                    `json:"name"`
+	ContextWindow    int                       `json:"contextWindow"`
+	MaxOutputTokens  int                       `json:"maxOutputTokens"`
+	InputModalities  []catalog.Modality        `json:"inputModalities"`
+	SystemRole       string                    `json:"systemRole"`
+	UsageInStream    bool                      `json:"usageInStream"`
+	ExtraBody        map[string]any            `json:"extraBody"`
+	Cost             *catalog.Cost             `json:"cost"`
+	ProtocolMetadata *catalog.ProtocolMetadata `json:"protocolMetadata"`
+	Hidden           bool                      `json:"hidden"`
+	Source           string                    `json:"source"`
 }
 
 type RuntimeConfigSettings struct {

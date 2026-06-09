@@ -248,6 +248,104 @@ export namespace agent {
 	        this.max_output_tokens = source["max_output_tokens"];
 	    }
 	}
+	export class ModelConfigInput {
+	    name: string;
+	    contextWindow: number;
+	    maxOutputTokens: number;
+	    inputModalities?: string[];
+	    systemRole?: string;
+	    usageInStream?: boolean;
+	    extraBody?: Record<string, any>;
+	    cost?: catalog.Cost;
+	    protocolMetadata?: catalog.ProtocolMetadata;
+
+	    static createFrom(source: any = {}) {
+	        return new ModelConfigInput(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.contextWindow = source["contextWindow"];
+	        this.maxOutputTokens = source["maxOutputTokens"];
+	        this.inputModalities = source["inputModalities"];
+	        this.systemRole = source["systemRole"];
+	        this.usageInStream = source["usageInStream"];
+	        this.extraBody = source["extraBody"];
+	        this.cost = this.convertValues(source["cost"], catalog.Cost);
+	        this.protocolMetadata = this.convertValues(source["protocolMetadata"], catalog.ProtocolMetadata);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class ModelConfigView {
+	    id: string;
+	    name: string;
+	    contextWindow: number;
+	    maxOutputTokens: number;
+	    inputModalities: string[];
+	    systemRole: string;
+	    usageInStream: boolean;
+	    extraBody: Record<string, any>;
+	    cost?: catalog.Cost;
+	    protocolMetadata?: catalog.ProtocolMetadata;
+	    hidden: boolean;
+	    source: string;
+
+	    static createFrom(source: any = {}) {
+	        return new ModelConfigView(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.contextWindow = source["contextWindow"];
+	        this.maxOutputTokens = source["maxOutputTokens"];
+	        this.inputModalities = source["inputModalities"];
+	        this.systemRole = source["systemRole"];
+	        this.usageInStream = source["usageInStream"];
+	        this.extraBody = source["extraBody"];
+	        this.cost = this.convertValues(source["cost"], catalog.Cost);
+	        this.protocolMetadata = this.convertValues(source["protocolMetadata"], catalog.ProtocolMetadata);
+	        this.hidden = source["hidden"];
+	        this.source = source["source"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class ModelInfo {
 	    ref: string;
 	    provider: string;
@@ -297,11 +395,13 @@ export namespace agent {
 	    model: string;
 	    displayName: string;
 	    contextWindow: number;
+	    maxOutputTokens: number;
 	    cost?: catalog.Cost;
 	    hidden: boolean;
 	    providerHidden: boolean;
 	    incomplete: boolean;
 	    default: boolean;
+	    source: string;
 
 	    static createFrom(source: any = {}) {
 	        return new ModelListEntry(source);
@@ -315,11 +415,13 @@ export namespace agent {
 	        this.model = source["model"];
 	        this.displayName = source["displayName"];
 	        this.contextWindow = source["contextWindow"];
+	        this.maxOutputTokens = source["maxOutputTokens"];
 	        this.cost = this.convertValues(source["cost"], catalog.Cost);
 	        this.hidden = source["hidden"];
 	        this.providerHidden = source["providerHidden"];
 	        this.incomplete = source["incomplete"];
 	        this.default = source["default"];
+	        this.source = source["source"];
 	    }
 
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -373,6 +475,118 @@ export namespace agent {
 	        this.kind = source["kind"];
 	        this.message = source["message"];
 	    }
+	}
+	export class ProviderConfigInput {
+	    name: string;
+	    baseURL: string;
+	    apiKeyEnv: string;
+	    headers?: Record<string, string>;
+	    options?: Record<string, any>;
+	    systemRole?: string;
+	    usageInStream?: boolean;
+	    maxTokensField?: string;
+	    extraBody?: Record<string, any>;
+	    discovery?: boolean;
+	    protocolMetadata?: catalog.ProtocolMetadata;
+
+	    static createFrom(source: any = {}) {
+	        return new ProviderConfigInput(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.baseURL = source["baseURL"];
+	        this.apiKeyEnv = source["apiKeyEnv"];
+	        this.headers = source["headers"];
+	        this.options = source["options"];
+	        this.systemRole = source["systemRole"];
+	        this.usageInStream = source["usageInStream"];
+	        this.maxTokensField = source["maxTokensField"];
+	        this.extraBody = source["extraBody"];
+	        this.discovery = source["discovery"];
+	        this.protocolMetadata = this.convertValues(source["protocolMetadata"], catalog.ProtocolMetadata);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class ProviderConfigView {
+	    id: string;
+	    name: string;
+	    builtin: boolean;
+	    connected: boolean;
+	    baseURL: string;
+	    apiKeyEnv: string;
+	    generatedKeyEnv: string;
+	    headers: Record<string, string>;
+	    userHeaders: Record<string, string>;
+	    options: Record<string, any>;
+	    systemRole: string;
+	    usageInStream: boolean;
+	    maxTokensField: string;
+	    extraBody: Record<string, any>;
+	    discovery: boolean;
+	    protocolMetadata?: catalog.ProtocolMetadata;
+	    models: ModelConfigView[];
+
+	    static createFrom(source: any = {}) {
+	        return new ProviderConfigView(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.builtin = source["builtin"];
+	        this.connected = source["connected"];
+	        this.baseURL = source["baseURL"];
+	        this.apiKeyEnv = source["apiKeyEnv"];
+	        this.generatedKeyEnv = source["generatedKeyEnv"];
+	        this.headers = source["headers"];
+	        this.userHeaders = source["userHeaders"];
+	        this.options = source["options"];
+	        this.systemRole = source["systemRole"];
+	        this.usageInStream = source["usageInStream"];
+	        this.maxTokensField = source["maxTokensField"];
+	        this.extraBody = source["extraBody"];
+	        this.discovery = source["discovery"];
+	        this.protocolMetadata = this.convertValues(source["protocolMetadata"], catalog.ProtocolMetadata);
+	        this.models = this.convertValues(source["models"], ModelConfigView);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 	export class ProviderStatus {
 	    id: string;
