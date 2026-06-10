@@ -2,6 +2,7 @@ package agent
 
 import (
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/permission"
 )
 
@@ -227,11 +228,13 @@ type RuntimeToolsConfig struct {
 	MaxBackgroundProcesses int `json:"max_background_processes"`
 }
 
+// Key-source classes re-exported from internal/config, which owns the
+// classifier.
 const (
-	ProviderKeySourceNone     = "none"
-	ProviderKeySourceKeyless  = "keyless"
-	ProviderKeySourceManaged  = "managed"
-	ProviderKeySourceExternal = "external"
+	ProviderKeySourceNone     = config.KeySourceNone
+	ProviderKeySourceKeyless  = config.KeySourceKeyless
+	ProviderKeySourceManaged  = config.KeySourceManaged
+	ProviderKeySourceExternal = config.KeySourceExternal
 )
 
 // ProviderStatus describes a provider's setup state for adapter-neutral settings surfaces.

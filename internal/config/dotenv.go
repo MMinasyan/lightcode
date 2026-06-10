@@ -230,6 +230,58 @@ func LoadDotEnv() (*ManagedEnv, error) {
 	return m, nil
 }
 
+// ReadDotEnvKeys reads the .env file at path and returns the set of key
+// names it defines, plus human-readable descriptions of any malformed lines.
+// It is the read-only counterpart of LoadDotEnv: an absent file yields an
+// empty set without creating anything, values are parsed only to detect
+// malformed quoting and never retained, and the process environment is not
+// touched.
+func ReadDotEnvKeys(path string) (map[string]struct{}, []string, error) {
+	keys := map[string]struct{}{}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return keys, nil, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return keys, nil, nil
+		}
+		return nil, nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	var malformed []string
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			malformed = append(malformed, fmt.Sprintf("%s:%d: malformed line", path, lineNum))
+			continue
+		}
+
+		key := strings.TrimSpace(line[:eq])
+		value := strings.TrimSpace(line[eq+1:])
+		if _, err := parseEnvValue(value); err != nil {
+			malformed = append(malformed, fmt.Sprintf("%s:%d: malformed quoted value: %v", path, lineNum, err))
+			continue
+		}
+		keys[key] = struct{}{}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	return keys, malformed, nil
+}
+
 // NewManagedEnvForTest constructs a ManagedEnv bound to path with an empty
 // managed set. Intended for tests that want to exercise Set/Remove against a
 // specific file without going through LoadDotEnv.

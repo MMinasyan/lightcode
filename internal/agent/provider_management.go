@@ -84,17 +84,13 @@ func usableModelCount(prov *catalog.Provider) int {
 	return count
 }
 
+// keySourceLocked classifies via the shared classifier with the agent's env
+// semantics: LoadDotEnv already Setenv'd every managed key, so external means
+// set-in-env and not managed — managed keys stay managed.
 func (a *Agent) keySourceLocked(apiKeyEnv string) string {
-	if apiKeyEnv == "" {
-		return ProviderKeySourceKeyless
-	}
-	if a.env != nil && a.env.IsManaged(apiKeyEnv) {
-		return ProviderKeySourceManaged
-	}
-	if os.Getenv(apiKeyEnv) != "" {
-		return ProviderKeySourceExternal
-	}
-	return ProviderKeySourceNone
+	managed := func(name string) bool { return a.env != nil && a.env.IsManaged(name) }
+	external := func(name string) bool { return os.Getenv(name) != "" && !managed(name) }
+	return config.ClassifyKeySource(apiKeyEnv, external, managed)
 }
 
 // GenerateAPIKeyEnvName returns a stable, unique env var name derived from providerID.

@@ -3346,26 +3346,13 @@ func (a *Agent) providerConnected() bool {
 	return false
 }
 
+// providerConnected applies the shared connection predicate with the agent's
+// env semantics: LoadDotEnv already ran, so a plain non-empty Getenv covers
+// both shell-exported and .env-managed keys.
 func providerConnected(prov *catalog.Provider) bool {
-	if prov == nil || !providerHasUsableModel(prov) {
-		return false
-	}
-	if prov.Transport.APIKeyEnv != "" {
-		return os.Getenv(prov.Transport.APIKeyEnv) != ""
-	}
-	return prov.Transport.BaseURL != ""
-}
-
-func providerHasUsableModel(prov *catalog.Provider) bool {
-	if prov == nil {
-		return false
-	}
-	for _, model := range prov.Models {
-		if model != nil && model.ContextWindow > 0 {
-			return true
-		}
-	}
-	return false
+	return catalog.ProviderConnected(prov, func(name string) bool {
+		return os.Getenv(name) != ""
+	})
 }
 
 func (a *Agent) modelRefConnected(ref coremodel.ModelRef) bool {

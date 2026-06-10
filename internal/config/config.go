@@ -23,11 +23,6 @@ import (
 // ErrMissingEnvVar) to surface a friendlier hint that points at the .env file.
 var ErrMissingEnvVar = errors.New("provider API key env var is unset")
 
-// ErrEmptyConfig is returned (wrapped) by Load when the config file has no
-// default_model set. The catalog can still provide bundled providers, but the
-// runtime needs an explicit starting model.
-var ErrEmptyConfig = errors.New("config is empty — default_model must be set")
-
 // ConfigPath returns the path where Lightcode expects its main config file.
 // The user owns this file; it is auto-created as an empty skeleton on first
 // run if it does not exist.
@@ -37,6 +32,16 @@ func ConfigPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".lightcode", "config.json"), nil
+}
+
+// ResolvePath returns the config file path the process should use: the
+// LIGHTCODE_CONFIG override when set, otherwise ConfigPath(). It only
+// resolves the path — it never creates or reads the file.
+func ResolvePath() (string, error) {
+	if path := os.Getenv("LIGHTCODE_CONFIG"); path != "" {
+		return path, nil
+	}
+	return ConfigPath()
 }
 
 // emptyConfigTemplate is written to ~/.lightcode/config.json the first time
@@ -132,9 +137,9 @@ func defaultCompactionConfig() CompactionConfig {
 }
 
 // Load reads and parses the config file at path. If the file does not exist,
-// Load creates it with an empty skeleton and returns ErrEmptyConfig so the
-// caller can show the user what to put in it. Old provider/model tuple config
-// shapes are rejected with explicit cutover errors; no migration is attempted.
+// Load creates it with an empty skeleton (a valid config with no
+// default_model) and parses that. Old provider/model tuple config shapes are
+// rejected with explicit cutover errors; no migration is attempted.
 func Load(path string) (*Config, error) {
 	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -149,13 +154,25 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
-	if err := rejectOldShape(data); err != nil {
+	c, err := Parse(data)
+	if err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	return c, nil
+}
+
+// Parse parses and validates config bytes without touching the filesystem.
+// It accepts the empty first-run skeleton (an unset default_model is an
+// agent-start concern, not a parse error) and rejects the same old config
+// shapes Load rejects.
+func Parse(data []byte) (*Config, error) {
+	if err := rejectOldShape(data); err != nil {
+		return nil, err
 	}
 
 	var c Config
 	if err := json.Unmarshal(data, &c); err != nil {
-		return nil, fmt.Errorf("parse config %s: %w", path, err)
+		return nil, err
 	}
 	if c.Providers == nil {
 		c.Providers = map[string]any{}

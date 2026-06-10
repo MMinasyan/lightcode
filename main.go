@@ -82,13 +82,9 @@ func buildAgent() (*agent.Agent, error) {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
-	cfgPath := os.Getenv("LIGHTCODE_CONFIG")
-	if cfgPath == "" {
-		p, perr := config.ConfigPath()
-		if perr != nil {
-			return nil, fmt.Errorf("resolve config path: %w", perr)
-		}
-		cfgPath = p
+	cfgPath, err := config.ResolvePath()
+	if err != nil {
+		return nil, fmt.Errorf("resolve config path: %w", err)
 	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {

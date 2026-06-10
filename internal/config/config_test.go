@@ -168,3 +168,57 @@ func TestLoadMissingFileCreatesEmptyConfig(t *testing.T) {
 		t.Fatalf("Created config missing default_model field: %s", data)
 	}
 }
+
+func TestParseAcceptsEmptySkeleton(t *testing.T) {
+	cfg, err := Parse([]byte(emptyConfigTemplate))
+	if err != nil {
+		t.Fatalf("Parse(empty skeleton) returned error: %v", err)
+	}
+	if cfg.DefaultModel != "" {
+		t.Fatalf("DefaultModel = %q, want empty", cfg.DefaultModel)
+	}
+	if cfg.Providers == nil || len(cfg.Providers) != 0 {
+		t.Fatalf("Providers = %v, want empty map", cfg.Providers)
+	}
+	if !cfg.Sessions.AutoArchive || cfg.Sessions.ArchiveAfterDays != 7 {
+		t.Fatalf("Sessions defaults not applied: %+v", cfg.Sessions)
+	}
+	if !cfg.Compaction.Enabled || cfg.Compaction.ThresholdPct != 0.90 {
+		t.Fatalf("Compaction defaults not applied: %+v", cfg.Compaction)
+	}
+}
+
+func TestParseRejectsOldShapes(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{
+			name:    "default model object",
+			body:    `{"providers": {}, "default_model": {"provider": "openai", "model": "gpt-5.4-mini"}}`,
+			wantErr: "default_model must be a provider-prefixed string",
+		},
+		{
+			name:    "context windows map",
+			body:    `{"providers": {"openai": {"models": {"gpt-5.4-mini": {}}, "context_windows": {"gpt-5.4-mini": 128000}}}, "default_model": "openai/gpt-5.4-mini"}`,
+			wantErr: "providers.openai.context_windows is no longer supported",
+		},
+		{
+			name:    "invalid json",
+			body:    `{not json`,
+			wantErr: "invalid character",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.body))
+			if err == nil {
+				t.Fatalf("Parse returned nil error, want %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
