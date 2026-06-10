@@ -60,7 +60,7 @@ func TestBuildOfflineZeroWrites(t *testing.T) {
 		before := snapshotTree(t, home)
 		userRaw := map[string]any{
 			"local": map[string]any{
-				"transport": map[string]any{"base_url": "http://localhost:11434/v1"},
+				"transport": map[string]any{"base_url": "http://localhost:11434/v1", "api_key_env": ""},
 				"discovery": false,
 				"models":    map[string]any{"m1": map[string]any{"context_window": float64(8192)}},
 			},

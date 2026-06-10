@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 
+	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/doctor"
 	"github.com/MMinasyan/lightcode/internal/version"
 )
 
@@ -63,12 +66,13 @@ func checkNoArgs(fs *flag.FlagSet) error {
 	return nil
 }
 
-// servePort and versionJSON are bound by their FlagSets; the *Var calls
-// reset them to defaults on every flags() call, so state never leaks
-// between dispatches.
+// servePort, versionJSON, and doctorJSON are bound by their FlagSets; the
+// *Var calls reset them to defaults on every flags() call, so state never
+// leaks between dispatches.
 var (
 	servePort   int
 	versionJSON bool
+	doctorJSON  bool
 )
 
 // commands is filled in init: the help entry's closure walks the registry
@@ -150,6 +154,21 @@ func init() {
 			},
 		},
 		{
+			name:    "doctor",
+			summary: "diagnose the install, config, and providers",
+			flags: func() *flag.FlagSet {
+				fs := newFlagSet("doctor")
+				fs.BoolVar(&doctorJSON, "json", false, "machine-readable output")
+				return fs
+			},
+			run: func(fs *flag.FlagSet, args []string) error {
+				if err := checkNoArgs(fs); err != nil {
+					return err
+				}
+				return runDoctor(doctorJSON)
+			},
+		},
+		{
 			name:    "help",
 			summary: "show help for a command",
 			args:    "[command]",
@@ -172,6 +191,49 @@ func init() {
 			},
 		},
 	}
+}
+
+// runDoctor renders the diagnostics report on outW. Any FAIL makes the
+// command exit 1; warnings alone exit 0.
+func runDoctor(asJSON bool) error {
+	home, homeErr := os.UserHomeDir()
+	cfgPath, cfgPathErr := config.ResolvePath()
+	workDir, _ := os.Getwd()
+	binPath, binErr := os.Executable()
+	if binErr != nil {
+		binPath = fmt.Sprintf("unknown (%v)", binErr)
+	}
+	report, noProviders := doctor.Run(doctor.Params{
+		Home:          home,
+		HomeErr:       homeErr,
+		ConfigPath:    cfgPath,
+		ConfigPathErr: cfgPathErr,
+		WorkDir:       workDir,
+		BinaryPath:    binPath,
+		Version:       version.String(),
+		Platform:      runtime.GOOS + "/" + runtime.GOARCH,
+		LookupEnv:     os.LookupEnv,
+	})
+
+	if asJSON {
+		b, err := json.Marshal(report)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(outW, string(b))
+	} else {
+		for _, c := range report.Checks {
+			fmt.Fprintf(outW, "%s %s/%s: %s\n", c.Status, c.Group, c.Name, c.Detail)
+		}
+		fmt.Fprintf(outW, "doctor: %d ok, %d warnings, %d failures\n", report.OK, report.Warnings, report.Failures)
+		if noProviders && report.Failures == 0 {
+			fmt.Fprintln(outW, "no providers connected yet - this is expected on a new install")
+		}
+	}
+	if report.Failures > 0 {
+		return fmt.Errorf("doctor found %d failures", report.Failures)
+	}
+	return nil
 }
 
 func findCommand(name string) *command {

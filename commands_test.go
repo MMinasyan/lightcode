@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -149,7 +152,7 @@ func TestShouldDetachRespectsEnv(t *testing.T) {
 }
 
 func TestDispatchPerCommandHelpFlag(t *testing.T) {
-	for _, name := range []string{"desktop", "cli", "serve", "acp", "help"} {
+	for _, name := range []string{"desktop", "cli", "serve", "acp", "doctor", "help"} {
 		_, code, stdout, stderr := capture(t, []string{"lightcode", name, "-h"})
 		if code != 0 {
 			t.Fatalf("%s -h: exit code = %d, want 0", name, code)
@@ -185,6 +188,7 @@ func TestDispatchUnexpectedPositionals(t *testing.T) {
 		{"lightcode", "acp", "extra"},
 		{"lightcode", "desktop", "extra"},
 		{"lightcode", "serve", "extra"},
+		{"lightcode", "doctor", "extra"},
 	} {
 		gui, code, stdout, stderr := capture(t, argv)
 		if gui {
@@ -257,4 +261,95 @@ func TestDispatchVersionExtraArgs(t *testing.T) {
 			t.Fatalf("%v: stderr missing message: %q", argv, stderr)
 		}
 	}
+}
+
+func TestDispatchDoctor(t *testing.T) {
+	t.Run("fresh home exits 0 with the report on stdout", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("LIGHTCODE_CONFIG", "")
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "doctor"})
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+		}
+		if stderr != "" {
+			t.Fatalf("stderr must be empty, got %q", stderr)
+		}
+		if !strings.Contains(stdout, "doctor: ") {
+			t.Fatalf("stdout missing summary line: %q", stdout)
+		}
+		if !strings.Contains(stdout, "no providers connected yet - this is expected on a new install") {
+			t.Fatalf("stdout missing fresh-install appendix: %q", stdout)
+		}
+		if strings.Contains(stdout, "fail ") {
+			t.Fatalf("fresh home must not FAIL: %q", stdout)
+		}
+		if _, err := os.Stat(filepath.Join(home, ".lightcode")); !os.IsNotExist(err) {
+			t.Fatal("doctor created the data dir")
+		}
+	})
+
+	t.Run("json emits the report shape on stdout", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("LIGHTCODE_CONFIG", "")
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "doctor", "--json"})
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0\nstderr: %s", code, stderr)
+		}
+		if stderr != "" {
+			t.Fatalf("stderr must be empty, got %q", stderr)
+		}
+		var decoded struct {
+			Checks []map[string]any `json:"checks"`
+			OK     *int             `json:"ok"`
+			Warn   *int             `json:"warnings"`
+			Fail   *int             `json:"failures"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("stdout is not valid JSON: %v\n%q", err, stdout)
+		}
+		if decoded.OK == nil || decoded.Warn == nil || decoded.Fail == nil || len(decoded.Checks) == 0 {
+			t.Fatalf("missing top-level fields: %s", stdout)
+		}
+		for _, field := range []string{"group", "name", "status", "detail"} {
+			if _, ok := decoded.Checks[0][field]; !ok {
+				t.Fatalf("check missing %q: %v", field, decoded.Checks[0])
+			}
+		}
+	})
+
+	t.Run("invalid config exits 1", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("LIGHTCODE_CONFIG", "")
+		if err := os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, ".lightcode", "config.json"), []byte("{bad json"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "doctor"})
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1\nstdout: %s", code, stdout)
+		}
+		if !strings.Contains(stdout, "fail data/config:") {
+			t.Fatalf("stdout missing config FAIL: %q", stdout)
+		}
+		if !strings.HasPrefix(stderr, "lightcode: ") {
+			t.Fatalf("stderr missing error prefix: %q", stderr)
+		}
+	})
+
+	t.Run("unresolvable home exits 1", func(t *testing.T) {
+		t.Setenv("HOME", "")
+		t.Setenv("LIGHTCODE_CONFIG", "")
+		_, code, stdout, _ := capture(t, []string{"lightcode", "doctor"})
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1\nstdout: %s", code, stdout)
+		}
+		if !strings.Contains(stdout, "fail install/") {
+			t.Fatalf("stdout missing install-group FAIL: %q", stdout)
+		}
+	})
 }

@@ -1,0 +1,581 @@
+package doctor
+
+import (
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/config"
+)
+
+func snapshotTree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	snap := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		snap[path] = fmt.Sprintf("%d:%d:%v", info.Size(), info.ModTime().UnixNano(), info.IsDir())
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("snapshot %s: %v", root, err)
+	}
+	return snap
+}
+
+// run executes doctor.Run and asserts zero filesystem writes under home.
+func run(t *testing.T, p Params) (Report, bool) {
+	t.Helper()
+	before := snapshotTree(t, p.Home)
+	report, noProviders := Run(p)
+	after := snapshotTree(t, p.Home)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("doctor wrote to the filesystem:\nbefore: %v\nafter:  %v", before, after)
+	}
+	return report, noProviders
+}
+
+func params(home string) Params {
+	return Params{
+		Home:       home,
+		ConfigPath: filepath.Join(home, ".lightcode", "config.json"),
+		WorkDir:    "/nonexistent-workdir",
+		BinaryPath: "/test/lightcode",
+		Version:    "dev",
+		Platform:   "linux/amd64",
+		LookupEnv:  func(string) (string, bool) { return "", false },
+	}
+}
+
+func find(t *testing.T, r Report, group, name string) Check {
+	t.Helper()
+	for _, c := range r.Checks {
+		if c.Group == group && c.Name == name {
+			return c
+		}
+	}
+	t.Fatalf("no check %s/%s in %+v", group, name, r.Checks)
+	return Check{}
+}
+
+func writeConfig(t *testing.T, home, body string) {
+	t.Helper()
+	dir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// keyedProviderConfig is a valid user provider with one usable model whose
+// key env is DOCTOR_TEST_KEY.
+const keyedProviderConfig = `{
+  "providers": {
+    "keyedtest": {
+      "name": "Keyed Test",
+      "transport": {"base_url": "https://keyed.example/v1", "api_key_env": "DOCTOR_TEST_KEY"},
+      "discovery": false,
+      "models": {"m1": {"context_window": 8192}}
+    }
+  },
+  "default_model": ""
+}`
+
+func TestFreshHome(t *testing.T) {
+	home := t.TempDir()
+	report, noProviders := run(t, params(home))
+	if report.Failures != 0 {
+		t.Fatalf("fresh home has failures: %+v", report.Checks)
+	}
+	if !noProviders {
+		t.Fatal("fresh home must report no providers connected")
+	}
+	c := find(t, report, "data", "dir")
+	if c.Status != StatusOK || c.Detail != "not created yet (created on first run)" {
+		t.Fatalf("data/dir = %+v", c)
+	}
+	for _, check := range report.Checks {
+		if check.Group == "data" && check.Name != "dir" {
+			t.Fatalf("data group not skipped on absent dir: %+v", check)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, ".lightcode")); !os.IsNotExist(err) {
+		t.Fatal("doctor created the data dir")
+	}
+}
+
+func TestMissingConfigReportedNotCreated(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	report, _ := run(t, params(home))
+	c := find(t, report, "data", "config")
+	if c.Status != StatusOK || c.Detail != "config.json: not created yet (created on first run)" {
+		t.Fatalf("data/config = %+v", c)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".lightcode", "config.json")); !os.IsNotExist(err) {
+		t.Fatal("doctor created config.json")
+	}
+}
+
+func TestInvalidConfigFails(t *testing.T) {
+	home := t.TempDir()
+	writeConfig(t, home, `{not json`)
+	report, _ := run(t, params(home))
+	if find(t, report, "data", "config").Status != StatusFail {
+		t.Fatalf("invalid config not FAIL: %+v", report.Checks)
+	}
+	if report.Failures == 0 {
+		t.Fatal("invalid config must count as a failure")
+	}
+}
+
+func TestEmptySkeletonIsFreshMachine(t *testing.T) {
+	home := t.TempDir()
+	writeConfig(t, home, `{"providers": {}, "default_model": ""}`)
+	report, noProviders := run(t, params(home))
+	if report.Failures != 0 {
+		t.Fatalf("empty skeleton has failures: %+v", report.Checks)
+	}
+	if !noProviders {
+		t.Fatal("empty skeleton must report no providers connected")
+	}
+	if find(t, report, "setup", "provider").Status != StatusWarn {
+		t.Fatal("setup/provider should warn with nothing connected")
+	}
+	if find(t, report, "setup", "default-model").Status != StatusWarn {
+		t.Fatal("setup/default-model should warn on empty default")
+	}
+}
+
+func TestKeySourceClasses(t *testing.T) {
+	t.Run("unset key warns", func(t *testing.T) {
+		home := t.TempDir()
+		writeConfig(t, home, keyedProviderConfig)
+		report, _ := run(t, params(home))
+		c := find(t, report, "providers", "keyedtest")
+		if c.Status != StatusWarn {
+			t.Fatalf("unset key = %+v, want warn", c)
+		}
+	})
+
+	t.Run("shell env key is external", func(t *testing.T) {
+		home := t.TempDir()
+		writeConfig(t, home, keyedProviderConfig)
+		p := params(home)
+		p.LookupEnv = func(name string) (string, bool) {
+			if name == "DOCTOR_TEST_KEY" {
+				return "x", true
+			}
+			return "", false
+		}
+		report, noProviders := run(t, p)
+		c := find(t, report, "providers", "keyedtest")
+		if c.Status != StatusOK || c.Detail != "key external, connected, 1 usable models" {
+			t.Fatalf("shell key = %+v", c)
+		}
+		if noProviders {
+			t.Fatal("a connected provider must clear the fresh-install hint")
+		}
+		if find(t, report, "setup", "provider").Status != StatusOK {
+			t.Fatal("setup/provider should be ok with a connected provider")
+		}
+	})
+
+	t.Run("dotenv-only key is managed and connected", func(t *testing.T) {
+		home := t.TempDir()
+		writeConfig(t, home, keyedProviderConfig)
+		if err := os.WriteFile(filepath.Join(home, ".lightcode", ".env"), []byte("DOCTOR_TEST_KEY=x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		report, _ := run(t, params(home))
+		c := find(t, report, "providers", "keyedtest")
+		if c.Status != StatusOK || c.Detail != "key managed, connected, 1 usable models" {
+			t.Fatalf("dotenv-only key = %+v (the false-none/false-disconnected regression)", c)
+		}
+	})
+
+	t.Run("shell beats dotenv", func(t *testing.T) {
+		home := t.TempDir()
+		writeConfig(t, home, keyedProviderConfig)
+		if err := os.WriteFile(filepath.Join(home, ".lightcode", ".env"), []byte("DOCTOR_TEST_KEY=x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		p := params(home)
+		p.LookupEnv = func(name string) (string, bool) { return "x", name == "DOCTOR_TEST_KEY" }
+		report, _ := run(t, p)
+		if c := find(t, report, "providers", "keyedtest"); c.Detail != "key external, connected, 1 usable models" {
+			t.Fatalf("shell+dotenv key = %+v, want external", c)
+		}
+	})
+}
+
+func TestConnectionSemantics(t *testing.T) {
+	t.Run("keyless with base url and usable model connects", func(t *testing.T) {
+		home := t.TempDir()
+		writeConfig(t, home, `{
+  "providers": {
+    "keylesstest": {
+      "transport": {"base_url": "http://localhost:11434/v1", "api_key_env": ""},
+      "discovery": false,
+      "models": {"m1": {"context_window": 8192}}
+    }
+  },
+  "default_model": ""
+}`)
+		report, noProviders := run(t, params(home))
+		c := find(t, report, "providers", "keylesstest")
+		if c.Status != StatusOK || c.Detail != "key keyless, connected, 1 usable models" {
+			t.Fatalf("keyless = %+v", c)
+		}
+		if noProviders {
+			t.Fatal("keyless connected provider must count as connected")
+		}
+	})
+
+	t.Run("keyed with env set but no usable model stays disconnected", func(t *testing.T) {
+		home := t.TempDir()
+		writeConfig(t, home, `{
+  "providers": {
+    "nousable": {
+      "transport": {"base_url": "https://x.example/v1", "api_key_env": "DOCTOR_TEST_KEY"},
+      "discovery": false,
+      "models": {"m1": {}}
+    }
+  },
+  "default_model": ""
+}`)
+		p := params(home)
+		p.LookupEnv = func(name string) (string, bool) { return "x", name == "DOCTOR_TEST_KEY" }
+		report, noProviders := run(t, p)
+		c := find(t, report, "providers", "nousable")
+		if c.Detail != "key external, not connected, 0 usable models" {
+			t.Fatalf("no-usable-model provider = %+v", c)
+		}
+		if !noProviders {
+			t.Fatal("a provider without usable models must not count as connected")
+		}
+	})
+}
+
+func TestDefaultModelChecks(t *testing.T) {
+	configWithDefault := func(defaultModel, modelBody string) string {
+		return `{
+  "providers": {
+    "keyedtest": {
+      "transport": {"base_url": "https://keyed.example/v1", "api_key_env": "DOCTOR_TEST_KEY"},
+      "discovery": false,
+      "models": {"m1": ` + modelBody + `}
+    }
+  },
+  "default_model": "` + defaultModel + `"
+}`
+	}
+	envSet := func(name string) (string, bool) { return "x", name == "DOCTOR_TEST_KEY" }
+
+	cases := []struct {
+		name       string
+		config     string
+		env        func(string) (string, bool)
+		wantStatus string
+	}{
+		{"available default model", configWithDefault("keyedtest/m1", `{"context_window": 8192}`), envSet, StatusOK},
+		{"missing default model", configWithDefault("keyedtest/nosuch", `{"context_window": 8192}`), envSet, StatusWarn},
+		{"incomplete default model", configWithDefault("keyedtest/m1", `{}`), envSet, StatusWarn},
+		{"provider not connected", configWithDefault("keyedtest/m1", `{"context_window": 8192}`), nil, StatusWarn},
+		{"hidden but complete default model", configWithDefault("keyedtest/m1", `{"context_window": 8192, "hidden": true}`), envSet, StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			writeConfig(t, home, tc.config)
+			p := params(home)
+			if tc.env != nil {
+				p.LookupEnv = tc.env
+			}
+			report, _ := run(t, p)
+			if c := find(t, report, "setup", "default-model"); c.Status != tc.wantStatus {
+				t.Fatalf("setup/default-model = %+v, want %s", c, tc.wantStatus)
+			}
+		})
+	}
+}
+
+// An unparseable default_model cannot reach the setup check through a real
+// config (config.Parse rejects non-prefixed refs), so the defensive branch
+// is exercised directly.
+func TestSetupModelCheckUnparseableRef(t *testing.T) {
+	var checks []Check
+	add := func(group, name, status, detail string) {
+		checks = append(checks, Check{Group: group, Name: name, Status: status, Detail: detail})
+	}
+	cfg := &config.Config{DefaultModel: "no-slash-ref"}
+	setupModelCheck(cfg, &catalog.Catalog{Providers: map[string]*catalog.Provider{}}, func(string) bool { return false }, add)
+	if len(checks) != 1 || checks[0].Status != StatusWarn {
+		t.Fatalf("checks = %+v, want one warn", checks)
+	}
+}
+
+func TestCatalogWarningSeverities(t *testing.T) {
+	t.Run("user_config_skip is a failure", func(t *testing.T) {
+		home := t.TempDir()
+		writeConfig(t, home, `{"providers": {"droppedprovider": 42}, "default_model": ""}`)
+		report, _ := run(t, params(home))
+		c := find(t, report, "catalog", "droppedprovider")
+		if c.Status != StatusFail {
+			t.Fatalf("user_config_skip = %+v, want fail", c)
+		}
+		if report.Failures == 0 {
+			t.Fatal("a dropped user provider must fail the run")
+		}
+	})
+
+	t.Run("empty provider warns", func(t *testing.T) {
+		home := t.TempDir()
+		writeConfig(t, home, `{
+  "providers": {"emptytest": {"transport": {"base_url": "https://e.example/v1", "api_key_env": ""}, "discovery": false, "models": {}}},
+  "default_model": ""
+}`)
+		report, _ := run(t, params(home))
+		if c := find(t, report, "catalog", "emptytest"); c.Status != StatusWarn {
+			t.Fatalf("empty_provider = %+v, want warn", c)
+		}
+		if report.Failures != 0 {
+			t.Fatal("empty_provider must not fail the run")
+		}
+	})
+
+	t.Run("incomplete model warns", func(t *testing.T) {
+		home := t.TempDir()
+		writeConfig(t, home, `{
+  "providers": {"incompletetest": {"transport": {"base_url": "https://i.example/v1", "api_key_env": ""}, "discovery": false, "models": {"m1": {}}}},
+  "default_model": ""
+}`)
+		report, _ := run(t, params(home))
+		if c := find(t, report, "catalog", "incompletetest"); c.Status != StatusWarn {
+			t.Fatalf("incomplete_model = %+v, want warn", c)
+		}
+	})
+
+	t.Run("corrupt discovery cache warns", func(t *testing.T) {
+		home := t.TempDir()
+		dir := filepath.Join(home, ".lightcode", "cache", "discovery")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "cacheprov.json"), []byte("{not json"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		report, _ := run(t, params(home))
+		if c := find(t, report, "catalog", "cacheprov"); c.Status != StatusWarn {
+			t.Fatalf("discovery_failure = %+v, want warn", c)
+		}
+	})
+
+	t.Run("severity mapping covers bundled skip and unknown kinds", func(t *testing.T) {
+		var checks []Check
+		add := func(group, name, status, detail string) {
+			checks = append(checks, Check{Group: group, Name: name, Status: status, Detail: detail})
+		}
+		catalogChecks([]catalog.Warning{
+			{Kind: "bundled_config_skip", Provider: "bp", Message: "broken bundled"},
+			{Kind: "never_seen_kind", Provider: "np", Message: "novel"},
+		}, 0, add)
+		if len(checks) != 2 || checks[0].Status != StatusWarn || checks[1].Status != StatusWarn {
+			t.Fatalf("checks = %+v", checks)
+		}
+		if want := `unknown warning kind "never_seen_kind": novel`; checks[1].Detail != want {
+			t.Fatalf("unknown-kind detail = %q, want %q", checks[1].Detail, want)
+		}
+	})
+}
+
+func TestMalformedDotEnvLineWarns(t *testing.T) {
+	home := t.TempDir()
+	writeConfig(t, home, `{"providers": {}, "default_model": ""}`)
+	if err := os.WriteFile(filepath.Join(home, ".lightcode", ".env"), []byte("no equals sign\nGOOD_KEY=v\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, _ := run(t, params(home))
+	warned := false
+	for _, c := range report.Checks {
+		if c.Group == "data" && c.Name == "env" && c.Status == StatusWarn {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("no warn for the malformed .env line: %+v", report.Checks)
+	}
+}
+
+func TestPermissionWarnings(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("K=v\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, _ := run(t, params(home))
+	if c := find(t, report, "data", "dir"); c.Status != StatusWarn {
+		t.Fatalf("0755 data dir = %+v, want warn", c)
+	}
+	envWarned := false
+	for _, c := range report.Checks {
+		if c.Group == "data" && c.Name == "env" && c.Status == StatusWarn {
+			envWarned = true
+		}
+	}
+	if !envWarned {
+		t.Fatal("0644 .env should warn")
+	}
+}
+
+func TestSymlinkDataDirWarns(t *testing.T) {
+	home := t.TempDir()
+	real := filepath.Join(home, "realdata")
+	if err := os.MkdirAll(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(home, ".lightcode")); err != nil {
+		t.Fatal(err)
+	}
+	report, _ := run(t, params(home))
+	c := find(t, report, "data", "dir")
+	if c.Status != StatusWarn {
+		t.Fatalf("symlinked data dir = %+v, want warn", c)
+	}
+}
+
+func TestLockfiles(t *testing.T) {
+	home := t.TempDir()
+	writeConfig(t, home, `{"providers": {}, "default_model": ""}`)
+	daemonDir := filepath.Join(home, ".lightcode", "daemon")
+	if err := os.MkdirAll(daemonDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Live: this test process. Stale: a child that has already exited.
+	livePID := os.Getpid()
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	stalePID := cmd.Process.Pid
+
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(daemonDir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("liveproj.lock", fmt.Sprintf(`{"port": 4321, "token": "t", "pid": %d}`, livePID))
+	write("staleproj.lock", fmt.Sprintf(`{"port": 4322, "token": "t", "pid": %d}`, stalePID))
+	write("badproj.lock", "{garbage")
+
+	report, _ := run(t, params(home))
+	if c := find(t, report, "daemon", "liveproj"); c.Status != StatusOK {
+		t.Fatalf("live lockfile = %+v", c)
+	}
+	if c := find(t, report, "daemon", "staleproj"); c.Status != StatusWarn {
+		t.Fatalf("stale lockfile = %+v", c)
+	}
+	if c := find(t, report, "daemon", "badproj"); c.Status != StatusWarn {
+		t.Fatalf("malformed lockfile = %+v", c)
+	}
+	if report.Failures != 0 {
+		t.Fatal("lockfile problems are warnings, not failures")
+	}
+}
+
+func TestProjectRecordFound(t *testing.T) {
+	home := t.TempDir()
+	workDir := filepath.Join(home, "work")
+	projDir := filepath.Join(home, ".lightcode", "projects", "test-id")
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta := fmt.Sprintf(`{"id": "test-id", "name": "work", "path": %q, "created_at": "2026-01-01T00:00:00Z", "last_activity": 1}`, workDir)
+	if err := os.WriteFile(filepath.Join(projDir, "meta.json"), []byte(meta), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := params(home)
+	p.WorkDir = workDir
+	report, _ := run(t, p)
+	c := find(t, report, "daemon", "project")
+	if c.Status != StatusOK || c.Detail != "project work (test-id)" {
+		t.Fatalf("daemon/project = %+v", c)
+	}
+}
+
+func TestResolveErrorsFail(t *testing.T) {
+	t.Run("config path error", func(t *testing.T) {
+		p := params(t.TempDir())
+		p.ConfigPathErr = fmt.Errorf("no home")
+		report, _ := run(t, p)
+		if find(t, report, "install", "config-path").Status != StatusFail {
+			t.Fatal("config-path resolution error must FAIL")
+		}
+		if report.Failures == 0 {
+			t.Fatal("resolution failure must count")
+		}
+	})
+
+	t.Run("home error stops home-dependent groups", func(t *testing.T) {
+		p := Params{HomeErr: fmt.Errorf("no home"), BinaryPath: "b", Version: "dev", Platform: "linux/amd64"}
+		report, noProviders := Run(p)
+		if find(t, report, "install", "home").Status != StatusFail {
+			t.Fatal("home resolution error must FAIL")
+		}
+		if noProviders {
+			t.Fatal("fresh-install hint must not show on a resolution failure")
+		}
+		for _, c := range report.Checks {
+			if c.Group != "install" {
+				t.Fatalf("home-dependent group ran without a home: %+v", c)
+			}
+		}
+	})
+}
+
+func TestReportJSONShape(t *testing.T) {
+	home := t.TempDir()
+	report, _ := run(t, params(home))
+	b, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Checks []map[string]any `json:"checks"`
+		OK     *int             `json:"ok"`
+		Warn   *int             `json:"warnings"`
+		Fail   *int             `json:"failures"`
+	}
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.OK == nil || decoded.Warn == nil || decoded.Fail == nil || len(decoded.Checks) == 0 {
+		t.Fatalf("missing top-level fields: %s", b)
+	}
+	for _, c := range decoded.Checks {
+		for _, field := range []string{"group", "name", "status", "detail"} {
+			if _, ok := c[field]; !ok {
+				t.Fatalf("check missing %q: %v", field, c)
+			}
+		}
+	}
+}
