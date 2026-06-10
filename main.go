@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"embed"
-	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -25,51 +24,48 @@ import (
 var assets embed.FS
 
 func main() {
-	// Subcommand dispatch — serve and acp run in the foreground.
-	if len(os.Args) >= 2 {
-		var err error
-		switch os.Args[1] {
-		case "serve":
-			err = runServe(os.Args[2:])
-		case "acp":
-			err = runACP()
-		case "cli":
-			err = runCLI()
-		}
-		if os.Args[1] == "serve" || os.Args[1] == "acp" || os.Args[1] == "cli" {
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "lightcode: %v\n", err)
-				os.Exit(1)
-			}
-			os.Exit(0)
-		}
+	// Strict dispatch: a known command runs, anything else errors. Only a
+	// bare invocation or the desktop command reaches the GUI path.
+	launchGUI, code := dispatch(os.Args)
+	if !launchGUI {
+		os.Exit(code)
 	}
 
 	// Wails GUI path — detach from the terminal.
-	if os.Getenv("LIGHTCODE_DETACHED") != "1" {
-		bin, err := os.Executable()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "lightcode: %v\n", err)
-			os.Exit(1)
-		}
-		cmd := exec.Command(bin)
-		cmd.Dir, _ = os.Getwd()
-		cmd.Env = append(os.Environ(), "LIGHTCODE_DETACHED=1")
-		cmd.Stdin = nil
-		cmd.Stdout = nil
-		cmd.Stderr = nil
-		cmd.SysProcAttr = detachAttr()
-		if err := cmd.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "lightcode: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
+	if shouldDetach() {
+		detachAndExit()
 	}
 
 	if err := runWails(); err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func shouldDetach() bool {
+	return os.Getenv("LIGHTCODE_DETACHED") != "1"
+}
+
+// detachAndExit re-launches the binary detached from the terminal and
+// exits; the child re-enters main with no args and LIGHTCODE_DETACHED=1.
+func detachAndExit() {
+	bin, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lightcode: %v\n", err)
+		os.Exit(1)
+	}
+	cmd := exec.Command(bin)
+	cmd.Dir, _ = os.Getwd()
+	cmd.Env = append(os.Environ(), "LIGHTCODE_DETACHED=1")
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.SysProcAttr = detachAttr()
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "lightcode: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
 
 // buildAgent performs shared setup (dotenv, logging, config) and
@@ -133,11 +129,7 @@ func runACP() error {
 	return acp.New(svc).Run(context.Background())
 }
 
-func runServe(args []string) error {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	port := fs.Int("port", 0, "listen port (0 = OS-assigned)")
-	_ = fs.Parse(args)
-
+func runServe(port int) error {
 	svc, err := buildAgent()
 	if err != nil {
 		return err
@@ -149,7 +141,7 @@ func runServe(args []string) error {
 		return fmt.Errorf("ensure project: %w", err)
 	}
 
-	srv := server.New(svc, server.Config{Port: *port})
+	srv := server.New(svc, server.Config{Port: port})
 	return srv.Serve(context.Background(), home, proj.ID)
 }
 
