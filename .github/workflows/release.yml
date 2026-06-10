@@ -49,6 +49,10 @@ jobs:
             v*) ;;
             *) echo "release tag must start with v" >&2; exit 1 ;;
           esac
+          if ! printf '%s' "$tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "release tag must be vMAJOR.MINOR.PATCH (no leading zeros)" >&2
+            exit 1
+          fi
           git check-ref-format "refs/tags/$tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "ref=refs/tags/$tag" >> "$GITHUB_OUTPUT"
@@ -88,7 +92,12 @@ jobs:
           scripts/test-install.sh
 
       - name: Build Wails app
-        run: $(go env GOPATH)/bin/wails build -tags webkit2_41
+        env:
+          TAG: ${{ steps.release_ref.outputs.tag }}
+        run: |
+          commit=$(git rev-parse --short HEAD)
+          pkg=github.com/MMinasyan/lightcode/internal/version
+          $(go env GOPATH)/bin/wails build -tags webkit2_41 -ldflags "-X ${pkg}.Version=${TAG} -X ${pkg}.Commit=${commit}"
 
       - name: Check formatting
         run: |
@@ -126,6 +135,14 @@ jobs:
           (cd dist && sha256sum install.sh lightcode-linux-amd64.tar.gz > SHA256SUMS)
           tar -tzf dist/lightcode-linux-amd64.tar.gz
           (cd dist && sha256sum -c SHA256SUMS)
+
+      - name: Verify packaged version
+        env:
+          TAG: ${{ steps.release_ref.outputs.tag }}
+        run: |
+          tmp=$(mktemp -d)
+          tar -C "$tmp" -xzf dist/lightcode-linux-amd64.tar.gz
+          "$tmp/lightcode" version | grep -F "${TAG}"
 
       - name: Upload release assets
         uses: actions/upload-artifact@v4

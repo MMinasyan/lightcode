@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/version"
 )
 
 // capture swaps the dispatcher streams for one dispatch call.
@@ -187,6 +190,63 @@ func TestDispatchUnexpectedPositionals(t *testing.T) {
 		if gui {
 			t.Fatalf("%v: must not reach the GUI path", argv)
 		}
+		if code != 2 {
+			t.Fatalf("%v: exit code = %d, want 2", argv, code)
+		}
+		if stdout != "" {
+			t.Fatalf("%v: stdout must be empty, got %q", argv, stdout)
+		}
+		if !strings.Contains(stderr, `unexpected argument "extra"`) {
+			t.Fatalf("%v: stderr missing message: %q", argv, stderr)
+		}
+	}
+}
+
+func TestDispatchVersion(t *testing.T) {
+	oldV, oldC := version.Version, version.Commit
+	version.Version, version.Commit = "v9.9.9", "abcdef1"
+	defer func() { version.Version, version.Commit = oldV, oldC }()
+
+	for _, argv := range [][]string{
+		{"lightcode", "version"},
+		{"lightcode", "-v"},
+		{"lightcode", "--version"},
+	} {
+		_, code, stdout, stderr := capture(t, argv)
+		if code != 0 {
+			t.Fatalf("%v: exit code = %d, want 0", argv, code)
+		}
+		if stderr != "" {
+			t.Fatalf("%v: stderr must be empty, got %q", argv, stderr)
+		}
+		want := "lightcode v9.9.9 (" + runtime.GOOS + "/" + runtime.GOARCH + ")\n"
+		if stdout != want {
+			t.Fatalf("%v: stdout = %q, want %q", argv, stdout, want)
+		}
+	}
+}
+
+func TestDispatchVersionJSON(t *testing.T) {
+	oldV, oldC := version.Version, version.Commit
+	version.Version, version.Commit = "v9.9.9", "abcdef1"
+	defer func() { version.Version, version.Commit = oldV, oldC }()
+
+	_, code, stdout, stderr := capture(t, []string{"lightcode", "version", "--json"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("exit=%d stderr=%q, want clean exit 0", code, stderr)
+	}
+	want := `{"version":"v9.9.9","commit":"abcdef1","os":"` + runtime.GOOS + `","arch":"` + runtime.GOARCH + `"}` + "\n"
+	if stdout != want {
+		t.Fatalf("stdout = %q, want %q", stdout, want)
+	}
+}
+
+func TestDispatchVersionExtraArgs(t *testing.T) {
+	for _, argv := range [][]string{
+		{"lightcode", "version", "extra"},
+		{"lightcode", "-v", "extra"},
+	} {
+		_, code, stdout, stderr := capture(t, argv)
 		if code != 2 {
 			t.Fatalf("%v: exit code = %d, want 2", argv, code)
 		}

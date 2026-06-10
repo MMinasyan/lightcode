@@ -9,7 +9,7 @@
   import {
     ProviderList, AllModelList, GetRuntimeConfig, SetRuntimeConfig,
     SetModelHidden, SetProviderHidden, SetDefaultModel,
-    ConnectProvider, DisconnectProvider, RemoveProvider,
+    ConnectProvider, DisconnectProvider, RemoveProvider, AppVersion,
   } from '../../wailsjs/go/main/App';
 
   export let initialSection = 'providers';
@@ -46,7 +46,14 @@
     } catch (e) { fail(e); }
   }
 
-  onMount(async () => { loading = true; await loadAll(); loading = false; });
+  let appVersion = '';
+
+  onMount(async () => {
+    loading = true;
+    await loadAll();
+    try { appVersion = await AppVersion(); } catch (e) { fail(e); }
+    loading = false;
+  });
 
   let openProvider = null;
   function toggleFold(id) { openProvider = openProvider === id ? null : id; }
@@ -234,6 +241,10 @@
             <input type="number" min="50" max="200" step="5" value={$settings.fontScale}
               on:change={(e) => settings.update((s) => ({ ...s, fontScale: Math.max(50, Math.min(200, Number(e.target.value) || 100)) }))} />
           </label>
+          <div class="mrow">
+            <span class="mname">Version</span>
+            <span class="mval">{appVersion}</span>
+          </div>
         {/if}
       </div>
     </section>
@@ -310,6 +321,7 @@
   .mrow { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:7px 2px; }
   .mrow.dim { opacity:.45; }
   .mname { font-size:13px; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .mval { font-size:13px; color:var(--text-dim); white-space:nowrap; }
 
   .switch { position:relative; display:inline-flex; flex-shrink:0; cursor:pointer; }
   .switch input { position:absolute; opacity:0; width:0; height:0; }

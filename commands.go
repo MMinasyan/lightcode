@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/MMinasyan/lightcode/internal/version"
 )
 
 // outW and errW are the dispatcher's streams: a command's answer goes to
@@ -60,9 +63,13 @@ func checkNoArgs(fs *flag.FlagSet) error {
 	return nil
 }
 
-// servePort is bound by the serve FlagSet; IntVar resets it to the default
-// on every flags() call, so state never leaks between dispatches.
-var servePort int
+// servePort and versionJSON are bound by their FlagSets; the *Var calls
+// reset them to defaults on every flags() call, so state never leaks
+// between dispatches.
+var (
+	servePort   int
+	versionJSON bool
+)
 
 // commands is filled in init: the help entry's closure walks the registry
 // itself, which would otherwise be an initialization cycle.
@@ -119,6 +126,30 @@ func init() {
 			},
 		},
 		{
+			name:    "version",
+			summary: "print the build version",
+			flags: func() *flag.FlagSet {
+				fs := newFlagSet("version")
+				fs.BoolVar(&versionJSON, "json", false, "machine-readable output")
+				return fs
+			},
+			run: func(fs *flag.FlagSet, args []string) error {
+				if err := checkNoArgs(fs); err != nil {
+					return err
+				}
+				if versionJSON {
+					b, err := json.Marshal(version.Current())
+					if err != nil {
+						return err
+					}
+					fmt.Fprintln(outW, string(b))
+					return nil
+				}
+				fmt.Fprintln(outW, version.Line())
+				return nil
+			},
+		},
+		{
 			name:    "help",
 			summary: "show help for a command",
 			args:    "[command]",
@@ -161,8 +192,11 @@ func dispatch(argv []string) (launchGUI bool, code int) {
 		return true, 0
 	}
 	name, rest := argv[1], argv[2:]
-	if name == "-h" || name == "--help" {
+	switch name {
+	case "-h", "--help":
 		name = "help"
+	case "-v", "--version":
+		name = "version"
 	}
 	cmd := findCommand(name)
 	if cmd == nil {
@@ -244,6 +278,10 @@ func renderTopHelp(w io.Writer) {
 		}
 		fmt.Fprintf(w, "  %-10s %s\n", cmd.name, summary)
 	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  -h, --help      show help")
+	fmt.Fprintln(w, "  -v, --version   print the build version")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Use 'lightcode help <command>' or 'lightcode <command> -h' for command help.")
 	fmt.Fprintln(w)
