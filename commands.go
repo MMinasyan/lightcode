@@ -441,6 +441,7 @@ func runUpgrade(raw []string) error {
 		return err
 	}
 	if err := selfupdate.SmokeCheck(staged, target); err != nil {
+		// #nosec G703 -- staged comes from os.CreateTemp in the binary's own resolved directory, not external input.
 		_ = os.Remove(staged)
 		return fmt.Errorf("%v; install with the installer instead: curl -fsSL https://github.com/MMinasyan/lightcode/releases/latest/download/install.sh | LIGHTCODE_VERSION=%s sh", err, target)
 	}
