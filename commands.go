@@ -10,8 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
+	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/doctor"
 	"github.com/MMinasyan/lightcode/internal/selfupdate"
@@ -88,6 +90,9 @@ var (
 	uninstallPurge  bool
 	uninstallYes    bool
 	uninstallDryRun bool
+	modelsAll       bool
+	modelsJSON      bool
+	configPathOnly  bool
 )
 
 // commands is filled in init: the help entry's closure walks the registry
@@ -212,6 +217,84 @@ func init() {
 					return err
 				}
 				return runUninstall(uninstallPurge, uninstallYes, uninstallDryRun)
+			},
+		},
+		{
+			name:    "completion",
+			summary: "print a shell completion script",
+			args:    "[bash|zsh|fish]",
+			flags:   func() *flag.FlagSet { return newFlagSet("completion") },
+			run: func(fs *flag.FlagSet, args []string) error {
+				shell := "bash"
+				switch fs.NArg() {
+				case 0:
+				case 1:
+					shell = fs.Arg(0)
+				default:
+					return usageErrorf("unexpected argument %q", fs.Arg(1))
+				}
+				switch shell {
+				case "bash":
+					writeBashCompletion(outW)
+				case "zsh":
+					writeZshCompletion(outW)
+				case "fish":
+					writeFishCompletion(outW)
+				default:
+					return usageErrorf("unsupported shell %q (supported: bash, zsh, fish)", shell)
+				}
+				return nil
+			},
+		},
+		{
+			name:    "models",
+			summary: "list available models",
+			args:    "[provider]",
+			flags: func() *flag.FlagSet {
+				fs := newFlagSet("models")
+				fs.BoolVar(&modelsAll, "all", false, "include hidden and incomplete models")
+				fs.BoolVar(&modelsJSON, "json", false, "machine-readable output")
+				return fs
+			},
+			run: func(fs *flag.FlagSet, args []string) error {
+				// The flag package stops parsing at the first positional;
+				// fold trailing flags back so `models <provider> --all`
+				// works like `models --all <provider>`.
+				var positionals []string
+				for _, a := range fs.Args() {
+					switch a {
+					case "--all", "-all":
+						modelsAll = true
+					case "--json", "-json":
+						modelsJSON = true
+					default:
+						positionals = append(positionals, a)
+					}
+				}
+				provider := ""
+				switch len(positionals) {
+				case 0:
+				case 1:
+					provider = positionals[0]
+				default:
+					return usageErrorf("unexpected argument %q", positionals[1])
+				}
+				return runModels(provider, modelsAll, modelsJSON)
+			},
+		},
+		{
+			name:    "config",
+			summary: "print the config file",
+			flags: func() *flag.FlagSet {
+				fs := newFlagSet("config")
+				fs.BoolVar(&configPathOnly, "path", false, "print the resolved config path instead")
+				return fs
+			},
+			run: func(fs *flag.FlagSet, args []string) error {
+				if err := checkNoArgs(fs); err != nil {
+					return err
+				}
+				return runConfig(configPathOnly)
 			},
 		},
 		{
@@ -507,6 +590,141 @@ func runUninstall(purge, yes, dryRun bool) error {
 	}
 	fmt.Fprintf(errW, "removed %s\n", binPath)
 	return nil
+}
+
+// runModels lists models through the same agent bootstrap as every
+// cli/GUI start (it may refresh a stale discovery cache and auto-create
+// the config templates on first run — doctor and config are the
+// zero-write commands). The handler filters Incomplete entries from the
+// default view itself: ModelList() resolves refs via LookupOrIncomplete
+// and filters hidden only.
+func runModels(provider string, all, asJSON bool) error {
+	svc, err := buildAgent()
+	if err != nil {
+		return err
+	}
+
+	var rows []agent.ModelListEntry
+	if all {
+		rows = svc.AllModelList()
+	} else {
+		for _, row := range svc.ModelList() {
+			if row.Incomplete {
+				continue
+			}
+			rows = append(rows, row)
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Ref < rows[j].Ref })
+
+	hint := ""
+	if provider != "" {
+		// Validate against ProviderList: the filtered rows cannot
+		// distinguish an unknown provider from a known-but-disconnected
+		// one.
+		var match *agent.ProviderStatus
+		var known []string
+		for _, p := range svc.ProviderList() {
+			known = append(known, p.ID)
+			if p.ID == provider {
+				m := p
+				match = &m
+			}
+		}
+		if match == nil {
+			return usageErrorf("unknown provider %q (known: %s)", provider, strings.Join(known, ", "))
+		}
+		filtered := rows[:0]
+		for _, row := range rows {
+			if row.Provider == provider {
+				filtered = append(filtered, row)
+			}
+		}
+		rows = filtered
+		switch {
+		case !match.Connected:
+			rows = nil
+			hint = fmt.Sprintf("provider %q is not connected - connect it in Settings first", provider)
+		case len(rows) == 0:
+			hint = fmt.Sprintf("no visible models for %q - rerun with --all", provider)
+		}
+	} else if len(rows) == 0 {
+		anyConnected := false
+		for _, p := range svc.ProviderList() {
+			if p.Connected {
+				anyConnected = true
+				break
+			}
+		}
+		if anyConnected {
+			hint = "no visible models - rerun with --all"
+		} else {
+			hint = "no models available - connect a provider in Settings first"
+		}
+	}
+
+	if hint != "" {
+		fmt.Fprintln(errW, hint)
+	}
+	if asJSON {
+		// Always valid JSON on stdout: an empty result is [], never
+		// empty bytes.
+		if rows == nil {
+			rows = []agent.ModelListEntry{}
+		}
+		b, err := json.Marshal(rows)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(outW, string(b))
+		return nil
+	}
+	for _, row := range rows {
+		var markers []string
+		if row.Default {
+			markers = append(markers, "default")
+		}
+		if row.Hidden {
+			markers = append(markers, "hidden")
+		}
+		if row.Incomplete {
+			markers = append(markers, "incomplete")
+		}
+		marker := "-"
+		if len(markers) > 0 {
+			marker = strings.Join(markers, ",")
+		}
+		fmt.Fprintf(outW, "%s\t%d\t%d\t%s\n", row.Ref, row.ContextWindow, row.MaxOutputTokens, marker)
+	}
+	return nil
+}
+
+// runConfig prints the raw config bytes (cat semantics — pipes stay
+// intact) or, with --path, the resolved path. It never auto-creates the
+// file.
+func runConfig(pathOnly bool) error {
+	path, err := config.ResolvePath()
+	if err != nil {
+		return err
+	}
+	if pathOnly {
+		// The path IS the stdout answer; the env note below does not
+		// fire here.
+		fmt.Fprintln(outW, path)
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return fmt.Errorf("config not created yet (run lightcode once to initialize): %s", path)
+	}
+	if err != nil {
+		return err
+	}
+	if os.Getenv("LIGHTCODE_CONFIG") != "" {
+		fmt.Fprintf(errW, "using config at %s\n", path)
+	}
+	_, err = outW.Write(data)
+	return err
 }
 
 // runDoctor renders the diagnostics report on outW. Any FAIL makes the

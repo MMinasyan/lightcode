@@ -8,10 +8,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -161,7 +163,7 @@ func TestShouldDetachRespectsEnv(t *testing.T) {
 }
 
 func TestDispatchPerCommandHelpFlag(t *testing.T) {
-	for _, name := range []string{"desktop", "cli", "serve", "acp", "doctor", "help"} {
+	for _, name := range []string{"desktop", "cli", "serve", "acp", "doctor", "completion", "models", "config", "help"} {
 		_, code, stdout, stderr := capture(t, []string{"lightcode", name, "-h"})
 		if code != 0 {
 			t.Fatalf("%s -h: exit code = %d, want 0", name, code)
@@ -199,6 +201,7 @@ func TestDispatchUnexpectedPositionals(t *testing.T) {
 		{"lightcode", "serve", "extra"},
 		{"lightcode", "doctor", "extra"},
 		{"lightcode", "uninstall", "extra"},
+		{"lightcode", "config", "extra"},
 	} {
 		gui, code, stdout, stderr := capture(t, argv)
 		if gui {
@@ -1329,6 +1332,499 @@ func TestDispatchUninstall(t *testing.T) {
 		}
 		if _, err := os.Stat(dataDir); err != nil {
 			t.Fatal("root purge refusal must remove nothing")
+		}
+	})
+}
+
+func TestDispatchCompletion(t *testing.T) {
+	t.Run("registry drift guard across all shells", func(t *testing.T) {
+		for _, shell := range []string{"bash", "zsh", "fish"} {
+			_, code, stdout, stderr := capture(t, []string{"lightcode", "completion", shell})
+			if code != 0 || stderr != "" {
+				t.Fatalf("%s: exit=%d stderr=%q", shell, code, stderr)
+			}
+			// Every registry command, every registered flag name, and the
+			// top-level aliases must appear; a new command or flag that
+			// misses the generator fails here.
+			for i := range commands {
+				cmd := &commands[i]
+				if !strings.Contains(stdout, cmd.name) {
+					t.Fatalf("%s: missing command %q", shell, cmd.name)
+				}
+				for _, flagName := range registeredFlagNames(cmd) {
+					if !strings.Contains(stdout, flagName) {
+						t.Fatalf("%s: missing flag %q of %q", shell, flagName, cmd.name)
+					}
+				}
+			}
+			aliases := []string{"-h", "--help", "-v", "--version"}
+			if shell == "fish" {
+				// fish declares flags in its native -s/-l form.
+				aliases = []string{"-s h", "-l help", "-s v", "-l version"}
+			}
+			for _, alias := range aliases {
+				if !strings.Contains(stdout, alias) {
+					t.Fatalf("%s: missing top-level alias %q", shell, alias)
+				}
+			}
+		}
+	})
+
+	t.Run("per-command help flags for sampled commands", func(t *testing.T) {
+		_, _, stdout, _ := capture(t, []string{"lightcode", "completion", "bash"})
+		for _, name := range []string{"models", "doctor", "upgrade"} {
+			_, after, found := strings.Cut(stdout, name+")")
+			if !found {
+				t.Fatalf("no case arm for %q", name)
+			}
+			arm, _, _ := strings.Cut(after, ";;")
+			if !strings.Contains(arm, "-h") || !strings.Contains(arm, "--help") {
+				t.Fatalf("%q arm missing injected help flags: %q", name, arm)
+			}
+		}
+	})
+
+	t.Run("shell enum arm is static", func(t *testing.T) {
+		_, _, stdout, _ := capture(t, []string{"lightcode", "completion", "bash"})
+		_, after, found := strings.Cut(stdout, "completion)")
+		if !found {
+			t.Fatal("no case arm for completion")
+		}
+		arm, _, _ := strings.Cut(after, ";;")
+		for _, shell := range []string{"bash", "zsh", "fish"} {
+			if !strings.Contains(arm, shell) {
+				t.Fatalf("completion arm missing %q: %q", shell, arm)
+			}
+		}
+	})
+
+	t.Run("bare completion emits bash", func(t *testing.T) {
+		_, code, stdout, _ := capture(t, []string{"lightcode", "completion"})
+		if code != 0 || !strings.HasPrefix(stdout, "# bash completion for lightcode") {
+			t.Fatalf("exit=%d stdout=%q", code, stdout)
+		}
+	})
+
+	t.Run("unsupported shell exits 2", func(t *testing.T) {
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "completion", "powershell"})
+		if code != 2 || stdout != "" {
+			t.Fatalf("exit=%d stdout=%q", code, stdout)
+		}
+		if !strings.Contains(stderr, `unsupported shell "powershell" (supported: bash, zsh, fish)`) {
+			t.Fatalf("stderr = %q", stderr)
+		}
+	})
+
+	t.Run("second positional exits 2", func(t *testing.T) {
+		_, code, _, stderr := capture(t, []string{"lightcode", "completion", "bash", "zsh"})
+		if code != 2 || !strings.Contains(stderr, `unexpected argument "zsh"`) {
+			t.Fatalf("exit=%d stderr=%q", code, stderr)
+		}
+	})
+}
+
+func TestEscapeSingleQuoted(t *testing.T) {
+	if got := escapeSingleQuoted("a'b"); got != `a'\''b` {
+		t.Fatalf("escaped = %q", got)
+	}
+}
+
+// modelsFixtureConfig defines providers covering every models state:
+// modeltest is connected with a visible, a hidden, and an incomplete model;
+// disc is keyed but never connected; allinc has only incomplete models.
+const modelsFixtureConfig = `{
+  "providers": {
+    "modeltest": {
+      "transport": {"base_url": "https://mt.example/v1", "api_key_env": "MODELS_TEST_KEY"},
+      "discovery": false,
+      "models": {
+        "vis": {"context_window": 8192, "max_output_tokens": 1024},
+        "hid": {"context_window": 16384, "hidden": true},
+        "inc": {}
+      }
+    },
+    "disc": {
+      "transport": {"base_url": "https://d.example/v1", "api_key_env": "MODELS_DISC_KEY"},
+      "discovery": false,
+      "models": {"m": {"context_window": 4096}}
+    },
+    "allinc": {
+      "transport": {"base_url": "https://ai.example/v1", "api_key_env": "MODELS_TEST_KEY"},
+      "discovery": false,
+      "models": {"m": {}}
+    }
+  },
+  "default_model": "modeltest/vis"
+}`
+
+func modelsFixtureHome(t *testing.T, body string) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("LIGHTCODE_CONFIG", "")
+	dir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return home
+}
+
+func TestDispatchModels(t *testing.T) {
+	t.Run("default shows visible complete connected models", func(t *testing.T) {
+		modelsFixtureHome(t, modelsFixtureConfig)
+		t.Setenv("MODELS_TEST_KEY", "x")
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "models"})
+		if code != 0 {
+			t.Fatalf("exit=%d stderr=%q", code, stderr)
+		}
+		want := "modeltest/vis\t8192\t1024\tdefault\n"
+		if stdout != want {
+			t.Fatalf("stdout = %q, want %q", stdout, want)
+		}
+	})
+
+	t.Run("all includes hidden and incomplete with markers", func(t *testing.T) {
+		modelsFixtureHome(t, modelsFixtureConfig)
+		t.Setenv("MODELS_TEST_KEY", "x")
+		_, code, stdout, _ := capture(t, []string{"lightcode", "models", "--all"})
+		if code != 0 {
+			t.Fatalf("exit=%d", code)
+		}
+		want := "modeltest/hid\t16384\t0\thidden\n" +
+			"modeltest/inc\t0\t0\tincomplete\n" +
+			"modeltest/vis\t8192\t1024\tdefault\n"
+		if stdout != want {
+			t.Fatalf("stdout = %q, want %q", stdout, want)
+		}
+	})
+
+	t.Run("provider filter returns only that provider's rows", func(t *testing.T) {
+		modelsFixtureHome(t, `{
+  "providers": {
+    "modeltest": {
+      "transport": {"base_url": "https://mt.example/v1", "api_key_env": "MODELS_TEST_KEY"},
+      "discovery": false,
+      "models": {"vis": {"context_window": 8192, "max_output_tokens": 1024}}
+    },
+    "other": {
+      "transport": {"base_url": "http://localhost:11434/v1", "api_key_env": ""},
+      "discovery": false,
+      "models": {"m": {"context_window": 4096}}
+    }
+  },
+  "default_model": ""
+}`)
+		t.Setenv("MODELS_TEST_KEY", "x")
+		// Both providers are connected; unfiltered output shows both.
+		_, code, stdout, _ := capture(t, []string{"lightcode", "models"})
+		if code != 0 || !strings.Contains(stdout, "modeltest/vis") || !strings.Contains(stdout, "other/m") {
+			t.Fatalf("unfiltered exit=%d stdout=%q", code, stdout)
+		}
+		// The filter keeps exactly the named provider's rows.
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "models", "modeltest"})
+		if code != 0 || stderr != "" {
+			t.Fatalf("exit=%d stderr=%q", code, stderr)
+		}
+		if stdout != "modeltest/vis\t8192\t1024\t-\n" {
+			t.Fatalf("filtered stdout = %q", stdout)
+		}
+	})
+
+	t.Run("unknown provider exits 2 with known ids", func(t *testing.T) {
+		modelsFixtureHome(t, modelsFixtureConfig)
+		t.Setenv("MODELS_TEST_KEY", "x")
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "models", "nosuch"})
+		if code != 2 || stdout != "" {
+			t.Fatalf("exit=%d stdout=%q", code, stdout)
+		}
+		if !strings.Contains(stderr, `unknown provider "nosuch"`) || !strings.Contains(stderr, "modeltest") {
+			t.Fatalf("stderr = %q", stderr)
+		}
+	})
+
+	t.Run("disconnected provider hints on stderr", func(t *testing.T) {
+		modelsFixtureHome(t, modelsFixtureConfig)
+		t.Setenv("MODELS_TEST_KEY", "x")
+		for _, argv := range [][]string{
+			{"lightcode", "models", "disc"},
+			{"lightcode", "models", "disc", "--all"},
+		} {
+			_, code, stdout, stderr := capture(t, argv)
+			if code != 0 || stdout != "" {
+				t.Fatalf("%v: exit=%d stdout=%q", argv, code, stdout)
+			}
+			if !strings.Contains(stderr, `provider "disc" is not connected - connect it in Settings first`) {
+				t.Fatalf("%v: stderr = %q", argv, stderr)
+			}
+		}
+	})
+
+	t.Run("all-incomplete provider counts as disconnected", func(t *testing.T) {
+		modelsFixtureHome(t, modelsFixtureConfig)
+		t.Setenv("MODELS_TEST_KEY", "x")
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "models", "allinc"})
+		if code != 0 || stdout != "" {
+			t.Fatalf("exit=%d stdout=%q", code, stdout)
+		}
+		if !strings.Contains(stderr, `provider "allinc" is not connected - connect it in Settings first`) {
+			t.Fatalf("stderr = %q", stderr)
+		}
+	})
+
+	t.Run("connected provider with nothing visible hints rerun with all", func(t *testing.T) {
+		modelsFixtureHome(t, `{
+  "providers": {
+    "hiddenonly": {
+      "transport": {"base_url": "https://h.example/v1", "api_key_env": "MODELS_TEST_KEY"},
+      "discovery": false,
+      "models": {"h": {"context_window": 8192, "hidden": true}, "hi": {"hidden": true}}
+    }
+  },
+  "default_model": ""
+}`)
+		t.Setenv("MODELS_TEST_KEY", "x")
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "models", "hiddenonly"})
+		if code != 0 || stdout != "" {
+			t.Fatalf("exit=%d stdout=%q", code, stdout)
+		}
+		if !strings.Contains(stderr, `no visible models for "hiddenonly" - rerun with --all`) {
+			t.Fatalf("stderr = %q", stderr)
+		}
+
+		// --all shows both, including the hidden,incomplete multi-marker.
+		_, code, stdout, _ = capture(t, []string{"lightcode", "models", "hiddenonly", "--all"})
+		if code != 0 {
+			t.Fatalf("--all exit=%d", code)
+		}
+		want := "hiddenonly/h\t8192\t0\thidden\n" +
+			"hiddenonly/hi\t0\t0\thidden,incomplete\n"
+		if stdout != want {
+			t.Fatalf("--all stdout = %q, want %q", stdout, want)
+		}
+	})
+
+	t.Run("global empty distinguishes connect-first from rerun-with-all", func(t *testing.T) {
+		modelsFixtureHome(t, modelsFixtureConfig)
+		// No key set anywhere: nothing connected.
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "models"})
+		if code != 0 || stdout != "" {
+			t.Fatalf("exit=%d stdout=%q", code, stdout)
+		}
+		if !strings.Contains(stderr, "no models available - connect a provider in Settings first") {
+			t.Fatalf("stderr = %q", stderr)
+		}
+	})
+
+	t.Run("global rerun-with-all when connected but nothing visible", func(t *testing.T) {
+		modelsFixtureHome(t, `{
+  "providers": {
+    "hiddenonly": {
+      "transport": {"base_url": "https://h.example/v1", "api_key_env": "MODELS_TEST_KEY"},
+      "discovery": false,
+      "models": {"h": {"context_window": 8192, "hidden": true}}
+    }
+  },
+  "default_model": ""
+}`)
+		t.Setenv("MODELS_TEST_KEY", "x")
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "models"})
+		if code != 0 || stdout != "" {
+			t.Fatalf("exit=%d stdout=%q", code, stdout)
+		}
+		if !strings.Contains(stderr, "no visible models - rerun with --all") {
+			t.Fatalf("stderr = %q", stderr)
+		}
+	})
+
+	t.Run("json is always valid and hints stay on stderr", func(t *testing.T) {
+		modelsFixtureHome(t, modelsFixtureConfig)
+		// Empty state: stdout must be [] and the hint on stderr.
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "models", "--json"})
+		if code != 0 {
+			t.Fatalf("exit=%d", code)
+		}
+		if strings.TrimSpace(stdout) != "[]" {
+			t.Fatalf("empty --json stdout = %q, want []", stdout)
+		}
+		if !strings.Contains(stderr, "no models available") {
+			t.Fatalf("hint missing from stderr: %q", stderr)
+		}
+	})
+
+	t.Run("json golden fields", func(t *testing.T) {
+		modelsFixtureHome(t, modelsFixtureConfig)
+		t.Setenv("MODELS_TEST_KEY", "x")
+		_, code, stdout, _ := capture(t, []string{"lightcode", "models", "--json"})
+		if code != 0 {
+			t.Fatalf("exit=%d", code)
+		}
+		var rows []map[string]any
+		if err := json.Unmarshal([]byte(stdout), &rows); err != nil {
+			t.Fatalf("stdout not JSON: %v\n%q", err, stdout)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("rows = %v", rows)
+		}
+		row := rows[0]
+		for field, want := range map[string]any{
+			"ref":             "modeltest/vis",
+			"provider":        "modeltest",
+			"providerName":    "modeltest",
+			"model":           "vis",
+			"displayName":     "vis",
+			"contextWindow":   float64(8192),
+			"maxOutputTokens": float64(1024),
+			"hidden":          false,
+			"providerHidden":  false,
+			"incomplete":      false,
+			"default":         true,
+			"source":          "user",
+		} {
+			if row[field] != want {
+				t.Fatalf("row[%q] = %v, want %v", field, row[field], want)
+			}
+		}
+		// cost is omitempty and the fixture sets none.
+		if _, present := row["cost"]; present {
+			t.Fatalf("cost must be omitted when unset: %v", row)
+		}
+	})
+
+	t.Run("two positionals exit 2", func(t *testing.T) {
+		_, code, _, stderr := capture(t, []string{"lightcode", "models", "p1", "p2"})
+		if code != 2 || !strings.Contains(stderr, `unexpected argument "p2"`) {
+			t.Fatalf("exit=%d stderr=%q", code, stderr)
+		}
+	})
+}
+
+// snapshotHome records every entry under root with size and mtime so a
+// before/after comparison proves zero filesystem writes.
+func snapshotHome(t *testing.T, root string) map[string]string {
+	t.Helper()
+	snap := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		snap[path] = fmt.Sprintf("%d:%d:%v", info.Size(), info.ModTime().UnixNano(), info.IsDir())
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("snapshot %s: %v", root, err)
+	}
+	return snap
+}
+
+func TestDispatchConfig(t *testing.T) {
+	t.Run("path prints the resolved path even when absent", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("LIGHTCODE_CONFIG", "")
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "config", "--path"})
+		if code != 0 || stderr != "" {
+			t.Fatalf("exit=%d stderr=%q", code, stderr)
+		}
+		if stdout != filepath.Join(home, ".lightcode", "config.json")+"\n" {
+			t.Fatalf("stdout = %q", stdout)
+		}
+	})
+
+	t.Run("path honors LIGHTCODE_CONFIG", func(t *testing.T) {
+		custom := filepath.Join(t.TempDir(), "custom.json")
+		t.Setenv("LIGHTCODE_CONFIG", custom)
+		_, code, stdout, _ := capture(t, []string{"lightcode", "config", "--path"})
+		if code != 0 || stdout != custom+"\n" {
+			t.Fatalf("exit=%d stdout=%q", code, stdout)
+		}
+	})
+
+	t.Run("default is byte passthrough even for invalid json", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("LIGHTCODE_CONFIG", "")
+		body := "{not json at all"
+		if err := os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, ".lightcode", "config.json"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "config"})
+		if code != 0 || stderr != "" {
+			t.Fatalf("exit=%d stderr=%q", code, stderr)
+		}
+		if stdout != body {
+			t.Fatalf("stdout = %q, want byte-exact %q", stdout, body)
+		}
+	})
+
+	t.Run("env override notes the path on stderr", func(t *testing.T) {
+		custom := filepath.Join(t.TempDir(), "custom.json")
+		if err := os.WriteFile(custom, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("LIGHTCODE_CONFIG", custom)
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "config"})
+		if code != 0 || stdout != "{}" {
+			t.Fatalf("exit=%d stdout=%q", code, stdout)
+		}
+		if !strings.Contains(stderr, custom) {
+			t.Fatalf("stderr missing the resolved path: %q", stderr)
+		}
+	})
+
+	t.Run("missing file errors without creating it", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("LIGHTCODE_CONFIG", "")
+		path := filepath.Join(home, ".lightcode", "config.json")
+		before := snapshotHome(t, home)
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "config"})
+		if code != 1 || stdout != "" {
+			t.Fatalf("exit=%d stdout=%q", code, stdout)
+		}
+		if !strings.Contains(stderr, "lightcode: config not created yet (run lightcode once to initialize): "+path) {
+			t.Fatalf("stderr = %q", stderr)
+		}
+		if after := snapshotHome(t, home); !reflect.DeepEqual(before, after) {
+			t.Fatalf("config wrote to the filesystem:\nbefore: %v\nafter:  %v", before, after)
+		}
+	})
+
+	t.Run("normal run performs zero writes", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("LIGHTCODE_CONFIG", "")
+		if err := os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, ".lightcode", "config.json"), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshotHome(t, home)
+		_, code, stdout, _ := capture(t, []string{"lightcode", "config"})
+		if code != 0 || stdout != "{}" {
+			t.Fatalf("exit=%d stdout=%q", code, stdout)
+		}
+		if after := snapshotHome(t, home); !reflect.DeepEqual(before, after) {
+			t.Fatalf("config wrote to the filesystem:\nbefore: %v\nafter:  %v", before, after)
+		}
+	})
+
+	t.Run("resolve failure exits 1", func(t *testing.T) {
+		t.Setenv("HOME", "")
+		t.Setenv("LIGHTCODE_CONFIG", "")
+		_, code, _, stderr := capture(t, []string{"lightcode", "config", "--path"})
+		if code != 1 || !strings.HasPrefix(stderr, "lightcode: ") {
+			t.Fatalf("exit=%d stderr=%q", code, stderr)
 		}
 	})
 }
