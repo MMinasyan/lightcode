@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/doctor"
@@ -39,6 +42,12 @@ func usageErrorf(format string, a ...any) error {
 // desktop app; main owns the actual detach/launch.
 var errLaunchGUI = errors.New("launch gui")
 
+// errSilent marks a failure whose message the handler already printed in
+// its own pinned format (the taxonomy's unprefixed exceptions, like the
+// user-decline status "cancelled"); the dispatcher exits 1 without the
+// "lightcode:" line.
+var errSilent = errors.New("silent failure")
+
 // command is one registry entry. The registry is the single source for
 // dispatch, help, and completion.
 type command struct {
@@ -67,15 +76,18 @@ func checkNoArgs(fs *flag.FlagSet) error {
 	return nil
 }
 
-// servePort, versionJSON, doctorJSON, upgradeCheck, and upgradeJSON are
-// bound by their FlagSets; the *Var calls reset them to defaults on every
-// flags() call, so state never leaks between dispatches.
+// The command flag targets are bound by their FlagSets; the *Var calls
+// reset them to defaults on every flags() call, so state never leaks
+// between dispatches.
 var (
-	servePort    int
-	versionJSON  bool
-	doctorJSON   bool
-	upgradeCheck bool
-	upgradeJSON  bool
+	servePort       int
+	versionJSON     bool
+	doctorJSON      bool
+	upgradeCheck    bool
+	upgradeJSON     bool
+	uninstallPurge  bool
+	uninstallYes    bool
+	uninstallDryRun bool
 )
 
 // commands is filled in init: the help entry's closure walks the registry
@@ -183,6 +195,23 @@ func init() {
 			},
 			run: func(fs *flag.FlagSet, args []string) error {
 				return runUpgrade(fs.Args())
+			},
+		},
+		{
+			name:    "uninstall",
+			summary: "remove the installed binary (and optionally all data)",
+			flags: func() *flag.FlagSet {
+				fs := newFlagSet("uninstall")
+				fs.BoolVar(&uninstallPurge, "purge", false, "also remove ~/.lightcode (API keys, sessions, snapshots)")
+				fs.BoolVar(&uninstallYes, "yes", false, "skip the confirmation prompt")
+				fs.BoolVar(&uninstallDryRun, "dry-run", false, "list what would be removed and exit")
+				return fs
+			},
+			run: func(fs *flag.FlagSet, args []string) error {
+				if err := checkNoArgs(fs); err != nil {
+					return err
+				}
+				return runUninstall(uninstallPurge, uninstallYes, uninstallDryRun)
 			},
 		},
 		{
@@ -374,6 +403,112 @@ func runUpgradeCheck(positionals []string) error {
 	return nil
 }
 
+// runUninstall removes the installed binary and, with purge, the data
+// directory. Data validation and removal always precede binary removal —
+// a failed purge after a successful binary unlink would leave no command
+// to retry with.
+func runUninstall(purge, yes, dryRun bool) error {
+	binPath, binDir, err := selfupdate.ResolveExecutable()
+	if err != nil {
+		return err
+	}
+	// The home dir is resolved only where the data half needs it: the
+	// binary-only flow (sudo's half of the privileged two-step) must work
+	// without $HOME, and the root purge refusal precedes any home lookup.
+	resolveDataDir := func() (string, error) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home dir: %w", err)
+		}
+		return filepath.Join(home, ".lightcode"), nil
+	}
+
+	// A pure read: it works in a pipe without --yes and against an
+	// unwritable install.
+	if dryRun {
+		fmt.Fprintf(outW, "would remove %s\n", binPath)
+		if purge {
+			dataDir, err := resolveDataDir()
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(outW, "would remove %s (all data: API keys, sessions, snapshots)\n", dataDir)
+		}
+		return nil
+	}
+
+	dataDir := ""
+	if purge {
+		if selfupdate.Geteuid() == 0 {
+			return fmt.Errorf("refusing to purge user data as root; run 'lightcode uninstall --purge' as the owning user first, then remove the binary with sudo")
+		}
+		dataDir, err = resolveDataDir()
+		if err != nil {
+			return err
+		}
+		state, err := selfupdate.ClassifyDataDir(dataDir)
+		if err != nil {
+			return err
+		}
+		switch state {
+		case selfupdate.DataDirAbsent:
+			fmt.Fprintf(errW, "no data directory at %s - nothing to purge\n", dataDir)
+			// Continue exactly as a plain no-purge uninstall, so the
+			// privileged partial-flow message (which claims data was
+			// removed) can never fire when nothing was purged.
+			purge = false
+		case selfupdate.DataDirSymlink:
+			return fmt.Errorf("~/.lightcode is a symlink; refusing to purge through it")
+		case selfupdate.DataDirNotDir:
+			return fmt.Errorf("~/.lightcode is not a directory; refusing to purge")
+		case selfupdate.DataDirNotOwned:
+			return fmt.Errorf("~/.lightcode is not owned by the current user; refusing to purge")
+		}
+	}
+
+	// Without a purge nothing useful can happen against an unwritable
+	// install, and the refusal must be deterministic when both this
+	// preflight and the no-TTY refusal would fire.
+	if !purge && !selfupdate.DirWritable(binDir) {
+		return fmt.Errorf("binary is at %s (not writable); re-run as: sudo lightcode uninstall", binPath)
+	}
+
+	if !yes {
+		if !selfupdate.IsTerminal() {
+			return fmt.Errorf("uninstall is interactive; pass --yes to confirm non-interactively")
+		}
+		if purge {
+			fmt.Fprintf(errW, "Remove %s and ALL data in %s (API keys, sessions, snapshots)? [y/N] ", binPath, dataDir)
+		} else {
+			fmt.Fprintf(errW, "Remove %s? [y/N] ", binPath)
+		}
+		answer, _ := bufio.NewReader(selfupdate.PromptInput).ReadString('\n')
+		if strings.ToLower(strings.TrimSpace(answer)) != "y" {
+			fmt.Fprintln(errW, "cancelled")
+			return errSilent
+		}
+	}
+
+	if purge {
+		if err := selfupdate.PurgeData(dataDir); err != nil {
+			return err
+		}
+		fmt.Fprintf(errW, "removed %s\n", dataDir)
+	}
+
+	selfupdate.SweepStaged(binDir)
+	if err := os.Remove(binPath); err != nil {
+		if purge {
+			// The privileged two-step: data is gone, the root-owned
+			// binary needs sudo. The requested operation is incomplete.
+			return fmt.Errorf("data removed; binary still installed at %s - run: sudo lightcode uninstall --yes", binPath)
+		}
+		return err
+	}
+	fmt.Fprintf(errW, "removed %s\n", binPath)
+	return nil
+}
+
 // runDoctor renders the diagnostics report on outW. Any FAIL makes the
 // command exit 1; warnings alone exit 0.
 func runDoctor(asJSON bool) error {
@@ -463,6 +598,8 @@ func dispatch(argv []string) (launchGUI bool, code int) {
 		return false, 0
 	case errors.Is(err, errLaunchGUI):
 		return true, 0
+	case errors.Is(err, errSilent):
+		return false, 1
 	case errors.Is(err, errUsage):
 		fmt.Fprintf(errW, "lightcode: %v\n", err)
 		renderCommandUsage(errW, cmd)

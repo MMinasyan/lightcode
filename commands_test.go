@@ -198,6 +198,7 @@ func TestDispatchUnexpectedPositionals(t *testing.T) {
 		{"lightcode", "desktop", "extra"},
 		{"lightcode", "serve", "extra"},
 		{"lightcode", "doctor", "extra"},
+		{"lightcode", "uninstall", "extra"},
 	} {
 		gui, code, stdout, stderr := capture(t, argv)
 		if gui {
@@ -894,6 +895,440 @@ func TestDispatchUpgradeInstallFlow(t *testing.T) {
 			if strings.HasPrefix(e.Name(), ".lightcode.tmp.") {
 				t.Fatalf("staged file left behind: %s", e.Name())
 			}
+		}
+	})
+}
+
+// uninstallSeams pins the interactive seams to deterministic values and
+// restores them after the test.
+func uninstallSeams(t *testing.T, tty bool, input string) {
+	t.Helper()
+	oldTTY, oldIn := selfupdate.IsTerminal, selfupdate.PromptInput
+	selfupdate.IsTerminal = func() bool { return tty }
+	selfupdate.PromptInput = strings.NewReader(input)
+	t.Cleanup(func() { selfupdate.IsTerminal, selfupdate.PromptInput = oldTTY, oldIn })
+}
+
+func TestDispatchUninstall(t *testing.T) {
+	t.Run("dry run lists targets and removes nothing", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		dataDir := filepath.Join(home, ".lightcode")
+		if err := os.MkdirAll(dataDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		_, target := fakeInstall(t)
+		uninstallSeams(t, false, "") // works in a pipe without --yes
+
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "uninstall", "--purge", "--dry-run"})
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0\nstderr: %s", code, stderr)
+		}
+		want := "would remove " + target + "\n" +
+			"would remove " + dataDir + " (all data: API keys, sessions, snapshots)\n"
+		if stdout != want {
+			t.Fatalf("stdout = %q, want %q", stdout, want)
+		}
+		if _, err := os.Stat(target); err != nil {
+			t.Fatal("dry run removed the binary")
+		}
+		if _, err := os.Stat(dataDir); err != nil {
+			t.Fatal("dry run removed the data dir")
+		}
+	})
+
+	t.Run("dry run works against an unwritable install", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root writes everywhere")
+		}
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		dir, target := fakeInstall(t)
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		uninstallSeams(t, false, "")
+
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "uninstall", "--dry-run"})
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0\nstderr: %s", code, stderr)
+		}
+		if stdout != "would remove "+target+"\n" {
+			t.Fatalf("stdout = %q", stdout)
+		}
+		if strings.Contains(stderr, "not writable") {
+			t.Fatalf("dry run must short-circuit before the writability preflight: %q", stderr)
+		}
+	})
+
+	t.Run("yes removes the binary and sweeps owned staged files only", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		dir, target := fakeInstall(t)
+		staged := filepath.Join(dir, ".lightcode.tmp.stale")
+		if err := os.WriteFile(staged, []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(dir, ".lightcode.tmp.link")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		uninstallSeams(t, false, "")
+
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "uninstall", "--yes"})
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0\nstderr: %s", code, stderr)
+		}
+		if stdout != "" {
+			t.Fatalf("stdout must be empty, got %q", stdout)
+		}
+		if stderr != "removed "+target+"\n" {
+			t.Fatalf("stderr = %q", stderr)
+		}
+		if _, err := os.Stat(target); !os.IsNotExist(err) {
+			t.Fatal("binary not removed")
+		}
+		if _, err := os.Stat(staged); !os.IsNotExist(err) {
+			t.Fatal("owned staged file not swept")
+		}
+		if _, err := os.Lstat(link); err != nil {
+			t.Fatal("symlinked staged entry must survive the sweep")
+		}
+	})
+
+	t.Run("foreign-owned staged file survives the sweep", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		dir, target := fakeInstall(t)
+		staged := filepath.Join(dir, ".lightcode.tmp.foreign")
+		if err := os.WriteFile(staged, []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		oldOwner := selfupdate.FileOwner
+		selfupdate.FileOwner = func(info os.FileInfo) (int, bool) { return os.Geteuid() + 1, true }
+		t.Cleanup(func() { selfupdate.FileOwner = oldOwner })
+		uninstallSeams(t, false, "")
+
+		_, code, _, _ := capture(t, []string{"lightcode", "uninstall", "--yes"})
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0", code)
+		}
+		if _, err := os.Stat(staged); err != nil {
+			t.Fatal("foreign-owned staged file must survive the sweep")
+		}
+		if _, err := os.Stat(target); !os.IsNotExist(err) {
+			t.Fatal("binary not removed")
+		}
+	})
+
+	t.Run("purge removes data before the binary", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		dataDir := filepath.Join(home, ".lightcode")
+		if err := os.MkdirAll(filepath.Join(dataDir, "sessions"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		_, target := fakeInstall(t)
+		uninstallSeams(t, false, "")
+
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "uninstall", "--purge", "--yes"})
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0\nstderr: %s", code, stderr)
+		}
+		if stdout != "" {
+			t.Fatalf("stdout must be empty, got %q", stdout)
+		}
+		want := "removed " + dataDir + "\nremoved " + target + "\n"
+		if stderr != want {
+			t.Fatalf("stderr = %q, want %q (data line first)", stderr, want)
+		}
+		if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
+			t.Fatal("data dir not removed")
+		}
+		if _, err := os.Stat(target); !os.IsNotExist(err) {
+			t.Fatal("binary not removed")
+		}
+	})
+
+	t.Run("no tty and no yes refuses", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		_, target := fakeInstall(t)
+		uninstallSeams(t, false, "")
+
+		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall"})
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1", code)
+		}
+		if !strings.Contains(stderr, "lightcode: uninstall is interactive; pass --yes to confirm non-interactively") {
+			t.Fatalf("stderr = %q", stderr)
+		}
+		if _, err := os.Stat(target); err != nil {
+			t.Fatal("refusal must remove nothing")
+		}
+	})
+
+	t.Run("decline cancels with an unprefixed status", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		_, target := fakeInstall(t)
+		uninstallSeams(t, true, "n\n")
+
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "uninstall"})
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1", code)
+		}
+		if stdout != "" {
+			t.Fatalf("stdout must be empty, got %q", stdout)
+		}
+		if !strings.Contains(stderr, "Remove "+target+"? [y/N] ") {
+			t.Fatalf("stderr missing prompt: %q", stderr)
+		}
+		if !strings.Contains(stderr, "cancelled\n") {
+			t.Fatalf("stderr missing cancelled status: %q", stderr)
+		}
+		if strings.Contains(stderr, "lightcode: ") {
+			t.Fatalf("cancelled must not carry the error prefix: %q", stderr)
+		}
+		if _, err := os.Stat(target); err != nil {
+			t.Fatal("decline must remove nothing")
+		}
+	})
+
+	t.Run("empty answer defaults to no", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		_, target := fakeInstall(t)
+		uninstallSeams(t, true, "\n")
+
+		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall"})
+		if code != 1 || !strings.Contains(stderr, "cancelled") {
+			t.Fatalf("exit=%d stderr=%q", code, stderr)
+		}
+		if _, err := os.Stat(target); err != nil {
+			t.Fatal("default answer must remove nothing")
+		}
+	})
+
+	t.Run("accept via prompt removes", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		dataDir := filepath.Join(home, ".lightcode")
+		if err := os.MkdirAll(dataDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		_, target := fakeInstall(t)
+		uninstallSeams(t, true, "y\n")
+
+		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--purge"})
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0\nstderr: %s", code, stderr)
+		}
+		if !strings.Contains(stderr, "Remove "+target+" and ALL data in "+dataDir+" (API keys, sessions, snapshots)? [y/N] ") {
+			t.Fatalf("stderr missing purge prompt: %q", stderr)
+		}
+		if _, err := os.Stat(target); !os.IsNotExist(err) {
+			t.Fatal("binary not removed")
+		}
+	})
+
+	t.Run("purge refuses a symlinked data dir", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		real := filepath.Join(home, "realdata")
+		if err := os.MkdirAll(real, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(real, filepath.Join(home, ".lightcode")); err != nil {
+			t.Fatal(err)
+		}
+		_, target := fakeInstall(t)
+		uninstallSeams(t, true, "y\n")
+
+		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--purge", "--yes"})
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1", code)
+		}
+		if !strings.Contains(stderr, "lightcode: ~/.lightcode is a symlink; refusing to purge through it") {
+			t.Fatalf("stderr = %q", stderr)
+		}
+		if _, err := os.Stat(real); err != nil {
+			t.Fatal("symlink target must be untouched")
+		}
+		if _, err := os.Stat(target); err != nil {
+			t.Fatal("binary must be untouched on purge refusal")
+		}
+	})
+
+	t.Run("purge refuses a foreign-owned data dir", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		dataDir := filepath.Join(home, ".lightcode")
+		if err := os.MkdirAll(dataDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		fakeInstall(t)
+		oldOwner := selfupdate.FileOwner
+		selfupdate.FileOwner = func(info os.FileInfo) (int, bool) { return os.Geteuid() + 1, true }
+		t.Cleanup(func() { selfupdate.FileOwner = oldOwner })
+
+		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--purge", "--yes"})
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1", code)
+		}
+		if !strings.Contains(stderr, "lightcode: ~/.lightcode is not owned by the current user; refusing to purge") {
+			t.Fatalf("stderr = %q", stderr)
+		}
+		if _, err := os.Stat(dataDir); err != nil {
+			t.Fatal("foreign-owned data dir must be untouched")
+		}
+	})
+
+	t.Run("purge with absent data dir continues as plain uninstall", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		_, target := fakeInstall(t)
+		uninstallSeams(t, true, "y\n")
+
+		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--purge"})
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0\nstderr: %s", code, stderr)
+		}
+		if !strings.Contains(stderr, "no data directory at "+filepath.Join(home, ".lightcode")+" - nothing to purge") {
+			t.Fatalf("stderr missing nothing-to-purge note: %q", stderr)
+		}
+		if !strings.Contains(stderr, "Remove "+target+"? [y/N] ") {
+			t.Fatalf("prompt must be the binary-only one: %q", stderr)
+		}
+		if strings.Contains(stderr, "ALL data") {
+			t.Fatalf("purge prompt must not fire with nothing to purge: %q", stderr)
+		}
+		if strings.Contains(stderr, "data removed") {
+			t.Fatalf("the partial-flow message must never fire with nothing purged: %q", stderr)
+		}
+		if _, err := os.Stat(target); !os.IsNotExist(err) {
+			t.Fatal("binary not removed")
+		}
+	})
+
+	t.Run("unwritable binary dir refuses before any prompt", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root writes everywhere")
+		}
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		dir, target := fakeInstall(t)
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		uninstallSeams(t, true, "y\n")
+
+		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall"})
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1", code)
+		}
+		if !strings.Contains(stderr, "lightcode: binary is at "+target+" (not writable); re-run as: sudo lightcode uninstall") {
+			t.Fatalf("stderr = %q", stderr)
+		}
+		if strings.Contains(stderr, "[y/N]") {
+			t.Fatalf("the preflight must refuse before any prompt: %q", stderr)
+		}
+	})
+
+	t.Run("privileged partial flow purges data then points at sudo", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root writes everywhere")
+		}
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		dataDir := filepath.Join(home, ".lightcode")
+		if err := os.MkdirAll(dataDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		dir, target := fakeInstall(t)
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		uninstallSeams(t, true, "y\n")
+
+		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--purge"})
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1\nstderr: %s", code, stderr)
+		}
+		if !strings.Contains(stderr, "removed "+dataDir+"\n") {
+			t.Fatalf("stderr missing data removal line: %q", stderr)
+		}
+		if !strings.Contains(stderr, "lightcode: data removed; binary still installed at "+target+" - run: sudo lightcode uninstall --yes") {
+			t.Fatalf("stderr = %q", stderr)
+		}
+		if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
+			t.Fatal("data dir must be purged in the partial flow")
+		}
+		if _, err := os.Stat(target); err != nil {
+			t.Fatal("binary must remain when its dir is unwritable")
+		}
+	})
+
+	t.Run("binary-only flow works without HOME", func(t *testing.T) {
+		t.Setenv("HOME", "")
+		_, target := fakeInstall(t)
+		uninstallSeams(t, false, "")
+
+		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--yes"})
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0\nstderr: %s", code, stderr)
+		}
+		if strings.Contains(stderr, "resolve home dir") {
+			t.Fatalf("the binary-only flow must not resolve the home dir: %q", stderr)
+		}
+		if _, err := os.Stat(target); !os.IsNotExist(err) {
+			t.Fatal("binary not removed")
+		}
+	})
+
+	t.Run("root purge refusal precedes home resolution", func(t *testing.T) {
+		t.Setenv("HOME", "")
+		fakeInstall(t)
+		oldEuid := selfupdate.Geteuid
+		selfupdate.Geteuid = func() int { return 0 }
+		t.Cleanup(func() { selfupdate.Geteuid = oldEuid })
+
+		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--purge", "--yes"})
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1", code)
+		}
+		if !strings.Contains(stderr, "refusing to purge user data as root") {
+			t.Fatalf("stderr = %q", stderr)
+		}
+		if strings.Contains(stderr, "resolve home dir") {
+			t.Fatalf("the root refusal must fire before any home lookup: %q", stderr)
+		}
+	})
+
+	t.Run("root refuses to purge", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		dataDir := filepath.Join(home, ".lightcode")
+		if err := os.MkdirAll(dataDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		fakeInstall(t)
+		oldEuid := selfupdate.Geteuid
+		selfupdate.Geteuid = func() int { return 0 }
+		t.Cleanup(func() { selfupdate.Geteuid = oldEuid })
+
+		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--purge", "--yes"})
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1", code)
+		}
+		if !strings.Contains(stderr, "lightcode: refusing to purge user data as root; run 'lightcode uninstall --purge' as the owning user first, then remove the binary with sudo") {
+			t.Fatalf("stderr = %q", stderr)
+		}
+		if _, err := os.Stat(dataDir); err != nil {
+			t.Fatal("root purge refusal must remove nothing")
 		}
 	})
 }
