@@ -96,13 +96,16 @@ func Run(p Params) (Report, bool) {
 	}
 	catalogChecks(result.Warnings, len(result.Catalog.Providers), add)
 
-	// Providers.
+	// Providers. The connection resolver mirrors the agent's effective
+	// environment after LoadDotEnv: shell presence (even an empty export)
+	// shadows .env, and a credential resolves only when the effective
+	// value is non-empty — a template-style `KEY=` line defines the name
+	// but connects nothing.
 	envIsSet := func(name string) bool {
-		if _, ok := p.LookupEnv(name); ok {
-			return true
+		if shellVal, shellPresent := p.LookupEnv(name); shellPresent {
+			return shellVal != ""
 		}
-		_, ok := dotenvKeys[name]
-		return ok
+		return dotenvKeys[name]
 	}
 	anyConnected := providerChecks(result.Catalog, dotenvKeys, p.LookupEnv, envIsSet, add)
 
@@ -122,9 +125,10 @@ func Run(p Params) (Report, bool) {
 }
 
 // dataChecks runs the data-dir group and returns the parsed config (nil when
-// absent or unparseable) and the .env key-name set.
-func dataChecks(p Params, dataDir string, checks *[]Check, add func(group, name, status, detail string)) (*config.Config, map[string]struct{}) {
-	dotenvKeys := map[string]struct{}{}
+// absent or unparseable) and the .env key names, each mapped to whether its
+// value is non-empty.
+func dataChecks(p Params, dataDir string, checks *[]Check, add func(group, name, status, detail string)) (*config.Config, map[string]bool) {
+	dotenvKeys := map[string]bool{}
 
 	info, err := os.Lstat(dataDir)
 	if os.IsNotExist(err) {
@@ -209,7 +213,7 @@ func catalogChecks(warnings []catalog.Warning, providerCount int, add func(group
 	}
 }
 
-func providerChecks(cat *catalog.Catalog, dotenvKeys map[string]struct{}, lookupEnv func(string) (string, bool), envIsSet func(string) bool, add func(group, name, status, detail string)) bool {
+func providerChecks(cat *catalog.Catalog, dotenvKeys map[string]bool, lookupEnv func(string) (string, bool), envIsSet func(string) bool, add func(group, name, status, detail string)) bool {
 	ids := make([]string, 0, len(cat.Providers))
 	for id := range cat.Providers {
 		ids = append(ids, id)
@@ -217,8 +221,19 @@ func providerChecks(cat *catalog.Catalog, dotenvKeys map[string]struct{}, lookup
 	sort.Strings(ids)
 
 	anyConnected := false
-	external := func(name string) bool { _, ok := lookupEnv(name); return ok }
-	managed := func(name string) bool { _, ok := dotenvKeys[name]; return ok }
+	// Agent-parity key-source adapters: external means a non-empty shell
+	// value (an empty export classifies none, as the agent's Getenv check
+	// does); managed means the name is defined in .env and not shadowed by
+	// the shell — LoadDotEnv marks even empty .env values managed, but
+	// skips keys the shell already set.
+	external := func(name string) bool { shellVal, _ := lookupEnv(name); return shellVal != "" }
+	managed := func(name string) bool {
+		if _, shellPresent := lookupEnv(name); shellPresent {
+			return false
+		}
+		_, inDotEnv := dotenvKeys[name]
+		return inDotEnv
+	}
 	for _, id := range ids {
 		prov := cat.Providers[id]
 		keySource := config.ClassifyKeySource(prov.Transport.APIKeyEnv, external, managed)

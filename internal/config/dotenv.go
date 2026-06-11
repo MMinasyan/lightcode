@@ -230,14 +230,17 @@ func LoadDotEnv() (*ManagedEnv, error) {
 	return m, nil
 }
 
-// ReadDotEnvKeys reads the .env file at path and returns the set of key
-// names it defines, plus human-readable descriptions of any malformed lines.
-// It is the read-only counterpart of LoadDotEnv: an absent file yields an
-// empty set without creating anything, values are parsed only to detect
-// malformed quoting and never retained, and the process environment is not
-// touched.
-func ReadDotEnvKeys(path string) (map[string]struct{}, []string, error) {
-	keys := map[string]struct{}{}
+// ReadDotEnvKeys reads the .env file at path and returns the key names it
+// defines, each mapped to whether its parsed value is non-empty — a
+// template-style `KEY=` line defines the name but resolves no credential.
+// It also returns human-readable descriptions of any malformed lines. It is
+// the read-only counterpart of LoadDotEnv: an absent file yields an empty
+// map without creating anything, values are parsed only to detect malformed
+// quoting and emptiness and never retained, the first occurrence of a
+// duplicated key wins (as in LoadDotEnv), and the process environment is
+// not touched.
+func ReadDotEnvKeys(path string) (map[string]bool, []string, error) {
+	keys := map[string]bool{}
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return keys, nil, nil
 	}
@@ -269,12 +272,14 @@ func ReadDotEnvKeys(path string) (map[string]struct{}, []string, error) {
 		}
 
 		key := strings.TrimSpace(line[:eq])
-		value := strings.TrimSpace(line[eq+1:])
-		if _, err := parseEnvValue(value); err != nil {
+		value, err := parseEnvValue(strings.TrimSpace(line[eq+1:]))
+		if err != nil {
 			malformed = append(malformed, fmt.Sprintf("%s:%d: malformed quoted value: %v", path, lineNum, err))
 			continue
 		}
-		keys[key] = struct{}{}
+		if _, seen := keys[key]; !seen {
+			keys[key] = value != ""
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, nil, fmt.Errorf("read %s: %w", path, err)

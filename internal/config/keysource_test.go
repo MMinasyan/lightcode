@@ -48,20 +48,34 @@ func TestClassifyKeySourceAgentContext(t *testing.T) {
 	}
 }
 
-// Doctor-context adapter: LoadDotEnv never ran, so doctor passes the shell
-// env directly and the ReadDotEnvKeys name set as managed. A shell-exported
-// key beats .env; a .env-only key stays managed.
+// Doctor-context adapter: LoadDotEnv never ran, so doctor mirrors its
+// effective env — external means a non-empty shell value; managed means the
+// name is defined in .env (any value) and not shadowed by the shell, which
+// skips even empty exports. A shell-exported key beats .env; a .env-only
+// key stays managed.
 func TestClassifyKeySourceDoctorContext(t *testing.T) {
-	shell := map[string]bool{"BOTH_KEY": true, "SHELL_KEY": true}
-	dotenv := map[string]struct{}{"BOTH_KEY": {}, "DOTENV_KEY": {}}
-	external := func(name string) bool { return shell[name] }
-	managed := func(name string) bool { _, ok := dotenv[name]; return ok }
+	shell := map[string]string{"BOTH_KEY": "x", "SHELL_KEY": "x", "EMPTY_SHELL_KEY": ""}
+	dotenv := map[string]bool{"BOTH_KEY": true, "DOTENV_KEY": true, "EMPTY_DOTENV_KEY": false}
+	external := func(name string) bool { return shell[name] != "" }
+	managed := func(name string) bool {
+		if _, shellPresent := shell[name]; shellPresent {
+			return false
+		}
+		_, inDotEnv := dotenv[name]
+		return inDotEnv
+	}
 
 	if got := ClassifyKeySource("BOTH_KEY", external, managed); got != KeySourceExternal {
 		t.Fatalf("shell+.env key = %q, want %q", got, KeySourceExternal)
 	}
 	if got := ClassifyKeySource("DOTENV_KEY", external, managed); got != KeySourceManaged {
 		t.Fatalf(".env-only key = %q, want %q", got, KeySourceManaged)
+	}
+	if got := ClassifyKeySource("EMPTY_DOTENV_KEY", external, managed); got != KeySourceManaged {
+		t.Fatalf("empty .env value = %q, want %q (LoadDotEnv marks it managed)", got, KeySourceManaged)
+	}
+	if got := ClassifyKeySource("EMPTY_SHELL_KEY", external, managed); got != KeySourceNone {
+		t.Fatalf("empty shell export = %q, want %q", got, KeySourceNone)
 	}
 	if got := ClassifyKeySource("OTHER_KEY", external, managed); got != KeySourceNone {
 		t.Fatalf("absent key = %q, want %q", got, KeySourceNone)

@@ -209,6 +209,92 @@ func TestKeySourceClasses(t *testing.T) {
 		}
 	})
 
+	t.Run("empty dotenv value is managed but not connected", func(t *testing.T) {
+		// The template-style state: the user uncommented `KEY=` but never
+		// pasted a key. The agent marks it managed yet not connected;
+		// doctor must agree instead of reporting a false connection.
+		for name, envBody := range map[string]string{
+			"bare":          "DOCTOR_TEST_KEY=\n",
+			"double quoted": "DOCTOR_TEST_KEY=\"\"\n",
+			"single quoted": "DOCTOR_TEST_KEY=''\n",
+		} {
+			t.Run(name, func(t *testing.T) {
+				home := t.TempDir()
+				writeConfig(t, home, keyedProviderConfig)
+				if err := os.WriteFile(filepath.Join(home, ".lightcode", ".env"), []byte(envBody), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				report, noProviders := run(t, params(home))
+				c := find(t, report, "providers", "keyedtest")
+				if c.Status != StatusOK || c.Detail != "key managed, not connected, 1 usable models" {
+					t.Fatalf("empty dotenv value = %+v", c)
+				}
+				if !noProviders {
+					t.Fatal("an empty key must not count as a connected provider")
+				}
+				if find(t, report, "setup", "provider").Status != StatusWarn {
+					t.Fatal("setup/provider must warn when the only key is empty")
+				}
+			})
+		}
+	})
+
+	t.Run("empty dotenv value leaves the default model unavailable", func(t *testing.T) {
+		home := t.TempDir()
+		writeConfig(t, home, `{
+  "providers": {
+    "keyedtest": {
+      "transport": {"base_url": "https://keyed.example/v1", "api_key_env": "DOCTOR_TEST_KEY"},
+      "discovery": false,
+      "models": {"m1": {"context_window": 8192}}
+    }
+  },
+  "default_model": "keyedtest/m1"
+}`)
+		if err := os.WriteFile(filepath.Join(home, ".lightcode", ".env"), []byte("DOCTOR_TEST_KEY=\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		report, _ := run(t, params(home))
+		if c := find(t, report, "setup", "default-model"); c.Status != StatusWarn {
+			t.Fatalf("setup/default-model = %+v, want warn with an empty key", c)
+		}
+	})
+
+	t.Run("empty shell export is none and not connected", func(t *testing.T) {
+		home := t.TempDir()
+		writeConfig(t, home, keyedProviderConfig)
+		p := params(home)
+		p.LookupEnv = func(name string) (string, bool) { return "", name == "DOCTOR_TEST_KEY" }
+		report, noProviders := run(t, p)
+		c := find(t, report, "providers", "keyedtest")
+		if c.Status != StatusWarn {
+			t.Fatalf("empty shell export = %+v, want the no-key warn (key-source none)", c)
+		}
+		if !noProviders {
+			t.Fatal("an empty shell export must not count as connected")
+		}
+	})
+
+	t.Run("empty shell export shadows a non-empty dotenv value", func(t *testing.T) {
+		// Agent parity: LoadDotEnv skips keys the shell already set, even
+		// to an empty value, so the .env credential never loads.
+		home := t.TempDir()
+		writeConfig(t, home, keyedProviderConfig)
+		if err := os.WriteFile(filepath.Join(home, ".lightcode", ".env"), []byte("DOCTOR_TEST_KEY=x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		p := params(home)
+		p.LookupEnv = func(name string) (string, bool) { return "", name == "DOCTOR_TEST_KEY" }
+		report, noProviders := run(t, p)
+		c := find(t, report, "providers", "keyedtest")
+		if c.Status != StatusWarn {
+			t.Fatalf("shadowed dotenv key = %+v, want the no-key warn", c)
+		}
+		if !noProviders {
+			t.Fatal("a shell-shadowed .env credential must not count as connected")
+		}
+	})
+
 	t.Run("shell beats dotenv", func(t *testing.T) {
 		home := t.TempDir()
 		writeConfig(t, home, keyedProviderConfig)

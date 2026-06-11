@@ -158,16 +158,16 @@ func TestProviderConnected(t *testing.T) {
 }
 
 // Doctor-context resolution: LoadDotEnv never ran, so a .env-only key is not
-// in the process env — it resolves because the ReadDotEnvKeys name set is
-// part of the injected lookup.
+// in the process env — it resolves because the ReadDotEnvKeys map (name ->
+// value is non-empty) is part of the injected lookup; the shell, even an
+// empty export, shadows it.
 func TestProviderConnectedDoctorContext(t *testing.T) {
-	dotenvKeys := map[string]struct{}{"DOTENV_ONLY_KEY": {}}
+	dotenvKeys := map[string]bool{"DOTENV_ONLY_KEY": true}
 	isSet := func(name string) bool {
-		if _, ok := os.LookupEnv(name); ok {
-			return true
+		if shellVal, shellPresent := os.LookupEnv(name); shellPresent {
+			return shellVal != ""
 		}
-		_, ok := dotenvKeys[name]
-		return ok
+		return dotenvKeys[name]
 	}
 	prov := &Provider{
 		Transport: Transport{APIKeyEnv: "DOTENV_ONLY_KEY", BaseURL: "https://x"},
