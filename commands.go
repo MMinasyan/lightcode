@@ -11,6 +11,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/doctor"
+	"github.com/MMinasyan/lightcode/internal/selfupdate"
 	"github.com/MMinasyan/lightcode/internal/version"
 )
 
@@ -66,13 +67,15 @@ func checkNoArgs(fs *flag.FlagSet) error {
 	return nil
 }
 
-// servePort, versionJSON, and doctorJSON are bound by their FlagSets; the
-// *Var calls reset them to defaults on every flags() call, so state never
-// leaks between dispatches.
+// servePort, versionJSON, doctorJSON, upgradeCheck, and upgradeJSON are
+// bound by their FlagSets; the *Var calls reset them to defaults on every
+// flags() call, so state never leaks between dispatches.
 var (
-	servePort   int
-	versionJSON bool
-	doctorJSON  bool
+	servePort    int
+	versionJSON  bool
+	doctorJSON   bool
+	upgradeCheck bool
+	upgradeJSON  bool
 )
 
 // commands is filled in init: the help entry's closure walks the registry
@@ -169,6 +172,20 @@ func init() {
 			},
 		},
 		{
+			name:    "upgrade",
+			summary: "update the installed binary from the release channel",
+			args:    "[version]",
+			flags: func() *flag.FlagSet {
+				fs := newFlagSet("upgrade")
+				fs.BoolVar(&upgradeCheck, "check", false, "compare against the latest release without installing")
+				fs.BoolVar(&upgradeJSON, "json", false, "machine-readable --check output")
+				return fs
+			},
+			run: func(fs *flag.FlagSet, args []string) error {
+				return runUpgrade(fs.Args())
+			},
+		},
+		{
 			name:    "help",
 			summary: "show help for a command",
 			args:    "[command]",
@@ -191,6 +208,170 @@ func init() {
 			},
 		},
 	}
+}
+
+// runUpgrade implements the upgrade flow. raw is everything after the
+// parsed flags; the flag package stops parsing at the first positional, so
+// check/json given after a version argument arrive here and are folded back
+// into their flags.
+func runUpgrade(raw []string) error {
+	var positionals []string
+	for _, a := range raw {
+		switch a {
+		case "--check", "-check":
+			upgradeCheck = true
+		case "--json", "-json":
+			upgradeJSON = true
+		default:
+			positionals = append(positionals, a)
+		}
+	}
+	if upgradeJSON && !upgradeCheck {
+		return usageErrorf("--json requires --check")
+	}
+
+	if upgradeCheck {
+		return runUpgradeCheck(positionals)
+	}
+
+	if len(positionals) > 1 {
+		return usageErrorf("unexpected argument %q", positionals[1])
+	}
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		return fmt.Errorf("no prebuilt release for %s/%s; build from source (see README)", runtime.GOOS, runtime.GOARCH)
+	}
+
+	base := os.Getenv("LIGHTCODE_RELEASE_BASE")
+	if base != "" && selfupdate.IgnoreReleaseBaseAsRoot() {
+		fmt.Fprintln(errW, "note: LIGHTCODE_RELEASE_BASE ignored when running as root")
+		base = ""
+	}
+
+	explicit := ""
+	if len(positionals) == 1 {
+		explicit = positionals[0]
+	}
+	if !version.IsRelease(version.Version) && explicit == "" {
+		return fmt.Errorf("this is a development build (%s); pass an explicit version to upgrade anyway: lightcode upgrade %s", version.String(), selfupdate.MinInstallable)
+	}
+
+	var target string
+	switch {
+	case explicit != "":
+		if !version.IsRelease(explicit) {
+			return usageErrorf("invalid version %q (expected vMAJOR.MINOR.PATCH)", explicit)
+		}
+		target = explicit
+	case base != "":
+		return usageErrorf("LIGHTCODE_RELEASE_BASE is set; pass an explicit version")
+	default:
+		tag, err := selfupdate.LatestTag()
+		if err != nil {
+			return err
+		}
+		target = tag
+	}
+
+	// The floor gate applies to the target in all cases, the equal-version
+	// early exit included.
+	floorOK := version.Compare(target, selfupdate.MinInstallable) >= 0
+	if version.IsRelease(version.Version) {
+		switch version.Compare(version.Version, target) {
+		case 0:
+			if floorOK {
+				fmt.Fprintf(errW, "already up to date (%s)\n", target)
+				return nil
+			}
+		case 1:
+			if explicit == "" {
+				// Downgrade is an explicit-target operation; an implicit
+				// latest below the current release is nothing to do.
+				fmt.Fprintf(errW, "already up to date (%s)\n", version.Version)
+				return nil
+			}
+			fmt.Fprintf(errW, "downgrading %s -> %s\n", version.Version, target)
+		}
+	} else {
+		// Comparison is undefined for a non-semver current; the explicit
+		// target (required above) installs unconditionally.
+		fmt.Fprintf(errW, "installing %s over dev build\n", target)
+	}
+	if !floorOK {
+		return fmt.Errorf("%s predates the upgrade command; install it with the installer instead: curl -fsSL https://github.com/MMinasyan/lightcode/releases/latest/download/install.sh | LIGHTCODE_VERSION=%s sh", target, target)
+	}
+
+	targetPath, targetDir, err := selfupdate.ResolveExecutable()
+	if err != nil {
+		return err
+	}
+	if !selfupdate.DirWritable(targetDir) {
+		return fmt.Errorf("binary is at %s (not writable); re-run as: sudo lightcode upgrade", targetPath)
+	}
+
+	assetURL, sumsURL := selfupdate.AssetURLs(base, target)
+	tarball, err := selfupdate.Download(assetURL)
+	if err != nil {
+		return err
+	}
+	sums, err := selfupdate.Download(sumsURL)
+	if err != nil {
+		return err
+	}
+	if err := selfupdate.VerifySHA256(tarball, sums, selfupdate.AssetName); err != nil {
+		return err
+	}
+	binary, err := selfupdate.ExtractBinary(tarball)
+	if err != nil {
+		return err
+	}
+	staged, err := selfupdate.Stage(targetDir, binary)
+	if err != nil {
+		return err
+	}
+	if err := selfupdate.SmokeCheck(staged, target); err != nil {
+		_ = os.Remove(staged)
+		return fmt.Errorf("%v; install with the installer instead: curl -fsSL https://github.com/MMinasyan/lightcode/releases/latest/download/install.sh | LIGHTCODE_VERSION=%s sh", err, target)
+	}
+	if err := selfupdate.Replace(staged, targetPath); err != nil {
+		return err
+	}
+	fmt.Fprintf(errW, "upgraded %s -> %s; takes effect the next time lightcode starts - including the GUI's own relaunch when switching projects.\n", version.String(), target)
+	return nil
+}
+
+// runUpgradeCheck is a pure read: it branches before every installation
+// gate, so it works on dev builds and against a pre-surface channel.
+func runUpgradeCheck(positionals []string) error {
+	if len(positionals) > 0 {
+		return usageErrorf("--check takes no version argument")
+	}
+	if os.Getenv("LIGHTCODE_RELEASE_BASE") != "" {
+		return usageErrorf("LIGHTCODE_RELEASE_BASE is set; --check is meaningless against a directory base")
+	}
+	latest, err := selfupdate.LatestTag()
+	if err != nil {
+		return err
+	}
+	result := selfupdate.Check(version.Version, version.String(), latest)
+	if upgradeJSON {
+		b, err := json.Marshal(result)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(outW, string(b))
+		return nil
+	}
+	switch result.Status {
+	case selfupdate.StatusBelowFloor:
+		fmt.Fprintf(outW, "current: %s, latest: %s (not selfupdate-capable; use the installer)\n", result.Current, result.Latest)
+	case selfupdate.StatusDevBuild:
+		fmt.Fprintf(outW, "current: %s, latest: %s\n", result.Current, result.Latest)
+	case selfupdate.StatusUpdateAvailable:
+		fmt.Fprintf(outW, "current: %s, latest: %s (update available; run: lightcode upgrade)\n", result.Current, result.Latest)
+	default:
+		fmt.Fprintf(outW, "current: %s, latest: %s (up to date)\n", result.Current, result.Latest)
+	}
+	return nil
 }
 
 // runDoctor renders the diagnostics report on outW. Any FAIL makes the

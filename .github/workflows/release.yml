@@ -110,6 +110,11 @@ jobs:
       - name: Test
         run: go test -race -tags webkit2_41 ./...
 
+      - name: Verify selfupdate floor
+        env:
+          TAG: ${{ steps.release_ref.outputs.tag }}
+        run: LIGHTCODE_RELEASE_TAG="$TAG" go test ./internal/selfupdate -run TestFloorWithinReleaseTag -v
+
       - name: Fuzz seed corpus
         run: go test -tags webkit2_41 -run=Fuzz ./internal/provider/... ./internal/catalog/... ./internal/engine/message/...
 
