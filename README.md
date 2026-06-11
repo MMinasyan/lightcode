@@ -182,6 +182,10 @@ Useful CLI commands:
 
 `lightcode serve` writes a daemon lockfile under `~/.lightcode/daemon/` containing the port and token. HTTP clients use Bearer auth; ACP clients use newline-delimited JSON-RPC over stdio.
 
+#### Commands
+
+Beyond the run modes above, the binary ships utility commands: `version`, `doctor` (offline install/config diagnostics), `upgrade` (self-update; verifies the release's SHA-256 checksum before installing), `uninstall`, `completion`, `models`, and `config`. Run `lightcode help` for the full reference.
+
 #### Data locations
 
 - `~/.lightcode/config.json` — user config
