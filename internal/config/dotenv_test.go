@@ -464,3 +464,121 @@ func TestIsValidEnvKey(t *testing.T) {
 		}
 	}
 }
+
+func TestReadDotEnvKeysAbsentFileCreatesNothing(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nonexistent")
+	path := filepath.Join(dir, ".env")
+	keys, malformed, err := ReadDotEnvKeys(path)
+	if err != nil {
+		t.Fatalf("ReadDotEnvKeys returned error: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("keys = %v, want empty", keys)
+	}
+	if len(malformed) != 0 {
+		t.Fatalf("malformed = %v, want empty", malformed)
+	}
+	if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
+		t.Fatalf("parent dir was created: stat err = %v", statErr)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf(".env was created: stat err = %v", statErr)
+	}
+}
+
+func TestReadDotEnvKeysParsesNamesOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	body := "# comment\n" +
+		"\n" +
+		"PLAIN_KEY=secret-value\n" +
+		"export EXPORTED_KEY=\"quoted value\"\n" +
+		"COMMENTED_OUT_IN_TEMPLATE_STYLE=\n" +
+		"no equals sign here\n" +
+		"BAD_QUOTE_KEY=\"bad \\x escape\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	keys, malformed, err := ReadDotEnvKeys(path)
+	if err != nil {
+		t.Fatalf("ReadDotEnvKeys returned error: %v", err)
+	}
+	for name, wantNonEmpty := range map[string]bool{
+		"PLAIN_KEY":                       true,
+		"EXPORTED_KEY":                    true,
+		"COMMENTED_OUT_IN_TEMPLATE_STYLE": false,
+	} {
+		got, ok := keys[name]
+		if !ok {
+			t.Errorf("keys missing %q: %v", name, keys)
+		} else if got != wantNonEmpty {
+			t.Errorf("keys[%q] = %v, want %v (value emptiness)", name, got, wantNonEmpty)
+		}
+	}
+	if len(keys) != 3 {
+		t.Fatalf("keys = %v, want exactly 3 names", keys)
+	}
+	if len(malformed) != 2 {
+		t.Fatalf("malformed = %v, want 2 entries", malformed)
+	}
+	for _, m := range malformed {
+		if !strings.Contains(m, path+":") {
+			t.Errorf("malformed entry %q does not name the file and line", m)
+		}
+	}
+
+	// The process environment is untouched: nothing was Setenv'd.
+	if _, set := os.LookupEnv("PLAIN_KEY"); set {
+		t.Fatal("ReadDotEnvKeys set PLAIN_KEY in the process env")
+	}
+}
+
+// Duplicate keys: the first occurrence wins, exactly as LoadDotEnv behaves
+// (after its first Setenv the key is already set and later lines skip).
+func TestReadDotEnvKeysFirstOccurrenceWins(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	body := "EMPTY_FIRST=\n" +
+		"EMPTY_FIRST=value\n" +
+		"VALUE_FIRST=value\n" +
+		"VALUE_FIRST=\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keys, _, err := ReadDotEnvKeys(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keys["EMPTY_FIRST"] {
+		t.Fatal("EMPTY_FIRST: the empty first occurrence must win")
+	}
+	if !keys["VALUE_FIRST"] {
+		t.Fatal("VALUE_FIRST: the non-empty first occurrence must win")
+	}
+}
+
+// Quoted empty values unwrap to empty, exactly as LoadDotEnv parses them.
+func TestReadDotEnvKeysQuotedEmptyValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	body := "DOUBLE_QUOTED_EMPTY=\"\"\n" +
+		"SINGLE_QUOTED_EMPTY=''\n" +
+		"QUOTED_VALUE=\"x\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keys, malformed, err := ReadDotEnvKeys(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(malformed) != 0 {
+		t.Fatalf("malformed = %v, want none", malformed)
+	}
+	for _, name := range []string{"DOUBLE_QUOTED_EMPTY", "SINGLE_QUOTED_EMPTY"} {
+		nonEmpty, ok := keys[name]
+		if !ok || nonEmpty {
+			t.Fatalf("%s: present=%v nonEmpty=%v, want defined and empty", name, ok, nonEmpty)
+		}
+	}
+	if !keys["QUOTED_VALUE"] {
+		t.Fatal("QUOTED_VALUE: a quoted non-empty value must resolve")
+	}
+}

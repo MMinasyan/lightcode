@@ -7,6 +7,8 @@ export function AddCustomProvider(arg1:agent.CustomProviderRequest):Promise<void
 
 export function AllModelList():Promise<Array<agent.ModelListEntry>>;
 
+export function AppVersion():Promise<string>;
+
 export function ApplyTurnAction(arg1:number,arg2:string,arg3:boolean):Promise<agent.TurnActionResult>;
 
 export function Cancel():Promise<void>;

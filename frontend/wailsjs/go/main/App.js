@@ -10,6 +10,10 @@ export function AllModelList() {
   return window['go']['main']['App']['AllModelList']();
 }
 
+export function AppVersion() {
+  return window['go']['main']['App']['AppVersion']();
+}
+
 export function ApplyTurnAction(arg1, arg2, arg3) {
   return window['go']['main']['App']['ApplyTurnAction'](arg1, arg2, arg3);
 }

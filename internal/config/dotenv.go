@@ -230,6 +230,63 @@ func LoadDotEnv() (*ManagedEnv, error) {
 	return m, nil
 }
 
+// ReadDotEnvKeys reads the .env file at path and returns the key names it
+// defines, each mapped to whether its parsed value is non-empty — a
+// template-style `KEY=` line defines the name but resolves no credential.
+// It also returns human-readable descriptions of any malformed lines. It is
+// the read-only counterpart of LoadDotEnv: an absent file yields an empty
+// map without creating anything, values are parsed only to detect malformed
+// quoting and emptiness and never retained, the first occurrence of a
+// duplicated key wins (as in LoadDotEnv), and the process environment is
+// not touched.
+func ReadDotEnvKeys(path string) (map[string]bool, []string, error) {
+	keys := map[string]bool{}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return keys, nil, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return keys, nil, nil
+		}
+		return nil, nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	var malformed []string
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			malformed = append(malformed, fmt.Sprintf("%s:%d: malformed line", path, lineNum))
+			continue
+		}
+
+		key := strings.TrimSpace(line[:eq])
+		value, err := parseEnvValue(strings.TrimSpace(line[eq+1:]))
+		if err != nil {
+			malformed = append(malformed, fmt.Sprintf("%s:%d: malformed quoted value: %v", path, lineNum, err))
+			continue
+		}
+		if _, seen := keys[key]; !seen {
+			keys[key] = value != ""
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	return keys, malformed, nil
+}
+
 // NewManagedEnvForTest constructs a ManagedEnv bound to path with an empty
 // managed set. Intended for tests that want to exercise Set/Remove against a
 // specific file without going through LoadDotEnv.

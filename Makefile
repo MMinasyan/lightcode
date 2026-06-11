@@ -1,7 +1,14 @@
 PREFIX ?= ~/.local
 
+# VERSION stays "dev" for source builds (an exact vX.Y.Z stamps a release
+# build; used when testing upgrade flows). COMMIT is best-effort.
+VERSION ?= dev
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null)
+VERSION_PKG := github.com/MMinasyan/lightcode/internal/version
+LDFLAGS := -X $(VERSION_PKG).Version=$(VERSION) -X $(VERSION_PKG).Commit=$(COMMIT)
+
 build:
-	~/go/bin/wails build
+	~/go/bin/wails build -ldflags '$(LDFLAGS)'
 
 test:
 	go test ./...

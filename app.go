@@ -11,6 +11,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/version"
 )
 
 // App is the Wails-bound struct that bridges the Go backend to the
@@ -172,6 +173,11 @@ func (a *App) emitSessionChanged() {
 // CurrentWarnings returns the backend-owned warning snapshot.
 func (a *App) CurrentWarnings() []agent.PromptWarning {
 	return a.svc.CurrentWarnings()
+}
+
+// AppVersion returns the binary's build identity for the About row.
+func (a *App) AppVersion() string {
+	return version.String()
 }
 
 // Submit is the single entry point for user input: it starts a turn when idle
