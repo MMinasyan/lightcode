@@ -1232,15 +1232,19 @@ func (a *Agent) resumeMostRecent() error {
 	}
 	a.populateFileTracker()
 	a.loadTokensFromDisk()
+	// Restore the model under rt.mu so the currentRef / contextWindowSize / client
+	// writes publish atomically with respect to the signal scheduler and queue
+	// drainer started at construction (which read currentRef under the lock),
+	// mirroring SessionSwitch. restoreModelFromSession never re-acquires rt.mu.
 	a.ensureRuntime().mu.Lock()
 	if err := a.reloadLocked(); err != nil {
-		a.ensureRuntime().mu.Unlock()
 		fmt.Fprintf(os.Stderr, "lightcode: reload config on resume: %v\n", err)
 		a.restoreModelFromSession()
+		a.ensureRuntime().mu.Unlock()
 		return nil
 	}
-	a.ensureRuntime().mu.Unlock()
 	a.restoreModelFromSession()
+	a.ensureRuntime().mu.Unlock()
 	return nil
 }
 
