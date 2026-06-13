@@ -277,6 +277,10 @@ func (l *Loop) SetClient(c modelclient.ChatStreamer) { l.client = c }
 // advertisement, dispatch gate, leak pattern). Passing nil restores baseline.
 func (l *Loop) SetActiveAdaptation(a *adaptation.Adaptation) { l.activeAdapt = a }
 
+// ActiveAdaptation returns the adaptation currently applied to the loop, or nil for
+// baseline.
+func (l *Loop) ActiveAdaptation() *adaptation.Adaptation { return l.activeAdapt }
+
 // SetStore wires a persistence store into the loop. Messages appended
 // after this call are persisted via store.AppendMessage.
 func (l *Loop) SetStore(s Store) { l.store = s }
