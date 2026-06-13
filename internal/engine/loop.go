@@ -17,6 +17,7 @@ import (
 
 	openai "github.com/sashabaranov/go-openai"
 
+	"github.com/MMinasyan/lightcode/internal/adaptation"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
@@ -247,6 +248,11 @@ type Loop struct {
 
 	signalMu       sync.Mutex
 	pendingSignals []PendingSignal
+
+	// activeAdapt is the adaptation resolved for the active model, or nil for
+	// baseline. It gates tool advertisement and dispatch and supplies the leak
+	// pattern. Set via SetActiveAdaptation whenever the active model changes.
+	activeAdapt *adaptation.Adaptation
 }
 
 // New returns a Loop pre-seeded with the system prompt.
@@ -261,6 +267,10 @@ func New(client modelclient.ChatStreamer, registry *tool.Registry, systemPrompt 
 
 // SetClient replaces the provider client used for subsequent turns.
 func (l *Loop) SetClient(c modelclient.ChatStreamer) { l.client = c }
+
+// SetActiveAdaptation sets the adaptation applied to subsequent turns (tool
+// advertisement, dispatch gate, leak pattern). Passing nil restores baseline.
+func (l *Loop) SetActiveAdaptation(a *adaptation.Adaptation) { l.activeAdapt = a }
 
 // SetStore wires a persistence store into the loop. Messages appended
 // after this call are persisted via store.AppendMessage.
@@ -825,7 +835,7 @@ func (l *Loop) runStream(ctx context.Context) (message.Message, bool, error) {
 		}
 		stream, err := l.client.ChatStream(ctx, modelclient.ChatRequest{
 			Messages: l.messages,
-			Tools:    l.registry.OpenAITools(),
+			Tools:    l.registry.AdvertisedTools(l.activeAdapt),
 		})
 		if err != nil {
 			if ctx.Err() != nil {
@@ -1090,6 +1100,16 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) dispatchResult
 		}
 		l.emit(ev)
 		return dispatchResult{Content: result, IsError: isError, Metadata: metadata}
+	}
+
+	// Advertisement gate: a registered tool the active adaptation withholds
+	// (excluded, or hidden and not included) is rejected here — ahead of the
+	// pending coordinator and the registry lookup — through the same finish
+	// closure, so it emits the same ToolCallStart+ToolCallEnd(error) row shape
+	// as the unknown-tool path below. Unknown (unregistered) tools are left to
+	// that path, so baseline behavior is unchanged when nothing is withheld.
+	if _, registered := l.registry.Get(tc.Function.Name); registered && !l.registry.Advertises(tc.Function.Name, l.activeAdapt) {
+		return finish(fmt.Sprintf("error: tool %q is not available", tc.Function.Name), true, tc.Function.Arguments)
 	}
 
 	if parseErr != nil {
