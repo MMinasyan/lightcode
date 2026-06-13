@@ -28,6 +28,11 @@ import (
 // may perform before the loop gives up. Prevents runaway tool-call cycles.
 const maxIterations = 25
 
+// leakRecoverySignal is the fixed steering message queued when an adaptation's
+// leak pattern matches a model's text — a tool call written as prose the provider
+// failed to parse. It asks the model to reissue the call as a structured tool call.
+const leakRecoverySignal = "A tool call you wrote was not recognized and did not execute. If you intended to call a tool, reissue it as a proper structured tool call."
+
 // traceMaxChars is the length at which tool call arguments and results
 // are truncated when written to the trace. Keeps the REPL readable when
 // the agent reads large files.
@@ -742,6 +747,13 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		l.messages = append(l.messages, msg)
 		l.persistMessage(turn, msg)
 
+		// Leak recovery (D3): a flagged family wrote a tool call as text the provider
+		// failed to parse. Detect over content only — never Refusal, so a deliberate
+		// refusal containing tool-call-shaped text does not misfire. The cancelled
+		// branch returned above, so !cancelled holds here.
+		leaked := !cancelled && l.activeAdapt != nil && l.activeAdapt.LeakPattern != nil &&
+			l.activeAdapt.LeakPattern.MatchString(msg.TextContent())
+
 		if len(msg.ToolCalls) == 0 {
 			if l.pendingQueue.Len() > 0 {
 				results, err := l.flushPendingAtTurnEnd(ctx)
@@ -749,6 +761,17 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 					return "", fmt.Errorf("flush pending at turn end: %w", err)
 				}
 				l.appendStagedFlushWrapper(turn, results)
+			}
+			// Pure leak: queue the steering signal (only on a non-final iteration so
+			// it cannot strand undrained) and continue. Queued after the flush so a
+			// flush error never strands a signal; the explicit continue means a
+			// detected leak never returns the leaked text, and a final-iteration leak
+			// exhausts the loop to the cap error below instead of stalling.
+			if leaked {
+				if iter < maxIterations-1 {
+					l.AddPendingSignal(PendingSignal{Payload: leakRecoverySignal, Wake: true, Persist: true})
+				}
+				continue
 			}
 			if l.HasPendingWakeSignal() {
 				continue
@@ -782,6 +805,13 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		if len(l.consumedFlushResults) > 0 {
 			l.appendStagedFlushWrapper(turn, l.consumedFlushResults)
 			l.consumedFlushResults = nil
+		}
+		// Mixed leak: a leaked tool call alongside ≥1 valid structured call (already
+		// executed above). Queue the steering signal so it rides the next request,
+		// but never on a denied turn (it ends without a drain, so a stranded wake
+		// signal would fire a spurious autonomous turn) nor the final iteration.
+		if leaked && !denied && iter < maxIterations-1 {
+			l.AddPendingSignal(PendingSignal{Payload: leakRecoverySignal, Wake: true, Persist: true})
 		}
 		if denied {
 			return "Tool denied by user.", nil
