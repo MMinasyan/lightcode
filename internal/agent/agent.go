@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/adaptation"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 	"github.com/MMinasyan/lightcode/internal/compact"
@@ -67,6 +68,13 @@ type Agent struct {
 
 	currentRef        coremodel.ModelRef
 	contextWindowSize int
+
+	// activeAdapt is the adaptation resolved for the active model (nil = baseline);
+	// resolveAdapt maps a bare model id to its adaptation (default adaptation.Match,
+	// overridable in tests). Both are written only via setActiveModelLocked /
+	// clearActiveModelLocked under rt.mu.
+	activeAdapt  *adaptation.Adaptation
+	resolveAdapt adaptation.Resolver
 
 	tokensMu        sync.Mutex
 	tokens          map[string]*TokenEntry
@@ -178,6 +186,7 @@ func New(c Config) (*Agent, error) {
 		configPath:    configPath,
 		env:           c.Env,
 		warningGroups: make(map[string][]PromptWarning),
+		resolveAdapt:  adaptation.Match,
 	}
 	a.rt = newRuntime(a, runtimeOptions{WorkspaceRoot: c.ProjectRoot})
 	rt := a.ensureRuntime()
@@ -349,6 +358,7 @@ func New(c Config) (*Agent, error) {
 		Ask:           askPolicy,
 		AskAction:     askActionPolicy,
 		UsageRecorder: agentUsageRecorder{agent: a},
+		ResolveAdapt:  adaptation.Match,
 	})
 	registry.Register(tt)
 	a.subagentLoader = loader
@@ -1232,15 +1242,19 @@ func (a *Agent) resumeMostRecent() error {
 	}
 	a.populateFileTracker()
 	a.loadTokensFromDisk()
+	// Restore the model under rt.mu so the currentRef / contextWindowSize / client
+	// writes publish atomically with respect to the signal scheduler and queue
+	// drainer started at construction (which read currentRef under the lock),
+	// mirroring SessionSwitch. restoreModelFromSession never re-acquires rt.mu.
 	a.ensureRuntime().mu.Lock()
 	if err := a.reloadLocked(); err != nil {
-		a.ensureRuntime().mu.Unlock()
 		fmt.Fprintf(os.Stderr, "lightcode: reload config on resume: %v\n", err)
 		a.restoreModelFromSession()
+		a.ensureRuntime().mu.Unlock()
 		return nil
 	}
-	a.ensureRuntime().mu.Unlock()
 	a.restoreModelFromSession()
+	a.ensureRuntime().mu.Unlock()
 	return nil
 }
 
@@ -1312,6 +1326,72 @@ func (a *Agent) populateFileTracker() {
 	a.fileTracker.PopulateFromMessages(msgs)
 }
 
+// resolveAdaptation maps a bare model id to its adaptation, defaulting to the
+// production matcher when no resolver is injected.
+func (a *Agent) resolveAdaptation(modelID string) *adaptation.Adaptation {
+	if a.resolveAdapt != nil {
+		return a.resolveAdapt(modelID)
+	}
+	return adaptation.Match(modelID)
+}
+
+// setActiveModelLocked publishes a newly active model and its adaptation. It is one
+// of the two sole writers of currentRef/contextWindowSize/client/activeAdapt and
+// must be called with rt.mu held. It resolves the adaptation, installs it on the
+// loop, and reassembles the system prompt immediately so the advertised tools, the
+// leak pattern, and the prompt all reflect the new model on its first turn. With the
+// shipped (empty) matcher table the adaptation is nil and the reassembly is a cache
+// hit (no prompt change), so behavior is unchanged.
+func (a *Agent) setActiveModelLocked(ref coremodel.ModelRef, client *provider.Client, model *catalog.Model) {
+	a.currentRef = ref
+	a.contextWindowSize = model.ContextWindow
+	a.activeAdapt = a.resolveAdaptation(ref.Model)
+	if a.lp != nil {
+		a.lp.SetClient(provider.NewAdapter(client))
+		a.lp.SetActiveAdaptation(a.activeAdapt)
+	}
+	a.applyActiveAdaptationPromptLocked()
+}
+
+// clearActiveModelLocked clears the active model and its adaptation, reverting all
+// three levers (tools, leak pattern, prompt) to baseline. The other sole writer;
+// must be called with rt.mu held.
+func (a *Agent) clearActiveModelLocked() {
+	a.currentRef = coremodel.ModelRef{}
+	a.contextWindowSize = 0
+	a.activeAdapt = nil
+	if a.lp != nil {
+		a.lp.SetClient(nil)
+		a.lp.SetActiveAdaptation(nil)
+	}
+	a.applyActiveAdaptationPromptLocked()
+}
+
+// applyActiveAdaptationPromptLocked reassembles the system prompt for the current
+// activeAdapt and installs it when changed. Called by the two model chokepoints with
+// rt.mu held; the assembler never re-acquires rt.mu. With the empty matcher table the
+// adaptation is nil and this is a prompt-cache hit (no UpdateSystemPrompt churn).
+func (a *Agent) applyActiveAdaptationPromptLocked() {
+	if a.assembler == nil || a.lp == nil {
+		return
+	}
+	if res := a.assembler.AssembleFor(a.activeAdapt); res.Rebuilt {
+		a.lp.UpdateSystemPrompt(res.Prompt)
+	}
+}
+
+// refreshSystemPrompt rebuilds the system prompt for the active model's adaptation
+// and the current rules files, installing it when changed. It is the per-turn
+// preamble — it runs without rt.mu, which is safe because the model-set paths are
+// idle-gated, so activeAdapt is stable while a turn is in flight.
+func (a *Agent) refreshSystemPrompt() {
+	res := a.assembler.AssembleFor(a.activeAdapt)
+	if res.Rebuilt {
+		a.lp.UpdateSystemPrompt(res.Prompt)
+	}
+	a.setWarningGroup("prompt", res.Warnings)
+}
+
 func (a *Agent) restoreModelFromSession() {
 	meta, err := a.store.Meta()
 	if err != nil || meta.Provider == "" || meta.Model == "" {
@@ -1322,9 +1402,7 @@ func (a *Agent) restoreModelFromSession() {
 	if err != nil {
 		return
 	}
-	a.lp.SetClient(provider.NewAdapter(client))
-	a.currentRef = ref
-	a.contextWindowSize = model.ContextWindow
+	a.setActiveModelLocked(ref, client, model)
 }
 
 func (a *Agent) loadHistoryIntoLoop() error {
@@ -1695,11 +1773,7 @@ func (rt *runtime) launchTurn(ctx context.Context, turnCtx context.Context, canc
 		if ctx.Err() != nil {
 			return
 		}
-		res := a.assembler.Assemble()
-		if res.Rebuilt {
-			a.lp.UpdateSystemPrompt(res.Prompt)
-		}
-		a.setWarningGroup("prompt", res.Warnings)
+		a.refreshSystemPrompt()
 
 		if ctx.Err() != nil {
 			return
@@ -1811,9 +1885,7 @@ func (a *Agent) SwitchModel(refStr string) error {
 	if err != nil {
 		return err
 	}
-	a.lp.SetClient(provider.NewAdapter(client))
-	a.currentRef = ref
-	a.contextWindowSize = model.ContextWindow
+	a.setActiveModelLocked(ref, client, model)
 	a.ensureRuntime().signalSink.AddSignal(loop.PendingSignal{Payload: fmt.Sprintf("Model switched to %s", ref.String()), Persist: true})
 	if a.store.Active() {
 		if err := a.store.SetModel(ref.Provider, ref.Model); err != nil {
@@ -1876,9 +1948,7 @@ func (a *Agent) reloadLockedWithRefresh(allowBackgroundDiscovery bool) error {
 	}
 	a.updateRegisteredToolsConfigLocked(cfg.Tools)
 	if !a.modelRefConnected(a.currentRef) {
-		a.currentRef = coremodel.ModelRef{}
-		a.contextWindowSize = 0
-		a.lp.SetClient(nil)
+		a.clearActiveModelLocked()
 	}
 	a.ensureActiveModelLocked()
 	a.setWarningGroup("catalog", catalogWarningsToPromptWarnings(catalogWarnings))
@@ -3373,11 +3443,7 @@ func (a *Agent) ensureActiveModelLocked() bool {
 	if a.modelRefConnected(a.currentRef) {
 		return true
 	}
-	a.currentRef = coremodel.ModelRef{}
-	a.contextWindowSize = 0
-	if a.lp != nil {
-		a.lp.SetClient(nil)
-	}
+	a.clearActiveModelLocked()
 	if a.cfg == nil || a.cfg.DefaultModel == "" {
 		return false
 	}
@@ -3389,11 +3455,7 @@ func (a *Agent) ensureActiveModelLocked() bool {
 	if err != nil {
 		return false
 	}
-	a.currentRef = ref
-	a.contextWindowSize = model.ContextWindow
-	if a.lp != nil {
-		a.lp.SetClient(provider.NewAdapter(client))
-	}
+	a.setActiveModelLocked(ref, client, model)
 	return true
 }
 

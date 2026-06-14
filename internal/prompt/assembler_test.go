@@ -19,14 +19,14 @@ func TestDetectOverrides(t *testing.T) {
 
 func TestBuildIncludesBaseEnvironmentAndRules(t *testing.T) {
 	a := New("/work/project", t.TempDir())
-	prompt := a.build("global rules", "project rules")
+	prompt := a.build("global rules", "project rules", nil)
 	for _, want := range []string{"Working directory: /work/project", "global rules", "project rules"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q\n%s", want, prompt)
 		}
 	}
-	withoutOverride := a.build("", "")
-	withOverride := a.build("# Safety\ncustom", "")
+	withoutOverride := a.build("", "", nil)
+	withOverride := a.build("# Safety\ncustom", "", nil)
 	if strings.Contains(withOverride, strings.TrimSpace(safetySection)) && !strings.Contains(withoutOverride, strings.TrimSpace(safetySection)) {
 		t.Fatal("sanity check failed for safety section")
 	}

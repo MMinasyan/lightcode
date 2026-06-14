@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/MMinasyan/lightcode/internal/adaptation"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 	"github.com/MMinasyan/lightcode/internal/config"
@@ -57,6 +58,8 @@ type taskTool struct {
 
 	subModel string
 
+	resolveAdapt adaptation.Resolver
+
 	toolsConfig   config.ToolsConfig
 	homeDir       string
 	workspaceRoot string
@@ -86,6 +89,8 @@ type taskToolConfig struct {
 
 	SubModel string
 
+	ResolveAdapt adaptation.Resolver
+
 	ToolsConfig   config.ToolsConfig
 	HomeDir       string
 	WorkspaceRoot string
@@ -114,6 +119,7 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		providerName:  cfg.ProviderName,
 		model:         cfg.Model,
 		subModel:      cfg.SubModel,
+		resolveAdapt:  cfg.ResolveAdapt,
 		toolsConfig:   cfg.ToolsConfig,
 		homeDir:       cfg.HomeDir,
 		workspaceRoot: cfg.WorkspaceRoot,
@@ -279,6 +285,42 @@ func (t *taskTool) DisplayMetadata(_ context.Context, args json.RawMessage, _ st
 	return metadata
 }
 
+// resolveAdaptation maps a child model id to its adaptation, defaulting to the
+// production matcher when no resolver is injected.
+func (t *taskTool) resolveAdaptation(modelID string) *adaptation.Adaptation {
+	if t.resolveAdapt != nil {
+		return t.resolveAdapt(modelID)
+	}
+	return adaptation.Match(modelID)
+}
+
+// appendAdaptationBlocks appends an adaptation's coaching blocks to a subagent prompt
+// (subagents bypass the section assembler), trimmed and blank-line separated. A nil or
+// empty adaptation returns the prompt unchanged.
+func appendAdaptationBlocks(prompt string, adapt *adaptation.Adaptation) string {
+	if adapt == nil || len(adapt.Blocks) == 0 {
+		return prompt
+	}
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(prompt))
+	for _, block := range adapt.Blocks {
+		b.WriteString("\n\n")
+		b.WriteString(strings.TrimSpace(block))
+	}
+	return b.String()
+}
+
+// buildChildLoop constructs the child loop for a subagent and applies the adaptation
+// resolved from the child's OWN model (which may differ from the parent's via
+// cfg.Subagents.Model): it appends the adaptation's coaching blocks to the prompt and
+// installs the adaptation on the loop (tool advertisement, dispatch gate, leak pattern).
+func (t *taskTool) buildChildLoop(at subagent.AgentType, client *provider.Client, registry *tool.Registry, ref coremodel.ModelRef) *loop.Loop {
+	adapt := t.resolveAdaptation(ref.Model)
+	lp := loop.New(provider.NewAdapter(client), registry, appendAdaptationBlocks(at.Prompt, adapt))
+	lp.SetActiveAdaptation(adapt)
+	return lp
+}
+
 func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, parentToolCallID string) taskResult {
 	at, err := t.loader.Load(td.SubagentType)
 	if err != nil {
@@ -350,7 +392,7 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		return result
 	}
 
-	lp = loop.New(provider.NewAdapter(client), registry, at.Prompt)
+	lp = t.buildChildLoop(at, client, registry, ref)
 	if events != nil {
 		lp.SetEvents(events)
 	}

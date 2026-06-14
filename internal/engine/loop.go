@@ -17,6 +17,7 @@ import (
 
 	openai "github.com/sashabaranov/go-openai"
 
+	"github.com/MMinasyan/lightcode/internal/adaptation"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
@@ -26,6 +27,11 @@ import (
 // maxIterations caps how many model→tool→model rounds a single user turn
 // may perform before the loop gives up. Prevents runaway tool-call cycles.
 const maxIterations = 25
+
+// leakRecoverySignal is the fixed steering message queued when an adaptation's
+// leak pattern matches a model's text — a tool call written as prose the provider
+// failed to parse. It asks the model to reissue the call as a structured tool call.
+const leakRecoverySignal = "A tool call you wrote was not recognized and did not execute. If you intended to call a tool, reissue it as a proper structured tool call."
 
 // traceMaxChars is the length at which tool call arguments and results
 // are truncated when written to the trace. Keeps the REPL readable when
@@ -247,6 +253,11 @@ type Loop struct {
 
 	signalMu       sync.Mutex
 	pendingSignals []PendingSignal
+
+	// activeAdapt is the adaptation resolved for the active model, or nil for
+	// baseline. It gates tool advertisement and dispatch and supplies the leak
+	// pattern. Set via SetActiveAdaptation whenever the active model changes.
+	activeAdapt *adaptation.Adaptation
 }
 
 // New returns a Loop pre-seeded with the system prompt.
@@ -261,6 +272,14 @@ func New(client modelclient.ChatStreamer, registry *tool.Registry, systemPrompt 
 
 // SetClient replaces the provider client used for subsequent turns.
 func (l *Loop) SetClient(c modelclient.ChatStreamer) { l.client = c }
+
+// SetActiveAdaptation sets the adaptation applied to subsequent turns (tool
+// advertisement, dispatch gate, leak pattern). Passing nil restores baseline.
+func (l *Loop) SetActiveAdaptation(a *adaptation.Adaptation) { l.activeAdapt = a }
+
+// ActiveAdaptation returns the adaptation currently applied to the loop, or nil for
+// baseline.
+func (l *Loop) ActiveAdaptation() *adaptation.Adaptation { return l.activeAdapt }
 
 // SetStore wires a persistence store into the loop. Messages appended
 // after this call are persisted via store.AppendMessage.
@@ -732,6 +751,13 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		l.messages = append(l.messages, msg)
 		l.persistMessage(turn, msg)
 
+		// Leak recovery (D3): a flagged family wrote a tool call as text the provider
+		// failed to parse. Detect over content only — never Refusal, so a deliberate
+		// refusal containing tool-call-shaped text does not misfire. The cancelled
+		// branch returned above, so !cancelled holds here.
+		leaked := !cancelled && l.activeAdapt != nil && l.activeAdapt.LeakPattern != nil &&
+			l.activeAdapt.LeakPattern.MatchString(msg.TextContent())
+
 		if len(msg.ToolCalls) == 0 {
 			if l.pendingQueue.Len() > 0 {
 				results, err := l.flushPendingAtTurnEnd(ctx)
@@ -739,6 +765,17 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 					return "", fmt.Errorf("flush pending at turn end: %w", err)
 				}
 				l.appendStagedFlushWrapper(turn, results)
+			}
+			// Pure leak: queue the steering signal (only on a non-final iteration so
+			// it cannot strand undrained) and continue. Queued after the flush so a
+			// flush error never strands a signal; the explicit continue means a
+			// detected leak never returns the leaked text, and a final-iteration leak
+			// exhausts the loop to the cap error below instead of stalling.
+			if leaked {
+				if iter < maxIterations-1 {
+					l.AddPendingSignal(PendingSignal{Payload: leakRecoverySignal, Wake: true, Persist: true})
+				}
+				continue
 			}
 			if l.HasPendingWakeSignal() {
 				continue
@@ -772,6 +809,13 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		if len(l.consumedFlushResults) > 0 {
 			l.appendStagedFlushWrapper(turn, l.consumedFlushResults)
 			l.consumedFlushResults = nil
+		}
+		// Mixed leak: a leaked tool call alongside ≥1 valid structured call (already
+		// executed above). Queue the steering signal so it rides the next request,
+		// but never on a denied turn (it ends without a drain, so a stranded wake
+		// signal would fire a spurious autonomous turn) nor the final iteration.
+		if leaked && !denied && iter < maxIterations-1 {
+			l.AddPendingSignal(PendingSignal{Payload: leakRecoverySignal, Wake: true, Persist: true})
 		}
 		if denied {
 			return "Tool denied by user.", nil
@@ -825,7 +869,7 @@ func (l *Loop) runStream(ctx context.Context) (message.Message, bool, error) {
 		}
 		stream, err := l.client.ChatStream(ctx, modelclient.ChatRequest{
 			Messages: l.messages,
-			Tools:    l.registry.OpenAITools(),
+			Tools:    l.registry.AdvertisedTools(l.activeAdapt),
 		})
 		if err != nil {
 			if ctx.Err() != nil {
@@ -1090,6 +1134,16 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) dispatchResult
 		}
 		l.emit(ev)
 		return dispatchResult{Content: result, IsError: isError, Metadata: metadata}
+	}
+
+	// Advertisement gate: a registered tool the active adaptation withholds
+	// (excluded, or hidden and not included) is rejected here — ahead of the
+	// pending coordinator and the registry lookup — through the same finish
+	// closure, so it emits the same ToolCallStart+ToolCallEnd(error) row shape
+	// as the unknown-tool path below. Unknown (unregistered) tools are left to
+	// that path, so baseline behavior is unchanged when nothing is withheld.
+	if _, registered := l.registry.Get(tc.Function.Name); registered && !l.registry.Advertises(tc.Function.Name, l.activeAdapt) {
+		return finish(fmt.Sprintf("error: tool %q is not available", tc.Function.Name), true, tc.Function.Arguments)
 	}
 
 	if parseErr != nil {

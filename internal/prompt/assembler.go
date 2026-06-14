@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/adaptation"
 )
 
 //go:embed identity.md
@@ -73,6 +75,7 @@ type Assembler struct {
 
 	cachedPrompt    string
 	cachedRulesHash [32]byte
+	cachedAdaptName string
 }
 
 func New(projectRoot, home string) *Assembler {
@@ -83,7 +86,15 @@ func New(projectRoot, home string) *Assembler {
 	}
 }
 
-func (a *Assembler) Assemble() Result {
+// Assemble builds the baseline system prompt (no adaptation).
+func (a *Assembler) Assemble() Result { return a.AssembleFor(nil) }
+
+// AssembleFor builds the system prompt for adapt (nil = baseline). The rules
+// hash is computed exactly as for the baseline; the adaptation name is a
+// companion cache key, so a cache hit requires both the rules and the name to be
+// unchanged. An empty name (baseline) reproduces the baseline hit/miss cadence;
+// a name change forces a rebuild.
+func (a *Assembler) AssembleFor(adapt *adaptation.Adaptation) Result {
 	var warnings []Warning
 
 	globalContent, err := readRulesFile(filepath.Join(a.home, ".lightcode"))
@@ -109,18 +120,23 @@ func (a *Assembler) Assemble() Result {
 	}
 
 	h := sha256.Sum256([]byte(combined))
-	if a.cachedPrompt != "" && h == a.cachedRulesHash {
+	adaptName := ""
+	if adapt != nil {
+		adaptName = adapt.Name
+	}
+	if a.cachedPrompt != "" && h == a.cachedRulesHash && adaptName == a.cachedAdaptName {
 		return Result{Prompt: a.cachedPrompt, Rebuilt: false, Warnings: warnings}
 	}
 
-	prompt := a.build(globalContent, projectContent)
+	prompt := a.build(globalContent, projectContent, adapt)
 
 	a.cachedPrompt = prompt
 	a.cachedRulesHash = h
+	a.cachedAdaptName = adaptName
 	return Result{Prompt: prompt, Rebuilt: true, Warnings: warnings}
 }
 
-func (a *Assembler) build(globalRules, projectRules string) string {
+func (a *Assembler) build(globalRules, projectRules string, adapt *adaptation.Adaptation) string {
 	var b strings.Builder
 
 	for _, s := range []string{
@@ -147,6 +163,15 @@ func (a *Assembler) build(globalRules, projectRules string) string {
 		}
 		b.WriteString(strings.TrimSpace(overridableSections[name]))
 		b.WriteString("\n\n")
+	}
+
+	// Adaptation coaching blocks sit after the built-in sections and before user
+	// rules. Baseline (nil/empty) inserts nothing, so the prompt is unchanged.
+	if adapt != nil && len(adapt.Blocks) > 0 {
+		for _, block := range adapt.Blocks {
+			b.WriteString(strings.TrimSpace(block))
+			b.WriteString("\n\n")
+		}
 	}
 
 	trimmed := strings.TrimSpace(rulesContent)
