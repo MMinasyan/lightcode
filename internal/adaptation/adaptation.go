@@ -35,4 +35,11 @@ type Adaptation struct {
 	// Blocks are coaching paragraphs appended to the system prompt after the
 	// built-in sections and before user rules.
 	Blocks []string
+
+	// Additions are system-owned per-section prompt additions keyed by the
+	// user-overridable section ids ("safety", "tone", "task_execution",
+	// "language"). An addition for a section renders after the section main,
+	// even when a user rules heading overrides that section. Nil or missing
+	// entries mean "fall back to the default addition for this section".
+	Additions map[string]string
 }

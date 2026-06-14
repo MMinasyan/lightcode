@@ -124,6 +124,10 @@ func (a *Assembler) AssembleFor(adapt *adaptation.Adaptation) Result {
 	if adapt != nil {
 		adaptName = adapt.Name
 	}
+	// Cache key is (rules hash, adaptation name). defaultAdditions is a
+	// compile-time constant, so the name is sufficient; a Name:"" adaptation
+	// carrying additions would be mis-cached against baseline, but matched
+	// table entries always have names and Blocks shares the same hazard.
 	if a.cachedPrompt != "" && h == a.cachedRulesHash && adaptName == a.cachedAdaptName {
 		return Result{Prompt: a.cachedPrompt, Rebuilt: false, Warnings: warnings}
 	}
@@ -158,11 +162,17 @@ func (a *Assembler) build(globalRules, projectRules string, adapt *adaptation.Ad
 	rulesContent := strings.TrimSpace(globalRules + "\n\n" + projectRules)
 	overridden := detectOverrides(rulesContent)
 	for _, name := range overridableOrder {
-		if overridden[name] {
-			continue
+		if !overridden[name] {
+			b.WriteString(strings.TrimSpace(overridableSections[name]))
+			b.WriteString("\n\n")
 		}
-		b.WriteString(strings.TrimSpace(overridableSections[name]))
-		b.WriteString("\n\n")
+		// System territory: renders even when a user heading overrides the main
+		// (D5: additions are system-owned). Empty defaults/adaptations write
+		// nothing, so the baseline prompt is unchanged.
+		if add := adaptation.SectionAddition(adapt, name); add != "" {
+			b.WriteString(strings.TrimSpace(add))
+			b.WriteString("\n\n")
+		}
 	}
 
 	// Adaptation coaching blocks sit after the built-in sections and before user

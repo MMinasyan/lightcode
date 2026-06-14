@@ -1,6 +1,7 @@
 package adaptation
 
 import (
+	"maps"
 	"slices"
 	"strings"
 )
@@ -20,11 +21,29 @@ type entry struct {
 // later phase.
 var table []entry
 
+// defaultAdditions is the system-owned fallback for per-section additions.
+// It ships empty so the assembled prompt is byte-identical to a build without
+// this subsystem. Real content is added later, one section at a time.
+var defaultAdditions map[string]string
+
 // Match returns the adaptation bound to modelID, or nil for baseline. It is the
 // production Resolver and inspects only the bare model id (never the
 // provider-prefixed form).
 func Match(modelID string) *Adaptation {
 	return matchIn(table, modelID)
+}
+
+// SectionAddition returns the addition for section from the active adaptation
+// if it exists and is non-empty, otherwise the default addition for that
+// section (which may be empty). section is one of the four user-overridable
+// section ids: "safety", "tone", "task_execution", "language".
+func SectionAddition(adapt *Adaptation, section string) string {
+	if adapt != nil && adapt.Additions != nil {
+		if v := adapt.Additions[section]; v != "" {
+			return v
+		}
+	}
+	return defaultAdditions[section]
 }
 
 // matchIn returns an independent copy of the first entry in t whose pattern
@@ -41,6 +60,7 @@ func matchIn(t []entry, modelID string) *Adaptation {
 			a.ExcludeTools = slices.Clone(a.ExcludeTools)
 			a.IncludeTools = slices.Clone(a.IncludeTools)
 			a.Blocks = slices.Clone(a.Blocks)
+			a.Additions = maps.Clone(a.Additions)
 			return &a
 		}
 	}

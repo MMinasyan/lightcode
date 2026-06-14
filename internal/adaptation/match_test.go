@@ -78,6 +78,7 @@ func TestMatchInReturnsCopyNotAlias(t *testing.T) {
 		ExcludeTools: []string{"edit_file"},
 		IncludeTools: []string{"apply_patch"},
 		Blocks:       []string{"coach"},
+		Additions:    map[string]string{"tone": "tone-add"},
 	}}}
 	got := matchIn(tbl, "gpt-5.4")
 	if got == nil {
@@ -92,6 +93,8 @@ func TestMatchInReturnsCopyNotAlias(t *testing.T) {
 	got.IncludeTools[0] = "mutated"
 	got.Blocks[0] = "mutated"
 	got.Blocks = append(got.Blocks, "extra")
+	got.Additions["tone"] = "mutated"
+	got.Additions["safety"] = "mutated"
 	if tbl[0].adapt.Name != "gpt" {
 		t.Fatalf("Name leaked into the table: %q", tbl[0].adapt.Name)
 	}
@@ -103,6 +106,49 @@ func TestMatchInReturnsCopyNotAlias(t *testing.T) {
 	}
 	if len(tbl[0].adapt.Blocks) != 1 || tbl[0].adapt.Blocks[0] != "coach" {
 		t.Fatalf("Blocks leaked into the table: %v", tbl[0].adapt.Blocks)
+	}
+	if len(tbl[0].adapt.Additions) != 1 || tbl[0].adapt.Additions["tone"] != "tone-add" {
+		t.Fatalf("Additions leaked into the table: %v", tbl[0].adapt.Additions)
+	}
+}
+
+func TestSectionAdditionResolution(t *testing.T) {
+	origDefault := defaultAdditions
+	defer func() { defaultAdditions = origDefault }()
+
+	defaultAdditions = map[string]string{"tone": "DEFAULT_TONE_ADDITION"}
+
+	cases := []struct {
+		name    string
+		adapt   *Adaptation
+		section string
+		want    string
+	}{
+		{"nil adapt + no default", nil, "safety", ""},
+		{"active non-empty key", &Adaptation{Additions: map[string]string{"tone": "ACTIVE_TONE"}}, "tone", "ACTIVE_TONE"},
+		{"active key absent + default present", &Adaptation{Additions: map[string]string{"safety": "ACTIVE_SAFETY"}}, "tone", "DEFAULT_TONE_ADDITION"},
+		{"nil adapt + default present", nil, "tone", "DEFAULT_TONE_ADDITION"},
+		{"active present + default present", &Adaptation{Additions: map[string]string{"tone": "ACTIVE_TONE"}}, "tone", "ACTIVE_TONE"},
+		{"nil Additions map", &Adaptation{Name: "empty"}, "tone", "DEFAULT_TONE_ADDITION"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := SectionAddition(tc.adapt, tc.section)
+			if got != tc.want {
+				t.Fatalf("SectionAddition(%v, %q) = %q, want %q", tc.adapt, tc.section, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestShippedDefaultsEmpty(t *testing.T) {
+	if len(defaultAdditions) != 0 {
+		t.Fatalf("production defaultAdditions ships with %d entries, want 0", len(defaultAdditions))
+	}
+	for _, section := range []string{"safety", "tone", "task_execution", "language"} {
+		if got := SectionAddition(nil, section); got != "" {
+			t.Fatalf("SectionAddition(nil, %q) = %q, want empty (empty ship)", section, got)
+		}
 	}
 }
 
