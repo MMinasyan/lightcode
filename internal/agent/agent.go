@@ -358,6 +358,7 @@ func New(c Config) (*Agent, error) {
 		Ask:           askPolicy,
 		AskAction:     askActionPolicy,
 		UsageRecorder: agentUsageRecorder{agent: a},
+		ResolveAdapt:  adaptation.Match,
 	})
 	registry.Register(tt)
 	a.subagentLoader = loader
