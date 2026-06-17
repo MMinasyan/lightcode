@@ -16,19 +16,22 @@ type entry struct {
 	adapt   Adaptation
 }
 
-// table is the production binding table, ordered most-specific-first. It ships
-// empty: every model resolves to baseline until per-model content is added in a
-// later phase.
-var table []entry
+// table is the production binding table, ordered most-specific-first.
+var table = []entry{
+	{pattern: "*gpt-5.5*", adapt: gptTaskExecutionAdaptation},
+	{pattern: "*gpt-5.4*", adapt: gptTaskExecutionAdaptation},
+	{pattern: "*grok-build-0.1", adapt: gptTaskExecutionAdaptation},
+	{pattern: "*gemini-3*", adapt: googleTaskExecutionAdaptation},
+	{pattern: "*gemma-4*", adapt: googleTaskExecutionAdaptation},
+}
 
 // defaultAdditions is the system-owned fallback for per-section additions.
-// It ships empty so the assembled prompt is byte-identical to a build without
-// this subsystem. Real content is added later, one section at a time.
+// Empty means there is no baseline addition for that section.
 var defaultAdditions map[string]string
 
 // Match returns the adaptation bound to modelID, or nil for baseline. It is the
-// production Resolver and inspects only the bare model id (never the
-// provider-prefixed form).
+// production Resolver and expects the model component of the active model ref;
+// aggregator model IDs may still contain slashes.
 func Match(modelID string) *Adaptation {
 	return matchIn(table, modelID)
 }

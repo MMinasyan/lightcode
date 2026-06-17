@@ -5,9 +5,7 @@
 //
 // The binding table in this package is the only place in the codebase that
 // inspects the model-id string. Consumers stay model-blind: they receive a
-// resolved *Adaptation (nil = baseline) and apply their own lever. The table
-// ships empty, so every model resolves to baseline until per-model content is
-// added in a later phase.
+// resolved *Adaptation (nil = baseline) and apply their own lever.
 package adaptation
 
 import "regexp"

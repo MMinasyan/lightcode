@@ -370,11 +370,10 @@ func TestLifecycleEnsureClearRevertsAdaptation(t *testing.T) {
 	}
 }
 
-// Master invariant: with the shipped (empty) production table, every model resolves to
-// baseline across ALL lifecycle paths — restore, lazy-resolve, switch, and reload —
-// so tools, prompt, and leak are unchanged. No resolver is injected (the production
-// adaptation.Match over the empty table).
-func TestLifecycleEmptyTableIsBaseline(t *testing.T) {
+// Master invariant: an unmatched model resolves to baseline across ALL lifecycle
+// paths — restore, lazy-resolve, switch, and reload — so tools, prompt, and leak
+// are unchanged. No resolver is injected; this uses the production matcher.
+func TestLifecycleUnmatchedModelIsBaseline(t *testing.T) {
 	t.Setenv("LIGHTCODE_LIFECYCLE_KEY", "test-key")
 	home, projectRoot := t.TempDir(), t.TempDir()
 	// Seed a session pinned to alt-model so Init exercises the restore path.
@@ -382,8 +381,8 @@ func TestLifecycleEmptyTableIsBaseline(t *testing.T) {
 	seedLifecycleSession(t, seed, projectRoot, "test", "alt-model")
 
 	a := newLifecycleAgent(t, home, projectRoot, "test/alt-model")
-	// Capture the construction-time baseline prompt; under the empty table it must
-	// stay byte-identical across every lifecycle path.
+	// Capture the construction-time baseline prompt; it must stay byte-identical
+	// across every lifecycle path for an unmatched model.
 	baselinePrompt := a.lp.Messages()[0].TextContent()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -392,7 +391,7 @@ func TestLifecycleEmptyTableIsBaseline(t *testing.T) {
 		t.Helper()
 		assertBaselineActive(t, a)
 		if got := a.lp.Messages()[0].TextContent(); got != baselinePrompt {
-			t.Fatalf("%s: system prompt bytes changed under the empty table", path)
+			t.Fatalf("%s: system prompt bytes changed for unmatched model", path)
 		}
 		// The nil-adaptation set path must be a prompt-cache hit — no rebuild, hence no
 		// UpdateSystemPrompt churn.

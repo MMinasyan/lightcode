@@ -1339,9 +1339,8 @@ func (a *Agent) resolveAdaptation(modelID string) *adaptation.Adaptation {
 // of the two sole writers of currentRef/contextWindowSize/client/activeAdapt and
 // must be called with rt.mu held. It resolves the adaptation, installs it on the
 // loop, and reassembles the system prompt immediately so the advertised tools, the
-// leak pattern, and the prompt all reflect the new model on its first turn. With the
-// shipped (empty) matcher table the adaptation is nil and the reassembly is a cache
-// hit (no prompt change), so behavior is unchanged.
+// leak pattern, and the prompt all reflect the new model on its first turn. An
+// unmatched model resolves to nil adaptation and stays on the baseline prompt.
 func (a *Agent) setActiveModelLocked(ref coremodel.ModelRef, client *provider.Client, model *catalog.Model) {
 	a.currentRef = ref
 	a.contextWindowSize = model.ContextWindow
@@ -1369,8 +1368,8 @@ func (a *Agent) clearActiveModelLocked() {
 
 // applyActiveAdaptationPromptLocked reassembles the system prompt for the current
 // activeAdapt and installs it when changed. Called by the two model chokepoints with
-// rt.mu held; the assembler never re-acquires rt.mu. With the empty matcher table the
-// adaptation is nil and this is a prompt-cache hit (no UpdateSystemPrompt churn).
+// rt.mu held; the assembler never re-acquires rt.mu. If the active adaptation is nil,
+// the baseline prompt cache path avoids UpdateSystemPrompt churn.
 func (a *Agent) applyActiveAdaptationPromptLocked() {
 	if a.assembler == nil || a.lp == nil {
 		return

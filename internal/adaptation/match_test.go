@@ -152,14 +152,76 @@ func TestShippedDefaultsEmpty(t *testing.T) {
 	}
 }
 
-func TestShippedTableIsEmpty(t *testing.T) {
-	if len(table) != 0 {
-		t.Fatalf("production table ships with %d entries, want 0", len(table))
+func TestShippedTableMatchesGPTTaskExecutionModels(t *testing.T) {
+	for _, id := range []string{
+		"gpt-5.4",
+		"gpt-5.4-mini",
+		"gpt-5.5",
+		"openai/gpt-5.4-mini",
+		"openai/gpt-5.5-pro",
+		"grok-build-0.1",
+		"x-ai/grok-build-0.1",
+	} {
+		t.Run(id, func(t *testing.T) {
+			got := Match(id)
+			if got == nil {
+				t.Fatalf("Match(%q) = nil, want adaptation", id)
+			}
+			if got.Name != gptTaskExecutionAdaptation.Name {
+				t.Fatalf("Match(%q).Name = %q, want %q", id, got.Name, gptTaskExecutionAdaptation.Name)
+			}
+			if add := SectionAddition(got, "task_execution"); add != gptTaskExecutionAddition {
+				t.Fatalf("SectionAddition(Match(%q), task_execution) = %q, want GPT addition", id, add)
+			}
+		})
 	}
-	for _, id := range []string{"gpt-5.4", "gpt-oss-20b", "deepseek/deepseek-chat", "qwen3.7-plus", ""} {
-		if got := Match(id); got != nil {
-			t.Fatalf("Match(%q) = %q, want nil (empty table)", id, got.Name)
-		}
+}
+
+func TestShippedTableMatchesGoogleTaskExecutionModels(t *testing.T) {
+	for _, id := range []string{
+		"gemini-3-flash-preview",
+		"gemini-3.1-pro-preview",
+		"gemini-3.1-flash-lite",
+		"google/gemini-3.5-flash",
+		"gemma-4-26b-a4b",
+		"google/gemma-4-31b",
+	} {
+		t.Run(id, func(t *testing.T) {
+			got := Match(id)
+			if got == nil {
+				t.Fatalf("Match(%q) = nil, want adaptation", id)
+			}
+			if got.Name != googleTaskExecutionAdaptation.Name {
+				t.Fatalf("Match(%q).Name = %q, want %q", id, got.Name, googleTaskExecutionAdaptation.Name)
+			}
+			if add := SectionAddition(got, "task_execution"); add != googleTaskExecutionAddition {
+				t.Fatalf("SectionAddition(Match(%q), task_execution) = %q, want Google addition", id, add)
+			}
+		})
+	}
+}
+
+func TestShippedTableLeavesOtherModelsBaseline(t *testing.T) {
+	for _, id := range []string{
+		"gpt-oss-120b",
+		"accounts/fireworks/models/gpt-oss-120b",
+		"gpt-5.3-codex",
+		"openai/gpt-5.3-codex",
+		"grok-4.3",
+		"grok-build-0.1-preview",
+		"gemini-2.5-pro",
+		"gemini-4-pro",
+		"gemma-3",
+		"gemma-5",
+		"deepseek/deepseek-chat",
+		"qwen3.7-plus",
+		"",
+	} {
+		t.Run(id, func(t *testing.T) {
+			if got := Match(id); got != nil {
+				t.Fatalf("Match(%q) = %q, want nil", id, got.Name)
+			}
+		})
 	}
 }
 
