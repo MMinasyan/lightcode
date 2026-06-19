@@ -33,7 +33,7 @@
 
 Lightcode uses the OpenAI Chat Completions shape with streaming and tool calls. Provider compatibility still varies: some OpenAI-compatible models stream text correctly but do not reliably support streamed tool calls. Test a new provider/model with a real tool call before relying on it.
 
-**Tools** — `read_file` · `write_file` · `edit_file` · `run_command` · `execute_pending` · `process` · `sleep` · `save_memory` · `search_memory` · `search_history` · `diagnostics` · `workspace_symbol` · `task`
+**Tools** — `read_file` · `write_file` · `edit_file` · `apply_patch` · `run_command` · `execute_pending` · `process` · `sleep` · `save_memory` · `search_memory` · `search_history` · `diagnostics` · `workspace_symbol` · `task`
 
 **Snapshots** — Every file edit is snapshotted by turn. Revert code, revert history, or fork from any point. Copy-based, no git dependency.
 

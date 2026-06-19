@@ -416,16 +416,46 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 }
 
 func (t *taskTool) buildRegistry(at subagent.AgentType, scope parentMutationScope, procMgr *process.Manager) *tool.Registry {
+	root := scope.workspaceRoot
+	core := tool.CoreTools(scope.snapshotStore(), scope.tracker, t.toolsConfig, root, t.permissionCheck(), t.permissionAsk())
 	reg := tool.NewRegistry()
 	for _, name := range at.Tools {
 		if name == "task" {
+			continue
+		}
+		if name == "execute_pending" {
+			// execute_pending is not in CoreTools (no snapshot/tracker
+			// wiring). Register it only for subagent types that explicitly
+			// list it; read-only types must not receive mutation tools.
+			reg.Register(tool.WrapWithPermission(tool.ExecutePending{}, t.permissionCheck(), t.permissionAsk()))
+			continue
+		}
+		if tt, ok := core[name]; ok {
+			reg.Register(tt)
 			continue
 		}
 		if tt := t.newChildTool(name, at, scope, procMgr); tt != nil {
 			reg.Register(tt)
 		}
 	}
+	// Mutation-capable subagents register apply_patch even when their explicit
+	// tool list names only edit_file/write_file. Adaptations can then reveal the
+	// hidden tool. Read-only subagents do not gain apply_patch.
+	if hasMutationTool(at.Tools) {
+		if applyPatch, ok := core["apply_patch"]; ok {
+			reg.Register(applyPatch)
+		}
+	}
 	return reg
+}
+
+func hasMutationTool(names []string) bool {
+	for _, n := range names {
+		if n == "edit_file" || n == "write_file" {
+			return true
+		}
+	}
+	return false
 }
 
 type parentMutationScope struct {
@@ -473,14 +503,6 @@ func (t *taskTool) newChildTool(name string, at subagent.AgentType, scope parent
 	ask := t.permissionAsk()
 	root := scope.workspaceRoot
 	switch name {
-	case "read_file":
-		return tool.WrapWithPermissionAtRoot(tool.NewReadFileAtRoot(t.toolsConfig, scope.tracker, root), root, check, ask)
-	case "write_file":
-		return tool.WrapWithPermissionAtRoot(tool.NewWriteFileWithSnapshotAtRoot(scope.snapshotStore(), scope.tracker, t.toolsConfig, root), root, check, ask)
-	case "edit_file":
-		return tool.WrapWithPermissionAtRoot(tool.NewEditFileWithSnapshotAtRoot(scope.snapshotStore(), scope.tracker, t.toolsConfig, root), root, check, ask)
-	case "execute_pending":
-		return tool.WrapWithPermission(tool.ExecutePending{}, check, ask)
 	case "run_command":
 		rc := tool.NewRunCommandAtRoot(t.toolsConfig, t.homeDir, root, procMgr)
 		if isReadOnlyType(at) {

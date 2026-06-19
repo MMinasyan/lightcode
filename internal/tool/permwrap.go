@@ -56,6 +56,30 @@ func (p *PermWrapped) ParametersSchema() map[string]any { return p.inner.Paramet
 func (p *PermWrapped) WrappedTool() Tool                { return p.inner }
 
 func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (string, error) {
+	// apply_patch has no path param and one approval covers the whole patch.
+	// The shared target plan drives permission checks, prompt fields, and the
+	// internal approval receipt used during execution.
+	if p.inner.Name() == "apply_patch" {
+		targets, _, agg, err := applyPatchPermissionPlan(p.check, p.workspaceRoot, params)
+		if err != nil {
+			return "", err
+		}
+		switch agg {
+		case permission.DecisionAllow:
+			return p.inner.Execute(ctx, withApplyPatchReceipt(params, targets))
+		case permission.DecisionDeny:
+			return "", ErrDenied
+		default:
+			if p.ask != nil {
+				req := applyPatchAskRequest(targets)
+				if permissionAllows(p.ask(ctx, req)) {
+					return p.inner.Execute(ctx, withApplyPatchReceipt(params, targets))
+				}
+			}
+			return "", ErrDenied
+		}
+	}
+
 	execParams, err := resolveFileToolParamsAtRoot(p.workspaceRoot, p.inner.Name(), params)
 	if err != nil {
 		return "", err
@@ -72,6 +96,30 @@ func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (strin
 			return p.inner.Execute(ctx, execParams)
 		}
 		return "", ErrDenied
+	}
+}
+
+// applyPatchAskRequest builds the permission ask for apply_patch: BatchFiles
+// lists every touched file; Arg and ResolvedArg are the first touched path
+// (the representative path the rule engine sees). The batch-level fields
+// (BatchIndex, BatchTotal, CanAllowAll) are set by the staged caller; the
+// immediate path leaves them zero, which is correct (single-call).
+func applyPatchAskRequest(targets []applyPatchTarget) permission.Request {
+	arg := ""
+	resolved := ""
+	paths := applyPatchDisplayFiles(targets)
+	resolvedPaths := applyPatchCanonicalFiles(targets)
+	if len(targets) > 0 {
+		arg = targets[0].AbsPath
+		resolved = targets[0].CanonicalPath
+	}
+	return permission.Request{
+		ToolName:           "apply_patch",
+		Arg:                arg,
+		ResolvedArg:        resolved,
+		BatchFiles:         paths,
+		BatchResolvedFiles: resolvedPaths,
+		DisableProjectSave: len(paths) > 1,
 	}
 }
 

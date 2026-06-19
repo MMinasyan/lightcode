@@ -219,6 +219,13 @@ func toolChangeSummary(name, args string, metadata map[string]any) (toolChangeCo
 		}
 		counts := editPreviewChangeCounts(preview)
 		return counts, counts.added > 0 || counts.removed > 0
+	case "apply_patch":
+		files, ok := editpreview.FilesFromMetadata(metadata)
+		if !ok {
+			return toolChangeCounts{}, false
+		}
+		counts := applyPatchFilesChangeCounts(files)
+		return counts, counts.added > 0 || counts.removed > 0
 	case "write_file":
 		lines := countContentLines(extractWriteContent(args))
 		if lines <= 0 {
@@ -228,6 +235,23 @@ func toolChangeSummary(name, args string, metadata map[string]any) (toolChangeCo
 	default:
 		return toolChangeCounts{}, false
 	}
+}
+
+func applyPatchFilesChangeCounts(files []editpreview.FileEntry) toolChangeCounts {
+	var counts toolChangeCounts
+	for _, f := range files {
+		for _, hunk := range f.Preview.Hunks {
+			for _, row := range hunk.Rows {
+				switch row.Kind {
+				case editpreview.KindAdd:
+					counts.added++
+				case editpreview.KindRemove:
+					counts.removed++
+				}
+			}
+		}
+	}
+	return counts
 }
 
 func writeToolChangeSummary(b *strings.Builder, counts toolChangeCounts) {
@@ -268,6 +292,16 @@ func renderToolResult(name, args, result string, success bool, expanded bool, wi
 	if name == "edit_file" {
 		if preview, ok := editpreview.FromMetadata(metadata); ok {
 			b.WriteString(renderEditPreview(preview, indent, inner, expanded))
+			return b.String()
+		}
+		return ""
+	}
+
+	// apply_patch success output is per-file; render one diff block
+	// per file under the outer per-file shape.
+	if name == "apply_patch" {
+		if files, ok := editpreview.FilesFromMetadata(metadata); ok {
+			b.WriteString(renderApplyPatchFiles(files, indent, inner, expanded))
 			return b.String()
 		}
 		return ""
@@ -368,6 +402,39 @@ func editPreviewRowCount(preview *editpreview.Preview) int {
 		total += len(hunk.Rows)
 	}
 	return total
+}
+
+// renderApplyPatchFiles renders one diff block per entry in the
+// edit_preview_files list (apply_patch). Each block has the op tag
+// (A/M/D) and the path on its first line, followed by the per-file
+// preview's hunks. Per-file expand / collapse is per-block; the outer
+// shape mirrors the GUI's outer per-file grouping.
+func renderApplyPatchFiles(files []editpreview.FileEntry, indent string, inner int, expanded bool) string {
+	if len(files) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, file := range files {
+		if i > 0 {
+			b.WriteString(nl)
+		}
+		op := file.Op
+		if op == "" {
+			op = "M"
+		}
+		b.WriteString(indent)
+		b.WriteString(colorCyan)
+		b.WriteString(op)
+		b.WriteString(colorReset)
+		b.WriteString(" ")
+		b.WriteString(file.Path)
+		b.WriteString(nl)
+		if len(file.Preview.Hunks) == 0 {
+			continue
+		}
+		b.WriteString(renderEditPreview(&file.Preview, indent, inner, expanded))
+	}
+	return b.String()
 }
 
 func editPreviewChangeCounts(preview *editpreview.Preview) toolChangeCounts {
@@ -515,8 +582,10 @@ func permissionActions(req *agent.PermissionRequest) []menuItem {
 	items = append(items,
 		menuItem{label: "Allow", detail: "once", selectable: true, extra: "allow"},
 		menuItem{label: "Deny", detail: "this request", selectable: true, extra: "deny"},
-		menuItem{label: "Allow for project", detail: "save rule", selectable: true, extra: "project"},
 	)
+	if req == nil || !req.DisableProjectSave {
+		items = append(items, menuItem{label: "Allow for project", detail: "save rule", selectable: true, extra: "project"})
+	}
 	return items
 }
 
@@ -536,13 +605,20 @@ func permissionMenuItems(req *agent.PermissionRequest) []menuItem {
 	if req.ResolvedArg != "" && req.ResolvedArg != req.Arg {
 		items = append(items, menuItem{label: "resolves to " + req.ResolvedArg, selectable: false})
 	}
-	if req.CanAllowAll && len(req.BatchFiles) > 0 {
-		items = append(items, menuItem{label: "Staged files:", selectable: false})
+	if len(req.BatchFiles) > 0 {
+		title := "Affected files:"
+		if req.CanAllowAll {
+			title = "Staged files:"
+		}
+		items = append(items, menuItem{label: title, selectable: false})
 		current := req.Arg
-		for _, file := range req.BatchFiles {
+		for i, file := range req.BatchFiles {
 			prefix := "  "
 			if file == current {
 				prefix = "> "
+			}
+			if i < len(req.BatchResolvedFiles) && req.BatchResolvedFiles[i] != "" && req.BatchResolvedFiles[i] != file {
+				file += " -> " + req.BatchResolvedFiles[i]
 			}
 			items = append(items, menuItem{label: prefix + file, selectable: false})
 		}
@@ -571,7 +647,7 @@ func permissionPromptHeaderRows(req *agent.PermissionRequest) int {
 	if req.ResolvedArg != "" && req.ResolvedArg != req.Arg {
 		rows++
 	}
-	if req.CanAllowAll && len(req.BatchFiles) > 0 {
+	if len(req.BatchFiles) > 0 {
 		rows += 1 + len(req.BatchFiles)
 	}
 	return rows

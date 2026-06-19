@@ -22,7 +22,7 @@
   }
 
   async function openSuggest() {
-    if (!permission) return;
+    if (!permission || permission.canSaveProject === false) return;
     try {
       suggestions = await PermissionSuggest(permission.tool, permission.resolvedArg || permission.args) || [];
       selected = {};
@@ -74,11 +74,13 @@
         <span class="batch-badge">{permission.batchIndex}/{permission.batchTotal}</span>
       {/if}
     </div>
-    {#if permission?.canAllowAll && permission?.batchFiles?.length}
+    {#if permission?.batchFiles?.length}
       <div class="batch-list">
-        <div class="batch-title">Staged files</div>
-        {#each permission.batchFiles as file}
-          <div class:current-file={file === permission.args}>{file}</div>
+        <div class="batch-title">{permission?.canAllowAll ? 'Staged files' : 'Affected files'}</div>
+        {#each permission.batchFiles as file, i}
+          <div class:current-file={file === permission.args}>
+            {file}{#if permission.batchResolvedFiles?.[i] && permission.batchResolvedFiles[i] !== file} -> {permission.batchResolvedFiles[i]}{/if}
+          </div>
         {/each}
       </div>
     {/if}
@@ -110,7 +112,9 @@
         {/if}
         <button class="btn allow" on:click={() => respond('allow')}>Allow</button>
         <button class="btn deny" on:click={() => respond('deny')}>Deny</button>
-        <button class="btn project" on:click={openSuggest}>Allow for project</button>
+        {#if permission?.canSaveProject !== false}
+          <button class="btn project" on:click={openSuggest}>Allow for project</button>
+        {/if}
       </div>
     {/if}
   </div>

@@ -16,24 +16,16 @@ type entry struct {
 	adapt   Adaptation
 }
 
-// table is the production binding table, ordered most-specific-first.
-var table = []entry{
-	{pattern: "*gpt-5.5*", adapt: gptTaskExecutionAdaptation},
-	{pattern: "*gpt-5.4*", adapt: gptTaskExecutionAdaptation},
-	{pattern: "*grok-build-0.1", adapt: gptTaskExecutionAdaptation},
-	{pattern: "*gemini-3*", adapt: googleTaskExecutionAdaptation},
-	{pattern: "*gemma-4*", adapt: googleTaskExecutionAdaptation},
-}
-
 // defaultAdditions is the system-owned fallback for per-section additions.
 // Empty means there is no baseline addition for that section.
 var defaultAdditions map[string]string
 
 // Match returns the adaptation bound to modelID, or nil for baseline. It is the
 // production Resolver and expects the model component of the active model ref;
-// aggregator model IDs may still contain slashes.
+// aggregator model IDs may still contain slashes. The table is loaded from
+// the bundled data file in loader.go; the matcher itself is generic.
 func Match(modelID string) *Adaptation {
-	return matchIn(table, modelID)
+	return matchIn(bundledTable, modelID)
 }
 
 // SectionAddition returns the addition for section from the active adaptation
@@ -72,8 +64,9 @@ func matchIn(t []entry, modelID string) *Adaptation {
 
 // globMatch reports whether glob matches the whole string s. '*' matches any
 // run of characters, including '/' and the empty string; every other byte is
-// literal. The match is anchored at both ends, so "gpt-5*" matches "gpt-5.4"
-// but not "openai/gpt-5.4".
+// literal. The match is anchored at both ends, so "model-5*" matches
+// "model-5.4" but not "provider/model-5.4"; a leading wildcard such as
+// "*-5*" does match across '/'.
 func globMatch(glob, s string) bool {
 	// Linear scan with backtracking to the most recent '*'.
 	var gi, si int

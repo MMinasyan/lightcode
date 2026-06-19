@@ -199,11 +199,13 @@ func New(c Config) (*Agent, error) {
 			PermID:   req.ID,
 			PermArg:  req.Arg,
 			Metadata: map[string]any{
-				"resolved_arg":  req.ResolvedArg,
-				"can_allow_all": req.CanAllowAll,
-				"batch_index":   req.BatchIndex,
-				"batch_total":   req.BatchTotal,
-				"batch_files":   req.BatchFiles,
+				"resolved_arg":         req.ResolvedArg,
+				"can_allow_all":        req.CanAllowAll,
+				"disable_project_save": req.DisableProjectSave,
+				"batch_index":          req.BatchIndex,
+				"batch_total":          req.BatchTotal,
+				"batch_files":          req.BatchFiles,
+				"batch_resolved_files": req.BatchResolvedFiles,
 			},
 		}
 		select {
@@ -243,9 +245,9 @@ func New(c Config) (*Agent, error) {
 	a.fileTracker = fileTracker
 
 	registry := tool.NewRegistry()
-	registry.Register(tool.WrapWithPermissionAtRoot(tool.NewReadFileAtRoot(c.Cfg.Tools, fileTracker, rt.workspaceRoot), rt.workspaceRoot, checkPolicy, askPolicy))
-	registry.Register(tool.WrapWithPermissionAtRoot(tool.NewWriteFileWithSnapshotAtRoot(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot), rt.workspaceRoot, checkPolicy, askPolicy))
-	registry.Register(tool.WrapWithPermissionAtRoot(tool.NewEditFileWithSnapshotAtRoot(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot), rt.workspaceRoot, checkPolicy, askPolicy))
+	for _, tl := range tool.CoreToolList(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askPolicy) {
+		registry.Register(tl)
+	}
 	registry.Register(tool.WrapWithPermission(tool.ExecutePending{}, checkPolicy, askPolicy))
 
 	procMgr := process.NewManagerAtRoot(c.Cfg.Tools.MaxBackgroundProcesses, cmdoutput.Options{
@@ -735,21 +737,25 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 		})
 	case loop.PermissionRequest:
 		canAllowAll, _ := ev.Metadata["can_allow_all"].(bool)
+		disableProjectSave, _ := ev.Metadata["disable_project_save"].(bool)
 		batchIndex, _ := ev.Metadata["batch_index"].(int)
 		batchTotal, _ := ev.Metadata["batch_total"].(int)
 		batchFiles, _ := ev.Metadata["batch_files"].([]string)
+		batchResolvedFiles, _ := ev.Metadata["batch_resolved_files"].([]string)
 		resolvedArg, _ := ev.Metadata["resolved_arg"].(string)
 		a.emitEvent(Event{
 			Kind: EventPermissionRequest,
 			PermReq: &PermissionRequest{
-				ID:          ev.PermID,
-				ToolName:    ev.ToolName,
-				Arg:         ev.PermArg,
-				ResolvedArg: resolvedArg,
-				CanAllowAll: canAllowAll,
-				BatchIndex:  batchIndex,
-				BatchTotal:  batchTotal,
-				BatchFiles:  batchFiles,
+				ID:                 ev.PermID,
+				ToolName:           ev.ToolName,
+				Arg:                ev.PermArg,
+				ResolvedArg:        resolvedArg,
+				CanAllowAll:        canAllowAll,
+				DisableProjectSave: disableProjectSave,
+				BatchIndex:         batchIndex,
+				BatchTotal:         batchTotal,
+				BatchFiles:         batchFiles,
+				BatchResolvedFiles: batchResolvedFiles,
 			},
 		})
 	case loop.Usage:
@@ -1852,6 +1858,15 @@ func (a *Agent) PermissionSuggest(toolName, arg string) []PermissionSuggestion {
 // SaveProjectPermission appends patterns to the project's local
 // permissions.json, then allows the pending request.
 func (a *Agent) SaveProjectPermission(id string, patterns []string) error {
+	if a.gate != nil {
+		canSave, err := a.gate.CanSaveProjectPermission(id)
+		if err == nil && !canSave {
+			return errors.New("project permission save is disabled for this request")
+		}
+		if err != nil && !errors.Is(err, permission.ErrUnknownRequest) {
+			return err
+		}
+	}
 	proj, err := a.projects.Ensure()
 	if err != nil {
 		return err

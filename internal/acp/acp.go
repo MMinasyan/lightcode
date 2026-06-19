@@ -236,14 +236,16 @@ func (r *Runner) handleEvent(ev agent.Event) {
 	case agent.EventPermissionRequest:
 		method = "agent/permission_request"
 		params = map[string]any{
-			"id":          ev.PermReq.ID,
-			"tool":        ev.PermReq.ToolName,
-			"arg":         ev.PermReq.Arg,
-			"resolvedArg": ev.PermReq.ResolvedArg,
-			"canAllowAll": ev.PermReq.CanAllowAll,
-			"batchIndex":  ev.PermReq.BatchIndex,
-			"batchTotal":  ev.PermReq.BatchTotal,
-			"batchFiles":  ev.PermReq.BatchFiles,
+			"id":                 ev.PermReq.ID,
+			"tool":               ev.PermReq.ToolName,
+			"arg":                ev.PermReq.Arg,
+			"resolvedArg":        ev.PermReq.ResolvedArg,
+			"canAllowAll":        ev.PermReq.CanAllowAll,
+			"canSaveProject":     !ev.PermReq.DisableProjectSave,
+			"batchIndex":         ev.PermReq.BatchIndex,
+			"batchTotal":         ev.PermReq.BatchTotal,
+			"batchFiles":         ev.PermReq.BatchFiles,
+			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		}
 	case agent.EventCompactionStart:
 		method = "agent/compaction_start"
