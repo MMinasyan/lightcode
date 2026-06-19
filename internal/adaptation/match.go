@@ -64,8 +64,9 @@ func matchIn(t []entry, modelID string) *Adaptation {
 
 // globMatch reports whether glob matches the whole string s. '*' matches any
 // run of characters, including '/' and the empty string; every other byte is
-// literal. The match is anchored at both ends, so "*-5*" matches "model-5.4"
-// but not "provider/model-5.4".
+// literal. The match is anchored at both ends, so "model-5*" matches
+// "model-5.4" but not "provider/model-5.4"; a leading wildcard such as
+// "*-5*" does match across '/'.
 func globMatch(glob, s string) bool {
 	// Linear scan with backtracking to the most recent '*'.
 	var gi, si int

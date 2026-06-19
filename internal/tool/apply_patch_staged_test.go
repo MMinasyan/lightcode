@@ -36,10 +36,9 @@ func TestApplyPatchValidateStagedRejectsMissingInput(t *testing.T) {
 }
 
 func TestApplyPatchValidateStagedNoFSAccess(t *testing.T) {
-	// Invariant 2: ValidateStaged must not touch the filesystem. A
-	// patch referring to a non-existent file must still validate
-	// successfully (the existence check happens in the apply engine,
-	// after permission approval).
+	// ValidateStaged must not touch the filesystem. A patch referring to a
+	// non-existent file must still validate successfully (the existence check
+	// happens in the apply engine, after permission approval).
 	tool := NewApplyPatchWithSnapshotAtRoot(&applyPatchStore{turn: 1}, NewFileTracker(), config.ToolsConfig{}, t.TempDir())
 	// Build the args JSON programmatically (the patch contains newlines
 	// that need JSON-escaping; using a string concatenation here would
@@ -224,8 +223,7 @@ func TestApplyPatchStagedFlushPartialFailureSetsError(t *testing.T) {
 	// snapshot returns an error (simulated mid-write I/O failure
 	// after validation passed). The staged result must carry the
 	// A summary + the I/O error in BatchResult.Error so the existing
-	// emitPendingResults branch routes it to the model with
-	// isError = true (Invariant 5, no struct change).
+	// emitPendingResults branch routes it to the model with isError = true.
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "x.txt"), []byte("alpha\nBEFORE\nbeta"), 0o644); err != nil {
 		t.Fatal(err)
@@ -421,6 +419,51 @@ func TestApplyPatchStagedBatchCanAllowAllFalse(t *testing.T) {
 	}
 	if *seenCanAllowAll {
 		t.Fatalf("CanAllowAll = true, want false for pure apply_patch batch")
+	}
+}
+
+func TestApplyPatchStagedForgedAllowAllDoesNotApproveLaterPatch(t *testing.T) {
+	dir := t.TempDir()
+	store := &applyPatchStore{turn: 1}
+	tracker := NewFileTracker()
+	asked := 0
+	executor := NewStagedExecutorAtRoot(store, tracker, config.ToolsConfig{}, dir,
+		rulesCheck(dir, permission.Rules{Ask: []string{ruleFor(dir, "**")}}),
+		func(_ context.Context, req permission.Request) permission.ResponseAction {
+			asked++
+			if req.CanAllowAll {
+				t.Fatalf("CanAllowAll = true for apply_patch request")
+			}
+			if asked == 1 {
+				return permission.ResponseAllowAll
+			}
+			return permission.ResponseDeny
+		},
+	)
+
+	first := applyPatchInput(t, "*** Add File: a.txt\n+hi")
+	second := applyPatchInput(t, "*** Add File: b.txt\n+there")
+	results := executor.ExecutePending(context.Background(), []StagedCall{
+		{ToolName: "apply_patch", ToolCallID: "1", Args: first, Params: map[string]any{"input": first}},
+		{ToolName: "apply_patch", ToolCallID: "2", Args: second, Params: map[string]any{"input": second}},
+	})
+	if asked != 2 {
+		t.Fatalf("permission prompts = %d, want 2", asked)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results len = %d, want 2", len(results))
+	}
+	if !results[0].Success {
+		t.Fatalf("first result = %+v, want success", results[0])
+	}
+	if results[1].Error != "denied by user" {
+		t.Fatalf("second result error = %q, want denied by user", results[1].Error)
+	}
+	if got := readFile(t, filepath.Join(dir, "a.txt")); got != "hi" {
+		t.Fatalf("a.txt = %q, want hi", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "b.txt")); !os.IsNotExist(err) {
+		t.Fatalf("b.txt exists after forged allow_all: %v", err)
 	}
 }
 

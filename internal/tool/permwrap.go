@@ -60,7 +60,10 @@ func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (strin
 	// The shared target plan drives permission checks, prompt fields, and the
 	// internal approval receipt used during execution.
 	if p.inner.Name() == "apply_patch" {
-		targets, _, agg := applyPatchPermissionPlan(p.check, p.workspaceRoot, params)
+		targets, _, agg, err := applyPatchPermissionPlan(p.check, p.workspaceRoot, params)
+		if err != nil {
+			return "", err
+		}
 		switch agg {
 		case permission.DecisionAllow:
 			return p.inner.Execute(ctx, withApplyPatchReceipt(params, targets))
@@ -116,6 +119,7 @@ func applyPatchAskRequest(targets []applyPatchTarget) permission.Request {
 		ResolvedArg:        resolved,
 		BatchFiles:         paths,
 		BatchResolvedFiles: resolvedPaths,
+		DisableProjectSave: len(paths) > 1,
 	}
 }
 

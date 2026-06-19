@@ -176,6 +176,28 @@ func TestLocateEOFTrailingEmptyRetry(t *testing.T) {
 	if start != 0 {
 		t.Fatalf("start = %d, want 0", start)
 	}
+	match, err := locateHunk(lines, h, "p", 0)
+	if err != nil {
+		t.Fatalf("locateHunk err = %v", err)
+	}
+	if match.start != 0 || match.realMatchedLen != 2 || !match.syntheticTrailingEmpty {
+		t.Fatalf("locateHunk = %+v, want start 0 len 2 synthetic trailing empty", match)
+	}
+}
+
+func TestLocateEOFTrailingEmptyRetryDoesNotMatchBeforeEOF(t *testing.T) {
+	lines := []string{"alpha", "beta", "charlie"}
+	h := hunk{lines: []hunkLine{
+		{kind: lineContext, text: "alpha"},
+		{kind: lineRemove, text: ""},
+	}}
+	_, err := locate(lines, h, "p", 0)
+	if err == nil {
+		t.Fatal("locate err = nil, want non-EOF trailing-empty retry to fail")
+	}
+	if !strings.HasPrefix(err.Error(), "Failed to find expected lines in p:") {
+		t.Fatalf("err = %q, want expected-lines failure", err.Error())
+	}
 }
 
 func TestLocateNoEOFTrailingEmptyWhenFileHasIt(t *testing.T) {
@@ -193,6 +215,13 @@ func TestLocateNoEOFTrailingEmptyWhenFileHasIt(t *testing.T) {
 	}
 	if start != 0 {
 		t.Fatalf("start = %d, want 0", start)
+	}
+	match, err := locateHunk(lines, h, "p", 0)
+	if err != nil {
+		t.Fatalf("locateHunk err = %v", err)
+	}
+	if match.start != 0 || match.realMatchedLen != 3 || match.syntheticTrailingEmpty {
+		t.Fatalf("locateHunk = %+v, want start 0 len 3 no synthetic line", match)
 	}
 }
 

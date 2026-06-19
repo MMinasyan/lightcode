@@ -22,7 +22,7 @@
   }
 
   async function openSuggest() {
-    if (!permission) return;
+    if (!permission || permission.canSaveProject === false) return;
     try {
       suggestions = await PermissionSuggest(permission.tool, permission.resolvedArg || permission.args) || [];
       selected = {};
@@ -112,7 +112,9 @@
         {/if}
         <button class="btn allow" on:click={() => respond('allow')}>Allow</button>
         <button class="btn deny" on:click={() => respond('deny')}>Deny</button>
-        <button class="btn project" on:click={openSuggest}>Allow for project</button>
+        {#if permission?.canSaveProject !== false}
+          <button class="btn project" on:click={openSuggest}>Allow for project</button>
+        {/if}
       </div>
     {/if}
   </div>

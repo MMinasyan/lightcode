@@ -201,6 +201,7 @@ func New(c Config) (*Agent, error) {
 			Metadata: map[string]any{
 				"resolved_arg":         req.ResolvedArg,
 				"can_allow_all":        req.CanAllowAll,
+				"disable_project_save": req.DisableProjectSave,
 				"batch_index":          req.BatchIndex,
 				"batch_total":          req.BatchTotal,
 				"batch_files":          req.BatchFiles,
@@ -736,6 +737,7 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 		})
 	case loop.PermissionRequest:
 		canAllowAll, _ := ev.Metadata["can_allow_all"].(bool)
+		disableProjectSave, _ := ev.Metadata["disable_project_save"].(bool)
 		batchIndex, _ := ev.Metadata["batch_index"].(int)
 		batchTotal, _ := ev.Metadata["batch_total"].(int)
 		batchFiles, _ := ev.Metadata["batch_files"].([]string)
@@ -749,6 +751,7 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 				Arg:                ev.PermArg,
 				ResolvedArg:        resolvedArg,
 				CanAllowAll:        canAllowAll,
+				DisableProjectSave: disableProjectSave,
 				BatchIndex:         batchIndex,
 				BatchTotal:         batchTotal,
 				BatchFiles:         batchFiles,
@@ -1855,6 +1858,15 @@ func (a *Agent) PermissionSuggest(toolName, arg string) []PermissionSuggestion {
 // SaveProjectPermission appends patterns to the project's local
 // permissions.json, then allows the pending request.
 func (a *Agent) SaveProjectPermission(id string, patterns []string) error {
+	if a.gate != nil {
+		canSave, err := a.gate.CanSaveProjectPermission(id)
+		if err == nil && !canSave {
+			return errors.New("project permission save is disabled for this request")
+		}
+		if err != nil && !errors.Is(err, permission.ErrUnknownRequest) {
+			return err
+		}
+	}
 	proj, err := a.projects.Ensure()
 	if err != nil {
 		return err

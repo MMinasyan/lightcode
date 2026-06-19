@@ -136,6 +136,154 @@ func TestApplyPatchUpdatesExistingFile(t *testing.T) {
 	}
 }
 
+func TestApplyPatchFuzzyMatchPreservesActualTrailingWhitespaceContext(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.go")
+	if err := os.WriteFile(path, []byte("alpha   \nBEFORE\nbeta"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewApplyPatchWithSnapshotAtRoot(&applyPatchStore{turn: 1}, NewFileTracker(), config.ToolsConfig{}, dir)
+
+	input := applyPatchInput(t, "*** Update File: a.go\n@@\n alpha\n-BEFORE\n+AFTER\n beta")
+	if _, err := runApplyPatch(t, tool, map[string]any{"input": input}); err != nil {
+		t.Fatalf("Execute err = %v", err)
+	}
+	if got := readFile(t, path); got != "alpha   \nAFTER\nbeta" {
+		t.Fatalf("file = %q, want context trailing spaces preserved", got)
+	}
+}
+
+func TestApplyPatchFuzzyMatchPreservesActualUnicodeContext(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.go")
+	if err := os.WriteFile(path, []byte("say \u201Chello\u201D\nBEFORE\nbeta"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewApplyPatchWithSnapshotAtRoot(&applyPatchStore{turn: 1}, NewFileTracker(), config.ToolsConfig{}, dir)
+
+	input := applyPatchInput(t, "*** Update File: a.go\n@@\n say \"hello\"\n-BEFORE\n+AFTER\n beta")
+	if _, err := runApplyPatch(t, tool, map[string]any{"input": input}); err != nil {
+		t.Fatalf("Execute err = %v", err)
+	}
+	if got := readFile(t, path); got != "say \u201Chello\u201D\nAFTER\nbeta" {
+		t.Fatalf("file = %q, want unicode context preserved", got)
+	}
+}
+
+func TestApplyPatchSyntheticEOFContextDoesNotCreateTrailingNewline(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("foo\nbar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewApplyPatchWithSnapshotAtRoot(&applyPatchStore{turn: 1}, NewFileTracker(), config.ToolsConfig{}, dir)
+
+	input := applyPatchInput(t, "*** Update File: a.txt\n@@\n foo\n-bar\n+baz\n ")
+	if _, err := runApplyPatch(t, tool, map[string]any{"input": input}); err != nil {
+		t.Fatalf("Execute err = %v", err)
+	}
+	if got := readFile(t, path); got != "foo\nbaz" {
+		t.Fatalf("file = %q, want no synthetic trailing newline", got)
+	}
+	previews := tool.takeApplyPreview()
+	if len(previews) != 1 || len(previews[0].Hunks) != 1 {
+		t.Fatalf("previews = %#v, want one hunk", previews)
+	}
+	lines := previews[0].Hunks[0].Lines
+	if len(lines) != 3 {
+		t.Fatalf("preview lines = %#v, want context/remove/add only", lines)
+	}
+	if lines[0].kind != lineContext || lines[0].text != "foo" ||
+		lines[1].kind != lineRemove || lines[1].text != "bar" ||
+		lines[2].kind != lineAdd || lines[2].text != "baz" {
+		t.Fatalf("preview lines = %#v, want synthetic EOF context omitted", lines)
+	}
+}
+
+func TestApplyPatchSyntheticEOFRemoveFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("foo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewApplyPatchWithSnapshotAtRoot(&applyPatchStore{turn: 1}, NewFileTracker(), config.ToolsConfig{}, dir)
+
+	input := applyPatchInput(t, "*** Update File: a.txt\n@@\n-\n+bar")
+	_, err := runApplyPatch(t, tool, map[string]any{"input": input})
+	if err == nil {
+		t.Fatal("Execute err = nil, want synthetic EOF remove to fail")
+	}
+	if !strings.HasPrefix(err.Error(), "Failed to find expected lines in a.txt:") {
+		t.Fatalf("err = %v, want expected-lines failure", err)
+	}
+	if got := readFile(t, path); got != "foo" {
+		t.Fatalf("file = %q, want unchanged", got)
+	}
+}
+
+func TestApplyPatchRealEOFContextPreservesTrailingNewline(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("foo\nbar\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewApplyPatchWithSnapshotAtRoot(&applyPatchStore{turn: 1}, NewFileTracker(), config.ToolsConfig{}, dir)
+
+	input := applyPatchInput(t, "*** Update File: a.txt\n@@\n foo\n-bar\n+baz\n ")
+	if _, err := runApplyPatch(t, tool, map[string]any{"input": input}); err != nil {
+		t.Fatalf("Execute err = %v", err)
+	}
+	if got := readFile(t, path); got != "foo\nbaz\n" {
+		t.Fatalf("file = %q, want real trailing newline preserved", got)
+	}
+	previews := tool.takeApplyPreview()
+	if len(previews) != 1 || len(previews[0].Hunks) != 1 {
+		t.Fatalf("previews = %#v, want one hunk", previews)
+	}
+	lines := previews[0].Hunks[0].Lines
+	if len(lines) != 4 || lines[3].kind != lineContext || lines[3].text != "" {
+		t.Fatalf("preview lines = %#v, want real EOF context retained", lines)
+	}
+}
+
+func TestApplyPatchRealEmptyRemoveStillWorks(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("foo\n\nbaz"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewApplyPatchWithSnapshotAtRoot(&applyPatchStore{turn: 1}, NewFileTracker(), config.ToolsConfig{}, dir)
+
+	input := applyPatchInput(t, "*** Update File: a.txt\n@@\n foo\n-\n+bar\n baz")
+	if _, err := runApplyPatch(t, tool, map[string]any{"input": input}); err != nil {
+		t.Fatalf("Execute err = %v", err)
+	}
+	if got := readFile(t, path); got != "foo\nbar\nbaz" {
+		t.Fatalf("file = %q, want real empty line replaced", got)
+	}
+}
+
+func TestApplyPatchTrailingEmptyRetryDoesNotConsumeNextLineBeforeEOF(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.go")
+	if err := os.WriteFile(path, []byte("alpha\nbeta\ncharlie"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewApplyPatchWithSnapshotAtRoot(&applyPatchStore{turn: 1}, NewFileTracker(), config.ToolsConfig{}, dir)
+
+	input := applyPatchInput(t, "*** Update File: a.go\n@@\n alpha\n-\n+blank")
+	_, err := runApplyPatch(t, tool, map[string]any{"input": input})
+	if err == nil {
+		t.Fatal("Execute err = nil, want non-EOF trailing-empty pattern to fail")
+	}
+	if !strings.HasPrefix(err.Error(), "Failed to find expected lines in a.go:") {
+		t.Fatalf("err = %v, want expected-lines failure", err)
+	}
+	if got := readFile(t, path); got != "alpha\nbeta\ncharlie" {
+		t.Fatalf("file = %q, want unchanged", got)
+	}
+}
+
 func TestApplyPatchUpdateFailsIfHunkContextMissing(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a.go")
@@ -321,7 +469,7 @@ func TestApplyPatchRefusesDeleteWhenContentChangesAfterValidation(t *testing.T) 
 	}
 }
 
-func TestApplyPatchRefusesMoveSourceWhenContentChangesAfterValidation(t *testing.T) {
+func TestApplyPatchRefusesMoveSourceWhenContentChangesAfterDestinationWrite(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "old.txt")
 	dst := filepath.Join(dir, "new.txt")
@@ -329,7 +477,7 @@ func TestApplyPatchRefusesMoveSourceWhenContentChangesAfterValidation(t *testing
 		t.Fatal(err)
 	}
 	store := &applyPatchStore{turn: 1, onSnapshot: func(call int) {
-		if call == 1 {
+		if call == 2 {
 			if err := os.WriteFile(src, []byte("changed"), 0o644); err != nil {
 				t.Fatalf("mutate source: %v", err)
 			}
@@ -342,11 +490,15 @@ func TestApplyPatchRefusesMoveSourceWhenContentChangesAfterValidation(t *testing
 	if err == nil || !strings.Contains(err.Error(), "changed after validation") {
 		t.Fatalf("Execute err = %v, want changed-after-validation", err)
 	}
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) || !strings.Contains(exitErr.Output, "M new.txt") {
+		t.Fatalf("Execute err = %v, want partial summary with M new.txt", err)
+	}
 	if got := readFile(t, src); got != "changed" {
 		t.Fatalf("source = %q, want concurrent content retained", got)
 	}
-	if _, err := os.Stat(dst); !os.IsNotExist(err) {
-		t.Fatalf("dest exists despite refused move: %v", err)
+	if got := readFile(t, dst); got != "old content" {
+		t.Fatalf("dest = %q, want committed pre-change content", got)
 	}
 }
 
@@ -424,7 +576,7 @@ func TestApplyPatchAllOrNothingPartialApplyError(t *testing.T) {
 }
 
 func TestApplyPatchNoReadGate(t *testing.T) {
-	// Decision 12: apply_patch never calls tracker.WasReadCheckIdentity.
+	// apply_patch relies on patch preconditions instead of the read-before-edit gate.
 	// The file is updated without ever being read_file'd.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a.go")
@@ -534,10 +686,9 @@ func TestApplyPatchDefaultHidden(t *testing.T) {
 
 func TestApplyPatchCapturesPreviewForDisplayMetadata(t *testing.T) {
 	// Verifies the engine captures per-op pre/post/hunks data during
-	// apply so DisplayMetadata (commit 6) can build edit_preview_files
-	// without post-write disk reads. Read-after-apply is not viable
-	// for updates (source is overwritten), deletes (file is gone), or
-	// moves (source is unlinked).
+	// apply so DisplayMetadata can build edit_preview_files without
+	// post-write disk reads. Read-after-apply is not viable for updates
+	// (source is overwritten), deletes (file is gone), or moves (source is unlinked).
 	dir := t.TempDir()
 	src := filepath.Join(dir, "x.txt")
 	if err := os.WriteFile(src, []byte("alpha\nBEFORE\nbeta"), 0o644); err != nil {

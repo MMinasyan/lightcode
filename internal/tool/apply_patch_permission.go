@@ -24,18 +24,17 @@ func applyPatchFilesAtRoot(workspaceRoot string, params map[string]any) []string
 // check function to both the immediate PermWrapped.Execute branch and
 // the staged executor's permission loop keeps the two paths identical.
 func applyPatchPermissionDecision(check CheckFunc, workspaceRoot string, params map[string]any) (paths []string, perPath []permission.Decision, aggregate permission.Decision) {
-	targets, perPath, aggregate := applyPatchPermissionPlan(check, workspaceRoot, params)
+	targets, perPath, aggregate, _ := applyPatchPermissionPlan(check, workspaceRoot, params)
 	return applyPatchDisplayFiles(targets), perPath, aggregate
 }
 
-func applyPatchPermissionPlan(check CheckFunc, workspaceRoot string, params map[string]any) (targets []applyPatchTarget, perPath []permission.Decision, aggregate permission.Decision) {
-	_, targets, err := resolveApplyPatchTargets(workspaceRoot, params)
+func applyPatchPermissionPlan(check CheckFunc, workspaceRoot string, params map[string]any) (targets []applyPatchTarget, perPath []permission.Decision, aggregate permission.Decision, err error) {
+	_, targets, err = resolveApplyPatchTargets(workspaceRoot, params)
 	if err != nil || len(targets) == 0 {
-		// Malformed patch or no ops; let the apply engine surface the error.
-		return nil, nil, permission.DecisionAsk
+		return nil, nil, permission.DecisionAsk, err
 	}
 	if check == nil {
-		return targets, nil, permission.DecisionAsk
+		return targets, nil, permission.DecisionAsk, nil
 	}
 	perPath = make([]permission.Decision, len(targets))
 	aggregate = permission.DecisionAllow
@@ -56,5 +55,5 @@ func applyPatchPermissionPlan(check CheckFunc, workspaceRoot string, params map[
 			}
 		}
 	}
-	return targets, perPath, aggregate
+	return targets, perPath, aggregate, nil
 }

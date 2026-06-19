@@ -19,6 +19,7 @@ type Request struct {
 	Arg                string   `json:"args"`
 	ResolvedArg        string   `json:"resolved_arg,omitempty"`
 	CanAllowAll        bool     `json:"can_allow_all,omitempty"`
+	DisableProjectSave bool     `json:"disable_project_save,omitempty"`
 	BatchIndex         int      `json:"batch_index,omitempty"`
 	BatchTotal         int      `json:"batch_total,omitempty"`
 	BatchFiles         []string `json:"batch_files,omitempty"`
@@ -38,16 +39,21 @@ const (
 // round-trip through the Wails frontend.
 type Gate struct {
 	mu      sync.Mutex
-	pending map[string]chan ResponseAction
+	pending map[string]pendingRequest
 
 	// OnRequest is called when a new permission request is registered.
 	OnRequest func(ctx context.Context, req Request)
 }
 
+type pendingRequest struct {
+	ch  chan ResponseAction
+	req Request
+}
+
 // NewGate returns a Gate that calls onRequest for each new permission request.
 func NewGate(onRequest func(ctx context.Context, req Request)) *Gate {
 	return &Gate{
-		pending:   make(map[string]chan ResponseAction),
+		pending:   make(map[string]pendingRequest),
 		OnRequest: onRequest,
 	}
 }
@@ -71,7 +77,7 @@ func (g *Gate) AskRequest(ctx context.Context, req Request) ResponseAction {
 	req.ID = id
 
 	g.mu.Lock()
-	g.pending[id] = ch
+	g.pending[id] = pendingRequest{ch: ch, req: req}
 	g.mu.Unlock()
 
 	if g.OnRequest != nil {
@@ -95,7 +101,7 @@ func (g *Gate) AskRequest(ctx context.Context, req Request) ResponseAction {
 			return result
 		default:
 		}
-		if current, ok := g.pending[id]; ok && current == ch {
+		if current, ok := g.pending[id]; ok && current.ch == ch {
 			delete(g.pending, id)
 		}
 		g.mu.Unlock()
@@ -109,7 +115,7 @@ func (g *Gate) CancelAll() {
 	defer g.mu.Unlock()
 	for id, ch := range g.pending {
 		select {
-		case ch <- ResponseDeny:
+		case ch.ch <- ResponseDeny:
 		default:
 		}
 		delete(g.pending, id)
@@ -134,15 +140,28 @@ func (g *Gate) RespondAction(id string, action string) error {
 	}
 
 	g.mu.Lock()
-	ch, ok := g.pending[id]
+	pending, ok := g.pending[id]
 	if !ok {
 		g.mu.Unlock()
 		return fmt.Errorf("%w: id %q", ErrUnknownRequest, id)
 	}
-	ch <- response
+	if response == ResponseAllowAll && !pending.req.CanAllowAll {
+		response = ResponseAllow
+	}
+	pending.ch <- response
 	delete(g.pending, id)
 	g.mu.Unlock()
 	return nil
+}
+
+func (g *Gate) CanSaveProjectPermission(id string) (bool, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	pending, ok := g.pending[id]
+	if !ok {
+		return false, fmt.Errorf("%w: id %q", ErrUnknownRequest, id)
+	}
+	return !pending.req.DisableProjectSave, nil
 }
 
 func newID() string {

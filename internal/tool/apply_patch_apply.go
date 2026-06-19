@@ -253,43 +253,81 @@ func hunkHasMatchLines(h hunk) bool {
 }
 
 // applyHunk locates h's pattern (context + remove lines) starting at cursor
-// and replaces the matched block with the new content (context + add lines).
+// and replaces the matched block with the new content. Fuzzy matching is used
+// only to locate the hunk: context rows in the replacement are preserved from
+// the actual matched file content, while add rows come from the patch.
 // Returns the new lines slice, the new cursor (positioned just past the new
 // content), and the appliedHunkPreview so the diff rows can be reconstructed
 // without re-reading the file. Anchor handling is inside locate: the anchor
 // is located first if present, advancing the cursor; the pattern is then
 // located at the advanced cursor.
 func applyHunk(fileLines []string, h hunk, path string, cursor int) ([]string, int, appliedHunkPreview, error) {
-	start, err := locate(fileLines, h, path, cursor)
+	match, err := locateHunk(fileLines, h, path, cursor)
 	if err != nil {
 		return nil, 0, appliedHunkPreview{}, err
 	}
-	oldLines, newLines := hunkTransform(h)
-	end := start + len(oldLines)
+	start := match.start
+	patternLines := hunkPatternLines(h)
+	matchEnd := start + match.realMatchedLen
+	if matchEnd > len(fileLines) {
+		return nil, 0, appliedHunkPreview{}, fmt.Errorf("Failed to find expected lines in %s:\n%s", path, strings.Join(patternLines, "\n"))
+	}
+	matchedLines := fileLines[start:matchEnd]
+	oldLines, newLines, lines, err := hunkTransformPreservingMatchedContext(h, matchedLines, match.syntheticTrailingEmpty, path, patternLines)
+	if err != nil {
+		return nil, 0, appliedHunkPreview{}, err
+	}
 	out := make([]string, 0, len(fileLines)+len(newLines)-len(oldLines))
 	out = append(out, fileLines[:start]...)
 	out = append(out, newLines...)
-	out = append(out, fileLines[end:]...)
-	// Capture the classified hunk lines so display metadata can build diff rows
-	// without re-reading the file after the matched pattern is overwritten.
-	lines := make([]hunkLine, len(h.lines))
-	copy(lines, h.lines)
+	out = append(out, fileLines[matchEnd:]...)
 	return out, start + len(newLines), appliedHunkPreview{StartLine: start + 1, Old: oldLines, New: newLines, Lines: lines}, nil
 }
 
-func hunkTransform(h hunk) (oldLines, newLines []string) {
+func hunkPatternLines(h hunk) []string {
+	out := make([]string, 0, len(h.lines))
+	for _, hl := range h.lines {
+		if hl.kind == lineContext || hl.kind == lineRemove {
+			out = append(out, hl.text)
+		}
+	}
+	return out
+}
+
+func hunkTransformPreservingMatchedContext(h hunk, matchedLines []string, syntheticTrailingEmpty bool, path string, patternLines []string) (oldLines, newLines []string, lines []hunkLine, err error) {
+	lines = make([]hunkLine, 0, len(h.lines))
+	matchIdx := 0
 	for _, hl := range h.lines {
 		switch hl.kind {
 		case lineContext:
-			oldLines = append(oldLines, hl.text)
-			newLines = append(newLines, hl.text)
+			if matchIdx >= len(matchedLines) && syntheticTrailingEmpty && hl.text == "" {
+				continue
+			}
+			text := hl.text
+			if matchIdx < len(matchedLines) {
+				text = matchedLines[matchIdx]
+			}
+			oldLines = append(oldLines, text)
+			newLines = append(newLines, text)
+			lines = append(lines, hunkLine{kind: lineContext, text: text})
+			matchIdx++
 		case lineRemove:
-			oldLines = append(oldLines, hl.text)
+			if matchIdx >= len(matchedLines) {
+				return nil, nil, nil, fmt.Errorf("Failed to find expected lines in %s:\n%s", path, strings.Join(patternLines, "\n"))
+			}
+			text := hl.text
+			if matchIdx < len(matchedLines) {
+				text = matchedLines[matchIdx]
+			}
+			oldLines = append(oldLines, text)
+			lines = append(lines, hunkLine{kind: lineRemove, text: text})
+			matchIdx++
 		case lineAdd:
 			newLines = append(newLines, hl.text)
+			lines = append(lines, hl)
 		}
 	}
-	return
+	return oldLines, newLines, lines, nil
 }
 
 // applyOne applies a single op's mutation and returns the per-file
@@ -310,6 +348,9 @@ func applyOne(ctx context.Context, pl *applyPlan, store SnapshotStore, tracker *
 			return nil, &ExitError{Output: buildPartialSummary(*committed) + "\n\n" + err.Error()}
 		}
 		*committed = append(*committed, appliedOp{kind: "M", path: pl.op.movePath})
+		if err := revalidateApplySourceContent(pl); err != nil {
+			return nil, &ExitError{Output: buildPartialSummary(*committed) + "\n\n" + err.Error()}
+		}
 	}
 
 	// Now the original-path mutation (Add / Update / Delete), tracked separately for Move.
@@ -337,6 +378,17 @@ func revalidateApplyPlan(pl *applyPlan) error {
 		if !bytes.Equal(data, pl.preContent) {
 			return fmt.Errorf("apply_patch: %s changed after validation", pl.op.path)
 		}
+	}
+	return nil
+}
+
+func revalidateApplySourceContent(pl *applyPlan) error {
+	data, err := readFileBytes(pl.canonicalPath)
+	if err != nil {
+		return fmt.Errorf("apply_patch: read %s before mutation: %w", pl.op.path, err)
+	}
+	if !bytes.Equal(data, pl.preContent) {
+		return fmt.Errorf("apply_patch: %s changed after validation", pl.op.path)
 	}
 	return nil
 }

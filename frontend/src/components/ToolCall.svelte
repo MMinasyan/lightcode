@@ -206,6 +206,14 @@
         </div>
       {/each}
     {/if}
+    {#if done && result && !success}
+      <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+      <div class="output-block" class:expandable={hasMore} on:click={() => toggleOrOpenOutput('apply_patch output')}>
+        <pre class="output">{shownOutput}</pre>
+        {#if hasMore && !expanded}<div class="more">show all ({lines.length} lines)</div>{/if}
+        {#if hasMore && expanded}<div class="more">collapse</div>{/if}
+      </div>
+    {/if}
   {:else if name === 'background_process'}
     <div class="line">
       <span class="tool-name">background_process</span>

@@ -27,6 +27,22 @@ import (
 // trailing whitespace, (4) Unicode-normalize typographic variants
 // (dashes, fancy quotes, exotic spaces → ASCII) then trim.
 func locate(lines []string, h hunk, path string, cursor int) (int, error) {
+	match, err := locateHunk(lines, h, path, cursor)
+	return match.start, err
+}
+
+type hunkLocation struct {
+	start                  int
+	realMatchedLen         int
+	syntheticTrailingEmpty bool
+}
+
+type hunkPatternLine struct {
+	kind lineKind
+	text string
+}
+
+func locateHunk(lines []string, h hunk, path string, cursor int) (hunkLocation, error) {
 	c := cursor
 	if c < 0 {
 		c = 0
@@ -38,7 +54,7 @@ func locate(lines []string, h hunk, path string, cursor int) (int, error) {
 	if h.anchor != "" {
 		idx, err := locateLine(lines, h.anchor, path, c)
 		if err != nil {
-			return 0, err
+			return hunkLocation{}, err
 		}
 		c = idx + 1
 	}
@@ -47,16 +63,16 @@ func locate(lines []string, h hunk, path string, cursor int) (int, error) {
 	if len(pattern) == 0 {
 		// Update hunks with no context or remove lines carry no pattern
 		// to match; treat the advanced cursor as the start position.
-		return c, nil
+		return hunkLocation{start: c}, nil
 	}
 	return locateSeq(lines, pattern, path, c)
 }
 
-func patternFromHunk(h hunk) []string {
-	out := make([]string, 0, len(h.lines))
+func patternFromHunk(h hunk) []hunkPatternLine {
+	out := make([]hunkPatternLine, 0, len(h.lines))
 	for _, hl := range h.lines {
 		if hl.kind == lineContext || hl.kind == lineRemove {
-			out = append(out, hl.text)
+			out = append(out, hunkPatternLine{kind: hl.kind, text: hl.text})
 		}
 	}
 	return out
@@ -77,9 +93,9 @@ func locateLine(lines []string, target, path string, cursor int) (int, error) {
 	return 0, fmt.Errorf("Failed to find context '%s' in %s", target, path)
 }
 
-func locateSeq(lines []string, pattern []string, path string, cursor int) (int, error) {
+func locateSeq(lines []string, pattern []hunkPatternLine, path string, cursor int) (hunkLocation, error) {
 	if len(pattern) == 0 {
-		return cursor, nil
+		return hunkLocation{start: cursor}, nil
 	}
 	c := cursor
 	if c < 0 {
@@ -93,7 +109,7 @@ func locateSeq(lines []string, pattern []string, path string, cursor int) (int, 
 	if maxStart >= c {
 		for start := c; start <= maxStart; start++ {
 			if matchPatternAt(lines, pattern, start) {
-				return start, nil
+				return hunkLocation{start: start, realMatchedLen: len(pattern)}, nil
 			}
 		}
 	}
@@ -101,26 +117,26 @@ func locateSeq(lines []string, pattern []string, path string, cursor int) (int, 
 	// End-of-file empty-line retry: if the pattern's last line is empty,
 	// drop it and retry. This handles the common case of a file with no
 	// trailing newline whose pattern's trailing context line is blank.
-	if last := pattern[len(pattern)-1]; last == "" {
+	if last := pattern[len(pattern)-1]; last.kind == lineContext && last.text == "" {
 		trimmed := pattern[:len(pattern)-1]
 		maxStartTrim := len(lines) - len(trimmed)
 		if maxStartTrim >= c {
 			for start := c; start <= maxStartTrim; start++ {
-				if matchPatternAt(lines, trimmed, start) {
-					return start, nil
+				if matchPatternAt(lines, trimmed, start) && start+len(trimmed) == len(lines) {
+					return hunkLocation{start: start, realMatchedLen: len(trimmed), syntheticTrailingEmpty: true}, nil
 				}
 			}
 		}
 	}
 
-	return 0, fmt.Errorf("Failed to find expected lines in %s:\n%s", path, strings.Join(pattern, "\n"))
+	return hunkLocation{}, fmt.Errorf("Failed to find expected lines in %s:\n%s", path, strings.Join(patternTexts(pattern), "\n"))
 }
 
-func matchPatternAt(lines, pattern []string, start int) bool {
+func matchPatternAt(lines []string, pattern []hunkPatternLine, start int) bool {
 	for level := 1; level <= 4; level++ {
 		ok := true
 		for j, p := range pattern {
-			if !matchAtLevel(lines[start+j], p, level) {
+			if !matchAtLevel(lines[start+j], p.text, level) {
 				ok = false
 				break
 			}
@@ -130,6 +146,14 @@ func matchPatternAt(lines, pattern []string, start int) bool {
 		}
 	}
 	return false
+}
+
+func patternTexts(pattern []hunkPatternLine) []string {
+	out := make([]string, 0, len(pattern))
+	for _, p := range pattern {
+		out = append(out, p.text)
+	}
+	return out
 }
 
 func matchAtLevel(line, target string, level int) bool {

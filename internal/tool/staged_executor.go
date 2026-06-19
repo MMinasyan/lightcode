@@ -102,7 +102,12 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 		var decision permission.Decision
 		var targets []applyPatchTarget
 		if call.ToolName == "apply_patch" {
-			targets, _, decision = applyPatchPermissionPlan(e.check, e.workspaceRoot, execParams)
+			var err error
+			targets, _, decision, err = applyPatchPermissionPlan(e.check, e.workspaceRoot, execParams)
+			if err != nil {
+				results[i].Error = err.Error()
+				continue
+			}
 		} else {
 			decision = permission.DecisionAsk
 			if e.check != nil {
@@ -140,6 +145,9 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 				req.BatchFiles = batchFiles
 			}
 			action := e.ask(ctx, req)
+			if action == permission.ResponseAllowAll && !req.CanAllowAll {
+				action = permission.ResponseAllow
+			}
 			switch action {
 			case permission.ResponseAllow:
 				allowed[i] = true

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -561,6 +562,157 @@ func TestHandleWarningsReturnsEmptyArrayForNoWarnings(t *testing.T) {
 	}
 }
 
+func TestHandlePermissionSaveFailureKeepsTimerAndPendingRequest(t *testing.T) {
+	var calls int
+	var callsMu sync.Mutex
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callsMu.Lock()
+		calls++
+		call := calls
+		callsMu.Unlock()
+		if call != 1 {
+			t.Fatalf("unexpected provider call %d", call)
+		}
+		patch := "*** Begin Patch\n*** Add File: allowed.txt\n+ok\n*** Add File: blocked.txt\n+secret\n*** End Patch"
+		args := fmt.Sprintf(`{"input":%q}`, patch)
+		serverWriteSSE(w, serverToolCallChunk("save-fail-1", "gpt-5", "call_patch", "apply_patch", args), serverStopChunk("save-fail-1", "gpt-5"), "[DONE]")
+	}))
+	t.Cleanup(provider.Close)
+
+	a := newServerTestAgentWithModel(t, provider.URL+"/v1", false, "gpt-5")
+	s := &Server{
+		agent:      a,
+		hub:        newSSEHub(),
+		permTimers: make(map[string]*time.Timer),
+		cfg:        Config{PermissionTimeout: time.Hour},
+	}
+	events := make(chan agent.Event, 16)
+	a.SetEventHandler(func(ev agent.Event) {
+		s.handleEvent(ev)
+		events <- ev
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Init(ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		_, err := a.Submit(ctx, "apply a multi-file patch")
+		submitDone <- err
+	}()
+
+	permReq := waitServerPermissionRequest(t, events)
+	if !permReq.DisableProjectSave {
+		t.Fatal("permission request allows project save, want disabled")
+	}
+
+	rec := httptest.NewRecorder()
+	body := `{"id":` + strconv.Quote(permReq.ID) + `,"patterns":["apply_patch(/allowed.txt)"]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/permission/save", strings.NewReader(body))
+	s.handlePermissionSave(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("permission save status = %d, body = %s; want 500", rec.Code, rec.Body.String())
+	}
+
+	s.permMu.Lock()
+	_, timerStillPending := s.permTimers[permReq.ID]
+	s.permMu.Unlock()
+	if !timerStillPending {
+		t.Fatal("permission timer was cancelled after rejected project save")
+	}
+
+	s.cancelPermissionTimer(permReq.ID)
+	if err := a.RespondPermission(permReq.ID, false); err != nil {
+		t.Fatalf("RespondPermission after rejected save: %v", err)
+	}
+	select {
+	case err := <-submitDone:
+		if err != nil {
+			t.Fatalf("Submit after denial: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Submit stayed blocked after rejected save and explicit denial")
+	}
+	waitServerEventKind(t, events, agent.EventTurnEnd)
+}
+
+func TestHandlePermissionResponseFailureKeepsTimerAndPendingRequest(t *testing.T) {
+	var calls int
+	var callsMu sync.Mutex
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callsMu.Lock()
+		calls++
+		call := calls
+		callsMu.Unlock()
+		if call != 1 {
+			t.Fatalf("unexpected provider call %d", call)
+		}
+		serverWriteSSE(w, serverToolCallChunk("response-fail-1", "test-model", "call_read", "read_file", `{"path":"target.txt"}`), serverStopChunk("response-fail-1", "test-model"), "[DONE]")
+	}))
+	t.Cleanup(provider.Close)
+
+	a := newServerTestAgentWithProvider(t, provider.URL+"/v1", false)
+	s := &Server{
+		agent:      a,
+		hub:        newSSEHub(),
+		permTimers: make(map[string]*time.Timer),
+		cfg:        Config{PermissionTimeout: time.Hour},
+	}
+	events := make(chan agent.Event, 16)
+	a.SetEventHandler(func(ev agent.Event) {
+		s.handleEvent(ev)
+		events <- ev
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Init(ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		_, err := a.Submit(ctx, "read target.txt")
+		submitDone <- err
+	}()
+
+	permReq := waitServerPermissionRequest(t, events)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/permission/"+permReq.ID, strings.NewReader(`{}`))
+	s.handlePermission(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing action status = %d, body = %s; want 400", rec.Code, rec.Body.String())
+	}
+	assertServerPermissionTimerPending(t, s, permReq.ID)
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/permission/"+permReq.ID, strings.NewReader(`{"action":"bogus"}`))
+	s.handlePermission(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("invalid action status = %d, body = %s; want 404", rec.Code, rec.Body.String())
+	}
+	assertServerPermissionTimerPending(t, s, permReq.ID)
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/permission/"+permReq.ID, strings.NewReader(`{"action":"deny"}`))
+	s.handlePermission(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("deny status = %d, body = %s; want 200", rec.Code, rec.Body.String())
+	}
+	s.permMu.Lock()
+	_, timerStillPending := s.permTimers[permReq.ID]
+	s.permMu.Unlock()
+	if timerStillPending {
+		t.Fatal("permission timer remained after accepted denial")
+	}
+	select {
+	case err := <-submitDone:
+		if err != nil {
+			t.Fatalf("Submit after denial: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Submit stayed blocked after invalid responses and explicit denial")
+	}
+	waitServerEventKind(t, events, agent.EventTurnEnd)
+}
+
 func TestHandleSessionMessagesByIDDoesNotSwitchCurrentSession(t *testing.T) {
 	a := newServerTestAgent(t)
 	firstTurn := appendServerUserTurn(t, a, "first session")
@@ -669,6 +821,11 @@ func newServerWarningTestAgent(t *testing.T) *agent.Agent {
 
 func newServerTestAgentWithProvider(t *testing.T, baseURL string, discovery bool) *agent.Agent {
 	t.Helper()
+	return newServerTestAgentWithModel(t, baseURL, discovery, "test-model")
+}
+
+func newServerTestAgentWithModel(t *testing.T, baseURL string, discovery bool, modelID string) *agent.Agent {
+	t.Helper()
 	home := t.TempDir()
 	projectRoot := t.TempDir()
 	lightcodeDir := filepath.Join(home, ".lightcode")
@@ -684,11 +841,11 @@ func newServerTestAgentWithProvider(t *testing.T, baseURL string, discovery bool
       "transport": { "base_url": "`+baseURL+`", "api_key_env": "LIGHTCODE_TEST_KEY" },
       "discovery": `+strconv.FormatBool(discovery)+`,
       "models": {
-        "test-model": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 }
+        "`+modelID+`": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 }
       }
     }
   },
-  "default_model": "test/test-model"
+  "default_model": "test/`+modelID+`"
 }`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -701,6 +858,63 @@ func newServerTestAgentWithProvider(t *testing.T, baseURL string, discovery bool
 		t.Fatalf("new agent: %v", err)
 	}
 	return a
+}
+
+func waitServerPermissionRequest(t *testing.T, events <-chan agent.Event) *agent.PermissionRequest {
+	t.Helper()
+	for {
+		select {
+		case ev := <-events:
+			if ev.Kind == agent.EventPermissionRequest && ev.PermReq != nil {
+				return ev.PermReq
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for permission request")
+		}
+	}
+}
+
+func waitServerEventKind(t *testing.T, events <-chan agent.Event, kind agent.EventKind) agent.Event {
+	t.Helper()
+	for {
+		select {
+		case ev := <-events:
+			if ev.Kind == kind {
+				return ev
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for event %v", kind)
+		}
+	}
+}
+
+func assertServerPermissionTimerPending(t *testing.T, s *Server, id string) {
+	t.Helper()
+	s.permMu.Lock()
+	_, ok := s.permTimers[id]
+	s.permMu.Unlock()
+	if !ok {
+		t.Fatal("permission timer was cancelled after rejected response")
+	}
+}
+
+func serverWriteSSE(w http.ResponseWriter, payloads ...string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	for _, payload := range payloads {
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+}
+
+func serverToolCallChunk(id, model, callID, name, arguments string) string {
+	argsJSON, _ := json.Marshal(arguments)
+	return fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":%q,"type":"function","function":{"name":%q,"arguments":%s}}]},"finish_reason":null}]}`, id, model, callID, name, argsJSON)
+}
+
+func serverStopChunk(id, model string) string {
+	return fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`, id, model)
 }
 
 func appendServerUserTurn(t *testing.T, a *agent.Agent, content string) int {

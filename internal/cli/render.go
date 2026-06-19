@@ -582,8 +582,10 @@ func permissionActions(req *agent.PermissionRequest) []menuItem {
 	items = append(items,
 		menuItem{label: "Allow", detail: "once", selectable: true, extra: "allow"},
 		menuItem{label: "Deny", detail: "this request", selectable: true, extra: "deny"},
-		menuItem{label: "Allow for project", detail: "save rule", selectable: true, extra: "project"},
 	)
+	if req == nil || !req.DisableProjectSave {
+		items = append(items, menuItem{label: "Allow for project", detail: "save rule", selectable: true, extra: "project"})
+	}
 	return items
 }
 

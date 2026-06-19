@@ -419,13 +419,15 @@ func (t *taskTool) buildRegistry(at subagent.AgentType, scope parentMutationScop
 	root := scope.workspaceRoot
 	core := tool.CoreTools(scope.snapshotStore(), scope.tracker, t.toolsConfig, root, t.permissionCheck(), t.permissionAsk())
 	reg := tool.NewRegistry()
-	// execute_pending is not in CoreTools (no snapshot/tracker wiring; one-
-	// liner). Register it here so subagents whose at.Tools lists it can
-	// flush staged edits, mirroring the main agent's inline registration
-	// at agent.go:249.
-	reg.Register(tool.WrapWithPermission(tool.ExecutePending{}, t.permissionCheck(), t.permissionAsk()))
 	for _, name := range at.Tools {
 		if name == "task" {
+			continue
+		}
+		if name == "execute_pending" {
+			// execute_pending is not in CoreTools (no snapshot/tracker
+			// wiring). Register it only for subagent types that explicitly
+			// list it; read-only types must not receive mutation tools.
+			reg.Register(tool.WrapWithPermission(tool.ExecutePending{}, t.permissionCheck(), t.permissionAsk()))
 			continue
 		}
 		if tt, ok := core[name]; ok {

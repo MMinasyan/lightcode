@@ -206,6 +206,29 @@ func TestApplyPatchImmediateAnyDenyReturnsErrDenied(t *testing.T) {
 	}
 }
 
+func TestApplyPatchImmediateMalformedInputReturnsBeforePermission(t *testing.T) {
+	dir := t.TempDir()
+	asked := 0
+	tool := NewApplyPatchWithSnapshotAtRoot(&applyPatchStore{turn: 1}, NewFileTracker(), config.ToolsConfig{}, dir)
+	wrapped := WrapWithPermissionAtRoot(tool, dir,
+		func(string, string) permission.Decision {
+			return permission.DecisionAsk
+		},
+		func(context.Context, permission.Request) permission.ResponseAction {
+			asked++
+			return permission.ResponseDeny
+		},
+	)
+
+	_, err := wrapped.Execute(context.Background(), map[string]any{"input": "not a patch"})
+	if err == nil || !strings.Contains(err.Error(), "apply_patch:") {
+		t.Fatalf("Execute err = %v, want parse error", err)
+	}
+	if asked != 0 {
+		t.Fatalf("permission prompts = %d, want 0", asked)
+	}
+}
+
 func TestApplyPatchImmediateAskSingleAllowAppliesAll(t *testing.T) {
 	dir := t.TempDir()
 	check := rulesCheck(dir, permission.Rules{Ask: []string{ruleFor(dir, "**")}})
@@ -414,10 +437,7 @@ func TestApplyPatchStagedAllAllowNoAsk(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("results len = %d, want 1", len(results))
 	}
-	// The apply dispatch lands in commit 5; at this stage the staged
-	// branch isn't wired, so the executor will return an error from
-	// the per-file grouping path. The key point: the permission step
-	// did not call ask (all-allow).
+	// The key point: the permission step did not call ask (all-allow).
 }
 
 func TestApplyPatchStagedAnyDenyNoAsk(t *testing.T) {
@@ -452,12 +472,9 @@ func TestApplyPatchStagedAnyDenyNoAsk(t *testing.T) {
 }
 
 func TestApplyPatchStagedPermissionAsksWithPatchFiles(t *testing.T) {
-	// Commit 4 only wires the staged permission loop to route
-	// apply_patch through the multi-path helper; the apply dispatch
-	// branch lands in commit 5. This test verifies the ask request
-	// is built correctly (BatchFiles = patch's files, Arg/ResolvedArg
-	// = first path) by intercepting the ask and returning Deny so the
-	// executor never reaches the apply engine.
+	// This verifies the ask request is built correctly (BatchFiles =
+	// patch's files, Arg/ResolvedArg = first path) by intercepting the ask
+	// and returning Deny so the executor never reaches the apply engine.
 	dir := t.TempDir()
 	store := &applyPatchStore{turn: 1}
 	tracker := NewFileTracker()

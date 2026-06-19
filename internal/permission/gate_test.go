@@ -259,7 +259,7 @@ func TestGateRespondActionInvalid(t *testing.T) {
 
 	result := make(chan ResponseAction, 1)
 	go func() {
-		result <- gate.AskRequest(context.Background(), Request{ToolName: "write_file", Arg: "a.go"})
+		result <- gate.AskRequest(context.Background(), Request{ToolName: "write_file", Arg: "a.go", CanAllowAll: true})
 	}()
 	waitForPending(t, gate, 1)
 	id := <-idCh
@@ -286,6 +286,33 @@ func TestGateRespondActionInvalid(t *testing.T) {
 	}
 }
 
+func TestGateAskRequestForgedAllowAllBecomesAllow(t *testing.T) {
+	idCh := make(chan string, 1)
+	gate := NewGate(func(ctx context.Context, req Request) {
+		idCh <- req.ID
+	})
+
+	result := make(chan ResponseAction, 1)
+	go func() {
+		result <- gate.AskRequest(context.Background(), Request{ToolName: "apply_patch", Arg: "a.go", CanAllowAll: false})
+	}()
+	waitForPending(t, gate, 1)
+	id := <-idCh
+
+	if err := gate.RespondAction(id, string(ResponseAllowAll)); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-result:
+		if got != ResponseAllow {
+			t.Fatalf("got %q, want allow", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AskRequest did not return")
+	}
+}
+
 // --- AskRequest with AllowAll ---
 
 func TestGateAskRequestAllowAll(t *testing.T) {
@@ -296,7 +323,7 @@ func TestGateAskRequestAllowAll(t *testing.T) {
 
 	result := make(chan ResponseAction, 1)
 	go func() {
-		result <- gate.AskRequest(context.Background(), Request{ToolName: "write_file", Arg: "a.go"})
+		result <- gate.AskRequest(context.Background(), Request{ToolName: "write_file", Arg: "a.go", CanAllowAll: true})
 	}()
 	waitForPending(t, gate, 1)
 	id := <-idCh
