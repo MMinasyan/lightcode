@@ -1,10 +1,6 @@
 package tool
 
-import (
-	"path/filepath"
-
-	"github.com/MMinasyan/lightcode/internal/permission"
-)
+import "github.com/MMinasyan/lightcode/internal/permission"
 
 // applyPatchFilesAtRoot returns the absolute paths every file op in the
 // patch touches: add, update, delete, move source, and move destination.
@@ -13,19 +9,11 @@ import (
 // (immediate + staged) and by the staged batch prompt to list every
 // patched file.
 func applyPatchFilesAtRoot(workspaceRoot string, params map[string]any) []string {
-	input, _ := params["input"].(string)
-	p, err := parsePatch(input)
+	_, targets, err := resolveApplyPatchTargets(workspaceRoot, params)
 	if err != nil {
 		return nil
 	}
-	var out []string
-	for _, op := range p.ops {
-		out = append(out, resolvePermissionArg(workspaceRoot, op.path))
-		if op.movePath != "" {
-			out = append(out, resolvePermissionArg(workspaceRoot, op.movePath))
-		}
-	}
-	return out
+	return applyPatchDisplayFiles(targets)
 }
 
 // applyPatchPermissionDecision evaluates the rule check for every file
@@ -34,26 +22,30 @@ func applyPatchFilesAtRoot(workspaceRoot string, params map[string]any) []string
 // path is denied, Allow if all paths are allowed, otherwise Ask. The
 // check function is the runtime's per-tool CheckFunc; passing the same
 // check function to both the immediate PermWrapped.Execute branch and
-// the staged executor's permission loop is what makes the two paths
-// identical (Invariant 3).
+// the staged executor's permission loop keeps the two paths identical.
 func applyPatchPermissionDecision(check CheckFunc, workspaceRoot string, params map[string]any) (paths []string, perPath []permission.Decision, aggregate permission.Decision) {
-	paths = applyPatchFilesAtRoot(workspaceRoot, params)
-	if len(paths) == 0 {
+	targets, perPath, aggregate := applyPatchPermissionPlan(check, workspaceRoot, params)
+	return applyPatchDisplayFiles(targets), perPath, aggregate
+}
+
+func applyPatchPermissionPlan(check CheckFunc, workspaceRoot string, params map[string]any) (targets []applyPatchTarget, perPath []permission.Decision, aggregate permission.Decision) {
+	_, targets, err := resolveApplyPatchTargets(workspaceRoot, params)
+	if err != nil || len(targets) == 0 {
 		// Malformed patch or no ops; let the apply engine surface the error.
 		return nil, nil, permission.DecisionAsk
 	}
 	if check == nil {
-		return paths, nil, permission.DecisionAsk
+		return targets, nil, permission.DecisionAsk
 	}
-	perPath = make([]permission.Decision, len(paths))
+	perPath = make([]permission.Decision, len(targets))
 	aggregate = permission.DecisionAllow
-	for i, p := range paths {
-		d := check("apply_patch", p)
+	for i, target := range targets {
+		d := check("apply_patch", target.CanonicalPath)
 		perPath[i] = d
 		switch d {
 		case permission.DecisionDeny:
-			// Deny is sticky: any Deny in any path denies the whole
-			// patch regardless of what other paths decide (Invariant 3).
+			// Deny is sticky: any Deny in any path denies the whole patch
+			// regardless of what other paths decide.
 			aggregate = permission.DecisionDeny
 		case permission.DecisionAllow:
 			// aggregate stays whatever it was (Allow doesn't promote
@@ -64,18 +56,5 @@ func applyPatchPermissionDecision(check CheckFunc, workspaceRoot string, params 
 			}
 		}
 	}
-	return paths, perPath, aggregate
-}
-
-// resolvePermissionArg resolves a path the way the rest of the file
-// tools do: relative paths join workspaceRoot, absolute paths are
-// accepted as-is. The check function sees the canonical arg.
-func resolvePermissionArg(workspaceRoot, path string) string {
-	if workspaceRoot != "" && !filepath.IsAbs(path) {
-		path = filepath.Join(workspaceRoot, path)
-	}
-	if abs, err := filepath.Abs(path); err == nil {
-		return abs
-	}
-	return path
+	return targets, perPath, aggregate
 }

@@ -199,11 +199,12 @@ func New(c Config) (*Agent, error) {
 			PermID:   req.ID,
 			PermArg:  req.Arg,
 			Metadata: map[string]any{
-				"resolved_arg":  req.ResolvedArg,
-				"can_allow_all": req.CanAllowAll,
-				"batch_index":   req.BatchIndex,
-				"batch_total":   req.BatchTotal,
-				"batch_files":   req.BatchFiles,
+				"resolved_arg":         req.ResolvedArg,
+				"can_allow_all":        req.CanAllowAll,
+				"batch_index":          req.BatchIndex,
+				"batch_total":          req.BatchTotal,
+				"batch_files":          req.BatchFiles,
+				"batch_resolved_files": req.BatchResolvedFiles,
 			},
 		}
 		select {
@@ -243,7 +244,7 @@ func New(c Config) (*Agent, error) {
 	a.fileTracker = fileTracker
 
 	registry := tool.NewRegistry()
-	for _, tl := range tool.CoreTools(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askPolicy) {
+	for _, tl := range tool.CoreToolList(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askPolicy) {
 		registry.Register(tl)
 	}
 	registry.Register(tool.WrapWithPermission(tool.ExecutePending{}, checkPolicy, askPolicy))
@@ -738,18 +739,20 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 		batchIndex, _ := ev.Metadata["batch_index"].(int)
 		batchTotal, _ := ev.Metadata["batch_total"].(int)
 		batchFiles, _ := ev.Metadata["batch_files"].([]string)
+		batchResolvedFiles, _ := ev.Metadata["batch_resolved_files"].([]string)
 		resolvedArg, _ := ev.Metadata["resolved_arg"].(string)
 		a.emitEvent(Event{
 			Kind: EventPermissionRequest,
 			PermReq: &PermissionRequest{
-				ID:          ev.PermID,
-				ToolName:    ev.ToolName,
-				Arg:         ev.PermArg,
-				ResolvedArg: resolvedArg,
-				CanAllowAll: canAllowAll,
-				BatchIndex:  batchIndex,
-				BatchTotal:  batchTotal,
-				BatchFiles:  batchFiles,
+				ID:                 ev.PermID,
+				ToolName:           ev.ToolName,
+				Arg:                ev.PermArg,
+				ResolvedArg:        resolvedArg,
+				CanAllowAll:        canAllowAll,
+				BatchIndex:         batchIndex,
+				BatchTotal:         batchTotal,
+				BatchFiles:         batchFiles,
+				BatchResolvedFiles: batchResolvedFiles,
 			},
 		})
 	case loop.Usage:

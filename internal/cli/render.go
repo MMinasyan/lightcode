@@ -603,13 +603,20 @@ func permissionMenuItems(req *agent.PermissionRequest) []menuItem {
 	if req.ResolvedArg != "" && req.ResolvedArg != req.Arg {
 		items = append(items, menuItem{label: "resolves to " + req.ResolvedArg, selectable: false})
 	}
-	if req.CanAllowAll && len(req.BatchFiles) > 0 {
-		items = append(items, menuItem{label: "Staged files:", selectable: false})
+	if len(req.BatchFiles) > 0 {
+		title := "Affected files:"
+		if req.CanAllowAll {
+			title = "Staged files:"
+		}
+		items = append(items, menuItem{label: title, selectable: false})
 		current := req.Arg
-		for _, file := range req.BatchFiles {
+		for i, file := range req.BatchFiles {
 			prefix := "  "
 			if file == current {
 				prefix = "> "
+			}
+			if i < len(req.BatchResolvedFiles) && req.BatchResolvedFiles[i] != "" && req.BatchResolvedFiles[i] != file {
+				file += " -> " + req.BatchResolvedFiles[i]
 			}
 			items = append(items, menuItem{label: prefix + file, selectable: false})
 		}
@@ -638,7 +645,7 @@ func permissionPromptHeaderRows(req *agent.PermissionRequest) int {
 	if req.ResolvedArg != "" && req.ResolvedArg != req.Arg {
 		rows++
 	}
-	if req.CanAllowAll && len(req.BatchFiles) > 0 {
+	if len(req.BatchFiles) > 0 {
 		rows += 1 + len(req.BatchFiles)
 	}
 	return rows

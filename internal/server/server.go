@@ -233,14 +233,15 @@ func (s *Server) handleEvent(ev agent.Event) {
 	case agent.EventPermissionRequest:
 		name = "permission_request"
 		data = map[string]any{
-			"id":          ev.PermReq.ID,
-			"tool":        ev.PermReq.ToolName,
-			"arg":         ev.PermReq.Arg,
-			"resolvedArg": ev.PermReq.ResolvedArg,
-			"canAllowAll": ev.PermReq.CanAllowAll,
-			"batchIndex":  ev.PermReq.BatchIndex,
-			"batchTotal":  ev.PermReq.BatchTotal,
-			"batchFiles":  ev.PermReq.BatchFiles,
+			"id":                 ev.PermReq.ID,
+			"tool":               ev.PermReq.ToolName,
+			"arg":                ev.PermReq.Arg,
+			"resolvedArg":        ev.PermReq.ResolvedArg,
+			"canAllowAll":        ev.PermReq.CanAllowAll,
+			"batchIndex":         ev.PermReq.BatchIndex,
+			"batchTotal":         ev.PermReq.BatchTotal,
+			"batchFiles":         ev.PermReq.BatchFiles,
+			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		}
 		s.startPermissionTimer(ev.PermReq.ID)
 	case agent.EventCompactionStart:

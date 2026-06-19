@@ -14,14 +14,15 @@ var ErrUnknownRequest = errors.New("no pending permission request")
 // Request is the structured payload sent to the frontend when the gate
 // needs to ask the user for permission.
 type Request struct {
-	ID          string   `json:"id"`
-	ToolName    string   `json:"tool"`
-	Arg         string   `json:"args"`
-	ResolvedArg string   `json:"resolved_arg,omitempty"`
-	CanAllowAll bool     `json:"can_allow_all,omitempty"`
-	BatchIndex  int      `json:"batch_index,omitempty"`
-	BatchTotal  int      `json:"batch_total,omitempty"`
-	BatchFiles  []string `json:"batch_files,omitempty"`
+	ID                 string   `json:"id"`
+	ToolName           string   `json:"tool"`
+	Arg                string   `json:"args"`
+	ResolvedArg        string   `json:"resolved_arg,omitempty"`
+	CanAllowAll        bool     `json:"can_allow_all,omitempty"`
+	BatchIndex         int      `json:"batch_index,omitempty"`
+	BatchTotal         int      `json:"batch_total,omitempty"`
+	BatchFiles         []string `json:"batch_files,omitempty"`
+	BatchResolvedFiles []string `json:"batch_resolved_files,omitempty"`
 }
 
 // ResponseAction is the user's answer to a permission prompt.

@@ -78,9 +78,9 @@ func FromMetadata(metadata map[string]any) (*Preview, bool) {
 // FileEntry is one file in the per-file edit_preview_files list emitted
 // by apply_patch. The inner Preview is today's editpreview.Preview
 // (Hunks of Rows) so the existing per-file renderer is reused unchanged;
-// only the outer per-file shape is new. The Op tag is the A/M/D label
-// from the apply_patch result (A = add, M = update or move destination,
-// D = delete or move source). Decision 9.
+// only the outer per-file shape is new. The Op tag is the A/M/D label from
+// the apply_patch result (A = add, M = update or move destination, D = delete
+// or move source).
 type FileEntry struct {
 	Path    string  `json:"path"`
 	Op      string  `json:"op"`

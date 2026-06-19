@@ -436,13 +436,9 @@ func (t *taskTool) buildRegistry(at subagent.AgentType, scope parentMutationScop
 			reg.Register(tt)
 		}
 	}
-	// Decision 18: a GPT-5 subagent must be able to use apply_patch as the
-	// replacement for edit_file + write_file. The adaptation's IncludeTools
-	// only reveals already-registered names (advertise.go:31), so apply_patch
-	// must be registered even when at.Tools doesn't list it — but only when
-	// the agent already has mutation capability. If the agent has neither
-	// edit_file nor write_file, it stays read-only and apply_patch is not
-	// registered.
+	// Mutation-capable subagents register apply_patch even when their explicit
+	// tool list names only edit_file/write_file. Adaptations can then reveal the
+	// hidden tool. Read-only subagents do not gain apply_patch.
 	if hasMutationTool(at.Tools) {
 		if applyPatch, ok := core["apply_patch"]; ok {
 			reg.Register(applyPatch)

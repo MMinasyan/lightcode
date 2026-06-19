@@ -1,44 +1,38 @@
 package tool
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 
+	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/safefs"
 	"golang.org/x/sys/unix"
 )
 
-// applyPatchApplyAtRoot is the shared engine for apply_patch. It is called
-// directly by ApplyPatch.Execute (commit 3) and by the staged-flush dispatch
-// branch (commit 5). The flow is validate-first all-or-nothing: every op is
-// resolved and located against the current files before any mutation, so a
-// failed validation writes nothing. The only path to a partial apply is a
-// mid-write I/O error after validation passed; on that rare failure the
-// committed files stay on disk, remain snapshotted, and are recoverable via
-// the turn revert. The immediate path wraps the partial-failure error in
-// *ExitError so the model sees the committed-files A/M/D summary (Decision
-// 13); the staged path returns the same summary in BatchResult.Error
-// (Invariant 5, no struct change).
+// applyPatchApplyAtRoot is the shared engine for immediate and staged
+// apply_patch execution. The flow is validate-first all-or-nothing: every op
+// is resolved and located against current files before any mutation. The only
+// path to a partial apply is a mid-write I/O error after validation passed; on
+// that rare failure, committed files stay on disk, remain snapshotted, and are
+// recoverable via turn revert. Partial failures return *ExitError carrying the
+// committed-files A/M/D summary for model-visible output.
 //
-// The engine captures per-op pre / post / hunk data during apply and
-// returns it as the second value. The caller (immediate Execute, staged
-// branch) stashes the previews on the tool or on its BatchResult so
-// DisplayMetadata (commit 6) can build the edit_preview_files map from
-// captured data, not post-write disk reads. (Read-after-apply is not
-// viable: updates have overwritten the source, deletes have removed the
-// file, moves have unlinked the source.)
+// The engine captures per-op pre/post/hunk data during apply and returns it as
+// the second value. Callers attach those previews to immediate or staged
+// display metadata so renderers do not need post-write disk reads. Read-after-
+// apply is not viable for updates, deletes, or moves.
 func applyPatchApplyAtRoot(ctx context.Context, root string, store SnapshotStore, tracker *FileTracker, params map[string]any) (string, []appliedFilePreview, error) {
-	input, _ := params["input"].(string)
-	p, err := parsePatch(input)
+	p, targets, err := validateApplyPatchReceipt(root, params)
 	if err != nil {
 		return "", nil, err
 	}
 
 	// Phase 1: validate (read-only).
-	plans, err := buildApplyPlans(p, root, params, store)
+	plans, err := buildApplyPlans(p, root, targets)
 	if err != nil {
 		return "", nil, err
 	}
@@ -63,14 +57,11 @@ type appliedOp struct {
 	path string
 }
 
-// appliedFilePreview is the per-file data the engine captures during
-// apply so DisplayMetadata (commit 6) can build the edit_preview_files
-// metadata without post-write disk reads. Pre is the pre-mutation
-// content (nil for Add); Post is the post-mutation content (nil for
-// Delete); Hunks is the list of applied hunks (only for Update /
-// Move destination). A Move produces two entries: the destination
-// (M, with the new content and the applied hunks) and the source
-// (D, with the original content and no hunks).
+// appliedFilePreview is the per-file data the engine captures so display
+// metadata can be built without post-write disk reads. Pre is the pre-mutation
+// content (nil for Add); Post is the post-mutation content (nil for Delete);
+// Hunks is the list of applied hunks. A Move produces two entries: destination
+// M and source D.
 type appliedFilePreview struct {
 	Op    string
 	Path  string
@@ -102,31 +93,34 @@ type appliedHunkPreview struct {
 
 type applyPlan struct {
 	op             fileOp
+	root           string
 	canonicalPath  string
 	displayAbsPath string
 	newContent     string // for Add / Update / Move
 	moveCanonical  string // for Move
 	moveDisplay    string
 	preLines       []string             // pre-mutation content (for Update/Delete/Move source)
+	preContent     []byte               // exact content validated before mutation
 	hunks          []appliedHunkPreview // applied hunks (for Update/Move destination)
 }
 
-func buildApplyPlans(p *patch, root string, params map[string]any, store SnapshotStore) ([]applyPlan, error) {
+func buildApplyPlans(p *patch, root string, targets []applyPatchTarget) ([]applyPlan, error) {
 	plans := make([]applyPlan, 0, len(p.ops))
+	targetIdx := 0
 	for _, op := range p.ops {
-		canonicalPath, err := fileSecurityPathAtRoot(root, params, op.path)
-		if err != nil {
-			return nil, fmt.Errorf("apply_patch: %s: %w", op.path, err)
+		if targetIdx >= len(targets) {
+			return nil, fmt.Errorf("apply_patch: target plan missing %s", op.path)
 		}
-		displayAbsPath, err := fileDisplayAbsPathAtRoot(root, op.path)
-		if err != nil {
-			return nil, fmt.Errorf("apply_patch: %s: %w", op.path, err)
+		target := targets[targetIdx]
+		targetIdx++
+		if target.Path != op.path || target.Destination {
+			return nil, fmt.Errorf("apply_patch: target plan mismatch for %s", op.path)
 		}
-		pl := applyPlan{op: op, canonicalPath: canonicalPath, displayAbsPath: displayAbsPath}
+		pl := applyPlan{op: op, root: root, canonicalPath: target.CanonicalPath, displayAbsPath: target.AbsPath}
 
 		switch op.kind {
 		case opAdd:
-			existed, shapeErr := ensureRegularExistingTarget(canonicalPath)
+			existed, shapeErr := ensureRegularExistingTarget(pl.canonicalPath)
 			if shapeErr != nil {
 				return nil, fmt.Errorf("apply_patch: %s: %w", op.path, shapeErr)
 			}
@@ -135,22 +129,23 @@ func buildApplyPlans(p *patch, root string, params map[string]any, store Snapsho
 			}
 			pl.newContent = buildAddContent(op)
 		case opUpdate:
-			existed, shapeErr := ensureRegularExistingTarget(canonicalPath)
+			existed, shapeErr := ensureRegularExistingTarget(pl.canonicalPath)
 			if shapeErr != nil {
 				return nil, fmt.Errorf("apply_patch: %s: %w", op.path, shapeErr)
 			}
 			if !existed {
 				return nil, fmt.Errorf("apply_patch: %s does not exist (Update requires the path to exist)", op.path)
 			}
-			preLines, content, hunks, err := computeUpdatedContent(canonicalPath, op, root, params)
+			preContent, preLines, content, hunks, err := computeUpdatedContent(pl.canonicalPath, op)
 			if err != nil {
 				return nil, err
 			}
+			pl.preContent = preContent
 			pl.preLines = preLines
 			pl.newContent = content
 			pl.hunks = hunks
 		case opDelete:
-			existed, shapeErr := ensureRegularExistingTarget(canonicalPath)
+			existed, shapeErr := ensureRegularExistingTarget(pl.canonicalPath)
 			if shapeErr != nil {
 				return nil, fmt.Errorf("apply_patch: %s: %w", op.path, shapeErr)
 			}
@@ -159,22 +154,25 @@ func buildApplyPlans(p *patch, root string, params map[string]any, store Snapsho
 			}
 			// Capture pre-mutation content for the preview stash so the
 			// GUI / CLI can show the file's pre-delete state.
-			data, readErr := readFileBytes(canonicalPath)
+			data, readErr := readFileBytes(pl.canonicalPath)
 			if readErr != nil {
 				return nil, fmt.Errorf("apply_patch: read %s: %w", op.path, readErr)
 			}
+			pl.preContent = data
 			pl.preLines = splitLinesRaw(data)
 		}
 
 		if op.movePath != "" {
-			moveCanonical, err := fileSecurityPathAtRoot(root, params, op.movePath)
-			if err != nil {
-				return nil, fmt.Errorf("apply_patch: %s (move destination): %w", op.movePath, err)
+			if targetIdx >= len(targets) {
+				return nil, fmt.Errorf("apply_patch: target plan missing %s", op.movePath)
 			}
-			moveDisplay, err := fileDisplayAbsPathAtRoot(root, op.movePath)
-			if err != nil {
-				return nil, fmt.Errorf("apply_patch: %s (move destination): %w", op.movePath, err)
+			moveTarget := targets[targetIdx]
+			targetIdx++
+			if moveTarget.Path != op.movePath || !moveTarget.Destination {
+				return nil, fmt.Errorf("apply_patch: target plan mismatch for %s", op.movePath)
 			}
+			moveCanonical := moveTarget.CanonicalPath
+			moveDisplay := moveTarget.AbsPath
 			existed, shapeErr := ensureRegularExistingTarget(moveCanonical)
 			if shapeErr != nil {
 				return nil, fmt.Errorf("apply_patch: %s (move destination): %w", op.movePath, shapeErr)
@@ -184,9 +182,15 @@ func buildApplyPlans(p *patch, root string, params map[string]any, store Snapsho
 			}
 			pl.moveCanonical = moveCanonical
 			pl.moveDisplay = moveDisplay
+			if len(op.hunks) == 0 {
+				pl.newContent = string(pl.preContent)
+			}
 		}
 
 		plans = append(plans, pl)
+	}
+	if targetIdx != len(targets) {
+		return nil, fmt.Errorf("apply_patch: target plan has extra entries")
 	}
 	return plans, nil
 }
@@ -211,30 +215,41 @@ func buildAddContent(op fileOp) string {
 // computeUpdatedContent reads canonicalPath, applies every hunk in order via
 // the Codex fuzzy ladder, and returns the resulting file content as a
 // single string (lines joined by \n, with no trailing newline). It also
-// returns the pre-mutation content (so DisplayMetadata in commit 6 can
-// show the file's pre-update state) and the applied-hunk descriptors
-// (StartLine 1-based, Old pattern, New content) so the diff rows can be
+// returns the pre-mutation content and the applied-hunk descriptors
+// (StartLine 1-based, Old pattern, New content) so diff rows can be
 // reconstructed without re-reading the file. Hunk location failures
 // (Failed to find context / Failed to find expected lines) bubble up
 // unchanged so the model sees Codex's exact error string.
-func computeUpdatedContent(canonicalPath string, op fileOp, root string, params map[string]any) (preLines []string, content string, hunks []appliedHunkPreview, err error) {
+func computeUpdatedContent(canonicalPath string, op fileOp) (preContent []byte, preLines []string, content string, hunks []appliedHunkPreview, err error) {
 	data, err := readFileBytes(canonicalPath)
 	if err != nil {
-		return nil, "", nil, fmt.Errorf("apply_patch: read %s: %w", op.path, err)
+		return nil, nil, "", nil, fmt.Errorf("apply_patch: read %s: %w", op.path, err)
 	}
 	preLines = splitLinesRaw(data)
 	lines := preLines
 	cursor := 0
 	for _, h := range op.hunks {
+		if !hunkHasMatchLines(h) {
+			return nil, nil, "", nil, fmt.Errorf("apply_patch: Update File %q has a hunk with no context or removed lines", op.path)
+		}
 		next, end, hunkPrev, lerr := applyHunk(lines, h, op.path, cursor)
 		if lerr != nil {
-			return nil, "", nil, lerr
+			return nil, nil, "", nil, lerr
 		}
 		lines = next
 		cursor = end
 		hunks = append(hunks, hunkPrev)
 	}
-	return preLines, strings.Join(lines, "\n"), hunks, nil
+	return data, preLines, strings.Join(lines, "\n"), hunks, nil
+}
+
+func hunkHasMatchLines(h hunk) bool {
+	for _, line := range h.lines {
+		if line.kind == lineContext || line.kind == lineRemove {
+			return true
+		}
+	}
+	return false
 }
 
 // applyHunk locates h's pattern (context + remove lines) starting at cursor
@@ -255,9 +270,8 @@ func applyHunk(fileLines []string, h hunk, path string, cursor int) ([]string, i
 	out = append(out, fileLines[:start]...)
 	out = append(out, newLines...)
 	out = append(out, fileLines[end:]...)
-	// Capture the classified hunk lines so DisplayMetadata in commit
-	// 6 can build the diff rows without re-reading the file (the
-	// post-mutation state has overwritten the matched pattern).
+	// Capture the classified hunk lines so display metadata can build diff rows
+	// without re-reading the file after the matched pattern is overwritten.
 	lines := make([]hunkLine, len(h.lines))
 	copy(lines, h.lines)
 	return out, start + len(newLines), appliedHunkPreview{StartLine: start + 1, Old: oldLines, New: newLines, Lines: lines}, nil
@@ -279,16 +293,16 @@ func hunkTransform(h hunk) (oldLines, newLines []string) {
 }
 
 // applyOne applies a single op's mutation and returns the per-file
-// preview data captured during the apply (so the engine can stash it
-// for DisplayMetadata). On a mid-write failure it wraps the
-// partial-failure summary in *ExitError so the immediate Execute path
-// surfaces the committed-files A/M/D list to the model (Decision 13);
-// on a pre-mutation failure (e.g. snapshot error) it returns a plain
-// error. committed is the running list of ops that have already
-// landed on disk; applyOne appends to it on success and reads it for
-// the partial-failure summary.
+// preview data captured during the apply. On a mid-write failure it wraps the
+// partial-failure summary in *ExitError so the model sees the committed-files
+// A/M/D list. committed is the running list of ops that have already landed on
+// disk; applyOne appends to it on success and reads it for partial-failure
+// summaries.
 func applyOne(ctx context.Context, pl *applyPlan, store SnapshotStore, tracker *FileTracker, committed *[]appliedOp) ([]appliedFilePreview, error) {
 	_ = ctx
+	if err := revalidateApplyPlan(pl); err != nil {
+		return nil, &ExitError{Output: buildPartialSummary(*committed) + "\n\n" + err.Error()}
+	}
 
 	// Move: write the destination first (so it lands), then snapshot + delete the source.
 	if pl.op.movePath != "" {
@@ -304,6 +318,38 @@ func applyOne(ctx context.Context, pl *applyPlan, store SnapshotStore, tracker *
 		return nil, &ExitError{Output: buildPartialSummary(*committed) + "\n\n" + origErr.Error()}
 	}
 	return buildOpPreviews(pl), nil
+}
+
+func revalidateApplyPlan(pl *applyPlan) error {
+	if err := revalidateApplyPatchTarget(pl.root, pl.op.path, pl.canonicalPath); err != nil {
+		return err
+	}
+	if pl.moveCanonical != "" {
+		if err := revalidateApplyPatchTarget(pl.root, pl.op.movePath, pl.moveCanonical); err != nil {
+			return err
+		}
+	}
+	if pl.op.kind == opUpdate || pl.op.kind == opDelete || pl.moveCanonical != "" {
+		data, err := readFileBytes(pl.canonicalPath)
+		if err != nil {
+			return fmt.Errorf("apply_patch: read %s before mutation: %w", pl.op.path, err)
+		}
+		if !bytes.Equal(data, pl.preContent) {
+			return fmt.Errorf("apply_patch: %s changed after validation", pl.op.path)
+		}
+	}
+	return nil
+}
+
+func revalidateApplyPatchTarget(root, path, approvedCanonical string) error {
+	resolved, err := pathutil.ResolveFilePathFrom(root, path)
+	if err != nil {
+		return fmt.Errorf("apply_patch: %s: %w", path, err)
+	}
+	if resolved.CanonicalPath != approvedCanonical {
+		return fmt.Errorf("apply_patch: approved canonical path changed from %s to %s", approvedCanonical, resolved.CanonicalPath)
+	}
+	return nil
 }
 
 // buildOpPreviews assembles the per-op preview data captured during
@@ -482,7 +528,7 @@ func buildPartialSummary(committed []appliedOp) string {
 // readFileBytes reads the entire file at canonicalPath with O_NOFOLLOW and
 // O_NONBLOCK and returns the raw bytes. Used by the Update/Move path to
 // read the file's current content; raw bytes (including \r) ride through
-// unchanged per Decision 17.
+// unchanged.
 func readFileBytes(canonicalPath string) ([]byte, error) {
 	f, err := safefs.OpenExisting(canonicalPath, os.O_RDONLY|unix.O_NONBLOCK)
 	if err != nil {

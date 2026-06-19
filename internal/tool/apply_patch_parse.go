@@ -70,7 +70,7 @@ func parsePatch(input string) (*patch, error) {
 		return nil, errApplyPatchEmpty
 	}
 
-	// Decision 17: split on \n only; \r rides inside lines as raw bytes.
+	// Split on \n only; \r rides inside lines as raw bytes.
 	lines := strings.Split(input, "\n")
 	// Trim a single trailing empty produced by a final newline so the
 	// envelope's last line lands on *** End Patch exactly.
@@ -184,7 +184,7 @@ func parsePatch(input string) (*patch, error) {
 				}
 				op.hunks = append(op.hunks, h)
 			}
-			if len(op.hunks) == 0 {
+			if len(op.hunks) == 0 && op.movePath == "" {
 				return nil, fmt.Errorf("apply_patch: Update File %q has no hunks", path)
 			}
 			seen[path] = true

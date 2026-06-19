@@ -268,7 +268,7 @@ func TestLocateCursorClamped(t *testing.T) {
 		t.Fatalf("start = %d, want 0 (cursor clamped)", start)
 	}
 
-	start, err = locate(lines, h, "p", 100)
+	_, err = locate(lines, h, "p", 100)
 	if err == nil {
 		t.Fatal("locate err = nil, want non-nil (pattern cannot be located past end)")
 	}

@@ -53,12 +53,29 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 	allowed := make([]bool, len(staged))
 	resolvedStaged := make([]StagedCall, len(staged))
 	allowAll := false
+	hasApplyPatch := false
+	hasFileEdit := false
+
+	for i, call := range staged {
+		results[i].ToolName = call.ToolName
+		results[i].ToolCallID = call.ToolCallID
+		if call.ToolName == "apply_patch" {
+			hasApplyPatch = true
+		}
+		if call.ToolName == "edit_file" || call.ToolName == "write_file" {
+			hasFileEdit = true
+		}
+	}
+	if hasApplyPatch && hasFileEdit {
+		for i := range results {
+			results[i].Error = "staged apply_patch cannot be mixed with edit_file or write_file"
+		}
+		return results
+	}
 	batchFiles := stagedBatchFilesAtRoot(e.workspaceRoot, staged)
 
 	for i, call := range staged {
 		resolvedStaged[i] = call
-		results[i].ToolName = call.ToolName
-		results[i].ToolCallID = call.ToolCallID
 
 		if call.ToolName == "write_file" {
 			if _, ok := call.Params["content"].(string); !ok {
@@ -80,13 +97,12 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 			continue
 		}
 		execParams := call.Params
-		// apply_patch has no path param; use the multi-path decision
-		// (Invariant 3) so the staged path is identical to the immediate
-		// path. Other tools keep the per-arg check.
+		// apply_patch has no path param, so it uses the same multi-path target
+		// plan as the immediate path. Other tools keep the per-arg check.
 		var decision permission.Decision
-		var patchPaths []string
+		var targets []applyPatchTarget
 		if call.ToolName == "apply_patch" {
-			patchPaths, _, decision = applyPatchPermissionDecision(e.check, e.workspaceRoot, execParams)
+			targets, _, decision = applyPatchPermissionPlan(e.check, e.workspaceRoot, execParams)
 		} else {
 			decision = permission.DecisionAsk
 			if e.check != nil {
@@ -96,11 +112,17 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 		switch decision {
 		case permission.DecisionAllow:
 			allowed[i] = true
+			if call.ToolName == "apply_patch" {
+				resolvedStaged[i].Params = withApplyPatchReceipt(execParams, targets)
+			}
 		case permission.DecisionDeny:
 			results[i].Error = "denied by user"
 		default:
 			if allowAll {
 				allowed[i] = true
+				if call.ToolName == "apply_patch" {
+					resolvedStaged[i].Params = withApplyPatchReceipt(execParams, targets)
+				}
 				continue
 			}
 			if e.ask == nil {
@@ -108,27 +130,28 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 				continue
 			}
 			req := permissionRequestAtRoot(e.workspaceRoot, call.ToolName, staged[i].Params, execParams)
-			req.CanAllowAll = len(staged) > 1
+			if call.ToolName == "apply_patch" {
+				req = applyPatchAskRequest(targets)
+			}
+			req.CanAllowAll = len(staged) > 1 && !hasApplyPatch
 			req.BatchIndex = i + 1
 			req.BatchTotal = len(staged)
-			if patchPaths != nil {
-				// apply_patch: the batch prompt lists the patch's files,
-				// not the staged batch's files (Decision 5).
-				req.BatchFiles = patchPaths
-				if req.Arg == "" {
-					req.Arg = patchPaths[0]
-					req.ResolvedArg = patchPaths[0]
-				}
-			} else {
+			if call.ToolName != "apply_patch" {
 				req.BatchFiles = batchFiles
 			}
 			action := e.ask(ctx, req)
 			switch action {
 			case permission.ResponseAllow:
 				allowed[i] = true
+				if call.ToolName == "apply_patch" {
+					resolvedStaged[i].Params = withApplyPatchReceipt(execParams, targets)
+				}
 			case permission.ResponseAllowAll:
 				allowed[i] = true
 				allowAll = true
+				if call.ToolName == "apply_patch" {
+					resolvedStaged[i].Params = withApplyPatchReceipt(execParams, targets)
+				}
 			default:
 				results[i].Error = "denied by user"
 			}
@@ -177,15 +200,14 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 	// apply_patch staged flush. Each allowed call runs through the
 	// engine (parse → FS-validate → snapshot-and-apply), which returns
 	// the A/M/D summary. Partial mid-write failure returns *ExitError
-	// whose Output is the committed-files summary + the error; we set
-	// BatchResult.Error to that body so the existing
-	// emitPendingResults branch at loop.go:1339-1342 routes it to
-	// the model with isError = true (Invariant 5, no struct change).
+	// whose Output is the committed-files summary plus the error. Use that body
+	// as BatchResult.Error so the existing pending-result emitter sends it to
+	// the model as an error result.
 	for i, call := range resolvedStaged {
 		if !allowed[i] || call.ToolName != "apply_patch" {
 			continue
 		}
-		result, _, err := applyPatchApplyAtRoot(ctx, e.workspaceRoot, e.store, e.tracker, call.Params)
+		result, previews, err := applyPatchApplyAtRoot(ctx, e.workspaceRoot, e.store, e.tracker, call.Params)
 		if err != nil {
 			var exitErr *ExitError
 			if errors.As(err, &exitErr) {
@@ -196,6 +218,7 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 			continue
 		}
 		results[i].Result = result
+		results[i].Metadata = applyPatchPreviewMetadata(previews)
 		results[i].Success = true
 	}
 

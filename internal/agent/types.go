@@ -79,14 +79,15 @@ type PromptWarning struct {
 
 // PermissionRequest is sent to adapters when a tool needs user approval.
 type PermissionRequest struct {
-	ID          string
-	ToolName    string
-	Arg         string
-	ResolvedArg string
-	CanAllowAll bool
-	BatchIndex  int
-	BatchTotal  int
-	BatchFiles  []string
+	ID                 string
+	ToolName           string
+	Arg                string
+	ResolvedArg        string
+	CanAllowAll        bool
+	BatchIndex         int
+	BatchTotal         int
+	BatchFiles         []string
+	BatchResolvedFiles []string
 }
 
 // TokenEntry holds accumulated token counts for one {provider, model} pair.

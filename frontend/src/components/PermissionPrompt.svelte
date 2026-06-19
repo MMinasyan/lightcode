@@ -74,11 +74,13 @@
         <span class="batch-badge">{permission.batchIndex}/{permission.batchTotal}</span>
       {/if}
     </div>
-    {#if permission?.canAllowAll && permission?.batchFiles?.length}
+    {#if permission?.batchFiles?.length}
       <div class="batch-list">
-        <div class="batch-title">Staged files</div>
-        {#each permission.batchFiles as file}
-          <div class:current-file={file === permission.args}>{file}</div>
+        <div class="batch-title">{permission?.canAllowAll ? 'Staged files' : 'Affected files'}</div>
+        {#each permission.batchFiles as file, i}
+          <div class:current-file={file === permission.args}>
+            {file}{#if permission.batchResolvedFiles?.[i] && permission.batchResolvedFiles[i] !== file} -> {permission.batchResolvedFiles[i]}{/if}
+          </div>
         {/each}
       </div>
     {/if}

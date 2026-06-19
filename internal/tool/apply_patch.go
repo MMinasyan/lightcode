@@ -10,12 +10,10 @@ import (
 	"github.com/MMinasyan/lightcode/internal/editpreview"
 )
 
-// applyPatchDescription is the model-facing description of apply_patch. The
-// text is the verbatim V4A instruction set from Decision 19, trimmed to
-// Lightcode's house style: one-line capability summary plus terse imperative
-// bullets, no worked example, no formal-grammar block. The format is taught
-// in the description and the JSON schema; no editing section is added to
-// the system prompt (Decision 11).
+// applyPatchDescription is the model-facing description of apply_patch: a
+// terse capability summary plus imperative format rules. The format is taught
+// in the tool description and JSON schema, not through extra system-prompt
+// sections.
 const applyPatchDescription = `Edits, creates, deletes, or renames files using the apply_patch (V4A) patch format.
 - Wrap every change between *** Begin Patch and *** End Patch, with one section per file.
 - Start each section with a header: *** Add File: <path> (every following line is a + line of new content), *** Update File: <path> (edit in place), or *** Delete File: <path> (nothing follows).
@@ -24,22 +22,18 @@ const applyPatchDescription = `Edits, creates, deletes, or renames files using t
 - Use file paths relative to the project root.
 - Use pending=true unless the patch is your last action; pending patches apply automatically with your next tool call or after your response. Leave it off only on a final patch you want applied immediately (prefer that over execute_pending).`
 
-// ApplyPatch implements the V4A patch tool. It replaces edit_file + write_file
-// for the GPT-5.x / Codex family (Decision 2) and is registered DefaultHidden
-// so it reaches that family only through an adaptation's IncludeTools. Apply
-// behavior is Codex's in full (Decision 3): the patch is validated before any
-// write, Add/Update/Delete/Move go through the same safefs + snapshot
-// primitives as the rest of Lightcode's file tools, and the result format is
-// Codex's `Success. Updated the following files:` A/M/D summary. Move
-// decomposes into write-new + delete-old (Decision 14); no read-before-edit
-// gate is enforced (Decision 12). applyPatchApplyAtRoot is the engine and
-// is shared with the staged flush (commit 5).
+// ApplyPatch implements the V4A patch tool. It is DefaultHidden so only model
+// adaptations that include it can see it. The patch is validated before any
+// write; Add/Update/Delete/Move go through the same safefs and snapshot
+// primitives as the rest of Lightcode's file tools; and successful output uses
+// the `Success. Updated the following files:` A/M/D summary. Move decomposes
+// into write-new plus delete-old. apply_patch does not use the read-before-edit
+// gate because Update hunks must match current file content.
 //
-// The tool also captures per-op pre / post / hunk data during apply
-// (applyPreview / applyPreviewMu) and stashes it as the most recent
-// apply. DisplayMetadata in commit 6 reads that stash to build the
-// edit_preview_files map; the stash is cleared after each read so a
-// later tool call cannot see a stale preview.
+// The tool captures per-op pre/post/hunk data during apply and stashes it as
+// the most recent apply. DisplayMetadata reads that stash to build the
+// edit_preview_files map, then clears it so later tool calls cannot see stale
+// previews.
 type ApplyPatch struct {
 	store         SnapshotStore
 	tracker       *FileTracker
@@ -81,18 +75,17 @@ func (*ApplyPatch) ParametersSchema() map[string]any {
 
 func (*ApplyPatch) DefaultHidden() bool { return true }
 
-// DisplayMetadata reads the applyPreview stash captured during Execute
-// and returns the edit_preview_files map (Decision 9 / Invariant 6).
-// The stash is taken and cleared on each call so a later tool call
-// cannot see a stale preview. The inner per-file shape is today's
-// editpreview.Preview (Hunks of Rows) so the existing per-file
-// renderer is reused unchanged; only the outer per-file list is new.
+// DisplayMetadata reads and clears the preview stash captured during Execute,
+// then returns the edit_preview_files map consumed by CLI and GUI renderers.
 func (a *ApplyPatch) DisplayMetadata(_ context.Context, _ json.RawMessage, _ string) map[string]any {
 	a.applyPreviewMu.Lock()
 	previews := a.applyPreview
 	a.applyPreview = nil
 	a.applyPreviewMu.Unlock()
+	return applyPatchPreviewMetadata(previews)
+}
 
+func applyPatchPreviewMetadata(previews []appliedFilePreview) map[string]any {
 	if len(previews) == 0 {
 		return nil
 	}
@@ -120,6 +113,9 @@ func appliedPreviewToFileEntry(p appliedFilePreview) editpreview.FileEntry {
 
 func buildPreviewFromCaptured(p appliedFilePreview) editpreview.Preview {
 	if len(p.Hunks) == 0 {
+		if p.Op != "A" {
+			return editpreview.Preview{}
+		}
 		// Add: build a synthetic single hunk with all post lines as add.
 		if len(p.Post) == 0 {
 			return editpreview.Preview{}
@@ -162,11 +158,9 @@ func buildPreviewFromCaptured(p appliedFilePreview) editpreview.Preview {
 	return editpreview.Preview{Hunks: hunks}
 }
 
-// ValidateStaged is the structure-only parse for the pending flush
-// (Invariant 2). It must not touch the filesystem: the staged permission
-// gate happens after this, and the full FS validation (existence
-// preconditions, hunk location, Move-destination check) runs inside the
-// staged commit, not at staging time.
+// ValidateStaged is the structure-only parse for pending calls. It must not
+// touch the filesystem: permission and full filesystem validation happen when
+// the staged batch is flushed.
 func (*ApplyPatch) ValidateStaged(_ context.Context, args json.RawMessage) error {
 	var params map[string]any
 	if err := json.Unmarshal(args, &params); err != nil {
@@ -203,7 +197,7 @@ func (a *ApplyPatch) Execute(ctx context.Context, params map[string]any) (string
 }
 
 // takeApplyPreview returns the most recent apply's per-file previews and
-// clears the stash. Used by DisplayMetadata (commit 6) and by tests.
+// clears the stash. Used by DisplayMetadata and tests.
 func (a *ApplyPatch) takeApplyPreview() []appliedFilePreview {
 	a.applyPreviewMu.Lock()
 	defer a.applyPreviewMu.Unlock()

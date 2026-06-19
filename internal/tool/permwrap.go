@@ -56,23 +56,21 @@ func (p *PermWrapped) ParametersSchema() map[string]any { return p.inner.Paramet
 func (p *PermWrapped) WrappedTool() Tool                { return p.inner }
 
 func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (string, error) {
-	// apply_patch has no path param and one approval covers the whole
-	// patch (Decision 5). The multi-path decision (per file + aggregate)
-	// is computed by the shared helper so the immediate and staged paths
-	// are identical (Invariant 3). The ask request lists every touched
-	// file under BatchFiles and uses the first as Arg.
+	// apply_patch has no path param and one approval covers the whole patch.
+	// The shared target plan drives permission checks, prompt fields, and the
+	// internal approval receipt used during execution.
 	if p.inner.Name() == "apply_patch" {
-		paths, _, agg := applyPatchPermissionDecision(p.check, p.workspaceRoot, params)
+		targets, _, agg := applyPatchPermissionPlan(p.check, p.workspaceRoot, params)
 		switch agg {
 		case permission.DecisionAllow:
-			return p.inner.Execute(ctx, params)
+			return p.inner.Execute(ctx, withApplyPatchReceipt(params, targets))
 		case permission.DecisionDeny:
 			return "", ErrDenied
 		default:
 			if p.ask != nil {
-				req := applyPatchAskRequest(p.workspaceRoot, params, paths)
+				req := applyPatchAskRequest(targets)
 				if permissionAllows(p.ask(ctx, req)) {
-					return p.inner.Execute(ctx, params)
+					return p.inner.Execute(ctx, withApplyPatchReceipt(params, targets))
 				}
 			}
 			return "", ErrDenied
@@ -103,18 +101,21 @@ func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (strin
 // (the representative path the rule engine sees). The batch-level fields
 // (BatchIndex, BatchTotal, CanAllowAll) are set by the staged caller; the
 // immediate path leaves them zero, which is correct (single-call).
-func applyPatchAskRequest(workspaceRoot string, params map[string]any, paths []string) permission.Request {
+func applyPatchAskRequest(targets []applyPatchTarget) permission.Request {
 	arg := ""
 	resolved := ""
-	if len(paths) > 0 {
-		arg = paths[0]
-		resolved = paths[0]
+	paths := applyPatchDisplayFiles(targets)
+	resolvedPaths := applyPatchCanonicalFiles(targets)
+	if len(targets) > 0 {
+		arg = targets[0].AbsPath
+		resolved = targets[0].CanonicalPath
 	}
 	return permission.Request{
-		ToolName:    "apply_patch",
-		Arg:         arg,
-		ResolvedArg: resolved,
-		BatchFiles:  paths,
+		ToolName:           "apply_patch",
+		Arg:                arg,
+		ResolvedArg:        resolved,
+		BatchFiles:         paths,
+		BatchResolvedFiles: resolvedPaths,
 	}
 }
 

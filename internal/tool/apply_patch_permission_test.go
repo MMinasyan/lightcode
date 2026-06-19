@@ -269,6 +269,110 @@ func TestApplyPatchImmediateSensitiveSecondaryForcesAsk(t *testing.T) {
 	}
 }
 
+func TestApplyPatchImmediateSymlinkApprovalUsesCanonicalReceipt(t *testing.T) {
+	dir := t.TempDir()
+	real1 := filepath.Join(dir, "real1.txt")
+	real2 := filepath.Join(dir, "real2.txt")
+	link := filepath.Join(dir, "link.txt")
+	if err := os.WriteFile(real1, []byte("alpha\nBEFORE\nbeta"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(real2, []byte("alpha\nBEFORE\nbeta"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real1, link); err != nil {
+		t.Fatal(err)
+	}
+	check := rulesCheck(dir, permission.Rules{Ask: []string{ruleFor(dir, "**")}})
+	asked := 0
+	ask := func(_ context.Context, req permission.Request) permission.ResponseAction {
+		asked++
+		if len(req.BatchFiles) != 1 || req.BatchFiles[0] != link {
+			t.Fatalf("BatchFiles = %v, want [%s]", req.BatchFiles, link)
+		}
+		if len(req.BatchResolvedFiles) != 1 || req.BatchResolvedFiles[0] != real1 {
+			t.Fatalf("BatchResolvedFiles = %v, want [%s]", req.BatchResolvedFiles, real1)
+		}
+		if req.ResolvedArg != real1 {
+			t.Fatalf("ResolvedArg = %q, want %q", req.ResolvedArg, real1)
+		}
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(real2, link); err != nil {
+			t.Fatal(err)
+		}
+		return permission.ResponseAllow
+	}
+	tool := NewApplyPatchWithSnapshotAtRoot(&applyPatchStore{turn: 1}, NewFileTracker(), config.ToolsConfig{}, dir)
+	wrapped := WrapWithPermissionAtRoot(tool, dir, check, ask)
+
+	input := applyPatchInput(t, "*** Update File: link.txt\n@@\n alpha\n-BEFORE\n+AFTER\n beta")
+	_, err := wrapped.Execute(context.Background(), map[string]any{"input": input})
+	if err == nil || !strings.Contains(err.Error(), "approved canonical path changed") {
+		t.Fatalf("Execute err = %v, want approved canonical path changed", err)
+	}
+	if asked != 1 {
+		t.Fatalf("asked = %d, want 1", asked)
+	}
+	if got := readFile(t, real1); got != "alpha\nBEFORE\nbeta" {
+		t.Fatalf("real1 = %q, want unchanged", got)
+	}
+	if got := readFile(t, real2); got != "alpha\nBEFORE\nbeta" {
+		t.Fatalf("real2 = %q, want unchanged", got)
+	}
+}
+
+func TestApplyPatchCanonicalCollisionRejectedBeforeApply(t *testing.T) {
+	// Two different raw paths that resolve to the same canonical path
+	// must be rejected before any mutation. The parser allows them
+	// (raw-path dedup catches only exact duplicates); target planning
+	// catches the canonical collision.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &applyPatchStore{turn: 1}
+	tracker := NewFileTracker()
+	tool := NewApplyPatchWithSnapshotAtRoot(store, tracker, config.ToolsConfig{}, dir)
+	// "a.txt" and "./a.txt" are different raw paths but resolve to the same canonical.
+	input := applyPatchInput(t, "*** Update File: a.txt\n@@\n-hi\n+bye\n*** Update File: ./a.txt\n@@\n-hi\n+there")
+	_, err := tool.Execute(context.Background(), map[string]any{"input": input})
+	if err == nil || !strings.Contains(err.Error(), "resolve to the same file") {
+		t.Fatalf("Execute err = %v, want canonical collision error", err)
+	}
+	if got := readFile(t, filepath.Join(dir, "a.txt")); got != "hi" {
+		t.Fatalf("a.txt = %q, want unchanged (collision rejected before apply)", got)
+	}
+	if len(store.calls) != 0 {
+		t.Fatalf("snapshot calls = %d, want 0 (collision rejected before apply)", len(store.calls))
+	}
+}
+
+func TestApplyPatchCanonicalCollisionSymlinkRejected(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.txt")
+	link := filepath.Join(dir, "link.txt")
+	if err := os.WriteFile(real, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	store := &applyPatchStore{turn: 1}
+	tracker := NewFileTracker()
+	tool := NewApplyPatchWithSnapshotAtRoot(store, tracker, config.ToolsConfig{}, dir)
+	// Two raw paths resolving to the same canonical via symlink.
+	input := applyPatchInput(t, "*** Update File: real.txt\n@@\n content\n+changed\n*** Delete File: link.txt")
+	_, err := tool.Execute(context.Background(), map[string]any{"input": input})
+	if err == nil || !strings.Contains(err.Error(), "resolve to the same file") {
+		t.Fatalf("Execute err = %v, want canonical collision error", err)
+	}
+	if len(store.calls) != 0 {
+		t.Fatalf("snapshot calls = %d, want 0 (collision rejected before apply)", len(store.calls))
+	}
+}
+
 func TestApplyPatchImmediateEditFilePermissionUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hi"), 0o644); err != nil {

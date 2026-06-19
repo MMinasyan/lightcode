@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/editpreview"
 	"github.com/MMinasyan/lightcode/internal/permission"
 )
 
@@ -91,6 +92,130 @@ func TestApplyPatchStagedFlushAppliesViaOwnCommit(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "b.txt")); err != nil {
 		t.Fatalf("b.txt not created: %v", err)
+	}
+}
+
+func TestApplyPatchStagedFlushEmitsPreviewMetadata(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "x.txt"), []byte("alpha\nBEFORE\nbeta"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	executor := NewStagedExecutorAtRoot(&applyPatchStore{turn: 1}, NewFileTracker(), config.ToolsConfig{}, dir,
+		rulesCheck(dir, permission.Rules{Allow: []string{ruleFor(dir, "**")}}),
+		denyAskAction(t),
+	)
+
+	input := applyPatchInput(t, "*** Update File: x.txt\n@@\n alpha\n-BEFORE\n+AFTER\n beta")
+	results := executor.ExecutePending(context.Background(), []StagedCall{
+		{ToolName: "apply_patch", ToolCallID: "1", Args: input, Params: map[string]any{"input": input}},
+	})
+	if results[0].Error != "" || !results[0].Success {
+		t.Fatalf("result = %+v, want success", results[0])
+	}
+	files, ok := editpreview.FilesFromMetadata(results[0].Metadata)
+	if !ok {
+		t.Fatalf("metadata = %#v, want edit_preview_files", results[0].Metadata)
+	}
+	if len(files) != 1 || files[0].Path != "x.txt" || files[0].Op != "M" {
+		t.Fatalf("metadata files = %+v, want M x.txt", files)
+	}
+}
+
+func TestApplyPatchStagedMixedBatchRejectsWithoutMutation(t *testing.T) {
+	for _, toolName := range []string{"edit_file", "write_file"} {
+		t.Run(toolName, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "a.txt")
+			if err := os.WriteFile(path, []byte("hi"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			tracker := NewFileTracker()
+			trackIdentityForPath(t, tracker, path, 1, 100)
+			asked := 0
+			executor := NewStagedExecutorAtRoot(&applyPatchStore{turn: 1}, tracker, config.ToolsConfig{}, dir,
+				rulesCheck(dir, permission.Rules{Allow: []string{ruleFor(dir, "**"), toolName + "(/a.txt)"}}),
+				func(_ context.Context, req permission.Request) permission.ResponseAction {
+					asked++
+					return permission.ResponseAllow
+				},
+			)
+			patch := applyPatchInput(t, "*** Add File: b.txt\n+new")
+			otherParams := map[string]any{"path": path, "old_string": "hi", "new_string": "bye"}
+			if toolName == "write_file" {
+				otherParams = map[string]any{"path": path, "content": "bye"}
+			}
+			results := executor.ExecutePending(context.Background(), []StagedCall{
+				{ToolName: "apply_patch", ToolCallID: "1", Args: patch, Params: map[string]any{"input": patch}},
+				{ToolName: toolName, ToolCallID: "2", Args: `{}`, Params: otherParams},
+			})
+			if asked != 0 {
+				t.Fatalf("asked = %d, want 0", asked)
+			}
+			for i, r := range results {
+				if !strings.Contains(r.Error, "cannot be mixed") {
+					t.Fatalf("results[%d].Error = %q, want mixed-batch rejection", i, r.Error)
+				}
+			}
+			if got := readFile(t, path); got != "hi" {
+				t.Fatalf("a.txt = %q, want unchanged", got)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "b.txt")); !os.IsNotExist(err) {
+				t.Fatalf("b.txt exists despite mixed rejection: %v", err)
+			}
+		})
+	}
+}
+
+func TestApplyPatchStagedSymlinkApprovalUsesCanonicalReceipt(t *testing.T) {
+	dir := t.TempDir()
+	real1 := filepath.Join(dir, "real1.txt")
+	real2 := filepath.Join(dir, "real2.txt")
+	link := filepath.Join(dir, "link.txt")
+	if err := os.WriteFile(real1, []byte("alpha\nBEFORE\nbeta"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(real2, []byte("alpha\nBEFORE\nbeta"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real1, link); err != nil {
+		t.Fatal(err)
+	}
+	asked := 0
+	executor := NewStagedExecutorAtRoot(&applyPatchStore{turn: 1}, NewFileTracker(), config.ToolsConfig{}, dir,
+		rulesCheck(dir, permission.Rules{Ask: []string{ruleFor(dir, "**")}}),
+		func(_ context.Context, req permission.Request) permission.ResponseAction {
+			asked++
+			if len(req.BatchFiles) != 1 || req.BatchFiles[0] != link {
+				t.Fatalf("BatchFiles = %v, want [%s]", req.BatchFiles, link)
+			}
+			if len(req.BatchResolvedFiles) != 1 || req.BatchResolvedFiles[0] != real1 {
+				t.Fatalf("BatchResolvedFiles = %v, want [%s]", req.BatchResolvedFiles, real1)
+			}
+			if err := os.Remove(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(real2, link); err != nil {
+				t.Fatal(err)
+			}
+			return permission.ResponseAllow
+		},
+	)
+
+	input := applyPatchInput(t, "*** Update File: link.txt\n@@\n alpha\n-BEFORE\n+AFTER\n beta")
+	results := executor.ExecutePending(context.Background(), []StagedCall{
+		{ToolName: "apply_patch", ToolCallID: "1", Args: input, Params: map[string]any{"input": input}},
+	})
+	if asked != 1 {
+		t.Fatalf("asked = %d, want 1", asked)
+	}
+	if len(results) != 1 || !strings.Contains(results[0].Error, "approved canonical path changed") {
+		t.Fatalf("results = %+v, want canonical-change error", results)
+	}
+	if got := readFile(t, real1); got != "alpha\nBEFORE\nbeta" {
+		t.Fatalf("real1 = %q, want unchanged", got)
+	}
+	if got := readFile(t, real2); got != "alpha\nBEFORE\nbeta" {
+		t.Fatalf("real2 = %q, want unchanged", got)
 	}
 }
 
@@ -261,6 +386,41 @@ func TestApplyPatchStagedEditFileRegression(t *testing.T) {
 	}
 	if got := readFile(t, path); got != "bye" {
 		t.Fatalf("a.txt = %q, want %q (edit_file flush unchanged)", got, "bye")
+	}
+}
+
+func TestApplyPatchStagedBatchCanAllowAllFalse(t *testing.T) {
+	// DESIGN: Allow all is only for staged edit/write batch prompts.
+	// A pure apply_patch batch must not expose CanAllowAll, even when
+	// it contains multiple calls. The user sees only the current
+	// patch's files; approving later patches unseen would be unsafe.
+	dir := t.TempDir()
+	store := &applyPatchStore{turn: 1}
+	tracker := NewFileTracker()
+	var seenCanAllowAll *bool
+	executor := NewStagedExecutorAtRoot(store, tracker, config.ToolsConfig{}, dir,
+		rulesCheck(dir, permission.Rules{Ask: []string{ruleFor(dir, "**")}}),
+		func(_ context.Context, req permission.Request) permission.ResponseAction {
+			v := req.CanAllowAll
+			seenCanAllowAll = &v
+			return permission.ResponseDeny
+		},
+	)
+
+	first := applyPatchInput(t, "*** Add File: a.txt\n+hi")
+	second := applyPatchInput(t, "*** Add File: b.txt\n+there")
+	results := executor.ExecutePending(context.Background(), []StagedCall{
+		{ToolName: "apply_patch", ToolCallID: "1", Args: first, Params: map[string]any{"input": first}},
+		{ToolName: "apply_patch", ToolCallID: "2", Args: second, Params: map[string]any{"input": second}},
+	})
+	if len(results) != 2 {
+		t.Fatalf("results len = %d, want 2", len(results))
+	}
+	if seenCanAllowAll == nil {
+		t.Fatal("ask was never called; expected at least one permission prompt")
+	}
+	if *seenCanAllowAll {
+		t.Fatalf("CanAllowAll = true, want false for pure apply_patch batch")
 	}
 }
 

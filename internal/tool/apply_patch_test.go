@@ -23,9 +23,10 @@ func applyPatchInput(t *testing.T, s string) string {
 // edit_file tests assumes a pre-existing file, which is wrong for
 // apply_patch's Add and Move-destination cases.
 type applyPatchStore struct {
-	turn  int
-	calls []snapshotCall
-	seen  map[string]string
+	turn       int
+	calls      []snapshotCall
+	seen       map[string]string
+	onSnapshot func(call int)
 	// failOnCall, when > 0, makes the Nth snapshot call return errFail
 	// (used to simulate a mid-write failure at the second op).
 	failOnCall int
@@ -38,6 +39,9 @@ func (s *applyPatchStore) Snapshot(turn int, absPath string) error {
 
 func (s *applyPatchStore) SnapshotResolved(turn int, originalPath, canonicalPath string) error {
 	s.calls = append(s.calls, snapshotCall{turn: turn, path: originalPath, canonical: canonicalPath})
+	if s.onSnapshot != nil {
+		s.onSnapshot(len(s.calls))
+	}
 	if s.failOnCall > 0 && len(s.calls) == s.failOnCall {
 		return s.errFail
 	}
@@ -154,6 +158,27 @@ func TestApplyPatchUpdateFailsIfHunkContextMissing(t *testing.T) {
 	}
 }
 
+func TestApplyPatchRejectsContextFreeUpdateHunk(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.go")
+	if err := os.WriteFile(path, []byte("alpha\nbeta"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewApplyPatchWithSnapshotAtRoot(&applyPatchStore{turn: 1}, NewFileTracker(), config.ToolsConfig{}, dir)
+
+	input := applyPatchInput(t, "*** Update File: a.go\n@@\n+blind insert")
+	_, err := runApplyPatch(t, tool, map[string]any{"input": input})
+	if err == nil {
+		t.Fatal("Execute err = nil, want context-free hunk rejection")
+	}
+	if !strings.Contains(err.Error(), "no context or removed lines") {
+		t.Fatalf("err = %v, want no-context rejection", err)
+	}
+	if got := readFile(t, path); got != "alpha\nbeta" {
+		t.Fatalf("file = %q, want unchanged", got)
+	}
+}
+
 func TestApplyPatchDeletesFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "old.txt")
@@ -217,6 +242,111 @@ func TestApplyPatchMovesFile(t *testing.T) {
 	}
 	if got := readFile(t, dst); got != "alpha\nAFTER\nbeta" {
 		t.Fatalf("dest = %q, want %q", got, "alpha\nAFTER\nbeta")
+	}
+}
+
+func TestApplyPatchPureRenameSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "old.go")
+	dst := filepath.Join(dir, "new.go")
+	if err := os.WriteFile(src, []byte("alpha\nbeta\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &applyPatchStore{turn: 1}
+	tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, dir)
+
+	input := applyPatchInput(t, "*** Update File: old.go\n*** Move to: new.go")
+	result, err := runApplyPatch(t, tool, map[string]any{"input": input})
+	if err != nil {
+		t.Fatalf("Execute err = %v", err)
+	}
+	if !strings.Contains(result, "M new.go") || !strings.Contains(result, "D old.go") {
+		t.Fatalf("result = %q, want move summary", result)
+	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Fatalf("source still exists: %v", err)
+	}
+	if got := readFile(t, dst); got != "alpha\nbeta\n" {
+		t.Fatalf("dest = %q, want source content preserved", got)
+	}
+}
+
+func TestApplyPatchRefusesUpdateWhenContentChangesAfterValidation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target.txt")
+	if err := os.WriteFile(path, []byte("alpha\nBEFORE\nbeta"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &applyPatchStore{turn: 1, onSnapshot: func(call int) {
+		if call == 1 {
+			if err := os.WriteFile(path, []byte("alpha\nCHANGED\nbeta"), 0o644); err != nil {
+				t.Fatalf("mutate target: %v", err)
+			}
+		}
+	}}
+	tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, dir)
+
+	input := applyPatchInput(t, "*** Add File: first.txt\n+hi\n*** Update File: target.txt\n@@\n alpha\n-BEFORE\n+AFTER\n beta")
+	_, err := runApplyPatch(t, tool, map[string]any{"input": input})
+	if err == nil || !strings.Contains(err.Error(), "changed after validation") {
+		t.Fatalf("Execute err = %v, want changed-after-validation", err)
+	}
+	if got := readFile(t, path); got != "alpha\nCHANGED\nbeta" {
+		t.Fatalf("target = %q, want concurrent content retained", got)
+	}
+}
+
+func TestApplyPatchRefusesDeleteWhenContentChangesAfterValidation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target.txt")
+	if err := os.WriteFile(path, []byte("delete me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &applyPatchStore{turn: 1, onSnapshot: func(call int) {
+		if call == 1 {
+			if err := os.WriteFile(path, []byte("changed"), 0o644); err != nil {
+				t.Fatalf("mutate target: %v", err)
+			}
+		}
+	}}
+	tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, dir)
+
+	input := applyPatchInput(t, "*** Add File: first.txt\n+hi\n*** Delete File: target.txt")
+	_, err := runApplyPatch(t, tool, map[string]any{"input": input})
+	if err == nil || !strings.Contains(err.Error(), "changed after validation") {
+		t.Fatalf("Execute err = %v, want changed-after-validation", err)
+	}
+	if got := readFile(t, path); got != "changed" {
+		t.Fatalf("target = %q, want concurrent content retained", got)
+	}
+}
+
+func TestApplyPatchRefusesMoveSourceWhenContentChangesAfterValidation(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "old.txt")
+	dst := filepath.Join(dir, "new.txt")
+	if err := os.WriteFile(src, []byte("old content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &applyPatchStore{turn: 1, onSnapshot: func(call int) {
+		if call == 1 {
+			if err := os.WriteFile(src, []byte("changed"), 0o644); err != nil {
+				t.Fatalf("mutate source: %v", err)
+			}
+		}
+	}}
+	tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, dir)
+
+	input := applyPatchInput(t, "*** Add File: first.txt\n+hi\n*** Update File: old.txt\n*** Move to: new.txt")
+	_, err := runApplyPatch(t, tool, map[string]any{"input": input})
+	if err == nil || !strings.Contains(err.Error(), "changed after validation") {
+		t.Fatalf("Execute err = %v, want changed-after-validation", err)
+	}
+	if got := readFile(t, src); got != "changed" {
+		t.Fatalf("source = %q, want concurrent content retained", got)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("dest exists despite refused move: %v", err)
 	}
 }
 
@@ -557,6 +687,19 @@ func TestApplyPatchRegisteredAsDefaultHiddenExcludedFromBaseline(t *testing.T) {
 	exclNames := openAIToolNames(registry, exclude)
 	if contains(exclNames, "edit_file") || contains(exclNames, "write_file") {
 		t.Fatalf("edit_file/write_file leaked under ExcludeTools: %v", exclNames)
+	}
+}
+
+func TestCoreToolListOrderIsDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	tools := CoreToolList(&applyPatchStore{turn: 1}, NewFileTracker(), config.ToolsConfig{}, dir, nil, nil)
+	got := make([]string, 0, len(tools))
+	for _, tl := range tools {
+		got = append(got, tl.Name())
+	}
+	want := []string{"read_file", "write_file", "edit_file", "apply_patch"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("CoreToolList order = %v, want %v", got, want)
 	}
 }
 
