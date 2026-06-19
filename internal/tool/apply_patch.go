@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/editpreview"
 )
 
 // applyPatchDescription is the model-facing description of apply_patch. The
@@ -80,11 +81,85 @@ func (*ApplyPatch) ParametersSchema() map[string]any {
 
 func (*ApplyPatch) DefaultHidden() bool { return true }
 
-// DisplayMetadata is implemented in commit 6 (edit_preview_files). The stub
-// returns nil so commit 3 ships the tool inert against the GUI/CLI diff
-// metadata contract.
-func (*ApplyPatch) DisplayMetadata(_ context.Context, _ json.RawMessage, _ string) map[string]any {
-	return nil
+// DisplayMetadata reads the applyPreview stash captured during Execute
+// and returns the edit_preview_files map (Decision 9 / Invariant 6).
+// The stash is taken and cleared on each call so a later tool call
+// cannot see a stale preview. The inner per-file shape is today's
+// editpreview.Preview (Hunks of Rows) so the existing per-file
+// renderer is reused unchanged; only the outer per-file list is new.
+func (a *ApplyPatch) DisplayMetadata(_ context.Context, _ json.RawMessage, _ string) map[string]any {
+	a.applyPreviewMu.Lock()
+	previews := a.applyPreview
+	a.applyPreview = nil
+	a.applyPreviewMu.Unlock()
+
+	if len(previews) == 0 {
+		return nil
+	}
+	files := make([]editpreview.FileEntry, 0, len(previews))
+	for _, p := range previews {
+		files = append(files, appliedPreviewToFileEntry(p))
+	}
+	return map[string]any{"edit_preview_files": files}
+}
+
+// appliedPreviewToFileEntry converts the engine's captured per-file
+// pre/post/hunks data into the public editpreview.FileEntry shape.
+// Add produces a synthetic "all add" hunk from the post content;
+// Update / Move destination builds hunks from the captured classified
+// lines with StartLine as the 1-based anchor; Delete / Move source
+// produces no hunks (just the D tag, which the renderer uses as a
+// header).
+func appliedPreviewToFileEntry(p appliedFilePreview) editpreview.FileEntry {
+	return editpreview.FileEntry{
+		Path:    p.Path,
+		Op:      p.Op,
+		Preview: buildPreviewFromCaptured(p),
+	}
+}
+
+func buildPreviewFromCaptured(p appliedFilePreview) editpreview.Preview {
+	if len(p.Hunks) == 0 {
+		// Add: build a synthetic single hunk with all post lines as add.
+		if len(p.Post) == 0 {
+			return editpreview.Preview{}
+		}
+		rows := make([]editpreview.Row, 0, len(p.Post))
+		for i, l := range p.Post {
+			rows = append(rows, editpreview.Row{
+				Kind: editpreview.KindAdd, NewLine: i + 1, Text: l,
+			})
+		}
+		return editpreview.Preview{Hunks: []editpreview.Hunk{{Rows: rows}}}
+	}
+	hunks := make([]editpreview.Hunk, 0, len(p.Hunks))
+	for _, h := range p.Hunks {
+		rows := make([]editpreview.Row, 0, len(h.Lines))
+		oldLine := h.StartLine
+		newLine := h.StartLine
+		for _, l := range h.Lines {
+			switch l.kind {
+			case lineContext:
+				rows = append(rows, editpreview.Row{
+					Kind: editpreview.KindContext, OldLine: oldLine, NewLine: newLine, Text: l.text,
+				})
+				oldLine++
+				newLine++
+			case lineRemove:
+				rows = append(rows, editpreview.Row{
+					Kind: editpreview.KindRemove, OldLine: oldLine, Text: l.text,
+				})
+				oldLine++
+			case lineAdd:
+				rows = append(rows, editpreview.Row{
+					Kind: editpreview.KindAdd, NewLine: newLine, Text: l.text,
+				})
+				newLine++
+			}
+		}
+		hunks = append(hunks, editpreview.Hunk{Rows: rows})
+	}
+	return editpreview.Preview{Hunks: hunks}
 }
 
 // ValidateStaged is the structure-only parse for the pending flush

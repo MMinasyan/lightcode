@@ -27,6 +27,8 @@
   $: editHasMore = editRowCount > collapsedPreviewLines;
   $: editCanExpandInline = editRowCount <= maxInlineExpandLines;
   $: editChangeCounts = countEditChanges(editHunks);
+  $: applyPatchFiles = normalizeApplyPatchFiles(metadata && metadata.edit_preview_files);
+  $: applyPatchChangeCounts = countApplyPatchChanges(applyPatchFiles);
   $: writeAddedLines = name === 'write_file' ? countContentLines(displayOutput) : 0;
   $: commandHeaderLines = splitCommandLines(parsed.command || '');
   $: commandHasMore = commandHeaderLines.length > 1;
@@ -78,6 +80,34 @@
     return preview.hunks.map(hunk => ({
       rows: Array.isArray(hunk.rows) ? hunk.rows : []
     })).filter(hunk => hunk.rows.length > 0);
+  }
+
+  function normalizeApplyPatchFiles(files) {
+    if (!Array.isArray(files)) return [];
+    return files.map(f => ({
+      path: f && typeof f.path === 'string' ? f.path : '',
+      op: f && typeof f.op === 'string' ? f.op : '',
+      preview: f && f.preview && Array.isArray(f.preview.hunks) ? {
+        hunks: f.preview.hunks.map(h => ({
+          rows: Array.isArray(h.rows) ? h.rows : []
+        })).filter(h => h.rows.length > 0)
+      } : { hunks: [] }
+    }));
+  }
+
+  function countApplyPatchChanges(files) {
+    let added = 0;
+    let removed = 0;
+    for (const f of files || []) {
+      if (!f.preview) continue;
+      for (const h of f.preview.hunks) {
+        for (const r of h.rows || []) {
+          if (r.kind === 'add') added++;
+          else if (r.kind === 'remove') removed++;
+        }
+      }
+    }
+    return { added, removed };
   }
 
   function countEditRows(hunks) {
@@ -155,6 +185,26 @@
         {#if hasMore && !expanded}<div class="more">show all ({lines.length} lines)</div>{/if}
         {#if hasMore && expanded}<div class="more">collapse</div>{/if}
       </div>
+    {/if}
+  {:else if name === 'apply_patch'}
+    <div class="line">
+      <span class="tool-name">{name}</span>
+      <span class="arg">{applyPatchFiles.length} file{applyPatchFiles.length === 1 ? '' : 's'}</span>
+      {#if applyPatchChangeCounts.added > 0}<span class="change add">+{applyPatchChangeCounts.added}</span>{/if}
+      {#if applyPatchChangeCounts.removed > 0}<span class="change remove">-{applyPatchChangeCounts.removed}</span>{/if}
+    </div>
+    {#if done && success && applyPatchFiles.length}
+      {#each applyPatchFiles as file}
+        <div class="output-block edit-preview">
+          <div class="line">
+            <span class="tool-name">{file.op || 'M'}</span>
+            <span class="arg">{file.path}</span>
+          </div>
+          {#if file.preview.hunks.length}
+            <EditPreview hunks={file.preview.hunks} limit={collapsedPreviewLines} />
+          {/if}
+        </div>
+      {/each}
     {/if}
   {:else if name === 'background_process'}
     <div class="line">

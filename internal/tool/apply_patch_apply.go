@@ -90,6 +90,14 @@ type appliedHunkPreview struct {
 	StartLine int
 	Old       []string
 	New       []string
+	// Lines is the classified hunk lines (kind + text, in original
+	// order). DisplayMetadata uses these to build diff rows without
+	// re-reading the file: the post-mutation state has overwritten
+	// the matched pattern, so a disk read is not viable (Update
+	// overwrites, Delete removes, Move unlinks). The Old / New
+	// fields are kept for any future consumer that wants the
+	// pre-flattened split.
+	Lines []hunkLine
 }
 
 type applyPlan struct {
@@ -247,7 +255,12 @@ func applyHunk(fileLines []string, h hunk, path string, cursor int) ([]string, i
 	out = append(out, fileLines[:start]...)
 	out = append(out, newLines...)
 	out = append(out, fileLines[end:]...)
-	return out, start + len(newLines), appliedHunkPreview{StartLine: start + 1, Old: oldLines, New: newLines}, nil
+	// Capture the classified hunk lines so DisplayMetadata in commit
+	// 6 can build the diff rows without re-reading the file (the
+	// post-mutation state has overwritten the matched pattern).
+	lines := make([]hunkLine, len(h.lines))
+	copy(lines, h.lines)
+	return out, start + len(newLines), appliedHunkPreview{StartLine: start + 1, Old: oldLines, New: newLines, Lines: lines}, nil
 }
 
 func hunkTransform(h hunk) (oldLines, newLines []string) {

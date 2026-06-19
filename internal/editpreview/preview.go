@@ -75,6 +75,61 @@ func FromMetadata(metadata map[string]any) (*Preview, bool) {
 	return &preview, true
 }
 
+// FileEntry is one file in the per-file edit_preview_files list emitted
+// by apply_patch. The inner Preview is today's editpreview.Preview
+// (Hunks of Rows) so the existing per-file renderer is reused unchanged;
+// only the outer per-file shape is new. The Op tag is the A/M/D label
+// from the apply_patch result (A = add, M = update or move destination,
+// D = delete or move source). Decision 9.
+type FileEntry struct {
+	Path    string  `json:"path"`
+	Op      string  `json:"op"`
+	Preview Preview `json:"preview"`
+}
+
+// FilesFromMetadata decodes the edit_preview_files key. Returns the
+// list and true if the key is present and decodes cleanly, otherwise
+// nil and false. The GUI and CLI consumers use this to render the
+// multi-file shape (one diff block per entry).
+func FilesFromMetadata(metadata map[string]any) ([]FileEntry, bool) {
+	if metadata == nil {
+		return nil, false
+	}
+	value, ok := metadata["edit_preview_files"]
+	if !ok || value == nil {
+		return nil, false
+	}
+	switch v := value.(type) {
+	case []FileEntry:
+		return v, len(v) > 0
+	case []any:
+		out := make([]FileEntry, 0, len(v))
+		for _, item := range v {
+			entry, ok := item.(FileEntry)
+			if !ok {
+				data, err := json.Marshal(item)
+				if err != nil {
+					return nil, false
+				}
+				if err := json.Unmarshal(data, &entry); err != nil {
+					return nil, false
+				}
+			}
+			out = append(out, entry)
+		}
+		return out, len(out) > 0
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, false
+	}
+	var out []FileEntry
+	if json.Unmarshal(data, &out) != nil || len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
 func Build(oldString, newString, result string) *Preview {
 	starts := parseStartLines(result)
 	if len(starts) == 0 {
