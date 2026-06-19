@@ -291,7 +291,7 @@ func evaluateSingle(rules Rules, toolName, arg string, ctx evalContext) Decision
 }
 
 func IsFileTool(toolName string) bool {
-	return toolName == "read_file" || toolName == "write_file" || toolName == "edit_file"
+	return toolName == "read_file" || toolName == "write_file" || toolName == "edit_file" || toolName == "apply_patch"
 }
 
 var sensitiveNames = map[string]bool{

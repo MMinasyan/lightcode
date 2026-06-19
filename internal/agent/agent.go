@@ -243,9 +243,9 @@ func New(c Config) (*Agent, error) {
 	a.fileTracker = fileTracker
 
 	registry := tool.NewRegistry()
-	registry.Register(tool.WrapWithPermissionAtRoot(tool.NewReadFileAtRoot(c.Cfg.Tools, fileTracker, rt.workspaceRoot), rt.workspaceRoot, checkPolicy, askPolicy))
-	registry.Register(tool.WrapWithPermissionAtRoot(tool.NewWriteFileWithSnapshotAtRoot(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot), rt.workspaceRoot, checkPolicy, askPolicy))
-	registry.Register(tool.WrapWithPermissionAtRoot(tool.NewEditFileWithSnapshotAtRoot(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot), rt.workspaceRoot, checkPolicy, askPolicy))
+	for _, tl := range tool.CoreTools(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askPolicy) {
+		registry.Register(tl)
+	}
 	registry.Register(tool.WrapWithPermission(tool.ExecutePending{}, checkPolicy, askPolicy))
 
 	procMgr := process.NewManagerAtRoot(c.Cfg.Tools.MaxBackgroundProcesses, cmdoutput.Options{

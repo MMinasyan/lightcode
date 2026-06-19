@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -122,10 +121,18 @@ func TestSubagentBaselineModelUnchanged(t *testing.T) {
 	if lp.ActiveAdaptation() != nil {
 		t.Fatalf("baseline child carries an adaptation: %v", lp.ActiveAdaptation())
 	}
-	// The whole advertised set/order is unchanged (no DefaultHidden child tool, so the
-	// baseline advertisement is exactly the full registered set).
-	if !reflect.DeepEqual(registry.AdvertisedTools(nil), registry.OpenAITools()) {
-		t.Fatalf("baseline child advertised set differs from the full tool set: %v", advertisedToolNames(registry, nil))
+	// The advertised set is the registered tools minus DefaultHidden ones.
+	// A mutation-capable baseline child now also has apply_patch registered
+	// (DefaultHidden) so the GPT-5 adaptation can reveal it; the baseline
+	// filter withholds apply_patch from the advertisement.
+	baseline := advertisedToolNames(registry, nil)
+	if slices.Contains(baseline, "apply_patch") {
+		t.Fatalf("apply_patch leaked into baseline child advertised set: %v", baseline)
+	}
+	// An IncludeTools adaptation that names apply_patch reveals it.
+	full := advertisedToolNames(registry, &adaptation.Adaptation{IncludeTools: []string{"apply_patch"}})
+	if !slices.Contains(full, "apply_patch") {
+		t.Fatalf("apply_patch absent from full set under IncludeTools: %v", full)
 	}
 	if got := lp.Messages()[0].TextContent(); got != "explore base prompt" {
 		t.Fatalf("baseline child prompt changed: %q", got)
@@ -357,5 +364,63 @@ func TestSubagentChildShowsOwnAdaptationAndGateBlocks(t *testing.T) {
 	// The excluded read_file call was gate-blocked; the error rides into the next request.
 	if !strings.Contains(req2, "is not available") {
 		t.Fatal("child's excluded read_file call was not gate-blocked at dispatch")
+	}
+}
+
+// A subagent whose adaptation reveals apply_patch (the IncludeTools /
+// ExcludeTools shape the production GPT-5 binding will produce in
+// commit 7) advertises apply_patch and not edit_file / write_file. The
+// key invariant — Decision 18 — is that the agent does NOT have to
+// list apply_patch in at.Tools to receive it; it only has to be
+// mutation-capable (edit_file or write_file present), because the
+// registry always registers apply_patch as a hidden core tool for
+// any mutation-capable agent instance, and the adaptation reveals it.
+func TestSubagentAppliesApplyPatchOnGPT5Family(t *testing.T) {
+	gptCodex := &adaptation.Adaptation{
+		Name:         "gpt-codex",
+		ExcludeTools: []string{"edit_file", "write_file"},
+		IncludeTools: []string{"apply_patch"},
+	}
+	task := newSubagentTaskTool(t, func(string) *adaptation.Adaptation { return gptCodex })
+	at := subagent.AgentType{Name: "explore", Tools: []string{"read_file", "edit_file", "write_file"}, Prompt: "p"}
+	registry := task.buildRegistry(at, parentMutationScope{}, nil)
+	ref := coremodel.ModelRef{Provider: "test", Model: "gpt-5.4"}
+
+	lp := task.buildChildLoop(at, dummyChildClient(), registry, ref)
+	adapt := lp.ActiveAdaptation()
+	if adapt == nil || adapt.Name != "gpt-codex" {
+		t.Fatalf("child adaptation = %v, want the gpt-codex fixture", adapt)
+	}
+
+	names := advertisedToolNames(registry, adapt)
+	if !slices.Contains(names, "apply_patch") {
+		t.Fatalf("apply_patch missing from child's advertised set: %v", names)
+	}
+	if slices.Contains(names, "edit_file") {
+		t.Fatalf("edit_file leaked into the gpt-5.4 child's advertised set: %v", names)
+	}
+	if slices.Contains(names, "write_file") {
+		t.Fatalf("write_file leaked into the gpt-5.4 child's advertised set: %v", names)
+	}
+}
+
+// A read-only subagent (no edit_file / write_file in at.Tools) does NOT
+// receive apply_patch even if the adaptation names it in IncludeTools,
+// because apply_patch is not registered on a read-only child registry.
+// Include of an unregistered name is a silent no-op (advertise.go:31).
+func TestReadOnlySubagentDoesNotReceiveApplyPatch(t *testing.T) {
+	gptCodex := &adaptation.Adaptation{
+		IncludeTools: []string{"apply_patch"},
+	}
+	task := newSubagentTaskTool(t, func(string) *adaptation.Adaptation { return gptCodex })
+	at := subagent.AgentType{Name: "explore", Tools: []string{"read_file"}, Prompt: "p"}
+	registry := task.buildRegistry(at, parentMutationScope{}, nil)
+	ref := coremodel.ModelRef{Provider: "test", Model: "gpt-5.4"}
+
+	lp := task.buildChildLoop(at, dummyChildClient(), registry, ref)
+	_ = lp.ActiveAdaptation()
+	names := advertisedToolNames(registry, gptCodex)
+	if slices.Contains(names, "apply_patch") {
+		t.Fatalf("apply_patch leaked into a read-only child's advertised set: %v", names)
 	}
 }
