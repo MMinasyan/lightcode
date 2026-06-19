@@ -79,9 +79,18 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 			continue
 		}
 		execParams := call.Params
-		decision := permission.DecisionAsk
-		if e.check != nil {
-			decision = e.check(call.ToolName, PermissionCheckArgAtRoot(e.workspaceRoot, call.ToolName, execParams))
+		// apply_patch has no path param; use the multi-path decision
+		// (Invariant 3) so the staged path is identical to the immediate
+		// path. Other tools keep the per-arg check.
+		var decision permission.Decision
+		var patchPaths []string
+		if call.ToolName == "apply_patch" {
+			patchPaths, _, decision = applyPatchPermissionDecision(e.check, e.workspaceRoot, execParams)
+		} else {
+			decision = permission.DecisionAsk
+			if e.check != nil {
+				decision = e.check(call.ToolName, PermissionCheckArgAtRoot(e.workspaceRoot, call.ToolName, execParams))
+			}
 		}
 		switch decision {
 		case permission.DecisionAllow:
@@ -101,7 +110,17 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 			req.CanAllowAll = len(staged) > 1
 			req.BatchIndex = i + 1
 			req.BatchTotal = len(staged)
-			req.BatchFiles = batchFiles
+			if patchPaths != nil {
+				// apply_patch: the batch prompt lists the patch's files,
+				// not the staged batch's files (Decision 5).
+				req.BatchFiles = patchPaths
+				if req.Arg == "" {
+					req.Arg = patchPaths[0]
+					req.ResolvedArg = patchPaths[0]
+				}
+			} else {
+				req.BatchFiles = batchFiles
+			}
 			action := e.ask(ctx, req)
 			switch action {
 			case permission.ResponseAllow:
