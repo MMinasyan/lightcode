@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 
 	"github.com/MMinasyan/lightcode/internal/config"
@@ -85,6 +86,30 @@ func (*ApplyPatch) DefaultHidden() bool { return true }
 func (*ApplyPatch) DisplayMetadata(_ context.Context, _ json.RawMessage, _ string) map[string]any {
 	return nil
 }
+
+// ValidateStaged is the structure-only parse for the pending flush
+// (Invariant 2). It must not touch the filesystem: the staged permission
+// gate happens after this, and the full FS validation (existence
+// preconditions, hunk location, Move-destination check) runs inside the
+// staged commit, not at staging time.
+func (*ApplyPatch) ValidateStaged(_ context.Context, args json.RawMessage) error {
+	var params map[string]any
+	if err := json.Unmarshal(args, &params); err != nil {
+		return fmt.Errorf("apply_patch: invalid staged arguments: %w", err)
+	}
+	input, _ := params["input"].(string)
+	if input == "" {
+		return fmt.Errorf("apply_patch: input is required")
+	}
+	if _, err := parsePatch(input); err != nil {
+		return err
+	}
+	return nil
+}
+
+// StagedResultMessage is the body returned to the model when the
+// staged call is queued, matching edit_file / write_file.
+func (*ApplyPatch) StagedResultMessage() string { return "Staged." }
 
 func (a *ApplyPatch) Execute(ctx context.Context, params map[string]any) (string, error) {
 	result, previews, err := applyPatchApplyAtRoot(ctx, a.workspaceRoot, a.store, a.tracker, params)

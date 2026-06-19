@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -144,6 +145,12 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 		if !allowed[i] {
 			continue
 		}
+		if call.ToolName == "apply_patch" {
+			// apply_patch has no path param; flushed through its own
+			// commit below. The per-file grouping loop can't represent
+			// a multi-file patch (it buckets by single path).
+			continue
+		}
 		path, _ := call.Params["path"].(string)
 		groupPath := canonicalPathFromParams(call.Params)
 		if groupPath == "" {
@@ -167,6 +174,31 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 		e.executeFileGroup(ctx, resolvedStaged, results, g.absPath, g.indexes)
 	}
 
+	// apply_patch staged flush. Each allowed call runs through the
+	// engine (parse → FS-validate → snapshot-and-apply), which returns
+	// the A/M/D summary. Partial mid-write failure returns *ExitError
+	// whose Output is the committed-files summary + the error; we set
+	// BatchResult.Error to that body so the existing
+	// emitPendingResults branch at loop.go:1339-1342 routes it to
+	// the model with isError = true (Invariant 5, no struct change).
+	for i, call := range resolvedStaged {
+		if !allowed[i] || call.ToolName != "apply_patch" {
+			continue
+		}
+		result, _, err := applyPatchApplyAtRoot(ctx, e.workspaceRoot, e.store, e.tracker, call.Params)
+		if err != nil {
+			var exitErr *ExitError
+			if errors.As(err, &exitErr) {
+				results[i].Error = exitErr.Output
+			} else {
+				results[i].Error = err.Error()
+			}
+			continue
+		}
+		results[i].Result = result
+		results[i].Success = true
+	}
+
 	return results
 }
 
@@ -178,6 +210,18 @@ func stagedBatchFilesAtRoot(root string, staged []StagedCall) []string {
 	files := make([]string, 0, len(staged))
 	seen := map[string]bool{}
 	for _, call := range staged {
+		if call.ToolName == "apply_patch" {
+			// apply_patch has no path param; parse the patch and
+			// contribute its touched files to the batch prompt.
+			for _, p := range applyPatchFilesAtRoot(root, call.Params) {
+				if seen[p] {
+					continue
+				}
+				seen[p] = true
+				files = append(files, p)
+			}
+			continue
+		}
 		path, _ := call.Params["path"].(string)
 		if path == "" {
 			continue
