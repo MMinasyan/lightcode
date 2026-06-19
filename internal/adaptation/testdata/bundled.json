@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "pattern": "*gpt-5.5*",
+      "name": "gpt-codex",
+      "exclude_tools": ["edit_file", "write_file"],
+      "include_tools": ["apply_patch"],
+      "additions": {
+        "task_execution": "Use more tool calls when they can improve the response, provide useful context, or help plan or complete the task.\n\nIf you encounter a new or unexpected challenge before the active task is complete, try to resolve it yourself first. If a tool call fails or returns incomplete or unhelpful output, try another tool or a different approach."
+      }
+    },
+    {
+      "pattern": "*gpt-5.4*",
+      "name": "gpt-codex",
+      "exclude_tools": ["edit_file", "write_file"],
+      "include_tools": ["apply_patch"],
+      "additions": {
+        "task_execution": "Use more tool calls when they can improve the response, provide useful context, or help plan or complete the task.\n\nIf you encounter a new or unexpected challenge before the active task is complete, try to resolve it yourself first. If a tool call fails or returns incomplete or unhelpful output, try another tool or a different approach."
+      }
+    },
+    {
+      "pattern": "*gpt-5*",
+      "name": "gpt-apply-patch",
+      "exclude_tools": ["edit_file", "write_file"],
+      "include_tools": ["apply_patch"]
+    },
+    {
+      "pattern": "*grok-build-0.1",
+      "name": "gpt-task-execution",
+      "additions": {
+        "task_execution": "Use more tool calls when they can improve the response, provide useful context, or help plan or complete the task.\n\nIf you encounter a new or unexpected challenge before the active task is complete, try to resolve it yourself first. If a tool call fails or returns incomplete or unhelpful output, try another tool or a different approach."
+      }
+    },
+    {
+      "pattern": "*gemini-3*",
+      "name": "google-task-execution",
+      "additions": {
+        "task_execution": "Use absolute paths when calling tools or running commands.\n\nDo not run commands that require interaction, such as `y`/`yes` confirmation prompts. Run them in non-interactive mode when available, such as with `-y`, `--yes`, or `--non-interactive`.\n\nAlways provide a brief explanation BEFORE running commands that modify the filesystem."
+      }
+    },
+    {
+      "pattern": "*gemma-4*",
+      "name": "google-task-execution",
+      "additions": {
+        "task_execution": "Use absolute paths when calling tools or running commands.\n\nDo not run commands that require interaction, such as `y`/`yes` confirmation prompts. Run them in non-interactive mode when available, such as with `-y`, `--yes`, or `--non-interactive`.\n\nAlways provide a brief explanation BEFORE running commands that modify the filesystem."
+      }
+    }
+  ]
+}

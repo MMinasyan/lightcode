@@ -1,6 +1,9 @@
 package adaptation
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 func TestMatchInOrderingMostSpecificFirst(t *testing.T) {
 	// gpt-oss* is listed before gpt-* so the more specific family wins on overlap.
@@ -152,50 +155,101 @@ func TestShippedDefaultsEmpty(t *testing.T) {
 	}
 }
 
-func TestShippedTableMatchesGPTTaskExecutionModels(t *testing.T) {
+// TestShippedTableMatchesBundledGPTCodex asserts that the bundled data's
+// GPT-Codex row (5.4 / 5.5) gets the combined adaptation: prompt addition
+// plus the apply_patch tool swap. The expected text is sourced from the
+// fixture JSON — no Go constant for the addition text.
+func TestShippedTableMatchesBundledGPTCodex(t *testing.T) {
+	fx := loadFixture(t)
+	codex := fixtureRow(fx, "gpt-codex")
+	want := "Use more tool calls when they can improve the response, provide useful context, or help plan or complete the task.\n\nIf you encounter a new or unexpected challenge before the active task is complete, try to resolve it yourself first. If a tool call fails or returns incomplete or unhelpful output, try another tool or a different approach."
+	if codex.Additions["task_execution"] != want {
+		t.Fatalf("fixture gpt-codex additions text differs from canonical Decision-1 text")
+	}
 	for _, id := range []string{
-		"gpt-5.4",
-		"gpt-5.4-mini",
-		"gpt-5.5",
-		"openai/gpt-5.4-mini",
-		"openai/gpt-5.5-pro",
-		"grok-build-0.1",
-		"x-ai/grok-build-0.1",
+		"gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "openai/gpt-5.4-mini", "openai/gpt-5.5-pro",
 	} {
 		t.Run(id, func(t *testing.T) {
 			got := Match(id)
 			if got == nil {
-				t.Fatalf("Match(%q) = nil, want adaptation", id)
+				t.Fatalf("Match(%q) = nil, want gpt-codex", id)
 			}
-			if got.Name != gptTaskExecutionAdaptation.Name {
-				t.Fatalf("Match(%q).Name = %q, want %q", id, got.Name, gptTaskExecutionAdaptation.Name)
+			if got.Name != codex.Name {
+				t.Fatalf("Match(%q).Name = %q, want %q", id, got.Name, codex.Name)
 			}
-			if add := SectionAddition(got, "task_execution"); add != gptTaskExecutionAddition {
-				t.Fatalf("SectionAddition(Match(%q), task_execution) = %q, want GPT addition", id, add)
+			if add := SectionAddition(got, "task_execution"); add != want {
+				t.Fatalf("SectionAddition(Match(%q), task_execution) differs from canonical text", id)
+			}
+			if !slices.Contains(got.IncludeTools, "apply_patch") {
+				t.Errorf("Match(%q).IncludeTools = %v, want apply_patch", id, got.IncludeTools)
 			}
 		})
 	}
 }
 
-func TestShippedTableMatchesGoogleTaskExecutionModels(t *testing.T) {
+func TestShippedTableMatchesBundledGPTApplyPatchBroad(t *testing.T) {
+	fx := loadFixture(t)
+	ap := fixtureRow(fx, "gpt-apply-patch")
 	for _, id := range []string{
-		"gemini-3-flash-preview",
-		"gemini-3.1-pro-preview",
-		"gemini-3.1-flash-lite",
-		"google/gemini-3.5-flash",
-		"gemma-4-26b-a4b",
-		"google/gemma-4-31b",
+		"gpt-5.3-codex", "openai/gpt-5.3-codex", "gpt-5", "openai/gpt-5",
 	} {
+		t.Run(id, func(t *testing.T) {
+			got := Match(id)
+			if got == nil {
+				t.Fatalf("Match(%q) = nil, want gpt-apply-patch", id)
+			}
+			if got.Name != ap.Name {
+				t.Fatalf("Match(%q).Name = %q, want %q", id, got.Name, ap.Name)
+			}
+			if !slices.Contains(got.IncludeTools, "apply_patch") {
+				t.Errorf("Match(%q).IncludeTools = %v, want apply_patch", id, got.IncludeTools)
+			}
+			if v, ok := got.Additions["task_execution"]; ok && v != "" {
+				t.Errorf("Match(%q).Additions[task_execution] = %q, want absent (broader gpt-5 has no prompt addition)", id, v)
+			}
+		})
+	}
+}
+
+func TestShippedTableMatchesBundledGrok(t *testing.T) {
+	fx := loadFixture(t)
+	ge := fixtureRow(fx, "gpt-task-execution")
+	for _, id := range []string{"grok-build-0.1", "x-ai/grok-build-0.1"} {
 		t.Run(id, func(t *testing.T) {
 			got := Match(id)
 			if got == nil {
 				t.Fatalf("Match(%q) = nil, want adaptation", id)
 			}
-			if got.Name != googleTaskExecutionAdaptation.Name {
-				t.Fatalf("Match(%q).Name = %q, want %q", id, got.Name, googleTaskExecutionAdaptation.Name)
+			if got.Name != ge.Name {
+				t.Fatalf("Match(%q).Name = %q, want %q", id, got.Name, ge.Name)
 			}
-			if add := SectionAddition(got, "task_execution"); add != googleTaskExecutionAddition {
-				t.Fatalf("SectionAddition(Match(%q), task_execution) = %q, want Google addition", id, add)
+			if add := SectionAddition(got, "task_execution"); add == "" {
+				t.Errorf("Match(%q) should keep the prompt addition", id)
+			}
+			if slices.Contains(got.IncludeTools, "apply_patch") {
+				t.Errorf("grok should not include apply_patch (not V4A): %v", got.IncludeTools)
+			}
+		})
+	}
+}
+
+func TestShippedTableMatchesBundledGoogle(t *testing.T) {
+	fx := loadFixture(t)
+	ge := fixtureRow(fx, "google-task-execution")
+	for _, id := range []string{
+		"gemini-3-flash-preview", "gemini-3.1-pro-preview", "gemini-3.1-flash-lite",
+		"google/gemini-3.5-flash", "gemma-4-26b-a4b", "google/gemma-4-31b",
+	} {
+		t.Run(id, func(t *testing.T) {
+			got := Match(id)
+			if got == nil {
+				t.Fatalf("Match(%q) = nil, want google-task-execution", id)
+			}
+			if got.Name != ge.Name {
+				t.Fatalf("Match(%q).Name = %q, want %q", id, got.Name, ge.Name)
+			}
+			if add := SectionAddition(got, "task_execution"); add == "" {
+				t.Errorf("Match(%q) should keep the Google prompt addition", id)
 			}
 		})
 	}
@@ -205,8 +259,6 @@ func TestShippedTableLeavesOtherModelsBaseline(t *testing.T) {
 	for _, id := range []string{
 		"gpt-oss-120b",
 		"accounts/fireworks/models/gpt-oss-120b",
-		"gpt-5.3-codex",
-		"openai/gpt-5.3-codex",
 		"grok-4.3",
 		"grok-build-0.1-preview",
 		"gemini-2.5-pro",

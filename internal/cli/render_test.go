@@ -234,6 +234,26 @@ func TestPermissionPromptShowsResolvedTarget(t *testing.T) {
 	}
 }
 
+func TestPermissionPromptHidesProjectSaveWhenDisabled(t *testing.T) {
+	req := &agent.PermissionRequest{
+		ToolName:           "apply_patch",
+		Arg:                "/tmp/project/a.txt",
+		BatchFiles:         []string{"/tmp/project/a.txt", "/tmp/project/.env"},
+		BatchResolvedFiles: []string{"/tmp/project/a.txt", "/tmp/project/.env"},
+		DisableProjectSave: true,
+	}
+
+	rendered := renderPermissionPrompt(req, 0, 80)
+	if strings.Contains(rendered, "Allow for project") {
+		t.Fatalf("permission prompt shows disabled project-save action:\n%s", rendered)
+	}
+	for _, action := range permissionActions(req) {
+		if action.extra == "project" {
+			t.Fatalf("permission actions include disabled project-save: %#v", permissionActions(req))
+		}
+	}
+}
+
 func TestExtractJSONString(t *testing.T) {
 	cases := []struct{ json, key, want string }{
 		{`{"path":"/tmp/x.go"}`, "path", "/tmp/x.go"},

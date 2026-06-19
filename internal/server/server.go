@@ -233,14 +233,16 @@ func (s *Server) handleEvent(ev agent.Event) {
 	case agent.EventPermissionRequest:
 		name = "permission_request"
 		data = map[string]any{
-			"id":          ev.PermReq.ID,
-			"tool":        ev.PermReq.ToolName,
-			"arg":         ev.PermReq.Arg,
-			"resolvedArg": ev.PermReq.ResolvedArg,
-			"canAllowAll": ev.PermReq.CanAllowAll,
-			"batchIndex":  ev.PermReq.BatchIndex,
-			"batchTotal":  ev.PermReq.BatchTotal,
-			"batchFiles":  ev.PermReq.BatchFiles,
+			"id":                 ev.PermReq.ID,
+			"tool":               ev.PermReq.ToolName,
+			"arg":                ev.PermReq.Arg,
+			"resolvedArg":        ev.PermReq.ResolvedArg,
+			"canAllowAll":        ev.PermReq.CanAllowAll,
+			"canSaveProject":     !ev.PermReq.DisableProjectSave,
+			"batchIndex":         ev.PermReq.BatchIndex,
+			"batchTotal":         ev.PermReq.BatchTotal,
+			"batchFiles":         ev.PermReq.BatchFiles,
+			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		}
 		s.startPermissionTimer(ev.PermReq.ID)
 	case agent.EventCompactionStart:
@@ -396,7 +398,6 @@ func (s *Server) handlePermission(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	s.cancelPermissionTimer(id)
 	if body.Action == "" {
 		if body.Allow == nil {
 			jsonError(w, "missing permission action", http.StatusBadRequest)
@@ -412,6 +413,7 @@ func (s *Server) handlePermission(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	s.cancelPermissionTimer(id)
 	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -436,11 +438,11 @@ func (s *Server) handlePermissionSave(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	s.cancelPermissionTimer(body.ID)
 	if err := s.agent.SaveProjectPermission(body.ID, body.Patterns); err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.cancelPermissionTimer(body.ID)
 	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
 }
 

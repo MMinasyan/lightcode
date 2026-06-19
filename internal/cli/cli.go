@@ -410,7 +410,9 @@ func (c *CLI) handleKeyPermission(k keyMsg) {
 	case 'n', 'N':
 		c.popAndRespond(req.ID, false)
 	case 'p', 'P':
-		c.showPermissionSuggestions(req)
+		if !req.DisableProjectSave {
+			c.showPermissionSuggestions(req)
+		}
 	case 'a', 'A':
 		if req.CanAllowAll {
 			c.popAndRespondAction(req.ID, "allow_all")
