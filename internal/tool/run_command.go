@@ -49,7 +49,7 @@ func (*RunCommand) Description() string {
 - Each call starts a fresh shell in the project root. Environment variables, aliases, and working directory do not persist between calls. Use "cd /path && command" if you need a different working directory.
 - Foreground commands use the default timeout. Background commands run until they exit, are killed, or reach an explicit timeout parameter.
 - For long-running commands like dev servers, file watchers, or test suites that run continuously, set background=true. It returns immediately with a process ID. You will be notified when it finishes. If you stop now, you will not be able to do anything until it completed. If your next steps do not depend on its output, continue with them while it runs. To read its output while it is still running, use the sleep tool to wait, then the process tool to read the output. To kill it, use the process tool.
-- Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use edit_file or write_file.`
+- Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use <EDIT FILE OR WRITE FILE>.`
 }
 
 func (*RunCommand) ParametersSchema() map[string]any {

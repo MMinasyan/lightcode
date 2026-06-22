@@ -40,4 +40,8 @@ type Adaptation struct {
 	// even when a user rules heading overrides that section. Nil or missing
 	// entries mean "fall back to the default addition for this section".
 	Additions map[string]string
+
+	// ToolDescriptionReplacements overrides default placeholder replacements
+	// applied to model-facing tool descriptions.
+	ToolDescriptionReplacements map[string]string
 }

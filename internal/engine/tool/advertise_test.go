@@ -4,11 +4,13 @@ import (
 	"context"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	openai "github.com/sashabaranov/go-openai"
 
 	"github.com/MMinasyan/lightcode/internal/adaptation"
+	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/engine/tool"
 	runtimetool "github.com/MMinasyan/lightcode/internal/tool"
 )
@@ -32,6 +34,15 @@ func advertisedNames(tools []openai.Tool) []string {
 		out = append(out, t.Function.Name)
 	}
 	return out
+}
+
+func advertisedDescription(tools []openai.Tool, name string) string {
+	for _, t := range tools {
+		if t.Function != nil && t.Function.Name == name {
+			return t.Function.Description
+		}
+	}
+	return ""
 }
 
 func TestAdvertisedToolsNilMatchesOpenAIToolsWithoutHidden(t *testing.T) {
@@ -121,5 +132,42 @@ func TestExcludePlusIncludePreservesRegistrationOrder(t *testing.T) {
 	got := advertisedNames(r.AdvertisedTools(adapt))
 	if want := []string{"read_file", "apply_patch"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("advertised = %v, want %v", got, want)
+	}
+}
+
+func TestAdvertisedToolsRenderDescriptionReplacements(t *testing.T) {
+	r := tool.NewRegistry()
+	r.Register(runtimetool.NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, runtimetool.NewFileTracker()))
+	r.Register(runtimetool.NewRunCommand(config.ToolsConfig{CommandTimeout: 1}, t.TempDir(), nil))
+
+	baseline := r.AdvertisedTools(nil)
+	runDesc := advertisedDescription(baseline, "run_command")
+	if !strings.Contains(runDesc, "use edit_file or write_file") {
+		t.Fatalf("baseline run_command description = %q, want default edit/write phrase", runDesc)
+	}
+	readDesc := advertisedDescription(baseline, "read_file")
+	if !strings.Contains(readDesc, "edit_file and write_file will error") {
+		t.Fatalf("baseline read_file description = %q, want read-first rule", readDesc)
+	}
+
+	adapt := &adaptation.Adaptation{
+		ToolDescriptionReplacements: map[string]string{
+			"<EDIT FILE OR WRITE FILE>": "apply_patch",
+			"<READ-FIRST RULE>":         "",
+		},
+	}
+	adapted := r.AdvertisedTools(adapt)
+	runDesc = advertisedDescription(adapted, "run_command")
+	if !strings.Contains(runDesc, "use apply_patch") || strings.Contains(runDesc, "edit_file") || strings.Contains(runDesc, "write_file") {
+		t.Fatalf("adapted run_command description = %q, want apply_patch only", runDesc)
+	}
+	readDesc = advertisedDescription(adapted, "read_file")
+	if strings.Contains(readDesc, "READ-FIRST") || strings.Contains(readDesc, "edit_file and write_file will error") {
+		t.Fatalf("adapted read_file description = %q, want read-first rule removed", readDesc)
+	}
+	for _, tl := range adapted {
+		if tl.Function != nil && strings.Contains(tl.Function.Description, "<") {
+			t.Fatalf("advertised description for %s has unresolved placeholder: %q", tl.Function.Name, tl.Function.Description)
+		}
 	}
 }

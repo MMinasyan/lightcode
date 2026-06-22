@@ -158,7 +158,7 @@ func (r *Registry) PendingCoordinator() (PendingCoordinator, bool) {
 func (r *Registry) OpenAITools() []openai.Tool {
 	out := make([]openai.Tool, 0, len(r.order))
 	for _, name := range r.order {
-		out = append(out, toolDef(r.tools[name]))
+		out = append(out, toolDef(r.tools[name], nil))
 	}
 	return out
 }

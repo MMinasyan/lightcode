@@ -106,6 +106,33 @@ func TestProductionBundledDataAdditionsUseValidSectionIDs(t *testing.T) {
 	}
 }
 
+func TestProductionBundledDataHasToolDescriptionDefaults(t *testing.T) {
+	doc := loadFixture(t)
+	if len(doc.Defaults.ToolDescriptionReplacements) == 0 {
+		t.Fatal("fixture defaults.tool_description_replacements is empty")
+	}
+	for _, key := range []string{"<EDIT FILE OR WRITE FILE>", "<READ-FIRST RULE>"} {
+		if _, ok := doc.Defaults.ToolDescriptionReplacements[key]; !ok {
+			t.Fatalf("fixture missing default tool description replacement %q", key)
+		}
+	}
+}
+
+func TestBundledEntryRejectsUnknownToolDescriptionReplacement(t *testing.T) {
+	err := validateBundledEntry(0, bundledEntry{
+		Pattern: "model-*",
+		Name:    "model",
+		ToolDescriptionReplacements: map[string]string{
+			"<UNKNOWN>": "value",
+		},
+	}, bundledDefaults{ToolDescriptionReplacements: map[string]string{
+		"<KNOWN>": "value",
+	}})
+	if err == nil || !strings.Contains(err.Error(), "has no default replacement") {
+		t.Fatalf("validateBundledEntry err = %v, want unknown replacement key error", err)
+	}
+}
+
 func indexOf(doc bundledDoc, want bundledEntry) int {
 	for i, e := range doc.Entries {
 		if e.Pattern == want.Pattern && e.Name == want.Name {

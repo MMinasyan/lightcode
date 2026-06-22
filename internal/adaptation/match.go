@@ -20,6 +20,10 @@ type entry struct {
 // Empty means there is no baseline addition for that section.
 var defaultAdditions map[string]string
 
+// defaultToolDescriptionReplacements is populated from bundled data and applies
+// to model-facing tool descriptions when no active adaptation overrides a key.
+var defaultToolDescriptionReplacements map[string]string
+
 // Match returns the adaptation bound to modelID, or nil for baseline. It is the
 // production Resolver and expects the model component of the active model ref;
 // aggregator model IDs may still contain slashes. The table is loaded from
@@ -41,6 +45,38 @@ func SectionAddition(adapt *Adaptation, section string) string {
 	return defaultAdditions[section]
 }
 
+// RenderToolDescription applies bundled placeholder replacements to a
+// model-facing tool description. Active adaptations override default
+// replacement values. A line that consists only of a placeholder is removed when
+// that placeholder resolves to an empty string.
+func RenderToolDescription(description string, adapt *Adaptation) string {
+	replacements := maps.Clone(defaultToolDescriptionReplacements)
+	if replacements == nil {
+		replacements = map[string]string{}
+	}
+	if adapt != nil {
+		for k, v := range adapt.ToolDescriptionReplacements {
+			replacements[k] = v
+		}
+	}
+
+	lines := strings.Split(description, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+		if replacement, ok := replacements[trimmed]; ok && replacement == "" {
+			lines = append(lines[:i], lines[i+1:]...)
+			i--
+			continue
+		}
+		for key, replacement := range replacements {
+			line = strings.ReplaceAll(line, key, replacement)
+		}
+		lines[i] = line
+	}
+	return strings.Join(lines, "\n")
+}
+
 // matchIn returns an independent copy of the first entry in t whose pattern
 // matches modelID, or nil. Matching is case-insensitive and walks t in order, so
 // the table's most-specific-first ordering decides ties (first match wins). The
@@ -56,6 +92,7 @@ func matchIn(t []entry, modelID string) *Adaptation {
 			a.IncludeTools = slices.Clone(a.IncludeTools)
 			a.Blocks = slices.Clone(a.Blocks)
 			a.Additions = maps.Clone(a.Additions)
+			a.ToolDescriptionReplacements = maps.Clone(a.ToolDescriptionReplacements)
 			return &a
 		}
 	}

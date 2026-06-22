@@ -2,6 +2,7 @@ package adaptation
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -77,11 +78,12 @@ func TestMatchInIsAnchoredNotSubstring(t *testing.T) {
 
 func TestMatchInReturnsCopyNotAlias(t *testing.T) {
 	tbl := []entry{{pattern: "gpt-*", adapt: Adaptation{
-		Name:         "gpt",
-		ExcludeTools: []string{"edit_file"},
-		IncludeTools: []string{"apply_patch"},
-		Blocks:       []string{"coach"},
-		Additions:    map[string]string{"tone": "tone-add"},
+		Name:                        "gpt",
+		ExcludeTools:                []string{"edit_file"},
+		IncludeTools:                []string{"apply_patch"},
+		Blocks:                      []string{"coach"},
+		Additions:                   map[string]string{"tone": "tone-add"},
+		ToolDescriptionReplacements: map[string]string{"<EDIT FILE OR WRITE FILE>": "apply_patch"},
 	}}}
 	got := matchIn(tbl, "gpt-5.4")
 	if got == nil {
@@ -98,6 +100,7 @@ func TestMatchInReturnsCopyNotAlias(t *testing.T) {
 	got.Blocks = append(got.Blocks, "extra")
 	got.Additions["tone"] = "mutated"
 	got.Additions["safety"] = "mutated"
+	got.ToolDescriptionReplacements["<EDIT FILE OR WRITE FILE>"] = "mutated"
 	if tbl[0].adapt.Name != "gpt" {
 		t.Fatalf("Name leaked into the table: %q", tbl[0].adapt.Name)
 	}
@@ -112,6 +115,9 @@ func TestMatchInReturnsCopyNotAlias(t *testing.T) {
 	}
 	if len(tbl[0].adapt.Additions) != 1 || tbl[0].adapt.Additions["tone"] != "tone-add" {
 		t.Fatalf("Additions leaked into the table: %v", tbl[0].adapt.Additions)
+	}
+	if len(tbl[0].adapt.ToolDescriptionReplacements) != 1 || tbl[0].adapt.ToolDescriptionReplacements["<EDIT FILE OR WRITE FILE>"] != "apply_patch" {
+		t.Fatalf("ToolDescriptionReplacements leaked into the table: %v", tbl[0].adapt.ToolDescriptionReplacements)
 	}
 }
 
@@ -152,6 +158,51 @@ func TestShippedDefaultsEmpty(t *testing.T) {
 		if got := SectionAddition(nil, section); got != "" {
 			t.Fatalf("SectionAddition(nil, %q) = %q, want empty (empty ship)", section, got)
 		}
+	}
+}
+
+func TestShippedToolDescriptionDefaults(t *testing.T) {
+	want := map[string]string{
+		"<EDIT FILE OR WRITE FILE>": "edit_file or write_file",
+		"<READ-FIRST RULE>":         "- You must read a file before editing or overwriting it. edit_file and write_file will error if you have not read the file first.",
+	}
+	for key, value := range want {
+		if got := defaultToolDescriptionReplacements[key]; got != value {
+			t.Fatalf("defaultToolDescriptionReplacements[%q] = %q, want %q", key, got, value)
+		}
+	}
+}
+
+func TestRenderToolDescriptionReplacements(t *testing.T) {
+	orig := defaultToolDescriptionReplacements
+	defer func() { defaultToolDescriptionReplacements = orig }()
+	defaultToolDescriptionReplacements = map[string]string{
+		"<EDIT FILE OR WRITE FILE>": "edit_file or write_file",
+		"<READ-FIRST RULE>":         "- read first",
+	}
+
+	description := strings.Join([]string{
+		"use <EDIT FILE OR WRITE FILE>",
+		"<READ-FIRST RULE>",
+		"done",
+	}, "\n")
+
+	baseline := RenderToolDescription(description, nil)
+	if strings.Contains(baseline, "<") || !strings.Contains(baseline, "use edit_file or write_file") || !strings.Contains(baseline, "- read first") {
+		t.Fatalf("baseline RenderToolDescription = %q", baseline)
+	}
+
+	adapted := RenderToolDescription(description, &Adaptation{
+		ToolDescriptionReplacements: map[string]string{
+			"<EDIT FILE OR WRITE FILE>": "apply_patch",
+			"<READ-FIRST RULE>":         "",
+		},
+	})
+	if strings.Contains(adapted, "<") || strings.Contains(adapted, "read first") {
+		t.Fatalf("adapted RenderToolDescription = %q", adapted)
+	}
+	if want := "use apply_patch\ndone"; adapted != want {
+		t.Fatalf("adapted RenderToolDescription = %q, want %q", adapted, want)
 	}
 }
 

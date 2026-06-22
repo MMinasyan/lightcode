@@ -42,7 +42,7 @@ func (r *ReadFile) Description() string {
 	return `Reads a file from disk with line numbers.
 - Results are returned with line numbers: each line is prefixed with its number and a tab (e.g. "1\tpackage main"). Line numbers start at 1.
 - By default reads the first 500 lines. When you already know which part of the file you need, use offset and limit to read only that part.
-- You must read a file before editing or overwriting it. edit_file and write_file will error if you have not read the file first.
+<READ-FIRST RULE>
 - If you read a file that has not changed since the last time you read it, the tool returns a short notice instead of the full content. The earlier read in this conversation is still current.
 - Do not use cat, head, tail, or sed via run_command to read files. Use this tool.`
 }

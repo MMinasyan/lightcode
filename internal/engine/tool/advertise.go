@@ -17,12 +17,12 @@ type DefaultHidden interface {
 }
 
 // toolDef renders a tool in the shape every OpenAI-compatible endpoint expects.
-func toolDef(t Tool) openai.Tool {
+func toolDef(t Tool, adapt *adaptation.Adaptation) openai.Tool {
 	return openai.Tool{
 		Type: openai.ToolTypeFunction,
 		Function: &openai.FunctionDefinition{
 			Name:        t.Name(),
-			Description: t.Description(),
+			Description: adaptation.RenderToolDescription(t.Description(), adapt),
 			Parameters:  t.ParametersSchema(),
 		},
 	}
@@ -38,7 +38,7 @@ func (r *Registry) AdvertisedTools(adapt *adaptation.Adaptation) []openai.Tool {
 	out := make([]openai.Tool, 0, len(r.order))
 	for _, name := range r.order {
 		if r.Advertises(name, adapt) {
-			out = append(out, toolDef(r.tools[name]))
+			out = append(out, toolDef(r.tools[name], adapt))
 		}
 	}
 	return out
