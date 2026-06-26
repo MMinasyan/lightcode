@@ -198,7 +198,7 @@ func renderEnvironment(projectRoot string, sessionStart time.Time) string {
 	if shell == "" {
 		shell = "unknown"
 	}
-	return fmt.Sprintf("Working directory: %s\nPlatform: %s\nShell: %s\nOS: %s\nSession started: %s",
+	return fmt.Sprintf("## Environment\n\nWorking directory: %s\nPlatform: %s\nShell: %s\nOS: %s\nSession started: %s",
 		projectRoot,
 		runtime.GOOS,
 		shell,
@@ -249,7 +249,11 @@ func detectOverrides(rulesContent string) map[string]bool {
 		}
 		headingText := strings.TrimLeft(trimmed, "#")
 		headingText = strings.TrimSpace(headingText)
+		headingText = strings.TrimSpace(strings.TrimRight(headingText, "#"))
 		headingText = strings.ToLower(headingText)
+		headingText = strings.ReplaceAll(headingText, "-", " ")
+		headingText = strings.ReplaceAll(headingText, "_", " ")
+		headingText = strings.Join(strings.Fields(headingText), "_")
 		if _, ok := result[headingText]; ok {
 			result[headingText] = true
 		}

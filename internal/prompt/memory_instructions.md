@@ -1,3 +1,5 @@
+## Memory Instructions
+
 You have persistent memory across sessions via three tools: save_memory, search_memory, search_history.
 
 Save memories when you encounter information valuable for future sessions: user preferences, non-obvious project facts, feedback on approaches that worked or didn't, solutions to problems not derivable from the codebase. Do not save things derivable from code, git history, file structure, or ephemeral task details.

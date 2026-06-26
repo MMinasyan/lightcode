@@ -1,3 +1,5 @@
+## Core Rules
+
 Tool effects are real — edits modify files on disk, commands execute against the live system.
 
 If you make a mistake, correct it with the available tools: inspect what went wrong, identify the error, and apply the fix.
