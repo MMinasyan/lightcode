@@ -150,6 +150,8 @@ func (r agentUsageRecorder) RecordUsage(ev loop.Event) {
 	}
 }
 
+var newMemoryEmbedder = memory.NewEmbedder
+
 // New constructs an Agent from the given config. It creates the
 // provider client, tool registry, permission gate, snapshot store,
 // and loop. Call Init after setting up the event handler.
@@ -304,7 +306,7 @@ func New(c Config) (*Agent, error) {
 	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(procMgr), checkPolicy, askPolicy))
 	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkPolicy, askPolicy))
 
-	embedder, err := memory.NewEmbedder()
+	embedder, err := newMemoryEmbedder(c.Home)
 	if err != nil {
 		// Embedder failure is non-fatal: semantic memory search will be disabled.
 		a.embedderDegraded = true

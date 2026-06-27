@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,7 +54,7 @@ func TestStoreDeleteSessionSummaries(t *testing.T) {
 
 func TestIndexSummaryReturnsMetaWriteErrorBeforeSections(t *testing.T) {
 	home := t.TempDir()
-	store := NewStore(nil, t.TempDir(), home)
+	store := &Store{embedder: &fakeMemoryEmbedder{}, projectsRoot: t.TempDir(), home: home}
 	dir := filepath.Join(home, ".lightcode", "summaries", "session-1")
 	if err := os.MkdirAll(filepath.Join(dir, "meta.json"), 0o700); err != nil {
 		t.Fatal(err)
@@ -70,3 +71,112 @@ func TestIndexSummaryReturnsMetaWriteErrorBeforeSections(t *testing.T) {
 		t.Fatalf("00-goal.vec stat error = %v, want not exist", err)
 	}
 }
+
+func TestStoreSaveMemoryWithoutEmbedderReturnsUnavailable(t *testing.T) {
+	store := NewStore(nil, t.TempDir(), t.TempDir())
+	memoriesDir := filepath.Join(t.TempDir(), "memories")
+
+	if _, err := store.SaveMemory(memoriesDir, "Title", "Content"); !errors.Is(err, errEmbedderUnavailable) {
+		t.Fatalf("SaveMemory error = %v, want %v", err, errEmbedderUnavailable)
+	}
+	if entries, err := os.ReadDir(memoriesDir); err == nil && len(entries) != 0 {
+		t.Fatalf("memory files were written with unavailable embedder: %v", entries)
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadDir memoriesDir: %v", err)
+	}
+}
+
+func TestStoreSearchMemoryWithoutEmbedderReturnsUnavailable(t *testing.T) {
+	store := NewStore(nil, t.TempDir(), t.TempDir())
+
+	if _, err := store.SearchMemory("query", "project-1", false, 3); !errors.Is(err, errEmbedderUnavailable) {
+		t.Fatalf("SearchMemory error = %v, want %v", err, errEmbedderUnavailable)
+	}
+}
+
+func TestStoreSearchHistoryWithoutEmbedderReturnsUnavailable(t *testing.T) {
+	store := NewStore(nil, t.TempDir(), t.TempDir())
+
+	if _, err := store.SearchHistory("query", "project-1", false, 3); !errors.Is(err, errEmbedderUnavailable) {
+		t.Fatalf("SearchHistory error = %v, want %v", err, errEmbedderUnavailable)
+	}
+}
+
+func TestStoreIndexSummaryWithoutEmbedderReturnsUnavailable(t *testing.T) {
+	home := t.TempDir()
+	store := NewStore(nil, t.TempDir(), home)
+
+	err := store.IndexSummary("session-1", "project-1", "Project", "## Goal\nbody", "now", "/tmp/compaction.json")
+	if !errors.Is(err, errEmbedderUnavailable) {
+		t.Fatalf("IndexSummary error = %v, want %v", err, errEmbedderUnavailable)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".lightcode", "summaries")); !os.IsNotExist(err) {
+		t.Fatalf("summaries root stat error = %v, want not exist", err)
+	}
+}
+
+func TestStoreIndexSummaryWithUnavailableEmbedderWritesNoPartialFiles(t *testing.T) {
+	home := t.TempDir()
+	store := &Store{
+		embedder:     &fakeMemoryEmbedder{err: errEmbedderUnavailable},
+		projectsRoot: t.TempDir(),
+		home:         home,
+	}
+
+	err := store.IndexSummary("session-1", "project-1", "Project", "## Goal\nbody", "now", "/tmp/compaction.json")
+	if !errors.Is(err, errEmbedderUnavailable) {
+		t.Fatalf("IndexSummary error = %v, want %v", err, errEmbedderUnavailable)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".lightcode", "summaries")); !os.IsNotExist(err) {
+		t.Fatalf("summaries root stat error = %v, want not exist", err)
+	}
+}
+
+func TestStoreReindexWithoutEmbedderReturnsUnavailable(t *testing.T) {
+	store := NewStore(nil, t.TempDir(), t.TempDir())
+
+	if err := store.Reconcile(); !errors.Is(err, errEmbedderUnavailable) {
+		t.Fatalf("Reconcile error = %v, want %v", err, errEmbedderUnavailable)
+	}
+}
+
+func TestStoreReindexWithUnavailableEmbedderReturnsUnavailable(t *testing.T) {
+	projectsRoot := t.TempDir()
+	memoriesDir := filepath.Join(projectsRoot, "project-1", "memories")
+	if err := os.MkdirAll(memoriesDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mdPath := filepath.Join(memoriesDir, "20260626-memory.md")
+	if err := os.WriteFile(mdPath, []byte("---\ntitle: Existing\ncreated_at: now\n---\n\nbody\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{
+		embedder:     &fakeMemoryEmbedder{err: errEmbedderUnavailable},
+		projectsRoot: projectsRoot,
+		home:         t.TempDir(),
+	}
+
+	if err := store.Reconcile(); !errors.Is(err, errEmbedderUnavailable) {
+		t.Fatalf("Reconcile error = %v, want %v", err, errEmbedderUnavailable)
+	}
+	if _, err := os.Stat(strings.TrimSuffix(mdPath, ".md") + ".vec"); !os.IsNotExist(err) {
+		t.Fatalf("vec stat error = %v, want not exist", err)
+	}
+}
+
+type fakeMemoryEmbedder struct {
+	vec []float32
+	err error
+}
+
+func (f *fakeMemoryEmbedder) Embed(string) ([]float32, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.vec != nil {
+		return append([]float32(nil), f.vec...), nil
+	}
+	return []float32{1, 0, 0}, nil
+}
+
+func (f *fakeMemoryEmbedder) Close() {}

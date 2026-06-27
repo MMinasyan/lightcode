@@ -15,6 +15,8 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/memory"
+	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
@@ -167,6 +169,107 @@ func TestAgentSetupWarningsForUnconfiguredStartup(t *testing.T) {
 	warnings := a.CurrentWarnings()
 	if !hasWarningKind(warnings, "setup_no_provider") || !hasWarningKind(warnings, "setup_no_default_model") {
 		t.Fatalf("warnings = %#v, want setup provider/default warnings", warnings)
+	}
+}
+
+func TestAgentDegradedMemoryStartupUsesHomeAndKeepsToolsAvailable(t *testing.T) {
+	t.Setenv("LIGHTCODE_DEGRADED_MEMORY_KEY", "test-key")
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	lightcodeDir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(lightcodeDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{
+  "providers": {
+    "test": {
+      "name": "Test Provider",
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_DEGRADED_MEMORY_KEY" },
+      "discovery": false,
+      "models": { "test-model": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 } }
+    }
+  },
+  "default_model": "test/test-model"
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	projectsRoot := filepath.Join(home, ".lightcode", "projects")
+	absProjectRoot, err := filepath.Abs(projectRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proj, err := project.EnsureForPath(projectsRoot, absProjectRoot)
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	memoriesDir := filepath.Join(projectsRoot, proj.ID, "memories")
+	if err := os.MkdirAll(memoriesDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	staleMemoryPath := filepath.Join(memoriesDir, "20260626-existing.md")
+	if err := os.WriteFile(staleMemoryPath, []byte("---\ntitle: Existing\ncreated_at: 2026-06-26T00:00:00Z\n---\n\nbody\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldNewMemoryEmbedder := newMemoryEmbedder
+	var gotHome string
+	newMemoryEmbedder = func(homeArg string) (*memory.Embedder, error) {
+		gotHome = homeArg
+		return nil, fmt.Errorf("forced embedder failure")
+	}
+	t.Cleanup(func() {
+		newMemoryEmbedder = oldNewMemoryEmbedder
+	})
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	if gotHome != home {
+		t.Fatalf("NewEmbedder home = %q, want %q", gotHome, home)
+	}
+	for _, name := range []string{"save_memory", "search_memory", "search_history"} {
+		if _, ok := a.registry.Get(name); !ok {
+			t.Fatalf("%s not registered", name)
+		}
+		if !a.registry.Advertises(name, nil) {
+			t.Fatalf("%s is not model-visible", name)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.Init(ctx)
+	if !hasWarningKind(a.CurrentWarnings(), "setup_embedder_degraded") {
+		t.Fatalf("warnings = %#v, want setup_embedder_degraded", a.CurrentWarnings())
+	}
+	if _, err := os.Stat(strings.TrimSuffix(staleMemoryPath, ".md") + ".vec"); !os.IsNotExist(err) {
+		t.Fatalf("stale memory vec stat error = %v, want not exist", err)
+	}
+
+	saveTool, _ := a.registry.Get("save_memory")
+	if wrapped, ok := saveTool.(interface{ WrappedTool() tool.Tool }); ok {
+		saveTool = wrapped.WrappedTool()
+	}
+	out, err := saveTool.Execute(context.Background(), map[string]any{"title": "New", "content": "Body"})
+	if err != nil {
+		t.Fatalf("save_memory Execute returned error: %v", err)
+	}
+	if !strings.Contains(out, "memory embedder unavailable") {
+		t.Fatalf("save_memory output = %q, want unavailable error", out)
+	}
+	matches, err := filepath.Glob(filepath.Join(memoriesDir, "*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 || matches[0] != staleMemoryPath {
+		t.Fatalf("memory files after save_memory = %v, want only stale memory", matches)
 	}
 }
 

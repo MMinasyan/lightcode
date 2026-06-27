@@ -3,8 +3,6 @@ package memory
 import (
 	"context"
 	_ "embed"
-	"os"
-	"path/filepath"
 	"sync"
 
 	"github.com/knights-analytics/hugot"
@@ -21,48 +19,41 @@ var modelTokenizer []byte
 var modelConfig []byte
 
 type Embedder struct {
-	mu       sync.Mutex
-	session  *hugot.Session
-	pipeline *pipelines.FeatureExtractionPipeline
-	modelDir string
+	mu        sync.Mutex
+	closeOnce sync.Once
+	session   *hugot.Session
+	pipeline  *pipelines.FeatureExtractionPipeline
+	modelDir  string
 }
 
-func NewEmbedder() (*Embedder, error) {
-	dir, err := os.MkdirTemp("", "lightcode-model-*")
+var (
+	newGoSession                 = hugot.NewGoSession
+	newFeatureExtractionPipeline = func(session *hugot.Session, config hugot.FeatureExtractionConfig) (*pipelines.FeatureExtractionPipeline, error) {
+		return hugot.NewPipeline(session, config)
+	}
+)
+
+func NewEmbedder(home string) (*Embedder, error) {
+	dir, err := ensureEmbeddedModelDir(home)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "model.onnx"), modelOnnx, 0644); err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, err
-	}
-	if err := os.WriteFile(filepath.Join(dir, "tokenizer.json"), modelTokenizer, 0644); err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, err
-	}
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), modelConfig, 0644); err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, err
-	}
 
-	session, err := hugot.NewGoSession(context.Background())
+	session, err := newGoSession(context.Background())
 	if err != nil {
-		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-
 	config := hugot.FeatureExtractionConfig{
 		ModelPath:    dir,
-		Name:         "bge-small",
+		Name:         embeddedModelName,
 		OnnxFilename: "model.onnx",
 		Options: []hugot.FeatureExtractionOption{
 			pipelines.WithNormalization(),
 		},
 	}
-	pipeline, err := hugot.NewPipeline(session, config)
+	pipeline, err := newFeatureExtractionPipeline(session, config)
 	if err != nil {
 		_ = session.Destroy()
-		_ = os.RemoveAll(dir)
 		return nil, err
 	}
 
@@ -76,6 +67,9 @@ func NewEmbedder() (*Embedder, error) {
 func (e *Embedder) Embed(text string) ([]float32, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.pipeline == nil {
+		return nil, errEmbedderUnavailable
+	}
 	result, err := e.pipeline.RunPipeline(context.Background(), []string{text})
 	if err != nil {
 		return nil, err
@@ -84,10 +78,13 @@ func (e *Embedder) Embed(text string) ([]float32, error) {
 }
 
 func (e *Embedder) Close() {
-	if e.session != nil {
-		_ = e.session.Destroy()
-	}
-	if e.modelDir != "" {
-		_ = os.RemoveAll(e.modelDir)
-	}
+	e.closeOnce.Do(func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if e.session != nil {
+			_ = e.session.Destroy()
+			e.session = nil
+			e.pipeline = nil
+		}
+	})
 }

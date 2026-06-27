@@ -2,11 +2,19 @@ package memory
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+var errEmbedderUnavailable = errors.New("memory embedder unavailable")
+
+type memoryEmbedder interface {
+	Embed(text string) ([]float32, error)
+	Close()
+}
 
 type MemoryResult struct {
 	Title     string
@@ -25,21 +33,29 @@ type HistoryResult struct {
 }
 
 type Store struct {
-	embedder     *Embedder
+	embedder     memoryEmbedder
 	projectsRoot string
 	home         string
 }
 
 func NewStore(embedder *Embedder, projectsRoot, home string) *Store {
-	return &Store{embedder: embedder, projectsRoot: projectsRoot, home: home}
+	var e memoryEmbedder
+	if embedder != nil {
+		e = embedder
+	}
+	return &Store{embedder: e, projectsRoot: projectsRoot, home: home}
 }
 
 func (s *Store) SaveMemory(memoriesDir, title, content string) (string, error) {
+	embedder, err := s.requireEmbedder()
+	if err != nil {
+		return "", err
+	}
 	fp, err := WriteMemoryFile(memoriesDir, title, content)
 	if err != nil {
 		return "", err
 	}
-	vec, err := s.embedder.Embed(content)
+	vec, err := embedder.Embed(content)
 	if err != nil {
 		_ = os.Remove(fp)
 		return "", fmt.Errorf("embed memory: %w", err)
@@ -53,7 +69,11 @@ func (s *Store) SaveMemory(memoriesDir, title, content string) (string, error) {
 }
 
 func (s *Store) SearchMemory(query, projectID string, allProjects bool, limit int) ([]MemoryResult, error) {
-	qvec, err := s.embedder.Embed(query)
+	embedder, err := s.requireEmbedder()
+	if err != nil {
+		return nil, err
+	}
+	qvec, err := embedder.Embed(query)
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
@@ -124,6 +144,24 @@ func (s *Store) IndexSummary(sessionID, projectID, projectName, summary, created
 	if len(sections) == 0 {
 		return nil
 	}
+	embedder, err := s.requireEmbedder()
+	if err != nil {
+		return err
+	}
+
+	type indexedSection struct {
+		section Section
+		vec     []float32
+	}
+	indexed := make([]indexedSection, 0, len(sections))
+	for _, sec := range sections {
+		vec, err := embedder.Embed(sec.Content)
+		if err != nil {
+			return fmt.Errorf("embed summary section: %w", err)
+		}
+		indexed = append(indexed, indexedSection{section: sec, vec: vec})
+	}
+
 	dir := filepath.Join(s.summariesRoot(), sessionID)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
@@ -140,18 +178,14 @@ func (s *Store) IndexSummary(sessionID, projectID, projectName, summary, created
 		return fmt.Errorf("write summary meta: %w", err)
 	}
 
-	for i, sec := range sections {
-		baseName := fmt.Sprintf("%02d-%s", i, slugify(sec.Name))
+	for i, item := range indexed {
+		baseName := fmt.Sprintf("%02d-%s", i, slugify(item.section.Name))
 		mdPath := filepath.Join(dir, baseName+".md")
-		if err := os.WriteFile(mdPath, []byte(sec.Content), 0644); err != nil {
+		if err := os.WriteFile(mdPath, []byte(item.section.Content), 0644); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: memory index write: %v\n", err)
 		}
 
-		vec, err := s.embedder.Embed(sec.Content)
-		if err != nil {
-			continue
-		}
-		if err := WriteVec(filepath.Join(dir, baseName+".vec"), vec); err != nil {
+		if err := WriteVec(filepath.Join(dir, baseName+".vec"), item.vec); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: memory index vec: %v\n", err)
 		}
 	}
@@ -166,7 +200,11 @@ type summaryMeta struct {
 }
 
 func (s *Store) SearchHistory(query, projectID string, allProjects bool, limit int) ([]HistoryResult, error) {
-	qvec, err := s.embedder.Embed(query)
+	embedder, err := s.requireEmbedder()
+	if err != nil {
+		return nil, err
+	}
+	qvec, err := embedder.Embed(query)
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
@@ -255,6 +293,10 @@ func (s *Store) DeleteSessionSummaries(sessionID string) error {
 }
 
 func (s *Store) Reconcile() error {
+	embedder, err := s.requireEmbedder()
+	if err != nil {
+		return err
+	}
 	projects, err := os.ReadDir(s.projectsRoot)
 	if err != nil {
 		return nil
@@ -288,8 +330,11 @@ func (s *Store) Reconcile() error {
 			if err != nil {
 				continue
 			}
-			vec, err := s.embedder.Embed(content)
+			vec, err := embedder.Embed(content)
 			if err != nil {
+				if errors.Is(err, errEmbedderUnavailable) {
+					return err
+				}
 				continue
 			}
 			_ = WriteVec(vecPath, vec)
@@ -302,6 +347,13 @@ func (s *Store) Close() {
 	if s.embedder != nil {
 		s.embedder.Close()
 	}
+}
+
+func (s *Store) requireEmbedder() (memoryEmbedder, error) {
+	if s == nil || s.embedder == nil {
+		return nil, errEmbedderUnavailable
+	}
+	return s.embedder, nil
 }
 
 func readProjectName(metaPath string) string {
