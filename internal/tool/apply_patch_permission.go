@@ -29,7 +29,11 @@ func applyPatchPermissionDecision(check CheckFunc, workspaceRoot string, params 
 }
 
 func applyPatchPermissionPlan(check CheckFunc, workspaceRoot string, params map[string]any) (targets []applyPatchTarget, perPath []permission.Decision, aggregate permission.Decision, err error) {
-	_, targets, err = resolveApplyPatchTargets(workspaceRoot, params)
+	return applyPatchPermissionPlanWithOptions(check, workspaceRoot, params, CapabilityOptions{})
+}
+
+func applyPatchPermissionPlanWithOptions(check CheckFunc, workspaceRoot string, params map[string]any, opts CapabilityOptions) (targets []applyPatchTarget, perPath []permission.Decision, aggregate permission.Decision, err error) {
+	_, targets, err = resolveApplyPatchTargetsWithOptions(workspaceRoot, params, opts)
 	if err != nil || len(targets) == 0 {
 		return nil, nil, permission.DecisionAsk, err
 	}

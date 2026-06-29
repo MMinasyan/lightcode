@@ -26,6 +26,7 @@ type StagedExecutor struct {
 	check         CheckFunc
 	ask           AskActionFunc
 	workspaceRoot string
+	options       CapabilityOptions
 }
 
 // NewStagedExecutor creates a staged batch executor.
@@ -34,6 +35,10 @@ func NewStagedExecutor(store SnapshotStore, tracker *FileTracker, cfg config.Too
 }
 
 func NewStagedExecutorAtRoot(store SnapshotStore, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string, check CheckFunc, ask AskActionFunc) *StagedExecutor {
+	return NewStagedExecutorAtRootWithOptions(store, tracker, cfg, workspaceRoot, check, ask, CapabilityOptions{})
+}
+
+func NewStagedExecutorAtRootWithOptions(store SnapshotStore, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string, check CheckFunc, ask AskActionFunc, opts CapabilityOptions) *StagedExecutor {
 	return &StagedExecutor{
 		store:         store,
 		tracker:       tracker,
@@ -41,6 +46,7 @@ func NewStagedExecutorAtRoot(store SnapshotStore, tracker *FileTracker, cfg conf
 		check:         check,
 		ask:           ask,
 		workspaceRoot: workspaceRoot,
+		options:       opts,
 	}
 }
 
@@ -84,7 +90,7 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 			}
 		}
 
-		execParams, err := resolveFileToolParamsAtRoot(e.workspaceRoot, call.ToolName, call.Params)
+		execParams, err := resolveFileToolParamsAtRootWithOptions(e.workspaceRoot, call.ToolName, call.Params, e.options)
 		if err != nil {
 			results[i].Error = fmt.Sprintf("%s: resolve path: %v", call.ToolName, err)
 			continue
@@ -103,7 +109,7 @@ func (e *StagedExecutor) ExecutePending(ctx context.Context, staged []StagedCall
 		var targets []applyPatchTarget
 		if call.ToolName == "apply_patch" {
 			var err error
-			targets, _, decision, err = applyPatchPermissionPlan(e.check, e.workspaceRoot, execParams)
+			targets, _, decision, err = applyPatchPermissionPlanWithOptions(e.check, e.workspaceRoot, execParams, e.options)
 			if err != nil {
 				results[i].Error = err.Error()
 				continue

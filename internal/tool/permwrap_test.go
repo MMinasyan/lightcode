@@ -262,6 +262,251 @@ func TestPermWrappedInjectsCanonicalPathForInnerFileTool(t *testing.T) {
 	}
 }
 
+func TestPermWrappedWriteDirConfinementForFileTools(t *testing.T) {
+	root := t.TempDir()
+	writeDir := t.TempDir()
+	inside := filepath.Join(writeDir, "inside.txt")
+	outside := filepath.Join(root, "outside.txt")
+
+	for _, name := range []string{"write_file", "edit_file"} {
+		t.Run(name+" inside write_dir", func(t *testing.T) {
+			checkCalls := 0
+			inner := &recordingTool{name: name, result: "ok"}
+			wrapped := WrapWithPermissionAtRootWithOptions(inner, root, func(toolName, arg string) permission.Decision {
+				checkCalls++
+				if toolName != name || arg != inside {
+					t.Fatalf("check = (%q, %q), want (%q, %q)", toolName, arg, name, inside)
+				}
+				return permission.DecisionAllow
+			}, denyIfAsked(t), CapabilityOptions{WriteDir: writeDir})
+
+			if _, err := wrapped.Execute(context.Background(), map[string]any{"path": inside}); err != nil {
+				t.Fatalf("Execute inside write_dir error = %v", err)
+			}
+			if checkCalls != 1 || inner.calls != 1 {
+				t.Fatalf("checkCalls=%d inner.calls=%d, want 1/1", checkCalls, inner.calls)
+			}
+		})
+
+		t.Run(name+" outside write_dir", func(t *testing.T) {
+			checkCalls := 0
+			inner := &recordingTool{name: name, result: "ok"}
+			wrapped := WrapWithPermissionAtRootWithOptions(inner, root, func(string, string) permission.Decision {
+				checkCalls++
+				return permission.DecisionAllow
+			}, denyIfAsked(t), CapabilityOptions{WriteDir: writeDir})
+
+			_, err := wrapped.Execute(context.Background(), map[string]any{"path": outside})
+			if err == nil || !strings.Contains(err.Error(), "outside write_dir") {
+				t.Fatalf("Execute outside write_dir error = %v, want confinement error", err)
+			}
+			if checkCalls != 0 || inner.calls != 0 {
+				t.Fatalf("checkCalls=%d inner.calls=%d, want 0/0 before permission or execution", checkCalls, inner.calls)
+			}
+		})
+	}
+}
+
+func TestPermWrappedWriteDirConfinementForApplyPatchTargets(t *testing.T) {
+	root := t.TempDir()
+	writeDir := t.TempDir()
+	inside := filepath.Join(writeDir, "inside.txt")
+	outside := filepath.Join(root, "outside.txt")
+	insidePatch := "*** Begin Patch\n*** Add File: " + inside + "\n+x\n*** End Patch"
+	outsidePatch := "*** Begin Patch\n*** Add File: " + outside + "\n+x\n*** End Patch"
+
+	checkCalls := 0
+	inner := &recordingTool{name: "apply_patch", result: "ok"}
+	wrapped := WrapWithPermissionAtRootWithOptions(inner, root, func(toolName, arg string) permission.Decision {
+		checkCalls++
+		if toolName != "apply_patch" || arg != inside {
+			t.Fatalf("check = (%q, %q), want apply_patch/%q", toolName, arg, inside)
+		}
+		return permission.DecisionAllow
+	}, denyIfAsked(t), CapabilityOptions{WriteDir: writeDir})
+
+	if _, err := wrapped.Execute(context.Background(), map[string]any{"input": insidePatch}); err != nil {
+		t.Fatalf("Execute inside write_dir error = %v", err)
+	}
+	if checkCalls != 1 || inner.calls != 1 {
+		t.Fatalf("checkCalls=%d inner.calls=%d, want 1/1", checkCalls, inner.calls)
+	}
+
+	_, err := wrapped.Execute(context.Background(), map[string]any{"input": outsidePatch})
+	if err == nil || !strings.Contains(err.Error(), "outside write_dir") {
+		t.Fatalf("Execute outside write_dir error = %v, want confinement error", err)
+	}
+	if checkCalls != 1 || inner.calls != 1 {
+		t.Fatalf("outside write_dir reached permission or execution: checkCalls=%d inner.calls=%d", checkCalls, inner.calls)
+	}
+}
+
+func TestWriteDirConfinementAllowsActualWritesOutsideProject(t *testing.T) {
+	root := t.TempDir()
+	writeDir := t.TempDir()
+	writeTarget := filepath.Join(writeDir, "write.txt")
+	patchTarget := filepath.Join(writeDir, "patch.txt")
+	opts := CapabilityOptions{WriteDir: writeDir}
+	allow := func(string, string) permission.Decision { return permission.DecisionAllow }
+	if err := os.WriteFile(writeTarget, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := &recordingSnapshotStore{turn: 1, before: map[string]string{}}
+	writeTool := WrapWithPermissionAtRootWithOptions(NewWriteFileWithSnapshotAtRoot(store, nil, config.ToolsConfig{}, root), root, allow, denyIfAsked(t), opts)
+	if _, err := writeTool.Execute(context.Background(), map[string]any{"path": writeTarget, "content": "written"}); err != nil {
+		t.Fatalf("write_file inside outside-project write_dir error = %v", err)
+	}
+	if data, err := os.ReadFile(writeTarget); err != nil || string(data) != "written" {
+		t.Fatalf("write target content = %q, %v; want written", data, err)
+	}
+
+	patchTool := WrapWithPermissionAtRootWithOptions(NewApplyPatchWithSnapshotAtRoot(nil, nil, config.ToolsConfig{}, root), root, allow, denyIfAsked(t), opts)
+	input := "*** Begin Patch\n*** Add File: " + patchTarget + "\n+patched\n*** End Patch"
+	if _, err := patchTool.Execute(context.Background(), map[string]any{"input": input}); err != nil {
+		t.Fatalf("apply_patch inside outside-project write_dir error = %v", err)
+	}
+	if data, err := os.ReadFile(patchTarget); err != nil || string(data) != "patched" {
+		t.Fatalf("patch target content = %q, %v; want patched", data, err)
+	}
+}
+
+func TestPermWrappedWriteDirConfinementValidatesStagedBeforeQueue(t *testing.T) {
+	root := t.TempDir()
+	writeDir := t.TempDir()
+	outside := filepath.Join(root, "outside.txt")
+	registry := NewRegistry()
+	registry.Register(WrapWithPermissionAtRootWithOptions(NewWriteFileWithSnapshotAtRoot(nil, nil, config.ToolsConfig{}, root), root, func(string, string) permission.Decision {
+		t.Fatal("permission check called during staged validation")
+		return permission.DecisionAllow
+	}, nil, CapabilityOptions{WriteDir: writeDir}))
+
+	stageable, ok := registry.StageableTool("write_file")
+	if !ok {
+		t.Fatal("wrapped write_file did not expose staged validation")
+	}
+	args, err := json.Marshal(map[string]any{"path": outside, "content": "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = stageable.ValidateStaged(context.Background(), args)
+	if err == nil || !strings.Contains(err.Error(), "outside write_dir") {
+		t.Fatalf("ValidateStaged outside write_dir error = %v, want confinement error", err)
+	}
+}
+
+func TestPermWrappedWriteDirConfinementValidatesStagedApplyPatchTargets(t *testing.T) {
+	root := t.TempDir()
+	writeDir := t.TempDir()
+	outside := filepath.Join(root, "outside.txt")
+	registry := NewRegistry()
+	registry.Register(WrapWithPermissionAtRootWithOptions(NewApplyPatchWithSnapshotAtRoot(nil, nil, config.ToolsConfig{}, root), root, func(string, string) permission.Decision {
+		t.Fatal("permission check called during staged validation")
+		return permission.DecisionAllow
+	}, nil, CapabilityOptions{WriteDir: writeDir}))
+
+	stageable, ok := registry.StageableTool("apply_patch")
+	if !ok {
+		t.Fatal("wrapped apply_patch did not expose staged validation")
+	}
+	args, err := json.Marshal(map[string]any{"input": "*** Begin Patch\n*** Add File: " + outside + "\n+x\n*** End Patch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = stageable.ValidateStaged(context.Background(), args)
+	if err == nil || !strings.Contains(err.Error(), "outside write_dir") {
+		t.Fatalf("ValidateStaged outside write_dir error = %v, want confinement error", err)
+	}
+}
+
+func TestWriteDirConfinementCanonicalBypassMatrix(t *testing.T) {
+	root := t.TempDir()
+	writeDir := filepath.Join(root, "write")
+	outsideDir := filepath.Join(root, "outside")
+	if err := os.MkdirAll(writeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkOut := filepath.Join(writeDir, "link-out")
+	if err := os.Symlink(outsideDir, linkOut); err != nil {
+		t.Fatal(err)
+	}
+
+	pathSep := string(os.PathSeparator)
+	dotdotEscape := writeDir + pathSep + ".." + pathSep + "outside" + pathSep + "dotdot.txt"
+	cases := []struct {
+		name      string
+		path      string
+		wantAllow bool
+	}{
+		{name: "nearest allowed sibling inside write_dir", path: filepath.Join(writeDir, "allowed.txt"), wantAllow: true},
+		{name: "absolute outside target", path: filepath.Join(outsideDir, "absolute.txt")},
+		{name: "dotdot escape outside write_dir", path: dotdotEscape},
+		{name: "symlink escape outside write_dir", path: filepath.Join(linkOut, "symlink.txt")},
+	}
+
+	for _, toolName := range []string{"write_file", "edit_file", "apply_patch"} {
+		for _, tc := range cases {
+			t.Run(toolName+" immediate "+tc.name, func(t *testing.T) {
+				checkCalls := 0
+				inner := &recordingTool{name: toolName, result: "ok"}
+				wrapped := WrapWithPermissionAtRootWithOptions(inner, root, func(name, arg string) permission.Decision {
+					checkCalls++
+					if name != toolName {
+						t.Fatalf("check tool = %q, want %q", name, toolName)
+					}
+					return permission.DecisionAllow
+				}, denyIfAsked(t), CapabilityOptions{WriteDir: writeDir})
+
+				_, err := wrapped.Execute(context.Background(), immediateWriteDirParams(toolName, tc.path))
+				if tc.wantAllow {
+					if err != nil {
+						t.Fatalf("Execute inside write_dir error = %v", err)
+					}
+					if checkCalls != 1 || inner.calls != 1 {
+						t.Fatalf("checkCalls=%d inner.calls=%d, want 1/1", checkCalls, inner.calls)
+					}
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), "outside write_dir") {
+					t.Fatalf("Execute escape error = %v, want confinement error", err)
+				}
+				if checkCalls != 0 || inner.calls != 0 {
+					t.Fatalf("escape reached permission or execution: checkCalls=%d inner.calls=%d", checkCalls, inner.calls)
+				}
+			})
+
+			t.Run(toolName+" staged "+tc.name, func(t *testing.T) {
+				registry := NewRegistry()
+				registry.Register(WrapWithPermissionAtRootWithOptions(stageableWriteDirTool(toolName, root), root, func(string, string) permission.Decision {
+					t.Fatal("permission check called during staged validation")
+					return permission.DecisionAllow
+				}, nil, CapabilityOptions{WriteDir: writeDir}))
+				stageable, ok := registry.StageableTool(toolName)
+				if !ok {
+					t.Fatalf("%s did not expose staged validation", toolName)
+				}
+				args, err := json.Marshal(stagedWriteDirParams(toolName, tc.path))
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = stageable.ValidateStaged(context.Background(), args)
+				if tc.wantAllow {
+					if err != nil {
+						t.Fatalf("ValidateStaged inside write_dir error = %v", err)
+					}
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), "outside write_dir") {
+					t.Fatalf("ValidateStaged escape error = %v, want confinement error", err)
+				}
+			})
+		}
+	}
+}
+
 func TestModelSuppliedCanonicalPathParamIsIgnored(t *testing.T) {
 	root := t.TempDir()
 	realPath := filepath.Join(root, "real.txt")
@@ -392,6 +637,43 @@ func (t *recordingTool) Execute(_ context.Context, params map[string]any) (strin
 	t.calls++
 	t.lastParams = params
 	return t.result, t.err
+}
+
+func immediateWriteDirParams(toolName, path string) map[string]any {
+	if toolName == "apply_patch" {
+		return map[string]any{"input": addFilePatch(path)}
+	}
+	return map[string]any{"path": path}
+}
+
+func stagedWriteDirParams(toolName, path string) map[string]any {
+	switch toolName {
+	case "write_file":
+		return map[string]any{"path": path, "content": "x"}
+	case "edit_file":
+		return map[string]any{"path": path, "old_string": "old", "new_string": "new"}
+	case "apply_patch":
+		return map[string]any{"input": addFilePatch(path)}
+	default:
+		return map[string]any{"path": path}
+	}
+}
+
+func addFilePatch(path string) string {
+	return "*** Begin Patch\n*** Add File: " + path + "\n+x\n*** End Patch"
+}
+
+func stageableWriteDirTool(toolName, root string) Tool {
+	switch toolName {
+	case "write_file":
+		return NewWriteFileWithSnapshotAtRoot(nil, nil, config.ToolsConfig{}, root)
+	case "edit_file":
+		return NewEditFileWithSnapshotAtRoot(nil, nil, config.ToolsConfig{}, root)
+	case "apply_patch":
+		return NewApplyPatchWithSnapshotAtRoot(nil, nil, config.ToolsConfig{}, root)
+	default:
+		return &recordingTool{name: toolName}
+	}
 }
 
 func rulesCheck(root string, rules permission.Rules) CheckFunc {

@@ -233,7 +233,7 @@ func TestRunCommandCancellationOutput(t *testing.T) {
 }
 
 func TestRunCommandBackgroundDelegatesToProcessManager(t *testing.T) {
-	procMgr := &recordingProcessManager{id: "proc-1"}
+	procMgr := &recordingProcessManager{id: "proc-2", activeIDs: []string{"proc-1", "proc-2"}}
 	tool := NewRunCommand(config.ToolsConfig{CommandTimeout: 3}, t.TempDir(), procMgr)
 
 	result, err := tool.Execute(context.Background(), map[string]any{
@@ -244,11 +244,29 @@ func TestRunCommandBackgroundDelegatesToProcessManager(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute error = %v", err)
 	}
-	if result != "Command running in background with ID: proc-1" {
+	want := "Command running in the background with ID: `proc-2`. You will be notified when it finishes. If your next steps do not depend on its output, continue with them; otherwise use sleep to wait and process to read the output.\nRunning in the background: `proc-1, proc-2`."
+	if result != want {
 		t.Fatalf("Execute result = %q, want background id", result)
 	}
 	if procMgr.command != "sleep 10" || procMgr.timeoutSec != 4 {
 		t.Fatalf("ProcessManager call = (%q, %d), want command and timeout override", procMgr.command, procMgr.timeoutSec)
+	}
+}
+
+func TestRunCommandBackgroundUsesEmptyActiveListFromLister(t *testing.T) {
+	procMgr := &recordingProcessManager{id: "proc-1", activeIDs: []string{}}
+	tool := NewRunCommand(config.ToolsConfig{CommandTimeout: 3}, t.TempDir(), procMgr)
+
+	result, err := tool.Execute(context.Background(), map[string]any{
+		"command":    "true",
+		"background": true,
+	})
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
+	}
+	want := "Command running in the background with ID: `proc-1`. You will be notified when it finishes. If your next steps do not depend on its output, continue with them; otherwise use sleep to wait and process to read the output.\nRunning in the background: ``."
+	if result != want {
+		t.Fatalf("Execute result = %q, want empty active list", result)
 	}
 }
 
@@ -381,12 +399,17 @@ type recordingProcessManager struct {
 	err        error
 	command    string
 	timeoutSec int
+	activeIDs  []string
 }
 
 func (m *recordingProcessManager) Start(command string, timeoutSec int) (string, error) {
 	m.command = command
 	m.timeoutSec = timeoutSec
 	return m.id, m.err
+}
+
+func (m *recordingProcessManager) ActiveIDs() []string {
+	return append([]string(nil), m.activeIDs...)
 }
 
 func extractSpillPath(t *testing.T, result string) string {

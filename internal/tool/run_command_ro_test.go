@@ -14,16 +14,27 @@ import (
 	"github.com/MMinasyan/lightcode/internal/config"
 )
 
-func TestReadOnlyRunCommandRejectsBackgroundParamBeforeProcessManager(t *testing.T) {
-	procMgr := &recordingProcessManager{id: "proc-1"}
+func TestReadOnlyRunCommandAllowsBackgroundParam(t *testing.T) {
+	procMgr := &recordingProcessManager{id: "proc-1", activeIDs: []string{"proc-1"}}
 	tool := NewReadOnlyRunCommand(NewRunCommand(config.ToolsConfig{CommandTimeout: 2}, t.TempDir(), procMgr))
 
-	_, err := tool.Execute(context.Background(), map[string]any{"command": "pwd", "background": true})
-	if err == nil || !strings.Contains(err.Error(), "background") || !strings.Contains(err.Error(), "read-only") {
-		t.Fatalf("Execute background error = %v, want read-only background rejection", err)
+	result, err := tool.Execute(context.Background(), map[string]any{"command": "pwd", "background": true, "timeout": float64(4)})
+	if err != nil {
+		t.Fatalf("Execute background error = %v", err)
 	}
-	if procMgr.command != "" {
-		t.Fatalf("background command started as %q, want no process start", procMgr.command)
+	want := "Command running in the background with ID: `proc-1`. You will be notified when it finishes. If your next steps do not depend on its output, continue with them; otherwise use sleep to wait and process to read the output.\nRunning in the background: `proc-1`."
+	if result != want {
+		t.Fatalf("Execute background result = %q, want %q", result, want)
+	}
+	if procMgr.command != "pwd" || procMgr.timeoutSec != 4 {
+		t.Fatalf("background process = (%q, %d), want sanitized command and timeout", procMgr.command, procMgr.timeoutSec)
+	}
+}
+
+func TestReadOnlyRunCommandDescriptionMatchesDecisionText(t *testing.T) {
+	tool := NewReadOnlyRunCommand(NewRunCommand(config.ToolsConfig{}, t.TempDir(), nil))
+	if got := tool.Description(); got != readOnlyRunCommandDescription {
+		t.Fatalf("Description = %q, want decision text", got)
 	}
 }
 
@@ -176,10 +187,25 @@ func TestReadOnlyRunCommandRejectsUnsafeCommands(t *testing.T) {
 	for _, command := range tests {
 		t.Run(command, func(t *testing.T) {
 			_, err := tool.Execute(context.Background(), map[string]any{"command": command})
-			if err == nil || !strings.Contains(err.Error(), "command not permitted in read-only mode") {
+			if err == nil || err.Error() != readOnlyRunCommandRejected {
 				t.Fatalf("Execute(%q) error = %v, want read-only rejection", command, err)
 			}
 		})
+	}
+}
+
+func TestReadOnlyRunCommandRejectsWithoutEchoingCommand(t *testing.T) {
+	tool := NewReadOnlyRunCommand(NewRunCommand(config.ToolsConfig{CommandTimeout: 2}, t.TempDir(), nil))
+	command := "rm -rf /tmp/lightcode-very-specific-rejected-command"
+	_, err := tool.Execute(context.Background(), map[string]any{"command": command})
+	if err == nil {
+		t.Fatal("Execute succeeded, want rejection")
+	}
+	if err.Error() != readOnlyRunCommandRejected {
+		t.Fatalf("Execute error = %q, want decision text", err.Error())
+	}
+	if strings.Contains(err.Error(), "very-specific-rejected-command") {
+		t.Fatalf("Execute error echoed rejected command: %q", err.Error())
 	}
 }
 

@@ -390,7 +390,9 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 	}
 	lp.SetStore(childStore)
 	lp.SetUsageRecorder(t.usageRecorder)
-	pendingExecutor := tool.NewStagedExecutorAtRoot(scope.snapshotStore(), scope.tracker, t.toolsConfig, scope.workspaceRoot, t.permissionCheck(), t.permissionAskAction())
+	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(scope.snapshotStore(), scope.tracker, t.toolsConfig, scope.workspaceRoot, t.permissionCheck(), t.permissionAskAction(), tool.CapabilityOptions{
+		WriteDir: taskToolExposure(at).writeDir,
+	})
 	lp.SetPendingExecutor(pendingExecutor)
 	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 
@@ -409,9 +411,11 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 
 func (t *taskTool) buildRegistry(at agentcfg.Resolved, scope parentMutationScope, procMgr *process.Manager) *tool.Registry {
 	root := scope.workspaceRoot
-	core := tool.CoreTools(scope.snapshotStore(), scope.tracker, t.toolsConfig, root, t.permissionCheck(), t.permissionAsk())
-	reg := tool.NewRegistry()
 	exposure := taskToolExposure(at)
+	core := tool.CoreToolsWithOptions(scope.snapshotStore(), scope.tracker, t.toolsConfig, root, t.permissionCheck(), t.permissionAsk(), tool.CapabilityOptions{
+		WriteDir: exposure.writeDir,
+	})
+	reg := tool.NewRegistry()
 	for _, name := range exposure.tools {
 		if name == "task" {
 			continue
@@ -612,12 +616,13 @@ func (t *taskTool) permissionAskAction() tool.AskActionFunc {
 }
 
 func isReadOnlyType(at agentcfg.Resolved) bool {
-	return taskToolExposure(at).readonly
+	return at.Readonly
 }
 
 type taskExposure struct {
 	tools    []string
 	readonly bool
+	writeDir string
 }
 
 func taskToolExposure(at agentcfg.Resolved) taskExposure {
@@ -636,20 +641,12 @@ func taskToolExposure(at agentcfg.Resolved) taskExposure {
 		tools = removeTools(tools, "diagnostics", "workspace_symbol")
 	}
 
-	readonly := at.Readonly || toolsInferReadOnly(tools)
-	if readonly {
-		tools = removeTools(tools, "write_file", "edit_file", "apply_patch", "execute_pending")
+	readonly := at.Readonly
+	writeDir := strings.TrimSpace(at.WriteDir)
+	if readonly && writeDir == "" {
+		tools = removeTools(tools, "write_file", "edit_file", "apply_patch")
 	}
-	return taskExposure{tools: tools, readonly: readonly}
-}
-
-func toolsInferReadOnly(tools []string) bool {
-	for _, name := range tools {
-		if name == "write_file" || name == "edit_file" {
-			return false
-		}
-	}
-	return true
+	return taskExposure{tools: tools, readonly: readonly, writeDir: writeDir}
 }
 
 func appendToolIfMissing(tools []string, name string) []string {

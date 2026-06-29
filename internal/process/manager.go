@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os/exec"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -321,6 +322,26 @@ func (m *Manager) List() string {
 		return "No background processes."
 	}
 	return result
+}
+
+func (m *Manager) ActiveIDs() []string {
+	sessionID := m.currentSessionID()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := make([]string, 0, len(m.procs))
+	for id, cs := range m.procs {
+		if cs.SessionID != sessionID {
+			continue
+		}
+		cs.mu.Lock()
+		running := !cs.exited
+		cs.mu.Unlock()
+		if running {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // KillAll terminates all running background processes.

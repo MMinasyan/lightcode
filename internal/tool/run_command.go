@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +17,10 @@ import (
 // by the agent. May be nil if background process support is not loaded.
 type ProcessManager interface {
 	Start(command string, timeoutSec int) (id string, err error)
+}
+
+type activeProcessLister interface {
+	ActiveIDs() []string
 }
 
 // RunCommand implements the run_command tool.
@@ -48,7 +53,7 @@ func (*RunCommand) Description() string {
 	return `Executes a shell command and returns combined stdout and stderr.
 - Each call starts a fresh shell in the project root. Environment variables, aliases, and working directory do not persist between calls. Use "cd /path && command" if you need a different working directory.
 - Foreground commands use the default timeout. Background commands run until they exit, are killed, or reach an explicit timeout parameter.
-- For long-running commands like dev servers, file watchers, or test suites that run continuously, set background=true. It returns immediately with a process ID. You will be notified when it finishes. If you stop now, you will not be able to do anything until it completed. If your next steps do not depend on its output, continue with them while it runs. To read its output while it is still running, use the sleep tool to wait, then the process tool to read the output. To kill it, use the process tool.
+- For commands that may run for a long time, keep producing output, wait on external state, and are not needed before your next step, set background=true. It returns immediately with a process ID. You will be notified when it finishes. To read output while it is still running, use sleep to wait, then process to read the output. To kill it, use process. Do not use background=true for commands that will probably finish in a few seconds.
 - Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use <EDIT FILE OR WRITE FILE>.`
 }
 
@@ -105,7 +110,11 @@ func (r *RunCommand) runBackground(ctx context.Context, command string, timeoutS
 	if err != nil {
 		return "", fmt.Errorf("run_command: background start: %w", err)
 	}
-	return fmt.Sprintf("Command running in background with ID: %s", id), nil
+	active := []string{id}
+	if lister, ok := r.procMgr.(activeProcessLister); ok {
+		active = lister.ActiveIDs()
+	}
+	return fmt.Sprintf("Command running in the background with ID: `%s`. You will be notified when it finishes. If your next steps do not depend on its output, continue with them; otherwise use sleep to wait and process to read the output.\nRunning in the background: `%s`.", id, strings.Join(active, ", ")), nil
 }
 
 func (r *RunCommand) runForeground(ctx context.Context, command string, timeoutSec int) (string, error) {

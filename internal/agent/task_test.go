@@ -232,29 +232,53 @@ func TestTaskToolAgentTypeResolutionInheritsPrimaryModel(t *testing.T) {
 
 func TestTaskToolReadOnlyAndRegistryRouting(t *testing.T) {
 	cases := []struct {
-		name  string
-		tools []string
-		want  bool
+		name string
+		at   agentcfg.Resolved
+		want bool
 	}{
-		{name: "read only", tools: []string{"read_file", "run_command"}, want: true},
-		{name: "write file", tools: []string{"read_file", "write_file"}, want: false},
-		{name: "edit file", tools: []string{"edit_file"}, want: false},
+		{name: "explicit read only", at: agentcfg.Resolved{Tools: []string{"read_file", "run_command"}, Readonly: true}, want: true},
+		{name: "tools do not infer read only", at: agentcfg.Resolved{Tools: []string{"read_file", "run_command"}}, want: false},
+		{name: "write file", at: agentcfg.Resolved{Tools: []string{"read_file", "write_file"}}, want: false},
+		{name: "edit file", at: agentcfg.Resolved{Tools: []string{"edit_file"}}, want: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isReadOnlyType(taskResolvedType(tc.tools)); got != tc.want {
-				t.Fatalf("isReadOnlyType(%v) = %v, want %v", tc.tools, got, tc.want)
+			if got := isReadOnlyType(tc.at); got != tc.want {
+				t.Fatalf("isReadOnlyType(%+v) = %v, want %v", tc.at, got, tc.want)
 			}
 		})
 	}
 
 	task := &taskTool{}
-	registry := task.buildRegistry(taskResolvedType([]string{"read_file", "task"}), parentMutationScope{}, nil)
+	registry := task.buildRegistry(agentcfg.Resolved{Tools: []string{"read_file", "task"}, Readonly: true}, parentMutationScope{}, nil)
 	if _, ok := registry.Get("read_file"); !ok {
 		t.Fatal("buildRegistry missing allowed read_file tool")
 	}
 	if _, ok := registry.Get("task"); ok {
 		t.Fatal("buildRegistry included recursive task tool")
+	}
+}
+
+func TestTaskToolWriteDirKeepsWriteToolsConfinedAndRunCommandReadOnly(t *testing.T) {
+	writeDir := t.TempDir()
+	task := &taskTool{
+		check: func(string, string) permission.Decision { return permission.DecisionAllow },
+	}
+	at := agentcfg.Resolved{
+		Tools:    []string{"write_file", "edit_file", "apply_patch", "execute_pending", "run_command"},
+		Readonly: true,
+		WriteDir: writeDir,
+	}
+
+	registry := task.buildRegistry(at, parentMutationScope{}, nil)
+	for _, name := range []string{"write_file", "edit_file", "apply_patch", "execute_pending", "run_command"} {
+		if _, ok := registry.Get(name); !ok {
+			t.Fatalf("write_dir registry missing %s; names=%v", name, taskRegistryToolNames(registry))
+		}
+	}
+	runCommand, _ := registry.Get("run_command")
+	if _, err := runCommand.Execute(context.Background(), map[string]any{"command": "touch should-not-run"}); err == nil {
+		t.Fatal("write_dir read-only run_command accepted a write-style command; want read-only rejection")
 	}
 }
 
@@ -389,7 +413,7 @@ func TestTaskToolWrapsReadOnlyRunCommandWithParentPermission(t *testing.T) {
 		},
 	}
 
-	registry := task.buildRegistry(taskResolvedType([]string{"run_command"}), parentMutationScope{}, nil)
+	registry := task.buildRegistry(agentcfg.Resolved{Tools: []string{"run_command"}, Readonly: true}, parentMutationScope{}, nil)
 	runCommand, ok := registry.Get("run_command")
 	if !ok {
 		t.Fatal("buildRegistry missing run_command")
@@ -421,7 +445,7 @@ func TestTaskToolReadOnlyRunCommandCanAskAndExecute(t *testing.T) {
 		},
 	}
 
-	registry := task.buildRegistry(taskResolvedType([]string{"run_command"}), parentMutationScope{}, nil)
+	registry := task.buildRegistry(agentcfg.Resolved{Tools: []string{"run_command"}, Readonly: true}, parentMutationScope{}, nil)
 	runCommand, ok := registry.Get("run_command")
 	if !ok {
 		t.Fatal("buildRegistry missing run_command")
@@ -445,7 +469,7 @@ func TestTaskToolReadOnlyRunCommandCanAskAndExecute(t *testing.T) {
 func TestTaskToolReadOnlyRunCommandFailsClosedWithoutPermissionGate(t *testing.T) {
 	task := &taskTool{}
 
-	registry := task.buildRegistry(taskResolvedType([]string{"run_command"}), parentMutationScope{}, nil)
+	registry := task.buildRegistry(agentcfg.Resolved{Tools: []string{"run_command"}, Readonly: true}, parentMutationScope{}, nil)
 	runCommand, ok := registry.Get("run_command")
 	if !ok {
 		t.Fatal("buildRegistry missing run_command")

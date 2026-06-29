@@ -36,6 +36,10 @@ func (applyPatchReceiptValue) String() string { return "<internal apply_patch ap
 func (applyPatchReceiptValue) GoString() string { return "applyPatchReceiptValue{}" }
 
 func resolveApplyPatchTargets(root string, params map[string]any) (*patch, []applyPatchTarget, error) {
+	return resolveApplyPatchTargetsWithOptions(root, params, CapabilityOptions{})
+}
+
+func resolveApplyPatchTargetsWithOptions(root string, params map[string]any, opts CapabilityOptions) (*patch, []applyPatchTarget, error) {
 	input, _ := params["input"].(string)
 	p, err := parsePatch(input)
 	if err != nil {
@@ -58,10 +62,16 @@ func resolveApplyPatchTargets(root string, params map[string]any) (*patch, []app
 		if err != nil {
 			return nil, nil, err
 		}
+		if err := checkWriteDirTarget(root, "apply_patch", target.CanonicalPath, opts); err != nil {
+			return nil, nil, err
+		}
 		targets = append(targets, target)
 		if op.movePath != "" {
 			target, err := resolveApplyPatchTarget(root, op.movePath, applyPatchTargetMoveDest, true)
 			if err != nil {
+				return nil, nil, err
+			}
+			if err := checkWriteDirTarget(root, "apply_patch", target.CanonicalPath, opts); err != nil {
 				return nil, nil, err
 			}
 			targets = append(targets, target)

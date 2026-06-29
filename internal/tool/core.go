@@ -19,7 +19,19 @@ func CoreTools(
 	check CheckFunc,
 	ask AskFunc,
 ) map[string]Tool {
-	tools := CoreToolList(store, tracker, cfg, root, check, ask)
+	return CoreToolsWithOptions(store, tracker, cfg, root, check, ask, CapabilityOptions{})
+}
+
+func CoreToolsWithOptions(
+	store SnapshotStore,
+	tracker *FileTracker,
+	cfg config.ToolsConfig,
+	root string,
+	check CheckFunc,
+	ask AskFunc,
+	opts CapabilityOptions,
+) map[string]Tool {
+	tools := CoreToolListWithOptions(store, tracker, cfg, root, check, ask, opts)
 	out := make(map[string]Tool, len(tools))
 	for _, tool := range tools {
 		out[tool.Name()] = tool
@@ -35,10 +47,22 @@ func CoreToolList(
 	check CheckFunc,
 	ask AskFunc,
 ) []Tool {
+	return CoreToolListWithOptions(store, tracker, cfg, root, check, ask, CapabilityOptions{})
+}
+
+func CoreToolListWithOptions(
+	store SnapshotStore,
+	tracker *FileTracker,
+	cfg config.ToolsConfig,
+	root string,
+	check CheckFunc,
+	ask AskFunc,
+	opts CapabilityOptions,
+) []Tool {
 	return []Tool{
 		WrapWithPermissionAtRoot(NewReadFileAtRoot(cfg, tracker, root), root, check, ask),
-		WrapWithPermissionAtRoot(NewWriteFileWithSnapshotAtRoot(store, tracker, cfg, root), root, check, ask),
-		WrapWithPermissionAtRoot(NewEditFileWithSnapshotAtRoot(store, tracker, cfg, root), root, check, ask),
-		WrapWithPermissionAtRoot(NewApplyPatchWithSnapshotAtRoot(store, tracker, cfg, root), root, check, ask),
+		WrapWithPermissionAtRootWithOptions(NewWriteFileWithSnapshotAtRoot(store, tracker, cfg, root), root, check, ask, opts),
+		WrapWithPermissionAtRootWithOptions(NewEditFileWithSnapshotAtRoot(store, tracker, cfg, root), root, check, ask, opts),
+		WrapWithPermissionAtRootWithOptions(NewApplyPatchWithSnapshotAtRoot(store, tracker, cfg, root), root, check, ask, opts),
 	}
 }

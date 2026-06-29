@@ -154,6 +154,10 @@ func (r agentUsageRecorder) RecordUsage(ev loop.Event) {
 
 var newMemoryEmbedder = memory.NewEmbedder
 
+func isAgentWriteTool(name string) bool {
+	return name == "write_file" || name == "edit_file" || name == "apply_patch"
+}
+
 // New constructs an Agent from the given config. It creates the
 // provider client, tool registry, permission gate, snapshot store,
 // and loop. Call Init after setting up the event handler.
@@ -255,8 +259,14 @@ func New(c Config) (*Agent, error) {
 	fileTracker := tool.NewFileTracker()
 	a.fileTracker = fileTracker
 
+	primaryType, _ := a.resolvedAgentTypeLocked("primary")
+	primaryWriteDir := strings.TrimSpace(primaryType.WriteDir)
+	primaryOptions := tool.CapabilityOptions{WriteDir: primaryWriteDir}
 	registry := tool.NewRegistry()
-	for _, tl := range tool.CoreToolList(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askPolicy) {
+	for _, tl := range tool.CoreToolListWithOptions(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askPolicy, primaryOptions) {
+		if primaryType.Readonly && primaryWriteDir == "" && isAgentWriteTool(tl.Name()) {
+			continue
+		}
 		registry.Register(tl)
 	}
 	registry.Register(tool.WrapWithPermission(tool.ExecutePending{}, checkPolicy, askPolicy))
@@ -311,7 +321,11 @@ func New(c Config) (*Agent, error) {
 
 	// Re-create RunCommand with the process manager.
 	rc := tool.NewRunCommandAtRoot(c.Cfg.Tools, c.Home, rt.workspaceRoot, procMgr)
-	registry.Register(tool.WrapWithPermission(rc, checkPolicy, askPolicy))
+	if primaryType.Readonly {
+		registry.Register(tool.WrapWithPermission(tool.NewReadOnlyRunCommand(rc), checkPolicy, askPolicy))
+	} else {
+		registry.Register(tool.WrapWithPermission(rc, checkPolicy, askPolicy))
+	}
 	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(procMgr), checkPolicy, askPolicy))
 	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkPolicy, askPolicy))
 
@@ -385,7 +399,7 @@ func New(c Config) (*Agent, error) {
 	l.SetStore(store)
 	l.SetContextTransformer(a)
 	l.SetUsageRecorder(agentUsageRecorder{agent: a})
-	pendingExecutor := tool.NewStagedExecutorAtRoot(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askActionPolicy)
+	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askActionPolicy, primaryOptions)
 	a.pendingExecutor = pendingExecutor
 	l.SetPendingExecutor(pendingExecutor)
 	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
