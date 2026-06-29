@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 
@@ -38,6 +39,7 @@ type PermWrapped struct {
 	check         CheckFunc
 	ask           AskFunc
 	workspaceRoot string
+	options       CapabilityOptions
 }
 
 // WrapWithPermission wraps t so that every Execute call is gated by
@@ -50,6 +52,10 @@ func WrapWithPermissionAtRoot(t Tool, workspaceRoot string, check CheckFunc, ask
 	return &PermWrapped{inner: t, check: check, ask: ask, workspaceRoot: workspaceRoot}
 }
 
+func WrapWithPermissionAtRootWithOptions(t Tool, workspaceRoot string, check CheckFunc, ask AskFunc, opts CapabilityOptions) *PermWrapped {
+	return &PermWrapped{inner: t, check: check, ask: ask, workspaceRoot: workspaceRoot, options: opts}
+}
+
 func (p *PermWrapped) Name() string                     { return p.inner.Name() }
 func (p *PermWrapped) Description() string              { return p.inner.Description() }
 func (p *PermWrapped) ParametersSchema() map[string]any { return p.inner.ParametersSchema() }
@@ -60,7 +66,7 @@ func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (strin
 	// The shared target plan drives permission checks, prompt fields, and the
 	// internal approval receipt used during execution.
 	if p.inner.Name() == "apply_patch" {
-		targets, _, agg, err := applyPatchPermissionPlan(p.check, p.workspaceRoot, params)
+		targets, _, agg, err := applyPatchPermissionPlanWithOptions(p.check, p.workspaceRoot, params, p.options)
 		if err != nil {
 			return "", err
 		}
@@ -80,7 +86,7 @@ func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (strin
 		}
 	}
 
-	execParams, err := resolveFileToolParamsAtRoot(p.workspaceRoot, p.inner.Name(), params)
+	execParams, err := resolveFileToolParamsAtRootWithOptions(p.workspaceRoot, p.inner.Name(), params, p.options)
 	if err != nil {
 		return "", err
 	}
@@ -97,6 +103,49 @@ func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (strin
 		}
 		return "", ErrDenied
 	}
+}
+
+func (p *PermWrapped) StageableTool() (StageableTool, bool) {
+	stageable, ok := p.inner.(StageableTool)
+	if !ok {
+		return nil, false
+	}
+	if !p.options.hasWriteDir() || !isWriteTool(p.inner.Name()) {
+		return stageable, true
+	}
+	return writeDirStageable{
+		inner: stageable,
+		name:  p.inner.Name(),
+		root:  p.workspaceRoot,
+		opts:  p.options,
+	}, true
+}
+
+type writeDirStageable struct {
+	inner StageableTool
+	name  string
+	root  string
+	opts  CapabilityOptions
+}
+
+func (s writeDirStageable) ValidateStaged(ctx context.Context, args json.RawMessage) error {
+	if err := s.inner.ValidateStaged(ctx, args); err != nil {
+		return err
+	}
+	var params map[string]any
+	if err := json.Unmarshal(args, &params); err != nil {
+		return fmt.Errorf("%s: invalid staged arguments: %w", s.name, err)
+	}
+	if s.name == "apply_patch" {
+		_, _, err := resolveApplyPatchTargetsWithOptions(s.root, params, s.opts)
+		return err
+	}
+	_, err := resolveFileToolParamsAtRootWithOptions(s.root, s.name, params, s.opts)
+	return err
+}
+
+func (s writeDirStageable) StagedResultMessage() string {
+	return s.inner.StagedResultMessage()
 }
 
 // applyPatchAskRequest builds the permission ask for apply_patch: BatchFiles
@@ -199,6 +248,10 @@ func resolveFileToolParams(toolName string, params map[string]any) (map[string]a
 }
 
 func resolveFileToolParamsAtRoot(root, toolName string, params map[string]any) (map[string]any, error) {
+	return resolveFileToolParamsAtRootWithOptions(root, toolName, params, CapabilityOptions{})
+}
+
+func resolveFileToolParamsAtRootWithOptions(root, toolName string, params map[string]any, opts CapabilityOptions) (map[string]any, error) {
 	if !permission.IsFileTool(toolName) {
 		return params, nil
 	}
@@ -209,6 +262,9 @@ func resolveFileToolParamsAtRoot(root, toolName string, params map[string]any) (
 	}
 	resolved, err := pathutil.ResolveFilePathFrom(root, path)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkWriteDirTarget(root, toolName, resolved.CanonicalPath, opts); err != nil {
 		return nil, err
 	}
 	return withCanonicalPathParam(cleanParams, resolved.CanonicalPath), nil

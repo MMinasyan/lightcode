@@ -41,7 +41,14 @@ func TestManagerListRemoveAndIDs(t *testing.T) {
 	if got := m.List(); !strings.Contains(got, "p1") || !strings.Contains(got, "sleep 1") {
 		t.Fatalf("List with process = %q", got)
 	}
+	m.procs["p2"] = &CommandStarted{ID: "p2", Command: "sleep 2", StartedAt: time.Now()}
+	m.procs["done"] = &CommandStarted{ID: "done", Command: "true", StartedAt: time.Now(), exited: true}
+	if got := strings.Join(m.ActiveIDs(), ","); got != "p1,p2" {
+		t.Fatalf("ActiveIDs = %q, want p1,p2", got)
+	}
 	m.Remove("p1")
+	m.Remove("p2")
+	m.Remove("done")
 	if len(m.procs) != 0 {
 		t.Fatalf("Remove left procs = %+v", m.procs)
 	}

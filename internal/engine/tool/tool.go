@@ -57,6 +57,10 @@ type StageableTool interface {
 	StagedResultMessage() string
 }
 
+type StageableToolProvider interface {
+	StageableTool() (StageableTool, bool)
+}
+
 // ToolCall is the generic identity of a model-requested tool call.
 type ToolCall struct {
 	Name      string
@@ -132,7 +136,14 @@ func (r *Registry) DisplayMetadataProvider(name string) (DisplayMetadataProvider
 
 // StageableTool returns a registered tool's staging capability.
 func (r *Registry) StageableTool(name string) (StageableTool, bool) {
-	t, ok := r.capabilityTool(name)
+	t, ok := r.Get(name)
+	if !ok {
+		return nil, false
+	}
+	if provider, ok := t.(StageableToolProvider); ok {
+		return provider.StageableTool()
+	}
+	t, ok = r.capabilityTool(name)
 	if !ok {
 		return nil, false
 	}
