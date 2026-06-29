@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/MMinasyan/lightcode/internal/adaptation"
+	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 	"github.com/MMinasyan/lightcode/internal/config"
@@ -19,7 +20,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/process"
 	"github.com/MMinasyan/lightcode/internal/provider"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
-	"github.com/MMinasyan/lightcode/internal/subagent"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
@@ -44,7 +44,7 @@ type TaggedLoopEvent struct {
 }
 
 type taskTool struct {
-	loader        *subagent.Loader
+	agentTypes    *agentcfg.Config
 	parentStore   *snapshot.Store
 	parentTracker *tool.FileTracker
 	maxConcurrent int
@@ -52,11 +52,7 @@ type taskTool struct {
 
 	mu           sync.Mutex
 	modelCatalog *catalog.Catalog
-	providerName string
-	model        string
 	cancelParent func()
-
-	subModel string
 
 	resolveAdapt adaptation.Resolver
 
@@ -77,17 +73,13 @@ type taskTool struct {
 }
 
 type taskToolConfig struct {
-	Loader        *subagent.Loader
+	AgentTypes    *agentcfg.Config
 	ParentStore   *snapshot.Store
 	ParentTracker *tool.FileTracker
 	MaxConcurrent int
 	TaggedEvents  chan<- TaggedLoopEvent
 
 	ModelCatalog *catalog.Catalog
-	ProviderName string
-	Model        string
-
-	SubModel string
 
 	ResolveAdapt adaptation.Resolver
 
@@ -110,15 +102,12 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		cfg.MaxConcurrent = 4
 	}
 	return &taskTool{
-		loader:        cfg.Loader,
+		agentTypes:    cfg.AgentTypes,
 		parentStore:   cfg.ParentStore,
 		parentTracker: cfg.ParentTracker,
 		maxConcurrent: cfg.MaxConcurrent,
 		taggedEvents:  cfg.TaggedEvents,
 		modelCatalog:  cfg.ModelCatalog,
-		providerName:  cfg.ProviderName,
-		model:         cfg.Model,
-		subModel:      cfg.SubModel,
 		resolveAdapt:  cfg.ResolveAdapt,
 		toolsConfig:   cfg.ToolsConfig,
 		homeDir:       cfg.HomeDir,
@@ -140,10 +129,8 @@ func (*taskTool) Name() string { return "task" }
 func (t *taskTool) Description() string {
 	var b strings.Builder
 	b.WriteString("Spawn one or more subagents to work on tasks concurrently. Each task runs in its own context with a restricted toolset defined by its subagent_type. Results are returned when all tasks complete.\n\nAvailable subagent types:\n")
-	if t.loader != nil {
-		for _, at := range t.loader.All() {
-			fmt.Fprintf(&b, "- %s: %s\n", at.Name, at.Description)
-		}
+	for _, at := range t.availableAgentTypes() {
+		fmt.Fprintf(&b, "- %s: %s\n", at.Name, at.Description)
 	}
 	return b.String()
 }
@@ -188,6 +175,12 @@ func (t *taskTool) setToolsConfig(cfg config.ToolsConfig) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.toolsConfig = cfg
+}
+
+func (t *taskTool) setAgentTypes(cfg *agentcfg.Config) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.agentTypes = cfg
 }
 
 func (t *taskTool) Execute(ctx context.Context, params map[string]any) (string, error) {
@@ -311,10 +304,9 @@ func appendAdaptationBlocks(prompt string, adapt *adaptation.Adaptation) string 
 }
 
 // buildChildLoop constructs the child loop for a subagent and applies the adaptation
-// resolved from the child's OWN model (which may differ from the parent's via
-// cfg.Subagents.Model): it appends the adaptation's coaching blocks to the prompt and
+// resolved from the child's OWN model: it appends the adaptation's coaching blocks to the prompt and
 // installs the adaptation on the loop (tool advertisement, dispatch gate, leak pattern).
-func (t *taskTool) buildChildLoop(at subagent.AgentType, client *provider.Client, registry *tool.Registry, ref coremodel.ModelRef) *loop.Loop {
+func (t *taskTool) buildChildLoop(at agentcfg.Resolved, client *provider.Client, registry *tool.Registry, ref coremodel.ModelRef) *loop.Loop {
 	adapt := t.resolveAdaptation(ref.Model)
 	lp := loop.New(provider.NewAdapter(client), registry, appendAdaptationBlocks(at.Prompt, adapt))
 	lp.SetActiveAdaptation(adapt)
@@ -322,12 +314,12 @@ func (t *taskTool) buildChildLoop(at subagent.AgentType, client *provider.Client
 }
 
 func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, parentToolCallID string) taskResult {
-	at, err := t.loader.Load(td.SubagentType)
+	at, err := t.resolveAgentType(td.SubagentType)
 	if err != nil {
 		return taskResult{index: index, err: fmt.Errorf("unknown subagent type %q: %w", td.SubagentType, err)}
 	}
 
-	client, ref, err := t.resolveClient()
+	client, ref, err := t.resolveClient(at.Model)
 	if err != nil {
 		return taskResult{index: index, err: err}
 	}
@@ -415,7 +407,7 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 	return finish(taskResult{index: index, result: result})
 }
 
-func (t *taskTool) buildRegistry(at subagent.AgentType, scope parentMutationScope, procMgr *process.Manager) *tool.Registry {
+func (t *taskTool) buildRegistry(at agentcfg.Resolved, scope parentMutationScope, procMgr *process.Manager) *tool.Registry {
 	root := scope.workspaceRoot
 	core := tool.CoreTools(scope.snapshotStore(), scope.tracker, t.toolsConfig, root, t.permissionCheck(), t.permissionAsk())
 	reg := tool.NewRegistry()
@@ -498,7 +490,7 @@ func (s parentTurnSnapshotStore) RetainSnapshotEntry(_ int, entryID string) {
 	s.store.RetainSnapshotEntry(s.turn, entryID)
 }
 
-func (t *taskTool) newChildTool(name string, at subagent.AgentType, scope parentMutationScope, procMgr *process.Manager) tool.Tool {
+func (t *taskTool) newChildTool(name string, at agentcfg.Resolved, scope parentMutationScope, procMgr *process.Manager) tool.Tool {
 	check := t.permissionCheck()
 	ask := t.permissionAsk()
 	root := scope.workspaceRoot
@@ -618,7 +610,7 @@ func (t *taskTool) permissionAskAction() tool.AskActionFunc {
 	}
 }
 
-func isReadOnlyType(at subagent.AgentType) bool {
+func isReadOnlyType(at agentcfg.Resolved) bool {
 	for _, name := range at.Tools {
 		if name == "write_file" || name == "edit_file" {
 			return false
@@ -627,21 +619,58 @@ func isReadOnlyType(at subagent.AgentType) bool {
 	return true
 }
 
-func (t *taskTool) resolveClient() (*provider.Client, coremodel.ModelRef, error) {
+func (t *taskTool) availableAgentTypes() []agentcfg.Resolved {
 	t.mu.Lock()
-	providerName := t.providerName
-	modelID := t.model
-	subModel := t.subModel
-	modelCatalog := t.modelCatalog
+	cfg := t.agentTypes
+	ctx := agentcfg.ResolveContext{Home: t.homeDir, ProjectID: t.projectID}
 	t.mu.Unlock()
 
-	ref := coremodel.ModelRef{Provider: providerName, Model: modelID}
-	if subModel != "" {
-		parsed, err := coremodel.Parse(subModel)
-		if err != nil {
-			return nil, coremodel.ModelRef{}, err
+	if cfg == nil {
+		return nil
+	}
+	all := cfg.All(ctx)
+	out := make([]agentcfg.Resolved, 0, len(all))
+	for _, at := range all {
+		if at.Subagent {
+			out = append(out, at)
 		}
-		ref = parsed
+	}
+	return out
+}
+
+func (t *taskTool) resolveAgentType(name string) (agentcfg.Resolved, error) {
+	t.mu.Lock()
+	cfg := t.agentTypes
+	ctx := agentcfg.ResolveContext{Home: t.homeDir, ProjectID: t.projectID}
+	t.mu.Unlock()
+
+	if cfg == nil {
+		return agentcfg.Resolved{}, fmt.Errorf("agent types are not configured")
+	}
+	at, err := cfg.Resolve(name, ctx)
+	if err != nil {
+		return agentcfg.Resolved{}, err
+	}
+	if !at.Subagent {
+		return agentcfg.Resolved{}, fmt.Errorf("agent type is not available as a subagent")
+	}
+	return at, nil
+}
+
+func (t *taskTool) resolveClient(modelRef string) (*provider.Client, coremodel.ModelRef, error) {
+	if strings.TrimSpace(modelRef) == "" {
+		return nil, coremodel.ModelRef{}, loop.ErrNoModelConfigured
+	}
+	ref, err := coremodel.Parse(modelRef)
+	if err != nil {
+		return nil, coremodel.ModelRef{}, err
+	}
+
+	t.mu.Lock()
+	modelCatalog := t.modelCatalog
+	t.mu.Unlock()
+	if modelCatalog == nil {
+		return nil, coremodel.ModelRef{}, fmt.Errorf("model catalog is not configured")
 	}
 
 	client, _, err := newProviderClient(modelCatalog, ref)
@@ -664,11 +693,9 @@ func (t *taskTool) forwardEvents(ch <-chan loop.Event, taskIndex int, sessionID,
 	}
 }
 
-func (t *taskTool) updateParentState(providerName, model string, cancelParent func()) {
+func (t *taskTool) updateParentState(cancelParent func()) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.providerName = providerName
-	t.model = model
 	t.cancelParent = cancelParent
 }
 
@@ -676,10 +703,4 @@ func (t *taskTool) setCatalog(catalog *catalog.Catalog) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.modelCatalog = catalog
-}
-
-func (t *taskTool) setSubModel(subModel string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.subModel = subModel
 }

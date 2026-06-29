@@ -388,12 +388,24 @@ func TestAgentNewSessionUsesUpdatedPrimaryModelButExistingSessionKeepsModel(t *t
 
 func TestAgentRuntimeConfigRoundTripWritesReloadsAndExcludesMasterBooleans(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
+	var root map[string]any
+	data, err := os.ReadFile(a.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatal(err)
+	}
+	objectMap(root, "subagents")["model"] = "test/stale-model"
+	if err := writeAgentConfigAtomic(a.configPath, root); err != nil {
+		t.Fatal(err)
+	}
+
 	settings := a.GetRuntimeConfig()
 	settings.Sessions.ArchiveAfterDays = 14
 	settings.Sessions.DeleteAfterArchiveDays = 21
 	settings.Compaction.ThresholdPct = 0.75
 	settings.Subagents.MaxConcurrent = 3
-	settings.Subagents.Model = "test/alt-model"
 	settings.Tools.MaxOutputBytes = 32768
 	settings.Tools.ReadMaxLines = 10
 	settings.Tools.ReadLineMaxChars = 7000
@@ -407,21 +419,21 @@ func TestAgentRuntimeConfigRoundTripWritesReloadsAndExcludesMasterBooleans(t *te
 	if got.Sessions.ArchiveAfterDays != 14 || got.Sessions.DeleteAfterArchiveDays != 21 || got.Compaction.ThresholdPct != 0.75 {
 		t.Fatalf("runtime config after set = %#v", got)
 	}
-	if got.Subagents.MaxConcurrent != 3 || got.Subagents.Model != "test/alt-model" || got.Tools.CommandTimeout != 90 || got.Tools.MaxBackgroundProcesses != 1 {
+	if got.Subagents.MaxConcurrent != 3 || got.Tools.CommandTimeout != 90 || got.Tools.MaxBackgroundProcesses != 1 {
 		t.Fatalf("runtime tool/subagent config after set = %#v", got)
 	}
-	data, err := os.ReadFile(a.configPath)
+	data, err = os.ReadFile(a.configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(data)
-	for _, want := range []string{`"archive_after_days": 14`, `"delete_after_archive_days": 21`, `"threshold_pct": 0.75`, `"max_concurrent": 3`, `"model": "test/alt-model"`, `"command_timeout": 90`} {
+	for _, want := range []string{`"archive_after_days": 14`, `"delete_after_archive_days": 21`, `"threshold_pct": 0.75`, `"max_concurrent": 3`, `"command_timeout": 90`} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("config missing %s:\n%s", want, text)
 		}
 	}
-	if strings.Contains(text, `"summarizer_model"`) {
-		t.Fatalf("config write should remove summarizer_model:\n%s", text)
+	if strings.Contains(text, `"summarizer_model"`) || strings.Contains(text, `"model": "test/stale-model"`) {
+		t.Fatalf("config write should remove removed model fields:\n%s", text)
 	}
 	if strings.Contains(text, `"auto_archive"`) || strings.Contains(text, `"enabled"`) || strings.Contains(text, `"permissions"`) {
 		t.Fatalf("config write should not add excluded runtime fields:\n%s", text)
@@ -458,7 +470,7 @@ func TestAgentRuntimeConfigRoundTripWritesReloadsAndExcludesMasterBooleans(t *te
 	if err := a.Reload(); err != nil {
 		t.Fatalf("Reload returned error: %v", err)
 	}
-	if got := a.GetRuntimeConfig(); got.Tools.CommandTimeout != 90 || got.Subagents.Model != "test/alt-model" {
+	if got := a.GetRuntimeConfig(); got.Tools.CommandTimeout != 90 || got.Subagents.MaxConcurrent != 3 {
 		t.Fatalf("runtime config after reload = %#v", got)
 	}
 }
@@ -530,11 +542,6 @@ func TestAgentSetRuntimeConfigRejectsInvalidValues(t *testing.T) {
 	settings.Compaction.ThresholdPct = 1
 	if err := a.SetRuntimeConfig(settings); err == nil {
 		t.Fatal("SetRuntimeConfig returned nil for invalid threshold")
-	}
-	settings = a.GetRuntimeConfig()
-	settings.Subagents.Model = "badref"
-	if err := a.SetRuntimeConfig(settings); err == nil {
-		t.Fatal("SetRuntimeConfig returned nil for invalid subagent model ref")
 	}
 	settings = a.GetRuntimeConfig()
 	settings.Tools.CommandTimeout = 0

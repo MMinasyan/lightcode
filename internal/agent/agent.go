@@ -33,7 +33,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/provider"
 	"github.com/MMinasyan/lightcode/internal/safefs"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
-	"github.com/MMinasyan/lightcode/internal/subagent"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
@@ -97,8 +96,7 @@ type Agent struct {
 	lspManager     *lsp.Manager
 	lspDiagnostics *tool.LSPDiagnostics
 
-	subagentLoader *subagent.Loader
-	taskToolInst   *taskTool
+	taskToolInst *taskTool
 
 	procMgr         *process.Manager
 	pendingExecutor *tool.StagedExecutor
@@ -346,21 +344,15 @@ func New(c Config) (*Agent, error) {
 	registry.Register(lspDiag)
 	registry.Register(tool.NewWorkspaceSymbol(lspClient))
 
-	loader := subagent.NewLoader(c.ProjectRoot, c.Home)
 	taggedEvts := make(chan TaggedLoopEvent, 512)
 
-	subModel := c.Cfg.Subagents.Model
-
 	tt := newTaskTool(taskToolConfig{
-		Loader:        loader,
+		AgentTypes:    agentTypes,
 		ParentStore:   store,
 		ParentTracker: fileTracker,
 		MaxConcurrent: c.Cfg.Subagents.MaxConcurrent,
 		TaggedEvents:  taggedEvts,
 		ModelCatalog:  modelCatalog,
-		ProviderName:  "",
-		Model:         "",
-		SubModel:      subModel,
 		ToolsConfig:   c.Cfg.Tools,
 		HomeDir:       c.Home,
 		WorkspaceRoot: rt.workspaceRoot,
@@ -376,7 +368,6 @@ func New(c Config) (*Agent, error) {
 		ResolveAdapt:  adaptation.Match,
 	})
 	registry.Register(tt)
-	a.subagentLoader = loader
 	rt.taggedEvents = taggedEvts
 	a.taskToolInst = tt
 
@@ -1763,11 +1754,10 @@ func (rt *runtime) launchTurn(ctx context.Context, turnCtx context.Context, canc
 	rt.mu.Lock()
 	a.ensureActiveModelLocked()
 	a.setWarningGroup("setup", a.setupWarningsLocked())
-	currentRef := a.currentRef
 	rt.mu.Unlock()
 
 	if a.taskToolInst != nil {
-		a.taskToolInst.updateParentState(currentRef.Provider, currentRef.Model, cancel)
+		a.taskToolInst.updateParentState(cancel)
 	}
 
 	go func() {
@@ -1970,7 +1960,7 @@ func (a *Agent) reloadLockedWithRefresh(allowBackgroundDiscovery bool) error {
 	a.catalog = modelCatalog
 	if a.taskToolInst != nil {
 		a.taskToolInst.setCatalog(modelCatalog)
-		a.taskToolInst.setSubModel(cfg.Subagents.Model)
+		a.taskToolInst.setAgentTypes(agentTypes)
 		a.taskToolInst.setMaxConcurrent(cfg.Subagents.MaxConcurrent)
 		a.taskToolInst.setToolsConfig(cfg.Tools)
 	}
@@ -2318,7 +2308,6 @@ func runtimeConfigFromConfig(cfg *config.Config) RuntimeConfigSettings {
 		},
 		Subagents: RuntimeSubagentsConfig{
 			MaxConcurrent: cfg.Subagents.MaxConcurrent,
-			Model:         cfg.Subagents.Model,
 		},
 		Tools: RuntimeToolsConfig{
 			MaxOutputBytes:         cfg.Tools.MaxOutputBytes,
@@ -2355,11 +2344,7 @@ func (a *Agent) SetRuntimeConfig(settings RuntimeConfigSettings) error {
 	delete(compaction, "summarizer_model")
 	subagents := objectMap(root, "subagents")
 	subagents["max_concurrent"] = settings.Subagents.MaxConcurrent
-	if settings.Subagents.Model == "" {
-		delete(subagents, "model")
-	} else {
-		subagents["model"] = settings.Subagents.Model
-	}
+	delete(subagents, "model")
 	tools := objectMap(root, "tools")
 	tools["max_output_bytes"] = settings.Tools.MaxOutputBytes
 	tools["read_max_lines"] = settings.Tools.ReadMaxLines
@@ -2395,11 +2380,6 @@ func validateRuntimeConfig(settings RuntimeConfigSettings) error {
 	}
 	if settings.Subagents.MaxConcurrent < 1 || settings.Subagents.MaxConcurrent > 20 {
 		return fmt.Errorf("subagents.max_concurrent must be between 1 and 20")
-	}
-	if settings.Subagents.Model != "" {
-		if _, err := coremodel.Parse(settings.Subagents.Model); err != nil {
-			return fmt.Errorf("subagents.model: %w", err)
-		}
 	}
 	if settings.Tools.MaxOutputBytes < 1024 || settings.Tools.MaxOutputBytes > 1048576 {
 		return fmt.Errorf("tools.max_output_bytes must be between 1024 and 1048576")

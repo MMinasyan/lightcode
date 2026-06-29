@@ -217,8 +217,7 @@ type RuntimeCompactionConfig struct {
 }
 
 type RuntimeSubagentsConfig struct {
-	MaxConcurrent int    `json:"max_concurrent"`
-	Model         string `json:"model"`
+	MaxConcurrent int `json:"max_concurrent"`
 }
 
 type RuntimeToolsConfig struct {

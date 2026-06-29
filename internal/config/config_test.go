@@ -35,7 +35,7 @@ func TestLoadAcceptsCatalogProviderEnvelopeAndIgnoresRemovedModelFields(t *testi
   },
   "subagents": {
     "max_concurrent": 2,
-    "model": "local/chat"
+    "model": { "provider": "local", "model": "chat" }
   }
 }`)
 
@@ -49,8 +49,8 @@ func TestLoadAcceptsCatalogProviderEnvelopeAndIgnoresRemovedModelFields(t *testi
 	if cfg.Compaction.ThresholdPct != 0.75 {
 		t.Fatalf("ThresholdPct = %v", cfg.Compaction.ThresholdPct)
 	}
-	if cfg.Subagents.MaxConcurrent != 2 || cfg.Subagents.Model != "local/chat" {
-		t.Fatalf("Subagents = %#v, want temporary max_concurrent/model values", cfg.Subagents)
+	if cfg.Subagents.MaxConcurrent != 2 {
+		t.Fatalf("Subagents = %#v, want max_concurrent=2 and removed model ignored", cfg.Subagents)
 	}
 	if _, ok := cfg.Providers["local"]; !ok {
 		t.Fatalf("providers map did not retain local entry: %#v", cfg.Providers)
@@ -80,15 +80,6 @@ func TestLoadRejectsOldShapeWithClearErrors(t *testing.T) {
   "subagents": { "provider": "openai", "model": "gpt-5.4-mini" }
 }`,
 			wantErr: "subagents.provider is no longer supported",
-		},
-		{
-			name: "subagents model object",
-			body: `{
-  "providers": {},
-  "default_model": "openai/gpt-5.4-mini",
-  "subagents": { "model": { "provider": "openai", "model": "gpt-5.4-mini" } }
-}`,
-			wantErr: "subagents.model must be a provider-prefixed string",
 		},
 		{
 			name: "provider models array",

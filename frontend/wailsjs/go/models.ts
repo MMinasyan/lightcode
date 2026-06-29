@@ -705,7 +705,6 @@ export namespace agent {
 	}
 	export class RuntimeSubagentsConfig {
 	    max_concurrent: number;
-	    model: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new RuntimeSubagentsConfig(source);
@@ -714,7 +713,6 @@ export namespace agent {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.max_concurrent = source["max_concurrent"];
-	        this.model = source["model"];
 	    }
 	}
 	export class RuntimeSessionsConfig {

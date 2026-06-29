@@ -110,10 +110,6 @@
     runtime.compaction.threshold_pct = clampInt(e.target.value, 10, 99, 90) / 100;
     await saveRuntime();
   }
-  async function setRuntimeModel(section, key, ref) {
-    runtime[section][key] = ref;
-    await saveRuntime();
-  }
 
   async function onProviderAdded() { showAdd = false; await loadAll(); }
   function close() { dispatch('close'); }
@@ -218,7 +214,6 @@
 
             <div class="sec">Subagents</div>
             <label class="field"><span class="flabel">Max concurrent</span><input type="number" min="1" max="20" disabled={savingRuntime} value={runtime.subagents.max_concurrent} on:change={(e) => setRuntimeInt('subagents', 'max_concurrent', 1, 20, 4, e)} /></label>
-            <div class="field"><span class="flabel">Subagent model</span><ModelPicker value={runtime.subagents.model} models={usableModels} defaultLabel="Same as default" on:change={(e) => setRuntimeModel('subagents', 'model', e.detail)} /></div>
 
             <div class="sec">Tools</div>
             <label class="field"><span class="flabel">Max output (bytes)</span><input type="number" min="1024" max="1048576" disabled={savingRuntime} value={runtime.tools.max_output_bytes} on:change={(e) => setRuntimeInt('tools', 'max_output_bytes', 1024, 1048576, 65536, e)} /></label>
