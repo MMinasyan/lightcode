@@ -61,9 +61,9 @@
   $: managedProviders = providers.filter((p) => p.connected || !p.builtin);
   $: usableModels = models.filter((m) => !m.incomplete);
   $: modelGroups = groupByProvider(usableModels);
-  $: configuredDefault = models.find((m) => m.default);
-  $: currentDefault = (usableModels.find((m) => m.default) || {}).ref || '';
-  $: unavailableDefault = configuredDefault && configuredDefault.incomplete ? configuredDefault.ref : '';
+  $: configuredPrimary = models.find((m) => m.default);
+  $: currentPrimary = (usableModels.find((m) => m.default) || {}).ref || '';
+  $: unavailablePrimary = configuredPrimary && configuredPrimary.incomplete ? configuredPrimary.ref : '';
 
   async function disconnect(p) { try { await DisconnectProvider(p.id); } catch (e) { fail(e); } finally { await loadAll(); } }
   function openConnect(p) { connectTarget = p; connectKey = ''; }
@@ -77,7 +77,7 @@
   async function remove(p) { try { await RemoveProvider(p.id); } catch (e) { fail(e); } finally { await loadAll(); } }
   async function toggleModel(entry) { try { await SetModelHidden(entry.ref, !entry.hidden); } catch (e) { fail(e); } finally { await loadAll(); } }
   async function toggleProvider(group) { try { await SetProviderHidden(group.provider, !group.providerHidden); } catch (e) { fail(e); } finally { await loadAll(); } }
-  async function pickDefault(ref) { if (!ref) return; try { await SetDefaultModel(ref); } catch (e) { fail(e); } finally { await loadAll(); } }
+  async function pickPrimary(ref) { if (!ref) return; try { await SetDefaultModel(ref); } catch (e) { fail(e); } finally { await loadAll(); } }
 
   function cloneRuntimeConfig(value) {
     return JSON.parse(JSON.stringify(value));
@@ -108,10 +108,6 @@
   }
   async function setThreshold(e) {
     runtime.compaction.threshold_pct = clampInt(e.target.value, 10, 99, 90) / 100;
-    await saveRuntime();
-  }
-  async function setRuntimeModel(section, key, ref) {
-    runtime[section][key] = ref;
     await saveRuntime();
   }
 
@@ -201,10 +197,10 @@
 
         {:else if active === 'agent'}
           <div class="field">
-            <span class="flabel">Default model</span>
+            <span class="flabel">Primary model</span>
             <div class="stack">
-              <ModelPicker value={currentDefault} models={usableModels} placeholder="Select a model" on:change={(e) => pickDefault(e.detail)} />
-              {#if unavailableDefault}<span class="hint warn">Configured default is unavailable: {unavailableDefault}</span>{/if}
+              <ModelPicker value={currentPrimary} models={usableModels} placeholder="Select a model" on:change={(e) => pickPrimary(e.detail)} />
+              {#if unavailablePrimary}<span class="hint warn">Configured primary model is unavailable: {unavailablePrimary}</span>{/if}
             </div>
           </div>
 
@@ -215,11 +211,9 @@
 
             <div class="sec">Compaction</div>
             <label class="field"><span class="flabel">Threshold (%)</span><input type="number" min="10" max="99" disabled={savingRuntime} value={Math.round(runtime.compaction.threshold_pct * 100)} on:change={setThreshold} /></label>
-            <div class="field"><span class="flabel">Summarizer model</span><ModelPicker value={runtime.compaction.summarizer_model} models={usableModels} defaultLabel="Same as default" on:change={(e) => setRuntimeModel('compaction', 'summarizer_model', e.detail)} /></div>
 
             <div class="sec">Subagents</div>
             <label class="field"><span class="flabel">Max concurrent</span><input type="number" min="1" max="20" disabled={savingRuntime} value={runtime.subagents.max_concurrent} on:change={(e) => setRuntimeInt('subagents', 'max_concurrent', 1, 20, 4, e)} /></label>
-            <div class="field"><span class="flabel">Subagent model</span><ModelPicker value={runtime.subagents.model} models={usableModels} defaultLabel="Same as default" on:change={(e) => setRuntimeModel('subagents', 'model', e.detail)} /></div>
 
             <div class="sec">Tools</div>
             <label class="field"><span class="flabel">Max output (bytes)</span><input type="number" min="1024" max="1048576" disabled={savingRuntime} value={runtime.tools.max_output_bytes} on:change={(e) => setRuntimeInt('tools', 'max_output_bytes', 1024, 1048576, 65536, e)} /></label>

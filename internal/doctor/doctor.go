@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/project"
@@ -82,7 +83,7 @@ func Run(p Params) (Report, bool) {
 	}
 
 	dataDir := filepath.Join(p.Home, ".lightcode")
-	cfg, dotenvKeys := dataChecks(p, dataDir, &checks, add)
+	cfg, agentsCfg, dotenvKeys := dataChecks(p, dataDir, &checks, add)
 
 	// Catalog.
 	var userRaw map[string]any
@@ -115,8 +116,8 @@ func Run(p Params) (Report, bool) {
 	} else {
 		add("setup", "provider", StatusWarn, "no provider connected - configure a provider with credentials and at least one usable model")
 	}
-	if cfg != nil {
-		setupModelCheck(cfg, result.Catalog, envIsSet, add)
+	if agentsCfg != nil {
+		setupModelCheck(agentsCfg, result.Catalog, envIsSet, add)
 	}
 
 	daemonChecks(p, add)
@@ -127,17 +128,17 @@ func Run(p Params) (Report, bool) {
 // dataChecks runs the data-dir group and returns the parsed config (nil when
 // absent or unparseable) and the .env key names, each mapped to whether its
 // value is non-empty.
-func dataChecks(p Params, dataDir string, checks *[]Check, add func(group, name, status, detail string)) (*config.Config, map[string]bool) {
+func dataChecks(p Params, dataDir string, checks *[]Check, add func(group, name, status, detail string)) (*config.Config, *agentcfg.Config, map[string]bool) {
 	dotenvKeys := map[string]bool{}
 
 	info, err := os.Lstat(dataDir)
 	if os.IsNotExist(err) {
 		add("data", "dir", StatusOK, "not created yet (created on first run)")
-		return nil, dotenvKeys
+		return nil, nil, dotenvKeys
 	}
 	if err != nil {
 		add("data", "dir", StatusFail, err.Error())
-		return nil, dotenvKeys
+		return nil, nil, dotenvKeys
 	}
 	switch {
 	case info.Mode()&os.ModeSymlink != 0:
@@ -151,6 +152,7 @@ func dataChecks(p Params, dataDir string, checks *[]Check, add func(group, name,
 	}
 
 	var cfg *config.Config
+	var agentsCfg *agentcfg.Config
 	if p.ConfigPathErr == nil {
 		if _, err := os.Stat(p.ConfigPath); os.IsNotExist(err) {
 			add("data", "config", StatusOK, "config.json: not created yet (created on first run)")
@@ -163,6 +165,23 @@ func dataChecks(p Params, dataDir string, checks *[]Check, add func(group, name,
 		} else {
 			cfg = parsed
 			add("data", "config", StatusOK, p.ConfigPath)
+		}
+
+		agentsPath := agentcfg.PathForConfig(p.ConfigPath)
+		if _, err := os.Stat(agentsPath); os.IsNotExist(err) {
+			if parsed, parseErr := agentcfg.Parse([]byte("{}")); parseErr == nil {
+				agentsCfg = parsed
+			}
+			add("data", "agents", StatusOK, "agents.json: not created yet (created on first run)")
+		} else if err != nil {
+			add("data", "agents", StatusFail, err.Error())
+		} else if data, err := os.ReadFile(agentsPath); err != nil {
+			add("data", "agents", StatusFail, err.Error())
+		} else if parsed, err := agentcfg.Parse(data); err != nil {
+			add("data", "agents", StatusFail, err.Error())
+		} else {
+			agentsCfg = parsed
+			add("data", "agents", StatusOK, agentsPath)
 		}
 	}
 
@@ -186,7 +205,7 @@ func dataChecks(p Params, dataDir string, checks *[]Check, add func(group, name,
 			add("data", "env", StatusOK, fmt.Sprintf("%d keys", len(keys)))
 		}
 	}
-	return cfg, dotenvKeys
+	return cfg, agentsCfg, dotenvKeys
 }
 
 // catalogChecks maps build warnings to severities. A silently dropped user
@@ -261,28 +280,33 @@ func providerChecks(cat *catalog.Catalog, dotenvKeys map[string]bool, lookupEnv 
 	return anyConnected
 }
 
-// setupModelCheck mirrors the agent's no-default-model / default-model-
+// setupModelCheck mirrors the agent's no-model / model-unavailable
 // unavailable warnings, which are mutually exclusive.
-func setupModelCheck(cfg *config.Config, cat *catalog.Catalog, envIsSet func(string) bool, add func(group, name, status, detail string)) {
-	if cfg.DefaultModel == "" {
-		add("setup", "default-model", StatusWarn, "no default model configured - choose one in Settings")
+func setupModelCheck(agentsCfg *agentcfg.Config, cat *catalog.Catalog, envIsSet func(string) bool, add func(group, name, status, detail string)) {
+	resolved, err := agentsCfg.Resolve("primary", agentcfg.ResolveContext{})
+	if err != nil {
+		add("setup", "model", StatusWarn, err.Error())
 		return
 	}
-	ref, err := catalog.ParseModelRef(cfg.DefaultModel)
+	if resolved.Model == "" {
+		add("setup", "model", StatusWarn, "No model is configured. Select a model to get started.")
+		return
+	}
+	ref, err := catalog.ParseModelRef(resolved.Model)
 	if err != nil {
-		add("setup", "default-model", StatusWarn, fmt.Sprintf("default model %q is unavailable: %v", cfg.DefaultModel, err))
+		add("setup", "model", StatusWarn, fmt.Sprintf("configured model %q is unavailable: %v", resolved.Model, err))
 		return
 	}
 	prov, model, err := cat.Lookup(ref)
 	if err != nil || model == nil || model.ContextWindow <= 0 {
-		add("setup", "default-model", StatusWarn, fmt.Sprintf("default model %q is unavailable: not in the catalog or incomplete", cfg.DefaultModel))
+		add("setup", "model", StatusWarn, fmt.Sprintf("configured model %q is unavailable: not in the catalog or incomplete", resolved.Model))
 		return
 	}
 	if !catalog.ProviderConnected(prov, envIsSet) {
-		add("setup", "default-model", StatusWarn, fmt.Sprintf("default model %q is unavailable: provider %s is not connected", cfg.DefaultModel, ref.Provider))
+		add("setup", "model", StatusWarn, fmt.Sprintf("configured model %q is unavailable: provider %s is not connected", resolved.Model, ref.Provider))
 		return
 	}
-	add("setup", "default-model", StatusOK, cfg.DefaultModel)
+	add("setup", "model", StatusOK, resolved.Model)
 }
 
 func daemonChecks(p Params, add func(group, name, status, detail string)) {

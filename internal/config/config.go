@@ -1,6 +1,6 @@
 // Package config loads the Lightcode config file and resolves process-level
-// settings. Provider/model metadata is owned by internal/catalog; this package
-// keeps only the non-provider sections plus provider-prefixed model refs.
+// settings. Provider/model metadata is owned by internal/catalog and
+// internal/agents; this package keeps only non-model runtime sections.
 //
 // Secrets are env vars. They are loaded at startup from ~/.lightcode/.env (if
 // present) or inherited from the shell. They are never written to config.json
@@ -45,11 +45,9 @@ func ResolvePath() (string, error) {
 }
 
 // emptyConfigTemplate is written to ~/.lightcode/config.json the first time
-// Lightcode runs. It is a valid but empty skeleton — the user must set a
-// provider-prefixed default model before the runtime can start.
+// Lightcode runs. It is a valid but empty skeleton.
 const emptyConfigTemplate = `{
-  "providers": {},
-  "default_model": ""
+  "providers": {}
 }
 `
 
@@ -63,15 +61,13 @@ type SessionConfig struct {
 
 // CompactionConfig controls context lifecycle management.
 type CompactionConfig struct {
-	Enabled         bool    `json:"enabled"`
-	ThresholdPct    float64 `json:"threshold_pct"`
-	SummarizerModel string  `json:"summarizer_model,omitempty"`
+	Enabled      bool    `json:"enabled"`
+	ThresholdPct float64 `json:"threshold_pct"`
 }
 
 // SubagentsConfig controls subagent orchestration.
 type SubagentsConfig struct {
-	MaxConcurrent int    `json:"max_concurrent,omitempty"`
-	Model         string `json:"model,omitempty"`
+	MaxConcurrent int `json:"max_concurrent,omitempty"`
 }
 
 // ToolsConfig holds limits and timeouts for built-in tools.
@@ -97,13 +93,12 @@ func defaultToolsConfig() ToolsConfig {
 // so config consumers can round-trip the section, but catalog.Loader is the
 // only code that interprets provider/model metadata.
 type Config struct {
-	Providers    map[string]any   `json:"providers,omitempty"`
-	DefaultModel string           `json:"default_model"`
-	Sessions     SessionConfig    `json:"sessions"`
-	Compaction   CompactionConfig `json:"compaction,omitempty"`
-	Subagents    SubagentsConfig  `json:"subagents,omitempty"`
-	Permissions  permission.Rules `json:"permissions,omitempty"`
-	Tools        ToolsConfig      `json:"tools,omitempty"`
+	Providers   map[string]any   `json:"providers,omitempty"`
+	Sessions    SessionConfig    `json:"sessions"`
+	Compaction  CompactionConfig `json:"compaction,omitempty"`
+	Subagents   SubagentsConfig  `json:"subagents,omitempty"`
+	Permissions permission.Rules `json:"permissions,omitempty"`
+	Tools       ToolsConfig      `json:"tools,omitempty"`
 }
 
 // rawSessionConfig is used to detect which sessions fields were present in the
@@ -124,9 +119,8 @@ func defaultSessionConfig() SessionConfig {
 }
 
 type rawCompactionConfig struct {
-	Enabled         *bool    `json:"enabled"`
-	ThresholdPct    *float64 `json:"threshold_pct"`
-	SummarizerModel *string  `json:"summarizer_model"`
+	Enabled      *bool    `json:"enabled"`
+	ThresholdPct *float64 `json:"threshold_pct"`
 }
 
 func defaultCompactionConfig() CompactionConfig {
@@ -138,8 +132,8 @@ func defaultCompactionConfig() CompactionConfig {
 
 // Load reads and parses the config file at path. If the file does not exist,
 // Load creates it with an empty skeleton (a valid config with no
-// default_model) and parses that. Old provider/model tuple config shapes are
-// rejected with explicit cutover errors; no migration is attempted.
+// provider model) and parses that. Old provider catalog shapes are rejected
+// with explicit cutover errors; no migration is attempted.
 func Load(path string) (*Config, error) {
 	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -162,9 +156,8 @@ func Load(path string) (*Config, error) {
 }
 
 // Parse parses and validates config bytes without touching the filesystem.
-// It accepts the empty first-run skeleton (an unset default_model is an
-// agent-start concern, not a parse error) and rejects the same old config
-// shapes Load rejects.
+// It accepts the empty first-run skeleton and rejects the same old provider
+// catalog shapes Load rejects.
 func Parse(data []byte) (*Config, error) {
 	if err := rejectOldShape(data); err != nil {
 		return nil, err
@@ -179,8 +172,7 @@ func Parse(data []byte) (*Config, error) {
 	}
 
 	type rawSubagentsConfig struct {
-		MaxConcurrent *int    `json:"max_concurrent"`
-		Model         *string `json:"model"`
+		MaxConcurrent *int `json:"max_concurrent"`
 	}
 
 	var raw struct {
@@ -211,18 +203,12 @@ func Parse(data []byte) (*Config, error) {
 		if raw.Compaction.ThresholdPct != nil {
 			c.Compaction.ThresholdPct = *raw.Compaction.ThresholdPct
 		}
-		if raw.Compaction.SummarizerModel != nil {
-			c.Compaction.SummarizerModel = *raw.Compaction.SummarizerModel
-		}
 	}
 
 	c.Subagents = SubagentsConfig{MaxConcurrent: 4}
 	if raw.Subagents != nil {
 		if raw.Subagents.MaxConcurrent != nil {
 			c.Subagents.MaxConcurrent = *raw.Subagents.MaxConcurrent
-		}
-		if raw.Subagents.Model != nil {
-			c.Subagents.Model = *raw.Subagents.Model
 		}
 	}
 
@@ -265,30 +251,11 @@ func rejectOldShape(data []byte) error {
 		return nil
 	}
 
-	if raw, ok := root["default_model"]; ok {
-		model, err := stringField(raw)
-		if err != nil {
-			return fmt.Errorf("default_model must be a provider-prefixed string like %q; old {provider, model} object shape is no longer supported", "openai/gpt-5.4-mini")
-		}
-		if err := validateModelRefField("default_model", model); err != nil {
-			return err
-		}
-	}
-
 	if raw, ok := root["compaction"]; ok {
 		var compaction map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &compaction); err == nil && compaction != nil {
 			if _, exists := compaction["summarizer_provider"]; exists {
-				return fmt.Errorf("compaction.summarizer_provider is no longer supported; use compaction.summarizer_model as a provider-prefixed string like %q", "openai/gpt-5.4-mini")
-			}
-			if rawModel, exists := compaction["summarizer_model"]; exists {
-				model, err := stringField(rawModel)
-				if err != nil {
-					return fmt.Errorf("compaction.summarizer_model must be a provider-prefixed string like %q", "openai/gpt-5.4-mini")
-				}
-				if err := validateModelRefField("compaction.summarizer_model", model); err != nil {
-					return err
-				}
+				return fmt.Errorf("compaction.summarizer_provider is no longer supported; compaction model selection now lives in agents.json")
 			}
 		}
 	}
@@ -297,16 +264,7 @@ func rejectOldShape(data []byte) error {
 		var subagents map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &subagents); err == nil && subagents != nil {
 			if _, exists := subagents["provider"]; exists {
-				return fmt.Errorf("subagents.provider is no longer supported; use subagents.model as a provider-prefixed string like %q", "openai/gpt-5.4-mini")
-			}
-			if rawModel, exists := subagents["model"]; exists {
-				model, err := stringField(rawModel)
-				if err != nil {
-					return fmt.Errorf("subagents.model must be a provider-prefixed string like %q", "openai/gpt-5.4-mini")
-				}
-				if err := validateModelRefField("subagents.model", model); err != nil {
-					return err
-				}
+				return fmt.Errorf("subagents.provider is no longer supported; task agent model selection now lives in agents.json")
 			}
 		}
 	}
@@ -327,25 +285,6 @@ func rejectOldShape(data []byte) error {
 				}
 			}
 		}
-	}
-	return nil
-}
-
-func stringField(raw json.RawMessage) (string, error) {
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return "", err
-	}
-	return s, nil
-}
-
-func validateModelRefField(field, value string) error {
-	if value == "" {
-		return nil
-	}
-	provider, model, ok := strings.Cut(value, "/")
-	if !ok || provider == "" || model == "" {
-		return fmt.Errorf("%s must be a provider-prefixed string like %q", field, "openai/gpt-5.4-mini")
 	}
 	return nil
 }

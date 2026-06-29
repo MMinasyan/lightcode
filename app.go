@@ -373,7 +373,7 @@ func (a *App) SetProviderHidden(providerID string, hidden bool) error {
 	return a.svc.SetProviderHidden(providerID, hidden)
 }
 
-// SetDefaultModel writes the persisted default model to config.
+// SetDefaultModel writes the persisted primary model to agent type config.
 func (a *App) SetDefaultModel(ref string) error {
 	return a.svc.SetDefaultModel(ref)
 }

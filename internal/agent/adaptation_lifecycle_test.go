@@ -66,6 +66,11 @@ func writeLifecycleConfig(t *testing.T, home, defaultModel string, includeAlt bo
 	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if defaultModel != "" {
+		writeAgentsTestConfig(t, configPath, `{"primary": {"model": "`+defaultModel+`"}}`)
+	} else {
+		writeAgentsTestConfig(t, configPath, `{}`)
+	}
 	return configPath
 }
 
@@ -215,7 +220,7 @@ func TestLifecycleRestoreAppliesFixture(t *testing.T) {
 	assertFixtureActive(t, a2)
 }
 
-// SET via ensureActiveModelLocked (lazy resolve of the default model).
+// SET via ensureActiveModelLocked (lazy resolve of the primary model).
 func TestLifecycleEnsureAppliesFixture(t *testing.T) {
 	t.Setenv("LIGHTCODE_LIFECYCLE_KEY", "test-key")
 	a := newLifecycleAgent(t, t.TempDir(), t.TempDir(), "test/alt-model")
@@ -223,7 +228,7 @@ func TestLifecycleEnsureAppliesFixture(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	a.Init(ctx)
-	_ = a.CurrentModel() // ensureActiveModelLocked sets the default alt-model -> fixture
+	_ = a.CurrentModel() // ensureActiveModelLocked sets primary alt-model -> fixture
 	assertFixtureActive(t, a)
 }
 
@@ -240,7 +245,7 @@ func TestLifecycleReloadDisconnectClears(t *testing.T) {
 	_ = a.CurrentModel()
 	assertFixtureActive(t, a)
 
-	// Rewrite the config without alt-model and with no default, then reload: the
+	// Rewrite the config without alt-model and with no primary model, then reload: the
 	// active alt-model is no longer connected, so the inline clear fires and nothing
 	// re-sets it.
 	writeLifecycleConfig(t, home, "", false, deadProviderURL)
@@ -261,10 +266,10 @@ func TestLifecycleReloadDisconnectClears(t *testing.T) {
 	}
 }
 
-// SET via SetDefaultModel (nil -> set through ensureActiveModelLocked's own branch).
+// SET via SetDefaultModel (nil -> primary.model -> ensureActiveModelLocked's own branch).
 func TestLifecycleSetDefaultModelAppliesFixture(t *testing.T) {
 	t.Setenv("LIGHTCODE_LIFECYCLE_KEY", "test-key")
-	a := newLifecycleAgent(t, t.TempDir(), t.TempDir(), "") // no default -> no model resolved at Init
+	a := newLifecycleAgent(t, t.TempDir(), t.TempDir(), "") // no primary model -> no model resolved at Init
 	a.resolveAdapt = lifecycleResolver
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -339,17 +344,22 @@ func TestLifecyclePreambleKeepsBlockAcrossTurn(t *testing.T) {
 }
 
 // CLEAR via ensureActiveModelLocked in isolation: a disconnected current model with no
-// default must revert activeAdapt to nil (would stay the fixture if ensure's clear
+// primary model must revert activeAdapt to nil (would stay the fixture if ensure's clear
 // branch were not routed through clearActiveModelLocked).
 func TestLifecycleEnsureClearRevertsAdaptation(t *testing.T) {
 	t.Setenv("LIGHTCODE_LIFECYCLE_KEY", "test-key")
-	a := newLifecycleAgent(t, t.TempDir(), t.TempDir(), "") // no default model
+	a := newLifecycleAgent(t, t.TempDir(), t.TempDir(), "") // no primary model
 	a.resolveAdapt = lifecycleResolver
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	a.Init(ctx)
 	if err := a.SwitchModel("test/alt-model"); err != nil {
 		t.Fatalf("switch to fixture model: %v", err)
+	}
+	assertFixtureActive(t, a)
+	writeAgentsTestConfig(t, a.configPath, `{}`)
+	if err := a.Reload(); err != nil {
+		t.Fatalf("reload after clearing primary model: %v", err)
 	}
 	assertFixtureActive(t, a)
 

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/adaptation"
+	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 	"github.com/MMinasyan/lightcode/internal/compact"
@@ -32,7 +33,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/provider"
 	"github.com/MMinasyan/lightcode/internal/safefs"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
-	"github.com/MMinasyan/lightcode/internal/subagent"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
@@ -52,6 +52,7 @@ type Agent struct {
 	rt *runtime
 
 	cfg      *config.Config
+	agents   *agentcfg.Config
 	catalog  *catalog.Catalog
 	store    *snapshot.Store
 	projects *project.Resolver
@@ -62,6 +63,7 @@ type Agent struct {
 	projectRoot string
 	home        string
 	configPath  string // resolved config path (env override or default)
+	agentsPath  string
 	env         *config.ManagedEnv
 
 	bundledModels map[string]map[string]struct{} // lazily loaded bundled provider→model id sets, for provenance
@@ -83,6 +85,7 @@ type Agent struct {
 	assembler              *prompt.Assembler
 	pendingPromptWarnings  []prompt.Warning
 	pendingCatalogWarnings []prompt.Warning
+	pendingAgentWarnings   []prompt.Warning
 	pendingSetupWarnings   []prompt.Warning
 
 	embedderDegraded bool // true when memory embedder failed to initialize
@@ -93,8 +96,7 @@ type Agent struct {
 	lspManager     *lsp.Manager
 	lspDiagnostics *tool.LSPDiagnostics
 
-	subagentLoader *subagent.Loader
-	taskToolInst   *taskTool
+	taskToolInst *taskTool
 
 	procMgr         *process.Manager
 	pendingExecutor *tool.StagedExecutor
@@ -168,6 +170,11 @@ func New(c Config) (*Agent, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load model catalog: %w", err)
 	}
+	agentsPath := agentcfg.PathForConfig(configPath)
+	agentTypes, err := agentcfg.Load(agentsPath)
+	if err != nil {
+		return nil, fmt.Errorf("load agents config: %w", err)
+	}
 
 	resolver, err := project.NewResolver(c.Home, c.ProjectRoot)
 	if err != nil {
@@ -180,12 +187,14 @@ func New(c Config) (*Agent, error) {
 
 	a := &Agent{
 		cfg:           c.Cfg,
+		agents:        agentTypes,
 		catalog:       modelCatalog,
 		store:         store,
 		projects:      resolver,
 		projectRoot:   c.ProjectRoot,
 		home:          c.Home,
 		configPath:    configPath,
+		agentsPath:    agentsPath,
 		env:           c.Env,
 		warningGroups: make(map[string][]PromptWarning),
 		resolveAdapt:  adaptation.Match,
@@ -335,21 +344,15 @@ func New(c Config) (*Agent, error) {
 	registry.Register(lspDiag)
 	registry.Register(tool.NewWorkspaceSymbol(lspClient))
 
-	loader := subagent.NewLoader(c.ProjectRoot, c.Home)
 	taggedEvts := make(chan TaggedLoopEvent, 512)
 
-	subModel := c.Cfg.Subagents.Model
-
 	tt := newTaskTool(taskToolConfig{
-		Loader:        loader,
+		AgentTypes:    agentTypes,
 		ParentStore:   store,
 		ParentTracker: fileTracker,
 		MaxConcurrent: c.Cfg.Subagents.MaxConcurrent,
 		TaggedEvents:  taggedEvts,
 		ModelCatalog:  modelCatalog,
-		ProviderName:  "",
-		Model:         "",
-		SubModel:      subModel,
 		ToolsConfig:   c.Cfg.Tools,
 		HomeDir:       c.Home,
 		WorkspaceRoot: rt.workspaceRoot,
@@ -365,7 +368,6 @@ func New(c Config) (*Agent, error) {
 		ResolveAdapt:  adaptation.Match,
 	})
 	registry.Register(tt)
-	a.subagentLoader = loader
 	rt.taggedEvents = taggedEvts
 	a.taskToolInst = tt
 
@@ -376,6 +378,7 @@ func New(c Config) (*Agent, error) {
 	a.assembler = asm
 	a.pendingPromptWarnings = res.Warnings
 	a.pendingCatalogWarnings = catalogWarningsToPromptWarnings(catalogWarnings)
+	a.pendingAgentWarnings = agentWarningsToPromptWarnings(agentTypes.Warnings())
 
 	l := loop.New(nil, registry, res.Prompt)
 	l.SetEvents(events)
@@ -449,6 +452,8 @@ func (rt *runtime) init(ctx context.Context) {
 	a.pendingPromptWarnings = nil
 	a.setWarningGroup("catalog", a.pendingCatalogWarnings)
 	a.pendingCatalogWarnings = nil
+	a.setWarningGroup("agents", a.pendingAgentWarnings)
+	a.pendingAgentWarnings = nil
 	a.ensureRuntime().mu.Lock()
 	a.setWarningGroup("setup", a.setupWarningsLocked())
 	a.ensureRuntime().mu.Unlock()
@@ -559,7 +564,7 @@ func (a *Agent) CurrentWarnings() []PromptWarning {
 
 func (a *Agent) warningSnapshotLocked() []PromptWarning {
 	var out []PromptWarning
-	for _, group := range []string{"setup", "prompt", "catalog", "lsp", "protocol"} {
+	for _, group := range []string{"setup", "prompt", "catalog", "agents", "lsp", "protocol"} {
 		out = append(out, a.warningGroups[group]...)
 	}
 	return out
@@ -1171,11 +1176,8 @@ func activeTailReadRecords(tail []message.Message, reads []tool.ReadRecord, defa
 
 func (a *Agent) summarizerClientAndWindow() (*provider.Adapter, int) {
 	ref := a.currentRef
-	if a.cfg.Compaction.SummarizerModel != "" {
-		parsed, err := coremodel.Parse(a.cfg.Compaction.SummarizerModel)
-		if err == nil {
-			ref = parsed
-		}
+	if compactRef, _, ok := a.resolvedAgentModelLocked("compact"); ok {
+		ref = compactRef
 	}
 
 	client, model, err := newProviderClient(a.catalog, ref)
@@ -1477,6 +1479,7 @@ func (a *Agent) ensureSession() error {
 	if a.store.Active() {
 		return nil
 	}
+	a.clearActiveModelLocked()
 	if err := a.reloadLocked(); err != nil {
 		return err
 	}
@@ -1751,11 +1754,10 @@ func (rt *runtime) launchTurn(ctx context.Context, turnCtx context.Context, canc
 	rt.mu.Lock()
 	a.ensureActiveModelLocked()
 	a.setWarningGroup("setup", a.setupWarningsLocked())
-	currentRef := a.currentRef
 	rt.mu.Unlock()
 
 	if a.taskToolInst != nil {
-		a.taskToolInst.updateParentState(currentRef.Provider, currentRef.Model, cancel)
+		a.taskToolInst.updateParentState(cancel)
 	}
 
 	go func() {
@@ -1808,7 +1810,7 @@ func (rt *runtime) launchTurn(ctx context.Context, turnCtx context.Context, canc
 
 func (a *Agent) turnErrorMessage(err error) string {
 	if errors.Is(err, loop.ErrNoModelConfigured) {
-		return "no model configured — set default_model in ~/.lightcode/config.json and an API key in ~/.lightcode/.env"
+		return "No model is configured. Select a model to get started."
 	}
 	return err.Error()
 }
@@ -1901,6 +1903,9 @@ func (a *Agent) SwitchModel(refStr string) error {
 	if err != nil {
 		return err
 	}
+	if err := a.writePrimaryModelLocked(ref); err != nil {
+		return err
+	}
 	a.setActiveModelLocked(ref, client, model)
 	a.ensureRuntime().signalSink.AddSignal(loop.PendingSignal{Payload: fmt.Sprintf("Model switched to %s", ref.String()), Persist: true})
 	if a.store.Active() {
@@ -1934,6 +1939,10 @@ func (a *Agent) reloadLockedWithRefresh(allowBackgroundDiscovery bool) error {
 	if err != nil {
 		return err
 	}
+	agentTypes, err := agentcfg.Load(a.agentsPath)
+	if err != nil {
+		return fmt.Errorf("load agents config: %w", err)
+	}
 	modelLoader := catalog.NewLoaderWithConfigPath(a.home, nil, a.configPath)
 	modelLoader.AllowRefresh = func(_ string, prov *catalog.Provider) bool {
 		if !allowBackgroundDiscovery {
@@ -1947,10 +1956,10 @@ func (a *Agent) reloadLockedWithRefresh(allowBackgroundDiscovery bool) error {
 	}
 
 	a.cfg = cfg
+	a.setAgentTypesLocked(agentTypes)
 	a.catalog = modelCatalog
 	if a.taskToolInst != nil {
 		a.taskToolInst.setCatalog(modelCatalog)
-		a.taskToolInst.setSubModel(cfg.Subagents.Model)
 		a.taskToolInst.setMaxConcurrent(cfg.Subagents.MaxConcurrent)
 		a.taskToolInst.setToolsConfig(cfg.Tools)
 	}
@@ -1970,6 +1979,14 @@ func (a *Agent) reloadLockedWithRefresh(allowBackgroundDiscovery bool) error {
 	a.setWarningGroup("catalog", catalogWarningsToPromptWarnings(catalogWarnings))
 	a.setWarningGroup("setup", a.setupWarningsLocked())
 	return nil
+}
+
+func (a *Agent) setAgentTypesLocked(agentTypes *agentcfg.Config) {
+	a.agents = agentTypes
+	if a.taskToolInst != nil {
+		a.taskToolInst.setAgentTypes(agentTypes)
+	}
+	a.setWarningGroup("agents", agentWarningsToPromptWarnings(agentTypes.Warnings()))
 }
 
 type ModelCompletion struct {
@@ -2153,6 +2170,7 @@ func (a *Agent) CurrentModel() ModelInfo {
 func (a *Agent) modelListFrom(refs []catalog.ModelRef) []ModelListEntry {
 	bundled := a.bundledModelIDsLocked()
 	disc := a.discoveryCacheLocked()
+	_, primaryModel, _ := a.resolvedAgentModelLocked("primary")
 	result := make([]ModelListEntry, 0, len(refs))
 	for _, ref := range refs {
 		prov, model, err := a.catalog.LookupOrIncomplete(ref)
@@ -2183,7 +2201,7 @@ func (a *Agent) modelListFrom(refs []catalog.ModelRef) []ModelListEntry {
 			Hidden:          model.Hidden || prov.Hidden,
 			ProviderHidden:  prov.Hidden,
 			Incomplete:      incomplete,
-			Default:         ref.String() == a.cfg.DefaultModel,
+			Default:         ref.String() == primaryModel,
 			Source:          classifyModelSource(prov, ref.Model, bundled, disc),
 		})
 	}
@@ -2292,12 +2310,10 @@ func runtimeConfigFromConfig(cfg *config.Config) RuntimeConfigSettings {
 			DeleteAfterArchiveDays: cfg.Sessions.DeleteAfterArchiveDays,
 		},
 		Compaction: RuntimeCompactionConfig{
-			ThresholdPct:    cfg.Compaction.ThresholdPct,
-			SummarizerModel: cfg.Compaction.SummarizerModel,
+			ThresholdPct: cfg.Compaction.ThresholdPct,
 		},
 		Subagents: RuntimeSubagentsConfig{
 			MaxConcurrent: cfg.Subagents.MaxConcurrent,
-			Model:         cfg.Subagents.Model,
 		},
 		Tools: RuntimeToolsConfig{
 			MaxOutputBytes:         cfg.Tools.MaxOutputBytes,
@@ -2331,18 +2347,10 @@ func (a *Agent) SetRuntimeConfig(settings RuntimeConfigSettings) error {
 	sessions["delete_after_archive_days"] = settings.Sessions.DeleteAfterArchiveDays
 	compaction := objectMap(root, "compaction")
 	compaction["threshold_pct"] = settings.Compaction.ThresholdPct
-	if settings.Compaction.SummarizerModel == "" {
-		delete(compaction, "summarizer_model")
-	} else {
-		compaction["summarizer_model"] = settings.Compaction.SummarizerModel
-	}
+	delete(compaction, "summarizer_model")
 	subagents := objectMap(root, "subagents")
 	subagents["max_concurrent"] = settings.Subagents.MaxConcurrent
-	if settings.Subagents.Model == "" {
-		delete(subagents, "model")
-	} else {
-		subagents["model"] = settings.Subagents.Model
-	}
+	delete(subagents, "model")
 	tools := objectMap(root, "tools")
 	tools["max_output_bytes"] = settings.Tools.MaxOutputBytes
 	tools["read_max_lines"] = settings.Tools.ReadMaxLines
@@ -2376,18 +2384,8 @@ func validateRuntimeConfig(settings RuntimeConfigSettings) error {
 	if settings.Compaction.ThresholdPct < 0.1 || settings.Compaction.ThresholdPct > 0.99 {
 		return fmt.Errorf("compaction.threshold_pct must be between 0.1 and 0.99")
 	}
-	if settings.Compaction.SummarizerModel != "" {
-		if _, err := coremodel.Parse(settings.Compaction.SummarizerModel); err != nil {
-			return fmt.Errorf("compaction.summarizer_model: %w", err)
-		}
-	}
 	if settings.Subagents.MaxConcurrent < 1 || settings.Subagents.MaxConcurrent > 20 {
 		return fmt.Errorf("subagents.max_concurrent must be between 1 and 20")
-	}
-	if settings.Subagents.Model != "" {
-		if _, err := coremodel.Parse(settings.Subagents.Model); err != nil {
-			return fmt.Errorf("subagents.model: %w", err)
-		}
 	}
 	if settings.Tools.MaxOutputBytes < 1024 || settings.Tools.MaxOutputBytes > 1048576 {
 		return fmt.Errorf("tools.max_output_bytes must be between 1024 and 1048576")
@@ -2420,24 +2418,28 @@ func (a *Agent) SetDefaultModel(refStr string) error {
 	if _, _, err := a.catalog.LookupOrIncomplete(ref); err != nil {
 		return err
 	}
-	path := a.configPath
-	data, err := os.ReadFile(path)
-	if err != nil {
+	if err := a.writePrimaryModelLocked(ref); err != nil {
 		return err
 	}
-	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
-		return fmt.Errorf("parse config %s: %w", path, err)
-	}
-	root["default_model"] = refStr
-	if err := writeAgentConfigAtomic(path, root); err != nil {
-		return err
-	}
-	a.cfg.DefaultModel = refStr
 	if a.currentRef.Provider == "" && a.currentRef.Model == "" {
 		a.ensureActiveModelLocked()
 	}
 	a.setWarningGroup("setup", a.setupWarningsLocked())
+	return nil
+}
+
+func (a *Agent) writePrimaryModelLocked(ref coremodel.ModelRef) error {
+	if a.agentsPath == "" {
+		a.agentsPath = agentcfg.PathForConfig(a.configPath)
+	}
+	if err := agentcfg.WriteModel(a.agentsPath, "primary", ref.String()); err != nil {
+		return err
+	}
+	agentTypes, err := agentcfg.Load(a.agentsPath)
+	if err != nil {
+		return err
+	}
+	a.setAgentTypesLocked(agentTypes)
 	return nil
 }
 
@@ -3387,6 +3389,14 @@ func catalogWarningsToPromptWarnings(warnings []catalog.Warning) []prompt.Warnin
 	return out
 }
 
+func agentWarningsToPromptWarnings(warnings []agentcfg.Warning) []prompt.Warning {
+	out := make([]prompt.Warning, 0, len(warnings))
+	for _, w := range warnings {
+		out = append(out, prompt.Warning{Kind: w.Kind, Message: w.Error()})
+	}
+	return out
+}
+
 func metaState(s string) string {
 	if s == "" {
 		return snapshot.StateActive
@@ -3452,19 +3462,45 @@ func (a *Agent) modelRefConnected(ref coremodel.ModelRef) bool {
 	return providerConnected(prov)
 }
 
-// ensureActiveModelLocked resolves the active model lazily from cfg.DefaultModel
-// only if the default provider is connected. Caller must hold the runtime mutex.
+func (a *Agent) agentResolveContextLocked() agentcfg.ResolveContext {
+	ctx := agentcfg.ResolveContext{Home: a.home}
+	if a.projects != nil {
+		if proj, err := a.projects.Current(); err == nil && proj != nil {
+			ctx.ProjectID = proj.ID
+		}
+	}
+	return ctx
+}
+
+func (a *Agent) resolvedAgentTypeLocked(name string) (agentcfg.Resolved, error) {
+	if a.agents == nil {
+		return agentcfg.Resolved{}, fmt.Errorf("agents config is not loaded")
+	}
+	return a.agents.Resolve(name, a.agentResolveContextLocked())
+}
+
+func (a *Agent) resolvedAgentModelLocked(name string) (coremodel.ModelRef, string, bool) {
+	resolved, err := a.resolvedAgentTypeLocked(name)
+	if err != nil || resolved.Model == "" {
+		return coremodel.ModelRef{}, "", false
+	}
+	ref, err := coremodel.Parse(resolved.Model)
+	if err != nil {
+		return coremodel.ModelRef{}, resolved.Model, false
+	}
+	return ref, resolved.Model, true
+}
+
+// ensureActiveModelLocked resolves the active model lazily from primary.model
+// only if the provider is connected. Caller must hold the runtime mutex.
 // If no active model can be resolved, it leaves currentRef empty and returns false.
 func (a *Agent) ensureActiveModelLocked() bool {
 	if a.modelRefConnected(a.currentRef) {
 		return true
 	}
 	a.clearActiveModelLocked()
-	if a.cfg == nil || a.cfg.DefaultModel == "" {
-		return false
-	}
-	ref, err := coremodel.Parse(a.cfg.DefaultModel)
-	if err != nil || !a.modelRefConnected(ref) {
+	ref, _, ok := a.resolvedAgentModelLocked("primary")
+	if !ok || !a.modelRefConnected(ref) {
 		return false
 	}
 	client, model, err := newProviderClient(a.catalog, ref)
@@ -3485,19 +3521,17 @@ func (a *Agent) setupWarningsLocked() []prompt.Warning {
 			Message: "No provider connected — configure a provider with credentials and at least one usable model.",
 		})
 	}
-	if a.cfg == nil || a.cfg.DefaultModel == "" {
+	ref, configuredModel, ok := a.resolvedAgentModelLocked("primary")
+	if configuredModel == "" {
 		out = append(out, prompt.Warning{
-			Kind:    "setup_no_default_model",
-			Message: "No default model configured — choose a default model in Settings.",
+			Kind:    "setup_no_model",
+			Message: "No model is configured. Select a model to get started.",
 		})
-	} else {
-		ref, err := coremodel.Parse(a.cfg.DefaultModel)
-		if err != nil || !a.modelRefConnected(ref) {
-			out = append(out, prompt.Warning{
-				Kind:    "setup_default_model_unavailable",
-				Message: fmt.Sprintf("Default model %q is unavailable because its provider is not connected or the model is incomplete.", a.cfg.DefaultModel),
-			})
-		}
+	} else if !ok || !a.modelRefConnected(ref) {
+		out = append(out, prompt.Warning{
+			Kind:    "setup_model_unavailable",
+			Message: fmt.Sprintf("Configured model %q is unavailable because its provider is not connected or the model is incomplete.", configuredModel),
+		})
 	}
 	if a.embedderDegraded {
 		out = append(out, prompt.Warning{

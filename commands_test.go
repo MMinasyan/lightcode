@@ -1458,6 +1458,10 @@ const modelsFixtureConfig = `{
 }`
 
 func modelsFixtureHome(t *testing.T, body string) string {
+	return modelsFixtureHomeWithPrimary(t, body, "")
+}
+
+func modelsFixtureHomeWithPrimary(t *testing.T, body, primaryModel string) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -1469,12 +1473,17 @@ func modelsFixtureHome(t *testing.T, body string) string {
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if primaryModel != "" {
+		if err := os.WriteFile(filepath.Join(dir, "agents.json"), []byte(`{"primary": {"model": "`+primaryModel+`"}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return home
 }
 
 func TestDispatchModels(t *testing.T) {
 	t.Run("default shows visible complete connected models", func(t *testing.T) {
-		modelsFixtureHome(t, modelsFixtureConfig)
+		modelsFixtureHomeWithPrimary(t, modelsFixtureConfig, "modeltest/vis")
 		t.Setenv("MODELS_TEST_KEY", "x")
 		_, code, stdout, stderr := capture(t, []string{"lightcode", "models"})
 		if code != 0 {
@@ -1487,7 +1496,7 @@ func TestDispatchModels(t *testing.T) {
 	})
 
 	t.Run("all includes hidden and incomplete with markers", func(t *testing.T) {
-		modelsFixtureHome(t, modelsFixtureConfig)
+		modelsFixtureHomeWithPrimary(t, modelsFixtureConfig, "modeltest/vis")
 		t.Setenv("MODELS_TEST_KEY", "x")
 		_, code, stdout, _ := capture(t, []string{"lightcode", "models", "--all"})
 		if code != 0 {
@@ -1655,7 +1664,7 @@ func TestDispatchModels(t *testing.T) {
 	})
 
 	t.Run("json golden fields", func(t *testing.T) {
-		modelsFixtureHome(t, modelsFixtureConfig)
+		modelsFixtureHomeWithPrimary(t, modelsFixtureConfig, "modeltest/vis")
 		t.Setenv("MODELS_TEST_KEY", "x")
 		_, code, stdout, _ := capture(t, []string{"lightcode", "models", "--json"})
 		if code != 0 {

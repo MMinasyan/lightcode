@@ -15,6 +15,7 @@ import (
 
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/engine/message"
+	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/provider"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
@@ -40,6 +41,38 @@ func (h *fakeMemoryHooks) IndexSummary(sessionID, projectID, projectName, summar
 func (h *fakeMemoryHooks) DeleteSessionSummaries(sessionID string) error {
 	h.deleteCalls++
 	return nil
+}
+
+type deterministicMemoryEmbedder struct{}
+
+func (deterministicMemoryEmbedder) Embed(string) ([]float32, error) { return []float32{1, 0, 0}, nil }
+func (deterministicMemoryEmbedder) Close()                          {}
+
+type recordingMemoryHooks struct {
+	store *memory.Store
+
+	sessionID      string
+	projectID      string
+	projectName    string
+	summary        string
+	createdAt      string
+	compactionPath string
+}
+
+func (h *recordingMemoryHooks) Reconcile() error { return h.store.Reconcile() }
+
+func (h *recordingMemoryHooks) IndexSummary(sessionID, projectID, projectName, summary, createdAt, compactionPath string) error {
+	h.sessionID = sessionID
+	h.projectID = projectID
+	h.projectName = projectName
+	h.summary = summary
+	h.createdAt = createdAt
+	h.compactionPath = compactionPath
+	return h.store.IndexSummary(sessionID, projectID, projectName, summary, createdAt, compactionPath)
+}
+
+func (h *recordingMemoryHooks) DeleteSessionSummaries(sessionID string) error {
+	return h.store.DeleteSessionSummaries(sessionID)
 }
 
 func TestApplyTurnActionRevertCodeUsesClickedTurn(t *testing.T) {
@@ -204,6 +237,62 @@ func TestCompactionMemoryHookRunsOnlyAfterSuccessfulSummary(t *testing.T) {
 			t.Fatalf("memory hook index calls=%d, want 0 on failed compaction", hooks.indexCalls)
 		}
 	})
+}
+
+func TestCompactionIndexesConversationSessionAndSearchHistoryRecallsSummary(t *testing.T) {
+	const summary = "## Goal\nremember alpha detail"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":%q},"finish_reason":"stop"}]}`, summary)
+	}))
+	defer server.Close()
+
+	a := newCatalogBackedTestAgent(t)
+	appendUserTurn(t, a, "first")
+	sessionID := a.store.SessionID()
+	if sessionID == "" {
+		t.Fatal("conversation session id is empty")
+	}
+	a.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
+	memStore := memory.NewStoreWithEmbedder(deterministicMemoryEmbedder{}, a.projects.Root(), a.home)
+	hooks := &recordingMemoryHooks{store: memStore}
+	a.memoryHooks = hooks
+
+	if err := a.runCompaction(context.Background(), false); err != nil {
+		t.Fatalf("runCompaction returned error: %v", err)
+	}
+
+	if hooks.sessionID != sessionID {
+		t.Fatalf("indexed session id = %q, want conversation session %q", hooks.sessionID, sessionID)
+	}
+	wantCompactionPath := filepath.Join(a.store.Dir(), "compaction.json")
+	if hooks.compactionPath != wantCompactionPath {
+		t.Fatalf("indexed compaction path = %q, want %q", hooks.compactionPath, wantCompactionPath)
+	}
+
+	metaPath := filepath.Join(a.home, ".lightcode", "summaries", sessionID, "meta.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read summary meta: %v", err)
+	}
+	var meta struct {
+		CompactionPath string `json:"compaction_path"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("decode summary meta: %v", err)
+	}
+	if meta.CompactionPath != wantCompactionPath {
+		t.Fatalf("summary meta compaction_path = %q, want %q", meta.CompactionPath, wantCompactionPath)
+	}
+
+	searchHistory := tool.NewSearchHistory(memStore, hooks.projectID)
+	result, err := searchHistory.Execute(context.Background(), map[string]any{"query": "alpha detail"})
+	if err != nil {
+		t.Fatalf("search_history returned error: %v", err)
+	}
+	if !strings.Contains(result, sessionID) || !strings.Contains(result, wantCompactionPath) || !strings.Contains(result, "remember alpha detail") {
+		t.Fatalf("search_history result = %q, want session id, compaction path, and summary", result)
+	}
 }
 
 func TestBackgroundExitSignalAfterSessionNewDoesNotDrainIntoNewSession(t *testing.T) {

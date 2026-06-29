@@ -474,6 +474,9 @@ func newTestAgentWithBaseURL(t *testing.T, baseURL string) (*agent.Agent, string
 	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(lightcodeDir, "agents.json"), []byte(`{"primary": {"model": "test/test-model"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		t.Fatal(err)

@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,11 +16,11 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/adaptation"
+	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 	"github.com/MMinasyan/lightcode/internal/provider"
-	"github.com/MMinasyan/lightcode/internal/subagent"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
@@ -49,7 +48,7 @@ func subResolver(modelID string) *adaptation.Adaptation {
 func newSubagentTaskTool(t *testing.T, resolver adaptation.Resolver) *taskTool {
 	t.Helper()
 	return newTaskTool(taskToolConfig{
-		Loader:       subagent.NewLoader(t.TempDir(), t.TempDir()),
+		AgentTypes:   mustParseTaskAgents(t, `{}`),
 		ResolveAdapt: resolver,
 	})
 }
@@ -77,7 +76,7 @@ func advertisedToolNames(registry *tool.Registry, adapt *adaptation.Adaptation) 
 // the leak pattern is installed on the child loop.
 func TestSubagentFixtureExcludesToolSeedsBlockAndLeak(t *testing.T) {
 	task := newSubagentTaskTool(t, subResolver)
-	at := subagent.AgentType{Name: "explore", Tools: []string{"read_file", "write_file"}, Prompt: "explore base prompt"}
+	at := agentcfg.Resolved{Name: "explore", Tools: []string{"read_file", "write_file"}, Prompt: "explore base prompt"}
 	registry := task.buildRegistry(at, parentMutationScope{}, nil)
 	ref := coremodel.ModelRef{Provider: "test", Model: "alt-model"}
 
@@ -112,7 +111,7 @@ func TestSubagentFixtureExcludesToolSeedsBlockAndLeak(t *testing.T) {
 // Bullet 2: a child on a baseline model is unchanged — advertised set, prompt, no leak.
 func TestSubagentBaselineModelUnchanged(t *testing.T) {
 	task := newSubagentTaskTool(t, subResolver)
-	at := subagent.AgentType{Name: "explore", Tools: []string{"read_file", "write_file"}, Prompt: "explore base prompt"}
+	at := agentcfg.Resolved{Name: "explore", Tools: []string{"read_file", "write_file"}, Prompt: "explore base prompt"}
 	registry := task.buildRegistry(at, parentMutationScope{}, nil)
 	ref := coremodel.ModelRef{Provider: "test", Model: "baseline-model"} // not mapped -> nil
 
@@ -139,11 +138,11 @@ func TestSubagentBaselineModelUnchanged(t *testing.T) {
 	}
 }
 
-// Bullet 3: the child resolves its OWN model's adaptation (the model from resolveClient,
-// which may be the cfg.Subagents.Model override), never the parent's.
+// Bullet 3: the child resolves its OWN model's adaptation (the model from the
+// resolved child agent type), never the parent's.
 func TestSubagentResolvesOwnModelNotParent(t *testing.T) {
 	task := newSubagentTaskTool(t, subResolver)
-	at := subagent.AgentType{Name: "explore", Tools: []string{"read_file"}, Prompt: "p"}
+	at := agentcfg.Resolved{Name: "explore", Tools: []string{"read_file"}, Prompt: "p"}
 	registry := task.buildRegistry(at, parentMutationScope{}, nil)
 
 	child := task.buildChildLoop(at, dummyChildClient(), registry, coremodel.ModelRef{Provider: "test", Model: "alt-model"})
@@ -159,24 +158,28 @@ func TestSubagentResolvesOwnModelNotParent(t *testing.T) {
 	}
 }
 
-// Bullet 3 (mechanism): the cfg.Subagents.Model override (subModel) makes the child's
-// model — the one resolveClient hands buildChildLoop — differ from the parent's.
-func TestSubagentSubModelSelectsChildModel(t *testing.T) {
+// Bullet 3 (mechanism): the target agent type's model makes the child's model
+// differ from the parent's.
+func TestSubagentAgentTypeModelSelectsChildModel(t *testing.T) {
 	t.Setenv("LIGHTCODE_LIFECYCLE_KEY", "test-key")
 	a := newLifecycleAgent(t, t.TempDir(), t.TempDir(), "test/test-model")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	a.Init(ctx)
-
-	// Parent runs test-model; point the subagent override at alt-model.
-	a.taskToolInst.setCatalog(a.catalog)
-	a.taskToolInst.setSubModel("test/alt-model")
-	_, ref, err := a.taskToolInst.resolveClient()
+	writeAgentsTestConfig(t, a.configPath, `{
+		"primary": { "model": "test/test-model" },
+		"explore": { "model": "test/alt-model" }
+	}`)
+	if err := a.Reload(); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	at, err := a.taskToolInst.resolveAgentType("explore")
+	if err != nil {
+		t.Fatalf("resolveAgentType: %v", err)
+	}
+	_, ref, err := a.taskToolInst.resolveClient(at.Model)
 	if err != nil {
 		t.Fatalf("resolveClient: %v", err)
 	}
 	if ref.Model != "alt-model" {
-		t.Fatalf("child model = %q, want alt-model (the subModel override, not the parent's test-model)", ref.Model)
+		t.Fatalf("child model = %q, want alt-model (the agent type model, not the parent's test-model)", ref.Model)
 	}
 }
 
@@ -190,7 +193,7 @@ func TestSubagentIncludeExcludeEdgeCases(t *testing.T) {
 			ExcludeTools: []string{"does_not_exist"}, // absent -> harmless
 		}
 	})
-	at := subagent.AgentType{Name: "explore", Tools: []string{"read_file", "task"}, Prompt: "p"}
+	at := agentcfg.Resolved{Name: "explore", Tools: []string{"read_file", "task"}, Prompt: "p"}
 	registry := task.buildRegistry(at, parentMutationScope{}, nil)
 
 	lp := task.buildChildLoop(at, dummyChildClient(), registry, coremodel.ModelRef{Provider: "test", Model: "x"})
@@ -210,7 +213,7 @@ func TestSubagentIncludeExcludeEdgeCases(t *testing.T) {
 // shared state).
 func TestSubagentConcurrentIndependentAdaptations(t *testing.T) {
 	task := newSubagentTaskTool(t, subResolver)
-	at := subagent.AgentType{Name: "explore", Tools: []string{"read_file"}, Prompt: "p"}
+	at := agentcfg.Resolved{Name: "explore", Tools: []string{"read_file"}, Prompt: "p"}
 	models := []string{"alt-model", "parent-model", "baseline-x"}
 	want := []string{"child", "parent", ""}
 
@@ -237,10 +240,9 @@ func TestSubagentConcurrentIndependentAdaptations(t *testing.T) {
 	}
 }
 
-// newSubModelEventAgent builds a full agent whose subagents run a DIFFERENT model than
-// the parent (subagents.model = test/alt-model vs the parent's test-model), pointed at
-// the given SSE base URL.
-func newSubModelEventAgent(t *testing.T, baseURL string) *Agent {
+// newChildModelEventAgent builds a full agent whose custom writer child runs a
+// different model than the parent, pointed at the given SSE base URL.
+func newChildModelEventAgent(t *testing.T, baseURL string) *Agent {
 	t.Helper()
 	home, projectRoot := t.TempDir(), t.TempDir()
 	if err := os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700); err != nil {
@@ -258,12 +260,21 @@ func newSubModelEventAgent(t *testing.T, baseURL string) *Agent {
       "alt-model": { "name": "AM", "context_window": 8192, "max_output_tokens": 1024 }
     }
   } },
-  "default_model": "test/test-model",
-  "subagents": { "model": "test/alt-model" }
+  "default_model": "test/test-model"
 }`, baseURL)
 	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	writeAgentsTestConfig(t, configPath, `{
+		"primary": { "model": "test/test-model" },
+		"writer": {
+			"model": "test/alt-model",
+			"tools": ["read_file", "write_file", "run_command", "process", "sleep"],
+			"prompt": "Writer child.",
+			"description": "Writer child",
+			"subagent": true
+		}
+	}`)
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		t.Fatal(err)
@@ -312,7 +323,7 @@ func TestSubagentChildShowsOwnAdaptationAndGateBlocks(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch calls.Add(1) {
 		case 1:
-			writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"go","subagent_type":"explore"}]}`)
+			writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"go","subagent_type":"writer"}]}`)
 		case 2:
 			body, _ := io.ReadAll(r.Body)
 			childReq1.Store(string(body))
@@ -328,10 +339,9 @@ func TestSubagentChildShowsOwnAdaptationAndGateBlocks(t *testing.T) {
 	}))
 	defer server.Close()
 
-	a := newSubModelEventAgent(t, server.URL+"/v1")
+	a := newChildModelEventAgent(t, server.URL+"/v1")
 	a.resolveAdapt = resolver              // parent -> A (test-model)
 	a.taskToolInst.resolveAdapt = resolver // child -> B (alt-model)
-	writeProjectSubagentType(t, a.projectRoot, "explore", []string{"read_file", "write_file"})
 
 	cap := &eventCapture{}
 	ctx := startEventOrderAgent(t, a, cap)
@@ -382,7 +392,7 @@ func TestSubagentAppliesApplyPatchOnGPT5Family(t *testing.T) {
 		IncludeTools: []string{"apply_patch"},
 	}
 	task := newSubagentTaskTool(t, func(string) *adaptation.Adaptation { return gptCodex })
-	at := subagent.AgentType{Name: "explore", Tools: []string{"read_file", "edit_file", "write_file"}, Prompt: "p"}
+	at := agentcfg.Resolved{Name: "explore", Tools: []string{"read_file", "edit_file", "write_file"}, Prompt: "p"}
 	registry := task.buildRegistry(at, parentMutationScope{}, nil)
 	ref := coremodel.ModelRef{Provider: "test", Model: "gpt-5.4"}
 
@@ -413,7 +423,7 @@ func TestReadOnlySubagentDoesNotReceiveApplyPatch(t *testing.T) {
 		IncludeTools: []string{"apply_patch"},
 	}
 	task := newSubagentTaskTool(t, func(string) *adaptation.Adaptation { return gptCodex })
-	at := subagent.AgentType{Name: "explore", Tools: []string{"read_file"}, Prompt: "p"}
+	at := agentcfg.Resolved{Name: "explore", Tools: []string{"read_file"}, Prompt: "p"}
 	registry := task.buildRegistry(at, parentMutationScope{}, nil)
 	ref := coremodel.ModelRef{Provider: "test", Model: "gpt-5.4"}
 
@@ -427,7 +437,7 @@ func TestReadOnlySubagentDoesNotReceiveApplyPatch(t *testing.T) {
 
 func TestReadOnlySubagentDoesNotReceiveExecutePending(t *testing.T) {
 	task := newSubagentTaskTool(t, nil)
-	at := subagent.AgentType{
+	at := agentcfg.Resolved{
 		Name:   "explore",
 		Tools:  []string{"read_file", "run_command", "diagnostics", "workspace_symbol"},
 		Prompt: "p",

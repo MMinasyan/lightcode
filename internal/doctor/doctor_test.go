@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/config"
 )
 
 func snapshotTree(t *testing.T, root string) map[string]string {
@@ -76,6 +75,17 @@ func writeConfig(t *testing.T, home, body string) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeAgents(t *testing.T, home, body string) {
+	t.Helper()
+	dir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "agents.json"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -157,8 +167,8 @@ func TestEmptySkeletonIsFreshMachine(t *testing.T) {
 	if find(t, report, "setup", "provider").Status != StatusWarn {
 		t.Fatal("setup/provider should warn with nothing connected")
 	}
-	if find(t, report, "setup", "default-model").Status != StatusWarn {
-		t.Fatal("setup/default-model should warn on empty default")
+	if find(t, report, "setup", "model").Status != StatusWarn {
+		t.Fatal("setup/model should warn on empty primary model")
 	}
 }
 
@@ -251,12 +261,13 @@ func TestKeySourceClasses(t *testing.T) {
   },
   "default_model": "keyedtest/m1"
 }`)
+		writeAgents(t, home, `{"primary": {"model": "keyedtest/m1"}}`)
 		if err := os.WriteFile(filepath.Join(home, ".lightcode", ".env"), []byte("DOCTOR_TEST_KEY=\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		report, _ := run(t, params(home))
-		if c := find(t, report, "setup", "default-model"); c.Status != StatusWarn {
-			t.Fatalf("setup/default-model = %+v, want warn with an empty key", c)
+		if c := find(t, report, "setup", "model"); c.Status != StatusWarn {
+			t.Fatalf("setup/model = %+v, want warn with an empty key", c)
 		}
 	})
 
@@ -358,8 +369,8 @@ func TestConnectionSemantics(t *testing.T) {
 	})
 }
 
-func TestDefaultModelChecks(t *testing.T) {
-	configWithDefault := func(defaultModel, modelBody string) string {
+func TestPrimaryModelChecks(t *testing.T) {
+	configWithModel := func(modelBody string) string {
 		return `{
   "providers": {
     "keyedtest": {
@@ -367,8 +378,7 @@ func TestDefaultModelChecks(t *testing.T) {
       "discovery": false,
       "models": {"m1": ` + modelBody + `}
     }
-  },
-  "default_model": "` + defaultModel + `"
+  }
 }`
 	}
 	envSet := func(name string) (string, bool) { return "x", name == "DOCTOR_TEST_KEY" }
@@ -376,43 +386,30 @@ func TestDefaultModelChecks(t *testing.T) {
 	cases := []struct {
 		name       string
 		config     string
+		agents     string
 		env        func(string) (string, bool)
 		wantStatus string
 	}{
-		{"available default model", configWithDefault("keyedtest/m1", `{"context_window": 8192}`), envSet, StatusOK},
-		{"missing default model", configWithDefault("keyedtest/nosuch", `{"context_window": 8192}`), envSet, StatusWarn},
-		{"incomplete default model", configWithDefault("keyedtest/m1", `{}`), envSet, StatusWarn},
-		{"provider not connected", configWithDefault("keyedtest/m1", `{"context_window": 8192}`), nil, StatusWarn},
-		{"hidden but complete default model", configWithDefault("keyedtest/m1", `{"context_window": 8192, "hidden": true}`), envSet, StatusOK},
+		{"available primary model", configWithModel(`{"context_window": 8192}`), `{"primary": {"model": "keyedtest/m1"}}`, envSet, StatusOK},
+		{"missing primary model", configWithModel(`{"context_window": 8192}`), `{"primary": {"model": "keyedtest/nosuch"}}`, envSet, StatusWarn},
+		{"incomplete primary model", configWithModel(`{}`), `{"primary": {"model": "keyedtest/m1"}}`, envSet, StatusWarn},
+		{"provider not connected", configWithModel(`{"context_window": 8192}`), `{"primary": {"model": "keyedtest/m1"}}`, nil, StatusWarn},
+		{"hidden but complete primary model", configWithModel(`{"context_window": 8192, "hidden": true}`), `{"primary": {"model": "keyedtest/m1"}}`, envSet, StatusOK},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
 			writeConfig(t, home, tc.config)
+			writeAgents(t, home, tc.agents)
 			p := params(home)
 			if tc.env != nil {
 				p.LookupEnv = tc.env
 			}
 			report, _ := run(t, p)
-			if c := find(t, report, "setup", "default-model"); c.Status != tc.wantStatus {
-				t.Fatalf("setup/default-model = %+v, want %s", c, tc.wantStatus)
+			if c := find(t, report, "setup", "model"); c.Status != tc.wantStatus {
+				t.Fatalf("setup/model = %+v, want %s", c, tc.wantStatus)
 			}
 		})
-	}
-}
-
-// An unparseable default_model cannot reach the setup check through a real
-// config (config.Parse rejects non-prefixed refs), so the defensive branch
-// is exercised directly.
-func TestSetupModelCheckUnparseableRef(t *testing.T) {
-	var checks []Check
-	add := func(group, name, status, detail string) {
-		checks = append(checks, Check{Group: group, Name: name, Status: status, Detail: detail})
-	}
-	cfg := &config.Config{DefaultModel: "no-slash-ref"}
-	setupModelCheck(cfg, &catalog.Catalog{Providers: map[string]*catalog.Provider{}}, func(string) bool { return false }, add)
-	if len(checks) != 1 || checks[0].Status != StatusWarn {
-		t.Fatalf("checks = %+v, want one warn", checks)
 	}
 }
 

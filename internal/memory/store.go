@@ -39,11 +39,14 @@ type Store struct {
 }
 
 func NewStore(embedder *Embedder, projectsRoot, home string) *Store {
-	var e memoryEmbedder
-	if embedder != nil {
-		e = embedder
+	if embedder == nil {
+		return NewStoreWithEmbedder(nil, projectsRoot, home)
 	}
-	return &Store{embedder: e, projectsRoot: projectsRoot, home: home}
+	return NewStoreWithEmbedder(embedder, projectsRoot, home)
+}
+
+func NewStoreWithEmbedder(embedder memoryEmbedder, projectsRoot, home string) *Store {
+	return &Store{embedder: embedder, projectsRoot: projectsRoot, home: home}
 }
 
 func (s *Store) SaveMemory(memoriesDir, title, content string) (string, error) {

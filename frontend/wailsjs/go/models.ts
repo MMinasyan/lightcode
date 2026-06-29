@@ -673,7 +673,6 @@ export namespace agent {
 	
 	export class RuntimeCompactionConfig {
 	    threshold_pct: number;
-	    summarizer_model: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new RuntimeCompactionConfig(source);
@@ -682,7 +681,6 @@ export namespace agent {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.threshold_pct = source["threshold_pct"];
-	        this.summarizer_model = source["summarizer_model"];
 	    }
 	}
 	export class RuntimeToolsConfig {
@@ -707,7 +705,6 @@ export namespace agent {
 	}
 	export class RuntimeSubagentsConfig {
 	    max_concurrent: number;
-	    model: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new RuntimeSubagentsConfig(source);
@@ -716,7 +713,6 @@ export namespace agent {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.max_concurrent = source["max_concurrent"];
-	        this.model = source["model"];
 	    }
 	}
 	export class RuntimeSessionsConfig {

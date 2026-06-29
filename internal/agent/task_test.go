@@ -15,9 +15,11 @@ import (
 	"sync/atomic"
 	"testing"
 
+	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
 	loop "github.com/MMinasyan/lightcode/internal/engine"
+	"github.com/MMinasyan/lightcode/internal/lsp"
+	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
-	"github.com/MMinasyan/lightcode/internal/subagent"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
@@ -155,8 +157,8 @@ func TestDrainPendingLoopEventsDrainsTaggedSubagentEvents(t *testing.T) {
 }
 
 func TestTaskToolMetadataAndValidation(t *testing.T) {
-	loader := subagent.NewLoader(t.TempDir(), t.TempDir())
-	task := newTaskTool(taskToolConfig{Loader: loader})
+	agents := mustParseTaskAgents(t, `{}`)
+	task := newTaskTool(taskToolConfig{AgentTypes: agents})
 	if task.maxConcurrent != 4 {
 		t.Fatalf("default maxConcurrent = %d, want 4", task.maxConcurrent)
 	}
@@ -182,6 +184,52 @@ func TestTaskToolMetadataAndValidation(t *testing.T) {
 	}
 }
 
+func TestTaskToolAgentTypeResolutionUsesAgentsConfig(t *testing.T) {
+	agents := mustParseTaskAgents(t, `{
+		"primary": { "model": "test/test-model" },
+		"worker": {
+			"model": "test/alt-model",
+			"tools": ["read_file"],
+			"prompt": "Worker prompt.",
+			"description": "Worker",
+			"subagent": true
+		}
+	}`)
+	task := newTaskTool(taskToolConfig{AgentTypes: agents})
+
+	at, err := task.resolveAgentType("worker")
+	if err != nil {
+		t.Fatalf("resolveAgentType worker: %v", err)
+	}
+	if at.Model != "test/alt-model" || !at.Subagent {
+		t.Fatalf("worker resolution = %#v, want explicit child model and subagent=true", at)
+	}
+	if _, err := task.resolveAgentType("primary"); err == nil {
+		t.Fatal("resolveAgentType primary returned nil error, want non-subagent rejection")
+	}
+}
+
+func TestTaskToolAgentTypeResolutionInheritsPrimaryModel(t *testing.T) {
+	agents := mustParseTaskAgents(t, `{
+		"primary": { "model": "test/test-model" },
+		"worker": {
+			"tools": ["read_file"],
+			"prompt": "Worker prompt.",
+			"description": "Worker",
+			"subagent": true
+		}
+	}`)
+	task := newTaskTool(taskToolConfig{AgentTypes: agents})
+
+	at, err := task.resolveAgentType("worker")
+	if err != nil {
+		t.Fatalf("resolveAgentType worker: %v", err)
+	}
+	if at.Model != "test/test-model" {
+		t.Fatalf("worker model = %q, want inherited primary model", at.Model)
+	}
+}
+
 func TestTaskToolReadOnlyAndRegistryRouting(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -194,19 +242,136 @@ func TestTaskToolReadOnlyAndRegistryRouting(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isReadOnlyType(subagent.AgentType{Tools: tc.tools}); got != tc.want {
+			if got := isReadOnlyType(taskResolvedType(tc.tools)); got != tc.want {
 				t.Fatalf("isReadOnlyType(%v) = %v, want %v", tc.tools, got, tc.want)
 			}
 		})
 	}
 
 	task := &taskTool{}
-	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"read_file", "task"}}, parentMutationScope{}, nil)
+	registry := task.buildRegistry(taskResolvedType([]string{"read_file", "task"}), parentMutationScope{}, nil)
 	if _, ok := registry.Get("read_file"); !ok {
 		t.Fatal("buildRegistry missing allowed read_file tool")
 	}
 	if _, ok := registry.Get("task"); ok {
 		t.Fatal("buildRegistry included recursive task tool")
+	}
+}
+
+func TestTaskToolBuiltInExploreUsesResolvedCapabilities(t *testing.T) {
+	agents := mustParseTaskAgents(t, `{}`)
+	task := &taskTool{
+		check:      func(string, string) permission.Decision { return permission.DecisionAllow },
+		lspManager: lsp.NewManager(t.TempDir(), t.TempDir()),
+	}
+	at, err := agents.Resolve("explore", agentcfg.ResolveContext{})
+	if err != nil {
+		t.Fatalf("resolve explore: %v", err)
+	}
+	if !at.Readonly || !at.LSP {
+		t.Fatalf("test setup: explore resolved readonly=%v lsp=%v, want both true", at.Readonly, at.LSP)
+	}
+
+	registry := task.buildRegistry(at, parentMutationScope{}, nil)
+	for _, name := range []string{"write_file", "edit_file", "apply_patch"} {
+		if _, ok := registry.Get(name); ok {
+			t.Fatalf("explore registry contains %s; names=%v", name, taskRegistryToolNames(registry))
+		}
+		if registry.Advertises(name, nil) {
+			t.Fatalf("explore advertises %s; names=%v", name, taskAdvertisedToolNames(registry))
+		}
+	}
+	for _, name := range []string{"read_file", "run_command", "diagnostics", "workspace_symbol"} {
+		if _, ok := registry.Get(name); !ok {
+			t.Fatalf("explore registry missing %s; names=%v", name, taskRegistryToolNames(registry))
+		}
+	}
+
+	runCommand, _ := registry.Get("run_command")
+	if _, err := runCommand.Execute(context.Background(), map[string]any{"command": "touch should-not-run"}); err == nil {
+		t.Fatal("explore run_command accepted a write-style command; want read-only rejection")
+	}
+}
+
+func TestTaskToolCustomLSPCapabilityControlsLSPTools(t *testing.T) {
+	agents := mustParseTaskAgents(t, `{
+		"primary": { "model": "test/test-model" },
+		"with_lsp": {
+			"tools": ["read_file"],
+			"lsp": true,
+			"prompt": "With LSP.",
+			"description": "With LSP",
+			"subagent": true
+		},
+		"without_lsp": {
+			"tools": ["read_file"],
+			"lsp": false,
+			"prompt": "Without LSP.",
+			"description": "Without LSP",
+			"subagent": true
+		}
+	}`)
+	task := &taskTool{lspManager: lsp.NewManager(t.TempDir(), t.TempDir())}
+
+	withLSP, err := agents.Resolve("with_lsp", agentcfg.ResolveContext{})
+	if err != nil {
+		t.Fatalf("resolve with_lsp: %v", err)
+	}
+	withRegistry := task.buildRegistry(withLSP, parentMutationScope{}, nil)
+	for _, name := range []string{"diagnostics", "workspace_symbol"} {
+		if _, ok := withRegistry.Get(name); !ok {
+			t.Fatalf("lsp:true registry missing %s; names=%v", name, taskRegistryToolNames(withRegistry))
+		}
+	}
+
+	withoutLSP, err := agents.Resolve("without_lsp", agentcfg.ResolveContext{})
+	if err != nil {
+		t.Fatalf("resolve without_lsp: %v", err)
+	}
+	withoutRegistry := task.buildRegistry(withoutLSP, parentMutationScope{}, nil)
+	for _, name := range []string{"diagnostics", "workspace_symbol"} {
+		if _, ok := withoutRegistry.Get(name); ok {
+			t.Fatalf("lsp:false registry contains %s; names=%v", name, taskRegistryToolNames(withoutRegistry))
+		}
+	}
+}
+
+func TestTaskToolMemoryCapabilityControlsMemoryTools(t *testing.T) {
+	task := &taskTool{memoryStore: memory.NewStore(nil, t.TempDir(), t.TempDir())}
+
+	withMemory := task.buildRegistry(agentcfg.Resolved{
+		Tools:  []string{"read_file"},
+		Memory: true,
+	}, parentMutationScope{}, nil)
+	for _, name := range []string{"save_memory", "search_memory", "search_history"} {
+		if _, ok := withMemory.Get(name); !ok {
+			t.Fatalf("memory:true registry missing %s; names=%v", name, taskRegistryToolNames(withMemory))
+		}
+	}
+
+	withoutMemory := task.buildRegistry(agentcfg.Resolved{
+		Tools:  []string{"read_file"},
+		Memory: false,
+	}, parentMutationScope{}, nil)
+	for _, name := range []string{"save_memory", "search_memory", "search_history"} {
+		if _, ok := withoutMemory.Get(name); ok {
+			t.Fatalf("memory:false registry contains %s; names=%v", name, taskRegistryToolNames(withoutMemory))
+		}
+	}
+
+	onlyMemory := task.buildRegistry(agentcfg.Resolved{
+		Tools:  []string{},
+		Memory: true,
+	}, parentMutationScope{}, nil)
+	for _, name := range []string{"save_memory", "search_memory", "search_history"} {
+		if _, ok := onlyMemory.Get(name); !ok {
+			t.Fatalf("tools:[] memory:true registry missing %s; names=%v", name, taskRegistryToolNames(onlyMemory))
+		}
+	}
+	for _, name := range []string{"read_file", "write_file", "edit_file", "run_command", "process", "sleep", "diagnostics", "workspace_symbol"} {
+		if _, ok := onlyMemory.Get(name); ok {
+			t.Fatalf("tools:[] memory:true registry contains non-memory tool %s; names=%v", name, taskRegistryToolNames(onlyMemory))
+		}
 	}
 }
 
@@ -224,7 +389,7 @@ func TestTaskToolWrapsReadOnlyRunCommandWithParentPermission(t *testing.T) {
 		},
 	}
 
-	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"run_command"}}, parentMutationScope{}, nil)
+	registry := task.buildRegistry(taskResolvedType([]string{"run_command"}), parentMutationScope{}, nil)
 	runCommand, ok := registry.Get("run_command")
 	if !ok {
 		t.Fatal("buildRegistry missing run_command")
@@ -256,7 +421,7 @@ func TestTaskToolReadOnlyRunCommandCanAskAndExecute(t *testing.T) {
 		},
 	}
 
-	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"run_command"}}, parentMutationScope{}, nil)
+	registry := task.buildRegistry(taskResolvedType([]string{"run_command"}), parentMutationScope{}, nil)
 	runCommand, ok := registry.Get("run_command")
 	if !ok {
 		t.Fatal("buildRegistry missing run_command")
@@ -280,7 +445,7 @@ func TestTaskToolReadOnlyRunCommandCanAskAndExecute(t *testing.T) {
 func TestTaskToolReadOnlyRunCommandFailsClosedWithoutPermissionGate(t *testing.T) {
 	task := &taskTool{}
 
-	registry := task.buildRegistry(subagent.AgentType{Tools: []string{"run_command"}}, parentMutationScope{}, nil)
+	registry := task.buildRegistry(taskResolvedType([]string{"run_command"}), parentMutationScope{}, nil)
 	runCommand, ok := registry.Get("run_command")
 	if !ok {
 		t.Fatal("buildRegistry missing run_command")
@@ -295,14 +460,13 @@ func TestTaskToolReadOnlyRunCommandFailsClosedWithoutPermissionGate(t *testing.T
 func TestTaskToolStateAndSessionID(t *testing.T) {
 	task := &taskTool{}
 	cancelled := false
-	task.updateParentState("provider", "model", func() { cancelled = true })
-	task.setSubModel("other/model")
+	task.updateParentState(func() { cancelled = true })
 
 	task.mu.Lock()
-	providerName, model, subModel, cancel := task.providerName, task.model, task.subModel, task.cancelParent
+	cancel := task.cancelParent
 	task.mu.Unlock()
-	if providerName != "provider" || model != "model" || subModel != "other/model" {
-		t.Fatalf("task state = %q/%q sub:%q, want provider/model sub other/model", providerName, model, subModel)
+	if cancel == nil {
+		t.Fatal("cancelParent was not preserved")
 	}
 	cancel()
 	if !cancelled {
@@ -433,7 +597,12 @@ func TestTaskToolChildStagedEditUsesParentTurnSnapshot(t *testing.T) {
 
 	a := newEventOrderAgent(t, server.URL+"/v1")
 	a.cfg.Permissions.Allow = []string{"read_file(/**)", "edit_file(/**)", "write_file(/**)"}
-	writeProjectSubagentType(t, a.projectRoot, "editor", []string{"read_file", "edit_file", "execute_pending"})
+	writeTaskAgentTypes(t, a, `"editor": {
+		"description": "test editor",
+		"tools": ["read_file", "edit_file", "execute_pending"],
+		"prompt": "Test editor.",
+		"subagent": true
+	}`)
 	target := filepath.Join(a.projectRoot, "target.txt")
 	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
 		t.Fatalf("write target: %v", err)
@@ -537,7 +706,12 @@ func TestTaskToolChildBackgroundProcessStaysChildScoped(t *testing.T) {
 	defer server.Close()
 
 	a = newEventOrderAgent(t, server.URL+"/v1")
-	writeProjectSubagentType(t, a.projectRoot, "runner", []string{"run_command", "sleep", "process", "write_file"})
+	writeTaskAgentTypes(t, a, `"runner": {
+		"description": "test runner",
+		"tools": ["run_command", "sleep", "process", "write_file"],
+		"prompt": "Test runner.",
+		"subagent": true
+	}`)
 	cap := &eventCapture{}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -617,20 +791,51 @@ func hasDisplayMessage(msgs []DisplayMessage, typ, content string) bool {
 	return false
 }
 
-func writeProjectSubagentType(t *testing.T, projectRoot, name string, tools []string) {
+func taskResolvedType(tools []string) agentcfg.Resolved {
+	return agentcfg.Resolved{Tools: tools}
+}
+
+func taskRegistryToolNames(r *tool.Registry) []string {
+	var names []string
+	for _, name := range []string{
+		"read_file", "write_file", "edit_file", "apply_patch", "run_command",
+		"execute_pending", "process", "sleep", "task", "save_memory", "search_memory",
+		"search_history", "diagnostics", "workspace_symbol",
+	} {
+		if _, ok := r.Get(name); ok {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func taskAdvertisedToolNames(r *tool.Registry) []string {
+	var names []string
+	for _, tl := range r.AdvertisedTools(nil) {
+		if tl.Function != nil {
+			names = append(names, tl.Function.Name)
+		}
+	}
+	return names
+}
+
+func mustParseTaskAgents(t *testing.T, content string) *agentcfg.Config {
 	t.Helper()
-	dir := filepath.Join(projectRoot, ".lightcode", "agents")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir agents: %v", err)
+	cfg, err := agentcfg.Parse([]byte(content))
+	if err != nil {
+		t.Fatalf("parse agents config: %v", err)
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "---\nname: %s\ndescription: test %s\ntools:\n", name, name)
-	for _, toolName := range tools {
-		fmt.Fprintf(&b, "  - %s\n", toolName)
-	}
-	fmt.Fprint(&b, "---\nTest subagent.")
-	if err := os.WriteFile(filepath.Join(dir, name+".md"), []byte(b.String()), 0o644); err != nil {
-		t.Fatalf("write subagent type: %v", err)
+	return cfg
+}
+
+func writeTaskAgentTypes(t *testing.T, a *Agent, entries string) {
+	t.Helper()
+	writeAgentsTestConfig(t, a.configPath, `{
+		"primary": { "model": "test/test-model" },
+		`+entries+`
+	}`)
+	if err := a.Reload(); err != nil {
+		t.Fatalf("reload task agent types: %v", err)
 	}
 }
 
@@ -654,7 +859,7 @@ func TestSubagentRunCommandUsesFreshPermissionWrappedTool(t *testing.T) {
 		},
 	}
 
-	at := subagent.AgentType{Tools: []string{"run_command", "write_file"}}
+	at := taskResolvedType([]string{"run_command", "write_file"})
 	if isReadOnlyType(at) {
 		t.Fatal("test setup: at must be non-read-only")
 	}
