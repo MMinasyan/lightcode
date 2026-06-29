@@ -3,12 +3,18 @@
 package safefs
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"golang.org/x/sys/unix"
+)
+
+var (
+	ErrNonRegular = errors.New("safefs: non-regular target")
+	ErrHardlink   = errors.New("safefs: hardlinked target")
 )
 
 // OpenExisting opens path without following any symlink in the parent
@@ -115,13 +121,13 @@ func requireRemovableLeaf(parent int, base, path string) error {
 	switch st.Mode & unix.S_IFMT {
 	case unix.S_IFREG, unix.S_IFLNK:
 		if st.Nlink > 1 {
-			return fmt.Errorf("safefs: hardlinked target (link count > 1): %s", path)
+			return fmt.Errorf("%w (link count > 1): %s", ErrHardlink, path)
 		}
 		return nil
 	case unix.S_IFDIR:
 		return nil
 	default:
-		return fmt.Errorf("safefs: non-regular leaf target: %s", path)
+		return fmt.Errorf("%w: leaf target: %s", ErrNonRegular, path)
 	}
 }
 
@@ -189,10 +195,10 @@ func requireRegularFD(fd int, path string) error {
 		return &os.PathError{Op: "fstat", Path: path, Err: err}
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return fmt.Errorf("safefs: non-regular file target: %s", path)
+		return fmt.Errorf("%w: file target: %s", ErrNonRegular, path)
 	}
 	if st.Nlink > 1 {
-		return fmt.Errorf("safefs: hardlinked target (link count > 1): %s", path)
+		return fmt.Errorf("%w (link count > 1): %s", ErrHardlink, path)
 	}
 	return nil
 }

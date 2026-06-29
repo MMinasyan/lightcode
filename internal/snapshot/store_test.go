@@ -118,9 +118,7 @@ func TestSnapshotDeduplicatesSymlinkAndRealPath(t *testing.T) {
 			if symlinkFirst {
 				first, second = linkPath, realPath
 			}
-			if err := store.Snapshot(turn, first); err != nil {
-				t.Fatal(err)
-			}
+			entryID := snapshotEntry(t, store, turn, first, realPath)
 			if err := store.Snapshot(turn, second); err != nil {
 				t.Fatal(err)
 			}
@@ -136,11 +134,12 @@ func TestSnapshotDeduplicatesSymlinkAndRealPath(t *testing.T) {
 			if err := os.WriteFile(realPath, []byte("v2"), 0o644); err != nil {
 				t.Fatal(err)
 			}
+			recordSnapshotContent(t, store, turn, entryID, "v2")
 			affected, err := store.RevertCode(0)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(affected) != 1 {
+			if len(affected.Restored) != 1 {
 				t.Fatalf("affected = %v, want one path", affected)
 			}
 			got, err := os.ReadFile(realPath)
@@ -167,9 +166,7 @@ func TestSnapshotResolvedPreservesOriginalPathForListing(t *testing.T) {
 	}
 
 	turn := store.BeginTurn()
-	if err := store.SnapshotResolved(turn, linkPath, realPath); err != nil {
-		t.Fatal(err)
-	}
+	entryID := snapshotEntry(t, store, turn, linkPath, realPath)
 
 	entries, err := store.ListTurns()
 	if err != nil {
@@ -184,11 +181,12 @@ func TestSnapshotResolvedPreservesOriginalPathForListing(t *testing.T) {
 	if err := os.WriteFile(realPath, []byte("v2"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	recordSnapshotContent(t, store, turn, entryID, "v2")
 	affected, err := store.RevertCode(0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(affected, []string{linkPath}) {
+	if !reflect.DeepEqual(affected.Restored, []string{linkPath}) {
 		t.Fatalf("affected = %v, want original requested path %q", affected, linkPath)
 	}
 	if got, err := os.ReadFile(realPath); err != nil || string(got) != "v1" {
@@ -289,16 +287,20 @@ func TestSnapshotResolvedRetainsEntryAgainstLaterDiscard(t *testing.T) {
 	}
 }
 
-func TestRevertRefusesCanonicalPathReplacedBySymlink(t *testing.T) {
+func TestRevertSkipsCanonicalPathReplacedBySymlinkAndContinues(t *testing.T) {
 	store := newTestStore(t)
 	projectDir := t.TempDir()
 	originalTarget := filepath.Join(projectDir, "original.txt")
 	repointedTarget := filepath.Join(projectDir, "repointed.txt")
 	linkPath := filepath.Join(projectDir, "link.txt")
+	ownedPath := filepath.Join(projectDir, "owned.txt")
 	if err := os.WriteFile(originalTarget, []byte("before"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(repointedTarget, []byte("other"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ownedPath, []byte("owned-before"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(originalTarget, linkPath); err != nil {
@@ -306,12 +308,16 @@ func TestRevertRefusesCanonicalPathReplacedBySymlink(t *testing.T) {
 	}
 
 	turn := store.BeginTurn()
-	if err := store.SnapshotResolved(turn, linkPath, originalTarget); err != nil {
-		t.Fatal(err)
-	}
+	linkEntry := snapshotEntry(t, store, turn, linkPath, originalTarget)
+	ownedEntry := snapshotEntry(t, store, turn, ownedPath, ownedPath)
 	if err := os.WriteFile(originalTarget, []byte("after"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	recordSnapshotContent(t, store, turn, linkEntry, "after")
+	if err := os.WriteFile(ownedPath, []byte("owned-after"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recordSnapshotContent(t, store, turn, ownedEntry, "owned-after")
 	if err := os.Remove(linkPath); err != nil {
 		t.Fatal(err)
 	}
@@ -321,17 +327,72 @@ func TestRevertRefusesCanonicalPathReplacedBySymlink(t *testing.T) {
 
 	affected, err := store.RevertCode(0)
 
-	if err == nil || !strings.Contains(err.Error(), "canonical path changed") {
-		t.Fatalf("RevertCode error = %v, want canonical path changed error", err)
+	if err != nil {
+		t.Fatalf("RevertCode error = %v, want skipped symlink target", err)
 	}
-	if len(affected) != 0 {
-		t.Fatalf("affected = %v, want none on refused restore", affected)
+	if !reflect.DeepEqual(affected.Restored, []string{ownedPath}) {
+		t.Fatalf("restored = %v, want [%s]", affected.Restored, ownedPath)
+	}
+	if len(affected.Skipped) != 1 || affected.Skipped[0].Path != linkPath {
+		t.Fatalf("skipped = %+v, want %s", affected.Skipped, linkPath)
 	}
 	if got, err := os.ReadFile(originalTarget); err != nil || string(got) != "after" {
 		t.Fatalf("original target = %q, %v; want after", got, err)
 	}
 	if got, err := os.ReadFile(repointedTarget); err != nil || string(got) != "other" {
 		t.Fatalf("repointed target = %q, %v; want other", got, err)
+	}
+	if got, err := os.ReadFile(ownedPath); err != nil || string(got) != "owned-before" {
+		t.Fatalf("owned target = %q, %v; want owned-before", got, err)
+	}
+}
+
+func TestRevertSkipsExistingFileReplacedByDirectoryAndContinues(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	dirPath := filepath.Join(projectDir, "target.txt")
+	ownedPath := filepath.Join(projectDir, "owned.txt")
+	if err := os.WriteFile(dirPath, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ownedPath, []byte("owned-before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	dirEntry := snapshotEntry(t, store, turn, dirPath, dirPath)
+	ownedEntry := snapshotEntry(t, store, turn, ownedPath, ownedPath)
+	if err := os.WriteFile(dirPath, []byte("after"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recordSnapshotContent(t, store, turn, dirEntry, "after")
+	if err := os.WriteFile(ownedPath, []byte("owned-after"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recordSnapshotContent(t, store, turn, ownedEntry, "owned-after")
+	if err := os.Remove(dirPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(dirPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+
+	if err != nil {
+		t.Fatalf("RevertCode error = %v, want skipped directory replacement", err)
+	}
+	if !reflect.DeepEqual(affected.Restored, []string{ownedPath}) {
+		t.Fatalf("restored = %v, want [%s]", affected.Restored, ownedPath)
+	}
+	if len(affected.Skipped) != 1 || affected.Skipped[0].Path != dirPath {
+		t.Fatalf("skipped = %+v, want %s", affected.Skipped, dirPath)
+	}
+	if info, err := os.Lstat(dirPath); err != nil || !info.IsDir() {
+		t.Fatalf("directory replacement = %v, %v; want preserved directory", info, err)
+	}
+	if got, err := os.ReadFile(ownedPath); err != nil || string(got) != "owned-before" {
+		t.Fatalf("owned target = %q, %v; want owned-before", got, err)
 	}
 }
 
@@ -351,7 +412,11 @@ func TestRevertOldSnapshotMetaFallsBackToOriginalPath(t *testing.T) {
 	if err := copyFile(path, filepath.Join(entryDir, "original")); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: path, Existed: true}); err != nil {
+	if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{
+		OriginalPath: path,
+		Existed:      true,
+		LastWrite:    &SnapshotContentIdentity{Hash: hashBytes([]byte("after"))},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if turn != 1 {
@@ -366,7 +431,7 @@ func TestRevertOldSnapshotMetaFallsBackToOriginalPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(affected, []string{path}) {
+	if !reflect.DeepEqual(affected.Restored, []string{path}) {
 		t.Fatalf("affected = %v, want [%s]", affected, path)
 	}
 	if got, err := os.ReadFile(path); err != nil || string(got) != "before" {
@@ -390,7 +455,11 @@ func TestRevertOldSnapshotMetaRestoresMissingRegularPathWithOldHash(t *testing.T
 	if err := copyFile(path, filepath.Join(entryDir, "original")); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: path, Existed: true}); err != nil {
+	if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{
+		OriginalPath: path,
+		Existed:      true,
+		LastWrite:    &SnapshotContentIdentity{Absent: true},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if turn != 1 {
@@ -405,11 +474,45 @@ func TestRevertOldSnapshotMetaRestoresMissingRegularPathWithOldHash(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(affected, []string{path}) {
+	if !reflect.DeepEqual(affected.Restored, []string{path}) {
 		t.Fatalf("affected = %v, want [%s]", affected, path)
 	}
 	if got, err := os.ReadFile(path); err != nil || string(got) != "before" {
 		t.Fatalf("restored content = %q, %v; want before", got, err)
+	}
+}
+
+func TestRevertSkipsExistingFileSnapshotWithoutRecordedLastWriteIdentity(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	path := filepath.Join(projectDir, "target.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := store.BeginTurn()
+	if err := store.Snapshot(turn, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("after"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(affected.Restored) != 0 {
+		t.Fatalf("restored = %v, want none", affected.Restored)
+	}
+	if len(affected.Skipped) != 1 || affected.Skipped[0].Path != path {
+		t.Fatalf("skipped = %+v, want %s", affected.Skipped, path)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "after" {
+		t.Fatalf("path content = %q, %v; want after", got, err)
+	}
+	if got := readIntDirs(store.snapshotsDir); !reflect.DeepEqual(got, []int{turn}) {
+		t.Fatalf("snapshot dirs = %v, want [%d]", got, turn)
 	}
 }
 
@@ -433,7 +536,11 @@ func TestRevertOldSnapshotMetaRestoresCurrentSymlinkTargetWhenHashMatches(t *tes
 	if err := copyFile(originalTarget, filepath.Join(entryDir, "original")); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: linkPath, Existed: true}); err != nil {
+	if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{
+		OriginalPath: linkPath,
+		Existed:      true,
+		LastWrite:    &SnapshotContentIdentity{Hash: hashBytes([]byte("after"))},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if turn != 1 {
@@ -448,7 +555,7 @@ func TestRevertOldSnapshotMetaRestoresCurrentSymlinkTargetWhenHashMatches(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(affected, []string{linkPath}) {
+	if !reflect.DeepEqual(affected.Restored, []string{linkPath}) {
 		t.Fatalf("affected = %v, want [%s]", affected, linkPath)
 	}
 	if got, err := os.ReadFile(originalTarget); err != nil || string(got) != "before" {
@@ -491,7 +598,7 @@ func TestRevertOldSnapshotMetaRefusesGoneSymlinkTarget(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "target missing and cannot be proven") {
 		t.Fatalf("RevertCode error = %v, want missing legacy target refusal", err)
 	}
-	if len(affected) != 0 {
+	if len(affected.Restored) != 0 {
 		t.Fatalf("affected = %v, want none on refused restore", affected)
 	}
 }
@@ -541,7 +648,7 @@ func TestRevertOldSnapshotMetaRefusesCurrentSymlinkPath(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "legacy snapshot target hash changed") {
 		t.Fatalf("RevertCode error = %v, want legacy hash-change refusal", err)
 	}
-	if len(affected) != 0 {
+	if len(affected.Restored) != 0 {
 		t.Fatalf("affected = %v, want none on refused restore", affected)
 	}
 	if got, err := os.ReadFile(originalTarget); err != nil || string(got) != "after" {
@@ -552,7 +659,7 @@ func TestRevertOldSnapshotMetaRefusesCurrentSymlinkPath(t *testing.T) {
 	}
 }
 
-func TestRevertModernSnapshotRefusesFinalTargetSwappedToSymlink(t *testing.T) {
+func TestRevertModernSnapshotSkipsFinalTargetSwappedToSymlink(t *testing.T) {
 	store := newTestStore(t)
 	projectDir := t.TempDir()
 	target := filepath.Join(projectDir, "target.txt")
@@ -565,9 +672,11 @@ func TestRevertModernSnapshotRefusesFinalTargetSwappedToSymlink(t *testing.T) {
 	}
 
 	turn := store.BeginTurn()
-	if err := store.SnapshotResolved(turn, target, target); err != nil {
+	entryID := snapshotEntry(t, store, turn, target, target)
+	if err := os.WriteFile(target, []byte("after"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	recordSnapshotContent(t, store, turn, entryID, "after")
 	if err := os.Remove(target); err != nil {
 		t.Fatal(err)
 	}
@@ -577,18 +686,21 @@ func TestRevertModernSnapshotRefusesFinalTargetSwappedToSymlink(t *testing.T) {
 
 	affected, err := store.RevertCode(0)
 
-	if err == nil || !strings.Contains(err.Error(), "canonical path changed") {
-		t.Fatalf("RevertCode error = %v, want canonical path changed error", err)
+	if err != nil {
+		t.Fatalf("RevertCode error = %v, want skipped symlink replacement", err)
 	}
-	if len(affected) != 0 {
-		t.Fatalf("affected = %v, want none on refused restore", affected)
+	if len(affected.Restored) != 0 {
+		t.Fatalf("restored = %v, want none", affected.Restored)
+	}
+	if len(affected.Skipped) != 1 || affected.Skipped[0].Path != target {
+		t.Fatalf("skipped = %+v, want %s", affected.Skipped, target)
 	}
 	if got, err := os.ReadFile(secret); err != nil || string(got) != "secret" {
 		t.Fatalf("secret target = %q, %v; want unchanged", got, err)
 	}
 }
 
-func TestRevertExistedFalseRemovesSymlinkLeafOnly(t *testing.T) {
+func TestRevertExistedFalseSkipsSymlinkWithoutRecordedIdentity(t *testing.T) {
 	store := newTestStore(t)
 	projectDir := t.TempDir()
 	createdPath := filepath.Join(projectDir, "created.txt")
@@ -610,11 +722,14 @@ func TestRevertExistedFalseRemovesSymlinkLeafOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(affected, []string{createdPath}) {
-		t.Fatalf("affected = %v, want [%s]", affected, createdPath)
+	if len(affected.Restored) != 0 {
+		t.Fatalf("restored = %v, want none", affected.Restored)
 	}
-	if _, err := os.Lstat(createdPath); !os.IsNotExist(err) {
-		t.Fatalf("created symlink should be removed, lstat err = %v", err)
+	if len(affected.Skipped) != 1 || affected.Skipped[0].Path != createdPath {
+		t.Fatalf("skipped = %+v, want %s", affected.Skipped, createdPath)
+	}
+	if _, err := os.Lstat(createdPath); err != nil {
+		t.Fatalf("created symlink should be preserved, lstat err = %v", err)
 	}
 	if got, err := os.ReadFile(secret); err != nil || string(got) != "secret" {
 		t.Fatalf("secret target = %q, %v; want unchanged", got, err)
@@ -640,12 +755,11 @@ func TestRevertExistedFalseRefusesRepointedParent(t *testing.T) {
 	repointedTarget := filepath.Join(repointedRoot, "created.txt")
 
 	turn := store.BeginTurn()
-	if err := store.SnapshotResolved(turn, requestedPath, originalTarget); err != nil {
-		t.Fatal(err)
-	}
+	entryID := snapshotEntry(t, store, turn, requestedPath, originalTarget)
 	if err := os.WriteFile(originalTarget, []byte("original"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	recordSnapshotContent(t, store, turn, entryID, "original")
 	if err := os.WriteFile(repointedTarget, []byte("repointed"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -661,7 +775,7 @@ func TestRevertExistedFalseRefusesRepointedParent(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "canonical path changed") {
 		t.Fatalf("RevertCode error = %v, want canonical path changed error", err)
 	}
-	if len(affected) != 0 {
+	if len(affected.Restored) != 0 {
 		t.Fatalf("affected = %v, want none on refused delete", affected)
 	}
 	if got, err := os.ReadFile(originalTarget); err != nil || string(got) != "original" {
@@ -686,12 +800,11 @@ func TestRevertCodeRestoresLaterSnapshotsAndDeletesLaterSnapshotDirs(t *testing.
 	}
 
 	turn2 := store.BeginTurn()
-	if err := store.Snapshot(turn2, path); err != nil {
-		t.Fatal(err)
-	}
+	entryID := snapshotEntry(t, store, turn2, path, path)
 	if err := os.WriteFile(path, []byte("new"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	recordSnapshotContent(t, store, turn2, entryID, "new")
 	if err := store.MarkTurnComplete(turn2); err != nil {
 		t.Fatal(err)
 	}
@@ -700,7 +813,7 @@ func TestRevertCodeRestoresLaterSnapshotsAndDeletesLaterSnapshotDirs(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(affected, []string{path}) {
+	if !reflect.DeepEqual(affected.Restored, []string{path}) {
 		t.Fatalf("affected = %v, want [%s]", affected, path)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -721,6 +834,29 @@ func newTestStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	return store
+}
+
+func snapshotEntry(t *testing.T, store *Store, turn int, originalPath, canonicalPath string) string {
+	t.Helper()
+	entryID, _, err := store.SnapshotResolvedEntry(turn, originalPath, canonicalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return entryID
+}
+
+func recordSnapshotContent(t *testing.T, store *Store, turn int, entryID string, content string) {
+	t.Helper()
+	if err := store.RecordSnapshotContent(turn, entryID, []byte(content)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func recordSnapshotAbsence(t *testing.T, store *Store, turn int, entryID string) {
+	t.Helper()
+	if err := store.RecordSnapshotAbsence(turn, entryID); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestBeginTurnCreatesAndIncrementsTurnDirs(t *testing.T) {
@@ -892,21 +1028,19 @@ func TestSnapshotFirstWriteWinsAndNewFileDeletesOnRevert(t *testing.T) {
 		t.Fatal(err)
 	}
 	turn := store.BeginTurn()
-	if err := store.Snapshot(turn, existing); err != nil {
-		t.Fatal(err)
-	}
+	existingEntry := snapshotEntry(t, store, turn, existing, existing)
 	if err := os.WriteFile(existing, []byte("v2"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	recordSnapshotContent(t, store, turn, existingEntry, "v2")
 	if err := store.Snapshot(turn, existing); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Snapshot(turn, created); err != nil {
-		t.Fatal(err)
-	}
+	createdEntry := snapshotEntry(t, store, turn, created, created)
 	if err := os.WriteFile(created, []byte("new"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	recordSnapshotContent(t, store, turn, createdEntry, "new")
 
 	if _, err := store.RevertCode(0); err != nil {
 		t.Fatal(err)
@@ -916,6 +1050,56 @@ func TestSnapshotFirstWriteWinsAndNewFileDeletesOnRevert(t *testing.T) {
 	}
 	if _, err := os.Stat(created); !os.IsNotExist(err) {
 		t.Fatalf("created file should be removed, stat err = %v", err)
+	}
+}
+
+func TestRevertSkipBlocksOlderSnapshotForSameFile(t *testing.T) {
+	store := newTestStore(t)
+	projectDir := t.TempDir()
+	path := filepath.Join(projectDir, "file.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	turn1 := store.BeginTurn()
+	entry1 := snapshotEntry(t, store, turn1, path, path)
+	if err := os.WriteFile(path, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recordSnapshotContent(t, store, turn1, entry1, "first")
+	if err := store.MarkTurnComplete(turn1); err != nil {
+		t.Fatal(err)
+	}
+
+	turn2 := store.BeginTurn()
+	entry2 := snapshotEntry(t, store, turn2, path, path)
+	if err := os.WriteFile(path, []byte("second"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recordSnapshotContent(t, store, turn2, entry2, "second")
+	if err := store.MarkTurnComplete(turn2); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(path, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(affected.Restored) != 0 {
+		t.Fatalf("restored = %v, want none", affected.Restored)
+	}
+	if len(affected.Skipped) != 1 || affected.Skipped[0].Path != path {
+		t.Fatalf("skipped = %+v, want one skipped %s", affected.Skipped, path)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "first" {
+		t.Fatalf("path content = %q, %v; want first", got, err)
+	}
+	if got := readIntDirs(store.snapshotsDir); !reflect.DeepEqual(got, []int{turn1, turn2}) {
+		t.Fatalf("snapshot dirs = %v, want [%d %d]", got, turn1, turn2)
 	}
 }
 
@@ -1029,10 +1213,9 @@ func mustAppendMessage(t *testing.T, store *Store, turn int, msg string) {
 	}
 }
 
-// When revertOneTurn fails mid-turn, RevertCode must include the
-// already-restored paths from that turn in the affected list so callers
-// can surface accurate partial-state reporting.
-func TestPR11Closure_RevertCodePartialStateIsReported(t *testing.T) {
+// RevertCode must include both restored and skipped paths from the same turn so
+// callers can surface accurate partial-state reporting while revert continues.
+func TestRevertCodeReportsRestoredAndSkippedStateInSameTurn(t *testing.T) {
 	store := newTestStore(t)
 	projectDir := t.TempDir()
 	pathA := filepath.Join(projectDir, "fileA.txt")
@@ -1048,12 +1231,10 @@ func TestPR11Closure_RevertCodePartialStateIsReported(t *testing.T) {
 	}
 
 	turn := store.BeginTurn()
-	if err := store.Snapshot(turn, pathA); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Snapshot(turn, pathB); err != nil {
-		t.Fatal(err)
-	}
+	entryA := snapshotEntry(t, store, turn, pathA, pathA)
+	entryB := snapshotEntry(t, store, turn, pathB, pathB)
+	recordSnapshotContent(t, store, turn, entryA, "before")
+	recordSnapshotContent(t, store, turn, entryB, "before")
 
 	// revertOneTurn processes entries in os.ReadDir order (lexical by entry
 	// dir name = hashString(EvalSymlinks(canonicalPath))). Resolve symlinks
@@ -1078,11 +1259,11 @@ func TestPR11Closure_RevertCodePartialStateIsReported(t *testing.T) {
 	}
 
 	affected, err := store.RevertCode(0)
-	if err == nil {
-		t.Fatal("RevertCode succeeded; want partial-restore error")
+	if err != nil {
+		t.Fatalf("RevertCode error = %v, want skipped symlink target", err)
 	}
 	containsFirst := false
-	for _, p := range affected {
+	for _, p := range affected.Restored {
 		if p == firstPath {
 			containsFirst = true
 			break
@@ -1090,6 +1271,9 @@ func TestPR11Closure_RevertCodePartialStateIsReported(t *testing.T) {
 	}
 	if !containsFirst {
 		t.Fatalf("affected = %v, want to include %q (already-restored entry before mid-turn failure)", affected, firstPath)
+	}
+	if len(affected.Skipped) != 1 || affected.Skipped[0].Path != secondPath {
+		t.Fatalf("skipped = %+v, want %s", affected.Skipped, secondPath)
 	}
 }
 

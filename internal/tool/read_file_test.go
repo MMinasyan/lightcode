@@ -2,7 +2,6 @@ package tool
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -76,8 +75,8 @@ func TestReadFileTracksSuccessfulReadsAndDeduplicatesUnchangedRange(t *testing.T
 	if !strings.Contains(result, "1\talpha") {
 		t.Fatalf("first Execute result = %q, want file content", result)
 	}
-	if err := wasReadCheckForPath(t, tracker, path); err != nil {
-		t.Fatalf("WasReadCheck after read = %v", err)
+	if !trackerHasRead(tracker, path) {
+		t.Fatal("tracker did not record successful read")
 	}
 
 	result, err = tool.Execute(context.Background(), map[string]any{
@@ -96,7 +95,7 @@ func TestReadFileTracksSuccessfulReadsAndDeduplicatesUnchangedRange(t *testing.T
 	}
 }
 
-func TestReadFileChangedFileBypassesDedupAndRetracks(t *testing.T) {
+func TestReadFileModifiedFileBypassesDedupAndRetracks(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "before")
 	setTrackerFileMtime(t, path, time.Unix(100, 0))
 	tracker := NewFileTracker()
@@ -117,8 +116,8 @@ func TestReadFileChangedFileBypassesDedupAndRetracks(t *testing.T) {
 	if result != "1\tafter" {
 		t.Fatalf("second Execute result = %q, want changed content", result)
 	}
-	if err := wasReadCheckForPath(t, tracker, path); err != nil {
-		t.Fatalf("WasReadCheck after changed read = %v", err)
+	if !trackerHasRead(tracker, path) {
+		t.Fatal("tracker did not record changed read")
 	}
 }
 
@@ -207,12 +206,11 @@ func TestReadFileFollowsSymlinkAndTracksRealPath(t *testing.T) {
 	if result != "1\ttarget" {
 		t.Fatalf("Execute result = %q, want symlink target content", result)
 	}
-	if err := wasReadCheckForPath(t, tracker, realPath); err != nil {
-		t.Fatalf("real path WasReadCheck = %v", err)
+	if !trackerHasRead(tracker, realPath) {
+		t.Fatal("tracker did not record symlink target path")
 	}
-	var readErr *ReadRequiredError
-	if err := wasReadCheckForPath(t, tracker, linkPath); !errors.As(err, &readErr) {
-		t.Fatalf("link path WasReadCheck = %T %v, want *ReadRequiredError", err, err)
+	if trackerHasRead(tracker, linkPath) {
+		t.Fatal("tracker recorded symlink display path; want canonical target only")
 	}
 }
 

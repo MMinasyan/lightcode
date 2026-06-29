@@ -23,10 +23,11 @@ func applyPatchInput(t *testing.T, s string) string {
 // edit_file tests assumes a pre-existing file, which is wrong for
 // apply_patch's Add and Move-destination cases.
 type applyPatchStore struct {
-	turn       int
-	calls      []snapshotCall
-	seen       map[string]string
-	onSnapshot func(call int)
+	turn            int
+	calls           []snapshotCall
+	seen            map[string]string
+	identityRecords []snapshotIdentityRecord
+	onSnapshot      func(call int)
 	// failOnCall, when > 0, makes the Nth snapshot call return errFail
 	// (used to simulate a mid-write failure at the second op).
 	failOnCall int
@@ -57,6 +58,37 @@ func (s *applyPatchStore) SnapshotResolved(turn int, originalPath, canonicalPath
 		return err
 	}
 	s.seen[canonicalPath] = string(data)
+	return nil
+}
+
+func (s *applyPatchStore) SnapshotResolvedEntry(turn int, originalPath, canonicalPath string) (string, bool, error) {
+	if err := s.SnapshotResolved(turn, originalPath, canonicalPath); err != nil {
+		return "", false, err
+	}
+	return canonicalPath, true, nil
+}
+
+func (s *applyPatchStore) DiscardSnapshotEntry(int, string) error {
+	return nil
+}
+
+func (s *applyPatchStore) RetainSnapshotEntry(int, string) {}
+
+func (s *applyPatchStore) RecordSnapshotContent(turn int, entryID string, content []byte) error {
+	s.identityRecords = append(s.identityRecords, snapshotIdentityRecord{
+		turn:    turn,
+		entryID: entryID,
+		content: string(content),
+	})
+	return nil
+}
+
+func (s *applyPatchStore) RecordSnapshotAbsence(turn int, entryID string) error {
+	s.identityRecords = append(s.identityRecords, snapshotIdentityRecord{
+		turn:    turn,
+		entryID: entryID,
+		absent:  true,
+	})
 	return nil
 }
 
@@ -349,6 +381,30 @@ func TestApplyPatchDeletesFile(t *testing.T) {
 	}
 }
 
+func TestApplyPatchRecordsSnapshotIdentityForAddUpdateAndDelete(t *testing.T) {
+	dir := t.TempDir()
+	updatePath := filepath.Join(dir, "update.txt")
+	deletePath := filepath.Join(dir, "delete.txt")
+	addPath := filepath.Join(dir, "new.txt")
+	if err := os.WriteFile(updatePath, []byte("a\nB\nc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(deletePath, []byte("remove me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &applyPatchStore{turn: 4}
+	tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, dir)
+
+	input := applyPatchInput(t, "*** Add File: new.txt\n+created\n*** Update File: update.txt\n@@\n a\n-B\n+B2\n c\n*** Delete File: delete.txt")
+	if _, err := runApplyPatch(t, tool, map[string]any{"input": input}); err != nil {
+		t.Fatalf("Execute err = %v", err)
+	}
+
+	assertSnapshotIdentityContent(t, store.identityRecords, 4, addPath, "created")
+	assertSnapshotIdentityContent(t, store.identityRecords, 4, updatePath, "a\nB2\nc")
+	assertSnapshotIdentityAbsent(t, store.identityRecords, 4, deletePath)
+}
+
 func TestApplyPatchDeleteFailsIfFileAbsent(t *testing.T) {
 	dir := t.TempDir()
 	store := &applyPatchStore{turn: 1}
@@ -575,9 +631,9 @@ func TestApplyPatchAllOrNothingPartialApplyError(t *testing.T) {
 	}
 }
 
-func TestApplyPatchNoReadGate(t *testing.T) {
-	// apply_patch relies on patch preconditions instead of the read-before-edit gate.
-	// The file is updated without ever being read_file'd.
+func TestApplyPatchUpdatesWithoutPriorRead(t *testing.T) {
+	// apply_patch relies on patch preconditions. The file is updated without
+	// ever being read_file'd.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a.go")
 	if err := os.WriteFile(path, []byte("alpha\nBEFORE\nbeta"), 0o644); err != nil {
@@ -592,7 +648,7 @@ func TestApplyPatchNoReadGate(t *testing.T) {
 		t.Fatalf("Execute err = %v", err)
 	}
 	if got := readFile(t, path); got != "alpha\nAFTER\nbeta" {
-		t.Fatalf("file = %q, want %q (no read-before-edit gate)", got, "alpha\nAFTER\nbeta")
+		t.Fatalf("file = %q, want %q", got, "alpha\nAFTER\nbeta")
 	}
 }
 

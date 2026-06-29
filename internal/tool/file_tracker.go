@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// ReadRecord records a read_file call for deduplication and edit enforcement.
+// ReadRecord records a read_file call for deduplication.
 type ReadRecord struct {
 	Path     string
 	Offset   int
@@ -31,21 +31,16 @@ type FileIdentity struct {
 	HasHash bool
 }
 
-// FileTracker tracks which files have been read and their mtimes.
-// It is populated from conversation history on session load and
-// updated by read_file executions.
+// FileTracker tracks read_file observations for duplicate suppression.
 type FileTracker struct {
 	mu         sync.Mutex
 	generation uint64
-	reads      []ReadRecord            // ordered by time, earliest first
-	identities map[string]FileIdentity // path -> last read identity
+	reads      []ReadRecord // ordered by time, earliest first
 }
 
 // NewFileTracker returns an empty FileTracker.
 func NewFileTracker() *FileTracker {
-	return &FileTracker{
-		identities: make(map[string]FileIdentity),
-	}
+	return &FileTracker{}
 }
 
 // TrackIdentity records a read using identity metadata from the already-opened file.
@@ -62,7 +57,6 @@ func (t *FileTracker) trackIdentity(path string, offset, limit int, identity Fil
 	if generation != t.generation {
 		return
 	}
-	t.identities[path] = identity
 	t.reads = append(t.reads, ReadRecord{
 		Path:     path,
 		Offset:   offset,
@@ -72,27 +66,6 @@ func (t *FileTracker) trackIdentity(path string, offset, limit int, identity Fil
 	})
 }
 
-// UpdateAfterWriteIdentity refreshes the tracked identity using metadata from
-// the already-opened file after a successful write.
-func (t *FileTracker) UpdateAfterWriteIdentity(path string, identity FileIdentity) {
-	t.mu.Lock()
-	generation := t.generation
-	t.mu.Unlock()
-	t.updateAfterWriteIdentity(path, identity, generation)
-}
-
-func (t *FileTracker) updateAfterWriteIdentity(path string, identity FileIdentity, generation uint64) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if generation != t.generation {
-		return
-	}
-	if _, ok := t.identities[path]; !ok {
-		return
-	}
-	t.identities[path] = identity
-}
-
 // Reset clears all tracked reads. Call this when visible conversation history
 // changes so hidden or old reads cannot authorize future edits.
 func (t *FileTracker) Reset() {
@@ -100,7 +73,6 @@ func (t *FileTracker) Reset() {
 	defer t.mu.Unlock()
 	t.generation++
 	t.reads = nil
-	t.identities = make(map[string]FileIdentity)
 }
 
 // Snapshot returns a copy of the tracked read state.
@@ -122,10 +94,6 @@ func (t *FileTracker) Restore(reads []ReadRecord) {
 	defer t.mu.Unlock()
 	t.generation++
 	t.reads = append([]ReadRecord(nil), reads...)
-	t.identities = make(map[string]FileIdentity, len(reads))
-	for _, r := range reads {
-		t.identities[r.Path] = r.Identity
-	}
 }
 
 // IsDuplicateIdentity checks duplicate status against identity metadata from an already-opened file.
@@ -142,44 +110,6 @@ func (t *FileTracker) IsDuplicateIdentity(path string, offset, limit int, curren
 		}
 	}
 	return false, ReadRecord{}
-}
-
-func (t *FileTracker) HasRead(path string) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	_, ok := t.identities[path]
-	return ok
-}
-
-// WasReadCheckIdentity checks read authorization against identity metadata from an already-opened file.
-func (t *FileTracker) WasReadCheckIdentity(path string, current FileIdentity) error {
-	t.mu.Lock()
-	lastReadIdentity, wasRead := t.identities[path]
-	t.mu.Unlock()
-	if !wasRead {
-		return &ReadRequiredError{Path: path}
-	}
-	if !identityMatches(lastReadIdentity, current) {
-		return &FileChangedError{Path: path}
-	}
-	return nil
-}
-
-// PopulateFromMessages scans historical tool result messages and marks
-// read_file paths as having been read. Since we don't have mtime in
-// persisted messages, we mark them with a zero time, which means the
-// "was read" check passes but "modified since" check always fails
-// (forces a re-read on first edit after session load).
-func (t *FileTracker) PopulateFromMessages(messages []PersistedMessage) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	for _, m := range messages {
-		if m.Role == "tool" && m.ToolName == "read_file" && m.Path != "" {
-			if _, exists := t.identities[m.Path]; !exists {
-				t.identities[m.Path] = FileIdentity{} // no identity = force reread
-			}
-		}
-	}
 }
 
 func FileIdentityFromFileInfo(info os.FileInfo) FileIdentity {
@@ -238,29 +168,4 @@ func identityMatches(expected, current FileIdentity) bool {
 		return true
 	}
 	return expected.Mtime.Equal(current.Mtime)
-}
-
-// PersistedMessage is a simplified message for tracker population.
-type PersistedMessage struct {
-	Role     string
-	ToolName string
-	Path     string
-}
-
-// ReadRequiredError is returned when a file was not read before editing.
-type ReadRequiredError struct {
-	Path string
-}
-
-func (e *ReadRequiredError) Error() string {
-	return "file " + e.Path + " has not been read yet. You must read it before editing or overwriting."
-}
-
-// FileChangedError is returned when a file was modified since last read.
-type FileChangedError struct {
-	Path string
-}
-
-func (e *FileChangedError) Error() string {
-	return "file " + e.Path + " has been modified since your last read. Read it again before editing."
 }

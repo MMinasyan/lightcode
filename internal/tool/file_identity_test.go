@@ -2,26 +2,21 @@ package tool
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
 )
 
-func TestDirectWritesAreBoundToReadFileIdentity(t *testing.T) {
+func TestDirectWritesIgnoreReadFileIdentity(t *testing.T) {
 	for _, tc := range []struct {
-		name        string
-		run         func(t *testing.T, path string, tracker *FileTracker) error
-		wantAbsent  bool
-		wantContent string
+		name string
+		run  func(t *testing.T, path string, tracker *FileTracker) error
 	}{
 		{
-			name:       "write deleted after read",
-			wantAbsent: true,
+			name: "write deleted after read",
 			run: func(t *testing.T, path string, tracker *FileTracker) error {
 				if err := os.Remove(path); err != nil {
 					t.Fatal(err)
@@ -31,8 +26,7 @@ func TestDirectWritesAreBoundToReadFileIdentity(t *testing.T) {
 			},
 		},
 		{
-			name:        "write recreated with same mtime",
-			wantContent: "external",
+			name: "write recreated after read",
 			run: func(t *testing.T, path string, tracker *FileTracker) error {
 				recreateWithSameMtimeForIdentity(t, path, "external")
 				_, err := NewWriteFile(tracker, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
@@ -40,8 +34,7 @@ func TestDirectWritesAreBoundToReadFileIdentity(t *testing.T) {
 			},
 		},
 		{
-			name:        "edit recreated with same mtime",
-			wantContent: "external",
+			name: "edit recreated after read",
 			run: func(t *testing.T, path string, tracker *FileTracker) error {
 				recreateWithSameMtimeForIdentity(t, path, "external")
 				_, err := NewEditFile(tracker, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
@@ -60,67 +53,21 @@ func TestDirectWritesAreBoundToReadFileIdentity(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			err := tc.run(t, path, tracker)
-			var changedErr *FileChangedError
-			if !errors.As(err, &changedErr) {
-				t.Fatalf("operation error = %T %v, want *FileChangedError", err, err)
+			if err := tc.run(t, path, tracker); err != nil {
+				t.Fatalf("operation error = %v", err)
 			}
-			if tc.wantAbsent {
-				assertFileAbsentAfterStaleRefusal(t, path)
-			} else {
-				assertFileContent(t, path, tc.wantContent)
-			}
+			assertFileContent(t, path, "after")
 		})
 	}
 }
 
-func TestReadFileTracksKernelIdentity(t *testing.T) {
-	path := readIdentityTrackedFile(t, "content")
-	tracker := NewFileTracker()
-
-	if _, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, tracker).Execute(context.Background(), map[string]any{"path": path}); err != nil {
-		t.Fatal(err)
-	}
-
-	tracker.mu.Lock()
-	defer tracker.mu.Unlock()
-	identity, ok := tracker.identities[path]
-	if !ok {
-		t.Fatalf("tracker has no read identity for %s", path)
-	}
-	if !identity.Valid || identity.Dev == 0 || identity.Ino == 0 || identity.Mtime.IsZero() || identity.Ctime.IsZero() || !identity.Mode.IsRegular() {
-		t.Fatalf("tracked identity = %+v, want valid regular kernel identity", identity)
-	}
-}
-
-func TestDeleteRecreateChangesTrackedIdentity(t *testing.T) {
-	path := readIdentityTrackedFile(t, "before")
-	tracker := NewFileTracker()
-	if _, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, tracker).Execute(context.Background(), map[string]any{"path": path}); err != nil {
-		t.Fatal(err)
-	}
-
-	tracker.mu.Lock()
-	before := tracker.identities[path]
-	tracker.mu.Unlock()
-	recreateWithSameMtimeForIdentity(t, path, "external")
-	after := fileIdentityForPath(t, path)
-
-	if identityMatches(before, after) {
-		t.Fatalf("identity matched after delete/recreate with same mtime: before=%+v after=%+v", before, after)
-	}
-}
-
-func TestStagedWritesAreBoundToReadFileIdentity(t *testing.T) {
+func TestStagedWritesIgnoreReadFileIdentity(t *testing.T) {
 	for _, tc := range []struct {
-		name        string
-		run         func(t *testing.T, path string, tracker *FileTracker) []BatchResult
-		wantAbsent  bool
-		wantContent string
+		name string
+		run  func(t *testing.T, path string, tracker *FileTracker) []BatchResult
 	}{
 		{
-			name:       "write deleted after read",
-			wantAbsent: true,
+			name: "write deleted after read",
 			run: func(t *testing.T, path string, tracker *FileTracker) []BatchResult {
 				if err := os.Remove(path); err != nil {
 					t.Fatal(err)
@@ -131,8 +78,7 @@ func TestStagedWritesAreBoundToReadFileIdentity(t *testing.T) {
 			},
 		},
 		{
-			name:        "write recreated with same mtime",
-			wantContent: "external",
+			name: "write recreated after read",
 			run: func(t *testing.T, path string, tracker *FileTracker) []BatchResult {
 				recreateWithSameMtimeForIdentity(t, path, "external")
 				return NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
@@ -141,8 +87,7 @@ func TestStagedWritesAreBoundToReadFileIdentity(t *testing.T) {
 			},
 		},
 		{
-			name:        "edit recreated with same mtime",
-			wantContent: "external",
+			name: "edit recreated after read",
 			run: func(t *testing.T, path string, tracker *FileTracker) []BatchResult {
 				recreateWithSameMtimeForIdentity(t, path, "external")
 				return NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
@@ -159,76 +104,20 @@ func TestStagedWritesAreBoundToReadFileIdentity(t *testing.T) {
 			}
 
 			results := tc.run(t, path, tracker)
-			assertSingleStaleReadBatch(t, results)
-			if tc.wantAbsent {
-				assertFileAbsentAfterStaleRefusal(t, path)
-			} else {
-				assertFileContent(t, path, tc.wantContent)
-			}
+			assertSingleSuccessfulBatch(t, results)
+			assertFileContent(t, path, "after")
 		})
 	}
 }
 
-func TestSnapshotWritesRevalidateReadIdentityBeforeFinalWrite(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		mutate      func(t *testing.T, path string)
-		wantAbsent  bool
-		wantContent string
-	}{
-		{
-			name:       "deleted after snapshot",
-			wantAbsent: true,
-			mutate: func(t *testing.T, path string) {
-				if err := os.Remove(path); err != nil {
-					t.Fatal(err)
-				}
-			},
-		},
-		{
-			name:        "recreated with same mtime after snapshot",
-			wantContent: "external",
-			mutate: func(t *testing.T, path string) {
-				recreateWithSameMtimeForIdentity(t, path, "external")
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			path := readIdentityTrackedFile(t, "before")
-			tracker := NewFileTracker()
-			if _, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, tracker).Execute(context.Background(), map[string]any{"path": path}); err != nil {
-				t.Fatal(err)
-			}
-			store := &mutatingSnapshotStoreForIdentity{turn: 1, path: path, mutate: func(path string) {
-				tc.mutate(t, path)
-			}}
-
-			_, err := NewWriteFileWithSnapshot(store, tracker, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
-
-			var changedErr *FileChangedError
-			if !errors.As(err, &changedErr) {
-				t.Fatalf("write_file error = %T %v, want *FileChangedError", err, err)
-			}
-			if tc.wantAbsent {
-				assertFileAbsentAfterStaleRefusal(t, path)
-			} else {
-				assertFileContent(t, path, tc.wantContent)
-			}
-		})
-	}
-}
-
-func TestStaleSnapshotAwareFileToolsDoNotSnapshot(t *testing.T) {
+func TestSnapshotAwareFileToolsRecordPostWriteIdentityAfterRevalidation(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		run  func(path string, tracker *FileTracker, store *recordingSnapshotStoreForIdentity) error
+		run  func(path string, tracker *FileTracker, store *recordingIdentitySnapshotStore) error
 	}{
 		{
-			name: "write deleted after read",
-			run: func(path string, tracker *FileTracker, store *recordingSnapshotStoreForIdentity) error {
-				if err := os.Remove(path); err != nil {
-					t.Fatal(err)
-				}
+			name: "write",
+			run: func(path string, tracker *FileTracker, store *recordingIdentitySnapshotStore) error {
 				_, err := NewWriteFileWithSnapshot(store, tracker, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
 					"path":    path,
 					"content": "after",
@@ -237,20 +126,8 @@ func TestStaleSnapshotAwareFileToolsDoNotSnapshot(t *testing.T) {
 			},
 		},
 		{
-			name: "write recreated with same mtime",
-			run: func(path string, tracker *FileTracker, store *recordingSnapshotStoreForIdentity) error {
-				recreateWithSameMtimeForIdentity(t, path, "external")
-				_, err := NewWriteFileWithSnapshot(store, tracker, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
-					"path":    path,
-					"content": "after",
-				})
-				return err
-			},
-		},
-		{
-			name: "edit recreated with same mtime",
-			run: func(path string, tracker *FileTracker, store *recordingSnapshotStoreForIdentity) error {
-				recreateWithSameMtimeForIdentity(t, path, "external")
+			name: "edit",
+			run: func(path string, tracker *FileTracker, store *recordingIdentitySnapshotStore) error {
 				_, err := NewEditFileWithSnapshot(store, tracker, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
 					"path":       path,
 					"old_string": "external",
@@ -266,72 +143,56 @@ func TestStaleSnapshotAwareFileToolsDoNotSnapshot(t *testing.T) {
 			if _, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, tracker).Execute(context.Background(), map[string]any{"path": path}); err != nil {
 				t.Fatal(err)
 			}
-			store := &recordingSnapshotStoreForIdentity{turn: 1}
+			store := &recordingIdentitySnapshotStore{turn: 1, entryID: "entry", mutate: func() {
+				recreateWithSameMtimeForIdentity(t, path, "external")
+			}}
 
-			var changedErr *FileChangedError
-			if err := tc.run(path, tracker, store); !errors.As(err, &changedErr) {
-				t.Fatalf("operation error = %T %v, want *FileChangedError", err, err)
+			if err := tc.run(path, tracker, store); err != nil {
+				t.Fatalf("operation error = %v", err)
 			}
-			if store.calls != 0 {
-				t.Fatalf("snapshot calls = %d, want none before stale-read refusal", store.calls)
+			assertFileContent(t, path, "after")
+			if string(store.recordedContent) != "after" {
+				t.Fatalf("recorded content = %q, want after", store.recordedContent)
 			}
 		})
 	}
 }
 
-func TestStagedSnapshotWritesRevalidateReadIdentityBeforeFinalWrite(t *testing.T) {
+func TestReadFileTracksKernelIdentity(t *testing.T) {
+	path := readIdentityTrackedFile(t, "content")
+	tracker := NewFileTracker()
+
+	if _, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, tracker).Execute(context.Background(), map[string]any{"path": path}); err != nil {
+		t.Fatal(err)
+	}
+
+	records := tracker.Snapshot()
+	if len(records) != 1 || records[0].Path != path {
+		t.Fatalf("tracker records = %+v, want one read for %s", records, path)
+	}
+	identity := records[0].Identity
+	if !identity.Valid || identity.Dev == 0 || identity.Ino == 0 || identity.Mtime.IsZero() || identity.Ctime.IsZero() || !identity.Mode.IsRegular() {
+		t.Fatalf("tracked identity = %+v, want valid regular kernel identity", identity)
+	}
+}
+
+func TestDeleteRecreateChangesTrackedIdentity(t *testing.T) {
 	path := readIdentityTrackedFile(t, "before")
 	tracker := NewFileTracker()
 	if _, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, tracker).Execute(context.Background(), map[string]any{"path": path}); err != nil {
 		t.Fatal(err)
 	}
-	store := &mutatingSnapshotStoreForIdentity{turn: 1, path: path, mutate: func(path string) {
-		recreateWithSameMtimeForIdentity(t, path, "external")
-	}}
 
-	results := NewStagedExecutor(store, tracker, config.ToolsConfig{}, allowStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-		stagedWrite(path, "call-1", "after"),
-	})
+	records := tracker.Snapshot()
+	if len(records) != 1 {
+		t.Fatalf("tracker records = %+v, want one", records)
+	}
+	before := records[0].Identity
+	recreateWithSameMtimeForIdentity(t, path, "external")
+	after := fileIdentityForPath(t, path)
 
-	assertSingleStaleReadBatch(t, results)
-	assertFileContent(t, path, "external")
-}
-
-func TestHistoricalReadsWithoutIdentityForceReread(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		run  func(path string, tracker *FileTracker) error
-	}{
-		{
-			name: "write",
-			run: func(path string, tracker *FileTracker) error {
-				_, err := NewWriteFile(tracker, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
-				return err
-			},
-		},
-		{
-			name: "edit",
-			run: func(path string, tracker *FileTracker) error {
-				_, err := NewEditFile(tracker, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
-					"path":       path,
-					"old_string": "content",
-					"new_string": "after",
-				})
-				return err
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			path := readIdentityTrackedFile(t, "content")
-			tracker := NewFileTracker()
-			tracker.PopulateFromMessages([]PersistedMessage{{Role: "tool", ToolName: "read_file", Path: path}})
-
-			var changedErr *FileChangedError
-			if err := tc.run(path, tracker); !errors.As(err, &changedErr) {
-				t.Fatalf("operation error = %T %v, want *FileChangedError", err, err)
-			}
-			assertFileContent(t, path, "content")
-		})
+	if identityMatches(before, after) {
+		t.Fatalf("identity matched after delete/recreate with same mtime: before=%+v after=%+v", before, after)
 	}
 }
 
@@ -344,8 +205,8 @@ func TestNewMissingWriteWithoutReadRecordStillCreatesFile(t *testing.T) {
 	}
 
 	assertFileContent(t, path, "created")
-	if tracker.HasRead(path) {
-		t.Fatal("new write created read authorization, want no read record")
+	if trackerHasRead(tracker, path) {
+		t.Fatal("new write created read record, want no read record")
 	}
 }
 
@@ -362,7 +223,7 @@ func readIdentityTrackedFile(t *testing.T, content string) string {
 func recreateWithSameMtimeForIdentity(t *testing.T, path, content string) {
 	t.Helper()
 	mtime := mustStat(t, path).ModTime()
-	if err := os.Remove(path); err != nil {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -371,20 +232,13 @@ func recreateWithSameMtimeForIdentity(t *testing.T, path, content string) {
 	setTrackerFileMtime(t, path, mtime)
 }
 
-func assertSingleStaleReadBatch(t *testing.T, results []BatchResult) {
+func assertSingleSuccessfulBatch(t *testing.T, results []BatchResult) {
 	t.Helper()
 	if len(results) != 1 {
 		t.Fatalf("results len = %d, want 1", len(results))
 	}
-	if results[0].Success || !strings.Contains(results[0].Error, "modified since your last read") {
-		t.Fatalf("result = %+v, want stale-read failure", results[0])
-	}
-}
-
-func assertFileAbsentAfterStaleRefusal(t *testing.T, path string) {
-	t.Helper()
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("stat %s = %v, want not exist", path, err)
+	if !results[0].Success || results[0].Error != "" {
+		t.Fatalf("result = %+v, want success", results[0])
 	}
 }
 
@@ -402,39 +256,48 @@ func fileIdentityForPath(t *testing.T, path string) FileIdentity {
 	return FileIdentityFromFileInfo(info)
 }
 
-type mutatingSnapshotStoreForIdentity struct {
-	turn   int
-	path   string
-	mutate func(string)
+type recordingIdentitySnapshotStore struct {
+	turn            int
+	entryID         string
+	mutate          func()
+	recordedContent []byte
 }
 
-func (s *mutatingSnapshotStoreForIdentity) Snapshot(turn int, absPath string) error {
+func (s *recordingIdentitySnapshotStore) Snapshot(turn int, absPath string) error {
 	return s.SnapshotResolved(turn, absPath, absPath)
 }
 
-func (s *mutatingSnapshotStoreForIdentity) SnapshotResolved(int, string, string) error {
-	s.mutate(s.path)
+func (s *recordingIdentitySnapshotStore) SnapshotResolved(int, string, string) error {
+	if s.mutate != nil {
+		mutate := s.mutate
+		s.mutate = nil
+		mutate()
+	}
 	return nil
 }
 
-func (s *mutatingSnapshotStoreForIdentity) CurrentTurn() int {
-	return s.turn
+func (s *recordingIdentitySnapshotStore) SnapshotResolvedEntry(int, string, string) (string, bool, error) {
+	if err := s.SnapshotResolved(s.turn, "", ""); err != nil {
+		return "", false, err
+	}
+	return s.entryID, true, nil
 }
 
-type recordingSnapshotStoreForIdentity struct {
-	turn  int
-	calls int
-}
-
-func (s *recordingSnapshotStoreForIdentity) Snapshot(turn int, absPath string) error {
-	return s.SnapshotResolved(turn, absPath, absPath)
-}
-
-func (s *recordingSnapshotStoreForIdentity) SnapshotResolved(int, string, string) error {
-	s.calls++
+func (s *recordingIdentitySnapshotStore) DiscardSnapshotEntry(int, string) error {
 	return nil
 }
 
-func (s *recordingSnapshotStoreForIdentity) CurrentTurn() int {
+func (s *recordingIdentitySnapshotStore) RetainSnapshotEntry(int, string) {}
+
+func (s *recordingIdentitySnapshotStore) RecordSnapshotContent(_ int, _ string, content []byte) error {
+	s.recordedContent = append([]byte(nil), content...)
+	return nil
+}
+
+func (s *recordingIdentitySnapshotStore) RecordSnapshotAbsence(int, string) error {
+	return nil
+}
+
+func (s *recordingIdentitySnapshotStore) CurrentTurn() int {
 	return s.turn
 }

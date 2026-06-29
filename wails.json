@@ -6,6 +6,9 @@
   "frontend:build": "npm run build",
   "frontend:dev:watcher": "npm run dev",
   "frontend:dev:serverUrl": "auto",
+  "postBuildHooks": {
+    "*/*": "node ../../frontend/scripts/normalize-wails-bindings.js"
+  },
   "author": {
     "name": "Lightcode"
   }

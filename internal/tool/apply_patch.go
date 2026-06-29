@@ -27,8 +27,7 @@ const applyPatchDescription = `Edits, creates, deletes, or renames files using t
 // write; Add/Update/Delete/Move go through the same safefs and snapshot
 // primitives as the rest of Lightcode's file tools; and successful output uses
 // the `Success. Updated the following files:` A/M/D summary. Move decomposes
-// into write-new plus delete-old. apply_patch does not use the read-before-edit
-// gate because Update hunks must match current file content.
+// into write-new plus delete-old. Update hunks must match current file content.
 //
 // The tool captures per-op pre/post/hunk data during apply and stashes it as
 // the most recent apply. DisplayMetadata reads that stash to build the

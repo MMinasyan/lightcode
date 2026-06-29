@@ -164,7 +164,6 @@ func TestShippedDefaultsEmpty(t *testing.T) {
 func TestShippedToolDescriptionDefaults(t *testing.T) {
 	want := map[string]string{
 		"<EDIT FILE OR WRITE FILE>": "edit_file or write_file",
-		"<READ-FIRST RULE>":         "- You must read a file before editing or overwriting it. edit_file and write_file will error if you have not read the file first.",
 	}
 	for key, value := range want {
 		if got := defaultToolDescriptionReplacements[key]; got != value {
@@ -178,27 +177,27 @@ func TestRenderToolDescriptionReplacements(t *testing.T) {
 	defer func() { defaultToolDescriptionReplacements = orig }()
 	defaultToolDescriptionReplacements = map[string]string{
 		"<EDIT FILE OR WRITE FILE>": "edit_file or write_file",
-		"<READ-FIRST RULE>":         "- read first",
+		"<REMOVE LINE>":             "- removed by adaptation",
 	}
 
 	description := strings.Join([]string{
 		"use <EDIT FILE OR WRITE FILE>",
-		"<READ-FIRST RULE>",
+		"<REMOVE LINE>",
 		"done",
 	}, "\n")
 
 	baseline := RenderToolDescription(description, nil)
-	if strings.Contains(baseline, "<") || !strings.Contains(baseline, "use edit_file or write_file") || !strings.Contains(baseline, "- read first") {
+	if strings.Contains(baseline, "<") || !strings.Contains(baseline, "use edit_file or write_file") || !strings.Contains(baseline, "- removed by adaptation") {
 		t.Fatalf("baseline RenderToolDescription = %q", baseline)
 	}
 
 	adapted := RenderToolDescription(description, &Adaptation{
 		ToolDescriptionReplacements: map[string]string{
 			"<EDIT FILE OR WRITE FILE>": "apply_patch",
-			"<READ-FIRST RULE>":         "",
+			"<REMOVE LINE>":             "",
 		},
 	})
-	if strings.Contains(adapted, "<") || strings.Contains(adapted, "read first") {
+	if strings.Contains(adapted, "<") || strings.Contains(adapted, "removed by adaptation") {
 		t.Fatalf("adapted RenderToolDescription = %q", adapted)
 	}
 	if want := "use apply_patch\ndone"; adapted != want {

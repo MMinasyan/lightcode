@@ -10,11 +10,10 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
-	"github.com/MMinasyan/lightcode/internal/safefs"
 )
 
-// EditFile implements the edit_file tool with mtime enforcement,
-// O(1) results with line ranges, and pending support.
+// EditFile implements the edit_file tool with O(1) results with line ranges
+// and pending support.
 type EditFile struct {
 	tracker       *FileTracker
 	cfg           config.ToolsConfig
@@ -36,7 +35,6 @@ func (e *EditFile) Name() string { return "edit_file" }
 
 func (e *EditFile) Description() string {
 	return `Performs exact string replacement in a file.
-- You must use read_file on the file before editing. This tool will error if the file was not read or was modified since your last read.
 - When using text from read_file output, never include the line number prefix in old_string or new_string. The prefix format is: number + tab. Everything after the tab is the actual file content.
 - The edit will FAIL if old_string is not unique in the file. Provide more surrounding context to make it unique, or use replace_all to change every instance.
 - old_string and new_string must be different. old_string must not be empty.
@@ -75,9 +73,10 @@ func (e *EditFile) ParametersSchema() map[string]any {
 }
 
 type editResult struct {
-	Result     string
-	LineRanges string
-	Count      int
+	Result         string
+	UpdatedContent string
+	LineRanges     string
+	Count          int
 }
 
 func (e *EditFile) Execute(_ context.Context, params map[string]any) (string, error) {
@@ -153,6 +152,7 @@ func (e *EditFileWithSnapshot) Execute(_ context.Context, params map[string]any)
 	if err != nil {
 		return "", fmt.Errorf("edit_file: snapshot: %w", err)
 	}
+	defer releaseSnapshotMutation(snapshot)
 	res, mutationStarted, err := editFileExecCommonForSnapshot(params, e.tracker, e.cfg, e.workspaceRoot)
 	if err != nil {
 		if !mutationStarted {
@@ -160,9 +160,13 @@ func (e *EditFileWithSnapshot) Execute(_ context.Context, params map[string]any)
 				return "", fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
 			}
 		} else {
-			retainMutatedSnapshot(snapshot)
+			err = retainFailedMutatedSnapshot(snapshot, securityPath, err)
 		}
 		return "", err
+	}
+	if err := recordMutatedSnapshotContent(snapshot, []byte(res.UpdatedContent)); err != nil {
+		retainMutatedSnapshot(snapshot)
+		return "", fmt.Errorf("edit_file: record snapshot identity: %w", err)
 	}
 	retainMutatedSnapshot(snapshot)
 	return res.Result, nil
@@ -203,11 +207,11 @@ func (e *EditFile) editFileExec(params map[string]any) (string, error) {
 	return res.Result, nil
 }
 
-func preflightEditSnapshotTarget(absPath string, tracker *FileTracker) error {
+func preflightEditSnapshotTarget(absPath string, _ *FileTracker) error {
 	if _, err := ensureRegularExistingTarget(absPath); err != nil {
 		return fmt.Errorf("edit_file: %w", err)
 	}
-	f, err := safefs.OpenExisting(absPath, os.O_RDWR)
+	f, err := openExistingMutationFile(absPath, os.O_RDWR)
 	if err != nil {
 		return fmt.Errorf("edit_file: %w", err)
 	}
@@ -219,14 +223,7 @@ func preflightEditSnapshotTarget(absPath string, tracker *FileTracker) error {
 	if err := ensureRegularFileInfo(absPath, info); err != nil {
 		return fmt.Errorf("edit_file: %w", err)
 	}
-	if tracker == nil {
-		return nil
-	}
-	identity, err := FileIdentityFromOpenFile(f, info)
-	if err != nil {
-		return fmt.Errorf("edit_file: read identity: %w", err)
-	}
-	return tracker.WasReadCheckIdentity(absPath, identity)
+	return nil
 }
 
 // editFileExecCommon is the shared implementation.
@@ -261,8 +258,7 @@ func editFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker, 
 		return nil, false, fmt.Errorf("edit_file: %w", err)
 	}
 
-	// Mtime enforcement.
-	f, err := safefs.OpenExisting(absPath, os.O_RDWR)
+	f, err := openExistingMutationFile(absPath, os.O_RDWR)
 	if err != nil {
 		return nil, false, fmt.Errorf("edit_file: %w", err)
 	}
@@ -278,11 +274,6 @@ func editFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker, 
 	data, err := io.ReadAll(f)
 	if err != nil {
 		return nil, false, fmt.Errorf("edit_file: %w", err)
-	}
-	if tracker != nil {
-		if err := tracker.WasReadCheckIdentity(absPath, FileIdentityFromFileInfoAndData(info, data)); err != nil {
-			return nil, false, err
-		}
 	}
 	content := string(data)
 
@@ -305,17 +296,11 @@ func editFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker, 
 		return nil, mutationStarted, fmt.Errorf("edit_file: sync: %w", err)
 	}
 
-	// Refresh mtime after successful write without creating read authorization.
-	if tracker != nil {
-		if info, err := f.Stat(); err == nil {
-			tracker.UpdateAfterWriteIdentity(absPath, FileIdentityFromFileInfoAndData(info, []byte(res.UpdatedContent)))
-		}
-	}
-
 	return &editResult{
-		Result:     res.Summary,
-		LineRanges: res.LineRanges,
-		Count:      res.Count,
+		Result:         res.Summary,
+		UpdatedContent: res.UpdatedContent,
+		LineRanges:     res.LineRanges,
+		Count:          res.Count,
 	}, mutationStarted, nil
 }
 

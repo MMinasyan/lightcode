@@ -2,7 +2,6 @@ package tool
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,8 +29,11 @@ func TestEditFileReplacesUniqueStringAndReportsLineRange(t *testing.T) {
 		t.Fatalf("Execute result = %q, want one-replacement summary", result)
 	}
 	assertFileContent(t, path, "alpha\ndelta\ngamma")
-	if err := wasReadCheckForPath(t, tracker, path); err != nil {
-		t.Fatalf("WasReadCheck after edit = %v", err)
+	if !trackerHasRead(tracker, path) {
+		t.Fatal("tracker lost the original read record")
+	}
+	if dup, record := isDuplicateForPath(t, tracker, path, 1, 100); dup {
+		t.Fatalf("tracker treated old read as duplicate after edit, record=%+v", record)
 	}
 }
 
@@ -105,23 +107,25 @@ func TestEditFileValidatesOldString(t *testing.T) {
 	}
 }
 
-func TestEditFileRequiresReadBeforeEdit(t *testing.T) {
+func TestEditFileEditsUnreadExistingFile(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "before")
 	tool := NewEditFile(NewFileTracker(), config.ToolsConfig{})
 
-	_, err := tool.Execute(context.Background(), map[string]any{
+	result, err := tool.Execute(context.Background(), map[string]any{
 		"path":       path,
 		"old_string": "before",
 		"new_string": "after",
 	})
-	var readErr *ReadRequiredError
-	if !errors.As(err, &readErr) {
-		t.Fatalf("Execute error = %T %v, want *ReadRequiredError", err, err)
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
 	}
-	assertFileContent(t, path, "before")
+	if !strings.Contains(result, "Edited "+path) {
+		t.Fatalf("Execute result = %q, want success", result)
+	}
+	assertFileContent(t, path, "after")
 }
 
-func TestEditFileRejectsEditAfterExternalModification(t *testing.T) {
+func TestEditFileEditsAfterExternalModification(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "before")
 	setTrackerFileMtime(t, path, time.Unix(100, 0))
 	tracker := NewFileTracker()
@@ -137,11 +141,10 @@ func TestEditFileRejectsEditAfterExternalModification(t *testing.T) {
 		"old_string": "external",
 		"new_string": "after",
 	})
-	var changedErr *FileChangedError
-	if !errors.As(err, &changedErr) {
-		t.Fatalf("Execute error = %T %v, want *FileChangedError", err, err)
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
 	}
-	assertFileContent(t, path, "external")
+	assertFileContent(t, path, "after")
 }
 
 func TestEditFileMultilineReplacementLineRange(t *testing.T) {

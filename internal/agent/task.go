@@ -495,6 +495,18 @@ func (s parentTurnSnapshotStore) RetainSnapshotEntry(_ int, entryID string) {
 	s.store.RetainSnapshotEntry(s.turn, entryID)
 }
 
+func (s parentTurnSnapshotStore) RecordSnapshotContent(_ int, entryID string, content []byte) error {
+	return s.store.RecordSnapshotContent(s.turn, entryID, content)
+}
+
+func (s parentTurnSnapshotStore) RecordSnapshotAbsence(_ int, entryID string) error {
+	return s.store.RecordSnapshotAbsence(s.turn, entryID)
+}
+
+func (s parentTurnSnapshotStore) LockSnapshotMutation(_ int, entryID string) (func(), error) {
+	return s.store.LockSnapshotMutation(s.turn, entryID)
+}
+
 func (t *taskTool) newChildTool(name string, readonly bool, scope parentMutationScope, procMgr *process.Manager) tool.Tool {
 	check := t.permissionCheck()
 	ask := t.permissionAsk()

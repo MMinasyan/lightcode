@@ -1264,7 +1264,7 @@ func (a *Agent) resumeMostRecent() error {
 	if err := a.loadHistoryIntoLoop(); err != nil {
 		return err
 	}
-	a.populateFileTracker()
+	a.resetFileTracker()
 	a.loadTokensFromDisk()
 	// Restore the model under rt.mu so the currentRef / contextWindowSize / client
 	// writes publish atomically with respect to the signal scheduler and queue
@@ -1282,72 +1282,11 @@ func (a *Agent) resumeMostRecent() error {
 	return nil
 }
 
-func (a *Agent) populateFileTracker() {
+func (a *Agent) resetFileTracker() {
 	if a.fileTracker == nil {
 		return
 	}
 	a.fileTracker.Reset()
-	if a.store == nil {
-		return
-	}
-	rec, _ := a.store.LoadCompaction()
-	var raw []snapshot.TurnMessages
-	var err error
-	if rec != nil {
-		raw, err = a.store.LoadCompleteTurnsAfter(rec.BoundaryTurn)
-	} else {
-		raw, err = a.store.LoadCompleteTurns()
-	}
-	if err != nil || len(raw) == 0 {
-		return
-	}
-	var msgs []tool.PersistedMessage
-	// We extract paths from assistant messages' tool_call args,
-	// since tool result messages don't contain the file path.
-	for _, t := range raw {
-		for _, line := range t.Messages {
-			var rawMsg map[string]any
-			if json.Unmarshal(line, &rawMsg) != nil {
-				continue
-			}
-			role, _ := rawMsg["role"].(string)
-			if role != "assistant" {
-				continue
-			}
-			toolCalls, ok := rawMsg["tool_calls"].([]any)
-			if !ok {
-				continue
-			}
-			for _, tc := range toolCalls {
-				tcMap, ok := tc.(map[string]any)
-				if !ok {
-					continue
-				}
-				fn, ok := tcMap["function"].(map[string]any)
-				if !ok {
-					continue
-				}
-				fnName, _ := fn["name"].(string)
-				if fnName != "read_file" {
-					continue
-				}
-				argsStr, _ := fn["arguments"].(string)
-				var args map[string]any
-				if json.Unmarshal([]byte(argsStr), &args) != nil {
-					continue
-				}
-				path, _ := args["path"].(string)
-				if path != "" {
-					msgs = append(msgs, tool.PersistedMessage{
-						Role:     "tool",
-						ToolName: "read_file",
-						Path:     path,
-					})
-				}
-			}
-		}
-	}
-	a.fileTracker.PopulateFromMessages(msgs)
 }
 
 // resolveAdaptation maps a bare model id to its adaptation, defaulting to the
@@ -2594,7 +2533,7 @@ func (a *Agent) SessionSwitch(id string) error {
 	if err := a.loadHistoryIntoLoop(); err != nil {
 		return err
 	}
-	a.populateFileTracker()
+	a.resetFileTracker()
 	a.loadTokensFromDisk()
 	if err := a.reloadLocked(); err != nil {
 		return err
@@ -3051,10 +2990,13 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 	case TurnActionRevertCode:
 		target := turn - 1
 		result.TargetTurn = target
-		if _, err := a.store.RevertCode(target); err != nil {
+		revertResult, err := a.store.RevertCode(target)
+		if err != nil {
 			return TurnActionResult{}, err
 		}
-		a.populateFileTracker()
+		result.RestoredFiles = revertResult.Restored
+		result.SkippedFiles = revertResult.Skipped
+		a.resetFileTracker()
 		return result, nil
 
 	case TurnActionRevertHistory:
@@ -3063,9 +3005,12 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 		result.Prefill = prefill
 		result.SessionChanged = true
 		if alsoRevertCode {
-			if _, err := a.store.RevertCode(target); err != nil {
+			revertResult, err := a.store.RevertCode(target)
+			if err != nil {
 				return TurnActionResult{}, err
 			}
+			result.RestoredFiles = revertResult.Restored
+			result.SkippedFiles = revertResult.Skipped
 		}
 		if err := a.store.RevertHistory(target); err != nil {
 			return TurnActionResult{}, err
@@ -3075,7 +3020,7 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 		if err := a.loadHistoryIntoLoop(); err != nil {
 			return TurnActionResult{}, err
 		}
-		a.populateFileTracker()
+		a.resetFileTracker()
 		return a.populateTurnActionResult(result), nil
 
 	case TurnActionFork:
@@ -3083,9 +3028,12 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 		result.TargetTurn = target
 		result.SessionChanged = true
 		if alsoRevertCode {
-			if _, err := a.store.RevertCode(target); err != nil {
+			revertResult, err := a.store.RevertCode(target)
+			if err != nil {
 				return TurnActionResult{}, err
 			}
+			result.RestoredFiles = revertResult.Restored
+			result.SkippedFiles = revertResult.Skipped
 		}
 		newID, _, err := a.store.ForkInto(target)
 		if err != nil {
@@ -3103,7 +3051,7 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 		if err := a.loadHistoryIntoLoop(); err != nil {
 			return TurnActionResult{}, err
 		}
-		a.populateFileTracker()
+		a.resetFileTracker()
 		a.loadTokensFromDisk()
 		return a.populateTurnActionResult(result), nil
 
@@ -3139,26 +3087,22 @@ func (a *Agent) userMessageContentForTurn(turn int) string {
 	return ""
 }
 
-// RevertCode restores files to their state at the given turn. After the
-// store revert lands the file tracker is repopulated from conversation
-// history: stale per-path identities are cleared while paths visible in
-// messages keep their "read happened" marker, forcing a re-read on the
-// next edit until read_file observes the current disk state. Symmetric
-// with RevertHistory.
-func (a *Agent) RevertCode(turn int) error {
+// RevertCode restores files to their state at the given turn.
+func (a *Agent) RevertCode(turn int) (snapshot.RevertResult, error) {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
 	if a.ensureRuntime().busy {
-		return fmt.Errorf("cannot revert while a turn is running")
+		return snapshot.RevertResult{}, fmt.Errorf("cannot revert while a turn is running")
 	}
 	if !a.store.Active() {
-		return fmt.Errorf("no session open")
+		return snapshot.RevertResult{}, fmt.Errorf("no session open")
 	}
-	if _, err := a.store.RevertCode(turn); err != nil {
-		return err
+	result, err := a.store.RevertCode(turn)
+	if err != nil {
+		return result, err
 	}
-	a.populateFileTracker()
-	return nil
+	a.resetFileTracker()
+	return result, nil
 }
 
 // RevertHistory truncates conversation after the given turn.
@@ -3185,7 +3129,7 @@ func (a *Agent) RevertHistory(turn int) error {
 	if err := a.loadHistoryIntoLoop(); err != nil {
 		return err
 	}
-	a.populateFileTracker()
+	a.resetFileTracker()
 	return nil
 }
 
@@ -3220,7 +3164,7 @@ func (a *Agent) ForkSession(turn int) error {
 	if err := a.loadHistoryIntoLoop(); err != nil {
 		return err
 	}
-	a.populateFileTracker()
+	a.resetFileTracker()
 	a.loadTokensFromDisk()
 	return nil
 }

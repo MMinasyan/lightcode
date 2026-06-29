@@ -4,6 +4,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 // EventKind identifies the type of agent event.
@@ -376,14 +377,16 @@ type SubmitResult struct {
 
 // TurnActionResult is returned after a user-message revert/fork action.
 type TurnActionResult struct {
-	Action         string           `json:"action"`
-	Turn           int              `json:"turn"`
-	TargetTurn     int              `json:"targetTurn"`
-	SessionChanged bool             `json:"sessionChanged"`
-	Prefill        string           `json:"prefill,omitempty"`
-	Session        SessionSummary   `json:"session"`
-	Messages       []DisplayMessage `json:"messages,omitempty"`
-	Tokens         TokenReport      `json:"tokens"`
+	Action         string                   `json:"action"`
+	Turn           int                      `json:"turn"`
+	TargetTurn     int                      `json:"targetTurn"`
+	SessionChanged bool                     `json:"sessionChanged"`
+	Prefill        string                   `json:"prefill,omitempty"`
+	RestoredFiles  []string                 `json:"restoredFiles,omitempty"`
+	SkippedFiles   []snapshot.SkippedRevert `json:"skippedFiles,omitempty"`
+	Session        SessionSummary           `json:"session"`
+	Messages       []DisplayMessage         `json:"messages,omitempty"`
+	Tokens         TokenReport              `json:"tokens"`
 }
 
 // ModelInfo holds the active model identity and catalog metadata.

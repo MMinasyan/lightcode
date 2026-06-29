@@ -28,10 +28,37 @@ type transactionalSnapshotStore interface {
 	RetainSnapshotEntry(turn int, entryID string)
 }
 
+type snapshotIdentityRecorder interface {
+	RecordSnapshotContent(turn int, entryID string, content []byte) error
+	RecordSnapshotAbsence(turn int, entryID string) error
+}
+
+type snapshotMutationLocker interface {
+	LockSnapshotMutation(turn int, entryID string) (func(), error)
+}
+
+type mutationFile interface {
+	io.Reader
+	io.Seeker
+	io.Writer
+	Close() error
+	Stat() (os.FileInfo, error)
+	Sync() error
+	Truncate(size int64) error
+}
+
+var (
+	openWriteTargetForMutationFunc = openWriteTargetForMutationReal
+	openExistingMutationFile       = func(path string, flag int) (mutationFile, error) {
+		return safefs.OpenExisting(path, flag)
+	}
+)
+
 type snapshotEntry struct {
 	turn    int
 	entryID string
 	store   transactionalSnapshotStore
+	release func()
 }
 
 func snapshotFile(store SnapshotStore, turn int, originalPath, canonicalPath string) error {
@@ -47,9 +74,26 @@ func snapshotFileForMutation(store SnapshotStore, turn int, originalPath, canoni
 		if err != nil {
 			return snapshotEntry{}, err
 		}
-		return snapshotEntry{turn: turn, entryID: entryID, store: transactional}, nil
+		entry := snapshotEntry{turn: turn, entryID: entryID, store: transactional}
+		if locker, ok := store.(snapshotMutationLocker); ok {
+			release, err := locker.LockSnapshotMutation(turn, entryID)
+			if err != nil {
+				if discardErr := transactional.DiscardSnapshotEntry(turn, entryID); discardErr != nil {
+					return snapshotEntry{}, fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
+				}
+				return snapshotEntry{}, err
+			}
+			entry.release = release
+		}
+		return entry, nil
 	}
 	return snapshotEntry{}, snapshotFile(store, turn, originalPath, canonicalPath)
+}
+
+func releaseSnapshotMutation(entry snapshotEntry) {
+	if entry.release != nil {
+		entry.release()
+	}
 }
 
 func discardUnmutatedSnapshot(entry snapshotEntry) error {
@@ -66,8 +110,54 @@ func retainMutatedSnapshot(entry snapshotEntry) {
 	entry.store.RetainSnapshotEntry(entry.turn, entry.entryID)
 }
 
-// WriteFile implements the write_file tool with mtime enforcement
-// and pending support.
+func recordMutatedSnapshotContent(entry snapshotEntry, content []byte) error {
+	if entry.store == nil || entry.entryID == "" {
+		return nil
+	}
+	recorder, ok := entry.store.(snapshotIdentityRecorder)
+	if !ok {
+		return nil
+	}
+	return recorder.RecordSnapshotContent(entry.turn, entry.entryID, content)
+}
+
+func recordMutatedSnapshotAbsence(entry snapshotEntry) error {
+	if entry.store == nil || entry.entryID == "" {
+		return nil
+	}
+	recorder, ok := entry.store.(snapshotIdentityRecorder)
+	if !ok {
+		return nil
+	}
+	return recorder.RecordSnapshotAbsence(entry.turn, entry.entryID)
+}
+
+func recordCurrentSnapshotContent(entry snapshotEntry, path string) error {
+	if entry.store == nil || entry.entryID == "" {
+		return nil
+	}
+	f, err := safefs.OpenExisting(path, os.O_RDONLY)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	content, err := io.ReadAll(f)
+	if err != nil {
+		return err
+	}
+	return recordMutatedSnapshotContent(entry, content)
+}
+
+func retainFailedMutatedSnapshot(entry snapshotEntry, path string, err error) error {
+	if recordErr := recordCurrentSnapshotContent(entry, path); recordErr != nil {
+		retainMutatedSnapshot(entry)
+		return fmt.Errorf("%w; additionally failed to record snapshot identity: %v", err, recordErr)
+	}
+	retainMutatedSnapshot(entry)
+	return err
+}
+
+// WriteFile implements the write_file tool with pending support.
 type WriteFile struct {
 	tracker       *FileTracker
 	cfg           config.ToolsConfig
@@ -90,8 +180,7 @@ func (w *WriteFile) Name() string { return "write_file" }
 func (w *WriteFile) Description() string {
 	return `Writes a file to disk.
 - Creates parent directories if they don't exist. Overwrites the file if it already exists.
-- You must use read_file on the file before overwriting an existing file. This tool will error if the file was not read or was modified since your last read.
-- Use this tool for new files or complete rewrites. For targeted changes to existing files, use edit_file instead.
+- Use this tool for new files or complete rewrites. For targeted changes to existing files, use edit_file instead. Writing to a path that already exists overwrites it entirely, so when creating a new file, use a path that does not already exist.
 - ALWAYS use pending=true when your task requires multiple edits or writes. Pending calls will be applied AUTOMATICALLY with next tool call or after your response.`
 }
 
@@ -189,6 +278,7 @@ func (w *WriteFileWithSnapshot) Execute(_ context.Context, params map[string]any
 	if err != nil {
 		return "", fmt.Errorf("write_file: snapshot: %w", err)
 	}
+	defer releaseSnapshotMutation(snapshot)
 	res, mutationStarted, err := writeFileExecCommonForSnapshot(params, w.tracker, w.cfg, w.workspaceRoot)
 	if err != nil {
 		if !mutationStarted {
@@ -196,9 +286,14 @@ func (w *WriteFileWithSnapshot) Execute(_ context.Context, params map[string]any
 				return "", fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
 			}
 		} else {
-			retainMutatedSnapshot(snapshot)
+			err = retainFailedMutatedSnapshot(snapshot, securityPath, err)
 		}
 		return "", err
+	}
+	content, _ := params["content"].(string)
+	if err := recordMutatedSnapshotContent(snapshot, []byte(content)); err != nil {
+		retainMutatedSnapshot(snapshot)
+		return "", fmt.Errorf("write_file: record snapshot identity: %w", err)
 	}
 	retainMutatedSnapshot(snapshot)
 	return res.Result, nil
@@ -260,36 +355,19 @@ func writeFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker,
 		return nil, mutationStarted, fmt.Errorf("write_file: sync: %w", err)
 	}
 
-	// Refresh mtime after successful write without creating read authorization.
-	if tracker != nil {
-		if info, err := f.Stat(); err == nil {
-			tracker.UpdateAfterWriteIdentity(absPath, FileIdentityFromFileInfoAndData(info, []byte(content)))
-		}
-	}
-
 	return &writeResult{
 		Result: fmt.Sprintf("Wrote %s.", path),
 	}, mutationStarted, nil
 }
 
-func openWriteTargetForMutation(absPath string, tracker *FileTracker) (*os.File, bool, bool, error) {
-	existed, err := ensureRegularExistingTarget(absPath)
+func openWriteTargetForMutation(absPath string, tracker *FileTracker) (mutationFile, bool, bool, error) {
+	return openWriteTargetForMutationFunc(absPath, tracker)
+}
+
+func openWriteTargetForMutationReal(absPath string, _ *FileTracker) (mutationFile, bool, bool, error) {
+	_, err := ensureRegularExistingTarget(absPath)
 	if err != nil {
 		return nil, false, false, err
-	}
-	if tracker != nil && tracker.HasRead(absPath) {
-		f, err := safefs.OpenExisting(absPath, os.O_RDWR)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil, false, false, &FileChangedError{Path: absPath}
-			}
-			return nil, false, false, err
-		}
-		if err := validateWriteIdentity(f, absPath, tracker); err != nil {
-			_ = f.Close()
-			return nil, false, false, err
-		}
-		return f, true, false, nil
 	}
 
 	f, openedExisting, err := safefs.OpenForWrite(absPath, 0o644)
@@ -306,58 +384,18 @@ func openWriteTargetForMutation(absPath string, tracker *FileTracker) (*os.File,
 			_ = f.Close()
 			return nil, false, false, err
 		}
-		if tracker != nil {
-			if err := validateWriteIdentity(f, absPath, tracker); err != nil {
-				_ = f.Close()
-				return nil, false, false, err
-			}
-		}
-	} else if existed {
-		_ = f.Close()
-		return nil, false, true, &FileChangedError{Path: absPath}
 	}
 	return f, openedExisting, !openedExisting, nil
 }
 
-func validateWriteIdentity(f *os.File, absPath string, tracker *FileTracker) error {
-	info, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("stat: %w", err)
-	}
-	if err := ensureRegularFileInfo(absPath, info); err != nil {
-		return err
-	}
-	identity, err := FileIdentityFromOpenFile(f, info)
-	if err != nil {
-		return fmt.Errorf("read identity: %w", err)
-	}
-	return tracker.WasReadCheckIdentity(absPath, identity)
-}
-
-func preflightWriteSnapshotTarget(absPath string, tracker *FileTracker) error {
+func preflightWriteSnapshotTarget(absPath string, _ *FileTracker) error {
 	existed, err := ensureRegularExistingTarget(absPath)
 	if err != nil {
 		return fmt.Errorf("write_file: %w", err)
 	}
 	if !existed {
-		if tracker != nil && tracker.HasRead(absPath) {
-			return &FileChangedError{Path: absPath}
-		}
 		return nil
 	}
-
-	if tracker != nil && tracker.HasRead(absPath) {
-		f, err := safefs.OpenExisting(absPath, os.O_RDWR)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return &FileChangedError{Path: absPath}
-			}
-			return fmt.Errorf("write_file: %w", err)
-		}
-		defer f.Close()
-		return validateWriteIdentity(f, absPath, tracker)
-	}
-
 	f, err := safefs.OpenExisting(absPath, os.O_RDWR)
 	if err != nil {
 		return fmt.Errorf("write_file: %w", err)
@@ -370,8 +408,5 @@ func preflightWriteSnapshotTarget(absPath string, tracker *FileTracker) error {
 	if err := ensureRegularFileInfo(absPath, info); err != nil {
 		return fmt.Errorf("write_file: %w", err)
 	}
-	if tracker == nil {
-		return nil
-	}
-	return validateWriteIdentity(f, absPath, tracker)
+	return nil
 }
