@@ -1956,11 +1956,10 @@ func (a *Agent) reloadLockedWithRefresh(allowBackgroundDiscovery bool) error {
 	}
 
 	a.cfg = cfg
-	a.agents = agentTypes
+	a.setAgentTypesLocked(agentTypes)
 	a.catalog = modelCatalog
 	if a.taskToolInst != nil {
 		a.taskToolInst.setCatalog(modelCatalog)
-		a.taskToolInst.setAgentTypes(agentTypes)
 		a.taskToolInst.setMaxConcurrent(cfg.Subagents.MaxConcurrent)
 		a.taskToolInst.setToolsConfig(cfg.Tools)
 	}
@@ -1978,9 +1977,16 @@ func (a *Agent) reloadLockedWithRefresh(allowBackgroundDiscovery bool) error {
 	}
 	a.ensureActiveModelLocked()
 	a.setWarningGroup("catalog", catalogWarningsToPromptWarnings(catalogWarnings))
-	a.setWarningGroup("agents", agentWarningsToPromptWarnings(agentTypes.Warnings()))
 	a.setWarningGroup("setup", a.setupWarningsLocked())
 	return nil
+}
+
+func (a *Agent) setAgentTypesLocked(agentTypes *agentcfg.Config) {
+	a.agents = agentTypes
+	if a.taskToolInst != nil {
+		a.taskToolInst.setAgentTypes(agentTypes)
+	}
+	a.setWarningGroup("agents", agentWarningsToPromptWarnings(agentTypes.Warnings()))
 }
 
 type ModelCompletion struct {
@@ -2433,8 +2439,7 @@ func (a *Agent) writePrimaryModelLocked(ref coremodel.ModelRef) error {
 	if err != nil {
 		return err
 	}
-	a.agents = agentTypes
-	a.setWarningGroup("agents", agentWarningsToPromptWarnings(agentTypes.Warnings()))
+	a.setAgentTypesLocked(agentTypes)
 	return nil
 }
 

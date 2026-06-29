@@ -122,8 +122,17 @@ Lightcode ships with bundled provider metadata, but no credentials and no preset
         }
       }
     }
-  },
-  "default_model": "openrouter/z-ai/glm-5.1"
+  }
+}
+```
+
+Put model selections in `~/.lightcode/agents.json`:
+
+```json
+{
+  "primary": {
+    "model": "openrouter/z-ai/glm-5.1"
+  }
 }
 ```
 

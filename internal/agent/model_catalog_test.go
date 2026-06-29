@@ -386,6 +386,49 @@ func TestAgentNewSessionUsesUpdatedPrimaryModelButExistingSessionKeepsModel(t *t
 	}
 }
 
+func TestAgentModelWritesRefreshTaskToolAgentConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		set  func(*Agent) error
+	}{
+		{
+			name: "SetDefaultModel",
+			set:  func(a *Agent) error { return a.SetDefaultModel("test/alt-model") },
+		},
+		{
+			name: "SwitchModel",
+			set: func(a *Agent) error {
+				appendUserTurn(t, a, "activate session")
+				return a.SwitchModel("test/alt-model")
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newCatalogBackedTestAgent(t)
+			before, err := a.taskToolInst.resolveAgentType("secondary")
+			if err != nil {
+				t.Fatalf("resolve secondary before model write: %v", err)
+			}
+			if before.Model != "test/test-model" {
+				t.Fatalf("secondary model before write = %q, want test/test-model", before.Model)
+			}
+
+			if err := tc.set(a); err != nil {
+				t.Fatalf("%s returned error: %v", tc.name, err)
+			}
+
+			after, err := a.taskToolInst.resolveAgentType("secondary")
+			if err != nil {
+				t.Fatalf("resolve secondary after model write: %v", err)
+			}
+			if after.Model != "test/alt-model" {
+				t.Fatalf("secondary model after %s = %q, want updated primary model test/alt-model", tc.name, after.Model)
+			}
+		})
+	}
+}
+
 func TestAgentRuntimeConfigRoundTripWritesReloadsAndExcludesMasterBooleans(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	var root map[string]any

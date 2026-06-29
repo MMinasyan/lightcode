@@ -240,7 +240,7 @@ func TestSubagentConcurrentIndependentAdaptations(t *testing.T) {
 	}
 }
 
-// newChildModelEventAgent builds a full agent whose explore child runs a
+// newChildModelEventAgent builds a full agent whose custom writer child runs a
 // different model than the parent, pointed at the given SSE base URL.
 func newChildModelEventAgent(t *testing.T, baseURL string) *Agent {
 	t.Helper()
@@ -267,7 +267,13 @@ func newChildModelEventAgent(t *testing.T, baseURL string) *Agent {
 	}
 	writeAgentsTestConfig(t, configPath, `{
 		"primary": { "model": "test/test-model" },
-		"explore": { "model": "test/alt-model" }
+		"writer": {
+			"model": "test/alt-model",
+			"tools": ["read_file", "write_file", "run_command", "process", "sleep"],
+			"prompt": "Writer child.",
+			"description": "Writer child",
+			"subagent": true
+		}
 	}`)
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -317,7 +323,7 @@ func TestSubagentChildShowsOwnAdaptationAndGateBlocks(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch calls.Add(1) {
 		case 1:
-			writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"go","subagent_type":"explore"}]}`)
+			writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"go","subagent_type":"writer"}]}`)
 		case 2:
 			body, _ := io.ReadAll(r.Body)
 			childReq1.Store(string(body))

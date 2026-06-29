@@ -411,7 +411,8 @@ func (t *taskTool) buildRegistry(at agentcfg.Resolved, scope parentMutationScope
 	root := scope.workspaceRoot
 	core := tool.CoreTools(scope.snapshotStore(), scope.tracker, t.toolsConfig, root, t.permissionCheck(), t.permissionAsk())
 	reg := tool.NewRegistry()
-	for _, name := range at.Tools {
+	exposure := taskToolExposure(at)
+	for _, name := range exposure.tools {
 		if name == "task" {
 			continue
 		}
@@ -426,14 +427,14 @@ func (t *taskTool) buildRegistry(at agentcfg.Resolved, scope parentMutationScope
 			reg.Register(tt)
 			continue
 		}
-		if tt := t.newChildTool(name, at, scope, procMgr); tt != nil {
+		if tt := t.newChildTool(name, exposure.readonly, scope, procMgr); tt != nil {
 			reg.Register(tt)
 		}
 	}
 	// Mutation-capable subagents register apply_patch even when their explicit
 	// tool list names only edit_file/write_file. Adaptations can then reveal the
 	// hidden tool. Read-only subagents do not gain apply_patch.
-	if hasMutationTool(at.Tools) {
+	if hasMutationTool(exposure.tools) {
 		if applyPatch, ok := core["apply_patch"]; ok {
 			reg.Register(applyPatch)
 		}
@@ -490,14 +491,14 @@ func (s parentTurnSnapshotStore) RetainSnapshotEntry(_ int, entryID string) {
 	s.store.RetainSnapshotEntry(s.turn, entryID)
 }
 
-func (t *taskTool) newChildTool(name string, at agentcfg.Resolved, scope parentMutationScope, procMgr *process.Manager) tool.Tool {
+func (t *taskTool) newChildTool(name string, readonly bool, scope parentMutationScope, procMgr *process.Manager) tool.Tool {
 	check := t.permissionCheck()
 	ask := t.permissionAsk()
 	root := scope.workspaceRoot
 	switch name {
 	case "run_command":
 		rc := tool.NewRunCommandAtRoot(t.toolsConfig, t.homeDir, root, procMgr)
-		if isReadOnlyType(at) {
+		if readonly {
 			return tool.WrapWithPermission(tool.NewReadOnlyRunCommand(rc), check, ask)
 		}
 		return tool.WrapWithPermission(rc, check, ask)
@@ -611,12 +612,67 @@ func (t *taskTool) permissionAskAction() tool.AskActionFunc {
 }
 
 func isReadOnlyType(at agentcfg.Resolved) bool {
-	for _, name := range at.Tools {
+	return taskToolExposure(at).readonly
+}
+
+type taskExposure struct {
+	tools    []string
+	readonly bool
+}
+
+func taskToolExposure(at agentcfg.Resolved) taskExposure {
+	tools := append([]string(nil), at.Tools...)
+	if at.Memory {
+		tools = appendToolIfMissing(tools, "save_memory")
+		tools = appendToolIfMissing(tools, "search_memory")
+		tools = appendToolIfMissing(tools, "search_history")
+	} else {
+		tools = removeTools(tools, "save_memory", "search_memory", "search_history")
+	}
+	if at.LSP {
+		tools = appendToolIfMissing(tools, "diagnostics")
+		tools = appendToolIfMissing(tools, "workspace_symbol")
+	} else {
+		tools = removeTools(tools, "diagnostics", "workspace_symbol")
+	}
+
+	readonly := at.Readonly || toolsInferReadOnly(tools)
+	if readonly {
+		tools = removeTools(tools, "write_file", "edit_file", "apply_patch", "execute_pending")
+	}
+	return taskExposure{tools: tools, readonly: readonly}
+}
+
+func toolsInferReadOnly(tools []string) bool {
+	for _, name := range tools {
 		if name == "write_file" || name == "edit_file" {
 			return false
 		}
 	}
 	return true
+}
+
+func appendToolIfMissing(tools []string, name string) []string {
+	for _, toolName := range tools {
+		if toolName == name {
+			return tools
+		}
+	}
+	return append(tools, name)
+}
+
+func removeTools(tools []string, names ...string) []string {
+	remove := make(map[string]bool, len(names))
+	for _, name := range names {
+		remove[name] = true
+	}
+	out := tools[:0]
+	for _, name := range tools {
+		if !remove[name] {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 func (t *taskTool) availableAgentTypes() []agentcfg.Resolved {

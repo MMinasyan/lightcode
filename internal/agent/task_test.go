@@ -17,6 +17,8 @@ import (
 
 	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
 	loop "github.com/MMinasyan/lightcode/internal/engine"
+	"github.com/MMinasyan/lightcode/internal/lsp"
+	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
@@ -253,6 +255,123 @@ func TestTaskToolReadOnlyAndRegistryRouting(t *testing.T) {
 	}
 	if _, ok := registry.Get("task"); ok {
 		t.Fatal("buildRegistry included recursive task tool")
+	}
+}
+
+func TestTaskToolBuiltInExploreUsesResolvedCapabilities(t *testing.T) {
+	agents := mustParseTaskAgents(t, `{}`)
+	task := &taskTool{
+		check:      func(string, string) permission.Decision { return permission.DecisionAllow },
+		lspManager: lsp.NewManager(t.TempDir(), t.TempDir()),
+	}
+	at, err := agents.Resolve("explore", agentcfg.ResolveContext{})
+	if err != nil {
+		t.Fatalf("resolve explore: %v", err)
+	}
+	if !at.Readonly || !at.LSP {
+		t.Fatalf("test setup: explore resolved readonly=%v lsp=%v, want both true", at.Readonly, at.LSP)
+	}
+
+	registry := task.buildRegistry(at, parentMutationScope{}, nil)
+	for _, name := range []string{"write_file", "edit_file", "apply_patch"} {
+		if _, ok := registry.Get(name); ok {
+			t.Fatalf("explore registry contains %s; names=%v", name, taskRegistryToolNames(registry))
+		}
+		if registry.Advertises(name, nil) {
+			t.Fatalf("explore advertises %s; names=%v", name, taskAdvertisedToolNames(registry))
+		}
+	}
+	for _, name := range []string{"read_file", "run_command", "diagnostics", "workspace_symbol"} {
+		if _, ok := registry.Get(name); !ok {
+			t.Fatalf("explore registry missing %s; names=%v", name, taskRegistryToolNames(registry))
+		}
+	}
+
+	runCommand, _ := registry.Get("run_command")
+	if _, err := runCommand.Execute(context.Background(), map[string]any{"command": "touch should-not-run"}); err == nil {
+		t.Fatal("explore run_command accepted a write-style command; want read-only rejection")
+	}
+}
+
+func TestTaskToolCustomLSPCapabilityControlsLSPTools(t *testing.T) {
+	agents := mustParseTaskAgents(t, `{
+		"primary": { "model": "test/test-model" },
+		"with_lsp": {
+			"tools": ["read_file"],
+			"lsp": true,
+			"prompt": "With LSP.",
+			"description": "With LSP",
+			"subagent": true
+		},
+		"without_lsp": {
+			"tools": ["read_file"],
+			"lsp": false,
+			"prompt": "Without LSP.",
+			"description": "Without LSP",
+			"subagent": true
+		}
+	}`)
+	task := &taskTool{lspManager: lsp.NewManager(t.TempDir(), t.TempDir())}
+
+	withLSP, err := agents.Resolve("with_lsp", agentcfg.ResolveContext{})
+	if err != nil {
+		t.Fatalf("resolve with_lsp: %v", err)
+	}
+	withRegistry := task.buildRegistry(withLSP, parentMutationScope{}, nil)
+	for _, name := range []string{"diagnostics", "workspace_symbol"} {
+		if _, ok := withRegistry.Get(name); !ok {
+			t.Fatalf("lsp:true registry missing %s; names=%v", name, taskRegistryToolNames(withRegistry))
+		}
+	}
+
+	withoutLSP, err := agents.Resolve("without_lsp", agentcfg.ResolveContext{})
+	if err != nil {
+		t.Fatalf("resolve without_lsp: %v", err)
+	}
+	withoutRegistry := task.buildRegistry(withoutLSP, parentMutationScope{}, nil)
+	for _, name := range []string{"diagnostics", "workspace_symbol"} {
+		if _, ok := withoutRegistry.Get(name); ok {
+			t.Fatalf("lsp:false registry contains %s; names=%v", name, taskRegistryToolNames(withoutRegistry))
+		}
+	}
+}
+
+func TestTaskToolMemoryCapabilityControlsMemoryTools(t *testing.T) {
+	task := &taskTool{memoryStore: memory.NewStore(nil, t.TempDir(), t.TempDir())}
+
+	withMemory := task.buildRegistry(agentcfg.Resolved{
+		Tools:  []string{"read_file"},
+		Memory: true,
+	}, parentMutationScope{}, nil)
+	for _, name := range []string{"save_memory", "search_memory", "search_history"} {
+		if _, ok := withMemory.Get(name); !ok {
+			t.Fatalf("memory:true registry missing %s; names=%v", name, taskRegistryToolNames(withMemory))
+		}
+	}
+
+	withoutMemory := task.buildRegistry(agentcfg.Resolved{
+		Tools:  []string{"read_file"},
+		Memory: false,
+	}, parentMutationScope{}, nil)
+	for _, name := range []string{"save_memory", "search_memory", "search_history"} {
+		if _, ok := withoutMemory.Get(name); ok {
+			t.Fatalf("memory:false registry contains %s; names=%v", name, taskRegistryToolNames(withoutMemory))
+		}
+	}
+
+	onlyMemory := task.buildRegistry(agentcfg.Resolved{
+		Tools:  []string{},
+		Memory: true,
+	}, parentMutationScope{}, nil)
+	for _, name := range []string{"save_memory", "search_memory", "search_history"} {
+		if _, ok := onlyMemory.Get(name); !ok {
+			t.Fatalf("tools:[] memory:true registry missing %s; names=%v", name, taskRegistryToolNames(onlyMemory))
+		}
+	}
+	for _, name := range []string{"read_file", "write_file", "edit_file", "run_command", "process", "sleep", "diagnostics", "workspace_symbol"} {
+		if _, ok := onlyMemory.Get(name); ok {
+			t.Fatalf("tools:[] memory:true registry contains non-memory tool %s; names=%v", name, taskRegistryToolNames(onlyMemory))
+		}
 	}
 }
 
@@ -674,6 +793,30 @@ func hasDisplayMessage(msgs []DisplayMessage, typ, content string) bool {
 
 func taskResolvedType(tools []string) agentcfg.Resolved {
 	return agentcfg.Resolved{Tools: tools}
+}
+
+func taskRegistryToolNames(r *tool.Registry) []string {
+	var names []string
+	for _, name := range []string{
+		"read_file", "write_file", "edit_file", "apply_patch", "run_command",
+		"execute_pending", "process", "sleep", "task", "save_memory", "search_memory",
+		"search_history", "diagnostics", "workspace_symbol",
+	} {
+		if _, ok := r.Get(name); ok {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func taskAdvertisedToolNames(r *tool.Registry) []string {
+	var names []string
+	for _, tl := range r.AdvertisedTools(nil) {
+		if tl.Function != nil {
+			names = append(names, tl.Function.Name)
+		}
+	}
+	return names
 }
 
 func mustParseTaskAgents(t *testing.T, content string) *agentcfg.Config {
