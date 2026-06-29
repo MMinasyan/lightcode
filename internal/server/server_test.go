@@ -849,6 +849,9 @@ func newServerTestAgentWithModel(t *testing.T, baseURL string, discovery bool, m
 }`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(lightcodeDir, "agents.json"), []byte(`{"primary": {"model": "test/`+modelID+`"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := lcconfig.Load(configPath)
 	if err != nil {
 		t.Fatalf("load config: %v", err)

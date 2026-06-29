@@ -38,6 +38,7 @@ func newResumeRaceAgent(t *testing.T, home, projectRoot string) *Agent {
 }`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	writeAgentsTestConfig(t, configPath, `{"primary": {"model": "test/test-model"}}`)
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		t.Fatalf("load config: %v", err)

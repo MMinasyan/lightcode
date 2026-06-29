@@ -213,8 +213,7 @@ type RuntimeSessionsConfig struct {
 }
 
 type RuntimeCompactionConfig struct {
-	ThresholdPct    float64 `json:"threshold_pct"`
-	SummarizerModel string  `json:"summarizer_model"`
+	ThresholdPct float64 `json:"threshold_pct"`
 }
 
 type RuntimeSubagentsConfig struct {

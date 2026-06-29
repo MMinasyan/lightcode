@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/memory"
@@ -47,6 +48,7 @@ func newCatalogBackedTestAgent(t *testing.T) *Agent {
 }`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	writeAgentsTestConfig(t, configPath, `{"primary": {"model": "test/test-model"}}`)
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
@@ -167,8 +169,8 @@ func TestAgentSetupWarningsForUnconfiguredStartup(t *testing.T) {
 	defer cancel()
 	a.Init(ctx)
 	warnings := a.CurrentWarnings()
-	if !hasWarningKind(warnings, "setup_no_provider") || !hasWarningKind(warnings, "setup_no_default_model") {
-		t.Fatalf("warnings = %#v, want setup provider/default warnings", warnings)
+	if !hasWarningKind(warnings, "setup_no_provider") || !hasWarningKind(warnings, "setup_no_model") {
+		t.Fatalf("warnings = %#v, want setup provider/model warnings", warnings)
 	}
 }
 
@@ -290,7 +292,7 @@ func TestAgentSetDefaultModelWritesConfigAndUpdatesWarnings(t *testing.T) {
       "models": { "test-model": { "name": "Test Model", "context_window": 8192 } }
     }
   },
-  "default_model": ""
+  "compaction": { "threshold_pct": 0.9 }
 }`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -305,8 +307,8 @@ func TestAgentSetDefaultModelWritesConfigAndUpdatesWarnings(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	a.Init(ctx)
-	if !hasWarningKind(a.CurrentWarnings(), "setup_no_default_model") {
-		t.Fatalf("warnings before SetDefaultModel = %#v, want setup_no_default_model", a.CurrentWarnings())
+	if !hasWarningKind(a.CurrentWarnings(), "setup_no_model") {
+		t.Fatalf("warnings before SetDefaultModel = %#v, want setup_no_model", a.CurrentWarnings())
 	}
 	if err := a.SetDefaultModel("test/test-model"); err != nil {
 		t.Fatalf("SetDefaultModel returned error: %v", err)
@@ -315,11 +317,18 @@ func TestAgentSetDefaultModelWritesConfigAndUpdatesWarnings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), `"default_model": "test/test-model"`) {
-		t.Fatalf("config after SetDefaultModel = %s, want default_model", data)
+	if strings.Contains(string(data), "default_model") {
+		t.Fatalf("config after SetDefaultModel unexpectedly contains default_model: %s", data)
 	}
-	if hasWarningKind(a.CurrentWarnings(), "setup_no_default_model") {
-		t.Fatalf("warnings after SetDefaultModel = %#v, did not expect setup_no_default_model", a.CurrentWarnings())
+	agentsData, err := os.ReadFile(agentcfg.PathForConfig(configPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(agentsData), `"model": "test/test-model"`) {
+		t.Fatalf("agents config after SetDefaultModel = %s, want primary.model", agentsData)
+	}
+	if hasWarningKind(a.CurrentWarnings(), "setup_no_model") {
+		t.Fatalf("warnings after SetDefaultModel = %#v, did not expect setup_no_model", a.CurrentWarnings())
 	}
 	entries := a.AllModelList()
 	if len(entries) != 1 || entries[0].Ref != "test/test-model" || !entries[0].Default {
@@ -331,13 +340,58 @@ func TestAgentSetDefaultModelWritesConfigAndUpdatesWarnings(t *testing.T) {
 	}
 }
 
+func TestAgentNewSessionUsesUpdatedPrimaryModelButExistingSessionKeepsModel(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	cur := a.CurrentModel()
+	if cur.Ref != "test/test-model" {
+		t.Fatalf("initial CurrentModel = %#v, want test/test-model", cur)
+	}
+	appendUserTurn(t, a, "first")
+	firstID := a.SessionCurrent().ID
+	if firstID == "" {
+		t.Fatal("first session id is empty")
+	}
+	firstMeta, err := a.store.Meta()
+	if err != nil {
+		t.Fatalf("first session meta: %v", err)
+	}
+	if firstMeta.Provider != "test" || firstMeta.Model != "test-model" {
+		t.Fatalf("first session model = %s/%s, want test/test-model", firstMeta.Provider, firstMeta.Model)
+	}
+
+	if err := a.SetDefaultModel("test/alt-model"); err != nil {
+		t.Fatalf("SetDefaultModel returned error: %v", err)
+	}
+	if cur := a.CurrentModel(); cur.Ref != "test/test-model" {
+		t.Fatalf("current session model changed after primary model write: %#v", cur)
+	}
+
+	if err := a.SessionNew(); err != nil {
+		t.Fatalf("SessionNew returned error: %v", err)
+	}
+	appendUserTurn(t, a, "second")
+	secondMeta, err := a.store.Meta()
+	if err != nil {
+		t.Fatalf("second session meta: %v", err)
+	}
+	if secondMeta.Provider != "test" || secondMeta.Model != "alt-model" {
+		t.Fatalf("new session model = %s/%s, want test/alt-model", secondMeta.Provider, secondMeta.Model)
+	}
+
+	if err := a.SessionSwitch(firstID); err != nil {
+		t.Fatalf("SessionSwitch first returned error: %v", err)
+	}
+	if cur := a.CurrentModel(); cur.Ref != "test/test-model" {
+		t.Fatalf("existing session model after switch = %#v, want test/test-model", cur)
+	}
+}
+
 func TestAgentRuntimeConfigRoundTripWritesReloadsAndExcludesMasterBooleans(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	settings := a.GetRuntimeConfig()
 	settings.Sessions.ArchiveAfterDays = 14
 	settings.Sessions.DeleteAfterArchiveDays = 21
 	settings.Compaction.ThresholdPct = 0.75
-	settings.Compaction.SummarizerModel = "test/test-model"
 	settings.Subagents.MaxConcurrent = 3
 	settings.Subagents.Model = "test/alt-model"
 	settings.Tools.MaxOutputBytes = 32768
@@ -350,7 +404,7 @@ func TestAgentRuntimeConfigRoundTripWritesReloadsAndExcludesMasterBooleans(t *te
 		t.Fatalf("SetRuntimeConfig returned error: %v", err)
 	}
 	got := a.GetRuntimeConfig()
-	if got.Sessions.ArchiveAfterDays != 14 || got.Sessions.DeleteAfterArchiveDays != 21 || got.Compaction.ThresholdPct != 0.75 || got.Compaction.SummarizerModel != "test/test-model" {
+	if got.Sessions.ArchiveAfterDays != 14 || got.Sessions.DeleteAfterArchiveDays != 21 || got.Compaction.ThresholdPct != 0.75 {
 		t.Fatalf("runtime config after set = %#v", got)
 	}
 	if got.Subagents.MaxConcurrent != 3 || got.Subagents.Model != "test/alt-model" || got.Tools.CommandTimeout != 90 || got.Tools.MaxBackgroundProcesses != 1 {
@@ -361,10 +415,13 @@ func TestAgentRuntimeConfigRoundTripWritesReloadsAndExcludesMasterBooleans(t *te
 		t.Fatal(err)
 	}
 	text := string(data)
-	for _, want := range []string{`"archive_after_days": 14`, `"delete_after_archive_days": 21`, `"threshold_pct": 0.75`, `"summarizer_model": "test/test-model"`, `"max_concurrent": 3`, `"model": "test/alt-model"`, `"command_timeout": 90`} {
+	for _, want := range []string{`"archive_after_days": 14`, `"delete_after_archive_days": 21`, `"threshold_pct": 0.75`, `"max_concurrent": 3`, `"model": "test/alt-model"`, `"command_timeout": 90`} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("config missing %s:\n%s", want, text)
 		}
+	}
+	if strings.Contains(text, `"summarizer_model"`) {
+		t.Fatalf("config write should remove summarizer_model:\n%s", text)
 	}
 	if strings.Contains(text, `"auto_archive"`) || strings.Contains(text, `"enabled"`) || strings.Contains(text, `"permissions"`) {
 		t.Fatalf("config write should not add excluded runtime fields:\n%s", text)
@@ -486,6 +543,46 @@ func TestAgentSetRuntimeConfigRejectsInvalidValues(t *testing.T) {
 	}
 }
 
+func TestAgentSummarizerUsesCompactAgentModel(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	writeAgentsTestConfig(t, a.configPath, `{
+  "primary": { "model": "test/test-model" },
+  "compact": { "model": "test/alt-model" }
+}`)
+	if err := a.Reload(); err != nil {
+		t.Fatalf("Reload returned error: %v", err)
+	}
+	_ = a.CurrentModel()
+
+	client, window := a.summarizerClientAndWindow()
+	if got := client.ModelRef(); got.Provider != "test" || got.Model != "alt-model" {
+		t.Fatalf("summarizer model = %#v, want test/alt-model", got)
+	}
+	if window != 4096 {
+		t.Fatalf("summarizer window = %d, want alt-model window 4096", window)
+	}
+}
+
+func TestAgentSummarizerFallsBackToActiveModelWhenCompactModelUnavailable(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	writeAgentsTestConfig(t, a.configPath, `{
+  "primary": { "model": "test/test-model" },
+  "compact": { "model": "test/missing-model" }
+}`)
+	if err := a.Reload(); err != nil {
+		t.Fatalf("Reload returned error: %v", err)
+	}
+	_ = a.CurrentModel()
+
+	client, window := a.summarizerClientAndWindow()
+	if got := client.ModelRef(); got.Provider != "test" || got.Model != "test-model" {
+		t.Fatalf("summarizer fallback model = %#v, want active test/test-model", got)
+	}
+	if window != 8192 {
+		t.Fatalf("summarizer fallback window = %d, want primary window 8192", window)
+	}
+}
+
 func TestAgentSetRuntimeConfigRefusesWhileBusy(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	a.ensureRuntime().mu.Lock()
@@ -554,21 +651,21 @@ func hasWarningKind(warnings []PromptWarning, kind string) bool {
 	return false
 }
 
-func TestAgentInitDoesNotWarnForConnectedDefaultModel(t *testing.T) {
+func TestAgentInitDoesNotWarnForConnectedPrimaryModel(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	a.Init(ctx)
 	warnings := a.CurrentWarnings()
-	if hasWarningKind(warnings, "setup_default_model_unavailable") {
-		t.Fatalf("warnings = %#v, did not expect default unavailable for connected default", warnings)
+	if hasWarningKind(warnings, "setup_model_unavailable") {
+		t.Fatalf("warnings = %#v, did not expect model unavailable for connected primary model", warnings)
 	}
-	if hasWarningKind(warnings, "setup_no_provider") || hasWarningKind(warnings, "setup_no_default_model") {
-		t.Fatalf("warnings = %#v, did not expect setup missing warnings for connected default", warnings)
+	if hasWarningKind(warnings, "setup_no_provider") || hasWarningKind(warnings, "setup_no_model") {
+		t.Fatalf("warnings = %#v, did not expect setup missing warnings for connected primary model", warnings)
 	}
 }
 
-func TestAgentInitDoesNotActivateDefaultModel(t *testing.T) {
+func TestAgentInitDoesNotActivatePrimaryModel(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -581,7 +678,7 @@ func TestAgentInitDoesNotActivateDefaultModel(t *testing.T) {
 	}
 }
 
-func TestAgentCurrentModelUsesCatalogDefaultRef(t *testing.T) {
+func TestAgentCurrentModelUsesPrimaryModelRef(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 
 	cur := a.CurrentModel()
@@ -596,6 +693,8 @@ func TestAgentCurrentModelUsesCatalogDefaultRef(t *testing.T) {
 
 func TestAgentSwitchModelTakesPrefixRef(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
+	_ = a.CurrentModel()
+	appendUserTurn(t, a, "hello")
 
 	if err := a.SwitchModel("test/alt-model"); err != nil {
 		t.Fatalf("SwitchModel returned error: %v", err)
@@ -603,6 +702,20 @@ func TestAgentSwitchModelTakesPrefixRef(t *testing.T) {
 	cur := a.CurrentModel()
 	if cur.Ref != "test/alt-model" || cur.Model != "alt-model" || cur.DisplayName != "Alt Model" || cur.ContextWindow != 4096 {
 		t.Fatalf("CurrentModel after switch = %#v, want alt-model metadata", cur)
+	}
+	agentsData, err := os.ReadFile(agentcfg.PathForConfig(a.configPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(agentsData), `"model": "test/alt-model"`) {
+		t.Fatalf("agents config after SwitchModel = %s, want primary.model alt-model", agentsData)
+	}
+	meta, err := a.store.Meta()
+	if err != nil {
+		t.Fatalf("store meta: %v", err)
+	}
+	if meta.Provider != "test" || meta.Model != "alt-model" {
+		t.Fatalf("session model after SwitchModel = %s/%s, want test/alt-model", meta.Provider, meta.Model)
 	}
 }
 
@@ -802,6 +915,7 @@ func TestAgentReloadRebuildsCatalogAndFallsBackToDefault(t *testing.T) {
   },
   "default_model": "test/test-model"
 }`)
+	writeAgentsTestConfig(t, a.configPath, `{"primary": {"model": "test/test-model"}}`)
 
 	if err := a.Reload(); err != nil {
 		t.Fatalf("Reload returned error: %v", err)
@@ -1270,6 +1384,17 @@ func writeCatalogTestConfig(t *testing.T, home, content string) {
 	path := filepath.Join(home, ".lightcode", "config.json")
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
+	}
+}
+
+func writeAgentsTestConfig(t *testing.T, configPath, content string) {
+	t.Helper()
+	path := agentcfg.PathForConfig(configPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create agents dir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write agents config: %v", err)
 	}
 }
 

@@ -117,6 +117,7 @@ func TestPR11Closure_ViewerReadAcceptsSymlinkedProjectRoot(t *testing.T) {
 }`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	writeAgentsTestConfig(t, configPath, `{"primary": {"model": "test/test-model"}}`)
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		t.Fatalf("load config: %v", err)

@@ -136,8 +136,7 @@ func readBundledProviders(fsys fs.FS) (map[string]json.RawMessage, error) {
 }
 
 const catalogEmptyConfigTemplate = `{
-  "providers": {},
-  "default_model": ""
+  "providers": {}
 }
 `
 

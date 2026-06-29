@@ -192,7 +192,7 @@ func TestWailsBindingsCoverExportedAppMethods(t *testing.T) {
 
 func TestFrontendRuntimeConfigTabExcludesMasterTogglesAndPermissions(t *testing.T) {
 	settings := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "components", "Settings.svelte"))
-	for _, want := range []string{"GetRuntimeConfig", "SetRuntimeConfig", "active === 'agent'", "archive_after_days", "delete_after_archive_days", "threshold_pct", "summarizer_model", "max_concurrent", "max_output_bytes", "max_background_processes"} {
+	for _, want := range []string{"GetRuntimeConfig", "SetRuntimeConfig", "active === 'agent'", "archive_after_days", "delete_after_archive_days", "threshold_pct", "max_concurrent", "max_output_bytes", "max_background_processes"} {
 		if !strings.Contains(settings, want) {
 			t.Fatalf("Settings.svelte runtime config tab missing %q", want)
 		}
