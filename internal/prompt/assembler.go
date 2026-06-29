@@ -50,12 +50,18 @@ var overridableSections = map[string]string{
 }
 
 const (
+	SizeNone   = "none"
+	SizeSimple = "simple"
+	SizeFull   = "full"
+
 	WarnRulesTooLarge        = "rules_too_large"
 	WarnRulesNotFound        = "rules_not_found"
 	WarnRulesReadError       = "rules_read_error"
 	WarnLSPInstallFailed     = "lsp_install_failed"
 	WarnLSPServerUnavailable = "lsp_server_unavailable"
 )
+
+const agentPromptHeading = "## Your Role and Instructions"
 
 type Warning struct {
 	Kind    string
@@ -68,6 +74,13 @@ type Result struct {
 	Warnings []Warning
 }
 
+type Spec struct {
+	Size   string
+	Body   string
+	Memory bool
+	Adapt  *adaptation.Adaptation
+}
+
 type Assembler struct {
 	projectRoot  string
 	home         string
@@ -76,6 +89,9 @@ type Assembler struct {
 	cachedPrompt    string
 	cachedRulesHash [32]byte
 	cachedAdaptName string
+	cachedSize      string
+	cachedBody      string
+	cachedMemory    bool
 }
 
 func New(projectRoot, home string) *Assembler {
@@ -89,66 +105,93 @@ func New(projectRoot, home string) *Assembler {
 // Assemble builds the baseline system prompt (no adaptation).
 func (a *Assembler) Assemble() Result { return a.AssembleFor(nil) }
 
-// AssembleFor builds the system prompt for adapt (nil = baseline). The rules
-// hash is computed exactly as for the baseline; the adaptation name is a
-// companion cache key, so a cache hit requires both the rules and the name to be
-// unchanged. An empty name (baseline) reproduces the baseline hit/miss cadence;
-// a name change forces a rebuild.
+// AssembleFor builds the full system prompt for adapt (nil = baseline). The
+// rules hash is computed exactly as for the baseline; the adaptation name is a
+// companion cache key, so a cache hit requires both the rules and the name to
+// be unchanged. An empty name (baseline) reproduces the baseline hit/miss
+// cadence; a name change forces a rebuild.
 func (a *Assembler) AssembleFor(adapt *adaptation.Adaptation) Result {
+	return a.AssembleForSpec(Spec{Size: SizeFull, Memory: true, Adapt: adapt})
+}
+
+func (a *Assembler) AssembleForSpec(spec Spec) Result {
+	spec = normalizeSpec(spec)
 	var warnings []Warning
 
-	globalContent, err := readRulesFile(filepath.Join(a.home, ".lightcode"))
-	if err != nil {
-		warnings = append(warnings, Warning{Kind: WarnRulesReadError, Message: "Failed to read global rules file: " + err.Error()})
-		globalContent = ""
-	}
+	var globalContent, projectContent string
+	if spec.Size != SizeNone {
+		var err error
+		globalContent, err = readRulesFile(filepath.Join(a.home, ".lightcode"))
+		if err != nil {
+			warnings = append(warnings, Warning{Kind: WarnRulesReadError, Message: "Failed to read global rules file: " + err.Error()})
+			globalContent = ""
+		}
 
-	projectContent, err := readRulesFile(a.projectRoot)
-	if err != nil {
-		warnings = append(warnings, Warning{Kind: WarnRulesReadError, Message: "Failed to read project rules file: " + err.Error()})
-		projectContent = ""
-	}
+		projectContent, err = readRulesFile(a.projectRoot)
+		if err != nil {
+			warnings = append(warnings, Warning{Kind: WarnRulesReadError, Message: "Failed to read project rules file: " + err.Error()})
+			projectContent = ""
+		}
 
-	if projectContent == "" && globalContent == "" {
-		warnings = append(warnings, Warning{Kind: WarnRulesNotFound, Message: "No AGENTS.md found"})
+		if projectContent == "" && globalContent == "" {
+			warnings = append(warnings, Warning{Kind: WarnRulesNotFound, Message: "No AGENTS.md found"})
+		}
 	}
 
 	combined := globalContent + "\x00" + projectContent
 
-	if len(combined) > 20000 {
+	if spec.Size != SizeNone && len(combined) > 20000 {
 		warnings = append(warnings, Warning{Kind: WarnRulesTooLarge, Message: fmt.Sprintf("Rules file exceeds 20,000 characters (%d chars). Consider trimming it.", len(combined))})
 	}
 
 	h := sha256.Sum256([]byte(combined))
 	adaptName := ""
-	if adapt != nil {
-		adaptName = adapt.Name
+	if spec.Adapt != nil && spec.Size != SizeNone {
+		adaptName = spec.Adapt.Name
 	}
-	// Cache key is (rules hash, adaptation name). defaultAdditions is a
-	// compile-time constant, so the name is sufficient; a Name:"" adaptation
-	// carrying additions would be mis-cached against baseline, but matched
-	// table entries always have names and Blocks shares the same hazard.
-	if a.cachedPrompt != "" && h == a.cachedRulesHash && adaptName == a.cachedAdaptName {
+	// Cache key is the prompt spec plus (rules hash, adaptation name).
+	// defaultAdditions is a compile-time constant, so the name is sufficient;
+	// a Name:"" adaptation carrying additions would be mis-cached against
+	// baseline, but matched table entries always have names and Blocks shares
+	// the same hazard.
+	if a.cachedPrompt != "" &&
+		h == a.cachedRulesHash &&
+		adaptName == a.cachedAdaptName &&
+		spec.Size == a.cachedSize &&
+		spec.Body == a.cachedBody &&
+		spec.Memory == a.cachedMemory {
 		return Result{Prompt: a.cachedPrompt, Rebuilt: false, Warnings: warnings}
 	}
 
-	prompt := a.build(globalContent, projectContent, adapt)
+	prompt := a.buildSpec(globalContent, projectContent, spec)
 
 	a.cachedPrompt = prompt
 	a.cachedRulesHash = h
 	a.cachedAdaptName = adaptName
+	a.cachedSize = spec.Size
+	a.cachedBody = spec.Body
+	a.cachedMemory = spec.Memory
 	return Result{Prompt: prompt, Rebuilt: true, Warnings: warnings}
 }
 
 func (a *Assembler) build(globalRules, projectRules string, adapt *adaptation.Adaptation) string {
+	return a.buildSpec(globalRules, projectRules, Spec{Size: SizeFull, Memory: true, Adapt: adapt})
+}
+
+func (a *Assembler) buildSpec(globalRules, projectRules string, spec Spec) string {
+	spec = normalizeSpec(spec)
 	var b strings.Builder
 
-	for _, s := range []string{
-		identitySection,
-		coreRulesSection,
-		rulesFileGuideSection,
-		compactionAwarenessSection,
-	} {
+	if spec.Size == SizeNone {
+		if spec.Memory {
+			b.WriteString(strings.TrimSpace(memoryInstructionsSection))
+			b.WriteString("\n\n")
+		}
+		writeAgentBody(&b, spec.Body)
+		return strings.TrimSpace(b.String())
+	}
+
+	for _, s := range defaultSectionsForSize(spec.Size) {
 		b.WriteString(strings.TrimSpace(s))
 		b.WriteString("\n\n")
 	}
@@ -156,12 +199,14 @@ func (a *Assembler) build(globalRules, projectRules string, adapt *adaptation.Ad
 	b.WriteString(renderEnvironment(a.projectRoot, a.sessionStart))
 	b.WriteString("\n\n")
 
-	b.WriteString(strings.TrimSpace(memoryInstructionsSection))
-	b.WriteString("\n\n")
+	if spec.Memory {
+		b.WriteString(strings.TrimSpace(memoryInstructionsSection))
+		b.WriteString("\n\n")
+	}
 
 	rulesContent := strings.TrimSpace(globalRules + "\n\n" + projectRules)
 	overridden := detectOverrides(rulesContent)
-	for _, name := range overridableOrder {
+	for _, name := range overridableOrderForSize(spec.Size) {
 		if !overridden[name] {
 			b.WriteString(strings.TrimSpace(overridableSections[name]))
 			b.WriteString("\n\n")
@@ -169,7 +214,7 @@ func (a *Assembler) build(globalRules, projectRules string, adapt *adaptation.Ad
 		// System territory: renders even when a user heading overrides the main
 		// (D5: additions are system-owned). Empty defaults/adaptations write
 		// nothing, so the baseline prompt is unchanged.
-		if add := adaptation.SectionAddition(adapt, name); add != "" {
+		if add := adaptation.SectionAddition(spec.Adapt, name); add != "" {
 			b.WriteString(strings.TrimSpace(add))
 			b.WriteString("\n\n")
 		}
@@ -177,12 +222,14 @@ func (a *Assembler) build(globalRules, projectRules string, adapt *adaptation.Ad
 
 	// Adaptation coaching blocks sit after the built-in sections and before user
 	// rules. Baseline (nil/empty) inserts nothing, so the prompt is unchanged.
-	if adapt != nil && len(adapt.Blocks) > 0 {
-		for _, block := range adapt.Blocks {
+	if spec.Adapt != nil && len(spec.Adapt.Blocks) > 0 {
+		for _, block := range spec.Adapt.Blocks {
 			b.WriteString(strings.TrimSpace(block))
 			b.WriteString("\n\n")
 		}
 	}
+
+	writeAgentBody(&b, spec.Body)
 
 	trimmed := strings.TrimSpace(rulesContent)
 	if trimmed != "" {
@@ -191,6 +238,76 @@ func (a *Assembler) build(globalRules, projectRules string, adapt *adaptation.Ad
 	}
 
 	return strings.TrimSpace(b.String())
+}
+
+func normalizeSpec(spec Spec) Spec {
+	switch spec.Size {
+	case SizeNone, SizeSimple, SizeFull:
+	default:
+		spec.Size = SizeFull
+	}
+	spec.Body = strings.TrimSpace(spec.Body)
+	if spec.Size == SizeNone {
+		spec.Adapt = nil
+	}
+	return spec
+}
+
+func defaultSectionsForSize(size string) []string {
+	if size == SizeSimple {
+		return []string{
+			identitySection,
+			coreRulesSection,
+			compactionAwarenessSection,
+		}
+	}
+	return []string{
+		identitySection,
+		coreRulesSection,
+		rulesFileGuideSection,
+		compactionAwarenessSection,
+	}
+}
+
+func overridableOrderForSize(size string) []string {
+	if size == SizeSimple {
+		return []string{"safety"}
+	}
+	return overridableOrder
+}
+
+func writeAgentBody(b *strings.Builder, body string) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return
+	}
+	if !startsWithAgentPromptHeading(body) {
+		b.WriteString(agentPromptHeading)
+		b.WriteString("\n\n")
+	}
+	b.WriteString(body)
+	b.WriteString("\n\n")
+}
+
+func startsWithAgentPromptHeading(body string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "#") {
+			return false
+		}
+		headingText := strings.TrimLeft(line, "#")
+		headingText = strings.TrimSpace(headingText)
+		headingText = strings.TrimSpace(strings.TrimRight(headingText, "#"))
+		headingText = strings.ToLower(headingText)
+		headingText = strings.ReplaceAll(headingText, "-", " ")
+		headingText = strings.ReplaceAll(headingText, "_", " ")
+		headingText = strings.Join(strings.Fields(headingText), " ")
+		return headingText == "your role and instructions"
+	}
+	return false
 }
 
 func renderEnvironment(projectRoot string, sessionStart time.Time) string {

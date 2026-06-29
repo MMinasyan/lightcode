@@ -374,8 +374,8 @@ func New(c Config) (*Agent, error) {
 	a.registry = registry
 
 	asm := prompt.New(c.ProjectRoot, c.Home)
-	res := asm.Assemble()
 	a.assembler = asm
+	res := a.assembleSystemPromptLocked()
 	a.pendingPromptWarnings = res.Warnings
 	a.pendingCatalogWarnings = catalogWarningsToPromptWarnings(catalogWarnings)
 	a.pendingAgentWarnings = agentWarningsToPromptWarnings(agentTypes.Warnings())
@@ -1384,7 +1384,7 @@ func (a *Agent) applyActiveAdaptationPromptLocked() {
 	if a.assembler == nil || a.lp == nil {
 		return
 	}
-	if res := a.assembler.AssembleFor(a.activeAdapt); res.Rebuilt {
+	if res := a.assembleSystemPromptLocked(); res.Rebuilt {
 		a.lp.UpdateSystemPrompt(res.Prompt)
 	}
 }
@@ -1394,11 +1394,21 @@ func (a *Agent) applyActiveAdaptationPromptLocked() {
 // preamble — it runs without rt.mu, which is safe because the model-set paths are
 // idle-gated, so activeAdapt is stable while a turn is in flight.
 func (a *Agent) refreshSystemPrompt() {
-	res := a.assembler.AssembleFor(a.activeAdapt)
+	res := a.assembleSystemPromptLocked()
 	if res.Rebuilt {
 		a.lp.UpdateSystemPrompt(res.Prompt)
 	}
 	a.setWarningGroup("prompt", res.Warnings)
+}
+
+func (a *Agent) assembleSystemPromptLocked() prompt.Result {
+	spec := prompt.Spec{Size: prompt.SizeFull, Memory: true, Adapt: a.activeAdapt}
+	if resolved, err := a.resolvedAgentTypeLocked("primary"); err == nil {
+		spec.Size = resolved.SystemPrompt
+		spec.Body = resolved.Prompt
+		spec.Memory = resolved.Memory
+	}
+	return a.assembler.AssembleForSpec(spec)
 }
 
 func (a *Agent) restoreModelFromSession() {
