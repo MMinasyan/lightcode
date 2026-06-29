@@ -44,6 +44,9 @@ func TestWailsModelSelectorUsesPrefixRefContract(t *testing.T) {
 	if !strings.Contains(binding, "ApplyTurnAction(arg1:number,arg2:string,arg3:boolean):Promise<agent.TurnActionResult>;") {
 		t.Fatalf("Wails binding must expose ApplyTurnAction for adapter-neutral turn actions")
 	}
+	if !strings.Contains(binding, "RevertCode(arg1:number):Promise<snapshot.RevertResult>;") {
+		t.Fatalf("Wails binding must expose RevertCode result with restored/skipped files")
+	}
 	if !strings.Contains(binding, "Submit(arg1:string):Promise<agent.SubmitResult>;") {
 		t.Fatalf("Wails binding must expose Submit as the single backend input entry point")
 	}
@@ -68,6 +71,9 @@ func TestWailsModelSelectorUsesPrefixRefContract(t *testing.T) {
 	}
 	if strings.Contains(models, "export class ProviderModels") {
 		t.Fatalf("models.ts still contains old ProviderModels type")
+	}
+	if !strings.Contains(models, "export class RevertResult") || !strings.Contains(models, "restored?: string[]") || !strings.Contains(models, "skipped?: SkippedRevert[]") {
+		t.Fatalf("generated models must include snapshot.RevertResult with restored/skipped fields")
 	}
 }
 
@@ -229,6 +235,7 @@ func TestWailsLifecycleSurfaceContract(t *testing.T) {
 		"export function SessionSwitch(arg1:string):Promise<void>;",
 		"export function SessionMessagesFor(arg1:string):Promise<Array<agent.DisplayMessage>>;",
 		"export function ApplyTurnAction(arg1:number,arg2:string,arg3:boolean):Promise<agent.TurnActionResult>;",
+		"export function RevertCode(arg1:number):Promise<snapshot.RevertResult>;",
 		"export function TokenUsage():Promise<agent.TokenReport>;",
 		"export function CurrentWarnings():Promise<Array<agent.PromptWarning>>;",
 		"export function SetDefaultModel(arg1:string):Promise<void>;",

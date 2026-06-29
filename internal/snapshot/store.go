@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/pathutil"
@@ -67,9 +68,15 @@ type Store struct {
 	projectHash  string
 	currentTurn  int
 	snapshotTx   map[string]*snapshotTxState
+	mutationLock map[string]*snapshotMutationLock
 }
 
 type snapshotTxState struct {
+	refs int
+}
+
+type snapshotMutationLock struct {
+	mu   sync.Mutex
 	refs int
 }
 
@@ -238,6 +245,7 @@ func (s *Store) clearLocked() {
 	s.projectHash = ""
 	s.currentTurn = 0
 	s.snapshotTx = nil
+	s.mutationLock = nil
 }
 
 // Active reports whether a session is currently open.
@@ -453,6 +461,85 @@ func (s *Store) RetainSnapshotEntry(turn int, entryID string) {
 		return
 	}
 	delete(s.snapshotTx, key)
+}
+
+// LockSnapshotMutation serializes same-session mutations for one snapshot
+// entry. Callers hold the returned release function until the disk mutation
+// and last-write identity record have both completed.
+func (s *Store) LockSnapshotMutation(turn int, entryID string) (func(), error) {
+	if turn < 1 {
+		return nil, fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
+	}
+	if !isLegacyEntryID(entryID) {
+		return nil, fmt.Errorf("snapshot: invalid entry id %q", entryID)
+	}
+	s.mu.Lock()
+	if !s.active {
+		s.mu.Unlock()
+		return nil, ErrNoSession
+	}
+	key := snapshotTxKey(turn, entryID)
+	if s.mutationLock == nil {
+		s.mutationLock = make(map[string]*snapshotMutationLock)
+	}
+	lock := s.mutationLock[key]
+	if lock == nil {
+		lock = &snapshotMutationLock{}
+		s.mutationLock[key] = lock
+	}
+	lock.refs++
+	s.mu.Unlock()
+
+	lock.mu.Lock()
+	released := false
+	return func() {
+		if released {
+			return
+		}
+		released = true
+		lock.mu.Unlock()
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		lock.refs--
+		if lock.refs == 0 && s.mutationLock[key] == lock {
+			delete(s.mutationLock, key)
+		}
+	}, nil
+}
+
+// RecordSnapshotContent records the content produced by a successful mutation.
+func (s *Store) RecordSnapshotContent(turn int, entryID string, content []byte) error {
+	return s.recordSnapshotIdentity(turn, entryID, SnapshotContentIdentity{Hash: hashBytes(content)})
+}
+
+// RecordSnapshotAbsence records that a successful mutation removed the file.
+func (s *Store) RecordSnapshotAbsence(turn int, entryID string) error {
+	return s.recordSnapshotIdentity(turn, entryID, SnapshotContentIdentity{Absent: true})
+}
+
+func (s *Store) recordSnapshotIdentity(turn int, entryID string, identity SnapshotContentIdentity) error {
+	if turn < 1 {
+		return fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
+	}
+	if !isLegacyEntryID(entryID) {
+		return fmt.Errorf("snapshot: invalid entry id %q", entryID)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active {
+		return ErrNoSession
+	}
+	metaPath := filepath.Join(s.snapshotsDir, strconv.Itoa(turn), entryID, "meta.json")
+	var meta SnapshotMeta
+	if err := readJSON(metaPath, &meta); err != nil {
+		return err
+	}
+	meta.LastWrite = &identity
+	if err := writeJSON(metaPath, meta); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) snapshotTxStateLocked(turn int, entryID string, create bool) *snapshotTxState {
@@ -736,33 +823,36 @@ func (s *Store) ListTurns() ([]TurnEntry, error) {
 // RevertCode restores every file snapshotted in turns > toTurn to its
 // pre-turn state and deletes those snapshot turn dirs. Message history
 // and turn dirs are NOT touched — conversation stays intact.
-func (s *Store) RevertCode(toTurn int) ([]string, error) {
+func (s *Store) RevertCode(toTurn int) (RevertResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.active {
-		return nil, ErrNoSession
+		return RevertResult{}, ErrNoSession
 	}
 	if toTurn < 0 {
 		toTurn = 0
 	}
 	turns := readIntDirs(s.snapshotsDir)
-	var affected []string
+	var result RevertResult
+	skippedEntries := make(map[string]struct{})
+	reportedSkippedEntries := make(map[string]struct{})
 	for i := len(turns) - 1; i >= 0; i-- {
 		turn := turns[i]
 		if turn <= toTurn {
 			break
 		}
 		turnDir := filepath.Join(s.snapshotsDir, strconv.Itoa(turn))
-		paths, err := revertOneTurn(turnDir)
-		affected = append(affected, paths...)
+		turnResult, err := revertOneTurn(turnDir, skippedEntries, reportedSkippedEntries)
+		result.Restored = append(result.Restored, turnResult.Restored...)
+		result.Skipped = append(result.Skipped, turnResult.Skipped...)
 		if err != nil {
-			return affected, fmt.Errorf("snapshot: revert turn %d: %w", turn, err)
+			return result, fmt.Errorf("snapshot: revert turn %d: %w", turn, err)
 		}
-		if err := os.RemoveAll(turnDir); err != nil {
-			return affected, fmt.Errorf("snapshot: remove %s: %w", turnDir, err)
+		if err := os.Remove(turnDir); err != nil && !errors.Is(err, os.ErrNotExist) && !isDirNotEmpty(err) {
+			return result, fmt.Errorf("snapshot: remove %s: %w", turnDir, err)
 		}
 	}
-	return affected, nil
+	return result, nil
 }
 
 // RevertHistory deletes message turn dirs strictly greater than toTurn
@@ -1196,12 +1286,12 @@ func (s *Store) highestCompleteTurnLocked() int {
 	return max
 }
 
-func revertOneTurn(turnDir string) ([]string, error) {
+func revertOneTurn(turnDir string, skippedEntries, reportedSkippedEntries map[string]struct{}) (RevertResult, error) {
 	entries, err := os.ReadDir(turnDir)
 	if err != nil {
-		return nil, err
+		return RevertResult{}, err
 	}
-	var affected []string
+	var result RevertResult
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -1209,54 +1299,160 @@ func revertOneTurn(turnDir string) ([]string, error) {
 		entryDir := filepath.Join(turnDir, e.Name())
 		var meta SnapshotMeta
 		if err := readJSON(filepath.Join(entryDir, "meta.json"), &meta); err != nil {
-			return affected, fmt.Errorf("read snapshot meta in %s: %w", entryDir, err)
+			return result, fmt.Errorf("read snapshot meta in %s: %w", entryDir, err)
 		}
-		if err := restoreOne(entryDir, meta); err != nil {
-			return affected, fmt.Errorf("restore %s: %w", meta.OriginalPath, err)
+		entryID := filepath.Base(entryDir)
+		if _, blocked := skippedEntries[entryID]; blocked {
+			continue
 		}
-		affected = append(affected, meta.OriginalPath)
+		restored, skipped, err := restoreOne(entryDir, meta)
+		if err != nil {
+			return result, fmt.Errorf("restore %s: %w", meta.OriginalPath, err)
+		}
+		if skipped != nil {
+			skippedEntries[entryID] = struct{}{}
+			if _, reported := reportedSkippedEntries[entryID]; !reported {
+				result.Skipped = append(result.Skipped, *skipped)
+				reportedSkippedEntries[entryID] = struct{}{}
+			}
+			continue
+		}
+		if restored {
+			result.Restored = append(result.Restored, meta.OriginalPath)
+			if err := os.RemoveAll(entryDir); err != nil {
+				return result, fmt.Errorf("remove restored snapshot entry %s: %w", entryDir, err)
+			}
+		}
 	}
-	return affected, nil
+	return result, nil
 }
 
-func restoreOne(entryDir string, meta SnapshotMeta) error {
+func restoreOne(entryDir string, meta SnapshotMeta) (bool, *SkippedRevert, error) {
 	entryID := filepath.Base(entryDir)
-	restorePath, err := validateRestorePath(entryID, meta)
+	restorePath, skipped, err := validateRestorePath(entryID, meta)
 	if err != nil {
-		return err
+		return false, nil, err
+	}
+	if skipped != nil {
+		return false, skipped, nil
+	}
+	if ok, reason, err := currentMatchesLastWrite(restorePath, meta.LastWrite); err != nil {
+		return false, nil, err
+	} else if !ok {
+		return false, &SkippedRevert{Path: meta.OriginalPath, Reason: reason}, nil
 	}
 	if !meta.Existed {
 		if err := safefs.RemoveLeaf(restorePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+			return false, nil, err
 		}
-		return nil
+		return true, nil, nil
 	}
 	src := filepath.Join(entryDir, "original")
-	return restoreFile(src, restorePath)
+	return true, nil, restoreFile(src, restorePath)
 }
 
-func validateRestorePath(entryID string, meta SnapshotMeta) (string, error) {
+func currentMatchesLastWrite(path string, last *SnapshotContentIdentity) (bool, string, error) {
+	if last == nil {
+		return false, "snapshot entry has no recorded post-write identity", nil
+	}
+	if last.Absent {
+		if _, err := os.Lstat(path); err == nil {
+			return false, "file exists but this session last left it absent", nil
+		} else if errors.Is(err, os.ErrNotExist) {
+			return true, "", nil
+		} else {
+			return false, "", fmt.Errorf("stat current target %s: %w", path, err)
+		}
+	}
+	got, exists, reason, err := hashCurrentFile(path)
+	if err != nil {
+		return false, "", err
+	}
+	if reason != "" {
+		return false, reason, nil
+	}
+	if !exists {
+		return false, "file is missing but this session last wrote content", nil
+	}
+	if got != last.Hash {
+		return false, "file content changed since this session last wrote it", nil
+	}
+	return true, "", nil
+}
+
+func hashCurrentFile(path string) (string, bool, string, error) {
+	f, err := safefs.OpenExisting(path, os.O_RDONLY|unix.O_NONBLOCK)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", false, "", nil
+		}
+		if errors.Is(err, safefs.ErrNonRegular) || errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.ENOTDIR) {
+			hardlinked, statErr := hardlinkedRegularOrSymlinkLeaf(path)
+			if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+				return "", false, "", statErr
+			}
+			if hardlinked {
+				return "", false, "", fmt.Errorf("%w (link count > 1): %s", safefs.ErrHardlink, path)
+			}
+			return "", true, "file is no longer a regular file", nil
+		}
+		return "", false, "", fmt.Errorf("open current target %s: %w", path, err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return "", false, "", fmt.Errorf("read current target %s: %w", path, err)
+	}
+	return hashBytes(data), true, "", nil
+}
+
+func hardlinkedRegularOrSymlinkLeaf(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false, err
+	}
+	mode := info.Mode()
+	if !mode.IsRegular() && mode&os.ModeSymlink == 0 {
+		return false, nil
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false, nil
+	}
+	return st.Nlink > 1, nil
+}
+
+func isDirNotEmpty(err error) bool {
+	return errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, unix.ENOTEMPTY)
+}
+
+func validateRestorePath(entryID string, meta SnapshotMeta) (string, *SkippedRevert, error) {
 	if !meta.Existed {
-		return validateDeletePath(entryID, meta)
+		restorePath, err := validateDeletePath(entryID, meta)
+		return restorePath, nil, err
 	}
 	if meta.CanonicalPath == "" {
-		return validateLegacyRestorePath(entryID, meta.OriginalPath)
+		restorePath, err := validateLegacyRestorePath(entryID, meta.OriginalPath)
+		return restorePath, nil, err
 	}
 	return validateModernRestorePath(entryID, meta)
 }
 
-func validateModernRestorePath(entryID string, meta SnapshotMeta) (string, error) {
+func validateModernRestorePath(entryID string, meta SnapshotMeta) (string, *SkippedRevert, error) {
 	if hashString(meta.CanonicalPath) != entryID {
-		return "", fmt.Errorf("modern restore refused: meta canonical path %q does not match entry id %s", meta.CanonicalPath, entryID)
+		return "", nil, fmt.Errorf("modern restore refused: meta canonical path %q does not match entry id %s", meta.CanonicalPath, entryID)
 	}
 	resolved, err := pathutil.ResolveFilePath(meta.OriginalPath)
 	if err != nil {
-		return "", fmt.Errorf("resolve restore path %s: %w", meta.OriginalPath, err)
+		return "", nil, fmt.Errorf("resolve restore path %s: %w", meta.OriginalPath, err)
 	}
 	if resolved.CanonicalPath != meta.CanonicalPath {
-		return "", fmt.Errorf("canonical path changed from %s to %s", meta.CanonicalPath, resolved.CanonicalPath)
+		return "", &SkippedRevert{
+			Path:   meta.OriginalPath,
+			Reason: fmt.Sprintf("canonical path changed from %s to %s", meta.CanonicalPath, resolved.CanonicalPath),
+		}, nil
 	}
-	return meta.CanonicalPath, nil
+	return meta.CanonicalPath, nil, nil
 }
 
 func validateDeletePath(entryID string, meta SnapshotMeta) (string, error) {
@@ -1384,6 +1580,11 @@ func newSessionID() (string, error) {
 func hashString(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])[:16]
+}
+
+func hashBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 func copyFile(src, dst string) error {

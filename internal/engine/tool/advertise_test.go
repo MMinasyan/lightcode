@@ -146,14 +146,13 @@ func TestAdvertisedToolsRenderDescriptionReplacements(t *testing.T) {
 		t.Fatalf("baseline run_command description = %q, want default edit/write phrase", runDesc)
 	}
 	readDesc := advertisedDescription(baseline, "read_file")
-	if !strings.Contains(readDesc, "edit_file and write_file will error") {
-		t.Fatalf("baseline read_file description = %q, want read-first rule", readDesc)
+	if strings.Contains(readDesc, "<") {
+		t.Fatalf("baseline read_file description has unresolved placeholder: %q", readDesc)
 	}
 
 	adapt := &adaptation.Adaptation{
 		ToolDescriptionReplacements: map[string]string{
 			"<EDIT FILE OR WRITE FILE>": "apply_patch",
-			"<READ-FIRST RULE>":         "",
 		},
 	}
 	adapted := r.AdvertisedTools(adapt)
@@ -162,8 +161,8 @@ func TestAdvertisedToolsRenderDescriptionReplacements(t *testing.T) {
 		t.Fatalf("adapted run_command description = %q, want apply_patch only", runDesc)
 	}
 	readDesc = advertisedDescription(adapted, "read_file")
-	if strings.Contains(readDesc, "READ-FIRST") || strings.Contains(readDesc, "edit_file and write_file will error") {
-		t.Fatalf("adapted read_file description = %q, want read-first rule removed", readDesc)
+	if strings.Contains(readDesc, "<") {
+		t.Fatalf("adapted read_file description has unresolved placeholder: %q", readDesc)
 	}
 	for _, tl := range adapted {
 		if tl.Function != nil && strings.Contains(tl.Function.Description, "<") {

@@ -18,7 +18,7 @@ import (
 type AskActionFunc func(ctx context.Context, req permission.Request) permission.ResponseAction
 
 // StagedExecutor executes pending edit/write calls as a batch while
-// preserving the normal permission, snapshot, and read-before-edit rules.
+// preserving normal permission and snapshot rules.
 type StagedExecutor struct {
 	store         SnapshotStore
 	tracker       *FileTracker
@@ -323,15 +323,6 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 		}
 		var readErr error
 		data, readErr = io.ReadAll(readFile)
-		if readErr == nil && e.tracker != nil {
-			if err := e.tracker.WasReadCheckIdentity(absPath, FileIdentityFromFileInfoAndData(info, data)); err != nil {
-				_ = readFile.Close()
-				for _, idx := range indexes {
-					results[idx].Error = err.Error()
-				}
-				return
-			}
-		}
 		_ = readFile.Close()
 		if readErr != nil {
 			for _, idx := range indexes {
@@ -340,13 +331,6 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 			return
 		}
 	}
-	if !existed && e.tracker != nil && e.tracker.HasRead(absPath) {
-		for _, idx := range indexes {
-			results[idx].Error = (&FileChangedError{Path: absPath}).Error()
-		}
-		return
-	}
-
 	content := string(data)
 	successes := 0
 	for _, idx := range indexes {
@@ -404,6 +388,9 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 				return
 			}
 			snapshot, err = snapshotFileForMutation(e.store, turn, displayAbsPath, absPath)
+			if err == nil {
+				defer releaseSnapshotMutation(snapshot)
+			}
 		}
 		if err != nil {
 			for _, idx := range indexes {
@@ -439,7 +426,7 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 				err = fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
 			}
 		} else {
-			retainMutatedSnapshot(snapshot)
+			err = retainFailedMutatedSnapshot(snapshot, absPath, err)
 		}
 		e.failSuccessful(results, indexes, fmt.Sprintf("write %s: %v", absPath, err))
 		return
@@ -447,26 +434,29 @@ func (e *StagedExecutor) executeFileGroup(ctx context.Context, staged []StagedCa
 	defer writeFile.Close()
 	retainMutatedSnapshot(snapshot)
 	if err := writeFile.Truncate(0); err != nil {
+		err = retainFailedMutatedSnapshot(snapshot, absPath, err)
 		e.failSuccessful(results, indexes, fmt.Sprintf("truncate %s: %v", absPath, err))
 		return
 	}
 	if _, err := writeFile.Seek(0, io.SeekStart); err != nil {
+		err = retainFailedMutatedSnapshot(snapshot, absPath, err)
 		e.failSuccessful(results, indexes, fmt.Sprintf("seek %s: %v", absPath, err))
 		return
 	}
 	if _, err := writeFile.Write([]byte(content)); err != nil {
+		err = retainFailedMutatedSnapshot(snapshot, absPath, err)
 		e.failSuccessful(results, indexes, fmt.Sprintf("write %s: %v", absPath, err))
 		return
 	}
 	if err := writeFile.Sync(); err != nil {
+		err = retainFailedMutatedSnapshot(snapshot, absPath, err)
 		e.failSuccessful(results, indexes, fmt.Sprintf("sync %s: %v", absPath, err))
 		return
 	}
-
-	if e.tracker != nil {
-		if info, err := writeFile.Stat(); err == nil {
-			e.tracker.UpdateAfterWriteIdentity(absPath, FileIdentityFromFileInfoAndData(info, []byte(content)))
-		}
+	if err := recordMutatedSnapshotContent(snapshot, []byte(content)); err != nil {
+		retainMutatedSnapshot(snapshot)
+		e.failSuccessful(results, indexes, fmt.Sprintf("record snapshot identity %s: %v", absPath, err))
+		return
 	}
 }
 

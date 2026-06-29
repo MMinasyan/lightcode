@@ -2,8 +2,7 @@
   "version": 1,
   "defaults": {
     "tool_description_replacements": {
-      "<EDIT FILE OR WRITE FILE>": "edit_file or write_file",
-      "<READ-FIRST RULE>": "- You must read a file before editing or overwriting it. edit_file and write_file will error if you have not read the file first."
+      "<EDIT FILE OR WRITE FILE>": "edit_file or write_file"
     }
   },
   "entries": [
@@ -13,8 +12,7 @@
       "exclude_tools": ["edit_file", "write_file"],
       "include_tools": ["apply_patch"],
       "tool_description_replacements": {
-        "<EDIT FILE OR WRITE FILE>": "apply_patch",
-        "<READ-FIRST RULE>": ""
+        "<EDIT FILE OR WRITE FILE>": "apply_patch"
       },
       "additions": {
         "task_execution": "Use more tool calls when they can improve the response, provide useful context, or help plan or complete the task.\n\nIf you encounter a new or unexpected challenge before the active task is complete, try to resolve it yourself first. If a tool call fails or returns incomplete or unhelpful output, try another tool or a different approach."
@@ -26,8 +24,7 @@
       "exclude_tools": ["edit_file", "write_file"],
       "include_tools": ["apply_patch"],
       "tool_description_replacements": {
-        "<EDIT FILE OR WRITE FILE>": "apply_patch",
-        "<READ-FIRST RULE>": ""
+        "<EDIT FILE OR WRITE FILE>": "apply_patch"
       },
       "additions": {
         "task_execution": "Use more tool calls when they can improve the response, provide useful context, or help plan or complete the task.\n\nIf you encounter a new or unexpected challenge before the active task is complete, try to resolve it yourself first. If a tool call fails or returns incomplete or unhelpful output, try another tool or a different approach."
@@ -39,8 +36,7 @@
       "exclude_tools": ["edit_file", "write_file"],
       "include_tools": ["apply_patch"],
       "tool_description_replacements": {
-        "<EDIT FILE OR WRITE FILE>": "apply_patch",
-        "<READ-FIRST RULE>": ""
+        "<EDIT FILE OR WRITE FILE>": "apply_patch"
       }
     },
     {

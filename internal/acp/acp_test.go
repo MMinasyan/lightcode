@@ -604,7 +604,8 @@ func appendACPUserTurn(t *testing.T, a *agent.Agent, content string) int {
 func appendACPUserTurnWithSnapshot(t *testing.T, a *agent.Agent, content, path, after string) int {
 	t.Helper()
 	turn := appendACPUserTurn(t, a, content)
-	if err := a.Store().Snapshot(turn, path); err != nil {
+	entryID, _, err := a.Store().SnapshotResolvedEntry(turn, path, path)
+	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -612,6 +613,9 @@ func appendACPUserTurnWithSnapshot(t *testing.T, a *agent.Agent, content, path, 
 	}
 	if err := os.WriteFile(path, []byte(after), 0o600); err != nil {
 		t.Fatalf("write changed file: %v", err)
+	}
+	if err := a.Store().RecordSnapshotContent(turn, entryID, []byte(after)); err != nil {
+		t.Fatalf("RecordSnapshotContent: %v", err)
 	}
 	return turn
 }

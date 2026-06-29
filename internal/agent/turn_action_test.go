@@ -14,7 +14,6 @@ import (
 	"time"
 
 	loop "github.com/MMinasyan/lightcode/internal/engine"
-	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/provider"
 	"github.com/MMinasyan/lightcode/internal/tool"
@@ -526,7 +525,8 @@ func appendUserTurnWithSnapshot(t *testing.T, a *Agent, content, path, after str
 		t.Fatalf("ensureSession returned error: %v", err)
 	}
 	turn := a.store.BeginTurn()
-	if err := a.store.Snapshot(turn, path); err != nil {
+	entryID, _, err := a.store.SnapshotResolvedEntry(turn, path, path)
+	if err != nil {
 		t.Fatalf("Snapshot returned error: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -534,6 +534,9 @@ func appendUserTurnWithSnapshot(t *testing.T, a *Agent, content, path, after str
 	}
 	if err := os.WriteFile(path, []byte(after), 0o600); err != nil {
 		t.Fatalf("write changed file: %v", err)
+	}
+	if err := a.store.RecordSnapshotContent(turn, entryID, []byte(after)); err != nil {
+		t.Fatalf("RecordSnapshotContent returned error: %v", err)
 	}
 	a.lp.AppendUserMessage(turn, content)
 	if err := a.store.MarkTurnComplete(turn); err != nil {
@@ -564,14 +567,7 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
-// Agent.RevertCode must repopulate the file tracker from disk after
-// restoring snapshots, symmetric with how RevertHistory rebuilds the
-// tracker. The test setup includes a read_file tool call in the message
-// history so the repopulation path has something to populate from; this
-// distinguishes the fix from a plain tracker.Reset() (Reset leaves
-// HasRead == false; populate leaves HasRead == true with cleared
-// identity).
-func TestPR11Closure_RevertCodeRepopulatesTracker(t *testing.T) {
+func TestRevertCodeClearsFileTrackerState(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	if err := a.ensureSession(); err != nil {
 		t.Fatalf("ensureSession: %v", err)
@@ -582,58 +578,18 @@ func TestPR11Closure_RevertCodeRepopulatesTracker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Turn 1: append a user message and an assistant message whose
-	// tool_calls include a read_file for `path`. The repopulation routine
-	// scans this for paths to re-track.
-	turn1 := a.store.BeginTurn()
-	historyMsgs := []message.Message{
-		message.NewText(message.RoleUser, "read tracked.txt"),
-		{
-			Role:    message.RoleAssistant,
-			Content: []message.ContentPart{{Type: message.ContentPartText, Text: "reading"}},
-			ToolCalls: []message.ToolCall{{
-				ID:       "call_1",
-				Type:     "function",
-				Function: message.FunctionCall{Name: "read_file", Arguments: `{"path":"` + path + `"}`},
-			}},
-		},
-		toolResult("call_1", "read_file", "v1"),
-	}
-	for _, msg := range historyMsgs {
-		data, err := json.Marshal(msg)
-		if err != nil {
-			t.Fatalf("marshal message: %v", err)
-		}
-		if err := a.store.AppendMessage(turn1, data); err != nil {
-			t.Fatalf("AppendMessage: %v", err)
-		}
-	}
-	if err := a.store.MarkTurnComplete(turn1); err != nil {
-		t.Fatalf("MarkTurnComplete: %v", err)
-	}
-
-	// Turn 2: snapshot the v1 state, then write "v2".
 	clickedTurn := appendUserTurnWithSnapshot(t, a, "modify", path, "v2")
+	a.fileTracker.TrackIdentity(path, 0, 500, tool.FileIdentity{Valid: true})
+	if !agentTrackerHasRead(a, path) {
+		t.Fatal("setup: tracker missing read state")
+	}
 
-	// Construct identities for both versions.
-	v2Info, err := os.Stat(path)
+	result, err := a.RevertCode(clickedTurn - 1)
 	if err != nil {
-		t.Fatal(err)
-	}
-	v2Data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	v2Identity := tool.FileIdentityFromFileInfoAndData(v2Info, v2Data)
-
-	// Simulate the agent's tracker carrying the post-modification state.
-	a.fileTracker.TrackIdentity(path, 0, 500, v2Identity)
-	if a.fileTracker.WasReadCheckIdentity(path, v2Identity) != nil {
-		t.Fatal("setup: tracker should accept v2 identity before revert")
-	}
-
-	if err := a.RevertCode(clickedTurn - 1); err != nil {
 		t.Fatalf("RevertCode error: %v", err)
+	}
+	if len(result.Restored) != 1 || result.Restored[0] != path {
+		t.Fatalf("RevertCode result = %+v, want restored %s", result, path)
 	}
 
 	// Disk should now hold v1 again.
@@ -644,44 +600,12 @@ func TestPR11Closure_RevertCodeRepopulatesTracker(t *testing.T) {
 	if string(got) != "v1" {
 		t.Fatalf("on-disk content after revert = %q, want %q", string(got), "v1")
 	}
-
-	// Tracker must still record the path (rules out a plain tracker.Reset
-	// implementation — that would leave HasRead == false).
-	if !a.fileTracker.HasRead(path) {
-		t.Fatal("tracker.HasRead = false after RevertCode; populateFileTracker did not re-populate from message history")
-	}
-
-	// The stale v2 identity must be gone (rules out the bug where RevertCode
-	// leaves the tracker untouched).
-	if a.fileTracker.WasReadCheckIdentity(path, v2Identity) == nil {
-		t.Fatal("tracker still accepts the stale v2 identity after RevertCode; tracker was not refreshed against post-revert disk state")
-	}
-
-	// The post-revert state must still require a real read_file before the
-	// next edit, even against the actual current on-disk identity. The
-	// stored identity is empty after repopulation, so this check fails
-	// (FileChangedError) until read_file observes the current state.
-	currentInfo, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	currentData, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	currentIdentity := tool.FileIdentityFromFileInfoAndData(currentInfo, currentData)
-	if a.fileTracker.WasReadCheckIdentity(path, currentIdentity) == nil {
-		t.Fatal("tracker accepted the current on-disk identity without a fresh read_file; revert must force re-read before next edit")
+	if agentTrackerHasRead(a, path) {
+		t.Fatal("tracker retained read state after RevertCode")
 	}
 }
 
-// TestPR11Closure_ApplyTurnActionRevertCodeRepopulatesTracker exercises the
-// user-facing UI path. Wails (`App.ApplyTurnAction`) and the CLI menu both
-// route revert through `ApplyTurnAction(turn, TurnActionRevertCode, ...)`,
-// which is a separate branch from direct `Agent.RevertCode(...)`. Without
-// the tracker repopulation in that branch a stale identity captured before
-// the revert would still authorize the next `edit_file`.
-func TestPR11Closure_ApplyTurnActionRevertCodeRepopulatesTracker(t *testing.T) {
+func TestRevertCodeReturnsSkippedFiles(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	if err := a.ensureSession(); err != nil {
 		t.Fatalf("ensureSession: %v", err)
@@ -692,53 +616,48 @@ func TestPR11Closure_ApplyTurnActionRevertCodeRepopulatesTracker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	turn1 := a.store.BeginTurn()
-	historyMsgs := []message.Message{
-		message.NewText(message.RoleUser, "read tracked.txt"),
-		{
-			Role:    message.RoleAssistant,
-			Content: []message.ContentPart{{Type: message.ContentPartText, Text: "reading"}},
-			ToolCalls: []message.ToolCall{{
-				ID:       "call_1",
-				Type:     "function",
-				Function: message.FunctionCall{Name: "read_file", Arguments: `{"path":"` + path + `"}`},
-			}},
-		},
-		toolResult("call_1", "read_file", "v1"),
+	clickedTurn := appendUserTurnWithSnapshot(t, a, "modify", path, "v2")
+	if err := os.WriteFile(path, []byte("external"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	for _, msg := range historyMsgs {
-		data, err := json.Marshal(msg)
-		if err != nil {
-			t.Fatalf("marshal message: %v", err)
-		}
-		if err := a.store.AppendMessage(turn1, data); err != nil {
-			t.Fatalf("AppendMessage: %v", err)
-		}
+
+	result, err := a.RevertCode(clickedTurn - 1)
+	if err != nil {
+		t.Fatalf("RevertCode: %v", err)
 	}
-	if err := a.store.MarkTurnComplete(turn1); err != nil {
-		t.Fatalf("MarkTurnComplete: %v", err)
+	if len(result.Restored) != 0 {
+		t.Fatalf("Restored = %v, want none", result.Restored)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].Path != path {
+		t.Fatalf("Skipped = %+v, want skipped %s", result.Skipped, path)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "external" {
+		t.Fatalf("path after skipped revert = %q, %v; want external", got, err)
+	}
+}
+
+func TestApplyTurnActionRevertCodeReportsRestoredFiles(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession: %v", err)
+	}
+
+	path := filepath.Join(a.projectRoot, "tracked.txt")
+	if err := os.WriteFile(path, []byte("v1"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 
 	clickedTurn := appendUserTurnWithSnapshot(t, a, "modify", path, "v2")
 
-	v2Info, err := os.Stat(path)
+	result, err := a.ApplyTurnAction(clickedTurn, TurnActionRevertCode, false)
 	if err != nil {
-		t.Fatal(err)
-	}
-	v2Data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	v2Identity := tool.FileIdentityFromFileInfoAndData(v2Info, v2Data)
-
-	a.fileTracker.TrackIdentity(path, 0, 500, v2Identity)
-	if a.fileTracker.WasReadCheckIdentity(path, v2Identity) != nil {
-		t.Fatal("setup: tracker should accept v2 identity before revert")
-	}
-
-	// Drive the revert through ApplyTurnAction — the UI-facing path.
-	if _, err := a.ApplyTurnAction(clickedTurn, TurnActionRevertCode, false); err != nil {
 		t.Fatalf("ApplyTurnAction: %v", err)
+	}
+	if len(result.RestoredFiles) != 1 || result.RestoredFiles[0] != path {
+		t.Fatalf("RestoredFiles = %v, want [%s]", result.RestoredFiles, path)
+	}
+	if len(result.SkippedFiles) != 0 {
+		t.Fatalf("SkippedFiles = %+v, want none", result.SkippedFiles)
 	}
 
 	got, err := os.ReadFile(path)
@@ -748,139 +667,46 @@ func TestPR11Closure_ApplyTurnActionRevertCodeRepopulatesTracker(t *testing.T) {
 	if string(got) != "v1" {
 		t.Fatalf("on-disk content after revert = %q, want %q", string(got), "v1")
 	}
-
-	if !a.fileTracker.HasRead(path) {
-		t.Fatal("tracker.HasRead = false after ApplyTurnAction(revert_code); populateFileTracker did not re-populate from message history")
-	}
-
-	if a.fileTracker.WasReadCheckIdentity(path, v2Identity) == nil {
-		t.Fatal("tracker still accepts the stale v2 identity after ApplyTurnAction(revert_code); tracker was not refreshed against post-revert disk state")
-	}
-
-	currentInfo, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	currentData, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	currentIdentity := tool.FileIdentityFromFileInfoAndData(currentInfo, currentData)
-	if a.fileTracker.WasReadCheckIdentity(path, currentIdentity) == nil {
-		t.Fatal("tracker accepted the current on-disk identity without a fresh read_file; revert must force re-read before next edit")
-	}
 }
 
-// TestPR11Closure_RevertHistoryThenRevertCodeTrackerStaysTruncated exercises
-// the sequence: RevertHistory truncates later turns, then a *separate*
-// RevertCode is applied. populateFileTracker runs at both steps and must
-// rebuild from the truncated store only, so a read recorded in a removed
-// turn does not silently authorize a future edit.
-func TestPR11Closure_RevertHistoryThenRevertCodeTrackerStaysTruncated(t *testing.T) {
+func TestApplyTurnActionRevertCodeReportsSkippedFiles(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	if err := a.ensureSession(); err != nil {
 		t.Fatalf("ensureSession: %v", err)
 	}
 
-	pathA := filepath.Join(a.projectRoot, "trackedA.txt")
-	pathB := filepath.Join(a.projectRoot, "trackedB.txt")
-	if err := os.WriteFile(pathA, []byte("a-v1"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(pathB, []byte("b-v1"), 0o600); err != nil {
+	path := filepath.Join(a.projectRoot, "tracked.txt")
+	if err := os.WriteFile(path, []byte("v1"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	// Turn 1: read_file pathA in assistant tool_calls.
-	turn1 := a.store.BeginTurn()
-	appendReadFileTurn(t, a, turn1, "read A", pathA, "a-v1", "call_a")
+	clickedTurn := appendUserTurnWithSnapshot(t, a, "modify", path, "v2")
+	if err := os.WriteFile(path, []byte("external"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
-	// Turn 2: snapshot pathA + write v2, so RevertCode has work to do.
-	turn2 := appendUserTurnWithSnapshot(t, a, "modify A", pathA, "a-v2")
-
-	// Turn 3: read_file pathB. This turn will be truncated by RevertHistory.
-	turn3 := a.store.BeginTurn()
-	appendReadFileTurn(t, a, turn3, "read B", pathB, "b-v1", "call_b")
-
-	// Seed the in-memory tracker as if a real read_file in turn 3 had
-	// authorized pathB. The revert sequence must clear this — replaying
-	// only on-disk history is not enough; in-memory state for the
-	// truncated turn must not silently survive.
-	bInfo, err := os.Stat(pathB)
+	result, err := a.ApplyTurnAction(clickedTurn, TurnActionRevertCode, false)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ApplyTurnAction: %v", err)
 	}
-	bData, err := os.ReadFile(pathB)
-	if err != nil {
-		t.Fatal(err)
+	if len(result.RestoredFiles) != 0 {
+		t.Fatalf("RestoredFiles = %v, want none", result.RestoredFiles)
 	}
-	bIdentity := tool.FileIdentityFromFileInfoAndData(bInfo, bData)
-	a.fileTracker.TrackIdentity(pathB, 0, 500, bIdentity)
-	if a.fileTracker.WasReadCheckIdentity(pathB, bIdentity) != nil {
-		t.Fatal("setup: tracker should accept pathB identity before revert")
+	if len(result.SkippedFiles) != 1 || result.SkippedFiles[0].Path != path {
+		t.Fatalf("SkippedFiles = %+v, want skipped %s", result.SkippedFiles, path)
 	}
-
-	// RevertHistory at turn 3 → target=2, keeps turns 1 and 2, drops turn 3.
-	if _, err := a.ApplyTurnAction(turn3, TurnActionRevertHistory, false); err != nil {
-		t.Fatalf("ApplyTurnAction revert_history: %v", err)
-	}
-	if !a.fileTracker.HasRead(pathA) {
-		t.Fatal("after revert_history: tracker missing pathA (visible read in turn 1)")
-	}
-	if a.fileTracker.HasRead(pathB) {
-		t.Fatal("after revert_history: tracker still has pathB (read was in truncated turn 3)")
-	}
-	if a.fileTracker.WasReadCheckIdentity(pathB, bIdentity) == nil {
-		t.Fatal("after revert_history: tracker still authorizes pathB identity from truncated turn")
-	}
-
-	// RevertCode at turn 2 → target=1, restores pathA to v1.
-	// populateFileTracker runs again; the truncated read of pathB must not
-	// reappear (neither on disk nor in memory).
-	if _, err := a.ApplyTurnAction(turn2, TurnActionRevertCode, false); err != nil {
-		t.Fatalf("ApplyTurnAction revert_code: %v", err)
-	}
-	if got, err := os.ReadFile(pathA); err != nil || string(got) != "a-v1" {
-		t.Fatalf("pathA after revert_code = %q, %v; want a-v1", got, err)
-	}
-	if !a.fileTracker.HasRead(pathA) {
-		t.Fatal("after revert_code: tracker missing pathA (visible read in turn 1)")
-	}
-	if a.fileTracker.HasRead(pathB) {
-		t.Fatal("after revert_code: tracker has pathB; populateFileTracker reintroduced a truncated read")
-	}
-	if a.fileTracker.WasReadCheckIdentity(pathB, bIdentity) == nil {
-		t.Fatal("after revert_code: tracker still authorizes pathB identity from truncated turn")
+	if got, err := os.ReadFile(path); err != nil || string(got) != "external" {
+		t.Fatalf("path after skipped revert = %q, %v; want external", got, err)
 	}
 }
 
-func appendReadFileTurn(t *testing.T, a *Agent, turn int, userText, path, content, callID string) {
-	t.Helper()
-	msgs := []message.Message{
-		message.NewText(message.RoleUser, userText),
-		{
-			Role:    message.RoleAssistant,
-			Content: []message.ContentPart{{Type: message.ContentPartText, Text: "reading"}},
-			ToolCalls: []message.ToolCall{{
-				ID:       callID,
-				Type:     "function",
-				Function: message.FunctionCall{Name: "read_file", Arguments: `{"path":"` + path + `"}`},
-			}},
-		},
-		toolResult(callID, "read_file", content),
-	}
-	for _, msg := range msgs {
-		data, err := json.Marshal(msg)
-		if err != nil {
-			t.Fatalf("marshal message: %v", err)
-		}
-		if err := a.store.AppendMessage(turn, data); err != nil {
-			t.Fatalf("AppendMessage: %v", err)
+func agentTrackerHasRead(a *Agent, path string) bool {
+	for _, record := range a.fileTracker.Snapshot() {
+		if record.Path == path {
+			return true
 		}
 	}
-	if err := a.store.MarkTurnComplete(turn); err != nil {
-		t.Fatalf("MarkTurnComplete: %v", err)
-	}
+	return false
 }
 
 func waitUntilIdle(t *testing.T, a *Agent) {

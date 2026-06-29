@@ -11,6 +11,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/version"
 )
 
@@ -281,7 +282,7 @@ func (a *App) ResetModelField(providerID string, modelID string, field string) e
 }
 
 // RevertCode restores files to their state at turn N.
-func (a *App) RevertCode(turn int) error {
+func (a *App) RevertCode(turn int) (snapshot.RevertResult, error) {
 	return a.svc.RevertCode(turn)
 }
 

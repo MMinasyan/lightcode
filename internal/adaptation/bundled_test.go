@@ -111,7 +111,7 @@ func TestProductionBundledDataHasToolDescriptionDefaults(t *testing.T) {
 	if len(doc.Defaults.ToolDescriptionReplacements) == 0 {
 		t.Fatal("fixture defaults.tool_description_replacements is empty")
 	}
-	for _, key := range []string{"<EDIT FILE OR WRITE FILE>", "<READ-FIRST RULE>"} {
+	for _, key := range []string{"<EDIT FILE OR WRITE FILE>"} {
 		if _, ok := doc.Defaults.ToolDescriptionReplacements[key]; !ok {
 			t.Fatalf("fixture missing default tool description replacement %q", key)
 		}

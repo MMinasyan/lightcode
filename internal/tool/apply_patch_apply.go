@@ -476,9 +476,10 @@ func writeWithSnapshot(store SnapshotStore, displayAbsPath, canonicalPath, conte
 		}
 		snap = s
 		hasSnap = true
+		defer releaseSnapshotMutation(snap)
 	}
 
-	f, existed, err := safefs.OpenForWrite(canonicalPath, 0o644)
+	f, existed, _, err := openWriteTargetForMutation(canonicalPath, tracker)
 	if err != nil {
 		if hasSnap {
 			_ = discardUnmutatedSnapshot(snap)
@@ -497,35 +498,36 @@ func writeWithSnapshot(store SnapshotStore, displayAbsPath, canonicalPath, conte
 
 	if err := f.Truncate(0); err != nil {
 		if hasSnap {
-			retainMutatedSnapshot(snap)
+			err = retainFailedMutatedSnapshot(snap, canonicalPath, err)
 		}
 		return fmt.Errorf("truncate: %w", err)
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		if hasSnap {
-			retainMutatedSnapshot(snap)
+			err = retainFailedMutatedSnapshot(snap, canonicalPath, err)
 		}
 		return fmt.Errorf("seek: %w", err)
 	}
 	if _, err := f.Write([]byte(content)); err != nil {
 		if hasSnap {
-			retainMutatedSnapshot(snap)
+			err = retainFailedMutatedSnapshot(snap, canonicalPath, err)
 		}
 		return fmt.Errorf("write: %w", err)
 	}
 	if err := f.Sync(); err != nil {
 		if hasSnap {
-			retainMutatedSnapshot(snap)
+			err = retainFailedMutatedSnapshot(snap, canonicalPath, err)
 		}
 		return fmt.Errorf("sync: %w", err)
 	}
 	if hasSnap {
-		retainMutatedSnapshot(snap)
-	}
-	if tracker != nil {
-		if info, err := f.Stat(); err == nil {
-			tracker.UpdateAfterWriteIdentity(canonicalPath, FileIdentityFromFileInfoAndData(info, []byte(content)))
+		if err := recordMutatedSnapshotContent(snap, []byte(content)); err != nil {
+			retainMutatedSnapshot(snap)
+			return fmt.Errorf("record snapshot identity: %w", err)
 		}
+	}
+	if hasSnap {
+		retainMutatedSnapshot(snap)
 	}
 	return nil
 }
@@ -542,12 +544,19 @@ func deleteWithSnapshot(store SnapshotStore, displayAbsPath, canonicalPath strin
 		}
 		snap = s
 		hasSnap = true
+		defer releaseSnapshotMutation(snap)
 	}
 	if err := safefs.RemoveLeaf(canonicalPath); err != nil {
 		if hasSnap {
 			_ = discardUnmutatedSnapshot(snap)
 		}
 		return fmt.Errorf("remove: %w", err)
+	}
+	if hasSnap {
+		if err := recordMutatedSnapshotAbsence(snap); err != nil {
+			retainMutatedSnapshot(snap)
+			return fmt.Errorf("record snapshot identity: %w", err)
+		}
 	}
 	if hasSnap {
 		retainMutatedSnapshot(snap)

@@ -2,7 +2,6 @@ package tool
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -27,9 +26,8 @@ func TestWriteFileCreatesNewFileAndParentDirs(t *testing.T) {
 		t.Fatalf("Execute result = %q, want original path in success message", result)
 	}
 	assertFileContent(t, path, "created")
-	var readErr *ReadRequiredError
-	if err := wasReadCheckForPath(t, tracker, path); !errors.As(err, &readErr) {
-		t.Fatalf("WasReadCheck after new-file write = %T %v, want *ReadRequiredError", err, err)
+	if trackerHasRead(tracker, path) {
+		t.Fatal("write_file created a read record for a new file")
 	}
 }
 
@@ -51,27 +49,32 @@ func TestWriteFileOverwritesAfterRecentReadAndRefreshesTracker(t *testing.T) {
 		t.Fatalf("Execute result = %q, want original path in success message", result)
 	}
 	assertFileContent(t, path, "after")
-	if err := wasReadCheckForPath(t, tracker, path); err != nil {
-		t.Fatalf("WasReadCheck after overwrite = %v", err)
+	if !trackerHasRead(tracker, path) {
+		t.Fatal("tracker lost the original read record")
+	}
+	if dup, record := isDuplicateForPath(t, tracker, path, 1, 100); dup {
+		t.Fatalf("tracker treated old read as duplicate after overwrite, record=%+v", record)
 	}
 }
 
-func TestWriteFileRequiresReadBeforeOverwrite(t *testing.T) {
+func TestWriteFileOverwritesUnreadExistingFile(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "before")
 	tool := NewWriteFile(NewFileTracker(), config.ToolsConfig{})
 
-	_, err := tool.Execute(context.Background(), map[string]any{
+	result, err := tool.Execute(context.Background(), map[string]any{
 		"path":    path,
 		"content": "after",
 	})
-	var readErr *ReadRequiredError
-	if !errors.As(err, &readErr) {
-		t.Fatalf("Execute error = %T %v, want *ReadRequiredError", err, err)
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
 	}
-	assertFileContent(t, path, "before")
+	if result != "Wrote "+path+"." {
+		t.Fatalf("Execute result = %q, want success", result)
+	}
+	assertFileContent(t, path, "after")
 }
 
-func TestWriteFileRejectsOverwriteAfterExternalModification(t *testing.T) {
+func TestWriteFileOverwritesAfterExternalModification(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "before")
 	setTrackerFileMtime(t, path, time.Unix(100, 0))
 	tracker := NewFileTracker()
@@ -86,11 +89,10 @@ func TestWriteFileRejectsOverwriteAfterExternalModification(t *testing.T) {
 		"path":    path,
 		"content": "after",
 	})
-	var changedErr *FileChangedError
-	if !errors.As(err, &changedErr) {
-		t.Fatalf("Execute error = %T %v, want *FileChangedError", err, err)
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
 	}
-	assertFileContent(t, path, "external")
+	assertFileContent(t, path, "after")
 }
 
 func TestWriteFileWritesContentExactlyIncludingTrailingNewline(t *testing.T) {
@@ -181,7 +183,7 @@ func TestWriteFileWithSnapshotUsesCanonicalTargetAndRequestedResult(t *testing.T
 		t.Fatalf("snapshot saw %q, want pre-write content", store.before[target])
 	}
 	assertFileContent(t, target, "after")
-	if err := wasReadCheckForPath(t, tracker, target); err != nil {
-		t.Fatalf("canonical target WasReadCheck = %v", err)
+	if dup, record := isDuplicateForPath(t, tracker, target, 1, 100); dup {
+		t.Fatalf("canonical target old read still duplicates after overwrite, record=%+v", record)
 	}
 }

@@ -299,7 +299,7 @@ func TestStagedExecutorAttributesEditErrorsPerCall(t *testing.T) {
 	assertFileContent(t, path, "same same done")
 }
 
-func TestStagedExecutorFileAppearingBeforeFlushRequiresRead(t *testing.T) {
+func TestStagedExecutorFileAppearingBeforeFlushIsOverwritten(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "appeared.txt")
 	call := stagedWrite(path, "call-1", "new content")
 	if err := os.WriteFile(path, []byte("external content"), 0o644); err != nil {
@@ -312,13 +312,10 @@ func TestStagedExecutorFileAppearingBeforeFlushRequiresRead(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("results length = %d, want 1", len(results))
 	}
-	if results[0].Success {
-		t.Fatalf("result success = true, want read-before-write error: %+v", results[0])
+	if !results[0].Success || results[0].Error != "" {
+		t.Fatalf("result = %+v, want success", results[0])
 	}
-	if !strings.Contains(results[0].Error, "has not been read yet") {
-		t.Fatalf("result error = %q, want read-required error", results[0].Error)
-	}
-	assertFileContent(t, path, "external content")
+	assertFileContent(t, path, "new content")
 }
 
 func TestStagedExecutorSnapshotsBeforeFinalWrite(t *testing.T) {
@@ -343,6 +340,34 @@ func TestStagedExecutorSnapshotsBeforeFinalWrite(t *testing.T) {
 		t.Fatalf("content observed by Snapshot = %q, want pre-write content", store.before[path])
 	}
 	assertFileContent(t, path, "after")
+}
+
+func TestStagedExecutorRecordsSnapshotIdentityForEdit(t *testing.T) {
+	path := stagedExecutorFile(t, "file.txt", "before")
+	store := &recordingSnapshotStore{turn: 7, before: map[string]string{}}
+	executor := NewStagedExecutor(store, NewFileTracker(), config.ToolsConfig{}, allowStagedCall, nil)
+
+	results := executor.ExecutePending(context.Background(), []StagedCall{
+		stagedEdit(path, "call-1", "before", "after", false),
+	})
+
+	assertBatchSuccess(t, results, 0, "edit_file", "call-1")
+	assertSnapshotIdentityContent(t, store.identityRecords, 7, path, "after")
+	assertFileContent(t, path, "after")
+}
+
+func TestStagedExecutorRecordsSnapshotIdentityForWrite(t *testing.T) {
+	path := stagedExecutorFile(t, "file.txt", "before")
+	store := &recordingSnapshotStore{turn: 7, before: map[string]string{}}
+	executor := NewStagedExecutor(store, NewFileTracker(), config.ToolsConfig{}, allowStagedCall, nil)
+
+	results := executor.ExecutePending(context.Background(), []StagedCall{
+		stagedWrite(path, "call-1", "written"),
+	})
+
+	assertBatchSuccess(t, results, 0, "write_file", "call-1")
+	assertSnapshotIdentityContent(t, store.identityRecords, 7, path, "written")
+	assertFileContent(t, path, "written")
 }
 
 func TestStagedExecutorGroupsAliasesInternallyAndDisplaysRequestedPaths(t *testing.T) {
@@ -430,10 +455,18 @@ type snapshotCall struct {
 	canonical string
 }
 
+type snapshotIdentityRecord struct {
+	turn    int
+	entryID string
+	content string
+	absent  bool
+}
+
 type recordingSnapshotStore struct {
-	turn   int
-	calls  []snapshotCall
-	before map[string]string
+	turn            int
+	calls           []snapshotCall
+	before          map[string]string
+	identityRecords []snapshotIdentityRecord
 }
 
 func (s *recordingSnapshotStore) Snapshot(turn int, absPath string) error {
@@ -447,6 +480,37 @@ func (s *recordingSnapshotStore) SnapshotResolved(turn int, originalPath, canoni
 	}
 	s.calls = append(s.calls, snapshotCall{turn: turn, path: originalPath, canonical: canonicalPath})
 	s.before[canonicalPath] = string(data)
+	return nil
+}
+
+func (s *recordingSnapshotStore) SnapshotResolvedEntry(turn int, originalPath, canonicalPath string) (string, bool, error) {
+	if err := s.SnapshotResolved(turn, originalPath, canonicalPath); err != nil {
+		return "", false, err
+	}
+	return canonicalPath, true, nil
+}
+
+func (s *recordingSnapshotStore) DiscardSnapshotEntry(int, string) error {
+	return nil
+}
+
+func (s *recordingSnapshotStore) RetainSnapshotEntry(int, string) {}
+
+func (s *recordingSnapshotStore) RecordSnapshotContent(turn int, entryID string, content []byte) error {
+	s.identityRecords = append(s.identityRecords, snapshotIdentityRecord{
+		turn:    turn,
+		entryID: entryID,
+		content: string(content),
+	})
+	return nil
+}
+
+func (s *recordingSnapshotStore) RecordSnapshotAbsence(turn int, entryID string) error {
+	s.identityRecords = append(s.identityRecords, snapshotIdentityRecord{
+		turn:    turn,
+		entryID: entryID,
+		absent:  true,
+	})
 	return nil
 }
 
@@ -562,6 +626,26 @@ func assertFileContent(t *testing.T, path, want string) {
 	if got := string(data); got != want {
 		t.Fatalf("content of %s = %q, want %q", path, got, want)
 	}
+}
+
+func assertSnapshotIdentityContent(t *testing.T, records []snapshotIdentityRecord, turn int, entryID, content string) {
+	t.Helper()
+	for _, record := range records {
+		if record.turn == turn && record.entryID == entryID && !record.absent && record.content == content {
+			return
+		}
+	}
+	t.Fatalf("snapshot identity records = %+v, want turn=%d entry=%q content=%q", records, turn, entryID, content)
+}
+
+func assertSnapshotIdentityAbsent(t *testing.T, records []snapshotIdentityRecord, turn int, entryID string) {
+	t.Helper()
+	for _, record := range records {
+		if record.turn == turn && record.entryID == entryID && record.absent {
+			return
+		}
+	}
+	t.Fatalf("snapshot identity records = %+v, want turn=%d entry=%q absent", records, turn, entryID)
 }
 
 func repointStagedSymlink(t *testing.T, link, target string) {

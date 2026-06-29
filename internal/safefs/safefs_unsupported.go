@@ -3,8 +3,14 @@
 package safefs
 
 import (
+	"errors"
 	"fmt"
 	"os"
+)
+
+var (
+	ErrNonRegular = errors.New("safefs: non-regular target")
+	ErrHardlink   = errors.New("safefs: hardlinked target")
 )
 
 func OpenExisting(path string, flag int) (*os.File, error) {

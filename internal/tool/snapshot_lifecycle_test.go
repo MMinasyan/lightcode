@@ -2,20 +2,21 @@ package tool
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
-func TestWriteFileDiscardsSnapshotWhenValidationFailsBeforeMutation(t *testing.T) {
+func TestWriteFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		mutate     func(t *testing.T, path string)
-		assertPath func(t *testing.T, path string)
+		name   string
+		mutate func(t *testing.T, path string)
 	}{
 		{
 			name: "deleted",
@@ -23,12 +24,6 @@ func TestWriteFileDiscardsSnapshotWhenValidationFailsBeforeMutation(t *testing.T
 				t.Helper()
 				if err := os.Remove(path); err != nil {
 					t.Fatal(err)
-				}
-			},
-			assertPath: func(t *testing.T, path string) {
-				t.Helper()
-				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-					t.Fatalf("post-revert stat = %v, want file to remain absent", err)
 				}
 			},
 		},
@@ -42,10 +37,6 @@ func TestWriteFileDiscardsSnapshotWhenValidationFailsBeforeMutation(t *testing.T
 				if err := os.WriteFile(path, []byte("external"), 0o644); err != nil {
 					t.Fatal(err)
 				}
-			},
-			assertPath: func(t *testing.T, path string) {
-				t.Helper()
-				assertFileContent(t, path, "external")
 			},
 		},
 	} {
@@ -66,18 +57,18 @@ func TestWriteFileDiscardsSnapshotWhenValidationFailsBeforeMutation(t *testing.T
 				"content": "after",
 			})
 
-			var changedErr *FileChangedError
-			if !errors.As(err, &changedErr) {
-				t.Fatalf("write_file error = %T %v, want *FileChangedError", err, err)
+			if err != nil {
+				t.Fatalf("write_file error = %v", err)
 			}
+			assertFileContent(t, path, "after")
 			affected, err := store.RevertCode(0)
 			if err != nil {
-				t.Fatalf("RevertCode error = %v, want no active snapshot entry", err)
+				t.Fatalf("RevertCode error = %v", err)
 			}
-			if len(affected) != 0 {
-				t.Fatalf("RevertCode affected = %v, want no files", affected)
+			if len(affected.Restored) != 1 || affected.Restored[0] != path {
+				t.Fatalf("RevertCode affected = %v, want restored %s", affected, path)
 			}
-			tc.assertPath(t, path)
+			assertFileContent(t, path, "before")
 		})
 	}
 }
@@ -101,13 +92,13 @@ func TestEditFileDiscardsSnapshotWhenEditFailsBeforeMutation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RevertCode error = %v, want no active snapshot entry", err)
 	}
-	if len(affected) != 0 {
+	if len(affected.Restored) != 0 {
 		t.Fatalf("RevertCode affected = %v, want no files", affected)
 	}
 	assertFileContent(t, path, "before")
 }
 
-func TestEditFileDiscardsSnapshotWhenValidationFailsBeforeMutation(t *testing.T) {
+func TestEditFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
 	root := t.TempDir()
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
 	store := newSnapshotLifecycleStore(t, root)
@@ -130,18 +121,18 @@ func TestEditFileDiscardsSnapshotWhenValidationFailsBeforeMutation(t *testing.T)
 		"new_string": "after",
 	})
 
-	var changedErr *FileChangedError
-	if !errors.As(err, &changedErr) {
-		t.Fatalf("edit_file error = %T %v, want *FileChangedError", err, err)
+	if err != nil {
+		t.Fatalf("edit_file error = %v", err)
 	}
+	assertFileContent(t, path, "after")
 	affected, err := store.RevertCode(0)
 	if err != nil {
-		t.Fatalf("RevertCode error = %v, want no active snapshot entry", err)
+		t.Fatalf("RevertCode error = %v", err)
 	}
-	if len(affected) != 0 {
-		t.Fatalf("RevertCode affected = %v, want no files", affected)
+	if len(affected.Restored) != 1 || affected.Restored[0] != path {
+		t.Fatalf("RevertCode affected = %v, want restored %s", affected, path)
 	}
-	assertFileContent(t, path, "external")
+	assertFileContent(t, path, "before")
 }
 
 func TestFailedValidationDoesNotDiscardPreviouslyRetainedSnapshot(t *testing.T) {
@@ -168,10 +159,271 @@ func TestFailedValidationDoesNotDiscardPreviouslyRetainedSnapshot(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(affected) != 1 || affected[0] != path {
+	if len(affected.Restored) != 1 || affected.Restored[0] != path {
 		t.Fatalf("RevertCode affected = %v, want retained snapshot for %s", affected, path)
 	}
 	assertFileContent(t, path, "before")
+}
+
+func TestWriteFileSameTurnSecondWriteControlsSnapshotIdentity(t *testing.T) {
+	root := t.TempDir()
+	path := snapshotLifecycleFile(t, root, "file.txt", "before")
+	store := newSnapshotLifecycleStore(t, root)
+	tool := NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{})
+
+	if _, err := tool.Execute(context.Background(), map[string]any{
+		"path":    path,
+		"content": "first",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tool.Execute(context.Background(), map[string]any{
+		"path":    path,
+		"content": "second",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := store.RevertCode(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(affected.Restored) != 0 {
+		t.Fatalf("RevertCode restored = %v, want none", affected.Restored)
+	}
+	if len(affected.Skipped) != 1 || affected.Skipped[0].Path != path {
+		t.Fatalf("RevertCode skipped = %+v, want skipped %s", affected.Skipped, path)
+	}
+	assertFileContent(t, path, "first")
+}
+
+func TestConcurrentSameTurnWritesKeepLatestSnapshotIdentity(t *testing.T) {
+	root := t.TempDir()
+	path := snapshotLifecycleFile(t, root, "file.txt", "before")
+	store := &blockingRecordSnapshotStore{
+		Store:              newSnapshotLifecycleStore(t, root),
+		firstRecordStarted: make(chan struct{}),
+		releaseFirstRecord: make(chan struct{}),
+		secondLockAttempt:  make(chan struct{}),
+	}
+	tool := NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{})
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := tool.Execute(context.Background(), map[string]any{
+			"path":    path,
+			"content": "first",
+		})
+		firstDone <- err
+	}()
+
+	<-store.firstRecordStarted
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := tool.Execute(context.Background(), map[string]any{
+			"path":    path,
+			"content": "second",
+		})
+		secondDone <- err
+	}()
+
+	secondFinishedBeforeRelease := false
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second write before first release: %v", err)
+		}
+		secondFinishedBeforeRelease = true
+	case <-store.secondLockAttempt:
+	case <-time.After(time.Second):
+		t.Fatal("second write neither completed nor reached the snapshot mutation lock")
+	}
+
+	close(store.releaseFirstRecord)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if !secondFinishedBeforeRelease {
+		if err := <-secondDone; err != nil {
+			t.Fatalf("second write: %v", err)
+		}
+	}
+
+	assertFileContent(t, path, "second")
+	affected, err := store.RevertCode(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(affected.Restored) != 1 || affected.Restored[0] != path {
+		t.Fatalf("RevertCode restored = %v, want %s", affected.Restored, path)
+	}
+	if len(affected.Skipped) != 0 {
+		t.Fatalf("RevertCode skipped = %+v, want none", affected.Skipped)
+	}
+	assertFileContent(t, path, "before")
+}
+
+func TestRetainedPartialMutationRecordsCurrentIdentityAndReverts(t *testing.T) {
+	steps := []mutationFailureStep{failAfterTruncate, failAfterWrite, failAfterSync}
+	cases := []struct {
+		name string
+		run  func(t *testing.T, root, path string, store *snapshot.Store) error
+	}{
+		{
+			name: "immediate_write",
+			run: func(t *testing.T, _ string, path string, store *snapshot.Store) error {
+				t.Helper()
+				_, err := NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+					"path":    path,
+					"content": "after",
+				})
+				return err
+			},
+		},
+		{
+			name: "immediate_edit",
+			run: func(t *testing.T, _ string, path string, store *snapshot.Store) error {
+				t.Helper()
+				_, err := NewEditFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+					"path":       path,
+					"old_string": "before",
+					"new_string": "after",
+				})
+				return err
+			},
+		},
+		{
+			name: "staged_write",
+			run: func(t *testing.T, _ string, path string, store *snapshot.Store) error {
+				t.Helper()
+				results := NewStagedExecutor(store, nil, config.ToolsConfig{}, allowStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
+					stagedWrite(path, "call-1", "after"),
+				})
+				return batchError(t, results)
+			},
+		},
+		{
+			name: "staged_edit",
+			run: func(t *testing.T, _ string, path string, store *snapshot.Store) error {
+				t.Helper()
+				results := NewStagedExecutor(store, nil, config.ToolsConfig{}, allowStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
+					stagedEdit(path, "call-1", "before", "after", false),
+				})
+				return batchError(t, results)
+			},
+		},
+		{
+			name: "apply_patch",
+			run: func(t *testing.T, root, _ string, store *snapshot.Store) error {
+				t.Helper()
+				tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, root)
+				input := applyPatchInput(t, "*** Update File: file.txt\n@@\n-before\n+after")
+				_, err := runApplyPatch(t, tool, map[string]any{"input": input})
+				return err
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		for _, step := range steps {
+			t.Run(fmt.Sprintf("%s_%s", tc.name, step), func(t *testing.T) {
+				root := t.TempDir()
+				path := snapshotLifecycleFile(t, root, "file.txt", "before")
+				store := newSnapshotLifecycleStore(t, root)
+				withMutationFailure(t, path, step)
+
+				err := tc.run(t, root, path, store)
+
+				if err == nil {
+					t.Fatalf("%s with %s succeeded, want injected I/O failure", tc.name, step)
+				}
+				affected, revErr := store.RevertCode(0)
+				if revErr != nil {
+					t.Fatalf("RevertCode error = %v", revErr)
+				}
+				if len(affected.Restored) != 1 || affected.Restored[0] != path {
+					t.Fatalf("RevertCode affected = %+v, want restored %s", affected, path)
+				}
+				if len(affected.Skipped) != 0 {
+					t.Fatalf("RevertCode skipped = %+v, want none", affected.Skipped)
+				}
+				assertFileContent(t, path, "before")
+			})
+		}
+	}
+}
+
+func TestRetainedPartialCreatedFileMutationRecordsCurrentIdentityAndDeletesOnRevert(t *testing.T) {
+	steps := []mutationFailureStep{failAfterTruncate, failAfterWrite, failAfterSync}
+	cases := []struct {
+		name string
+		run  func(t *testing.T, root, path string, store *snapshot.Store) error
+	}{
+		{
+			name: "immediate_write_create",
+			run: func(t *testing.T, _ string, path string, store *snapshot.Store) error {
+				t.Helper()
+				_, err := NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+					"path":    path,
+					"content": "after",
+				})
+				return err
+			},
+		},
+		{
+			name: "staged_write_create",
+			run: func(t *testing.T, _ string, path string, store *snapshot.Store) error {
+				t.Helper()
+				results := NewStagedExecutor(store, nil, config.ToolsConfig{}, allowStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
+					stagedWrite(path, "call-1", "after"),
+				})
+				return batchError(t, results)
+			},
+		},
+		{
+			name: "apply_patch_add",
+			run: func(t *testing.T, root, _ string, store *snapshot.Store) error {
+				t.Helper()
+				tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, root)
+				input := applyPatchInput(t, "*** Add File: created.txt\n+after")
+				_, err := runApplyPatch(t, tool, map[string]any{"input": input})
+				return err
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		for _, step := range steps {
+			t.Run(fmt.Sprintf("%s_%s", tc.name, step), func(t *testing.T) {
+				root := t.TempDir()
+				path := filepath.Join(root, "created.txt")
+				store := newSnapshotLifecycleStore(t, root)
+				withMutationFailure(t, path, step)
+
+				err := tc.run(t, root, path, store)
+
+				if err == nil {
+					t.Fatalf("%s with %s succeeded, want injected I/O failure", tc.name, step)
+				}
+				affected, revErr := store.RevertCode(0)
+				if revErr != nil {
+					t.Fatalf("RevertCode error = %v", revErr)
+				}
+				if len(affected.Restored) != 1 || affected.Restored[0] != path {
+					t.Fatalf("RevertCode affected = %+v, want restored %s", affected, path)
+				}
+				if len(affected.Skipped) != 0 {
+					t.Fatalf("RevertCode skipped = %+v, want none", affected.Skipped)
+				}
+				if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
+					t.Fatalf("created file should be removed after RevertCode, stat err = %v", statErr)
+				}
+			})
+		}
+	}
 }
 
 func TestStagedExecutorDiscardsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
@@ -205,11 +457,102 @@ func TestStagedExecutorDiscardsSnapshotWhenTargetChangesBeforeMutation(t *testin
 	if err != nil {
 		t.Fatalf("RevertCode error = %v, want no active snapshot entry", err)
 	}
-	if len(affected) != 0 {
+	if len(affected.Restored) != 0 {
 		t.Fatalf("RevertCode affected = %v, want no files", affected)
 	}
 	assertFileContent(t, target, "before")
 	assertFileContent(t, secret, "secret")
+}
+
+type mutationFailureStep string
+
+const (
+	failAfterTruncate mutationFailureStep = "truncate"
+	failAfterWrite    mutationFailureStep = "write"
+	failAfterSync     mutationFailureStep = "sync"
+)
+
+type injectedMutationError string
+
+func (e injectedMutationError) Error() string { return string(e) }
+
+var errInjectedMutation = injectedMutationError("injected mutation error")
+
+type failingMutationFile struct {
+	mutationFile
+	step mutationFailureStep
+}
+
+func (f *failingMutationFile) Truncate(size int64) error {
+	err := f.mutationFile.Truncate(size)
+	if err != nil {
+		return err
+	}
+	if f.step == failAfterTruncate {
+		return errInjectedMutation
+	}
+	return nil
+}
+
+func (f *failingMutationFile) Write(p []byte) (int, error) {
+	n, err := f.mutationFile.Write(p)
+	if err != nil {
+		return n, err
+	}
+	if f.step == failAfterWrite {
+		return n, errInjectedMutation
+	}
+	return n, nil
+}
+
+func (f *failingMutationFile) Sync() error {
+	err := f.mutationFile.Sync()
+	if err != nil {
+		return err
+	}
+	if f.step == failAfterSync {
+		return errInjectedMutation
+	}
+	return nil
+}
+
+func withMutationFailure(t *testing.T, target string, step mutationFailureStep) {
+	t.Helper()
+	target = filepath.Clean(target)
+	prevWrite := openWriteTargetForMutationFunc
+	prevExisting := openExistingMutationFile
+	openWriteTargetForMutationFunc = func(absPath string, tracker *FileTracker) (mutationFile, bool, bool, error) {
+		f, existed, started, err := prevWrite(absPath, tracker)
+		if err == nil && filepath.Clean(absPath) == target {
+			f = &failingMutationFile{mutationFile: f, step: step}
+		}
+		return f, existed, started, err
+	}
+	openExistingMutationFile = func(absPath string, flag int) (mutationFile, error) {
+		f, err := prevExisting(absPath, flag)
+		if err == nil && filepath.Clean(absPath) == target {
+			f = &failingMutationFile{mutationFile: f, step: step}
+		}
+		return f, err
+	}
+	t.Cleanup(func() {
+		openWriteTargetForMutationFunc = prevWrite
+		openExistingMutationFile = prevExisting
+	})
+}
+
+func batchError(t *testing.T, results []BatchResult) error {
+	t.Helper()
+	if len(results) != 1 {
+		return fmt.Errorf("results len = %d, want 1", len(results))
+	}
+	if results[0].Success {
+		return nil
+	}
+	if results[0].Error == "" {
+		return fmt.Errorf("result failed without error: %+v", results[0])
+	}
+	return fmt.Errorf("%s", results[0].Error)
 }
 
 type mutatingTransactionalSnapshotStore struct {
@@ -225,6 +568,41 @@ func (s *mutatingTransactionalSnapshotStore) SnapshotResolvedEntry(turn int, ori
 		mutate()
 	}
 	return entryID, created, err
+}
+
+type blockingRecordSnapshotStore struct {
+	*snapshot.Store
+	mu                 sync.Mutex
+	records            int
+	lockAttempts       int
+	firstRecordStarted chan struct{}
+	releaseFirstRecord chan struct{}
+	secondLockAttempt  chan struct{}
+}
+
+func (s *blockingRecordSnapshotStore) LockSnapshotMutation(turn int, entryID string) (func(), error) {
+	s.mu.Lock()
+	s.lockAttempts++
+	attempt := s.lockAttempts
+	s.mu.Unlock()
+
+	if attempt == 2 {
+		close(s.secondLockAttempt)
+	}
+	return s.Store.LockSnapshotMutation(turn, entryID)
+}
+
+func (s *blockingRecordSnapshotStore) RecordSnapshotContent(turn int, entryID string, content []byte) error {
+	s.mu.Lock()
+	s.records++
+	record := s.records
+	s.mu.Unlock()
+
+	if record == 1 {
+		close(s.firstRecordStarted)
+		<-s.releaseFirstRecord
+	}
+	return s.Store.RecordSnapshotContent(turn, entryID, content)
 }
 
 func newSnapshotLifecycleStore(t *testing.T, projectRoot string) *snapshot.Store {

@@ -619,28 +619,56 @@ func (c *CLI) showRevertMenu() {
 	action := actionResult.extra.(string)
 	switch action {
 	case "code":
-		if _, err := c.agent.ApplyTurnAction(turn, agent.TurnActionRevertCode, false); err != nil {
+		result, err := c.agent.ApplyTurnAction(turn, agent.TurnActionRevertCode, false)
+		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
 		c.printLine(renderSystemMsg(fmt.Sprintf("  reverted code to before turn %d", turn)))
+		c.printRevertSkipped(result)
 
 	case "history":
 		alsoCode := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
-		if _, err := c.agent.ApplyTurnAction(turn, agent.TurnActionRevertHistory, alsoCode); err != nil {
+		result, err := c.agent.ApplyTurnAction(turn, agent.TurnActionRevertHistory, alsoCode)
+		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
 		c.refreshSession()
+		c.printRevertSkipped(result)
 
 	case "fork":
 		alsoCode := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
-		if _, err := c.agent.ApplyTurnAction(turn, agent.TurnActionFork, alsoCode); err != nil {
+		result, err := c.agent.ApplyTurnAction(turn, agent.TurnActionFork, alsoCode)
+		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
 		c.refreshSession()
+		c.printRevertSkipped(result)
 
 	case "back":
 	}
+}
+
+func (c *CLI) printRevertSkipped(result agent.TurnActionResult) {
+	if len(result.SkippedFiles) == 0 {
+		return
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "  kept %d file", len(result.SkippedFiles))
+	if len(result.SkippedFiles) != 1 {
+		b.WriteByte('s')
+	}
+	b.WriteString(" changed outside this session:")
+	for _, skipped := range result.SkippedFiles {
+		b.WriteString("\n  - ")
+		b.WriteString(skipped.Path)
+		if skipped.Reason != "" {
+			b.WriteString(" (")
+			b.WriteString(skipped.Reason)
+			b.WriteByte(')')
+		}
+	}
+	c.printLine(renderSystemMsg(b.String()))
 }

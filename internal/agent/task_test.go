@@ -14,12 +14,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/config"
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/lsp"
 	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
@@ -650,6 +653,90 @@ func TestTaskToolChildStagedEditUsesParentTurnSnapshot(t *testing.T) {
 	}
 }
 
+func TestParentTurnSnapshotStoreSerializesConcurrentSamePathWrites(t *testing.T) {
+	root := t.TempDir()
+	parentStore, err := snapshot.NewForSessionsRoot(t.TempDir(), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parentStore.BeginNewSession(root); err != nil {
+		t.Fatal(err)
+	}
+	turn := parentStore.BeginTurn()
+	if turn != 1 {
+		t.Fatalf("BeginTurn = %d, want 1", turn)
+	}
+	path := filepath.Join(root, "target.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &blockingParentTurnSnapshotStore{
+		parentTurnSnapshotStore: parentTurnSnapshotStore{store: parentStore, turn: turn},
+		firstRecordStarted:      make(chan struct{}),
+		releaseFirstRecord:      make(chan struct{}),
+		secondLockAttempt:       make(chan struct{}),
+	}
+	writeTool := tool.NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{})
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := writeTool.Execute(context.Background(), map[string]any{
+			"path":    path,
+			"content": "first",
+		})
+		firstDone <- err
+	}()
+
+	<-store.firstRecordStarted
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := writeTool.Execute(context.Background(), map[string]any{
+			"path":    path,
+			"content": "second",
+		})
+		secondDone <- err
+	}()
+
+	secondFinishedBeforeRelease := false
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second write before first release: %v", err)
+		}
+		secondFinishedBeforeRelease = true
+	case <-store.secondLockAttempt:
+	case <-time.After(time.Second):
+		t.Fatal("second write neither completed nor reached the parent-turn snapshot lock")
+	}
+
+	close(store.releaseFirstRecord)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if !secondFinishedBeforeRelease {
+		if err := <-secondDone; err != nil {
+			t.Fatalf("second write: %v", err)
+		}
+	}
+
+	if got, err := os.ReadFile(path); err != nil || string(got) != "second" {
+		t.Fatalf("target after concurrent writes = %q, %v; want second", got, err)
+	}
+	affected, err := parentStore.RevertCode(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(affected.Restored) != 1 || affected.Restored[0] != path {
+		t.Fatalf("RevertCode restored = %v, want %s", affected.Restored, path)
+	}
+	if len(affected.Skipped) != 0 {
+		t.Fatalf("RevertCode skipped = %+v, want none", affected.Skipped)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "before" {
+		t.Fatalf("target after parent revert = %q, %v; want before", got, err)
+	}
+}
+
 func TestTaskToolAllDeniedSubagentsCancelParentTurn(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -861,6 +948,41 @@ func writeTaskAgentTypes(t *testing.T, a *Agent, entries string) {
 	if err := a.Reload(); err != nil {
 		t.Fatalf("reload task agent types: %v", err)
 	}
+}
+
+type blockingParentTurnSnapshotStore struct {
+	parentTurnSnapshotStore
+	mu                 sync.Mutex
+	records            int
+	lockAttempts       int
+	firstRecordStarted chan struct{}
+	releaseFirstRecord chan struct{}
+	secondLockAttempt  chan struct{}
+}
+
+func (s *blockingParentTurnSnapshotStore) LockSnapshotMutation(turn int, entryID string) (func(), error) {
+	s.mu.Lock()
+	s.lockAttempts++
+	attempt := s.lockAttempts
+	s.mu.Unlock()
+
+	if attempt == 2 {
+		close(s.secondLockAttempt)
+	}
+	return s.parentTurnSnapshotStore.LockSnapshotMutation(turn, entryID)
+}
+
+func (s *blockingParentTurnSnapshotStore) RecordSnapshotContent(turn int, entryID string, content []byte) error {
+	s.mu.Lock()
+	s.records++
+	record := s.records
+	s.mu.Unlock()
+
+	if record == 1 {
+		close(s.firstRecordStarted)
+		<-s.releaseFirstRecord
+	}
+	return s.parentTurnSnapshotStore.RecordSnapshotContent(turn, entryID, content)
 }
 
 type stubTaskTool struct{ name string }

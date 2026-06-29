@@ -61,9 +61,30 @@ type SessionMeta struct {
 // Existed is false when the snapshot represents a file that did not
 // exist before the turn — on revert, that file is deleted.
 type SnapshotMeta struct {
-	OriginalPath  string `json:"original_path"`
-	CanonicalPath string `json:"canonical_path,omitempty"`
-	Existed       bool   `json:"existed"`
+	OriginalPath  string                   `json:"original_path"`
+	CanonicalPath string                   `json:"canonical_path,omitempty"`
+	Existed       bool                     `json:"existed"`
+	LastWrite     *SnapshotContentIdentity `json:"last_write,omitempty"`
+}
+
+// SnapshotContentIdentity identifies the state produced by the session's
+// latest successful mutation for a snapshot entry.
+type SnapshotContentIdentity struct {
+	Hash   string `json:"hash,omitempty"`
+	Absent bool   `json:"absent,omitempty"`
+}
+
+// RevertResult reports the restore work performed by RevertCode.
+type RevertResult struct {
+	Restored []string        `json:"restored,omitempty"`
+	Skipped  []SkippedRevert `json:"skipped,omitempty"`
+}
+
+// SkippedRevert is reported when a restore is skipped because the current
+// on-disk state no longer belongs to this session's last write.
+type SkippedRevert struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
 }
 
 // CompactionRecord is persisted to compaction.json when context

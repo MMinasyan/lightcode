@@ -91,6 +91,17 @@
     messages = [...messages, { _id: mid(), type: 'error', content: prefix ? `${prefix}: ${text}` : text }];
   }
 
+  function appendRevertSkipNotice(result) {
+    const skipped = result?.skippedFiles || [];
+    if (!skipped.length) return;
+    const lines = skipped.map((f) => `- ${f.path}${f.reason ? ` (${f.reason})` : ''}`);
+    messages = [...messages, {
+      _id: mid(),
+      type: 'system',
+      content: `System: Kept ${skipped.length} file${skipped.length === 1 ? '' : 's'} changed outside this session:\n${lines.join('\n')}`,
+    }];
+  }
+
   function rebuildFromHistory(persisted) {
     currentTurn = 0;
     pendingSubagentSessionLinks = {};
@@ -351,7 +362,10 @@
 
   async function handleRevertCode(e) {
     const { turn } = e.detail;
-    try { await ApplyTurnAction(turn, 'revert_code', false); }
+    try {
+      const result = await ApplyTurnAction(turn, 'revert_code', false);
+      appendRevertSkipNotice(result);
+    }
     catch (err) { showError(err); }
   }
 
@@ -360,6 +374,7 @@
     try {
       const result = await ApplyTurnAction(turn, 'revert_history', !!alsoRevertCode);
       applySessionPayload(result);
+      appendRevertSkipNotice(result);
       inputArea?.prefill(result?.prefill || '');
     }
     catch (err) { showError(err); }
@@ -370,6 +385,7 @@
     try {
       const result = await ApplyTurnAction(turn, 'fork', !!alsoRevertCode);
       applySessionPayload(result);
+      appendRevertSkipNotice(result);
     }
     catch (err) { showError(err); }
   }

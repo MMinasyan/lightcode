@@ -9,8 +9,8 @@ import (
 	"testing"
 )
 
-func TestRevertHandlesCreatedDirectoryLeaves(t *testing.T) {
-	t.Run("empty directory is removed", func(t *testing.T) {
+func TestRevertSkipsCreatedDirectoryLeavesWithoutRecordedIdentity(t *testing.T) {
+	t.Run("empty directory is preserved", func(t *testing.T) {
 		store := newTestStore(t)
 		projectDir := t.TempDir()
 		createdPath := filepath.Join(projectDir, "created-dir")
@@ -26,15 +26,18 @@ func TestRevertHandlesCreatedDirectoryLeaves(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !reflect.DeepEqual(affected, []string{createdPath}) {
-			t.Fatalf("affected = %v, want [%s]", affected, createdPath)
+		if len(affected.Restored) != 0 {
+			t.Fatalf("restored = %v, want none", affected.Restored)
 		}
-		if _, err := os.Lstat(createdPath); !os.IsNotExist(err) {
-			t.Fatalf("created directory should be removed, lstat err = %v", err)
+		if len(affected.Skipped) != 1 || affected.Skipped[0].Path != createdPath {
+			t.Fatalf("skipped = %+v, want %s", affected.Skipped, createdPath)
+		}
+		if info, err := os.Lstat(createdPath); err != nil || !info.IsDir() {
+			t.Fatalf("created directory should be preserved, stat = %v isDir=%v", err, err == nil && info.IsDir())
 		}
 	})
 
-	t.Run("non-empty directory is refused and preserved", func(t *testing.T) {
+	t.Run("non-empty directory is preserved", func(t *testing.T) {
 		store := newTestStore(t)
 		projectDir := t.TempDir()
 		createdPath := filepath.Join(projectDir, "created-dir")
@@ -51,11 +54,14 @@ func TestRevertHandlesCreatedDirectoryLeaves(t *testing.T) {
 		}
 
 		affected, err := store.RevertCode(0)
-		if err == nil {
-			t.Fatal("RevertCode removed non-empty directory, want refusal")
+		if err != nil {
+			t.Fatal(err)
 		}
-		if len(affected) != 0 {
-			t.Fatalf("affected = %v, want none on refused non-empty directory delete", affected)
+		if len(affected.Restored) != 0 {
+			t.Fatalf("restored = %v, want none", affected.Restored)
+		}
+		if len(affected.Skipped) != 1 || affected.Skipped[0].Path != createdPath {
+			t.Fatalf("skipped = %+v, want %s", affected.Skipped, createdPath)
 		}
 		if got, err := os.ReadFile(childPath); err != nil || string(got) != "child" {
 			t.Fatalf("child content = %q, %v; want preserved", got, err)
@@ -130,7 +136,7 @@ func TestLegacyCreatedDeleteRequiresCleanPathHash(t *testing.T) {
 		if err == nil {
 			t.Fatal("RevertCode succeeded for mismatched legacy delete hash, want refusal")
 		}
-		if len(affected) != 0 {
+		if len(affected.Restored) != 0 {
 			t.Fatalf("affected = %v, want none", affected)
 		}
 		if got, err := os.ReadFile(victimClean); err != nil || string(got) != "victim" {
@@ -165,7 +171,7 @@ func TestLegacyMissingLeafRestoreRequiresTargetProof(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !reflect.DeepEqual(affected, []string{requested}) {
+		if !reflect.DeepEqual(affected.Restored, []string{requested}) {
 			t.Fatalf("affected = %v, want [%s]", affected, requested)
 		}
 		if got, err := os.ReadFile(target); err != nil || string(got) != "before" {
@@ -212,7 +218,7 @@ func TestLegacyMissingLeafRestoreRequiresTargetProof(t *testing.T) {
 		if err == nil {
 			t.Fatal("RevertCode succeeded for repointed symlink parent, want refusal")
 		}
-		if len(affected) != 0 {
+		if len(affected.Restored) != 0 {
 			t.Fatalf("affected = %v, want none", affected)
 		}
 		if got, err := os.ReadFile(secretTarget); err != nil || string(got) != "secret" {
@@ -231,7 +237,11 @@ func writeLegacySnapshotForMissingLeafProof(t *testing.T, store *Store, requeste
 	if err := copyFile(canonical, filepath.Join(entryDir, "original")); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: requested, Existed: true}); err != nil {
+	if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{
+		OriginalPath: requested,
+		Existed:      true,
+		LastWrite:    &SnapshotContentIdentity{Absent: true},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if turn != 1 {
@@ -314,9 +324,7 @@ func TestPR11Closure_HardlinkRefusedOnSnapshotRestore(t *testing.T) {
 	}
 
 	turn := store.BeginTurn()
-	if err := store.SnapshotResolved(turn, target, target); err != nil {
-		t.Fatal(err)
-	}
+	entryID := snapshotEntry(t, store, turn, target, target)
 
 	// Replace target with a hardlink to an outside-boundary file.
 	outside := filepath.Join(t.TempDir(), "outside.txt")
@@ -329,6 +337,7 @@ func TestPR11Closure_HardlinkRefusedOnSnapshotRestore(t *testing.T) {
 	if err := os.Link(outside, target); err != nil {
 		t.Fatal(err)
 	}
+	recordSnapshotContent(t, store, turn, entryID, "outside-content")
 
 	_, err := store.RevertCode(0)
 	if err == nil {
@@ -352,9 +361,7 @@ func TestPR11Closure_HardlinkRefusedOnSnapshotCreatedDelete(t *testing.T) {
 	createdPath := filepath.Join(projectDir, "created.txt")
 
 	turn := store.BeginTurn()
-	if err := store.Snapshot(turn, createdPath); err != nil {
-		t.Fatal(err)
-	}
+	entryID := snapshotEntry(t, store, turn, createdPath, createdPath)
 
 	outside := filepath.Join(t.TempDir(), "outside.txt")
 	if err := os.WriteFile(outside, []byte("outside-content"), 0o644); err != nil {
@@ -363,6 +370,7 @@ func TestPR11Closure_HardlinkRefusedOnSnapshotCreatedDelete(t *testing.T) {
 	if err := os.Link(outside, createdPath); err != nil {
 		t.Fatal(err)
 	}
+	recordSnapshotContent(t, store, turn, entryID, "outside-content")
 
 	_, err := store.RevertCode(0)
 	if err == nil {
@@ -386,9 +394,7 @@ func TestPR11Closure_HardlinkedSymlinkRefusedOnSnapshotCreatedDelete(t *testing.
 	createdPath := filepath.Join(projectDir, "created-link")
 
 	turn := store.BeginTurn()
-	if err := store.Snapshot(turn, createdPath); err != nil {
-		t.Fatal(err)
-	}
+	entryID := snapshotEntry(t, store, turn, createdPath, createdPath)
 
 	target := filepath.Join(t.TempDir(), "outside-target.txt")
 	if err := os.WriteFile(target, []byte("outside-target"), 0o644); err != nil {
@@ -403,6 +409,7 @@ func TestPR11Closure_HardlinkedSymlinkRefusedOnSnapshotCreatedDelete(t *testing.
 	}
 	assertHardlinkedSymlink(t, originalLink)
 	assertHardlinkedSymlink(t, createdPath)
+	recordSnapshotContent(t, store, turn, entryID, "outside-target")
 
 	_, err := store.RevertCode(0)
 	if err == nil {
