@@ -306,11 +306,34 @@ func appendAdaptationBlocks(prompt string, adapt *adaptation.Adaptation) string 
 // buildChildLoop constructs the child loop for a subagent and applies the adaptation
 // resolved from the child's OWN model: it appends the adaptation's coaching blocks to the prompt and
 // installs the adaptation on the loop (tool advertisement, dispatch gate, leak pattern).
-func (t *taskTool) buildChildLoop(at agentcfg.Resolved, client *provider.Client, registry *tool.Registry, ref coremodel.ModelRef) *loop.Loop {
+type childLoopRuntime struct {
+	store           *snapshot.Store
+	events          chan<- loop.Event
+	pendingExecutor tool.PendingExecutor
+}
+
+func (t *taskTool) buildChildLoop(at agentcfg.Resolved, client *provider.Client, registry *tool.Registry, ref coremodel.ModelRef, runtimeCfg ...childLoopRuntime) *loop.Loop {
 	adapt := t.resolveAdaptation(ref.Model)
-	lp := loop.New(provider.NewAdapter(client), registry, appendAdaptationBlocks(at.Prompt, adapt))
-	lp.SetActiveAdaptation(adapt)
-	return lp
+	var rt childLoopRuntime
+	if len(runtimeCfg) > 0 {
+		rt = runtimeCfg[0]
+	}
+	unit := newRunningUnit(runningUnitConfig{
+		ActiveAgentType: at.Name,
+		Store:           rt.store,
+		CurrentRef:      ref,
+		Loop: runningUnitLoopConfig{
+			Client:           client,
+			Registry:         registry,
+			SystemPrompt:     appendAdaptationBlocks(at.Prompt, adapt),
+			Store:            rt.store,
+			Events:           rt.events,
+			UsageRecorder:    t.usageRecorder,
+			PendingExecutor:  rt.pendingExecutor,
+			ActiveAdaptation: adapt,
+		},
+	})
+	return unit.lp
 }
 
 func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, parentToolCallID string) taskResult {
@@ -384,16 +407,14 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		return result
 	}
 
-	lp = t.buildChildLoop(at, client, registry, ref)
-	if events != nil {
-		lp.SetEvents(events)
-	}
-	lp.SetStore(childStore)
-	lp.SetUsageRecorder(t.usageRecorder)
 	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(scope.snapshotStore(), scope.tracker, t.toolsConfig, scope.workspaceRoot, t.permissionCheck(), t.permissionAskAction(), tool.CapabilityOptions{
 		WriteDir: taskToolExposure(at).writeDir,
 	})
-	lp.SetPendingExecutor(pendingExecutor)
+	lp = t.buildChildLoop(at, client, registry, ref, childLoopRuntime{
+		store:           childStore,
+		events:          events,
+		pendingExecutor: pendingExecutor,
+	})
 	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 
 	if turn := childStore.BeginTurn(); turn == 0 {

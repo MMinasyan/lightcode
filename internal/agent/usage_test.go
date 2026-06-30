@@ -10,7 +10,7 @@ import (
 func TestRecordUsagePrefersEventModelRef(t *testing.T) {
 	parentRef := coremodel.ModelRef{Provider: "parent-provider", Model: "parent-model"}
 	childRef := coremodel.ModelRef{Provider: "child-provider", Model: "child-model"}
-	a := &Agent{currentRef: parentRef}
+	a := &Agent{session: session{currentRef: parentRef}}
 
 	a.recordUsage(loop.Event{
 		Kind:       loop.Usage,

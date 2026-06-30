@@ -161,7 +161,7 @@ func (a *Agent) ConnectProvider(providerID, apiKey string) error {
 	}
 	var plan connectPlan
 	a.ensureRuntime().mu.Lock()
-	if a.ensureRuntime().busy {
+	if a.ensureRuntime().session().busy {
 		a.ensureRuntime().mu.Unlock()
 		return fmt.Errorf("cannot connect provider while a turn is running")
 	}
@@ -205,7 +205,7 @@ func (a *Agent) ConnectProvider(providerID, apiKey string) error {
 		// Phase 3: re-acquire lock, re-validate, persist.
 		a.ensureRuntime().mu.Lock()
 		defer a.ensureRuntime().mu.Unlock()
-		if a.ensureRuntime().busy {
+		if a.ensureRuntime().session().busy {
 			return fmt.Errorf("cannot connect provider while a turn is running")
 		}
 		current := a.catalog.Providers[providerID]
@@ -228,7 +228,7 @@ func (a *Agent) ConnectProvider(providerID, apiKey string) error {
 	// Non-discovery path: persist key and reload.
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().busy {
+	if a.ensureRuntime().session().busy {
 		return fmt.Errorf("cannot connect provider while a turn is running")
 	}
 	if apiKey != "" {
@@ -311,7 +311,7 @@ func cloneHeaders(in map[string]string) map[string]string {
 func (a *Agent) DiscoverCustomProvider(req CustomProviderRequest) ([]DiscoveryModelCandidate, error) {
 	// Phase 1: validate inputs under the lock.
 	a.ensureRuntime().mu.Lock()
-	if a.ensureRuntime().busy {
+	if a.ensureRuntime().session().busy {
 		a.ensureRuntime().mu.Unlock()
 		return nil, fmt.Errorf("cannot discover provider while a turn is running")
 	}
@@ -374,7 +374,7 @@ func discoveryCandidates(discovered catalog.DiscoveredProvider) []DiscoveryModel
 func (a *Agent) AddCustomProvider(req CustomProviderRequest) error {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().busy {
+	if a.ensureRuntime().session().busy {
 		return fmt.Errorf("cannot add provider while a turn is running")
 	}
 	providerID := strings.TrimSpace(req.ID)
@@ -524,7 +524,7 @@ func customModelsMap(inputs []CustomProviderModelInput) (map[string]any, int, er
 func (a *Agent) DisconnectProvider(providerID string) error {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().busy {
+	if a.ensureRuntime().session().busy {
 		return fmt.Errorf("cannot disconnect provider while a turn is running")
 	}
 	prov := a.catalog.Providers[providerID]
@@ -551,7 +551,7 @@ func (a *Agent) DisconnectProvider(providerID string) error {
 func (a *Agent) RemoveProvider(providerID string) error {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().busy {
+	if a.ensureRuntime().session().busy {
 		return fmt.Errorf("cannot remove provider while a turn is running")
 	}
 	prov := a.catalog.Providers[providerID]

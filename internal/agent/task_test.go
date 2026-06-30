@@ -1027,7 +1027,8 @@ func TestSubagentRunCommandUsesFreshPermissionWrappedTool(t *testing.T) {
 // Agent.seenSessions must be safe under concurrent dispatch + reset.
 func TestPR11Closure_SeenSessionsNoRace(t *testing.T) {
 	agent := &Agent{}
-	agent.ensureRuntime().seenSessions = map[string]bool{}
+	rt := agent.ensureRuntime()
+	agent.session.seenSessions = map[string]bool{}
 	var wg sync.WaitGroup
 	const N = 100
 	wg.Add(2)
@@ -1040,9 +1041,9 @@ func TestPR11Closure_SeenSessionsNoRace(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < N; i++ {
-			agent.ensureRuntime().mu.Lock()
-			agent.ensureRuntime().seenSessions = map[string]bool{}
-			agent.ensureRuntime().mu.Unlock()
+			rt.mu.Lock()
+			agent.session.seenSessions = map[string]bool{}
+			rt.mu.Unlock()
 		}
 	}()
 	wg.Wait()

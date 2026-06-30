@@ -636,7 +636,7 @@ func TestAgentSummarizerFallsBackToActiveModelWhenCompactModelUnavailable(t *tes
 func TestAgentSetRuntimeConfigRefusesWhileBusy(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	a.ensureRuntime().mu.Lock()
-	a.ensureRuntime().busy = true
+	a.ensureRuntime().session().busy = true
 	a.ensureRuntime().mu.Unlock()
 	if err := a.SetRuntimeConfig(a.GetRuntimeConfig()); err == nil {
 		t.Fatal("SetRuntimeConfig returned nil while busy")
@@ -987,7 +987,7 @@ func TestAgentReloadRebuildsCatalogAndFallsBackToDefault(t *testing.T) {
 func TestAgentReloadRefusesWhileBusy(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	a.ensureRuntime().mu.Lock()
-	a.ensureRuntime().busy = true
+	a.ensureRuntime().session().busy = true
 	a.ensureRuntime().mu.Unlock()
 
 	if err := a.Reload(); err == nil {

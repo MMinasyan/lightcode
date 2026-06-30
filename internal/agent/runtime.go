@@ -63,18 +63,7 @@ type runtime struct {
 	eventMu sync.RWMutex
 	onEvent func(Event)
 
-	mu         sync.Mutex
-	busy       bool
-	turnCancel context.CancelFunc
-	turnCtx    context.Context
-
-	queue         []QueuedItem
-	queueVersion  int
-	queueSeq      int
-	transitioning bool
-	seenSessions  map[string]bool
-
-	sessionRefreshAfterTurn bool
+	mu sync.Mutex
 }
 
 func newRuntime(a *Agent, opts runtimeOptions) *runtime {
@@ -114,4 +103,11 @@ func (a *Agent) ensureRuntime() *runtime {
 		a.rt.signalSink = loopSignalSink{agent: a}
 	}
 	return a.rt
+}
+
+func (rt *runtime) session() *session {
+	if rt == nil || rt.agent == nil {
+		return nil
+	}
+	return &rt.agent.session
 }
