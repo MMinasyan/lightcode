@@ -506,13 +506,14 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 	})
 	registry.Register(tt)
 
-	rc := tool.NewRunCommandAtRoot(a.cfg.Tools, a.home, projectRoot, a.procMgr)
+	processes := a.procMgr.ForSession(func() string { return sessionIDOf(unitRef()) })
+	rc := tool.NewRunCommandAtRoot(a.cfg.Tools, a.home, projectRoot, processes)
 	if resolved.Readonly {
 		registry.Register(tool.WrapWithPermission(tool.NewReadOnlyRunCommand(rc), checkPolicy, askPolicy))
 	} else {
 		registry.Register(tool.WrapWithPermission(rc, checkPolicy, askPolicy))
 	}
-	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(a.procMgr), checkPolicy, askPolicy))
+	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(processes), checkPolicy, askPolicy))
 	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkPolicy, askPolicy))
 	registry.Register(tool.WrapWithPermission(tool.NewSaveMemory(a.memoryStore, memoriesDir), checkPolicy, askPolicy))
 	registry.Register(tool.WrapWithPermission(tool.NewSearchMemory(a.memoryStore, projectID), checkPolicy, askPolicy))
@@ -680,12 +681,17 @@ func New(c Config) (*Agent, error) {
 	procMgr.SetExitHandler(func(event process.ExitEvent) {
 		rt := a.ensureRuntime()
 		rt.mu.Lock()
-		unit := rt.sessionLocked()
-		if unit == nil || unit.lp == nil {
-			rt.mu.Unlock()
-			return
+		var unit *session
+		if event.SessionID != "" {
+			a.ensureSessionMapLocked()
+			unit = a.sessions[event.SessionID]
+			if unit == nil && sessionIDOf(a.session) == event.SessionID {
+				unit = a.session
+			}
+		} else {
+			unit = rt.sessionLocked()
 		}
-		if event.SessionID != "" && sessionIDOf(unit) != event.SessionID {
+		if unit == nil || unit.lp == nil || unit.store == nil || !unit.store.Active() || (event.SessionID != "" && sessionIDOf(unit) != event.SessionID) {
 			rt.mu.Unlock()
 			return
 		}
@@ -717,14 +723,14 @@ func New(c Config) (*Agent, error) {
 		rt.nudgeSignalScheduler()
 	})
 
-	// Re-create RunCommand with the process manager.
-	rc := tool.NewRunCommandAtRoot(c.Cfg.Tools, c.Home, rt.workspaceRoot, procMgr)
+	processes := procMgr.ForSession(func() string { return sessionIDOf(initialUnitRef()) })
+	rc := tool.NewRunCommandAtRoot(c.Cfg.Tools, c.Home, rt.workspaceRoot, processes)
 	if primaryType.Readonly {
 		registry.Register(tool.WrapWithPermission(tool.NewReadOnlyRunCommand(rc), checkPolicy, askPolicy))
 	} else {
 		registry.Register(tool.WrapWithPermission(rc, checkPolicy, askPolicy))
 	}
-	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(procMgr), checkPolicy, askPolicy))
+	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(processes), checkPolicy, askPolicy))
 	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkPolicy, askPolicy))
 
 	embedder, err := newMemoryEmbedder(c.Home)

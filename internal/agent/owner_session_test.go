@@ -1011,6 +1011,110 @@ func TestOpenSessionKeepsCurrent(t *testing.T) {
 	}
 }
 
+func TestRootProcessRoutesBySession(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	a.cfg.Permissions.Allow = []string{
+		"run_command(printf *)",
+		"run_command(sleep *)",
+		"process(process)",
+		"process(process:*)",
+	}
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	a.ensureRuntime().mu.Lock()
+	first := a.sessions[firstID]
+	second := a.sessions[secondID]
+	a.ensureRuntime().mu.Unlock()
+	firstRun, ok := first.registry.Get("run_command")
+	if !ok {
+		t.Fatal("first run_command missing")
+	}
+	firstProcess, ok := first.registry.Get("process")
+	if !ok {
+		t.Fatal("first process missing")
+	}
+	secondProcess, ok := second.registry.Get("process")
+	if !ok {
+		t.Fatal("second process missing")
+	}
+
+	result, err := firstRun.Execute(context.Background(), map[string]any{
+		"command":    "printf first-bg-marker; sleep 5",
+		"background": true,
+	})
+	if err != nil {
+		t.Fatalf("start background: %v", err)
+	}
+	id := backgroundID(t, result)
+	defer a.procMgr.KillAll()
+	waitProcessOutput(t, firstProcess, id, "first-bg-marker")
+
+	list, err := firstProcess.Execute(context.Background(), map[string]any{"action": "list"})
+	if err != nil {
+		t.Fatalf("first process list: %v", err)
+	}
+	if !strings.Contains(list, id) || !strings.Contains(list, "first-bg-marker") {
+		t.Fatalf("first process list = %q, want %s", list, id)
+	}
+	list, err = secondProcess.Execute(context.Background(), map[string]any{"action": "list"})
+	if err != nil {
+		t.Fatalf("second process list: %v", err)
+	}
+	if list != "No background processes." {
+		t.Fatalf("second process list = %q, want no processes", list)
+	}
+	if _, err := secondProcess.Execute(context.Background(), map[string]any{"action": "read", "id": id}); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("no process with ID %q", id)) {
+		t.Fatalf("second read error = %v, want missing process", err)
+	}
+	if _, err := secondProcess.Execute(context.Background(), map[string]any{"action": "kill", "id": id}); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("no process with ID %q", id)) {
+		t.Fatalf("second kill error = %v, want missing process", err)
+	}
+	if _, err := firstProcess.Execute(context.Background(), map[string]any{"action": "kill", "id": id}); err != nil {
+		t.Fatalf("first kill: %v", err)
+	}
+}
+
+func TestRootProcessCompletionStaysWithOwner(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	a.cfg.Permissions.Allow = []string{"run_command(printf *)"}
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	a.ensureRuntime().mu.Lock()
+	first := a.sessions[firstID]
+	second := a.sessions[secondID]
+	a.ensureRuntime().mu.Unlock()
+	firstRun, ok := first.registry.Get("run_command")
+	if !ok {
+		t.Fatal("first run_command missing")
+	}
+
+	if _, err := firstRun.Execute(context.Background(), map[string]any{
+		"command":    "printf first-done",
+		"background": true,
+	}); err != nil {
+		t.Fatalf("start background: %v", err)
+	}
+	waitPendingSignal(t, first, "first")
+	if second.lp.HasPendingSignal() {
+		t.Fatal("second session received first session background signal")
+	}
+	if current := a.SessionCurrent().ID; current != secondID {
+		t.Fatalf("backend current = %q, want %q", current, secondID)
+	}
+}
+
 func TestRemoveCrossProjectLiveSession(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -1198,6 +1302,44 @@ func waitEvent(t *testing.T, events <-chan Event) Event {
 		t.Fatal("timed out waiting for event")
 		return Event{}
 	}
+}
+
+func backgroundID(t *testing.T, result string) string {
+	t.Helper()
+	const marker = "ID: `"
+	start := strings.Index(result, marker)
+	if start < 0 {
+		t.Fatalf("background result = %q, missing id marker", result)
+	}
+	start += len(marker)
+	end := strings.Index(result[start:], "`")
+	if end < 0 {
+		t.Fatalf("background result = %q, unterminated id", result)
+	}
+	return result[start : start+end]
+}
+
+func waitProcessOutput(t *testing.T, processTool tool.Tool, id string, want string) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		out, err := processTool.Execute(context.Background(), map[string]any{"action": "read", "id": id})
+		if err == nil && strings.Contains(out, want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("process %s output did not contain %q", id, want)
+}
+
+func waitPendingSignal(t *testing.T, unit *session, label string) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if unit != nil && unit.lp != nil && unit.lp.HasPendingSignal() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s session did not receive pending signal", label)
 }
 
 func writeTokenFile(t *testing.T, unit *session, entries ...TokenEntry) {
