@@ -31,9 +31,10 @@ const (
 
 // Event is the unified event type emitted by the Agent to adapters.
 type Event struct {
-	Kind      EventKind
-	SessionID string
-	ProjectID string
+	Kind            EventKind
+	SessionID       string
+	ProjectID       string
+	ParentSessionID string
 
 	// Loop-level fields (forwarded from loop.Event):
 	ToolName   string

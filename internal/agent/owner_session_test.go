@@ -17,6 +17,7 @@ import (
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
@@ -39,6 +40,19 @@ func TestUnknownSessionIDsAreRejected(t *testing.T) {
 			name: "queue",
 			run: func() error {
 				_, err := a.QueueSnapshotForSession("missing-session")
+				return err
+			},
+		},
+		{
+			name: "compact",
+			run: func() error {
+				return a.CompactNowForSession(context.Background(), "missing-session")
+			},
+		},
+		{
+			name: "snapshots",
+			run: func() error {
+				_, err := a.SnapshotListForSession("missing-session")
 				return err
 			},
 		},
@@ -486,13 +500,17 @@ func TestTaskProjectSync(t *testing.T) {
 	if memoriesDir == "" {
 		t.Fatal("task memories dir is empty")
 	}
+	parentSessionID := a.session.store.SessionID()
+	if parentSessionID == "" {
+		t.Fatal("parent session id is empty")
+	}
 
 	tagged := make(chan TaggedLoopEvent, 1)
 	tt.taggedEvents = tagged
 	source := make(chan loop.Event, 1)
 	source <- loop.Event{Kind: loop.ToolCallStart, ToolName: "read_file"}
 	close(source)
-	tt.forwardEvents(source, 0, "child-session", taskProjectID, "call-task")
+	tt.forwardEvents(source, 0, "child-session", parentSessionID, taskProjectID, "call-task")
 	got := <-tagged
 	if got.ProjectID != projectID {
 		t.Fatalf("forwarded project id = %q, want %q", got.ProjectID, projectID)
@@ -623,14 +641,14 @@ func TestMessagesComeFromSelectedSessionProject(t *testing.T) {
 	second.ensureRuntime().mu.Lock()
 	second.sessions[firstID] = first.sessions[firstID]
 	second.ensureRuntime().mu.Unlock()
-	firstMessages, err := second.SessionMessagesByID(firstID)
+	firstMessages, err := second.SessionMessagesFor(firstID)
 	if err != nil {
 		t.Fatalf("messages first via second owner: %v", err)
 	}
 	if got := userContents(firstMessages); !equalStrings(got, []string{"from first project"}) {
 		t.Fatalf("first messages through resolved store = %#v, want first project", got)
 	}
-	secondMessages, err := second.SessionMessagesByID(secondID)
+	secondMessages, err := second.SessionMessagesFor(secondID)
 	if err != nil {
 		t.Fatalf("messages second: %v", err)
 	}
@@ -861,6 +879,174 @@ func TestCompactTypeCannotBeStartedByUser(t *testing.T) {
 	_, err := a.NewSession("", "compact")
 	if err == nil || !strings.Contains(err.Error(), `agent type "compact" cannot be started as a session`) {
 		t.Fatalf("NewSession compact error = %v, want code-only rejection", err)
+	}
+}
+
+func TestCloseRemovedLiveSession(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*Agent, string) (bool, error)
+	}{
+		{name: "archive", run: func(a *Agent, id string) (bool, error) { return a.SessionArchive(id) }},
+		{name: "delete", run: func(a *Agent, id string) (bool, error) { return a.SessionDelete(id) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newCatalogBackedTestAgent(t)
+			firstID, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("NewSession first: %v", err)
+			}
+			if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
+				t.Fatalf("append first: %v", err)
+			}
+			secondID, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("NewSession second: %v", err)
+			}
+			if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+				t.Fatalf("append second: %v", err)
+			}
+			if current := a.SessionCurrent().ID; current != secondID {
+				t.Fatalf("current session = %q, want %q", current, secondID)
+			}
+
+			closedCurrent, err := tc.run(a, firstID)
+			if err != nil {
+				t.Fatalf("%s first: %v", tc.name, err)
+			}
+			if closedCurrent {
+				t.Fatalf("%s closed backend current session", tc.name)
+			}
+			if _, err := a.SessionSummaryForSession(firstID); err == nil {
+				t.Fatalf("%s left first session live", tc.name)
+			}
+			if current := a.SessionCurrent().ID; current != secondID {
+				t.Fatalf("current session after %s = %q, want %q", tc.name, current, secondID)
+			}
+		})
+	}
+}
+
+func TestCloseClaimBlocksSubmit(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
+		t.Fatalf("append first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+		t.Fatalf("append second: %v", err)
+	}
+	if current := a.SessionCurrent().ID; current != secondID {
+		t.Fatalf("current session = %q, want %q", current, secondID)
+	}
+
+	release, err := a.beginLiveSessionClose(firstID)
+	if err != nil {
+		t.Fatalf("begin close: %v", err)
+	}
+	if release == nil {
+		t.Fatal("begin close returned no release")
+	}
+	defer release()
+
+	_, err = a.SubmitToSession(context.Background(), firstID, "blocked")
+	if err == nil || !strings.Contains(err.Error(), "session is changing") {
+		t.Fatalf("submit while closing = %v, want session changing", err)
+	}
+	if current := a.SessionCurrent().ID; current != secondID {
+		t.Fatalf("current session after blocked submit = %q, want %q", current, secondID)
+	}
+}
+
+func TestRemoveCrossProjectLiveSession(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		run   func(*Agent, string) (bool, error)
+		check func(*testing.T, string, string)
+	}{
+		{
+			name: "archive",
+			run:  func(a *Agent, id string) (bool, error) { return a.SessionArchive(id) },
+			check: func(t *testing.T, sessionsRoot, id string) {
+				t.Helper()
+				infos, err := snapshot.List(sessionsRoot, "", snapshot.StateArchived)
+				if err != nil {
+					t.Fatalf("list archived: %v", err)
+				}
+				for _, info := range infos {
+					if info.ID == id {
+						return
+					}
+				}
+				t.Fatalf("archived session %s not found in %s", id, sessionsRoot)
+			},
+		},
+		{
+			name: "delete",
+			run:  func(a *Agent, id string) (bool, error) { return a.SessionDelete(id) },
+			check: func(t *testing.T, sessionsRoot, id string) {
+				t.Helper()
+				if _, err := os.Stat(filepath.Join(sessionsRoot, id)); !os.IsNotExist(err) {
+					t.Fatalf("deleted session dir stat err = %v, want not exist", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			firstRoot := t.TempDir()
+			secondRoot := t.TempDir()
+			a := newCatalogBackedTestAgentForRoot(t, home, firstRoot)
+			firstProject, err := a.projects.Ensure()
+			if err != nil {
+				t.Fatalf("ensure first project: %v", err)
+			}
+			secondAgent := newCatalogBackedTestAgentForRoot(t, home, secondRoot)
+			secondProject, err := secondAgent.projects.Ensure()
+			if err != nil {
+				t.Fatalf("ensure second project: %v", err)
+			}
+
+			secondID, err := a.NewSession(secondProject.ID, "primary")
+			if err != nil {
+				t.Fatalf("NewSession second project: %v", err)
+			}
+			if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+				t.Fatalf("append second: %v", err)
+			}
+			firstID, err := a.NewSession(firstProject.ID, "primary")
+			if err != nil {
+				t.Fatalf("NewSession first project: %v", err)
+			}
+			if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
+				t.Fatalf("append first: %v", err)
+			}
+			if current := a.SessionCurrent().ID; current != firstID {
+				t.Fatalf("current session = %q, want %q", current, firstID)
+			}
+
+			closedCurrent, err := tc.run(a, secondID)
+			if err != nil {
+				t.Fatalf("%s second project: %v", tc.name, err)
+			}
+			if closedCurrent {
+				t.Fatalf("%s closed backend current session", tc.name)
+			}
+			if _, err := a.SessionSummaryForSession(secondID); err == nil {
+				t.Fatalf("%s left second session live", tc.name)
+			}
+			tc.check(t, a.projects.SessionsRoot(secondProject.ID), secondID)
+			if current := a.SessionCurrent().ID; current != firstID {
+				t.Fatalf("current session after %s = %q, want %q", tc.name, current, firstID)
+			}
+		})
 	}
 }
 

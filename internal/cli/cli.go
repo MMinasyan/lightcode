@@ -31,6 +31,10 @@ type CLI struct {
 	out   io.Writer
 	mu    *sync.Mutex
 
+	currentMu sync.Mutex
+	currentID string
+	children  map[string]struct{}
+
 	width    int
 	oldState *term.State
 	rawFd    int
@@ -96,6 +100,178 @@ func New(a *agent.Agent) *CLI {
 	}
 }
 
+func (c *CLI) setCurrentSessionID(id string) {
+	c.currentMu.Lock()
+	id = strings.TrimSpace(id)
+	if c.currentID != id {
+		c.children = nil
+	}
+	c.currentID = id
+	c.currentMu.Unlock()
+}
+
+func (c *CLI) currentSessionID() string {
+	c.currentMu.Lock()
+	defer c.currentMu.Unlock()
+	return strings.TrimSpace(c.currentID)
+}
+
+func (c *CLI) currentSession() (string, error) {
+	id := c.currentSessionID()
+	if id == "" {
+		return "", fmt.Errorf("no current session")
+	}
+	return id, nil
+}
+
+func (c *CLI) clearRemovedCurrent(id string, closedCurrent bool) {
+	wasCurrent := c.currentSessionID() == strings.TrimSpace(id)
+	if wasCurrent {
+		c.setCurrentSessionID("")
+	}
+	if closedCurrent || wasCurrent {
+		c.refreshSession()
+	}
+}
+
+func (c *CLI) resolveSessionID(id string) (string, error) {
+	id = strings.TrimSpace(id)
+	if id != "" {
+		return id, nil
+	}
+	return c.currentSession()
+}
+
+func (c *CLI) acceptsSessionEvent(sessionID string) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return true
+	}
+	return c.liveCurrentSessionID() == sessionID
+}
+
+func (c *CLI) acceptsEvent(ev agent.Event) bool {
+	if ev.SubagentSessionID != "" {
+		return c.acceptsSubagentEvent(ev)
+	}
+	if ev.SessionID != "" {
+		return c.acceptsSessionEvent(ev.SessionID)
+	}
+	return true
+}
+
+func (c *CLI) acceptsSubagentEvent(ev agent.Event) bool {
+	current := c.liveCurrentSessionID()
+	if current == "" {
+		return false
+	}
+	return c.acceptsSubagentEventForCurrent(current, ev)
+}
+
+func (c *CLI) acceptsSubagentEventForCurrent(current string, ev agent.Event) bool {
+	child := strings.TrimSpace(ev.SubagentSessionID)
+	if child == "" {
+		return false
+	}
+	c.currentMu.Lock()
+	defer c.currentMu.Unlock()
+	if strings.TrimSpace(c.currentID) != current {
+		return false
+	}
+	if ev.ParentSessionID == current {
+		if c.children == nil {
+			c.children = make(map[string]struct{})
+		}
+		c.children[child] = struct{}{}
+		return true
+	}
+	_, ok := c.children[child]
+	return ok
+}
+
+func (c *CLI) liveCurrentSessionID() string {
+	id := c.currentSessionID()
+	if id == "" {
+		return ""
+	}
+	if _, err := c.agent.SessionSummaryForSession(id); err != nil {
+		c.setCurrentSessionID("")
+		return ""
+	}
+	return id
+}
+
+func (c *CLI) currentSessionSummary() agent.SessionSummary {
+	id := c.currentSessionID()
+	if id == "" {
+		return agent.SessionSummary{}
+	}
+	s, err := c.agent.SessionSummaryForSession(id)
+	if err != nil {
+		c.setCurrentSessionID("")
+		return agent.SessionSummary{}
+	}
+	return s
+}
+
+func (c *CLI) currentModel() agent.ModelInfo {
+	id, err := c.currentSession()
+	if err != nil {
+		return agent.ModelInfo{}
+	}
+	model, err := c.agent.CurrentModelForSession(id)
+	if err != nil {
+		return agent.ModelInfo{}
+	}
+	return model
+}
+
+func (c *CLI) tokenUsage() agent.TokenReport {
+	id := c.currentSessionID()
+	if id == "" {
+		return agent.TokenReport{}
+	}
+	report, err := c.agent.TokenUsageForSession(id)
+	if err != nil {
+		return agent.TokenReport{}
+	}
+	return report
+}
+
+func (c *CLI) sessionMessages() []agent.DisplayMessage {
+	id := c.currentSessionID()
+	if id == "" {
+		return nil
+	}
+	if _, err := c.agent.SessionSummaryForSession(id); err != nil {
+		c.setCurrentSessionID("")
+		return nil
+	}
+	msgs, err := c.agent.SessionMessagesFor(id)
+	if err != nil {
+		return nil
+	}
+	return msgs
+}
+
+func (c *CLI) queueSnapshot() agent.QueueState {
+	id := c.currentSessionID()
+	if id == "" {
+		return agent.QueueState{}
+	}
+	q, err := c.agent.QueueSnapshotForSession(id)
+	if err != nil {
+		return agent.QueueState{}
+	}
+	return q
+}
+
+func (c *CLI) cancelCurrent() {
+	if id, err := c.currentSession(); err == nil {
+		_ = c.agent.CancelSession(id)
+	}
+}
+
 func (c *CLI) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -132,7 +308,7 @@ func (c *CLI) Run(ctx context.Context) error {
 					st := c.state
 					c.mu.Unlock()
 					if st == stateStreaming || st == statePermission {
-						_ = c.agent.Cancel()
+						c.cancelCurrent()
 					} else {
 						_ = term.Restore(rawFd, oldState)
 						fmt.Fprint(os.Stdout, "\r\n\x1b[?25h")
@@ -164,10 +340,17 @@ func (c *CLI) Run(ctx context.Context) error {
 	})
 
 	c.agent.Init(ctx)
+	sessionID := c.agent.SessionCurrent().ID
+	if sessionID == "" {
+		if id, err := c.agent.NewSession("", "primary"); err == nil {
+			sessionID = id
+		}
+	}
+	c.setCurrentSessionID(sessionID)
 
 	c.refreshState()
 
-	msgs := c.agent.SessionMessages()
+	msgs := c.sessionMessages()
 	c.messages = buildDisplayMsgs(msgs)
 	c.seedInputHistory()
 
@@ -360,7 +543,7 @@ func (c *CLI) handleKeyStreaming(k keyMsg) {
 	}
 	switch k.Special {
 	case keyCtrlC, keyEscape:
-		_ = c.agent.Cancel()
+		c.cancelCurrent()
 	case keyEnter:
 		text := c.input.String()
 		if text != "" {
@@ -400,22 +583,22 @@ func (c *CLI) handleKeyPermission(k keyMsg) {
 		c.choosePermission(req)
 		return
 	case keyCtrlC, keyEscape:
-		c.popAndRespond(req.ID, false)
+		c.popAndRespond(req, false)
 		return
 	}
 
 	switch k.Rune {
 	case 'y', 'Y':
-		c.popAndRespond(req.ID, true)
+		c.popAndRespond(req, true)
 	case 'n', 'N':
-		c.popAndRespond(req.ID, false)
+		c.popAndRespond(req, false)
 	case 'p', 'P':
 		if !req.DisableProjectSave {
 			c.showPermissionSuggestions(req)
 		}
 	case 'a', 'A':
 		if req.CanAllowAll {
-			c.popAndRespondAction(req.ID, "allow_all")
+			c.popAndRespondAction(req, "allow_all")
 		}
 	}
 }
@@ -428,31 +611,35 @@ func (c *CLI) choosePermission(req *agent.PermissionRequest) {
 	action, _ := actions[c.permSelected].extra.(string)
 	switch action {
 	case "allow":
-		c.popAndRespond(req.ID, true)
+		c.popAndRespond(req, true)
 	case "deny":
-		c.popAndRespond(req.ID, false)
+		c.popAndRespond(req, false)
 	case "project":
 		c.showPermissionSuggestions(req)
 	case "allow_all":
-		c.popAndRespondAction(req.ID, "allow_all")
+		c.popAndRespondAction(req, "allow_all")
 	}
 }
 
-func (c *CLI) popAndRespond(id string, allow bool) {
+func (c *CLI) popAndRespond(req *agent.PermissionRequest, allow bool) {
 	action := "deny"
 	if allow {
 		action = "allow"
 	}
-	c.popAndRespondAction(id, action)
+	c.popAndRespondAction(req, action)
 }
 
-func (c *CLI) popAndRespondAction(id string, action string) {
+func (c *CLI) popAndRespondAction(req *agent.PermissionRequest, action string) {
 	c.mu.Lock()
 	c.erasePermissionBlockLocked()
 	c.advancePermissionQueueLocked()
 	c.mu.Unlock()
 
-	_ = c.agent.RespondPermissionAction(id, action)
+	sessionID, err := c.resolveSessionID(req.SessionID)
+	if err != nil {
+		return
+	}
+	_ = c.agent.RespondPermissionActionForSession(sessionID, req.ID, action)
 }
 
 func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
@@ -460,7 +647,25 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 	if req.ResolvedArg != "" {
 		suggestArg = req.ResolvedArg
 	}
-	suggestions := c.agent.PermissionSuggest(req.ToolName, suggestArg)
+	var (
+		suggestions []agent.PermissionSuggestion
+		err         error
+	)
+	if req.ProjectID != "" {
+		suggestions, err = c.agent.PermissionSuggestForProject(req.ProjectID, req.ToolName, suggestArg)
+	} else {
+		sessionID, resolveErr := c.resolveSessionID(req.SessionID)
+		if resolveErr != nil {
+			err = resolveErr
+		} else {
+			suggestions, err = c.agent.PermissionSuggestForSession(sessionID, req.ToolName, suggestArg)
+		}
+	}
+	if err != nil {
+		c.printLine(renderErrorMsg(err.Error()))
+		c.printPermissionBlock(req)
+		return
+	}
 	if len(suggestions) == 0 {
 		c.mu.Lock()
 		c.erasePermissionBlockLocked()
@@ -499,7 +704,7 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 	for {
 		k, err := c.readKeyFn()
 		if err != nil {
-			c.popAndRespond(req.ID, false)
+			c.popAndRespond(req, false)
 			return
 		}
 
@@ -511,7 +716,13 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 		case keyEnter:
 			patterns := []string{suggestions[selected].Rule}
 			eraseSuggestions()
-			if err := c.agent.SaveProjectPermission(req.ID, patterns); err != nil {
+			sessionID, err := c.resolveSessionID(req.SessionID)
+			if err != nil {
+				c.printLine(renderErrorMsg(err.Error()))
+				c.printPermissionBlock(req)
+				return
+			}
+			if err := c.agent.SaveProjectPermissionForSession(sessionID, req.ID, patterns); err != nil {
 				c.printLine(renderErrorMsg(err.Error()))
 				c.printPermissionBlock(req)
 				return
@@ -552,6 +763,10 @@ func parseSelectionNumbers(s string, max int) []int {
 }
 
 func (c *CLI) handleEvent(ev agent.Event) {
+	if !c.acceptsEvent(ev) {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -914,7 +1129,7 @@ func terminalRowsForText(text string, width int) int {
 }
 
 func (c *CLI) refreshState() {
-	m := c.agent.CurrentModel()
+	m := c.currentModel()
 	c.modelRef = m.Ref
 	if c.modelRef == "" && m.Provider != "" && m.Model != "" {
 		c.modelRef = m.Provider + "/" + m.Model
@@ -950,7 +1165,7 @@ func (c *CLI) printHeader() {
 }
 
 func (c *CLI) printHeaderLocked() {
-	session := c.agent.SessionCurrent()
+	session := c.currentSessionSummary()
 	sid := session.ID
 	if sid == "" {
 		sid = "(no session)"
@@ -1090,7 +1305,11 @@ func (c *CLI) submitInputLocked(text string) {
 // restores the input prompt. Runs the call off the lock in a goroutine.
 func (c *CLI) submitToBackend(text string) {
 	go func() {
-		if _, err := c.agent.Submit(c.ctx, text); err != nil {
+		sessionID, err := c.currentSession()
+		if err == nil {
+			_, err = c.agent.SubmitToSession(c.ctx, sessionID, text)
+		}
+		if err != nil {
 			c.mu.Lock()
 			c.handleSubmitErrorLocked(text, err)
 			c.mu.Unlock()
@@ -1119,9 +1338,9 @@ func (c *CLI) refreshSession() {
 
 func (c *CLI) refreshSessionLocked() {
 	c.refreshState()
-	msgs := c.agent.SessionMessages()
+	msgs := c.sessionMessages()
 	c.messages = buildDisplayMsgs(msgs)
-	q := c.agent.QueueSnapshot()
+	q := c.queueSnapshot()
 	c.queueDisplay = q.Items
 	c.lastQueueVersion = q.Version
 	c.seedInputHistory()
@@ -1189,10 +1408,12 @@ func (c *CLI) dispatchCommand(text string) {
 	case "/project":
 		c.showProjectMenu()
 	case "/new":
-		if err := c.agent.SessionNew(); err != nil {
+		id, err := c.agent.NewSession("", "primary")
+		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
+		c.setCurrentSessionID(id)
 		c.refreshSession()
 	case "/resume":
 		c.cmdResume(parts)
@@ -1264,6 +1485,7 @@ func (c *CLI) cmdResume(parts []string) {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
+		c.setCurrentSessionID(id)
 		c.refreshSession()
 		return
 	}
@@ -1282,11 +1504,12 @@ func (c *CLI) cmdResume(parts []string) {
 		c.printLine(renderErrorMsg(err.Error()))
 		return
 	}
+	c.setCurrentSessionID(sessions[0].ID)
 	c.refreshSession()
 }
 
 func (c *CLI) cmdContext() {
-	report := c.agent.TokenUsage()
+	report := c.tokenUsage()
 
 	c.printLine("")
 	if report.ContextWindow > 0 {
@@ -1315,6 +1538,11 @@ func (c *CLI) cmdCompact() {
 		c.printLine(renderErrorMsg("cannot compact while a turn is running"))
 		return
 	}
+	sessionID := c.liveCurrentSessionID()
+	if sessionID == "" {
+		c.printLine(renderErrorMsg("no current session"))
+		return
+	}
 
 	c.mu.Lock()
 	c.compacting = true
@@ -1324,7 +1552,7 @@ func (c *CLI) cmdCompact() {
 	c.startAnimation("Compacting")
 
 	go func() {
-		err := c.agent.CompactNow(c.ctx)
+		err := c.agent.CompactNowForSession(c.ctx, sessionID)
 		c.mu.Lock()
 		idle := c.finishCompactLocked()
 		c.mu.Unlock()

@@ -136,10 +136,10 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 		t.Fatalf("read menu.go: %v", err)
 	}
 	menu := string(menuBytes)
-	if !strings.Contains(menu, "ApplyTurnAction(turn, agent.TurnActionRevertCode") ||
-		!strings.Contains(menu, "ApplyTurnAction(turn, agent.TurnActionRevertHistory") ||
-		!strings.Contains(menu, "ApplyTurnAction(turn, agent.TurnActionFork") {
-		t.Fatalf("CLI revert menu must route through ApplyTurnAction")
+	if !strings.Contains(menu, "ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertCode") ||
+		!strings.Contains(menu, "ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertHistory") ||
+		!strings.Contains(menu, "ApplyTurnActionForSession(sessionID, turn, agent.TurnActionFork") {
+		t.Fatalf("CLI revert menu must route through ApplyTurnActionForSession")
 	}
 	if strings.Contains(menu, "RevertCode(turn - 1)") || strings.Contains(menu, "ForkSession(turn") {
 		t.Fatalf("CLI revert menu still performs adapter-local turn action logic")

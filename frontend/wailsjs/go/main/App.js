@@ -78,8 +78,8 @@ export function ModelList() {
   return window['go']['main']['App']['ModelList']();
 }
 
-export function PermissionSuggest(arg1, arg2) {
-  return window['go']['main']['App']['PermissionSuggest'](arg1, arg2);
+export function PermissionSuggest(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['PermissionSuggest'](arg1, arg2, arg3, arg4);
 }
 
 export function ProjectCurrent() {
@@ -130,8 +130,8 @@ export function ResetProviderField(arg1, arg2) {
   return window['go']['main']['App']['ResetProviderField'](arg1, arg2);
 }
 
-export function RespondPermission(arg1, arg2) {
-  return window['go']['main']['App']['RespondPermission'](arg1, arg2);
+export function RespondPermission(arg1, arg2, arg3) {
+  return window['go']['main']['App']['RespondPermission'](arg1, arg2, arg3);
 }
 
 export function RevertCode(arg1) {
@@ -146,8 +146,8 @@ export function SaveModel(arg1, arg2, arg3) {
   return window['go']['main']['App']['SaveModel'](arg1, arg2, arg3);
 }
 
-export function SaveProjectPermission(arg1, arg2) {
-  return window['go']['main']['App']['SaveProjectPermission'](arg1, arg2);
+export function SaveProjectPermission(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SaveProjectPermission'](arg1, arg2, arg3);
 }
 
 export function SessionArchive(arg1) {

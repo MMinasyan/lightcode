@@ -134,6 +134,26 @@ func TestHandleEventNotifications(t *testing.T) {
 	}
 }
 
+func TestHandleEventFiltersSession(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	r.setCurrentSessionID("session-a")
+	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "session-b", Result: "skip"})
+	if out.Len() != 0 {
+		t.Fatalf("wrong-session event was emitted: %q", out.String())
+	}
+	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "session-a", Result: "keep"})
+	lines := responseLines(t, out.String(), 1)
+	assertACPNotificationMethod(t, lines[0], "agent/message_chunk")
+
+	out.Reset()
+	r.setCurrentSessionID("")
+	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "session-a", Result: "skip"})
+	if out.Len() != 0 {
+		t.Fatalf("empty-current event was emitted: %q", out.String())
+	}
+}
+
 func TestHandleEventNotifiesUserMessageAndSystemSignal(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{out: &out}
@@ -231,7 +251,10 @@ func TestHandleEventTurnEndIncludesCancelled(t *testing.T) {
 
 func TestHandleEventCompactionEndPushesSessionChanged(t *testing.T) {
 	var out bytes.Buffer
-	r := &Runner{agent: newACPTestAgent(t), out: &out}
+	a := newACPTestAgent(t)
+	_ = appendACPUserTurn(t, a, "seed")
+	r := &Runner{agent: a, out: &out}
+	r.setCurrentSessionID(a.SessionCurrent().ID)
 
 	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, RefreshSession: true})
 
@@ -255,6 +278,7 @@ func TestHandleEventActiveCompactionDefersSessionChangedUntilTurnEnd(t *testing.
 	}
 	var out bytes.Buffer
 	r := &Runner{agent: a, out: &out}
+	r.setCurrentSessionID(a.SessionCurrent().ID)
 
 	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd})
 	lines := responseLines(t, out.String(), 1)
@@ -337,6 +361,7 @@ func TestHandleTurnActionACPRevertCodeReturnsResultWithoutSessionChanged(t *test
 	r := &Runner{agent: a, out: &out}
 
 	_ = appendACPUserTurn(t, a, "first")
+	r.setCurrentSessionID(a.SessionCurrent().ID)
 	path := filepath.Join(a.ProjectRoot(), "created.txt")
 	clickedTurn := appendACPUserTurnWithSnapshot(t, a, "create file", path, "created\n")
 
@@ -369,6 +394,7 @@ func TestHandleTurnActionACPRevertHistoryPropagatesAlsoRevertCode(t *testing.T) 
 	r := &Runner{agent: a, out: &out}
 
 	_ = appendACPUserTurn(t, a, "first")
+	r.setCurrentSessionID(a.SessionCurrent().ID)
 	path := filepath.Join(a.ProjectRoot(), "created.txt")
 	clickedTurn := appendACPUserTurnWithSnapshot(t, a, "create file", path, "created\n")
 	_ = appendACPUserTurn(t, a, "after")
@@ -403,6 +429,7 @@ func TestHandleTurnActionACPForkReturnsResultAndSessionChanged(t *testing.T) {
 	r := &Runner{agent: a, out: &out}
 
 	_ = appendACPUserTurn(t, a, "first")
+	r.setCurrentSessionID(a.SessionCurrent().ID)
 	clickedTurn := appendACPUserTurn(t, a, "fork point")
 	_ = appendACPUserTurn(t, a, "after")
 	beforeID := a.SessionCurrent().ID
@@ -462,6 +489,7 @@ func TestHandleSessionMessagesByIDDoesNotSwitchCurrentSession(t *testing.T) {
 
 	var out bytes.Buffer
 	r := &Runner{agent: a, out: &out}
+	r.setCurrentSessionID(currentID)
 	r.handleSessionMessages(Request{
 		JSONRPC: "2.0",
 		ID:      "messages-by-id",
@@ -499,11 +527,203 @@ func TestHandleSessionMessagesByIDDoesNotSwitchCurrentSession(t *testing.T) {
 	}
 }
 
+func TestACPPromptSelectsSession(t *testing.T) {
+	a := newACPTestAgent(t)
+	_ = appendACPUserTurn(t, a, "first")
+	firstID := a.SessionCurrent().ID
+	if firstID == "" {
+		t.Fatal("missing first session")
+	}
+	if err := a.SessionNew(); err != nil {
+		t.Fatalf("SessionNew: %v", err)
+	}
+	_ = appendACPUserTurn(t, a, "second")
+	secondID := a.SessionCurrent().ID
+	if secondID == "" || secondID == firstID {
+		t.Fatalf("second session id = %q, first = %q", secondID, firstID)
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: a, out: &out}
+	r.setCurrentSessionID(firstID)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.handleSessionPrompt(ctx, Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"hello"}`),
+	})
+	if got := r.currentSessionSummary().ID; got != secondID {
+		t.Fatalf("current session = %q, want %q", got, secondID)
+	}
+}
+
+func TestACPNewSetsCurrent(t *testing.T) {
+	a := newACPTestAgent(t)
+	var out bytes.Buffer
+	r := &Runner{agent: a, out: &out}
+	r.handleSessionNew(Request{JSONRPC: "2.0", ID: "new"})
+	if got := r.currentSessionSummary().ID; got == "" {
+		t.Fatal("new session did not set current")
+	}
+
+	out.Reset()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.handleSessionPrompt(ctx, Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"content":"hello"}`),
+	})
+	lines := responseLines(t, out.String(), 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("prompt response json: %v", err)
+	}
+	if resp.Error != nil && strings.Contains(resp.Error.Message, "no current session") {
+		t.Fatalf("prompt after new = %+v", resp.Error)
+	}
+}
+
+func TestACPStaleCurrent(t *testing.T) {
+	a := newACPTestAgent(t)
+	_ = appendACPUserTurn(t, a, "gone")
+	id := a.SessionCurrent().ID
+	if id == "" {
+		t.Fatal("missing session id")
+	}
+	if _, err := a.SessionDelete(id); err != nil {
+		t.Fatalf("SessionDelete: %v", err)
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: a, out: &out}
+	r.setCurrentSessionID(id)
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "current", Method: "session/current"})
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "messages", Method: "session/messages"})
+
+	lines := responseLines(t, out.String(), 2)
+	var current Response
+	if err := json.Unmarshal([]byte(lines[0]), &current); err != nil {
+		t.Fatalf("current json: %v", err)
+	}
+	data, err := json.Marshal(current.Result)
+	if err != nil {
+		t.Fatalf("current marshal: %v", err)
+	}
+	var summary agent.SessionSummary
+	if err := json.Unmarshal(data, &summary); err != nil {
+		t.Fatalf("current result json: %v", err)
+	}
+	if summary.ID != "" {
+		t.Fatalf("stale current id = %q, want empty", summary.ID)
+	}
+
+	var messages Response
+	if err := json.Unmarshal([]byte(lines[1]), &messages); err != nil {
+		t.Fatalf("messages json: %v", err)
+	}
+	if messages.Error == nil {
+		t.Fatalf("stale current messages response = %+v, want error", messages)
+	}
+}
+
+func TestACPStaleEvent(t *testing.T) {
+	a := newACPTestAgent(t)
+	_ = appendACPUserTurn(t, a, "gone")
+	id := a.SessionCurrent().ID
+	if id == "" {
+		t.Fatal("missing session id")
+	}
+	if _, err := a.SessionDelete(id); err != nil {
+		t.Fatalf("SessionDelete: %v", err)
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: a, out: &out}
+	r.setCurrentSessionID(id)
+	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: id, Result: "skip"})
+	if out.Len() != 0 {
+		t.Fatalf("stale event was emitted: %q", out.String())
+	}
+	if got := r.currentSessionSummary().ID; got != "" {
+		t.Fatalf("stale current id = %q, want empty", got)
+	}
+}
+
+func TestACPClearRemovedCurrent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*Runner, Request)
+	}{
+		{name: "archive", run: func(r *Runner, req Request) { r.handleSessionArchive(req) }},
+		{name: "delete", run: func(r *Runner, req Request) { r.handleSessionDelete(req) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newACPTestAgent(t)
+			firstID, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("NewSession first: %v", err)
+			}
+			if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
+				t.Fatalf("append first: %v", err)
+			}
+			secondID, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("NewSession second: %v", err)
+			}
+			if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+				t.Fatalf("append second: %v", err)
+			}
+
+			var out bytes.Buffer
+			r := &Runner{agent: a, out: &out}
+			r.setCurrentSessionID(firstID)
+			tc.run(r, Request{
+				JSONRPC: "2.0",
+				ID:      tc.name,
+				Params:  json.RawMessage(`{"id":"` + firstID + `"}`),
+			})
+			if got := r.currentSessionSummary().ID; got != "" {
+				t.Fatalf("current after %s = %q, want empty", tc.name, got)
+			}
+			out.Reset()
+			r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "snapshots", Method: "snapshot/list"})
+			lines := responseLines(t, out.String(), 1)
+			var snapshots Response
+			if err := json.Unmarshal([]byte(lines[0]), &snapshots); err != nil {
+				t.Fatalf("snapshot response json: %v", err)
+			}
+			if snapshots.Error == nil {
+				t.Fatalf("%s snapshot/list response = %+v, want error", tc.name, snapshots)
+			}
+			out.Reset()
+			r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "compact", Method: "compact"})
+			lines = responseLines(t, out.String(), 1)
+			var compact Response
+			if err := json.Unmarshal([]byte(lines[0]), &compact); err != nil {
+				t.Fatalf("compact response json: %v", err)
+			}
+			if compact.Error == nil {
+				t.Fatalf("%s compact response = %+v, want error", tc.name, compact)
+			}
+			out.Reset()
+			r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: firstID, Result: "skip"})
+			if strings.Contains(out.String(), "skip") {
+				t.Fatalf("%s left old session event visible: %q", tc.name, out.String())
+			}
+			if current := a.SessionCurrent().ID; current != secondID {
+				t.Fatalf("backend current after %s = %q, want %q", tc.name, current, secondID)
+			}
+		})
+	}
+}
+
 func TestACPHandlersUseSharedTurnActionContract(t *testing.T) {
 	src := mustReadACPSource(t)
 	helper := extractSourceFunc(t, src, "func (r *Runner) handleTurnAction(")
-	if !strings.Contains(helper, ".ApplyTurnAction(") {
-		t.Fatal("handleTurnAction must call ApplyTurnAction")
+	if !strings.Contains(helper, ".ApplyTurnActionForSession(") {
+		t.Fatal("handleTurnAction must call ApplyTurnActionForSession")
 	}
 	for _, forbidden := range []string{".ForkSession(", ".RevertCode(", ".RevertHistory("} {
 		if strings.Contains(helper, forbidden) {

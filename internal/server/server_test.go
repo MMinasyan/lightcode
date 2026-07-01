@@ -50,10 +50,63 @@ func TestAuthMiddleware(t *testing.T) {
 	}
 }
 
+func TestHTTPRequiresSessionID(t *testing.T) {
+	s := &Server{agent: newServerTestAgent(t), hub: newSSEHub()}
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		call   func(http.ResponseWriter, *http.Request)
+	}{
+		{name: "prompt", method: http.MethodPost, path: "/v1/prompt", body: `{"content":"hi"}`, call: s.handlePrompt},
+		{name: "current", method: http.MethodGet, path: "/v1/session", call: s.handleSessionCurrent},
+		{name: "queue", method: http.MethodGet, path: "/v1/queue", call: s.handleQueue},
+		{name: "cancel", method: http.MethodPost, path: "/v1/cancel", call: s.handleCancel},
+		{name: "compact", method: http.MethodPost, path: "/v1/compact", call: s.handleCompact},
+		{name: "snapshots", method: http.MethodGet, path: "/v1/snapshots", call: s.handleSnapshots},
+		{name: "model", method: http.MethodGet, path: "/v1/model", call: s.handleModelCurrent},
+		{name: "tokens", method: http.MethodGet, path: "/v1/tokens", call: s.handleTokens},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			tc.call(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s; want 400", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestHTTPCurrentByID(t *testing.T) {
+	a := newServerTestAgent(t)
+	id, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	s := &Server{agent: a, hub: newSSEHub()}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/session?session_id="+id, nil)
+	s.handleSessionCurrent(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s; want 200", rec.Code, rec.Body.String())
+	}
+	var summary agent.SessionSummary
+	if err := json.Unmarshal(rec.Body.Bytes(), &summary); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if summary.ID != id {
+		t.Fatalf("session id = %q, want %q", summary.ID, id)
+	}
+}
+
 func TestSSEHubSubscribeBroadcastUnsubscribe(t *testing.T) {
 	hub := newSSEHub()
-	ch1, unsub1 := hub.subscribe()
-	ch2, unsub2 := hub.subscribe()
+	ch1, unsub1 := hub.subscribe("")
+	ch2, unsub2 := hub.subscribe("")
 	hub.broadcast("message_chunk", map[string]any{"content": "hi"})
 	for i, ch := range []<-chan []byte{ch1, ch2} {
 		select {
@@ -78,9 +131,29 @@ func TestSSEHubSubscribeBroadcastUnsubscribe(t *testing.T) {
 	unsub2()
 }
 
+func TestSSEHubSessionFilter(t *testing.T) {
+	hub := newSSEHub()
+	sessionA, unsubA := hub.subscribe("session-a")
+	defer unsubA()
+	sessionB, unsubB := hub.subscribe("session-b")
+	defer unsubB()
+	global, unsubGlobal := hub.subscribe("")
+	defer unsubGlobal()
+
+	hub.broadcastForSession("session-a", "message_chunk", map[string]any{"content": "owned"})
+	assertSSEEvent(t, sessionA, "message_chunk")
+	assertNoSSEMessage(t, sessionB)
+	assertNoSSEMessage(t, global)
+
+	hub.broadcast("warnings", []agent.PromptWarning{{Kind: "test", Message: "global"}})
+	assertSSEEvent(t, sessionA, "warnings")
+	assertSSEEvent(t, sessionB, "warnings")
+	assertSSEEvent(t, global, "warnings")
+}
+
 func TestSSEHubDropsForFullClientWithoutBlocking(t *testing.T) {
 	hub := newSSEHub()
-	ch, unsub := hub.subscribe()
+	ch, unsub := hub.subscribe("")
 	defer unsub()
 	for i := 0; i < 64; i++ {
 		hub.broadcast("event", map[string]any{"n": i})
@@ -98,7 +171,7 @@ func TestSSEHubDropsForFullClientWithoutBlocking(t *testing.T) {
 
 func TestSSEHubBroadcastDoesNotHoldHubLockDuringFanout(t *testing.T) {
 	hub := newSSEHub()
-	_, unsub := hub.subscribe()
+	_, unsub := hub.subscribe("")
 	defer unsub()
 
 	hub.mu.Lock()
@@ -122,7 +195,7 @@ func TestSSEHubBroadcastDoesNotHoldHubLockDuringFanout(t *testing.T) {
 
 	subscribeDone := make(chan func(), 1)
 	go func() {
-		_, unsubscribe := hub.subscribe()
+		_, unsubscribe := hub.subscribe("")
 		subscribeDone <- unsubscribe
 	}()
 
@@ -145,7 +218,7 @@ func TestSSEHubBroadcastDoesNotHoldHubLockDuringFanout(t *testing.T) {
 func TestSSEHubConcurrentBroadcastUnsubscribeNoPanic(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		hub := newSSEHub()
-		_, unsubscribe := hub.subscribe()
+		_, unsubscribe := hub.subscribe("")
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
@@ -211,7 +284,7 @@ func TestSSEDisconnectCleanup(t *testing.T) {
 
 func TestHandleEventBroadcastsAndSkipsSubagents(t *testing.T) {
 	hub := newSSEHub()
-	ch, unsub := hub.subscribe()
+	ch, unsub := hub.subscribe("")
 	defer unsub()
 	s := &Server{hub: hub}
 	s.handleEvent(agent.Event{Kind: agent.EventTextDelta, Result: "hello"})
@@ -282,9 +355,22 @@ func TestHandleEventBroadcastsAndSkipsSubagents(t *testing.T) {
 	}
 }
 
+func TestHandleEventSessionFilter(t *testing.T) {
+	hub := newSSEHub()
+	sessionA, unsubA := hub.subscribe("session-a")
+	defer unsubA()
+	sessionB, unsubB := hub.subscribe("session-b")
+	defer unsubB()
+	s := &Server{hub: hub}
+
+	s.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "session-a", Result: "hello"})
+	assertSSEEvent(t, sessionA, "message_chunk")
+	assertNoSSEMessage(t, sessionB)
+}
+
 func TestHandleEventBroadcastsUserMessageAndSystemSignal(t *testing.T) {
 	hub := newSSEHub()
-	ch, unsub := hub.subscribe()
+	ch, unsub := hub.subscribe("")
 	defer unsub()
 	s := &Server{hub: hub}
 
@@ -313,7 +399,7 @@ func TestHandleEventBroadcastsUserMessageAndSystemSignal(t *testing.T) {
 
 func TestHandleEventQueueChangedBroadcasts(t *testing.T) {
 	hub := newSSEHub()
-	ch, unsub := hub.subscribe()
+	ch, unsub := hub.subscribe("")
 	defer unsub()
 	s := &Server{hub: hub}
 
@@ -346,7 +432,7 @@ func TestHandleEventQueueChangedBroadcasts(t *testing.T) {
 
 func TestHandleEventTurnEndIncludesCancelled(t *testing.T) {
 	hub := newSSEHub()
-	ch, unsub := hub.subscribe()
+	ch, unsub := hub.subscribe("")
 	defer unsub()
 	s := &Server{hub: hub}
 
@@ -376,7 +462,7 @@ func TestHandleEventTurnEndIncludesCancelled(t *testing.T) {
 func TestHandleEventCompactionEndBroadcastsSessionChanged(t *testing.T) {
 	a := newServerTestAgent(t)
 	s := &Server{agent: a, hub: newSSEHub()}
-	ch, unsub := s.hub.subscribe()
+	ch, unsub := s.hub.subscribe("")
 	defer unsub()
 
 	s.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, RefreshSession: true})
@@ -403,7 +489,7 @@ func TestHandleEventActiveCompactionRefreshesSessionAfterTurnEnd(t *testing.T) {
 		}
 	}
 	s := &Server{agent: a, hub: newSSEHub()}
-	ch, unsub := s.hub.subscribe()
+	ch, unsub := s.hub.subscribe("")
 	defer unsub()
 
 	s.handleEvent(agent.Event{Kind: agent.EventCompactionEnd})
@@ -437,15 +523,16 @@ func TestHandleEventActiveCompactionRefreshesSessionAfterTurnEnd(t *testing.T) {
 func TestHandleTurnActionRevertCodeReturnsResultWithoutSessionChanged(t *testing.T) {
 	a := newServerTestAgent(t)
 	s := &Server{agent: a, hub: newSSEHub()}
-	ch, unsub := s.hub.subscribe()
+	ch, unsub := s.hub.subscribe("")
 	defer unsub()
 
 	_ = appendServerUserTurn(t, a, "first")
 	path := filepath.Join(a.ProjectRoot(), "created.txt")
 	clickedTurn := appendServerUserTurnWithSnapshot(t, a, "create file", path, "created\n")
+	sessionID := a.SessionCurrent().ID
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/revert/code", strings.NewReader(`{"turn":`+itoa(clickedTurn)+`}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/revert/code", strings.NewReader(`{"session_id":`+strconv.Quote(sessionID)+`,"turn":`+itoa(clickedTurn)+`}`))
 	s.handleRevertCode(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -467,19 +554,54 @@ func TestHandleTurnActionRevertCodeReturnsResultWithoutSessionChanged(t *testing
 	assertNoSSEMessage(t, ch)
 }
 
+func TestHandleSnapshotsByID(t *testing.T) {
+	a := newServerTestAgent(t)
+	s := &Server{agent: a, hub: newSSEHub()}
+
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	path := filepath.Join(a.ProjectRoot(), "first.txt")
+	firstTurn := appendServerUserTurnWithSnapshot(t, a, "first snapshot", path, "first\n")
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	if current := a.SessionCurrent().ID; current != secondID {
+		t.Fatalf("current session = %q, want %q", current, secondID)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/snapshots?session_id="+firstID, nil)
+	s.handleSnapshots(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var snapshots []agent.Snapshot
+	if err := json.NewDecoder(rec.Body).Decode(&snapshots); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(snapshots) != 1 || snapshots[0].Turn != firstTurn {
+		t.Fatalf("snapshots = %#v, want first turn %d", snapshots, firstTurn)
+	}
+}
+
 func TestHandleTurnActionRevertHistoryReturnsResultAndSessionChanged(t *testing.T) {
 	a := newServerTestAgent(t)
 	s := &Server{agent: a, hub: newSSEHub()}
-	ch, unsub := s.hub.subscribe()
+	ch, unsub := s.hub.subscribe("")
 	defer unsub()
 
 	_ = appendServerUserTurn(t, a, "first")
 	path := filepath.Join(a.ProjectRoot(), "created.txt")
 	clickedTurn := appendServerUserTurnWithSnapshot(t, a, "create file", path, "created\n")
 	_ = appendServerUserTurn(t, a, "after")
+	sessionID := a.SessionCurrent().ID
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/revert/history", strings.NewReader(`{"turn":`+itoa(clickedTurn)+`,"alsoRevertCode":true}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/revert/history", strings.NewReader(`{"session_id":`+strconv.Quote(sessionID)+`,"turn":`+itoa(clickedTurn)+`,"alsoRevertCode":true}`))
 	s.handleRevertHistory(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -504,7 +626,7 @@ func TestHandleTurnActionRevertHistoryReturnsResultAndSessionChanged(t *testing.
 func TestHandleTurnActionForkReturnsResultAndSessionChanged(t *testing.T) {
 	a := newServerTestAgent(t)
 	s := &Server{agent: a, hub: newSSEHub()}
-	ch, unsub := s.hub.subscribe()
+	ch, unsub := s.hub.subscribe("")
 	defer unsub()
 
 	_ = appendServerUserTurn(t, a, "first")
@@ -513,7 +635,7 @@ func TestHandleTurnActionForkReturnsResultAndSessionChanged(t *testing.T) {
 	beforeID := a.SessionCurrent().ID
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/session/fork", strings.NewReader(`{"turn":`+itoa(clickedTurn)+`}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/fork", strings.NewReader(`{"session_id":`+strconv.Quote(beforeID)+`,"turn":`+itoa(clickedTurn)+`}`))
 	s.handleSessionFork(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -540,9 +662,10 @@ func TestHandleTurnActionForkPropagatesAlsoRevertCode(t *testing.T) {
 	clickedTurn := appendServerUserTurn(t, a, "fork point")
 	path := filepath.Join(a.ProjectRoot(), "created-after-fork.txt")
 	_ = appendServerUserTurnWithSnapshot(t, a, "create after fork", path, "later\n")
+	sessionID := a.SessionCurrent().ID
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/session/fork", strings.NewReader(`{"turn":`+itoa(clickedTurn)+`,"alsoRevertCode":true}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/fork", strings.NewReader(`{"session_id":`+strconv.Quote(sessionID)+`,"turn":`+itoa(clickedTurn)+`,"alsoRevertCode":true}`))
 	s.handleSessionFork(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -645,7 +768,7 @@ func TestHandlePermissionSaveFailureKeepsTimerAndPendingRequest(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	body := `{"id":` + strconv.Quote(permReq.ID) + `,"patterns":["apply_patch(/allowed.txt)"]}`
+	body := `{"session_id":` + strconv.Quote(permReq.SessionID) + `,"id":` + strconv.Quote(permReq.ID) + `,"patterns":["apply_patch(/allowed.txt)"]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/permission/save", strings.NewReader(body))
 	s.handlePermissionSave(rec, req)
 	if rec.Code != http.StatusInternalServerError {
@@ -660,7 +783,7 @@ func TestHandlePermissionSaveFailureKeepsTimerAndPendingRequest(t *testing.T) {
 	}
 
 	s.cancelPermissionTimer(permReq.ID)
-	if err := a.RespondPermission(permReq.ID, false); err != nil {
+	if err := a.RespondPermissionForSession(permReq.SessionID, permReq.ID, false); err != nil {
 		t.Fatalf("RespondPermission after rejected save: %v", err)
 	}
 	select {
@@ -713,7 +836,7 @@ func TestHandlePermissionResponseFailureKeepsTimerAndPendingRequest(t *testing.T
 
 	permReq := waitServerPermissionRequest(t, events)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/permission/"+permReq.ID, strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/permission/"+permReq.ID, strings.NewReader(`{"session_id":`+strconv.Quote(permReq.SessionID)+`}`))
 	s.handlePermission(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("missing action status = %d, body = %s; want 400", rec.Code, rec.Body.String())
@@ -721,7 +844,7 @@ func TestHandlePermissionResponseFailureKeepsTimerAndPendingRequest(t *testing.T
 	assertServerPermissionTimerPending(t, s, permReq.ID)
 
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/v1/permission/"+permReq.ID, strings.NewReader(`{"action":"bogus"}`))
+	req = httptest.NewRequest(http.MethodPost, "/v1/permission/"+permReq.ID, strings.NewReader(`{"session_id":`+strconv.Quote(permReq.SessionID)+`,"action":"bogus"}`))
 	s.handlePermission(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("invalid action status = %d, body = %s; want 404", rec.Code, rec.Body.String())
@@ -729,7 +852,7 @@ func TestHandlePermissionResponseFailureKeepsTimerAndPendingRequest(t *testing.T
 	assertServerPermissionTimerPending(t, s, permReq.ID)
 
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/v1/permission/"+permReq.ID, strings.NewReader(`{"action":"deny"}`))
+	req = httptest.NewRequest(http.MethodPost, "/v1/permission/"+permReq.ID, strings.NewReader(`{"session_id":`+strconv.Quote(permReq.SessionID)+`,"action":"deny"}`))
 	s.handlePermission(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("deny status = %d, body = %s; want 200", rec.Code, rec.Body.String())
@@ -789,23 +912,16 @@ func TestHandleSessionMessagesByIDDoesNotSwitchCurrentSession(t *testing.T) {
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/v1/session/messages", nil)
 	s.handleSessionMessages(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("current status = %d, body = %s", rec.Code, rec.Body.String())
-	}
-	msgs = nil
-	if err := json.NewDecoder(rec.Body).Decode(&msgs); err != nil {
-		t.Fatalf("decode current messages: %v", err)
-	}
-	if got := userMessageContents(msgs); !equalStringSlices(got, []string{"second session"}) {
-		t.Fatalf("current messages = %q", got)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing session_id status = %d, body = %s; want 400", rec.Code, rec.Body.String())
 	}
 }
 
 func TestHTTPHandlersUseSharedTurnActionContract(t *testing.T) {
 	src := mustReadServerSource(t)
 	helper := extractSourceFunc(t, src, "func (s *Server) handleTurnAction(")
-	if !strings.Contains(helper, ".ApplyTurnAction(") {
-		t.Fatal("handleTurnAction must call ApplyTurnAction")
+	if !strings.Contains(helper, ".ApplyTurnActionForSession(") {
+		t.Fatal("handleTurnAction must call ApplyTurnActionForSession")
 	}
 	for _, forbidden := range []string{".ForkSession(", ".RevertCode(", ".RevertHistory("} {
 		if strings.Contains(helper, forbidden) {

@@ -42,7 +42,7 @@ export function GetRuntimeConfig():Promise<agent.RuntimeConfigSettings>;
 
 export function ModelList():Promise<Array<agent.ModelListEntry>>;
 
-export function PermissionSuggest(arg1:string,arg2:string):Promise<Array<permission.Suggestion>>;
+export function PermissionSuggest(arg1:string,arg2:string,arg3:string,arg4:string):Promise<Array<permission.Suggestion>>;
 
 export function ProjectCurrent():Promise<agent.ProjectSummary>;
 
@@ -68,7 +68,7 @@ export function ResetModelField(arg1:string,arg2:string,arg3:string):Promise<voi
 
 export function ResetProviderField(arg1:string,arg2:string):Promise<void>;
 
-export function RespondPermission(arg1:string,arg2:string):Promise<void>;
+export function RespondPermission(arg1:string,arg2:string,arg3:string):Promise<void>;
 
 export function RevertCode(arg1:number):Promise<snapshot.RevertResult>;
 
@@ -76,7 +76,7 @@ export function RevertHistory(arg1:number):Promise<void>;
 
 export function SaveModel(arg1:string,arg2:string,arg3:agent.ModelConfigInput):Promise<void>;
 
-export function SaveProjectPermission(arg1:string,arg2:Array<string>):Promise<void>;
+export function SaveProjectPermission(arg1:string,arg2:string,arg3:Array<string>):Promise<void>;
 
 export function SessionArchive(arg1:string):Promise<void>;
 

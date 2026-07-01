@@ -37,11 +37,12 @@ type taskResult struct {
 }
 
 type TaggedLoopEvent struct {
-	SessionID  string
-	ProjectID  string
-	TaskIndex  int
-	ToolCallID string
-	Event      loop.Event
+	SessionID       string
+	ParentSessionID string
+	ProjectID       string
+	TaskIndex       int
+	ToolCallID      string
+	Event           loop.Event
 }
 
 type taskTool struct {
@@ -403,7 +404,7 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		forwardDone = make(chan struct{})
 		go func() {
 			defer close(forwardDone)
-			t.forwardEvents(events, index, sessionID, t.projectID, parentToolCallID)
+			t.forwardEvents(events, index, sessionID, parentSessionID, t.projectID, parentToolCallID)
 		}()
 	}
 	finish := func(result taskResult) taskResult {
@@ -778,15 +779,16 @@ func (t *taskTool) resolveClient(modelRef string) (*provider.Client, coremodel.M
 	return client, ref, nil
 }
 
-func (t *taskTool) forwardEvents(ch <-chan loop.Event, taskIndex int, sessionID, projectID, toolCallID string) {
+func (t *taskTool) forwardEvents(ch <-chan loop.Event, taskIndex int, sessionID, parentSessionID, projectID, toolCallID string) {
 	for ev := range ch {
 		if t.taggedEvents != nil {
 			t.taggedEvents <- TaggedLoopEvent{
-				SessionID:  sessionID,
-				ProjectID:  projectID,
-				TaskIndex:  taskIndex,
-				ToolCallID: toolCallID,
-				Event:      ev,
+				SessionID:       sessionID,
+				ParentSessionID: parentSessionID,
+				ProjectID:       projectID,
+				TaskIndex:       taskIndex,
+				ToolCallID:      toolCallID,
+				Event:           ev,
 			}
 		}
 	}

@@ -89,6 +89,7 @@ type session struct {
 // Agent is the shared service facade used by all adapters (Wails, HTTP, ACP).
 type Agent struct {
 	*session
+	rt *runtime
 
 	cfg      *config.Config
 	agents   *agentcfg.Config
@@ -141,21 +142,43 @@ type loopSignalSink struct {
 }
 
 func (s loopSignalSink) AddSignal(signal loop.PendingSignal) {
-	if s.agent == nil || s.agent.lp == nil {
+	if s.agent == nil {
 		return
 	}
-	s.agent.lp.AddPendingSignal(signal)
+	rt := s.agent.ensureRuntime()
+	rt.mu.Lock()
+	unit := rt.sessionLocked()
+	if unit == nil || unit.lp == nil {
+		rt.mu.Unlock()
+		return
+	}
+	unit.lp.AddPendingSignal(signal)
+	rt.mu.Unlock()
 	if signal.Wake {
-		s.agent.ensureRuntime().nudgeSignalScheduler()
+		rt.nudgeSignalScheduler()
 	}
 }
 
 func (s loopSignalSink) HasWakeSignal() bool {
-	return s.agent != nil && s.agent.lp != nil && s.agent.lp.HasPendingWakeSignal()
+	if s.agent == nil {
+		return false
+	}
+	rt := s.agent.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	unit := rt.sessionLocked()
+	return unit != nil && unit.lp != nil && unit.lp.HasPendingWakeSignal()
 }
 
 func (s loopSignalSink) HasSignal() bool {
-	return s.agent != nil && s.agent.lp != nil && s.agent.lp.HasPendingSignal()
+	if s.agent == nil {
+		return false
+	}
+	rt := s.agent.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	unit := rt.sessionLocked()
+	return unit != nil && unit.lp != nil && unit.lp.HasPendingSignal()
 }
 
 type agentMemoryHooks interface {
@@ -291,8 +314,11 @@ func (a *Agent) registerLiveSessionLocked(unit *session) {
 func (a *Agent) setCurrentSessionLocked(unit *session) {
 	if unit == nil {
 		a.currentSessionID = ""
-		a.session = &session{}
+		a.session = &session{rt: a.rt}
 		return
+	}
+	if unit.rt == nil {
+		unit.rt = a.rt
 	}
 	a.session = unit
 	a.currentSessionID = sessionIDOf(unit)
@@ -652,37 +678,43 @@ func New(c Config) (*Agent, error) {
 		return a.store.SessionID()
 	})
 	procMgr.SetExitHandler(func(event process.ExitEvent) {
-		if a.lp != nil {
-			a.ensureRuntime().mu.Lock()
-			defer a.ensureRuntime().mu.Unlock()
-			if event.SessionID != "" && a.store.SessionID() != event.SessionID {
-				return
-			}
-			output := ""
-			if event.FormatOutput != nil {
-				output = event.FormatOutput()
-			}
-			if output == "" {
-				output = "(No output)"
-			}
-			reason := event.Reason
-			if reason == "" {
-				reason = process.ExitReasonCompleted
-			}
-			payload := backgroundTerminalPayload(event, output)
-			a.ensureRuntime().signalSink.AddSignal(loop.PendingSignal{
-				Payload: payload,
-				Wake:    true,
-				Persist: true,
-				BackgroundProcess: &loop.BackgroundProcessDisplay{
-					ID:       event.ID,
-					Command:  event.Command,
-					Reason:   string(reason),
-					ExitCode: event.ExitCode,
-					Output:   output,
-				},
-			})
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := rt.sessionLocked()
+		if unit == nil || unit.lp == nil {
+			rt.mu.Unlock()
+			return
 		}
+		if event.SessionID != "" && sessionIDOf(unit) != event.SessionID {
+			rt.mu.Unlock()
+			return
+		}
+		output := ""
+		if event.FormatOutput != nil {
+			output = event.FormatOutput()
+		}
+		if output == "" {
+			output = "(No output)"
+		}
+		reason := event.Reason
+		if reason == "" {
+			reason = process.ExitReasonCompleted
+		}
+		payload := backgroundTerminalPayload(event, output)
+		unit.lp.AddPendingSignal(loop.PendingSignal{
+			Payload: payload,
+			Wake:    true,
+			Persist: true,
+			BackgroundProcess: &loop.BackgroundProcessDisplay{
+				ID:       event.ID,
+				Command:  event.Command,
+				Reason:   string(reason),
+				ExitCode: event.ExitCode,
+				Output:   output,
+			},
+		})
+		rt.mu.Unlock()
+		rt.nudgeSignalScheduler()
 	})
 
 	// Re-create RunCommand with the process manager.
@@ -917,12 +949,12 @@ func (rt *runtime) tryStartSignalTurn(ctx context.Context) {
 		return
 	}
 	rt.mu.Lock()
-	unit := rt.session()
+	unit := rt.sessionLocked()
 	// Queued user input takes priority over a bare signal turn, and a session
 	// change in flight must block it. The gate and the busy-claim share one
 	// lock hold so nothing can slip a signal turn in between (claimTurnLocked
 	// is called while still holding the runtime mutex).
-	if unit.busy || unit.transitioning || len(unit.queue) > 0 || unit.store == nil || !unit.store.Active() || !rt.signalSink.HasWakeSignal() {
+	if unit.busy || unit.transitioning || len(unit.queue) > 0 || unit.store == nil || !unit.store.Active() || unit.lp == nil || !unit.lp.HasPendingWakeSignal() {
 		rt.mu.Unlock()
 		return
 	}
@@ -1221,17 +1253,19 @@ func (a *Agent) dispatchTaggedEvent(tev TaggedLoopEvent) {
 func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 	a := rt.agent
 	rt.mu.Lock()
-	if rt.session().seenSessions == nil {
-		rt.session().seenSessions = make(map[string]bool)
+	unit := rt.sessionLocked()
+	if unit.seenSessions == nil {
+		unit.seenSessions = make(map[string]bool)
 	}
-	isNew := tev.SessionID != "" && !rt.session().seenSessions[tev.SessionID]
+	isNew := tev.SessionID != "" && !unit.seenSessions[tev.SessionID]
 	if isNew {
-		rt.session().seenSessions[tev.SessionID] = true
+		unit.seenSessions[tev.SessionID] = true
 	}
 	rt.mu.Unlock()
 	if isNew {
 		a.emitEvent(Event{
 			SessionID:         tev.SessionID,
+			ParentSessionID:   tev.ParentSessionID,
 			ProjectID:         tev.ProjectID,
 			Kind:              EventSubagentStart,
 			SubagentSessionID: tev.SessionID,
@@ -1247,6 +1281,7 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 	}
 	base := Event{
 		SessionID:         tev.SessionID,
+		ParentSessionID:   tev.ParentSessionID,
 		ProjectID:         projectID,
 		SubagentSessionID: tev.SessionID,
 		TaskIndex:         tev.TaskIndex,
@@ -1590,7 +1625,12 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 }
 
 func (rt *runtime) deferSessionRefreshAfterTurn() {
-	rt.deferSessionRefreshAfterTurnForSession(rt.session())
+	rt.mu.Lock()
+	unit := rt.sessionLocked()
+	if unit != nil {
+		unit.sessionRefreshAfterTurn = true
+	}
+	rt.mu.Unlock()
 }
 
 func (rt *runtime) deferSessionRefreshAfterTurnForSession(unit *session) {
@@ -1602,7 +1642,15 @@ func (rt *runtime) deferSessionRefreshAfterTurnForSession(unit *session) {
 }
 
 func (rt *runtime) takeDeferredSessionRefreshAfterTurn() bool {
-	return rt.takeDeferredSessionRefreshAfterTurnForSession(rt.session())
+	rt.mu.Lock()
+	unit := rt.sessionLocked()
+	refresh := false
+	if unit != nil {
+		refresh = unit.sessionRefreshAfterTurn
+		unit.sessionRefreshAfterTurn = false
+	}
+	rt.mu.Unlock()
+	return refresh
 }
 
 func (rt *runtime) takeDeferredSessionRefreshAfterTurnForSession(unit *session) bool {
@@ -1711,10 +1759,48 @@ func (a *Agent) CompactNow(ctx context.Context) error {
 	return a.ensureRuntime().compactNow(ctx)
 }
 
+func (a *Agent) CompactNowForSession(ctx context.Context, sessionID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	unit, err := a.liveSessionLocked(sessionID)
+	if err != nil {
+		rt.mu.Unlock()
+		return err
+	}
+	if unit.busy {
+		rt.mu.Unlock()
+		return fmt.Errorf("cannot compact while a turn is running")
+	}
+	unit.busy = true
+	compactCtx, cancel := context.WithCancel(ctx)
+	unit.turnCancel = cancel
+	unit.turnCtx = compactCtx
+	rt.mu.Unlock()
+
+	defer func() {
+		rt.mu.Lock()
+		unit.busy = false
+		unit.turnCancel = nil
+		unit.turnCtx = nil
+		rt.mu.Unlock()
+		cancel()
+		rt.nudgeQueueDrainer()
+		if rt.signalSink != nil && rt.signalSink.HasWakeSignal() {
+			rt.nudgeSignalScheduler()
+		}
+	}()
+
+	return a.runCompactionForSession(compactCtx, unit, false)
+}
+
 func (rt *runtime) compactNow(ctx context.Context) error {
 	a := rt.agent
 	rt.mu.Lock()
-	if rt.session().busy {
+	unit := rt.sessionLocked()
+	if unit.busy {
 		rt.mu.Unlock()
 		return fmt.Errorf("cannot compact while a turn is running")
 	}
@@ -1722,17 +1808,17 @@ func (rt *runtime) compactNow(ctx context.Context) error {
 		rt.mu.Unlock()
 		return fmt.Errorf("no session open")
 	}
-	rt.session().busy = true
+	unit.busy = true
 	compactCtx, cancel := context.WithCancel(ctx)
-	rt.session().turnCancel = cancel
-	rt.session().turnCtx = compactCtx
+	unit.turnCancel = cancel
+	unit.turnCtx = compactCtx
 	rt.mu.Unlock()
 
 	defer func() {
 		rt.mu.Lock()
-		rt.session().busy = false
-		rt.session().turnCancel = nil
-		rt.session().turnCtx = nil
+		unit.busy = false
+		unit.turnCancel = nil
+		unit.turnCtx = nil
 		rt.mu.Unlock()
 		cancel()
 		// Manual compaction uses the same busy gate as a turn. If input was
@@ -1763,8 +1849,11 @@ func (a *Agent) resumeMostRecent() error {
 	if err := a.store.LoadSession(id); err != nil {
 		return err
 	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
 	a.setSessionProject(a.session, proj)
 	a.setCurrentSessionLocked(a.session)
+	rt.mu.Unlock()
 	if err := a.loadHistoryIntoLoop(); err != nil {
 		return err
 	}
@@ -1774,15 +1863,15 @@ func (a *Agent) resumeMostRecent() error {
 	// writes publish atomically with respect to the signal scheduler and queue
 	// drainer started at construction (which read currentRef under the lock),
 	// mirroring SessionSwitch. restoreModelFromSession never re-acquires rt.mu.
-	a.ensureRuntime().mu.Lock()
+	rt.mu.Lock()
 	if err := a.reloadLocked(); err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: reload config on resume: %v\n", err)
 		a.restoreModelFromSession()
-		a.ensureRuntime().mu.Unlock()
+		rt.mu.Unlock()
 		return nil
 	}
 	a.restoreModelFromSession()
-	a.ensureRuntime().mu.Unlock()
+	rt.mu.Unlock()
 	return nil
 }
 
@@ -2244,7 +2333,7 @@ func copyQueue(items []QueuedItem) []QueuedItem {
 // the monotonic version when the queue was non-empty. Caller holds the runtime mutex.
 // Returns the empty snapshot, its version, and whether the queue changed.
 func (rt *runtime) clearQueueLocked() ([]QueuedItem, int, bool) {
-	return rt.clearQueueLockedForSession(rt.session())
+	return rt.clearQueueLockedForSession(rt.sessionLocked())
 }
 
 func (rt *runtime) clearQueueLockedForSession(unit *session) ([]QueuedItem, int, bool) {
@@ -2267,7 +2356,7 @@ func (rt *runtime) clearQueueLockedForSession(unit *session) ([]QueuedItem, int,
 // even on the pre-lock error return.
 func (rt *runtime) beginTransition() {
 	rt.mu.Lock()
-	rt.session().transitioning = true
+	rt.sessionLocked().transitioning = true
 	rt.mu.Unlock()
 }
 
@@ -2280,7 +2369,7 @@ func (rt *runtime) beginTransition() {
 func (rt *runtime) endTransition() {
 	a := rt.agent
 	rt.mu.Lock()
-	unit := rt.session()
+	unit := rt.sessionLocked()
 	unit.transitioning = false
 	items := copyQueue(unit.queue)
 	version := unit.queueVersion
@@ -2369,7 +2458,7 @@ func (rt *runtime) nextDrainableSessionLocked() *session {
 	if rt == nil || rt.agent == nil {
 		return nil
 	}
-	if unit := rt.session(); drainableSession(unit) {
+	if unit := rt.sessionLocked(); drainableSession(unit) {
 		return unit
 	}
 	for _, unit := range rt.agent.sessions {
@@ -2937,11 +3026,13 @@ func (a *Agent) refreshDiscoveryLocked(provider string) error {
 
 // CurrentModel returns the active model identity and catalog metadata.
 func (a *Agent) CurrentModel() ModelInfo {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
-	a.ensureActiveModelForSessionLocked(a.session)
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	unit := rt.sessionLocked()
+	a.ensureActiveModelForSessionLocked(unit)
 	a.setWarningGroup("setup", a.setupWarningsLocked())
-	return a.modelInfo(a.currentRef)
+	return a.modelInfo(unit.currentRef)
 }
 
 func (a *Agent) CurrentModelForSession(sessionID string) (ModelInfo, error) {
@@ -3540,7 +3631,8 @@ func (a *Agent) projectForSessionCreateLocked(projectID string) (*project.Projec
 // SessionArchive archives a session. If it's the current session, close
 // first. Returns true if the current session was closed.
 func (a *Agent) SessionArchive(id string) (bool, error) {
-	sessionsRoot, err := a.currentSessionsRoot()
+	id = strings.TrimSpace(id)
+	sessionsRoot, err := a.sessionsRootForSession(id)
 	if err != nil {
 		return false, err
 	}
@@ -3548,12 +3640,28 @@ func (a *Agent) SessionArchive(id string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if a.gate != nil {
-		a.gate.CancelSession(id)
+	var releaseClose func()
+	if !closedCurrent {
+		releaseClose, err = a.beginLiveSessionClose(id)
+		if err != nil {
+			return false, err
+		}
+		defer func() {
+			if releaseClose != nil {
+				releaseClose()
+			}
+		}()
 	}
 	if err := snapshot.ArchiveSession(sessionsRoot, id); err != nil {
 		return false, err
 	}
+	if a.gate != nil {
+		a.gate.CancelSession(id)
+	}
+	if _, err := a.closeLiveSession(id); err != nil {
+		return false, err
+	}
+	releaseClose = nil
 	if closedCurrent {
 		a.resetCurrentSessionState()
 	}
@@ -3563,12 +3671,28 @@ func (a *Agent) SessionArchive(id string) (bool, error) {
 // SessionDelete removes a session from disk. Returns true if the
 // current session was closed.
 func (a *Agent) SessionDelete(id string) (bool, error) {
-	sessionsRoot, err := a.currentSessionsRoot()
+	id = strings.TrimSpace(id)
+	sessionsRoot, err := a.sessionsRootForSession(id)
 	if err != nil {
 		return false, err
 	}
 	closedCurrent, err := a.closeIfCurrent(id)
 	if err != nil {
+		return false, err
+	}
+	var releaseClose func()
+	if !closedCurrent {
+		releaseClose, err = a.beginLiveSessionClose(id)
+		if err != nil {
+			return false, err
+		}
+		defer func() {
+			if releaseClose != nil {
+				releaseClose()
+			}
+		}()
+	}
+	if err := snapshot.DeleteSession(sessionsRoot, id); err != nil {
 		return false, err
 	}
 	if a.gate != nil {
@@ -3577,9 +3701,10 @@ func (a *Agent) SessionDelete(id string) (bool, error) {
 	if a.memoryHooks != nil {
 		_ = a.memoryHooks.DeleteSessionSummaries(id)
 	}
-	if err := snapshot.DeleteSession(sessionsRoot, id); err != nil {
+	if _, err := a.closeLiveSession(id); err != nil {
 		return false, err
 	}
+	releaseClose = nil
 	if closedCurrent {
 		a.resetCurrentSessionState()
 	}
@@ -3598,11 +3723,18 @@ func (a *Agent) SessionMessages() []DisplayMessage {
 // SessionMessagesFor returns persisted messages for a session without
 // switching the active session.
 func (a *Agent) SessionMessagesFor(id string) ([]DisplayMessage, error) {
-	if a.store == nil {
-		return nil, snapshot.ErrNoSession
-	}
+	id = strings.TrimSpace(id)
 	if id == "" {
 		return a.SessionMessages(), nil
+	}
+	a.ensureRuntime().mu.Lock()
+	unit, err := a.liveSessionLocked(id)
+	a.ensureRuntime().mu.Unlock()
+	if err == nil {
+		return a.messagesForFrontendForStore(unit.store, id)
+	}
+	if a.store == nil {
+		return nil, snapshot.ErrNoSession
 	}
 	return a.messagesForFrontendForSession(id)
 }
@@ -3628,6 +3760,93 @@ func (a *Agent) currentSessionsRoot() (string, error) {
 	return a.projects.SessionsRoot(proj.ID), nil
 }
 
+func (a *Agent) sessionsRootForSession(id string) (string, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return a.currentSessionsRoot()
+	}
+	if a.projects != nil {
+		if root, ok := a.liveSessionsRoot(id); ok {
+			return root, nil
+		}
+		projects, err := project.List(a.projects.Root())
+		if err != nil {
+			return "", err
+		}
+		for _, proj := range projects {
+			root := a.projects.SessionsRoot(proj.ID)
+			_, err := os.Stat(filepath.Join(root, id, "meta.json"))
+			if err == nil {
+				return root, nil
+			}
+			if err != nil && !os.IsNotExist(err) {
+				return "", err
+			}
+		}
+	}
+	return a.currentSessionsRoot()
+}
+
+func (a *Agent) liveSessionsRoot(id string) (string, bool) {
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	a.ensureSessionMapLocked()
+	unit := a.sessions[id]
+	if unit == nil || unit.projectID == "" || a.projects == nil {
+		return "", false
+	}
+	return a.projects.SessionsRoot(unit.projectID), true
+}
+
+func (a *Agent) beginLiveSessionClose(id string) (func(), error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, nil
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	a.ensureSessionMapLocked()
+	unit := a.sessions[id]
+	if unit == nil || unit == a.session {
+		rt.mu.Unlock()
+		return nil, nil
+	}
+	if unit.store == nil || !unit.store.Active() || unit.store.SessionID() != id {
+		rt.mu.Unlock()
+		return nil, nil
+	}
+	if unit.busy {
+		rt.mu.Unlock()
+		return nil, fmt.Errorf("cannot close session while a turn is running")
+	}
+	unit.transitioning = true
+	rt.mu.Unlock()
+	return func() {
+		var items []QueuedItem
+		var version int
+		var sessionID string
+		var projectID string
+		var active bool
+		rt.mu.Lock()
+		if unit.store != nil && unit.store.Active() && unit.store.SessionID() == id {
+			unit.transitioning = false
+			items = copyQueue(unit.queue)
+			version = unit.queueVersion
+			sessionID = sessionIDOf(unit)
+			projectID = unit.projectID
+			active = true
+		}
+		rt.mu.Unlock()
+		if active {
+			a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionID, ProjectID: projectID, Queue: items, QueueVersion: version})
+			if len(items) > 0 {
+				rt.nudgeQueueDrainer()
+			}
+		}
+	}, nil
+}
+
 func (a *Agent) closeIfCurrent(id string) (bool, error) {
 	if !a.store.Active() || a.store.SessionID() != id {
 		return false, nil // not the current session: not a transition, queue untouched
@@ -3647,6 +3866,37 @@ func (a *Agent) closeIfCurrent(id string) (bool, error) {
 	// Close (no LoadSession follows for archive/delete) is the irreversible
 	// change: clear the queue now.
 	a.ensureRuntime().clearQueueLocked()
+	return true, nil
+}
+
+func (a *Agent) closeLiveSession(id string) (bool, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, nil
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	a.ensureSessionMapLocked()
+	unit := a.sessions[id]
+	if unit == nil {
+		return false, nil
+	}
+	if unit.store == nil || !unit.store.Active() || unit.store.SessionID() != id {
+		delete(a.sessions, id)
+		return false, nil
+	}
+	if unit == a.session {
+		return false, nil
+	}
+	if unit.busy {
+		return false, fmt.Errorf("cannot close session while a turn is running")
+	}
+	if _, err := unit.store.Close(); err != nil {
+		return false, err
+	}
+	rt.clearQueueLockedForSession(unit)
+	delete(a.sessions, id)
 	return true, nil
 }
 
@@ -4235,7 +4485,24 @@ func (a *Agent) SnapshotList() ([]Snapshot, error) {
 	if !a.store.Active() {
 		return nil, nil
 	}
-	turns, err := a.store.ListTurns()
+	return snapshotListForStore(a.store)
+}
+
+func (a *Agent) SnapshotListForSession(sessionID string) ([]Snapshot, error) {
+	a.ensureRuntime().mu.Lock()
+	unit, err := a.liveSessionLocked(sessionID)
+	a.ensureRuntime().mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return snapshotListForStore(unit.store)
+}
+
+func snapshotListForStore(store *snapshot.Store) ([]Snapshot, error) {
+	if store == nil || !store.Active() {
+		return nil, nil
+	}
+	turns, err := store.ListTurns()
 	if err != nil {
 		return nil, err
 	}
