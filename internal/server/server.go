@@ -226,7 +226,7 @@ func (s *Server) handleEvent(ev agent.Event) {
 	case agent.EventTurnEnd:
 		s.hub.broadcastForSession(ev.SessionID, "turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
 		if ev.RefreshSession {
-			s.broadcastSessionChanged()
+			s.broadcastSessionChangedForSession(ev.SessionID)
 		}
 		return
 	case agent.EventError:
@@ -254,7 +254,7 @@ func (s *Server) handleEvent(ev agent.Event) {
 	case agent.EventCompactionEnd:
 		s.hub.broadcastForSession(ev.SessionID, "compaction_end", nil)
 		if ev.RefreshSession {
-			s.broadcastSessionChanged()
+			s.broadcastSessionChangedForSession(ev.SessionID)
 		}
 		return
 	case agent.EventWarning:
@@ -370,13 +370,30 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// broadcastSessionChanged pushes a session_changed event to all SSE clients.
-func (s *Server) broadcastSessionChanged() {
-	s.hub.broadcast("session_changed", map[string]any{
-		"session":  s.agent.SessionCurrent(),
-		"messages": s.agent.SessionMessages(),
-		"tokens":   s.agent.TokenUsage(),
-	})
+// broadcastSessionChangedForSession pushes a session_changed event to subscribers of one session.
+func (s *Server) broadcastSessionChangedForSession(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	s.broadcastSessionChanged(sessionID, sessionID)
+}
+
+func (s *Server) broadcastSessionChanged(routeSessionID, payloadSessionID string) {
+	routeSessionID = strings.TrimSpace(routeSessionID)
+	if routeSessionID == "" {
+		return
+	}
+	payloadSessionID = strings.TrimSpace(payloadSessionID)
+	payload := agent.SessionPayload{}
+	if payloadSessionID != "" {
+		var err error
+		payload, err = s.agent.SessionPayloadForSession(payloadSessionID)
+		if err != nil {
+			payload = agent.SessionPayload{}
+		}
+	}
+	s.hub.broadcastForSession(routeSessionID, "session_changed", payload)
 }
 
 // --- Route handlers ---
@@ -552,7 +569,7 @@ func (s *Server) handleSessionNew(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusConflict)
 		return
 	}
-	s.broadcastSessionChanged()
+	s.broadcastSessionChangedForSession(id)
 	summary, err := s.agent.SessionSummaryForSession(id)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusNotFound)
@@ -569,12 +586,13 @@ func (s *Server) handleSessionSwitch(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	if err := s.agent.SessionSwitch(body.ID); err != nil {
+	summary, err := s.agent.OpenSession(body.ID)
+	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.broadcastSessionChanged()
-	jsonResp(w, http.StatusOK, s.agent.SessionCurrent())
+	s.broadcastSessionChangedForSession(summary.ID)
+	jsonResp(w, http.StatusOK, summary)
 }
 
 func (s *Server) handleSessionList(w http.ResponseWriter, r *http.Request) {
@@ -598,14 +616,12 @@ func (s *Server) handleSessionArchive(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	closedCurrent, err := s.agent.SessionArchive(body.ID)
+	_, err := s.agent.SessionArchive(body.ID)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if closedCurrent {
-		s.broadcastSessionChanged()
-	}
+	s.broadcastSessionChangedForSession(body.ID)
 	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -617,14 +633,12 @@ func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	closedCurrent, err := s.agent.SessionDelete(body.ID)
+	_, err := s.agent.SessionDelete(body.ID)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if closedCurrent {
-		s.broadcastSessionChanged()
-	}
+	s.broadcastSessionChangedForSession(body.ID)
 	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -676,7 +690,11 @@ func (s *Server) handleTurnAction(w http.ResponseWriter, r *http.Request, action
 		return
 	}
 	if result.SessionChanged {
-		s.broadcastSessionChanged()
+		if result.Session.ID != "" {
+			s.broadcastSessionChanged(sessionID, result.Session.ID)
+		} else {
+			s.broadcastSessionChangedForSession(sessionID)
+		}
 	}
 	jsonResp(w, http.StatusOK, result)
 }

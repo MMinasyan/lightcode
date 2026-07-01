@@ -1481,11 +1481,12 @@ func (c *CLI) clearTerminalLocked() {
 func (c *CLI) cmdResume(parts []string) {
 	if len(parts) > 1 {
 		id := parts[1]
-		if err := c.agent.SessionSwitch(id); err != nil {
+		summary, err := c.agent.OpenSession(id)
+		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
-		c.setCurrentSessionID(id)
+		c.setCurrentSessionID(summary.ID)
 		c.refreshSession()
 		return
 	}
@@ -1500,11 +1501,12 @@ func (c *CLI) cmdResume(parts []string) {
 		return
 	}
 
-	if err := c.agent.SessionSwitch(sessions[0].ID); err != nil {
+	summary, err := c.agent.OpenSession(sessions[0].ID)
+	if err != nil {
 		c.printLine(renderErrorMsg(err.Error()))
 		return
 	}
-	c.setCurrentSessionID(sessions[0].ID)
+	c.setCurrentSessionID(summary.ID)
 	c.refreshSession()
 }
 

@@ -150,7 +150,7 @@ func (a *App) handleEvent(ev agent.Event) {
 		wailsRuntime.EventsEmit(a.ctx, "turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
 		wailsRuntime.EventsEmit(a.ctx, "status", map[string]any{"state": "idle"})
 		if ev.RefreshSession {
-			a.emitSessionChanged()
+			a.emitSessionChangedForEvent(ev)
 		}
 	case agent.EventError:
 		wailsRuntime.EventsEmit(a.ctx, "error", map[string]any{"message": ev.Error})
@@ -174,7 +174,7 @@ func (a *App) handleEvent(ev agent.Event) {
 	case agent.EventCompactionEnd:
 		wailsRuntime.EventsEmit(a.ctx, "compaction_end", nil)
 		if ev.RefreshSession {
-			a.emitSessionChanged()
+			a.emitSessionChangedForEvent(ev)
 		}
 	case agent.EventWarning:
 		wailsRuntime.EventsEmit(a.ctx, "warnings", ev.Warnings)
@@ -183,14 +183,31 @@ func (a *App) handleEvent(ev agent.Event) {
 
 // emitSessionChanged tells the frontend to replace its message list.
 func (a *App) emitSessionChanged() {
+	a.emitSessionChangedForSession(a.currentSessionID())
+}
+
+func (a *App) emitSessionChangedForEvent(ev agent.Event) {
+	if strings.TrimSpace(ev.SessionID) != "" {
+		a.emitSessionChangedForSession(ev.SessionID)
+		return
+	}
+	a.emitSessionChanged()
+}
+
+func (a *App) emitSessionChangedForSession(sessionID string) {
 	if a.ctx == nil {
 		return
 	}
-	wailsRuntime.EventsEmit(a.ctx, "session_changed", map[string]any{
-		"session":  a.currentSessionSummary(),
-		"messages": a.sessionMessages(),
-		"tokens":   a.tokenUsage(),
-	})
+	sessionID = strings.TrimSpace(sessionID)
+	payload := agent.SessionPayload{}
+	if sessionID != "" {
+		var err error
+		payload, err = a.svc.SessionPayloadForSession(sessionID)
+		if err != nil && sessionID == a.currentSessionID() {
+			a.setCurrentSessionID("")
+		}
+	}
+	wailsRuntime.EventsEmit(a.ctx, "session_changed", payload)
 }
 
 func (a *App) setCurrentSessionID(id string) {
@@ -467,7 +484,7 @@ func (a *App) RevertHistory(turn int) error {
 	if err := a.svc.RevertHistoryForSession(sessionID, turn); err != nil {
 		return err
 	}
-	a.emitSessionChanged()
+	a.emitSessionChangedForSession(sessionID)
 	return nil
 }
 
@@ -484,7 +501,7 @@ func (a *App) ForkSession(turn int) error {
 	if result.Session.ID != "" {
 		a.setCurrentSessionID(result.Session.ID)
 	}
-	a.emitSessionChanged()
+	a.emitSessionChangedForSession(result.Session.ID)
 	return nil
 }
 
@@ -501,8 +518,10 @@ func (a *App) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (age
 	if result.SessionChanged {
 		if result.Session.ID != "" {
 			a.setCurrentSessionID(result.Session.ID)
+			a.emitSessionChangedForSession(result.Session.ID)
+		} else {
+			a.emitSessionChangedForSession(sessionID)
 		}
-		a.emitSessionChanged()
 	}
 	return result, nil
 }
@@ -654,11 +673,12 @@ func (a *App) SessionList(state string) ([]agent.SessionSummary, error) {
 
 // SessionSwitch switches to another session.
 func (a *App) SessionSwitch(id string) error {
-	if err := a.svc.SessionSwitch(id); err != nil {
+	summary, err := a.svc.OpenSession(id)
+	if err != nil {
 		return err
 	}
-	a.setCurrentSessionID(id)
-	a.emitSessionChanged()
+	a.setCurrentSessionID(summary.ID)
+	a.emitSessionChangedForSession(summary.ID)
 	return nil
 }
 
@@ -673,7 +693,7 @@ func (a *App) SessionArchive(id string) error {
 		a.setCurrentSessionID("")
 	}
 	if closedCurrent || wasCurrent {
-		a.emitSessionChanged()
+		a.emitSessionChangedForSession(strings.TrimSpace(id))
 	}
 	return nil
 }
@@ -689,7 +709,7 @@ func (a *App) SessionDelete(id string) error {
 		a.setCurrentSessionID("")
 	}
 	if closedCurrent || wasCurrent {
-		a.emitSessionChanged()
+		a.emitSessionChangedForSession(strings.TrimSpace(id))
 	}
 	return nil
 }
@@ -701,7 +721,7 @@ func (a *App) SessionNew() error {
 		return err
 	}
 	a.setCurrentSessionID(id)
-	a.emitSessionChanged()
+	a.emitSessionChangedForSession(id)
 	return nil
 }
 

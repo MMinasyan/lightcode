@@ -279,6 +279,39 @@ func TestCLINewSetsCurrent(t *testing.T) {
 	}
 }
 
+func TestCLISwitchKeepsCurrent(t *testing.T) {
+	a, _ := newTestAgent(t)
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
+		t.Fatalf("append first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+		t.Fatalf("append second: %v", err)
+	}
+
+	c := New(a)
+	var out bytes.Buffer
+	c.out = &out
+	c.setCurrentSessionID(secondID)
+	c.cmdResume([]string{"/resume", firstID})
+	if got := c.currentSessionSummary().ID; got != firstID {
+		t.Fatalf("cli current = %q, want %q", got, firstID)
+	}
+	if got := a.SessionCurrent().ID; got != secondID {
+		t.Fatalf("backend current = %q, want %q", got, secondID)
+	}
+	if got := cliUserContents(c.sessionMessages()); !equalStringSlices(got, []string{"first"}) {
+		t.Fatalf("cli messages = %#v, want first", got)
+	}
+}
+
 func TestCLISubagentFilter(t *testing.T) {
 	a, _ := newTestAgent(t)
 	if _, err := a.AppendUserMessage("root"); err != nil {
@@ -591,6 +624,28 @@ func extractFunctionBody(source, prefix string) (string, bool) {
 
 func newTestAgent(t *testing.T) (*agent.Agent, string) {
 	return newTestAgentWithBaseURL(t, "http://127.0.0.1:9/v1")
+}
+
+func cliUserContents(messages []agent.DisplayMessage) []string {
+	var out []string
+	for _, msg := range messages {
+		if msg.Type == "user" {
+			out = append(out, msg.Content)
+		}
+	}
+	return out
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func newTestAgentWithBaseURL(t *testing.T, baseURL string) (*agent.Agent, string) {

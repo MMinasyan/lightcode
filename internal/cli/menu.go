@@ -385,11 +385,12 @@ func (c *CLI) showSessionMenuInner(state string) {
 	case "select":
 		if result.selected >= 0 {
 			id := result.extra.(string)
-			if err := c.agent.SessionSwitch(id); err != nil {
+			summary, err := c.agent.OpenSession(id)
+			if err != nil {
 				c.printLine(renderErrorMsg(err.Error()))
 				return
 			}
-			c.setCurrentSessionID(id)
+			c.setCurrentSessionID(summary.ID)
 			c.refreshSession()
 		}
 	case "new":

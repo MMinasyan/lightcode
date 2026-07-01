@@ -965,6 +965,52 @@ func TestCloseClaimBlocksSubmit(t *testing.T) {
 	}
 }
 
+func TestOpenSessionKeepsCurrent(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
+		t.Fatalf("append first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+		t.Fatalf("append second: %v", err)
+	}
+	if _, err := a.closeLiveSession(firstID); err != nil {
+		t.Fatalf("close first live: %v", err)
+	}
+
+	summary, err := a.OpenSession(firstID)
+	if err != nil {
+		t.Fatalf("OpenSession first: %v", err)
+	}
+	if summary.ID != firstID {
+		t.Fatalf("opened session = %q, want %q", summary.ID, firstID)
+	}
+	if current := a.SessionCurrent().ID; current != secondID {
+		t.Fatalf("backend current after open = %q, want %q", current, secondID)
+	}
+	firstMessages, err := a.SessionMessagesFor(firstID)
+	if err != nil {
+		t.Fatalf("messages first: %v", err)
+	}
+	if got := userContents(firstMessages); !equalStrings(got, []string{"first"}) {
+		t.Fatalf("first messages = %#v, want first", got)
+	}
+	secondMessages, err := a.SessionMessagesFor(secondID)
+	if err != nil {
+		t.Fatalf("messages second: %v", err)
+	}
+	if got := userContents(secondMessages); !equalStrings(got, []string{"second"}) {
+		t.Fatalf("second messages = %#v, want second", got)
+	}
+}
+
 func TestRemoveCrossProjectLiveSession(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

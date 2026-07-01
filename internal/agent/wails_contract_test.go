@@ -273,14 +273,14 @@ func TestWailsDefersActiveCompactionSessionRefreshUntilTurnEnd(t *testing.T) {
 	if !strings.Contains(compactionEnd, `EventsEmit(a.ctx, "compaction_end"`) {
 		t.Fatalf("EventCompactionEnd must still emit compaction_end; case:\n%s", compactionEnd)
 	}
-	if !strings.Contains(compactionEnd, "if ev.RefreshSession") || !strings.Contains(compactionEnd, "a.emitSessionChanged()") {
+	if !strings.Contains(compactionEnd, "if ev.RefreshSession") || !strings.Contains(compactionEnd, "a.emitSessionChangedForEvent(ev)") {
 		t.Fatalf("EventCompactionEnd must refresh history only when backend marks it safe; case:\n%s", compactionEnd)
 	}
 	turnEnd := extractSwitchCase(t, app, "case agent.EventTurnEnd:")
 	if !strings.Contains(turnEnd, `EventsEmit(a.ctx, "turn_end"`) {
 		t.Fatalf("EventTurnEnd must still emit turn_end; case:\n%s", turnEnd)
 	}
-	if !strings.Contains(turnEnd, "if ev.RefreshSession") || !strings.Contains(turnEnd, "a.emitSessionChanged()") {
+	if !strings.Contains(turnEnd, "if ev.RefreshSession") || !strings.Contains(turnEnd, "a.emitSessionChangedForEvent(ev)") {
 		t.Fatalf("EventTurnEnd must perform deferred compaction history refresh; case:\n%s", turnEnd)
 	}
 }

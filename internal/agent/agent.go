@@ -3365,6 +3365,26 @@ func (a *Agent) SessionSummaryForSession(sessionID string) (SessionSummary, erro
 	return sessionSummary(unit), nil
 }
 
+func (a *Agent) SessionPayloadForSession(sessionID string) (SessionPayload, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return SessionPayload{}, fmt.Errorf("session id is required")
+	}
+	summary, err := a.SessionSummaryForSession(sessionID)
+	if err != nil {
+		return SessionPayload{}, err
+	}
+	messages, err := a.SessionMessagesFor(sessionID)
+	if err != nil {
+		return SessionPayload{}, err
+	}
+	tokens, err := a.TokenUsageForSession(sessionID)
+	if err != nil {
+		return SessionPayload{}, err
+	}
+	return SessionPayload{Session: summary, Messages: messages, Tokens: tokens}, nil
+}
+
 func sessionSummary(unit *session) SessionSummary {
 	if unit == nil || unit.store == nil || !unit.store.Active() {
 		return SessionSummary{}
@@ -3406,6 +3426,82 @@ func (a *Agent) SessionList(state string) ([]SessionSummary, error) {
 		}
 	}
 	return out, nil
+}
+
+func (a *Agent) OpenSession(id string) (SessionSummary, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return SessionSummary{}, fmt.Errorf("session id is required")
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	if unit, err := a.liveSessionLocked(id); err == nil {
+		summary := sessionSummary(unit)
+		rt.mu.Unlock()
+		return summary, nil
+	}
+	rt.mu.Unlock()
+
+	proj, err := a.projectForExistingSession(id)
+	if err != nil {
+		return SessionSummary{}, err
+	}
+	store, err := snapshot.NewForSessionsRoot(a.projects.SessionsRoot(proj.ID), a.projects.Root(), proj.ID)
+	if err != nil {
+		return SessionSummary{}, err
+	}
+
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if unit, err := a.liveSessionLocked(id); err == nil {
+		return sessionSummary(unit), nil
+	}
+	if err := a.reloadLocked(); err != nil {
+		return SessionSummary{}, err
+	}
+	unit, err := a.rootRunningUnitLocked(store, "primary", proj.ID, proj.Name, proj.Path)
+	if err != nil {
+		return SessionSummary{}, err
+	}
+	if err := unit.store.LoadSession(id); err != nil {
+		return SessionSummary{}, err
+	}
+	meta, err := unit.store.Meta()
+	if err == nil && metaState(meta.State) == snapshot.StateArchived {
+		_ = unit.store.SetState(snapshot.StateActive)
+		_ = unit.store.TouchActivity()
+	}
+	if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
+		return SessionSummary{}, err
+	}
+	a.resetFileTrackerForSession(unit)
+	a.loadTokensFromDiskForSession(unit)
+	a.restoreModelFromSessionForSession(unit)
+	a.registerLiveSessionLocked(unit)
+	return sessionSummary(unit), nil
+}
+
+func (a *Agent) projectForExistingSession(id string) (*project.Project, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, fmt.Errorf("session id is required")
+	}
+	if a.projects == nil {
+		return nil, fmt.Errorf("unknown session %q", id)
+	}
+	projects, err := project.List(a.projects.Root())
+	if err != nil {
+		return nil, err
+	}
+	for i := range projects {
+		proj := projects[i]
+		if _, err := os.Stat(filepath.Join(a.projects.SessionsRoot(proj.ID), id, "meta.json")); err == nil {
+			return &proj, nil
+		} else if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("unknown session %q", id)
 }
 
 func (a *Agent) cancelAndWaitIdle() error {

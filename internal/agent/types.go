@@ -380,6 +380,13 @@ type SubmitResult struct {
 	Version int          `json:"version"`
 }
 
+// SessionPayload is the adapter-facing state snapshot for one session.
+type SessionPayload struct {
+	Session  SessionSummary   `json:"session"`
+	Messages []DisplayMessage `json:"messages"`
+	Tokens   TokenReport      `json:"tokens"`
+}
+
 // TurnActionResult is returned after a user-message revert/fork action.
 type TurnActionResult struct {
 	Action         string                   `json:"action"`

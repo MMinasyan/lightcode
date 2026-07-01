@@ -254,9 +254,10 @@ func TestHandleEventCompactionEndPushesSessionChanged(t *testing.T) {
 	a := newACPTestAgent(t)
 	_ = appendACPUserTurn(t, a, "seed")
 	r := &Runner{agent: a, out: &out}
-	r.setCurrentSessionID(a.SessionCurrent().ID)
+	sessionID := a.SessionCurrent().ID
+	r.setCurrentSessionID(sessionID)
 
-	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, RefreshSession: true})
+	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, SessionID: sessionID, RefreshSession: true})
 
 	lines := responseLines(t, out.String(), 2)
 	assertACPNotificationMethod(t, lines[0], "agent/compaction_end")
@@ -278,9 +279,10 @@ func TestHandleEventActiveCompactionDefersSessionChangedUntilTurnEnd(t *testing.
 	}
 	var out bytes.Buffer
 	r := &Runner{agent: a, out: &out}
-	r.setCurrentSessionID(a.SessionCurrent().ID)
+	sessionID := a.SessionCurrent().ID
+	r.setCurrentSessionID(sessionID)
 
-	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd})
+	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, SessionID: sessionID})
 	lines := responseLines(t, out.String(), 1)
 	assertACPNotificationMethod(t, lines[0], "agent/compaction_end")
 
@@ -288,7 +290,7 @@ func TestHandleEventActiveCompactionDefersSessionChangedUntilTurnEnd(t *testing.
 		t.Fatalf("MarkTurnComplete active: %v", err)
 	}
 	out.Reset()
-	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: turn, RefreshSession: true})
+	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, SessionID: sessionID, Turn: turn, RefreshSession: true})
 	lines = responseLines(t, out.String(), 2)
 	assertACPNotificationMethod(t, lines[0], "agent/turn_end")
 	assertACPNotificationMethod(t, lines[1], "agent/session_changed")
@@ -585,6 +587,62 @@ func TestACPNewSetsCurrent(t *testing.T) {
 	}
 }
 
+func TestACPSwitchKeepsCurrent(t *testing.T) {
+	a := newACPTestAgent(t)
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
+		t.Fatalf("append first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+		t.Fatalf("append second: %v", err)
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: a, out: &out}
+	r.setCurrentSessionID(secondID)
+	r.handleSessionSwitch(Request{
+		JSONRPC: "2.0",
+		ID:      "switch",
+		Params:  json.RawMessage(`{"id":"` + firstID + `"}`),
+	})
+
+	lines := responseLines(t, out.String(), 2)
+	var notif Notification
+	if err := json.Unmarshal([]byte(lines[0]), &notif); err != nil {
+		t.Fatalf("notification json: %v", err)
+	}
+	if notif.Method != "agent/session_changed" {
+		t.Fatalf("notification method = %q, want session_changed", notif.Method)
+	}
+	payload := sessionPayloadFromParams(t, notif.Params)
+	if payload.Session.ID != firstID {
+		t.Fatalf("payload session = %q, want %q", payload.Session.ID, firstID)
+	}
+	if got := acpUserMessageContents(payload.Messages); !equalStringSlices(got, []string{"first"}) {
+		t.Fatalf("payload messages = %#v, want first", got)
+	}
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("switch response error = %+v", resp.Error)
+	}
+	if got := r.currentSessionSummary().ID; got != firstID {
+		t.Fatalf("runner current = %q, want %q", got, firstID)
+	}
+	if got := a.SessionCurrent().ID; got != secondID {
+		t.Fatalf("backend current = %q, want %q", got, secondID)
+	}
+}
+
 func TestACPStaleCurrent(t *testing.T) {
 	a := newACPTestAgent(t)
 	_ = appendACPUserTurn(t, a, "gone")
@@ -875,6 +933,19 @@ func displayMessagesFromResponse(t *testing.T, resp Response) []agent.DisplayMes
 		t.Fatalf("unmarshal display messages: %v", err)
 	}
 	return messages
+}
+
+func sessionPayloadFromParams(t *testing.T, params any) agent.SessionPayload {
+	t.Helper()
+	data, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var payload agent.SessionPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("unmarshal session payload: %v", err)
+	}
+	return payload
 }
 
 func promptWarningsFromResponse(t *testing.T, resp Response) []agent.PromptWarning {

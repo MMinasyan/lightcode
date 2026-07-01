@@ -161,6 +161,39 @@ func TestWailsForkCurrent(t *testing.T) {
 	}
 }
 
+func TestWailsSwitchKeepsCurrent(t *testing.T) {
+	svc := newAppTestAgent(t)
+	firstID, err := svc.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	if _, err := svc.AppendUserMessageToSession(firstID, "first"); err != nil {
+		t.Fatalf("append first: %v", err)
+	}
+	secondID, err := svc.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	if _, err := svc.AppendUserMessageToSession(secondID, "second"); err != nil {
+		t.Fatalf("append second: %v", err)
+	}
+
+	app := &App{svc: svc}
+	app.setCurrentSessionID(secondID)
+	if err := app.SessionSwitch(firstID); err != nil {
+		t.Fatalf("SessionSwitch: %v", err)
+	}
+	if got := app.SessionCurrent().ID; got != firstID {
+		t.Fatalf("app current = %q, want %q", got, firstID)
+	}
+	if got := svc.SessionCurrent().ID; got != secondID {
+		t.Fatalf("backend current = %q, want %q", got, secondID)
+	}
+	if got := userContents(app.SessionMessages()); !equalStrings(got, []string{"first"}) {
+		t.Fatalf("app messages = %#v, want first", got)
+	}
+}
+
 func TestWailsSubagentFilter(t *testing.T) {
 	svc := newAppTestAgent(t)
 	if _, err := svc.AppendUserMessage("root"); err != nil {
@@ -243,4 +276,26 @@ func newAppTestAgent(t *testing.T) *agent.Agent {
 		t.Fatal(err)
 	}
 	return a
+}
+
+func userContents(messages []agent.DisplayMessage) []string {
+	var out []string
+	for _, msg := range messages {
+		if msg.Type == "user" {
+			out = append(out, msg.Content)
+		}
+	}
+	return out
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -103,6 +103,172 @@ func TestHTTPCurrentByID(t *testing.T) {
 	}
 }
 
+func TestHTTPReadsByID(t *testing.T) {
+	a := newServerTestAgent(t)
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	if err := a.SwitchModelForSession(firstID, "test/alt-model"); err != nil {
+		t.Fatalf("SwitchModelForSession first: %v", err)
+	}
+	s := &Server{agent: a, hub: newSSEHub()}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/model?session_id="+firstID, nil)
+	s.handleModelCurrent(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("model status = %d, body = %s; want 200", rec.Code, rec.Body.String())
+	}
+	var firstModel agent.ModelInfo
+	if err := json.Unmarshal(rec.Body.Bytes(), &firstModel); err != nil {
+		t.Fatalf("decode first model: %v", err)
+	}
+	if firstModel.Ref != "test/alt-model" || firstModel.ContextWindow != 4096 {
+		t.Fatalf("first model = %#v, want alt model", firstModel)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/tokens?session_id="+firstID, nil)
+	s.handleTokens(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tokens status = %d, body = %s; want 200", rec.Code, rec.Body.String())
+	}
+	var firstTokens agent.TokenReport
+	if err := json.Unmarshal(rec.Body.Bytes(), &firstTokens); err != nil {
+		t.Fatalf("decode first tokens: %v", err)
+	}
+	if firstTokens.ContextWindow != 4096 {
+		t.Fatalf("first tokens context window = %d, want 4096", firstTokens.ContextWindow)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/model?session_id="+secondID, nil)
+	s.handleModelCurrent(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second model status = %d, body = %s; want 200", rec.Code, rec.Body.String())
+	}
+	var secondModel agent.ModelInfo
+	if err := json.Unmarshal(rec.Body.Bytes(), &secondModel); err != nil {
+		t.Fatalf("decode second model: %v", err)
+	}
+	if secondModel.Ref != "test/test-model" || secondModel.ContextWindow != 8192 {
+		t.Fatalf("second model = %#v, want test model", secondModel)
+	}
+	if current := a.SessionCurrent().ID; current != secondID {
+		t.Fatalf("backend current = %q, want %q", current, secondID)
+	}
+}
+
+func TestHTTPSwitchRoutesByID(t *testing.T) {
+	a := newServerTestAgent(t)
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
+		t.Fatalf("append first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+		t.Fatalf("append second: %v", err)
+	}
+	s := &Server{agent: a, hub: newSSEHub()}
+	firstCh, unsubFirst := s.hub.subscribe(firstID)
+	defer unsubFirst()
+	secondCh, unsubSecond := s.hub.subscribe(secondID)
+	defer unsubSecond()
+	globalCh, unsubGlobal := s.hub.subscribe("")
+	defer unsubGlobal()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/switch", strings.NewReader(`{"id":`+strconv.Quote(firstID)+`}`))
+	s.handleSessionSwitch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s; want 200", rec.Code, rec.Body.String())
+	}
+	var summary agent.SessionSummary
+	if err := json.Unmarshal(rec.Body.Bytes(), &summary); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if summary.ID != firstID {
+		t.Fatalf("response session = %q, want %q", summary.ID, firstID)
+	}
+	var payload agent.SessionPayload
+	readSSEPayload(t, firstCh, "session_changed", &payload)
+	if payload.Session.ID != firstID {
+		t.Fatalf("payload session = %q, want %q", payload.Session.ID, firstID)
+	}
+	if got := userMessageContents(payload.Messages); !equalStringSlices(got, []string{"first"}) {
+		t.Fatalf("payload messages = %#v, want first", got)
+	}
+	assertNoSSEMessage(t, secondCh)
+	assertNoSSEMessage(t, globalCh)
+	if current := a.SessionCurrent().ID; current != secondID {
+		t.Fatalf("backend current = %q, want %q", current, secondID)
+	}
+}
+
+func TestHTTPRemoveRoutesByID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		call func(*Server, http.ResponseWriter, *http.Request)
+	}{
+		{name: "archive", path: "/v1/session/archive", call: (*Server).handleSessionArchive},
+		{name: "delete", path: "/v1/session/delete", call: (*Server).handleSessionDelete},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newServerTestAgent(t)
+			firstID, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("NewSession first: %v", err)
+			}
+			if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
+				t.Fatalf("append first: %v", err)
+			}
+			secondID, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("NewSession second: %v", err)
+			}
+			if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+				t.Fatalf("append second: %v", err)
+			}
+			s := &Server{agent: a, hub: newSSEHub()}
+			firstCh, unsubFirst := s.hub.subscribe(firstID)
+			defer unsubFirst()
+			secondCh, unsubSecond := s.hub.subscribe(secondID)
+			defer unsubSecond()
+			globalCh, unsubGlobal := s.hub.subscribe("")
+			defer unsubGlobal()
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(`{"id":`+strconv.Quote(firstID)+`}`))
+			tc.call(s, rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s; want 200", rec.Code, rec.Body.String())
+			}
+			var payload agent.SessionPayload
+			readSSEPayload(t, firstCh, "session_changed", &payload)
+			if payload.Session.ID != "" || len(payload.Messages) != 0 {
+				t.Fatalf("removed-session payload = %#v, want empty", payload)
+			}
+			assertNoSSEMessage(t, secondCh)
+			assertNoSSEMessage(t, globalCh)
+			if current := a.SessionCurrent().ID; current != secondID {
+				t.Fatalf("backend current = %q, want %q", current, secondID)
+			}
+		})
+	}
+}
+
 func TestSSEHubSubscribeBroadcastUnsubscribe(t *testing.T) {
 	hub := newSSEHub()
 	ch1, unsub1 := hub.subscribe("")
@@ -461,11 +627,15 @@ func TestHandleEventTurnEndIncludesCancelled(t *testing.T) {
 
 func TestHandleEventCompactionEndBroadcastsSessionChanged(t *testing.T) {
 	a := newServerTestAgent(t)
+	sessionID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
 	s := &Server{agent: a, hub: newSSEHub()}
-	ch, unsub := s.hub.subscribe("")
+	ch, unsub := s.hub.subscribe(sessionID)
 	defer unsub()
 
-	s.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, RefreshSession: true})
+	s.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, SessionID: sessionID, RefreshSession: true})
 
 	assertSSEEvent(t, ch, "compaction_end")
 	assertSSEEvent(t, ch, "session_changed")
@@ -489,10 +659,11 @@ func TestHandleEventActiveCompactionRefreshesSessionAfterTurnEnd(t *testing.T) {
 		}
 	}
 	s := &Server{agent: a, hub: newSSEHub()}
-	ch, unsub := s.hub.subscribe("")
+	sessionID := a.SessionCurrent().ID
+	ch, unsub := s.hub.subscribe(sessionID)
 	defer unsub()
 
-	s.handleEvent(agent.Event{Kind: agent.EventCompactionEnd})
+	s.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, SessionID: sessionID})
 
 	assertSSEEvent(t, ch, "compaction_end")
 	assertNoSSEMessage(t, ch)
@@ -504,7 +675,7 @@ func TestHandleEventActiveCompactionRefreshesSessionAfterTurnEnd(t *testing.T) {
 	if err := a.Store().MarkTurnComplete(turn); err != nil {
 		t.Fatalf("MarkTurnComplete active: %v", err)
 	}
-	s.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: turn, RefreshSession: true})
+	s.handleEvent(agent.Event{Kind: agent.EventTurnEnd, SessionID: sessionID, Turn: turn, RefreshSession: true})
 	assertSSEEvent(t, ch, "turn_end")
 	select {
 	case msg := <-ch:
@@ -591,14 +762,14 @@ func TestHandleSnapshotsByID(t *testing.T) {
 func TestHandleTurnActionRevertHistoryReturnsResultAndSessionChanged(t *testing.T) {
 	a := newServerTestAgent(t)
 	s := &Server{agent: a, hub: newSSEHub()}
-	ch, unsub := s.hub.subscribe("")
-	defer unsub()
 
 	_ = appendServerUserTurn(t, a, "first")
 	path := filepath.Join(a.ProjectRoot(), "created.txt")
 	clickedTurn := appendServerUserTurnWithSnapshot(t, a, "create file", path, "created\n")
 	_ = appendServerUserTurn(t, a, "after")
 	sessionID := a.SessionCurrent().ID
+	ch, unsub := s.hub.subscribe(sessionID)
+	defer unsub()
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/revert/history", strings.NewReader(`{"session_id":`+strconv.Quote(sessionID)+`,"turn":`+itoa(clickedTurn)+`,"alsoRevertCode":true}`))
@@ -626,13 +797,13 @@ func TestHandleTurnActionRevertHistoryReturnsResultAndSessionChanged(t *testing.
 func TestHandleTurnActionForkReturnsResultAndSessionChanged(t *testing.T) {
 	a := newServerTestAgent(t)
 	s := &Server{agent: a, hub: newSSEHub()}
-	ch, unsub := s.hub.subscribe("")
-	defer unsub()
 
 	_ = appendServerUserTurn(t, a, "first")
 	clickedTurn := appendServerUserTurn(t, a, "fork point")
 	_ = appendServerUserTurn(t, a, "after")
 	beforeID := a.SessionCurrent().ID
+	ch, unsub := s.hub.subscribe(beforeID)
+	defer unsub()
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/session/fork", strings.NewReader(`{"session_id":`+strconv.Quote(beforeID)+`,"turn":`+itoa(clickedTurn)+`}`))
@@ -651,7 +822,14 @@ func TestHandleTurnActionForkReturnsResultAndSessionChanged(t *testing.T) {
 	if got := userMessageContents(result.Messages); !equalStringSlices(got, []string{"first", "fork point"}) {
 		t.Fatalf("fork messages = %q, want selected turn included", got)
 	}
-	assertSSEEvent(t, ch, "session_changed")
+	var payload agent.SessionPayload
+	readSSEPayload(t, ch, "session_changed", &payload)
+	if payload.Session.ID != result.Session.ID {
+		t.Fatalf("session_changed payload session = %q, want fork %q", payload.Session.ID, result.Session.ID)
+	}
+	if got := userMessageContents(payload.Messages); !equalStringSlices(got, []string{"first", "fork point"}) {
+		t.Fatalf("session_changed messages = %q, want fork messages", got)
+	}
 }
 
 func TestHandleTurnActionForkPropagatesAlsoRevertCode(t *testing.T) {
@@ -995,7 +1173,8 @@ func newServerTestAgentWithModel(t *testing.T, baseURL string, discovery bool, m
       "transport": { "base_url": "`+baseURL+`", "api_key_env": "LIGHTCODE_TEST_KEY" },
       "discovery": `+strconv.FormatBool(discovery)+`,
       "models": {
-        "`+modelID+`": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 }
+        "`+modelID+`": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 },
+        "alt-model": { "name": "Alt Model", "context_window": 4096, "max_output_tokens": 512 }
       }
     }
   },
@@ -1109,6 +1288,28 @@ func assertSSEEvent(t *testing.T, ch <-chan []byte, name string) {
 		if !strings.Contains(string(msg), "event: "+name) {
 			t.Fatalf("SSE message = %q, want event %q", msg, name)
 		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for SSE event %q", name)
+	}
+}
+
+func readSSEPayload(t *testing.T, ch <-chan []byte, name string, out any) {
+	t.Helper()
+	select {
+	case msg := <-ch:
+		text := string(msg)
+		if !strings.Contains(text, "event: "+name) {
+			t.Fatalf("SSE message = %q, want event %q", msg, name)
+		}
+		for _, line := range strings.Split(text, "\n") {
+			if strings.HasPrefix(line, "data: ") {
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), out); err != nil {
+					t.Fatalf("decode SSE data: %v; message=%q", err, msg)
+				}
+				return
+			}
+		}
+		t.Fatalf("SSE message missing data line: %q", msg)
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for SSE event %q", name)
 	}

@@ -247,7 +247,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 			Params:  map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled},
 		})
 		if ev.RefreshSession {
-			r.pushSessionChanged()
+			r.pushSessionChangedForEvent(ev)
 		}
 		return
 	case agent.EventError:
@@ -277,7 +277,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 			Method:  "agent/compaction_end",
 		})
 		if ev.RefreshSession {
-			r.pushSessionChanged()
+			r.pushSessionChangedForEvent(ev)
 		}
 		return
 	case agent.EventWarning:
@@ -393,7 +393,7 @@ func (r *Runner) handleSessionNew(req Request) {
 		return
 	}
 	r.setCurrentSessionID(id)
-	r.pushSessionChanged()
+	r.pushSessionChangedForSession(id)
 	r.respond(req.ID, r.currentSessionSummary())
 }
 
@@ -520,13 +520,14 @@ func (r *Runner) handleSessionSwitch(req Request) {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	if err := r.agent.SessionSwitch(params.ID); err != nil {
+	summary, err := r.agent.OpenSession(params.ID)
+	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	r.setCurrentSessionID(params.ID)
-	r.pushSessionChanged()
-	r.respond(req.ID, r.currentSessionSummary())
+	r.setCurrentSessionID(summary.ID)
+	r.pushSessionChangedForSession(summary.ID)
+	r.respond(req.ID, summary)
 }
 
 func (r *Runner) handleSessionArchive(req Request) {
@@ -550,7 +551,7 @@ func (r *Runner) handleSessionArchive(req Request) {
 		r.setCurrentSessionID("")
 	}
 	if closedCurrent || wasCurrent {
-		r.pushSessionChanged()
+		r.pushSessionChangedForSession(strings.TrimSpace(params.ID))
 	}
 	r.respond(req.ID, map[string]any{"ok": true})
 }
@@ -576,7 +577,7 @@ func (r *Runner) handleSessionDelete(req Request) {
 		r.setCurrentSessionID("")
 	}
 	if closedCurrent || wasCurrent {
-		r.pushSessionChanged()
+		r.pushSessionChangedForSession(strings.TrimSpace(params.ID))
 	}
 	r.respond(req.ID, map[string]any{"ok": true})
 }
@@ -615,8 +616,10 @@ func (r *Runner) handleTurnAction(req Request, action string) {
 	if result.SessionChanged {
 		if result.Session.ID != "" {
 			r.setCurrentSessionID(result.Session.ID)
+			r.pushSessionChangedForSession(result.Session.ID)
+		} else {
+			r.pushSessionChangedForSession(sessionID)
 		}
-		r.pushSessionChanged()
 	}
 	r.respond(req.ID, result)
 }
@@ -812,21 +815,39 @@ func warningSnapshot(warnings []agent.PromptWarning) []agent.PromptWarning {
 }
 
 func (r *Runner) pushSessionChanged() {
-	current := r.currentSessionSummary()
-	var messages []agent.DisplayMessage
-	var tokens agent.TokenReport
-	if current.ID != "" {
-		messages, _ = r.agent.SessionMessagesFor(current.ID)
-		tokens, _ = r.agent.TokenUsageForSession(current.ID)
+	current, err := r.currentSession()
+	if err != nil {
+		r.pushSessionChangedForSession("")
+		return
+	}
+	r.pushSessionChangedForSession(current)
+}
+
+func (r *Runner) pushSessionChangedForEvent(ev agent.Event) {
+	if strings.TrimSpace(ev.SessionID) != "" {
+		r.pushSessionChangedForSession(ev.SessionID)
+		return
+	}
+	r.pushSessionChanged()
+}
+
+func (r *Runner) pushSessionChangedForSession(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	payload := agent.SessionPayload{}
+	if sessionID != "" {
+		var err error
+		payload, err = r.agent.SessionPayloadForSession(sessionID)
+		if err != nil {
+			if current, currentErr := r.currentSession(); currentErr == nil && current == sessionID {
+				r.setCurrentSessionID("")
+			}
+			payload = agent.SessionPayload{}
+		}
 	}
 	r.sendNotification(Notification{
 		JSONRPC: "2.0",
 		Method:  "agent/session_changed",
-		Params: map[string]any{
-			"session":  current,
-			"messages": messages,
-			"tokens":   tokens,
-		},
+		Params:  payload,
 	})
 }
 
