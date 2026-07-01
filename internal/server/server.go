@@ -34,10 +34,16 @@ type Server struct {
 	token   string
 	httpSrv *http.Server
 	srvCtx  context.Context
+	cancel  context.CancelFunc
 
 	permMu            sync.Mutex
 	permTimers        map[string]*time.Timer
 	permTimerSessions map[string]string
+
+	lifeMu            sync.Mutex
+	adapterCount      int
+	adapterLeases     map[string]struct{}
+	shutdownRequested bool
 }
 
 // New constructs a Server.
@@ -58,7 +64,9 @@ func New(a *agent.Agent, cfg Config) *Server {
 // Start starts the HTTP server in the background. It writes the owner
 // lockfile on startup and removes it on shutdown.
 func (s *Server) Start(ctx context.Context, home string) (LockFile, <-chan error, error) {
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	baseCtx, cancel := context.WithCancel(ctx)
+	ctx, stop := signal.NotifyContext(baseCtx, os.Interrupt, syscall.SIGTERM)
+	s.cancel = cancel
 
 	if lf, err := Read(home); err == nil {
 		if !IsStale(lf) {
@@ -117,16 +125,17 @@ func (s *Server) Start(ctx context.Context, home string) (LockFile, <-chan error
 	done := make(chan error, 1)
 	go func() {
 		defer stop()
-		defer Remove(home)
 		err := s.httpSrv.Serve(ln)
 		if err == http.ErrServerClosed {
 			err = nil
 		}
+		_ = Remove(home)
 		done <- err
 	}()
 
 	go func() {
 		<-ctx.Done()
+		s.agent.ShutdownOwner()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = s.httpSrv.Shutdown(shutCtx)
@@ -145,6 +154,9 @@ func (s *Server) Serve(ctx context.Context, home string) error {
 	if err != nil {
 		return err
 	}
+	if _, err := s.AttachAdapter(); err != nil {
+		return err
+	}
 	return <-done
 }
 
@@ -155,6 +167,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	// All other routes require Bearer auth.
 	mux.HandleFunc("POST /v1/adapter/rpc", s.auth(s.handleAdapterRPC))
+	mux.HandleFunc("POST /v1/owner/shutdown", s.auth(s.handleOwnerShutdown))
 	mux.HandleFunc("POST /v1/prompt", s.auth(s.handlePrompt))
 
 	mux.HandleFunc("POST /v1/cancel", s.auth(s.handleCancel))

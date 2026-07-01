@@ -26,6 +26,9 @@ type Client struct {
 	mu      sync.Mutex
 	handler func(agent.Event)
 	started bool
+
+	lifeMu    sync.Mutex
+	adapterID string
 }
 
 func NewClient(lf LockFile, projectRoot string) *Client {
@@ -52,6 +55,57 @@ func (c *Client) Init(ctx context.Context) {
 	c.started = true
 	c.mu.Unlock()
 	go c.streamEvents(ctx)
+}
+
+func (c *Client) AttachAdapter(ctx context.Context) error {
+	id, err := rpcCall[string](ctx, c, "AttachAdapter", nil)
+	if err != nil {
+		return err
+	}
+	c.lifeMu.Lock()
+	c.adapterID = id
+	c.lifeMu.Unlock()
+	return nil
+}
+
+func (c *Client) DetachAdapter(ctx context.Context) error {
+	c.lifeMu.Lock()
+	id := c.adapterID
+	c.lifeMu.Unlock()
+	if id == "" {
+		return nil
+	}
+	if err := c.rpc(ctx, "DetachAdapter", map[string]any{"adapter_id": id}); err != nil {
+		return err
+	}
+	c.lifeMu.Lock()
+	if c.adapterID == id {
+		c.adapterID = ""
+	}
+	c.lifeMu.Unlock()
+	return nil
+}
+
+func (c *Client) RequestShutdown(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/owner/shutdown", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		msg := strings.TrimSpace(string(data))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return fmt.Errorf("%s", msg)
+	}
+	return nil
 }
 
 func (c *Client) streamEvents(ctx context.Context) {

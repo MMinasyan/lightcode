@@ -594,6 +594,51 @@ func TestSubagentBackgroundProcessCompletionRenders(t *testing.T) {
 	}
 }
 
+func TestCLIExitReturnsThroughLifecycleDetach(t *testing.T) {
+	a, _ := newTestAgent(t)
+	svc := &cliLifecycleService{AdapterService: a}
+	c := New(svc)
+	detach := c.attachAdapter(context.Background())
+	if detach == nil {
+		t.Fatal("attachAdapter returned nil detach")
+	}
+	err := c.dispatchCommand("/exit")
+	var exit interface{ ExitCode() int }
+	if !errors.As(err, &exit) || exit.ExitCode() != 0 {
+		t.Fatalf("/exit err = %v, want exit code 0", err)
+	}
+	detach()
+	if svc.attached != 1 || svc.detached != 1 {
+		t.Fatalf("lifecycle attached/detached = %d/%d, want 1/1", svc.attached, svc.detached)
+	}
+}
+
+func TestCLIDoesNotCallOSExit(t *testing.T) {
+	data, err := os.ReadFile("cli.go")
+	if err != nil {
+		t.Fatalf("read cli.go: %v", err)
+	}
+	if strings.Contains(string(data), "os.Exit(") {
+		t.Fatal("CLI must return through Run so lifecycle defers execute, not call os.Exit")
+	}
+}
+
+type cliLifecycleService struct {
+	agent.AdapterService
+	attached int
+	detached int
+}
+
+func (s *cliLifecycleService) AttachAdapter(context.Context) error {
+	s.attached++
+	return nil
+}
+
+func (s *cliLifecycleService) DetachAdapter(context.Context) error {
+	s.detached++
+	return nil
+}
+
 // extractFunctionBody returns the brace-delimited body of the first function
 // whose definition line starts with prefix. It does not understand strings or
 // comments containing braces, so callers should pass production code only.

@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -114,7 +118,17 @@ func runCLI() error {
 	if err != nil {
 		return err
 	}
-	return cli.New(svc).Run(context.Background())
+	err = cli.New(svc).Run(context.Background())
+	var exit interface{ ExitCode() int }
+	if err != nil && !errors.As(err, &exit) {
+		return err
+	}
+	if waiter, ok := svc.(interface{ WaitOwner() error }); ok {
+		if waitErr := waiter.WaitOwner(); waitErr != nil {
+			return waitErr
+		}
+	}
+	return err
 }
 
 func runACP() error {
@@ -122,13 +136,33 @@ func runACP() error {
 	if err != nil {
 		return err
 	}
-	return acp.New(svc).Run(context.Background())
+	if err := acp.New(svc).Run(context.Background()); err != nil {
+		return err
+	}
+	if waiter, ok := svc.(interface{ WaitOwner() error }); ok {
+		return waiter.WaitOwner()
+	}
+	return nil
 }
 
 func runServe(port int) error {
 	home, _ := os.UserHomeDir()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if lf, err := server.Read(home); err == nil && !server.IsStale(lf) {
+		projectRoot, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("resolve project root: %w", err)
+		}
+		client := server.NewClient(lf, projectRoot)
+		if err := client.AttachAdapter(ctx); err != nil {
+			return err
+		}
+		defer client.DetachAdapter(context.Background())
 		fmt.Fprintf(os.Stderr, "lightcode: serving on 127.0.0.1:%d (token in %s)\n", lf.Port, server.Path(home))
+		if err := server.WaitForOwnerExitContext(ctx, home); err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
 		return nil
 	} else if err != nil && !os.IsNotExist(err) {
 		if removeErr := server.Remove(home); removeErr != nil {
@@ -141,7 +175,50 @@ func runServe(port int) error {
 		return err
 	}
 	srv := server.New(svc, server.Config{Port: port})
-	return srv.Serve(context.Background(), home)
+	return srv.Serve(ctx, home)
+}
+
+func runStop() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolve home dir: %w", err)
+	}
+	lf, err := server.Read(home)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintln(outW, "lightcode: no owner running")
+			return nil
+		}
+		if removeErr := server.Remove(home); removeErr == nil {
+			fmt.Fprintln(outW, "lightcode: removed unreadable owner lock")
+			return nil
+		}
+		return fmt.Errorf("read owner lock: %w", err)
+	}
+	if server.IsStale(lf) {
+		_ = server.Remove(home)
+		fmt.Fprintln(outW, "lightcode: removed stale owner lock")
+		return nil
+	}
+	projectRoot, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("resolve project root: %w", err)
+	}
+	client := server.NewClient(lf, projectRoot)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.AttachAdapter(ctx); err != nil {
+		return err
+	}
+	if err := client.RequestShutdown(ctx); err != nil {
+		_ = client.DetachAdapter(context.Background())
+		return err
+	}
+	if err := server.WaitForOwnerExit(home, 5*time.Second); err != nil {
+		return err
+	}
+	fmt.Fprintln(outW, "lightcode: owner stopped")
+	return nil
 }
 
 func runWails() error {
@@ -152,7 +229,7 @@ func runWails() error {
 
 	app := &App{svc: svc}
 
-	return wails.Run(&options.App{
+	if err := wails.Run(&options.App{
 		Title:  "Lightcode — " + svc.ProjectName(),
 		Width:  900,
 		Height: 700,
@@ -162,9 +239,16 @@ func runWails() error {
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
-		OnStartup: app.startup,
-		Bind:      []interface{}{app},
-	})
+		OnStartup:  app.startup,
+		OnShutdown: app.shutdown,
+		Bind:       []interface{}{app},
+	}); err != nil {
+		return err
+	}
+	if waiter, ok := svc.(interface{ WaitOwner() error }); ok {
+		return waiter.WaitOwner()
+	}
+	return nil
 }
 
 func ownerService(port int) (agent.AdapterService, error) {
@@ -198,11 +282,6 @@ func ownerService(port int) (agent.AdapterService, error) {
 		}
 		return nil, err
 	} else {
-		go func() {
-			if err := <-done; err != nil {
-				fmt.Fprintf(os.Stderr, "lightcode: owner http: %v\n", err)
-			}
-		}()
+		return server.NewLocalService(svc, srv, done), nil
 	}
-	return svc, nil
 }

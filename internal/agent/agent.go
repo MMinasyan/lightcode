@@ -3174,6 +3174,47 @@ func (a *Agent) updateRegisteredToolsConfigLocked(cfg config.ToolsConfig) {
 	}
 }
 
+func (a *Agent) LiveSessionCount() int {
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	count := 0
+	for _, unit := range a.sessions {
+		if unit != nil && unit.store != nil && unit.store.Active() {
+			count++
+		}
+	}
+	return count
+}
+
+func (a *Agent) ShutdownOwner() {
+	rt := a.ensureRuntime()
+	var cancels []context.CancelFunc
+	var sessionIDs []string
+	rt.mu.Lock()
+	for id, unit := range a.sessions {
+		if unit == nil || unit.store == nil || !unit.store.Active() {
+			continue
+		}
+		if cancel := rt.turnCancelSnapshotLocked(unit); cancel != nil {
+			cancels = append(cancels, cancel)
+		}
+		sessionIDs = append(sessionIDs, id)
+	}
+	rt.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	if a.gate != nil {
+		for _, id := range sessionIDs {
+			a.gate.CancelSession(id)
+		}
+	}
+	if a.procMgr != nil {
+		a.procMgr.KillAll()
+	}
+}
+
 func setRegisteredToolConfig(t tool.Tool, cfg config.ToolsConfig) {
 	for t != nil {
 		if setter, ok := t.(toolsConfigSetter); ok {

@@ -71,6 +71,14 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	r.agent.SetEventHandler(r.handleEvent)
 	r.agent.Init(ctx)
+	if lifecycle, ok := r.agent.(interface {
+		AttachAdapter(context.Context) error
+		DetachAdapter(context.Context) error
+	}); ok {
+		if err := lifecycle.AttachAdapter(ctx); err == nil {
+			defer lifecycle.DetachAdapter(context.Background())
+		}
+	}
 	sessionID := ""
 	if sessions, err := r.agent.SessionList("active"); err == nil && len(sessions) > 0 {
 		if summary, err := r.agent.OpenSession(sessions[0].ID); err == nil {

@@ -20,11 +20,12 @@ import (
 // App is the Wails-bound struct that bridges the Go backend to the
 // frontend. All exported methods are callable from JavaScript.
 type App struct {
-	ctx       context.Context
-	svc       agent.AdapterService
-	currentMu sync.Mutex
-	currentID string
-	children  map[string]struct{}
+	ctx             context.Context
+	svc             agent.AdapterService
+	currentMu       sync.Mutex
+	currentID       string
+	children        map[string]struct{}
+	adapterAttached bool
 }
 
 type ModelCompletion = agent.ModelCompletion
@@ -34,6 +35,9 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.svc.SetEventHandler(a.handleEvent)
 	a.svc.Init(ctx)
+	if lifecycle, ok := a.svc.(interface{ AttachAdapter(context.Context) error }); ok {
+		a.adapterAttached = lifecycle.AttachAdapter(ctx) == nil
+	}
 	sessionID := ""
 	if sessions, err := a.svc.SessionList("active"); err == nil && len(sessions) > 0 {
 		if summary, err := a.svc.OpenSession(sessions[0].ID); err == nil {
@@ -46,6 +50,15 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 	a.setCurrentSessionID(sessionID)
+}
+
+func (a *App) shutdown(ctx context.Context) {
+	if !a.adapterAttached {
+		return
+	}
+	if lifecycle, ok := a.svc.(interface{ DetachAdapter(context.Context) error }); ok {
+		_ = lifecycle.DetachAdapter(ctx)
+	}
 }
 
 func (a *App) handleEvent(ev agent.Event) {

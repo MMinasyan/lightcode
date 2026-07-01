@@ -1115,6 +1115,74 @@ func TestRootProcessCompletionStaysWithOwner(t *testing.T) {
 	}
 }
 
+func TestShutdownOwnerCancelsSessionWork(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	a.cfg.Permissions.Allow = []string{"run_command(sleep *)"}
+	events := make(chan Event, 16)
+	a.SetEventHandler(func(ev Event) {
+		events <- ev
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Init(ctx)
+	sessionID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	a.ensureRuntime().mu.Lock()
+	unit := a.sessions[sessionID]
+	turnCtx, turnCancel := context.WithCancel(ctx)
+	unit.turnCtx = turnCtx
+	unit.turnCancel = turnCancel
+	readTool, readOK := unit.registry.Get("read_file")
+	runTool, runOK := unit.registry.Get("run_command")
+	a.ensureRuntime().mu.Unlock()
+	if !readOK {
+		t.Fatal("read_file missing")
+	}
+	if !runOK {
+		t.Fatal("run_command missing")
+	}
+
+	permissionDone := make(chan error, 1)
+	go func() {
+		_, err := readTool.Execute(ctx, map[string]any{"path": "needs-approval.txt"})
+		permissionDone <- err
+	}()
+	req := waitPermissionEvent(t, events).PermReq
+	if req.SessionID != sessionID {
+		t.Fatalf("permission session = %q, want %q", req.SessionID, sessionID)
+	}
+
+	result, err := runTool.Execute(context.Background(), map[string]any{
+		"command":    "sleep 5",
+		"background": true,
+	})
+	if err != nil {
+		t.Fatalf("start background process: %v", err)
+	}
+	id := backgroundID(t, result)
+	waitActiveProcess(t, a, sessionID, id)
+
+	a.ShutdownOwner()
+
+	select {
+	case <-turnCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("turn context was not cancelled")
+	}
+	select {
+	case err := <-permissionDone:
+		if !errors.Is(err, tool.ErrDenied) {
+			t.Fatalf("permission err = %v, want denied", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("permission request stayed blocked")
+	}
+	waitNoActiveProcesses(t, a, sessionID)
+}
+
 func TestRemoveCrossProjectLiveSession(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -1329,6 +1397,30 @@ func waitProcessOutput(t *testing.T, processTool tool.Tool, id string, want stri
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("process %s output did not contain %q", id, want)
+}
+
+func waitActiveProcess(t *testing.T, a *Agent, sessionID string, id string) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		for _, active := range a.procMgr.ActiveIDsForSession(sessionID) {
+			if active == id {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("process %s did not become active", id)
+}
+
+func waitNoActiveProcesses(t *testing.T, a *Agent, sessionID string) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if len(a.procMgr.ActiveIDsForSession(sessionID)) == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("active processes after shutdown = %v, want none", a.procMgr.ActiveIDsForSession(sessionID))
 }
 
 func waitPendingSignal(t *testing.T, unit *session, label string) {

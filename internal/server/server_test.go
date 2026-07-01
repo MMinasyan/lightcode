@@ -296,6 +296,177 @@ func TestOwnerStartRemovesMalformedLock(t *testing.T) {
 	}
 }
 
+func TestOwnerDetachWithoutLiveSessionStopsOwner(t *testing.T) {
+	home := t.TempDir()
+	a := newServerTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := New(a, Config{})
+	_, done, err := srv.Start(ctx, home)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	lease, err := srv.AttachAdapter()
+	if err != nil {
+		t.Fatalf("AttachAdapter: %v", err)
+	}
+	srv.DetachAdapter(lease)
+	waitOwnerDone(t, done)
+	if _, err := Read(home); !os.IsNotExist(err) {
+		t.Fatalf("owner lock after last detach = %v, want removed", err)
+	}
+}
+
+func TestAdapterClientDetachWithoutLiveSessionStopsOwner(t *testing.T) {
+	home := t.TempDir()
+	a := newServerTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := New(a, Config{})
+	lf, done, err := srv.Start(ctx, home)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	client := NewClient(lf, a.ProjectRoot())
+	if err := client.AttachAdapter(context.Background()); err != nil {
+		t.Fatalf("AttachAdapter: %v", err)
+	}
+	if err := client.DetachAdapter(context.Background()); err != nil {
+		t.Fatalf("DetachAdapter: %v", err)
+	}
+	waitOwnerDone(t, done)
+	if _, err := Read(home); !os.IsNotExist(err) {
+		t.Fatalf("owner lock after adapter RPC detach = %v, want removed", err)
+	}
+}
+
+func TestServeCountsAsAdapter(t *testing.T) {
+	home := t.TempDir()
+	a := newServerTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := New(a, Config{})
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.Serve(ctx, home)
+	}()
+	waitOwnerLock(t, home)
+	waitAdapterCount(t, srv, 1)
+	lf, err := Read(home)
+	if err != nil {
+		t.Fatalf("Read owner lock: %v", err)
+	}
+	client := NewClient(lf, a.ProjectRoot())
+	if err := client.AttachAdapter(context.Background()); err != nil {
+		t.Fatalf("AttachAdapter: %v", err)
+	}
+	if err := client.DetachAdapter(context.Background()); err != nil {
+		t.Fatalf("DetachAdapter: %v", err)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("serve exited while serve adapter remained attached: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	waitOwnerDone(t, done)
+}
+
+func TestOwnerDetachWithLiveSessionKeepsOwner(t *testing.T) {
+	home := t.TempDir()
+	a := newServerTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := New(a, Config{})
+	_, done, err := srv.Start(ctx, home)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	cleaned := false
+	t.Cleanup(func() {
+		if !cleaned {
+			srv.RequestShutdown()
+			waitOwnerDone(t, done)
+		}
+	})
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	lease, err := srv.AttachAdapter()
+	if err != nil {
+		t.Fatalf("AttachAdapter: %v", err)
+	}
+	srv.DetachAdapter(lease)
+	select {
+	case err := <-done:
+		t.Fatalf("owner exited after live-session detach: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := Read(home); err != nil {
+		t.Fatalf("owner lock after live-session detach: %v", err)
+	}
+}
+
+func TestAdapterDetachRequiresLease(t *testing.T) {
+	home := t.TempDir()
+	a := newServerTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := New(a, Config{})
+	lf, done, err := srv.Start(ctx, home)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	cleaned := false
+	t.Cleanup(func() {
+		if !cleaned {
+			srv.RequestShutdown()
+			waitOwnerDone(t, done)
+		}
+	})
+	client := NewClient(lf, a.ProjectRoot())
+	if err := client.AttachAdapter(context.Background()); err != nil {
+		t.Fatalf("AttachAdapter: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	body := `{"method":"DetachAdapter","params":{"adapter_id":"stale"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/adapter/rpc", strings.NewReader(body))
+	srv.handleAdapterRPC(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("stale detach status = %d, body = %s; want 409", rec.Code, rec.Body.String())
+	}
+	waitAdapterCount(t, srv, 1)
+	select {
+	case err := <-done:
+		t.Fatalf("owner exited after stale detach: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := client.DetachAdapter(context.Background()); err != nil {
+		t.Fatalf("valid DetachAdapter: %v", err)
+	}
+	waitOwnerDone(t, done)
+	cleaned = true
+}
+
+func TestOwnerShutdownRequestRemovesLock(t *testing.T) {
+	home := t.TempDir()
+	a := newServerTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := New(a, Config{})
+	lf, done, err := srv.Start(ctx, home)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	client := NewClient(lf, a.ProjectRoot())
+	if err := client.RequestShutdown(context.Background()); err != nil {
+		t.Fatalf("RequestShutdown: %v", err)
+	}
+	waitOwnerDone(t, done)
+	if _, err := Read(home); !os.IsNotExist(err) {
+		t.Fatalf("owner lock after shutdown request = %v, want removed", err)
+	}
+}
+
 func TestHTTPRequiresSessionID(t *testing.T) {
 	s := &Server{agent: newServerTestAgent(t), hub: newSSEHub()}
 	cases := []struct {
@@ -1483,6 +1654,46 @@ func assertServerPermissionTimerPending(t *testing.T, s *Server, id string) {
 	if !ok {
 		t.Fatal("permission timer was cancelled after rejected response")
 	}
+}
+
+func waitOwnerDone(t *testing.T, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("owner shutdown: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("owner did not shut down")
+	}
+}
+
+func waitOwnerLock(t *testing.T, home string) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if _, err := Read(home); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("owner lock was not written")
+}
+
+func waitAdapterCount(t *testing.T, s *Server, want int) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		s.lifeMu.Lock()
+		got := s.adapterCount
+		s.lifeMu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s.lifeMu.Lock()
+	got := s.adapterCount
+	s.lifeMu.Unlock()
+	t.Fatalf("adapter count = %d, want %d", got, want)
 }
 
 func serverWriteSSE(w http.ResponseWriter, payloads ...string) {

@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
@@ -55,6 +56,19 @@ func (s *Server) handleAdapterRPC(w http.ResponseWriter, r *http.Request) {
 	var out any
 	var err error
 	switch req.Method {
+	case "AttachAdapter":
+		out, err = s.AttachAdapter()
+	case "DetachAdapter":
+		var p struct {
+			AdapterID string `json:"adapter_id"`
+		}
+		if !decodeRPCParams(w, req.Params, &p) {
+			return
+		}
+		if !s.DetachAdapter(p.AdapterID) {
+			err = fmt.Errorf("unknown adapter")
+		}
+		out = map[string]any{"ok": true}
 	case "CurrentWarnings":
 		out = warningSnapshot(s.agent.CurrentWarnings())
 	case "SubmitToSession":

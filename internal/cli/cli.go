@@ -45,6 +45,8 @@ type CLI struct {
 	history   inputHistory
 	keyCh     chan keyMsg
 	events    chan agent.Event
+	exitCh    chan error
+	exitOnce  sync.Once
 	readKeyFn func() (keyMsg, error)
 	ctx       context.Context
 
@@ -95,9 +97,28 @@ func New(a agent.AdapterService) *CLI {
 		history:             newInputHistory(),
 		keyCh:               make(chan keyMsg, 64),
 		events:              make(chan agent.Event, 256),
+		exitCh:              make(chan error, 1),
 		width:               80,
 		lastWarningSnapshot: make(map[string]bool),
 	}
+}
+
+type ExitError struct {
+	Code int
+}
+
+func (e ExitError) Error() string {
+	return fmt.Sprintf("exit %d", e.Code)
+}
+
+func (e ExitError) ExitCode() int {
+	return e.Code
+}
+
+func (c *CLI) requestExit(err error) {
+	c.exitOnce.Do(func() {
+		c.exitCh <- err
+	})
 }
 
 func (c *CLI) setCurrentSessionID(id string) {
@@ -310,14 +331,12 @@ func (c *CLI) Run(ctx context.Context) error {
 					if st == stateStreaming || st == statePermission {
 						c.cancelCurrent()
 					} else {
-						_ = term.Restore(rawFd, oldState)
 						fmt.Fprint(os.Stdout, "\r\n\x1b[?25h")
-						os.Exit(130)
+						c.requestExit(ExitError{Code: 130})
 					}
 				case syscall.SIGTERM:
-					_ = term.Restore(rawFd, oldState)
 					fmt.Fprint(os.Stdout, "\r\n\x1b[?25h")
-					os.Exit(130)
+					c.requestExit(ExitError{Code: 130})
 				}
 			case <-ctx.Done():
 				return
@@ -340,6 +359,9 @@ func (c *CLI) Run(ctx context.Context) error {
 	})
 
 	c.agent.Init(ctx)
+	if detach := c.attachAdapter(ctx); detach != nil {
+		defer detach()
+	}
 	sessionID := ""
 	if sessions, err := c.agent.SessionList("active"); err == nil && len(sessions) > 0 {
 		if summary, err := c.agent.OpenSession(sessions[0].ID); err == nil {
@@ -369,9 +391,23 @@ func (c *CLI) Run(ctx context.Context) error {
 
 	go c.readKeys(ctx)
 
-	c.mainLoop(ctx)
+	return c.mainLoop(ctx)
+}
 
-	return nil
+func (c *CLI) attachAdapter(ctx context.Context) func() {
+	lifecycle, ok := c.agent.(interface {
+		AttachAdapter(context.Context) error
+		DetachAdapter(context.Context) error
+	})
+	if !ok {
+		return nil
+	}
+	if err := lifecycle.AttachAdapter(ctx); err != nil {
+		return nil
+	}
+	return func() {
+		_ = lifecycle.DetachAdapter(context.Background())
+	}
 }
 
 func (c *CLI) readKeys(ctx context.Context) {
@@ -397,29 +433,34 @@ func (c *CLI) readKeys(ctx context.Context) {
 	}
 }
 
-func (c *CLI) mainLoop(ctx context.Context) {
+func (c *CLI) mainLoop(ctx context.Context) error {
 	for {
 		select {
 		case k := <-c.keyCh:
-			c.handleKey(k)
+			if err := c.handleKey(k); err != nil {
+				return err
+			}
 		case ev := <-c.events:
 			c.handleEvent(ev)
+		case err := <-c.exitCh:
+			return err
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		}
 	}
 }
 
-func (c *CLI) handleKey(k keyMsg) {
+func (c *CLI) handleKey(k keyMsg) error {
 	switch c.state {
 	case stateIdle:
-		c.handleKeyIdle(k)
+		return c.handleKeyIdle(k)
 	case stateStreaming:
 		c.handleKeyStreaming(k)
 	case statePermission:
 		c.handleKeyPermission(k)
 	case stateMenu:
 	}
+	return nil
 }
 
 func (c *CLI) handleInputEdit(k keyMsg, redrawPrompt bool) bool {
@@ -495,9 +536,9 @@ func (c *CLI) handleInputEdit(k keyMsg, redrawPrompt bool) bool {
 	}
 }
 
-func (c *CLI) handleKeyIdle(k keyMsg) {
+func (c *CLI) handleKeyIdle(k keyMsg) error {
 	if c.handleInputEdit(k, true) {
-		return
+		return nil
 	}
 	switch k.Special {
 	case keyEnter:
@@ -514,15 +555,17 @@ func (c *CLI) handleKeyIdle(k keyMsg) {
 
 		if text == "" {
 			c.printInputPrompt()
-			return
+			return nil
 		}
 		c.history.Add(text)
 
 		if strings.HasPrefix(text, "/") {
 			c.printLine(colorDim + "> " + text + colorReset)
-			c.dispatchCommand(text)
+			if err := c.dispatchCommand(text); err != nil {
+				return err
+			}
 			c.printInputPrompt()
-			return
+			return nil
 		}
 
 		c.submitInput(text)
@@ -537,9 +580,9 @@ func (c *CLI) handleKeyIdle(k keyMsg) {
 		c.printInputPrompt()
 
 	case keyCtrlC, keyCtrlD:
-		c.restoreTerminal()
-		os.Exit(0)
+		return ExitError{Code: 0}
 	}
+	return nil
 }
 
 func (c *CLI) handleKeyStreaming(k keyMsg) {
@@ -1397,7 +1440,7 @@ func (c *CLI) handleSlashWhileBusy(text string) {
 	c.mu.Unlock()
 }
 
-func (c *CLI) dispatchCommand(text string) {
+func (c *CLI) dispatchCommand(text string) error {
 	parts := strings.Fields(text)
 	cmd := parts[0]
 
@@ -1416,7 +1459,7 @@ func (c *CLI) dispatchCommand(text string) {
 		id, err := c.agent.NewSession("", "primary")
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
-			return
+			return nil
 		}
 		c.setCurrentSessionID(id)
 		c.refreshSession()
@@ -1433,11 +1476,11 @@ func (c *CLI) dispatchCommand(text string) {
 	case "/copy":
 		c.cmdCopy()
 	case "/exit":
-		c.restoreTerminal()
-		os.Exit(0)
+		return ExitError{Code: 0}
 	default:
 		c.printLine(renderErrorMsg(fmt.Sprintf("unknown command: %s", cmd)))
 	}
+	return nil
 }
 
 func (c *CLI) cmdHelp() {
@@ -1600,17 +1643,16 @@ func (c *CLI) cmdCopy() {
 
 func (c *CLI) projectSwitch(targetPath string) {
 	if err := c.agent.CloseForProjectSwitch(); err != nil {
-		c.restoreTerminal()
-		fmt.Fprintf(os.Stderr, "close current session: %v\n", err)
-		os.Exit(1)
+		c.requestExit(fmt.Errorf("close current session: %w", err))
+		return
 	}
 
 	c.restoreTerminal()
 	if err := c.relaunchIn(targetPath); err != nil {
-		fmt.Fprintf(os.Stderr, "relaunch: %v\n", err)
-		os.Exit(1)
+		c.requestExit(fmt.Errorf("relaunch: %w", err))
+		return
 	}
-	os.Exit(0)
+	c.requestExit(ExitError{Code: 0})
 }
 
 func (c *CLI) restoreTerminal() {
