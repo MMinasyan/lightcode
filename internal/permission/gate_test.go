@@ -2,6 +2,7 @@ package permission
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -92,6 +93,106 @@ func TestGateRespondActionBeforeCancel(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("AskRequest did not return")
+	}
+}
+
+func TestGateSessionRespond(t *testing.T) {
+	idCh := make(chan string, 1)
+	gate := NewGate(func(ctx context.Context, req Request) {
+		idCh <- req.ID
+	})
+
+	result := make(chan ResponseAction, 1)
+	go func() {
+		result <- gate.AskRequest(context.Background(), Request{
+			SessionID: "session-a",
+			ProjectID: "project-a",
+			ToolName:  "read_file",
+			Arg:       "README.md",
+		})
+	}()
+	waitForPending(t, gate, 1)
+	id := <-idCh
+
+	for _, sessionID := range []string{"session-b", ""} {
+		if err := gate.RespondActionForSession(sessionID, id, string(ResponseAllow)); !errors.Is(err, ErrSessionMismatch) {
+			t.Fatalf("RespondActionForSession(%q) err = %v, want session mismatch", sessionID, err)
+		}
+	}
+	if err := gate.RespondActionForSession("session-a", id, string(ResponseDeny)); err != nil {
+		t.Fatalf("RespondActionForSession matching session: %v", err)
+	}
+
+	select {
+	case got := <-result:
+		if got != ResponseDeny {
+			t.Fatalf("AskRequest = %q, want deny", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AskRequest did not return")
+	}
+	if err := gate.RespondActionForSession("session-a", id, string(ResponseAllow)); !errors.Is(err, ErrUnknownRequest) {
+		t.Fatalf("stale RespondActionForSession err = %v, want unknown request", err)
+	}
+}
+
+func TestGateSessionCancel(t *testing.T) {
+	gate := NewGate(nil)
+	ctx := context.Background()
+	type pending struct {
+		id     string
+		result <-chan ResponseAction
+	}
+	start := func(sessionID string) pending {
+		result := make(chan ResponseAction, 1)
+		go func() {
+			result <- gate.AskRequest(ctx, Request{SessionID: sessionID, ToolName: "read_file", Arg: sessionID + ".txt"})
+		}()
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			gate.mu.Lock()
+			for id, p := range gate.pending {
+				if p.req.SessionID == sessionID {
+					gate.mu.Unlock()
+					return pending{id: id, result: result}
+				}
+			}
+			gate.mu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("missing pending request for %q", sessionID)
+		return pending{}
+	}
+
+	first := start("session-a")
+	second := start("session-b")
+	if cancelled := gate.CancelSession("session-a"); cancelled != 1 {
+		t.Fatalf("CancelSession cancelled %d, want 1", cancelled)
+	}
+
+	select {
+	case got := <-first.result:
+		if got != ResponseDeny {
+			t.Fatalf("first result = %q, want deny", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first request did not resolve")
+	}
+	select {
+	case got := <-second.result:
+		t.Fatalf("second request resolved as %q, want still pending", got)
+	default:
+	}
+	if err := gate.RespondActionForSession("session-b", second.id, string(ResponseAllow)); err != nil {
+		t.Fatalf("respond second: %v", err)
+	}
+	select {
+	case got := <-second.result:
+		if got != ResponseAllow {
+			t.Fatalf("second result = %q, want allow", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second request did not resolve")
 	}
 }
 

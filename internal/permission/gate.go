@@ -6,15 +6,19 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 )
 
 var ErrUnknownRequest = errors.New("no pending permission request")
+var ErrSessionMismatch = errors.New("permission request belongs to another session")
 
 // Request is the structured payload sent to the frontend when the gate
 // needs to ask the user for permission.
 type Request struct {
 	ID                 string   `json:"id"`
+	SessionID          string   `json:"session_id,omitempty"`
+	ProjectID          string   `json:"project_id,omitempty"`
 	ToolName           string   `json:"tool"`
 	Arg                string   `json:"args"`
 	ResolvedArg        string   `json:"resolved_arg,omitempty"`
@@ -122,6 +126,29 @@ func (g *Gate) CancelAll() {
 	}
 }
 
+// CancelSession resolves pending requests owned by sessionID as denied.
+func (g *Gate) CancelSession(sessionID string) int {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	cancelled := 0
+	for id, pending := range g.pending {
+		if pending.req.SessionID != sessionID {
+			continue
+		}
+		select {
+		case pending.ch <- ResponseDeny:
+		default:
+		}
+		delete(g.pending, id)
+		cancelled++
+	}
+	return cancelled
+}
+
 // Respond delivers an answer to the pending request with the given id.
 func (g *Gate) Respond(id string, allow bool) error {
 	if allow {
@@ -130,8 +157,25 @@ func (g *Gate) Respond(id string, allow bool) error {
 	return g.RespondAction(id, string(ResponseDeny))
 }
 
+// RespondForSession delivers an answer after validating request ownership.
+func (g *Gate) RespondForSession(sessionID, id string, allow bool) error {
+	if allow {
+		return g.RespondActionForSession(sessionID, id, string(ResponseAllow))
+	}
+	return g.RespondActionForSession(sessionID, id, string(ResponseDeny))
+}
+
 // RespondAction delivers an action to the pending request with the given id.
 func (g *Gate) RespondAction(id string, action string) error {
+	return g.respondAction("", id, action, false)
+}
+
+// RespondActionForSession delivers an action after validating request ownership.
+func (g *Gate) RespondActionForSession(sessionID, id string, action string) error {
+	return g.respondAction(sessionID, id, action, true)
+}
+
+func (g *Gate) respondAction(sessionID, id string, action string, requireSession bool) error {
 	response := ResponseAction(action)
 	switch response {
 	case ResponseAllow, ResponseDeny, ResponseAllowAll:
@@ -145,6 +189,10 @@ func (g *Gate) RespondAction(id string, action string) error {
 		g.mu.Unlock()
 		return fmt.Errorf("%w: id %q", ErrUnknownRequest, id)
 	}
+	if requireSession && !requestMatchesSession(pending.req, sessionID) {
+		g.mu.Unlock()
+		return fmt.Errorf("%w: id %q", ErrSessionMismatch, id)
+	}
 	if response == ResponseAllowAll && !pending.req.CanAllowAll {
 		response = ResponseAllow
 	}
@@ -154,14 +202,29 @@ func (g *Gate) RespondAction(id string, action string) error {
 	return nil
 }
 
-func (g *Gate) CanSaveProjectPermission(id string) (bool, error) {
+// ProjectSaveRequest returns the pending request after validating that
+// project-level permission persistence is allowed.
+func (g *Gate) ProjectSaveRequest(sessionID, id string, requireSession bool) (Request, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	pending, ok := g.pending[id]
 	if !ok {
-		return false, fmt.Errorf("%w: id %q", ErrUnknownRequest, id)
+		return Request{}, fmt.Errorf("%w: id %q", ErrUnknownRequest, id)
 	}
-	return !pending.req.DisableProjectSave, nil
+	if requireSession && !requestMatchesSession(pending.req, sessionID) {
+		return Request{}, fmt.Errorf("%w: id %q", ErrSessionMismatch, id)
+	}
+	if pending.req.DisableProjectSave {
+		return Request{}, errors.New("project permission save is disabled for this request")
+	}
+	return pending.req, nil
+}
+
+func requestMatchesSession(req Request, sessionID string) bool {
+	if req.SessionID == "" {
+		return true
+	}
+	return strings.TrimSpace(sessionID) == req.SessionID
 }
 
 func newID() string {

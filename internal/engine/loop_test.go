@@ -468,12 +468,16 @@ func TestEmitFlushesDroppedWarningBeforeTranscriptEvent(t *testing.T) {
 	ch := make(chan Event, 4)
 	lp := &Loop{droppedEvents: 7}
 	lp.SetEvents(ch)
+	lp.SetEventOwner("session-a", "project-a")
 
 	lp.emit(Event{Kind: UserMessageDisplay, Turn: 5, Result: "hello"})
 
 	first := <-ch
 	if first.Kind != Warning || !strings.Contains(first.Result, "dropped 7 events") {
 		t.Fatalf("expected dropped-events warning first, got %#v", first)
+	}
+	if first.SessionID != "session-a" || first.ProjectID != "project-a" {
+		t.Fatalf("warning owner = %q/%q, want session-a/project-a", first.SessionID, first.ProjectID)
 	}
 	second := <-ch
 	if second.Kind != UserMessageDisplay || second.Result != "hello" {
@@ -489,6 +493,7 @@ func TestEmitDropsTelemetryWhenChannelFull(t *testing.T) {
 	ch <- Event{Kind: Usage, Model: "filler"}
 	loop := &Loop{}
 	loop.SetEvents(ch)
+	loop.SetEventOwner("session-a", "project-a")
 
 	for i := 0; i < 10; i++ {
 		loop.emit(Event{Kind: Usage, Model: "drop"})
@@ -506,6 +511,9 @@ func TestEmitDropsTelemetryWhenChannelFull(t *testing.T) {
 	case ev := <-ch:
 		if ev.Kind != Warning || !strings.Contains(ev.Result, "dropped 10 events") {
 			t.Fatalf("warning event = %#v", ev)
+		}
+		if ev.SessionID != "session-a" || ev.ProjectID != "project-a" {
+			t.Fatalf("warning owner = %q/%q, want session-a/project-a", ev.SessionID, ev.ProjectID)
 		}
 	default:
 		t.Fatal("expected dropped-event warning")

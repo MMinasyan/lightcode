@@ -38,6 +38,7 @@ type taskResult struct {
 
 type TaggedLoopEvent struct {
 	SessionID  string
+	ProjectID  string
 	TaskIndex  int
 	ToolCallID string
 	Event      loop.Event
@@ -122,6 +123,16 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		askAction:     cfg.AskAction,
 		usageRecorder: cfg.UsageRecorder,
 	}
+}
+
+func (t *taskTool) setProject(projectID, memoriesDir string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.projectID = projectID
+	t.memoriesDir = memoriesDir
+	t.mu.Unlock()
 }
 
 func (*taskTool) Name() string { return "task" }
@@ -392,7 +403,7 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		forwardDone = make(chan struct{})
 		go func() {
 			defer close(forwardDone)
-			t.forwardEvents(events, index, sessionID, parentToolCallID)
+			t.forwardEvents(events, index, sessionID, t.projectID, parentToolCallID)
 		}()
 	}
 	finish := func(result taskResult) taskResult {
@@ -415,6 +426,7 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		events:          events,
 		pendingExecutor: pendingExecutor,
 	})
+	lp.SetEventOwner(sessionID, t.projectID)
 	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 
 	if turn := childStore.BeginTurn(); turn == 0 {
@@ -766,11 +778,12 @@ func (t *taskTool) resolveClient(modelRef string) (*provider.Client, coremodel.M
 	return client, ref, nil
 }
 
-func (t *taskTool) forwardEvents(ch <-chan loop.Event, taskIndex int, sessionID, toolCallID string) {
+func (t *taskTool) forwardEvents(ch <-chan loop.Event, taskIndex int, sessionID, projectID, toolCallID string) {
 	for ev := range ch {
 		if t.taggedEvents != nil {
 			t.taggedEvents <- TaggedLoopEvent{
 				SessionID:  sessionID,
+				ProjectID:  projectID,
 				TaskIndex:  taskIndex,
 				ToolCallID: toolCallID,
 				Event:      ev,

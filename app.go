@@ -142,6 +142,8 @@ func (a *App) handleEvent(ev agent.Event) {
 	case agent.EventPermissionRequest:
 		wailsRuntime.EventsEmit(a.ctx, "permission_request", map[string]any{
 			"id":                 ev.PermReq.ID,
+			"sessionId":          ev.PermReq.SessionID,
+			"projectId":          ev.PermReq.ProjectID,
 			"tool":               ev.PermReq.ToolName,
 			"args":               ev.PermReq.Arg,
 			"resolvedArg":        ev.PermReq.ResolvedArg,

@@ -34,8 +34,9 @@ type Server struct {
 	httpSrv *http.Server
 	srvCtx  context.Context
 
-	permMu     sync.Mutex
-	permTimers map[string]*time.Timer
+	permMu            sync.Mutex
+	permTimers        map[string]*time.Timer
+	permTimerSessions map[string]string
 }
 
 // New constructs a Server.
@@ -44,10 +45,11 @@ func New(a *agent.Agent, cfg Config) *Server {
 		cfg.PermissionTimeout = 60 * time.Second
 	}
 	return &Server{
-		agent:      a,
-		cfg:        cfg,
-		hub:        newSSEHub(),
-		permTimers: make(map[string]*time.Timer),
+		agent:             a,
+		cfg:               cfg,
+		hub:               newSSEHub(),
+		permTimers:        make(map[string]*time.Timer),
+		permTimerSessions: make(map[string]string),
 	}
 }
 
@@ -234,6 +236,8 @@ func (s *Server) handleEvent(ev agent.Event) {
 		name = "permission_request"
 		data = map[string]any{
 			"id":                 ev.PermReq.ID,
+			"sessionId":          ev.PermReq.SessionID,
+			"projectId":          ev.PermReq.ProjectID,
 			"tool":               ev.PermReq.ToolName,
 			"arg":                ev.PermReq.Arg,
 			"resolvedArg":        ev.PermReq.ResolvedArg,
@@ -244,7 +248,7 @@ func (s *Server) handleEvent(ev agent.Event) {
 			"batchFiles":         ev.PermReq.BatchFiles,
 			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		}
-		s.startPermissionTimer(ev.PermReq.ID)
+		s.startPermissionTimer(ev.PermReq)
 	case agent.EventCompactionStart:
 		name = "compaction_start"
 	case agent.EventCompactionEnd:
@@ -263,17 +267,31 @@ func (s *Server) handleEvent(ev agent.Event) {
 	s.hub.broadcast(name, data)
 }
 
-func (s *Server) startPermissionTimer(id string) {
+func (s *Server) startPermissionTimer(req *agent.PermissionRequest) {
+	if req == nil {
+		return
+	}
+	id := req.ID
+	sessionID := req.SessionID
 	s.permMu.Lock()
 	defer s.permMu.Unlock()
 	timer := time.AfterFunc(s.cfg.PermissionTimeout, func() {
 		slog.Warn("permission timeout, auto-denying", "id", id)
-		_ = s.agent.RespondPermission(id, false)
+		if sessionID != "" {
+			_ = s.agent.RespondPermissionForSession(sessionID, id, false)
+		} else {
+			_ = s.agent.RespondPermission(id, false)
+		}
 		s.permMu.Lock()
 		delete(s.permTimers, id)
+		delete(s.permTimerSessions, id)
 		s.permMu.Unlock()
 	})
+	if s.permTimerSessions == nil {
+		s.permTimerSessions = make(map[string]string)
+	}
 	s.permTimers[id] = timer
+	s.permTimerSessions[id] = sessionID
 }
 
 func (s *Server) cancelPermissionTimer(id string) {
@@ -283,6 +301,7 @@ func (s *Server) cancelPermissionTimer(id string) {
 		timer.Stop()
 		delete(s.permTimers, id)
 	}
+	delete(s.permTimerSessions, id)
 }
 
 // --- SSE handler ---
@@ -308,17 +327,24 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	ch, unsub := s.hub.subscribe()
 	defer unsub()
 
-	// On disconnect, auto-deny any pending permissions.
+	sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
+
+	// On disconnect, auto-deny pending permissions only for the subscribed session.
 	defer func() {
+		if sessionID == "" {
+			return
+		}
 		s.permMu.Lock()
-		ids := make([]string, 0, len(s.permTimers))
+		ids := make([]string, 0)
 		for id := range s.permTimers {
-			ids = append(ids, id)
+			if s.permTimerSessions[id] == sessionID {
+				ids = append(ids, id)
+			}
 		}
 		s.permMu.Unlock()
 		for _, id := range ids {
 			s.cancelPermissionTimer(id)
-			_ = s.agent.RespondPermission(id, false)
+			_ = s.agent.RespondPermissionForSession(sessionID, id, false)
 		}
 	}()
 

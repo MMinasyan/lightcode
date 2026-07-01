@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,7 +14,9 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
+	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/memory"
+	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
@@ -167,6 +170,332 @@ func TestLiveSessionsHaveSeparateHistoryAndQueues(t *testing.T) {
 	}
 	if len(secondQueue.Items) != 1 || secondQueue.Items[0].Content != "queued second" {
 		t.Fatalf("second queue = %#v, want queued second", secondQueue.Items)
+	}
+}
+
+func TestPermissionSessionMatch(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	events := make(chan Event, 16)
+	a.SetEventHandler(func(ev Event) {
+		events <- ev
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Init(ctx)
+
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	a.ensureRuntime().mu.Lock()
+	first := a.sessions[firstID]
+	first.turnCtx = ctx
+	readTool, ok := first.registry.Get("read_file")
+	firstProjectID := first.projectID
+	a.ensureRuntime().mu.Unlock()
+	if !ok {
+		t.Fatal("read_file not registered")
+	}
+	if current := a.SessionCurrent().ID; current != secondID {
+		t.Fatalf("current session = %q, want second %q", current, secondID)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := readTool.Execute(ctx, map[string]any{"path": "needs-approval.txt"})
+		done <- err
+	}()
+	reqEvent := waitPermissionEvent(t, events)
+	req := reqEvent.PermReq
+	if reqEvent.SessionID != firstID || req.SessionID != firstID {
+		t.Fatalf("permission session event/request = %q/%q, want %q", reqEvent.SessionID, req.SessionID, firstID)
+	}
+	if reqEvent.ProjectID != firstProjectID || req.ProjectID != firstProjectID {
+		t.Fatalf("permission project event/request = %q/%q, want %q", reqEvent.ProjectID, req.ProjectID, firstProjectID)
+	}
+
+	if err := a.RespondPermissionAction(req.ID, "allow"); !errors.Is(err, permission.ErrSessionMismatch) {
+		t.Fatalf("current-session RespondPermissionAction err = %v, want session mismatch", err)
+	}
+	if err := a.RespondPermissionActionForSession("", req.ID, "allow"); !errors.Is(err, permission.ErrSessionMismatch) {
+		t.Fatalf("empty-session RespondPermissionActionForSession err = %v, want session mismatch", err)
+	}
+	if err := a.RespondPermissionActionForSession(firstID, req.ID, "deny"); err != nil {
+		t.Fatalf("matching RespondPermissionActionForSession: %v", err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, tool.ErrDenied) {
+			t.Fatalf("read_file err = %v, want denied", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("read_file stayed blocked after denial")
+	}
+	if err := a.RespondPermissionActionForSession(firstID, req.ID, "allow"); !errors.Is(err, permission.ErrUnknownRequest) {
+		t.Fatalf("stale RespondPermissionActionForSession err = %v, want unknown request", err)
+	}
+}
+
+func TestPermissionStampOwner(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	events := make(chan Event, 16)
+	a.SetEventHandler(func(ev Event) {
+		events <- ev
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Init(ctx)
+
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	a.ensureRuntime().mu.Lock()
+	first := a.sessions[firstID]
+	projectID := first.projectID
+	a.ensureRuntime().mu.Unlock()
+
+	done := make(chan permission.ResponseAction, 1)
+	go func() {
+		done <- a.askPermissionForSession(ctx, first, permission.Request{
+			SessionID: secondID,
+			ProjectID: "forged-project",
+			ToolName:  "read_file",
+			Arg:       "forged.txt",
+		}, projectID, false)
+	}()
+	req := waitPermissionEvent(t, events).PermReq
+	if req.SessionID != firstID || req.ProjectID != projectID {
+		t.Fatalf("permission owner = %q/%q, want %q/%q", req.SessionID, req.ProjectID, firstID, projectID)
+	}
+	if err := a.RespondPermissionActionForSession(secondID, req.ID, "allow"); !errors.Is(err, permission.ErrSessionMismatch) {
+		t.Fatalf("forged session response err = %v, want session mismatch", err)
+	}
+	if err := a.RespondPermissionActionForSession(firstID, req.ID, "deny"); err != nil {
+		t.Fatalf("owner response: %v", err)
+	}
+	select {
+	case got := <-done:
+		if got != permission.ResponseDeny {
+			t.Fatalf("permission response = %q, want deny", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("permission ask stayed blocked")
+	}
+}
+
+func TestEventFanout(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	legacy := make(chan Event, 2)
+	extra := make(chan Event, 2)
+	a.SetEventHandler(func(ev Event) {
+		legacy <- ev
+	})
+	unsubscribe := a.SubscribeEvents(func(ev Event) {
+		extra <- ev
+	})
+
+	a.emitEvent(Event{Kind: EventWarning, Warnings: []PromptWarning{{Kind: "test", Message: "first"}}})
+	if got := waitEvent(t, legacy).Warnings[0].Message; got != "first" {
+		t.Fatalf("legacy handler saw %q, want first", got)
+	}
+	if got := waitEvent(t, extra).Warnings[0].Message; got != "first" {
+		t.Fatalf("extra subscriber saw %q, want first", got)
+	}
+
+	unsubscribe()
+	a.emitEvent(Event{Kind: EventWarning, Warnings: []PromptWarning{{Kind: "test", Message: "second"}}})
+	if got := waitEvent(t, legacy).Warnings[0].Message; got != "second" {
+		t.Fatalf("legacy handler after unsubscribe saw %q, want second", got)
+	}
+	select {
+	case ev := <-extra:
+		t.Fatalf("unsubscribed handler saw event %#v", ev)
+	default:
+	}
+}
+
+func TestPermissionSaveProject(t *testing.T) {
+	home := t.TempDir()
+	firstRoot := t.TempDir()
+	secondRoot := t.TempDir()
+	a := newCatalogBackedTestAgentForRoot(t, home, firstRoot)
+	firstProject, err := a.projects.Ensure()
+	if err != nil {
+		t.Fatalf("ensure first project: %v", err)
+	}
+	secondAgent := newCatalogBackedTestAgentForRoot(t, home, secondRoot)
+	secondProject, err := secondAgent.projects.Ensure()
+	if err != nil {
+		t.Fatalf("ensure second project: %v", err)
+	}
+
+	events := make(chan Event, 16)
+	a.SetEventHandler(func(ev Event) {
+		events <- ev
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Init(ctx)
+
+	secondID, err := a.NewSession(secondProject.ID, "primary")
+	if err != nil {
+		t.Fatalf("NewSession second project: %v", err)
+	}
+	firstID, err := a.NewSession(firstProject.ID, "primary")
+	if err != nil {
+		t.Fatalf("NewSession first project: %v", err)
+	}
+	if current := a.SessionCurrent().ID; current != firstID {
+		t.Fatalf("current session = %q, want first %q", current, firstID)
+	}
+
+	a.ensureRuntime().mu.Lock()
+	second := a.sessions[secondID]
+	second.turnCtx = ctx
+	runTool, ok := second.registry.Get("run_command")
+	a.ensureRuntime().mu.Unlock()
+	if !ok {
+		t.Fatal("run_command not registered")
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := runTool.Execute(ctx, map[string]any{"command": "printf save-target"})
+		done <- err
+	}()
+	req := waitPermissionEvent(t, events).PermReq
+	if req.SessionID != secondID || req.ProjectID != secondProject.ID {
+		t.Fatalf("permission request owner = %q/%q, want %q/%q", req.SessionID, req.ProjectID, secondID, secondProject.ID)
+	}
+	if err := a.SaveProjectPermissionForSession(firstID, req.ID, []string{"run_command(printf save-target)"}); !errors.Is(err, permission.ErrSessionMismatch) {
+		t.Fatalf("wrong-session save err = %v, want session mismatch", err)
+	}
+	if err := a.SaveProjectPermissionForSession(secondID, req.ID, []string{"run_command(printf save-target)"}); err != nil {
+		t.Fatalf("matching save: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run_command after save: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("run_command stayed blocked after save")
+	}
+
+	secondRules, err := permission.LoadLocal(a.projects.Root(), secondProject.ID)
+	if err != nil {
+		t.Fatalf("load second project rules: %v", err)
+	}
+	if !equalStrings(secondRules.Allow, []string{"run_command(printf save-target)"}) {
+		t.Fatalf("second project rules = %#v", secondRules.Allow)
+	}
+	firstRules, err := permission.LoadLocal(a.projects.Root(), firstProject.ID)
+	if err != nil {
+		t.Fatalf("load first project rules: %v", err)
+	}
+	if len(firstRules.Allow) != 0 {
+		t.Fatalf("first project rules = %#v, want none", firstRules.Allow)
+	}
+}
+
+func TestStagedPermissionOwner(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	events := make(chan Event, 16)
+	a.SetEventHandler(func(ev Event) {
+		events <- ev
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Init(ctx)
+
+	sessionID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	a.ensureRuntime().mu.Lock()
+	unit := a.sessions[sessionID]
+	unit.turnCtx = ctx
+	projectID := unit.projectID
+	exec := unit.pendingExecutor
+	a.ensureRuntime().mu.Unlock()
+	if exec == nil {
+		t.Fatal("pending executor is nil")
+	}
+
+	staged := []tool.StagedCall{{
+		ToolName:   "write_file",
+		ToolCallID: "call-write",
+		Args:       `{"path":"staged.txt","content":"ok"}`,
+		Params: map[string]any{
+			"path":    "staged.txt",
+			"content": "ok",
+		},
+	}}
+	done := make(chan []tool.BatchResult, 1)
+	go func() {
+		done <- exec.ExecutePending(ctx, staged)
+	}()
+	req := waitPermissionEvent(t, events).PermReq
+	if req.SessionID != sessionID || req.ProjectID != projectID {
+		t.Fatalf("staged permission owner = %q/%q, want %q/%q", req.SessionID, req.ProjectID, sessionID, projectID)
+	}
+	if req.BatchIndex != 1 || req.BatchTotal != 1 {
+		t.Fatalf("staged batch position = %d/%d, want 1/1", req.BatchIndex, req.BatchTotal)
+	}
+	if err := a.RespondPermissionActionForSession(sessionID, req.ID, "deny"); err != nil {
+		t.Fatalf("deny staged permission: %v", err)
+	}
+	select {
+	case results := <-done:
+		if len(results) != 1 || results[0].Error != "denied by user" {
+			t.Fatalf("staged results = %#v, want denied by user", results)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("staged executor stayed blocked after denial")
+	}
+}
+
+func TestTaskProjectSync(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	if err := a.ensureSession(); err != nil {
+		t.Fatalf("ensureSession: %v", err)
+	}
+	projectID := a.session.projectID
+	if projectID == "" {
+		t.Fatal("session project id is empty")
+	}
+	tt := a.session.taskToolInst
+	if tt == nil {
+		t.Fatal("task tool is nil")
+	}
+	tt.mu.Lock()
+	taskProjectID := tt.projectID
+	memoriesDir := tt.memoriesDir
+	tt.mu.Unlock()
+	if taskProjectID != projectID {
+		t.Fatalf("task project id = %q, want %q", taskProjectID, projectID)
+	}
+	if memoriesDir == "" {
+		t.Fatal("task memories dir is empty")
+	}
+
+	tagged := make(chan TaggedLoopEvent, 1)
+	tt.taggedEvents = tagged
+	source := make(chan loop.Event, 1)
+	source <- loop.Event{Kind: loop.ToolCallStart, ToolName: "read_file"}
+	close(source)
+	tt.forwardEvents(source, 0, "child-session", taskProjectID, "call-task")
+	got := <-tagged
+	if got.ProjectID != projectID {
+		t.Fatalf("forwarded project id = %q, want %q", got.ProjectID, projectID)
 	}
 }
 
@@ -612,6 +941,31 @@ func waitUntilSessionQueueEmpty(t *testing.T, a *Agent, sessionID string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("session %s did not drain", sessionID)
+}
+
+func waitPermissionEvent(t *testing.T, events <-chan Event) Event {
+	t.Helper()
+	for {
+		select {
+		case ev := <-events:
+			if ev.Kind == EventPermissionRequest && ev.PermReq != nil {
+				return ev
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for permission request")
+		}
+	}
+}
+
+func waitEvent(t *testing.T, events <-chan Event) Event {
+	t.Helper()
+	select {
+	case ev := <-events:
+		return ev
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for event")
+		return Event{}
+	}
 }
 
 func writeTokenFile(t *testing.T, unit *session, entries ...TokenEntry) {

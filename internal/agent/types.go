@@ -31,7 +31,9 @@ const (
 
 // Event is the unified event type emitted by the Agent to adapters.
 type Event struct {
-	Kind EventKind
+	Kind      EventKind
+	SessionID string
+	ProjectID string
 
 	// Loop-level fields (forwarded from loop.Event):
 	ToolName   string
@@ -81,6 +83,8 @@ type PromptWarning struct {
 // PermissionRequest is sent to adapters when a tool needs user approval.
 type PermissionRequest struct {
 	ID                 string
+	SessionID          string
+	ProjectID          string
 	ToolName           string
 	Arg                string
 	ResolvedArg        string

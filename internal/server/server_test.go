@@ -171,6 +171,44 @@ func TestSSEHubConcurrentBroadcastUnsubscribeNoPanic(t *testing.T) {
 	}
 }
 
+func TestSSEDisconnectCleanup(t *testing.T) {
+	s := &Server{
+		agent:             &agent.Agent{},
+		hub:               newSSEHub(),
+		permTimers:        make(map[string]*time.Timer),
+		permTimerSessions: make(map[string]string),
+	}
+	addTimer := func(id string, sessionID string) {
+		timer := time.AfterFunc(time.Hour, func() {})
+		t.Cleanup(func() {
+			timer.Stop()
+		})
+		s.permTimers[id] = timer
+		s.permTimerSessions[id] = sessionID
+	}
+	addTimer("req-a", "session-a")
+	addTimer("req-b", "session-b")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil).WithContext(ctx)
+	s.handleSSE(httptest.NewRecorder(), req)
+	if _, ok := s.permTimers["req-a"]; !ok {
+		t.Fatal("SSE without session cleaned permission timer")
+	}
+
+	ctx, cancel = context.WithCancel(context.Background())
+	cancel()
+	req = httptest.NewRequest(http.MethodGet, "/v1/events?session_id=session-a", nil).WithContext(ctx)
+	s.handleSSE(httptest.NewRecorder(), req)
+	if _, ok := s.permTimers["req-a"]; ok {
+		t.Fatal("session timer remained after matching SSE disconnect")
+	}
+	if _, ok := s.permTimers["req-b"]; !ok {
+		t.Fatal("other session timer was cleaned")
+	}
+}
+
 func TestHandleEventBroadcastsAndSkipsSubagents(t *testing.T) {
 	hub := newSSEHub()
 	ch, unsub := hub.subscribe()

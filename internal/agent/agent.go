@@ -283,6 +283,7 @@ func (a *Agent) registerLiveSessionLocked(unit *session) {
 	if id == "" {
 		return
 	}
+	unit.syncEventOwner()
 	a.ensureSessionMapLocked()
 	a.sessions[id] = unit
 }
@@ -321,6 +322,93 @@ func setSessionProject(unit *session, proj *project.Project) {
 	unit.projectID = proj.ID
 	unit.projectName = proj.Name
 	unit.projectRoot = proj.Path
+	unit.syncEventOwner()
+}
+
+func (a *Agent) setSessionProject(unit *session, proj *project.Project) {
+	setSessionProject(unit, proj)
+	if unit == nil || unit.taskToolInst == nil || proj == nil || a == nil || a.projects == nil {
+		return
+	}
+	unit.taskToolInst.setProject(proj.ID, filepath.Join(a.projects.Root(), proj.ID, "memories"))
+}
+
+func (unit *session) syncEventOwner() {
+	if unit == nil || unit.lp == nil || unit.store == nil {
+		return
+	}
+	unit.lp.SetEventOwner(unit.store.SessionID(), unit.projectID)
+}
+
+func (a *Agent) permissionCheckForProject(projectID, projectRoot string) tool.CheckFunc {
+	cfg := a.cfg
+	return tool.CheckFunc(func(toolName, arg string) permission.Decision {
+		var local permission.Rules
+		if projectID != "" && a.projects != nil {
+			local, _ = permission.LoadLocal(a.projects.Root(), projectID)
+		} else if a.projects != nil {
+			if proj, err := a.projects.Current(); err == nil && proj != nil {
+				local, _ = permission.LoadLocal(a.projects.Root(), proj.ID)
+			}
+		}
+		root := projectRoot
+		if root == "" {
+			root = a.projectRoot
+		}
+		var global permission.Rules
+		if cfg != nil {
+			global = cfg.Permissions
+		}
+		return permission.Check(local, global, toolName, arg, root, a.home, root)
+	})
+}
+
+func (a *Agent) permissionAskForSession(unitRef func() *session, projectID string, useTurnContext bool) tool.AskFunc {
+	return tool.AskFunc(func(ctx context.Context, req permission.Request) permission.ResponseAction {
+		return a.askPermissionForSession(ctx, unitRef(), req, projectID, useTurnContext)
+	})
+}
+
+func (a *Agent) permissionAskActionForSession(unitRef func() *session, projectID string, useTurnContext bool) tool.AskActionFunc {
+	return tool.AskActionFunc(func(ctx context.Context, req permission.Request) permission.ResponseAction {
+		return a.askPermissionForSession(ctx, unitRef(), req, projectID, useTurnContext)
+	})
+}
+
+func (a *Agent) askPermissionForSession(ctx context.Context, unit *session, req permission.Request, projectID string, useTurnContext bool) permission.ResponseAction {
+	if a.gate == nil {
+		return permission.ResponseDeny
+	}
+	req = permissionRequestForSession(unit, req, projectID)
+	waitCtx := ctx
+	if useTurnContext {
+		waitCtx = nil
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		if unit != nil {
+			waitCtx = unit.turnCtx
+		}
+		rt.mu.Unlock()
+	}
+	if waitCtx == nil {
+		return permission.ResponseDeny
+	}
+	return a.gate.AskRequest(waitCtx, req)
+}
+
+func permissionRequestForSession(unit *session, req permission.Request, projectID string) permission.Request {
+	if unit != nil {
+		if unit.store != nil {
+			req.SessionID = unit.store.SessionID()
+		}
+		if unit.projectID != "" {
+			req.ProjectID = unit.projectID
+		}
+	}
+	if req.ProjectID == "" {
+		req.ProjectID = projectID
+	}
+	return req
 }
 
 func (a *Agent) refreshCurrentSessionProjectLocked() {
@@ -328,7 +416,7 @@ func (a *Agent) refreshCurrentSessionProjectLocked() {
 		return
 	}
 	if proj, err := a.projects.Current(); err == nil && proj != nil {
-		setSessionProject(a.session, proj)
+		a.setSessionProject(a.session, proj)
 	}
 }
 
@@ -344,9 +432,11 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 		return nil, err
 	}
 	rt := a.ensureRuntime()
-	checkPolicy := rt.permissionPolicy.checkFunc()
-	askPolicy := rt.permissionPolicy.askFunc()
-	askActionPolicy := rt.permissionPolicy.askActionFunc()
+	var unit *session
+	unitRef := func() *session { return unit }
+	checkPolicy := a.permissionCheckForProject(projectID, projectRoot)
+	askPolicy := a.permissionAskForSession(unitRef, projectID, true)
+	askActionPolicy := a.permissionAskActionForSession(unitRef, projectID, false)
 	fileTracker := tool.NewFileTracker()
 	writeDir := strings.TrimSpace(resolved.WriteDir)
 	options := tool.CapabilityOptions{WriteDir: writeDir}
@@ -410,7 +500,7 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 	unitAssembler := prompt.New(projectRoot, a.home)
 	promptUnit := &session{activeAgentType: activeAgentType, projectID: projectID, projectName: projectName, projectRoot: projectRoot, assembler: unitAssembler}
 	res := a.assembleSystemPromptForSessionLocked(promptUnit)
-	unit := newRunningUnit(runningUnitConfig{
+	unit = newRunningUnit(runningUnitConfig{
 		Runtime:         rt,
 		ActiveAgentType: activeAgentType,
 		ProjectID:       projectID,
@@ -488,10 +578,12 @@ func New(c Config) (*Agent, error) {
 
 	gate := permission.NewGate(func(ctx context.Context, req permission.Request) {
 		ev := loop.Event{
-			Kind:     loop.PermissionRequest,
-			ToolName: req.ToolName,
-			PermID:   req.ID,
-			PermArg:  req.Arg,
+			Kind:      loop.PermissionRequest,
+			SessionID: req.SessionID,
+			ProjectID: req.ProjectID,
+			ToolName:  req.ToolName,
+			PermID:    req.ID,
+			PermArg:   req.Arg,
 			Metadata: map[string]any{
 				"resolved_arg":         req.ResolvedArg,
 				"can_allow_all":        req.CanAllowAll,
@@ -509,27 +601,23 @@ func New(c Config) (*Agent, error) {
 	})
 	a.gate = gate
 
-	checkFunc := tool.CheckFunc(func(toolName, arg string) permission.Decision {
-		var local permission.Rules
-		if proj, err := resolver.Current(); err == nil && proj != nil {
-			local, _ = permission.LoadLocal(resolver.Root(), proj.ID)
-		}
-		return permission.Check(local, c.Cfg.Permissions, toolName, arg, c.ProjectRoot, c.Home, c.ProjectRoot)
-	})
+	var projectID, projectName, memoriesDir string
+	if proj, err := resolver.Current(); err == nil && proj != nil {
+		projectID = proj.ID
+		projectName = proj.Name
+		memoriesDir = filepath.Join(resolver.Root(), proj.ID, "memories")
+	}
 
-	askFunc := tool.AskFunc(func(ctx context.Context, req permission.Request) permission.ResponseAction {
-		a.ensureRuntime().mu.Lock()
-		turnCtx := a.ensureRuntime().session().turnCtx
-		a.ensureRuntime().mu.Unlock()
-		if turnCtx == nil {
-			return permission.ResponseDeny
+	var initialUnit *session
+	initialUnitRef := func() *session {
+		if initialUnit != nil {
+			return initialUnit
 		}
-		return gate.AskRequest(turnCtx, req)
-	})
-
-	askActionFunc := tool.AskActionFunc(func(ctx context.Context, req permission.Request) permission.ResponseAction {
-		return gate.AskRequest(ctx, req)
-	})
+		return a.session
+	}
+	checkFunc := a.permissionCheckForProject(projectID, c.ProjectRoot)
+	askFunc := a.permissionAskForSession(initialUnitRef, projectID, true)
+	askActionFunc := a.permissionAskActionForSession(initialUnitRef, projectID, false)
 	rt.permissionPolicy = runtimePermissionPolicy{Check: checkFunc, Ask: askFunc, AskAction: askActionFunc}
 	checkPolicy := rt.permissionPolicy.checkFunc()
 	askPolicy := rt.permissionPolicy.askFunc()
@@ -616,13 +704,6 @@ func New(c Config) (*Agent, error) {
 	memStore := memory.NewStore(embedder, resolver.Root(), c.Home)
 	a.memoryStore = memStore
 	a.memoryHooks = memStore
-
-	var projectID, projectName, memoriesDir string
-	if proj, err := resolver.Current(); err == nil && proj != nil {
-		projectID = proj.ID
-		projectName = proj.Name
-		memoriesDir = filepath.Join(resolver.Root(), proj.ID, "memories")
-	}
 	registry.Register(tool.WrapWithPermission(tool.NewSaveMemory(memStore, memoriesDir), checkPolicy, askPolicy))
 	registry.Register(tool.WrapWithPermission(tool.NewSearchMemory(memStore, projectID), checkPolicy, askPolicy))
 	registry.Register(tool.WrapWithPermission(tool.NewSearchHistory(memStore, projectID), checkPolicy, askPolicy))
@@ -669,7 +750,7 @@ func New(c Config) (*Agent, error) {
 	a.pendingAgentWarnings = agentWarningsToPromptWarnings(agentTypes.Warnings())
 
 	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askActionPolicy, primaryOptions)
-	a.session = newRunningUnit(runningUnitConfig{
+	initialUnit = newRunningUnit(runningUnitConfig{
 		Runtime:         rt,
 		ActiveAgentType: "primary",
 		ProjectID:       projectID,
@@ -690,6 +771,7 @@ func New(c Config) (*Agent, error) {
 			PendingExecutor:    pendingExecutor,
 		},
 	})
+	a.session = initialUnit
 	a.session.lp.SetContextTransformer(sessionLoopHooks{agent: a, unit: a.session})
 	a.session.lp.SetUsageRecorder(sessionLoopHooks{agent: a, unit: a.session})
 	tt.usageRecorder = sessionLoopHooks{agent: a, unit: a.session}
@@ -708,6 +790,30 @@ func (rt *runtime) setEventHandler(fn func(Event)) {
 	rt.eventMu.Lock()
 	defer rt.eventMu.Unlock()
 	rt.onEvent = fn
+}
+
+// SubscribeEvents registers an additional event consumer and returns an unsubscribe function.
+func (a *Agent) SubscribeEvents(fn func(Event)) func() {
+	return a.ensureRuntime().subscribeEvents(fn)
+}
+
+func (rt *runtime) subscribeEvents(fn func(Event)) func() {
+	if fn == nil {
+		return func() {}
+	}
+	rt.eventMu.Lock()
+	if rt.eventSubscribers == nil {
+		rt.eventSubscribers = make(map[int]func(Event))
+	}
+	rt.nextEventSubscriber++
+	id := rt.nextEventSubscriber
+	rt.eventSubscribers[id] = fn
+	rt.eventMu.Unlock()
+	return func() {
+		rt.eventMu.Lock()
+		delete(rt.eventSubscribers, id)
+		rt.eventMu.Unlock()
+	}
 }
 
 // Init starts background goroutines, runs the session sweep, and
@@ -770,9 +876,16 @@ func (a *Agent) emitEvent(ev Event) {
 func (rt *runtime) emitEvent(ev Event) {
 	rt.eventMu.RLock()
 	fn := rt.onEvent
+	subscribers := make([]func(Event), 0, len(rt.eventSubscribers))
+	for _, sub := range rt.eventSubscribers {
+		subscribers = append(subscribers, sub)
+	}
 	rt.eventMu.RUnlock()
 	if fn != nil {
 		fn(ev)
+	}
+	for _, sub := range subscribers {
+		sub(ev)
 	}
 }
 
@@ -1007,11 +1120,15 @@ func (a *Agent) dispatchLoopEvent(ev loop.Event) {
 
 func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 	a := rt.agent
+	sessionID := ev.SessionID
+	projectID := ev.ProjectID
 	switch ev.Kind {
 	case loop.TextDelta:
-		a.emitEvent(Event{Kind: EventTextDelta, Result: ev.Result})
+		a.emitEvent(Event{Kind: EventTextDelta, SessionID: sessionID, ProjectID: projectID, Result: ev.Result})
 	case loop.ToolCallStart:
 		a.emitEvent(Event{
+			SessionID:  sessionID,
+			ProjectID:  projectID,
 			Kind:       EventToolCallStart,
 			ToolCallID: ev.ToolCallID,
 			ToolName:   ev.ToolName,
@@ -1019,6 +1136,8 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 		})
 	case loop.ToolCallEnd:
 		a.emitEvent(Event{
+			SessionID:  sessionID,
+			ProjectID:  projectID,
 			Kind:       EventToolCallEnd,
 			ToolCallID: ev.ToolCallID,
 			ToolName:   ev.ToolName,
@@ -1029,6 +1148,8 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 		})
 	case loop.BackgroundProcessComplete:
 		a.emitEvent(Event{
+			SessionID:         sessionID,
+			ProjectID:         projectID,
 			Kind:              EventBackgroundProcessComplete,
 			Result:            ev.Result,
 			IsError:           ev.IsError,
@@ -1037,38 +1158,26 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 		})
 	case loop.UserMessageDisplay:
 		a.emitEvent(Event{
-			Kind:   EventUserMessageDisplay,
-			Turn:   ev.Turn,
-			Result: ev.Result,
+			SessionID: sessionID,
+			ProjectID: projectID,
+			Kind:      EventUserMessageDisplay,
+			Turn:      ev.Turn,
+			Result:    ev.Result,
 		})
 	case loop.GenericSystemSignalDisplay:
 		a.emitEvent(Event{
-			Kind:   EventGenericSystemSignal,
-			Turn:   ev.Turn,
-			Result: ev.Result,
+			SessionID: sessionID,
+			ProjectID: projectID,
+			Kind:      EventGenericSystemSignal,
+			Turn:      ev.Turn,
+			Result:    ev.Result,
 		})
 	case loop.PermissionRequest:
-		canAllowAll, _ := ev.Metadata["can_allow_all"].(bool)
-		disableProjectSave, _ := ev.Metadata["disable_project_save"].(bool)
-		batchIndex, _ := ev.Metadata["batch_index"].(int)
-		batchTotal, _ := ev.Metadata["batch_total"].(int)
-		batchFiles, _ := ev.Metadata["batch_files"].([]string)
-		batchResolvedFiles, _ := ev.Metadata["batch_resolved_files"].([]string)
-		resolvedArg, _ := ev.Metadata["resolved_arg"].(string)
 		a.emitEvent(Event{
-			Kind: EventPermissionRequest,
-			PermReq: &PermissionRequest{
-				ID:                 ev.PermID,
-				ToolName:           ev.ToolName,
-				Arg:                ev.PermArg,
-				ResolvedArg:        resolvedArg,
-				CanAllowAll:        canAllowAll,
-				DisableProjectSave: disableProjectSave,
-				BatchIndex:         batchIndex,
-				BatchTotal:         batchTotal,
-				BatchFiles:         batchFiles,
-				BatchResolvedFiles: batchResolvedFiles,
-			},
+			SessionID: sessionID,
+			ProjectID: projectID,
+			Kind:      EventPermissionRequest,
+			PermReq:   permissionRequestFromLoopEvent(ev, sessionID, projectID),
 		})
 	case loop.Usage:
 		a.recordUsage(ev)
@@ -1078,6 +1187,30 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 			kind = "protocol_warning"
 		}
 		a.addWarning("protocol", prompt.Warning{Kind: kind, Message: ev.Result})
+	}
+}
+
+func permissionRequestFromLoopEvent(ev loop.Event, sessionID, projectID string) *PermissionRequest {
+	canAllowAll, _ := ev.Metadata["can_allow_all"].(bool)
+	disableProjectSave, _ := ev.Metadata["disable_project_save"].(bool)
+	batchIndex, _ := ev.Metadata["batch_index"].(int)
+	batchTotal, _ := ev.Metadata["batch_total"].(int)
+	batchFiles, _ := ev.Metadata["batch_files"].([]string)
+	batchResolvedFiles, _ := ev.Metadata["batch_resolved_files"].([]string)
+	resolvedArg, _ := ev.Metadata["resolved_arg"].(string)
+	return &PermissionRequest{
+		ID:                 ev.PermID,
+		SessionID:          sessionID,
+		ProjectID:          projectID,
+		ToolName:           ev.ToolName,
+		Arg:                ev.PermArg,
+		ResolvedArg:        resolvedArg,
+		CanAllowAll:        canAllowAll,
+		DisableProjectSave: disableProjectSave,
+		BatchIndex:         batchIndex,
+		BatchTotal:         batchTotal,
+		BatchFiles:         batchFiles,
+		BatchResolvedFiles: batchResolvedFiles,
 	}
 }
 
@@ -1098,6 +1231,8 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 	rt.mu.Unlock()
 	if isNew {
 		a.emitEvent(Event{
+			SessionID:         tev.SessionID,
+			ProjectID:         tev.ProjectID,
 			Kind:              EventSubagentStart,
 			SubagentSessionID: tev.SessionID,
 			TaskIndex:         tev.TaskIndex,
@@ -1106,7 +1241,13 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 	}
 
 	ev := tev.Event
+	projectID := tev.ProjectID
+	if projectID == "" {
+		projectID = ev.ProjectID
+	}
 	base := Event{
+		SessionID:         tev.SessionID,
+		ProjectID:         projectID,
 		SubagentSessionID: tev.SessionID,
 		TaskIndex:         tev.TaskIndex,
 		ToolCallID:        tev.ToolCallID,
@@ -1141,6 +1282,9 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 				Output:   ev.BackgroundProcess.Output,
 			}
 		}
+	case loop.PermissionRequest:
+		base.Kind = EventPermissionRequest
+		base.PermReq = permissionRequestFromLoopEvent(ev, tev.SessionID, projectID)
 	case loop.Usage:
 		a.recordUsage(ev)
 		return
@@ -1195,6 +1339,8 @@ func (a *Agent) recordUsageForSession(unit *session, ev loop.Event) {
 	unit.tokensMu.Unlock()
 
 	a.emitEvent(Event{
+		SessionID:  sessionIDOf(unit),
+		ProjectID:  unit.projectID,
 		Kind:       EventUsage,
 		Model:      model,
 		Cache:      ev.Cache,
@@ -1317,7 +1463,7 @@ func (a *Agent) beforeModelRequestForSession(ctx context.Context, unit *session,
 		if checkpoint.Force {
 			return loop.ContextTransformResult{}, err
 		}
-		a.emitEvent(Event{Kind: EventError, Error: fmt.Sprintf("compaction: %v", err), Turn: checkpoint.Turn})
+		a.emitEvent(Event{Kind: EventError, SessionID: sessionIDOf(unit), ProjectID: unit.projectID, Error: fmt.Sprintf("compaction: %v", err), Turn: checkpoint.Turn})
 		return loop.ContextTransformResult{}, nil
 	}
 	return loop.ContextTransformResult{Transformed: true, ActiveTurnStart: activeStart}, nil
@@ -1355,10 +1501,12 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 	if unit == nil || unit.lp == nil || unit.store == nil {
 		return 0, fmt.Errorf("no session open")
 	}
-	a.emitEvent(Event{Kind: EventCompactionStart})
+	sessionID := sessionIDOf(unit)
+	projectID := unit.projectID
+	a.emitEvent(Event{Kind: EventCompactionStart, SessionID: sessionID, ProjectID: projectID})
 	refreshSessionNow := false
 	defer func() {
-		a.emitEvent(Event{Kind: EventCompactionEnd, RefreshSession: refreshSessionNow})
+		a.emitEvent(Event{Kind: EventCompactionEnd, SessionID: sessionID, ProjectID: projectID, RefreshSession: refreshSessionNow})
 	}()
 
 	messages := unit.lp.Messages()
@@ -1615,7 +1763,7 @@ func (a *Agent) resumeMostRecent() error {
 	if err := a.store.LoadSession(id); err != nil {
 		return err
 	}
-	setSessionProject(a.session, proj)
+	a.setSessionProject(a.session, proj)
 	a.setCurrentSessionLocked(a.session)
 	if err := a.loadHistoryIntoLoop(); err != nil {
 		return err
@@ -1886,7 +2034,7 @@ func (a *Agent) ensureSession() error {
 	if err := a.store.BeginNewSession(a.projectRoot); err != nil {
 		return err
 	}
-	setSessionProject(a.session, proj)
+	a.setSessionProject(a.session, proj)
 	a.setCurrentSessionLocked(a.session)
 	if a.currentRef.Provider != "" && a.currentRef.Model != "" {
 		if err := a.store.SetModel(a.currentRef.Provider, a.currentRef.Model); err != nil {
@@ -1952,9 +2100,11 @@ func (rt *runtime) submit(ctx context.Context, unit *session, content string) (S
 	unit.queueVersion++
 	items := copyQueue(unit.queue)
 	version := unit.queueVersion
+	sessionID := sessionIDOf(unit)
+	projectID := unit.projectID
 	rt.mu.Unlock()
 	rt.nudgeQueueDrainer()
-	a.emitEvent(Event{Kind: EventQueueChanged, Queue: items, QueueVersion: version})
+	a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionID, ProjectID: projectID, Queue: items, QueueVersion: version})
 	return SubmitResult{Started: false, Queue: items, Version: version}, nil
 }
 
@@ -2130,12 +2280,15 @@ func (rt *runtime) beginTransition() {
 func (rt *runtime) endTransition() {
 	a := rt.agent
 	rt.mu.Lock()
-	rt.session().transitioning = false
-	items := copyQueue(rt.session().queue)
-	version := rt.session().queueVersion
+	unit := rt.session()
+	unit.transitioning = false
+	items := copyQueue(unit.queue)
+	version := unit.queueVersion
+	sessionID := sessionIDOf(unit)
+	projectID := unit.projectID
 	active := a.store != nil && a.store.Active()
 	rt.mu.Unlock()
-	a.emitEvent(Event{Kind: EventQueueChanged, Queue: items, QueueVersion: version})
+	a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionID, ProjectID: projectID, Queue: items, QueueVersion: version})
 	if len(items) > 0 && active {
 		rt.nudgeQueueDrainer()
 	}
@@ -2204,9 +2357,11 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 	turnCtx, cancel := context.WithCancel(ctx)
 	unit.turnCancel = cancel
 	unit.turnCtx = turnCtx
+	sessionID := sessionIDOf(unit)
+	projectID := unit.projectID
 	rt.mu.Unlock()
 
-	a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: version})
+	a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionID, ProjectID: projectID, Queue: emptyQueue(), QueueVersion: version})
 	rt.launchTurn(ctx, unit, turnCtx, cancel, []string{contents[len(contents)-1]})
 }
 
@@ -2239,9 +2394,12 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 	if unit == nil || unit.store == nil || unit.lp == nil {
 		return 0
 	}
+	unit.syncEventOwner()
+	sessionID := sessionIDOf(unit)
+	projectID := unit.projectID
 	turn := unit.store.BeginTurn()
 
-	a.emitEvent(Event{Kind: EventTurnStart, Turn: turn})
+	a.emitEvent(Event{Kind: EventTurnStart, SessionID: sessionID, ProjectID: projectID, Turn: turn})
 
 	rt.mu.Lock()
 	a.ensureActiveModelForSessionLocked(unit)
@@ -2292,9 +2450,9 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 		}
 
 		if err != nil {
-			a.emitEvent(Event{Kind: EventError, Error: a.turnErrorMessage(err), Turn: turn})
+			a.emitEvent(Event{Kind: EventError, SessionID: sessionID, ProjectID: projectID, Error: a.turnErrorMessage(err), Turn: turn})
 		}
-		a.emitEvent(Event{Kind: EventTurnEnd, Turn: turn, Cancelled: turnCtx.Err() != nil, RefreshSession: rt.takeDeferredSessionRefreshAfterTurnForSession(unit)})
+		a.emitEvent(Event{Kind: EventTurnEnd, SessionID: sessionID, ProjectID: projectID, Turn: turn, Cancelled: turnCtx.Err() != nil, RefreshSession: rt.takeDeferredSessionRefreshAfterTurnForSession(unit)})
 	}()
 
 	return turn
@@ -2314,7 +2472,7 @@ func (a *Agent) Cancel() error {
 		cancel()
 	}
 	if a.gate != nil {
-		a.gate.CancelAll()
+		a.gate.CancelSession(a.currentPermissionSessionID())
 	}
 	return nil
 }
@@ -2328,6 +2486,9 @@ func (a *Agent) CancelSession(sessionID string) error {
 		rt.mu.Unlock()
 		if cancel != nil {
 			cancel()
+		}
+		if a.gate != nil {
+			a.gate.CancelSession(sessionID)
 		}
 		return nil
 	}
@@ -2376,46 +2537,108 @@ func (rt *runtime) busySnapshotLocked(unit *session) bool {
 
 // RespondPermission answers a pending permission prompt.
 func (a *Agent) RespondPermission(id string, allow bool) error {
-	return a.gate.Respond(id, allow)
+	return a.RespondPermissionForSession(a.currentPermissionSessionID(), id, allow)
 }
 
 // RespondPermissionAction answers a pending permission prompt with an action.
 func (a *Agent) RespondPermissionAction(id string, action string) error {
-	return a.gate.RespondAction(id, action)
+	return a.RespondPermissionActionForSession(a.currentPermissionSessionID(), id, action)
+}
+
+func (a *Agent) RespondPermissionForSession(sessionID string, id string, allow bool) error {
+	if a.gate == nil {
+		return permission.ErrUnknownRequest
+	}
+	return a.gate.RespondForSession(sessionID, id, allow)
+}
+
+func (a *Agent) RespondPermissionActionForSession(sessionID string, id string, action string) error {
+	if a.gate == nil {
+		return permission.ErrUnknownRequest
+	}
+	return a.gate.RespondActionForSession(sessionID, id, action)
 }
 
 // PermissionSuggest returns pattern suggestions for the "Allow for project" UI.
 func (a *Agent) PermissionSuggest(toolName, arg string) []PermissionSuggestion {
-	return permission.Suggest(toolName, arg, a.projectRoot)
+	suggestions, err := a.PermissionSuggestForSession(a.currentPermissionSessionID(), toolName, arg)
+	if err != nil {
+		return nil
+	}
+	return suggestions
+}
+
+func (a *Agent) PermissionSuggestForSession(sessionID, toolName, arg string) ([]PermissionSuggestion, error) {
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	unit, err := a.liveSessionLocked(sessionID)
+	rt.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return permission.Suggest(toolName, arg, unit.projectRoot), nil
+}
+
+func (a *Agent) PermissionSuggestForProject(projectID, toolName, arg string) ([]PermissionSuggestion, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return nil, fmt.Errorf("project id is required")
+	}
+	projects, err := project.List(a.projects.Root())
+	if err != nil {
+		return nil, err
+	}
+	for i := range projects {
+		if projects[i].ID == projectID {
+			return permission.Suggest(toolName, arg, projects[i].Path), nil
+		}
+	}
+	return nil, fmt.Errorf("unknown project %q", projectID)
 }
 
 // SaveProjectPermission appends patterns to the project's local
 // permissions.json, then allows the pending request.
 func (a *Agent) SaveProjectPermission(id string, patterns []string) error {
-	if a.gate != nil {
-		canSave, err := a.gate.CanSaveProjectPermission(id)
-		if err == nil && !canSave {
-			return errors.New("project permission save is disabled for this request")
-		}
-		if err != nil && !errors.Is(err, permission.ErrUnknownRequest) {
-			return err
-		}
+	return a.SaveProjectPermissionForSession(a.currentPermissionSessionID(), id, patterns)
+}
+
+func (a *Agent) SaveProjectPermissionForSession(sessionID string, id string, patterns []string) error {
+	if a.gate == nil {
+		return permission.ErrUnknownRequest
 	}
-	proj, err := a.projects.Ensure()
+	req, err := a.gate.ProjectSaveRequest(sessionID, id, true)
 	if err != nil {
 		return err
 	}
+	projectID := req.ProjectID
+	if projectID == "" {
+		proj, err := a.projects.Ensure()
+		if err != nil {
+			return err
+		}
+		projectID = proj.ID
+	}
 	add := permission.Rules{Allow: patterns}
-	if err := permission.SaveLocal(a.projects.Root(), proj.ID, add); err != nil {
+	if err := permission.SaveLocal(a.projects.Root(), projectID, add); err != nil {
 		return err
 	}
-	if err := a.gate.Respond(id, true); err != nil {
+	if err := a.gate.RespondForSession(sessionID, id, true); err != nil {
 		if errors.Is(err, permission.ErrUnknownRequest) {
 			return nil
 		}
 		return err
 	}
 	return nil
+}
+
+func (a *Agent) currentPermissionSessionID() string {
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if a.currentSessionID != "" {
+		return a.currentSessionID
+	}
+	return sessionIDOf(a.session)
 }
 
 // SwitchModel changes the active model by provider-prefixed catalog ref.
@@ -3168,7 +3391,7 @@ func (a *Agent) SessionSwitch(id string) error {
 	if err := a.store.LoadSession(id); err != nil {
 		return err
 	}
-	setSessionProject(a.session, proj)
+	a.setSessionProject(a.session, proj)
 	delete(a.sessions, oldID)
 	a.setCurrentSessionLocked(a.session)
 	meta, err := a.store.Meta()
@@ -3221,9 +3444,11 @@ func (a *Agent) SessionNew() error {
 	// Registered before the lock so it emits after unlock (defer LIFO).
 	var clearedVersion int
 	var queueCleared bool
+	var eventSessionID string
+	var eventProjectID string
 	defer func() {
 		if queueCleared {
-			a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: clearedVersion})
+			a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
 		}
 	}()
 	a.ensureRuntime().mu.Lock()
@@ -3233,6 +3458,8 @@ func (a *Agent) SessionNew() error {
 	}
 	defer a.ensureRuntime().mu.Unlock()
 
+	eventSessionID = sessionIDOf(a.session)
+	eventProjectID = a.session.projectID
 	if _, err := a.store.Close(); err != nil {
 		return err
 	}
@@ -3321,6 +3548,9 @@ func (a *Agent) SessionArchive(id string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if a.gate != nil {
+		a.gate.CancelSession(id)
+	}
 	if err := snapshot.ArchiveSession(sessionsRoot, id); err != nil {
 		return false, err
 	}
@@ -3340,6 +3570,9 @@ func (a *Agent) SessionDelete(id string) (bool, error) {
 	closedCurrent, err := a.closeIfCurrent(id)
 	if err != nil {
 		return false, err
+	}
+	if a.gate != nil {
+		a.gate.CancelSession(id)
 	}
 	if a.memoryHooks != nil {
 		_ = a.memoryHooks.DeleteSessionSummaries(id)
@@ -3712,9 +3945,11 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 	// irreversible store mutation and emit after unlock (defer LIFO).
 	var clearedVersion int
 	var queueCleared bool
+	var eventSessionID string
+	var eventProjectID string
 	defer func() {
 		if queueCleared {
-			a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: clearedVersion})
+			a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
 		}
 	}()
 	a.ensureRuntime().mu.Lock()
@@ -3729,6 +3964,8 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		return TurnActionResult{}, fmt.Errorf("turn must be >= 1")
 	}
 
+	eventSessionID = sessionIDOf(unit)
+	eventProjectID = unit.projectID
 	prefill := a.userMessageContentForTurnForSession(unit, turn)
 	result := TurnActionResult{Action: action, Turn: turn}
 
@@ -3905,9 +4142,11 @@ func (a *Agent) RevertHistoryForSession(sessionID string, turn int) error {
 func (a *Agent) revertHistoryForSession(unit *session, turn int) error {
 	var clearedVersion int
 	var queueCleared bool
+	var eventSessionID string
+	var eventProjectID string
 	defer func() {
 		if queueCleared {
-			a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: clearedVersion})
+			a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
 		}
 	}()
 	a.ensureRuntime().mu.Lock()
@@ -3918,6 +4157,8 @@ func (a *Agent) revertHistoryForSession(unit *session, turn int) error {
 	if unit.busy {
 		return fmt.Errorf("cannot revert while a turn is running")
 	}
+	eventSessionID = sessionIDOf(unit)
+	eventProjectID = unit.projectID
 	if err := unit.store.RevertHistory(turn); err != nil {
 		return err
 	}
@@ -3947,9 +4188,11 @@ func (a *Agent) ForkSessionForSession(sessionID string, turn int) error {
 func (a *Agent) forkSessionForSession(unit *session, turn int) error {
 	var clearedVersion int
 	var queueCleared bool
+	var eventSessionID string
+	var eventProjectID string
 	defer func() {
 		if queueCleared {
-			a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: clearedVersion})
+			a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
 		}
 	}()
 	a.ensureRuntime().mu.Lock()
@@ -3960,6 +4203,8 @@ func (a *Agent) forkSessionForSession(unit *session, turn int) error {
 	if unit.busy {
 		return fmt.Errorf("cannot fork while a turn is running")
 	}
+	eventSessionID = sessionIDOf(unit)
+	eventProjectID = unit.projectID
 	oldID := unit.store.SessionID()
 	newID, _, err := unit.store.ForkInto(turn)
 	if err != nil {

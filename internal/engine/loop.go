@@ -144,6 +144,8 @@ const (
 // activity as first-class items instead of parsing the text trace.
 type Event struct {
 	Kind       EventKind
+	SessionID  string
+	ProjectID  string
 	ToolName   string
 	ToolCallID string
 	Args       string
@@ -234,8 +236,11 @@ type Loop struct {
 	// session the store currently holds. May be nil for tests.
 	store Store
 
-	trace  io.Writer
-	events chan<- Event
+	trace        io.Writer
+	events       chan<- Event
+	eventOwnerMu sync.RWMutex
+	eventSession string
+	eventProject string
 
 	droppedEvents int
 
@@ -298,6 +303,14 @@ func (l *Loop) SetTrace(w io.Writer) {
 // SetEvents registers a channel to receive structured tool call events.
 func (l *Loop) SetEvents(ch chan<- Event) { l.events = ch }
 
+// SetEventOwner stamps emitted events with their owning session/project.
+func (l *Loop) SetEventOwner(sessionID, projectID string) {
+	l.eventOwnerMu.Lock()
+	l.eventSession = sessionID
+	l.eventProject = projectID
+	l.eventOwnerMu.Unlock()
+}
+
 // SetContextTransformer configures the before-model-request transform hook.
 func (l *Loop) SetContextTransformer(t ContextTransformer) { l.contextTransformer = t }
 
@@ -318,12 +331,14 @@ func (l *Loop) SetPendingExecutor(exec tool.PendingExecutor) {
 
 func (l *Loop) emit(ev Event) {
 	if ev.Kind == Usage && l.usageRecorder != nil {
+		l.stampEventOwner(&ev)
 		l.usageRecorder.RecordUsage(ev)
 		return
 	}
 	if l.events == nil {
 		return
 	}
+	l.stampEventOwner(&ev)
 	if isTranscriptEvent(ev.Kind) {
 		// Transcript display events back the backend-owned display-order
 		// invariant: every persisted display item must produce exactly
@@ -336,6 +351,7 @@ func (l *Loop) emit(ev Event) {
 	}
 	if l.droppedEvents > 0 && ev.Kind != Warning {
 		warning := Event{Kind: Warning, Result: fmt.Sprintf("dropped %d events because event channel was full", l.droppedEvents)}
+		l.stampEventOwner(&warning)
 		select {
 		case l.events <- warning:
 			l.droppedEvents = 0
@@ -349,6 +365,22 @@ func (l *Loop) emit(ev Event) {
 	}
 }
 
+func (l *Loop) stampEventOwner(ev *Event) {
+	if ev == nil || (ev.SessionID != "" && ev.ProjectID != "") {
+		return
+	}
+	l.eventOwnerMu.RLock()
+	sessionID := l.eventSession
+	projectID := l.eventProject
+	l.eventOwnerMu.RUnlock()
+	if ev.SessionID == "" {
+		ev.SessionID = sessionID
+	}
+	if ev.ProjectID == "" {
+		ev.ProjectID = projectID
+	}
+}
+
 // flushDroppedWarningLocked emits the pending dropped-events warning before a
 // non-droppable event so chronological ordering is preserved. The warning
 // itself is still droppable.
@@ -357,6 +389,7 @@ func (l *Loop) flushDroppedWarningLocked() {
 		return
 	}
 	warning := Event{Kind: Warning, Result: fmt.Sprintf("dropped %d events because event channel was full", l.droppedEvents)}
+	l.stampEventOwner(&warning)
 	select {
 	case l.events <- warning:
 		l.droppedEvents = 0

@@ -62,7 +62,7 @@ func TestForwardEventsTagsEvents(t *testing.T) {
 	source <- loop.Event{Kind: loop.ToolCallEnd, ToolName: "read_file", Result: "done"}
 	close(source)
 
-	task.forwardEvents(source, 2, "subsession", "parent-call")
+	task.forwardEvents(source, 2, "subsession", "project-a", "parent-call")
 	close(tagged)
 
 	var got []TaggedLoopEvent
@@ -73,8 +73,8 @@ func TestForwardEventsTagsEvents(t *testing.T) {
 		t.Fatalf("tagged events = %d, want 3", len(got))
 	}
 	for i, ev := range got {
-		if ev.SessionID != "subsession" || ev.TaskIndex != 2 || ev.ToolCallID != "parent-call" {
-			t.Fatalf("event[%d] tag = session:%q index:%d call:%q", i, ev.SessionID, ev.TaskIndex, ev.ToolCallID)
+		if ev.SessionID != "subsession" || ev.ProjectID != "project-a" || ev.TaskIndex != 2 || ev.ToolCallID != "parent-call" {
+			t.Fatalf("event[%d] tag = session:%q project:%q index:%d call:%q", i, ev.SessionID, ev.ProjectID, ev.TaskIndex, ev.ToolCallID)
 		}
 	}
 	if got[0].Event.Kind != loop.ToolCallStart || got[1].Event.Kind != loop.TextDelta || got[2].Event.Kind != loop.ToolCallEnd {
@@ -87,7 +87,7 @@ func TestForwardEventsNoopWhenTaggedEventsNil(t *testing.T) {
 	source := make(chan loop.Event, 1)
 	source <- loop.Event{Kind: loop.TextDelta, Result: "ignored"}
 	close(source)
-	task.forwardEvents(source, 0, "", "")
+	task.forwardEvents(source, 0, "", "", "")
 }
 
 func TestForwardEventsBurst(t *testing.T) {
@@ -100,7 +100,7 @@ func TestForwardEventsBurst(t *testing.T) {
 	forwardDone.Add(1)
 	go func() {
 		defer forwardDone.Done()
-		task.forwardEvents(source, 1, "session", "parent")
+		task.forwardEvents(source, 1, "session", "project", "parent")
 	}()
 
 	var received []TaggedLoopEvent
@@ -125,7 +125,7 @@ func TestForwardEventsBurst(t *testing.T) {
 		t.Fatalf("forwarded burst events = %d, want %d", len(received), count)
 	}
 	for i, ev := range received {
-		if ev.SessionID != "session" || ev.TaskIndex != 1 || ev.ToolCallID != "parent" || ev.Event.Kind != loop.TextDelta {
+		if ev.SessionID != "session" || ev.ProjectID != "project" || ev.TaskIndex != 1 || ev.ToolCallID != "parent" || ev.Event.Kind != loop.TextDelta {
 			t.Fatalf("event[%d] = %+v, want stable tags", i, ev)
 		}
 	}
@@ -142,6 +142,7 @@ func TestDrainPendingLoopEventsDrainsTaggedSubagentEvents(t *testing.T) {
 
 	rt.taggedEvents <- TaggedLoopEvent{
 		SessionID:  "child-session",
+		ProjectID:  "project-a",
 		TaskIndex:  1,
 		ToolCallID: "parent-task",
 		Event:      loop.Event{Kind: loop.ToolCallStart, ToolCallID: "child-tool", ToolName: "read_file"},
@@ -151,10 +152,10 @@ func TestDrainPendingLoopEventsDrainsTaggedSubagentEvents(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("events = %#v, want subagent start and tool start", got)
 	}
-	if got[0].Kind != EventSubagentStart || got[0].SubagentSessionID != "child-session" {
+	if got[0].Kind != EventSubagentStart || got[0].SubagentSessionID != "child-session" || got[0].ProjectID != "project-a" {
 		t.Fatalf("event[0] = %+v, want subagent start", got[0])
 	}
-	if got[1].Kind != EventToolCallStart || got[1].SubagentSessionID != "child-session" || got[1].ToolCallID != "child-tool" {
+	if got[1].Kind != EventToolCallStart || got[1].SubagentSessionID != "child-session" || got[1].ProjectID != "project-a" || got[1].ToolCallID != "child-tool" {
 		t.Fatalf("event[1] = %+v, want child tool start", got[1])
 	}
 }
@@ -1035,7 +1036,7 @@ func TestPR11Closure_SeenSessionsNoRace(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < N; i++ {
-			agent.dispatchTaggedEvent(TaggedLoopEvent{SessionID: "sub", Event: loop.Event{Kind: loop.ToolCallStart}})
+			agent.dispatchTaggedEvent(TaggedLoopEvent{SessionID: "sub", ProjectID: "project", Event: loop.Event{Kind: loop.ToolCallStart}})
 		}
 	}()
 	go func() {
