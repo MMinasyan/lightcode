@@ -81,6 +81,9 @@ func newRuntime(a *Agent, opts runtimeOptions) *runtime {
 }
 
 func (a *Agent) ensureRuntime() *runtime {
+	if a.session == nil {
+		a.session = &session{}
+	}
 	if a.rt == nil {
 		a.rt = newRuntime(a, runtimeOptions{})
 	}
@@ -109,5 +112,6 @@ func (rt *runtime) session() *session {
 	if rt == nil || rt.agent == nil {
 		return nil
 	}
-	return &rt.agent.session
+	rt.agent.ensureRuntime()
+	return rt.agent.session
 }

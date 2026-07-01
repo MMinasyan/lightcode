@@ -56,9 +56,13 @@ type session struct {
 	registry *tool.Registry
 
 	activeAgentType   string
+	projectID         string
+	projectName       string
+	projectRoot       string
 	currentRef        coremodel.ModelRef
 	contextWindowSize int
 	activeAdapt       *adaptation.Adaptation
+	assembler         *prompt.Assembler
 
 	busy       bool
 	turnCancel context.CancelFunc
@@ -84,7 +88,7 @@ type session struct {
 
 // Agent is the shared service facade used by all adapters (Wails, HTTP, ACP).
 type Agent struct {
-	session
+	*session
 
 	cfg      *config.Config
 	agents   *agentcfg.Config
@@ -117,6 +121,9 @@ type Agent struct {
 
 	lspManager *lsp.Manager
 	procMgr    *process.Manager
+
+	sessions         map[string]*session
+	currentSessionID string
 
 	warningsMu      sync.Mutex
 	warningGroups   map[string][]PromptWarning
@@ -157,13 +164,21 @@ type agentMemoryHooks interface {
 	DeleteSessionSummaries(sessionID string) error
 }
 
-type agentUsageRecorder struct {
+type sessionLoopHooks struct {
 	agent *Agent
+	unit  *session
 }
 
-func (r agentUsageRecorder) RecordUsage(ev loop.Event) {
-	if r.agent != nil {
-		r.agent.recordUsage(ev)
+func (h sessionLoopHooks) BeforeModelRequest(ctx context.Context, checkpoint loop.ContextTransformCheckpoint) (loop.ContextTransformResult, error) {
+	if h.agent == nil || h.unit == nil {
+		return loop.ContextTransformResult{}, nil
+	}
+	return h.agent.beforeModelRequestForSession(ctx, h.unit, checkpoint)
+}
+
+func (h sessionLoopHooks) RecordUsage(ev loop.Event) {
+	if h.agent != nil && h.unit != nil {
+		h.agent.recordUsageForSession(h.unit, ev)
 	}
 }
 
@@ -191,7 +206,11 @@ type runningUnitConfig struct {
 	Store             *snapshot.Store
 	Loop              runningUnitLoopConfig
 	CurrentRef        coremodel.ModelRef
+	ProjectID         string
+	ProjectName       string
+	ProjectRoot       string
 	ContextWindowSize int
+	Assembler         *prompt.Assembler
 	TaskTool          *taskTool
 	PendingExecutor   *tool.StagedExecutor
 	FileTracker       *tool.FileTracker
@@ -204,9 +223,13 @@ func newRunningUnit(cfg runningUnitConfig) *session {
 		store:             cfg.Store,
 		registry:          cfg.Loop.Registry,
 		activeAgentType:   cfg.ActiveAgentType,
+		projectID:         cfg.ProjectID,
+		projectName:       cfg.ProjectName,
+		projectRoot:       cfg.ProjectRoot,
 		currentRef:        cfg.CurrentRef,
 		contextWindowSize: cfg.ContextWindowSize,
 		activeAdapt:       cfg.Loop.ActiveAdaptation,
+		assembler:         cfg.Assembler,
 		taskToolInst:      cfg.TaskTool,
 		pendingExecutor:   cfg.PendingExecutor,
 		fileTracker:       cfg.FileTracker,
@@ -242,6 +265,178 @@ func newRunningUnitLoop(cfg runningUnitLoopConfig) *loop.Loop {
 	return lp
 }
 
+func (a *Agent) ensureSessionMapLocked() {
+	if a.sessions == nil {
+		a.sessions = make(map[string]*session)
+	}
+}
+
+func sessionIDOf(unit *session) string {
+	if unit == nil || unit.store == nil || !unit.store.Active() {
+		return ""
+	}
+	return unit.store.SessionID()
+}
+
+func (a *Agent) registerLiveSessionLocked(unit *session) {
+	id := sessionIDOf(unit)
+	if id == "" {
+		return
+	}
+	a.ensureSessionMapLocked()
+	a.sessions[id] = unit
+}
+
+func (a *Agent) setCurrentSessionLocked(unit *session) {
+	if unit == nil {
+		a.currentSessionID = ""
+		a.session = &session{}
+		return
+	}
+	a.session = unit
+	a.currentSessionID = sessionIDOf(unit)
+	a.registerLiveSessionLocked(unit)
+}
+
+func (a *Agent) liveSessionLocked(id string) (*session, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, fmt.Errorf("session id is required")
+	}
+	a.ensureSessionMapLocked()
+	if unit := a.sessions[id]; unit != nil && unit.store != nil && unit.store.Active() && unit.store.SessionID() == id {
+		return unit, nil
+	}
+	if current := sessionIDOf(a.session); current == id {
+		a.sessions[id] = a.session
+		return a.session, nil
+	}
+	return nil, fmt.Errorf("unknown session %q", id)
+}
+
+func setSessionProject(unit *session, proj *project.Project) {
+	if unit == nil || proj == nil {
+		return
+	}
+	unit.projectID = proj.ID
+	unit.projectName = proj.Name
+	unit.projectRoot = proj.Path
+}
+
+func (a *Agent) refreshCurrentSessionProjectLocked() {
+	if a == nil || a.session == nil || a.session.projectID != "" || a.projects == nil {
+		return
+	}
+	if proj, err := a.projects.Current(); err == nil && proj != nil {
+		setSessionProject(a.session, proj)
+	}
+}
+
+func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType string, projectID string, projectName string, projectRoot string) (*session, error) {
+	if activeAgentType == "" {
+		activeAgentType = "primary"
+	}
+	if projectRoot == "" {
+		projectRoot = a.projectRoot
+	}
+	resolved, err := a.resolvedAgentTypeForProjectLocked(activeAgentType, projectID)
+	if err != nil {
+		return nil, err
+	}
+	rt := a.ensureRuntime()
+	checkPolicy := rt.permissionPolicy.checkFunc()
+	askPolicy := rt.permissionPolicy.askFunc()
+	askActionPolicy := rt.permissionPolicy.askActionFunc()
+	fileTracker := tool.NewFileTracker()
+	writeDir := strings.TrimSpace(resolved.WriteDir)
+	options := tool.CapabilityOptions{WriteDir: writeDir}
+	registry := tool.NewRegistry()
+	for _, tl := range tool.CoreToolListWithOptions(store, fileTracker, a.cfg.Tools, projectRoot, checkPolicy, askPolicy, options) {
+		if resolved.Readonly && writeDir == "" && isAgentWriteTool(tl.Name()) {
+			continue
+		}
+		registry.Register(tl)
+	}
+	registry.Register(tool.WrapWithPermission(tool.ExecutePending{}, checkPolicy, askPolicy))
+
+	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(store, fileTracker, a.cfg.Tools, projectRoot, checkPolicy, askActionPolicy, options)
+
+	if rt.taggedEvents == nil {
+		rt.taggedEvents = make(chan TaggedLoopEvent, 512)
+	}
+	memoriesDir := ""
+	if projectID != "" && a.projects != nil {
+		memoriesDir = filepath.Join(a.projects.Root(), projectID, "memories")
+	}
+	tt := newTaskTool(taskToolConfig{
+		AgentTypes:    a.agents,
+		ParentStore:   store,
+		ParentTracker: fileTracker,
+		MaxConcurrent: a.cfg.Subagents.MaxConcurrent,
+		TaggedEvents:  rt.taggedEvents,
+		ModelCatalog:  a.catalog,
+		ToolsConfig:   a.cfg.Tools,
+		HomeDir:       a.home,
+		WorkspaceRoot: projectRoot,
+		ProcMgr:       a.procMgr,
+		MemoryStore:   a.memoryStore,
+		ProjectID:     projectID,
+		MemoriesDir:   memoriesDir,
+		LSPManager:    a.lspManager,
+		Check:         checkPolicy,
+		Ask:           askPolicy,
+		AskAction:     askActionPolicy,
+		ResolveAdapt:  a.resolveAdapt,
+	})
+	registry.Register(tt)
+
+	rc := tool.NewRunCommandAtRoot(a.cfg.Tools, a.home, projectRoot, a.procMgr)
+	if resolved.Readonly {
+		registry.Register(tool.WrapWithPermission(tool.NewReadOnlyRunCommand(rc), checkPolicy, askPolicy))
+	} else {
+		registry.Register(tool.WrapWithPermission(rc, checkPolicy, askPolicy))
+	}
+	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(a.procMgr), checkPolicy, askPolicy))
+	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkPolicy, askPolicy))
+	registry.Register(tool.WrapWithPermission(tool.NewSaveMemory(a.memoryStore, memoriesDir), checkPolicy, askPolicy))
+	registry.Register(tool.WrapWithPermission(tool.NewSearchMemory(a.memoryStore, projectID), checkPolicy, askPolicy))
+	registry.Register(tool.WrapWithPermission(tool.NewSearchHistory(a.memoryStore, projectID), checkPolicy, askPolicy))
+
+	lspClient := lsp.NewClient(a.lspManager)
+	lspDiag := tool.NewLSPDiagnostics(lspClient, &snapshotDiagAdapter{store: store})
+	registry.Register(lspDiag)
+	registry.Register(tool.NewWorkspaceSymbol(lspClient))
+
+	unitAssembler := prompt.New(projectRoot, a.home)
+	promptUnit := &session{activeAgentType: activeAgentType, projectID: projectID, projectName: projectName, projectRoot: projectRoot, assembler: unitAssembler}
+	res := a.assembleSystemPromptForSessionLocked(promptUnit)
+	unit := newRunningUnit(runningUnitConfig{
+		Runtime:         rt,
+		ActiveAgentType: activeAgentType,
+		ProjectID:       projectID,
+		ProjectName:     projectName,
+		ProjectRoot:     projectRoot,
+		Assembler:       unitAssembler,
+		Store:           store,
+		TaskTool:        tt,
+		PendingExecutor: pendingExecutor,
+		FileTracker:     fileTracker,
+		LSPDiagnostics:  lspDiag,
+		Loop: runningUnitLoopConfig{
+			Registry:        registry,
+			SystemPrompt:    res.Prompt,
+			Store:           store,
+			Events:          rt.loopEvents,
+			PendingExecutor: pendingExecutor,
+		},
+	})
+	unit.lp.SetContextTransformer(sessionLoopHooks{agent: a, unit: unit})
+	unit.lp.SetUsageRecorder(sessionLoopHooks{agent: a, unit: unit})
+	tt.usageRecorder = sessionLoopHooks{agent: a, unit: unit}
+	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
+	return unit, nil
+}
+
 // New constructs an Agent from the given config. It creates the
 // provider client, tool registry, permission gate, snapshot store,
 // and loop. Call Init after setting up the event handler.
@@ -274,7 +469,7 @@ func New(c Config) (*Agent, error) {
 	}
 
 	a := &Agent{
-		session:       session{store: store},
+		session:       &session{store: store},
 		cfg:           c.Cfg,
 		agents:        agentTypes,
 		catalog:       modelCatalog,
@@ -422,9 +617,10 @@ func New(c Config) (*Agent, error) {
 	a.memoryStore = memStore
 	a.memoryHooks = memStore
 
-	var projectID, memoriesDir string
+	var projectID, projectName, memoriesDir string
 	if proj, err := resolver.Current(); err == nil && proj != nil {
 		projectID = proj.ID
+		projectName = proj.Name
 		memoriesDir = filepath.Join(resolver.Root(), proj.ID, "memories")
 	}
 	registry.Register(tool.WrapWithPermission(tool.NewSaveMemory(memStore, memoriesDir), checkPolicy, askPolicy))
@@ -460,7 +656,6 @@ func New(c Config) (*Agent, error) {
 		Check:         checkPolicy,
 		Ask:           askPolicy,
 		AskAction:     askActionPolicy,
-		UsageRecorder: agentUsageRecorder{agent: a},
 		ResolveAdapt:  adaptation.Match,
 	})
 	registry.Register(tt)
@@ -474,9 +669,13 @@ func New(c Config) (*Agent, error) {
 	a.pendingAgentWarnings = agentWarningsToPromptWarnings(agentTypes.Warnings())
 
 	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askActionPolicy, primaryOptions)
-	a.session = *newRunningUnit(runningUnitConfig{
+	a.session = newRunningUnit(runningUnitConfig{
 		Runtime:         rt,
 		ActiveAgentType: "primary",
+		ProjectID:       projectID,
+		ProjectName:     projectName,
+		ProjectRoot:     c.ProjectRoot,
+		Assembler:       asm,
 		Store:           store,
 		TaskTool:        tt,
 		PendingExecutor: pendingExecutor,
@@ -488,10 +687,12 @@ func New(c Config) (*Agent, error) {
 			Store:              store,
 			Events:             events,
 			ContextTransformer: a,
-			UsageRecorder:      agentUsageRecorder{agent: a},
 			PendingExecutor:    pendingExecutor,
 		},
 	})
+	a.session.lp.SetContextTransformer(sessionLoopHooks{agent: a, unit: a.session})
+	a.session.lp.SetUsageRecorder(sessionLoopHooks{agent: a, unit: a.session})
+	tt.usageRecorder = sessionLoopHooks{agent: a, unit: a.session}
 	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 
 	return a, nil
@@ -603,15 +804,16 @@ func (rt *runtime) tryStartSignalTurn(ctx context.Context) {
 		return
 	}
 	rt.mu.Lock()
+	unit := rt.session()
 	// Queued user input takes priority over a bare signal turn, and a session
 	// change in flight must block it. The gate and the busy-claim share one
 	// lock hold so nothing can slip a signal turn in between (claimTurnLocked
 	// is called while still holding the runtime mutex).
-	if rt.session().busy || rt.session().transitioning || len(rt.session().queue) > 0 || a.store == nil || !a.store.Active() || !rt.signalSink.HasWakeSignal() {
+	if unit.busy || unit.transitioning || len(unit.queue) > 0 || unit.store == nil || !unit.store.Active() || !rt.signalSink.HasWakeSignal() {
 		rt.mu.Unlock()
 		return
 	}
-	turnCtx, cancel, err := rt.claimTurnLocked(ctx)
+	turnCtx, cancel, err := rt.claimTurnLocked(ctx, unit)
 	rt.mu.Unlock()
 	if err != nil {
 		if !strings.Contains(err.Error(), "turn is already in progress") {
@@ -619,7 +821,7 @@ func (rt *runtime) tryStartSignalTurn(ctx context.Context) {
 		}
 		return
 	}
-	rt.launchTurn(ctx, turnCtx, cancel, nil)
+	rt.launchTurn(ctx, unit, turnCtx, cancel, nil)
 }
 
 func (a *Agent) setWarningGroup(group string, warnings []prompt.Warning) {
@@ -956,7 +1158,14 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 }
 
 func (a *Agent) recordUsage(ev loop.Event) {
-	ref := a.currentRef
+	a.recordUsageForSession(a.session, ev)
+}
+
+func (a *Agent) recordUsageForSession(unit *session, ev loop.Event) {
+	if unit == nil {
+		return
+	}
+	ref := unit.currentRef
 	if !ev.ModelRef.IsZero() {
 		ref = ev.ModelRef
 	}
@@ -967,23 +1176,23 @@ func (a *Agent) recordUsage(ev loop.Event) {
 	}
 	key := prov + "/" + model
 
-	a.tokensMu.Lock()
-	if a.tokens == nil {
-		a.tokens = map[string]*TokenEntry{}
+	unit.tokensMu.Lock()
+	if unit.tokens == nil {
+		unit.tokens = map[string]*TokenEntry{}
 	}
-	entry, ok := a.tokens[key]
+	entry, ok := unit.tokens[key]
 	if !ok {
 		entry = &TokenEntry{Provider: prov, Model: model, Known: true}
-		a.tokens[key] = entry
+		unit.tokens[key] = entry
 	}
 	entry.Cache += ev.Cache
 	entry.Input += ev.Input
 	entry.Output += ev.Output
 	if ev.UsageKnown {
-		a.lastContextUsed = ev.Cache + ev.Input
+		unit.lastContextUsed = ev.Cache + ev.Input
 	}
-	a.persistTokensLocked()
-	a.tokensMu.Unlock()
+	a.persistTokensForSessionLocked(unit)
+	unit.tokensMu.Unlock()
 
 	a.emitEvent(Event{
 		Kind:       EventUsage,
@@ -996,9 +1205,16 @@ func (a *Agent) recordUsage(ev loop.Event) {
 }
 
 func (a *Agent) buildReportLocked() TokenReport {
+	return a.buildReportForSessionLocked(a.session)
+}
+
+func (a *Agent) buildReportForSessionLocked(unit *session) TokenReport {
+	if unit == nil {
+		return TokenReport{}
+	}
 	total := TokenEntry{Known: true}
-	per := make([]TokenEntry, 0, len(a.tokens))
-	for _, e := range a.tokens {
+	per := make([]TokenEntry, 0, len(unit.tokens))
+	for _, e := range unit.tokens {
 		per = append(per, *e)
 		total.Cache += e.Cache
 		total.Input += e.Input
@@ -1007,17 +1223,21 @@ func (a *Agent) buildReportLocked() TokenReport {
 	return TokenReport{
 		Total:         total,
 		PerModel:      per,
-		ContextUsed:   a.lastContextUsed,
-		ContextWindow: a.contextWindowSize,
+		ContextUsed:   unit.lastContextUsed,
+		ContextWindow: unit.contextWindowSize,
 	}
 }
 
 func (a *Agent) persistTokensLocked() {
-	if a.store == nil || !a.store.Active() {
+	a.persistTokensForSessionLocked(a.session)
+}
+
+func (a *Agent) persistTokensForSessionLocked(unit *session) {
+	if unit == nil || unit.store == nil || !unit.store.Active() {
 		return
 	}
-	entries := make([]TokenEntry, 0, len(a.tokens))
-	for _, e := range a.tokens {
+	entries := make([]TokenEntry, 0, len(unit.tokens))
+	for _, e := range unit.tokens {
 		entries = append(entries, *e)
 	}
 	data, err := json.MarshalIndent(entries, "", "  ")
@@ -1025,7 +1245,7 @@ func (a *Agent) persistTokensLocked() {
 		return
 	}
 	data = append(data, '\n')
-	_ = os.WriteFile(filepath.Join(a.store.Dir(), tokensFileName), data, 0o600)
+	_ = os.WriteFile(filepath.Join(unit.store.Dir(), tokensFileName), data, 0o600)
 }
 
 func (a *Agent) runSweep() {
@@ -1060,13 +1280,20 @@ func (a *Agent) periodicSweep(ctx context.Context) {
 }
 
 func (a *Agent) shouldAutoCompact() bool {
+	return a.shouldAutoCompactForSession(a.session)
+}
+
+func (a *Agent) shouldAutoCompactForSession(unit *session) bool {
+	if unit == nil {
+		return false
+	}
 	if !a.cfg.Compaction.Enabled {
 		return false
 	}
-	a.tokensMu.Lock()
-	used := a.lastContextUsed
-	window := a.contextWindowSize
-	a.tokensMu.Unlock()
+	unit.tokensMu.Lock()
+	used := unit.lastContextUsed
+	window := unit.contextWindowSize
+	unit.tokensMu.Unlock()
 	if window <= 0 || used <= 0 {
 		return false
 	}
@@ -1075,10 +1302,17 @@ func (a *Agent) shouldAutoCompact() bool {
 
 // BeforeModelRequest implements the loop context-transform checkpoint.
 func (a *Agent) BeforeModelRequest(ctx context.Context, checkpoint loop.ContextTransformCheckpoint) (loop.ContextTransformResult, error) {
-	if !checkpoint.Force && !a.shouldAutoCompact() {
+	return a.beforeModelRequestForSession(ctx, a.session, checkpoint)
+}
+
+func (a *Agent) beforeModelRequestForSession(ctx context.Context, unit *session, checkpoint loop.ContextTransformCheckpoint) (loop.ContextTransformResult, error) {
+	if unit == nil {
 		return loop.ContextTransformResult{}, nil
 	}
-	activeStart, err := a.compactAtCheckpoint(ctx, checkpoint)
+	if !checkpoint.Force && !a.shouldAutoCompactForSession(unit) {
+		return loop.ContextTransformResult{}, nil
+	}
+	activeStart, err := a.compactAtCheckpointForSession(ctx, unit, checkpoint)
 	if err != nil {
 		if checkpoint.Force {
 			return loop.ContextTransformResult{}, err
@@ -1093,27 +1327,41 @@ func (a *Agent) BeforeModelRequest(ctx context.Context, checkpoint loop.ContextT
 // transform hook used by model-request checkpoints. It is kept for existing
 // focused tests and manual compaction plumbing.
 func (a *Agent) runCompaction(ctx context.Context, turnInProgress bool) error {
-	activeStart := len(a.lp.Messages())
+	return a.runCompactionForSession(ctx, a.session, turnInProgress)
+}
+
+func (a *Agent) runCompactionForSession(ctx context.Context, unit *session, turnInProgress bool) error {
+	if unit == nil || unit.lp == nil || unit.store == nil {
+		return fmt.Errorf("no session open")
+	}
+	activeStart := len(unit.lp.Messages())
 	checkpoint := loop.ContextTransformCheckpoint{
-		Turn:            a.store.CurrentTurn(),
+		Turn:            unit.store.CurrentTurn(),
 		ActiveTurnStart: activeStart,
 		Force:           true,
 	}
 	if turnInProgress && activeStart > 0 {
 		checkpoint.ActiveTurnStart = activeStart
 	}
-	_, err := a.BeforeModelRequest(ctx, checkpoint)
+	_, err := a.beforeModelRequestForSession(ctx, unit, checkpoint)
 	return err
 }
 
 func (a *Agent) compactAtCheckpoint(ctx context.Context, checkpoint loop.ContextTransformCheckpoint) (int, error) {
+	return a.compactAtCheckpointForSession(ctx, a.session, checkpoint)
+}
+
+func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session, checkpoint loop.ContextTransformCheckpoint) (int, error) {
+	if unit == nil || unit.lp == nil || unit.store == nil {
+		return 0, fmt.Errorf("no session open")
+	}
 	a.emitEvent(Event{Kind: EventCompactionStart})
 	refreshSessionNow := false
 	defer func() {
 		a.emitEvent(Event{Kind: EventCompactionEnd, RefreshSession: refreshSessionNow})
 	}()
 
-	messages := a.lp.Messages()
+	messages := unit.lp.Messages()
 	activeStart := checkpoint.ActiveTurnStart
 	if activeStart <= 0 || activeStart > len(messages) {
 		activeStart = len(messages)
@@ -1124,9 +1372,9 @@ func (a *Agent) compactAtCheckpoint(ctx context.Context, checkpoint loop.Context
 	activeTail := activeStart < len(messages)
 	toSummarize := append([]message.Message(nil), messages[1:activeStart]...)
 
-	client, summarizerWindow := a.summarizerClientAndWindow()
+	client, summarizerWindow := a.summarizerClientAndWindowForSession(unit)
 	if summarizerWindow <= 0 {
-		summarizerWindow = a.contextWindowSize
+		summarizerWindow = unit.contextWindowSize
 	}
 
 	prompt := compact.DefaultSummarizerPrompt
@@ -1140,7 +1388,7 @@ func (a *Agent) compactAtCheckpoint(ctx context.Context, checkpoint loop.Context
 		return activeStart, err
 	}
 
-	boundaryTurn := a.store.CurrentTurn()
+	boundaryTurn := unit.store.CurrentTurn()
 	if !checkpoint.Force && checkpoint.Turn > 0 {
 		boundaryTurn = checkpoint.Turn - 1
 	} else if checkpoint.Force && activeStart < len(messages) && checkpoint.Turn > 0 {
@@ -1153,59 +1401,69 @@ func (a *Agent) compactAtCheckpoint(ctx context.Context, checkpoint loop.Context
 		SummarizerModel:    result.SummarizerModel,
 		SummarizerProvider: result.SummarizerRef.Provider,
 	}
-	if err := a.store.SaveCompaction(rec); err != nil {
+	if err := unit.store.SaveCompaction(rec); err != nil {
 		return activeStart, fmt.Errorf("save compaction: %w", err)
 	}
 
 	var activeReads []tool.ReadRecord
-	if a.fileTracker != nil && activeStart < len(messages) {
-		activeReads = activeTailReadRecords(messages[activeStart:], a.fileTracker.Snapshot(), a.cfg.Tools.ReadMaxLines, a.ensureRuntime().workspaceRoot)
+	if unit.fileTracker != nil && activeStart < len(messages) {
+		activeReads = activeTailReadRecords(messages[activeStart:], unit.fileTracker.Snapshot(), a.cfg.Tools.ReadMaxLines, unit.projectRoot)
 	}
 
 	if a.memoryHooks != nil {
-		sessionID := a.store.SessionID()
-		var projID, projName string
-		if proj, pErr := a.projects.Current(); pErr == nil && proj != nil {
-			projID = proj.ID
-			projName = proj.Name
-		}
-		compactionPath := filepath.Join(a.store.Dir(), "compaction.json")
+		sessionID := unit.store.SessionID()
+		projID := unit.projectID
+		projName := unit.projectName
+		compactionPath := filepath.Join(unit.store.Dir(), "compaction.json")
 		if err := a.memoryHooks.IndexSummary(sessionID, projID, projName, result.Summary, rec.CompactedAt, compactionPath); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: memory index summary: %v\n", err)
 		}
 	}
 
-	newActiveStart := a.lp.LoadHistoryWithSummaryAndActiveTail(result.Summary, result.SummarizerRef, activeStart)
-	if a.fileTracker != nil {
+	newActiveStart := unit.lp.LoadHistoryWithSummaryAndActiveTail(result.Summary, result.SummarizerRef, activeStart)
+	if unit.fileTracker != nil {
 		if len(activeReads) > 0 {
-			a.fileTracker.Restore(activeReads)
+			unit.fileTracker.Restore(activeReads)
 		} else {
-			a.fileTracker.Reset()
+			unit.fileTracker.Reset()
 		}
 	}
 	if activeTail {
-		a.ensureRuntime().deferSessionRefreshAfterTurn()
+		a.ensureRuntime().deferSessionRefreshAfterTurnForSession(unit)
 	} else {
 		refreshSessionNow = true
 	}
 
-	a.tokensMu.Lock()
-	a.lastContextUsed = 0
-	a.tokensMu.Unlock()
+	unit.tokensMu.Lock()
+	unit.lastContextUsed = 0
+	unit.tokensMu.Unlock()
 
 	return newActiveStart, nil
 }
 
 func (rt *runtime) deferSessionRefreshAfterTurn() {
+	rt.deferSessionRefreshAfterTurnForSession(rt.session())
+}
+
+func (rt *runtime) deferSessionRefreshAfterTurnForSession(unit *session) {
 	rt.mu.Lock()
-	rt.session().sessionRefreshAfterTurn = true
+	if unit != nil {
+		unit.sessionRefreshAfterTurn = true
+	}
 	rt.mu.Unlock()
 }
 
 func (rt *runtime) takeDeferredSessionRefreshAfterTurn() bool {
+	return rt.takeDeferredSessionRefreshAfterTurnForSession(rt.session())
+}
+
+func (rt *runtime) takeDeferredSessionRefreshAfterTurnForSession(unit *session) bool {
 	rt.mu.Lock()
-	refresh := rt.session().sessionRefreshAfterTurn
-	rt.session().sessionRefreshAfterTurn = false
+	refresh := false
+	if unit != nil {
+		refresh = unit.sessionRefreshAfterTurn
+		unit.sessionRefreshAfterTurn = false
+	}
 	rt.mu.Unlock()
 	return refresh
 }
@@ -1278,14 +1536,21 @@ func activeTailReadRecords(tail []message.Message, reads []tool.ReadRecord, defa
 }
 
 func (a *Agent) summarizerClientAndWindow() (*provider.Adapter, int) {
-	ref := a.currentRef
+	return a.summarizerClientAndWindowForSession(a.session)
+}
+
+func (a *Agent) summarizerClientAndWindowForSession(unit *session) (*provider.Adapter, int) {
+	ref := coremodel.ModelRef{}
+	if unit != nil {
+		ref = unit.currentRef
+	}
 	if compactRef, _, ok := a.resolvedAgentModelLocked("compact"); ok {
 		ref = compactRef
 	}
 
 	client, model, err := newProviderClient(a.catalog, ref)
-	if err != nil && ref != a.currentRef {
-		client, model, err = newProviderClient(a.catalog, a.currentRef)
+	if err != nil && unit != nil && ref != unit.currentRef {
+		client, model, err = newProviderClient(a.catalog, unit.currentRef)
 	}
 	if err != nil {
 		return provider.NewAdapter(provider.New(nil, nil, "")), 0
@@ -1350,6 +1615,8 @@ func (a *Agent) resumeMostRecent() error {
 	if err := a.store.LoadSession(id); err != nil {
 		return err
 	}
+	setSessionProject(a.session, proj)
+	a.setCurrentSessionLocked(a.session)
 	if err := a.loadHistoryIntoLoop(); err != nil {
 		return err
 	}
@@ -1372,10 +1639,14 @@ func (a *Agent) resumeMostRecent() error {
 }
 
 func (a *Agent) resetFileTracker() {
-	if a.fileTracker == nil {
+	a.resetFileTrackerForSession(a.session)
+}
+
+func (a *Agent) resetFileTrackerForSession(unit *session) {
+	if unit == nil || unit.fileTracker == nil {
 		return
 	}
-	a.fileTracker.Reset()
+	unit.fileTracker.Reset()
 }
 
 // resolveAdaptation maps a bare model id to its adaptation, defaulting to the
@@ -1394,28 +1665,42 @@ func (a *Agent) resolveAdaptation(modelID string) *adaptation.Adaptation {
 // leak pattern, and the prompt all reflect the new model on its first turn. An
 // unmatched model resolves to nil adaptation and stays on the baseline prompt.
 func (a *Agent) setActiveModelLocked(ref coremodel.ModelRef, client *provider.Client, model *catalog.Model) {
-	a.currentRef = ref
-	a.contextWindowSize = model.ContextWindow
-	a.activeAdapt = a.resolveAdaptation(ref.Model)
-	if a.lp != nil {
-		a.lp.SetClient(provider.NewAdapter(client))
-		a.lp.SetActiveAdaptation(a.activeAdapt)
+	a.setActiveModelForSessionLocked(a.session, ref, client, model)
+}
+
+func (a *Agent) setActiveModelForSessionLocked(unit *session, ref coremodel.ModelRef, client *provider.Client, model *catalog.Model) {
+	if unit == nil {
+		return
 	}
-	a.applyActiveAdaptationPromptLocked()
+	unit.currentRef = ref
+	unit.contextWindowSize = model.ContextWindow
+	unit.activeAdapt = a.resolveAdaptation(ref.Model)
+	if unit.lp != nil {
+		unit.lp.SetClient(provider.NewAdapter(client))
+		unit.lp.SetActiveAdaptation(unit.activeAdapt)
+	}
+	a.applyActiveAdaptationPromptForSessionLocked(unit)
 }
 
 // clearActiveModelLocked clears the active model and its adaptation, reverting all
 // three levers (tools, leak pattern, prompt) to baseline. The other sole writer;
 // must be called with rt.mu held.
 func (a *Agent) clearActiveModelLocked() {
-	a.currentRef = coremodel.ModelRef{}
-	a.contextWindowSize = 0
-	a.activeAdapt = nil
-	if a.lp != nil {
-		a.lp.SetClient(nil)
-		a.lp.SetActiveAdaptation(nil)
+	a.clearActiveModelForSessionLocked(a.session)
+}
+
+func (a *Agent) clearActiveModelForSessionLocked(unit *session) {
+	if unit == nil {
+		return
 	}
-	a.applyActiveAdaptationPromptLocked()
+	unit.currentRef = coremodel.ModelRef{}
+	unit.contextWindowSize = 0
+	unit.activeAdapt = nil
+	if unit.lp != nil {
+		unit.lp.SetClient(nil)
+		unit.lp.SetActiveAdaptation(nil)
+	}
+	a.applyActiveAdaptationPromptForSessionLocked(unit)
 }
 
 // applyActiveAdaptationPromptLocked reassembles the system prompt for the current
@@ -1423,11 +1708,15 @@ func (a *Agent) clearActiveModelLocked() {
 // rt.mu held; the assembler never re-acquires rt.mu. If the active adaptation is nil,
 // the baseline prompt cache path avoids UpdateSystemPrompt churn.
 func (a *Agent) applyActiveAdaptationPromptLocked() {
-	if a.assembler == nil || a.lp == nil {
+	a.applyActiveAdaptationPromptForSessionLocked(a.session)
+}
+
+func (a *Agent) applyActiveAdaptationPromptForSessionLocked(unit *session) {
+	if unit == nil || a.assembler == nil || unit.lp == nil {
 		return
 	}
-	if res := a.assembleSystemPromptLocked(); res.Rebuilt {
-		a.lp.UpdateSystemPrompt(res.Prompt)
+	if res := a.assembleSystemPromptForSessionLocked(unit); res.Rebuilt {
+		unit.lp.UpdateSystemPrompt(res.Prompt)
 	}
 }
 
@@ -1436,25 +1725,58 @@ func (a *Agent) applyActiveAdaptationPromptLocked() {
 // preamble — it runs without rt.mu, which is safe because the model-set paths are
 // idle-gated, so activeAdapt is stable while a turn is in flight.
 func (a *Agent) refreshSystemPrompt() {
-	res := a.assembleSystemPromptLocked()
+	a.refreshSystemPromptForSession(a.session)
+}
+
+func (a *Agent) refreshSystemPromptForSession(unit *session) {
+	if unit == nil || unit.lp == nil {
+		return
+	}
+	res := a.assembleSystemPromptForSessionLocked(unit)
 	if res.Rebuilt {
-		a.lp.UpdateSystemPrompt(res.Prompt)
+		unit.lp.UpdateSystemPrompt(res.Prompt)
 	}
 	a.setWarningGroup("prompt", res.Warnings)
 }
 
 func (a *Agent) assembleSystemPromptLocked() prompt.Result {
-	spec := prompt.Spec{Size: prompt.SizeFull, Memory: true, Adapt: a.activeAdapt}
-	if resolved, err := a.resolvedAgentTypeLocked("primary"); err == nil {
+	return a.assembleSystemPromptForSessionLocked(a.session)
+}
+
+func (a *Agent) assembleSystemPromptForSessionLocked(unit *session) prompt.Result {
+	adapt := (*adaptation.Adaptation)(nil)
+	agentType := "primary"
+	assembler := a.assembler
+	if unit != nil {
+		adapt = unit.activeAdapt
+		if strings.TrimSpace(unit.activeAgentType) != "" {
+			agentType = unit.activeAgentType
+		}
+		if unit.assembler != nil {
+			assembler = unit.assembler
+		}
+	}
+	spec := prompt.Spec{Size: prompt.SizeFull, Memory: true, Adapt: adapt}
+	if resolved, err := a.resolvedAgentTypeLocked(agentType); err == nil {
 		spec.Size = resolved.SystemPrompt
 		spec.Body = resolved.Prompt
 		spec.Memory = resolved.Memory
 	}
-	return a.assembler.AssembleForSpec(spec)
+	if assembler == nil {
+		return prompt.Result{}
+	}
+	return assembler.AssembleForSpec(spec)
 }
 
 func (a *Agent) restoreModelFromSession() {
-	meta, err := a.store.Meta()
+	a.restoreModelFromSessionForSession(a.session)
+}
+
+func (a *Agent) restoreModelFromSessionForSession(unit *session) {
+	if unit == nil || unit.store == nil {
+		return
+	}
+	meta, err := unit.store.Meta()
 	if err != nil || meta.Provider == "" || meta.Model == "" {
 		return
 	}
@@ -1463,20 +1785,27 @@ func (a *Agent) restoreModelFromSession() {
 	if err != nil {
 		return
 	}
-	a.setActiveModelLocked(ref, client, model)
+	a.setActiveModelForSessionLocked(unit, ref, client, model)
 }
 
 func (a *Agent) loadHistoryIntoLoop() error {
-	rec, err := a.store.LoadCompaction()
+	return a.loadHistoryIntoLoopForSession(a.session)
+}
+
+func (a *Agent) loadHistoryIntoLoopForSession(unit *session) error {
+	if unit == nil || unit.store == nil || unit.lp == nil {
+		return snapshot.ErrNoSession
+	}
+	rec, err := unit.store.LoadCompaction()
 	if err != nil {
 		return err
 	}
 
 	var raw []snapshot.TurnMessages
 	if rec != nil {
-		raw, err = a.store.LoadCompleteTurnsAfter(rec.BoundaryTurn)
+		raw, err = unit.store.LoadCompleteTurnsAfter(rec.BoundaryTurn)
 	} else {
-		raw, err = a.store.LoadCompleteTurns()
+		raw, err = unit.store.LoadCompleteTurns()
 	}
 	if err != nil {
 		return err
@@ -1498,21 +1827,28 @@ func (a *Agent) loadHistoryIntoLoop() error {
 	}
 
 	if rec != nil {
-		a.lp.LoadHistoryWithSummary(rec.Summary, coremodel.ModelRef{Provider: rec.SummarizerProvider, Model: rec.SummarizerModel}, decoded)
+		unit.lp.LoadHistoryWithSummary(rec.Summary, coremodel.ModelRef{Provider: rec.SummarizerProvider, Model: rec.SummarizerModel}, decoded)
 	} else {
-		a.lp.LoadHistory(decoded)
+		unit.lp.LoadHistory(decoded)
 	}
 	return nil
 }
 
 func (a *Agent) loadTokensFromDisk() {
-	a.tokensMu.Lock()
-	defer a.tokensMu.Unlock()
-	a.tokens = map[string]*TokenEntry{}
-	if a.store == nil || !a.store.Active() {
+	a.loadTokensFromDiskForSession(a.session)
+}
+
+func (a *Agent) loadTokensFromDiskForSession(unit *session) {
+	if unit == nil {
 		return
 	}
-	data, err := os.ReadFile(filepath.Join(a.store.Dir(), tokensFileName))
+	unit.tokensMu.Lock()
+	defer unit.tokensMu.Unlock()
+	unit.tokens = map[string]*TokenEntry{}
+	if unit.store == nil || !unit.store.Active() {
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(unit.store.Dir(), tokensFileName))
 	if err != nil {
 		return
 	}
@@ -1523,12 +1859,17 @@ func (a *Agent) loadTokensFromDisk() {
 	for i := range entries {
 		e := entries[i]
 		e.Known = true
-		a.tokens[e.Provider+"/"+e.Model] = &e
+		unit.tokens[e.Provider+"/"+e.Model] = &e
 	}
 }
 
 func (a *Agent) ensureSession() error {
 	if a.store.Active() {
+		a.refreshCurrentSessionProjectLocked()
+		a.registerLiveSessionLocked(a.session)
+		if a.currentSessionID == "" {
+			a.currentSessionID = a.store.SessionID()
+		}
 		return nil
 	}
 	a.clearActiveModelLocked()
@@ -1545,6 +1886,8 @@ func (a *Agent) ensureSession() error {
 	if err := a.store.BeginNewSession(a.projectRoot); err != nil {
 		return err
 	}
+	setSessionProject(a.session, proj)
+	a.setCurrentSessionLocked(a.session)
 	if a.currentRef.Provider != "" && a.currentRef.Model != "" {
 		if err := a.store.SetModel(a.currentRef.Provider, a.currentRef.Model); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)
@@ -1567,33 +1910,48 @@ func (a *Agent) ensureSession() error {
 // than accepting input it would then discard. Any queue mutation emits a
 // versioned EventQueueChanged.
 func (a *Agent) Submit(ctx context.Context, content string) (SubmitResult, error) {
-	return a.ensureRuntime().submit(ctx, content)
+	return a.ensureRuntime().submit(ctx, a.session, content)
 }
 
-func (rt *runtime) submit(ctx context.Context, content string) (SubmitResult, error) {
+func (a *Agent) SubmitToSession(ctx context.Context, sessionID string, content string) (SubmitResult, error) {
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	unit, err := a.liveSessionLocked(sessionID)
+	rt.mu.Unlock()
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	return rt.submit(ctx, unit, content)
+}
+
+func (rt *runtime) submit(ctx context.Context, unit *session, content string) (SubmitResult, error) {
 	a := rt.agent
 	rt.mu.Lock()
-	if rt.session().transitioning {
+	if unit == nil {
+		rt.mu.Unlock()
+		return SubmitResult{}, snapshot.ErrNoSession
+	}
+	if unit.transitioning {
 		rt.mu.Unlock()
 		return SubmitResult{}, fmt.Errorf("session is changing; retry")
 	}
-	if !rt.session().busy && len(rt.session().queue) == 0 {
-		turnCtx, cancel, err := rt.claimTurnLocked(ctx)
+	if !unit.busy && len(unit.queue) == 0 {
+		turnCtx, cancel, err := rt.claimTurnLocked(ctx, unit)
 		if err != nil {
 			rt.mu.Unlock()
 			return SubmitResult{}, err
 		}
-		version := rt.session().queueVersion
+		version := unit.queueVersion
 		rt.mu.Unlock()
-		turn := rt.launchTurn(ctx, turnCtx, cancel, []string{content})
+		turn := rt.launchTurn(ctx, unit, turnCtx, cancel, []string{content})
 		return SubmitResult{Started: true, Turn: turn, Queue: emptyQueue(), Version: version}, nil
 	}
 	// Busy or queue non-empty: enqueue and let the drainer pick it up.
-	rt.session().queueSeq++
-	rt.session().queue = append(rt.session().queue, QueuedItem{ID: fmt.Sprintf("q-%d", rt.session().queueSeq), Content: content})
-	rt.session().queueVersion++
-	items := copyQueue(rt.session().queue)
-	version := rt.session().queueVersion
+	unit.queueSeq++
+	unit.queue = append(unit.queue, QueuedItem{ID: fmt.Sprintf("q-%d", unit.queueSeq), Content: content})
+	unit.queueVersion++
+	items := copyQueue(unit.queue)
+	version := unit.queueVersion
 	rt.mu.Unlock()
 	rt.nudgeQueueDrainer()
 	a.emitEvent(Event{Kind: EventQueueChanged, Queue: items, QueueVersion: version})
@@ -1603,13 +1961,31 @@ func (rt *runtime) submit(ctx context.Context, content string) (SubmitResult, er
 // QueueSnapshot returns a versioned copy of the current queue, for adapter
 // hydration (subscribe-then-GET: register the queue_changed handler first).
 func (a *Agent) QueueSnapshot() QueueState {
-	return a.ensureRuntime().queueSnapshot()
+	return a.ensureRuntime().queueSnapshot(a.session)
 }
 
-func (rt *runtime) queueSnapshot() QueueState {
+func (a *Agent) QueueSnapshotForSession(sessionID string) (QueueState, error) {
+	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	return QueueState{Items: copyQueue(rt.session().queue), Version: rt.session().queueVersion}
+	unit, err := a.liveSessionLocked(sessionID)
+	if err != nil {
+		return QueueState{}, err
+	}
+	return rt.queueSnapshotLocked(unit), nil
+}
+
+func (rt *runtime) queueSnapshot(unit *session) QueueState {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.queueSnapshotLocked(unit)
+}
+
+func (rt *runtime) queueSnapshotLocked(unit *session) QueueState {
+	if unit == nil {
+		return QueueState{Items: emptyQueue()}
+	}
+	return QueueState{Items: copyQueue(unit.queue), Version: unit.queueVersion}
 }
 
 // AppendUserMessage persists a user message as its own complete turn WITHOUT
@@ -1618,22 +1994,44 @@ func (rt *runtime) queueSnapshot() QueueState {
 // It still routes through the loop's emit chokepoint, so it is display-ordered.
 // Not exposed in the Wails layer.
 func (a *Agent) AppendUserMessage(content string) (int, error) {
-	return a.ensureRuntime().appendUserMessage(content)
+	return a.ensureRuntime().appendUserMessage(a.session, content)
 }
 
-func (rt *runtime) appendUserMessage(content string) (int, error) {
-	a := rt.agent
+func (a *Agent) AppendUserMessageToSession(sessionID string, content string) (int, error) {
+	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	if rt.session().busy {
-		return 0, fmt.Errorf("a turn is already in progress")
-	}
-	if err := a.ensureSession(); err != nil {
+	unit, err := a.liveSessionLocked(sessionID)
+	if err != nil {
 		return 0, err
 	}
-	turn := a.store.BeginTurn()
-	a.lp.AppendUserMessage(turn, content)
-	_ = a.store.MarkTurnComplete(turn)
+	return rt.appendUserMessageLocked(unit, content)
+}
+
+func (rt *runtime) appendUserMessage(unit *session, content string) (int, error) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.appendUserMessageLocked(unit, content)
+}
+
+func (rt *runtime) appendUserMessageLocked(unit *session, content string) (int, error) {
+	a := rt.agent
+	if unit == nil {
+		return 0, snapshot.ErrNoSession
+	}
+	if unit.busy {
+		return 0, fmt.Errorf("a turn is already in progress")
+	}
+	if unit == a.session {
+		if err := a.ensureSession(); err != nil {
+			return 0, err
+		}
+	} else if unit.store == nil || !unit.store.Active() {
+		return 0, snapshot.ErrNoSession
+	}
+	turn := unit.store.BeginTurn()
+	unit.lp.AppendUserMessage(turn, content)
+	_ = unit.store.MarkTurnComplete(turn)
 	return turn, nil
 }
 
@@ -1641,24 +2039,31 @@ func (rt *runtime) appendUserMessage(content string) (int, error) {
 // per-turn context). Caller must hold the runtime mutex. Returns a non-nil error if a turn
 // is already in progress or ensureSession fails; on error it leaves busy
 // unchanged (never half-claims). launchTurn must be called AFTER unlocking.
-func (rt *runtime) claimTurnLocked(ctx context.Context) (context.Context, context.CancelFunc, error) {
+func (rt *runtime) claimTurnLocked(ctx context.Context, unit *session) (context.Context, context.CancelFunc, error) {
 	a := rt.agent
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	if rt.session().busy {
+	if unit == nil {
+		return nil, nil, snapshot.ErrNoSession
+	}
+	if unit.busy {
 		return nil, nil, fmt.Errorf("a turn is already in progress")
 	}
-	if err := a.ensureSession(); err != nil {
-		return nil, nil, err
+	if unit == a.session {
+		if err := a.ensureSession(); err != nil {
+			return nil, nil, err
+		}
+	} else if unit.store == nil || !unit.store.Active() {
+		return nil, nil, snapshot.ErrNoSession
 	}
-	a.ensureActiveModelLocked()
+	a.ensureActiveModelForSessionLocked(unit)
 	a.setWarningGroup("setup", a.setupWarningsLocked())
-	rt.session().busy = true
-	rt.session().seenSessions = nil
+	unit.busy = true
+	unit.seenSessions = nil
 	turnCtx, cancel := context.WithCancel(ctx)
-	rt.session().turnCancel = cancel
-	rt.session().turnCtx = turnCtx
+	unit.turnCancel = cancel
+	unit.turnCtx = turnCtx
 	return turnCtx, cancel, nil
 }
 
@@ -1689,13 +2094,20 @@ func copyQueue(items []QueuedItem) []QueuedItem {
 // the monotonic version when the queue was non-empty. Caller holds the runtime mutex.
 // Returns the empty snapshot, its version, and whether the queue changed.
 func (rt *runtime) clearQueueLocked() ([]QueuedItem, int, bool) {
-	rt.session().queueSeq = 0
-	if len(rt.session().queue) == 0 {
-		return emptyQueue(), rt.session().queueVersion, false
+	return rt.clearQueueLockedForSession(rt.session())
+}
+
+func (rt *runtime) clearQueueLockedForSession(unit *session) ([]QueuedItem, int, bool) {
+	if unit == nil {
+		return emptyQueue(), 0, false
 	}
-	rt.session().queue = nil
-	rt.session().queueVersion++
-	return emptyQueue(), rt.session().queueVersion, true
+	unit.queueSeq = 0
+	if len(unit.queue) == 0 {
+		return emptyQueue(), unit.queueVersion, false
+	}
+	unit.queue = nil
+	unit.queueVersion++
+	return emptyQueue(), unit.queueVersion, true
 }
 
 // beginTransition marks a cancel-and-wait session change in flight. While set,
@@ -1762,62 +2174,90 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 		return
 	}
 	rt.mu.Lock()
-	if ctx.Err() != nil || rt.session().busy || rt.session().transitioning || a.store == nil || !a.store.Active() || len(rt.session().queue) == 0 {
+	unit := rt.nextDrainableSessionLocked()
+	if ctx.Err() != nil || unit == nil {
 		rt.mu.Unlock()
 		return
 	}
-	contents := make([]string, len(rt.session().queue))
-	for i, it := range rt.session().queue {
+	contents := make([]string, len(unit.queue))
+	for i, it := range unit.queue {
 		contents[i] = it.Content
 	}
-	rt.session().queue = nil
-	rt.session().queueVersion++
-	version := rt.session().queueVersion
+	unit.queue = nil
+	unit.queueVersion++
+	version := unit.queueVersion
 	for _, content := range contents[:len(contents)-1] {
 		if ctx.Err() != nil {
 			rt.mu.Unlock()
 			return
 		}
-		turn := a.store.BeginTurn()
-		a.lp.AppendUserMessage(turn, content)
-		_ = a.store.MarkTurnComplete(turn)
+		turn := unit.store.BeginTurn()
+		unit.lp.AppendUserMessage(turn, content)
+		_ = unit.store.MarkTurnComplete(turn)
 	}
 	if ctx.Err() != nil {
 		rt.mu.Unlock()
 		return
 	}
-	rt.session().busy = true
-	rt.session().seenSessions = nil
+	unit.busy = true
+	unit.seenSessions = nil
 	turnCtx, cancel := context.WithCancel(ctx)
-	rt.session().turnCancel = cancel
-	rt.session().turnCtx = turnCtx
+	unit.turnCancel = cancel
+	unit.turnCtx = turnCtx
 	rt.mu.Unlock()
 
 	a.emitEvent(Event{Kind: EventQueueChanged, Queue: emptyQueue(), QueueVersion: version})
-	rt.launchTurn(ctx, turnCtx, cancel, []string{contents[len(contents)-1]})
+	rt.launchTurn(ctx, unit, turnCtx, cancel, []string{contents[len(contents)-1]})
 }
 
-func (rt *runtime) launchTurn(ctx context.Context, turnCtx context.Context, cancel context.CancelFunc, contents []string) int {
+func (rt *runtime) nextDrainableSessionLocked() *session {
+	if rt == nil || rt.agent == nil {
+		return nil
+	}
+	if unit := rt.session(); drainableSession(unit) {
+		return unit
+	}
+	for _, unit := range rt.agent.sessions {
+		if drainableSession(unit) {
+			return unit
+		}
+	}
+	return nil
+}
+
+func drainableSession(unit *session) bool {
+	return unit != nil &&
+		!unit.busy &&
+		!unit.transitioning &&
+		unit.store != nil &&
+		unit.store.Active() &&
+		len(unit.queue) > 0
+}
+
+func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx context.Context, cancel context.CancelFunc, contents []string) int {
 	a := rt.agent
-	turn := a.store.BeginTurn()
+	if unit == nil || unit.store == nil || unit.lp == nil {
+		return 0
+	}
+	turn := unit.store.BeginTurn()
 
 	a.emitEvent(Event{Kind: EventTurnStart, Turn: turn})
 
 	rt.mu.Lock()
-	a.ensureActiveModelLocked()
+	a.ensureActiveModelForSessionLocked(unit)
 	a.setWarningGroup("setup", a.setupWarningsLocked())
 	rt.mu.Unlock()
 
-	if a.taskToolInst != nil {
-		a.taskToolInst.updateParentState(cancel)
+	if unit.taskToolInst != nil {
+		unit.taskToolInst.updateParentState(cancel)
 	}
 
 	go func() {
 		defer func() {
 			rt.mu.Lock()
-			rt.session().busy = false
-			rt.session().turnCancel = nil
-			rt.session().turnCtx = nil
+			unit.busy = false
+			unit.turnCancel = nil
+			unit.turnCtx = nil
 			rt.mu.Unlock()
 			cancel()
 			// Unconditionally nudge the queue drainer after every turn end: it
@@ -1834,12 +2274,12 @@ func (rt *runtime) launchTurn(ctx context.Context, turnCtx context.Context, canc
 		if ctx.Err() != nil {
 			return
 		}
-		a.refreshSystemPrompt()
+		a.refreshSystemPromptForSession(unit)
 
 		if ctx.Err() != nil {
 			return
 		}
-		_, err := a.lp.Run(turnCtx, contents...)
+		_, err := unit.lp.Run(turnCtx, contents...)
 
 		done := make(chan struct{})
 		select {
@@ -1854,7 +2294,7 @@ func (rt *runtime) launchTurn(ctx context.Context, turnCtx context.Context, canc
 		if err != nil {
 			a.emitEvent(Event{Kind: EventError, Error: a.turnErrorMessage(err), Turn: turn})
 		}
-		a.emitEvent(Event{Kind: EventTurnEnd, Turn: turn, Cancelled: turnCtx.Err() != nil, RefreshSession: rt.takeDeferredSessionRefreshAfterTurn()})
+		a.emitEvent(Event{Kind: EventTurnEnd, Turn: turn, Cancelled: turnCtx.Err() != nil, RefreshSession: rt.takeDeferredSessionRefreshAfterTurnForSession(unit)})
 	}()
 
 	return turn
@@ -1869,7 +2309,7 @@ func (a *Agent) turnErrorMessage(err error) string {
 
 // Cancel aborts the current turn.
 func (a *Agent) Cancel() error {
-	cancel := a.ensureRuntime().turnCancelSnapshot()
+	cancel := a.ensureRuntime().turnCancelSnapshot(a.session)
 	if cancel != nil {
 		cancel()
 	}
@@ -1879,21 +2319,59 @@ func (a *Agent) Cancel() error {
 	return nil
 }
 
+func (a *Agent) CancelSession(sessionID string) error {
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	unit, err := a.liveSessionLocked(sessionID)
+	if err == nil {
+		cancel := rt.turnCancelSnapshotLocked(unit)
+		rt.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		return nil
+	}
+	rt.mu.Unlock()
+	return err
+}
+
 // Busy reports whether a turn is in progress.
 func (a *Agent) Busy() bool {
-	return a.ensureRuntime().busySnapshot()
+	return a.ensureRuntime().busySnapshot(a.session)
 }
 
-func (rt *runtime) turnCancelSnapshot() context.CancelFunc {
+func (a *Agent) BusyForSession(sessionID string) (bool, error) {
+	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	return rt.session().turnCancel
+	unit, err := a.liveSessionLocked(sessionID)
+	if err != nil {
+		return false, err
+	}
+	return rt.busySnapshotLocked(unit), nil
 }
 
-func (rt *runtime) busySnapshot() bool {
+func (rt *runtime) turnCancelSnapshot(unit *session) context.CancelFunc {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	return rt.session().busy
+	return rt.turnCancelSnapshotLocked(unit)
+}
+
+func (rt *runtime) turnCancelSnapshotLocked(unit *session) context.CancelFunc {
+	if unit == nil {
+		return nil
+	}
+	return unit.turnCancel
+}
+
+func (rt *runtime) busySnapshot(unit *session) bool {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.busySnapshotLocked(unit)
+}
+
+func (rt *runtime) busySnapshotLocked(unit *session) bool {
+	return unit != nil && unit.busy
 }
 
 // RespondPermission answers a pending permission prompt.
@@ -1942,9 +2420,26 @@ func (a *Agent) SaveProjectPermission(id string, patterns []string) error {
 
 // SwitchModel changes the active model by provider-prefixed catalog ref.
 func (a *Agent) SwitchModel(refStr string) error {
+	return a.switchModelForSession(a.session, refStr)
+}
+
+func (a *Agent) SwitchModelForSession(sessionID string, refStr string) error {
+	a.ensureRuntime().mu.Lock()
+	unit, err := a.liveSessionLocked(sessionID)
+	a.ensureRuntime().mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return a.switchModelForSession(unit, refStr)
+}
+
+func (a *Agent) switchModelForSession(unit *session, refStr string) error {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().session().busy {
+	if unit == nil {
+		return snapshot.ErrNoSession
+	}
+	if unit.busy {
 		return fmt.Errorf("cannot switch model while a turn is running")
 	}
 	ref, err := coremodel.Parse(refStr)
@@ -1958,10 +2453,12 @@ func (a *Agent) SwitchModel(refStr string) error {
 	if err := a.writePrimaryModelLocked(ref); err != nil {
 		return err
 	}
-	a.setActiveModelLocked(ref, client, model)
-	a.ensureRuntime().signalSink.AddSignal(loop.PendingSignal{Payload: fmt.Sprintf("Model switched to %s", ref.String()), Persist: true})
-	if a.store.Active() {
-		if err := a.store.SetModel(ref.Provider, ref.Model); err != nil {
+	a.setActiveModelForSessionLocked(unit, ref, client, model)
+	if unit.lp != nil {
+		unit.lp.AddPendingSignal(loop.PendingSignal{Payload: fmt.Sprintf("Model switched to %s", ref.String()), Persist: true})
+	}
+	if unit.store != nil && unit.store.Active() {
+		if err := unit.store.SetModel(ref.Provider, ref.Model); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)
 		}
 	}
@@ -2035,7 +2532,14 @@ func (a *Agent) reloadLockedWithRefresh(allowBackgroundDiscovery bool) error {
 
 func (a *Agent) setAgentTypesLocked(agentTypes *agentcfg.Config) {
 	a.agents = agentTypes
-	if a.taskToolInst != nil {
+	seen := map[*taskTool]bool{}
+	for _, unit := range a.sessions {
+		if unit != nil && unit.taskToolInst != nil && !seen[unit.taskToolInst] {
+			unit.taskToolInst.setAgentTypes(agentTypes)
+			seen[unit.taskToolInst] = true
+		}
+	}
+	if a.taskToolInst != nil && !seen[a.taskToolInst] {
 		a.taskToolInst.setAgentTypes(agentTypes)
 	}
 	a.setWarningGroup("agents", agentWarningsToPromptWarnings(agentTypes.Warnings()))
@@ -2212,9 +2716,21 @@ func (a *Agent) refreshDiscoveryLocked(provider string) error {
 func (a *Agent) CurrentModel() ModelInfo {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	a.ensureActiveModelLocked()
+	a.ensureActiveModelForSessionLocked(a.session)
 	a.setWarningGroup("setup", a.setupWarningsLocked())
 	return a.modelInfo(a.currentRef)
+}
+
+func (a *Agent) CurrentModelForSession(sessionID string) (ModelInfo, error) {
+	a.ensureRuntime().mu.Lock()
+	defer a.ensureRuntime().mu.Unlock()
+	unit, err := a.liveSessionLocked(sessionID)
+	if err != nil {
+		return ModelInfo{}, err
+	}
+	a.ensureActiveModelForSessionLocked(unit)
+	a.setWarningGroup("setup", a.setupWarningsLocked())
+	return a.modelInfo(unit.currentRef), nil
 }
 
 // modelListFrom builds enriched model list entries from the given refs.
@@ -2497,21 +3013,51 @@ func (a *Agent) writePrimaryModelLocked(ref coremodel.ModelRef) error {
 
 // TokenUsage returns cumulative token usage for the session.
 func (a *Agent) TokenUsage() TokenReport {
-	a.tokensMu.Lock()
-	defer a.tokensMu.Unlock()
-	return a.buildReportLocked()
+	unit := a.session
+	if unit == nil {
+		return TokenReport{}
+	}
+	unit.tokensMu.Lock()
+	defer unit.tokensMu.Unlock()
+	return a.buildReportForSessionLocked(unit)
+}
+
+func (a *Agent) TokenUsageForSession(sessionID string) (TokenReport, error) {
+	a.ensureRuntime().mu.Lock()
+	unit, err := a.liveSessionLocked(sessionID)
+	a.ensureRuntime().mu.Unlock()
+	if err != nil {
+		return TokenReport{}, err
+	}
+	unit.tokensMu.Lock()
+	defer unit.tokensMu.Unlock()
+	return a.buildReportForSessionLocked(unit), nil
 }
 
 // --- Session operations ---
 
 // SessionCurrent returns the active session, or zero-value if none is open.
 func (a *Agent) SessionCurrent() SessionSummary {
-	if !a.store.Active() {
+	return sessionSummary(a.session)
+}
+
+func (a *Agent) SessionSummaryForSession(sessionID string) (SessionSummary, error) {
+	a.ensureRuntime().mu.Lock()
+	unit, err := a.liveSessionLocked(sessionID)
+	a.ensureRuntime().mu.Unlock()
+	if err != nil {
+		return SessionSummary{}, err
+	}
+	return sessionSummary(unit), nil
+}
+
+func sessionSummary(unit *session) SessionSummary {
+	if unit == nil || unit.store == nil || !unit.store.Active() {
 		return SessionSummary{}
 	}
-	meta, err := a.store.Meta()
+	meta, err := unit.store.Meta()
 	if err != nil {
-		return SessionSummary{ID: a.store.SessionID()}
+		return SessionSummary{ID: unit.store.SessionID()}
 	}
 	return SessionSummary{
 		ID:              meta.ID,
@@ -2580,9 +3126,11 @@ func (a *Agent) CloseForProjectSwitch() error {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
 	if a.store.Active() {
+		oldID := a.store.SessionID()
 		if _, err := a.store.Close(); err != nil {
 			return err
 		}
+		delete(a.sessions, oldID)
 	}
 	a.ensureRuntime().clearQueueLocked()
 	return nil
@@ -2602,8 +3150,14 @@ func (a *Agent) SessionSwitch(id string) error {
 	defer a.ensureRuntime().mu.Unlock()
 
 	if a.store.Active() && a.store.SessionID() == id {
+		a.refreshCurrentSessionProjectLocked()
 		return nil // same-session no-op: queue is preserved
 	}
+	var proj *project.Project
+	if a.projects != nil {
+		proj, _ = a.projects.Current()
+	}
+	oldID := a.store.SessionID()
 	if _, err := a.store.Close(); err != nil {
 		return err
 	}
@@ -2614,6 +3168,9 @@ func (a *Agent) SessionSwitch(id string) error {
 	if err := a.store.LoadSession(id); err != nil {
 		return err
 	}
+	setSessionProject(a.session, proj)
+	delete(a.sessions, oldID)
+	a.setCurrentSessionLocked(a.session)
 	meta, err := a.store.Meta()
 	if err == nil && metaState(meta.State) == snapshot.StateArchived {
 		_ = a.store.SetState(snapshot.StateActive)
@@ -2684,6 +3241,75 @@ func (a *Agent) SessionNew() error {
 	return nil
 }
 
+func (a *Agent) NewSession(projectID string, agentType string) (string, error) {
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	resolvedType, err := a.explicitRootSessionTypeLocked(agentType)
+	if err != nil {
+		return "", err
+	}
+	proj, err := a.projectForSessionCreateLocked(projectID)
+	if err != nil {
+		return "", err
+	}
+	store, err := snapshot.NewForSessionsRoot(a.projects.SessionsRoot(proj.ID), a.projects.Root(), proj.ID)
+	if err != nil {
+		return "", err
+	}
+	unit, err := a.rootRunningUnitLocked(store, resolvedType, proj.ID, proj.Name, proj.Path)
+	if err != nil {
+		return "", err
+	}
+	if err := unit.store.BeginNewSession(proj.Path); err != nil {
+		return "", err
+	}
+	a.ensureActiveModelForSessionLocked(unit)
+	if unit.currentRef.Provider != "" && unit.currentRef.Model != "" {
+		if err := unit.store.SetModel(unit.currentRef.Provider, unit.currentRef.Model); err != nil {
+			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)
+		}
+	}
+	unit.lp.ResetHistory()
+	if unit.fileTracker != nil {
+		unit.fileTracker.Reset()
+	}
+	a.loadTokensFromDiskForSession(unit)
+	a.setCurrentSessionLocked(unit)
+	return unit.store.SessionID(), nil
+}
+
+func (a *Agent) explicitRootSessionTypeLocked(agentType string) (string, error) {
+	if strings.TrimSpace(agentType) == "" {
+		agentType = "primary"
+	}
+	resolved, err := a.resolvedAgentTypeLocked(agentType)
+	if err != nil {
+		return "", err
+	}
+	if resolved.Name == "compact" {
+		return "", fmt.Errorf("agent type %q cannot be started as a session", resolved.Name)
+	}
+	return resolved.Name, nil
+}
+
+func (a *Agent) projectForSessionCreateLocked(projectID string) (*project.Project, error) {
+	if strings.TrimSpace(projectID) == "" {
+		return a.projects.Ensure()
+	}
+	projects, err := project.List(a.projects.Root())
+	if err != nil {
+		return nil, err
+	}
+	for i := range projects {
+		if projects[i].ID == projectID {
+			p := projects[i]
+			return &p, nil
+		}
+	}
+	return nil, fmt.Errorf("unknown project %q", projectID)
+}
+
 // SessionArchive archives a session. If it's the current session, close
 // first. Returns true if the current session was closed.
 func (a *Agent) SessionArchive(id string) (bool, error) {
@@ -2748,6 +3374,16 @@ func (a *Agent) SessionMessagesFor(id string) ([]DisplayMessage, error) {
 	return a.messagesForFrontendForSession(id)
 }
 
+func (a *Agent) SessionMessagesByID(id string) ([]DisplayMessage, error) {
+	a.ensureRuntime().mu.Lock()
+	unit, err := a.liveSessionLocked(id)
+	a.ensureRuntime().mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return a.messagesForFrontendForStore(unit.store, id)
+}
+
 func (a *Agent) currentSessionsRoot() (string, error) {
 	proj, err := a.projects.Current()
 	if err != nil {
@@ -2787,12 +3423,19 @@ func (a *Agent) messagesForFrontend() []DisplayMessage {
 }
 
 func (a *Agent) messagesForFrontendForSession(sessionID string) ([]DisplayMessage, error) {
+	return a.messagesForFrontendForStore(a.store, sessionID)
+}
+
+func (a *Agent) messagesForFrontendForStore(store *snapshot.Store, sessionID string) ([]DisplayMessage, error) {
+	if store == nil {
+		return nil, snapshot.ErrNoSession
+	}
 	var rec *snapshot.CompactionRecord
 	var err error
 	if sessionID == "" {
-		rec, err = a.store.LoadCompaction()
+		rec, err = store.LoadCompaction()
 	} else {
-		rec, err = a.store.LoadCompactionForSession(sessionID)
+		rec, err = store.LoadCompactionForSession(sessionID)
 	}
 	if err != nil {
 		return nil, err
@@ -2800,14 +3443,14 @@ func (a *Agent) messagesForFrontendForSession(sessionID string) ([]DisplayMessag
 	var raw []snapshot.TurnMessages
 	if sessionID == "" {
 		if rec != nil {
-			raw, err = a.store.LoadCompleteTurnsAfterReadOnly(rec.BoundaryTurn)
+			raw, err = store.LoadCompleteTurnsAfterReadOnly(rec.BoundaryTurn)
 		} else {
-			raw, err = a.store.LoadCompleteTurnsReadOnly()
+			raw, err = store.LoadCompleteTurnsReadOnly()
 		}
 	} else if rec != nil {
-		raw, err = a.store.LoadCompleteTurnsAfterForSessionReadOnly(sessionID, rec.BoundaryTurn)
+		raw, err = store.LoadCompleteTurnsAfterForSessionReadOnly(sessionID, rec.BoundaryTurn)
 	} else {
-		raw, err = a.store.LoadCompleteTurnsForSessionReadOnly(sessionID)
+		raw, err = store.LoadCompleteTurnsForSessionReadOnly(sessionID)
 	}
 	if err != nil {
 		return nil, err
@@ -3051,6 +3694,20 @@ func (a *Agent) displayMetadataForToolCall(name, args, result string) map[string
 // The turn argument is the clicked user turn; this method owns the conversion
 // to the lower-level snapshot/history cut points so adapters do not duplicate it.
 func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (TurnActionResult, error) {
+	return a.applyTurnActionForSession(a.session, turn, action, alsoRevertCode)
+}
+
+func (a *Agent) ApplyTurnActionForSession(sessionID string, turn int, action string, alsoRevertCode bool) (TurnActionResult, error) {
+	a.ensureRuntime().mu.Lock()
+	unit, err := a.liveSessionLocked(sessionID)
+	a.ensureRuntime().mu.Unlock()
+	if err != nil {
+		return TurnActionResult{}, err
+	}
+	return a.applyTurnActionForSession(unit, turn, action, alsoRevertCode)
+}
+
+func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string, alsoRevertCode bool) (TurnActionResult, error) {
 	// fork / revert_history change the session; clear the queue at the
 	// irreversible store mutation and emit after unlock (defer LIFO).
 	var clearedVersion int
@@ -3062,30 +3719,30 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 	}()
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().session().busy {
-		return TurnActionResult{}, fmt.Errorf("cannot %s while a turn is running", turnActionVerb(action))
+	if unit == nil || unit.store == nil || !unit.store.Active() {
+		return TurnActionResult{}, snapshot.ErrNoSession
 	}
-	if !a.store.Active() {
-		return TurnActionResult{}, fmt.Errorf("no session open")
+	if unit.busy {
+		return TurnActionResult{}, fmt.Errorf("cannot %s while a turn is running", turnActionVerb(action))
 	}
 	if turn < 1 {
 		return TurnActionResult{}, fmt.Errorf("turn must be >= 1")
 	}
 
-	prefill := a.userMessageContentForTurn(turn)
+	prefill := a.userMessageContentForTurnForSession(unit, turn)
 	result := TurnActionResult{Action: action, Turn: turn}
 
 	switch action {
 	case TurnActionRevertCode:
 		target := turn - 1
 		result.TargetTurn = target
-		revertResult, err := a.store.RevertCode(target)
+		revertResult, err := unit.store.RevertCode(target)
 		if err != nil {
 			return TurnActionResult{}, err
 		}
 		result.RestoredFiles = revertResult.Restored
 		result.SkippedFiles = revertResult.Skipped
-		a.resetFileTracker()
+		a.resetFileTrackerForSession(unit)
 		return result, nil
 
 	case TurnActionRevertHistory:
@@ -3094,55 +3751,61 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 		result.Prefill = prefill
 		result.SessionChanged = true
 		if alsoRevertCode {
-			revertResult, err := a.store.RevertCode(target)
+			revertResult, err := unit.store.RevertCode(target)
 			if err != nil {
 				return TurnActionResult{}, err
 			}
 			result.RestoredFiles = revertResult.Restored
 			result.SkippedFiles = revertResult.Skipped
 		}
-		if err := a.store.RevertHistory(target); err != nil {
+		if err := unit.store.RevertHistory(target); err != nil {
 			return TurnActionResult{}, err
 		}
 		// History irreversibly truncated: the queued input no longer applies.
-		_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLocked()
-		if err := a.loadHistoryIntoLoop(); err != nil {
+		_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLockedForSession(unit)
+		if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
 			return TurnActionResult{}, err
 		}
-		a.resetFileTracker()
-		return a.populateTurnActionResult(result), nil
+		a.resetFileTrackerForSession(unit)
+		return a.populateTurnActionResultForSession(unit, result), nil
 
 	case TurnActionFork:
 		target := turn
 		result.TargetTurn = target
 		result.SessionChanged = true
 		if alsoRevertCode {
-			revertResult, err := a.store.RevertCode(target)
+			revertResult, err := unit.store.RevertCode(target)
 			if err != nil {
 				return TurnActionResult{}, err
 			}
 			result.RestoredFiles = revertResult.Restored
 			result.SkippedFiles = revertResult.Skipped
 		}
-		newID, _, err := a.store.ForkInto(target)
+		oldID := unit.store.SessionID()
+		newID, _, err := unit.store.ForkInto(target)
 		if err != nil {
 			return TurnActionResult{}, err
 		}
-		if _, err := a.store.Close(); err != nil {
+		if _, err := unit.store.Close(); err != nil {
 			return TurnActionResult{}, err
 		}
 		// Old session irreversibly detached by the fork's Close: clear here,
 		// before LoadSession (which may fail and leave no active session).
-		_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLocked()
-		if err := a.store.LoadSession(newID); err != nil {
+		_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLockedForSession(unit)
+		if err := unit.store.LoadSession(newID); err != nil {
 			return TurnActionResult{}, err
 		}
-		if err := a.loadHistoryIntoLoop(); err != nil {
+		delete(a.sessions, oldID)
+		a.registerLiveSessionLocked(unit)
+		if a.currentSessionID == oldID {
+			a.currentSessionID = newID
+		}
+		if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
 			return TurnActionResult{}, err
 		}
-		a.resetFileTracker()
-		a.loadTokensFromDisk()
-		return a.populateTurnActionResult(result), nil
+		a.resetFileTrackerForSession(unit)
+		a.loadTokensFromDiskForSession(unit)
+		return a.populateTurnActionResultForSession(unit, result), nil
 
 	default:
 		return TurnActionResult{}, fmt.Errorf("unknown turn action %q", action)
@@ -3161,14 +3824,30 @@ func turnActionVerb(action string) string {
 }
 
 func (a *Agent) populateTurnActionResult(result TurnActionResult) TurnActionResult {
-	result.Session = a.SessionCurrent()
-	result.Messages = a.messagesForFrontend()
-	result.Tokens = a.TokenUsage()
+	return a.populateTurnActionResultForSession(a.session, result)
+}
+
+func (a *Agent) populateTurnActionResultForSession(unit *session, result TurnActionResult) TurnActionResult {
+	result.Session = sessionSummary(unit)
+	if unit != nil && unit.store != nil && unit.store.Active() {
+		result.Messages, _ = a.messagesForFrontendForStore(unit.store, unit.store.SessionID())
+		unit.tokensMu.Lock()
+		result.Tokens = a.buildReportForSessionLocked(unit)
+		unit.tokensMu.Unlock()
+	}
 	return result
 }
 
 func (a *Agent) userMessageContentForTurn(turn int) string {
-	for _, msg := range a.messagesForFrontend() {
+	return a.userMessageContentForTurnForSession(a.session, turn)
+}
+
+func (a *Agent) userMessageContentForTurnForSession(unit *session, turn int) string {
+	var msgs []DisplayMessage
+	if unit != nil && unit.store != nil && unit.store.Active() {
+		msgs, _ = a.messagesForFrontendForStore(unit.store, unit.store.SessionID())
+	}
+	for _, msg := range msgs {
 		if msg.Type == "user" && msg.Turn == turn {
 			return msg.Content
 		}
@@ -3178,24 +3857,52 @@ func (a *Agent) userMessageContentForTurn(turn int) string {
 
 // RevertCode restores files to their state at the given turn.
 func (a *Agent) RevertCode(turn int) (snapshot.RevertResult, error) {
+	return a.revertCodeForSession(a.session, turn)
+}
+
+func (a *Agent) RevertCodeForSession(sessionID string, turn int) (snapshot.RevertResult, error) {
+	a.ensureRuntime().mu.Lock()
+	unit, err := a.liveSessionLocked(sessionID)
+	a.ensureRuntime().mu.Unlock()
+	if err != nil {
+		return snapshot.RevertResult{}, err
+	}
+	return a.revertCodeForSession(unit, turn)
+}
+
+func (a *Agent) revertCodeForSession(unit *session, turn int) (snapshot.RevertResult, error) {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().session().busy {
+	if unit == nil || unit.store == nil || !unit.store.Active() {
+		return snapshot.RevertResult{}, snapshot.ErrNoSession
+	}
+	if unit.busy {
 		return snapshot.RevertResult{}, fmt.Errorf("cannot revert while a turn is running")
 	}
-	if !a.store.Active() {
-		return snapshot.RevertResult{}, fmt.Errorf("no session open")
-	}
-	result, err := a.store.RevertCode(turn)
+	result, err := unit.store.RevertCode(turn)
 	if err != nil {
 		return result, err
 	}
-	a.resetFileTracker()
+	a.resetFileTrackerForSession(unit)
 	return result, nil
 }
 
 // RevertHistory truncates conversation after the given turn.
 func (a *Agent) RevertHistory(turn int) error {
+	return a.revertHistoryForSession(a.session, turn)
+}
+
+func (a *Agent) RevertHistoryForSession(sessionID string, turn int) error {
+	a.ensureRuntime().mu.Lock()
+	unit, err := a.liveSessionLocked(sessionID)
+	a.ensureRuntime().mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return a.revertHistoryForSession(unit, turn)
+}
+
+func (a *Agent) revertHistoryForSession(unit *session, turn int) error {
 	var clearedVersion int
 	var queueCleared bool
 	defer func() {
@@ -3205,25 +3912,39 @@ func (a *Agent) RevertHistory(turn int) error {
 	}()
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().session().busy {
+	if unit == nil || unit.store == nil || !unit.store.Active() {
+		return snapshot.ErrNoSession
+	}
+	if unit.busy {
 		return fmt.Errorf("cannot revert while a turn is running")
 	}
-	if !a.store.Active() {
-		return fmt.Errorf("no session open")
-	}
-	if err := a.store.RevertHistory(turn); err != nil {
+	if err := unit.store.RevertHistory(turn); err != nil {
 		return err
 	}
-	_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLocked()
-	if err := a.loadHistoryIntoLoop(); err != nil {
+	_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLockedForSession(unit)
+	if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
 		return err
 	}
-	a.resetFileTracker()
+	a.resetFileTrackerForSession(unit)
 	return nil
 }
 
 // ForkSession creates a new session branched from the given turn.
 func (a *Agent) ForkSession(turn int) error {
+	return a.forkSessionForSession(a.session, turn)
+}
+
+func (a *Agent) ForkSessionForSession(sessionID string, turn int) error {
+	a.ensureRuntime().mu.Lock()
+	unit, err := a.liveSessionLocked(sessionID)
+	a.ensureRuntime().mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return a.forkSessionForSession(unit, turn)
+}
+
+func (a *Agent) forkSessionForSession(unit *session, turn int) error {
 	var clearedVersion int
 	var queueCleared bool
 	defer func() {
@@ -3233,28 +3954,34 @@ func (a *Agent) ForkSession(turn int) error {
 	}()
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().session().busy {
+	if unit == nil || unit.store == nil || !unit.store.Active() {
+		return snapshot.ErrNoSession
+	}
+	if unit.busy {
 		return fmt.Errorf("cannot fork while a turn is running")
 	}
-	if !a.store.Active() {
-		return fmt.Errorf("no session open")
-	}
-	newID, _, err := a.store.ForkInto(turn)
+	oldID := unit.store.SessionID()
+	newID, _, err := unit.store.ForkInto(turn)
 	if err != nil {
 		return err
 	}
-	if _, err := a.store.Close(); err != nil {
+	if _, err := unit.store.Close(); err != nil {
 		return err
 	}
-	_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLocked()
-	if err := a.store.LoadSession(newID); err != nil {
+	_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLockedForSession(unit)
+	if err := unit.store.LoadSession(newID); err != nil {
 		return err
 	}
-	if err := a.loadHistoryIntoLoop(); err != nil {
+	delete(a.sessions, oldID)
+	a.registerLiveSessionLocked(unit)
+	if a.currentSessionID == oldID {
+		a.currentSessionID = newID
+	}
+	if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
 		return err
 	}
-	a.resetFileTracker()
-	a.loadTokensFromDisk()
+	a.resetFileTrackerForSession(unit)
+	a.loadTokensFromDiskForSession(unit)
 	return nil
 }
 
@@ -3530,10 +4257,18 @@ func (a *Agent) agentResolveContextLocked() agentcfg.ResolveContext {
 }
 
 func (a *Agent) resolvedAgentTypeLocked(name string) (agentcfg.Resolved, error) {
+	return a.resolvedAgentTypeForProjectLocked(name, "")
+}
+
+func (a *Agent) resolvedAgentTypeForProjectLocked(name string, projectID string) (agentcfg.Resolved, error) {
 	if a.agents == nil {
 		return agentcfg.Resolved{}, fmt.Errorf("agents config is not loaded")
 	}
-	return a.agents.Resolve(name, a.agentResolveContextLocked())
+	ctx := a.agentResolveContextLocked()
+	if strings.TrimSpace(projectID) != "" {
+		ctx.ProjectID = projectID
+	}
+	return a.agents.Resolve(name, ctx)
 }
 
 func (a *Agent) resolvedAgentModelLocked(name string) (coremodel.ModelRef, string, bool) {
@@ -3552,11 +4287,22 @@ func (a *Agent) resolvedAgentModelLocked(name string) (coremodel.ModelRef, strin
 // only if the provider is connected. Caller must hold the runtime mutex.
 // If no active model can be resolved, it leaves currentRef empty and returns false.
 func (a *Agent) ensureActiveModelLocked() bool {
-	if a.modelRefConnected(a.currentRef) {
+	return a.ensureActiveModelForSessionLocked(a.session)
+}
+
+func (a *Agent) ensureActiveModelForSessionLocked(unit *session) bool {
+	if unit == nil {
+		return false
+	}
+	if a.modelRefConnected(unit.currentRef) {
 		return true
 	}
-	a.clearActiveModelLocked()
-	ref, _, ok := a.resolvedAgentModelLocked("primary")
+	a.clearActiveModelForSessionLocked(unit)
+	agentType := unit.activeAgentType
+	if agentType == "" {
+		agentType = "primary"
+	}
+	ref, _, ok := a.resolvedAgentModelLocked(agentType)
 	if !ok || !a.modelRefConnected(ref) {
 		return false
 	}
@@ -3564,7 +4310,7 @@ func (a *Agent) ensureActiveModelLocked() bool {
 	if err != nil {
 		return false
 	}
-	a.setActiveModelLocked(ref, client, model)
+	a.setActiveModelForSessionLocked(unit, ref, client, model)
 	return true
 }
 
