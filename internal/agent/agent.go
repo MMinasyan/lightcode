@@ -3770,29 +3770,6 @@ func (a *Agent) cancelAndWaitIdle() error {
 	return fmt.Errorf("timed out waiting for current turn to end")
 }
 
-// CloseForProjectSwitch cancels any active turn, closes the current session, and
-// clears queued input under the backend transition guard before adapters relaunch
-// the process in another project.
-func (a *Agent) CloseForProjectSwitch() error {
-	a.ensureRuntime().beginTransition()
-	defer a.ensureRuntime().endTransition()
-	if err := a.cancelAndWaitIdle(); err != nil {
-		return err
-	}
-
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
-	if a.store.Active() {
-		oldID := a.store.SessionID()
-		if _, err := a.store.Close(); err != nil {
-			return err
-		}
-		delete(a.sessions, oldID)
-	}
-	a.ensureRuntime().clearQueueLocked()
-	return nil
-}
-
 // SessionSwitch closes the current session and loads another.
 func (a *Agent) SessionSwitch(id string) error {
 	id = strings.TrimSpace(id)

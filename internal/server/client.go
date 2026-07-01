@@ -450,8 +450,4 @@ func (c *Client) SessionListForProjectPath(projectPath string, state string) ([]
 	return rpcCall[[]agent.SessionSummary](context.Background(), c, "SessionListForProjectPath", map[string]any{"project_path": projectPath, "state": state})
 }
 
-func (c *Client) CloseForProjectSwitch() error {
-	return c.rpc(context.Background(), "CloseForProjectSwitch", nil)
-}
-
 var _ agent.AdapterService = (*Client)(nil)

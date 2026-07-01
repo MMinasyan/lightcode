@@ -763,7 +763,7 @@ func (a *App) ProjectCurrent() agent.ProjectSummary {
 	return a.svc.ProjectCurrent()
 }
 
-// ProjectSwitch spawns a detached child in the target directory and quits.
+// ProjectSwitch spawns a detached child in the target directory and quits this adapter.
 func (a *App) ProjectSwitch(targetPath string) error {
 	if targetPath == "" {
 		return fmt.Errorf("empty target path")
@@ -781,10 +781,6 @@ func (a *App) ProjectSwitch(targetPath string) error {
 	}
 	if abs == a.svc.ProjectRoot() {
 		return nil
-	}
-
-	if err := a.svc.CloseForProjectSwitch(); err != nil {
-		return fmt.Errorf("close current session: %w", err)
 	}
 
 	if err := a.relaunchIn(abs); err != nil {

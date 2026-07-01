@@ -510,9 +510,6 @@ func (s *Server) handleAdapterRPC(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out, err = s.agent.SessionListForProjectPath(p.ProjectPath, p.State)
-	case "CloseForProjectSwitch":
-		err = s.agent.CloseForProjectSwitch()
-		out = map[string]any{"ok": err == nil}
 	default:
 		jsonError(w, "unknown adapter method", http.StatusNotFound)
 		return

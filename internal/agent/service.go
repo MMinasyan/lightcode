@@ -74,7 +74,6 @@ type AdapterService interface {
 	ProjectCurrentForPath(string) (ProjectSummary, error)
 	ProjectList() ([]ProjectSummary, error)
 	SessionListForProjectPath(string, string) ([]SessionSummary, error)
-	CloseForProjectSwitch() error
 }
 
 var _ AdapterService = (*Agent)(nil)

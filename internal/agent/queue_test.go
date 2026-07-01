@@ -276,46 +276,6 @@ func TestTryDrainQueueCanceledContextDoesNotPersistQueuedDraft(t *testing.T) {
 	}
 }
 
-func TestCloseForProjectSwitchClearsQueueUnderTransition(t *testing.T) {
-	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
-	cap := &eventCapture{}
-	_ = startEventOrderAgent(t, a, cap)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
-	}
-	a.ensureRuntime().mu.Lock()
-	a.ensureRuntime().session().queue = []QueuedItem{{ID: "q-1", Content: "stale"}}
-	a.ensureRuntime().session().queueSeq = 1
-	a.ensureRuntime().session().queueVersion = 4
-	a.ensureRuntime().mu.Unlock()
-
-	if err := a.CloseForProjectSwitch(); err != nil {
-		t.Fatalf("CloseForProjectSwitch: %v", err)
-	}
-	if a.store.Active() {
-		t.Fatal("project switch close should detach the active session")
-	}
-	got := a.QueueSnapshot()
-	if len(got.Items) != 0 || got.Items == nil {
-		t.Fatalf("queue after project switch = %#v, want empty non-nil slice", got.Items)
-	}
-	if got.Version <= 4 {
-		t.Fatalf("queue version = %d, want > 4", got.Version)
-	}
-	var sawEmpty bool
-	for _, ev := range cap.snapshot() {
-		if ev.Kind == EventQueueChanged && ev.QueueVersion == got.Version {
-			if len(ev.Queue) != 0 || ev.Queue == nil {
-				t.Fatalf("project switch event queue = %#v, want empty non-nil slice", ev.Queue)
-			}
-			sawEmpty = true
-		}
-	}
-	if !sawEmpty {
-		t.Fatalf("missing project switch queue_changed event: %#v", cap.snapshot())
-	}
-}
-
 func TestSessionNewClearsQueueAndBumpsVersionMonotonically(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
 	cap := &eventCapture{}

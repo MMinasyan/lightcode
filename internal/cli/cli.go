@@ -1642,11 +1642,6 @@ func (c *CLI) cmdCopy() {
 }
 
 func (c *CLI) projectSwitch(targetPath string) {
-	if err := c.agent.CloseForProjectSwitch(); err != nil {
-		c.requestExit(fmt.Errorf("close current session: %w", err))
-		return
-	}
-
 	c.restoreTerminal()
 	if err := c.relaunchIn(targetPath); err != nil {
 		c.requestExit(fmt.Errorf("relaunch: %w", err))
