@@ -50,6 +50,252 @@ func TestAuthMiddleware(t *testing.T) {
 	}
 }
 
+func TestOwnerStartWritesLockAndClientAttaches(t *testing.T) {
+	home := t.TempDir()
+	a := newServerTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := New(a, Config{})
+	lf, done, err := srv.Start(ctx, home)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("server shutdown: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("server did not shut down")
+		}
+	})
+
+	if lf.Port == 0 || lf.Token == "" || lf.PID != os.Getpid() {
+		t.Fatalf("lockfile = %+v, want port/token/current pid", lf)
+	}
+	got, err := Read(home)
+	if err != nil {
+		t.Fatalf("Read owner lock: %v", err)
+	}
+	if got != lf {
+		t.Fatalf("owner lock = %+v, want %+v", got, lf)
+	}
+
+	client := NewClient(lf, a.ProjectRoot())
+	id, err := client.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("client NewSession: %v", err)
+	}
+	summary, err := client.SessionSummaryForSession(id)
+	if err != nil {
+		t.Fatalf("client SessionSummaryForSession: %v", err)
+	}
+	if summary.ID != id {
+		t.Fatalf("summary id = %q, want %q", summary.ID, id)
+	}
+}
+
+func TestOwnerStartConcurrentCreatesOneLock(t *testing.T) {
+	home := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		servers  []*Server
+		started  []<-chan error
+		success  int
+		failures int
+	)
+	for i := 0; i < 2; i++ {
+		servers = append(servers, New(newServerTestAgent(t), Config{}))
+	}
+	var wg sync.WaitGroup
+	for _, srv := range servers {
+		wg.Add(1)
+		go func(srv *Server) {
+			defer wg.Done()
+			_, done, err := srv.Start(ctx, home)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				failures++
+				return
+			}
+			success++
+			started = append(started, done)
+		}(srv)
+	}
+	wg.Wait()
+	if success != 1 || failures != 1 {
+		t.Fatalf("starts success/failure = %d/%d, want 1/1", success, failures)
+	}
+	if _, err := Read(home); err != nil {
+		t.Fatalf("Read owner lock: %v", err)
+	}
+	cancel()
+	for _, done := range started {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("server shutdown: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("server did not shut down")
+		}
+	}
+}
+
+func TestAdapterClientReceivesOwnerEvents(t *testing.T) {
+	home := t.TempDir()
+	a := newServerTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := New(a, Config{})
+	lf, done, err := srv.Start(ctx, home)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("server shutdown: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("server did not shut down")
+		}
+	})
+
+	client := NewClient(lf, a.ProjectRoot())
+	if client.http.Timeout != 0 {
+		t.Fatalf("adapter SSE client timeout = %v, want none", client.http.Timeout)
+	}
+	events := make(chan agent.Event, 1)
+	client.SetEventHandler(func(ev agent.Event) {
+		events <- ev
+	})
+	client.Init(ctx)
+
+	want := agent.Event{Kind: agent.EventWarning, SessionID: "session-a", Warnings: []agent.PromptWarning{{Kind: "test", Message: "hello"}}}
+	deadline := time.After(2 * time.Second)
+	for {
+		srv.handleEvent(want)
+		select {
+		case got := <-events:
+			if got.Kind != want.Kind || got.SessionID != want.SessionID || len(got.Warnings) != 1 || got.Warnings[0].Message != "hello" {
+				t.Fatalf("event = %+v, want %+v", got, want)
+			}
+			return
+		case <-time.After(20 * time.Millisecond):
+		case <-deadline:
+			t.Fatal("timed out waiting for adapter event")
+		}
+	}
+}
+
+func TestAdapterClientBindsAttachProject(t *testing.T) {
+	home := t.TempDir()
+	projectA := filepath.Join(home, "project-a")
+	projectB := filepath.Join(home, "project-b")
+	if err := os.MkdirAll(projectA, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(projectB, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a := newServerTestAgentWithHomeRoot(t, home, projectA, "http://127.0.0.1:9/v1", false, "test-model")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := New(a, Config{})
+	lf, done, err := srv.Start(ctx, home)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("server shutdown: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("server did not shut down")
+		}
+	})
+
+	clientA := NewClient(lf, projectA)
+	sessionA, err := clientA.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("clientA NewSession: %v", err)
+	}
+	clientB := NewClient(lf, projectB)
+	if list, err := clientB.SessionList("active"); err != nil {
+		t.Fatalf("clientB SessionList: %v", err)
+	} else if len(list) != 0 {
+		t.Fatalf("clientB SessionList before new = %v, want none", list)
+	}
+	sessionB, err := clientB.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("clientB NewSession: %v", err)
+	}
+	if sessionB == sessionA {
+		t.Fatalf("clientB reused project A session %q", sessionB)
+	}
+	summaryB, err := clientB.SessionSummaryForSession(sessionB)
+	if err != nil {
+		t.Fatalf("clientB SessionSummaryForSession: %v", err)
+	}
+	if summaryB.ProjectPath != projectB {
+		t.Fatalf("clientB session project = %q, want %q", summaryB.ProjectPath, projectB)
+	}
+	if list, err := clientB.SessionList("active"); err != nil {
+		t.Fatalf("clientB SessionList after new: %v", err)
+	} else if len(list) != 1 || list[0].ID != sessionB {
+		t.Fatalf("clientB SessionList after new = %v, want only %s", list, sessionB)
+	}
+	if current := clientB.ProjectCurrent(); current.Path != projectB {
+		t.Fatalf("clientB ProjectCurrent path = %q, want %q", current.Path, projectB)
+	}
+}
+
+func TestOwnerStartRemovesMalformedLock(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Dir(Path(home)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(Path(home), []byte("{garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := newServerTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := New(a, Config{})
+	_, done, err := srv.Start(ctx, home)
+	if err != nil {
+		t.Fatalf("Start with malformed lock: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("server shutdown: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("server did not shut down")
+		}
+	})
+	if lf, err := Read(home); err != nil {
+		t.Fatalf("Read replacement owner lock: %v", err)
+	} else if lf.Token == "" || lf.Port == 0 {
+		t.Fatalf("replacement owner lock = %+v, want token and port", lf)
+	}
+}
+
 func TestHTTPRequiresSessionID(t *testing.T) {
 	s := &Server{agent: newServerTestAgent(t), hub: newSSEHub()}
 	cases := []struct {
@@ -1160,6 +1406,11 @@ func newServerTestAgentWithModel(t *testing.T, baseURL string, discovery bool, m
 	t.Helper()
 	home := t.TempDir()
 	projectRoot := t.TempDir()
+	return newServerTestAgentWithHomeRoot(t, home, projectRoot, baseURL, discovery, modelID)
+}
+
+func newServerTestAgentWithHomeRoot(t *testing.T, home string, projectRoot string, baseURL string, discovery bool, modelID string) *agent.Agent {
+	t.Helper()
 	lightcodeDir := filepath.Join(home, ".lightcode")
 	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
 		t.Fatal(err)

@@ -50,7 +50,7 @@ type turnActionParams struct {
 
 // Runner drives the ACP stdio protocol.
 type Runner struct {
-	agent *agent.Agent
+	agent agent.AdapterService
 	mu    sync.Mutex
 	out   io.Writer
 
@@ -59,7 +59,7 @@ type Runner struct {
 }
 
 // New creates an ACP Runner.
-func New(a *agent.Agent) *Runner {
+func New(a agent.AdapterService) *Runner {
 	return &Runner{agent: a, out: os.Stdout}
 }
 
@@ -71,7 +71,12 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	r.agent.SetEventHandler(r.handleEvent)
 	r.agent.Init(ctx)
-	sessionID := r.agent.SessionCurrent().ID
+	sessionID := ""
+	if sessions, err := r.agent.SessionList("active"); err == nil && len(sessions) > 0 {
+		if summary, err := r.agent.OpenSession(sessions[0].ID); err == nil {
+			sessionID = summary.ID
+		}
+	}
 	if sessionID == "" {
 		if id, err := r.agent.NewSession("", "primary"); err == nil {
 			sessionID = id

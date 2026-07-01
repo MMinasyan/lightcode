@@ -110,7 +110,7 @@ func buildAgent() (*agent.Agent, error) {
 }
 
 func runCLI() error {
-	svc, err := buildAgent()
+	svc, err := ownerService(0)
 	if err != nil {
 		return err
 	}
@@ -118,7 +118,7 @@ func runCLI() error {
 }
 
 func runACP() error {
-	svc, err := buildAgent()
+	svc, err := ownerService(0)
 	if err != nil {
 		return err
 	}
@@ -126,23 +126,26 @@ func runACP() error {
 }
 
 func runServe(port int) error {
+	home, _ := os.UserHomeDir()
+	if lf, err := server.Read(home); err == nil && !server.IsStale(lf) {
+		fmt.Fprintf(os.Stderr, "lightcode: serving on 127.0.0.1:%d (token in %s)\n", lf.Port, server.Path(home))
+		return nil
+	} else if err != nil && !os.IsNotExist(err) {
+		if removeErr := server.Remove(home); removeErr != nil {
+			return fmt.Errorf("remove unreadable owner lock: read %v: remove %w", err, removeErr)
+		}
+	}
+
 	svc, err := buildAgent()
 	if err != nil {
 		return err
 	}
-
-	home, _ := os.UserHomeDir()
-	proj, err := svc.Projects().Ensure()
-	if err != nil {
-		return fmt.Errorf("ensure project: %w", err)
-	}
-
 	srv := server.New(svc, server.Config{Port: port})
-	return srv.Serve(context.Background(), home, proj.ID)
+	return srv.Serve(context.Background(), home)
 }
 
 func runWails() error {
-	svc, err := buildAgent()
+	svc, err := ownerService(0)
 	if err != nil {
 		return err
 	}
@@ -162,4 +165,44 @@ func runWails() error {
 		OnStartup: app.startup,
 		Bind:      []interface{}{app},
 	})
+}
+
+func ownerService(port int) (agent.AdapterService, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("resolve home dir: %w", err)
+	}
+	projectRoot, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("resolve project root: %w", err)
+	}
+	if lf, err := server.Read(home); err == nil {
+		if !server.IsStale(lf) {
+			return server.NewClient(lf, projectRoot), nil
+		}
+		_ = server.Remove(home)
+	} else if !os.IsNotExist(err) {
+		if removeErr := server.Remove(home); removeErr != nil {
+			return nil, fmt.Errorf("remove unreadable owner lock: read %v: remove %w", err, removeErr)
+		}
+	}
+
+	svc, err := buildAgent()
+	if err != nil {
+		return nil, err
+	}
+	srv := server.New(svc, server.Config{Port: port})
+	if _, done, err := srv.Start(context.Background(), home); err != nil {
+		if lf, readErr := server.Read(home); readErr == nil && !server.IsStale(lf) {
+			return server.NewClient(lf, projectRoot), nil
+		}
+		return nil, err
+	} else {
+		go func() {
+			if err := <-done; err != nil {
+				fmt.Fprintf(os.Stderr, "lightcode: owner http: %v\n", err)
+			}
+		}()
+	}
+	return svc, nil
 }

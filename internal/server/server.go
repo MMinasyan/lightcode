@@ -30,6 +30,7 @@ type Server struct {
 	agent   *agent.Agent
 	cfg     Config
 	hub     *sseHub
+	adapter *sseHub
 	token   string
 	httpSrv *http.Server
 	srvCtx  context.Context
@@ -48,30 +49,35 @@ func New(a *agent.Agent, cfg Config) *Server {
 		agent:             a,
 		cfg:               cfg,
 		hub:               newSSEHub(),
+		adapter:           newSSEHub(),
 		permTimers:        make(map[string]*time.Timer),
 		permTimerSessions: make(map[string]string),
 	}
 }
 
-// Serve starts the HTTP server and blocks until ctx is cancelled or a
-// signal is received. It writes a lockfile on startup and removes it
-// on shutdown.
-func (s *Server) Serve(ctx context.Context, home, projectID string) error {
+// Start starts the HTTP server in the background. It writes the owner
+// lockfile on startup and removes it on shutdown.
+func (s *Server) Start(ctx context.Context, home string) (LockFile, <-chan error, error) {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
-	// Check for existing daemon.
-	if lf, err := Read(home, projectID); err == nil {
+	if lf, err := Read(home); err == nil {
 		if !IsStale(lf) {
-			return fmt.Errorf("daemon already running for this project (pid %d, port %d)", lf.PID, lf.Port)
+			stop()
+			return LockFile{}, nil, fmt.Errorf("owner already running (pid %d, port %d)", lf.PID, lf.Port)
 		}
-		_ = Remove(home, projectID)
+		_ = Remove(home)
+	} else if !os.IsNotExist(err) {
+		if removeErr := Remove(home); removeErr != nil {
+			stop()
+			return LockFile{}, nil, fmt.Errorf("remove unreadable owner lock: read %v: remove %w", err, removeErr)
+		}
 	}
 
 	// Generate auth token.
 	var tokenBytes [32]byte
 	if _, err := rand.Read(tokenBytes[:]); err != nil {
-		return fmt.Errorf("generate token: %w", err)
+		stop()
+		return LockFile{}, nil, fmt.Errorf("generate token: %w", err)
 	}
 	s.token = hex.EncodeToString(tokenBytes[:])
 
@@ -79,22 +85,23 @@ func (s *Server) Serve(ctx context.Context, home, projectID string) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", s.cfg.Port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", addr, err)
+		stop()
+		return LockFile{}, nil, fmt.Errorf("listen %s: %w", addr, err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
 	// Write lockfile.
 	lf := LockFile{Port: port, Token: s.token, PID: os.Getpid()}
-	if err := Write(home, projectID, lf); err != nil {
+	if err := Write(home, lf); err != nil {
 		_ = ln.Close()
-		return fmt.Errorf("write lockfile: %w", err)
+		stop()
+		return LockFile{}, nil, fmt.Errorf("write lockfile: %w", err)
 	}
-	defer Remove(home, projectID)
 
 	s.srvCtx = ctx
 
 	// Wire event handler.
-	s.agent.SetEventHandler(s.handleEvent)
+	s.agent.SubscribeEvents(s.handleEvent)
 	s.agent.Init(ctx)
 
 	// Build routes.
@@ -107,6 +114,17 @@ func (s *Server) Serve(ctx context.Context, home, projectID string) error {
 	// because the parent ctx has already been cancelled by the time we get
 	// here; deriving from it would give Shutdown zero time to drain.
 	// #nosec G118 -- parent ctx is already cancelled; Shutdown needs its own 5s budget.
+	done := make(chan error, 1)
+	go func() {
+		defer stop()
+		defer Remove(home)
+		err := s.httpSrv.Serve(ln)
+		if err == http.ErrServerClosed {
+			err = nil
+		}
+		done <- err
+	}()
+
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -115,19 +133,28 @@ func (s *Server) Serve(ctx context.Context, home, projectID string) error {
 	}()
 
 	slog.Info("lightcode serve", "port", port, "pid", os.Getpid())
-	fmt.Fprintf(os.Stderr, "lightcode: serving on 127.0.0.1:%d (token in %s)\n", port, Path(home, projectID))
+	fmt.Fprintf(os.Stderr, "lightcode: serving on 127.0.0.1:%d (token in %s)\n", port, Path(home))
 
-	if err := s.httpSrv.Serve(ln); err != http.ErrServerClosed {
+	return lf, done, nil
+}
+
+// Serve starts the HTTP server and blocks until ctx is cancelled or a
+// signal is received.
+func (s *Server) Serve(ctx context.Context, home string) error {
+	_, done, err := s.Start(ctx, home)
+	if err != nil {
 		return err
 	}
-	return nil
+	return <-done
 }
 
 func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// SSE endpoint (no auth — token is in the query string for EventSource compatibility).
 	mux.HandleFunc("GET /v1/events", s.handleSSE)
+	mux.HandleFunc("GET /v1/adapter/events", s.handleAdapterSSE)
 
 	// All other routes require Bearer auth.
+	mux.HandleFunc("POST /v1/adapter/rpc", s.auth(s.handleAdapterRPC))
 	mux.HandleFunc("POST /v1/prompt", s.auth(s.handlePrompt))
 
 	mux.HandleFunc("POST /v1/cancel", s.auth(s.handleCancel))
@@ -173,6 +200,10 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 // --- Event handler ---
 
 func (s *Server) handleEvent(ev agent.Event) {
+	if s.adapter != nil {
+		s.adapter.broadcast("agent_event", ev)
+	}
+
 	if ev.SubagentSessionID != "" {
 		return
 	}

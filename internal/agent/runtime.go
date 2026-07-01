@@ -65,7 +65,8 @@ type runtime struct {
 	eventSubscribers    map[int]func(Event)
 	nextEventSubscriber int
 
-	mu sync.Mutex
+	initOnce sync.Once
+	mu       sync.Mutex
 }
 
 func newRuntime(a *Agent, opts runtimeOptions) *runtime {

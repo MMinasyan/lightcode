@@ -21,7 +21,7 @@ import (
 // frontend. All exported methods are callable from JavaScript.
 type App struct {
 	ctx       context.Context
-	svc       *agent.Agent
+	svc       agent.AdapterService
 	currentMu sync.Mutex
 	currentID string
 	children  map[string]struct{}
@@ -34,7 +34,12 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.svc.SetEventHandler(a.handleEvent)
 	a.svc.Init(ctx)
-	sessionID := a.svc.SessionCurrent().ID
+	sessionID := ""
+	if sessions, err := a.svc.SessionList("active"); err == nil && len(sessions) > 0 {
+		if summary, err := a.svc.OpenSession(sessions[0].ID); err == nil {
+			sessionID = summary.ID
+		}
+	}
 	if sessionID == "" {
 		if id, err := a.svc.NewSession("", "primary"); err == nil {
 			sessionID = id

@@ -862,6 +862,12 @@ func (a *Agent) Init(ctx context.Context) {
 }
 
 func (rt *runtime) init(ctx context.Context) {
+	rt.initOnce.Do(func() {
+		rt.initOnceLocked(ctx)
+	})
+}
+
+func (rt *runtime) initOnceLocked(ctx context.Context) {
 	a := rt.agent
 	go rt.drainLoopEvents(ctx)
 	go rt.runSignalScheduler(ctx)
@@ -3434,6 +3440,33 @@ func (a *Agent) SessionList(state string) ([]SessionSummary, error) {
 	return out, nil
 }
 
+func (a *Agent) SessionListForProjectPath(projectPath string, state string) ([]SessionSummary, error) {
+	if state != snapshot.StateActive && state != snapshot.StateArchived {
+		return nil, fmt.Errorf("invalid state %q", state)
+	}
+	proj, err := a.ensureProjectForPath(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	infos, err := snapshot.List(a.projects.SessionsRoot(proj.ID), proj.Path, state)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SessionSummary, len(infos))
+	for i, info := range infos {
+		out[i] = SessionSummary{
+			ID:              info.ID,
+			CreatedAt:       info.CreatedAt,
+			LastActivity:    info.LastActivity,
+			State:           info.State,
+			ArchivedAt:      info.ArchivedAt,
+			ProjectPath:     info.ProjectPath,
+			ParentSessionID: info.ParentSessionID,
+		}
+	}
+	return out, nil
+}
+
 func (a *Agent) OpenSession(id string) (SessionSummary, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -3699,6 +3732,14 @@ func (a *Agent) NewSession(projectID string, agentType string) (string, error) {
 	return unit.store.SessionID(), nil
 }
 
+func (a *Agent) NewSessionForProjectPath(projectPath string, agentType string) (string, error) {
+	proj, err := a.ensureProjectForPath(projectPath)
+	if err != nil {
+		return "", err
+	}
+	return a.NewSession(proj.ID, agentType)
+}
+
 func (a *Agent) explicitRootSessionTypeLocked(agentType string) (string, error) {
 	if strings.TrimSpace(agentType) == "" {
 		agentType = "primary"
@@ -3728,6 +3769,20 @@ func (a *Agent) projectForSessionCreateLocked(projectID string) (*project.Projec
 		}
 	}
 	return nil, fmt.Errorf("unknown project %q", projectID)
+}
+
+func (a *Agent) ensureProjectForPath(projectPath string) (*project.Project, error) {
+	if strings.TrimSpace(projectPath) == "" {
+		return nil, fmt.Errorf("project path is required")
+	}
+	abs, err := filepath.Abs(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if a.projects == nil {
+		return nil, fmt.Errorf("project resolver unavailable")
+	}
+	return project.EnsureForPath(a.projects.Root(), abs)
 }
 
 // SessionArchive archives a session. If it's the current session, close
@@ -4632,13 +4687,17 @@ func snapshotListForStore(store *snapshot.Store) ([]Snapshot, error) {
 // stay inside; (f) hardlinks rejected at safefs FD layer via
 // requireRegularFD; (g) sensitive-name leaves rejected.
 func (a *Agent) viewerReadAllowed(path string) (string, error) {
+	return viewerReadAllowedAtRoot(a.projectRoot, path)
+}
+
+func viewerReadAllowedAtRoot(projectRoot string, path string) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("empty path")
 	}
 	if !filepath.IsAbs(path) {
-		path = filepath.Join(a.projectRoot, path)
+		path = filepath.Join(projectRoot, path)
 	}
-	canonicalRoot, _, err := pathutil.ResolveAbsPath(a.projectRoot)
+	canonicalRoot, _, err := pathutil.ResolveAbsPath(projectRoot)
 	if err != nil {
 		return "", fmt.Errorf("resolve project root: %w", err)
 	}
@@ -4665,6 +4724,22 @@ func (a *Agent) ReadFileContent(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return readFileContentAtCanonical(canonicalPath)
+}
+
+func (a *Agent) ReadFileContentForProjectPath(projectPath string, path string) (string, error) {
+	proj, err := a.ensureProjectForPath(projectPath)
+	if err != nil {
+		return "", err
+	}
+	canonicalPath, err := viewerReadAllowedAtRoot(proj.Path, path)
+	if err != nil {
+		return "", err
+	}
+	return readFileContentAtCanonical(canonicalPath)
+}
+
+func readFileContentAtCanonical(canonicalPath string) (string, error) {
 	f, err := safefs.OpenExisting(canonicalPath, os.O_RDONLY)
 	if err != nil {
 		return "", err
@@ -4718,6 +4793,20 @@ func (a *Agent) ProjectCurrent() ProjectSummary {
 		CreatedAt:    p.CreatedAt,
 		LastActivity: p.LastActivity,
 	}
+}
+
+func (a *Agent) ProjectCurrentForPath(projectPath string) (ProjectSummary, error) {
+	proj, err := a.ensureProjectForPath(projectPath)
+	if err != nil {
+		return ProjectSummary{}, err
+	}
+	return ProjectSummary{
+		ID:           proj.ID,
+		Name:         proj.Name,
+		Path:         proj.Path,
+		CreatedAt:    proj.CreatedAt,
+		LastActivity: proj.LastActivity,
+	}, nil
 }
 
 // ProjectList returns every known project sorted by last activity.

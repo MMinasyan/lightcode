@@ -27,7 +27,7 @@ const (
 )
 
 type CLI struct {
-	agent *agent.Agent
+	agent agent.AdapterService
 	out   io.Writer
 	mu    *sync.Mutex
 
@@ -86,7 +86,7 @@ type CLI struct {
 	lastWarningSnapshot map[string]bool
 }
 
-func New(a *agent.Agent) *CLI {
+func New(a agent.AdapterService) *CLI {
 	return &CLI{
 		agent:               a,
 		out:                 os.Stdout,
@@ -340,7 +340,12 @@ func (c *CLI) Run(ctx context.Context) error {
 	})
 
 	c.agent.Init(ctx)
-	sessionID := c.agent.SessionCurrent().ID
+	sessionID := ""
+	if sessions, err := c.agent.SessionList("active"); err == nil && len(sessions) > 0 {
+		if summary, err := c.agent.OpenSession(sessions[0].ID); err == nil {
+			sessionID = summary.ID
+		}
+	}
 	if sessionID == "" {
 		if id, err := c.agent.NewSession("", "primary"); err == nil {
 			sessionID = id
