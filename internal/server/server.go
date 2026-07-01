@@ -118,10 +118,6 @@ func (s *Server) Start(ctx context.Context, home string) (LockFile, <-chan error
 
 	s.httpSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 
-	// Shutdown goroutine. Uses context.Background for the Shutdown timeout
-	// because the parent ctx has already been cancelled by the time we get
-	// here; deriving from it would give Shutdown zero time to drain.
-	// #nosec G118 -- parent ctx is already cancelled; Shutdown needs its own 5s budget.
 	done := make(chan error, 1)
 	go func() {
 		defer stop()
@@ -136,7 +132,7 @@ func (s *Server) Start(ctx context.Context, home string) (LockFile, <-chan error
 	go func() {
 		<-ctx.Done()
 		s.agent.ShutdownOwner()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		_ = s.httpSrv.Shutdown(shutCtx)
 	}()
