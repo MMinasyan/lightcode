@@ -502,21 +502,20 @@ func TestCompactNowNudgesQueueDrainer(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Stream bool `json:"stream"`
+			Tools []map[string]any `json:"tools"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if !body.Stream {
+		if len(body.Tools) == 0 {
 			startedOnce.Do(func() { close(summaryStarted) })
 			select {
 			case <-releaseSummary:
 			case <-r.Context().Done():
 				return
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"compact summary"},"finish_reason":"stop"}]}`))
+			writeTextResponse(w, "compact summary")
 			return
 		}
 		writeTextResponse(w, "drained")
@@ -575,16 +574,15 @@ func TestAutoCompactionEventOrderInsideTurn(t *testing.T) {
 	var summaryOnce sync.Once
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Stream bool `json:"stream"`
+			Tools []map[string]any `json:"tools"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if !body.Stream {
+		if len(body.Tools) == 0 {
 			summaryOnce.Do(func() { close(summaryRequest) })
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"compact summary"},"finish_reason":"stop"}]}`))
+			writeTextResponse(w, "compact summary")
 			return
 		}
 		writeTextResponse(w, "after compaction")
@@ -671,15 +669,14 @@ func TestAutoCompactionBeforeFollowUpPreservesActiveToolTail(t *testing.T) {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if stream, _ := body["stream"].(bool); !stream {
+		if tools, _ := body["tools"].([]any); len(tools) == 0 {
 			messages, _ := body["messages"].([]any)
 			if len(messages) > 1 {
 				if msg, ok := messages[1].(map[string]any); ok {
 					summaryInput, _ = msg["content"].(string)
 				}
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"summary after tool"},"finish_reason":"stop"}]}`))
+			writeTextResponse(w, "summary after tool")
 			return
 		}
 		streamCalls++
@@ -755,9 +752,8 @@ func TestAutoCompactionBeforeFollowUpPreservesActiveReadTracker(t *testing.T) {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if stream, _ := body["stream"].(bool); !stream {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"summary after read"},"finish_reason":"stop"}]}`))
+		if tools, _ := body["tools"].([]any); len(tools) == 0 {
+			writeTextResponse(w, "summary after read")
 			return
 		}
 		streamCalls++

@@ -17,6 +17,7 @@ type SessionInfo struct {
 	ArchivedAt      int64  `json:"archivedAt"`
 	ProjectPath     string `json:"projectPath"`
 	ParentSessionID string `json:"parentSessionId,omitempty"`
+	ActiveAgentType string `json:"activeAgentType,omitempty"`
 }
 
 // LifecycleConfig controls Sweep's archive/delete thresholds. Days are
@@ -68,10 +69,20 @@ func List(root, projectPath, state string) ([]SessionInfo, error) {
 			ArchivedAt:      meta.ArchivedAt,
 			ProjectPath:     meta.ProjectPath,
 			ParentSessionID: meta.ParentSessionID,
+			ActiveAgentType: meta.ActiveAgentType,
 		})
 	}
 	sortByActivityDesc(out)
 	return out, nil
+}
+
+// LoadSessionMeta reads a session's persisted metadata without opening a Store.
+func LoadSessionMeta(root, id string) (SessionMeta, error) {
+	var meta SessionMeta
+	if err := readJSON(filepath.Join(root, id, "meta.json"), &meta); err != nil {
+		return SessionMeta{}, err
+	}
+	return meta, nil
 }
 
 // LoadMostRecent returns the most recently active session for projectPath,

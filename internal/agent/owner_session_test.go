@@ -802,8 +802,7 @@ func TestTurnActionsUseSelectedSessionHistory(t *testing.T) {
 func TestCompactionIndexesSelectedSessionProject(t *testing.T) {
 	const summary = "## Goal\nremember second project detail"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":%q},"finish_reason":"stop"}]}`, summary)
+		writeTextResponse(w, summary)
 	}))
 	defer server.Close()
 

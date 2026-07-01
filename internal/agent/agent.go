@@ -23,6 +23,7 @@ import (
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 	"github.com/MMinasyan/lightcode/internal/engine/message"
+	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
 	"github.com/MMinasyan/lightcode/internal/lsp"
 	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
@@ -206,6 +207,65 @@ func (h sessionLoopHooks) RecordUsage(ev loop.Event) {
 }
 
 var newMemoryEmbedder = memory.NewEmbedder
+
+type compactUnitSummarizer struct {
+	unit         *session
+	systemPrompt string
+}
+
+func (s compactUnitSummarizer) Chat(ctx context.Context, req modelclient.ChatRequest) (modelclient.ChatResponse, error) {
+	if s.unit == nil || s.unit.lp == nil || s.unit.store == nil {
+		return modelclient.ChatResponse{}, fmt.Errorf("compact session is not configured")
+	}
+	systemPrompt, userContent := compactRequestMessages(req.Messages)
+	if strings.TrimSpace(systemPrompt) == "" {
+		systemPrompt = s.systemPrompt
+	}
+	s.unit.lp.ResetHistory()
+	s.unit.lp.UpdateSystemPrompt(systemPrompt)
+	turn := s.unit.store.BeginTurn()
+	if turn == 0 {
+		return modelclient.ChatResponse{}, fmt.Errorf("compact session is not active")
+	}
+	result, err := s.unit.lp.Run(ctx, userContent)
+	if err != nil {
+		return modelclient.ChatResponse{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return modelclient.ChatResponse{}, err
+	}
+	return modelclient.ChatResponse{Content: result, HasChoice: true}, nil
+}
+
+func (s compactUnitSummarizer) Model() string {
+	if s.unit == nil {
+		return ""
+	}
+	return s.unit.currentRef.Model
+}
+
+func (s compactUnitSummarizer) ModelRef() coremodel.ModelRef {
+	if s.unit == nil {
+		return coremodel.ModelRef{}
+	}
+	return s.unit.currentRef
+}
+
+func compactRequestMessages(messages []message.Message) (string, string) {
+	var systemPrompt string
+	var userParts []string
+	for _, msg := range messages {
+		switch msg.Role {
+		case message.RoleSystem:
+			if systemPrompt == "" {
+				systemPrompt = msg.TextContent()
+			}
+		case message.RoleUser:
+			userParts = append(userParts, msg.TextContent())
+		}
+	}
+	return systemPrompt, strings.Join(userParts, "\n\n")
+}
 
 func isAgentWriteTool(name string) bool {
 	return name == "write_file" || name == "edit_file" || name == "apply_patch"
@@ -552,6 +612,89 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 	tt.usageRecorder = sessionLoopHooks{agent: a, unit: unit}
 	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 	return unit, nil
+}
+
+func (a *Agent) compactRunningUnitForSession(parent *session) (*session, int, error) {
+	if parent == nil || parent.store == nil {
+		return nil, 0, fmt.Errorf("no session open")
+	}
+	parentSessionID := parent.store.SessionID()
+	if parentSessionID == "" {
+		return nil, 0, fmt.Errorf("no session open")
+	}
+	projectRoot := parent.projectRoot
+	if projectRoot == "" {
+		projectRoot = parent.store.ProjectPath()
+	}
+	if projectRoot == "" {
+		projectRoot = a.projectRoot
+	}
+
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	ref := parent.currentRef
+	if compactRef, _, ok := a.resolvedAgentModelLocked("compact"); ok {
+		ref = compactRef
+	}
+	compactPrompt := compact.DefaultSummarizerPrompt
+	if resolved, err := a.resolvedAgentTypeForProjectLocked("compact", parent.projectID); err == nil && strings.TrimSpace(resolved.Prompt) != "" {
+		compactPrompt = strings.TrimSpace(resolved.Prompt)
+	}
+	client, model, err := newProviderClient(a.catalog, ref)
+	if err != nil && ref != parent.currentRef {
+		ref = parent.currentRef
+		client, model, err = newProviderClient(a.catalog, ref)
+	}
+	window := 0
+	if err == nil && model != nil {
+		window = model.ContextWindow
+	}
+	rt.mu.Unlock()
+	if err != nil {
+		return nil, 0, err
+	}
+	if window <= 0 {
+		window = parent.contextWindowSize
+	}
+
+	projectsRoot := ""
+	if a.projects != nil {
+		projectsRoot = a.projects.Root()
+	}
+	store, err := snapshot.NewForSessionsRoot(parent.store.Root(), projectsRoot, parent.projectID)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := store.BeginChildSession(projectRoot, parentSessionID); err != nil {
+		return nil, 0, err
+	}
+	if err := store.SetActiveAgentType("compact"); err != nil {
+		_, _ = store.Close()
+		return nil, 0, err
+	}
+	if ref.Provider != "" || ref.Model != "" {
+		if err := store.SetModel(ref.Provider, ref.Model); err != nil {
+			_, _ = store.Close()
+			return nil, 0, err
+		}
+	}
+
+	unit := newRunningUnit(runningUnitConfig{
+		ActiveAgentType:   "compact",
+		ProjectID:         parent.projectID,
+		ProjectName:       parent.projectName,
+		ProjectRoot:       projectRoot,
+		Store:             store,
+		CurrentRef:        ref,
+		ContextWindowSize: window,
+		Loop: runningUnitLoopConfig{
+			Client:       client,
+			Registry:     tool.NewRegistry(),
+			SystemPrompt: compactPrompt,
+			Store:        store,
+		},
+	})
+	return unit, window, nil
 }
 
 // New constructs an Agent from the given config. It creates the
@@ -1567,15 +1710,30 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 	activeTail := activeStart < len(messages)
 	toSummarize := append([]message.Message(nil), messages[1:activeStart]...)
 
-	client, summarizerWindow := a.summarizerClientAndWindowForSession(unit)
+	compactUnit, summarizerWindow, err := a.compactRunningUnitForSession(unit)
+	if err != nil {
+		return activeStart, err
+	}
+	defer func() {
+		_, _ = compactUnit.store.Close()
+	}()
 	if summarizerWindow <= 0 {
 		summarizerWindow = unit.contextWindowSize
 	}
 
-	prompt := compact.DefaultSummarizerPrompt
+	prompt := ""
+	if compactUnit.lp != nil {
+		messages := compactUnit.lp.Messages()
+		if len(messages) > 0 {
+			prompt = messages[0].TextContent()
+		}
+	}
+	if prompt == "" {
+		prompt = compact.DefaultSummarizerPrompt
+	}
 
 	result, err := compact.Run(ctx, toSummarize, compact.Config{
-		SummarizerClient: client,
+		SummarizerClient: compactUnitSummarizer{unit: compactUnit, systemPrompt: prompt},
 		ContextWindow:    summarizerWindow,
 		SummarizerPrompt: prompt,
 	})
@@ -3466,17 +3624,12 @@ func (a *Agent) SessionList(state string) ([]SessionSummary, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make([]SessionSummary, len(infos))
-	for i, info := range infos {
-		out[i] = SessionSummary{
-			ID:              info.ID,
-			CreatedAt:       info.CreatedAt,
-			LastActivity:    info.LastActivity,
-			State:           info.State,
-			ArchivedAt:      info.ArchivedAt,
-			ProjectPath:     info.ProjectPath,
-			ParentSessionID: info.ParentSessionID,
+	out := make([]SessionSummary, 0, len(infos))
+	for _, info := range infos {
+		if isCompactSessionType(info.ActiveAgentType) {
+			continue
 		}
+		out = append(out, sessionSummaryFromInfo(info))
 	}
 	return out, nil
 }
@@ -3493,19 +3646,26 @@ func (a *Agent) SessionListForProjectPath(projectPath string, state string) ([]S
 	if err != nil {
 		return nil, err
 	}
-	out := make([]SessionSummary, len(infos))
-	for i, info := range infos {
-		out[i] = SessionSummary{
-			ID:              info.ID,
-			CreatedAt:       info.CreatedAt,
-			LastActivity:    info.LastActivity,
-			State:           info.State,
-			ArchivedAt:      info.ArchivedAt,
-			ProjectPath:     info.ProjectPath,
-			ParentSessionID: info.ParentSessionID,
+	out := make([]SessionSummary, 0, len(infos))
+	for _, info := range infos {
+		if isCompactSessionType(info.ActiveAgentType) {
+			continue
 		}
+		out = append(out, sessionSummaryFromInfo(info))
 	}
 	return out, nil
+}
+
+func sessionSummaryFromInfo(info snapshot.SessionInfo) SessionSummary {
+	return SessionSummary{
+		ID:              info.ID,
+		CreatedAt:       info.CreatedAt,
+		LastActivity:    info.LastActivity,
+		State:           info.State,
+		ArchivedAt:      info.ArchivedAt,
+		ProjectPath:     info.ProjectPath,
+		ParentSessionID: info.ParentSessionID,
+	}
 }
 
 func (a *Agent) OpenSession(id string) (SessionSummary, error) {
@@ -3516,6 +3676,10 @@ func (a *Agent) OpenSession(id string) (SessionSummary, error) {
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	if unit, err := a.liveSessionLocked(id); err == nil {
+		if isCompactSessionType(unit.activeAgentType) {
+			rt.mu.Unlock()
+			return SessionSummary{}, internalTranscriptSessionError(id)
+		}
 		summary := sessionSummary(unit)
 		rt.mu.Unlock()
 		return summary, nil
@@ -3524,6 +3688,9 @@ func (a *Agent) OpenSession(id string) (SessionSummary, error) {
 
 	proj, err := a.projectForExistingSession(id)
 	if err != nil {
+		return SessionSummary{}, err
+	}
+	if err := a.rejectCompactSession(a.projects.SessionsRoot(proj.ID), id); err != nil {
 		return SessionSummary{}, err
 	}
 	store, err := snapshot.NewForSessionsRoot(a.projects.SessionsRoot(proj.ID), a.projects.Root(), proj.ID)
@@ -3628,6 +3795,10 @@ func (a *Agent) CloseForProjectSwitch() error {
 
 // SessionSwitch closes the current session and loads another.
 func (a *Agent) SessionSwitch(id string) error {
+	id = strings.TrimSpace(id)
+	if _, err := a.sessionsRootForUserManagedSession(id); err != nil {
+		return err
+	}
 	// Mark the transition and register the clear BEFORE cancelAndWaitIdle so it
 	// fires on every return — including the pre-lock error return below — and
 	// never leaves transitioning stuck true.
@@ -3830,7 +4001,7 @@ func (a *Agent) ensureProjectForPath(projectPath string) (*project.Project, erro
 // first. Returns true if the current session was closed.
 func (a *Agent) SessionArchive(id string) (bool, error) {
 	id = strings.TrimSpace(id)
-	sessionsRoot, err := a.sessionsRootForSession(id)
+	sessionsRoot, err := a.sessionsRootForUserManagedSession(id)
 	if err != nil {
 		return false, err
 	}
@@ -3870,7 +4041,7 @@ func (a *Agent) SessionArchive(id string) (bool, error) {
 // current session was closed.
 func (a *Agent) SessionDelete(id string) (bool, error) {
 	id = strings.TrimSpace(id)
-	sessionsRoot, err := a.sessionsRootForSession(id)
+	sessionsRoot, err := a.sessionsRootForUserManagedSession(id)
 	if err != nil {
 		return false, err
 	}
@@ -3983,6 +4154,36 @@ func (a *Agent) sessionsRootForSession(id string) (string, error) {
 		}
 	}
 	return a.currentSessionsRoot()
+}
+
+func (a *Agent) sessionsRootForUserManagedSession(id string) (string, error) {
+	root, err := a.sessionsRootForSession(id)
+	if err != nil {
+		return "", err
+	}
+	if err := a.rejectCompactSession(root, id); err != nil {
+		return "", err
+	}
+	return root, nil
+}
+
+func (a *Agent) rejectCompactSession(root, id string) error {
+	meta, err := snapshot.LoadSessionMeta(root, id)
+	if err != nil {
+		return err
+	}
+	if isCompactSessionType(meta.ActiveAgentType) {
+		return internalTranscriptSessionError(id)
+	}
+	return nil
+}
+
+func isCompactSessionType(agentType string) bool {
+	return strings.TrimSpace(agentType) == "compact"
+}
+
+func internalTranscriptSessionError(id string) error {
+	return fmt.Errorf("session %q is an internal compact transcript", id)
 }
 
 func (a *Agent) liveSessionsRoot(id string) (string, bool) {

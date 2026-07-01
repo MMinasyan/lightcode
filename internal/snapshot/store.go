@@ -1054,6 +1054,24 @@ func (s *Store) SetModel(provider, model string) error {
 	return writeJSON(metaPath, meta)
 }
 
+// SetActiveAgentType writes the active_agent_type field into meta.json.
+func (s *Store) SetActiveAgentType(agentType string) error {
+	s.mu.Lock()
+	if !s.active {
+		s.mu.Unlock()
+		return ErrNoSession
+	}
+	dir := s.dir
+	s.mu.Unlock()
+	metaPath := filepath.Join(dir, "meta.json")
+	var meta SessionMeta
+	if err := readJSON(metaPath, &meta); err != nil {
+		return err
+	}
+	meta.ActiveAgentType = agentType
+	return writeJSON(metaPath, meta)
+}
+
 // SetState writes state + archived_at fields into meta.json.
 func (s *Store) SetState(state string) error {
 	s.mu.Lock()
