@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/adaptation"
@@ -30,6 +31,36 @@ func TestAssembleForSpecFullMatchesBaselineAndSharesCache(t *testing.T) {
 	if cached := a2.Assemble(); cached.Rebuilt {
 		t.Fatal("Assemble after equivalent full spec Rebuilt=true, want cached false")
 	}
+}
+
+func TestAssemblerConcurrentCacheAccess(t *testing.T) {
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_RULES_MARKER"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	asm := New(projectRoot, home)
+	adapt := &adaptation.Adaptation{Name: "concurrent", Blocks: []string{"CONCURRENT_BLOCK"}}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				res := asm.AssembleForSpec(Spec{
+					Size:   []string{SizeFull, SizeSimple, SizeNone}[j%3],
+					Body:   "body",
+					Memory: j%2 == 0,
+					Adapt:  adapt,
+				})
+				if strings.TrimSpace(res.Prompt) == "" {
+					t.Errorf("goroutine %d build %d produced empty prompt", i, j)
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
 }
 
 func TestAssembleForSpecFullWithAdaptationMatchesAssembleFor(t *testing.T) {

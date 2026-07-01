@@ -1,6 +1,8 @@
 package lsp
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/lsp/server"
@@ -27,6 +29,37 @@ func TestManagerForFileAndAllInstances(t *testing.T) {
 	all := m.AllInstances()
 	if len(all) != 1 || all[0] != inst {
 		t.Fatalf("AllInstances = %+v, want inserted instance", all)
+	}
+}
+
+func TestManagerConcurrentHandlersAndInstances(t *testing.T) {
+	m := NewManager(t.TempDir(), t.TempDir())
+	def := server.ForExtension(".go")
+	inst := newInstance(def, m.projectRoot, m.home, nil)
+	m.mu.Lock()
+	m.instances[def.Name] = inst
+	m.mu.Unlock()
+
+	var warnings atomic.Int64
+	var signals atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				m.SetWarningHandler(func(string, string) { warnings.Add(1) })
+				m.SetSignalHandler(func(string) { signals.Add(1) })
+				m.emitWarning("kind", "message")
+				m.emitSignal("signal")
+				_ = m.ForFile("main.go")
+				_ = m.AllInstances()
+			}
+		}()
+	}
+	wg.Wait()
+	if warnings.Load() == 0 || signals.Load() == 0 {
+		t.Fatalf("handlers were not called: warnings=%d signals=%d", warnings.Load(), signals.Load())
 	}
 }
 

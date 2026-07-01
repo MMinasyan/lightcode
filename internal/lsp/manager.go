@@ -29,10 +29,14 @@ func NewManager(projectRoot, home string) *Manager {
 }
 
 func (m *Manager) SetWarningHandler(fn func(kind, message string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.onWarning = fn
 }
 
 func (m *Manager) SetSignalHandler(fn func(content string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.onSignal = fn
 }
 
@@ -139,13 +143,19 @@ func (m *Manager) install(def *server.Definition) error {
 }
 
 func (m *Manager) emitWarning(kind, message string) {
-	if m.onWarning != nil {
-		m.onWarning(kind, message)
+	m.mu.Lock()
+	fn := m.onWarning
+	m.mu.Unlock()
+	if fn != nil {
+		fn(kind, message)
 	}
 }
 
 func (m *Manager) emitSignal(content string) {
-	if m.onSignal != nil {
-		m.onSignal(content)
+	m.mu.Lock()
+	fn := m.onSignal
+	m.mu.Unlock()
+	if fn != nil {
+		fn(content)
 	}
 }

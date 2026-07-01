@@ -2,9 +2,11 @@ package memory
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -164,6 +166,59 @@ func TestStoreReindexWithUnavailableEmbedderReturnsUnavailable(t *testing.T) {
 	}
 }
 
+func TestStoreConcurrentAccess(t *testing.T) {
+	home := t.TempDir()
+	projectsRoot := t.TempDir()
+	projectID := "project-1"
+	projectRoot := filepath.Join(projectsRoot, projectID)
+	memoriesDir := filepath.Join(projectRoot, "memories")
+	if err := os.MkdirAll(memoriesDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectRoot, "meta.json"), []byte(`{"name":"Project"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStoreWithEmbedder(&countingMemoryEmbedder{}, projectsRoot, home)
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 64)
+	for i := 0; i < 4; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := store.SaveMemory(memoriesDir, fmt.Sprintf("Title %d", i), fmt.Sprintf("content %d", i)); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := store.IndexSummary(fmt.Sprintf("session-%d", i), projectID, "Project", "## Goal\nsummary", "now", "/tmp/compaction.json"); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = store.SearchMemory("content", projectID, false, 3)
+			_, _ = store.SearchHistory("summary", projectID, false, 3)
+			_ = store.Reconcile()
+			_ = store.DeleteSessionSummaries("delete-only")
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("concurrent store operation: %v", err)
+	}
+}
+
 type fakeMemoryEmbedder struct {
 	vec []float32
 	err error
@@ -180,3 +235,14 @@ func (f *fakeMemoryEmbedder) Embed(string) ([]float32, error) {
 }
 
 func (f *fakeMemoryEmbedder) Close() {}
+
+type countingMemoryEmbedder struct {
+	calls int
+}
+
+func (f *countingMemoryEmbedder) Embed(string) ([]float32, error) {
+	f.calls++
+	return []float32{1, 0, 0}, nil
+}
+
+func (f *countingMemoryEmbedder) Close() {}
