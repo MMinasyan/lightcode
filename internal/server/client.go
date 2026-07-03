@@ -357,11 +357,6 @@ func (c *Client) TokenUsageForSession(sessionID string) (agent.TokenReport, erro
 	return rpcCall[agent.TokenReport](context.Background(), c, "TokenUsageForSession", map[string]any{"session_id": sessionID})
 }
 
-func (c *Client) SessionCurrent() agent.SessionSummary {
-	out, _ := rpcCall[agent.SessionSummary](context.Background(), c, "SessionCurrent", nil)
-	return out
-}
-
 func (c *Client) SessionSummaryForSession(sessionID string) (agent.SessionSummary, error) {
 	return rpcCall[agent.SessionSummary](context.Background(), c, "SessionSummaryForSession", map[string]any{"session_id": sessionID})
 }

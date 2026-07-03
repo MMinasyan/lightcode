@@ -65,6 +65,8 @@ func (s *Server) RequestShutdown() {
 	}
 }
 
+// handleOwnerShutdown responds 200 then shuts down async. Callers that need
+// to wait must poll WaitForOwnerExit, like `lightcode stop` does.
 func (s *Server) handleOwnerShutdown(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
 	go s.RequestShutdown()

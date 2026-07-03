@@ -1484,3 +1484,40 @@ func newCatalogBackedTestAgentForRoot(t *testing.T, home, projectRoot string) *A
 	}
 	return a
 }
+
+func TestStaleIdsClearedOnClose(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	ctx := context.Background()
+	a.Init(ctx)
+
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	if _, err := a.SessionDelete(firstID); err != nil {
+		t.Fatalf("SessionDelete: %v", err)
+	}
+	if a.currentSessionID == firstID {
+		t.Fatalf("currentSessionID not cleared after delete of current session")
+	}
+	a.ensureRuntime().mu.Lock()
+	if _, ok := a.sessions[firstID]; ok {
+		t.Fatalf("deleted session still in owner map")
+	}
+	a.ensureRuntime().mu.Unlock()
+
+	// SessionNew should also clean the old id from the map.
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	if err := a.SessionNew(); err != nil {
+		t.Fatalf("SessionNew: %v", err)
+	}
+	a.ensureRuntime().mu.Lock()
+	if _, ok := a.sessions[secondID]; ok {
+		t.Fatalf("old session id still in map after SessionNew")
+	}
+	a.ensureRuntime().mu.Unlock()
+}

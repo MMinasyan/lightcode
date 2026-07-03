@@ -604,7 +604,7 @@ func TestAgentSummarizerUsesCompactAgentModel(t *testing.T) {
 	}
 	_ = a.CurrentModel()
 
-	client, window := a.summarizerClientAndWindow()
+	client, window := a.summarizerClientAndWindowForSession(a.session)
 	if got := client.ModelRef(); got.Provider != "test" || got.Model != "alt-model" {
 		t.Fatalf("summarizer model = %#v, want test/alt-model", got)
 	}
@@ -624,7 +624,7 @@ func TestAgentSummarizerFallsBackToActiveModelWhenCompactModelUnavailable(t *tes
 	}
 	_ = a.CurrentModel()
 
-	client, window := a.summarizerClientAndWindow()
+	client, window := a.summarizerClientAndWindowForSession(a.session)
 	if got := client.ModelRef(); got.Provider != "test" || got.Model != "test-model" {
 		t.Fatalf("summarizer fallback model = %#v, want active test/test-model", got)
 	}
@@ -636,7 +636,7 @@ func TestAgentSummarizerFallsBackToActiveModelWhenCompactModelUnavailable(t *tes
 func TestAgentSetRuntimeConfigRefusesWhileBusy(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	a.ensureRuntime().mu.Lock()
-	a.ensureRuntime().session().busy = true
+	a.ensureRuntime().sessionLocked().busy = true
 	a.ensureRuntime().mu.Unlock()
 	if err := a.SetRuntimeConfig(a.GetRuntimeConfig()); err == nil {
 		t.Fatal("SetRuntimeConfig returned nil while busy")
@@ -987,7 +987,7 @@ func TestAgentReloadRebuildsCatalogAndFallsBackToDefault(t *testing.T) {
 func TestAgentReloadRefusesWhileBusy(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	a.ensureRuntime().mu.Lock()
-	a.ensureRuntime().session().busy = true
+	a.ensureRuntime().sessionLocked().busy = true
 	a.ensureRuntime().mu.Unlock()
 
 	if err := a.Reload(); err == nil {

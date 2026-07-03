@@ -51,7 +51,6 @@ type AdapterService interface {
 	SetRuntimeConfig(RuntimeConfigSettings) error
 
 	TokenUsageForSession(string) (TokenReport, error)
-	SessionCurrent() SessionSummary
 	SessionSummaryForSession(string) (SessionSummary, error)
 	SessionPayloadForSession(string) (SessionPayload, error)
 	SessionList(string) ([]SessionSummary, error)

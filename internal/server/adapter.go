@@ -354,8 +354,6 @@ func (s *Server) handleAdapterRPC(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out, err = s.agent.TokenUsageForSession(p.SessionID)
-	case "SessionCurrent":
-		out = s.agent.SessionCurrent()
 	case "SessionSummaryForSession":
 		var p struct {
 			SessionID string `json:"session_id"`

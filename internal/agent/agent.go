@@ -135,7 +135,6 @@ type Agent struct {
 type agentSignalSink interface {
 	AddSignal(loop.PendingSignal)
 	HasWakeSignal() bool
-	HasSignal() bool
 }
 
 type loopSignalSink struct {
@@ -169,17 +168,6 @@ func (s loopSignalSink) HasWakeSignal() bool {
 	defer rt.mu.Unlock()
 	unit := rt.sessionLocked()
 	return unit != nil && unit.lp != nil && unit.lp.HasPendingWakeSignal()
-}
-
-func (s loopSignalSink) HasSignal() bool {
-	if s.agent == nil {
-		return false
-	}
-	rt := s.agent.ensureRuntime()
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	unit := rt.sessionLocked()
-	return unit != nil && unit.lp != nil && unit.lp.HasPendingSignal()
 }
 
 type agentMemoryHooks interface {
@@ -1366,8 +1354,6 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 			Kind:      EventPermissionRequest,
 			PermReq:   permissionRequestFromLoopEvent(ev, sessionID, projectID),
 		})
-	case loop.Usage:
-		a.recordUsage(ev)
 	case loop.Warning:
 		kind, _ := ev.Metadata["kind"].(string)
 		if kind == "" {
@@ -1475,9 +1461,6 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 	case loop.PermissionRequest:
 		base.Kind = EventPermissionRequest
 		base.PermReq = permissionRequestFromLoopEvent(ev, tev.SessionID, projectID)
-	case loop.Usage:
-		a.recordUsage(ev)
-		return
 	case loop.Warning:
 		kind, _ := ev.Metadata["kind"].(string)
 		if kind == "" {
@@ -1794,33 +1777,12 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 	return newActiveStart, nil
 }
 
-func (rt *runtime) deferSessionRefreshAfterTurn() {
-	rt.mu.Lock()
-	unit := rt.sessionLocked()
-	if unit != nil {
-		unit.sessionRefreshAfterTurn = true
-	}
-	rt.mu.Unlock()
-}
-
 func (rt *runtime) deferSessionRefreshAfterTurnForSession(unit *session) {
 	rt.mu.Lock()
 	if unit != nil {
 		unit.sessionRefreshAfterTurn = true
 	}
 	rt.mu.Unlock()
-}
-
-func (rt *runtime) takeDeferredSessionRefreshAfterTurn() bool {
-	rt.mu.Lock()
-	unit := rt.sessionLocked()
-	refresh := false
-	if unit != nil {
-		refresh = unit.sessionRefreshAfterTurn
-		unit.sessionRefreshAfterTurn = false
-	}
-	rt.mu.Unlock()
-	return refresh
 }
 
 func (rt *runtime) takeDeferredSessionRefreshAfterTurnForSession(unit *session) bool {
@@ -1899,10 +1861,6 @@ func activeTailReadRecords(tail []message.Message, reads []tool.ReadRecord, defa
 		out = append(out, reversed[i])
 	}
 	return out
-}
-
-func (a *Agent) summarizerClientAndWindow() (*provider.Adapter, int) {
-	return a.summarizerClientAndWindowForSession(a.session)
 }
 
 func (a *Agent) summarizerClientAndWindowForSession(unit *session) (*provider.Adapter, int) {
@@ -2951,7 +2909,7 @@ func (a *Agent) switchModelForSession(unit *session, refStr string) error {
 func (a *Agent) Reload() error {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().session().busy {
+	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot reload while a turn is running")
 	}
 	return a.reloadLocked()
@@ -3039,7 +2997,7 @@ func (a *Agent) CompleteModelEntry(refStr string, completion ModelCompletion) er
 	}
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().session().busy {
+	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot complete model entry while a turn is running")
 	}
 	if err := a.mutateModelConfig(ref, func(modelMap map[string]any) error {
@@ -3179,7 +3137,7 @@ func (a *Agent) mutateModelConfig(ref coremodel.ModelRef, mutate func(modelMap m
 func (a *Agent) RefreshDiscovery(provider string) error {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().session().busy {
+	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot refresh discovery while a turn is running")
 	}
 	return a.refreshDiscoveryLocked(provider)
@@ -3280,7 +3238,7 @@ func (a *Agent) SetModelHidden(refStr string, hidden bool) error {
 	}
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().session().busy {
+	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot change model visibility while a turn is running")
 	}
 	if err := a.mutateModelConfig(ref, func(modelMap map[string]any) error {
@@ -3300,7 +3258,7 @@ func (a *Agent) SetModelHidden(refStr string, hidden bool) error {
 func (a *Agent) SetProviderHidden(providerID string, hidden bool) error {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().session().busy {
+	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot change provider visibility while a turn is running")
 	}
 	if err := a.mutateProviderConfig(providerID, func(providerMap map[string]any) error {
@@ -3345,6 +3303,10 @@ func (a *Agent) LiveSessionCount() int {
 	return count
 }
 
+// ShutdownOwner cancels all live turns, session-owned permission timers, and
+// background processes. It does not close session stores or join turn goroutines
+// because state persists per turn and Store.Close's only side effect is
+// discarding empty sessions — acceptable for process exit.
 func (a *Agent) ShutdownOwner() {
 	rt := a.ensureRuntime()
 	var cancels []context.CancelFunc
@@ -3424,7 +3386,7 @@ func (a *Agent) SetRuntimeConfig(settings RuntimeConfigSettings) error {
 	}
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().session().busy {
+	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot change runtime config while a turn is running")
 	}
 	data, err := os.ReadFile(a.configPath)
@@ -3505,7 +3467,7 @@ func (a *Agent) SetDefaultModel(refStr string) error {
 	}
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().session().busy {
+	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot set default model while a turn is running")
 	}
 	if _, _, err := a.catalog.LookupOrIncomplete(ref); err != nil {
@@ -3753,14 +3715,14 @@ func (a *Agent) projectForExistingSession(id string) (*project.Project, error) {
 
 func (a *Agent) cancelAndWaitIdle() error {
 	a.ensureRuntime().mu.Lock()
-	cancel := a.ensureRuntime().session().turnCancel
+	cancel := a.ensureRuntime().sessionLocked().turnCancel
 	a.ensureRuntime().mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	for i := 0; i < 200; i++ {
 		a.ensureRuntime().mu.Lock()
-		busy := a.ensureRuntime().session().busy
+		busy := a.ensureRuntime().sessionLocked().busy
 		a.ensureRuntime().mu.Unlock()
 		if !busy {
 			return nil
@@ -3867,7 +3829,7 @@ func (a *Agent) SessionNew() error {
 		}
 	}()
 	a.ensureRuntime().mu.Lock()
-	if a.ensureRuntime().session().busy {
+	if a.ensureRuntime().sessionLocked().busy {
 		a.ensureRuntime().mu.Unlock()
 		return fmt.Errorf("cannot start new session while a turn is running")
 	}
@@ -3878,6 +3840,7 @@ func (a *Agent) SessionNew() error {
 	if _, err := a.store.Close(); err != nil {
 		return err
 	}
+	delete(a.sessions, eventSessionID)
 	_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLocked()
 	a.resetCurrentSessionStateLocked()
 	return nil
@@ -4059,6 +4022,9 @@ func (a *Agent) SessionDelete(id string) (bool, error) {
 
 // SessionMessages returns the persisted messages for the current session.
 func (a *Agent) SessionMessages() []DisplayMessage {
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 	if a.store == nil || !a.store.Active() {
 		return nil
 	}
@@ -4239,6 +4205,10 @@ func (a *Agent) closeIfCurrent(id string) (bool, error) {
 	if _, err := a.store.Close(); err != nil {
 		return false, err
 	}
+	if a.currentSessionID == id {
+		a.currentSessionID = ""
+	}
+	delete(a.sessions, id)
 	// Close (no LoadSession follows for archive/delete) is the irreversible
 	// change: clear the queue now.
 	a.ensureRuntime().clearQueueLocked()
