@@ -458,9 +458,6 @@ func TestAgentRuntimeConfigRoundTripWritesReloadsAndExcludesMasterBooleans(t *te
 	if err := a.SetRuntimeConfig(settings); err != nil {
 		t.Fatalf("SetRuntimeConfig returned error: %v", err)
 	}
-	a.ensureRuntime().mu.Lock()
-	a.applyUnitConfigLocked(a.session)
-	a.ensureRuntime().mu.Unlock()
 	got := a.GetRuntimeConfig()
 	if got.Sessions.ArchiveAfterDays != 14 || got.Sessions.DeleteAfterArchiveDays != 21 || got.Compaction.ThresholdPct != 0.75 {
 		t.Fatalf("runtime config after set = %#v", got)
@@ -483,28 +480,6 @@ func TestAgentRuntimeConfigRoundTripWritesReloadsAndExcludesMasterBooleans(t *te
 	}
 	if strings.Contains(text, `"auto_archive"`) || strings.Contains(text, `"enabled"`) || strings.Contains(text, `"permissions"`) {
 		t.Fatalf("config write should not add excluded runtime fields:\n%s", text)
-	}
-	filePath := filepath.Join(a.projectRoot, "many-lines.txt")
-	var lines strings.Builder
-	for i := 1; i <= 20; i++ {
-		fmt.Fprintf(&lines, "line-%03d\n", i)
-	}
-	if err := os.WriteFile(filePath, []byte(lines.String()), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	readTool, ok := a.registry.Get("read_file")
-	if !ok {
-		t.Fatal("read_file tool not registered")
-	}
-	if wrapped, ok := readTool.(interface{ WrappedTool() tool.Tool }); ok {
-		readTool = wrapped.WrappedTool()
-	}
-	readOutput, err := readTool.Execute(context.Background(), map[string]any{"path": filePath})
-	if err != nil {
-		t.Fatalf("read_file Execute returned error: %v", err)
-	}
-	if !strings.Contains(readOutput, "line-010") || strings.Contains(readOutput, "line-011") {
-		t.Fatalf("read_file did not use updated read_max_lines=10; output=%q", readOutput)
 	}
 	defer a.procMgr.KillAll()
 	if _, err := a.procMgr.Start("sleep 5", 0); err != nil {

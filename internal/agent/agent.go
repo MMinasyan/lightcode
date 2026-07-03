@@ -146,6 +146,7 @@ func (s loopSignalSink) AddSignal(signal loop.PendingSignal) {
 	}
 	rt := s.agent.ensureRuntime()
 	rt.mu.Lock()
+	// LSP signals have no session attribution yet; keep them on the transitional current unit.
 	unit := rt.sessionLocked()
 	if unit == nil || unit.lp == nil {
 		rt.mu.Unlock()
@@ -1383,8 +1384,6 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 	var unit *session
 	if tev.ParentSessionID != "" {
 		unit = a.sessions[tev.ParentSessionID]
-	} else {
-		unit = rt.sessionLocked()
 	}
 	isNew := false
 	if unit != nil {
@@ -2639,6 +2638,7 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 
 	rt.mu.Lock()
 	a.ensureActiveModelForSessionLocked(unit)
+	a.applyUnitConfigLocked(unit)
 	a.setWarningGroup("setup", a.setupWarningsLocked())
 	rt.mu.Unlock()
 
@@ -3659,18 +3659,6 @@ func (a *Agent) OpenSession(id string) (SessionSummary, error) {
 		return SessionSummary{}, err
 	}
 
-	agentType := "primary"
-	if meta, err := snapshot.LoadSessionMeta(a.projects.SessionsRoot(proj.ID), id); err == nil && meta.ActiveAgentType != "" {
-		if _, resolveErr := a.agents.Resolve(meta.ActiveAgentType, agentcfg.ResolveContext{
-			Home:      a.home,
-			ProjectID: proj.ID,
-		}); resolveErr == nil {
-			agentType = meta.ActiveAgentType
-		} else {
-			fmt.Fprintf(os.Stderr, "lightcode: stored agent type %q no longer resolves, falling back to primary\n", meta.ActiveAgentType)
-		}
-	}
-
 	store, err := snapshot.NewForSessionsRoot(a.projects.SessionsRoot(proj.ID), a.projects.Root(), proj.ID)
 	if err != nil {
 		return SessionSummary{}, err
@@ -3684,7 +3672,7 @@ func (a *Agent) OpenSession(id string) (SessionSummary, error) {
 	if err := a.reloadLocked(); err != nil {
 		return SessionSummary{}, err
 	}
-	unit, err := a.rootRunningUnitLocked(store, agentType, proj.ID, proj.Name, proj.Path)
+	unit, err := a.rootRunningUnitLocked(store, "primary", proj.ID, proj.Name, proj.Path)
 	if err != nil {
 		return SessionSummary{}, err
 	}

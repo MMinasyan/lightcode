@@ -1555,7 +1555,7 @@ func TestBackgroundWakeStartsNonCurrentSession(t *testing.T) {
 	first.lp.AddPendingSignal(loop.PendingSignal{
 		Wake:    true,
 		Persist: true,
-		Payload:  "background process completed",
+		Payload: "background process completed",
 	})
 	a.ensureRuntime().mu.Unlock()
 	a.ensureRuntime().nudgeSignalScheduler()
@@ -1577,6 +1577,54 @@ func TestBackgroundWakeStartsNonCurrentSession(t *testing.T) {
 
 	if got := a.SessionCurrent().ID; got != secondID {
 		t.Fatalf("current session = %q, want second %q (should not have moved)", got, secondID)
+	}
+}
+
+func TestQueueDrainPullsRuntimeConfigForNonCurrentSession(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	ctx := context.Background()
+	a.Init(ctx)
+
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+
+	filePath := filepath.Join(a.projectRoot, "many-lines.txt")
+	var lines strings.Builder
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&lines, "line-%03d\n", i)
+	}
+	if err := os.WriteFile(filePath, []byte(lines.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	settings := a.GetRuntimeConfig()
+	settings.Tools.ReadMaxLines = 10
+	if err := a.SetRuntimeConfig(settings); err != nil {
+		t.Fatalf("SetRuntimeConfig: %v", err)
+	}
+
+	a.ensureRuntime().mu.Lock()
+	first := a.sessions[firstID]
+	if first == nil {
+		a.ensureRuntime().mu.Unlock()
+		t.Fatalf("first session not in live map")
+	}
+	first.queue = []QueuedItem{{ID: "q-1", Content: "queued turn"}}
+	first.queueSeq = 1
+	first.queueVersion = 1
+	a.ensureRuntime().mu.Unlock()
+
+	a.ensureRuntime().tryDrainQueue(ctx)
+	waitUntilSessionQueueEmpty(t, a, firstID)
+
+	readOutput := readFileWithUnitRegistry(t, first, filePath)
+	if !strings.Contains(readOutput, "line-010") || strings.Contains(readOutput, "line-011") {
+		t.Fatalf("queued turn did not pull updated read_max_lines=10; output=%q", readOutput)
 	}
 }
 
@@ -1654,4 +1702,21 @@ func TestMutationsRejectDuringTransition(t *testing.T) {
 	a.ensureRuntime().mu.Unlock()
 }
 
-
+func readFileWithUnitRegistry(t *testing.T, unit *session, path string) string {
+	t.Helper()
+	if unit == nil || unit.registry == nil {
+		t.Fatal("unit registry is nil")
+	}
+	readTool, ok := unit.registry.Get("read_file")
+	if !ok {
+		t.Fatal("read_file tool not registered")
+	}
+	if wrapped, ok := readTool.(interface{ WrappedTool() tool.Tool }); ok {
+		readTool = wrapped.WrappedTool()
+	}
+	out, err := readTool.Execute(context.Background(), map[string]any{"path": path})
+	if err != nil {
+		t.Fatalf("read_file Execute: %v", err)
+	}
+	return out
+}
