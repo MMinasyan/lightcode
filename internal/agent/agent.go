@@ -2414,7 +2414,6 @@ func (rt *runtime) claimTurnLocked(ctx context.Context, unit *session) (context.
 		return nil, nil, snapshot.ErrNoSession
 	}
 	a.ensureActiveModelForSessionLocked(unit)
-	a.applyUnitConfigLocked(unit)
 	a.setWarningGroup("setup", a.setupWarningsLocked())
 	unit.busy = true
 	unit.seenSessions = nil

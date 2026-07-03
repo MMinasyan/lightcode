@@ -1580,6 +1580,206 @@ func TestBackgroundWakeStartsNonCurrentSession(t *testing.T) {
 	}
 }
 
+func TestWakeNonCurrentWhileCurrentBusy(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Init(ctx)
+
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	turnStarts := make(chan Event, 2)
+	a.SetEventHandler(func(ev Event) {
+		if ev.Kind == EventTurnStart {
+			turnStarts <- ev
+		}
+	})
+
+	a.ensureRuntime().mu.Lock()
+	first := a.sessions[firstID]
+	second := a.sessions[secondID]
+	if first == nil || second == nil {
+		a.ensureRuntime().mu.Unlock()
+		t.Fatalf("test setup missing sessions first=%v second=%v", first != nil, second != nil)
+	}
+	second.busy = true
+	first.lp.AddPendingSignal(loop.PendingSignal{Wake: true, Persist: true, Payload: "background complete"})
+	a.ensureRuntime().mu.Unlock()
+	t.Cleanup(func() {
+		a.ensureRuntime().mu.Lock()
+		second.busy = false
+		a.ensureRuntime().mu.Unlock()
+	})
+
+	a.ensureRuntime().tryStartSignalTurn(ctx)
+	select {
+	case ev := <-turnStarts:
+		if ev.SessionID != firstID {
+			t.Fatalf("turn start session = %q, want non-current %q", ev.SessionID, firstID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("non-current wake did not start while backend-current was busy")
+	}
+	if current := a.SessionCurrent().ID; current != secondID {
+		t.Fatalf("current session = %q, want %q", current, secondID)
+	}
+}
+
+func TestWakeDeferredByQueue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTextResponse(w, "ok")
+	}))
+	t.Cleanup(server.Close)
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+	sessionID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	a.ensureRuntime().mu.Lock()
+	unit := a.sessions[sessionID]
+	if unit == nil {
+		a.ensureRuntime().mu.Unlock()
+		t.Fatal("session not in live map")
+	}
+	unit.queue = []QueuedItem{{ID: "q-1", Content: "queued before wake"}}
+	unit.queueSeq = 1
+	unit.queueVersion = 1
+	unit.lp.AddPendingSignal(loop.PendingSignal{Wake: true, Persist: true, Payload: "wake after queue"})
+	a.ensureRuntime().mu.Unlock()
+
+	a.ensureRuntime().tryStartSignalTurn(ctx)
+	time.Sleep(50 * time.Millisecond)
+	if got := countTurnStartsForSession(cap.snapshot(), sessionID); got != 0 {
+		t.Fatalf("signal scheduler started %d turns while queue was pending", got)
+	}
+	a.ensureRuntime().tryDrainQueue(ctx)
+	waitUntilTurnStartsForSession(t, cap, sessionID, 1)
+	waitUntilSessionQueueEmpty(t, a, sessionID)
+	if unit.lp.HasPendingWakeSignal() {
+		t.Fatal("wake signal remained pending after queued turn drained")
+	}
+}
+
+func TestTaggedEventDedupByParent(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Init(ctx)
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	starts := make(chan Event, 4)
+	a.SetEventHandler(func(ev Event) {
+		if ev.Kind == EventSubagentStart {
+			starts <- ev
+		}
+	})
+
+	tev := TaggedLoopEvent{
+		SessionID:       "child-session",
+		ParentSessionID: firstID,
+		ProjectID:       a.session.projectID,
+		Event:           loop.Event{Kind: loop.TextDelta, Result: "child output"},
+	}
+	a.dispatchTaggedEvent(tev)
+	select {
+	case ev := <-starts:
+		if ev.ParentSessionID != firstID || ev.SubagentSessionID != "child-session" {
+			t.Fatalf("subagent start = %+v, want parent %q child", ev, firstID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first tagged child event did not emit subagent_start")
+	}
+
+	a.ensureRuntime().mu.Lock()
+	if second := a.sessions[secondID]; second != nil {
+		second.seenSessions = nil
+	}
+	a.ensureRuntime().mu.Unlock()
+	a.dispatchTaggedEvent(tev)
+	select {
+	case ev := <-starts:
+		t.Fatalf("duplicate subagent_start after backend-current dedup reset: %+v", ev)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	noParent := tev
+	noParent.SessionID = "orphan-child"
+	noParent.ParentSessionID = ""
+	a.dispatchTaggedEvent(noParent)
+	select {
+	case ev := <-starts:
+		t.Fatalf("subagent_start emitted without parent session id: %+v", ev)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestQueueDrainsAllFromOneNudge(t *testing.T) {
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		writeTextResponse(w, "drained")
+	}))
+	t.Cleanup(server.Close)
+	defer close(release)
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+
+	a.ensureRuntime().mu.Lock()
+	for _, id := range []string{firstID, secondID} {
+		unit := a.sessions[id]
+		if unit == nil {
+			a.ensureRuntime().mu.Unlock()
+			t.Fatalf("session %q not in live map", id)
+		}
+		unit.queue = []QueuedItem{{ID: "q-" + id, Content: "queued " + id}}
+		unit.queueSeq = 1
+		unit.queueVersion = 1
+	}
+	a.ensureRuntime().mu.Unlock()
+
+	a.ensureRuntime().tryDrainQueue(ctx)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d queued sessions started from one drain nudge", i)
+		}
+	}
+	waitUntilTurnStartsForSession(t, cap, firstID, 1)
+	waitUntilTurnStartsForSession(t, cap, secondID, 1)
+}
+
 func TestQueueDrainPullsRuntimeConfigForNonCurrentSession(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	ctx := context.Background()
@@ -1643,7 +1843,7 @@ func TestSessionListExcludesChildren(t *testing.T) {
 	if err != nil {
 		t.Fatalf("child store: %v", err)
 	}
-	if err := childStore.BeginChildSession(a.session.projectID, parentID); err != nil {
+	if err := childStore.BeginChildSession(a.ProjectRoot(), parentID); err != nil {
 		t.Fatalf("BeginChildSession: %v", err)
 	}
 	childID := childStore.SessionID()
@@ -1660,6 +1860,73 @@ func TestSessionListExcludesChildren(t *testing.T) {
 		if s.ParentSessionID != "" {
 			t.Fatalf("session %q has ParentSessionID %q, should be empty", s.ID, s.ParentSessionID)
 		}
+	}
+}
+
+func TestSessionListBothStatesExcludeChildren(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Init(ctx)
+	projectRoot := a.ProjectRoot()
+	parentID, childID := createChildSession(t, a)
+	if parentID == "" || childID == "" {
+		t.Fatalf("parent/child ids = %q/%q", parentID, childID)
+	}
+
+	active, err := a.SessionListForProjectPath(projectRoot, snapshot.StateActive)
+	if err != nil {
+		t.Fatalf("active SessionListForProjectPath: %v", err)
+	}
+	assertSessionListExcludesID(t, active, childID)
+	if err := snapshot.ArchiveSession(a.projects.SessionsRoot(a.session.projectID), childID); err != nil {
+		t.Fatalf("ArchiveSession child: %v", err)
+	}
+	archived, err := a.SessionListForProjectPath(projectRoot, snapshot.StateArchived)
+	if err != nil {
+		t.Fatalf("archived SessionListForProjectPath: %v", err)
+	}
+	assertSessionListExcludesID(t, archived, childID)
+}
+
+func TestOpenArchiveDeleteRejectChildren(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*Agent, string) error
+	}{
+		{
+			name: "open",
+			run: func(a *Agent, id string) error {
+				_, err := a.OpenSession(id)
+				return err
+			},
+		},
+		{
+			name: "archive",
+			run: func(a *Agent, id string) error {
+				_, err := a.SessionArchive(id)
+				return err
+			},
+		},
+		{
+			name: "delete",
+			run: func(a *Agent, id string) error {
+				_, err := a.SessionDelete(id)
+				return err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newCatalogBackedTestAgent(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			a.Init(ctx)
+			_, childID := createChildSession(t, a)
+			err := tc.run(a, childID)
+			if err == nil || !strings.Contains(err.Error(), "internal transcript session") {
+				t.Fatalf("%s child error = %v, want internal transcript rejection", tc.name, err)
+			}
+		})
 	}
 }
 
@@ -1700,6 +1967,107 @@ func TestMutationsRejectDuringTransition(t *testing.T) {
 	a.ensureRuntime().mu.Lock()
 	unit.transitioning = false
 	a.ensureRuntime().mu.Unlock()
+}
+
+func TestCompactVsArchiveRace(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseCompaction := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseCompaction()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		writeTextResponse(w, "compact summary")
+	}))
+	t.Cleanup(server.Close)
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	ctx := startEventOrderAgent(t, a, &eventCapture{})
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(firstID, "compact me"); err != nil {
+		t.Fatalf("AppendUserMessageToSession first: %v", err)
+	}
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+
+	compactDone := make(chan error, 1)
+	go func() {
+		compactDone <- a.CompactNowForSession(ctx, firstID)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("compaction provider request did not start")
+	}
+	if _, err := a.SessionArchive(firstID); err == nil || !strings.Contains(err.Error(), "turn is running") {
+		t.Fatalf("SessionArchive during compaction err = %v, want busy rejection", err)
+	}
+	releaseCompaction()
+	select {
+	case err := <-compactDone:
+		if err != nil {
+			t.Fatalf("CompactNowForSession: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("compaction did not finish")
+	}
+}
+
+func waitUntilTurnStartsForSession(t *testing.T, cap *eventCapture, sessionID string, want int) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if got := countTurnStartsForSession(cap.snapshot(), sessionID); got >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("turn starts for session %s = %d, want %d", sessionID, countTurnStartsForSession(cap.snapshot(), sessionID), want)
+}
+
+func countTurnStartsForSession(events []Event, sessionID string) int {
+	count := 0
+	for _, ev := range events {
+		if ev.Kind == EventTurnStart && ev.SessionID == sessionID {
+			count++
+		}
+	}
+	return count
+}
+
+func createChildSession(t *testing.T, a *Agent) (string, string) {
+	t.Helper()
+	parentID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession parent: %v", err)
+	}
+	childStore, err := snapshot.NewForSessionsRoot(a.projects.SessionsRoot(a.session.projectID), a.projects.Root(), a.session.projectID)
+	if err != nil {
+		t.Fatalf("child store: %v", err)
+	}
+	if err := childStore.BeginChildSession(a.ProjectRoot(), parentID); err != nil {
+		t.Fatalf("BeginChildSession: %v", err)
+	}
+	return parentID, childStore.SessionID()
+}
+
+func assertSessionListExcludesID(t *testing.T, sessions []SessionSummary, id string) {
+	t.Helper()
+	for _, s := range sessions {
+		if s.ID == id {
+			t.Fatalf("child session %q leaked into session list", id)
+		}
+		if s.ParentSessionID != "" {
+			t.Fatalf("session %q has ParentSessionID %q, want empty", s.ID, s.ParentSessionID)
+		}
+	}
 }
 
 func readFileWithUnitRegistry(t *testing.T, unit *session, path string) string {

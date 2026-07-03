@@ -1903,6 +1903,70 @@ func TestPermissionTimerHeadlessOnly(t *testing.T) {
 	}
 }
 
+func TestAttachCancelsTimers(t *testing.T) {
+	var calls int
+	var callsMu sync.Mutex
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callsMu.Lock()
+		calls++
+		call := calls
+		callsMu.Unlock()
+		if call == 1 {
+			serverWriteSSE(w, serverToolCallChunk("attach-cancel-1", "test-model", "call_read", "read_file", `{"path":"target.txt"}`), serverStopChunk("attach-cancel-1", "test-model"), "[DONE]")
+			return
+		}
+		serverWriteSSE(w, serverStopChunk("attach-cancel-2", "test-model"), "[DONE]")
+	}))
+	t.Cleanup(provider.Close)
+
+	a := newServerTestAgentWithProvider(t, provider.URL+"/v1", false)
+	if err := os.WriteFile(filepath.Join(a.ProjectRoot(), "target.txt"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(a, Config{PermissionTimeout: 500 * time.Millisecond})
+	events := make(chan agent.Event, 16)
+	a.SetEventHandler(func(ev agent.Event) {
+		srv.handleEvent(ev)
+		events <- ev
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Init(ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		_, err := a.Submit(ctx, "read target.txt")
+		submitDone <- err
+	}()
+
+	permReq := waitServerPermissionRequest(t, events)
+	assertServerPermissionTimerPending(t, srv, permReq.ID)
+	lease, err := srv.AttachAdapter()
+	if err != nil {
+		t.Fatalf("AttachAdapter: %v", err)
+	}
+	t.Cleanup(func() { srv.DetachAdapter(lease) })
+	time.Sleep(700 * time.Millisecond)
+	srv.permMu.Lock()
+	_, timerStillPending := srv.permTimers[permReq.ID]
+	srv.permMu.Unlock()
+	if timerStillPending {
+		t.Fatal("permission timer remained after adapter attach")
+	}
+	if err := a.RespondPermissionForSession(permReq.SessionID, permReq.ID, true); err != nil {
+		t.Fatalf("RespondPermission after attach cancelled timer: %v", err)
+	}
+	select {
+	case err := <-submitDone:
+		if err != nil {
+			t.Fatalf("Submit after permission allow: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Submit stayed blocked after attach-cancelled timer and allow")
+	}
+	waitServerEventKind(t, events, agent.EventTurnEnd)
+}
+
 func TestExitOnLastDetach(t *testing.T) {
 	home := t.TempDir()
 	a := newServerTestAgent(t)
@@ -1928,5 +1992,111 @@ func TestExitOnLastDetach(t *testing.T) {
 	waitOwnerDone(t, done)
 	if _, err := Read(home); !os.IsNotExist(err) {
 		t.Fatalf("owner lock after last detach = %v, want removed", err)
+	}
+}
+
+func TestTwoLeasesKeepAlive(t *testing.T) {
+	home := t.TempDir()
+	a := newServerTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := New(a, Config{ExitOnLastDetach: true})
+	_, done, err := srv.Start(ctx, home)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	stopped := false
+	defer func() {
+		if stopped {
+			return
+		}
+		srv.RequestShutdown()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Log("owner did not shut down during cleanup")
+		}
+	}()
+
+	first, err := srv.AttachAdapter()
+	if err != nil {
+		t.Fatalf("AttachAdapter first: %v", err)
+	}
+	second, err := srv.AttachAdapter()
+	if err != nil {
+		t.Fatalf("AttachAdapter second: %v", err)
+	}
+	if !srv.DetachAdapter(first) {
+		t.Fatal("DetachAdapter first returned false")
+	}
+	waitAdapterCount(t, srv, 1)
+	select {
+	case err := <-done:
+		t.Fatalf("owner exited while one lease remained: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if !srv.DetachAdapter(second) {
+		t.Fatal("DetachAdapter second returned false")
+	}
+	waitOwnerDone(t, done)
+	stopped = true
+}
+
+func TestExitMidTurn(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	providerCancelled := make(chan struct{}, 1)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+		select {
+		case providerCancelled <- struct{}{}:
+		default:
+		}
+	}))
+	t.Cleanup(provider.Close)
+
+	home := t.TempDir()
+	a := newServerTestAgentWithProvider(t, provider.URL+"/v1", false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := New(a, Config{ExitOnLastDetach: true})
+	_, done, err := srv.Start(ctx, home)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	lease, err := srv.AttachAdapter()
+	if err != nil {
+		t.Fatalf("AttachAdapter: %v", err)
+	}
+
+	if res, err := a.Submit(ctx, "hang until owner exits"); err != nil || !res.Started {
+		t.Fatalf("Submit = %#v, %v; want started turn", res, err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider request did not start")
+	}
+	if !srv.DetachAdapter(lease) {
+		t.Fatal("DetachAdapter returned false")
+	}
+	waitOwnerDone(t, done)
+	select {
+	case <-providerCancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider request was not cancelled on owner shutdown")
+	}
+	if _, err := Read(home); !os.IsNotExist(err) {
+		t.Fatalf("owner lock after mid-turn detach = %v, want removed", err)
 	}
 }

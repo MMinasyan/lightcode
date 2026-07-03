@@ -124,5 +124,3 @@ func (rt *runtime) sessionLocked() *session {
 	}
 	return rt.agent.session
 }
-
-
