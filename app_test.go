@@ -45,7 +45,7 @@ func TestWailsStaleCurrent(t *testing.T) {
 
 	app := newTestApp(svc)
 	app.setCurrentSessionID(id)
-	if _, err := svc.SessionDelete(id); err != nil {
+	if err := svc.SessionDelete(id); err != nil {
 		t.Fatalf("SessionDelete: %v", err)
 	}
 
@@ -365,5 +365,51 @@ func TestProjectSwitchNoOpSameDir(t *testing.T) {
 	}
 	if got := app.SessionCurrent().ID; got != firstID {
 		t.Fatalf("current = %q, want %q (no-op switch should not change session)", got, firstID)
+	}
+}
+
+func TestArchiveNonCurrentKeepsView(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*App, string) error
+	}{
+		{name: "archive", run: func(app *App, id string) error { return app.SessionArchive(id) }},
+		{name: "delete", run: func(app *App, id string) error { return app.SessionDelete(id) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newAppTestAgent(t)
+			firstID, err := svc.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("NewSession first: %v", err)
+			}
+			secondID, err := svc.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("NewSession second: %v", err)
+			}
+			// Seed secondID with a message so it has a complete turn and
+			// won't be discarded by Store.Close when closeIfCurrent runs.
+			if _, err := svc.AppendUserMessageToSession(secondID, "second"); err != nil {
+				t.Fatalf("append second: %v", err)
+			}
+
+			app := newTestApp(svc)
+			// After two NewSession calls, backend-current is secondID.
+			// Set adapter-current to firstID (not backend-current).
+			app.setCurrentSessionID(firstID)
+
+			if backend := svc.SessionCurrent().ID; backend != secondID {
+				t.Fatalf("backend current = %q, want %q (setup invariant)", backend, secondID)
+			}
+
+			// Archive/delete the backend-current (secondID), not adapter-current.
+			if err := tc.run(app, secondID); err != nil {
+				t.Fatalf("%s second: %v", tc.name, err)
+			}
+
+			// Adapter view must stay on firstID.
+			if got := app.SessionCurrent().ID; got != firstID {
+				t.Fatalf("adapter current after %s = %q, want %q", tc.name, got, firstID)
+			}
+		})
 	}
 }

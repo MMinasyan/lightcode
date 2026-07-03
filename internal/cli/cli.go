@@ -150,12 +150,12 @@ func (c *CLI) currentSession() (string, error) {
 	return id, nil
 }
 
-func (c *CLI) clearRemovedCurrent(id string, closedCurrent bool) {
+func (c *CLI) clearRemovedCurrent(id string) {
 	wasCurrent := c.currentSessionID() == strings.TrimSpace(id)
 	if wasCurrent {
 		c.setCurrentSessionID("")
 	}
-	if closedCurrent || wasCurrent {
+	if wasCurrent {
 		c.refreshSession()
 	}
 }

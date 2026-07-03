@@ -704,14 +704,11 @@ func (a *App) SessionSwitch(id string) error {
 // SessionArchive archives a session.
 func (a *App) SessionArchive(id string) error {
 	wasCurrent := a.currentSessionID() == strings.TrimSpace(id)
-	closedCurrent, err := a.svc.SessionArchive(id)
-	if err != nil {
+	if err := a.svc.SessionArchive(id); err != nil {
 		return err
 	}
 	if wasCurrent {
 		a.setCurrentSessionID("")
-	}
-	if closedCurrent || wasCurrent {
 		a.emitSessionChangedForSession(strings.TrimSpace(id))
 	}
 	return nil
@@ -720,14 +717,11 @@ func (a *App) SessionArchive(id string) error {
 // SessionDelete removes a session from disk.
 func (a *App) SessionDelete(id string) error {
 	wasCurrent := a.currentSessionID() == strings.TrimSpace(id)
-	closedCurrent, err := a.svc.SessionDelete(id)
-	if err != nil {
+	if err := a.svc.SessionDelete(id); err != nil {
 		return err
 	}
 	if wasCurrent {
 		a.setCurrentSessionID("")
-	}
-	if closedCurrent || wasCurrent {
 		a.emitSessionChangedForSession(strings.TrimSpace(id))
 	}
 	return nil

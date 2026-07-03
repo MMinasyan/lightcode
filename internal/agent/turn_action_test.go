@@ -378,8 +378,8 @@ func TestCompactionWritesCompactTranscript(t *testing.T) {
 	}{
 		{name: "open", run: func() error { _, err := a.OpenSession(childID); return err }},
 		{name: "switch", run: func() error { return a.SessionSwitch(childID) }},
-		{name: "archive", run: func() error { _, err := a.SessionArchive(childID); return err }},
-		{name: "delete", run: func() error { _, err := a.SessionDelete(childID); return err }},
+		{name: "archive", run: func() error { return a.SessionArchive(childID) }},
+		{name: "delete", run: func() error { return a.SessionDelete(childID) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.run()

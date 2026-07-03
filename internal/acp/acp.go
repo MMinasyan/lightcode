@@ -555,15 +555,12 @@ func (r *Runner) handleSessionArchive(req Request) {
 	if current, err := r.currentSession(); err == nil && current == strings.TrimSpace(params.ID) {
 		wasCurrent = true
 	}
-	closedCurrent, err := r.agent.SessionArchive(params.ID)
-	if err != nil {
+	if err := r.agent.SessionArchive(params.ID); err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
 	if wasCurrent {
 		r.setCurrentSessionID("")
-	}
-	if closedCurrent || wasCurrent {
 		r.pushSessionChangedForSession(strings.TrimSpace(params.ID))
 	}
 	r.respond(req.ID, map[string]any{"ok": true})
@@ -581,15 +578,12 @@ func (r *Runner) handleSessionDelete(req Request) {
 	if current, err := r.currentSession(); err == nil && current == strings.TrimSpace(params.ID) {
 		wasCurrent = true
 	}
-	closedCurrent, err := r.agent.SessionDelete(params.ID)
-	if err != nil {
+	if err := r.agent.SessionDelete(params.ID); err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
 	if wasCurrent {
 		r.setCurrentSessionID("")
-	}
-	if closedCurrent || wasCurrent {
 		r.pushSessionChangedForSession(strings.TrimSpace(params.ID))
 	}
 	r.respond(req.ID, map[string]any{"ok": true})

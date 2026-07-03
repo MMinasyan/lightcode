@@ -668,7 +668,7 @@ func (s *Server) handleSessionArchive(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	_, err := s.agent.SessionArchive(body.ID)
+	err := s.agent.SessionArchive(body.ID)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -685,7 +685,7 @@ func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	_, err := s.agent.SessionDelete(body.ID)
+	err := s.agent.SessionDelete(body.ID)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return

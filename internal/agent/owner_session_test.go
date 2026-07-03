@@ -885,10 +885,10 @@ func TestCompactTypeCannotBeStartedByUser(t *testing.T) {
 func TestCloseRemovedLiveSession(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		run  func(*Agent, string) (bool, error)
+		run  func(*Agent, string) error
 	}{
-		{name: "archive", run: func(a *Agent, id string) (bool, error) { return a.SessionArchive(id) }},
-		{name: "delete", run: func(a *Agent, id string) (bool, error) { return a.SessionDelete(id) }},
+		{name: "archive", run: func(a *Agent, id string) error { return a.SessionArchive(id) }},
+		{name: "delete", run: func(a *Agent, id string) error { return a.SessionDelete(id) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := newCatalogBackedTestAgent(t)
@@ -910,12 +910,8 @@ func TestCloseRemovedLiveSession(t *testing.T) {
 				t.Fatalf("current session = %q, want %q", current, secondID)
 			}
 
-			closedCurrent, err := tc.run(a, firstID)
-			if err != nil {
+			if err := tc.run(a, firstID); err != nil {
 				t.Fatalf("%s first: %v", tc.name, err)
-			}
-			if closedCurrent {
-				t.Fatalf("%s closed backend current session", tc.name)
 			}
 			if _, err := a.SessionSummaryForSession(firstID); err == nil {
 				t.Fatalf("%s left first session live", tc.name)
@@ -1186,12 +1182,12 @@ func TestShutdownOwnerCancelsSessionWork(t *testing.T) {
 func TestRemoveCrossProjectLiveSession(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
-		run   func(*Agent, string) (bool, error)
+		run   func(*Agent, string) error
 		check func(*testing.T, string, string)
 	}{
 		{
 			name: "archive",
-			run:  func(a *Agent, id string) (bool, error) { return a.SessionArchive(id) },
+			run:  func(a *Agent, id string) error { return a.SessionArchive(id) },
 			check: func(t *testing.T, sessionsRoot, id string) {
 				t.Helper()
 				infos, err := snapshot.List(sessionsRoot, "", snapshot.StateArchived)
@@ -1208,7 +1204,7 @@ func TestRemoveCrossProjectLiveSession(t *testing.T) {
 		},
 		{
 			name: "delete",
-			run:  func(a *Agent, id string) (bool, error) { return a.SessionDelete(id) },
+			run:  func(a *Agent, id string) error { return a.SessionDelete(id) },
 			check: func(t *testing.T, sessionsRoot, id string) {
 				t.Helper()
 				if _, err := os.Stat(filepath.Join(sessionsRoot, id)); !os.IsNotExist(err) {
@@ -1250,12 +1246,8 @@ func TestRemoveCrossProjectLiveSession(t *testing.T) {
 				t.Fatalf("current session = %q, want %q", current, firstID)
 			}
 
-			closedCurrent, err := tc.run(a, secondID)
-			if err != nil {
+			if err := tc.run(a, secondID); err != nil {
 				t.Fatalf("%s second project: %v", tc.name, err)
-			}
-			if closedCurrent {
-				t.Fatalf("%s closed backend current session", tc.name)
 			}
 			if _, err := a.SessionSummaryForSession(secondID); err == nil {
 				t.Fatalf("%s left second session live", tc.name)
@@ -1496,7 +1488,7 @@ func TestStaleIdsClearedOnClose(t *testing.T) {
 		t.Fatalf("NewSession: %v", err)
 	}
 
-	if _, err := a.SessionDelete(firstID); err != nil {
+	if err := a.SessionDelete(firstID); err != nil {
 		t.Fatalf("SessionDelete: %v", err)
 	}
 	if a.currentSessionID == firstID {
@@ -1904,15 +1896,13 @@ func TestOpenArchiveDeleteRejectChildren(t *testing.T) {
 		{
 			name: "archive",
 			run: func(a *Agent, id string) error {
-				_, err := a.SessionArchive(id)
-				return err
+				return a.SessionArchive(id)
 			},
 		},
 		{
 			name: "delete",
 			run: func(a *Agent, id string) error {
-				_, err := a.SessionDelete(id)
-				return err
+				return a.SessionDelete(id)
 			},
 		},
 	} {
@@ -2007,7 +1997,7 @@ func TestCompactVsArchiveRace(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("compaction provider request did not start")
 	}
-	if _, err := a.SessionArchive(firstID); err == nil || !strings.Contains(err.Error(), "turn is running") {
+	if err := a.SessionArchive(firstID); err == nil || !strings.Contains(err.Error(), "turn is running") {
 		t.Fatalf("SessionArchive during compaction err = %v, want busy rejection", err)
 	}
 	releaseCompaction()

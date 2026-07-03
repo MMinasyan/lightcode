@@ -3940,23 +3940,22 @@ func (a *Agent) ensureProjectForPath(projectPath string) (*project.Project, erro
 	return project.EnsureForPath(a.projects.Root(), abs)
 }
 
-// SessionArchive archives a session. If it's the current session, close
-// first. Returns true if the current session was closed.
-func (a *Agent) SessionArchive(id string) (bool, error) {
+// SessionArchive archives a session.
+func (a *Agent) SessionArchive(id string) error {
 	id = strings.TrimSpace(id)
 	sessionsRoot, err := a.sessionsRootForUserManagedSession(id)
 	if err != nil {
-		return false, err
+		return err
 	}
 	closedCurrent, err := a.closeIfCurrent(id)
 	if err != nil {
-		return false, err
+		return err
 	}
 	var releaseClose func()
 	if !closedCurrent {
 		releaseClose, err = a.beginLiveSessionClose(id)
 		if err != nil {
-			return false, err
+			return err
 		}
 		defer func() {
 			if releaseClose != nil {
@@ -3965,38 +3964,37 @@ func (a *Agent) SessionArchive(id string) (bool, error) {
 		}()
 	}
 	if err := snapshot.ArchiveSession(sessionsRoot, id); err != nil {
-		return false, err
+		return err
 	}
 	if a.gate != nil {
 		a.gate.CancelSession(id)
 	}
 	if _, err := a.closeLiveSession(id); err != nil {
-		return false, err
+		return err
 	}
 	releaseClose = nil
 	if closedCurrent {
 		a.resetCurrentSessionState()
 	}
-	return closedCurrent, nil
+	return nil
 }
 
-// SessionDelete removes a session from disk. Returns true if the
-// current session was closed.
-func (a *Agent) SessionDelete(id string) (bool, error) {
+// SessionDelete removes a session from disk.
+func (a *Agent) SessionDelete(id string) error {
 	id = strings.TrimSpace(id)
 	sessionsRoot, err := a.sessionsRootForUserManagedSession(id)
 	if err != nil {
-		return false, err
+		return err
 	}
 	closedCurrent, err := a.closeIfCurrent(id)
 	if err != nil {
-		return false, err
+		return err
 	}
 	var releaseClose func()
 	if !closedCurrent {
 		releaseClose, err = a.beginLiveSessionClose(id)
 		if err != nil {
-			return false, err
+			return err
 		}
 		defer func() {
 			if releaseClose != nil {
@@ -4005,7 +4003,7 @@ func (a *Agent) SessionDelete(id string) (bool, error) {
 		}()
 	}
 	if err := snapshot.DeleteSession(sessionsRoot, id); err != nil {
-		return false, err
+		return err
 	}
 	if a.gate != nil {
 		a.gate.CancelSession(id)
@@ -4014,13 +4012,13 @@ func (a *Agent) SessionDelete(id string) (bool, error) {
 		_ = a.memoryHooks.DeleteSessionSummaries(id)
 	}
 	if _, err := a.closeLiveSession(id); err != nil {
-		return false, err
+		return err
 	}
 	releaseClose = nil
 	if closedCurrent {
 		a.resetCurrentSessionState()
 	}
-	return closedCurrent, nil
+	return nil
 }
 
 // SessionMessages returns the persisted messages for the current session.
@@ -4106,6 +4104,20 @@ func (a *Agent) sessionsRootForUserManagedSession(id string) (string, error) {
 	root, err := a.sessionsRootForSession(id)
 	if err != nil {
 		return "", err
+	}
+	// For live sessions, check the in-memory unit directly — child sessions
+	// are never registered live, and compact is identifiable by agent type.
+	// This avoids a disk read that may fail if the session directory was
+	// created by a different store instance.
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	unit := a.sessions[id]
+	rt.mu.Unlock()
+	if unit != nil {
+		if isCompactSessionType(unit.activeAgentType) {
+			return "", internalTranscriptSessionError(id)
+		}
+		return root, nil
 	}
 	if err := a.rejectInternalSession(root, id); err != nil {
 		return "", err

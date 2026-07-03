@@ -384,12 +384,12 @@ func (c *Client) NewSessionForProjectPath(projectPath string, agentType string) 
 	return rpcCall[string](context.Background(), c, "NewSessionForProjectPath", map[string]any{"project_path": projectPath, "agent_type": agentType})
 }
 
-func (c *Client) SessionArchive(id string) (bool, error) {
-	return rpcCall[bool](context.Background(), c, "SessionArchive", map[string]any{"id": id})
+func (c *Client) SessionArchive(id string) error {
+	return c.rpc(context.Background(), "SessionArchive", map[string]any{"id": id})
 }
 
-func (c *Client) SessionDelete(id string) (bool, error) {
-	return rpcCall[bool](context.Background(), c, "SessionDelete", map[string]any{"id": id})
+func (c *Client) SessionDelete(id string) error {
+	return c.rpc(context.Background(), "SessionDelete", map[string]any{"id": id})
 }
 
 func (c *Client) SessionMessagesFor(id string) ([]agent.DisplayMessage, error) {

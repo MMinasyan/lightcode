@@ -200,7 +200,7 @@ func TestCLIStaleCurrent(t *testing.T) {
 	if id == "" {
 		t.Fatal("missing session id")
 	}
-	if _, err := a.SessionDelete(id); err != nil {
+	if err := a.SessionDelete(id); err != nil {
 		t.Fatalf("SessionDelete: %v", err)
 	}
 
@@ -218,10 +218,10 @@ func TestCLIStaleCurrent(t *testing.T) {
 func TestCLIClearRemovedCurrent(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		run  func(*agent.Agent, string) (bool, error)
+		run  func(*agent.Agent, string) error
 	}{
-		{name: "archive", run: func(a *agent.Agent, id string) (bool, error) { return a.SessionArchive(id) }},
-		{name: "delete", run: func(a *agent.Agent, id string) (bool, error) { return a.SessionDelete(id) }},
+		{name: "archive", run: func(a *agent.Agent, id string) error { return a.SessionArchive(id) }},
+		{name: "delete", run: func(a *agent.Agent, id string) error { return a.SessionDelete(id) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, _ := newTestAgent(t)
@@ -244,11 +244,10 @@ func TestCLIClearRemovedCurrent(t *testing.T) {
 			var out bytes.Buffer
 			c.out = &out
 			c.setCurrentSessionID(firstID)
-			closedCurrent, err := tc.run(a, firstID)
-			if err != nil {
+			if err := tc.run(a, firstID); err != nil {
 				t.Fatalf("%s first: %v", tc.name, err)
 			}
-			c.clearRemovedCurrent(firstID, closedCurrent)
+			c.clearRemovedCurrent(firstID)
 			if got := c.currentSessionSummary().ID; got != "" {
 				t.Fatalf("current after %s = %q, want empty", tc.name, got)
 			}

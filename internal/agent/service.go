@@ -57,8 +57,8 @@ type AdapterService interface {
 	OpenSession(string) (SessionSummary, error)
 	NewSession(string, string) (string, error)
 	NewSessionForProjectPath(string, string) (string, error)
-	SessionArchive(string) (bool, error)
-	SessionDelete(string) (bool, error)
+	SessionArchive(string) error
+	SessionDelete(string) error
 	SessionMessagesFor(string) ([]DisplayMessage, error)
 	ApplyTurnActionForSession(string, int, string, bool) (TurnActionResult, error)
 	RevertCodeForSession(string, int) (snapshot.RevertResult, error)

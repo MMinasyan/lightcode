@@ -650,7 +650,7 @@ func TestACPStaleCurrent(t *testing.T) {
 	if id == "" {
 		t.Fatal("missing session id")
 	}
-	if _, err := a.SessionDelete(id); err != nil {
+	if err := a.SessionDelete(id); err != nil {
 		t.Fatalf("SessionDelete: %v", err)
 	}
 
@@ -693,7 +693,7 @@ func TestACPStaleEvent(t *testing.T) {
 	if id == "" {
 		t.Fatal("missing session id")
 	}
-	if _, err := a.SessionDelete(id); err != nil {
+	if err := a.SessionDelete(id); err != nil {
 		t.Fatalf("SessionDelete: %v", err)
 	}
 

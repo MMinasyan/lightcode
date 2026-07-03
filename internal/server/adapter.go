@@ -411,7 +411,8 @@ func (s *Server) handleAdapterRPC(w http.ResponseWriter, r *http.Request) {
 		if !decodeRPCParams(w, req.Params, &p) {
 			return
 		}
-		out, err = s.agent.SessionArchive(p.ID)
+		err = s.agent.SessionArchive(p.ID)
+		out = map[string]any{"ok": err == nil}
 	case "SessionDelete":
 		var p struct {
 			ID string `json:"id"`
@@ -419,7 +420,8 @@ func (s *Server) handleAdapterRPC(w http.ResponseWriter, r *http.Request) {
 		if !decodeRPCParams(w, req.Params, &p) {
 			return
 		}
-		out, err = s.agent.SessionDelete(p.ID)
+		err = s.agent.SessionDelete(p.ID)
+		out = map[string]any{"ok": err == nil}
 	case "SessionMessagesFor":
 		var p struct {
 			ID string `json:"id"`

@@ -404,24 +404,22 @@ func (c *CLI) showSessionMenuInner(state string) {
 	case "archive":
 		if result.selected >= 0 {
 			id := result.extra.(string)
-			closedCurrent, err := c.agent.SessionArchive(id)
-			if err != nil {
+			if err := c.agent.SessionArchive(id); err != nil {
 				c.printLine(renderErrorMsg(err.Error()))
 				return
 			}
 			c.printLine(renderSystemMsg("  session archived"))
-			c.clearRemovedCurrent(id, closedCurrent)
+			c.clearRemovedCurrent(id)
 		}
 	case "delete":
 		if result.selected >= 0 {
 			id := result.extra.(string)
-			closedCurrent, err := c.agent.SessionDelete(id)
-			if err != nil {
+			if err := c.agent.SessionDelete(id); err != nil {
 				c.printLine(renderErrorMsg(err.Error()))
 				return
 			}
 			c.printLine(renderSystemMsg("  session deleted"))
-			c.clearRemovedCurrent(id, closedCurrent)
+			c.clearRemovedCurrent(id)
 		}
 	case "toggle":
 		if state == "active" {
