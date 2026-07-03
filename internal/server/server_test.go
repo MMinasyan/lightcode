@@ -301,7 +301,7 @@ func TestOwnerDetachWithoutLiveSessionStopsOwner(t *testing.T) {
 	a := newServerTestAgent(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	srv := New(a, Config{})
+	srv := New(a, Config{ExitOnLastDetach: true})
 	_, done, err := srv.Start(ctx, home)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -322,7 +322,7 @@ func TestAdapterClientDetachWithoutLiveSessionStopsOwner(t *testing.T) {
 	a := newServerTestAgent(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	srv := New(a, Config{})
+	srv := New(a, Config{ExitOnLastDetach: true})
 	lf, done, err := srv.Start(ctx, home)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -340,17 +340,17 @@ func TestAdapterClientDetachWithoutLiveSessionStopsOwner(t *testing.T) {
 	}
 }
 
-func TestServeCountsAsAdapter(t *testing.T) {
+func TestServeNoExitOnLastDetach(t *testing.T) {
 	home := t.TempDir()
 	a := newServerTestAgent(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	srv := New(a, Config{})
+	srv := New(a, Config{ExitOnLastDetach: false})
 	done := make(chan error, 1)
 	go func() {
 		done <- srv.Serve(ctx, home)
 	}()
 	waitOwnerLock(t, home)
-	waitAdapterCount(t, srv, 1)
+	waitAdapterCount(t, srv, 0)
 	lf, err := Read(home)
 	if err != nil {
 		t.Fatalf("Read owner lock: %v", err)
@@ -364,7 +364,7 @@ func TestServeCountsAsAdapter(t *testing.T) {
 	}
 	select {
 	case err := <-done:
-		t.Fatalf("serve exited while serve adapter remained attached: %v", err)
+		t.Fatalf("serve exited after last adapter detach with ExitOnLastDetach=false: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 	cancel()
@@ -411,7 +411,7 @@ func TestAdapterDetachRequiresLease(t *testing.T) {
 	a := newServerTestAgent(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	srv := New(a, Config{})
+	srv := New(a, Config{ExitOnLastDetach: true})
 	lf, done, err := srv.Start(ctx, home)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -1854,4 +1854,79 @@ func extractSourceFunc(t *testing.T, src, signature string) string {
 	}
 	t.Fatalf("unterminated function %q", signature)
 	return ""
+}
+
+func TestPermissionTimerHeadlessOnly(t *testing.T) {
+	home := t.TempDir()
+	a := newServerTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := New(a, Config{
+		PermissionTimeout: 100 * time.Millisecond,
+	})
+	_, done, err := srv.Start(ctx, home)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		srv.RequestShutdown()
+		<-done
+	}()
+
+	lease, err := srv.AttachAdapter()
+	if err != nil {
+		t.Fatalf("AttachAdapter: %v", err)
+	}
+	defer srv.DetachAdapter(lease)
+
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	// With an adapter attached, the timer should not arm.
+	// Simulate a permission request by calling startPermissionTimer directly.
+	srv.startPermissionTimer(&agent.PermissionRequest{
+		ID:        "test-perm-headless",
+		SessionID: "",
+		ToolName:  "write_file",
+	})
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Timer should not have fired — the permission should still be respondable.
+	// Verify no timer was created by checking that permTimers is empty.
+	srv.permMu.Lock()
+	_, hasTimer := srv.permTimers["test-perm-headless"]
+	srv.permMu.Unlock()
+	if hasTimer {
+		t.Fatal("permission timer was armed despite attached adapter")
+	}
+}
+
+func TestExitOnLastDetach(t *testing.T) {
+	home := t.TempDir()
+	a := newServerTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := New(a, Config{ExitOnLastDetach: true})
+	_, done, err := srv.Start(ctx, home)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Open a session — the old condition checked LiveSessionCount and would
+	// prevent exit even with no adapters. With the fix, only adapter count matters.
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	lease, err := srv.AttachAdapter()
+	if err != nil {
+		t.Fatalf("AttachAdapter: %v", err)
+	}
+	srv.DetachAdapter(lease)
+	waitOwnerDone(t, done)
+	if _, err := Read(home); !os.IsNotExist(err) {
+		t.Fatalf("owner lock after last detach = %v, want removed", err)
+	}
 }

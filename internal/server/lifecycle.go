@@ -17,8 +17,8 @@ func (s *Server) AttachAdapter() (string, error) {
 		return "", err
 	}
 	s.lifeMu.Lock()
-	defer s.lifeMu.Unlock()
 	if s.shutdownRequested {
+		s.lifeMu.Unlock()
 		return "", fmt.Errorf("owner is shutting down")
 	}
 	if s.adapterLeases == nil {
@@ -26,7 +26,21 @@ func (s *Server) AttachAdapter() (string, error) {
 	}
 	s.adapterLeases[id] = struct{}{}
 	s.adapterCount = len(s.adapterLeases)
+	s.lifeMu.Unlock()
+
+	// A UI now owns pending prompts — cancel headless timers.
+	s.cancelAllPermissionTimers()
 	return id, nil
+}
+
+func (s *Server) cancelAllPermissionTimers() {
+	s.permMu.Lock()
+	for id, timer := range s.permTimers {
+		timer.Stop()
+		delete(s.permTimers, id)
+		delete(s.permTimerSessions, id)
+	}
+	s.permMu.Unlock()
 }
 
 func (s *Server) DetachAdapter(id string) bool {
@@ -42,7 +56,7 @@ func (s *Server) DetachAdapter(id string) bool {
 	}
 	delete(s.adapterLeases, id)
 	s.adapterCount = len(s.adapterLeases)
-	shouldShutdown := len(s.adapterLeases) == 0 && s.agent.LiveSessionCount() == 0
+	shouldShutdown := s.cfg.ExitOnLastDetach && len(s.adapterLeases) == 0
 	s.lifeMu.Unlock()
 	if shouldShutdown {
 		s.RequestShutdown()

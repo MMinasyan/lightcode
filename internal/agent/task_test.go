@@ -134,6 +134,11 @@ func TestForwardEventsBurst(t *testing.T) {
 func TestDrainPendingLoopEventsDrainsTaggedSubagentEvents(t *testing.T) {
 	a := &Agent{}
 	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	a.ensureSessionMapLocked()
+	parentUnit := &session{rt: rt}
+	a.sessions["parent-session"] = parentUnit
+	rt.mu.Unlock()
 	rt.taggedEvents = make(chan TaggedLoopEvent, 2)
 	var got []Event
 	a.SetEventHandler(func(ev Event) {
@@ -537,17 +542,18 @@ func TestTaskToolPersistsInspectableChildSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SessionList: %v", err)
 	}
-	var foundChild bool
 	for _, s := range sessions {
 		if s.ID == subEv.SubagentSessionID {
-			foundChild = true
-			if s.ParentSessionID != parentID {
-				t.Fatalf("child ParentSessionID = %q, want %q", s.ParentSessionID, parentID)
-			}
+			t.Fatalf("child session %q should not be listed in active sessions", subEv.SubagentSessionID)
 		}
 	}
-	if !foundChild {
-		t.Fatalf("child session %q not listed in active sessions: %#v", subEv.SubagentSessionID, sessions)
+
+	childMsgs, err := a.SessionMessagesFor(subEv.SubagentSessionID)
+	if err != nil {
+		t.Fatalf("SessionMessagesFor child: %v", err)
+	}
+	if len(childMsgs) == 0 {
+		t.Fatal("child transcript is empty, expected child messages")
 	}
 
 	parentMsgs := a.SessionMessages()
@@ -574,10 +580,6 @@ func TestTaskToolPersistsInspectableChildSession(t *testing.T) {
 		t.Fatalf("task subagent link = %#v, want index 0 session %q", taskRow.SubagentSessionIDs[0], subEv.SubagentSessionID)
 	}
 
-	childMsgs, err := a.SessionMessagesFor(subEv.SubagentSessionID)
-	if err != nil {
-		t.Fatalf("SessionMessagesFor child: %v", err)
-	}
 	if got := a.SessionCurrent().ID; got != parentID {
 		t.Fatalf("SessionMessagesFor switched current session to %q, want parent %q", got, parentID)
 	}
@@ -588,19 +590,8 @@ func TestTaskToolPersistsInspectableChildSession(t *testing.T) {
 		t.Fatalf("child transcript read by id missing assistant result: %#v", childMsgs)
 	}
 
-	if err := a.SessionSwitch(subEv.SubagentSessionID); err != nil {
-		t.Fatalf("SessionSwitch child: %v", err)
-	}
-	child := a.SessionCurrent()
-	if child.ParentSessionID != parentID {
-		t.Fatalf("current child ParentSessionID = %q, want %q", child.ParentSessionID, parentID)
-	}
-	childMsgs = a.SessionMessages()
-	if !hasDisplayMessage(childMsgs, "user", "inspect child") {
-		t.Fatalf("child transcript missing task prompt: %#v", childMsgs)
-	}
-	if !hasDisplayMessage(childMsgs, "assistant", "CHILD_ONLY") {
-		t.Fatalf("child transcript missing assistant result: %#v", childMsgs)
+	if err := a.SessionSwitch(subEv.SubagentSessionID); err == nil {
+		t.Fatal("SessionSwitch child should reject internal session")
 	}
 }
 

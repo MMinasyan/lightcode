@@ -458,6 +458,9 @@ func TestAgentRuntimeConfigRoundTripWritesReloadsAndExcludesMasterBooleans(t *te
 	if err := a.SetRuntimeConfig(settings); err != nil {
 		t.Fatalf("SetRuntimeConfig returned error: %v", err)
 	}
+	a.ensureRuntime().mu.Lock()
+	a.applyUnitConfigLocked(a.session)
+	a.ensureRuntime().mu.Unlock()
 	got := a.GetRuntimeConfig()
 	if got.Sessions.ArchiveAfterDays != 14 || got.Sessions.DeleteAfterArchiveDays != 21 || got.Compaction.ThresholdPct != 0.75 {
 		t.Fatalf("runtime config after set = %#v", got)

@@ -23,6 +23,7 @@ import (
 type Config struct {
 	Port              int
 	PermissionTimeout time.Duration
+	ExitOnLastDetach  bool
 }
 
 // Server is the HTTP+SSE daemon.
@@ -148,9 +149,6 @@ func (s *Server) Start(ctx context.Context, home string) (LockFile, <-chan error
 func (s *Server) Serve(ctx context.Context, home string) error {
 	_, done, err := s.Start(ctx, home)
 	if err != nil {
-		return err
-	}
-	if _, err := s.AttachAdapter(); err != nil {
 		return err
 	}
 	return <-done
@@ -318,6 +316,12 @@ func (s *Server) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
 
 func (s *Server) startPermissionTimer(req *agent.PermissionRequest) {
 	if req == nil {
+		return
+	}
+	s.lifeMu.Lock()
+	hasAdapters := len(s.adapterLeases) > 0
+	s.lifeMu.Unlock()
+	if hasAdapters {
 		return
 	}
 	id := req.ID

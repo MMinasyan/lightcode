@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1521,3 +1522,136 @@ func TestStaleIdsClearedOnClose(t *testing.T) {
 	}
 	a.ensureRuntime().mu.Unlock()
 }
+
+func TestBackgroundWakeStartsNonCurrentSession(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	ctx := context.Background()
+	a.Init(ctx)
+
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+
+	var events []Event
+	var evMu sync.Mutex
+	a.SetEventHandler(func(ev Event) {
+		if ev.Kind == EventTurnStart && ev.SessionID == firstID {
+			evMu.Lock()
+			events = append(events, ev)
+			evMu.Unlock()
+		}
+	})
+
+	a.ensureRuntime().mu.Lock()
+	first := a.sessions[firstID]
+	if first == nil {
+		t.Fatalf("first session not in live map")
+	}
+	first.lp.AddPendingSignal(loop.PendingSignal{
+		Wake:    true,
+		Persist: true,
+		Payload:  "background process completed",
+	})
+	a.ensureRuntime().mu.Unlock()
+	a.ensureRuntime().nudgeSignalScheduler()
+
+	timeout := time.After(2 * time.Second)
+	for {
+		evMu.Lock()
+		got := len(events)
+		evMu.Unlock()
+		if got > 0 {
+			break
+		}
+		select {
+		case <-timeout:
+			t.Fatalf("signal turn did not start for non-current session %q", firstID)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	if got := a.SessionCurrent().ID; got != secondID {
+		t.Fatalf("current session = %q, want second %q (should not have moved)", got, secondID)
+	}
+}
+
+func TestSessionListExcludesChildren(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	ctx := context.Background()
+	a.Init(ctx)
+
+	parentID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	a.ensureRuntime().mu.Lock()
+	childStore, err := snapshot.NewForSessionsRoot(a.projects.SessionsRoot(a.session.projectID), a.projects.Root(), a.session.projectID)
+	if err != nil {
+		t.Fatalf("child store: %v", err)
+	}
+	if err := childStore.BeginChildSession(a.session.projectID, parentID); err != nil {
+		t.Fatalf("BeginChildSession: %v", err)
+	}
+	childID := childStore.SessionID()
+	a.ensureRuntime().mu.Unlock()
+
+	sessions, err := a.SessionList("active")
+	if err != nil {
+		t.Fatalf("SessionList: %v", err)
+	}
+	for _, s := range sessions {
+		if s.ID == childID {
+			t.Fatalf("child session %q should not be in SessionList", childID)
+		}
+		if s.ParentSessionID != "" {
+			t.Fatalf("session %q has ParentSessionID %q, should be empty", s.ID, s.ParentSessionID)
+		}
+	}
+}
+
+func TestMutationsRejectDuringTransition(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	ctx := context.Background()
+	a.Init(ctx)
+
+	id, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	a.ensureRuntime().mu.Lock()
+	unit := a.sessions[id]
+	unit.transitioning = true
+	a.ensureRuntime().mu.Unlock()
+
+	if err := a.CompactNowForSession(ctx, id); err == nil {
+		t.Error("CompactNowForSession should reject during transition")
+	}
+	if err := a.SwitchModelForSession(id, "test/test-model"); err == nil {
+		t.Error("SwitchModelForSession should reject during transition")
+	}
+	if _, err := a.ApplyTurnActionForSession(id, 1, "revert_code", false); err == nil {
+		t.Error("ApplyTurnActionForSession should reject during transition")
+	}
+	if _, err := a.RevertCodeForSession(id, 0); err == nil {
+		t.Error("RevertCodeForSession should reject during transition")
+	}
+	if err := a.RevertHistoryForSession(id, 1); err == nil {
+		t.Error("RevertHistoryForSession should reject during transition")
+	}
+	if err := a.ForkSessionForSession(id, 1); err == nil {
+		t.Error("ForkSessionForSession should reject during transition")
+	}
+
+	a.ensureRuntime().mu.Lock()
+	unit.transitioning = false
+	a.ensureRuntime().mu.Unlock()
+}
+
+

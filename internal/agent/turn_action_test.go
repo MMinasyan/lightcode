@@ -383,7 +383,7 @@ func TestCompactionWritesCompactTranscript(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.run()
-			if err == nil || !strings.Contains(err.Error(), "internal compact transcript") {
+			if err == nil || !strings.Contains(err.Error(), "internal transcript session") {
 				t.Fatalf("%s compact child error = %v, want internal transcript rejection", tc.name, err)
 			}
 		})

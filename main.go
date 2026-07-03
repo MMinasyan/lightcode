@@ -159,6 +159,9 @@ func runServe(port int) error {
 			return err
 		}
 		defer client.DetachAdapter(context.Background())
+		if port != 0 && port != lf.Port {
+			fmt.Fprintf(os.Stderr, "lightcode: owner already running on port %d; ignoring --port\n", lf.Port)
+		}
 		fmt.Fprintf(os.Stderr, "lightcode: serving on 127.0.0.1:%d (token in %s)\n", lf.Port, server.Path(home))
 		if err := server.WaitForOwnerExitContext(ctx, home); err != nil && !errors.Is(err, context.Canceled) {
 			return err
@@ -174,8 +177,20 @@ func runServe(port int) error {
 	if err != nil {
 		return err
 	}
-	srv := server.New(svc, server.Config{Port: port})
-	return srv.Serve(ctx, home)
+	srv := server.New(svc, server.Config{Port: port, ExitOnLastDetach: false})
+	if err := srv.Serve(ctx, home); err != nil {
+		if lf, readErr := server.Read(home); readErr == nil && !server.IsStale(lf) {
+			projectRoot, _ := os.Getwd()
+			client := server.NewClient(lf, projectRoot)
+			if attachErr := client.AttachAdapter(ctx); attachErr != nil {
+				return err
+			}
+			defer client.DetachAdapter(context.Background())
+			return server.WaitForOwnerExitContext(ctx, home)
+		}
+		return err
+	}
+	return nil
 }
 
 func runStop() error {
@@ -275,7 +290,7 @@ func ownerService(port int) (agent.AdapterService, error) {
 	if err != nil {
 		return nil, err
 	}
-	srv := server.New(svc, server.Config{Port: port})
+	srv := server.New(svc, server.Config{Port: port, ExitOnLastDetach: true})
 	if _, done, err := srv.Start(context.Background(), home); err != nil {
 		if lf, readErr := server.Read(home); readErr == nil && !server.IsStale(lf) {
 			return server.NewClient(lf, projectRoot), nil
