@@ -1967,6 +1967,69 @@ func TestAttachCancelsTimers(t *testing.T) {
 	waitServerEventKind(t, events, agent.EventTurnEnd)
 }
 
+// TestTimerAttachRace exercises the concurrent arm/attach path. The bug is
+// logical atomicity (a timer registered after attach's cancel slipped through
+// the non-atomic check→register gap), not a data race, so -race will not catch
+// it on pre-fix code. This stress test runs arm and attach/detach loops
+// concurrently and then asserts no timer survives a final attach. It is a
+// regression pin, not a deterministic fail-before — the interleaving window is
+// sub-µs and cannot be forced without a production test seam.
+func TestTimerAttachRace(t *testing.T) {
+	a := newServerTestAgent(t)
+	srv := New(a, Config{PermissionTimeout: time.Hour}) // long: we test survival, not firing
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+				srv.startPermissionTimer(&agent.PermissionRequest{
+					ID:       fmt.Sprintf("race-%d", i),
+					ToolName: "write_file",
+				})
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				lease, err := srv.AttachAdapter()
+				if err != nil {
+					return
+				}
+				srv.DetachAdapter(lease)
+			}
+		}
+	}()
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	// A final attach must find zero surviving timers: under the fix, every
+	// arm that passed the lease-check also registered under the same lifeMu
+	// hold, so the cancel in attach reached it.
+	lease, err := srv.AttachAdapter()
+	if err != nil {
+		t.Fatalf("final AttachAdapter: %v", err)
+	}
+	defer srv.DetachAdapter(lease)
+	srv.permMu.Lock()
+	remaining := len(srv.permTimers)
+	srv.permMu.Unlock()
+	if remaining > 0 {
+		t.Fatalf("%d permission timers survived an adapter attach", remaining)
+	}
+}
+
 func TestExitOnLastDetach(t *testing.T) {
 	home := t.TempDir()
 	a := newServerTestAgent(t)

@@ -314,14 +314,16 @@ func (s *Server) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
 	return s.agent.TokenUsage()
 }
 
+// startPermissionTimer arms the headless auto-deny timer. It holds lifeMu
+// across the lease-check and the register so an attach cannot interleave
+// between them. Lock order is lifeMu -> permMu; no path takes permMu -> lifeMu.
 func (s *Server) startPermissionTimer(req *agent.PermissionRequest) {
 	if req == nil {
 		return
 	}
 	s.lifeMu.Lock()
-	hasAdapters := len(s.adapterLeases) > 0
-	s.lifeMu.Unlock()
-	if hasAdapters {
+	defer s.lifeMu.Unlock()
+	if len(s.adapterLeases) > 0 {
 		return
 	}
 	id := req.ID
@@ -329,16 +331,22 @@ func (s *Server) startPermissionTimer(req *agent.PermissionRequest) {
 	s.permMu.Lock()
 	defer s.permMu.Unlock()
 	timer := time.AfterFunc(s.cfg.PermissionTimeout, func() {
+		s.lifeMu.Lock()
+		hasAdapters := len(s.adapterLeases) > 0
+		s.permMu.Lock()
+		delete(s.permTimers, id)
+		delete(s.permTimerSessions, id)
+		s.permMu.Unlock()
+		s.lifeMu.Unlock()
+		if hasAdapters {
+			return
+		}
 		slog.Warn("permission timeout, auto-denying", "id", id)
 		if sessionID != "" {
 			_ = s.agent.RespondPermissionForSession(sessionID, id, false)
 		} else {
 			_ = s.agent.RespondPermission(id, false)
 		}
-		s.permMu.Lock()
-		delete(s.permTimers, id)
-		delete(s.permTimerSessions, id)
-		s.permMu.Unlock()
 	})
 	if s.permTimerSessions == nil {
 		s.permTimerSessions = make(map[string]string)

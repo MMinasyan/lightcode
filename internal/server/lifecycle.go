@@ -17,8 +17,8 @@ func (s *Server) AttachAdapter() (string, error) {
 		return "", err
 	}
 	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
 	if s.shutdownRequested {
-		s.lifeMu.Unlock()
 		return "", fmt.Errorf("owner is shutting down")
 	}
 	if s.adapterLeases == nil {
@@ -26,14 +26,17 @@ func (s *Server) AttachAdapter() (string, error) {
 	}
 	s.adapterLeases[id] = struct{}{}
 	s.adapterCount = len(s.adapterLeases)
-	s.lifeMu.Unlock()
-
-	// A UI now owns pending prompts — cancel headless timers.
-	s.cancelAllPermissionTimers()
+	// A UI now owns pending prompts — cancel headless timers while still
+	// holding lifeMu (order lifeMu -> permMu) so a concurrent
+	// startPermissionTimer cannot slip a timer in between the lease add
+	// and the cancel.
+	s.cancelAllPermissionTimersLocked()
 	return id, nil
 }
 
-func (s *Server) cancelAllPermissionTimers() {
+// cancelAllPermissionTimersLocked stops and clears every pending permission
+// timer. Caller must hold lifeMu; takes permMu (order lifeMu -> permMu).
+func (s *Server) cancelAllPermissionTimersLocked() {
 	s.permMu.Lock()
 	for id, timer := range s.permTimers {
 		timer.Stop()
