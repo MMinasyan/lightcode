@@ -149,18 +149,21 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 func TestProjectSwitchDoesNotCloseOwnerSession(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
 	if strings.Contains(app, "CloseForProjectSwitch") || strings.Contains(app, "close current session") {
-		t.Fatalf("ProjectSwitch must relaunch the adapter without closing the owner session")
+		t.Fatalf("ProjectSwitch must not close the owner session")
 	}
-	if !strings.Contains(app, "a.relaunchIn(abs)") || !strings.Contains(app, "wailsRuntime.Quit(a.ctx)") {
-		t.Fatalf("ProjectSwitch must relaunch the adapter and quit the current Wails attachment")
+	if strings.Contains(app, "relaunchIn") || strings.Contains(app, "wailsRuntime.Quit") {
+		t.Fatalf("ProjectSwitch must not relaunch the process or quit the adapter")
+	}
+	if !strings.Contains(app, "OpenOrCreateSession") {
+		t.Fatalf("ProjectSwitch must navigate in-place via OpenOrCreateSession")
 	}
 
 	cli := mustReadContractFile(t, filepath.Join("..", "cli", "cli.go"))
 	if strings.Contains(cli, "CloseForProjectSwitch") || strings.Contains(cli, "close current session") {
-		t.Fatalf("CLI projectSwitch must relaunch the adapter without closing the owner session")
+		t.Fatalf("CLI projectSwitch must not close the owner session")
 	}
-	if !strings.Contains(cli, "c.relaunchIn(targetPath)") || !strings.Contains(cli, "ExitError{Code: 0}") {
-		t.Fatalf("CLI projectSwitch must relaunch the adapter and exit cleanly")
+	if strings.Contains(cli, "relaunchIn") || strings.Contains(cli, "syscall.Exec") {
+		t.Fatalf("CLI projectSwitch must not relaunch or exec")
 	}
 }
 

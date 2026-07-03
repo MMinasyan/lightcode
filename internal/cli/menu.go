@@ -351,7 +351,7 @@ func (c *CLI) showSessionMenuInner(state string) {
 	c.stopAnimationLocked()
 	c.mu.Unlock()
 
-	sessions, err := c.agent.SessionList(state)
+	sessions, err := c.scope.SessionList(state)
 	if err != nil {
 		c.printLine(renderErrorMsg(err.Error()))
 		return
@@ -394,7 +394,7 @@ func (c *CLI) showSessionMenuInner(state string) {
 			c.refreshSession()
 		}
 	case "new":
-		id, err := c.agent.NewSession("", "primary")
+		id, err := c.scope.NewSession("primary")
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
@@ -541,7 +541,7 @@ func (c *CLI) showProjectMenu() {
 		return
 	}
 
-	cur := c.agent.ProjectCurrent()
+	cur := c.scope.ProjectCurrent()
 
 	var items []menuItem
 	for _, p := range projects {

@@ -360,6 +360,11 @@
     } catch (e) { showError(e, 'Load model failed'); }
   }
 
+  async function handleProjectSwitched() {
+    try { projectName = await ProjectName(); } catch (e) { showError(e, 'Load project failed'); }
+    await refreshCurrentModel();
+  }
+
   async function handleRevertCode(e) {
     const { turn } = e.detail;
     try {
@@ -443,7 +448,7 @@
     <SessionSelector on:close={() => showSessionSelector=false} on:error={(e) => showError(e.detail)} />
   {/if}
   {#if showProjectSelector}
-    <ProjectSelector on:close={() => showProjectSelector=false} on:error={(e) => showError(e.detail)} />
+    <ProjectSelector on:switched={handleProjectSwitched} on:close={() => showProjectSelector=false} on:error={(e) => showError(e.detail)} />
   {/if}
   {#if showWarnings}
     <WarningDetails {warnings} on:close={() => showWarnings=false} />

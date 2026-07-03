@@ -28,6 +28,7 @@ const (
 
 type CLI struct {
 	agent agent.AdapterService
+	scope *agent.AdapterScope
 	out   io.Writer
 	mu    *sync.Mutex
 
@@ -89,7 +90,7 @@ type CLI struct {
 }
 
 func New(a agent.AdapterService) *CLI {
-	return &CLI{
+	c := &CLI{
 		agent:               a,
 		out:                 os.Stdout,
 		mu:                  &sync.Mutex{},
@@ -101,6 +102,10 @@ func New(a agent.AdapterService) *CLI {
 		width:               80,
 		lastWarningSnapshot: make(map[string]bool),
 	}
+	if a != nil {
+		c.scope = agent.NewAdapterScope(a, a.ProjectRoot())
+	}
+	return c
 }
 
 type ExitError struct {
@@ -363,13 +368,13 @@ func (c *CLI) Run(ctx context.Context) error {
 		defer detach()
 	}
 	sessionID := ""
-	if sessions, err := c.agent.SessionList("active"); err == nil && len(sessions) > 0 {
+	if sessions, err := c.scope.SessionList("active"); err == nil && len(sessions) > 0 {
 		if summary, err := c.agent.OpenSession(sessions[0].ID); err == nil {
 			sessionID = summary.ID
 		}
 	}
 	if sessionID == "" {
-		if id, err := c.agent.NewSession("", "primary"); err == nil {
+		if id, err := c.scope.NewSession("primary"); err == nil {
 			sessionID = id
 		}
 	}
@@ -1218,7 +1223,7 @@ func (c *CLI) printHeaderLocked() {
 	if sid == "" {
 		sid = "(no session)"
 	}
-	header := fmt.Sprintf("  %s  %s  %s", c.agent.ProjectName(), sid, c.modelRef)
+	header := fmt.Sprintf("  %s  %s  %s", c.scope.ProjectName(), sid, c.modelRef)
 	c.printLineLocked(colorDim + header + colorReset)
 	c.printLineLocked("")
 }
@@ -1456,7 +1461,7 @@ func (c *CLI) dispatchCommand(text string) error {
 	case "/project":
 		c.showProjectMenu()
 	case "/new":
-		id, err := c.agent.NewSession("", "primary")
+		id, err := c.scope.NewSession("primary")
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return nil
@@ -1539,7 +1544,7 @@ func (c *CLI) cmdResume(parts []string) {
 		return
 	}
 
-	sessions, err := c.agent.SessionList("active")
+	sessions, err := c.scope.SessionList("active")
 	if err != nil {
 		c.printLine(renderErrorMsg(err.Error()))
 		return
@@ -1642,12 +1647,14 @@ func (c *CLI) cmdCopy() {
 }
 
 func (c *CLI) projectSwitch(targetPath string) {
-	c.restoreTerminal()
-	if err := c.relaunchIn(targetPath); err != nil {
-		c.requestExit(fmt.Errorf("relaunch: %w", err))
+	summary, err := c.scope.OpenOrCreateSession(targetPath)
+	if err != nil {
+		c.printLine(renderErrorMsg(err.Error()))
 		return
 	}
-	c.requestExit(ExitError{Code: 0})
+	c.scope.SetProjectPath(targetPath)
+	c.setCurrentSessionID(summary.ID)
+	c.refreshSession()
 }
 
 func (c *CLI) restoreTerminal() {

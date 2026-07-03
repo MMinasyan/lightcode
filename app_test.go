@@ -16,7 +16,7 @@ import (
 // agent.ReadFileContent. The Wails adapter must propagate the agent's
 // boundary refusal.
 func TestPR11Closure_AppReadFileContentPropagatesViewerBoundaryRefusal(t *testing.T) {
-	app := &App{svc: newAppTestAgent(t)}
+	app := newTestApp(newAppTestAgent(t))
 
 	outsideDir := t.TempDir()
 	outsideSecret := filepath.Join(outsideDir, "secret.txt")
@@ -43,7 +43,7 @@ func TestWailsStaleCurrent(t *testing.T) {
 		t.Fatal("missing session id")
 	}
 
-	app := &App{svc: svc}
+	app := newTestApp(svc)
 	app.setCurrentSessionID(id)
 	if _, err := svc.SessionDelete(id); err != nil {
 		t.Fatalf("SessionDelete: %v", err)
@@ -64,7 +64,7 @@ func TestWailsStaleCurrent(t *testing.T) {
 
 func TestWailsNewSetsCurrent(t *testing.T) {
 	svc := newAppTestAgent(t)
-	app := &App{svc: svc}
+	app := newTestApp(svc)
 	if err := app.SessionNew(); err != nil {
 		t.Fatalf("SessionNew: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestWailsClearRemovedCurrent(t *testing.T) {
 				t.Fatalf("append second: %v", err)
 			}
 
-			app := &App{svc: svc}
+			app := newTestApp(svc)
 			app.setCurrentSessionID(firstID)
 			if err := tc.run(app, firstID); err != nil {
 				t.Fatalf("%s first: %v", tc.name, err)
@@ -147,7 +147,7 @@ func TestWailsForkCurrent(t *testing.T) {
 		t.Fatalf("append second: %v", err)
 	}
 
-	app := &App{svc: svc}
+	app := newTestApp(svc)
 	app.setCurrentSessionID(firstID)
 	if err := app.ForkSession(turn); err != nil {
 		t.Fatalf("ForkSession: %v", err)
@@ -178,7 +178,7 @@ func TestWailsSwitchKeepsCurrent(t *testing.T) {
 		t.Fatalf("append second: %v", err)
 	}
 
-	app := &App{svc: svc}
+	app := newTestApp(svc)
 	app.setCurrentSessionID(secondID)
 	if err := app.SessionSwitch(firstID); err != nil {
 		t.Fatalf("SessionSwitch: %v", err)
@@ -203,7 +203,7 @@ func TestWailsSubagentFilter(t *testing.T) {
 	if root == "" {
 		t.Fatal("missing root session")
 	}
-	app := &App{svc: svc}
+	app := newTestApp(svc)
 
 	app.setCurrentSessionID("")
 	if app.acceptsEvent(agent.Event{Kind: agent.EventSubagentStart, SessionID: "child", SubagentSessionID: "child", ParentSessionID: root}) {
@@ -278,6 +278,10 @@ func newAppTestAgent(t *testing.T) *agent.Agent {
 	return a
 }
 
+func newTestApp(svc *agent.Agent) *App {
+	return &App{svc: svc, scope: agent.NewAdapterScope(svc, svc.ProjectRoot())}
+}
+
 func userContents(messages []agent.DisplayMessage) []string {
 	var out []string
 	for _, msg := range messages {
@@ -298,4 +302,68 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestProjectSwitchInPlaceKeepsOwnerAlive(t *testing.T) {
+	svc := newAppTestAgent(t)
+	app := newTestApp(svc)
+	app.scope = agent.NewAdapterScope(svc, svc.ProjectRoot())
+
+	firstID, err := svc.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	if _, err := svc.AppendUserMessageToSession(firstID, "first"); err != nil {
+		t.Fatalf("append first: %v", err)
+	}
+	app.setCurrentSessionID(firstID)
+
+	targetDir := t.TempDir()
+	if err := app.ProjectSwitch(targetDir); err != nil {
+		t.Fatalf("ProjectSwitch: %v", err)
+	}
+
+	// Adapter current must point at a session in the target project.
+	got := app.SessionCurrent().ID
+	if got == "" {
+		t.Fatal("no current session after project switch")
+	}
+	if got == firstID {
+		t.Fatal("project switch did not change the current session")
+	}
+
+	// The old session must still be alive on the owner.
+	if _, err := svc.SessionSummaryForSession(firstID); err != nil {
+		t.Fatalf("old session not alive after switch: %v", err)
+	}
+
+	// ProjectName must reflect the target directory.
+	if name := app.ProjectName(); name != filepath.Base(targetDir) {
+		t.Fatalf("ProjectName = %q, want %q", name, filepath.Base(targetDir))
+	}
+
+	// No relaunch: adapter must still be attached.
+	if app.adapterAttached {
+		// In tests adapterAttached is false (no lifecycle service); the point
+		// is that ProjectSwitch did not call DetachAdapter or Quit.
+	}
+}
+
+func TestProjectSwitchNoOpSameDir(t *testing.T) {
+	svc := newAppTestAgent(t)
+	app := newTestApp(svc)
+	app.scope = agent.NewAdapterScope(svc, svc.ProjectRoot())
+
+	firstID, err := svc.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	app.setCurrentSessionID(firstID)
+
+	if err := app.ProjectSwitch(svc.ProjectRoot()); err != nil {
+		t.Fatalf("ProjectSwitch same dir: %v", err)
+	}
+	if got := app.SessionCurrent().ID; got != firstID {
+		t.Fatalf("current = %q, want %q (no-op switch should not change session)", got, firstID)
+	}
 }

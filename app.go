@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -22,6 +21,7 @@ import (
 type App struct {
 	ctx             context.Context
 	svc             agent.AdapterService
+	scope           *agent.AdapterScope
 	currentMu       sync.Mutex
 	currentID       string
 	children        map[string]struct{}
@@ -35,17 +35,18 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.svc.SetEventHandler(a.handleEvent)
 	a.svc.Init(ctx)
+	a.scope = agent.NewAdapterScope(a.svc, a.svc.ProjectRoot())
 	if lifecycle, ok := a.svc.(interface{ AttachAdapter(context.Context) error }); ok {
 		a.adapterAttached = lifecycle.AttachAdapter(ctx) == nil
 	}
 	sessionID := ""
-	if sessions, err := a.svc.SessionList("active"); err == nil && len(sessions) > 0 {
+	if sessions, err := a.scope.SessionList("active"); err == nil && len(sessions) > 0 {
 		if summary, err := a.svc.OpenSession(sessions[0].ID); err == nil {
 			sessionID = summary.ID
 		}
 	}
 	if sessionID == "" {
-		if id, err := a.svc.NewSession("", "primary"); err == nil {
+		if id, err := a.scope.NewSession("primary"); err == nil {
 			sessionID = id
 		}
 	}
@@ -664,14 +665,14 @@ func (a *App) SetRuntimeConfig(settings agent.RuntimeConfigSettings) error {
 	return a.svc.SetRuntimeConfig(settings)
 }
 
-// ProjectName returns the basename of the project directory.
+// ProjectName returns the basename of the adapter-local project directory.
 func (a *App) ProjectName() string {
-	return a.svc.ProjectName()
+	return a.scope.ProjectName()
 }
 
 // ReadFileContent loads a file's contents for the in-app viewer.
 func (a *App) ReadFileContent(path string) (string, error) {
-	return a.svc.ReadFileContent(path)
+	return a.scope.ReadFileContent(path)
 }
 
 // TokenUsage returns the current cumulative token usage for the session.
@@ -686,7 +687,7 @@ func (a *App) SessionCurrent() agent.SessionSummary {
 
 // SessionList returns sessions filtered by state.
 func (a *App) SessionList(state string) ([]agent.SessionSummary, error) {
-	return a.svc.SessionList(state)
+	return a.scope.SessionList(state)
 }
 
 // SessionSwitch switches to another session.
@@ -732,9 +733,9 @@ func (a *App) SessionDelete(id string) error {
 	return nil
 }
 
-// SessionNew starts a fresh session.
+// SessionNew starts a fresh session in the adapter-local project.
 func (a *App) SessionNew() error {
-	id, err := a.svc.NewSession("", "primary")
+	id, err := a.scope.NewSession("primary")
 	if err != nil {
 		return err
 	}
@@ -758,12 +759,13 @@ func (a *App) ProjectList() ([]agent.ProjectSummary, error) {
 	return a.svc.ProjectList()
 }
 
-// ProjectCurrent returns the project record for the current cwd.
+// ProjectCurrent returns the project record for the adapter-local project.
 func (a *App) ProjectCurrent() agent.ProjectSummary {
-	return a.svc.ProjectCurrent()
+	return a.scope.ProjectCurrent()
 }
 
-// ProjectSwitch spawns a detached child in the target directory and quits this adapter.
+// ProjectSwitch navigates to a different project in-place over the existing
+// owner connection — no process spawn, no detach, no lease gap.
 func (a *App) ProjectSwitch(targetPath string) error {
 	if targetPath == "" {
 		return fmt.Errorf("empty target path")
@@ -779,14 +781,20 @@ func (a *App) ProjectSwitch(targetPath string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("%s is not a directory", abs)
 	}
-	if abs == a.svc.ProjectRoot() {
+	if abs == a.scope.ProjectRoot() {
 		return nil
 	}
 
-	if err := a.relaunchIn(abs); err != nil {
+	summary, err := a.scope.OpenOrCreateSession(abs)
+	if err != nil {
 		return err
 	}
-	wailsRuntime.Quit(a.ctx)
+	a.scope.SetProjectPath(abs)
+	a.setCurrentSessionID(summary.ID)
+	a.emitSessionChangedForSession(summary.ID)
+	if a.ctx != nil {
+		wailsRuntime.WindowSetTitle(a.ctx, "Lightcode — "+a.scope.ProjectName())
+	}
 	return nil
 }
 
@@ -802,18 +810,4 @@ func (a *App) ProjectPickAndSwitch() error {
 		return nil
 	}
 	return a.ProjectSwitch(selected)
-}
-
-func (a *App) relaunchIn(dir string) error {
-	bin, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("resolve lightcode binary: %w", err)
-	}
-	cmd := exec.Command(bin)
-	cmd.Dir = dir
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	cmd.SysProcAttr = detachAttr()
-	return cmd.Start()
 }
