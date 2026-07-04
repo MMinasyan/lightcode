@@ -32,9 +32,8 @@ type CLI struct {
 	out   io.Writer
 	mu    *sync.Mutex
 
-	currentMu sync.Mutex
-	currentID string
-	children  map[string]struct{}
+	viewOnce sync.Once
+	view     *agent.SessionView
 
 	width    int
 	oldState *term.State
@@ -126,118 +125,55 @@ func (c *CLI) requestExit(err error) {
 	})
 }
 
+func (c *CLI) sv() *agent.SessionView {
+	c.viewOnce.Do(func() { c.view = agent.NewSessionView(c.agent) })
+	return c.view
+}
+
 func (c *CLI) setCurrentSessionID(id string) {
-	c.currentMu.Lock()
-	id = strings.TrimSpace(id)
-	if c.currentID != id {
-		c.children = nil
-	}
-	c.currentID = id
-	c.currentMu.Unlock()
+	c.sv().SetCurrent(id)
 }
 
 func (c *CLI) currentSessionID() string {
-	c.currentMu.Lock()
-	defer c.currentMu.Unlock()
-	return strings.TrimSpace(c.currentID)
+	return c.sv().Current()
 }
 
 func (c *CLI) currentSession() (string, error) {
-	id := c.currentSessionID()
-	if id == "" {
-		return "", fmt.Errorf("no current session")
-	}
-	return id, nil
+	return c.sv().CurrentOrErr()
 }
 
 func (c *CLI) clearRemovedCurrent(id string) {
-	wasCurrent := c.currentSessionID() == strings.TrimSpace(id)
-	if wasCurrent {
-		c.setCurrentSessionID("")
-	}
-	if wasCurrent {
+	if c.sv().RemovedCurrent(id) {
 		c.refreshSession()
 	}
 }
 
 func (c *CLI) resolveSessionID(id string) (string, error) {
-	id = strings.TrimSpace(id)
-	if id != "" {
-		return id, nil
-	}
-	return c.currentSession()
+	return c.sv().Resolve(id)
 }
 
 func (c *CLI) acceptsSessionEvent(sessionID string) bool {
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		return true
-	}
-	return c.liveCurrentSessionID() == sessionID
+	return c.sv().AcceptsSessionEvent(sessionID)
 }
 
 func (c *CLI) acceptsEvent(ev agent.Event) bool {
-	if ev.SubagentSessionID != "" {
-		return c.acceptsSubagentEvent(ev)
-	}
-	if ev.SessionID != "" {
-		return c.acceptsSessionEvent(ev.SessionID)
-	}
-	return true
+	return c.sv().AcceptsEvent(ev)
 }
 
 func (c *CLI) acceptsSubagentEvent(ev agent.Event) bool {
-	current := c.liveCurrentSessionID()
-	if current == "" {
-		return false
-	}
-	return c.acceptsSubagentEventForCurrent(current, ev)
+	return c.sv().AcceptsSubagentEvent(ev)
 }
 
 func (c *CLI) acceptsSubagentEventForCurrent(current string, ev agent.Event) bool {
-	child := strings.TrimSpace(ev.SubagentSessionID)
-	if child == "" {
-		return false
-	}
-	c.currentMu.Lock()
-	defer c.currentMu.Unlock()
-	if strings.TrimSpace(c.currentID) != current {
-		return false
-	}
-	if ev.ParentSessionID == current {
-		if c.children == nil {
-			c.children = make(map[string]struct{})
-		}
-		c.children[child] = struct{}{}
-		return true
-	}
-	_, ok := c.children[child]
-	return ok
+	return c.sv().AcceptsSubagentEventForCurrent(current, ev)
 }
 
 func (c *CLI) liveCurrentSessionID() string {
-	id := c.currentSessionID()
-	if id == "" {
-		return ""
-	}
-	if _, err := c.agent.SessionSummaryForSession(id); err != nil {
-		c.setCurrentSessionID("")
-		return ""
-	}
-	return id
+	return c.sv().LiveCurrent()
 }
 
 func (c *CLI) currentSessionSummary() agent.SessionSummary {
-	id := c.currentSessionID()
-	if id == "" {
-		return agent.SessionSummary{}
-	}
-	s, err := c.agent.SessionSummaryForSession(id)
-	if err != nil {
-		c.setCurrentSessionID("")
-		return agent.SessionSummary{}
-	}
-	return s
+	return c.sv().CurrentSummary()
 }
 
 func (c *CLI) currentModel() agent.ModelInfo {
@@ -253,15 +189,7 @@ func (c *CLI) currentModel() agent.ModelInfo {
 }
 
 func (c *CLI) tokenUsage() agent.TokenReport {
-	id := c.currentSessionID()
-	if id == "" {
-		return agent.TokenReport{}
-	}
-	report, err := c.agent.TokenUsageForSession(id)
-	if err != nil {
-		return agent.TokenReport{}
-	}
-	return report
+	return c.sv().TokenUsage()
 }
 
 func (c *CLI) sessionMessages() []agent.DisplayMessage {

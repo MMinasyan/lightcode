@@ -22,9 +22,8 @@ type App struct {
 	ctx             context.Context
 	svc             agent.AdapterService
 	scope           *agent.AdapterScope
-	currentMu       sync.Mutex
-	currentID       string
-	children        map[string]struct{}
+	viewOnce        sync.Once
+	view            *agent.SessionView
 	adapterAttached bool
 }
 
@@ -60,6 +59,11 @@ func (a *App) shutdown(ctx context.Context) {
 	if lifecycle, ok := a.svc.(interface{ DetachAdapter(context.Context) error }); ok {
 		_ = lifecycle.DetachAdapter(ctx)
 	}
+}
+
+func (a *App) sv() *agent.SessionView {
+	a.viewOnce.Do(func() { a.view = agent.NewSessionView(a.svc) })
+	return a.view
 }
 
 func (a *App) handleEvent(ev agent.Event) {
@@ -217,132 +221,52 @@ func (a *App) emitSessionChangedForSession(sessionID string) {
 	if a.ctx == nil {
 		return
 	}
-	sessionID = strings.TrimSpace(sessionID)
-	payload := agent.SessionPayload{}
-	if sessionID != "" {
-		var err error
-		payload, err = a.svc.SessionPayloadForSession(sessionID)
-		if err != nil && sessionID == a.currentSessionID() {
-			a.setCurrentSessionID("")
-		}
-	}
+	payload := a.sv().SessionChangedPayload(sessionID)
 	wailsRuntime.EventsEmit(a.ctx, "session_changed", payload)
 }
 
 func (a *App) setCurrentSessionID(id string) {
-	a.currentMu.Lock()
-	id = strings.TrimSpace(id)
-	if a.currentID != id {
-		a.children = nil
-	}
-	a.currentID = id
-	a.currentMu.Unlock()
+	a.sv().SetCurrent(id)
 }
 
 func (a *App) currentSessionID() string {
-	a.currentMu.Lock()
-	defer a.currentMu.Unlock()
-	return strings.TrimSpace(a.currentID)
+	return a.sv().Current()
 }
 
 func (a *App) currentSession() (string, error) {
-	id := a.currentSessionID()
-	if id == "" {
-		return "", fmt.Errorf("no current session")
-	}
-	return id, nil
+	return a.sv().CurrentOrErr()
 }
 
 func (a *App) acceptsSessionEvent(sessionID string) bool {
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		return true
-	}
-	return a.liveCurrentSessionID() == sessionID
+	return a.sv().AcceptsSessionEvent(sessionID)
 }
 
 func (a *App) acceptsEvent(ev agent.Event) bool {
-	if ev.SubagentSessionID != "" {
-		return a.acceptsSubagentEvent(ev)
-	}
-	if ev.SessionID != "" {
-		return a.acceptsSessionEvent(ev.SessionID)
-	}
-	return true
+	return a.sv().AcceptsEvent(ev)
 }
 
 func (a *App) acceptsSubagentEvent(ev agent.Event) bool {
-	current := a.liveCurrentSessionID()
-	if current == "" {
-		return false
-	}
-	return a.acceptsSubagentEventForCurrent(current, ev)
+	return a.sv().AcceptsSubagentEvent(ev)
 }
 
 func (a *App) acceptsSubagentEventForCurrent(current string, ev agent.Event) bool {
-	child := strings.TrimSpace(ev.SubagentSessionID)
-	if child == "" {
-		return false
-	}
-	a.currentMu.Lock()
-	defer a.currentMu.Unlock()
-	if strings.TrimSpace(a.currentID) != current {
-		return false
-	}
-	if ev.ParentSessionID == current {
-		if a.children == nil {
-			a.children = make(map[string]struct{})
-		}
-		a.children[child] = struct{}{}
-		return true
-	}
-	_, ok := a.children[child]
-	return ok
+	return a.sv().AcceptsSubagentEventForCurrent(current, ev)
 }
 
 func (a *App) liveCurrentSessionID() string {
-	id := a.currentSessionID()
-	if id == "" {
-		return ""
-	}
-	if _, err := a.svc.SessionSummaryForSession(id); err != nil {
-		a.setCurrentSessionID("")
-		return ""
-	}
-	return id
+	return a.sv().LiveCurrent()
 }
 
 func (a *App) resolveSessionID(id string) (string, error) {
-	id = strings.TrimSpace(id)
-	if id != "" {
-		return id, nil
-	}
-	return a.currentSession()
+	return a.sv().Resolve(id)
 }
 
 func (a *App) currentSessionSummary() agent.SessionSummary {
-	id := a.currentSessionID()
-	if id == "" {
-		return agent.SessionSummary{}
-	}
-	s, err := a.svc.SessionSummaryForSession(id)
-	if err != nil {
-		a.setCurrentSessionID("")
-		return agent.SessionSummary{}
-	}
-	return s
+	return a.sv().CurrentSummary()
 }
 
 func (a *App) tokenUsage() agent.TokenReport {
-	id := a.currentSessionID()
-	if id == "" {
-		return agent.TokenReport{}
-	}
-	report, err := a.svc.TokenUsageForSession(id)
-	if err != nil {
-		return agent.TokenReport{}
-	}
-	return report
+	return a.sv().TokenUsage()
 }
 
 func (a *App) sessionMessages() []agent.DisplayMessage {
@@ -703,12 +627,11 @@ func (a *App) SessionSwitch(id string) error {
 
 // SessionArchive archives a session.
 func (a *App) SessionArchive(id string) error {
-	wasCurrent := a.currentSessionID() == strings.TrimSpace(id)
 	if err := a.svc.SessionArchive(id); err != nil {
 		return err
 	}
+	wasCurrent := a.sv().RemovedCurrent(id)
 	if wasCurrent {
-		a.setCurrentSessionID("")
 		a.emitSessionChangedForSession(strings.TrimSpace(id))
 	}
 	return nil
@@ -716,12 +639,11 @@ func (a *App) SessionArchive(id string) error {
 
 // SessionDelete removes a session from disk.
 func (a *App) SessionDelete(id string) error {
-	wasCurrent := a.currentSessionID() == strings.TrimSpace(id)
 	if err := a.svc.SessionDelete(id); err != nil {
 		return err
 	}
+	wasCurrent := a.sv().RemovedCurrent(id)
 	if wasCurrent {
-		a.setCurrentSessionID("")
 		a.emitSessionChangedForSession(strings.TrimSpace(id))
 	}
 	return nil

@@ -54,8 +54,8 @@ type Runner struct {
 	mu    sync.Mutex
 	out   io.Writer
 
-	currentMu        sync.Mutex
-	currentSessionID string
+	viewOnce sync.Once
+	view     *agent.SessionView
 }
 
 // New creates an ACP Runner.
@@ -324,20 +324,17 @@ func (r *Runner) handleInitialize(req Request) {
 	})
 }
 
+func (r *Runner) sv() *agent.SessionView {
+	r.viewOnce.Do(func() { r.view = agent.NewSessionView(r.agent) })
+	return r.view
+}
+
 func (r *Runner) setCurrentSessionID(id string) {
-	r.currentMu.Lock()
-	r.currentSessionID = strings.TrimSpace(id)
-	r.currentMu.Unlock()
+	r.sv().SetCurrent(id)
 }
 
 func (r *Runner) currentSession() (string, error) {
-	r.currentMu.Lock()
-	id := r.currentSessionID
-	r.currentMu.Unlock()
-	if strings.TrimSpace(id) == "" {
-		return "", fmt.Errorf("no current session")
-	}
-	return id, nil
+	return r.sv().CurrentOrErr()
 }
 
 func (r *Runner) paramsSessionID(explicit string) (string, error) {
@@ -349,40 +346,15 @@ func (r *Runner) paramsSessionID(explicit string) (string, error) {
 }
 
 func (r *Runner) acceptsSessionEvent(sessionID string) bool {
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		return true
-	}
-	current := r.liveCurrentSessionID()
-	return current != "" && current == sessionID
+	return r.sv().AcceptsSessionEvent(sessionID)
 }
 
 func (r *Runner) liveCurrentSessionID() string {
-	current, err := r.currentSession()
-	if err != nil {
-		return ""
-	}
-	if r.agent == nil {
-		return current
-	}
-	if _, err := r.agent.SessionSummaryForSession(current); err != nil {
-		r.setCurrentSessionID("")
-		return ""
-	}
-	return current
+	return r.sv().LiveCurrent()
 }
 
 func (r *Runner) currentSessionSummary() agent.SessionSummary {
-	current, err := r.currentSession()
-	if err != nil {
-		return agent.SessionSummary{}
-	}
-	summary, err := r.agent.SessionSummaryForSession(current)
-	if err != nil {
-		r.setCurrentSessionID("")
-		return agent.SessionSummary{}
-	}
-	return summary
+	return r.sv().CurrentSummary()
 }
 
 func (r *Runner) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
@@ -551,16 +523,12 @@ func (r *Runner) handleSessionArchive(req Request) {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	wasCurrent := false
-	if current, err := r.currentSession(); err == nil && current == strings.TrimSpace(params.ID) {
-		wasCurrent = true
-	}
 	if err := r.agent.SessionArchive(params.ID); err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
+	wasCurrent := r.sv().RemovedCurrent(params.ID)
 	if wasCurrent {
-		r.setCurrentSessionID("")
 		r.pushSessionChangedForSession(strings.TrimSpace(params.ID))
 	}
 	r.respond(req.ID, map[string]any{"ok": true})
@@ -574,16 +542,12 @@ func (r *Runner) handleSessionDelete(req Request) {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	wasCurrent := false
-	if current, err := r.currentSession(); err == nil && current == strings.TrimSpace(params.ID) {
-		wasCurrent = true
-	}
 	if err := r.agent.SessionDelete(params.ID); err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
+	wasCurrent := r.sv().RemovedCurrent(params.ID)
 	if wasCurrent {
-		r.setCurrentSessionID("")
 		r.pushSessionChangedForSession(strings.TrimSpace(params.ID))
 	}
 	r.respond(req.ID, map[string]any{"ok": true})
@@ -839,18 +803,7 @@ func (r *Runner) pushSessionChangedForEvent(ev agent.Event) {
 }
 
 func (r *Runner) pushSessionChangedForSession(sessionID string) {
-	sessionID = strings.TrimSpace(sessionID)
-	payload := agent.SessionPayload{}
-	if sessionID != "" {
-		var err error
-		payload, err = r.agent.SessionPayloadForSession(sessionID)
-		if err != nil {
-			if current, currentErr := r.currentSession(); currentErr == nil && current == sessionID {
-				r.setCurrentSessionID("")
-			}
-			payload = agent.SessionPayload{}
-		}
-	}
+	payload := r.sv().SessionChangedPayload(sessionID)
 	r.sendNotification(Notification{
 		JSONRPC: "2.0",
 		Method:  "agent/session_changed",
