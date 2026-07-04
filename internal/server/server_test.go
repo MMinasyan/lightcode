@@ -1350,10 +1350,14 @@ func TestHandlePermissionSaveFailureKeepsTimerAndPendingRequest(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	a.Init(ctx)
+	sessionID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
 
 	submitDone := make(chan error, 1)
 	go func() {
-		_, err := a.Submit(ctx, "apply a multi-file patch")
+		_, err := a.SubmitToSession(ctx, sessionID, "apply a multi-file patch")
 		submitDone <- err
 	}()
 
@@ -1422,10 +1426,14 @@ func TestHandlePermissionResponseFailureKeepsTimerAndPendingRequest(t *testing.T
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	a.Init(ctx)
+	sessionID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
 
 	submitDone := make(chan error, 1)
 	go func() {
-		_, err := a.Submit(ctx, "read target.txt")
+		_, err := a.SubmitToSession(ctx, sessionID, "read target.txt")
 		submitDone <- err
 	}()
 
@@ -1476,7 +1484,7 @@ func TestHandleSessionMessagesByIDDoesNotSwitchCurrentSession(t *testing.T) {
 	if firstID == "" || firstTurn == 0 {
 		t.Fatalf("first session id/turn = %q/%d", firstID, firstTurn)
 	}
-	if err := a.SessionNew(); err != nil {
+	if _, err := a.NewSession("", "primary"); err != nil {
 		t.Fatalf("SessionNew: %v", err)
 	}
 	appendServerUserTurn(t, a, "second session")
@@ -1932,10 +1940,14 @@ func TestAttachCancelsTimers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	a.Init(ctx)
+	sessionID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
 
 	submitDone := make(chan error, 1)
 	go func() {
-		_, err := a.Submit(ctx, "read target.txt")
+		_, err := a.SubmitToSession(ctx, sessionID, "read target.txt")
 		submitDone <- err
 	}()
 
@@ -2134,7 +2146,8 @@ func TestExitMidTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if _, err := a.NewSession("", "primary"); err != nil {
+	sessionID, err := a.NewSession("", "primary")
+	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
 	lease, err := srv.AttachAdapter()
@@ -2142,7 +2155,7 @@ func TestExitMidTurn(t *testing.T) {
 		t.Fatalf("AttachAdapter: %v", err)
 	}
 
-	if res, err := a.Submit(ctx, "hang until owner exits"); err != nil || !res.Started {
+	if res, err := a.SubmitToSession(ctx, sessionID, "hang until owner exits"); err != nil || !res.Started {
 		t.Fatalf("Submit = %#v, %v; want started turn", res, err)
 	}
 	select {

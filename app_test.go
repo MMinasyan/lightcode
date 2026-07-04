@@ -222,7 +222,7 @@ func TestWailsSubagentFilter(t *testing.T) {
 	}
 
 	oldRoot := app.liveCurrentSessionID()
-	if err := svc.SessionNew(); err != nil {
+	if _, err := svc.NewSession("", "primary"); err != nil {
 		t.Fatalf("SessionNew: %v", err)
 	}
 	if _, err := svc.AppendUserMessage("next"); err != nil {

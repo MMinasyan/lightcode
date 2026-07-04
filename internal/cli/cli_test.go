@@ -339,7 +339,7 @@ func TestCLISubagentFilter(t *testing.T) {
 	}
 
 	oldRoot := c.liveCurrentSessionID()
-	if err := a.SessionNew(); err != nil {
+	if _, err := a.NewSession("", "primary"); err != nil {
 		t.Fatalf("SessionNew: %v", err)
 	}
 	if _, err := a.AppendUserMessage("next"); err != nil {

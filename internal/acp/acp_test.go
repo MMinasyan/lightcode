@@ -480,7 +480,7 @@ func TestHandleSessionMessagesByIDDoesNotSwitchCurrentSession(t *testing.T) {
 	if firstID == "" || firstTurn == 0 {
 		t.Fatalf("first session id/turn = %q/%d", firstID, firstTurn)
 	}
-	if err := a.SessionNew(); err != nil {
+	if _, err := a.NewSession("", "primary"); err != nil {
 		t.Fatalf("SessionNew: %v", err)
 	}
 	appendACPUserTurn(t, a, "second session")
@@ -536,7 +536,7 @@ func TestACPPromptSelectsSession(t *testing.T) {
 	if firstID == "" {
 		t.Fatal("missing first session")
 	}
-	if err := a.SessionNew(); err != nil {
+	if _, err := a.NewSession("", "primary"); err != nil {
 		t.Fatalf("SessionNew: %v", err)
 	}
 	_ = appendACPUserTurn(t, a, "second")
