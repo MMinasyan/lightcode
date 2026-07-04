@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -47,487 +48,356 @@ type adapterRPCRequest struct {
 	Params json.RawMessage `json:"params"`
 }
 
+var errBadRPCParams = errors.New("invalid params")
+
+type rpcHandler func(s *Server, raw json.RawMessage) (any, error)
+
+func rpc[P any](fn func(*Server, P) (any, error)) rpcHandler {
+	return func(s *Server, raw json.RawMessage) (any, error) {
+		var p P
+		if len(raw) == 0 {
+			raw = []byte(`{}`)
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, errBadRPCParams
+		}
+		return fn(s, p)
+	}
+}
+
+func rpc0(fn func(*Server) (any, error)) rpcHandler {
+	return func(s *Server, _ json.RawMessage) (any, error) { return fn(s) }
+}
+
+func okResult(err error) (any, error) {
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true}, nil
+}
+
+type sessionParam struct {
+	SessionID string `json:"session_id"`
+}
+type idParam struct {
+	ID string `json:"id"`
+}
+type providerParam struct {
+	ProviderID string `json:"provider_id"`
+}
+type adapterIDParam struct {
+	AdapterID string `json:"adapter_id"`
+}
+type stateParam struct {
+	State string `json:"state"`
+}
+type refParam struct {
+	Ref string `json:"ref"`
+}
+type submitParam struct {
+	SessionID string `json:"session_id"`
+	Content   string `json:"content"`
+}
+type permActionParam struct {
+	SessionID string `json:"session_id"`
+	ID        string `json:"id"`
+	Action    string `json:"action"`
+}
+type suggestSessionParam struct {
+	SessionID string `json:"session_id"`
+	Tool      string `json:"tool"`
+	Arg       string `json:"arg"`
+}
+type suggestProjectParam struct {
+	ProjectID string `json:"project_id"`
+	Tool      string `json:"tool"`
+	Arg       string `json:"arg"`
+}
+type savePermParam struct {
+	SessionID string   `json:"session_id"`
+	ID        string   `json:"id"`
+	Patterns  []string `json:"patterns"`
+}
+type modelSwitchParam struct {
+	SessionID string `json:"session_id"`
+	Ref       string `json:"ref"`
+}
+type modelHiddenParam struct {
+	Ref    string `json:"ref"`
+	Hidden bool   `json:"hidden"`
+}
+type providerHiddenParam struct {
+	ProviderID string `json:"provider_id"`
+	Hidden     bool   `json:"hidden"`
+}
+type completeModelParam struct {
+	Ref        string                `json:"ref"`
+	Completion agent.ModelCompletion `json:"completion"`
+}
+type connectProviderParam struct {
+	ProviderID string `json:"provider_id"`
+	APIKey     string `json:"api_key"`
+}
+type customProviderParam struct {
+	Request agent.CustomProviderRequest `json:"request"`
+}
+type providerConfigParam struct {
+	ProviderID string                    `json:"provider_id"`
+	Config     agent.ProviderConfigInput `json:"config"`
+}
+type providerFieldParam struct {
+	ProviderID string `json:"provider_id"`
+	Field      string `json:"field"`
+}
+type saveModelParam struct {
+	ProviderID string                 `json:"provider_id"`
+	ModelID    string                 `json:"model_id"`
+	Config     agent.ModelConfigInput `json:"config"`
+}
+type modelIDParam struct {
+	ProviderID string `json:"provider_id"`
+	ModelID    string `json:"model_id"`
+}
+type modelFieldParam struct {
+	ProviderID string `json:"provider_id"`
+	ModelID    string `json:"model_id"`
+	Field      string `json:"field"`
+}
+type runtimeConfigParam struct {
+	Settings agent.RuntimeConfigSettings `json:"settings"`
+}
+type newSessionParam struct {
+	ProjectID string `json:"project_id"`
+	AgentType string `json:"agent_type"`
+}
+type newSessionPathParam struct {
+	ProjectPath string `json:"project_path"`
+	AgentType   string `json:"agent_type"`
+}
+type turnActionParam struct {
+	SessionID      string `json:"session_id"`
+	Turn           int    `json:"turn"`
+	Action         string `json:"action"`
+	AlsoRevertCode bool   `json:"also_revert_code"`
+}
+type turnParam struct {
+	SessionID string `json:"session_id"`
+	Turn      int    `json:"turn"`
+}
+type filePathParam struct {
+	Path string `json:"path"`
+}
+type projectFileParam struct {
+	ProjectPath string `json:"project_path"`
+	Path        string `json:"path"`
+}
+type projectPathParam struct {
+	ProjectPath string `json:"project_path"`
+}
+type listPathParam struct {
+	ProjectPath string `json:"project_path"`
+	State       string `json:"state"`
+}
+
+var rpcHandlers = map[string]rpcHandler{
+	"AttachAdapter": rpc0(func(s *Server) (any, error) {
+		return s.AttachAdapter()
+	}),
+	"DetachAdapter": rpc(func(s *Server, p adapterIDParam) (any, error) {
+		if !s.DetachAdapter(p.AdapterID) {
+			return nil, fmt.Errorf("unknown adapter")
+		}
+		return map[string]any{"ok": true}, nil
+	}),
+	"CurrentWarnings": rpc0(func(s *Server) (any, error) {
+		return warningSnapshot(s.agent.CurrentWarnings()), nil
+	}),
+	"SubmitToSession": rpc(func(s *Server, p submitParam) (any, error) {
+		return s.agent.SubmitToSession(s.srvCtx, p.SessionID, p.Content)
+	}),
+	"QueueSnapshotForSession": rpc(func(s *Server, p sessionParam) (any, error) {
+		return s.agent.QueueSnapshotForSession(p.SessionID)
+	}),
+	"CancelSession": rpc(func(s *Server, p sessionParam) (any, error) {
+		return okResult(s.agent.CancelSession(p.SessionID))
+	}),
+	"CompactNowForSession": rpc(func(s *Server, p sessionParam) (any, error) {
+		return okResult(s.agent.CompactNowForSession(s.srvCtx, p.SessionID))
+	}),
+	"RespondPermissionActionForSession": rpc(func(s *Server, p permActionParam) (any, error) {
+		return okResult(s.agent.RespondPermissionActionForSession(p.SessionID, p.ID, p.Action))
+	}),
+	"PermissionSuggestForSession": rpc(func(s *Server, p suggestSessionParam) (any, error) {
+		return s.agent.PermissionSuggestForSession(p.SessionID, p.Tool, p.Arg)
+	}),
+	"PermissionSuggestForProject": rpc(func(s *Server, p suggestProjectParam) (any, error) {
+		return s.agent.PermissionSuggestForProject(p.ProjectID, p.Tool, p.Arg)
+	}),
+	"SaveProjectPermissionForSession": rpc(func(s *Server, p savePermParam) (any, error) {
+		return okResult(s.agent.SaveProjectPermissionForSession(p.SessionID, p.ID, p.Patterns))
+	}),
+	"SwitchModelForSession": rpc(func(s *Server, p modelSwitchParam) (any, error) {
+		return okResult(s.agent.SwitchModelForSession(p.SessionID, p.Ref))
+	}),
+	"CurrentModelForSession": rpc(func(s *Server, p sessionParam) (any, error) {
+		return s.agent.CurrentModelForSession(p.SessionID)
+	}),
+	"ModelList": rpc0(func(s *Server) (any, error) {
+		return s.agent.ModelList(), nil
+	}),
+	"AllModelList": rpc0(func(s *Server) (any, error) {
+		return s.agent.AllModelList(), nil
+	}),
+	"SetDefaultModel": rpc(func(s *Server, p refParam) (any, error) {
+		return okResult(s.agent.SetDefaultModel(p.Ref))
+	}),
+	"SetModelHidden": rpc(func(s *Server, p modelHiddenParam) (any, error) {
+		return okResult(s.agent.SetModelHidden(p.Ref, p.Hidden))
+	}),
+	"SetProviderHidden": rpc(func(s *Server, p providerHiddenParam) (any, error) {
+		return okResult(s.agent.SetProviderHidden(p.ProviderID, p.Hidden))
+	}),
+	"CompleteModelEntry": rpc(func(s *Server, p completeModelParam) (any, error) {
+		return okResult(s.agent.CompleteModelEntry(p.Ref, p.Completion))
+	}),
+	"ProviderList": rpc0(func(s *Server) (any, error) {
+		return s.agent.ProviderList(), nil
+	}),
+	"ConnectProvider": rpc(func(s *Server, p connectProviderParam) (any, error) {
+		return okResult(s.agent.ConnectProvider(p.ProviderID, p.APIKey))
+	}),
+	"DiscoverCustomProvider": rpc(func(s *Server, p customProviderParam) (any, error) {
+		return s.agent.DiscoverCustomProvider(p.Request)
+	}),
+	"AddCustomProvider": rpc(func(s *Server, p customProviderParam) (any, error) {
+		return okResult(s.agent.AddCustomProvider(p.Request))
+	}),
+	"DisconnectProvider": rpc(func(s *Server, p providerParam) (any, error) {
+		return okResult(s.agent.DisconnectProvider(p.ProviderID))
+	}),
+	"RemoveProvider": rpc(func(s *Server, p providerParam) (any, error) {
+		return okResult(s.agent.RemoveProvider(p.ProviderID))
+	}),
+	"GenerateAPIKeyEnvName": rpc(func(s *Server, p providerParam) (any, error) {
+		return s.agent.GenerateAPIKeyEnvName(p.ProviderID), nil
+	}),
+	"GetProviderConfig": rpc(func(s *Server, p providerParam) (any, error) {
+		return s.agent.GetProviderConfig(p.ProviderID)
+	}),
+	"DiscoverableModels": rpc(func(s *Server, p providerParam) (any, error) {
+		return s.agent.DiscoverableModels(p.ProviderID)
+	}),
+	"SetProviderConfig": rpc(func(s *Server, p providerConfigParam) (any, error) {
+		return okResult(s.agent.SetProviderConfig(p.ProviderID, p.Config))
+	}),
+	"ResetProviderField": rpc(func(s *Server, p providerFieldParam) (any, error) {
+		return okResult(s.agent.ResetProviderField(p.ProviderID, p.Field))
+	}),
+	"SaveModel": rpc(func(s *Server, p saveModelParam) (any, error) {
+		return okResult(s.agent.SaveModel(p.ProviderID, p.ModelID, p.Config))
+	}),
+	"DeleteModel": rpc(func(s *Server, p modelIDParam) (any, error) {
+		return okResult(s.agent.DeleteModel(p.ProviderID, p.ModelID))
+	}),
+	"ResetModelField": rpc(func(s *Server, p modelFieldParam) (any, error) {
+		return okResult(s.agent.ResetModelField(p.ProviderID, p.ModelID, p.Field))
+	}),
+	"Reload": rpc0(func(s *Server) (any, error) {
+		return okResult(s.agent.Reload())
+	}),
+	"GetRuntimeConfig": rpc0(func(s *Server) (any, error) {
+		return s.agent.GetRuntimeConfig(), nil
+	}),
+	"SetRuntimeConfig": rpc(func(s *Server, p runtimeConfigParam) (any, error) {
+		return okResult(s.agent.SetRuntimeConfig(p.Settings))
+	}),
+	"TokenUsageForSession": rpc(func(s *Server, p sessionParam) (any, error) {
+		return s.agent.TokenUsageForSession(p.SessionID)
+	}),
+	"SessionSummaryForSession": rpc(func(s *Server, p sessionParam) (any, error) {
+		return s.agent.SessionSummaryForSession(p.SessionID)
+	}),
+	"SessionPayloadForSession": rpc(func(s *Server, p sessionParam) (any, error) {
+		return s.agent.SessionPayloadForSession(p.SessionID)
+	}),
+	"SessionList": rpc(func(s *Server, p stateParam) (any, error) {
+		return s.agent.SessionList(p.State)
+	}),
+	"OpenSession": rpc(func(s *Server, p idParam) (any, error) {
+		return s.agent.OpenSession(p.ID)
+	}),
+	"NewSession": rpc(func(s *Server, p newSessionParam) (any, error) {
+		return s.agent.NewSession(p.ProjectID, p.AgentType)
+	}),
+	"NewSessionForProjectPath": rpc(func(s *Server, p newSessionPathParam) (any, error) {
+		return s.agent.NewSessionForProjectPath(p.ProjectPath, p.AgentType)
+	}),
+	"SessionArchive": rpc(func(s *Server, p idParam) (any, error) {
+		return okResult(s.agent.SessionArchive(p.ID))
+	}),
+	"SessionDelete": rpc(func(s *Server, p idParam) (any, error) {
+		return okResult(s.agent.SessionDelete(p.ID))
+	}),
+	"SessionMessagesFor": rpc(func(s *Server, p idParam) (any, error) {
+		return s.agent.SessionMessagesFor(p.ID)
+	}),
+	"ApplyTurnActionForSession": rpc(func(s *Server, p turnActionParam) (any, error) {
+		return s.agent.ApplyTurnActionForSession(p.SessionID, p.Turn, p.Action, p.AlsoRevertCode)
+	}),
+	"RevertCodeForSession": rpc(func(s *Server, p turnParam) (any, error) {
+		return s.agent.RevertCodeForSession(p.SessionID, p.Turn)
+	}),
+	"RevertHistoryForSession": rpc(func(s *Server, p turnParam) (any, error) {
+		return okResult(s.agent.RevertHistoryForSession(p.SessionID, p.Turn))
+	}),
+	"SnapshotListForSession": rpc(func(s *Server, p sessionParam) (any, error) {
+		return s.agent.SnapshotListForSession(p.SessionID)
+	}),
+	"ReadFileContent": rpc(func(s *Server, p filePathParam) (any, error) {
+		return s.agent.ReadFileContent(p.Path)
+	}),
+	"ReadFileContentForProjectPath": rpc(func(s *Server, p projectFileParam) (any, error) {
+		return s.agent.ReadFileContentForProjectPath(p.ProjectPath, p.Path)
+	}),
+	"ProjectName": rpc0(func(s *Server) (any, error) {
+		return s.agent.ProjectName(), nil
+	}),
+	"ProjectRoot": rpc0(func(s *Server) (any, error) {
+		return s.agent.ProjectRoot(), nil
+	}),
+	"ProjectCurrent": rpc0(func(s *Server) (any, error) {
+		return s.agent.ProjectCurrent(), nil
+	}),
+	"ProjectCurrentForPath": rpc(func(s *Server, p projectPathParam) (any, error) {
+		return s.agent.ProjectCurrentForPath(p.ProjectPath)
+	}),
+	"ProjectList": rpc0(func(s *Server) (any, error) {
+		return s.agent.ProjectList()
+	}),
+	"SessionListForProjectPath": rpc(func(s *Server, p listPathParam) (any, error) {
+		return s.agent.SessionListForProjectPath(p.ProjectPath, p.State)
+	}),
+}
+
 func (s *Server) handleAdapterRPC(w http.ResponseWriter, r *http.Request) {
 	var req adapterRPCRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	var out any
-	var err error
-	switch req.Method {
-	case "AttachAdapter":
-		out, err = s.AttachAdapter()
-	case "DetachAdapter":
-		var p struct {
-			AdapterID string `json:"adapter_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		if !s.DetachAdapter(p.AdapterID) {
-			err = fmt.Errorf("unknown adapter")
-		}
-		out = map[string]any{"ok": true}
-	case "CurrentWarnings":
-		out = warningSnapshot(s.agent.CurrentWarnings())
-	case "SubmitToSession":
-		var p struct {
-			SessionID string `json:"session_id"`
-			Content   string `json:"content"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.SubmitToSession(s.srvCtx, p.SessionID, p.Content)
-	case "QueueSnapshotForSession":
-		var p struct {
-			SessionID string `json:"session_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.QueueSnapshotForSession(p.SessionID)
-	case "CancelSession":
-		var p struct {
-			SessionID string `json:"session_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.CancelSession(p.SessionID)
-		out = map[string]any{"ok": err == nil}
-	case "CompactNowForSession":
-		var p struct {
-			SessionID string `json:"session_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.CompactNowForSession(s.srvCtx, p.SessionID)
-		out = map[string]any{"ok": err == nil}
-	case "RespondPermissionActionForSession":
-		var p struct {
-			SessionID string `json:"session_id"`
-			ID        string `json:"id"`
-			Action    string `json:"action"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.RespondPermissionActionForSession(p.SessionID, p.ID, p.Action)
-		out = map[string]any{"ok": err == nil}
-	case "PermissionSuggestForSession":
-		var p struct {
-			SessionID string `json:"session_id"`
-			Tool      string `json:"tool"`
-			Arg       string `json:"arg"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.PermissionSuggestForSession(p.SessionID, p.Tool, p.Arg)
-	case "PermissionSuggestForProject":
-		var p struct {
-			ProjectID string `json:"project_id"`
-			Tool      string `json:"tool"`
-			Arg       string `json:"arg"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.PermissionSuggestForProject(p.ProjectID, p.Tool, p.Arg)
-	case "SaveProjectPermissionForSession":
-		var p struct {
-			SessionID string   `json:"session_id"`
-			ID        string   `json:"id"`
-			Patterns  []string `json:"patterns"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.SaveProjectPermissionForSession(p.SessionID, p.ID, p.Patterns)
-		out = map[string]any{"ok": err == nil}
-	case "SwitchModelForSession":
-		var p struct {
-			SessionID string `json:"session_id"`
-			Ref       string `json:"ref"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.SwitchModelForSession(p.SessionID, p.Ref)
-		out = map[string]any{"ok": err == nil}
-	case "CurrentModelForSession":
-		var p struct {
-			SessionID string `json:"session_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.CurrentModelForSession(p.SessionID)
-	case "ModelList":
-		out = s.agent.ModelList()
-	case "AllModelList":
-		out = s.agent.AllModelList()
-	case "SetDefaultModel":
-		var p struct {
-			Ref string `json:"ref"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.SetDefaultModel(p.Ref)
-		out = map[string]any{"ok": err == nil}
-	case "SetModelHidden":
-		var p struct {
-			Ref    string `json:"ref"`
-			Hidden bool   `json:"hidden"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.SetModelHidden(p.Ref, p.Hidden)
-		out = map[string]any{"ok": err == nil}
-	case "SetProviderHidden":
-		var p struct {
-			ProviderID string `json:"provider_id"`
-			Hidden     bool   `json:"hidden"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.SetProviderHidden(p.ProviderID, p.Hidden)
-		out = map[string]any{"ok": err == nil}
-	case "CompleteModelEntry":
-		var p struct {
-			Ref        string                `json:"ref"`
-			Completion agent.ModelCompletion `json:"completion"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.CompleteModelEntry(p.Ref, p.Completion)
-		out = map[string]any{"ok": err == nil}
-	case "ProviderList":
-		out = s.agent.ProviderList()
-	case "ConnectProvider":
-		var p struct {
-			ProviderID string `json:"provider_id"`
-			APIKey     string `json:"api_key"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.ConnectProvider(p.ProviderID, p.APIKey)
-		out = map[string]any{"ok": err == nil}
-	case "DiscoverCustomProvider":
-		var p struct {
-			Request agent.CustomProviderRequest `json:"request"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.DiscoverCustomProvider(p.Request)
-	case "AddCustomProvider":
-		var p struct {
-			Request agent.CustomProviderRequest `json:"request"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.AddCustomProvider(p.Request)
-		out = map[string]any{"ok": err == nil}
-	case "DisconnectProvider":
-		var p struct {
-			ProviderID string `json:"provider_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.DisconnectProvider(p.ProviderID)
-		out = map[string]any{"ok": err == nil}
-	case "RemoveProvider":
-		var p struct {
-			ProviderID string `json:"provider_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.RemoveProvider(p.ProviderID)
-		out = map[string]any{"ok": err == nil}
-	case "GenerateAPIKeyEnvName":
-		var p struct {
-			ProviderID string `json:"provider_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out = s.agent.GenerateAPIKeyEnvName(p.ProviderID)
-	case "GetProviderConfig":
-		var p struct {
-			ProviderID string `json:"provider_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.GetProviderConfig(p.ProviderID)
-	case "DiscoverableModels":
-		var p struct {
-			ProviderID string `json:"provider_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.DiscoverableModels(p.ProviderID)
-	case "SetProviderConfig":
-		var p struct {
-			ProviderID string                    `json:"provider_id"`
-			Config     agent.ProviderConfigInput `json:"config"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.SetProviderConfig(p.ProviderID, p.Config)
-		out = map[string]any{"ok": err == nil}
-	case "ResetProviderField":
-		var p struct {
-			ProviderID string `json:"provider_id"`
-			Field      string `json:"field"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.ResetProviderField(p.ProviderID, p.Field)
-		out = map[string]any{"ok": err == nil}
-	case "SaveModel":
-		var p struct {
-			ProviderID string                 `json:"provider_id"`
-			ModelID    string                 `json:"model_id"`
-			Config     agent.ModelConfigInput `json:"config"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.SaveModel(p.ProviderID, p.ModelID, p.Config)
-		out = map[string]any{"ok": err == nil}
-	case "DeleteModel":
-		var p struct {
-			ProviderID string `json:"provider_id"`
-			ModelID    string `json:"model_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.DeleteModel(p.ProviderID, p.ModelID)
-		out = map[string]any{"ok": err == nil}
-	case "ResetModelField":
-		var p struct {
-			ProviderID string `json:"provider_id"`
-			ModelID    string `json:"model_id"`
-			Field      string `json:"field"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.ResetModelField(p.ProviderID, p.ModelID, p.Field)
-		out = map[string]any{"ok": err == nil}
-	case "Reload":
-		err = s.agent.Reload()
-		out = map[string]any{"ok": err == nil}
-	case "GetRuntimeConfig":
-		out = s.agent.GetRuntimeConfig()
-	case "SetRuntimeConfig":
-		var p struct {
-			Settings agent.RuntimeConfigSettings `json:"settings"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.SetRuntimeConfig(p.Settings)
-		out = map[string]any{"ok": err == nil}
-	case "TokenUsageForSession":
-		var p struct {
-			SessionID string `json:"session_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.TokenUsageForSession(p.SessionID)
-	case "SessionSummaryForSession":
-		var p struct {
-			SessionID string `json:"session_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.SessionSummaryForSession(p.SessionID)
-	case "SessionPayloadForSession":
-		var p struct {
-			SessionID string `json:"session_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.SessionPayloadForSession(p.SessionID)
-	case "SessionList":
-		var p struct {
-			State string `json:"state"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.SessionList(p.State)
-	case "OpenSession":
-		var p struct {
-			ID string `json:"id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.OpenSession(p.ID)
-	case "NewSession":
-		var p struct {
-			ProjectID string `json:"project_id"`
-			AgentType string `json:"agent_type"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.NewSession(p.ProjectID, p.AgentType)
-	case "NewSessionForProjectPath":
-		var p struct {
-			ProjectPath string `json:"project_path"`
-			AgentType   string `json:"agent_type"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.NewSessionForProjectPath(p.ProjectPath, p.AgentType)
-	case "SessionArchive":
-		var p struct {
-			ID string `json:"id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.SessionArchive(p.ID)
-		out = map[string]any{"ok": err == nil}
-	case "SessionDelete":
-		var p struct {
-			ID string `json:"id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.SessionDelete(p.ID)
-		out = map[string]any{"ok": err == nil}
-	case "SessionMessagesFor":
-		var p struct {
-			ID string `json:"id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.SessionMessagesFor(p.ID)
-	case "ApplyTurnActionForSession":
-		var p struct {
-			SessionID      string `json:"session_id"`
-			Turn           int    `json:"turn"`
-			Action         string `json:"action"`
-			AlsoRevertCode bool   `json:"also_revert_code"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.ApplyTurnActionForSession(p.SessionID, p.Turn, p.Action, p.AlsoRevertCode)
-	case "RevertCodeForSession":
-		var p struct {
-			SessionID string `json:"session_id"`
-			Turn      int    `json:"turn"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.RevertCodeForSession(p.SessionID, p.Turn)
-	case "RevertHistoryForSession":
-		var p struct {
-			SessionID string `json:"session_id"`
-			Turn      int    `json:"turn"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		err = s.agent.RevertHistoryForSession(p.SessionID, p.Turn)
-		out = map[string]any{"ok": err == nil}
-	case "SnapshotListForSession":
-		var p struct {
-			SessionID string `json:"session_id"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.SnapshotListForSession(p.SessionID)
-	case "ReadFileContent":
-		var p struct {
-			Path string `json:"path"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.ReadFileContent(p.Path)
-	case "ReadFileContentForProjectPath":
-		var p struct {
-			ProjectPath string `json:"project_path"`
-			Path        string `json:"path"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.ReadFileContentForProjectPath(p.ProjectPath, p.Path)
-	case "ProjectName":
-		out = s.agent.ProjectName()
-	case "ProjectRoot":
-		out = s.agent.ProjectRoot()
-	case "ProjectCurrent":
-		out = s.agent.ProjectCurrent()
-	case "ProjectCurrentForPath":
-		var p struct {
-			ProjectPath string `json:"project_path"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.ProjectCurrentForPath(p.ProjectPath)
-	case "ProjectList":
-		out, err = s.agent.ProjectList()
-	case "SessionListForProjectPath":
-		var p struct {
-			ProjectPath string `json:"project_path"`
-			State       string `json:"state"`
-		}
-		if !decodeRPCParams(w, req.Params, &p) {
-			return
-		}
-		out, err = s.agent.SessionListForProjectPath(p.ProjectPath, p.State)
-	default:
+	h, ok := rpcHandlers[req.Method]
+	if !ok {
 		jsonError(w, "unknown adapter method", http.StatusNotFound)
 		return
 	}
+	out, err := h(s, req.Params)
 	if err != nil {
+		if errors.Is(err, errBadRPCParams) {
+			jsonError(w, "invalid params", http.StatusBadRequest)
+			return
+		}
 		jsonError(w, err.Error(), http.StatusConflict)
 		return
 	}
 	jsonResp(w, http.StatusOK, out)
-}
-
-func decodeRPCParams(w http.ResponseWriter, raw json.RawMessage, dst any) bool {
-	if len(raw) == 0 {
-		raw = []byte(`{}`)
-	}
-	if err := json.Unmarshal(raw, dst); err != nil {
-		jsonError(w, "invalid params", http.StatusBadRequest)
-		return false
-	}
-	return true
 }
