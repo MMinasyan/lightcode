@@ -378,6 +378,14 @@ func (a *Agent) liveSessionLocked(id string) (*session, error) {
 	return nil, fmt.Errorf("unknown session %q", id)
 }
 
+func (a *Agent) resolveLiveSession(id string) (*session, error) {
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	unit, err := a.liveSessionLocked(id)
+	rt.mu.Unlock()
+	return unit, err
+}
+
 func setSessionProject(unit *session, proj *project.Project) {
 	if unit == nil || proj == nil {
 		return
@@ -2636,10 +2644,7 @@ func (a *Agent) PermissionSuggest(toolName, arg string) []PermissionSuggestion {
 }
 
 func (a *Agent) PermissionSuggestForSession(sessionID, toolName, arg string) ([]PermissionSuggestion, error) {
-	rt := a.ensureRuntime()
-	rt.mu.Lock()
-	unit, err := a.liveSessionLocked(sessionID)
-	rt.mu.Unlock()
+	unit, err := a.resolveLiveSession(sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -2714,9 +2719,7 @@ func (a *Agent) SwitchModel(refStr string) error {
 }
 
 func (a *Agent) SwitchModelForSession(sessionID string, refStr string) error {
-	a.ensureRuntime().mu.Lock()
-	unit, err := a.liveSessionLocked(sessionID)
-	a.ensureRuntime().mu.Unlock()
+	unit, err := a.resolveLiveSession(sessionID)
 	if err != nil {
 		return err
 	}
@@ -3335,9 +3338,7 @@ func (a *Agent) TokenUsage() TokenReport {
 }
 
 func (a *Agent) TokenUsageForSession(sessionID string) (TokenReport, error) {
-	a.ensureRuntime().mu.Lock()
-	unit, err := a.liveSessionLocked(sessionID)
-	a.ensureRuntime().mu.Unlock()
+	unit, err := a.resolveLiveSession(sessionID)
 	if err != nil {
 		return TokenReport{}, err
 	}
@@ -3354,9 +3355,7 @@ func (a *Agent) SessionCurrent() SessionSummary {
 }
 
 func (a *Agent) SessionSummaryForSession(sessionID string) (SessionSummary, error) {
-	a.ensureRuntime().mu.Lock()
-	unit, err := a.liveSessionLocked(sessionID)
-	a.ensureRuntime().mu.Unlock()
+	unit, err := a.resolveLiveSession(sessionID)
 	if err != nil {
 		return SessionSummary{}, err
 	}
@@ -4282,9 +4281,7 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 }
 
 func (a *Agent) ApplyTurnActionForSession(sessionID string, turn int, action string, alsoRevertCode bool) (TurnActionResult, error) {
-	a.ensureRuntime().mu.Lock()
-	unit, err := a.liveSessionLocked(sessionID)
-	a.ensureRuntime().mu.Unlock()
+	unit, err := a.resolveLiveSession(sessionID)
 	if err != nil {
 		return TurnActionResult{}, err
 	}
@@ -4449,9 +4446,7 @@ func (a *Agent) RevertCode(turn int) (snapshot.RevertResult, error) {
 }
 
 func (a *Agent) RevertCodeForSession(sessionID string, turn int) (snapshot.RevertResult, error) {
-	a.ensureRuntime().mu.Lock()
-	unit, err := a.liveSessionLocked(sessionID)
-	a.ensureRuntime().mu.Unlock()
+	unit, err := a.resolveLiveSession(sessionID)
 	if err != nil {
 		return snapshot.RevertResult{}, err
 	}
@@ -4481,9 +4476,7 @@ func (a *Agent) RevertHistory(turn int) error {
 }
 
 func (a *Agent) RevertHistoryForSession(sessionID string, turn int) error {
-	a.ensureRuntime().mu.Lock()
-	unit, err := a.liveSessionLocked(sessionID)
-	a.ensureRuntime().mu.Unlock()
+	unit, err := a.resolveLiveSession(sessionID)
 	if err != nil {
 		return err
 	}
@@ -4527,9 +4520,7 @@ func (a *Agent) ForkSession(turn int) error {
 }
 
 func (a *Agent) ForkSessionForSession(sessionID string, turn int) error {
-	a.ensureRuntime().mu.Lock()
-	unit, err := a.liveSessionLocked(sessionID)
-	a.ensureRuntime().mu.Unlock()
+	unit, err := a.resolveLiveSession(sessionID)
 	if err != nil {
 		return err
 	}
@@ -4590,9 +4581,7 @@ func (a *Agent) SnapshotList() ([]Snapshot, error) {
 }
 
 func (a *Agent) SnapshotListForSession(sessionID string) ([]Snapshot, error) {
-	a.ensureRuntime().mu.Lock()
-	unit, err := a.liveSessionLocked(sessionID)
-	a.ensureRuntime().mu.Unlock()
+	unit, err := a.resolveLiveSession(sessionID)
 	if err != nil {
 		return nil, err
 	}
