@@ -483,7 +483,7 @@ func (a *Agent) refreshCurrentSessionProjectLocked() {
 	}
 }
 
-func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType string, projectID string, projectName string, projectRoot string) (*session, error) {
+func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType string, projectID string, projectName string, projectRoot string) (*session, []prompt.Warning, error) {
 	if activeAgentType == "" {
 		activeAgentType = "primary"
 	}
@@ -492,7 +492,7 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 	}
 	resolved, err := a.resolvedAgentTypeForProjectLocked(activeAgentType, projectID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	rt := a.ensureRuntime()
 	var unit *session
@@ -588,7 +588,7 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 	unit.lp.SetUsageRecorder(sessionLoopHooks{agent: a, unit: unit})
 	tt.usageRecorder = sessionLoopHooks{agent: a, unit: unit}
 	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
-	return unit, nil
+	return unit, res.Warnings, nil
 }
 
 func (a *Agent) compactRunningUnitForSession(parent *session) (*session, int, error) {
@@ -748,41 +748,10 @@ func New(c Config) (*Agent, error) {
 	})
 	a.gate = gate
 
-	var projectID, projectName, memoriesDir string
-	if proj, err := resolver.Current(); err == nil && proj != nil {
-		projectID = proj.ID
-		projectName = proj.Name
-		memoriesDir = filepath.Join(resolver.Root(), proj.ID, "memories")
+	proj := &project.Project{}
+	if p, err := resolver.Current(); err == nil && p != nil {
+		proj = p
 	}
-
-	var initialUnit *session
-	initialUnitRef := func() *session {
-		if initialUnit != nil {
-			return initialUnit
-		}
-		return a.session
-	}
-	checkFunc := a.permissionCheckForProject(projectID, c.ProjectRoot)
-	askFunc := a.permissionAskForSession(initialUnitRef, projectID, true)
-	askActionFunc := a.permissionAskActionForSession(initialUnitRef, projectID, false)
-	rt.permissionPolicy = runtimePermissionPolicy{Check: checkFunc, Ask: askFunc, AskAction: askActionFunc}
-	checkPolicy := rt.permissionPolicy.checkFunc()
-	askPolicy := rt.permissionPolicy.askFunc()
-	askActionPolicy := rt.permissionPolicy.askActionFunc()
-
-	fileTracker := tool.NewFileTracker()
-
-	primaryType, _ := a.resolvedAgentTypeLocked("primary")
-	primaryWriteDir := strings.TrimSpace(primaryType.WriteDir)
-	primaryOptions := tool.CapabilityOptions{WriteDir: primaryWriteDir}
-	registry := tool.NewRegistry()
-	for _, tl := range tool.CoreToolListWithOptions(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askPolicy, primaryOptions) {
-		if primaryType.Readonly && primaryWriteDir == "" && isAgentWriteTool(tl.Name()) {
-			continue
-		}
-		registry.Register(tl)
-	}
-	registry.Register(tool.WrapWithPermission(tool.ExecutePending{}, checkPolicy, askPolicy))
 
 	procMgr := process.NewManagerAtRoot(c.Cfg.Tools.MaxBackgroundProcesses, cmdoutput.Options{
 		HomeDir:      c.Home,
@@ -843,16 +812,6 @@ func New(c Config) (*Agent, error) {
 		rt.nudgeSignalScheduler()
 	})
 
-	processes := procMgr.ForSession(func() string { return sessionIDOf(initialUnitRef()) })
-	rc := tool.NewRunCommandAtRoot(c.Cfg.Tools, c.Home, rt.workspaceRoot, processes)
-	if primaryType.Readonly {
-		registry.Register(tool.WrapWithPermission(tool.NewReadOnlyRunCommand(rc), checkPolicy, askPolicy))
-	} else {
-		registry.Register(tool.WrapWithPermission(rc, checkPolicy, askPolicy))
-	}
-	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(processes), checkPolicy, askPolicy))
-	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkPolicy, askPolicy))
-
 	embedder, err := newMemoryEmbedder(c.Home)
 	if err != nil {
 		// Embedder failure is non-fatal: semantic memory search will be disabled.
@@ -862,78 +821,21 @@ func New(c Config) (*Agent, error) {
 	memStore := memory.NewStore(embedder, resolver.Root(), c.Home)
 	a.memoryStore = memStore
 	a.memoryHooks = memStore
-	registry.Register(tool.WrapWithPermission(tool.NewSaveMemory(memStore, memoriesDir), checkPolicy, askPolicy))
-	registry.Register(tool.WrapWithPermission(tool.NewSearchMemory(memStore, projectID), checkPolicy, askPolicy))
-	registry.Register(tool.WrapWithPermission(tool.NewSearchHistory(memStore, projectID), checkPolicy, askPolicy))
 
 	lspMgr := lsp.NewManager(c.ProjectRoot, c.Home)
 	a.lspManager = lspMgr
 
-	lspClient := lsp.NewClient(lspMgr)
-	diagAdapter := &snapshotDiagAdapter{store: store}
-	lspDiag := tool.NewLSPDiagnostics(lspClient, diagAdapter)
-	registry.Register(lspDiag)
-	registry.Register(tool.NewWorkspaceSymbol(lspClient))
-
-	taggedEvts := make(chan TaggedLoopEvent, 512)
-
-	tt := newTaskTool(taskToolConfig{
-		AgentTypes:    agentTypes,
-		ParentStore:   store,
-		ParentTracker: fileTracker,
-		MaxConcurrent: c.Cfg.Subagents.MaxConcurrent,
-		TaggedEvents:  taggedEvts,
-		ModelCatalog:  modelCatalog,
-		ToolsConfig:   c.Cfg.Tools,
-		HomeDir:       c.Home,
-		WorkspaceRoot: rt.workspaceRoot,
-		ProcMgr:       procMgr,
-		MemoryStore:   memStore,
-		ProjectID:     projectID,
-		MemoriesDir:   memoriesDir,
-		LSPManager:    lspMgr,
-		Check:         checkPolicy,
-		Ask:           askPolicy,
-		AskAction:     askActionPolicy,
-		ResolveAdapt:  adaptation.Match,
-	})
-	registry.Register(tt)
-	rt.taggedEvents = taggedEvts
-
-	asm := prompt.New(c.ProjectRoot, c.Home)
-	a.assembler = asm
-	res := a.assembleSystemPromptLocked()
-	a.pendingPromptWarnings = res.Warnings
+	rt.mu.Lock()
+	unit, promptWarnings, err := a.rootRunningUnitLocked(store, "primary", proj.ID, proj.Name, c.ProjectRoot)
+	rt.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	a.session = unit
+	a.assembler = unit.assembler
+	a.pendingPromptWarnings = promptWarnings
 	a.pendingCatalogWarnings = catalogWarningsToPromptWarnings(catalogWarnings)
 	a.pendingAgentWarnings = agentWarningsToPromptWarnings(agentTypes.Warnings())
-
-	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(store, fileTracker, c.Cfg.Tools, rt.workspaceRoot, checkPolicy, askActionPolicy, primaryOptions)
-	initialUnit = newRunningUnit(runningUnitConfig{
-		Runtime:         rt,
-		ActiveAgentType: "primary",
-		ProjectID:       projectID,
-		ProjectName:     projectName,
-		ProjectRoot:     c.ProjectRoot,
-		Assembler:       asm,
-		Store:           store,
-		TaskTool:        tt,
-		PendingExecutor: pendingExecutor,
-		FileTracker:     fileTracker,
-		LSPDiagnostics:  lspDiag,
-		Loop: runningUnitLoopConfig{
-			Registry:           registry,
-			SystemPrompt:       res.Prompt,
-			Store:              store,
-			Events:             events,
-			ContextTransformer: a,
-			PendingExecutor:    pendingExecutor,
-		},
-	})
-	a.session = initialUnit
-	a.session.lp.SetContextTransformer(sessionLoopHooks{agent: a, unit: a.session})
-	a.session.lp.SetUsageRecorder(sessionLoopHooks{agent: a, unit: a.session})
-	tt.usageRecorder = sessionLoopHooks{agent: a, unit: a.session}
-	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 
 	return a, nil
 }
@@ -3592,7 +3494,7 @@ func (a *Agent) OpenSession(id string) (SessionSummary, error) {
 	if err := a.reloadLocked(); err != nil {
 		return SessionSummary{}, err
 	}
-	unit, err := a.rootRunningUnitLocked(store, "primary", proj.ID, proj.Name, proj.Path)
+	unit, _, err := a.rootRunningUnitLocked(store, "primary", proj.ID, proj.Name, proj.Path)
 	if err != nil {
 		return SessionSummary{}, err
 	}
@@ -3694,7 +3596,7 @@ func (a *Agent) NewSession(projectID string, agentType string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	unit, err := a.rootRunningUnitLocked(store, resolvedType, proj.ID, proj.Name, proj.Path)
+	unit, _, err := a.rootRunningUnitLocked(store, resolvedType, proj.ID, proj.Name, proj.Path)
 	if err != nil {
 		return "", err
 	}
