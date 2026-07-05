@@ -459,7 +459,7 @@ func (s *Server) clearPermissionStateForSession(sessionID string) {
 	s.permMu.Lock()
 	defer s.permMu.Unlock()
 	for id, timer := range s.permTimers {
-		if s.permTimerSessions[id] != sessionID {
+		if s.permTimerSessions[id] != sessionID && !permissionEventMatchesSession(s.permEvents[id], sessionID) {
 			continue
 		}
 		timer.Stop()
@@ -468,17 +468,17 @@ func (s *Server) clearPermissionStateForSession(sessionID string) {
 		delete(s.permEvents, id)
 	}
 	for id, ev := range s.permEvents {
-		if permissionEventSessionID(ev) == sessionID {
+		if permissionEventMatchesSession(ev, sessionID) {
 			delete(s.permEvents, id)
 		}
 	}
 }
 
-func permissionEventSessionID(ev agent.Event) string {
-	if ev.PermReq != nil && ev.PermReq.SessionID != "" {
-		return ev.PermReq.SessionID
+func permissionEventMatchesSession(ev agent.Event, sessionID string) bool {
+	if ev.SessionID == sessionID || ev.ParentSessionID == sessionID || ev.SubagentSessionID == sessionID {
+		return true
 	}
-	return ev.SessionID
+	return ev.PermReq != nil && ev.PermReq.SessionID == sessionID
 }
 
 // --- SSE handler ---

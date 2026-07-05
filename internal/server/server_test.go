@@ -2235,6 +2235,23 @@ func TestSubagentPermissionRequestRetainedAndReplayed(t *testing.T) {
 	srv.cancelPermissionTimer(req.ID)
 }
 
+func TestSubagentPermissionStateClearsByParentSession(t *testing.T) {
+	a := newServerTestAgent(t)
+	srv := New(a, Config{PermissionTimeout: time.Hour})
+	srv.permEvents["subagent-clear"] = agent.Event{
+		Kind:              agent.EventPermissionRequest,
+		SessionID:         "parent-session",
+		ParentSessionID:   "parent-session",
+		SubagentSessionID: "child-session",
+		PermReq:           &agent.PermissionRequest{ID: "subagent-clear", SessionID: "child-session", ToolName: "write_file"},
+	}
+	srv.permTimers["subagent-clear"] = time.AfterFunc(time.Hour, func() {})
+	srv.permTimerSessions["subagent-clear"] = "child-session"
+	srv.clearPermissionStateForSession("parent-session")
+	waitServerPermissionTimerCleared(t, srv, "subagent-clear")
+	waitServerPermissionRequestCleared(t, srv, "subagent-clear")
+}
+
 func TestTurnEndClearsRetainedPermissionState(t *testing.T) {
 	a := newServerTestAgent(t)
 	srv := New(a, Config{PermissionTimeout: time.Hour})
