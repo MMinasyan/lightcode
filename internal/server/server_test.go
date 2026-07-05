@@ -1585,6 +1585,27 @@ func TestAdapterPermissionRPCHandlersClearPendingState(t *testing.T) {
 	}
 }
 
+func TestLocalServicePermissionHandlersClearPendingState(t *testing.T) {
+	data, err := os.ReadFile("local_service.go")
+	if err != nil {
+		t.Fatalf("read local_service.go: %v", err)
+	}
+	src := string(data)
+	checks := map[string]string{
+		"func (s *LocalService) RespondPermissionActionForSession(": "s.server.cancelPermissionTimer(id)",
+		"func (s *LocalService) SaveProjectPermissionForSession(":   "s.server.cancelPermissionTimer(id)",
+		"func (s *LocalService) CancelSession(":                     "s.server.clearPermissionStateForSession(sessionID)",
+		"func (s *LocalService) SessionArchive(":                    "s.server.clearPermissionStateForSession(id)",
+		"func (s *LocalService) SessionDelete(":                     "s.server.clearPermissionStateForSession(id)",
+	}
+	for signature, want := range checks {
+		body := extractSourceFunc(t, src, signature)
+		if !strings.Contains(body, want) {
+			t.Fatalf("%s must clear server permission state after success with %q; body:\n%s", signature, want, body)
+		}
+	}
+}
+
 func TestJSONHelpers(t *testing.T) {
 	rec := httptest.NewRecorder()
 	jsonResp(rec, http.StatusAccepted, map[string]any{"ok": true})
@@ -1993,6 +2014,131 @@ func TestPermissionTimerSkipsLocalAdapter(t *testing.T) {
 	srv.permMu.Unlock()
 	if hasTimer {
 		t.Fatal("permission timer was armed despite local adapter")
+	}
+}
+
+func TestLocalAdapterPermissionRetainedForRemoteReplay(t *testing.T) {
+	a := newServerTestAgent(t)
+	srv := New(a, Config{PermissionTimeout: time.Hour})
+	lease, err := srv.AttachLocalAdapter()
+	if err != nil {
+		t.Fatalf("AttachLocalAdapter: %v", err)
+	}
+	defer srv.DetachAdapter(lease)
+
+	req := &agent.PermissionRequest{ID: "local-replay", SessionID: "session-a", ProjectID: "project-a", ToolName: "write_file"}
+	srv.handleEvent(agent.Event{Kind: agent.EventPermissionRequest, SessionID: req.SessionID, ProjectID: req.ProjectID, PermReq: req})
+	waitServerPermissionTimerCleared(t, srv, req.ID)
+
+	ch, client, unsubscribe := srv.adapter.subscribeClient("")
+	defer unsubscribe()
+	srv.replayPendingPermissionPrompts(client)
+	select {
+	case msg := <-ch:
+		if !strings.Contains(string(msg), req.ID) {
+			t.Fatalf("replayed local-owned permission event = %s, want id %q", string(msg), req.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for replayed local-owned permission event")
+	}
+	srv.cancelPermissionTimer(req.ID)
+}
+
+func TestLocalAdapterAttachStopsTimerButRetainsPermissionForRemoteReplay(t *testing.T) {
+	a := newServerTestAgent(t)
+	srv := New(a, Config{PermissionTimeout: time.Hour})
+	req := &agent.PermissionRequest{ID: "local-attach-replay", SessionID: "session-a", ProjectID: "project-a", ToolName: "write_file"}
+	srv.handleEvent(agent.Event{Kind: agent.EventPermissionRequest, SessionID: req.SessionID, ProjectID: req.ProjectID, PermReq: req})
+	waitServerPermissionTimerPending(t, srv, req.ID)
+
+	lease, err := srv.AttachLocalAdapter()
+	if err != nil {
+		t.Fatalf("AttachLocalAdapter: %v", err)
+	}
+	defer srv.DetachAdapter(lease)
+	waitServerPermissionTimerCleared(t, srv, req.ID)
+
+	ch, client, unsubscribe := srv.adapter.subscribeClient("")
+	defer unsubscribe()
+	srv.replayPendingPermissionPrompts(client)
+	select {
+	case msg := <-ch:
+		if !strings.Contains(string(msg), req.ID) {
+			t.Fatalf("replayed local-adopted permission event = %s, want id %q", string(msg), req.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for replayed local-adopted permission event")
+	}
+	srv.cancelPermissionTimer(req.ID)
+}
+
+func TestLocalServiceRespondPermissionClearsRetainedState(t *testing.T) {
+	var calls int
+	var callsMu sync.Mutex
+	releaseSecond := make(chan struct{})
+	var releaseSecondOnce sync.Once
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callsMu.Lock()
+		calls++
+		call := calls
+		callsMu.Unlock()
+		if call == 1 {
+			serverWriteSSE(w, serverToolCallChunk("local-service-cleanup-1", "test-model", "call_read", "read_file", `{"path":"target.txt"}`), serverStopChunk("local-service-cleanup-1", "test-model"), "[DONE]")
+			return
+		}
+		select {
+		case <-releaseSecond:
+		case <-r.Context().Done():
+			return
+		}
+		serverWriteSSE(w, serverStopChunk("local-service-cleanup-2", "test-model"), "[DONE]")
+	}))
+	t.Cleanup(provider.Close)
+	t.Cleanup(func() { releaseSecondOnce.Do(func() { close(releaseSecond) }) })
+
+	a := newServerTestAgentWithProvider(t, provider.URL+"/v1", false)
+	if err := os.WriteFile(filepath.Join(a.ProjectRoot(), "target.txt"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(a, Config{PermissionTimeout: time.Hour})
+	svc := NewLocalService(a, srv, nil)
+	events := make(chan agent.Event, 16)
+	a.SetEventHandler(func(ev agent.Event) {
+		srv.handleEvent(ev)
+		events <- ev
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := svc.AttachAdapter(ctx); err != nil {
+		t.Fatalf("AttachAdapter: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.DetachAdapter(context.Background()) })
+	a.Init(ctx)
+	sessionID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	submitDone := make(chan error, 1)
+	go func() {
+		_, err := a.SubmitToSession(ctx, sessionID, "read target.txt")
+		submitDone <- err
+	}()
+
+	permReq := waitServerPermissionRequest(t, events)
+	waitServerPermissionTimerCleared(t, srv, permReq.ID)
+	if err := svc.RespondPermissionActionForSession(permReq.SessionID, permReq.ID, "allow"); err != nil {
+		t.Fatalf("RespondPermissionActionForSession: %v", err)
+	}
+	waitServerPermissionRequestCleared(t, srv, permReq.ID)
+	releaseSecondOnce.Do(func() { close(releaseSecond) })
+	select {
+	case err := <-submitDone:
+		if err != nil {
+			t.Fatalf("Submit after local permission allow: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Submit stayed blocked after local permission allow")
 	}
 }
 

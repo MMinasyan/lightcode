@@ -49,7 +49,6 @@ func (s *Server) cancelAllPermissionTimers() {
 		timer.Stop()
 		delete(s.permTimers, id)
 		delete(s.permTimerSessions, id)
-		delete(s.permEvents, id)
 	}
 	s.permMu.Unlock()
 }

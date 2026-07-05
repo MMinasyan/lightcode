@@ -46,6 +46,46 @@ func (s *LocalService) DetachAdapter(context.Context) error {
 	return nil
 }
 
+func (s *LocalService) CancelSession(sessionID string) error {
+	if err := s.Agent.CancelSession(sessionID); err != nil {
+		return err
+	}
+	s.server.clearPermissionStateForSession(sessionID)
+	return nil
+}
+
+func (s *LocalService) RespondPermissionActionForSession(sessionID string, id string, action string) error {
+	if err := s.Agent.RespondPermissionActionForSession(sessionID, id, action); err != nil {
+		return err
+	}
+	s.server.cancelPermissionTimer(id)
+	return nil
+}
+
+func (s *LocalService) SaveProjectPermissionForSession(sessionID string, id string, patterns []string) error {
+	if err := s.Agent.SaveProjectPermissionForSession(sessionID, id, patterns); err != nil {
+		return err
+	}
+	s.server.cancelPermissionTimer(id)
+	return nil
+}
+
+func (s *LocalService) SessionArchive(id string) error {
+	if err := s.Agent.SessionArchive(id); err != nil {
+		return err
+	}
+	s.server.clearPermissionStateForSession(id)
+	return nil
+}
+
+func (s *LocalService) SessionDelete(id string) error {
+	if err := s.Agent.SessionDelete(id); err != nil {
+		return err
+	}
+	s.server.clearPermissionStateForSession(id)
+	return nil
+}
+
 func (s *LocalService) WaitOwner() error {
 	if s.done == nil {
 		return nil

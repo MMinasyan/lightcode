@@ -353,15 +353,16 @@ func (s *Server) startPermissionTimerForEvent(ev agent.Event) bool {
 	sessionID := req.SessionID
 	s.lifeMu.Lock()
 	localReceiver := s.hasLocalAdapterLeaseLocked()
-	if localReceiver {
-		s.lifeMu.Unlock()
-		return false
-	}
 	s.permMu.Lock()
 	if s.permEvents == nil {
 		s.permEvents = make(map[string]agent.Event)
 	}
 	s.permEvents[id] = ev
+	if localReceiver {
+		s.permMu.Unlock()
+		s.lifeMu.Unlock()
+		return false
+	}
 	timer := time.AfterFunc(s.cfg.PermissionTimeout, func() {
 		s.permMu.Lock()
 		if _, ok := s.permTimers[id]; !ok {
