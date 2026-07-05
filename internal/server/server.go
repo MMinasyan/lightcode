@@ -213,9 +213,8 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 // --- Event handler ---
 
 func (s *Server) handleEvent(ev agent.Event) {
-	adapterDelivered := 0
-	if s.adapter != nil {
-		adapterDelivered = s.adapter.broadcast("agent_event", ev)
+	if s.adapter != nil && ev.Kind != agent.EventPermissionRequest {
+		s.adapter.broadcast("agent_event", ev)
 	}
 
 	if ev.SubagentSessionID != "" {
@@ -294,7 +293,9 @@ func (s *Server) handleEvent(ev agent.Event) {
 			"batchFiles":         ev.PermReq.BatchFiles,
 			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		}
-		s.startPermissionTimerWithReceiver(ev.PermReq, adapterDelivered > 0)
+		if !s.startPermissionTimer(ev.PermReq) && s.adapter != nil {
+			s.adapter.broadcast("agent_event", ev)
+		}
 	case agent.EventCompactionStart:
 		name = "compaction_start"
 	case agent.EventCompactionEnd:
@@ -325,13 +326,13 @@ func (s *Server) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
 // startPermissionTimer arms the headless auto-deny timer unless a prompt
 // receiver already exists. Local attach is checked under lifeMu before the
 // timer record is registered so a local UI cannot miss the cancel window.
-func (s *Server) startPermissionTimer(req *agent.PermissionRequest) {
-	s.startPermissionTimerWithReceiver(req, false)
+func (s *Server) startPermissionTimer(req *agent.PermissionRequest) bool {
+	return s.startPermissionTimerWithReceiver(req)
 }
 
-func (s *Server) startPermissionTimerWithReceiver(req *agent.PermissionRequest, remoteDelivered bool) {
+func (s *Server) startPermissionTimerWithReceiver(req *agent.PermissionRequest) bool {
 	if req == nil {
-		return
+		return false
 	}
 	id := req.ID
 	sessionID := req.SessionID
@@ -339,18 +340,13 @@ func (s *Server) startPermissionTimerWithReceiver(req *agent.PermissionRequest, 
 	localReceiver := s.hasLocalAdapterLeaseLocked()
 	if localReceiver {
 		s.lifeMu.Unlock()
-		return
+		return false
 	}
 	s.permMu.Lock()
 	if s.permRequests == nil {
 		s.permRequests = make(map[string]agent.PermissionRequest)
 	}
 	s.permRequests[id] = *req
-	if remoteDelivered {
-		s.permMu.Unlock()
-		s.lifeMu.Unlock()
-		return
-	}
 	timer := time.AfterFunc(s.cfg.PermissionTimeout, func() {
 		s.permMu.Lock()
 		if _, ok := s.permTimers[id]; !ok {
@@ -375,7 +371,8 @@ func (s *Server) startPermissionTimerWithReceiver(req *agent.PermissionRequest, 
 	s.permTimerSessions[id] = sessionID
 	s.permMu.Unlock()
 	s.lifeMu.Unlock()
-	s.adoptPendingPermissionPrompts()
+	s.adoptPermissionPrompt(*req)
+	return true
 }
 
 func (s *Server) hasLocalAdapterLeaseLocked() bool {
@@ -387,22 +384,12 @@ func (s *Server) hasLocalAdapterLeaseLocked() bool {
 	return false
 }
 
-func (s *Server) adoptPendingPermissionPrompts() {
+func (s *Server) adoptPermissionPrompt(req agent.PermissionRequest) {
 	if s.adapter == nil {
 		return
 	}
-	s.permMu.Lock()
-	requests := make([]agent.PermissionRequest, 0, len(s.permRequests))
-	for _, req := range s.permRequests {
-		requests = append(requests, req)
-	}
-	s.permMu.Unlock()
-
-	for _, req := range requests {
-		req := req
-		if s.adapter.broadcast("agent_event", agent.Event{Kind: agent.EventPermissionRequest, SessionID: req.SessionID, ProjectID: req.ProjectID, PermReq: &req}) > 0 {
-			s.stopPermissionTimer(req.ID)
-		}
+	if s.adapter.broadcast("agent_event", agent.Event{Kind: agent.EventPermissionRequest, SessionID: req.SessionID, ProjectID: req.ProjectID, PermReq: &req}) > 0 {
+		s.stopPermissionTimer(req.ID)
 	}
 }
 

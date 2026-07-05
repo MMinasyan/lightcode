@@ -2185,9 +2185,9 @@ func TestAdapterStreamReplaysDeliveredPendingPermission(t *testing.T) {
 	unsubscribeFirst()
 	waitServerPermissionTimerCleared(t, srv, req.ID)
 
-	second, unsubscribeSecond := srv.adapter.subscribe("")
+	second, secondClient, unsubscribeSecond := srv.adapter.subscribeClient("")
 	defer unsubscribeSecond()
-	srv.adoptPendingPermissionPrompts()
+	srv.replayPendingPermissionPrompts(secondClient)
 	select {
 	case msg := <-second:
 		if !strings.Contains(string(msg), req.ID) {
