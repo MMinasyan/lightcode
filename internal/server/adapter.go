@@ -26,8 +26,9 @@ func (s *Server) handleAdapterSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	flusher.Flush()
 
-	ch, unsub := s.adapter.subscribe("")
+	ch, client, unsub := s.adapter.subscribeClient("")
 	defer unsub()
+	s.replayPendingPermissionPrompts(client)
 
 	for {
 		select {
@@ -219,13 +220,21 @@ var rpcHandlers = map[string]rpcHandler{
 		return s.agent.QueueSnapshotForSession(p.SessionID)
 	}),
 	"CancelSession": rpc(func(s *Server, p sessionParam) (any, error) {
-		return okResult(s.agent.CancelSession(p.SessionID))
+		if err := s.agent.CancelSession(p.SessionID); err != nil {
+			return nil, err
+		}
+		s.clearPermissionStateForSession(p.SessionID)
+		return map[string]any{"ok": true}, nil
 	}),
 	"CompactNowForSession": rpc(func(s *Server, p sessionParam) (any, error) {
 		return okResult(s.agent.CompactNowForSession(s.srvCtx, p.SessionID))
 	}),
 	"RespondPermissionActionForSession": rpc(func(s *Server, p permActionParam) (any, error) {
-		return okResult(s.agent.RespondPermissionActionForSession(p.SessionID, p.ID, p.Action))
+		if err := s.agent.RespondPermissionActionForSession(p.SessionID, p.ID, p.Action); err != nil {
+			return nil, err
+		}
+		s.cancelPermissionTimer(p.ID)
+		return map[string]any{"ok": true}, nil
 	}),
 	"PermissionSuggestForSession": rpc(func(s *Server, p suggestSessionParam) (any, error) {
 		return s.agent.PermissionSuggestForSession(p.SessionID, p.Tool, p.Arg)
@@ -234,7 +243,11 @@ var rpcHandlers = map[string]rpcHandler{
 		return s.agent.PermissionSuggestForProject(p.ProjectID, p.Tool, p.Arg)
 	}),
 	"SaveProjectPermissionForSession": rpc(func(s *Server, p savePermParam) (any, error) {
-		return okResult(s.agent.SaveProjectPermissionForSession(p.SessionID, p.ID, p.Patterns))
+		if err := s.agent.SaveProjectPermissionForSession(p.SessionID, p.ID, p.Patterns); err != nil {
+			return nil, err
+		}
+		s.cancelPermissionTimer(p.ID)
+		return map[string]any{"ok": true}, nil
 	}),
 	"SwitchModelForSession": rpc(func(s *Server, p modelSwitchParam) (any, error) {
 		return okResult(s.agent.SwitchModelForSession(p.SessionID, p.Ref))
@@ -333,10 +346,18 @@ var rpcHandlers = map[string]rpcHandler{
 		return s.agent.NewSessionForProjectPath(p.ProjectPath, p.AgentType)
 	}),
 	"SessionArchive": rpc(func(s *Server, p idParam) (any, error) {
-		return okResult(s.agent.SessionArchive(p.ID))
+		if err := s.agent.SessionArchive(p.ID); err != nil {
+			return nil, err
+		}
+		s.clearPermissionStateForSession(p.ID)
+		return map[string]any{"ok": true}, nil
 	}),
 	"SessionDelete": rpc(func(s *Server, p idParam) (any, error) {
-		return okResult(s.agent.SessionDelete(p.ID))
+		if err := s.agent.SessionDelete(p.ID); err != nil {
+			return nil, err
+		}
+		s.clearPermissionStateForSession(p.ID)
+		return map[string]any{"ok": true}, nil
 	}),
 	"SessionMessagesFor": rpc(func(s *Server, p idParam) (any, error) {
 		return s.agent.SessionMessagesFor(p.ID)

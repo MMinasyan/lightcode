@@ -40,11 +40,16 @@ type Server struct {
 	permMu            sync.Mutex
 	permTimers        map[string]*time.Timer
 	permTimerSessions map[string]string
+	permRequests      map[string]agent.PermissionRequest
 
 	lifeMu            sync.Mutex
 	adapterCount      int
-	adapterLeases     map[string]struct{}
+	adapterLeases     map[string]adapterLease
 	shutdownRequested bool
+}
+
+type adapterLease struct {
+	local bool
 }
 
 // New constructs a Server.
@@ -59,6 +64,7 @@ func New(a *agent.Agent, cfg Config) *Server {
 		adapter:           newSSEHub(),
 		permTimers:        make(map[string]*time.Timer),
 		permTimerSessions: make(map[string]string),
+		permRequests:      make(map[string]agent.PermissionRequest),
 	}
 }
 
@@ -207,8 +213,9 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 // --- Event handler ---
 
 func (s *Server) handleEvent(ev agent.Event) {
+	adapterDelivered := 0
 	if s.adapter != nil {
-		s.adapter.broadcast("agent_event", ev)
+		adapterDelivered = s.adapter.broadcast("agent_event", ev)
 	}
 
 	if ev.SubagentSessionID != "" {
@@ -262,6 +269,7 @@ func (s *Server) handleEvent(ev agent.Event) {
 		name = "turn_start"
 		data = map[string]any{"turn": ev.Turn}
 	case agent.EventTurnEnd:
+		s.clearPermissionStateForSession(ev.SessionID)
 		s.hub.broadcastForSession(ev.SessionID, "turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
 		if ev.RefreshSession {
 			s.broadcastSessionChangedForSession(ev.SessionID)
@@ -286,7 +294,7 @@ func (s *Server) handleEvent(ev agent.Event) {
 			"batchFiles":         ev.PermReq.BatchFiles,
 			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		}
-		s.startPermissionTimer(ev.PermReq)
+		s.startPermissionTimerWithReceiver(ev.PermReq, adapterDelivered > 0)
 	case agent.EventCompactionStart:
 		name = "compaction_start"
 	case agent.EventCompactionEnd:
@@ -314,33 +322,45 @@ func (s *Server) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
 	return s.agent.TokenUsage()
 }
 
-// startPermissionTimer arms the headless auto-deny timer. It holds lifeMu
-// across the lease-check and the register so an attach cannot interleave
-// between them. Lock order is lifeMu -> permMu; no path takes permMu -> lifeMu.
+// startPermissionTimer arms the headless auto-deny timer unless a prompt
+// receiver already exists. Local attach is checked under lifeMu before the
+// timer record is registered so a local UI cannot miss the cancel window.
 func (s *Server) startPermissionTimer(req *agent.PermissionRequest) {
+	s.startPermissionTimerWithReceiver(req, false)
+}
+
+func (s *Server) startPermissionTimerWithReceiver(req *agent.PermissionRequest, remoteDelivered bool) {
 	if req == nil {
-		return
-	}
-	s.lifeMu.Lock()
-	defer s.lifeMu.Unlock()
-	if len(s.adapterLeases) > 0 {
 		return
 	}
 	id := req.ID
 	sessionID := req.SessionID
+	s.lifeMu.Lock()
+	localReceiver := s.hasLocalAdapterLeaseLocked()
+	if localReceiver {
+		s.lifeMu.Unlock()
+		return
+	}
 	s.permMu.Lock()
-	defer s.permMu.Unlock()
-	timer := time.AfterFunc(s.cfg.PermissionTimeout, func() {
-		s.lifeMu.Lock()
-		hasAdapters := len(s.adapterLeases) > 0
-		s.permMu.Lock()
-		delete(s.permTimers, id)
-		delete(s.permTimerSessions, id)
+	if s.permRequests == nil {
+		s.permRequests = make(map[string]agent.PermissionRequest)
+	}
+	s.permRequests[id] = *req
+	if remoteDelivered {
 		s.permMu.Unlock()
 		s.lifeMu.Unlock()
-		if hasAdapters {
+		return
+	}
+	timer := time.AfterFunc(s.cfg.PermissionTimeout, func() {
+		s.permMu.Lock()
+		if _, ok := s.permTimers[id]; !ok {
+			s.permMu.Unlock()
 			return
 		}
+		delete(s.permTimers, id)
+		delete(s.permTimerSessions, id)
+		delete(s.permRequests, id)
+		s.permMu.Unlock()
 		slog.Warn("permission timeout, auto-denying", "id", id)
 		if sessionID != "" {
 			_ = s.agent.RespondPermissionForSession(sessionID, id, false)
@@ -353,6 +373,66 @@ func (s *Server) startPermissionTimer(req *agent.PermissionRequest) {
 	}
 	s.permTimers[id] = timer
 	s.permTimerSessions[id] = sessionID
+	s.permMu.Unlock()
+	s.lifeMu.Unlock()
+	s.adoptPendingPermissionPrompts()
+}
+
+func (s *Server) hasLocalAdapterLeaseLocked() bool {
+	for _, lease := range s.adapterLeases {
+		if lease.local {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) adoptPendingPermissionPrompts() {
+	if s.adapter == nil {
+		return
+	}
+	s.permMu.Lock()
+	requests := make([]agent.PermissionRequest, 0, len(s.permRequests))
+	for _, req := range s.permRequests {
+		requests = append(requests, req)
+	}
+	s.permMu.Unlock()
+
+	for _, req := range requests {
+		req := req
+		if s.adapter.broadcast("agent_event", agent.Event{Kind: agent.EventPermissionRequest, SessionID: req.SessionID, ProjectID: req.ProjectID, PermReq: &req}) > 0 {
+			s.stopPermissionTimer(req.ID)
+		}
+	}
+}
+
+func (s *Server) replayPendingPermissionPrompts(client *sseClient) {
+	if s.adapter == nil || client == nil {
+		return
+	}
+	s.permMu.Lock()
+	requests := make([]agent.PermissionRequest, 0, len(s.permRequests))
+	for _, req := range s.permRequests {
+		requests = append(requests, req)
+	}
+	s.permMu.Unlock()
+
+	for _, req := range requests {
+		req := req
+		if s.adapter.send(client, "agent_event", agent.Event{Kind: agent.EventPermissionRequest, SessionID: req.SessionID, ProjectID: req.ProjectID, PermReq: &req}) {
+			s.stopPermissionTimer(req.ID)
+		}
+	}
+}
+
+func (s *Server) stopPermissionTimer(id string) {
+	s.permMu.Lock()
+	defer s.permMu.Unlock()
+	if timer, ok := s.permTimers[id]; ok {
+		timer.Stop()
+		delete(s.permTimers, id)
+	}
+	delete(s.permTimerSessions, id)
 }
 
 func (s *Server) cancelPermissionTimer(id string) {
@@ -363,6 +443,30 @@ func (s *Server) cancelPermissionTimer(id string) {
 		delete(s.permTimers, id)
 	}
 	delete(s.permTimerSessions, id)
+	delete(s.permRequests, id)
+}
+
+func (s *Server) clearPermissionStateForSession(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	s.permMu.Lock()
+	defer s.permMu.Unlock()
+	for id, timer := range s.permTimers {
+		if s.permTimerSessions[id] != sessionID {
+			continue
+		}
+		timer.Stop()
+		delete(s.permTimers, id)
+		delete(s.permTimerSessions, id)
+		delete(s.permRequests, id)
+	}
+	for id, req := range s.permRequests {
+		if req.SessionID == sessionID {
+			delete(s.permRequests, id)
+		}
+	}
 }
 
 // --- SSE handler ---
@@ -506,6 +610,7 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	s.clearPermissionStateForSession(sessionID)
 	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -673,6 +778,7 @@ func (s *Server) handleSessionArchive(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.clearPermissionStateForSession(body.ID)
 	s.broadcastSessionChangedForSession(body.ID)
 	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -690,6 +796,7 @@ func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.clearPermissionStateForSession(body.ID)
 	s.broadcastSessionChangedForSession(body.ID)
 	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -897,11 +1004,16 @@ func newSSEHub() *sseHub {
 }
 
 func (h *sseHub) subscribe(sessionID string) (<-chan []byte, func()) {
+	ch, _, unsub := h.subscribeClient(sessionID)
+	return ch, unsub
+}
+
+func (h *sseHub) subscribeClient(sessionID string) (<-chan []byte, *sseClient, func()) {
 	client := &sseClient{ch: make(chan []byte, 64), sessionID: strings.TrimSpace(sessionID)}
 	h.mu.Lock()
 	h.clients = append(h.clients, client)
 	h.mu.Unlock()
-	return client.ch, func() {
+	return client.ch, client, func() {
 		h.mu.Lock()
 		for i, c := range h.clients {
 			if c == client {
@@ -919,20 +1031,40 @@ func (h *sseHub) subscribe(sessionID string) (<-chan []byte, func()) {
 	}
 }
 
-func (h *sseHub) broadcast(eventName string, data any) {
-	h.broadcastForSession("", eventName, data)
+func (h *sseHub) send(client *sseClient, eventName string, data any) bool {
+	payload, err := json.Marshal(data)
+	if err != nil || client == nil {
+		return false
+	}
+	msg := fmt.Appendf(nil, "event: %s\ndata: %s\n\n", eventName, payload)
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.closed {
+		return false
+	}
+	select {
+	case client.ch <- msg:
+		return true
+	default:
+		return false
+	}
 }
 
-func (h *sseHub) broadcastForSession(sessionID string, eventName string, data any) {
+func (h *sseHub) broadcast(eventName string, data any) int {
+	return h.broadcastForSession("", eventName, data)
+}
+
+func (h *sseHub) broadcastForSession(sessionID string, eventName string, data any) int {
 	payload, err := json.Marshal(data)
 	if err != nil {
-		return
+		return 0
 	}
 	sessionID = strings.TrimSpace(sessionID)
 	msg := fmt.Appendf(nil, "event: %s\ndata: %s\n\n", eventName, payload)
 	h.mu.Lock()
 	clients := append([]*sseClient(nil), h.clients...)
 	h.mu.Unlock()
+	delivered := 0
 	for _, client := range clients {
 		client.mu.Lock()
 		if client.closed {
@@ -945,10 +1077,12 @@ func (h *sseHub) broadcastForSession(sessionID string, eventName string, data an
 		}
 		select {
 		case client.ch <- msg:
+			delivered++
 		default:
 		}
 		client.mu.Unlock()
 	}
+	return delivered
 }
 
 // --- JSON helpers ---

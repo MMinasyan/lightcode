@@ -580,10 +580,16 @@ func TestAgentSummarizerUsesCompactAgentModel(t *testing.T) {
 	if err := a.Reload(); err != nil {
 		t.Fatalf("Reload returned error: %v", err)
 	}
-	_ = a.CurrentModel()
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
 
-	client, window := a.summarizerClientAndWindowForSession(a.session)
-	if got := client.ModelRef(); got.Provider != "test" || got.Model != "alt-model" {
+	compactUnit, window, err := a.compactRunningUnitForSession(a.session)
+	if err != nil {
+		t.Fatalf("compactRunningUnitForSession: %v", err)
+	}
+	t.Cleanup(func() { _, _ = compactUnit.store.Close() })
+	if got := compactUnit.currentRef; got.Provider != "test" || got.Model != "alt-model" {
 		t.Fatalf("summarizer model = %#v, want test/alt-model", got)
 	}
 	if window != 4096 {
@@ -600,10 +606,16 @@ func TestAgentSummarizerFallsBackToActiveModelWhenCompactModelUnavailable(t *tes
 	if err := a.Reload(); err != nil {
 		t.Fatalf("Reload returned error: %v", err)
 	}
-	_ = a.CurrentModel()
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
 
-	client, window := a.summarizerClientAndWindowForSession(a.session)
-	if got := client.ModelRef(); got.Provider != "test" || got.Model != "test-model" {
+	compactUnit, window, err := a.compactRunningUnitForSession(a.session)
+	if err != nil {
+		t.Fatalf("compactRunningUnitForSession: %v", err)
+	}
+	t.Cleanup(func() { _, _ = compactUnit.store.Close() })
+	if got := compactUnit.currentRef; got.Provider != "test" || got.Model != "test-model" {
 		t.Fatalf("summarizer fallback model = %#v, want active test/test-model", got)
 	}
 	if window != 8192 {

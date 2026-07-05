@@ -1766,25 +1766,6 @@ func activeTailReadRecords(tail []message.Message, reads []tool.ReadRecord, defa
 	return out
 }
 
-func (a *Agent) summarizerClientAndWindowForSession(unit *session) (*provider.Adapter, int) {
-	ref := coremodel.ModelRef{}
-	if unit != nil {
-		ref = unit.currentRef
-	}
-	if compactRef, _, ok := a.resolvedAgentModelLocked("compact"); ok {
-		ref = compactRef
-	}
-
-	client, model, err := newProviderClient(a.catalog, ref)
-	if err != nil && unit != nil && ref != unit.currentRef {
-		client, model, err = newProviderClient(a.catalog, unit.currentRef)
-	}
-	if err != nil {
-		return provider.NewAdapter(provider.New(nil, nil, "")), 0
-	}
-	return provider.NewAdapter(client), model.ContextWindow
-}
-
 func (a *Agent) CompactNowForSession(ctx context.Context, sessionID string) error {
 	if ctx == nil {
 		ctx = context.Background()

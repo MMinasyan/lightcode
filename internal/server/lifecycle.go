@@ -12,36 +12,44 @@ import (
 )
 
 func (s *Server) AttachAdapter() (string, error) {
+	return s.attachAdapter(false)
+}
+
+func (s *Server) AttachLocalAdapter() (string, error) {
+	return s.attachAdapter(true)
+}
+
+func (s *Server) attachAdapter(local bool) (string, error) {
 	id, err := newAdapterID()
 	if err != nil {
 		return "", err
 	}
 	s.lifeMu.Lock()
-	defer s.lifeMu.Unlock()
 	if s.shutdownRequested {
+		s.lifeMu.Unlock()
 		return "", fmt.Errorf("owner is shutting down")
 	}
 	if s.adapterLeases == nil {
-		s.adapterLeases = make(map[string]struct{})
+		s.adapterLeases = make(map[string]adapterLease)
 	}
-	s.adapterLeases[id] = struct{}{}
+	s.adapterLeases[id] = adapterLease{local: local}
 	s.adapterCount = len(s.adapterLeases)
-	// A UI now owns pending prompts — cancel headless timers while still
-	// holding lifeMu (order lifeMu -> permMu) so a concurrent
-	// startPermissionTimer cannot slip a timer in between the lease add
-	// and the cancel.
-	s.cancelAllPermissionTimersLocked()
+	s.lifeMu.Unlock()
+	if local {
+		// Local adapters receive agent events in-process; any active timer now has
+		// a prompt owner. Remote adapters adopt only after their SSE stream exists.
+		s.cancelAllPermissionTimers()
+	}
 	return id, nil
 }
 
-// cancelAllPermissionTimersLocked stops and clears every pending permission
-// timer. Caller must hold lifeMu; takes permMu (order lifeMu -> permMu).
-func (s *Server) cancelAllPermissionTimersLocked() {
+func (s *Server) cancelAllPermissionTimers() {
 	s.permMu.Lock()
 	for id, timer := range s.permTimers {
 		timer.Stop()
 		delete(s.permTimers, id)
 		delete(s.permTimerSessions, id)
+		delete(s.permRequests, id)
 	}
 	s.permMu.Unlock()
 }

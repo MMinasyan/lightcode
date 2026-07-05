@@ -20,7 +20,7 @@ func NewLocalService(a *agent.Agent, srv *Server, done <-chan error) *LocalServi
 }
 
 func (s *LocalService) AttachAdapter(context.Context) error {
-	id, err := s.server.AttachAdapter()
+	id, err := s.server.AttachLocalAdapter()
 	if err != nil {
 		return err
 	}

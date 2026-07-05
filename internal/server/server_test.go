@@ -1336,12 +1336,7 @@ func TestHandlePermissionSaveFailureKeepsTimerAndPendingRequest(t *testing.T) {
 	t.Cleanup(provider.Close)
 
 	a := newServerTestAgentWithModel(t, provider.URL+"/v1", false, "gpt-5")
-	s := &Server{
-		agent:      a,
-		hub:        newSSEHub(),
-		permTimers: make(map[string]*time.Timer),
-		cfg:        Config{PermissionTimeout: time.Hour},
-	}
+	s := New(a, Config{PermissionTimeout: time.Hour})
 	events := make(chan agent.Event, 16)
 	a.SetEventHandler(func(ev agent.Event) {
 		s.handleEvent(ev)
@@ -1412,12 +1407,7 @@ func TestHandlePermissionResponseFailureKeepsTimerAndPendingRequest(t *testing.T
 	t.Cleanup(provider.Close)
 
 	a := newServerTestAgentWithProvider(t, provider.URL+"/v1", false)
-	s := &Server{
-		agent:      a,
-		hub:        newSSEHub(),
-		permTimers: make(map[string]*time.Timer),
-		cfg:        Config{PermissionTimeout: time.Hour},
-	}
+	s := New(a, Config{PermissionTimeout: time.Hour})
 	events := make(chan agent.Event, 16)
 	a.SetEventHandler(func(ev agent.Event) {
 		s.handleEvent(ev)
@@ -1545,6 +1535,56 @@ func TestHTTPHandlersUseSharedTurnActionContract(t *testing.T) {
 	}
 }
 
+func TestPermissionTimerReceiverDecisionUnderLifecycleLock(t *testing.T) {
+	src := mustReadServerSource(t)
+	handler := extractSourceFunc(t, src, "func (s *Server) handleEvent(")
+	if strings.Contains(handler, "hasLocalAdapterLease") || strings.Contains(handler, "localReceiver") {
+		t.Fatalf("handleEvent must not precompute local adapter liveness before timer registration; body:\n%s", handler)
+	}
+	helper := extractSourceFunc(t, src, "func (s *Server) startPermissionTimerWithReceiver(")
+	lockIndex := strings.Index(helper, "s.lifeMu.Lock()")
+	localIndex := strings.Index(helper, "s.hasLocalAdapterLeaseLocked()")
+	if lockIndex < 0 || localIndex < 0 || localIndex < lockIndex {
+		t.Fatalf("startPermissionTimerWithReceiver must decide local adapter liveness under lifeMu; body:\n%s", helper)
+	}
+}
+
+func TestAdapterPermissionRPCHandlersClearPendingState(t *testing.T) {
+	data, err := os.ReadFile("adapter.go")
+	if err != nil {
+		t.Fatalf("read adapter.go: %v", err)
+	}
+	src := string(data)
+	for _, method := range []string{"RespondPermissionActionForSession", "SaveProjectPermissionForSession"} {
+		start := strings.Index(src, `"`+method+`":`)
+		if start < 0 {
+			t.Fatalf("missing adapter RPC handler %q", method)
+		}
+		end := strings.Index(src[start:], "\n\t}),")
+		if end < 0 {
+			t.Fatalf("unterminated adapter RPC handler %q", method)
+		}
+		body := src[start : start+end]
+		if !strings.Contains(body, "s.cancelPermissionTimer(p.ID)") {
+			t.Fatalf("adapter RPC handler %q must clear server permission state after success; body:\n%s", method, body)
+		}
+	}
+	for _, method := range []string{"CancelSession", "SessionArchive", "SessionDelete"} {
+		start := strings.Index(src, `"`+method+`":`)
+		if start < 0 {
+			t.Fatalf("missing adapter RPC handler %q", method)
+		}
+		end := strings.Index(src[start:], "\n\t}),")
+		if end < 0 {
+			t.Fatalf("unterminated adapter RPC handler %q", method)
+		}
+		body := src[start : start+end]
+		if !strings.Contains(body, "s.clearPermissionStateForSession(") {
+			t.Fatalf("adapter RPC handler %q must clear server permission state after success; body:\n%s", method, body)
+		}
+	}
+}
+
 func TestJSONHelpers(t *testing.T) {
 	rec := httptest.NewRecorder()
 	jsonResp(rec, http.StatusAccepted, map[string]any{"ok": true})
@@ -1662,6 +1702,51 @@ func assertServerPermissionTimerPending(t *testing.T, s *Server, id string) {
 	if !ok {
 		t.Fatal("permission timer was cancelled after rejected response")
 	}
+}
+
+func waitServerPermissionTimerPending(t *testing.T, s *Server, id string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		s.permMu.Lock()
+		_, ok := s.permTimers[id]
+		s.permMu.Unlock()
+		if ok {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("permission timer %q was not registered", id)
+}
+
+func waitServerPermissionTimerCleared(t *testing.T, s *Server, id string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		s.permMu.Lock()
+		_, ok := s.permTimers[id]
+		s.permMu.Unlock()
+		if !ok {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("permission timer %q was not cleared", id)
+}
+
+func waitServerPermissionRequestCleared(t *testing.T, s *Server, id string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		s.permMu.Lock()
+		_, ok := s.permRequests[id]
+		s.permMu.Unlock()
+		if !ok {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("permission request %q was not cleared", id)
 }
 
 func waitOwnerDone(t *testing.T, done <-chan error) {
@@ -1864,7 +1949,7 @@ func extractSourceFunc(t *testing.T, src, signature string) string {
 	return ""
 }
 
-func TestPermissionTimerHeadlessOnly(t *testing.T) {
+func TestPermissionTimerSkipsLocalAdapter(t *testing.T) {
 	home := t.TempDir()
 	a := newServerTestAgent(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1881,9 +1966,9 @@ func TestPermissionTimerHeadlessOnly(t *testing.T) {
 		<-done
 	}()
 
-	lease, err := srv.AttachAdapter()
+	lease, err := srv.AttachLocalAdapter()
 	if err != nil {
-		t.Fatalf("AttachAdapter: %v", err)
+		t.Fatalf("AttachLocalAdapter: %v", err)
 	}
 	defer srv.DetachAdapter(lease)
 
@@ -1891,7 +1976,7 @@ func TestPermissionTimerHeadlessOnly(t *testing.T) {
 		t.Fatalf("NewSession: %v", err)
 	}
 
-	// With an adapter attached, the timer should not arm.
+	// With a local in-process adapter attached, the timer should not arm.
 	// Simulate a permission request by calling startPermissionTimer directly.
 	srv.startPermissionTimer(&agent.PermissionRequest{
 		ID:        "test-perm-headless",
@@ -1907,11 +1992,11 @@ func TestPermissionTimerHeadlessOnly(t *testing.T) {
 	_, hasTimer := srv.permTimers["test-perm-headless"]
 	srv.permMu.Unlock()
 	if hasTimer {
-		t.Fatal("permission timer was armed despite attached adapter")
+		t.Fatal("permission timer was armed despite local adapter")
 	}
 }
 
-func TestAttachCancelsTimers(t *testing.T) {
+func TestRemoteAttachWithoutStreamKeepsPermissionTimer(t *testing.T) {
 	var calls int
 	var callsMu sync.Mutex
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1931,7 +2016,7 @@ func TestAttachCancelsTimers(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(a.ProjectRoot(), "target.txt"), []byte("ok"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(a, Config{PermissionTimeout: 500 * time.Millisecond})
+	srv := New(a, Config{PermissionTimeout: time.Hour})
 	events := make(chan agent.Event, 16)
 	a.SetEventHandler(func(ev agent.Event) {
 		srv.handleEvent(ev)
@@ -1952,21 +2037,16 @@ func TestAttachCancelsTimers(t *testing.T) {
 	}()
 
 	permReq := waitServerPermissionRequest(t, events)
-	assertServerPermissionTimerPending(t, srv, permReq.ID)
+	waitServerPermissionTimerPending(t, srv, permReq.ID)
 	lease, err := srv.AttachAdapter()
 	if err != nil {
 		t.Fatalf("AttachAdapter: %v", err)
 	}
 	t.Cleanup(func() { srv.DetachAdapter(lease) })
-	time.Sleep(700 * time.Millisecond)
-	srv.permMu.Lock()
-	_, timerStillPending := srv.permTimers[permReq.ID]
-	srv.permMu.Unlock()
-	if timerStillPending {
-		t.Fatal("permission timer remained after adapter attach")
-	}
+	waitServerPermissionTimerPending(t, srv, permReq.ID)
+	srv.cancelPermissionTimer(permReq.ID)
 	if err := a.RespondPermissionForSession(permReq.SessionID, permReq.ID, true); err != nil {
-		t.Fatalf("RespondPermission after attach cancelled timer: %v", err)
+		t.Fatalf("RespondPermission after remote attach: %v", err)
 	}
 	select {
 	case err := <-submitDone:
@@ -1979,67 +2059,182 @@ func TestAttachCancelsTimers(t *testing.T) {
 	waitServerEventKind(t, events, agent.EventTurnEnd)
 }
 
-// TestTimerAttachRace exercises the concurrent arm/attach path. The bug is
-// logical atomicity (a timer registered after attach's cancel slipped through
-// the non-atomic check→register gap), not a data race, so -race will not catch
-// it on pre-fix code. This stress test runs arm and attach/detach loops
-// concurrently and then asserts no timer survives a final attach. It is a
-// regression pin, not a deterministic fail-before — the interleaving window is
-// sub-µs and cannot be forced without a production test seam.
-func TestTimerAttachRace(t *testing.T) {
+func TestAdapterStreamAdoptsPendingPermissionPrompt(t *testing.T) {
+	var calls int
+	var callsMu sync.Mutex
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callsMu.Lock()
+		calls++
+		call := calls
+		callsMu.Unlock()
+		if call == 1 {
+			serverWriteSSE(w, serverToolCallChunk("stream-adopt-1", "test-model", "call_read", "read_file", `{"path":"target.txt"}`), serverStopChunk("stream-adopt-1", "test-model"), "[DONE]")
+			return
+		}
+		serverWriteSSE(w, serverStopChunk("stream-adopt-2", "test-model"), "[DONE]")
+	}))
+	t.Cleanup(provider.Close)
+
+	home := t.TempDir()
+	a := newServerTestAgentWithProvider(t, provider.URL+"/v1", false)
+	if err := os.WriteFile(filepath.Join(a.ProjectRoot(), "target.txt"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(a, Config{PermissionTimeout: time.Hour})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	lf, done, err := srv.Start(ctx, home)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		srv.RequestShutdown()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("server shutdown: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("server did not shut down")
+		}
+	})
+
+	events := make(chan agent.Event, 16)
+	unsubscribe := a.SubscribeEvents(func(ev agent.Event) { events <- ev })
+	t.Cleanup(unsubscribe)
+	sessionID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	submitDone := make(chan error, 1)
+	go func() {
+		_, err := a.SubmitToSession(ctx, sessionID, "read target.txt")
+		submitDone <- err
+	}()
+
+	permReq := waitServerPermissionRequest(t, events)
+	waitServerPermissionTimerPending(t, srv, permReq.ID)
+
+	client := NewClient(lf, a.ProjectRoot())
+	if err := client.AttachAdapter(ctx); err != nil {
+		t.Fatalf("AttachAdapter: %v", err)
+	}
+	t.Cleanup(func() { _ = client.DetachAdapter(context.Background()) })
+	waitServerPermissionTimerPending(t, srv, permReq.ID)
+
+	adapterEvents := make(chan agent.Event, 16)
+	client.SetEventHandler(func(ev agent.Event) { adapterEvents <- ev })
+	client.Init(ctx)
+	replayed := waitServerPermissionRequest(t, adapterEvents)
+	if replayed.ID != permReq.ID || replayed.SessionID != permReq.SessionID {
+		t.Fatalf("replayed permission = %+v, want id %q session %q", replayed, permReq.ID, permReq.SessionID)
+	}
+	waitServerPermissionTimerCleared(t, srv, permReq.ID)
+	if err := client.RespondPermissionActionForSession(replayed.SessionID, replayed.ID, "allow"); err != nil {
+		t.Fatalf("RespondPermissionActionForSession: %v", err)
+	}
+	waitServerPermissionRequestCleared(t, srv, permReq.ID)
+	select {
+	case err := <-submitDone:
+		if err != nil {
+			t.Fatalf("Submit after permission allow: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Submit stayed blocked after adapter stream adopted permission prompt")
+	}
+	waitServerEventKind(t, events, agent.EventTurnEnd)
+}
+
+func TestAdapterStreamAdoptsPermissionRegisteredAfterSubscribe(t *testing.T) {
 	a := newServerTestAgent(t)
-	srv := New(a, Config{PermissionTimeout: time.Hour}) // long: we test survival, not firing
+	srv := New(a, Config{PermissionTimeout: time.Hour})
+	ch, unsubscribe := srv.adapter.subscribe("")
+	defer unsubscribe()
 
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		for i := 0; ; i++ {
-			select {
-			case <-stop:
-				return
-			default:
-				srv.startPermissionTimer(&agent.PermissionRequest{
-					ID:       fmt.Sprintf("race-%d", i),
-					ToolName: "write_file",
-				})
-			}
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				lease, err := srv.AttachAdapter()
-				if err != nil {
-					return
-				}
-				srv.DetachAdapter(lease)
-			}
-		}
-	}()
-	time.Sleep(50 * time.Millisecond)
-	close(stop)
-	wg.Wait()
+	req := &agent.PermissionRequest{ID: "registered-after-subscribe", SessionID: "session-a", ProjectID: "project-a", ToolName: "write_file"}
+	srv.startPermissionTimer(req)
 
-	// A final attach must find zero surviving timers: under the fix, every
-	// arm that passed the lease-check also registered under the same lifeMu
-	// hold, so the cancel in attach reached it.
+	select {
+	case msg := <-ch:
+		if !strings.Contains(string(msg), req.ID) {
+			t.Fatalf("adopted permission event = %s, want id %q", string(msg), req.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for adopted permission event")
+	}
+	waitServerPermissionTimerCleared(t, srv, req.ID)
+}
+
+func TestAdapterStreamReplaysDeliveredPendingPermission(t *testing.T) {
+	a := newServerTestAgent(t)
+	srv := New(a, Config{PermissionTimeout: time.Hour})
+	first, unsubscribeFirst := srv.adapter.subscribe("")
+
+	req := &agent.PermissionRequest{ID: "replay-delivered", SessionID: "session-a", ProjectID: "project-a", ToolName: "write_file"}
+	srv.handleEvent(agent.Event{Kind: agent.EventPermissionRequest, SessionID: req.SessionID, ProjectID: req.ProjectID, PermReq: req})
+
+	select {
+	case msg := <-first:
+		if !strings.Contains(string(msg), req.ID) {
+			t.Fatalf("first permission event = %s, want id %q", string(msg), req.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first permission event")
+	}
+	unsubscribeFirst()
+	waitServerPermissionTimerCleared(t, srv, req.ID)
+
+	second, unsubscribeSecond := srv.adapter.subscribe("")
+	defer unsubscribeSecond()
+	srv.adoptPendingPermissionPrompts()
+	select {
+	case msg := <-second:
+		if !strings.Contains(string(msg), req.ID) {
+			t.Fatalf("replayed permission event = %s, want id %q", string(msg), req.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for replayed permission event")
+	}
+	srv.cancelPermissionTimer(req.ID)
+}
+
+func TestTurnEndClearsRetainedPermissionState(t *testing.T) {
+	a := newServerTestAgent(t)
+	srv := New(a, Config{PermissionTimeout: time.Hour})
+	srv.permRequests["turn-end"] = agent.PermissionRequest{ID: "turn-end", SessionID: "session-a", ToolName: "write_file"}
+	srv.handleEvent(agent.Event{Kind: agent.EventTurnEnd, SessionID: "session-a"})
+	waitServerPermissionRequestCleared(t, srv, "turn-end")
+}
+
+func TestHandleCancelClearsRetainedPermissionState(t *testing.T) {
+	a := newServerTestAgent(t)
+	sessionID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	srv := New(a, Config{PermissionTimeout: time.Hour})
+	srv.permRequests["cancel"] = agent.PermissionRequest{ID: "cancel", SessionID: sessionID, ToolName: "write_file"}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/cancel?session_id="+sessionID, nil)
+	srv.handleCancel(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cancel status = %d, body = %s; want 200", rec.Code, rec.Body.String())
+	}
+	waitServerPermissionRequestCleared(t, srv, "cancel")
+}
+
+func TestRemoteLeaseBeforePromptStillArmsTimerWithoutStream(t *testing.T) {
+	a := newServerTestAgent(t)
+	srv := New(a, Config{PermissionTimeout: time.Hour})
 	lease, err := srv.AttachAdapter()
 	if err != nil {
-		t.Fatalf("final AttachAdapter: %v", err)
+		t.Fatalf("AttachAdapter: %v", err)
 	}
 	defer srv.DetachAdapter(lease)
-	srv.permMu.Lock()
-	remaining := len(srv.permTimers)
-	srv.permMu.Unlock()
-	if remaining > 0 {
-		t.Fatalf("%d permission timers survived an adapter attach", remaining)
-	}
+	srv.startPermissionTimer(&agent.PermissionRequest{ID: "remote-no-stream", ToolName: "write_file"})
+	assertServerPermissionTimerPending(t, srv, "remote-no-stream")
+	srv.cancelPermissionTimer("remote-no-stream")
 }
 
 func TestExitOnLastDetach(t *testing.T) {

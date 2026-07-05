@@ -161,9 +161,11 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 
 func (m *Manager) StartForSession(sessionID string, command string, timeoutSec int) (string, error) {
 	sessionID = strings.TrimSpace(sessionID)
-	if m.maxProcs > 0 {
-		running := 0
-		m.mu.Lock()
+	m.mu.Lock()
+	maxProcs := m.maxProcs
+	outputOptions := m.outputOptions
+	running := 0
+	if maxProcs > 0 {
 		for _, cs := range m.procs {
 			if cs.SessionID != sessionID {
 				continue
@@ -174,10 +176,10 @@ func (m *Manager) StartForSession(sessionID string, command string, timeoutSec i
 			}
 			cs.mu.Unlock()
 		}
-		m.mu.Unlock()
-		if running >= m.maxProcs {
-			return "", fmt.Errorf("process: background process limit reached (%d/%d). Kill existing processes or wait for them to exit", running, m.maxProcs)
-		}
+	}
+	m.mu.Unlock()
+	if maxProcs > 0 && running >= maxProcs {
+		return "", fmt.Errorf("process: background process limit reached (%d/%d). Kill existing processes or wait for them to exit", running, maxProcs)
 	}
 
 	id, err := newProcessID()
@@ -189,7 +191,7 @@ func (m *Manager) StartForSession(sessionID string, command string, timeoutSec i
 		cmd.Dir = m.workspaceRoot
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	capture := cmdoutput.NewCapture(m.outputOptions)
+	capture := cmdoutput.NewCapture(outputOptions)
 	cmd.Stdout = capture.Stdout()
 	cmd.Stderr = capture.Stderr()
 
