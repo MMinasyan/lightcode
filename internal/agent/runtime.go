@@ -60,21 +60,13 @@ type runtime struct {
 	queueWake    chan struct{}
 	signalSink   agentSignalSink
 
-	eventMu sync.RWMutex
-	onEvent func(Event)
+	eventMu             sync.RWMutex
+	onEvent             func(Event)
+	eventSubscribers    map[int]func(Event)
+	nextEventSubscriber int
 
-	mu         sync.Mutex
-	busy       bool
-	turnCancel context.CancelFunc
-	turnCtx    context.Context
-
-	queue         []QueuedItem
-	queueVersion  int
-	queueSeq      int
-	transitioning bool
-	seenSessions  map[string]bool
-
-	sessionRefreshAfterTurn bool
+	initOnce sync.Once
+	mu       sync.Mutex
 }
 
 func newRuntime(a *Agent, opts runtimeOptions) *runtime {
@@ -93,7 +85,14 @@ func newRuntime(a *Agent, opts runtimeOptions) *runtime {
 
 func (a *Agent) ensureRuntime() *runtime {
 	if a.rt == nil {
-		a.rt = newRuntime(a, runtimeOptions{})
+		if a.session != nil && a.session.rt != nil {
+			a.rt = a.session.rt
+		} else {
+			a.rt = newRuntime(a, runtimeOptions{})
+		}
+		if a.session == nil {
+			a.session = &session{rt: a.rt}
+		}
 	}
 	if a.rt.agent == nil {
 		a.rt.agent = a
@@ -114,4 +113,14 @@ func (a *Agent) ensureRuntime() *runtime {
 		a.rt.signalSink = loopSignalSink{agent: a}
 	}
 	return a.rt
+}
+
+func (rt *runtime) sessionLocked() *session {
+	if rt == nil || rt.agent == nil {
+		return nil
+	}
+	if rt.agent.session == nil {
+		rt.agent.session = &session{}
+	}
+	return rt.agent.session
 }

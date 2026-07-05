@@ -8,21 +8,21 @@ import (
 	"syscall"
 )
 
-// LockFile is written to disk so clients can discover a running daemon.
+// LockFile is written to disk so clients can discover the running owner.
 type LockFile struct {
 	Port  int    `json:"port"`
 	Token string `json:"token"`
 	PID   int    `json:"pid"`
 }
 
-// Path returns the lockfile path for the given project.
-func Path(home, projectID string) string {
-	return filepath.Join(home, ".lightcode", "daemon", projectID+".lock")
+// Path returns the owner lockfile path.
+func Path(home string) string {
+	return filepath.Join(home, ".lightcode", "owner.lock")
 }
 
 // Write persists a lockfile to disk, creating parent dirs as needed.
-func Write(home, projectID string, lf LockFile) error {
-	p := Path(home, projectID)
+func Write(home string, lf LockFile) error {
+	p := Path(home)
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return fmt.Errorf("lockfile: mkdir: %w", err)
 	}
@@ -30,12 +30,21 @@ func Write(home, projectID string, lf LockFile) error {
 	if err != nil {
 		return fmt.Errorf("lockfile: marshal: %w", err)
 	}
-	return os.WriteFile(p, data, 0o600)
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		_ = os.Remove(p)
+		return err
+	}
+	return nil
 }
 
 // Read loads a lockfile from disk.
-func Read(home, projectID string) (LockFile, error) {
-	data, err := os.ReadFile(Path(home, projectID))
+func Read(home string) (LockFile, error) {
+	data, err := os.ReadFile(Path(home))
 	if err != nil {
 		return LockFile{}, err
 	}
@@ -47,8 +56,8 @@ func Read(home, projectID string) (LockFile, error) {
 }
 
 // Remove deletes the lockfile from disk.
-func Remove(home, projectID string) error {
-	return os.Remove(Path(home, projectID))
+func Remove(home string) error {
+	return os.Remove(Path(home))
 }
 
 // IsStale checks whether the PID in the lockfile is still alive.

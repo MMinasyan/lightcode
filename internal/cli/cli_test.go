@@ -19,7 +19,11 @@ import (
 
 func TestCmdClearClearsTerminalRedrawsHeaderAndKeepsMessages(t *testing.T) {
 	a, projectName := newTestAgent(t)
+	if _, err := a.AppendUserMessage("seed"); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
 	c := New(a)
+	c.setCurrentSessionID(a.SessionCurrent().ID)
 	c.refreshState()
 
 	var out bytes.Buffer
@@ -153,6 +157,7 @@ func TestActiveCompactionRefreshDeferredUntilTurnEnd(t *testing.T) {
 	}
 
 	c := New(a)
+	c.setCurrentSessionID(a.SessionCurrent().ID)
 	var out bytes.Buffer
 	c.out = &out
 	c.messages = []displayEntry{{typ: "system", content: "System: live signal before compaction"}}
@@ -186,6 +191,170 @@ func TestActiveCompactionRefreshDeferredUntilTurnEnd(t *testing.T) {
 	}
 }
 
+func TestCLIStaleCurrent(t *testing.T) {
+	a, _ := newTestAgent(t)
+	if _, err := a.AppendUserMessage("gone"); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	id := a.SessionCurrent().ID
+	if id == "" {
+		t.Fatal("missing session id")
+	}
+	if err := a.SessionDelete(id); err != nil {
+		t.Fatalf("SessionDelete: %v", err)
+	}
+
+	c := New(a)
+	c.setCurrentSessionID(id)
+	if got := c.currentSessionSummary().ID; got != "" {
+		t.Fatalf("stale current id = %q, want empty", got)
+	}
+	c.setCurrentSessionID(id)
+	if got := c.sessionMessages(); len(got) != 0 {
+		t.Fatalf("stale messages = %#v, want empty", got)
+	}
+}
+
+func TestCLIClearRemovedCurrent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*agent.Agent, string) error
+	}{
+		{name: "archive", run: func(a *agent.Agent, id string) error { return a.SessionArchive(id) }},
+		{name: "delete", run: func(a *agent.Agent, id string) error { return a.SessionDelete(id) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _ := newTestAgent(t)
+			firstID, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("NewSession first: %v", err)
+			}
+			if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
+				t.Fatalf("append first: %v", err)
+			}
+			secondID, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("NewSession second: %v", err)
+			}
+			if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+				t.Fatalf("append second: %v", err)
+			}
+
+			c := New(a)
+			var out bytes.Buffer
+			c.out = &out
+			c.setCurrentSessionID(firstID)
+			if err := tc.run(a, firstID); err != nil {
+				t.Fatalf("%s first: %v", tc.name, err)
+			}
+			c.clearRemovedCurrent(firstID)
+			if got := c.currentSessionSummary().ID; got != "" {
+				t.Fatalf("current after %s = %q, want empty", tc.name, got)
+			}
+			out.Reset()
+			c.cmdCompact()
+			if !strings.Contains(out.String(), "no current session") {
+				t.Fatalf("%s compact output = %q, want no current session", tc.name, out.String())
+			}
+			if c.acceptsEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: firstID, Result: "skip"}) {
+				t.Fatalf("%s left old session event visible", tc.name)
+			}
+			if current := a.SessionCurrent().ID; current != secondID {
+				t.Fatalf("backend current after %s = %q, want %q", tc.name, current, secondID)
+			}
+		})
+	}
+}
+
+func TestCLINewSetsCurrent(t *testing.T) {
+	a, _ := newTestAgent(t)
+	c := New(a)
+	var out bytes.Buffer
+	c.out = &out
+
+	c.dispatchCommand("/new")
+	if got := c.currentSessionSummary().ID; got == "" {
+		t.Fatal("new session did not set current")
+	}
+}
+
+func TestCLISwitchKeepsCurrent(t *testing.T) {
+	a, _ := newTestAgent(t)
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
+		t.Fatalf("append first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+		t.Fatalf("append second: %v", err)
+	}
+
+	c := New(a)
+	var out bytes.Buffer
+	c.out = &out
+	c.setCurrentSessionID(secondID)
+	c.cmdResume([]string{"/resume", firstID})
+	if got := c.currentSessionSummary().ID; got != firstID {
+		t.Fatalf("cli current = %q, want %q", got, firstID)
+	}
+	if got := a.SessionCurrent().ID; got != secondID {
+		t.Fatalf("backend current = %q, want %q", got, secondID)
+	}
+	if got := cliUserContents(c.sessionMessages()); !equalStringSlices(got, []string{"first"}) {
+		t.Fatalf("cli messages = %#v, want first", got)
+	}
+}
+
+func TestCLISubagentFilter(t *testing.T) {
+	a, _ := newTestAgent(t)
+	if _, err := a.AppendUserMessage("root"); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	root := a.SessionCurrent().ID
+	if root == "" {
+		t.Fatal("missing root session")
+	}
+	c := New(a)
+
+	c.setCurrentSessionID("")
+	if c.acceptsEvent(agent.Event{Kind: agent.EventSubagentStart, SessionID: "child", SubagentSessionID: "child", ParentSessionID: root}) {
+		t.Fatal("empty current accepted child event")
+	}
+
+	c.setCurrentSessionID(root)
+	if c.acceptsEvent(agent.Event{Kind: agent.EventSubagentStart, SessionID: "child", SubagentSessionID: "child", ParentSessionID: "other"}) {
+		t.Fatal("wrong parent accepted child event")
+	}
+	if !c.acceptsEvent(agent.Event{Kind: agent.EventSubagentStart, SessionID: "child", SubagentSessionID: "child", ParentSessionID: root}) {
+		t.Fatal("matching parent child start rejected")
+	}
+	if !c.acceptsEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "child", SubagentSessionID: "child", Result: "ok"}) {
+		t.Fatal("subscribed child event rejected")
+	}
+
+	oldRoot := c.liveCurrentSessionID()
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("SessionNew: %v", err)
+	}
+	if _, err := a.AppendUserMessage("next"); err != nil {
+		t.Fatalf("seed next session: %v", err)
+	}
+	next := a.SessionCurrent().ID
+	if next == "" || next == oldRoot {
+		t.Fatalf("new session id = %q, old = %q", next, oldRoot)
+	}
+	c.setCurrentSessionID(next)
+	if c.acceptsSubagentEventForCurrent(oldRoot, agent.Event{Kind: agent.EventSubagentStart, SessionID: "old-child", SubagentSessionID: "old-child", ParentSessionID: oldRoot}) {
+		t.Fatal("stale current snapshot accepted child event")
+	}
+}
+
 func TestSubmitAndFlushDoNotRenderUserMessagesLocally(t *testing.T) {
 	source, err := os.ReadFile("cli.go")
 	if err != nil {
@@ -212,9 +381,9 @@ func TestSubmitAndFlushDoNotRenderUserMessagesLocally(t *testing.T) {
 	if strings.Contains(body, "typ:  \"user\"") || strings.Contains(body, "typ: \"user\"") {
 		t.Fatalf("submitToBackend must not append a user displayEntry locally")
 	}
-	// The CLI must route input through the backend Submit entry point.
-	if !strings.Contains(string(source), "c.agent.Submit(c.ctx") {
-		t.Fatalf("CLI must submit input through agent.Submit")
+	// The CLI must route input through the explicit-session backend submit entry point.
+	if !strings.Contains(string(source), "c.agent.SubmitToSession(c.ctx") {
+		t.Fatalf("CLI must submit input through agent.SubmitToSession")
 	}
 }
 
@@ -389,11 +558,21 @@ func TestInlineToolEndStillRewritesInPlace(t *testing.T) {
 }
 
 func TestSubagentBackgroundProcessCompletionRenders(t *testing.T) {
+	a, _ := newTestAgent(t)
+	if _, err := a.AppendUserMessage("root"); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	root := a.SessionCurrent().ID
 	var buf bytes.Buffer
-	c := &CLI{out: &buf, mu: &sync.Mutex{}}
+	c := New(a)
+	c.out = &buf
+	c.setCurrentSessionID(root)
+	c.handleEvent(agent.Event{Kind: agent.EventSubagentStart, SessionID: "child-1", ParentSessionID: root, SubagentSessionID: "child-1", TaskIndex: 2})
+	buf.Reset()
 
 	c.handleEvent(agent.Event{
 		Kind:              agent.EventBackgroundProcessComplete,
+		SessionID:         "child-1",
 		SubagentSessionID: "child-1",
 		TaskIndex:         2,
 		Result:            "background done",
@@ -412,6 +591,51 @@ func TestSubagentBackgroundProcessCompletionRenders(t *testing.T) {
 			t.Fatalf("subagent background render missing %q: %q", want, rendered)
 		}
 	}
+}
+
+func TestCLIExitReturnsThroughLifecycleDetach(t *testing.T) {
+	a, _ := newTestAgent(t)
+	svc := &cliLifecycleService{AdapterService: a}
+	c := New(svc)
+	detach := c.attachAdapter(context.Background())
+	if detach == nil {
+		t.Fatal("attachAdapter returned nil detach")
+	}
+	err := c.dispatchCommand("/exit")
+	var exit interface{ ExitCode() int }
+	if !errors.As(err, &exit) || exit.ExitCode() != 0 {
+		t.Fatalf("/exit err = %v, want exit code 0", err)
+	}
+	detach()
+	if svc.attached != 1 || svc.detached != 1 {
+		t.Fatalf("lifecycle attached/detached = %d/%d, want 1/1", svc.attached, svc.detached)
+	}
+}
+
+func TestCLIDoesNotCallOSExit(t *testing.T) {
+	data, err := os.ReadFile("cli.go")
+	if err != nil {
+		t.Fatalf("read cli.go: %v", err)
+	}
+	if strings.Contains(string(data), "os.Exit(") {
+		t.Fatal("CLI must return through Run so lifecycle defers execute, not call os.Exit")
+	}
+}
+
+type cliLifecycleService struct {
+	agent.AdapterService
+	attached int
+	detached int
+}
+
+func (s *cliLifecycleService) AttachAdapter(context.Context) error {
+	s.attached++
+	return nil
+}
+
+func (s *cliLifecycleService) DetachAdapter(context.Context) error {
+	s.detached++
+	return nil
 }
 
 // extractFunctionBody returns the brace-delimited body of the first function
@@ -444,6 +668,28 @@ func extractFunctionBody(source, prefix string) (string, bool) {
 
 func newTestAgent(t *testing.T) (*agent.Agent, string) {
 	return newTestAgentWithBaseURL(t, "http://127.0.0.1:9/v1")
+}
+
+func cliUserContents(messages []agent.DisplayMessage) []string {
+	var out []string
+	for _, msg := range messages {
+		if msg.Type == "user" {
+			out = append(out, msg.Content)
+		}
+	}
+	return out
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func newTestAgentWithBaseURL(t *testing.T, baseURL string) (*agent.Agent, string) {

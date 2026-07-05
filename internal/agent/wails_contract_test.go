@@ -136,43 +136,34 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 		t.Fatalf("read menu.go: %v", err)
 	}
 	menu := string(menuBytes)
-	if !strings.Contains(menu, "ApplyTurnAction(turn, agent.TurnActionRevertCode") ||
-		!strings.Contains(menu, "ApplyTurnAction(turn, agent.TurnActionRevertHistory") ||
-		!strings.Contains(menu, "ApplyTurnAction(turn, agent.TurnActionFork") {
-		t.Fatalf("CLI revert menu must route through ApplyTurnAction")
+	if !strings.Contains(menu, "ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertCode") ||
+		!strings.Contains(menu, "ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertHistory") ||
+		!strings.Contains(menu, "ApplyTurnActionForSession(sessionID, turn, agent.TurnActionFork") {
+		t.Fatalf("CLI revert menu must route through ApplyTurnActionForSession")
 	}
 	if strings.Contains(menu, "RevertCode(turn - 1)") || strings.Contains(menu, "ForkSession(turn") {
 		t.Fatalf("CLI revert menu still performs adapter-local turn action logic")
 	}
 }
 
-func TestProjectSwitchHandlesStoreCloseErrors(t *testing.T) {
+func TestProjectSwitchDoesNotCloseOwnerSession(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
-	if strings.Contains(app, "_, _ = a.svc.Store().Close()") {
-		t.Fatalf("ProjectSwitch must not ignore Store().Close errors")
+	if strings.Contains(app, "CloseForProjectSwitch") || strings.Contains(app, "close current session") {
+		t.Fatalf("ProjectSwitch must not close the owner session")
 	}
-	if strings.Contains(app, "a.svc.Store().Close()") {
-		t.Fatalf("ProjectSwitch must route session close through Agent.CloseForProjectSwitch")
+	if strings.Contains(app, "relaunchIn") || strings.Contains(app, "wailsRuntime.Quit") {
+		t.Fatalf("ProjectSwitch must not relaunch the process or quit the adapter")
 	}
-	if !strings.Contains(app, "a.svc.CloseForProjectSwitch()") {
-		t.Fatalf("ProjectSwitch must use Agent.CloseForProjectSwitch")
-	}
-	if !strings.Contains(app, "close current session") {
-		t.Fatalf("ProjectSwitch must return close-session errors with context")
+	if !strings.Contains(app, "OpenOrCreateSession") {
+		t.Fatalf("ProjectSwitch must navigate in-place via OpenOrCreateSession")
 	}
 
 	cli := mustReadContractFile(t, filepath.Join("..", "cli", "cli.go"))
-	if strings.Contains(cli, "_, _ = c.agent.Store().Close()") {
-		t.Fatalf("CLI projectSwitch must not ignore Store().Close errors")
+	if strings.Contains(cli, "CloseForProjectSwitch") || strings.Contains(cli, "close current session") {
+		t.Fatalf("CLI projectSwitch must not close the owner session")
 	}
-	if strings.Contains(cli, "c.agent.Store().Close()") {
-		t.Fatalf("CLI projectSwitch must route session close through Agent.CloseForProjectSwitch")
-	}
-	if !strings.Contains(cli, "c.agent.CloseForProjectSwitch()") {
-		t.Fatalf("CLI projectSwitch must use Agent.CloseForProjectSwitch")
-	}
-	if !strings.Contains(cli, "close current session") {
-		t.Fatalf("CLI projectSwitch must report close-session errors with context")
+	if strings.Contains(cli, "relaunchIn") || strings.Contains(cli, "syscall.Exec") {
+		t.Fatalf("CLI projectSwitch must not relaunch or exec")
 	}
 }
 
@@ -273,14 +264,14 @@ func TestWailsDefersActiveCompactionSessionRefreshUntilTurnEnd(t *testing.T) {
 	if !strings.Contains(compactionEnd, `EventsEmit(a.ctx, "compaction_end"`) {
 		t.Fatalf("EventCompactionEnd must still emit compaction_end; case:\n%s", compactionEnd)
 	}
-	if !strings.Contains(compactionEnd, "if ev.RefreshSession") || !strings.Contains(compactionEnd, "a.emitSessionChanged()") {
+	if !strings.Contains(compactionEnd, "if ev.RefreshSession") || !strings.Contains(compactionEnd, "a.emitSessionChangedForEvent(ev)") {
 		t.Fatalf("EventCompactionEnd must refresh history only when backend marks it safe; case:\n%s", compactionEnd)
 	}
 	turnEnd := extractSwitchCase(t, app, "case agent.EventTurnEnd:")
 	if !strings.Contains(turnEnd, `EventsEmit(a.ctx, "turn_end"`) {
 		t.Fatalf("EventTurnEnd must still emit turn_end; case:\n%s", turnEnd)
 	}
-	if !strings.Contains(turnEnd, "if ev.RefreshSession") || !strings.Contains(turnEnd, "a.emitSessionChanged()") {
+	if !strings.Contains(turnEnd, "if ev.RefreshSession") || !strings.Contains(turnEnd, "a.emitSessionChangedForEvent(ev)") {
 		t.Fatalf("EventTurnEnd must perform deferred compaction history refresh; case:\n%s", turnEnd)
 	}
 }

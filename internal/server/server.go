@@ -23,6 +23,7 @@ import (
 type Config struct {
 	Port              int
 	PermissionTimeout time.Duration
+	ExitOnLastDetach  bool
 }
 
 // Server is the HTTP+SSE daemon.
@@ -30,12 +31,25 @@ type Server struct {
 	agent   *agent.Agent
 	cfg     Config
 	hub     *sseHub
+	adapter *sseHub
 	token   string
 	httpSrv *http.Server
 	srvCtx  context.Context
+	cancel  context.CancelFunc
 
-	permMu     sync.Mutex
-	permTimers map[string]*time.Timer
+	permMu            sync.Mutex
+	permTimers        map[string]*time.Timer
+	permTimerSessions map[string]string
+	permEvents        map[string]agent.Event
+
+	lifeMu            sync.Mutex
+	adapterCount      int
+	adapterLeases     map[string]adapterLease
+	shutdownRequested bool
+}
+
+type adapterLease struct {
+	local bool
 }
 
 // New constructs a Server.
@@ -44,32 +58,41 @@ func New(a *agent.Agent, cfg Config) *Server {
 		cfg.PermissionTimeout = 60 * time.Second
 	}
 	return &Server{
-		agent:      a,
-		cfg:        cfg,
-		hub:        newSSEHub(),
-		permTimers: make(map[string]*time.Timer),
+		agent:             a,
+		cfg:               cfg,
+		hub:               newSSEHub(),
+		adapter:           newSSEHub(),
+		permTimers:        make(map[string]*time.Timer),
+		permTimerSessions: make(map[string]string),
+		permEvents:        make(map[string]agent.Event),
 	}
 }
 
-// Serve starts the HTTP server and blocks until ctx is cancelled or a
-// signal is received. It writes a lockfile on startup and removes it
-// on shutdown.
-func (s *Server) Serve(ctx context.Context, home, projectID string) error {
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
+// Start starts the HTTP server in the background. It writes the owner
+// lockfile on startup and removes it on shutdown.
+func (s *Server) Start(ctx context.Context, home string) (LockFile, <-chan error, error) {
+	baseCtx, cancel := context.WithCancel(ctx)
+	ctx, stop := signal.NotifyContext(baseCtx, os.Interrupt, syscall.SIGTERM)
+	s.cancel = cancel
 
-	// Check for existing daemon.
-	if lf, err := Read(home, projectID); err == nil {
+	if lf, err := Read(home); err == nil {
 		if !IsStale(lf) {
-			return fmt.Errorf("daemon already running for this project (pid %d, port %d)", lf.PID, lf.Port)
+			stop()
+			return LockFile{}, nil, fmt.Errorf("owner already running (pid %d, port %d)", lf.PID, lf.Port)
 		}
-		_ = Remove(home, projectID)
+		_ = Remove(home)
+	} else if !os.IsNotExist(err) {
+		if removeErr := Remove(home); removeErr != nil {
+			stop()
+			return LockFile{}, nil, fmt.Errorf("remove unreadable owner lock: read %v: remove %w", err, removeErr)
+		}
 	}
 
 	// Generate auth token.
 	var tokenBytes [32]byte
 	if _, err := rand.Read(tokenBytes[:]); err != nil {
-		return fmt.Errorf("generate token: %w", err)
+		stop()
+		return LockFile{}, nil, fmt.Errorf("generate token: %w", err)
 	}
 	s.token = hex.EncodeToString(tokenBytes[:])
 
@@ -77,22 +100,23 @@ func (s *Server) Serve(ctx context.Context, home, projectID string) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", s.cfg.Port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", addr, err)
+		stop()
+		return LockFile{}, nil, fmt.Errorf("listen %s: %w", addr, err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
 	// Write lockfile.
 	lf := LockFile{Port: port, Token: s.token, PID: os.Getpid()}
-	if err := Write(home, projectID, lf); err != nil {
+	if err := Write(home, lf); err != nil {
 		_ = ln.Close()
-		return fmt.Errorf("write lockfile: %w", err)
+		stop()
+		return LockFile{}, nil, fmt.Errorf("write lockfile: %w", err)
 	}
-	defer Remove(home, projectID)
 
 	s.srvCtx = ctx
 
 	// Wire event handler.
-	s.agent.SetEventHandler(s.handleEvent)
+	s.agent.SubscribeEvents(s.handleEvent)
 	s.agent.Init(ctx)
 
 	// Build routes.
@@ -101,31 +125,49 @@ func (s *Server) Serve(ctx context.Context, home, projectID string) error {
 
 	s.httpSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 
-	// Shutdown goroutine. Uses context.Background for the Shutdown timeout
-	// because the parent ctx has already been cancelled by the time we get
-	// here; deriving from it would give Shutdown zero time to drain.
-	// #nosec G118 -- parent ctx is already cancelled; Shutdown needs its own 5s budget.
+	done := make(chan error, 1)
+	go func() {
+		defer stop()
+		err := s.httpSrv.Serve(ln)
+		if err == http.ErrServerClosed {
+			err = nil
+		}
+		_ = Remove(home)
+		done <- err
+	}()
+
 	go func() {
 		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		s.agent.ShutdownOwner()
+		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		_ = s.httpSrv.Shutdown(shutCtx)
 	}()
 
 	slog.Info("lightcode serve", "port", port, "pid", os.Getpid())
-	fmt.Fprintf(os.Stderr, "lightcode: serving on 127.0.0.1:%d (token in %s)\n", port, Path(home, projectID))
+	fmt.Fprintf(os.Stderr, "lightcode: serving on 127.0.0.1:%d (token in %s)\n", port, Path(home))
 
-	if err := s.httpSrv.Serve(ln); err != http.ErrServerClosed {
+	return lf, done, nil
+}
+
+// Serve starts the HTTP server and blocks until ctx is cancelled or a
+// signal is received.
+func (s *Server) Serve(ctx context.Context, home string) error {
+	_, done, err := s.Start(ctx, home)
+	if err != nil {
 		return err
 	}
-	return nil
+	return <-done
 }
 
 func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// SSE endpoint (no auth — token is in the query string for EventSource compatibility).
 	mux.HandleFunc("GET /v1/events", s.handleSSE)
+	mux.HandleFunc("GET /v1/adapter/events", s.handleAdapterSSE)
 
 	// All other routes require Bearer auth.
+	mux.HandleFunc("POST /v1/adapter/rpc", s.auth(s.handleAdapterRPC))
+	mux.HandleFunc("POST /v1/owner/shutdown", s.auth(s.handleOwnerShutdown))
 	mux.HandleFunc("POST /v1/prompt", s.auth(s.handlePrompt))
 
 	mux.HandleFunc("POST /v1/cancel", s.auth(s.handleCancel))
@@ -171,7 +213,11 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 // --- Event handler ---
 
 func (s *Server) handleEvent(ev agent.Event) {
-	if ev.SubagentSessionID != "" {
+	if s.adapter != nil && ev.Kind != agent.EventPermissionRequest {
+		s.adapter.broadcast("agent_event", ev)
+	}
+
+	if ev.SubagentSessionID != "" && ev.Kind != agent.EventPermissionRequest {
 		return
 	}
 
@@ -217,14 +263,15 @@ func (s *Server) handleEvent(ev agent.Event) {
 		data = map[string]any{"items": queue, "version": ev.QueueVersion}
 	case agent.EventUsage:
 		name = "usage"
-		data = s.agent.TokenUsage()
+		data = s.tokenUsageForEvent(ev)
 	case agent.EventTurnStart:
 		name = "turn_start"
 		data = map[string]any{"turn": ev.Turn}
 	case agent.EventTurnEnd:
-		s.hub.broadcast("turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
+		s.clearPermissionStateForSession(ev.SessionID)
+		s.hub.broadcastForSession(ev.SessionID, "turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
 		if ev.RefreshSession {
-			s.broadcastSessionChanged()
+			s.broadcastSessionChangedForSession(ev.SessionID)
 		}
 		return
 	case agent.EventError:
@@ -234,6 +281,8 @@ func (s *Server) handleEvent(ev agent.Event) {
 		name = "permission_request"
 		data = map[string]any{
 			"id":                 ev.PermReq.ID,
+			"sessionId":          ev.PermReq.SessionID,
+			"projectId":          ev.PermReq.ProjectID,
 			"tool":               ev.PermReq.ToolName,
 			"arg":                ev.PermReq.Arg,
 			"resolvedArg":        ev.PermReq.ResolvedArg,
@@ -244,13 +293,15 @@ func (s *Server) handleEvent(ev agent.Event) {
 			"batchFiles":         ev.PermReq.BatchFiles,
 			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		}
-		s.startPermissionTimer(ev.PermReq.ID)
+		if !s.startPermissionTimerForEvent(ev) && s.adapter != nil {
+			s.adapter.broadcast("agent_event", ev)
+		}
 	case agent.EventCompactionStart:
 		name = "compaction_start"
 	case agent.EventCompactionEnd:
-		s.hub.broadcast("compaction_end", nil)
+		s.hub.broadcastForSession(ev.SessionID, "compaction_end", nil)
 		if ev.RefreshSession {
-			s.broadcastSessionChanged()
+			s.broadcastSessionChangedForSession(ev.SessionID)
 		}
 		return
 	case agent.EventWarning:
@@ -260,20 +311,134 @@ func (s *Server) handleEvent(ev agent.Event) {
 		return
 	}
 
-	s.hub.broadcast(name, data)
+	s.hub.broadcastForSession(ev.SessionID, name, data)
 }
 
-func (s *Server) startPermissionTimer(id string) {
+func (s *Server) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
+	if ev.SessionID != "" {
+		if report, err := s.agent.TokenUsageForSession(ev.SessionID); err == nil {
+			return report
+		}
+	}
+	return s.agent.TokenUsage()
+}
+
+// startPermissionTimer arms the headless auto-deny timer unless a prompt
+// receiver already exists. Local attach is checked under lifeMu before the
+// timer record is registered so a local UI cannot miss the cancel window.
+func (s *Server) startPermissionTimer(req *agent.PermissionRequest) bool {
+	if req == nil {
+		return false
+	}
+	return s.startPermissionTimerForEvent(agent.Event{Kind: agent.EventPermissionRequest, SessionID: req.SessionID, ProjectID: req.ProjectID, PermReq: req})
+}
+
+func (s *Server) startPermissionTimerForEvent(ev agent.Event) bool {
+	req := ev.PermReq
+	if req == nil {
+		return false
+	}
+	reqCopy := *req
+	ev.PermReq = &reqCopy
+	if ev.Kind != agent.EventPermissionRequest {
+		ev.Kind = agent.EventPermissionRequest
+	}
+	if ev.SessionID == "" {
+		ev.SessionID = reqCopy.SessionID
+	}
+	if ev.ProjectID == "" {
+		ev.ProjectID = reqCopy.ProjectID
+	}
+	id := req.ID
+	sessionID := req.SessionID
+	s.lifeMu.Lock()
+	localReceiver := s.hasLocalAdapterLeaseLocked()
+	s.permMu.Lock()
+	if s.permEvents == nil {
+		s.permEvents = make(map[string]agent.Event)
+	}
+	s.permEvents[id] = ev
+	if localReceiver {
+		s.permMu.Unlock()
+		s.lifeMu.Unlock()
+		return false
+	}
+	timer := time.AfterFunc(s.cfg.PermissionTimeout, func() {
+		s.permMu.Lock()
+		if _, ok := s.permTimers[id]; !ok {
+			s.permMu.Unlock()
+			return
+		}
+		delete(s.permTimers, id)
+		delete(s.permTimerSessions, id)
+		delete(s.permEvents, id)
+		s.permMu.Unlock()
+		slog.Warn("permission timeout, auto-denying", "id", id)
+		if sessionID != "" {
+			_ = s.agent.RespondPermissionForSession(sessionID, id, false)
+		} else {
+			_ = s.agent.RespondPermission(id, false)
+		}
+	})
+	if s.permTimerSessions == nil {
+		s.permTimerSessions = make(map[string]string)
+	}
+	s.permTimers[id] = timer
+	s.permTimerSessions[id] = sessionID
+	s.permMu.Unlock()
+	s.lifeMu.Unlock()
+	s.adoptPermissionPrompt(ev)
+	return true
+}
+
+func (s *Server) hasLocalAdapterLeaseLocked() bool {
+	for _, lease := range s.adapterLeases {
+		if lease.local {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) adoptPermissionPrompt(ev agent.Event) {
+	if s.adapter == nil {
+		return
+	}
+	if ev.PermReq == nil {
+		return
+	}
+	if s.adapter.broadcast("agent_event", ev) > 0 {
+		s.stopPermissionTimer(ev.PermReq.ID)
+	}
+}
+
+func (s *Server) replayPendingPermissionPrompts(client *sseClient) {
+	if s.adapter == nil || client == nil {
+		return
+	}
+	s.permMu.Lock()
+	events := make([]agent.Event, 0, len(s.permEvents))
+	for _, ev := range s.permEvents {
+		events = append(events, ev)
+	}
+	s.permMu.Unlock()
+
+	for _, ev := range events {
+		ev := ev
+		if ev.PermReq != nil && s.adapter.send(client, "agent_event", ev) {
+			s.stopPermissionTimer(ev.PermReq.ID)
+		}
+	}
+}
+
+func (s *Server) stopPermissionTimer(id string) {
 	s.permMu.Lock()
 	defer s.permMu.Unlock()
-	timer := time.AfterFunc(s.cfg.PermissionTimeout, func() {
-		slog.Warn("permission timeout, auto-denying", "id", id)
-		_ = s.agent.RespondPermission(id, false)
-		s.permMu.Lock()
+	if timer, ok := s.permTimers[id]; ok {
+		timer.Stop()
 		delete(s.permTimers, id)
-		s.permMu.Unlock()
-	})
-	s.permTimers[id] = timer
+	}
+	delete(s.permTimerSessions, id)
 }
 
 func (s *Server) cancelPermissionTimer(id string) {
@@ -283,6 +448,38 @@ func (s *Server) cancelPermissionTimer(id string) {
 		timer.Stop()
 		delete(s.permTimers, id)
 	}
+	delete(s.permTimerSessions, id)
+	delete(s.permEvents, id)
+}
+
+func (s *Server) clearPermissionStateForSession(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	s.permMu.Lock()
+	defer s.permMu.Unlock()
+	for id, timer := range s.permTimers {
+		if s.permTimerSessions[id] != sessionID && !permissionEventMatchesSession(s.permEvents[id], sessionID) {
+			continue
+		}
+		timer.Stop()
+		delete(s.permTimers, id)
+		delete(s.permTimerSessions, id)
+		delete(s.permEvents, id)
+	}
+	for id, ev := range s.permEvents {
+		if permissionEventMatchesSession(ev, sessionID) {
+			delete(s.permEvents, id)
+		}
+	}
+}
+
+func permissionEventMatchesSession(ev agent.Event, sessionID string) bool {
+	if ev.SessionID == sessionID || ev.ParentSessionID == sessionID || ev.SubagentSessionID == sessionID {
+		return true
+	}
+	return ev.PermReq != nil && ev.PermReq.SessionID == sessionID
 }
 
 // --- SSE handler ---
@@ -305,20 +502,26 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	flusher.Flush()
 
-	ch, unsub := s.hub.subscribe()
+	sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
+	ch, unsub := s.hub.subscribe(sessionID)
 	defer unsub()
 
-	// On disconnect, auto-deny any pending permissions.
+	// On disconnect, auto-deny pending permissions only for the subscribed session.
 	defer func() {
+		if sessionID == "" {
+			return
+		}
 		s.permMu.Lock()
-		ids := make([]string, 0, len(s.permTimers))
+		ids := make([]string, 0)
 		for id := range s.permTimers {
-			ids = append(ids, id)
+			if s.permTimerSessions[id] == sessionID {
+				ids = append(ids, id)
+			}
 		}
 		s.permMu.Unlock()
 		for _, id := range ids {
 			s.cancelPermissionTimer(id)
-			_ = s.agent.RespondPermission(id, false)
+			_ = s.agent.RespondPermissionForSession(sessionID, id, false)
 		}
 	}()
 
@@ -336,33 +539,56 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// broadcastSessionChanged pushes a session_changed event to all SSE clients.
-func (s *Server) broadcastSessionChanged() {
-	s.hub.broadcast("session_changed", map[string]any{
-		"session":  s.agent.SessionCurrent(),
-		"messages": s.agent.SessionMessages(),
-		"tokens":   s.agent.TokenUsage(),
-	})
+// broadcastSessionChangedForSession pushes a session_changed event to subscribers of one session.
+func (s *Server) broadcastSessionChangedForSession(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	s.broadcastSessionChanged(sessionID, sessionID)
+}
+
+func (s *Server) broadcastSessionChanged(routeSessionID, payloadSessionID string) {
+	routeSessionID = strings.TrimSpace(routeSessionID)
+	if routeSessionID == "" {
+		return
+	}
+	payloadSessionID = strings.TrimSpace(payloadSessionID)
+	payload := agent.SessionPayload{}
+	if payloadSessionID != "" {
+		var err error
+		payload, err = s.agent.SessionPayloadForSession(payloadSessionID)
+		if err != nil {
+			payload = agent.SessionPayload{}
+		}
+	}
+	s.hub.broadcastForSession(routeSessionID, "session_changed", payload)
 }
 
 // --- Route handlers ---
 
 type turnActionRequest struct {
-	Turn           int  `json:"turn"`
-	AlsoRevertCode bool `json:"alsoRevertCode"`
+	SessionID      string `json:"session_id"`
+	Turn           int    `json:"turn"`
+	AlsoRevertCode bool   `json:"alsoRevertCode"`
 }
 
 func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Content string `json:"content"`
+		SessionID string `json:"session_id"`
+		Content   string `json:"content"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
+	sessionID, ok := requireSessionID(w, body.SessionID)
+	if !ok {
+		return
+	}
 	// srvCtx (not the request ctx) so the started/queued turn outlives the HTTP
 	// response.
-	res, err := s.agent.Submit(s.srvCtx, body.Content)
+	res, err := s.agent.SubmitToSession(s.srvCtx, sessionID, body.Content)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusConflict)
 		return
@@ -376,11 +602,28 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
-	jsonResp(w, http.StatusOK, s.agent.QueueSnapshot())
+	sessionID, ok := requireQuerySessionID(w, r)
+	if !ok {
+		return
+	}
+	q, err := s.agent.QueueSnapshotForSession(sessionID)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	jsonResp(w, http.StatusOK, q)
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
-	_ = s.agent.Cancel()
+	sessionID, ok := requireQuerySessionID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.agent.CancelSession(sessionID); err != nil {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	s.clearPermissionStateForSession(sessionID)
 	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -391,11 +634,16 @@ func (s *Server) handlePermission(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Allow  *bool  `json:"allow"`
-		Action string `json:"action"`
+		SessionID string `json:"session_id"`
+		Allow     *bool  `json:"allow"`
+		Action    string `json:"action"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	sessionID, ok := requireSessionID(w, body.SessionID)
+	if !ok {
 		return
 	}
 	if body.Action == "" {
@@ -409,7 +657,7 @@ func (s *Server) handlePermission(w http.ResponseWriter, r *http.Request) {
 			body.Action = "deny"
 		}
 	}
-	if err := s.agent.RespondPermissionAction(id, body.Action); err != nil {
+	if err := s.agent.RespondPermissionActionForSession(sessionID, id, body.Action); err != nil {
 		jsonError(w, err.Error(), http.StatusNotFound)
 		return
 	}
@@ -419,26 +667,52 @@ func (s *Server) handlePermission(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePermissionSuggest(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Tool string `json:"tool"`
-		Arg  string `json:"arg"`
+		SessionID string `json:"session_id"`
+		ProjectID string `json:"project_id"`
+		Tool      string `json:"tool"`
+		Arg       string `json:"arg"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	jsonResp(w, http.StatusOK, s.agent.PermissionSuggest(body.Tool, body.Arg))
+	sessionID := strings.TrimSpace(body.SessionID)
+	projectID := strings.TrimSpace(body.ProjectID)
+	var (
+		suggestions []agent.PermissionSuggestion
+		err         error
+	)
+	switch {
+	case sessionID != "":
+		suggestions, err = s.agent.PermissionSuggestForSession(sessionID, body.Tool, body.Arg)
+	case projectID != "":
+		suggestions, err = s.agent.PermissionSuggestForProject(projectID, body.Tool, body.Arg)
+	default:
+		jsonError(w, "session_id or project_id is required", http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	jsonResp(w, http.StatusOK, suggestions)
 }
 
 func (s *Server) handlePermissionSave(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID       string   `json:"id"`
-		Patterns []string `json:"patterns"`
+		SessionID string   `json:"session_id"`
+		ID        string   `json:"id"`
+		Patterns  []string `json:"patterns"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	if err := s.agent.SaveProjectPermission(body.ID, body.Patterns); err != nil {
+	sessionID, ok := requireSessionID(w, body.SessionID)
+	if !ok {
+		return
+	}
+	if err := s.agent.SaveProjectPermissionForSession(sessionID, body.ID, body.Patterns); err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -447,16 +721,31 @@ func (s *Server) handlePermissionSave(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSessionCurrent(w http.ResponseWriter, r *http.Request) {
-	jsonResp(w, http.StatusOK, s.agent.SessionCurrent())
+	sessionID, ok := requireQuerySessionID(w, r)
+	if !ok {
+		return
+	}
+	summary, err := s.agent.SessionSummaryForSession(sessionID)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	jsonResp(w, http.StatusOK, summary)
 }
 
 func (s *Server) handleSessionNew(w http.ResponseWriter, r *http.Request) {
-	if err := s.agent.SessionNew(); err != nil {
+	id, err := s.agent.NewSession("", "primary")
+	if err != nil {
 		jsonError(w, err.Error(), http.StatusConflict)
 		return
 	}
-	s.broadcastSessionChanged()
-	jsonResp(w, http.StatusOK, s.agent.SessionCurrent())
+	s.broadcastSessionChangedForSession(id)
+	summary, err := s.agent.SessionSummaryForSession(id)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	jsonResp(w, http.StatusOK, summary)
 }
 
 func (s *Server) handleSessionSwitch(w http.ResponseWriter, r *http.Request) {
@@ -467,12 +756,13 @@ func (s *Server) handleSessionSwitch(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	if err := s.agent.SessionSwitch(body.ID); err != nil {
+	summary, err := s.agent.OpenSession(body.ID)
+	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.broadcastSessionChanged()
-	jsonResp(w, http.StatusOK, s.agent.SessionCurrent())
+	s.broadcastSessionChangedForSession(summary.ID)
+	jsonResp(w, http.StatusOK, summary)
 }
 
 func (s *Server) handleSessionList(w http.ResponseWriter, r *http.Request) {
@@ -496,14 +786,13 @@ func (s *Server) handleSessionArchive(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	closedCurrent, err := s.agent.SessionArchive(body.ID)
+	err := s.agent.SessionArchive(body.ID)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if closedCurrent {
-		s.broadcastSessionChanged()
-	}
+	s.clearPermissionStateForSession(body.ID)
+	s.broadcastSessionChangedForSession(body.ID)
 	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -515,28 +804,31 @@ func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	closedCurrent, err := s.agent.SessionDelete(body.ID)
+	err := s.agent.SessionDelete(body.ID)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if closedCurrent {
-		s.broadcastSessionChanged()
-	}
+	s.clearPermissionStateForSession(body.ID)
+	s.broadcastSessionChangedForSession(body.ID)
 	jsonResp(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleSessionMessages(w http.ResponseWriter, r *http.Request) {
-	if id := r.URL.Query().Get("id"); id != "" {
-		msgs, err := s.agent.SessionMessagesFor(id)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
-			return
-		}
-		jsonResp(w, http.StatusOK, msgs)
+	id := strings.TrimSpace(r.URL.Query().Get("session_id"))
+	if id == "" {
+		id = strings.TrimSpace(r.URL.Query().Get("id"))
+	}
+	if id == "" {
+		jsonError(w, "session_id is required", http.StatusBadRequest)
 		return
 	}
-	jsonResp(w, http.StatusOK, s.agent.SessionMessages())
+	msgs, err := s.agent.SessionMessagesFor(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	jsonResp(w, http.StatusOK, msgs)
 }
 
 func (s *Server) handleSessionFork(w http.ResponseWriter, r *http.Request) {
@@ -560,43 +852,74 @@ func (s *Server) handleTurnAction(w http.ResponseWriter, r *http.Request, action
 	if action == agent.TurnActionRevertCode {
 		body.AlsoRevertCode = false
 	}
-	result, err := s.agent.ApplyTurnAction(body.Turn, action, body.AlsoRevertCode)
+	sessionID, ok := requireSessionID(w, body.SessionID)
+	if !ok {
+		return
+	}
+	result, err := s.agent.ApplyTurnActionForSession(sessionID, body.Turn, action, body.AlsoRevertCode)
 	if err != nil {
 		jsonError(w, err.Error(), actionErrorStatus)
 		return
 	}
 	if result.SessionChanged {
-		s.broadcastSessionChanged()
+		if result.Session.ID != "" {
+			s.broadcastSessionChanged(sessionID, result.Session.ID)
+		} else {
+			s.broadcastSessionChangedForSession(sessionID)
+		}
 	}
 	jsonResp(w, http.StatusOK, result)
 }
 
 func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
-	list, err := s.agent.SnapshotList()
+	sessionID, ok := requireQuerySessionID(w, r)
+	if !ok {
+		return
+	}
+	list, err := s.agent.SnapshotListForSession(sessionID)
 	if err != nil {
-		jsonError(w, err.Error(), http.StatusInternalServerError)
+		jsonError(w, err.Error(), http.StatusNotFound)
 		return
 	}
 	jsonResp(w, http.StatusOK, list)
 }
 
 func (s *Server) handleModelCurrent(w http.ResponseWriter, r *http.Request) {
-	jsonResp(w, http.StatusOK, s.agent.CurrentModel())
+	sessionID, ok := requireQuerySessionID(w, r)
+	if !ok {
+		return
+	}
+	model, err := s.agent.CurrentModelForSession(sessionID)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	jsonResp(w, http.StatusOK, model)
 }
 
 func (s *Server) handleModelSwitch(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Ref string `json:"ref"`
+		SessionID string `json:"session_id"`
+		Ref       string `json:"ref"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	if err := s.agent.SwitchModel(body.Ref); err != nil {
+	sessionID, ok := requireSessionID(w, body.SessionID)
+	if !ok {
+		return
+	}
+	if err := s.agent.SwitchModelForSession(sessionID, body.Ref); err != nil {
 		jsonError(w, err.Error(), http.StatusConflict)
 		return
 	}
-	jsonResp(w, http.StatusOK, s.agent.CurrentModel())
+	model, err := s.agent.CurrentModelForSession(sessionID)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	jsonResp(w, http.StatusOK, model)
 }
 
 func (s *Server) handleModelList(w http.ResponseWriter, r *http.Request) {
@@ -604,7 +927,16 @@ func (s *Server) handleModelList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
-	jsonResp(w, http.StatusOK, s.agent.TokenUsage())
+	sessionID, ok := requireQuerySessionID(w, r)
+	if !ok {
+		return
+	}
+	report, err := s.agent.TokenUsageForSession(sessionID)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	jsonResp(w, http.StatusOK, report)
 }
 
 func (s *Server) handleProjectCurrent(w http.ResponseWriter, r *http.Request) {
@@ -631,7 +963,11 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
-	if err := s.agent.CompactNow(r.Context()); err != nil {
+	sessionID, ok := requireQuerySessionID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.agent.CompactNowForSession(r.Context(), sessionID); err != nil {
 		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -649,12 +985,26 @@ func warningSnapshot(warnings []agent.PromptWarning) []agent.PromptWarning {
 	return warnings
 }
 
+func requireQuerySessionID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	return requireSessionID(w, r.URL.Query().Get("session_id"))
+}
+
+func requireSessionID(w http.ResponseWriter, id string) (string, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		jsonError(w, "session_id is required", http.StatusBadRequest)
+		return "", false
+	}
+	return id, true
+}
+
 // --- SSE hub ---
 
 type sseClient struct {
-	mu     sync.Mutex
-	ch     chan []byte
-	closed bool
+	mu        sync.Mutex
+	ch        chan []byte
+	sessionID string
+	closed    bool
 }
 
 type sseHub struct {
@@ -666,12 +1016,17 @@ func newSSEHub() *sseHub {
 	return &sseHub{}
 }
 
-func (h *sseHub) subscribe() (<-chan []byte, func()) {
-	client := &sseClient{ch: make(chan []byte, 64)}
+func (h *sseHub) subscribe(sessionID string) (<-chan []byte, func()) {
+	ch, _, unsub := h.subscribeClient(sessionID)
+	return ch, unsub
+}
+
+func (h *sseHub) subscribeClient(sessionID string) (<-chan []byte, *sseClient, func()) {
+	client := &sseClient{ch: make(chan []byte, 64), sessionID: strings.TrimSpace(sessionID)}
 	h.mu.Lock()
 	h.clients = append(h.clients, client)
 	h.mu.Unlock()
-	return client.ch, func() {
+	return client.ch, client, func() {
 		h.mu.Lock()
 		for i, c := range h.clients {
 			if c == client {
@@ -689,27 +1044,58 @@ func (h *sseHub) subscribe() (<-chan []byte, func()) {
 	}
 }
 
-func (h *sseHub) broadcast(eventName string, data any) {
+func (h *sseHub) send(client *sseClient, eventName string, data any) bool {
+	payload, err := json.Marshal(data)
+	if err != nil || client == nil {
+		return false
+	}
+	msg := fmt.Appendf(nil, "event: %s\ndata: %s\n\n", eventName, payload)
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.closed {
+		return false
+	}
+	select {
+	case client.ch <- msg:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *sseHub) broadcast(eventName string, data any) int {
+	return h.broadcastForSession("", eventName, data)
+}
+
+func (h *sseHub) broadcastForSession(sessionID string, eventName string, data any) int {
 	payload, err := json.Marshal(data)
 	if err != nil {
-		return
+		return 0
 	}
+	sessionID = strings.TrimSpace(sessionID)
 	msg := fmt.Appendf(nil, "event: %s\ndata: %s\n\n", eventName, payload)
 	h.mu.Lock()
 	clients := append([]*sseClient(nil), h.clients...)
 	h.mu.Unlock()
+	delivered := 0
 	for _, client := range clients {
 		client.mu.Lock()
 		if client.closed {
 			client.mu.Unlock()
 			continue
 		}
+		if sessionID != "" && client.sessionID != sessionID {
+			client.mu.Unlock()
+			continue
+		}
 		select {
 		case client.ch <- msg:
+			delivered++
 		default:
 		}
 		client.mu.Unlock()
 	}
+	return delivered
 }
 
 // --- JSON helpers ---

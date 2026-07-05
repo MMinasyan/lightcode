@@ -293,7 +293,7 @@ func (c *CLI) showModelMenu() {
 		return
 	}
 
-	cur := c.agent.CurrentModel()
+	cur := c.currentModel()
 
 	var items []menuItem
 	lastProvider := ""
@@ -323,7 +323,12 @@ func (c *CLI) showModelMenu() {
 	result := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, "Model", items, c.currentWidth())
 	if result.selected >= 0 {
 		choice := result.extra.(modelChoice)
-		if err := c.agent.SwitchModel(choice.ref); err != nil {
+		sessionID, err := c.currentSession()
+		if err != nil {
+			c.printLine(renderErrorMsg(err.Error()))
+			return
+		}
+		if err := c.agent.SwitchModelForSession(sessionID, choice.ref); err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
@@ -346,13 +351,13 @@ func (c *CLI) showSessionMenuInner(state string) {
 	c.stopAnimationLocked()
 	c.mu.Unlock()
 
-	sessions, err := c.agent.SessionList(state)
+	sessions, err := c.scope.SessionList(state)
 	if err != nil {
 		c.printLine(renderErrorMsg(err.Error()))
 		return
 	}
 
-	cur := c.agent.SessionCurrent()
+	cur := c.currentSessionSummary()
 
 	var items []menuItem
 	if len(sessions) == 0 {
@@ -380,43 +385,41 @@ func (c *CLI) showSessionMenuInner(state string) {
 	case "select":
 		if result.selected >= 0 {
 			id := result.extra.(string)
-			if err := c.agent.SessionSwitch(id); err != nil {
+			summary, err := c.agent.OpenSession(id)
+			if err != nil {
 				c.printLine(renderErrorMsg(err.Error()))
 				return
 			}
+			c.setCurrentSessionID(summary.ID)
 			c.refreshSession()
 		}
 	case "new":
-		if err := c.agent.SessionNew(); err != nil {
+		id, err := c.scope.NewSession("primary")
+		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
+		c.setCurrentSessionID(id)
 		c.refreshSession()
 	case "archive":
 		if result.selected >= 0 {
 			id := result.extra.(string)
-			closedCurrent, err := c.agent.SessionArchive(id)
-			if err != nil {
+			if err := c.agent.SessionArchive(id); err != nil {
 				c.printLine(renderErrorMsg(err.Error()))
 				return
 			}
 			c.printLine(renderSystemMsg("  session archived"))
-			if closedCurrent {
-				c.refreshSession()
-			}
+			c.clearRemovedCurrent(id)
 		}
 	case "delete":
 		if result.selected >= 0 {
 			id := result.extra.(string)
-			closedCurrent, err := c.agent.SessionDelete(id)
-			if err != nil {
+			if err := c.agent.SessionDelete(id); err != nil {
 				c.printLine(renderErrorMsg(err.Error()))
 				return
 			}
 			c.printLine(renderSystemMsg("  session deleted"))
-			if closedCurrent {
-				c.refreshSession()
-			}
+			c.clearRemovedCurrent(id)
 		}
 	case "toggle":
 		if state == "active" {
@@ -536,7 +539,7 @@ func (c *CLI) showProjectMenu() {
 		return
 	}
 
-	cur := c.agent.ProjectCurrent()
+	cur := c.scope.ProjectCurrent()
 
 	var items []menuItem
 	for _, p := range projects {
@@ -566,7 +569,7 @@ func (c *CLI) showRevertMenu() {
 	c.stopAnimationLocked()
 	c.mu.Unlock()
 
-	msgs := c.agent.SessionMessages()
+	msgs := c.sessionMessages()
 	if len(msgs) == 0 {
 		c.printLine(renderErrorMsg("no messages to revert"))
 		return
@@ -617,9 +620,14 @@ func (c *CLI) showRevertMenu() {
 	}
 
 	action := actionResult.extra.(string)
+	sessionID, err := c.currentSession()
+	if err != nil {
+		c.printLine(renderErrorMsg(err.Error()))
+		return
+	}
 	switch action {
 	case "code":
-		result, err := c.agent.ApplyTurnAction(turn, agent.TurnActionRevertCode, false)
+		result, err := c.agent.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertCode, false)
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
@@ -629,20 +637,26 @@ func (c *CLI) showRevertMenu() {
 
 	case "history":
 		alsoCode := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
-		result, err := c.agent.ApplyTurnAction(turn, agent.TurnActionRevertHistory, alsoCode)
+		result, err := c.agent.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertHistory, alsoCode)
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
+		}
+		if result.Session.ID != "" {
+			c.setCurrentSessionID(result.Session.ID)
 		}
 		c.refreshSession()
 		c.printRevertSkipped(result)
 
 	case "fork":
 		alsoCode := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
-		result, err := c.agent.ApplyTurnAction(turn, agent.TurnActionFork, alsoCode)
+		result, err := c.agent.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionFork, alsoCode)
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
+		}
+		if result.Session.ID != "" {
+			c.setCurrentSessionID(result.Session.ID)
 		}
 		c.refreshSession()
 		c.printRevertSkipped(result)

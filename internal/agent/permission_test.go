@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -10,7 +11,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/project"
 )
 
-func TestSaveProjectPermissionReturnsSuccessWhenRuleSavedButRespondStale(t *testing.T) {
+func TestStalePermissionSave(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := t.TempDir()
 	resolver, err := project.NewResolver(home, projectRoot)
@@ -36,8 +37,9 @@ func TestSaveProjectPermissionReturnsSuccessWhenRuleSavedButRespondStale(t *test
 	}
 
 	a := &Agent{projects: resolver, gate: gate}
-	if err := a.SaveProjectPermission(id, []string{"write_file:*"}); err != nil {
-		t.Fatalf("SaveProjectPermission returned error for stale id after saving rule: %v", err)
+	err = a.SaveProjectPermissionForSession("session-a", id, []string{"write_file:*"})
+	if !errors.Is(err, permission.ErrUnknownRequest) {
+		t.Fatalf("SaveProjectPermissionForSession err = %v, want unknown request", err)
 	}
 
 	proj, err := resolver.Ensure()
@@ -48,12 +50,12 @@ func TestSaveProjectPermissionReturnsSuccessWhenRuleSavedButRespondStale(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rules.Allow) != 1 || rules.Allow[0] != "write_file:*" {
-		t.Fatalf("saved rules = %#v", rules)
+	if len(rules.Allow) != 0 {
+		t.Fatalf("saved rules = %#v, want none", rules)
 	}
 }
 
-func TestSaveProjectPermissionRejectsDisabledPendingRequest(t *testing.T) {
+func TestPermissionSaveDisabled(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := t.TempDir()
 	resolver, err := project.NewResolver(home, projectRoot)

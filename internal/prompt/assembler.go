@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/adaptation"
@@ -82,6 +83,8 @@ type Spec struct {
 }
 
 type Assembler struct {
+	mu sync.Mutex
+
 	projectRoot  string
 	home         string
 	sessionStart time.Time
@@ -115,6 +118,8 @@ func (a *Assembler) AssembleFor(adapt *adaptation.Adaptation) Result {
 }
 
 func (a *Assembler) AssembleForSpec(spec Spec) Result {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	spec = normalizeSpec(spec)
 	var warnings []Warning
 

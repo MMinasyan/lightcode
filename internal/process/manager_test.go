@@ -284,6 +284,41 @@ func TestManagerLimitAppliesPerSession(t *testing.T) {
 	}
 }
 
+func TestManagerSetLimitsConcurrentWithStartForSession(t *testing.T) {
+	m := NewManager(0, cmdoutput.Options{})
+	stop := make(chan struct{})
+	var setter sync.WaitGroup
+	setter.Add(1)
+	go func() {
+		defer setter.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+				m.SetLimits(0, cmdoutput.Options{MaxBytes: 1024 + i%8, MaxLineChars: 80 + i%8})
+			}
+		}
+	}()
+
+	var starters sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		sessionID := fmt.Sprintf("session-%d", i)
+		starters.Add(1)
+		go func() {
+			defer starters.Done()
+			for j := 0; j < 25; j++ {
+				if _, err := m.StartForSession(sessionID, "true", 0); err != nil {
+					t.Errorf("StartForSession: %v", err)
+				}
+			}
+		}()
+	}
+	starters.Wait()
+	close(stop)
+	setter.Wait()
+}
+
 func TestManagerLargeBackgroundOutputSpillsAndReadReusesPath(t *testing.T) {
 	home := t.TempDir()
 	m := NewManager(1, cmdoutput.Options{

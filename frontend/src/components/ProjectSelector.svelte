@@ -21,12 +21,12 @@
   onMount(load);
 
   async function pick(path) {
-    try { await ProjectSwitch(path); dispatch('close'); }
+    try { await ProjectSwitch(path); dispatch('switched'); dispatch('close'); }
     catch (e) { dispatch('error', errorText(e)); }
   }
 
   async function addProject() {
-    try { await ProjectPickAndSwitch(); dispatch('close'); }
+    try { await ProjectPickAndSwitch(); dispatch('switched'); dispatch('close'); }
     catch (e) { dispatch('error', errorText(e)); }
   }
 </script>

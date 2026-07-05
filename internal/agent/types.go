@@ -31,7 +31,10 @@ const (
 
 // Event is the unified event type emitted by the Agent to adapters.
 type Event struct {
-	Kind EventKind
+	Kind            EventKind
+	SessionID       string
+	ProjectID       string
+	ParentSessionID string
 
 	// Loop-level fields (forwarded from loop.Event):
 	ToolName   string
@@ -81,6 +84,8 @@ type PromptWarning struct {
 // PermissionRequest is sent to adapters when a tool needs user approval.
 type PermissionRequest struct {
 	ID                 string
+	SessionID          string
+	ProjectID          string
 	ToolName           string
 	Arg                string
 	ResolvedArg        string
@@ -373,6 +378,13 @@ type SubmitResult struct {
 	Turn    int          `json:"turn,omitempty"`
 	Queue   []QueuedItem `json:"queue"`
 	Version int          `json:"version"`
+}
+
+// SessionPayload is the adapter-facing state snapshot for one session.
+type SessionPayload struct {
+	Session  SessionSummary   `json:"session"`
+	Messages []DisplayMessage `json:"messages"`
+	Tokens   TokenReport      `json:"tokens"`
 }
 
 // TurnActionResult is returned after a user-message revert/fork action.

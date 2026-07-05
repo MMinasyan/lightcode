@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 var errEmbedderUnavailable = errors.New("memory embedder unavailable")
@@ -33,6 +34,7 @@ type HistoryResult struct {
 }
 
 type Store struct {
+	mu           sync.Mutex
 	embedder     memoryEmbedder
 	projectsRoot string
 	home         string
@@ -50,6 +52,11 @@ func NewStoreWithEmbedder(embedder memoryEmbedder, projectsRoot, home string) *S
 }
 
 func (s *Store) SaveMemory(memoriesDir, title, content string) (string, error) {
+	if s == nil {
+		return "", errEmbedderUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	embedder, err := s.requireEmbedder()
 	if err != nil {
 		return "", err
@@ -72,6 +79,11 @@ func (s *Store) SaveMemory(memoriesDir, title, content string) (string, error) {
 }
 
 func (s *Store) SearchMemory(query, projectID string, allProjects bool, limit int) ([]MemoryResult, error) {
+	if s == nil {
+		return nil, errEmbedderUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	embedder, err := s.requireEmbedder()
 	if err != nil {
 		return nil, err
@@ -143,6 +155,11 @@ func (s *Store) summariesRoot() string {
 }
 
 func (s *Store) IndexSummary(sessionID, projectID, projectName, summary, createdAt, compactionPath string) error {
+	if s == nil {
+		return errEmbedderUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	sections := SplitSummary(summary)
 	if len(sections) == 0 {
 		return nil
@@ -203,6 +220,11 @@ type summaryMeta struct {
 }
 
 func (s *Store) SearchHistory(query, projectID string, allProjects bool, limit int) ([]HistoryResult, error) {
+	if s == nil {
+		return nil, errEmbedderUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	embedder, err := s.requireEmbedder()
 	if err != nil {
 		return nil, err
@@ -291,11 +313,21 @@ func (s *Store) SearchHistory(query, projectID string, allProjects bool, limit i
 }
 
 func (s *Store) DeleteSessionSummaries(sessionID string) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	dir := filepath.Join(s.summariesRoot(), sessionID)
 	return os.RemoveAll(dir)
 }
 
 func (s *Store) Reconcile() error {
+	if s == nil {
+		return errEmbedderUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	embedder, err := s.requireEmbedder()
 	if err != nil {
 		return err
@@ -347,6 +379,11 @@ func (s *Store) Reconcile() error {
 }
 
 func (s *Store) Close() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.embedder != nil {
 		s.embedder.Close()
 	}

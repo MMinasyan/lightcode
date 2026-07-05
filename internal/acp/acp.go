@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
@@ -42,19 +43,23 @@ type Notification struct {
 }
 
 type turnActionParams struct {
-	Turn           int  `json:"turn"`
-	AlsoRevertCode bool `json:"alsoRevertCode"`
+	SessionID      string `json:"session_id"`
+	Turn           int    `json:"turn"`
+	AlsoRevertCode bool   `json:"alsoRevertCode"`
 }
 
 // Runner drives the ACP stdio protocol.
 type Runner struct {
-	agent *agent.Agent
+	agent agent.AdapterService
 	mu    sync.Mutex
 	out   io.Writer
+
+	viewOnce sync.Once
+	view     *agent.SessionView
 }
 
 // New creates an ACP Runner.
-func New(a *agent.Agent) *Runner {
+func New(a agent.AdapterService) *Runner {
 	return &Runner{agent: a, out: os.Stdout}
 }
 
@@ -66,6 +71,26 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	r.agent.SetEventHandler(r.handleEvent)
 	r.agent.Init(ctx)
+	if lifecycle, ok := r.agent.(interface {
+		AttachAdapter(context.Context) error
+		DetachAdapter(context.Context) error
+	}); ok {
+		if err := lifecycle.AttachAdapter(ctx); err == nil {
+			defer lifecycle.DetachAdapter(context.Background())
+		}
+	}
+	sessionID := ""
+	if sessions, err := r.agent.SessionList("active"); err == nil && len(sessions) > 0 {
+		if summary, err := r.agent.OpenSession(sessions[0].ID); err == nil {
+			sessionID = summary.ID
+		}
+	}
+	if sessionID == "" {
+		if id, err := r.agent.NewSession("", "primary"); err == nil {
+			sessionID = id
+		}
+	}
+	r.setCurrentSessionID(sessionID)
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
@@ -107,9 +132,9 @@ func (r *Runner) dispatch(ctx context.Context, req Request) {
 	case "session/prompt":
 		r.handleSessionPrompt(ctx, req)
 	case "session/cancel":
-		_ = r.agent.Cancel()
+		r.handleSessionCancel(req)
 	case "session/current":
-		r.respond(req.ID, r.agent.SessionCurrent())
+		r.respond(req.ID, r.currentSessionSummary())
 	case "session/list":
 		r.handleSessionList(req)
 	case "session/switch":
@@ -129,20 +154,25 @@ func (r *Runner) dispatch(ctx context.Context, req Request) {
 	case "session/revert_history":
 		r.handleRevertHistory(req)
 	case "model/current":
-		r.respond(req.ID, r.agent.CurrentModel())
+		r.handleModelCurrent(req)
 	case "model/list":
 		r.respond(req.ID, r.agent.ModelList())
 	case "model/switch":
 		r.handleModelSwitch(req)
 	case "snapshot/list":
-		list, err := r.agent.SnapshotList()
+		sessionID := r.liveCurrentSessionID()
+		if sessionID == "" {
+			r.respondError(req.ID, -32000, "no current session")
+			return
+		}
+		list, err := r.agent.SnapshotListForSession(sessionID)
 		if err != nil {
 			r.respondError(req.ID, -32000, err.Error())
 		} else {
 			r.respond(req.ID, list)
 		}
 	case "tokens/usage":
-		r.respond(req.ID, r.agent.TokenUsage())
+		r.handleTokenUsage(req)
 	case "project/current":
 		r.respond(req.ID, r.agent.ProjectCurrent())
 	case "project/list":
@@ -173,6 +203,9 @@ func (r *Runner) dispatch(ctx context.Context, req Request) {
 
 func (r *Runner) handleEvent(ev agent.Event) {
 	if ev.SubagentSessionID != "" {
+		return
+	}
+	if !r.acceptsSessionEvent(ev.SessionID) {
 		return
 	}
 
@@ -216,7 +249,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 		params = map[string]any{"items": queue, "version": ev.QueueVersion}
 	case agent.EventUsage:
 		method = "agent/usage"
-		params = r.agent.TokenUsage()
+		params = r.tokenUsageForEvent(ev)
 	case agent.EventTurnStart:
 		method = "agent/turn_start"
 		params = map[string]any{"turn": ev.Turn}
@@ -227,7 +260,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 			Params:  map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled},
 		})
 		if ev.RefreshSession {
-			r.pushSessionChanged()
+			r.pushSessionChangedForEvent(ev)
 		}
 		return
 	case agent.EventError:
@@ -237,6 +270,8 @@ func (r *Runner) handleEvent(ev agent.Event) {
 		method = "agent/permission_request"
 		params = map[string]any{
 			"id":                 ev.PermReq.ID,
+			"sessionId":          ev.PermReq.SessionID,
+			"projectId":          ev.PermReq.ProjectID,
 			"tool":               ev.PermReq.ToolName,
 			"arg":                ev.PermReq.Arg,
 			"resolvedArg":        ev.PermReq.ResolvedArg,
@@ -255,7 +290,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 			Method:  "agent/compaction_end",
 		})
 		if ev.RefreshSession {
-			r.pushSessionChanged()
+			r.pushSessionChangedForEvent(ev)
 		}
 		return
 	case agent.EventWarning:
@@ -289,24 +324,86 @@ func (r *Runner) handleInitialize(req Request) {
 	})
 }
 
+func (r *Runner) sv() *agent.SessionView {
+	r.viewOnce.Do(func() { r.view = agent.NewSessionView(r.agent) })
+	return r.view
+}
+
+func (r *Runner) setCurrentSessionID(id string) {
+	r.sv().SetCurrent(id)
+}
+
+func (r *Runner) currentSession() (string, error) {
+	return r.sv().CurrentOrErr()
+}
+
+func (r *Runner) paramsSessionID(explicit string) (string, error) {
+	explicit = strings.TrimSpace(explicit)
+	if explicit != "" {
+		return explicit, nil
+	}
+	return r.currentSession()
+}
+
+func (r *Runner) acceptsSessionEvent(sessionID string) bool {
+	return r.sv().AcceptsSessionEvent(sessionID)
+}
+
+func (r *Runner) liveCurrentSessionID() string {
+	return r.sv().LiveCurrent()
+}
+
+func (r *Runner) currentSessionSummary() agent.SessionSummary {
+	return r.sv().CurrentSummary()
+}
+
+func (r *Runner) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
+	if ev.SessionID != "" {
+		if report, err := r.agent.TokenUsageForSession(ev.SessionID); err == nil {
+			return report
+		}
+	}
+	if current, err := r.currentSession(); err == nil {
+		if report, err := r.agent.TokenUsageForSession(current); err == nil {
+			return report
+		}
+	}
+	return agent.TokenReport{}
+}
+
 func (r *Runner) handleSessionNew(req Request) {
-	if err := r.agent.SessionNew(); err != nil {
+	id, err := r.agent.NewSession("", "primary")
+	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	r.pushSessionChanged()
-	r.respond(req.ID, r.agent.SessionCurrent())
+	r.setCurrentSessionID(id)
+	r.pushSessionChangedForSession(id)
+	r.respond(req.ID, r.currentSessionSummary())
 }
 
 func (r *Runner) handleSessionPrompt(ctx context.Context, req Request) {
 	var params struct {
-		Content string `json:"content"`
+		SessionID string `json:"session_id"`
+		Content   string `json:"content"`
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	res, err := r.agent.Submit(ctx, params.Content)
+	sessionID, err := r.paramsSessionID(params.SessionID)
+	if err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	if strings.TrimSpace(params.SessionID) != "" {
+		if _, err := r.agent.SessionSummaryForSession(sessionID); err != nil {
+			r.respondError(req.ID, -32000, err.Error())
+			return
+		}
+		r.setCurrentSessionID(sessionID)
+	}
+	res, err := r.agent.SubmitToSession(ctx, sessionID, params.Content)
 	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
@@ -319,8 +416,31 @@ func (r *Runner) handleSessionPrompt(ctx context.Context, req Request) {
 	})
 }
 
+func (r *Runner) handleSessionCancel(req Request) {
+	sessionID, err := r.currentSession()
+	if err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	if err := r.agent.CancelSession(sessionID); err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	r.respond(req.ID, map[string]any{"ok": true})
+}
+
 func (r *Runner) handleQueueList(req Request) {
-	r.respond(req.ID, r.agent.QueueSnapshot())
+	sessionID, err := r.currentSession()
+	if err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	q, err := r.agent.QueueSnapshotForSession(sessionID)
+	if err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	r.respond(req.ID, q)
 }
 
 func (r *Runner) handleSessionList(req Request) {
@@ -343,7 +463,8 @@ func (r *Runner) handleSessionList(req Request) {
 
 func (r *Runner) handleSessionMessages(req Request) {
 	var params struct {
-		ID string `json:"id"`
+		ID        string `json:"id"`
+		SessionID string `json:"session_id"`
 	}
 	if req.Params != nil {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -351,11 +472,24 @@ func (r *Runner) handleSessionMessages(req Request) {
 			return
 		}
 	}
-	if params.ID == "" {
-		r.respond(req.ID, r.agent.SessionMessages())
-		return
+	id := strings.TrimSpace(params.SessionID)
+	if id == "" {
+		id = strings.TrimSpace(params.ID)
 	}
-	msgs, err := r.agent.SessionMessagesFor(params.ID)
+	if id == "" {
+		var err error
+		id, err = r.currentSession()
+		if err != nil {
+			r.respondError(req.ID, -32000, err.Error())
+			return
+		}
+		if _, err := r.agent.SessionSummaryForSession(id); err != nil {
+			r.setCurrentSessionID("")
+			r.respondError(req.ID, -32000, err.Error())
+			return
+		}
+	}
+	msgs, err := r.agent.SessionMessagesFor(id)
 	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
@@ -371,12 +505,14 @@ func (r *Runner) handleSessionSwitch(req Request) {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	if err := r.agent.SessionSwitch(params.ID); err != nil {
+	summary, err := r.agent.OpenSession(params.ID)
+	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	r.pushSessionChanged()
-	r.respond(req.ID, r.agent.SessionCurrent())
+	r.setCurrentSessionID(summary.ID)
+	r.pushSessionChangedForSession(summary.ID)
+	r.respond(req.ID, summary)
 }
 
 func (r *Runner) handleSessionArchive(req Request) {
@@ -387,13 +523,13 @@ func (r *Runner) handleSessionArchive(req Request) {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	closedCurrent, err := r.agent.SessionArchive(params.ID)
-	if err != nil {
+	if err := r.agent.SessionArchive(params.ID); err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	if closedCurrent {
-		r.pushSessionChanged()
+	wasCurrent := r.sv().RemovedCurrent(params.ID)
+	if wasCurrent {
+		r.pushSessionChangedForSession(strings.TrimSpace(params.ID))
 	}
 	r.respond(req.ID, map[string]any{"ok": true})
 }
@@ -406,13 +542,13 @@ func (r *Runner) handleSessionDelete(req Request) {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	closedCurrent, err := r.agent.SessionDelete(params.ID)
-	if err != nil {
+	if err := r.agent.SessionDelete(params.ID); err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	if closedCurrent {
-		r.pushSessionChanged()
+	wasCurrent := r.sv().RemovedCurrent(params.ID)
+	if wasCurrent {
+		r.pushSessionChangedForSession(strings.TrimSpace(params.ID))
 	}
 	r.respond(req.ID, map[string]any{"ok": true})
 }
@@ -438,30 +574,65 @@ func (r *Runner) handleTurnAction(req Request, action string) {
 	if action == agent.TurnActionRevertCode {
 		params.AlsoRevertCode = false
 	}
-	result, err := r.agent.ApplyTurnAction(params.Turn, action, params.AlsoRevertCode)
+	sessionID, err := r.paramsSessionID(params.SessionID)
+	if err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	result, err := r.agent.ApplyTurnActionForSession(sessionID, params.Turn, action, params.AlsoRevertCode)
 	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
 	if result.SessionChanged {
-		r.pushSessionChanged()
+		if result.Session.ID != "" {
+			r.setCurrentSessionID(result.Session.ID)
+			r.pushSessionChangedForSession(result.Session.ID)
+		} else {
+			r.pushSessionChangedForSession(sessionID)
+		}
 	}
 	r.respond(req.ID, result)
 }
 
+func (r *Runner) handleModelCurrent(req Request) {
+	sessionID, err := r.currentSession()
+	if err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	model, err := r.agent.CurrentModelForSession(sessionID)
+	if err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	r.respond(req.ID, model)
+}
+
 func (r *Runner) handleModelSwitch(req Request) {
 	var params struct {
-		Ref string `json:"ref"`
+		SessionID string `json:"session_id"`
+		Ref       string `json:"ref"`
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	if err := r.agent.SwitchModel(params.Ref); err != nil {
+	sessionID, err := r.paramsSessionID(params.SessionID)
+	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	r.respond(req.ID, r.agent.CurrentModel())
+	if err := r.agent.SwitchModelForSession(sessionID, params.Ref); err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	model, err := r.agent.CurrentModelForSession(sessionID)
+	if err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	r.respond(req.ID, model)
 }
 
 func (r *Runner) handleFileRead(req Request) {
@@ -482,26 +653,52 @@ func (r *Runner) handleFileRead(req Request) {
 
 func (r *Runner) handlePermissionSuggest(req Request) {
 	var params struct {
-		Tool string `json:"tool"`
-		Arg  string `json:"arg"`
+		SessionID string `json:"session_id"`
+		ProjectID string `json:"project_id"`
+		Tool      string `json:"tool"`
+		Arg       string `json:"arg"`
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	r.respond(req.ID, r.agent.PermissionSuggest(params.Tool, params.Arg))
+	var (
+		suggestions []agent.PermissionSuggestion
+		err         error
+	)
+	if strings.TrimSpace(params.ProjectID) != "" {
+		suggestions, err = r.agent.PermissionSuggestForProject(params.ProjectID, params.Tool, params.Arg)
+	} else {
+		sessionID, sessionErr := r.paramsSessionID(params.SessionID)
+		if sessionErr != nil {
+			r.respondError(req.ID, -32000, sessionErr.Error())
+			return
+		}
+		suggestions, err = r.agent.PermissionSuggestForSession(sessionID, params.Tool, params.Arg)
+	}
+	if err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	r.respond(req.ID, suggestions)
 }
 
 func (r *Runner) handlePermissionSave(req Request) {
 	var params struct {
-		ID       string   `json:"id"`
-		Patterns []string `json:"patterns"`
+		SessionID string   `json:"session_id"`
+		ID        string   `json:"id"`
+		Patterns  []string `json:"patterns"`
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	if err := r.agent.SaveProjectPermission(params.ID, params.Patterns); err != nil {
+	sessionID, err := r.paramsSessionID(params.SessionID)
+	if err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	if err := r.agent.SaveProjectPermissionForSession(sessionID, params.ID, params.Patterns); err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
@@ -510,9 +707,10 @@ func (r *Runner) handlePermissionSave(req Request) {
 
 func (r *Runner) handlePermissionRespond(req Request) {
 	var params struct {
-		ID     string `json:"id"`
-		Allow  *bool  `json:"allow"`
-		Action string `json:"action"`
+		SessionID string `json:"session_id"`
+		ID        string `json:"id"`
+		Allow     *bool  `json:"allow"`
+		Action    string `json:"action"`
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		r.respondError(req.ID, -32602, "invalid params")
@@ -529,7 +727,12 @@ func (r *Runner) handlePermissionRespond(req Request) {
 			params.Action = "deny"
 		}
 	}
-	if err := r.agent.RespondPermissionAction(params.ID, params.Action); err != nil {
+	sessionID, err := r.paramsSessionID(params.SessionID)
+	if err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	if err := r.agent.RespondPermissionActionForSession(sessionID, params.ID, params.Action); err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
@@ -537,11 +740,42 @@ func (r *Runner) handlePermissionRespond(req Request) {
 }
 
 func (r *Runner) handleCompact(ctx context.Context, req Request) {
-	if err := r.agent.CompactNow(ctx); err != nil {
+	var params struct {
+		SessionID string `json:"session_id"`
+	}
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			r.respondError(req.ID, -32602, "invalid params")
+			return
+		}
+	}
+	sessionID := strings.TrimSpace(params.SessionID)
+	if sessionID == "" {
+		sessionID = r.liveCurrentSessionID()
+		if sessionID == "" {
+			r.respondError(req.ID, -32000, "no current session")
+			return
+		}
+	}
+	if err := r.agent.CompactNowForSession(ctx, sessionID); err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
 	r.respond(req.ID, map[string]any{"ok": true})
+}
+
+func (r *Runner) handleTokenUsage(req Request) {
+	sessionID, err := r.currentSession()
+	if err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	report, err := r.agent.TokenUsageForSession(sessionID)
+	if err != nil {
+		r.respondError(req.ID, -32000, err.Error())
+		return
+	}
+	r.respond(req.ID, report)
 }
 
 func warningSnapshot(warnings []agent.PromptWarning) []agent.PromptWarning {
@@ -552,14 +786,28 @@ func warningSnapshot(warnings []agent.PromptWarning) []agent.PromptWarning {
 }
 
 func (r *Runner) pushSessionChanged() {
+	current, err := r.currentSession()
+	if err != nil {
+		r.pushSessionChangedForSession("")
+		return
+	}
+	r.pushSessionChangedForSession(current)
+}
+
+func (r *Runner) pushSessionChangedForEvent(ev agent.Event) {
+	if strings.TrimSpace(ev.SessionID) != "" {
+		r.pushSessionChangedForSession(ev.SessionID)
+		return
+	}
+	r.pushSessionChanged()
+}
+
+func (r *Runner) pushSessionChangedForSession(sessionID string) {
+	payload := r.sv().SessionChangedPayload(sessionID)
 	r.sendNotification(Notification{
 		JSONRPC: "2.0",
 		Method:  "agent/session_changed",
-		Params: map[string]any{
-			"session":  r.agent.SessionCurrent(),
-			"messages": r.agent.SessionMessages(),
-			"tokens":   r.agent.TokenUsage(),
-		},
+		Params:  payload,
 	})
 }
 

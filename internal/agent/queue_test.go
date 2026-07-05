@@ -197,9 +197,9 @@ func TestQueuedInputWinsOverPendingWakeSignal(t *testing.T) {
 
 	a.lp.AddPendingSignal(loop.PendingSignal{Payload: "wake signal", Persist: true, Wake: true})
 	a.ensureRuntime().mu.Lock()
-	a.ensureRuntime().queue = []QueuedItem{{ID: "q-1", Content: "queued user"}}
-	a.ensureRuntime().queueSeq = 1
-	a.ensureRuntime().queueVersion = 1
+	a.ensureRuntime().sessionLocked().queue = []QueuedItem{{ID: "q-1", Content: "queued user"}}
+	a.ensureRuntime().sessionLocked().queueSeq = 1
+	a.ensureRuntime().sessionLocked().queueVersion = 1
 	a.ensureRuntime().mu.Unlock()
 
 	a.nudgeSignalScheduler()
@@ -237,7 +237,7 @@ func TestSubmitRejectsDuringTransition(t *testing.T) {
 	_ = startEventOrderAgent(t, a, cap)
 
 	a.ensureRuntime().mu.Lock()
-	a.ensureRuntime().transitioning = true
+	a.ensureRuntime().sessionLocked().transitioning = true
 	a.ensureRuntime().mu.Unlock()
 
 	_, err := a.Submit(context.Background(), "during switch")
@@ -250,7 +250,7 @@ func TestSubmitRejectsDuringTransition(t *testing.T) {
 
 	// Clearing transitioning lets submits proceed again.
 	a.ensureRuntime().mu.Lock()
-	a.ensureRuntime().transitioning = false
+	a.ensureRuntime().sessionLocked().transitioning = false
 	a.ensureRuntime().mu.Unlock()
 }
 
@@ -260,8 +260,8 @@ func TestTryDrainQueueCanceledContextDoesNotPersistQueuedDraft(t *testing.T) {
 		t.Fatalf("ensureSession: %v", err)
 	}
 	a.ensureRuntime().mu.Lock()
-	a.ensureRuntime().queue = []QueuedItem{{ID: "q-1", Content: "queued draft"}}
-	a.ensureRuntime().queueVersion = 1
+	a.ensureRuntime().sessionLocked().queue = []QueuedItem{{ID: "q-1", Content: "queued draft"}}
+	a.ensureRuntime().sessionLocked().queueVersion = 1
 	a.ensureRuntime().mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -276,46 +276,6 @@ func TestTryDrainQueueCanceledContextDoesNotPersistQueuedDraft(t *testing.T) {
 	}
 }
 
-func TestCloseForProjectSwitchClearsQueueUnderTransition(t *testing.T) {
-	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
-	cap := &eventCapture{}
-	_ = startEventOrderAgent(t, a, cap)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
-	}
-	a.ensureRuntime().mu.Lock()
-	a.ensureRuntime().queue = []QueuedItem{{ID: "q-1", Content: "stale"}}
-	a.ensureRuntime().queueSeq = 1
-	a.ensureRuntime().queueVersion = 4
-	a.ensureRuntime().mu.Unlock()
-
-	if err := a.CloseForProjectSwitch(); err != nil {
-		t.Fatalf("CloseForProjectSwitch: %v", err)
-	}
-	if a.store.Active() {
-		t.Fatal("project switch close should detach the active session")
-	}
-	got := a.QueueSnapshot()
-	if len(got.Items) != 0 || got.Items == nil {
-		t.Fatalf("queue after project switch = %#v, want empty non-nil slice", got.Items)
-	}
-	if got.Version <= 4 {
-		t.Fatalf("queue version = %d, want > 4", got.Version)
-	}
-	var sawEmpty bool
-	for _, ev := range cap.snapshot() {
-		if ev.Kind == EventQueueChanged && ev.QueueVersion == got.Version {
-			if len(ev.Queue) != 0 || ev.Queue == nil {
-				t.Fatalf("project switch event queue = %#v, want empty non-nil slice", ev.Queue)
-			}
-			sawEmpty = true
-		}
-	}
-	if !sawEmpty {
-		t.Fatalf("missing project switch queue_changed event: %#v", cap.snapshot())
-	}
-}
-
 func TestSessionNewClearsQueueAndBumpsVersionMonotonically(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
 	cap := &eventCapture{}
@@ -326,9 +286,9 @@ func TestSessionNewClearsQueueAndBumpsVersionMonotonically(t *testing.T) {
 
 	// White-box: seed a non-empty queue at a known version.
 	a.ensureRuntime().mu.Lock()
-	a.ensureRuntime().queue = []QueuedItem{{ID: "q-1", Content: "stale"}}
-	a.ensureRuntime().queueSeq = 1
-	a.ensureRuntime().queueVersion = 7
+	a.ensureRuntime().sessionLocked().queue = []QueuedItem{{ID: "q-1", Content: "stale"}}
+	a.ensureRuntime().sessionLocked().queueSeq = 1
+	a.ensureRuntime().sessionLocked().queueVersion = 7
 	a.ensureRuntime().mu.Unlock()
 
 	if err := a.SessionNew(); err != nil {
@@ -502,21 +462,20 @@ func TestCompactNowNudgesQueueDrainer(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Stream bool `json:"stream"`
+			Tools []map[string]any `json:"tools"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if !body.Stream {
+		if len(body.Tools) == 0 {
 			startedOnce.Do(func() { close(summaryStarted) })
 			select {
 			case <-releaseSummary:
 			case <-r.Context().Done():
 				return
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"compact summary"},"finish_reason":"stop"}]}`))
+			writeTextResponse(w, "compact summary")
 			return
 		}
 		writeTextResponse(w, "drained")
@@ -575,16 +534,15 @@ func TestAutoCompactionEventOrderInsideTurn(t *testing.T) {
 	var summaryOnce sync.Once
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Stream bool `json:"stream"`
+			Tools []map[string]any `json:"tools"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if !body.Stream {
+		if len(body.Tools) == 0 {
 			summaryOnce.Do(func() { close(summaryRequest) })
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"compact summary"},"finish_reason":"stop"}]}`))
+			writeTextResponse(w, "compact summary")
 			return
 		}
 		writeTextResponse(w, "after compaction")
@@ -671,15 +629,14 @@ func TestAutoCompactionBeforeFollowUpPreservesActiveToolTail(t *testing.T) {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if stream, _ := body["stream"].(bool); !stream {
+		if tools, _ := body["tools"].([]any); len(tools) == 0 {
 			messages, _ := body["messages"].([]any)
 			if len(messages) > 1 {
 				if msg, ok := messages[1].(map[string]any); ok {
 					summaryInput, _ = msg["content"].(string)
 				}
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"summary after tool"},"finish_reason":"stop"}]}`))
+			writeTextResponse(w, "summary after tool")
 			return
 		}
 		streamCalls++
@@ -755,9 +712,8 @@ func TestAutoCompactionBeforeFollowUpPreservesActiveReadTracker(t *testing.T) {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if stream, _ := body["stream"].(bool); !stream {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"summary after read"},"finish_reason":"stop"}]}`))
+		if tools, _ := body["tools"].([]any); len(tools) == 0 {
+			writeTextResponse(w, "summary after read")
 			return
 		}
 		streamCalls++
@@ -872,8 +828,8 @@ func TestActiveTailReadRecordsResolveRelativePathFromWorkspaceRoot(t *testing.T)
 func TestQueueSnapshotReturnsCopy(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
 	a.ensureRuntime().mu.Lock()
-	a.ensureRuntime().queue = []QueuedItem{{ID: "q-1", Content: "a"}}
-	a.ensureRuntime().queueVersion = 3
+	a.ensureRuntime().sessionLocked().queue = []QueuedItem{{ID: "q-1", Content: "a"}}
+	a.ensureRuntime().sessionLocked().queueVersion = 3
 	a.ensureRuntime().mu.Unlock()
 
 	snap := a.QueueSnapshot()
@@ -962,9 +918,9 @@ func contains(ss []string, want string) bool {
 func seedQueue(t *testing.T, a *Agent, version int, content string) {
 	t.Helper()
 	a.ensureRuntime().mu.Lock()
-	a.ensureRuntime().queue = []QueuedItem{{ID: "q-1", Content: content}}
-	a.ensureRuntime().queueSeq = 1
-	a.ensureRuntime().queueVersion = version
+	a.ensureRuntime().sessionLocked().queue = []QueuedItem{{ID: "q-1", Content: content}}
+	a.ensureRuntime().sessionLocked().queueSeq = 1
+	a.ensureRuntime().sessionLocked().queueVersion = version
 	a.ensureRuntime().mu.Unlock()
 }
 

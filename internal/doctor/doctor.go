@@ -321,36 +321,21 @@ func daemonChecks(p Params, add func(group, name, status, detail string)) {
 		add("daemon", "project", StatusOK, fmt.Sprintf("project %s (%s)", current.Name, current.ID))
 	}
 
-	daemonDir := filepath.Join(p.Home, ".lightcode", "daemon")
-	entries, err := os.ReadDir(daemonDir)
+	lockPath := server.Path(p.Home)
+	lf, err := server.Read(p.Home)
 	if os.IsNotExist(err) {
 		add("daemon", "lockfiles", StatusOK, "none")
 		return
 	}
 	if err != nil {
-		add("daemon", "lockfiles", StatusWarn, err.Error())
+		add("daemon", "owner", StatusWarn, fmt.Sprintf("malformed lockfile: %v", err))
 		return
 	}
-	found := false
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".lock" {
-			continue
-		}
-		found = true
-		projectID := entry.Name()[:len(entry.Name())-len(".lock")]
-		lf, err := server.Read(p.Home, projectID)
-		switch {
-		case err != nil:
-			add("daemon", projectID, StatusWarn, fmt.Sprintf("malformed lockfile: %v", err))
-		case server.IsStale(lf):
-			add("daemon", projectID, StatusWarn, fmt.Sprintf("stale lockfile (pid %d not running)", lf.PID))
-		default:
-			add("daemon", projectID, StatusOK, fmt.Sprintf("running (pid %d, port %d)", lf.PID, lf.Port))
-		}
+	if server.IsStale(lf) {
+		add("daemon", "owner", StatusWarn, fmt.Sprintf("stale lockfile (pid %d not running)", lf.PID))
+		return
 	}
-	if !found {
-		add("daemon", "lockfiles", StatusOK, "none")
-	}
+	add("daemon", "owner", StatusOK, fmt.Sprintf("running (pid %d, port %d, lock %s)", lf.PID, lf.Port, lockPath))
 }
 
 func summarize(checks []Check) Report {

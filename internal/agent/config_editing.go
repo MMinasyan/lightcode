@@ -241,7 +241,7 @@ func applyProviderFields(pm map[string]any, cfg ProviderConfigInput) {
 // connected provider.
 func (a *Agent) DiscoverableModels(providerID string) ([]DiscoveryModelCandidate, error) {
 	a.ensureRuntime().mu.Lock()
-	if a.ensureRuntime().busy {
+	if a.ensureRuntime().sessionLocked().busy {
 		a.ensureRuntime().mu.Unlock()
 		return nil, fmt.Errorf("cannot discover models while a turn is running")
 	}
@@ -326,7 +326,7 @@ func lockedModelFields(cfg ModelConfigInput) error {
 func (a *Agent) SaveModel(providerID, modelID string, cfg ModelConfigInput) error {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().busy {
+	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot edit model while a turn is running")
 	}
 	providerID = strings.TrimSpace(providerID)
@@ -360,7 +360,7 @@ func (a *Agent) SaveModel(providerID, modelID string, cfg ModelConfigInput) erro
 func (a *Agent) DeleteModel(providerID, modelID string) error {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().busy {
+	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot delete model while a turn is running")
 	}
 	providerID = strings.TrimSpace(providerID)
@@ -399,7 +399,7 @@ var resettableModelFields = map[string]struct{}{
 func (a *Agent) ResetModelField(providerID, modelID, field string) error {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().busy {
+	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot reset model field while a turn is running")
 	}
 	if _, ok := resettableModelFields[field]; !ok {
@@ -431,7 +431,7 @@ func (a *Agent) ResetModelField(providerID, modelID, field string) error {
 func (a *Agent) SetProviderConfig(providerID string, cfg ProviderConfigInput) error {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().busy {
+	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot edit provider while a turn is running")
 	}
 	providerID = strings.TrimSpace(providerID)
@@ -531,7 +531,7 @@ var transportFields = map[string]struct{}{
 func (a *Agent) ResetProviderField(providerID, field string) error {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().busy {
+	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot reset provider field while a turn is running")
 	}
 	if _, ok := resettableProviderFields[field]; !ok {

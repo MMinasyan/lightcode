@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os/exec"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -63,6 +64,12 @@ type ExitEvent struct {
 	FormatOutput func() string
 }
 
+// SessionManager binds process operations to one session.
+type SessionManager struct {
+	manager   *Manager
+	sessionID func() string
+}
+
 // NewManager creates a new process Manager. maxProcs limits concurrent
 // background processes (0 = unlimited).
 func NewManager(maxProcs int, outputOptions cmdoutput.Options) *Manager {
@@ -101,12 +108,64 @@ func (m *Manager) SetSessionProvider(provider func() string) {
 	m.sessionID = provider
 }
 
+func (m *Manager) ForSession(sessionID func() string) *SessionManager {
+	return &SessionManager{manager: m, sessionID: sessionID}
+}
+
+func (m *SessionManager) currentSessionID() string {
+	if m == nil || m.sessionID == nil {
+		return ""
+	}
+	return strings.TrimSpace(m.sessionID())
+}
+
+func (m *SessionManager) Start(command string, timeoutSec int) (string, error) {
+	if m == nil || m.manager == nil {
+		return "", fmt.Errorf("process: manager unavailable")
+	}
+	return m.manager.StartForSession(m.currentSessionID(), command, timeoutSec)
+}
+
+func (m *SessionManager) Read(id string) (string, error) {
+	if m == nil || m.manager == nil {
+		return "", fmt.Errorf("process: manager unavailable")
+	}
+	return m.manager.ReadForSession(m.currentSessionID(), id)
+}
+
+func (m *SessionManager) Kill(id string) error {
+	if m == nil || m.manager == nil {
+		return fmt.Errorf("process: manager unavailable")
+	}
+	return m.manager.KillForSession(m.currentSessionID(), id)
+}
+
+func (m *SessionManager) List() string {
+	if m == nil || m.manager == nil {
+		return "No background processes."
+	}
+	return m.manager.ListForSession(m.currentSessionID())
+}
+
+func (m *SessionManager) ActiveIDs() []string {
+	if m == nil || m.manager == nil {
+		return nil
+	}
+	return m.manager.ActiveIDsForSession(m.currentSessionID())
+}
+
 // Start launches a background process and returns its ID.
 func (m *Manager) Start(command string, timeoutSec int) (string, error) {
-	sessionID := m.currentSessionID()
-	if m.maxProcs > 0 {
-		running := 0
-		m.mu.Lock()
+	return m.StartForSession(m.currentSessionID(), command, timeoutSec)
+}
+
+func (m *Manager) StartForSession(sessionID string, command string, timeoutSec int) (string, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	m.mu.Lock()
+	maxProcs := m.maxProcs
+	outputOptions := m.outputOptions
+	running := 0
+	if maxProcs > 0 {
 		for _, cs := range m.procs {
 			if cs.SessionID != sessionID {
 				continue
@@ -117,10 +176,10 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 			}
 			cs.mu.Unlock()
 		}
-		m.mu.Unlock()
-		if running >= m.maxProcs {
-			return "", fmt.Errorf("process: background process limit reached (%d/%d). Kill existing processes or wait for them to exit", running, m.maxProcs)
-		}
+	}
+	m.mu.Unlock()
+	if maxProcs > 0 && running >= maxProcs {
+		return "", fmt.Errorf("process: background process limit reached (%d/%d). Kill existing processes or wait for them to exit", running, maxProcs)
 	}
 
 	id, err := newProcessID()
@@ -132,7 +191,7 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 		cmd.Dir = m.workspaceRoot
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	capture := cmdoutput.NewCapture(m.outputOptions)
+	capture := cmdoutput.NewCapture(outputOptions)
 	cmd.Stdout = capture.Stdout()
 	cmd.Stderr = capture.Stderr()
 
@@ -224,7 +283,11 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 
 // Read returns output accumulated so far for a running background process.
 func (m *Manager) Read(id string) (string, error) {
-	sessionID := m.currentSessionID()
+	return m.ReadForSession(m.currentSessionID(), id)
+}
+
+func (m *Manager) ReadForSession(sessionID, id string) (string, error) {
+	sessionID = strings.TrimSpace(sessionID)
 	m.mu.Lock()
 	cs, ok := m.procs[id]
 	m.mu.Unlock()
@@ -248,14 +311,14 @@ func (m *Manager) Read(id string) (string, error) {
 // Kill terminates a background process. Sends SIGTERM, waits 500ms,
 // then SIGKILL.
 func (m *Manager) Kill(id string) error {
-	return m.kill(id, true)
+	return m.KillForSession(m.currentSessionID(), id)
 }
 
-func (m *Manager) kill(id string, enforceSession bool) error {
-	sessionID := ""
-	if enforceSession {
-		sessionID = m.currentSessionID()
-	}
+func (m *Manager) KillForSession(sessionID, id string) error {
+	return m.kill(id, strings.TrimSpace(sessionID), true)
+}
+
+func (m *Manager) kill(id string, sessionID string, enforceSession bool) error {
 	m.mu.Lock()
 	cs, ok := m.procs[id]
 	m.mu.Unlock()
@@ -298,7 +361,11 @@ func terminateProcessGroup(pid int) {
 
 // List returns a formatted list of background processes for the current session.
 func (m *Manager) List() string {
-	sessionID := m.currentSessionID()
+	return m.ListForSession(m.currentSessionID())
+}
+
+func (m *Manager) ListForSession(sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var result string
@@ -325,7 +392,11 @@ func (m *Manager) List() string {
 }
 
 func (m *Manager) ActiveIDs() []string {
-	sessionID := m.currentSessionID()
+	return m.ActiveIDsForSession(m.currentSessionID())
+}
+
+func (m *Manager) ActiveIDsForSession(sessionID string) []string {
+	sessionID = strings.TrimSpace(sessionID)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ids := make([]string, 0, len(m.procs))
@@ -353,7 +424,7 @@ func (m *Manager) KillAll() {
 	}
 	m.mu.Unlock()
 	for _, id := range ids {
-		_ = m.kill(id, false)
+		_ = m.kill(id, "", false)
 	}
 }
 

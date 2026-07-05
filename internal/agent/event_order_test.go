@@ -532,6 +532,60 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 	})
 }
 
+func TestTwoLiveSessionsRunTurnsConcurrently(t *testing.T) {
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := inFlight.Add(1)
+		for {
+			max := maxInFlight.Load()
+			if current <= max || maxInFlight.CompareAndSwap(max, current) {
+				break
+			}
+		}
+		entered <- struct{}{}
+		<-release
+		inFlight.Add(-1)
+		writeTextResponse(w, "done")
+	}))
+	defer server.Close()
+	defer releaseOnce.Do(func() { close(release) })
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+
+	if _, err := a.SubmitToSession(ctx, firstID, "first"); err != nil {
+		t.Fatalf("SubmitToSession first: %v", err)
+	}
+	if _, err := a.SubmitToSession(ctx, secondID, "second"); err != nil {
+		t.Fatalf("SubmitToSession second: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d requests entered provider; max in flight = %d", i, maxInFlight.Load())
+		}
+	}
+	if maxInFlight.Load() < 2 {
+		t.Fatalf("max concurrent provider requests = %d, want at least 2", maxInFlight.Load())
+	}
+	releaseOnce.Do(func() { close(release) })
+	waitUntilEventOrderTurnEndCount(t, cap, 2)
+}
+
 type fakeAgentPendingExecutor struct {
 	results map[string]tool.BatchResult
 }

@@ -548,12 +548,11 @@ func TestSymlinkDataDirWarns(t *testing.T) {
 func TestLockfiles(t *testing.T) {
 	home := t.TempDir()
 	writeConfig(t, home, `{"providers": {}, "default_model": ""}`)
-	daemonDir := filepath.Join(home, ".lightcode", "daemon")
-	if err := os.MkdirAll(daemonDir, 0o700); err != nil {
+	ownerPath := filepath.Join(home, ".lightcode", "owner.lock")
+	if err := os.MkdirAll(filepath.Dir(ownerPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
 
-	// Live: this test process. Stale: a child that has already exited.
 	livePID := os.Getpid()
 	cmd := exec.Command("true")
 	if err := cmd.Run(); err != nil {
@@ -561,23 +560,27 @@ func TestLockfiles(t *testing.T) {
 	}
 	stalePID := cmd.Process.Pid
 
-	write := func(name, body string) {
-		if err := os.WriteFile(filepath.Join(daemonDir, name), []byte(body), 0o600); err != nil {
+	write := func(body string) {
+		if err := os.WriteFile(ownerPath, []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	write("liveproj.lock", fmt.Sprintf(`{"port": 4321, "token": "t", "pid": %d}`, livePID))
-	write("staleproj.lock", fmt.Sprintf(`{"port": 4322, "token": "t", "pid": %d}`, stalePID))
-	write("badproj.lock", "{garbage")
+	write(fmt.Sprintf(`{"port": 4321, "token": "t", "pid": %d}`, livePID))
 
 	report, _ := run(t, params(home))
-	if c := find(t, report, "daemon", "liveproj"); c.Status != StatusOK {
+	if c := find(t, report, "daemon", "owner"); c.Status != StatusOK {
 		t.Fatalf("live lockfile = %+v", c)
 	}
-	if c := find(t, report, "daemon", "staleproj"); c.Status != StatusWarn {
+
+	write(fmt.Sprintf(`{"port": 4322, "token": "t", "pid": %d}`, stalePID))
+	report, _ = run(t, params(home))
+	if c := find(t, report, "daemon", "owner"); c.Status != StatusWarn {
 		t.Fatalf("stale lockfile = %+v", c)
 	}
-	if c := find(t, report, "daemon", "badproj"); c.Status != StatusWarn {
+
+	write("{garbage")
+	report, _ = run(t, params(home))
+	if c := find(t, report, "daemon", "owner"); c.Status != StatusWarn {
 		t.Fatalf("malformed lockfile = %+v", c)
 	}
 	if report.Failures != 0 {

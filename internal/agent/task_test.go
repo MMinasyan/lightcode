@@ -62,7 +62,7 @@ func TestForwardEventsTagsEvents(t *testing.T) {
 	source <- loop.Event{Kind: loop.ToolCallEnd, ToolName: "read_file", Result: "done"}
 	close(source)
 
-	task.forwardEvents(source, 2, "subsession", "parent-call")
+	task.forwardEvents(source, 2, "subsession", "parent-session", "project-a", "parent-call")
 	close(tagged)
 
 	var got []TaggedLoopEvent
@@ -73,8 +73,8 @@ func TestForwardEventsTagsEvents(t *testing.T) {
 		t.Fatalf("tagged events = %d, want 3", len(got))
 	}
 	for i, ev := range got {
-		if ev.SessionID != "subsession" || ev.TaskIndex != 2 || ev.ToolCallID != "parent-call" {
-			t.Fatalf("event[%d] tag = session:%q index:%d call:%q", i, ev.SessionID, ev.TaskIndex, ev.ToolCallID)
+		if ev.SessionID != "subsession" || ev.ParentSessionID != "parent-session" || ev.ProjectID != "project-a" || ev.TaskIndex != 2 || ev.ToolCallID != "parent-call" {
+			t.Fatalf("event[%d] tag = session:%q parent:%q project:%q index:%d call:%q", i, ev.SessionID, ev.ParentSessionID, ev.ProjectID, ev.TaskIndex, ev.ToolCallID)
 		}
 	}
 	if got[0].Event.Kind != loop.ToolCallStart || got[1].Event.Kind != loop.TextDelta || got[2].Event.Kind != loop.ToolCallEnd {
@@ -87,7 +87,7 @@ func TestForwardEventsNoopWhenTaggedEventsNil(t *testing.T) {
 	source := make(chan loop.Event, 1)
 	source <- loop.Event{Kind: loop.TextDelta, Result: "ignored"}
 	close(source)
-	task.forwardEvents(source, 0, "", "")
+	task.forwardEvents(source, 0, "", "", "", "")
 }
 
 func TestForwardEventsBurst(t *testing.T) {
@@ -100,7 +100,7 @@ func TestForwardEventsBurst(t *testing.T) {
 	forwardDone.Add(1)
 	go func() {
 		defer forwardDone.Done()
-		task.forwardEvents(source, 1, "session", "parent")
+		task.forwardEvents(source, 1, "session", "root", "project", "parent")
 	}()
 
 	var received []TaggedLoopEvent
@@ -125,7 +125,7 @@ func TestForwardEventsBurst(t *testing.T) {
 		t.Fatalf("forwarded burst events = %d, want %d", len(received), count)
 	}
 	for i, ev := range received {
-		if ev.SessionID != "session" || ev.TaskIndex != 1 || ev.ToolCallID != "parent" || ev.Event.Kind != loop.TextDelta {
+		if ev.SessionID != "session" || ev.ParentSessionID != "root" || ev.ProjectID != "project" || ev.TaskIndex != 1 || ev.ToolCallID != "parent" || ev.Event.Kind != loop.TextDelta {
 			t.Fatalf("event[%d] = %+v, want stable tags", i, ev)
 		}
 	}
@@ -134,6 +134,11 @@ func TestForwardEventsBurst(t *testing.T) {
 func TestDrainPendingLoopEventsDrainsTaggedSubagentEvents(t *testing.T) {
 	a := &Agent{}
 	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	a.ensureSessionMapLocked()
+	parentUnit := &session{rt: rt}
+	a.sessions["parent-session"] = parentUnit
+	rt.mu.Unlock()
 	rt.taggedEvents = make(chan TaggedLoopEvent, 2)
 	var got []Event
 	a.SetEventHandler(func(ev Event) {
@@ -141,20 +146,22 @@ func TestDrainPendingLoopEventsDrainsTaggedSubagentEvents(t *testing.T) {
 	})
 
 	rt.taggedEvents <- TaggedLoopEvent{
-		SessionID:  "child-session",
-		TaskIndex:  1,
-		ToolCallID: "parent-task",
-		Event:      loop.Event{Kind: loop.ToolCallStart, ToolCallID: "child-tool", ToolName: "read_file"},
+		SessionID:       "child-session",
+		ParentSessionID: "parent-session",
+		ProjectID:       "project-a",
+		TaskIndex:       1,
+		ToolCallID:      "parent-task",
+		Event:           loop.Event{Kind: loop.ToolCallStart, ToolCallID: "child-tool", ToolName: "read_file"},
 	}
 	a.drainPendingLoopEvents()
 
 	if len(got) != 2 {
 		t.Fatalf("events = %#v, want subagent start and tool start", got)
 	}
-	if got[0].Kind != EventSubagentStart || got[0].SubagentSessionID != "child-session" {
+	if got[0].Kind != EventSubagentStart || got[0].SubagentSessionID != "child-session" || got[0].ParentSessionID != "parent-session" || got[0].ProjectID != "project-a" {
 		t.Fatalf("event[0] = %+v, want subagent start", got[0])
 	}
-	if got[1].Kind != EventToolCallStart || got[1].SubagentSessionID != "child-session" || got[1].ToolCallID != "child-tool" {
+	if got[1].Kind != EventToolCallStart || got[1].SubagentSessionID != "child-session" || got[1].ParentSessionID != "parent-session" || got[1].ProjectID != "project-a" || got[1].ToolCallID != "child-tool" {
 		t.Fatalf("event[1] = %+v, want child tool start", got[1])
 	}
 }
@@ -535,17 +542,18 @@ func TestTaskToolPersistsInspectableChildSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SessionList: %v", err)
 	}
-	var foundChild bool
 	for _, s := range sessions {
 		if s.ID == subEv.SubagentSessionID {
-			foundChild = true
-			if s.ParentSessionID != parentID {
-				t.Fatalf("child ParentSessionID = %q, want %q", s.ParentSessionID, parentID)
-			}
+			t.Fatalf("child session %q should not be listed in active sessions", subEv.SubagentSessionID)
 		}
 	}
-	if !foundChild {
-		t.Fatalf("child session %q not listed in active sessions: %#v", subEv.SubagentSessionID, sessions)
+
+	childMsgs, err := a.SessionMessagesFor(subEv.SubagentSessionID)
+	if err != nil {
+		t.Fatalf("SessionMessagesFor child: %v", err)
+	}
+	if len(childMsgs) == 0 {
+		t.Fatal("child transcript is empty, expected child messages")
 	}
 
 	parentMsgs := a.SessionMessages()
@@ -572,10 +580,6 @@ func TestTaskToolPersistsInspectableChildSession(t *testing.T) {
 		t.Fatalf("task subagent link = %#v, want index 0 session %q", taskRow.SubagentSessionIDs[0], subEv.SubagentSessionID)
 	}
 
-	childMsgs, err := a.SessionMessagesFor(subEv.SubagentSessionID)
-	if err != nil {
-		t.Fatalf("SessionMessagesFor child: %v", err)
-	}
 	if got := a.SessionCurrent().ID; got != parentID {
 		t.Fatalf("SessionMessagesFor switched current session to %q, want parent %q", got, parentID)
 	}
@@ -586,19 +590,8 @@ func TestTaskToolPersistsInspectableChildSession(t *testing.T) {
 		t.Fatalf("child transcript read by id missing assistant result: %#v", childMsgs)
 	}
 
-	if err := a.SessionSwitch(subEv.SubagentSessionID); err != nil {
-		t.Fatalf("SessionSwitch child: %v", err)
-	}
-	child := a.SessionCurrent()
-	if child.ParentSessionID != parentID {
-		t.Fatalf("current child ParentSessionID = %q, want %q", child.ParentSessionID, parentID)
-	}
-	childMsgs = a.SessionMessages()
-	if !hasDisplayMessage(childMsgs, "user", "inspect child") {
-		t.Fatalf("child transcript missing task prompt: %#v", childMsgs)
-	}
-	if !hasDisplayMessage(childMsgs, "assistant", "CHILD_ONLY") {
-		t.Fatalf("child transcript missing assistant result: %#v", childMsgs)
+	if err := a.SessionSwitch(subEv.SubagentSessionID); err == nil {
+		t.Fatal("SessionSwitch child should reject internal session")
 	}
 }
 
@@ -1027,22 +1020,24 @@ func TestSubagentRunCommandUsesFreshPermissionWrappedTool(t *testing.T) {
 // Agent.seenSessions must be safe under concurrent dispatch + reset.
 func TestPR11Closure_SeenSessionsNoRace(t *testing.T) {
 	agent := &Agent{}
-	agent.ensureRuntime().seenSessions = map[string]bool{}
+	rt := agent.ensureRuntime()
+	agent.session = &session{}
+	agent.session.seenSessions = map[string]bool{}
 	var wg sync.WaitGroup
 	const N = 100
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		for i := 0; i < N; i++ {
-			agent.dispatchTaggedEvent(TaggedLoopEvent{SessionID: "sub", Event: loop.Event{Kind: loop.ToolCallStart}})
+			agent.dispatchTaggedEvent(TaggedLoopEvent{SessionID: "sub", ProjectID: "project", Event: loop.Event{Kind: loop.ToolCallStart}})
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		for i := 0; i < N; i++ {
-			agent.ensureRuntime().mu.Lock()
-			agent.ensureRuntime().seenSessions = map[string]bool{}
-			agent.ensureRuntime().mu.Unlock()
+			rt.mu.Lock()
+			agent.session.seenSessions = map[string]bool{}
+			rt.mu.Unlock()
 		}
 	}()
 	wg.Wait()

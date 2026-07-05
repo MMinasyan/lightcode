@@ -13,9 +13,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/compact"
 	loop "github.com/MMinasyan/lightcode/internal/engine"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/provider"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
@@ -163,14 +166,20 @@ func TestRunCompactionPreservesPendingSignalsForMainModel(t *testing.T) {
 		if !ok || len(messages) != 2 {
 			t.Fatalf("summarizer messages = %#v, want system and user", body["messages"])
 		}
+		systemMsg, ok := messages[0].(map[string]any)
+		if !ok {
+			t.Fatalf("summarizer system message = %#v", messages[0])
+		}
+		if got, _ := systemMsg["content"].(string); got != compact.DefaultSummarizerPrompt {
+			t.Fatalf("summarizer system prompt = %q, want compact prompt body", got)
+		}
 		userMsg, ok := messages[1].(map[string]any)
 		if !ok {
 			t.Fatalf("summarizer user message = %#v", messages[1])
 		}
 		content, _ := userMsg["content"].(string)
 		sawSignal = strings.Contains(content, `<system-signal>idle signal</system-signal>`)
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"summary"},"finish_reason":"stop"}]}`)
+		writeTextResponse(w, "summary")
 	}))
 	defer server.Close()
 
@@ -198,8 +207,7 @@ func TestRunCompactionPreservesPendingSignalsForMainModel(t *testing.T) {
 func TestCompactionMemoryHookRunsOnlyAfterSuccessfulSummary(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"hook summary"},"finish_reason":"stop"}]}`)
+			writeTextResponse(w, "hook summary")
 		}))
 		defer server.Close()
 
@@ -241,8 +249,7 @@ func TestCompactionMemoryHookRunsOnlyAfterSuccessfulSummary(t *testing.T) {
 func TestCompactionIndexesConversationSessionAndSearchHistoryRecallsSummary(t *testing.T) {
 	const summary = "## Goal\nremember alpha detail"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"id":"chat-1","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":%q},"finish_reason":"stop"}]}`, summary)
+		writeTextResponse(w, summary)
 	}))
 	defer server.Close()
 
@@ -291,6 +298,138 @@ func TestCompactionIndexesConversationSessionAndSearchHistoryRecallsSummary(t *t
 	}
 	if !strings.Contains(result, sessionID) || !strings.Contains(result, wantCompactionPath) || !strings.Contains(result, "remember alpha detail") {
 		t.Fatalf("search_history result = %q, want session id, compaction path, and summary", result)
+	}
+}
+
+func TestCompactionWritesCompactTranscript(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		writeTextResponse(w, fmt.Sprintf("summary-%d", calls))
+	}))
+	defer server.Close()
+
+	a := newCatalogBackedTestAgent(t)
+	appendUserTurn(t, a, strings.Repeat("alpha ", 1600))
+	appendUserTurn(t, a, strings.Repeat("beta ", 1600))
+	sessionID := a.store.SessionID()
+	a.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
+
+	if err := a.runCompaction(context.Background(), false); err != nil {
+		t.Fatalf("runCompaction returned error: %v", err)
+	}
+	if calls < 2 {
+		t.Fatalf("summarizer calls = %d, want iterative compaction to make at least 2 calls", calls)
+	}
+
+	infos, err := snapshot.List(a.store.Root(), "", snapshot.StateActive)
+	if err != nil {
+		t.Fatalf("list sessions: %v", err)
+	}
+	var childID string
+	for _, info := range infos {
+		if info.ParentSessionID == sessionID {
+			if childID != "" {
+				t.Fatalf("multiple compact child sessions found: %q and %q", childID, info.ID)
+			}
+			childID = info.ID
+		}
+	}
+	if childID == "" {
+		t.Fatal("compact child session was not created")
+	}
+	if childID == sessionID {
+		t.Fatalf("compact child session reused conversation id %q", sessionID)
+	}
+	if _, err := os.Stat(filepath.Join(a.store.Root(), childID, "compaction.json")); !os.IsNotExist(err) {
+		t.Fatalf("compact child compaction.json stat error = %v, want not exist", err)
+	}
+	if _, err := os.Stat(filepath.Join(a.store.Dir(), "compaction.json")); err != nil {
+		t.Fatalf("conversation compaction.json stat: %v", err)
+	}
+	meta, err := snapshot.LoadSessionMeta(a.store.Root(), childID)
+	if err != nil {
+		t.Fatalf("load compact child meta: %v", err)
+	}
+	if meta.ActiveAgentType != "compact" {
+		t.Fatalf("compact child active agent type = %q, want compact", meta.ActiveAgentType)
+	}
+	sessions, err := a.SessionList(snapshot.StateActive)
+	if err != nil {
+		t.Fatalf("SessionList: %v", err)
+	}
+	for _, session := range sessions {
+		if session.ID == childID {
+			t.Fatalf("compact child session leaked into SessionList: %#v", sessions)
+		}
+	}
+	projectSessions, err := a.SessionListForProjectPath(a.projectRoot, snapshot.StateActive)
+	if err != nil {
+		t.Fatalf("SessionListForProjectPath: %v", err)
+	}
+	for _, session := range projectSessions {
+		if session.ID == childID {
+			t.Fatalf("compact child session leaked into project SessionList: %#v", projectSessions)
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		run  func() error
+	}{
+		{name: "open", run: func() error { _, err := a.OpenSession(childID); return err }},
+		{name: "switch", run: func() error { return a.SessionSwitch(childID) }},
+		{name: "archive", run: func() error { return a.SessionArchive(childID) }},
+		{name: "delete", run: func() error { return a.SessionDelete(childID) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.run()
+			if err == nil || !strings.Contains(err.Error(), "internal transcript session") {
+				t.Fatalf("%s compact child error = %v, want internal transcript rejection", tc.name, err)
+			}
+		})
+	}
+	if got := a.SessionCurrent().ID; got != sessionID {
+		t.Fatalf("current session after rejected compact management = %q, want %q", got, sessionID)
+	}
+
+	childStore, err := snapshot.NewForSessionsRoot(a.store.Root(), "", "")
+	if err != nil {
+		t.Fatalf("new child store: %v", err)
+	}
+	if err := childStore.LoadSession(childID); err != nil {
+		t.Fatalf("load compact child session: %v", err)
+	}
+	turns, err := childStore.LoadCompleteTurnsReadOnly()
+	if err != nil {
+		t.Fatalf("load compact child turns: %v", err)
+	}
+	if len(turns) != calls {
+		t.Fatalf("compact transcript turns = %d, want %d", len(turns), calls)
+	}
+	for i, turn := range turns {
+		if len(turn.Messages) != 2 {
+			t.Fatalf("compact turn %d messages = %d, want user and assistant", turn.Turn, len(turn.Messages))
+		}
+		var userMsg, assistantMsg message.Message
+		if err := json.Unmarshal(turn.Messages[0], &userMsg); err != nil {
+			t.Fatalf("decode compact user turn %d: %v", turn.Turn, err)
+		}
+		if err := json.Unmarshal(turn.Messages[1], &assistantMsg); err != nil {
+			t.Fatalf("decode compact assistant turn %d: %v", turn.Turn, err)
+		}
+		if userMsg.Role != message.RoleUser {
+			t.Fatalf("compact turn %d first role = %q, want user", turn.Turn, userMsg.Role)
+		}
+		if assistantMsg.Role != message.RoleAssistant || assistantMsg.TextContent() != fmt.Sprintf("summary-%d", i+1) {
+			t.Fatalf("compact turn %d assistant = role:%q text:%q", turn.Turn, assistantMsg.Role, assistantMsg.TextContent())
+		}
+	}
+	displayMessages, err := a.SessionMessagesFor(childID)
+	if err != nil {
+		t.Fatalf("SessionMessagesFor compact child: %v", err)
+	}
+	if len(displayMessages) == 0 {
+		t.Fatal("SessionMessagesFor compact child returned no transcript rows")
 	}
 }
 

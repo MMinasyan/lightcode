@@ -52,6 +52,7 @@ type SessionMeta struct {
 	Provider         string `json:"provider,omitempty"`
 	Model            string `json:"model,omitempty"`
 	ParentSessionID  string `json:"parent_session_id,omitempty"`
+	ActiveAgentType  string `json:"active_agent_type,omitempty"`
 }
 
 // SnapshotMeta is written alongside each snapshotted file. OriginalPath

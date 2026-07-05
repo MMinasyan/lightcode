@@ -19,6 +19,7 @@ func TestSessionMetaJSONRoundTripIncludesOptionalFields(t *testing.T) {
 		Provider:         "openrouter",
 		Model:            "provider/model",
 		ParentSessionID:  "parent-1",
+		ActiveAgentType:  "compact",
 	}
 
 	data, err := json.Marshal(want)
@@ -40,7 +41,7 @@ func TestSessionMetaOptionalFieldsOmittedWhenEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	jsonText := string(data)
-	for _, field := range []string{"provider", "model", "parent_session_id"} {
+	for _, field := range []string{"provider", "model", "parent_session_id", "active_agent_type"} {
 		if strings.Contains(jsonText, field) {
 			t.Fatalf("json %s unexpectedly contains empty optional field %q", jsonText, field)
 		}
@@ -65,8 +66,8 @@ func TestSessionMetaBackwardsCompatibleWithOldMetaFiles(t *testing.T) {
 	if got.ID != "old-session" || got.ProjectPath != "/project" || got.State != StateActive {
 		t.Fatalf("old meta decode = %+v, want old fields preserved", got)
 	}
-	if got.LightcodeVersion != "" || got.Provider != "" || got.Model != "" || got.ParentSessionID != "" {
-		t.Fatalf("new fields = version:%q provider:%q model:%q parent:%q, want zero values", got.LightcodeVersion, got.Provider, got.Model, got.ParentSessionID)
+	if got.LightcodeVersion != "" || got.Provider != "" || got.Model != "" || got.ParentSessionID != "" || got.ActiveAgentType != "" {
+		t.Fatalf("new fields = version:%q provider:%q model:%q parent:%q active_type:%q, want zero values", got.LightcodeVersion, got.Provider, got.Model, got.ParentSessionID, got.ActiveAgentType)
 	}
 }
 

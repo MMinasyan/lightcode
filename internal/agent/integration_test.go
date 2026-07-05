@@ -409,9 +409,9 @@ func TestIntegrationCompactionTriggerSavesSummary(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		req := readIntegrationRequest(t, r)
-		if !req.Stream {
+		if len(req.Tools) == 0 {
 			sawSummary.Store(true)
-			_, _ = fmt.Fprint(w, chatResponse("compact summary"))
+			writeSSE(w, textChunk("compact-summary", "test-model", "compact summary"), stopChunk("compact-summary", "test-model"), "[DONE]")
 			return
 		}
 		call := calls.Add(1)

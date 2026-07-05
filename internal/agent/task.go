@@ -37,10 +37,12 @@ type taskResult struct {
 }
 
 type TaggedLoopEvent struct {
-	SessionID  string
-	TaskIndex  int
-	ToolCallID string
-	Event      loop.Event
+	SessionID       string
+	ParentSessionID string
+	ProjectID       string
+	TaskIndex       int
+	ToolCallID      string
+	Event           loop.Event
 }
 
 type taskTool struct {
@@ -122,6 +124,16 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		askAction:     cfg.AskAction,
 		usageRecorder: cfg.UsageRecorder,
 	}
+}
+
+func (t *taskTool) setProject(projectID, memoriesDir string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.projectID = projectID
+	t.memoriesDir = memoriesDir
+	t.mu.Unlock()
 }
 
 func (*taskTool) Name() string { return "task" }
@@ -306,11 +318,34 @@ func appendAdaptationBlocks(prompt string, adapt *adaptation.Adaptation) string 
 // buildChildLoop constructs the child loop for a subagent and applies the adaptation
 // resolved from the child's OWN model: it appends the adaptation's coaching blocks to the prompt and
 // installs the adaptation on the loop (tool advertisement, dispatch gate, leak pattern).
-func (t *taskTool) buildChildLoop(at agentcfg.Resolved, client *provider.Client, registry *tool.Registry, ref coremodel.ModelRef) *loop.Loop {
+type childLoopRuntime struct {
+	store           *snapshot.Store
+	events          chan<- loop.Event
+	pendingExecutor tool.PendingExecutor
+}
+
+func (t *taskTool) buildChildLoop(at agentcfg.Resolved, client *provider.Client, registry *tool.Registry, ref coremodel.ModelRef, runtimeCfg ...childLoopRuntime) *loop.Loop {
 	adapt := t.resolveAdaptation(ref.Model)
-	lp := loop.New(provider.NewAdapter(client), registry, appendAdaptationBlocks(at.Prompt, adapt))
-	lp.SetActiveAdaptation(adapt)
-	return lp
+	var rt childLoopRuntime
+	if len(runtimeCfg) > 0 {
+		rt = runtimeCfg[0]
+	}
+	unit := newRunningUnit(runningUnitConfig{
+		ActiveAgentType: at.Name,
+		Store:           rt.store,
+		CurrentRef:      ref,
+		Loop: runningUnitLoopConfig{
+			Client:           client,
+			Registry:         registry,
+			SystemPrompt:     appendAdaptationBlocks(at.Prompt, adapt),
+			Store:            rt.store,
+			Events:           rt.events,
+			UsageRecorder:    t.usageRecorder,
+			PendingExecutor:  rt.pendingExecutor,
+			ActiveAdaptation: adapt,
+		},
+	})
+	return unit.lp
 }
 
 func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, parentToolCallID string) taskResult {
@@ -369,7 +404,7 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		forwardDone = make(chan struct{})
 		go func() {
 			defer close(forwardDone)
-			t.forwardEvents(events, index, sessionID, parentToolCallID)
+			t.forwardEvents(events, index, sessionID, parentSessionID, t.projectID, parentToolCallID)
 		}()
 	}
 	finish := func(result taskResult) taskResult {
@@ -384,16 +419,15 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		return result
 	}
 
-	lp = t.buildChildLoop(at, client, registry, ref)
-	if events != nil {
-		lp.SetEvents(events)
-	}
-	lp.SetStore(childStore)
-	lp.SetUsageRecorder(t.usageRecorder)
 	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(scope.snapshotStore(), scope.tracker, t.toolsConfig, scope.workspaceRoot, t.permissionCheck(), t.permissionAskAction(), tool.CapabilityOptions{
 		WriteDir: taskToolExposure(at).writeDir,
 	})
-	lp.SetPendingExecutor(pendingExecutor)
+	lp = t.buildChildLoop(at, client, registry, ref, childLoopRuntime{
+		store:           childStore,
+		events:          events,
+		pendingExecutor: pendingExecutor,
+	})
+	lp.SetEventOwner(sessionID, t.projectID)
 	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 
 	if turn := childStore.BeginTurn(); turn == 0 {
@@ -745,14 +779,16 @@ func (t *taskTool) resolveClient(modelRef string) (*provider.Client, coremodel.M
 	return client, ref, nil
 }
 
-func (t *taskTool) forwardEvents(ch <-chan loop.Event, taskIndex int, sessionID, toolCallID string) {
+func (t *taskTool) forwardEvents(ch <-chan loop.Event, taskIndex int, sessionID, parentSessionID, projectID, toolCallID string) {
 	for ev := range ch {
 		if t.taggedEvents != nil {
 			t.taggedEvents <- TaggedLoopEvent{
-				SessionID:  sessionID,
-				TaskIndex:  taskIndex,
-				ToolCallID: toolCallID,
-				Event:      ev,
+				SessionID:       sessionID,
+				ParentSessionID: parentSessionID,
+				ProjectID:       projectID,
+				TaskIndex:       taskIndex,
+				ToolCallID:      toolCallID,
+				Event:           ev,
 			}
 		}
 	}

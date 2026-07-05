@@ -4,8 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -18,8 +19,12 @@ import (
 // App is the Wails-bound struct that bridges the Go backend to the
 // frontend. All exported methods are callable from JavaScript.
 type App struct {
-	ctx context.Context
-	svc *agent.Agent
+	ctx             context.Context
+	svc             agent.AdapterService
+	scope           *agent.AdapterScope
+	viewOnce        sync.Once
+	view            *agent.SessionView
+	adapterAttached bool
 }
 
 type ModelCompletion = agent.ModelCompletion
@@ -29,9 +34,42 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.svc.SetEventHandler(a.handleEvent)
 	a.svc.Init(ctx)
+	a.scope = agent.NewAdapterScope(a.svc, a.svc.ProjectRoot())
+	if lifecycle, ok := a.svc.(interface{ AttachAdapter(context.Context) error }); ok {
+		a.adapterAttached = lifecycle.AttachAdapter(ctx) == nil
+	}
+	sessionID := ""
+	if sessions, err := a.scope.SessionList("active"); err == nil && len(sessions) > 0 {
+		if summary, err := a.svc.OpenSession(sessions[0].ID); err == nil {
+			sessionID = summary.ID
+		}
+	}
+	if sessionID == "" {
+		if id, err := a.scope.NewSession("primary"); err == nil {
+			sessionID = id
+		}
+	}
+	a.setCurrentSessionID(sessionID)
+}
+
+func (a *App) shutdown(ctx context.Context) {
+	if !a.adapterAttached {
+		return
+	}
+	if lifecycle, ok := a.svc.(interface{ DetachAdapter(context.Context) error }); ok {
+		_ = lifecycle.DetachAdapter(ctx)
+	}
+}
+
+func (a *App) sv() *agent.SessionView {
+	a.viewOnce.Do(func() { a.view = agent.NewSessionView(a.svc) })
+	return a.view
 }
 
 func (a *App) handleEvent(ev agent.Event) {
+	if !a.acceptsEvent(ev) {
+		return
+	}
 	if ev.SubagentSessionID != "" {
 		switch ev.Kind {
 		case agent.EventTextDelta:
@@ -127,7 +165,7 @@ func (a *App) handleEvent(ev agent.Event) {
 			"version": ev.QueueVersion,
 		})
 	case agent.EventUsage:
-		wailsRuntime.EventsEmit(a.ctx, "usage", a.svc.TokenUsage())
+		wailsRuntime.EventsEmit(a.ctx, "usage", a.tokenUsage())
 	case agent.EventTurnStart:
 		wailsRuntime.EventsEmit(a.ctx, "turn_start", map[string]any{"turn": ev.Turn})
 		wailsRuntime.EventsEmit(a.ctx, "status", map[string]any{"state": "streaming"})
@@ -135,13 +173,15 @@ func (a *App) handleEvent(ev agent.Event) {
 		wailsRuntime.EventsEmit(a.ctx, "turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
 		wailsRuntime.EventsEmit(a.ctx, "status", map[string]any{"state": "idle"})
 		if ev.RefreshSession {
-			a.emitSessionChanged()
+			a.emitSessionChangedForEvent(ev)
 		}
 	case agent.EventError:
 		wailsRuntime.EventsEmit(a.ctx, "error", map[string]any{"message": ev.Error})
 	case agent.EventPermissionRequest:
 		wailsRuntime.EventsEmit(a.ctx, "permission_request", map[string]any{
 			"id":                 ev.PermReq.ID,
+			"sessionId":          ev.PermReq.SessionID,
+			"projectId":          ev.PermReq.ProjectID,
 			"tool":               ev.PermReq.ToolName,
 			"args":               ev.PermReq.Arg,
 			"resolvedArg":        ev.PermReq.ResolvedArg,
@@ -157,7 +197,7 @@ func (a *App) handleEvent(ev agent.Event) {
 	case agent.EventCompactionEnd:
 		wailsRuntime.EventsEmit(a.ctx, "compaction_end", nil)
 		if ev.RefreshSession {
-			a.emitSessionChanged()
+			a.emitSessionChangedForEvent(ev)
 		}
 	case agent.EventWarning:
 		wailsRuntime.EventsEmit(a.ctx, "warnings", ev.Warnings)
@@ -166,11 +206,83 @@ func (a *App) handleEvent(ev agent.Event) {
 
 // emitSessionChanged tells the frontend to replace its message list.
 func (a *App) emitSessionChanged() {
-	wailsRuntime.EventsEmit(a.ctx, "session_changed", map[string]any{
-		"session":  a.svc.SessionCurrent(),
-		"messages": a.svc.SessionMessages(),
-		"tokens":   a.svc.TokenUsage(),
-	})
+	a.emitSessionChangedForSession(a.currentSessionID())
+}
+
+func (a *App) emitSessionChangedForEvent(ev agent.Event) {
+	if strings.TrimSpace(ev.SessionID) != "" {
+		a.emitSessionChangedForSession(ev.SessionID)
+		return
+	}
+	a.emitSessionChanged()
+}
+
+func (a *App) emitSessionChangedForSession(sessionID string) {
+	if a.ctx == nil {
+		return
+	}
+	payload := a.sv().SessionChangedPayload(sessionID)
+	wailsRuntime.EventsEmit(a.ctx, "session_changed", payload)
+}
+
+func (a *App) setCurrentSessionID(id string) {
+	a.sv().SetCurrent(id)
+}
+
+func (a *App) currentSessionID() string {
+	return a.sv().Current()
+}
+
+func (a *App) currentSession() (string, error) {
+	return a.sv().CurrentOrErr()
+}
+
+func (a *App) acceptsSessionEvent(sessionID string) bool {
+	return a.sv().AcceptsSessionEvent(sessionID)
+}
+
+func (a *App) acceptsEvent(ev agent.Event) bool {
+	return a.sv().AcceptsEvent(ev)
+}
+
+func (a *App) acceptsSubagentEvent(ev agent.Event) bool {
+	return a.sv().AcceptsSubagentEvent(ev)
+}
+
+func (a *App) acceptsSubagentEventForCurrent(current string, ev agent.Event) bool {
+	return a.sv().AcceptsSubagentEventForCurrent(current, ev)
+}
+
+func (a *App) liveCurrentSessionID() string {
+	return a.sv().LiveCurrent()
+}
+
+func (a *App) resolveSessionID(id string) (string, error) {
+	return a.sv().Resolve(id)
+}
+
+func (a *App) currentSessionSummary() agent.SessionSummary {
+	return a.sv().CurrentSummary()
+}
+
+func (a *App) tokenUsage() agent.TokenReport {
+	return a.sv().TokenUsage()
+}
+
+func (a *App) sessionMessages() []agent.DisplayMessage {
+	id := a.currentSessionID()
+	if id == "" {
+		return nil
+	}
+	if _, err := a.svc.SessionSummaryForSession(id); err != nil {
+		a.setCurrentSessionID("")
+		return nil
+	}
+	msgs, err := a.svc.SessionMessagesFor(id)
+	if err != nil {
+		return nil
+	}
+	return msgs
 }
 
 // CurrentWarnings returns the backend-owned warning snapshot.
@@ -187,18 +299,34 @@ func (a *App) AppVersion() string {
 // or queues the input in the backend, returning whether it started and a
 // versioned queue snapshot.
 func (a *App) Submit(content string) (agent.SubmitResult, error) {
-	return a.svc.Submit(a.ctx, content)
+	sessionID, err := a.currentSession()
+	if err != nil {
+		return agent.SubmitResult{}, err
+	}
+	return a.svc.SubmitToSession(a.ctx, sessionID, content)
 }
 
 // QueueSnapshot returns the backend's versioned input-queue snapshot for
 // frontend hydration (register the queue_changed listener before calling).
 func (a *App) QueueSnapshot() agent.QueueState {
-	return a.svc.QueueSnapshot()
+	sessionID, err := a.currentSession()
+	if err != nil {
+		return agent.QueueState{}
+	}
+	q, err := a.svc.QueueSnapshotForSession(sessionID)
+	if err != nil {
+		return agent.QueueState{}
+	}
+	return q
 }
 
 // SwitchModel changes the active model by provider-prefixed catalog ref.
 func (a *App) SwitchModel(ref string) error {
-	return a.svc.SwitchModel(ref)
+	sessionID, err := a.currentSession()
+	if err != nil {
+		return err
+	}
+	return a.svc.SwitchModelForSession(sessionID, ref)
 }
 
 // Reload reloads config and catalog state for future turns.
@@ -283,57 +411,113 @@ func (a *App) ResetModelField(providerID string, modelID string, field string) e
 
 // RevertCode restores files to their state at turn N.
 func (a *App) RevertCode(turn int) (snapshot.RevertResult, error) {
-	return a.svc.RevertCode(turn)
+	sessionID, err := a.currentSession()
+	if err != nil {
+		return snapshot.RevertResult{}, err
+	}
+	return a.svc.RevertCodeForSession(sessionID, turn)
 }
 
 // RevertHistory truncates conversation after turn N.
 func (a *App) RevertHistory(turn int) error {
-	if err := a.svc.RevertHistory(turn); err != nil {
+	sessionID, err := a.currentSession()
+	if err != nil {
 		return err
 	}
-	a.emitSessionChanged()
+	if err := a.svc.RevertHistoryForSession(sessionID, turn); err != nil {
+		return err
+	}
+	a.emitSessionChangedForSession(sessionID)
 	return nil
 }
 
 // ForkSession creates a new session branched from turn N.
 func (a *App) ForkSession(turn int) error {
-	if err := a.svc.ForkSession(turn); err != nil {
+	sessionID, err := a.currentSession()
+	if err != nil {
 		return err
 	}
-	a.emitSessionChanged()
+	result, err := a.svc.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionFork, false)
+	if err != nil {
+		return err
+	}
+	if result.Session.ID != "" {
+		a.setCurrentSessionID(result.Session.ID)
+	}
+	a.emitSessionChangedForSession(result.Session.ID)
 	return nil
 }
 
 // ApplyTurnAction applies a user-message revert/fork action.
 func (a *App) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (agent.TurnActionResult, error) {
-	result, err := a.svc.ApplyTurnAction(turn, action, alsoRevertCode)
+	sessionID, err := a.currentSession()
+	if err != nil {
+		return agent.TurnActionResult{}, err
+	}
+	result, err := a.svc.ApplyTurnActionForSession(sessionID, turn, action, alsoRevertCode)
 	if err != nil {
 		return result, err
 	}
 	if result.SessionChanged {
-		a.emitSessionChanged()
+		if result.Session.ID != "" {
+			a.setCurrentSessionID(result.Session.ID)
+			a.emitSessionChangedForSession(result.Session.ID)
+		} else {
+			a.emitSessionChangedForSession(sessionID)
+		}
 	}
 	return result, nil
 }
 
 // RespondPermission answers a pending permission prompt.
-func (a *App) RespondPermission(id string, action string) error {
-	return a.svc.RespondPermissionAction(id, action)
+func (a *App) RespondPermission(sessionID string, id string, action string) error {
+	sessionID, err := a.resolveSessionID(sessionID)
+	if err != nil {
+		return err
+	}
+	return a.svc.RespondPermissionActionForSession(sessionID, id, action)
 }
 
 // PermissionSuggest returns pattern suggestions for the "Allow for project" UI.
-func (a *App) PermissionSuggest(toolName, arg string) []permission.Suggestion {
-	return a.svc.PermissionSuggest(toolName, arg)
+func (a *App) PermissionSuggest(sessionID string, projectID string, toolName string, arg string) []permission.Suggestion {
+	var (
+		suggestions []permission.Suggestion
+		err         error
+	)
+	if strings.TrimSpace(projectID) != "" {
+		suggestions, err = a.svc.PermissionSuggestForProject(projectID, toolName, arg)
+	} else {
+		sessionID, err = a.resolveSessionID(sessionID)
+		if err == nil {
+			suggestions, err = a.svc.PermissionSuggestForSession(sessionID, toolName, arg)
+		}
+	}
+	if err != nil {
+		return nil
+	}
+	return suggestions
 }
 
 // SaveProjectPermission appends patterns to project permissions and allows the request.
-func (a *App) SaveProjectPermission(id string, patterns []string) error {
-	return a.svc.SaveProjectPermission(id, patterns)
+func (a *App) SaveProjectPermission(sessionID string, id string, patterns []string) error {
+	sessionID, err := a.resolveSessionID(sessionID)
+	if err != nil {
+		return err
+	}
+	return a.svc.SaveProjectPermissionForSession(sessionID, id, patterns)
 }
 
 // CompactNow triggers manual context compaction.
 func (a *App) CompactNow() error {
-	if err := a.svc.CompactNow(a.ctx); err != nil {
+	sessionID := a.liveCurrentSessionID()
+	if sessionID == "" {
+		return fmt.Errorf("no current session")
+	}
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := a.svc.CompactNowForSession(ctx, sessionID); err != nil {
 		return err
 	}
 	return nil
@@ -341,12 +525,20 @@ func (a *App) CompactNow() error {
 
 // Cancel aborts the current agentic loop iteration.
 func (a *App) Cancel() error {
-	return a.svc.Cancel()
+	sessionID, err := a.currentSession()
+	if err != nil {
+		return err
+	}
+	return a.svc.CancelSession(sessionID)
 }
 
 // SnapshotList returns the timeline of all snapshots in the session.
 func (a *App) SnapshotList() ([]agent.Snapshot, error) {
-	return a.svc.SnapshotList()
+	sessionID := a.liveCurrentSessionID()
+	if sessionID == "" {
+		return nil, fmt.Errorf("no current session")
+	}
+	return a.svc.SnapshotListForSession(sessionID)
 }
 
 // ModelList returns all visible catalog models.
@@ -356,7 +548,15 @@ func (a *App) ModelList() ([]agent.ModelListEntry, error) {
 
 // CurrentModel returns the active provider and model.
 func (a *App) CurrentModel() agent.ModelInfo {
-	return a.svc.CurrentModel()
+	sessionID, err := a.currentSession()
+	if err != nil {
+		return agent.ModelInfo{}
+	}
+	model, err := a.svc.CurrentModelForSession(sessionID)
+	if err != nil {
+		return agent.ModelInfo{}
+	}
+	return model
 }
 
 // AllModelList returns every catalog model including hidden ones.
@@ -389,76 +589,80 @@ func (a *App) SetRuntimeConfig(settings agent.RuntimeConfigSettings) error {
 	return a.svc.SetRuntimeConfig(settings)
 }
 
-// ProjectName returns the basename of the project directory.
+// ProjectName returns the basename of the adapter-local project directory.
 func (a *App) ProjectName() string {
-	return a.svc.ProjectName()
+	return a.scope.ProjectName()
 }
 
 // ReadFileContent loads a file's contents for the in-app viewer.
 func (a *App) ReadFileContent(path string) (string, error) {
-	return a.svc.ReadFileContent(path)
+	return a.scope.ReadFileContent(path)
 }
 
 // TokenUsage returns the current cumulative token usage for the session.
 func (a *App) TokenUsage() agent.TokenReport {
-	return a.svc.TokenUsage()
+	return a.tokenUsage()
 }
 
 // SessionCurrent returns the active session.
 func (a *App) SessionCurrent() agent.SessionSummary {
-	return a.svc.SessionCurrent()
+	return a.currentSessionSummary()
 }
 
 // SessionList returns sessions filtered by state.
 func (a *App) SessionList(state string) ([]agent.SessionSummary, error) {
-	return a.svc.SessionList(state)
+	return a.scope.SessionList(state)
 }
 
 // SessionSwitch switches to another session.
 func (a *App) SessionSwitch(id string) error {
-	if err := a.svc.SessionSwitch(id); err != nil {
+	summary, err := a.svc.OpenSession(id)
+	if err != nil {
 		return err
 	}
-	a.emitSessionChanged()
+	a.setCurrentSessionID(summary.ID)
+	a.emitSessionChangedForSession(summary.ID)
 	return nil
 }
 
 // SessionArchive archives a session.
 func (a *App) SessionArchive(id string) error {
-	closedCurrent, err := a.svc.SessionArchive(id)
-	if err != nil {
+	if err := a.svc.SessionArchive(id); err != nil {
 		return err
 	}
-	if closedCurrent {
-		a.emitSessionChanged()
+	wasCurrent := a.sv().RemovedCurrent(id)
+	if wasCurrent {
+		a.emitSessionChangedForSession(strings.TrimSpace(id))
 	}
 	return nil
 }
 
 // SessionDelete removes a session from disk.
 func (a *App) SessionDelete(id string) error {
-	closedCurrent, err := a.svc.SessionDelete(id)
-	if err != nil {
+	if err := a.svc.SessionDelete(id); err != nil {
 		return err
 	}
-	if closedCurrent {
-		a.emitSessionChanged()
+	wasCurrent := a.sv().RemovedCurrent(id)
+	if wasCurrent {
+		a.emitSessionChangedForSession(strings.TrimSpace(id))
 	}
 	return nil
 }
 
-// SessionNew starts a fresh session.
+// SessionNew starts a fresh session in the adapter-local project.
 func (a *App) SessionNew() error {
-	if err := a.svc.SessionNew(); err != nil {
+	id, err := a.scope.NewSession("primary")
+	if err != nil {
 		return err
 	}
-	a.emitSessionChanged()
+	a.setCurrentSessionID(id)
+	a.emitSessionChangedForSession(id)
 	return nil
 }
 
 // SessionMessages returns persisted history for the current session.
 func (a *App) SessionMessages() []agent.DisplayMessage {
-	return a.svc.SessionMessages()
+	return a.sessionMessages()
 }
 
 // SessionMessagesFor returns persisted history for a session without switching.
@@ -471,12 +675,13 @@ func (a *App) ProjectList() ([]agent.ProjectSummary, error) {
 	return a.svc.ProjectList()
 }
 
-// ProjectCurrent returns the project record for the current cwd.
+// ProjectCurrent returns the project record for the adapter-local project.
 func (a *App) ProjectCurrent() agent.ProjectSummary {
-	return a.svc.ProjectCurrent()
+	return a.scope.ProjectCurrent()
 }
 
-// ProjectSwitch spawns a detached child in the target directory and quits.
+// ProjectSwitch navigates to a different project in-place over the existing
+// owner connection — no process spawn, no detach, no lease gap.
 func (a *App) ProjectSwitch(targetPath string) error {
 	if targetPath == "" {
 		return fmt.Errorf("empty target path")
@@ -492,18 +697,20 @@ func (a *App) ProjectSwitch(targetPath string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("%s is not a directory", abs)
 	}
-	if abs == a.svc.ProjectRoot() {
+	if abs == a.scope.ProjectRoot() {
 		return nil
 	}
 
-	if err := a.svc.CloseForProjectSwitch(); err != nil {
-		return fmt.Errorf("close current session: %w", err)
-	}
-
-	if err := a.relaunchIn(abs); err != nil {
+	summary, err := a.scope.OpenOrCreateSession(abs)
+	if err != nil {
 		return err
 	}
-	wailsRuntime.Quit(a.ctx)
+	a.scope.SetProjectPath(abs)
+	a.setCurrentSessionID(summary.ID)
+	a.emitSessionChangedForSession(summary.ID)
+	if a.ctx != nil {
+		wailsRuntime.WindowSetTitle(a.ctx, "Lightcode — "+a.scope.ProjectName())
+	}
 	return nil
 }
 
@@ -519,18 +726,4 @@ func (a *App) ProjectPickAndSwitch() error {
 		return nil
 	}
 	return a.ProjectSwitch(selected)
-}
-
-func (a *App) relaunchIn(dir string) error {
-	bin, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("resolve lightcode binary: %w", err)
-	}
-	cmd := exec.Command(bin)
-	cmd.Dir = dir
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	cmd.SysProcAttr = detachAttr()
-	return cmd.Start()
 }

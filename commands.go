@@ -139,6 +139,17 @@ func init() {
 			},
 		},
 		{
+			name:    "stop",
+			summary: "stop the local owner process",
+			flags:   func() *flag.FlagSet { return newFlagSet("stop") },
+			run: func(fs *flag.FlagSet, args []string) error {
+				if err := checkNoArgs(fs); err != nil {
+					return err
+				}
+				return runStop()
+			},
+		},
+		{
 			name:    "acp",
 			summary: "run as an ACP agent over stdio",
 			flags:   func() *flag.FlagSet { return newFlagSet("acp") },
@@ -819,6 +830,8 @@ func dispatch(argv []string) (launchGUI bool, code int) {
 		return true, 0
 	case errors.Is(err, errSilent):
 		return false, 1
+	case exitCodeOf(err) >= 0:
+		return false, exitCodeOf(err)
 	case errors.Is(err, errUsage):
 		fmt.Fprintf(errW, "lightcode: %v\n", err)
 		renderCommandUsage(errW, cmd)
@@ -827,6 +840,14 @@ func dispatch(argv []string) (launchGUI bool, code int) {
 		fmt.Fprintf(errW, "lightcode: %v\n", err)
 		return false, 1
 	}
+}
+
+func exitCodeOf(err error) int {
+	var exit interface{ ExitCode() int }
+	if errors.As(err, &exit) {
+		return exit.ExitCode()
+	}
+	return -1
 }
 
 func usageLine(cmd *command) string {

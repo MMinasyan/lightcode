@@ -14,7 +14,7 @@
   async function respond(action) {
     if (!permission) return;
     try {
-      await RespondPermission(permission.id, action);
+      await RespondPermission(permission.sessionId || '', permission.id, action);
       reset();
     } catch (e) {
       dispatch('error', errorText(e));
@@ -24,7 +24,7 @@
   async function openSuggest() {
     if (!permission || permission.canSaveProject === false) return;
     try {
-      suggestions = await PermissionSuggest(permission.tool, permission.resolvedArg || permission.args) || [];
+      suggestions = await PermissionSuggest(permission.sessionId || '', permission.projectId || '', permission.tool, permission.resolvedArg || permission.args) || [];
       selected = {};
       showSuggest = true;
     } catch (e) {
@@ -48,7 +48,7 @@
     if (patterns.length === 0) return;
     saving = true;
     try {
-      await SaveProjectPermission(permission.id, patterns);
+      await SaveProjectPermission(permission.sessionId || '', permission.id, patterns);
       reset();
     } catch (e) {
       saving = false;
