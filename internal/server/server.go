@@ -40,7 +40,7 @@ type Server struct {
 	permMu            sync.Mutex
 	permTimers        map[string]*time.Timer
 	permTimerSessions map[string]string
-	permRequests      map[string]agent.PermissionRequest
+	permEvents        map[string]agent.Event
 
 	lifeMu            sync.Mutex
 	adapterCount      int
@@ -64,7 +64,7 @@ func New(a *agent.Agent, cfg Config) *Server {
 		adapter:           newSSEHub(),
 		permTimers:        make(map[string]*time.Timer),
 		permTimerSessions: make(map[string]string),
-		permRequests:      make(map[string]agent.PermissionRequest),
+		permEvents:        make(map[string]agent.Event),
 	}
 }
 
@@ -217,7 +217,7 @@ func (s *Server) handleEvent(ev agent.Event) {
 		s.adapter.broadcast("agent_event", ev)
 	}
 
-	if ev.SubagentSessionID != "" {
+	if ev.SubagentSessionID != "" && ev.Kind != agent.EventPermissionRequest {
 		return
 	}
 
@@ -293,7 +293,7 @@ func (s *Server) handleEvent(ev agent.Event) {
 			"batchFiles":         ev.PermReq.BatchFiles,
 			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		}
-		if !s.startPermissionTimer(ev.PermReq) && s.adapter != nil {
+		if !s.startPermissionTimerForEvent(ev) && s.adapter != nil {
 			s.adapter.broadcast("agent_event", ev)
 		}
 	case agent.EventCompactionStart:
@@ -327,12 +327,27 @@ func (s *Server) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
 // receiver already exists. Local attach is checked under lifeMu before the
 // timer record is registered so a local UI cannot miss the cancel window.
 func (s *Server) startPermissionTimer(req *agent.PermissionRequest) bool {
-	return s.startPermissionTimerWithReceiver(req)
-}
-
-func (s *Server) startPermissionTimerWithReceiver(req *agent.PermissionRequest) bool {
 	if req == nil {
 		return false
+	}
+	return s.startPermissionTimerForEvent(agent.Event{Kind: agent.EventPermissionRequest, SessionID: req.SessionID, ProjectID: req.ProjectID, PermReq: req})
+}
+
+func (s *Server) startPermissionTimerForEvent(ev agent.Event) bool {
+	req := ev.PermReq
+	if req == nil {
+		return false
+	}
+	reqCopy := *req
+	ev.PermReq = &reqCopy
+	if ev.Kind != agent.EventPermissionRequest {
+		ev.Kind = agent.EventPermissionRequest
+	}
+	if ev.SessionID == "" {
+		ev.SessionID = reqCopy.SessionID
+	}
+	if ev.ProjectID == "" {
+		ev.ProjectID = reqCopy.ProjectID
 	}
 	id := req.ID
 	sessionID := req.SessionID
@@ -343,10 +358,10 @@ func (s *Server) startPermissionTimerWithReceiver(req *agent.PermissionRequest) 
 		return false
 	}
 	s.permMu.Lock()
-	if s.permRequests == nil {
-		s.permRequests = make(map[string]agent.PermissionRequest)
+	if s.permEvents == nil {
+		s.permEvents = make(map[string]agent.Event)
 	}
-	s.permRequests[id] = *req
+	s.permEvents[id] = ev
 	timer := time.AfterFunc(s.cfg.PermissionTimeout, func() {
 		s.permMu.Lock()
 		if _, ok := s.permTimers[id]; !ok {
@@ -355,7 +370,7 @@ func (s *Server) startPermissionTimerWithReceiver(req *agent.PermissionRequest) 
 		}
 		delete(s.permTimers, id)
 		delete(s.permTimerSessions, id)
-		delete(s.permRequests, id)
+		delete(s.permEvents, id)
 		s.permMu.Unlock()
 		slog.Warn("permission timeout, auto-denying", "id", id)
 		if sessionID != "" {
@@ -371,7 +386,7 @@ func (s *Server) startPermissionTimerWithReceiver(req *agent.PermissionRequest) 
 	s.permTimerSessions[id] = sessionID
 	s.permMu.Unlock()
 	s.lifeMu.Unlock()
-	s.adoptPermissionPrompt(*req)
+	s.adoptPermissionPrompt(ev)
 	return true
 }
 
@@ -384,12 +399,15 @@ func (s *Server) hasLocalAdapterLeaseLocked() bool {
 	return false
 }
 
-func (s *Server) adoptPermissionPrompt(req agent.PermissionRequest) {
+func (s *Server) adoptPermissionPrompt(ev agent.Event) {
 	if s.adapter == nil {
 		return
 	}
-	if s.adapter.broadcast("agent_event", agent.Event{Kind: agent.EventPermissionRequest, SessionID: req.SessionID, ProjectID: req.ProjectID, PermReq: &req}) > 0 {
-		s.stopPermissionTimer(req.ID)
+	if ev.PermReq == nil {
+		return
+	}
+	if s.adapter.broadcast("agent_event", ev) > 0 {
+		s.stopPermissionTimer(ev.PermReq.ID)
 	}
 }
 
@@ -398,16 +416,16 @@ func (s *Server) replayPendingPermissionPrompts(client *sseClient) {
 		return
 	}
 	s.permMu.Lock()
-	requests := make([]agent.PermissionRequest, 0, len(s.permRequests))
-	for _, req := range s.permRequests {
-		requests = append(requests, req)
+	events := make([]agent.Event, 0, len(s.permEvents))
+	for _, ev := range s.permEvents {
+		events = append(events, ev)
 	}
 	s.permMu.Unlock()
 
-	for _, req := range requests {
-		req := req
-		if s.adapter.send(client, "agent_event", agent.Event{Kind: agent.EventPermissionRequest, SessionID: req.SessionID, ProjectID: req.ProjectID, PermReq: &req}) {
-			s.stopPermissionTimer(req.ID)
+	for _, ev := range events {
+		ev := ev
+		if ev.PermReq != nil && s.adapter.send(client, "agent_event", ev) {
+			s.stopPermissionTimer(ev.PermReq.ID)
 		}
 	}
 }
@@ -430,7 +448,7 @@ func (s *Server) cancelPermissionTimer(id string) {
 		delete(s.permTimers, id)
 	}
 	delete(s.permTimerSessions, id)
-	delete(s.permRequests, id)
+	delete(s.permEvents, id)
 }
 
 func (s *Server) clearPermissionStateForSession(sessionID string) {
@@ -447,13 +465,20 @@ func (s *Server) clearPermissionStateForSession(sessionID string) {
 		timer.Stop()
 		delete(s.permTimers, id)
 		delete(s.permTimerSessions, id)
-		delete(s.permRequests, id)
+		delete(s.permEvents, id)
 	}
-	for id, req := range s.permRequests {
-		if req.SessionID == sessionID {
-			delete(s.permRequests, id)
+	for id, ev := range s.permEvents {
+		if permissionEventSessionID(ev) == sessionID {
+			delete(s.permEvents, id)
 		}
 	}
+}
+
+func permissionEventSessionID(ev agent.Event) string {
+	if ev.PermReq != nil && ev.PermReq.SessionID != "" {
+		return ev.PermReq.SessionID
+	}
+	return ev.SessionID
 }
 
 // --- SSE handler ---

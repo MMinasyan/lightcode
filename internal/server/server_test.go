@@ -1541,11 +1541,11 @@ func TestPermissionTimerReceiverDecisionUnderLifecycleLock(t *testing.T) {
 	if strings.Contains(handler, "hasLocalAdapterLease") || strings.Contains(handler, "localReceiver") {
 		t.Fatalf("handleEvent must not precompute local adapter liveness before timer registration; body:\n%s", handler)
 	}
-	helper := extractSourceFunc(t, src, "func (s *Server) startPermissionTimerWithReceiver(")
+	helper := extractSourceFunc(t, src, "func (s *Server) startPermissionTimerForEvent(")
 	lockIndex := strings.Index(helper, "s.lifeMu.Lock()")
 	localIndex := strings.Index(helper, "s.hasLocalAdapterLeaseLocked()")
 	if lockIndex < 0 || localIndex < 0 || localIndex < lockIndex {
-		t.Fatalf("startPermissionTimerWithReceiver must decide local adapter liveness under lifeMu; body:\n%s", helper)
+		t.Fatalf("startPermissionTimerForEvent must decide local adapter liveness under lifeMu; body:\n%s", helper)
 	}
 }
 
@@ -1739,7 +1739,7 @@ func waitServerPermissionRequestCleared(t *testing.T, s *Server, id string) {
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		s.permMu.Lock()
-		_, ok := s.permRequests[id]
+		_, ok := s.permEvents[id]
 		s.permMu.Unlock()
 		if !ok {
 			return
@@ -2199,10 +2199,46 @@ func TestAdapterStreamReplaysDeliveredPendingPermission(t *testing.T) {
 	srv.cancelPermissionTimer(req.ID)
 }
 
+func TestSubagentPermissionRequestRetainedAndReplayed(t *testing.T) {
+	a := newServerTestAgent(t)
+	srv := New(a, Config{PermissionTimeout: time.Hour})
+	first, unsubscribeFirst := srv.adapter.subscribe("")
+
+	req := &agent.PermissionRequest{ID: "subagent-perm", SessionID: "parent-session", ProjectID: "project-a", ToolName: "write_file"}
+	ev := agent.Event{Kind: agent.EventPermissionRequest, SessionID: "parent-session", ProjectID: "project-a", ParentSessionID: "parent-session", SubagentSessionID: "child-session", PermReq: req}
+	srv.handleEvent(ev)
+
+	select {
+	case msg := <-first:
+		body := string(msg)
+		if !strings.Contains(body, req.ID) || !strings.Contains(body, "child-session") {
+			t.Fatalf("subagent permission event = %s, want id %q and child-session", body, req.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for subagent permission event")
+	}
+	unsubscribeFirst()
+	waitServerPermissionTimerCleared(t, srv, req.ID)
+
+	second, secondClient, unsubscribeSecond := srv.adapter.subscribeClient("")
+	defer unsubscribeSecond()
+	srv.replayPendingPermissionPrompts(secondClient)
+	select {
+	case msg := <-second:
+		body := string(msg)
+		if !strings.Contains(body, req.ID) || !strings.Contains(body, "child-session") {
+			t.Fatalf("replayed subagent permission event = %s, want id %q and child-session", body, req.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for replayed subagent permission event")
+	}
+	srv.cancelPermissionTimer(req.ID)
+}
+
 func TestTurnEndClearsRetainedPermissionState(t *testing.T) {
 	a := newServerTestAgent(t)
 	srv := New(a, Config{PermissionTimeout: time.Hour})
-	srv.permRequests["turn-end"] = agent.PermissionRequest{ID: "turn-end", SessionID: "session-a", ToolName: "write_file"}
+	srv.permEvents["turn-end"] = agent.Event{Kind: agent.EventPermissionRequest, SessionID: "session-a", PermReq: &agent.PermissionRequest{ID: "turn-end", SessionID: "session-a", ToolName: "write_file"}}
 	srv.handleEvent(agent.Event{Kind: agent.EventTurnEnd, SessionID: "session-a"})
 	waitServerPermissionRequestCleared(t, srv, "turn-end")
 }
@@ -2214,7 +2250,7 @@ func TestHandleCancelClearsRetainedPermissionState(t *testing.T) {
 		t.Fatalf("NewSession: %v", err)
 	}
 	srv := New(a, Config{PermissionTimeout: time.Hour})
-	srv.permRequests["cancel"] = agent.PermissionRequest{ID: "cancel", SessionID: sessionID, ToolName: "write_file"}
+	srv.permEvents["cancel"] = agent.Event{Kind: agent.EventPermissionRequest, SessionID: sessionID, PermReq: &agent.PermissionRequest{ID: "cancel", SessionID: sessionID, ToolName: "write_file"}}
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/cancel?session_id="+sessionID, nil)
 	srv.handleCancel(rec, req)
