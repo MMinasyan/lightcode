@@ -410,6 +410,25 @@ func (a *App) emitSessionChangedForSession(sessionID string) {
 	a.emitFrame("session_changed", payload)
 }
 
+// emitNavigationBoundary captures the destination session's complete state and
+// appends it as the navigation boundary the frontend applies as its whole
+// replacement view. An empty or unresolved id yields the zero state, which the
+// frontend applies as a detach. The caller holds navMu, so navMu -> the owner's
+// HydrateSession locks stays in the documented order.
+func (a *App) emitNavigationBoundary(sessionID string) {
+	if a.ctx == nil {
+		return
+	}
+	emit := func(state agent.HydrationState) { a.emitFrame("navigation", state) }
+	if a.agent == nil {
+		emit(agent.HydrationState{})
+		return
+	}
+	// Append the boundary while the capture locks are held so no event delivered
+	// after the capture can be enqueued before it.
+	a.agent.HydrateSessionWithBoundary(sessionID, emit)
+}
+
 func (a *App) setCurrentSessionID(id string) {
 	a.sv().SetCurrent(id)
 }
@@ -886,7 +905,7 @@ func (a *App) SessionSwitch(id string) error {
 		return err
 	}
 	a.setCurrentSessionID(summary.ID)
-	a.emitSessionChangedForSession(summary.ID)
+	a.emitNavigationBoundary(summary.ID)
 	return nil
 }
 
@@ -903,7 +922,7 @@ func (a *App) SessionArchive(id string) error {
 		return err
 	}
 	if a.sv().RemovedCurrent(id) {
-		a.emitSessionChangedForSession(strings.TrimSpace(id))
+		a.emitNavigationBoundary(strings.TrimSpace(id))
 	}
 	return nil
 }
@@ -919,7 +938,7 @@ func (a *App) SessionDelete(id string) error {
 		return err
 	}
 	if a.sv().RemovedCurrent(id) {
-		a.emitSessionChangedForSession(strings.TrimSpace(id))
+		a.emitNavigationBoundary(strings.TrimSpace(id))
 	}
 	return nil
 }
@@ -936,7 +955,7 @@ func (a *App) SessionNew() error {
 		return err
 	}
 	a.setCurrentSessionID(id)
-	a.emitSessionChangedForSession(id)
+	a.emitNavigationBoundary(id)
 	return nil
 }
 
@@ -994,7 +1013,7 @@ func (a *App) ProjectSwitch(targetPath string) error {
 	// following current-target call never sees one without the other.
 	a.scope.SetProjectPath(abs)
 	a.setCurrentSessionID(summary.ID)
-	a.emitSessionChangedForSession(summary.ID)
+	a.emitNavigationBoundary(summary.ID)
 	if a.ctx != nil {
 		wailsRuntime.WindowSetTitle(a.ctx, "Lightcode — "+a.scope.ProjectName())
 	}

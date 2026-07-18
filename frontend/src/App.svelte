@@ -263,6 +263,11 @@
       gate = { highWater: 0 };
     }));
 
+    // A navigation boundary carries the destination session's complete state;
+    // applying it replaces the whole live view (messages, gate, tokens, activity,
+    // queue, warnings, permissions). An empty state is a detach.
+    EventsOn('navigation', buffered((data) => { applySnapshot(data); }));
+
     EventsOn('token', buffered(applyToken));
     EventsOn('tool_start', buffered(applyToolStart));
     EventsOn('tool_result', buffered(applyToolResult));
