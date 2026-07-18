@@ -63,9 +63,15 @@ type App struct {
 	navClosed bool
 
 	scope           *agent.AdapterScope
-	viewOnce        sync.Once
-	view            *agent.SessionView
 	adapterAttached bool
+
+	// routeMu guards the adapter's routing-current session id and its subagent
+	// child set — a leaf below navMu. Navigation and current-target operations take
+	// navMu then routeMu; the event-acceptance callback, which must not take navMu,
+	// takes routeMu alone.
+	routeMu       sync.Mutex
+	routeCurrent  string
+	routeChildren map[string]struct{}
 
 	// Delivery spine: every event and navigation payload is appended as a frame;
 	// the single drainer is the only goroutine that emits to the frontend, so
@@ -239,11 +245,6 @@ func (a *App) closeDelivery() {
 		case <-time.After(deliveryJoinTimeout):
 		}
 	})
-}
-
-func (a *App) sv() *agent.SessionView {
-	a.viewOnce.Do(func() { a.view = agent.NewSessionView(a.svc) })
-	return a.view
 }
 
 func (a *App) handleEvent(ev agent.Event) {
@@ -458,19 +459,43 @@ func (a *App) emitResyncBoundary(sessionID string) {
 	if a.ctx == nil {
 		return
 	}
-	a.emitFrame("resync", a.sv().SessionChangedPayload(sessionID))
+	a.emitFrame("resync", a.sessionChangedPayload(sessionID))
 }
 
 func (a *App) setCurrentSessionID(id string) {
-	a.sv().SetCurrent(id)
+	id = strings.TrimSpace(id)
+	a.routeMu.Lock()
+	if a.routeCurrent != id {
+		a.routeChildren = nil
+	}
+	a.routeCurrent = id
+	a.routeMu.Unlock()
+}
+
+// clearRouteIfCurrent clears the routing current only when it still equals id, so
+// a stale validation cannot clear a session another goroutine has since selected.
+func (a *App) clearRouteIfCurrent(id string) {
+	id = strings.TrimSpace(id)
+	a.routeMu.Lock()
+	if a.routeCurrent == id {
+		a.routeCurrent = ""
+		a.routeChildren = nil
+	}
+	a.routeMu.Unlock()
 }
 
 func (a *App) currentSessionID() string {
-	return a.sv().Current()
+	a.routeMu.Lock()
+	defer a.routeMu.Unlock()
+	return a.routeCurrent
 }
 
 func (a *App) currentSession() (string, error) {
-	return a.sv().CurrentOrErr()
+	id := a.currentSessionID()
+	if id == "" {
+		return "", fmt.Errorf("no current session")
+	}
+	return id, nil
 }
 
 // boundedSessionIDLocked returns the routing-current session id for an ordinary
@@ -483,36 +508,126 @@ func (a *App) boundedSessionIDLocked() (string, error) {
 	return a.currentSession()
 }
 
-func (a *App) acceptsSessionEvent(sessionID string) bool {
-	return a.sv().AcceptsSessionEvent(sessionID)
+func (a *App) acceptsEvent(ev agent.Event) bool {
+	if ev.SubagentSessionID != "" {
+		return a.acceptsSubagentEvent(ev)
+	}
+	if ev.SessionID != "" {
+		return a.acceptsSessionEvent(ev.SessionID)
+	}
+	return true
 }
 
-func (a *App) acceptsEvent(ev agent.Event) bool {
-	return a.sv().AcceptsEvent(ev)
+func (a *App) acceptsSessionEvent(sessionID string) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return true
+	}
+	return a.liveCurrentSessionID() == sessionID
 }
 
 func (a *App) acceptsSubagentEvent(ev agent.Event) bool {
-	return a.sv().AcceptsSubagentEvent(ev)
+	current := a.liveCurrentSessionID()
+	if current == "" {
+		return false
+	}
+	return a.acceptsSubagentEventForCurrent(current, ev)
 }
 
+// acceptsSubagentEventForCurrent decides a subagent event against an explicit
+// current snapshot. Re-checking routeCurrent under routeMu rejects an event whose
+// current was captured before a concurrent switch changed it, so a child is never
+// registered against a session the adapter has since left.
 func (a *App) acceptsSubagentEventForCurrent(current string, ev agent.Event) bool {
-	return a.sv().AcceptsSubagentEventForCurrent(current, ev)
+	child := strings.TrimSpace(ev.SubagentSessionID)
+	if child == "" {
+		return false
+	}
+	a.routeMu.Lock()
+	defer a.routeMu.Unlock()
+	if a.routeCurrent != current {
+		return false
+	}
+	if ev.ParentSessionID == current {
+		if a.routeChildren == nil {
+			a.routeChildren = make(map[string]struct{})
+		}
+		a.routeChildren[child] = struct{}{}
+		return true
+	}
+	_, ok := a.routeChildren[child]
+	return ok
 }
 
 func (a *App) liveCurrentSessionID() string {
-	return a.sv().LiveCurrent()
+	id := a.currentSessionID()
+	if id == "" {
+		return ""
+	}
+	if _, err := a.svc.SessionSummaryForSession(id); err != nil {
+		a.clearRouteIfCurrent(id)
+		return ""
+	}
+	return id
 }
 
 func (a *App) resolveSessionID(id string) (string, error) {
-	return a.sv().Resolve(id)
+	id = strings.TrimSpace(id)
+	if id != "" {
+		return id, nil
+	}
+	return a.currentSession()
 }
 
 func (a *App) currentSessionSummary() agent.SessionSummary {
-	return a.sv().CurrentSummary()
+	id := a.currentSessionID()
+	if id == "" {
+		return agent.SessionSummary{}
+	}
+	s, err := a.svc.SessionSummaryForSession(id)
+	if err != nil {
+		a.setCurrentSessionID("")
+		return agent.SessionSummary{}
+	}
+	return s
 }
 
 func (a *App) tokenUsage() agent.TokenReport {
-	return a.sv().TokenUsage()
+	id := a.currentSessionID()
+	if id == "" {
+		return agent.TokenReport{}
+	}
+	report, err := a.svc.TokenUsageForSession(id)
+	if err != nil {
+		return agent.TokenReport{}
+	}
+	return report
+}
+
+// removedCurrent clears the routing current when the removed id was it, and
+// reports whether the adapter should refresh its view.
+func (a *App) removedCurrent(id string) bool {
+	id = strings.TrimSpace(id)
+	wasCurrent := a.currentSessionID() == id
+	if wasCurrent {
+		a.setCurrentSessionID("")
+	}
+	return wasCurrent
+}
+
+// sessionChangedPayload builds the resync payload for a session, clearing the
+// routing current when the session read fails.
+func (a *App) sessionChangedPayload(sessionID string) agent.SessionPayload {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return agent.SessionPayload{}
+	}
+	payload, err := a.svc.SessionPayloadForSession(sessionID)
+	if err != nil {
+		a.clearRouteIfCurrent(sessionID)
+		return agent.SessionPayload{}
+	}
+	return payload
 }
 
 func (a *App) sessionMessages() []agent.DisplayMessage {
@@ -957,7 +1072,7 @@ func (a *App) SessionArchive(id string) error {
 	if err := a.svc.SessionArchive(id); err != nil {
 		return err
 	}
-	if a.sv().RemovedCurrent(id) {
+	if a.removedCurrent(id) {
 		a.emitNavigationBoundary(strings.TrimSpace(id))
 	}
 	return nil
@@ -973,7 +1088,7 @@ func (a *App) SessionDelete(id string) error {
 	if err := a.svc.SessionDelete(id); err != nil {
 		return err
 	}
-	if a.sv().RemovedCurrent(id) {
+	if a.removedCurrent(id) {
 		a.emitNavigationBoundary(strings.TrimSpace(id))
 	}
 	return nil
