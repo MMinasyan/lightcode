@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/pathutil"
+	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/safefs"
 	"golang.org/x/sys/unix"
 )
@@ -988,35 +989,40 @@ func copyDir(src, dst string) error {
 	return nil
 }
 
-// TouchActivity updates LastActivity in meta.json to now. Called on
-// every user message. Also bumps the owning project's meta.json when
-// the store is project-aware.
-func (s *Store) TouchActivity() error {
+// updateMeta reads, mutates, and rewrites the session meta.json while
+// holding the store lock, so two concurrent field updates cannot lose each
+// other, and the rewrite is atomic so a reader always sees old-or-new
+// complete JSON.
+func (s *Store) updateMeta(mutate func(*SessionMeta)) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.active {
-		s.mu.Unlock()
 		return ErrNoSession
 	}
-	dir := s.dir
-	projectsRoot := s.projectsRoot
-	projectID := s.projectID
-	s.mu.Unlock()
-	metaPath := filepath.Join(dir, "meta.json")
+	metaPath := filepath.Join(s.dir, "meta.json")
 	var meta SessionMeta
 	if err := readJSON(metaPath, &meta); err != nil {
 		return err
 	}
-	meta.LastActivity = time.Now().Unix()
-	if err := writeJSON(metaPath, meta); err != nil {
+	mutate(&meta)
+	return writeJSON(metaPath, meta)
+}
+
+// TouchActivity updates LastActivity in meta.json to now. Called on
+// every user message. Also advances the owning project's meta.json when
+// the store is project-aware.
+func (s *Store) TouchActivity() error {
+	if err := s.updateMeta(func(m *SessionMeta) {
+		m.LastActivity = time.Now().Unix()
+	}); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	projectsRoot := s.projectsRoot
+	projectID := s.projectID
+	s.mu.Unlock()
 	if projectsRoot != "" && projectID != "" {
-		projectMeta := filepath.Join(projectsRoot, projectID, "meta.json")
-		var pm map[string]any
-		if err := readJSON(projectMeta, &pm); err == nil {
-			pm["last_activity"] = time.Now().Unix()
-			_ = writeJSON(projectMeta, pm)
-		}
+		return project.TouchActivity(projectsRoot, projectID)
 	}
 	return nil
 }
@@ -1037,62 +1043,29 @@ func (s *Store) Meta() (SessionMeta, error) {
 
 // SetModel writes provider + model fields into meta.json.
 func (s *Store) SetModel(provider, model string) error {
-	s.mu.Lock()
-	if !s.active {
-		s.mu.Unlock()
-		return ErrNoSession
-	}
-	dir := s.dir
-	s.mu.Unlock()
-	metaPath := filepath.Join(dir, "meta.json")
-	var meta SessionMeta
-	if err := readJSON(metaPath, &meta); err != nil {
-		return err
-	}
-	meta.Provider = provider
-	meta.Model = model
-	return writeJSON(metaPath, meta)
+	return s.updateMeta(func(m *SessionMeta) {
+		m.Provider = provider
+		m.Model = model
+	})
 }
 
 // SetActiveAgentType writes the active_agent_type field into meta.json.
 func (s *Store) SetActiveAgentType(agentType string) error {
-	s.mu.Lock()
-	if !s.active {
-		s.mu.Unlock()
-		return ErrNoSession
-	}
-	dir := s.dir
-	s.mu.Unlock()
-	metaPath := filepath.Join(dir, "meta.json")
-	var meta SessionMeta
-	if err := readJSON(metaPath, &meta); err != nil {
-		return err
-	}
-	meta.ActiveAgentType = agentType
-	return writeJSON(metaPath, meta)
+	return s.updateMeta(func(m *SessionMeta) {
+		m.ActiveAgentType = agentType
+	})
 }
 
 // SetState writes state + archived_at fields into meta.json.
 func (s *Store) SetState(state string) error {
-	s.mu.Lock()
-	if !s.active {
-		s.mu.Unlock()
-		return ErrNoSession
-	}
-	dir := s.dir
-	s.mu.Unlock()
-	metaPath := filepath.Join(dir, "meta.json")
-	var meta SessionMeta
-	if err := readJSON(metaPath, &meta); err != nil {
-		return err
-	}
-	meta.State = state
-	if state == StateArchived {
-		meta.ArchivedAt = time.Now().Unix()
-	} else {
-		meta.ArchivedAt = 0
-	}
-	return writeJSON(metaPath, meta)
+	return s.updateMeta(func(m *SessionMeta) {
+		m.State = state
+		if state == StateArchived {
+			m.ArchivedAt = time.Now().Unix()
+		} else {
+			m.ArchivedAt = 0
+		}
+	})
 }
 
 // --- internal helpers ---

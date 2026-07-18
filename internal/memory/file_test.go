@@ -45,8 +45,9 @@ func TestWriteReadMemoryFileRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteMemoryFile: %v", err)
 	}
-	if !strings.HasPrefix(filepath.Base(path), "20") || !strings.HasSuffix(path, "a-title.md") {
-		t.Fatalf("path = %q, want timestamped slug", path)
+	base := filepath.Base(path)
+	if !strings.HasPrefix(base, "20") || !strings.Contains(base, "a-title") || !strings.HasSuffix(base, ".md") {
+		t.Fatalf("path = %q, want timestamped slug with .md suffix", path)
 	}
 	title, content, createdAt, err := ReadMemoryFile(path)
 	if err != nil {

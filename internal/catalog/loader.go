@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 // bundledFS contains Lightcode's hand-curated built-in provider catalog files.
@@ -153,7 +155,10 @@ func readUserConfigProvidersAt(home, configPath string) (map[string]any, []Warni
 		if writeErr := writeEmptyCatalogConfig(configPath); writeErr != nil {
 			return map[string]any{}, []Warning{{Kind: "user_config_skip", Message: fmt.Sprintf("create empty config: %v", writeErr)}}
 		}
-		return map[string]any{}, nil
+		// The file now exists — either the empty one just created, or one a
+		// concurrent creator won. Re-read so a losing creator still observes
+		// the winner's providers instead of an empty map.
+		data, err = os.ReadFile(configPath)
 	}
 	if err != nil {
 		return map[string]any{}, []Warning{{Kind: "user_config_skip", Message: fmt.Sprintf("read config: %v", err)}}
@@ -177,10 +182,10 @@ func readUserConfigProvidersAt(home, configPath string) (map[string]any, []Warni
 }
 
 func writeEmptyCatalogConfig(configPath string) error {
-	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+	if _, err := atomicfs.CreateExclusive(configPath, []byte(catalogEmptyConfigTemplate), 0o600); err != nil {
 		return err
 	}
-	return os.WriteFile(configPath, []byte(catalogEmptyConfigTemplate), 0o600)
+	return nil
 }
 
 func lightcodeDir(home string) string {

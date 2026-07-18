@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/project"
 )
 
 func snapshotTree(t *testing.T, root string) map[string]string {
@@ -591,20 +592,18 @@ func TestLockfiles(t *testing.T) {
 func TestProjectRecordFound(t *testing.T) {
 	home := t.TempDir()
 	workDir := filepath.Join(home, "work")
-	projDir := filepath.Join(home, ".lightcode", "projects", "test-id")
-	if err := os.MkdirAll(projDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	meta := fmt.Sprintf(`{"id": "test-id", "name": "work", "path": %q, "created_at": "2026-01-01T00:00:00Z", "last_activity": 1}`, workDir)
-	if err := os.WriteFile(filepath.Join(projDir, "meta.json"), []byte(meta), 0o600); err != nil {
+	projectsRoot := filepath.Join(home, ".lightcode", "projects")
+	rec, err := project.EnsureForPath(projectsRoot, workDir)
+	if err != nil {
 		t.Fatal(err)
 	}
 	p := params(home)
 	p.WorkDir = workDir
 	report, _ := run(t, p)
 	c := find(t, report, "daemon", "project")
-	if c.Status != StatusOK || c.Detail != "project work (test-id)" {
-		t.Fatalf("daemon/project = %+v", c)
+	wantDetail := fmt.Sprintf("project work (%s)", rec.ID)
+	if c.Status != StatusOK || c.Detail != wantDetail {
+		t.Fatalf("daemon/project = %+v, want detail %q", c, wantDetail)
 	}
 }
 

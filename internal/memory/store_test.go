@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func TestReadProjectNameAndSummaryMeta(t *testing.T) {
+func TestReadProjectNameAndSummaryIndex(t *testing.T) {
 	dir := t.TempDir()
 	projectMeta := filepath.Join(dir, "project.json")
 	if err := os.WriteFile(projectMeta, []byte(`{"name":"Logwise"}`), 0o600); err != nil {
@@ -23,16 +23,24 @@ func TestReadProjectNameAndSummaryMeta(t *testing.T) {
 		t.Fatalf("readProjectName missing = %q, want empty", got)
 	}
 
-	summaryMetaPath := filepath.Join(dir, "summary.json")
-	if err := os.WriteFile(summaryMetaPath, []byte(`{"project_id":"p1","project_name":"Project","created_at":"now","compaction_path":"/c.json"}`), 0o600); err != nil {
+	indexPath := filepath.Join(dir, "index.json")
+	if err := os.WriteFile(indexPath, []byte(`{"generation":"gen-abc","project_id":"p1","project_name":"Project","created_at":"now","compaction_path":"/c.json"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got := readSummaryMeta(summaryMetaPath)
-	if got.ProjectID != "p1" || got.ProjectName != "Project" || got.CreatedAt != "now" || got.CompactionPath != "/c.json" {
-		t.Fatalf("readSummaryMeta = %+v", got)
+	got, ok := readSummaryIndex(indexPath)
+	if !ok || got.Generation != "gen-abc" || got.ProjectID != "p1" || got.ProjectName != "Project" || got.CreatedAt != "now" || got.CompactionPath != "/c.json" {
+		t.Fatalf("readSummaryIndex = %+v, ok=%v", got, ok)
 	}
-	if got := readSummaryMeta(filepath.Join(dir, "missing-summary.json")); got != (summaryMeta{}) {
-		t.Fatalf("readSummaryMeta missing = %+v, want zero", got)
+	if _, ok := readSummaryIndex(filepath.Join(dir, "missing.json")); ok {
+		t.Fatal("readSummaryIndex missing = ok, want not ok")
+	}
+	// An index with no generation names no committed record.
+	noGen := filepath.Join(dir, "nogen.json")
+	if err := os.WriteFile(noGen, []byte(`{"project_id":"p1"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readSummaryIndex(noGen); ok {
+		t.Fatal("readSummaryIndex without generation = ok, want not ok")
 	}
 }
 
@@ -54,23 +62,115 @@ func TestStoreDeleteSessionSummaries(t *testing.T) {
 	}
 }
 
-func TestIndexSummaryReturnsMetaWriteErrorBeforeSections(t *testing.T) {
+func TestIndexSummaryFailsAtomicallyOnIndexWriteError(t *testing.T) {
 	home := t.TempDir()
 	store := &Store{embedder: &fakeMemoryEmbedder{}, projectsRoot: t.TempDir(), home: home}
-	dir := filepath.Join(home, ".lightcode", "summaries", "session-1")
-	if err := os.MkdirAll(filepath.Join(dir, "meta.json"), 0o700); err != nil {
+	sessionDir := filepath.Join(home, ".lightcode", "summaries", "session-1")
+	// Make index.json a directory so its atomic publication fails after the
+	// generation's sections are written; the generation must stay uncommitted.
+	if err := os.MkdirAll(filepath.Join(sessionDir, "index.json"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 
 	err := store.IndexSummary("session-1", "project-1", "Project", "## Goal\nbody", "now", "/tmp/compaction.json")
-	if err == nil || !strings.Contains(err.Error(), "write summary meta") {
-		t.Fatalf("IndexSummary error = %v, want write summary meta", err)
+	if err == nil || !strings.Contains(err.Error(), "write summary index") {
+		t.Fatalf("IndexSummary error = %v, want write summary index", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "00-goal.md")); !os.IsNotExist(err) {
-		t.Fatalf("00-goal.md stat error = %v, want not exist", err)
+	if _, ok := readSummaryIndex(filepath.Join(sessionDir, "index.json")); ok {
+		t.Fatal("summary index committed despite write failure")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "00-goal.vec")); !os.IsNotExist(err) {
-		t.Fatalf("00-goal.vec stat error = %v, want not exist", err)
+	results, err := store.SearchHistory("body", "project-1", false, 5)
+	if err != nil {
+		t.Fatalf("SearchHistory: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("SearchHistory returned %d results from an uncommitted generation", len(results))
+	}
+}
+
+func TestSearchHistoryReadsCommittedGenerationAndIgnoresOrphans(t *testing.T) {
+	home := t.TempDir()
+	store := NewStoreWithEmbedder(&fakeMemoryEmbedder{}, t.TempDir(), home)
+
+	if err := store.IndexSummary("session-1", "project-1", "Project", "## Goal\nfindme", "now", "/c.json"); err != nil {
+		t.Fatalf("IndexSummary: %v", err)
+	}
+	sessionDir := filepath.Join(home, ".lightcode", "summaries", "session-1")
+	idx, ok := readSummaryIndex(filepath.Join(sessionDir, "index.json"))
+	if !ok || idx.Generation == "" {
+		t.Fatalf("no committed index after IndexSummary: %+v ok=%v", idx, ok)
+	}
+	if _, err := os.Stat(filepath.Join(sessionDir, idx.Generation, "00-goal.md")); err != nil {
+		t.Fatalf("committed section md missing: %v", err)
+	}
+
+	// An orphan generation not named by index.json must be ignored.
+	orphan := filepath.Join(sessionDir, "gen-orphan")
+	writeSummarySectionForTest(t, orphan, "00-goal", "orphan-body")
+
+	// A session dir with no index.json at all must be ignored.
+	writeSummarySectionForTest(t, filepath.Join(home, ".lightcode", "summaries", "session-2", "gen-x"), "00-goal", "uncommitted-body")
+
+	results, err := store.SearchHistory("findme", "project-1", false, 10)
+	if err != nil {
+		t.Fatalf("SearchHistory: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("SearchHistory returned %d results, want 1 (committed only)", len(results))
+	}
+	if results[0].SectionContent != "findme" || results[0].SessionID != "session-1" {
+		t.Fatalf("unexpected result: %+v", results[0])
+	}
+}
+
+func writeSummarySectionForTest(t *testing.T, dir, base, body string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteVec(filepath.Join(dir, base+".vec"), []float32{1, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, base+".md"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSaveMemorySameTitleDistinctPairs(t *testing.T) {
+	memoriesDir := filepath.Join(t.TempDir(), "memories")
+	store := NewStoreWithEmbedder(&fakeMemoryEmbedder{}, t.TempDir(), t.TempDir())
+
+	fp1, err := store.SaveMemory(memoriesDir, "Same Title", "content one")
+	if err != nil {
+		t.Fatalf("save 1: %v", err)
+	}
+	fp2, err := store.SaveMemory(memoriesDir, "Same Title", "content two")
+	if err != nil {
+		t.Fatalf("save 2: %v", err)
+	}
+	if fp1 == fp2 {
+		t.Fatal("two same-title saves produced the same .md path")
+	}
+	for _, fp := range []string{fp1, fp2} {
+		if _, err := os.Stat(fp); err != nil {
+			t.Fatalf("md missing: %v", err)
+		}
+		if _, err := os.Stat(strings.TrimSuffix(fp, ".md") + ".vec"); err != nil {
+			t.Fatalf("vec missing for %s: %v", fp, err)
+		}
+	}
+	entries, _ := os.ReadDir(memoriesDir)
+	var mds, vecs int
+	for _, e := range entries {
+		switch {
+		case strings.HasSuffix(e.Name(), ".md"):
+			mds++
+		case strings.HasSuffix(e.Name(), ".vec"):
+			vecs++
+		}
+	}
+	if mds != 2 || vecs != 2 {
+		t.Fatalf("got %d .md + %d .vec, want 2 each", mds, vecs)
 	}
 }
 

@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 const discoveryCacheTTL = 24 * time.Hour
@@ -507,7 +509,7 @@ func writeDiscoveryCacheFile(path string, raw discoveryCacheFile) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	return atomicfs.Write(path, data, 0o600)
 }
 
 func safeProviderID(providerID string) bool {

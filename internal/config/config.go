@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/permission"
 )
 
@@ -136,10 +137,7 @@ func defaultCompactionConfig() CompactionConfig {
 // with explicit cutover errors; no migration is attempted.
 func Load(path string) (*Config, error) {
 	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return nil, fmt.Errorf("create config dir: %w", err)
-		}
-		if err := os.WriteFile(path, []byte(emptyConfigTemplate), 0o600); err != nil {
+		if _, err := atomicfs.CreateExclusive(path, []byte(emptyConfigTemplate), 0o600); err != nil {
 			return nil, fmt.Errorf("create config %s: %w", path, err)
 		}
 	}

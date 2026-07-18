@@ -6,14 +6,17 @@
 package project
 
 import (
-	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 // Project is persisted to projects/<id>/meta.json.
@@ -86,6 +89,11 @@ func List(root string) ([]Project, error) {
 		if !e.IsDir() {
 			continue
 		}
+		// Skip reserved sidecar dirs (.locks, .staging, .deleting) that are
+		// not project records.
+		if strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
 		var p Project
 		if err := readJSON(filepath.Join(root, e.Name(), "meta.json"), &p); err != nil {
 			continue
@@ -107,77 +115,122 @@ func ListSortedByActivity(root string) ([]Project, error) {
 	return out, nil
 }
 
-// FindByPath returns the first project whose Path == absPath, or (nil, nil).
+// FindByPath returns the project record for absPath, or (nil, nil) if none
+// has been created. The project id is a deterministic function of the
+// normalized path, so this reads exactly that project's meta.json.
 func FindByPath(root, absPath string) (*Project, error) {
-	projects, err := List(root)
+	clean, err := normalizePath(absPath)
 	if err != nil {
 		return nil, err
 	}
-	for i := range projects {
-		if projects[i].Path == absPath {
-			p := projects[i]
-			return &p, nil
+	var p Project
+	if err := readJSON(metaPathFor(root, projectID(clean)), &p); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
 		}
-	}
-	return nil, nil
-}
-
-// EnsureForPath returns the existing project record for absPath or
-// creates a new one. The new project's sessions/ subdir is also created.
-func EnsureForPath(root, absPath string) (*Project, error) {
-	if existing, err := FindByPath(root, absPath); err != nil {
-		return nil, err
-	} else if existing != nil {
-		return existing, nil
-	}
-	id, err := newProjectID()
-	if err != nil {
-		return nil, err
-	}
-	dir := filepath.Join(root, id)
-	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o700); err != nil {
-		return nil, fmt.Errorf("project: create %s: %w", dir, err)
-	}
-	now := time.Now()
-	p := Project{
-		ID:           id,
-		Name:         filepath.Base(absPath),
-		Path:         absPath,
-		CreatedAt:    now.UTC().Format(time.RFC3339),
-		LastActivity: now.Unix(),
-	}
-	if err := writeJSON(filepath.Join(dir, "meta.json"), p); err != nil {
 		return nil, err
 	}
 	return &p, nil
 }
 
-// TouchActivity bumps LastActivity on the project's meta.json to now.
+// EnsureForPath returns the existing project record for absPath or creates
+// one. The project id is the deterministic id of the normalized path, so a
+// path maps to exactly one project. Creation is serialized under the
+// per-path identity lock, so two concurrent creators converge on one record
+// with one CreatedAt rather than racing to overwrite each other.
+func EnsureForPath(root, absPath string) (*Project, error) {
+	clean, err := normalizePath(absPath)
+	if err != nil {
+		return nil, err
+	}
+	id := projectID(clean)
+	dir := filepath.Join(root, id)
+	metaPath := filepath.Join(dir, "meta.json")
+
+	var result Project
+	err = atomicfs.WithLock(identityLockPath(root, clean), func() error {
+		var existing Project
+		if err := readJSON(metaPath, &existing); err == nil {
+			result = existing
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o700); err != nil {
+			return fmt.Errorf("project: create %s: %w", dir, err)
+		}
+		now := time.Now()
+		p := Project{
+			ID:           id,
+			Name:         filepath.Base(clean),
+			Path:         clean,
+			CreatedAt:    now.UTC().Format(time.RFC3339),
+			LastActivity: now.Unix(),
+		}
+		if err := writeJSON(metaPath, p); err != nil {
+			return err
+		}
+		result = p
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// TouchActivity advances LastActivity on the project's meta.json to now.
+// The whole read-modify-write runs under the project meta lock and never
+// moves activity backward, so concurrent touches serialize to a monotonic
+// value instead of losing an update.
 func TouchActivity(root, projectID string) error {
 	if projectID == "" {
 		return nil
 	}
-	metaPath := filepath.Join(root, projectID, "meta.json")
-	var p Project
-	if err := readJSON(metaPath, &p); err != nil {
-		return err
-	}
-	p.LastActivity = time.Now().Unix()
-	return writeJSON(metaPath, p)
+	metaPath := metaPathFor(root, projectID)
+	return atomicfs.WithLock(metaLockPath(root, projectID), func() error {
+		var p Project
+		if err := readJSON(metaPath, &p); err != nil {
+			return err
+		}
+		now := time.Now().Unix()
+		if now <= p.LastActivity {
+			return nil
+		}
+		p.LastActivity = now
+		return writeJSON(metaPath, p)
+	})
 }
 
-func newProjectID() (string, error) {
-	var buf [16]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return "", fmt.Errorf("project: random: %w", err)
+// normalizePath is the canonical project-path identity: the cleaned
+// absolute path, with no symlink or case rewriting.
+func normalizePath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("project: resolve path: %w", err)
 	}
-	buf[6] = (buf[6] & 0x0f) | 0x40
-	buf[8] = (buf[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%s-%s-%s-%s-%s",
-		hex.EncodeToString(buf[0:4]),
-		hex.EncodeToString(buf[4:6]),
-		hex.EncodeToString(buf[6:8]),
-		hex.EncodeToString(buf[8:10]),
-		hex.EncodeToString(buf[10:16]),
-	), nil
+	return filepath.Clean(abs), nil
+}
+
+func pathHash(cleanAbs string) string {
+	sum := sha256.Sum256([]byte(cleanAbs))
+	return hex.EncodeToString(sum[:])
+}
+
+// projectID is p- plus the full lowercase SHA-256 hex of the normalized
+// path bytes. It is fully deterministic; there is no random or legacy id.
+func projectID(cleanAbs string) string {
+	return "p-" + pathHash(cleanAbs)
+}
+
+func metaPathFor(root, id string) string {
+	return filepath.Join(root, id, "meta.json")
+}
+
+func identityLockPath(root, cleanAbs string) string {
+	return filepath.Join(root, ".locks", "identity", pathHash(cleanAbs)+".lock")
+}
+
+func metaLockPath(root, id string) string {
+	return filepath.Join(root, id, ".locks", "meta.lock")
 }

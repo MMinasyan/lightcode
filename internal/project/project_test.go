@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -25,7 +26,7 @@ func TestResolverEnsureCurrentAndSessionsRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-	if p.ID == "" || p.Path != projectRoot || p.Name != filepath.Base(projectRoot) {
+	if p.ID != projectID(projectRoot) || p.Path != projectRoot || p.Name != filepath.Base(projectRoot) {
 		t.Fatalf("project = %+v", p)
 	}
 	if !strings.HasSuffix(resolver.SessionsRoot(p.ID), filepath.Join(p.ID, "sessions")) {
@@ -43,27 +44,29 @@ func TestResolverEnsureCurrentAndSessionsRoot(t *testing.T) {
 
 func TestListFindSortAndTouch(t *testing.T) {
 	root := t.TempDir()
-	older := Project{ID: "old", Name: "old", Path: "/old", CreatedAt: time.Now().UTC().Format(time.RFC3339), LastActivity: 1}
-	newer := Project{ID: "new", Name: "new", Path: "/new", CreatedAt: time.Now().UTC().Format(time.RFC3339), LastActivity: 2}
-	writeProjectForTest(t, root, older)
-	writeProjectForTest(t, root, newer)
+	older := ensureForTest(t, root, filepath.Join(t.TempDir(), "old"))
+	newer := ensureForTest(t, root, filepath.Join(t.TempDir(), "new"))
+	// Force a deterministic activity ordering.
+	setActivityForTest(t, root, older.ID, 1)
+	setActivityForTest(t, root, newer.ID, 2)
+
 	projects, err := List(root)
 	if err != nil || len(projects) != 2 {
 		t.Fatalf("List = %+v, %v; want 2", projects, err)
 	}
-	found, err := FindByPath(root, "/new")
-	if err != nil || found == nil || found.ID != "new" {
-		t.Fatalf("FindByPath = %+v, %v; want new", found, err)
+	found, err := FindByPath(root, newer.Path)
+	if err != nil || found == nil || found.ID != newer.ID {
+		t.Fatalf("FindByPath = %+v, %v; want %s", found, err, newer.ID)
 	}
 	sorted, err := ListSortedByActivity(root)
-	if err != nil || len(sorted) != 2 || sorted[0].ID != "new" || sorted[1].ID != "old" {
+	if err != nil || len(sorted) != 2 || sorted[0].ID != newer.ID || sorted[1].ID != older.ID {
 		t.Fatalf("ListSortedByActivity = %+v, %v", sorted, err)
 	}
-	if err := TouchActivity(root, "old"); err != nil {
+	if err := TouchActivity(root, older.ID); err != nil {
 		t.Fatalf("TouchActivity: %v", err)
 	}
-	found, err = FindByPath(root, "/old")
-	if err != nil || found.LastActivity < older.LastActivity {
+	found, err = FindByPath(root, older.Path)
+	if err != nil || found.LastActivity < 1 {
 		t.Fatalf("TouchActivity result = %+v, %v", found, err)
 	}
 	if got, err := List(filepath.Join(root, "missing")); err != nil || got != nil {
@@ -71,21 +74,61 @@ func TestListFindSortAndTouch(t *testing.T) {
 	}
 }
 
-func TestProjectIDAndJSONHelpers(t *testing.T) {
-	id1, err := newProjectID()
-	if err != nil {
-		t.Fatalf("newProjectID: %v", err)
+// TestProjectIdentityIsDeterministicWithoutLegacyReuse: the same
+// normalized path always yields the same p-<sha256> id, distinct paths yield
+// distinct ids, and re-ensuring reuses the record without a second CreatedAt.
+func TestProjectIdentityIsDeterministicWithoutLegacyReuse(t *testing.T) {
+	root := t.TempDir()
+	pathA := filepath.Join(t.TempDir(), "a")
+	pathB := filepath.Join(t.TempDir(), "b")
+
+	id := projectID(pathA)
+	if !strings.HasPrefix(id, "p-") || len(id) != len("p-")+64 {
+		t.Fatalf("id = %q; want p- plus 64 hex", id)
 	}
-	id2, err := newProjectID()
-	if err != nil {
-		t.Fatalf("newProjectID: %v", err)
+	if projectID(pathA) != id {
+		t.Fatal("projectID not deterministic for the same path")
 	}
-	if len(id1) != 36 || id1 == id2 || strings.Count(id1, "-") != 4 {
-		t.Fatalf("ids = %q, %q; want distinct UUID-ish IDs", id1, id2)
+	if projectID(pathB) == id {
+		t.Fatal("distinct paths produced the same id")
+	}
+	// Trailing-slash and dot segments normalize to the same identity.
+	base, _ := normalizePath(pathA)
+	trailing, _ := normalizePath(pathA + string(filepath.Separator))
+	dotted, _ := normalizePath(filepath.Join(pathA, "."))
+	if trailing != base || dotted != base || projectID(base) != id {
+		t.Fatal("normalization mismatch for equivalent paths")
 	}
 
+	first, err := EnsureForPath(root, pathA)
+	if err != nil {
+		t.Fatalf("ensure a: %v", err)
+	}
+	if first.ID != id {
+		t.Fatalf("ensured id = %q, want %q", first.ID, id)
+	}
+	second, err := EnsureForPath(root, pathA)
+	if err != nil {
+		t.Fatalf("re-ensure a: %v", err)
+	}
+	if second.ID != first.ID || second.CreatedAt != first.CreatedAt {
+		t.Fatalf("re-ensure changed record: %+v vs %+v", second, first)
+	}
+	entries, _ := os.ReadDir(root)
+	projectDirs := 0
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), ".") {
+			projectDirs++
+		}
+	}
+	if projectDirs != 1 {
+		t.Fatalf("project dirs = %d, want 1", projectDirs)
+	}
+}
+
+func TestJSONHelpersRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "x.json")
-	want := Project{ID: "id", Name: "n", Path: "/p", LastActivity: 1}
+	want := Project{ID: "id", Name: "n", Path: "/p", CreatedAt: time.Now().UTC().Format(time.RFC3339), LastActivity: 1}
 	if err := writeJSON(path, want); err != nil {
 		t.Fatalf("writeJSON: %v", err)
 	}
@@ -98,12 +141,71 @@ func TestProjectIDAndJSONHelpers(t *testing.T) {
 	}
 }
 
-func writeProjectForTest(t *testing.T, root string, p Project) {
+// TestProjectIdentityConcurrentEnsure: concurrent creators of the
+// same path converge on one record with one deterministic id and one
+// CreatedAt; neither misses the other and overwrites it.
+func TestProjectIdentityConcurrentEnsure(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(t.TempDir(), "proj")
+
+	const workers = 16
+	var wg sync.WaitGroup
+	results := make([]*Project, workers)
+	errs := make([]error, workers)
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = EnsureForPath(root, path)
+		}(i)
+	}
+	wg.Wait()
+
+	wantID := projectID(path)
+	var createdAt string
+	for i := 0; i < workers; i++ {
+		if errs[i] != nil {
+			t.Fatalf("worker %d: %v", i, errs[i])
+		}
+		if results[i].ID != wantID {
+			t.Fatalf("worker %d id = %q, want %q", i, results[i].ID, wantID)
+		}
+		if createdAt == "" {
+			createdAt = results[i].CreatedAt
+		} else if results[i].CreatedAt != createdAt {
+			t.Fatalf("divergent CreatedAt: %q vs %q", results[i].CreatedAt, createdAt)
+		}
+	}
+	entries, _ := os.ReadDir(root)
+	projectDirs := 0
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), ".") {
+			projectDirs++
+		}
+	}
+	if projectDirs != 1 {
+		t.Fatalf("project dirs = %d, want 1", projectDirs)
+	}
+}
+
+func ensureForTest(t *testing.T, root, path string) *Project {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Join(root, p.ID), 0o700); err != nil {
+	p, err := EnsureForPath(root, path)
+	if err != nil {
+		t.Fatalf("ensure %s: %v", path, err)
+	}
+	return p
+}
+
+func setActivityForTest(t *testing.T, root, id string, activity int64) {
+	t.Helper()
+	metaPath := metaPathFor(root, id)
+	var p Project
+	if err := readJSON(metaPath, &p); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(root, p.ID, "meta.json"), p); err != nil {
+	p.LastActivity = activity
+	if err := writeJSON(metaPath, p); err != nil {
 		t.Fatal(err)
 	}
 }

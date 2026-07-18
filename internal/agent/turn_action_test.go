@@ -276,19 +276,19 @@ func TestCompactionIndexesConversationSessionAndSearchHistoryRecallsSummary(t *t
 		t.Fatalf("indexed compaction path = %q, want %q", hooks.compactionPath, wantCompactionPath)
 	}
 
-	metaPath := filepath.Join(a.home, ".lightcode", "summaries", sessionID, "meta.json")
-	data, err := os.ReadFile(metaPath)
+	indexPath := filepath.Join(a.home, ".lightcode", "summaries", sessionID, "index.json")
+	data, err := os.ReadFile(indexPath)
 	if err != nil {
-		t.Fatalf("read summary meta: %v", err)
+		t.Fatalf("read summary index: %v", err)
 	}
-	var meta struct {
+	var index struct {
 		CompactionPath string `json:"compaction_path"`
 	}
-	if err := json.Unmarshal(data, &meta); err != nil {
-		t.Fatalf("decode summary meta: %v", err)
+	if err := json.Unmarshal(data, &index); err != nil {
+		t.Fatalf("decode summary index: %v", err)
 	}
-	if meta.CompactionPath != wantCompactionPath {
-		t.Fatalf("summary meta compaction_path = %q, want %q", meta.CompactionPath, wantCompactionPath)
+	if index.CompactionPath != wantCompactionPath {
+		t.Fatalf("summary index compaction_path = %q, want %q", index.CompactionPath, wantCompactionPath)
 	}
 
 	searchHistory := tool.NewSearchHistory(memStore, hooks.projectID)

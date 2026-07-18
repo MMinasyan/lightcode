@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 // DotEnvPath returns the path where Lightcode expects its .env file.
@@ -17,6 +19,12 @@ func DotEnvPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".lightcode", ".env"), nil
+}
+
+// envLockPath is the cross-process lock serializing read-modify-write of the
+// .env file, held so two processes cannot lose each other's updates.
+func envLockPath(envPath string) string {
+	return filepath.Join(filepath.Dir(envPath), ".locks", "env.lock")
 }
 
 // dotEnvTemplate is written to ~/.lightcode/.env the first time Lightcode
@@ -172,7 +180,7 @@ func LoadDotEnv() (*ManagedEnv, error) {
 			fmt.Fprintf(os.Stderr, "lightcode: could not create %s: %v\n", filepath.Dir(path), err)
 			return &ManagedEnv{path: path, managed: map[string]struct{}{}}, nil
 		}
-		if err := os.WriteFile(path, []byte(dotEnvTemplate), 0o600); err != nil {
+		if _, err := atomicfs.CreateExclusive(path, []byte(dotEnvTemplate), 0o600); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: could not create %s: %v\n", path, err)
 			return &ManagedEnv{path: path, managed: map[string]struct{}{}}, nil
 		}
@@ -323,6 +331,12 @@ func isValidEnvKey(key string) bool {
 // mode 0600. If the file exists, its permissions are preserved when possible;
 // new files are created with 0600.
 func writeDotEnvLine(path, key, value string) error {
+	lock, err := atomicfs.Acquire(envLockPath(path))
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -377,6 +391,12 @@ func writeDotEnvLine(path, key, value string) error {
 // preserving comments, blank lines, and other keys. If path does not exist,
 // it is a no-op.
 func removeDotEnvLine(path, key string) error {
+	lock, err := atomicfs.Acquire(envLockPath(path))
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+
 	existing, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -489,33 +509,5 @@ func parseEnvValue(value string) (string, error) {
 // Mirrors the pattern used by writeAgentConfigAtomic. On any failure the
 // temp file is removed so no partial artifact remains.
 func writeDotEnvAtomic(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".env-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	return nil
+	return atomicfs.Write(path, data, 0o600)
 }

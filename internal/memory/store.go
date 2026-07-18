@@ -1,6 +1,8 @@
 package memory
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 var errEmbedderUnavailable = errors.New("memory embedder unavailable")
@@ -182,41 +186,64 @@ func (s *Store) IndexSummary(sessionID, projectID, projectName, summary, created
 		indexed = append(indexed, indexedSection{section: sec, vec: vec})
 	}
 
-	dir := filepath.Join(s.summariesRoot(), sessionID)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	// Each indexing writes an immutable generation directory. index.json is
+	// published atomically last and is the commit marker: it names the current
+	// generation. A crash before index.json leaves an orphan generation that
+	// readers ignore, and re-indexing supersedes the old generation by writing
+	// a new one and repointing index.json.
+	generation, err := newGeneration()
+	if err != nil {
+		return err
+	}
+	sessionDir := filepath.Join(s.summariesRoot(), sessionID)
+	genDir := filepath.Join(sessionDir, generation)
+	if err := os.MkdirAll(genDir, 0755); err != nil {
 		return err
 	}
 
-	meta := summaryMeta{
+	for i, item := range indexed {
+		baseName := fmt.Sprintf("%02d-%s", i, slugify(item.section.Name))
+		if err := atomicfs.Write(filepath.Join(genDir, baseName+".md"), []byte(item.section.Content), 0644); err != nil {
+			return fmt.Errorf("write summary section: %w", err)
+		}
+		if err := WriteVec(filepath.Join(genDir, baseName+".vec"), item.vec); err != nil {
+			return fmt.Errorf("write summary vec: %w", err)
+		}
+	}
+
+	idx := summaryIndex{
+		Generation:     generation,
 		ProjectID:      projectID,
 		ProjectName:    projectName,
 		CreatedAt:      createdAt,
 		CompactionPath: compactionPath,
 	}
-	metaData, _ := json.Marshal(meta)
-	if err := os.WriteFile(filepath.Join(dir, "meta.json"), metaData, 0644); err != nil {
-		return fmt.Errorf("write summary meta: %w", err)
+	data, err := json.Marshal(idx)
+	if err != nil {
+		return err
 	}
-
-	for i, item := range indexed {
-		baseName := fmt.Sprintf("%02d-%s", i, slugify(item.section.Name))
-		mdPath := filepath.Join(dir, baseName+".md")
-		if err := os.WriteFile(mdPath, []byte(item.section.Content), 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "lightcode: memory index write: %v\n", err)
-		}
-
-		if err := WriteVec(filepath.Join(dir, baseName+".vec"), item.vec); err != nil {
-			fmt.Fprintf(os.Stderr, "lightcode: memory index vec: %v\n", err)
-		}
+	if err := atomicfs.Write(filepath.Join(sessionDir, "index.json"), data, 0644); err != nil {
+		return fmt.Errorf("write summary index: %w", err)
 	}
 	return nil
 }
 
-type summaryMeta struct {
+// summaryIndex is the committed pointer for one session's summary. It names
+// the current generation directory and carries the summary metadata.
+type summaryIndex struct {
+	Generation     string `json:"generation"`
 	ProjectID      string `json:"project_id"`
 	ProjectName    string `json:"project_name"`
 	CreatedAt      string `json:"created_at"`
 	CompactionPath string `json:"compaction_path"`
+}
+
+func newGeneration() (string, error) {
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", fmt.Errorf("memory: generation id: %w", err)
+	}
+	return "gen-" + hex.EncodeToString(buf[:]), nil
 }
 
 func (s *Store) SearchHistory(query, projectID string, allProjects bool, limit int) ([]HistoryResult, error) {
@@ -243,6 +270,7 @@ func (s *Store) SearchHistory(query, projectID string, allProjects bool, limit i
 	type vecWithSession struct {
 		entry     VecEntry
 		sessionID string
+		idx       summaryIndex
 	}
 	var all []vecWithSession
 
@@ -253,14 +281,16 @@ func (s *Store) SearchHistory(query, projectID string, allProjects bool, limit i
 		sessionID := sess.Name()
 		sessDir := filepath.Join(root, sessionID)
 
-		if !allProjects {
-			meta := readSummaryMeta(filepath.Join(sessDir, "meta.json"))
-			if meta.ProjectID != projectID {
-				continue
-			}
+		idx, ok := readSummaryIndex(filepath.Join(sessDir, "index.json"))
+		if !ok {
+			continue
+		}
+		if !allProjects && idx.ProjectID != projectID {
+			continue
 		}
 
-		files, err := os.ReadDir(sessDir)
+		genDir := filepath.Join(sessDir, idx.Generation)
+		files, err := os.ReadDir(genDir)
 		if err != nil {
 			continue
 		}
@@ -268,7 +298,7 @@ func (s *Store) SearchHistory(query, projectID string, allProjects bool, limit i
 			if !strings.HasSuffix(f.Name(), ".vec") {
 				continue
 			}
-			vecPath := filepath.Join(sessDir, f.Name())
+			vecPath := filepath.Join(genDir, f.Name())
 			vec, err := ReadVec(vecPath)
 			if err != nil {
 				continue
@@ -276,6 +306,7 @@ func (s *Store) SearchHistory(query, projectID string, allProjects bool, limit i
 			all = append(all, vecWithSession{
 				entry:     VecEntry{Path: vecPath, Vec: vec},
 				sessionID: sessionID,
+				idx:       idx,
 			})
 		}
 	}
@@ -300,13 +331,12 @@ func (s *Store) SearchHistory(query, projectID string, allProjects bool, limit i
 		a := byPath[e.Path]
 		mdPath := strings.TrimSuffix(e.Path, ".vec") + ".md"
 		content, _ := os.ReadFile(mdPath)
-		meta := readSummaryMeta(filepath.Join(filepath.Dir(e.Path), "meta.json"))
 		results = append(results, HistoryResult{
 			SectionContent: string(content),
 			SessionID:      a.sessionID,
-			CreatedAt:      meta.CreatedAt,
-			Project:        meta.ProjectName,
-			CompactionPath: meta.CompactionPath,
+			CreatedAt:      a.idx.CreatedAt,
+			Project:        a.idx.ProjectName,
+			CompactionPath: a.idx.CompactionPath,
 		})
 	}
 	return results, nil
@@ -408,12 +438,14 @@ func readProjectName(metaPath string) string {
 	return m.Name
 }
 
-func readSummaryMeta(path string) summaryMeta {
+func readSummaryIndex(path string) (summaryIndex, bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return summaryMeta{}
+		return summaryIndex{}, false
 	}
-	var m summaryMeta
-	_ = json.Unmarshal(data, &m)
-	return m
+	var idx summaryIndex
+	if err := json.Unmarshal(data, &idx); err != nil || idx.Generation == "" {
+		return summaryIndex{}, false
+	}
+	return idx, true
 }
