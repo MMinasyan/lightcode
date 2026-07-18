@@ -283,7 +283,7 @@ func newAppTestAgentAt(t *testing.T, baseURL string) *agent.Agent {
 }
 
 func newTestApp(svc *agent.Agent) *App {
-	return &App{svc: svc, scope: agent.NewAdapterScope(svc, svc.ProjectRoot())}
+	return &App{svc: svc, routeProjectPath: svc.ProjectRoot()}
 }
 
 func userContents(messages []agent.DisplayMessage) []string {
@@ -311,7 +311,6 @@ func equalStrings(a, b []string) bool {
 func TestProjectSwitchInPlaceKeepsOwnerAlive(t *testing.T) {
 	svc := newAppTestAgent(t)
 	app := newTestApp(svc)
-	app.scope = agent.NewAdapterScope(svc, svc.ProjectRoot())
 
 	firstID, err := svc.NewSession("", "primary")
 	if err != nil {
@@ -356,7 +355,6 @@ func TestProjectSwitchInPlaceKeepsOwnerAlive(t *testing.T) {
 func TestProjectSwitchNoOpSameDir(t *testing.T) {
 	svc := newAppTestAgent(t)
 	app := newTestApp(svc)
-	app.scope = agent.NewAdapterScope(svc, svc.ProjectRoot())
 
 	firstID, err := svc.NewSession("", "primary")
 	if err != nil {

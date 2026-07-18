@@ -62,7 +62,6 @@ type App struct {
 	navMu     sync.Mutex
 	navClosed bool
 
-	scope           *agent.AdapterScope
 	adapterAttached bool
 
 	// routeMu guards the adapter's routing-current session id and its subagent
@@ -72,6 +71,11 @@ type App struct {
 	routeMu       sync.Mutex
 	routeCurrent  string
 	routeChildren map[string]struct{}
+
+	// routeProjectPath is the adapter's routing-current project path, owned by
+	// navMu: navigation commits it and every project-scoped read captures it under
+	// navMu. Nothing reads it off the operation gate, so it needs no leaf lock.
+	routeProjectPath string
 
 	// Delivery spine: every event and navigation payload is appended as a frame;
 	// the single drainer is the only goroutine that emits to the frontend, so
@@ -103,27 +107,32 @@ func (a *App) startup(ctx context.Context) {
 	// the original ctx, which stays valid until the drainer is closed.
 	hostCtx, cancel := context.WithCancel(ctx)
 	a.hostCancel = cancel
+	// Hold navMu across the whole startup so it is a readiness barrier. Wails loads
+	// the frontend concurrently with this asynchronous startup, so every routing
+	// operation waits here until routing is fully set up: it can neither read a
+	// half-initialized route nor commit a project switch that startup would then
+	// overwrite. Owner initialization takes no adapter lock, so this cannot deadlock.
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
 	a.startDelivery()
 	a.svc.SetEventHandler(a.handleEvent)
 	a.svc.Init(hostCtx)
-	a.scope = agent.NewAdapterScope(a.svc, a.svc.ProjectRoot())
 	if lifecycle, ok := a.svc.(interface{ AttachAdapter(context.Context) error }); ok {
 		a.adapterAttached = lifecycle.AttachAdapter(hostCtx) == nil
 	}
+	a.routeProjectPath = a.svc.ProjectRoot()
 	sessionID := ""
-	if sessions, err := a.scope.SessionList("active"); err == nil && len(sessions) > 0 {
+	if sessions, err := a.svc.SessionListForProjectPath(a.routeProjectPath, "active"); err == nil && len(sessions) > 0 {
 		if summary, err := a.svc.OpenSession(sessions[0].ID); err == nil {
 			sessionID = summary.ID
 		}
 	}
 	if sessionID == "" {
-		if id, err := a.scope.NewSession("primary"); err == nil {
+		if id, err := a.svc.NewSessionForProjectPath(a.routeProjectPath, "primary"); err == nil {
 			sessionID = id
 		}
 	}
-	a.navMu.Lock()
 	a.setCurrentSessionID(sessionID)
-	a.navMu.Unlock()
 	a.started = true
 }
 
@@ -1011,12 +1020,50 @@ func (a *App) SetRuntimeConfig(settings agent.RuntimeConfigSettings) error {
 
 // ProjectName returns the basename of the adapter-local project directory.
 func (a *App) ProjectName() string {
-	return a.scope.ProjectName()
+	return filepath.Base(a.routeProjectPathCaptured())
 }
 
 // ReadFileContent loads a file's contents for the in-app viewer.
 func (a *App) ReadFileContent(path string) (string, error) {
-	return a.scope.ReadFileContent(path)
+	root, err := a.routeProjectPathBounded()
+	if err != nil {
+		return "", err
+	}
+	return a.svc.ReadFileContentForProjectPath(root, path)
+}
+
+// routeProjectPathCaptured reads the routing-current project path under navMu and
+// releases it, so the value is a consistent snapshot linearized against a project
+// switch without holding the gate across the read that follows.
+func (a *App) routeProjectPathCaptured() string {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	return a.routeProjectPath
+}
+
+// routeProjectPathBounded is routeProjectPathCaptured for a route that must reject
+// after the adapter is closed.
+func (a *App) routeProjectPathBounded() (string, error) {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return "", errAdapterClosed
+	}
+	return a.routeProjectPath, nil
+}
+
+// openOrCreateSession opens the most recent active session for a project path, or
+// creates one. The caller holds navMu across it as part of a navigation.
+func (a *App) openOrCreateSession(projectPath string) (agent.SessionSummary, error) {
+	sessions, err := a.svc.SessionListForProjectPath(projectPath, "active")
+	if err == nil && len(sessions) > 0 {
+		return a.svc.OpenSession(sessions[0].ID)
+	}
+	id, err := a.svc.NewSessionForProjectPath(projectPath, "primary")
+	if err != nil {
+		return agent.SessionSummary{}, err
+	}
+	return a.svc.SessionSummaryForSession(id)
 }
 
 // TokenUsage returns the current cumulative token usage for the session.
@@ -1041,7 +1088,11 @@ func (a *App) SessionCurrent() agent.SessionSummary {
 
 // SessionList returns sessions filtered by state.
 func (a *App) SessionList(state string) ([]agent.SessionSummary, error) {
-	return a.scope.SessionList(state)
+	root, err := a.routeProjectPathBounded()
+	if err != nil {
+		return nil, err
+	}
+	return a.svc.SessionListForProjectPath(root, state)
 }
 
 // SessionSwitch switches to another session.
@@ -1101,7 +1152,7 @@ func (a *App) SessionNew() error {
 	if a.navClosed {
 		return errAdapterClosed
 	}
-	id, err := a.scope.NewSession("primary")
+	id, err := a.svc.NewSessionForProjectPath(a.routeProjectPath, "primary")
 	if err != nil {
 		return err
 	}
@@ -1127,7 +1178,8 @@ func (a *App) ProjectList() ([]agent.ProjectSummary, error) {
 
 // ProjectCurrent returns the project record for the adapter-local project.
 func (a *App) ProjectCurrent() agent.ProjectSummary {
-	return a.scope.ProjectCurrent()
+	out, _ := a.svc.ProjectCurrentForPath(a.routeProjectPathCaptured())
+	return out
 }
 
 // ProjectSwitch navigates to a different project in-place over the existing
@@ -1153,20 +1205,20 @@ func (a *App) ProjectSwitch(targetPath string) error {
 	if a.navClosed {
 		return errAdapterClosed
 	}
-	if abs == a.scope.ProjectRoot() {
+	if abs == a.routeProjectPath {
 		return nil
 	}
-	summary, err := a.scope.OpenOrCreateSession(abs)
+	summary, err := a.openOrCreateSession(abs)
 	if err != nil {
 		return err
 	}
 	// Commit the project path and the session id together under navMu so a
 	// following current-target call never sees one without the other.
-	a.scope.SetProjectPath(abs)
+	a.routeProjectPath = abs
 	a.setCurrentSessionID(summary.ID)
 	a.emitNavigationBoundary(summary.ID)
 	if a.ctx != nil {
-		wailsRuntime.WindowSetTitle(a.ctx, "Lightcode — "+a.scope.ProjectName())
+		wailsRuntime.WindowSetTitle(a.ctx, "Lightcode — "+filepath.Base(abs))
 	}
 	return nil
 }

@@ -199,8 +199,8 @@ func TestProjectSwitchDoesNotCloseOwnerSession(t *testing.T) {
 	if strings.Contains(app, "relaunchIn") || strings.Contains(app, "wailsRuntime.Quit") {
 		t.Fatalf("ProjectSwitch must not relaunch the process or quit the adapter")
 	}
-	if !strings.Contains(app, "OpenOrCreateSession") {
-		t.Fatalf("ProjectSwitch must navigate in-place via OpenOrCreateSession")
+	if !strings.Contains(app, "openOrCreateSession") {
+		t.Fatalf("ProjectSwitch must navigate in-place via openOrCreateSession")
 	}
 
 	cli := mustReadContractFile(t, filepath.Join("..", "cli", "cli.go"))
