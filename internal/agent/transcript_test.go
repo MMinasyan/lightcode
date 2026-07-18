@@ -59,6 +59,58 @@ func TestTranscriptCoordinatorProjectionMatchesEventFold(t *testing.T) {
 	}
 }
 
+// TestTranscriptCoordinatorPerDeltaSequence verifies each streamed text delta
+// advances the sequence and returns it, while the coalesced tail row carries its
+// latest delta's sequence — so a delta delivered after a capture gates as new even
+// though the tail still holds one coalesced row.
+func TestTranscriptCoordinatorPerDeltaSequence(t *testing.T) {
+	tr := newTranscript()
+	tr.seqMu.Lock()
+	defer tr.seqMu.Unlock()
+
+	tr.appendEventLocked(Event{Kind: EventTurnStart, Turn: 1})
+	s1 := tr.appendEventLocked(Event{Kind: EventTextDelta, Result: "a"})
+	s2 := tr.appendEventLocked(Event{Kind: EventTextDelta, Result: "b"})
+	s3 := tr.appendEventLocked(Event{Kind: EventTextDelta, Result: "c"})
+
+	if s1 == 0 || s2 != s1+1 || s3 != s2+1 {
+		t.Fatalf("delta sequences = %d,%d,%d, want three consecutive nonzero", s1, s2, s3)
+	}
+	if len(tr.tail) != 1 {
+		t.Fatalf("tail rows = %d, want 1 coalesced row", len(tr.tail))
+	}
+	if tr.tail[0].msg.Content != "abc" {
+		t.Fatalf("coalesced content = %q, want %q", tr.tail[0].msg.Content, "abc")
+	}
+	if tr.tail[0].seq != s3 {
+		t.Fatalf("coalesced row seq = %d, want last delta seq %d", tr.tail[0].seq, s3)
+	}
+}
+
+// TestTranscriptCoordinatorToolEndKeepsRowSequence verifies a tool end updates its
+// row in place and returns that row's original sequence, so an id-keyed result
+// update is never re-sequenced and tail sequences stay monotonic even when a tool
+// completes after a later row was appended.
+func TestTranscriptCoordinatorToolEndKeepsRowSequence(t *testing.T) {
+	tr := newTranscript()
+	tr.seqMu.Lock()
+	defer tr.seqMu.Unlock()
+
+	startSeq := tr.appendEventLocked(Event{Kind: EventToolCallStart, ToolCallID: "t1", ToolName: "read_file"})
+	userSeq := tr.appendEventLocked(Event{Kind: EventUserMessageDisplay, Result: "q", Turn: 1})
+	endSeq := tr.appendEventLocked(Event{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "ok"})
+
+	if endSeq != startSeq {
+		t.Fatalf("tool end seq = %d, want the tool row's start seq %d", endSeq, startSeq)
+	}
+	if userSeq <= startSeq {
+		t.Fatalf("later row seq %d must exceed the tool row seq %d", userSeq, startSeq)
+	}
+	if len(tr.tail) != 2 || tr.tail[0].seq != startSeq || !tr.tail[0].msg.Done {
+		t.Fatalf("tool row = %#v, want seq %d done in place", tr.tail[0], startSeq)
+	}
+}
+
 // TestTranscriptCoordinatorStagedToolLastEndWins verifies a second tool end for the
 // same call overwrites the first in place, without adding a row or a sequence.
 func TestTranscriptCoordinatorStagedToolLastEndWins(t *testing.T) {

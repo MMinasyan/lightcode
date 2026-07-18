@@ -323,11 +323,53 @@ func TestTranscriptCoordinatorLiveFeedRootTurn(t *testing.T) {
 	if tailLen != 0 {
 		t.Fatalf("retained tail = %d rows after commit, want 0", tailLen)
 	}
-	if committedSeq != len(rows) {
-		t.Fatalf("committedSeq = %d, want %d (delivered display rows)", committedSeq, len(rows))
+	// committedSeq is the sequence high-water, not a row count: each display row
+	// consumes at least one sequence, and a coalesced text row consumes one per
+	// delta, so the high-water is at least the number of delivered display rows.
+	if committedSeq < len(rows) {
+		t.Fatalf("committedSeq = %d, want >= %d (delivered display rows)", committedSeq, len(rows))
 	}
 	if committedSeq == 0 {
 		t.Fatal("coordinator sequenced no rows from the live feed")
+	}
+}
+
+// TestDeliveredTextDeltasCarrySequence verifies the dispatch sequences a row before
+// delivering it: every delivered text delta carries a strictly increasing nonzero
+// coordinator sequence, while lifecycle events that produce no row carry none.
+func TestDeliveredTextDeltasCarrySequence(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTextResponse(w, "hello back")
+	}))
+	defer server.Close()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+	if _, err := a.Submit(ctx, "hello"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	waitUntilEventOrderTurnEndCount(t, cap, 1)
+	waitUntilEventOrderAgentIdle(t, a)
+
+	var lastDeltaSeq int
+	sawDelta := false
+	for _, ev := range cap.snapshot() {
+		switch ev.Kind {
+		case EventTextDelta:
+			if ev.Seq <= lastDeltaSeq {
+				t.Fatalf("delivered text delta seq = %d, want > previous %d", ev.Seq, lastDeltaSeq)
+			}
+			lastDeltaSeq = ev.Seq
+			sawDelta = true
+		case EventTurnStart, EventTurnEnd:
+			if ev.Seq != 0 {
+				t.Fatalf("lifecycle event %v carried seq %d, want 0", ev.Kind, ev.Seq)
+			}
+		}
+	}
+	if !sawDelta {
+		t.Fatal("no text delta events delivered to assert sequence on")
 	}
 }
 

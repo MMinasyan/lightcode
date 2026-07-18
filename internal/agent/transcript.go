@@ -67,7 +67,12 @@ func newTranscript() *transcript {
 // assistant text deltas coalesce into one row; a tool start opens one row that its
 // matching end completes in place (last end wins); user, system, and background
 // rows map one to one; lifecycle and metadata events produce no row.
-func (t *transcript) appendEventLocked(ev Event) {
+// appendEventLocked returns the sequence of the row this event created or
+// extended, or zero for an event that produces no row. A row-inserting event
+// gets a fresh sequence; a coalesced text delta advances the sequence and carries
+// it on the open row (last delta wins) so a delta streamed after a capture gates
+// as new; a tool end updates its row in place and keeps that row's sequence.
+func (t *transcript) appendEventLocked(ev Event) int {
 	switch ev.Kind {
 	case EventTurnStart:
 		t.textOpen = false
@@ -76,14 +81,19 @@ func (t *transcript) appendEventLocked(ev Event) {
 		t.textOpen = false
 	case EventTextDelta:
 		if t.textOpen && len(t.tail) > 0 {
-			t.tail[len(t.tail)-1].msg.Content += ev.Result
-			return
+			last := &t.tail[len(t.tail)-1]
+			last.msg.Content += ev.Result
+			last.seq = t.nextSeq
+			seq := t.nextSeq
+			t.nextSeq++
+			return seq
 		}
-		t.appendRowLocked(DisplayMessage{Type: "assistant", Content: ev.Result, Turn: t.curTurn})
+		seq := t.appendRowLocked(DisplayMessage{Type: "assistant", Content: ev.Result, Turn: t.curTurn})
 		t.textOpen = true
+		return seq
 	case EventToolCallStart:
 		t.textOpen = false
-		t.appendRowLocked(DisplayMessage{Type: "tool", ID: ev.ToolCallID, Name: ev.ToolName, Args: ev.Args})
+		return t.appendRowLocked(DisplayMessage{Type: "tool", ID: ev.ToolCallID, Name: ev.ToolName, Args: ev.Args})
 	case EventToolCallEnd:
 		// Last end wins: a staged edit emits a second end (the real result) after
 		// its stage-time end, and the later end overwrites the row. Display metadata
@@ -109,15 +119,15 @@ func (t *transcript) appendEventLocked(ev Event) {
 					r.msg.Metadata = nil
 					r.msg.SubagentSessionIDs = nil
 				}
-				break
+				return r.seq
 			}
 		}
 	case EventUserMessageDisplay:
 		t.textOpen = false
-		t.appendRowLocked(DisplayMessage{Type: "user", Content: ev.Result, Turn: ev.Turn})
+		return t.appendRowLocked(DisplayMessage{Type: "user", Content: ev.Result, Turn: ev.Turn})
 	case EventGenericSystemSignal:
 		t.textOpen = false
-		t.appendRowLocked(DisplayMessage{Type: "system", Content: "System: " + ev.Result})
+		return t.appendRowLocked(DisplayMessage{Type: "system", Content: "System: " + ev.Result})
 	case EventBackgroundProcessComplete:
 		t.textOpen = false
 		msg := DisplayMessage{Type: "background_process", Done: true, Success: !ev.IsError, Result: ev.Result}
@@ -125,13 +135,16 @@ func (t *transcript) appendEventLocked(ev Event) {
 			msg.BackgroundProcess = ev.BackgroundProcess
 			msg.ID = ev.BackgroundProcess.ID
 		}
-		t.appendRowLocked(msg)
+		return t.appendRowLocked(msg)
 	}
+	return 0
 }
 
-func (t *transcript) appendRowLocked(msg DisplayMessage) {
-	t.tail = append(t.tail, tailRow{seq: t.nextSeq, msg: msg})
+func (t *transcript) appendRowLocked(msg DisplayMessage) int {
+	seq := t.nextSeq
+	t.tail = append(t.tail, tailRow{seq: seq, msg: msg})
 	t.nextSeq++
+	return seq
 }
 
 // commitLocked records that turn is durably persisted. The just-completed turn's
@@ -180,17 +193,19 @@ func (t *transcript) tailMessagesLocked() []DisplayMessage {
 // feedLocked routes one delivered event into the coordinator: a session-tagged
 // error is retained, a turn end closes the open span and commits the turn, and
 // every other event folds into the tail. The caller holds seqMu.
-func (t *transcript) feedLocked(ev Event) {
+func (t *transcript) feedLocked(ev Event) int {
 	switch ev.Kind {
 	case EventError:
 		if ev.SessionID != "" {
-			t.appendErrorLocked(ev)
+			return t.appendErrorLocked(ev)
 		}
+		return 0
 	case EventTurnEnd:
-		t.appendEventLocked(ev)
+		seq := t.appendEventLocked(ev)
 		t.commitLocked(ev.Turn)
+		return seq
 	default:
-		t.appendEventLocked(ev)
+		return t.appendEventLocked(ev)
 	}
 }
 
@@ -198,14 +213,16 @@ func (t *transcript) feedLocked(ev Event) {
 // from the same sequence as transcript rows so it merges into display order, and
 // it closes any open text span. Retained errors are not durable and ordinary
 // commits never prune them.
-func (t *transcript) appendErrorLocked(ev Event) {
+func (t *transcript) appendErrorLocked(ev Event) int {
 	t.textOpen = false
+	seq := t.nextSeq
 	t.retainedErrors = append(t.retainedErrors, errorRow{
-		seq:  t.nextSeq,
+		seq:  seq,
 		turn: ev.Turn,
 		msg:  DisplayMessage{Type: "error", Content: ev.Error, Turn: ev.Turn},
 	})
 	t.nextSeq++
+	return seq
 }
 
 // dropErrorsAboveTurnLocked removes retained errors for turns above target. It is

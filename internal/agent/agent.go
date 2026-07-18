@@ -1075,15 +1075,17 @@ func (a *Agent) transcriptForSessionID(id string) *transcript {
 	return nil
 }
 
-// feedTranscript folds one delivered event into a session coordinator under its
-// own seqMu. A nil coordinator (sessionless or unknown session) is a no-op.
-func feedTranscript(tr *transcript, ev Event) {
+// feedTranscript folds one event into a session coordinator under its own seqMu
+// and returns the sequence assigned to its display row (zero for a rowless event
+// or a nil coordinator). A nil coordinator (sessionless or unknown session) is a
+// no-op.
+func feedTranscript(tr *transcript, ev Event) int {
 	if tr == nil {
-		return
+		return 0
 	}
 	tr.seqMu.Lock()
-	tr.feedLocked(ev)
-	tr.seqMu.Unlock()
+	defer tr.seqMu.Unlock()
+	return tr.feedLocked(ev)
 }
 
 func (a *Agent) nudgeSignalScheduler() {
@@ -1317,12 +1319,13 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 	a := rt.agent
 	sessionID := ev.SessionID
 	projectID := ev.ProjectID
-	// The coordinator sequences every root display row from the same delivered
-	// event, so it stays consistent with what adapters receive.
+	// The coordinator sequences every root display row before the same event is
+	// delivered, so the delivered event carries the row's sequence and an adapter
+	// can gate it against a later capture's high-water.
 	tr := a.transcriptForSessionID(sessionID)
 	emit := func(out Event) {
+		out.Seq = feedTranscript(tr, out)
 		a.emitEvent(out)
-		feedTranscript(tr, out)
 	}
 	switch ev.Kind {
 	case loop.TextDelta:
@@ -1671,7 +1674,9 @@ func (a *Agent) beforeModelRequestForSession(ctx context.Context, unit *session,
 		if checkpoint.Force {
 			return loop.ContextTransformResult{}, err
 		}
-		a.emitEvent(Event{Kind: EventError, SessionID: sessionIDOf(unit), ProjectID: unit.projectID, Error: fmt.Sprintf("compaction: %v", err), Turn: checkpoint.Turn})
+		errEv := Event{Kind: EventError, SessionID: sessionIDOf(unit), ProjectID: unit.projectID, Error: fmt.Sprintf("compaction: %v", err), Turn: checkpoint.Turn}
+		errEv.Seq = feedTranscript(unit.transcript, errEv)
+		a.emitEvent(errEv)
 		return loop.ContextTransformResult{}, nil
 	}
 	return loop.ContextTransformResult{Transformed: true, ActiveTurnStart: activeStart}, nil
@@ -2747,8 +2752,8 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 
 		if err != nil {
 			errEv := Event{Kind: EventError, SessionID: sessionID, ProjectID: projectID, Error: a.turnErrorMessage(err), Turn: turn}
+			errEv.Seq = feedTranscript(unit.transcript, errEv)
 			a.emitEvent(errEv)
-			feedTranscript(unit.transcript, errEv)
 		}
 		endEv := Event{Kind: EventTurnEnd, SessionID: sessionID, ProjectID: projectID, Turn: turn, Cancelled: turnCtx.Err() != nil, RefreshSession: rt.takeDeferredSessionRefreshAfterTurnForSession(unit)}
 		a.emitEvent(endEv)

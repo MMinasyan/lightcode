@@ -277,10 +277,12 @@ func (a *App) handleEvent(ev agent.Event) {
 	switch ev.Kind {
 	case agent.EventTextDelta:
 		a.emitFrame("token", map[string]any{
+			"seq":     ev.Seq,
 			"content": ev.Result,
 		})
 	case agent.EventToolCallStart:
 		a.emitFrame("tool_start", map[string]any{
+			"seq":  ev.Seq,
 			"id":   ev.ToolCallID,
 			"name": ev.ToolName,
 			"args": ev.Args,
@@ -297,6 +299,7 @@ func (a *App) handleEvent(ev agent.Event) {
 	case agent.EventBackgroundProcessComplete:
 		if ev.BackgroundProcess != nil {
 			a.emitFrame("background_process_complete", map[string]any{
+				"seq":      ev.Seq,
 				"id":       ev.BackgroundProcess.ID,
 				"command":  ev.BackgroundProcess.Command,
 				"reason":   ev.BackgroundProcess.Reason,
@@ -307,11 +310,13 @@ func (a *App) handleEvent(ev agent.Event) {
 		}
 	case agent.EventUserMessageDisplay:
 		a.emitFrame("user_message", map[string]any{
+			"seq":     ev.Seq,
 			"turn":    ev.Turn,
 			"content": ev.Result,
 		})
 	case agent.EventGenericSystemSignal:
 		a.emitFrame("system_signal", map[string]any{
+			"seq":     ev.Seq,
 			"content": "System: " + ev.Result,
 		})
 	case agent.EventQueueChanged:
@@ -335,7 +340,7 @@ func (a *App) handleEvent(ev agent.Event) {
 			a.emitSessionChangedForEvent(ev)
 		}
 	case agent.EventError:
-		a.emitFrame("error", map[string]any{"message": ev.Error})
+		a.emitFrame("error", map[string]any{"seq": ev.Seq, "message": ev.Error})
 	case agent.EventPermissionRequest:
 		a.emitFrame("permission_request", map[string]any{
 			"id":                 ev.PermReq.ID,

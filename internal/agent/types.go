@@ -69,6 +69,11 @@ type Event struct {
 	// Queue fields (EventQueueChanged): a versioned snapshot of the input queue.
 	Queue        []QueuedItem
 	QueueVersion int
+
+	// Seq is the transcript sequence the coordinator assigned to this event's
+	// display row, set before delivery so an adapter can gate the item against a
+	// capture high-water. Zero for events that produce no row.
+	Seq int
 }
 
 // BackgroundProcessDisplay is the adapter-facing display payload for a
