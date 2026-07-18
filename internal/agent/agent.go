@@ -121,8 +121,14 @@ type Agent struct {
 	memoryStore *memory.Store
 	memoryHooks agentMemoryHooks
 
-	lspManager *lsp.Manager
-	procMgr    *process.Manager
+	// servicesMu guards lspManagers and detectCtx. Each project owns one LSP
+	// manager, keyed by canonical project root and bound to it; the shared
+	// process manager and memory store remain owner-wide. detectCtx is set once
+	// the owner is running, so detection starts exactly once per manager.
+	servicesMu  sync.Mutex
+	lspManagers map[string]*lspEntry
+	detectCtx   context.Context
+	procMgr     *process.Manager
 
 	sessions         map[string]*session
 	currentSessionID string
@@ -508,6 +514,50 @@ func (a *Agent) refreshCurrentSessionProjectLocked() {
 	}
 }
 
+type lspEntry struct {
+	mgr       *lsp.Manager
+	detecting bool
+}
+
+// lspManagerFor returns the LSP manager for a project root, creating it on first
+// use. Managers are keyed by canonical root — equivalent to the project id,
+// which derives from it — so a not-yet-created project shares one manager with
+// its later id. Detection starts once, when the owner is running.
+func (a *Agent) lspManagerFor(projectRoot string) *lsp.Manager {
+	key := projectRoot
+	if abs, err := filepath.Abs(projectRoot); err == nil {
+		key = filepath.Clean(abs)
+	}
+	a.servicesMu.Lock()
+	defer a.servicesMu.Unlock()
+	if a.lspManagers == nil {
+		a.lspManagers = map[string]*lspEntry{}
+	}
+	if e, ok := a.lspManagers[key]; ok {
+		return e.mgr
+	}
+	m := lsp.NewManager(projectRoot, a.home)
+	m.SetWarningHandler(func(kind, message string) {
+		a.addWarning("lsp", prompt.Warning{Kind: kind, Message: message})
+	})
+	m.SetSignalHandler(func(content string) {
+		a.ensureRuntime().signalSink.AddSignal(loop.PendingSignal{Payload: content, Persist: true})
+	})
+	e := &lspEntry{mgr: m}
+	a.lspManagers[key] = e
+	a.startDetectLocked(e)
+	return m
+}
+
+// startDetectLocked starts detection for e exactly once, and only once the owner
+// is running. Caller holds servicesMu.
+func (a *Agent) startDetectLocked(e *lspEntry) {
+	if a.detectCtx != nil && !e.detecting {
+		e.detecting = true
+		go e.mgr.Detect(a.detectCtx)
+	}
+}
+
 func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType string, projectID string, projectName string, projectRoot string) (*session, []prompt.Warning, error) {
 	if activeAgentType == "" {
 		activeAgentType = "primary"
@@ -520,6 +570,7 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 		return nil, nil, err
 	}
 	rt := a.ensureRuntime()
+	lspMgr := a.lspManagerFor(projectRoot)
 	var unit *session
 	unitRef := func() *session { return unit }
 	checkPolicy := a.permissionCheckForProject(projectID, projectRoot)
@@ -560,7 +611,7 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 		MemoryStore:   a.memoryStore,
 		ProjectID:     projectID,
 		MemoriesDir:   memoriesDir,
-		LSPManager:    a.lspManager,
+		LSPManager:    lspMgr,
 		Check:         checkPolicy,
 		Ask:           askPolicy,
 		AskAction:     askActionPolicy,
@@ -581,7 +632,7 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 	registry.Register(tool.WrapWithPermission(tool.NewSearchMemory(a.memoryStore, projectID), checkPolicy, askPolicy))
 	registry.Register(tool.WrapWithPermission(tool.NewSearchHistory(a.memoryStore, projectID), checkPolicy, askPolicy))
 
-	lspClient := lsp.NewClient(a.lspManager)
+	lspClient := lsp.NewClient(lspMgr)
 	lspDiag := tool.NewLSPDiagnostics(lspClient, &snapshotDiagAdapter{store: store})
 	registry.Register(lspDiag)
 	registry.Register(tool.NewWorkspaceSymbol(lspClient))
@@ -847,9 +898,6 @@ func New(c Config) (*Agent, error) {
 	a.memoryStore = memStore
 	a.memoryHooks = memStore
 
-	lspMgr := lsp.NewManager(c.ProjectRoot, c.Home)
-	a.lspManager = lspMgr
-
 	rt.mu.Lock()
 	unit, promptWarnings, err := a.rootRunningUnitLocked(store, "primary", proj.ID, proj.Name, c.ProjectRoot)
 	rt.mu.Unlock()
@@ -940,19 +988,27 @@ func (rt *runtime) initOnceLocked(ctx context.Context) {
 		a.ShutdownOwner()
 	}()
 
-	if a.lspManager != nil {
-		a.lspManager.SetWarningHandler(func(kind, message string) {
-			a.addWarning("lsp", prompt.Warning{Kind: kind, Message: message})
-		})
-		a.lspManager.SetSignalHandler(func(content string) {
-			a.ensureRuntime().signalSink.AddSignal(loop.PendingSignal{Payload: content, Persist: true})
-		})
-		go a.lspManager.Detect(rt.ownerCtx)
-		go func() {
-			<-ctx.Done()
-			a.lspManager.ShutdownAll()
-		}()
+	// The owner is now running: record the detection context and start detection
+	// once for every project manager created before Init (handlers are installed
+	// at creation). Managers created later start detection when built.
+	a.servicesMu.Lock()
+	a.detectCtx = rt.ownerCtx
+	for _, e := range a.lspManagers {
+		a.startDetectLocked(e)
 	}
+	a.servicesMu.Unlock()
+	go func() {
+		<-ctx.Done()
+		a.servicesMu.Lock()
+		mgrs := make([]*lsp.Manager, 0, len(a.lspManagers))
+		for _, e := range a.lspManagers {
+			mgrs = append(mgrs, e.mgr)
+		}
+		a.servicesMu.Unlock()
+		for _, m := range mgrs {
+			m.ShutdownAll()
+		}
+	}()
 
 	a.setWarningGroup("prompt", a.pendingPromptWarnings)
 	a.pendingPromptWarnings = nil
