@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 )
@@ -48,6 +49,9 @@ type turnActionParams struct {
 	AlsoRevertCode bool   `json:"alsoRevertCode"`
 }
 
+// acpOutputJoinTimeout bounds how long shutdown waits for the output drainer.
+var acpOutputJoinTimeout = 5 * time.Second
+
 // Runner drives the ACP stdio protocol.
 type Runner struct {
 	// agent is the concrete local owner this adapter constructs, initializes, and
@@ -55,12 +59,87 @@ type Runner struct {
 	// (complete-state hydration and ShutdownOwner).
 	agent agent.AdapterService
 	owner *agent.Agent
-	mu    sync.Mutex
 	in    io.Reader
 	out   io.Writer
 
+	// Output delivery spine: every outbound JSON-RPC frame is appended here and the
+	// sole drainer writes r.out, so protocol order is the drainer's write order, not
+	// merely non-interleaved bytes. Producers only append and wake the drainer.
+	mu        sync.Mutex
+	outFrames [][]byte
+	outWake   chan struct{}
+	outClosed bool
+	outDone   chan struct{}
+	outOnce   sync.Once
+
 	viewOnce sync.Once
 	view     *agent.SessionView
+}
+
+// startOutput installs the single output drainer before any producer runs.
+func (r *Runner) startOutput() {
+	r.outWake = make(chan struct{}, 1)
+	r.outDone = make(chan struct{})
+	go r.runOutputDrainer()
+}
+
+// enqueue appends one marshaled frame and wakes the drainer. It never blocks or
+// writes, so it is safe to call from the event callback that runs under an owner lock.
+func (r *Runner) enqueue(data []byte) {
+	r.mu.Lock()
+	if r.outClosed {
+		r.mu.Unlock()
+		return
+	}
+	r.outFrames = append(r.outFrames, data)
+	r.mu.Unlock()
+	select {
+	case r.outWake <- struct{}{}:
+	default:
+	}
+}
+
+// runOutputDrainer is the only goroutine that writes r.out. It drains frames in
+// FIFO order and exits once closed.
+func (r *Runner) runOutputDrainer() {
+	defer close(r.outDone)
+	for {
+		r.mu.Lock()
+		if r.outClosed {
+			r.mu.Unlock()
+			return
+		}
+		if len(r.outFrames) == 0 {
+			r.mu.Unlock()
+			<-r.outWake
+			continue
+		}
+		data := r.outFrames[0]
+		r.outFrames = r.outFrames[1:]
+		r.mu.Unlock()
+		_, _ = r.out.Write(data)
+	}
+}
+
+// closeOutput rejects further frames and joins the drainer, abandoning it if it is
+// blocked inside one write.
+func (r *Runner) closeOutput() {
+	r.outOnce.Do(func() {
+		r.mu.Lock()
+		r.outClosed = true
+		r.mu.Unlock()
+		select {
+		case r.outWake <- struct{}{}:
+		default:
+		}
+		if r.outDone == nil {
+			return
+		}
+		select {
+		case <-r.outDone:
+		case <-time.After(acpOutputJoinTimeout):
+		}
+	})
 }
 
 // New creates an ACP Runner that owns one concrete local agent.
@@ -74,6 +153,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	r.startOutput()
 	r.agent.SetEventHandler(r.handleEvent)
 	r.agent.Init(ctx)
 	sessionID := ""
@@ -118,11 +198,14 @@ scan:
 		r.dispatch(ctx, req)
 	}
 
-	// Join the owner's in-flight turns and workers before the deferred cancel tears
-	// down the host context (the LSP teardown keys on it).
+	// Join the owner's in-flight turns and workers first, so their terminal events
+	// (e.g. turn_end) are still admitted to the output, then drain and close the
+	// output writer, then let the deferred cancel tear down the host context (the
+	// LSP teardown keys on it).
 	if r.owner != nil {
 		r.owner.ShutdownOwner()
 	}
+	r.closeOutput()
 	return scanner.Err()
 }
 
@@ -825,23 +908,17 @@ func (r *Runner) respondError(id any, code int, msg string) {
 }
 
 func (r *Runner) sendResponse(resp Response) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	data, err := json.Marshal(resp)
 	if err != nil {
 		return
 	}
-	data = append(data, '\n')
-	_, _ = r.out.Write(data)
+	r.enqueue(append(data, '\n'))
 }
 
 func (r *Runner) sendNotification(n Notification) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	data, err := json.Marshal(n)
 	if err != nil {
 		return
 	}
-	data = append(data, '\n')
-	_, _ = r.out.Write(data)
+	r.enqueue(append(data, '\n'))
 }

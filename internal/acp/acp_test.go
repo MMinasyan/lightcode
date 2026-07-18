@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,6 +18,78 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agent"
 	lcconfig "github.com/MMinasyan/lightcode/internal/config"
 )
+
+// TestACPOutputIsWrittenOnlyByDrainer proves the single output drainer is the only
+// path that writes the ACP stream, so protocol order is the drainer's write order.
+func TestACPOutputIsWrittenOnlyByDrainer(t *testing.T) {
+	src, err := os.ReadFile("acp.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	decl := regexp.MustCompile(`(?m)^func (?:\([^)]*\) )?(\w+)\(`)
+	locs := decl.FindAllStringSubmatchIndex(s, -1)
+	for i, loc := range locs {
+		name := s[loc[2]:loc[3]]
+		end := len(s)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		if name != "runOutputDrainer" && strings.Contains(s[loc[1]:end], "r.out.Write") {
+			t.Fatalf("r.out.Write is called in %s; only runOutputDrainer may write the ACP stream", name)
+		}
+	}
+}
+
+// TestACPShutdownJoinsOwnerBeforeClosingOutput proves Run joins the owner before
+// closing the output, so a turn's terminal events (e.g. turn_end) emitted while the
+// owner drains on shutdown are still admitted and delivered rather than dropped.
+func TestACPShutdownJoinsOwnerBeforeClosingOutput(t *testing.T) {
+	src, err := os.ReadFile("acp.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	shut := strings.Index(s, "r.owner.ShutdownOwner()")
+	closeOut := strings.Index(s, "r.closeOutput()")
+	if shut < 0 || closeOut < 0 || shut > closeOut {
+		t.Fatal("Run must join the owner (ShutdownOwner) before closing output so terminal events are delivered on shutdown")
+	}
+}
+
+// TestACPOutputDrainsInOrder proves the drainer writes queued frames in FIFO order.
+func TestACPOutputDrainsInOrder(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	r.startOutput()
+	const n = 50
+	for i := 0; i < n; i++ {
+		r.enqueue([]byte("f" + strconv.Itoa(i) + "\n"))
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		r.mu.Lock()
+		pending := len(r.outFrames)
+		r.mu.Unlock()
+		if pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d frames still undrained", pending)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	r.closeOutput() // join the drainer after its last write before reading out
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != n {
+		t.Fatalf("got %d lines, want %d: %q", len(lines), n, out.String())
+	}
+	for i, line := range lines {
+		if want := "f" + strconv.Itoa(i); line != want {
+			t.Fatalf("line %d = %q, want %q", i, line, want)
+		}
+	}
+}
 
 // TestACPOwnsConcreteAgentLifecycle proves the runner initializes the concrete
 // owner it constructs, establishes a current session, and joins the owner cleanly
@@ -45,7 +118,7 @@ func TestDispatchInitializeAndUnknownMethod(t *testing.T) {
 	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: float64(1), Method: "initialize"})
 	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: float64(2), Method: "missing/method"})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	var initResp Response
 	if err := json.Unmarshal([]byte(lines[0]), &initResp); err != nil {
 		t.Fatalf("initialize response json: %v", err)
@@ -74,7 +147,7 @@ func TestWireHelpers(t *testing.T) {
 	r.respondError("id-2", -32602, "bad params")
 	r.sendNotification(Notification{JSONRPC: "2.0", Method: "agent/test", Params: map[string]any{"x": 1}})
 
-	lines := responseLines(t, out.String(), 3)
+	lines := drainedLines(t, r, &out, 3)
 	if !strings.Contains(lines[0], `"jsonrpc":"2.0"`) || !strings.HasSuffix(out.String(), "\n") {
 		t.Fatalf("response is not newline-terminated JSON-RPC: %q", out.String())
 	}
@@ -115,7 +188,7 @@ func TestHandleEventNotifications(t *testing.T) {
 	r.handleEvent(agent.Event{Kind: agent.EventWarning})
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, Result: "skip", SubagentSessionID: "sub"})
 
-	lines := responseLines(t, out.String(), 6)
+	lines := drainedLines(t, r, &out, 6)
 	wantMethods := []string{"agent/message_chunk", "agent/tool_start", "agent/tool_result", "agent/background_process_complete", "agent/warnings", "agent/warnings"}
 	for i, want := range wantMethods {
 		var got Notification
@@ -161,16 +234,19 @@ func TestHandleEventFiltersSession(t *testing.T) {
 	r := &Runner{out: &out}
 	r.setCurrentSessionID("session-a")
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "session-b", Result: "skip"})
+	r.drainForTest()
 	if out.Len() != 0 {
 		t.Fatalf("wrong-session event was emitted: %q", out.String())
 	}
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "session-a", Result: "keep"})
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	assertACPNotificationMethod(t, lines[0], "agent/message_chunk")
 
+	r.drainForTest()
 	out.Reset()
 	r.setCurrentSessionID("")
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "session-a", Result: "skip"})
+	r.drainForTest()
 	if out.Len() != 0 {
 		t.Fatalf("empty-current event was emitted: %q", out.String())
 	}
@@ -183,7 +259,7 @@ func TestHandleEventNotifiesUserMessageAndSystemSignal(t *testing.T) {
 	r.handleEvent(agent.Event{Kind: agent.EventUserMessageDisplay, Turn: 4, Result: "hello"})
 	r.handleEvent(agent.Event{Kind: agent.EventGenericSystemSignal, Turn: 4, Result: "Model switched to x/y"})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	var um Notification
 	if err := json.Unmarshal([]byte(lines[0]), &um); err != nil {
 		t.Fatalf("user_message json: %v", err)
@@ -222,7 +298,7 @@ func TestHandleEventNotifiesQueueChanged(t *testing.T) {
 		Kind:         agent.EventQueueChanged,
 		QueueVersion: 3,
 	})
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	var qc Notification
 	if err := json.Unmarshal([]byte(lines[0]), &qc); err != nil {
 		t.Fatalf("queue_changed json: %v", err)
@@ -251,7 +327,7 @@ func TestHandleEventTurnEndIncludesCancelled(t *testing.T) {
 	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 3, Cancelled: true})
 	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 5, Cancelled: false})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	for i, expectCancelled := range []bool{true, false} {
 		var n Notification
 		if err := json.Unmarshal([]byte(lines[i]), &n); err != nil {
@@ -281,7 +357,7 @@ func TestHandleEventCompactionEndPushesSessionChanged(t *testing.T) {
 
 	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, SessionID: sessionID, RefreshSession: true})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	assertACPNotificationMethod(t, lines[0], "agent/compaction_end")
 	assertACPNotificationMethod(t, lines[1], "agent/session_changed")
 }
@@ -305,15 +381,16 @@ func TestHandleEventActiveCompactionDefersSessionChangedUntilTurnEnd(t *testing.
 	r.setCurrentSessionID(sessionID)
 
 	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, SessionID: sessionID})
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	assertACPNotificationMethod(t, lines[0], "agent/compaction_end")
 
 	if err := a.Store().MarkTurnComplete(turn); err != nil {
 		t.Fatalf("MarkTurnComplete active: %v", err)
 	}
+	r.drainForTest()
 	out.Reset()
 	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, SessionID: sessionID, Turn: turn, RefreshSession: true})
-	lines = responseLines(t, out.String(), 2)
+	lines = drainedLines(t, r, &out, 2)
 	assertACPNotificationMethod(t, lines[0], "agent/turn_end")
 	assertACPNotificationMethod(t, lines[1], "agent/session_changed")
 	if !strings.Contains(lines[1], "active prompt") {
@@ -331,7 +408,7 @@ func TestDispatchWarningsCurrentReturnsCurrentWarningSnapshot(t *testing.T) {
 
 	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "warnings", Method: "warnings/current"})
 
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("response json: %v", err)
@@ -351,7 +428,7 @@ func TestDispatchWarningsCurrentReturnsEmptyArrayForNoWarnings(t *testing.T) {
 
 	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "warnings", Method: "warnings/current"})
 
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("response json: %v", err)
@@ -369,7 +446,7 @@ func TestPermissionRespondMissingAction(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{out: &out}
 	r.handlePermissionRespond(Request{JSONRPC: "2.0", ID: "p", Params: json.RawMessage(`{"id":"perm"}`)})
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("response json: %v", err)
@@ -395,7 +472,7 @@ func TestHandleTurnActionACPRevertCodeReturnsResultWithoutSessionChanged(t *test
 		Params:  json.RawMessage(`{"turn":` + itoa(clickedTurn) + `,"alsoRevertCode":true}`),
 	})
 
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("response json: %v", err)
@@ -429,7 +506,7 @@ func TestHandleTurnActionACPRevertHistoryPropagatesAlsoRevertCode(t *testing.T) 
 		Params:  json.RawMessage(`{"turn":` + itoa(clickedTurn) + `,"alsoRevertCode":true}`),
 	})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
@@ -464,7 +541,7 @@ func TestHandleTurnActionACPForkReturnsResultAndSessionChanged(t *testing.T) {
 		Params:  json.RawMessage(`{"turn":` + itoa(clickedTurn) + `}`),
 	})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
@@ -485,7 +562,7 @@ func TestHandleTurnActionACPInvalidParams(t *testing.T) {
 
 	r.handleRevertHistory(Request{JSONRPC: "2.0", ID: "bad", Params: json.RawMessage(`{`)})
 
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("response json: %v", err)
@@ -520,7 +597,7 @@ func TestHandleSessionMessagesByIDDoesNotSwitchCurrentSession(t *testing.T) {
 		Params:  json.RawMessage(`{"id":"` + firstID + `"}`),
 	})
 
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("response json: %v", err)
@@ -536,9 +613,10 @@ func TestHandleSessionMessagesByIDDoesNotSwitchCurrentSession(t *testing.T) {
 		t.Fatalf("SessionMessagesFor switched current session to %q, want %q", got, currentID)
 	}
 
+	r.drainForTest()
 	out.Reset()
 	r.handleSessionMessages(Request{JSONRPC: "2.0", ID: "current-messages"})
-	lines = responseLines(t, out.String(), 1)
+	lines = drainedLines(t, r, &out, 1)
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("current response json: %v", err)
 	}
@@ -591,6 +669,7 @@ func TestACPNewSetsCurrent(t *testing.T) {
 		t.Fatal("new session did not set current")
 	}
 
+	r.drainForTest()
 	out.Reset()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -599,7 +678,7 @@ func TestACPNewSetsCurrent(t *testing.T) {
 		ID:      "prompt",
 		Params:  json.RawMessage(`{"content":"hello"}`),
 	})
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("prompt response json: %v", err)
@@ -635,7 +714,7 @@ func TestACPSwitchKeepsCurrent(t *testing.T) {
 		Params:  json.RawMessage(`{"id":"` + firstID + `"}`),
 	})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	var notif Notification
 	if err := json.Unmarshal([]byte(lines[0]), &notif); err != nil {
 		t.Fatalf("notification json: %v", err)
@@ -682,7 +761,7 @@ func TestACPStaleCurrent(t *testing.T) {
 	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "current", Method: "session/current"})
 	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "messages", Method: "session/messages"})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	var current Response
 	if err := json.Unmarshal([]byte(lines[0]), &current); err != nil {
 		t.Fatalf("current json: %v", err)
@@ -723,6 +802,7 @@ func TestACPStaleEvent(t *testing.T) {
 	r := &Runner{agent: a, out: &out}
 	r.setCurrentSessionID(id)
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: id, Result: "skip"})
+	r.drainForTest()
 	if out.Len() != 0 {
 		t.Fatalf("stale event was emitted: %q", out.String())
 	}
@@ -767,9 +847,10 @@ func TestACPClearRemovedCurrent(t *testing.T) {
 			if got := r.currentSessionSummary().ID; got != "" {
 				t.Fatalf("current after %s = %q, want empty", tc.name, got)
 			}
+			r.drainForTest()
 			out.Reset()
 			r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "snapshots", Method: "snapshot/list"})
-			lines := responseLines(t, out.String(), 1)
+			lines := drainedLines(t, r, &out, 1)
 			var snapshots Response
 			if err := json.Unmarshal([]byte(lines[0]), &snapshots); err != nil {
 				t.Fatalf("snapshot response json: %v", err)
@@ -777,9 +858,10 @@ func TestACPClearRemovedCurrent(t *testing.T) {
 			if snapshots.Error == nil {
 				t.Fatalf("%s snapshot/list response = %+v, want error", tc.name, snapshots)
 			}
+			r.drainForTest()
 			out.Reset()
 			r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "compact", Method: "compact"})
-			lines = responseLines(t, out.String(), 1)
+			lines = drainedLines(t, r, &out, 1)
 			var compact Response
 			if err := json.Unmarshal([]byte(lines[0]), &compact); err != nil {
 				t.Fatalf("compact response json: %v", err)
@@ -787,8 +869,10 @@ func TestACPClearRemovedCurrent(t *testing.T) {
 			if compact.Error == nil {
 				t.Fatalf("%s compact response = %+v, want error", tc.name, compact)
 			}
+			r.drainForTest()
 			out.Reset()
 			r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: firstID, Result: "skip"})
+			r.drainForTest()
 			if strings.Contains(out.String(), "skip") {
 				t.Fatalf("%s left old session event visible: %q", tc.name, out.String())
 			}
@@ -836,6 +920,24 @@ func responseLines(t *testing.T, output string, want int) []string {
 		t.Fatalf("output lines = %d, want %d: %q", len(lines), want, output)
 	}
 	return lines
+}
+
+// drainForTest synchronously writes the runner's queued output frames to r.out, so
+// a test can read the output the sole drainer would otherwise write asynchronously.
+func (r *Runner) drainForTest() {
+	r.mu.Lock()
+	frames := r.outFrames
+	r.outFrames = nil
+	r.mu.Unlock()
+	for _, data := range frames {
+		_, _ = r.out.Write(data)
+	}
+}
+
+func drainedLines(t *testing.T, r *Runner, out *bytes.Buffer, want int) []string {
+	t.Helper()
+	r.drainForTest()
+	return responseLines(t, out.String(), want)
 }
 
 func newACPTestAgent(t *testing.T) *agent.Agent {
