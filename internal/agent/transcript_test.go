@@ -188,6 +188,7 @@ func TestCaptureStateReadsAllLiveClasses(t *testing.T) {
 
 	rt.mu.Lock()
 	unit.busy = true
+	unit.compacting = true
 	unit.currentRef = coremodel.ModelRef{Provider: "p", Model: "m"}
 	unit.queue = []QueuedItem{{ID: "q1", Content: "queued"}}
 	unit.queueVersion = 7
@@ -213,6 +214,9 @@ func TestCaptureStateReadsAllLiveClasses(t *testing.T) {
 	}
 	if !st.busy {
 		t.Fatal("busy not captured")
+	}
+	if !st.compacting {
+		t.Fatal("compacting not captured")
 	}
 	if st.model.Provider != "p" || st.model.Model != "m" {
 		t.Fatalf("model = %+v, want p/m", st.model)

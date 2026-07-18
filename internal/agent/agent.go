@@ -68,6 +68,7 @@ type session struct {
 	installedPrompt   string
 
 	busy       bool
+	compacting bool
 	turnCancel context.CancelFunc
 	turnCtx    context.Context
 
@@ -1705,11 +1706,20 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 	}
 	sessionID := sessionIDOf(unit)
 	projectID := unit.projectID
-	a.emitEvent(Event{Kind: EventCompactionStart, SessionID: sessionID, ProjectID: projectID})
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	unit.compacting = true
+	rt.mu.Unlock()
 	refreshSessionNow := false
+	// Register the clear before emitting the start event so the flag is always
+	// released even if a synchronous handler panics on the start event.
 	defer func() {
+		rt.mu.Lock()
+		unit.compacting = false
+		rt.mu.Unlock()
 		a.emitEvent(Event{Kind: EventCompactionEnd, SessionID: sessionID, ProjectID: projectID, RefreshSession: refreshSessionNow})
 	}()
+	a.emitEvent(Event{Kind: EventCompactionStart, SessionID: sessionID, ProjectID: projectID})
 
 	messages := unit.lp.Messages()
 	activeStart := checkpoint.ActiveTurnStart
@@ -4313,13 +4323,13 @@ func (a *Agent) messagesForFrontendForSession(sessionID string) ([]DisplayMessag
 }
 
 // completeState is a session's complete live state: its transcript plus the
-// captured live classes read as one consistent set. The compacting flag is
-// captured with its reader in a later change.
+// captured live classes read as one consistent set.
 type completeState struct {
 	transcript  completeTranscript
 	tokens      TokenReport
 	model       coremodel.ModelRef
 	busy        bool
+	compacting  bool
 	queue       QueueState
 	warnings    []PromptWarning
 	permissions []permission.Request
@@ -4349,6 +4359,7 @@ func (a *Agent) captureState(unit *session) (completeState, error) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	busy := unit.busy
+	compacting := unit.compacting
 	model := unit.currentRef
 	queue := rt.queueSnapshotLocked(unit)
 	var permissions []permission.Request
@@ -4376,6 +4387,7 @@ func (a *Agent) captureState(unit *session) (completeState, error) {
 		tokens:      tokens,
 		model:       model,
 		busy:        busy,
+		compacting:  compacting,
 		queue:       queue,
 		warnings:    warnings,
 		permissions: permissions,
