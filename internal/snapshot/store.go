@@ -147,6 +147,37 @@ func (s *Store) BeginNewSession(projectRoot string) error {
 	return s.beginNewSessionLocked(projectRoot, "")
 }
 
+// BeginNewSessionStaged creates a fresh session in an unlisted staging directory
+// and atomically publishes it into the store's sessions root, so a partially
+// initialized final session directory is never listed. The Store must not have
+// an active session; on any failure it is left inactive and only staging is
+// removed. On success the store is active and rebound to the final location.
+func (s *Store) BeginNewSessionStaged(projectRoot string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active {
+		return fmt.Errorf("snapshot: session %q already open", s.sessionID)
+	}
+	stagingRoot, err := NewStagingSessionsRoot(s.root)
+	if err != nil {
+		return err
+	}
+	// Prepare under staging while the cached paths stay bound to the final
+	// location, then publish by atomic rename; s.root never becomes a staging
+	// path, so a concurrent reader never observes an unpublished candidate.
+	if err := s.beginNewSessionAtLocked(projectRoot, "", stagingRoot); err != nil {
+		return cleanupStagingRoot(stagingRoot, err)
+	}
+	if err := PublishStagedSession(stagingRoot, s.root, s.sessionID); err != nil {
+		// The session is active but its files are still under staging; drop it.
+		s.clearLocked()
+		return cleanupStagingRoot(stagingRoot, err)
+	}
+	// Files now live at s.dir; the empty staging parent is post-commit cleanup.
+	_ = os.RemoveAll(stagingRoot)
+	return nil
+}
+
 // BeginChildSession creates a fresh session linked to a parent session.
 func (s *Store) BeginChildSession(projectRoot, parentSessionID string) error {
 	s.mu.Lock()
@@ -157,7 +188,17 @@ func (s *Store) BeginChildSession(projectRoot, parentSessionID string) error {
 	return s.beginNewSessionLocked(projectRoot, parentSessionID)
 }
 
-func (s *Store) beginNewSessionLocked(projectRoot, parentSessionID string) (err error) {
+func (s *Store) beginNewSessionLocked(projectRoot, parentSessionID string) error {
+	return s.beginNewSessionAtLocked(projectRoot, parentSessionID, s.root)
+}
+
+// beginNewSessionAtLocked creates a fresh session's directory and meta under
+// createRoot but binds the store's cached paths to its permanent location under
+// s.root. For an in-place begin createRoot == s.root; for staged publication
+// createRoot is an unlisted staging root and the caller renames <createRoot>/<id>
+// into <s.root>/<id> before any store I/O, so the cached paths (and s.root) are
+// never a staging path. Caller holds s.mu.
+func (s *Store) beginNewSessionAtLocked(projectRoot, parentSessionID, createRoot string) (err error) {
 	absProject, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return fmt.Errorf("snapshot: resolve project root: %w", err)
@@ -175,10 +216,8 @@ func (s *Store) beginNewSessionLocked(projectRoot, parentSessionID string) (err 
 			s.releaseClaimLocked()
 		}
 	}()
-	dir := filepath.Join(s.root, sessionID)
-	snapshotsDir := filepath.Join(dir, "snapshots")
-	turnsDir := filepath.Join(dir, "turns")
-	for _, p := range []string{snapshotsDir, turnsDir} {
+	createDir := filepath.Join(createRoot, sessionID)
+	for _, p := range []string{filepath.Join(createDir, "snapshots"), filepath.Join(createDir, "turns")} {
 		if err := os.MkdirAll(p, 0o700); err != nil {
 			return fmt.Errorf("snapshot: create %s: %w", p, err)
 		}
@@ -195,13 +234,14 @@ func (s *Store) beginNewSessionLocked(projectRoot, parentSessionID string) (err 
 		LastActivity:     now,
 		ParentSessionID:  parentSessionID,
 	}
-	if err := writeJSON(filepath.Join(dir, "meta.json"), meta); err != nil {
+	if err := writeJSON(filepath.Join(createDir, "meta.json"), meta); err != nil {
 		return fmt.Errorf("snapshot: write session meta: %w", err)
 	}
+	dir := filepath.Join(s.root, sessionID)
 	s.active = true
 	s.dir = dir
-	s.snapshotsDir = snapshotsDir
-	s.turnsDir = turnsDir
+	s.snapshotsDir = filepath.Join(dir, "snapshots")
+	s.turnsDir = filepath.Join(dir, "turns")
 	s.sessionID = sessionID
 	s.projectRoot = absProject
 	s.projectHash = projectHash
@@ -288,11 +328,17 @@ func (s *Store) RelocateActiveSessionPaths(finalSessionsRoot string) error {
 	if !s.active {
 		return ErrNoSession
 	}
+	s.relocateActiveSessionPathsLocked(finalSessionsRoot)
+	return nil
+}
+
+// relocateActiveSessionPathsLocked recomputes the cached session paths from the
+// known session id and a new sessions root. Caller holds s.mu.
+func (s *Store) relocateActiveSessionPathsLocked(finalSessionsRoot string) {
 	s.root = finalSessionsRoot
 	s.dir = filepath.Join(finalSessionsRoot, s.sessionID)
 	s.snapshotsDir = filepath.Join(s.dir, "snapshots")
 	s.turnsDir = filepath.Join(s.dir, "turns")
-	return nil
 }
 
 // Detach releases the store's claim and resets it to the no-session state

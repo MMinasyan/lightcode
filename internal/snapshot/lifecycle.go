@@ -318,6 +318,15 @@ func PublishStagedSession(stagingRoot, finalSessionsRoot, id string) error {
 	return nil
 }
 
+// cleanupStagingRoot removes a staging directory after a preparation failure,
+// joining any cleanup error with the original cause so neither is lost.
+func cleanupStagingRoot(stagingRoot string, cause error) error {
+	if err := os.RemoveAll(stagingRoot); err != nil {
+		return errors.Join(cause, fmt.Errorf("snapshot: staging cleanup: %w", err))
+	}
+	return cause
+}
+
 func effectiveState(s string) string {
 	if s == "" {
 		return StateActive

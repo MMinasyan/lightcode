@@ -89,12 +89,12 @@ func TestForkStagedPublication(t *testing.T) {
 			t.Fatal("fork of a busy source should be rejected")
 		}
 
-		// Rejected before any staging: current unchanged, no staging created.
+		// Rejected before any staging: current unchanged, no candidate left.
 		if a.SessionCurrent().ID != sourceID {
 			t.Fatalf("current changed to %q after rejected fork", a.SessionCurrent().ID)
 		}
-		if _, err := os.Stat(filepath.Join(filepath.Dir(sessionsRoot), ".staging")); !os.IsNotExist(err) {
-			t.Fatalf("staging created for a rejected fork: %v", err)
+		if entries, _ := os.ReadDir(filepath.Join(filepath.Dir(sessionsRoot), ".staging", "sessions")); len(entries) != 0 {
+			t.Fatalf("staging candidate left for a rejected fork: %v", entries)
 		}
 	})
 

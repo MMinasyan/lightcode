@@ -977,6 +977,79 @@ func TestLoadCompleteTurnsWithoutSessionReturnsErrNoSession(t *testing.T) {
 	}
 }
 
+// TestBeginNewSessionStagedPublishesAtomically proves a new session is prepared
+// under staging and published by atomic rename: the final session exists and is
+// readable, the store is rebound to the final root, and no staging candidate is
+// left behind.
+func TestBeginNewSessionStagedPublishesAtomically(t *testing.T) {
+	projectsRoot := t.TempDir()
+	projectID := "p-staged-new"
+	sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+	store, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginNewSessionStaged(t.TempDir()); err != nil {
+		t.Fatalf("BeginNewSessionStaged: %v", err)
+	}
+	id := store.SessionID()
+	if store.Root() != sessionsRoot || store.Dir() != filepath.Join(sessionsRoot, id) {
+		t.Fatalf("store not rebound to final root: root=%q dir=%q", store.Root(), store.Dir())
+	}
+	if _, err := os.Stat(filepath.Join(sessionsRoot, id, "meta.json")); err != nil {
+		t.Fatalf("published session missing: %v", err)
+	}
+	assertNoStagingCandidate(t, projectsRoot, projectID)
+	if _, err := store.Meta(); err != nil {
+		t.Fatalf("Meta after publish: %v", err)
+	}
+	store.Detach()
+}
+
+// TestBeginNewSessionStagedPartialFailureLeavesNoFinalDir proves a staged new
+// session whose publication fails leaves no final session directory, leaves the
+// store inactive, and removes the staging candidate.
+func TestBeginNewSessionStagedPartialFailureLeavesNoFinalDir(t *testing.T) {
+	projectsRoot := t.TempDir()
+	projectID := "p-staged-fail"
+	sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+	if err := os.MkdirAll(filepath.Dir(sessionsRoot), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Make the sessions root a file so publication (rename into it) fails.
+	if err := os.WriteFile(sessionsRoot, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{root: sessionsRoot, projectsRoot: projectsRoot, projectID: projectID}
+
+	if err := store.BeginNewSessionStaged(t.TempDir()); err == nil {
+		t.Fatal("BeginNewSessionStaged should fail when the sessions root is not a directory")
+	}
+	if store.Active() {
+		t.Fatal("store left active after a failed staged begin")
+	}
+	if info, _ := os.Stat(sessionsRoot); info == nil || info.IsDir() {
+		t.Fatal("sessions root changed by a failed staged begin")
+	}
+	assertNoStagingCandidate(t, projectsRoot, projectID)
+}
+
+// assertNoStagingCandidate fails if any staged session candidate remains under
+// the project's staging namespace (an absent namespace is clean).
+func assertNoStagingCandidate(t *testing.T, projectsRoot, projectID string) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(projectsRoot, projectID, ".staging", "sessions"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		t.Fatalf("read staging: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("staging candidate left behind: %v", entries)
+	}
+}
+
 func TestForkIntoPreservesActiveAgentType(t *testing.T) {
 	store := newTestStore(t)
 	turn := store.BeginTurn()

@@ -2144,7 +2144,7 @@ func (a *Agent) ensureSession() error {
 	if err := a.store.AttachSessionsRoot(a.projects.SessionsRoot(proj.ID), a.projects.Root(), proj.ID); err != nil {
 		return err
 	}
-	if err := a.store.BeginNewSession(a.projectRoot); err != nil {
+	if err := a.store.BeginNewSessionStaged(a.projectRoot); err != nil {
 		return err
 	}
 	a.setSessionProject(a.session, proj)
@@ -3677,7 +3677,7 @@ func (a *Agent) NewSession(projectID string, agentType string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := unit.store.BeginNewSession(proj.Path); err != nil {
+	if err := unit.store.BeginNewSessionStaged(proj.Path); err != nil {
 		return "", err
 	}
 	a.ensureActiveModelForSessionLocked(unit)
