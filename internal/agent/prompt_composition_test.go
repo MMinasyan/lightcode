@@ -3,8 +3,6 @@ package agent
 import (
 	"strings"
 	"testing"
-
-	"github.com/MMinasyan/lightcode/internal/prompt"
 )
 
 func TestAgentDefaultPrimaryPromptUsesSpecDrivenAssembler(t *testing.T) {
@@ -17,7 +15,7 @@ func TestAgentDefaultPrimaryPromptUsesSpecDrivenAssembler(t *testing.T) {
 	if !strings.Contains(system, "## Memory Instructions") {
 		t.Fatalf("default primary prompt should include memory instructions\n%s", system)
 	}
-	if cached := a.assembler.AssembleForSpec(prompt.Spec{Size: prompt.SizeFull, Memory: true}); cached.Rebuilt {
-		t.Fatal("default primary construction did not seed the full/memory-on prompt cache")
+	if got := a.assembleSystemPromptForSessionLocked(a.session); got.Prompt != a.session.installedPrompt {
+		t.Fatal("default primary construction did not record the installed prompt: a fresh assembly differs")
 	}
 }

@@ -63,7 +63,8 @@ type session struct {
 	currentRef        coremodel.ModelRef
 	contextWindowSize int
 	activeAdapt       *adaptation.Adaptation
-	assembler         *prompt.Assembler
+	sessionStart      time.Time
+	installedPrompt   string
 
 	busy       bool
 	turnCancel context.CancelFunc
@@ -110,7 +111,7 @@ type Agent struct {
 	// adaptation.Match, overridable in tests). activeAdapt lives on the session.
 	resolveAdapt adaptation.Resolver
 
-	assembler              *prompt.Assembler
+	promptSvc              *prompt.Service
 	pendingPromptWarnings  []prompt.Warning
 	pendingCatalogWarnings []prompt.Warning
 	pendingAgentWarnings   []prompt.Warning
@@ -279,7 +280,8 @@ type runningUnitConfig struct {
 	ProjectName       string
 	ProjectRoot       string
 	ContextWindowSize int
-	Assembler         *prompt.Assembler
+	SessionStart      time.Time
+	InstalledPrompt   string
 	TaskTool          *taskTool
 	PendingExecutor   *tool.StagedExecutor
 	FileTracker       *tool.FileTracker
@@ -298,7 +300,8 @@ func newRunningUnit(cfg runningUnitConfig) *session {
 		currentRef:        cfg.CurrentRef,
 		contextWindowSize: cfg.ContextWindowSize,
 		activeAdapt:       cfg.Loop.ActiveAdaptation,
-		assembler:         cfg.Assembler,
+		sessionStart:      cfg.SessionStart,
+		installedPrompt:   cfg.InstalledPrompt,
 		taskToolInst:      cfg.TaskTool,
 		pendingExecutor:   cfg.PendingExecutor,
 		fileTracker:       cfg.FileTracker,
@@ -640,8 +643,8 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 	registry.Register(lspDiag)
 	registry.Register(tool.NewWorkspaceSymbol(lspClient))
 
-	unitAssembler := prompt.New(projectRoot, a.home)
-	promptUnit := &session{activeAgentType: activeAgentType, projectID: projectID, projectName: projectName, projectRoot: projectRoot, assembler: unitAssembler}
+	sessionStart := time.Now()
+	promptUnit := &session{activeAgentType: activeAgentType, projectID: projectID, projectName: projectName, projectRoot: projectRoot, sessionStart: sessionStart}
 	res := a.assembleSystemPromptForSessionLocked(promptUnit)
 	unit = newRunningUnit(runningUnitConfig{
 		Runtime:         rt,
@@ -649,7 +652,8 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 		ProjectID:       projectID,
 		ProjectName:     projectName,
 		ProjectRoot:     projectRoot,
-		Assembler:       unitAssembler,
+		SessionStart:    sessionStart,
+		InstalledPrompt: res.Prompt,
 		Store:           store,
 		TaskTool:        tt,
 		PendingExecutor: pendingExecutor,
@@ -797,6 +801,7 @@ func New(c Config) (*Agent, error) {
 		env:           c.Env,
 		warningGroups: make(map[string][]PromptWarning),
 		resolveAdapt:  adaptation.Match,
+		promptSvc:     prompt.NewService(c.Home),
 	}
 	a.rt = newRuntime(a, runtimeOptions{WorkspaceRoot: c.ProjectRoot})
 	rt := a.ensureRuntime()
@@ -909,7 +914,6 @@ func New(c Config) (*Agent, error) {
 		return nil, err
 	}
 	a.session = unit
-	a.assembler = unit.assembler
 	a.pendingPromptWarnings = promptWarnings
 	a.pendingCatalogWarnings = catalogWarningsToPromptWarnings(catalogWarnings)
 	a.pendingAgentWarnings = agentWarningsToPromptWarnings(agentTypes.Warnings())
@@ -2021,11 +2025,13 @@ func (a *Agent) applyActiveAdaptationPromptLocked() {
 }
 
 func (a *Agent) applyActiveAdaptationPromptForSessionLocked(unit *session) {
-	if unit == nil || a.assembler == nil || unit.lp == nil {
+	if unit == nil || a.promptSvc == nil || unit.lp == nil {
 		return
 	}
-	if res := a.assembleSystemPromptForSessionLocked(unit); res.Rebuilt {
+	res := a.assembleSystemPromptForSessionLocked(unit)
+	if res.Prompt != unit.installedPrompt {
 		unit.lp.UpdateSystemPrompt(res.Prompt)
+		unit.installedPrompt = res.Prompt
 	}
 }
 
@@ -2038,12 +2044,13 @@ func (a *Agent) refreshSystemPrompt() {
 }
 
 func (a *Agent) refreshSystemPromptForSession(unit *session) {
-	if unit == nil || unit.lp == nil {
+	if unit == nil || unit.lp == nil || a.promptSvc == nil {
 		return
 	}
 	res := a.assembleSystemPromptForSessionLocked(unit)
-	if res.Rebuilt {
+	if res.Prompt != unit.installedPrompt {
 		unit.lp.UpdateSystemPrompt(res.Prompt)
+		unit.installedPrompt = res.Prompt
 	}
 	a.setWarningGroup("prompt", res.Warnings)
 }
@@ -2053,28 +2060,20 @@ func (a *Agent) assembleSystemPromptLocked() prompt.Result {
 }
 
 func (a *Agent) assembleSystemPromptForSessionLocked(unit *session) prompt.Result {
-	adapt := (*adaptation.Adaptation)(nil)
-	agentType := "primary"
-	assembler := a.assembler
-	if unit != nil {
-		adapt = unit.activeAdapt
-		if strings.TrimSpace(unit.activeAgentType) != "" {
-			agentType = unit.activeAgentType
-		}
-		if unit.assembler != nil {
-			assembler = unit.assembler
-		}
+	if unit == nil || a.promptSvc == nil {
+		return prompt.Result{}
 	}
-	spec := prompt.Spec{Size: prompt.SizeFull, Memory: true, Adapt: adapt}
+	agentType := "primary"
+	if strings.TrimSpace(unit.activeAgentType) != "" {
+		agentType = unit.activeAgentType
+	}
+	spec := prompt.Spec{Size: prompt.SizeFull, Memory: true, Adapt: unit.activeAdapt}
 	if resolved, err := a.resolvedAgentTypeLocked(agentType); err == nil {
 		spec.Size = resolved.SystemPrompt
 		spec.Body = resolved.Prompt
 		spec.Memory = resolved.Memory
 	}
-	if assembler == nil {
-		return prompt.Result{}
-	}
-	return assembler.AssembleForSpec(spec)
+	return a.promptSvc.Assemble(unit.projectRoot, unit.sessionStart, spec)
 }
 
 func (a *Agent) restoreModelFromSession() {

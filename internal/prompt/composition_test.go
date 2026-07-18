@@ -10,36 +10,33 @@ import (
 	"github.com/MMinasyan/lightcode/internal/adaptation"
 )
 
-func TestAssembleForSpecFullMatchesBaselineAndSharesCache(t *testing.T) {
+func TestAssembleFullSpecIsStatelessAndDeterministic(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := t.TempDir()
 	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_RULES_MARKER"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	a1 := New(projectRoot, home)
-	a2 := New(projectRoot, home)
-	a2.sessionStart = a1.sessionStart
-
-	base := a1.Assemble()
-	spec := a2.AssembleForSpec(Spec{Size: SizeFull, Memory: true})
-	if base.Prompt != spec.Prompt {
-		t.Fatalf("full empty-body memory-on spec changed baseline prompt\n--- baseline ---\n%s\n--- spec ---\n%s", base.Prompt, spec.Prompt)
+	spec := Spec{Size: SizeFull, Memory: true}
+	// A baseline (nil adapt) render and an explicit full/memory-on spec are the
+	// same prompt, and repeated renders are byte-identical: the service holds no
+	// state that would drift between calls.
+	base := assembleFull(projectRoot, home, nil).Prompt
+	explicit := assembleSpec(projectRoot, home, spec).Prompt
+	if base != explicit {
+		t.Fatalf("full empty-body memory-on spec differs from baseline\n--- baseline ---\n%s\n--- spec ---\n%s", base, explicit)
 	}
-	if !base.Rebuilt || !spec.Rebuilt {
-		t.Fatalf("first build Rebuilt: baseline=%v spec=%v, want both true", base.Rebuilt, spec.Rebuilt)
-	}
-	if cached := a2.Assemble(); cached.Rebuilt {
-		t.Fatal("Assemble after equivalent full spec Rebuilt=true, want cached false")
+	if again := assembleSpec(projectRoot, home, spec).Prompt; again != explicit {
+		t.Fatalf("repeated render differs\n--- first ---\n%s\n--- again ---\n%s", explicit, again)
 	}
 }
 
-func TestAssemblerConcurrentCacheAccess(t *testing.T) {
+func TestAssembleConcurrent(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := t.TempDir()
 	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_RULES_MARKER"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	asm := New(projectRoot, home)
+	svc := NewService(home)
 	adapt := &adaptation.Adaptation{Name: "concurrent", Blocks: []string{"CONCURRENT_BLOCK"}}
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
@@ -47,7 +44,7 @@ func TestAssemblerConcurrentCacheAccess(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
-				res := asm.AssembleForSpec(Spec{
+				res := svc.Assemble(projectRoot, testStart, Spec{
 					Size:   []string{SizeFull, SizeSimple, SizeNone}[j%3],
 					Body:   "body",
 					Memory: j%2 == 0,
@@ -63,7 +60,7 @@ func TestAssemblerConcurrentCacheAccess(t *testing.T) {
 	wg.Wait()
 }
 
-func TestAssembleForSpecFullWithAdaptationMatchesAssembleFor(t *testing.T) {
+func TestAssembleFullWithAdaptationRendersAdaptationContent(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := t.TempDir()
 	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_RULES_MARKER"), 0o600); err != nil {
@@ -74,20 +71,11 @@ func TestAssembleForSpecFullWithAdaptationMatchesAssembleFor(t *testing.T) {
 		Blocks:    []string{"FULL_BLOCK_MARKER"},
 		Additions: map[string]string{"tone": "FULL_TONE_ADDITION"},
 	}
-	a1 := New(projectRoot, home)
-	a2 := New(projectRoot, home)
-	a2.sessionStart = a1.sessionStart
-
-	wrapper := a1.AssembleFor(adapt)
-	spec := a2.AssembleForSpec(Spec{Size: SizeFull, Memory: true, Adapt: adapt})
-	if wrapper.Prompt != spec.Prompt {
-		t.Fatalf("full adapted spec changed AssembleFor prompt\n--- wrapper ---\n%s\n--- spec ---\n%s", wrapper.Prompt, spec.Prompt)
-	}
-	if !wrapper.Rebuilt || !spec.Rebuilt {
-		t.Fatalf("first build Rebuilt: wrapper=%v spec=%v, want both true", wrapper.Rebuilt, spec.Rebuilt)
-	}
-	if cached := a2.AssembleFor(adapt); cached.Rebuilt {
-		t.Fatal("AssembleFor after equivalent adapted full spec Rebuilt=true, want cached false")
+	prompt := assembleFull(projectRoot, home, adapt).Prompt
+	for _, want := range []string{"FULL_BLOCK_MARKER", "FULL_TONE_ADDITION", "PROJECT_RULES_MARKER", "## Environment"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("adapted full prompt missing %q\n%s", want, prompt)
+		}
 	}
 }
 
@@ -97,13 +85,12 @@ func TestAssembleForSpecSimpleIncludesOnlySimpleSectionsAndBodySlot(t *testing.T
 	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("## Tone\n\nPROJECT_TONE_RULES_MARKER"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	a := New(projectRoot, home)
 	adapt := &adaptation.Adaptation{
 		Name:      "simple",
 		Blocks:    []string{"SIMPLE_BLOCK_MARKER"},
 		Additions: map[string]string{"safety": "SIMPLE_SAFETY_ADDITION", "tone": "SIMPLE_TONE_ADDITION"},
 	}
-	prompt := a.AssembleForSpec(Spec{
+	prompt := assembleSpec(projectRoot, home, Spec{
 		Size:   SizeSimple,
 		Body:   "Do the focused job.",
 		Memory: true,
@@ -156,8 +143,7 @@ func TestAssembleForSpecNoneOnlyMemoryAndBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := "## Your Role and Instructions\n\nOnly compact this transcript."
-	a := New(projectRoot, home)
-	prompt := a.AssembleForSpec(Spec{
+	prompt := assembleSpec(projectRoot, home, Spec{
 		Size:   SizeNone,
 		Body:   body,
 		Memory: true,
@@ -184,7 +170,7 @@ func TestAssembleForSpecNoneOnlyMemoryAndBody(t *testing.T) {
 		t.Fatalf("agent prompt heading count = %d, want 1\n%s", count, prompt)
 	}
 
-	withoutMemory := a.AssembleForSpec(Spec{Size: SizeNone, Body: body, Memory: false}).Prompt
+	withoutMemory := assembleSpec(projectRoot, home, Spec{Size: SizeNone, Body: body, Memory: false}).Prompt
 	if withoutMemory != body {
 		t.Fatalf("none memory-off prompt = %q, want body only", withoutMemory)
 	}
@@ -194,12 +180,12 @@ func TestAssembleForSpecMemoryGatingIsIndependentOfSize(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := t.TempDir()
 
-	fullNoMemory := New(projectRoot, home).AssembleForSpec(Spec{Size: SizeFull, Memory: false}).Prompt
+	fullNoMemory := assembleSpec(projectRoot, home, Spec{Size: SizeFull, Memory: false}).Prompt
 	if strings.Contains(fullNoMemory, strings.TrimSpace(memoryInstructionsSection)) {
 		t.Fatalf("full memory-off prompt contains memory instructions\n%s", fullNoMemory)
 	}
 
-	noneWithMemory := New(projectRoot, home).AssembleForSpec(Spec{Size: SizeNone, Body: "Remember.", Memory: true}).Prompt
+	noneWithMemory := assembleSpec(projectRoot, home, Spec{Size: SizeNone, Body: "Remember.", Memory: true}).Prompt
 	if !strings.Contains(noneWithMemory, strings.TrimSpace(memoryInstructionsSection)) {
 		t.Fatalf("none memory-on prompt missing memory instructions\n%s", noneWithMemory)
 	}

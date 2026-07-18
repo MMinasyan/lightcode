@@ -403,10 +403,10 @@ func TestLifecycleUnmatchedModelIsBaseline(t *testing.T) {
 		if got := a.lp.Messages()[0].TextContent(); got != baselinePrompt {
 			t.Fatalf("%s: system prompt bytes changed for unmatched model", path)
 		}
-		// The nil-adaptation set path must be a prompt-cache hit — no rebuild, hence no
-		// UpdateSystemPrompt churn.
-		if a.assembler.AssembleFor(nil).Rebuilt {
-			t.Fatalf("%s: nil-adaptation assemble was not a cache hit", path)
+		// A nil-adaptation refresh must reproduce the installed prompt exactly, so
+		// the installed-prompt comparison suppresses any UpdateSystemPrompt churn.
+		if got := a.assembleSystemPromptForSessionLocked(a.session); got.Prompt != a.session.installedPrompt {
+			t.Fatalf("%s: nil-adaptation assemble differs from the installed prompt", path)
 		}
 	}
 
