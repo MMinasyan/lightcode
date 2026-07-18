@@ -177,6 +177,23 @@ func (t *transcript) tailMessagesLocked() []DisplayMessage {
 	return out
 }
 
+// feedLocked routes one delivered event into the coordinator: a session-tagged
+// error is retained, a turn end closes the open span and commits the turn, and
+// every other event folds into the tail. The caller holds seqMu.
+func (t *transcript) feedLocked(ev Event) {
+	switch ev.Kind {
+	case EventError:
+		if ev.SessionID != "" {
+			t.appendErrorLocked(ev)
+		}
+	case EventTurnEnd:
+		t.appendEventLocked(ev)
+		t.commitLocked(ev.Turn)
+	default:
+		t.appendEventLocked(ev)
+	}
+}
+
 // appendErrorLocked retains a session-tagged error as a display row. It draws
 // from the same sequence as transcript rows so it merges into display order, and
 // it closes any open text span. Retained errors are not durable and ordinary

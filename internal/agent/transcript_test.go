@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func feedTranscript(tr *transcript, events []Event) {
+func feedTranscriptEvents(tr *transcript, events []Event) {
 	tr.seqMu.Lock()
 	defer tr.seqMu.Unlock()
 	for _, ev := range events {
@@ -43,7 +43,7 @@ func TestTranscriptCoordinatorProjectionMatchesEventFold(t *testing.T) {
 		{Kind: EventTurnEnd, Turn: 2},
 	}
 	tr := newTranscript()
-	feedTranscript(tr, events)
+	feedTranscriptEvents(tr, events)
 
 	got := transcriptTailRows(tr)
 	want := projectEvents(events)
@@ -56,7 +56,7 @@ func TestTranscriptCoordinatorProjectionMatchesEventFold(t *testing.T) {
 // same call overwrites the first in place, without adding a row or a sequence.
 func TestTranscriptCoordinatorStagedToolLastEndWins(t *testing.T) {
 	tr := newTranscript()
-	feedTranscript(tr, []Event{
+	feedTranscriptEvents(tr, []Event{
 		{Kind: EventToolCallStart, ToolCallID: "t1", ToolName: "apply_patch"},
 		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "Staged."},
 		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "Applied.", ToolName: "apply_patch"},
@@ -83,7 +83,7 @@ func TestTranscriptCoordinatorToolMetadataAndSubagentLinks(t *testing.T) {
 		"subagent_session_ids": []SubagentSessionLink{{Index: 0, SessionID: "child-1"}},
 	}
 	tr := newTranscript()
-	feedTranscript(tr, []Event{
+	feedTranscriptEvents(tr, []Event{
 		{Kind: EventToolCallStart, ToolCallID: "t1", ToolName: "task"},
 		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "done", Metadata: meta},
 	})
@@ -100,7 +100,7 @@ func TestTranscriptCoordinatorToolMetadataAndSubagentLinks(t *testing.T) {
 	// A failing final end drops metadata and links: the durable projection keeps
 	// them only for a successful result, so the last-end-wins tail must too.
 	tr2 := newTranscript()
-	feedTranscript(tr2, []Event{
+	feedTranscriptEvents(tr2, []Event{
 		{Kind: EventToolCallStart, ToolCallID: "t1", ToolName: "task"},
 		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "staged", Metadata: meta},
 		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "boom", IsError: true},
@@ -182,7 +182,7 @@ func TestTranscriptCoordinatorCommit(t *testing.T) {
 	tr := newTranscript()
 
 	// Turn 1 streams two rows, then commits.
-	feedTranscript(tr, []Event{
+	feedTranscriptEvents(tr, []Event{
 		{Kind: EventTurnStart, Turn: 1},
 		{Kind: EventTextDelta, Result: "a"},
 		{Kind: EventToolCallStart, ToolCallID: "t1", ToolName: "x"},
@@ -207,7 +207,7 @@ func TestTranscriptCoordinatorCommit(t *testing.T) {
 	}
 
 	// Preseed of turn 2: its rows must take sequences strictly above committedSeq.
-	feedTranscript(tr, []Event{
+	feedTranscriptEvents(tr, []Event{
 		{Kind: EventUserMessageDisplay, Result: "q2", Turn: 2},
 		{Kind: EventTurnStart, Turn: 2},
 		{Kind: EventTextDelta, Result: "b"},
@@ -229,7 +229,7 @@ func TestTranscriptCoordinatorCommit(t *testing.T) {
 
 	// A rewrite (revert/compaction/fork) bumps the epoch, rebases the committed
 	// turn, keeps sequence monotonic, and clears the tail.
-	feedTranscript(tr, []Event{
+	feedTranscriptEvents(tr, []Event{
 		{Kind: EventTurnStart, Turn: 3},
 		{Kind: EventTextDelta, Result: "c"},
 	})

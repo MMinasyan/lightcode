@@ -52,9 +52,10 @@ type Config struct {
 type session struct {
 	rt *runtime
 
-	store    *snapshot.Store
-	lp       *loop.Loop
-	registry *tool.Registry
+	store      *snapshot.Store
+	lp         *loop.Loop
+	registry   *tool.Registry
+	transcript *transcript
 
 	activeAgentType   string
 	projectID         string
@@ -293,6 +294,7 @@ func newRunningUnit(cfg runningUnitConfig) *session {
 		rt:                cfg.Runtime,
 		store:             cfg.Store,
 		registry:          cfg.Loop.Registry,
+		transcript:        newTranscript(),
 		activeAgentType:   cfg.ActiveAgentType,
 		projectID:         cfg.ProjectID,
 		projectName:       cfg.ProjectName,
@@ -1049,6 +1051,35 @@ func (rt *runtime) emitEvent(ev Event) {
 	}
 }
 
+// transcriptForSessionID resolves the live coordinator owning a session id, or
+// nil for an unknown or sessionless event.
+func (a *Agent) transcriptForSessionID(id string) *transcript {
+	if id == "" {
+		return nil
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if unit := a.sessions[id]; unit != nil {
+		return unit.transcript
+	}
+	if sessionIDOf(a.session) == id {
+		return a.session.transcript
+	}
+	return nil
+}
+
+// feedTranscript folds one delivered event into a session coordinator under its
+// own seqMu. A nil coordinator (sessionless or unknown session) is a no-op.
+func feedTranscript(tr *transcript, ev Event) {
+	if tr == nil {
+		return
+	}
+	tr.seqMu.Lock()
+	tr.feedLocked(ev)
+	tr.seqMu.Unlock()
+}
+
 func (a *Agent) nudgeSignalScheduler() {
 	a.ensureRuntime().nudgeSignalScheduler()
 }
@@ -1280,11 +1311,18 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 	a := rt.agent
 	sessionID := ev.SessionID
 	projectID := ev.ProjectID
+	// The coordinator sequences every root display row from the same delivered
+	// event, so it stays consistent with what adapters receive.
+	tr := a.transcriptForSessionID(sessionID)
+	emit := func(out Event) {
+		a.emitEvent(out)
+		feedTranscript(tr, out)
+	}
 	switch ev.Kind {
 	case loop.TextDelta:
-		a.emitEvent(Event{Kind: EventTextDelta, SessionID: sessionID, ProjectID: projectID, Result: ev.Result})
+		emit(Event{Kind: EventTextDelta, SessionID: sessionID, ProjectID: projectID, Result: ev.Result})
 	case loop.ToolCallStart:
-		a.emitEvent(Event{
+		emit(Event{
 			SessionID:  sessionID,
 			ProjectID:  projectID,
 			Kind:       EventToolCallStart,
@@ -1293,7 +1331,7 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 			Args:       ev.Args,
 		})
 	case loop.ToolCallEnd:
-		a.emitEvent(Event{
+		emit(Event{
 			SessionID:  sessionID,
 			ProjectID:  projectID,
 			Kind:       EventToolCallEnd,
@@ -1305,7 +1343,7 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 			Metadata:   ev.Metadata,
 		})
 	case loop.BackgroundProcessComplete:
-		a.emitEvent(Event{
+		emit(Event{
 			SessionID:         sessionID,
 			ProjectID:         projectID,
 			Kind:              EventBackgroundProcessComplete,
@@ -1315,7 +1353,7 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 			BackgroundProcess: agentBackgroundProcessDisplay(ev.BackgroundProcess),
 		})
 	case loop.UserMessageDisplay:
-		a.emitEvent(Event{
+		emit(Event{
 			SessionID: sessionID,
 			ProjectID: projectID,
 			Kind:      EventUserMessageDisplay,
@@ -1323,7 +1361,7 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 			Result:    ev.Result,
 		})
 	case loop.GenericSystemSignalDisplay:
-		a.emitEvent(Event{
+		emit(Event{
 			SessionID: sessionID,
 			ProjectID: projectID,
 			Kind:      EventGenericSystemSignal,
@@ -2638,7 +2676,9 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 	projectID := unit.projectID
 	turn := unit.store.BeginTurn()
 
-	a.emitEvent(Event{Kind: EventTurnStart, SessionID: sessionID, ProjectID: projectID, Turn: turn})
+	startEv := Event{Kind: EventTurnStart, SessionID: sessionID, ProjectID: projectID, Turn: turn}
+	a.emitEvent(startEv)
+	feedTranscript(unit.transcript, startEv)
 
 	rt.mu.Lock()
 	a.ensureActiveModelForSessionLocked(unit)
@@ -2679,19 +2719,30 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 		_, err := unit.lp.Run(turnCtx, contents...)
 
 		done := make(chan struct{})
+		flushed := false
 		select {
 		case rt.loopFlush <- done:
 			select {
 			case <-done:
+				flushed = true
 			case <-ctx.Done():
 			}
 		case <-ctx.Done():
 		}
 
 		if err != nil {
-			a.emitEvent(Event{Kind: EventError, SessionID: sessionID, ProjectID: projectID, Error: a.turnErrorMessage(err), Turn: turn})
+			errEv := Event{Kind: EventError, SessionID: sessionID, ProjectID: projectID, Error: a.turnErrorMessage(err), Turn: turn}
+			a.emitEvent(errEv)
+			feedTranscript(unit.transcript, errEv)
 		}
-		a.emitEvent(Event{Kind: EventTurnEnd, SessionID: sessionID, ProjectID: projectID, Turn: turn, Cancelled: turnCtx.Err() != nil, RefreshSession: rt.takeDeferredSessionRefreshAfterTurnForSession(unit)})
+		endEv := Event{Kind: EventTurnEnd, SessionID: sessionID, ProjectID: projectID, Turn: turn, Cancelled: turnCtx.Err() != nil, RefreshSession: rt.takeDeferredSessionRefreshAfterTurnForSession(unit)}
+		a.emitEvent(endEv)
+		// Commit the coordinator only once the drainer flush is acknowledged. If
+		// owner cancellation bypassed the flush a streamed row may still be
+		// buffered, and it must not be fed after the turn commits.
+		if flushed {
+			feedTranscript(unit.transcript, endEv)
+		}
 	}()
 
 	return turn

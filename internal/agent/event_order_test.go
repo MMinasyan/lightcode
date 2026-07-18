@@ -286,6 +286,51 @@ func writeHangingResponse(w http.ResponseWriter, ctx context.Context) {
 	<-ctx.Done()
 }
 
+// TestTranscriptCoordinatorLiveFeedRootTurn verifies the live event path feeds the
+// session coordinator: a delivered root turn commits, clears the retained tail,
+// and sequences exactly the display rows that the delivered event stream folds to.
+func TestTranscriptCoordinatorLiveFeedRootTurn(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTextResponse(w, "hello back")
+	}))
+	defer server.Close()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+	if _, err := a.Submit(ctx, "hello"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	waitUntilEventOrderTurnEndCount(t, cap, 1)
+	// The commit feed runs just after EventTurnEnd is delivered and strictly
+	// before the turn clears busy, so idle guarantees the commit is visible.
+	waitUntilEventOrderAgentIdle(t, a)
+
+	tr := a.session.transcript
+	if tr == nil {
+		t.Fatal("session has no transcript coordinator")
+	}
+	tr.seqMu.Lock()
+	committedTurn := tr.committedTurn
+	committedSeq := tr.committedSeq
+	tailLen := len(tr.tail)
+	tr.seqMu.Unlock()
+
+	rows := projectEvents(cap.snapshot())
+	if committedTurn != 1 {
+		t.Fatalf("committedTurn = %d, want 1", committedTurn)
+	}
+	if tailLen != 0 {
+		t.Fatalf("retained tail = %d rows after commit, want 0", tailLen)
+	}
+	if committedSeq != len(rows) {
+		t.Fatalf("committedSeq = %d, want %d (delivered display rows)", committedSeq, len(rows))
+	}
+	if committedSeq == 0 {
+		t.Fatal("coordinator sequenced no rows from the live feed")
+	}
+}
+
 func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 	t.Run("direct_submit_no_signal", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
