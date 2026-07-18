@@ -309,15 +309,61 @@ func TestWailsDefersActiveCompactionSessionRefreshUntilTurnEnd(t *testing.T) {
 	if !strings.Contains(compactionEnd, `emitFrame("compaction_end"`) {
 		t.Fatalf("EventCompactionEnd must still emit compaction_end; case:\n%s", compactionEnd)
 	}
-	if !strings.Contains(compactionEnd, "if ev.RefreshSession") || !strings.Contains(compactionEnd, "a.emitSessionChangedForEvent(ev)") {
+	if !strings.Contains(compactionEnd, "if ev.RefreshSession") || !strings.Contains(compactionEnd, "a.emitResyncBoundary(ev.SessionID)") {
 		t.Fatalf("EventCompactionEnd must refresh history only when backend marks it safe; case:\n%s", compactionEnd)
 	}
 	turnEnd := extractSwitchCase(t, app, "case agent.EventTurnEnd:")
 	if !strings.Contains(turnEnd, `emitFrame("turn_end"`) {
 		t.Fatalf("EventTurnEnd must still emit turn_end; case:\n%s", turnEnd)
 	}
-	if !strings.Contains(turnEnd, "if ev.RefreshSession") || !strings.Contains(turnEnd, "a.emitSessionChangedForEvent(ev)") {
+	if !strings.Contains(turnEnd, "if ev.RefreshSession") || !strings.Contains(turnEnd, "a.emitResyncBoundary(ev.SessionID)") {
 		t.Fatalf("EventTurnEnd must perform deferred compaction history refresh; case:\n%s", turnEnd)
+	}
+}
+
+// TestCompactionResyncRefreshesTranscriptWithoutRestickingActivity proves the
+// compaction resync applies only the transcript and tokens — never activity or
+// queue. Compaction changes none of those, and the resync runs at turn end before
+// the deferred busy clear, so applying busy from it would re-stick a stale busy the
+// turn_end frame already cleared.
+func TestCompactionResyncRefreshesTranscriptWithoutRestickingActivity(t *testing.T) {
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	body, ok := extractSvelteFunctionBody(svelte, "function applyResync(")
+	if !ok {
+		t.Fatal("applyResync not found in App.svelte")
+	}
+	for _, forbidden := range []string{"busy =", "compacting =", "messageQueue =", "lastQueueVersion =", "warnings =", "permissions ="} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("applyResync must not apply %q: compaction does not change it and a turn-end refresh's busy is stale", strings.TrimSpace(forbidden))
+		}
+	}
+	if !strings.Contains(body, "messages =") || !strings.Contains(body, "tokens =") {
+		t.Fatal("applyResync must refresh the transcript and tokens")
+	}
+	// A resync never switches sessions: it must reject a payload for a session the
+	// frontend has navigated away from, or a stale resync would restore it over the
+	// destination of a concurrent switch.
+	if !strings.Contains(body, "!== sessionId") {
+		t.Fatal("applyResync must reject a resync whose session differs from the current session")
+	}
+	if strings.Contains(body, "sessionId =") {
+		t.Fatal("applyResync must not assign sessionId; a resync never changes the session")
+	}
+}
+
+// TestTurnEndDoesNotReresolveSession proves the turn_end handler never reassigns
+// sessionId. Session identity is owned by the ordered navigation/turn_action/
+// hydration boundaries; an out-of-band SessionCurrent() at turn end could restore a
+// session a concurrent switch already navigated away from, defeating the resync
+// guard that compares against the current session.
+func TestTurnEndDoesNotReresolveSession(t *testing.T) {
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	body, ok := extractSvelteFunctionBody(svelte, "EventsOn('turn_end'")
+	if !ok {
+		t.Fatal("turn_end handler not found in App.svelte")
+	}
+	if strings.Contains(body, "sessionId =") || strings.Contains(body, "SessionCurrent(") {
+		t.Fatal("turn_end must not re-resolve sessionId; only navigation/turn_action/hydration boundaries own session identity")
 	}
 }
 

@@ -358,7 +358,7 @@ func (a *App) handleEvent(ev agent.Event) {
 		a.emitFrame("turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
 		a.emitFrame("status", map[string]any{"state": "idle"})
 		if ev.RefreshSession {
-			a.emitSessionChangedForEvent(ev)
+			a.emitResyncBoundary(ev.SessionID)
 		}
 	case agent.EventError:
 		a.emitFrame("error", map[string]any{"seq": ev.Seq, "message": ev.Error})
@@ -382,32 +382,11 @@ func (a *App) handleEvent(ev agent.Event) {
 	case agent.EventCompactionEnd:
 		a.emitFrame("compaction_end", nil)
 		if ev.RefreshSession {
-			a.emitSessionChangedForEvent(ev)
+			a.emitResyncBoundary(ev.SessionID)
 		}
 	case agent.EventWarning:
 		a.emitFrame("warnings", ev.Warnings)
 	}
-}
-
-// emitSessionChanged tells the frontend to replace its message list.
-func (a *App) emitSessionChanged() {
-	a.emitSessionChangedForSession(a.currentSessionID())
-}
-
-func (a *App) emitSessionChangedForEvent(ev agent.Event) {
-	if strings.TrimSpace(ev.SessionID) != "" {
-		a.emitSessionChangedForSession(ev.SessionID)
-		return
-	}
-	a.emitSessionChanged()
-}
-
-func (a *App) emitSessionChangedForSession(sessionID string) {
-	if a.ctx == nil {
-		return
-	}
-	payload := a.sv().SessionChangedPayload(sessionID)
-	a.emitFrame("session_changed", payload)
 }
 
 // emitNavigationBoundary captures the destination session's complete state and
@@ -465,6 +444,21 @@ func (a *App) emitTurnActionNotice(skipped []snapshot.SkippedRevert) {
 		return
 	}
 	a.emitFrame("turn_action", turnActionBoundary{SkippedFiles: skipped})
+}
+
+// emitResyncBoundary re-syncs a compacted session's transcript and tokens through
+// one ordered frame. It runs on the lock-free event callback, which must not take
+// lifecycleMu: a concurrent archive/delete/revert of this session can hold
+// lifecycleMu while waiting for this very turn to go idle, so a capture that
+// acquired lifecycleMu here would stall the turn against that operation. It
+// therefore uses the rt.mu-only session payload; the frontend applies only the
+// compaction-affected transcript and tokens, leaving activity and queue that
+// compaction did not change to the live stream.
+func (a *App) emitResyncBoundary(sessionID string) {
+	if a.ctx == nil {
+		return
+	}
+	a.emitFrame("resync", a.sv().SessionChangedPayload(sessionID))
 }
 
 func (a *App) setCurrentSessionID(id string) {
@@ -697,7 +691,7 @@ func (a *App) RevertHistory(turn int) error {
 	if err := a.svc.RevertHistoryForSession(sessionID, turn); err != nil {
 		return err
 	}
-	a.emitSessionChangedForSession(sessionID)
+	a.emitTurnActionBoundary(sessionID, nil)
 	return nil
 }
 
@@ -715,8 +709,8 @@ func (a *App) ForkSession(turn int) error {
 	}
 	if result.Session.ID != "" {
 		a.setCurrentSessionID(result.Session.ID)
+		a.emitTurnActionBoundary(result.Session.ID, result.SkippedFiles)
 	}
-	a.emitSessionChangedForSession(result.Session.ID)
 	return nil
 }
 

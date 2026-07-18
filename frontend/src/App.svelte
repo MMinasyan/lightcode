@@ -136,10 +136,22 @@
     });
   }
 
-  function applySessionId(nextSessionId) {
-    // Queue is backend-owned: session changes clear it server-side and emit
-    // queue_changed; no local reset here.
-    sessionId = nextSessionId;
+  // applyResync refreshes a compacted session's transcript and tokens without
+  // disturbing activity, queue, warnings, or permissions, which compaction does
+  // not change — and which a turn-end refresh could otherwise re-stick to a stale
+  // busy. The payload carries no sequence cursor, so the gate resets to admit the
+  // refreshed session's live stream.
+  function applyResync(data) {
+    if (!data) return;
+    // A resync only refreshes the current session; it never switches. Reject one
+    // for a session we have navigated away from — a compaction resync for A can be
+    // enqueued after a switch to B committed its navigation, and applying it would
+    // restore A over B.
+    if ((data.session?.id || '') !== sessionId) return;
+    tokens = data.tokens || defaultTokens();
+    messages = rebuildFromHistory(data.messages || []);
+    streamingIdx = -1;
+    gate = { highWater: 0 };
   }
 
   // applySnapshot renders one complete-state hydration as the whole live view and
@@ -243,16 +255,10 @@
     EventsOn('warnings', buffered((data) => { if (data) warnings = data; }));
     EventsOn('usage', buffered((data) => { if (data) tokens = data; }));
 
-    EventsOn('session_changed', buffered((data) => {
-      if (!data) return;
-      applySessionId(data.session?.id || '');
-      tokens = data.tokens || defaultTokens();
-      messages = rebuildFromHistory(data.messages || []);
-      streamingIdx = -1;
-      // The legacy navigation payload carries no sequence cursor, so reset the gate
-      // to admit the destination session's live stream.
-      gate = { highWater: 0 };
-    }));
+    // A resync boundary carries a compacted session's transcript and tokens;
+    // applying it refreshes the view without touching activity or queue that
+    // compaction does not change.
+    EventsOn('resync', buffered((data) => { applyResync(data); }));
 
     // A navigation boundary carries the destination session's complete state;
     // applying it replaces the whole live view (messages, gate, tokens, activity,
@@ -288,16 +294,15 @@
       if (data?.turn) currentTurn = data.turn;
     }));
 
-    EventsOn('turn_end', buffered(async (data) => {
+    EventsOn('turn_end', buffered((data) => {
       closeStreaming();
       busy = false;
       // A pending request blocks its turn, so a turn end (including a cancel) leaves
       // no request that still needs an answer.
       permissions = {};
-      try {
-        const cur = await SessionCurrent();
-        if (cur?.id) sessionId = cur.id;
-      } catch (e) {}
+      // Session identity is owned by the ordered navigation/turn_action/hydration
+      // boundaries; a turn end never re-resolves it. An out-of-band current-session
+      // lookup here could restore a session a concurrent switch already left.
       // Queue draining is backend-owned: the agent auto-drains after the turn
       // ends and emits turn_start + queue_changed. No frontend flush.
     }));
