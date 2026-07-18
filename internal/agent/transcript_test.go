@@ -169,7 +169,7 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 		a := newCatalogBackedTestAgent(t)
 		attempts := 0
 		a.captureProbe = func(int) error { attempts++; return nil }
-		if _, err := a.captureStateForSelection(a.session); err != nil {
+		if _, err := a.captureStateForSelection(a.session, nil); err != nil {
 			t.Fatalf("err = %v, want nil", err)
 		}
 		if attempts != 1 {
@@ -188,7 +188,7 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 			}
 			return nil
 		}
-		if _, err := a.captureStateForSelection(a.session); err != nil {
+		if _, err := a.captureStateForSelection(a.session, nil); err != nil {
 			t.Fatalf("err = %v, want nil", err)
 		}
 		if attempts != 2 {
@@ -209,7 +209,7 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 			}
 			return nil
 		}
-		if _, err := a.captureStateForSelection(a.session); err != nil {
+		if _, err := a.captureStateForSelection(a.session, nil); err != nil {
 			t.Fatalf("err = %v, want nil", err)
 		}
 		if attempts != 2 {
@@ -226,7 +226,7 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 			bumpCommit(tr)
 			return nil
 		}
-		_, err := a.captureStateForSelection(a.session)
+		_, err := a.captureStateForSelection(a.session, nil)
 		if !errors.Is(err, errCaptureRevisionChanged) {
 			t.Fatalf("err = %v, want errCaptureRevisionChanged", err)
 		}
@@ -246,7 +246,7 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 			}
 			return nil
 		}
-		_, err := a.captureStateForSelection(a.session)
+		_, err := a.captureStateForSelection(a.session, nil)
 		if !errors.Is(err, sentinel) {
 			t.Fatalf("err = %v, want sentinel", err)
 		}
@@ -270,7 +270,7 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 			}
 			return nil
 		}
-		_, err := a.captureStateForSelection(a.session)
+		_, err := a.captureStateForSelection(a.session, nil)
 		if !errors.Is(err, sentinel) {
 			t.Fatalf("err = %v, want sentinel", err)
 		}
@@ -278,6 +278,38 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 			t.Fatalf("attempts = %d, want 2", attempts)
 		}
 	})
+}
+
+// TestCaptureStateInvokesBoundaryWithBuiltState verifies the capture invokes the
+// boundary callback with the immutable state it built, so an adapter can append
+// its boundary while the capture still holds the locks.
+func TestCaptureStateInvokesBoundaryWithBuiltState(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	unit := a.session
+
+	tr := unit.transcript
+	tr.seqMu.Lock()
+	tr.appendEventLocked(Event{Kind: EventTextDelta, Result: "hi"})
+	tr.seqMu.Unlock()
+
+	invoked := 0
+	var seen completeState
+	returned, err := a.captureState(unit, func(st completeState) {
+		invoked++
+		seen = st
+	})
+	if err != nil {
+		t.Fatalf("captureState: %v", err)
+	}
+	if invoked != 1 {
+		t.Fatalf("boundary invoked %d times, want 1", invoked)
+	}
+	if len(seen.transcript.tail) != 1 || seen.transcript.tail[0].msg.Content != "hi" {
+		t.Fatalf("boundary state tail = %#v", seen.transcript.tail)
+	}
+	if len(returned.transcript.tail) != len(seen.transcript.tail) {
+		t.Fatal("boundary state differs from the returned state")
+	}
 }
 
 // TestCaptureStateCapturesPendingPermissions verifies the capture reads the
@@ -296,7 +328,7 @@ func TestCaptureStateCapturesPendingPermissions(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 
-	st, err := a.captureState(unit)
+	st, err := a.captureState(unit, nil)
 	if err != nil {
 		t.Fatalf("captureState: %v", err)
 	}
@@ -334,7 +366,7 @@ func TestCaptureStateReadsAllLiveClasses(t *testing.T) {
 
 	a.setWarningGroup("protocol", []prompt.Warning{{Kind: "k", Message: "m"}})
 
-	st, err := a.captureState(unit)
+	st, err := a.captureState(unit, nil)
 	if err != nil {
 		t.Fatalf("captureState: %v", err)
 	}

@@ -4349,7 +4349,7 @@ var errCaptureRevisionChanged = errors.New("capture revision changed")
 // captured-state locks (it does I/O), then reads every live class while holding
 // the locks in the total order, so the snapshot is one consistent set with no
 // class read outside the lock that guards it. This is the single-read shape.
-func (a *Agent) captureState(unit *session) (completeState, error) {
+func (a *Agent) captureState(unit *session, boundary func(completeState)) (completeState, error) {
 	if unit == nil || unit.store == nil || unit.transcript == nil {
 		return completeState{}, snapshot.ErrNoSession
 	}
@@ -4358,7 +4358,7 @@ func (a *Agent) captureState(unit *session) (completeState, error) {
 	if err != nil {
 		return completeState{}, err
 	}
-	state, _ := a.captureUnderLocks(unit, committed, sessionID, nil)
+	state, _ := a.captureUnderLocks(unit, committed, sessionID, nil, boundary)
 	return state, nil
 }
 
@@ -4368,7 +4368,7 @@ func (a *Agent) captureState(unit *session) (completeState, error) {
 // prefix, so it retries on the first two mismatches and returns
 // errCaptureRevisionChanged on the third, never publishing a partial result. A
 // durable read/decode error returns immediately. The caller holds lifecycleMu.
-func (a *Agent) captureStateForSelection(unit *session) (completeState, error) {
+func (a *Agent) captureStateForSelection(unit *session, boundary func(completeState)) (completeState, error) {
 	if unit == nil || unit.store == nil || unit.transcript == nil {
 		return completeState{}, snapshot.ErrNoSession
 	}
@@ -4389,7 +4389,7 @@ func (a *Agent) captureStateForSelection(unit *session) (completeState, error) {
 		if err != nil {
 			return completeState{}, err
 		}
-		if state, ok := a.captureUnderLocks(unit, committed, sessionID, &rev0); ok {
+		if state, ok := a.captureUnderLocks(unit, committed, sessionID, &rev0, boundary); ok {
 			return state, nil
 		}
 	}
@@ -4408,8 +4408,13 @@ func (a *Agent) captureDurableHistory(unit *session, sessionID string) ([]Displa
 // captureUnderLocks reads every live class while holding the captured-state locks
 // in the total order and builds the immutable state. When wantRev is non-nil it
 // revalidates the transcript revision under seqMu, returning ok=false if it
-// changed so the caller can retry with a fresh durable read.
-func (a *Agent) captureUnderLocks(unit *session, committed []DisplayMessage, sessionID string, wantRev *captureRevision) (completeState, bool) {
+// changed so the caller can retry with a fresh durable read. When the state is
+// built and boundary is non-nil, boundary is invoked while runtime.mu, tokensMu,
+// warningsMu, and seqMu are still held, so an adapter's boundary append orders
+// with those classes' events. The pending-permission snapshot is read under the
+// gate lock, which is released before the boundary runs; holding it across the
+// boundary lands with the atomic publication of every producer.
+func (a *Agent) captureUnderLocks(unit *session, committed []DisplayMessage, sessionID string, wantRev *captureRevision, boundary func(completeState)) (completeState, bool) {
 	rt := a.ensureRuntime()
 	tr := unit.transcript
 
@@ -4437,7 +4442,7 @@ func (a *Agent) captureUnderLocks(unit *session, committed []DisplayMessage, ses
 	if wantRev != nil && tr.revisionLocked() != *wantRev {
 		return completeState{}, false
 	}
-	return completeState{
+	state := completeState{
 		transcript: completeTranscript{
 			committed: committed,
 			tail:      tr.tailSnapshotLocked(),
@@ -4451,7 +4456,11 @@ func (a *Agent) captureUnderLocks(unit *session, committed []DisplayMessage, ses
 		queue:       queue,
 		warnings:    warnings,
 		permissions: permissions,
-	}, true
+	}
+	if boundary != nil {
+		boundary(state)
+	}
+	return state, true
 }
 
 // captureTranscript reads a session's durable committed history outside the
