@@ -218,6 +218,46 @@ func TestWailsDeliveryAppliesTitleAfterFrame(t *testing.T) {
 	}
 }
 
+// TestWailsDeliveryOrdersModelItemAfterBoundary proves the single drainer keeps a
+// root-model item after a preceding navigation boundary, and successive model items
+// in order — so a delayed boundary cannot overwrite a later model result and
+// concurrent switches cannot invert.
+func TestWailsDeliveryOrdersModelItemAfterBoundary(t *testing.T) {
+	a := &App{ctx: context.Background()}
+	var mu sync.Mutex
+	var order []string
+	a.emitFn = func(name string, _ any) { mu.Lock(); order = append(order, name); mu.Unlock() }
+	a.startDelivery()
+	defer a.closeDelivery()
+
+	a.emitFrame("navigation", nil)
+	a.emitFrame("model", nil)
+	a.emitFrame("model", nil)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := len(order)
+		mu.Unlock()
+		if n == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("drained %d of 3: %v", n, order)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"navigation", "model", "model"}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("delivery order = %v, want %v", order, want)
+		}
+	}
+}
+
 // TestWailsDeliveryDropsTitleAfterClose proves a boundary's window title is not
 // applied after close: if the boundary's emit blocks and close abandons the
 // drainer, the title must not change once shutdown has proceeded.

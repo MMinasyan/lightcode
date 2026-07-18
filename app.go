@@ -744,7 +744,25 @@ func (a *App) SwitchModel(ref string) error {
 	if err != nil {
 		return err
 	}
-	return a.svc.SwitchModelForSession(sessionID, ref)
+	if a.agent == nil {
+		return a.svc.SwitchModelForSession(sessionID, ref)
+	}
+	// The owner returns the committed model from the same mutation; append it as an
+	// ordered item tagged with the root it switched, so the selector updates only
+	// while that root is presentation-current — never out of band or on another root.
+	model, err := a.agent.SwitchModelForSessionInfo(sessionID, ref)
+	if err != nil {
+		return err
+	}
+	a.emitFrame("model", modelItem{RootID: sessionID, Model: model})
+	return nil
+}
+
+// modelItem is the ordered frame a root-model switch appends: the committed model
+// info tagged with the root it switched.
+type modelItem struct {
+	RootID string          `json:"rootId"`
+	Model  agent.ModelInfo `json:"model"`
 }
 
 // Reload reloads config and catalog state for future turns.

@@ -191,6 +191,42 @@ func TestTurnActionAppliesDestinationStateThroughOrderedBoundary(t *testing.T) {
 	}
 }
 
+// TestWailsModelSwitchAppendsOrderedPresentationItem proves a root-model switch
+// updates the selector through an ordered, presentation-scoped item, not an
+// out-of-band immediate update: SwitchModel appends a model item to the FIFO, the
+// frontend applies it only when its root is the presented session, and the switch
+// handler never sets the model itself.
+func TestWailsModelSwitchAppendsOrderedPresentationItem(t *testing.T) {
+	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
+	body, ok := extractSvelteFunctionBody(app, "func (a *App) SwitchModel(")
+	if !ok {
+		t.Fatal("SwitchModel not found in app.go")
+	}
+	if !strings.Contains(body, `emitFrame("model"`) {
+		t.Fatal("SwitchModel must append a model item to the ordered delivery FIFO")
+	}
+
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	handler, ok := extractSvelteFunctionBody(svelte, "EventsOn('model'")
+	if !ok {
+		t.Fatal("model handler not found in App.svelte")
+	}
+	if !strings.Contains(handler, "data.rootId !== sessionId") {
+		t.Fatal("model handler must apply only for the presentation-current root")
+	}
+	if !strings.Contains(handler, "modelRef =") {
+		t.Fatal("model handler must update the selector from the ordered item")
+	}
+
+	switched, ok := extractSvelteFunctionBody(svelte, "function handleModelSwitched(")
+	if !ok {
+		t.Fatal("handleModelSwitched not found in App.svelte")
+	}
+	if strings.Contains(switched, "modelRef =") {
+		t.Fatal("handleModelSwitched must not set the model out of band; the ordered item does")
+	}
+}
+
 func TestProjectSwitchDoesNotCloseOwnerSession(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
 	if strings.Contains(app, "CloseForProjectSwitch") || strings.Contains(app, "close current session") {

@@ -2938,36 +2938,45 @@ func (a *Agent) currentPermissionSessionID() string {
 
 // SwitchModel changes the active model by provider-prefixed catalog ref.
 func (a *Agent) SwitchModel(refStr string) error {
-	return a.switchModelForSession(a.session, refStr)
+	_, err := a.switchModelForSession(a.session, refStr)
+	return err
 }
 
 func (a *Agent) SwitchModelForSession(sessionID string, refStr string) error {
+	_, err := a.SwitchModelForSessionInfo(sessionID, refStr)
+	return err
+}
+
+// SwitchModelForSessionInfo switches the model and returns the committed model
+// info from the same mutation, so a caller appends it as a presentation item
+// without a follow-up owner read.
+func (a *Agent) SwitchModelForSessionInfo(sessionID string, refStr string) (ModelInfo, error) {
 	unit, err := a.resolveLiveSession(sessionID)
 	if err != nil {
-		return err
+		return ModelInfo{}, err
 	}
 	return a.switchModelForSession(unit, refStr)
 }
 
-func (a *Agent) switchModelForSession(unit *session, refStr string) error {
+func (a *Agent) switchModelForSession(unit *session, refStr string) (ModelInfo, error) {
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
 	if unit == nil {
-		return snapshot.ErrNoSession
+		return ModelInfo{}, snapshot.ErrNoSession
 	}
 	if err := unitMutableLocked(unit); err != nil {
-		return err
+		return ModelInfo{}, err
 	}
 	ref, err := coremodel.Parse(refStr)
 	if err != nil {
-		return err
+		return ModelInfo{}, err
 	}
 	client, model, err := newProviderClient(a.catalog, ref)
 	if err != nil {
-		return err
+		return ModelInfo{}, err
 	}
 	if err := a.writePrimaryModelLocked(ref); err != nil {
-		return err
+		return ModelInfo{}, err
 	}
 	a.setActiveModelForSessionLocked(unit, ref, client, model)
 	if unit.lp != nil {
@@ -2978,7 +2987,7 @@ func (a *Agent) switchModelForSession(unit *session, refStr string) error {
 			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)
 		}
 	}
-	return nil
+	return a.modelInfo(ref), nil
 }
 
 // Reload reloads config and catalog state for future turns.

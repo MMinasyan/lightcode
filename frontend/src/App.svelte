@@ -273,6 +273,16 @@
       appendRevertSkipNotice({ skippedFiles: data?.skippedFiles });
     }));
 
+    // A root-model item carries the committed model tagged with the root it
+    // switched; apply it to the selector only while that root is the presented
+    // session, so a switch never shows on another session or out of order.
+    EventsOn('model', buffered((data) => {
+      if (!data || data.rootId !== sessionId) return;
+      const m = data.model || {};
+      modelRef = m.ref || ((m.provider && m.model) ? `${m.provider}/${m.model}` : '');
+      modelName = m.displayName || modelRef;
+    }));
+
     EventsOn('token', buffered(applyToken));
     EventsOn('tool_start', buffered(applyToolStart));
     EventsOn('tool_result', buffered(applyToolResult));
@@ -387,7 +397,9 @@
   }
 
   function handleManageSettings() { showModelSelector = false; settingsSection = 'models'; showSettings = true; }
-  function handleModelSwitched(e) { modelRef = e.detail.ref; modelName = e.detail.displayName || e.detail.ref; showModelSelector = false; }
+  // The backend appends an ordered model item that updates the selector; the
+  // switch handler only closes the picker, never sets the model out of band.
+  function handleModelSwitched() { showModelSelector = false; }
   async function refreshCurrentModel() {
     try {
       const r = await CurrentModel();
