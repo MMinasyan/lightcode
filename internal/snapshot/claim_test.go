@@ -122,7 +122,7 @@ func TestSweepClaimsCandidatesAndSkipsContended(t *testing.T) {
 	defer held.Release()
 
 	cfg := LifecycleConfig{Enabled: true, ArchiveAfterDays: 1, DeleteAfterArchiveDays: 3650}
-	if _, _, err := SweepAllProjects(projectsRoot, cfg, nil); err != nil {
+	if _, _, err := SweepAllProjects(projectsRoot, cfg, nil, nil); err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
 

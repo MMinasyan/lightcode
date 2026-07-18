@@ -66,7 +66,13 @@ type runtime struct {
 	nextEventSubscriber int
 
 	initOnce sync.Once
-	mu       sync.Mutex
+	// lifecycleMu serializes identity-changing lifecycle operations
+	// (open/resume/new/fork/archive/delete/history-revert and each sweep
+	// candidate) so two cannot interleave preparation and publication. It is
+	// the outermost owner lock, taken before mu, and is never held during turn
+	// execution or acquired by a drainer/callback.
+	lifecycleMu sync.Mutex
+	mu          sync.Mutex
 }
 
 func newRuntime(a *Agent, opts runtimeOptions) *runtime {

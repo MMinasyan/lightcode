@@ -265,6 +265,25 @@ func (s *Store) Close() (bool, error) {
 	return discarded, nil
 }
 
+// RelocateActiveSessionPaths rewrites the active store's cached directory
+// paths to a new sessions root after its session directory has been
+// atomically renamed there (staged fork/new publication). It performs no I/O:
+// it recomputes root/dir/snapshotsDir/turnsDir from the known session id. The
+// claim path derives from projectsRoot/projectID and is unaffected. The store
+// must be active.
+func (s *Store) RelocateActiveSessionPaths(finalSessionsRoot string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active {
+		return ErrNoSession
+	}
+	s.root = finalSessionsRoot
+	s.dir = filepath.Join(finalSessionsRoot, s.sessionID)
+	s.snapshotsDir = filepath.Join(s.dir, "snapshots")
+	s.turnsDir = filepath.Join(s.dir, "turns")
+	return nil
+}
+
 // Detach releases the store's claim and resets it to the no-session state
 // without discarding the session directory. Used when an open fails after the
 // claim was acquired but the persisted session must remain on disk (unlike

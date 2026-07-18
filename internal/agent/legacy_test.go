@@ -102,7 +102,7 @@ func (a *Agent) SessionSwitch(id string) error {
 	// fires on every return — including the pre-lock error return below — and
 	// never leaves transitioning stuck true.
 	a.ensureRuntime().beginTransition()
-	defer a.ensureRuntime().endTransition()
+	defer a.endLiveTransition(a.session)
 	if err := a.cancelAndWaitIdle(); err != nil {
 		return err
 	}

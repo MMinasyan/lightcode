@@ -1500,7 +1500,7 @@ func (a *Agent) runSweep() {
 	if a.memoryHooks != nil {
 		onDelete = func(sessionID string) { _ = a.memoryHooks.DeleteSessionSummaries(sessionID) }
 	}
-	if _, _, err := snapshot.SweepAllProjects(a.projects.Root(), cfg, onDelete); err != nil {
+	if _, _, err := snapshot.SweepAllProjects(a.projects.Root(), cfg, onDelete, a.lockLifecycle); err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: sweep: %v\n", err)
 	}
 }
@@ -1819,6 +1819,7 @@ func (a *Agent) CompactNowForSession(ctx context.Context, sessionID string) erro
 }
 
 func (a *Agent) resumeMostRecent() error {
+	defer a.lockLifecycle()()
 	proj, err := a.projects.Current()
 	if err != nil || proj == nil {
 		return err
@@ -1827,20 +1828,35 @@ func (a *Agent) resumeMostRecent() error {
 	if err := a.store.AttachSessionsRoot(sessionsRoot, a.projects.Root(), proj.ID); err != nil {
 		return err
 	}
-	id, err := snapshot.LoadMostRecent(sessionsRoot, "")
-	if err != nil || id == "" {
-		return err
-	}
-	if err := a.store.LoadSession(id); err != nil {
+	candidates, err := snapshot.List(sessionsRoot, "", snapshot.StateActive)
+	if err != nil {
 		return err
 	}
 	rt := a.ensureRuntime()
-	rt.mu.Lock()
-	a.setSessionProject(a.session, proj)
-	a.setCurrentSessionLocked(a.session)
-	rt.mu.Unlock()
-	if err := a.loadHistoryIntoLoop(); err != nil {
-		return err
+	resumed := false
+	for _, info := range candidates {
+		if info.ParentSessionID != "" {
+			continue // only root sessions resume
+		}
+		// Try active root sessions newest-first. A contended, corrupt, or
+		// unreadable candidate, or one whose history fails to load, releases its
+		// provisional claim and does not stop the scan.
+		if err := a.store.LoadSession(info.ID); err != nil {
+			continue
+		}
+		if err := a.loadHistoryIntoLoop(); err != nil {
+			a.store.Detach()
+			continue
+		}
+		rt.mu.Lock()
+		a.setSessionProject(a.session, proj)
+		a.setCurrentSessionLocked(a.session)
+		rt.mu.Unlock()
+		resumed = true
+		break
+	}
+	if !resumed {
+		return nil // no candidate opened; the adapter creates a new session
 	}
 	a.resetFileTracker()
 	a.loadTokensFromDisk()
@@ -2329,27 +2345,51 @@ func (rt *runtime) beginTransition() {
 	rt.mu.Unlock()
 }
 
-// endTransition clears the transitioning flag and emits the current queue
-// snapshot (adapters dedup by version, so this is harmless when unchanged and
-// delivers the emptied snapshot when the swap cleared the queue). If the queue
-// survived (a no-op or failed transition) and a session is active, it re-nudges
-// the drainer — a nudge token may have been consumed while transitioning
-// blocked the drain, which would otherwise strand the intact queue.
-func (rt *runtime) endTransition() {
-	a := rt.agent
+// endLiveTransition clears a unit's transitioning flag and, only when the
+// (failed or no-op) transition leaves the unit live, re-nudges both the queue
+// drainer and the signal scheduler — a wake token may have been consumed while
+// transitioning blocked them, which would otherwise strand intact queue or
+// signal work. It is the single primitive for both current and non-current
+// units. A committed removal leaves the unit inactive, so this is a no-op
+// there and the removal boundary carries the emptied state.
+// lockLifecycle acquires the owner lifecycle lock and returns its release, for
+// the idiom `defer a.lockLifecycle()()`. It is the outermost owner lock and is
+// taken at the entry of every identity-changing lifecycle operation, before
+// any runtime.mu, so overlapping operations serialize with exactly one
+// committed outcome.
+func (a *Agent) lockLifecycle() func() {
+	rt := a.ensureRuntime()
+	rt.lifecycleMu.Lock()
+	return rt.lifecycleMu.Unlock
+}
+
+func (a *Agent) endLiveTransition(unit *session) {
+	if unit == nil {
+		return
+	}
+	rt := a.ensureRuntime()
+	var items []QueuedItem
+	var version int
+	var sessionID, projectID string
+	var active bool
 	rt.mu.Lock()
-	unit := rt.sessionLocked()
-	unit.transitioning = false
-	items := copyQueue(unit.queue)
-	version := unit.queueVersion
-	sessionID := sessionIDOf(unit)
-	projectID := unit.projectID
-	active := a.store != nil && a.store.Active()
+	if unit.store != nil && unit.store.Active() {
+		unit.transitioning = false
+		items = copyQueue(unit.queue)
+		version = unit.queueVersion
+		sessionID = sessionIDOf(unit)
+		projectID = unit.projectID
+		active = true
+	}
 	rt.mu.Unlock()
+	if !active {
+		return
+	}
 	a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionID, ProjectID: projectID, Queue: items, QueueVersion: version})
-	if len(items) > 0 && active {
+	if len(items) > 0 {
 		rt.nudgeQueueDrainer()
 	}
+	rt.nudgeSignalScheduler()
 }
 
 // runQueueDrainer drains the backend queue after a turn ends. It is woken by
@@ -3453,6 +3493,7 @@ func sessionSummaryFromInfo(info snapshot.SessionInfo) SessionSummary {
 }
 
 func (a *Agent) OpenSession(id string) (SessionSummary, error) {
+	defer a.lockLifecycle()()
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return SessionSummary{}, fmt.Errorf("session id is required")
@@ -3498,17 +3539,28 @@ func (a *Agent) OpenSession(id string) (SessionSummary, error) {
 	if err := unit.store.LoadSession(id); err != nil {
 		return SessionSummary{}, err
 	}
+	// Detach releases the claim acquired by LoadSession without discarding the
+	// persisted session; the unit is never registered on any failure below, so
+	// nothing else detaches it.
 	meta, err := unit.store.Meta()
-	if err == nil && metaState(meta.State) == snapshot.StateArchived {
-		_ = unit.store.SetState(snapshot.StateActive)
-		_ = unit.store.TouchActivity()
+	if err != nil {
+		unit.store.Detach()
+		return SessionSummary{}, fmt.Errorf("open session %s: %w", id, err)
 	}
+	// Validate history before any reactivation, so a corrupt session is never
+	// flipped from archived to active.
 	if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
-		// Release the claim acquired by LoadSession without discarding the
-		// persisted session; the unit is never registered, so nothing else
-		// detaches it.
 		unit.store.Detach()
 		return SessionSummary{}, err
+	}
+	if metaState(meta.State) == snapshot.StateArchived {
+		if err := unit.store.SetState(snapshot.StateActive); err != nil {
+			// Reactivation must reach disk; otherwise the owner would drive a
+			// session that stays archived and absent from active listings.
+			unit.store.Detach()
+			return SessionSummary{}, fmt.Errorf("reactivate session %s: %w", id, err)
+		}
+		_ = unit.store.TouchActivity()
 	}
 	a.resetFileTrackerForSession(unit)
 	a.loadTokensFromDiskForSession(unit)
@@ -3582,6 +3634,7 @@ func (a *Agent) resetCurrentSessionState() {
 }
 
 func (a *Agent) NewSession(projectID string, agentType string) (string, error) {
+	defer a.lockLifecycle()()
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -3691,6 +3744,7 @@ func (a *Agent) claimPersistedOnlySession(sessionsRoot, id string) (func(), erro
 }
 
 func (a *Agent) SessionArchive(id string) error {
+	defer a.lockLifecycle()()
 	id = strings.TrimSpace(id)
 	sessionsRoot, err := a.sessionsRootForUserManagedSession(id)
 	if err != nil {
@@ -3744,6 +3798,7 @@ func (a *Agent) SessionArchive(id string) error {
 
 // SessionDelete removes a session from disk.
 func (a *Agent) SessionDelete(id string) error {
+	defer a.lockLifecycle()()
 	id = strings.TrimSpace(id)
 	sessionsRoot, err := a.sessionsRootForUserManagedSession(id)
 	if err != nil {
@@ -3976,29 +4031,7 @@ func (a *Agent) beginLiveSessionClose(id string) (func(), error) {
 	}
 	unit.transitioning = true
 	rt.mu.Unlock()
-	return func() {
-		var items []QueuedItem
-		var version int
-		var sessionID string
-		var projectID string
-		var active bool
-		rt.mu.Lock()
-		if unit.store != nil && unit.store.Active() && unit.store.SessionID() == id {
-			unit.transitioning = false
-			items = copyQueue(unit.queue)
-			version = unit.queueVersion
-			sessionID = sessionIDOf(unit)
-			projectID = unit.projectID
-			active = true
-		}
-		rt.mu.Unlock()
-		if active {
-			a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionID, ProjectID: projectID, Queue: items, QueueVersion: version})
-			if len(items) > 0 {
-				rt.nudgeQueueDrainer()
-			}
-		}
-	}, nil
+	return func() { a.endLiveTransition(unit) }, nil
 }
 
 func (a *Agent) closeIfCurrent(id string) (bool, error) {
@@ -4008,15 +4041,15 @@ func (a *Agent) closeIfCurrent(id string) (bool, error) {
 	// Transition begins only once we've decided to actually close the current
 	// session; clear registered before cancelAndWaitIdle covers its error path.
 	a.ensureRuntime().beginTransition()
-	defer a.ensureRuntime().endTransition()
+	defer a.endLiveTransition(a.session)
 	if err := a.cancelAndWaitIdle(); err != nil {
 		return false, err
 	}
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if _, err := a.store.Close(); err != nil {
-		return false, err
-	}
+	// Detach (not Close) so an empty session is preserved for archive; delete
+	// removes it via the atomic rename, not an empty-session discard.
+	a.store.Detach()
 	if a.currentSessionID == id {
 		a.currentSessionID = ""
 	}
@@ -4050,9 +4083,9 @@ func (a *Agent) closeLiveSession(id string) (bool, error) {
 	if unit.busy {
 		return false, fmt.Errorf("cannot close session while a turn is running")
 	}
-	if _, err := unit.store.Close(); err != nil {
-		return false, err
-	}
+	// Detach (not Close) so an archived empty session is preserved; delete
+	// removes the directory via the atomic rename.
+	unit.store.Detach()
 	rt.clearQueueLockedForSession(unit)
 	delete(a.sessions, id)
 	return true, nil
@@ -4339,6 +4372,7 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 }
 
 func (a *Agent) ApplyTurnActionForSession(sessionID string, turn int, action string, alsoRevertCode bool) (TurnActionResult, error) {
+	defer a.lockLifecycle()()
 	unit, err := a.resolveRootDriveSession(sessionID)
 	if err != nil {
 		return TurnActionResult{}, err
@@ -4534,6 +4568,7 @@ func (a *Agent) RevertHistory(turn int) error {
 }
 
 func (a *Agent) RevertHistoryForSession(sessionID string, turn int) error {
+	defer a.lockLifecycle()()
 	unit, err := a.resolveRootDriveSession(sessionID)
 	if err != nil {
 		return err
@@ -4578,6 +4613,7 @@ func (a *Agent) ForkSession(turn int) error {
 }
 
 func (a *Agent) ForkSessionForSession(sessionID string, turn int) error {
+	defer a.lockLifecycle()()
 	unit, err := a.resolveRootDriveSession(sessionID)
 	if err != nil {
 		return err

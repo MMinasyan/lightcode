@@ -107,9 +107,17 @@ func LoadMostRecent(root, projectPath string) (string, error) {
 	return "", nil
 }
 
+// CandidateSerializer, when non-nil, serializes each sweep candidate against
+// foreground lifecycle operations: it is invoked before a candidate is claimed
+// and its returned func is called after the candidate is processed. The owner
+// passes a hook that holds the lifecycle lock per candidate, so a foreground
+// op and a sweep candidate on the same id never interleave, without blocking
+// foreground ops for the whole sweep.
+type CandidateSerializer func() (release func())
+
 // SweepAllProjects runs Sweep over every project's sessions/ dir under
 // projectsRoot. Returns combined counts across all projects.
-func SweepAllProjects(projectsRoot string, cfg LifecycleConfig, onDelete func(sessionID string)) (int, int, error) {
+func SweepAllProjects(projectsRoot string, cfg LifecycleConfig, onDelete func(sessionID string), serialize CandidateSerializer) (int, int, error) {
 	entries, err := os.ReadDir(projectsRoot)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -122,7 +130,7 @@ func SweepAllProjects(projectsRoot string, cfg LifecycleConfig, onDelete func(se
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
-		a, d, err := Sweep(projectsRoot, e.Name(), cfg, onDelete)
+		a, d, err := Sweep(projectsRoot, e.Name(), cfg, onDelete, serialize)
 		if err != nil {
 			continue
 		}
@@ -133,11 +141,10 @@ func SweepAllProjects(projectsRoot string, cfg LifecycleConfig, onDelete func(se
 }
 
 // Sweep walks one project's session dirs and applies state transitions per
-// cfg. Each candidate is claimed before mutation: a session driven by any
-// live process (this owner or another) is contended and skipped, and
-// eligibility is rechecked under the claim since state is only stable once
-// held. Returns (archived, deleted) counts.
-func Sweep(projectsRoot, projectID string, cfg LifecycleConfig, onDelete func(sessionID string)) (int, int, error) {
+// cfg. Each eligible candidate is processed under the lifecycle serializer (if
+// any) and its session claim, so a session driven by any live process is
+// skipped and no foreground op interleaves. Returns (archived, deleted).
+func Sweep(projectsRoot, projectID string, cfg LifecycleConfig, onDelete func(sessionID string), serialize CandidateSerializer) (int, int, error) {
 	if !cfg.Enabled {
 		return 0, 0, nil
 	}
@@ -161,47 +168,59 @@ func Sweep(projectsRoot, projectID string, cfg LifecycleConfig, onDelete func(se
 		if ValidateSessionID(sessionID) != nil {
 			continue
 		}
-		dir := filepath.Join(root, sessionID)
-		metaPath := filepath.Join(dir, "meta.json")
-		var meta SessionMeta
-		if err := readJSON(metaPath, &meta); err != nil {
-			continue
-		}
-		if !sweepEligible(meta, now, archiveCutoff, deleteCutoff) {
-			continue
-		}
-		claim, ok, err := AcquireSessionClaim(projectsRoot, projectID, sessionID)
-		if err != nil || !ok {
-			continue
-		}
-		// Recheck under the claim; the holder may have changed state or the
-		// session may no longer be eligible.
-		if readJSON(metaPath, &meta) != nil {
-			claim.Release()
-			continue
-		}
-		switch effectiveState(meta.State) {
-		case StateActive:
-			if archiveCutoff > 0 && meta.LastActivity > 0 && now-meta.LastActivity > archiveCutoff {
-				meta.State = StateArchived
-				meta.ArchivedAt = now
-				if writeJSON(metaPath, meta) == nil {
-					archived++
-				}
+		a, d := sweepCandidate(projectsRoot, projectID, root, sessionID, now, archiveCutoff, deleteCutoff, onDelete, serialize)
+		archived += a
+		deleted += d
+	}
+	return archived, deleted, nil
+}
+
+// sweepCandidate processes one candidate. The lifecycle serializer (if any) is
+// held from before the claim through the mutation, and both are released on
+// return. Eligibility is pre-filtered lock-free, then rechecked under the
+// claim since state is only stable once held.
+func sweepCandidate(projectsRoot, projectID, root, sessionID string, now, archiveCutoff, deleteCutoff int64, onDelete func(sessionID string), serialize CandidateSerializer) (int, int) {
+	metaPath := filepath.Join(root, sessionID, "meta.json")
+	var meta SessionMeta
+	if readJSON(metaPath, &meta) != nil {
+		return 0, 0
+	}
+	if !sweepEligible(meta, now, archiveCutoff, deleteCutoff) {
+		return 0, 0
+	}
+	if serialize != nil {
+		defer serialize()()
+	}
+	claim, ok, err := AcquireSessionClaim(projectsRoot, projectID, sessionID)
+	if err != nil || !ok {
+		return 0, 0
+	}
+	defer claim.Release()
+	if readJSON(metaPath, &meta) != nil {
+		return 0, 0
+	}
+	switch effectiveState(meta.State) {
+	case StateActive:
+		if archiveCutoff > 0 && meta.LastActivity > 0 && now-meta.LastActivity > archiveCutoff {
+			meta.State = StateArchived
+			meta.ArchivedAt = now
+			if writeJSON(metaPath, meta) == nil {
+				return 1, 0
 			}
-		case StateArchived:
-			if deleteCutoff > 0 && meta.ArchivedAt > 0 && now-meta.ArchivedAt > deleteCutoff {
+		}
+	case StateArchived:
+		if deleteCutoff > 0 && meta.ArchivedAt > 0 && now-meta.ArchivedAt > deleteCutoff {
+			// Commit the durable delete first; only then run post-commit cleanup
+			// so a rename failure never loses summaries for a still-listed session.
+			if DeleteSession(root, sessionID) == nil {
 				if onDelete != nil {
 					onDelete(sessionID)
 				}
-				if os.RemoveAll(dir) == nil {
-					deleted++
-				}
+				return 0, 1
 			}
 		}
-		claim.Release()
 	}
-	return archived, deleted, nil
+	return 0, 0
 }
 
 func sweepEligible(meta SessionMeta, now, archiveCutoff, deleteCutoff int64) bool {
@@ -234,14 +253,39 @@ func ArchiveSession(sessionsRoot, id string) error {
 	return writeJSON(metaPath, meta)
 }
 
-// DeleteSession removes a session's dir entirely, same effect as the
-// sweep's archived→deleted branch.
+// DeleteSession removes a session. The durable commit is an atomic rename of
+// sessions/<id> into the project's unlisted .deleting namespace: after it, the
+// session is gone from every listing and cannot reappear. Recursive removal of
+// the renamed directory is best-effort post-commit cleanup — a leftover under
+// .deleting is ignored, not an error — so a partial removal never destroys a
+// listed session or converts the committed delete into a failure.
 func DeleteSession(sessionsRoot, id string) error {
 	if err := ValidateSessionID(id); err != nil {
 		return err
 	}
-	dir := filepath.Join(sessionsRoot, id)
-	return os.RemoveAll(dir)
+	nonce, err := newSessionID()
+	if err != nil {
+		return fmt.Errorf("snapshot: delete nonce: %w", err)
+	}
+	deletingRoot := filepath.Join(filepath.Dir(sessionsRoot), ".deleting", "sessions")
+	if err := os.MkdirAll(deletingRoot, 0o700); err != nil {
+		return fmt.Errorf("snapshot: delete staging: %w", err)
+	}
+	src := filepath.Join(sessionsRoot, id)
+	dst := filepath.Join(deletingRoot, id+"-"+nonce)
+	if err := os.Rename(src, dst); err != nil {
+		// Rename ENOENT is ambiguous (source gone vs destination parent gone);
+		// only a missing source is the idempotent already-deleted case.
+		if os.IsNotExist(err) {
+			if _, statErr := os.Lstat(src); os.IsNotExist(statErr) {
+				return nil
+			}
+		}
+		return fmt.Errorf("snapshot: delete %s: %w", id, err)
+	}
+	// Post-commit cleanup only; failure leaves an ignored orphan under .deleting.
+	_ = os.RemoveAll(dst)
+	return nil
 }
 
 func effectiveState(s string) string {
