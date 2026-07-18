@@ -647,7 +647,13 @@ func waitAgentEventKind(t *testing.T, events <-chan Event, kind EventKind) Event
 
 func appendUserTurn(t *testing.T, a *Agent, content string) int {
 	t.Helper()
-	if err := a.ensureSession(); err != nil {
+	// ensureSession registers the live session in a.sessions; production callers
+	// hold the runtime mutex around it, so this helper must too.
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	err := a.ensureSession()
+	rt.mu.Unlock()
+	if err != nil {
 		t.Fatalf("ensureSession returned error: %v", err)
 	}
 	turn := a.store.BeginTurn()

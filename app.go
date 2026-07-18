@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,6 +22,10 @@ import (
 // finish. A drainer blocked inside a framework emit is abandoned after it; it
 // holds no lock or state and process exit owns the blocked call.
 var deliveryJoinTimeout = 5 * time.Second
+
+// errAdapterClosed is returned by a current-target or navigation call that
+// acquires navMu after close has won it.
+var errAdapterClosed = errors.New("adapter is closed")
 
 // deliveryFrame is one immutable item the delivery FIFO carries. Today every
 // frame is a legacy named event with its payload; the sole drainer emits it.
@@ -47,6 +52,15 @@ type App struct {
 	started     bool
 	closed      bool
 	hostCancel  context.CancelFunc
+
+	// navMu is the operation gate owning routing-current (session id + project
+	// path). Ordinary current-target calls hold it across owner entry; a
+	// cancellable/long call captures its id under it and releases before invoking
+	// the owner; navigation holds it across the routing commit. Lock order is
+	// lifecycleMu (App startup/shutdown) -> navMu -> the owner's own locks.
+	// navClosed, set under navMu on close, makes a call waiting on navMu reject.
+	navMu     sync.Mutex
+	navClosed bool
 
 	scope           *agent.AdapterScope
 	viewOnce        sync.Once
@@ -101,7 +115,9 @@ func (a *App) startup(ctx context.Context) {
 			sessionID = id
 		}
 	}
+	a.navMu.Lock()
 	a.setCurrentSessionID(sessionID)
+	a.navMu.Unlock()
 	a.started = true
 }
 
@@ -110,6 +126,11 @@ func (a *App) shutdown(ctx context.Context) {
 	a.closed = true
 	started := a.started
 	hostCancel := a.hostCancel
+	// Win navMu so a current-target/navigation call waiting on it rejects instead
+	// of racing teardown.
+	a.navMu.Lock()
+	a.navClosed = true
+	a.navMu.Unlock()
 	a.lifecycleMu.Unlock()
 
 	a.closeDelivery()
@@ -401,6 +422,16 @@ func (a *App) currentSession() (string, error) {
 	return a.sv().CurrentOrErr()
 }
 
+// boundedSessionIDLocked returns the routing-current session id for an ordinary
+// current-target call. The caller holds navMu across the owner call so the id it
+// targets cannot change under it; a close that won navMu first rejects here.
+func (a *App) boundedSessionIDLocked() (string, error) {
+	if a.navClosed {
+		return "", errAdapterClosed
+	}
+	return a.currentSession()
+}
+
 func (a *App) acceptsSessionEvent(sessionID string) bool {
 	return a.sv().AcceptsSessionEvent(sessionID)
 }
@@ -434,14 +465,22 @@ func (a *App) tokenUsage() agent.TokenReport {
 }
 
 func (a *App) sessionMessages() []agent.DisplayMessage {
+	a.navMu.Lock()
+	if a.navClosed {
+		a.navMu.Unlock()
+		return nil
+	}
 	id := a.currentSessionID()
 	if id == "" {
+		a.navMu.Unlock()
 		return nil
 	}
 	if _, err := a.svc.SessionSummaryForSession(id); err != nil {
 		a.setCurrentSessionID("")
+		a.navMu.Unlock()
 		return nil
 	}
+	a.navMu.Unlock()
 	msgs, err := a.svc.SessionMessagesFor(id)
 	if err != nil {
 		return nil
@@ -463,7 +502,9 @@ func (a *App) AppVersion() string {
 // or queues the input in the backend, returning whether it started and a
 // versioned queue snapshot.
 func (a *App) Submit(content string) (agent.SubmitResult, error) {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return agent.SubmitResult{}, err
 	}
@@ -473,7 +514,9 @@ func (a *App) Submit(content string) (agent.SubmitResult, error) {
 // QueueSnapshot returns the backend's versioned input-queue snapshot for
 // frontend hydration (register the queue_changed listener before calling).
 func (a *App) QueueSnapshot() agent.QueueState {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return agent.QueueState{}
 	}
@@ -486,7 +529,9 @@ func (a *App) QueueSnapshot() agent.QueueState {
 
 // SwitchModel changes the active model by provider-prefixed catalog ref.
 func (a *App) SwitchModel(ref string) error {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return err
 	}
@@ -575,7 +620,9 @@ func (a *App) ResetModelField(providerID string, modelID string, field string) e
 
 // RevertCode restores files to their state at turn N.
 func (a *App) RevertCode(turn int) (snapshot.RevertResult, error) {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return snapshot.RevertResult{}, err
 	}
@@ -584,7 +631,9 @@ func (a *App) RevertCode(turn int) (snapshot.RevertResult, error) {
 
 // RevertHistory truncates conversation after turn N.
 func (a *App) RevertHistory(turn int) error {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return err
 	}
@@ -597,7 +646,9 @@ func (a *App) RevertHistory(turn int) error {
 
 // ForkSession creates a new session branched from turn N.
 func (a *App) ForkSession(turn int) error {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return err
 	}
@@ -614,7 +665,9 @@ func (a *App) ForkSession(turn int) error {
 
 // ApplyTurnAction applies a user-message revert/fork action.
 func (a *App) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (agent.TurnActionResult, error) {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return agent.TurnActionResult{}, err
 	}
@@ -635,6 +688,11 @@ func (a *App) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (age
 
 // RespondPermission answers a pending permission prompt.
 func (a *App) RespondPermission(sessionID string, id string, action string) error {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return errAdapterClosed
+	}
 	sessionID, err := a.resolveSessionID(sessionID)
 	if err != nil {
 		return err
@@ -644,6 +702,11 @@ func (a *App) RespondPermission(sessionID string, id string, action string) erro
 
 // PermissionSuggest returns pattern suggestions for the "Allow for project" UI.
 func (a *App) PermissionSuggest(sessionID string, projectID string, toolName string, arg string) []permission.Suggestion {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return nil
+	}
 	var (
 		suggestions []permission.Suggestion
 		err         error
@@ -664,6 +727,11 @@ func (a *App) PermissionSuggest(sessionID string, projectID string, toolName str
 
 // SaveProjectPermission appends patterns to project permissions and allows the request.
 func (a *App) SaveProjectPermission(sessionID string, id string, patterns []string) error {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return errAdapterClosed
+	}
 	sessionID, err := a.resolveSessionID(sessionID)
 	if err != nil {
 		return err
@@ -673,7 +741,15 @@ func (a *App) SaveProjectPermission(sessionID string, id string, patterns []stri
 
 // CompactNow triggers manual context compaction.
 func (a *App) CompactNow() error {
+	a.navMu.Lock()
+	if a.navClosed {
+		a.navMu.Unlock()
+		return errAdapterClosed
+	}
+	// Capture the id under navMu, then release it before the long owner call so it
+	// stays free for Cancel/Close.
 	sessionID := a.liveCurrentSessionID()
+	a.navMu.Unlock()
 	if sessionID == "" {
 		return fmt.Errorf("no current session")
 	}
@@ -689,7 +765,9 @@ func (a *App) CompactNow() error {
 
 // Cancel aborts the current agentic loop iteration.
 func (a *App) Cancel() error {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return err
 	}
@@ -698,7 +776,13 @@ func (a *App) Cancel() error {
 
 // SnapshotList returns the timeline of all snapshots in the session.
 func (a *App) SnapshotList() ([]agent.Snapshot, error) {
+	a.navMu.Lock()
+	if a.navClosed {
+		a.navMu.Unlock()
+		return nil, errAdapterClosed
+	}
 	sessionID := a.liveCurrentSessionID()
+	a.navMu.Unlock()
 	if sessionID == "" {
 		return nil, fmt.Errorf("no current session")
 	}
@@ -712,7 +796,9 @@ func (a *App) ModelList() ([]agent.ModelListEntry, error) {
 
 // CurrentModel returns the active provider and model.
 func (a *App) CurrentModel() agent.ModelInfo {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return agent.ModelInfo{}
 	}
@@ -765,11 +851,21 @@ func (a *App) ReadFileContent(path string) (string, error) {
 
 // TokenUsage returns the current cumulative token usage for the session.
 func (a *App) TokenUsage() agent.TokenReport {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return agent.TokenReport{}
+	}
 	return a.tokenUsage()
 }
 
 // SessionCurrent returns the active session.
 func (a *App) SessionCurrent() agent.SessionSummary {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return agent.SessionSummary{}
+	}
 	return a.currentSessionSummary()
 }
 
@@ -780,6 +876,11 @@ func (a *App) SessionList(state string) ([]agent.SessionSummary, error) {
 
 // SessionSwitch switches to another session.
 func (a *App) SessionSwitch(id string) error {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return errAdapterClosed
+	}
 	summary, err := a.svc.OpenSession(id)
 	if err != nil {
 		return err
@@ -791,11 +892,17 @@ func (a *App) SessionSwitch(id string) error {
 
 // SessionArchive archives a session.
 func (a *App) SessionArchive(id string) error {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return errAdapterClosed
+	}
+	// Durable archive then the deterministic detach, together under navMu so a
+	// concurrent switch to the same session cannot interleave between them.
 	if err := a.svc.SessionArchive(id); err != nil {
 		return err
 	}
-	wasCurrent := a.sv().RemovedCurrent(id)
-	if wasCurrent {
+	if a.sv().RemovedCurrent(id) {
 		a.emitSessionChangedForSession(strings.TrimSpace(id))
 	}
 	return nil
@@ -803,11 +910,15 @@ func (a *App) SessionArchive(id string) error {
 
 // SessionDelete removes a session from disk.
 func (a *App) SessionDelete(id string) error {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return errAdapterClosed
+	}
 	if err := a.svc.SessionDelete(id); err != nil {
 		return err
 	}
-	wasCurrent := a.sv().RemovedCurrent(id)
-	if wasCurrent {
+	if a.sv().RemovedCurrent(id) {
 		a.emitSessionChangedForSession(strings.TrimSpace(id))
 	}
 	return nil
@@ -815,6 +926,11 @@ func (a *App) SessionDelete(id string) error {
 
 // SessionNew starts a fresh session in the adapter-local project.
 func (a *App) SessionNew() error {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return errAdapterClosed
+	}
 	id, err := a.scope.NewSession("primary")
 	if err != nil {
 		return err
@@ -861,14 +977,21 @@ func (a *App) ProjectSwitch(targetPath string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("%s is not a directory", abs)
 	}
+
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return errAdapterClosed
+	}
 	if abs == a.scope.ProjectRoot() {
 		return nil
 	}
-
 	summary, err := a.scope.OpenOrCreateSession(abs)
 	if err != nil {
 		return err
 	}
+	// Commit the project path and the session id together under navMu so a
+	// following current-target call never sees one without the other.
 	a.scope.SetProjectPath(abs)
 	a.setCurrentSessionID(summary.ID)
 	a.emitSessionChangedForSession(summary.ID)

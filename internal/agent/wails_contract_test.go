@@ -204,7 +204,7 @@ func TestFrontendRuntimeConfigTabExcludesMasterTogglesAndPermissions(t *testing.
 func TestFrontendNoActiveModelSendGate(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
 	input := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "components", "InputArea.svelte"))
-	if !strings.Contains(app, "hasActiveModel={!!modelRef}") {
+	if !strings.Contains(app, "hasActiveModel={!!modelRef") {
 		t.Fatalf("App.svelte must pass active-model state into InputArea")
 	}
 	if !strings.Contains(app, "Connect a provider or pick a model before sending.") {

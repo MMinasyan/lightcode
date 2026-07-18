@@ -106,6 +106,17 @@ func (v *SessionView) SetCurrent(id string) {
 	v.mu.Unlock()
 }
 
+// clearIfCurrent clears the current pointer only when it still equals id, so a
+// stale validation cannot clear a session another goroutine has since selected.
+func (v *SessionView) clearIfCurrent(id string) {
+	v.mu.Lock()
+	if v.current == strings.TrimSpace(id) {
+		v.current = ""
+		v.children = nil
+	}
+	v.mu.Unlock()
+}
+
 func (v *SessionView) Current() string {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -137,7 +148,7 @@ func (v *SessionView) LiveCurrent() string {
 		return id
 	}
 	if _, err := v.svc.SessionSummaryForSession(id); err != nil {
-		v.SetCurrent("")
+		v.clearIfCurrent(id)
 		return ""
 	}
 	return id
@@ -236,9 +247,7 @@ func (v *SessionView) SessionChangedPayload(sessionID string) SessionPayload {
 	}
 	payload, err := v.svc.SessionPayloadForSession(sessionID)
 	if err != nil {
-		if v.Current() == sessionID {
-			v.SetCurrent("")
-		}
+		v.clearIfCurrent(sessionID)
 		return SessionPayload{}
 	}
 	return payload
