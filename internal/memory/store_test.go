@@ -346,3 +346,19 @@ func (f *countingMemoryEmbedder) Embed(string) ([]float32, error) {
 }
 
 func (f *countingMemoryEmbedder) Close() {}
+
+// TestStoreCloseBorrowsEmbedder proves closing a store never closes the borrowed
+// embedder, so one project's store close cannot disable the shared embedder.
+func TestStoreCloseBorrowsEmbedder(t *testing.T) {
+	e := &closeTrackingEmbedder{}
+	s := NewStoreWithEmbedder(e, t.TempDir(), t.TempDir())
+	s.Close()
+	if e.closed {
+		t.Fatal("Store.Close closed the borrowed embedder; it must be closed only by its owner")
+	}
+}
+
+type closeTrackingEmbedder struct{ closed bool }
+
+func (e *closeTrackingEmbedder) Embed(string) ([]float32, error) { return []float32{1, 0, 0}, nil }
+func (e *closeTrackingEmbedder) Close()                          { e.closed = true }

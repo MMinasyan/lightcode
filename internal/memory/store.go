@@ -412,16 +412,10 @@ func (s *Store) Reconcile() error {
 	return nil
 }
 
-func (s *Store) Close() {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.embedder != nil {
-		s.embedder.Close()
-	}
-}
+// Close releases store-local resources. The embedder is borrowed, not owned, so
+// it is never closed here — closing one store must not disable the shared
+// embedder that other stores still use. Its owner closes it once.
+func (s *Store) Close() {}
 
 func (s *Store) requireEmbedder() (memoryEmbedder, error) {
 	if s == nil || s.embedder == nil {

@@ -120,6 +120,9 @@ type Agent struct {
 
 	memoryStore *memory.Store
 	memoryHooks agentMemoryHooks
+	// embedder is the one shared embedding model. Memory stores borrow it; the
+	// owner closes it exactly once at shutdown.
+	embedder *memory.Embedder
 
 	// servicesMu guards lspManagers and detectCtx. Each project owns one LSP
 	// manager, keyed by canonical project root and bound to it; the shared
@@ -894,6 +897,7 @@ func New(c Config) (*Agent, error) {
 		a.embedderDegraded = true
 		embedder = nil
 	}
+	a.embedder = embedder
 	memStore := memory.NewStore(embedder, resolver.Root(), c.Home)
 	a.memoryStore = memStore
 	a.memoryHooks = memStore
@@ -3333,7 +3337,8 @@ func (a *Agent) ShutdownOwner() {
 		}
 		// Join in-flight turns and mutations first, while the drainer is still
 		// alive, so their terminal events are delivered before delivery stops.
-		if !waitGroupOrTimeout(&rt.turnWG, shutdownJoinTimeout) {
+		turnsDrained := waitGroupOrTimeout(&rt.turnWG, shutdownJoinTimeout)
+		if !turnsDrained {
 			fmt.Fprintf(os.Stderr, "lightcode: owner shutdown abandoned in-flight turns after %s\n", shutdownJoinTimeout)
 		}
 		if rt.ownerCancel != nil {
@@ -3344,6 +3349,12 @@ func (a *Agent) ShutdownOwner() {
 		}
 		if a.procMgr != nil {
 			a.procMgr.Close()
+		}
+		// Close the shared embedder only once every turn has actually finished, so
+		// an abandoned turn never hits a closed embedder; a leaked embedder is
+		// released at process exit.
+		if turnsDrained && a.embedder != nil {
+			a.embedder.Close()
 		}
 		close(rt.shutdownDone)
 	})
