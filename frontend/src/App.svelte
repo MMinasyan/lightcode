@@ -1,7 +1,8 @@
 <script>
   import { onMount } from 'svelte';
   import { EventsOn } from '../wailsjs/runtime/runtime';
-  import { Submit, QueueSnapshot, ApplyTurnAction, CurrentModel, CurrentWarnings, TokenUsage, ProjectName, SessionCurrent, SessionMessages, CompactNow } from '../wailsjs/go/main/App';
+  import { Submit, ApplyTurnAction, CurrentModel, ProjectName, SessionCurrent, CompactNow, HydrateSession } from '../wailsjs/go/main/App';
+  import { admitSequenced, newTranscriptGate, snapshotMessages } from './lib/hydration.js';
   import Toolbar from './components/Toolbar.svelte';
   import MessageList from './components/MessageList.svelte';
   import InputArea from './components/InputArea.svelte';
@@ -84,7 +85,30 @@
   let showWarnings = false;
   let pendingSubagentSessionLinks = {};
 
+  // Complete-state hydration: listeners register before the snapshot is read, so
+  // transcript frames arriving during the read are buffered and replayed after the
+  // snapshot is applied. The gate then drops any replayed or live transcript item
+  // already represented in the snapshot (sequence at or below its high-water).
+  let hydrated = false;
+  let pendingFrames = [];
+  let gate = { highWater: 0 };
+
   function mid() { return nextId++; }
+
+  function defaultTokens() {
+    return { total: { cache:0, input:0, output:0, known:true }, perModel: [], contextUsed: 0, contextWindow: 0 };
+  }
+
+  // buffered wraps a delivered-frame handler so it holds until the snapshot is
+  // applied, then replays in delivery order. Applying the snapshot first and every
+  // buffered frame after it keeps a frame delivered during the read from being
+  // overwritten by the older captured state.
+  function buffered(handler) {
+    return (data) => {
+      if (!hydrated) { pendingFrames.push(() => handler(data)); return; }
+      handler(data);
+    };
+  }
 
   function showError(err, prefix = '') {
     const text = errorText(err);
@@ -121,156 +145,145 @@
     if (!result?.sessionChanged) return;
     applySessionId(result.session?.id || sessionId);
     if (result.tokens) tokens = result.tokens;
-    else tokens = { total: { cache:0, input:0, output:0, known:true }, perModel: [], contextUsed: 0, contextWindow: 0 };
+    else tokens = defaultTokens();
     messages = rebuildFromHistory(result.messages || []);
     streamingIdx = -1;
   }
 
+  // applySnapshot renders one complete-state hydration as the whole live view and
+  // seeds the transcript gate at its high-water. The queue guard resets to the
+  // snapshot's session and version; later same-session versions must increase.
+  function applySnapshot(hs) {
+    if (!hs) return;
+    sessionId = hs.session?.id || '';
+    messages = rebuildFromHistory(snapshotMessages(hs));
+    gate = newTranscriptGate(hs);
+    streamingIdx = -1;
+    tokens = hs.tokens || defaultTokens();
+    busy = !!hs.busy;
+    compacting = !!hs.compacting;
+    lastQueueVersion = hs.queue?.version || 0;
+    messageQueue = (hs.queue?.items || []).map((it) => ({ _id: it.id, content: it.content }));
+    warnings = hs.warnings || [];
+  }
+
+  async function hydrate() {
+    let id = sessionId;
+    if (!id) {
+      try { const cur = await SessionCurrent(); id = cur?.id || ''; } catch (e) {}
+    }
+    if (id) {
+      try { applySnapshot(await HydrateSession(id)); }
+      catch (e) { showError(e, 'Load session failed'); }
+    }
+    const buffered = pendingFrames;
+    pendingFrames = [];
+    hydrated = true;
+    for (const replay of buffered) replay();
+  }
+
+  function closeStreaming() {
+    if (streamingIdx !== -1 && messages[streamingIdx]) {
+      messages[streamingIdx] = { ...messages[streamingIdx], partial: false };
+    }
+    streamingIdx = -1;
+  }
+
+  function applyToken(data) {
+    if (!admitSequenced(gate, data.seq)) return;
+    if (streamingIdx === -1) {
+      streamingIdx = messages.length;
+      messages = [...messages, { _id: mid(), type: 'assistant', content: data.content, turn: currentTurn, partial: true }];
+    } else {
+      messages[streamingIdx] = { ...messages[streamingIdx], content: messages[streamingIdx].content + data.content };
+      messages = messages;
+    }
+  }
+
+  function applyToolStart(data) {
+    if (!admitSequenced(gate, data.seq)) return;
+    closeStreaming();
+    const pending = takePendingSubagentLinks(pendingSubagentSessionLinks, data.id);
+    pendingSubagentSessionLinks = pending.pending;
+    messages = [...messages, { _id: mid(), type: 'tool', id: data.id, name: data.name, args: data.args, done: false, success: true, result: '', subagentSessionIds: pending.links }];
+  }
+
+  function applyToolResult(data) {
+    // Delivered id-keyed and applied idempotently by tool-call id; not sequence-gated.
+    const metadata = data.metadata || null;
+    const metadataLinks = subagentLinksFromMetadata(metadata);
+    messages = messages.map(m => m.type === 'tool' && m.id === data.id ? {
+      ...m,
+      done: true,
+      success: data.success,
+      result: data.output,
+      name: data.name || m.name,
+      args: data.args || m.args,
+      metadata: metadata || m.metadata,
+      subagentSessionIds: mergeSubagentLinks(m.subagentSessionIds, metadataLinks),
+    } : m);
+  }
+
+  function applyBackgroundProcess(data) {
+    if (!data || !admitSequenced(gate, data.seq)) return;
+    closeStreaming();
+    const backgroundProcess = { id: data.id || '', command: data.command || '', reason: data.reason || '', exitCode: data.exitCode || 0, output: data.output || '' };
+    messages = [...messages, { _id: mid(), type: 'background_process', id: backgroundProcess.id, done: true, success: data.success !== false, result: backgroundProcess.output, backgroundProcess }];
+  }
+
+  function applyUserMessage(data) {
+    if (!data || !admitSequenced(gate, data.seq)) return;
+    closeStreaming();
+    messages = [...messages, { _id: mid(), type: 'user', content: data.content || '', turn: data.turn || 0 }];
+  }
+
+  function applySystemSignal(data) {
+    if (!data || !admitSequenced(gate, data.seq)) return;
+    closeStreaming();
+    messages = [...messages, { _id: mid(), type: 'system', content: data.content || '' }];
+  }
+
   onMount(async () => {
-    EventsOn('warnings', (data) => { if (data) warnings = data; });
-    try {
-      const currentWarnings = await CurrentWarnings();
-      if (currentWarnings) warnings = currentWarnings;
-    } catch (e) { showError(e, 'Load warnings failed'); }
+    // Register every listener before the first hydration read, each buffered so the
+    // snapshot applies first and every frame delivered during the read replays after
+    // it in delivery order.
+    EventsOn('warnings', buffered((data) => { if (data) warnings = data; }));
+    EventsOn('usage', buffered((data) => { if (data) tokens = data; }));
 
-    try {
-      const r = await CurrentModel();
-      modelRef = r.ref || ((r.provider && r.model) ? `${r.provider}/${r.model}` : '');
-      modelName = r.displayName || modelRef;
-    } catch (e) { showError(e, 'Load model failed'); }
-
-    try { projectName = await ProjectName(); } catch (e) { showError(e, 'Load project failed'); }
-
-    try {
-      const cur = await SessionCurrent();
-      sessionId = cur?.id || '';
-      if (sessionId) {
-        const hist = await SessionMessages();
-        messages = rebuildFromHistory(hist || []);
-      }
-    } catch (e) { showError(e, 'Load session failed'); }
-
-    try {
-      const t = await TokenUsage();
-      if (t) tokens = t;
-    } catch (e) { showError(e, 'Load token usage failed'); }
-
-    EventsOn('usage', (data) => { if (data) tokens = data; });
-
-    EventsOn('session_changed', (data) => {
+    EventsOn('session_changed', buffered((data) => {
       if (!data) return;
       applySessionId(data.session?.id || '');
-      if (data.tokens) tokens = data.tokens;
-      else tokens = { total: { cache:0, input:0, output:0, known:true }, perModel: [], contextUsed: 0, contextWindow: 0 };
+      tokens = data.tokens || defaultTokens();
       messages = rebuildFromHistory(data.messages || []);
       streamingIdx = -1;
-    });
+      // The legacy navigation payload carries no sequence cursor, so reset the gate
+      // to admit the destination session's live stream.
+      gate = { highWater: 0 };
+    }));
 
-    EventsOn('token', (data) => {
-      if (streamingIdx === -1) {
-        streamingIdx = messages.length;
-        messages = [...messages, { _id:mid(), type:'assistant', content:data.content, turn:currentTurn, partial:true }];
-      } else {
-        messages[streamingIdx] = { ...messages[streamingIdx], content: messages[streamingIdx].content + data.content };
-        messages = messages;
-      }
-    });
+    EventsOn('token', buffered(applyToken));
+    EventsOn('tool_start', buffered(applyToolStart));
+    EventsOn('tool_result', buffered(applyToolResult));
+    EventsOn('background_process_complete', buffered(applyBackgroundProcess));
+    EventsOn('user_message', buffered(applyUserMessage));
+    EventsOn('system_signal', buffered(applySystemSignal));
 
-    EventsOn('tool_start', (data) => {
-      if (streamingIdx !== -1 && messages[streamingIdx]) {
-        messages[streamingIdx] = { ...messages[streamingIdx], partial:false };
-      }
-      streamingIdx = -1;
-      const pending = takePendingSubagentLinks(pendingSubagentSessionLinks, data.id);
-      pendingSubagentSessionLinks = pending.pending;
-      const subagentSessionIds = pending.links;
-      messages = [...messages, { _id:mid(), type:'tool', id:data.id, name:data.name, args:data.args, done:false, success:true, result:'', subagentSessionIds }];
-    });
-
-    EventsOn('tool_result', (data) => {
-      const metadata = data.metadata || null;
-      const metadataLinks = subagentLinksFromMetadata(metadata);
-      messages = messages.map(m => m.type==='tool' && m.id===data.id ? {
-        ...m,
-        done:true,
-        success:data.success,
-        result:data.output,
-        name:data.name || m.name,
-        args:data.args || m.args,
-        metadata:metadata || m.metadata,
-        subagentSessionIds:mergeSubagentLinks(m.subagentSessionIds, metadataLinks),
-      } : m);
-    });
-
-    EventsOn('background_process_complete', (data) => {
-      if (!data) return;
-      if (streamingIdx !== -1 && messages[streamingIdx]) {
-        messages[streamingIdx] = { ...messages[streamingIdx], partial:false };
-      }
-      streamingIdx = -1;
-      const backgroundProcess = {
-        id: data.id || '',
-        command: data.command || '',
-        reason: data.reason || '',
-        exitCode: data.exitCode || 0,
-        output: data.output || '',
-      };
-      messages = [...messages, {
-        _id: mid(),
-        type: 'background_process',
-        id: backgroundProcess.id,
-        done: true,
-        success: data.success !== false,
-        result: backgroundProcess.output,
-        backgroundProcess,
-      }];
-    });
-
-    EventsOn('user_message', (data) => {
-      if (!data) return;
-      if (streamingIdx !== -1 && messages[streamingIdx]) {
-        messages[streamingIdx] = { ...messages[streamingIdx], partial:false };
-      }
-      streamingIdx = -1;
-      messages = [...messages, { _id: mid(), type: 'user', content: data.content || '', turn: data.turn || 0 }];
-    });
-
-    EventsOn('system_signal', (data) => {
-      if (!data) return;
-      if (streamingIdx !== -1 && messages[streamingIdx]) {
-        messages[streamingIdx] = { ...messages[streamingIdx], partial:false };
-      }
-      streamingIdx = -1;
-      messages = [...messages, { _id: mid(), type: 'system', content: data.content || '' }];
-    });
-
-    EventsOn('queue_changed', (data) => {
+    EventsOn('queue_changed', buffered((data) => {
       if (!data) return;
       const version = data.version || 0;
       if (version <= lastQueueVersion) return; // drop stale/reordered snapshots
       lastQueueVersion = version;
       messageQueue = (data.items || []).map(it => ({ _id: it.id, content: it.content }));
-    });
-    // Subscribe-then-GET: hydrate the queue only after the listener is registered.
-    try {
-      const q = await QueueSnapshot();
-      if (q && (q.version || 0) >= lastQueueVersion) {
-        lastQueueVersion = q.version || 0;
-        messageQueue = (q.items || []).map(it => ({ _id: it.id, content: it.content }));
-      }
-    } catch (e) {}
+    }));
 
-    EventsOn('turn_start', (data) => {
+    EventsOn('turn_start', buffered((data) => {
       busy = true;
       streamingIdx = -1;
       if (data?.turn) currentTurn = data.turn;
-    });
+    }));
 
-    EventsOn('turn_end', async (data) => {
-      if (streamingIdx !== -1 && messages[streamingIdx]) {
-        messages[streamingIdx] = { ...messages[streamingIdx], partial:false };
-      }
-      streamingIdx = -1;
+    EventsOn('turn_end', buffered(async (data) => {
+      closeStreaming();
       busy = false;
       permissionQueue = [];
       try {
@@ -279,33 +292,33 @@
       } catch (e) {}
       // Queue draining is backend-owned: the agent auto-drains after the turn
       // ends and emits turn_start + queue_changed. No frontend flush.
-    });
+    }));
 
-    EventsOn('error', (data) => {
+    EventsOn('error', buffered((data) => {
       showError(data?.message || data);
       busy = false;
-    });
+    }));
 
-    EventsOn('status', (data) => { status = data.state; });
+    EventsOn('status', buffered((data) => { status = data.state; }));
 
-    EventsOn('permission_request', (data) => { permissionQueue = [...permissionQueue, data]; });
+    EventsOn('permission_request', buffered((data) => { permissionQueue = [...permissionQueue, data]; }));
 
-    EventsOn('compaction_start', () => { compacting = true; });
-    EventsOn('compaction_end', () => { compacting = false; });
+    EventsOn('compaction_start', buffered(() => { compacting = true; }));
+    EventsOn('compaction_end', buffered(() => { compacting = false; }));
 
-    EventsOn('subagent_token', (data) => {
+    EventsOn('subagent_token', buffered((data) => {
       appendSubagentEvent(data.sessionId, { type: 'token', content: data.content });
-    });
-    EventsOn('subagent_tool_start', (data) => {
+    }));
+    EventsOn('subagent_tool_start', buffered((data) => {
       appendSubagentEvent(data.sessionId, { type: 'tool_start', id: data.id, name: data.name, args: data.args });
-    });
-    EventsOn('subagent_tool_result', (data) => {
+    }));
+    EventsOn('subagent_tool_result', buffered((data) => {
       appendSubagentEvent(data.sessionId, { type: 'tool_result', id: data.id, success: data.success, output: data.output, name: data.name, args: data.args, metadata: data.metadata });
-    });
-    EventsOn('subagent_background_process_complete', (data) => {
+    }));
+    EventsOn('subagent_background_process_complete', buffered((data) => {
       appendSubagentEvent(data.sessionId, { type: 'background_process_complete', id: data.id, command: data.command, reason: data.reason, exitCode: data.exitCode, success: data.success, output: data.output });
-    });
-    EventsOn('subagent_session_start', (data) => {
+    }));
+    EventsOn('subagent_session_start', buffered((data) => {
       const link = { index: Number(data.taskIndex), sessionId: data.sessionId };
       const rowExists = messages.some(m => m.type === 'tool' && m.id === data.taskToolCallId);
       if (!rowExists) pendingSubagentSessionLinks = rememberSubagentLink(pendingSubagentSessionLinks, data.taskToolCallId, link);
@@ -314,7 +327,17 @@
           ? { ...m, subagentSessionIds: mergeSubagentLinks(m.subagentSessionIds, [link]) }
           : m
       );
-    });
+    }));
+
+    // Non-transcript scalars not carried by the snapshot: fetched directly.
+    try {
+      const r = await CurrentModel();
+      modelRef = r.ref || ((r.provider && r.model) ? `${r.provider}/${r.model}` : '');
+      modelName = r.displayName || modelRef;
+    } catch (e) { showError(e, 'Load model failed'); }
+    try { projectName = await ProjectName(); } catch (e) { showError(e, 'Load project failed'); }
+
+    await hydrate();
   });
 
   async function handleCompact() {
@@ -408,8 +431,8 @@
     on:openModelSelector={() => showModelSelector=true}
     on:openTokens={() => showTokens=true}
     on:compact={handleCompact}
-    on:openSessionSelector={() => showSessionSelector=true}
-    on:openProjectSelector={() => showProjectSelector=true}
+    on:openSessionSelector={() => { if (hydrated) showSessionSelector = true; }}
+    on:openProjectSelector={() => { if (hydrated) showProjectSelector = true; }}
     on:openSettings={() => { settingsSection = 'providers'; showSettings = true; }}
     on:openWarnings={() => showWarnings=true} />
   <div class="content" bind:this={contentEl} bind:clientWidth={contentWidth}>
@@ -427,7 +450,7 @@
       {/if}
     {/if}
   </div>
-  <InputArea bind:this={inputArea} busy={busy || compacting} hasActiveModel={!!modelRef} on:submit={handleSubmit} on:error={(e) => showError(e.detail)}>
+  <InputArea bind:this={inputArea} busy={busy || compacting} hasActiveModel={!!modelRef && hydrated} on:submit={handleSubmit} on:error={(e) => showError(e.detail)}>
     <StatusBar {modelName} on:openModelSelector={() => showModelSelector=true} />
   </InputArea>
   {#if showModelSelector}

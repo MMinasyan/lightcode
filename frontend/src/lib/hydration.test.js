@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { admitSequenced, newTranscriptGate, snapshotHighWater } from './hydration.js';
+import { admitSequenced, newTranscriptGate, snapshotHighWater, snapshotMessages } from './hydration.js';
 
 describe('transcript high-water gating', () => {
   it('takes the high-water from the max of the cursor, tail, and error rows', () => {
@@ -43,5 +43,30 @@ describe('transcript high-water gating', () => {
     expect(admitSequenced(gate, undefined)).toBe(true);
     // The water is unchanged by an unsequenced admission.
     expect(gate.highWater).toBe(9);
+  });
+});
+
+describe('snapshot message merge', () => {
+  it('puts committed messages first, then tail and errors merged by sequence', () => {
+    const state = {
+      messages: [{ type: 'user', content: 'q1' }, { type: 'assistant', content: 'a1' }],
+      tail: [
+        { seq: 7, message: { type: 'assistant', content: 'streaming' } },
+        { seq: 5, message: { type: 'user', content: 'q2' } },
+      ],
+      errors: [{ seq: 6, message: { type: 'error', content: 'boom' } }],
+    };
+    expect(snapshotMessages(state).map((m) => m.content)).toEqual([
+      'q1',
+      'a1',
+      'q2',
+      'boom',
+      'streaming',
+    ]);
+  });
+
+  it('returns only committed messages when there is no live tail or errors', () => {
+    expect(snapshotMessages({ messages: [{ content: 'only' }] }).map((m) => m.content)).toEqual(['only']);
+    expect(snapshotMessages({})).toEqual([]);
   });
 });

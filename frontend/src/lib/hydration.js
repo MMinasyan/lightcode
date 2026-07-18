@@ -36,3 +36,18 @@ export function admitSequenced(gate, seq) {
   gate.highWater = s;
   return true;
 }
+
+// snapshotMessages builds the ordered display list for a complete-state snapshot:
+// the durable committed messages first, then the retained tail rows and retained
+// errors merged by their shared display sequence.
+export function snapshotMessages(state) {
+  const committed = state?.messages || [];
+  const live = [
+    ...(state?.tail || []),
+    ...(state?.errors || []),
+  ]
+    .filter((row) => row && row.message)
+    .sort((a, b) => (Number(a.seq) || 0) - (Number(b.seq) || 0))
+    .map((row) => row.message);
+  return [...committed, ...live];
+}
