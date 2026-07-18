@@ -198,7 +198,12 @@ func newEventOrderAgent(t *testing.T, baseURL string) *Agent {
 func startEventOrderAgent(t *testing.T, a *Agent, cap *eventCapture) context.Context {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	// Join the owner on cleanup so the background goroutines stop before the
+	// test's temp dir is removed.
+	t.Cleanup(func() {
+		cancel()
+		a.ShutdownOwner()
+	})
 	a.SetEventHandler(cap.handler)
 	a.Init(ctx)
 	return ctx

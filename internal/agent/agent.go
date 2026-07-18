@@ -916,9 +916,15 @@ func (rt *runtime) init(ctx context.Context) {
 
 func (rt *runtime) initOnceLocked(ctx context.Context) {
 	a := rt.agent
-	go rt.drainLoopEvents(ctx)
-	go rt.runSignalScheduler(ctx)
-	go rt.runQueueDrainer(ctx)
+	// The background goroutines run on an owned context. An explicit shutdown
+	// (ShutdownOwner) cancels it after the in-flight turn join so the drainer
+	// stays alive to deliver terminal events; host-context cancellation stops
+	// them directly, and the bounded join then abandons any blocked delivery.
+	rt.ownerCtx, rt.ownerCancel = context.WithCancel(ctx)
+	rt.bgWG.Add(4)
+	go func() { defer rt.bgWG.Done(); rt.drainLoopEvents(rt.ownerCtx) }()
+	go func() { defer rt.bgWG.Done(); rt.runSignalScheduler(rt.ownerCtx) }()
+	go func() { defer rt.bgWG.Done(); rt.runQueueDrainer(rt.ownerCtx) }()
 	if a.memoryHooks != nil {
 		_ = a.memoryHooks.Reconcile()
 	}
@@ -926,14 +932,13 @@ func (rt *runtime) initOnceLocked(ctx context.Context) {
 	if err := a.resumeMostRecent(); err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: resume session: %v\n", err)
 	}
-	go a.periodicSweep(ctx)
+	go func() { defer rt.bgWG.Done(); a.periodicSweep(rt.ownerCtx) }()
 
-	if a.procMgr != nil {
-		go func() {
-			<-ctx.Done()
-			a.procMgr.Close()
-		}()
-	}
+	// Host context cancellation drives the joined owner shutdown.
+	go func() {
+		<-ctx.Done()
+		a.ShutdownOwner()
+	}()
 
 	if a.lspManager != nil {
 		a.lspManager.SetWarningHandler(func(kind, message string) {
@@ -942,7 +947,7 @@ func (rt *runtime) initOnceLocked(ctx context.Context) {
 		a.lspManager.SetSignalHandler(func(content string) {
 			a.ensureRuntime().signalSink.AddSignal(loop.PendingSignal{Payload: content, Persist: true})
 		})
-		go a.lspManager.Detect(ctx)
+		go a.lspManager.Detect(rt.ownerCtx)
 		go func() {
 			<-ctx.Done()
 			a.lspManager.ShutdownAll()
@@ -1017,7 +1022,7 @@ func (rt *runtime) tryStartSignalTurn(ctx context.Context) {
 		turnCtx, cancel, err := rt.claimTurnLocked(ctx, unit)
 		rt.mu.Unlock()
 		if err != nil {
-			if !strings.Contains(err.Error(), "turn is already in progress") {
+			if !errors.Is(err, errOwnerClosed) && !strings.Contains(err.Error(), "turn is already in progress") {
 				a.emitEvent(Event{Kind: EventError, Error: err.Error()})
 			}
 			return
@@ -1798,7 +1803,12 @@ func (a *Agent) CompactNowForSession(ctx context.Context, sessionID string) erro
 		rt.mu.Unlock()
 		return err
 	}
+	if rt.closed {
+		rt.mu.Unlock()
+		return errOwnerClosed
+	}
 	unit.busy = true
+	rt.turnWG.Add(1)
 	compactCtx, cancel := context.WithCancel(ctx)
 	unit.turnCancel = cancel
 	unit.turnCtx = compactCtx
@@ -1813,6 +1823,7 @@ func (a *Agent) CompactNowForSession(ctx context.Context, sessionID string) erro
 		cancel()
 		rt.nudgeQueueDrainer()
 		rt.nudgeSignalScheduler()
+		rt.turnWG.Done()
 	}()
 
 	return a.runCompactionForSession(compactCtx, unit, false)
@@ -2186,6 +2197,10 @@ func (rt *runtime) submit(ctx context.Context, unit *session, content string) (S
 		rt.mu.Unlock()
 		return SubmitResult{}, fmt.Errorf("session is changing; retry")
 	}
+	if rt.closed {
+		rt.mu.Unlock()
+		return SubmitResult{}, errOwnerClosed
+	}
 	if !unit.busy && len(unit.queue) == 0 {
 		turnCtx, cancel, err := rt.claimTurnLocked(ctx, unit)
 		if err != nil {
@@ -2282,6 +2297,10 @@ func (rt *runtime) appendUserMessageLocked(unit *session, content string) (int, 
 	return turn, nil
 }
 
+// errOwnerClosed is returned when the owner is shutting down and no longer
+// admits new turns or mutations.
+var errOwnerClosed = errors.New("agent: owner is shutting down")
+
 // claimTurnLocked checks the busy gate and claims a turn (sets busy, builds the
 // per-turn context). Caller must hold the runtime mutex. Returns a non-nil error if a turn
 // is already in progress or ensureSession fails; on error it leaves busy
@@ -2290,6 +2309,9 @@ func (rt *runtime) claimTurnLocked(ctx context.Context, unit *session) (context.
 	a := rt.agent
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
+	}
+	if rt.closed {
+		return nil, nil, errOwnerClosed
 	}
 	if unit == nil {
 		return nil, nil, snapshot.ErrNoSession
@@ -2308,6 +2330,10 @@ func (rt *runtime) claimTurnLocked(ctx context.Context, unit *session) (context.
 	a.setWarningGroup("setup", a.setupWarningsLocked())
 	unit.busy = true
 	unit.seenSessions = nil
+	// Track the turn from the moment it is claimed, under mu, so owner shutdown's
+	// join can never miss a turn between claim and launch. launchTurn's goroutine
+	// calls Done.
+	rt.turnWG.Add(1)
 	turnCtx, cancel := context.WithCancel(ctx)
 	unit.turnCancel = cancel
 	unit.turnCtx = turnCtx
@@ -2450,7 +2476,7 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 		}
 		rt.mu.Lock()
 		unit := rt.nextDrainableSessionLocked()
-		if ctx.Err() != nil || unit == nil {
+		if ctx.Err() != nil || unit == nil || rt.closed {
 			rt.mu.Unlock()
 			return
 		}
@@ -2476,6 +2502,7 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 		}
 		unit.busy = true
 		unit.seenSessions = nil
+		rt.turnWG.Add(1)
 		turnCtx, cancel := context.WithCancel(ctx)
 		unit.turnCancel = cancel
 		unit.turnCtx = turnCtx
@@ -2541,6 +2568,8 @@ func wakeableSession(unit *session) bool {
 func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx context.Context, cancel context.CancelFunc, contents []string) int {
 	a := rt.agent
 	if unit == nil || unit.store == nil || unit.lp == nil {
+		// The turn was claimed (and counted) but cannot launch; release the count.
+		rt.turnWG.Done()
 		return 0
 	}
 	unit.syncEventOwner()
@@ -2575,6 +2604,7 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 			// pending, matching the queue drainer's unconditional nudge.
 			rt.nudgeQueueDrainer()
 			rt.nudgeSignalScheduler()
+			rt.turnWG.Done()
 		}()
 
 		if ctx.Err() != nil {
@@ -3192,36 +3222,76 @@ func (a *Agent) applyUnitConfigLocked(unit *session) {
 	}
 }
 
-// ShutdownOwner cancels all live turns, session-owned permission timers, and
-// background processes. It does not close session stores or join turn goroutines
-// because state persists per turn and Store.Close's only side effect is
-// discarding empty sessions — acceptable for process exit.
+// shutdownJoinTimeout bounds each owner-shutdown join. A delivery callback that
+// blocks (a full adapter sink whose consumer has stopped) is abandoned rather
+// than hanging the host; the abandoned goroutine holds no owner lock and ends at
+// process exit.
+const shutdownJoinTimeout = 5 * time.Second
+
+// waitGroupOrTimeout waits for wg, returning true if it drained within d and
+// false if the wait was abandoned.
+func waitGroupOrTimeout(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+// ShutdownOwner closes turn admission, cancels live turns and permission timers,
+// joins in-flight turns so their terminal events flush through the still-running
+// drainer, then cancels and joins the background goroutines and closes the
+// subordinate services. It is one shared join: every caller waits for the same
+// cleanup, and it runs exactly once. Session stores are not closed; state
+// persists per turn and the process-exit boundary releases claims.
 func (a *Agent) ShutdownOwner() {
 	rt := a.ensureRuntime()
-	var cancels []context.CancelFunc
-	var sessionIDs []string
-	rt.mu.Lock()
-	for id, unit := range a.sessions {
-		if unit == nil || unit.store == nil || !unit.store.Active() {
-			continue
+	rt.shutdownOnce.Do(func() {
+		rt.mu.Lock()
+		rt.closed = true
+		var cancels []context.CancelFunc
+		var sessionIDs []string
+		for id, unit := range a.sessions {
+			if unit == nil || unit.store == nil || !unit.store.Active() {
+				continue
+			}
+			if cancel := rt.turnCancelSnapshotLocked(unit); cancel != nil {
+				cancels = append(cancels, cancel)
+			}
+			sessionIDs = append(sessionIDs, id)
 		}
-		if cancel := rt.turnCancelSnapshotLocked(unit); cancel != nil {
-			cancels = append(cancels, cancel)
+		rt.mu.Unlock()
+		for _, cancel := range cancels {
+			cancel()
 		}
-		sessionIDs = append(sessionIDs, id)
-	}
-	rt.mu.Unlock()
-	for _, cancel := range cancels {
-		cancel()
-	}
-	if a.gate != nil {
-		for _, id := range sessionIDs {
-			a.gate.CancelSession(id)
+		if a.gate != nil {
+			for _, id := range sessionIDs {
+				a.gate.CancelSession(id)
+			}
 		}
-	}
-	if a.procMgr != nil {
-		a.procMgr.Close()
-	}
+		// Join in-flight turns and mutations first, while the drainer is still
+		// alive, so their terminal events are delivered before delivery stops.
+		if !waitGroupOrTimeout(&rt.turnWG, shutdownJoinTimeout) {
+			fmt.Fprintf(os.Stderr, "lightcode: owner shutdown abandoned in-flight turns after %s\n", shutdownJoinTimeout)
+		}
+		if rt.ownerCancel != nil {
+			rt.ownerCancel()
+		}
+		if !waitGroupOrTimeout(&rt.bgWG, shutdownJoinTimeout) {
+			fmt.Fprintf(os.Stderr, "lightcode: owner shutdown abandoned background workers after %s\n", shutdownJoinTimeout)
+		}
+		if a.procMgr != nil {
+			a.procMgr.Close()
+		}
+		close(rt.shutdownDone)
+	})
+	<-rt.shutdownDone
 }
 
 func setRegisteredToolConfig(t tool.Tool, cfg config.ToolsConfig) {

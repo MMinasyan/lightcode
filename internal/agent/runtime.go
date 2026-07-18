@@ -73,6 +73,18 @@ type runtime struct {
 	// execution or acquired by a drainer/callback.
 	lifecycleMu sync.Mutex
 	mu          sync.Mutex
+
+	// Owner shutdown. ownerCtx/ownerCancel bound the background goroutines;
+	// closed is the turn-admission gate (guarded by mu); turnWG tracks in-flight
+	// turns and mutations; bgWG tracks the background goroutines; shutdownOnce and
+	// shutdownDone make ShutdownOwner one shared join for all callers.
+	ownerCtx     context.Context
+	ownerCancel  context.CancelFunc
+	closed       bool
+	turnWG       sync.WaitGroup
+	bgWG         sync.WaitGroup
+	shutdownOnce sync.Once
+	shutdownDone chan struct{}
 }
 
 func newRuntime(a *Agent, opts runtimeOptions) *runtime {
@@ -84,6 +96,7 @@ func newRuntime(a *Agent, opts runtimeOptions) *runtime {
 		loopFlush:        make(chan chan struct{}, 1),
 		signalWake:       make(chan struct{}, 1),
 		queueWake:        make(chan struct{}, 1),
+		shutdownDone:     make(chan struct{}),
 	}
 	rt.signalSink = loopSignalSink{agent: a}
 	return rt
@@ -114,6 +127,9 @@ func (a *Agent) ensureRuntime() *runtime {
 	}
 	if a.rt.queueWake == nil {
 		a.rt.queueWake = make(chan struct{}, 1)
+	}
+	if a.rt.shutdownDone == nil {
+		a.rt.shutdownDone = make(chan struct{})
 	}
 	if a.rt.signalSink == nil {
 		a.rt.signalSink = loopSignalSink{agent: a}
