@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -15,6 +16,18 @@ import (
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/version"
 )
+
+// deliveryJoinTimeout bounds how long close waits for the delivery drainer to
+// finish. A drainer blocked inside a framework emit is abandoned after it; it
+// holds no lock or state and process exit owns the blocked call.
+var deliveryJoinTimeout = 5 * time.Second
+
+// deliveryFrame is one immutable item the delivery FIFO carries. Today every
+// frame is a legacy named event with its payload; the sole drainer emits it.
+type deliveryFrame struct {
+	name    string
+	payload any
+}
 
 // App is the Wails-bound struct that bridges the Go backend to the
 // frontend. All exported methods are callable from JavaScript.
@@ -25,6 +38,18 @@ type App struct {
 	viewOnce        sync.Once
 	view            *agent.SessionView
 	adapterAttached bool
+
+	// Delivery spine: every event and navigation payload is appended as a frame;
+	// the single drainer is the only goroutine that emits to the frontend, so
+	// delivery order is the drainer's write order. emitFn is the one emission
+	// choke point (overridable in tests).
+	emitFn         func(name string, payload any)
+	deliveryMu     sync.Mutex
+	deliveryFrames []deliveryFrame
+	deliveryWake   chan struct{}
+	deliveryClosed bool
+	deliveryDone   chan struct{}
+	deliveryOnce   sync.Once
 }
 
 type ModelCompletion = agent.ModelCompletion
@@ -32,6 +57,7 @@ type ModelCompletion = agent.ModelCompletion
 // startup is called by Wails after the window is created.
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	a.startDelivery()
 	a.svc.SetEventHandler(a.handleEvent)
 	a.svc.Init(ctx)
 	a.scope = agent.NewAdapterScope(a.svc, a.svc.ProjectRoot())
@@ -53,12 +79,89 @@ func (a *App) startup(ctx context.Context) {
 }
 
 func (a *App) shutdown(ctx context.Context) {
+	a.closeDelivery()
 	if !a.adapterAttached {
 		return
 	}
 	if lifecycle, ok := a.svc.(interface{ DetachAdapter(context.Context) error }); ok {
 		_ = lifecycle.DetachAdapter(ctx)
 	}
+}
+
+// startDelivery installs the emission choke point and starts the sole drainer
+// before any event callback is connected. emitFn defaults to the framework emit
+// and is left untouched when a test set it first.
+func (a *App) startDelivery() {
+	if a.emitFn == nil {
+		a.emitFn = func(name string, payload any) {
+			wailsRuntime.EventsEmit(a.ctx, name, payload)
+		}
+	}
+	a.deliveryWake = make(chan struct{}, 1)
+	a.deliveryDone = make(chan struct{})
+	go a.runDeliveryDrainer()
+}
+
+// emitFrame appends one frame and wakes the drainer. It never blocks or emits,
+// so it is safe to call from an event callback that runs under an owner lock.
+func (a *App) emitFrame(name string, payload any) {
+	a.deliveryMu.Lock()
+	if a.deliveryClosed {
+		a.deliveryMu.Unlock()
+		return
+	}
+	a.deliveryFrames = append(a.deliveryFrames, deliveryFrame{name: name, payload: payload})
+	a.deliveryMu.Unlock()
+	select {
+	case a.deliveryWake <- struct{}{}:
+	default:
+	}
+}
+
+// runDeliveryDrainer is the only goroutine that emits to the frontend. It drains
+// frames in FIFO order and exits once closed and drained.
+func (a *App) runDeliveryDrainer() {
+	defer close(a.deliveryDone)
+	for {
+		a.deliveryMu.Lock()
+		if a.deliveryClosed {
+			// Once closed, stop emitting and drop pending frames — including any
+			// queued behind an abandoned blocked emit, which must not reach the
+			// frontend after shutdown has proceeded.
+			a.deliveryMu.Unlock()
+			return
+		}
+		if len(a.deliveryFrames) == 0 {
+			a.deliveryMu.Unlock()
+			<-a.deliveryWake
+			continue
+		}
+		frame := a.deliveryFrames[0]
+		a.deliveryFrames = a.deliveryFrames[1:]
+		a.deliveryMu.Unlock()
+		a.emitFn(frame.name, frame.payload)
+	}
+}
+
+// closeDelivery rejects further frames and joins the drainer, abandoning it if
+// it is blocked inside one framework emit.
+func (a *App) closeDelivery() {
+	a.deliveryOnce.Do(func() {
+		a.deliveryMu.Lock()
+		a.deliveryClosed = true
+		a.deliveryMu.Unlock()
+		select {
+		case a.deliveryWake <- struct{}{}:
+		default:
+		}
+		if a.deliveryDone == nil {
+			return
+		}
+		select {
+		case <-a.deliveryDone:
+		case <-time.After(deliveryJoinTimeout):
+		}
+	})
 }
 
 func (a *App) sv() *agent.SessionView {
@@ -73,19 +176,19 @@ func (a *App) handleEvent(ev agent.Event) {
 	if ev.SubagentSessionID != "" {
 		switch ev.Kind {
 		case agent.EventTextDelta:
-			wailsRuntime.EventsEmit(a.ctx, "subagent_token", map[string]any{
+			a.emitFrame("subagent_token", map[string]any{
 				"sessionId": ev.SubagentSessionID,
 				"content":   ev.Result,
 			})
 		case agent.EventToolCallStart:
-			wailsRuntime.EventsEmit(a.ctx, "subagent_tool_start", map[string]any{
+			a.emitFrame("subagent_tool_start", map[string]any{
 				"sessionId": ev.SubagentSessionID,
 				"id":        ev.ToolCallID,
 				"name":      ev.ToolName,
 				"args":      ev.Args,
 			})
 		case agent.EventToolCallEnd:
-			wailsRuntime.EventsEmit(a.ctx, "subagent_tool_result", map[string]any{
+			a.emitFrame("subagent_tool_result", map[string]any{
 				"sessionId": ev.SubagentSessionID,
 				"id":        ev.ToolCallID,
 				"name":      ev.ToolName,
@@ -95,14 +198,14 @@ func (a *App) handleEvent(ev agent.Event) {
 				"metadata":  ev.Metadata,
 			})
 		case agent.EventSubagentStart:
-			wailsRuntime.EventsEmit(a.ctx, "subagent_session_start", map[string]any{
+			a.emitFrame("subagent_session_start", map[string]any{
 				"sessionId":      ev.SubagentSessionID,
 				"taskToolCallId": ev.ToolCallID,
 				"taskIndex":      ev.TaskIndex,
 			})
 		case agent.EventBackgroundProcessComplete:
 			if ev.BackgroundProcess != nil {
-				wailsRuntime.EventsEmit(a.ctx, "subagent_background_process_complete", map[string]any{
+				a.emitFrame("subagent_background_process_complete", map[string]any{
 					"sessionId": ev.SubagentSessionID,
 					"id":        ev.BackgroundProcess.ID,
 					"command":   ev.BackgroundProcess.Command,
@@ -117,17 +220,17 @@ func (a *App) handleEvent(ev agent.Event) {
 	}
 	switch ev.Kind {
 	case agent.EventTextDelta:
-		wailsRuntime.EventsEmit(a.ctx, "token", map[string]any{
+		a.emitFrame("token", map[string]any{
 			"content": ev.Result,
 		})
 	case agent.EventToolCallStart:
-		wailsRuntime.EventsEmit(a.ctx, "tool_start", map[string]any{
+		a.emitFrame("tool_start", map[string]any{
 			"id":   ev.ToolCallID,
 			"name": ev.ToolName,
 			"args": ev.Args,
 		})
 	case agent.EventToolCallEnd:
-		wailsRuntime.EventsEmit(a.ctx, "tool_result", map[string]any{
+		a.emitFrame("tool_result", map[string]any{
 			"id":       ev.ToolCallID,
 			"name":     ev.ToolName,
 			"args":     ev.Args,
@@ -137,7 +240,7 @@ func (a *App) handleEvent(ev agent.Event) {
 		})
 	case agent.EventBackgroundProcessComplete:
 		if ev.BackgroundProcess != nil {
-			wailsRuntime.EventsEmit(a.ctx, "background_process_complete", map[string]any{
+			a.emitFrame("background_process_complete", map[string]any{
 				"id":       ev.BackgroundProcess.ID,
 				"command":  ev.BackgroundProcess.Command,
 				"reason":   ev.BackgroundProcess.Reason,
@@ -147,12 +250,12 @@ func (a *App) handleEvent(ev agent.Event) {
 			})
 		}
 	case agent.EventUserMessageDisplay:
-		wailsRuntime.EventsEmit(a.ctx, "user_message", map[string]any{
+		a.emitFrame("user_message", map[string]any{
 			"turn":    ev.Turn,
 			"content": ev.Result,
 		})
 	case agent.EventGenericSystemSignal:
-		wailsRuntime.EventsEmit(a.ctx, "system_signal", map[string]any{
+		a.emitFrame("system_signal", map[string]any{
 			"content": "System: " + ev.Result,
 		})
 	case agent.EventQueueChanged:
@@ -160,25 +263,25 @@ func (a *App) handleEvent(ev agent.Event) {
 		if queue == nil {
 			queue = []agent.QueuedItem{}
 		}
-		wailsRuntime.EventsEmit(a.ctx, "queue_changed", map[string]any{
+		a.emitFrame("queue_changed", map[string]any{
 			"items":   queue,
 			"version": ev.QueueVersion,
 		})
 	case agent.EventUsage:
-		wailsRuntime.EventsEmit(a.ctx, "usage", a.tokenUsage())
+		a.emitFrame("usage", a.tokenUsage())
 	case agent.EventTurnStart:
-		wailsRuntime.EventsEmit(a.ctx, "turn_start", map[string]any{"turn": ev.Turn})
-		wailsRuntime.EventsEmit(a.ctx, "status", map[string]any{"state": "streaming"})
+		a.emitFrame("turn_start", map[string]any{"turn": ev.Turn})
+		a.emitFrame("status", map[string]any{"state": "streaming"})
 	case agent.EventTurnEnd:
-		wailsRuntime.EventsEmit(a.ctx, "turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
-		wailsRuntime.EventsEmit(a.ctx, "status", map[string]any{"state": "idle"})
+		a.emitFrame("turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
+		a.emitFrame("status", map[string]any{"state": "idle"})
 		if ev.RefreshSession {
 			a.emitSessionChangedForEvent(ev)
 		}
 	case agent.EventError:
-		wailsRuntime.EventsEmit(a.ctx, "error", map[string]any{"message": ev.Error})
+		a.emitFrame("error", map[string]any{"message": ev.Error})
 	case agent.EventPermissionRequest:
-		wailsRuntime.EventsEmit(a.ctx, "permission_request", map[string]any{
+		a.emitFrame("permission_request", map[string]any{
 			"id":                 ev.PermReq.ID,
 			"sessionId":          ev.PermReq.SessionID,
 			"projectId":          ev.PermReq.ProjectID,
@@ -193,14 +296,14 @@ func (a *App) handleEvent(ev agent.Event) {
 			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		})
 	case agent.EventCompactionStart:
-		wailsRuntime.EventsEmit(a.ctx, "compaction_start", nil)
+		a.emitFrame("compaction_start", nil)
 	case agent.EventCompactionEnd:
-		wailsRuntime.EventsEmit(a.ctx, "compaction_end", nil)
+		a.emitFrame("compaction_end", nil)
 		if ev.RefreshSession {
 			a.emitSessionChangedForEvent(ev)
 		}
 	case agent.EventWarning:
-		wailsRuntime.EventsEmit(a.ctx, "warnings", ev.Warnings)
+		a.emitFrame("warnings", ev.Warnings)
 	}
 }
 
@@ -222,7 +325,7 @@ func (a *App) emitSessionChangedForSession(sessionID string) {
 		return
 	}
 	payload := a.sv().SessionChangedPayload(sessionID)
-	wailsRuntime.EventsEmit(a.ctx, "session_changed", payload)
+	a.emitFrame("session_changed", payload)
 }
 
 func (a *App) setCurrentSessionID(id string) {

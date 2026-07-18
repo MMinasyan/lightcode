@@ -261,14 +261,14 @@ func TestWailsLifecycleSurfaceContract(t *testing.T) {
 func TestWailsDefersActiveCompactionSessionRefreshUntilTurnEnd(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
 	compactionEnd := extractSwitchCase(t, app, "case agent.EventCompactionEnd:")
-	if !strings.Contains(compactionEnd, `EventsEmit(a.ctx, "compaction_end"`) {
+	if !strings.Contains(compactionEnd, `emitFrame("compaction_end"`) {
 		t.Fatalf("EventCompactionEnd must still emit compaction_end; case:\n%s", compactionEnd)
 	}
 	if !strings.Contains(compactionEnd, "if ev.RefreshSession") || !strings.Contains(compactionEnd, "a.emitSessionChangedForEvent(ev)") {
 		t.Fatalf("EventCompactionEnd must refresh history only when backend marks it safe; case:\n%s", compactionEnd)
 	}
 	turnEnd := extractSwitchCase(t, app, "case agent.EventTurnEnd:")
-	if !strings.Contains(turnEnd, `EventsEmit(a.ctx, "turn_end"`) {
+	if !strings.Contains(turnEnd, `emitFrame("turn_end"`) {
 		t.Fatalf("EventTurnEnd must still emit turn_end; case:\n%s", turnEnd)
 	}
 	if !strings.Contains(turnEnd, "if ev.RefreshSession") || !strings.Contains(turnEnd, "a.emitSessionChangedForEvent(ev)") {
@@ -385,7 +385,7 @@ func extractSvelteFunctionBody(source, prefix string) (string, bool) {
 }
 
 func TestBackendEmittedEventsAreListenedToByFrontend(t *testing.T) {
-	emitted := collectContractMatches(t, filepath.Join("..", ".."), ".go", `EventsEmit\([^,]+,\s*["']([^"']+)["']`)
+	emitted := collectContractMatches(t, filepath.Join("..", ".."), ".go", `(?:EventsEmit\([^,]+,\s*|emitFrame\(\s*)["']([^"']+)["']`)
 	listened := stringSet(collectContractMatches(t, filepath.Join("..", "..", "frontend", "src"), ".svelte", `EventsOn\(["']([^"']+)["']`))
 	if len(emitted) == 0 {
 		t.Fatal("no runtime.EventsEmit calls found")
@@ -403,7 +403,7 @@ func TestBackendEmittedEventsAreListenedToByFrontend(t *testing.T) {
 
 func TestFrontendEventListenersHaveBackendEmitters(t *testing.T) {
 	listened := collectContractMatches(t, filepath.Join("..", "..", "frontend", "src"), ".svelte", `EventsOn\(["']([^"']+)["']`)
-	emitted := stringSet(collectContractMatches(t, filepath.Join("..", ".."), ".go", `EventsEmit\([^,]+,\s*["']([^"']+)["']`))
+	emitted := stringSet(collectContractMatches(t, filepath.Join("..", ".."), ".go", `(?:EventsEmit\([^,]+,\s*|emitFrame\(\s*)["']([^"']+)["']`))
 	if len(listened) == 0 {
 		t.Fatal("no frontend EventsOn calls found")
 	}
@@ -441,6 +441,11 @@ func collectContractMatches(t *testing.T, root, ext, pattern string) []string {
 			return nil
 		}
 		if filepath.Ext(path) != ext {
+			return nil
+		}
+		// Contracts live in production code; test files may reference the same
+		// helpers with throwaway names.
+		if strings.HasSuffix(d.Name(), "_test.go") {
 			return nil
 		}
 		for _, match := range extractUniqueMatches(mustReadContractFile(t, path), pattern) {
