@@ -142,6 +142,11 @@ type Agent struct {
 	warningsMu      sync.Mutex
 	warningGroups   map[string][]PromptWarning
 	warningSnapshot []PromptWarning
+
+	// captureProbe is a test seam invoked after each live-selection candidate
+	// read to deterministically inject a revision change or a read error; nil in
+	// production.
+	captureProbe func(attempt int) error
 }
 
 type agentSignalSink interface {
@@ -4335,24 +4340,76 @@ type completeState struct {
 	permissions []permission.Request
 }
 
+// errCaptureRevisionChanged is returned by the live-selection capture when the
+// coordinator revision changes across all attempts, so the caller retries the
+// whole selection without any partial publication.
+var errCaptureRevisionChanged = errors.New("capture revision changed")
+
 // captureState reads a session's durable committed history outside the
-// captured-state locks (it does I/O), then acquires the live-class locks in the
-// total order and reads activity/queue/model, tokens, warnings, and the
-// transcript tail/errors/revision while holding them, so the snapshot is one
-// consistent set with no class read outside the lock that guards it.
+// captured-state locks (it does I/O), then reads every live class while holding
+// the locks in the total order, so the snapshot is one consistent set with no
+// class read outside the lock that guards it. This is the single-read shape.
 func (a *Agent) captureState(unit *session) (completeState, error) {
 	if unit == nil || unit.store == nil || unit.transcript == nil {
 		return completeState{}, snapshot.ErrNoSession
 	}
 	sessionID := sessionIDOf(unit)
-	var committed []DisplayMessage
-	if unit.store.Active() {
-		var err error
-		committed, err = a.messagesForFrontendForStore(unit.store, sessionID)
+	committed, err := a.captureDurableHistory(unit, sessionID)
+	if err != nil {
+		return completeState{}, err
+	}
+	state, _ := a.captureUnderLocks(unit, committed, sessionID, nil)
+	return state, nil
+}
+
+// captureStateForSelection is the live-selection/reconnect shape. It reads the
+// durable history outside the locks, then revalidates the coordinator revision
+// under the locks: a turn committed during the read leaves the read-again
+// prefix, so it retries on the first two mismatches and returns
+// errCaptureRevisionChanged on the third, never publishing a partial result. A
+// durable read/decode error returns immediately. The caller holds lifecycleMu.
+func (a *Agent) captureStateForSelection(unit *session) (completeState, error) {
+	if unit == nil || unit.store == nil || unit.transcript == nil {
+		return completeState{}, snapshot.ErrNoSession
+	}
+	tr := unit.transcript
+	sessionID := sessionIDOf(unit)
+	for attempt := 1; attempt <= 3; attempt++ {
+		tr.seqMu.Lock()
+		rev0 := tr.revisionLocked()
+		tr.seqMu.Unlock()
+
+		if a.captureProbe != nil {
+			if err := a.captureProbe(attempt); err != nil {
+				return completeState{}, err
+			}
+		}
+
+		committed, err := a.captureDurableHistory(unit, sessionID)
 		if err != nil {
 			return completeState{}, err
 		}
+		if state, ok := a.captureUnderLocks(unit, committed, sessionID, &rev0); ok {
+			return state, nil
+		}
 	}
+	return completeState{}, errCaptureRevisionChanged
+}
+
+// captureDurableHistory reads a session's committed display history. It does I/O
+// and must run outside the captured-state locks.
+func (a *Agent) captureDurableHistory(unit *session, sessionID string) ([]DisplayMessage, error) {
+	if !unit.store.Active() {
+		return nil, nil
+	}
+	return a.messagesForFrontendForStore(unit.store, sessionID)
+}
+
+// captureUnderLocks reads every live class while holding the captured-state locks
+// in the total order and builds the immutable state. When wantRev is non-nil it
+// revalidates the transcript revision under seqMu, returning ok=false if it
+// changed so the caller can retry with a fresh durable read.
+func (a *Agent) captureUnderLocks(unit *session, committed []DisplayMessage, sessionID string, wantRev *captureRevision) (completeState, bool) {
 	rt := a.ensureRuntime()
 	tr := unit.transcript
 
@@ -4377,6 +4434,9 @@ func (a *Agent) captureState(unit *session) (completeState, error) {
 
 	tr.seqMu.Lock()
 	defer tr.seqMu.Unlock()
+	if wantRev != nil && tr.revisionLocked() != *wantRev {
+		return completeState{}, false
+	}
 	return completeState{
 		transcript: completeTranscript{
 			committed: committed,
@@ -4391,7 +4451,7 @@ func (a *Agent) captureState(unit *session) (completeState, error) {
 		queue:       queue,
 		warnings:    warnings,
 		permissions: permissions,
-	}, nil
+	}, true
 }
 
 // captureTranscript reads a session's durable committed history outside the

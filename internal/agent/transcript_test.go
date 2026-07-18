@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -149,6 +150,134 @@ func TestCaptureTranscriptProvidesDurableTailAndErrors(t *testing.T) {
 	if ct.revision.committedTurn != 0 {
 		t.Fatalf("fresh session revision = %+v, want no commits", ct.revision)
 	}
+}
+
+// TestCaptureStateForSelectionRevalidation verifies the live-selection capture
+// revalidates the coordinator revision across a fixed three attempts: a stable
+// revision succeeds on the first read, a commit or rewrite during the read is
+// retried once and then succeeds, three consecutive changes exhaust the attempts
+// with a retryable error, and a durable read error returns immediately with no
+// further attempt.
+func TestCaptureStateForSelectionRevalidation(t *testing.T) {
+	bumpCommit := func(tr *transcript) {
+		tr.seqMu.Lock()
+		tr.commitLocked(tr.committedTurn + 1)
+		tr.seqMu.Unlock()
+	}
+
+	t.Run("stable_first", func(t *testing.T) {
+		a := newCatalogBackedTestAgent(t)
+		attempts := 0
+		a.captureProbe = func(int) error { attempts++; return nil }
+		if _, err := a.captureStateForSelection(a.session); err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if attempts != 1 {
+			t.Fatalf("attempts = %d, want 1 (no retry)", attempts)
+		}
+	})
+
+	t.Run("normal_commit_then_success", func(t *testing.T) {
+		a := newCatalogBackedTestAgent(t)
+		tr := a.session.transcript
+		attempts := 0
+		a.captureProbe = func(attempt int) error {
+			attempts++
+			if attempt == 1 {
+				bumpCommit(tr)
+			}
+			return nil
+		}
+		if _, err := a.captureStateForSelection(a.session); err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if attempts != 2 {
+			t.Fatalf("attempts = %d, want 2 (one retry then success)", attempts)
+		}
+	})
+
+	t.Run("rewrite_then_success", func(t *testing.T) {
+		a := newCatalogBackedTestAgent(t)
+		tr := a.session.transcript
+		attempts := 0
+		a.captureProbe = func(attempt int) error {
+			attempts++
+			if attempt == 1 {
+				tr.seqMu.Lock()
+				tr.rewriteLocked(tr.committedTurn)
+				tr.seqMu.Unlock()
+			}
+			return nil
+		}
+		if _, err := a.captureStateForSelection(a.session); err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if attempts != 2 {
+			t.Fatalf("attempts = %d, want 2", attempts)
+		}
+	})
+
+	t.Run("three_mismatches", func(t *testing.T) {
+		a := newCatalogBackedTestAgent(t)
+		tr := a.session.transcript
+		attempts := 0
+		a.captureProbe = func(int) error {
+			attempts++
+			bumpCommit(tr)
+			return nil
+		}
+		_, err := a.captureStateForSelection(a.session)
+		if !errors.Is(err, errCaptureRevisionChanged) {
+			t.Fatalf("err = %v, want errCaptureRevisionChanged", err)
+		}
+		if attempts != 3 {
+			t.Fatalf("attempts = %d, want 3", attempts)
+		}
+	})
+
+	t.Run("read_error_attempt_1", func(t *testing.T) {
+		a := newCatalogBackedTestAgent(t)
+		sentinel := errors.New("read boom")
+		attempts := 0
+		a.captureProbe = func(attempt int) error {
+			attempts++
+			if attempt == 1 {
+				return sentinel
+			}
+			return nil
+		}
+		_, err := a.captureStateForSelection(a.session)
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("err = %v, want sentinel", err)
+		}
+		if attempts != 1 {
+			t.Fatalf("attempts = %d, want 1 (no later attempt)", attempts)
+		}
+	})
+
+	t.Run("read_error_attempt_2_after_mismatch", func(t *testing.T) {
+		a := newCatalogBackedTestAgent(t)
+		tr := a.session.transcript
+		sentinel := errors.New("read boom")
+		attempts := 0
+		a.captureProbe = func(attempt int) error {
+			attempts++
+			switch attempt {
+			case 1:
+				bumpCommit(tr)
+			case 2:
+				return sentinel
+			}
+			return nil
+		}
+		_, err := a.captureStateForSelection(a.session)
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("err = %v, want sentinel", err)
+		}
+		if attempts != 2 {
+			t.Fatalf("attempts = %d, want 2", attempts)
+		}
+	})
 }
 
 // TestCaptureStateCapturesPendingPermissions verifies the capture reads the
