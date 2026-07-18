@@ -18,6 +18,9 @@ type Manager struct {
 	home        string
 	onWarning   func(kind, message string)
 	onSignal    func(content string)
+	// closed is set by ShutdownAll so a server still starting during shutdown is
+	// torn down instead of registered after the shutdown snapshot.
+	closed bool
 }
 
 func NewManager(projectRoot, home string) *Manager {
@@ -89,6 +92,13 @@ func (m *Manager) startServer(ctx context.Context, def *server.Definition) {
 	}
 
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		// Shutdown began while this server was starting; tear it down so it is
+		// never left running after the shutdown snapshot.
+		inst.shutdown()
+		return
+	}
 	m.instances[def.Name] = inst
 	m.mu.Unlock()
 }
@@ -120,6 +130,7 @@ func (m *Manager) AllInstances() []*instance {
 
 func (m *Manager) ShutdownAll() {
 	m.mu.Lock()
+	m.closed = true
 	instances := make([]*instance, 0, len(m.instances))
 	for _, inst := range m.instances {
 		instances = append(instances, inst)
