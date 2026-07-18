@@ -132,17 +132,11 @@ func runCLI() error {
 }
 
 func runACP() error {
-	svc, err := ownerService(0)
+	ag, err := buildAgent()
 	if err != nil {
 		return err
 	}
-	if err := acp.New(svc).Run(context.Background()); err != nil {
-		return err
-	}
-	if waiter, ok := svc.(interface{ WaitOwner() error }); ok {
-		return waiter.WaitOwner()
-	}
-	return nil
+	return acp.New(ag).Run(context.Background())
 }
 
 func runServe(port int) error {

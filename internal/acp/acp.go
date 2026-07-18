@@ -50,17 +50,22 @@ type turnActionParams struct {
 
 // Runner drives the ACP stdio protocol.
 type Runner struct {
+	// agent is the concrete local owner this adapter constructs, initializes, and
+	// shuts down; owner is the same object typed for the concrete-only surface
+	// (complete-state hydration and ShutdownOwner).
 	agent agent.AdapterService
+	owner *agent.Agent
 	mu    sync.Mutex
+	in    io.Reader
 	out   io.Writer
 
 	viewOnce sync.Once
 	view     *agent.SessionView
 }
 
-// New creates an ACP Runner.
-func New(a agent.AdapterService) *Runner {
-	return &Runner{agent: a, out: os.Stdout}
+// New creates an ACP Runner that owns one concrete local agent.
+func New(a *agent.Agent) *Runner {
+	return &Runner{agent: a, owner: a, in: os.Stdin, out: os.Stdout}
 }
 
 // Run reads JSON-RPC requests from stdin and dispatches them. It
@@ -71,14 +76,6 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	r.agent.SetEventHandler(r.handleEvent)
 	r.agent.Init(ctx)
-	if lifecycle, ok := r.agent.(interface {
-		AttachAdapter(context.Context) error
-		DetachAdapter(context.Context) error
-	}); ok {
-		if err := lifecycle.AttachAdapter(ctx); err == nil {
-			defer lifecycle.DetachAdapter(context.Background())
-		}
-	}
 	sessionID := ""
 	if sessions, err := r.agent.SessionList("active"); err == nil && len(sessions) > 0 {
 		if summary, err := r.agent.OpenSession(sessions[0].ID); err == nil {
@@ -92,13 +89,14 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.setCurrentSessionID(sessionID)
 
-	scanner := bufio.NewScanner(os.Stdin)
+	scanner := bufio.NewScanner(r.in)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
 
+scan:
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
-			return nil
+			break scan
 		default:
 		}
 
@@ -120,6 +118,11 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.dispatch(ctx, req)
 	}
 
+	// Join the owner's in-flight turns and workers before the deferred cancel tears
+	// down the host context (the LSP teardown keys on it).
+	if r.owner != nil {
+		r.owner.ShutdownOwner()
+	}
 	return scanner.Err()
 }
 

@@ -12,10 +12,32 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 	lcconfig "github.com/MMinasyan/lightcode/internal/config"
 )
+
+// TestACPOwnsConcreteAgentLifecycle proves the runner initializes the concrete
+// owner it constructs, establishes a current session, and joins the owner cleanly
+// on stdin EOF without hanging.
+func TestACPOwnsConcreteAgentLifecycle(t *testing.T) {
+	ag := newACPTestAgent(t)
+	var out bytes.Buffer
+	r := &Runner{agent: ag, owner: ag, in: strings.NewReader(""), out: &out}
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Run hung joining the owner after stdin EOF")
+	}
+}
 
 func TestDispatchInitializeAndUnknownMethod(t *testing.T) {
 	var out bytes.Buffer
