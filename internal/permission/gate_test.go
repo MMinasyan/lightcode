@@ -7,6 +7,25 @@ import (
 	"time"
 )
 
+// --- PendingForSession snapshots only the named session's requests ---
+
+func TestGatePendingForSession(t *testing.T) {
+	gate := NewGate(func(ctx context.Context, req Request) {})
+
+	go gate.AskRequest(context.Background(), Request{SessionID: "s1", ToolName: "write_file", Arg: "a"})
+	go gate.AskRequest(context.Background(), Request{SessionID: "s2", ToolName: "write_file", Arg: "b"})
+	waitForPending(t, gate, 2)
+
+	if got := gate.PendingForSession("s1"); len(got) != 1 || got[0].SessionID != "s1" || got[0].ToolName != "write_file" {
+		t.Fatalf("PendingForSession(s1) = %#v, want one s1 write_file request", got)
+	}
+	if got := gate.PendingForSession("nope"); len(got) != 0 {
+		t.Fatalf("PendingForSession(nope) = %#v, want none", got)
+	}
+
+	gate.CancelAll()
+}
+
 // --- AskRequest happy path: Respond before ctx cancel ---
 
 func TestGateAskRequestHappyPath(t *testing.T) {

@@ -4313,15 +4313,16 @@ func (a *Agent) messagesForFrontendForSession(sessionID string) ([]DisplayMessag
 }
 
 // completeState is a session's complete live state: its transcript plus the
-// captured live classes read as one consistent set. Pending permissions and the
-// compacting flag are captured with their readers in a later change.
+// captured live classes read as one consistent set. The compacting flag is
+// captured with its reader in a later change.
 type completeState struct {
-	transcript completeTranscript
-	tokens     TokenReport
-	model      coremodel.ModelRef
-	busy       bool
-	queue      QueueState
-	warnings   []PromptWarning
+	transcript  completeTranscript
+	tokens      TokenReport
+	model       coremodel.ModelRef
+	busy        bool
+	queue       QueueState
+	warnings    []PromptWarning
+	permissions []permission.Request
 }
 
 // captureState reads a session's durable committed history outside the
@@ -4333,10 +4334,11 @@ func (a *Agent) captureState(unit *session) (completeState, error) {
 	if unit == nil || unit.store == nil || unit.transcript == nil {
 		return completeState{}, snapshot.ErrNoSession
 	}
+	sessionID := sessionIDOf(unit)
 	var committed []DisplayMessage
 	if unit.store.Active() {
 		var err error
-		committed, err = a.messagesForFrontendForStore(unit.store, sessionIDOf(unit))
+		committed, err = a.messagesForFrontendForStore(unit.store, sessionID)
 		if err != nil {
 			return completeState{}, err
 		}
@@ -4349,6 +4351,10 @@ func (a *Agent) captureState(unit *session) (completeState, error) {
 	busy := unit.busy
 	model := unit.currentRef
 	queue := rt.queueSnapshotLocked(unit)
+	var permissions []permission.Request
+	if a.gate != nil {
+		permissions = a.gate.PendingForSession(sessionID)
+	}
 
 	unit.tokensMu.Lock()
 	defer unit.tokensMu.Unlock()
@@ -4367,11 +4373,12 @@ func (a *Agent) captureState(unit *session) (completeState, error) {
 			errors:    tr.errorSnapshotLocked(),
 			revision:  tr.revisionLocked(),
 		},
-		tokens:   tokens,
-		model:    model,
-		busy:     busy,
-		queue:    queue,
-		warnings: warnings,
+		tokens:      tokens,
+		model:       model,
+		busy:        busy,
+		queue:       queue,
+		warnings:    warnings,
+		permissions: permissions,
 	}, nil
 }
 

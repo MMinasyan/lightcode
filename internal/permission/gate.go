@@ -126,6 +126,26 @@ func (g *Gate) CancelAll() {
 	}
 }
 
+// PendingForSession returns a snapshot of the pending requests owned by
+// sessionID, keyed by request id. The order is unspecified: consumers key by
+// Request.ID.
+func (g *Gate) PendingForSession(sessionID string) []Request {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var out []Request
+	for _, p := range g.pending {
+		if p.req.SessionID == sessionID {
+			req := p.req
+			// Detach the batch slices so the snapshot shares no backing array
+			// with the gate's live request.
+			req.BatchFiles = append([]string(nil), p.req.BatchFiles...)
+			req.BatchResolvedFiles = append([]string(nil), p.req.BatchResolvedFiles...)
+			out = append(out, req)
+		}
+	}
+	return out
+}
+
 // CancelSession resolves pending requests owned by sessionID as denied.
 func (g *Gate) CancelSession(sessionID string) int {
 	sessionID = strings.TrimSpace(sessionID)

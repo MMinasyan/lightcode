@@ -1,10 +1,13 @@
 package agent
 
 import (
+	"context"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/prompt"
 )
 
@@ -145,6 +148,33 @@ func TestCaptureTranscriptProvidesDurableTailAndErrors(t *testing.T) {
 	}
 	if ct.revision.committedTurn != 0 {
 		t.Fatalf("fresh session revision = %+v, want no commits", ct.revision)
+	}
+}
+
+// TestCaptureStateCapturesPendingPermissions verifies the capture reads the
+// session's pending permission requests under the gate lock.
+func TestCaptureStateCapturesPendingPermissions(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	unit := a.session
+	sessionID := sessionIDOf(unit)
+
+	permCtx, permCancel := context.WithCancel(context.Background())
+	defer permCancel()
+	go a.gate.AskRequest(permCtx, permission.Request{SessionID: sessionID, ToolName: "write_file", Arg: "x"})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for len(a.gate.PendingForSession(sessionID)) == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	st, err := a.captureState(unit)
+	if err != nil {
+		t.Fatalf("captureState: %v", err)
+	}
+	a.gate.CancelAll()
+
+	if len(st.permissions) != 1 || st.permissions[0].ToolName != "write_file" || st.permissions[0].SessionID != sessionID {
+		t.Fatalf("captured permissions = %#v, want one write_file for this session", st.permissions)
 	}
 }
 
