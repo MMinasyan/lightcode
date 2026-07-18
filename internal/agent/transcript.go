@@ -28,12 +28,25 @@ type transcript struct {
 	textOpen bool
 
 	tail []tailRow
+
+	// retainedErrors holds session-tagged errors kept independently of ordinary
+	// tail pruning. They are process-local (not durable) and draw from the same
+	// sequence as rows so they merge into display order.
+	retainedErrors []errorRow
 }
 
 // tailRow is one sequenced, uncommitted display row.
 type tailRow struct {
 	seq int
 	msg DisplayMessage
+}
+
+// errorRow is one retained session-tagged error as a display row, tagged with
+// the turn it belongs to for the revert and compaction dispositions.
+type errorRow struct {
+	seq  int
+	turn int
+	msg  DisplayMessage
 }
 
 // captureRevision identifies a coordinator state: the committed markers plus the
@@ -160,6 +173,62 @@ func (t *transcript) tailMessagesLocked() []DisplayMessage {
 	out := make([]DisplayMessage, len(t.tail))
 	for i, r := range t.tail {
 		out[i] = r.msg
+	}
+	return out
+}
+
+// appendErrorLocked retains a session-tagged error as a display row. It draws
+// from the same sequence as transcript rows so it merges into display order, and
+// it closes any open text span. Retained errors are not durable and ordinary
+// commits never prune them.
+func (t *transcript) appendErrorLocked(ev Event) {
+	t.textOpen = false
+	t.retainedErrors = append(t.retainedErrors, errorRow{
+		seq:  t.nextSeq,
+		turn: ev.Turn,
+		msg:  DisplayMessage{Type: "error", Content: ev.Error, Turn: ev.Turn},
+	})
+	t.nextSeq++
+}
+
+// dropErrorsAboveTurnLocked removes retained errors for turns above target. It is
+// the history-revert disposition: errors at or below the revert target survive.
+func (t *transcript) dropErrorsAboveTurnLocked(target int) {
+	t.retainedErrors = filterErrors(t.retainedErrors, func(e errorRow) bool { return e.turn <= target })
+}
+
+// dropErrorsThroughTurnLocked removes retained errors for turns at or below
+// through. It is the compaction disposition: errors in the transcript range the
+// compacted record replaces are removed.
+func (t *transcript) dropErrorsThroughTurnLocked(through int) {
+	t.retainedErrors = filterErrors(t.retainedErrors, func(e errorRow) bool { return e.turn > through })
+}
+
+// clearErrorsLocked removes all retained errors. It is the external-rebase and
+// lifecycle-removal disposition.
+func (t *transcript) clearErrorsLocked() {
+	t.retainedErrors = nil
+}
+
+// retainedErrorMessagesLocked returns a copy of the retained error rows in
+// sequence order, for a capture to merge with tail rows and durable history.
+func (t *transcript) retainedErrorMessagesLocked() []DisplayMessage {
+	if len(t.retainedErrors) == 0 {
+		return nil
+	}
+	out := make([]DisplayMessage, len(t.retainedErrors))
+	for i, e := range t.retainedErrors {
+		out[i] = e.msg
+	}
+	return out
+}
+
+func filterErrors(errs []errorRow, keep func(errorRow) bool) []errorRow {
+	var out []errorRow
+	for _, e := range errs {
+		if keep(e) {
+			out = append(out, e)
+		}
 	}
 	return out
 }

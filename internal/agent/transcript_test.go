@@ -113,6 +113,66 @@ func TestTranscriptCoordinatorToolMetadataAndSubagentLinks(t *testing.T) {
 	}
 }
 
+// TestTranscriptCoordinatorSessionErrorRetention verifies session-tagged errors are
+// retained as sequenced display rows, kept across ordinary commits, and disposed
+// per operation: history revert drops errors above its target turn, compaction
+// drops errors through its replaced range, and rebase/removal clears them.
+func TestTranscriptCoordinatorSessionErrorRetention(t *testing.T) {
+	tr := newTranscript()
+
+	tr.seqMu.Lock()
+	tr.appendEventLocked(Event{Kind: EventTurnStart, Turn: 1})
+	tr.appendEventLocked(Event{Kind: EventTextDelta, Result: "hello"})
+	tr.appendErrorLocked(Event{Kind: EventError, Error: "boom", Turn: 1})
+	tr.appendEventLocked(Event{Kind: EventToolCallStart, ToolCallID: "t1", ToolName: "x"})
+
+	// Rows and the error share one strictly increasing sequence.
+	rowSeq1 := tr.tail[0].seq
+	errSeq := tr.retainedErrors[0].seq
+	rowSeq2 := tr.tail[1].seq
+	if !(rowSeq1 < errSeq && errSeq < rowSeq2) {
+		t.Fatalf("error not sequenced between rows: row=%d err=%d row=%d", rowSeq1, errSeq, rowSeq2)
+	}
+	e := tr.retainedErrors[0]
+	if e.msg.Type != "error" || e.msg.Content != "boom" || e.turn != 1 {
+		t.Fatalf("retained error = %+v", e)
+	}
+
+	// Ordinary commit preserves the error: completed messages do not represent it.
+	tr.commitLocked(1)
+	if len(tr.retainedErrors) != 1 {
+		t.Fatalf("commit pruned retained error: %#v", tr.retainedErrors)
+	}
+	tr.seqMu.Unlock()
+
+	// History revert to turn 1 drops errors above turn 1, keeps turn 1.
+	tr.seqMu.Lock()
+	tr.appendErrorLocked(Event{Kind: EventError, Error: "later", Turn: 2})
+	tr.dropErrorsAboveTurnLocked(1)
+	if len(tr.retainedErrors) != 1 || tr.retainedErrors[0].turn != 1 {
+		t.Fatalf("history-revert disposition wrong: %#v", tr.retainedErrors)
+	}
+	tr.seqMu.Unlock()
+
+	// Compaction through turn 1 removes the turn-1 error.
+	tr.seqMu.Lock()
+	tr.dropErrorsThroughTurnLocked(1)
+	if len(tr.retainedErrors) != 0 {
+		t.Fatalf("compaction disposition kept turn-1 error: %#v", tr.retainedErrors)
+	}
+	tr.seqMu.Unlock()
+
+	// Rebase/removal clears everything.
+	tr.seqMu.Lock()
+	tr.appendErrorLocked(Event{Kind: EventError, Error: "x", Turn: 3})
+	tr.clearErrorsLocked()
+	empty := len(tr.retainedErrors) == 0 && tr.retainedErrorMessagesLocked() == nil
+	tr.seqMu.Unlock()
+	if !empty {
+		t.Fatal("rebase/removal did not clear retained errors")
+	}
+}
+
 // TestTranscriptCoordinatorCommit verifies the commit cursor partitions
 // state exactly: a committed turn clears the retained tail and advances the
 // committed markers to the sequence high-water, later preseeds keep sequence
