@@ -288,6 +288,36 @@ func DeleteSession(sessionsRoot, id string) error {
 	return nil
 }
 
+// NewStagingSessionsRoot allocates a fresh unlisted staging sessions root for a
+// candidate under the same project as sessionsRoot: a sibling of the sessions
+// directory. Session enumeration skips the .staging namespace, so a candidate
+// prepared there is invisible until an atomic rename publishes it. The nonce
+// disambiguates concurrent candidates.
+func NewStagingSessionsRoot(sessionsRoot string) (string, error) {
+	nonce, err := newSessionID()
+	if err != nil {
+		return "", fmt.Errorf("snapshot: staging nonce: %w", err)
+	}
+	return filepath.Join(filepath.Dir(sessionsRoot), ".staging", "sessions", nonce), nil
+}
+
+// PublishStagedSession atomically publishes a staged session into the real
+// sessions namespace by renaming <stagingRoot>/<id> to <finalSessionsRoot>/<id>.
+// The rename is the single durable commit; the caller relocates the candidate
+// store's cached paths and removes the now-empty staging parent afterward.
+func PublishStagedSession(stagingRoot, finalSessionsRoot, id string) error {
+	if err := ValidateSessionID(id); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(finalSessionsRoot, 0o700); err != nil {
+		return fmt.Errorf("snapshot: publish staged: %w", err)
+	}
+	if err := os.Rename(filepath.Join(stagingRoot, id), filepath.Join(finalSessionsRoot, id)); err != nil {
+		return fmt.Errorf("snapshot: publish staged %s: %w", id, err)
+	}
+	return nil
+}
+
 func effectiveState(s string) string {
 	if s == "" {
 		return StateActive

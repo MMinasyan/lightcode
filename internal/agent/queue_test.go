@@ -369,7 +369,7 @@ func TestApplyTurnActionSessionChangesClearQueueAndBumpVersionMonotonically(t *t
 		if !res.SessionChanged || res.Session.ID == "" || res.Session.ID == before {
 			t.Fatalf("fork result = %#v, before session %q", res, before)
 		}
-		assertQueueClearedAfterVersion(t, a, cap, 30)
+		assertForkQueuePreservesSource(t, a, before, 30)
 	})
 }
 
@@ -403,7 +403,7 @@ func TestDirectRevertAndForkClearQueueAndBumpVersionMonotonically(t *testing.T) 
 		if got := a.SessionCurrent().ID; got == "" || got == before {
 			t.Fatalf("current session after ForkSession = %q, before %q", got, before)
 		}
-		assertQueueClearedAfterVersion(t, a, cap, 50)
+		assertForkQueuePreservesSource(t, a, before, 50)
 	})
 }
 
@@ -944,5 +944,22 @@ func assertQueueClearedAfterVersion(t *testing.T, a *Agent, cap *eventCapture, p
 	}
 	if !sawEvent {
 		t.Fatalf("missing queue_changed event for version %d: %#v", got.Version, cap.snapshot())
+	}
+}
+
+// assertForkQueuePreservesSource verifies fork queue semantics: the source
+// session stays live and keeps its queued input at its version, while the new
+// current fork starts with an empty queue.
+func assertForkQueuePreservesSource(t *testing.T, a *Agent, sourceID string, sourceVersion int) {
+	t.Helper()
+	src, err := a.QueueSnapshotForSession(sourceID)
+	if err != nil {
+		t.Fatalf("source queue after fork: %v", err)
+	}
+	if len(src.Items) != 1 || src.Version != sourceVersion {
+		t.Fatalf("source queue after fork = %#v (version %d), want 1 item at version %d", src.Items, src.Version, sourceVersion)
+	}
+	if cur := a.QueueSnapshot(); len(cur.Items) != 0 {
+		t.Fatalf("fork queue = %#v, want empty", cur.Items)
 	}
 }

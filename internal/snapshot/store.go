@@ -105,6 +105,17 @@ func NewForSessionsRoot(sessionsRoot, projectsRoot, projectID string) (*Store, e
 	}, nil
 }
 
+// NewStagingStore returns a Store rooted at stagingRoot but carrying this
+// store's project context, so a candidate prepared under staging claims the
+// same per-session lock namespace as this store and, once its directory is
+// renamed into the real sessions root, needs no reclaim.
+func (s *Store) NewStagingStore(stagingRoot string) (*Store, error) {
+	s.mu.Lock()
+	projectsRoot, projectID := s.projectsRoot, s.projectID
+	s.mu.Unlock()
+	return NewForSessionsRoot(stagingRoot, projectsRoot, projectID)
+}
+
 // AttachSessionsRoot swaps the store's sessions root and project
 // bookkeeping. Used for the lazy project-creation path: a Store built
 // with NewEmpty gets its real root once the first session is created.
@@ -941,10 +952,13 @@ func (s *Store) RevertHistory(toTurn int) error {
 	return nil
 }
 
-// ForkInto copies turns 1..toTurn (both snapshots and messages) into a
-// new session directory. The current session is untouched. Returns the
-// path of the new session dir. Caller is responsible for switching to it.
-func (s *Store) ForkInto(toTurn int) (string, string, error) {
+// ForkInto copies turns 1..toTurn (both snapshots and messages) from the
+// current session into a new session directory under destSessionsRoot. The
+// current session is untouched. Returns the new session id and dir. The caller
+// loads the copy through a store rooted at destSessionsRoot; for staged
+// publication destSessionsRoot is an unlisted staging root later renamed
+// atomically into the session namespace.
+func (s *Store) ForkInto(toTurn int, destSessionsRoot string) (string, string, error) {
 	s.mu.Lock()
 	defer func() {
 		forkIntoLockReleasedHook()
@@ -954,14 +968,13 @@ func (s *Store) ForkInto(toTurn int) (string, string, error) {
 		return "", "", ErrNoSession
 	}
 	srcDir := s.dir
-	root := s.root
 	projectRoot := s.projectRoot
 
 	newID, err := newSessionID()
 	if err != nil {
 		return "", "", fmt.Errorf("snapshot: fork: generate id: %w", err)
 	}
-	newDir := filepath.Join(root, newID)
+	newDir := filepath.Join(destSessionsRoot, newID)
 	newSnapshots := filepath.Join(newDir, "snapshots")
 	newTurns := filepath.Join(newDir, "turns")
 	for _, p := range []string{newSnapshots, newTurns} {
@@ -970,41 +983,67 @@ func (s *Store) ForkInto(toTurn int) (string, string, error) {
 		}
 	}
 
-	// Copy snapshot and turn dirs for turns 1..toTurn.
+	// Copy snapshot and turn dirs for turns 1..toTurn. A missing turn dir is
+	// skipped; any other stat or copy error fails the fork so a partial or
+	// silently truncated candidate is never published.
 	for turn := 1; turn <= toTurn; turn++ {
 		ts := strconv.Itoa(turn)
 		srcSnap := filepath.Join(srcDir, "snapshots", ts)
-		if info, err := os.Stat(srcSnap); err == nil && info.IsDir() {
+		if info, err := os.Stat(srcSnap); err == nil {
+			if !info.IsDir() {
+				return "", "", fmt.Errorf("snapshot: fork: snapshots/%d is not a directory", turn)
+			}
 			if err := copyDirFunc(srcSnap, filepath.Join(newSnapshots, ts)); err != nil {
 				return "", "", fmt.Errorf("snapshot: fork: copy snapshots/%d: %w", turn, err)
 			}
+		} else if !os.IsNotExist(err) {
+			return "", "", fmt.Errorf("snapshot: fork: stat snapshots/%d: %w", turn, err)
 		}
 		srcTurn := filepath.Join(srcDir, "turns", ts)
-		if info, err := os.Stat(srcTurn); err == nil && info.IsDir() {
+		if info, err := os.Stat(srcTurn); err == nil {
+			if !info.IsDir() {
+				return "", "", fmt.Errorf("snapshot: fork: turns/%d is not a directory", turn)
+			}
 			if err := copyDirFunc(srcTurn, filepath.Join(newTurns, ts)); err != nil {
 				return "", "", fmt.Errorf("snapshot: fork: copy turns/%d: %w", turn, err)
 			}
+		} else if !os.IsNotExist(err) {
+			return "", "", fmt.Errorf("snapshot: fork: stat turns/%d: %w", turn, err)
 		}
 	}
 
-	// Copy tokens.json if present.
+	// Copy tokens.json if present; a real read/copy error fails the fork.
 	srcTokens := filepath.Join(srcDir, "tokens.json")
 	if _, err := os.Stat(srcTokens); err == nil {
-		_ = copyFile(srcTokens, filepath.Join(newDir, "tokens.json"))
+		if err := copyFile(srcTokens, filepath.Join(newDir, "tokens.json")); err != nil {
+			return "", "", fmt.Errorf("snapshot: fork: copy tokens: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", "", fmt.Errorf("snapshot: fork: stat tokens: %w", err)
 	}
 
 	// Copy compaction.json only when its boundary exists in the forked history.
 	srcCompaction := filepath.Join(srcDir, "compaction.json")
 	if _, err := os.Stat(srcCompaction); err == nil {
 		var rec CompactionRecord
-		if err := readJSON(srcCompaction, &rec); err == nil && rec.BoundaryTurn <= toTurn {
-			_ = copyFile(srcCompaction, filepath.Join(newDir, "compaction.json"))
+		if err := readJSON(srcCompaction, &rec); err != nil {
+			return "", "", fmt.Errorf("snapshot: fork: read compaction: %w", err)
 		}
+		if rec.BoundaryTurn <= toTurn {
+			if err := copyFile(srcCompaction, filepath.Join(newDir, "compaction.json")); err != nil {
+				return "", "", fmt.Errorf("snapshot: fork: copy compaction: %w", err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return "", "", fmt.Errorf("snapshot: fork: stat compaction: %w", err)
 	}
 
-	// Read source meta to carry over model fields.
+	// Read source meta to carry over model and agent-type fields; a read error
+	// fails the fork rather than publishing a candidate with blank metadata.
 	var srcMeta SessionMeta
-	_ = readJSON(filepath.Join(srcDir, "meta.json"), &srcMeta)
+	if err := readJSON(filepath.Join(srcDir, "meta.json"), &srcMeta); err != nil {
+		return "", "", fmt.Errorf("snapshot: fork: read source meta: %w", err)
+	}
 
 	// Write meta.json for the new session.
 	now := time.Now()
@@ -1018,6 +1057,7 @@ func (s *Store) ForkInto(toTurn int) (string, string, error) {
 		LastActivity:     now.Unix(),
 		Provider:         srcMeta.Provider,
 		Model:            srcMeta.Model,
+		ActiveAgentType:  srcMeta.ActiveAgentType,
 	}
 	if err := writeJSON(filepath.Join(newDir, "meta.json"), meta); err != nil {
 		return "", "", fmt.Errorf("snapshot: fork: write meta: %w", err)

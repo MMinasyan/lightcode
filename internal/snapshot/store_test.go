@@ -29,7 +29,7 @@ func TestForkIntoCopiesCompaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, forkDir, err := store.ForkInto(turn)
+	_, forkDir, err := store.ForkInto(turn, store.Root())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestForkIntoOmitsCompactionPastForkTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, forkDir, err := store.ForkInto(2)
+	_, forkDir, err := store.ForkInto(2, store.Root())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -977,6 +977,29 @@ func TestLoadCompleteTurnsWithoutSessionReturnsErrNoSession(t *testing.T) {
 	}
 }
 
+func TestForkIntoPreservesActiveAgentType(t *testing.T) {
+	store := newTestStore(t)
+	turn := store.BeginTurn()
+	mustAppendMessage(t, store, turn, `{"role":"user","content":"turn"}`)
+	if err := store.MarkTurnComplete(turn); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetActiveAgentType("reviewer"); err != nil {
+		t.Fatal(err)
+	}
+	newID, _, err := store.ForkInto(1, store.Root())
+	if err != nil {
+		t.Fatalf("ForkInto: %v", err)
+	}
+	meta, err := LoadSessionMeta(store.Root(), newID)
+	if err != nil {
+		t.Fatalf("LoadSessionMeta: %v", err)
+	}
+	if meta.ActiveAgentType != "reviewer" {
+		t.Fatalf("fork ActiveAgentType = %q, want reviewer", meta.ActiveAgentType)
+	}
+}
+
 func TestForkIntoCopiesTurnsUpToTargetAndCanBeLoaded(t *testing.T) {
 	store := newTestStore(t)
 	if err := store.SetModel("openrouter", "test/model"); err != nil {
@@ -990,7 +1013,7 @@ func TestForkIntoCopiesTurnsUpToTargetAndCanBeLoaded(t *testing.T) {
 		}
 	}
 
-	newID, newDir, err := store.ForkInto(2)
+	newID, newDir, err := store.ForkInto(2, store.Root())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1328,7 +1351,7 @@ func TestPR11Closure_ForkIntoSerializesWithConcurrentMutation(t *testing.T) {
 		}
 		forkResults := make(chan forkResult, 1)
 		go func() {
-			_, newDir, err := store.ForkInto(5)
+			_, newDir, err := store.ForkInto(5, store.Root())
 			forkResults <- forkResult{newDir, err}
 		}()
 		<-firstCopyStarted
@@ -1414,7 +1437,7 @@ func TestPR11Closure_ForkIntoSerializesWithConcurrentMutation(t *testing.T) {
 		}
 		forkResults := make(chan forkResult, 1)
 		go func() {
-			_, newDir, err := store.ForkInto(3)
+			_, newDir, err := store.ForkInto(3, store.Root())
 			forkResults <- forkResult{newDir, err}
 		}()
 		<-firstCopyStarted

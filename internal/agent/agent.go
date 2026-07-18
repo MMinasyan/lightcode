@@ -2026,6 +2026,29 @@ func (a *Agent) restoreModelFromSessionForSession(unit *session) {
 	a.setActiveModelForSessionLocked(unit, ref, client, model)
 }
 
+// inheritActiveModelLocked gives the fork the source unit's live active model,
+// preferring the in-memory selection over persisted metadata so an unpersisted
+// model switch is not lost, and persists it into the candidate so the fork
+// reopens on the same model. A source with no live selection keeps the persisted
+// model. Reconstruction or persistence of a live selection fails the fork before
+// publication rather than silently substituting a different model.
+func (a *Agent) inheritActiveModelLocked(candidate, source *session) error {
+	ref := source.currentRef
+	if ref.Provider == "" || ref.Model == "" {
+		a.restoreModelFromSessionForSession(candidate)
+		return nil
+	}
+	client, model, err := newProviderClient(a.catalog, ref)
+	if err != nil {
+		return fmt.Errorf("fork model %s/%s: %w", ref.Provider, ref.Model, err)
+	}
+	a.setActiveModelForSessionLocked(candidate, ref, client, model)
+	if err := candidate.store.SetModel(ref.Provider, ref.Model); err != nil {
+		return fmt.Errorf("fork persist model: %w", err)
+	}
+	return nil
+}
+
 func (a *Agent) loadHistoryIntoLoop() error {
 	return a.loadHistoryIntoLoopForSession(a.session)
 }
@@ -4450,39 +4473,24 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		target := turn
 		result.TargetTurn = target
 		result.SessionChanged = true
-		if alsoRevertCode {
-			revertResult, err := unit.store.RevertCode(target)
-			if err != nil {
-				return TurnActionResult{}, err
-			}
-			result.RestoredFiles = revertResult.Restored
-			result.SkippedFiles = revertResult.Skipped
-		}
-		oldID := unit.store.SessionID()
-		newID, _, err := unit.store.ForkInto(target)
+		candidate, err := a.forkUnitStagedLocked(unit, target)
 		if err != nil {
 			return TurnActionResult{}, err
 		}
-		if _, err := unit.store.Close(); err != nil {
-			return TurnActionResult{}, err
+		// Code revert runs only after the fork is published, so a fork failure
+		// never mutates the working tree. It is best-effort against the source
+		// store, which retains the post-target snapshots needed to undo later
+		// changes: a revert error keeps the partial result rather than failing
+		// the already-committed fork.
+		if alsoRevertCode {
+			revertResult, revertErr := unit.store.RevertCode(target)
+			result.RestoredFiles = revertResult.Restored
+			result.SkippedFiles = revertResult.Skipped
+			if revertErr != nil {
+				fmt.Fprintf(os.Stderr, "lightcode: fork code revert: %v\n", revertErr)
+			}
 		}
-		// Old session irreversibly detached by the fork's Close: clear here,
-		// before LoadSession (which may fail and leave no active session).
-		_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLockedForSession(unit)
-		if err := unit.store.LoadSession(newID); err != nil {
-			return TurnActionResult{}, err
-		}
-		delete(a.sessions, oldID)
-		a.registerLiveSessionLocked(unit)
-		if a.currentSessionID == oldID {
-			a.currentSessionID = newID
-		}
-		if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
-			return TurnActionResult{}, err
-		}
-		a.resetFileTrackerForSession(unit)
-		a.loadTokensFromDiskForSession(unit)
-		return a.populateTurnActionResultForSession(unit, result), nil
+		return a.populateTurnActionResultForSession(candidate, result), nil
 
 	default:
 		return TurnActionResult{}, fmt.Errorf("unknown turn action %q", action)
@@ -4607,6 +4615,89 @@ func (a *Agent) revertHistoryForSession(unit *session, turn int) error {
 	return nil
 }
 
+// cleanupStaging removes a fork's staging directory after a preparation
+// failure, joining any cleanup error with the original cause so neither is lost.
+func cleanupStaging(stagingRoot string, cause error) error {
+	if err := os.RemoveAll(stagingRoot); err != nil {
+		return errors.Join(cause, fmt.Errorf("snapshot: fork staging cleanup: %w", err))
+	}
+	return cause
+}
+
+// forkUnitStagedLocked forks unit at the given turn through staged publication.
+// The source session is copied into an unlisted staging directory and loaded
+// through a separate candidate store while the source stays live and claimed.
+// The single durable commit is the atomic rename of the validated candidate
+// into the session namespace; only then is the new fork registered as its own
+// live unit and, when the source was current, selected. Any preparation or
+// rename failure leaves the source unchanged and removes only its staging
+// directory. Caller holds rt.mu.
+func (a *Agent) forkUnitStagedLocked(unit *session, turn int) (*session, error) {
+	if unit == nil || unit.store == nil || !unit.store.Active() {
+		return nil, snapshot.ErrNoSession
+	}
+	if err := unitMutableLocked(unit); err != nil {
+		return nil, err
+	}
+	oldID := unit.store.SessionID()
+	sessionsRoot := unit.store.Root()
+	stagingRoot, err := snapshot.NewStagingSessionsRoot(sessionsRoot)
+	if err != nil {
+		return nil, err
+	}
+	// Copy the source into staging; the source store stays authoritative.
+	newID, _, err := unit.store.ForkInto(turn, stagingRoot)
+	if err != nil {
+		return nil, cleanupStaging(stagingRoot, err)
+	}
+	// Prepare a separate candidate store and unit against the staged copy. The
+	// source (oldID) and candidate (newID) claims are both held here.
+	candidateStore, err := unit.store.NewStagingStore(stagingRoot)
+	if err != nil {
+		return nil, cleanupStaging(stagingRoot, err)
+	}
+	if err := candidateStore.LoadSession(newID); err != nil {
+		return nil, cleanupStaging(stagingRoot, err)
+	}
+	candidate, _, err := a.rootRunningUnitLocked(candidateStore, unit.activeAgentType, unit.projectID, unit.projectName, unit.projectRoot)
+	if err != nil {
+		candidateStore.Detach()
+		return nil, cleanupStaging(stagingRoot, err)
+	}
+	if err := a.loadHistoryIntoLoopForSession(candidate); err != nil {
+		candidateStore.Detach()
+		return nil, cleanupStaging(stagingRoot, err)
+	}
+	// Prepare all remaining candidate state from the staged copy before the
+	// durable commit, so no fallible read runs after the rename.
+	a.resetFileTrackerForSession(candidate)
+	a.loadTokensFromDiskForSession(candidate)
+	if err := a.inheritActiveModelLocked(candidate, unit); err != nil {
+		candidateStore.Detach()
+		return nil, cleanupStaging(stagingRoot, err)
+	}
+	// Durable commit: the atomic rename publishes the candidate. The source is
+	// still authoritative until it succeeds.
+	if err := snapshot.PublishStagedSession(stagingRoot, sessionsRoot, newID); err != nil {
+		candidateStore.Detach()
+		return nil, cleanupStaging(stagingRoot, err)
+	}
+	if err := candidateStore.RelocateActiveSessionPaths(sessionsRoot); err != nil {
+		candidateStore.Detach()
+		return nil, err
+	}
+	// Post-commit publication is infallible: drop the empty staging parent, then
+	// register the fork as its own live unit, selecting it only when the source
+	// was current.
+	_ = os.RemoveAll(stagingRoot)
+	if a.currentSessionID == oldID {
+		a.setCurrentSessionLocked(candidate)
+	} else {
+		a.registerLiveSessionLocked(candidate)
+	}
+	return candidate, nil
+}
+
 // ForkSession creates a new session branched from the given turn.
 func (a *Agent) ForkSession(turn int) error {
 	return a.forkSessionForSession(a.session, turn)
@@ -4622,48 +4713,10 @@ func (a *Agent) ForkSessionForSession(sessionID string, turn int) error {
 }
 
 func (a *Agent) forkSessionForSession(unit *session, turn int) error {
-	var clearedVersion int
-	var queueCleared bool
-	var eventSessionID string
-	var eventProjectID string
-	defer func() {
-		if queueCleared {
-			a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
-		}
-	}()
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
-	if unit == nil || unit.store == nil || !unit.store.Active() {
-		return snapshot.ErrNoSession
-	}
-	if err := unitMutableLocked(unit); err != nil {
-		return err
-	}
-	eventSessionID = sessionIDOf(unit)
-	eventProjectID = unit.projectID
-	oldID := unit.store.SessionID()
-	newID, _, err := unit.store.ForkInto(turn)
-	if err != nil {
-		return err
-	}
-	if _, err := unit.store.Close(); err != nil {
-		return err
-	}
-	_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLockedForSession(unit)
-	if err := unit.store.LoadSession(newID); err != nil {
-		return err
-	}
-	delete(a.sessions, oldID)
-	a.registerLiveSessionLocked(unit)
-	if a.currentSessionID == oldID {
-		a.currentSessionID = newID
-	}
-	if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
-		return err
-	}
-	a.resetFileTrackerForSession(unit)
-	a.loadTokensFromDiskForSession(unit)
-	return nil
+	_, err := a.forkUnitStagedLocked(unit, turn)
+	return err
 }
 
 // SnapshotList returns the timeline of all snapshots in the session.
