@@ -13,9 +13,10 @@
 
   async function respond(action) {
     if (!permission) return;
+    const id = permission.id;
     try {
-      await RespondPermission(permission.sessionId || '', permission.id, action);
-      reset();
+      await RespondPermission(permission.sessionId || '', id, action);
+      reset(id);
     } catch (e) {
       dispatch('error', errorText(e));
     }
@@ -44,24 +45,25 @@
 
   async function saveSuggestions() {
     if (!permission) return;
+    const id = permission.id;
     const patterns = Object.keys(selected);
     if (patterns.length === 0) return;
     saving = true;
     try {
-      await SaveProjectPermission(permission.sessionId || '', permission.id, patterns);
-      reset();
+      await SaveProjectPermission(permission.sessionId || '', id, patterns);
+      reset(id);
     } catch (e) {
       saving = false;
       dispatch('error', errorText(e));
     }
   }
 
-  function reset() {
+  function reset(id) {
     showSuggest = false;
     suggestions = [];
     selected = {};
     saving = false;
-    onDone();
+    onDone(id);
   }
 </script>
 

@@ -3,6 +3,7 @@
   import { EventsOn } from '../wailsjs/runtime/runtime';
   import { Submit, ApplyTurnAction, CurrentModel, ProjectName, SessionCurrent, CompactNow, HydrateSession } from '../wailsjs/go/main/App';
   import { admitSequenced, newTranscriptGate, snapshotMessages } from './lib/hydration.js';
+  import { permissionList, removePermission, seedPermissions, upsertPermission } from './lib/permissions.js';
   import Toolbar from './components/Toolbar.svelte';
   import MessageList from './components/MessageList.svelte';
   import InputArea from './components/InputArea.svelte';
@@ -74,8 +75,8 @@
   let showProjectSelector = false;
   let showSettings = false;
   let settingsSection = 'appearance';
-  let permissionQueue = [];
-  $: currentPermission = permissionQueue[0] || null;
+  let permissions = new Map(); // pending permission requests keyed by request id
+  $: currentPermission = permissionList(permissions)[0] || null;
   let inputArea;
   let streamingIdx = -1;
   let tokens = { total: { cache:0, input:0, output:0, known:true }, perModel: [], contextUsed: 0, contextWindow: 0 };
@@ -165,6 +166,7 @@
     lastQueueVersion = hs.queue?.version || 0;
     messageQueue = (hs.queue?.items || []).map((it) => ({ _id: it.id, content: it.content }));
     warnings = hs.warnings || [];
+    permissions = seedPermissions(hs.permissions);
   }
 
   async function hydrate() {
@@ -285,7 +287,9 @@
     EventsOn('turn_end', buffered(async (data) => {
       closeStreaming();
       busy = false;
-      permissionQueue = [];
+      // A pending request blocks its turn, so a turn end (including a cancel) leaves
+      // no request that still needs an answer.
+      permissions = {};
       try {
         const cur = await SessionCurrent();
         if (cur?.id) sessionId = cur.id;
@@ -301,7 +305,7 @@
 
     EventsOn('status', buffered((data) => { status = data.state; }));
 
-    EventsOn('permission_request', buffered((data) => { permissionQueue = [...permissionQueue, data]; }));
+    EventsOn('permission_request', buffered((data) => { permissions = upsertPermission(permissions, data); }));
 
     EventsOn('compaction_start', buffered(() => { compacting = true; }));
     EventsOn('compaction_end', buffered(() => { compacting = false; }));
@@ -462,7 +466,7 @@
   {/if}
 
   {#if currentPermission}
-    <PermissionPrompt permission={currentPermission} onDone={() => { permissionQueue = permissionQueue.slice(1); }} on:error={(e) => showError(e.detail)} />
+    <PermissionPrompt permission={currentPermission} onDone={(id) => { permissions = removePermission(permissions, id); }} on:error={(e) => showError(e.detail)} />
   {/if}
   {#if showTokens}
     <TokenDetails {tokens} on:close={() => showTokens=false} />
