@@ -113,6 +113,38 @@ func TestTranscriptCoordinatorToolMetadataAndSubagentLinks(t *testing.T) {
 	}
 }
 
+// TestCaptureTranscriptProvidesDurableTailAndErrors verifies the capture reads the
+// durable committed history plus the coordinator's retained tail, retained
+// errors, and revision as one consistent set, preserving the shared sequence.
+func TestCaptureTranscriptProvidesDurableTailAndErrors(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	unit := a.session
+
+	tr := unit.transcript
+	tr.seqMu.Lock()
+	tr.appendEventLocked(Event{Kind: EventTurnStart, Turn: 1})
+	tr.appendEventLocked(Event{Kind: EventTextDelta, Result: "hi"})
+	tr.appendErrorLocked(Event{Kind: EventError, Error: "boom", Turn: 1})
+	tr.seqMu.Unlock()
+
+	ct, err := a.captureTranscript(unit)
+	if err != nil {
+		t.Fatalf("captureTranscript: %v", err)
+	}
+	if len(ct.tail) != 1 || ct.tail[0].msg.Content != "hi" {
+		t.Fatalf("captured tail = %#v", ct.tail)
+	}
+	if len(ct.errors) != 1 || ct.errors[0].msg.Content != "boom" {
+		t.Fatalf("captured errors = %#v", ct.errors)
+	}
+	if ct.tail[0].seq >= ct.errors[0].seq {
+		t.Fatalf("tail seq %d must precede error seq %d", ct.tail[0].seq, ct.errors[0].seq)
+	}
+	if ct.revision.committedTurn != 0 {
+		t.Fatalf("fresh session revision = %+v, want no commits", ct.revision)
+	}
+}
+
 // TestTranscriptCoordinatorSessionErrorRetention verifies session-tagged errors are
 // retained as sequenced display rows, kept across ordinary commits, and disposed
 // per operation: history revert drops errors above its target turn, compaction

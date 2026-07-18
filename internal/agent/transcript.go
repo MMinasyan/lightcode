@@ -249,3 +249,34 @@ func filterErrors(errs []errorRow, keep func(errorRow) bool) []errorRow {
 	}
 	return out
 }
+
+// completeTranscript is the transcript portion of a session's complete live
+// state: durable committed rows read from history, the retained uncommitted
+// tail, retained session errors, and the capture revision. Tail and error rows
+// keep their sequence so a consumer can interleave them into display order.
+type completeTranscript struct {
+	committed []DisplayMessage
+	tail      []tailRow
+	errors    []errorRow
+	revision  captureRevision
+}
+
+// tailSnapshotLocked returns a copy of the retained tail preserving sequence.
+func (t *transcript) tailSnapshotLocked() []tailRow {
+	if len(t.tail) == 0 {
+		return nil
+	}
+	out := make([]tailRow, len(t.tail))
+	copy(out, t.tail)
+	return out
+}
+
+// errorSnapshotLocked returns a copy of the retained errors preserving sequence.
+func (t *transcript) errorSnapshotLocked() []errorRow {
+	if len(t.retainedErrors) == 0 {
+		return nil
+	}
+	out := make([]errorRow, len(t.retainedErrors))
+	copy(out, t.retainedErrors)
+	return out
+}

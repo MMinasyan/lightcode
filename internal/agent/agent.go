@@ -4312,6 +4312,34 @@ func (a *Agent) messagesForFrontendForSession(sessionID string) ([]DisplayMessag
 	return a.messagesForFrontendForStore(a.store, sessionID)
 }
 
+// captureTranscript reads a session's durable committed history outside the
+// sequence lock (it does I/O), then snapshots the coordinator's retained tail,
+// retained errors, and revision under seqMu so the live pieces form one
+// consistent set. This is the single-read shape; a live-selection capture layers
+// revision revalidation on top.
+func (a *Agent) captureTranscript(unit *session) (completeTranscript, error) {
+	if unit == nil || unit.store == nil || unit.transcript == nil {
+		return completeTranscript{}, snapshot.ErrNoSession
+	}
+	var committed []DisplayMessage
+	if unit.store.Active() {
+		var err error
+		committed, err = a.messagesForFrontendForStore(unit.store, sessionIDOf(unit))
+		if err != nil {
+			return completeTranscript{}, err
+		}
+	}
+	tr := unit.transcript
+	tr.seqMu.Lock()
+	defer tr.seqMu.Unlock()
+	return completeTranscript{
+		committed: committed,
+		tail:      tr.tailSnapshotLocked(),
+		errors:    tr.errorSnapshotLocked(),
+		revision:  tr.revisionLocked(),
+	}, nil
+}
+
 func (a *Agent) messagesForFrontendForStore(store *snapshot.Store, sessionID string) ([]DisplayMessage, error) {
 	if store == nil {
 		return nil, snapshot.ErrNoSession
