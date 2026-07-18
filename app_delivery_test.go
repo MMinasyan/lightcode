@@ -179,6 +179,82 @@ func TestWailsDeliveryFIFOEmitsFramesInOrder(t *testing.T) {
 	}
 }
 
+// TestWailsDeliveryAppliesTitleAfterFrame proves the drainer applies a frame's
+// window title in the same ordered step, right after emitting the frame and before
+// the next, so a stalled boundary withholds its title too.
+func TestWailsDeliveryAppliesTitleAfterFrame(t *testing.T) {
+	a := &App{ctx: context.Background()}
+	var mu sync.Mutex
+	var order []string
+	a.emitFn = func(name string, _ any) { mu.Lock(); order = append(order, "emit:"+name); mu.Unlock() }
+	a.titleFn = func(title string) { mu.Lock(); order = append(order, "title:"+title); mu.Unlock() }
+	a.startDelivery()
+	defer a.closeDelivery()
+
+	a.emitFrameTitled("navigation", nil, "Project B")
+	a.emitFrame("token", nil)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := len(order)
+		mu.Unlock()
+		if n == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("drained %d of 3 items: %v", n, order)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"emit:navigation", "title:Project B", "emit:token"}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("delivery order = %v, want %v", order, want)
+		}
+	}
+}
+
+// TestWailsDeliveryDropsTitleAfterClose proves a boundary's window title is not
+// applied after close: if the boundary's emit blocks and close abandons the
+// drainer, the title must not change once shutdown has proceeded.
+func TestWailsDeliveryDropsTitleAfterClose(t *testing.T) {
+	old := deliveryJoinTimeout
+	deliveryJoinTimeout = 50 * time.Millisecond
+	defer func() { deliveryJoinTimeout = old }()
+
+	a := &App{ctx: context.Background()}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var titles []string
+	a.emitFn = func(string, any) { close(entered); <-release } // block the boundary's emit
+	a.titleFn = func(title string) { mu.Lock(); titles = append(titles, title); mu.Unlock() }
+	a.startDelivery()
+	a.emitFrameTitled("navigation", nil, "Project B")
+	<-entered // the drainer is blocked inside the boundary's emit
+
+	done := make(chan struct{})
+	go func() { a.closeDelivery(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("closeDelivery did not return")
+	}
+
+	close(release)                     // unblock the emit; the drainer reaches the title step
+	time.Sleep(100 * time.Millisecond) // give it a chance to (wrongly) apply the title
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(titles) != 0 {
+		t.Fatalf("title applied after close: %v", titles)
+	}
+}
+
 // TestWailsDeliveryCloseJoinsAndRejects verifies close drains and joins the
 // drainer, then rejects further frames.
 func TestWailsDeliveryCloseJoinsAndRejects(t *testing.T) {

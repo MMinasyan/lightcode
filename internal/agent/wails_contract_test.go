@@ -476,7 +476,7 @@ func extractSvelteFunctionBody(source, prefix string) (string, bool) {
 }
 
 func TestBackendEmittedEventsAreListenedToByFrontend(t *testing.T) {
-	emitted := collectContractMatches(t, filepath.Join("..", ".."), ".go", `(?:EventsEmit\([^,]+,\s*|emitFrame\(\s*)["']([^"']+)["']`)
+	emitted := collectContractMatches(t, filepath.Join("..", ".."), ".go", `(?:EventsEmit\([^,]+,\s*|emitFrame(?:Titled)?\(\s*)["']([^"']+)["']`)
 	listened := stringSet(collectContractMatches(t, filepath.Join("..", "..", "frontend", "src"), ".svelte", `EventsOn\(["']([^"']+)["']`))
 	if len(emitted) == 0 {
 		t.Fatal("no runtime.EventsEmit calls found")
@@ -494,7 +494,7 @@ func TestBackendEmittedEventsAreListenedToByFrontend(t *testing.T) {
 
 func TestFrontendEventListenersHaveBackendEmitters(t *testing.T) {
 	listened := collectContractMatches(t, filepath.Join("..", "..", "frontend", "src"), ".svelte", `EventsOn\(["']([^"']+)["']`)
-	emitted := stringSet(collectContractMatches(t, filepath.Join("..", ".."), ".go", `(?:EventsEmit\([^,]+,\s*|emitFrame\(\s*)["']([^"']+)["']`))
+	emitted := stringSet(collectContractMatches(t, filepath.Join("..", ".."), ".go", `(?:EventsEmit\([^,]+,\s*|emitFrame(?:Titled)?\(\s*)["']([^"']+)["']`))
 	if len(listened) == 0 {
 		t.Fatal("no frontend EventsOn calls found")
 	}

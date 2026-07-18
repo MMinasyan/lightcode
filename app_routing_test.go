@@ -61,6 +61,18 @@ func TestWailsRoutingStateIsEncapsulated(t *testing.T) {
 		"setCurrentSessionID", "clearRouteIfCurrent", "acceptsSubagentEventForCurrent")
 }
 
+// TestWailsTitleChangesOnlyThroughOrderedBoundary proves no operation sets the
+// native window title directly: WindowSetTitle appears only in the drainer's title
+// choke point, so a project switch's title changes only when its boundary is
+// consumed — a stalled boundary keeps the title at the prior project.
+func TestWailsTitleChangesOnlyThroughOrderedBoundary(t *testing.T) {
+	for name := range appFuncsReferencing(t, "WindowSetTitle") {
+		if name != "startDelivery" {
+			t.Fatalf("WindowSetTitle is called in %s; the title must change only through the ordered delivery drainer", name)
+		}
+	}
+}
+
 // TestWailsEventAcceptanceIsNavMuFree proves the event-acceptance path never takes
 // navMu. handleEvent runs on the owner's event callback, and an operation may hold
 // navMu while waiting on the owner, so acquiring navMu on the callback could

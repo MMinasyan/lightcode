@@ -3,11 +3,87 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 )
+
+// recordingProjectSvc records the project path each project-scoped owner call
+// targets, so a test can prove routing commits immediately.
+type recordingProjectSvc struct {
+	agent.AdapterService
+	mu    sync.Mutex
+	paths []string
+}
+
+func (s *recordingProjectSvc) SessionListForProjectPath(path, _ string) ([]agent.SessionSummary, error) {
+	s.mu.Lock()
+	s.paths = append(s.paths, path)
+	s.mu.Unlock()
+	return nil, nil
+}
+
+func (s *recordingProjectSvc) NewSessionForProjectPath(_, _ string) (string, error) {
+	return "sess", nil
+}
+
+func (s *recordingProjectSvc) SessionSummaryForSession(id string) (agent.SessionSummary, error) {
+	return agent.SessionSummary{ID: id}, nil
+}
+
+func (s *recordingProjectSvc) lastPath() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.paths) == 0 {
+		return ""
+	}
+	return s.paths[len(s.paths)-1]
+}
+
+func (s *recordingProjectSvc) reset() {
+	s.mu.Lock()
+	s.paths = nil
+	s.mu.Unlock()
+}
+
+// TestNavProjectSwitchRoutesFollowingReadDespiteStalledBoundary proves a project
+// switch commits routing immediately: after it returns, a following project-scoped
+// read targets the new project even though the switch's navigation boundary (and
+// its window title) are still stalled in delivery, so presentation still shows the
+// old project.
+func TestNavProjectSwitchRoutesFollowingReadDespiteStalledBoundary(t *testing.T) {
+	svc := &recordingProjectSvc{}
+	release := make(chan struct{})
+	a := &App{svc: svc, ctx: context.Background()}
+	a.emitFn = func(string, any) { <-release } // stall the drainer on the boundary
+	a.titleFn = func(string) {}
+	a.startDelivery()
+	defer func() {
+		close(release)
+		a.closeDelivery()
+	}()
+
+	a.routeProjectPath = t.TempDir()
+	a.navMu.Lock()
+	a.setCurrentSessionID("sessA")
+	a.navMu.Unlock()
+
+	targetB := t.TempDir()
+	if err := a.ProjectSwitch(targetB); err != nil {
+		t.Fatalf("ProjectSwitch: %v", err)
+	}
+	// The boundary is now stalled in delivery, so presentation still shows A. A
+	// following current-target read must still route to B.
+	svc.reset()
+	if _, err := a.SessionList("active"); err != nil {
+		t.Fatalf("SessionList: %v", err)
+	}
+	if got := svc.lastPath(); got != targetB {
+		t.Fatalf("SessionList targeted %q, want %q: routing must commit despite the stalled boundary", got, targetB)
+	}
+}
 
 // recordingSvc stubs the AdapterService methods the navMu barriers exercise. It
 // records the session id an operation targets and blocks the long owner calls so

@@ -27,11 +27,14 @@ var deliveryJoinTimeout = 5 * time.Second
 // acquires navMu after close has won it.
 var errAdapterClosed = errors.New("adapter is closed")
 
-// deliveryFrame is one immutable item the delivery FIFO carries. Today every
-// frame is a legacy named event with its payload; the sole drainer emits it.
+// deliveryFrame is one immutable item the delivery FIFO carries: a named event
+// with its payload, plus an optional native window title a navigation boundary
+// carries so the drainer applies the title in the same ordered step as the
+// boundary. The sole drainer emits it.
 type deliveryFrame struct {
 	name    string
 	payload any
+	title   string
 }
 
 // App is the Wails-bound struct that bridges the Go backend to the
@@ -82,6 +85,7 @@ type App struct {
 	// delivery order is the drainer's write order. emitFn is the one emission
 	// choke point (overridable in tests).
 	emitFn         func(name string, payload any)
+	titleFn        func(title string)
 	deliveryMu     sync.Mutex
 	deliveryFrames []deliveryFrame
 	deliveryWake   chan struct{}
@@ -189,6 +193,11 @@ func (a *App) startDelivery() {
 			wailsRuntime.EventsEmit(a.ctx, name, payload)
 		}
 	}
+	if a.titleFn == nil {
+		a.titleFn = func(title string) {
+			wailsRuntime.WindowSetTitle(a.ctx, title)
+		}
+	}
 	a.deliveryWake = make(chan struct{}, 1)
 	a.deliveryDone = make(chan struct{})
 	go a.runDeliveryDrainer()
@@ -197,12 +206,19 @@ func (a *App) startDelivery() {
 // emitFrame appends one frame and wakes the drainer. It never blocks or emits,
 // so it is safe to call from an event callback that runs under an owner lock.
 func (a *App) emitFrame(name string, payload any) {
+	a.emitFrameTitled(name, payload, "")
+}
+
+// emitFrameTitled appends a frame that also carries a native window title for the
+// drainer to apply in the same ordered step, so the title changes only when its
+// boundary is consumed.
+func (a *App) emitFrameTitled(name string, payload any, title string) {
 	a.deliveryMu.Lock()
 	if a.deliveryClosed {
 		a.deliveryMu.Unlock()
 		return
 	}
-	a.deliveryFrames = append(a.deliveryFrames, deliveryFrame{name: name, payload: payload})
+	a.deliveryFrames = append(a.deliveryFrames, deliveryFrame{name: name, payload: payload, title: title})
 	a.deliveryMu.Unlock()
 	select {
 	case a.deliveryWake <- struct{}{}:
@@ -232,6 +248,17 @@ func (a *App) runDeliveryDrainer() {
 		a.deliveryFrames = a.deliveryFrames[1:]
 		a.deliveryMu.Unlock()
 		a.emitFn(frame.name, frame.payload)
+		if frame.title != "" {
+			// Recheck close before applying the title: if emitFn blocked and close
+			// abandoned the drainer meanwhile, the window is going away and the title
+			// must not change after shutdown has proceeded.
+			a.deliveryMu.Lock()
+			closed := a.deliveryClosed
+			a.deliveryMu.Unlock()
+			if !closed {
+				a.titleFn(frame.title)
+			}
+		}
 	}
 }
 
@@ -405,10 +432,17 @@ func (a *App) handleEvent(ev agent.Event) {
 // frontend applies as a detach. The caller holds navMu, so navMu -> the owner's
 // HydrateSession locks stays in the documented order.
 func (a *App) emitNavigationBoundary(sessionID string) {
+	a.emitNavigationBoundaryWithTitle(sessionID, "")
+}
+
+// emitNavigationBoundaryWithTitle is emitNavigationBoundary that also carries a
+// native window title on the boundary frame, so a project switch changes the title
+// only when the ordered consumer applies its presentation.
+func (a *App) emitNavigationBoundaryWithTitle(sessionID, title string) {
 	if a.ctx == nil {
 		return
 	}
-	emit := func(state agent.HydrationState) { a.emitFrame("navigation", state) }
+	emit := func(state agent.HydrationState) { a.emitFrameTitled("navigation", state, title) }
 	if a.agent == nil {
 		emit(agent.HydrationState{})
 		return
@@ -1213,13 +1247,11 @@ func (a *App) ProjectSwitch(targetPath string) error {
 		return err
 	}
 	// Commit the project path and the session id together under navMu so a
-	// following current-target call never sees one without the other.
+	// following current-target call never sees one without the other. The native
+	// title rides the boundary, so it changes only when the boundary is consumed.
 	a.routeProjectPath = abs
 	a.setCurrentSessionID(summary.ID)
-	a.emitNavigationBoundary(summary.ID)
-	if a.ctx != nil {
-		wailsRuntime.WindowSetTitle(a.ctx, "Lightcode — "+filepath.Base(abs))
-	}
+	a.emitNavigationBoundaryWithTitle(summary.ID, "Lightcode — "+filepath.Base(abs))
 	return nil
 }
 
