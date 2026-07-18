@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 var errEmbedderUnavailable = errors.New("memory embedder unavailable")
@@ -345,6 +346,9 @@ func (s *Store) SearchHistory(query, projectID string, allProjects bool, limit i
 func (s *Store) DeleteSessionSummaries(sessionID string) error {
 	if s == nil {
 		return nil
+	}
+	if err := snapshot.ValidateSessionID(sessionID); err != nil {
+		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/safefs"
@@ -70,6 +71,12 @@ type Store struct {
 	currentTurn  int
 	snapshotTx   map[string]*snapshotTxState
 	mutationLock map[string]*snapshotMutationLock
+
+	// claim is the cross-process exclusion held while this process drives the
+	// session. It is acquired before a mutating load or new-session
+	// publication and released on Close. Nil for stores with no project
+	// context (legacy/test stores that never drive across processes).
+	claim *atomicfs.Lock
 }
 
 type snapshotTxState struct {
@@ -139,7 +146,7 @@ func (s *Store) BeginChildSession(projectRoot, parentSessionID string) error {
 	return s.beginNewSessionLocked(projectRoot, parentSessionID)
 }
 
-func (s *Store) beginNewSessionLocked(projectRoot, parentSessionID string) error {
+func (s *Store) beginNewSessionLocked(projectRoot, parentSessionID string) (err error) {
 	absProject, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return fmt.Errorf("snapshot: resolve project root: %w", err)
@@ -148,6 +155,15 @@ func (s *Store) beginNewSessionLocked(projectRoot, parentSessionID string) error
 	if err != nil {
 		return fmt.Errorf("snapshot: generate session id: %w", err)
 	}
+	// A freshly minted id is uncontended; claim it before publishing the dir.
+	if cerr := s.acquireClaimLocked(sessionID); cerr != nil {
+		return cerr
+	}
+	defer func() {
+		if err != nil {
+			s.releaseClaimLocked()
+		}
+	}()
 	dir := filepath.Join(s.root, sessionID)
 	snapshotsDir := filepath.Join(dir, "snapshots")
 	turnsDir := filepath.Join(dir, "turns")
@@ -184,16 +200,29 @@ func (s *Store) beginNewSessionLocked(projectRoot, parentSessionID string) error
 
 // LoadSession attaches this Store to an existing on-disk session.
 // Discards any incomplete turn dirs (crash recovery).
-func (s *Store) LoadSession(id string) error {
+func (s *Store) LoadSession(id string) (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.active {
 		return fmt.Errorf("snapshot: session %q already open", s.sessionID)
 	}
+	if verr := ValidateSessionID(id); verr != nil {
+		return verr
+	}
+	// Claim the session before the crash-recovery mutation below, so only one
+	// process ever discards this session's incomplete turns.
+	if cerr := s.acquireClaimLocked(id); cerr != nil {
+		return cerr
+	}
+	defer func() {
+		if err != nil {
+			s.releaseClaimLocked()
+		}
+	}()
 	dir := filepath.Join(s.root, id)
 	var meta SessionMeta
-	if err := readJSON(filepath.Join(dir, "meta.json"), &meta); err != nil {
-		return fmt.Errorf("snapshot: load %s: %w", id, err)
+	if rerr := readJSON(filepath.Join(dir, "meta.json"), &meta); rerr != nil {
+		return fmt.Errorf("snapshot: load %s: %w", id, rerr)
 	}
 	snapshotsDir := filepath.Join(dir, "snapshots")
 	turnsDir := filepath.Join(dir, "turns")
@@ -236,7 +265,21 @@ func (s *Store) Close() (bool, error) {
 	return discarded, nil
 }
 
+// Detach releases the store's claim and resets it to the no-session state
+// without discarding the session directory. Used when an open fails after the
+// claim was acquired but the persisted session must remain on disk (unlike
+// Close, which discards a session that has no complete turns).
+func (s *Store) Detach() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active {
+		return
+	}
+	s.clearLocked()
+}
+
 func (s *Store) clearLocked() {
+	s.releaseClaimLocked()
 	s.active = false
 	s.dir = ""
 	s.snapshotsDir = ""
@@ -766,8 +809,8 @@ func loadCompleteTurnsFromDir(turnsDir string, after int, filterAfter bool) ([]T
 }
 
 func (s *Store) sessionReadDirs(id string) (string, string, error) {
-	if id == "" || id == "." || id == ".." || filepath.Base(id) != id {
-		return "", "", fmt.Errorf("snapshot: invalid session id %q", id)
+	if err := ValidateSessionID(id); err != nil {
+		return "", "", err
 	}
 	s.mu.Lock()
 	root := s.root

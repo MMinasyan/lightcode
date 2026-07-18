@@ -386,6 +386,23 @@ func (a *Agent) resolveLiveSession(id string) (*session, error) {
 	return unit, err
 }
 
+// resolveRootDriveSession resolves a live session for a root-only drive
+// operation — snapshot list, code/history revert, and user fork. Task-child
+// and compact-child sessions are never registered as drivable live units, so
+// resolveLiveSession already rejects them; the explicit compact-type guard
+// keeps the root-only contract at this boundary even if that changes. A
+// descendant's edits are recorded through its root's store, not its own.
+func (a *Agent) resolveRootDriveSession(id string) (*session, error) {
+	unit, err := a.resolveLiveSession(id)
+	if err != nil {
+		return nil, err
+	}
+	if isCompactSessionType(unit.activeAgentType) {
+		return nil, internalTranscriptSessionError(id)
+	}
+	return unit, nil
+}
+
 func setSessionProject(unit *session, proj *project.Project) {
 	if unit == nil || proj == nil {
 		return
@@ -3487,6 +3504,10 @@ func (a *Agent) OpenSession(id string) (SessionSummary, error) {
 		_ = unit.store.TouchActivity()
 	}
 	if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
+		// Release the claim acquired by LoadSession without discarding the
+		// persisted session; the unit is never registered, so nothing else
+		// detaches it.
+		unit.store.Detach()
 		return SessionSummary{}, err
 	}
 	a.resetFileTrackerForSession(unit)
@@ -3498,8 +3519,8 @@ func (a *Agent) OpenSession(id string) (SessionSummary, error) {
 
 func (a *Agent) projectForExistingSession(id string) (*project.Project, error) {
 	id = strings.TrimSpace(id)
-	if id == "" {
-		return nil, fmt.Errorf("session id is required")
+	if err := snapshot.ValidateSessionID(id); err != nil {
+		return nil, err
 	}
 	if a.projects == nil {
 		return nil, fmt.Errorf("unknown session %q", id)
@@ -3652,6 +3673,23 @@ func (a *Agent) ensureProjectForPath(projectPath string) (*project.Project, erro
 }
 
 // SessionArchive archives a session.
+// claimPersistedOnlySession acquires a temporary claim for a session that is
+// not live in this owner, so a persisted-only archive/delete cannot mutate a
+// session another process is driving. The caller releases via the returned
+// func.
+func (a *Agent) claimPersistedOnlySession(sessionsRoot, id string) (func(), error) {
+	projectID := filepath.Base(filepath.Dir(sessionsRoot))
+	projectsRoot := filepath.Dir(filepath.Dir(sessionsRoot))
+	claim, ok, err := snapshot.AcquireSessionClaim(projectsRoot, projectID, id)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("session %q is being driven by another process", id)
+	}
+	return func() { _ = claim.Release() }, nil
+}
+
 func (a *Agent) SessionArchive(id string) error {
 	id = strings.TrimSpace(id)
 	sessionsRoot, err := a.sessionsRootForUserManagedSession(id)
@@ -3662,17 +3700,31 @@ func (a *Agent) SessionArchive(id string) error {
 	if err != nil {
 		return err
 	}
+	needTempClaim := closedCurrent
 	var releaseClose func()
 	if !closedCurrent {
 		releaseClose, err = a.beginLiveSessionClose(id)
 		if err != nil {
 			return err
 		}
-		defer func() {
-			if releaseClose != nil {
-				releaseClose()
-			}
-		}()
+		if releaseClose != nil {
+			defer func() {
+				if releaseClose != nil {
+					releaseClose()
+				}
+			}()
+		} else {
+			needTempClaim = true
+		}
+	}
+	if needTempClaim {
+		// A current or persisted-only target holds no live store claim; take a
+		// temporary claim so the durable mutation still owns the session.
+		claimRelease, cerr := a.claimPersistedOnlySession(sessionsRoot, id)
+		if cerr != nil {
+			return cerr
+		}
+		defer claimRelease()
 	}
 	if err := snapshot.ArchiveSession(sessionsRoot, id); err != nil {
 		return err
@@ -3701,17 +3753,31 @@ func (a *Agent) SessionDelete(id string) error {
 	if err != nil {
 		return err
 	}
+	needTempClaim := closedCurrent
 	var releaseClose func()
 	if !closedCurrent {
 		releaseClose, err = a.beginLiveSessionClose(id)
 		if err != nil {
 			return err
 		}
-		defer func() {
-			if releaseClose != nil {
-				releaseClose()
-			}
-		}()
+		if releaseClose != nil {
+			defer func() {
+				if releaseClose != nil {
+					releaseClose()
+				}
+			}()
+		} else {
+			needTempClaim = true
+		}
+	}
+	if needTempClaim {
+		// A current or persisted-only target holds no live store claim; take a
+		// temporary claim so the durable mutation still owns the session.
+		claimRelease, cerr := a.claimPersistedOnlySession(sessionsRoot, id)
+		if cerr != nil {
+			return cerr
+		}
+		defer claimRelease()
 	}
 	if err := snapshot.DeleteSession(sessionsRoot, id); err != nil {
 		return err
@@ -3753,10 +3819,18 @@ func (a *Agent) SessionMessagesFor(id string) ([]DisplayMessage, error) {
 	if err == nil {
 		return a.messagesForFrontendForStore(unit.store, id)
 	}
-	if a.store == nil {
-		return nil, snapshot.ErrNoSession
+	// Not live: resolve the session's owning project and read it read-only,
+	// without a mutating load or a claim, rather than falling back to the
+	// current session (which would return a different session's messages).
+	root, rerr := a.sessionsRootForSession(id)
+	if rerr != nil {
+		return nil, rerr
 	}
-	return a.messagesForFrontendForSession(id)
+	store, serr := snapshot.NewForSessionsRoot(root, "", "")
+	if serr != nil {
+		return nil, serr
+	}
+	return a.messagesForFrontendForStore(store, id)
 }
 
 func (a *Agent) SessionMessagesByID(id string) ([]DisplayMessage, error) {
@@ -3784,6 +3858,9 @@ func (a *Agent) sessionsRootForSession(id string) (string, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return a.currentSessionsRoot()
+	}
+	if err := snapshot.ValidateSessionID(id); err != nil {
+		return "", err
 	}
 	if a.projects != nil {
 		if root, ok := a.liveSessionsRoot(id); ok {
@@ -4262,7 +4339,7 @@ func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (T
 }
 
 func (a *Agent) ApplyTurnActionForSession(sessionID string, turn int, action string, alsoRevertCode bool) (TurnActionResult, error) {
-	unit, err := a.resolveLiveSession(sessionID)
+	unit, err := a.resolveRootDriveSession(sessionID)
 	if err != nil {
 		return TurnActionResult{}, err
 	}
@@ -4427,7 +4504,7 @@ func (a *Agent) RevertCode(turn int) (snapshot.RevertResult, error) {
 }
 
 func (a *Agent) RevertCodeForSession(sessionID string, turn int) (snapshot.RevertResult, error) {
-	unit, err := a.resolveLiveSession(sessionID)
+	unit, err := a.resolveRootDriveSession(sessionID)
 	if err != nil {
 		return snapshot.RevertResult{}, err
 	}
@@ -4457,7 +4534,7 @@ func (a *Agent) RevertHistory(turn int) error {
 }
 
 func (a *Agent) RevertHistoryForSession(sessionID string, turn int) error {
-	unit, err := a.resolveLiveSession(sessionID)
+	unit, err := a.resolveRootDriveSession(sessionID)
 	if err != nil {
 		return err
 	}
@@ -4501,7 +4578,7 @@ func (a *Agent) ForkSession(turn int) error {
 }
 
 func (a *Agent) ForkSessionForSession(sessionID string, turn int) error {
-	unit, err := a.resolveLiveSession(sessionID)
+	unit, err := a.resolveRootDriveSession(sessionID)
 	if err != nil {
 		return err
 	}
@@ -4562,7 +4639,7 @@ func (a *Agent) SnapshotList() ([]Snapshot, error) {
 }
 
 func (a *Agent) SnapshotListForSession(sessionID string) ([]Snapshot, error) {
-	unit, err := a.resolveLiveSession(sessionID)
+	unit, err := a.resolveRootDriveSession(sessionID)
 	if err != nil {
 		return nil, err
 	}
