@@ -3,6 +3,9 @@ package agent
 import (
 	"reflect"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/prompt"
 )
 
 func feedTranscriptEvents(tr *transcript, events []Event) {
@@ -142,6 +145,62 @@ func TestCaptureTranscriptProvidesDurableTailAndErrors(t *testing.T) {
 	}
 	if ct.revision.committedTurn != 0 {
 		t.Fatalf("fresh session revision = %+v, want no commits", ct.revision)
+	}
+}
+
+// TestCaptureStateReadsAllLiveClasses verifies the full capture reads every live
+// class — transcript, activity, model, tokens, queue, warnings — as one set, by
+// seeding a distinctive value in each under its lock and asserting all of them.
+func TestCaptureStateReadsAllLiveClasses(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	unit := a.session
+	rt := a.ensureRuntime()
+
+	rt.mu.Lock()
+	unit.busy = true
+	unit.currentRef = coremodel.ModelRef{Provider: "p", Model: "m"}
+	unit.queue = []QueuedItem{{ID: "q1", Content: "queued"}}
+	unit.queueVersion = 7
+	rt.mu.Unlock()
+
+	unit.tokensMu.Lock()
+	unit.tokens = map[string]*TokenEntry{"p/m": {Provider: "p", Model: "m", Input: 11, Known: true}}
+	unit.tokensMu.Unlock()
+
+	tr := unit.transcript
+	tr.seqMu.Lock()
+	tr.appendEventLocked(Event{Kind: EventTextDelta, Result: "hi"})
+	tr.seqMu.Unlock()
+
+	a.setWarningGroup("protocol", []prompt.Warning{{Kind: "k", Message: "m"}})
+
+	st, err := a.captureState(unit)
+	if err != nil {
+		t.Fatalf("captureState: %v", err)
+	}
+	if len(st.transcript.tail) != 1 || st.transcript.tail[0].msg.Content != "hi" {
+		t.Fatalf("captured transcript tail = %#v", st.transcript.tail)
+	}
+	if !st.busy {
+		t.Fatal("busy not captured")
+	}
+	if st.model.Provider != "p" || st.model.Model != "m" {
+		t.Fatalf("model = %+v, want p/m", st.model)
+	}
+	if st.tokens.Total.Input != 11 {
+		t.Fatalf("tokens total input = %d, want 11", st.tokens.Total.Input)
+	}
+	if len(st.queue.Items) != 1 || st.queue.Items[0].ID != "q1" || st.queue.Version != 7 {
+		t.Fatalf("queue = %+v, want one item q1 version 7", st.queue)
+	}
+	found := false
+	for _, w := range st.warnings {
+		if w.Kind == "k" && w.Message == "m" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("warning not captured: %#v", st.warnings)
 	}
 }
 

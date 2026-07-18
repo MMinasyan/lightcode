@@ -4312,6 +4312,69 @@ func (a *Agent) messagesForFrontendForSession(sessionID string) ([]DisplayMessag
 	return a.messagesForFrontendForStore(a.store, sessionID)
 }
 
+// completeState is a session's complete live state: its transcript plus the
+// captured live classes read as one consistent set. Pending permissions and the
+// compacting flag are captured with their readers in a later change.
+type completeState struct {
+	transcript completeTranscript
+	tokens     TokenReport
+	model      coremodel.ModelRef
+	busy       bool
+	queue      QueueState
+	warnings   []PromptWarning
+}
+
+// captureState reads a session's durable committed history outside the
+// captured-state locks (it does I/O), then acquires the live-class locks in the
+// total order and reads activity/queue/model, tokens, warnings, and the
+// transcript tail/errors/revision while holding them, so the snapshot is one
+// consistent set with no class read outside the lock that guards it.
+func (a *Agent) captureState(unit *session) (completeState, error) {
+	if unit == nil || unit.store == nil || unit.transcript == nil {
+		return completeState{}, snapshot.ErrNoSession
+	}
+	var committed []DisplayMessage
+	if unit.store.Active() {
+		var err error
+		committed, err = a.messagesForFrontendForStore(unit.store, sessionIDOf(unit))
+		if err != nil {
+			return completeState{}, err
+		}
+	}
+	rt := a.ensureRuntime()
+	tr := unit.transcript
+
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	busy := unit.busy
+	model := unit.currentRef
+	queue := rt.queueSnapshotLocked(unit)
+
+	unit.tokensMu.Lock()
+	defer unit.tokensMu.Unlock()
+	tokens := a.buildReportForSessionLocked(unit)
+
+	a.warningsMu.Lock()
+	defer a.warningsMu.Unlock()
+	warnings := append([]PromptWarning(nil), a.warningSnapshot...)
+
+	tr.seqMu.Lock()
+	defer tr.seqMu.Unlock()
+	return completeState{
+		transcript: completeTranscript{
+			committed: committed,
+			tail:      tr.tailSnapshotLocked(),
+			errors:    tr.errorSnapshotLocked(),
+			revision:  tr.revisionLocked(),
+		},
+		tokens:   tokens,
+		model:    model,
+		busy:     busy,
+		queue:    queue,
+		warnings: warnings,
+	}, nil
+}
+
 // captureTranscript reads a session's durable committed history outside the
 // sequence lock (it does I/O), then snapshots the coordinator's retained tail,
 // retained errors, and revision under seqMu so the live pieces form one
