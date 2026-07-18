@@ -429,6 +429,44 @@ func (a *App) emitNavigationBoundary(sessionID string) {
 	a.agent.HydrateSessionWithBoundary(sessionID, emit)
 }
 
+// turnActionBoundary is the ordered frame a fork, history revert, or code revert
+// appends through the delivery FIFO: the destination session's complete state (nil
+// when the action changed no session) plus any files a code revert kept unchanged.
+// The ordered consumer applies the state and the skip notice together, so no live
+// frame interleaves between them or clobbers the notice.
+type turnActionBoundary struct {
+	State        *agent.HydrationState    `json:"state"`
+	SkippedFiles []snapshot.SkippedRevert `json:"skippedFiles"`
+}
+
+// emitTurnActionBoundary appends the destination's complete state and code-revert
+// skip notice as one ordered frame. It captures atomically like the navigation
+// boundary, so a live frame delivered after the capture is enqueued after it and
+// the skip notice cannot be clobbered by an out-of-band apply.
+func (a *App) emitTurnActionBoundary(sessionID string, skipped []snapshot.SkippedRevert) {
+	if a.ctx == nil {
+		return
+	}
+	emit := func(state agent.HydrationState) {
+		a.emitFrame("turn_action", turnActionBoundary{State: &state, SkippedFiles: skipped})
+	}
+	if a.agent == nil {
+		emit(agent.HydrationState{})
+		return
+	}
+	a.agent.HydrateSessionWithBoundary(sessionID, emit)
+}
+
+// emitTurnActionNotice appends a code revert's skip notice as an ordered notice-only
+// frame (no state change), so a refresh already queued ahead of it applies first and
+// cannot clobber the notice appended after.
+func (a *App) emitTurnActionNotice(skipped []snapshot.SkippedRevert) {
+	if a.ctx == nil || len(skipped) == 0 {
+		return
+	}
+	a.emitFrame("turn_action", turnActionBoundary{SkippedFiles: skipped})
+}
+
 func (a *App) setCurrentSessionID(id string) {
 	a.sv().SetCurrent(id)
 }
@@ -694,13 +732,17 @@ func (a *App) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (age
 	if err != nil {
 		return result, err
 	}
-	if result.SessionChanged {
-		if result.Session.ID != "" {
-			a.setCurrentSessionID(result.Session.ID)
-			a.emitSessionChangedForSession(result.Session.ID)
-		} else {
-			a.emitSessionChangedForSession(sessionID)
-		}
+	if result.SessionChanged && result.Session.ID != "" {
+		// A fork navigates to the new branched session; a history revert stays on
+		// the reverted one. Commit routing, then append the destination's complete
+		// state and any code-revert skip notice as one ordered boundary, so the
+		// state and notice apply together and no live frame interleaves between them.
+		a.setCurrentSessionID(result.Session.ID)
+		a.emitTurnActionBoundary(result.Session.ID, result.SkippedFiles)
+	} else {
+		// A code-only revert changes no session; deliver its skip notice through the
+		// same ordered FIFO so a queued refresh cannot clobber it.
+		a.emitTurnActionNotice(result.SkippedFiles)
 	}
 	return result, nil
 }

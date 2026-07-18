@@ -146,6 +146,51 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 	}
 }
 
+// TestTurnActionAppliesDestinationStateThroughOrderedBoundary proves the Wails
+// turn-action path (fork / history revert) applies the destination's complete
+// state and the code-revert skip notice through one ordered delivery frame, not an
+// out-of-band read that could race live frames or lose the notice. The backend
+// commits routing and appends a turn_action boundary (never a legacy
+// session_changed or navigation frame), and the frontend's turn_action handler
+// applies the snapshot before the skip notice so the two land atomically; the
+// handlers apply nothing out of band.
+func TestTurnActionAppliesDestinationStateThroughOrderedBoundary(t *testing.T) {
+	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
+	body, ok := extractSvelteFunctionBody(app, "func (a *App) ApplyTurnAction(")
+	if !ok {
+		t.Fatal("ApplyTurnAction not found in app.go")
+	}
+	if !strings.Contains(body, "emitTurnActionBoundary") {
+		t.Fatal("ApplyTurnAction must append a turn_action boundary on a session change")
+	}
+	if strings.Contains(body, "emitSessionChanged") || strings.Contains(body, "emitNavigationBoundary") {
+		t.Fatal("ApplyTurnAction must not emit a legacy session_changed or navigation frame")
+	}
+
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	handler, ok := extractSvelteFunctionBody(svelte, "EventsOn('turn_action'")
+	if !ok {
+		t.Fatal("turn_action handler not found in App.svelte")
+	}
+	snap := strings.Index(handler, "applySnapshot(")
+	notice := strings.Index(handler, "appendRevertSkipNotice(")
+	if snap < 0 || notice < 0 {
+		t.Fatal("turn_action handler must apply the snapshot and append the skip notice")
+	}
+	if snap > notice {
+		t.Fatal("turn_action handler must apply the snapshot before the skip notice")
+	}
+	for _, fn := range []string{"async function handleFork(", "async function handleRevertHistory(", "async function handleRevertCode("} {
+		fnBody, ok := extractSvelteFunctionBody(svelte, fn)
+		if !ok {
+			t.Fatalf("%s not found in App.svelte", fn)
+		}
+		if strings.Contains(fnBody, "applySnapshot(") || strings.Contains(fnBody, "appendRevertSkipNotice(") {
+			t.Fatalf("%s must not apply state or notice out of band; the ordered turn_action frame is authoritative", fn)
+		}
+	}
+}
+
 func TestProjectSwitchDoesNotCloseOwnerSession(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
 	if strings.Contains(app, "CloseForProjectSwitch") || strings.Contains(app, "close current session") {

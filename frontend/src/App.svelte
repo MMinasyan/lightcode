@@ -142,15 +142,6 @@
     sessionId = nextSessionId;
   }
 
-  function applySessionPayload(result) {
-    if (!result?.sessionChanged) return;
-    applySessionId(result.session?.id || sessionId);
-    if (result.tokens) tokens = result.tokens;
-    else tokens = defaultTokens();
-    messages = rebuildFromHistory(result.messages || []);
-    streamingIdx = -1;
-  }
-
   // applySnapshot renders one complete-state hydration as the whole live view and
   // seeds the transcript gate at its high-water. The queue guard resets to the
   // snapshot's session and version; later same-session versions must increase.
@@ -267,6 +258,14 @@
     // applying it replaces the whole live view (messages, gate, tokens, activity,
     // queue, warnings, permissions). An empty state is a detach.
     EventsOn('navigation', buffered((data) => { applySnapshot(data); }));
+
+    // A turn-action boundary carries the fork/revert destination's complete state
+    // and any code-revert skip notice as one ordered frame; applying the snapshot
+    // and appending the notice together keeps the notice from being clobbered.
+    EventsOn('turn_action', buffered((data) => {
+      applySnapshot(data?.state);
+      appendRevertSkipNotice({ skippedFiles: data?.skippedFiles });
+    }));
 
     EventsOn('token', buffered(applyToken));
     EventsOn('tool_start', buffered(applyToolStart));
@@ -400,8 +399,9 @@
   async function handleRevertCode(e) {
     const { turn } = e.detail;
     try {
-      const result = await ApplyTurnAction(turn, 'revert_code', false);
-      appendRevertSkipNotice(result);
+      // The backend appends the skip notice as an ordered turn_action frame; no
+      // out-of-band append here that a queued refresh could clobber.
+      await ApplyTurnAction(turn, 'revert_code', false);
     }
     catch (err) { showError(err); }
   }
@@ -410,8 +410,9 @@
     const { turn, alsoRevertCode } = e.detail;
     try {
       const result = await ApplyTurnAction(turn, 'revert_history', !!alsoRevertCode);
-      applySessionPayload(result);
-      appendRevertSkipNotice(result);
+      // The backend appends the reverted session's complete state and any skip
+      // notice as one ordered turn_action boundary; only the input prefill is
+      // applied from the direct result here.
       inputArea?.prefill(result?.prefill || '');
     }
     catch (err) { showError(err); }
@@ -420,9 +421,9 @@
   async function handleFork(e) {
     const { turn, alsoRevertCode } = e.detail;
     try {
-      const result = await ApplyTurnAction(turn, 'fork', !!alsoRevertCode);
-      applySessionPayload(result);
-      appendRevertSkipNotice(result);
+      // The backend appends the forked session's complete state and any skip
+      // notice as one ordered turn_action boundary; nothing is applied here.
+      await ApplyTurnAction(turn, 'fork', !!alsoRevertCode);
     }
     catch (err) { showError(err); }
   }
