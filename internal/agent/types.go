@@ -60,6 +60,12 @@ type Event struct {
 	TaskIndex         int
 	BackgroundProcess *BackgroundProcessDisplay
 
+	// CumulativeTokens (EventUsage) is the session's absolute cumulative token
+	// report computed under tokensMu, so a consumer applies it as a replacement
+	// rather than querying the owner. The Cache/Input/Output fields above remain
+	// this event's delta.
+	CumulativeTokens *TokenReport
+
 	// Queue fields (EventQueueChanged): a versioned snapshot of the input queue.
 	Queue        []QueuedItem
 	QueueVersion int

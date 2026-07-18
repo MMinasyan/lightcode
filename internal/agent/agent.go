@@ -1498,17 +1498,19 @@ func (a *Agent) recordUsageForSession(unit *session, ev loop.Event) {
 		unit.lastContextUsed = ev.Cache + ev.Input
 	}
 	a.persistTokensForSessionLocked(unit)
+	report := a.buildReportForSessionLocked(unit)
 	unit.tokensMu.Unlock()
 
 	a.emitEvent(Event{
-		SessionID:  sessionIDOf(unit),
-		ProjectID:  unit.projectID,
-		Kind:       EventUsage,
-		Model:      model,
-		Cache:      ev.Cache,
-		Input:      ev.Input,
-		Output:     ev.Output,
-		UsageKnown: ev.UsageKnown,
+		SessionID:        sessionIDOf(unit),
+		ProjectID:        unit.projectID,
+		Kind:             EventUsage,
+		Model:            model,
+		Cache:            ev.Cache,
+		Input:            ev.Input,
+		Output:           ev.Output,
+		UsageKnown:       ev.UsageKnown,
+		CumulativeTokens: &report,
 	})
 }
 
