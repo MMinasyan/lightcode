@@ -3,10 +3,139 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/agent"
 )
+
+// TestWailsHydrateSessionUnavailableWithoutAgent verifies the concrete-only
+// hydration surface fails cleanly when no concrete agent is owned.
+func TestWailsHydrateSessionUnavailableWithoutAgent(t *testing.T) {
+	app := &App{}
+	if _, err := app.HydrateSession("x"); err == nil {
+		t.Fatal("HydrateSession without a concrete agent = nil error, want unavailable")
+	}
+}
+
+// TestWailsAppOwnsConcreteAgentLifecycle verifies startup initializes and marks the
+// owner, hydration reaches the concrete agent, and shutdown joins the owner
+// without hanging.
+func TestWailsAppOwnsConcreteAgentLifecycle(t *testing.T) {
+	ag := newAppTestAgent(t)
+	app := &App{svc: ag, agent: ag}
+	app.emitFn = func(string, any) {}
+
+	app.startup(context.Background())
+	if !app.started {
+		t.Fatal("startup did not mark the owner started")
+	}
+	id := app.currentSessionID()
+	if id == "" {
+		t.Fatal("startup did not establish a current session")
+	}
+	hs, err := app.HydrateSession(id)
+	if err != nil {
+		t.Fatalf("HydrateSession: %v", err)
+	}
+	if hs.Session.ID != id {
+		t.Fatalf("hydrated session = %q, want %q", hs.Session.ID, id)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		app.shutdown(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("app.shutdown hung joining the owner")
+	}
+}
+
+// TestWailsShutdownBeforeStartupIsSafe verifies a close that wins the race against
+// an asynchronous startup neither joins an uninitialized owner nor lets startup
+// initialize one afterwards.
+func TestWailsShutdownBeforeStartupIsSafe(t *testing.T) {
+	ag := newAppTestAgent(t)
+	app := &App{svc: ag, agent: ag}
+	app.emitFn = func(string, any) {}
+	app.startDelivery()
+
+	app.shutdown(context.Background())
+	if app.started {
+		t.Fatal("shutdown before startup must not mark started")
+	}
+
+	app.startup(context.Background())
+	if app.started {
+		t.Fatal("startup after shutdown must short-circuit without initializing an owner")
+	}
+}
+
+// TestWailsShutdownJoinsInFlightTurn verifies shutdown joins a turn that is still
+// running when the window closes. The turn's end-of-turn flush needs the owner's
+// internal event drainer alive, so shutdown must join the owner before cancelling
+// the host context (whose cancellation would otherwise stop that drainer first and
+// strand the flush).
+func TestWailsShutdownJoinsInFlightTurn(t *testing.T) {
+	srvCtx, cancelSrv := context.WithCancel(context.Background())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-srvCtx.Done() // hold the model call open until the turn is cancelled
+	}))
+	// Release the hanging handler before closing the server: Close waits for
+	// outstanding handlers, and the handler only returns once srvCtx is cancelled.
+	defer func() {
+		cancelSrv()
+		server.Close()
+	}()
+
+	ag := newAppTestAgentAt(t, server.URL+"/v1")
+	app := &App{svc: ag, agent: ag}
+	app.emitFn = func(string, any) {}
+	app.startup(context.Background())
+
+	id := app.currentSessionID()
+	if id == "" {
+		t.Fatal("startup did not establish a current session")
+	}
+	if _, err := ag.SubmitToSession(context.Background(), id, "hi"); err != nil {
+		t.Fatalf("SubmitToSession: %v", err)
+	}
+	waitUntilBusyApp(t, ag)
+
+	done := make(chan struct{})
+	go func() {
+		app.shutdown(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("app.shutdown did not join the in-flight turn: the internal drainer was stopped before the turn flushed")
+	}
+}
+
+// waitUntilBusyApp blocks until the owner reports an in-flight turn.
+func waitUntilBusyApp(t *testing.T, ag *agent.Agent) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ag.Busy() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("turn did not become in-flight")
+}
 
 // TestWailsDeliveryFIFOEmitsFramesInOrder verifies every frame reaches the emit
 // choke point through the single drainer, in append order.
@@ -118,7 +247,7 @@ func TestWailsDeliveryCloseAbandonsBlockedEmit(t *testing.T) {
 		t.Fatal("closeDelivery did not return; blocked drainer not abandoned")
 	}
 
-	close(release)                    // unblock the drainer
+	close(release)                     // unblock the drainer
 	time.Sleep(100 * time.Millisecond) // give it a chance to (wrongly) emit the queued frame
 
 	mu.Lock()

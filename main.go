@@ -237,15 +237,15 @@ func runStop() error {
 }
 
 func runWails() error {
-	svc, err := ownerService(0)
+	ag, err := buildAgent()
 	if err != nil {
 		return err
 	}
 
-	app := &App{svc: svc}
+	app := &App{svc: ag, agent: ag}
 
 	if err := wails.Run(&options.App{
-		Title:  "Lightcode — " + svc.ProjectName(),
+		Title:  "Lightcode — " + ag.ProjectName(),
 		Width:  900,
 		Height: 700,
 		Linux: &linux.Options{
@@ -259,9 +259,6 @@ func runWails() error {
 		Bind:       []interface{}{app},
 	}); err != nil {
 		return err
-	}
-	if waiter, ok := svc.(interface{ WaitOwner() error }); ok {
-		return waiter.WaitOwner()
 	}
 	return nil
 }

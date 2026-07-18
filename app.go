@@ -32,8 +32,22 @@ type deliveryFrame struct {
 // App is the Wails-bound struct that bridges the Go backend to the
 // frontend. All exported methods are callable from JavaScript.
 type App struct {
-	ctx             context.Context
-	svc             agent.AdapterService
+	ctx context.Context
+	svc agent.AdapterService
+	// agent is the concrete local owner this adapter constructs, initializes, and
+	// shuts down. It also backs the concrete-only complete-state hydration surface,
+	// which is intentionally not part of AdapterService.
+	agent *agent.Agent
+
+	// lifecycleMu serializes startup against shutdown. Startup initializes the owner
+	// under it and records started; shutdown takes it, records closed, and tears down
+	// only an owner startup actually initialized. This makes an early close that races
+	// an asynchronous startup safe: shutdown before startup short-circuits both.
+	lifecycleMu sync.Mutex
+	started     bool
+	closed      bool
+	hostCancel  context.CancelFunc
+
 	scope           *agent.AdapterScope
 	viewOnce        sync.Once
 	view            *agent.SessionView
@@ -54,15 +68,27 @@ type App struct {
 
 type ModelCompletion = agent.ModelCompletion
 
-// startup is called by Wails after the window is created.
+// startup is called by Wails after the window is created. Wails runs it
+// asynchronously, so it holds lifecycleMu across owner initialization: a close
+// that races it either waits here or, if it already ran, short-circuits.
 func (a *App) startup(ctx context.Context) {
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
+	if a.closed {
+		return
+	}
 	a.ctx = ctx
+	// The owner's host-context teardown (LSP shutdown) keys on the init context, so
+	// initialize under a cancelable child that shutdown cancels. Delivery keeps using
+	// the original ctx, which stays valid until the drainer is closed.
+	hostCtx, cancel := context.WithCancel(ctx)
+	a.hostCancel = cancel
 	a.startDelivery()
 	a.svc.SetEventHandler(a.handleEvent)
-	a.svc.Init(ctx)
+	a.svc.Init(hostCtx)
 	a.scope = agent.NewAdapterScope(a.svc, a.svc.ProjectRoot())
 	if lifecycle, ok := a.svc.(interface{ AttachAdapter(context.Context) error }); ok {
-		a.adapterAttached = lifecycle.AttachAdapter(ctx) == nil
+		a.adapterAttached = lifecycle.AttachAdapter(hostCtx) == nil
 	}
 	sessionID := ""
 	if sessions, err := a.scope.SessionList("active"); err == nil && len(sessions) > 0 {
@@ -76,16 +102,46 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 	a.setCurrentSessionID(sessionID)
+	a.started = true
 }
 
 func (a *App) shutdown(ctx context.Context) {
+	a.lifecycleMu.Lock()
+	a.closed = true
+	started := a.started
+	hostCancel := a.hostCancel
+	a.lifecycleMu.Unlock()
+
 	a.closeDelivery()
-	if !a.adapterAttached {
+	if a.adapterAttached {
+		if lifecycle, ok := a.svc.(interface{ DetachAdapter(context.Context) error }); ok {
+			_ = lifecycle.DetachAdapter(ctx)
+		}
+	}
+	if !started {
 		return
 	}
-	if lifecycle, ok := a.svc.(interface{ DetachAdapter(context.Context) error }); ok {
-		_ = lifecycle.DetachAdapter(ctx)
+	// Join the owner's turns and workers first: ShutdownOwner drains in-flight turns
+	// while the internal event drainer is still alive, then stops the workers. Only
+	// then cancel the host context, whose sole watcher is the LSP teardown goroutine
+	// (ShutdownOwner never cancels it, since it keys on the init context).
+	if a.agent != nil {
+		a.agent.ShutdownOwner()
 	}
+	if hostCancel != nil {
+		hostCancel()
+	}
+}
+
+// HydrateSession returns a session's complete live state for the frontend to
+// apply as one snapshot before replaying subsequent live events. It reaches the
+// concrete owner directly because complete-state hydration is not part of the
+// shared AdapterService.
+func (a *App) HydrateSession(sessionID string) (agent.HydrationState, error) {
+	if a.agent == nil {
+		return agent.HydrationState{}, fmt.Errorf("hydration is unavailable")
+	}
+	return a.agent.HydrateSession(sessionID)
 }
 
 // startDelivery installs the emission choke point and starts the sole drainer

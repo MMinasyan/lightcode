@@ -239,6 +239,10 @@ func TestWailsSubagentFilter(t *testing.T) {
 }
 
 func newAppTestAgent(t *testing.T) *agent.Agent {
+	return newAppTestAgentAt(t, "http://127.0.0.1:9/v1")
+}
+
+func newAppTestAgentAt(t *testing.T, baseURL string) *agent.Agent {
 	t.Helper()
 
 	home := t.TempDir()
@@ -260,7 +264,7 @@ func newAppTestAgent(t *testing.T) *agent.Agent {
       }
     }
   }
-}`, "http://127.0.0.1:9/v1")
+}`, baseURL)
 	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}

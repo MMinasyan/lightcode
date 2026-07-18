@@ -74,6 +74,10 @@ export function GetRuntimeConfig() {
   return window['go']['main']['App']['GetRuntimeConfig']();
 }
 
+export function HydrateSession(arg1) {
+  return window['go']['main']['App']['HydrateSession'](arg1);
+}
+
 export function ModelList() {
   return window['go']['main']['App']['ModelList']();
 }

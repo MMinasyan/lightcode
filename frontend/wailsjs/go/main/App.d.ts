@@ -40,6 +40,8 @@ export function GetProviderConfig(arg1:string):Promise<agent.ProviderConfigView>
 
 export function GetRuntimeConfig():Promise<agent.RuntimeConfigSettings>;
 
+export function HydrateSession(arg1:string):Promise<agent.HydrationState>;
+
 export function ModelList():Promise<Array<agent.ModelListEntry>>;
 
 export function PermissionSuggest(arg1:string,arg2:string,arg3:string,arg4:string):Promise<Array<permission.Suggestion>>;
