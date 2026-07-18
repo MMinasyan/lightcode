@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -52,6 +53,15 @@ type Manager struct {
 	maxProcs      int
 	outputOptions cmdoutput.Options
 	workspaceRoot string
+	// closed rejects new starts after Close. cbClosed suppresses exit callbacks
+	// not yet admitted; cbWG tracks callbacks admitted before close, both guarded
+	// by mu so admission cannot race Close's wait. closeOnce/closeDone make Close
+	// a single shared join so concurrent callers all wait for the same cleanup.
+	closed    bool
+	cbClosed  bool
+	cbWG      sync.WaitGroup
+	closeOnce sync.Once
+	closeDone chan struct{}
 }
 
 type ExitEvent struct {
@@ -82,6 +92,7 @@ func NewManagerAtRoot(maxProcs int, outputOptions cmdoutput.Options, workspaceRo
 		maxProcs:      maxProcs,
 		outputOptions: outputOptions,
 		workspaceRoot: workspaceRoot,
+		closeDone:     make(chan struct{}),
 	}
 }
 
@@ -161,11 +172,25 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 
 func (m *Manager) StartForSession(sessionID string, command string, timeoutSec int) (string, error) {
 	sessionID = strings.TrimSpace(sessionID)
+	id, err := newProcessID()
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.Command("sh", "-c", command)
+	if m.workspaceRoot != "" {
+		cmd.Dir = m.workspaceRoot
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// Hold mu from the closed/limit check through cmd.Start and registration so a
+	// child is either registered before Close or never starts after it.
 	m.mu.Lock()
-	maxProcs := m.maxProcs
-	outputOptions := m.outputOptions
-	running := 0
-	if maxProcs > 0 {
+	if m.closed {
+		m.mu.Unlock()
+		return "", fmt.Errorf("process: manager is closed")
+	}
+	if m.maxProcs > 0 {
+		running := 0
 		for _, cs := range m.procs {
 			if cs.SessionID != sessionID {
 				continue
@@ -176,30 +201,19 @@ func (m *Manager) StartForSession(sessionID string, command string, timeoutSec i
 			}
 			cs.mu.Unlock()
 		}
+		if running >= m.maxProcs {
+			m.mu.Unlock()
+			return "", fmt.Errorf("process: background process limit reached (%d/%d). Kill existing processes or wait for them to exit", running, m.maxProcs)
+		}
 	}
-	m.mu.Unlock()
-	if maxProcs > 0 && running >= maxProcs {
-		return "", fmt.Errorf("process: background process limit reached (%d/%d). Kill existing processes or wait for them to exit", running, maxProcs)
-	}
-
-	id, err := newProcessID()
-	if err != nil {
-		return "", err
-	}
-	cmd := exec.Command("sh", "-c", command)
-	if m.workspaceRoot != "" {
-		cmd.Dir = m.workspaceRoot
-	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	capture := cmdoutput.NewCapture(outputOptions)
+	capture := cmdoutput.NewCapture(m.outputOptions)
 	cmd.Stdout = capture.Stdout()
 	cmd.Stderr = capture.Stderr()
-
 	if err := cmd.Start(); err != nil {
+		m.mu.Unlock()
 		capture.Close()
 		return "", err
 	}
-
 	cs := &CommandStarted{
 		ID:         id,
 		Command:    command,
@@ -210,8 +224,6 @@ func (m *Manager) StartForSession(sessionID string, command string, timeoutSec i
 		done:       make(chan struct{}),
 		timeoutSec: timeoutSec,
 	}
-
-	m.mu.Lock()
 	m.procs[id] = cs
 	handler := m.onExit
 	m.mu.Unlock()
@@ -237,7 +249,20 @@ func (m *Manager) StartForSession(sessionID string, command string, timeoutSec i
 		reason := cs.reason
 		cs.mu.Unlock()
 
-		if handler != nil {
+		// The child is reaped: unblock kill/Close before running the exit
+		// callback, so reaping never waits on a callback.
+		close(cs.done)
+
+		// Run the exit callback only if admitted; Close suppresses callbacks not
+		// yet admitted and joins those admitted before it. FormatOutput stays lazy
+		// so a dropped handler never surfaces the full spilled output.
+		m.mu.Lock()
+		admit := handler != nil && !m.cbClosed
+		if admit {
+			m.cbWG.Add(1)
+		}
+		m.mu.Unlock()
+		if admit {
 			handler(ExitEvent{
 				ID:           id,
 				Command:      command,
@@ -247,6 +272,7 @@ func (m *Manager) StartForSession(sessionID string, command string, timeoutSec i
 				TimeoutSec:   timeoutSec,
 				FormatOutput: capture.Format,
 			})
+			m.cbWG.Done()
 		}
 
 		cs.mu.Lock()
@@ -255,7 +281,6 @@ func (m *Manager) StartForSession(sessionID string, command string, timeoutSec i
 
 		// Auto-remove finalized process so it doesn't count against the limit.
 		m.Remove(id)
-		close(cs.done)
 		capture.Close()
 	}()
 
@@ -340,9 +365,39 @@ func (m *Manager) kill(id string, sessionID string, enforceSession bool) error {
 	case <-cs.done:
 	case <-time.After(500 * time.Millisecond):
 		_ = syscall.Kill(-cs.cmd.Process.Pid, syscall.SIGKILL)
-		<-cs.done
+		select {
+		case <-cs.done:
+		case <-time.After(5 * time.Second):
+			// An unreapable child after SIGKILL is diagnosed and abandoned rather
+			// than blocking shutdown indefinitely.
+			fmt.Fprintf(os.Stderr, "lightcode: process %s not reaped within 5s after SIGKILL\n", id)
+		}
 	}
 	return nil
+}
+
+// Close stops accepting new starts, terminates and reaps every registered child,
+// and joins every exit callback admitted before close; callbacks not yet
+// admitted are suppressed. It is idempotent.
+func (m *Manager) Close() {
+	m.closeOnce.Do(func() {
+		m.mu.Lock()
+		m.closed = true
+		m.cbClosed = true
+		ids := make([]string, 0, len(m.procs))
+		for id := range m.procs {
+			ids = append(ids, id)
+		}
+		m.mu.Unlock()
+		for _, id := range ids {
+			_ = m.kill(id, "", false)
+		}
+		m.cbWG.Wait()
+		close(m.closeDone)
+	})
+	// Every caller, including the one that performed the work, waits for the
+	// shared cleanup to complete so Close is a real join.
+	<-m.closeDone
 }
 
 func (cs *CommandStarted) markReason(reason ExitReason) bool {

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -610,4 +611,91 @@ func extractSpillPath(t *testing.T, result string) string {
 		path = path[:end]
 	}
 	return strings.TrimSpace(path)
+}
+
+// TestProcessManagerClose covers the Close/start-admission/reap protocol:
+// Close rejects new starts, and killing a process reaps it (unblocking the kill)
+// before running the exit callback, so a blocked callback never stalls the kill.
+func TestProcessManagerClose(t *testing.T) {
+	t.Run("close_rejects_new_start", func(t *testing.T) {
+		m := NewManager(0, cmdoutput.Options{})
+		m.Close()
+		if _, err := m.StartForSession("s", "true", 0); err == nil {
+			t.Fatal("StartForSession after Close should be rejected")
+		}
+	})
+
+	t.Run("kill_reaps_before_callback", func(t *testing.T) {
+		m := NewManager(0, cmdoutput.Options{})
+		started := make(chan struct{})
+		release := make(chan struct{})
+		m.SetExitHandler(func(ExitEvent) {
+			close(started)
+			<-release
+		})
+		id, err := m.StartForSession("s", "sleep 30", 0)
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		killed := make(chan struct{})
+		go func() {
+			_ = m.KillForSession("s", id)
+			close(killed)
+		}()
+		select {
+		case <-killed:
+		case <-time.After(3 * time.Second):
+			t.Fatal("Kill blocked on the exit callback")
+		}
+		<-started
+		close(release)
+	})
+}
+
+// TestProcessExitCallbackClose covers exit-callback admission: Close
+// suppresses a callback for a child it reaps, and joins a callback already
+// admitted before Close.
+func TestProcessExitCallbackClose(t *testing.T) {
+	t.Run("close_suppresses_unadmitted_callback", func(t *testing.T) {
+		m := NewManager(0, cmdoutput.Options{})
+		var called int32
+		m.SetExitHandler(func(ExitEvent) { atomic.AddInt32(&called, 1) })
+		if _, err := m.StartForSession("s", "sleep 30", 0); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		m.Close()
+		if atomic.LoadInt32(&called) != 0 {
+			t.Fatal("exit callback ran for a child reaped during Close, want suppressed")
+		}
+	})
+
+	t.Run("close_joins_admitted_callback", func(t *testing.T) {
+		m := NewManager(0, cmdoutput.Options{})
+		started := make(chan struct{})
+		release := make(chan struct{})
+		m.SetExitHandler(func(ExitEvent) {
+			close(started)
+			<-release
+		})
+		if _, err := m.StartForSession("s", "true", 0); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		<-started // the callback is admitted and running before Close
+		closed := make(chan struct{})
+		go func() {
+			m.Close()
+			close(closed)
+		}()
+		select {
+		case <-closed:
+			t.Fatal("Close returned before joining the admitted callback")
+		case <-time.After(200 * time.Millisecond):
+		}
+		close(release)
+		select {
+		case <-closed:
+		case <-time.After(3 * time.Second):
+			t.Fatal("Close did not return after the callback was released")
+		}
+	})
 }

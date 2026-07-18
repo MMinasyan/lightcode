@@ -410,7 +410,7 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 	finish := func(result taskResult) taskResult {
 		result.sessionID = sessionID
 		if childProcMgr != nil {
-			childProcMgr.KillAll()
+			childProcMgr.Close()
 		}
 		if events != nil {
 			close(events)

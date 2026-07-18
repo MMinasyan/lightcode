@@ -931,7 +931,7 @@ func (rt *runtime) initOnceLocked(ctx context.Context) {
 	if a.procMgr != nil {
 		go func() {
 			<-ctx.Done()
-			a.procMgr.KillAll()
+			a.procMgr.Close()
 		}()
 	}
 
@@ -3220,7 +3220,7 @@ func (a *Agent) ShutdownOwner() {
 		}
 	}
 	if a.procMgr != nil {
-		a.procMgr.KillAll()
+		a.procMgr.Close()
 	}
 }
 
