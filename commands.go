@@ -82,7 +82,6 @@ func checkNoArgs(fs *flag.FlagSet) error {
 // reset them to defaults on every flags() call, so state never leaks
 // between dispatches.
 var (
-	servePort       int
 	versionJSON     bool
 	doctorJSON      bool
 	upgradeCheck    bool
@@ -121,32 +120,6 @@ func init() {
 					return err
 				}
 				return runCLI()
-			},
-		},
-		{
-			name:    "serve",
-			summary: "run the local HTTP daemon",
-			flags: func() *flag.FlagSet {
-				fs := newFlagSet("serve")
-				fs.IntVar(&servePort, "port", 0, "listen port (0 = OS-assigned)")
-				return fs
-			},
-			run: func(fs *flag.FlagSet, args []string) error {
-				if err := checkNoArgs(fs); err != nil {
-					return err
-				}
-				return runServe(servePort)
-			},
-		},
-		{
-			name:    "stop",
-			summary: "stop the local owner process",
-			flags:   func() *flag.FlagSet { return newFlagSet("stop") },
-			run: func(fs *flag.FlagSet, args []string) error {
-				if err := checkNoArgs(fs); err != nil {
-					return err
-				}
-				return runStop()
 			},
 		},
 		{

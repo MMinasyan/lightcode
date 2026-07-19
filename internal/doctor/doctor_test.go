@@ -5,13 +5,11 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/project"
 )
 
 func snapshotTree(t *testing.T, root string) map[string]string {
@@ -543,67 +541,6 @@ func TestSymlinkDataDirWarns(t *testing.T) {
 	c := find(t, report, "data", "dir")
 	if c.Status != StatusWarn {
 		t.Fatalf("symlinked data dir = %+v, want warn", c)
-	}
-}
-
-func TestLockfiles(t *testing.T) {
-	home := t.TempDir()
-	writeConfig(t, home, `{"providers": {}, "default_model": ""}`)
-	ownerPath := filepath.Join(home, ".lightcode", "owner.lock")
-	if err := os.MkdirAll(filepath.Dir(ownerPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	livePID := os.Getpid()
-	cmd := exec.Command("true")
-	if err := cmd.Run(); err != nil {
-		t.Fatal(err)
-	}
-	stalePID := cmd.Process.Pid
-
-	write := func(body string) {
-		if err := os.WriteFile(ownerPath, []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write(fmt.Sprintf(`{"port": 4321, "token": "t", "pid": %d}`, livePID))
-
-	report, _ := run(t, params(home))
-	if c := find(t, report, "daemon", "owner"); c.Status != StatusOK {
-		t.Fatalf("live lockfile = %+v", c)
-	}
-
-	write(fmt.Sprintf(`{"port": 4322, "token": "t", "pid": %d}`, stalePID))
-	report, _ = run(t, params(home))
-	if c := find(t, report, "daemon", "owner"); c.Status != StatusWarn {
-		t.Fatalf("stale lockfile = %+v", c)
-	}
-
-	write("{garbage")
-	report, _ = run(t, params(home))
-	if c := find(t, report, "daemon", "owner"); c.Status != StatusWarn {
-		t.Fatalf("malformed lockfile = %+v", c)
-	}
-	if report.Failures != 0 {
-		t.Fatal("lockfile problems are warnings, not failures")
-	}
-}
-
-func TestProjectRecordFound(t *testing.T) {
-	home := t.TempDir()
-	workDir := filepath.Join(home, "work")
-	projectsRoot := filepath.Join(home, ".lightcode", "projects")
-	rec, err := project.EnsureForPath(projectsRoot, workDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p := params(home)
-	p.WorkDir = workDir
-	report, _ := run(t, p)
-	c := find(t, report, "daemon", "project")
-	wantDetail := fmt.Sprintf("project work (%s)", rec.ID)
-	if c.Status != StatusOK || c.Detail != wantDetail {
-		t.Fatalf("daemon/project = %+v, want detail %q", c, wantDetail)
 	}
 }
 
