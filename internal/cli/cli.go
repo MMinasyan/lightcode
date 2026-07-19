@@ -363,7 +363,8 @@ func (c *CLI) acceptsSessionEvent(sessionID string) bool {
 }
 
 func (c *CLI) acceptsEvent(ev agent.Event) bool {
-	return c.sv().AcceptsEvent(ev)
+	v := c.sv()
+	return v.AcceptsEventForCurrent(v.Current(), ev)
 }
 
 func (c *CLI) acceptsSubagentEvent(ev agent.Event) bool {

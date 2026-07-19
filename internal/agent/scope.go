@@ -172,6 +172,26 @@ func (v *SessionView) AcceptsEvent(ev Event) bool {
 	return true
 }
 
+// AcceptsEventForCurrent decides event delivery against an explicit current
+// session id without querying the owner. A single-goroutine consumer that has
+// already fixed its presentation-current id calls this while owner state locks
+// may be held, so it must never probe liveness or take an owner lock. Global
+// (untagged) events always pass; a session-tagged event passes only for the
+// given current; subagent events pass through the children set.
+func (v *SessionView) AcceptsEventForCurrent(current string, ev Event) bool {
+	current = strings.TrimSpace(current)
+	if ev.SubagentSessionID != "" {
+		if current == "" {
+			return false
+		}
+		return v.AcceptsSubagentEventForCurrent(current, ev)
+	}
+	if sessionID := strings.TrimSpace(ev.SessionID); sessionID != "" {
+		return sessionID == current
+	}
+	return true
+}
+
 func (v *SessionView) acceptsSubagentEvent(ev Event) bool {
 	current := v.LiveCurrent()
 	if current == "" {
