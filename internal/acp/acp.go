@@ -54,6 +54,28 @@ type turnActionParams struct {
 // acpOutputJoinTimeout bounds how long shutdown waits for the output drainer.
 var acpOutputJoinTimeout = 5 * time.Second
 
+// frameKind selects how the sole drainer filters an output frame against
+// presentation current before writing it.
+type frameKind uint8
+
+const (
+	// frameNormal is written while its sessionID is presentation-current; an empty
+	// sessionID is an untagged frame (a response or a global notification) the
+	// drainer always writes.
+	frameNormal frameKind = iota
+	// frameAdvance is a boundary: written when it carries bytes, and it adopts
+	// sessionID as the new presentation current (empty for a detach).
+	frameAdvance
+)
+
+// outFrame is one item the output FIFO carries: the marshaled JSON-RPC bytes (nil
+// for an invisible presentation-current advance) plus the drain-time filter tag.
+type outFrame struct {
+	data      []byte
+	kind      frameKind
+	sessionID string
+}
+
 // Runner drives the ACP stdio protocol.
 type Runner struct {
 	// agent is the concrete local owner this adapter constructs, initializes, and
@@ -66,9 +88,12 @@ type Runner struct {
 
 	// Output delivery spine: every outbound JSON-RPC frame is appended here and the
 	// sole drainer writes r.out, so protocol order is the drainer's write order, not
-	// merely non-interleaved bytes. Producers only append and wake the drainer.
+	// merely non-interleaved bytes. Producers only append and wake the drainer; the
+	// drainer decides delivery against presented (presentation current), which
+	// advances only when the drainer consumes a boundary. Both fields are under mu.
 	mu        sync.Mutex
-	outFrames [][]byte
+	outFrames []outFrame
+	presented string
 	outWake   chan struct{}
 	outClosed bool
 	outDone   chan struct{}
@@ -114,20 +139,35 @@ func (r *Runner) startOutput() {
 	go r.runOutputDrainer()
 }
 
-// enqueue appends one marshaled frame and wakes the drainer. It never blocks or
-// writes, so it is safe to call from the event callback that runs under an owner lock.
-func (r *Runner) enqueue(data []byte) {
+// enqueueFrame appends one frame and wakes the drainer. It never blocks, writes,
+// or queries the owner, so it is safe to call from the event callback that runs
+// under an owner lock.
+func (r *Runner) enqueueFrame(f outFrame) {
 	r.mu.Lock()
 	if r.outClosed {
 		r.mu.Unlock()
 		return
 	}
-	r.outFrames = append(r.outFrames, data)
+	r.outFrames = append(r.outFrames, f)
 	r.mu.Unlock()
 	select {
 	case r.outWake <- struct{}{}:
 	default:
 	}
+}
+
+// enqueue appends one untagged frame (a response or a global notification) the
+// drainer always writes.
+func (r *Runner) enqueue(data []byte) {
+	r.enqueueFrame(outFrame{data: data})
+}
+
+// seedPresented sets presentation current at startup, before the client's first
+// prompt, so the initially-current session's live events reach the client.
+func (r *Runner) seedPresented(id string) {
+	r.mu.Lock()
+	r.presented = strings.TrimSpace(id)
+	r.mu.Unlock()
 }
 
 // runOutputDrainer is the only goroutine that writes r.out. It drains frames in
@@ -145,11 +185,28 @@ func (r *Runner) runOutputDrainer() {
 			<-r.outWake
 			continue
 		}
-		data := r.outFrames[0]
+		frame := r.outFrames[0]
 		r.outFrames = r.outFrames[1:]
+		write := r.presentAcceptsLocked(frame)
 		r.mu.Unlock()
-		_, _ = r.out.Write(data)
+		if write && frame.data != nil {
+			_, _ = r.out.Write(frame.data)
+		}
 	}
+}
+
+// presentAcceptsLocked decides whether a frame is written and adopts a boundary's
+// destination as presentation current. It runs under mu on the sole drainer, so
+// presented is drainer-owned and never queried from the owner: an untagged frame
+// (response or global notification) always writes, a session-tagged notification
+// writes only while its session is presentation-current, and a boundary always
+// advances presented (empty for a detach).
+func (r *Runner) presentAcceptsLocked(f outFrame) bool {
+	if f.kind == frameAdvance {
+		r.presented = f.sessionID
+		return true
+	}
+	return f.sessionID == "" || f.sessionID == r.presented
 }
 
 // closeOutput rejects further frames and joins the drainer, abandoning it if it is
@@ -207,6 +264,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 	r.setCurrentSessionID(sessionID)
+	r.seedPresented(sessionID)
 
 	scanErr := make(chan error, 1)
 	go func() { scanErr <- r.scanLoop(sigCtx) }()
@@ -356,10 +414,9 @@ func (r *Runner) handleEvent(ev agent.Event) {
 	if ev.SubagentSessionID != "" {
 		return
 	}
-	if !r.acceptsSessionEvent(ev.SessionID) {
-		return
-	}
-
+	// This callback only appends the event tagged with its session; the sole
+	// drainer, not this callback, decides delivery against presentation current, so
+	// the callback never queries the owner for liveness.
 	var method string
 	var params any
 
@@ -410,7 +467,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 			JSONRPC: "2.0",
 			Method:  "agent/turn_end",
 			Params:  map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled},
-		})
+		}, ev.SessionID)
 		if ev.RefreshSession {
 			r.pushResyncForEvent(ev)
 		}
@@ -440,7 +497,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 		r.sendNotification(Notification{
 			JSONRPC: "2.0",
 			Method:  "agent/compaction_end",
-		})
+		}, ev.SessionID)
 		if ev.RefreshSession {
 			r.pushResyncForEvent(ev)
 		}
@@ -456,7 +513,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 		JSONRPC: "2.0",
 		Method:  method,
 		Params:  params,
-	})
+	}, ev.SessionID)
 }
 
 // --- Method handlers ---
@@ -495,10 +552,6 @@ func (r *Runner) paramsSessionID(explicit string) (string, error) {
 		return explicit, nil
 	}
 	return r.currentSession()
-}
-
-func (r *Runner) acceptsSessionEvent(sessionID string) bool {
-	return r.sv().AcceptsSessionEvent(sessionID)
 }
 
 func (r *Runner) liveCurrentSessionID() string {
@@ -566,7 +619,14 @@ func (r *Runner) handleSessionPrompt(ctx context.Context, req Request) {
 			r.respondError(req.ID, -32000, err.Error())
 			return
 		}
+		prev, _ := r.currentSession()
 		r.setCurrentSessionID(sessionID)
+		if strings.TrimSpace(prev) != sessionID {
+			// Prompting an explicit different session switches presentation current
+			// too, FIFO-ordered ahead of this turn's events and without a
+			// client-visible boundary, so the turn's events reach the client.
+			r.enqueueFrame(outFrame{kind: frameAdvance, sessionID: sessionID})
+		}
 	}
 	res, err := r.agent.SubmitToSession(ctx, sessionID, params.Content)
 	if err != nil {
@@ -959,11 +1019,11 @@ func (r *Runner) pushSessionBoundary(sessionID string) {
 		return
 	}
 	r.owner.HydrateSessionWithBoundary(sessionID, func(state agent.HydrationState) {
-		r.sendNotification(Notification{
+		r.sendBoundary(Notification{
 			JSONRPC: "2.0",
 			Method:  "agent/session_changed",
 			Params:  state,
-		})
+		}, strings.TrimSpace(state.Session.ID))
 	})
 }
 
@@ -976,7 +1036,7 @@ func (r *Runner) pushSessionResync(sessionID string) {
 		JSONRPC: "2.0",
 		Method:  "agent/session_resync",
 		Params:  r.sv().SessionChangedPayload(sessionID),
-	})
+	}, sessionID)
 }
 
 func (r *Runner) pushResyncForEvent(ev agent.Event) {
@@ -1009,10 +1069,23 @@ func (r *Runner) sendResponse(resp Response) {
 	r.enqueue(append(data, '\n'))
 }
 
-func (r *Runner) sendNotification(n Notification) {
+// sendNotification appends a session-tagged notification the drainer delivers only
+// while that session is presentation-current. An empty session id is a global
+// notification the drainer always writes.
+func (r *Runner) sendNotification(n Notification, sessionID string) {
 	data, err := json.Marshal(n)
 	if err != nil {
 		return
 	}
-	r.enqueue(append(data, '\n'))
+	r.enqueueFrame(outFrame{data: append(data, '\n'), sessionID: strings.TrimSpace(sessionID)})
+}
+
+// sendBoundary appends a navigation/turn-action boundary the drainer writes and
+// then adopts sessionID as presentation current (empty for a detach).
+func (r *Runner) sendBoundary(n Notification, sessionID string) {
+	data, err := json.Marshal(n)
+	if err != nil {
+		return
+	}
+	r.enqueueFrame(outFrame{data: append(data, '\n'), kind: frameAdvance, sessionID: strings.TrimSpace(sessionID)})
 }

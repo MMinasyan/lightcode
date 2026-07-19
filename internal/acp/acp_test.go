@@ -294,7 +294,7 @@ func TestWireHelpers(t *testing.T) {
 	r := &Runner{out: &out}
 	r.respond("id-1", map[string]any{"ok": true})
 	r.respondError("id-2", -32602, "bad params")
-	r.sendNotification(Notification{JSONRPC: "2.0", Method: "agent/test", Params: map[string]any{"x": 1}})
+	r.sendNotification(Notification{JSONRPC: "2.0", Method: "agent/test", Params: map[string]any{"x": 1}}, "")
 
 	lines := drainedLines(t, r, &out, 3)
 	if !strings.Contains(lines[0], `"jsonrpc":"2.0"`) || !strings.HasSuffix(out.String(), "\n") {
@@ -432,7 +432,7 @@ func TestHandleEventCarriesSequence(t *testing.T) {
 func TestACPUsageAppliesCumulativeWithoutOwnerQuery(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{out: &out}
-	r.setCurrentSessionID("s")
+	r.seedPresented("s")
 	report := agent.TokenReport{ContextUsed: 1234, ContextWindow: 8000}
 	r.handleEvent(agent.Event{Kind: agent.EventUsage, SessionID: "s", CumulativeTokens: &report})
 
@@ -455,26 +455,32 @@ func TestACPUsageAppliesCumulativeWithoutOwnerQuery(t *testing.T) {
 	}
 }
 
+// TestHandleEventFiltersSession proves the drainer writes a session-tagged event
+// only while its session is presentation-current: a wrong-session event is dropped,
+// the presentation-current session's event is written, and a boundary that detaches
+// presentation current drops the session's subsequent events.
 func TestHandleEventFiltersSession(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{out: &out}
-	r.setCurrentSessionID("session-a")
+	r.seedPresented("session-a")
+
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "session-b", Result: "skip"})
 	r.drainForTest()
 	if out.Len() != 0 {
 		t.Fatalf("wrong-session event was emitted: %q", out.String())
 	}
+
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "session-a", Result: "keep"})
 	lines := drainedLines(t, r, &out, 1)
 	assertACPNotificationMethod(t, lines[0], "agent/message_chunk")
 
-	r.drainForTest()
 	out.Reset()
-	r.setCurrentSessionID("")
+	// Detach presentation current through a boundary; the session's events now drop.
+	r.enqueueFrame(outFrame{kind: frameAdvance, sessionID: ""})
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "session-a", Result: "skip"})
 	r.drainForTest()
 	if out.Len() != 0 {
-		t.Fatalf("empty-current event was emitted: %q", out.String())
+		t.Fatalf("event after detach was emitted: %q", out.String())
 	}
 }
 
@@ -580,6 +586,7 @@ func TestHandleEventCompactionEndPushesSessionChanged(t *testing.T) {
 	r := &Runner{agent: a, out: &out}
 	sessionID := a.SessionCurrent().ID
 	r.setCurrentSessionID(sessionID)
+	r.seedPresented(sessionID)
 
 	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, SessionID: sessionID, RefreshSession: true})
 
@@ -605,6 +612,7 @@ func TestHandleEventActiveCompactionDefersSessionChangedUntilTurnEnd(t *testing.
 	r := &Runner{agent: a, out: &out}
 	sessionID := a.SessionCurrent().ID
 	r.setCurrentSessionID(sessionID)
+	r.seedPresented(sessionID)
 
 	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, SessionID: sessionID})
 	lines := drainedLines(t, r, &out, 1)
@@ -1024,6 +1032,7 @@ func TestACPStalledOutputPreservesBoundaryOrder(t *testing.T) {
 	out := new(bytes.Buffer)
 	r := &Runner{agent: a, owner: a, out: out}
 	r.setCurrentSessionID(aID)
+	r.seedPresented(aID)
 	// Output is stalled: the drainer is never started, so every frame accumulates in
 	// the FIFO and is delivered only when the test drains it.
 
@@ -1155,6 +1164,58 @@ func TestACPPromptSelectsSession(t *testing.T) {
 	})
 	if got := r.currentSessionSummary().ID; got != secondID {
 		t.Fatalf("current session = %q, want %q", got, secondID)
+	}
+}
+
+// TestACPPromptSwitchAdvancesPresentation proves prompting an explicit different
+// session advances presentation current, so the prompted session's turn events reach
+// the client (the switch pushes no client-visible boundary), and a late event for the
+// previous session is dropped.
+func TestACPPromptSwitchAdvancesPresentation(t *testing.T) {
+	a := newACPTestAgent(t)
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
+		t.Fatalf("append first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+		t.Fatalf("append second: %v", err)
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: a, owner: a, out: &out}
+	r.setCurrentSessionID(firstID)
+	r.seedPresented(firstID)
+
+	// The cancelled context fails the model call fast, but the explicit switch must
+	// still advance presentation current to secondID ahead of any turn events.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.handleSessionPrompt(ctx, Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"hi"}`),
+	})
+	r.drainForTest()
+	out.Reset()
+
+	// A live event for the prompted session now reaches the client.
+	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: secondID, Result: "second-event"})
+	lines := drainedLines(t, r, &out, 1)
+	assertACPNotificationMethod(t, lines[0], "agent/message_chunk")
+
+	// A late event for the previous session is dropped.
+	out.Reset()
+	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: firstID, Result: "late-first"})
+	r.drainForTest()
+	if out.Len() != 0 {
+		t.Fatalf("late event for the previous session was emitted: %q", out.String())
 	}
 }
 
@@ -1469,12 +1530,19 @@ func responseLines(t *testing.T, output string, want int) []string {
 // drainForTest synchronously writes the runner's queued output frames to r.out, so
 // a test can read the output the sole drainer would otherwise write asynchronously.
 func (r *Runner) drainForTest() {
-	r.mu.Lock()
-	frames := r.outFrames
-	r.outFrames = nil
-	r.mu.Unlock()
-	for _, data := range frames {
-		_, _ = r.out.Write(data)
+	for {
+		r.mu.Lock()
+		if len(r.outFrames) == 0 {
+			r.mu.Unlock()
+			return
+		}
+		f := r.outFrames[0]
+		r.outFrames = r.outFrames[1:]
+		write := r.presentAcceptsLocked(f)
+		r.mu.Unlock()
+		if write && f.data != nil {
+			_, _ = r.out.Write(f.data)
+		}
 	}
 }
 
