@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -110,6 +111,154 @@ func TestACPOwnsConcreteAgentLifecycle(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("Run hung joining the owner after stdin EOF")
 	}
+}
+
+// blockingReader blocks every Read until release is closed, modeling stdin with no
+// input so a Scan stays blocked until shutdown abandons it.
+type blockingReader struct{ release <-chan struct{} }
+
+func (b blockingReader) Read(p []byte) (int, error) {
+	<-b.release
+	return 0, io.EOF
+}
+
+// TestACPStdinReadByOneScanner proves only scanLoop reads r.in, so there is no
+// second stdin reader competing for input lines.
+func TestACPStdinReadByOneScanner(t *testing.T) {
+	src, err := os.ReadFile("acp.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	decl := regexp.MustCompile(`(?m)^func (?:\([^)]*\) )?(\w+)\(`)
+	locs := decl.FindAllStringSubmatchIndex(s, -1)
+	for i, loc := range locs {
+		name := s[loc[2]:loc[3]]
+		end := len(s)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		if name != "scanLoop" && strings.Contains(s[loc[1]:end], "r.in") {
+			t.Fatalf("r.in is read in %s; only scanLoop may read the ACP stdin stream", name)
+		}
+	}
+}
+
+// TestACPCloseRejectsLaterAdmission proves a line read after shutdown closed the
+// dispatch gate is not admitted, so it is never parsed or dispatched.
+func TestACPCloseRejectsLaterAdmission(t *testing.T) {
+	r := &Runner{}
+	r.closeDispatch()
+	if r.admitDispatch() {
+		r.dispatchWG.Done()
+		t.Fatal("a line read after dispatch close must not be admitted")
+	}
+}
+
+// TestACPShutdownJoinsAdmittedDispatchResponse proves shutdown waits for an
+// in-flight dispatch and that the dispatch's response is enqueued before shutdown
+// completes.
+func TestACPShutdownJoinsAdmittedDispatchResponse(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	if !r.admitDispatch() {
+		t.Fatal("admitDispatch must succeed before dispatch close")
+	}
+
+	teardownDone := make(chan struct{})
+	go func() {
+		r.closeDispatch()
+		r.dispatchWG.Wait()
+		close(teardownDone)
+	}()
+
+	select {
+	case <-teardownDone:
+		t.Fatal("shutdown joined before the admitted dispatch finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	r.processLine(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`))
+	r.dispatchWG.Done()
+
+	select {
+	case <-teardownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not complete after the admitted dispatch finished")
+	}
+
+	lines := drainedLines(t, r, &out, 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error != nil || resp.Result == nil {
+		t.Fatalf("admitted dispatch response = %+v, want a success result", resp)
+	}
+}
+
+// TestACPShutdownJoinsAdmittedDispatchParseError proves a malformed admitted line
+// still enqueues its parse-error response before shutdown completes.
+func TestACPShutdownJoinsAdmittedDispatchParseError(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	if !r.admitDispatch() {
+		t.Fatal("admitDispatch must succeed before dispatch close")
+	}
+
+	teardownDone := make(chan struct{})
+	go func() {
+		r.closeDispatch()
+		r.dispatchWG.Wait()
+		close(teardownDone)
+	}()
+
+	select {
+	case <-teardownDone:
+		t.Fatal("shutdown joined before the admitted parse-error finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	r.processLine(context.Background(), []byte(`{not json`))
+	r.dispatchWG.Done()
+
+	select {
+	case <-teardownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not complete after the admitted parse-error finished")
+	}
+
+	lines := drainedLines(t, r, &out, 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error == nil || resp.Error.Code != -32700 {
+		t.Fatalf("admitted parse-error response = %+v, want code -32700", resp)
+	}
+}
+
+// TestACPShutdownReturnsWithScanBlocked proves shutdown tears down and Run returns
+// even while a Scan is blocked on stdin; the blocked reader is abandoned.
+func TestACPShutdownReturnsWithScanBlocked(t *testing.T) {
+	ag := newACPTestAgent(t)
+	release := make(chan struct{})
+	var out bytes.Buffer
+	r := &Runner{agent: ag, owner: ag, in: blockingReader{release: release}, out: &out}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	time.Sleep(100 * time.Millisecond) // let Run reach the blocked Scan
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("Run did not return while a Scan was blocked on stdin")
+	}
+	close(release) // release the abandoned reader goroutine
 }
 
 func TestDispatchInitializeAndUnknownMethod(t *testing.T) {

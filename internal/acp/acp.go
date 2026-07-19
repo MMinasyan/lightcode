@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
@@ -72,8 +74,37 @@ type Runner struct {
 	outDone   chan struct{}
 	outOnce   sync.Once
 
+	// Input dispatch admission: the single scan loop admits one whole line at a
+	// time under dispatchMu. Once closed no further line is admitted, and
+	// dispatchWG tracks the in-flight line-processing interval so shutdown joins a
+	// running dispatch before tearing down the owner and output.
+	dispatchMu     sync.Mutex
+	dispatchClosed bool
+	dispatchWG     sync.WaitGroup
+
 	viewOnce sync.Once
 	view     *agent.SessionView
+}
+
+// admitDispatch reserves the line-processing interval unless dispatch admission is
+// closed. On success the caller must call dispatchWG.Done once the line is fully
+// processed and its response or parse error is enqueued.
+func (r *Runner) admitDispatch() bool {
+	r.dispatchMu.Lock()
+	defer r.dispatchMu.Unlock()
+	if r.dispatchClosed {
+		return false
+	}
+	r.dispatchWG.Add(1)
+	return true
+}
+
+// closeDispatch rejects further line admission under the gate, so a line read after
+// shutdown starts is never processed.
+func (r *Runner) closeDispatch() {
+	r.dispatchMu.Lock()
+	r.dispatchClosed = true
+	r.dispatchMu.Unlock()
 }
 
 // startOutput installs the single output drainer before any producer runs.
@@ -153,6 +184,14 @@ func (r *Runner) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// One signal watcher owns process shutdown: SIGTERM/Interrupt (or a cancelled
+	// parent context) cancels sigCtx. The scan loop observes it before its next
+	// Scan, and Run observes it to tear down even when a Scan is already blocked on
+	// stdin — that blocked Scan is the process-lifetime exception, abandoned rather
+	// than joined.
+	sigCtx, sigStop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer sigStop()
+
 	r.startOutput()
 	r.agent.SetEventHandler(r.handleEvent)
 	r.agent.Init(ctx)
@@ -169,44 +208,70 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.setCurrentSessionID(sessionID)
 
-	scanner := bufio.NewScanner(r.in)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+	scanErr := make(chan error, 1)
+	go func() { scanErr <- r.scanLoop(sigCtx) }()
 
-scan:
-	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
-			break scan
-		default:
-		}
-
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-
-		var req Request
-		if err := json.Unmarshal(line, &req); err != nil {
-			r.sendResponse(Response{
-				JSONRPC: "2.0",
-				ID:      nil,
-				Error:   &RPCError{Code: -32700, Message: "parse error"},
-			})
-			continue
-		}
-
-		r.dispatch(ctx, req)
+	var err error
+	select {
+	case err = <-scanErr:
+	case <-sigCtx.Done():
 	}
 
-	// Join the owner's in-flight turns and workers first, so their terminal events
-	// (e.g. turn_end) are still admitted to the output, then drain and close the
-	// output writer, then let the deferred cancel tear down the host context (the
-	// LSP teardown keys on it).
+	// Teardown, once, in order: close admission under the gate so no further line is
+	// processed, join any in-flight dispatch, join the owner's turns/workers so their
+	// terminal events (e.g. turn_end) are still admitted, then drain and close the
+	// output writer. The deferred cancel then tears down the host context.
+	r.closeDispatch()
+	r.dispatchWG.Wait()
 	if r.owner != nil {
 		r.owner.ShutdownOwner()
 	}
 	r.closeOutput()
-	return scanner.Err()
+	return err
+}
+
+// scanLoop is the single stdin reader. It processes one whole line at a time and
+// returns when stdin ends, a read errors, ctx is cancelled between lines, or
+// dispatch admission has closed. A Scan already blocked on stdin is not unblocked
+// here; Run abandons that goroutine as the process-lifetime exception.
+func (r *Runner) scanLoop(ctx context.Context) error {
+	scanner := bufio.NewScanner(r.in)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+		if !scanner.Scan() {
+			return scanner.Err()
+		}
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		if !r.admitDispatch() {
+			return nil
+		}
+		r.processLine(ctx, line)
+		r.dispatchWG.Done()
+	}
+}
+
+// processLine parses and dispatches one request line, enqueueing its response or a
+// parse error to the output FIFO. It is the whole interval the dispatch WaitGroup
+// tracks between Add and Done, so the response is always enqueued before Done.
+func (r *Runner) processLine(ctx context.Context, line []byte) {
+	var req Request
+	if err := json.Unmarshal(line, &req); err != nil {
+		r.sendResponse(Response{
+			JSONRPC: "2.0",
+			ID:      nil,
+			Error:   &RPCError{Code: -32700, Message: "parse error"},
+		})
+		return
+	}
+	r.dispatch(ctx, req)
 }
 
 func (r *Runner) dispatch(ctx context.Context, req Request) {
