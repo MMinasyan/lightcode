@@ -325,7 +325,7 @@ func (r *Runner) dispatch(ctx context.Context, req Request) {
 	case "tokens/usage":
 		r.handleTokenUsage(req)
 	case "project/current":
-		r.respond(req.ID, r.agent.ProjectCurrent())
+		r.respond(req.ID, r.projectCurrent())
 	case "project/list":
 		list, err := r.agent.ProjectList()
 		if err != nil {
@@ -507,6 +507,23 @@ func (r *Runner) liveCurrentSessionID() string {
 
 func (r *Runner) currentSessionSummary() agent.SessionSummary {
 	return r.sv().CurrentSummary()
+}
+
+// projectCurrent resolves the project of the connection's routing-current session.
+// ACP has no project-switch RPC, so the routing-current project is definitionally
+// the current session's project; resolving from it avoids the owner/backend current
+// and startup cwd, which do not track this connection's session switches.
+func (r *Runner) projectCurrent() agent.ProjectSummary {
+	id, err := r.currentSession()
+	if err != nil {
+		return agent.ProjectSummary{}
+	}
+	summary, err := r.agent.SessionSummaryForSession(id)
+	if err != nil {
+		return agent.ProjectSummary{}
+	}
+	out, _ := r.agent.ProjectCurrentForPath(summary.ProjectPath)
+	return out
 }
 
 func (r *Runner) tokenUsageForEvent(ev agent.Event) agent.TokenReport {

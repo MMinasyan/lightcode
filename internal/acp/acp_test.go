@@ -1008,6 +1008,52 @@ func TestACPStaleEvent(t *testing.T) {
 	}
 }
 
+// TestACPProjectCurrentFollowsCrossProjectSwitch proves project/current resolves
+// the routing-current session's project — not the owner/startup project — so an
+// A->B cross-project session switch makes project/current report B's project.
+func TestACPProjectCurrentFollowsCrossProjectSwitch(t *testing.T) {
+	a := newACPTestAgent(t)
+	startupID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	otherRoot := t.TempDir()
+	otherID, err := a.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath: %v", err)
+	}
+	wantStartup, err := a.ProjectCurrentForPath(a.ProjectRoot())
+	if err != nil {
+		t.Fatalf("startup project: %v", err)
+	}
+	wantOther, err := a.ProjectCurrentForPath(otherRoot)
+	if err != nil {
+		t.Fatalf("other project: %v", err)
+	}
+	if wantStartup.ID == wantOther.ID {
+		t.Fatal("test setup: the two sessions must be in different projects")
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: a, owner: a, out: &out}
+	r.setCurrentSessionID(startupID)
+
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "p1", Method: "project/current"})
+	if got := acpProjectFromResponse(t, drainedLines(t, r, &out, 1)[0]); got.ID != wantStartup.ID {
+		t.Fatalf("project/current before switch id = %q, want startup %q", got.ID, wantStartup.ID)
+	}
+	out.Reset()
+
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + otherID + `"}`)})
+	r.drainForTest()
+	out.Reset()
+
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "p2", Method: "project/current"})
+	if got := acpProjectFromResponse(t, drainedLines(t, r, &out, 1)[0]); got.ID != wantOther.ID {
+		t.Fatalf("project/current after cross-project switch id = %q, want %q (startup was %q)", got.ID, wantOther.ID, wantStartup.ID)
+	}
+}
+
 func TestACPClearRemovedCurrent(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -1217,6 +1263,26 @@ func appendACPUserTurnWithSnapshot(t *testing.T, a *agent.Agent, content, path, 
 		t.Fatalf("RecordSnapshotContent: %v", err)
 	}
 	return turn
+}
+
+func acpProjectFromResponse(t *testing.T, line string) agent.ProjectSummary {
+	t.Helper()
+	var resp Response
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("project response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("project response error: %+v", resp.Error)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("project result marshal: %v", err)
+	}
+	var proj agent.ProjectSummary
+	if err := json.Unmarshal(data, &proj); err != nil {
+		t.Fatalf("project result json: %v", err)
+	}
+	return proj
 }
 
 func assertACPNotificationMethod(t *testing.T, line, method string) {
