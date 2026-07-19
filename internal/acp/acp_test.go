@@ -753,6 +753,278 @@ func TestHandleTurnActionACPForkReturnsResultAndSessionChanged(t *testing.T) {
 	}
 }
 
+// TestACPOrderedDelivery proves that every boundary-producing lifecycle
+// operation enqueues its session boundary before its success response (the nearest
+// forbidden sibling is response-before-boundary), and that a preparation/mutation
+// failure enqueues only its error response and no boundary. revert_code is the one
+// lifecycle op that emits no boundary by design, so its success is response-only.
+func TestACPOrderedDelivery(t *testing.T) {
+	cases := []struct {
+		name          string
+		emitsBoundary bool
+		success       func(t *testing.T) (*Runner, *bytes.Buffer, func())
+		fail          func(t *testing.T) (*Runner, *bytes.Buffer, func())
+	}{
+		{
+			name:          "session_new",
+			emitsBoundary: true,
+			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				id, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession: %v", err)
+				}
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				r.setCurrentSessionID(id)
+				req := Request{JSONRPC: "2.0", ID: "new", Method: "session/new"}
+				return r, out, func() { r.handleSessionNew(req) }
+			},
+		},
+		{
+			name:          "session_switch",
+			emitsBoundary: true,
+			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				first, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession first: %v", err)
+				}
+				if _, err := a.AppendUserMessageToSession(first, "first"); err != nil {
+					t.Fatalf("append first: %v", err)
+				}
+				second, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession second: %v", err)
+				}
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				r.setCurrentSessionID(second)
+				req := Request{JSONRPC: "2.0", ID: "switch", Params: json.RawMessage(`{"id":"` + first + `"}`)}
+				return r, out, func() { r.handleSessionSwitch(req) }
+			},
+			fail: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				id, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession: %v", err)
+				}
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				r.setCurrentSessionID(id)
+				req := Request{JSONRPC: "2.0", ID: "switch", Params: json.RawMessage(`{"id":"does-not-exist"}`)}
+				return r, out, func() { r.handleSessionSwitch(req) }
+			},
+		},
+		{
+			name:          "session_archive",
+			emitsBoundary: true,
+			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				if _, err := a.NewSession("", "primary"); err != nil {
+					t.Fatalf("NewSession keep: %v", err)
+				}
+				id, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession target: %v", err)
+				}
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				r.setCurrentSessionID(id)
+				req := Request{JSONRPC: "2.0", ID: "archive", Params: json.RawMessage(`{"id":"` + id + `"}`)}
+				return r, out, func() { r.handleSessionArchive(req) }
+			},
+			fail: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				id, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession: %v", err)
+				}
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				r.setCurrentSessionID(id)
+				req := Request{JSONRPC: "2.0", ID: "archive", Params: json.RawMessage(`{"id":"does-not-exist"}`)}
+				return r, out, func() { r.handleSessionArchive(req) }
+			},
+		},
+		{
+			name:          "session_delete",
+			emitsBoundary: true,
+			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				if _, err := a.NewSession("", "primary"); err != nil {
+					t.Fatalf("NewSession keep: %v", err)
+				}
+				id, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession target: %v", err)
+				}
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				r.setCurrentSessionID(id)
+				req := Request{JSONRPC: "2.0", ID: "delete", Params: json.RawMessage(`{"id":"` + id + `"}`)}
+				return r, out, func() { r.handleSessionDelete(req) }
+			},
+			fail: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				id, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession: %v", err)
+				}
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				r.setCurrentSessionID(id)
+				req := Request{JSONRPC: "2.0", ID: "delete", Params: json.RawMessage(`{"id":"does-not-exist"}`)}
+				return r, out, func() { r.handleSessionDelete(req) }
+			},
+		},
+		{
+			name:          "session_fork",
+			emitsBoundary: true,
+			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				appendACPUserTurn(t, a, "first")
+				r.setCurrentSessionID(a.SessionCurrent().ID)
+				clicked := appendACPUserTurn(t, a, "fork point")
+				appendACPUserTurn(t, a, "after")
+				req := Request{JSONRPC: "2.0", ID: "fork", Params: json.RawMessage(`{"turn":` + itoa(clicked) + `}`)}
+				return r, out, func() { r.handleSessionFork(req) }
+			},
+			fail: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				req := Request{JSONRPC: "2.0", ID: "fork", Params: json.RawMessage(`{"session_id":"does-not-exist","turn":1}`)}
+				return r, out, func() { r.handleSessionFork(req) }
+			},
+		},
+		{
+			name:          "session_revert_code",
+			emitsBoundary: false,
+			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				appendACPUserTurn(t, a, "first")
+				r.setCurrentSessionID(a.SessionCurrent().ID)
+				path := filepath.Join(a.ProjectRoot(), "created.txt")
+				clicked := appendACPUserTurnWithSnapshot(t, a, "create file", path, "created\n")
+				req := Request{JSONRPC: "2.0", ID: "revert-code", Params: json.RawMessage(`{"turn":` + itoa(clicked) + `,"alsoRevertCode":true}`)}
+				return r, out, func() { r.handleRevertCode(req) }
+			},
+			fail: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				req := Request{JSONRPC: "2.0", ID: "revert-code", Params: json.RawMessage(`{"session_id":"does-not-exist","turn":1,"alsoRevertCode":true}`)}
+				return r, out, func() { r.handleRevertCode(req) }
+			},
+		},
+		{
+			name:          "session_revert_history",
+			emitsBoundary: true,
+			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				appendACPUserTurn(t, a, "first")
+				r.setCurrentSessionID(a.SessionCurrent().ID)
+				path := filepath.Join(a.ProjectRoot(), "created.txt")
+				clicked := appendACPUserTurnWithSnapshot(t, a, "create file", path, "created\n")
+				appendACPUserTurn(t, a, "after")
+				req := Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"turn":` + itoa(clicked) + `,"alsoRevertCode":true}`)}
+				return r, out, func() { r.handleRevertHistory(req) }
+			},
+			fail: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				req := Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"session_id":"does-not-exist","turn":1,"alsoRevertCode":true}`)}
+				return r, out, func() { r.handleRevertHistory(req) }
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"/success_boundary_before_response", func(t *testing.T) {
+			r, out, invoke := tc.success(t)
+			invoke()
+			if tc.emitsBoundary {
+				lines := drainedLines(t, r, out, 2)
+				assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+				assertACPSuccessResponse(t, lines[1])
+			} else {
+				lines := drainedLines(t, r, out, 1)
+				assertACPSuccessResponse(t, lines[0])
+			}
+		})
+		if tc.fail != nil {
+			t.Run(tc.name+"/failure_error_only_no_boundary", func(t *testing.T) {
+				r, out, invoke := tc.fail(t)
+				invoke()
+				lines := drainedLines(t, r, out, 1)
+				assertACPErrorResponse(t, lines[0])
+			})
+		}
+	}
+}
+
+// TestACPStalledOutputPreservesBoundaryOrder proves that with the output drainer
+// stalled, the FIFO still delivers a queued source event, then the A->B boundary,
+// then the switch response, then a destination event in that exact order — and that
+// routing current commits B (so a current-target request routes to B) before the
+// response is drained.
+func TestACPStalledOutputPreservesBoundaryOrder(t *testing.T) {
+	a := newACPTestAgent(t)
+	aID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession A: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(aID, "a-msg"); err != nil {
+		t.Fatalf("append A: %v", err)
+	}
+	bID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession B: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(bID, "b-msg"); err != nil {
+		t.Fatalf("append B: %v", err)
+	}
+
+	out := new(bytes.Buffer)
+	r := &Runner{agent: a, owner: a, out: out}
+	r.setCurrentSessionID(aID)
+	// Output is stalled: the drainer is never started, so every frame accumulates in
+	// the FIFO and is delivered only when the test drains it.
+
+	// A source (A) event is queued before the A->B boundary.
+	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: aID, Seq: 1, Result: "a-event"})
+	// The switch commits routing current to B and enqueues its boundary then response.
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + bID + `"}`)})
+	if got := r.currentSessionSummary().ID; got != bID {
+		t.Fatalf("routing current = %q, want B %q while output stalled", got, bID)
+	}
+	// A following current-target request routes to B while output remains stalled.
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "cur", Method: "session/current"})
+	// A destination (B) event is queued after the boundary.
+	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: bID, Seq: 2, Result: "b-event"})
+
+	// Resume output: the FIFO delivers in enqueue order.
+	lines := drainedLines(t, r, out, 5)
+	if c := acpChunkContent(t, lines[0]); c != "a-event" {
+		t.Fatalf("frame 0 = %q, want the source event before the boundary", c)
+	}
+	assertACPNotificationMethod(t, lines[1], "agent/session_changed")
+	assertACPSuccessResponse(t, lines[2])
+	if got := acpSessionSummaryFromResponse(t, lines[3]).ID; got != bID {
+		t.Fatalf("session/current response = %q, want B %q", got, bID)
+	}
+	if c := acpChunkContent(t, lines[4]); c != "b-event" {
+		t.Fatalf("frame 4 = %q, want the destination event after the boundary", c)
+	}
+}
+
 func TestHandleTurnActionACPInvalidParams(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{agent: newACPTestAgent(t), out: &out}
@@ -1263,6 +1535,67 @@ func appendACPUserTurnWithSnapshot(t *testing.T, a *agent.Agent, content, path, 
 		t.Fatalf("RecordSnapshotContent: %v", err)
 	}
 	return turn
+}
+
+func assertACPSuccessResponse(t *testing.T, line string) {
+	t.Helper()
+	var resp Response
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	// A JSON-RPC response echoes the request id; a notification carries none. This
+	// rejects a stray boundary notification standing in for the operation response.
+	if resp.ID == nil {
+		t.Fatalf("expected a JSON-RPC response with an id, got a frame without one: %s", line)
+	}
+	if resp.Error != nil {
+		t.Fatalf("expected success response, got error %+v", resp.Error)
+	}
+}
+
+func assertACPErrorResponse(t *testing.T, line string) {
+	t.Helper()
+	var resp Response
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error == nil {
+		t.Fatalf("expected error response, got success %+v", resp.Result)
+	}
+}
+
+func acpSessionSummaryFromResponse(t *testing.T, line string) agent.SessionSummary {
+	t.Helper()
+	var resp Response
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("session response error: %+v", resp.Error)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("session result marshal: %v", err)
+	}
+	var summary agent.SessionSummary
+	if err := json.Unmarshal(data, &summary); err != nil {
+		t.Fatalf("session result json: %v", err)
+	}
+	return summary
+}
+
+func acpChunkContent(t *testing.T, line string) string {
+	t.Helper()
+	var notif Notification
+	if err := json.Unmarshal([]byte(line), &notif); err != nil {
+		t.Fatalf("chunk notification json: %v", err)
+	}
+	params, ok := notif.Params.(map[string]any)
+	if !ok {
+		t.Fatalf("chunk params not object: %#v", notif.Params)
+	}
+	content, _ := params["content"].(string)
+	return content
 }
 
 func acpProjectFromResponse(t *testing.T, line string) agent.ProjectSummary {
