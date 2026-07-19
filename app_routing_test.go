@@ -35,6 +35,14 @@ func appFuncsReferencing(t *testing.T, token string) map[string]bool {
 	return out
 }
 
+// TestWailsUsageCallbackDoesNotQueryOwner proves the usage owner-query is confined to
+// the bound request method; the event callback (handleEvent) applies the event's
+// cumulative report as a replacement instead of querying, so it never re-enters the
+// owner while it emits under tokensMu.
+func TestWailsUsageCallbackDoesNotQueryOwner(t *testing.T) {
+	assertConfinedTo(t, "a.tokenUsage", "TokenUsage")
+}
+
 func assertConfinedTo(t *testing.T, token string, allowed ...string) {
 	t.Helper()
 	allow := map[string]bool{}

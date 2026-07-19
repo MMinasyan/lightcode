@@ -387,7 +387,14 @@ func (a *App) handleEvent(ev agent.Event) {
 			"version": ev.QueueVersion,
 		})
 	case agent.EventUsage:
-		a.emitFrame("usage", a.tokenUsage())
+		// Apply the event's absolute cumulative report as a replacement rather than
+		// querying the owner, so this callback never re-enters the owner while it is
+		// emitting under tokensMu.
+		report := agent.TokenReport{}
+		if ev.CumulativeTokens != nil {
+			report = *ev.CumulativeTokens
+		}
+		a.emitFrame("usage", report)
 	case agent.EventTurnStart:
 		a.emitFrame("turn_start", map[string]any{"turn": ev.Turn})
 		a.emitFrame("status", map[string]any{"state": "streaming"})

@@ -527,15 +527,11 @@ func (r *Runner) projectCurrent() agent.ProjectSummary {
 }
 
 func (r *Runner) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
-	if ev.SessionID != "" {
-		if report, err := r.agent.TokenUsageForSession(ev.SessionID); err == nil {
-			return report
-		}
-	}
-	if current, err := r.currentSession(); err == nil {
-		if report, err := r.agent.TokenUsageForSession(current); err == nil {
-			return report
-		}
+	// The event carries the session's absolute cumulative report (computed under
+	// tokensMu); apply it as a replacement rather than querying the owner, so this
+	// callback never re-enters the owner while it is emitting under tokensMu.
+	if ev.CumulativeTokens != nil {
+		return *ev.CumulativeTokens
 	}
 	return agent.TokenReport{}
 }

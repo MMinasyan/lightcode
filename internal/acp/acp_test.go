@@ -426,6 +426,35 @@ func TestHandleEventCarriesSequence(t *testing.T) {
 	}
 }
 
+// TestACPUsageAppliesCumulativeWithoutOwnerQuery proves the usage callback applies
+// the event's absolute cumulative report as a replacement and never queries the
+// owner: the runner has no agent, so any owner query would panic.
+func TestACPUsageAppliesCumulativeWithoutOwnerQuery(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	r.setCurrentSessionID("s")
+	report := agent.TokenReport{ContextUsed: 1234, ContextWindow: 8000}
+	r.handleEvent(agent.Event{Kind: agent.EventUsage, SessionID: "s", CumulativeTokens: &report})
+
+	lines := drainedLines(t, r, &out, 1)
+	assertACPNotificationMethod(t, lines[0], "agent/usage")
+	var notif Notification
+	if err := json.Unmarshal([]byte(lines[0]), &notif); err != nil {
+		t.Fatalf("usage notification json: %v", err)
+	}
+	data, err := json.Marshal(notif.Params)
+	if err != nil {
+		t.Fatalf("usage params marshal: %v", err)
+	}
+	var got agent.TokenReport
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("usage params json: %v", err)
+	}
+	if got.ContextUsed != 1234 || got.ContextWindow != 8000 {
+		t.Fatalf("usage = %#v, want the event's cumulative report applied without a query", got)
+	}
+}
+
 func TestHandleEventFiltersSession(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{out: &out}
