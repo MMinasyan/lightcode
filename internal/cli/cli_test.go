@@ -694,6 +694,52 @@ func TestCLIExitLatchUnwindsKeyRead(t *testing.T) {
 	}
 }
 
+// TestCLITickAnimationRendersWhenActiveOnly proves mainLoop's ticker renders a
+// spinner frame only while animation is active, so there is no free-running spinner.
+func TestCLITickAnimationRendersWhenActiveOnly(t *testing.T) {
+	var buf bytes.Buffer
+	c := &CLI{out: &buf, mu: &sync.Mutex{}}
+
+	c.tickAnimation()
+	if buf.Len() != 0 {
+		t.Fatalf("inactive tick wrote %q, want nothing", buf.String())
+	}
+
+	c.mu.Lock()
+	c.startAnimationLocked("Thinking")
+	c.mu.Unlock()
+	buf.Reset()
+	c.tickAnimation()
+	if !strings.Contains(buf.String(), "Thinking") {
+		t.Fatalf("active tick = %q, want a frame carrying the label", buf.String())
+	}
+
+	c.mu.Lock()
+	c.stopAnimationLocked()
+	c.mu.Unlock()
+	buf.Reset()
+	c.tickAnimation()
+	if buf.Len() != 0 {
+		t.Fatalf("stopped tick wrote %q, want nothing", buf.String())
+	}
+}
+
+// TestCLIAnimationHasNoSpinnerGoroutine proves the spinner runs through mainLoop's
+// ticker rather than a separate goroutine, keeping mainLoop the sole terminal writer.
+func TestCLIAnimationHasNoSpinnerGoroutine(t *testing.T) {
+	src, err := os.ReadFile("cli.go")
+	if err != nil {
+		t.Fatalf("read cli.go: %v", err)
+	}
+	body, ok := extractFunctionBody(string(src), "func (c *CLI) startAnimationLocked(")
+	if !ok {
+		t.Fatal("startAnimationLocked not found")
+	}
+	if strings.Contains(body, "go func") {
+		t.Fatal("startAnimationLocked must not spawn a goroutine; animation renders via mainLoop's ticker")
+	}
+}
+
 // TestCLIPopKeyReportsEmptyAfterExit proves latch priority is enforced atomically at
 // the single pop point: once exit is requested, popKey reports empty even with keys
 // buffered, so no key read (mainLoop or a nested menu) can pop and act on a queued

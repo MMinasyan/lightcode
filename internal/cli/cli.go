@@ -77,8 +77,11 @@ type CLI struct {
 
 	modelRef string
 
-	animStop  chan struct{}
-	animLabel string
+	// Animation state rendered by mainLoop's ticker case; there is no spinner
+	// goroutine, so mainLoop stays the sole terminal writer.
+	animActive bool
+	animLabel  string
+	animFrame  int
 
 	streamStarted       bool
 	streamDisplayActive bool
@@ -506,6 +509,8 @@ func (c *CLI) readKeys(ctx context.Context) {
 }
 
 func (c *CLI) mainLoop(ctx context.Context) error {
+	anim := time.NewTicker(80 * time.Millisecond)
+	defer anim.Stop()
 	for {
 		select {
 		case <-c.keyWake:
@@ -522,6 +527,8 @@ func (c *CLI) mainLoop(ctx context.Context) error {
 			}
 		case <-c.eventWake:
 			c.drainEvents()
+		case <-anim.C:
+			c.tickAnimation()
 		case <-c.exitLatch:
 			return c.exitErr
 		case <-ctx.Done():
@@ -1748,44 +1755,35 @@ func (c *CLI) startAnimation(label string) {
 	c.startAnimationLocked(label)
 }
 
-func (c *CLI) startAnimationLocked(label string) {
-	c.stopAnimationLocked()
-	c.animLabel = label
-	stop := make(chan struct{})
-	c.animStop = stop
+var animFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
-	go func() {
-		frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-		i := 0
-		c.mu.Lock()
-		c.writeRaw("\x1b[?25l")
-		c.mu.Unlock()
-		for {
-			select {
-			case <-stop:
-				c.mu.Lock()
-				c.writeRaw("\x1b[?25h")
-				c.mu.Unlock()
-				return
-			case <-time.After(80 * time.Millisecond):
-				c.mu.Lock()
-				if c.animStop == nil {
-					c.mu.Unlock()
-					return
-				}
-				c.writeRaw(fmt.Sprintf("\r\x1b[2K%s %s", frames[i%len(frames)], label))
-				c.mu.Unlock()
-				i++
-			}
-		}
-	}()
+func (c *CLI) startAnimationLocked(label string) {
+	c.animLabel = label
+	if !c.animActive {
+		c.animActive = true
+		c.animFrame = 0
+		c.writeRaw("\x1b[?25l") // hide cursor while the spinner runs
+	}
 }
 
 func (c *CLI) stopAnimationLocked() {
-	if c.animStop != nil {
-		close(c.animStop)
-		c.animStop = nil
+	if c.animActive {
+		c.animActive = false
+		c.writeRaw("\x1b[?25h") // show cursor
 	}
+}
+
+// tickAnimation renders the next spinner frame if animation is active. It runs on
+// mainLoop's goroutine from the ticker case, so the spinner shares mainLoop's single
+// terminal-writer discipline instead of a separate goroutine.
+func (c *CLI) tickAnimation() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.animActive {
+		return
+	}
+	c.writeRaw(fmt.Sprintf("\r\x1b[2K%s %s", animFrames[c.animFrame%len(animFrames)], c.animLabel))
+	c.animFrame++
 }
 
 func (c *CLI) writeRaw(s string) {
