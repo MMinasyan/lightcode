@@ -724,6 +724,23 @@ func TestCLITickAnimationRendersWhenActiveOnly(t *testing.T) {
 	}
 }
 
+// TestCLISignalPathDoesNotWriteTerminal proves the signal handler (inside Run) does
+// not write os.Stdout: signals only requestExit, and the deferred restoreTerminal
+// shows the cursor. Keeps the terminal writer single.
+func TestCLISignalPathDoesNotWriteTerminal(t *testing.T) {
+	src, err := os.ReadFile("cli.go")
+	if err != nil {
+		t.Fatalf("read cli.go: %v", err)
+	}
+	body, ok := extractFunctionBody(string(src), "func (c *CLI) Run(")
+	if !ok {
+		t.Fatal("Run not found")
+	}
+	if strings.Contains(body, "os.Stdout") {
+		t.Fatal("Run's signal handler must not write os.Stdout; the signal path only requestExit and restoreTerminal shows the cursor")
+	}
+}
+
 // TestCLIAnimationHasNoSpinnerGoroutine proves the spinner runs through mainLoop's
 // ticker rather than a separate goroutine, keeping mainLoop the sole terminal writer.
 func TestCLIAnimationHasNoSpinnerGoroutine(t *testing.T) {

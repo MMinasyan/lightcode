@@ -421,11 +421,11 @@ func (c *CLI) Run(ctx context.Context) error {
 					if st == stateStreaming || st == statePermission {
 						c.cancelCurrent()
 					} else {
-						fmt.Fprint(os.Stdout, "\r\n\x1b[?25h")
+						// Signal path never writes the terminal; requestExit unwinds
+						// mainLoop and the deferred restoreTerminal shows the cursor.
 						c.requestExit(ExitError{Code: 130})
 					}
 				case syscall.SIGTERM:
-					fmt.Fprint(os.Stdout, "\r\n\x1b[?25h")
 					c.requestExit(ExitError{Code: 130})
 				}
 			case <-ctx.Done():
