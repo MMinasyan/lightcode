@@ -27,14 +27,35 @@ var deliveryJoinTimeout = 5 * time.Second
 // acquires navMu after close has won it.
 var errAdapterClosed = errors.New("adapter is closed")
 
+// frameKind selects how the sole drainer filters a frame against presentation
+// current before emitting it.
+type frameKind uint8
+
+const (
+	// frameNormal is delivered while its sessionID is presentation-current; an
+	// empty sessionID is a global frame the drainer always delivers.
+	frameNormal frameKind = iota
+	// frameSubagent is delivered for a child registered under the presented root.
+	frameSubagent
+	// frameAdvance is a navigation/turn-action boundary: always delivered, and it
+	// adopts sessionID as the new presentation current (empty for a detach).
+	frameAdvance
+)
+
 // deliveryFrame is one immutable item the delivery FIFO carries: a named event
 // with its payload, plus an optional native window title a navigation boundary
 // carries so the drainer applies the title in the same ordered step as the
-// boundary. The sole drainer emits it.
+// boundary. kind and the session/subagent tags let the sole drainer filter it
+// against presentation current at drain time, so the event callback that appends
+// it never queries the owner. The sole drainer emits it.
 type deliveryFrame struct {
-	name    string
-	payload any
-	title   string
+	name      string
+	payload   any
+	title     string
+	kind      frameKind
+	sessionID string // frameNormal tag / frameAdvance destination
+	parent    string // frameSubagent parent (root) session
+	child     string // frameSubagent child session
 }
 
 // App is the Wails-bound struct that bridges the Go backend to the
@@ -67,13 +88,12 @@ type App struct {
 
 	adapterAttached bool
 
-	// routeMu guards the adapter's routing-current session id and its subagent
-	// child set — a leaf below navMu. Navigation and current-target operations take
-	// navMu then routeMu; the event-acceptance callback, which must not take navMu,
-	// takes routeMu alone.
-	routeMu       sync.Mutex
-	routeCurrent  string
-	routeChildren map[string]struct{}
+	// routeMu guards the adapter's routing-current session id — a leaf below navMu.
+	// Navigation and current-target operations take navMu then routeMu. Routing
+	// current is where operations route; presentation current (owned by the drainer)
+	// is what the frontend shows, and the two diverge while a boundary is in flight.
+	routeMu      sync.Mutex
+	routeCurrent string
 
 	// routeProjectPath is the adapter's routing-current project path, owned by
 	// navMu: navigation commits it and every project-scoped read captures it under
@@ -92,6 +112,15 @@ type App struct {
 	deliveryClosed bool
 	deliveryDone   chan struct{}
 	deliveryOnce   sync.Once
+
+	// presented is presentation current: the session id the drainer is currently
+	// showing. It advances only when the drainer consumes a navigation/turn-action
+	// boundary, so a stalled sink keeps presenting the prior session while routing
+	// current has already moved. presentedChildren holds the subagent children
+	// registered under it. Both are owned by the drainer and read or written only
+	// under deliveryMu (the startup seed included).
+	presented         string
+	presentedChildren map[string]struct{}
 }
 
 type ModelCompletion = agent.ModelCompletion
@@ -137,6 +166,7 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 	a.setCurrentSessionID(sessionID)
+	a.seedPresented(sessionID)
 	a.started = true
 }
 
@@ -203,27 +233,67 @@ func (a *App) startDelivery() {
 	go a.runDeliveryDrainer()
 }
 
-// emitFrame appends one frame and wakes the drainer. It never blocks or emits,
-// so it is safe to call from an event callback that runs under an owner lock.
-func (a *App) emitFrame(name string, payload any) {
-	a.emitFrameTitled(name, payload, "")
-}
-
-// emitFrameTitled appends a frame that also carries a native window title for the
-// drainer to apply in the same ordered step, so the title changes only when its
-// boundary is consumed.
-func (a *App) emitFrameTitled(name string, payload any, title string) {
+// enqueueFrame appends one frame and wakes the drainer. It never blocks, emits,
+// or queries the owner, so it is safe to call from an event callback that runs
+// under an owner lock.
+func (a *App) enqueueFrame(f deliveryFrame) {
 	a.deliveryMu.Lock()
 	if a.deliveryClosed {
 		a.deliveryMu.Unlock()
 		return
 	}
-	a.deliveryFrames = append(a.deliveryFrames, deliveryFrame{name: name, payload: payload, title: title})
+	a.deliveryFrames = append(a.deliveryFrames, f)
 	a.deliveryMu.Unlock()
 	select {
 	case a.deliveryWake <- struct{}{}:
 	default:
 	}
+}
+
+// emitFrame appends a global frame the drainer always delivers.
+func (a *App) emitFrame(name string, payload any) {
+	a.enqueueFrame(deliveryFrame{name: name, payload: payload})
+}
+
+// emitSessionFrame appends a session-tagged frame the drainer delivers only while
+// that session is presentation-current. An empty session id is a global frame.
+func (a *App) emitSessionFrame(sessionID, name string, payload any) {
+	a.enqueueFrame(deliveryFrame{name: name, payload: payload, sessionID: strings.TrimSpace(sessionID)})
+}
+
+// emitSubagentFrame appends a subagent frame the drainer delivers only for a child
+// registered under the presentation-current root.
+func (a *App) emitSubagentFrame(ev agent.Event, name string, payload any) {
+	a.enqueueFrame(deliveryFrame{
+		name:    name,
+		payload: payload,
+		kind:    frameSubagent,
+		parent:  strings.TrimSpace(ev.ParentSessionID),
+		child:   strings.TrimSpace(ev.SubagentSessionID),
+	})
+}
+
+// enqueueBoundary appends a navigation/turn-action boundary: the drainer delivers
+// it and then adopts sessionID as presentation current (empty for a detach). A
+// native window title, if any, rides the same ordered step.
+func (a *App) enqueueBoundary(name string, payload any, title, sessionID string) {
+	a.enqueueFrame(deliveryFrame{
+		name:      name,
+		payload:   payload,
+		title:     title,
+		kind:      frameAdvance,
+		sessionID: strings.TrimSpace(sessionID),
+	})
+}
+
+// seedPresented sets presentation current at startup, before the frontend's
+// hydration pull, so live frames for the initially-current session reach it. It
+// takes deliveryMu because the drainer is already running.
+func (a *App) seedPresented(id string) {
+	a.deliveryMu.Lock()
+	a.presented = strings.TrimSpace(id)
+	a.presentedChildren = nil
+	a.deliveryMu.Unlock()
 }
 
 // runDeliveryDrainer is the only goroutine that emits to the frontend. It drains
@@ -246,7 +316,11 @@ func (a *App) runDeliveryDrainer() {
 		}
 		frame := a.deliveryFrames[0]
 		a.deliveryFrames = a.deliveryFrames[1:]
+		deliver := a.presentAcceptsLocked(frame)
 		a.deliveryMu.Unlock()
+		if !deliver {
+			continue
+		}
 		a.emitFn(frame.name, frame.payload)
 		if frame.title != "" {
 			// Recheck close before applying the title: if emitFn blocked and close
@@ -259,6 +333,37 @@ func (a *App) runDeliveryDrainer() {
 				a.titleFn(frame.title)
 			}
 		}
+	}
+}
+
+// presentAcceptsLocked decides whether a frame reaches the frontend and adopts a
+// boundary's destination as presentation current. It runs under deliveryMu on the
+// sole drainer, so presented and its subagent child set are drainer-owned and
+// never queried from the owner: a session-tagged frame reaches the frontend only
+// while its session is presentation-current, a boundary always passes and advances
+// presented (empty for a detach), and a subagent frame passes through the child
+// set registered under the presented root.
+func (a *App) presentAcceptsLocked(f deliveryFrame) bool {
+	switch f.kind {
+	case frameAdvance:
+		a.presented = f.sessionID
+		a.presentedChildren = nil
+		return true
+	case frameSubagent:
+		if a.presented == "" {
+			return false
+		}
+		if f.parent == a.presented {
+			if a.presentedChildren == nil {
+				a.presentedChildren = make(map[string]struct{})
+			}
+			a.presentedChildren[f.child] = struct{}{}
+			return true
+		}
+		_, ok := a.presentedChildren[f.child]
+		return ok
+	default:
+		return f.sessionID == "" || f.sessionID == a.presented
 	}
 }
 
@@ -284,25 +389,23 @@ func (a *App) closeDelivery() {
 }
 
 func (a *App) handleEvent(ev agent.Event) {
-	if !a.acceptsEvent(ev) {
-		return
-	}
 	if ev.SubagentSessionID != "" {
+		emit := func(name string, payload any) { a.emitSubagentFrame(ev, name, payload) }
 		switch ev.Kind {
 		case agent.EventTextDelta:
-			a.emitFrame("subagent_token", map[string]any{
+			emit("subagent_token", map[string]any{
 				"sessionId": ev.SubagentSessionID,
 				"content":   ev.Result,
 			})
 		case agent.EventToolCallStart:
-			a.emitFrame("subagent_tool_start", map[string]any{
+			emit("subagent_tool_start", map[string]any{
 				"sessionId": ev.SubagentSessionID,
 				"id":        ev.ToolCallID,
 				"name":      ev.ToolName,
 				"args":      ev.Args,
 			})
 		case agent.EventToolCallEnd:
-			a.emitFrame("subagent_tool_result", map[string]any{
+			emit("subagent_tool_result", map[string]any{
 				"sessionId": ev.SubagentSessionID,
 				"id":        ev.ToolCallID,
 				"name":      ev.ToolName,
@@ -312,14 +415,14 @@ func (a *App) handleEvent(ev agent.Event) {
 				"metadata":  ev.Metadata,
 			})
 		case agent.EventSubagentStart:
-			a.emitFrame("subagent_session_start", map[string]any{
+			emit("subagent_session_start", map[string]any{
 				"sessionId":      ev.SubagentSessionID,
 				"taskToolCallId": ev.ToolCallID,
 				"taskIndex":      ev.TaskIndex,
 			})
 		case agent.EventBackgroundProcessComplete:
 			if ev.BackgroundProcess != nil {
-				a.emitFrame("subagent_background_process_complete", map[string]any{
+				emit("subagent_background_process_complete", map[string]any{
 					"sessionId": ev.SubagentSessionID,
 					"id":        ev.BackgroundProcess.ID,
 					"command":   ev.BackgroundProcess.Command,
@@ -332,21 +435,25 @@ func (a *App) handleEvent(ev agent.Event) {
 		}
 		return
 	}
+	// Every frame this callback appends carries the event's session tag; the sole
+	// drainer, not this callback, decides delivery against presentation current, so
+	// the callback never queries the owner for liveness.
+	emit := func(name string, payload any) { a.emitSessionFrame(ev.SessionID, name, payload) }
 	switch ev.Kind {
 	case agent.EventTextDelta:
-		a.emitFrame("token", map[string]any{
+		emit("token", map[string]any{
 			"seq":     ev.Seq,
 			"content": ev.Result,
 		})
 	case agent.EventToolCallStart:
-		a.emitFrame("tool_start", map[string]any{
+		emit("tool_start", map[string]any{
 			"seq":  ev.Seq,
 			"id":   ev.ToolCallID,
 			"name": ev.ToolName,
 			"args": ev.Args,
 		})
 	case agent.EventToolCallEnd:
-		a.emitFrame("tool_result", map[string]any{
+		emit("tool_result", map[string]any{
 			"id":       ev.ToolCallID,
 			"name":     ev.ToolName,
 			"args":     ev.Args,
@@ -356,7 +463,7 @@ func (a *App) handleEvent(ev agent.Event) {
 		})
 	case agent.EventBackgroundProcessComplete:
 		if ev.BackgroundProcess != nil {
-			a.emitFrame("background_process_complete", map[string]any{
+			emit("background_process_complete", map[string]any{
 				"seq":      ev.Seq,
 				"id":       ev.BackgroundProcess.ID,
 				"command":  ev.BackgroundProcess.Command,
@@ -367,13 +474,13 @@ func (a *App) handleEvent(ev agent.Event) {
 			})
 		}
 	case agent.EventUserMessageDisplay:
-		a.emitFrame("user_message", map[string]any{
+		emit("user_message", map[string]any{
 			"seq":     ev.Seq,
 			"turn":    ev.Turn,
 			"content": ev.Result,
 		})
 	case agent.EventGenericSystemSignal:
-		a.emitFrame("system_signal", map[string]any{
+		emit("system_signal", map[string]any{
 			"seq":     ev.Seq,
 			"content": "System: " + ev.Result,
 		})
@@ -382,7 +489,7 @@ func (a *App) handleEvent(ev agent.Event) {
 		if queue == nil {
 			queue = []agent.QueuedItem{}
 		}
-		a.emitFrame("queue_changed", map[string]any{
+		emit("queue_changed", map[string]any{
 			"items":   queue,
 			"version": ev.QueueVersion,
 		})
@@ -394,20 +501,20 @@ func (a *App) handleEvent(ev agent.Event) {
 		if ev.CumulativeTokens != nil {
 			report = *ev.CumulativeTokens
 		}
-		a.emitFrame("usage", report)
+		emit("usage", report)
 	case agent.EventTurnStart:
-		a.emitFrame("turn_start", map[string]any{"turn": ev.Turn})
-		a.emitFrame("status", map[string]any{"state": "streaming"})
+		emit("turn_start", map[string]any{"turn": ev.Turn})
+		emit("status", map[string]any{"state": "streaming"})
 	case agent.EventTurnEnd:
-		a.emitFrame("turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
-		a.emitFrame("status", map[string]any{"state": "idle"})
+		emit("turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
+		emit("status", map[string]any{"state": "idle"})
 		if ev.RefreshSession {
 			a.emitResyncBoundary(ev.SessionID)
 		}
 	case agent.EventError:
-		a.emitFrame("error", map[string]any{"seq": ev.Seq, "message": ev.Error})
+		emit("error", map[string]any{"seq": ev.Seq, "message": ev.Error})
 	case agent.EventPermissionRequest:
-		a.emitFrame("permission_request", map[string]any{
+		emit("permission_request", map[string]any{
 			"id":                 ev.PermReq.ID,
 			"sessionId":          ev.PermReq.SessionID,
 			"projectId":          ev.PermReq.ProjectID,
@@ -422,14 +529,14 @@ func (a *App) handleEvent(ev agent.Event) {
 			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		})
 	case agent.EventCompactionStart:
-		a.emitFrame("compaction_start", nil)
+		emit("compaction_start", nil)
 	case agent.EventCompactionEnd:
-		a.emitFrame("compaction_end", nil)
+		emit("compaction_end", nil)
 		if ev.RefreshSession {
 			a.emitResyncBoundary(ev.SessionID)
 		}
 	case agent.EventWarning:
-		a.emitFrame("warnings", ev.Warnings)
+		emit("warnings", ev.Warnings)
 	}
 }
 
@@ -449,7 +556,9 @@ func (a *App) emitNavigationBoundaryWithTitle(sessionID, title string) {
 	if a.ctx == nil {
 		return
 	}
-	emit := func(state agent.HydrationState) { a.emitFrameTitled("navigation", state, title) }
+	emit := func(state agent.HydrationState) {
+		a.enqueueBoundary("navigation", state, title, state.Session.ID)
+	}
 	if a.agent == nil {
 		emit(agent.HydrationState{})
 		return
@@ -478,7 +587,7 @@ func (a *App) emitTurnActionBoundary(sessionID string, skipped []snapshot.Skippe
 		return
 	}
 	emit := func(state agent.HydrationState) {
-		a.emitFrame("turn_action", turnActionBoundary{State: &state, SkippedFiles: skipped})
+		a.enqueueBoundary("turn_action", turnActionBoundary{State: &state, SkippedFiles: skipped}, "", state.Session.ID)
 	}
 	if a.agent == nil {
 		emit(agent.HydrationState{})
@@ -509,15 +618,12 @@ func (a *App) emitResyncBoundary(sessionID string) {
 	if a.ctx == nil {
 		return
 	}
-	a.emitFrame("resync", a.sessionChangedPayload(sessionID))
+	a.emitSessionFrame(sessionID, "resync", a.sessionChangedPayload(sessionID))
 }
 
 func (a *App) setCurrentSessionID(id string) {
 	id = strings.TrimSpace(id)
 	a.routeMu.Lock()
-	if a.routeCurrent != id {
-		a.routeChildren = nil
-	}
 	a.routeCurrent = id
 	a.routeMu.Unlock()
 }
@@ -529,7 +635,6 @@ func (a *App) clearRouteIfCurrent(id string) {
 	a.routeMu.Lock()
 	if a.routeCurrent == id {
 		a.routeCurrent = ""
-		a.routeChildren = nil
 	}
 	a.routeMu.Unlock()
 }
@@ -556,57 +661,6 @@ func (a *App) boundedSessionIDLocked() (string, error) {
 		return "", errAdapterClosed
 	}
 	return a.currentSession()
-}
-
-func (a *App) acceptsEvent(ev agent.Event) bool {
-	if ev.SubagentSessionID != "" {
-		return a.acceptsSubagentEvent(ev)
-	}
-	if ev.SessionID != "" {
-		return a.acceptsSessionEvent(ev.SessionID)
-	}
-	return true
-}
-
-func (a *App) acceptsSessionEvent(sessionID string) bool {
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		return true
-	}
-	return a.liveCurrentSessionID() == sessionID
-}
-
-func (a *App) acceptsSubagentEvent(ev agent.Event) bool {
-	current := a.liveCurrentSessionID()
-	if current == "" {
-		return false
-	}
-	return a.acceptsSubagentEventForCurrent(current, ev)
-}
-
-// acceptsSubagentEventForCurrent decides a subagent event against an explicit
-// current snapshot. Re-checking routeCurrent under routeMu rejects an event whose
-// current was captured before a concurrent switch changed it, so a child is never
-// registered against a session the adapter has since left.
-func (a *App) acceptsSubagentEventForCurrent(current string, ev agent.Event) bool {
-	child := strings.TrimSpace(ev.SubagentSessionID)
-	if child == "" {
-		return false
-	}
-	a.routeMu.Lock()
-	defer a.routeMu.Unlock()
-	if a.routeCurrent != current {
-		return false
-	}
-	if ev.ParentSessionID == current {
-		if a.routeChildren == nil {
-			a.routeChildren = make(map[string]struct{})
-		}
-		a.routeChildren[child] = struct{}{}
-		return true
-	}
-	_, ok := a.routeChildren[child]
-	return ok
 }
 
 func (a *App) liveCurrentSessionID() string {

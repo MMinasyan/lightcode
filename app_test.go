@@ -119,7 +119,10 @@ func TestWailsClearRemovedCurrent(t *testing.T) {
 			if err := app.CompactNow(); err == nil {
 				t.Fatalf("%s compact succeeded with no current session", tc.name)
 			}
-			if app.acceptsEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: firstID, Result: "skip"}) {
+			app.deliveryMu.Lock()
+			delivered := app.presentAcceptsLocked(deliveryFrame{name: "token", sessionID: firstID})
+			app.deliveryMu.Unlock()
+			if delivered {
 				t.Fatalf("%s left old session event visible", tc.name)
 			}
 			if current := svc.SessionCurrent().ID; current != secondID {
@@ -194,47 +197,45 @@ func TestWailsSwitchKeepsCurrent(t *testing.T) {
 	}
 }
 
+// TestWailsSubagentFilter drives the drain-side subagent gating: a subagent frame
+// reaches the frontend only for a child registered under the presentation-current
+// root, and a boundary that advances presentation current clears the child set.
 func TestWailsSubagentFilter(t *testing.T) {
-	svc := newAppTestAgent(t)
-	if _, err := svc.AppendUserMessage("root"); err != nil {
-		t.Fatalf("seed session: %v", err)
+	app := &App{}
+	accept := func(f deliveryFrame) bool {
+		app.deliveryMu.Lock()
+		defer app.deliveryMu.Unlock()
+		return app.presentAcceptsLocked(f)
 	}
-	root := svc.SessionCurrent().ID
-	if root == "" {
-		t.Fatal("missing root session")
+	sub := func(parent, child string) deliveryFrame {
+		return deliveryFrame{name: "subagent_token", kind: frameSubagent, parent: parent, child: child}
 	}
-	app := newTestApp(svc)
+	advance := func(id string) { accept(deliveryFrame{name: "navigation", kind: frameAdvance, sessionID: id}) }
 
-	app.setCurrentSessionID("")
-	if app.acceptsEvent(agent.Event{Kind: agent.EventSubagentStart, SessionID: "child", SubagentSessionID: "child", ParentSessionID: root}) {
-		t.Fatal("empty current accepted child event")
+	// No presentation current rejects any subagent event.
+	if accept(sub("root", "child")) {
+		t.Fatal("empty presented accepted child event")
 	}
 
-	app.setCurrentSessionID(root)
-	if app.acceptsEvent(agent.Event{Kind: agent.EventSubagentStart, SessionID: "child", SubagentSessionID: "child", ParentSessionID: "other"}) {
+	advance("root")
+	// Wrong parent with an unregistered child rejects.
+	if accept(sub("other", "child")) {
 		t.Fatal("wrong parent accepted child event")
 	}
-	if !app.acceptsEvent(agent.Event{Kind: agent.EventSubagentStart, SessionID: "child", SubagentSessionID: "child", ParentSessionID: root}) {
+	// A direct child of the presented root registers and is accepted.
+	if !accept(sub("root", "child")) {
 		t.Fatal("matching parent child start rejected")
 	}
-	if !app.acceptsEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "child", SubagentSessionID: "child", Result: "ok"}) {
+	// A later event from the registered child is accepted via the set.
+	if !accept(sub("", "child")) {
 		t.Fatal("subscribed child event rejected")
 	}
 
-	oldRoot := app.liveCurrentSessionID()
-	if _, err := svc.NewSession("", "primary"); err != nil {
-		t.Fatalf("SessionNew: %v", err)
-	}
-	if _, err := svc.AppendUserMessage("next"); err != nil {
-		t.Fatalf("seed next session: %v", err)
-	}
-	next := svc.SessionCurrent().ID
-	if next == "" || next == oldRoot {
-		t.Fatalf("new session id = %q, old = %q", next, oldRoot)
-	}
-	app.setCurrentSessionID(next)
-	if app.acceptsSubagentEventForCurrent(oldRoot, agent.Event{Kind: agent.EventSubagentStart, SessionID: "old-child", SubagentSessionID: "old-child", ParentSessionID: oldRoot}) {
-		t.Fatal("stale current snapshot accepted child event")
+	// Advancing presentation current to a new root clears the child set, so the old
+	// child is rejected.
+	advance("next")
+	if accept(sub("", "child")) {
+		t.Fatal("stale child accepted after boundary advanced presentation current")
 	}
 }
 

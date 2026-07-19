@@ -191,7 +191,7 @@ func TestWailsDeliveryAppliesTitleAfterFrame(t *testing.T) {
 	a.startDelivery()
 	defer a.closeDelivery()
 
-	a.emitFrameTitled("navigation", nil, "Project B")
+	a.enqueueFrame(deliveryFrame{name: "navigation", payload: nil, title: "Project B"})
 	a.emitFrame("token", nil)
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -258,6 +258,55 @@ func TestWailsDeliveryOrdersModelItemAfterBoundary(t *testing.T) {
 	}
 }
 
+// TestWailsDeliveryFiltersAndAdvancesPresentation drives the drain-side filter: an
+// A frame delivers while A is presentation-current, a navigation boundary advances
+// presentation current to B, a B frame then delivers, and both a premature B frame
+// and a late A frame are dropped — proving delivery is decided at drain time against
+// a drainer-owned presentation current, in FIFO order, with no owner query.
+func TestWailsDeliveryFiltersAndAdvancesPresentation(t *testing.T) {
+	a := &App{ctx: context.Background()}
+	var mu sync.Mutex
+	var got []string
+	a.emitFn = func(name string, _ any) { mu.Lock(); got = append(got, name); mu.Unlock() }
+	a.startDelivery()
+	defer a.closeDelivery()
+
+	a.seedPresented("A")
+	a.emitSessionFrame("A", "tokenA", nil)                                                 // delivered: A is current
+	a.emitSessionFrame("B", "earlyB", nil)                                                 // dropped: B not yet current
+	a.enqueueFrame(deliveryFrame{name: "navigation", kind: frameAdvance, sessionID: "B"})  // delivered + advances to B
+	a.emitSessionFrame("B", "tokenB", nil)                                                 // delivered: B is current
+	a.emitSessionFrame("A", "lateA", nil)                                                  // dropped: A no longer current
+	a.emitFrame("sentinel", nil)                                                           // delivered: global sentinel (last)
+
+	want := []string{"tokenA", "navigation", "tokenB", "sentinel"}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		done := len(got) > 0 && got[len(got)-1] == "sentinel"
+		cur := append([]string(nil), got...)
+		mu.Unlock()
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sentinel not drained; got %v, want %v", cur, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != len(want) {
+		t.Fatalf("delivered %v, want exactly %v (a dropped frame leaked or a delivered frame is missing)", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("delivery order = %v, want %v", got, want)
+		}
+	}
+}
+
 // TestWailsDeliveryDropsTitleAfterClose proves a boundary's window title is not
 // applied after close: if the boundary's emit blocks and close abandons the
 // drainer, the title must not change once shutdown has proceeded.
@@ -274,7 +323,7 @@ func TestWailsDeliveryDropsTitleAfterClose(t *testing.T) {
 	a.emitFn = func(string, any) { close(entered); <-release } // block the boundary's emit
 	a.titleFn = func(title string) { mu.Lock(); titles = append(titles, title); mu.Unlock() }
 	a.startDelivery()
-	a.emitFrameTitled("navigation", nil, "Project B")
+	a.enqueueFrame(deliveryFrame{name: "navigation", payload: nil, title: "Project B"})
 	<-entered // the drainer is blocked inside the boundary's emit
 
 	done := make(chan struct{})

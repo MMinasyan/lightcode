@@ -64,9 +64,7 @@ func TestWailsRoutingStateIsEncapsulated(t *testing.T) {
 	assertConfinedTo(t, "a.routeProjectPath",
 		"routeProjectPathCaptured", "routeProjectPathBounded", "ProjectSwitch", "SessionNew", "startup")
 	assertConfinedTo(t, "a.routeCurrent",
-		"setCurrentSessionID", "clearRouteIfCurrent", "currentSessionID", "acceptsSubagentEventForCurrent")
-	assertConfinedTo(t, "a.routeChildren",
-		"setCurrentSessionID", "clearRouteIfCurrent", "acceptsSubagentEventForCurrent")
+		"setCurrentSessionID", "clearRouteIfCurrent", "currentSessionID")
 }
 
 // TestWailsTitleChangesOnlyThroughOrderedBoundary proves no operation sets the
@@ -81,18 +79,43 @@ func TestWailsTitleChangesOnlyThroughOrderedBoundary(t *testing.T) {
 	}
 }
 
-// TestWailsEventAcceptanceIsNavMuFree proves the event-acceptance path never takes
-// navMu. handleEvent runs on the owner's event callback, and an operation may hold
-// navMu while waiting on the owner, so acquiring navMu on the callback could
-// deadlock; the path reads routing through the routeMu leaf lock instead.
-func TestWailsEventAcceptanceIsNavMuFree(t *testing.T) {
+// TestWailsEventDeliveryIsNavMuFree proves the event callback and the sole drainer
+// never take navMu. handleEvent runs on the owner's event callback, and an
+// operation may hold navMu while waiting on the owner, so acquiring navMu on the
+// callback or drainer could deadlock; the callback only appends frames and the
+// drainer filters them against presentation current under the deliveryMu leaf.
+func TestWailsEventDeliveryIsNavMuFree(t *testing.T) {
 	navMuUsers := appFuncsReferencing(t, "a.navMu")
 	for _, fn := range []string{
-		"handleEvent", "acceptsEvent", "acceptsSessionEvent", "acceptsSubagentEvent",
-		"acceptsSubagentEventForCurrent", "liveCurrentSessionID", "currentSessionID", "clearRouteIfCurrent",
+		"handleEvent", "enqueueFrame", "emitFrame", "emitSessionFrame",
+		"emitSubagentFrame", "presentAcceptsLocked", "seedPresented", "emitResyncBoundary",
+		"sessionChangedPayload", "currentSessionID", "clearRouteIfCurrent",
 	} {
 		if navMuUsers[fn] {
-			t.Fatalf("%s takes navMu, but it is on the event-acceptance callback path, which must stay navMu-free", fn)
+			t.Fatalf("%s takes navMu, but it is on the event callback or delivery path, which must stay navMu-free", fn)
+		}
+	}
+}
+
+// TestWailsHandleEventDoesNotQueryOwnerForDelivery proves the delivery filter is
+// owner-query-free: the callback appends frames without probing session liveness,
+// and the drainer decides delivery against a drainer-owned presentation current, so
+// no path here re-enters the owner while it may hold an event-producing lock.
+func TestWailsHandleEventDoesNotQueryOwnerForDelivery(t *testing.T) {
+	for _, probe := range []struct {
+		fn     string
+		tokens []string
+	}{
+		{"handleEvent", []string{"a.acceptsEvent", "a.liveCurrentSessionID", "a.currentSessionID"}},
+		{"presentAcceptsLocked", []string{"a.svc", "a.liveCurrentSessionID"}},
+		{"emitSessionFrame", []string{"a.svc", "a.liveCurrentSessionID"}},
+		{"emitSubagentFrame", []string{"a.svc", "a.liveCurrentSessionID"}},
+		{"enqueueFrame", []string{"a.svc", "a.liveCurrentSessionID"}},
+	} {
+		for _, token := range probe.tokens {
+			if appFuncsReferencing(t, token)[probe.fn] {
+				t.Fatalf("%s references %s, but the delivery filter must not query the owner", probe.fn, token)
+			}
 		}
 	}
 }
