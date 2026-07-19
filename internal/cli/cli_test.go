@@ -603,6 +603,164 @@ func TestCLIExitReturnsExitError(t *testing.T) {
 	}
 }
 
+// TestCLISelectionOnlyRouting verifies /session, /resume, /new, and /project
+// change only the current selection: idle success retains the source session
+// (no teardown); a busy CLI rejects the command unchanged; and a destination
+// failure leaves the source selection unchanged.
+func TestCLISelectionOnlyRouting(t *testing.T) {
+	t.Run("resume_idle_success_retains_source", func(t *testing.T) {
+		a, _ := newTestAgent(t)
+		c := New(a)
+		out := new(bytes.Buffer)
+		c.out = out
+		source, _ := a.NewSession("", "primary")
+		dest, _ := a.NewSession("", "primary")
+		c.setCurrentSessionID(source)
+
+		if err := c.dispatchCommand("/resume " + dest); err != nil {
+			t.Fatalf("/resume: %v", err)
+		}
+		if got, _ := c.currentSession(); got != dest {
+			t.Fatalf("current after /resume = %q, want dest %q", got, dest)
+		}
+		// The source session was not torn down: it is still openable.
+		if _, err := a.SessionSummaryForSession(source); err != nil {
+			t.Fatalf("source session was torn down by selection: %v", err)
+		}
+	})
+
+	t.Run("new_idle_success_retains_source", func(t *testing.T) {
+		a, _ := newTestAgent(t)
+		c := New(a)
+		out := new(bytes.Buffer)
+		c.out = out
+		source, _ := a.NewSession("", "primary")
+		c.setCurrentSessionID(source)
+
+		if err := c.dispatchCommand("/new"); err != nil {
+			t.Fatalf("/new: %v", err)
+		}
+		if got, _ := c.currentSession(); got == source || got == "" {
+			t.Fatalf("current after /new = %q, want a new session distinct from source", got)
+		}
+		if _, err := a.SessionSummaryForSession(source); err != nil {
+			t.Fatalf("source session was torn down by /new: %v", err)
+		}
+	})
+
+	t.Run("busy_rejected_unchanged", func(t *testing.T) {
+		for _, cmd := range []string{"/session", "/resume x", "/new", "/project"} {
+			a, _ := newTestAgent(t)
+			c := New(a)
+			out := new(bytes.Buffer)
+			c.out = out
+			source, _ := a.NewSession("", "primary")
+			c.setCurrentSessionID(source)
+
+			c.handleSlashWhileBusy(cmd)
+
+			if !strings.Contains(out.String(), "cannot run this command while a turn is running") {
+				t.Fatalf("%q while busy = %q, want rejection", cmd, out.String())
+			}
+			if got, _ := c.currentSession(); got != source {
+				t.Fatalf("%q while busy changed current to %q, want unchanged %q", cmd, got, source)
+			}
+		}
+	})
+
+	t.Run("resume_destination_failure_source_unchanged", func(t *testing.T) {
+		a, _ := newTestAgent(t)
+		c := New(a)
+		out := new(bytes.Buffer)
+		c.out = out
+		source, _ := a.NewSession("", "primary")
+		c.setCurrentSessionID(source)
+
+		if err := c.dispatchCommand("/resume does-not-exist"); err != nil {
+			t.Fatalf("/resume unexpected error return: %v", err)
+		}
+		if got, _ := c.currentSession(); got != source {
+			t.Fatalf("current after failed /resume = %q, want unchanged source %q", got, source)
+		}
+	})
+}
+
+// TestCLISelectionCommandsHaveNoTeardown proves no selection path tears down the
+// source session: none call cancel/stop/close/detach/evict/shutdown.
+func TestCLISelectionCommandsHaveNoTeardown(t *testing.T) {
+	for _, file := range []string{"cli.go", "menu.go"} {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		s := string(src)
+		for _, fn := range selectionFuncsIn(file) {
+			body, ok := extractFunctionBody(s, fn)
+			if !ok {
+				t.Fatalf("selection function %q not found in %s; the teardown scan must cover it", fn, file)
+			}
+			for _, bad := range []string{"CancelSession", "ShutdownOwner", "DetachAdapter", "closeEvents", "closeKeys"} {
+				if strings.Contains(body, bad) {
+					t.Fatalf("%s must not tear down the source session; found %s", fn, bad)
+				}
+			}
+		}
+	}
+}
+
+func selectionFuncsIn(file string) []string {
+	switch file {
+	case "cli.go":
+		// dispatchCommand routes /new (inline), /session, /project, /resume; scanning
+		// it covers the inline /new selection path that has no named handler.
+		return []string{"func (c *CLI) dispatchCommand(", "func (c *CLI) cmdResume(", "func (c *CLI) projectSwitch("}
+	case "menu.go":
+		return []string{"func (c *CLI) showSessionMenuInner("}
+	}
+	return nil
+}
+
+// TestCLIQueueCursorDropsSameSessionStale proves a stale queue snapshot (older
+// version) for the current session is dropped.
+func TestCLIQueueCursorDropsSameSessionStale(t *testing.T) {
+	a, _ := newTestAgent(t)
+	c := New(a)
+	c.out = new(bytes.Buffer)
+	id, _ := a.NewSession("", "primary")
+	c.setCurrentSessionID(id)
+
+	c.lastQueueVersion = 10
+	c.queueDisplay = []agent.QueuedItem{{Content: "keep"}}
+	c.handleEvent(agent.Event{Kind: agent.EventQueueChanged, SessionID: id, QueueVersion: 5, Queue: []agent.QueuedItem{{Content: "stale"}}})
+	if c.lastQueueVersion != 10 || len(c.queueDisplay) != 1 || c.queueDisplay[0].Content != "keep" {
+		t.Fatalf("stale queue snapshot applied: version=%d display=%#v", c.lastQueueVersion, c.queueDisplay)
+	}
+	// A newer version for the same session applies.
+	c.handleEvent(agent.Event{Kind: agent.EventQueueChanged, SessionID: id, QueueVersion: 11, Queue: []agent.QueuedItem{{Content: "fresh"}}})
+	if c.lastQueueVersion != 11 || c.queueDisplay[0].Content != "fresh" {
+		t.Fatalf("newer same-session queue not applied: version=%d display=%#v", c.lastQueueVersion, c.queueDisplay)
+	}
+}
+
+// TestCLIRefreshResetsQueueCursor proves a destination replacement resets the one
+// version cursor from a fresh snapshot, so the destination's lower queue version is
+// not dropped against a higher source version.
+func TestCLIRefreshResetsQueueCursor(t *testing.T) {
+	a, _ := newTestAgent(t)
+	c := New(a)
+	c.out = new(bytes.Buffer)
+	id, _ := a.NewSession("", "primary")
+	c.setCurrentSessionID(id)
+
+	c.lastQueueVersion = 100 // a high version left over from a prior session
+	c.mu.Lock()
+	c.refreshSessionLocked()
+	c.mu.Unlock()
+	if c.lastQueueVersion != c.queueSnapshot().Version {
+		t.Fatalf("refresh did not reset the queue cursor: cursor=%d snapshot=%d", c.lastQueueVersion, c.queueSnapshot().Version)
+	}
+}
+
 // TestCLIEventCallbackAbsorbsBurstWithoutBlocking proves the owner event callback
 // never blocks, even when a synchronous owner call emits far more events than the
 // former bounded channel held while mainLoop is stalled.
