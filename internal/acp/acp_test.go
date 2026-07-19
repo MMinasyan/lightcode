@@ -359,7 +359,7 @@ func TestHandleEventCompactionEndPushesSessionChanged(t *testing.T) {
 
 	lines := drainedLines(t, r, &out, 2)
 	assertACPNotificationMethod(t, lines[0], "agent/compaction_end")
-	assertACPNotificationMethod(t, lines[1], "agent/session_changed")
+	assertACPNotificationMethod(t, lines[1], "agent/session_resync")
 }
 
 func TestHandleEventActiveCompactionDefersSessionChangedUntilTurnEnd(t *testing.T) {
@@ -392,9 +392,9 @@ func TestHandleEventActiveCompactionDefersSessionChangedUntilTurnEnd(t *testing.
 	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, SessionID: sessionID, Turn: turn, RefreshSession: true})
 	lines = drainedLines(t, r, &out, 2)
 	assertACPNotificationMethod(t, lines[0], "agent/turn_end")
-	assertACPNotificationMethod(t, lines[1], "agent/session_changed")
+	assertACPNotificationMethod(t, lines[1], "agent/session_resync")
 	if !strings.Contains(lines[1], "active prompt") {
-		t.Fatalf("session_changed after turn_end omitted completed active turn: %s", lines[1])
+		t.Fatalf("session_resync after turn_end omitted completed active turn: %s", lines[1])
 	}
 }
 
@@ -492,7 +492,7 @@ func TestHandleTurnActionACPRevertCodeReturnsResultWithoutSessionChanged(t *test
 func TestHandleTurnActionACPRevertHistoryPropagatesAlsoRevertCode(t *testing.T) {
 	a := newACPTestAgent(t)
 	var out bytes.Buffer
-	r := &Runner{agent: a, out: &out}
+	r := &Runner{agent: a, owner: a, out: &out}
 
 	_ = appendACPUserTurn(t, a, "first")
 	r.setCurrentSessionID(a.SessionCurrent().ID)
@@ -527,7 +527,7 @@ func TestHandleTurnActionACPRevertHistoryPropagatesAlsoRevertCode(t *testing.T) 
 func TestHandleTurnActionACPForkReturnsResultAndSessionChanged(t *testing.T) {
 	a := newACPTestAgent(t)
 	var out bytes.Buffer
-	r := &Runner{agent: a, out: &out}
+	r := &Runner{agent: a, owner: a, out: &out}
 
 	_ = appendACPUserTurn(t, a, "first")
 	r.setCurrentSessionID(a.SessionCurrent().ID)
@@ -706,7 +706,7 @@ func TestACPSwitchKeepsCurrent(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	r := &Runner{agent: a, out: &out}
+	r := &Runner{agent: a, owner: a, out: &out}
 	r.setCurrentSessionID(secondID)
 	r.handleSessionSwitch(Request{
 		JSONRPC: "2.0",

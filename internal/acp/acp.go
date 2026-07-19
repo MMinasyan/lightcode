@@ -346,7 +346,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 			Params:  map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled},
 		})
 		if ev.RefreshSession {
-			r.pushSessionChangedForEvent(ev)
+			r.pushResyncForEvent(ev)
 		}
 		return
 	case agent.EventError:
@@ -376,7 +376,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 			Method:  "agent/compaction_end",
 		})
 		if ev.RefreshSession {
-			r.pushSessionChangedForEvent(ev)
+			r.pushResyncForEvent(ev)
 		}
 		return
 	case agent.EventWarning:
@@ -464,7 +464,7 @@ func (r *Runner) handleSessionNew(req Request) {
 		return
 	}
 	r.setCurrentSessionID(id)
-	r.pushSessionChangedForSession(id)
+	r.pushSessionBoundary(id)
 	r.respond(req.ID, r.currentSessionSummary())
 }
 
@@ -597,7 +597,7 @@ func (r *Runner) handleSessionSwitch(req Request) {
 		return
 	}
 	r.setCurrentSessionID(summary.ID)
-	r.pushSessionChangedForSession(summary.ID)
+	r.pushSessionBoundary(summary.ID)
 	r.respond(req.ID, summary)
 }
 
@@ -615,7 +615,7 @@ func (r *Runner) handleSessionArchive(req Request) {
 	}
 	wasCurrent := r.sv().RemovedCurrent(params.ID)
 	if wasCurrent {
-		r.pushSessionChangedForSession(strings.TrimSpace(params.ID))
+		r.pushSessionBoundary(strings.TrimSpace(params.ID))
 	}
 	r.respond(req.ID, map[string]any{"ok": true})
 }
@@ -634,7 +634,7 @@ func (r *Runner) handleSessionDelete(req Request) {
 	}
 	wasCurrent := r.sv().RemovedCurrent(params.ID)
 	if wasCurrent {
-		r.pushSessionChangedForSession(strings.TrimSpace(params.ID))
+		r.pushSessionBoundary(strings.TrimSpace(params.ID))
 	}
 	r.respond(req.ID, map[string]any{"ok": true})
 }
@@ -673,9 +673,9 @@ func (r *Runner) handleTurnAction(req Request, action string) {
 	if result.SessionChanged {
 		if result.Session.ID != "" {
 			r.setCurrentSessionID(result.Session.ID)
-			r.pushSessionChangedForSession(result.Session.ID)
+			r.pushSessionBoundary(result.Session.ID)
 		} else {
-			r.pushSessionChangedForSession(sessionID)
+			r.pushSessionBoundary(sessionID)
 		}
 	}
 	r.respond(req.ID, result)
@@ -871,30 +871,45 @@ func warningSnapshot(warnings []agent.PromptWarning) []agent.PromptWarning {
 	return warnings
 }
 
-func (r *Runner) pushSessionChanged() {
-	current, err := r.currentSession()
-	if err != nil {
-		r.pushSessionChangedForSession("")
+// pushSessionBoundary sends the destination session's complete state as the
+// navigation/turn-action boundary. It runs from a request handler, never the event
+// callback, so acquiring the capture's lifecycle lock cannot stall a turn.
+func (r *Runner) pushSessionBoundary(sessionID string) {
+	if r.owner == nil {
+		r.pushSessionResync(sessionID)
 		return
 	}
-	r.pushSessionChangedForSession(current)
+	r.owner.HydrateSessionWithBoundary(sessionID, func(state agent.HydrationState) {
+		r.sendNotification(Notification{
+			JSONRPC: "2.0",
+			Method:  "agent/session_changed",
+			Params:  state,
+		})
+	})
 }
 
-func (r *Runner) pushSessionChangedForEvent(ev agent.Event) {
-	if strings.TrimSpace(ev.SessionID) != "" {
-		r.pushSessionChangedForSession(ev.SessionID)
-		return
-	}
-	r.pushSessionChanged()
-}
-
-func (r *Runner) pushSessionChangedForSession(sessionID string) {
-	payload := r.sv().SessionChangedPayload(sessionID)
+// pushSessionResync re-syncs a compacted session's transcript from the event
+// callback using the rt.mu-only payload, never the lifecycle-locked capture: a
+// concurrent archive/delete/revert can hold the lifecycle lock while waiting for
+// this very turn to go idle, so acquiring it here would stall the turn.
+func (r *Runner) pushSessionResync(sessionID string) {
 	r.sendNotification(Notification{
 		JSONRPC: "2.0",
-		Method:  "agent/session_changed",
-		Params:  payload,
+		Method:  "agent/session_resync",
+		Params:  r.sv().SessionChangedPayload(sessionID),
 	})
+}
+
+func (r *Runner) pushResyncForEvent(ev agent.Event) {
+	if id := strings.TrimSpace(ev.SessionID); id != "" {
+		r.pushSessionResync(id)
+		return
+	}
+	if current, err := r.currentSession(); err == nil {
+		r.pushSessionResync(current)
+		return
+	}
+	r.pushSessionResync("")
 }
 
 // --- Wire helpers ---
