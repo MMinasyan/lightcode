@@ -593,22 +593,54 @@ func TestSubagentBackgroundProcessCompletionRenders(t *testing.T) {
 	}
 }
 
-func TestCLIExitReturnsThroughLifecycleDetach(t *testing.T) {
+func TestCLIExitReturnsExitError(t *testing.T) {
 	a, _ := newTestAgent(t)
-	svc := &cliLifecycleService{AdapterService: a}
-	c := New(svc)
-	detach := c.attachAdapter(context.Background())
-	if detach == nil {
-		t.Fatal("attachAdapter returned nil detach")
-	}
+	c := New(a)
 	err := c.dispatchCommand("/exit")
 	var exit interface{ ExitCode() int }
 	if !errors.As(err, &exit) || exit.ExitCode() != 0 {
 		t.Fatalf("/exit err = %v, want exit code 0", err)
 	}
-	detach()
-	if svc.attached != 1 || svc.detached != 1 {
-		t.Fatalf("lifecycle attached/detached = %d/%d, want 1/1", svc.attached, svc.detached)
+}
+
+// TestCLIEventCallbackAbsorbsBurstWithoutBlocking proves the owner event callback
+// never blocks, even when a synchronous owner call emits far more events than the
+// former bounded channel held while mainLoop is stalled.
+func TestCLIEventCallbackAbsorbsBurstWithoutBlocking(t *testing.T) {
+	c := New(nil)
+	const n = 1000 // well above the former 256 channel capacity
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < n; i++ {
+			c.enqueueEvent(agent.Event{Kind: agent.EventTextDelta, Result: "x"})
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("event callback blocked emitting above the former channel capacity")
+	}
+	c.eventMu.Lock()
+	got := len(c.eventFrames)
+	c.eventMu.Unlock()
+	if got != n {
+		t.Fatalf("buffered events = %d, want %d (none dropped or blocked)", got, n)
+	}
+}
+
+// TestCLIClosedEventCallbackDropsEvents proves that once event admission is closed
+// the callback drops further events, so shutdown can join the owner without a late
+// event slipping into an abandoned queue.
+func TestCLIClosedEventCallbackDropsEvents(t *testing.T) {
+	c := New(nil)
+	c.closeEvents()
+	c.enqueueEvent(agent.Event{Kind: agent.EventTextDelta, Result: "x"})
+	c.eventMu.Lock()
+	got := len(c.eventFrames)
+	c.eventMu.Unlock()
+	if got != 0 {
+		t.Fatalf("closed event admission buffered %d events, want 0", got)
 	}
 }
 
@@ -620,22 +652,6 @@ func TestCLIDoesNotCallOSExit(t *testing.T) {
 	if strings.Contains(string(data), "os.Exit(") {
 		t.Fatal("CLI must return through Run so lifecycle defers execute, not call os.Exit")
 	}
-}
-
-type cliLifecycleService struct {
-	agent.AdapterService
-	attached int
-	detached int
-}
-
-func (s *cliLifecycleService) AttachAdapter(context.Context) error {
-	s.attached++
-	return nil
-}
-
-func (s *cliLifecycleService) DetachAdapter(context.Context) error {
-	s.detached++
-	return nil
 }
 
 // extractFunctionBody returns the brace-delimited body of the first function

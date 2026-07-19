@@ -114,19 +114,14 @@ func buildAgent() (*agent.Agent, error) {
 }
 
 func runCLI() error {
-	svc, err := ownerService(0)
+	ag, err := buildAgent()
 	if err != nil {
 		return err
 	}
-	err = cli.New(svc).Run(context.Background())
+	err = cli.New(ag).Run(context.Background())
 	var exit interface{ ExitCode() int }
 	if err != nil && !errors.As(err, &exit) {
 		return err
-	}
-	if waiter, ok := svc.(interface{ WaitOwner() error }); ok {
-		if waitErr := waiter.WaitOwner(); waitErr != nil {
-			return waitErr
-		}
 	}
 	return err
 }

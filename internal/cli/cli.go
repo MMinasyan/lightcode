@@ -27,7 +27,11 @@ const (
 )
 
 type CLI struct {
+	// agent is the concrete local owner this adapter constructs and shuts down;
+	// owner is the same object typed for the concrete-only surface (ShutdownOwner).
+	// Most CLI code uses the AdapterService interface, so agent keeps that type.
 	agent agent.AdapterService
+	owner *agent.Agent
 	scope *agent.AdapterScope
 	out   io.Writer
 	mu    *sync.Mutex
@@ -44,11 +48,19 @@ type CLI struct {
 	input     *inputLine
 	history   inputHistory
 	keyCh     chan keyMsg
-	events    chan agent.Event
 	exitCh    chan error
 	exitOnce  sync.Once
 	readKeyFn func() (keyMsg, error)
 	ctx       context.Context
+
+	// Event delivery spine: the owner callback appends every event here and wakes
+	// mainLoop, which is the sole drainer. A synchronous owner call may emit more
+	// events than the former bounded channel held while mainLoop is stalled, so the
+	// callback only appends and never blocks. Producers never render.
+	eventMu     sync.Mutex
+	eventFrames []agent.Event
+	eventWake   chan struct{}
+	eventClosed bool
 
 	modelRef string
 
@@ -88,23 +100,70 @@ type CLI struct {
 	lastWarningSnapshot map[string]bool
 }
 
-func New(a agent.AdapterService) *CLI {
+func New(a *agent.Agent) *CLI {
 	c := &CLI{
-		agent:               a,
 		out:                 os.Stdout,
 		mu:                  &sync.Mutex{},
 		input:               newInputLine(),
 		history:             newInputHistory(),
 		keyCh:               make(chan keyMsg, 64),
-		events:              make(chan agent.Event, 256),
+		eventWake:           make(chan struct{}, 1),
 		exitCh:              make(chan error, 1),
 		width:               80,
 		lastWarningSnapshot: make(map[string]bool),
 	}
+	// A nil concrete agent must leave the interface field nil (not an interface
+	// wrapping a nil pointer), so tests that construct a headless CLI still see no
+	// owner.
 	if a != nil {
+		c.agent = a
+		c.owner = a
 		c.scope = agent.NewAdapterScope(a, a.ProjectRoot())
 	}
 	return c
+}
+
+// enqueueEvent appends one owner event and wakes mainLoop. It never blocks or
+// renders, so it is safe to call from the owner's event callback while a
+// synchronous owner call is in flight and mainLoop is stalled.
+func (c *CLI) enqueueEvent(ev agent.Event) {
+	c.eventMu.Lock()
+	if c.eventClosed {
+		c.eventMu.Unlock()
+		return
+	}
+	c.eventFrames = append(c.eventFrames, ev)
+	c.eventMu.Unlock()
+	select {
+	case c.eventWake <- struct{}{}:
+	default:
+	}
+}
+
+// drainEvents renders every queued event in FIFO order. It runs on mainLoop's
+// goroutine and pops under eventMu but renders (handleEvent takes the render mutex)
+// without holding it, so the callback can keep appending while events render.
+func (c *CLI) drainEvents() {
+	for {
+		c.eventMu.Lock()
+		if len(c.eventFrames) == 0 {
+			c.eventMu.Unlock()
+			return
+		}
+		ev := c.eventFrames[0]
+		c.eventFrames = c.eventFrames[1:]
+		c.eventMu.Unlock()
+		c.handleEvent(ev)
+	}
+}
+
+// closeEvents rejects further owner events. Shutdown joins the owner before calling
+// it, so a cancelled turn's terminal events are admitted during the join rather than
+// dropped; the CLI is exiting, so those final events are not rendered.
+func (c *CLI) closeEvents() {
+	c.eventMu.Lock()
+	c.eventClosed = true
+	c.eventMu.Unlock()
 }
 
 type ExitError struct {
@@ -287,14 +346,9 @@ func (c *CLI) Run(ctx context.Context) error {
 		}
 	}
 
-	c.agent.SetEventHandler(func(ev agent.Event) {
-		c.events <- ev
-	})
+	c.agent.SetEventHandler(c.enqueueEvent)
 
 	c.agent.Init(ctx)
-	if detach := c.attachAdapter(ctx); detach != nil {
-		defer detach()
-	}
 	sessionID := ""
 	if sessions, err := c.scope.SessionList("active"); err == nil && len(sessions) > 0 {
 		if summary, err := c.agent.OpenSession(sessions[0].ID); err == nil {
@@ -324,23 +378,18 @@ func (c *CLI) Run(ctx context.Context) error {
 
 	go c.readKeys(ctx)
 
-	return c.mainLoop(ctx)
-}
+	err = c.mainLoop(ctx)
 
-func (c *CLI) attachAdapter(ctx context.Context) func() {
-	lifecycle, ok := c.agent.(interface {
-		AttachAdapter(context.Context) error
-		DetachAdapter(context.Context) error
-	})
-	if !ok {
-		return nil
+	// Teardown: stop the input and signal goroutines, join the owner so a cancelled
+	// turn's terminal events are still admitted (join precedes event close), then
+	// reject further events. restoreTerminal runs via the deferred cleanup, after
+	// the owner join.
+	cancel()
+	if c.owner != nil {
+		c.owner.ShutdownOwner()
 	}
-	if err := lifecycle.AttachAdapter(ctx); err != nil {
-		return nil
-	}
-	return func() {
-		_ = lifecycle.DetachAdapter(context.Background())
-	}
+	c.closeEvents()
+	return err
 }
 
 func (c *CLI) readKeys(ctx context.Context) {
@@ -373,8 +422,8 @@ func (c *CLI) mainLoop(ctx context.Context) error {
 			if err := c.handleKey(k); err != nil {
 				return err
 			}
-		case ev := <-c.events:
-			c.handleEvent(ev)
+		case <-c.eventWake:
+			c.drainEvents()
 		case err := <-c.exitCh:
 			return err
 		case <-ctx.Done():
