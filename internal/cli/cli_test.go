@@ -724,6 +724,81 @@ func TestCLITickAnimationRendersWhenActiveOnly(t *testing.T) {
 	}
 }
 
+// TestCLIOpGroupRejectsAfterClose proves the op-group admits members while open and
+// rejects them (without running) once admission is closed.
+func TestCLIOpGroupRejectsAfterClose(t *testing.T) {
+	c := New(nil)
+	if !c.spawnOp(func() {}) {
+		t.Fatal("spawnOp should admit while open")
+	}
+	c.opWG.Wait()
+	c.closeOpAdmission()
+	ran := make(chan struct{}, 1)
+	if c.spawnOp(func() { ran <- struct{}{} }) {
+		t.Fatal("spawnOp must reject after closeOpAdmission")
+	}
+	select {
+	case <-ran:
+		t.Fatal("a rejected op must not run")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestCLIOpGroupJoinsMembers proves opWG.Wait joins an in-flight member, so host exit
+// does not abandon a running submit/compact.
+func TestCLIOpGroupJoinsMembers(t *testing.T) {
+	c := New(nil)
+	release := make(chan struct{})
+	done := make(chan struct{})
+	if !c.spawnOp(func() { <-release; close(done) }) {
+		t.Fatal("spawnOp should admit")
+	}
+	c.closeOpAdmission()
+
+	joined := make(chan struct{})
+	go func() { c.opWG.Wait(); close(joined) }()
+	select {
+	case <-joined:
+		t.Fatal("opWG.Wait returned before the member finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("member did not run")
+	}
+	select {
+	case <-joined:
+	case <-time.After(time.Second):
+		t.Fatal("opWG.Wait did not return after the member finished")
+	}
+}
+
+// TestCLIAsyncOpsUseOpGroup proves submit and compact run through the op-group (so
+// they are admission-gated and joined on exit) rather than bare goroutines.
+func TestCLIAsyncOpsUseOpGroup(t *testing.T) {
+	src, err := os.ReadFile("cli.go")
+	if err != nil {
+		t.Fatalf("read cli.go: %v", err)
+	}
+	s := string(src)
+	// submit and compact always run through the op-group; cmdCopy runs its clipboard
+	// fallback through it (its OSC-52 fast path is synchronous mainLoop output).
+	for _, fn := range []string{"func (c *CLI) submitToBackend(", "func (c *CLI) cmdCompact(", "func (c *CLI) cmdCopy("} {
+		body, ok := extractFunctionBody(s, fn)
+		if !ok {
+			t.Fatalf("%s not found", fn)
+		}
+		if strings.Contains(body, "go func") {
+			t.Fatalf("%s must run through spawnOp, not a bare goroutine", fn)
+		}
+		if !strings.Contains(body, "c.spawnOp(") {
+			t.Fatalf("%s must run through the op-group (spawnOp)", fn)
+		}
+	}
+}
+
 // TestCLISignalPathDoesNotWriteTerminal proves the signal handler (inside Run) does
 // not write os.Stdout: signals only requestExit, and the deferred restoreTerminal
 // shows the cursor. Keeps the terminal writer single.

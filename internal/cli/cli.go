@@ -66,14 +66,23 @@ type CLI struct {
 	keyWake   chan struct{}
 	keyClosed bool
 
-	// Event delivery spine: the owner callback appends every event here and wakes
-	// mainLoop, which is the sole drainer. A synchronous owner call may emit more
-	// events than the former bounded channel held while mainLoop is stalled, so the
-	// callback only appends and never blocks. Producers never render.
+	// Delivery spine: one FIFO of closures carrying owner events and async-operation
+	// results, drained by mainLoop, which is the sole drainer and sole terminal
+	// writer. Producers (the owner callback, op-group members) only append and wake;
+	// they never render. A synchronous owner call may append more than the former
+	// bounded channel held while mainLoop is stalled, so appending never blocks.
 	eventMu     sync.Mutex
-	eventFrames []agent.Event
+	eventFrames []func()
 	eventWake   chan struct{}
 	eventClosed bool
+
+	// Async op-group: submit, compact, and the clipboard fallback run here. spawnOp
+	// admits and starts a member unless closed; each runs on the adapter context and
+	// posts its result to the delivery FIFO. Close sets closed under opMu before the
+	// join, so an admitting Add cannot race the shutdown Wait.
+	opMu     sync.Mutex
+	opClosed bool
+	opWG     sync.WaitGroup
 
 	modelRef string
 
@@ -139,16 +148,16 @@ func New(a *agent.Agent) *CLI {
 	return c
 }
 
-// enqueueEvent appends one owner event and wakes mainLoop. It never blocks or
-// renders, so it is safe to call from the owner's event callback while a
-// synchronous owner call is in flight and mainLoop is stalled.
-func (c *CLI) enqueueEvent(ev agent.Event) {
+// enqueueItem appends one delivery closure and wakes mainLoop. It never blocks or
+// renders, so it is safe to call from the owner's event callback (while a synchronous
+// owner call is in flight and mainLoop is stalled) or from an op-group member.
+func (c *CLI) enqueueItem(item func()) {
 	c.eventMu.Lock()
 	if c.eventClosed {
 		c.eventMu.Unlock()
 		return
 	}
-	c.eventFrames = append(c.eventFrames, ev)
+	c.eventFrames = append(c.eventFrames, item)
 	c.eventMu.Unlock()
 	select {
 	case c.eventWake <- struct{}{}:
@@ -156,9 +165,21 @@ func (c *CLI) enqueueEvent(ev agent.Event) {
 	}
 }
 
-// drainEvents renders every queued event in FIFO order. It runs on mainLoop's
-// goroutine and pops under eventMu but renders (handleEvent takes the render mutex)
-// without holding it, so the callback can keep appending while events render.
+// enqueueEvent posts one owner event to the delivery FIFO.
+func (c *CLI) enqueueEvent(ev agent.Event) {
+	c.enqueueItem(func() { c.handleEvent(ev) })
+}
+
+// enqueuePost posts one async-operation result to the delivery FIFO, so it renders
+// on mainLoop's goroutine in order with owner events rather than from the member's
+// own goroutine.
+func (c *CLI) enqueuePost(render func()) {
+	c.enqueueItem(render)
+}
+
+// drainEvents runs every queued delivery closure in FIFO order. It runs on
+// mainLoop's goroutine and pops under eventMu but runs each closure (which takes the
+// render mutex) without holding it, so producers can keep appending while items run.
 func (c *CLI) drainEvents() {
 	for {
 		c.eventMu.Lock()
@@ -166,11 +187,39 @@ func (c *CLI) drainEvents() {
 			c.eventMu.Unlock()
 			return
 		}
-		ev := c.eventFrames[0]
+		item := c.eventFrames[0]
 		c.eventFrames = c.eventFrames[1:]
 		c.eventMu.Unlock()
-		c.handleEvent(ev)
+		item()
 	}
+}
+
+// spawnOp admits and starts one async op unless the op-group is closed. The op runs
+// on the adapter context and must post any result to the delivery FIFO via
+// enqueuePost, never rendering from its own goroutine.
+func (c *CLI) spawnOp(fn func()) bool {
+	c.opMu.Lock()
+	if c.opClosed {
+		c.opMu.Unlock()
+		return false
+	}
+	c.opWG.Add(1)
+	c.opMu.Unlock()
+	go func() {
+		defer c.opWG.Done()
+		fn()
+	}()
+	return true
+}
+
+// closeOpAdmission rejects further ops under opMu, so no new member starts after it
+// returns. The Run teardown then cancels the adapter context (releasing members
+// blocked in owner calls) and joins opWG; because admission closed under opMu first,
+// no admitting Add can race that Wait.
+func (c *CLI) closeOpAdmission() {
+	c.opMu.Lock()
+	c.opClosed = true
+	c.opMu.Unlock()
 }
 
 // closeEvents rejects further owner events. Shutdown joins the owner before calling
@@ -471,15 +520,18 @@ func (c *CLI) Run(ctx context.Context) error {
 
 	err = c.mainLoop(ctx)
 
-	// Teardown in the one host-shutdown order: stop ingress (close key admission and
-	// cancel the input/signal goroutines), join the owner so a cancelled turn's
-	// terminal events are still admitted, then close delivery. restoreTerminal runs
+	// Teardown in the one host-shutdown order: stop ingress (close key and op-group
+	// admission), cancel the input/signal goroutines and release members blocked in
+	// owner calls, join the owner so a cancelled turn's terminal events are still
+	// admitted, join the op-group members, then close delivery. restoreTerminal runs
 	// via the deferred cleanup, after the owner join.
 	c.closeKeys()
+	c.closeOpAdmission()
 	cancel()
 	if c.owner != nil {
 		c.owner.ShutdownOwner()
 	}
+	c.opWG.Wait()
 	c.closeEvents()
 	return err
 }
@@ -1439,17 +1491,19 @@ func (c *CLI) submitInputLocked(text string) {
 // the CLI does not own the queue. On error it renders the message and, if idle,
 // restores the input prompt. Runs the call off the lock in a goroutine.
 func (c *CLI) submitToBackend(text string) {
-	go func() {
+	c.spawnOp(func() {
 		sessionID, err := c.currentSession()
 		if err == nil {
 			_, err = c.agent.SubmitToSession(c.ctx, sessionID, text)
 		}
 		if err != nil {
-			c.mu.Lock()
-			c.handleSubmitErrorLocked(text, err)
-			c.mu.Unlock()
+			c.enqueuePost(func() {
+				c.mu.Lock()
+				c.handleSubmitErrorLocked(text, err)
+				c.mu.Unlock()
+			})
 		}
-	}()
+	})
 }
 
 func (c *CLI) handleSubmitErrorLocked(text string, err error) {
@@ -1688,19 +1742,21 @@ func (c *CLI) cmdCompact() {
 
 	c.startAnimation("Compacting")
 
-	go func() {
+	c.spawnOp(func() {
 		err := c.agent.CompactNowForSession(c.ctx, sessionID)
-		c.mu.Lock()
-		idle := c.finishCompactLocked()
-		c.mu.Unlock()
+		c.enqueuePost(func() {
+			c.mu.Lock()
+			idle := c.finishCompactLocked()
+			c.mu.Unlock()
 
-		if err != nil {
-			c.printLine(renderErrorMsg(err.Error()))
-			if idle {
-				c.printInputPrompt()
+			if err != nil {
+				c.printLine(renderErrorMsg(err.Error()))
+				if idle {
+					c.printInputPrompt()
+				}
 			}
-		}
-	}()
+		})
+	})
 }
 
 func (c *CLI) finishCompactLocked() bool {
@@ -1717,11 +1773,25 @@ func (c *CLI) finishCompactLocked() bool {
 func (c *CLI) cmdCopy() {
 	for i := len(c.messages) - 1; i >= 0; i-- {
 		if c.messages[i].typ == "assistant" && c.messages[i].content != "" {
-			if err := writeClipboard(c.out, c.messages[i].content); err != nil {
-				c.printLine(renderErrorMsg(err.Error()))
+			text := c.messages[i].content
+			// OSC-52 is ordinary mainLoop output.
+			if err := writeClipboardOSC52(c.out, text); err == nil {
+				c.printLine(renderSystemMsg("copied to clipboard"))
 				return
 			}
-			c.printLine(renderSystemMsg("copied to clipboard"))
+			// The write failed: run the shell-out fallback in the op-group so a
+			// blocking clipboard tool cannot wedge mainLoop, and post the result to
+			// the delivery FIFO.
+			c.spawnOp(func() {
+				err := writeClipboardFallback(c.ctx, text)
+				c.enqueuePost(func() {
+					if err != nil {
+						c.printLine(renderErrorMsg(err.Error()))
+					} else {
+						c.printLine(renderSystemMsg("copied to clipboard"))
+					}
+				})
+			})
 			return
 		}
 	}
