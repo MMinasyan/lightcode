@@ -301,10 +301,10 @@ func (r *Runner) handleEvent(ev agent.Event) {
 	switch ev.Kind {
 	case agent.EventTextDelta:
 		method = "agent/message_chunk"
-		params = map[string]any{"content": ev.Result}
+		params = map[string]any{"seq": ev.Seq, "content": ev.Result}
 	case agent.EventToolCallStart:
 		method = "agent/tool_start"
-		params = map[string]any{"id": ev.ToolCallID, "name": ev.ToolName, "args": ev.Args}
+		params = map[string]any{"seq": ev.Seq, "id": ev.ToolCallID, "name": ev.ToolName, "args": ev.Args}
 	case agent.EventToolCallEnd:
 		method = "agent/tool_result"
 		params = map[string]any{"id": ev.ToolCallID, "name": ev.ToolName, "args": ev.Args, "success": !ev.IsError, "output": ev.Result, "metadata": ev.Metadata}
@@ -312,6 +312,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 		method = "agent/background_process_complete"
 		if ev.BackgroundProcess != nil {
 			params = map[string]any{
+				"seq":      ev.Seq,
 				"id":       ev.BackgroundProcess.ID,
 				"command":  ev.BackgroundProcess.Command,
 				"reason":   ev.BackgroundProcess.Reason,
@@ -322,10 +323,10 @@ func (r *Runner) handleEvent(ev agent.Event) {
 		}
 	case agent.EventUserMessageDisplay:
 		method = "agent/user_message"
-		params = map[string]any{"turn": ev.Turn, "content": ev.Result}
+		params = map[string]any{"seq": ev.Seq, "turn": ev.Turn, "content": ev.Result}
 	case agent.EventGenericSystemSignal:
 		method = "agent/system_signal"
-		params = map[string]any{"content": "System: " + ev.Result}
+		params = map[string]any{"seq": ev.Seq, "content": "System: " + ev.Result}
 	case agent.EventQueueChanged:
 		queue := ev.Queue
 		if queue == nil {
@@ -351,7 +352,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 		return
 	case agent.EventError:
 		method = "agent/error"
-		params = map[string]any{"message": ev.Error, "turn": ev.Turn}
+		params = map[string]any{"seq": ev.Seq, "message": ev.Error, "turn": ev.Turn}
 	case agent.EventPermissionRequest:
 		method = "agent/permission_request"
 		params = map[string]any{

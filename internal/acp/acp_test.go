@@ -229,6 +229,54 @@ func TestHandleEventNotifications(t *testing.T) {
 	}
 }
 
+func TestHandleEventCarriesSequence(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, Seq: 5, Result: "hi"})
+	r.handleEvent(agent.Event{Kind: agent.EventToolCallStart, Seq: 6, ToolCallID: "tc1", ToolName: "read_file"})
+	r.handleEvent(agent.Event{Kind: agent.EventToolCallEnd, Seq: 7, ToolCallID: "tc1", ToolName: "read_file", Result: "done"})
+	r.handleEvent(agent.Event{Kind: agent.EventUserMessageDisplay, Seq: 8, Turn: 1, Result: "u"})
+	r.handleEvent(agent.Event{Kind: agent.EventGenericSystemSignal, Seq: 9, Result: "s"})
+	r.handleEvent(agent.Event{Kind: agent.EventError, Seq: 10, Error: "boom", Turn: 1})
+	r.handleEvent(agent.Event{
+		Kind: agent.EventBackgroundProcessComplete, Seq: 11,
+		BackgroundProcess: &agent.BackgroundProcessDisplay{ID: "bg-1", Command: "x", Reason: "completed"},
+	})
+
+	lines := drainedLines(t, r, &out, 7)
+	// Every transcript row carries its sequence so the client can gate live
+	// items against the navigation boundary high-water. tool_result is the
+	// exception: it updates the id-keyed row started by tool_start.
+	wantSeq := map[string]float64{
+		"agent/message_chunk":               5,
+		"agent/tool_start":                  6,
+		"agent/user_message":                8,
+		"agent/system_signal":               9,
+		"agent/error":                       10,
+		"agent/background_process_complete": 11,
+	}
+	for i, line := range lines {
+		var got Notification
+		if err := json.Unmarshal([]byte(line), &got); err != nil {
+			t.Fatalf("notification[%d] json: %v", i, err)
+		}
+		params, ok := got.Params.(map[string]any)
+		if !ok {
+			t.Fatalf("notification[%d] %s params not object: %#v", i, got.Method, got.Params)
+		}
+		if want, seqBearing := wantSeq[got.Method]; seqBearing {
+			if params["seq"] != want {
+				t.Fatalf("%s seq = %#v, want %v", got.Method, params["seq"], want)
+			}
+		}
+		if got.Method == "agent/tool_result" {
+			if _, present := params["seq"]; present {
+				t.Fatalf("tool_result must not carry seq (id-keyed update), got %#v", params["seq"])
+			}
+		}
+	}
+}
+
 func TestHandleEventFiltersSession(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{out: &out}
