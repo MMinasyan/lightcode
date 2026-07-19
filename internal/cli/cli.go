@@ -47,11 +47,24 @@ type CLI struct {
 	busy      bool
 	input     *inputLine
 	history   inputHistory
-	keyCh     chan keyMsg
-	exitCh    chan error
-	exitOnce  sync.Once
 	readKeyFn func() (keyMsg, error)
 	ctx       context.Context
+
+	// Exit latch: requestExit stores the exit error and closes exitLatch once. Every
+	// key read (mainLoop and nested menus) and mainLoop's select observe it, so a
+	// signal or stdin EOF unwinds all of them and reaches shutdown.
+	exitOnce  sync.Once
+	exitLatch chan struct{}
+	exitErr   error
+
+	// Key ingest spine: readKeys appends parsed keys here and wakes a reader; the key
+	// reader (mainLoop or a nested menu) pops without blocking on a bounded channel,
+	// so a stalled mainLoop can never wedge the reader mid-send. Closed on stdin EOF
+	// and host exit.
+	keyMu     sync.Mutex
+	keyFrames []keyMsg
+	keyWake   chan struct{}
+	keyClosed bool
 
 	// Event delivery spine: the owner callback appends every event here and wakes
 	// mainLoop, which is the sole drainer. A synchronous owner call may emit more
@@ -106,9 +119,9 @@ func New(a *agent.Agent) *CLI {
 		mu:                  &sync.Mutex{},
 		input:               newInputLine(),
 		history:             newInputHistory(),
-		keyCh:               make(chan keyMsg, 64),
+		keyWake:             make(chan struct{}, 1),
 		eventWake:           make(chan struct{}, 1),
-		exitCh:              make(chan error, 1),
+		exitLatch:           make(chan struct{}),
 		width:               80,
 		lastWarningSnapshot: make(map[string]bool),
 	}
@@ -166,6 +179,82 @@ func (c *CLI) closeEvents() {
 	c.eventMu.Unlock()
 }
 
+// enqueueKey appends one parsed key and wakes a reader. It never blocks, so a
+// stalled mainLoop cannot wedge the key reader in a send and keep it from its next
+// stdin read.
+func (c *CLI) enqueueKey(k keyMsg) {
+	c.keyMu.Lock()
+	if c.keyClosed {
+		c.keyMu.Unlock()
+		return
+	}
+	c.keyFrames = append(c.keyFrames, k)
+	c.keyMu.Unlock()
+	select {
+	case c.keyWake <- struct{}{}:
+	default:
+	}
+}
+
+// popKey removes the next buffered key, reporting whether one was available. Once
+// the exit latch is set it reports empty even with keys buffered, so mainLoop and
+// nested menus stop dequeuing and unwind to shutdown; the latch check is under keyMu,
+// so it is atomic with requestExit's latch close and no key is dequeued after exit.
+// This is the exit's "stop ingress" boundary: a key already dequeued when the latch
+// closes completes its handling (pop and handling cannot be atomic — handling blocks
+// on nested menus and owner calls), then the next read observes the latch and unwinds.
+func (c *CLI) popKey() (keyMsg, bool) {
+	c.keyMu.Lock()
+	defer c.keyMu.Unlock()
+	select {
+	case <-c.exitLatch:
+		return keyMsg{}, false
+	default:
+	}
+	if len(c.keyFrames) == 0 {
+		return keyMsg{}, false
+	}
+	k := c.keyFrames[0]
+	c.keyFrames = c.keyFrames[1:]
+	return k, true
+}
+
+// closeKeys rejects further keys and wakes any waiting reader so it re-checks and
+// observes the exit latch. Called on stdin EOF and at host exit.
+func (c *CLI) closeKeys() {
+	c.keyMu.Lock()
+	c.keyClosed = true
+	c.keyMu.Unlock()
+	select {
+	case c.keyWake <- struct{}{}:
+	default:
+	}
+}
+
+// nextKey is the single key source shared by mainLoop and every nested menu. popKey
+// enforces exit priority (it reports empty once the latch is set), so a returned key
+// is always one the exit latch had not yet claimed; otherwise nextKey reports the
+// exit error, or the context error on cancellation.
+func (c *CLI) nextKey(ctx context.Context) (keyMsg, error) {
+	for {
+		if k, ok := c.popKey(); ok {
+			return k, nil
+		}
+		select {
+		case <-c.exitLatch:
+			return keyMsg{}, c.exitErr
+		default:
+		}
+		select {
+		case <-c.keyWake:
+		case <-c.exitLatch:
+			return keyMsg{}, c.exitErr
+		case <-ctx.Done():
+			return keyMsg{}, ctx.Err()
+		}
+	}
+}
+
 type ExitError struct {
 	Code int
 }
@@ -180,7 +269,13 @@ func (e ExitError) ExitCode() int {
 
 func (c *CLI) requestExit(err error) {
 	c.exitOnce.Do(func() {
-		c.exitCh <- err
+		// Close the latch under keyMu so it is atomic with popKey's latch check: a
+		// key read either observes the open latch and pops, or observes the closed
+		// latch and unwinds — never pops a key after exit was requested.
+		c.keyMu.Lock()
+		c.exitErr = err
+		close(c.exitLatch)
+		c.keyMu.Unlock()
 	})
 }
 
@@ -337,14 +432,7 @@ func (c *CLI) Run(ctx context.Context) error {
 	}()
 
 	c.ctx = ctx
-	c.readKeyFn = func() (keyMsg, error) {
-		select {
-		case k := <-c.keyCh:
-			return k, nil
-		case <-ctx.Done():
-			return keyMsg{}, ctx.Err()
-		}
-	}
+	c.readKeyFn = func() (keyMsg, error) { return c.nextKey(ctx) }
 
 	c.agent.SetEventHandler(c.enqueueEvent)
 
@@ -380,10 +468,11 @@ func (c *CLI) Run(ctx context.Context) error {
 
 	err = c.mainLoop(ctx)
 
-	// Teardown: stop the input and signal goroutines, join the owner so a cancelled
-	// turn's terminal events are still admitted (join precedes event close), then
-	// reject further events. restoreTerminal runs via the deferred cleanup, after
-	// the owner join.
+	// Teardown in the one host-shutdown order: stop ingress (close key admission and
+	// cancel the input/signal goroutines), join the owner so a cancelled turn's
+	// terminal events are still admitted, then close delivery. restoreTerminal runs
+	// via the deferred cleanup, after the owner join.
+	c.closeKeys()
 	cancel()
 	if c.owner != nil {
 		c.owner.ShutdownOwner()
@@ -402,15 +491,16 @@ func (c *CLI) readKeys(ctx context.Context) {
 		}
 		n, err := os.Stdin.Read(buf[:])
 		if err != nil {
+			// stdin ended: set the exit latch BEFORE closing key admission, so the
+			// wake closeKeys issues can never let mainLoop or a nested menu pop and
+			// act on a buffered key while the latch still looks open. The latch is
+			// established first, so a full key backlog unwinds to shutdown instead.
+			c.requestExit(ExitError{Code: 0})
+			c.closeKeys()
 			return
 		}
-		keys := parseInputBytes(buf[:n])
-		for _, k := range keys {
-			select {
-			case c.keyCh <- k:
-			case <-ctx.Done():
-				return
-			}
+		for _, k := range parseInputBytes(buf[:n]) {
+			c.enqueueKey(k)
 		}
 	}
 }
@@ -418,14 +508,22 @@ func (c *CLI) readKeys(ctx context.Context) {
 func (c *CLI) mainLoop(ctx context.Context) error {
 	for {
 		select {
-		case k := <-c.keyCh:
-			if err := c.handleKey(k); err != nil {
-				return err
+		case <-c.keyWake:
+			// Drain buffered keys. popKey reports empty once the exit latch is set,
+			// so this loop stops draining at exit and the outer select returns.
+			for {
+				k, ok := c.popKey()
+				if !ok {
+					break
+				}
+				if err := c.handleKey(k); err != nil {
+					return err
+				}
 			}
 		case <-c.eventWake:
 			c.drainEvents()
-		case err := <-c.exitCh:
-			return err
+		case <-c.exitLatch:
+			return c.exitErr
 		case <-ctx.Done():
 			return ctx.Err()
 		}

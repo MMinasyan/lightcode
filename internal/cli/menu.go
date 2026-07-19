@@ -206,7 +206,7 @@ func firstSelectableMenuItem(items []menuItem) int {
 	return -1
 }
 
-func showMenu(mu *sync.Mutex, out func(string), keyCh chan keyMsg, readKeyFn func() (keyMsg, error), title string, items []menuItem, width int) menuResult {
+func showMenu(mu *sync.Mutex, out func(string), readKeyFn func() (keyMsg, error), title string, items []menuItem, width int) menuResult {
 	if width < 30 {
 		width = 30
 	}
@@ -278,7 +278,7 @@ func confirmYN(mu *sync.Mutex, out func(string), readKeyFn func() (keyMsg, error
 		{label: "Yes", selectable: true},
 		{label: "No", selectable: true},
 	}
-	result := showMenu(mu, out, nil, readKeyFn, question, items, width)
+	result := showMenu(mu, out, readKeyFn, question, items, width)
 	return result.selected == 0
 }
 
@@ -320,7 +320,7 @@ func (c *CLI) showModelMenu() {
 		})
 	}
 
-	result := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, "Model", items, c.currentWidth())
+	result := showMenu(c.mu, c.writeRaw, c.readKeyFn, "Model", items, c.currentWidth())
 	if result.selected >= 0 {
 		choice := result.extra.(modelChoice)
 		sessionID, err := c.currentSession()
@@ -556,7 +556,7 @@ func (c *CLI) showProjectMenu() {
 		})
 	}
 
-	result := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, "Project", items, c.currentWidth())
+	result := showMenu(c.mu, c.writeRaw, c.readKeyFn, "Project", items, c.currentWidth())
 	if result.selected >= 0 {
 		path := result.extra.(string)
 		c.printLine(renderSystemMsg("  switching to " + path + "..."))
@@ -601,7 +601,7 @@ func (c *CLI) showRevertMenu() {
 		})
 	}
 
-	result := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, "Revert — pick turn", items, c.currentWidth())
+	result := showMenu(c.mu, c.writeRaw, c.readKeyFn, "Revert — pick turn", items, c.currentWidth())
 	if result.selected < 0 {
 		return
 	}
@@ -614,7 +614,7 @@ func (c *CLI) showRevertMenu() {
 		{label: "Back", selectable: true, extra: "back"},
 	}
 
-	actionResult := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, fmt.Sprintf("Turn %d — action", turn), actionItems, c.currentWidth())
+	actionResult := showMenu(c.mu, c.writeRaw, c.readKeyFn, fmt.Sprintf("Turn %d — action", turn), actionItems, c.currentWidth())
 	if actionResult.selected < 0 {
 		return
 	}

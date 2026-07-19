@@ -25,7 +25,7 @@ func TestShowMenuDoesNotRedrawAtNavigationBounds(t *testing.T) {
 		{label: "Turn 1", detail: `write 3 test files. all the .txt files, containing only "test"`, selectable: true},
 	}
 
-	result := showMenu(&sync.Mutex{}, func(s string) { out.WriteString(s) }, nil, readKey, "Revert - pick turn", items, 80)
+	result := showMenu(&sync.Mutex{}, func(s string) { out.WriteString(s) }, readKey, "Revert - pick turn", items, 80)
 	if result.selected != -1 {
 		t.Fatalf("selected = %d, want cancel", result.selected)
 	}
@@ -52,7 +52,7 @@ func TestShowMenuRedrawUsesRenderedLineCount(t *testing.T) {
 		{label: "Turn 2", selectable: true},
 	}
 
-	_ = showMenu(&sync.Mutex{}, func(s string) { out.WriteString(s) }, nil, readKey, "Revert - pick turn", items, 80)
+	_ = showMenu(&sync.Mutex{}, func(s string) { out.WriteString(s) }, readKey, "Revert - pick turn", items, 80)
 	rendered := out.String()
 	if strings.Contains(rendered, "\x1b7") || strings.Contains(rendered, "\x1b8") || strings.Contains(rendered, "\x1b[J") {
 		t.Fatalf("menu redraw should not use cursor save/restore anchors:\n%q", rendered)

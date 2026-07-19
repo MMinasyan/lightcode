@@ -644,6 +644,101 @@ func TestCLIClosedEventCallbackDropsEvents(t *testing.T) {
 	}
 }
 
+// TestCLIKeyReaderAbsorbsBurstWithoutBlocking proves the key reader never blocks on
+// a bounded channel, so a stalled mainLoop cannot wedge it mid-send and keep it from
+// its next stdin read.
+func TestCLIKeyReaderAbsorbsBurstWithoutBlocking(t *testing.T) {
+	c := New(nil)
+	const n = 500 // well above the former 64 channel capacity
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < n; i++ {
+			c.enqueueKey(keyMsg{Rune: 'x'})
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("key reader blocked appending above the former channel capacity")
+	}
+	c.keyMu.Lock()
+	got := len(c.keyFrames)
+	c.keyMu.Unlock()
+	if got != n {
+		t.Fatalf("buffered keys = %d, want %d", got, n)
+	}
+}
+
+// TestCLINextKeyReturnsBufferedKey proves the shared key source pops keys in order.
+func TestCLINextKeyReturnsBufferedKey(t *testing.T) {
+	c := New(nil)
+	c.enqueueKey(keyMsg{Rune: 'a'})
+	k, err := c.nextKey(context.Background())
+	if err != nil || k.Rune != 'a' {
+		t.Fatalf("nextKey = (%v, %v), want rune 'a'", k, err)
+	}
+}
+
+// TestCLIExitLatchUnwindsKeyRead proves the exit latch takes priority over a
+// buffered key, so a signal or EOF unwinds a nested menu read rather than consuming
+// another key.
+func TestCLIExitLatchUnwindsKeyRead(t *testing.T) {
+	c := New(nil)
+	c.enqueueKey(keyMsg{Rune: 'x'}) // a key is buffered
+	c.requestExit(ExitError{Code: 7})
+	_, err := c.nextKey(context.Background())
+	var exit interface{ ExitCode() int }
+	if !errors.As(err, &exit) || exit.ExitCode() != 7 {
+		t.Fatalf("nextKey after exit = %v, want ExitError code 7 (latch priority over buffered key)", err)
+	}
+}
+
+// TestCLIPopKeyReportsEmptyAfterExit proves latch priority is enforced atomically at
+// the single pop point: once exit is requested, popKey reports empty even with keys
+// buffered, so no key read (mainLoop or a nested menu) can pop and act on a queued
+// key — e.g. a buffered Enter cannot fire a revert during signal shutdown.
+func TestCLIPopKeyReportsEmptyAfterExit(t *testing.T) {
+	c := New(nil)
+	c.enqueueKey(keyMsg{Rune: 'a'})
+	c.enqueueKey(keyMsg{Rune: 'b'})
+	c.requestExit(ExitError{Code: 0})
+	if _, ok := c.popKey(); ok {
+		t.Fatal("popKey returned a buffered key after exit was requested; latch priority must gate popping")
+	}
+}
+
+// TestCLINextKeyObservesContextCancel proves a cancelled context releases a blocked
+// key read.
+func TestCLINextKeyObservesContextCancel(t *testing.T) {
+	c := New(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.nextKey(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("nextKey with cancelled ctx = %v, want context.Canceled", err)
+	}
+}
+
+// TestCLIReadKeysSetsExitLatchBeforeClosingKeys proves the stdin-EOF path establishes
+// the exit latch before closing key admission. closeKeys wakes a reader, so if it ran
+// first a reader could observe an open latch and pop and act on a buffered key (a
+// full key backlog after EOF) instead of unwinding to shutdown.
+func TestCLIReadKeysSetsExitLatchBeforeClosingKeys(t *testing.T) {
+	src, err := os.ReadFile("cli.go")
+	if err != nil {
+		t.Fatalf("read cli.go: %v", err)
+	}
+	body, ok := extractFunctionBody(string(src), "func (c *CLI) readKeys(")
+	if !ok {
+		t.Fatal("readKeys not found")
+	}
+	req := strings.Index(body, "c.requestExit(")
+	clo := strings.Index(body, "c.closeKeys()")
+	if req < 0 || clo < 0 || req > clo {
+		t.Fatalf("readKeys must set the exit latch (requestExit) before closing key admission (closeKeys); requestExit@%d closeKeys@%d", req, clo)
+	}
+}
+
 func TestCLIDoesNotCallOSExit(t *testing.T) {
 	data, err := os.ReadFile("cli.go")
 	if err != nil {
