@@ -927,30 +927,6 @@ func (rt *runtime) setEventHandler(fn func(Event)) {
 	rt.onEvent = fn
 }
 
-// SubscribeEvents registers an additional event consumer and returns an unsubscribe function.
-func (a *Agent) SubscribeEvents(fn func(Event)) func() {
-	return a.ensureRuntime().subscribeEvents(fn)
-}
-
-func (rt *runtime) subscribeEvents(fn func(Event)) func() {
-	if fn == nil {
-		return func() {}
-	}
-	rt.eventMu.Lock()
-	if rt.eventSubscribers == nil {
-		rt.eventSubscribers = make(map[int]func(Event))
-	}
-	rt.nextEventSubscriber++
-	id := rt.nextEventSubscriber
-	rt.eventSubscribers[id] = fn
-	rt.eventMu.Unlock()
-	return func() {
-		rt.eventMu.Lock()
-		delete(rt.eventSubscribers, id)
-		rt.eventMu.Unlock()
-	}
-}
-
 // Init starts background goroutines, runs the session sweep, and
 // resumes the most recent session if one exists. ctx controls the
 // agent's lifetime.
@@ -1030,16 +1006,9 @@ func (a *Agent) emitEvent(ev Event) {
 func (rt *runtime) emitEvent(ev Event) {
 	rt.eventMu.RLock()
 	fn := rt.onEvent
-	subscribers := make([]func(Event), 0, len(rt.eventSubscribers))
-	for _, sub := range rt.eventSubscribers {
-		subscribers = append(subscribers, sub)
-	}
 	rt.eventMu.RUnlock()
 	if fn != nil {
 		fn(ev)
-	}
-	for _, sub := range subscribers {
-		sub(ev)
 	}
 }
 

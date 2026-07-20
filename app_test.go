@@ -345,12 +345,6 @@ func TestProjectSwitchInPlaceKeepsOwnerAlive(t *testing.T) {
 	if name := app.ProjectName(); name != filepath.Base(targetDir) {
 		t.Fatalf("ProjectName = %q, want %q", name, filepath.Base(targetDir))
 	}
-
-	// No relaunch: adapter must still be attached.
-	if app.adapterAttached {
-		// In tests adapterAttached is false (no lifecycle service); the point
-		// is that ProjectSwitch did not call DetachAdapter or Quit.
-	}
 }
 
 func TestProjectSwitchNoOpSameDir(t *testing.T) {

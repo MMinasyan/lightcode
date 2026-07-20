@@ -86,8 +86,6 @@ type App struct {
 	navMu     sync.Mutex
 	navClosed bool
 
-	adapterAttached bool
-
 	// routeMu guards the adapter's routing-current session id — a leaf below navMu.
 	// Navigation and current-target operations take navMu then routeMu. Routing
 	// current is where operations route; presentation current (owned by the drainer)
@@ -150,9 +148,6 @@ func (a *App) startup(ctx context.Context) {
 	a.startDelivery()
 	a.svc.SetEventHandler(a.handleEvent)
 	a.svc.Init(hostCtx)
-	if lifecycle, ok := a.svc.(interface{ AttachAdapter(context.Context) error }); ok {
-		a.adapterAttached = lifecycle.AttachAdapter(hostCtx) == nil
-	}
 	a.routeProjectPath = a.svc.ProjectRoot()
 	sessionID := ""
 	if sessions, err := a.svc.SessionListForProjectPath(a.routeProjectPath, "active"); err == nil && len(sessions) > 0 {
@@ -170,7 +165,7 @@ func (a *App) startup(ctx context.Context) {
 	a.started = true
 }
 
-func (a *App) shutdown(ctx context.Context) {
+func (a *App) shutdown(_ context.Context) {
 	a.lifecycleMu.Lock()
 	a.closed = true
 	started := a.started
@@ -183,11 +178,6 @@ func (a *App) shutdown(ctx context.Context) {
 	a.lifecycleMu.Unlock()
 
 	a.closeDelivery()
-	if a.adapterAttached {
-		if lifecycle, ok := a.svc.(interface{ DetachAdapter(context.Context) error }); ok {
-			_ = lifecycle.DetachAdapter(ctx)
-		}
-	}
 	if !started {
 		return
 	}

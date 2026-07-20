@@ -60,10 +60,8 @@ type runtime struct {
 	queueWake    chan struct{}
 	signalSink   agentSignalSink
 
-	eventMu             sync.RWMutex
-	onEvent             func(Event)
-	eventSubscribers    map[int]func(Event)
-	nextEventSubscriber int
+	eventMu sync.RWMutex
+	onEvent func(Event)
 
 	initOnce sync.Once
 	// lifecycleMu serializes identity-changing lifecycle operations

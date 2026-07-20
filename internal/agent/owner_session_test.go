@@ -307,37 +307,6 @@ func TestPermissionStampOwner(t *testing.T) {
 	}
 }
 
-func TestEventFanout(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
-	legacy := make(chan Event, 2)
-	extra := make(chan Event, 2)
-	a.SetEventHandler(func(ev Event) {
-		legacy <- ev
-	})
-	unsubscribe := a.SubscribeEvents(func(ev Event) {
-		extra <- ev
-	})
-
-	a.emitEvent(Event{Kind: EventWarning, Warnings: []PromptWarning{{Kind: "test", Message: "first"}}})
-	if got := waitEvent(t, legacy).Warnings[0].Message; got != "first" {
-		t.Fatalf("legacy handler saw %q, want first", got)
-	}
-	if got := waitEvent(t, extra).Warnings[0].Message; got != "first" {
-		t.Fatalf("extra subscriber saw %q, want first", got)
-	}
-
-	unsubscribe()
-	a.emitEvent(Event{Kind: EventWarning, Warnings: []PromptWarning{{Kind: "test", Message: "second"}}})
-	if got := waitEvent(t, legacy).Warnings[0].Message; got != "second" {
-		t.Fatalf("legacy handler after unsubscribe saw %q, want second", got)
-	}
-	select {
-	case ev := <-extra:
-		t.Fatalf("unsubscribed handler saw event %#v", ev)
-	default:
-	}
-}
-
 func TestPermissionSaveProject(t *testing.T) {
 	home := t.TempDir()
 	firstRoot := t.TempDir()
@@ -1353,16 +1322,6 @@ func waitPermissionEvent(t *testing.T, events <-chan Event) Event {
 	}
 }
 
-func waitEvent(t *testing.T, events <-chan Event) Event {
-	t.Helper()
-	select {
-	case ev := <-events:
-		return ev
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for event")
-		return Event{}
-	}
-}
 
 func backgroundID(t *testing.T, result string) string {
 	t.Helper()
