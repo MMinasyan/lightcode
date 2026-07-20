@@ -505,6 +505,14 @@ func TestIntegrationCrashRecoveryLoadsCleanHistory(t *testing.T) {
 	log1.waitFor(t, EventTurnEnd)
 	firstSession := a1.SessionCurrent().ID
 
+	// A crash ends the owner process, which releases its per-session flock claim
+	// via the OS. Simulate that release in-process (the same one process cannot
+	// otherwise drop a flock it still holds) so a fresh owner can reclaim and
+	// recover the durable session persisted on disk.
+	if _, err := a1.store.Close(); err != nil {
+		t.Fatalf("release first agent claim: %v", err)
+	}
+
 	a2 := newIntegrationAgentWithRoots(t, home, projectRoot, server.URL, opts)
 	log2, ctx2 := startIntegrationAgent(t, a2)
 	if got := a2.SessionCurrent().ID; got != firstSession {

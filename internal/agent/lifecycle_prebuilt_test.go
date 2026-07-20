@@ -127,6 +127,22 @@ func TestLifecycleReturnsPrebuiltReplacement(t *testing.T) {
 		}
 	})
 
+	// Current-session removal (archive/delete) commits durable removal first and then performs
+	// a deterministic detach with no complete-state capture: there is no boundary-
+	// capturing variant of SessionArchive/SessionDelete, and removing the current
+	// session clears selection with no automatic fallback replacement.
+	t.Run("case=removal_no_capture", func(t *testing.T) {
+		a := newCatalogBackedTestAgent(t)
+		appendUserTurn(t, a, "kept")
+		id := a.SessionCurrent().ID
+		if err := a.SessionArchive(id); err != nil {
+			t.Fatalf("SessionArchive: %v", err)
+		}
+		if cur := a.SessionCurrent().ID; cur != "" {
+			t.Fatalf("current = %q after archiving the only session; current-session removal selects no session and never falls back", cur)
+		}
+	})
+
 	// A failed activation must not publish a boundary. The old
 	// postcommit capture emitted a zero-state detach when its fallible read failed;
 	// the prebuilt path fails preparation before any commit, so nothing is published.
