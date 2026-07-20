@@ -2,7 +2,7 @@
 
 <p align="center">
   A coding agent that works with any OpenAI-compatible LLM provider.<br>
-  Desktop app · Terminal CLI · HTTP daemon · ACP stdio adapter — one Go binary, four interfaces.
+  Desktop app · Terminal CLI · ACP stdio adapter — one Go binary, three interfaces.
 </p>
 
 <p align="center">
@@ -173,7 +173,6 @@ Run Lightcode from the project directory you want it to work on:
 ```bash
 lightcode                       # Desktop GUI
 lightcode cli                   # Terminal REPL
-lightcode serve --port 8080     # HTTP+SSE daemon
 lightcode acp                   # JSON-RPC over stdio
 ```
 
@@ -189,7 +188,7 @@ Useful CLI commands:
 - `/copy` — copy the last assistant response
 - `/exit` — exit
 
-`lightcode serve` writes a daemon lockfile under `~/.lightcode/daemon/` containing the port and token. HTTP clients use Bearer auth; ACP clients use newline-delimited JSON-RPC over stdio.
+ACP clients drive Lightcode over newline-delimited JSON-RPC on stdio.
 
 #### Commands
 
@@ -201,7 +200,6 @@ Beyond the run modes above, the binary ships utility commands: `version`, `docto
 - `~/.lightcode/.env` — local API keys
 - `~/.lightcode/projects/` — project metadata, sessions, snapshots, memories, and project permissions
 - `~/.lightcode/cache/` — discovery and runtime caches
-- `~/.lightcode/daemon/` — localhost daemon lockfiles
 
 ---
 
