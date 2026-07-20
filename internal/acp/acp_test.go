@@ -588,11 +588,20 @@ func TestHandleEventCompactionEndPushesSessionChanged(t *testing.T) {
 	r.setCurrentSessionID(sessionID)
 	r.seedPresented(sessionID)
 
-	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, SessionID: sessionID, RefreshSession: true})
-
-	lines := drainedLines(t, r, &out, 2)
+	// compaction_end alone notifies only compaction_end; the replacement transcript
+	// arrives as the separate rewrite boundary.
+	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, SessionID: sessionID})
+	lines := drainedLines(t, r, &out, 1)
 	assertACPNotificationMethod(t, lines[0], "agent/compaction_end")
-	assertACPNotificationMethod(t, lines[1], "agent/session_resync")
+
+	out.Reset()
+	payload, err := a.SessionPayloadForSession(sessionID)
+	if err != nil {
+		t.Fatalf("SessionPayloadForSession: %v", err)
+	}
+	r.handleEvent(agent.Event{Kind: agent.EventSessionRewrite, SessionID: sessionID, RewritePayload: &payload})
+	lines = drainedLines(t, r, &out, 1)
+	assertACPNotificationMethod(t, lines[0], "agent/session_resync")
 }
 
 func TestHandleEventActiveCompactionDefersSessionChangedUntilTurnEnd(t *testing.T) {
@@ -623,13 +632,23 @@ func TestHandleEventActiveCompactionDefersSessionChangedUntilTurnEnd(t *testing.
 	}
 	r.drainForTest()
 	out.Reset()
-	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, SessionID: sessionID, Turn: turn, RefreshSession: true})
-	lines = drainedLines(t, r, &out, 2)
-	assertACPNotificationMethod(t, lines[0], "agent/turn_end")
-	assertACPNotificationMethod(t, lines[1], "agent/session_resync")
-	if !strings.Contains(lines[1], "active prompt") {
-		t.Fatalf("session_resync after turn_end omitted completed active turn: %s", lines[1])
+	// The replacement is published as the rewrite boundary at compaction success,
+	// not deferred onto turn_end; turn_end itself carries no resync.
+	payload, err := a.SessionPayloadForSession(sessionID)
+	if err != nil {
+		t.Fatalf("SessionPayloadForSession: %v", err)
 	}
+	r.handleEvent(agent.Event{Kind: agent.EventSessionRewrite, SessionID: sessionID, RewritePayload: &payload})
+	lines = drainedLines(t, r, &out, 1)
+	assertACPNotificationMethod(t, lines[0], "agent/session_resync")
+	if !strings.Contains(lines[0], "active prompt") {
+		t.Fatalf("session_resync omitted completed active turn: %s", lines[0])
+	}
+
+	out.Reset()
+	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, SessionID: sessionID, Turn: turn})
+	lines = drainedLines(t, r, &out, 1)
+	assertACPNotificationMethod(t, lines[0], "agent/turn_end")
 }
 
 func TestDispatchWarningsCurrentReturnsCurrentWarningSnapshot(t *testing.T) {

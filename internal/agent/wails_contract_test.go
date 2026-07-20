@@ -339,21 +339,25 @@ func TestWailsLifecycleSurfaceContract(t *testing.T) {
 	}
 }
 
-func TestWailsDefersActiveCompactionSessionRefreshUntilTurnEnd(t *testing.T) {
+func TestWailsCompactionResyncPublishesThroughRewriteBoundary(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
 	compactionEnd := extractSwitchCase(t, app, "case agent.EventCompactionEnd:")
 	if !strings.Contains(compactionEnd, `emit("compaction_end"`) {
 		t.Fatalf("EventCompactionEnd must still emit compaction_end; case:\n%s", compactionEnd)
 	}
-	if !strings.Contains(compactionEnd, "if ev.RefreshSession") || !strings.Contains(compactionEnd, "a.emitResyncBoundary(ev.SessionID)") {
-		t.Fatalf("EventCompactionEnd must refresh history only when backend marks it safe; case:\n%s", compactionEnd)
+	if strings.Contains(compactionEnd, "emitResyncBoundary") {
+		t.Fatalf("EventCompactionEnd must not resync; the rewrite boundary does; case:\n%s", compactionEnd)
 	}
 	turnEnd := extractSwitchCase(t, app, "case agent.EventTurnEnd:")
 	if !strings.Contains(turnEnd, `emit("turn_end"`) {
 		t.Fatalf("EventTurnEnd must still emit turn_end; case:\n%s", turnEnd)
 	}
-	if !strings.Contains(turnEnd, "if ev.RefreshSession") || !strings.Contains(turnEnd, "a.emitResyncBoundary(ev.SessionID)") {
-		t.Fatalf("EventTurnEnd must perform deferred compaction history refresh; case:\n%s", turnEnd)
+	if strings.Contains(turnEnd, "emitResyncBoundary") {
+		t.Fatalf("EventTurnEnd must not resync; the rewrite boundary does; case:\n%s", turnEnd)
+	}
+	rewrite := extractSwitchCase(t, app, "case agent.EventSessionRewrite:")
+	if !strings.Contains(rewrite, "a.emitResyncBoundary(ev.SessionID, ev.RewritePayload)") {
+		t.Fatalf("EventSessionRewrite must apply the producer-built replacement; case:\n%s", rewrite)
 	}
 }
 

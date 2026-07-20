@@ -1168,11 +1168,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.permFrame = transientMenuFrame{}
 		// Queue draining is backend-owned: the agent auto-drains after the turn
 		// ends and emits turn_start for the next turn. The CLI just re-prompts.
-		if ev.RefreshSession {
-			c.refreshSessionLocked()
-		} else {
-			c.printInputPromptLocked()
-		}
+		c.printInputPromptLocked()
 
 	case agent.EventError:
 		c.activeToolID = ""
@@ -1202,9 +1198,8 @@ func (c *CLI) handleEvent(ev agent.Event) {
 
 	case agent.EventCompactionEnd:
 		c.compacting = false
-		if ev.RefreshSession {
-			c.refreshSessionLocked()
-		}
+	case agent.EventSessionRewrite:
+		c.applyResyncLocked(ev.RewritePayload)
 
 	case agent.EventWarning:
 		c.activeToolID = ""
@@ -1533,6 +1528,26 @@ func (c *CLI) refreshSessionLocked() {
 	q := c.queueSnapshot()
 	c.queueDisplay = q.Items
 	c.lastQueueVersion = q.Version
+	c.seedInputHistory()
+
+	c.printLineLocked("")
+	c.printHeaderLocked()
+	for _, m := range c.messages {
+		c.printDisplayEntryLocked(m)
+	}
+	c.printInputPromptLocked()
+}
+
+// applyResyncLocked re-renders the transcript from the compaction snapshot the
+// producer carried on the event. It never queries the owner: compaction changes
+// only the transcript, so model and queue state stay as the live stream left
+// them. A nil payload (the rare build failure) just re-prompts.
+func (c *CLI) applyResyncLocked(payload *agent.SessionPayload) {
+	if payload == nil {
+		c.printInputPromptLocked()
+		return
+	}
+	c.messages = buildDisplayMsgs(payload.Messages)
 	c.seedInputHistory()
 
 	c.printLineLocked("")

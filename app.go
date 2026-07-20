@@ -508,9 +508,6 @@ func (a *App) handleEvent(ev agent.Event) {
 	case agent.EventTurnEnd:
 		emit("turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
 		emit("status", map[string]any{"state": "idle"})
-		if ev.RefreshSession {
-			a.emitResyncBoundary(ev.SessionID)
-		}
 	case agent.EventError:
 		emit("error", map[string]any{"seq": ev.Seq, "message": ev.Error})
 	case agent.EventPermissionRequest:
@@ -532,9 +529,8 @@ func (a *App) handleEvent(ev agent.Event) {
 		emit("compaction_start", nil)
 	case agent.EventCompactionEnd:
 		emit("compaction_end", nil)
-		if ev.RefreshSession {
-			a.emitResyncBoundary(ev.SessionID)
-		}
+	case agent.EventSessionRewrite:
+		a.emitResyncBoundary(ev.SessionID, ev.RewritePayload)
 	case agent.EventWarning:
 		emit("warnings", ev.Warnings)
 	}
@@ -607,18 +603,19 @@ func (a *App) emitTurnActionNotice(skipped []snapshot.SkippedRevert) {
 }
 
 // emitResyncBoundary re-syncs a compacted session's transcript and tokens through
-// one ordered frame. It runs on the lock-free event callback, which must not take
-// lifecycleMu: a concurrent archive/delete/revert of this session can hold
-// lifecycleMu while waiting for this very turn to go idle, so a capture that
-// acquired lifecycleMu here would stall the turn against that operation. It
-// therefore uses the rt.mu-only session payload; the frontend applies only the
-// compaction-affected transcript and tokens, leaving activity and queue that
-// compaction did not change to the live stream.
-func (a *App) emitResyncBoundary(sessionID string) {
+// one ordered frame. The payload is built by the producer and carried on the
+// event, so this callback only enqueues it and never re-enters the owner. The
+// frontend applies the compaction-affected transcript and tokens, leaving
+// activity and queue that compaction did not change to the live stream.
+func (a *App) emitResyncBoundary(sessionID string, payload *agent.SessionPayload) {
 	if a.ctx == nil {
 		return
 	}
-	a.emitSessionFrame(sessionID, "resync", a.sessionChangedPayload(sessionID))
+	p := agent.SessionPayload{}
+	if payload != nil {
+		p = *payload
+	}
+	a.emitSessionFrame(sessionID, "resync", p)
 }
 
 func (a *App) setCurrentSessionID(id string) {
@@ -717,21 +714,6 @@ func (a *App) removedCurrent(id string) bool {
 		a.setCurrentSessionID("")
 	}
 	return wasCurrent
-}
-
-// sessionChangedPayload builds the resync payload for a session, clearing the
-// routing current when the session read fails.
-func (a *App) sessionChangedPayload(sessionID string) agent.SessionPayload {
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		return agent.SessionPayload{}
-	}
-	payload, err := a.svc.SessionPayloadForSession(sessionID)
-	if err != nil {
-		a.clearRouteIfCurrent(sessionID)
-		return agent.SessionPayload{}
-	}
-	return payload
 }
 
 func (a *App) sessionMessages() []agent.DisplayMessage {

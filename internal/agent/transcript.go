@@ -158,15 +158,25 @@ func (t *transcript) commitLocked(turn int) {
 	t.textOpen = false
 }
 
-// rewriteLocked publishes one rewrite boundary for a revert, compaction, or fork:
-// it advances the rewrite epoch, rebases the committed turn to the new durable
-// turn, clears obsolete tail state, and keeps sequence monotonic.
+// rewriteLocked publishes one rewrite boundary for a revert or fork: it advances
+// the rewrite epoch, rebases the committed turn to the new durable turn, clears
+// obsolete tail state, and keeps sequence monotonic.
 func (t *transcript) rewriteLocked(turn int) {
 	t.rewriteEpoch++
 	t.committedTurn = turn
 	t.committedSeq = t.nextSeq - 1
 	t.tail = nil
 	t.textOpen = false
+}
+
+// compactionRewriteLocked publishes the rewrite boundary for a compaction. Unlike
+// a revert or fork, a compaction completes no new turn and leaves the active
+// turn's uncommitted tail live, so it advances only the rewrite epoch: the
+// committed markers and the still-live tail are unchanged. Advancing the epoch is
+// what makes a live-selection capture that raced the compaction revalidate and
+// re-read the rewritten durable prefix.
+func (t *transcript) compactionRewriteLocked() {
+	t.rewriteEpoch++
 }
 
 func (t *transcript) revisionLocked() captureRevision {

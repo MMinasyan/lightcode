@@ -27,6 +27,7 @@ const (
 	EventUserMessageDisplay                         // A user-role message was appended to history.
 	EventGenericSystemSignal                        // A non-background <system-signal> was appended to history.
 	EventQueueChanged                               // The backend-owned input queue changed; carries a versioned snapshot.
+	EventSessionRewrite                             // Compaction rewrote the durable prefix; carries the replacement transcript state.
 )
 
 // Event is the unified event type emitted by the Agent to adapters.
@@ -53,7 +54,10 @@ type Event struct {
 	Turn              int
 	Cancelled         bool
 	Error             string
-	RefreshSession    bool
+	// RewritePayload (EventSessionRewrite) is the compacted session's replacement
+	// transcript/token snapshot, built by the producer under the transcript lock, so
+	// the adapter callback applies it without re-entering the owner.
+	RewritePayload    *SessionPayload
 	PermReq           *PermissionRequest
 	Warnings          []PromptWarning
 	SubagentSessionID string

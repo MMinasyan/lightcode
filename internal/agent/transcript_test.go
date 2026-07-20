@@ -250,14 +250,15 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 
 	t.Run("rewrite_then_success", func(t *testing.T) {
 		a := newCatalogBackedTestAgent(t)
-		tr := a.session.transcript
+		unit := a.session
 		attempts := 0
 		a.captureProbe = func(attempt int) error {
 			attempts++
 			if attempt == 1 {
-				tr.seqMu.Lock()
-				tr.rewriteLocked(tr.committedTurn)
-				tr.seqMu.Unlock()
+				// Drive the production compaction rewrite path, not rewriteLocked
+				// directly: it advances the epoch, so the racing capture must
+				// revalidate and retry rather than publish the pre-compaction prefix.
+				a.publishCompactionRewrite(unit, sessionIDOf(unit), unit.projectID, SessionSummary{}, nil)
 			}
 			return nil
 		}
@@ -265,7 +266,7 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 			t.Fatalf("err = %v, want nil", err)
 		}
 		if attempts != 2 {
-			t.Fatalf("attempts = %d, want 2", attempts)
+			t.Fatalf("attempts = %d, want 2 (production compaction bumped the epoch once)", attempts)
 		}
 	})
 

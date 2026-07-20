@@ -590,6 +590,7 @@ func TestAutoCompactionEventOrderInsideTurn(t *testing.T) {
 	}
 	turnStart := index(func(ev Event) bool { return ev.Kind == EventTurnStart && ev.Turn == 2 })
 	compactStart := index(func(ev Event) bool { return ev.Kind == EventCompactionStart })
+	rewrite := index(func(ev Event) bool { return ev.Kind == EventSessionRewrite })
 	compactEnd := index(func(ev Event) bool { return ev.Kind == EventCompactionEnd })
 	userDisplay := index(func(ev Event) bool { return ev.Kind == EventUserMessageDisplay && ev.Turn == 2 })
 	textDelta := index(func(ev Event) bool { return ev.Kind == EventTextDelta })
@@ -597,6 +598,7 @@ func TestAutoCompactionEventOrderInsideTurn(t *testing.T) {
 	for name, idx := range map[string]int{
 		"turn start":       turnStart,
 		"compaction start": compactStart,
+		"session rewrite":  rewrite,
 		"compaction end":   compactEnd,
 		"user display":     userDisplay,
 		"text delta":       textDelta,
@@ -606,14 +608,14 @@ func TestAutoCompactionEventOrderInsideTurn(t *testing.T) {
 			t.Fatalf("missing %s event in %#v", name, events)
 		}
 	}
-	if !(turnStart < compactStart && compactStart < compactEnd && compactEnd < userDisplay && userDisplay < textDelta && textDelta < turnEnd) {
-		t.Fatalf("unexpected auto-compaction event order: turnStart=%d compactStart=%d compactEnd=%d userDisplay=%d textDelta=%d turnEnd=%d events=%#v", turnStart, compactStart, compactEnd, userDisplay, textDelta, turnEnd, events)
+	if !(turnStart < compactStart && compactStart < rewrite && rewrite < compactEnd && compactEnd < userDisplay && userDisplay < textDelta && textDelta < turnEnd) {
+		t.Fatalf("unexpected auto-compaction event order: turnStart=%d compactStart=%d rewrite=%d compactEnd=%d userDisplay=%d textDelta=%d turnEnd=%d events=%#v", turnStart, compactStart, rewrite, compactEnd, userDisplay, textDelta, turnEnd, events)
 	}
-	if events[compactEnd].RefreshSession {
-		t.Fatalf("active-turn compaction_end must not request immediate history refresh: %#v", events[compactEnd])
-	}
-	if !events[turnEnd].RefreshSession {
-		t.Fatalf("active-turn compaction must request deferred history refresh on turn_end: %#v", events[turnEnd])
+	// The compaction publishes its replacement as a rewrite boundary at compaction
+	// success, not deferred onto turn_end, and carries the producer-built payload so
+	// no adapter re-enters the owner.
+	if events[rewrite].RewritePayload == nil {
+		t.Fatalf("rewrite boundary must carry the producer-built replacement: %#v", events[rewrite])
 	}
 }
 

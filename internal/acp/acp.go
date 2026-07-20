@@ -468,9 +468,9 @@ func (r *Runner) handleEvent(ev agent.Event) {
 			Method:  "agent/turn_end",
 			Params:  map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled},
 		}, ev.SessionID)
-		if ev.RefreshSession {
-			r.pushResyncForEvent(ev)
-		}
+		return
+	case agent.EventSessionRewrite:
+		r.pushResyncForEvent(ev)
 		return
 	case agent.EventError:
 		method = "agent/error"
@@ -498,9 +498,6 @@ func (r *Runner) handleEvent(ev agent.Event) {
 			JSONRPC: "2.0",
 			Method:  "agent/compaction_end",
 		}, ev.SessionID)
-		if ev.RefreshSession {
-			r.pushResyncForEvent(ev)
-		}
 		return
 	case agent.EventWarning:
 		method = "agent/warnings"
@@ -1027,10 +1024,10 @@ func (r *Runner) pushSessionBoundary(sessionID string) {
 	})
 }
 
-// pushSessionResync re-syncs a compacted session's transcript from the event
-// callback using the rt.mu-only payload, never the lifecycle-locked capture: a
-// concurrent archive/delete/revert can hold the lifecycle lock while waiting for
-// this very turn to go idle, so acquiring it here would stall the turn.
+// pushSessionResync re-syncs a session's transcript through the rt.mu-only
+// payload. It is the request-handler fallback used when no owner is wired for the
+// lifecycle-locked boundary capture; the event-callback resync instead applies
+// the payload the producer carried on the event.
 func (r *Runner) pushSessionResync(sessionID string) {
 	r.sendNotification(Notification{
 		JSONRPC: "2.0",
@@ -1039,16 +1036,24 @@ func (r *Runner) pushSessionResync(sessionID string) {
 	}, sessionID)
 }
 
+// pushResyncForEvent emits the replacement transcript the producer carried on the
+// rewrite-boundary event, so this callback never re-enters the owner.
 func (r *Runner) pushResyncForEvent(ev agent.Event) {
-	if id := strings.TrimSpace(ev.SessionID); id != "" {
-		r.pushSessionResync(id)
-		return
+	id := strings.TrimSpace(ev.SessionID)
+	if id == "" {
+		if current, err := r.currentSession(); err == nil {
+			id = current
+		}
 	}
-	if current, err := r.currentSession(); err == nil {
-		r.pushSessionResync(current)
-		return
+	payload := agent.SessionPayload{}
+	if ev.RewritePayload != nil {
+		payload = *ev.RewritePayload
 	}
-	r.pushSessionResync("")
+	r.sendNotification(Notification{
+		JSONRPC: "2.0",
+		Method:  "agent/session_resync",
+		Params:  payload,
+	}, id)
 }
 
 // --- Wire helpers ---

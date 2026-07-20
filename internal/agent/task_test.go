@@ -751,9 +751,10 @@ func TestTaskToolAllDeniedSubagentsCancelParentTurn(t *testing.T) {
 	a.SetEventHandler(func(ev Event) {
 		cap.handler(ev)
 		if ev.Kind == EventPermissionRequest && ev.PermReq != nil {
-			if err := a.RespondPermission(ev.PermReq.ID, false); err != nil {
-				t.Errorf("RespondPermission deny: %v", err)
-			}
+			// The request event is delivered under the gate mutex, so respond off the
+			// callback goroutine (as a real adapter does) rather than re-entering it.
+			id := ev.PermReq.ID
+			go func() { _ = a.RespondPermission(id, false) }()
 		}
 	})
 	a.Init(ctx)
@@ -822,9 +823,10 @@ func TestTaskToolChildBackgroundProcessStaysChildScoped(t *testing.T) {
 	a.SetEventHandler(func(ev Event) {
 		cap.handler(ev)
 		if ev.Kind == EventPermissionRequest && ev.PermReq != nil {
-			if err := a.RespondPermission(ev.PermReq.ID, true); err != nil {
-				t.Errorf("RespondPermission allow: %v", err)
-			}
+			// The request event is delivered under the gate mutex, so respond off the
+			// callback goroutine (as a real adapter does) rather than re-entering it.
+			id := ev.PermReq.ID
+			go func() { _ = a.RespondPermission(id, true) }()
 		}
 	})
 	a.Init(ctx)

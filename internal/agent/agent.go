@@ -78,8 +78,6 @@ type session struct {
 	transitioning bool
 	seenSessions  map[string]bool
 
-	sessionRefreshAfterTurn bool
-
 	tokensMu        sync.Mutex
 	tokens          map[string]*TokenEntry
 	lastContextUsed int
@@ -813,30 +811,18 @@ func New(c Config) (*Agent, error) {
 	}
 	a.rt = newRuntime(a, runtimeOptions{WorkspaceRoot: c.ProjectRoot})
 	rt := a.ensureRuntime()
-	events := rt.loopEvents
 
-	gate := permission.NewGate(func(ctx context.Context, req permission.Request) {
-		ev := loop.Event{
-			Kind:      loop.PermissionRequest,
+	// The gate calls this under its mutex; emit the request event directly so the
+	// insert and its delivery are one atomic section a navigation capture cannot
+	// split. The adapter callback only appends to its leaf queue, so this takes no
+	// lock above the gate mutex.
+	gate := permission.NewGate(func(_ context.Context, req permission.Request) {
+		a.emitEvent(Event{
+			Kind:      EventPermissionRequest,
 			SessionID: req.SessionID,
 			ProjectID: req.ProjectID,
-			ToolName:  req.ToolName,
-			PermID:    req.ID,
-			PermArg:   req.Arg,
-			Metadata: map[string]any{
-				"resolved_arg":         req.ResolvedArg,
-				"can_allow_all":        req.CanAllowAll,
-				"disable_project_save": req.DisableProjectSave,
-				"batch_index":          req.BatchIndex,
-				"batch_total":          req.BatchTotal,
-				"batch_files":          req.BatchFiles,
-				"batch_resolved_files": req.BatchResolvedFiles,
-			},
-		}
-		select {
-		case events <- ev:
-		case <-ctx.Done():
-		}
+			PermReq:   permissionRequestFromGateRequest(req),
+		})
 	})
 	a.gate = gate
 
@@ -1088,6 +1074,21 @@ func feedTranscript(tr *transcript, ev Event) int {
 	return tr.feedLocked(ev)
 }
 
+// feedAndEmit sequences a transcript row (or session error) and enqueues its
+// event in one seqMu section, so a navigation capture that reads the retained
+// tail and errors under seqMu and appends its boundary cannot interleave: the row
+// is in the snapshot and delivered before the boundary, or after both.
+func (a *Agent) feedAndEmit(tr *transcript, ev Event) {
+	if tr == nil {
+		a.emitEvent(ev)
+		return
+	}
+	tr.seqMu.Lock()
+	ev.Seq = tr.feedLocked(ev)
+	a.emitEvent(ev)
+	tr.seqMu.Unlock()
+}
+
 func (a *Agent) nudgeSignalScheduler() {
 	a.ensureRuntime().nudgeSignalScheduler()
 }
@@ -1164,9 +1165,11 @@ func (a *Agent) updateWarningGroup(group string, warnings []PromptWarning, appen
 		return
 	}
 	a.warningSnapshot = append([]PromptWarning(nil), next...)
-	a.warningsMu.Unlock()
-
+	// Enqueue the warning event inside the warningsMu section that mutated the
+	// snapshot, so a navigation capture (which reads warnings under warningsMu and
+	// appends its boundary) cannot interleave.
 	a.emitEvent(Event{Kind: EventWarning, Warnings: next})
+	a.warningsMu.Unlock()
 }
 
 // CurrentWarnings returns the current warning snapshot for adapters that need
@@ -1324,8 +1327,7 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 	// can gate it against a later capture's high-water.
 	tr := a.transcriptForSessionID(sessionID)
 	emit := func(out Event) {
-		out.Seq = feedTranscript(tr, out)
-		a.emitEvent(out)
+		a.feedAndEmit(tr, out)
 	}
 	switch ev.Kind {
 	case loop.TextDelta:
@@ -1377,19 +1379,31 @@ func (rt *runtime) dispatchLoopEvent(ev loop.Event) {
 			Turn:      ev.Turn,
 			Result:    ev.Result,
 		})
-	case loop.PermissionRequest:
-		a.emitEvent(Event{
-			SessionID: sessionID,
-			ProjectID: projectID,
-			Kind:      EventPermissionRequest,
-			PermReq:   permissionRequestFromLoopEvent(ev, sessionID, projectID),
-		})
 	case loop.Warning:
 		kind, _ := ev.Metadata["kind"].(string)
 		if kind == "" {
 			kind = "protocol_warning"
 		}
 		a.addWarning("protocol", prompt.Warning{Kind: kind, Message: ev.Result})
+	}
+}
+
+// permissionRequestFromGateRequest maps a gate request to the adapter-facing
+// permission request the gate callback emits directly under the gate mutex.
+func permissionRequestFromGateRequest(req permission.Request) *PermissionRequest {
+	return &PermissionRequest{
+		ID:                 req.ID,
+		SessionID:          req.SessionID,
+		ProjectID:          req.ProjectID,
+		ToolName:           req.ToolName,
+		Arg:                req.Arg,
+		ResolvedArg:        req.ResolvedArg,
+		CanAllowAll:        req.CanAllowAll,
+		DisableProjectSave: req.DisableProjectSave,
+		BatchIndex:         req.BatchIndex,
+		BatchTotal:         req.BatchTotal,
+		BatchFiles:         req.BatchFiles,
+		BatchResolvedFiles: req.BatchResolvedFiles,
 	}
 }
 
@@ -1546,8 +1560,10 @@ func (a *Agent) recordUsageForSession(unit *session, ev loop.Event) {
 	}
 	a.persistTokensForSessionLocked(unit)
 	report := a.buildReportForSessionLocked(unit)
-	unit.tokensMu.Unlock()
-
+	// Enqueue the usage event inside the tokensMu section that produced the report,
+	// so a navigation capture (which reads the report under tokensMu and appends its
+	// boundary) cannot interleave: the event is captured in the snapshot or delivered
+	// after the boundary, never lost or delivered before a boundary that omits it.
 	a.emitEvent(Event{
 		SessionID:        sessionIDOf(unit),
 		ProjectID:        unit.projectID,
@@ -1559,6 +1575,7 @@ func (a *Agent) recordUsageForSession(unit *session, ev loop.Event) {
 		UsageKnown:       ev.UsageKnown,
 		CumulativeTokens: &report,
 	})
+	unit.tokensMu.Unlock()
 }
 
 func (a *Agent) buildReportLocked() TokenReport {
@@ -1675,8 +1692,7 @@ func (a *Agent) beforeModelRequestForSession(ctx context.Context, unit *session,
 			return loop.ContextTransformResult{}, err
 		}
 		errEv := Event{Kind: EventError, SessionID: sessionIDOf(unit), ProjectID: unit.projectID, Error: fmt.Sprintf("compaction: %v", err), Turn: checkpoint.Turn}
-		errEv.Seq = feedTranscript(unit.transcript, errEv)
-		a.emitEvent(errEv)
+		a.feedAndEmit(unit.transcript, errEv)
 		return loop.ContextTransformResult{}, nil
 	}
 	return loop.ContextTransformResult{Transformed: true, ActiveTurnStart: activeStart}, nil
@@ -1717,19 +1733,21 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 	sessionID := sessionIDOf(unit)
 	projectID := unit.projectID
 	rt := a.ensureRuntime()
+	// Set compacting and enqueue the start event in one runtime.mu section so a
+	// capture reads a compacting flag consistent with compaction_start. The end
+	// event clears compacting and enqueues in the same runtime.mu section, so no
+	// capture snapshots compacting=true after compaction_end is delivered. The
+	// replacement transcript is published separately as the rewrite boundary below.
 	rt.mu.Lock()
 	unit.compacting = true
+	a.emitEvent(Event{Kind: EventCompactionStart, SessionID: sessionID, ProjectID: projectID})
 	rt.mu.Unlock()
-	refreshSessionNow := false
-	// Register the clear before emitting the start event so the flag is always
-	// released even if a synchronous handler panics on the start event.
 	defer func() {
 		rt.mu.Lock()
 		unit.compacting = false
+		a.emitEvent(Event{Kind: EventCompactionEnd, SessionID: sessionID, ProjectID: projectID})
 		rt.mu.Unlock()
-		a.emitEvent(Event{Kind: EventCompactionEnd, SessionID: sessionID, ProjectID: projectID, RefreshSession: refreshSessionNow})
 	}()
-	a.emitEvent(Event{Kind: EventCompactionStart, SessionID: sessionID, ProjectID: projectID})
 
 	messages := unit.lp.Messages()
 	activeStart := checkpoint.ActiveTurnStart
@@ -1739,7 +1757,6 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 	if activeStart <= 1 {
 		return activeStart, fmt.Errorf("nothing to compact")
 	}
-	activeTail := activeStart < len(messages)
 	toSummarize := append([]message.Message(nil), messages[1:activeStart]...)
 
 	compactUnit, summarizerWindow, err := a.compactRunningUnitForSession(unit)
@@ -1779,6 +1796,16 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 	} else if checkpoint.Force && activeStart < len(messages) && checkpoint.Turn > 0 {
 		boundaryTurn--
 	}
+	// Prebuild the fallible parts of the rewrite replacement before SaveCompaction
+	// so no fallible read runs after the durable commit: the compacted completed
+	// messages (durable turns after boundaryTurn, unchanged by SaveCompaction) and
+	// the session summary. The live tail is read with the emit inside one seqMu
+	// section on success, so its read-and-append stays atomic against row delivery.
+	summary := sessionSummary(unit)
+	committed, err := a.prebuiltCompactionCommitted(unit, sessionID, boundaryTurn)
+	if err != nil {
+		return activeStart, fmt.Errorf("prepare compacted replacement: %w", err)
+	}
 	rec := snapshot.CompactionRecord{
 		Summary:            result.Summary,
 		BoundaryTurn:       boundaryTurn,
@@ -1789,6 +1816,11 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 	if err := unit.store.SaveCompaction(rec); err != nil {
 		return activeStart, fmt.Errorf("save compaction: %w", err)
 	}
+	// Publish the rewrite boundary on durable success, before the loop-history
+	// rewrite and memory indexing, so a live-selection capture racing the compaction
+	// sees the revision advance promptly and re-reads the rewritten durable prefix
+	// rather than publishing the pre-compaction one.
+	a.publishCompactionRewrite(unit, sessionID, projectID, summary, committed)
 
 	var activeReads []tool.ReadRecord
 	if unit.fileTracker != nil && activeStart < len(messages) {
@@ -1813,36 +1845,59 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 			unit.fileTracker.Reset()
 		}
 	}
-	if activeTail {
-		a.ensureRuntime().deferSessionRefreshAfterTurnForSession(unit)
-	} else {
-		refreshSessionNow = true
-	}
-
-	unit.tokensMu.Lock()
-	unit.lastContextUsed = 0
-	unit.tokensMu.Unlock()
 
 	return newActiveStart, nil
 }
 
-func (rt *runtime) deferSessionRefreshAfterTurnForSession(unit *session) {
-	rt.mu.Lock()
-	if unit != nil {
-		unit.sessionRefreshAfterTurn = true
+// prebuiltCompactionCommitted renders the compacted completed messages — the
+// durable completed turns after boundaryTurn, the rows messagesForFrontendForStore
+// yields once the compaction record names that boundary. Those turns are unchanged
+// by SaveCompaction, so rendering them before the durable commit lets the rewrite
+// boundary carry a prebuilt committed prefix with no fallible post-commit read. The
+// live tail is not read here: it is read inside the boundary's own seqMu section
+// (with the emit), so the tail read-and-append stays one atomic section against
+// concurrent row delivery.
+func (a *Agent) prebuiltCompactionCommitted(unit *session, sessionID string, boundaryTurn int) ([]DisplayMessage, error) {
+	var raw []snapshot.TurnMessages
+	var err error
+	if sessionID == "" {
+		raw, err = unit.store.LoadCompleteTurnsAfterReadOnly(boundaryTurn)
+	} else {
+		raw, err = unit.store.LoadCompleteTurnsAfterForSessionReadOnly(sessionID, boundaryTurn)
 	}
-	rt.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return a.renderCompleteTurns(raw), nil
 }
 
-func (rt *runtime) takeDeferredSessionRefreshAfterTurnForSession(unit *session) bool {
-	rt.mu.Lock()
-	refresh := false
-	if unit != nil {
-		refresh = unit.sessionRefreshAfterTurn
-		unit.sessionRefreshAfterTurn = false
+// publishCompactionRewrite advances the transcript rewrite epoch and appends the
+// replacement transcript as one rewrite boundary after a durable compaction. The
+// summary and committed prefix are prebuilt before SaveCompaction (the only
+// fallible reads), so this performs no fallible post-commit read. The reset context
+// total and its cumulative report share one tokensMu section, taken before the
+// transcript section so tokensMu is never held inside seqMu. Reading the live tail
+// and appending the boundary happen in one seqMu section — mutually exclusive with
+// feedAndEmit's row publication — so a row delivered concurrently is either in the
+// tail and enqueued before the boundary or absent and enqueued after it, never
+// split. Advancing the epoch makes a live-selection capture that raced the
+// compaction revalidate and re-read the rewritten durable prefix.
+func (a *Agent) publishCompactionRewrite(unit *session, sessionID, projectID string, summary SessionSummary, committed []DisplayMessage) {
+	tr := unit.transcript
+	if tr == nil {
+		return
 	}
-	rt.mu.Unlock()
-	return refresh
+	unit.tokensMu.Lock()
+	unit.lastContextUsed = 0
+	tokens := a.buildReportForSessionLocked(unit)
+	unit.tokensMu.Unlock()
+
+	tr.seqMu.Lock()
+	tr.compactionRewriteLocked()
+	messages := append(append([]DisplayMessage(nil), committed...), tr.tailMessagesLocked()...)
+	payload := SessionPayload{Session: summary, Messages: messages, Tokens: tokens}
+	a.emitEvent(Event{Kind: EventSessionRewrite, SessionID: sessionID, ProjectID: projectID, RewritePayload: &payload})
+	tr.seqMu.Unlock()
 }
 
 func activeTailReadRecords(tail []message.Message, reads []tool.ReadRecord, defaultLimit int, workspaceRoot string) []tool.ReadRecord {
@@ -2339,9 +2394,12 @@ func (rt *runtime) submit(ctx context.Context, unit *session, content string) (S
 	version := unit.queueVersion
 	sessionID := sessionIDOf(unit)
 	projectID := unit.projectID
+	// Enqueue the queue-changed event inside the runtime.mu section that bumped the
+	// version, so a navigation capture reads a queue snapshot consistent with the
+	// events it delivers.
+	a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionID, ProjectID: projectID, Queue: items, QueueVersion: version})
 	rt.mu.Unlock()
 	rt.nudgeQueueDrainer()
-	a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionID, ProjectID: projectID, Queue: items, QueueVersion: version})
 	return SubmitResult{Started: false, Queue: items, Version: version}, nil
 }
 
@@ -2548,12 +2606,12 @@ func (a *Agent) endLiveTransition(unit *session) {
 		sessionID = sessionIDOf(unit)
 		projectID = unit.projectID
 		active = true
+		a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionID, ProjectID: projectID, Queue: items, QueueVersion: version})
 	}
 	rt.mu.Unlock()
 	if !active {
 		return
 	}
-	a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionID, ProjectID: projectID, Queue: items, QueueVersion: version})
 	if len(items) > 0 {
 		rt.nudgeQueueDrainer()
 	}
@@ -2627,9 +2685,9 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 		unit.turnCtx = turnCtx
 		sessionID := sessionIDOf(unit)
 		projectID := unit.projectID
+		a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionID, ProjectID: projectID, Queue: emptyQueue(), QueueVersion: version})
 		rt.mu.Unlock()
 
-		a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionID, ProjectID: projectID, Queue: emptyQueue(), QueueVersion: version})
 		rt.launchTurn(ctx, unit, turnCtx, cancel, []string{contents[len(contents)-1]})
 	}
 }
@@ -2697,14 +2755,16 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 	turn := unit.store.BeginTurn()
 
 	startEv := Event{Kind: EventTurnStart, SessionID: sessionID, ProjectID: projectID, Turn: turn}
-	a.emitEvent(startEv)
-	feedTranscript(unit.transcript, startEv)
-
 	rt.mu.Lock()
+	// Enqueue turn_start in a runtime.mu section — busy is already true under
+	// runtime.mu from the turn claim — so a capture observes busy consistent with the
+	// turn events it delivers.
+	a.emitEvent(startEv)
 	a.ensureActiveModelForSessionLocked(unit)
 	a.applyUnitConfigLocked(unit)
 	a.setWarningGroup("setup", a.setupWarningsLocked())
 	rt.mu.Unlock()
+	feedTranscript(unit.transcript, startEv)
 
 	if unit.taskToolInst != nil {
 		unit.taskToolInst.updateParentState(cancel)
@@ -2752,11 +2812,20 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 
 		if err != nil {
 			errEv := Event{Kind: EventError, SessionID: sessionID, ProjectID: projectID, Error: a.turnErrorMessage(err), Turn: turn}
-			errEv.Seq = feedTranscript(unit.transcript, errEv)
-			a.emitEvent(errEv)
+			a.feedAndEmit(unit.transcript, errEv)
 		}
-		endEv := Event{Kind: EventTurnEnd, SessionID: sessionID, ProjectID: projectID, Turn: turn, Cancelled: turnCtx.Err() != nil, RefreshSession: rt.takeDeferredSessionRefreshAfterTurnForSession(unit)}
+		endEv := Event{Kind: EventTurnEnd, SessionID: sessionID, ProjectID: projectID, Turn: turn, Cancelled: turnCtx.Err() != nil}
+		// Clear busy and enqueue turn_end in one runtime.mu section: busy is already
+		// false when turn_end is delivered, and no idle gap lets a concurrent submit
+		// claim the unit and enqueue turn_start(N+1) before turn_end(N). The deferred
+		// clear below is an idempotent fallback for owner-cancelled early-return paths
+		// that never reach here.
+		rt.mu.Lock()
+		unit.busy = false
+		unit.turnCancel = nil
+		unit.turnCtx = nil
 		a.emitEvent(endEv)
+		rt.mu.Unlock()
 		// Commit the coordinator only once the drainer flush is acknowledged. If
 		// owner cancellation bypassed the flush a streamed row may still be
 		// buffered, and it must not be fed after the turn commits.
@@ -4424,10 +4493,10 @@ func (a *Agent) captureDurableHistory(unit *session, sessionID string) ([]Displa
 // revalidates the transcript revision under seqMu, returning ok=false if it
 // changed so the caller can retry with a fresh durable read. When the state is
 // built and boundary is non-nil, boundary is invoked while runtime.mu, tokensMu,
-// warningsMu, and seqMu are still held, so an adapter's boundary append orders
-// with those classes' events. The pending-permission snapshot is read under the
-// gate lock, which is released before the boundary runs; holding it across the
-// boundary lands with the atomic publication of every producer.
+// gateMu, warningsMu, and seqMu are still held, so an adapter's boundary append
+// orders with those classes' events. The pending-permission snapshot is read and
+// held under the gate lock through the boundary, so a request registering during
+// the capture is either in the snapshot or delivered after the boundary.
 func (a *Agent) captureUnderLocks(unit *session, committed []DisplayMessage, sessionID string, wantRev *captureRevision, boundary func(completeState)) (completeState, bool) {
 	rt := a.ensureRuntime()
 	tr := unit.transcript
@@ -4440,7 +4509,9 @@ func (a *Agent) captureUnderLocks(unit *session, committed []DisplayMessage, ses
 	queue := rt.queueSnapshotLocked(unit)
 	var permissions []permission.Request
 	if a.gate != nil {
-		permissions = a.gate.PendingForSession(sessionID)
+		a.gate.Lock()
+		defer a.gate.Unlock()
+		permissions = a.gate.PendingForSessionLocked(sessionID)
 	}
 
 	unit.tokensMu.Lock()
@@ -4534,7 +4605,13 @@ func (a *Agent) messagesForFrontendForStore(store *snapshot.Store, sessionID str
 	if err != nil {
 		return nil, err
 	}
+	return a.renderCompleteTurns(raw), nil
+}
 
+// renderCompleteTurns renders durable turn messages into display rows. It is the
+// shared body of full-history hydration and the compaction rewrite's prebuilt
+// committed prefix, so both render identically.
+func (a *Agent) renderCompleteTurns(raw []snapshot.TurnMessages) []DisplayMessage {
 	var out []DisplayMessage
 
 	for _, t := range raw {
@@ -4638,7 +4715,7 @@ func (a *Agent) messagesForFrontendForStore(store *snapshot.Store, sessionID str
 			}
 		}
 	}
-	return out, nil
+	return out
 }
 
 // collapseOneLine flattens runs of whitespace (including newlines) to single
@@ -4786,17 +4863,13 @@ func (a *Agent) ApplyTurnActionForSession(sessionID string, turn int, action str
 }
 
 func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string, alsoRevertCode bool) (TurnActionResult, error) {
-	// fork / revert_history change the session; clear the queue at the
-	// irreversible store mutation and emit after unlock (defer LIFO).
+	// fork / revert_history change the session; revert_history clears the queue at
+	// the irreversible store mutation and enqueues the event in the same runtime.mu
+	// section.
 	var clearedVersion int
 	var queueCleared bool
 	var eventSessionID string
 	var eventProjectID string
-	defer func() {
-		if queueCleared {
-			a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
-		}
-	}()
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
 	if unit == nil || unit.store == nil || !unit.store.Active() {
@@ -4845,6 +4918,9 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		}
 		// History irreversibly truncated: the queued input no longer applies.
 		_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLockedForSession(unit)
+		if queueCleared {
+			a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
+		}
 		if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
 			return TurnActionResult{}, err
 		}
@@ -4971,11 +5047,6 @@ func (a *Agent) revertHistoryForSession(unit *session, turn int) error {
 	var queueCleared bool
 	var eventSessionID string
 	var eventProjectID string
-	defer func() {
-		if queueCleared {
-			a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
-		}
-	}()
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
 	if unit == nil || unit.store == nil || !unit.store.Active() {
@@ -4990,6 +5061,9 @@ func (a *Agent) revertHistoryForSession(unit *session, turn int) error {
 		return err
 	}
 	_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLockedForSession(unit)
+	if queueCleared {
+		a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
+	}
 	if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
 		return err
 	}

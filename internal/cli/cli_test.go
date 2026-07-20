@@ -165,29 +165,35 @@ func TestActiveCompactionRefreshDeferredUntilTurnEnd(t *testing.T) {
 	c.busy = true
 	c.state = stateStreaming
 
-	c.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, RefreshSession: false})
+	c.handleEvent(agent.Event{Kind: agent.EventCompactionEnd})
 
 	if c.compacting {
 		t.Fatal("compaction_end should clear compacting state")
 	}
 	if got := len(c.messages); got != 1 || c.messages[0].content != "System: live signal before compaction" {
-		t.Fatalf("compaction_end without RefreshSession rebuilt active live rows: %#v", c.messages)
+		t.Fatalf("compaction_end alone rebuilt active live rows: %#v", c.messages)
 	}
 	if strings.Contains(out.String(), "persisted before compaction") {
-		t.Fatalf("compaction_end without RefreshSession refreshed persisted history: %q", out.String())
+		t.Fatalf("compaction_end alone refreshed persisted history: %q", out.String())
 	}
 
+	// The replacement transcript arrives as the rewrite boundary carrying the payload.
 	out.Reset()
-	c.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 2, RefreshSession: true})
-
-	if c.busy || c.state != stateIdle {
-		t.Fatalf("turn_end should leave CLI idle: busy=%v state=%v", c.busy, c.state)
+	payload, err := a.SessionPayloadForSession(a.SessionCurrent().ID)
+	if err != nil {
+		t.Fatalf("SessionPayloadForSession: %v", err)
 	}
+	c.handleEvent(agent.Event{Kind: agent.EventSessionRewrite, RewritePayload: &payload})
 	if got := len(c.messages); got != 1 || c.messages[0].typ != "user" || c.messages[0].content != "persisted before compaction" {
-		t.Fatalf("turn_end with RefreshSession should rebuild from persisted history: %#v", c.messages)
+		t.Fatalf("rewrite boundary should rebuild from the carried payload: %#v", c.messages)
 	}
 	if !strings.Contains(out.String(), "persisted before compaction") {
-		t.Fatalf("turn_end with RefreshSession did not render refreshed history: %q", out.String())
+		t.Fatalf("rewrite boundary did not render the replacement: %q", out.String())
+	}
+
+	c.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 2})
+	if c.busy || c.state != stateIdle {
+		t.Fatalf("turn_end should leave CLI idle: busy=%v state=%v", c.busy, c.state)
 	}
 }
 
