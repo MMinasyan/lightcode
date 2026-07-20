@@ -160,8 +160,8 @@ func TestTurnActionAppliesDestinationStateThroughOrderedBoundary(t *testing.T) {
 	if !ok {
 		t.Fatal("ApplyTurnAction not found in app.go")
 	}
-	if !strings.Contains(body, "emitTurnActionBoundary") {
-		t.Fatal("ApplyTurnAction must append a turn_action boundary on a session change")
+	if !strings.Contains(body, "ApplyTurnActionForSessionWithBoundary") || !strings.Contains(body, "turnActionBoundaryEmit") {
+		t.Fatal("ApplyTurnAction must publish the turn_action boundary in-commit through turnActionBoundaryEmit")
 	}
 	if strings.Contains(body, "emitSessionChanged") || strings.Contains(body, "emitNavigationBoundary") {
 		t.Fatal("ApplyTurnAction must not emit a legacy session_changed or navigation frame")

@@ -33,6 +33,20 @@ func (s *recordingProjectSvc) SessionSummaryForSession(id string) (agent.Session
 	return agent.SessionSummary{ID: id}, nil
 }
 
+func (s *recordingProjectSvc) NewSessionForProjectPathWithBoundary(_, _ string, emit func(agent.HydrationState)) (string, error) {
+	if emit != nil {
+		emit(agent.HydrationState{Session: agent.SessionSummary{ID: "sess"}})
+	}
+	return "sess", nil
+}
+
+func (s *recordingProjectSvc) OpenSessionWithBoundary(id string, emit func(agent.HydrationState)) (agent.SessionSummary, error) {
+	if emit != nil {
+		emit(agent.HydrationState{Session: agent.SessionSummary{ID: id}})
+	}
+	return agent.SessionSummary{ID: id}, nil
+}
+
 func (s *recordingProjectSvc) lastPath() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -108,6 +122,13 @@ func (s *recordingSvc) CompactNowForSession(_ context.Context, id string) error 
 }
 
 func (s *recordingSvc) OpenSession(id string) (agent.SessionSummary, error) {
+	return agent.SessionSummary{ID: id}, nil
+}
+
+func (s *recordingSvc) OpenSessionWithBoundary(id string, emit func(agent.HydrationState)) (agent.SessionSummary, error) {
+	if emit != nil {
+		emit(agent.HydrationState{Session: agent.SessionSummary{ID: id}})
+	}
 	return agent.SessionSummary{ID: id}, nil
 }
 

@@ -536,34 +536,6 @@ func (a *App) handleEvent(ev agent.Event) {
 	}
 }
 
-// emitNavigationBoundary captures the destination session's complete state and
-// appends it as the navigation boundary the frontend applies as its whole
-// replacement view. An empty or unresolved id yields the zero state, which the
-// frontend applies as a detach. The caller holds navMu, so navMu -> the owner's
-// HydrateSession locks stays in the documented order.
-func (a *App) emitNavigationBoundary(sessionID string) {
-	a.emitNavigationBoundaryWithTitle(sessionID, "")
-}
-
-// emitNavigationBoundaryWithTitle is emitNavigationBoundary that also carries a
-// native window title on the boundary frame, so a project switch changes the title
-// only when the ordered consumer applies its presentation.
-func (a *App) emitNavigationBoundaryWithTitle(sessionID, title string) {
-	if a.ctx == nil {
-		return
-	}
-	emit := func(state agent.HydrationState) {
-		a.enqueueBoundary("navigation", state, title, state.Session.ID)
-	}
-	if a.agent == nil {
-		emit(agent.HydrationState{})
-		return
-	}
-	// Append the boundary while the capture locks are held so no event delivered
-	// after the capture can be enqueued before it.
-	a.agent.HydrateSessionWithBoundary(sessionID, emit)
-}
-
 // turnActionBoundary is the ordered frame a fork, history revert, or code revert
 // appends through the delivery FIFO: the destination session's complete state (nil
 // when the action changed no session) plus any files a code revert kept unchanged.
@@ -572,24 +544,6 @@ func (a *App) emitNavigationBoundaryWithTitle(sessionID, title string) {
 type turnActionBoundary struct {
 	State        *agent.HydrationState    `json:"state"`
 	SkippedFiles []snapshot.SkippedRevert `json:"skippedFiles"`
-}
-
-// emitTurnActionBoundary appends the destination's complete state and code-revert
-// skip notice as one ordered frame. It captures atomically like the navigation
-// boundary, so a live frame delivered after the capture is enqueued after it and
-// the skip notice cannot be clobbered by an out-of-band apply.
-func (a *App) emitTurnActionBoundary(sessionID string, skipped []snapshot.SkippedRevert) {
-	if a.ctx == nil {
-		return
-	}
-	emit := func(state agent.HydrationState) {
-		a.enqueueBoundary("turn_action", turnActionBoundary{State: &state, SkippedFiles: skipped}, "", state.Session.ID)
-	}
-	if a.agent == nil {
-		emit(agent.HydrationState{})
-		return
-	}
-	a.agent.HydrateSessionWithBoundary(sessionID, emit)
 }
 
 // emitTurnActionNotice appends a code revert's skip notice as an ordered notice-only
@@ -900,6 +854,17 @@ func (a *App) RevertCode(turn int) (snapshot.RevertResult, error) {
 }
 
 // RevertHistory truncates conversation after turn N.
+// turnActionBoundaryEmit is the owner's in-commit callback for a session-changing
+// revert/fork: it commits routing current, then appends the destination's complete
+// state and any code-revert skip notice as one ordered boundary, so state and notice
+// apply together and no live frame interleaves between them.
+func (a *App) turnActionBoundaryEmit() func(agent.HydrationState, []snapshot.SkippedRevert) {
+	return func(state agent.HydrationState, skipped []snapshot.SkippedRevert) {
+		a.setCurrentSessionID(state.Session.ID)
+		a.enqueueBoundary("turn_action", turnActionBoundary{State: &state, SkippedFiles: skipped}, "", state.Session.ID)
+	}
+}
+
 func (a *App) RevertHistory(turn int) error {
 	a.navMu.Lock()
 	defer a.navMu.Unlock()
@@ -907,11 +872,7 @@ func (a *App) RevertHistory(turn int) error {
 	if err != nil {
 		return err
 	}
-	if err := a.svc.RevertHistoryForSession(sessionID, turn); err != nil {
-		return err
-	}
-	a.emitTurnActionBoundary(sessionID, nil)
-	return nil
+	return a.svc.RevertHistoryForSessionWithBoundary(sessionID, turn, a.turnActionBoundaryEmit())
 }
 
 // ForkSession creates a new session branched from turn N.
@@ -922,15 +883,8 @@ func (a *App) ForkSession(turn int) error {
 	if err != nil {
 		return err
 	}
-	result, err := a.svc.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionFork, false)
-	if err != nil {
-		return err
-	}
-	if result.Session.ID != "" {
-		a.setCurrentSessionID(result.Session.ID)
-		a.emitTurnActionBoundary(result.Session.ID, result.SkippedFiles)
-	}
-	return nil
+	_, err = a.svc.ApplyTurnActionForSessionWithBoundary(sessionID, turn, agent.TurnActionFork, false, a.turnActionBoundaryEmit())
+	return err
 }
 
 // ApplyTurnAction applies a user-message revert/fork action.
@@ -941,20 +895,14 @@ func (a *App) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (age
 	if err != nil {
 		return agent.TurnActionResult{}, err
 	}
-	result, err := a.svc.ApplyTurnActionForSession(sessionID, turn, action, alsoRevertCode)
+	result, err := a.svc.ApplyTurnActionForSessionWithBoundary(sessionID, turn, action, alsoRevertCode, a.turnActionBoundaryEmit())
 	if err != nil {
 		return result, err
 	}
-	if result.SessionChanged && result.Session.ID != "" {
-		// A fork navigates to the new branched session; a history revert stays on
-		// the reverted one. Commit routing, then append the destination's complete
-		// state and any code-revert skip notice as one ordered boundary, so the
-		// state and notice apply together and no live frame interleaves between them.
-		a.setCurrentSessionID(result.Session.ID)
-		a.emitTurnActionBoundary(result.Session.ID, result.SkippedFiles)
-	} else {
-		// A code-only revert changes no session; deliver its skip notice through the
-		// same ordered FIFO so a queued refresh cannot clobber it.
+	if !result.SessionChanged {
+		// A code-only revert changes no session, so the owner emits no boundary;
+		// deliver its skip notice through the same ordered FIFO so a queued refresh
+		// cannot clobber it.
 		a.emitTurnActionNotice(result.SkippedFiles)
 	}
 	return result, nil
@@ -1149,16 +1097,16 @@ func (a *App) routeProjectPathBounded() (string, error) {
 
 // openOrCreateSession opens the most recent active session for a project path, or
 // creates one. The caller holds navMu across it as part of a navigation.
-func (a *App) openOrCreateSession(projectPath string) (agent.SessionSummary, error) {
+func (a *App) openOrCreateSession(projectPath string, emit func(agent.HydrationState)) (agent.SessionSummary, error) {
 	sessions, err := a.svc.SessionListForProjectPath(projectPath, "active")
 	if err == nil && len(sessions) > 0 {
-		return a.svc.OpenSession(sessions[0].ID)
+		return a.svc.OpenSessionWithBoundary(sessions[0].ID, emit)
 	}
-	id, err := a.svc.NewSessionForProjectPath(projectPath, "primary")
+	id, err := a.svc.NewSessionForProjectPathWithBoundary(projectPath, "primary", emit)
 	if err != nil {
 		return agent.SessionSummary{}, err
 	}
-	return a.svc.SessionSummaryForSession(id)
+	return agent.SessionSummary{ID: id}, nil
 }
 
 // TokenUsage returns the current cumulative token usage for the session.
@@ -1197,13 +1145,14 @@ func (a *App) SessionSwitch(id string) error {
 	if a.navClosed {
 		return errAdapterClosed
 	}
-	summary, err := a.svc.OpenSession(id)
-	if err != nil {
-		return err
-	}
-	a.setCurrentSessionID(summary.ID)
-	a.emitNavigationBoundary(summary.ID)
-	return nil
+	// The owner publishes the destination boundary in-commit; the callback commits
+	// adapter routing current before appending the boundary, both while this goroutine
+	// holds navMu, so a failed switch leaves routing and presentation unchanged.
+	_, err := a.svc.OpenSessionWithBoundary(id, func(state agent.HydrationState) {
+		a.setCurrentSessionID(state.Session.ID)
+		a.enqueueBoundary("navigation", state, "", state.Session.ID)
+	})
+	return err
 }
 
 // SessionArchive archives a session.
@@ -1218,8 +1167,11 @@ func (a *App) SessionArchive(id string) error {
 	if err := a.svc.SessionArchive(id); err != nil {
 		return err
 	}
+	// Removing the current session performs no complete-state capture of the removed session: current
+	// removal appends a deterministic no-session boundary the frontend applies as a
+	// detach; non-current removal leaves selection/presentation unchanged.
 	if a.removedCurrent(id) {
-		a.emitNavigationBoundary(strings.TrimSpace(id))
+		a.enqueueBoundary("navigation", agent.HydrationState{}, "", "")
 	}
 	return nil
 }
@@ -1234,8 +1186,9 @@ func (a *App) SessionDelete(id string) error {
 	if err := a.svc.SessionDelete(id); err != nil {
 		return err
 	}
+	// Current removal: deterministic no-session boundary, no capture.
 	if a.removedCurrent(id) {
-		a.emitNavigationBoundary(strings.TrimSpace(id))
+		a.enqueueBoundary("navigation", agent.HydrationState{}, "", "")
 	}
 	return nil
 }
@@ -1247,13 +1200,11 @@ func (a *App) SessionNew() error {
 	if a.navClosed {
 		return errAdapterClosed
 	}
-	id, err := a.svc.NewSessionForProjectPath(a.routeProjectPath, "primary")
-	if err != nil {
-		return err
-	}
-	a.setCurrentSessionID(id)
-	a.emitNavigationBoundary(id)
-	return nil
+	_, err := a.svc.NewSessionForProjectPathWithBoundary(a.routeProjectPath, "primary", func(state agent.HydrationState) {
+		a.setCurrentSessionID(state.Session.ID)
+		a.enqueueBoundary("navigation", state, "", state.Session.ID)
+	})
+	return err
 }
 
 // SessionMessages returns persisted history for the current session.
@@ -1303,17 +1254,16 @@ func (a *App) ProjectSwitch(targetPath string) error {
 	if abs == a.routeProjectPath {
 		return nil
 	}
-	summary, err := a.openOrCreateSession(abs)
-	if err != nil {
-		return err
-	}
-	// Commit the project path and the session id together under navMu so a
-	// following current-target call never sees one without the other. The native
-	// title rides the boundary, so it changes only when the boundary is consumed.
-	a.routeProjectPath = abs
-	a.setCurrentSessionID(summary.ID)
-	a.emitNavigationBoundaryWithTitle(summary.ID, "Lightcode — "+filepath.Base(abs))
-	return nil
+	// Commit the project path, session id, title, and boundary together in-commit under
+	// navMu so a following current-target call never sees one without the other. The
+	// native title rides the boundary, so it changes only when the boundary is consumed.
+	title := "Lightcode — " + filepath.Base(abs)
+	_, err = a.openOrCreateSession(abs, func(state agent.HydrationState) {
+		a.routeProjectPath = abs
+		a.setCurrentSessionID(state.Session.ID)
+		a.enqueueBoundary("navigation", state, title, state.Session.ID)
+	})
+	return err
 }
 
 // ProjectPickAndSwitch opens a native directory picker.

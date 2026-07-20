@@ -55,14 +55,19 @@ type AdapterService interface {
 	SessionPayloadForSession(string) (SessionPayload, error)
 	SessionList(string) ([]SessionSummary, error)
 	OpenSession(string) (SessionSummary, error)
+	OpenSessionWithBoundary(string, func(HydrationState)) (SessionSummary, error)
 	NewSession(string, string) (string, error)
+	NewSessionWithBoundary(string, string, func(HydrationState)) (string, error)
 	NewSessionForProjectPath(string, string) (string, error)
+	NewSessionForProjectPathWithBoundary(string, string, func(HydrationState)) (string, error)
 	SessionArchive(string) error
 	SessionDelete(string) error
 	SessionMessagesFor(string) ([]DisplayMessage, error)
 	ApplyTurnActionForSession(string, int, string, bool) (TurnActionResult, error)
+	ApplyTurnActionForSessionWithBoundary(string, int, string, bool, func(HydrationState, []snapshot.SkippedRevert)) (TurnActionResult, error)
 	RevertCodeForSession(string, int) (snapshot.RevertResult, error)
 	RevertHistoryForSession(string, int) error
+	RevertHistoryForSessionWithBoundary(string, int, func(HydrationState, []snapshot.SkippedRevert)) error
 	SnapshotListForSession(string) ([]Snapshot, error)
 
 	ReadFileContent(string) (string, error)

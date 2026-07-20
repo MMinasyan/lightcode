@@ -1160,11 +1160,25 @@ func (s *Store) updateMeta(mutate func(*SessionMeta)) error {
 // every user message. Also advances the owning project's meta.json when
 // the store is project-aware.
 func (s *Store) TouchActivity() error {
-	if err := s.updateMeta(func(m *SessionMeta) {
-		m.LastActivity = time.Now().Unix()
-	}); err != nil {
+	if err := s.SetLastActivity(time.Now().Unix()); err != nil {
 		return err
 	}
+	return s.TouchProjectActivity()
+}
+
+// SetLastActivity stamps only the session meta's LastActivity to ts. It does not touch
+// project activity, so a caller can report the session's committed LastActivity in a
+// boundary summary based solely on this write's success.
+func (s *Store) SetLastActivity(ts int64) error {
+	return s.updateMeta(func(m *SessionMeta) {
+		m.LastActivity = ts
+	})
+}
+
+// TouchProjectActivity records project-level recent activity; it never affects the
+// session's own LastActivity, so its failure does not make a boundary summary that
+// already reported the session's LastActivity inconsistent with disk.
+func (s *Store) TouchProjectActivity() error {
 	s.mu.Lock()
 	projectsRoot := s.projectsRoot
 	projectID := s.projectID

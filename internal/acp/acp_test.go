@@ -1510,8 +1510,8 @@ func TestACPClearRemovedCurrent(t *testing.T) {
 func TestACPHandlersUseSharedTurnActionContract(t *testing.T) {
 	src := mustReadACPSource(t)
 	helper := extractSourceFunc(t, src, "func (r *Runner) handleTurnAction(")
-	if !strings.Contains(helper, ".ApplyTurnActionForSession(") {
-		t.Fatal("handleTurnAction must call ApplyTurnActionForSession")
+	if !strings.Contains(helper, ".ApplyTurnActionForSessionWithBoundary(") {
+		t.Fatal("handleTurnAction must call ApplyTurnActionForSessionWithBoundary")
 	}
 	for _, forbidden := range []string{".ForkSession(", ".RevertCode(", ".RevertHistory("} {
 		if strings.Contains(helper, forbidden) {

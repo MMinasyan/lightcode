@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 // Request is an incoming JSON-RPC 2.0 request.
@@ -587,13 +588,19 @@ func (r *Runner) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
 }
 
 func (r *Runner) handleSessionNew(req Request) {
-	id, err := r.agent.NewSession("", "primary")
+	_, err := r.agent.NewSessionWithBoundary("", "primary", func(state agent.HydrationState) {
+		id := strings.TrimSpace(state.Session.ID)
+		r.setCurrentSessionID(id)
+		r.sendBoundary(Notification{
+			JSONRPC: "2.0",
+			Method:  "agent/session_changed",
+			Params:  state,
+		}, id)
+	})
 	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	r.setCurrentSessionID(id)
-	r.pushSessionBoundary(id)
 	r.respond(req.ID, r.currentSessionSummary())
 }
 
@@ -727,13 +734,22 @@ func (r *Runner) handleSessionSwitch(req Request) {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	summary, err := r.agent.OpenSession(params.ID)
+	// The owner publishes the destination boundary in-commit; the callback commits
+	// connection routing current before enqueueing the boundary, which precedes the
+	// success response. A failed switch calls emit never, leaving routing unchanged.
+	summary, err := r.agent.OpenSessionWithBoundary(params.ID, func(state agent.HydrationState) {
+		id := strings.TrimSpace(state.Session.ID)
+		r.setCurrentSessionID(id)
+		r.sendBoundary(Notification{
+			JSONRPC: "2.0",
+			Method:  "agent/session_changed",
+			Params:  state,
+		}, id)
+	})
 	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	r.setCurrentSessionID(summary.ID)
-	r.pushSessionBoundary(summary.ID)
 	r.respond(req.ID, summary)
 }
 
@@ -751,7 +767,13 @@ func (r *Runner) handleSessionArchive(req Request) {
 	}
 	wasCurrent := r.sv().RemovedCurrent(params.ID)
 	if wasCurrent {
-		r.pushSessionBoundary(strings.TrimSpace(params.ID))
+		// Current removal: deterministic no-session boundary before the response, with no
+		// complete-state capture of the removed session.
+		r.sendBoundary(Notification{
+			JSONRPC: "2.0",
+			Method:  "agent/session_changed",
+			Params:  agent.HydrationState{},
+		}, "")
 	}
 	r.respond(req.ID, map[string]any{"ok": true})
 }
@@ -770,7 +792,13 @@ func (r *Runner) handleSessionDelete(req Request) {
 	}
 	wasCurrent := r.sv().RemovedCurrent(params.ID)
 	if wasCurrent {
-		r.pushSessionBoundary(strings.TrimSpace(params.ID))
+		// Current removal: deterministic no-session boundary before the response, with no
+		// complete-state capture of the removed session.
+		r.sendBoundary(Notification{
+			JSONRPC: "2.0",
+			Method:  "agent/session_changed",
+			Params:  agent.HydrationState{},
+		}, "")
 	}
 	r.respond(req.ID, map[string]any{"ok": true})
 }
@@ -801,18 +829,20 @@ func (r *Runner) handleTurnAction(req Request, action string) {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	result, err := r.agent.ApplyTurnActionForSession(sessionID, params.Turn, action, params.AlsoRevertCode)
+	// The owner publishes the session-changing revert/fork boundary in-commit before
+	// the response; a code-only revert changes no session and emits nothing.
+	result, err := r.agent.ApplyTurnActionForSessionWithBoundary(sessionID, params.Turn, action, params.AlsoRevertCode, func(state agent.HydrationState, _ []snapshot.SkippedRevert) {
+		id := strings.TrimSpace(state.Session.ID)
+		r.setCurrentSessionID(id)
+		r.sendBoundary(Notification{
+			JSONRPC: "2.0",
+			Method:  "agent/session_changed",
+			Params:  state,
+		}, id)
+	})
 	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
-	}
-	if result.SessionChanged {
-		if result.Session.ID != "" {
-			r.setCurrentSessionID(result.Session.ID)
-			r.pushSessionBoundary(result.Session.ID)
-		} else {
-			r.pushSessionBoundary(sessionID)
-		}
 	}
 	r.respond(req.ID, result)
 }
@@ -1005,23 +1035,6 @@ func warningSnapshot(warnings []agent.PromptWarning) []agent.PromptWarning {
 		return []agent.PromptWarning{}
 	}
 	return warnings
-}
-
-// pushSessionBoundary sends the destination session's complete state as the
-// navigation/turn-action boundary. It runs from a request handler, never the event
-// callback, so acquiring the capture's lifecycle lock cannot stall a turn.
-func (r *Runner) pushSessionBoundary(sessionID string) {
-	if r.owner == nil {
-		r.pushSessionResync(sessionID)
-		return
-	}
-	r.owner.HydrateSessionWithBoundary(sessionID, func(state agent.HydrationState) {
-		r.sendBoundary(Notification{
-			JSONRPC: "2.0",
-			Method:  "agent/session_changed",
-			Params:  state,
-		}, strings.TrimSpace(state.Session.ID))
-	})
 }
 
 // pushSessionResync re-syncs a session's transcript through the rt.mu-only

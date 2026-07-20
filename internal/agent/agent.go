@@ -3738,6 +3738,13 @@ func sessionSummary(unit *session) SessionSummary {
 	if err != nil {
 		return SessionSummary{ID: unit.store.SessionID()}
 	}
+	return sessionSummaryFromMeta(meta)
+}
+
+// sessionSummaryFromMeta builds a session summary from an already-read meta record, so
+// a caller that must not re-read meta after a durable commit can reuse the meta it
+// prepared before the commit.
+func sessionSummaryFromMeta(meta snapshot.SessionMeta) SessionSummary {
 	return SessionSummary{
 		ID:              meta.ID,
 		CreatedAt:       meta.CreatedAt,
@@ -3803,6 +3810,21 @@ func sessionSummaryFromInfo(info snapshot.SessionInfo) SessionSummary {
 }
 
 func (a *Agent) OpenSession(id string) (SessionSummary, error) {
+	return a.openSession(id, nil)
+}
+
+// OpenSessionWithBoundary is OpenSession that publishes the destination's complete
+// state through emit in the same section that commits its selection, so no fallible
+// capture runs after the durable commit. Reactivation prebuilds the compacted
+// committed history before the durable reactivation and emits the replacement
+// in-commit; live selection emits under the three-attempt revision revalidation
+// before any routing change. emit is not called when the session cannot be resolved,
+// leaving the adapter's current presentation unchanged.
+func (a *Agent) OpenSessionWithBoundary(id string, emit func(HydrationState)) (SessionSummary, error) {
+	return a.openSession(id, emit)
+}
+
+func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummary, error) {
 	defer a.lockLifecycle()()
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -3817,6 +3839,16 @@ func (a *Agent) OpenSession(id string) (SessionSummary, error) {
 		}
 		summary := sessionSummary(unit)
 		rt.mu.Unlock()
+		// Live selection performs no durable mutation: capture with the three-attempt
+		// revision revalidation before returning, so a concurrent commit forces a retry
+		// rather than a stale prefix and the boundary is atomic with the live state.
+		if emit != nil {
+			if _, err := a.captureStateForSelection(unit, func(cs completeState) {
+				emit(hydrationStateFrom(summary, cs))
+			}); err != nil {
+				return SessionSummary{}, err
+			}
+		}
 		return summary, nil
 	}
 	rt.mu.Unlock()
@@ -3837,6 +3869,9 @@ func (a *Agent) OpenSession(id string) (SessionSummary, error) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	if unit, err := a.liveSessionLocked(id); err == nil {
+		if emit != nil {
+			a.emitBoundaryForLiveUnitLocked(unit, id, emit)
+		}
 		return sessionSummary(unit), nil
 	}
 	if err := a.reloadLocked(); err != nil {
@@ -3863,20 +3898,73 @@ func (a *Agent) OpenSession(id string) (SessionSummary, error) {
 		unit.store.Detach()
 		return SessionSummary{}, err
 	}
-	if metaState(meta.State) == snapshot.StateArchived {
+	// Prebuild the compacted committed history before the durable reactivation, so the
+	// in-commit boundary carries a prebuilt replacement with no postcommit read. The
+	// durable turns are unchanged by the state flip, so this equals the post-commit
+	// projection. A read failure aborts before the reactivation, leaving the source
+	// archived and unregistered.
+	reactivate := metaState(meta.State) == snapshot.StateArchived
+	var prebuilt []DisplayMessage
+	var prebuiltSummary SessionSummary
+	if emit != nil {
+		prebuilt, err = a.captureDurableHistory(unit, id)
+		if err != nil {
+			unit.store.Detach()
+			return SessionSummary{}, err
+		}
+		// Prebuild the summary from the meta already read; the reactivation below flips
+		// an archived session active, so reflect that here rather than re-reading meta
+		// after the durable commit.
+		prebuiltSummary = sessionSummaryFromMeta(meta)
+		if reactivate {
+			prebuiltSummary.State = snapshot.StateActive
+			prebuiltSummary.ArchivedAt = 0
+		}
+	}
+	if reactivate {
 		if err := unit.store.SetState(snapshot.StateActive); err != nil {
 			// Reactivation must reach disk; otherwise the owner would drive a
 			// session that stays archived and absent from active listings.
 			unit.store.Detach()
 			return SessionSummary{}, fmt.Errorf("reactivate session %s: %w", id, err)
 		}
-		_ = unit.store.TouchActivity()
+		// Stamp the session's LastActivity with one sampled timestamp and report it in
+		// the boundary only when the session-meta write itself landed; the project-level
+		// touch is best-effort and does not affect the reported value, so a boundary
+		// summary never disagrees with the session's committed LastActivity.
+		ts := time.Now().Unix()
+		if unit.store.SetLastActivity(ts) == nil {
+			prebuiltSummary.LastActivity = ts
+		}
+		_ = unit.store.TouchProjectActivity()
 	}
 	a.resetFileTrackerForSession(unit)
 	a.loadTokensFromDiskForSession(unit)
 	a.restoreModelFromSessionForSession(unit)
 	a.registerLiveSessionLocked(unit)
+	// Infallible in-commit publication: the committed prefix and summary are prebuilt,
+	// so this only captures the live classes and appends the boundary under their locks.
+	if emit != nil {
+		a.captureUnderLocksRTHeld(unit, prebuilt, id, nil, func(cs completeState) {
+			emit(hydrationStateFrom(prebuiltSummary, cs))
+		})
+	}
 	return sessionSummary(unit), nil
+}
+
+// emitBoundaryForLiveUnitLocked publishes an already-live unit's complete-state
+// boundary while runtime.mu is held (the open-session re-check race where the session
+// became live between the two lookups). The committed prefix is read here — this path
+// performed no durable commit, so the read is not a postcommit capture.
+func (a *Agent) emitBoundaryForLiveUnitLocked(unit *session, id string, emit func(HydrationState)) {
+	committed, err := a.captureDurableHistory(unit, id)
+	if err != nil {
+		return
+	}
+	summary := sessionSummary(unit)
+	a.captureUnderLocksRTHeld(unit, committed, id, nil, func(cs completeState) {
+		emit(hydrationStateFrom(summary, cs))
+	})
 }
 
 func (a *Agent) projectForExistingSession(id string) (*project.Project, error) {
@@ -3944,6 +4032,18 @@ func (a *Agent) resetCurrentSessionState() {
 }
 
 func (a *Agent) NewSession(projectID string, agentType string) (string, error) {
+	return a.newSession(projectID, agentType, nil)
+}
+
+// NewSessionWithBoundary is NewSession that publishes the fresh session's complete
+// state through emit in the same section that commits it. A new session has empty
+// durable history and a deterministic summary, so the capture appends the boundary
+// under the live-state locks with no fallible read.
+func (a *Agent) NewSessionWithBoundary(projectID string, agentType string, emit func(HydrationState)) (string, error) {
+	return a.newSession(projectID, agentType, emit)
+}
+
+func (a *Agent) newSession(projectID string, agentType string, emit func(HydrationState)) (string, error) {
 	defer a.lockLifecycle()()
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
@@ -3978,16 +4078,45 @@ func (a *Agent) NewSession(projectID string, agentType string) (string, error) {
 		unit.fileTracker.Reset()
 	}
 	a.loadTokensFromDiskForSession(unit)
+	// Prepare the complete summary from the just-created meta before the in-memory
+	// registration, so the boundary carries the durable CreatedAt/LastActivity and no
+	// fallible read runs after that commit.
+	var prebuiltSummary SessionSummary
+	if emit != nil {
+		if meta, merr := unit.store.Meta(); merr == nil {
+			prebuiltSummary = sessionSummaryFromMeta(meta)
+		} else {
+			prebuiltSummary = SessionSummary{ID: unit.store.SessionID(), State: snapshot.StateActive, ProjectPath: proj.Path}
+		}
+	}
 	a.setCurrentSessionLocked(unit)
-	return unit.store.SessionID(), nil
+	sid := unit.store.SessionID()
+	if emit != nil {
+		// New sessions have empty durable history, so the in-commit capture appends the
+		// boundary from the prebuilt summary with no further read.
+		a.captureUnderLocksRTHeld(unit, nil, sid, nil, func(cs completeState) {
+			emit(hydrationStateFrom(prebuiltSummary, cs))
+		})
+	}
+	return sid, nil
 }
 
 func (a *Agent) NewSessionForProjectPath(projectPath string, agentType string) (string, error) {
+	return a.newSessionForProjectPath(projectPath, agentType, nil)
+}
+
+// NewSessionForProjectPathWithBoundary is NewSessionForProjectPath that publishes the
+// fresh session's boundary in-commit.
+func (a *Agent) NewSessionForProjectPathWithBoundary(projectPath string, agentType string, emit func(HydrationState)) (string, error) {
+	return a.newSessionForProjectPath(projectPath, agentType, emit)
+}
+
+func (a *Agent) newSessionForProjectPath(projectPath string, agentType string, emit func(HydrationState)) (string, error) {
 	proj, err := a.ensureProjectForPath(projectPath)
 	if err != nil {
 		return "", err
 	}
-	return a.NewSession(proj.ID, agentType)
+	return a.newSession(proj.ID, agentType, emit)
 }
 
 func (a *Agent) explicitRootSessionTypeLocked(agentType string) (string, error) {
@@ -4499,10 +4628,21 @@ func (a *Agent) captureDurableHistory(unit *session, sessionID string) ([]Displa
 // the capture is either in the snapshot or delivered after the boundary.
 func (a *Agent) captureUnderLocks(unit *session, committed []DisplayMessage, sessionID string, wantRev *captureRevision, boundary func(completeState)) (completeState, bool) {
 	rt := a.ensureRuntime()
-	tr := unit.transcript
-
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	return a.captureUnderLocksRTHeld(unit, committed, sessionID, wantRev, boundary)
+}
+
+// captureUnderLocksRTHeld is captureUnderLocks for a caller that already holds
+// runtime.mu (a reactivation or current removal publishing its boundary in-commit): it
+// captures the remaining live classes and appends the boundary under their locks,
+// so the boundary stays atomic with the operation's committed state. The committed
+// prefix is prebuilt by the caller before its durable commit, so this performs no
+// fallible read.
+func (a *Agent) captureUnderLocksRTHeld(unit *session, committed []DisplayMessage, sessionID string, wantRev *captureRevision, boundary func(completeState)) (completeState, bool) {
+	rt := a.ensureRuntime()
+	tr := unit.transcript
+
 	busy := unit.busy
 	compacting := unit.compacting
 	model := unit.currentRef
@@ -4850,19 +4990,46 @@ func (a *Agent) displayMetadataForToolCall(name, args, result string) map[string
 // The turn argument is the clicked user turn; this method owns the conversion
 // to the lower-level snapshot/history cut points so adapters do not duplicate it.
 func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (TurnActionResult, error) {
-	return a.applyTurnActionForSession(a.session, turn, action, alsoRevertCode)
+	return a.applyTurnActionForSession(a.session, turn, action, alsoRevertCode, nil)
 }
 
 func (a *Agent) ApplyTurnActionForSession(sessionID string, turn int, action string, alsoRevertCode bool) (TurnActionResult, error) {
+	return a.applyTurnActionResolved(sessionID, turn, action, alsoRevertCode, nil)
+}
+
+// ApplyTurnActionForSessionWithBoundary is ApplyTurnActionForSession that publishes a
+// session-changing revert/fork result as an in-commit boundary through emit — from the
+// operation's own prebuilt result under the mutating lock — so the adapter performs no
+// separate postcommit capture of the mutated session. Code-only revert changes no
+// session and never calls emit.
+func (a *Agent) ApplyTurnActionForSessionWithBoundary(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert)) (TurnActionResult, error) {
+	return a.applyTurnActionResolved(sessionID, turn, action, alsoRevertCode, emit)
+}
+
+func (a *Agent) applyTurnActionResolved(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert)) (TurnActionResult, error) {
 	defer a.lockLifecycle()()
 	unit, err := a.resolveRootDriveSession(sessionID)
 	if err != nil {
 		return TurnActionResult{}, err
 	}
-	return a.applyTurnActionForSession(unit, turn, action, alsoRevertCode)
+	return a.applyTurnActionForSession(unit, turn, action, alsoRevertCode, emit)
 }
 
-func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string, alsoRevertCode bool) (TurnActionResult, error) {
+// emitTurnActionBoundaryLocked publishes a revert/fork result as an in-commit boundary
+// while runtime.mu is held: the committed prefix is the result's prebuilt Messages, so
+// this captures only the live classes and appends the boundary under their locks,
+// replacing the adapter's separate postcommit HydrateSessionWithBoundary capture. The
+// code-revert skips ride the boundary so the adapter reassembles its combined frame.
+func (a *Agent) emitTurnActionBoundaryLocked(unit *session, result TurnActionResult, emit func(HydrationState, []snapshot.SkippedRevert)) {
+	if emit == nil || unit == nil {
+		return
+	}
+	a.captureUnderLocksRTHeld(unit, result.Messages, sessionIDOf(unit), nil, func(cs completeState) {
+		emit(hydrationStateFrom(result.Session, cs), result.SkippedFiles)
+	})
+}
+
+func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert)) (TurnActionResult, error) {
 	// fork / revert_history change the session; revert_history clears the queue at
 	// the irreversible store mutation and enqueues the event in the same runtime.mu
 	// section.
@@ -4925,7 +5092,9 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 			return TurnActionResult{}, err
 		}
 		a.resetFileTrackerForSession(unit)
-		return a.populateTurnActionResultForSession(unit, result), nil
+		result = a.populateTurnActionResultForSession(unit, result)
+		a.emitTurnActionBoundaryLocked(unit, result, emit)
+		return result, nil
 
 	case TurnActionFork:
 		target := turn
@@ -4948,7 +5117,9 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 				fmt.Fprintf(os.Stderr, "lightcode: fork code revert: %v\n", revertErr)
 			}
 		}
-		return a.populateTurnActionResultForSession(candidate, result), nil
+		result = a.populateTurnActionResultForSession(candidate, result)
+		a.emitTurnActionBoundaryLocked(candidate, result, emit)
+		return result, nil
 
 	default:
 		return TurnActionResult{}, fmt.Errorf("unknown turn action %q", action)
@@ -5030,19 +5201,31 @@ func (a *Agent) revertCodeForSession(unit *session, turn int) (snapshot.RevertRe
 
 // RevertHistory truncates conversation after the given turn.
 func (a *Agent) RevertHistory(turn int) error {
-	return a.revertHistoryForSession(a.session, turn)
+	return a.revertHistoryForSession(a.session, turn, nil)
 }
 
 func (a *Agent) RevertHistoryForSession(sessionID string, turn int) error {
+	return a.revertHistoryResolved(sessionID, turn, nil)
+}
+
+// RevertHistoryForSessionWithBoundary is RevertHistoryForSession that publishes the
+// reverted session's boundary in-commit through emit — from the operation's own
+// prebuilt result under the mutating lock — so the adapter performs no separate
+// postcommit capture.
+func (a *Agent) RevertHistoryForSessionWithBoundary(sessionID string, turn int, emit func(HydrationState, []snapshot.SkippedRevert)) error {
+	return a.revertHistoryResolved(sessionID, turn, emit)
+}
+
+func (a *Agent) revertHistoryResolved(sessionID string, turn int, emit func(HydrationState, []snapshot.SkippedRevert)) error {
 	defer a.lockLifecycle()()
 	unit, err := a.resolveRootDriveSession(sessionID)
 	if err != nil {
 		return err
 	}
-	return a.revertHistoryForSession(unit, turn)
+	return a.revertHistoryForSession(unit, turn, emit)
 }
 
-func (a *Agent) revertHistoryForSession(unit *session, turn int) error {
+func (a *Agent) revertHistoryForSession(unit *session, turn int, emit func(HydrationState, []snapshot.SkippedRevert)) error {
 	var clearedVersion int
 	var queueCleared bool
 	var eventSessionID string
@@ -5068,6 +5251,12 @@ func (a *Agent) revertHistoryForSession(unit *session, turn int) error {
 		return err
 	}
 	a.resetFileTrackerForSession(unit)
+	if emit != nil {
+		result := a.populateTurnActionResultForSession(unit, TurnActionResult{
+			Action: TurnActionRevertHistory, Turn: turn, TargetTurn: turn, SessionChanged: true,
+		})
+		a.emitTurnActionBoundaryLocked(unit, result, emit)
+	}
 	return nil
 }
 
