@@ -156,4 +156,3 @@ func runWails() error {
 	}
 	return nil
 }
-

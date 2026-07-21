@@ -32,21 +32,21 @@ func Write(path string, data []byte, perm os.FileMode) error {
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("atomicfs: write temp for %s: %w", path, err)
 	}
 	if err := tmp.Chmod(perm); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("atomicfs: chmod temp for %s: %w", path, err)
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("atomicfs: close temp for %s: %w", path, err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("atomicfs: rename temp onto %s: %w", path, err)
 	}
 	return nil
@@ -68,13 +68,13 @@ func CreateExclusive(path string, data []byte, perm os.FileMode) (bool, error) {
 		return false, fmt.Errorf("atomicfs: create temp for %s: %w", path, err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() { _ = os.Remove(tmpName) }()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return false, fmt.Errorf("atomicfs: write temp for %s: %w", path, err)
 	}
 	if err := tmp.Chmod(perm); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return false, fmt.Errorf("atomicfs: chmod temp for %s: %w", path, err)
 	}
 	if err := tmp.Close(); err != nil {

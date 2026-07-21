@@ -1322,7 +1322,6 @@ func waitPermissionEvent(t *testing.T, events <-chan Event) Event {
 	}
 }
 
-
 func backgroundID(t *testing.T, result string) string {
 	t.Helper()
 	const marker = "ID: `"

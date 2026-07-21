@@ -272,12 +272,12 @@ func TestWailsDeliveryFiltersAndAdvancesPresentation(t *testing.T) {
 	defer a.closeDelivery()
 
 	a.seedPresented("A")
-	a.emitSessionFrame("A", "tokenA", nil)                                                 // delivered: A is current
-	a.emitSessionFrame("B", "earlyB", nil)                                                 // dropped: B not yet current
-	a.enqueueFrame(deliveryFrame{name: "navigation", kind: frameAdvance, sessionID: "B"})  // delivered + advances to B
-	a.emitSessionFrame("B", "tokenB", nil)                                                 // delivered: B is current
-	a.emitSessionFrame("A", "lateA", nil)                                                  // dropped: A no longer current
-	a.emitFrame("sentinel", nil)                                                           // delivered: global sentinel (last)
+	a.emitSessionFrame("A", "tokenA", nil)                                                // delivered: A is current
+	a.emitSessionFrame("B", "earlyB", nil)                                                // dropped: B not yet current
+	a.enqueueFrame(deliveryFrame{name: "navigation", kind: frameAdvance, sessionID: "B"}) // delivered + advances to B
+	a.emitSessionFrame("B", "tokenB", nil)                                                // delivered: B is current
+	a.emitSessionFrame("A", "lateA", nil)                                                 // dropped: A no longer current
+	a.emitFrame("sentinel", nil)                                                          // delivered: global sentinel (last)
 
 	want := []string{"tokenA", "navigation", "tokenB", "sentinel"}
 	deadline := time.Now().Add(2 * time.Second)

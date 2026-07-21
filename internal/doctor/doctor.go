@@ -305,7 +305,6 @@ func setupModelCheck(agentsCfg *agentcfg.Config, cat *catalog.Catalog, envIsSet 
 	add("setup", "model", StatusOK, resolved.Model)
 }
 
-
 func summarize(checks []Check) Report {
 	r := Report{Checks: checks}
 	for _, c := range checks {

@@ -51,9 +51,9 @@ type Event struct {
 	Metadata   map[string]any
 
 	// Agent-level fields:
-	Turn              int
-	Cancelled         bool
-	Error             string
+	Turn      int
+	Cancelled bool
+	Error     string
 	// RewritePayload (EventSessionRewrite) is the compacted session's replacement
 	// transcript/token snapshot, built by the producer under the transcript lock, so
 	// the adapter callback applies it without re-entering the owner.
