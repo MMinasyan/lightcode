@@ -60,32 +60,6 @@ func TestHydrationStateFromCompleteState(t *testing.T) {
 	}
 }
 
-// TestHydrateSessionWithBoundaryEmitsCapturedStateOnce verifies the atomic-capture
-// wrapper invokes emit exactly once with the resolved session's state, and once
-// with the zero state (a detach) for an empty id.
-func TestHydrateSessionWithBoundaryEmitsCapturedStateOnce(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
-	id, err := a.NewSession("", "primary")
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-
-	var got []HydrationState
-	a.HydrateSessionWithBoundary(id, func(hs HydrationState) { got = append(got, hs) })
-	if len(got) != 1 {
-		t.Fatalf("emit called %d times, want 1", len(got))
-	}
-	if got[0].Session.ID != id {
-		t.Fatalf("boundary session = %q, want %q", got[0].Session.ID, id)
-	}
-
-	got = nil
-	a.HydrateSessionWithBoundary("", func(hs HydrationState) { got = append(got, hs) })
-	if len(got) != 1 || got[0].Session.ID != "" {
-		t.Fatalf("detach = %#v, want one zero state", got)
-	}
-}
-
 // TestHydrateSessionResolvesAndCaptures verifies the method resolves a live session
 // and returns its complete state.
 func TestHydrateSessionResolvesAndCaptures(t *testing.T) {

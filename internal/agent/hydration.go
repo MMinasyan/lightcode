@@ -72,41 +72,6 @@ func (a *Agent) HydrateSession(sessionID string) (HydrationState, error) {
 	return hydrationStateFrom(summary, cs), nil
 }
 
-// HydrateSessionWithBoundary captures a session's complete state and calls emit
-// with it while the capture locks are still held, so a boundary the adapter appends
-// from emit is atomic with the captured state: no event delivered after the capture
-// can be enqueued before the boundary. emit is called exactly once — with the
-// captured state, or with the zero state when the session is empty/unresolvable or
-// the durable read fails (a detach).
-func (a *Agent) HydrateSessionWithBoundary(sessionID string, emit func(HydrationState)) {
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		emit(HydrationState{})
-		return
-	}
-	defer a.lockLifecycle()()
-	rt := a.ensureRuntime()
-	rt.mu.Lock()
-	unit, err := a.liveSessionLocked(sessionID)
-	rt.mu.Unlock()
-	if err != nil {
-		emit(HydrationState{})
-		return
-	}
-	summary, err := a.SessionSummaryForSession(sessionID)
-	if err != nil {
-		emit(HydrationState{})
-		return
-	}
-	emitted := false
-	if _, err := a.captureState(unit, func(cs completeState) {
-		emitted = true
-		emit(hydrationStateFrom(summary, cs))
-	}); err != nil && !emitted {
-		emit(HydrationState{})
-	}
-}
-
 func hydrationStateFrom(summary SessionSummary, cs completeState) HydrationState {
 	hs := HydrationState{
 		Session:  summary,
