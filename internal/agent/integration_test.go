@@ -392,9 +392,9 @@ func TestIntegrationForkSessionContinuesConversation(t *testing.T) {
 	}
 	log.waitFor(t, EventTurnEnd)
 	before := a.SessionCurrent().ID
-	result, err := a.ApplyTurnAction(res.Turn, TurnActionFork, false)
+	result, err := a.ApplyTurnActionForSession(before, res.Turn, TurnActionFork, false)
 	if err != nil {
-		t.Fatalf("ApplyTurnAction fork: %v", err)
+		t.Fatalf("ApplyTurnActionForSession fork: %v", err)
 	}
 	if result.Session.ID == "" || result.Session.ID == before {
 		t.Fatalf("fork session ID = %q, before %q", result.Session.ID, before)

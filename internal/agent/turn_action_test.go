@@ -88,9 +88,9 @@ func TestApplyTurnActionRevertCodeUsesClickedTurn(t *testing.T) {
 		t.Fatalf("expected created file before revert: %v", err)
 	}
 
-	result, err := a.ApplyTurnAction(clickedTurn, TurnActionRevertCode, false)
+	result, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, clickedTurn, TurnActionRevertCode, false)
 	if err != nil {
-		t.Fatalf("ApplyTurnAction returned error: %v", err)
+		t.Fatalf("ApplyTurnActionForSession returned error: %v", err)
 	}
 
 	if result.TargetTurn != clickedTurn-1 {
@@ -112,9 +112,9 @@ func TestApplyTurnActionRevertHistoryWithCodeUsesClickedTurn(t *testing.T) {
 	clickedTurn := appendUserTurnWithSnapshot(t, a, "create file", path, "created\n")
 	appendUserTurn(t, a, "after")
 
-	result, err := a.ApplyTurnAction(clickedTurn, TurnActionRevertHistory, true)
+	result, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, clickedTurn, TurnActionRevertHistory, true)
 	if err != nil {
-		t.Fatalf("ApplyTurnAction returned error: %v", err)
+		t.Fatalf("ApplyTurnActionForSession returned error: %v", err)
 	}
 
 	if result.TargetTurn != clickedTurn-1 {
@@ -139,9 +139,9 @@ func TestApplyTurnActionForkIncludesClickedTurn(t *testing.T) {
 	appendUserTurn(t, a, "after")
 	beforeID := a.SessionCurrent().ID
 
-	result, err := a.ApplyTurnAction(clickedTurn, TurnActionFork, false)
+	result, err := a.ApplyTurnActionForSession(beforeID, clickedTurn, TurnActionFork, false)
 	if err != nil {
-		t.Fatalf("ApplyTurnAction returned error: %v", err)
+		t.Fatalf("ApplyTurnActionForSession returned error: %v", err)
 	}
 
 	if result.TargetTurn != clickedTurn {
@@ -807,9 +807,9 @@ func TestApplyTurnActionRevertCodeReportsRestoredFiles(t *testing.T) {
 
 	clickedTurn := appendUserTurnWithSnapshot(t, a, "modify", path, "v2")
 
-	result, err := a.ApplyTurnAction(clickedTurn, TurnActionRevertCode, false)
+	result, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, clickedTurn, TurnActionRevertCode, false)
 	if err != nil {
-		t.Fatalf("ApplyTurnAction: %v", err)
+		t.Fatalf("ApplyTurnActionForSession: %v", err)
 	}
 	if len(result.RestoredFiles) != 1 || result.RestoredFiles[0] != path {
 		t.Fatalf("RestoredFiles = %v, want [%s]", result.RestoredFiles, path)
@@ -843,9 +843,9 @@ func TestApplyTurnActionRevertCodeReportsSkippedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := a.ApplyTurnAction(clickedTurn, TurnActionRevertCode, false)
+	result, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, clickedTurn, TurnActionRevertCode, false)
 	if err != nil {
-		t.Fatalf("ApplyTurnAction: %v", err)
+		t.Fatalf("ApplyTurnActionForSession: %v", err)
 	}
 	if len(result.RestoredFiles) != 0 {
 		t.Fatalf("RestoredFiles = %v, want none", result.RestoredFiles)

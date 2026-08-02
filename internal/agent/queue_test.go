@@ -346,9 +346,9 @@ func TestApplyTurnActionSessionChangesClearQueueAndBumpVersionMonotonically(t *t
 		appendUserTurn(t, a, "turn two")
 
 		seedQueue(t, a, 20, "stale after revert")
-		res, err := a.ApplyTurnAction(2, TurnActionRevertHistory, false)
+		res, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, 2, TurnActionRevertHistory, false)
 		if err != nil {
-			t.Fatalf("ApplyTurnAction revert_history: %v", err)
+			t.Fatalf("ApplyTurnActionForSession revert_history: %v", err)
 		}
 		if !res.SessionChanged {
 			t.Fatalf("revert_history result = %#v, want SessionChanged", res)
@@ -365,9 +365,9 @@ func TestApplyTurnActionSessionChangesClearQueueAndBumpVersionMonotonically(t *t
 		before := a.SessionCurrent().ID
 
 		seedQueue(t, a, 30, "stale after fork")
-		res, err := a.ApplyTurnAction(2, TurnActionFork, false)
+		res, err := a.ApplyTurnActionForSession(before, 2, TurnActionFork, false)
 		if err != nil {
-			t.Fatalf("ApplyTurnAction fork: %v", err)
+			t.Fatalf("ApplyTurnActionForSession fork: %v", err)
 		}
 		if !res.SessionChanged || res.Session.ID == "" || res.Session.ID == before {
 			t.Fatalf("fork result = %#v, before session %q", res, before)
@@ -385,8 +385,8 @@ func TestDirectRevertAndForkClearQueueAndBumpVersionMonotonically(t *testing.T) 
 		appendUserTurn(t, a, "turn two")
 
 		seedQueue(t, a, 40, "stale after direct revert")
-		if err := a.RevertHistory(1); err != nil {
-			t.Fatalf("RevertHistory: %v", err)
+		if err := a.RevertHistoryForSession(a.SessionCurrent().ID, 1); err != nil {
+			t.Fatalf("RevertHistoryForSession: %v", err)
 		}
 		assertQueueClearedAfterVersion(t, a, cap, 40)
 	})
@@ -400,11 +400,11 @@ func TestDirectRevertAndForkClearQueueAndBumpVersionMonotonically(t *testing.T) 
 		before := a.SessionCurrent().ID
 
 		seedQueue(t, a, 50, "stale after direct fork")
-		if err := a.ForkSession(2); err != nil {
-			t.Fatalf("ForkSession: %v", err)
+		if err := a.ForkSessionForSession(before, 2); err != nil {
+			t.Fatalf("ForkSessionForSession: %v", err)
 		}
 		if got := a.SessionCurrent().ID; got == "" || got == before {
-			t.Fatalf("current session after ForkSession = %q, before %q", got, before)
+			t.Fatalf("current session after ForkSessionForSession = %q, before %q", got, before)
 		}
 		assertForkQueuePreservesSource(t, a, before, 50)
 	})

@@ -25,8 +25,8 @@ func TestForkStagedPublication(t *testing.T) {
 		// Seed the source queue to prove fork preserves the source's live state.
 		seedQueue(t, a, 7, "kept on source")
 
-		if err := a.ForkSession(2); err != nil {
-			t.Fatalf("ForkSession: %v", err)
+		if err := a.ForkSessionForSession(sourceID, 2); err != nil {
+			t.Fatalf("ForkSessionForSession: %v", err)
 		}
 		forkID := a.SessionCurrent().ID
 		if forkID == "" || forkID == sourceID {
@@ -81,7 +81,7 @@ func TestForkStagedPublication(t *testing.T) {
 		a.ensureRuntime().mu.Lock()
 		a.session.busy = true
 		a.ensureRuntime().mu.Unlock()
-		forkErr := a.ForkSession(1)
+		forkErr := a.ForkSessionForSession(sourceID, 1)
 		a.ensureRuntime().mu.Lock()
 		a.session.busy = false
 		a.ensureRuntime().mu.Unlock()
@@ -113,7 +113,7 @@ func TestForkStagedPublication(t *testing.T) {
 		}
 		sourceID := a.SessionCurrent().ID
 
-		if _, err := a.ApplyTurnAction(clicked, TurnActionFork, true); err == nil {
+		if _, err := a.ApplyTurnActionForSession(sourceID, clicked, TurnActionFork, true); err == nil {
 			t.Fatal("fork should fail when the source meta is unreadable")
 		}
 		// Fork failed before publication: no code revert ran, so the file created
@@ -146,7 +146,7 @@ func TestForkStagedPublication(t *testing.T) {
 		}
 		defer os.Chmod(sub, 0o700)
 
-		res, err := a.ApplyTurnAction(clicked, TurnActionFork, true)
+		res, err := a.ApplyTurnActionForSession(sourceID, clicked, TurnActionFork, true)
 		if err != nil {
 			t.Fatalf("best-effort code revert must not fail a committed fork: %v", err)
 		}
@@ -167,8 +167,8 @@ func TestForkStagedPublication(t *testing.T) {
 		a.session.currentRef = alt
 		a.ensureRuntime().mu.Unlock()
 
-		if err := a.ForkSession(1); err != nil {
-			t.Fatalf("ForkSession: %v", err)
+		if err := a.ForkSessionForSession(a.SessionCurrent().ID, 1); err != nil {
+			t.Fatalf("ForkSessionForSession: %v", err)
 		}
 		if got := a.session.currentRef; got != alt {
 			t.Fatalf("fork model = %#v, want inherited live %#v", got, alt)
@@ -192,7 +192,7 @@ func TestForkStagedPublication(t *testing.T) {
 		a.session.currentRef = coremodel.ModelRef{Provider: "ghost", Model: "missing"}
 		a.ensureRuntime().mu.Unlock()
 
-		if err := a.ForkSession(1); err == nil {
+		if err := a.ForkSessionForSession(sourceID, 1); err == nil {
 			t.Fatal("fork should abort when the live model cannot be reconstructed")
 		}
 		if a.SessionCurrent().ID != sourceID {

@@ -4898,13 +4898,6 @@ func (a *Agent) displayMetadataForToolCall(name, args, result string) map[string
 
 // --- Snapshot / revert operations ---
 
-// ApplyTurnAction applies a revert/fork action selected from a user message.
-// The turn argument is the clicked user turn; this method owns the conversion
-// to the lower-level snapshot/history cut points so adapters do not duplicate it.
-func (a *Agent) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (TurnActionResult, error) {
-	return a.applyTurnActionForSession(a.session, turn, action, alsoRevertCode, nil)
-}
-
 func (a *Agent) ApplyTurnActionForSession(sessionID string, turn int, action string, alsoRevertCode bool) (TurnActionResult, error) {
 	return a.applyTurnActionResolved(sessionID, turn, action, alsoRevertCode, nil)
 }
@@ -5110,11 +5103,6 @@ func (a *Agent) revertCodeForSession(unit *session, turn int) (snapshot.RevertRe
 	return result, nil
 }
 
-// RevertHistory truncates conversation after the given turn.
-func (a *Agent) RevertHistory(turn int) error {
-	return a.revertHistoryForSession(a.session, turn, nil)
-}
-
 func (a *Agent) RevertHistoryForSession(sessionID string, turn int) error {
 	return a.revertHistoryResolved(sessionID, turn, nil)
 }
@@ -5252,11 +5240,6 @@ func (a *Agent) forkUnitStagedLocked(unit *session, turn int) (*session, error) 
 		a.registerLiveSessionLocked(candidate)
 	}
 	return candidate, nil
-}
-
-// ForkSession creates a new session branched from the given turn.
-func (a *Agent) ForkSession(turn int) error {
-	return a.forkSessionForSession(a.session, turn)
 }
 
 func (a *Agent) ForkSessionForSession(sessionID string, turn int) error {

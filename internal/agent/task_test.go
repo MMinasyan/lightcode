@@ -645,8 +645,8 @@ func TestTaskToolChildStagedEditUsesParentTurnSnapshot(t *testing.T) {
 	if got, err := os.ReadFile(target); err != nil || string(got) != "new" {
 		t.Fatalf("target after child staged edit = %q, %v; want new", got, err)
 	}
-	if _, err := a.ApplyTurnAction(res.Turn, TurnActionRevertCode, false); err != nil {
-		t.Fatalf("ApplyTurnAction revert_code: %v", err)
+	if _, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, res.Turn, TurnActionRevertCode, false); err != nil {
+		t.Fatalf("ApplyTurnActionForSession revert_code: %v", err)
 	}
 	if got, err := os.ReadFile(target); err != nil || string(got) != "old" {
 		t.Fatalf("target after parent revert = %q, %v; want old", got, err)
