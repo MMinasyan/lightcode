@@ -1624,10 +1624,20 @@ func (a *Agent) runSweep() {
 	if a.projects == nil {
 		return
 	}
+	// The sweep runs from the hourly background goroutine (and once at init),
+	// which holds no lock; snapshot the sessions policy under runtime.mu so the
+	// reads cannot race applyReloadStateLocked's write of a.cfg. The directory
+	// sweep itself runs after the lock is released.
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	autoArchive := a.cfg.Sessions.AutoArchive
+	archiveAfterDays := a.cfg.Sessions.ArchiveAfterDays
+	deleteAfterArchiveDays := a.cfg.Sessions.DeleteAfterArchiveDays
+	rt.mu.Unlock()
 	cfg := snapshot.LifecycleConfig{
-		Enabled:                a.cfg.Sessions.AutoArchive,
-		ArchiveAfterDays:       a.cfg.Sessions.ArchiveAfterDays,
-		DeleteAfterArchiveDays: a.cfg.Sessions.DeleteAfterArchiveDays,
+		Enabled:                autoArchive,
+		ArchiveAfterDays:       archiveAfterDays,
+		DeleteAfterArchiveDays: deleteAfterArchiveDays,
 	}
 	var onDelete func(string)
 	if a.memoryHooks != nil {
@@ -1659,7 +1669,15 @@ func (a *Agent) shouldAutoCompactForSession(unit *session) bool {
 	if unit == nil {
 		return false
 	}
-	if !a.cfg.Compaction.Enabled {
+	// Runs on the turn goroutine's model-request hook, which holds no lock;
+	// snapshot the compaction policy under runtime.mu so these reads cannot
+	// race a concurrent session switch's config reload.
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	enabled := a.cfg.Compaction.Enabled
+	thresholdPct := a.cfg.Compaction.ThresholdPct
+	rt.mu.Unlock()
+	if !enabled {
 		return false
 	}
 	unit.tokensMu.Lock()
@@ -1669,7 +1687,7 @@ func (a *Agent) shouldAutoCompactForSession(unit *session) bool {
 	if window <= 0 || used <= 0 {
 		return false
 	}
-	return float64(used)/float64(window) >= a.cfg.Compaction.ThresholdPct
+	return float64(used)/float64(window) >= thresholdPct
 }
 
 // BeforeModelRequest implements the loop context-transform checkpoint.
@@ -1822,7 +1840,13 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 
 	var activeReads []tool.ReadRecord
 	if unit.fileTracker != nil && activeStart < len(messages) {
-		activeReads = activeTailReadRecords(messages[activeStart:], unit.fileTracker.Snapshot(), a.cfg.Tools.ReadMaxLines, unit.projectRoot)
+		// The tools policy is read under runtime.mu: this runs on the turn
+		// goroutine's model-request hook and the explicit compact-now path,
+		// both outside the lock, while a session switch can reload config.
+		rt.mu.Lock()
+		readMaxLines := a.cfg.Tools.ReadMaxLines
+		rt.mu.Unlock()
+		activeReads = activeTailReadRecords(messages[activeStart:], unit.fileTracker.Snapshot(), readMaxLines, unit.projectRoot)
 	}
 
 	if a.memoryHooks != nil {
@@ -2171,7 +2195,28 @@ func (a *Agent) refreshSystemPromptForSession(unit *session) {
 	if unit == nil || unit.lp == nil || a.promptSvc == nil {
 		return
 	}
-	res := a.assembleSystemPromptForSessionLocked(unit)
+	agentType := "primary"
+	if strings.TrimSpace(unit.activeAgentType) != "" {
+		agentType = unit.activeAgentType
+	}
+	// The agents config is written under runtime.mu by a concurrent session
+	// switch (applyReloadStateLocked -> setAgentTypesLocked), and this runs on
+	// the turn goroutine without that lock. Resolve the agent type under
+	// runtime.mu and copy the resolved values out: resolution is a pure
+	// in-memory read, so only it runs under the lock. The resolve context is
+	// built first because the current project id is a durable read, and the
+	// prompt assembly (rules-file I/O) runs after release.
+	ctx := agentcfg.ResolveContext{Home: a.home}
+	if a.projects != nil {
+		if proj, err := a.projects.Current(); err == nil && proj != nil {
+			ctx.ProjectID = proj.ID
+		}
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	resolved, resolveErr := a.resolvedAgentTypeWithContextLocked(agentType, ctx)
+	rt.mu.Unlock()
+	res := a.assembleSystemPromptForSessionResolved(unit, resolved, resolveErr)
 	if res.Prompt != unit.installedPrompt {
 		unit.lp.UpdateSystemPrompt(res.Prompt)
 		unit.installedPrompt = res.Prompt
@@ -2191,8 +2236,22 @@ func (a *Agent) assembleSystemPromptForSessionLocked(unit *session) prompt.Resul
 	if strings.TrimSpace(unit.activeAgentType) != "" {
 		agentType = unit.activeAgentType
 	}
+	resolved, err := a.resolvedAgentTypeLocked(agentType)
+	return a.assembleSystemPromptForSessionResolved(unit, resolved, err)
+}
+
+// assembleSystemPromptForSessionResolved renders the system prompt from an
+// already-resolved agent type. The caller performs the resolution, so an
+// unlocked caller (refreshSystemPromptForSession) can snapshot the resolved
+// values under runtime.mu and release before the rules-file I/O below, while
+// locked callers resolve under their existing hold. The resolved values are a
+// copy, not pointers into the agents config.
+func (a *Agent) assembleSystemPromptForSessionResolved(unit *session, resolved agentcfg.Resolved, resolveErr error) prompt.Result {
+	if unit == nil || a.promptSvc == nil {
+		return prompt.Result{}
+	}
 	spec := prompt.Spec{Size: prompt.SizeFull, Memory: true, Adapt: unit.activeAdapt}
-	if resolved, err := a.resolvedAgentTypeLocked(agentType); err == nil {
+	if resolveErr == nil {
 		spec.Size = resolved.SystemPrompt
 		spec.Body = resolved.Prompt
 		spec.Memory = resolved.Memory
@@ -5839,12 +5898,22 @@ func (a *Agent) resolvedAgentTypeLocked(name string) (agentcfg.Resolved, error) 
 }
 
 func (a *Agent) resolvedAgentTypeForProjectLocked(name string, projectID string) (agentcfg.Resolved, error) {
-	if a.agents == nil {
-		return agentcfg.Resolved{}, fmt.Errorf("agents config is not loaded")
-	}
 	ctx := a.agentResolveContextLocked()
 	if strings.TrimSpace(projectID) != "" {
 		ctx.ProjectID = projectID
+	}
+	return a.resolvedAgentTypeWithContextLocked(name, ctx)
+}
+
+// resolvedAgentTypeWithContextLocked resolves one agent type against the agents
+// config. The config is written under runtime.mu (applyReloadStateLocked ->
+// setAgentTypesLocked), so the caller must hold runtime.mu across this call;
+// resolution is a pure in-memory read returning a value copy, never pointers
+// into the config. The resolve context is prebuilt by the caller so no durable
+// read (the current project id) runs under the lock.
+func (a *Agent) resolvedAgentTypeWithContextLocked(name string, ctx agentcfg.ResolveContext) (agentcfg.Resolved, error) {
+	if a.agents == nil {
+		return agentcfg.Resolved{}, fmt.Errorf("agents config is not loaded")
 	}
 	return a.agents.Resolve(name, ctx)
 }
