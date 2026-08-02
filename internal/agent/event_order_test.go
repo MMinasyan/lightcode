@@ -399,8 +399,8 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		a := newEventOrderAgent(t, server.URL+"/v1")
 		cap := &eventCapture{}
 		ctx := startEventOrderAgent(t, a, cap)
-		if err := a.ensureSession(); err != nil {
-			t.Fatalf("ensureSession: %v", err)
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
 		}
 		a.lp.AddPendingSignal(loop.PendingSignal{Payload: "Model switched to test/test-model", Persist: true})
 		if _, err := a.Submit(ctx, "after switch"); err != nil {
@@ -437,8 +437,8 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		a := newEventOrderAgent(t, server.URL+"/v1")
 		cap := &eventCapture{}
 		ctx := startEventOrderAgent(t, a, cap)
-		if err := a.ensureSession(); err != nil {
-			t.Fatalf("ensureSession: %v", err)
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
 		}
 		a.lp.AddPendingSignal(loop.PendingSignal{Payload: "Model switched to test/test-model", Persist: true})
 		for _, m := range []string{"alpha", "beta"} {
@@ -459,8 +459,8 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		a := newEventOrderAgent(t, server.URL+"/v1")
 		cap := &eventCapture{}
 		ctx := startEventOrderAgent(t, a, cap)
-		if err := a.ensureSession(); err != nil {
-			t.Fatalf("ensureSession: %v", err)
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
 		}
 		bg := &loop.BackgroundProcessDisplay{
 			ID:       "bg-1",
@@ -587,6 +587,11 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		defer server.Close()
 
 		a := newEventOrderAgent(t, server.URL+"/v1")
+		// Bootstrap the session first: newSession builds a fresh loop, so the
+		// fake pending executor must be installed on the live unit's loop.
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
 		a.lp.SetPendingExecutor(fakeAgentPendingExecutor{results: map[string]tool.BatchResult{
 			"call_1": {Success: true, Result: "Edited file.txt (1 replacement, lines 1-1)."},
 		}})
@@ -611,6 +616,9 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		defer server.Close()
 
 		a := newEventOrderAgent(t, server.URL+"/v1")
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
 		a.lp.SetPendingExecutor(fakeAgentPendingExecutor{results: map[string]tool.BatchResult{
 			"call_1": {Success: false, Error: "error: no match"},
 		}})

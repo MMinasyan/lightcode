@@ -191,8 +191,8 @@ func TestQueuedInputWinsOverPendingWakeSignal(t *testing.T) {
 	a := newEventOrderAgent(t, server.URL+"/v1")
 	cap := &eventCapture{}
 	_ = startEventOrderAgent(t, a, cap)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 
 	a.lp.AddPendingSignal(loop.PendingSignal{Payload: "wake signal", Persist: true, Wake: true})
@@ -235,6 +235,9 @@ func TestSubmitRejectsDuringTransition(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
 	cap := &eventCapture{}
 	_ = startEventOrderAgent(t, a, cap)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
 
 	a.ensureRuntime().mu.Lock()
 	a.ensureRuntime().sessionLocked().transitioning = true
@@ -256,8 +259,8 @@ func TestSubmitRejectsDuringTransition(t *testing.T) {
 
 func TestTryDrainQueueCanceledContextDoesNotPersistQueuedDraft(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	a.ensureRuntime().mu.Lock()
 	a.ensureRuntime().sessionLocked().queue = []QueuedItem{{ID: "q-1", Content: "queued draft"}}
@@ -280,8 +283,8 @@ func TestSessionNewClearsQueueAndBumpsVersionMonotonically(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
 	cap := &eventCapture{}
 	_ = startEventOrderAgent(t, a, cap)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 
 	// White-box: seed a non-empty queue at a known version.
@@ -307,16 +310,16 @@ func TestSessionSwitchClearsQueueAndBumpsVersionMonotonically(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
 	cap := &eventCapture{}
 	_ = startEventOrderAgent(t, a, cap)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	appendUserTurn(t, a, "first session turn")
 	firstID := a.store.SessionID()
 	if err := a.SessionNew(); err != nil {
 		t.Fatalf("SessionNew: %v", err)
 	}
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensure second session: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession second session: %v", err)
 	}
 	appendUserTurn(t, a, "second session turn")
 	secondID := a.store.SessionID()
@@ -655,11 +658,15 @@ func TestAutoCompactionBeforeFollowUpPreservesActiveToolTail(t *testing.T) {
 	defer server.Close()
 
 	a := newEventOrderAgent(t, server.URL+"/v1")
-	a.registry.Register(compactionCheckpointTool{})
 	a.memoryHooks = nil
 	cap := &eventCapture{}
 	ctx := startEventOrderAgent(t, a, cap)
-
+	// Bootstrap the session first: newSession builds a fresh registry, so the
+	// checkpoint tool must be registered on the live unit's registry.
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	a.registry.Register(compactionCheckpointTool{})
 	appendUserTurn(t, a, "completed prior turn")
 	a.cfg.Compaction.Enabled = true
 	a.cfg.Compaction.ThresholdPct = 0.50

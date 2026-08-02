@@ -60,6 +60,15 @@ func (rt *runtime) compactNow(ctx context.Context) error {
 // than accepting input it would then discard. Any queue mutation emits a
 // versioned EventQueueChanged.
 func (a *Agent) Submit(ctx context.Context, content string) (SubmitResult, error) {
+	if !a.store.Active() {
+		// Test-only bootstrap: the deleted ensureSession creating branch used to
+		// open a session on first use. Tests reach Submit with a freshly
+		// constructed agent, so route the bootstrap through the real creation
+		// entry point instead.
+		if _, err := a.NewSession("", "primary"); err != nil {
+			return SubmitResult{}, err
+		}
+	}
 	return a.ensureRuntime().submit(ctx, a.session, content)
 }
 

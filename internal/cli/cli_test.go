@@ -19,6 +19,9 @@ import (
 
 func TestCmdClearClearsTerminalRedrawsHeaderAndKeepsMessages(t *testing.T) {
 	a, projectName := newTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
 	if _, err := a.AppendUserMessage("seed"); err != nil {
 		t.Fatalf("seed session: %v", err)
 	}
@@ -152,6 +155,9 @@ func TestHandleTurnEndCancelledDoesNotAppendTranscriptEntry(t *testing.T) {
 
 func TestActiveCompactionRefreshDeferredUntilTurnEnd(t *testing.T) {
 	a, _ := newTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
 	if _, err := a.AppendUserMessage("persisted before compaction"); err != nil {
 		t.Fatalf("seed session: %v", err)
 	}
@@ -199,6 +205,9 @@ func TestActiveCompactionRefreshDeferredUntilTurnEnd(t *testing.T) {
 
 func TestCLIStaleCurrent(t *testing.T) {
 	a, _ := newTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
 	if _, err := a.AppendUserMessage("gone"); err != nil {
 		t.Fatalf("seed session: %v", err)
 	}
@@ -319,6 +328,9 @@ func TestCLISwitchKeepsCurrent(t *testing.T) {
 
 func TestCLISubagentFilter(t *testing.T) {
 	a, _ := newTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
 	if _, err := a.AppendUserMessage("root"); err != nil {
 		t.Fatalf("seed session: %v", err)
 	}
@@ -565,6 +577,9 @@ func TestInlineToolEndStillRewritesInPlace(t *testing.T) {
 
 func TestSubagentBackgroundProcessCompletionRenders(t *testing.T) {
 	a, _ := newTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
 	if _, err := a.AppendUserMessage("root"); err != nil {
 		t.Fatalf("seed session: %v", err)
 	}

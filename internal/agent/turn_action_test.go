@@ -647,6 +647,14 @@ func waitAgentEventKind(t *testing.T, events <-chan Event, kind EventKind) Event
 
 func appendUserTurn(t *testing.T, a *Agent, content string) int {
 	t.Helper()
+	// ensureSession no longer creates a session; bootstrap through the real
+	// creation entry when the agent has none yet (fresh agent or after
+	// SessionNew).
+	if !a.store.Active() {
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+	}
 	// ensureSession registers the live session in a.sessions; production callers
 	// hold the runtime mutex around it, so this helper must too.
 	rt := a.ensureRuntime()
@@ -666,6 +674,11 @@ func appendUserTurn(t *testing.T, a *Agent, content string) int {
 
 func appendUserTurnWithSnapshot(t *testing.T, a *Agent, content, path, after string) int {
 	t.Helper()
+	if !a.store.Active() {
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+	}
 	if err := a.ensureSession(); err != nil {
 		t.Fatalf("ensureSession returned error: %v", err)
 	}
@@ -714,8 +727,8 @@ func equalStrings(a, b []string) bool {
 
 func TestRevertCodeClearsFileTrackerState(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 
 	path := filepath.Join(a.projectRoot, "tracked.txt")
@@ -752,8 +765,8 @@ func TestRevertCodeClearsFileTrackerState(t *testing.T) {
 
 func TestRevertCodeReturnsSkippedFiles(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 
 	path := filepath.Join(a.projectRoot, "tracked.txt")
@@ -783,8 +796,8 @@ func TestRevertCodeReturnsSkippedFiles(t *testing.T) {
 
 func TestApplyTurnActionRevertCodeReportsRestoredFiles(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 
 	path := filepath.Join(a.projectRoot, "tracked.txt")
@@ -816,8 +829,8 @@ func TestApplyTurnActionRevertCodeReportsRestoredFiles(t *testing.T) {
 
 func TestApplyTurnActionRevertCodeReportsSkippedFiles(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 
 	path := filepath.Join(a.projectRoot, "tracked.txt")

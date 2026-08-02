@@ -449,8 +449,8 @@ func TestStagedPermissionOwner(t *testing.T) {
 
 func TestTaskProjectSync(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	projectID := a.session.projectID
 	if projectID == "" {

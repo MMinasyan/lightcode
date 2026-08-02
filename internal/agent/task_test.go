@@ -616,13 +616,20 @@ func TestTaskToolChildStagedEditUsesParentTurnSnapshot(t *testing.T) {
 	defer server.Close()
 
 	a := newEventOrderAgent(t, server.URL+"/v1")
-	a.cfg.Permissions.Allow = []string{"read_file(/**)", "edit_file(/**)", "write_file(/**)"}
 	writeTaskAgentTypes(t, a, `"editor": {
 		"description": "test editor",
 		"tools": ["read_file", "edit_file", "execute_pending"],
 		"prompt": "Test editor.",
 		"subagent": true
 	}`)
+	// Bootstrap the session before mutating permissions: the live unit's
+	// permission policy captures a.cfg at build time, and writeTaskAgentTypes's
+	// Reload replaces a.cfg with a fresh pointer, so the Allow edit must land on
+	// the config the live policy holds.
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	a.cfg.Permissions.Allow = []string{"read_file(/**)", "edit_file(/**)", "write_file(/**)"}
 	target := filepath.Join(a.projectRoot, "target.txt")
 	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
 		t.Fatalf("write target: %v", err)

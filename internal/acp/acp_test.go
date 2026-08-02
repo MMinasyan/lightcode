@@ -1627,6 +1627,13 @@ func newACPTestAgentWithProvider(t *testing.T, baseURL string, discovery bool) *
 
 func appendACPUserTurn(t *testing.T, a *agent.Agent, content string) int {
 	t.Helper()
+	// The removed ensureSession creating branch used to open a session on first
+	// use; bootstrap through the real creation entry when none exists yet.
+	if !a.Store().Active() {
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+	}
 	turn, err := a.AppendUserMessage(content)
 	if err != nil {
 		t.Fatalf("AppendUserMessage: %v", err)

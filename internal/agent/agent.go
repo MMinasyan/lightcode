@@ -2279,40 +2279,11 @@ func (a *Agent) loadTokensFromDiskForSession(unit *session) {
 }
 
 func (a *Agent) ensureSession() error {
-	if a.store.Active() {
-		a.refreshCurrentSessionProjectLocked()
-		a.registerLiveSessionLocked(a.session)
-		if a.currentSessionID == "" {
-			a.currentSessionID = a.store.SessionID()
-		}
-		return nil
+	a.refreshCurrentSessionProjectLocked()
+	a.registerLiveSessionLocked(a.session)
+	if a.currentSessionID == "" {
+		a.currentSessionID = a.store.SessionID()
 	}
-	a.clearActiveModelLocked()
-	if err := a.reloadLocked(); err != nil {
-		return err
-	}
-	proj, err := a.projects.Ensure()
-	if err != nil {
-		return err
-	}
-	if err := a.store.AttachSessionsRoot(a.projects.SessionsRoot(proj.ID), a.projects.Root(), proj.ID); err != nil {
-		return err
-	}
-	if err := a.store.BeginNewSessionStaged(a.projectRoot); err != nil {
-		return err
-	}
-	a.setSessionProject(a.session, proj)
-	a.setCurrentSessionLocked(a.session)
-	if a.currentRef.Provider != "" && a.currentRef.Model != "" {
-		if err := a.store.SetModel(a.currentRef.Provider, a.currentRef.Model); err != nil {
-			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)
-		}
-	}
-	a.lp.ResetHistory()
-	if a.fileTracker != nil {
-		a.fileTracker.Reset()
-	}
-	a.loadTokensFromDisk()
 	return nil
 }
 

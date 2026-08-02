@@ -1021,9 +1021,33 @@ func TestAgentCompleteModelEntryWritesConfigAndReloadsCatalog(t *testing.T) {
 	t.Fatalf("ModelList missing test/incomplete-model after CompleteModelEntry; entries=%#v", entries)
 }
 
-func TestAgentEnsureSessionReloadsExternalConfigEdit(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
-	writeCatalogTestConfig(t, a.home, `{
+// TestAgentResumeReloadsExternalConfigEdit verifies that starting a session
+// from disk (Init → resume) reloads the config, so an external config edit made
+// while the previous owner ran takes effect at the next session start. The
+// deleted ensureSession creating branch used to reload on in-process session
+// creation; the resume path is the remaining session-start flow that reloads.
+// The second owner is constructed before the edit: New loads the catalog from
+// the on-disk config, so the construction load cannot observe the edited
+// config — only the resume-time reloadLocked can.
+func TestAgentResumeReloadsExternalConfigEdit(t *testing.T) {
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+
+	first := newCatalogBackedTestAgentForRoot(t, home, projectRoot)
+	if _, err := first.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	appendUserTurn(t, first, "persisted before restart")
+	// Release the first owner's per-session claim so a fresh owner can resume it.
+	if _, err := first.store.Close(); err != nil {
+		t.Fatalf("release first owner claim: %v", err)
+	}
+
+	// Construct the second owner before editing the config so its catalog is
+	// loaded from the original config; only the resume reload may observe the edit.
+	second := newCatalogBackedTestAgentForRoot(t, home, projectRoot)
+
+	writeCatalogTestConfig(t, home, `{
   "providers": {
     "test": {
       "name": "Test Provider",
@@ -1038,13 +1062,15 @@ func TestAgentEnsureSessionReloadsExternalConfigEdit(t *testing.T) {
   "default_model": "test/test-model"
 }`)
 
-	appendUserTurn(t, a, "hello")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	second.Init(ctx)
 
-	cur := a.CurrentModel()
+	cur := second.CurrentModel()
 	if cur.DisplayName != "Edited Model" || cur.ContextWindow != 24576 {
 		t.Fatalf("CurrentModel after session-start reload = %#v, want edited model", cur)
 	}
-	entries := a.ModelList()
+	entries := second.ModelList()
 	for _, entry := range entries {
 		if entry.Ref == "test/new-session-model" {
 			return

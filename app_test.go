@@ -35,6 +35,9 @@ func TestPR11Closure_AppReadFileContentPropagatesViewerBoundaryRefusal(t *testin
 
 func TestWailsStaleCurrent(t *testing.T) {
 	svc := newAppTestAgent(t)
+	if _, err := svc.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
 	if _, err := svc.AppendUserMessage("gone"); err != nil {
 		t.Fatalf("seed session: %v", err)
 	}
