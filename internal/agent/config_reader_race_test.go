@@ -92,11 +92,137 @@ func TestOwnerConfigReadsRaceFree(t *testing.T) {
 
 	// A turn submitted concurrently with a session reactivation has been
 	// observed to produce overlapping loop runs on one session's loop: two
-	// turn goroutines inside Loop.Run at once. The overlap appears both
-	// through the production SubmitToSession path and through the test-only
-	// Submit helper, which additionally reads the current-session field
-	// without the runtime mutex. The combination is not driven as a subtest
-	// because the race detector trips it intermittently.
+	// turn goroutines inside Loop.Run at once. Reactivation turned out to be
+	// incidental — the mechanism is launchTurn's deferred busy clear firing
+	// after a later turn has already claimed the unit, so concurrent submits
+	// alone expose it. The trigger below forces that interleaving
+	// deterministically instead of sampling for it: turn N is parked in its
+	// model request while the test takes the session transcript's seqMu, so
+	// the turn's final feedTranscript(endEv) — the last step before the
+	// deferred cleanup — blocks; the test then claims turn N+1 while the
+	// deferred is pending and releases the stall. The busy gate must survive
+	// the deferred, or a later submit can launch a second Run on the same
+	// loop.
+
+	t.Run("trigger=submit_while_deferred_clear_pending", func(t *testing.T) {
+		// Deterministic busy-gate regression: a claim sets unit.busy under
+		// runtime.mu and it must stay set until that turn is over. launchTurn's
+		// deferred cleanup once cleared busy unconditionally, so when it fired
+		// after a later turn had claimed the unit it dropped the later turn's
+		// gate. The deferred now clears only its own turn's state, keyed on
+		// the per-turn context the unit holds.
+		//
+		// The model response is payload-only (a MessageExtra field, no
+		// content, no usage): no TextDelta reaches the loop event queue while
+		// seqMu is held, so the drainer stays idle and the flush ack completes
+		// instead of deadlocking on the held transcript lock.
+		releaseRun := make(chan struct{})
+		releaseN1 := make(chan struct{})
+		reqNSeen := make(chan struct{}, 1)
+		reqN1Seen := make(chan struct{}, 1)
+		var runOnce, n1Once sync.Once
+		closeRun := func() { runOnce.Do(func() { close(releaseRun) }) }
+		closeN1 := func() { n1Once.Do(func() { close(releaseN1) }) }
+		t.Cleanup(closeRun)
+		t.Cleanup(closeN1)
+
+		var reqs atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Tools []map[string]any `json:"tools"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			if len(body.Tools) == 0 {
+				writeTextResponse(w, "summary")
+				return
+			}
+			gate := releaseN1
+			seen := reqN1Seen
+			if reqs.Add(1) == 1 {
+				gate = releaseRun
+				seen = reqNSeen
+			}
+			select {
+			case seen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, `data: {"choices":[{"delta":{"role":"assistant","reasoning":"stall"},"finish_reason":"stop"}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		}))
+		t.Cleanup(server.Close)
+
+		a, ctx := newRaceTurnAgent(t, server.URL+"/v1")
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		unit := a.sessions[id]
+
+		// Turn N: submit and park its Run in the model request.
+		resN, err := a.SubmitToSession(ctx, id, "turn N")
+		if err != nil {
+			t.Fatalf("SubmitToSession N: %v", err)
+		}
+		if !resN.Started {
+			t.Fatalf("turn N enqueued instead of starting")
+		}
+		waitForSignal(t, reqNSeen, "turn N model request")
+
+		// Hold the transcript feed lock while Run(N) is parked: the loop event
+		// queues are empty, so nothing else contends on seqMu. When the gate
+		// releases, Run(N) finishes, the turn-end section clears busy and
+		// emits turn_end, and the goroutine parks at feedTranscript(endEv)
+		// with the deferred cleanup pending.
+		unit.transcript.seqMu.Lock()
+		seqMuHeld := true
+		defer func() {
+			if seqMuHeld {
+				unit.transcript.seqMu.Unlock()
+			}
+		}()
+
+		closeRun()
+		waitBusyState(t, a, id, false) // turn N's turn-end section ran; deferred pending
+
+		// Claim turn N+1 while turn N's deferred cleanup is still pending.
+		var resN1 SubmitResult
+		var errN1 error
+		var subWg sync.WaitGroup
+		subWg.Add(1)
+		go func() {
+			defer subWg.Done()
+			resN1, errN1 = a.SubmitToSession(ctx, id, "turn N+1")
+		}()
+		waitBusyState(t, a, id, true) // N+1 claimed; submitter parked at feedTranscript(startEv)
+
+		// Release the stall: the deferred now runs with N+1 holding the unit.
+		unit.transcript.seqMu.Unlock()
+		seqMuHeld = false
+
+		// N+1's Run must be in flight (parked at the second gate) and busy
+		// must stay set — the deferred must not have cleared N+1's gate.
+		waitForSignal(t, reqN1Seen, "turn N+1 model request")
+		assertBusyStaysSet(t, a, id, 500*time.Millisecond)
+
+		closeN1()
+		subWg.Wait()
+		if errN1 != nil {
+			t.Fatalf("SubmitToSession N+1: %v", errN1)
+		}
+		if !resN1.Started {
+			t.Fatalf("turn N+1 enqueued instead of claiming the unit")
+		}
+		waitSessionDrained(t, a, id)
+	})
 
 	t.Run("trigger=sweep_during_reload", func(t *testing.T) {
 		// runSweep is unexported; its production callers are Init's one-shot
@@ -265,4 +391,53 @@ func waitSessionState(t *testing.T, a *Agent, sessionID string, requireEmptyQueu
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatalf("session %s did not become idle", sessionID)
+}
+
+// waitForSignal waits until the given channel is signaled or the deadline
+// passes. Used by the deterministic deferred-clear trigger to sequence the two
+// gated model requests.
+func waitForSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// waitBusyState polls a session's busy flag until it equals want.
+func waitBusyState(t *testing.T, a *Agent, sessionID string, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		busy, err := a.BusyForSession(sessionID)
+		if err != nil {
+			t.Fatalf("BusyForSession: %v", err)
+		}
+		if busy == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("session %s busy = %v, want %v", sessionID, !want, want)
+}
+
+// assertBusyStaysSet polls the session's busy flag for the whole window and
+// fails on the first false sample. Used to prove a claimed turn's busy gate
+// survives a stale deferred cleanup: while the later turn is parked in its
+// model request nothing legitimate can clear busy, so any false sample means
+// the earlier turn's deferred cleanup dropped the later turn's gate.
+func assertBusyStaysSet(t *testing.T, a *Agent, sessionID string, window time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		busy, err := a.BusyForSession(sessionID)
+		if err != nil {
+			t.Fatalf("BusyForSession: %v", err)
+		}
+		if !busy {
+			t.Fatalf("session %s busy dropped to false while its turn is in flight", sessionID)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

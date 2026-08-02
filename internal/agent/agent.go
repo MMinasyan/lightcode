@@ -2829,9 +2829,20 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 	go func() {
 		defer func() {
 			rt.mu.Lock()
-			unit.busy = false
-			unit.turnCancel = nil
-			unit.turnCtx = nil
+			// Clear only this turn's claim. A later turn may have claimed the
+			// unit between this turn's busy clear and this deferred running;
+			// clearing busy then would drop the later turn's gate while its
+			// loop is still running, letting a concurrent submit launch a
+			// second Run on the same loop. The turn-end section above already
+			// cleared busy and nilled the per-turn values in one runtime.mu
+			// section, so this defer acts only when that section never ran
+			// (owner-cancelled early returns) and the unit still holds this
+			// turn's context.
+			if unit.turnCtx == turnCtx {
+				unit.busy = false
+				unit.turnCancel = nil
+				unit.turnCtx = nil
+			}
 			rt.mu.Unlock()
 			cancel()
 			// Unconditionally nudge the queue drainer after every turn end: it
