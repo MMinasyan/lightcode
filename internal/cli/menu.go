@@ -630,6 +630,7 @@ func (c *CLI) showRevertMenu() {
 		result, err := c.agent.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertCode, false)
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
+			c.printRevertSkipped(result)
 			return
 		}
 		c.printLine(renderSystemMsg(fmt.Sprintf("  reverted code to before turn %d", turn)))
@@ -640,6 +641,7 @@ func (c *CLI) showRevertMenu() {
 		result, err := c.agent.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertHistory, alsoCode)
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
+			c.printRevertSkipped(result)
 			return
 		}
 		if result.Session.ID != "" {
@@ -653,6 +655,7 @@ func (c *CLI) showRevertMenu() {
 		result, err := c.agent.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionFork, alsoCode)
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
+			c.printRevertSkipped(result)
 			return
 		}
 		if result.Session.ID != "" {

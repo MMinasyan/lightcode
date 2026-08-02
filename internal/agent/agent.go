@@ -4921,7 +4921,64 @@ func (a *Agent) emitTurnActionBoundaryLocked(unit *session, result TurnActionRes
 	})
 }
 
+// reserveTurnActionUnit reserves a live unit across a durable revert mutation
+// with the same transitioning reservation pair the session-removal path uses:
+// the current unit gets the flag directly, a live non-current unit gets it
+// through beginLiveSessionClose, and endLiveTransition is the release for both.
+// Unlike the removal path it refuses a busy unit instead of cancelling its
+// turn. The release must run after the caller's runtime.mu section ends.
+func (a *Agent) reserveTurnActionUnit(unit *session) (func(), error) {
+	if unit == nil || unit.store == nil || !unit.store.Active() {
+		return nil, snapshot.ErrNoSession
+	}
+	if unit == a.session {
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		defer rt.mu.Unlock()
+		if err := unitMutableLocked(unit); err != nil {
+			return nil, err
+		}
+		unit.transitioning = true
+		return func() { a.endLiveTransition(unit) }, nil
+	}
+	release, err := a.beginLiveSessionClose(sessionIDOf(unit))
+	if err != nil {
+		return nil, err
+	}
+	if release == nil {
+		return nil, fmt.Errorf("session %q is not a live non-current session", sessionIDOf(unit))
+	}
+	return release, nil
+}
+
 func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert)) (TurnActionResult, error) {
+	// The revert cases reserve the unit across their durable mutation with the
+	// same reservation pair the removal path uses: the unit must not be
+	// driveable while its loop state and its durable history disagree (history
+	// truncation) or while its files are mid-restore. The release
+	// (endLiveTransition) is registered before the runtime.mu defer, so it runs
+	// after the lock is dropped and re-arms the drainers. The fork case is not
+	// reserved: it publishes a new session and changes no durable state of the
+	// source unit.
+	var release func()
+	switch action {
+	case TurnActionRevertCode, TurnActionRevertHistory:
+		var err error
+		release, err = a.reserveTurnActionUnit(unit)
+		if err != nil {
+			return TurnActionResult{}, err
+		}
+	}
+	// The release must run on success as well as failure because the unit
+	// stays live after a successful revert; the release is what clears its
+	// transitioning reservation. That is why a successful revert emits one
+	// extra queue-changed event, which is idempotent for consumers.
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
+
 	// fork / revert_history change the session; revert_history clears the queue at
 	// the irreversible store mutation and enqueues the event in the same runtime.mu
 	// section.
@@ -4934,8 +4991,12 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 	if unit == nil || unit.store == nil || !unit.store.Active() {
 		return TurnActionResult{}, snapshot.ErrNoSession
 	}
-	if err := unitMutableLocked(unit); err != nil {
-		return TurnActionResult{}, err
+	// The revert cases were validated by the reservation; the remaining cases
+	// keep the mutable check here (fork re-validates inside its own helper).
+	if action != TurnActionRevertCode && action != TurnActionRevertHistory {
+		if err := unitMutableLocked(unit); err != nil {
+			return TurnActionResult{}, err
+		}
 	}
 	if turn < 1 {
 		return TurnActionResult{}, fmt.Errorf("turn must be >= 1")
@@ -4951,11 +5012,14 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		target := turn - 1
 		result.TargetTurn = target
 		revertResult, err := unit.store.RevertCode(target)
-		if err != nil {
-			return TurnActionResult{}, err
-		}
 		result.RestoredFiles = revertResult.Restored
 		result.SkippedFiles = revertResult.Skipped
+		if err != nil {
+			// Some files may already be restored and some skipped; report the
+			// partial outcome alongside the error.
+			result = a.populateTurnActionResultForSession(unit, result)
+			return result, err
+		}
 		a.resetFileTrackerForSession(unit)
 		return result, nil
 
@@ -4966,14 +5030,18 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		result.SessionChanged = true
 		if alsoRevertCode {
 			revertResult, err := unit.store.RevertCode(target)
-			if err != nil {
-				return TurnActionResult{}, err
-			}
 			result.RestoredFiles = revertResult.Restored
 			result.SkippedFiles = revertResult.Skipped
+			if err != nil {
+				result = a.populateTurnActionResultForSession(unit, result)
+				return result, err
+			}
 		}
 		if err := unit.store.RevertHistory(target); err != nil {
-			return TurnActionResult{}, err
+			// The truncation stopped partway (the store reports where); return
+			// the partial result so the caller can show what happened.
+			result = a.populateTurnActionResultForSession(unit, result)
+			return result, err
 		}
 		// History irreversibly truncated: the queued input no longer applies.
 		_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLockedForSession(unit)
@@ -4981,7 +5049,8 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 			a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
 		}
 		if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
-			return TurnActionResult{}, err
+			result = a.populateTurnActionResultForSession(unit, result)
+			return result, err
 		}
 		a.resetFileTrackerForSession(unit)
 		result = a.populateTurnActionResultForSession(unit, result)
@@ -4994,7 +5063,10 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		result.SessionChanged = true
 		candidate, err := a.forkUnitStagedLocked(unit, target)
 		if err != nil {
-			return TurnActionResult{}, err
+			// The fork never published; the source unit is unchanged, so its
+			// state is still the accurate result payload.
+			result = a.populateTurnActionResultForSession(unit, result)
+			return result, err
 		}
 		// Code revert runs only after the fork is published, so a fork failure
 		// never mutates the working tree. It is best-effort against the source
@@ -5113,6 +5185,17 @@ func (a *Agent) revertHistoryResolved(sessionID string, turn int, emit func(Hydr
 }
 
 func (a *Agent) revertHistoryForSession(unit *session, turn int, emit func(HydrationState, []snapshot.SkippedRevert)) error {
+	// Reserve the unit across the durable truncation with the same reservation
+	// pair the removal path uses, so it cannot be driven while its loop state
+	// and its durable history disagree. The release is registered before the
+	// runtime.mu defer, so it runs after the lock is dropped and re-arms the
+	// drainers.
+	release, err := a.reserveTurnActionUnit(unit)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	var clearedVersion int
 	var queueCleared bool
 	var eventSessionID string
@@ -5121,9 +5204,6 @@ func (a *Agent) revertHistoryForSession(unit *session, turn int, emit func(Hydra
 	defer a.ensureRuntime().mu.Unlock()
 	if unit == nil || unit.store == nil || !unit.store.Active() {
 		return snapshot.ErrNoSession
-	}
-	if err := unitMutableLocked(unit); err != nil {
-		return err
 	}
 	eventSessionID = sessionIDOf(unit)
 	eventProjectID = unit.projectID

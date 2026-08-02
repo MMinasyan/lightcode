@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -312,6 +313,171 @@ func TestSessionLifecycleTransactionContract(t *testing.T) {
 			t.Fatalf("archived sessions = %#v, want only %q", list, firstID)
 		}
 	})
+
+	// shape=C is the revert shape: reserve (transitioning), durable mutation,
+	// release. A revert failing midway must leave the unit live and consistent
+	// afterwards — live, claimed, selected, its loop state untouched, its queue
+	// intact, and the transitioning reservation released so the unit is
+	// driveable again. The failure is injected at a specific turn directory
+	// through filesystem permissions: RevertHistory removes turn dirs strictly
+	// above the target, so an unwritable turn dir fails exactly its removal,
+	// midway through the walk. The subtests assert only that post-failure
+	// state: whether the reservation is held across the durable call is not
+	// observable without production surface that exists only for testing.
+	t.Run("shape=C/case=current_revert_failure_releases_reservation", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("directory permissions do not block writes as root")
+		}
+		home := t.TempDir()
+		projectRoot := t.TempDir()
+		a := newCatalogBackedTestAgentForRoot(t, home, projectRoot)
+		proj, err := a.projects.Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sessionsRoot := a.projects.SessionsRoot(proj.ID)
+		id, err := a.NewSession(proj.ID, "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		loopContents := []string{"turn one", "turn two", "turn three", "turn four"}
+		for _, content := range loopContents {
+			if _, err := a.AppendUserMessageToSession(id, content); err != nil {
+				t.Fatalf("append user turn: %v", err)
+			}
+		}
+		// Revert to before turn 3 (target 2) removes turns 4 and 3; block the
+		// removal of turn 3 so the walk removes turn 4, fails at turn 3, and stops.
+		blockedTurn := filepath.Join(sessionsRoot, id, "turns", "3")
+		if err := os.Chmod(blockedTurn, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = os.Chmod(blockedTurn, 0o700) }()
+
+		// The reservation must be released again after the failure, but whether
+		// it was held across the durable call is not observable here.
+		result, err := a.ApplyTurnActionForSession(id, 3, TurnActionRevertHistory, false)
+		if err == nil {
+			t.Fatal("revert_history succeeded despite the blocked removal; the failure was swallowed")
+		}
+		if !strings.Contains(err.Error(), "revert history turn 3") {
+			t.Fatalf("revert error = %q, want it to name turn 3 where the walk stopped", err.Error())
+		}
+		// The populated result reports what happened alongside the error.
+		if result.Action != TurnActionRevertHistory || result.Turn != 3 || result.TargetTurn != 2 || !result.SessionChanged {
+			t.Fatalf("populated result = %#v, want revert_history to turn 2 with session change", result)
+		}
+		if result.Session.ID != id {
+			t.Fatalf("result session = %q, want %q", result.Session.ID, id)
+		}
+		if got := userContents(result.Messages); !equalStrings(got, loopContents[:3]) {
+			t.Fatalf("result messages = %q, want the surviving turns 1..3 %q", got, loopContents[:3])
+		}
+		// Afterwards the unit is live, claimed, selected, consistent and the
+		// reservation is released.
+		assertCurrentRevertFailureIntact(t, a, id, proj, loopContents)
+	})
+
+	t.Run("shape=C/case=noncurrent_revert_failure_releases_reservation", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("directory permissions do not block writes as root")
+		}
+		home := t.TempDir()
+		projectRoot := t.TempDir()
+		a := newCatalogBackedTestAgentForRoot(t, home, projectRoot)
+		proj, err := a.projects.Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sessionsRoot := a.projects.SessionsRoot(proj.ID)
+		targetID, err := a.NewSession(proj.ID, "primary")
+		if err != nil {
+			t.Fatalf("NewSession target: %v", err)
+		}
+		secondID, err := a.NewSession(proj.ID, "primary")
+		if err != nil {
+			t.Fatalf("NewSession second: %v", err)
+		}
+		if current := a.SessionCurrent().ID; current != secondID {
+			t.Fatalf("current session = %q, want %q", current, secondID)
+		}
+		loopContents := []string{"turn one", "turn two", "turn three", "turn four"}
+		for _, content := range loopContents {
+			if _, err := a.AppendUserMessageToSession(targetID, content); err != nil {
+				t.Fatalf("append user turn: %v", err)
+			}
+		}
+		blockedTurn := filepath.Join(sessionsRoot, targetID, "turns", "3")
+		if err := os.Chmod(blockedTurn, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = os.Chmod(blockedTurn, 0o700) }()
+
+		result, err := a.ApplyTurnActionForSession(targetID, 3, TurnActionRevertHistory, false)
+		if err == nil {
+			t.Fatal("revert_history succeeded despite the blocked removal; the failure was swallowed")
+		}
+		if !strings.Contains(err.Error(), "revert history turn 3") {
+			t.Fatalf("revert error = %q, want it to name turn 3 where the walk stopped", err.Error())
+		}
+		if result.Action != TurnActionRevertHistory || result.Turn != 3 || result.TargetTurn != 2 || !result.SessionChanged {
+			t.Fatalf("populated result = %#v, want revert_history to turn 2 with session change", result)
+		}
+		if result.Session.ID != targetID {
+			t.Fatalf("result session = %q, want %q", result.Session.ID, targetID)
+		}
+		if got := userContents(result.Messages); !equalStrings(got, loopContents[:3]) {
+			t.Fatalf("result messages = %q, want the surviving turns 1..3 %q", got, loopContents[:3])
+		}
+		// Afterwards the target is live, claimed, consistent, the reservation is
+		// released, and the current selection is unchanged. Whether the
+		// reservation was held across the durable call is not observable here.
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[targetID]
+		if unit == nil {
+			rt.mu.Unlock()
+			t.Fatal("failed revert evicted the non-current session from the live map")
+		}
+		transitioning := unit.transitioning
+		queueLen := len(unit.queue)
+		loopMsgs := len(unit.lp.Messages())
+		rt.mu.Unlock()
+		if unit.store == nil || !unit.store.Active() || unit.store.SessionID() != targetID {
+			t.Fatal("failed revert detached the target session's store")
+		}
+		if transitioning {
+			t.Fatal("transitioning reservation not released after failed revert")
+		}
+		if queueLen != 0 {
+			t.Fatalf("queue length after failed revert = %d, want 0", queueLen)
+		}
+		if loopMsgs != len(loopContents)+1 {
+			t.Fatalf("loop message count = %d, want %d (system prompt + %d user turns; the loop was never reloaded)", loopMsgs, len(loopContents)+1, len(loopContents))
+		}
+		msgs, err := a.SessionMessagesFor(targetID)
+		if err != nil {
+			t.Fatalf("messages for %q: %v", targetID, err)
+		}
+		if got := userContents(msgs); !equalStrings(got, loopContents[:3]) {
+			t.Fatalf("durable messages after failed revert = %q, want the surviving turns 1..3 %q", got, loopContents[:3])
+		}
+		if err := unitMutableLocked(unit); err != nil {
+			t.Fatalf("target unit not driveable after failed revert: %v", err)
+		}
+		if got := a.SessionCurrent().ID; got != secondID {
+			t.Fatalf("SessionCurrent = %q, want unchanged %q", got, secondID)
+		}
+		// The live store still holds the target's claim.
+		claim, ok, err := snapshot.AcquireSessionClaim(a.projects.Root(), proj.ID, targetID)
+		if err != nil {
+			t.Fatalf("claim check: %v", err)
+		}
+		if ok {
+			_ = claim.Release()
+			t.Fatal("claim released by the failed revert; another process could drive the session")
+		}
+	})
 }
 
 // seedUnitQueue plants a queue item on a live unit. The volatile queue has no
@@ -375,6 +541,67 @@ func assertCurrentRemovalFailureIntact(t *testing.T, a *Agent, id string, proj *
 	if ok {
 		_ = claim.Release()
 		t.Fatal("claim released by the failed removal; another process could drive the session")
+	}
+}
+
+// assertCurrentRevertFailureIntact asserts that a failed current-session
+// revert left the unit live, claimed, selected and consistent: the durable
+// history is truncated only as far as the walk reached (all but the last
+// contents), the loop was never reloaded, and the transitioning reservation is
+// released so the unit is driveable again.
+func assertCurrentRevertFailureIntact(t *testing.T, a *Agent, id string, proj *project.Project, loopContents []string) {
+	t.Helper()
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	unit := a.sessions[id]
+	if unit == nil {
+		rt.mu.Unlock()
+		t.Fatal("failed revert evicted the current session from the live map")
+	}
+	transitioning := unit.transitioning
+	queueLen := len(unit.queue)
+	loopMsgs := len(unit.lp.Messages())
+	current := a.currentSessionID
+	rt.mu.Unlock()
+	if unit.store == nil || !unit.store.Active() {
+		t.Fatal("failed revert detached the current session's store")
+	}
+	if unit.store.SessionID() != id {
+		t.Fatalf("store session id = %q, want %q", unit.store.SessionID(), id)
+	}
+	if current != id {
+		t.Fatalf("currentSessionID = %q, want %q", current, id)
+	}
+	if got := a.SessionCurrent().ID; got != id {
+		t.Fatalf("SessionCurrent = %q, want %q", got, id)
+	}
+	if transitioning {
+		t.Fatal("transitioning reservation not released after failed revert")
+	}
+	if queueLen != 0 {
+		t.Fatalf("queue length after failed revert = %d, want 0", queueLen)
+	}
+	if loopMsgs != len(loopContents)+1 {
+		t.Fatalf("loop message count = %d, want %d (system prompt + %d user turns; the loop was never reloaded)", loopMsgs, len(loopContents)+1, len(loopContents))
+	}
+	msgs, err := a.SessionMessagesFor(id)
+	if err != nil {
+		t.Fatalf("messages for %q: %v", id, err)
+	}
+	if got := userContents(msgs); !equalStrings(got, loopContents[:len(loopContents)-1]) {
+		t.Fatalf("durable messages after failed revert = %q, want the surviving turns 1..%d %q", got, len(loopContents)-1, loopContents[:len(loopContents)-1])
+	}
+	if err := unitMutableLocked(unit); err != nil {
+		t.Fatalf("unit not driveable after failed revert: %v", err)
+	}
+	// The live store still holds the session's claim.
+	claim, ok, err := snapshot.AcquireSessionClaim(a.projects.Root(), proj.ID, id)
+	if err != nil {
+		t.Fatalf("claim check: %v", err)
+	}
+	if ok {
+		_ = claim.Release()
+		t.Fatal("claim released by the failed revert; another process could drive the session")
 	}
 }
 

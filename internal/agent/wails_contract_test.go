@@ -191,6 +191,64 @@ func TestTurnActionAppliesDestinationStateThroughOrderedBoundary(t *testing.T) {
 	}
 }
 
+// TestAdapterRevertOutcomeContract pins what each host renders when a revert
+// fails midway. Only the terminal host renders the skipped set, on every
+// failure branch: ApplyTurnActionForSession returns the populated result
+// alongside the error, and the CLI prints the skipped set before returning.
+// The desktop host cannot receive a result on a failing call at all — its
+// binding layer attaches the return value only on success, and that layer is
+// vendored — and the protocol host answers with an error string. Both
+// therefore surface the enriched error text naming where the revert stopped,
+// not the skipped set, and no plumbing exists to carry the skipped set to
+// them.
+func TestAdapterRevertOutcomeContract(t *testing.T) {
+	menu := mustReadContractFile(t, filepath.Join("..", "cli", "menu.go"))
+	for _, action := range []string{`"code"`, `"history"`, `"fork"`} {
+		body := extractSwitchCase(t, menu, "case "+action+":")
+		errIdx := strings.Index(body, "if err != nil {")
+		if errIdx < 0 {
+			t.Fatalf("CLI revert menu %s case has no error branch:\n%s", action, body)
+		}
+		retIdx := strings.Index(body[errIdx:], "return")
+		if retIdx < 0 {
+			t.Fatalf("CLI revert menu %s error branch has no return:\n%s", action, body)
+		}
+		errBranch := body[errIdx : errIdx+retIdx]
+		if !strings.Contains(errBranch, "c.printRevertSkipped(result)") {
+			t.Fatalf("CLI revert menu %s error branch must render the skipped set before returning:\n%s", action, errBranch)
+		}
+	}
+
+	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
+	body, ok := extractSvelteFunctionBody(app, "func (a *App) ApplyTurnAction(")
+	if !ok {
+		t.Fatal("ApplyTurnAction not found in app.go")
+	}
+	if !strings.Contains(body, "return result, err") {
+		t.Fatal("ApplyTurnAction must return the populated result alongside the error; the desktop binding attaches the return value only on success, so a failing call surfaces only the enriched error text naming where the revert stopped")
+	}
+
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	for _, fn := range []string{"async function handleRevertCode(", "async function handleRevertHistory(", "async function handleFork("} {
+		fnBody, ok := extractSvelteFunctionBody(svelte, fn)
+		if !ok {
+			t.Fatalf("%s not found in App.svelte", fn)
+		}
+		if !strings.Contains(fnBody, "showError(err)") {
+			t.Fatalf("%s must render the enriched error text (naming where the revert stopped) via showError", fn)
+		}
+	}
+
+	acp := mustReadContractFile(t, filepath.Join("..", "acp", "acp.go"))
+	acpBody, ok := extractSvelteFunctionBody(acp, "func (r *Runner) handleTurnAction(")
+	if !ok {
+		t.Fatal("handleTurnAction not found in acp.go")
+	}
+	if !strings.Contains(acpBody, "r.respondError(req.ID, -32000, err.Error())") {
+		t.Fatal("handleTurnAction must carry the enriched error string (naming where the revert stopped) in the protocol error response")
+	}
+}
+
 // TestWailsModelSwitchAppendsOrderedPresentationItem proves a root-model switch
 // updates the selector through an ordered, presentation-scoped item, not an
 // out-of-band immediate update: SwitchModel appends a model item to the FIFO, the

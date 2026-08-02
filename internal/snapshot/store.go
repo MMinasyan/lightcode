@@ -1069,10 +1069,24 @@ func (s *Store) RevertHistory(toTurn int) error {
 	if toTurn < 0 {
 		toTurn = 0
 	}
+	// Walk descending and stop at the first failed removal, exactly like
+	// RevertCode: the load path reads complete turns by scanning completion
+	// markers with no upper bound, so a surviving turn directory above the
+	// recorded truncation point would be re-read after a reload and the
+	// reverted turn would come back. The truncation point is therefore lowered
+	// only as far as removal actually reached — the failed turn survives, so
+	// the recorded point stops at it.
 	msgTurns := readIntDirs(s.turnsDir)
-	for _, t := range msgTurns {
-		if t > toTurn {
-			_ = os.RemoveAll(filepath.Join(s.turnsDir, strconv.Itoa(t)))
+	for i := len(msgTurns) - 1; i >= 0; i-- {
+		t := msgTurns[i]
+		if t <= toTurn {
+			break
+		}
+		if err := os.RemoveAll(filepath.Join(s.turnsDir, strconv.Itoa(t))); err != nil {
+			if t < s.currentTurn {
+				s.currentTurn = t
+			}
+			return fmt.Errorf("snapshot: revert history turn %d: %w", t, err)
 		}
 	}
 	if toTurn >= 0 && toTurn < s.currentTurn {
