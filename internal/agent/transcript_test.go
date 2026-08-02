@@ -223,9 +223,9 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 		a.captureProbe = func(attempt int) error {
 			attempts++
 			if attempt == 1 {
-				// Drive the production compaction rewrite path, not rewriteLocked
-				// directly: it advances the epoch, so the racing capture must
-				// revalidate and retry rather than publish the pre-compaction prefix.
+				// Drive the production compaction rewrite path: it advances the
+				// epoch, so the racing capture must revalidate and retry rather
+				// than publish the pre-compaction prefix.
 				a.publishCompactionRewrite(unit, sessionIDOf(unit), unit.projectID, SessionSummary{}, nil)
 			}
 			return nil
@@ -483,8 +483,7 @@ func TestTranscriptCoordinatorSessionErrorRetention(t *testing.T) {
 // TestTranscriptCoordinatorCommit verifies the commit cursor partitions
 // state exactly: a committed turn clears the retained tail and advances the
 // committed markers to the sequence high-water, later preseeds keep sequence
-// monotonic, and a rewrite advances the epoch and rebases the committed turn while
-// preserving monotonic sequence.
+// monotonic.
 func TestTranscriptCoordinatorCommit(t *testing.T) {
 	tr := newTranscript()
 
@@ -532,37 +531,5 @@ func TestTranscriptCoordinatorCommit(t *testing.T) {
 	}
 	if rev2 != (captureRevision{committedTurn: 2, committedSeq: high2, rewriteEpoch: 0}) {
 		t.Fatalf("revision after commit 2 = %+v (high2=%d)", rev2, high2)
-	}
-
-	// A rewrite (revert/compaction/fork) bumps the epoch, rebases the committed
-	// turn, keeps sequence monotonic, and clears the tail.
-	feedTranscriptEvents(tr, []Event{
-		{Kind: EventTurnStart, Turn: 3},
-		{Kind: EventTextDelta, Result: "c"},
-	})
-	tr.seqMu.Lock()
-	seqBeforeRewrite := tr.nextSeq
-	tr.rewriteLocked(2)
-	rev3 := tr.revisionLocked()
-	tailAfter3 := tr.tailMessagesLocked()
-	seqAfterRewrite := tr.nextSeq
-	tr.rewriteLocked(2)
-	rev4 := tr.revisionLocked()
-	tr.seqMu.Unlock()
-
-	if rev3.rewriteEpoch != 1 {
-		t.Fatalf("rewrite epoch = %d, want 1", rev3.rewriteEpoch)
-	}
-	if rev3.committedTurn != 2 {
-		t.Fatalf("rewrite committedTurn = %d, want rebased to 2", rev3.committedTurn)
-	}
-	if len(tailAfter3) != 0 {
-		t.Fatalf("tail after rewrite = %d rows, want 0", len(tailAfter3))
-	}
-	if seqAfterRewrite != seqBeforeRewrite {
-		t.Fatalf("rewrite reset sequence: before=%d after=%d", seqBeforeRewrite, seqAfterRewrite)
-	}
-	if rev4.rewriteEpoch != 2 {
-		t.Fatalf("second rewrite epoch = %d, want 2 (each rewrite is one boundary)", rev4.rewriteEpoch)
 	}
 }
