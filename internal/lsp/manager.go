@@ -85,7 +85,7 @@ func (m *Manager) startServer(ctx context.Context, def *server.Definition) {
 			name, strings.Join(def.Extensions, ", ")))
 	})
 
-	if err := inst.start(ctx); err != nil {
+	if _, err := inst.start(ctx); err != nil {
 		m.emitWarning("lsp_server_unavailable",
 			fmt.Sprintf("Failed to start %s: %v", def.Name, err))
 		return
