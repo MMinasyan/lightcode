@@ -145,6 +145,15 @@ type Agent struct {
 	// read to deterministically inject a revision change or a read error; nil in
 	// production.
 	captureProbe func(attempt int) error
+
+	// durableReadHook is a test seam invoked immediately before each observed
+	// durable I/O at the four owner-lock sites: the fork staging tree copy
+	// (which must run outside runtime.mu), resume's listing/history loads
+	// (which run under lifecycleMu), the tokens file read (outside the unit's
+	// tokensMu), and the tokens file write (inside the unit's tokensMu). The
+	// seam is nil in production; tests swap it to assert each I/O's position
+	// relative to its site's owner lock.
+	durableReadHook func()
 }
 
 type agentSignalSink interface {
@@ -1541,6 +1550,10 @@ func (a *Agent) recordUsageForSession(unit *session, ev loop.Event) {
 	if ev.UsageKnown {
 		unit.lastContextUsed = ev.Cache + ev.Input
 	}
+	// Persist the snapshot inside the same tokensMu section that mutated the
+	// entries: the marshal cannot be hoisted ahead of the lock, and the file
+	// write is small and local, so writing it inside the section keeps two
+	// concurrent writers from landing their snapshots in the opposite order.
 	a.persistTokensForSessionLocked(unit)
 	report := a.buildReportForSessionLocked(unit)
 	// Enqueue the usage event inside the tokensMu section that produced the report,
@@ -1585,10 +1598,12 @@ func (a *Agent) buildReportForSessionLocked(unit *session) TokenReport {
 	}
 }
 
-func (a *Agent) persistTokensLocked() {
-	a.persistTokensForSessionLocked(a.session)
-}
-
+// persistTokensForSessionLocked serializes the unit's token entries and
+// durably writes them to the session's tokens file. Caller holds
+// unit.tokensMu: the entries are mutated inside the caller's same section, so
+// the marshal cannot be hoisted ahead of the lock, and the small local write
+// stays inside the section so concurrent writers cannot land their snapshots
+// out of order.
 func (a *Agent) persistTokensForSessionLocked(unit *session) {
 	if unit == nil || unit.store == nil || !unit.store.Active() {
 		return
@@ -1601,8 +1616,8 @@ func (a *Agent) persistTokensForSessionLocked(unit *session) {
 	if err != nil {
 		return
 	}
-	data = append(data, '\n')
-	_ = os.WriteFile(filepath.Join(unit.store.Dir(), tokensFileName), data, 0o600)
+	a.fireDurableReadHook()
+	_ = os.WriteFile(filepath.Join(unit.store.Dir(), tokensFileName), append(data, '\n'), 0o600)
 }
 
 func (a *Agent) runSweep() {
@@ -2001,6 +2016,12 @@ func (a *Agent) resumeMostRecent() error {
 	if err := a.store.AttachSessionsRoot(sessionsRoot, a.projects.Root(), proj.ID); err != nil {
 		return err
 	}
+	// Candidate enumeration and loading run under the lifecycle lock: the
+	// listing and history reads are durable and fallible, but re-validating
+	// every candidate after a hoisted read would require machinery this path
+	// does not have, so the reads stay where the lifecycle lock already
+	// excludes concurrent lifecycle operations.
+	a.fireDurableReadHook()
 	candidates, err := snapshot.List(sessionsRoot, "", snapshot.StateActive)
 	if err != nil {
 		return err
@@ -2014,9 +2035,11 @@ func (a *Agent) resumeMostRecent() error {
 		// Try active root sessions newest-first. A contended, corrupt, or
 		// unreadable candidate, or one whose history fails to load, releases its
 		// provisional claim and does not stop the scan.
+		a.fireDurableReadHook()
 		if err := a.store.LoadSession(info.ID); err != nil {
 			continue
 		}
+		a.fireDurableReadHook()
 		if err := a.loadHistoryIntoLoop(); err != nil {
 			a.store.Detach()
 			continue
@@ -2197,24 +2220,26 @@ func (a *Agent) restoreModelFromSessionForSession(unit *session) {
 	a.setActiveModelForSessionLocked(unit, ref, client, model)
 }
 
-// inheritActiveModelLocked gives the fork the source unit's live active model,
-// preferring the in-memory selection over persisted metadata so an unpersisted
-// model switch is not lost, and persists it into the candidate so the fork
-// reopens on the same model. A source with no live selection keeps the persisted
-// model. Reconstruction or persistence of a live selection fails the fork before
+// inheritActiveModelForForkedSession gives the fork candidate the source
+// unit's live active model, preferring the in-memory selection over persisted
+// metadata so an unpersisted model switch is not lost, and persists it into
+// the candidate so the fork reopens on the same model. srcRef is the source's
+// currentRef snapshotted under rt.mu by the caller in the fork's first lock
+// half (currentRef is rt.mu-guarded) and consumed in the re-acquired commit
+// half. A source with no live selection keeps the persisted model.
+// Reconstruction or persistence of a live selection fails the fork before
 // publication rather than silently substituting a different model.
-func (a *Agent) inheritActiveModelLocked(candidate, source *session) error {
-	ref := source.currentRef
-	if ref.Provider == "" || ref.Model == "" {
+func (a *Agent) inheritActiveModelForForkedSession(candidate *session, srcRef coremodel.ModelRef) error {
+	if srcRef.Provider == "" || srcRef.Model == "" {
 		a.restoreModelFromSessionForSession(candidate)
 		return nil
 	}
-	client, model, err := newProviderClient(a.catalog, ref)
+	client, model, err := newProviderClient(a.catalog, srcRef)
 	if err != nil {
-		return fmt.Errorf("fork model %s/%s: %w", ref.Provider, ref.Model, err)
+		return fmt.Errorf("fork model %s/%s: %w", srcRef.Provider, srcRef.Model, err)
 	}
-	a.setActiveModelForSessionLocked(candidate, ref, client, model)
-	if err := candidate.store.SetModel(ref.Provider, ref.Model); err != nil {
+	a.setActiveModelForSessionLocked(candidate, srcRef, client, model)
+	if err := candidate.store.SetModel(srcRef.Provider, srcRef.Model); err != nil {
 		return fmt.Errorf("fork persist model: %w", err)
 	}
 	return nil
@@ -2270,22 +2295,35 @@ func (a *Agent) loadTokensFromDisk() {
 	a.loadTokensFromDiskForSession(a.session)
 }
 
+// fireDurableReadHook invokes the durableReadHook test seam when installed.
+// The seam is nil in production, so every observation point guards through
+// this helper.
+func (a *Agent) fireDurableReadHook() {
+	if a.durableReadHook != nil {
+		a.durableReadHook()
+	}
+}
+
 func (a *Agent) loadTokensFromDiskForSession(unit *session) {
 	if unit == nil {
 		return
 	}
+	// Read the tokens file before taking the tokens mutex: the read is durable
+	// and fallible and must not run while the mutex is held. The parsed entries
+	// replace unit.tokens atomically under the mutex.
+	var entries []TokenEntry
+	valid := false
+	if unit.store != nil && unit.store.Active() {
+		a.fireDurableReadHook()
+		data, err := os.ReadFile(filepath.Join(unit.store.Dir(), tokensFileName))
+		if err == nil {
+			valid = json.Unmarshal(data, &entries) == nil
+		}
+	}
 	unit.tokensMu.Lock()
 	defer unit.tokensMu.Unlock()
 	unit.tokens = map[string]*TokenEntry{}
-	if unit.store == nil || !unit.store.Active() {
-		return
-	}
-	data, err := os.ReadFile(filepath.Join(unit.store.Dir(), tokensFileName))
-	if err != nil {
-		return
-	}
-	var entries []TokenEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
+	if !valid {
 		return
 	}
 	for i := range entries {
@@ -4036,7 +4074,7 @@ func (a *Agent) newSession(projectID string, agentType string, emit func(Hydrati
 	}
 	// Prepare the candidate under an unlisted staging directory and run every
 	// fallible step against the not-yet-published session before the durable
-	// commit, mirroring forkUnitStagedLocked. From here until publish the
+	// commit, mirroring the fork's staged preparation. From here until publish the
 	// receiver (store) is mid-transaction: active, bound to the final location,
 	// and holding the session's claim, while the returned prepared store carries
 	// no claim of its own and addresses the candidate under staging. The single
@@ -5019,9 +5057,17 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		}
 	}()
 
-	// fork / revert_history change the session; revert_history clears the queue at
-	// the irreversible store mutation and enqueues the event in the same runtime.mu
-	// section.
+	// The fork case runs outside the locked body below: its durable tree copy
+	// must run with rt.mu released, so the fork manages its own lock split and
+	// validations (see forkUnitAtTurn).
+	if action == TurnActionFork {
+		return a.applyForkTurnAction(unit, turn, alsoRevertCode, emit)
+	}
+
+	// The remaining actions (the reverts) change the session; revert_history
+	// clears the queue at the irreversible store mutation and enqueues the
+	// event in the same runtime.mu section. Both were validated by the
+	// reservation.
 	var clearedVersion int
 	var queueCleared bool
 	var eventSessionID string
@@ -5030,13 +5076,6 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 	defer a.ensureRuntime().mu.Unlock()
 	if unit == nil || unit.store == nil || !unit.store.Active() {
 		return TurnActionResult{}, snapshot.ErrNoSession
-	}
-	// The revert cases were validated by the reservation; the remaining cases
-	// keep the mutable check here (fork re-validates inside its own helper).
-	if action != TurnActionRevertCode && action != TurnActionRevertHistory {
-		if err := unitMutableLocked(unit); err != nil {
-			return TurnActionResult{}, err
-		}
 	}
 	if turn < 1 {
 		return TurnActionResult{}, fmt.Errorf("turn must be >= 1")
@@ -5097,37 +5136,51 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		a.emitTurnActionBoundaryLocked(unit, result, emit)
 		return result, nil
 
-	case TurnActionFork:
-		target := turn
-		result.TargetTurn = target
-		result.SessionChanged = true
-		candidate, err := a.forkUnitStagedLocked(unit, target)
-		if err != nil {
-			// The fork never published; the source unit is unchanged, so its
-			// state is still the accurate result payload.
-			result = a.populateTurnActionResultForSession(unit, result)
-			return result, err
-		}
-		// Code revert runs only after the fork is published, so a fork failure
-		// never mutates the working tree. It is best-effort against the source
-		// store, which retains the post-target snapshots needed to undo later
-		// changes: a revert error keeps the partial result rather than failing
-		// the already-committed fork.
-		if alsoRevertCode {
-			revertResult, revertErr := unit.store.RevertCode(target)
-			result.RestoredFiles = revertResult.Restored
-			result.SkippedFiles = revertResult.Skipped
-			if revertErr != nil {
-				fmt.Fprintf(os.Stderr, "lightcode: fork code revert: %v\n", revertErr)
-			}
-		}
-		result = a.populateTurnActionResultForSession(candidate, result)
-		a.emitTurnActionBoundaryLocked(candidate, result, emit)
-		return result, nil
-
 	default:
 		return TurnActionResult{}, fmt.Errorf("unknown turn action %q", action)
 	}
+}
+
+// applyForkTurnAction applies the fork turn action. It runs outside
+// applyTurnActionForSession's locked body because the fork's durable tree copy
+// must run with rt.mu released; the fork manages its own lock split and
+// validations (see forkUnitAtTurn). The caller holds lifecycleMu. The code
+// revert, when requested, runs only after the fork is published, so a fork
+// failure never mutates the working tree; it is best-effort against the source
+// store, which retains the post-target snapshots needed to undo later changes:
+// a revert error keeps the partial result rather than failing the
+// already-committed fork.
+func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert)) (TurnActionResult, error) {
+	result := TurnActionResult{Action: TurnActionFork, Turn: turn}
+	result.TargetTurn = turn
+	result.SessionChanged = true
+	if turn < 1 {
+		return TurnActionResult{}, fmt.Errorf("turn must be >= 1")
+	}
+	candidate, err := a.forkUnitAtTurn(unit, turn)
+	if err != nil {
+		// The fork never published; the source unit is unchanged, so its
+		// state is still the accurate result payload.
+		result = a.populateTurnActionResultForSession(unit, result)
+		return result, err
+	}
+	result = a.populateTurnActionResultForSession(candidate, result)
+	// The revert and the in-commit boundary both run under rt.mu; the result
+	// payload above was built before the lock so no durable read runs inside
+	// it.
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if alsoRevertCode {
+		revertResult, revertErr := unit.store.RevertCode(turn)
+		result.RestoredFiles = revertResult.Restored
+		result.SkippedFiles = revertResult.Skipped
+		if revertErr != nil {
+			fmt.Fprintf(os.Stderr, "lightcode: fork code revert: %v\n", revertErr)
+		}
+	}
+	a.emitTurnActionBoundaryLocked(candidate, result, emit)
+	return result, nil
 }
 
 func turnActionVerb(action string) string {
@@ -5276,38 +5329,100 @@ func cleanupStaging(stagingRoot string, cause error) error {
 	return cause
 }
 
-// forkUnitStagedLocked forks unit at the given turn through staged publication.
-// The source session is copied into an unlisted staging directory and loaded
-// through a separate candidate store while the source stays live and claimed.
-// The single durable commit is the atomic rename of the validated candidate
-// into the session namespace; only then is the new fork registered as its own
-// live unit and, when the source was current, selected. Any preparation or
-// rename failure leaves the source unchanged and removes only its staging
-// directory. Caller holds rt.mu.
-func (a *Agent) forkUnitStagedLocked(unit *session, turn int) (*session, error) {
+// forkUnitAtTurn forks unit at turn through the split shape: the source is
+// validated and the copy inputs snapshotted under rt.mu, the durable tree copy
+// into staging runs with rt.mu released, then rt.mu is re-acquired and — only
+// after the source is re-validated — the candidate is built and published.
+// Each lock half's unlock is deferred within its own scope, so a panic cannot
+// leave the bracket unbalanced. The caller holds lifecycleMu; any failure
+// removes only the staging directory and leaves the source unchanged.
+func (a *Agent) forkUnitAtTurn(unit *session, turn int) (*session, error) {
+	rt := a.ensureRuntime()
+
+	// First half: validate the source and snapshot the copy inputs under rt.mu.
+	sessionID, sessionsRoot, srcRef, err := func() (string, string, coremodel.ModelRef, error) {
+		rt.mu.Lock()
+		defer rt.mu.Unlock()
+		return a.forkSnapshotSourceLocked(unit)
+	}()
+	if err != nil {
+		return nil, err
+	}
+
+	// The released section: only the durable tree copy runs without rt.mu.
+	stagingRoot, newID, err := a.forkCopyTree(unit, sessionsRoot, turn)
+	if err != nil {
+		return nil, err
+	}
+
+	// Second half: re-acquire rt.mu, re-validate the source, then build and
+	// publish the candidate.
+	return func() (*session, error) {
+		rt.mu.Lock()
+		defer rt.mu.Unlock()
+		return a.forkCommitStagedLocked(unit, sessionID, sessionsRoot, srcRef, stagingRoot, newID)
+	}()
+}
+
+// forkSnapshotSourceLocked validates the source and snapshots the fork inputs
+// under rt.mu: the source session id and sessions root (the copy destination)
+// and the source's live model ref (currentRef is rt.mu-guarded). Caller holds
+// rt.mu.
+func (a *Agent) forkSnapshotSourceLocked(unit *session) (sessionID, sessionsRoot string, srcRef coremodel.ModelRef, err error) {
 	if unit == nil || unit.store == nil || !unit.store.Active() {
+		return "", "", coremodel.ModelRef{}, snapshot.ErrNoSession
+	}
+	if err := unitMutableLocked(unit); err != nil {
+		return "", "", coremodel.ModelRef{}, err
+	}
+	return unit.store.SessionID(), unit.store.Root(), unit.currentRef, nil
+}
+
+// forkCopyTree copies the source session's tree into a fresh unlisted staging
+// root. It is the fork's only hoisted durable I/O and runs with rt.mu
+// released; its inputs were snapshotted under rt.mu by the caller. Returns the
+// new session id and the staging root; the source store stays authoritative.
+func (a *Agent) forkCopyTree(unit *session, sessionsRoot string, turn int) (stagingRoot, newID string, err error) {
+	stagingRoot, err = snapshot.NewStagingSessionsRoot(sessionsRoot)
+	if err != nil {
+		return "", "", err
+	}
+	a.fireDurableReadHook()
+	newID, _, err = unit.store.ForkInto(turn, stagingRoot)
+	if err != nil {
+		return "", "", cleanupStaging(stagingRoot, err)
+	}
+	return stagingRoot, newID, nil
+}
+
+// forkCommitStagedLocked re-validates the source under rt.mu — the copy ran
+// without it, so a concurrent close, replacement, or turn start may have made
+// the source unforkable — and only then builds the candidate from the staged
+// copy and publishes it with the single atomic rename into the session
+// namespace, registering the fork as its own live unit and selecting it when
+// the source was current. The source is still authoritative until the rename
+// succeeds; any failure leaves the source unchanged and removes only its
+// staging directory. Caller holds rt.mu.
+func (a *Agent) forkCommitStagedLocked(unit *session, sessionID, sessionsRoot string, srcRef coremodel.ModelRef, stagingRoot, newID string) (*session, error) {
+	// Re-validate the source before committing on the staged copy: the source
+	// was validated and snapshotted under rt.mu before the copy released it,
+	// so never commit on state read before the release.
+	if unit == nil || unit.store == nil || !unit.store.Active() {
+		return nil, snapshot.ErrNoSession
+	}
+	if unit.store.SessionID() != sessionID {
 		return nil, snapshot.ErrNoSession
 	}
 	if err := unitMutableLocked(unit); err != nil {
 		return nil, err
 	}
-	oldID := unit.store.SessionID()
-	sessionsRoot := unit.store.Root()
-	stagingRoot, err := snapshot.NewStagingSessionsRoot(sessionsRoot)
-	if err != nil {
-		return nil, err
-	}
-	// Copy the source into staging; the source store stays authoritative.
-	newID, _, err := unit.store.ForkInto(turn, stagingRoot)
-	if err != nil {
-		return nil, cleanupStaging(stagingRoot, err)
-	}
 	// Prepare a separate candidate store and unit against the staged copy. The
-	// source (oldID) and candidate (newID) claims are both held here.
+	// source (sessionID) and candidate (newID) claims are both held here.
 	candidateStore, err := unit.store.NewStagingStore(stagingRoot)
 	if err != nil {
 		return nil, cleanupStaging(stagingRoot, err)
 	}
+	a.fireDurableReadHook()
 	if err := candidateStore.LoadSession(newID); err != nil {
 		return nil, cleanupStaging(stagingRoot, err)
 	}
@@ -5316,6 +5431,7 @@ func (a *Agent) forkUnitStagedLocked(unit *session, turn int) (*session, error) 
 		candidateStore.Detach()
 		return nil, cleanupStaging(stagingRoot, err)
 	}
+	a.fireDurableReadHook()
 	if err := a.loadHistoryIntoLoopForSession(candidate); err != nil {
 		candidateStore.Detach()
 		return nil, cleanupStaging(stagingRoot, err)
@@ -5324,25 +5440,24 @@ func (a *Agent) forkUnitStagedLocked(unit *session, turn int) (*session, error) 
 	// durable commit, so no fallible read runs after the rename.
 	a.resetFileTrackerForSession(candidate)
 	a.loadTokensFromDiskForSession(candidate)
-	if err := a.inheritActiveModelLocked(candidate, unit); err != nil {
+	if err := a.inheritActiveModelForForkedSession(candidate, srcRef); err != nil {
 		candidateStore.Detach()
 		return nil, cleanupStaging(stagingRoot, err)
 	}
-	// Durable commit: the atomic rename publishes the candidate. The source is
-	// still authoritative until it succeeds.
+	// Durable commit: the atomic rename publishes the candidate.
 	if err := snapshot.PublishStagedSession(stagingRoot, sessionsRoot, newID); err != nil {
-		candidateStore.Detach()
+		candidate.store.Detach()
 		return nil, cleanupStaging(stagingRoot, err)
 	}
-	if err := candidateStore.RelocateActiveSessionPaths(sessionsRoot); err != nil {
-		candidateStore.Detach()
+	if err := candidate.store.RelocateActiveSessionPaths(sessionsRoot); err != nil {
+		candidate.store.Detach()
 		return nil, err
 	}
 	// Post-commit publication is infallible: drop the empty staging parent, then
 	// register the fork as its own live unit, selecting it only when the source
 	// was current.
 	_ = os.RemoveAll(stagingRoot)
-	if a.currentSessionID == oldID {
+	if a.currentSessionID == sessionID {
 		if err := a.setCurrentSessionLocked(candidate); err != nil {
 			return nil, err
 		}
@@ -5363,10 +5478,10 @@ func (a *Agent) ForkSessionForSession(sessionID string, turn int) error {
 	return a.forkSessionForSession(unit, turn)
 }
 
+// forkSessionForSession forks unit through forkUnitAtTurn's snapshot/copy/
+// revalidate-commit split, which owns the rt.mu bracket.
 func (a *Agent) forkSessionForSession(unit *session, turn int) error {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
-	_, err := a.forkUnitStagedLocked(unit, turn)
+	_, err := a.forkUnitAtTurn(unit, turn)
 	return err
 }
 
