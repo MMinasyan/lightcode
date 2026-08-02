@@ -302,8 +302,8 @@ func TestTranscriptCoordinatorLiveFeedRootTurn(t *testing.T) {
 		t.Fatalf("Submit: %v", err)
 	}
 	waitUntilEventOrderTurnEndCount(t, cap, 1)
-	// The commit feed runs just after EventTurnEnd is delivered and strictly
-	// before the turn clears busy, so idle guarantees the commit is visible.
+	// The commit feed runs inside the busy-clear section, before EventTurnEnd
+	// is delivered, so idle guarantees the commit is visible.
 	waitUntilEventOrderAgentIdle(t, a)
 
 	tr := a.transcriptForSessionID(sessionIDOf(a.session))

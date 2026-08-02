@@ -2884,14 +2884,19 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 		unit.busy = false
 		unit.turnCancel = nil
 		unit.turnCtx = nil
-		a.emitEvent(endEv)
-		rt.mu.Unlock()
 		// Commit the coordinator only once the drainer flush is acknowledged. If
 		// owner cancellation bypassed the flush a streamed row may still be
-		// buffered, and it must not be fed after the turn commits.
+		// buffered, and it must not be fed after the turn commits. The commit
+		// runs in this runtime.mu section — before turn_end is emitted and
+		// before a submit can observe busy cleared — so a submit that claims
+		// the unit next cannot feed the next turn's rows into a tail this
+		// commit then wipes. The contract requires the flush and commit to
+		// complete after the turn's loop returns and before EventTurnEnd.
 		if flushed {
 			feedTranscript(a.transcriptForSessionID(sessionID), endEv)
 		}
+		a.emitEvent(endEv)
+		rt.mu.Unlock()
 	}()
 
 	return turn

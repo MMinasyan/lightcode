@@ -3,7 +3,12 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -629,4 +634,352 @@ func TestTranscriptCoordinatorCommit(t *testing.T) {
 	if rev2 != (captureRevision{committedTurn: 2, committedSeq: high2, rewriteEpoch: 0}) {
 		t.Fatalf("revision after commit 2 = %+v (high2=%d)", rev2, high2)
 	}
+}
+
+// commitState is the coordinator snapshot a turn-end event handler records at
+// the moment EventTurnEnd is delivered.
+type commitState struct {
+	seen          bool
+	turn          int
+	committedTurn int
+	committedSeq  int
+	nextSeq       int
+	tailLen       int
+}
+
+// TestTranscriptCommitContractMatrix verifies the turn-end commit ordering
+// contract: the drainer flush and the coordinator commit run after the turn's
+// loop returns and strictly before EventTurnEnd is emitted. With the commit
+// inside the runtime.mu section that clears busy, a submit that observes busy
+// cleared and claims the unit cannot feed the next turn's rows into a tail the
+// previous turn's commit then wipes.
+func TestTranscriptCommitContractMatrix(t *testing.T) {
+	// The event handler observes the coordinator at the instant turn_end is
+	// delivered. The commit must already have run: committedTurn must equal
+	// the delivered turn, the retained tail must be empty, and the committed
+	// sequence must be the high-water. With the commit after the emit (the
+	// pre-fix order) the handler sees the turn's rows still uncommitted.
+	t.Run("order=commit_before_end_emit", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeTextResponse(w, "hello back")
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		ctx := startEventOrderAgent(t, a, &eventCapture{})
+		// Swap in the observing handler after Init: startEventOrderAgent
+		// installs the capture handler, and this one records the coordinator
+		// state at every turn_end delivery. The handler must take seqMu only
+		// for turn_end — row events are emitted from feedAndEmit, which
+		// already holds seqMu.
+		var stateMu sync.Mutex
+		var atEnd commitState
+		a.SetEventHandler(func(ev Event) {
+			if ev.Kind != EventTurnEnd {
+				return
+			}
+			tr := a.transcriptForSessionID(ev.SessionID)
+			if tr == nil {
+				return
+			}
+			tr.seqMu.Lock()
+			st := commitState{
+				seen:          true,
+				turn:          ev.Turn,
+				committedTurn: tr.committedTurn,
+				committedSeq:  tr.committedSeq,
+				nextSeq:       tr.nextSeq,
+				tailLen:       len(tr.tail),
+			}
+			tr.seqMu.Unlock()
+			stateMu.Lock()
+			atEnd = st
+			stateMu.Unlock()
+		})
+		if _, err := a.Submit(ctx, "hello"); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+		waitUntilEventOrderAgentIdle(t, a)
+
+		stateMu.Lock()
+		st := atEnd
+		stateMu.Unlock()
+		if !st.seen {
+			t.Fatal("no turn_end delivered")
+		}
+		if st.committedTurn != st.turn {
+			t.Fatalf("at turn_end delivery committedTurn = %d, want the delivered turn %d (the commit ran after the emit)", st.committedTurn, st.turn)
+		}
+		if st.tailLen != 0 {
+			t.Fatalf("at turn_end delivery retained tail = %d rows, want 0 (the commit ran after the emit)", st.tailLen)
+		}
+		if st.committedSeq != st.nextSeq-1 {
+			t.Fatalf("at turn_end delivery committedSeq = %d, want high-water %d (the commit ran after the emit)", st.committedSeq, st.nextSeq-1)
+		}
+	})
+
+	// A submit racing a turn end must not lose the next turn's rows. The
+	// pre-fix window: the turn-end path cleared busy and released runtime.mu
+	// before feeding the end event, so a concurrent submit could observe busy
+	// false, claim, and launch turn N+1 whose rows enter the tail before turn
+	// N's late commit set t.tail = nil, erasing them.
+	//
+	// The subtest parks turn N's commit feed by holding seqMu (the only
+	// parkable point on that path), releases turn N's model gate, and submits
+	// turn N+1 while the commit is still pending:
+	//
+	//   - Pre-fix the feed is post-unlock, so the submit claims, launches, and
+	//     its turn_start is delivered (and turn N's turn_end was already
+	//     delivered before the feed) while the commit is still pending — the
+	//     exact window the defect is built on. The assertion below fails.
+	//   - With the commit inside the busy-clear section the parked feed holds
+	//     runtime.mu, so the submit cannot claim until the commit has run: no
+	//     turn_start(N+1) is delivered before the release, and the next turn's
+	//     rows then feed after the commit and survive.
+	t.Run("race=submit_vs_turn_end", func(t *testing.T) {
+		releaseRun := make(chan struct{})
+		releaseN1 := make(chan struct{})
+		reqNSeen := make(chan struct{}, 1)
+		reqN1Seen := make(chan struct{}, 1)
+		var runOnce, n1Once sync.Once
+		closeRun := func() { runOnce.Do(func() { close(releaseRun) }) }
+		closeN1 := func() { n1Once.Do(func() { close(releaseN1) }) }
+		t.Cleanup(closeRun)
+		t.Cleanup(closeN1)
+
+		var reqs atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Payload-only response: no TextDelta reaches the loop event queue
+			// while seqMu is held, so the drainer stays idle and the flush ack
+			// completes instead of deadlocking on the parked commit feed.
+			gate := releaseN1
+			seen := reqN1Seen
+			if reqs.Add(1) == 1 {
+				gate = releaseRun
+				seen = reqNSeen
+			}
+			select {
+			case seen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, `data: {"choices":[{"delta":{"role":"assistant","reasoning":"stall"},"finish_reason":"stop"}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		}))
+		t.Cleanup(server.Close)
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		// Turn N: submit and park its Run in the model request.
+		resN, err := a.SubmitToSession(ctx, id, "turn N")
+		if err != nil {
+			t.Fatalf("SubmitToSession N: %v", err)
+		}
+		if !resN.Started {
+			t.Fatalf("turn N enqueued instead of starting")
+		}
+		waitForSignal(t, reqNSeen, "turn N model request")
+
+		// Park turn N's commit feed: hold seqMu, then release Run(N), so the
+		// turn-end path runs through the busy clear and parks at the commit
+		// feed with the deferred cleanup pending.
+		tr := a.transcriptForSessionID(id)
+		tr.seqMu.Lock()
+		seqMuHeld := true
+		defer func() {
+			if seqMuHeld {
+				tr.seqMu.Unlock()
+			}
+		}()
+
+		closeRun()
+		// Wait out the completion and the park: with the commit feed inside
+		// the busy-clear section the parked feed holds runtime.mu, so busy is
+		// not observable until the commit completes.
+		time.Sleep(200 * time.Millisecond)
+
+		// Submit turn N+1 racing the turn end while the commit is pending.
+		var resN1 SubmitResult
+		var errN1 error
+		var subWg sync.WaitGroup
+		subWg.Add(1)
+		go func() {
+			defer subWg.Done()
+			resN1, errN1 = a.SubmitToSession(ctx, id, "turn N+1")
+		}()
+		time.Sleep(100 * time.Millisecond)
+
+		// While turn N's commit is still pending (seqMu is still held here),
+		// the racing submit must not have claimed: no turn_start(N+1) may be
+		// delivered, and turn N's turn_end may not precede the commit.
+		startedNext, endedN := false, false
+		for _, ev := range cap.snapshot() {
+			switch {
+			case ev.Kind == EventTurnStart && ev.Turn == resN.Turn+1:
+				startedNext = true
+			case ev.Kind == EventTurnEnd && ev.Turn == resN.Turn:
+				endedN = true
+			}
+		}
+		if startedNext {
+			t.Fatalf("the racing submit claimed and launched turn %d while turn %d's commit was still pending — the window that wipes the next turn's rows", resN.Turn+1, resN.Turn)
+		}
+		if endedN {
+			t.Fatalf("turn %d's turn_end was delivered before its commit ran", resN.Turn)
+		}
+
+		// Release the stall: turn N's commit completes, then the submit
+		// claims and turn N+1 runs to the second gate.
+		tr.seqMu.Unlock()
+		seqMuHeld = false
+		waitForSignal(t, reqN1Seen, "turn N+1 model request")
+
+		// The next turn's rows must be intact: its user row is in the retained
+		// tail while the turn is live (the loop emits the user display before
+		// the model request).
+		userRow := false
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && !userRow {
+			tr.seqMu.Lock()
+			for _, row := range tr.tail {
+				if row.msg.Type == "user" && row.msg.Content == "turn N+1" {
+					userRow = true
+					break
+				}
+			}
+			tr.seqMu.Unlock()
+			if !userRow {
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+		if !userRow {
+			t.Fatal("the next turn's user row is missing from the retained tail: turn N's commit wiped it")
+		}
+
+		closeN1()
+		subWg.Wait()
+		if errN1 != nil {
+			t.Fatalf("SubmitToSession N+1: %v", errN1)
+		}
+		if !resN1.Started {
+			t.Fatalf("turn N+1 enqueued instead of claiming the unit")
+		}
+		waitSessionDrained(t, a, id)
+
+		tr.seqMu.Lock()
+		committedTurn := tr.committedTurn
+		tr.seqMu.Unlock()
+		if committedTurn != resN1.Turn {
+			t.Fatalf("committedTurn = %d, want turn N+1's turn %d", committedTurn, resN1.Turn)
+		}
+	})
+}
+
+// TestDeferredCleanupGuardContract pins launchTurn's deferred cleanup guard
+// directly, with no interleaving to force: the deferred cleanup must clear the
+// unit's per-turn state only when the unit still holds that turn's context,
+// and must leave a later claim's state untouched. The goroutine is driven to
+// its early-return path (the owner context is already canceled, so Run never
+// starts) and the deferred cleanup runs against the unit in the exact state
+// the test arranged; completion is observed through the deferred cleanup's
+// own cancel() of the turn context, which runs after the guard.
+func TestDeferredCleanupGuardContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTextResponse(w, "unreachable")
+	}))
+	defer server.Close()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	startEventOrderAgent(t, a, &eventCapture{})
+	id, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	unit := a.sessions[id]
+	rt := a.ensureRuntime()
+
+	// An already-canceled owner context makes launchTurn's goroutine take its
+	// early-return path, so the deferred cleanup runs without any turn work.
+	canceled, cancelOwner := context.WithCancel(context.Background())
+	cancelOwner()
+
+	// runDeferred arranges the unit's per-turn state, launches a turn whose
+	// deferred cleanup will run immediately, and waits for the deferred
+	// cleanup to complete (it cancels thisCtx after the guard).
+	runDeferred := func(unitBusy bool, unitCtx context.Context, unitCancel context.CancelFunc, thisCtx context.Context, thisCancel context.CancelFunc) {
+		t.Helper()
+		rt.mu.Lock()
+		unit.busy = unitBusy
+		unit.turnCtx = unitCtx
+		unit.turnCancel = unitCancel
+		rt.mu.Unlock()
+		rt.turnWG.Add(1)
+		rt.launchTurn(canceled, unit, thisCtx, thisCancel, []string{"x"})
+		select {
+		case <-thisCtx.Done():
+		case <-time.After(10 * time.Second):
+			t.Fatal("deferred cleanup did not run")
+		}
+	}
+
+	// A later claim replaced the unit's per-turn context (and busy flag)
+	// before this turn's deferred cleanup ran: the guard must leave that
+	// state untouched.
+	t.Run("state=later_claim_untouched", func(t *testing.T) {
+		thisCtx, thisCancel := context.WithCancel(context.Background())
+		defer thisCancel()
+		laterCtx, laterCancel := context.WithCancel(context.Background())
+		defer laterCancel()
+		runDeferred(true, laterCtx, laterCancel, thisCtx, thisCancel)
+
+		rt.mu.Lock()
+		busy := unit.busy
+		turnCtx := unit.turnCtx
+		turnCancel := unit.turnCancel
+		rt.mu.Unlock()
+		if !busy {
+			t.Fatal("deferred cleanup cleared the later turn's busy flag")
+		}
+		if turnCtx != laterCtx {
+			t.Fatal("deferred cleanup replaced the later turn's context")
+		}
+		if turnCancel == nil || reflect.ValueOf(turnCancel).Pointer() != reflect.ValueOf(laterCancel).Pointer() {
+			t.Fatal("deferred cleanup replaced the later turn's cancel")
+		}
+	})
+
+	// The unit still holds this turn's context: the deferred cleanup must
+	// clear the claim so the unit is not stuck busy after an owner-cancelled
+	// early return.
+	t.Run("state=own_context_cleared", func(t *testing.T) {
+		thisCtx, thisCancel := context.WithCancel(context.Background())
+		defer thisCancel()
+		runDeferred(true, thisCtx, thisCancel, thisCtx, thisCancel)
+
+		rt.mu.Lock()
+		busy := unit.busy
+		turnCtx := unit.turnCtx
+		turnCancel := unit.turnCancel
+		rt.mu.Unlock()
+		if busy {
+			t.Fatal("deferred cleanup left the unit busy while it still held the turn's context")
+		}
+		if turnCtx != nil {
+			t.Fatal("deferred cleanup left the unit's turn context set")
+		}
+		if turnCancel != nil {
+			t.Fatal("deferred cleanup left the unit's turn cancel set")
+		}
+	})
 }
