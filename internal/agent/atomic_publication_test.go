@@ -71,7 +71,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 	// usage(tokensMu): a usage event produced during the capture is delivered after
 	// the boundary and is absent from the snapshot's cumulative report.
 	t.Run("usage=blocked_producer_after_boundary_absent_from_snapshot", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
+		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
 		var mu sync.Mutex
 		var order []string
@@ -113,7 +113,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 	// usage: a usage event produced before the capture is in the snapshot and
 	// delivered before the boundary.
 	t.Run("usage=producer_before_capture_in_snapshot", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
+		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
 		var mu sync.Mutex
 		var order []string
@@ -149,7 +149,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 	// warnings(warningsMu): a warning mutation during the capture is delivered after
 	// the boundary and absent from the snapshot.
 	t.Run("warning=blocked_producer_after_boundary_absent_from_snapshot", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
+		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
 		var mu sync.Mutex
 		var order []string
@@ -195,7 +195,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 	// lock before the boundary, the registration could land during the capture,
 	// failing the pending-during-capture and delivery-order assertions.
 	t.Run("permission=blocked_during_capture_absent_from_snapshot_delivered_after", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
+		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
 		sessionID := sessionIDOf(unit)
 		permCtx, permCancel := context.WithCancel(context.Background())
@@ -269,9 +269,9 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 	// capture holds, so it is absent from the tail snapshot and delivered after the
 	// boundary.
 	t.Run("transcript=blocked_producer_after_boundary_absent_from_snapshot", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
+		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
-		tr := unit.transcript
+		tr := a.transcriptForSessionID(sessionIDOf(unit))
 		var mu sync.Mutex
 		var order []string
 		a.SetEventHandler(func(ev Event) {
@@ -312,9 +312,9 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 	// transcript: a row fed before the capture is in the tail snapshot and delivered
 	// before the boundary.
 	t.Run("transcript=producer_before_capture_in_snapshot", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
+		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
-		tr := unit.transcript
+		tr := a.transcriptForSessionID(sessionIDOf(unit))
 		var mu sync.Mutex
 		var order []string
 		a.SetEventHandler(func(ev Event) {
@@ -350,9 +350,9 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 	// capture holds, so it is absent from the retained-error snapshot and delivered
 	// after the boundary.
 	t.Run("session_error=blocked_producer_after_boundary_absent_from_snapshot", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
+		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
-		tr := unit.transcript
+		tr := a.transcriptForSessionID(sessionIDOf(unit))
 		var mu sync.Mutex
 		var order []string
 		a.SetEventHandler(func(ev Event) {
@@ -393,9 +393,9 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 	// session error: an error fed before the capture is in the retained-error
 	// snapshot and delivered before the boundary.
 	t.Run("session_error=producer_before_capture_in_snapshot", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
+		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
-		tr := unit.transcript
+		tr := a.transcriptForSessionID(sessionIDOf(unit))
 		var mu sync.Mutex
 		var order []string
 		a.SetEventHandler(func(ev Event) {
@@ -430,7 +430,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 	// warning: a warning mutated before the capture is in the snapshot and delivered
 	// before the boundary.
 	t.Run("warning=producer_before_capture_in_snapshot", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
+		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
 		var mu sync.Mutex
 		var order []string
@@ -465,7 +465,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 
 	// permission: a request registered before the capture is in the snapshot.
 	t.Run("permission=registered_before_capture_in_snapshot", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
+		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
 		sessionID := sessionIDOf(unit)
 		permCtx, permCancel := context.WithCancel(context.Background())
@@ -493,7 +493,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 	// clearing busy during the capture is serialized after the boundary. The
 	// snapshot reflects the pre-clear busy state.
 	t.Run("busy=capture_reads_busy_before_concurrent_clear", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
+		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
 		rt := a.ensureRuntime()
 		rt.mu.Lock()

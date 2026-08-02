@@ -306,7 +306,7 @@ func TestTranscriptCoordinatorLiveFeedRootTurn(t *testing.T) {
 	// before the turn clears busy, so idle guarantees the commit is visible.
 	waitUntilEventOrderAgentIdle(t, a)
 
-	tr := a.session.transcript
+	tr := a.transcriptForSessionID(sessionIDOf(a.session))
 	if tr == nil {
 		t.Fatal("session has no transcript coordinator")
 	}

@@ -20,6 +20,19 @@ func feedTranscriptEvents(tr *transcript, events []Event) {
 	}
 }
 
+// newLiveCatalogBackedTestAgent returns an agent whose current session is a
+// registered live session, so coordinator lookups resolve through the runtime's
+// transcriptState registry. Coordinator tests that operate on the current
+// session use this rather than reaching a coordinator field on the unit.
+func newLiveCatalogBackedTestAgent(t *testing.T) *Agent {
+	t.Helper()
+	a := newCatalogBackedTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	return a
+}
+
 func transcriptTailRows(tr *transcript) []transcriptRow {
 	tr.seqMu.Lock()
 	defer tr.seqMu.Unlock()
@@ -172,6 +185,90 @@ func TestTranscriptCoordinatorToolMetadataAndSubagentLinks(t *testing.T) {
 	}
 }
 
+// TestTranscriptRegistryCursorsAdvanceIndependently verifies the step-12
+// registry property: each live session's coordinator lives in its own registry
+// entry with its own seqMu, so feeding or committing one session never moves
+// another's {nextSeq, committedSeq, committedTurn}, and a feed to one session
+// never blocks on another session's coordinator lock. Mutation check: key the
+// registry so both sessions share one entry; this test must fail.
+func TestTranscriptRegistryCursorsAdvanceIndependently(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+
+	trA := a.transcriptForSessionID(firstID)
+	trB := a.transcriptForSessionID(secondID)
+	if trA == nil || trB == nil {
+		t.Fatal("live sessions have no registry entries")
+	}
+	if trA == trB {
+		t.Fatal("live sessions share one coordinator")
+	}
+
+	nextSeq := func(tr *transcript) int {
+		tr.seqMu.Lock()
+		defer tr.seqMu.Unlock()
+		return tr.nextSeq
+	}
+
+	// Interleaved feed: A's rows advance A only; B's cursor stays put. Turn
+	// start consumes no sequence; each text delta consumes one.
+	seqA0, seqB0 := nextSeq(trA), nextSeq(trB)
+	feedTranscript(trA, Event{Kind: EventTurnStart, Turn: 1})
+	feedTranscript(trA, Event{Kind: EventTextDelta, Result: "a1"})
+	feedTranscript(trA, Event{Kind: EventTextDelta, Result: "a2"})
+	if got := nextSeq(trA); got != seqA0+2 {
+		t.Fatalf("session A nextSeq = %d, want %d", got, seqA0+2)
+	}
+	if got := nextSeq(trB); got != seqB0 {
+		t.Fatalf("feeding session A advanced session B's cursor: %d -> %d", seqB0, got)
+	}
+
+	feedTranscript(trB, Event{Kind: EventTurnStart, Turn: 1})
+	feedTranscript(trB, Event{Kind: EventTextDelta, Result: "b1"})
+	if got := nextSeq(trB); got != seqB0+1 {
+		t.Fatalf("session B nextSeq = %d, want %d", got, seqB0+1)
+	}
+	if got := nextSeq(trA); got != seqA0+2 {
+		t.Fatalf("feeding session B advanced session A's cursor: %d -> %d", seqA0+2, got)
+	}
+
+	// Commits are per-session too: committing A's turn moves only A's markers.
+	trA.seqMu.Lock()
+	trA.commitLocked(1)
+	revA := trA.revisionLocked()
+	trA.seqMu.Unlock()
+	trB.seqMu.Lock()
+	revB := trB.revisionLocked()
+	trB.seqMu.Unlock()
+	if revA.committedTurn != 1 || revA.committedSeq == 0 {
+		t.Fatalf("session A revision after commit = %+v, want committedTurn 1 with a nonzero committedSeq", revA)
+	}
+	if revB != (captureRevision{}) {
+		t.Fatalf("committing session A advanced session B's committed markers: %+v", revB)
+	}
+
+	// A feed to B must not need A's lock: holding A's coordinator lock does not
+	// stall B's feed, which is exactly what a registry-wide hold would do.
+	trA.seqMu.Lock()
+	fedB := make(chan int, 1)
+	go func() {
+		fedB <- feedTranscript(trB, Event{Kind: EventTextDelta, Result: "b-concurrent"})
+	}()
+	select {
+	case <-fedB:
+	case <-time.After(2 * time.Second):
+		t.Fatal("feed to session B blocked on session A's coordinator lock: one lock guards both sessions' feeds")
+	}
+	trA.seqMu.Unlock()
+}
+
 // TestCaptureStateForSelectionRevalidation verifies the live-selection capture
 // revalidates the coordinator revision across a fixed three attempts: a stable
 // revision succeeds on the first read, a commit or rewrite during the read is
@@ -186,7 +283,7 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 	}
 
 	t.Run("stable_first", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
+		a := newLiveCatalogBackedTestAgent(t)
 		attempts := 0
 		a.captureProbe = func(int) error { attempts++; return nil }
 		if _, err := a.captureStateForSelection(a.session, nil); err != nil {
@@ -198,8 +295,8 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 	})
 
 	t.Run("normal_commit_then_success", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
-		tr := a.session.transcript
+		a := newLiveCatalogBackedTestAgent(t)
+		tr := a.transcriptForSessionID(sessionIDOf(a.session))
 		attempts := 0
 		a.captureProbe = func(attempt int) error {
 			attempts++
@@ -217,7 +314,7 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 	})
 
 	t.Run("rewrite_then_success", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
+		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
 		attempts := 0
 		a.captureProbe = func(attempt int) error {
@@ -239,8 +336,8 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 	})
 
 	t.Run("three_mismatches", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
-		tr := a.session.transcript
+		a := newLiveCatalogBackedTestAgent(t)
+		tr := a.transcriptForSessionID(sessionIDOf(a.session))
 		attempts := 0
 		a.captureProbe = func(int) error {
 			attempts++
@@ -257,7 +354,7 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 	})
 
 	t.Run("read_error_attempt_1", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
+		a := newLiveCatalogBackedTestAgent(t)
 		sentinel := errors.New("read boom")
 		attempts := 0
 		a.captureProbe = func(attempt int) error {
@@ -277,8 +374,8 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 	})
 
 	t.Run("read_error_attempt_2_after_mismatch", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
-		tr := a.session.transcript
+		a := newLiveCatalogBackedTestAgent(t)
+		tr := a.transcriptForSessionID(sessionIDOf(a.session))
 		sentinel := errors.New("read boom")
 		attempts := 0
 		a.captureProbe = func(attempt int) error {
@@ -305,10 +402,10 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 // boundary callback with the immutable state it built, so an adapter can append
 // its boundary while the capture still holds the locks.
 func TestCaptureStateInvokesBoundaryWithBuiltState(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
+	a := newLiveCatalogBackedTestAgent(t)
 	unit := a.session
 
-	tr := unit.transcript
+	tr := a.transcriptForSessionID(sessionIDOf(unit))
 	tr.seqMu.Lock()
 	tr.appendEventLocked(Event{Kind: EventTextDelta, Result: "hi"})
 	tr.seqMu.Unlock()
@@ -336,7 +433,7 @@ func TestCaptureStateInvokesBoundaryWithBuiltState(t *testing.T) {
 // TestCaptureStateCapturesPendingPermissions verifies the capture reads the
 // session's pending permission requests under the gate lock.
 func TestCaptureStateCapturesPendingPermissions(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
+	a := newLiveCatalogBackedTestAgent(t)
 	unit := a.session
 	sessionID := sessionIDOf(unit)
 
@@ -364,7 +461,7 @@ func TestCaptureStateCapturesPendingPermissions(t *testing.T) {
 // class — transcript, activity, model, tokens, queue, warnings — as one set, by
 // seeding a distinctive value in each under its lock and asserting all of them.
 func TestCaptureStateReadsAllLiveClasses(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
+	a := newLiveCatalogBackedTestAgent(t)
 	unit := a.session
 	rt := a.ensureRuntime()
 
@@ -380,7 +477,7 @@ func TestCaptureStateReadsAllLiveClasses(t *testing.T) {
 	unit.tokens = map[string]*TokenEntry{"p/m": {Provider: "p", Model: "m", Input: 11, Known: true}}
 	unit.tokensMu.Unlock()
 
-	tr := unit.transcript
+	tr := a.transcriptForSessionID(sessionIDOf(unit))
 	tr.seqMu.Lock()
 	tr.appendEventLocked(Event{Kind: EventTextDelta, Result: "hi"})
 	tr.seqMu.Unlock()

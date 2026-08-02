@@ -165,7 +165,6 @@ func TestOwnerConfigReadsRaceFree(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewSession: %v", err)
 		}
-		unit := a.sessions[id]
 
 		// Turn N: submit and park its Run in the model request.
 		resN, err := a.SubmitToSession(ctx, id, "turn N")
@@ -182,11 +181,12 @@ func TestOwnerConfigReadsRaceFree(t *testing.T) {
 		// releases, Run(N) finishes, the turn-end section clears busy and
 		// emits turn_end, and the goroutine parks at feedTranscript(endEv)
 		// with the deferred cleanup pending.
-		unit.transcript.seqMu.Lock()
+		tr := a.transcriptForSessionID(id)
+		tr.seqMu.Lock()
 		seqMuHeld := true
 		defer func() {
 			if seqMuHeld {
-				unit.transcript.seqMu.Unlock()
+				tr.seqMu.Unlock()
 			}
 		}()
 
@@ -205,7 +205,7 @@ func TestOwnerConfigReadsRaceFree(t *testing.T) {
 		waitBusyState(t, a, id, true) // N+1 claimed; submitter parked at feedTranscript(startEv)
 
 		// Release the stall: the deferred now runs with N+1 holding the unit.
-		unit.transcript.seqMu.Unlock()
+		tr.seqMu.Unlock()
 		seqMuHeld = false
 
 		// N+1's Run must be in flight (parked at the second gate) and busy

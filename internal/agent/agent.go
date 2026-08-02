@@ -52,10 +52,9 @@ type Config struct {
 type session struct {
 	rt *runtime
 
-	store      *snapshot.Store
-	lp         *loop.Loop
-	registry   *tool.Registry
-	transcript *transcript
+	store    *snapshot.Store
+	lp       *loop.Loop
+	registry *tool.Registry
 
 	activeAgentType   string
 	projectID         string
@@ -307,7 +306,6 @@ func newRunningUnit(cfg runningUnitConfig) *session {
 		rt:                cfg.Runtime,
 		store:             cfg.Store,
 		registry:          cfg.Loop.Registry,
-		transcript:        newTranscript(),
 		activeAgentType:   cfg.ActiveAgentType,
 		projectID:         cfg.ProjectID,
 		projectName:       cfg.ProjectName,
@@ -381,6 +379,10 @@ func (a *Agent) registerLiveSessionLocked(unit *session) error {
 		return fmt.Errorf("session %q is already registered to a different live session", id)
 	}
 	a.sessions[id] = unit
+	// A session becomes live here: publish its transcript registry entry so
+	// every by-id resolution finds its coordinator. Idempotent re-registration
+	// keeps the existing coordinator (and its sequenced rows).
+	a.ensureRuntime().registerTranscript(id, unit.store)
 	return nil
 }
 
@@ -409,6 +411,7 @@ func (a *Agent) liveSessionLocked(id string) (*session, error) {
 	}
 	if current := sessionIDOf(a.session); current == id {
 		a.sessions[id] = a.session
+		a.ensureRuntime().registerTranscript(id, a.session.store)
 		return a.session, nil
 	}
 	return nil, fmt.Errorf("unknown session %q", id)
@@ -1036,21 +1039,11 @@ func (rt *runtime) emitEvent(ev Event) {
 }
 
 // transcriptForSessionID resolves the live coordinator owning a session id, or
-// nil for an unknown or sessionless event.
+// nil for an unknown or sessionless event. Resolution takes the registry's map
+// lock briefly and releases it before the caller takes the coordinator's own
+// seqMu — two sessions' feeds never contend on one lock.
 func (a *Agent) transcriptForSessionID(id string) *transcript {
-	if id == "" {
-		return nil
-	}
-	rt := a.ensureRuntime()
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	if unit := a.sessions[id]; unit != nil {
-		return unit.transcript
-	}
-	if sessionIDOf(a.session) == id {
-		return a.session.transcript
-	}
-	return nil
+	return a.ensureRuntime().transcriptForSessionID(id)
 }
 
 // feedTranscript folds one event into a session coordinator under its own seqMu
@@ -1708,7 +1701,7 @@ func (a *Agent) beforeModelRequestForSession(ctx context.Context, unit *session,
 			return loop.ContextTransformResult{}, err
 		}
 		errEv := Event{Kind: EventError, SessionID: sessionIDOf(unit), ProjectID: unit.projectID, Error: fmt.Sprintf("compaction: %v", err), Turn: checkpoint.Turn}
-		a.feedAndEmit(unit.transcript, errEv)
+		a.feedAndEmit(a.transcriptForSessionID(sessionIDOf(unit)), errEv)
 		return loop.ContextTransformResult{}, nil
 	}
 	return loop.ContextTransformResult{Transformed: true, ActiveTurnStart: activeStart}, nil
@@ -1905,7 +1898,7 @@ func (a *Agent) prebuiltCompactionCommitted(unit *session, sessionID string, bou
 // split. Advancing the epoch makes a live-selection capture that raced the
 // compaction revalidate and re-read the rewritten durable prefix.
 func (a *Agent) publishCompactionRewrite(unit *session, sessionID, projectID string, summary SessionSummary, committed []DisplayMessage) {
-	tr := unit.transcript
+	tr := a.transcriptForSessionID(sessionID)
 	if tr == nil {
 		return
 	}
@@ -2820,7 +2813,7 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 	a.applyUnitConfigLocked(unit)
 	a.setWarningGroup("setup", a.setupWarningsLocked())
 	rt.mu.Unlock()
-	feedTranscript(unit.transcript, startEv)
+	feedTranscript(a.transcriptForSessionID(sessionID), startEv)
 
 	if unit.taskToolInst != nil {
 		unit.taskToolInst.updateParentState(cancel)
@@ -2879,7 +2872,7 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 
 		if err != nil {
 			errEv := Event{Kind: EventError, SessionID: sessionID, ProjectID: projectID, Error: a.turnErrorMessage(err), Turn: turn}
-			a.feedAndEmit(unit.transcript, errEv)
+			a.feedAndEmit(a.transcriptForSessionID(sessionID), errEv)
 		}
 		endEv := Event{Kind: EventTurnEnd, SessionID: sessionID, ProjectID: projectID, Turn: turn, Cancelled: turnCtx.Err() != nil}
 		// Clear busy and enqueue turn_end in one runtime.mu section: busy is already
@@ -2897,7 +2890,7 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 		// owner cancellation bypassed the flush a streamed row may still be
 		// buffered, and it must not be fed after the turn commits.
 		if flushed {
-			feedTranscript(unit.transcript, endEv)
+			feedTranscript(a.transcriptForSessionID(sessionID), endEv)
 		}
 	}()
 
@@ -4406,6 +4399,7 @@ func (a *Agent) removeSession(id string, durable func(sessionsRoot string, id st
 			a.currentSessionID = ""
 		}
 		delete(a.sessions, id)
+		rt.unregisterTranscript(id)
 		rt.clearQueueLocked()
 		rt.mu.Unlock()
 		a.resetCurrentSessionState()
@@ -4619,6 +4613,7 @@ func (a *Agent) closeLiveSession(id string) (bool, error) {
 	}
 	if unit.store == nil || !unit.store.Active() || unit.store.SessionID() != id {
 		delete(a.sessions, id)
+		rt.unregisterTranscript(id)
 		return false, nil
 	}
 	if unit == a.session {
@@ -4632,6 +4627,7 @@ func (a *Agent) closeLiveSession(id string) (bool, error) {
 	unit.store.Detach()
 	rt.clearQueueLockedForSession(unit)
 	delete(a.sessions, id)
+	rt.unregisterTranscript(id)
 	return true, nil
 }
 
@@ -4667,10 +4663,13 @@ var errCaptureRevisionChanged = errors.New("capture revision changed")
 // the locks in the total order, so the snapshot is one consistent set with no
 // class read outside the lock that guards it. This is the single-read shape.
 func (a *Agent) captureState(unit *session, boundary func(completeState)) (completeState, error) {
-	if unit == nil || unit.store == nil || unit.transcript == nil {
+	if unit == nil || unit.store == nil {
 		return completeState{}, snapshot.ErrNoSession
 	}
 	sessionID := sessionIDOf(unit)
+	if a.transcriptForSessionID(sessionID) == nil {
+		return completeState{}, snapshot.ErrNoSession
+	}
 	committed, err := a.captureDurableHistory(unit, sessionID)
 	if err != nil {
 		return completeState{}, err
@@ -4686,11 +4685,14 @@ func (a *Agent) captureState(unit *session, boundary func(completeState)) (compl
 // errCaptureRevisionChanged on the third, never publishing a partial result. A
 // durable read/decode error returns immediately. The caller holds lifecycleMu.
 func (a *Agent) captureStateForSelection(unit *session, boundary func(completeState)) (completeState, error) {
-	if unit == nil || unit.store == nil || unit.transcript == nil {
+	if unit == nil || unit.store == nil {
 		return completeState{}, snapshot.ErrNoSession
 	}
-	tr := unit.transcript
 	sessionID := sessionIDOf(unit)
+	tr := a.transcriptForSessionID(sessionID)
+	if tr == nil {
+		return completeState{}, snapshot.ErrNoSession
+	}
 	for attempt := 1; attempt <= 3; attempt++ {
 		tr.seqMu.Lock()
 		rev0 := tr.revisionLocked()
@@ -4746,7 +4748,10 @@ func (a *Agent) captureUnderLocks(unit *session, committed []DisplayMessage, ses
 // fallible read.
 func (a *Agent) captureUnderLocksRTHeld(unit *session, committed []DisplayMessage, sessionID string, wantRev *captureRevision, boundary func(completeState)) (completeState, bool) {
 	rt := a.ensureRuntime()
-	tr := unit.transcript
+	tr := a.transcriptForSessionID(sessionID)
+	if tr == nil {
+		return completeState{}, false
+	}
 
 	busy := unit.busy
 	compacting := unit.compacting
