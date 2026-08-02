@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -40,6 +41,24 @@ var copyDirFunc = copyDir
 // s.mu. Production no-op; tests use it to detect early release of the
 // lock from the fork copy region.
 var forkIntoLockReleasedHook = func() {}
+
+// mintMu serializes the session-id reservation sequence — draw, collision
+// scan, claim, directory creation, and the metadata write — across every
+// creation path in this process. The directory is the reservation: a second
+// mint can only scan after the winning id's directory exists on disk, so it
+// can never draw the same id. The hold spans only local filesystem work —
+// never a call that takes an owner lock — and is released before any turn
+// or loop work.
+var mintMu sync.Mutex
+
+// mintSessionIDMaxAttempts bounds how many ids the mint draws before giving
+// up on a persistent collision.
+const mintSessionIDMaxAttempts = 8
+
+// mintSessionIDFunc supplies the next raw session id for the mint. Production
+// draws from the crypto RNG; tests swap it to force collisions
+// deterministically. Follows the copyDirFunc precedent.
+var mintSessionIDFunc = newSessionID
 
 // Store owns one session directory at a time. Its session may be
 // swapped (Close + BeginNewSession / LoadSession) while tool and loop
@@ -281,44 +300,24 @@ func (s *Store) beginNewSessionLocked(projectRoot, parentSessionID string) error
 // createRoot is an unlisted staging root and the caller renames <createRoot>/<id>
 // into <s.root>/<id> before any store I/O, so the cached paths (and s.root) are
 // never a staging path. Caller holds s.mu.
-func (s *Store) beginNewSessionAtLocked(projectRoot, parentSessionID, createRoot string) (err error) {
+func (s *Store) beginNewSessionAtLocked(projectRoot, parentSessionID, createRoot string) error {
 	absProject, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return fmt.Errorf("snapshot: resolve project root: %w", err)
 	}
-	sessionID, err := newSessionID()
-	if err != nil {
-		return fmt.Errorf("snapshot: generate session id: %w", err)
-	}
-	// A freshly minted id is uncontended; claim it before publishing the dir.
-	if cerr := s.acquireClaimLocked(sessionID); cerr != nil {
-		return cerr
-	}
-	defer func() {
-		if err != nil {
-			s.releaseClaimLocked()
-		}
-	}()
-	createDir := filepath.Join(createRoot, sessionID)
-	for _, p := range []string{filepath.Join(createDir, "snapshots"), filepath.Join(createDir, "turns")} {
-		if err := os.MkdirAll(p, 0o700); err != nil {
-			return fmt.Errorf("snapshot: create %s: %w", p, err)
-		}
-	}
-	projectHash := hashString(absProject)
 	now := time.Now().Unix()
 	meta := SessionMeta{
-		ID:               sessionID,
 		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
 		ProjectPath:      absProject,
-		ProjectHash:      projectHash,
+		ProjectHash:      hashString(absProject),
 		LightcodeVersion: lightcodeVersion,
 		State:            StateActive,
 		LastActivity:     now,
 		ParentSessionID:  parentSessionID,
 	}
-	if err := writeJSON(filepath.Join(createDir, "meta.json"), meta); err != nil {
-		return fmt.Errorf("snapshot: write session meta: %w", err)
+	sessionID, err := s.mintReservedSessionID(createRoot, meta, true)
+	if err != nil {
+		return err
 	}
 	dir := filepath.Join(s.root, sessionID)
 	s.active = true
@@ -327,7 +326,7 @@ func (s *Store) beginNewSessionAtLocked(projectRoot, parentSessionID, createRoot
 	s.turnsDir = filepath.Join(dir, "turns")
 	s.sessionID = sessionID
 	s.projectRoot = absProject
-	s.projectHash = projectHash
+	s.projectHash = meta.ProjectHash
 	s.currentTurn = 0
 	return nil
 }
@@ -1113,18 +1112,33 @@ func (s *Store) ForkInto(toTurn int, destSessionsRoot string) (string, string, e
 	srcDir := s.dir
 	projectRoot := s.projectRoot
 
-	newID, err := newSessionID()
+	// Read source meta first so the mint can write the full fork meta under
+	// the reservation lock; a read error fails the fork rather than
+	// publishing a candidate with blank metadata.
+	var srcMeta SessionMeta
+	if err := readJSON(filepath.Join(srcDir, "meta.json"), &srcMeta); err != nil {
+		return "", "", fmt.Errorf("snapshot: fork: read source meta: %w", err)
+	}
+
+	now := time.Now()
+	meta := SessionMeta{
+		CreatedAt:        now.UTC().Format(time.RFC3339),
+		ProjectPath:      projectRoot,
+		ProjectHash:      hashString(projectRoot),
+		LightcodeVersion: lightcodeVersion,
+		State:            StateActive,
+		LastActivity:     now.Unix(),
+		Provider:         srcMeta.Provider,
+		Model:            srcMeta.Model,
+		ActiveAgentType:  srcMeta.ActiveAgentType,
+	}
+	newID, err := s.mintReservedSessionID(destSessionsRoot, meta, false)
 	if err != nil {
-		return "", "", fmt.Errorf("snapshot: fork: generate id: %w", err)
+		return "", "", fmt.Errorf("snapshot: fork: %w", err)
 	}
 	newDir := filepath.Join(destSessionsRoot, newID)
 	newSnapshots := filepath.Join(newDir, "snapshots")
 	newTurns := filepath.Join(newDir, "turns")
-	for _, p := range []string{newSnapshots, newTurns} {
-		if err := os.MkdirAll(p, 0o700); err != nil {
-			return "", "", fmt.Errorf("snapshot: fork: mkdir %s: %w", p, err)
-		}
-	}
 
 	// Copy snapshot and turn dirs for turns 1..toTurn. A missing turn dir is
 	// skipped; any other stat or copy error fails the fork so a partial or
@@ -1179,31 +1193,6 @@ func (s *Store) ForkInto(toTurn int, destSessionsRoot string) (string, string, e
 		}
 	} else if !os.IsNotExist(err) {
 		return "", "", fmt.Errorf("snapshot: fork: stat compaction: %w", err)
-	}
-
-	// Read source meta to carry over model and agent-type fields; a read error
-	// fails the fork rather than publishing a candidate with blank metadata.
-	var srcMeta SessionMeta
-	if err := readJSON(filepath.Join(srcDir, "meta.json"), &srcMeta); err != nil {
-		return "", "", fmt.Errorf("snapshot: fork: read source meta: %w", err)
-	}
-
-	// Write meta.json for the new session.
-	now := time.Now()
-	meta := SessionMeta{
-		ID:               newID,
-		CreatedAt:        now.UTC().Format(time.RFC3339),
-		ProjectPath:      projectRoot,
-		ProjectHash:      hashString(projectRoot),
-		LightcodeVersion: lightcodeVersion,
-		State:            StateActive,
-		LastActivity:     now.Unix(),
-		Provider:         srcMeta.Provider,
-		Model:            srcMeta.Model,
-		ActiveAgentType:  srcMeta.ActiveAgentType,
-	}
-	if err := writeJSON(filepath.Join(newDir, "meta.json"), meta); err != nil {
-		return "", "", fmt.Errorf("snapshot: fork: write meta: %w", err)
 	}
 
 	return newID, newDir, nil
@@ -1825,6 +1814,130 @@ func newSessionID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf[:]), nil
+}
+
+// mintReservedSessionID draws a fresh session id and reserves it on disk
+// while holding mintMu: it scans both namespaces of every project under the
+// store's projects root for an existing use of the drawn id, retrying on a
+// collision, and on a clean scan claims the id (when claim is set), creates
+// its directory under createRoot, and writes its meta. The directory is the
+// reservation, so the lock must span its creation: if it were released
+// before the winning id's directory existed, a second mint could scan the
+// same roots, see no collision, and draw the same id. A collided attempt
+// creates nothing, so no cleanup is needed between retries. The hold covers
+// local filesystem work only and is released before any turn or loop work.
+func (s *Store) mintReservedSessionID(createRoot string, meta SessionMeta, claim bool) (string, error) {
+	mintMu.Lock()
+	defer mintMu.Unlock()
+	for attempt := 0; attempt < mintSessionIDMaxAttempts; attempt++ {
+		id, err := mintSessionIDFunc()
+		if err != nil {
+			return "", fmt.Errorf("snapshot: generate session id: %w", err)
+		}
+		used, err := s.sessionIDExistsAnywhere(id)
+		if err != nil {
+			return "", fmt.Errorf("snapshot: scan session id %s: %w", id, err)
+		}
+		if used {
+			continue
+		}
+		if claim {
+			if cerr := s.acquireClaimLocked(id); cerr != nil {
+				return "", cerr
+			}
+		}
+		createDir := filepath.Join(createRoot, id)
+		for _, p := range []string{filepath.Join(createDir, "snapshots"), filepath.Join(createDir, "turns")} {
+			if err := os.MkdirAll(p, 0o700); err != nil {
+				if claim {
+					s.releaseClaimLocked()
+				}
+				return "", fmt.Errorf("snapshot: create %s: %w", p, err)
+			}
+		}
+		meta.ID = id
+		if err := writeJSON(filepath.Join(createDir, "meta.json"), meta); err != nil {
+			if claim {
+				s.releaseClaimLocked()
+			}
+			return "", fmt.Errorf("snapshot: write session meta: %w", err)
+		}
+		return id, nil
+	}
+	return "", fmt.Errorf("snapshot: could not mint a unique session id in %d attempts", mintSessionIDMaxAttempts)
+}
+
+// sessionIDExistsAnywhere reports whether id is already present on disk in
+// either namespace of any project the store can see: the visible sessions
+// directories under each project and the staged candidates under
+// <project>/.staging/sessions/<nonce>. Staged candidates are deliberately
+// invisible to session enumeration but are already minted, so a scan of only
+// the visible directories cannot see them; the nonce is not known, only
+// enumerated. Only a store without a projects root (legacy and test stores)
+// falls back to scanning its own root instead.
+func (s *Store) sessionIDExistsAnywhere(id string) (bool, error) {
+	if s.projectsRoot != "" {
+		entries, err := os.ReadDir(s.projectsRoot)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		for _, e := range entries {
+			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			projectDir := filepath.Join(s.projectsRoot, e.Name())
+			used, err := sessionIDInNamespaces(filepath.Join(projectDir, "sessions"), projectDir, id)
+			if used || err != nil {
+				return used, err
+			}
+		}
+		return false, nil
+	}
+	if s.root != "" {
+		return sessionIDInNamespaces(s.root, filepath.Dir(s.root), id)
+	}
+	return false, nil
+}
+
+// scanPathMissing reports whether err means the scanned path cannot hold a
+// session id: the parent is missing, or a component is not a directory (Go
+// no longer folds ENOTDIR into os.IsNotExist). Either way the id is absent.
+func scanPathMissing(err error) bool {
+	return os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR)
+}
+
+// sessionIDInNamespaces reports whether id exists under visibleRoot (the
+// visible sessions namespace) or under any staged candidate at
+// <projectDir>/.staging/sessions/<nonce>/<id> — one level deeper in the same
+// per-project walk the lifecycle sweep performs.
+func sessionIDInNamespaces(visibleRoot, projectDir, id string) (bool, error) {
+	if _, err := os.Stat(filepath.Join(visibleRoot, id)); err == nil {
+		return true, nil
+	} else if !scanPathMissing(err) {
+		return false, err
+	}
+	stagingRoot := filepath.Join(projectDir, ".staging", "sessions")
+	nonces, err := os.ReadDir(stagingRoot)
+	if err != nil {
+		if scanPathMissing(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, n := range nonces {
+		if !n.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(stagingRoot, n.Name(), id)); err == nil {
+			return true, nil
+		} else if !scanPathMissing(err) {
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 func hashString(s string) string {

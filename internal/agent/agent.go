@@ -356,28 +356,37 @@ func sessionIDOf(unit *session) string {
 	return unit.store.SessionID()
 }
 
-func (a *Agent) registerLiveSessionLocked(unit *session) {
+// registerLiveSessionLocked records unit in the live-session map. An
+// existing entry for the same id is only acceptable when it is the same unit
+// (idempotent re-registration); a different unit is refused with an error —
+// a silently overwritten registration is indistinguishable from success, and
+// a bare id must resolve to exactly one live session.
+func (a *Agent) registerLiveSessionLocked(unit *session) error {
 	id := sessionIDOf(unit)
 	if id == "" {
-		return
+		return nil
 	}
 	unit.syncEventOwner()
 	a.ensureSessionMapLocked()
+	if existing := a.sessions[id]; existing != nil && existing != unit {
+		return fmt.Errorf("session %q is already registered to a different live session", id)
+	}
 	a.sessions[id] = unit
+	return nil
 }
 
-func (a *Agent) setCurrentSessionLocked(unit *session) {
+func (a *Agent) setCurrentSessionLocked(unit *session) error {
 	if unit == nil {
 		a.currentSessionID = ""
 		a.session = &session{rt: a.rt}
-		return
+		return nil
 	}
 	if unit.rt == nil {
 		unit.rt = a.rt
 	}
 	a.session = unit
 	a.currentSessionID = sessionIDOf(unit)
-	a.registerLiveSessionLocked(unit)
+	return a.registerLiveSessionLocked(unit)
 }
 
 func (a *Agent) liveSessionLocked(id string) (*session, error) {
@@ -2014,7 +2023,10 @@ func (a *Agent) resumeMostRecent() error {
 		}
 		rt.mu.Lock()
 		a.setSessionProject(a.session, proj)
-		a.setCurrentSessionLocked(a.session)
+		if err := a.setCurrentSessionLocked(a.session); err != nil {
+			rt.mu.Unlock()
+			return err
+		}
 		rt.mu.Unlock()
 		resumed = true
 		break
@@ -2285,7 +2297,9 @@ func (a *Agent) loadTokensFromDiskForSession(unit *session) {
 
 func (a *Agent) ensureSession() error {
 	a.refreshCurrentSessionProjectLocked()
-	a.registerLiveSessionLocked(a.session)
+	if err := a.registerLiveSessionLocked(a.session); err != nil {
+		return err
+	}
 	if a.currentSessionID == "" {
 		a.currentSessionID = a.store.SessionID()
 	}
@@ -3886,7 +3900,10 @@ func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummar
 	a.resetFileTrackerForSession(unit)
 	a.loadTokensFromDiskForSession(unit)
 	a.restoreModelFromSessionForSession(unit)
-	a.registerLiveSessionLocked(unit)
+	if err := a.registerLiveSessionLocked(unit); err != nil {
+		unit.store.Detach()
+		return SessionSummary{}, err
+	}
 	// Infallible in-commit publication: the committed prefix and summary are prebuilt,
 	// so this only captures the live classes and appends the boundary under their locks.
 	if emit != nil {
@@ -3924,15 +3941,23 @@ func (a *Agent) projectForExistingSession(id string) (*project.Project, error) {
 	if err != nil {
 		return nil, err
 	}
+	var found *project.Project
 	for i := range projects {
 		proj := projects[i]
 		if _, err := os.Stat(filepath.Join(a.projects.SessionsRoot(proj.ID), id, "meta.json")); err == nil {
-			return &proj, nil
+			if found != nil {
+				return nil, fmt.Errorf("session %q is ambiguous: it exists in more than one project", id)
+			}
+			p := proj
+			found = &p
 		} else if err != nil && !os.IsNotExist(err) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("unknown session %q", id)
+	if found == nil {
+		return nil, fmt.Errorf("unknown session %q", id)
+	}
+	return found, nil
 }
 
 func (a *Agent) cancelAndWaitIdle() error {
@@ -4056,7 +4081,10 @@ func (a *Agent) newSession(projectID string, agentType string, emit func(Hydrati
 	if err := store.PublishPreparedSession(prepared); err != nil {
 		return "", err
 	}
-	a.setCurrentSessionLocked(unit)
+	if err := a.setCurrentSessionLocked(unit); err != nil {
+		unit.store.Detach()
+		return "", err
+	}
 	sid := unit.store.SessionID()
 	if emit != nil {
 		// New sessions have empty durable history, so the in-commit capture appends the
@@ -4323,15 +4351,22 @@ func (a *Agent) sessionsRootForSession(id string) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		var found string
 		for _, proj := range projects {
 			root := a.projects.SessionsRoot(proj.ID)
 			_, err := os.Stat(filepath.Join(root, id, "meta.json"))
 			if err == nil {
-				return root, nil
+				if found != "" {
+					return "", fmt.Errorf("session %q is ambiguous: it exists in more than one project", id)
+				}
+				found = root
 			}
 			if err != nil && !os.IsNotExist(err) {
 				return "", err
 			}
+		}
+		if found != "" {
+			return found, nil
 		}
 	}
 	return a.currentSessionsRoot()
@@ -5308,9 +5343,13 @@ func (a *Agent) forkUnitStagedLocked(unit *session, turn int) (*session, error) 
 	// was current.
 	_ = os.RemoveAll(stagingRoot)
 	if a.currentSessionID == oldID {
-		a.setCurrentSessionLocked(candidate)
+		if err := a.setCurrentSessionLocked(candidate); err != nil {
+			return nil, err
+		}
 	} else {
-		a.registerLiveSessionLocked(candidate)
+		if err := a.registerLiveSessionLocked(candidate); err != nil {
+			return nil, err
+		}
 	}
 	return candidate, nil
 }

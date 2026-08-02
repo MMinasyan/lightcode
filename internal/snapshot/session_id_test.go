@@ -1,0 +1,266 @@
+package snapshot
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+)
+
+// TestOwnerGlobalSessionIDNamespace proves session ids are unique across every
+// project an owner can see: the mint scans both the visible sessions
+// namespaces and the staged candidates of every project, retries on a
+// collision without entering the colliding directory, and serializes the
+// reservation across concurrent creations in the same and different projects.
+func TestOwnerGlobalSessionIDNamespace(t *testing.T) {
+	t.Run("dead session directory is not reused or rewritten", func(t *testing.T) {
+		projectsRoot := t.TempDir()
+		projectID := "p-dead"
+		sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+		store, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// A closed session holds no flock, so the only thing standing between a
+		// fresh mint and this directory is the collision scan. Pre-create it with
+		// stale turns, as a dead session leaves behind.
+		deadID := "deadbeef"
+		deadDir := filepath.Join(sessionsRoot, deadID)
+		if err := os.MkdirAll(filepath.Join(deadDir, "turns", "1"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		stale := []byte("{\"role\":\"user\",\"content\":\"stale\"}\n")
+		if err := os.WriteFile(filepath.Join(deadDir, "turns", "1", "messages.jsonl"), stale, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(deadDir, "turns", "1", "complete"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		deadMeta := []byte("{\"id\":\"deadbeef\",\"state\":\"active\"}\n")
+		if err := os.WriteFile(filepath.Join(deadDir, "meta.json"), deadMeta, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		origMint := mintSessionIDFunc
+		defer func() { mintSessionIDFunc = origMint }()
+		calls := 0
+		mintSessionIDFunc = func() (string, error) {
+			calls++
+			if calls == 1 {
+				return deadID, nil // force the collision with the dead directory
+			}
+			return "fresh000", nil
+		}
+
+		if err := store.BeginNewSession(t.TempDir()); err != nil {
+			t.Fatalf("BeginNewSession: %v", err)
+		}
+		defer func() { _, _ = store.Close() }()
+		if store.SessionID() == deadID {
+			t.Fatalf("mint reused the dead session id %q", deadID)
+		}
+		if store.SessionID() != "fresh000" {
+			t.Fatalf("mint id = %q, want fresh000", store.SessionID())
+		}
+		gotStale, err := os.ReadFile(filepath.Join(deadDir, "turns", "1", "messages.jsonl"))
+		if err != nil {
+			t.Fatalf("read stale turns: %v", err)
+		}
+		if string(gotStale) != string(stale) {
+			t.Fatalf("stale turns rewritten: got %q, want %q", gotStale, stale)
+		}
+		gotMeta, err := os.ReadFile(filepath.Join(deadDir, "meta.json"))
+		if err != nil {
+			t.Fatalf("read dead meta: %v", err)
+		}
+		if string(gotMeta) != string(deadMeta) {
+			t.Fatalf("dead session meta rewritten: got %q, want %q", gotMeta, deadMeta)
+		}
+	})
+
+	t.Run("concurrent creations in two projects get distinct ids", func(t *testing.T) {
+		projectsRoot := t.TempDir()
+		// Every mint's first draw collides with the single reserved id, so the
+		// retry path is exercised under concurrency: without the mint mutex two
+		// mints could scan before either reserved directory exists and draw the
+		// same id.
+		origMint := mintSessionIDFunc
+		defer func() { mintSessionIDFunc = origMint }()
+		draws := 0
+		var drawMu sync.Mutex
+		mintSessionIDFunc = func() (string, error) {
+			drawMu.Lock()
+			defer drawMu.Unlock()
+			draws++
+			if draws <= 4 {
+				return "collide", nil
+			}
+			return fmt.Sprintf("uniq%05d", draws), nil
+		}
+
+		const workers = 4
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		ids := make(map[string]struct{}, workers)
+		var firstErr error
+		for i := 0; i < workers; i++ {
+			projectID := fmt.Sprintf("p-conc-%d", i)
+			store, err := NewForSessionsRoot(filepath.Join(projectsRoot, projectID, "sessions"), projectsRoot, projectID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wg.Add(1)
+			// The stores stay open (no Close): like production children, the
+			// reserved directories must remain on disk while other mints run —
+			// Close would discard the empty sessions and remove the reservation.
+			go func(store *Store) {
+				defer wg.Done()
+				if err := store.BeginChildSession(t.TempDir(), "parent"); err != nil {
+					mu.Lock()
+					firstErr = err
+					mu.Unlock()
+					return
+				}
+				mu.Lock()
+				ids[store.SessionID()] = struct{}{}
+				mu.Unlock()
+			}(store)
+		}
+		wg.Wait()
+		if firstErr != nil {
+			t.Fatalf("concurrent child creation across projects: %v", firstErr)
+		}
+		if len(ids) != workers {
+			t.Fatalf("got %d distinct ids, want %d: %v", len(ids), workers, ids)
+		}
+	})
+
+	t.Run("concurrent children in one project get distinct ids", func(t *testing.T) {
+		projectsRoot := t.TempDir()
+		projectID := "p-same"
+		sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+		// Task-child creation takes no owner lock; only the mint mutex
+		// serializes these reservations.
+		origMint := mintSessionIDFunc
+		defer func() { mintSessionIDFunc = origMint }()
+		draws := 0
+		var drawMu sync.Mutex
+		mintSessionIDFunc = func() (string, error) {
+			drawMu.Lock()
+			defer drawMu.Unlock()
+			draws++
+			if draws <= 4 {
+				return "collide", nil
+			}
+			return fmt.Sprintf("uniq%05d", draws), nil
+		}
+
+		const workers = 4
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		ids := make(map[string]struct{}, workers)
+		var firstErr error
+		for i := 0; i < workers; i++ {
+			store, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wg.Add(1)
+			// The stores stay open; see the two-project subtest for why.
+			go func(store *Store) {
+				defer wg.Done()
+				if err := store.BeginChildSession(t.TempDir(), "parent"); err != nil {
+					mu.Lock()
+					firstErr = err
+					mu.Unlock()
+					return
+				}
+				mu.Lock()
+				ids[store.SessionID()] = struct{}{}
+				mu.Unlock()
+			}(store)
+		}
+		wg.Wait()
+		if firstErr != nil {
+			t.Fatalf("concurrent child creation in one project: %v", firstErr)
+		}
+		if len(ids) != workers {
+			t.Fatalf("got %d distinct ids, want %d: %v", len(ids), workers, ids)
+		}
+	})
+
+	t.Run("staged candidate blocks a child mint in another project", func(t *testing.T) {
+		projectsRoot := t.TempDir()
+		projectA := "p-a"
+		projectB := "p-b"
+		storeA, err := NewForSessionsRoot(filepath.Join(projectsRoot, projectA, "sessions"), projectsRoot, projectA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		storeB, err := NewForSessionsRoot(filepath.Join(projectsRoot, projectB, "sessions"), projectsRoot, projectB)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		origMint := mintSessionIDFunc
+		defer func() { mintSessionIDFunc = origMint }()
+		origHook := mintPublishHook
+		defer func() { mintPublishHook = origHook }()
+
+		const stagedID = "staged01"
+		const childID = "child002"
+		calls := 0
+		mintSessionIDFunc = func() (string, error) {
+			calls++
+			if calls == 1 {
+				return stagedID, nil // the staged root's mint
+			}
+			if calls == 2 {
+				return stagedID, nil // the child's first draw must collide
+			}
+			return childID, nil
+		}
+
+		// Hold the staged candidate unpublished between its mint and its
+		// publish, the window a visible-only scan cannot see into.
+		hookFired := make(chan struct{})
+		release := make(chan struct{})
+		mintPublishHook = func() {
+			close(hookFired)
+			<-release
+		}
+
+		publishDone := make(chan error, 1)
+		go func() {
+			prepared, err := storeA.PrepareStagedNewSession(t.TempDir())
+			if err != nil {
+				publishDone <- err
+				return
+			}
+			publishDone <- storeA.PublishPreparedSession(prepared)
+		}()
+		<-hookFired // the staged id is reserved on disk under .staging
+
+		if err := storeB.BeginChildSession(t.TempDir(), "parent"); err != nil {
+			t.Fatalf("child in project B: %v", err)
+		}
+		defer func() { _, _ = storeB.Close() }()
+		if storeB.SessionID() == stagedID {
+			t.Fatalf("child drew the unpublished staged id %q", stagedID)
+		}
+		if storeB.SessionID() != childID {
+			t.Fatalf("child id = %q, want %q", storeB.SessionID(), childID)
+		}
+
+		close(release)
+		if err := <-publishDone; err != nil {
+			t.Fatalf("publish staged: %v", err)
+		}
+		defer func() { _, _ = storeA.Close() }()
+		if _, err := os.Stat(filepath.Join(storeA.Root(), stagedID, "meta.json")); err != nil {
+			t.Fatalf("staged session not published: %v", err)
+		}
+	})
+}

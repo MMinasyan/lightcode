@@ -139,7 +139,9 @@ func (a *Agent) SessionSwitch(id string) error {
 	}
 	a.setSessionProject(a.session, proj)
 	delete(a.sessions, oldID)
-	a.setCurrentSessionLocked(a.session)
+	if err := a.setCurrentSessionLocked(a.session); err != nil {
+		return err
+	}
 	meta, err := a.store.Meta()
 	if err == nil && metaState(meta.State) == snapshot.StateArchived {
 		_ = a.store.SetState(snapshot.StateActive)

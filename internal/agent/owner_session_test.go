@@ -809,7 +809,10 @@ func TestCompactionIndexesSelectedSessionProject(t *testing.T) {
 
 	first.ensureRuntime().mu.Lock()
 	second := first.sessions[secondID]
-	first.setCurrentSessionLocked(first.sessions[firstID])
+	if err := first.setCurrentSessionLocked(first.sessions[firstID]); err != nil {
+		first.ensureRuntime().mu.Unlock()
+		t.Fatalf("setCurrentSessionLocked: %v", err)
+	}
 	first.ensureRuntime().mu.Unlock()
 	if err := first.runCompactionForSession(context.Background(), second, false); err != nil {
 		t.Fatalf("runCompactionForSession second: %v", err)

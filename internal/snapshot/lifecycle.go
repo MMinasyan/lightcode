@@ -301,6 +301,13 @@ func NewStagingSessionsRoot(sessionsRoot string) (string, error) {
 	return filepath.Join(filepath.Dir(sessionsRoot), ".staging", "sessions", nonce), nil
 }
 
+// mintPublishHook fires between a staged candidate's mint and its publish
+// (the atomic rename), while the candidate is reserved on disk under staging
+// but not yet visible to session enumeration. Production no-op; tests use it
+// to hold a candidate unpublished while another mint runs. Follows the
+// forkIntoLockReleasedHook precedent.
+var mintPublishHook = func() {}
+
 // PublishStagedSession atomically publishes a staged session into the real
 // sessions namespace by renaming <stagingRoot>/<id> to <finalSessionsRoot>/<id>.
 // The rename is the single durable commit; the caller relocates the candidate
@@ -309,6 +316,7 @@ func PublishStagedSession(stagingRoot, finalSessionsRoot, id string) error {
 	if err := ValidateSessionID(id); err != nil {
 		return err
 	}
+	mintPublishHook()
 	if err := os.MkdirAll(finalSessionsRoot, 0o700); err != nil {
 		return fmt.Errorf("snapshot: publish staged: %w", err)
 	}
