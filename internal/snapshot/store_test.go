@@ -1034,6 +1034,103 @@ func TestBeginNewSessionStagedPartialFailureLeavesNoFinalDir(t *testing.T) {
 	assertNoStagingCandidate(t, projectsRoot, projectID)
 }
 
+// TestPrepareStagedNewSessionWindow proves both halves of the prepared-new-session
+// window: the store returned by PrepareStagedNewSession is addressable and mutable
+// against the staging candidate before publish (while the sessions root stays
+// empty) and is rebound to the published location after a successful publish; and
+// a failure between prepare and publish leaves nothing in the sessions root, drops
+// the session state, and removes the staging candidate.
+func TestPrepareStagedNewSessionWindow(t *testing.T) {
+	projectsRoot := t.TempDir()
+	projectID := "p-staged-window"
+	sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+	store, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, err := store.PrepareStagedNewSession(t.TempDir())
+	if err != nil {
+		t.Fatalf("PrepareStagedNewSession: %v", err)
+	}
+
+	// Half 1 — the prepared store is addressable and mutable before publish, and
+	// nothing has been published into the sessions root.
+	if !prepared.Active() {
+		t.Fatal("prepared store not active before publish")
+	}
+	if prepared.SessionID() == "" || prepared.SessionID() != store.SessionID() {
+		t.Fatalf("prepared session id %q != store session id %q", prepared.SessionID(), store.SessionID())
+	}
+	if prepared.Dir() == store.Dir() {
+		t.Fatalf("prepared store not staging-bound: dir=%q store dir=%q", prepared.Dir(), store.Dir())
+	}
+	if _, err := os.Stat(filepath.Join(prepared.Dir(), "meta.json")); err != nil {
+		t.Fatalf("prepared session dir not addressable: %v", err)
+	}
+	if _, err := prepared.Meta(); err != nil {
+		t.Fatalf("Meta through prepared store before publish: %v", err)
+	}
+	if err := prepared.SetActiveAgentType("primary"); err != nil {
+		t.Fatalf("write through prepared store before publish: %v", err)
+	}
+	if meta, err := prepared.Meta(); err != nil {
+		t.Fatalf("Meta after pre-publish write: %v", err)
+	} else if meta.ActiveAgentType != "primary" {
+		t.Fatalf("pre-publish write not visible through prepared store: %+v", meta)
+	}
+	if _, err := os.Stat(filepath.Join(sessionsRoot, prepared.SessionID())); !os.IsNotExist(err) {
+		t.Fatalf("candidate visible in sessions root before publish: %v", err)
+	}
+
+	// Publish succeeds, the prepared store is rebound to the final location, and
+	// reads and writes through it keep working there.
+	if err := store.PublishPreparedSession(prepared); err != nil {
+		t.Fatalf("PublishPreparedSession: %v", err)
+	}
+	if prepared.Root() != sessionsRoot || prepared.Dir() != filepath.Join(sessionsRoot, prepared.SessionID()) {
+		t.Fatalf("prepared store not rebound after publish: root=%q dir=%q", prepared.Root(), prepared.Dir())
+	}
+	if _, err := os.Stat(filepath.Join(sessionsRoot, prepared.SessionID(), "meta.json")); err != nil {
+		t.Fatalf("published session missing: %v", err)
+	}
+	if meta, err := prepared.Meta(); err != nil {
+		t.Fatalf("Meta through prepared store after publish: %v", err)
+	} else if meta.ActiveAgentType != "primary" {
+		t.Fatalf("pre-publish write lost after publish: %+v", meta)
+	}
+	assertNoStagingCandidate(t, projectsRoot, projectID)
+	store.Detach()
+
+	// Half 2 — a failure between prepare and publish (the sessions root is a
+	// file, so the publish rename cannot happen) leaves the sessions root clean,
+	// drops the session state, and removes the staging candidate.
+	failStore := &Store{root: sessionsRoot, projectsRoot: projectsRoot, projectID: projectID}
+	if err := os.RemoveAll(sessionsRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sessionsRoot, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orphaned, err := failStore.PrepareStagedNewSession(t.TempDir())
+	if err != nil {
+		t.Fatalf("prepare against failing root: %v", err)
+	}
+	if err := failStore.PublishPreparedSession(orphaned); err == nil {
+		t.Fatal("PublishPreparedSession should fail when the sessions root is not a directory")
+	}
+	if failStore.Active() {
+		t.Fatal("store left active after a failed publish")
+	}
+	if orphaned.Active() {
+		t.Fatal("prepared store left active after a failed publish")
+	}
+	if info, _ := os.Stat(sessionsRoot); info == nil || info.IsDir() {
+		t.Fatal("sessions root changed by a failed publish")
+	}
+	assertNoStagingCandidate(t, projectsRoot, projectID)
+}
+
 // assertNoStagingCandidate fails if any staged session candidate remains under
 // the project's staging namespace (an absent namespace is clean).
 func assertNoStagingCandidate(t *testing.T, projectsRoot, projectID string) {

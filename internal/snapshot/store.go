@@ -149,29 +149,112 @@ func (s *Store) BeginNewSession(projectRoot string) error {
 
 // BeginNewSessionStaged creates a fresh session in an unlisted staging directory
 // and atomically publishes it into the store's sessions root, so a partially
-// initialized final session directory is never listed. The Store must not have
-// an active session; on any failure it is left inactive and only staging is
-// removed. On success the store is active and rebound to the final location.
+// initialized final session directory is never listed. It is the prepare-then-
+// publish sequence over PrepareStagedNewSession and PublishPreparedSession. The
+// Store must not have an active session; on any failure it is left inactive and
+// only staging is removed. On success the store is active and rebound to the
+// final location.
 func (s *Store) BeginNewSessionStaged(projectRoot string) error {
+	prepared, err := s.PrepareStagedNewSession(projectRoot)
+	if err != nil {
+		return err
+	}
+	return s.PublishPreparedSession(prepared)
+}
+
+// PrepareStagedNewSession prepares a fresh session under an unlisted staging
+// directory and returns a staging-bound store the caller can write to before
+// publication: the session files live at <staging>/<id>, so reads and writes
+// through the returned store address the candidate in that window. This store
+// is marked active and holds the session claim, but its own cached paths stay
+// bound to the final location under s.root, which the candidate has not reached
+// yet. Nothing is written to the sessions root, so abandoning the prepared
+// store without publishing leaves no trace there. On any preparation failure
+// the store is left inactive and only staging is removed.
+//
+// Between the prepare call and the publish call the receiver is mid-transaction:
+// it is bound to a session that is not yet published, and it holds that session's
+// claim. The caller is responsible for serializing these two calls against any
+// other use of the receiver; the store does not serialize them for you. The
+// prepared store returned here carries no claim of its own — the receiver holds
+// it — so a caller that intends to keep using the prepared store after publish
+// must account for that.
+func (s *Store) PrepareStagedNewSession(projectRoot string) (*Store, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.active {
-		return fmt.Errorf("snapshot: session %q already open", s.sessionID)
+		return nil, fmt.Errorf("snapshot: session %q already open", s.sessionID)
 	}
 	stagingRoot, err := NewStagingSessionsRoot(s.root)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Prepare under staging while the cached paths stay bound to the final
 	// location, then publish by atomic rename; s.root never becomes a staging
 	// path, so a concurrent reader never observes an unpublished candidate.
 	if err := s.beginNewSessionAtLocked(projectRoot, "", stagingRoot); err != nil {
-		return cleanupStagingRoot(stagingRoot, err)
+		return nil, cleanupStagingRoot(stagingRoot, err)
 	}
-	if err := PublishStagedSession(stagingRoot, s.root, s.sessionID); err != nil {
+	// The returned store mirrors the active session with its paths rooted at
+	// staging, where the candidate's files actually live. It carries no claim:
+	// this store holds the claim until Close, matching the single-call behavior.
+	return &Store{
+		root:         stagingRoot,
+		projectsRoot: s.projectsRoot,
+		projectID:    s.projectID,
+		active:       true,
+		dir:          filepath.Join(stagingRoot, s.sessionID),
+		snapshotsDir: filepath.Join(stagingRoot, s.sessionID, "snapshots"),
+		turnsDir:     filepath.Join(stagingRoot, s.sessionID, "turns"),
+		sessionID:    s.sessionID,
+		projectRoot:  s.projectRoot,
+		projectHash:  s.projectHash,
+	}, nil
+}
+
+// PublishPreparedSession atomically publishes a session prepared by
+// PrepareStagedNewSession: it renames the candidate from its staging root into
+// this store's sessions root and rebinds the prepared store to the final
+// location, so reads and writes through it keep working after publication. Its
+// failure semantics are asymmetric around the rename. A failure before the
+// rename (the publish step) leaves nothing published: the session state is
+// dropped, both stores are left inactive, and only staging is removed, so the
+// sessions root never holds a partial session. A failure after the rename (the
+// relocation step) leaves the session published with the receiver still owning
+// it: the receiver stays active and claim-holding on the published session, and
+// only the prepared store is detached as unusable.
+//
+// Between the prepare call and this call the receiver is mid-transaction: it is
+// bound to a session that is not yet published, and it holds that session's
+// claim. The caller is responsible for serializing these two calls against any
+// other use of the receiver; the store does not serialize them for you. The
+// prepared store returned by the prepare step carries no claim of its own — the
+// receiver holds it — so a caller that intends to keep using the prepared store
+// after publish must account for that.
+func (s *Store) PublishPreparedSession(prepared *Store) error {
+	s.mu.Lock()
+	if !s.active {
+		s.mu.Unlock()
+		return ErrNoSession
+	}
+	stagingRoot := prepared.root
+	finalRoot := s.root
+	if err := PublishStagedSession(stagingRoot, finalRoot, s.sessionID); err != nil {
 		// The session is active but its files are still under staging; drop it.
 		s.clearLocked()
+		s.mu.Unlock()
+		prepared.Detach()
 		return cleanupStagingRoot(stagingRoot, err)
+	}
+	s.mu.Unlock()
+	if err := prepared.RelocateActiveSessionPaths(finalRoot); err != nil {
+		// The rename already committed: the session is published and the
+		// receiver keeps its claim on it. Only the prepared store is broken;
+		// detach it, remove the now-empty staging parent (post-commit
+		// cleanup, as on the success path), and leave the receiver active.
+		prepared.Detach()
+		_ = os.RemoveAll(stagingRoot)
+		return err
 	}
 	// Files now live at s.dir; the empty staging parent is post-commit cleanup.
 	_ = os.RemoveAll(stagingRoot)
