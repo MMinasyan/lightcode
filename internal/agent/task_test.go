@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -1050,4 +1051,141 @@ func TestPR11Closure_SeenSessionsNoRace(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+// TestSessionClaimLifecycleContract proves a live task-child session holds the
+// cross-process session claim for the whole subagent turn: a second process
+// must be refused the child's claim while it runs, and must acquire it once the
+// child closes. It drives the real task-tool construction (runSubagent's
+// NewForSessionsRoot with the task tool's project context) through a live
+// subagent turn and contends with a real second process, following the
+// subprocess convention of the snapshot claim tests.
+func TestSessionClaimLifecycleContract(t *testing.T) {
+	if root := os.Getenv("LIGHTCODE_CLAIM_LIVENESS_PROJECTS_ROOT"); root != "" {
+		// Child process: attempt the claim on the given session.
+		_, ok, err := snapshot.AcquireSessionClaim(
+			root,
+			os.Getenv("LIGHTCODE_CLAIM_LIVENESS_PROJECT_ID"),
+			os.Getenv("LIGHTCODE_CLAIM_LIVENESS_SESSION_ID"),
+		)
+		if err != nil {
+			os.Exit(3) // unexpected error, not a contention verdict
+		}
+		if !ok {
+			os.Exit(2) // refused: another process holds the claim
+		}
+		os.Exit(0) // acquired
+	}
+
+	childHeld := make(chan struct{})
+	releaseChild := make(chan struct{})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch calls.Add(1) {
+		case 1:
+			writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"claim probe","subagent_type":"explore"}]}`)
+		case 2:
+			// The child's first provider request means its store is active and
+			// holds the session claim; keep it live until the test is done.
+			close(childHeld)
+			<-releaseChild
+			writeTextResponse(w, "child done")
+		case 3:
+			writeTextResponse(w, "parent done")
+		default:
+			t.Fatalf("unexpected provider call %d", calls.Load())
+		}
+	}))
+	defer server.Close()
+	// Release a blocked child turn on any exit path before server.Close, so a
+	// failed assertion cannot deadlock cleanup on the still-open request.
+	defer func() {
+		select {
+		case <-releaseChild:
+		default:
+			close(releaseChild)
+		}
+	}()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	proj, err := a.projects.Current()
+	if err != nil || proj == nil {
+		t.Fatalf("current project: %v", err)
+	}
+	parentID := a.SessionCurrent().ID
+
+	submitDone := make(chan error, 1)
+	go func() {
+		_, err := a.Submit(ctx, "claim probe")
+		submitDone <- err
+	}()
+
+	select {
+	case <-childHeld:
+	case <-time.After(10 * time.Second):
+		t.Fatal("task-child never reached its live turn")
+	}
+
+	// The child session is published in the project sessions root; it is the
+	// only session directory there other than the parent's.
+	sessionsRoot := a.projects.SessionsRoot(proj.ID)
+	childID := ""
+	deadline := time.Now().Add(5 * time.Second)
+	for childID == "" && time.Now().Before(deadline) {
+		entries, err := os.ReadDir(sessionsRoot)
+		if err != nil {
+			t.Fatalf("read sessions root: %v", err)
+		}
+		for _, e := range entries {
+			if e.IsDir() && e.Name() != parentID {
+				childID = e.Name()
+				break
+			}
+		}
+		if childID == "" {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if childID == "" {
+		t.Fatal("task-child session directory not found")
+	}
+
+	attemptClaim := func() (int, string) {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestSessionClaimLifecycleContract$")
+		cmd.Env = append(os.Environ(),
+			"LIGHTCODE_CLAIM_LIVENESS_PROJECTS_ROOT="+a.projects.Root(),
+			"LIGHTCODE_CLAIM_LIVENESS_PROJECT_ID="+proj.ID,
+			"LIGHTCODE_CLAIM_LIVENESS_SESSION_ID="+childID,
+		)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return 0, ""
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return exitErr.ExitCode(), ""
+		}
+		return -1, fmt.Sprintf("%v\n%s", err, out)
+	}
+
+	// While the child runs, a second process must be refused the claim.
+	if code, detail := attemptClaim(); code != 2 {
+		t.Fatalf("second process claim while child live = exit %d %s, want refusal (2)", code, detail)
+	}
+
+	close(releaseChild)
+	if err := <-submitDone; err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	waitUntilEventOrderTurnEndCount(t, cap, 1)
+
+	// Once the child closed, the same claim is acquirable again.
+	if code, detail := attemptClaim(); code != 0 {
+		t.Fatalf("second process claim after child close = exit %d %s, want acquisition (0)", code, detail)
+	}
 }

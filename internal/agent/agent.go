@@ -609,6 +609,10 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 	if projectID != "" && a.projects != nil {
 		memoriesDir = filepath.Join(a.projects.Root(), projectID, "memories")
 	}
+	projectsRoot := ""
+	if a.projects != nil {
+		projectsRoot = a.projects.Root()
+	}
 	tt := newTaskTool(taskToolConfig{
 		AgentTypes:    a.agents,
 		ParentStore:   store,
@@ -622,6 +626,7 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 		ProcMgr:       a.procMgr,
 		MemoryStore:   a.memoryStore,
 		ProjectID:     projectID,
+		ProjectsRoot:  projectsRoot,
 		MemoriesDir:   memoriesDir,
 		LSPManager:    lspMgr,
 		Check:         checkPolicy,

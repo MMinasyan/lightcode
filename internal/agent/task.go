@@ -64,6 +64,7 @@ type taskTool struct {
 	procMgr       *process.Manager
 	memoryStore   *memory.Store
 	projectID     string
+	projectsRoot  string
 	memoriesDir   string
 	lspManager    *lsp.Manager
 	check         tool.CheckFunc
@@ -91,6 +92,7 @@ type taskToolConfig struct {
 	ProcMgr       *process.Manager
 	MemoryStore   *memory.Store
 	ProjectID     string
+	ProjectsRoot  string
 	MemoriesDir   string
 	LSPManager    *lsp.Manager
 	Check         tool.CheckFunc
@@ -117,6 +119,7 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		procMgr:       cfg.ProcMgr,
 		memoryStore:   cfg.MemoryStore,
 		projectID:     cfg.ProjectID,
+		projectsRoot:  cfg.ProjectsRoot,
 		memoriesDir:   cfg.MemoriesDir,
 		lspManager:    cfg.LSPManager,
 		check:         cfg.Check,
@@ -367,7 +370,7 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		return taskResult{index: index, err: fmt.Errorf("subagent: parent turn is not active")}
 	}
 
-	childStore, err := snapshot.NewForSessionsRoot(t.parentStore.Root(), "", "")
+	childStore, err := snapshot.NewForSessionsRoot(t.parentStore.Root(), t.projectsRoot, t.projectID)
 	if err != nil {
 		return taskResult{index: index, err: err}
 	}
