@@ -3075,14 +3075,37 @@ func (a *Agent) reloadLockedNoRefresh() error {
 }
 
 func (a *Agent) reloadLockedWithRefresh(allowBackgroundDiscovery bool) error {
-	cfg, err := config.Load(a.configPath)
+	cfg, agentTypes, modelCatalog, catalogWarnings, err := a.loadReloadStateLocked(allowBackgroundDiscovery)
 	if err != nil {
 		return err
 	}
+	return a.applyReloadStateLocked(cfg, agentTypes, modelCatalog, catalogWarnings)
+}
+
+// loadReloadStateLocked loads the config, agents config, and model catalog
+// without touching shared agent state. When allowBackgroundDiscovery is true,
+// connected providers that are due for a refresh have their live discovery
+// fetched (network) before the catalog is assembled; callers that must not run
+// network I/O under the lock pass false. Caller holds runtime.mu.
+func (a *Agent) loadReloadStateLocked(allowBackgroundDiscovery bool) (*config.Config, *agentcfg.Config, *catalog.Catalog, []catalog.Warning, error) {
+	cfg, err := config.Load(a.configPath)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
 	agentTypes, err := agentcfg.Load(a.agentsPath)
 	if err != nil {
-		return fmt.Errorf("load agents config: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("load agents config: %w", err)
 	}
+	modelCatalog, catalogWarnings, err := a.loadCatalogLocked(allowBackgroundDiscovery)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return cfg, agentTypes, modelCatalog, catalogWarnings, nil
+}
+
+// loadCatalogLocked loads and assembles the model catalog from the bundled
+// catalog, the user config, and the discovery cache. Caller holds runtime.mu.
+func (a *Agent) loadCatalogLocked(allowBackgroundDiscovery bool) (*catalog.Catalog, []catalog.Warning, error) {
 	modelLoader := catalog.NewLoaderWithConfigPath(a.home, nil, a.configPath)
 	modelLoader.AllowRefresh = func(_ string, prov *catalog.Provider) bool {
 		if !allowBackgroundDiscovery {
@@ -3092,9 +3115,15 @@ func (a *Agent) reloadLockedWithRefresh(allowBackgroundDiscovery bool) error {
 	}
 	modelCatalog, catalogWarnings, err := modelLoader.Load()
 	if err != nil {
-		return fmt.Errorf("load model catalog: %w", err)
+		return nil, nil, fmt.Errorf("load model catalog: %w", err)
 	}
+	return modelCatalog, catalogWarnings, nil
+}
 
+// applyReloadStateLocked publishes freshly loaded config, agents, and catalog
+// state and refreshes the derived session state (active model, process limits,
+// warning groups). Caller holds runtime.mu.
+func (a *Agent) applyReloadStateLocked(cfg *config.Config, agentTypes *agentcfg.Config, modelCatalog *catalog.Catalog, catalogWarnings []catalog.Warning) error {
 	a.cfg = cfg
 	a.setAgentTypesLocked(agentTypes)
 	a.catalog = modelCatalog

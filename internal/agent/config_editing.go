@@ -6,6 +6,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
@@ -322,10 +323,30 @@ func lockedModelFields(cfg ModelConfigInput) error {
 }
 
 // SaveModel adds or edits one model's fields under a provider (user-layer
-// overrides). Used for both editing and "add model".
+// overrides). Used for both editing and "add model". The discovery cache is
+// warmed for the providers the reload would refresh (outside runtime.mu, see
+// warmSettingsEditDiscovery); the config mutation and the locked reload then
+// share a single lock hold.
 func (a *Agent) SaveModel(providerID, modelID string, cfg ModelConfigInput) error {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
+	warmWarnings, err := a.warmSettingsEditDiscovery()
+	if err != nil {
+		return err
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if err := a.saveModelLocked(providerID, modelID, cfg); err != nil {
+		return err
+	}
+	if err := a.reloadLocked(); err != nil {
+		return err
+	}
+	a.surfaceCatalogWarnings(warmWarnings)
+	return nil
+}
+
+// saveModelLocked validates and writes a model edit. Caller holds runtime.mu.
+func (a *Agent) saveModelLocked(providerID, modelID string, cfg ModelConfigInput) error {
 	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot edit model while a turn is running")
 	}
@@ -346,20 +367,37 @@ func (a *Agent) SaveModel(providerID, modelID string, cfg ModelConfigInput) erro
 		}
 	}
 	ref := coremodel.ModelRef{Provider: providerID, Model: modelID}
-	if err := a.mutateModelConfig(ref, func(m map[string]any) error {
+	return a.mutateModelConfig(ref, func(m map[string]any) error {
 		applyModelFields(m, cfg)
 		return nil
-	}); err != nil {
-		return err
-	}
-	return a.reloadLocked()
+	})
 }
 
 // DeleteModel removes a user-added model from config. Bundled/discovered models
 // cannot be deleted (the merge would re-add them); hide or reset them instead.
+// The discovery cache is warmed for the providers the reload would refresh
+// (outside runtime.mu, see warmSettingsEditDiscovery); the config mutation and
+// the locked reload then share a single lock hold.
 func (a *Agent) DeleteModel(providerID, modelID string) error {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
+	warmWarnings, err := a.warmSettingsEditDiscovery()
+	if err != nil {
+		return err
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if err := a.deleteModelLocked(providerID, modelID); err != nil {
+		return err
+	}
+	if err := a.reloadLocked(); err != nil {
+		return err
+	}
+	a.surfaceCatalogWarnings(warmWarnings)
+	return nil
+}
+
+// deleteModelLocked validates and writes a model deletion. Caller holds runtime.mu.
+func (a *Agent) deleteModelLocked(providerID, modelID string) error {
 	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot delete model while a turn is running")
 	}
@@ -368,7 +406,7 @@ func (a *Agent) DeleteModel(providerID, modelID string) error {
 	if a.modelSourceLocked(providerID, modelID) != modelSourceUser {
 		return fmt.Errorf("cannot delete model %q: only user-added models can be removed; hide or reset it instead", modelID)
 	}
-	if err := a.mutateConfigRootLocked(func(root map[string]any) error {
+	return a.mutateConfigRootLocked(func(root map[string]any) error {
 		providers, err := providerRootMap(root)
 		if err != nil {
 			return err
@@ -383,10 +421,7 @@ func (a *Agent) DeleteModel(providerID, modelID string) error {
 		}
 		delete(models, modelID)
 		return nil
-	}); err != nil {
-		return err
-	}
-	return a.reloadLocked()
+	})
 }
 
 var resettableModelFields = map[string]struct{}{
@@ -395,20 +430,45 @@ var resettableModelFields = map[string]struct{}{
 }
 
 // ResetModelField deletes a single user-layer override on a model, reverting it
-// to the bundled/discovery value. No-op (no write) when no override exists.
+// to the bundled/discovery value. No-op (no write) when no override exists. The
+// discovery cache is warmed for the providers the reload would refresh (outside
+// runtime.mu, see warmSettingsEditDiscovery); the config mutation and the
+// locked reload then share a single lock hold.
 func (a *Agent) ResetModelField(providerID, modelID, field string) error {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
+	warmWarnings, err := a.warmSettingsEditDiscovery()
+	if err != nil {
+		return err
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	changed, err := a.resetModelFieldLocked(providerID, modelID, field)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	if err := a.reloadLocked(); err != nil {
+		return err
+	}
+	a.surfaceCatalogWarnings(warmWarnings)
+	return nil
+}
+
+// resetModelFieldLocked validates and writes a model field reset, reporting
+// whether the write actually removed an override. Caller holds runtime.mu.
+func (a *Agent) resetModelFieldLocked(providerID, modelID, field string) (bool, error) {
 	if a.ensureRuntime().sessionLocked().busy {
-		return fmt.Errorf("cannot reset model field while a turn is running")
+		return false, fmt.Errorf("cannot reset model field while a turn is running")
 	}
 	if _, ok := resettableModelFields[field]; !ok {
-		return fmt.Errorf("field %q cannot be reset", field)
+		return false, fmt.Errorf("field %q cannot be reset", field)
 	}
 	providerID = strings.TrimSpace(providerID)
 	modelID = strings.TrimSpace(modelID)
 	if field == "context_window" && a.modelSourceLocked(providerID, modelID) == modelSourceUser {
-		return fmt.Errorf("cannot reset context_window for user-added model %q", modelID)
+		return false, fmt.Errorf("cannot reset context_window for user-added model %q", modelID)
 	}
 	changed := false
 	if err := a.mutateModelConfig(coremodel.ModelRef{Provider: providerID, Model: modelID}, func(m map[string]any) error {
@@ -418,19 +478,37 @@ func (a *Agent) ResetModelField(providerID, modelID, field string) error {
 		}
 		return nil
 	}); err != nil {
-		return err
+		return false, err
 	}
-	if !changed {
-		return nil
-	}
-	return a.reloadLocked()
+	return changed, nil
 }
 
 // SetProviderConfig edits an existing provider's transport and provider-level
-// fields (user-layer overrides). The API key value is never written here.
+// fields (user-layer overrides). The API key value is never written here. The
+// discovery cache is warmed for the providers the reload would refresh
+// (outside runtime.mu, see warmSettingsEditDiscovery); the config mutation and
+// the locked reload then share a single lock hold.
 func (a *Agent) SetProviderConfig(providerID string, cfg ProviderConfigInput) error {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
+	warmWarnings, err := a.warmSettingsEditDiscovery()
+	if err != nil {
+		return err
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if err := a.setProviderConfigLocked(providerID, cfg); err != nil {
+		return err
+	}
+	if err := a.reloadLocked(); err != nil {
+		return err
+	}
+	a.surfaceCatalogWarnings(warmWarnings)
+	return nil
+}
+
+// setProviderConfigLocked validates and writes a provider edit. Caller holds
+// runtime.mu.
+func (a *Agent) setProviderConfigLocked(providerID string, cfg ProviderConfigInput) error {
 	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot edit provider while a turn is running")
 	}
@@ -473,16 +551,13 @@ func (a *Agent) SetProviderConfig(providerID string, cfg ProviderConfigInput) er
 		}
 		cfg.Headers = nil
 	}
-	if err := a.mutateProviderConfig(providerID, func(pm map[string]any) error {
+	return a.mutateProviderConfig(providerID, func(pm map[string]any) error {
 		applyProviderFields(pm, cfg)
 		if headersProvided {
 			writeTransportHeaders(pm, cleaned)
 		}
 		return nil
-	}); err != nil {
-		return err
-	}
-	return a.reloadLocked()
+	})
 }
 
 func stripBundledHeaderKeys(headers map[string]string, providerID string) map[string]string {
@@ -528,18 +603,44 @@ var transportFields = map[string]struct{}{
 
 // ResetProviderField deletes a single user-layer override on a provider,
 // reverting it to the bundled value. No-op (no write) when no override exists.
+// The discovery cache is warmed for the providers the reload would refresh
+// (outside runtime.mu, see warmSettingsEditDiscovery); the config mutation and
+// the locked reload then share a single lock hold.
 func (a *Agent) ResetProviderField(providerID, field string) error {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
+	warmWarnings, err := a.warmSettingsEditDiscovery()
+	if err != nil {
+		return err
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	changed, err := a.resetProviderFieldLocked(providerID, field)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	if err := a.reloadLocked(); err != nil {
+		return err
+	}
+	a.surfaceCatalogWarnings(warmWarnings)
+	return nil
+}
+
+// resetProviderFieldLocked validates and writes a provider field reset,
+// reporting whether the write actually removed an override. Caller holds
+// runtime.mu.
+func (a *Agent) resetProviderFieldLocked(providerID, field string) (bool, error) {
 	if a.ensureRuntime().sessionLocked().busy {
-		return fmt.Errorf("cannot reset provider field while a turn is running")
+		return false, fmt.Errorf("cannot reset provider field while a turn is running")
 	}
 	if _, ok := resettableProviderFields[field]; !ok {
-		return fmt.Errorf("field %q cannot be reset", field)
+		return false, fmt.Errorf("field %q cannot be reset", field)
 	}
 	if field == "api_key_env" {
 		if prov := a.catalog.Providers[providerID]; prov != nil && providerConnected(prov) {
-			return fmt.Errorf("disconnect provider %q before resetting its API key variable", providerID)
+			return false, fmt.Errorf("disconnect provider %q before resetting its API key variable", providerID)
 		}
 	}
 	_, isTransport := transportFields[field]
@@ -559,10 +660,59 @@ func (a *Agent) ResetProviderField(providerID, field string) error {
 		}
 		return nil
 	}); err != nil {
-		return err
+		return false, err
 	}
-	if !changed {
-		return nil
+	return changed, nil
+}
+
+// warmSettingsEditDiscovery runs the first two phases of a settings edit's
+// reload. Under runtime.mu it builds the same no-refresh catalog the locked
+// reload starts from and works out which providers that reload would fetch
+// discovery for; without the lock it then warms the discovery cache for
+// exactly those providers by calling the same refresh function the locked
+// reload calls (catalog.RefreshProviderDiscoveryWithConfigPath, which applies
+// its own timeout bound internally). Nothing is merged, rebuilt, or applied
+// here: the only effect is that the cache and attempt markers on disk are
+// fresh, so the reload that follows (in the edit's single lock hold) finds the
+// attempts recent and does no network I/O while holding runtime.mu. The
+// refresh warnings are returned so the caller can surface them next to the
+// reload's own catalog warnings.
+func (a *Agent) warmSettingsEditDiscovery() ([]catalog.Warning, error) {
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	modelCatalog, _, err := a.loadCatalogLocked(false)
+	if err != nil {
+		rt.mu.Unlock()
+		return nil, err
 	}
-	return a.reloadLocked()
+	_, attempts, _ := catalog.ReadDiscoveryCache(a.home)
+	now := time.Now().UTC()
+	var planned []string
+	for _, providerID := range catalog.DiscoveryRefreshCandidates(modelCatalog, attempts, now) {
+		prov := modelCatalog.Providers[providerID]
+		if prov == nil || !providerConnected(prov) {
+			continue
+		}
+		if prov.Transport.APIKeyEnv != "" && os.Getenv(prov.Transport.APIKeyEnv) == "" {
+			continue
+		}
+		planned = append(planned, providerID)
+	}
+	rt.mu.Unlock()
+
+	var warnings []catalog.Warning
+	for _, providerID := range planned {
+		_, providerWarnings := catalog.RefreshProviderDiscoveryWithConfigPath(context.Background(), a.home, a.configPath, modelCatalog, providerID)
+		warnings = append(warnings, providerWarnings...)
+	}
+	return warnings, nil
+}
+
+// surfaceCatalogWarnings appends a settings edit's warm-phase discovery
+// refresh warnings to the catalog warning group, next to the locked reload's
+// own warnings.
+func (a *Agent) surfaceCatalogWarnings(warnings []catalog.Warning) {
+	for _, w := range catalogWarningsToPromptWarnings(warnings) {
+		a.addWarning("catalog", w)
+	}
 }
