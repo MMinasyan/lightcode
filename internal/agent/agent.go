@@ -4004,13 +4004,25 @@ func (a *Agent) newSession(projectID string, agentType string, emit func(Hydrati
 	if err != nil {
 		return "", err
 	}
-	if err := unit.store.BeginNewSessionStaged(proj.Path); err != nil {
+	// Prepare the candidate under an unlisted staging directory and run every
+	// fallible step against the not-yet-published session before the durable
+	// commit, mirroring forkUnitStagedLocked. From here until publish the
+	// receiver (store) is mid-transaction: active, bound to the final location,
+	// and holding the session's claim, while the returned prepared store carries
+	// no claim of its own and addresses the candidate under staging. The single
+	// durable commit is the atomic rename in PublishPreparedSession; a failure
+	// at any earlier step aborts the creation with nothing published.
+	prepared, err := store.PrepareStagedNewSession(proj.Path)
+	if err != nil {
 		return "", err
 	}
 	a.ensureActiveModelForSessionLocked(unit)
 	if unit.currentRef.Provider != "" && unit.currentRef.Model != "" {
-		if err := unit.store.SetModel(unit.currentRef.Provider, unit.currentRef.Model); err != nil {
-			fmt.Fprintf(os.Stderr, "lightcode: store.SetModel: %v\n", err)
+		if err := prepared.SetModel(unit.currentRef.Provider, unit.currentRef.Model); err != nil {
+			stagingRoot := prepared.Root()
+			prepared.Detach()
+			store.Detach()
+			return "", cleanupStaging(stagingRoot, fmt.Errorf("persist model: %w", err))
 		}
 	}
 	unit.lp.ResetHistory()
@@ -4018,16 +4030,26 @@ func (a *Agent) newSession(projectID string, agentType string, emit func(Hydrati
 		unit.fileTracker.Reset()
 	}
 	a.loadTokensFromDiskForSession(unit)
-	// Prepare the complete summary from the just-created meta before the in-memory
-	// registration, so the boundary carries the durable CreatedAt/LastActivity and no
+	// Prepare the complete summary from the staged meta before the durable
+	// commit, so the boundary carries the durable CreatedAt/LastActivity and no
 	// fallible read runs after that commit.
 	var prebuiltSummary SessionSummary
 	if emit != nil {
-		if meta, merr := unit.store.Meta(); merr == nil {
-			prebuiltSummary = sessionSummaryFromMeta(meta)
-		} else {
-			prebuiltSummary = SessionSummary{ID: unit.store.SessionID(), State: snapshot.StateActive, ProjectPath: proj.Path}
+		meta, merr := prepared.Meta()
+		if merr != nil {
+			stagingRoot := prepared.Root()
+			prepared.Detach()
+			store.Detach()
+			return "", cleanupStaging(stagingRoot, fmt.Errorf("read session meta: %w", merr))
 		}
+		prebuiltSummary = sessionSummaryFromMeta(meta)
+	}
+	// Durable commit: the atomic rename publishes the candidate into the
+	// sessions root. The receiver keeps the claim on the published session, and
+	// the unit keeps the receiver as its store, so the claim is released only
+	// when the session closes. Post-commit publication is infallible.
+	if err := store.PublishPreparedSession(prepared); err != nil {
+		return "", err
 	}
 	a.setCurrentSessionLocked(unit)
 	sid := unit.store.SessionID()
@@ -5159,7 +5181,7 @@ func (a *Agent) revertHistoryForSession(unit *session, turn int, emit func(Hydra
 	return nil
 }
 
-// cleanupStaging removes a fork's staging directory after a preparation
+// cleanupStaging removes a candidate's staging directory after a preparation
 // failure, joining any cleanup error with the original cause so neither is lost.
 func cleanupStaging(stagingRoot string, cause error) error {
 	if err := os.RemoveAll(stagingRoot); err != nil {
