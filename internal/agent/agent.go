@@ -4126,7 +4126,6 @@ func (a *Agent) ensureProjectForPath(projectPath string) (*project.Project, erro
 	return project.EnsureForPath(a.projects.Root(), abs)
 }
 
-// SessionArchive archives a session.
 // claimPersistedOnlySession acquires a temporary claim for a session that is
 // not live in this owner, so a persisted-only archive/delete cannot mutate a
 // session another process is driving. The caller releases via the returned
@@ -4144,113 +4143,106 @@ func (a *Agent) claimPersistedOnlySession(sessionsRoot, id string) (func(), erro
 	return func() { _ = claim.Release() }, nil
 }
 
+// SessionArchive archives a session.
 func (a *Agent) SessionArchive(id string) error {
-	defer a.lockLifecycle()()
-	id = strings.TrimSpace(id)
-	sessionsRoot, err := a.sessionsRootForUserManagedSession(id)
-	if err != nil {
-		return err
-	}
-	closedCurrent, err := a.closeIfCurrent(id)
-	if err != nil {
-		return err
-	}
-	needTempClaim := closedCurrent
-	var releaseClose func()
-	if !closedCurrent {
-		releaseClose, err = a.beginLiveSessionClose(id)
-		if err != nil {
-			return err
-		}
-		if releaseClose != nil {
-			defer func() {
-				if releaseClose != nil {
-					releaseClose()
-				}
-			}()
-		} else {
-			needTempClaim = true
-		}
-	}
-	if needTempClaim {
-		// A current or persisted-only target holds no live store claim; take a
-		// temporary claim so the durable mutation still owns the session.
-		claimRelease, cerr := a.claimPersistedOnlySession(sessionsRoot, id)
-		if cerr != nil {
-			return cerr
-		}
-		defer claimRelease()
-	}
-	if err := snapshot.ArchiveSession(sessionsRoot, id); err != nil {
-		return err
-	}
-	if a.gate != nil {
-		a.gate.CancelSession(id)
-	}
-	if _, err := a.closeLiveSession(id); err != nil {
-		return err
-	}
-	releaseClose = nil
-	if closedCurrent {
-		a.resetCurrentSessionState()
-	}
-	return nil
+	return a.removeSession(id, func(sessionsRoot, id string) error {
+		return snapshot.ArchiveSession(sessionsRoot, id)
+	})
 }
 
 // SessionDelete removes a session from disk.
 func (a *Agent) SessionDelete(id string) error {
+	return a.removeSession(id, func(sessionsRoot, id string) error {
+		if err := snapshot.DeleteSession(sessionsRoot, id); err != nil {
+			return err
+		}
+		if a.memoryHooks != nil {
+			_ = a.memoryHooks.DeleteSessionSummaries(id)
+		}
+		return nil
+	})
+}
+
+// removeSession is the single removal transaction behind SessionArchive and
+// SessionDelete, parameterised by the durable mutation. Ordering is reserve,
+// commit, release: the target is quiesced and reserved (transitioning) while
+// its claim is held, the durable mutation runs under that claim, and only a
+// successful commit publishes the teardown (detach, evict from the live map,
+// clear the selection and the queue, reset current-session state). The durable
+// commit is the point of no return — every step before it is reversible, so a
+// failure there leaves the unit live, claimed, selected and with its queue
+// intact, and the reservation release on the way out clears transitioning and
+// re-nudges the drainers.
+func (a *Agent) removeSession(id string, durable func(sessionsRoot string, id string) error) error {
 	defer a.lockLifecycle()()
 	id = strings.TrimSpace(id)
 	sessionsRoot, err := a.sessionsRootForUserManagedSession(id)
 	if err != nil {
 		return err
 	}
-	closedCurrent, err := a.closeIfCurrent(id)
-	if err != nil {
-		return err
-	}
-	needTempClaim := closedCurrent
-	var releaseClose func()
-	if !closedCurrent {
-		releaseClose, err = a.beginLiveSessionClose(id)
+
+	// Reserve before the durable mutation. The current session quiesces its
+	// running turn while staying attached, so its claim is held across the
+	// commit; a live non-current unit gets the same transitioning reservation
+	// while its claim stays held. Neither releases the claim nor touches the
+	// queue here, so a failed commit leaves everything intact.
+	isCurrent := a.store.Active() && a.store.SessionID() == id
+	var releaseReservation func()
+	if isCurrent {
+		a.ensureRuntime().beginTransition()
+		if err := a.cancelAndWaitIdle(); err != nil {
+			a.endLiveTransition(a.session)
+			return err
+		}
+		releaseReservation = func() { a.endLiveTransition(a.session) }
+	} else {
+		releaseReservation, err = a.beginLiveSessionClose(id)
 		if err != nil {
 			return err
 		}
-		if releaseClose != nil {
-			defer func() {
-				if releaseClose != nil {
-					releaseClose()
-				}
-			}()
-		} else {
-			needTempClaim = true
-		}
 	}
-	if needTempClaim {
-		// A current or persisted-only target holds no live store claim; take a
-		// temporary claim so the durable mutation still owns the session.
+	if releaseReservation != nil {
+		defer func() {
+			if releaseReservation != nil {
+				releaseReservation()
+			}
+		}()
+	}
+	// A target that is not live in this owner holds no claim of its own; take
+	// a temporary claim so the durable mutation still owns the session.
+	if releaseReservation == nil {
 		claimRelease, cerr := a.claimPersistedOnlySession(sessionsRoot, id)
 		if cerr != nil {
 			return cerr
 		}
 		defer claimRelease()
 	}
-	if err := snapshot.DeleteSession(sessionsRoot, id); err != nil {
+
+	// Point of no return: commit durably with the claim held.
+	if err := durable(sessionsRoot, id); err != nil {
 		return err
 	}
 	if a.gate != nil {
 		a.gate.CancelSession(id)
 	}
-	if a.memoryHooks != nil {
-		_ = a.memoryHooks.DeleteSessionSummaries(id)
-	}
-	if _, err := a.closeLiveSession(id); err != nil {
+	if isCurrent {
+		// Publish the removal: detach (not Close, so an empty session is
+		// preserved for archive), evict from the live map, and clear the
+		// selection and the queue.
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		a.store.Detach()
+		if a.currentSessionID == id {
+			a.currentSessionID = ""
+		}
+		delete(a.sessions, id)
+		rt.clearQueueLocked()
+		rt.mu.Unlock()
+		a.resetCurrentSessionState()
+	} else if _, err := a.closeLiveSession(id); err != nil {
 		return err
 	}
-	releaseClose = nil
-	if closedCurrent {
-		a.resetCurrentSessionState()
-	}
+	releaseReservation = nil
 	return nil
 }
 
@@ -4433,32 +4425,6 @@ func (a *Agent) beginLiveSessionClose(id string) (func(), error) {
 	unit.transitioning = true
 	rt.mu.Unlock()
 	return func() { a.endLiveTransition(unit) }, nil
-}
-
-func (a *Agent) closeIfCurrent(id string) (bool, error) {
-	if !a.store.Active() || a.store.SessionID() != id {
-		return false, nil // not the current session: not a transition, queue untouched
-	}
-	// Transition begins only once we've decided to actually close the current
-	// session; clear registered before cancelAndWaitIdle covers its error path.
-	a.ensureRuntime().beginTransition()
-	defer a.endLiveTransition(a.session)
-	if err := a.cancelAndWaitIdle(); err != nil {
-		return false, err
-	}
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
-	// Detach (not Close) so an empty session is preserved for archive; delete
-	// removes it via the atomic rename, not an empty-session discard.
-	a.store.Detach()
-	if a.currentSessionID == id {
-		a.currentSessionID = ""
-	}
-	delete(a.sessions, id)
-	// Close (no LoadSession follows for archive/delete) is the irreversible
-	// change: clear the queue now.
-	a.ensureRuntime().clearQueueLocked()
-	return true, nil
 }
 
 func (a *Agent) closeLiveSession(id string) (bool, error) {
