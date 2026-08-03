@@ -175,7 +175,8 @@
   async function hydrate() {
     let id = sessionId;
     if (!id) {
-      try { const cur = await SessionCurrent(); id = cur?.id || ''; } catch (e) {}
+      try { const cur = await SessionCurrent(); id = cur?.id || ''; }
+      catch (e) { showError(e, 'Load session failed'); }
     }
     if (id) {
       try { applySnapshot(await HydrateSession(id)); }

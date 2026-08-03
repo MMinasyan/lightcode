@@ -85,7 +85,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 
 		snapshotInput := -1
 		done := make(chan struct{})
-		if _, err := a.captureState(unit, func(st completeState) {
+		if _, err := a.captureStateForSelection(unit, func(st completeState) {
 			mu.Lock()
 			order = append(order, "boundary")
 			mu.Unlock()
@@ -95,7 +95,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 				close(done)
 			}()
 		}); err != nil {
-			t.Fatalf("captureState: %v", err)
+			t.Fatalf("captureStateForSelection: %v", err)
 		}
 		<-done
 
@@ -127,13 +127,13 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 		a.recordUsageForSession(unit, loop.Event{Model: "m", ModelRef: ref, UsageKnown: true, Input: 9})
 
 		snapshotInput := -1
-		if _, err := a.captureState(unit, func(st completeState) {
+		if _, err := a.captureStateForSelection(unit, func(st completeState) {
 			mu.Lock()
 			order = append(order, "boundary")
 			mu.Unlock()
 			snapshotInput = st.tokens.Total.Input
 		}); err != nil {
-			t.Fatalf("captureState: %v", err)
+			t.Fatalf("captureStateForSelection: %v", err)
 		}
 		mu.Lock()
 		got := append([]string(nil), order...)
@@ -163,7 +163,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 
 		snapshotWarnings := -1
 		done := make(chan struct{})
-		if _, err := a.captureState(unit, func(st completeState) {
+		if _, err := a.captureStateForSelection(unit, func(st completeState) {
 			mu.Lock()
 			order = append(order, "boundary")
 			mu.Unlock()
@@ -173,7 +173,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 				close(done)
 			}()
 		}); err != nil {
-			t.Fatalf("captureState: %v", err)
+			t.Fatalf("captureStateForSelection: %v", err)
 		}
 		<-done
 
@@ -228,7 +228,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 
 		snapshotPerms := -1
 		pendingDuringCapture := -1
-		if _, err := a.captureState(unit, func(st completeState) {
+		if _, err := a.captureStateForSelection(unit, func(st completeState) {
 			snapshotPerms = len(st.permissions)
 			mu.Lock()
 			order = append(order, "boundary")
@@ -242,7 +242,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 			}
 			pendingDuringCapture = len(a.gate.PendingForSessionLocked(sessionID))
 		}); err != nil {
-			t.Fatalf("captureState: %v", err)
+			t.Fatalf("captureStateForSelection: %v", err)
 		}
 		deadline := time.Now().Add(2 * time.Second)
 		for len(a.gate.PendingForSession(sessionID)) == 0 && time.Now().Before(deadline) {
@@ -284,7 +284,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 
 		snapshotTail := -1
 		done := make(chan struct{})
-		if _, err := a.captureState(unit, func(st completeState) {
+		if _, err := a.captureStateForSelection(unit, func(st completeState) {
 			mu.Lock()
 			order = append(order, "boundary")
 			mu.Unlock()
@@ -294,7 +294,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 				close(done)
 			}()
 		}); err != nil {
-			t.Fatalf("captureState: %v", err)
+			t.Fatalf("captureStateForSelection: %v", err)
 		}
 		<-done
 
@@ -327,13 +327,13 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 		a.feedAndEmit(tr, Event{Kind: EventTextDelta, SessionID: sessionIDOf(unit), Result: "before-row"})
 
 		snapshotTail := -1
-		if _, err := a.captureState(unit, func(st completeState) {
+		if _, err := a.captureStateForSelection(unit, func(st completeState) {
 			mu.Lock()
 			order = append(order, "boundary")
 			mu.Unlock()
 			snapshotTail = len(st.transcript.tail)
 		}); err != nil {
-			t.Fatalf("captureState: %v", err)
+			t.Fatalf("captureStateForSelection: %v", err)
 		}
 		mu.Lock()
 		got := append([]string(nil), order...)
@@ -365,7 +365,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 
 		snapshotErrors := -1
 		done := make(chan struct{})
-		if _, err := a.captureState(unit, func(st completeState) {
+		if _, err := a.captureStateForSelection(unit, func(st completeState) {
 			mu.Lock()
 			order = append(order, "boundary")
 			mu.Unlock()
@@ -375,7 +375,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 				close(done)
 			}()
 		}); err != nil {
-			t.Fatalf("captureState: %v", err)
+			t.Fatalf("captureStateForSelection: %v", err)
 		}
 		<-done
 
@@ -408,13 +408,13 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 		a.feedAndEmit(tr, Event{Kind: EventError, SessionID: "err-session", Error: "before-error", Turn: 1})
 
 		snapshotErrors := -1
-		if _, err := a.captureState(unit, func(st completeState) {
+		if _, err := a.captureStateForSelection(unit, func(st completeState) {
 			mu.Lock()
 			order = append(order, "boundary")
 			mu.Unlock()
 			snapshotErrors = len(st.transcript.errors)
 		}); err != nil {
-			t.Fatalf("captureState: %v", err)
+			t.Fatalf("captureStateForSelection: %v", err)
 		}
 		mu.Lock()
 		got := append([]string(nil), order...)
@@ -444,13 +444,13 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 		a.setWarningGroup("protocol", []prompt.Warning{{Kind: "k", Message: "before"}})
 
 		snapshotWarnings := -1
-		if _, err := a.captureState(unit, func(st completeState) {
+		if _, err := a.captureStateForSelection(unit, func(st completeState) {
 			mu.Lock()
 			order = append(order, "boundary")
 			mu.Unlock()
 			snapshotWarnings = len(st.warnings)
 		}); err != nil {
-			t.Fatalf("captureState: %v", err)
+			t.Fatalf("captureStateForSelection: %v", err)
 		}
 		mu.Lock()
 		got := append([]string(nil), order...)
@@ -479,10 +479,10 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 		}
 
 		snapshotPerms := -1
-		if _, err := a.captureState(unit, func(st completeState) {
+		if _, err := a.captureStateForSelection(unit, func(st completeState) {
 			snapshotPerms = len(st.permissions)
 		}); err != nil {
-			t.Fatalf("captureState: %v", err)
+			t.Fatalf("captureStateForSelection: %v", err)
 		}
 		if snapshotPerms != 1 {
 			t.Fatalf("snapshot permissions = %d, want 1 (registered before the capture)", snapshotPerms)
@@ -512,7 +512,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 
 		snapshotBusy := false
 		done := make(chan struct{})
-		if _, err := a.captureState(unit, func(st completeState) {
+		if _, err := a.captureStateForSelection(unit, func(st completeState) {
 			mu.Lock()
 			order = append(order, "boundary")
 			mu.Unlock()
@@ -527,7 +527,7 @@ func TestAtomicLifecyclePublication(t *testing.T) {
 				close(done)
 			}()
 		}); err != nil {
-			t.Fatalf("captureState: %v", err)
+			t.Fatalf("captureStateForSelection: %v", err)
 		}
 		<-done
 

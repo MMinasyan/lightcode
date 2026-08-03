@@ -44,7 +44,10 @@ type HydrationState struct {
 }
 
 // HydrateSession captures a session's complete live state for an adapter to apply
-// as one snapshot before replaying subsequent live events.
+// as one snapshot before replaying subsequent live events. The capture is the
+// revalidating live-selection shape: a compaction or commit landing between the
+// durable read and the locked read forces a retry, and exhausting the three
+// attempts surfaces an error rather than an empty session.
 func (a *Agent) HydrateSession(sessionID string) (HydrationState, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
@@ -65,7 +68,7 @@ func (a *Agent) HydrateSession(sessionID string) (HydrationState, error) {
 	if err != nil {
 		return HydrationState{}, err
 	}
-	cs, err := a.captureState(unit, nil)
+	cs, err := a.captureStateForSelection(unit, nil)
 	if err != nil {
 		return HydrationState{}, err
 	}

@@ -44,6 +44,37 @@ describe('transcript high-water gating', () => {
     // The water is unchanged by an unsequenced admission.
     expect(gate.highWater).toBe(9);
   });
+
+  it('rejects a replayed frame for a row the disjointness filter folded into the durable half', () => {
+    // A capture taken between a turn's completion marker and its commit drops
+    // the retained tail (the durable half already covers it) and raises the
+    // returned cursor over the dropped sequences. A frame buffered for
+    // post-snapshot replay carries the dropped row's sequence and must gate as
+    // already present, or the row renders twice.
+    const droppedSeq = 6;
+    const filtered = {
+      messages: [{ type: 'user', content: 'q1' }, { type: 'assistant', content: 'a1' }],
+      cursor: { committedSeq: droppedSeq },
+      tail: [],
+      errors: [],
+    };
+    const gate = newTranscriptGate(filtered);
+    expect(snapshotHighWater(filtered)).toBe(droppedSeq);
+    expect(admitSequenced(gate, droppedSeq)).toBe(false);
+    // A frame after the raised water is still new.
+    expect(admitSequenced(gate, droppedSeq + 1)).toBe(true);
+
+    // Without the cursor raise the same filtered snapshot admits the replay:
+    // the gate falls below the dropped sequence and the row renders again.
+    const torn = {
+      messages: filtered.messages,
+      cursor: { committedSeq: 3 },
+      tail: [],
+      errors: [],
+    };
+    const tornGate = newTranscriptGate(torn);
+    expect(admitSequenced(tornGate, droppedSeq)).toBe(true);
+  });
 });
 
 describe('snapshot message merge', () => {

@@ -140,9 +140,9 @@ type Agent struct {
 	warningGroups   map[string][]PromptWarning
 	warningSnapshot []PromptWarning
 
-	// captureProbe is a test seam invoked after each live-selection candidate
-	// read to deterministically inject a revision change or a read error; nil in
-	// production.
+	// captureProbe is a test seam invoked after each durable read and before
+	// the locked revalidation, to deterministically inject a revision change or
+	// a read error in the window the retry exists for; nil in production.
 	captureProbe func(attempt int) error
 
 	// durableReadHook is a test seam invoked immediately before each observed
@@ -4157,9 +4157,10 @@ func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummar
 	// archived and unregistered.
 	reactivate := metaState(meta.State) == snapshot.StateArchived
 	var prebuilt []DisplayMessage
+	var prebuiltMaxTurn int
 	var prebuiltSummary SessionSummary
 	if emit != nil {
-		prebuilt, err = a.captureDurableHistory(unit, id)
+		prebuilt, prebuiltMaxTurn, err = a.captureDurableHistory(unit, id)
 		if err != nil {
 			unit.store.Detach()
 			return SessionSummary{}, err
@@ -4200,7 +4201,7 @@ func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummar
 	// Infallible in-commit publication: the committed prefix and summary are prebuilt,
 	// so this only captures the live classes and appends the boundary under their locks.
 	if emit != nil {
-		a.captureUnderLocksRTHeld(unit, prebuilt, id, nil, func(cs completeState) {
+		a.captureUnderLocksRTHeld(unit, prebuilt, id, prebuiltMaxTurn, nil, func(cs completeState) {
 			emit(hydrationStateFrom(prebuiltSummary, cs))
 		})
 	}
@@ -4212,12 +4213,12 @@ func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummar
 // became live between the two lookups). The committed prefix is read here — this path
 // performed no durable commit, so the read is not a postcommit capture.
 func (a *Agent) emitBoundaryForLiveUnitLocked(unit *session, id string, emit func(HydrationState)) {
-	committed, err := a.captureDurableHistory(unit, id)
+	committed, maxDurableTurn, err := a.captureDurableHistory(unit, id)
 	if err != nil {
 		return
 	}
 	summary := sessionSummary(unit)
-	a.captureUnderLocksRTHeld(unit, committed, id, nil, func(cs completeState) {
+	a.captureUnderLocksRTHeld(unit, committed, id, maxDurableTurn, nil, func(cs completeState) {
 		emit(hydrationStateFrom(summary, cs))
 	})
 }
@@ -4382,7 +4383,7 @@ func (a *Agent) newSession(projectID string, agentType string, emit func(Hydrati
 	if emit != nil {
 		// New sessions have empty durable history, so the in-commit capture appends the
 		// boundary from the prebuilt summary with no further read.
-		a.captureUnderLocksRTHeld(unit, nil, sid, nil, func(cs completeState) {
+		a.captureUnderLocksRTHeld(unit, nil, sid, 0, nil, func(cs completeState) {
 			emit(hydrationStateFrom(prebuiltSummary, cs))
 		})
 	}
@@ -4821,27 +4822,7 @@ type completeState struct {
 // whole selection without any partial publication.
 var errCaptureRevisionChanged = errors.New("capture revision changed")
 
-// captureState reads a session's durable committed history outside the
-// captured-state locks (it does I/O), then reads every live class while holding
-// the locks in the total order, so the snapshot is one consistent set with no
-// class read outside the lock that guards it. This is the single-read shape.
-func (a *Agent) captureState(unit *session, boundary func(completeState)) (completeState, error) {
-	if unit == nil || unit.store == nil {
-		return completeState{}, snapshot.ErrNoSession
-	}
-	sessionID := sessionIDOf(unit)
-	if a.transcriptForSessionID(sessionID) == nil {
-		return completeState{}, snapshot.ErrNoSession
-	}
-	committed, err := a.captureDurableHistory(unit, sessionID)
-	if err != nil {
-		return completeState{}, err
-	}
-	state, _ := a.captureUnderLocks(unit, committed, sessionID, nil, boundary)
-	return state, nil
-}
-
-// captureStateForSelection is the live-selection/reconnect shape. It reads the
+// captureStateForSelection is the live-selection/hydration capture shape. It reads the
 // durable history outside the locks, then revalidates the coordinator revision
 // under the locks: a turn committed during the read leaves the read-again
 // prefix, so it retries on the first two mismatches and returns
@@ -4861,30 +4842,37 @@ func (a *Agent) captureStateForSelection(unit *session, boundary func(completeSt
 		rev0 := tr.revisionLocked()
 		tr.seqMu.Unlock()
 
+		committed, maxDurableTurn, err := a.captureDurableHistory(unit, sessionID)
+		if err != nil {
+			return completeState{}, err
+		}
+		// The probe fires in the window the retry exists for: after the durable
+		// read, before the locked revalidation. A test injects the revision
+		// change or read error here, where a real producer would land it.
 		if a.captureProbe != nil {
 			if err := a.captureProbe(attempt); err != nil {
 				return completeState{}, err
 			}
 		}
-
-		committed, err := a.captureDurableHistory(unit, sessionID)
-		if err != nil {
-			return completeState{}, err
-		}
-		if state, ok := a.captureUnderLocks(unit, committed, sessionID, &rev0, boundary); ok {
+		if state, ok := a.captureUnderLocks(unit, committed, sessionID, maxDurableTurn, &rev0, boundary); ok {
 			return state, nil
 		}
 	}
 	return completeState{}, errCaptureRevisionChanged
 }
 
-// captureDurableHistory reads a session's committed display history. It does I/O
-// and must run outside the captured-state locks.
-func (a *Agent) captureDurableHistory(unit *session, sessionID string) ([]DisplayMessage, error) {
+// captureDurableHistory reads a session's committed display history and the
+// highest durable turn in it. It does I/O and must run outside the captured-state
+// locks. The turn maximum is what a later locked capture compares the live
+// coordinator's current turn against, so it is reported alongside the read,
+// never recomputed from the rendered rows.
+func (a *Agent) captureDurableHistory(unit *session, sessionID string) ([]DisplayMessage, int, error) {
 	if !unit.store.Active() {
-		return nil, nil
+		return nil, 0, nil
 	}
-	return a.messagesForFrontendForStore(unit.store, sessionID)
+	a.fireDurableReadHook()
+	msgs, maxTurn, err := a.messagesForFrontendForStoreAndMaxTurn(unit.store, sessionID)
+	return msgs, maxTurn, err
 }
 
 // captureUnderLocks reads every live class while holding the captured-state locks
@@ -4896,11 +4884,13 @@ func (a *Agent) captureDurableHistory(unit *session, sessionID string) ([]Displa
 // orders with those classes' events. The pending-permission snapshot is read and
 // held under the gate lock through the boundary, so a request registering during
 // the capture is either in the snapshot or delivered after the boundary.
-func (a *Agent) captureUnderLocks(unit *session, committed []DisplayMessage, sessionID string, wantRev *captureRevision, boundary func(completeState)) (completeState, bool) {
+// maxDurableTurn is the highest turn the committed prefix was read from, so the
+// locked section can drop a retained tail the durable half already covers.
+func (a *Agent) captureUnderLocks(unit *session, committed []DisplayMessage, sessionID string, maxDurableTurn int, wantRev *captureRevision, boundary func(completeState)) (completeState, bool) {
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	return a.captureUnderLocksRTHeld(unit, committed, sessionID, wantRev, boundary)
+	return a.captureUnderLocksRTHeld(unit, committed, sessionID, maxDurableTurn, wantRev, boundary)
 }
 
 // captureUnderLocksRTHeld is captureUnderLocks for a caller that already holds
@@ -4909,7 +4899,7 @@ func (a *Agent) captureUnderLocks(unit *session, committed []DisplayMessage, ses
 // so the boundary stays atomic with the operation's committed state. The committed
 // prefix is prebuilt by the caller before its durable commit, so this performs no
 // fallible read.
-func (a *Agent) captureUnderLocksRTHeld(unit *session, committed []DisplayMessage, sessionID string, wantRev *captureRevision, boundary func(completeState)) (completeState, bool) {
+func (a *Agent) captureUnderLocksRTHeld(unit *session, committed []DisplayMessage, sessionID string, maxDurableTurn int, wantRev *captureRevision, boundary func(completeState)) (completeState, bool) {
 	rt := a.ensureRuntime()
 	tr := a.transcriptForSessionID(sessionID)
 	if tr == nil {
@@ -4940,12 +4930,36 @@ func (a *Agent) captureUnderLocksRTHeld(unit *session, committed []DisplayMessag
 	if wantRev != nil && tr.revisionLocked() != *wantRev {
 		return completeState{}, false
 	}
+	rev := tr.revisionLocked()
+	tail := tr.tailSnapshotLocked()
+	// Disjoint-halves guard: when the current turn is already durable while its
+	// commit has not run (the completion marker lands on disk before the flush
+	// and commit), the retained tail duplicates the durable half, so drop the
+	// tail whole — the tail never mixes turns, so one comparison over it
+	// suffices — and raise the captured cursor over the dropped sequences so a
+	// frame buffered for post-snapshot replay gates as already present. The
+	// lower bound keeps a row appended after the commit (a background
+	// completion between turns, which carries the same curTurn but is not
+	// durable) from being dropped with it. Only the captured cursor is raised;
+	// the coordinator's own commit stays with commitLocked.
+	if rev.committedTurn < tr.curTurn && tr.curTurn <= maxDurableTurn && len(tail) > 0 {
+		highest := 0
+		for _, r := range tail {
+			if r.seq > highest {
+				highest = r.seq
+			}
+		}
+		if highest > rev.committedSeq {
+			rev.committedSeq = highest
+		}
+		tail = nil
+	}
 	state := completeState{
 		transcript: completeTranscript{
 			committed: committed,
-			tail:      tr.tailSnapshotLocked(),
+			tail:      tail,
 			errors:    tr.errorSnapshotLocked(),
-			revision:  tr.revisionLocked(),
+			revision:  rev,
 		},
 		tokens:      tokens,
 		model:       model,
@@ -4961,9 +4975,22 @@ func (a *Agent) captureUnderLocksRTHeld(unit *session, committed []DisplayMessag
 	return state, true
 }
 
+// messagesForFrontendForStore renders a session's durable display history. It
+// is the wrapper callers use when they only need the messages.
 func (a *Agent) messagesForFrontendForStore(store *snapshot.Store, sessionID string) ([]DisplayMessage, error) {
+	msgs, _, err := a.messagesForFrontendForStoreAndMaxTurn(store, sessionID)
+	return msgs, err
+}
+
+// messagesForFrontendForStoreAndMaxTurn renders a session's durable display
+// history and the highest durable turn number in the raw turn records. The
+// maximum is taken from the raw records, where every element carries its turn,
+// not from the rendered rows: tool, system, and background rows carry no turn,
+// and a staged-flush wrapper produces no row at all, so a turn made only of
+// such rows would render nothing carrying a turn.
+func (a *Agent) messagesForFrontendForStoreAndMaxTurn(store *snapshot.Store, sessionID string) ([]DisplayMessage, int, error) {
 	if store == nil {
-		return nil, snapshot.ErrNoSession
+		return nil, 0, snapshot.ErrNoSession
 	}
 	var rec *snapshot.CompactionRecord
 	var err error
@@ -4973,7 +5000,7 @@ func (a *Agent) messagesForFrontendForStore(store *snapshot.Store, sessionID str
 		rec, err = store.LoadCompactionForSession(sessionID)
 	}
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var raw []snapshot.TurnMessages
 	if sessionID == "" {
@@ -4988,9 +5015,15 @@ func (a *Agent) messagesForFrontendForStore(store *snapshot.Store, sessionID str
 		raw, err = store.LoadCompleteTurnsForSessionReadOnly(sessionID)
 	}
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return a.renderCompleteTurns(raw), nil
+	maxTurn := 0
+	for _, t := range raw {
+		if t.Turn > maxTurn {
+			maxTurn = t.Turn
+		}
+	}
+	return a.renderCompleteTurns(raw), maxTurn, nil
 }
 
 // renderCompleteTurns renders durable turn messages into display rows. It is the
@@ -5257,11 +5290,13 @@ func (a *Agent) applyTurnActionResolved(sessionID string, turn int, action strin
 // while runtime.mu is held: the committed prefix is the result's prebuilt Messages, so
 // this captures only the live classes and appends the boundary under their locks. The
 // code-revert skips ride the boundary so the adapter reassembles its combined frame.
-func (a *Agent) emitTurnActionBoundaryLocked(unit *session, result TurnActionResult, emit func(HydrationState, []snapshot.SkippedRevert)) {
+// maxDurableTurn is the highest durable turn the result's Messages were read from, so
+// the locked capture can drop a retained tail the durable half already covers.
+func (a *Agent) emitTurnActionBoundaryLocked(unit *session, result TurnActionResult, maxDurableTurn int, emit func(HydrationState, []snapshot.SkippedRevert)) {
 	if emit == nil || unit == nil {
 		return
 	}
-	a.captureUnderLocksRTHeld(unit, result.Messages, sessionIDOf(unit), nil, func(cs completeState) {
+	a.captureUnderLocksRTHeld(unit, result.Messages, sessionIDOf(unit), maxDurableTurn, nil, func(cs completeState) {
 		emit(hydrationStateFrom(result.Session, cs), result.SkippedFiles)
 	})
 }
@@ -5363,7 +5398,7 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		if err != nil {
 			// Some files may already be restored and some skipped; report the
 			// partial outcome alongside the error.
-			result = a.populateTurnActionResultForSession(unit, result)
+			result, _ = a.populateTurnActionResultForSession(unit, result)
 			return result, err
 		}
 		a.resetFileTrackerForSession(unit)
@@ -5379,14 +5414,14 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 			result.RestoredFiles = revertResult.Restored
 			result.SkippedFiles = revertResult.Skipped
 			if err != nil {
-				result = a.populateTurnActionResultForSession(unit, result)
+				result, _ = a.populateTurnActionResultForSession(unit, result)
 				return result, err
 			}
 		}
 		if err := unit.store.RevertHistory(target); err != nil {
 			// The truncation stopped partway (the store reports where); return
 			// the partial result so the caller can show what happened.
-			result = a.populateTurnActionResultForSession(unit, result)
+			result, _ = a.populateTurnActionResultForSession(unit, result)
 			return result, err
 		}
 		// History irreversibly truncated: the queued input no longer applies.
@@ -5395,12 +5430,12 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 			a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
 		}
 		if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
-			result = a.populateTurnActionResultForSession(unit, result)
+			result, _ = a.populateTurnActionResultForSession(unit, result)
 			return result, err
 		}
 		a.resetFileTrackerForSession(unit)
-		result = a.populateTurnActionResultForSession(unit, result)
-		a.emitTurnActionBoundaryLocked(unit, result, emit)
+		result, maxDurableTurn := a.populateTurnActionResultForSession(unit, result)
+		a.emitTurnActionBoundaryLocked(unit, result, maxDurableTurn, emit)
 		return result, nil
 
 	default:
@@ -5428,10 +5463,10 @@ func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool
 	if err != nil {
 		// The fork never published; the source unit is unchanged, so its
 		// state is still the accurate result payload.
-		result = a.populateTurnActionResultForSession(unit, result)
+		result, _ = a.populateTurnActionResultForSession(unit, result)
 		return result, err
 	}
-	result = a.populateTurnActionResultForSession(candidate, result)
+	result, maxDurableTurn := a.populateTurnActionResultForSession(candidate, result)
 	// The revert and the in-commit boundary both run under rt.mu; the result
 	// payload above was built before the lock so no durable read runs inside
 	// it.
@@ -5446,7 +5481,7 @@ func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool
 			fmt.Fprintf(os.Stderr, "lightcode: fork code revert: %v\n", revertErr)
 		}
 	}
-	a.emitTurnActionBoundaryLocked(candidate, result, emit)
+	a.emitTurnActionBoundaryLocked(candidate, result, maxDurableTurn, emit)
 	return result, nil
 }
 
@@ -5462,18 +5497,25 @@ func turnActionVerb(action string) string {
 }
 
 func (a *Agent) populateTurnActionResult(result TurnActionResult) TurnActionResult {
-	return a.populateTurnActionResultForSession(a.session, result)
+	r, _ := a.populateTurnActionResultForSession(a.session, result)
+	return r
 }
 
-func (a *Agent) populateTurnActionResultForSession(unit *session, result TurnActionResult) TurnActionResult {
+// populateTurnActionResultForSession fills a turn-action result with the
+// session's complete post-mutation view: the summary, the durable display
+// history (prebuilt before the boundary emission), and the token report. It
+// also reports the highest durable turn in that history, which the boundary
+// capture needs to drop a retained tail the durable half already covers.
+func (a *Agent) populateTurnActionResultForSession(unit *session, result TurnActionResult) (TurnActionResult, int) {
 	result.Session = sessionSummary(unit)
+	maxDurableTurn := 0
 	if unit != nil && unit.store != nil && unit.store.Active() {
-		result.Messages, _ = a.messagesForFrontendForStore(unit.store, unit.store.SessionID())
+		result.Messages, maxDurableTurn, _ = a.messagesForFrontendForStoreAndMaxTurn(unit.store, unit.store.SessionID())
 		unit.tokensMu.Lock()
 		result.Tokens = a.buildReportForSessionLocked(unit)
 		unit.tokensMu.Unlock()
 	}
-	return result
+	return result, maxDurableTurn
 }
 
 func (a *Agent) userMessageContentForTurn(turn int) string {
@@ -5579,10 +5621,10 @@ func (a *Agent) revertHistoryForSession(unit *session, turn int, emit func(Hydra
 	}
 	a.resetFileTrackerForSession(unit)
 	if emit != nil {
-		result := a.populateTurnActionResultForSession(unit, TurnActionResult{
+		result, maxDurableTurn := a.populateTurnActionResultForSession(unit, TurnActionResult{
 			Action: TurnActionRevertHistory, Turn: turn, TargetTurn: turn, SessionChanged: true,
 		})
-		a.emitTurnActionBoundaryLocked(unit, result, emit)
+		a.emitTurnActionBoundaryLocked(unit, result, maxDurableTurn, emit)
 	}
 	return nil
 }

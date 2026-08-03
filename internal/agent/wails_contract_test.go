@@ -546,6 +546,26 @@ func TestFrontendTaskSubagentLinksRemainClickableAfterCompletion(t *testing.T) {
 	}
 }
 
+// TestHydrateSurfacesCurrentSessionLookupFailure proves hydrate() surfaces a
+// failed current-session lookup through showError instead of swallowing it: the
+// silent empty catch left id empty, skipped hydration entirely, and still ran
+// hydrated = true — a silently empty transcript indistinguishable from a
+// genuinely empty one. Only the lookup catch is silent; the HydrateSession
+// catch already surfaces through showError.
+func TestHydrateSurfacesCurrentSessionLookupFailure(t *testing.T) {
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	body, ok := extractSvelteFunctionBody(svelte, "async function hydrate(")
+	if !ok {
+		t.Fatal("hydrate not found in App.svelte")
+	}
+	if strings.Contains(body, "catch (e) {}") {
+		t.Fatal("hydrate must not swallow the current-session lookup failure: the silent empty session is indistinguishable from a genuinely empty one")
+	}
+	if !strings.Contains(body, "showError(e, 'Load session failed')") {
+		t.Fatal("hydrate must surface the current-session lookup failure through showError")
+	}
+}
+
 // extractSvelteFunctionBody returns the brace-balanced body of the first JS
 // function in source whose definition begins with prefix.
 func extractSvelteFunctionBody(source, prefix string) (string, bool) {
