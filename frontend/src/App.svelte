@@ -310,7 +310,7 @@
       busy = false;
       // A pending request blocks its turn, so a turn end (including a cancel) leaves
       // no request that still needs an answer.
-      permissions = {};
+      permissions = new Map();
       // Session identity is owned by the ordered navigation/turn_action/hydration
       // boundaries; a turn end never re-resolves it. An out-of-band current-session
       // lookup here could restore a session a concurrent switch already left.
