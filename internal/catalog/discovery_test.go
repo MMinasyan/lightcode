@@ -2,13 +2,16 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -361,5 +364,235 @@ func TestParseDiscoveredModelSkipsNullMaxTokensInTopProvider(t *testing.T) {
 	}
 	if model.MaxOutputTokens != 0 {
 		t.Fatalf("MaxOutputTokens = %d, want 0 (null in API, fallback happens in merge)", model.MaxOutputTokens)
+	}
+}
+
+// smallStale returns a small stale discovery cache. The assertions only need
+// stale content distinct from the fresh discovery so a clobber is detectable;
+// nothing depends on write sizes, so the seed stays minimal.
+func smallStale() DiscoveredProvider {
+	return DiscoveredProvider{Models: map[string]DiscoveredModel{
+		"stale-1": {Name: "Stale 1", ContextWindow: 1000},
+		"stale-2": {Name: "Stale 2", ContextWindow: 2000},
+	}}
+}
+
+// sortedModelKeys returns the sorted model IDs of a discovered provider.
+func sortedModelKeys(discovered DiscoveredProvider) []string {
+	keys := make([]string, 0, len(discovered.Models))
+	for id := range discovered.Models {
+		keys = append(keys, id)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// recordDiscoveryLockAcquisitions installs the discoveryLockAcquiredHook seam
+// so every discovery lock acquisition is recorded, and returns the recorded
+// paths. It restores the previous hook on test cleanup.
+func recordDiscoveryLockAcquisitions(t *testing.T) func() []string {
+	t.Helper()
+	var mu sync.Mutex
+	var acquired []string
+	origHook := discoveryLockAcquiredHook
+	discoveryLockAcquiredHook = func(lockPath string) {
+		mu.Lock()
+		acquired = append(acquired, lockPath)
+		mu.Unlock()
+	}
+	t.Cleanup(func() { discoveryLockAcquiredHook = origHook })
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), acquired...)
+	}
+}
+
+// TestConcurrentAttemptWritesLoseNoDiscovery proves two concurrent attempt
+// writes cannot lose a discovery published at the same time. The directly
+// observable fact is the lock: every discovery cache writer for the provider
+// must acquire the same per-provider discovery lock, exactly once per call.
+// If either writer's lock is removed the recorded acquisitions fall short on
+// every run, with no timing involved. With both locks present the writers
+// serialize and the fresh discovery survives.
+func TestConcurrentAttemptWritesLoseNoDiscovery(t *testing.T) {
+	home := t.TempDir()
+	if err := WriteDiscoveryCache(home, "p", smallStale(), time.Now().Add(-48*time.Hour).UTC()); err != nil {
+		t.Fatalf("seed WriteDiscoveryCache: %v", err)
+	}
+	fresh := DiscoveredProvider{Models: map[string]DiscoveredModel{
+		"fresh-a": {Name: "Fresh A", ContextWindow: 4096},
+		"fresh-b": {Name: "Fresh B", ContextWindow: 8192},
+	}}
+
+	acquisitions := recordDiscoveryLockAcquisitions(t)
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { // attempt writer 1
+		defer wg.Done()
+		if err := WriteDiscoveryAttempt(home, "p", time.Now().UTC()); err != nil {
+			t.Errorf("WriteDiscoveryAttempt 1: %v", err)
+		}
+	}()
+	go func() { // attempt writer 2
+		defer wg.Done()
+		if err := WriteDiscoveryAttempt(home, "p", time.Now().UTC()); err != nil {
+			t.Errorf("WriteDiscoveryAttempt 2: %v", err)
+		}
+	}()
+	go func() { // successful refresh: publishes fresh discovery
+		defer wg.Done()
+		if err := WriteDiscoveryCache(home, "p", fresh, time.Now().UTC()); err != nil {
+			t.Errorf("WriteDiscoveryCache: %v", err)
+		}
+	}()
+	wg.Wait()
+
+	// Every writer acquires the same per-provider discovery lock exactly once
+	// per call: a writer that skips the lock or uses a different path fails
+	// this assertion deterministically.
+	want := discoveryLockPath(home, "p")
+	got := acquisitions()
+	if len(got) != 3 {
+		t.Fatalf("discovery lock acquisitions = %v, want 3 acquisitions of %s (a writer skipped the lock)", got, want)
+	}
+	for _, p := range got {
+		if p != want {
+			t.Fatalf("discovery lock acquisition path = %q, want %q (writers did not share one lock)", p, want)
+		}
+	}
+
+	// Nothing was lost: the fresh discovery survives the concurrent attempts.
+	cache, _, warnings := ReadDiscoveryCache(home)
+	if len(warnings) != 0 {
+		t.Fatalf("ReadDiscoveryCache warnings = %#v, want none", warnings)
+	}
+	gotModels := cache["p"].Models
+	if len(gotModels) != 2 || gotModels["fresh-a"].Name != "Fresh A" || gotModels["fresh-b"].Name != "Fresh B" {
+		t.Fatalf("fresh discovery lost by concurrent attempt writes: got %d models, want [fresh-a fresh-b]", len(gotModels))
+	}
+}
+
+// TestConcurrentAttemptAndDiscoveryWriteLoseNeither proves a concurrent
+// attempt write and whole-file write for the same provider lose neither. The
+// directly observable fact is the lock: both write paths must acquire the
+// same per-provider discovery lock, exactly once per call. If either writer's
+// lock is removed the recorded acquisitions fall short on every run, with no
+// timing involved. With both locks present the writers serialize and the
+// fresh discovery survives.
+func TestConcurrentAttemptAndDiscoveryWriteLoseNeither(t *testing.T) {
+	home := t.TempDir()
+	if err := WriteDiscoveryCache(home, "p", smallStale(), time.Now().Add(-48*time.Hour).UTC()); err != nil {
+		t.Fatalf("seed WriteDiscoveryCache: %v", err)
+	}
+	fresh := DiscoveredProvider{Models: map[string]DiscoveredModel{
+		"fresh-a": {Name: "Fresh A", ContextWindow: 4096},
+		"fresh-b": {Name: "Fresh B", ContextWindow: 8192},
+	}}
+
+	acquisitions := recordDiscoveryLockAcquisitions(t)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { // failed refresh: only its attempt write lands
+		defer wg.Done()
+		if err := WriteDiscoveryAttempt(home, "p", time.Now().UTC()); err != nil {
+			t.Errorf("WriteDiscoveryAttempt: %v", err)
+		}
+	}()
+	go func() { // successful refresh: publishes fresh discovery
+		defer wg.Done()
+		if err := WriteDiscoveryCache(home, "p", fresh, time.Now().UTC()); err != nil {
+			t.Errorf("WriteDiscoveryCache: %v", err)
+		}
+	}()
+	wg.Wait()
+
+	// Both write paths acquire the same per-provider discovery lock exactly
+	// once per call: a writer that skips the lock or uses a different path
+	// fails this assertion deterministically.
+	want := discoveryLockPath(home, "p")
+	got := acquisitions()
+	if len(got) != 2 {
+		t.Fatalf("discovery lock acquisitions = %v, want 2 acquisitions of %s (a writer skipped the lock)", got, want)
+	}
+	for _, p := range got {
+		if p != want {
+			t.Fatalf("discovery lock acquisition path = %q, want %q (writers did not share one lock)", p, want)
+		}
+	}
+
+	// Nothing was lost: the fresh discovery survives the concurrent attempt
+	// write, and the published file is complete, parseable JSON.
+	cache, _, warnings := ReadDiscoveryCache(home)
+	if len(warnings) != 0 {
+		t.Fatalf("ReadDiscoveryCache warnings = %#v, want none", warnings)
+	}
+	gotModels := cache["p"].Models
+	if len(gotModels) != 2 || gotModels["fresh-a"].Name != "Fresh A" || gotModels["fresh-b"].Name != "Fresh B" {
+		t.Fatalf("fresh discovery lost by concurrent attempt write: got %d models, want [fresh-a fresh-b]", len(gotModels))
+	}
+	data, err := os.ReadFile(filepath.Join(discoveryCacheDir(home), "p.json"))
+	if err != nil {
+		t.Fatalf("read cache file: %v", err)
+	}
+	var raw discoveryCacheFile
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("published cache not complete JSON: %v", err)
+	}
+}
+
+// TestConcurrentDiscoveryWritesDoNotTearFile proves two concurrent whole-file
+// writes for the same provider never tear the file: after every round the file
+// is complete JSON equal to exactly one of the two payloads.
+func TestConcurrentDiscoveryWritesDoNotTearFile(t *testing.T) {
+	home := t.TempDir()
+	setA := DiscoveredProvider{Models: map[string]DiscoveredModel{
+		"tear-a-1": {Name: "A1", ContextWindow: 1000},
+		"tear-a-2": {Name: "A2", ContextWindow: 2000},
+		"tear-a-3": {Name: "A3", ContextWindow: 3000},
+	}}
+	setB := DiscoveredProvider{Models: map[string]DiscoveredModel{
+		"tear-b-1": {Name: "B1", ContextWindow: 4000},
+		"tear-b-2": {Name: "B2", ContextWindow: 5000},
+		"tear-b-3": {Name: "B3", ContextWindow: 6000},
+	}}
+	keysA := sortedModelKeys(setA)
+	keysB := sortedModelKeys(setB)
+
+	for round := 0; round < 30; round++ {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := WriteDiscoveryCache(home, "p", setA, time.Now().UTC()); err != nil {
+				t.Errorf("WriteDiscoveryCache A: %v", err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if err := WriteDiscoveryCache(home, "p", setB, time.Now().UTC()); err != nil {
+				t.Errorf("WriteDiscoveryCache B: %v", err)
+			}
+		}()
+		wg.Wait()
+
+		data, err := os.ReadFile(filepath.Join(discoveryCacheDir(home), "p.json"))
+		if err != nil {
+			t.Fatalf("round %d: read cache file: %v", round, err)
+		}
+		var raw discoveryCacheFile
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatalf("round %d: torn cache file, not complete JSON: %v", round, err)
+		}
+		got := make([]string, 0, len(raw.Models))
+		for id := range raw.Models {
+			got = append(got, id)
+		}
+		sort.Strings(got)
+		if !reflect.DeepEqual(got, keysA) && !reflect.DeepEqual(got, keysB) {
+			t.Fatalf("round %d: torn cache file mixing payloads: %v", round, got)
+		}
 	}
 }

@@ -423,8 +423,27 @@ func discoveryAttemptDue(attemptedAt, now time.Time) bool {
 	return now.Sub(attemptedAt) >= discoveryCacheTTL
 }
 
+// discoveryLockAcquiredHook fires after the per-provider discovery lock is
+// acquired, exactly once per acquisition, with the acquired lock path.
+// Production no-op; tests record acquisitions to prove every discovery cache
+// writer serializes on the same per-provider lock. Follows the snapshot
+// mintPublishHook precedent.
+var discoveryLockAcquiredHook = func(lockPath string) {}
+
+// withDiscoveryLock runs fn while holding the per-provider discovery lock for
+// providerID. It is the single locking helper for every discovery cache
+// writer, so all writers for one provider share one lock path.
+func withDiscoveryLock(home, providerID string, fn func() error) error {
+	return atomicfs.WithLock(discoveryLockPath(home, providerID), func() error {
+		discoveryLockAcquiredHook(discoveryLockPath(home, providerID))
+		return fn()
+	})
+}
+
 // WriteDiscoveryAttempt records a real discovery network attempt without
-// changing any cached model metadata.
+// changing any cached model metadata. The whole read-modify-write runs under
+// the per-provider discovery lock, so a stale attempt can never clobber a
+// discovery published concurrently by another refresh.
 func WriteDiscoveryAttempt(home, providerID string, attemptedAt time.Time) error {
 	if !safeProviderID(providerID) {
 		return fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
@@ -433,23 +452,28 @@ func WriteDiscoveryAttempt(home, providerID string, attemptedAt time.Time) error
 		attemptedAt = time.Now().UTC()
 	}
 	path := filepath.Join(discoveryCacheDir(home), providerID+".json")
-	raw := discoveryCacheFile{Models: map[string]discoveryCacheModel{}}
-	data, err := os.ReadFile(path)
-	if err == nil {
-		if err := json.Unmarshal(data, &raw); err != nil {
+	return withDiscoveryLock(home, providerID, func() error {
+		raw := discoveryCacheFile{Models: map[string]discoveryCacheModel{}}
+		data, err := os.ReadFile(path)
+		if err == nil {
+			if err := json.Unmarshal(data, &raw); err != nil {
+				return err
+			}
+			if raw.Models == nil {
+				raw.Models = map[string]discoveryCacheModel{}
+			}
+		} else if !os.IsNotExist(err) {
 			return err
 		}
-		if raw.Models == nil {
-			raw.Models = map[string]discoveryCacheModel{}
-		}
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	raw.AttemptedAt = attemptedAt.UTC()
-	return writeDiscoveryCacheFile(path, raw)
+		raw.AttemptedAt = attemptedAt.UTC()
+		return writeDiscoveryCacheFile(path, raw)
+	})
 }
 
-// WriteDiscoveryCache writes one provider's discovery cache file.
+// WriteDiscoveryCache writes one provider's discovery cache file. It builds
+// its payload fresh from the discovery result and publishes it under the
+// per-provider discovery lock, so it never interleaves with the attempt
+// writer's read-modify-write or another whole-file write for the same provider.
 func WriteDiscoveryCache(home, providerID string, discovered DiscoveredProvider, fetchedAt time.Time) error {
 	if !safeProviderID(providerID) {
 		return fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
@@ -457,18 +481,20 @@ func WriteDiscoveryCache(home, providerID string, discovered DiscoveredProvider,
 	if fetchedAt.IsZero() {
 		fetchedAt = time.Now().UTC()
 	}
-	raw := discoveryCacheFile{FetchedAt: fetchedAt.UTC(), AttemptedAt: fetchedAt.UTC(), Models: map[string]discoveryCacheModel{}}
-	for modelID, model := range discovered.Models {
-		raw.Models[modelID] = discoveryCacheModel{
-			ID:              modelID,
-			Name:            model.Name,
-			ContextWindow:   model.ContextWindow,
-			MaxOutputTokens: model.MaxOutputTokens,
-			Cost:            model.Cost,
-			Metadata:        model.metadata,
+	return withDiscoveryLock(home, providerID, func() error {
+		raw := discoveryCacheFile{FetchedAt: fetchedAt.UTC(), AttemptedAt: fetchedAt.UTC(), Models: map[string]discoveryCacheModel{}}
+		for modelID, model := range discovered.Models {
+			raw.Models[modelID] = discoveryCacheModel{
+				ID:              modelID,
+				Name:            model.Name,
+				ContextWindow:   model.ContextWindow,
+				MaxOutputTokens: model.MaxOutputTokens,
+				Cost:            model.Cost,
+				Metadata:        model.metadata,
+			}
 		}
-	}
-	return writeDiscoveryCacheFile(filepath.Join(discoveryCacheDir(home), providerID+".json"), raw)
+		return writeDiscoveryCacheFile(filepath.Join(discoveryCacheDir(home), providerID+".json"), raw)
+	})
 }
 
 func readDiscoveryCacheFile(path string) (DiscoveredProvider, time.Time, error) {
@@ -514,6 +540,13 @@ func writeDiscoveryCacheFile(path string, raw discoveryCacheFile) error {
 
 func safeProviderID(providerID string) bool {
 	return providerID != "" && !strings.Contains(providerID, "/") && !strings.Contains(providerID, `\`)
+}
+
+// discoveryLockPath is the per-provider sidecar lock that serializes all
+// writers of one provider's discovery cache file. It lives in a .locks
+// directory inside the cache dir and is never the provider's own cache file.
+func discoveryLockPath(home, providerID string) string {
+	return filepath.Join(discoveryCacheDir(home), ".locks", providerID+".lock")
 }
 
 func discoveryCacheDir(home string) string {
