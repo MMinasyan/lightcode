@@ -363,6 +363,16 @@ func sessionIDOf(unit *session) string {
 	return unit.store.SessionID()
 }
 
+// projectRootOf resolves the running unit's project root for its per-session
+// process view, with the same liveness gate as sessionIDOf so an inactive unit
+// falls back to the owner-level root.
+func projectRootOf(unit *session) string {
+	if unit == nil || unit.store == nil || !unit.store.Active() {
+		return ""
+	}
+	return unit.projectRoot
+}
+
 // registerLiveSessionLocked records unit in the live-session map. An
 // existing entry for the same id is only acceptable when it is the same unit
 // (idempotent re-registration); a different unit is refused with an error —
@@ -658,7 +668,10 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 	})
 	registry.Register(tt)
 
-	processes := a.procMgr.ForSession(func() string { return sessionIDOf(unitRef()) })
+	processes := a.procMgr.ForSession(
+		func() string { return sessionIDOf(unitRef()) },
+		func() string { return projectRootOf(unitRef()) },
+	)
 	rc := tool.NewRunCommandAtRoot(a.cfg.Tools, a.home, projectRoot, processes)
 	if resolved.Readonly {
 		registry.Register(tool.WrapWithPermission(tool.NewReadOnlyRunCommand(rc), checkPolicy, askPolicy))

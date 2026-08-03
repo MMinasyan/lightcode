@@ -74,10 +74,13 @@ type ExitEvent struct {
 	FormatOutput func() string
 }
 
-// SessionManager binds process operations to one session.
+// SessionManager binds process operations to one session. The workspace-root
+// source scopes background commands launched through the view to that session's
+// project root; a nil or empty source falls back to the manager's root.
 type SessionManager struct {
-	manager   *Manager
-	sessionID func() string
+	manager       *Manager
+	sessionID     func() string
+	workspaceRoot func() string
 }
 
 // NewManager creates a new process Manager. maxProcs limits concurrent
@@ -119,8 +122,8 @@ func (m *Manager) SetSessionProvider(provider func() string) {
 	m.sessionID = provider
 }
 
-func (m *Manager) ForSession(sessionID func() string) *SessionManager {
-	return &SessionManager{manager: m, sessionID: sessionID}
+func (m *Manager) ForSession(sessionID func() string, workspaceRoot func() string) *SessionManager {
+	return &SessionManager{manager: m, sessionID: sessionID, workspaceRoot: workspaceRoot}
 }
 
 func (m *SessionManager) currentSessionID() string {
@@ -130,11 +133,18 @@ func (m *SessionManager) currentSessionID() string {
 	return strings.TrimSpace(m.sessionID())
 }
 
+func (m *SessionManager) currentWorkspaceRoot() string {
+	if m == nil || m.workspaceRoot == nil {
+		return ""
+	}
+	return strings.TrimSpace(m.workspaceRoot())
+}
+
 func (m *SessionManager) Start(command string, timeoutSec int) (string, error) {
 	if m == nil || m.manager == nil {
 		return "", fmt.Errorf("process: manager unavailable")
 	}
-	return m.manager.StartForSession(m.currentSessionID(), command, timeoutSec)
+	return m.manager.StartForSessionAtRoot(m.currentSessionID(), m.currentWorkspaceRoot(), command, timeoutSec)
 }
 
 func (m *SessionManager) Read(id string) (string, error) {
@@ -171,14 +181,24 @@ func (m *Manager) Start(command string, timeoutSec int) (string, error) {
 }
 
 func (m *Manager) StartForSession(sessionID string, command string, timeoutSec int) (string, error) {
+	return m.StartForSessionAtRoot(sessionID, m.workspaceRoot, command, timeoutSec)
+}
+
+// StartForSessionAtRoot is StartForSession for an explicit workspace root; an
+// empty root falls back to the manager's root.
+func (m *Manager) StartForSessionAtRoot(sessionID, workspaceRoot string, command string, timeoutSec int) (string, error) {
 	sessionID = strings.TrimSpace(sessionID)
+	root := workspaceRoot
+	if root == "" {
+		root = m.workspaceRoot
+	}
 	id, err := newProcessID()
 	if err != nil {
 		return "", err
 	}
 	cmd := exec.Command("sh", "-c", command)
-	if m.workspaceRoot != "" {
-		cmd.Dir = m.workspaceRoot
+	if root != "" {
+		cmd.Dir = root
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 

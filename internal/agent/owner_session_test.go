@@ -18,6 +18,7 @@ import (
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
@@ -1045,6 +1046,84 @@ func TestRootProcessRoutesBySession(t *testing.T) {
 	}
 	if _, err := firstProcess.Execute(context.Background(), map[string]any{"action": "kill", "id": id}); err != nil {
 		t.Fatalf("first kill: %v", err)
+	}
+}
+
+// TestProjectServiceRoutingContract proves a background command started from a
+// session in one project runs with that project's root while another project's
+// session is current: the per-session process view resolves its own workspace
+// root instead of the owner-global one. The command runs through the running
+// unit's own tools — the seam the existing root-process tests use — because
+// tool execution is reachable only inside the loop during a turn, not through
+// an adapter-facing method.
+func TestProjectServiceRoutingContract(t *testing.T) {
+	home := t.TempDir()
+	firstRoot := t.TempDir()
+	secondRoot := t.TempDir()
+	a := newCatalogBackedTestAgentForRoot(t, home, firstRoot)
+	a.cfg.Permissions.Allow = []string{
+		"run_command(*)",
+		"process(process)",
+		"process(process:*)",
+	}
+	firstProject, err := a.projects.Ensure()
+	if err != nil {
+		t.Fatalf("ensure first project: %v", err)
+	}
+	secondProject, err := project.EnsureForPath(a.projects.Root(), secondRoot)
+	if err != nil {
+		t.Fatalf("ensure second project: %v", err)
+	}
+
+	// Create the second-project session first so the first-project session is
+	// the current one when the background command starts.
+	secondID, err := a.NewSession(secondProject.ID, "primary")
+	if err != nil {
+		t.Fatalf("NewSession second project: %v", err)
+	}
+	firstID, err := a.NewSession(firstProject.ID, "primary")
+	if err != nil {
+		t.Fatalf("NewSession first project: %v", err)
+	}
+	if current := a.SessionCurrent().ID; current != firstID {
+		t.Fatalf("current session = %q, want first %q", current, firstID)
+	}
+
+	a.ensureRuntime().mu.Lock()
+	second := a.sessions[secondID]
+	a.ensureRuntime().mu.Unlock()
+	secondRun, ok := second.registry.Get("run_command")
+	if !ok {
+		t.Fatal("second run_command missing")
+	}
+	secondProcess, ok := second.registry.Get("process")
+	if !ok {
+		t.Fatal("second process missing")
+	}
+
+	result, err := secondRun.Execute(context.Background(), map[string]any{
+		"command":    "pwd; sleep 5",
+		"background": true,
+	})
+	if err != nil {
+		t.Fatalf("start background: %v", err)
+	}
+	id := backgroundID(t, result)
+	defer a.procMgr.KillAll()
+
+	var got string
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		out, err := secondProcess.Execute(context.Background(), map[string]any{"action": "read", "id": id})
+		if err == nil {
+			if trimmed := strings.TrimSpace(out); trimmed != "" && trimmed != "(No output yet)" {
+				got = trimmed
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got != secondRoot {
+		t.Fatalf("background pwd from second-project session = %q, want its project root %q while the first project is current", got, secondRoot)
 	}
 }
 
