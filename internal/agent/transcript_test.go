@@ -796,6 +796,320 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 			t.Fatalf("hydrated background row %d times, want exactly once (a row appended after the commit is kept in the tail)", bgCount)
 		}
 	})
+
+	// A child's transcript hydrates without duplication once per exit path.
+	// Every subagent outcome funnels through the single exit closure that
+	// closes the forwarding channel, joins the forwarder, waits for the loop
+	// drainer to acknowledge the flush, commits the child's turn, and only then
+	// removes its registry entry — so by the time the parent turn ends (which
+	// the task tool's completion precedes), the child is committed and its
+	// entry is gone. The hydration then takes the completed-child route and
+	// must return the full durable transcript, not an error and not an empty
+	// view, with every row exactly once.
+	t.Run("shape=B/child_exit_path=normal", func(t *testing.T) {
+		var calls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch calls.Add(1) {
+			case 1:
+				writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"child normal","subagent_type":"explore"}]}`)
+			case 2:
+				writeTextResponse(w, "CHILD_NORMAL_DONE")
+			case 3:
+				writeTextResponse(w, "PARENT_DONE")
+			default:
+				t.Fatalf("unexpected provider call")
+			}
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		if _, err := a.Submit(ctx, "delegate normal"); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		childID := findSubagentStart(t, cap).SubagentSessionID
+
+		if tr := a.transcriptForSessionID(childID); tr != nil {
+			t.Fatal("child registry entry still present after the run finished")
+		}
+		hs, err := a.HydrateSession(childID)
+		if err != nil {
+			t.Fatalf("HydrateSession(completed child): %v", err)
+		}
+		if len(hs.Messages) == 0 {
+			t.Fatal("completed child hydration returned an empty transcript")
+		}
+		for _, content := range []string{"child normal", "CHILD_NORMAL_DONE"} {
+			if got := countHydrationContent(hs, content); got != 1 {
+				t.Fatalf("hydrated %q %d times, want exactly once (child rows must not duplicate across exit paths)", content, got)
+			}
+		}
+		if len(hs.Tail) != 0 || len(hs.Errors) != 0 {
+			t.Fatalf("completed child hydration has live rows: tail=%d errors=%d", len(hs.Tail), len(hs.Errors))
+		}
+	})
+
+	// Denied: the child's tool is denied, the loop returns "Tool denied by
+	// user.", and the exit closure still commits the child's turn.
+	t.Run("shape=B/child_exit_path=denied", func(t *testing.T) {
+		var calls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch calls.Add(1) {
+			case 1:
+				writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"child denied","subagent_type":"explore"}]}`)
+			case 2:
+				writeTaskToolCallResponse(w, "call_read", "read_file", `{"path":"target.txt"}`)
+			case 3:
+				writeTextResponse(w, "PARENT_DONE")
+			default:
+				t.Fatalf("unexpected provider call")
+			}
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		// The live unit's permission policy captures a.cfg at build time, so
+		// the deny rule must land on the config the policy holds.
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		a.cfg.Permissions.Deny = []string{"read_file(/**)"}
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		if _, err := a.Submit(ctx, "delegate denied"); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		childID := findSubagentStart(t, cap).SubagentSessionID
+
+		hs, err := a.HydrateSession(childID)
+		if err != nil {
+			t.Fatalf("HydrateSession(denied child): %v", err)
+		}
+		if got := countHydrationContent(hs, "child denied"); got != 1 {
+			t.Fatalf("hydrated %q %d times, want exactly once (a denied child still commits its turn)", "child denied", got)
+		}
+		if len(hs.Messages) == 0 {
+			t.Fatal("denied child hydration returned an empty transcript")
+		}
+		if len(hs.Tail) != 0 {
+			t.Fatalf("denied child hydration has %d live rows, want none", len(hs.Tail))
+		}
+	})
+
+	// Errored: the child's provider call fails, the loop returns an error, and
+	// the exit closure still commits whatever the turn persisted.
+	t.Run("shape=B/child_exit_path=errored", func(t *testing.T) {
+		var calls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch calls.Add(1) {
+			case 1:
+				writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"child errored","subagent_type":"explore"}]}`)
+			case 2:
+				// A non-retryable status so the child's loop fails on the
+				// first attempt instead of retrying.
+				http.Error(w, "boom", http.StatusBadRequest)
+			case 3:
+				writeTextResponse(w, "PARENT_DONE")
+			default:
+				t.Fatalf("unexpected provider call")
+			}
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		if _, err := a.Submit(ctx, "delegate errored"); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		childID := findSubagentStart(t, cap).SubagentSessionID
+
+		hs, err := a.HydrateSession(childID)
+		if err != nil {
+			t.Fatalf("HydrateSession(errored child): %v", err)
+		}
+		if got := countHydrationContent(hs, "child errored"); got != 1 {
+			t.Fatalf("hydrated %q %d times, want exactly once (an errored child still commits its turn)", "child errored", got)
+		}
+		if len(hs.Messages) == 0 {
+			t.Fatal("errored child hydration returned an empty transcript")
+		}
+		if len(hs.Tail) != 0 {
+			t.Fatalf("errored child hydration has %d live rows, want none", len(hs.Tail))
+		}
+	})
+
+	// Cancelled: an ordinary Stop/Escape cancels the parent turn, which is the
+	// child's turn context. The child returns cleanly — cancellation is not an
+	// error — and the exit closure still commits; the interrupted signal is
+	// part of the durable turn.
+	t.Run("shape=B/child_exit_path=cancelled", func(t *testing.T) {
+		childCallStarted := make(chan struct{})
+		release := make(chan struct{})
+		var calls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch calls.Add(1) {
+			case 1:
+				writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"child cancelled","subagent_type":"explore"}]}`)
+			case 2:
+				close(childCallStarted)
+				select {
+				case <-release:
+				case <-r.Context().Done():
+				}
+				// The client cancelling a request with a body does not
+				// necessarily reach this handler, and writing to an abandoned
+				// connection can block forever; the response is irrelevant —
+				// the child was cancelled — so return silently.
+			case 3:
+				writeTextResponse(w, "PARENT_DONE")
+			default:
+				t.Fatalf("unexpected provider call")
+			}
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		if _, err := a.Submit(ctx, "delegate cancelled"); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+		<-childCallStarted
+		parentID := a.SessionCurrent().ID
+		if err := a.CancelSession(parentID); err != nil {
+			t.Fatalf("CancelSession: %v", err)
+		}
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		// The parent turn end fires only after the task tool returned, which
+		// is after the child's exit closure committed; release the blocked
+		// handler so the server can close.
+		close(release)
+		childID := findSubagentStart(t, cap).SubagentSessionID
+
+		hs, err := a.HydrateSession(childID)
+		if err != nil {
+			t.Fatalf("HydrateSession(cancelled child): %v", err)
+		}
+		if got := countHydrationContent(hs, "child cancelled"); got != 1 {
+			t.Fatalf("hydrated %q %d times, want exactly once (a cancelled child still commits its turn)", "child cancelled", got)
+		}
+		if got := countHydrationContent(hs, "System: Request interrupted by user"); got != 1 {
+			t.Fatalf("hydrated interrupted signal %d times, want exactly once", got)
+		}
+		if len(hs.Tail) != 0 {
+			t.Fatalf("cancelled child hydration has %d live rows, want none", len(hs.Tail))
+		}
+	})
+
+	// A live child hydrates from its registry entry: the durable prefix read
+	// through the entry's store plus the retained tail and cursor — the same
+	// revalidating shape a root uses. After the run finishes and the entry is
+	// removed, the same id resolves from its durable store alone.
+	t.Run("shape=B/child=live_then_completed", func(t *testing.T) {
+		childCallStarted := make(chan struct{})
+		release := make(chan struct{})
+		var calls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch calls.Add(1) {
+			case 1:
+				writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"child live","subagent_type":"explore"}]}`)
+			case 2:
+				close(childCallStarted)
+				select {
+				case <-release:
+				case <-r.Context().Done():
+				}
+				writeTextResponse(w, "CHILD_LIVE_DONE")
+			case 3:
+				writeTextResponse(w, "PARENT_DONE")
+			default:
+				t.Fatalf("unexpected provider call")
+			}
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		if _, err := a.Submit(ctx, "delegate live"); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		var childID string
+		for {
+			for _, ev := range cap.snapshot() {
+				if ev.Kind == EventSubagentStart {
+					childID = ev.SubagentSessionID
+				}
+			}
+			if childID != "" {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("missing subagent start event: %#v", cap.snapshot())
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		// The child's user-display row is sequenced into its coordinator's
+		// tail in the same section that delivers the event, so observing the
+		// event means the tail holds the row when the hydration reads it.
+		deadline = time.Now().Add(5 * time.Second)
+		for {
+			found := false
+			for _, ev := range cap.snapshot() {
+				if ev.Kind == EventUserMessageDisplay && ev.SubagentSessionID == childID && ev.Result == "child live" {
+					found = true
+				}
+			}
+			if found {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("did not observe the child user display in time: %#v", cap.snapshot())
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		hs, err := a.HydrateSession(childID)
+		if err != nil {
+			t.Fatalf("HydrateSession(live child): %v", err)
+		}
+		if got := countHydrationContent(hs, "child live"); got != 1 {
+			t.Fatalf("hydrated live child %q %d times, want exactly once (the live route returns the tail row once)", "child live", got)
+		}
+		if len(hs.Messages) != 0 {
+			t.Fatalf("live child hydration has %d durable rows, want none (the turn is not complete yet)", len(hs.Messages))
+		}
+		if len(hs.Tail) == 0 {
+			t.Fatal("live child hydration has no retained tail")
+		}
+		if hs.Cursor.CommittedTurn != 0 {
+			t.Fatalf("live child cursor committedTurn = %d, want 0 (nothing committed yet)", hs.Cursor.CommittedTurn)
+		}
+
+		close(release)
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		if tr := a.transcriptForSessionID(childID); tr != nil {
+			t.Fatal("child registry entry still present after the run finished")
+		}
+		hs, err = a.HydrateSession(childID)
+		if err != nil {
+			t.Fatalf("HydrateSession(completed child): %v", err)
+		}
+		for _, content := range []string{"child live", "CHILD_LIVE_DONE"} {
+			if got := countHydrationContent(hs, content); got != 1 {
+				t.Fatalf("hydrated %q %d times, want exactly once (the completed route returns the durable turn once)", content, got)
+			}
+		}
+		if len(hs.Tail) != 0 {
+			t.Fatalf("completed child hydration has %d live rows, want none", len(hs.Tail))
+		}
+	})
 }
 
 // TestCaptureStateInvokesBoundaryWithBuiltState verifies the capture invokes the

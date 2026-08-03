@@ -385,16 +385,22 @@ func (a *App) handleEvent(ev agent.Event) {
 		case agent.EventTextDelta:
 			emit("subagent_token", map[string]any{
 				"sessionId": ev.SubagentSessionID,
+				"seq":       ev.Seq,
 				"content":   ev.Result,
 			})
 		case agent.EventToolCallStart:
 			emit("subagent_tool_start", map[string]any{
 				"sessionId": ev.SubagentSessionID,
+				"seq":       ev.Seq,
 				"id":        ev.ToolCallID,
 				"name":      ev.ToolName,
 				"args":      ev.Args,
 			})
 		case agent.EventToolCallEnd:
+			// Not sequence-gated: a tool result updates its row in place without
+			// advancing the sequence, so gating it would drop every result whose
+			// start already advanced the high-water. Delivered id-keyed and
+			// applied idempotently, exactly as the root branch handles it.
 			emit("subagent_tool_result", map[string]any{
 				"sessionId": ev.SubagentSessionID,
 				"id":        ev.ToolCallID,
@@ -414,6 +420,7 @@ func (a *App) handleEvent(ev agent.Event) {
 			if ev.BackgroundProcess != nil {
 				emit("subagent_background_process_complete", map[string]any{
 					"sessionId": ev.SubagentSessionID,
+					"seq":       ev.Seq,
 					"id":        ev.BackgroundProcess.ID,
 					"command":   ev.BackgroundProcess.Command,
 					"reason":    ev.BackgroundProcess.Reason,
@@ -422,6 +429,19 @@ func (a *App) handleEvent(ev agent.Event) {
 					"output":    ev.Result,
 				})
 			}
+		case agent.EventUserMessageDisplay:
+			emit("subagent_user_message", map[string]any{
+				"sessionId": ev.SubagentSessionID,
+				"seq":       ev.Seq,
+				"turn":      ev.Turn,
+				"content":   ev.Result,
+			})
+		case agent.EventGenericSystemSignal:
+			emit("subagent_system_signal", map[string]any{
+				"sessionId": ev.SubagentSessionID,
+				"seq":       ev.Seq,
+				"content":   "System: " + ev.Result,
+			})
 		}
 		return
 	}

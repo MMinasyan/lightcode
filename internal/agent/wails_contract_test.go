@@ -530,7 +530,7 @@ func TestFrontendTaskSubagentLinksRemainClickableAfterCompletion(t *testing.T) {
 			t.Fatalf("task branch missing persisted child-session affordance path %q", want)
 		}
 	}
-	for _, want := range []string{"SessionMessagesFor", "hydrateSubagentViewer"} {
+	for _, want := range []string{"HydrateSession", "hydrateSubagentViewer"} {
 		if !strings.Contains(toolCall, want) {
 			t.Fatalf("ToolCall.svelte missing persisted child-session hydration path %q", want)
 		}

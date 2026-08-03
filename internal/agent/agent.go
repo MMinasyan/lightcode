@@ -640,6 +640,7 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 		ParentTracker: fileTracker,
 		MaxConcurrent: a.cfg.Subagents.MaxConcurrent,
 		TaggedEvents:  rt.taggedEvents,
+		Runtime:       rt,
 		ModelCatalog:  a.catalog,
 		ToolsConfig:   a.cfg.Tools,
 		HomeDir:       a.home,
@@ -1463,15 +1464,24 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 		TaskIndex:         tev.TaskIndex,
 		ToolCallID:        tev.ToolCallID,
 	}
+	// The coordinator sequences every child display row before the same event
+	// is delivered, exactly as the root path does in dispatchLoopEvent, so the
+	// delivered event carries the row's sequence and an adapter can gate it
+	// against a later capture's high-water. Control events — subagent start,
+	// permission requests, warnings — produce no transcript row and stay bare.
+	tr := a.transcriptForSessionID(tev.SessionID)
+	emit := func(out Event) { a.feedAndEmit(tr, out) }
 	switch ev.Kind {
 	case loop.TextDelta:
 		base.Kind = EventTextDelta
 		base.Result = ev.Result
+		emit(base)
 	case loop.ToolCallStart:
 		base.Kind = EventToolCallStart
 		base.ToolCallID = ev.ToolCallID
 		base.ToolName = ev.ToolName
 		base.Args = ev.Args
+		emit(base)
 	case loop.ToolCallEnd:
 		base.Kind = EventToolCallEnd
 		base.ToolCallID = ev.ToolCallID
@@ -1480,6 +1490,7 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 		base.IsError = ev.IsError
 		base.Result = ev.Result
 		base.Metadata = ev.Metadata
+		emit(base)
 	case loop.BackgroundProcessComplete:
 		base.Kind = EventBackgroundProcessComplete
 		base.Result = ev.Result
@@ -1493,9 +1504,21 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 				Output:   ev.BackgroundProcess.Output,
 			}
 		}
+		emit(base)
+	case loop.UserMessageDisplay:
+		base.Kind = EventUserMessageDisplay
+		base.Turn = ev.Turn
+		base.Result = ev.Result
+		emit(base)
+	case loop.GenericSystemSignalDisplay:
+		base.Kind = EventGenericSystemSignal
+		base.Turn = ev.Turn
+		base.Result = ev.Result
+		emit(base)
 	case loop.PermissionRequest:
 		base.Kind = EventPermissionRequest
 		base.PermReq = permissionRequestFromLoopEvent(ev, tev.SessionID, projectID)
+		a.emitEvent(base)
 	case loop.Warning:
 		kind, _ := ev.Metadata["kind"].(string)
 		if kind == "" {
@@ -1506,7 +1529,6 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 	default:
 		return
 	}
-	a.emitEvent(base)
 }
 
 func (a *Agent) recordUsage(ev loop.Event) {
@@ -4927,8 +4949,36 @@ func (a *Agent) captureUnderLocksRTHeld(unit *session, committed []DisplayMessag
 
 	tr.seqMu.Lock()
 	defer tr.seqMu.Unlock()
-	if wantRev != nil && tr.revisionLocked() != *wantRev {
+	ct, ok := captureTranscriptLocked(tr, committed, maxDurableTurn, wantRev)
+	if !ok {
 		return completeState{}, false
+	}
+	state := completeState{
+		transcript:  ct,
+		tokens:      tokens,
+		model:       model,
+		busy:        busy,
+		compacting:  compacting,
+		queue:       queue,
+		warnings:    warnings,
+		permissions: permissions,
+	}
+	if boundary != nil {
+		boundary(state)
+	}
+	return state, true
+}
+
+// captureTranscriptLocked reads the transcript portion of a complete capture
+// under seqMu: the committed prefix, the retained tail, retained errors, and
+// the revision, applying the disjoint-halves guard. When wantRev is non-nil the
+// revision is revalidated and ok=false reports a change so the caller can retry
+// with a fresh durable read. It is the single implementation of the locked
+// transcript read, shared by the unit capture and the child capture, so the two
+// cannot diverge. The caller holds seqMu.
+func captureTranscriptLocked(tr *transcript, committed []DisplayMessage, maxDurableTurn int, wantRev *captureRevision) (completeTranscript, bool) {
+	if wantRev != nil && tr.revisionLocked() != *wantRev {
+		return completeTranscript{}, false
 	}
 	rev := tr.revisionLocked()
 	tail := tr.tailSnapshotLocked()
@@ -4954,25 +5004,12 @@ func (a *Agent) captureUnderLocksRTHeld(unit *session, committed []DisplayMessag
 		}
 		tail = nil
 	}
-	state := completeState{
-		transcript: completeTranscript{
-			committed: committed,
-			tail:      tail,
-			errors:    tr.errorSnapshotLocked(),
-			revision:  rev,
-		},
-		tokens:      tokens,
-		model:       model,
-		busy:        busy,
-		compacting:  compacting,
-		queue:       queue,
-		warnings:    warnings,
-		permissions: permissions,
-	}
-	if boundary != nil {
-		boundary(state)
-	}
-	return state, true
+	return completeTranscript{
+		committed: committed,
+		tail:      tail,
+		errors:    tr.errorSnapshotLocked(),
+		revision:  rev,
+	}, true
 }
 
 // messagesForFrontendForStore renders a session's durable display history. It

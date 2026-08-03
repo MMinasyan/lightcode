@@ -51,6 +51,11 @@ type taskTool struct {
 	parentTracker *tool.FileTracker
 	maxConcurrent int
 	taggedEvents  chan<- TaggedLoopEvent
+	// rt carries what a child session's transcript lifecycle needs — its
+	// registry entry, the flush channel, and the owner context — so a child is
+	// registered when its store is created, committed and removed when its run
+	// finishes. Nil in task-tool-only unit tests, which never run a child.
+	rt *runtime
 
 	mu           sync.Mutex
 	modelCatalog *catalog.Catalog
@@ -81,6 +86,7 @@ type taskToolConfig struct {
 	ParentTracker *tool.FileTracker
 	MaxConcurrent int
 	TaggedEvents  chan<- TaggedLoopEvent
+	Runtime       *runtime
 
 	ModelCatalog *catalog.Catalog
 
@@ -111,6 +117,7 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		parentTracker: cfg.ParentTracker,
 		maxConcurrent: cfg.MaxConcurrent,
 		taggedEvents:  cfg.TaggedEvents,
+		rt:            cfg.Runtime,
 		modelCatalog:  cfg.ModelCatalog,
 		resolveAdapt:  cfg.ResolveAdapt,
 		toolsConfig:   cfg.ToolsConfig,
@@ -384,6 +391,12 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		return taskResult{index: index, err: err}
 	}
 	sessionID := childStore.SessionID()
+	// A child is live from the moment its store exists: register its transcript
+	// entry before the forwarder starts, so every dispatched child event finds
+	// its coordinator. The entry is removed in the same closure that commits.
+	if t.rt != nil {
+		t.rt.registerTranscript(sessionID, childStore)
+	}
 
 	scope := parentMutationScope{
 		store:         t.parentStore,
@@ -402,6 +415,7 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 
 	var events chan loop.Event
 	var forwardDone chan struct{}
+	var turn int
 	if t.taggedEvents != nil {
 		events = make(chan loop.Event, 128)
 		forwardDone = make(chan struct{})
@@ -410,6 +424,13 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 			t.forwardEvents(events, index, sessionID, parentSessionID, t.projectID, parentToolCallID)
 		}()
 	}
+	// finish is the single exit closure every subagent outcome funnels through
+	// — normal completion, denial, error, and cancellation — so the child's
+	// turn is committed and its registry entry removed exactly once, on every
+	// path. The commit runs only after the forwarding channel is closed, the
+	// forwarder joined (every event handed off), and the loop drainer has
+	// acknowledged the flush (every event dispatched and sequenced); then the
+	// entry is dropped, so no live lookup resolves it afterwards.
 	finish := func(result taskResult) taskResult {
 		result.sessionID = sessionID
 		if childProcMgr != nil {
@@ -418,6 +439,10 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		if events != nil {
 			close(events)
 			<-forwardDone
+		}
+		if t.rt != nil {
+			t.rt.flushAndCommitTranscript(sessionID, turn)
+			t.rt.unregisterTranscript(sessionID)
 		}
 		return result
 	}
@@ -433,8 +458,15 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 	lp.SetEventOwner(sessionID, t.projectID)
 	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 
-	if turn := childStore.BeginTurn(); turn == 0 {
+	if turn = childStore.BeginTurn(); turn == 0 {
 		return finish(taskResult{index: index, err: fmt.Errorf("subagent: child session is not active")})
+	}
+	// Feed the turn start into the child's coordinator so curTurn names the
+	// turn being persisted: the capture's disjoint-halves guard compares
+	// curTurn against the highest durable turn, and a child that completed its
+	// turn durably without advancing curTurn would keep that window open.
+	if t.rt != nil {
+		feedTranscript(t.rt.transcriptForSessionID(sessionID), Event{Kind: EventTurnStart, SessionID: sessionID, ProjectID: t.projectID, Turn: turn})
 	}
 	result, err := lp.Run(ctx, td.Prompt)
 	if result == "Tool denied by user." {

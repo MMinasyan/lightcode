@@ -1,5 +1,5 @@
 <script>
-  import { ReadFileContent, SessionMessagesFor } from '../../wailsjs/go/main/App';
+  import { ReadFileContent, HydrateSession } from '../../wailsjs/go/main/App';
   import { openViewer, openEditPreview, openSubagentViewer, hydrateSubagentViewer } from '../lib/viewer.js';
   import { settings } from '../lib/settings.js';
   import { collapsedPreviewLines, maxInlineExpandLines } from '../lib/uiConstants.js';
@@ -68,10 +68,13 @@
     if (!sessionId) return;
     openSubagentViewer(title, sessionId, []);
     try {
-      const messages = await SessionMessagesFor(sessionId);
-      hydrateSubagentViewer(sessionId, messages || []);
+      // The child hydration read returns the messages and the transcript cursor
+      // together, so the viewer's gate can reject frames the snapshot already
+      // contains instead of reconciling by message shape.
+      const state = await HydrateSession(sessionId);
+      hydrateSubagentViewer(sessionId, state);
     } catch (e) {
-      hydrateSubagentViewer(sessionId, [{ type: 'error', content: 'Error: ' + (e?.message || e) }]);
+      hydrateSubagentViewer(sessionId, { messages: [{ type: 'error', content: 'Error: ' + (e?.message || e) }] });
     }
   }
 

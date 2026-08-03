@@ -330,17 +330,28 @@
     EventsOn('compaction_start', buffered(() => { compacting = true; }));
     EventsOn('compaction_end', buffered(() => { compacting = false; }));
 
+    // A subagent frame is gated per child by the child's transcript high-water
+    // in viewer.js: a frame already represented in the child's snapshot is
+    // dropped, everything above it replays in arrival order. Tool results are
+    // the exception — they update a row in place without advancing its
+    // sequence, so they are delivered id-keyed and applied idempotently.
     EventsOn('subagent_token', buffered((data) => {
-      appendSubagentEvent(data.sessionId, { type: 'token', content: data.content });
+      appendSubagentEvent(data.sessionId, { type: 'token', seq: data.seq, content: data.content });
     }));
     EventsOn('subagent_tool_start', buffered((data) => {
-      appendSubagentEvent(data.sessionId, { type: 'tool_start', id: data.id, name: data.name, args: data.args });
+      appendSubagentEvent(data.sessionId, { type: 'tool_start', seq: data.seq, id: data.id, name: data.name, args: data.args });
     }));
     EventsOn('subagent_tool_result', buffered((data) => {
       appendSubagentEvent(data.sessionId, { type: 'tool_result', id: data.id, success: data.success, output: data.output, name: data.name, args: data.args, metadata: data.metadata });
     }));
     EventsOn('subagent_background_process_complete', buffered((data) => {
-      appendSubagentEvent(data.sessionId, { type: 'background_process_complete', id: data.id, command: data.command, reason: data.reason, exitCode: data.exitCode, success: data.success, output: data.output });
+      appendSubagentEvent(data.sessionId, { type: 'background_process_complete', seq: data.seq, id: data.id, command: data.command, reason: data.reason, exitCode: data.exitCode, success: data.success, output: data.output });
+    }));
+    EventsOn('subagent_user_message', buffered((data) => {
+      appendSubagentEvent(data.sessionId, { type: 'user_message', seq: data.seq, turn: data.turn, content: data.content });
+    }));
+    EventsOn('subagent_system_signal', buffered((data) => {
+      appendSubagentEvent(data.sessionId, { type: 'system_signal', seq: data.seq, content: data.content });
     }));
     EventsOn('subagent_session_start', buffered((data) => {
       const link = { index: Number(data.taskIndex), sessionId: data.sessionId };

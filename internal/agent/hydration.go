@@ -6,6 +6,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 // HydrationRow is one sequenced live row — a retained tail row or a retained
@@ -47,7 +48,9 @@ type HydrationState struct {
 // as one snapshot before replaying subsequent live events. The capture is the
 // revalidating live-selection shape: a compaction or commit landing between the
 // durable read and the locked read forces a retry, and exhausting the three
-// attempts surfaces an error rather than an empty session.
+// attempts surfaces an error rather than an empty session. A session id that is
+// not a live root resolves as a child: a live child from its registry entry, a
+// completed child from its durable store.
 func (a *Agent) HydrateSession(sessionID string) (HydrationState, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
@@ -62,7 +65,7 @@ func (a *Agent) HydrateSession(sessionID string) (HydrationState, error) {
 	unit, err := a.liveSessionLocked(sessionID)
 	rt.mu.Unlock()
 	if err != nil {
-		return HydrationState{}, err
+		return a.hydrateChildSession(sessionID)
 	}
 	summary, err := a.SessionSummaryForSession(sessionID)
 	if err != nil {
@@ -73,6 +76,67 @@ func (a *Agent) HydrateSession(sessionID string) (HydrationState, error) {
 		return HydrationState{}, err
 	}
 	return hydrationStateFrom(summary, cs), nil
+}
+
+// hydrateChildSession resolves a child session's complete transcript. A live
+// child resolves from its registry entry — the durable prefix read through the
+// entry's store plus the retained tail, errors, and cursor — while a completed
+// child resolves from its durable store exactly as SessionMessagesFor's
+// non-live branch does, with an empty tail and errors so the frontend's gate is
+// a no-op. The registry entry's presence is the liveness signal: a lookup miss
+// is the common case (the viewer opens a completed subtask's transcript far
+// more often than a live one) and is not an error.
+func (a *Agent) hydrateChildSession(sessionID string) (HydrationState, error) {
+	rt := a.ensureRuntime()
+	rt.transcriptMu.Lock()
+	e := rt.transcriptState[sessionID]
+	rt.transcriptMu.Unlock()
+	if e != nil {
+		return a.captureLiveChildSession(sessionID, e)
+	}
+	root, err := a.sessionsRootForSession(sessionID)
+	if err != nil {
+		return HydrationState{}, err
+	}
+	store, err := snapshot.NewForSessionsRoot(root, "", "")
+	if err != nil {
+		return HydrationState{}, err
+	}
+	msgs, _, err := a.messagesForFrontendForStoreAndMaxTurn(store, sessionID)
+	if err != nil {
+		return HydrationState{}, err
+	}
+	return HydrationState{Messages: msgs}, nil
+}
+
+// captureLiveChildSession captures a live child's complete transcript with the
+// same revalidating shape a root hydration uses: the durable prefix is read
+// outside the coordinator lock, and a commit landing between the read and the
+// locked revalidation forces a retry rather than a torn snapshot. Only the
+// transcript portion is read — a child has no live unit classes — and it comes
+// from the shared locked capture, so the disjoint-halves guard applies to a
+// child exactly as it does to a root turn.
+func (a *Agent) captureLiveChildSession(sessionID string, e *transcriptCursor) (HydrationState, error) {
+	tr := e.coord
+	for attempt := 1; attempt <= 3; attempt++ {
+		tr.seqMu.Lock()
+		rev0 := tr.revisionLocked()
+		tr.seqMu.Unlock()
+
+		committed, maxDurableTurn, err := a.messagesForFrontendForStoreAndMaxTurn(e.store, sessionID)
+		if err != nil {
+			return HydrationState{}, err
+		}
+
+		tr.seqMu.Lock()
+		ct, ok := captureTranscriptLocked(tr, committed, maxDurableTurn, &rev0)
+		tr.seqMu.Unlock()
+		if !ok {
+			continue
+		}
+		return hydrationStateFrom(SessionSummary{ID: sessionID}, completeState{transcript: ct}), nil
+	}
+	return HydrationState{}, errCaptureRevisionChanged
 }
 
 func hydrationStateFrom(summary SessionSummary, cs completeState) HydrationState {

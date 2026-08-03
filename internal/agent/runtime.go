@@ -149,6 +149,44 @@ func (rt *runtime) transcriptForSessionID(id string) *transcript {
 	return e.coord
 }
 
+// ownerCtxDone returns the owner context's done channel, or nil when the owner
+// context is not set (a bare newRuntime in a test that never saw Init). A nil
+// channel blocks a select forever, which is the correct "no owner context yet"
+// behaviour.
+func (rt *runtime) ownerCtxDone() <-chan struct{} {
+	if rt == nil || rt.ownerCtx == nil {
+		return nil
+	}
+	return rt.ownerCtx.Done()
+}
+
+// flushAndCommitTranscript waits for the loop event drainer to dispatch every
+// queued event, then commits the session's turn. The round-trip is required,
+// not defensive: nextSeq is assigned inside dispatchLoopEvent and
+// dispatchTaggedEvent on the single drainLoopEvents goroutine, so a producer
+// finishing proves nothing about dispatch. The wait gives up on the owner
+// context — cancelled only by owner shutdown — so a shutting-down owner cannot
+// block the caller forever. It deliberately takes no caller context, so no call
+// site can reintroduce a turn-cancellable context that would race the flush and
+// commit an understated cursor.
+func (rt *runtime) flushAndCommitTranscript(sessionID string, turn int) {
+	if rt == nil {
+		return
+	}
+	done := make(chan struct{})
+	select {
+	case rt.loopFlush <- done:
+	case <-rt.ownerCtxDone():
+		return
+	}
+	select {
+	case <-done:
+	case <-rt.ownerCtxDone():
+		return
+	}
+	feedTranscript(rt.transcriptForSessionID(sessionID), Event{Kind: EventTurnEnd, SessionID: sessionID, Turn: turn})
+}
+
 func newRuntime(a *Agent, opts runtimeOptions) *runtime {
 	rt := &runtime{
 		agent:            a,
