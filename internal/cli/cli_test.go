@@ -867,17 +867,36 @@ func TestCLIEventCallbackAbsorbsBurstWithoutBlocking(t *testing.T) {
 }
 
 // TestCLIClosedEventCallbackDropsEvents proves that once event admission is closed
-// the callback drops further events, so shutdown can join the owner without a late
-// event slipping into an abandoned queue.
+// the callback drops further events, and that a frame already queued is discarded
+// at close, so shutdown joins the owner without a late event slipping into an
+// abandoned queue and nothing queued at close is ever rendered.
 func TestCLIClosedEventCallbackDropsEvents(t *testing.T) {
 	c := New(nil)
+	c.enqueueEvent(agent.Event{Kind: agent.EventTextDelta, Result: "queued before close"})
 	c.closeEvents()
-	c.enqueueEvent(agent.Event{Kind: agent.EventTextDelta, Result: "x"})
+	c.enqueueEvent(agent.Event{Kind: agent.EventTextDelta, Result: "after close"})
 	c.eventMu.Lock()
 	got := len(c.eventFrames)
 	c.eventMu.Unlock()
 	if got != 0 {
-		t.Fatalf("closed event admission buffered %d events, want 0", got)
+		t.Fatalf("closed event admission kept %d frames (queued backlog or late admission), want 0", got)
+	}
+}
+
+// TestHostDeliveryCloseDropPolicy proves the terminal host's close deliberately
+// discards frames already queued: mainLoop has returned by teardown and nothing
+// renders after it, so the backlog is dropped rather than drained — the protocol
+// host drains its backlog because its client process is still reading the pipe,
+// while the terminal has no consumer left at close.
+func TestHostDeliveryCloseDropPolicy(t *testing.T) {
+	c := New(nil)
+	c.enqueueEvent(agent.Event{Kind: agent.EventTextDelta, Result: "queued"})
+	c.closeEvents()
+	c.eventMu.Lock()
+	got := len(c.eventFrames)
+	c.eventMu.Unlock()
+	if got != 0 {
+		t.Fatalf("close left %d queued frames to be rendered later; the terminal host drops the backlog at close", got)
 	}
 }
 

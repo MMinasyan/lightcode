@@ -507,6 +507,53 @@ func TestWailsDeliveryCloseAbandonsBlockedEmit(t *testing.T) {
 	}
 }
 
+// TestHostDeliveryCloseDropPolicy proves the desktop host's close deliberately
+// drops frames still queued at close: the framework releases the window and
+// webview before invoking the shutdown hook, so nothing emitted from inside the
+// hook is ever dispatched — the drop is by drainer design, not because the queued
+// frame never got a turn. The protocol host is the opposite: its client process
+// is still reading the pipe, so its close drains the backlog instead.
+func TestHostDeliveryCloseDropPolicy(t *testing.T) {
+	old := deliveryJoinTimeout
+	deliveryJoinTimeout = 50 * time.Millisecond
+	defer func() { deliveryJoinTimeout = old }()
+
+	a := &App{ctx: context.Background()}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var emitted []string
+	a.emitFn = func(name string, _ any) {
+		mu.Lock()
+		first := len(emitted) == 0
+		emitted = append(emitted, name)
+		mu.Unlock()
+		if first {
+			close(entered)
+			<-release // block only the first emit
+		}
+	}
+	a.startDelivery()
+	a.emitFrame("blocked", nil)
+	a.emitFrame("queued_at_close", nil)
+	<-entered // the drainer is blocked inside the first emit; the second frame is queued
+
+	a.closeDelivery() // returns at the join bound; the drainer is still blocked
+
+	close(release) // the drainer resumes, sees close, and drops the queued frame
+	select {
+	case <-a.deliveryDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainer did not exit after close")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(emitted) != 1 || emitted[0] != "blocked" {
+		t.Fatalf("emitted = %v, want only the frame in flight: the queued frame is dropped at close by design", emitted)
+	}
+}
+
 // TestWailsOrderedDeliveryContract is the Wails ordered-delivery contract for
 // permission resolution: a resolution publishes its frame before the async turn
 // end, so the frontend can clear the prompt instead of showing an answerable

@@ -48,6 +48,10 @@ func TestACPOutputIsWrittenOnlyByDrainer(t *testing.T) {
 // TestACPShutdownJoinsOwnerBeforeClosingOutput proves Run joins the owner before
 // closing the output, so a turn's terminal events (e.g. turn_end) emitted while the
 // owner drains on shutdown are still admitted and delivered rather than dropped.
+// The source order is what lets them be admitted at all — a frame enqueued after
+// closeOutput is rejected by the closed gate — so the behavioral half forces a
+// shutdown-produced frame to be queued when close runs and asserts it is still
+// written.
 func TestACPShutdownJoinsOwnerBeforeClosingOutput(t *testing.T) {
 	src, err := os.ReadFile("acp.go")
 	if err != nil {
@@ -59,40 +63,216 @@ func TestACPShutdownJoinsOwnerBeforeClosingOutput(t *testing.T) {
 	if shut < 0 || closeOut < 0 || shut > closeOut {
 		t.Fatal("Run must join the owner (ShutdownOwner) before closing output so terminal events are delivered on shutdown")
 	}
+
+	// The behavioral half: with the drainer held inside one write, a frame the
+	// owner's shutdown enqueues (a terminal event) sits queued when closeOutput
+	// runs; close must write it, not discard it.
+	orig := acpOutputJoinTimeout
+	acpOutputJoinTimeout = 50 * time.Millisecond
+	defer func() { acpOutputJoinTimeout = orig }()
+
+	out := &blockingACPWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(out.release) }) }
+	t.Cleanup(release)
+
+	r := &Runner{out: out}
+	r.startOutput()
+
+	r.enqueue([]byte("in-flight\n"))
+	select {
+	case <-out.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainer did not start writing the in-flight frame")
+	}
+
+	// The owner drains on shutdown here; the drainer is busy, so the terminal
+	// event queues behind the in-flight frame and is still queued when
+	// closeOutput runs.
+	r.enqueue([]byte("turn_end\n"))
+	r.closeOutput() // returns at the join bound; the drainer is still blocked
+
+	release() // the drainer writes the in-flight frame, then the backlog
+	select {
+	case <-r.outDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drainer did not exit after the backlog drained")
+	}
+	if got := out.String(); got != "in-flight\nturn_end\n" {
+		t.Fatalf("output after close = %q, want the shutdown-produced frame written after the in-flight one", got)
+	}
 }
 
-// TestACPOutputDrainsInOrder proves the drainer writes queued frames in FIFO order.
+// TestACPOutputDrainsInOrder proves the drainer writes queued frames in FIFO
+// order. Two assertions, neither substituting for the other: with the output open
+// and never closed during the assertion, every queued frame is written in order —
+// the drain is live, not deferred to close; and frames still queued when
+// closeOutput runs are written after close rather than discarded — closing
+// refuses new frames but does not discard the backlog.
 func TestACPOutputDrainsInOrder(t *testing.T) {
-	var out bytes.Buffer
-	r := &Runner{out: &out}
-	r.startOutput()
-	const n = 50
-	for i := 0; i < n; i++ {
-		r.enqueue([]byte("f" + strconv.Itoa(i) + "\n"))
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for {
+	orig := acpOutputJoinTimeout
+	acpOutputJoinTimeout = 50 * time.Millisecond
+	defer func() { acpOutputJoinTimeout = orig }()
+
+	t.Run("open_stream=frames_written_while_output_open", func(t *testing.T) {
+		const n = 50
+		out := &blockingACPWriter{entered: make(chan struct{}), release: make(chan struct{})}
+		close(out.release) // writes never block: this assertion drives an open, unblocked stream
+		r := &Runner{out: out}
+		r.startOutput()
+		var want string
+		for i := 0; i < n; i++ {
+			r.enqueue([]byte("f" + strconv.Itoa(i) + "\n"))
+			want += "f" + strconv.Itoa(i) + "\n"
+		}
+		// The whole queue drains while the output is still open; closeOutput is
+		// never called during the assertion. An implementation that writes only
+		// up to a held frame and defers the rest to close never reaches the full
+		// content and fails here.
+		deadline := time.Now().Add(2 * time.Second)
+		for out.String() != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("open stream wrote %d of %d frames; the drain must happen while the output is open, not at close", strings.Count(out.String(), "\n"), n)
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if got := out.String(); got != want {
+			t.Fatalf("open stream output = %q, want %q", got, want)
+		}
 		r.mu.Lock()
-		pending := len(r.outFrames)
+		closed := r.outClosed
 		r.mu.Unlock()
-		if pending == 0 {
-			break
+		if closed {
+			t.Fatal("the output was closed during the open-stream assertion")
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%d frames still undrained", pending)
+		// The assertion ran with the output open; close only to join the drainer.
+		r.closeOutput()
+		select {
+		case <-r.outDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("drainer did not exit after close")
 		}
-		time.Sleep(time.Millisecond)
-	}
-	r.closeOutput() // join the drainer after its last write before reading out
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-	if len(lines) != n {
-		t.Fatalf("got %d lines, want %d: %q", len(lines), n, out.String())
-	}
-	for i, line := range lines {
-		if want := "f" + strconv.Itoa(i); line != want {
-			t.Fatalf("line %d = %q, want %q", i, line, want)
+	})
+
+	t.Run("close_with_backlog=frames_written_after_close", func(t *testing.T) {
+		const n = 50
+		out := &blockingACPWriter{entered: make(chan struct{}), release: make(chan struct{})}
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(out.release) }) }
+		t.Cleanup(release)
+
+		r := &Runner{out: out}
+		r.startOutput()
+		r.enqueue([]byte("f0\n"))
+		select {
+		case <-out.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("drainer did not start writing the first frame")
 		}
-	}
+		for i := 1; i < n; i++ {
+			r.enqueue([]byte("f" + strconv.Itoa(i) + "\n"))
+		}
+		// Close while 49 frames are still queued: they are the backlog close must
+		// drain rather than discard.
+		r.closeOutput()
+		release()
+		select {
+		case <-r.outDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("drainer did not exit after the backlog drained")
+		}
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+		if len(lines) != n {
+			t.Fatalf("got %d lines, want %d: %q", len(lines), n, out.String())
+		}
+		for i, line := range lines {
+			if want := "f" + strconv.Itoa(i); line != want {
+				t.Fatalf("line %d = %q, want %q", i, line, want)
+			}
+		}
+	})
+}
+
+// TestACPOutputCloseDrainsBacklog proves closing delivery on the protocol host
+// writes frames already queued before the drainer exits: the client process is
+// still reading the output pipe at close, and the queued frames are the terminal
+// events shutdown just produced. The backlog is forced, not raced — the drainer
+// is held inside one write while the rest queue behind it. Its nearest forbidden
+// sibling: a drainer blocked inside one write is still abandoned at the host's
+// existing join bound rather than waited for.
+func TestACPOutputCloseDrainsBacklog(t *testing.T) {
+	t.Run("queued_frames=written_after_close", func(t *testing.T) {
+		orig := acpOutputJoinTimeout
+		acpOutputJoinTimeout = 50 * time.Millisecond
+		defer func() { acpOutputJoinTimeout = orig }()
+
+		out := &blockingACPWriter{entered: make(chan struct{}), release: make(chan struct{})}
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(out.release) }) }
+		t.Cleanup(release)
+
+		r := &Runner{out: out}
+		r.startOutput()
+
+		// Frame A is dequeued and blocked inside its write...
+		r.enqueue([]byte("A\n"))
+		select {
+		case <-out.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("drainer did not start writing frame A")
+		}
+		// ...while B and C sit queued. Close must still write them.
+		r.enqueue([]byte("B\n"))
+		r.enqueue([]byte("C\n"))
+		r.closeOutput()
+
+		release() // the drainer writes A, then the backlog
+		select {
+		case <-r.outDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("drainer did not exit after the backlog drained")
+		}
+		if got := out.String(); got != "A\nB\nC\n" {
+			t.Fatalf("output after close = %q, want the queued backlog written: %q", got, "A\nB\nC\n")
+		}
+	})
+
+	t.Run("blocked_write=abandoned_at_existing_bound", func(t *testing.T) {
+		orig := acpOutputJoinTimeout
+		acpOutputJoinTimeout = 100 * time.Millisecond
+		defer func() { acpOutputJoinTimeout = orig }()
+
+		out := &blockingACPWriter{entered: make(chan struct{}), release: make(chan struct{})}
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(out.release) }) }
+		t.Cleanup(release)
+
+		r := &Runner{out: out}
+		r.startOutput()
+
+		r.enqueue([]byte("A\n"))
+		select {
+		case <-out.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("drainer did not start writing frame A")
+		}
+
+		// The write never completes; close must give up at the existing join
+		// bound rather than wait for the drainer.
+		start := time.Now()
+		r.closeOutput()
+		elapsed := time.Since(start)
+		if elapsed < acpOutputJoinTimeout/2 || elapsed > 2*time.Second {
+			t.Fatalf("closeOutput returned in %v; it must abandon the blocked drainer at the join bound (%v)", elapsed, acpOutputJoinTimeout)
+		}
+
+		release() // let the abandoned drainer finish and exit
+		select {
+		case <-r.outDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("drainer did not exit after the blocked write was released")
+		}
+	})
 }
 
 // TestACPOwnsConcreteAgentLifecycle proves the runner initializes the concrete
@@ -123,6 +303,31 @@ type blockingReader struct{ release <-chan struct{} }
 func (b blockingReader) Read(p []byte) (int, error) {
 	<-b.release
 	return 0, io.EOF
+}
+
+// blockingACPWriter signals when the drainer first enters a Write and blocks
+// every Write until release closes, so a test can hold the drainer mid-stream
+// and force a deterministic backlog at close.
+type blockingACPWriter struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	buf     bytes.Buffer
+}
+
+func (w *blockingACPWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-w.release
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *blockingACPWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
 }
 
 // TestACPStdinReadByOneScanner proves only scanLoop reads r.in, so there is no

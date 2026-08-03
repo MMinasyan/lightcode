@@ -292,7 +292,13 @@ func (a *App) runDeliveryDrainer() {
 		if a.deliveryClosed {
 			// Once closed, stop emitting and drop pending frames — including any
 			// queued behind an abandoned blocked emit, which must not reach the
-			// frontend after shutdown has proceeded.
+			// frontend after shutdown has proceeded. The drop is deliberate,
+			// unlike the protocol host's close, which drains its backlog because
+			// its client process is still reading the pipe: the Wails framework
+			// stops its main loop and releases the window and webview before
+			// invoking the shutdown hook (verified in Wails v2.12.0 on all three
+			// platforms), so an emit from inside that hook is never dispatched —
+			// on Linux the idle source never fires and the queued entry leaks.
 			a.deliveryMu.Unlock()
 			return
 		}

@@ -224,12 +224,17 @@ func (c *CLI) closeOpAdmission() {
 	c.opMu.Unlock()
 }
 
-// closeEvents rejects further owner events. Shutdown joins the owner before calling
-// it, so a cancelled turn's terminal events are admitted during the join rather than
-// dropped; the CLI is exiting, so those final events are not rendered.
+// closeEvents rejects further owner events and discards whatever is still queued.
+// Shutdown joins the owner before calling it, so a cancelled turn's terminal events
+// are admitted during the join rather than dropped at admission. The discard of the
+// already-queued backlog is deliberate, unlike the protocol host's close, which
+// drains its backlog because its client process is still reading the pipe: mainLoop
+// has already returned by teardown and the teardown never calls drainEvents again,
+// so nothing queued here would ever be rendered.
 func (c *CLI) closeEvents() {
 	c.eventMu.Lock()
 	c.eventClosed = true
+	c.eventFrames = nil
 	c.eventMu.Unlock()
 }
 

@@ -172,12 +172,13 @@ func (r *Runner) seedPresented(id string) {
 }
 
 // runOutputDrainer is the only goroutine that writes r.out. It drains frames in
-// FIFO order and exits once closed.
+// FIFO order and exits once closed and its queue is empty: closing delivery
+// refuses new frames but the drainer still writes what was already queued.
 func (r *Runner) runOutputDrainer() {
 	defer close(r.outDone)
 	for {
 		r.mu.Lock()
-		if r.outClosed {
+		if r.outClosed && len(r.outFrames) == 0 {
 			r.mu.Unlock()
 			return
 		}
@@ -210,8 +211,11 @@ func (r *Runner) presentAcceptsLocked(f outFrame) bool {
 	return f.sessionID == "" || f.sessionID == r.presented
 }
 
-// closeOutput rejects further frames and joins the drainer, abandoning it if it is
-// blocked inside one write.
+// closeOutput refuses further frames and joins the drainer, letting it write what
+// is already queued before it exits, bounded by acpOutputJoinTimeout: the client
+// process is still reading the pipe at close, and the queued frames are the
+// terminal events shutdown just produced. A drainer blocked inside one write is
+// abandoned at that bound.
 func (r *Runner) closeOutput() {
 	r.outOnce.Do(func() {
 		r.mu.Lock()
