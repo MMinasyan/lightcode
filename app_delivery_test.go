@@ -14,6 +14,66 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agent"
 )
 
+// TestWailsErrorFrameOmitsSequenceForSessionlessError verifies the error frame
+// built for an error event carries a seq field only when the event actually has
+// a sequence. A sessionless error is emitted directly and never sequenced
+// (Seq 0); its frame must omit the field, because the frontend gate reads the
+// field's absence as "unsequenced" and admits it, while a zero-stamped seq is
+// rejected against every snapshot high-water and the error never renders.
+func TestWailsErrorFrameOmitsSequenceForSessionlessError(t *testing.T) {
+	a := &App{ctx: context.Background()}
+	var mu sync.Mutex
+	var payloads []any
+	a.emitFn = func(name string, payload any) {
+		mu.Lock()
+		payloads = append(payloads, payload)
+		mu.Unlock()
+	}
+	a.startDelivery()
+	defer a.closeDelivery()
+	a.seedPresented("s")
+
+	// A sessionless error: no transcript, no sequence, and no session tag
+	// (an empty session id is a global frame, always delivered).
+	a.handleEvent(agent.Event{Kind: agent.EventError, Error: "sessionless"})
+	// A session error is sequenced by the transcript coordinator.
+	a.handleEvent(agent.Event{Kind: agent.EventError, SessionID: "s", Seq: 7, Error: "sequenced"})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := len(payloads)
+		mu.Unlock()
+		if n == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("drained %d of 2 error frames", n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	sessionless, ok1 := payloads[0].(map[string]any)
+	sequenced, ok2 := payloads[1].(map[string]any)
+	if !ok1 || !ok2 {
+		t.Fatalf("error frame payloads are %T and %T, want map[string]any", payloads[0], payloads[1])
+	}
+	if _, present := sessionless["seq"]; present {
+		t.Fatalf("sessionless error frame carries seq %#v; the field must be omitted so the frontend gate admits it", sessionless["seq"])
+	}
+	if sessionless["message"] != "sessionless" {
+		t.Fatalf("sessionless error frame message = %#v, want %q", sessionless["message"], "sessionless")
+	}
+	if sequenced["seq"] != 7 {
+		t.Fatalf("sequenced error frame seq = %#v, want 7", sequenced["seq"])
+	}
+	if sequenced["message"] != "sequenced" {
+		t.Fatalf("sequenced error frame message = %#v, want %q", sequenced["message"], "sequenced")
+	}
+}
+
 // TestWailsHydrateSessionUnavailableWithoutAgent verifies the concrete-only
 // hydration surface fails cleanly when no concrete agent is owned.
 func TestWailsHydrateSessionUnavailableWithoutAgent(t *testing.T) {

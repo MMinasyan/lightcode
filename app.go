@@ -516,7 +516,15 @@ func (a *App) handleEvent(ev agent.Event) {
 		emit("turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
 		emit("status", map[string]any{"state": "idle"})
 	case agent.EventError:
-		emit("error", map[string]any{"seq": ev.Seq, "message": ev.Error})
+		// A frame carries a sequence only when the event actually has one: a
+		// sessionless error is emitted directly, never sequenced, and a
+		// zero-stamped seq would gate it as already shown against every
+		// snapshot high-water, dropping the error.
+		errorFrame := map[string]any{"message": ev.Error}
+		if ev.Seq != 0 {
+			errorFrame["seq"] = ev.Seq
+		}
+		emit("error", errorFrame)
 	case agent.EventPermissionRequest:
 		emit("permission_request", map[string]any{
 			"id":                 ev.PermReq.ID,

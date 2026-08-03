@@ -428,6 +428,49 @@ func TestHandleEventCarriesSequence(t *testing.T) {
 	}
 }
 
+// TestHandleEventErrorOmitsSequenceWhenUnsequenced verifies the agent/error
+// notification carries a seq field only when the error event was sequenced by a
+// transcript. A sessionless error is emitted directly and never sequenced
+// (Seq 0); its notification must omit the field, because a client gate that
+// reads the field's absence as "unsequenced" would reject a zero-stamped seq
+// against every snapshot high-water and the user would see nothing.
+func TestHandleEventErrorOmitsSequenceWhenUnsequenced(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	r.handleEvent(agent.Event{Kind: agent.EventError, Error: "sessionless", Turn: 1})
+	r.handleEvent(agent.Event{Kind: agent.EventError, Seq: 5, Error: "sequenced", Turn: 2})
+
+	lines := drainedLines(t, r, &out, 2)
+	for i, line := range lines {
+		var got Notification
+		if err := json.Unmarshal([]byte(line), &got); err != nil {
+			t.Fatalf("notification[%d] json: %v", i, err)
+		}
+		if got.Method != "agent/error" {
+			t.Fatalf("notification[%d] method = %q, want agent/error", i, got.Method)
+		}
+		params, ok := got.Params.(map[string]any)
+		if !ok {
+			t.Fatalf("notification[%d] %s params not object: %#v", i, got.Method, got.Params)
+		}
+		if i == 0 {
+			if _, present := params["seq"]; present {
+				t.Fatalf("sessionless error notification carries seq %#v; the field must be omitted", params["seq"])
+			}
+			if params["message"] != "sessionless" || params["turn"] != float64(1) {
+				t.Fatalf("sessionless error params = %#v, want message %q and turn 1", params, "sessionless")
+			}
+		} else {
+			if params["seq"] != float64(5) {
+				t.Fatalf("sequenced error notification seq = %#v, want 5", params["seq"])
+			}
+			if params["message"] != "sequenced" || params["turn"] != float64(2) {
+				t.Fatalf("sequenced error params = %#v, want message %q and turn 2", params, "sequenced")
+			}
+		}
+	}
+}
+
 // TestACPUsageAppliesCumulativeWithoutOwnerQuery proves the usage callback applies
 // the event's absolute cumulative report as a replacement and never queries the
 // owner: the runner has no agent, so any owner query would panic.

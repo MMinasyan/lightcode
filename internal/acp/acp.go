@@ -477,7 +477,15 @@ func (r *Runner) handleEvent(ev agent.Event) {
 		return
 	case agent.EventError:
 		method = "agent/error"
-		params = map[string]any{"seq": ev.Seq, "message": ev.Error, "turn": ev.Turn}
+		// A notification carries a sequence only when the event actually has
+		// one: a sessionless error is emitted directly, never sequenced, and a
+		// zero-stamped seq would gate it as already shown against every
+		// snapshot high-water, dropping the error client-side.
+		errorParams := map[string]any{"message": ev.Error, "turn": ev.Turn}
+		if ev.Seq != 0 {
+			errorParams["seq"] = ev.Seq
+		}
+		params = errorParams
 	case agent.EventPermissionRequest:
 		method = "agent/permission_request"
 		params = map[string]any{

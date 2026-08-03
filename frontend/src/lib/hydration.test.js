@@ -1,6 +1,49 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { runInNewContext } from 'node:vm';
+
 import { describe, expect, it } from 'vitest';
 
 import { admitSequenced, newTranscriptGate, snapshotHighWater, snapshotMessages } from './hydration.js';
+
+// errorHandlerSource extracts the live 'error' listener's arrow function out of
+// App.svelte so the test drives the real handler code, not a copy of it. It
+// mirrors the eventCallbackSource helper in App.test.js.
+function errorHandlerSource() {
+  const app = readFileSync(resolve('src/App.svelte'), 'utf8');
+  const marker = `EventsOn('error',`;
+  const start = app.indexOf(marker);
+  if (start === -1) throw new Error(`no EventsOn('error') listener in App.svelte`);
+  const arrow = app.indexOf('=>', start);
+  const open = app.indexOf('{', arrow);
+  let depth = 0;
+  let close = -1;
+  for (let i = open; i < app.length; i++) {
+    const c = app[i];
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) { close = i; break; }
+    }
+  }
+  if (close === -1) throw new Error(`unbalanced listener body for 'error'`);
+  const head = app.slice(start, arrow);
+  return app.slice(start + head.lastIndexOf('('), close + 1);
+}
+
+// errorHandlerSandbox builds the runInNewContext sandbox the error-handler
+// tests drive: a snapshot-seeded gate and a showError that mirrors the real one
+// in App.svelte (the admitted frame appends a row).
+function errorHandlerSandbox(state) {
+  const sandbox = {
+    messages: snapshotMessages(state),
+    busy: true,
+    gate: newTranscriptGate(state),
+    admitSequenced,
+  };
+  sandbox.showError = (text) => { sandbox.messages = [...sandbox.messages, { type: 'error', content: String(text) }]; };
+  return sandbox;
+}
 
 describe('transcript high-water gating', () => {
   it('takes the high-water from the max of the cursor, tail, and error rows', () => {
@@ -74,6 +117,47 @@ describe('transcript high-water gating', () => {
     };
     const tornGate = newTranscriptGate(torn);
     expect(admitSequenced(tornGate, droppedSeq)).toBe(true);
+  });
+
+  // An error raised while the initial read is in flight is delivered as a live
+  // frame, buffered, and replayed after the snapshot applies. The snapshot
+  // retains that error and its row raises the high-water, so the replay must
+  // gate as already shown or the error renders twice.
+  it('renders a retained error once when the buffered frame replays after the snapshot', () => {
+    const state = {
+      messages: [{ type: 'user', content: 'q1' }],
+      cursor: { committedSeq: 4 },
+      errors: [{ seq: 5, message: { type: 'error', content: 'boom' } }],
+    };
+    const sandbox = errorHandlerSandbox(state);
+    runInNewContext(`(${errorHandlerSource()})({ seq: 5, message: 'boom' });`, sandbox);
+    // The snapshot rendered the error; the replay at its own sequence must not
+    // render it a second time.
+    expect(sandbox.messages.filter((m) => m.type === 'error')).toHaveLength(1);
+  });
+
+  // A sessionless error is emitted directly and never sequenced, so the
+  // producer frame carries no seq field. The gate must read the field's absence
+  // as unsequenced and admit it.
+  it('renders a sessionless error whose frame carries no sequence', () => {
+    const sandbox = errorHandlerSandbox({
+      messages: [{ type: 'user', content: 'q1' }],
+      cursor: { committedSeq: 4 },
+    });
+    runInNewContext(`(${errorHandlerSource()})({ message: 'boom' });`, sandbox);
+    expect(sandbox.messages.filter((m) => m.type === 'error')).toHaveLength(1);
+  });
+
+  // The sessionless case fails against the old zero-stamped frame: seq 0 is at
+  // or below every snapshot high-water, so the gate drops it and the error
+  // never renders. The producer must omit the field, never stamp a zero.
+  it('drops a sessionless error whose frame zero-stamps the sequence', () => {
+    const sandbox = errorHandlerSandbox({
+      messages: [{ type: 'user', content: 'q1' }],
+      cursor: { committedSeq: 4 },
+    });
+    runInNewContext(`(${errorHandlerSource()})({ seq: 0, message: 'boom' });`, sandbox);
+    expect(sandbox.messages.filter((m) => m.type === 'error')).toHaveLength(0);
   });
 });
 

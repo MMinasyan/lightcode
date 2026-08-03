@@ -326,6 +326,7 @@
     }));
 
     EventsOn('error', buffered((data) => {
+      if (!admitSequenced(gate, data?.seq)) return;
       showError(data?.message || data);
       busy = false;
     }));
