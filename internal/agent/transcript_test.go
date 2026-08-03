@@ -1494,10 +1494,11 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 	//     its turn_start is delivered (and turn N's turn_end was already
 	//     delivered before the feed) while the commit is still pending — the
 	//     exact window the defect is built on. The assertion below fails.
-	//   - With the commit inside the busy-clear section the parked feed holds
-	//     runtime.mu, so the submit cannot claim until the commit has run: no
-	//     turn_start(N+1) is delivered before the release, and the next turn's
-	//     rows then feed after the commit and survive.
+	//   - Now the commit runs immediately before the busy-clear section while
+	//     the unit is still busy, so the racing submit cannot claim: a busy
+	//     unit enqueues, no turn_start(N+1) is delivered before the release,
+	//     and the drained turn N+1 feeds its rows after the commit and
+	//     survives.
 	t.Run("race=submit_vs_turn_end", func(t *testing.T) {
 		releaseRun := make(chan struct{})
 		releaseN1 := make(chan struct{})
@@ -1554,8 +1555,8 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 		waitForSignal(t, reqNSeen, "turn N model request")
 
 		// Park turn N's commit feed: hold seqMu, then release Run(N), so the
-		// turn-end path runs through the busy clear and parks at the commit
-		// feed with the deferred cleanup pending.
+		// turn-end path runs through the flush and parks at the commit feed,
+		// before the busy-clear section, with the deferred cleanup pending.
 		tr := a.transcriptForSessionID(id)
 		tr.seqMu.Lock()
 		seqMuHeld := true
@@ -1566,12 +1567,15 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 		}()
 
 		closeRun()
-		// Wait out the completion and the park: with the commit feed inside
-		// the busy-clear section the parked feed holds runtime.mu, so busy is
-		// not observable until the commit completes.
+		// Wait out the completion and the park: the commit feed now runs
+		// before the busy-clear section, so while it is parked the unit is
+		// still busy and no concurrent submit can claim.
 		time.Sleep(200 * time.Millisecond)
 
-		// Submit turn N+1 racing the turn end while the commit is pending.
+		// Submit turn N+1 racing the turn end while the commit is pending,
+		// and wait for the submit to complete while the commit is still
+		// parked (seqMu is still held here): the unit is still busy, so a
+		// busy unit must enqueue rather than claim.
 		var resN1 SubmitResult
 		var errN1 error
 		var subWg sync.WaitGroup
@@ -1580,7 +1584,13 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 			defer subWg.Done()
 			resN1, errN1 = a.SubmitToSession(ctx, id, "turn N+1")
 		}()
-		time.Sleep(100 * time.Millisecond)
+		subWg.Wait()
+		if errN1 != nil {
+			t.Fatalf("SubmitToSession N+1: %v", errN1)
+		}
+		if resN1.Started {
+			t.Fatalf("the racing submit started turn %d while turn %d's commit was still pending; a busy unit must enqueue, not claim", resN1.Turn, resN.Turn)
+		}
 
 		// While turn N's commit is still pending (seqMu is still held here),
 		// the racing submit must not have claimed: no turn_start(N+1) may be
@@ -1601,8 +1611,9 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 			t.Fatalf("turn %d's turn_end was delivered before its commit ran", resN.Turn)
 		}
 
-		// Release the stall: turn N's commit completes, then the submit
-		// claims and turn N+1 runs to the second gate.
+		// Release the stall: turn N's commit completes and its end event is
+		// emitted, then the drainer launches the enqueued turn N+1, which
+		// runs to the second gate.
 		tr.seqMu.Unlock()
 		seqMuHeld = false
 		waitForSignal(t, reqN1Seen, "turn N+1 model request")
@@ -1630,20 +1641,15 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 		}
 
 		closeN1()
-		subWg.Wait()
-		if errN1 != nil {
-			t.Fatalf("SubmitToSession N+1: %v", errN1)
-		}
-		if !resN1.Started {
-			t.Fatalf("turn N+1 enqueued instead of claiming the unit")
-		}
 		waitSessionDrained(t, a, id)
 
+		// The drained turn advanced the committed marker: turn N+1's rows
+		// were committed, not wiped by turn N's commit.
 		tr.seqMu.Lock()
 		committedTurn := tr.committedTurn
 		tr.seqMu.Unlock()
-		if committedTurn != resN1.Turn {
-			t.Fatalf("committedTurn = %d, want turn N+1's turn %d", committedTurn, resN1.Turn)
+		if committedTurn != resN.Turn+1 {
+			t.Fatalf("committedTurn = %d, want the drained turn %d", committedTurn, resN.Turn+1)
 		}
 	})
 
@@ -2238,7 +2244,7 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 		// The cancel lands after the revalidation passed and before the
 		// launch begins.
 		cancel()
-		if launched := rt.launchTurn(ctx, unit, turnCtx, cancel, []string{"late cancel"}); launched != 0 {
+		if launched := rt.launchTurn(unit, turnCtx, cancel, []string{"late cancel"}); launched != 0 {
 			t.Fatalf("launchTurn accepted a cancelled handoff, returned turn %d", launched)
 		}
 
@@ -2426,10 +2432,12 @@ func assertQueueChangedPayloadForVersion(t *testing.T, cap *eventCapture, versio
 // directly, with no interleaving to force: the deferred cleanup must clear the
 // unit's per-turn state only when the unit still holds that turn's context,
 // and must leave a later claim's state untouched. The goroutine is driven to
-// its early-return path (the owner context is already canceled, so Run never
-// starts) and the deferred cleanup runs against the unit in the exact state
-// the test arranged; completion is observed through the deferred cleanup's
-// own cancel() of the turn context, which runs after the guard.
+// its early-return path (the owner context is already cancelled, so the
+// post-admission checks fire and Run never starts) and the deferred cleanup
+// runs against the unit in the exact state the test arranged; completion is
+// observed through the deferred cleanup's own cancel() of the turn context,
+// which runs after the guard. A cancelled caller context no longer drives
+// this path: once a turn is admitted, its lifetime is the owner's.
 func TestDeferredCleanupGuardContract(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeTextResponse(w, "unreachable")
@@ -2445,10 +2453,13 @@ func TestDeferredCleanupGuardContract(t *testing.T) {
 	unit := a.sessions[id]
 	rt := a.ensureRuntime()
 
-	// An already-canceled owner context makes launchTurn's goroutine take its
+	// An already-cancelled owner context makes launchTurn's goroutine take its
 	// early-return path, so the deferred cleanup runs without any turn work.
-	canceled, cancelOwner := context.WithCancel(context.Background())
-	cancelOwner()
+	// The turn context passed in is independent of the owner context, so the
+	// receiving-end rejection (which refuses an already-cancelled handoff)
+	// still admits the launch; the goroutine's post-admission check then fires
+	// on the owner's lifetime.
+	rt.ownerCancel()
 
 	// runDeferred arranges the unit's per-turn state, launches a turn whose
 	// deferred cleanup will run immediately, and waits for the deferred
@@ -2461,7 +2472,7 @@ func TestDeferredCleanupGuardContract(t *testing.T) {
 		unit.turnCancel = unitCancel
 		rt.mu.Unlock()
 		rt.turnWG.Add(1)
-		rt.launchTurn(canceled, unit, thisCtx, thisCancel, []string{"x"})
+		rt.launchTurn(unit, thisCtx, thisCancel, []string{"x"})
 		select {
 		case <-thisCtx.Done():
 		case <-time.After(10 * time.Second):

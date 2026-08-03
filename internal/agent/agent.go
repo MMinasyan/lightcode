@@ -995,11 +995,14 @@ func (rt *runtime) init(ctx context.Context) string {
 
 func (rt *runtime) initOnceLocked(ctx context.Context) string {
 	a := rt.agent
-	// The background goroutines run on an owned context. An explicit shutdown
-	// (ShutdownOwner) cancels it after the in-flight turn join so the drainer
-	// stays alive to deliver terminal events; host-context cancellation stops
-	// them directly, and the bounded join then abandons any blocked delivery.
-	rt.ownerCtx, rt.ownerCancel = context.WithCancel(ctx)
+	// The background goroutines run on an owned context that is independent of
+	// the host context. Once the owner accepts work, that work's lifetime is
+	// the owner's: a host context may trigger shutdown but never severs
+	// accepted work. Cancelling the host context still triggers the joined
+	// shutdown through the watcher below, which cancels the owner context
+	// after the in-flight turn join so the drainer stays alive to deliver
+	// terminal events.
+	rt.ownerCtx, rt.ownerCancel = context.WithCancel(context.Background())
 	rt.bgWG.Add(4)
 	go func() { defer rt.bgWG.Done(); rt.drainLoopEvents(rt.ownerCtx) }()
 	go func() { defer rt.bgWG.Done(); rt.runSignalScheduler(rt.ownerCtx) }()
@@ -1145,7 +1148,7 @@ func (rt *runtime) tryStartSignalTurn(ctx context.Context) {
 			}
 			return
 		}
-		rt.launchTurn(ctx, unit, turnCtx, cancel, nil)
+		rt.launchTurn(unit, turnCtx, cancel, nil)
 	}
 }
 
@@ -2034,9 +2037,20 @@ func activeTailReadRecords(tail []message.Message, reads []tool.ReadRecord, defa
 	return out
 }
 
+// CompactNowForSession runs a compaction for a live session. The caller's ctx
+// gates admission: an already-cancelled context refuses the compaction before
+// the session is marked busy. Once admitted, the compaction's context derives
+// from the owner context, so its lifetime is the owner's and a caller's
+// cancellation never severs it.
 func (a *Agent) CompactNowForSession(ctx context.Context, sessionID string) error {
+	// A nil context is not a cancelled one: normalise it to a live context
+	// ahead of the admission check, so the compaction is admitted as it
+	// always was instead of being refused or panicking.
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
@@ -2055,7 +2069,7 @@ func (a *Agent) CompactNowForSession(ctx context.Context, sessionID string) erro
 	}
 	unit.busy = true
 	rt.turnWG.Add(1)
-	compactCtx, cancel := context.WithCancel(ctx)
+	compactCtx, cancel := context.WithCancel(rt.workCtx())
 	unit.turnCancel = cancel
 	unit.turnCtx = compactCtx
 	rt.mu.Unlock()
@@ -2502,10 +2516,23 @@ func (rt *runtime) submit(ctx context.Context, unit *session, content string, ad
 		}
 		version := unit.queueVersion
 		rt.mu.Unlock()
-		turn := rt.launchTurn(ctx, unit, turnCtx, cancel, []string{content})
+		turn := rt.launchTurn(unit, turnCtx, cancel, []string{content})
 		return SubmitResult{Started: true, Turn: turn, Queue: emptyQueue(), Version: version}, nil
 	}
-	// Busy or queue non-empty: enqueue and let the drainer pick it up.
+	// Busy or queue non-empty: enqueue and let the drainer pick it up. The
+	// caller's context gates admission to the queue exactly as it gates the
+	// immediate claim in claimTurnLocked: an already-cancelled context refuses
+	// before the item is admitted, and once admitted the item's lifetime is
+	// the owner's. A nil context is not a cancelled one: normalise it to a
+	// live context ahead of the check, so it is admitted as it always was
+	// instead of panicking or being refused.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		rt.mu.Unlock()
+		return SubmitResult{}, err
+	}
 	unit.queueSeq++
 	unit.queue = append(unit.queue, QueuedItem{ID: fmt.Sprintf("q-%d", unit.queueSeq), Content: content})
 	unit.queueVersion++
@@ -2604,6 +2631,11 @@ var errOwnerClosed = errors.New("agent: owner is shutting down")
 // per-turn context). Caller must hold the runtime mutex. Returns a non-nil error if a turn
 // is already in progress or ensureSession fails; on error it leaves busy
 // unchanged (never half-claims). launchTurn must be called AFTER unlocking.
+// The caller's ctx gates admission only: an already-cancelled context refuses
+// the claim. The accepted turn's context derives from the owner context, so a
+// caller's cancellation after admission never severs the accepted turn — only
+// owner shutdown (which cancels it through the per-session cancel) or an
+// explicit per-session cancel can end it.
 func (rt *runtime) claimTurnLocked(ctx context.Context, unit *session) (context.Context, context.CancelFunc, error) {
 	a := rt.agent
 	if err := ctx.Err(); err != nil {
@@ -2633,7 +2665,7 @@ func (rt *runtime) claimTurnLocked(ctx context.Context, unit *session) (context.
 	// join can never miss a turn between claim and launch. launchTurn's goroutine
 	// calls Done.
 	rt.turnWG.Add(1)
-	turnCtx, cancel := context.WithCancel(ctx)
+	turnCtx, cancel := context.WithCancel(rt.workCtx())
 	unit.turnCancel = cancel
 	unit.turnCtx = turnCtx
 	return turnCtx, cancel, nil
@@ -2932,7 +2964,7 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 			// after releasing this count — is its only releaser.
 			rt.turnWG.Add(1)
 			rt.mu.Unlock()
-			launched = rt.launchTurn(ctx, unit, turnCtx, cancel, []string{contents[len(contents)-1]})
+			launched = rt.launchTurn(unit, turnCtx, cancel, []string{contents[len(contents)-1]})
 			if launched == 0 {
 				// The handoff was refused (a cancel or shutdown landed after
 				// the revalidation above, or the unit cannot launch): the
@@ -3003,7 +3035,7 @@ func wakeableSession(unit *session) bool {
 		unit.lp.HasPendingWakeSignal()
 }
 
-func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx context.Context, cancel context.CancelFunc, contents []string) int {
+func (rt *runtime) launchTurn(unit *session, turnCtx context.Context, cancel context.CancelFunc, contents []string) int {
 	a := rt.agent
 	if unit == nil || unit.store == nil || unit.lp == nil {
 		// The turn was claimed (and counted) but cannot launch; release the count.
@@ -3077,27 +3109,33 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 			rt.turnWG.Done()
 		}()
 
-		if ctx.Err() != nil {
+		// The post-admission checks key off the owner's lifetime, never the
+		// caller's: once a turn is admitted, only owner shutdown (or an
+		// explicit per-session cancel, which cancels the turn's own context)
+		// may end it. Pre-admission checks stay on the caller's context in
+		// claimTurnLocked, which refuses to accept work on an already-cancelled
+		// context.
+		if rt.ownerShuttingDown() {
 			return
 		}
 		a.refreshSystemPromptForSession(unit)
 
-		if ctx.Err() != nil {
+		if rt.ownerShuttingDown() {
 			return
 		}
 		_, err := unit.lp.Run(turnCtx, contents...)
 
-		done := make(chan struct{})
-		flushed := false
-		select {
-		case rt.loopFlush <- done:
-			select {
-			case <-done:
-				flushed = true
-			case <-ctx.Done():
-			}
-		case <-ctx.Done():
-		}
+		// The flush and the commit funnel through the shared helper, which
+		// takes no caller context: its wait gives up on the owner context, so
+		// no call site can reintroduce a turn-cancellable or caller-cancellable
+		// context that would race the flush and commit an understated cursor.
+		// The commit therefore runs while the unit is still busy — before
+		// turn_end is emitted and before a submit can observe busy cleared —
+		// so a submit that claims the unit next feeds the next turn's rows
+		// into a tail this commit already wiped. The contract requires the
+		// flush and commit to complete after the turn's loop returns and
+		// before EventTurnEnd.
+		rt.flushAndCommitTranscript(sessionID, turn)
 
 		if err != nil {
 			errEv := Event{Kind: EventError, SessionID: sessionID, ProjectID: projectID, Error: a.turnErrorMessage(err), Turn: turn}
@@ -3113,17 +3151,6 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 		unit.busy = false
 		unit.turnCancel = nil
 		unit.turnCtx = nil
-		// Commit the coordinator only once the drainer flush is acknowledged. If
-		// owner cancellation bypassed the flush a streamed row may still be
-		// buffered, and it must not be fed after the turn commits. The commit
-		// runs in this runtime.mu section — before turn_end is emitted and
-		// before a submit can observe busy cleared — so a submit that claims
-		// the unit next cannot feed the next turn's rows into a tail this
-		// commit then wipes. The contract requires the flush and commit to
-		// complete after the turn's loop returns and before EventTurnEnd.
-		if flushed {
-			feedTranscript(a.transcriptForSessionID(sessionID), endEv)
-		}
 		a.emitEvent(endEv)
 		rt.mu.Unlock()
 	}()

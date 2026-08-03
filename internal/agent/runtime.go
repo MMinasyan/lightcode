@@ -86,9 +86,11 @@ type runtime struct {
 	transcriptMu    sync.Mutex
 	transcriptState map[string]*transcriptCursor
 
-	// Owner shutdown. ownerCtx/ownerCancel bound the background goroutines;
-	// closed is the turn-admission gate (guarded by mu); turnWG tracks in-flight
-	// turns and mutations; bgWG tracks the background goroutines; shutdownOnce and
+	// Owner shutdown. ownerCtx/ownerCancel bound the background goroutines and
+	// the lifetime of accepted work; they are created independently of the host
+	// context, which only triggers shutdown through the Init watcher. closed is
+	// the turn-admission gate (guarded by mu); turnWG tracks in-flight turns
+	// and mutations; bgWG tracks the background goroutines; shutdownOnce and
 	// shutdownDone make ShutdownOwner one shared join for all callers.
 	ownerCtx     context.Context
 	ownerCancel  context.CancelFunc
@@ -163,6 +165,36 @@ func (rt *runtime) ownerCtxDone() <-chan struct{} {
 		return nil
 	}
 	return rt.ownerCtx.Done()
+}
+
+// workCtx returns the context accepted work derives from: the owner context,
+// or a fresh background context when the owner was never initialised (a bare
+// runtime in a test that never saw Init). Once the owner accepts work, that
+// work's lifetime is the owner's; a host context may trigger shutdown but
+// never severs accepted work. No call site may substitute the caller's
+// context here.
+func (rt *runtime) workCtx() context.Context {
+	if rt.ownerCtx != nil {
+		return rt.ownerCtx
+	}
+	return context.Background()
+}
+
+// ownerShuttingDown reports whether the owner context is done. It is the
+// post-admission lifetime check: once work is accepted, only the owner's
+// lifetime — or an explicit per-session cancel, which cancels the turn's own
+// context directly — may end it; a cancelled caller context cannot.
+func (rt *runtime) ownerShuttingDown() bool {
+	done := rt.ownerCtxDone()
+	if done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
 }
 
 // flushAndCommitTranscript waits for the loop event drainer to dispatch every

@@ -141,9 +141,11 @@ func TestWailsShutdownBeforeStartupIsSafe(t *testing.T) {
 
 // TestWailsShutdownJoinsInFlightTurn verifies shutdown joins a turn that is still
 // running when the window closes. The turn's end-of-turn flush needs the owner's
-// internal event drainer alive, so shutdown must join the owner before cancelling
-// the host context (whose cancellation would otherwise stop that drainer first and
-// strand the flush).
+// internal event drainer alive, and ShutdownOwner keeps it alive through the
+// in-flight turn join by construction: the drainer runs on the owner context,
+// which is independent of the host context and is cancelled only after the join,
+// so the accepted turn's flush and transcript commit complete before shutdown
+// returns.
 func TestWailsShutdownJoinsInFlightTurn(t *testing.T) {
 	srvCtx, cancelSrv := context.WithCancel(context.Background())
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -182,8 +184,29 @@ func TestWailsShutdownJoinsInFlightTurn(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("app.shutdown did not join the in-flight turn: the internal drainer was stopped before the turn flushed")
+		t.Fatal("app.shutdown did not join the in-flight turn: the owner's drainer was not kept alive through the turn flush")
 	}
+
+	// The accepted turn's work outlived the host window: the submitted message
+	// is durably persisted and the turn's transcript commit ran, so the
+	// shutdown did not sever in-flight work.
+	hs, err := app.HydrateSession(id)
+	if err != nil {
+		t.Fatalf("HydrateSession after shutdown: %v", err)
+	}
+	if !hydratedAppContains(hs.Messages, "hi") {
+		t.Fatalf("the in-flight turn's message is missing from durable history after shutdown: %#v", hs.Messages)
+	}
+}
+
+// hydratedAppContains reports whether a display message list contains content.
+func hydratedAppContains(messages []agent.DisplayMessage, content string) bool {
+	for _, m := range messages {
+		if m.Content == content {
+			return true
+		}
+	}
+	return false
 }
 
 // waitUntilBusyApp blocks until the owner reports an in-flight turn.

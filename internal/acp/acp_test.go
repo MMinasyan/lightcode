@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2687,4 +2688,805 @@ func acpStopChunk(id, model string) string {
 func acpToolCallChunk(id, model, callID, name, arguments string) string {
 	argsJSON, _ := json.Marshal(arguments)
 	return fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":%q,"type":"function","function":{"name":%q,"arguments":%s}}]},"finish_reason":null}]}`, id, model, callID, name, argsJSON)
+}
+
+// TestAcceptedWorkOutlivesHostContext is the accepted-work lifetime contract:
+// once the owner accepts work, that work's lifetime is the owner's; a host
+// context may trigger shutdown but never severs accepted work. The matrix axes
+// are cancellation source (host signal, caller context, owner shutdown,
+// explicit per-session cancel) by admission state (pre-admission,
+// post-admission) by work kind (direct submit, queued item, compaction, child
+// turn). The nearest forbidden siblings: a cancelled caller context is still
+// rejected before admission, a cancelled caller context does not sever
+// already-accepted work, and owner shutdown and per-session cancel do end it.
+// The protocol host's signal path is driven specifically — that is the
+// reachable production case.
+func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
+	// The host signal path: the protocol host passes its signal context into
+	// the submit path, and a signal must end the accepted turn only through the
+	// owner's joined shutdown — its terminal event delivered and its message
+	// persisted — never by severing the turn directly.
+	t.Run("source=host_signal/state=post_admission/work=direct_submit", func(t *testing.T) {
+		reqSeen := make(chan struct{}, 1)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			// Hold the model call open until the owner cancels the turn; the
+			// test-controlled release unblocks the handler so the server can
+			// close even when the turn ends without cancelling the request.
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		// The ACP test config declares no agents.json, so the primary agent
+		// type has no model; bootstrap it through the adapter-facing method.
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		var out bytes.Buffer
+		r := &Runner{
+			agent: ag,
+			owner: ag,
+			in:    &onePromptThenBlockReader{line: []byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"session_id":"","content":"hi"}}` + "\n")},
+			out:   &out,
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx) }()
+		t.Cleanup(cancel)
+
+		waitForACPRequest(t, reqSeen, "prompt turn model request")
+		cancel() // the host's signal: cancels the Run context, triggering owner shutdown
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatal("Run did not return after the signal")
+		}
+
+		// The accepted turn was not severed: its terminal event was delivered
+		// and its message persisted, even though the host context is gone.
+		params := waitForACPMethod(t, r, &out, "agent/turn_end")
+		if cancelled, _ := params["cancelled"].(bool); !cancelled {
+			t.Fatalf("turn_end cancelled = %v, want true (the signal ended the turn through the owner)", cancelled)
+		}
+		id := r.currentSessionSummary().ID
+		if id == "" {
+			t.Fatal("no current session after Run")
+		}
+		assertACPHydratedContent(t, ag, id, "hi")
+	})
+
+	// The forbidden sibling on the host path: a prompt submitted with an
+	// already-cancelled context is refused before admission.
+	t.Run("source=host_signal/state=pre_admission/work=direct_submit", func(t *testing.T) {
+		ag := newACPTestAgent(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		cancelled, cancelCtx := context.WithCancel(context.Background())
+		cancelCtx()
+		var out bytes.Buffer
+		r := &Runner{agent: ag, owner: ag, out: &out}
+		r.handleSessionPrompt(cancelled, Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + id + `","content":"hi"}`),
+		})
+		lines := drainedLines(t, r, &out, 1)
+		assertACPErrorResponse(t, lines[0])
+		if ag.Busy() {
+			t.Fatal("a cancelled-context prompt started a turn; admission must refuse it")
+		}
+	})
+
+	// The forbidden sibling on the queued path: a submit with an
+	// already-cancelled context is refused before the item is admitted to the
+	// queue, leaving the queue unchanged.
+	t.Run("source=host_signal/state=pre_admission/work=queued_item", func(t *testing.T) {
+		reqSeen := make(chan struct{}, 1)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			writeACPSSE(w, acpTextChunk("r", "test-model", "ok"), acpStopChunk("r", "test-model"), "[DONE]")
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		cap := &acpEventCapture{}
+		ag.SetEventHandler(cap.handler)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		// The unit is busy with a live turn, so a submit would enqueue.
+		res, err := ag.SubmitToSession(ctx, id, "first")
+		if err != nil {
+			t.Fatalf("SubmitToSession first: %v", err)
+		}
+		if !res.Started {
+			t.Fatalf("first turn enqueued instead of started: %+v", res)
+		}
+		<-reqSeen
+
+		// An already-cancelled caller is refused before the item is admitted
+		// to the queue.
+		cancelled, cancelCtx := context.WithCancel(context.Background())
+		cancelCtx()
+		if _, err := ag.SubmitToSession(cancelled, id, "queued"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("SubmitToSession with a cancelled context while busy = %v, want context.Canceled (admission must refuse before the item is queued)", err)
+		}
+		q, err := ag.QueueSnapshotForSession(id)
+		if err != nil {
+			t.Fatalf("QueueSnapshotForSession: %v", err)
+		}
+		if len(q.Items) != 0 {
+			t.Fatalf("queue after the refused submit = %d items, want none", len(q.Items))
+		}
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == agent.EventTurnStart && ev.Turn == res.Turn+1 {
+				t.Fatalf("a turn_start for a second turn was delivered after the refused submit: %#v", ev)
+			}
+		}
+	})
+
+	// The forbidden sibling on the compaction path: a compaction requested
+	// with an already-cancelled context is refused before the session is
+	// marked busy.
+	t.Run("source=host_signal/state=pre_admission/work=compaction", func(t *testing.T) {
+		ag := newACPTestAgent(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		if _, err := ag.AppendUserMessageToSession(id, "compact me"); err != nil {
+			t.Fatalf("AppendUserMessageToSession: %v", err)
+		}
+
+		cancelled, cancelCtx := context.WithCancel(context.Background())
+		cancelCtx()
+		if err := ag.CompactNowForSession(cancelled, id); !errors.Is(err, context.Canceled) {
+			t.Fatalf("CompactNowForSession with a cancelled context = %v, want context.Canceled (admission must refuse before marking the session busy)", err)
+		}
+		if ag.Busy() {
+			t.Fatal("the refused compaction marked the session busy")
+		}
+	})
+
+	// A nil caller context is not a cancelled one: the queued branch must
+	// treat it as the pre-existing behaviour did — enqueue on a busy unit,
+	// never panic on it and never refuse it.
+	t.Run("source=nil_context/state=pre_admission/work=queued_item", func(t *testing.T) {
+		reqSeen := make(chan struct{}, 1)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			writeACPSSE(w, acpTextChunk("r", "test-model", "ok"), acpStopChunk("r", "test-model"), "[DONE]")
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		// The unit is busy with a live turn, so a submit takes the queued
+		// branch.
+		res, err := ag.SubmitToSession(ctx, id, "first")
+		if err != nil {
+			t.Fatalf("SubmitToSession first: %v", err)
+		}
+		if !res.Started {
+			t.Fatalf("first turn enqueued instead of started: %+v", res)
+		}
+		<-reqSeen
+
+		// A nil context must be admitted like any live one: the item is
+		// enqueued instead of panicking or being refused.
+		resN, err := ag.SubmitToSession(nil, id, "queued")
+		if err != nil {
+			t.Fatalf("SubmitToSession(nil) while busy: %v", err)
+		}
+		if resN.Started {
+			t.Fatalf("SubmitToSession(nil) started a turn instead of enqueueing: %+v", resN)
+		}
+		q, err := ag.QueueSnapshotForSession(id)
+		if err != nil {
+			t.Fatalf("QueueSnapshotForSession: %v", err)
+		}
+		if len(q.Items) != 1 || q.Items[0].Content != "queued" {
+			t.Fatalf("queue after the nil-context submit = %#v, want the queued item", q.Items)
+		}
+	})
+
+	// A nil caller context is not a cancelled one: the admission check must
+	// treat it as the pre-existing normalisation did — admit the compaction,
+	// never panic on it and never refuse it.
+	t.Run("source=nil_context/state=pre_admission/work=compaction", func(t *testing.T) {
+		reqSeen := make(chan struct{}, 1)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			writeACPSSE(w, acpTextChunk("s", "test-model", "compact summary"), acpStopChunk("s", "test-model"), "[DONE]")
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		if _, err := ag.AppendUserMessageToSession(id, "compact me"); err != nil {
+			t.Fatalf("AppendUserMessageToSession: %v", err)
+		}
+
+		// A nil context must be admitted like any live one: the compaction
+		// runs to completion instead of panicking or being refused.
+		compactDone := make(chan error, 1)
+		go func() { compactDone <- ag.CompactNowForSession(nil, id) }()
+		<-reqSeen // the summarizer call is in flight: the compaction was admitted
+		closeRelease()
+		select {
+		case err := <-compactDone:
+			if err != nil {
+				t.Fatalf("CompactNowForSession(nil): %v", err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("compaction with a nil context did not complete")
+		}
+	})
+
+	// A cancelled caller context does not sever an accepted direct submit: the
+	// turn's context derives from the owner, so the in-flight model call
+	// survives the caller's cancellation and the turn completes.
+	t.Run("source=caller/state=post_admission/work=direct_submit", func(t *testing.T) {
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		reqSeen := make(chan struct{}, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			writeACPSSE(w, acpTextChunk("r1", "test-model", "hello back"), acpStopChunk("r1", "test-model"), "[DONE]")
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		cap := &acpEventCapture{}
+		ag.SetEventHandler(cap.handler)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		submitCtx, submitCancel := context.WithCancel(context.Background())
+		res, err := ag.SubmitToSession(submitCtx, id, "hi")
+		if err != nil {
+			t.Fatalf("SubmitToSession: %v", err)
+		}
+		if !res.Started {
+			t.Fatalf("turn enqueued instead of started: %+v", res)
+		}
+		<-reqSeen // the model call is in flight
+		submitCancel()
+		closeRelease() // the turn completes despite the caller's cancellation
+
+		// The turn continues to completion despite the caller's cancellation.
+		endEv := waitForACPTurnEnd(t, cap, id, 1)
+		if endEv.Cancelled {
+			t.Fatalf("turn_end cancelled = true after only the caller context was cancelled; the accepted turn must not be severed")
+		}
+		assertACPHydratedContent(t, ag, id, "hi")
+		assertACPHydratedContent(t, ag, id, "hello back")
+	})
+
+	// A queued item whose submitter's context is cancelled is still drained:
+	// the drainer launches it on the owner's lifetime.
+	t.Run("source=caller/state=post_admission/work=queued_item", func(t *testing.T) {
+		releaseA := make(chan struct{})
+		releaseB := make(chan struct{})
+		var releaseAOnce, releaseBOnce sync.Once
+		closeA := func() { releaseAOnce.Do(func() { close(releaseA) }) }
+		closeB := func() { releaseBOnce.Do(func() { close(releaseB) }) }
+		reqSeen := make(chan struct{}, 2)
+		var calls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			switch calls.Add(1) {
+			case 1:
+				select {
+				case <-releaseA:
+				case <-r.Context().Done():
+				}
+			case 2:
+				select {
+				case <-releaseB:
+				case <-r.Context().Done():
+				}
+			}
+			writeACPSSE(w, acpTextChunk("r", "test-model", "ok"), acpStopChunk("r", "test-model"), "[DONE]")
+		}))
+		t.Cleanup(func() { closeA(); closeB(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		cap := &acpEventCapture{}
+		ag.SetEventHandler(cap.handler)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		resA, err := ag.SubmitToSession(ctx, id, "first")
+		if err != nil {
+			t.Fatalf("SubmitToSession first: %v", err)
+		}
+		if !resA.Started {
+			t.Fatalf("first turn enqueued instead of started: %+v", resA)
+		}
+		<-reqSeen
+
+		// The second submit is accepted as a queued item under a cancellable
+		// caller context; cancelling that context must not drop the item.
+		submitBCtx, submitBCancel := context.WithCancel(context.Background())
+		resB, err := ag.SubmitToSession(submitBCtx, id, "queued")
+		if err != nil {
+			t.Fatalf("SubmitToSession queued: %v", err)
+		}
+		if resB.Started {
+			t.Fatalf("second turn started instead of queued: %+v", resB)
+		}
+		submitBCancel()
+
+		closeA() // turn A completes; the drainer launches the queued item
+		<-reqSeen
+		closeB() // turn B completes
+		waitForACPTurnEnd(t, cap, id, 2)
+		assertACPHydratedContent(t, ag, id, "first")
+		assertACPHydratedContent(t, ag, id, "queued")
+	})
+
+	// A compaction accepted under a caller context survives that context's
+	// cancellation: its context derives from the owner.
+	t.Run("source=caller/state=post_admission/work=compaction", func(t *testing.T) {
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		reqSeen := make(chan struct{}, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			writeACPSSE(w, acpTextChunk("s", "test-model", "compact summary"), acpStopChunk("s", "test-model"), "[DONE]")
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		if _, err := ag.AppendUserMessageToSession(id, "compact me"); err != nil {
+			t.Fatalf("AppendUserMessageToSession: %v", err)
+		}
+
+		compactCtx, compactCancel := context.WithCancel(context.Background())
+		compactDone := make(chan error, 1)
+		go func() { compactDone <- ag.CompactNowForSession(compactCtx, id) }()
+		<-reqSeen // the summarizer call is in flight
+		compactCancel()
+		closeRelease() // the compaction completes despite the caller's cancellation
+
+		// The compaction was accepted and must complete despite the caller's
+		// cancellation.
+		select {
+		case err := <-compactDone:
+			if err != nil {
+				t.Fatalf("CompactNowForSession: %v", err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("compaction did not complete after the caller context was cancelled")
+		}
+	})
+
+	// A child turn (subagent run) accepted inside a parent turn survives the
+	// caller's cancellation: the child's lifetime derives from the owner through
+	// the parent's accepted turn.
+	t.Run("source=caller/state=post_admission/work=child_turn", func(t *testing.T) {
+		releaseChild := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(releaseChild) }) }
+		childReqSeen := make(chan struct{}, 1)
+		var calls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch calls.Add(1) {
+			case 1:
+				writeACPSSE(w, acpToolCallChunk("p1", "test-model", "call_task", "task", `{"tasks":[{"prompt":"child work","subagent_type":"explore"}]}`), acpStopChunk("p1", "test-model"), "[DONE]")
+			case 2:
+				select {
+				case childReqSeen <- struct{}{}:
+				default:
+				}
+				select {
+				case <-releaseChild:
+				case <-r.Context().Done():
+				}
+				writeACPSSE(w, acpTextChunk("c1", "test-model", "CHILD_DONE"), acpStopChunk("c1", "test-model"), "[DONE]")
+			case 3:
+				writeACPSSE(w, acpTextChunk("p2", "test-model", "PARENT_DONE"), acpStopChunk("p2", "test-model"), "[DONE]")
+			default:
+				t.Fatalf("unexpected provider call %d", calls.Load())
+			}
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTaskAgent(t, server.URL+"/v1")
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		cap := &acpEventCapture{}
+		ag.SetEventHandler(cap.handler)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		submitCtx, submitCancel := context.WithCancel(context.Background())
+		if _, err := ag.SubmitToSession(submitCtx, id, "delegate"); err != nil {
+			t.Fatalf("SubmitToSession: %v", err)
+		}
+		<-childReqSeen // the child's model call is in flight
+		submitCancel()
+
+		// The child completes and the parent turn finishes normally.
+		closeRelease()
+		waitForACPTurnEnd(t, cap, id, 1)
+		childID := acpSubagentSessionID(t, cap)
+		if childID == "" {
+			t.Fatal("no subagent session started")
+		}
+		assertACPHydratedContent(t, ag, childID, "child work")
+		assertACPHydratedContent(t, ag, childID, "CHILD_DONE")
+	})
+
+	// Owner shutdown ends an accepted turn by cancelling and joining it: the
+	// terminal event is delivered and the message persisted.
+	t.Run("source=owner_shutdown/state=post_admission/work=direct_submit", func(t *testing.T) {
+		reqSeen := make(chan struct{}, 1)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel() })
+		ag.Init(ctx)
+		cap := &acpEventCapture{}
+		ag.SetEventHandler(cap.handler)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		res, err := ag.SubmitToSession(ctx, id, "hi")
+		if err != nil {
+			t.Fatalf("SubmitToSession: %v", err)
+		}
+		if !res.Started {
+			t.Fatalf("turn enqueued instead of started: %+v", res)
+		}
+		<-reqSeen
+
+		done := make(chan struct{})
+		go func() { ag.ShutdownOwner(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("ShutdownOwner did not join the in-flight turn")
+		}
+		endEv := waitForACPTurnEnd(t, cap, id, 1)
+		if !endEv.Cancelled {
+			t.Fatalf("turn_end cancelled = false after owner shutdown, want true")
+		}
+		assertACPHydratedContent(t, ag, id, "hi")
+	})
+
+	// An explicit per-session cancel still ends exactly one turn: the terminal
+	// event is delivered and the message persisted.
+	t.Run("source=per_session_cancel/state=post_admission/work=direct_submit", func(t *testing.T) {
+		reqSeen := make(chan struct{}, 1)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		cap := &acpEventCapture{}
+		ag.SetEventHandler(cap.handler)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		res, err := ag.SubmitToSession(ctx, id, "hi")
+		if err != nil {
+			t.Fatalf("SubmitToSession: %v", err)
+		}
+		if !res.Started {
+			t.Fatalf("turn enqueued instead of started: %+v", res)
+		}
+		<-reqSeen
+
+		if err := ag.CancelSession(id); err != nil {
+			t.Fatalf("CancelSession: %v", err)
+		}
+		endEv := waitForACPTurnEnd(t, cap, id, 1)
+		if !endEv.Cancelled {
+			t.Fatalf("turn_end cancelled = false after per-session cancel, want true")
+		}
+		assertACPHydratedContent(t, ag, id, "hi")
+	})
+}
+
+// onePromptThenBlockReader yields exactly one line and then blocks every
+// further Read, so Run reaches teardown only through context cancellation.
+type onePromptThenBlockReader struct {
+	line []byte
+	sent bool
+}
+
+func (r *onePromptThenBlockReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, r.line), nil
+	}
+	select {}
+}
+
+// newACPTaskAgent builds an ACP test agent whose agents config overrides the
+// primary model so subagent turns resolve to the test provider.
+func newACPTaskAgent(t *testing.T, baseURL string) *agent.Agent {
+	t.Helper()
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	lightcodeDir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LIGHTCODE_TEST_KEY", "test-key")
+	configPath := filepath.Join(lightcodeDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{
+  "providers": {
+    "test": {
+      "name": "Test Provider",
+      "transport": { "base_url": "`+baseURL+`", "api_key_env": "LIGHTCODE_TEST_KEY" },
+      "discovery": false,
+      "models": {
+        "test-model": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 }
+      }
+    }
+  },
+  "default_model": "test/test-model"
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lightcodeDir, "agents.json"), []byte(`{"primary": {"model": "test/test-model"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := lcconfig.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+	return a
+}
+
+// acpEventCapture records agent events for the accepted-work contract.
+type acpEventCapture struct {
+	mu     sync.Mutex
+	events []agent.Event
+}
+
+func (c *acpEventCapture) handler(ev agent.Event) {
+	c.mu.Lock()
+	c.events = append(c.events, ev)
+	c.mu.Unlock()
+}
+
+func (c *acpEventCapture) snapshot() []agent.Event {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]agent.Event(nil), c.events...)
+}
+
+// waitForACPTurnEnd waits until the want-th turn_end for sessionID is
+// delivered and returns it.
+func waitForACPTurnEnd(t *testing.T, cap *acpEventCapture, sessionID string, want int) agent.Event {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		seen := 0
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == agent.EventTurnEnd && ev.SessionID == sessionID {
+				seen++
+				if seen == want {
+					return ev
+				}
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for turn_end %d of session %q; events: %#v", want, sessionID, cap.snapshot())
+	return agent.Event{}
+}
+
+// acpSubagentSessionID returns the first subagent session id recorded in the
+// capture, or "" when none was started.
+func acpSubagentSessionID(t *testing.T, cap *acpEventCapture) string {
+	t.Helper()
+	for _, ev := range cap.snapshot() {
+		if ev.Kind == agent.EventSubagentStart && ev.SubagentSessionID != "" {
+			return ev.SubagentSessionID
+		}
+	}
+	return ""
+}
+
+// assertACPHydratedContent fails unless sessionID's durable history contains a
+// message with the given content.
+func assertACPHydratedContent(t *testing.T, a *agent.Agent, sessionID, content string) {
+	t.Helper()
+	hs, err := a.HydrateSession(sessionID)
+	if err != nil {
+		t.Fatalf("HydrateSession(%q): %v", sessionID, err)
+	}
+	for _, m := range hs.Messages {
+		if m.Content == content {
+			return
+		}
+	}
+	t.Fatalf("durable history for %q lacks %q: %#v", sessionID, content, hs.Messages)
+}
+
+// waitForACPRequest waits for a request-signal on ch; the server-side helper
+// for the accepted-work contract.
+func waitForACPRequest(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
 }
