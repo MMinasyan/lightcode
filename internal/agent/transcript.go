@@ -232,9 +232,11 @@ func (t *transcript) dropErrorsAboveTurnLocked(target int) {
 
 // dropErrorsThroughTurnLocked removes retained errors for turns at or below
 // through. It is the compaction disposition: errors in the transcript range the
-// compacted record replaces are removed.
+// compacted record replaces are removed. An error carrying no turn attribution
+// (turn == 0) is kept — it has no merge key, so it belongs to no compacted range
+// and keeps its position after all committed rows.
 func (t *transcript) dropErrorsThroughTurnLocked(through int) {
-	t.retainedErrors = filterErrors(t.retainedErrors, func(e errorRow) bool { return e.turn > through })
+	t.retainedErrors = filterErrors(t.retainedErrors, func(e errorRow) bool { return e.turn == 0 || e.turn > through })
 }
 
 // clearErrorsLocked removes all retained errors. It is the external-rebase and

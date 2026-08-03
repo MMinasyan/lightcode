@@ -331,8 +331,9 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 			if attempt == 1 {
 				// Drive the production compaction rewrite path: it advances the
 				// epoch, so the racing capture must revalidate and retry rather
-				// than publish the pre-compaction prefix.
-				a.publishCompactionRewrite(unit, sessionIDOf(unit), unit.projectID, SessionSummary{}, nil)
+				// than publish the pre-compaction prefix. Boundary 0 compacts
+				// nothing and no errors are retained, so the pruning is a no-op.
+				a.publishCompactionRewrite(unit, sessionIDOf(unit), unit.projectID, 0, SessionSummary{}, nil)
 			}
 			return nil
 		}
@@ -584,6 +585,59 @@ func TestTranscriptCoordinatorSessionErrorRetention(t *testing.T) {
 	if !empty {
 		t.Fatal("rebase/removal did not clear retained errors")
 	}
+}
+
+// TestSessionErrorRetentionContract verifies the compaction rewrite prunes
+// retained errors whose turns the compacted record replaces while keeping an
+// error that carries no turn attribution: an unattributed error has no merge
+// key, so it belongs to no compacted range and keeps its position after all
+// committed rows.
+//
+// Exception, named per the contract-test rule: the pruning runs inside
+// publishCompactionRewrite, which is unexported and not adapter-facing. The
+// exported route CompactNowForSession reaches the same boundary only after a
+// live multi-turn session, a model server, and a summarizer round-trip — none
+// of which participate in the pruning contract, and that full route is already
+// exercised end-to-end by TestCompactionIndexesSelectedSessionProject.
+func TestSessionErrorRetentionContract(t *testing.T) {
+	t.Run("attribution=compacted_away", func(t *testing.T) {
+		a := newLiveCatalogBackedTestAgent(t)
+		unit := a.session
+		tr := a.transcriptForSessionID(sessionIDOf(unit))
+		a.feedAndEmit(tr, Event{Kind: EventError, SessionID: sessionIDOf(unit), Error: "boom", Turn: 1})
+		a.publishCompactionRewrite(unit, sessionIDOf(unit), unit.projectID, 1, SessionSummary{}, nil)
+		tr.seqMu.Lock()
+		defer tr.seqMu.Unlock()
+		if len(tr.retainedErrors) != 0 {
+			t.Fatalf("retained errors = %#v, want the turn-1 error pruned by the compaction rewrite", tr.retainedErrors)
+		}
+	})
+
+	t.Run("attribution=none", func(t *testing.T) {
+		a := newLiveCatalogBackedTestAgent(t)
+		unit := a.session
+		tr := a.transcriptForSessionID(sessionIDOf(unit))
+		a.feedAndEmit(tr, Event{Kind: EventError, SessionID: sessionIDOf(unit), Error: "boom"})
+		a.publishCompactionRewrite(unit, sessionIDOf(unit), unit.projectID, 1, SessionSummary{}, nil)
+		tr.seqMu.Lock()
+		defer tr.seqMu.Unlock()
+		if len(tr.retainedErrors) != 1 || tr.retainedErrors[0].turn != 0 {
+			t.Fatalf("retained errors = %#v, want the unattributed error kept", tr.retainedErrors)
+		}
+	})
+
+	t.Run("attribution=after_boundary", func(t *testing.T) {
+		a := newLiveCatalogBackedTestAgent(t)
+		unit := a.session
+		tr := a.transcriptForSessionID(sessionIDOf(unit))
+		a.feedAndEmit(tr, Event{Kind: EventError, SessionID: sessionIDOf(unit), Error: "boom", Turn: 2})
+		a.publishCompactionRewrite(unit, sessionIDOf(unit), unit.projectID, 1, SessionSummary{}, nil)
+		tr.seqMu.Lock()
+		defer tr.seqMu.Unlock()
+		if len(tr.retainedErrors) != 1 || tr.retainedErrors[0].turn != 2 {
+			t.Fatalf("retained errors = %#v, want the turn-2 error kept", tr.retainedErrors)
+		}
+	})
 }
 
 // TestTranscriptCoordinatorCommit verifies the commit cursor partitions

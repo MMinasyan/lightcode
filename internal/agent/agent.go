@@ -1829,7 +1829,7 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 	// rewrite and memory indexing, so a live-selection capture racing the compaction
 	// sees the revision advance promptly and re-reads the rewritten durable prefix
 	// rather than publishing the pre-compaction one.
-	a.publishCompactionRewrite(unit, sessionID, projectID, summary, committed)
+	a.publishCompactionRewrite(unit, sessionID, projectID, boundaryTurn, summary, committed)
 
 	var activeReads []tool.ReadRecord
 	if unit.fileTracker != nil && activeStart < len(messages) {
@@ -1886,18 +1886,19 @@ func (a *Agent) prebuiltCompactionCommitted(unit *session, sessionID string, bou
 	return a.renderCompleteTurns(raw), nil
 }
 
-// publishCompactionRewrite advances the transcript rewrite epoch and appends the
-// replacement transcript as one rewrite boundary after a durable compaction. The
-// summary and committed prefix are prebuilt before SaveCompaction (the only
-// fallible reads), so this performs no fallible post-commit read. The reset context
-// total and its cumulative report share one tokensMu section, taken before the
-// transcript section so tokensMu is never held inside seqMu. Reading the live tail
-// and appending the boundary happen in one seqMu section — mutually exclusive with
-// feedAndEmit's row publication — so a row delivered concurrently is either in the
-// tail and enqueued before the boundary or absent and enqueued after it, never
-// split. Advancing the epoch makes a live-selection capture that raced the
+// publishCompactionRewrite advances the transcript rewrite epoch, prunes
+// retained errors tagged to the compacted range, and appends the replacement
+// transcript as one rewrite boundary after a durable compaction. The summary and
+// committed prefix are prebuilt before SaveCompaction (the only fallible reads),
+// so this performs no fallible post-commit read. The reset context total and its
+// cumulative report share one tokensMu section, taken before the transcript
+// section so tokensMu is never held inside seqMu. Reading the live tail and
+// appending the boundary happen in one seqMu section — mutually exclusive with
+// feedAndEmit's row publication — so a row delivered concurrently is either in
+// the tail and enqueued before the boundary or absent and enqueued after it,
+// never split. Advancing the epoch makes a live-selection capture that raced the
 // compaction revalidate and re-read the rewritten durable prefix.
-func (a *Agent) publishCompactionRewrite(unit *session, sessionID, projectID string, summary SessionSummary, committed []DisplayMessage) {
+func (a *Agent) publishCompactionRewrite(unit *session, sessionID, projectID string, boundaryTurn int, summary SessionSummary, committed []DisplayMessage) {
 	tr := a.transcriptForSessionID(sessionID)
 	if tr == nil {
 		return
@@ -1909,6 +1910,7 @@ func (a *Agent) publishCompactionRewrite(unit *session, sessionID, projectID str
 
 	tr.seqMu.Lock()
 	tr.compactionRewriteLocked()
+	tr.dropErrorsThroughTurnLocked(boundaryTurn)
 	messages := append(append([]DisplayMessage(nil), committed...), tr.tailMessagesLocked()...)
 	payload := SessionPayload{Session: summary, Messages: messages, Tokens: tokens}
 	a.emitEvent(Event{Kind: EventSessionRewrite, SessionID: sessionID, ProjectID: projectID, RewritePayload: &payload})
