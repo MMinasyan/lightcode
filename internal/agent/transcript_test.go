@@ -6,13 +6,17 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/prompt"
 )
@@ -884,6 +888,780 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 			t.Fatalf("committedTurn = %d, want turn N+1's turn %d", committedTurn, resN1.Turn)
 		}
 	})
+
+	// A queued preseed completes its turn durably and commits it before the
+	// final queued item launches. While the launched turn is still live (its
+	// model request parked), the coordinator must already have committed the
+	// preseed's turn, and a hydration taken then must return the preseed
+	// exactly once — from the durable half alone, with the retained tail no
+	// longer carrying it. The pre-fix drain preseeded under rt.mu with no feed
+	// and no commit, so the preseed's row stayed in the retained tail while its
+	// turn was already durable: a mid-drain hydration returned it from both
+	// halves and rendered it twice.
+	t.Run("preseed=commits_before_launch", func(t *testing.T) {
+		release := make(chan struct{})
+		reqSeen := make(chan struct{}, 1)
+		var reqSeenOnce, runOnce sync.Once
+		closeReqSeen := func() { reqSeenOnce.Do(func() { close(reqSeen) }) }
+		closeRun := func() { runOnce.Do(func() { close(release) }) }
+		// Register the server close before closeRun: cleanup runs LIFO, so a
+		// parked handler is released before the server is allowed to close.
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			closeReqSeen()
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+			writeTextResponse(w, "ok")
+		}))
+		t.Cleanup(func() { server.Close() })
+		t.Cleanup(closeRun)
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		rt.sessionLocked().queue = []QueuedItem{
+			{ID: "q-1", Content: "preseed me"},
+			{ID: "q-2", Content: "launch me"},
+		}
+		rt.sessionLocked().queueSeq = 2
+		rt.sessionLocked().queueVersion = 1
+		rt.mu.Unlock()
+
+		go rt.tryDrainQueue(ctx)
+		waitForSignal(t, reqSeen, "launched turn model request")
+
+		// The preseed's turn must already be committed while the launched turn
+		// is still live: the pre-fix drain fed nothing, so committedTurn is 0
+		// here.
+		tr := a.transcriptForSessionID(id)
+		tr.seqMu.Lock()
+		committedTurn := tr.committedTurn
+		tr.seqMu.Unlock()
+		if committedTurn != 1 {
+			t.Fatalf("committedTurn = %d while the launched turn is live, want 1 (the preseed commits before the launch)", committedTurn)
+		}
+
+		// A hydration taken mid-drain returns the preseed exactly once. The
+		// pre-fix drain left the preseed's row in the retained tail while its
+		// turn was already durable, so the capture returned it twice.
+		hs, err := a.HydrateSession(id)
+		if err != nil {
+			t.Fatalf("HydrateSession mid-drain: %v", err)
+		}
+		if got := countHydrationContent(hs, "preseed me"); got != 1 {
+			t.Fatalf("mid-drain hydration returns the preseed %d times, want exactly once (durable + tail)", got)
+		}
+
+		closeRun()
+		waitSessionDrained(t, a, id)
+
+		hs, err = a.HydrateSession(id)
+		if err != nil {
+			t.Fatalf("HydrateSession after drain: %v", err)
+		}
+		for _, content := range []string{"preseed me", "launch me"} {
+			if got := countHydrationContent(hs, content); got != 1 {
+				t.Fatalf("post-drain hydration returns %q %d times, want exactly once", content, got)
+			}
+		}
+		var livePreseed, liveLaunch int
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == EventUserMessageDisplay {
+				switch ev.Result {
+				case "preseed me":
+					livePreseed++
+				case "launch me":
+					liveLaunch++
+				}
+			}
+		}
+		if livePreseed != 1 || liveLaunch != 1 {
+			t.Fatalf("live user displays: preseed=%d launch=%d, want 1 each", livePreseed, liveLaunch)
+		}
+	})
+
+	// A preseed whose durable marker write fails must surface the failure
+	// through the transcript (sequenced, so a hydration or reconnect sees it),
+	// launch no further turn, requeue the untouched remainder — and only that,
+	// with its original ids — ahead of anything submitted meanwhile, and leave
+	// the unit drainable. Then, with the fault cleared, draining again must
+	// render the failed message exactly once in the live stream and exactly
+	// once in loop history: not once per attempt.
+	//
+	// The marker fault is armed with the drain parked at the preseed's turn
+	// start feed: the drain has already called BeginTurn (so the turn dir and
+	// Store.CurrentTurn() are known) but not yet MarkTurnComplete, and the
+	// parked feed holds seqMu so the test controls the release. A directory
+	// named complete at that turn's marker path makes the marker write fail
+	// with EISDIR on any filesystem, regardless of root. Arming before the
+	// drain cannot target a preseed: creating turns/<n> feeds the store's
+	// nextTurnLocked scan, so every preseed takes max+1 and skips the armed
+	// dir.
+	t.Run("preseed=marker_failure_aborts_and_requeues", func(t *testing.T) {
+		var reqs atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reqs.Add(1)
+			writeTextResponse(w, "ok")
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[id]
+		rt.mu.Unlock()
+
+		rt.mu.Lock()
+		unit.queue = []QueuedItem{
+			{ID: "q-1", Content: "fail me"},
+			{ID: "q-2", Content: "survivor"},
+		}
+		unit.queueSeq = 2
+		unit.queueVersion = 1
+		rt.mu.Unlock()
+
+		// Park the drain at the first preseed's turn start feed: the preseed
+		// loop has called BeginTurn (turns/<next> exists) and is waiting on the
+		// coordinator lock the test holds. The park is what makes both the
+		// arming and the mid-drain append deterministic.
+		tr := a.transcriptForSessionID(id)
+		tr.seqMu.Lock()
+		seqMuHeld := true
+		defer func() {
+			if seqMuHeld {
+				tr.seqMu.Unlock()
+			}
+		}()
+
+		drained := make(chan struct{})
+		go func() {
+			defer close(drained)
+			rt.tryDrainQueue(ctx)
+		}()
+		time.Sleep(100 * time.Millisecond)
+
+		// Arm the marker fault at the turn the parked drain just began. Then
+		// drive the concurrent message through the real submit path: the drain
+		// holds the claim (busy), so the submit enqueues, and the requeue must
+		// prepend the remainder ahead of it. The submit nudges the drainer;
+		// the settle sleep lets it consume the wake while the drain is still
+		// parked and busy, so it cannot re-drain after the abort.
+		failTurn := unit.store.CurrentTurn()
+		if failTurn == 0 {
+			t.Fatalf("drain did not begin a preseed turn before parking")
+		}
+		markerPath := filepath.Join(unit.store.Dir(), "turns", strconv.Itoa(failTurn), "complete")
+		if err := os.MkdirAll(markerPath, 0o700); err != nil {
+			t.Logf("armed marker fault failed (pre-fix drain does not park at the feed): %v", err)
+		}
+		clearFault := func() {
+			if err := os.Remove(markerPath); err != nil && !os.IsNotExist(err) {
+				t.Fatalf("clear marker fault: %v", err)
+			}
+		}
+		t.Cleanup(clearFault)
+
+		res, err := a.SubmitToSession(ctx, id, "meanwhile")
+		if err != nil {
+			t.Fatalf("SubmitToSession meanwhile: %v", err)
+		}
+		if res.Started {
+			t.Fatal("submit during the drain claimed the unit")
+		}
+		if len(res.Queue) != 1 || res.Queue[0].Content != "meanwhile" {
+			t.Fatalf("submit snapshot = %#v, want one enqueued meanwhile item", res.Queue)
+		}
+		time.Sleep(100 * time.Millisecond)
+
+		tr.seqMu.Unlock()
+		seqMuHeld = false
+		select {
+		case <-drained:
+		case <-time.After(15 * time.Second):
+			t.Fatal("drain did not return after the marker failure")
+		}
+
+		// The failure is sequenced into the coordinator — not just delivered
+		// live — so a hydration or reconnect sees it.
+		tr.seqMu.Lock()
+		errRows := append([]errorRow(nil), tr.retainedErrors...)
+		tr.seqMu.Unlock()
+		if len(errRows) != 1 {
+			t.Fatalf("retained errors = %d, want exactly 1 sequenced failure", len(errRows))
+		}
+		var liveErr bool
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == EventError {
+				liveErr = true
+			}
+		}
+		if !liveErr {
+			t.Fatal("marker failure was not delivered live")
+		}
+
+		// The drain aborted: no further turn launched.
+		if got := reqs.Load(); got != 0 {
+			t.Fatalf("a model turn launched after the marker failure (%d requests)", got)
+		}
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == EventTurnStart {
+				t.Fatalf("a turn_start was delivered after the marker failure: %#v", ev)
+			}
+		}
+
+		// The untouched remainder is back on the queue — the failed item is
+		// not — prepended ahead of the item appended meanwhile, with the
+		// original ids preserved.
+		q, err := a.QueueSnapshotForSession(id)
+		if err != nil {
+			t.Fatalf("QueueSnapshotForSession: %v", err)
+		}
+		if len(q.Items) != 2 ||
+			q.Items[0].Content != "survivor" || q.Items[0].ID != "q-2" ||
+			q.Items[1].Content != "meanwhile" {
+			t.Fatalf("requeued queue = %#v, want [survivor(q-2), meanwhile]", q.Items)
+		}
+		// The requeue event must carry the real queue, not an empty snapshot:
+		// a bare emptyQueue() here would tell every host the queue is empty
+		// while items sit in it.
+		assertQueueChangedPayloadForVersion(t, cap, q.Version, q.Items)
+
+		// The unit is drainable: the abort cleared the claimed-but-not-launched
+		// busy marker instead of wedging the session.
+		if busy, err := a.BusyForSession(id); err != nil || busy {
+			t.Fatalf("unit busy after failed drain: busy=%v err=%v", busy, err)
+		}
+		// The abort leaves the same residue as the other abort paths: the
+		// per-turn context is cleared, not left installed-cancelled.
+		rt.mu.Lock()
+		turnCtxSet := unit.turnCtx != nil
+		turnCancelSet := unit.turnCancel != nil
+		rt.mu.Unlock()
+		if turnCtxSet || turnCancelSet {
+			t.Fatal("failed drain left the per-turn context installed")
+		}
+
+		// Clear the fault and drain again: the failed message renders exactly
+		// once in the live stream and once in loop history, not once per
+		// attempt (a requeue of the failed item would re-append it).
+		clearFault()
+		rt.nudgeQueueDrainer()
+		waitSessionDrained(t, a, id)
+
+		var liveFail, liveSurvivor, liveMeanwhile int
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == EventUserMessageDisplay {
+				switch ev.Result {
+				case "fail me":
+					liveFail++
+				case "survivor":
+					liveSurvivor++
+				case "meanwhile":
+					liveMeanwhile++
+				}
+			}
+		}
+		if liveFail != 1 || liveSurvivor != 1 || liveMeanwhile != 1 {
+			t.Fatalf("live user displays: fail=%d survivor=%d meanwhile=%d, want 1 each", liveFail, liveSurvivor, liveMeanwhile)
+		}
+		var histFail, histSurvivor int
+		for _, m := range unit.lp.Messages() {
+			if m.Role != message.RoleUser {
+				continue
+			}
+			switch m.TextContent() {
+			case "fail me":
+				histFail++
+			case "survivor":
+				histSurvivor++
+			}
+		}
+		if histFail != 1 {
+			t.Fatalf("loop history has %q %d times, want exactly once", "fail me", histFail)
+		}
+		if histSurvivor != 1 {
+			t.Fatalf("loop history has %q %d times, want exactly once", "survivor", histSurvivor)
+		}
+	})
+
+	// Admission can close while the preseed runs. The section that reacquires
+	// the runtime mutex before the final launch must re-check it: a shutdown
+	// arriving during the preseed aborts the drain the way the marker-failure
+	// path aborts — the untouched remainder goes back on the queue, no turn is
+	// launched, and the per-iteration cleanup clears busy and releases the
+	// count. The pre-fix drain installed nothing to re-check, so it launched
+	// the final item after shutdown and emitted its turn_start.
+	t.Run("preseed=shutdown_aborts_before_launch", func(t *testing.T) {
+		var reqs atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reqs.Add(1)
+			writeTextResponse(w, "ok")
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[id]
+		rt.mu.Unlock()
+		rt.mu.Lock()
+		unit.queue = []QueuedItem{
+			{ID: "q-1", Content: "preseed"},
+			{ID: "q-2", Content: "launch"},
+		}
+		unit.queueSeq = 2
+		unit.queueVersion = 1
+		rt.mu.Unlock()
+
+		// Park the drain at the first preseed's turn start feed, then start
+		// the shutdown. ShutdownOwner sets admission closed, cancels the
+		// claim-time turn context, and joins turnWG — which the parked drain
+		// holds until it aborts.
+		tr := a.transcriptForSessionID(id)
+		tr.seqMu.Lock()
+		seqMuHeld := true
+		defer func() {
+			if seqMuHeld {
+				tr.seqMu.Unlock()
+			}
+		}()
+
+		drained := make(chan struct{})
+		go func() {
+			defer close(drained)
+			rt.tryDrainQueue(ctx)
+		}()
+		time.Sleep(100 * time.Millisecond)
+
+		shutdownDone := make(chan struct{})
+		go func() {
+			defer close(shutdownDone)
+			a.ShutdownOwner()
+		}()
+
+		// Wait until the shutdown has cancelled the claim-time turn context —
+		// only possible because the context is installed at claim. Releasing
+		// before that would let the drain finish its preseed unhindered.
+		cancelled := false
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			rt.mu.Lock()
+			tc := unit.turnCtx
+			rt.mu.Unlock()
+			if tc != nil && tc.Err() != nil {
+				cancelled = true
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		if !cancelled {
+			t.Fatal("shutdown did not cancel the claimed-but-not-launched turn context")
+		}
+
+		tr.seqMu.Unlock()
+		seqMuHeld = false
+		select {
+		case <-drained:
+		case <-time.After(15 * time.Second):
+			t.Fatal("drain did not return after shutdown")
+		}
+		select {
+		case <-shutdownDone:
+		case <-time.After(15 * time.Second):
+			t.Fatal("ShutdownOwner did not complete")
+		}
+
+		// No turn launched after shutdown.
+		if got := reqs.Load(); got != 0 {
+			t.Fatalf("a model turn launched after shutdown (%d requests)", got)
+		}
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == EventTurnStart {
+				t.Fatalf("a turn_start was delivered after shutdown: %#v", ev)
+			}
+		}
+
+		// The untouched remainder (the final item) is back on the queue with
+		// its original id, and the requeue event carries it.
+		q, err := a.QueueSnapshotForSession(id)
+		if err != nil {
+			t.Fatalf("QueueSnapshotForSession: %v", err)
+		}
+		if len(q.Items) != 1 || q.Items[0].Content != "launch" || q.Items[0].ID != "q-2" {
+			t.Fatalf("queue after shutdown abort = %#v, want [launch(q-2)]", q.Items)
+		}
+		assertQueueChangedPayloadForVersion(t, cap, q.Version, q.Items)
+
+		// The abort leaves the same residue as the other abort paths: the
+		// per-turn context is cleared, not left installed-cancelled.
+		rt.mu.Lock()
+		turnCtxSet := unit.turnCtx != nil
+		turnCancelSet := unit.turnCancel != nil
+		rt.mu.Unlock()
+		if turnCtxSet || turnCancelSet {
+			t.Fatal("shutdown abort left the per-turn context installed")
+		}
+	})
+
+	// The unit is busy from the moment it is claimed, so a cancel arriving
+	// during the preseed must find the turn's cancel already installed and
+	// must be honoured: no turn is launched afterwards, and the untouched
+	// remainder stays on the queue. The pre-fix drain installed the cancel
+	// only immediately before launchTurn, so the preseed window was not
+	// cancellable and the launch went ahead.
+	t.Run("preseed=cancel_aborts_before_launch", func(t *testing.T) {
+		var reqs atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reqs.Add(1)
+			writeTextResponse(w, "ok")
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[id]
+		rt.mu.Unlock()
+		rt.mu.Lock()
+		unit.queue = []QueuedItem{
+			{ID: "q-1", Content: "cancel me"},
+			{ID: "q-2", Content: "launch"},
+		}
+		unit.queueSeq = 2
+		unit.queueVersion = 1
+		rt.mu.Unlock()
+
+		// Park the drain at the first preseed's turn start feed, then cancel
+		// the session. The cancel must succeed and actually cancel the
+		// claim-time context, so the drain aborts instead of launching.
+		tr := a.transcriptForSessionID(id)
+		tr.seqMu.Lock()
+		seqMuHeld := true
+		defer func() {
+			if seqMuHeld {
+				tr.seqMu.Unlock()
+			}
+		}()
+
+		drained := make(chan struct{})
+		go func() {
+			defer close(drained)
+			rt.tryDrainQueue(ctx)
+		}()
+		time.Sleep(100 * time.Millisecond)
+
+		if err := a.CancelSession(id); err != nil {
+			t.Fatalf("CancelSession: %v", err)
+		}
+		tr.seqMu.Unlock()
+		seqMuHeld = false
+		select {
+		case <-drained:
+		case <-time.After(15 * time.Second):
+			t.Fatal("drain did not return after the cancel")
+		}
+
+		// No turn launched after the cancel.
+		if got := reqs.Load(); got != 0 {
+			t.Fatalf("a model turn launched after the cancel (%d requests)", got)
+		}
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == EventTurnStart {
+				t.Fatalf("a turn_start was delivered after the cancel: %#v", ev)
+			}
+		}
+
+		// The untouched remainder is back on the queue with its original id.
+		q, err := a.QueueSnapshotForSession(id)
+		if err != nil {
+			t.Fatalf("QueueSnapshotForSession: %v", err)
+		}
+		if len(q.Items) != 1 || q.Items[0].Content != "launch" || q.Items[0].ID != "q-2" {
+			t.Fatalf("queue after cancel abort = %#v, want [launch(q-2)]", q.Items)
+		}
+		assertQueueChangedPayloadForVersion(t, cap, q.Version, q.Items)
+
+		// The abort leaves the same residue as the other abort paths: the
+		// per-turn context is cleared, not left installed-cancelled.
+		rt.mu.Lock()
+		turnCtxSet := unit.turnCtx != nil
+		turnCancelSet := unit.turnCancel != nil
+		rt.mu.Unlock()
+		if turnCtxSet || turnCancelSet {
+			t.Fatal("cancel abort left the per-turn context installed")
+		}
+
+		// The unit is not wedged: the next drain launches the remainder
+		// normally.
+		rt.nudgeQueueDrainer()
+		waitSessionDrained(t, a, id)
+		if got := reqs.Load(); got != 1 {
+			t.Fatalf("model requests after re-drain = %d, want exactly 1 (the remainder launched once)", got)
+		}
+	})
+
+	// The drain's re-validation is not atomic with the launch: a cancel can
+	// land after the revalidation passes and the runtime mutex is released,
+	// but before launchTurn begins. launchTurn must reject such a handoff at
+	// its receiving end, before it creates or emits anything, and unwind the
+	// claim — the wait-group count and the busy flag — so the session is not
+	// wedged. The handoff is driven directly, the same way
+	// TestDeferredCleanupGuardContract drives launchTurn: the unit is
+	// arranged as a claimed-but-not-yet-launched turn whose revalidation
+	// already passed, the context is cancelled, and the call must be refused.
+	// Without the rejection launchTurn accepts it: it creates a turn, emits
+	// its turn_start, and returns a nonzero turn.
+	//
+	// The rejection's second half is the caller's: the final item was already
+	// removed from the queue when the handoff is refused, so the drain must
+	// put it back — the same requeue the other abort paths perform — and a
+	// later drain must launch it exactly once. That part is driven through
+	// the real drain with a deterministically refused launch
+	// (unit.lp = nil makes launchTurn return 0 before creating anything), so
+	// the closure's requeue-on-refusal is what is exercised.
+	t.Run("preseed=launch_rejects_cancelled_handoff", func(t *testing.T) {
+		var reqs atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reqs.Add(1)
+			writeTextResponse(w, "ok")
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[id]
+		rt.mu.Unlock()
+		before := unit.store.CurrentTurn()
+
+		// Arrange the claimed-but-not-yet-launched claim the drain leaves
+		// behind when it hands off: busy set, per-turn context installed, the
+		// preseed-phase wait-group count held.
+		turnCtx, cancel := context.WithCancel(ctx)
+		rt.mu.Lock()
+		unit.busy = true
+		unit.turnCtx = turnCtx
+		unit.turnCancel = cancel
+		rt.mu.Unlock()
+		rt.turnWG.Add(1)
+
+		// The cancel lands after the revalidation passed and before the
+		// launch begins.
+		cancel()
+		if launched := rt.launchTurn(ctx, unit, turnCtx, cancel, []string{"late cancel"}); launched != 0 {
+			t.Fatalf("launchTurn accepted a cancelled handoff, returned turn %d", launched)
+		}
+
+		// Nothing was created or emitted.
+		if got := unit.store.CurrentTurn(); got != before {
+			t.Fatalf("CurrentTurn = %d after the rejected handoff, want unchanged %d", got, before)
+		}
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == EventTurnStart {
+				t.Fatalf("a turn_start was delivered for a cancelled handoff: %#v", ev)
+			}
+		}
+		if got := reqs.Load(); got != 0 {
+			t.Fatalf("model request after rejected handoff (%d)", got)
+		}
+
+		// The claim was unwound: busy and the per-turn context are cleared,
+		// and the wait-group count is released.
+		rt.mu.Lock()
+		busy := unit.busy
+		turnCtxSet := unit.turnCtx != nil
+		turnCancelSet := unit.turnCancel != nil
+		rt.mu.Unlock()
+		if busy {
+			t.Fatal("unit still busy after the rejected handoff")
+		}
+		if turnCtxSet || turnCancelSet {
+			t.Fatal("unit still holds the per-turn context after the rejected handoff")
+		}
+		wgDone := make(chan struct{})
+		go func() {
+			rt.turnWG.Wait()
+			close(wgDone)
+		}()
+		select {
+		case <-wgDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("rejected handoff did not release the wait-group count")
+		}
+
+		// The session stays usable: a fresh submit claims, launches, and
+		// drains.
+		if _, err := a.Submit(ctx, "after cancel"); err != nil {
+			t.Fatalf("Submit after rejected handoff: %v", err)
+		}
+		waitSessionDrained(t, a, id)
+		if got := reqs.Load(); got != 1 {
+			t.Fatalf("model requests = %d, want exactly 1 (the follow-up turn)", got)
+		}
+
+		// Second half: a launch refused through the real drain must not drop
+		// the final item. Seed the queue, make launchTurn refuse the handoff
+		// deterministically (lp nil returns 0 before anything is created),
+		// and drain.
+		before2 := unit.store.CurrentTurn()
+		turnStartsBefore := 0
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == EventTurnStart {
+				turnStartsBefore++
+			}
+		}
+		savedLP := unit.lp
+		rt.mu.Lock()
+		unit.lp = nil
+		unit.queue = []QueuedItem{{ID: "q-1", Content: "late cancel"}}
+		unit.queueSeq = 1
+		unit.queueVersion = 0
+		rt.mu.Unlock()
+		rt.tryDrainQueue(ctx)
+
+		// No turn was created or emitted by the refused launch.
+		if got := unit.store.CurrentTurn(); got != before2 {
+			t.Fatalf("CurrentTurn = %d after the refused launch, want unchanged %d", got, before2)
+		}
+		turnStartsAfter := 0
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == EventTurnStart {
+				turnStartsAfter++
+			}
+		}
+		if turnStartsAfter != turnStartsBefore {
+			t.Fatalf("turn_start count changed across the refused launch: %d -> %d", turnStartsBefore, turnStartsAfter)
+		}
+		if got := reqs.Load(); got != 1 {
+			t.Fatalf("model requests after the refused launch = %d, want still 1", got)
+		}
+
+		// The final item is back on the queue with its original id, and the
+		// requeue event carries it.
+		q, err := a.QueueSnapshotForSession(id)
+		if err != nil {
+			t.Fatalf("QueueSnapshotForSession: %v", err)
+		}
+		if len(q.Items) != 1 || q.Items[0].Content != "late cancel" || q.Items[0].ID != "q-1" {
+			t.Fatalf("queue after the refused launch = %#v, want [late cancel(q-1)]", q.Items)
+		}
+		assertQueueChangedPayloadForVersion(t, cap, q.Version, q.Items)
+
+		// The claim was unwound: busy, the per-turn context, and the count.
+		rt.mu.Lock()
+		busy = unit.busy
+		turnCtxSet = unit.turnCtx != nil
+		turnCancelSet = unit.turnCancel != nil
+		rt.mu.Unlock()
+		if busy {
+			t.Fatal("unit still busy after the refused launch")
+		}
+		if turnCtxSet || turnCancelSet {
+			t.Fatal("unit still holds the per-turn context after the refused launch")
+		}
+		wgDone = make(chan struct{})
+		go func() {
+			rt.turnWG.Wait()
+			close(wgDone)
+		}()
+		select {
+		case <-wgDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("refused launch did not release the wait-group count")
+		}
+
+		// A later drain launches the requeued item exactly once.
+		rt.mu.Lock()
+		unit.lp = savedLP
+		rt.mu.Unlock()
+		rt.nudgeQueueDrainer()
+		waitSessionDrained(t, a, id)
+		if got := reqs.Load(); got != 2 {
+			t.Fatalf("model requests after re-drain = %d, want exactly 2 (the requeued item launched once)", got)
+		}
+		var liveLate int
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == EventUserMessageDisplay && ev.Result == "late cancel" {
+				liveLate++
+			}
+		}
+		if liveLate != 1 {
+			t.Fatalf("live user displays of %q = %d, want exactly once", "late cancel", liveLate)
+		}
+	})
+}
+
+// countHydrationContent counts how many times content appears across a
+// hydration's durable messages, retained tail rows, and retained error rows —
+// the three halves the frontend concatenates. A row present in both the
+// durable half and the tail counts twice.
+func countHydrationContent(hs HydrationState, content string) int {
+	n := 0
+	for _, m := range hs.Messages {
+		if m.Content == content {
+			n++
+		}
+	}
+	for _, r := range hs.Tail {
+		if r.Message.Content == content {
+			n++
+		}
+	}
+	for _, e := range hs.Errors {
+		if e.Message.Content == content {
+			n++
+		}
+	}
+	return n
+}
+
+// assertQueueChangedPayloadForVersion asserts the EventQueueChanged carrying
+// version carries exactly items: a requeue must publish the real queue, not an
+// empty snapshot, or every host would be told the queue is empty while items
+// sit in it.
+func assertQueueChangedPayloadForVersion(t *testing.T, cap *eventCapture, version int, items []QueuedItem) {
+	t.Helper()
+	for _, ev := range cap.snapshot() {
+		if ev.Kind == EventQueueChanged && ev.QueueVersion == version {
+			if !reflect.DeepEqual(ev.Queue, items) {
+				t.Fatalf("queue_changed v%d payload = %#v, want %#v", version, ev.Queue, items)
+			}
+			return
+		}
+	}
+	t.Fatalf("no queue_changed event for version %d in %#v", version, cap.snapshot())
 }
 
 // TestDeferredCleanupGuardContract pins launchTurn's deferred cleanup guard

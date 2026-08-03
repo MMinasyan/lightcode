@@ -2693,7 +2693,14 @@ func (rt *runtime) runQueueDrainer(ctx context.Context) {
 // transitioning, and a session is active. All but the last queued message
 // become user-only turns; the last starts the model turn. The gate + busy-claim
 // share one lock hold so it can never double-start or launch against a session
-// being swapped.
+// being swapped. Each claimed unit is preseeding and launching outside the
+// runtime mutex: the preseed phase counts on turnWG so owner shutdown joins it,
+// and the coordinator commits each preseeded turn before the next item or the
+// launch, so a hydration never returns a preseed from both the durable half
+// and the retained tail. The section that reacquires the runtime mutex before
+// the final launch re-validates what changed while it was released: admission
+// closed or the turn cancelled during the preseed aborts the drain without
+// launching, requeueing the untouched remainder.
 func (rt *runtime) tryDrainQueue(ctx context.Context) {
 	a := rt.agent
 	for {
@@ -2706,38 +2713,170 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 			rt.mu.Unlock()
 			return
 		}
-		contents := make([]string, len(unit.queue))
-		for i, it := range unit.queue {
-			contents[i] = it.Content
-		}
-		unit.queue = nil
-		unit.queueVersion++
-		version := unit.queueVersion
-		for _, content := range contents[:len(contents)-1] {
-			if ctx.Err() != nil {
-				rt.mu.Unlock()
-				return
-			}
-			turn := unit.store.BeginTurn()
-			unit.lp.AppendUserMessage(turn, content)
-			_ = unit.store.MarkTurnComplete(turn)
-		}
-		if ctx.Err() != nil {
-			rt.mu.Unlock()
-			return
-		}
+		// Claim the unit inside the still-locked section: busy marks it
+		// "claimed but not yet launched" so no concurrent claim (Submit, the
+		// signal scheduler) can re-select it mid-preseed. The turn's context
+		// and cancel are installed here too — not just before the launch — so
+		// the whole claimed-but-not-yet-launched window is cancellable: a
+		// cancel or shutdown arriving during the preseed finds a live
+		// turnCancel and actually cancels something, and the preseed loop
+		// honours it instead of launching afterwards. The turnWG count covers
+		// the preseed phase, which now runs unlocked and does durable store
+		// writes shutdown cannot see. This registration is independent of the
+		// pre-launch Add below: the closure releases it; launchTurn's
+		// goroutine (or its abort path) releases the launch's.
 		unit.busy = true
 		unit.seenSessions = nil
 		rt.turnWG.Add(1)
 		turnCtx, cancel := context.WithCancel(ctx)
 		unit.turnCancel = cancel
 		unit.turnCtx = turnCtx
+		items := unit.queue
+		contents := make([]string, len(items))
+		for i, it := range items {
+			contents[i] = it.Content
+		}
+		unit.queue = nil
+		unit.queueVersion++
+		version := unit.queueVersion
 		sessionID := sessionIDOf(unit)
 		projectID := unit.projectID
 		a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionID, ProjectID: projectID, Queue: emptyQueue(), QueueVersion: version})
 		rt.mu.Unlock()
 
-		rt.launchTurn(ctx, unit, turnCtx, cancel, []string{contents[len(contents)-1]})
+		// The claimed-unit work runs in its own closure with its own defer so
+		// each pass's Add is matched and this unit's busy is evaluated: one
+		// call can drain session A then session B, and a function-level defer
+		// would fire once over the last unit only. The closure reports whether
+		// the whole drain must stop (owner cancellation or a failed preseed);
+		// a bare return inside it would end only the current iteration.
+		stop := func() bool {
+			tr := a.transcriptForSessionID(sessionID)
+			launched := 0
+			// requeue puts the untouched remainder back on the queue,
+			// prepended ahead of anything submitted meanwhile, and publishes
+			// the real queue. It is the shared abort shape of the
+			// marker-failure, shutdown, and cancellation paths: the remainder
+			// keeps its original ids, and the queue-changed event carries the
+			// actual queue rather than an empty snapshot.
+			requeue := func(remainder []QueuedItem) {
+				rt.mu.Lock()
+				unit.queue = append(remainder, unit.queue...)
+				unit.queueVersion++
+				a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionID, ProjectID: projectID, Queue: copyQueue(unit.queue), QueueVersion: unit.queueVersion})
+				rt.mu.Unlock()
+			}
+			// The preseed-phase registration releases here, unconditionally:
+			// every exit of this closure — cancellation, a failed marker
+			// write, a launch abort, or a successful launch — leaves it
+			// counted exactly once. When no turn was launched, the claim is
+			// unwound completely: busy and the per-turn context are cleared,
+			// matching the residue launchTurn's receiving-end rejection
+			// leaves, so no later reader can tell the abort paths apart. A
+			// launched turn clears its own state in its turn-end section; the
+			// claim-time context is released here so a cancelled turn that
+			// never launched cannot outlive the drain.
+			defer func() {
+				rt.mu.Lock()
+				if launched == 0 {
+					unit.busy = false
+					unit.turnCancel = nil
+					unit.turnCtx = nil
+				}
+				rt.mu.Unlock()
+				if launched == 0 {
+					cancel()
+				}
+				rt.turnWG.Done()
+			}()
+			// Preseed every item but the last as a user-only turn, unlocked:
+			// BeginTurn, feed the turn start (so curTurn names the turn being
+			// persisted), append the user message, complete it durably, flush
+			// the loop event drainer, then commit via the turn end feed. The
+			// commit runs only when the marker write succeeded and the flush
+			// completed; feeding the end before the flush would commit an
+			// empty tail and the queued display event would then duplicate
+			// durable history. The feeds use feedTranscript, not
+			// feedAndEmit: a preseed produces no running state, so no spurious
+			// turn boundaries may flash through the adapters.
+			for i := 0; i < len(contents)-1; i++ {
+				// A cancellation arriving during the preseed stops the drain
+				// without launching. The check precedes BeginTurn, so nothing
+				// at or after i was reached and the remainder starts at i; a
+				// cancel landing mid-item lets that item finish (it is already
+				// durable) and aborts on the next iteration instead.
+				if turnCtx.Err() != nil {
+					requeue(items[i:])
+					return true
+				}
+				turn := unit.store.BeginTurn()
+				feedTranscript(tr, Event{Kind: EventTurnStart, SessionID: sessionID, ProjectID: projectID, Turn: turn})
+				unit.lp.AppendUserMessage(turn, contents[i])
+				if err := unit.store.MarkTurnComplete(turn); err != nil {
+					// The marker write failed: the message is in loop history
+					// and on screen but cannot be made durable, and no commit
+					// for this turn will run. Surface the failure through the
+					// transcript (sequenced, so a hydration or reconnect sees
+					// it), stop the drain outright — no remaining preseed, no
+					// final launch — and requeue the untouched remainder, and
+					// only that, prepended ahead of anything submitted
+					// meanwhile. The failed item is not requeued: re-appending
+					// it would render it twice.
+					a.feedAndEmit(tr, Event{Kind: EventError, SessionID: sessionID, ProjectID: projectID, Error: fmt.Sprintf("failed to persist queued message (turn %d): %v", turn, err), Turn: turn})
+					requeue(items[i+1:])
+					return true
+				}
+				done := make(chan struct{})
+				flushed := false
+				select {
+				case rt.loopFlush <- done:
+					select {
+					case <-done:
+						flushed = true
+					case <-ctx.Done():
+					}
+				case <-ctx.Done():
+				}
+				if flushed {
+					feedTranscript(tr, Event{Kind: EventTurnEnd, SessionID: sessionID, ProjectID: projectID, Turn: turn})
+				}
+			}
+			// Reacquire the runtime mutex and re-validate what changed while it
+			// was released: admission may have closed and the turn may have
+			// been cancelled during the preseed. Either aborts the way the
+			// marker-failure path aborts — requeue the untouched remainder
+			// (the final item was never reached), do not launch — and the
+			// per-iteration cleanup clears busy and releases the count.
+			rt.mu.Lock()
+			if rt.closed || turnCtx.Err() != nil {
+				rt.mu.Unlock()
+				requeue(items[len(items)-1:])
+				return true
+			}
+			// The pre-launch registration stays here, immediately before
+			// launchTurn, exactly as before: it belongs to the launched turn,
+			// and launchTurn's goroutine — or its abort path, which returns 0
+			// after releasing this count — is its only releaser.
+			rt.turnWG.Add(1)
+			rt.mu.Unlock()
+			launched = rt.launchTurn(ctx, unit, turnCtx, cancel, []string{contents[len(contents)-1]})
+			if launched == 0 {
+				// The handoff was refused (a cancel or shutdown landed after
+				// the revalidation above, or the unit cannot launch): the
+				// final item was already removed from the queue but never
+				// launched, and it is in no turn and no durable history.
+				// Requeue it the same way the other abort paths requeue the
+				// untouched remainder — prepended ahead of anything submitted
+				// meanwhile, with the version bumped and the queue-changed
+				// event carrying the real queue — and stop the drain.
+				requeue(items[len(items)-1:])
+				return true
+			}
+			return false
+		}()
+		if stop {
+			return
+		}
 	}
 }
 
@@ -2798,6 +2937,23 @@ func (rt *runtime) launchTurn(ctx context.Context, unit *session, turnCtx contex
 		rt.turnWG.Done()
 		return 0
 	}
+	// Reject a handoff whose turn context is already cancelled or whose
+	// runtime has closed. A cancel or shutdown can land after the caller's
+	// revalidation passed and before this call begins; accepting it would
+	// create and emit a turn for a dead handoff. Reject before anything is
+	// created or emitted, and unwind the claim the way the abort path above
+	// does — release the wait-group count and clear the busy flag (and the
+	// per-turn context) — so the unit is not left wedged.
+	rt.mu.Lock()
+	if rt.closed || turnCtx.Err() != nil {
+		unit.busy = false
+		unit.turnCancel = nil
+		unit.turnCtx = nil
+		rt.mu.Unlock()
+		rt.turnWG.Done()
+		return 0
+	}
+	rt.mu.Unlock()
 	unit.syncEventOwner()
 	sessionID := sessionIDOf(unit)
 	projectID := unit.projectID
