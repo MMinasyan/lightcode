@@ -532,6 +532,11 @@ func (a *App) handleEvent(ev agent.Event) {
 			"batchFiles":         ev.PermReq.BatchFiles,
 			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		})
+	case agent.EventPermissionResolved:
+		emit("permission_resolved", map[string]any{
+			"id":        ev.PermReq.ID,
+			"sessionId": ev.PermReq.SessionID,
+		})
 	case agent.EventCompactionStart:
 		emit("compaction_start", nil)
 	case agent.EventCompactionEnd:
@@ -926,7 +931,15 @@ func (a *App) RespondPermission(sessionID string, id string, action string) erro
 	if err != nil {
 		return err
 	}
-	return a.svc.RespondPermissionActionForSession(sessionID, id, action)
+	err = a.svc.RespondPermissionActionForSession(sessionID, id, action)
+	if errors.Is(err, permission.ErrUnknownRequest) {
+		// The bound methods are reachable only by the bundled frontend, which
+		// never constructs an id — every id it answers came from a request event
+		// or a gate-captured snapshot. An unknown-request outcome can therefore
+		// only mean the prompt was resolved underneath the user. Benign.
+		return nil
+	}
+	return err
 }
 
 // PermissionSuggest returns pattern suggestions for the "Allow for project" UI.
@@ -965,7 +978,14 @@ func (a *App) SaveProjectPermission(sessionID string, id string, patterns []stri
 	if err != nil {
 		return err
 	}
-	return a.svc.SaveProjectPermissionForSession(sessionID, id, patterns)
+	err = a.svc.SaveProjectPermissionForSession(sessionID, id, patterns)
+	if errors.Is(err, permission.ErrUnknownRequest) {
+		// Same soundness as RespondPermission: the id can only have come from a
+		// prompt this host was given, so an unknown-request outcome means it was
+		// resolved underneath the user. Benign.
+		return nil
+	}
+	return err
 }
 
 // CompactNow triggers manual context compaction.

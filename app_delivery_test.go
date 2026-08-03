@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -420,4 +422,206 @@ func TestWailsDeliveryCloseAbandonsBlockedEmit(t *testing.T) {
 	if len(emitted) != 1 || emitted[0] != "blocked" {
 		t.Fatalf("emitted = %v, want only [blocked]: no emission after close", emitted)
 	}
+}
+
+// TestWailsOrderedDeliveryContract is the Wails ordered-delivery contract for
+// permission resolution: a resolution publishes its frame before the async turn
+// end, so the frontend can clear the prompt instead of showing an answerable
+// stale request until turn_end, and answering an already-resolved prompt is a
+// benign no-op rather than a surfaced error.
+func TestWailsOrderedDeliveryContract(t *testing.T) {
+	t.Run("permission_resolved=cancel_clears_prompt_before_turn_end", func(t *testing.T) {
+		app, id, reqID, log := wailsPermissionPendingApp(t)
+
+		// Cancel while the prompt is pending: the resolution frame must clear the
+		// prompt before the turn end event lands.
+		if err := app.Cancel(); err != nil {
+			t.Fatalf("Cancel: %v", err)
+		}
+
+		resolved := waitForWailsFrame(t, log, "permission_resolved")
+		if got := wailsFrameString(t, resolved, "id"); got != reqID {
+			t.Fatalf("permission_resolved id = %q, want the pending request's id %q", got, reqID)
+		}
+		if got := wailsFrameString(t, resolved, "sessionId"); got != id {
+			t.Fatalf("permission_resolved sessionId = %q, want %q", got, id)
+		}
+		waitForWailsFrame(t, log, "turn_end")
+		if idxRes, idxEnd := wailsFrameIndex(t, log, "permission_resolved"), wailsFrameIndex(t, log, "turn_end"); idxRes > idxEnd {
+			t.Fatalf("permission_resolved (index %d) delivered after turn_end (index %d)", idxRes, idxEnd)
+		}
+	})
+
+	t.Run("permission_resolved=answer_publishes_resolution", func(t *testing.T) {
+		app, id, reqID, log := wailsPermissionPendingApp(t)
+
+		// The answer path removes the pending request too: answering must publish
+		// the same resolution frame the cancel path does.
+		if err := app.RespondPermission(id, reqID, "deny"); err != nil {
+			t.Fatalf("RespondPermission: %v", err)
+		}
+
+		resolved := waitForWailsFrame(t, log, "permission_resolved")
+		if got := wailsFrameString(t, resolved, "id"); got != reqID {
+			t.Fatalf("permission_resolved id = %q, want the answered request's id %q", got, reqID)
+		}
+		if got := wailsFrameString(t, resolved, "sessionId"); got != id {
+			t.Fatalf("permission_resolved sessionId = %q, want %q", got, id)
+		}
+	})
+
+	t.Run("permission_respond=already_resolved_returns_no_error", func(t *testing.T) {
+		ag := newAppTestAgentAt(t, "http://127.0.0.1:9/v1")
+		app := &App{svc: ag, agent: ag}
+		app.emitFn = func(string, any) {}
+		app.startup(context.Background())
+		id := app.currentSessionID()
+		if id == "" {
+			t.Fatal("startup did not establish a current session")
+		}
+
+		// A stale answer — the id can only have come from a prompt this host was
+		// given, so an unknown-request outcome means it was resolved underneath
+		// the user — is silent on the desktop.
+		if err := app.RespondPermission(id, "p1", "deny"); err != nil {
+			t.Fatalf("RespondPermission on an already-resolved request returned an error: %v", err)
+		}
+		// The allow-for-project route answers through the same gate; it must be a
+		// benign no-op for an already-resolved request too.
+		if err := app.SaveProjectPermission(id, "p1", []string{"/tmp/*"}); err != nil {
+			t.Fatalf("SaveProjectPermission on an already-resolved request returned an error: %v", err)
+		}
+	})
+}
+
+type wailsTestFrame struct {
+	name    string
+	payload any
+}
+
+type wailsFrameLog struct {
+	mu     sync.Mutex
+	frames []wailsTestFrame
+}
+
+func (l *wailsFrameLog) append(name string, payload any) {
+	l.mu.Lock()
+	l.frames = append(l.frames, wailsTestFrame{name: name, payload: payload})
+	l.mu.Unlock()
+}
+
+func (l *wailsFrameLog) first(name string) (any, int, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i, f := range l.frames {
+		if f.name == name {
+			return f.payload, i, true
+		}
+	}
+	return nil, -1, false
+}
+
+func waitForWailsFrame(t *testing.T, log *wailsFrameLog, name string) any {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if payload, _, ok := log.first(name); ok {
+			return payload
+		}
+		if time.Now().After(deadline) {
+			log.mu.Lock()
+			frames := append([]wailsTestFrame(nil), log.frames...)
+			log.mu.Unlock()
+			t.Fatalf("timed out waiting for frame %q; frames: %#v", name, frames)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func wailsFrameIndex(t *testing.T, log *wailsFrameLog, name string) int {
+	t.Helper()
+	_, idx, ok := log.first(name)
+	if !ok {
+		t.Fatalf("frame %q not present", name)
+	}
+	return idx
+}
+
+// wailsPermissionPendingApp wires a Wails app whose first turn asks a read_file
+// permission request, submits a message, and waits until the request is pending.
+// It returns the app, the session id, the pending request's id, and the frame
+// log the test asserts against.
+func wailsPermissionPendingApp(t *testing.T) (*App, string, string, *wailsFrameLog) {
+	t.Helper()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			writeAppSSE(w,
+				appToolCallChunk("perm-ask", "test-model", "call_read", "read_file", `{"path":"x.txt"}`),
+				appStopChunk("perm-ask", "test-model"),
+				"[DONE]")
+			return
+		}
+		// A cancelled turn makes no second model call; serve a plain
+		// completion so a stray call cannot hang the test.
+		writeAppSSE(w,
+			appTextChunk("perm-ask-2", "test-model", "done"),
+			appStopChunk("perm-ask-2", "test-model"),
+			"[DONE]")
+	}))
+	t.Cleanup(server.Close)
+
+	ag := newAppTestAgentAt(t, server.URL+"/v1")
+	app := &App{svc: ag, agent: ag}
+	log := &wailsFrameLog{}
+	app.emitFn = log.append
+	app.startup(context.Background())
+
+	id := app.currentSessionID()
+	if id == "" {
+		t.Fatal("startup did not establish a current session")
+	}
+	if _, err := app.Submit("read the file"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+
+	reqPayload := waitForWailsFrame(t, log, "permission_request")
+	reqID := wailsFrameString(t, reqPayload, "id")
+	if reqID == "" {
+		t.Fatalf("permission_request frame carries no id: %#v", reqPayload)
+	}
+	return app, id, reqID, log
+}
+
+func wailsFrameString(t *testing.T, payload any, key string) string {
+	t.Helper()
+	m, ok := payload.(map[string]any)
+	if !ok {
+		t.Fatalf("frame payload is %T, want map[string]any: %#v", payload, payload)
+	}
+	s, _ := m[key].(string)
+	return s
+}
+
+func writeAppSSE(w http.ResponseWriter, payloads ...string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	for _, payload := range payloads {
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+}
+
+func appTextChunk(id, model, content string) string {
+	return fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"role":"assistant","content":%q},"finish_reason":null}]}`, id, model, content)
+}
+
+func appStopChunk(id, model string) string {
+	return fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`, id, model)
+}
+
+func appToolCallChunk(id, model, callID, name, arguments string) string {
+	argsJSON, _ := json.Marshal(arguments)
+	return fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":%q,"type":"function","function":{"name":%q,"arguments":%s}}]},"finish_reason":null}]}`, id, model, callID, name, argsJSON)
 }

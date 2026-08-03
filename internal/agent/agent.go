@@ -864,6 +864,16 @@ func New(c Config) (*Agent, error) {
 			PermReq:   permissionRequestFromGateRequest(req),
 		})
 	})
+	// The removal side mirrors the registration side: publish the resolution in
+	// the same gate-mutex section that removed the pending request, so an adapter
+	// clears its prompt mirror before the turn-end event arrives.
+	gate.OnResolved = func(req permission.Request) {
+		a.emitEvent(Event{
+			Kind:      EventPermissionResolved,
+			SessionID: req.SessionID,
+			PermReq:   &PermissionRequest{ID: req.ID, SessionID: req.SessionID},
+		})
+	}
 	a.gate = gate
 
 	proj := &project.Project{}

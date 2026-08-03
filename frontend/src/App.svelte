@@ -327,6 +327,12 @@
 
     EventsOn('permission_request', buffered((data) => { permissions = upsertPermission(permissions, data); }));
 
+    EventsOn('permission_resolved', buffered((data) => {
+      // A pending request was answered or cancelled; drop it from the map so a
+      // cancelled prompt is not still shown (and answerable) until turn end.
+      if (data?.id) permissions = removePermission(permissions, data.id);
+    }));
+
     EventsOn('compaction_start', buffered(() => { compacting = true; }));
     EventsOn('compaction_end', buffered(() => { compacting = false; }));
 

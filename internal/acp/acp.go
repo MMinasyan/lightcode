@@ -494,6 +494,15 @@ func (r *Runner) handleEvent(ev agent.Event) {
 			"batchFiles":         ev.PermReq.BatchFiles,
 			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		}
+	case agent.EventPermissionResolved:
+		// The client holds the pending mirror; forward the resolution so it can
+		// clear a cancelled prompt before the turn-end notification.
+		r.sendNotification(Notification{
+			JSONRPC: "2.0",
+			Method:  "agent/permission_resolved",
+			Params:  map[string]any{"id": ev.PermReq.ID, "sessionId": ev.PermReq.SessionID},
+		}, ev.SessionID)
+		return
 	case agent.EventCompactionStart:
 		method = "agent/compaction_start"
 	case agent.EventCompactionEnd:
@@ -975,6 +984,10 @@ func (r *Runner) handlePermissionSave(req Request) {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
+	// The protocol client is third-party and may send anything: an unknown
+	// request is real information and must be reported. The client already
+	// receives a resolution for every prompt it was sent, which is what lets it
+	// keep its own mirror straight.
 	if err := r.agent.SaveProjectPermissionForSession(sessionID, params.ID, params.Patterns); err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
@@ -1009,6 +1022,8 @@ func (r *Runner) handlePermissionRespond(req Request) {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
+	// Same as handlePermissionSave: the client is third-party, so an unknown
+	// request is reported, not suppressed.
 	if err := r.agent.RespondPermissionActionForSession(sessionID, params.ID, params.Action); err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return

@@ -19,6 +19,7 @@ const (
 	EventTurnEnd                                    // Agent finished processing a turn.
 	EventError                                      // The agentic loop returned an error.
 	EventPermissionRequest                          // A tool needs user approval.
+	EventPermissionResolved                         // A pending permission request was removed (answered or cancelled).
 	EventCompactionStart                            // Compaction beginning.
 	EventCompactionEnd                              // Compaction finished.
 	EventWarning                                    // Current warning snapshot changed.

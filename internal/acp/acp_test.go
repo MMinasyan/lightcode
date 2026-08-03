@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1239,6 +1241,210 @@ func TestACPOrderedDeliveryContract(t *testing.T) {
 			t.Fatalf("presentation current = %q, want %q", presented, secondID)
 		}
 	})
+
+	t.Run("permission_resolved=cancel_forwarded_before_turn_end", func(t *testing.T) {
+		var calls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if calls.Add(1) == 1 {
+				writeACPSSE(w,
+					acpToolCallChunk("perm-cancel", "test-model", "call_read", "read_file", `{"path":"x.txt"}`),
+					acpStopChunk("perm-cancel", "test-model"),
+					"[DONE]")
+				return
+			}
+			// A cancelled turn makes no second model call; serve a plain
+			// completion so a stray call cannot hang the test.
+			writeACPSSE(w,
+				acpTextChunk("perm-cancel-2", "test-model", "done"),
+				acpStopChunk("perm-cancel-2", "test-model"),
+				"[DONE]")
+		}))
+		t.Cleanup(server.Close)
+
+		a := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		// The ACP test config declares no agents.json, so the primary agent type
+		// has no model; bootstrap it through the adapter-facing method.
+		if err := a.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		a.SetEventHandler(r.handleEvent)
+		sessionID := a.Init(ctx)
+		if sessionID == "" {
+			// Nothing to resume on a fresh agent: create, as Run does.
+			var createErr error
+			sessionID, createErr = a.NewSession("", "primary")
+			if createErr != nil {
+				t.Fatalf("NewSession: %v", createErr)
+			}
+		}
+		r.setCurrentSessionID(sessionID)
+		r.seedPresented(sessionID)
+
+		res, err := a.SubmitToSession(ctx, sessionID, "read the file")
+		if err != nil {
+			t.Fatalf("SubmitToSession: %v", err)
+		}
+		if !res.Started {
+			t.Fatalf("submit was queued, want started: %+v", res)
+		}
+
+		reqParams := waitForACPMethod(t, r, out, "agent/permission_request")
+		reqID := acpParamString(t, reqParams, "id")
+		if reqID == "" {
+			t.Fatalf("permission_request notification carries no id: %#v", reqParams)
+		}
+
+		// Cancel while the prompt is pending: the forwarded resolution must clear
+		// the client's mirror before the turn-end notification arrives.
+		r.handleSessionCancel(Request{JSONRPC: "2.0", ID: "cancel", Params: json.RawMessage(`{}`)})
+
+		waitForACPMethod(t, r, out, "agent/turn_end")
+		r.drainForTest()
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+		resolvedIdx, endIdx := -1, -1
+		var resID, resSession string
+		for i, line := range lines {
+			var n Notification
+			if err := json.Unmarshal([]byte(line), &n); err != nil {
+				continue
+			}
+			switch n.Method {
+			case "agent/permission_resolved":
+				resolvedIdx = i
+				params, _ := n.Params.(map[string]any)
+				resID, _ = params["id"].(string)
+				resSession, _ = params["sessionId"].(string)
+			case "agent/turn_end":
+				endIdx = i
+			}
+		}
+		if resolvedIdx < 0 || endIdx < 0 {
+			t.Fatalf("missing notifications: permission_resolved=%d turn_end=%d; output: %q", resolvedIdx, endIdx, out.String())
+		}
+		if resID != reqID {
+			t.Fatalf("permission_resolved id = %q, want the pending request's id %q", resID, reqID)
+		}
+		if resSession != sessionID {
+			t.Fatalf("permission_resolved sessionId = %q, want %q", resSession, sessionID)
+		}
+		if resolvedIdx > endIdx {
+			t.Fatalf("permission_resolved (index %d) delivered after turn_end (index %d)", resolvedIdx, endIdx)
+		}
+	})
+
+	t.Run("permission_respond=never_pending_is_reported", func(t *testing.T) {
+		a := newACPTestAgentWithProvider(t, "http://127.0.0.1:9/v1", false)
+		if err := a.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		sessionID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		a.SetEventHandler(r.handleEvent)
+		r.setCurrentSessionID(sessionID)
+		r.seedPresented(sessionID)
+
+		// The protocol client is third-party and may send anything: an unknown
+		// request is real information and is reported, not swallowed.
+		r.handlePermissionRespond(Request{
+			JSONRPC: "2.0",
+			ID:      "resp",
+			Params:  json.RawMessage(`{"id":"bogus-id","action":"deny"}`),
+		})
+		r.handlePermissionSave(Request{
+			JSONRPC: "2.0",
+			ID:      "save",
+			Params:  json.RawMessage(`{"id":"bogus-id","patterns":["/tmp/*"]}`),
+		})
+		r.drainForTest()
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+		for _, wantID := range []string{"resp", "save"} {
+			var respLine string
+			for _, line := range lines {
+				var resp Response
+				if err := json.Unmarshal([]byte(line), &resp); err != nil {
+					continue
+				}
+				if s, _ := resp.ID.(string); s == wantID {
+					respLine = line
+				}
+			}
+			if respLine == "" {
+				t.Fatalf("no response for %q among frames: %q", wantID, out.String())
+			}
+			assertACPErrorResponse(t, respLine)
+		}
+	})
+}
+
+// acpPermissionPendingRunner wires an ACP runner whose first turn asks a
+// read_file permission request, submits a message, and waits until the request
+// is pending. It returns the session id, the output buffer, and the runner.
+func acpPermissionPendingRunner(t *testing.T) (string, *bytes.Buffer, *Runner) {
+	t.Helper()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			writeACPSSE(w,
+				acpToolCallChunk("perm-ask", "test-model", "call_read", "read_file", `{"path":"x.txt"}`),
+				acpStopChunk("perm-ask", "test-model"),
+				"[DONE]")
+			return
+		}
+		// A cancelled turn makes no second model call; serve a plain
+		// completion so a stray call cannot hang the test.
+		writeACPSSE(w,
+			acpTextChunk("perm-ask-2", "test-model", "done"),
+			acpStopChunk("perm-ask-2", "test-model"),
+			"[DONE]")
+	}))
+	t.Cleanup(server.Close)
+
+	a := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+	// The ACP test config declares no agents.json, so the primary agent type
+	// has no model; bootstrap it through the adapter-facing method.
+	if err := a.SetDefaultModel("test/test-model"); err != nil {
+		t.Fatalf("SetDefaultModel: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	out := new(bytes.Buffer)
+	r := &Runner{agent: a, owner: a, out: out}
+	a.SetEventHandler(r.handleEvent)
+	sessionID := a.Init(ctx)
+	if sessionID == "" {
+		// Nothing to resume on a fresh agent: create, as Run does.
+		var createErr error
+		sessionID, createErr = a.NewSession("", "primary")
+		if createErr != nil {
+			t.Fatalf("NewSession: %v", createErr)
+		}
+	}
+	r.setCurrentSessionID(sessionID)
+	r.seedPresented(sessionID)
+
+	res, err := a.SubmitToSession(ctx, sessionID, "read the file")
+	if err != nil {
+		t.Fatalf("SubmitToSession: %v", err)
+	}
+	if !res.Started {
+		t.Fatalf("submit was queued, want started: %+v", res)
+	}
+
+	reqParams := waitForACPMethod(t, r, out, "agent/permission_request")
+	if id := acpParamString(t, reqParams, "id"); id == "" {
+		t.Fatalf("permission_request notification carries no id: %#v", reqParams)
+	}
+	return sessionID, out, r
 }
 
 // TestACPStalledOutputPreservesBoundaryOrder proves that with the output drainer
@@ -2321,4 +2527,55 @@ func extractSourceFunc(t *testing.T, src, signature string) string {
 	}
 	t.Fatalf("unterminated function %q", signature)
 	return ""
+}
+
+// waitForACPMethod drains until a notification with the given method is present
+// in the output and returns its params.
+func waitForACPMethod(t *testing.T, r *Runner, out *bytes.Buffer, method string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		r.drainForTest()
+		for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+			var n Notification
+			if err := json.Unmarshal([]byte(line), &n); err != nil || n.Method != method {
+				continue
+			}
+			params, _ := n.Params.(map[string]any)
+			return params
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for ACP notification %q; output: %q", method, out.String())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func acpParamString(t *testing.T, params map[string]any, key string) string {
+	t.Helper()
+	s, _ := params[key].(string)
+	return s
+}
+
+func writeACPSSE(w http.ResponseWriter, payloads ...string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	for _, payload := range payloads {
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+}
+
+func acpTextChunk(id, model, content string) string {
+	return fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"role":"assistant","content":%q},"finish_reason":null}]}`, id, model, content)
+}
+
+func acpStopChunk(id, model string) string {
+	return fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`, id, model)
+}
+
+func acpToolCallChunk(id, model, callID, name, arguments string) string {
+	argsJSON, _ := json.Marshal(arguments)
+	return fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":%q,"type":"function","function":{"name":%q,"arguments":%s}}]},"finish_reason":null}]}`, id, model, callID, name, argsJSON)
 }

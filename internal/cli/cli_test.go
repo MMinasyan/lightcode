@@ -1381,3 +1381,122 @@ func TestHandleKeyStreamingInputEditing(t *testing.T) {
 		t.Fatalf("input = %q, want empty after down", got)
 	}
 }
+
+// TestCLIPermissionStaleAnswerIsVoid proves an answer for a request that was
+// resolved underneath the user (removed from the displayed queue) is dropped
+// without answering the next request or surfacing an error.
+func TestCLIPermissionStaleAnswerIsVoid(t *testing.T) {
+	a, _ := newTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	c := New(a)
+	sid := a.SessionCurrent().ID
+	c.setCurrentSessionID(sid)
+
+	req1 := &agent.PermissionRequest{ID: "p1", SessionID: sid, ToolName: "read_file", Arg: "/tmp/a.txt"}
+	req2 := &agent.PermissionRequest{ID: "p2", SessionID: sid, ToolName: "read_file", Arg: "/tmp/b.txt"}
+	var out bytes.Buffer
+	c.out = &out
+	c.handleEvent(agent.Event{Kind: agent.EventPermissionRequest, SessionID: sid, PermReq: req1})
+	c.handleEvent(agent.Event{Kind: agent.EventPermissionRequest, SessionID: sid, PermReq: req2})
+	// The resolution for the displayed request lands while the user's answer for
+	// it is in flight.
+	c.handleEvent(agent.Event{Kind: agent.EventPermissionResolved, SessionID: sid, PermReq: &agent.PermissionRequest{ID: "p1", SessionID: sid}})
+
+	out.Reset()
+	c.popAndRespondAction(req1, "deny")
+
+	c.mu.Lock()
+	queue := append([]*agent.PermissionRequest(nil), c.permQueue...)
+	c.mu.Unlock()
+	if len(queue) != 1 || queue[0].ID != "p2" {
+		t.Fatalf("queue after stale answer = %#v, want [p2] untouched", queue)
+	}
+	if got := out.String(); strings.Contains(got, "no pending permission request") {
+		t.Fatalf("stale answer surfaced the unknown-request error: %q", got)
+	}
+}
+
+// TestCLIPermissionNeverPendingAnswerIsReported proves an answer for an id this
+// host never issued is surfaced rather than swallowed.
+// TestCLIPermissionStaleSaveIsSilent proves the allow-for-project save for a
+// request resolved underneath the user is a void no-op, not a printed error.
+func TestCLIPermissionStaleSaveIsSilent(t *testing.T) {
+	a, _ := newTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	c := New(a)
+	sid := a.SessionCurrent().ID
+	c.setCurrentSessionID(sid)
+
+	req := &agent.PermissionRequest{ID: "p1", SessionID: sid, ToolName: "read_file", Arg: "/tmp/a.txt"}
+	var out bytes.Buffer
+	c.out = &out
+	c.handleEvent(agent.Event{Kind: agent.EventPermissionRequest, SessionID: sid, PermReq: req})
+	// The resolution lands while the suggestion menu is open.
+	c.handleEvent(agent.Event{Kind: agent.EventPermissionResolved, SessionID: sid, PermReq: &agent.PermissionRequest{ID: "p1", SessionID: sid}})
+
+	out.Reset()
+	c.readKeyFn = func() (keyMsg, error) { return keyMsg{Special: keyEnter}, nil }
+	c.showPermissionSuggestions(req)
+
+	if got := out.String(); strings.Contains(got, "no pending permission request") {
+		t.Fatalf("stale save surfaced the unknown-request error: %q", got)
+	}
+}
+
+// TestCLIPermissionNeverPendingSaveIsReported proves the allow-for-project save
+// for an id this host never issued is surfaced rather than swallowed.
+// TestCLIPermissionCancellationBetweenCheckAndAnswerIsSilent proves a
+// resolution landing after the display decision but before the agent call does
+// not surface the unknown-request error: the decision is on whether this host
+// ever issued the id, which a later cancellation does not retract.
+// TestCLIPermissionCancellationBetweenCheckAndSaveIsSilent proves a resolution
+// landing after the display decision but before the save call does not surface
+// the unknown-request error.
+// TestCLIPermissionPreviousTurnIdReportedAfterTurnEnd proves an answer or save
+// naming an id from a previous turn is reported once the turn has ended: the
+// record is cleared at turn end, so a recycled id is not silently swallowed.
+// TestCLIPermissionTurnEndBetweenCheckAndCallIsSilent proves a turn end landing
+// after the membership capture but before the agent call does not surface the
+// unknown-request error: the decision is made on the captured membership, which
+// the clear at turn end does not retract. Once the turn has ended, the same id
+// is reported.
+// TestCLIPermissionOtherSessionIdReported proves an id issued for one session
+// does not authorise suppression for an answer naming a different session.
+
+// TestCLIPermissionResolvedBehindHeadLeavesDisplayAlone proves a resolution for
+// a queued request behind the displayed head removes it from the queue without
+// touching the displayed prompt: the head and the permission state stay put.
+func TestCLIPermissionResolvedBehindHeadLeavesDisplayAlone(t *testing.T) {
+	a, _ := newTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	c := New(a)
+	sid := a.SessionCurrent().ID
+	c.setCurrentSessionID(sid)
+
+	req1 := &agent.PermissionRequest{ID: "p1", SessionID: sid, ToolName: "read_file", Arg: "/tmp/a.txt"}
+	req2 := &agent.PermissionRequest{ID: "p2", SessionID: sid, ToolName: "read_file", Arg: "/tmp/b.txt"}
+	var out bytes.Buffer
+	c.out = &out
+	c.handleEvent(agent.Event{Kind: agent.EventPermissionRequest, SessionID: sid, PermReq: req1})
+	c.handleEvent(agent.Event{Kind: agent.EventPermissionRequest, SessionID: sid, PermReq: req2})
+
+	// The resolution lands for the queued request behind the displayed head.
+	c.handleEvent(agent.Event{Kind: agent.EventPermissionResolved, SessionID: sid, PermReq: &agent.PermissionRequest{ID: "p2", SessionID: sid}})
+
+	c.mu.Lock()
+	queue := append([]*agent.PermissionRequest(nil), c.permQueue...)
+	state := c.state
+	c.mu.Unlock()
+	if len(queue) != 1 || queue[0].ID != "p1" {
+		t.Fatalf("queue after behind-head resolution = %#v, want [p1]", queue)
+	}
+	if state != statePermission {
+		t.Fatalf("state = %v, want statePermission (the displayed prompt is untouched)", state)
+	}
+}

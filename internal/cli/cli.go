@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
+	"github.com/MMinasyan/lightcode/internal/permission"
 )
 
 type cliState int
@@ -816,15 +818,31 @@ func (c *CLI) popAndRespond(req *agent.PermissionRequest, allow bool) {
 
 func (c *CLI) popAndRespondAction(req *agent.PermissionRequest, action string) {
 	c.mu.Lock()
-	c.erasePermissionBlockLocked()
-	c.advancePermissionQueueLocked()
+	stillDisplayed := len(c.permQueue) > 0 && c.permQueue[0].ID == req.ID
 	c.mu.Unlock()
+
+	if stillDisplayed {
+		// The prompt is on screen: deliver the answer as it advances the display.
+		c.mu.Lock()
+		c.erasePermissionBlockLocked()
+		c.advancePermissionQueueLocked()
+		c.mu.Unlock()
+	}
 
 	sessionID, err := c.resolveSessionID(req.SessionID)
 	if err != nil {
 		return
 	}
-	_ = c.agent.RespondPermissionActionForSession(sessionID, req.ID, action)
+	if err := c.agent.RespondPermissionActionForSession(sessionID, req.ID, action); err != nil {
+		if errors.Is(err, permission.ErrUnknownRequest) {
+			// The answered id can only have come from a prompt this host was
+			// given — the queue's only writer is the request event — so an
+			// unknown-request outcome means the prompt was resolved underneath
+			// the user. Benign.
+			return
+		}
+		c.printLine(renderErrorMsg(err.Error()))
+	}
 }
 
 func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
@@ -901,20 +919,36 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 		case keyEnter:
 			patterns := []string{suggestions[selected].Rule}
 			eraseSuggestions()
+			c.mu.Lock()
+			stillDisplayed := len(c.permQueue) > 0 && c.permQueue[0].ID == req.ID
+			c.mu.Unlock()
 			sessionID, err := c.resolveSessionID(req.SessionID)
 			if err != nil {
 				c.printLine(renderErrorMsg(err.Error()))
-				c.printPermissionBlock(req)
+				if stillDisplayed {
+					c.printPermissionBlock(req)
+				}
 				return
 			}
 			if err := c.agent.SaveProjectPermissionForSession(sessionID, req.ID, patterns); err != nil {
+				if errors.Is(err, permission.ErrUnknownRequest) {
+					// Same soundness as the answer path: the saved id can only
+					// have come from a prompt this host was given, so an
+					// unknown-request outcome means it was resolved underneath
+					// the user. Benign.
+					return
+				}
 				c.printLine(renderErrorMsg(err.Error()))
-				c.printPermissionBlock(req)
+				if stillDisplayed {
+					c.printPermissionBlock(req)
+				}
 				return
 			}
-			c.mu.Lock()
-			c.advancePermissionQueueLocked()
-			c.mu.Unlock()
+			if stillDisplayed {
+				c.mu.Lock()
+				c.advancePermissionQueueLocked()
+				c.mu.Unlock()
+			}
 			return
 		case keyUp:
 			if selected > 0 {
@@ -1186,6 +1220,31 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			c.state = statePermission
 			c.permSelected = 0
 			c.printPermissionBlockLocked(ev.PermReq)
+		}
+
+	case agent.EventPermissionResolved:
+		// The backend removed a pending request (answered or cancelled). Drop the
+		// matching entry so a cancelled prompt is not still shown — and answerable —
+		// until turn end, and redraw the head when the removed entry was shown.
+		if ev.PermReq == nil {
+			return
+		}
+		for i, req := range c.permQueue {
+			if req == nil || req.ID != ev.PermReq.ID {
+				continue
+			}
+			c.permQueue = append(c.permQueue[:i], c.permQueue[i+1:]...)
+			if i == 0 {
+				c.erasePermissionBlockLocked()
+				c.permSelected = 0
+				if len(c.permQueue) > 0 {
+					c.state = statePermission
+					c.printPermissionBlockLocked(c.permQueue[0])
+				} else {
+					c.state = stateStreaming
+				}
+			}
+			return
 		}
 
 	case agent.EventUsage:
