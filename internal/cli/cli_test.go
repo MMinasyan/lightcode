@@ -689,6 +689,64 @@ func TestCLISelectionOnlyRouting(t *testing.T) {
 		}
 	})
 
+	t.Run("resume_cross_project_commits_destination", func(t *testing.T) {
+		a, _ := newTestAgent(t)
+		c := New(a)
+		out := new(bytes.Buffer)
+		c.out = out
+		source, _ := a.NewSession("", "primary")
+		otherRoot := t.TempDir()
+		dest, _ := a.NewSessionForProjectPath(otherRoot, "primary")
+		c.setCurrentSessionID(source)
+
+		if err := c.dispatchCommand("/resume " + dest); err != nil {
+			t.Fatalf("/resume: %v", err)
+		}
+		if got, _ := c.currentSession(); got != dest {
+			t.Fatalf("current after /resume = %q, want dest %q", got, dest)
+		}
+		// The project-scoped routes must now target the destination project.
+		if got := c.scope.ProjectPath(); got != otherRoot {
+			t.Fatalf("project path after /resume = %q, want destination %q", got, otherRoot)
+		}
+		sessions, err := c.scope.SessionList("active")
+		if err != nil {
+			t.Fatalf("SessionList: %v", err)
+		}
+		if len(sessions) != 1 || sessions[0].ID != dest {
+			t.Fatalf("project-scoped session list after /resume = %#v, want only %q", sessions, dest)
+		}
+	})
+
+	t.Run("resume_unreadable_meta_routes_destination", func(t *testing.T) {
+		a, _ := newTestAgent(t)
+		c := New(a)
+		out := new(bytes.Buffer)
+		c.out = out
+		source, _ := a.NewSession("", "primary")
+		otherRoot := t.TempDir()
+		dest, _ := a.NewSessionForProjectPath(otherRoot, "primary")
+		c.setCurrentSessionID(source)
+
+		// Corrupt the destination's metadata so its summary cannot read a
+		// project path; the owner still resolves the unit against its project,
+		// so the resume routes to the destination.
+		proj, err := a.ProjectCurrentForPath(otherRoot)
+		if err != nil {
+			t.Fatalf("destination project: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(a.Projects().SessionsRoot(proj.ID), dest, "meta.json"), []byte("{not json"), 0o600); err != nil {
+			t.Fatalf("corrupt destination meta: %v", err)
+		}
+
+		if err := c.dispatchCommand("/resume " + dest); err != nil {
+			t.Fatalf("/resume: %v", err)
+		}
+		if got := c.scope.ProjectPath(); got != otherRoot {
+			t.Fatalf("project path after /resume with unreadable meta = %q, want destination %q", got, otherRoot)
+		}
+	})
+
 	t.Run("resume_destination_failure_source_unchanged", func(t *testing.T) {
 		a, _ := newTestAgent(t)
 		c := New(a)

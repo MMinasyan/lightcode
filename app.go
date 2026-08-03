@@ -1105,6 +1105,14 @@ func (a *App) routeProjectPathBounded() (string, error) {
 	return a.routeProjectPath, nil
 }
 
+// setRouteProjectPathLocked commits the routing-current project path. The caller
+// holds navMu. The owner always resolves a selectable session against its
+// project, so the boundary summary carries a project path; the commit is
+// unconditional.
+func (a *App) setRouteProjectPathLocked(path string) {
+	a.routeProjectPath = path
+}
+
 // openOrCreateSession opens the most recent active session for a project path, or
 // creates one. The caller holds navMu across it as part of a navigation.
 func (a *App) openOrCreateSession(projectPath string, emit func(agent.HydrationState)) (agent.SessionSummary, error) {
@@ -1156,9 +1164,12 @@ func (a *App) SessionSwitch(id string) error {
 		return errAdapterClosed
 	}
 	// The owner publishes the destination boundary in-commit; the callback commits
-	// adapter routing current before appending the boundary, both while this goroutine
-	// holds navMu, so a failed switch leaves routing and presentation unchanged.
+	// adapter routing current — including the destination project, since the id may
+	// resolve in another project — before appending the boundary, both while this
+	// goroutine holds navMu, so a failed switch leaves routing and presentation
+	// unchanged.
 	_, err := a.svc.OpenSessionWithBoundary(id, func(state agent.HydrationState) {
+		a.setRouteProjectPathLocked(state.Session.ProjectPath)
 		a.setCurrentSessionID(state.Session.ID)
 		a.enqueueBoundary("navigation", state, "", state.Session.ID)
 	})
@@ -1269,7 +1280,7 @@ func (a *App) ProjectSwitch(targetPath string) error {
 	// native title rides the boundary, so it changes only when the boundary is consumed.
 	title := "Lightcode — " + filepath.Base(abs)
 	_, err = a.openOrCreateSession(abs, func(state agent.HydrationState) {
-		a.routeProjectPath = abs
+		a.setRouteProjectPathLocked(abs)
 		a.setCurrentSessionID(state.Session.ID)
 		a.enqueueBoundary("navigation", state, title, state.Session.ID)
 	})

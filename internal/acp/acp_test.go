@@ -1435,6 +1435,239 @@ func TestACPProjectCurrentFollowsCrossProjectSwitch(t *testing.T) {
 	}
 }
 
+// TestAdapterExplicitSessionTargetingContract proves the project-implicit ACP
+// routes resolve to the connection's current session's project after a
+// cross-project switch: project/current reports it, session/new creates in it,
+// session/list lists it, and file/read enforces its root as the viewer sandbox.
+// With no session selected, the three operation routes fall back to the
+// owner-startup project (the same fallback Run's bootstrap uses), while
+// project/current alone errors with -32000 — a pure query has nothing to report
+// where creating, listing, and reading stay meaningful against the owner project.
+func TestAdapterExplicitSessionTargetingContract(t *testing.T) {
+	newSwitchedRunner := func(t *testing.T) (*agent.Agent, *Runner, *bytes.Buffer, string, string) {
+		t.Helper()
+		a := newACPTestAgent(t)
+		startupID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession startup: %v", err)
+		}
+		otherRoot := t.TempDir()
+		otherID, err := a.NewSessionForProjectPath(otherRoot, "primary")
+		if err != nil {
+			t.Fatalf("NewSessionForProjectPath: %v", err)
+		}
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		r.setCurrentSessionID(startupID)
+		r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + otherID + `"}`)})
+		r.drainForTest()
+		out.Reset()
+		return a, r, out, otherRoot, otherID
+	}
+
+	t.Run("project_current=cross_project_session_switch_reports_B", func(t *testing.T) {
+		a, r, out, otherRoot, _ := newSwitchedRunner(t)
+		wantOther, err := a.ProjectCurrentForPath(otherRoot)
+		if err != nil {
+			t.Fatalf("other project: %v", err)
+		}
+		r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "p", Method: "project/current"})
+		if got := acpProjectFromResponse(t, drainedLines(t, r, out, 1)[0]); got.ID != wantOther.ID {
+			t.Fatalf("project/current after cross-project switch = %q, want %q", got.ID, wantOther.ID)
+		}
+	})
+
+	t.Run("project_current=no_session_returns_error", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "p", Method: "project/current"})
+		line := drainedLines(t, r, out, 1)[0]
+		var resp Response
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("response json: %v", err)
+		}
+		if resp.Error == nil {
+			t.Fatalf("project/current with no session = %+v, want -32000 error", resp.Result)
+		}
+		if resp.Error.Code != -32000 || !strings.Contains(resp.Error.Message, "no current session") {
+			t.Fatalf("project/current error = %+v, want code -32000 message containing %q", resp.Error, "no current session")
+		}
+	})
+
+	t.Run("acp_session_new=creates_in_selected_project", func(t *testing.T) {
+		_, r, out, otherRoot, _ := newSwitchedRunner(t)
+		r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "new", Method: "session/new"})
+		lines := drainedLines(t, r, out, 2)
+		assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+		summary := acpSessionSummaryFromResponse(t, lines[1])
+		if summary.ID == "" {
+			t.Fatal("session/new returned no session")
+		}
+		if summary.ProjectPath != otherRoot {
+			t.Fatalf("session/new created in project %q, want selected project %q", summary.ProjectPath, otherRoot)
+		}
+	})
+
+	t.Run("acp_session_list=lists_selected_project", func(t *testing.T) {
+		a, r, out, otherRoot, _ := newSwitchedRunner(t)
+		r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "list", Method: "session/list"})
+		line := drainedLines(t, r, out, 1)[0]
+		var resp Response
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("response json: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("session/list response error: %+v", resp.Error)
+		}
+		data, err := json.Marshal(resp.Result)
+		if err != nil {
+			t.Fatalf("session/list result marshal: %v", err)
+		}
+		var got []agent.SessionSummary
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatalf("session/list result json: %v", err)
+		}
+		want, err := a.SessionListForProjectPath(otherRoot, "active")
+		if err != nil {
+			t.Fatalf("SessionListForProjectPath: %v", err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("session/list returned %d sessions, want %d for selected project", len(got), len(want))
+		}
+		for i := range want {
+			if got[i].ID != want[i].ID {
+				t.Fatalf("session/list[%d] = %q, want selected project session %q", i, got[i].ID, want[i].ID)
+			}
+		}
+	})
+
+	t.Run("acp_file_read=allows_inside_selected_root", func(t *testing.T) {
+		_, r, out, otherRoot, _ := newSwitchedRunner(t)
+		inside := filepath.Join(otherRoot, "readme.txt")
+		if err := os.WriteFile(inside, []byte("b-content"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		r.dispatch(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "read",
+			Method:  "file/read",
+			Params:  json.RawMessage(`{"path":` + strconv.Quote(inside) + `}`),
+		})
+		line := drainedLines(t, r, out, 1)[0]
+		var resp Response
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("response json: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("file/read inside selected root errored: %+v", resp.Error)
+		}
+		data, err := json.Marshal(resp.Result)
+		if err != nil {
+			t.Fatalf("file/read result marshal: %v", err)
+		}
+		var payload struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			t.Fatalf("file/read result json: %v", err)
+		}
+		if payload.Content != "b-content" {
+			t.Fatalf("file/read inside selected root = %q, want %q", payload.Content, "b-content")
+		}
+	})
+
+	t.Run("acp_file_read=refuses_outside_selected_root", func(t *testing.T) {
+		a, r, out, _, _ := newSwitchedRunner(t)
+		outside := filepath.Join(a.ProjectRoot(), "old.txt")
+		if err := os.WriteFile(outside, []byte("old-content"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		r.dispatch(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "read",
+			Method:  "file/read",
+			Params:  json.RawMessage(`{"path":` + strconv.Quote(outside) + `}`),
+		})
+		line := drainedLines(t, r, out, 1)[0]
+		var resp Response
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("response json: %v", err)
+		}
+		if resp.Error == nil {
+			t.Fatalf("file/read outside selected root succeeded with %+v, want boundary refusal", resp.Result)
+		}
+	})
+
+	t.Run("acp_no_session=falls_back_to_owner_project", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		ownerRoot := a.ProjectRoot()
+
+		r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "list", Method: "session/list"})
+		line := drainedLines(t, r, out, 1)[0]
+		var resp Response
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("list response json: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("session/list with no session errored: %+v", resp.Error)
+		}
+		data, err := json.Marshal(resp.Result)
+		if err != nil {
+			t.Fatalf("session/list result marshal: %v", err)
+		}
+		var got []agent.SessionSummary
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatalf("session/list result json: %v", err)
+		}
+		want, err := a.SessionListForProjectPath(ownerRoot, "active")
+		if err != nil {
+			t.Fatalf("SessionListForProjectPath: %v", err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("session/list with no session returned %d sessions, want owner project's %d", len(got), len(want))
+		}
+		for i := range want {
+			if got[i].ID != want[i].ID {
+				t.Fatalf("session/list[%d] = %q, want owner project session %q", i, got[i].ID, want[i].ID)
+			}
+		}
+		out.Reset()
+
+		inside := filepath.Join(ownerRoot, "readme.txt")
+		if err := os.WriteFile(inside, []byte("owner-content"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		r.dispatch(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "read",
+			Method:  "file/read",
+			Params:  json.RawMessage(`{"path":` + strconv.Quote(inside) + `}`),
+		})
+		line = drainedLines(t, r, out, 1)[0]
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("read response json: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("file/read inside owner root with no session errored: %+v", resp.Error)
+		}
+		out.Reset()
+
+		r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "new", Method: "session/new"})
+		lines := drainedLines(t, r, out, 2)
+		assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+		summary := acpSessionSummaryFromResponse(t, lines[1])
+		if summary.ID == "" {
+			t.Fatal("session/new returned no session")
+		}
+		if summary.ProjectPath != ownerRoot {
+			t.Fatalf("session/new with no session created in project %q, want owner project %q", summary.ProjectPath, ownerRoot)
+		}
+	})
+}
+
 func TestACPClearRemovedCurrent(t *testing.T) {
 	for _, tc := range []struct {
 		name string

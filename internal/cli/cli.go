@@ -1691,6 +1691,10 @@ func (c *CLI) cmdResume(parts []string) {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
+		// The free-text id can resolve in another project; commit the destination
+		// project so later project-scoped commands route to it. The owner resolves
+		// the session against its project, so the summary always carries one.
+		c.scope.SetProjectPath(summary.ProjectPath)
 		c.setCurrentSessionID(summary.ID)
 		c.refreshSession()
 		return

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 // App.ReadFileContent (the Wails-bound surface) is a passthrough to
@@ -310,6 +312,224 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestAdapterExplicitSessionTargetingContract proves a cross-project session
+// switch commits the destination project on the Wails host, so every later
+// project-scoped route resolves to it rather than the previous project.
+func TestAdapterExplicitSessionTargetingContract(t *testing.T) {
+	t.Run("project_current=cross_project_session_switch_reports_B", func(t *testing.T) {
+		svc := newAppTestAgent(t)
+		startupID, err := svc.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession startup: %v", err)
+		}
+		otherRoot := t.TempDir()
+		otherID, err := svc.NewSessionForProjectPath(otherRoot, "primary")
+		if err != nil {
+			t.Fatalf("NewSessionForProjectPath: %v", err)
+		}
+		wantOther, err := svc.ProjectCurrentForPath(otherRoot)
+		if err != nil {
+			t.Fatalf("other project: %v", err)
+		}
+		if wantOther.ID == "" {
+			t.Fatal("test setup: destination project record missing")
+		}
+		app := newTestApp(svc)
+		app.setCurrentSessionID(startupID)
+		if err := app.SessionSwitch(otherID); err != nil {
+			t.Fatalf("SessionSwitch: %v", err)
+		}
+		if got := app.ProjectCurrent().ID; got != wantOther.ID {
+			t.Fatalf("ProjectCurrent after cross-project switch = %q, want %q", got, wantOther.ID)
+		}
+	})
+
+	t.Run("project_list=cross_project_switch_keeps_list", func(t *testing.T) {
+		svc := newAppTestAgent(t)
+		startupID, err := svc.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession startup: %v", err)
+		}
+		otherRoot := t.TempDir()
+		otherID, err := svc.NewSessionForProjectPath(otherRoot, "primary")
+		if err != nil {
+			t.Fatalf("NewSessionForProjectPath: %v", err)
+		}
+		app := newTestApp(svc)
+		app.setCurrentSessionID(startupID)
+		if err := app.SessionSwitch(otherID); err != nil {
+			t.Fatalf("SessionSwitch: %v", err)
+		}
+		sessions, err := app.SessionList("active")
+		if err != nil {
+			t.Fatalf("SessionList: %v", err)
+		}
+		if len(sessions) != 1 || sessions[0].ID != otherID {
+			t.Fatalf("SessionList after cross-project switch = %#v, want only %q", sessions, otherID)
+		}
+	})
+}
+
+// TestSessionSwitchUnreadableMetaStillRoutesDestination proves a session switch
+// routes to the destination project even when the destination's metadata is
+// unreadable: the owner resolves the unit against its project and carries that
+// project in the boundary summary, so the adapter commits the route instead of
+// losing it.
+func TestSessionSwitchUnreadableMetaStillRoutesDestination(t *testing.T) {
+	svc := newAppTestAgent(t)
+	startupID, err := svc.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	otherRoot := t.TempDir()
+	otherID, err := svc.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath: %v", err)
+	}
+	proj, err := svc.ProjectCurrentForPath(otherRoot)
+	if err != nil {
+		t.Fatalf("destination project: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(svc.Projects().SessionsRoot(proj.ID), otherID, "meta.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("corrupt destination meta: %v", err)
+	}
+
+	app := newTestApp(svc)
+	app.setCurrentSessionID(startupID)
+	if err := app.SessionSwitch(otherID); err != nil {
+		t.Fatalf("SessionSwitch: %v", err)
+	}
+	if got := app.routeProjectPath; got != otherRoot {
+		t.Fatalf("route after switch with unreadable meta = %q, want destination %q", got, otherRoot)
+	}
+	if got := app.ProjectCurrent().ID; got != proj.ID {
+		t.Fatalf("ProjectCurrent after switch = %q, want destination project %q", got, proj.ID)
+	}
+}
+
+// TestSessionSwitchArchivedSessionRoutesDestination proves the reactivation
+// boundary carries the destination project too: switching to an archived session
+// in another project whose metadata records no project path still routes to that
+// project, because the boundary builds from the same authoritative project as the
+// live-selection path.
+func TestSessionSwitchArchivedSessionRoutesDestination(t *testing.T) {
+	svc := newAppTestAgent(t)
+	startupID, err := svc.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	otherRoot := t.TempDir()
+	otherID, err := svc.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath: %v", err)
+	}
+	// The destination must be a persisted archived session, not a live unit, so
+	// the switch takes the reactivation branch; a complete turn keeps it from
+	// being discarded as an empty session when it closes.
+	if _, err := svc.AppendUserMessageToSession(otherID, "seed"); err != nil {
+		t.Fatalf("seed destination: %v", err)
+	}
+	if err := svc.SessionArchive(otherID); err != nil {
+		t.Fatalf("SessionArchive: %v", err)
+	}
+	proj, err := svc.ProjectCurrentForPath(otherRoot)
+	if err != nil {
+		t.Fatalf("destination project: %v", err)
+	}
+	metaPath := filepath.Join(svc.Projects().SessionsRoot(proj.ID), otherID, "meta.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read destination meta: %v", err)
+	}
+	var meta snapshot.SessionMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("unmarshal destination meta: %v", err)
+	}
+	meta.ProjectPath = ""
+	out, err := json.Marshal(&meta)
+	if err != nil {
+		t.Fatalf("marshal destination meta: %v", err)
+	}
+	if err := os.WriteFile(metaPath, out, 0o600); err != nil {
+		t.Fatalf("rewrite destination meta: %v", err)
+	}
+
+	app := newTestApp(svc)
+	app.setCurrentSessionID(startupID)
+	if err := app.SessionSwitch(otherID); err != nil {
+		t.Fatalf("SessionSwitch: %v", err)
+	}
+	if got := app.routeProjectPath; got != otherRoot {
+		t.Fatalf("route after switch to archived session with empty meta project = %q, want destination %q", got, otherRoot)
+	}
+	if got := app.ProjectCurrent().ID; got != proj.ID {
+		t.Fatalf("ProjectCurrent after switch = %q, want destination project %q", got, proj.ID)
+	}
+}
+
+// TestSessionSwitchArchivedStaleMetaRoutesActualProject proves the reactivation
+// boundary routes to the project the session actually lives in, not the project
+// its persisted metadata names: the unit is resolved from the session's real
+// directory, and that project is authoritative for the boundary even when the
+// metadata's path is nonempty and stale.
+func TestSessionSwitchArchivedStaleMetaRoutesActualProject(t *testing.T) {
+	svc := newAppTestAgent(t)
+	startupID, err := svc.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	otherRoot := t.TempDir()
+	otherID, err := svc.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath: %v", err)
+	}
+	// The destination must be a persisted archived session, not a live unit, so
+	// the switch takes the reactivation branch; a complete turn keeps it from
+	// being discarded as an empty session when it closes.
+	if _, err := svc.AppendUserMessageToSession(otherID, "seed"); err != nil {
+		t.Fatalf("seed destination: %v", err)
+	}
+	if err := svc.SessionArchive(otherID); err != nil {
+		t.Fatalf("SessionArchive: %v", err)
+	}
+	proj, err := svc.ProjectCurrentForPath(otherRoot)
+	if err != nil {
+		t.Fatalf("destination project: %v", err)
+	}
+	// The persisted metadata names a different project than the one the session
+	// physically lives under.
+	staleRoot := t.TempDir()
+	metaPath := filepath.Join(svc.Projects().SessionsRoot(proj.ID), otherID, "meta.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read destination meta: %v", err)
+	}
+	var meta snapshot.SessionMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("unmarshal destination meta: %v", err)
+	}
+	meta.ProjectPath = staleRoot
+	out, err := json.Marshal(&meta)
+	if err != nil {
+		t.Fatalf("marshal destination meta: %v", err)
+	}
+	if err := os.WriteFile(metaPath, out, 0o600); err != nil {
+		t.Fatalf("rewrite destination meta: %v", err)
+	}
+
+	app := newTestApp(svc)
+	app.setCurrentSessionID(startupID)
+	if err := app.SessionSwitch(otherID); err != nil {
+		t.Fatalf("SessionSwitch: %v", err)
+	}
+	if got := app.routeProjectPath; got != otherRoot {
+		t.Fatalf("route after switch to archived session with stale meta project = %q, want the project it lives in %q", got, otherRoot)
+	}
+	if got := app.ProjectCurrent().ID; got != proj.ID {
+		t.Fatalf("ProjectCurrent after switch = %q, want the project it lives in %q", got, proj.ID)
+	}
 }
 
 func TestProjectSwitchInPlaceKeepsOwnerAlive(t *testing.T) {

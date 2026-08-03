@@ -62,7 +62,7 @@ func assertConfinedTo(t *testing.T, token string, allowed ...string) {
 // access anywhere else would read or write routing off its lock.
 func TestWailsRoutingStateIsEncapsulated(t *testing.T) {
 	assertConfinedTo(t, "a.routeProjectPath",
-		"routeProjectPathCaptured", "routeProjectPathBounded", "ProjectSwitch", "SessionNew", "startup")
+		"routeProjectPathCaptured", "routeProjectPathBounded", "setRouteProjectPathLocked", "ProjectSwitch", "SessionNew", "startup")
 	assertConfinedTo(t, "a.routeCurrent",
 		"setCurrentSessionID", "clearRouteIfCurrent", "currentSessionID")
 }

@@ -384,7 +384,12 @@ func (r *Runner) dispatch(ctx context.Context, req Request) {
 	case "tokens/usage":
 		r.handleTokenUsage(req)
 	case "project/current":
-		r.respond(req.ID, r.projectCurrent())
+		out, err := r.projectCurrent()
+		if err != nil {
+			r.respondError(req.ID, -32000, err.Error())
+			return
+		}
+		r.respond(req.ID, out)
 	case "project/list":
 		list, err := r.agent.ProjectList()
 		if err != nil {
@@ -563,18 +568,35 @@ func (r *Runner) currentSessionSummary() agent.SessionSummary {
 // projectCurrent resolves the project of the connection's routing-current session.
 // ACP has no project-switch RPC, so the routing-current project is definitionally
 // the current session's project; resolving from it avoids the owner/backend current
-// and startup cwd, which do not track this connection's session switches.
-func (r *Runner) projectCurrent() agent.ProjectSummary {
+// and startup cwd, which do not track this connection's session switches. With no
+// current session the query has no truthful answer, so it errors like the other
+// no-current-session handlers rather than returning a zero-value project.
+func (r *Runner) projectCurrent() (agent.ProjectSummary, error) {
 	id, err := r.currentSession()
 	if err != nil {
-		return agent.ProjectSummary{}
+		return agent.ProjectSummary{}, err
 	}
 	summary, err := r.agent.SessionSummaryForSession(id)
 	if err != nil {
-		return agent.ProjectSummary{}
+		return agent.ProjectSummary{}, err
 	}
-	out, _ := r.agent.ProjectCurrentForPath(summary.ProjectPath)
-	return out
+	out, err := r.agent.ProjectCurrentForPath(summary.ProjectPath)
+	return out, err
+}
+
+// currentProjectPath resolves the project to scope a project-implicit operation to:
+// the connection's current session's project, else the owner-startup project — the
+// same fallback Run() uses before any session exists (acp.go:255-266).
+func (r *Runner) currentProjectPath() string {
+	id, err := r.currentSession()
+	if err != nil {
+		return r.agent.ProjectRoot()
+	}
+	summary, err := r.agent.SessionSummaryForSession(id)
+	if err != nil || strings.TrimSpace(summary.ProjectPath) == "" {
+		return r.agent.ProjectRoot()
+	}
+	return summary.ProjectPath
 }
 
 func (r *Runner) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
@@ -588,7 +610,7 @@ func (r *Runner) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
 }
 
 func (r *Runner) handleSessionNew(req Request) {
-	_, err := r.agent.NewSessionWithBoundary("", "primary", func(state agent.HydrationState) {
+	_, err := r.agent.NewSessionForProjectPathWithBoundary(r.currentProjectPath(), "primary", func(state agent.HydrationState) {
 		id := strings.TrimSpace(state.Session.ID)
 		r.setCurrentSessionID(id)
 		r.sendBoundary(Notification{
@@ -682,7 +704,7 @@ func (r *Runner) handleSessionList(req Request) {
 	if params.State == "" {
 		params.State = "active"
 	}
-	list, err := r.agent.SessionList(params.State)
+	list, err := r.agent.SessionListForProjectPath(r.currentProjectPath(), params.State)
 	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return
@@ -895,7 +917,7 @@ func (r *Runner) handleFileRead(req Request) {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	content, err := r.agent.ReadFileContent(params.Path)
+	content, err := r.agent.ReadFileContentForProjectPath(r.currentProjectPath(), params.Path)
 	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return

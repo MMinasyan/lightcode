@@ -4023,9 +4023,26 @@ func sessionSummary(unit *session) SessionSummary {
 	}
 	meta, err := unit.store.Meta()
 	if err != nil {
-		return SessionSummary{ID: unit.store.SessionID()}
+		// The metadata read failure stays suppressed to the bare id here, but the
+		// unit is already resolved against its project; carry that project so a
+		// selection boundary and an open-session result keep routing the adapter
+		// to the destination instead of reporting no project at all.
+		return SessionSummary{ID: unit.store.SessionID(), ProjectPath: unit.projectRoot}
 	}
-	return sessionSummaryFromMeta(meta)
+	return sessionSummaryFromUnit(unit, meta)
+}
+
+// sessionSummaryFromUnit builds a session summary from an already-read meta
+// record, taking the project from the resolved unit unconditionally: the unit is
+// resolved from the session's actual project directory, while the persisted
+// metadata's project path is unvalidated and can be nonempty and stale. Every
+// boundary builder and the open-session result build through it, so a selection
+// always routes to the project the session actually lives in, for empty, stale
+// and correct metadata alike.
+func sessionSummaryFromUnit(unit *session, meta snapshot.SessionMeta) SessionSummary {
+	out := sessionSummaryFromMeta(meta)
+	out.ProjectPath = unit.projectRoot
+	return out
 }
 
 // sessionSummaryFromMeta builds a session summary from an already-read meta record, so
@@ -4202,8 +4219,9 @@ func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummar
 		}
 		// Prebuild the summary from the meta already read; the reactivation below flips
 		// an archived session active, so reflect that here rather than re-reading meta
-		// after the durable commit.
-		prebuiltSummary = sessionSummaryFromMeta(meta)
+		// after the durable commit. The unit's resolved project is authoritative, so
+		// the boundary agrees with the live-selection path by construction.
+		prebuiltSummary = sessionSummaryFromUnit(unit, meta)
 		if reactivate {
 			prebuiltSummary.State = snapshot.StateActive
 			prebuiltSummary.ArchivedAt = 0
@@ -4401,7 +4419,7 @@ func (a *Agent) newSession(projectID string, agentType string, emit func(Hydrati
 			store.Detach()
 			return "", cleanupStaging(stagingRoot, fmt.Errorf("read session meta: %w", merr))
 		}
-		prebuiltSummary = sessionSummaryFromMeta(meta)
+		prebuiltSummary = sessionSummaryFromUnit(unit, meta)
 	}
 	// Durable commit: the atomic rename publishes the candidate into the
 	// sessions root. The receiver keeps the claim on the published session, and
