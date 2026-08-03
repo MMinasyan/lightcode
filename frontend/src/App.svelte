@@ -507,7 +507,9 @@
   {/if}
 
   {#if currentPermission}
-    <PermissionPrompt permission={currentPermission} onDone={(id) => { permissions = removePermission(permissions, id); }} on:error={(e) => showError(e.detail)} />
+    {#key currentPermission.id}
+      <PermissionPrompt permission={currentPermission} onDone={(id) => { permissions = removePermission(permissions, id); }} on:error={(e) => showError(e.detail)} />
+    {/key}
   {/if}
   {#if showTokens}
     <TokenDetails {tokens} on:close={() => showTokens=false} />
