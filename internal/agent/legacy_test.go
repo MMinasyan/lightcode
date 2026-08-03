@@ -69,7 +69,7 @@ func (a *Agent) Submit(ctx context.Context, content string) (SubmitResult, error
 			return SubmitResult{}, err
 		}
 	}
-	return a.ensureRuntime().submit(ctx, a.session, content)
+	return a.ensureRuntime().submit(ctx, a.session, content, nil)
 }
 
 // QueueSnapshot returns a versioned copy of the current queue, for adapter

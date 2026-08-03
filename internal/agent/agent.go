@@ -2446,6 +2446,16 @@ func (a *Agent) ensureSession() error {
 // --- Public methods (the service API) ---
 
 func (a *Agent) SubmitToSession(ctx context.Context, sessionID string, content string) (SubmitResult, error) {
+	return a.SubmitToSessionWithBoundary(ctx, sessionID, content, nil)
+}
+
+// SubmitToSessionWithBoundary is SubmitToSession that fires admitted under the
+// runtime mutex at the point admission becomes certain — after the turn claim
+// for an immediate start, after the queue-append decision for a queued submit,
+// and before any event for that submit is emitted — so an adapter can commit
+// routing state ordered ahead of the submit's own frames. A submit that fails
+// never fires it. SubmitToSession passes nil.
+func (a *Agent) SubmitToSessionWithBoundary(ctx context.Context, sessionID string, content string, admitted func()) (SubmitResult, error) {
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	unit, err := a.liveSessionLocked(sessionID)
@@ -2453,10 +2463,10 @@ func (a *Agent) SubmitToSession(ctx context.Context, sessionID string, content s
 	if err != nil {
 		return SubmitResult{}, err
 	}
-	return rt.submit(ctx, unit, content)
+	return rt.submit(ctx, unit, content, admitted)
 }
 
-func (rt *runtime) submit(ctx context.Context, unit *session, content string) (SubmitResult, error) {
+func (rt *runtime) submit(ctx context.Context, unit *session, content string, admitted func()) (SubmitResult, error) {
 	a := rt.agent
 	rt.mu.Lock()
 	if unit == nil {
@@ -2477,6 +2487,9 @@ func (rt *runtime) submit(ctx context.Context, unit *session, content string) (S
 			rt.mu.Unlock()
 			return SubmitResult{}, err
 		}
+		if admitted != nil {
+			admitted()
+		}
 		version := unit.queueVersion
 		rt.mu.Unlock()
 		turn := rt.launchTurn(ctx, unit, turnCtx, cancel, []string{content})
@@ -2490,6 +2503,9 @@ func (rt *runtime) submit(ctx context.Context, unit *session, content string) (S
 	version := unit.queueVersion
 	sessionID := sessionIDOf(unit)
 	projectID := unit.projectID
+	if admitted != nil {
+		admitted()
+	}
 	// Enqueue the queue-changed event inside the runtime.mu section that bumped the
 	// version, so a navigation capture reads a queue snapshot consistent with the
 	// events it delivers.

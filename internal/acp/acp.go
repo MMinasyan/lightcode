@@ -642,16 +642,22 @@ func (r *Runner) handleSessionPrompt(ctx context.Context, req Request) {
 			r.respondError(req.ID, -32000, err.Error())
 			return
 		}
-		prev, _ := r.currentSession()
-		r.setCurrentSessionID(sessionID)
-		if strings.TrimSpace(prev) != sessionID {
-			// Prompting an explicit different session switches presentation current
-			// too, FIFO-ordered ahead of this turn's events and without a
-			// client-visible boundary, so the turn's events reach the client.
-			r.enqueueFrame(outFrame{kind: frameAdvance, sessionID: sessionID})
-		}
 	}
-	res, err := r.agent.SubmitToSession(ctx, sessionID, params.Content)
+	// The implicit switch an explicit session_id performs commits routing
+	// current and advances presentation only inside submit admission, FIFO-ordered
+	// ahead of this turn's frames and without a client-visible boundary, so the
+	// turn's events reach the client. A submit that fails (a reserved unit or a
+	// closed runtime) never fires admitted and leaves routing and presentation on
+	// the previous session.
+	res, err := r.agent.SubmitToSessionWithBoundary(ctx, sessionID, params.Content, func() {
+		if strings.TrimSpace(params.SessionID) != "" {
+			prev, _ := r.currentSession()
+			r.setCurrentSessionID(sessionID)
+			if strings.TrimSpace(prev) != sessionID {
+				r.enqueueFrame(outFrame{kind: frameAdvance, sessionID: sessionID})
+			}
+		}
+	})
 	if err != nil {
 		r.respondError(req.ID, -32000, err.Error())
 		return

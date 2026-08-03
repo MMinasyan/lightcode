@@ -15,6 +15,7 @@ type AdapterService interface {
 
 	CurrentWarnings() []PromptWarning
 	SubmitToSession(context.Context, string, string) (SubmitResult, error)
+	SubmitToSessionWithBoundary(context.Context, string, string, func()) (SubmitResult, error)
 	QueueSnapshotForSession(string) (QueueState, error)
 	CancelSession(string) error
 	CompactNowForSession(context.Context, string) error

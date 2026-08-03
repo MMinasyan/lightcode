@@ -1026,6 +1026,221 @@ func TestACPOrderedDelivery(t *testing.T) {
 	}
 }
 
+// TestACPOrderedDeliveryContract is the session/prompt ordered-delivery
+// contract. The prompt's implicit switch boundary is invisible on the wire (an
+// advance frame with no payload), so it cannot be a row in the table-shaped
+// TestACPOrderedDelivery, whose success cells assert a visible boundary before
+// the response. Ordering is asserted through the boundary's effect: the
+// destination's first frames are delivered, and a submit that fails leaves
+// routing and presentation on the previous session.
+func TestACPOrderedDeliveryContract(t *testing.T) {
+	t.Run("session/prompt=success_advance_ahead_of_first_frames", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		firstID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession first: %v", err)
+		}
+		if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
+			t.Fatalf("append first: %v", err)
+		}
+		secondID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession second: %v", err)
+		}
+		if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+			t.Fatalf("append second: %v", err)
+		}
+
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		a.SetEventHandler(r.handleEvent)
+		r.setCurrentSessionID(firstID)
+		r.seedPresented(firstID)
+
+		// A live context admits the submit against the dead provider. The turn's
+		// first frame (turn_start) is enqueued synchronously inside the submit,
+		// ahead of the response; the turn itself fails fast in its goroutine and
+		// parks in the flush round-trip (whose consumer only runs after Init), so
+		// no further frames follow the response.
+		r.handleSessionPrompt(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"hi"}`),
+		})
+		r.drainForTest()
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+
+		// The invisible advance is adopted before the first written frame, so the
+		// destination's first frame — turn_start, emitted synchronously inside the
+		// submit — reaches the client instead of being filtered out, and it is
+		// delivered before the response. A commit-after-return ordering drops it.
+		turnStartIdx, responseIdx := -1, -1
+		for i, line := range lines {
+			var frame map[string]any
+			if err := json.Unmarshal([]byte(line), &frame); err != nil {
+				t.Fatalf("frame json: %v", err)
+			}
+			if m, _ := frame["method"].(string); m == "agent/turn_start" {
+				turnStartIdx = i
+			}
+			if _, ok := frame["id"]; ok {
+				responseIdx = i
+			}
+		}
+		if turnStartIdx < 0 {
+			t.Fatalf("no turn_start frame reached the client; frames: %q", out.String())
+		}
+		if responseIdx < 0 {
+			t.Fatalf("no success response among frames: %q", out.String())
+		}
+		if turnStartIdx > responseIdx {
+			t.Fatalf("turn_start frame (index %d) delivered after the response (index %d): %q", turnStartIdx, responseIdx, out.String())
+		}
+		if got := r.currentSessionSummary().ID; got != secondID {
+			t.Fatalf("routing current = %q, want %q", got, secondID)
+		}
+		r.mu.Lock()
+		presented := r.presented
+		r.mu.Unlock()
+		if presented != secondID {
+			t.Fatalf("presentation current = %q, want %q", presented, secondID)
+		}
+	})
+
+	t.Run("session/prompt=failure_routing_and_presentation_unchanged", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		firstID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession first: %v", err)
+		}
+		secondID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession second: %v", err)
+		}
+
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		r.setCurrentSessionID(firstID)
+		r.seedPresented(firstID)
+
+		// A closed runtime is the submit-side failure the id pre-check cannot
+		// see: the session is still resolvable, but rt.submit rejects admission.
+		a.ShutdownOwner()
+
+		r.handleSessionPrompt(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"hi"}`),
+		})
+		lines := drainedLines(t, r, out, 1)
+		assertACPErrorResponse(t, lines[0])
+		if got := r.currentSessionSummary().ID; got != firstID {
+			t.Fatalf("routing current = %q, want unchanged %q", got, firstID)
+		}
+		r.mu.Lock()
+		presented := r.presented
+		r.mu.Unlock()
+		if presented != firstID {
+			t.Fatalf("presentation current = %q, want unchanged %q", presented, firstID)
+		}
+	})
+
+	t.Run("session/prompt=success_queued_advance_ahead_of_queue_changed", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		firstID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession first: %v", err)
+		}
+		secondID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession second: %v", err)
+		}
+
+		// Make secondID busy with a real turn against the dead provider. The turn
+		// goroutine parks in the flush round-trip (whose consumer only runs after
+		// Init), so the unit stays busy and the next submit is queued, not
+		// started.
+		res, err := a.SubmitToSession(context.Background(), secondID, "first")
+		if err != nil {
+			t.Fatalf("SubmitToSession busy turn: %v", err)
+		}
+		if !res.Started {
+			t.Fatalf("busy turn was queued instead of started: %+v", res)
+		}
+
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		a.SetEventHandler(r.handleEvent)
+		r.setCurrentSessionID(firstID)
+		r.seedPresented(firstID)
+
+		// The targeted session is busy, so the submit queues; admission becomes
+		// certain at the queue append, where the implicit switch commits routing
+		// and advances presentation ahead of the queue-changed event for this
+		// submit.
+		r.handleSessionPrompt(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"queued"}`),
+		})
+		r.drainForTest()
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+
+		queueChangedIdx, responseIdx := -1, -1
+		for i, line := range lines {
+			var frame map[string]any
+			if err := json.Unmarshal([]byte(line), &frame); err != nil {
+				t.Fatalf("frame json: %v", err)
+			}
+			if m, _ := frame["method"].(string); m == "agent/queue_changed" {
+				queueChangedIdx = i
+			}
+			if _, ok := frame["id"]; ok {
+				responseIdx = i
+			}
+		}
+		// The advance is adopted before the first written frame, so the
+		// queue-changed event for this submit reaches the client instead of being
+		// filtered out, and it is delivered before the response. An admitted
+		// callback fired after the append drops it.
+		if queueChangedIdx < 0 {
+			t.Fatalf("no queue_changed frame reached the client; frames: %q", out.String())
+		}
+		if !strings.Contains(lines[queueChangedIdx], `"queued"`) {
+			t.Fatalf("queue_changed frame does not carry this submit's item: %q", lines[queueChangedIdx])
+		}
+		if responseIdx < 0 {
+			t.Fatalf("no success response among frames: %q", out.String())
+		}
+		if queueChangedIdx > responseIdx {
+			t.Fatalf("queue_changed frame (index %d) delivered after the response (index %d): %q", queueChangedIdx, responseIdx, out.String())
+		}
+		var resp Response
+		if err := json.Unmarshal([]byte(lines[responseIdx]), &resp); err != nil {
+			t.Fatalf("response json: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("queued prompt response error = %+v", resp.Error)
+		}
+		result, ok := resp.Result.(map[string]any)
+		if !ok {
+			t.Fatalf("queued prompt result not an object: %#v", resp.Result)
+		}
+		if started, _ := result["started"].(bool); started {
+			t.Fatalf("queued prompt response started = true, want queued (false)")
+		}
+		if got := r.currentSessionSummary().ID; got != secondID {
+			t.Fatalf("routing current = %q, want %q", got, secondID)
+		}
+		r.mu.Lock()
+		presented := r.presented
+		r.mu.Unlock()
+		if presented != secondID {
+			t.Fatalf("presentation current = %q, want %q", presented, secondID)
+		}
+	})
+}
+
 // TestACPStalledOutputPreservesBoundaryOrder proves that with the output drainer
 // stalled, the FIFO still delivers a queued source event, then the A->B boundary,
 // then the switch response, then a destination event in that exact order — and that
@@ -1174,9 +1389,10 @@ func TestACPPromptSelectsSession(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{agent: a, out: &out}
 	r.setCurrentSessionID(firstID)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	r.handleSessionPrompt(ctx, Request{
+	// A live context admits the submit, so the implicit switch commits inside
+	// admission; a cancelled context would fail the submit before the switch and
+	// the test would pass without exercising admission.
+	r.handleSessionPrompt(context.Background(), Request{
 		JSONRPC: "2.0",
 		ID:      "prompt",
 		Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"hello"}`),
@@ -1212,11 +1428,11 @@ func TestACPPromptSwitchAdvancesPresentation(t *testing.T) {
 	r.setCurrentSessionID(firstID)
 	r.seedPresented(firstID)
 
-	// The cancelled context fails the model call fast, but the explicit switch must
-	// still advance presentation current to secondID ahead of any turn events.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	r.handleSessionPrompt(ctx, Request{
+	// A live context admits the submit, so the implicit switch advances
+	// presentation current inside admission, ahead of any turn frames; a
+	// cancelled context would fail the submit before the switch and the test
+	// would pass without exercising admission.
+	r.handleSessionPrompt(context.Background(), Request{
 		JSONRPC: "2.0",
 		ID:      "prompt",
 		Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"hi"}`),
