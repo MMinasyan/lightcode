@@ -8,9 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
@@ -631,5 +633,116 @@ func TestArchiveNonCurrentKeepsView(t *testing.T) {
 				t.Fatalf("adapter current after %s = %q, want %q", tc.name, got, firstID)
 			}
 		})
+	}
+}
+
+// TestSessionStartupCandidateFallbackContract proves a contended startup
+// candidate does not spawn a spurious session: Init returns the id of the
+// session it actually resumed (skipping candidates whose claim another holder
+// owns), the adapter selects exactly that session, and a new session is
+// created only when nothing was resumed.
+func TestSessionStartupCandidateFallbackContract(t *testing.T) {
+	svc := newAppTestAgent(t)
+	proj, err := svc.Projects().Ensure()
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	sessionsRoot := svc.Projects().SessionsRoot(proj.ID)
+	projectsRoot := svc.Projects().Root()
+	projectRoot := svc.ProjectRoot()
+
+	seed := func(lastActivity int64) string {
+		t.Helper()
+		if err := svc.Store().AttachSessionsRoot(sessionsRoot, projectsRoot, proj.ID); err != nil {
+			t.Fatalf("attach sessions root: %v", err)
+		}
+		if err := svc.Store().BeginNewSession(projectRoot); err != nil {
+			t.Fatalf("begin session: %v", err)
+		}
+		id := svc.Store().SessionID()
+		if id == "" {
+			t.Fatal("seeded session id is empty")
+		}
+		raw, err := json.Marshal(message.NewText(message.RoleUser, "seed"))
+		if err != nil {
+			t.Fatalf("marshal message: %v", err)
+		}
+		if err := svc.Store().AppendMessage(1, raw); err != nil {
+			t.Fatalf("append message: %v", err)
+		}
+		if err := svc.Store().MarkTurnComplete(1); err != nil {
+			t.Fatalf("mark turn complete: %v", err)
+		}
+		if _, err := svc.Store().Close(); err != nil {
+			t.Fatalf("close session: %v", err)
+		}
+		stampSessionLastActivity(t, filepath.Join(sessionsRoot, id, "meta.json"), lastActivity)
+		return id
+	}
+
+	olderID := seed(time.Now().Unix() - 5)
+	newerID := seed(time.Now().Unix() - 2)
+
+	// The newest candidate is contended by a claim another holder owns; the
+	// older one is free. Both are durable root sessions, so the resume scan
+	// hits the contended one first.
+	claim, ok, err := snapshot.AcquireSessionClaim(projectsRoot, proj.ID, newerID)
+	if err != nil {
+		t.Fatalf("acquire claim: %v", err)
+	}
+	if !ok {
+		t.Fatal("test setup: newest session claim unexpectedly held")
+	}
+	defer claim.Release()
+
+	app := newTestApp(svc)
+	app.emitFn = func(string, any) {}
+	app.titleFn = func(string) {}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	app.startup(ctx)
+	defer app.shutdown(context.Background())
+
+	// The adapter is selected on the session actually resumed, not on the
+	// first listed (contended) one.
+	if got := app.SessionCurrent().ID; got != olderID {
+		t.Fatalf("adapter selected %q after startup, want the resumed session %q", got, olderID)
+	}
+
+	// No spurious session was created for the contended candidate.
+	sessions, err := svc.SessionListForProjectPath(app.routeProjectPath, "active")
+	if err != nil {
+		t.Fatalf("list active sessions: %v", err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("startup left %d active sessions, want exactly the two seeded", len(sessions))
+	}
+	for _, s := range sessions {
+		if s.ID == newerID || s.ID == olderID {
+			continue
+		}
+		t.Fatalf("spurious session %q created during startup", s.ID)
+	}
+}
+
+// stampSessionLastActivity rewrites a session's meta.json with a fixed
+// LastActivity so the newest-first resume scan order is deterministic.
+func stampSessionLastActivity(t *testing.T, metaPath string, lastActivity int64) {
+	t.Helper()
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read meta: %v", err)
+	}
+	var meta snapshot.SessionMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("unmarshal meta: %v", err)
+	}
+	meta.LastActivity = lastActivity
+	out, err := json.Marshal(&meta)
+	if err != nil {
+		t.Fatalf("marshal meta: %v", err)
+	}
+	if err := os.WriteFile(metaPath, out, 0o600); err != nil {
+		t.Fatalf("write meta: %v", err)
 	}
 }

@@ -65,6 +65,11 @@ type runtime struct {
 	onEvent func(Event)
 
 	initOnce sync.Once
+	// resumedSessionID is the session Init resumed, or "" when none was
+	// resumed. Init returns it so each adapter can adopt the resumed session as
+	// its interface-local selection; sync.Once cannot carry a return value, so
+	// the init body records it here and every caller of Do observes it.
+	resumedSessionID string
 	// lifecycleMu serializes identity-changing lifecycle operations
 	// (open/resume/new/fork/archive/delete/history-revert and each sweep
 	// candidate) so two cannot interleave preparation and publication. It is

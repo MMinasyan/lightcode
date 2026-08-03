@@ -107,7 +107,7 @@ func TestDurableIOAgainstOwnerLocks(t *testing.T) {
 
 		obs := probeOwnerLock(a, &a.ensureRuntime().lifecycleMu)
 		defer func() { obs() }()
-		if err := a.resumeMostRecent(); err != nil {
+		if _, err := a.resumeMostRecent(); err != nil {
 			t.Fatalf("resume: %v", err)
 		}
 		got := obs()

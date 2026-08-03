@@ -969,18 +969,21 @@ func (rt *runtime) setEventHandler(fn func(Event)) {
 
 // Init starts background goroutines, runs the session sweep, and
 // resumes the most recent session if one exists. ctx controls the
-// agent's lifetime.
-func (a *Agent) Init(ctx context.Context) {
-	a.ensureRuntime().init(ctx)
+// agent's lifetime. It returns the id of the session it resumed, or ""
+// when none was resumed, so the adapter can adopt that session as its
+// startup selection instead of re-deriving one from a listing.
+func (a *Agent) Init(ctx context.Context) string {
+	return a.ensureRuntime().init(ctx)
 }
 
-func (rt *runtime) init(ctx context.Context) {
+func (rt *runtime) init(ctx context.Context) string {
 	rt.initOnce.Do(func() {
-		rt.initOnceLocked(ctx)
+		rt.resumedSessionID = rt.initOnceLocked(ctx)
 	})
+	return rt.resumedSessionID
 }
 
-func (rt *runtime) initOnceLocked(ctx context.Context) {
+func (rt *runtime) initOnceLocked(ctx context.Context) string {
 	a := rt.agent
 	// The background goroutines run on an owned context. An explicit shutdown
 	// (ShutdownOwner) cancels it after the in-flight turn join so the drainer
@@ -995,7 +998,8 @@ func (rt *runtime) initOnceLocked(ctx context.Context) {
 		_ = a.memoryHooks.Reconcile()
 	}
 	a.runSweep()
-	if err := a.resumeMostRecent(); err != nil {
+	resumed, err := a.resumeMostRecent()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: resume session: %v\n", err)
 	}
 	go func() { defer rt.bgWG.Done(); a.periodicSweep(rt.ownerCtx) }()
@@ -1037,6 +1041,7 @@ func (rt *runtime) initOnceLocked(ctx context.Context) {
 	a.ensureRuntime().mu.Lock()
 	a.setWarningGroup("setup", a.setupWarningsLocked())
 	a.ensureRuntime().mu.Unlock()
+	return resumed
 }
 
 func (a *Agent) emitEvent(ev Event) {
@@ -2060,15 +2065,20 @@ func (a *Agent) CompactNowForSession(ctx context.Context, sessionID string) erro
 	return a.runCompactionForSession(compactCtx, unit, false)
 }
 
-func (a *Agent) resumeMostRecent() error {
+// resumeMostRecent scans active root sessions newest-first and resumes the
+// first whose claim is acquirable, returning its id. A contended, corrupt, or
+// unreadable candidate, or one whose history fails to load, releases its
+// provisional claim and does not stop the scan. It returns ("", nil) when no
+// candidate was resumed, and ("", err) on failure.
+func (a *Agent) resumeMostRecent() (string, error) {
 	defer a.lockLifecycle()()
 	proj, err := a.projects.Current()
 	if err != nil || proj == nil {
-		return err
+		return "", err
 	}
 	sessionsRoot := a.projects.SessionsRoot(proj.ID)
 	if err := a.store.AttachSessionsRoot(sessionsRoot, a.projects.Root(), proj.ID); err != nil {
-		return err
+		return "", err
 	}
 	// Candidate enumeration and loading run under the lifecycle lock: the
 	// listing and history reads are durable and fallible, but re-validating
@@ -2078,7 +2088,7 @@ func (a *Agent) resumeMostRecent() error {
 	a.fireDurableReadHook()
 	candidates, err := snapshot.List(sessionsRoot, "", snapshot.StateActive)
 	if err != nil {
-		return err
+		return "", err
 	}
 	rt := a.ensureRuntime()
 	resumed := false
@@ -2102,14 +2112,14 @@ func (a *Agent) resumeMostRecent() error {
 		a.setSessionProject(a.session, proj)
 		if err := a.setCurrentSessionLocked(a.session); err != nil {
 			rt.mu.Unlock()
-			return err
+			return "", err
 		}
 		rt.mu.Unlock()
 		resumed = true
 		break
 	}
 	if !resumed {
-		return nil // no candidate opened; the adapter creates a new session
+		return "", nil // no candidate opened; the adapter creates a new session
 	}
 	a.resetFileTracker()
 	a.loadTokensFromDisk()
@@ -2122,11 +2132,11 @@ func (a *Agent) resumeMostRecent() error {
 		fmt.Fprintf(os.Stderr, "lightcode: reload config on resume: %v\n", err)
 		a.restoreModelFromSession()
 		rt.mu.Unlock()
-		return nil
+		return sessionIDOf(a.session), nil
 	}
 	a.restoreModelFromSession()
 	rt.mu.Unlock()
-	return nil
+	return sessionIDOf(a.session), nil
 }
 
 func (a *Agent) resetFileTracker() {

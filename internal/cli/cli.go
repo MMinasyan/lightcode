@@ -489,13 +489,10 @@ func (c *CLI) Run(ctx context.Context) error {
 
 	c.agent.SetEventHandler(c.enqueueEvent)
 
-	c.agent.Init(ctx)
-	sessionID := ""
-	if sessions, err := c.scope.SessionList("active"); err == nil && len(sessions) > 0 {
-		if summary, err := c.agent.OpenSession(sessions[0].ID); err == nil {
-			sessionID = summary.ID
-		}
-	}
+	// Init resumes the most recent acquirable session and returns its id, so
+	// the adapter adopts exactly the session that was resumed; a new session
+	// is created only when nothing was resumed.
+	sessionID := c.agent.Init(ctx)
 	if sessionID == "" {
 		if id, err := c.scope.NewSession("primary"); err == nil {
 			sessionID = id

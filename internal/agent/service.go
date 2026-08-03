@@ -9,7 +9,9 @@ import (
 // AdapterService is the owner surface used by user-facing adapters.
 type AdapterService interface {
 	SetEventHandler(func(Event))
-	Init(context.Context)
+	// Init starts the owner and returns the id of the session it resumed,
+	// or "" when none was resumed — the adapter's startup selection.
+	Init(context.Context) string
 
 	CurrentWarnings() []PromptWarning
 	SubmitToSession(context.Context, string, string) (SubmitResult, error)

@@ -252,13 +252,10 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	r.startOutput()
 	r.agent.SetEventHandler(r.handleEvent)
-	r.agent.Init(ctx)
-	sessionID := ""
-	if sessions, err := r.agent.SessionList("active"); err == nil && len(sessions) > 0 {
-		if summary, err := r.agent.OpenSession(sessions[0].ID); err == nil {
-			sessionID = summary.ID
-		}
-	}
+	// Init resumes the most recent acquirable session and returns its id, so
+	// the adapter adopts exactly the session that was resumed; a new session
+	// is created only when nothing was resumed.
+	sessionID := r.agent.Init(ctx)
 	if sessionID == "" {
 		if id, err := r.agent.NewSession("", "primary"); err == nil {
 			sessionID = id

@@ -147,14 +147,11 @@ func (a *App) startup(ctx context.Context) {
 	defer a.navMu.Unlock()
 	a.startDelivery()
 	a.svc.SetEventHandler(a.handleEvent)
-	a.svc.Init(hostCtx)
+	// Init resumes the most recent acquirable session and returns its id, so
+	// the adapter adopts exactly the session that was resumed; a new session
+	// is created only when nothing was resumed.
+	sessionID := a.svc.Init(hostCtx)
 	a.routeProjectPath = a.svc.ProjectRoot()
-	sessionID := ""
-	if sessions, err := a.svc.SessionListForProjectPath(a.routeProjectPath, "active"); err == nil && len(sessions) > 0 {
-		if summary, err := a.svc.OpenSession(sessions[0].ID); err == nil {
-			sessionID = summary.ID
-		}
-	}
 	if sessionID == "" {
 		if id, err := a.svc.NewSessionForProjectPath(a.routeProjectPath, "primary"); err == nil {
 			sessionID = id
