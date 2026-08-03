@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
@@ -36,7 +35,7 @@ type HydrationState struct {
 	Errors      []HydrationRow       `json:"errors"`
 	Cursor      HydrationCursor      `json:"cursor"`
 	Tokens      TokenReport          `json:"tokens"`
-	Model       coremodel.ModelRef   `json:"model"`
+	Model       ModelInfo            `json:"model"`
 	Busy        bool                 `json:"busy"`
 	Compacting  bool                 `json:"compacting"`
 	Queue       QueueState           `json:"queue"`

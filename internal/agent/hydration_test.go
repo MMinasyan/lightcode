@@ -2,8 +2,6 @@ package agent
 
 import (
 	"testing"
-
-	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 )
 
 // TestHydrationStateFromCompleteState verifies the conversion maps every captured
@@ -18,7 +16,7 @@ func TestHydrationStateFromCompleteState(t *testing.T) {
 			revision:  captureRevision{committedTurn: 1, committedSeq: 4, rewriteEpoch: 2},
 		},
 		tokens:      TokenReport{Total: TokenEntry{Input: 7}},
-		model:       coremodel.ModelRef{Provider: "p", Model: "m"},
+		model:       ModelInfo{Ref: "p/m", Provider: "p", Model: "m"},
 		busy:        true,
 		compacting:  true,
 		queue:       QueueState{Items: []QueuedItem{{ID: "q1"}}, Version: 3},
@@ -46,8 +44,8 @@ func TestHydrationStateFromCompleteState(t *testing.T) {
 	if hs.Tokens.Total.Input != 7 {
 		t.Fatalf("tokens = %+v", hs.Tokens)
 	}
-	if hs.Model.Provider != "p" || hs.Model.Model != "m" {
-		t.Fatalf("model = %+v", hs.Model)
+	if hs.Model.Ref != "p/m" || hs.Model.Provider != "p" || hs.Model.Model != "m" {
+		t.Fatalf("model = %+v, want resolved p/m", hs.Model)
 	}
 	if !hs.Busy || !hs.Compacting {
 		t.Fatalf("activity busy=%v compacting=%v", hs.Busy, hs.Compacting)
@@ -75,6 +73,13 @@ func TestHydrateSessionResolvesAndCaptures(t *testing.T) {
 	}
 	if hs.Session.ID != id {
 		t.Fatalf("hydrated session = %q, want %q", hs.Session.ID, id)
+	}
+	// The captured state carries the resolved model shape — identifier plus
+	// catalog display name — so a snapshot-applying adapter can present the
+	// session's model without a separate fetch.
+	if hs.Model.Ref != "test/test-model" || hs.Model.Provider != "test" || hs.Model.Model != "test-model" ||
+		hs.Model.DisplayName != "Test Model" || hs.Model.ContextWindow != 8192 {
+		t.Fatalf("hydrated model = %+v, want resolved test/test-model (Test Model)", hs.Model)
 	}
 
 	if _, err := a.HydrateSession("missing-session"); err == nil {

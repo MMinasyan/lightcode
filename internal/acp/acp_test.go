@@ -1744,6 +1744,56 @@ func TestACPSwitchKeepsCurrent(t *testing.T) {
 	}
 }
 
+// TestACPSessionChangedCarriesResolvedModel proves the serialized
+// agent/session_changed notification carries the destination session's model as
+// the resolved object — identifier plus display name — not a bare
+// provider/model string. The protocol host forwards the same captured state the
+// desktop adapter hydrates from, so a third-party client can render the
+// selector from the notification alone; decoding the wire params into the full
+// hydration state must yield the resolved model.
+func TestACPSessionChangedCarriesResolvedModel(t *testing.T) {
+	a := newACPTestAgent(t)
+	// The ACP test config declares no agents.json, so the primary agent type
+	// has no model; bootstrap it through the adapter-facing method.
+	if err := a.SetDefaultModel("test/test-model"); err != nil {
+		t.Fatalf("SetDefaultModel: %v", err)
+	}
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: a, owner: a, out: &out}
+	r.setCurrentSessionID(secondID)
+	r.handleSessionSwitch(Request{
+		JSONRPC: "2.0",
+		ID:      "switch",
+		Params:  json.RawMessage(`{"id":"` + firstID + `"}`),
+	})
+
+	lines := drainedLines(t, r, &out, 2)
+	var notif Notification
+	if err := json.Unmarshal([]byte(lines[0]), &notif); err != nil {
+		t.Fatalf("notification json: %v", err)
+	}
+	if notif.Method != "agent/session_changed" {
+		t.Fatalf("notification method = %q, want session_changed", notif.Method)
+	}
+	state := hydrationStateFromParams(t, notif.Params)
+	if state.Session.ID != firstID {
+		t.Fatalf("notification session = %q, want %q", state.Session.ID, firstID)
+	}
+	if state.Model.Ref != "test/test-model" || state.Model.Provider != "test" || state.Model.Model != "test-model" ||
+		state.Model.DisplayName != "Test Model" || state.Model.ContextWindow != 8192 {
+		t.Fatalf("notification model = %+v, want resolved test/test-model (Test Model)", state.Model)
+	}
+}
+
 func TestACPStaleCurrent(t *testing.T) {
 	a := newACPTestAgent(t)
 	_ = appendACPUserTurn(t, a, "gone")
@@ -2444,6 +2494,22 @@ func sessionPayloadFromParams(t *testing.T, params any) agent.SessionPayload {
 		t.Fatalf("unmarshal session payload: %v", err)
 	}
 	return payload
+}
+
+// hydrationStateFromParams decodes a notification's wire params into the full
+// captured state so tests can assert classes SessionPayload discards (model,
+// queue, warnings, permissions).
+func hydrationStateFromParams(t *testing.T, params any) agent.HydrationState {
+	t.Helper()
+	data, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var state agent.HydrationState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("unmarshal hydration state: %v", err)
+	}
+	return state
 }
 
 func promptWarningsFromResponse(t *testing.T, resp Response) []agent.PromptWarning {

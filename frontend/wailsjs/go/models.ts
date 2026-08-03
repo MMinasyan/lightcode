@@ -342,6 +342,48 @@ export namespace agent {
 		    return a;
 		}
 	}
+	export class ModelInfo {
+	    ref: string;
+	    provider: string;
+	    model: string;
+	    displayName: string;
+	    contextWindow: number;
+	    cost?: catalog.Cost;
+	    incomplete: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new ModelInfo(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ref = source["ref"];
+	        this.provider = source["provider"];
+	        this.model = source["model"];
+	        this.displayName = source["displayName"];
+	        this.contextWindow = source["contextWindow"];
+	        this.cost = this.convertValues(source["cost"], catalog.Cost);
+	        this.incomplete = source["incomplete"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class TokenEntry {
 	    provider: string;
 	    model: string;
@@ -431,7 +473,7 @@ export namespace agent {
 	    errors: HydrationRow[];
 	    cursor: HydrationCursor;
 	    tokens: TokenReport;
-	    model: coremodel.ModelRef;
+	    model: ModelInfo;
 	    busy: boolean;
 	    compacting: boolean;
 	    queue: QueueState;
@@ -450,7 +492,7 @@ export namespace agent {
 	        this.errors = this.convertValues(source["errors"], HydrationRow);
 	        this.cursor = this.convertValues(source["cursor"], HydrationCursor);
 	        this.tokens = this.convertValues(source["tokens"], TokenReport);
-	        this.model = this.convertValues(source["model"], coremodel.ModelRef);
+	        this.model = this.convertValues(source["model"], ModelInfo);
 	        this.busy = source["busy"];
 	        this.compacting = source["compacting"];
 	        this.queue = this.convertValues(source["queue"], QueueState);
@@ -588,48 +630,7 @@ export namespace agent {
 		    return a;
 		}
 	}
-	export class ModelInfo {
-	    ref: string;
-	    provider: string;
-	    model: string;
-	    displayName: string;
-	    contextWindow: number;
-	    cost?: catalog.Cost;
-	    incomplete: boolean;
 
-	    static createFrom(source: any = {}) {
-	        return new ModelInfo(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.ref = source["ref"];
-	        this.provider = source["provider"];
-	        this.model = source["model"];
-	        this.displayName = source["displayName"];
-	        this.contextWindow = source["contextWindow"];
-	        this.cost = this.convertValues(source["cost"], catalog.Cost);
-	        this.incomplete = source["incomplete"];
-	    }
-
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
 	export class ModelListEntry {
 	    ref: string;
 	    provider: string;
@@ -1124,25 +1125,6 @@ export namespace catalog {
 	        this.family = source["family"];
 	        this.must_preserve = source["must_preserve"];
 	        this.drop = source["drop"];
-	    }
-	}
-
-}
-
-export namespace coremodel {
-
-	export class ModelRef {
-	    Provider: string;
-	    Model: string;
-
-	    static createFrom(source: any = {}) {
-	        return new ModelRef(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.Provider = source["Provider"];
-	        this.Model = source["Model"];
 	    }
 	}
 

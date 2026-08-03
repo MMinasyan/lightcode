@@ -285,6 +285,31 @@ func TestWailsModelSwitchAppendsOrderedPresentationItem(t *testing.T) {
 	}
 }
 
+// TestSnapshotCarriesModelAndProjectSwitchFetchesNone proves the hydration
+// snapshot applies the destination's resolved model alongside the rest of the
+// session classes, and that a project switch never fetches the current model
+// out of band: the destination's navigation boundary carries its model, and an
+// out-of-band CurrentModel would surface the destination's model before its
+// boundary does.
+func TestSnapshotCarriesModelAndProjectSwitchFetchesNone(t *testing.T) {
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	body, ok := extractSvelteFunctionBody(svelte, "function applySnapshot(")
+	if !ok {
+		t.Fatal("applySnapshot not found in App.svelte")
+	}
+	if !strings.Contains(body, "modelRef =") || !strings.Contains(body, "modelName =") {
+		t.Fatal("applySnapshot must apply the destination session's resolved model to the selector")
+	}
+
+	switched, ok := extractSvelteFunctionBody(svelte, "async function handleProjectSwitched(")
+	if !ok {
+		t.Fatal("handleProjectSwitched not found in App.svelte")
+	}
+	if strings.Contains(switched, "CurrentModel(") || strings.Contains(switched, "refreshCurrentModel(") {
+		t.Fatal("handleProjectSwitched must not fetch the current model out of band; the navigation boundary carries the destination's model")
+	}
+}
+
 func TestProjectSwitchDoesNotCloseOwnerSession(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
 	if strings.Contains(app, "CloseForProjectSwitch") || strings.Contains(app, "close current session") {

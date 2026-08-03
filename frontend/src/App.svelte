@@ -170,6 +170,13 @@
     messageQueue = (hs.queue?.items || []).map((it) => ({ _id: it.id, content: it.content }));
     warnings = hs.warnings || [];
     permissions = seedPermissions(hs.permissions);
+    // The captured state carries the resolved model (identifier plus display
+    // name, matching the live model item), so the selector follows the
+    // destination session's model; it degrades to the bare ref when the
+    // catalog has no entry.
+    const m = hs.model || {};
+    modelRef = m.ref || ((m.provider && m.model) ? `${m.provider}/${m.model}` : '');
+    modelName = m.displayName || modelRef;
   }
 
   async function hydrate() {
@@ -427,8 +434,10 @@
   }
 
   async function handleProjectSwitched() {
+    // The destination's model rides the ordered navigation boundary the switch
+    // delivers, which the snapshot applies; no out-of-band fetch that could
+    // surface it before its boundary does.
     try { projectName = await ProjectName(); } catch (e) { showError(e, 'Load project failed'); }
-    await refreshCurrentModel();
   }
 
   async function handleRevertCode(e) {

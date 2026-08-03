@@ -1211,8 +1211,8 @@ func TestCaptureStateReadsAllLiveClasses(t *testing.T) {
 	if !st.compacting {
 		t.Fatal("compacting not captured")
 	}
-	if st.model.Provider != "p" || st.model.Model != "m" {
-		t.Fatalf("model = %+v, want p/m", st.model)
+	if st.model.Ref != "p/m" || st.model.Provider != "p" || st.model.Model != "m" {
+		t.Fatalf("model = %+v, want resolved p/m", st.model)
 	}
 	if st.tokens.Total.Input != 11 {
 		t.Fatalf("tokens total input = %d, want 11", st.tokens.Total.Input)

@@ -4898,7 +4898,7 @@ func (a *Agent) messagesForFrontendForSession(sessionID string) ([]DisplayMessag
 type completeState struct {
 	transcript  completeTranscript
 	tokens      TokenReport
-	model       coremodel.ModelRef
+	model       ModelInfo
 	busy        bool
 	compacting  bool
 	queue       QueueState
@@ -4997,7 +4997,11 @@ func (a *Agent) captureUnderLocksRTHeld(unit *session, committed []DisplayMessag
 
 	busy := unit.busy
 	compacting := unit.compacting
-	model := unit.currentRef
+	// The resolved model shape: identifier plus catalog display name, built with
+	// the same helper CurrentModel uses so the captured state and the live model
+	// event speak one shape. It degrades to the bare ref when the catalog has no
+	// entry (or the session has no model), so this needs no error path.
+	model := a.modelInfo(unit.currentRef)
 	queue := rt.queueSnapshotLocked(unit)
 	var permissions []permission.Request
 	if a.gate != nil {
