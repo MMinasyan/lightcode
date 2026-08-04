@@ -646,7 +646,7 @@ func (c *CLI) handleKey(k keyMsg) error {
 	case stateStreaming:
 		c.handleKeyStreaming(k)
 	case statePermission:
-		c.handleKeyPermission(k)
+		return c.handleKeyPermission(k)
 	case stateMenu:
 	}
 	return nil
@@ -796,9 +796,9 @@ func (c *CLI) handleKeyStreaming(k keyMsg) {
 	}
 }
 
-func (c *CLI) handleKeyPermission(k keyMsg) {
+func (c *CLI) handleKeyPermission(k keyMsg) error {
 	if len(c.permQueue) == 0 {
-		return
+		return nil
 	}
 
 	req := c.permQueue[0]
@@ -809,19 +809,18 @@ func (c *CLI) handleKeyPermission(k keyMsg) {
 			c.permSelected--
 			c.redrawPermissionBlock(req)
 		}
-		return
+		return nil
 	case keyDown:
 		if c.permSelected < permissionActionCount(req)-1 {
 			c.permSelected++
 			c.redrawPermissionBlock(req)
 		}
-		return
+		return nil
 	case keyEnter:
-		c.choosePermission(req)
-		return
+		return c.choosePermission(req)
 	case keyCtrlC, keyEscape:
 		c.popAndRespond(req, false)
-		return
+		return nil
 	}
 
 	switch k.Rune {
@@ -831,19 +830,20 @@ func (c *CLI) handleKeyPermission(k keyMsg) {
 		c.popAndRespond(req, false)
 	case 'p', 'P':
 		if !req.DisableProjectSave {
-			c.showPermissionSuggestions(req)
+			return c.showPermissionSuggestions(req)
 		}
 	case 'a', 'A':
 		if req.CanAllowAll {
 			c.popAndRespondAction(req, "allow_all")
 		}
 	}
+	return nil
 }
 
-func (c *CLI) choosePermission(req *agent.PermissionRequest) {
+func (c *CLI) choosePermission(req *agent.PermissionRequest) error {
 	actions := permissionActions(req)
 	if c.permSelected < 0 || c.permSelected >= len(actions) {
-		return
+		return nil
 	}
 	action, _ := actions[c.permSelected].extra.(string)
 	switch action {
@@ -852,10 +852,11 @@ func (c *CLI) choosePermission(req *agent.PermissionRequest) {
 	case "deny":
 		c.popAndRespond(req, false)
 	case "project":
-		c.showPermissionSuggestions(req)
+		return c.showPermissionSuggestions(req)
 	case "allow_all":
 		c.popAndRespondAction(req, "allow_all")
 	}
+	return nil
 }
 
 func (c *CLI) popAndRespond(req *agent.PermissionRequest, allow bool) {
@@ -895,7 +896,7 @@ func (c *CLI) popAndRespondAction(req *agent.PermissionRequest, action string) {
 	}
 }
 
-func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
+func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) error {
 	suggestArg := req.Arg
 	if req.ResolvedArg != "" {
 		suggestArg = req.ResolvedArg
@@ -917,7 +918,7 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 	if err != nil {
 		c.printLine(renderErrorMsg(err.Error()))
 		c.printPermissionBlock(req)
-		return
+		return nil
 	}
 	if len(suggestions) == 0 {
 		c.mu.Lock()
@@ -925,7 +926,7 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 		c.mu.Unlock()
 		c.printLine(renderErrorMsg("no suggestions available"))
 		c.printPermissionBlock(req)
-		return
+		return nil
 	}
 
 	c.mu.Lock()
@@ -957,15 +958,17 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 	for {
 		k, err := c.readKeyFn()
 		if err != nil {
-			c.popAndRespond(req, false)
-			return
+			// The key read reports the exit error once the exit latch is set.
+			// Abort and return it rather than answering: a terminal exit must
+			// not be recorded as a deny the user never made.
+			return err
 		}
 
 		switch k.Special {
 		case keyEscape, keyCtrlC:
 			eraseSuggestions()
 			c.printPermissionBlock(req)
-			return
+			return nil
 		case keyEnter:
 			patterns := []string{suggestions[selected].Rule}
 			eraseSuggestions()
@@ -978,7 +981,7 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 				if stillDisplayed {
 					c.printPermissionBlock(req)
 				}
-				return
+				return nil
 			}
 			if err := c.agent.SaveProjectPermissionForSession(sessionID, req.ID, patterns); err != nil {
 				if errors.Is(err, permission.ErrUnknownRequest) {
@@ -986,20 +989,20 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 					// have come from a prompt this host was given, so an
 					// unknown-request outcome means it was resolved underneath
 					// the user. Benign.
-					return
+					return nil
 				}
 				c.printLine(renderErrorMsg(err.Error()))
 				if stillDisplayed {
 					c.printPermissionBlock(req)
 				}
-				return
+				return nil
 			}
 			if stillDisplayed {
 				c.mu.Lock()
 				c.advancePermissionQueueLocked()
 				c.mu.Unlock()
 			}
-			return
+			return nil
 		case keyUp:
 			if selected > 0 {
 				selected--
@@ -1744,9 +1747,9 @@ func (c *CLI) dispatchCommand(text string) error {
 	case "/resume":
 		c.cmdResume(parts)
 	case "/revert":
-		c.showRevertMenu()
+		return c.showRevertMenu()
 	case "/fork":
-		c.showRevertMenu()
+		return c.showRevertMenu()
 	case "/context":
 		c.cmdContext()
 	case "/compact":

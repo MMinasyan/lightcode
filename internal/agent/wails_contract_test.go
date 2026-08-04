@@ -192,30 +192,39 @@ func TestTurnActionAppliesDestinationStateThroughOrderedBoundary(t *testing.T) {
 }
 
 // TestAdapterRevertOutcomeContract pins what each host renders when a revert
-// fails midway. Only the terminal host renders the skipped set, on every
-// failure branch: ApplyTurnActionForSession returns the populated result
-// alongside the error, and the CLI prints the skipped set before returning.
-// The desktop host cannot receive a result on a failing call at all — its
-// binding layer attaches the return value only on success, and that layer is
-// vendored — and the protocol host answers with an error string. Both
-// therefore surface the enriched error text naming where the revert stopped,
-// not the skipped set, and no plumbing exists to carry the skipped set to
-// them.
+// fails midway. Only the terminal host renders the skipped set, on every error
+// branch that follows the action call: ApplyTurnActionForSession returns the
+// populated result alongside the error, and the CLI prints the skipped set
+// before returning. A branch that returns before the action is invoked — the
+// confirmation-read abort for the exiting-terminal case — has no result to
+// render and is not in this scan's scope. The desktop host cannot receive a
+// result on a failing call at all — its binding layer attaches the return
+// value only on success, and that layer is vendored — and the protocol host
+// answers with an error string. Both therefore surface the enriched error
+// text naming where the revert stopped, not the skipped set, and no plumbing
+// exists to carry the skipped set to them.
 func TestAdapterRevertOutcomeContract(t *testing.T) {
 	menu := mustReadContractFile(t, filepath.Join("..", "cli", "menu.go"))
 	for _, action := range []string{`"code"`, `"history"`, `"fork"`} {
 		body := extractSwitchCase(t, menu, "case "+action+":")
-		errIdx := strings.Index(body, "if err != nil {")
-		if errIdx < 0 {
-			t.Fatalf("CLI revert menu %s case has no error branch:\n%s", action, body)
+		// Anchor at the action call: an error branch that precedes it returns
+		// before any action was attempted, so there is nothing to render.
+		actionIdx := strings.Index(body, "ApplyTurnActionForSession(")
+		if actionIdx < 0 {
+			t.Fatalf("CLI revert menu %s case has no action call:\n%s", action, body)
 		}
+		errIdx := strings.Index(body[actionIdx:], "if err != nil {")
+		if errIdx < 0 {
+			t.Fatalf("CLI revert menu %s case has no post-action error branch:\n%s", action, body)
+		}
+		errIdx += actionIdx
 		retIdx := strings.Index(body[errIdx:], "return")
 		if retIdx < 0 {
-			t.Fatalf("CLI revert menu %s error branch has no return:\n%s", action, body)
+			t.Fatalf("CLI revert menu %s post-action error branch has no return:\n%s", action, body)
 		}
 		errBranch := body[errIdx : errIdx+retIdx]
 		if !strings.Contains(errBranch, "c.printRevertSkipped(result)") {
-			t.Fatalf("CLI revert menu %s error branch must render the skipped set before returning:\n%s", action, errBranch)
+			t.Fatalf("CLI revert menu %s post-action error branch must render the skipped set before returning:\n%s", action, errBranch)
 		}
 	}
 

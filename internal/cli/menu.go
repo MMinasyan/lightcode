@@ -273,13 +273,56 @@ func showMenu(mu *sync.Mutex, out func(string), readKeyFn func() (keyMsg, error)
 	}
 }
 
-func confirmYN(mu *sync.Mutex, out func(string), readKeyFn func() (keyMsg, error), question string, width int) bool {
+// confirmYN asks a Yes/No question and reports the choice, distinguishing a
+// deliberate No from a failed key read: a read error means the terminal is
+// exiting, and the caller must abort rather than treat it as an answer.
+// Escape cancels as No, exactly as showMenu's cancel does. It reads keys
+// itself because showMenu collapses a read error into selected -1, which
+// would be indistinguishable from No.
+func confirmYN(mu *sync.Mutex, out func(string), readKeyFn func() (keyMsg, error), question string, width int) (bool, error) {
 	items := []menuItem{
 		{label: "Yes", selectable: true},
 		{label: "No", selectable: true},
 	}
-	result := showMenu(mu, out, readKeyFn, question, items, width)
-	return result.selected == 0
+	if width < 30 {
+		width = 30
+	}
+	sel := 0
+	var frame transientMenuFrame
+	draw := func() {
+		mu.Lock()
+		frame.draw(out, renderMenu(question, items, sel, width, defaultMenuFooter), width)
+		mu.Unlock()
+	}
+	draw()
+	for {
+		k, err := readKeyFn()
+		if err != nil {
+			return false, err
+		}
+		switch k.Special {
+		case keyEscape, keyCtrlC:
+			mu.Lock()
+			frame.clear(out)
+			mu.Unlock()
+			return false, nil
+		case keyEnter:
+			mu.Lock()
+			frame.clear(out)
+			mu.Unlock()
+			return sel == 0, nil
+		case keyUp:
+			if sel > 0 {
+				sel--
+				draw()
+			}
+		case keyDown:
+			if sel < len(items)-1 {
+				sel++
+				draw()
+			}
+		}
+	}
 }
 
 func (c *CLI) showModelMenu() {
@@ -564,7 +607,12 @@ func (c *CLI) showProjectMenu() {
 	}
 }
 
-func (c *CLI) showRevertMenu() {
+// showRevertMenu runs the revert/fork picker flow. A failed key read inside
+// the confirmation is returned to the caller rather than consumed: the read
+// reports the exit error once the latch is set, and the command dispatch must
+// hand it to the key handler so the loop unwinds instead of rendering another
+// prompt. The pickers fail safe as menu cancels and are not errors.
+func (c *CLI) showRevertMenu() error {
 	c.mu.Lock()
 	c.stopAnimationLocked()
 	c.mu.Unlock()
@@ -572,7 +620,7 @@ func (c *CLI) showRevertMenu() {
 	msgs := c.sessionMessages()
 	if len(msgs) == 0 {
 		c.printLine(renderErrorMsg("no messages to revert"))
-		return
+		return nil
 	}
 
 	type userTurn struct {
@@ -588,7 +636,7 @@ func (c *CLI) showRevertMenu() {
 
 	if len(turns) == 0 {
 		c.printLine(renderErrorMsg("no user turns to revert"))
-		return
+		return nil
 	}
 
 	var items []menuItem
@@ -603,7 +651,7 @@ func (c *CLI) showRevertMenu() {
 
 	result := showMenu(c.mu, c.writeRaw, c.readKeyFn, "Revert — pick turn", items, c.currentWidth())
 	if result.selected < 0 {
-		return
+		return nil
 	}
 	turn := result.extra.(int)
 
@@ -616,14 +664,14 @@ func (c *CLI) showRevertMenu() {
 
 	actionResult := showMenu(c.mu, c.writeRaw, c.readKeyFn, fmt.Sprintf("Turn %d — action", turn), actionItems, c.currentWidth())
 	if actionResult.selected < 0 {
-		return
+		return nil
 	}
 
 	action := actionResult.extra.(string)
 	sessionID, err := c.currentSession()
 	if err != nil {
 		c.printLine(renderErrorMsg(err.Error()))
-		return
+		return nil
 	}
 	switch action {
 	case "code":
@@ -631,18 +679,24 @@ func (c *CLI) showRevertMenu() {
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			c.printRevertSkipped(result)
-			return
+			return nil
 		}
 		c.printLine(renderSystemMsg(fmt.Sprintf("  reverted code to before turn %d", turn)))
 		c.printRevertSkipped(result)
 
 	case "history":
-		alsoCode := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
+		alsoCode, err := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
+		if err != nil {
+			// The confirmation read failed (the terminal is exiting): abort the
+			// revert rather than performing it as a "no", and hand the error to
+			// the caller so the loop unwinds.
+			return err
+		}
 		result, err := c.agent.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertHistory, alsoCode)
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			c.printRevertSkipped(result)
-			return
+			return nil
 		}
 		if result.Session.ID != "" {
 			c.setCurrentSessionID(result.Session.ID)
@@ -651,12 +705,18 @@ func (c *CLI) showRevertMenu() {
 		c.printRevertSkipped(result)
 
 	case "fork":
-		alsoCode := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
+		alsoCode, err := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
+		if err != nil {
+			// The confirmation read failed (the terminal is exiting): abort the
+			// fork rather than performing it as a "no", and hand the error to
+			// the caller so the loop unwinds.
+			return err
+		}
 		result, err := c.agent.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionFork, alsoCode)
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			c.printRevertSkipped(result)
-			return
+			return nil
 		}
 		if result.Session.ID != "" {
 			c.setCurrentSessionID(result.Session.ID)
@@ -666,6 +726,7 @@ func (c *CLI) showRevertMenu() {
 
 	case "back":
 	}
+	return nil
 }
 
 func (c *CLI) printRevertSkipped(result agent.TurnActionResult) {

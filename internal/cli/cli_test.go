@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -1200,6 +1201,19 @@ func equalStringSlices(a, b []string) bool {
 	return true
 }
 
+// recordingPermissionAdapter wraps the real agent and records permission
+// answers, so a test can assert that a terminal exit performs no answer
+// instead of inferring it from the agent's gate.
+type recordingPermissionAdapter struct {
+	agent.AdapterService
+	answers []string
+}
+
+func (r *recordingPermissionAdapter) RespondPermissionActionForSession(sessionID, id, action string) error {
+	r.answers = append(r.answers, action)
+	return r.AdapterService.RespondPermissionActionForSession(sessionID, id, action)
+}
+
 func newTestAgentWithBaseURL(t *testing.T, baseURL string) (*agent.Agent, string) {
 	t.Helper()
 
@@ -1806,6 +1820,172 @@ func TestCLIRunShutdownContract(t *testing.T) {
 		case <-c.exitLatch:
 		case <-time.After(5 * time.Second):
 			t.Fatalf("terminate did not reach the exit latch after a resize burst (delivered=%v)", terminateDelivered)
+		}
+	})
+
+	t.Run("permission_prompt=exit_performs_no_answer", func(t *testing.T) {
+		// Exception, recorded per the contract-test rule: Run cannot be driven
+		// in a test (term.MakeRaw on os.Stdin requires a real TTY), so the key
+		// source is injected and the permission key path is driven through
+		// handleKey, mainLoop's own entry.
+		a, _ := newTestAgent(t)
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		c := New(a)
+		sid := a.SessionCurrent().ID
+		c.setCurrentSessionID(sid)
+		var out bytes.Buffer
+		c.out = &out
+
+		// Record any permission answer the flow would dispatch, so "no answer"
+		// is asserted on the agent call, not inferred from the gate.
+		rec := &recordingPermissionAdapter{AdapterService: a}
+		c.agent = rec
+
+		req := &agent.PermissionRequest{ID: "p1", SessionID: sid, ToolName: "read_file", Arg: "/tmp/a.txt"}
+		c.handleEvent(agent.Event{Kind: agent.EventPermissionRequest, SessionID: sid, PermReq: req})
+
+		// The terminal exits while the suggestion menu is open: the key read
+		// reports the exit error, exactly as nextKey does once the latch is set.
+		c.requestExit(ExitError{Code: 130})
+		c.readKeyFn = func() (keyMsg, error) { return keyMsg{}, c.exitErr }
+
+		err := c.handleKey(keyMsg{Rune: 'p'})
+		var exit ExitError
+		if !errors.As(err, &exit) || exit.Code != 130 {
+			t.Fatalf("handleKey returned %v, want the exit error", err)
+		}
+		c.mu.Lock()
+		queue := append([]*agent.PermissionRequest(nil), c.permQueue...)
+		c.mu.Unlock()
+		if len(queue) != 1 || queue[0].ID != req.ID {
+			t.Fatalf("permission queue after exit = %#v, want [p1] unanswered", queue)
+		}
+		if len(rec.answers) != 0 {
+			t.Fatalf("exit recorded an answer the user never made: %v", rec.answers)
+		}
+	})
+
+	t.Run("revert_confirm=exit_performs_no_revert", func(t *testing.T) {
+		// Exception, recorded per the contract-test rule: Run cannot be driven
+		// in a test (term.MakeRaw on os.Stdin requires a real TTY), so the
+		// command chain is driven through handleKeyIdle — the key handler
+		// mainLoop calls — with an injected key source; the confirmation read
+		// failure is the exit error nextKey reports once the latch is set. The
+		// error must reach the handler: a confirmation that consumes it lets
+		// the loop render another prompt, and the revert proceeds as a "no".
+		a, _ := newTestAgent(t)
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		if _, err := a.AppendUserMessage("seed message"); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		c := New(a)
+		sid := a.SessionCurrent().ID
+		c.setCurrentSessionID(sid)
+		var out bytes.Buffer
+		c.out = &out
+
+		before, err := a.SessionMessagesFor(sid)
+		if err != nil {
+			t.Fatalf("SessionMessagesFor before: %v", err)
+		}
+
+		// Select the seeded turn, then "Revert history"; the confirmation key
+		// read then reports the exit error.
+		keys := []keyMsg{
+			{Special: keyEnter},
+			{Special: keyDown},
+			{Special: keyEnter},
+		}
+		next := 0
+		c.requestExit(ExitError{Code: 130})
+		c.readKeyFn = func() (keyMsg, error) {
+			if next < len(keys) {
+				k := keys[next]
+				next++
+				return k, nil
+			}
+			return keyMsg{}, c.exitErr
+		}
+
+		c.input.Set("/revert")
+		err = c.handleKeyIdle(keyMsg{Special: keyEnter})
+		var exit ExitError
+		if !errors.As(err, &exit) || exit.Code != 130 {
+			t.Fatalf("handleKeyIdle returned %v, want the confirmation's exit error", err)
+		}
+
+		after, err := a.SessionMessagesFor(sid)
+		if err != nil {
+			t.Fatalf("SessionMessagesFor after: %v", err)
+		}
+		if !reflect.DeepEqual(before, after) {
+			t.Fatalf("exit during the revert confirmation performed a revert: before=%v after=%v", before, after)
+		}
+	})
+
+	t.Run("fork_confirm=exit_performs_no_fork", func(t *testing.T) {
+		// Exception, recorded per the contract-test rule: Run cannot be driven
+		// in a test (term.MakeRaw on os.Stdin requires a real TTY), so the
+		// command chain is driven through handleKeyIdle — the key handler
+		// mainLoop calls — with an injected key source; the confirmation read
+		// failure is the exit error nextKey reports once the latch is set. A
+		// guard that lets the fork through publishes a new session and the
+		// menu switches the selection to it, so both are asserted: the error
+		// reaches the handler and the selection stays on the source session.
+		a, _ := newTestAgent(t)
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		if _, err := a.AppendUserMessage("seed message"); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		c := New(a)
+		sid := a.SessionCurrent().ID
+		c.setCurrentSessionID(sid)
+		var out bytes.Buffer
+		c.out = &out
+
+		// Select the seeded turn, then "Fork from here"; the confirmation key
+		// read then reports the exit error.
+		keys := []keyMsg{
+			{Special: keyEnter},
+			{Special: keyDown},
+			{Special: keyDown},
+			{Special: keyEnter},
+		}
+		next := 0
+		c.requestExit(ExitError{Code: 130})
+		c.readKeyFn = func() (keyMsg, error) {
+			if next < len(keys) {
+				k := keys[next]
+				next++
+				return k, nil
+			}
+			return keyMsg{}, c.exitErr
+		}
+
+		c.input.Set("/fork")
+		err := c.handleKeyIdle(keyMsg{Special: keyEnter})
+		var exit ExitError
+		if !errors.As(err, &exit) || exit.Code != 130 {
+			t.Fatalf("handleKeyIdle returned %v, want the confirmation's exit error", err)
+		}
+
+		// A fork publishes a new session and the menu switches the selection
+		// to it; neither may happen on a failed confirmation read.
+		if got := c.currentSessionID(); got != sid {
+			t.Fatalf("fork switched the selection to %q on a failed confirmation read", got)
+		}
+		after, err := a.SessionMessagesFor(sid)
+		if err != nil {
+			t.Fatalf("SessionMessagesFor after: %v", err)
+		}
+		if len(after) != 1 || after[0].Content != "seed message" {
+			t.Fatalf("source session changed on a failed confirmation read: %v", after)
 		}
 	})
 }
