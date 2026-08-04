@@ -192,7 +192,16 @@ func TestOwnerShutdownContractMatrix(t *testing.T) {
 
 		// Clean shutdown: no turn is in flight, so the joins drain and every
 		// resource is released.
-		a.ShutdownOwner()
+		if !a.ShutdownOwner() {
+			t.Fatal("clean shutdown reported abandoned in-flight work")
+		}
+		// A caller that loses the once-guard — one that does not run the
+		// shutdown body — receives the stored outcome, not a zero value. This
+		// is the caller the stored result exists for: an outcome returned only
+		// from the body would reach it as the bool zero value and fail here.
+		if !a.ShutdownOwner() {
+			t.Fatal("a second caller of a clean shutdown received a zero value instead of the stored outcome")
+		}
 
 		if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
 			t.Fatalf("language server process %d still alive when owner shutdown returned (kill err = %v): the LSP teardown did not complete inside the join", pid, err)
@@ -238,13 +247,15 @@ func TestOwnerShutdownContractMatrix(t *testing.T) {
 		projectRoot := t.TempDir()
 		a, _, id, unit := startCleanBranchAgentWithFakeLSP(t, home, projectRoot, true)
 
-		done := make(chan struct{})
+		done := make(chan bool, 1)
 		go func() {
-			a.ShutdownOwner()
-			close(done)
+			done <- a.ShutdownOwner()
 		}()
 		select {
-		case <-done:
+		case clean := <-done:
+			if !clean {
+				t.Fatal("clean shutdown with an unresponsive language server reported abandoned in-flight work")
+			}
 		case <-time.After(2 * time.Second):
 			t.Fatal("owner shutdown did not return promptly with an unresponsive language server: the teardown must kill, not negotiate")
 		}
@@ -342,10 +353,9 @@ func TestOwnerShutdownContractMatrix(t *testing.T) {
 			}
 		}()
 
-		done := make(chan struct{})
+		done := make(chan bool, 1)
 		go func() {
-			a.ShutdownOwner()
-			close(done)
+			done <- a.ShutdownOwner()
 		}()
 		select {
 		case <-rt.ownerCtxDone():
@@ -358,9 +368,21 @@ func TestOwnerShutdownContractMatrix(t *testing.T) {
 			t.Fatal("owner context was not cancelled after the turn join timeout")
 		}
 		select {
-		case <-done:
+		case clean := <-done:
+			if clean {
+				t.Fatal("ShutdownOwner reported a clean shutdown although the turn join timed out")
+			}
 		case <-time.After(shutdownJoinTimeout + 10*time.Second):
 			t.Fatal("ShutdownOwner did not return after the join timeout")
+		}
+		// A caller that loses the once-guard — one that did not run the
+		// shutdown body — receives the same outcome on this path. On the
+		// abandoning branch that value coincides with the bool zero value, so
+		// this assertion covers the losing caller on this path; the
+		// clean-branch second caller above is the one that proves the result
+		// is stored, since there the zero value would differ.
+		if a.ShutdownOwner() {
+			t.Fatal("a second caller of an abandoned shutdown received a clean outcome instead of the stored one")
 		}
 
 		// The dangerous branch: a still-running turn holds the store, so the

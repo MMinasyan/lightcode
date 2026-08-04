@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -1517,5 +1518,40 @@ func TestCLIPermissionResolvedBehindHeadLeavesDisplayAlone(t *testing.T) {
 	}
 	if state != statePermission {
 		t.Fatalf("state = %v, want statePermission (the displayed prompt is untouched)", state)
+	}
+}
+
+// TestCLIShutdownAbandonedReturnsError pins Run's teardown fold: when the
+// owner reports that shutdown abandoned in-flight work, Run must fold a
+// non-nil error into its returned error so a script driving this process
+// detects the abandonment from the exit code. Exception, recorded per the
+// contract-test rule: Run cannot be driven against a stub owner in a test.
+// The owner field is a concrete *agent.Agent — typed for the concrete-only
+// surface (ShutdownOwner), not the AdapterService interface — so a stub
+// cannot be substituted without changing the field's type to an interface, a
+// production change this test must not force. Run additionally requires a
+// real TTY (term.MakeRaw on os.Stdin) to reach its teardown at all, and an
+// abandoned shutdown needs the agent-internal coordinator park that
+// TestOwnerShutdownContractMatrix drives (join=timeout). The fold is
+// therefore pinned structurally against that behavioral evidence.
+func TestCLIShutdownAbandonedReturnsError(t *testing.T) {
+	src, err := os.ReadFile("cli.go")
+	if err != nil {
+		t.Fatalf("read cli.go: %v", err)
+	}
+	body, ok := extractFunctionBody(string(src), "func (c *CLI) Run(")
+	if !ok {
+		t.Fatal("Run not found")
+	}
+	// The whole shape is one structure, not separate facts: the fold is
+	// guarded by the abandoned outcome, the joined error is assigned into
+	// err, and the same err is returned later in the body. An inverted guard,
+	// an unconditional fold, or a fold that builds the joined error and
+	// discards it would each fail this one pattern while still containing the
+	// guard, the join call, the message and the return somewhere in the
+	// function.
+	guardedFoldIntoReturned := regexp.MustCompile(`!c\.owner\.ShutdownOwner\(\)\s*\{\s*err\s*=\s*errors\.Join\(\s*err\s*,\s*fmt\.Errorf\(\s*"owner shutdown abandoned in-flight work"\s*\)\s*\)\s*\}[\s\S]*?return\s+err\b`)
+	if !guardedFoldIntoReturned.MatchString(body) {
+		t.Fatal("Run must fold the abandoned outcome into the error it returns as one guarded structure: `if !c.owner.ShutdownOwner() { err = errors.Join(err, fmt.Errorf(\"owner shutdown abandoned in-flight work\")) }` and later `return err`")
 	}
 }

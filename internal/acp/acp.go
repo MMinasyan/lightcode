@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -284,7 +285,12 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.closeDispatch()
 	r.dispatchWG.Wait()
 	if r.owner != nil {
-		r.owner.ShutdownOwner()
+		// An abandoned shutdown means work is still in flight when the host
+		// exits; fold that into the returned error so a script driving this
+		// process detects it from the exit code.
+		if !r.owner.ShutdownOwner() {
+			err = errors.Join(err, fmt.Errorf("owner shutdown abandoned in-flight work"))
+		}
 	}
 	r.closeOutput()
 	return err

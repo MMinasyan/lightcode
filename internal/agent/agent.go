@@ -3820,7 +3820,14 @@ func waitGroupOrTimeout(wg *sync.WaitGroup, d time.Duration) bool {
 // embedder is closed; an abandoned turn keeps both, so a still-running turn
 // never loses its store or hits a closed embedder, and the process-exit
 // boundary releases what shutdown did not.
-func (a *Agent) ShutdownOwner() {
+//
+// It reports whether shutdown completed every join — both the turn join and
+// the background join drained. The result is stored on the runtime rather than
+// returned from inside the Once body, because only the caller that wins the
+// Once executes that body; every other caller (e.g. the Init watcher that
+// triggers the same shutdown) waits on the channel and must read the field
+// after it, which the channel close makes visible without a lock.
+func (a *Agent) ShutdownOwner() bool {
 	rt := a.ensureRuntime()
 	rt.shutdownOnce.Do(func() {
 		rt.mu.Lock()
@@ -3869,7 +3876,8 @@ func (a *Agent) ShutdownOwner() {
 		if rt.ownerCancel != nil {
 			rt.ownerCancel()
 		}
-		if !waitGroupOrTimeout(&rt.bgWG, shutdownJoinTimeout) {
+		bgDrained := waitGroupOrTimeout(&rt.bgWG, shutdownJoinTimeout)
+		if !bgDrained {
 			fmt.Fprintf(os.Stderr, "lightcode: owner shutdown abandoned background workers after %s\n", shutdownJoinTimeout)
 		}
 		if a.procMgr != nil {
@@ -3881,9 +3889,15 @@ func (a *Agent) ShutdownOwner() {
 		if turnsDrained && a.embedder != nil {
 			a.embedder.Close()
 		}
+		// Store the outcome before the close: only the caller that wins the Once
+		// executes this body, so a value returned from inside the Do would reach
+		// every other caller as the zero value. The close supplies the
+		// happens-before edge, so the field needs no lock.
+		rt.shutdownClean = turnsDrained && bgDrained
 		close(rt.shutdownDone)
 	})
 	<-rt.shutdownDone
+	return rt.shutdownClean
 }
 
 func setRegisteredToolConfig(t tool.Tool, cfg config.ToolsConfig) {

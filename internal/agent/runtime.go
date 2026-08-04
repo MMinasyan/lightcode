@@ -99,6 +99,13 @@ type runtime struct {
 	bgWG         sync.WaitGroup
 	shutdownOnce sync.Once
 	shutdownDone chan struct{}
+	// shutdownClean records whether owner shutdown completed every join — both
+	// the turn join and the background join drained. Only the caller that wins
+	// shutdownOnce executes the shutdown body, so every other caller reads the
+	// result here rather than receiving it from the Do; the close of
+	// shutdownDone supplies the happens-before edge, so the field needs no
+	// lock.
+	shutdownClean bool
 }
 
 // transcriptCursor is one live session's registry entry: the session's

@@ -186,7 +186,9 @@ func (a *App) shutdown(_ context.Context) {
 	// session stores when every turn finished. Only then cancel the host context,
 	// whose sole watcher is the shutdown trigger goroutine.
 	if a.agent != nil {
-		a.agent.ShutdownOwner()
+		// The Wails shutdown hook has no return channel: the stderr diagnostic
+		// inside ShutdownOwner is this host's only available signal.
+		_ = a.agent.ShutdownOwner()
 	}
 	if hostCancel != nil {
 		hostCancel()

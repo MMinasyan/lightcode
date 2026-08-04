@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -137,6 +139,59 @@ func TestWailsShutdownBeforeStartupIsSafe(t *testing.T) {
 	if app.started {
 		t.Fatal("startup after shutdown must short-circuit without initializing an owner")
 	}
+}
+
+// TestWailsShutdownDiscardsOwnerResult pins the shutdown hook's explicit
+// discard of ShutdownOwner's result: the Wails framework hook is void and has
+// no return channel, so nothing can be folded into; the stderr diagnostic
+// inside ShutdownOwner is this host's only available signal, and the hook must
+// discard the result explicitly rather than silently. Exception, recorded per
+// the contract-test rule: making the owner's shutdown actually abandoned needs
+// the agent-internal coordinator park that TestOwnerShutdownContractMatrix
+// drives (join=timeout), which this package cannot reach, so the discard is
+// pinned structurally against that behavioral evidence and the clean-path
+// hook test (TestWailsAppOwnsConcreteAgentLifecycle), which drives shutdown
+// through the hook to completion.
+func TestWailsShutdownDiscardsOwnerResult(t *testing.T) {
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Fatalf("read app.go: %v", err)
+	}
+	body, ok := extractAppFunctionBody(string(src), "func (a *App) shutdown(")
+	if !ok {
+		t.Fatal("shutdown not found")
+	}
+	if !strings.Contains(body, "_ = a.agent.ShutdownOwner()") {
+		t.Fatal("the shutdown hook must discard ShutdownOwner's result explicitly (_ =), since the void framework hook has no return channel")
+	}
+}
+
+// extractAppFunctionBody returns the brace-delimited body of the first function
+// whose definition line starts with prefix. It does not understand strings or
+// comments containing braces, so callers should pass production code only.
+func extractAppFunctionBody(source, prefix string) (string, bool) {
+	idx := strings.Index(source, prefix)
+	if idx < 0 {
+		return "", false
+	}
+	rest := source[idx:]
+	open := strings.Index(rest, "{")
+	if open < 0 {
+		return "", false
+	}
+	depth := 1
+	for i := open + 1; i < len(rest); i++ {
+		switch rest[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return rest[open+1 : i], true
+			}
+		}
+	}
+	return "", false
 }
 
 // TestWailsShutdownJoinsInFlightTurn verifies shutdown joins a turn that is still

@@ -103,6 +103,69 @@ func TestACPShutdownJoinsOwnerBeforeClosingOutput(t *testing.T) {
 	}
 }
 
+// TestACPShutdownAbandonedReturnsError pins Run's teardown fold: when the
+// owner reports that shutdown abandoned in-flight work, Run must fold a
+// non-nil error into its returned error so a script driving this process
+// detects the abandonment from the exit code. Exception, recorded per the
+// contract-test rule: Run cannot be driven against a stub owner in a test.
+// The owner field is a concrete *agent.Agent — typed for the concrete-only
+// surface (ShutdownOwner), not the AdapterService interface — so a stub
+// cannot be substituted without changing the field's type to an interface, a
+// production change this test must not force. An abandoned shutdown would
+// otherwise need the agent-internal coordinator park that
+// TestOwnerShutdownContractMatrix drives (join=timeout), which this package
+// cannot reach. The fold is therefore pinned structurally against that
+// behavioral evidence.
+func TestACPShutdownAbandonedReturnsError(t *testing.T) {
+	src, err := os.ReadFile("acp.go")
+	if err != nil {
+		t.Fatalf("read acp.go: %v", err)
+	}
+	body, ok := extractACPFunctionBody(string(src), "func (r *Runner) Run(")
+	if !ok {
+		t.Fatal("Run not found")
+	}
+	// The whole shape is one structure, not separate facts: the fold is
+	// guarded by the abandoned outcome, the joined error is assigned into
+	// err, and the same err is returned later in the body. An inverted guard,
+	// an unconditional fold, or a fold that builds the joined error and
+	// discards it would each fail this one pattern while still containing the
+	// guard, the join call, the message and the return somewhere in the
+	// function.
+	guardedFoldIntoReturned := regexp.MustCompile(`!r\.owner\.ShutdownOwner\(\)\s*\{\s*err\s*=\s*errors\.Join\(\s*err\s*,\s*fmt\.Errorf\(\s*"owner shutdown abandoned in-flight work"\s*\)\s*\)\s*\}[\s\S]*?return\s+err\b`)
+	if !guardedFoldIntoReturned.MatchString(body) {
+		t.Fatal("Run must fold the abandoned outcome into the error it returns as one guarded structure: `if !r.owner.ShutdownOwner() { err = errors.Join(err, fmt.Errorf(\"owner shutdown abandoned in-flight work\")) }` and later `return err`")
+	}
+}
+
+// extractACPFunctionBody returns the brace-delimited body of the first function
+// whose definition line starts with prefix. It does not understand strings or
+// comments containing braces, so callers should pass production code only.
+func extractACPFunctionBody(source, prefix string) (string, bool) {
+	idx := strings.Index(source, prefix)
+	if idx < 0 {
+		return "", false
+	}
+	rest := source[idx:]
+	open := strings.Index(rest, "{")
+	if open < 0 {
+		return "", false
+	}
+	depth := 1
+	for i := open + 1; i < len(rest); i++ {
+		switch rest[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return rest[open+1 : i], true
+			}
+		}
+	}
+	return "", false
+}
+
 // TestACPOutputDrainsInOrder proves the drainer writes queued frames in FIFO
 // order. Two assertions, neither substituting for the other: with the output open
 // and never closed during the assertion, every queued frame is written in order —
