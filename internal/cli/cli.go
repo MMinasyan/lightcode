@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,11 +43,11 @@ type CLI struct {
 	viewOnce sync.Once
 	view     *agent.SessionView
 
-	width    int
+	width    atomic.Int32
 	oldState *term.State
 	rawFd    int
 
-	state     cliState
+	state     atomic.Int32
 	busy      bool
 	input     *inputLine
 	history   inputHistory
@@ -136,9 +138,9 @@ func New(a *agent.Agent) *CLI {
 		keyWake:             make(chan struct{}, 1),
 		eventWake:           make(chan struct{}, 1),
 		exitLatch:           make(chan struct{}),
-		width:               80,
 		lastWarningSnapshot: make(map[string]bool),
 	}
+	c.width.Store(int32(80))
 	// A nil concrete agent must leave the interface field nil (not an interface
 	// wrapping a nil pointer), so tests that construct a headless CLI still see no
 	// owner.
@@ -455,41 +457,25 @@ func (c *CLI) Run(ctx context.Context) error {
 	defer c.restoreTerminal()
 
 	if w, _, err := term.GetSize(rawFd); err == nil && w > 0 {
-		c.width = w
+		c.setWidth(w)
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
-	go func() {
-		for {
-			select {
-			case sig := <-sigCh:
-				switch sig {
-				case syscall.SIGWINCH:
-					if w, _, err := term.GetSize(rawFd); err == nil && w > 0 {
-						c.mu.Lock()
-						c.width = w
-						c.mu.Unlock()
-					}
-				case syscall.SIGINT:
-					c.mu.Lock()
-					st := c.state
-					c.mu.Unlock()
-					if st == stateStreaming || st == statePermission {
-						c.cancelCurrent()
-					} else {
-						// Signal path never writes the terminal; requestExit unwinds
-						// mainLoop and the deferred restoreTerminal shows the cursor.
-						c.requestExit(ExitError{Code: 130})
-					}
-				case syscall.SIGTERM:
-					c.requestExit(ExitError{Code: 130})
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	// Signals are split by kind: every signal that can independently require
+	// its own action gets its own registration and channel, so a full
+	// channel can only drop another of the same signal — one of that kind is
+	// already queued and will be acted on. No capacity on a shared channel
+	// closes the loss, because signals that do not terminate can fill it:
+	// two queued cancelling interrupts would drop the terminate behind them.
+	// The interrupt channel holds two so a cancel-then-exit double press
+	// survives a delivery window; the others need one, since a dropped
+	// duplicate is already covered by the queued instance.
+	resizeCh := make(chan os.Signal, 1)
+	signal.Notify(resizeCh, syscall.SIGWINCH)
+	intCh := make(chan os.Signal, 2)
+	signal.Notify(intCh, syscall.SIGINT)
+	termCh := make(chan os.Signal, 1)
+	signal.Notify(termCh, syscall.SIGTERM)
+	go c.watchSignals(termCh, intCh, resizeCh, ctx)
 
 	c.ctx = ctx
 	c.readKeyFn = func() (keyMsg, error) { return c.nextKey(ctx) }
@@ -523,7 +509,18 @@ func (c *CLI) Run(ctx context.Context) error {
 
 	go c.readKeys(ctx)
 
-	err = c.mainLoop(ctx)
+	// mainLoop runs on its own goroutine: a terminal write can block forever
+	// (stdout stopped being read) and teardown must not sit behind it. Only
+	// mainLoop is abandoned in that one blocked write; the op-group and the
+	// owner are still joined below.
+	mainDone := make(chan error, 1)
+	go func() { mainDone <- c.mainLoop(ctx) }()
+
+	select {
+	case err = <-mainDone:
+	case <-c.exitLatch:
+		err = c.exitErr
+	}
 
 	// Teardown in the one host-shutdown order: stop ingress (close key and op-group
 	// admission), cancel the input/signal goroutines and release members blocked in
@@ -544,6 +541,49 @@ func (c *CLI) Run(ctx context.Context) error {
 	c.opWG.Wait()
 	c.closeEvents()
 	return err
+}
+
+// handleSignal decides the host's response to one signal on the watcher
+// goroutine. It never writes the terminal and never takes the render lock:
+// a stalled write holds that lock, and any branch that waits on it strands
+// every later signal, including the one that would trigger the exit. Exit
+// unwinds through requestExit.
+func (c *CLI) handleSignal(sig os.Signal) {
+	switch sig {
+	case syscall.SIGWINCH:
+		if w, _, err := term.GetSize(c.rawFd); err == nil && w > 0 {
+			c.setWidth(w)
+		}
+	case syscall.SIGINT:
+		if st := cliState(c.state.Load()); st == stateStreaming || st == statePermission {
+			c.cancelCurrent()
+		} else {
+			// Signal path never writes the terminal; requestExit unwinds
+			// mainLoop and the deferred restoreTerminal shows the cursor.
+			c.requestExit(ExitError{Code: 130})
+		}
+	case syscall.SIGTERM:
+		c.requestExit(ExitError{Code: 130})
+	}
+}
+
+// watchSignals services the signal channels until the host context ends:
+// every signal that can independently require its own action has its own
+// channel, so a full channel can only drop another of the same signal. One
+// watcher, one loop.
+func (c *CLI) watchSignals(termCh, intCh, resizeCh <-chan os.Signal, ctx context.Context) {
+	for {
+		select {
+		case sig := <-termCh:
+			c.handleSignal(sig)
+		case sig := <-intCh:
+			c.handleSignal(sig)
+		case sig := <-resizeCh:
+			c.handleSignal(sig)
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (c *CLI) readKeys(ctx context.Context) {
@@ -600,7 +640,7 @@ func (c *CLI) mainLoop(ctx context.Context) error {
 }
 
 func (c *CLI) handleKey(k keyMsg) error {
-	switch c.state {
+	switch cliState(c.state.Load()) {
 	case stateIdle:
 		return c.handleKeyIdle(k)
 	case stateStreaming:
@@ -1008,7 +1048,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 	case agent.EventTurnStart:
 		c.stopAnimationLocked()
 		c.busy = true
-		c.state = stateStreaming
+		c.state.Store(int32(stateStreaming))
 		c.streamStarted = false
 		c.streamDisplayActive = false
 		c.streamBuf.Reset()
@@ -1082,7 +1122,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 					c.writeRaw(renderToolCall(ev.ToolName, ev.Args, ev.Metadata))
 				}
 			}
-			c.writeRaw(renderToolResult(ev.ToolName, ev.Args, ev.Result, !ev.IsError, c.toolExpanded, c.width, ev.Metadata))
+			c.writeRaw(renderToolResult(ev.ToolName, ev.Args, ev.Result, !ev.IsError, c.toolExpanded, int(c.width.Load()), ev.Metadata))
 		} else {
 			// Late completion (e.g. a staged-flush result arriving at turn end,
 			// far below its row): render a fresh block without cursor-relative
@@ -1095,7 +1135,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			}
 			c.writeRaw("\r\x1b[2K")
 			c.writeRaw(renderToolCall(name, args, meta))
-			c.writeRaw(renderToolResult(name, args, ev.Result, !ev.IsError, c.toolExpanded, c.width, meta))
+			c.writeRaw(renderToolResult(name, args, ev.Result, !ev.IsError, c.toolExpanded, int(c.width.Load()), meta))
 		}
 		c.writeRaw(nl)
 		if c.busy {
@@ -1128,7 +1168,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			bg:      ev.BackgroundProcess,
 		})
 		c.writeRaw(renderBackgroundProcessCall(ev.BackgroundProcess, success))
-		if result := renderToolResult("background_process", "", ev.Result, success, c.toolExpanded, c.width, nil); result != "" {
+		if result := renderToolResult("background_process", "", ev.Result, success, c.toolExpanded, int(c.width.Load()), nil); result != "" {
 			c.writeRaw(result)
 			c.writeRaw(nl)
 		}
@@ -1153,7 +1193,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			content: ev.Result,
 			turn:    ev.Turn,
 		})
-		c.printLineLocked(renderUserMsg(ev.Result, c.width))
+		c.printLineLocked(renderUserMsg(ev.Result, int(c.width.Load())))
 		if c.busy {
 			c.startAnimationLocked("Thinking")
 		}
@@ -1200,7 +1240,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			c.finalizeStreamBufLocked()
 		}
 		c.busy = false
-		c.state = stateIdle
+		c.state.Store(int32(stateIdle))
 		c.streamStarted = false
 		c.streamDisplayActive = false
 		c.permQueue = nil
@@ -1218,7 +1258,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.writeRaw("\r\x1b[2K")
 		c.writeRaw(renderErrorMsg(ev.Error))
 		c.busy = false
-		c.state = stateIdle
+		c.state.Store(int32(stateIdle))
 		c.printInputPromptLocked()
 
 	case agent.EventPermissionRequest:
@@ -1227,7 +1267,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.writeRaw("\r\x1b[2K")
 		c.permQueue = append(c.permQueue, ev.PermReq)
 		if len(c.permQueue) == 1 {
-			c.state = statePermission
+			c.state.Store(int32(statePermission))
 			c.permSelected = 0
 			c.printPermissionBlockLocked(ev.PermReq)
 		}
@@ -1248,10 +1288,10 @@ func (c *CLI) handleEvent(ev agent.Event) {
 				c.erasePermissionBlockLocked()
 				c.permSelected = 0
 				if len(c.permQueue) > 0 {
-					c.state = statePermission
+					c.state.Store(int32(statePermission))
 					c.printPermissionBlockLocked(c.permQueue[0])
 				} else {
-					c.state = stateStreaming
+					c.state.Store(int32(stateStreaming))
 				}
 			}
 			return
@@ -1280,7 +1320,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			c.writeRaw(renderWarningMsg(w.Kind + ": " + w.Message))
 		}
 		c.lastWarningSnapshot = current
-		if c.state == stateIdle {
+		if cliState(c.state.Load()) == stateIdle {
 			c.printInputPromptLocked()
 		}
 	}
@@ -1311,7 +1351,7 @@ func (c *CLI) handleSubagentEvent(ev agent.Event) {
 		if !ev.IsError && ev.ToolName == "edit_file" {
 			line = status
 			if preview, ok := editpreview.FromMetadata(ev.Metadata); ok {
-				line += "\n" + strings.TrimRight(renderEditPreview(preview, "", c.width, false), "\r\n")
+				line += "\n" + strings.TrimRight(renderEditPreview(preview, "", int(c.width.Load()), false), "\r\n")
 			}
 		}
 		c.writeRaw(renderSubagentMsg(tag, line))
@@ -1340,11 +1380,11 @@ func (c *CLI) handleSubagentEvent(ev agent.Event) {
 func (c *CLI) finalizeStreamBufLocked() {
 	text := c.streamBuf.String()
 	if text != "" {
-		rows := terminalRowsForText(c.streamVisibleBuf.String(), c.width)
+		rows := terminalRowsForText(c.streamVisibleBuf.String(), int(c.width.Load()))
 		if rows > 0 {
 			c.writeRaw(eraseBlock(rows + 1))
 		}
-		c.writeRaw(renderAssistantMsg(text, c.width))
+		c.writeRaw(renderAssistantMsg(text, int(c.width.Load())))
 
 		c.messages = append(c.messages, displayEntry{
 			typ:     "assistant",
@@ -1385,16 +1425,30 @@ func (c *CLI) refreshState() {
 	}
 }
 
+// setWidth records a terminal width reported by the OS. The clamp is honest
+// rather than a workaround: a width below one, or beyond what the atomic can
+// hold, is nonsense for a terminal, and bounding it first makes the
+// conversion provably safe instead of merely asserted.
+func (c *CLI) setWidth(w int) {
+	if w < 1 {
+		w = 1
+	} else if w > math.MaxInt32 {
+		w = math.MaxInt32
+	}
+	c.width.Store(int32(w))
+}
+
 func (c *CLI) currentWidth() int {
 	if c.rawFd > 0 {
 		if w, _, err := term.GetSize(c.rawFd); err == nil && w > 0 {
-			c.width = w
+			c.setWidth(w)
 		}
 	}
-	if c.width < 30 {
+	width := int(c.width.Load())
+	if width < 30 {
 		return 30
 	}
-	return c.width
+	return width
 }
 
 func (c *CLI) seedInputHistory() {
@@ -1445,8 +1499,9 @@ func (c *CLI) printInputPromptLocked() {
 	}
 
 	promptLen := 2 + visibleWidth(text)
-	if c.width > 0 && promptLen > c.width {
-		c.promptLines = (promptLen + c.width - 1) / c.width
+	width := int(c.width.Load())
+	if width > 0 && promptLen > width {
+		c.promptLines = (promptLen + width - 1) / width
 	} else {
 		c.promptLines = 1
 	}
@@ -1474,13 +1529,13 @@ func (c *CLI) printDisplayEntry(e displayEntry) {
 func (c *CLI) printDisplayEntryLocked(e displayEntry) {
 	switch e.typ {
 	case "user":
-		c.printLineLocked(renderUserMsg(e.content, c.width))
+		c.printLineLocked(renderUserMsg(e.content, int(c.width.Load())))
 	case "assistant":
-		c.printLineLocked(renderAssistantMsg(e.content, c.width))
+		c.printLineLocked(renderAssistantMsg(e.content, int(c.width.Load())))
 	case "tool":
 		c.printLineLocked(renderToolCall(e.name, e.args, e.metadata))
 		if e.done {
-			result := renderToolResult(e.name, e.args, e.result, e.success, c.toolExpanded, c.width, e.metadata)
+			result := renderToolResult(e.name, e.args, e.result, e.success, c.toolExpanded, int(c.width.Load()), e.metadata)
 			if result != "" {
 				c.printLineLocked(result)
 			}
@@ -1489,7 +1544,7 @@ func (c *CLI) printDisplayEntryLocked(e displayEntry) {
 	case "background_process":
 		c.printLineLocked(renderBackgroundProcessCall(e.bg, e.success))
 		if e.done {
-			result := renderToolResult("background_process", "", e.result, e.success, c.toolExpanded, c.width, nil)
+			result := renderToolResult("background_process", "", e.result, e.success, c.toolExpanded, int(c.width.Load()), nil)
 			if result != "" {
 				c.printLineLocked(result)
 			}
@@ -1523,11 +1578,11 @@ func (c *CLI) advancePermissionQueueLocked() {
 	}
 	c.permSelected = 0
 	if len(c.permQueue) > 0 {
-		c.state = statePermission
+		c.state.Store(int32(statePermission))
 		c.printPermissionBlockLocked(c.permQueue[0])
 		return
 	}
-	c.state = stateStreaming
+	c.state.Store(int32(stateStreaming))
 }
 
 func (c *CLI) redrawPermissionBlock(req *agent.PermissionRequest) {
@@ -1576,7 +1631,7 @@ func (c *CLI) handleSubmitErrorLocked(text string, err error) {
 		c.input.Set(text)
 	}
 	if !c.busy {
-		c.state = stateIdle
+		c.state.Store(int32(stateIdle))
 		c.printInputPromptLocked()
 	}
 }
@@ -1823,7 +1878,7 @@ func (c *CLI) cmdCompact() {
 
 	c.mu.Lock()
 	c.compacting = true
-	c.state = stateStreaming
+	c.state.Store(int32(stateStreaming))
 	c.mu.Unlock()
 
 	c.startAnimation("Compacting")
@@ -1852,7 +1907,7 @@ func (c *CLI) finishCompactLocked() bool {
 	if c.busy {
 		return false
 	}
-	c.state = stateIdle
+	c.state.Store(int32(stateIdle))
 	return true
 }
 
@@ -1896,13 +1951,16 @@ func (c *CLI) projectSwitch(targetPath string) {
 }
 
 func (c *CLI) restoreTerminal() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// The mode restore is a control operation on the descriptor: it cannot
+	// block on an unread output, so it runs without the render lock. Leaving
+	// the terminal in raw mode is real damage; a stalled write must not
+	// prevent undoing it. Nothing else happens here: no exit path may write
+	// to the output, because nothing available at exit establishes that it
+	// drains.
 	if c.oldState != nil {
 		_ = term.Restore(c.rawFd, c.oldState)
 		c.oldState = nil
 	}
-	c.writeRaw("\x1b[?25h")
 }
 
 func (c *CLI) startAnimation(label string) {

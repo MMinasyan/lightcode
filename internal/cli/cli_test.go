@@ -10,12 +10,14 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
+	"golang.org/x/term"
 )
 
 func TestCmdClearClearsTerminalRedrawsHeaderAndKeepsMessages(t *testing.T) {
@@ -64,7 +66,7 @@ func TestWarningSnapshotPrintsOnlyNewWarnings(t *testing.T) {
 	c := New(nil)
 	var out bytes.Buffer
 	c.out = &out
-	c.state = stateStreaming
+	c.state.Store(int32(stateStreaming))
 
 	w1 := agent.PromptWarning{Kind: "rules_not_found", Message: "No AGENTS.md found"}
 	w2 := agent.PromptWarning{Kind: "lsp_install_failed", Message: "Failed to install gopls"}
@@ -109,7 +111,7 @@ func TestHandleUserMessageDisplayAppendsAndRenders(t *testing.T) {
 	c := New(nil)
 	var out bytes.Buffer
 	c.out = &out
-	c.width = 80
+	c.width.Store(int32(80))
 
 	c.handleEvent(agent.Event{Kind: agent.EventUserMessageDisplay, Result: "hello world", Turn: 4})
 
@@ -125,7 +127,7 @@ func TestHandleGenericSystemSignalAppendsAndRenders(t *testing.T) {
 	c := New(nil)
 	var out bytes.Buffer
 	c.out = &out
-	c.width = 80
+	c.width.Store(int32(80))
 
 	c.handleEvent(agent.Event{Kind: agent.EventGenericSystemSignal, Result: "Model switched to test/test-model", Turn: 2})
 
@@ -170,7 +172,7 @@ func TestActiveCompactionRefreshDeferredUntilTurnEnd(t *testing.T) {
 	c.messages = []displayEntry{{typ: "system", content: "System: live signal before compaction"}}
 	c.compacting = true
 	c.busy = true
-	c.state = stateStreaming
+	c.state.Store(int32(stateStreaming))
 
 	c.handleEvent(agent.Event{Kind: agent.EventCompactionEnd})
 
@@ -199,8 +201,8 @@ func TestActiveCompactionRefreshDeferredUntilTurnEnd(t *testing.T) {
 	}
 
 	c.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 2})
-	if c.busy || c.state != stateIdle {
-		t.Fatalf("turn_end should leave CLI idle: busy=%v state=%v", c.busy, c.state)
+	if c.busy || cliState(c.state.Load()) != stateIdle {
+		t.Fatalf("turn_end should leave CLI idle: busy=%v state=%v", c.busy, cliState(c.state.Load()))
 	}
 }
 
@@ -452,8 +454,8 @@ func TestFinishCompactDoesNotOverwriteRunningQueuedTurn(t *testing.T) {
 		history:    newInputHistory(),
 		busy:       true,
 		compacting: true,
-		state:      stateStreaming,
 	}
+	c.state.Store(int32(stateStreaming))
 
 	c.mu.Lock()
 	idle := c.finishCompactLocked()
@@ -462,8 +464,8 @@ func TestFinishCompactDoesNotOverwriteRunningQueuedTurn(t *testing.T) {
 	if idle {
 		t.Fatal("finishCompactLocked reported idle while a queued turn was running")
 	}
-	if !c.busy || c.state != stateStreaming {
-		t.Fatalf("finishCompactLocked overwrote queued turn state: busy=%v state=%v", c.busy, c.state)
+	if !c.busy || cliState(c.state.Load()) != stateStreaming {
+		t.Fatalf("finishCompactLocked overwrote queued turn state: busy=%v state=%v", c.busy, cliState(c.state.Load()))
 	}
 	if c.compacting {
 		t.Fatal("finishCompactLocked should clear compacting")
@@ -478,15 +480,15 @@ func TestFinishCompactReturnsIdleWhenNoTurnRunning(t *testing.T) {
 		input:      newInputLine(),
 		history:    newInputHistory(),
 		compacting: true,
-		state:      stateStreaming,
 	}
+	c.state.Store(int32(stateStreaming))
 
 	c.mu.Lock()
 	idle := c.finishCompactLocked()
 	c.mu.Unlock()
 
-	if !idle || c.busy || c.state != stateIdle {
-		t.Fatalf("finishCompactLocked should restore idle state: idle=%v busy=%v state=%v", idle, c.busy, c.state)
+	if !idle || c.busy || cliState(c.state.Load()) != stateIdle {
+		t.Fatalf("finishCompactLocked should restore idle state: idle=%v busy=%v state=%v", idle, c.busy, cliState(c.state.Load()))
 	}
 	if c.compacting {
 		t.Fatal("finishCompactLocked should clear compacting")
@@ -1056,20 +1058,20 @@ func TestCLIAsyncOpsUseOpGroup(t *testing.T) {
 	}
 }
 
-// TestCLISignalPathDoesNotWriteTerminal proves the signal handler (inside Run) does
-// not write os.Stdout: signals only requestExit, and the deferred restoreTerminal
-// shows the cursor. Keeps the terminal writer single.
+// TestCLISignalPathDoesNotWriteTerminal proves the signal handler does not
+// write os.Stdout: signals only requestExit or cancel the current turn, and the
+// deferred restoreTerminal shows the cursor. Keeps the terminal writer single.
 func TestCLISignalPathDoesNotWriteTerminal(t *testing.T) {
 	src, err := os.ReadFile("cli.go")
 	if err != nil {
 		t.Fatalf("read cli.go: %v", err)
 	}
-	body, ok := extractFunctionBody(string(src), "func (c *CLI) Run(")
+	body, ok := extractFunctionBody(string(src), "func (c *CLI) handleSignal(")
 	if !ok {
-		t.Fatal("Run not found")
+		t.Fatal("handleSignal not found")
 	}
 	if strings.Contains(body, "os.Stdout") {
-		t.Fatal("Run's signal handler must not write os.Stdout; the signal path only requestExit and restoreTerminal shows the cursor")
+		t.Fatal("handleSignal must not write os.Stdout; the signal path only requestExit or cancels, and restoreTerminal shows the cursor")
 	}
 }
 
@@ -1511,7 +1513,7 @@ func TestCLIPermissionResolvedBehindHeadLeavesDisplayAlone(t *testing.T) {
 
 	c.mu.Lock()
 	queue := append([]*agent.PermissionRequest(nil), c.permQueue...)
-	state := c.state
+	state := cliState(c.state.Load())
 	c.mu.Unlock()
 	if len(queue) != 1 || queue[0].ID != "p1" {
 		t.Fatalf("queue after behind-head resolution = %#v, want [p1]", queue)
@@ -1519,6 +1521,384 @@ func TestCLIPermissionResolvedBehindHeadLeavesDisplayAlone(t *testing.T) {
 	if state != statePermission {
 		t.Fatalf("state = %v, want statePermission (the displayed prompt is untouched)", state)
 	}
+}
+
+// blockingWriter signals the first Write and blocks every Write until release
+// closes, standing in for a stdout that stopped being read: mainLoop stalls
+// inside writeRaw holding c.mu.
+type blockingWriter struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingWriter) Write(p []byte) (int, error) {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	return len(p), nil
+}
+
+// TestCLIRunShutdownContract proves the exit is reachable while a terminal
+// write is stalled, and that the host sequence does not sit behind mainLoop.
+// The trigger is the point: a test that starts from an already-requested exit
+// bypasses the defect, which is that mainLoop holds c.mu inside a blocked
+// writeRaw and the SIGINT branch used to take c.mu to read state.
+// Exception, recorded per the contract-test rule: Run cannot be driven in a
+// test (term.MakeRaw on os.Stdin requires a real TTY), so the trigger is
+// driven through handleSignal, the extracted signal branch, against mainLoop
+// run directly, and the teardown decoupling is pinned structurally against
+// the Run body.
+func TestCLIRunShutdownContract(t *testing.T) {
+	t.Run("trigger=blocked_write", func(t *testing.T) {
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		c := New(nil)
+		c.out = &blockingWriter{entered: entered, release: release}
+		c.readKeyFn = func() (keyMsg, error) { return keyMsg{}, nil }
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		mainDone := make(chan error, 1)
+		go func() { mainDone <- c.mainLoop(ctx) }()
+
+		// Pump one event so mainLoop enters handleEvent -> writeRaw and stalls
+		// inside the write, holding c.mu.
+		c.enqueueEvent(agent.Event{Kind: agent.EventTextDelta, Result: "blocked"})
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("mainLoop did not enter the blocked write")
+		}
+
+		// The signal trigger while the write is stalled: the SIGINT branch's
+		// state read must not block on c.mu, or the branch never reaches
+		// requestExit and the exit is never triggered at all.
+		triggered := make(chan struct{})
+		go func() { c.handleSignal(syscall.SIGINT); close(triggered) }()
+		select {
+		case <-triggered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("SIGINT branch blocked behind the stalled write's c.mu; the exit is never triggered")
+		}
+		select {
+		case <-c.exitLatch:
+		default:
+			t.Fatal("signal did not trigger the exit latch while the write was blocked")
+		}
+
+		// mainLoop is still abandoned in the blocked write: the host sequence
+		// must not sit behind it.
+		select {
+		case <-mainDone:
+			t.Fatal("mainLoop returned while its write was still blocked")
+		default:
+		}
+
+		// Unblock the write: mainLoop unwinds to the latch and the exit
+		// completes with the signal's code.
+		close(release)
+		select {
+		case err := <-mainDone:
+			var exit ExitError
+			if !errors.As(err, &exit) || exit.Code != 130 {
+				t.Fatalf("mainLoop returned %v, want ExitError{130}", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("mainLoop did not unwind to the exit after the write unblocked")
+		}
+	})
+
+	t.Run("teardown=independent_of_mainLoop", func(t *testing.T) {
+		src, err := os.ReadFile("cli.go")
+		if err != nil {
+			t.Fatalf("read cli.go: %v", err)
+		}
+		body, ok := extractFunctionBody(string(src), "func (c *CLI) Run(")
+		if !ok {
+			t.Fatal("Run not found")
+		}
+		// mainLoop must not run inline in Run: the inline form puts the whole
+		// teardown behind a blocked terminal write.
+		if strings.Contains(body, "err = c.mainLoop(ctx)") {
+			t.Fatal("Run must not run mainLoop inline; teardown would sit behind a blocked terminal write")
+		}
+		// Run must wait on the exit latch, so a signal starts teardown while
+		// mainLoop is still blocked, and the teardown must follow that wait.
+		latchIdx := strings.Index(body, "case <-c.exitLatch:")
+		teardownIdx := strings.Index(body, "c.closeKeys()")
+		if latchIdx < 0 {
+			t.Fatal("Run must wait on the exit latch so teardown does not sit behind mainLoop")
+		}
+		if teardownIdx < 0 || teardownIdx < latchIdx {
+			t.Fatal("Run's teardown must follow the latch wait, not mainLoop's return")
+		}
+	})
+
+	t.Run("watcher=resize_then_terminate_lock_held", func(t *testing.T) {
+		// The signal watcher is a single goroutine servicing every signal
+		// from one channel, so no branch of it may wait on the render lock:
+		// a stalled write holds c.mu, and any branch that waits on it strands
+		// every later signal, including the one that would trigger the exit.
+		// The rule is swept structurally across every branch. Exception,
+		// recorded per the contract-test rule: the resize branch only takes
+		// the lock after term.GetSize succeeds, which needs a real terminal,
+		// so the no-lock sweep is structural and the ordering is behavioral.
+		src, err := os.ReadFile("cli.go")
+		if err != nil {
+			t.Fatalf("read cli.go: %v", err)
+		}
+		body, ok := extractFunctionBody(string(src), "func (c *CLI) handleSignal(")
+		if !ok {
+			t.Fatal("handleSignal not found")
+		}
+		if strings.Contains(body, "c.mu.") {
+			t.Fatal("a signal watcher branch takes the render lock; a stalled write holds it and strands every later signal")
+		}
+
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		c := New(nil)
+		c.out = &blockingWriter{entered: entered, release: release}
+		c.rawFd = 0
+
+		// A stalled write holds the render lock.
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		// A resize is serviced promptly even while the lock is held...
+		resized := make(chan struct{})
+		go func() { c.handleSignal(syscall.SIGWINCH); close(resized) }()
+		select {
+		case <-resized:
+		case <-time.After(5 * time.Second):
+			t.Fatal("SIGWINCH branch did not return with the render lock held")
+		}
+		// ...and the terminate that follows it on the same watcher still
+		// reaches the exit latch.
+		c.handleSignal(syscall.SIGTERM)
+		select {
+		case <-c.exitLatch:
+		default:
+			t.Fatal("terminate did not reach the exit latch after a resize")
+		}
+	})
+
+	t.Run("watcher=signals_split_by_purpose", func(t *testing.T) {
+		// The runtime delivers signals non-blockingly and drops one whose
+		// channel is full, so every signal that can independently require its
+		// own action must be registered alone on its own channel: a shared
+		// channel lets one kind's burst discard a different kind (a resize
+		// burst or two cancelling interrupts can fill it and drop the
+		// terminate behind them), and with the render stalled nothing sets
+		// the exit latch.
+		src, err := os.ReadFile("cli.go")
+		if err != nil {
+			t.Fatalf("read cli.go: %v", err)
+		}
+		body, ok := extractFunctionBody(string(src), "func (c *CLI) Run(")
+		if !ok {
+			t.Fatal("Run not found")
+		}
+		signals := []string{"syscall.SIGWINCH", "syscall.SIGINT", "syscall.SIGTERM"}
+		for _, sig := range signals {
+			idx := strings.Index(body, sig)
+			if idx < 0 {
+				t.Fatalf("Run no longer registers %s", sig)
+			}
+			notifyStart := strings.LastIndex(body[:idx], "signal.Notify(")
+			if notifyStart < 0 {
+				t.Fatalf("%s is not registered via signal.Notify", sig)
+			}
+			notifyEnd := strings.Index(body[notifyStart:], ")")
+			reg := body[notifyStart : notifyStart+notifyEnd+1]
+			for _, other := range signals {
+				if other != sig && strings.Contains(reg, other) {
+					t.Fatalf("%s must be registered alone on its own channel, not with %s", sig, other)
+				}
+			}
+		}
+		wb, ok := extractFunctionBody(string(src), "func (c *CLI) watchSignals(")
+		if !ok {
+			t.Fatal("watchSignals not found")
+		}
+		if strings.Count(wb, "case sig := <-") != 3 {
+			t.Fatal("watchSignals must select on the resize, interrupt and terminate channels")
+		}
+	})
+
+	t.Run("watcher=two_interrupts_then_terminate", func(t *testing.T) {
+		// deliver simulates the runtime's signal delivery: a non-blocking
+		// send that drops the signal when the channel is full.
+		deliver := func(ch chan os.Signal, sig os.Signal) bool {
+			select {
+			case ch <- sig:
+				return true
+			default:
+				return false
+			}
+		}
+
+		// Two interrupts arrive during a turn, so neither exits. They ride
+		// their own channel and the terminate rides its own, so the queued
+		// cancels can never occupy the slot a terminate needs.
+		resizeCh := make(chan os.Signal, 1)
+		intCh := make(chan os.Signal, 2)
+		termCh := make(chan os.Signal, 1)
+		deliver(intCh, syscall.SIGINT)
+		deliver(intCh, syscall.SIGINT)
+		terminateDelivered := deliver(termCh, syscall.SIGTERM)
+		if !terminateDelivered {
+			t.Fatal("terminate was dropped despite its own channel")
+		}
+
+		c := New(nil)
+		c.state.Store(int32(stateStreaming)) // a turn is running: SIGINT cancels, not exits
+		c.mu.Lock()                          // a stalled write holds the render lock
+		defer c.mu.Unlock()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go c.watchSignals(termCh, intCh, resizeCh, ctx)
+
+		select {
+		case <-c.exitLatch:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("terminate did not reach the exit latch after two cancelling interrupts (delivered=%v)", terminateDelivered)
+		}
+	})
+
+	t.Run("watcher=resize_burst_then_terminate", func(t *testing.T) {
+		// deliver simulates the runtime's signal delivery: a non-blocking
+		// send that drops the signal when the channel is full.
+		deliver := func(ch chan os.Signal, sig os.Signal) bool {
+			select {
+			case ch <- sig:
+				return true
+			default:
+				return false
+			}
+		}
+
+		// A resize burst arrives before the watcher drains the channel: the
+		// first resize occupies the one slot, the rest are dropped (resizes
+		// coalesce, so that is harmless). The terminate rides its own
+		// channel, so the burst cannot displace it.
+		resizeCh := make(chan os.Signal, 1)
+		intCh := make(chan os.Signal, 2)
+		termCh := make(chan os.Signal, 1)
+		deliver(resizeCh, syscall.SIGWINCH)
+		deliver(resizeCh, syscall.SIGWINCH)
+		deliver(resizeCh, syscall.SIGWINCH)
+		terminateDelivered := deliver(termCh, syscall.SIGTERM)
+		if !terminateDelivered {
+			t.Fatal("terminate was dropped despite its own channel")
+		}
+
+		c := New(nil)
+		c.mu.Lock() // a stalled write holds the render lock
+		defer c.mu.Unlock()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go c.watchSignals(termCh, intCh, resizeCh, ctx)
+
+		select {
+		case <-c.exitLatch:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("terminate did not reach the exit latch after a resize burst (delivered=%v)", terminateDelivered)
+		}
+	})
+}
+
+// TestCLIRestoreTerminalUnblockedByStalledWrite proves restoreTerminal only
+// restores the terminal mode and never writes the output, whatever the output
+// is doing and whoever holds the render lock: no exit path may depend on the
+// output draining, and no fact available at exit — the lock's state or the
+// loop having finished — establishes that the output is writable. A filled
+// pipe with a dead reader hangs any write, so the cursor escape was removed
+// outright. What is given up: exiting mid-spinner leaves the cursor hidden
+// until the next prompt redraws it (the spinner shows the cursor again when
+// it stops, so the exit-time write only ever covered the mid-run exit).
+func TestCLIRestoreTerminalUnblockedByStalledWrite(t *testing.T) {
+	t.Run("output_normal_nothing_written", func(t *testing.T) {
+		var out bytes.Buffer
+		c := New(nil)
+		c.out = &out
+		c.rawFd = 0
+		c.oldState = &term.State{}
+
+		c.restoreTerminal()
+
+		if c.oldState != nil {
+			t.Fatal("restoreTerminal did not restore the terminal mode")
+		}
+		if out.Len() != 0 {
+			t.Fatalf("restoreTerminal wrote to the output: %q", out.String())
+		}
+	})
+
+	t.Run("stalled_output_lock_free_writes_nothing", func(t *testing.T) {
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		c := New(nil)
+		c.out = &blockingWriter{entered: entered, release: release}
+		c.rawFd = 0
+		c.oldState = &term.State{}
+
+		// No render lock is held — the shape that exposed the last guard: a
+		// stalled write from the lock-free clipboard path coexists with a
+		// free lock.
+		done := make(chan struct{})
+		go func() {
+			c.restoreTerminal()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("restoreTerminal did not return with the output stalled and the lock free")
+		}
+		if c.oldState != nil {
+			t.Fatal("restoreTerminal did not restore the terminal mode")
+		}
+		select {
+		case <-entered:
+			t.Fatal("restoreTerminal wrote to a stalled output")
+		default:
+		}
+	})
+
+	t.Run("stalled_output_lock_held_writes_nothing", func(t *testing.T) {
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		c := New(nil)
+		c.out = &blockingWriter{entered: entered, release: release}
+		c.rawFd = 0
+		c.oldState = &term.State{}
+
+		// The render lock is held, as by mainLoop inside a blocked writeRaw.
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		done := make(chan struct{})
+		go func() {
+			c.restoreTerminal()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("restoreTerminal did not return with the render lock held")
+		}
+		if c.oldState != nil {
+			t.Fatal("restoreTerminal did not restore the terminal mode")
+		}
+		select {
+		case <-entered:
+			t.Fatal("restoreTerminal wrote to a stalled output")
+		default:
+		}
+	})
 }
 
 // TestCLIShutdownAbandonedReturnsError pins Run's teardown fold: when the
