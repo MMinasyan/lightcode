@@ -1836,3 +1836,64 @@ func TestDispatchConfig(t *testing.T) {
 		}
 	})
 }
+
+// TestRemovedOwnerTransportSymbols proves the removed daemon transport cannot
+// silently return: serve and stop resolve as unknown commands through
+// findCommand's nil path, and zero references to the transport's package and
+// symbols exist anywhere in the tree.
+func TestRemovedOwnerTransportSymbols(t *testing.T) {
+	for _, name := range []string{"serve", "stop"} {
+		if cmd := findCommand(name); cmd != nil {
+			t.Fatalf("%q must resolve as an unknown command, got %#v", name, cmd)
+		}
+	}
+
+	symbols := []string{
+		"internal/server",
+		"runServe",
+		"runStop",
+		"server.NewClient",
+		"AttachAdapter",
+		"WaitOwner",
+		"/v1/adapter",
+	}
+	// The scan covers every code file in the product tree — Go, the
+	// frontend's Svelte/TS/JS/JSON/HTML — so a reference added anywhere in
+	// the repo (including the frontend) fails. Dot-directories are the
+	// repo's private/local material (.git, .office, .claude, .opencode),
+	// and node_modules/dist/build are dependencies and build output; none
+	// is product code. Test files may carry these symbols as the data of
+	// absence assertions, which is not a reference to the removed transport.
+	codeExts := map[string]bool{
+		".go": true, ".svelte": true, ".ts": true, ".js": true,
+		".mjs": true, ".cjs": true, ".json": true, ".html": true,
+	}
+	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name != "." && (strings.HasPrefix(name, ".") || name == "node_modules" || name == "dist" || name == "build") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !codeExts[filepath.Ext(path)] || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, symbol := range symbols {
+			if strings.Contains(string(b), symbol) {
+				t.Errorf("%s references removed owner transport symbol %q", path, symbol)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+}

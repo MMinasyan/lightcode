@@ -18,6 +18,8 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
+	"github.com/MMinasyan/lightcode/internal/project"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"golang.org/x/term"
 )
 
@@ -628,166 +630,540 @@ func TestCLIExitReturnsExitError(t *testing.T) {
 	}
 }
 
-// TestCLISelectionOnlyRouting verifies /session, /resume, /new, and /project
-// change only the current selection: idle success retains the source session
-// (no teardown); a busy CLI rejects the command unchanged; and a destination
-// failure leaves the source selection unchanged.
-func TestCLISelectionOnlyRouting(t *testing.T) {
-	t.Run("resume_idle_success_retains_source", func(t *testing.T) {
-		a, _ := newTestAgent(t)
-		c := New(a)
-		out := new(bytes.Buffer)
-		c.out = out
-		source, _ := a.NewSession("", "primary")
-		dest, _ := a.NewSession("", "primary")
-		c.setCurrentSessionID(source)
+// TestCLISelectionOnlyContract proves /session, /resume, /new, and /project
+// change only the current selection. For every command: an idle success
+// retains the source session's live claim with no teardown, a busy CLI
+// rejects the command unchanged, a destination failure leaves the source
+// selection unchanged, and an idle success replaces the source's queue
+// display with the destination's lower-version snapshot instead of dropping
+// it as stale against the source's cursor.
+func TestCLISelectionOnlyContract(t *testing.T) {
+	for _, cmd := range []string{"/session", "/resume", "/new", "/project"} {
+		cmd := cmd
+		t.Run(cmd+"/idle_success=source_live_claim_retained_no_teardown", func(t *testing.T) {
+			a, c, _, source := selectionCLI(t)
+			switch cmd {
+			case "/resume":
+				// Cross-project destination: the selection commits the
+				// destination project so later project-scoped routes target
+				// it, and the project-scoped list then shows the destination.
+				dest, otherRoot := sessionInOtherProject(t, c)
+				dispatchSelection(t, c, cmd, dest)
+				wantCurrent(t, c, dest)
+				wantProjectCommitted(t, c, otherRoot, dest)
+				// A destination whose metadata is unreadable still routes
+				// there: the summary carries the resolved project.
+				dest2, otherRoot2 := sessionInOtherProject(t, c)
+				corruptSessionMeta(t, a, otherRoot2, dest2)
+				dispatchSelection(t, c, cmd, dest2)
+				wantCurrent(t, c, dest2)
+				wantProjectPath(t, c, otherRoot2)
+			case "/new":
+				dispatchSelection(t, c, cmd, "")
+				got, err := c.currentSession()
+				if err != nil || got == "" || got == source {
+					t.Fatalf("current after /new = %q (err %v), want a new session distinct from source", got, err)
+				}
+			case "/session":
+				dest := secondSession(t, c)
+				selectSessionByID(t, c, dest)
+				dispatchSelection(t, c, cmd, "")
+				wantCurrent(t, c, dest)
+			case "/project":
+				dest, otherRoot := sessionInOtherProject(t, c)
+				selectProjectByPath(t, c, otherRoot)
+				dispatchSelection(t, c, cmd, "")
+				wantCurrent(t, c, dest)
+				wantProjectCommitted(t, c, otherRoot, dest)
+			}
+			if !sourceClaimRetained(c, source) {
+				t.Fatalf("source session %q lost its live claim", source)
+			}
+		})
 
-		if err := c.dispatchCommand("/resume " + dest); err != nil {
-			t.Fatalf("/resume: %v", err)
-		}
-		if got, _ := c.currentSession(); got != dest {
-			t.Fatalf("current after /resume = %q, want dest %q", got, dest)
-		}
-		// The source session was not torn down: it is still openable.
-		if _, err := a.SessionSummaryForSession(source); err != nil {
-			t.Fatalf("source session was torn down by selection: %v", err)
-		}
-	})
-
-	t.Run("new_idle_success_retains_source", func(t *testing.T) {
-		a, _ := newTestAgent(t)
-		c := New(a)
-		out := new(bytes.Buffer)
-		c.out = out
-		source, _ := a.NewSession("", "primary")
-		c.setCurrentSessionID(source)
-
-		if err := c.dispatchCommand("/new"); err != nil {
-			t.Fatalf("/new: %v", err)
-		}
-		if got, _ := c.currentSession(); got == source || got == "" {
-			t.Fatalf("current after /new = %q, want a new session distinct from source", got)
-		}
-		if _, err := a.SessionSummaryForSession(source); err != nil {
-			t.Fatalf("source session was torn down by /new: %v", err)
-		}
-	})
-
-	t.Run("busy_rejected_unchanged", func(t *testing.T) {
-		for _, cmd := range []string{"/session", "/resume x", "/new", "/project"} {
-			a, _ := newTestAgent(t)
-			c := New(a)
-			out := new(bytes.Buffer)
-			c.out = out
-			source, _ := a.NewSession("", "primary")
-			c.setCurrentSessionID(source)
-
-			c.handleSlashWhileBusy(cmd)
-
+		t.Run(cmd+"/busy=rejected_unchanged", func(t *testing.T) {
+			_, c, out, source := selectionCLI(t)
+			busyCmd := cmd
+			if cmd == "/resume" {
+				busyCmd = "/resume x"
+			}
+			c.handleSlashWhileBusy(busyCmd)
 			if !strings.Contains(out.String(), "cannot run this command while a turn is running") {
 				t.Fatalf("%q while busy = %q, want rejection", cmd, out.String())
 			}
 			if got, _ := c.currentSession(); got != source {
 				t.Fatalf("%q while busy changed current to %q, want unchanged %q", cmd, got, source)
 			}
-		}
-	})
+		})
 
-	t.Run("resume_cross_project_commits_destination", func(t *testing.T) {
-		a, _ := newTestAgent(t)
-		c := New(a)
-		out := new(bytes.Buffer)
-		c.out = out
-		source, _ := a.NewSession("", "primary")
-		otherRoot := t.TempDir()
-		dest, _ := a.NewSessionForProjectPath(otherRoot, "primary")
-		c.setCurrentSessionID(source)
+		t.Run(cmd+"/destination_failure=selection_source_claim_unchanged", func(t *testing.T) {
+			a, c, out, source := selectionCLI(t)
+			switch cmd {
+			case "/resume":
+				dispatchSelection(t, c, cmd, "does-not-exist")
+			case "/new":
+				// The destination project is unreadable: its meta record is
+				// corrupt, so the new-session create cannot proceed.
+				badPath := filepath.Join(t.TempDir(), "blocked")
+				proj, err := project.EnsureForPath(a.Projects().Root(), badPath)
+				if err != nil {
+					t.Fatalf("EnsureForPath(%q): %v", badPath, err)
+				}
+				if err := os.WriteFile(filepath.Join(a.Projects().Root(), proj.ID, "meta.json"), []byte("{not json"), 0o600); err != nil {
+					t.Fatalf("corrupt destination project meta: %v", err)
+				}
+				c.scope.SetProjectPath(badPath)
+				dispatchSelection(t, c, cmd, "")
+			case "/session":
+				// The destination is listed but driven by another process
+				// (its claim is held), so the open fails.
+				dest := holderSession(t, a, c.scope.ProjectPath())
+				selectSessionByID(t, c, dest)
+				dispatchSelection(t, c, cmd, "")
+				if !strings.Contains(out.String(), "driven by another process") {
+					t.Fatalf("/session over a contended destination = %q, want the contention error", out.String())
+				}
+			case "/project":
+				// The destination project's session is driven by another
+				// process (its claim is held), so the switch fails.
+				otherRoot := t.TempDir()
+				holderSession(t, a, otherRoot)
+				selectProjectByPath(t, c, otherRoot)
+				dispatchSelection(t, c, cmd, "")
+				if !strings.Contains(out.String(), "driven by another process") {
+					t.Fatalf("/project over a contended destination = %q, want the contention error", out.String())
+				}
+			}
+			if got, _ := c.currentSession(); got != source {
+				t.Fatalf("current after failed %s = %q, want unchanged source %q", cmd, got, source)
+			}
+			if !sourceClaimRetained(c, source) {
+				t.Fatalf("source session %q lost its live claim", source)
+			}
+		})
 
-		if err := c.dispatchCommand("/resume " + dest); err != nil {
-			t.Fatalf("/resume: %v", err)
-		}
-		if got, _ := c.currentSession(); got != dest {
-			t.Fatalf("current after /resume = %q, want dest %q", got, dest)
-		}
-		// The project-scoped routes must now target the destination project.
-		if got := c.scope.ProjectPath(); got != otherRoot {
-			t.Fatalf("project path after /resume = %q, want destination %q", got, otherRoot)
-		}
-		sessions, err := c.scope.SessionList("active")
-		if err != nil {
-			t.Fatalf("SessionList: %v", err)
-		}
-		if len(sessions) != 1 || sessions[0].ID != dest {
-			t.Fatalf("project-scoped session list after /resume = %#v, want only %q", sessions, dest)
-		}
-	})
+		t.Run(cmd+"/queue_version=destination_lower_than_source_replaces", func(t *testing.T) {
+			_, c, _, _ := selectionCLI(t)
+			// A high version cursor left over from the source session: the
+			// destination's lower-version snapshot must replace it, not be
+			// dropped as stale against the source sibling's cursor.
+			c.lastQueueVersion = 100
+			c.queueDisplay = []agent.QueuedItem{{Content: "stale source queue"}}
+			switch cmd {
+			case "/resume":
+				dest := secondSession(t, c)
+				dispatchSelection(t, c, cmd, dest)
+			case "/new":
+				dispatchSelection(t, c, cmd, "")
+			case "/session":
+				dest := secondSession(t, c)
+				selectSessionByID(t, c, dest)
+				dispatchSelection(t, c, cmd, "")
+			case "/project":
+				_, otherRoot := sessionInOtherProject(t, c)
+				selectProjectByPath(t, c, otherRoot)
+				dispatchSelection(t, c, cmd, "")
+			}
+			want := c.queueSnapshot()
+			if c.lastQueueVersion != want.Version {
+				t.Fatalf("queue cursor after %s = %d, want the destination's snapshot version %d", cmd, c.lastQueueVersion, want.Version)
+			}
+			if !reflect.DeepEqual(c.queueDisplay, want.Items) {
+				t.Fatalf("queue display after %s = %#v, want the destination's %#v", cmd, c.queueDisplay, want.Items)
+			}
+		})
+	}
 
-	t.Run("resume_unreadable_meta_routes_destination", func(t *testing.T) {
-		a, _ := newTestAgent(t)
-		c := New(a)
-		out := new(bytes.Buffer)
-		c.out = out
-		source, _ := a.NewSession("", "primary")
-		otherRoot := t.TempDir()
-		dest, _ := a.NewSessionForProjectPath(otherRoot, "primary")
-		c.setCurrentSessionID(source)
-
-		// Corrupt the destination's metadata so its summary cannot read a
-		// project path; the owner still resolves the unit against its project,
-		// so the resume routes to the destination.
-		proj, err := a.ProjectCurrentForPath(otherRoot)
-		if err != nil {
-			t.Fatalf("destination project: %v", err)
-		}
-		if err := os.WriteFile(filepath.Join(a.Projects().SessionsRoot(proj.ID), dest, "meta.json"), []byte("{not json"), 0o600); err != nil {
-			t.Fatalf("corrupt destination meta: %v", err)
-		}
-
-		if err := c.dispatchCommand("/resume " + dest); err != nil {
-			t.Fatalf("/resume: %v", err)
-		}
-		if got := c.scope.ProjectPath(); got != otherRoot {
-			t.Fatalf("project path after /resume with unreadable meta = %q, want destination %q", got, otherRoot)
-		}
-	})
-
-	t.Run("resume_destination_failure_source_unchanged", func(t *testing.T) {
-		a, _ := newTestAgent(t)
-		c := New(a)
-		out := new(bytes.Buffer)
-		c.out = out
-		source, _ := a.NewSession("", "primary")
-		c.setCurrentSessionID(source)
-
-		if err := c.dispatchCommand("/resume does-not-exist"); err != nil {
-			t.Fatalf("/resume unexpected error return: %v", err)
-		}
-		if got, _ := c.currentSession(); got != source {
-			t.Fatalf("current after failed /resume = %q, want unchanged source %q", got, source)
+	// The no-teardown barrier: no selection path calls a teardown operation,
+	// so the source session is never stopped, cancelled, closed, detached,
+	// evicted, or shut down by a selection.
+	t.Run("no_teardown=selection_paths", func(t *testing.T) {
+		for _, file := range []string{"cli.go", "menu.go"} {
+			src, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatalf("read %s: %v", file, err)
+			}
+			s := string(src)
+			for _, fn := range selectionFuncsIn(file) {
+				body, ok := extractFunctionBody(s, fn)
+				if !ok {
+					t.Fatalf("selection function %q not found in %s; the teardown scan must cover it", fn, file)
+				}
+				for _, bad := range []string{"CancelSession", "ShutdownOwner", "DetachAdapter", "closeEvents", "closeKeys"} {
+					if strings.Contains(body, bad) {
+						t.Fatalf("%s must not tear down the source session; found %s", fn, bad)
+					}
+				}
+			}
 		}
 	})
 }
 
-// TestCLISelectionCommandsHaveNoTeardown proves no selection path tears down the
-// source session: none call cancel/stop/close/detach/evict/shutdown.
-func TestCLISelectionCommandsHaveNoTeardown(t *testing.T) {
-	for _, file := range []string{"cli.go", "menu.go"} {
-		src, err := os.ReadFile(file)
-		if err != nil {
-			t.Fatalf("read %s: %v", file, err)
+// selectionCLI builds a CLI over a fresh agent with one source session
+// selected and its output captured.
+func selectionCLI(t *testing.T) (*agent.Agent, *CLI, *bytes.Buffer, string) {
+	t.Helper()
+	a, _ := newTestAgent(t)
+	source, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("source NewSession: %v", err)
+	}
+	c := New(a)
+	out := new(bytes.Buffer)
+	c.out = out
+	c.setCurrentSessionID(source)
+	return a, c, out, source
+}
+
+// secondSession creates one more session in the CLI's project.
+func secondSession(t *testing.T, c *CLI) string {
+	t.Helper()
+	id, err := c.agent.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	return id
+}
+
+// sessionInOtherProject creates a session in a fresh project and returns the
+// session id and the project path.
+func sessionInOtherProject(t *testing.T, c *CLI) (string, string) {
+	t.Helper()
+	otherRoot := t.TempDir()
+	dest, err := c.agent.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath: %v", err)
+	}
+	return dest, otherRoot
+}
+
+// corruptSessionMeta makes the session's persisted metadata unreadable.
+func corruptSessionMeta(t *testing.T, a *agent.Agent, projectPath, sessionID string) {
+	t.Helper()
+	proj, err := a.ProjectCurrentForPath(projectPath)
+	if err != nil {
+		t.Fatalf("ProjectCurrentForPath(%q): %v", projectPath, err)
+	}
+	if err := os.WriteFile(filepath.Join(a.Projects().SessionsRoot(proj.ID), sessionID, "meta.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("corrupt destination meta: %v", err)
+	}
+}
+
+// holderSession creates a session on disk through a bare snapshot store that
+// keeps the session claim, standing in for a destination driven by another
+// process: it is listed but cannot be opened here.
+func holderSession(t *testing.T, a *agent.Agent, projectPath string) string {
+	t.Helper()
+	proj, err := a.ProjectCurrentForPath(projectPath)
+	if err != nil {
+		t.Fatalf("ProjectCurrentForPath(%q): %v", projectPath, err)
+	}
+	holder, err := snapshot.NewForSessionsRoot(a.Projects().SessionsRoot(proj.ID), a.Projects().Root(), proj.ID)
+	if err != nil {
+		t.Fatalf("holder store: %v", err)
+	}
+	if err := holder.BeginNewSession(projectPath); err != nil {
+		t.Fatalf("holder BeginNewSession: %v", err)
+	}
+	t.Cleanup(func() { holder.Detach() })
+	return holder.SessionID()
+}
+
+// menuKeys returns a key source that navigates down n items and presses
+// enter, selecting the n-th item (0-based) of a menu.
+func menuKeys(n int) func() (keyMsg, error) {
+	return func() (keyMsg, error) {
+		if n > 0 {
+			n--
+			return keyMsg{Special: keyDown}, nil
 		}
-		s := string(src)
-		for _, fn := range selectionFuncsIn(file) {
-			body, ok := extractFunctionBody(s, fn)
-			if !ok {
-				t.Fatalf("selection function %q not found in %s; the teardown scan must cover it", fn, file)
+		return keyMsg{Special: keyEnter}, nil
+	}
+}
+
+// selectSessionByID wires the key source to select the given session in the
+// session menu, using the CLI's own project-scoped listing order.
+func selectSessionByID(t *testing.T, c *CLI, id string) {
+	t.Helper()
+	sessions, err := c.agent.SessionListForProjectPath(c.scope.ProjectPath(), "active")
+	if err != nil {
+		t.Fatalf("SessionListForProjectPath: %v", err)
+	}
+	idx := -1
+	for i, s := range sessions {
+		if s.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatalf("destination %q not listed in the session menu", id)
+	}
+	c.readKeyFn = menuKeys(idx)
+}
+
+// selectProjectByPath wires the key source to select the given project in the
+// project menu, using the host's own listing order.
+func selectProjectByPath(t *testing.T, c *CLI, path string) {
+	t.Helper()
+	projects, err := c.agent.ProjectList()
+	if err != nil {
+		t.Fatalf("ProjectList: %v", err)
+	}
+	idx := -1
+	for i, p := range projects {
+		if p.Path == path {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatalf("project %q not listed in the project menu", path)
+	}
+	c.readKeyFn = menuKeys(idx)
+}
+
+// dispatchSelection runs the given selection command against the wired CLI.
+func dispatchSelection(t *testing.T, c *CLI, cmd, dest string) {
+	t.Helper()
+	var err error
+	switch cmd {
+	case "/resume":
+		err = c.dispatchCommand("/resume " + dest)
+	default:
+		err = c.dispatchCommand(cmd)
+	}
+	if err != nil {
+		t.Fatalf("%s: %v", cmd, err)
+	}
+}
+
+func wantCurrent(t *testing.T, c *CLI, want string) {
+	t.Helper()
+	if got, _ := c.currentSession(); got != want {
+		t.Fatalf("current = %q, want %q", got, want)
+	}
+}
+
+func wantProjectPath(t *testing.T, c *CLI, want string) {
+	t.Helper()
+	if got := c.scope.ProjectPath(); got != want {
+		t.Fatalf("project path = %q, want %q", got, want)
+	}
+}
+
+// wantProjectCommitted asserts the destination project is committed: the
+// scope routes there and its project-scoped session list shows the
+// destination.
+func wantProjectCommitted(t *testing.T, c *CLI, otherRoot, dest string) {
+	t.Helper()
+	wantProjectPath(t, c, otherRoot)
+	sessions, err := c.scope.SessionList("active")
+	if err != nil {
+		t.Fatalf("SessionList: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != dest {
+		t.Fatalf("project-scoped session list after selection = %#v, want only %q", sessions, dest)
+	}
+}
+
+// sourceClaimRetained reports whether the source session is still live and
+// claimable after a selection.
+func sourceClaimRetained(c *CLI, source string) bool {
+	_, err := c.agent.SessionSummaryForSession(source)
+	return err == nil
+}
+
+// TestAdapterOperationParity proves the contract route set is reachable on
+// every host — the Wails bindings, the terminal host, and the ACP method
+// table — and that the routes the contract excludes stay absent. The absent
+// half is the point: it is what stops a later change quietly adding a route
+// the contract excludes. The checks are structural: each cell asserts the
+// named entry points exist (or do not exist) in the host's own source, not
+// that they are reachable from the process entry.
+func TestAdapterOperationParity(t *testing.T) {
+	readHost := func(files ...string) string {
+		t.Helper()
+		var sb strings.Builder
+		for _, f := range files {
+			b, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatalf("read %s: %v", f, err)
 			}
-			for _, bad := range []string{"CancelSession", "ShutdownOwner", "DetachAdapter", "closeEvents", "closeKeys"} {
-				if strings.Contains(body, bad) {
-					t.Fatalf("%s must not tear down the source session; found %s", fn, bad)
+			sb.Write(b)
+		}
+		return sb.String()
+	}
+	wails := readHost("../../app.go", "../../main.go", "../../frontend/src/App.svelte")
+	cli := readHost("cli.go", "menu.go", "input.go")
+	acp := readHost("../acp/acp.go")
+
+	type cell struct {
+		adapter string
+		route   string
+		present bool
+		needle  []string // present: every needle must exist; absent: none may
+	}
+	cells := []cell{
+		// Session list / open-resume / new / switch / fork / archive / delete.
+		{"wails", "session_list", true, []string{"func (a *App) SessionList("}},
+		{"cli", "session_list", true, []string{`case "/session":`, "showSessionMenu("}},
+		{"acp", "session_list", true, []string{`"session/list"`}},
+
+		{"wails", "session_open_resume", true, []string{"func (a *App) SessionSwitch("}},
+		{"cli", "session_open_resume", true, []string{`case "/resume":`, "func (c *CLI) cmdResume("}},
+		{"acp", "session_open_resume", true, []string{`"session/switch"`}},
+
+		{"wails", "session_new", true, []string{"func (a *App) SessionNew("}},
+		{"cli", "session_new", true, []string{`case "/new":`, "NewSession("}},
+		{"acp", "session_new", true, []string{`"session/new"`}},
+
+		{"wails", "session_switch", true, []string{"func (a *App) SessionSwitch("}},
+		{"cli", "session_switch", true, []string{"showSessionMenuWithActions(", "OpenSession("}},
+		{"acp", "session_switch", true, []string{`"session/switch"`}},
+
+		{"wails", "session_fork", true, []string{"func (a *App) ForkSession(", "func (a *App) ApplyTurnAction("}},
+		{"cli", "session_fork", true, []string{`case "/fork":`, "showRevertMenu("}},
+		{"acp", "session_fork", true, []string{`"session/fork"`}},
+
+		{"wails", "session_archive", true, []string{"func (a *App) SessionArchive("}},
+		{"cli", "session_archive", true, []string{"SessionArchive("}},
+		{"acp", "session_archive", true, []string{`"session/archive"`}},
+
+		{"wails", "session_delete", true, []string{"func (a *App) SessionDelete("}},
+		{"cli", "session_delete", true, []string{"SessionDelete("}},
+		{"acp", "session_delete", true, []string{`"session/delete"`}},
+
+		// Submit / cancel.
+		{"wails", "submit", true, []string{"func (a *App) Submit("}},
+		{"cli", "submit", true, []string{"submitToBackend("}},
+		{"acp", "submit", true, []string{`"session/prompt"`}},
+
+		{"wails", "cancel", true, []string{"func (a *App) Cancel("}},
+		{"cli", "cancel", true, []string{"cancelCurrent(", "case keyCtrlC, keyEscape:"}},
+		{"acp", "cancel", true, []string{`"session/cancel"`}},
+
+		// Queue; permission response.
+		{"wails", "queue", true, []string{"func (a *App) QueueSnapshot("}},
+		{"cli", "queue", true, []string{"queueSnapshot("}},
+		{"acp", "queue", true, []string{`"queue/list"`}},
+
+		{"wails", "permission_respond", true, []string{"func (a *App) RespondPermission("}},
+		{"cli", "permission_respond", true, []string{"popAndRespondAction("}},
+		{"acp", "permission_respond", true, []string{`"permission/respond"`}},
+
+		{"wails", "permission_suggest", true, []string{"func (a *App) PermissionSuggest("}},
+		{"cli", "permission_suggest", true, []string{"showPermissionSuggestions("}},
+		{"acp", "permission_suggest", true, []string{`"permission/suggest"`}},
+
+		{"wails", "permission_save", true, []string{"func (a *App) SaveProjectPermission("}},
+		{"cli", "permission_save", true, []string{"SaveProjectPermissionForSession("}},
+		{"acp", "permission_save", true, []string{`"permission/save"`}},
+
+		// Selected-root model current / switch.
+		{"wails", "model_current", true, []string{"func (a *App) CurrentModel("}},
+		{"cli", "model_current", true, []string{`case "/model":`, "showModelMenu("}},
+		{"acp", "model_current", true, []string{`"model/current"`}},
+
+		{"wails", "model_switch", true, []string{"func (a *App) SwitchModel("}},
+		{"cli", "model_switch", true, []string{"SwitchModelForSession("}},
+		{"acp", "model_switch", true, []string{`"model/switch"`}},
+
+		// Complete-state hydration / ordered events.
+		{"wails", "session_current", true, []string{"func (a *App) SessionCurrent("}},
+		{"cli", "session_current", true, []string{"refreshSessionLocked("}},
+		{"acp", "session_current", true, []string{`"session/current"`}},
+
+		{"wails", "session_messages", true, []string{"func (a *App) SessionMessages(", "func (a *App) SessionMessagesFor("}},
+		{"cli", "session_messages", true, []string{"SessionMessagesFor("}},
+		{"acp", "session_messages", true, []string{`"session/messages"`}},
+
+		{"wails", "state_snapshots", true, []string{"func (a *App) HydrateSession(", "EventsOn('navigation'", "EventsOn('resync'"}},
+		{"cli", "state_snapshots", true, []string{"refreshState("}},
+		{"acp", "state_snapshots", true, []string{"pushResyncForEvent("}},
+
+		{"wails", "events", true, []string{"EventsOn('turn_start'"}},
+		{"cli", "events", true, []string{"func (c *CLI) handleEvent("}},
+		{"acp", "events", true, []string{`"agent/turn_end"`}},
+
+		// Project access.
+		{"wails", "project_list", true, []string{"func (a *App) ProjectList("}},
+		{"cli", "project_list", true, []string{`case "/project":`, "showProjectMenu("}},
+		{"acp", "project_list", true, []string{`"project/list"`}},
+
+		{"wails", "project_current", true, []string{"func (a *App) ProjectCurrent("}},
+		{"cli", "project_current", true, []string{"ProjectCurrent("}},
+		{"acp", "project_current", true, []string{`"project/current"`}},
+
+		{"wails", "project_switch", true, []string{"func (a *App) ProjectSwitch(", "func (a *App) ProjectPickAndSwitch("}},
+		{"cli", "project_switch", true, []string{"projectSwitch("}},
+		{"acp", "project_switch", false, []string{`"project/switch"`}},
+
+		// Snapshot / revert.
+		{"wails", "snapshot_list", true, []string{"func (a *App) SnapshotList("}},
+		{"cli", "snapshot_list", false, []string{`"/snapshot"`, "SnapshotList"}},
+		{"acp", "snapshot_list", true, []string{`"snapshot/list"`}},
+
+		{"wails", "revert_code", true, []string{"func (a *App) RevertCode("}},
+		{"cli", "revert_code", true, []string{`case "/revert":`, "TurnActionRevertCode"}},
+		{"acp", "revert_code", true, []string{`"session/revert_code"`}},
+
+		{"wails", "revert_history", true, []string{"func (a *App) RevertHistory("}},
+		{"cli", "revert_history", true, []string{"TurnActionRevertHistory"}},
+		{"acp", "revert_history", true, []string{`"session/revert_history"`}},
+
+		// Host shutdown trigger — and no shutdown RPC anywhere.
+		{"wails", "shutdown_trigger", true, []string{"OnShutdown: app.shutdown"}},
+		{"cli", "shutdown_trigger", true, []string{`case "/exit":`, "signal.Notify(intCh, syscall.SIGINT)", "signal.Notify(termCh, syscall.SIGTERM)"}},
+		{"acp", "shutdown_trigger", true, []string{"signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)", "!scanner.Scan()"}},
+
+		// A shutdown RPC is absent in every shape it could take on each host:
+		// a Wails-bound shutdown/stop/exit-style method, a terminal slash
+		// route naming the action, and an ACP method that is the bare
+		// "shutdown" or any namespace ending in "/shutdown".
+		{"wails", "shutdown_rpc", false, []string{"func (a *App) Shutdown", "func (a *App) Stop", "func (a *App) Exit", "func (a *App) Quit", "func (a *App) Terminate"}},
+		{"cli", "shutdown_rpc", false, []string{`"/shutdown"`, `"/stop"`, `"/quit"`}},
+		{"acp", "shutdown_rpc", false, []string{`"shutdown`, `/shutdown"`}},
+
+		// The excluded provider/config routes (a Wails-only surface) and the
+		// removed public process-management surface stay off the other hosts.
+		{"cli", "provider_management", false, []string{"ConnectProvider(", "ProviderList("}},
+		{"acp", "provider_management", false, []string{`"provider/`}},
+		{"cli", "config_editing", false, []string{"SetRuntimeConfig(", "GetRuntimeConfig("}},
+		{"acp", "config_editing", false, []string{`"runtime_config"`, `"config/set"`}},
+		{"wails", "public_process_management", false, []string{"AttachAdapter", "WaitOwner", "runServe", "runStop"}},
+		{"cli", "public_process_management", false, []string{`"/serve"`, `"/attach"`}},
+		{"acp", "public_process_management", false, []string{`"owner/`, `"attach"`, `"serve"`}},
+	}
+
+	for _, cell := range cells {
+		cell := cell
+		status := "present"
+		if !cell.present {
+			status = "absent"
+		}
+		t.Run(fmt.Sprintf("adapter=%s/route=%s/%s", cell.adapter, cell.route, status), func(t *testing.T) {
+			var host string
+			switch cell.adapter {
+			case "wails":
+				host = wails
+			case "cli":
+				host = cli
+			case "acp":
+				host = acp
+			default:
+				t.Fatalf("unknown adapter %q", cell.adapter)
+			}
+			for _, needle := range cell.needle {
+				ok := strings.Contains(host, needle)
+				if cell.present && !ok {
+					t.Fatalf("%s must expose route %q (%s); missing %q", cell.adapter, cell.route, status, needle)
+				}
+				if !cell.present && ok {
+					t.Fatalf("%s must not expose route %q (%s); found %q", cell.adapter, cell.route, status, needle)
 				}
 			}
-		}
+		})
 	}
 }
 
