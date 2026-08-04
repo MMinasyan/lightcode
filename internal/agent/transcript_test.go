@@ -2066,11 +2066,16 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 		}
 
 		// The untouched remainder (the final item) is back on the queue with
-		// its original id, and the requeue event carries it.
-		q, err := a.QueueSnapshotForSession(id)
-		if err != nil {
-			t.Fatalf("QueueSnapshotForSession: %v", err)
-		}
+		// its original id, and the requeue event carries it. The queue is
+		// unit-local in-memory state with no durable counterpart, so it is read
+		// from the unit directly (named exception): the adapter-facing
+		// QueueSnapshotForSession requires a live store, and a clean shutdown
+		// deliberately detaches stores, so it cannot resolve the session
+		// afterwards. rt.queueSnapshotLocked is the same helper the adapter
+		// method calls.
+		rt.mu.Lock()
+		q := rt.queueSnapshotLocked(unit)
+		rt.mu.Unlock()
 		if len(q.Items) != 1 || q.Items[0].Content != "launch" || q.Items[0].ID != "q-2" {
 			t.Fatalf("queue after shutdown abort = %#v, want [launch(q-2)]", q.Items)
 		}

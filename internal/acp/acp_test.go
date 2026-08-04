@@ -1385,7 +1385,15 @@ func TestACPOrderedDeliveryContract(t *testing.T) {
 		})
 		lines := drainedLines(t, r, out, 1)
 		assertACPErrorResponse(t, lines[0])
-		if got := r.currentSessionSummary().ID; got != firstID {
+		// The view's routing id is asserted directly: it is the routing state
+		// the failed submit must leave unchanged, and it survives the clean
+		// shutdown, whose store detach makes a summary lookup fail and would
+		// clear the id on that error.
+		got, err := r.currentSession()
+		if err != nil {
+			t.Fatalf("current session: %v", err)
+		}
+		if got != firstID {
 			t.Fatalf("routing current = %q, want unchanged %q", got, firstID)
 		}
 		r.mu.Lock()
@@ -2951,6 +2959,13 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 		t.Cleanup(cancel)
 
 		waitForACPRequest(t, reqSeen, "prompt turn model request")
+		// Capture the session id before the signal: after the owner shutdown
+		// the session store is detached, so the routing current can no longer
+		// be resolved into a summary. The view's routing id itself survives.
+		id, err := r.currentSession()
+		if err != nil {
+			t.Fatalf("current session before signal: %v", err)
+		}
 		cancel() // the host's signal: cancels the Run context, triggering owner shutdown
 
 		select {
@@ -2968,11 +2983,7 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 		if cancelled, _ := params["cancelled"].(bool); !cancelled {
 			t.Fatalf("turn_end cancelled = %v, want true (the signal ended the turn through the owner)", cancelled)
 		}
-		id := r.currentSessionSummary().ID
-		if id == "" {
-			t.Fatal("no current session after Run")
-		}
-		assertACPHydratedContent(t, ag, id, "hi")
+		assertACPDurableContent(t, ag, id, "hi")
 	})
 
 	// The forbidden sibling on the host path: a prompt submitted with an
@@ -3506,7 +3517,10 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 		if !endEv.Cancelled {
 			t.Fatalf("turn_end cancelled = false after owner shutdown, want true")
 		}
-		assertACPHydratedContent(t, ag, id, "hi")
+		// The message persisted through the clean shutdown: the live store is
+		// detached once every turn finished, so the persistence fact is read
+		// deliberately through the durable path.
+		assertACPDurableContent(t, ag, id, "hi")
 	})
 
 	// An explicit per-session cancel still ends exactly one turn: the terminal
@@ -3683,6 +3697,26 @@ func assertACPHydratedContent(t *testing.T, a *agent.Agent, sessionID, content s
 		}
 	}
 	t.Fatalf("durable history for %q lacks %q: %#v", sessionID, content, hs.Messages)
+}
+
+// assertACPDurableContent fails unless sessionID's durable history contains a
+// message with the given content. It is the deliberate post-shutdown read:
+// SessionMessagesFor's non-live branch resolves the session's project and
+// reads it read-only, which is the read that survives a clean owner shutdown
+// (the live store is detached once every turn has finished, so the live
+// resolution and the hydration fallback are both unavailable by design).
+func assertACPDurableContent(t *testing.T, a *agent.Agent, sessionID, content string) {
+	t.Helper()
+	msgs, err := a.SessionMessagesFor(sessionID)
+	if err != nil {
+		t.Fatalf("SessionMessagesFor(%q): %v", sessionID, err)
+	}
+	for _, m := range msgs {
+		if m.Content == content {
+			return
+		}
+	}
+	t.Fatalf("durable history for %q lacks %q: %#v", sessionID, content, msgs)
 }
 
 // waitForACPRequest waits for a request-signal on ch; the server-side helper

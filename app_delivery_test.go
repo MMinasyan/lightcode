@@ -189,13 +189,16 @@ func TestWailsShutdownJoinsInFlightTurn(t *testing.T) {
 
 	// The accepted turn's work outlived the host window: the submitted message
 	// is durably persisted and the turn's transcript commit ran, so the
-	// shutdown did not sever in-flight work.
-	hs, err := app.HydrateSession(id)
+	// shutdown did not sever in-flight work. The read is deliberate:
+	// SessionMessagesFor's non-live branch resolves the session's project and
+	// reads it read-only — the read that survives the clean shutdown's store
+	// detach, which makes the live resolution unavailable by design.
+	msgs, err := ag.SessionMessagesFor(id)
 	if err != nil {
-		t.Fatalf("HydrateSession after shutdown: %v", err)
+		t.Fatalf("SessionMessagesFor after shutdown: %v", err)
 	}
-	if !hydratedAppContains(hs.Messages, "hi") {
-		t.Fatalf("the in-flight turn's message is missing from durable history after shutdown: %#v", hs.Messages)
+	if !hydratedAppContains(msgs, "hi") {
+		t.Fatalf("the in-flight turn's message is missing from durable history after shutdown: %#v", msgs)
 	}
 }
 

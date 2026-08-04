@@ -1003,10 +1003,29 @@ func (rt *runtime) initOnceLocked(ctx context.Context) string {
 	// after the in-flight turn join so the drainer stays alive to deliver
 	// terminal events.
 	rt.ownerCtx, rt.ownerCancel = context.WithCancel(context.Background())
-	rt.bgWG.Add(4)
+	// The project LSP teardown watches the owner context and is tracked on the
+	// same bgWG: ShutdownOwner cancels the owner context immediately before
+	// joining bgWG, so the teardown fires and completes inside that join. It
+	// cannot watch the host context — two of the three hosts cancel that only
+	// after shutdown returns, so the trigger would never fire while the join
+	// waits.
+	rt.bgWG.Add(5)
 	go func() { defer rt.bgWG.Done(); rt.drainLoopEvents(rt.ownerCtx) }()
 	go func() { defer rt.bgWG.Done(); rt.runSignalScheduler(rt.ownerCtx) }()
 	go func() { defer rt.bgWG.Done(); rt.runQueueDrainer(rt.ownerCtx) }()
+	go func() {
+		defer rt.bgWG.Done()
+		<-rt.ownerCtx.Done()
+		a.servicesMu.Lock()
+		mgrs := make([]*lsp.Manager, 0, len(a.lspManagers))
+		for _, e := range a.lspManagers {
+			mgrs = append(mgrs, e.mgr)
+		}
+		a.servicesMu.Unlock()
+		for _, m := range mgrs {
+			m.ShutdownAll()
+		}
+	}()
 	if a.memoryHooks != nil {
 		_ = a.memoryHooks.Reconcile()
 	}
@@ -1032,18 +1051,6 @@ func (rt *runtime) initOnceLocked(ctx context.Context) string {
 		a.startDetectLocked(e)
 	}
 	a.servicesMu.Unlock()
-	go func() {
-		<-ctx.Done()
-		a.servicesMu.Lock()
-		mgrs := make([]*lsp.Manager, 0, len(a.lspManagers))
-		for _, e := range a.lspManagers {
-			mgrs = append(mgrs, e.mgr)
-		}
-		a.servicesMu.Unlock()
-		for _, m := range mgrs {
-			m.ShutdownAll()
-		}
-	}()
 
 	a.setWarningGroup("prompt", a.pendingPromptWarnings)
 	a.pendingPromptWarnings = nil
@@ -3808,8 +3815,11 @@ func waitGroupOrTimeout(wg *sync.WaitGroup, d time.Duration) bool {
 // joins in-flight turns so their terminal events flush through the still-running
 // drainer, then cancels and joins the background goroutines and closes the
 // subordinate services. It is one shared join: every caller waits for the same
-// cleanup, and it runs exactly once. Session stores are not closed; state
-// persists per turn and the process-exit boundary releases claims.
+// cleanup, and it runs exactly once. When every turn has actually finished, the
+// live session stores are detached — releasing their claims — and the shared
+// embedder is closed; an abandoned turn keeps both, so a still-running turn
+// never loses its store or hits a closed embedder, and the process-exit
+// boundary releases what shutdown did not.
 func (a *Agent) ShutdownOwner() {
 	rt := a.ensureRuntime()
 	rt.shutdownOnce.Do(func() {
@@ -3817,6 +3827,7 @@ func (a *Agent) ShutdownOwner() {
 		rt.closed = true
 		var cancels []context.CancelFunc
 		var sessionIDs []string
+		var stores []*snapshot.Store
 		for id, unit := range a.sessions {
 			if unit == nil || unit.store == nil || !unit.store.Active() {
 				continue
@@ -3825,6 +3836,7 @@ func (a *Agent) ShutdownOwner() {
 				cancels = append(cancels, cancel)
 			}
 			sessionIDs = append(sessionIDs, id)
+			stores = append(stores, unit.store)
 		}
 		rt.mu.Unlock()
 		for _, cancel := range cancels {
@@ -3840,6 +3852,19 @@ func (a *Agent) ShutdownOwner() {
 		turnsDrained := waitGroupOrTimeout(&rt.turnWG, shutdownJoinTimeout)
 		if !turnsDrained {
 			fmt.Fprintf(os.Stderr, "lightcode: owner shutdown abandoned in-flight turns after %s\n", shutdownJoinTimeout)
+		}
+		// Detach every live session store only once every turn has actually
+		// finished. The join is bounded and may return while a turn still runs;
+		// detaching then would release that session's claim under the live turn,
+		// letting another process drive the same saved session — the condition
+		// the active-process marker exists to prevent. The embedder close below
+		// carries the same gate for the same reason. The gate is all-or-nothing
+		// across every live session; there is deliberately no per-session
+		// tracking.
+		if turnsDrained {
+			for _, store := range stores {
+				store.Detach()
+			}
 		}
 		if rt.ownerCancel != nil {
 			rt.ownerCancel()

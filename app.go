@@ -133,9 +133,11 @@ func (a *App) startup(ctx context.Context) {
 		return
 	}
 	a.ctx = ctx
-	// The owner's host-context teardown (LSP shutdown) keys on the init context, so
-	// initialize under a cancelable child that shutdown cancels. Delivery keeps using
-	// the original ctx, which stays valid until the drainer is closed.
+	// The host context only triggers the joined owner shutdown (the Init
+	// watcher); the project LSP teardown runs on the owner context inside that
+	// join. Initialize under a cancelable child so shutdown can release the
+	// watcher. Delivery keeps using the original ctx, which stays valid until
+	// the drainer is closed.
 	hostCtx, cancel := context.WithCancel(ctx)
 	a.hostCancel = cancel
 	// Hold navMu across the whole startup so it is a readiness barrier. Wails loads
@@ -179,9 +181,10 @@ func (a *App) shutdown(_ context.Context) {
 		return
 	}
 	// Join the owner's turns and workers first: ShutdownOwner drains in-flight turns
-	// while the internal event drainer is still alive, then stops the workers. Only
-	// then cancel the host context, whose sole watcher is the LSP teardown goroutine
-	// (ShutdownOwner never cancels it, since it keys on the init context).
+	// while the internal event drainer is still alive, then stops the workers, tears
+	// down the LSP services on the owner context inside the join, and detaches the
+	// session stores when every turn finished. Only then cancel the host context,
+	// whose sole watcher is the shutdown trigger goroutine.
 	if a.agent != nil {
 		a.agent.ShutdownOwner()
 	}
