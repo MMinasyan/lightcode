@@ -228,16 +228,11 @@ func TestOwnerShutdownContractMatrix(t *testing.T) {
 	})
 
 	// The unresponsive case: the language server accepts the connection and
-	// answers initialize, but never answers the shutdown request, so the
-	// teardown's shutdown call is held until its own bound. Joining the
-	// teardown means the owner shutdown is delayed where it previously was
-	// not — the deliberate trade of the rewire, which before left the teardown
-	// untracked so servers could outlive the owner. What must hold is that the
-	// delay stays bounded by the join the teardown is registered on: owner
-	// shutdown still returns, within the existing background-join bound,
-	// rather than hanging. The delay is acceptable because every host exits
-	// immediately after ShutdownOwner returns, and the alternative is a
-	// language server that survives the owner.
+	// answers initialize, but never answers a shutdown request. The teardown
+	// does not negotiate with it — ShutdownAll kills the process and reaps it
+	// directly, because the owner is exiting on every host and the server is
+	// our own child process — so owner shutdown must return promptly, well
+	// under the background-join bound, rather than being held by the server.
 	t.Run("join=clean/server=unresponsive", func(t *testing.T) {
 		home := t.TempDir()
 		projectRoot := t.TempDir()
@@ -250,10 +245,10 @@ func TestOwnerShutdownContractMatrix(t *testing.T) {
 		}()
 		select {
 		case <-done:
-		case <-time.After(shutdownJoinTimeout + 2*time.Second):
-			t.Fatal("owner shutdown hung with an unresponsive language server: the background join must bound the teardown")
+		case <-time.After(2 * time.Second):
+			t.Fatal("owner shutdown did not return promptly with an unresponsive language server: the teardown must kill, not negotiate")
 		}
-		// The clean-join release semantics are undisturbed by the delayed
+		// The clean-join release semantics are undisturbed by the kill-based
 		// teardown: the store is detached and its claim released.
 		if unit.store.Active() {
 			t.Fatal("session store still active after clean shutdown")

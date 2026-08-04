@@ -491,6 +491,54 @@ func (inst *instance) resetIdle() {
 	})
 }
 
+// killForTeardown is the manager-wide teardown path (owner shutdown): the
+// process is killed and reaped directly instead of negotiating a shutdown,
+// because the owner is exiting on every host and the servers are our own child
+// processes. It keeps shutdown's bookkeeping — the terminal transition that
+// releases anything waiting on the instance, the connection close, and the
+// captured handles cleared under the same attempt-identity check, so a
+// concurrent restart is not clobbered.
+func (inst *instance) killForTeardown() {
+	inst.mu.Lock()
+	rpc := inst.rpc
+	cmd := inst.cmd
+	procDone := inst.procDone
+	if inst.idleTimer != nil {
+		inst.idleTimer.Stop()
+		inst.idleTimer = nil
+	}
+	inst.setTerminalLocked(stateShutdown)
+	inst.mu.Unlock()
+
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		// The watcher (or the start path of an attempt still launching) reaps
+		// the process and closes procDone, so the wait returns promptly.
+		<-procDone
+	}
+
+	if rpc != nil {
+		rpc.Close()
+	}
+
+	// Clear the captured attempt's handles only if it is still the current
+	// one — procDone is the field this teardown actually waited on and the
+	// identity of the attempt it captured.
+	inst.mu.Lock()
+	if inst.procDone == procDone {
+		inst.rpc = nil
+		inst.cmd = nil
+		inst.openedVer = make(map[string]int)
+		inst.mu.Unlock()
+
+		inst.diagMu.Lock()
+		inst.diagnostics = make(map[string][]protocol.Diagnostic)
+		inst.diagMu.Unlock()
+	} else {
+		inst.mu.Unlock()
+	}
+}
+
 func (inst *instance) shutdown() {
 	inst.mu.Lock()
 	rpc := inst.rpc

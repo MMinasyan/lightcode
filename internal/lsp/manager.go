@@ -94,9 +94,11 @@ func (m *Manager) startServer(ctx context.Context, def *server.Definition) {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		// Shutdown began while this server was starting; tear it down so it is
-		// never left running after the shutdown snapshot.
-		inst.shutdown()
+		// Shutdown began while this server was starting; dispose of it the
+		// same way the teardown does, so the one server that appears after
+		// the shutdown snapshot is killed and reaped instead of negotiated
+		// with after the owner has stopped waiting for anything.
+		inst.killForTeardown()
 		return
 	}
 	m.instances[def.Name] = inst
@@ -128,6 +130,11 @@ func (m *Manager) AllInstances() []*instance {
 	return out
 }
 
+// ShutdownAll tears down every instance for the owner's shutdown: each
+// server's process is killed and reaped directly instead of negotiating a
+// shutdown, because the owner is exiting on every host and the servers are
+// our own child processes. Nothing here waits on a server's answer, so one
+// unresponsive server cannot delay the teardown of the others.
 func (m *Manager) ShutdownAll() {
 	m.mu.Lock()
 	m.closed = true
@@ -138,7 +145,7 @@ func (m *Manager) ShutdownAll() {
 	m.mu.Unlock()
 
 	for _, inst := range instances {
-		inst.shutdown()
+		inst.killForTeardown()
 	}
 }
 
