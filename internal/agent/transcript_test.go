@@ -2392,6 +2392,56 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 	})
 }
 
+// TestTurnBegunAfterRevertRendersOnceThroughHydration proves the
+// disjoint-halves guard against a reused turn number: after a combined
+// code+history revert the coordinator's committedTurn stays at the pre-revert
+// high-water, so a turn begun after the revert that reissued an old number
+// would compare a stale cursor against a reused number, keep its tail, and
+// render the turn twice — once from the durable half and once from the tail.
+// The store-level high-water keeps the new turn above every issued number, the
+// guard fires, and the hydration capture renders the turn exactly once.
+func TestTurnBegunAfterRevertRendersOnceThroughHydration(t *testing.T) {
+	a := newLiveCatalogBackedTestAgent(t)
+	id := a.SessionCurrent().ID
+
+	// Ten complete turns through the store and the coordinator: the durable
+	// side records turns 1..10 and the coordinator commits each one.
+	for i := 1; i <= 10; i++ {
+		turn := a.store.BeginTurn()
+		a.lp.AppendUserMessage(turn, fmt.Sprintf("turn %d", i))
+		if err := a.store.MarkTurnComplete(turn); err != nil {
+			t.Fatalf("MarkTurnComplete(%d): %v", turn, err)
+		}
+		feedTranscript(a.transcriptForSessionID(id), Event{Kind: EventTurnStart, Turn: turn})
+		feedTranscript(a.transcriptForSessionID(id), Event{Kind: EventTurnEnd, Turn: turn})
+	}
+
+	if _, err := a.ApplyTurnActionForSession(id, 6, TurnActionRevertHistory, true); err != nil {
+		t.Fatalf("ApplyTurnActionForSession revert_history: %v", err)
+	}
+
+	// Begin and persist the next turn, feeding its rows into the coordinator
+	// without a turn end: the completion marker lands on disk while the commit
+	// has not run — the window the disjoint-halves guard exists for.
+	fresh := a.store.BeginTurn()
+	const content = "fresh turn"
+	a.lp.AppendUserMessage(fresh, content)
+	if err := a.store.MarkTurnComplete(fresh); err != nil {
+		t.Fatalf("MarkTurnComplete(%d): %v", fresh, err)
+	}
+	tr := a.transcriptForSessionID(id)
+	feedTranscript(tr, Event{Kind: EventTurnStart, Turn: fresh})
+	feedTranscript(tr, Event{Kind: EventUserMessageDisplay, Result: content, Turn: fresh})
+
+	hs, err := a.HydrateSession(id)
+	if err != nil {
+		t.Fatalf("HydrateSession: %v", err)
+	}
+	if got := countHydrationContent(hs, content); got != 1 {
+		t.Fatalf("fresh turn rendered %d times through hydration, want exactly once (durable messages = %d, tail rows = %d)", got, len(hs.Messages), len(hs.Tail))
+	}
+}
+
 // countHydrationContent counts how many times content appears across a
 // hydration's durable messages, retained tail rows, and retained error rows —
 // the three halves the frontend concatenates. A row present in both the

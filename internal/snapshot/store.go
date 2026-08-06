@@ -88,8 +88,15 @@ type Store struct {
 	projectRoot  string
 	projectHash  string
 	currentTurn  int
-	snapshotTx   map[string]*snapshotTxState
-	mutationLock map[string]*snapshotMutationLock
+	// highWaterTurn is the highest turn number this Store has issued in the
+	// live session. RevertHistory and RevertCode remove turn directories, so
+	// allocation from disk alone would reissue a number the session already
+	// used; nextTurnLocked never allocates at or below this mark. It is
+	// per-session in-memory state: cleared with the rest of the session in
+	// clearLocked, so a Store that moves to another session restarts from disk.
+	highWaterTurn int
+	snapshotTx    map[string]*snapshotTxState
+	mutationLock  map[string]*snapshotMutationLock
 
 	// claim is the cross-process exclusion held while this process drives the
 	// session. It is acquired before a mutating load or new-session
@@ -446,6 +453,7 @@ func (s *Store) clearLocked() {
 	s.projectRoot = ""
 	s.projectHash = ""
 	s.currentTurn = 0
+	s.highWaterTurn = 0
 	s.snapshotTx = nil
 	s.mutationLock = nil
 }
@@ -498,6 +506,17 @@ func (s *Store) BeginTurn() int {
 }
 
 func (s *Store) nextTurnLocked() int {
+	max := s.maxTurnLocked()
+	if s.highWaterTurn > max {
+		max = s.highWaterTurn
+	}
+	return max + 1
+}
+
+// maxTurnLocked returns the highest turn directory present on disk, across
+// both the snapshots and the turns trees — the same union nextTurnLocked
+// allocates from. Caller holds s.mu.
+func (s *Store) maxTurnLocked() int {
 	snap := readIntDirs(s.snapshotsDir)
 	turn := readIntDirs(s.turnsDir)
 	max := 0
@@ -511,7 +530,7 @@ func (s *Store) nextTurnLocked() int {
 			max = n
 		}
 	}
-	return max + 1
+	return max
 }
 
 // CurrentTurn returns the last BeginTurn result, 0 if unset.
@@ -1034,6 +1053,13 @@ func (s *Store) RevertCode(toTurn int) (RevertResult, error) {
 	if toTurn < 0 {
 		toTurn = 0
 	}
+	// Record the highest turn number this session has issued before any
+	// removal: the walk deletes snapshot turn dirs, so allocation from disk
+	// alone would reissue numbers the session already used. The mark is raised,
+	// never assigned — a later revert can scan a union maximum below it.
+	if m := s.maxTurnLocked(); m > s.highWaterTurn {
+		s.highWaterTurn = m
+	}
 	turns := readIntDirs(s.snapshotsDir)
 	var result RevertResult
 	skippedEntries := make(map[string]struct{})
@@ -1067,6 +1093,13 @@ func (s *Store) RevertHistory(toTurn int) error {
 	}
 	if toTurn < 0 {
 		toTurn = 0
+	}
+	// Record the highest turn number this session has issued before any
+	// removal: the walk deletes message turn dirs, so allocation from disk
+	// alone would reissue numbers the session already used. The mark is raised,
+	// never assigned — a later revert can scan a union maximum below it.
+	if m := s.maxTurnLocked(); m > s.highWaterTurn {
+		s.highWaterTurn = m
 	}
 	// Walk descending and stop at the first failed removal, exactly like
 	// RevertCode: the load path reads complete turns by scanning completion

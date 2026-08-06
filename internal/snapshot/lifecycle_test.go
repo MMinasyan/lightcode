@@ -96,6 +96,53 @@ func TestRevertHistoryAtomicAgainstBeginTurn(t *testing.T) {
 	}
 }
 
+// TestRevertNeverReissuesTurnNumber proves a live session never reuses a turn
+// number after a combined revert: RevertHistory removes the turns tree and
+// RevertCode removes the snapshots tree, so the disk maximum drops and
+// allocation from disk alone would reissue a number this session already used.
+// The recorded high-water mark must also survive a later revert whose
+// pre-revert union maximum is below it — a bare assignment would drop the mark
+// and reissue a used number — and must die with the session, so a Store that
+// moves to another session starts allocating from disk again.
+func TestRevertNeverReissuesTurnNumber(t *testing.T) {
+	store := newTestStore(t)
+	maxIssued := 0
+	for i := 0; i < 10; i++ {
+		turn := store.BeginTurn()
+		if turn > maxIssued {
+			maxIssued = turn
+		}
+	}
+	// Combined revert to turn 5: both trees drop to 5, the disk maximum falls
+	// from 10 to 5.
+	if err := store.RevertHistory(5); err != nil {
+		t.Fatal(err)
+	}
+	// A deeper code revert scans a union whose maximum (8) is below the
+	// recorded mark (10); the mark must hold at 10, not drop to 8.
+	if _, err := store.RevertCode(8); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RevertCode(5); err != nil {
+		t.Fatal(err)
+	}
+
+	next := store.BeginTurn()
+	if next <= maxIssued {
+		t.Fatalf("BeginTurn after both reverts = %d, want a number above every issued turn %d", next, maxIssued)
+	}
+
+	// The mark is per-session: a Store that moves to another session restarts
+	// allocation from disk rather than from the reverted session's high-water.
+	store.Detach()
+	if err := store.BeginNewSession(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.BeginTurn(); got != 1 {
+		t.Fatalf("BeginTurn in a new session after a reverted one = %d, want 1", got)
+	}
+}
+
 func TestListAndLoadMostRecentUseCompletedSessionMetadata(t *testing.T) {
 	root := t.TempDir()
 	project := t.TempDir()
