@@ -1711,7 +1711,11 @@ func (a *Agent) runSweep() {
 	}
 	var onDelete func(string)
 	if a.memoryHooks != nil {
-		onDelete = func(sessionID string) { _ = a.memoryHooks.DeleteSessionSummaries(sessionID) }
+		onDelete = func(sessionID string) {
+			if err := a.memoryHooks.DeleteSessionSummaries(sessionID); err != nil {
+				fmt.Fprintf(os.Stderr, "lightcode: delete summaries for session %s: %v\n", sessionID, err)
+			}
+		}
 	}
 	if _, _, err := snapshot.SweepAllProjects(a.projects.Root(), cfg, onDelete, a.lockLifecycle); err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: sweep: %v\n", err)
@@ -4721,7 +4725,9 @@ func (a *Agent) claimPersistedOnlySession(sessionsRoot, id string) (func(), erro
 	if !ok {
 		return nil, SessionContendedError(id)
 	}
-	return func() { _ = claim.Release() }, nil
+	// ReleaseSessionClaim reports a failed release to stderr; this closure
+	// returns no error, so the release result is discarded here.
+	return func() { _ = snapshot.ReleaseSessionClaim(claim, id) }, nil
 }
 
 // SessionArchive archives a session.
@@ -4737,8 +4743,13 @@ func (a *Agent) SessionDelete(id string) error {
 		if err := snapshot.DeleteSession(sessionsRoot, id); err != nil {
 			return err
 		}
+		// The delete committed; a failed summaries removal cannot fail it.
+		// The residue keeps the deleted session's sections and vectors in
+		// search_history, so it is reported rather than dropped.
 		if a.memoryHooks != nil {
-			_ = a.memoryHooks.DeleteSessionSummaries(id)
+			if err := a.memoryHooks.DeleteSessionSummaries(id); err != nil {
+				fmt.Fprintf(os.Stderr, "lightcode: delete summaries for session %s: %v\n", id, err)
+			}
 		}
 		return nil
 	})
@@ -5701,10 +5712,12 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		// indexed summary along with the record: search_history would keep
 		// serving a "Full summary" path that no longer resolves. Delete the
 		// session's summaries before the reload, so the eviction path is
-		// covered by the same call. The error is discarded exactly as the
-		// sweep and delete call sites discard it.
+		// covered by the same call. The delete has committed, so a failed
+		// removal cannot fail the revert; the residue is reported to stderr.
 		if removedRecord && a.memoryHooks != nil {
-			_ = a.memoryHooks.DeleteSessionSummaries(eventSessionID)
+			if err := a.memoryHooks.DeleteSessionSummaries(eventSessionID); err != nil {
+				fmt.Fprintf(os.Stderr, "lightcode: delete summaries for session %s: %v\n", eventSessionID, err)
+			}
 		}
 		// The store maintains the post-walk turn for all three outcomes: the
 		// target on a completed walk, the turn the walk stopped at on a

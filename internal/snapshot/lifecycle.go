@@ -201,7 +201,9 @@ func sweepCandidate(projectsRoot, projectID, root, sessionID string, now, archiv
 	if err != nil || !ok {
 		return 0, 0
 	}
-	defer claim.Release()
+	// ReleaseSessionClaim reports a failed release to stderr; the sweep's
+	// return shape has no error to carry it in, so it is discarded here.
+	defer func() { _ = ReleaseSessionClaim(claim, sessionID) }()
 	if readJSON(metaPath, &meta) != nil {
 		return 0, 0
 	}

@@ -3,6 +3,7 @@ package snapshot
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -64,10 +65,32 @@ func (s *Store) acquireClaimLocked(sessionID string) error {
 	return nil
 }
 
-// releaseClaimLocked drops the session claim if held. Caller holds s.mu.
-func (s *Store) releaseClaimLocked() {
-	if s.claim != nil {
-		_ = s.claim.Release()
-		s.claim = nil
+// ReleaseSessionClaim drops a session claim, reporting a failed release to
+// stderr: a retained lock makes the session unavailable to every process
+// until this one exits, so a failure must surface even where the caller
+// cannot act on it. The session id is named in the diagnostic and in the
+// returned error, which callers that are already failing may join onto their
+// own cause.
+func ReleaseSessionClaim(claim *atomicfs.Lock, sessionID string) error {
+	if claim == nil {
+		return nil
 	}
+	if err := claim.Release(); err != nil {
+		fmt.Fprintf(os.Stderr, "lightcode: release claim for session %s: %v\n", sessionID, err)
+		return fmt.Errorf("snapshot: release claim for session %s: %w", sessionID, err)
+	}
+	return nil
+}
+
+// releaseClaimLocked drops the session claim if held. Caller holds s.mu. A
+// release failure is reported to stderr by ReleaseSessionClaim and returned
+// for the call sites that are already failing, so the retained lock is never
+// silent.
+func (s *Store) releaseClaimLocked(sessionID string) error {
+	if s.claim != nil {
+		err := ReleaseSessionClaim(s.claim, sessionID)
+		s.claim = nil
+		return err
+	}
+	return nil
 }

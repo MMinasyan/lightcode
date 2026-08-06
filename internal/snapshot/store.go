@@ -356,7 +356,7 @@ func (s *Store) LoadSession(id string) (err error) {
 	}
 	defer func() {
 		if err != nil {
-			s.releaseClaimLocked()
+			err = errors.Join(err, s.releaseClaimLocked(id))
 		}
 	}()
 	dir := filepath.Join(s.root, id)
@@ -444,7 +444,9 @@ func (s *Store) Detach() {
 }
 
 func (s *Store) clearLocked() {
-	s.releaseClaimLocked()
+	// Detach and Close do not surface the release result — no caller can act
+	// on it — so a failure is left to ReleaseSessionClaim's stderr report.
+	_ = s.releaseClaimLocked(s.sessionID)
 	s.active = false
 	s.dir = ""
 	s.snapshotsDir = ""
@@ -1913,7 +1915,7 @@ func (s *Store) mintReservedSessionID(createRoot string, meta SessionMeta, claim
 		for _, p := range []string{filepath.Join(createDir, "snapshots"), filepath.Join(createDir, "turns")} {
 			if err := os.MkdirAll(p, 0o700); err != nil {
 				if claim {
-					s.releaseClaimLocked()
+					err = errors.Join(err, s.releaseClaimLocked(id))
 				}
 				return "", fmt.Errorf("snapshot: create %s: %w", p, err)
 			}
@@ -1921,7 +1923,7 @@ func (s *Store) mintReservedSessionID(createRoot string, meta SessionMeta, claim
 		meta.ID = id
 		if err := writeJSON(filepath.Join(createDir, "meta.json"), meta); err != nil {
 			if claim {
-				s.releaseClaimLocked()
+				err = errors.Join(err, s.releaseClaimLocked(id))
 			}
 			return "", fmt.Errorf("snapshot: write session meta: %w", err)
 		}

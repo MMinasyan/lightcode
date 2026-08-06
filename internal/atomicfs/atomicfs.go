@@ -25,6 +25,12 @@ var SyncFileFunc func(*os.File) error
 // SyncDir; its return value is that sync's result. Nil in production.
 var SyncDirFunc func(string) error
 
+// ReleaseFunc, when non-nil, replaces the unlock performed by Lock.Release;
+// its return value is that unlock's result. It exists so tests can inject a
+// release failure without touching the filesystem. Nil in production;
+// test-only.
+var ReleaseFunc func(*Lock) error
+
 // Write atomically replaces path with data. It writes a temp file in the
 // destination directory, sets its mode, and renames it over path. The
 // temp lives in the same directory so the rename is a same-filesystem
@@ -210,6 +216,9 @@ func TryAcquire(lockPath string) (*Lock, bool, error) {
 
 // Release drops the lock and closes its file descriptor.
 func (l *Lock) Release() error {
+	if ReleaseFunc != nil {
+		return ReleaseFunc(l)
+	}
 	if l == nil || l.fl == nil {
 		return nil
 	}
