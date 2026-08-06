@@ -27,28 +27,28 @@ describe('viewer store', () => {
   });
 
   it('opens live subagent viewers', () => {
-    openSubagentViewer('Explore', 'session-1');
-    expect(get(viewer)).toEqual({ title: 'Explore', sessionId: 'session-1', live: true, messages: [] });
+    const generation = openSubagentViewer('Explore', 'session-1');
+    expect(get(viewer)).toEqual({ title: 'Explore', sessionId: 'session-1', live: true, generation, messages: [] });
   });
 
   it('opens subagent viewers with persisted messages', () => {
     const messages = [{ type: 'assistant', content: 'done' }];
-    openSubagentViewer('Explore', 'session-1', messages);
-    expect(get(viewer)).toEqual({ title: 'Explore', sessionId: 'session-1', live: true, messages });
+    const generation = openSubagentViewer('Explore', 'session-1', messages);
+    expect(get(viewer)).toEqual({ title: 'Explore', sessionId: 'session-1', live: true, generation, messages });
   });
 
   it('hydrates the matching live subagent viewer with a state snapshot', () => {
-    openSubagentViewer('Explore', 'session-1');
-    hydrateSubagentViewer('session-2', { messages: [{ type: 'assistant', content: 'ignored' }] });
+    const generation = openSubagentViewer('Explore', 'session-1');
+    hydrateSubagentViewer('session-2', { messages: [{ type: 'assistant', content: 'ignored' }] }, generation);
     expect(get(viewer).messages).toEqual([]);
-    hydrateSubagentViewer('session-1', { messages: [{ type: 'assistant', content: 'history' }] });
+    hydrateSubagentViewer('session-1', { messages: [{ type: 'assistant', content: 'history' }] }, generation);
     expect(get(viewer).messages).toEqual([{ type: 'assistant', content: 'history' }]);
   });
 
   it('does not discard live rows that arrive before persisted hydration returns', () => {
-    openSubagentViewer('Explore', 'session-1');
+    const generation = openSubagentViewer('Explore', 'session-1');
     appendSubagentEvent('session-1', { type: 'token', seq: 2, content: 'live' });
-    hydrateSubagentViewer('session-1', { messages: [{ type: 'assistant', content: 'history' }], cursor: { committedSeq: 1 } });
+    hydrateSubagentViewer('session-1', { messages: [{ type: 'assistant', content: 'history' }], cursor: { committedSeq: 1 } }, generation);
     expect(get(viewer).messages).toEqual([
       { type: 'assistant', content: 'history' },
       { type: 'assistant', content: 'live', partial: true, seq: 2 },
@@ -57,9 +57,9 @@ describe('viewer store', () => {
 
   it('does not duplicate persisted prefix on repeated hydration', () => {
     const history = [{ type: 'assistant', content: 'history' }];
-    openSubagentViewer('Explore', 'session-1', history);
+    const generation = openSubagentViewer('Explore', 'session-1', history);
     appendSubagentEvent('session-1', { type: 'token', seq: 2, content: 'live' });
-    hydrateSubagentViewer('session-1', { messages: history, cursor: { committedSeq: 1 } });
+    hydrateSubagentViewer('session-1', { messages: history, cursor: { committedSeq: 1 } }, generation);
     expect(get(viewer).messages).toEqual([
       { type: 'assistant', content: 'history' },
       { type: 'assistant', content: 'live', partial: true, seq: 2 },
@@ -67,14 +67,14 @@ describe('viewer store', () => {
   });
 
   it('replaces overlapping live partial rows when persisted hydration catches up', () => {
-    openSubagentViewer('Explore', 'session-1');
+    const generation = openSubagentViewer('Explore', 'session-1');
     appendSubagentEvent('session-1', { type: 'token', seq: 1, content: 'done' });
-    hydrateSubagentViewer('session-1', { messages: [{ type: 'assistant', content: 'done' }], cursor: { committedSeq: 1 } });
+    hydrateSubagentViewer('session-1', { messages: [{ type: 'assistant', content: 'done' }], cursor: { committedSeq: 1 } }, generation);
     expect(get(viewer).messages).toEqual([{ type: 'assistant', content: 'done' }]);
   });
 
   it('deduplicates live rows that overlap the end of persisted history', () => {
-    openSubagentViewer('Explore', 'session-1');
+    const generation = openSubagentViewer('Explore', 'session-1');
     appendSubagentEvent('session-1', { type: 'token', seq: 2, content: 'live' });
     hydrateSubagentViewer('session-1', {
       messages: [
@@ -82,7 +82,7 @@ describe('viewer store', () => {
         { type: 'assistant', content: 'live' },
       ],
       cursor: { committedSeq: 2 },
-    });
+    }, generation);
     expect(get(viewer).messages).toEqual([
       { type: 'user', content: 'prompt' },
       { type: 'assistant', content: 'live' },
@@ -182,11 +182,11 @@ describe('viewer store', () => {
 
 describe('child stream lifecycle', () => {
   it('applies the snapshot and rejects a replayed frame already in it', () => {
-    openSubagentViewer('Explore', 'session-1');
+    const generation = openSubagentViewer('Explore', 'session-1');
     hydrateSubagentViewer('session-1', {
       messages: [{ type: 'assistant', content: 'done' }],
       cursor: { committedSeq: 3 },
-    });
+    }, generation);
     appendSubagentEvent('session-1', { type: 'token', seq: 2, content: 'already in snapshot' });
     appendSubagentEvent('session-1', { type: 'token', seq: 4, content: 'new' });
     expect(get(viewer).messages).toEqual([
@@ -196,7 +196,7 @@ describe('child stream lifecycle', () => {
   });
 
   it('keeps live rows delivered during the hydration read, above the snapshot high-water', () => {
-    openSubagentViewer('Explore', 'session-1');
+    const generation = openSubagentViewer('Explore', 'session-1');
     // Delivered while the backend read is in flight: the snapshot covers rows
     // through seq 1, so this delta (seq 2) coalesced onto the snapshot's open
     // assistant row in the coordinator and folds into it here.
@@ -205,7 +205,7 @@ describe('child stream lifecycle', () => {
       messages: [{ type: 'user', content: 'prompt' }],
       tail: [{ seq: 1, message: { type: 'assistant', content: 'earlier' } }],
       cursor: { committedSeq: 0 },
-    });
+    }, generation);
     expect(get(viewer).messages).toEqual([
       { type: 'user', content: 'prompt' },
       { type: 'assistant', content: 'earlierlive', partial: true, seq: 2 },
@@ -216,11 +216,11 @@ describe('child stream lifecycle', () => {
   // through the retained tail; that row is still streaming, so the next text
   // delta must continue it rather than start a second row.
   it('continues a live child in-flight assistant row from the snapshot', () => {
-    openSubagentViewer('Explore', 'session-1');
+    const generation = openSubagentViewer('Explore', 'session-1');
     hydrateSubagentViewer('session-1', {
       tail: [{ seq: 1, message: { type: 'assistant', content: 'thinking ' } }],
       cursor: { committedSeq: 0 },
-    });
+    }, generation);
     appendSubagentEvent('session-1', { type: 'token', seq: 2, content: 'more' });
     expect(get(viewer).messages).toEqual([
       { type: 'assistant', content: 'thinking more', partial: true, seq: 2 },
@@ -231,11 +231,11 @@ describe('child stream lifecycle', () => {
   // nothing is streaming, so nothing is marked, and the next delta opens a
   // new row.
   it('marks nothing streaming for a completed child', () => {
-    openSubagentViewer('Explore', 'session-1');
+    const generation = openSubagentViewer('Explore', 'session-1');
     hydrateSubagentViewer('session-1', {
       messages: [{ type: 'assistant', content: 'final answer' }],
       cursor: { committedSeq: 0 },
-    });
+    }, generation);
     expect(get(viewer).messages).toEqual([{ type: 'assistant', content: 'final answer' }]);
     appendSubagentEvent('session-1', { type: 'token', seq: 1, content: 'new turn' });
     expect(get(viewer).messages).toEqual([
@@ -249,7 +249,7 @@ describe('child stream lifecycle', () => {
   // must be applied on top of the snapshot's running row, not discarded with
   // the live copy it updated.
   it('applies a tool result received during the read on top of the snapshot', () => {
-    openSubagentViewer('Explore', 'session-1');
+    const generation = openSubagentViewer('Explore', 'session-1');
     // The snapshot captured the row while the tool was running; the result
     // arrives while the read is in flight and finds no row in the empty live
     // view, so only the snapshot apply can carry it.
@@ -257,7 +257,7 @@ describe('child stream lifecycle', () => {
     hydrateSubagentViewer('session-1', {
       tail: [{ seq: 2, message: { type: 'tool', id: 'call-1', name: 'apply_patch', args: '{}', done: false, success: true, result: '' } }],
       cursor: { committedSeq: 2 },
-    });
+    }, generation);
     const row = get(viewer).messages.find((m) => m.type === 'tool' && m.id === 'call-1');
     expect(row.done).toBe(true);
     expect(row.success).toBe(true);
@@ -267,13 +267,13 @@ describe('child stream lifecycle', () => {
   // The same rule when both the start and the result arrived during the read:
   // the replayed start appends the row, the replayed result updates it.
   it('applies a tool result received during the read when its start also arrived during the read', () => {
-    openSubagentViewer('Explore', 'session-1');
+    const generation = openSubagentViewer('Explore', 'session-1');
     appendSubagentEvent('session-1', { type: 'tool_start', seq: 2, id: 'call-1', name: 'read_file', args: '{}' });
     appendSubagentEvent('session-1', { type: 'tool_result', id: 'call-1', success: false, output: 'denied' });
     hydrateSubagentViewer('session-1', {
       messages: [{ type: 'assistant', content: 'later' }],
       cursor: { committedSeq: 0 },
-    });
+    }, generation);
     const row = get(viewer).messages.find((m) => m.type === 'tool' && m.id === 'call-1');
     expect(row.done).toBe(true);
     expect(row.success).toBe(false);
@@ -281,22 +281,22 @@ describe('child stream lifecycle', () => {
   });
 
   it('does not duplicate a turn returned by both halves of a snapshot', () => {
-    openSubagentViewer('Explore', 'session-1');
+    const generation = openSubagentViewer('Explore', 'session-1');
     appendSubagentEvent('session-1', { type: 'token', seq: 1, content: 'window' });
     // The durable half already carries the turn and the cursor was raised over
     // the dropped tail, so the live row must be replaced by the snapshot copy.
     hydrateSubagentViewer('session-1', {
       messages: [{ type: 'assistant', content: 'window' }],
       cursor: { committedSeq: 1 },
-    });
+    }, generation);
     expect(get(viewer).messages).toEqual([{ type: 'assistant', content: 'window' }]);
   });
 
   it('applies a repeated hydration idempotently', () => {
-    openSubagentViewer('Explore', 'session-1');
+    const generation = openSubagentViewer('Explore', 'session-1');
     const state = { messages: [{ type: 'assistant', content: 'history' }], cursor: { committedSeq: 1 } };
-    hydrateSubagentViewer('session-1', state);
-    hydrateSubagentViewer('session-1', state);
+    hydrateSubagentViewer('session-1', state, generation);
+    hydrateSubagentViewer('session-1', state, generation);
     expect(get(viewer).messages).toEqual([{ type: 'assistant', content: 'history' }]);
   });
 
@@ -305,13 +305,13 @@ describe('child stream lifecycle', () => {
   // updates its row in place without advancing the sequence. A uniformly-gated
   // implementation would drop it as stale and strand the row at "running".
   it('renders a tool result that arrives after later rows advanced the high-water', () => {
-    openSubagentViewer('Explore', 'session-1');
+    const generation = openSubagentViewer('Explore', 'session-1');
     appendSubagentEvent('session-1', { type: 'tool_start', seq: 2, id: 'call-1', name: 'read_file', args: '{}' });
     hydrateSubagentViewer('session-1', {
       messages: [{ type: 'assistant', content: 'later' }],
       tail: [{ seq: 2, message: { type: 'tool', id: 'call-1', name: 'read_file', args: '{}', done: false, success: true, result: '' } }],
       cursor: { committedSeq: 5 },
-    });
+    }, generation);
     appendSubagentEvent('session-1', { type: 'tool_result', seq: 2, id: 'call-1', success: false, output: 'denied', metadata: { reason: 'test' } });
     const row = get(viewer).messages.find((m) => m.type === 'tool' && m.id === 'call-1');
     expect(row.done).toBe(true);
@@ -323,12 +323,12 @@ describe('child stream lifecycle', () => {
   // and real result); the last one wins. Both carry the row's original
   // sequence, so a uniformly-gated implementation would drop both.
   it('renders the last of two apply_patch ends', () => {
-    openSubagentViewer('Explore', 'session-1');
+    const generation = openSubagentViewer('Explore', 'session-1');
     appendSubagentEvent('session-1', { type: 'tool_start', seq: 2, id: 'call-1', name: 'apply_patch', args: '{}' });
     hydrateSubagentViewer('session-1', {
       tail: [{ seq: 2, message: { type: 'tool', id: 'call-1', name: 'apply_patch', args: '{}', done: false, success: true, result: '' } }],
       cursor: { committedSeq: 5 },
-    });
+    }, generation);
     appendSubagentEvent('session-1', { type: 'tool_result', seq: 2, id: 'call-1', success: true, output: 'staged' });
     appendSubagentEvent('session-1', { type: 'tool_result', seq: 2, id: 'call-1', success: true, output: 'real result' });
     const row = get(viewer).messages.find((m) => m.type === 'tool' && m.id === 'call-1');
@@ -337,11 +337,29 @@ describe('child stream lifecycle', () => {
   });
 
   it('gates sequenced frames per child session', () => {
-    openSubagentViewer('Explore', 'session-1');
-    hydrateSubagentViewer('session-1', { messages: [], cursor: { committedSeq: 1 } });
+    const generation = openSubagentViewer('Explore', 'session-1');
+    hydrateSubagentViewer('session-1', { messages: [], cursor: { committedSeq: 1 } }, generation);
     // A frame for another live child must not leak into this viewer, and its
     // own gate must not advance this child's.
     appendSubagentEvent('session-2', { type: 'token', seq: 2, content: 'other child' });
     expect(get(viewer).messages).toEqual([]);
+  });
+
+  // Closing and reopening the same child while the first open's hydration read
+  // is still in flight must not let the older hydration resolve into the newer
+  // open: it names the same session id, so only the generation can tell them
+  // apart. The stale read would seed the gate from its old cursor and consume
+  // the newer open's pending frames.
+  it('ignores a stale hydration for an earlier open of the same child', () => {
+    const staleGeneration = openSubagentViewer('Explore', 'session-1');
+    closeViewer();
+    openSubagentViewer('Explore', 'session-1');
+    appendSubagentEvent('session-1', { type: 'token', seq: 2, content: 'live' });
+    hydrateSubagentViewer('session-1', { messages: [{ type: 'assistant', content: 'stale' }], cursor: { committedSeq: 5 } }, staleGeneration);
+    expect(get(viewer).messages).toEqual([{ type: 'assistant', content: 'live', partial: true, seq: 2 }]);
+    // The newer open's gate must survive the rejected read: a frame above its
+    // own high-water still streams, where a stale-seeded gate would drop it.
+    appendSubagentEvent('session-1', { type: 'token', seq: 3, content: ' still here' });
+    expect(get(viewer).messages).toEqual([{ type: 'assistant', content: 'live still here', partial: true, seq: 3 }]);
   });
 });

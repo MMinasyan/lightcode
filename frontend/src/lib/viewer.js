@@ -2,8 +2,15 @@ import { writable } from 'svelte/store';
 import { admitSequenced, snapshotHighWater, snapshotMessages } from './hydration.js';
 
 // viewer holds the currently displayed full-screen content.
-// Shape: { title, content } | { title, editPreview, hunks } | { title, sessionId, live, messages } | null
+// Shape: { title, content } | { title, editPreview, hunks } | { title, sessionId, live, generation, messages } | null
 export const viewer = writable(null);
+
+// nextSubagentGeneration numbers every open of a child viewer. Each open
+// stores its value on the viewer object and returns it to the caller, so a
+// hydration read that resolves after the viewer was closed and reopened for
+// the same child can be told apart from the newer open's own read: the id
+// alone no longer identifies the open.
+let nextSubagentGeneration = 0;
 
 // childGates holds one transcript gate per child session id, seeded from the
 // cursor delivered with the child's snapshot and advanced by every admitted
@@ -39,9 +46,13 @@ export function openSubagentViewer(title, sessionId, messages = []) {
   // A fresh open starts the child's gate at zero and opens its read window:
   // frames delivered until the snapshot applies are held for replay. The
   // hydration read that follows re-seeds the gate from the snapshot's cursor.
+  // The generation tags this open; the caller passes it back with the
+  // hydration result so an earlier open's read cannot resolve into this one.
+  const generation = ++nextSubagentGeneration;
   childGates.delete(sessionId);
   pendingFrames.set(sessionId, []);
-  viewer.set({ title, sessionId, live: true, messages: messages || [] });
+  viewer.set({ title, sessionId, live: true, generation, messages: messages || [] });
+  return generation;
 }
 
 // hydrateSubagentViewer applies a child's complete-state snapshot (durable
@@ -52,9 +63,13 @@ export function openSubagentViewer(title, sessionId, messages = []) {
 // delivery — sequenced kinds through the gate (those already in the snapshot
 // are dropped), tool results by id-keyed idempotent apply (they update a row
 // in place without advancing the sequence, so the gate cannot protect them).
-export function hydrateSubagentViewer(sessionId, state) {
+// generation is the value openSubagentViewer returned for the open this read
+// belongs to; when the viewer was closed and reopened for the same child in
+// the meantime, the read is stale and applies nothing.
+export function hydrateSubagentViewer(sessionId, state, generation) {
   viewer.update(v => {
     if (!v || !v.live || v.sessionId !== sessionId) return v;
+    if (v.generation !== generation) return v;
     const gate = gateFor(sessionId);
     gate.highWater = snapshotHighWater(state || {});
     const messages = snapshotMessages(state || {});

@@ -66,15 +66,17 @@
 
   async function openSubagentTranscript(title, sessionId) {
     if (!sessionId) return;
-    openSubagentViewer(title, sessionId, []);
+    const generation = openSubagentViewer(title, sessionId, []);
     try {
       // The child hydration read returns the messages and the transcript cursor
       // together, so the viewer's gate can reject frames the snapshot already
-      // contains instead of reconciling by message shape.
+      // contains instead of reconciling by message shape. The generation tags
+      // this open: if the viewer was closed and reopened while the read was in
+      // flight, the result applies to nothing.
       const state = await HydrateSession(sessionId);
-      hydrateSubagentViewer(sessionId, state);
+      hydrateSubagentViewer(sessionId, state, generation);
     } catch (e) {
-      hydrateSubagentViewer(sessionId, { messages: [{ type: 'error', content: 'Error: ' + (e?.message || e) }] });
+      hydrateSubagentViewer(sessionId, { messages: [{ type: 'error', content: 'Error: ' + (e?.message || e) }] }, generation);
     }
   }
 

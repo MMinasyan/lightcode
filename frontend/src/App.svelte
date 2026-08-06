@@ -17,7 +17,7 @@
   import ProjectSelector from './components/ProjectSelector.svelte';
   import WarningDetails from './components/WarningDetails.svelte';
   import Viewer from './components/Viewer.svelte';
-  import { viewer, appendSubagentEvent } from './lib/viewer.js';
+  import { viewer, appendSubagentEvent, closeViewer } from './lib/viewer.js';
   import { settings } from './lib/settings.js';
   import { errorText } from './lib/errors.js';
   import {
@@ -166,6 +166,12 @@
   // snapshot's session and version; later same-session versions must increase.
   function applySnapshot(hs) {
     if (!hs) return;
+    // A snapshot replaces the root view wholesale (navigation, detach, the
+    // failed-hydration recovery path), so a child viewer open for the previous
+    // session closes here: the backend stops delivering that child's frames
+    // once the root moves on, and leaving it would freeze a live badge over a
+    // view that can no longer receive anything.
+    closeViewer();
     snapshotApplied = true;
     readOnly = !!hs.readOnly;
     sessionId = hs.session?.id || '';

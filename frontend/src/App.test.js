@@ -74,6 +74,7 @@ function applySnapshotSandbox(overrides = {}) {
     newTranscriptGate,
     defaultTokens: () => ({ total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 }),
     seedPermissions,
+    closeViewer: () => {},
     ...overrides,
   };
 }
@@ -230,5 +231,29 @@ describe('App project-switch model ordering', () => {
     const body = functionBodySource('handleProjectSwitched');
     expect(body).not.toMatch(/CurrentModel\(/);
     expect(body).not.toMatch(/refreshCurrentModel\(/);
+  });
+});
+
+describe('App snapshot closes the child viewer', () => {
+  it('closes the child viewer when a snapshot replaces the root view', () => {
+    // A snapshot replaces the whole root view (navigation, detach, and the
+    // failed-hydration recovery path). A child viewer open for the previous
+    // session can no longer receive that child's frames, so it must close
+    // rather than freeze with a live badge over a dead view.
+    const sandbox = applySnapshotSandbox({
+      closeViewer: () => { sandbox.viewerClosed = true; },
+    });
+    runInNewContext(
+      `(${functionBodySource('applySnapshot')})({
+        session: { id: 'dest-session' },
+        messages: [],
+        tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 },
+        queue: { items: [], version: 0 },
+        warnings: [],
+        permissions: [],
+      });`,
+      sandbox,
+    );
+    expect(sandbox.viewerClosed).toBe(true);
   });
 });
