@@ -91,6 +91,13 @@
   // snapshot is applied. The gate then drops any replayed or live transcript item
   // already represented in the snapshot (sequence at or below its high-water).
   let hydrated = false;
+  // A snapshot being applied is what seeds the transcript gate: on a hydration
+  // failure or an empty startup nothing was loaded, so the gate stays closed
+  // and the composer stays disabled. readOnly comes from the hydration state:
+  // a session another process is driving renders its durable transcript but
+  // must not admit a new turn here.
+  let snapshotApplied = false;
+  let readOnly = false;
   let pendingFrames = [];
   let gate = { highWater: 0 };
 
@@ -159,6 +166,8 @@
   // snapshot's session and version; later same-session versions must increase.
   function applySnapshot(hs) {
     if (!hs) return;
+    snapshotApplied = true;
+    readOnly = !!hs.readOnly;
     sessionId = hs.session?.id || '';
     messages = rebuildFromHistory(snapshotMessages(hs));
     gate = newTranscriptGate(hs);
@@ -188,6 +197,15 @@
     if (id) {
       try { applySnapshot(await HydrateSession(id)); }
       catch (e) { showError(e, 'Load session failed'); }
+    }
+    if (!snapshotApplied) {
+      // No snapshot was applied (a hydration failure or an empty startup), so
+      // nothing is loaded: close the gate so replayed or live transcript
+      // frames cannot render into the empty view, and drop the buffered
+      // frames instead of replaying them. The gate re-opens when a
+      // navigation boundary later applies complete state.
+      gate.highWater = Infinity;
+      pendingFrames = [];
     }
     const buffered = pendingFrames;
     pendingFrames = [];
@@ -306,13 +324,20 @@
       messageQueue = (data.items || []).map(it => ({ _id: it.id, content: it.content }));
     }));
 
+    // turn_start, turn_end, permission_request and permission_resolved carry
+    // no gating sequence, so each is gated on a snapshot having been applied:
+    // after a failed hydration or an empty startup nothing is loaded, and a
+    // live frame must not raise a busy spinner or an answerable prompt over a
+    // session the view never shows.
     EventsOn('turn_start', buffered((data) => {
+      if (!snapshotApplied) return;
       busy = true;
       streamingIdx = -1;
       if (data?.turn) currentTurn = data.turn;
     }));
 
     EventsOn('turn_end', buffered((data) => {
+      if (!snapshotApplied) return;
       closeStreaming();
       busy = false;
       // A pending request blocks its turn, so a turn end (including a cancel) leaves
@@ -333,9 +358,13 @@
 
     EventsOn('status', buffered((data) => { status = data.state; }));
 
-    EventsOn('permission_request', buffered((data) => { permissions = upsertPermission(permissions, data); }));
+    EventsOn('permission_request', buffered((data) => {
+      if (!snapshotApplied) return;
+      permissions = upsertPermission(permissions, data);
+    }));
 
     EventsOn('permission_resolved', buffered((data) => {
+      if (!snapshotApplied) return;
       // A pending request was answered or cancelled; drop it from the map so a
       // cancelled prompt is not still shown (and answerable) until turn end.
       if (data?.id) permissions = removePermission(permissions, data.id);
@@ -401,6 +430,14 @@
     const content = e.detail;
     if (!modelRef) {
       showError("Connect a provider or pick a model before sending.");
+      inputArea?.prefill(content);
+      return;
+    }
+    if (!snapshotApplied || readOnly) {
+      // The composer gate (send button and Enter) already blocks this; the
+      // handler refuses as well, keeping the draft, so a stale dispatch cannot
+      // submit into a session the view never loaded or one driven elsewhere.
+      showError("No session is open for sending messages.");
       inputArea?.prefill(content);
       return;
     }
@@ -505,7 +542,7 @@
       {/if}
     {/if}
   </div>
-  <InputArea bind:this={inputArea} busy={busy || compacting} hasActiveModel={!!modelRef && hydrated} on:submit={handleSubmit} on:error={(e) => showError(e.detail)}>
+  <InputArea bind:this={inputArea} busy={busy || compacting} hasActiveModel={!!modelRef && snapshotApplied && !readOnly} on:submit={handleSubmit} on:error={(e) => showError(e.detail)}>
     <StatusBar {modelName} on:openModelSelector={() => showModelSelector=true} />
   </InputArea>
   {#if showModelSelector}

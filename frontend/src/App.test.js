@@ -97,6 +97,7 @@ describe('App turn-end permission reset', () => {
     const sandbox = {
       permissions: new Map(),
       busy: true,
+      snapshotApplied: true,
       closeStreaming: () => {},
       upsertPermission,
     };
@@ -116,6 +117,64 @@ describe('App turn-end permission reset', () => {
     // The reactive render reads permissionList(permissions)[0]; the request
     // must come back so PermissionPrompt renders.
     expect(permissionList(sandbox.permissions).map((p) => p.id)).toEqual(['p1']);
+  });
+});
+
+describe('App turn-end gate over unseeded state', () => {
+  it('leaves the pending permissions and streaming alone when no snapshot was applied', () => {
+    const sandbox = {
+      snapshotApplied: false,
+      busy: true,
+      streamingIdx: 3,
+      closeStreaming: () => { sandbox.streamingIdx = -1; },
+      permissions: new Map([['a', { id: 'a' }]]),
+    };
+
+    runInNewContext(`(${eventCallbackSource('turn_end')})({});`, sandbox);
+
+    // The listener is gated on a snapshot having been applied: over unseeded
+    // state it must not clear the pending map, drop streaming, or touch busy.
+    expect(sandbox.permissions.has('a')).toBe(true);
+    expect(sandbox.streamingIdx).toBe(3);
+    expect(sandbox.busy).toBe(true);
+  });
+});
+
+describe('App submit gate over unseeded state', () => {
+  function submitSandbox(overrides = {}) {
+    const sandbox = {
+      modelRef: 'prov/model',
+      snapshotApplied: false,
+      readOnly: false,
+      shown: null,
+      prefilled: null,
+      showError: (err) => { sandbox.shown = err; },
+      inputArea: { prefill: (c) => { sandbox.prefilled = c; } },
+      Submit: async (content) => { sandbox.submitted = (sandbox.submitted || []).concat(content); return { started: false }; },
+      ...overrides,
+    };
+    return sandbox;
+  }
+
+  it('blocks handleSubmit when no snapshot was applied even with a model present', () => {
+    const sandbox = submitSandbox();
+    runInNewContext(`(async ${functionBodySource('handleSubmit')})({ detail: 'hello' });`, sandbox);
+
+    // The composer gate (button state) alone is not the gate: the handler must
+    // refuse too, keeping the draft, or a stale dispatch would submit into a
+    // session the view never loaded.
+    expect(sandbox.submitted).toBeUndefined();
+    expect(sandbox.prefilled).toBe('hello');
+    expect(sandbox.shown).toBeTruthy();
+  });
+
+  it('blocks handleSubmit for a read-only session', () => {
+    const sandbox = submitSandbox({ snapshotApplied: true, readOnly: true });
+    runInNewContext(`(async ${functionBodySource('handleSubmit')})({ detail: 'hello' });`, sandbox);
+
+    expect(sandbox.submitted).toBeUndefined();
+    expect(sandbox.prefilled).toBe('hello');
+    expect(sandbox.shown).toBeTruthy();
   });
 });
 
