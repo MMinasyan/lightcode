@@ -696,6 +696,10 @@ func (c *CLI) showRevertMenu() error {
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			c.printRevertSkipped(result)
+			// The owner reconciles the loop to disk after a history revert,
+			// even when the walk stopped partway, so the transcript the user
+			// is looking at is stale; re-render it over the reconciled state.
+			c.refreshSession()
 			return nil
 		}
 		if result.Session.ID != "" {

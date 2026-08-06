@@ -2303,6 +2303,120 @@ func TestCLIRunShutdownContract(t *testing.T) {
 		}
 	})
 
+	t.Run("revert_error_refreshes_reconciled_transcript", func(t *testing.T) {
+		// Exception, recorded per the contract-test rule: Run cannot be driven
+		// in a test (term.MakeRaw on os.Stdin requires a real TTY), so the
+		// command chain is driven through handleKeyIdle with an injected key
+		// source. A history revert that stops partway still removed every turn
+		// above the one it stopped at, so the loop is reconciled to disk and
+		// the error branch must refresh the view: the user must not keep
+		// looking at turns that are gone from both loop and disk.
+		if os.Geteuid() == 0 {
+			t.Skip("directory permissions do not block writes as root")
+		}
+		home := t.TempDir()
+		projectRoot := t.TempDir()
+		lightcodeDir := filepath.Join(home, ".lightcode")
+		if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("LIGHTCODE_TEST_KEY", "test")
+		configPath := filepath.Join(lightcodeDir, "config.json")
+		if err := os.WriteFile(configPath, []byte(`{
+  "providers": {
+    "test": {
+      "name": "Test Provider",
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_TEST_KEY" },
+      "discovery": false,
+      "models": {
+        "test-model": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 }
+      }
+    }
+  },
+  "default_model": "test/test-model"
+}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(lightcodeDir, "agents.json"), []byte(`{"primary": {"model": "test/test-model"}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := config.Load(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
+		if err != nil {
+			t.Fatalf("new agent: %v", err)
+		}
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		for i := 1; i <= 10; i++ {
+			if _, err := a.AppendUserMessage(fmt.Sprintf("turn %d", i)); err != nil {
+				t.Fatalf("seed turn %d: %v", i, err)
+			}
+		}
+		sid := a.SessionCurrent().ID
+		matches, err := filepath.Glob(filepath.Join(lightcodeDir, "projects", "*", "sessions", sid))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(matches) != 1 {
+			t.Fatalf("session dirs matching %q = %v, want exactly one", sid, matches)
+		}
+		blocked := filepath.Join(matches[0], "turns", "7")
+		if err := os.Chmod(blocked, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = os.Chmod(blocked, 0o700) }()
+
+		c := New(a)
+		c.setCurrentSessionID(sid)
+		var out bytes.Buffer
+		c.out = &out
+		c.refreshSession()
+		if len(c.messages) != 10 {
+			t.Fatalf("initial transcript has %d entries, want 10", len(c.messages))
+		}
+
+		// Pick the first user turn, choose "Revert history", and answer the
+		// code confirmation with Escape (No).
+		keys := []keyMsg{
+			{Special: keyEnter},
+			{Special: keyDown},
+			{Special: keyEnter},
+			{Special: keyEscape},
+		}
+		next := 0
+		c.readKeyFn = func() (keyMsg, error) {
+			if next < len(keys) {
+				k := keys[next]
+				next++
+				return k, nil
+			}
+			return keyMsg{}, fmt.Errorf("unexpected key read")
+		}
+
+		c.input.Set("/revert")
+		if err := c.handleKeyIdle(keyMsg{Special: keyEnter}); err != nil {
+			t.Fatalf("handleKeyIdle: %v", err)
+		}
+		// The error branch re-renders the transcript over the reconciled
+		// loop: turns 8-10 are gone from both loop and disk, so they must be
+		// gone from the display too.
+		if len(c.messages) != 7 {
+			t.Fatalf("transcript after partial revert = %d entries, want 7 (turns 1-7): the error branch must refresh the view", len(c.messages))
+		}
+		for i, m := range c.messages {
+			if m.turn != i+1 {
+				t.Fatalf("display entry %d = turn %d, want turn %d", i, m.turn, i+1)
+			}
+		}
+		if !strings.Contains(out.String(), "turn 7") {
+			t.Fatalf("revert error not shown in output:\n%s", out.String())
+		}
+	})
+
 	t.Run("fork_confirm=exit_performs_no_fork", func(t *testing.T) {
 		// Exception, recorded per the contract-test rule: Run cannot be driven
 		// in a test (term.MakeRaw on os.Stdin requires a real TTY), so the

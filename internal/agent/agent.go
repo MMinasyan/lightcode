@@ -5522,8 +5522,6 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 	// clears the queue at the irreversible store mutation and enqueues the
 	// event in the same runtime.mu section. Both were validated by the
 	// reservation.
-	var clearedVersion int
-	var queueCleared bool
 	var eventSessionID string
 	var eventProjectID string
 	a.ensureRuntime().mu.Lock()
@@ -5570,24 +5568,64 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 				return result, err
 			}
 		}
-		if err := unit.store.RevertHistory(target); err != nil {
-			// The truncation stopped partway (the store reports where); return
-			// the partial result so the caller can show what happened.
-			result, _ = a.populateTurnActionResultForSession(unit, result)
-			return result, err
-		}
-		// History irreversibly truncated: the queued input no longer applies.
-		_, clearedVersion, queueCleared = a.ensureRuntime().clearQueueLockedForSession(unit)
-		if queueCleared {
-			a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
-		}
+		// One rule, keyed on the reload: the loop must match what the revert
+		// achieved, whatever that was. The walk stops at the first failed
+		// removal, so even a failed walk removed every turn above the one it
+		// stopped at; the loop is therefore re-derived from disk after the
+		// walk, and the pre-walk truncation point tells the queue rule whether
+		// any turn was removed.
+		before := unit.store.CurrentTurn()
+		revertErr := unit.store.RevertHistory(target)
 		if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
+			// The loop can no longer match disk, so the unit must not stay
+			// live: releasing the reservation would re-arm the drainers over
+			// the mismatched loop, and leaving it set fails unitMutableLocked
+			// forever. Evict instead — the files are untouched and reopening
+			// loads them again.
+			id := sessionIDOf(unit)
+			if unit == a.session {
+				a.store.Detach()
+				if a.currentSessionID == id {
+					a.currentSessionID = ""
+				}
+				delete(a.sessions, id)
+				a.ensureRuntime().unregisterTranscript(id)
+				a.ensureRuntime().clearQueueLocked()
+				a.resetCurrentSessionStateLocked()
+			} else {
+				unit.store.Detach()
+				a.ensureRuntime().clearQueueLockedForSession(unit)
+				delete(a.sessions, id)
+				a.ensureRuntime().unregisterTranscript(id)
+			}
+			release = nil
+			if emit != nil {
+				emit(HydrationState{}, nil)
+			}
 			result, _ = a.populateTurnActionResultForSession(unit, result)
+			if revertErr != nil {
+				return result, revertErr
+			}
 			return result, err
+		}
+		// The loop now matches disk. History irreversibly truncated: the
+		// queued input no longer applies whenever the walk removed at least
+		// one turn, and is kept when the walk removed nothing.
+		if unit.store.CurrentTurn() < before {
+			_, clearedVersion, queueCleared := a.ensureRuntime().clearQueueLockedForSession(unit)
+			if queueCleared {
+				a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
+			}
 		}
 		a.resetFileTrackerForSession(unit)
 		result, maxDurableTurn := a.populateTurnActionResultForSession(unit, result)
+		// A reconciled walk failure still publishes the boundary: the loop is
+		// reconciled, so the capture is over state that matches disk, and the
+		// adapters learn the turns are gone from both.
 		a.emitTurnActionBoundaryLocked(unit, result, maxDurableTurn, emit)
+		if revertErr != nil {
+			return result, revertErr
+		}
 		return result, nil
 
 	default:

@@ -316,9 +316,9 @@ func TestSessionLifecycleTransactionContract(t *testing.T) {
 
 	// shape=C is the revert shape: reserve (transitioning), durable mutation,
 	// release. A revert failing midway must leave the unit live and consistent
-	// afterwards — live, claimed, selected, its loop state untouched, its queue
-	// intact, and the transitioning reservation released so the unit is
-	// driveable again. The failure is injected at a specific turn directory
+	// afterwards — live, claimed, selected, its loop reloaded to match the
+	// truncated history, and the transitioning reservation released so the unit
+	// is driveable again. The failure is injected at a specific turn directory
 	// through filesystem permissions: RevertHistory removes turn dirs strictly
 	// above the target, so an unwritable turn dir fails exactly its removal,
 	// midway through the walk. The subtests assert only that post-failure
@@ -452,8 +452,8 @@ func TestSessionLifecycleTransactionContract(t *testing.T) {
 		if queueLen != 0 {
 			t.Fatalf("queue length after failed revert = %d, want 0", queueLen)
 		}
-		if loopMsgs != len(loopContents)+1 {
-			t.Fatalf("loop message count = %d, want %d (system prompt + %d user turns; the loop was never reloaded)", loopMsgs, len(loopContents)+1, len(loopContents))
+		if loopMsgs != len(loopContents) {
+			t.Fatalf("loop message count = %d, want %d (system prompt + %d surviving user turns; the loop was reloaded to match disk)", loopMsgs, len(loopContents), len(loopContents)-1)
 		}
 		msgs, err := a.SessionMessagesFor(targetID)
 		if err != nil {
@@ -547,8 +547,8 @@ func assertCurrentRemovalFailureIntact(t *testing.T, a *Agent, id string, proj *
 // assertCurrentRevertFailureIntact asserts that a failed current-session
 // revert left the unit live, claimed, selected and consistent: the durable
 // history is truncated only as far as the walk reached (all but the last
-// contents), the loop was never reloaded, and the transitioning reservation is
-// released so the unit is driveable again.
+// contents), the loop was reloaded to match it, and the transitioning
+// reservation is released so the unit is driveable again.
 func assertCurrentRevertFailureIntact(t *testing.T, a *Agent, id string, proj *project.Project, loopContents []string) {
 	t.Helper()
 	rt := a.ensureRuntime()
@@ -581,8 +581,8 @@ func assertCurrentRevertFailureIntact(t *testing.T, a *Agent, id string, proj *p
 	if queueLen != 0 {
 		t.Fatalf("queue length after failed revert = %d, want 0", queueLen)
 	}
-	if loopMsgs != len(loopContents)+1 {
-		t.Fatalf("loop message count = %d, want %d (system prompt + %d user turns; the loop was never reloaded)", loopMsgs, len(loopContents)+1, len(loopContents))
+	if loopMsgs != len(loopContents) {
+		t.Fatalf("loop message count = %d, want %d (system prompt + %d surviving user turns; the loop was reloaded to match disk)", loopMsgs, len(loopContents), len(loopContents)-1)
 	}
 	msgs, err := a.SessionMessagesFor(id)
 	if err != nil {
