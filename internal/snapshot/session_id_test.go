@@ -264,3 +264,52 @@ func TestOwnerGlobalSessionIDNamespace(t *testing.T) {
 		}
 	})
 }
+
+// TestMintRedrawsOnLostClaim proves a mint whose first draw loses the claim
+// to another live process redraws with a fresh id instead of aborting: a lost
+// claim on a freshly drawn id is the same event as the scan collision, which
+// already retries.
+func TestMintRedrawsOnLostClaim(t *testing.T) {
+	projectsRoot := t.TempDir()
+	projectID := "p-redraw"
+	store, err := NewForSessionsRoot(filepath.Join(projectsRoot, projectID, "sessions"), projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the claim on the first drawn id, as another live process would.
+	heldID := "redraw01"
+	held, ok, err := AcquireSessionClaim(projectsRoot, projectID, heldID)
+	if err != nil || !ok {
+		t.Fatalf("pre-hold claim on %s: held=%v err=%v", heldID, ok, err)
+	}
+	defer func() { _ = held.Release() }()
+
+	origMint := mintSessionIDFunc
+	defer func() { mintSessionIDFunc = origMint }()
+	draws := 0
+	mintSessionIDFunc = func() (string, error) {
+		draws++
+		if draws == 1 {
+			return heldID, nil // the contended draw
+		}
+		return "redraw02", nil
+	}
+
+	id, err := store.mintReservedSessionID(t.TempDir(), SessionMeta{}, true)
+	if err != nil {
+		t.Fatalf("mint after a lost claim = %v, want a later draw to succeed", err)
+	}
+	if id != "redraw02" {
+		t.Fatalf("mint id = %q, want redraw02", id)
+	}
+	if draws != 2 {
+		t.Fatalf("draws = %d, want 2 (first draw contended)", draws)
+	}
+	if store.claim == nil {
+		t.Fatal("mint did not hold the claim on the winning id")
+	}
+	if err := store.releaseClaimLocked(id); err != nil {
+		t.Fatalf("release winning claim: %v", err)
+	}
+}

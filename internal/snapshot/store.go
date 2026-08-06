@@ -1889,8 +1889,12 @@ func newSessionID() (string, error) {
 // reservation, so the lock must span its creation: if it were released
 // before the winning id's directory existed, a second mint could scan the
 // same roots, see no collision, and draw the same id. A collided attempt
-// creates nothing, so no cleanup is needed between retries. The hold covers
-// local filesystem work only and is released before any turn or loop work.
+// creates nothing, so no cleanup is needed between retries. A lost claim on
+// a fresh draw redraws for the same reason: another process took the id, and
+// nothing was created. A failure after the claim removes the reservation
+// directory before returning, so a failed mint leaves nothing behind. The
+// hold covers local filesystem work only and is released before any turn or
+// loop work.
 func (s *Store) mintReservedSessionID(createRoot string, meta SessionMeta, claim bool) (string, error) {
 	mintMu.Lock()
 	defer mintMu.Unlock()
@@ -1908,6 +1912,13 @@ func (s *Store) mintReservedSessionID(createRoot string, meta SessionMeta, claim
 		}
 		if claim {
 			if cerr := s.acquireClaimLocked(id); cerr != nil {
+				// A lost claim means another process took this exact id, the
+				// same event as the scan collision above: redraw rather than
+				// abort. Any other error — validation or filesystem — fails
+				// the mint.
+				if errors.Is(cerr, ErrSessionContended) {
+					continue
+				}
 				return "", cerr
 			}
 		}
@@ -1917,6 +1928,7 @@ func (s *Store) mintReservedSessionID(createRoot string, meta SessionMeta, claim
 				if claim {
 					err = errors.Join(err, s.releaseClaimLocked(id))
 				}
+				err = errors.Join(err, removeMintedDir(createDir))
 				return "", fmt.Errorf("snapshot: create %s: %w", p, err)
 			}
 		}
@@ -1925,11 +1937,26 @@ func (s *Store) mintReservedSessionID(createRoot string, meta SessionMeta, claim
 			if claim {
 				err = errors.Join(err, s.releaseClaimLocked(id))
 			}
+			err = errors.Join(err, removeMintedDir(createDir))
 			return "", fmt.Errorf("snapshot: write session meta: %w", err)
 		}
 		return id, nil
 	}
-	return "", fmt.Errorf("snapshot: could not mint a unique session id in %d attempts", mintSessionIDMaxAttempts)
+	return "", fmt.Errorf("snapshot: could not mint a unique session id in %d attempts (collision or contention)", mintSessionIDMaxAttempts)
+}
+
+// removeMintedDir removes the reservation directory a failed mint created
+// under its create root, so the id can be drawn again and a lost mint leaves
+// nothing behind. It never removes the create root itself. Safe because
+// mintMu is held, the id appeared in no namespace, and nothing else can hold
+// a reference to a directory this call created moments earlier. A removal
+// failure is returned so the caller can join it onto the error it already
+// carries.
+func removeMintedDir(createDir string) error {
+	if err := os.RemoveAll(createDir); err != nil {
+		return fmt.Errorf("snapshot: remove %s: %w", createDir, err)
+	}
+	return nil
 }
 
 // sessionIDExistsAnywhere reports whether id is already present on disk in

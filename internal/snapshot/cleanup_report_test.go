@@ -165,6 +165,42 @@ func TestMintMetaWriteFailureJoinsFailedClaimRelease(t *testing.T) {
 	}
 }
 
+// TestMintMetaWriteFailureLeavesNothingBehind proves a mint whose metadata
+// write fails removes the reservation directory it created under the create
+// root and releases the claim: a failed mint leaves no orphan the id scan
+// would avoid forever, and the create root itself survives.
+func TestMintMetaWriteFailureLeavesNothingBehind(t *testing.T) {
+	// A failing temp sync makes the meta publication fail after the
+	// reservation directories were created.
+	atomicfs.SyncFileFunc = func(*os.File) error { return errors.New("injected sync failure") }
+	t.Cleanup(func() { atomicfs.SyncFileFunc = nil })
+
+	projectsRoot := t.TempDir()
+	projectID := "p-mint-orphan"
+	store, err := NewForSessionsRoot(filepath.Join(projectsRoot, projectID, "sessions"), projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origMint := mintSessionIDFunc
+	defer func() { mintSessionIDFunc = origMint }()
+	mintSessionIDFunc = func() (string, error) { return "orphan001", nil }
+
+	createRoot := t.TempDir()
+	_, err = store.mintReservedSessionID(createRoot, SessionMeta{}, true)
+	if err == nil {
+		t.Fatal("mint with failing meta write = nil error")
+	}
+	if _, serr := os.Stat(filepath.Join(createRoot, "orphan001")); !os.IsNotExist(serr) {
+		t.Fatalf("reservation directory still present after failed mint (stat err = %v)", serr)
+	}
+	if _, serr := os.Stat(createRoot); serr != nil {
+		t.Fatalf("create root removed by failed mint: %v", serr)
+	}
+	if store.claim != nil {
+		t.Fatal("failed mint retained the session claim")
+	}
+}
+
 // TestSweepReportsFailedClaimRelease proves a release failure does not fail
 // the sweep: the candidate is still processed, and the failed release is
 // reported to stderr naming the session.
