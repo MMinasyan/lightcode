@@ -536,12 +536,27 @@ func (c *CLI) Run(ctx context.Context) error {
 		// exits; fold that into the returned error so a script driving this
 		// process detects it from the exit code.
 		if !c.owner.ShutdownOwner() {
-			err = errors.Join(err, fmt.Errorf("owner shutdown abandoned in-flight work"))
+			err = foldAbandonedShutdown(err)
 		}
 	}
 	c.opWG.Wait()
 	c.closeEvents()
 	return err
+}
+
+// foldAbandonedShutdown folds the abandoned-shutdown report onto the error
+// Run is about to return, so a script driving this process detects the
+// abandonment from the exit code. The fold must force a non-zero exit and
+// never lower or overwrite a non-zero one already present: when the existing
+// error carries a non-zero ExitError (a signal), the message joins after it
+// and the code survives; otherwise ExitError{Code: 1} joins ahead of it, so
+// the exit-code selector reaches the forced code first.
+func foldAbandonedShutdown(err error) error {
+	var exit ExitError
+	if errors.As(err, &exit) && exit.Code != 0 {
+		return errors.Join(err, fmt.Errorf("owner shutdown abandoned in-flight work"))
+	}
+	return errors.Join(ExitError{Code: 1}, fmt.Errorf("owner shutdown abandoned in-flight work"), err)
 }
 
 // handleSignal decides the host's response to one signal on the watcher

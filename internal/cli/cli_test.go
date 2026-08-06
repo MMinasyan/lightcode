@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -3011,37 +3010,42 @@ func TestCLIRestoreTerminalUnblockedByStalledWrite(t *testing.T) {
 	})
 }
 
-// TestCLIShutdownAbandonedReturnsError pins Run's teardown fold: when the
-// owner reports that shutdown abandoned in-flight work, Run must fold a
-// non-nil error into its returned error so a script driving this process
-// detects the abandonment from the exit code. Exception, recorded per the
-// contract-test rule: Run cannot be driven against a stub owner in a test.
-// The owner field is a concrete *agent.Agent — typed for the concrete-only
-// surface (ShutdownOwner), not the AdapterService interface — so a stub
-// cannot be substituted without changing the field's type to an interface, a
-// production change this test must not force. Run additionally requires a
-// real TTY (term.MakeRaw on os.Stdin) to reach its teardown at all, and an
-// abandoned shutdown needs the agent-internal coordinator park that
-// TestOwnerShutdownContractMatrix drives (join=timeout). The fold is
-// therefore pinned structurally against that behavioral evidence.
-func TestCLIShutdownAbandonedReturnsError(t *testing.T) {
-	src, err := os.ReadFile("cli.go")
-	if err != nil {
-		t.Fatalf("read cli.go: %v", err)
+// TestFoldAbandonedShutdown pins the exit-code rule for an abandoned
+// shutdown: the fold must force a non-zero exit and never lower or
+// overwrite a non-zero code already present. The code is resolved the
+// same way the exit path resolves it — the first ExitError the joined
+// error yields — mirroring the selector the root command layer applies
+// to the error Run returns.
+func TestFoldAbandonedShutdown(t *testing.T) {
+	resolve := func(err error) int {
+		var exit ExitError
+		if errors.As(err, &exit) {
+			return exit.Code
+		}
+		return -1
 	}
-	body, ok := extractFunctionBody(string(src), "func (c *CLI) Run(")
-	if !ok {
-		t.Fatal("Run not found")
-	}
-	// The whole shape is one structure, not separate facts: the fold is
-	// guarded by the abandoned outcome, the joined error is assigned into
-	// err, and the same err is returned later in the body. An inverted guard,
-	// an unconditional fold, or a fold that builds the joined error and
-	// discards it would each fail this one pattern while still containing the
-	// guard, the join call, the message and the return somewhere in the
-	// function.
-	guardedFoldIntoReturned := regexp.MustCompile(`!c\.owner\.ShutdownOwner\(\)\s*\{\s*err\s*=\s*errors\.Join\(\s*err\s*,\s*fmt\.Errorf\(\s*"owner shutdown abandoned in-flight work"\s*\)\s*\)\s*\}[\s\S]*?return\s+err\b`)
-	if !guardedFoldIntoReturned.MatchString(body) {
-		t.Fatal("Run must fold the abandoned outcome into the error it returns as one guarded structure: `if !c.owner.ShutdownOwner() { err = errors.Join(err, fmt.Errorf(\"owner shutdown abandoned in-flight work\")) }` and later `return err`")
-	}
+
+	t.Run("abandoned_exit_becomes_1", func(t *testing.T) {
+		// /exit supplies ExitError{Code: 0}; the fold must join
+		// ExitError{Code: 1} ahead of it so the selector reaches the
+		// forced code first.
+		if code := resolve(foldAbandonedShutdown(ExitError{Code: 0})); code != 1 {
+			t.Fatalf("folded /exit resolves to %d, want 1", code)
+		}
+	})
+
+	t.Run("abandoned_signal_keeps_130", func(t *testing.T) {
+		// A signal supplies ExitError{Code: 130}; the message joins after
+		// it, so the non-zero code survives.
+		if code := resolve(foldAbandonedShutdown(ExitError{Code: 130})); code != 130 {
+			t.Fatalf("folded signal exit resolves to %d, want 130", code)
+		}
+	})
+
+	t.Run("clean_exit_stays_0", func(t *testing.T) {
+		// No abandonment: the error /exit supplies resolves to 0 on its own.
+		if code := resolve(ExitError{Code: 0}); code != 0 {
+			t.Fatalf("clean /exit resolves to %d, want 0", code)
+		}
+	})
 }
