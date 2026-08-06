@@ -643,6 +643,164 @@ func TestSessionSwitchArchivedStaleMetaRoutesActualProject(t *testing.T) {
 	}
 }
 
+// TestWailsExplicitOpenOfContendedSessionIsReadOnly proves an explicit switch
+// to a session another process drives opens it read-only: routing current
+// commits the session with its own identity, the durable transcript is
+// presented, a turn refuses with the contention message instead of "unknown
+// session", compaction keeps the selection and names the contention instead of
+// answering "no current session", and a later switch to a live session clears
+// the marker and admits a turn.
+func TestWailsExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
+	first, second := newAppTestAgentPair(t)
+	heldID, err := first.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession held: %v", err)
+	}
+	if _, err := first.AppendUserMessageToSession(heldID, "durable from the driving owner"); err != nil {
+		t.Fatalf("append durable message: %v", err)
+	}
+	startupID, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+
+	app := newTestApp(second)
+	app.agent = second
+	app.setCurrentSessionID(startupID)
+	if err := app.SessionSwitch(heldID); err != nil {
+		t.Fatalf("SessionSwitch over a held session = %v, want a read-only open", err)
+	}
+	if got := app.currentSessionID(); got != heldID {
+		t.Fatalf("routing current = %q, want the held session %q", got, heldID)
+	}
+	if got := app.SessionCurrent().ID; got != heldID {
+		t.Fatalf("SessionCurrent = %q, want the held session %q", got, heldID)
+	}
+	if got := userContents(app.SessionMessages()); !equalStrings(got, []string{"durable from the driving owner"}) {
+		t.Fatalf("read-only transcript = %#v, want the durable messages", got)
+	}
+
+	// Not live here: a turn refuses with the contention message.
+	if _, err := app.Submit("hi"); err == nil || !strings.Contains(err.Error(), "driven by another process") {
+		t.Fatalf("submit over the read-only session = %v, want the contention message", err)
+	}
+	// Compaction keeps the selection and names the contention.
+	if err := app.CompactNow(); err == nil || !strings.Contains(err.Error(), "driven by another process") {
+		t.Fatalf("CompactNow over the read-only session = %v, want the contention message", err)
+	}
+	if got := app.currentSessionID(); got != heldID {
+		t.Fatalf("routing current after failed compact = %q, want the read-only session kept %q", got, heldID)
+	}
+
+	// Switching to a live session clears the marker and admits a turn.
+	liveID, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession live: %v", err)
+	}
+	if err := app.SessionSwitch(liveID); err != nil {
+		t.Fatalf("SessionSwitch to a live session: %v", err)
+	}
+	if got := app.currentSessionID(); got != liveID {
+		t.Fatalf("routing current after live switch = %q, want %q", got, liveID)
+	}
+	app.ctx = context.Background()
+	if _, err := app.Submit("hi"); err != nil {
+		t.Fatalf("submit after switching to a live session = %v, want admission", err)
+	}
+}
+
+// TestWailsReopenAfterHolderReleasesIsLive proves a session opened read-only
+// becomes live again when it is reopened after the other process releases it:
+// the read-only marker does not survive a successful live commit of the same
+// id, so a turn is admitted and no contention is reported.
+func TestWailsReopenAfterHolderReleasesIsLive(t *testing.T) {
+	first, second := newAppTestAgentPair(t)
+	heldID, err := first.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession held: %v", err)
+	}
+	if _, err := first.AppendUserMessageToSession(heldID, "durable from the driving owner"); err != nil {
+		t.Fatalf("append durable message: %v", err)
+	}
+	startupID, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+
+	app := newTestApp(second)
+	app.agent = second
+	app.setCurrentSessionID(startupID)
+	if err := app.SessionSwitch(heldID); err != nil {
+		t.Fatalf("SessionSwitch over a held session = %v, want a read-only open", err)
+	}
+	if _, err := app.Submit("hi"); err == nil || !strings.Contains(err.Error(), "driven by another process") {
+		t.Fatalf("submit over the read-only session = %v, want the contention message", err)
+	}
+
+	// The driving process releases the session; reopening it must succeed live.
+	if err := first.SessionArchive(heldID); err != nil {
+		t.Fatalf("SessionArchive (release): %v", err)
+	}
+	if err := app.SessionSwitch(heldID); err != nil {
+		t.Fatalf("SessionSwitch after the holder released = %v, want a live open", err)
+	}
+	if got := app.liveCurrentSessionID(); got != heldID {
+		t.Fatalf("live current after reopen = %q, want %q", got, heldID)
+	}
+	if app.routeReadOnlyNames(heldID) {
+		t.Fatal("read-only marker survived the live reopen of the same session")
+	}
+	app.ctx = context.Background()
+	if _, err := app.Submit("hi"); err != nil {
+		t.Fatalf("submit after reopen = %v, want admission without contention", err)
+	}
+}
+
+// TestWailsReadOnlyOpenHydrationFailureLeavesRoutingUnchanged proves a
+// read-only open whose durable view cannot be read commits nothing: the
+// previous session and the routing project stay, so a failed presentation
+// never advances routing.
+func TestWailsReadOnlyOpenHydrationFailureLeavesRoutingUnchanged(t *testing.T) {
+	first, second := newAppTestAgentPair(t)
+	heldID, err := first.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession held: %v", err)
+	}
+	if _, err := first.AppendUserMessageToSession(heldID, "durable from the driving owner"); err != nil {
+		t.Fatalf("append durable message: %v", err)
+	}
+	startupID, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	// A held session whose durable history cannot be read: the open still fails
+	// as contention (the claim is acquired before any file read), and the
+	// read-only hydration then fails on the corrupt compaction record.
+	proj, err := first.ProjectCurrentForPath(first.ProjectRoot())
+	if err != nil {
+		t.Fatalf("project for held session: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(first.Projects().SessionsRoot(proj.ID), heldID, "compaction.json"), []byte(`{not json`), 0o600); err != nil {
+		t.Fatalf("corrupt held session compaction: %v", err)
+	}
+
+	app := newTestApp(second)
+	app.agent = second
+	app.setCurrentSessionID(startupID)
+	if err := app.SessionSwitch(heldID); err == nil || !strings.Contains(err.Error(), "compaction.json") {
+		t.Fatalf("SessionSwitch over a held session with unreadable history = %v, want the hydration failure", err)
+	}
+	if got := app.currentSessionID(); got != startupID {
+		t.Fatalf("routing current after failed read-only open = %q, want unchanged %q", got, startupID)
+	}
+	if got := app.routeProjectPath; got != second.ProjectRoot() {
+		t.Fatalf("routing project after failed read-only open = %q, want unchanged %q", got, second.ProjectRoot())
+	}
+	if app.routeReadOnlyNames(heldID) {
+		t.Fatal("read-only marker set for an open whose presentation failed")
+	}
+}
+
 func TestProjectSwitchInPlaceKeepsOwnerAlive(t *testing.T) {
 	svc := newAppTestAgent(t)
 	app := newTestApp(svc)

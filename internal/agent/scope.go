@@ -95,7 +95,7 @@ func (s *AdapterScope) OpenOrCreateSession(projectPath string) (SessionSummary, 
 	if err != nil {
 		return SessionSummary{}, err
 	}
-	return s.svc.SessionSummaryForSession(id)
+	return s.svc.SessionSummaryForSessionOrPersisted(id)
 }
 
 // SessionView owns an adapter-local current-session pointer and the
@@ -103,8 +103,14 @@ func (s *AdapterScope) OpenOrCreateSession(projectPath string) (SessionSummary, 
 type SessionView struct {
 	svc AdapterService
 
-	mu       sync.Mutex
-	current  string
+	mu      sync.Mutex
+	current string
+	// readOnly holds the id of the routing-current session that was opened
+	// read-only because another process holds its claim. The two states are
+	// explicit: SetCurrent clears it on every commit, and only the read-only
+	// open path sets it, after committing the id it names — so a successful
+	// live commit of the same session can never leave it stale.
+	readOnly string
 	children map[string]struct{}
 }
 
@@ -118,8 +124,46 @@ func (v *SessionView) SetCurrent(id string) {
 	if v.current != id {
 		v.children = nil
 	}
+	// Every routing commit clears the read-only marker unconditionally: only
+	// the read-only open path sets it, after committing the id it names, so a
+	// successful live commit of the same session can never leave it stale.
+	v.readOnly = ""
 	v.current = id
 	v.mu.Unlock()
+}
+
+// SetReadOnly records that the routing current was opened read-only because
+// another process holds the session's claim. SetCurrent clears the marker on
+// every commit, so it must be set after committing the id it names.
+func (v *SessionView) SetReadOnly(id string) {
+	v.mu.Lock()
+	v.readOnly = strings.TrimSpace(id)
+	v.mu.Unlock()
+}
+
+// IsReadOnly reports whether the given id is the read-only-marked session.
+func (v *SessionView) IsReadOnly(id string) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.readOnly != "" && v.readOnly == strings.TrimSpace(id)
+}
+
+// LiveCurrentOrErr is LiveCurrent for a caller that must distinguish why no
+// live session is current: the read-only-marked session is current, so another
+// process drives it, or there is no current session at all.
+func (v *SessionView) LiveCurrentOrErr() (string, error) {
+	id := v.LiveCurrent()
+	if id != "" {
+		return id, nil
+	}
+	v.mu.Lock()
+	readOnly := v.readOnly
+	current := strings.TrimSpace(v.current)
+	v.mu.Unlock()
+	if readOnly != "" && readOnly == current {
+		return "", SessionContendedError(current)
+	}
+	return "", fmt.Errorf("no current session")
 }
 
 // clearIfCurrent clears the current pointer only when it still equals id, so a
@@ -156,12 +200,20 @@ func (v *SessionView) Resolve(id string) (string, error) {
 }
 
 func (v *SessionView) LiveCurrent() string {
-	id := v.Current()
+	v.mu.Lock()
+	id := strings.TrimSpace(v.current)
+	readOnly := v.readOnly == id
+	v.mu.Unlock()
 	if id == "" {
 		return ""
 	}
 	if v.svc == nil {
 		return id
+	}
+	if readOnly {
+		// The routing current was opened read-only because another process
+		// drives it; it stays routed, just not live here.
+		return ""
 	}
 	if _, err := v.svc.SessionSummaryForSession(id); err != nil {
 		v.clearIfCurrent(id)
@@ -246,7 +298,7 @@ func (v *SessionView) CurrentSummary() SessionSummary {
 	if id == "" {
 		return SessionSummary{}
 	}
-	s, err := v.svc.SessionSummaryForSession(id)
+	s, err := v.svc.SessionSummaryForSessionOrPersisted(id)
 	if err != nil {
 		v.SetCurrent("")
 		return SessionSummary{}

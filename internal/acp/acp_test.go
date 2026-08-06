@@ -2011,6 +2011,272 @@ func TestACPNewSetsCurrent(t *testing.T) {
 	}
 }
 
+// TestACPExplicitSwitchToContendedSessionIsReadOnly proves session/switch over
+// a session another process drives opens it read-only: the switch succeeds,
+// the session_changed notification carries the read-only hydration state with
+// the session's own identity and durable transcript, session/prompt refuses
+// with the contention message on both the explicit-id and implicit-current
+// paths, compact and snapshot/list name the contention instead of "no current
+// session", and a switch to a live session clears the marker and admits a
+// prompt.
+func TestACPExplicitSwitchToContendedSessionIsReadOnly(t *testing.T) {
+	first, second := newACPTestAgentPair(t)
+	heldID, err := first.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession held: %v", err)
+	}
+	if _, err := first.AppendUserMessageToSession(heldID, "durable from the driving owner"); err != nil {
+		t.Fatalf("append durable message: %v", err)
+	}
+	startupID, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: second, owner: second, out: &out}
+	r.setCurrentSessionID(startupID)
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + heldID + `"}`)})
+
+	lines := drainedLines(t, r, &out, 2)
+	var notif Notification
+	if err := json.Unmarshal([]byte(lines[0]), &notif); err != nil {
+		t.Fatalf("notification json: %v", err)
+	}
+	if notif.Method != "agent/session_changed" {
+		t.Fatalf("notification method = %q, want session_changed", notif.Method)
+	}
+	state := hydrationStateFromParams(t, notif.Params)
+	if !state.ReadOnly {
+		t.Fatal("read-only switch notification is not marked read-only")
+	}
+	if state.Session.ID != heldID {
+		t.Fatalf("notification session = %q, want %q", state.Session.ID, heldID)
+	}
+	if got := acpUserMessageContents(state.Messages); !equalStringSlices(got, []string{"durable from the driving owner"}) {
+		t.Fatalf("notification messages = %#v, want the durable transcript", got)
+	}
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
+		t.Fatalf("switch response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("switch response error = %+v, want a read-only open", resp.Error)
+	}
+	if got := r.currentSessionSummary().ID; got != heldID {
+		t.Fatalf("runner current = %q, want the held session %q", got, heldID)
+	}
+	if got := r.sv().LiveCurrent(); got != "" {
+		t.Fatalf("read-only session reports live: %q", got)
+	}
+	if !r.sv().IsReadOnly(heldID) {
+		t.Fatal("held session not marked read-only")
+	}
+
+	// A prompt naming the read-only session refuses at its own precheck, which
+	// never reaches the owner, with the contention message.
+	out.Reset()
+	r.handleSessionPrompt(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"session_id":"` + heldID + `","content":"hi"}`),
+	})
+	lines = drainedLines(t, r, &out, 1)
+	var promptResp Response
+	if err := json.Unmarshal([]byte(lines[0]), &promptResp); err != nil {
+		t.Fatalf("prompt response json: %v", err)
+	}
+	if promptResp.Error == nil || !strings.Contains(promptResp.Error.Message, "driven by another process") {
+		t.Fatalf("explicit-id prompt over the read-only session = %+v, want the contention message", promptResp.Error)
+	}
+
+	// A prompt to the routing current (the read-only session) translates the
+	// owner's refusal the same way.
+	out.Reset()
+	r.handleSessionPrompt(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"content":"hi"}`),
+	})
+	lines = drainedLines(t, r, &out, 1)
+	var implicitResp Response
+	if err := json.Unmarshal([]byte(lines[0]), &implicitResp); err != nil {
+		t.Fatalf("prompt response json: %v", err)
+	}
+	if implicitResp.Error == nil || !strings.Contains(implicitResp.Error.Message, "driven by another process") {
+		t.Fatalf("implicit prompt over the read-only session = %+v, want the contention message", implicitResp.Error)
+	}
+
+	// Compact and snapshot/list name the contention instead of "no current
+	// session", keeping the selection.
+	out.Reset()
+	r.handleCompact(context.Background(), Request{JSONRPC: "2.0", ID: "compact"})
+	lines = drainedLines(t, r, &out, 1)
+	var compactResp Response
+	if err := json.Unmarshal([]byte(lines[0]), &compactResp); err != nil {
+		t.Fatalf("compact response json: %v", err)
+	}
+	if compactResp.Error == nil || !strings.Contains(compactResp.Error.Message, "driven by another process") {
+		t.Fatalf("compact over the read-only session = %+v, want the contention message", compactResp.Error)
+	}
+
+	out.Reset()
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "snaps", Method: "snapshot/list"})
+	lines = drainedLines(t, r, &out, 1)
+	var snapsResp Response
+	if err := json.Unmarshal([]byte(lines[0]), &snapsResp); err != nil {
+		t.Fatalf("snapshot/list response json: %v", err)
+	}
+	if snapsResp.Error == nil || !strings.Contains(snapsResp.Error.Message, "driven by another process") {
+		t.Fatalf("snapshot/list over the read-only session = %+v, want the contention message", snapsResp.Error)
+	}
+	if got := r.sv().Current(); got != heldID {
+		t.Fatalf("selection after failed compact/snapshot = %q, want the read-only session kept %q", got, heldID)
+	}
+
+	// Switching to a live session clears the marker and admits a prompt.
+	liveID, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession live: %v", err)
+	}
+	out.Reset()
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw2", Params: json.RawMessage(`{"id":"` + liveID + `"}`)})
+	lines = drainedLines(t, r, &out, 2)
+	var liveResp Response
+	if err := json.Unmarshal([]byte(lines[1]), &liveResp); err != nil {
+		t.Fatalf("switch response json: %v", err)
+	}
+	if liveResp.Error != nil {
+		t.Fatalf("switch to live response error = %+v", liveResp.Error)
+	}
+	if r.sv().IsReadOnly(heldID) {
+		t.Fatal("read-only marker survived the switch to a live session")
+	}
+	if got := r.sv().LiveCurrent(); got != liveID {
+		t.Fatalf("live current after switch = %q, want %q", got, liveID)
+	}
+}
+
+// TestACPReadOnlySwitchHydrationFailureLeavesRoutingUnchanged proves a
+// read-only switch whose durable view cannot be read commits nothing: the
+// protocol path keeps the previous session and the routing project.
+func TestACPReadOnlySwitchHydrationFailureLeavesRoutingUnchanged(t *testing.T) {
+	first, second := newACPTestAgentPair(t)
+	heldID, err := first.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession held: %v", err)
+	}
+	if _, err := first.AppendUserMessageToSession(heldID, "durable from the driving owner"); err != nil {
+		t.Fatalf("append durable message: %v", err)
+	}
+	startupID, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	// A held session whose durable history cannot be read: the open still fails
+	// as contention (the claim is acquired before any file read), and the
+	// read-only hydration then fails on the corrupt compaction record.
+	proj, err := first.ProjectCurrentForPath(first.ProjectRoot())
+	if err != nil {
+		t.Fatalf("project for held session: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(first.Projects().SessionsRoot(proj.ID), heldID, "compaction.json"), []byte(`{not json`), 0o600); err != nil {
+		t.Fatalf("corrupt held session compaction: %v", err)
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: second, owner: second, out: &out}
+	r.setCurrentSessionID(startupID)
+	r.routeProjectPath = second.ProjectRoot()
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + heldID + `"}`)})
+	lines := drainedLines(t, r, &out, 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("switch response json: %v", err)
+	}
+	if resp.Error == nil || !strings.Contains(resp.Error.Message, "compaction.json") {
+		t.Fatalf("switch over a held session with unreadable history = %+v, want the hydration failure", resp.Error)
+	}
+	if got := r.sv().Current(); got != startupID {
+		t.Fatalf("routing current after failed read-only switch = %q, want unchanged %q", got, startupID)
+	}
+	if got := r.routeProjectPath; got != second.ProjectRoot() {
+		t.Fatalf("routing project after failed read-only switch = %q, want unchanged %q", got, second.ProjectRoot())
+	}
+	if r.sv().IsReadOnly(heldID) {
+		t.Fatal("read-only marker set for a switch whose presentation failed")
+	}
+}
+
+// TestACPReopenAfterHolderReleasesIsLive proves a session switched read-only
+// becomes live again when it is switched again after the driving process
+// releases it: the read-only marker does not survive a successful live commit
+// of the same id, so a prompt is admitted and no contention is reported.
+func TestACPReopenAfterHolderReleasesIsLive(t *testing.T) {
+	first, second := newACPTestAgentPair(t)
+	heldID, err := first.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession held: %v", err)
+	}
+	startupID, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	var out bytes.Buffer
+	r := &Runner{agent: second, owner: second, out: &out}
+	r.setCurrentSessionID(startupID)
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + heldID + `"}`)})
+	lines := drainedLines(t, r, &out, 2)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
+		t.Fatalf("switch response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("read-only switch response error = %+v", resp.Error)
+	}
+	if !r.sv().IsReadOnly(heldID) {
+		t.Fatal("held session not marked read-only")
+	}
+
+	// The driving process releases the session; switching again must succeed
+	// live.
+	if err := first.SessionArchive(heldID); err != nil {
+		t.Fatalf("SessionArchive (release): %v", err)
+	}
+	out.Reset()
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw2", Params: json.RawMessage(`{"id":"` + heldID + `"}`)})
+	lines = drainedLines(t, r, &out, 2)
+	var liveResp Response
+	if err := json.Unmarshal([]byte(lines[1]), &liveResp); err != nil {
+		t.Fatalf("switch response json: %v", err)
+	}
+	if liveResp.Error != nil {
+		t.Fatalf("reopen switch response error = %+v, want a live open", liveResp.Error)
+	}
+	if r.sv().IsReadOnly(heldID) {
+		t.Fatal("read-only marker survived the live reopen of the same session")
+	}
+	if got := r.sv().LiveCurrent(); got != heldID {
+		t.Fatalf("live current after reopen = %q, want %q", got, heldID)
+	}
+
+	// A prompt to the reopened session is admitted; no contention is reported.
+	out.Reset()
+	r.handleSessionPrompt(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"content":"hi"}`),
+	})
+	lines = drainedLines(t, r, &out, 1)
+	var promptResp Response
+	if err := json.Unmarshal([]byte(lines[0]), &promptResp); err != nil {
+		t.Fatalf("prompt response json: %v", err)
+	}
+	if promptResp.Error != nil {
+		t.Fatalf("prompt after reopen = %+v, want admission without contention", promptResp.Error)
+	}
+}
+
 func TestACPSwitchKeepsCurrent(t *testing.T) {
 	a := newACPTestAgent(t)
 	firstID, err := a.NewSession("", "primary")
@@ -2988,6 +3254,14 @@ func newACPTestAgentWithProvider(t *testing.T, baseURL string, discovery bool) *
 func newACPTestAgentEnv(t *testing.T, baseURL string, discovery bool) (*agent.Agent, string) {
 	t.Helper()
 	home := t.TempDir()
+	a := newACPTestAgentAtHome(t, baseURL, discovery, home)
+	return a, home
+}
+
+// newACPTestAgentAtHome builds an owner over the given home, so several owners
+// can share one home for cross-process claim testing.
+func newACPTestAgentAtHome(t *testing.T, baseURL string, discovery bool, home string) *agent.Agent {
+	t.Helper()
 	projectRoot := t.TempDir()
 	lightcodeDir := filepath.Join(home, ".lightcode")
 	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
@@ -3018,7 +3292,18 @@ func newACPTestAgentEnv(t *testing.T, baseURL string, discovery bool) (*agent.Ag
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
-	return a, home
+	return a
+}
+
+// newACPTestAgentPair builds two owners over the same home with distinct
+// project roots, so one owner's live sessions hold their claims against the
+// other.
+func newACPTestAgentPair(t *testing.T) (*agent.Agent, *agent.Agent) {
+	t.Helper()
+	home := t.TempDir()
+	first := newACPTestAgentAtHome(t, "http://127.0.0.1:9/v1", false, home)
+	second := newACPTestAgentAtHome(t, "http://127.0.0.1:9/v1", false, home)
+	return first, second
 }
 
 func appendACPUserTurn(t *testing.T, a *agent.Agent, content string) int {

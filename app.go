@@ -90,8 +90,14 @@ type App struct {
 	// Navigation and current-target operations take navMu then routeMu. Routing
 	// current is where operations route; presentation current (owned by the drainer)
 	// is what the frontend shows, and the two diverge while a boundary is in flight.
-	routeMu      sync.Mutex
-	routeCurrent string
+	// routeReadOnly sits beside it: the id of the routing-current session that was
+	// opened read-only because another process holds its claim. The two states are
+	// explicit: the routing setter clears it on every commit, and only the read-only
+	// open path sets it, after committing the id it names — so a successful live
+	// commit of the same session can never leave it stale.
+	routeMu       sync.Mutex
+	routeCurrent  string
+	routeReadOnly string
 
 	// routeProjectPath is the adapter's routing-current project path, owned by
 	// navMu: navigation commits it and every project-scoped read captures it under
@@ -606,8 +612,31 @@ func (a *App) emitResyncBoundary(sessionID string, payload *agent.SessionPayload
 func (a *App) setCurrentSessionID(id string) {
 	id = strings.TrimSpace(id)
 	a.routeMu.Lock()
+	// Every routing commit clears the read-only marker unconditionally: only
+	// the read-only open path sets it, after committing the id it names, so a
+	// successful live commit of the same session can never leave it stale.
+	a.routeReadOnly = ""
 	a.routeCurrent = id
 	a.routeMu.Unlock()
+}
+
+// markRouteReadOnly records that the routing current was opened read-only
+// because another process holds the session's claim. The routing setter clears
+// the marker on every commit, so it must be set after committing the id it
+// names.
+func (a *App) markRouteReadOnly(id string) {
+	id = strings.TrimSpace(id)
+	a.routeMu.Lock()
+	a.routeReadOnly = id
+	a.routeMu.Unlock()
+}
+
+// routeReadOnlyNames reports whether the given id is the read-only-marked
+// routing current.
+func (a *App) routeReadOnlyNames(id string) bool {
+	a.routeMu.Lock()
+	defer a.routeMu.Unlock()
+	return a.routeReadOnly != "" && a.routeReadOnly == id
 }
 
 // clearRouteIfCurrent clears the routing current only when it still equals id, so
@@ -650,11 +679,31 @@ func (a *App) liveCurrentSessionID() string {
 	if id == "" {
 		return ""
 	}
+	if a.routeReadOnlyNames(id) {
+		// The routing current was opened read-only because another process
+		// drives it; it stays routed, just not live here.
+		return ""
+	}
 	if _, err := a.svc.SessionSummaryForSession(id); err != nil {
 		a.clearRouteIfCurrent(id)
 		return ""
 	}
 	return id
+}
+
+// liveCurrentSessionOrErr is liveCurrentSessionID for a caller that must
+// distinguish why no live session is current: the read-only-marked session is
+// current, so another process drives it, or there is no current session at all.
+func (a *App) liveCurrentSessionOrErr() (string, error) {
+	id := a.liveCurrentSessionID()
+	if id != "" {
+		return id, nil
+	}
+	current := a.currentSessionID()
+	if a.routeReadOnlyNames(current) {
+		return "", agent.SessionContendedError(current)
+	}
+	return "", fmt.Errorf("no current session")
 }
 
 func (a *App) resolveSessionID(id string) (string, error) {
@@ -670,7 +719,7 @@ func (a *App) currentSessionSummary() agent.SessionSummary {
 	if id == "" {
 		return agent.SessionSummary{}
 	}
-	s, err := a.svc.SessionSummaryForSession(id)
+	s, err := a.svc.SessionSummaryForSessionOrPersisted(id)
 	if err != nil {
 		a.setCurrentSessionID("")
 		return agent.SessionSummary{}
@@ -712,7 +761,7 @@ func (a *App) sessionMessages() []agent.DisplayMessage {
 		a.navMu.Unlock()
 		return nil
 	}
-	if _, err := a.svc.SessionSummaryForSession(id); err != nil {
+	if _, err := a.svc.SessionSummaryForSessionOrPersisted(id); err != nil {
 		a.setCurrentSessionID("")
 		a.navMu.Unlock()
 		return nil
@@ -745,7 +794,13 @@ func (a *App) Submit(content string) (agent.SubmitResult, error) {
 	if err != nil {
 		return agent.SubmitResult{}, err
 	}
-	return a.svc.SubmitToSession(a.ctx, sessionID, content)
+	result, err := a.svc.SubmitToSession(a.ctx, sessionID, content)
+	if err != nil && a.routeReadOnlyNames(sessionID) {
+		// The session is read-only: another process drives it, so the owner
+		// refuses it as unknown. Say what is actually wrong.
+		return agent.SubmitResult{}, agent.SessionContendedError(sessionID)
+	}
+	return result, err
 }
 
 // QueueSnapshot returns the backend's versioned input-queue snapshot for
@@ -1019,10 +1074,10 @@ func (a *App) CompactNow() error {
 	}
 	// Capture the id under navMu, then release it before the long owner call so it
 	// stays free for Cancel/Close.
-	sessionID := a.liveCurrentSessionID()
+	sessionID, err := a.liveCurrentSessionOrErr()
 	a.navMu.Unlock()
-	if sessionID == "" {
-		return fmt.Errorf("no current session")
+	if err != nil {
+		return err
 	}
 	ctx := a.ctx
 	if ctx == nil {
@@ -1052,10 +1107,10 @@ func (a *App) SnapshotList() ([]agent.Snapshot, error) {
 		a.navMu.Unlock()
 		return nil, errAdapterClosed
 	}
-	sessionID := a.liveCurrentSessionID()
+	sessionID, err := a.liveCurrentSessionOrErr()
 	a.navMu.Unlock()
-	if sessionID == "" {
-		return nil, fmt.Errorf("no current session")
+	if err != nil {
+		return nil, err
 	}
 	return a.svc.SnapshotListForSession(sessionID)
 }
@@ -1225,7 +1280,25 @@ func (a *App) SessionSwitch(id string) error {
 		a.setCurrentSessionID(state.Session.ID)
 		a.enqueueBoundary("navigation", state, "", state.Session.ID)
 	})
-	return err
+	if err != nil {
+		if !errors.Is(err, snapshot.ErrSessionContended) {
+			return err
+		}
+		// The user named a session another process is driving: the open
+		// succeeds as a read-only one. Present its durable transcript through
+		// the same navigation frame, committing routing current only once the
+		// view is available, so a failed presentation leaves routing unchanged.
+		state, herr := a.HydrateSession(id)
+		if herr != nil {
+			return herr
+		}
+		a.setRouteProjectPathLocked(state.Session.ProjectPath)
+		a.setCurrentSessionID(state.Session.ID)
+		a.markRouteReadOnly(state.Session.ID)
+		a.enqueueBoundary("navigation", state, "", state.Session.ID)
+		return nil
+	}
+	return nil
 }
 
 // SessionArchive archives a session.

@@ -398,9 +398,9 @@ func (r *Runner) dispatch(ctx context.Context, req Request) {
 	case "model/switch":
 		r.handleModelSwitch(req)
 	case "snapshot/list":
-		sessionID := r.liveCurrentSessionID()
-		if sessionID == "" {
-			r.respondError(req.ID, -32000, "no current session")
+		sessionID, err := r.sv().LiveCurrentOrErr()
+		if err != nil {
+			r.respondError(req.ID, -32000, err.Error())
 			return
 		}
 		list, err := r.agent.SnapshotListForSession(sessionID)
@@ -636,7 +636,7 @@ func (r *Runner) projectCurrent() (agent.ProjectSummary, error) {
 	if err != nil {
 		return agent.ProjectSummary{}, err
 	}
-	summary, err := r.agent.SessionSummaryForSession(id)
+	summary, err := r.agent.SessionSummaryForSessionOrPersisted(id)
 	if err != nil {
 		return agent.ProjectSummary{}, err
 	}
@@ -701,11 +701,15 @@ func (r *Runner) handleSessionPrompt(ctx context.Context, req Request) {
 	// The precheck resolves the explicit target's summary before admission;
 	// its project path is kept and committed alongside the id inside the
 	// admitted callback, never here, which runs before admission and must not
-	// move routing.
+	// move routing. The resolution stays live-only: for an explicit id naming
+	// the read-only session it refuses, and the refusal names the contention.
 	var summary agent.SessionSummary
 	if strings.TrimSpace(params.SessionID) != "" {
 		summary, err = r.agent.SessionSummaryForSession(sessionID)
 		if err != nil {
+			if r.sv().IsReadOnly(sessionID) {
+				err = agent.SessionContendedError(sessionID)
+			}
 			r.respondError(req.ID, -32000, err.Error())
 			return
 		}
@@ -726,6 +730,11 @@ func (r *Runner) handleSessionPrompt(ctx context.Context, req Request) {
 		}
 	})
 	if err != nil {
+		if r.sv().IsReadOnly(sessionID) {
+			// The session is read-only: another process drives it, so the
+			// owner refuses it as unknown. Say what is actually wrong.
+			err = agent.SessionContendedError(sessionID)
+		}
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
@@ -804,7 +813,7 @@ func (r *Runner) handleSessionMessages(req Request) {
 			r.respondError(req.ID, -32000, err.Error())
 			return
 		}
-		if _, err := r.agent.SessionSummaryForSession(id); err != nil {
+		if _, err := r.agent.SessionSummaryForSessionOrPersisted(id); err != nil {
 			r.setCurrentSessionID("")
 			r.respondError(req.ID, -32000, err.Error())
 			return
@@ -839,7 +848,29 @@ func (r *Runner) handleSessionSwitch(req Request) {
 		}, id)
 	})
 	if err != nil {
-		r.respondError(req.ID, -32000, err.Error())
+		if !errors.Is(err, snapshot.ErrSessionContended) {
+			r.respondError(req.ID, -32000, err.Error())
+			return
+		}
+		// The client named a session another process is driving: the open
+		// succeeds as a read-only one. Mark it, commit it as routing current,
+		// and notify the client with the read-only hydration state, committing
+		// only once the view is available so a failed presentation leaves
+		// routing unchanged.
+		state, herr := r.owner.HydrateSession(params.ID)
+		if herr != nil {
+			r.respondError(req.ID, -32000, herr.Error())
+			return
+		}
+		id := strings.TrimSpace(state.Session.ID)
+		r.setCurrent(id, state.Session)
+		r.sv().SetReadOnly(id)
+		r.sendBoundary(Notification{
+			JSONRPC: "2.0",
+			Method:  "agent/session_changed",
+			Params:  state,
+		}, id)
+		r.respond(req.ID, state.Session)
 		return
 	}
 	r.respond(req.ID, summary)
@@ -1101,9 +1132,10 @@ func (r *Runner) handleCompact(ctx context.Context, req Request) {
 	}
 	sessionID := strings.TrimSpace(params.SessionID)
 	if sessionID == "" {
-		sessionID = r.liveCurrentSessionID()
-		if sessionID == "" {
-			r.respondError(req.ID, -32000, "no current session")
+		var err error
+		sessionID, err = r.sv().LiveCurrentOrErr()
+		if err != nil {
+			r.respondError(req.ID, -32000, err.Error())
 			return
 		}
 	}

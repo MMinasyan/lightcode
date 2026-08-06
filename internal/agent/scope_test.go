@@ -50,6 +50,71 @@ func TestAcceptsEventForCurrentDoesNotQueryOwner(t *testing.T) {
 	}
 }
 
+// TestSessionViewReadOnlyMarker proves the read-only marker's lifecycle: a
+// marked current stays routed but reports not live without clearing, the
+// error helper names the contention while the marker holds and no current
+// session otherwise, and routing to a different session invalidates the
+// marker.
+func TestSessionViewReadOnlyMarker(t *testing.T) {
+	svc := &countingSvc{}
+	v := NewSessionView(svc)
+	v.SetCurrent("A")
+
+	// No marker: the live view resolves and the helper follows it.
+	if got := v.LiveCurrent(); got != "A" {
+		t.Fatalf("LiveCurrent = %q, want A", got)
+	}
+	if got, err := v.LiveCurrentOrErr(); err != nil || got != "A" {
+		t.Fatalf("LiveCurrentOrErr = %q, %v; want A", got, err)
+	}
+
+	// A marked read-only current stays routed but reports not live, and the
+	// helper names the contention instead of "no current session".
+	v.SetReadOnly("A")
+	if got := v.LiveCurrent(); got != "" {
+		t.Fatalf("LiveCurrent over the read-only marker = %q, want empty", got)
+	}
+	if got := v.Current(); got != "A" {
+		t.Fatalf("read-only marker cleared routing: current = %q, want A", got)
+	}
+	if !v.IsReadOnly("A") {
+		t.Fatal("IsReadOnly(A) = false, want true")
+	}
+	if _, err := v.LiveCurrentOrErr(); err == nil || err.Error() != `session "A" is being driven by another process` {
+		t.Fatalf("LiveCurrentOrErr over the read-only marker = %v, want the contention error", err)
+	}
+
+	// Routing to a different session invalidates the marker.
+	v.SetCurrent("B")
+	if v.IsReadOnly("A") {
+		t.Fatal("read-only marker survived a routing change")
+	}
+	if got := v.LiveCurrent(); got != "B" {
+		t.Fatalf("LiveCurrent after routing away = %q, want B", got)
+	}
+
+	// A live commit of the same id clears the marker: reopening the marked
+	// session after the holder releases it must not stay read-only.
+	v.SetCurrent("A")
+	v.SetReadOnly("A")
+	if !v.IsReadOnly("A") {
+		t.Fatal("SetReadOnly(A) did not mark A")
+	}
+	v.SetCurrent("A")
+	if v.IsReadOnly("A") {
+		t.Fatal("read-only marker survived a live commit of the same id")
+	}
+	if got := v.LiveCurrent(); got != "A" {
+		t.Fatalf("LiveCurrent after the same-id commit = %q, want A", got)
+	}
+
+	// With no current session the helper reports it plainly.
+	v.SetCurrent("")
+	if _, err := v.LiveCurrentOrErr(); err == nil || err.Error() != "no current session" {
+		t.Fatalf("LiveCurrentOrErr with no current = %v, want no current session", err)
+	}
+}
+
 func TestAcceptsEventForCurrentFiltersLateSourceSession(t *testing.T) {
 	v := NewSessionView(&countingSvc{})
 

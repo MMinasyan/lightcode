@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 type menuItem struct {
@@ -430,7 +432,26 @@ func (c *CLI) showSessionMenuInner(state string) {
 			id := result.extra.(string)
 			summary, err := c.agent.OpenSession(id)
 			if err != nil {
-				c.printLine(renderErrorMsg(err.Error()))
+				if !errors.Is(err, snapshot.ErrSessionContended) {
+					c.printLine(renderErrorMsg(err.Error()))
+					return
+				}
+				// The user named a session another process is driving: it
+				// opens read-only. Present its durable transcript, committing
+				// routing current only once the view is available.
+				state, herr := c.owner.HydrateSession(id)
+				if herr != nil {
+					c.printLine(renderErrorMsg(herr.Error()))
+					return
+				}
+				c.scope.SetProjectPath(state.Session.ProjectPath)
+				c.setCurrentSessionID(state.Session.ID)
+				c.sv().SetReadOnly(state.Session.ID)
+				// The render is fed from the state this open returned rather
+				// than re-read, so routing moves only once the view is in
+				// hand: a presentation that cannot be produced leaves the
+				// previous session and project in place.
+				c.refreshFromHydration(state)
 				return
 			}
 			c.setCurrentSessionID(summary.ID)

@@ -826,13 +826,14 @@ func TestCLISelectionOnlyContract(t *testing.T) {
 				c.scope.SetProjectPath(badPath)
 				dispatchSelection(t, c, cmd, "")
 			case "/session":
-				// The destination is listed but driven by another process
-				// (its claim is held), so the open fails.
-				dest := holderSession(t, a, c.scope.ProjectPath())
+				// The destination is listed but cannot load its history (a
+				// corrupt compaction record), so the open surfaces the failure
+				// instead of adopting the session.
+				dest := corruptSessionHistory(t, a, c.scope.ProjectPath())
 				selectSessionByID(t, c, dest)
 				dispatchSelection(t, c, cmd, "")
-				if !strings.Contains(out.String(), "driven by another process") {
-					t.Fatalf("/session over a contended destination = %q, want the contention error", out.String())
+				if !strings.Contains(out.String(), "compaction.json") {
+					t.Fatalf("/session over a corrupt destination = %q, want the load failure", out.String())
 				}
 			case "/project":
 				// The destination project's session is listed but cannot
@@ -937,6 +938,186 @@ func TestCLIProjectSwitchCreatesWhenEveryCandidateHeld(t *testing.T) {
 	}
 	if !sourceClaimRetained(c, source) {
 		t.Fatalf("source session %q lost its live claim", source)
+	}
+}
+
+// TestCLIReadOnlyOpenHydrationFailureLeavesSelectionAndProject proves a
+// read-only open whose durable view cannot be read commits nothing on either
+// terminal path: the session menu and /resume <id> keep the previous session,
+// the routing project, and the read-only marker unset, so a failed
+// presentation never advances routing.
+func TestCLIReadOnlyOpenHydrationFailureLeavesSelectionAndProject(t *testing.T) {
+	first, second := newTestAgentPair(t)
+	source, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession source: %v", err)
+	}
+	// The held session lives in its own project, so a failed read-only open of
+	// it must leave both the session and the routing project in place.
+	otherRoot := t.TempDir()
+	heldID, err := first.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath held: %v", err)
+	}
+	// A held session whose durable history cannot be read: the open still fails
+	// as contention (the claim is acquired before any file read), and the
+	// read-only hydration then fails on the corrupt compaction record.
+	proj, err := first.ProjectCurrentForPath(otherRoot)
+	if err != nil {
+		t.Fatalf("project for held session: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(first.Projects().SessionsRoot(proj.ID), heldID, "compaction.json"), []byte(`{not json`), 0o600); err != nil {
+		t.Fatalf("corrupt held session compaction: %v", err)
+	}
+
+	t.Run("session_menu", func(t *testing.T) {
+		c := New(second)
+		out := new(bytes.Buffer)
+		c.out = out
+		c.setCurrentSessionID(source)
+		// The menu lists the held session, so the CLI routes to its project.
+		c.scope.SetProjectPath(otherRoot)
+
+		selectSessionByID(t, c, heldID)
+		dispatchSelection(t, c, "/session", "")
+		if got, _ := c.currentSession(); got != source {
+			t.Fatalf("current after failed read-only open = %q, want unchanged %q", got, source)
+		}
+		if got := c.scope.ProjectPath(); got != otherRoot {
+			t.Fatalf("routing project after failed read-only open = %q, want unchanged %q", got, otherRoot)
+		}
+		if !strings.Contains(out.String(), "compaction.json") {
+			t.Fatalf("failed read-only open output = %q, want the hydration failure", out.String())
+		}
+		if c.sv().IsReadOnly(heldID) {
+			t.Fatal("read-only marker set for an open whose presentation failed")
+		}
+	})
+
+	t.Run("resume", func(t *testing.T) {
+		c := New(second)
+		out := new(bytes.Buffer)
+		c.out = out
+		c.setCurrentSessionID(source)
+		// The CLI routes to the source project; a failed read-only open of a
+		// session elsewhere must not commit the destination project.
+		wantProject := c.scope.ProjectPath()
+
+		dispatchSelection(t, c, "/resume", heldID)
+		if got, _ := c.currentSession(); got != source {
+			t.Fatalf("current after failed read-only open = %q, want unchanged %q", got, source)
+		}
+		if got := c.scope.ProjectPath(); got != wantProject {
+			t.Fatalf("routing project after failed read-only open = %q, want unchanged %q", got, wantProject)
+		}
+		if !strings.Contains(out.String(), "compaction.json") {
+			t.Fatalf("failed read-only open output = %q, want the hydration failure", out.String())
+		}
+		if c.sv().IsReadOnly(heldID) {
+			t.Fatal("read-only marker set for an open whose presentation failed")
+		}
+	})
+}
+
+// TestCLIExplicitOpenOfContendedSessionIsReadOnly proves an explicit open of a
+// session another process drives opens it read-only on both explicit-open
+// paths, the session menu and /resume <id>: the session becomes routing
+// current with its durable transcript and its own identity, a turn refuses
+// with the contention message instead of "unknown session", compaction names
+// the contention instead of "no current session", and a switch to a live
+// session clears the marker.
+func TestCLIExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
+	first, second := newTestAgentPair(t)
+	c := New(second)
+	out := new(bytes.Buffer)
+	c.out = out
+	source, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession source: %v", err)
+	}
+	// The held session lives in the CLI's project, so the session menu lists it.
+	heldID, err := first.NewSessionForProjectPath(c.scope.ProjectPath(), "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath held: %v", err)
+	}
+	if _, err := first.AppendUserMessageToSession(heldID, "durable from the driving owner"); err != nil {
+		t.Fatalf("append durable message: %v", err)
+	}
+	c.setCurrentSessionID(source)
+
+	// The session menu opens the held session read-only.
+	selectSessionByID(t, c, heldID)
+	dispatchSelection(t, c, "/session", "")
+	if got, _ := c.currentSession(); got != heldID {
+		t.Fatalf("current after /session over the held session = %q, want it adopted read-only", got)
+	}
+	if got := cliUserContents(c.sessionMessages()); !equalStringSlices(got, []string{"durable from the driving owner"}) {
+		t.Fatalf("read-only transcript = %#v, want the durable messages", got)
+	}
+	if got := c.liveCurrentSessionID(); got != "" {
+		t.Fatalf("read-only session reports live: %q", got)
+	}
+	if !c.sv().IsReadOnly(heldID) {
+		t.Fatal("held session not marked read-only after the menu open")
+	}
+
+	// A turn refuses with the contention message, not "unknown session".
+	c.submitToBackend("hi")
+	c.opWG.Wait()
+	c.drainEvents()
+	if !strings.Contains(out.String(), "driven by another process") {
+		t.Fatalf("submit over the read-only session = %q, want the contention message", out.String())
+	}
+	// Compaction names the contention instead of "no current session".
+	out.Reset()
+	c.cmdCompact()
+	if !strings.Contains(out.String(), "driven by another process") {
+		t.Fatalf("compact over the read-only session = %q, want the contention message", out.String())
+	}
+
+	// /resume <id> opens the held session read-only too.
+	out.Reset()
+	c.setCurrentSessionID(source)
+	dispatchSelection(t, c, "/resume", heldID)
+	if got, _ := c.currentSession(); got != heldID {
+		t.Fatalf("current after /resume over the held session = %q, want it adopted read-only", got)
+	}
+	if !c.sv().IsReadOnly(heldID) {
+		t.Fatal("held session not marked read-only after /resume")
+	}
+
+	// The driving process releases the session; /resume reopens it live: the
+	// read-only marker does not survive a successful live commit of the same
+	// id, so a turn is admitted and no contention is reported.
+	if err := first.SessionArchive(heldID); err != nil {
+		t.Fatalf("SessionArchive (release): %v", err)
+	}
+	out.Reset()
+	dispatchSelection(t, c, "/resume", heldID)
+	if got, _ := c.currentSession(); got != heldID {
+		t.Fatalf("current after /resume of the released session = %q, want it live", got)
+	}
+	if c.sv().IsReadOnly(heldID) {
+		t.Fatal("read-only marker survived the live reopen of the same session")
+	}
+	if got := c.liveCurrentSessionID(); got != heldID {
+		t.Fatalf("live current after reopen = %q, want %q", got, heldID)
+	}
+	c.ctx = context.Background()
+	c.submitToBackend("hi")
+	c.opWG.Wait()
+	c.drainEvents()
+	if strings.Contains(out.String(), "driven by another process") {
+		t.Fatalf("submit after reopen reported contention: %q", out.String())
+	}
+
+	// Switching to a live session clears the marker and restores the live view.
+	c.setCurrentSessionID(source)
+	if c.sv().IsReadOnly(heldID) {
+		t.Fatal("read-only marker survived the switch to a live session")
+	}
+	if got := c.liveCurrentSessionID(); got != source {
+		t.Fatalf("live current after switch = %q, want %q", got, source)
 	}
 }
 

@@ -414,7 +414,7 @@ func (c *CLI) sessionMessages() []agent.DisplayMessage {
 	if id == "" {
 		return nil
 	}
-	if _, err := c.agent.SessionSummaryForSession(id); err != nil {
+	if _, err := c.agent.SessionSummaryForSessionOrPersisted(id); err != nil {
 		c.setCurrentSessionID("")
 		return nil
 	}
@@ -1422,11 +1422,17 @@ func terminalRowsForText(text string, width int) int {
 }
 
 func (c *CLI) refreshState() {
-	m := c.currentModel()
-	c.modelRef = m.Ref
-	if c.modelRef == "" && m.Provider != "" && m.Model != "" {
-		c.modelRef = m.Provider + "/" + m.Model
+	c.modelRef = modelRefOf(c.currentModel())
+}
+
+// modelRefOf renders a model info as its provider-prefixed reference, the form
+// the header displays.
+func modelRefOf(m agent.ModelInfo) string {
+	ref := m.Ref
+	if ref == "" && m.Provider != "" && m.Model != "" {
+		ref = m.Provider + "/" + m.Model
 	}
+	return ref
 }
 
 // setWidth records a terminal width reported by the OS. The clamp is honest
@@ -1472,7 +1478,13 @@ func (c *CLI) printHeader() {
 }
 
 func (c *CLI) printHeaderLocked() {
-	session := c.currentSessionSummary()
+	c.printHeaderFromSummaryLocked(c.currentSessionSummary())
+}
+
+// printHeaderFromSummaryLocked renders the header row for an explicit summary,
+// so a render that already holds the presentation (a read-only open's
+// hydration state) does not re-read the owner for it.
+func (c *CLI) printHeaderFromSummaryLocked(session agent.SessionSummary) {
 	sid := session.ID
 	if sid == "" {
 		sid = "(no session)"
@@ -1616,6 +1628,11 @@ func (c *CLI) submitToBackend(text string) {
 		sessionID, err := c.currentSession()
 		if err == nil {
 			_, err = c.agent.SubmitToSession(c.ctx, sessionID, text)
+			if err != nil && c.sv().IsReadOnly(sessionID) {
+				// The session is read-only: another process drives it, so the
+				// owner refuses it as unknown. Say what is actually wrong.
+				err = agent.SessionContendedError(sessionID)
+			}
 		}
 		if err != nil {
 			c.enqueuePost(func() {
@@ -1644,6 +1661,33 @@ func (c *CLI) refreshSession() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.refreshSessionLocked()
+}
+
+// refreshFromHydration re-renders the session view from a hydration state an
+// open already produced, without re-reading the owner: the summary and the
+// durable messages it carries are the presentation, and a fresh read could
+// fail after routing already committed, leaving routing moved with nothing
+// rendered. The read-only hydration carries nothing live, so model and queue
+// render as their empty values.
+func (c *CLI) refreshFromHydration(state agent.HydrationState) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.refreshFromHydrationLocked(state)
+}
+
+func (c *CLI) refreshFromHydrationLocked(state agent.HydrationState) {
+	c.modelRef = modelRefOf(state.Model)
+	c.messages = buildDisplayMsgs(state.Messages)
+	c.queueDisplay = state.Queue.Items
+	c.lastQueueVersion = state.Queue.Version
+	c.seedInputHistory()
+
+	c.printLineLocked("")
+	c.printHeaderFromSummaryLocked(state.Session)
+	for _, m := range c.messages {
+		c.printDisplayEntryLocked(m)
+	}
+	c.printInputPromptLocked()
 }
 
 func (c *CLI) refreshSessionLocked() {
@@ -1813,7 +1857,26 @@ func (c *CLI) cmdResume(parts []string) {
 		id := parts[1]
 		summary, err := c.agent.OpenSession(id)
 		if err != nil {
-			c.printLine(renderErrorMsg(err.Error()))
+			if !errors.Is(err, snapshot.ErrSessionContended) {
+				c.printLine(renderErrorMsg(err.Error()))
+				return
+			}
+			// The user named a session another process is driving: it opens
+			// read-only. Present its durable transcript, committing routing
+			// current only once the view is available.
+			state, herr := c.owner.HydrateSession(id)
+			if herr != nil {
+				c.printLine(renderErrorMsg(herr.Error()))
+				return
+			}
+			c.scope.SetProjectPath(state.Session.ProjectPath)
+			c.setCurrentSessionID(state.Session.ID)
+			c.sv().SetReadOnly(state.Session.ID)
+			// The render is fed from the state this open returned rather than
+			// re-read, so routing moves only once the view is in hand: a
+			// presentation that cannot be produced leaves the previous session
+			// and project in place.
+			c.refreshFromHydration(state)
 			return
 		}
 		// The free-text id can resolve in another project; commit the destination
@@ -1884,9 +1947,9 @@ func (c *CLI) cmdCompact() {
 		c.printLine(renderErrorMsg("cannot compact while a turn is running"))
 		return
 	}
-	sessionID := c.liveCurrentSessionID()
-	if sessionID == "" {
-		c.printLine(renderErrorMsg("no current session"))
+	sessionID, err := c.sv().LiveCurrentOrErr()
+	if err != nil {
+		c.printLine(renderErrorMsg(err.Error()))
 		return
 	}
 
