@@ -210,6 +210,45 @@ func TestActiveCompactionRefreshDeferredUntilTurnEnd(t *testing.T) {
 	}
 }
 
+func TestRewriteBoundaryRendersRetainedErrors(t *testing.T) {
+	a, _ := newTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	c := New(a)
+	c.setCurrentSessionID(a.SessionCurrent().ID)
+	var out bytes.Buffer
+	c.out = &out
+	c.width.Store(int32(80))
+
+	// The producer's rewrite payload carries the committed prefix followed by
+	// tail rows and surviving retained errors merged by sequence. An error that
+	// survives the compaction disposition must stay on screen after the rewrite
+	// in the terminal too, in its sequenced position among the tail rows.
+	payload := agent.SessionPayload{
+		Messages: []agent.DisplayMessage{
+			{Type: "user", Content: "committed turn", Turn: 1},
+			{Type: "assistant", Content: "live tail row"},
+			{Type: "error", Content: "unattributed failure"},
+			{Type: "error", Content: "after boundary failure", Turn: 2},
+			{Type: "assistant", Content: "later tail row"},
+		},
+	}
+	c.handleEvent(agent.Event{Kind: agent.EventSessionRewrite, RewritePayload: &payload})
+
+	rendered := out.String()
+	if !strings.Contains(rendered, "unattributed failure") {
+		t.Fatalf("rewrite boundary dropped the unattributed error row: %q", rendered)
+	}
+	if !strings.Contains(rendered, "after boundary failure") {
+		t.Fatalf("rewrite boundary dropped the above-boundary error row: %q", rendered)
+	}
+	idx := func(s string) int { return strings.Index(rendered, s) }
+	if !(idx("live tail row") < idx("unattributed failure") && idx("unattributed failure") < idx("later tail row")) {
+		t.Fatalf("error row not rendered among the tail rows: %q", rendered)
+	}
+}
+
 func TestCLIStaleCurrent(t *testing.T) {
 	a, _ := newTestAgent(t)
 	if _, err := a.NewSession("", "primary"); err != nil {

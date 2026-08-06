@@ -1568,6 +1568,8 @@ func (c *CLI) printDisplayEntryLocked(e displayEntry) {
 		}
 	case "system":
 		c.printLineLocked(renderSystemMsg(e.content))
+	case "error":
+		c.printLineLocked(renderErrorMsg(e.content))
 	}
 }
 

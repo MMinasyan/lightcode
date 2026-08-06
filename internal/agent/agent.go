@@ -1970,11 +1970,13 @@ func (a *Agent) prebuiltCompactionCommitted(unit *session, sessionID string, bou
 // so this performs no fallible post-commit read. The reset context total and its
 // cumulative report share one tokensMu section, taken before the transcript
 // section so tokensMu is never held inside seqMu. Reading the live tail and
-// appending the boundary happen in one seqMu section — mutually exclusive with
-// feedAndEmit's row publication — so a row delivered concurrently is either in
-// the tail and enqueued before the boundary or absent and enqueued after it,
-// never split. Advancing the epoch makes a live-selection capture that raced the
-// compaction revalidate and re-read the rewritten durable prefix.
+// retained errors and appending the boundary happen in one seqMu section —
+// mutually exclusive with feedAndEmit's row publication — so a row delivered
+// concurrently is either in the tail and enqueued before the boundary or absent
+// and enqueued after it, never split. The boundary carries the committed prefix
+// followed by tail rows and surviving errors merged by their shared sequence.
+// Advancing the epoch makes a live-selection capture that raced the compaction
+// revalidate and re-read the rewritten durable prefix.
 func (a *Agent) publishCompactionRewrite(unit *session, sessionID, projectID string, boundaryTurn int, summary SessionSummary, committed []DisplayMessage) {
 	tr := a.transcriptForSessionID(sessionID)
 	if tr == nil {
@@ -1988,7 +1990,13 @@ func (a *Agent) publishCompactionRewrite(unit *session, sessionID, projectID str
 	tr.seqMu.Lock()
 	tr.compactionRewriteLocked()
 	tr.dropErrorsThroughTurnLocked(boundaryTurn)
-	messages := append(append([]DisplayMessage(nil), committed...), tr.tailMessagesLocked()...)
+	// The replacement carries the committed prefix followed by the retained tail
+	// and the surviving retained errors merged by their shared display sequence,
+	// the ordering the desktop snapshot applies to those two live classes — so an
+	// error that survives the compaction disposition stays on screen after the
+	// rewrite instead of vanishing until a full hydration.
+	messages := append([]DisplayMessage(nil), committed...)
+	messages = append(messages, mergeLiveRowsLocked(tr.tailSnapshotLocked(), tr.errorSnapshotLocked())...)
 	payload := SessionPayload{Session: summary, Messages: messages, Tokens: tokens}
 	a.emitEvent(Event{Kind: EventSessionRewrite, SessionID: sessionID, ProjectID: projectID, RewritePayload: &payload})
 	tr.seqMu.Unlock()

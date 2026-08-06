@@ -239,25 +239,6 @@ func (t *transcript) dropErrorsThroughTurnLocked(through int) {
 	t.retainedErrors = filterErrors(t.retainedErrors, func(e errorRow) bool { return e.turn == 0 || e.turn > through })
 }
 
-// clearErrorsLocked removes all retained errors. It is the external-rebase and
-// lifecycle-removal disposition.
-func (t *transcript) clearErrorsLocked() {
-	t.retainedErrors = nil
-}
-
-// retainedErrorMessagesLocked returns a copy of the retained error rows in
-// sequence order, for a capture to merge with tail rows and durable history.
-func (t *transcript) retainedErrorMessagesLocked() []DisplayMessage {
-	if len(t.retainedErrors) == 0 {
-		return nil
-	}
-	out := make([]DisplayMessage, len(t.retainedErrors))
-	for i, e := range t.retainedErrors {
-		out[i] = e.msg
-	}
-	return out
-}
-
 func filterErrors(errs []errorRow, keep func(errorRow) bool) []errorRow {
 	var out []errorRow
 	for _, e := range errs {
@@ -297,4 +278,25 @@ func (t *transcript) errorSnapshotLocked() []errorRow {
 	out := make([]errorRow, len(t.retainedErrors))
 	copy(out, t.retainedErrors)
 	return out
+}
+
+// mergeLiveRowsLocked merges retained tail rows and retained error rows into
+// one display list ordered by their shared sequence, the ordering the desktop
+// snapshot applies to the same two classes. The inputs are the snapshot
+// accessors' copies: each is already sorted by sequence, and both draw from one
+// monotonic counter, so a two-way merge reproduces display order without a
+// sort. The caller holds seqMu.
+func mergeLiveRowsLocked(tail []tailRow, errors []errorRow) []DisplayMessage {
+	live := make([]DisplayMessage, 0, len(tail)+len(errors))
+	i, j := 0, 0
+	for i < len(tail) || j < len(errors) {
+		if j >= len(errors) || (i < len(tail) && tail[i].seq <= errors[j].seq) {
+			live = append(live, tail[i].msg)
+			i++
+		} else {
+			live = append(live, errors[j].msg)
+			j++
+		}
+	}
+	return live
 }

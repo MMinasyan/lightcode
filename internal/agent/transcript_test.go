@@ -1233,8 +1233,8 @@ func TestCaptureStateReadsAllLiveClasses(t *testing.T) {
 
 // TestTranscriptCoordinatorSessionErrorRetention verifies session-tagged errors are
 // retained as sequenced display rows, kept across ordinary commits, and disposed
-// per operation: history revert drops errors above its target turn, compaction
-// drops errors through its replaced range, and rebase/removal clears them.
+// per operation: history revert drops errors above its target turn and compaction
+// drops errors through its replaced range.
 func TestTranscriptCoordinatorSessionErrorRetention(t *testing.T) {
 	tr := newTranscript()
 
@@ -1279,16 +1279,6 @@ func TestTranscriptCoordinatorSessionErrorRetention(t *testing.T) {
 		t.Fatalf("compaction disposition kept turn-1 error: %#v", tr.retainedErrors)
 	}
 	tr.seqMu.Unlock()
-
-	// Rebase/removal clears everything.
-	tr.seqMu.Lock()
-	tr.appendErrorLocked(Event{Kind: EventError, Error: "x", Turn: 3})
-	tr.clearErrorsLocked()
-	empty := len(tr.retainedErrors) == 0 && tr.retainedErrorMessagesLocked() == nil
-	tr.seqMu.Unlock()
-	if !empty {
-		t.Fatal("rebase/removal did not clear retained errors")
-	}
 }
 
 // TestSessionErrorRetentionContract verifies the compaction rewrite prunes
@@ -1342,6 +1332,51 @@ func TestSessionErrorRetentionContract(t *testing.T) {
 			t.Fatalf("retained errors = %#v, want the turn-2 error kept", tr.retainedErrors)
 		}
 	})
+}
+
+// TestCompactionRewriteCarriesRetainedErrors verifies the compaction rewrite
+// payload carries the committed prefix followed by the retained tail and the
+// surviving retained errors merged by their shared display sequence — the same
+// ordering the desktop snapshot applies to those two live classes — so an error
+// that survives the compaction disposition stays on screen after the rewrite
+// instead of vanishing until a full hydration. The turn-1 error is compacted
+// away; the unattributed (turn 0) and turn-2 errors survive and take their
+// sequenced place among the tail rows.
+func TestCompactionRewriteCarriesRetainedErrors(t *testing.T) {
+	a := newLiveCatalogBackedTestAgent(t)
+	unit := a.session
+	id := sessionIDOf(unit)
+	tr := a.transcriptForSessionID(id)
+
+	var rewrite Event
+	a.SetEventHandler(func(ev Event) {
+		if ev.Kind == EventSessionRewrite {
+			rewrite = ev
+		}
+	})
+
+	a.feedAndEmit(tr, Event{Kind: EventTurnStart, Turn: 1})
+	a.feedAndEmit(tr, Event{Kind: EventTextDelta, Result: "hello"})
+	a.feedAndEmit(tr, Event{Kind: EventError, SessionID: id, Error: "compacted away", Turn: 1})
+	a.feedAndEmit(tr, Event{Kind: EventError, SessionID: id, Error: "unattributed"})
+	a.feedAndEmit(tr, Event{Kind: EventError, SessionID: id, Error: "after boundary", Turn: 2})
+	a.feedAndEmit(tr, Event{Kind: EventUserMessageDisplay, Result: "next", Turn: 2})
+
+	a.publishCompactionRewrite(unit, id, unit.projectID, 1, SessionSummary{}, []DisplayMessage{
+		{Type: "user", Content: "committed", Turn: 1},
+	})
+	if rewrite.RewritePayload == nil {
+		t.Fatal("rewrite boundary not emitted")
+	}
+
+	var contents []string
+	for _, m := range rewrite.RewritePayload.Messages {
+		contents = append(contents, m.Content)
+	}
+	want := []string{"committed", "hello", "unattributed", "after boundary", "next"}
+	if !reflect.DeepEqual(contents, want) {
+		t.Fatalf("rewrite messages = %v, want %v", contents, want)
+	}
 }
 
 // TestTranscriptCoordinatorCommit verifies the commit cursor partitions
