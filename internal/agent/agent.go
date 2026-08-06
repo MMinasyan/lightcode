@@ -154,6 +154,12 @@ type Agent struct {
 	// seam is nil in production; tests swap it to assert each I/O's position
 	// relative to its site's owner lock.
 	durableReadHook func()
+
+	// shutdownBarrierHook is a test seam invoked immediately before
+	// ShutdownOwner acquires the lifecycle lock to publish closed — the one
+	// statement before shutdown blocks on the admission barrier. The seam is
+	// nil in production; tests swap it to observe that moment.
+	shutdownBarrierHook func()
 }
 
 type agentSignalSink interface {
@@ -2117,12 +2123,20 @@ func (a *Agent) resumeMostRecent() (string, error) {
 	// every candidate after a hoisted read would require machinery this path
 	// does not have, so the reads stay where the lifecycle lock already
 	// excludes concurrent lifecycle operations.
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	closed := rt.closed
+	rt.mu.Unlock()
+	// Admission check before the candidate loop: a resume starting after
+	// shutdown published closed must not load a candidate and take its claim.
+	if closed {
+		return "", errOwnerClosed
+	}
 	a.fireDurableReadHook()
 	candidates, err := snapshot.List(sessionsRoot, "", snapshot.StateActive)
 	if err != nil {
 		return "", err
 	}
-	rt := a.ensureRuntime()
 	resumed := false
 	for _, info := range candidates {
 		if info.ParentSessionID != "" {
@@ -2432,6 +2446,15 @@ func (a *Agent) loadTokensFromDisk() {
 func (a *Agent) fireDurableReadHook() {
 	if a.durableReadHook != nil {
 		a.durableReadHook()
+	}
+}
+
+// fireShutdownBarrierHook invokes the shutdownBarrierHook test seam when
+// installed. The seam is nil in production, so the call site guards through
+// this helper.
+func (a *Agent) fireShutdownBarrierHook() {
+	if a.shutdownBarrierHook != nil {
+		a.shutdownBarrierHook()
 	}
 }
 
@@ -3799,6 +3822,11 @@ func waitGroupOrTimeout(wg *sync.WaitGroup, d time.Duration) bool {
 // never loses its store or hits a closed embedder, and the process-exit
 // boundary releases what shutdown did not.
 //
+// It also closes session-identity admission: closed is published under the
+// lifecycle lock, so every open/resume/new/fork either completes before the
+// flag is visible or refuses at its entry check, and no session can register
+// after the live stores are snapshotted with a claim nothing will detach.
+//
 // It reports whether shutdown completed every join — both the turn join and
 // the background join drained. The result is stored on the runtime rather than
 // returned from inside the Once body, because only the caller that wins the
@@ -3808,6 +3836,14 @@ func waitGroupOrTimeout(wg *sync.WaitGroup, d time.Duration) bool {
 func (a *Agent) ShutdownOwner() bool {
 	rt := a.ensureRuntime()
 	rt.shutdownOnce.Do(func() {
+		// Shutdown is a barrier against session-identity operations: closed is
+		// published under lifecycleMu, so an open/resume/new/fork already running
+		// finishes completely before the flag is visible, and one starting
+		// afterwards sees the flag at its entry check — before it acquires any
+		// claim or registers anything. The lifecycle lock is released before the
+		// turn join, so in-flight turn teardown never waits on it.
+		a.fireShutdownBarrierHook()
+		releaseLifecycle := a.lockLifecycle()
 		rt.mu.Lock()
 		rt.closed = true
 		var cancels []context.CancelFunc
@@ -3832,6 +3868,7 @@ func (a *Agent) ShutdownOwner() bool {
 				a.gate.CancelSession(id)
 			}
 		}
+		releaseLifecycle()
 		// Join in-flight turns and mutations first, while the drainer is still
 		// alive, so their terminal events are delivered before delivery stops.
 		turnsDrained := waitGroupOrTimeout(&rt.turnWG, shutdownJoinTimeout)
@@ -4216,6 +4253,13 @@ func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummar
 	}
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
+	// Admission check at entry, before any disk work or claim acquisition: an
+	// open starting after shutdown published closed must not resolve a project,
+	// build a store, or take the session's claim.
+	if rt.closed {
+		rt.mu.Unlock()
+		return SessionSummary{}, errOwnerClosed
+	}
 	if unit, err := a.liveSessionLocked(id); err == nil {
 		if isCompactSessionType(unit.activeAgentType) {
 			rt.mu.Unlock()
@@ -4445,6 +4489,12 @@ func (a *Agent) newSession(projectID string, agentType string, emit func(Hydrati
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	// Admission check at entry, before any staged preparation or publication: a
+	// new session starting after shutdown published closed must publish nothing
+	// and acquire no claim.
+	if rt.closed {
+		return "", errOwnerClosed
+	}
 	resolvedType, err := a.explicitRootSessionTypeLocked(agentType)
 	if err != nil {
 		return "", err
@@ -5828,6 +5878,12 @@ func (a *Agent) forkUnitAtTurn(unit *session, turn int) (*session, error) {
 // and the source's live model ref (currentRef is rt.mu-guarded). Caller holds
 // rt.mu.
 func (a *Agent) forkSnapshotSourceLocked(unit *session) (sessionID, sessionsRoot string, srcRef coremodel.ModelRef, err error) {
+	// Admission check at the fork's entry, before the staged copy and the
+	// publication: a fork starting after shutdown published closed must not
+	// copy the tree or publish a new session.
+	if a.ensureRuntime().closed {
+		return "", "", coremodel.ModelRef{}, errOwnerClosed
+	}
 	if unit == nil || unit.store == nil || !unit.store.Active() {
 		return "", "", coremodel.ModelRef{}, snapshot.ErrNoSession
 	}
