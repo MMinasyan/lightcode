@@ -301,6 +301,54 @@ func TestCompactionIndexesConversationSessionAndSearchHistoryRecallsSummary(t *t
 	}
 }
 
+// TestRevertBelowCompactionBoundaryDeletesIndexedSummaries covers the other
+// half of what a revert below a compaction boundary invalidates: the indexed
+// summary under the summaries root is deleted with the compaction record, so
+// search_history no longer returns the compacted conversation whose "Full
+// summary" path the revert just removed.
+func TestRevertBelowCompactionBoundaryDeletesIndexedSummaries(t *testing.T) {
+	const summary = "## Goal\nremember alpha detail"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTextResponse(w, summary)
+	}))
+	defer server.Close()
+
+	a := newCatalogBackedTestAgent(t)
+	seedCompleteTurns(t, a, 10)
+	sessionID := a.store.SessionID()
+	if sessionID == "" {
+		t.Fatal("conversation session id is empty")
+	}
+	a.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
+	memStore := memory.NewStoreWithEmbedder(deterministicMemoryEmbedder{}, a.projects.Root(), a.home)
+	hooks := &recordingMemoryHooks{store: memStore}
+	a.memoryHooks = hooks
+
+	if err := a.runCompaction(context.Background(), false); err != nil {
+		t.Fatalf("runCompaction returned error: %v", err)
+	}
+	searchHistory := tool.NewSearchHistory(memStore, hooks.projectID)
+	before, err := searchHistory.Execute(context.Background(), map[string]any{"query": "alpha detail"})
+	if err != nil {
+		t.Fatalf("search_history returned error: %v", err)
+	}
+	if !strings.Contains(before, sessionID) || !strings.Contains(before, "remember alpha detail") {
+		t.Fatalf("setup: search_history before revert = %q, want the compacted session's summary", before)
+	}
+
+	if _, err := a.ApplyTurnActionForSession(sessionID, 6, TurnActionRevertHistory, false); err != nil {
+		t.Fatalf("revert: %v", err)
+	}
+
+	after, err := searchHistory.Execute(context.Background(), map[string]any{"query": "alpha detail"})
+	if err != nil {
+		t.Fatalf("search_history after revert returned error: %v", err)
+	}
+	if strings.Contains(after, sessionID) || strings.Contains(after, "remember alpha detail") {
+		t.Fatalf("search_history after revert = %q, want the reverted session's summaries gone", after)
+	}
+}
+
 func TestCompactionWritesCompactTranscript(t *testing.T) {
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

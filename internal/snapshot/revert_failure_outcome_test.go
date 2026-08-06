@@ -39,7 +39,7 @@ func TestRevertFailureOutcomeContract(t *testing.T) {
 	}
 	defer func() { _ = os.Chmod(blocked, 0o700) }()
 
-	err := store.RevertHistory(2)
+	_, err := store.RevertHistory(2)
 	if err == nil {
 		t.Fatal("RevertHistory swallowed the blocked removal and reported success")
 	}

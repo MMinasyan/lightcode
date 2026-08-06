@@ -1084,12 +1084,19 @@ func (s *Store) RevertCode(toTurn int) (RevertResult, error) {
 }
 
 // RevertHistory deletes message turn dirs strictly greater than toTurn
-// and updates currentTurn. Files on disk are NOT touched.
-func (s *Store) RevertHistory(toTurn int) error {
+// and updates currentTurn. Files on disk are NOT touched. The bool reports
+// whether the compaction record was unlinked: it becomes true the moment
+// the unlink succeeds, before the directory sync, so every return after
+// that point carries it — the sync failure, a walk failure, and success
+// alike, because the record is already gone from every reader. It is false
+// on every path where no unlink happened: an inactive session, an
+// unreadable record, a failed unlink, no record present, or a target at or
+// above the boundary.
+func (s *Store) RevertHistory(toTurn int) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.active {
-		return ErrNoSession
+		return false, ErrNoSession
 	}
 	if toTurn < 0 {
 		toTurn = 0
@@ -1100,6 +1107,29 @@ func (s *Store) RevertHistory(toTurn int) error {
 	// never assigned — a later revert can scan a union maximum below it.
 	if m := s.maxTurnLocked(); m > s.highWaterTurn {
 		s.highWaterTurn = m
+	}
+	// A revert below a compaction boundary empties the conversation: the
+	// summary record would survive untouched and the load path would drop
+	// every surviving turn behind the boundary it names. The record is
+	// therefore removed before any turn, and the removal is a precondition of
+	// the walk — a failed removal or a failed directory sync returns with no
+	// turn removed, and so does an unreadable record, because walking on a
+	// record whose survival is unknown truncates below a boundary whose
+	// record may still exist, which is exactly the state this removal exists
+	// to prevent.
+	rec, err := loadCompactionFromDir(s.dir)
+	if err != nil {
+		return false, fmt.Errorf("snapshot: read compaction record: %w", err)
+	}
+	removedRecord := false
+	if rec != nil && toTurn < rec.BoundaryTurn {
+		if err := os.Remove(filepath.Join(s.dir, "compaction.json")); err != nil {
+			return false, fmt.Errorf("snapshot: remove compaction record: %w", err)
+		}
+		removedRecord = true
+		if err := atomicfs.SyncDir(s.dir); err != nil {
+			return removedRecord, fmt.Errorf("snapshot: sync session dir: %w", err)
+		}
 	}
 	// Walk descending and stop at the first failed removal, exactly like
 	// RevertCode: the load path reads complete turns by scanning completion
@@ -1118,13 +1148,13 @@ func (s *Store) RevertHistory(toTurn int) error {
 			if t < s.currentTurn {
 				s.currentTurn = t
 			}
-			return fmt.Errorf("snapshot: revert history turn %d: %w", t, err)
+			return removedRecord, fmt.Errorf("snapshot: revert history turn %d: %w", t, err)
 		}
 	}
 	if toTurn >= 0 && toTurn < s.currentTurn {
 		s.currentTurn = toTurn
 	}
-	return nil
+	return removedRecord, nil
 }
 
 // ForkInto copies turns 1..toTurn (both snapshots and messages) from the

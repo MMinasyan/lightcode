@@ -72,7 +72,7 @@ func TestRevertHistoryAtomicAgainstBeginTurn(t *testing.T) {
 	}
 
 	done := make(chan error, 2)
-	go func() { done <- store.RevertHistory(2) }()
+	go func() { _, err := store.RevertHistory(2); done <- err }()
 	go func() {
 		if turn := store.BeginTurn(); turn == 0 {
 			done <- ErrNoSession
@@ -115,7 +115,7 @@ func TestRevertNeverReissuesTurnNumber(t *testing.T) {
 	}
 	// Combined revert to turn 5: both trees drop to 5, the disk maximum falls
 	// from 10 to 5.
-	if err := store.RevertHistory(5); err != nil {
+	if _, err := store.RevertHistory(5); err != nil {
 		t.Fatal(err)
 	}
 	// A deeper code revert scans a union whose maximum (8) is below the

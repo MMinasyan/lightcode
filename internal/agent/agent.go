@@ -5575,7 +5575,22 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		// walk, and the pre-walk truncation point tells the queue rule whether
 		// any turn was removed.
 		before := unit.store.CurrentTurn()
-		revertErr := unit.store.RevertHistory(target)
+		removedRecord, revertErr := unit.store.RevertHistory(target)
+		// A revert below a compaction boundary invalidates the session's
+		// indexed summary along with the record: search_history would keep
+		// serving a "Full summary" path that no longer resolves. Delete the
+		// session's summaries before the reload, so the eviction path is
+		// covered by the same call. The error is discarded exactly as the
+		// sweep and delete call sites discard it.
+		if removedRecord && a.memoryHooks != nil {
+			_ = a.memoryHooks.DeleteSessionSummaries(eventSessionID)
+		}
+		// The store maintains the post-walk turn for all three outcomes: the
+		// target on a completed walk, the turn the walk stopped at on a
+		// partial failure, unchanged when the first removal failed. It is the
+		// prune point for retained errors and the queue rule alike, so it is
+		// read once.
+		after := unit.store.CurrentTurn()
 		if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
 			// The loop can no longer match disk, so the unit must not stay
 			// live: releasing the reservation would re-arm the drainers over
@@ -5611,13 +5626,22 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		// The loop now matches disk. History irreversibly truncated: the
 		// queued input no longer applies whenever the walk removed at least
 		// one turn, and is kept when the walk removed nothing.
-		if unit.store.CurrentTurn() < before {
+		if after < before {
 			_, clearedVersion, queueCleared := a.ensureRuntime().clearQueueLockedForSession(unit)
 			if queueCleared {
 				a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
 			}
 		}
 		a.resetFileTrackerForSession(unit)
+		// Retained errors tagged to turns the revert removed point at history
+		// that is gone; prune them before the boundary capture, so the
+		// published state carries the survivor set once. This is the only
+		// thing a revert does to the coordinator: no cursor moves.
+		if tr := a.transcriptForSessionID(eventSessionID); tr != nil {
+			tr.seqMu.Lock()
+			tr.dropErrorsAboveTurnLocked(after)
+			tr.seqMu.Unlock()
+		}
 		result, maxDurableTurn := a.populateTurnActionResultForSession(unit, result)
 		// A reconciled walk failure still publishes the boundary: the loop is
 		// reconciled, so the capture is over state that matches disk, and the
