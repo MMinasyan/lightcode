@@ -2534,6 +2534,15 @@ func (a *Agent) SubmitToSessionWithBoundary(ctx context.Context, sessionID strin
 func (rt *runtime) submit(ctx context.Context, unit *session, content string, admitted func()) (SubmitResult, error) {
 	a := rt.agent
 	rt.mu.Lock()
+	// The caller's context gates admission exactly as it gates the immediate
+	// claim in claimTurnLocked: an already-cancelled context refuses before the
+	// item is admitted, and once admitted the item's lifetime is the owner's.
+	// A nil context is not a cancelled one: normalise it to a live context
+	// ahead of the check, so both admission paths share it instead of panicking
+	// or being refused.
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if unit == nil {
 		rt.mu.Unlock()
 		return SubmitResult{}, snapshot.ErrNoSession
@@ -2562,14 +2571,8 @@ func (rt *runtime) submit(ctx context.Context, unit *session, content string, ad
 	}
 	// Busy or queue non-empty: enqueue and let the drainer pick it up. The
 	// caller's context gates admission to the queue exactly as it gates the
-	// immediate claim in claimTurnLocked: an already-cancelled context refuses
-	// before the item is admitted, and once admitted the item's lifetime is
-	// the owner's. A nil context is not a cancelled one: normalise it to a
-	// live context ahead of the check, so it is admitted as it always was
-	// instead of panicking or being refused.
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	// immediate claim in claimTurnLocked; the nil-context normalisation above
+	// is shared by both paths.
 	if err := ctx.Err(); err != nil {
 		rt.mu.Unlock()
 		return SubmitResult{}, err

@@ -666,6 +666,7 @@ func TestWailsExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
 
 	app := newTestApp(second)
 	app.agent = second
+	app.ctx = context.Background()
 	app.setCurrentSessionID(startupID)
 	if err := app.SessionSwitch(heldID); err != nil {
 		t.Fatalf("SessionSwitch over a held session = %v, want a read-only open", err)
