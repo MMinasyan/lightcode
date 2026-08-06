@@ -1156,8 +1156,21 @@ func (a *App) setRouteProjectPathLocked(path string) {
 // creates one. The caller holds navMu across it as part of a navigation.
 func (a *App) openOrCreateSession(projectPath string, emit func(agent.HydrationState)) (agent.SessionSummary, error) {
 	sessions, err := a.svc.SessionListForProjectPath(projectPath, "active")
-	if err == nil && len(sessions) > 0 {
-		return a.svc.OpenSessionWithBoundary(sessions[0].ID, emit)
+	if err != nil {
+		return agent.SessionSummary{}, err
+	}
+	// Scan newest-first and skip a candidate another process is driving, so a
+	// contended session does not fail the whole navigation. Any other open
+	// failure surfaces: this is user-initiated, so a corrupt session must not
+	// be skipped silently.
+	for _, s := range sessions {
+		summary, err := a.svc.OpenSessionWithBoundary(s.ID, emit)
+		if err == nil {
+			return summary, nil
+		}
+		if !errors.Is(err, snapshot.ErrSessionContended) {
+			return agent.SessionSummary{}, err
+		}
 	}
 	id, err := a.svc.NewSessionForProjectPathWithBoundary(projectPath, "primary", emit)
 	if err != nil {

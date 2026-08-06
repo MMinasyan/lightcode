@@ -19,6 +19,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 type cliState int
@@ -1834,13 +1835,23 @@ func (c *CLI) cmdResume(parts []string) {
 		return
 	}
 
-	summary, err := c.agent.OpenSession(sessions[0].ID)
-	if err != nil {
-		c.printLine(renderErrorMsg(err.Error()))
-		return
+	// Scan newest-first and skip a candidate another process is driving, so a
+	// contended session does not fail the whole resume. Any other open failure
+	// surfaces: this is user-initiated, so a corrupt session must not be
+	// skipped silently.
+	for _, s := range sessions {
+		summary, err := c.agent.OpenSession(s.ID)
+		if err == nil {
+			c.setCurrentSessionID(summary.ID)
+			c.refreshSession()
+			return
+		}
+		if !errors.Is(err, snapshot.ErrSessionContended) {
+			c.printLine(renderErrorMsg(err.Error()))
+			return
+		}
 	}
-	c.setCurrentSessionID(summary.ID)
-	c.refreshSession()
+	c.printLine(renderErrorMsg("no active sessions"))
 }
 
 func (c *CLI) cmdContext() {

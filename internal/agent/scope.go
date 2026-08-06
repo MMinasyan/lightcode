@@ -1,10 +1,13 @@
 package agent
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 // AdapterScope holds an adapter-local project path and routes the
@@ -72,8 +75,21 @@ func (s *AdapterScope) ReadFileContent(path string) (string, error) {
 // project path, or creates a new one if none exists.
 func (s *AdapterScope) OpenOrCreateSession(projectPath string) (SessionSummary, error) {
 	sessions, err := s.svc.SessionListForProjectPath(projectPath, "active")
-	if err == nil && len(sessions) > 0 {
-		return s.svc.OpenSession(sessions[0].ID)
+	if err != nil {
+		return SessionSummary{}, err
+	}
+	// Scan newest-first and skip a candidate another process is driving, so a
+	// contended session does not fail the whole open. Any other open failure
+	// surfaces: this is user-initiated, so a corrupt session must not be
+	// skipped silently.
+	for _, session := range sessions {
+		summary, err := s.svc.OpenSession(session.ID)
+		if err == nil {
+			return summary, nil
+		}
+		if !errors.Is(err, snapshot.ErrSessionContended) {
+			return SessionSummary{}, err
+		}
 	}
 	id, err := s.svc.NewSessionForProjectPath(projectPath, "primary")
 	if err != nil {

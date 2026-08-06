@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -329,6 +330,80 @@ func TestCLISwitchKeepsCurrent(t *testing.T) {
 	}
 	if got := cliUserContents(c.sessionMessages()); !equalStringSlices(got, []string{"first"}) {
 		t.Fatalf("cli messages = %#v, want first", got)
+	}
+}
+
+// TestCLIResumeSkipsContendedNewestSession proves the no-argument resume opens
+// the newest candidate whose claim is acquirable: the newest session is held
+// by another owner, so the older one resumes instead of the command failing.
+func TestCLIResumeSkipsContendedNewestSession(t *testing.T) {
+	first, second := newTestAgentPair(t)
+	projectPath := t.TempDir()
+	olderID, err := second.NewSessionForProjectPath(projectPath, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath older: %v", err)
+	}
+	newestID, err := first.NewSessionForProjectPath(projectPath, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath newest: %v", err)
+	}
+	stampSessionActivity(t, second, projectPath, olderID, 1)
+	stampSessionActivity(t, first, projectPath, newestID, 2)
+
+	c := New(second)
+	c.scope = agent.NewAdapterScope(second, projectPath)
+	var out bytes.Buffer
+	c.out = &out
+	c.cmdResume([]string{"/resume"})
+	if got := c.currentSessionSummary().ID; got != olderID {
+		t.Fatalf("cli current after resume = %q, want the older session %q", got, olderID)
+	}
+}
+
+// TestCLIResumeReportsNoActiveSessionsWhenEveryCandidateContended proves the
+// no-argument resume reports the empty ending when every active candidate is
+// held by another owner instead of failing on the first candidate.
+func TestCLIResumeReportsNoActiveSessionsWhenEveryCandidateContended(t *testing.T) {
+	first, second := newTestAgentPair(t)
+	projectPath := t.TempDir()
+	olderID, err := first.NewSessionForProjectPath(projectPath, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath older: %v", err)
+	}
+	newestID, err := first.NewSessionForProjectPath(projectPath, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath newest: %v", err)
+	}
+	stampSessionActivity(t, first, projectPath, olderID, 1)
+	stampSessionActivity(t, first, projectPath, newestID, 2)
+
+	c := New(second)
+	c.scope = agent.NewAdapterScope(second, projectPath)
+	var out bytes.Buffer
+	c.out = &out
+	c.cmdResume([]string{"/resume"})
+	if !strings.Contains(out.String(), "no active sessions") {
+		t.Fatalf("resume output = %q, want %q", out.String(), "no active sessions")
+	}
+	if got := c.currentSessionID(); got != "" {
+		t.Fatalf("cli current after resume = %q, want empty", got)
+	}
+}
+
+// TestCLIResumeSurfacesListingFailure proves the no-argument resume reports a
+// session-listing failure instead of treating it as an empty project.
+func TestCLIResumeSurfacesListingFailure(t *testing.T) {
+	_, second := newTestAgentPair(t)
+	listErr := fmt.Errorf("session listing failed")
+	svc := &listingFailSvc{AdapterService: second, listErr: listErr}
+	c := New(nil)
+	c.agent = svc
+	c.scope = agent.NewAdapterScope(svc, second.ProjectRoot())
+	var out bytes.Buffer
+	c.out = &out
+	c.cmdResume([]string{"/resume"})
+	if !strings.Contains(out.String(), "session listing failed") {
+		t.Fatalf("resume output = %q, want the listing failure", out.String())
 	}
 }
 
@@ -724,14 +799,16 @@ func TestCLISelectionOnlyContract(t *testing.T) {
 					t.Fatalf("/session over a contended destination = %q, want the contention error", out.String())
 				}
 			case "/project":
-				// The destination project's session is driven by another
-				// process (its claim is held), so the switch fails.
+				// The destination project's session is listed but cannot
+				// load its history (a corrupt compaction record), so the
+				// switch surfaces the failure instead of skipping the
+				// candidate.
 				otherRoot := t.TempDir()
-				holderSession(t, a, otherRoot)
+				corruptSessionHistory(t, a, otherRoot)
 				selectProjectByPath(t, c, otherRoot)
 				dispatchSelection(t, c, cmd, "")
-				if !strings.Contains(out.String(), "driven by another process") {
-					t.Fatalf("/project over a contended destination = %q, want the contention error", out.String())
+				if !strings.Contains(out.String(), "compaction.json") {
+					t.Fatalf("/project over a corrupt destination = %q, want the load failure", out.String())
 				}
 			}
 			if got, _ := c.currentSession(); got != source {
@@ -797,6 +874,34 @@ func TestCLISelectionOnlyContract(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestCLIProjectSwitchCreatesWhenEveryCandidateHeld proves /project over a
+// destination whose every session is driven by another process creates a new
+// session in that project and switches to it, with the source keeping its
+// live claim: a held destination is not a destination failure, it is the
+// multi-interface case the per-session claim exists to support.
+func TestCLIProjectSwitchCreatesWhenEveryCandidateHeld(t *testing.T) {
+	a, c, _, source := selectionCLI(t)
+	otherRoot := t.TempDir()
+	heldID := holderSession(t, a, otherRoot)
+	selectProjectByPath(t, c, otherRoot)
+	dispatchSelection(t, c, "/project", "")
+
+	got, err := c.currentSession()
+	if err != nil || got == "" || got == source || got == heldID {
+		t.Fatalf("current after /project over a fully held destination = %q (err %v), want a newly created session", got, err)
+	}
+	if gotPath := c.scope.ProjectPath(); gotPath != otherRoot {
+		t.Fatalf("project path after /project = %q, want the destination %q", gotPath, otherRoot)
+	}
+	summary := c.currentSessionSummary()
+	if summary.ID != got || summary.ProjectPath != otherRoot {
+		t.Fatalf("current summary after /project = %+v, want session %q in project %q", summary, got, otherRoot)
+	}
+	if !sourceClaimRetained(c, source) {
+		t.Fatalf("source session %q lost its live claim", source)
+	}
 }
 
 // selectionCLI builds a CLI over a fresh agent with one source session
@@ -867,6 +972,31 @@ func holderSession(t *testing.T, a *agent.Agent, projectPath string) string {
 	}
 	t.Cleanup(func() { holder.Detach() })
 	return holder.SessionID()
+}
+
+// corruptSessionHistory plants a listed session whose history cannot load: a
+// valid meta record with a broken compaction record, so opening it fails as a
+// corrupt destination rather than as contention.
+func corruptSessionHistory(t *testing.T, a *agent.Agent, projectPath string) string {
+	t.Helper()
+	proj, err := a.ProjectCurrentForPath(projectPath)
+	if err != nil {
+		t.Fatalf("ProjectCurrentForPath(%q): %v", projectPath, err)
+	}
+	const id = "corrupt-session"
+	sessionDir := filepath.Join(a.Projects().SessionsRoot(proj.ID), id)
+	if err := os.MkdirAll(filepath.Join(sessionDir, "turns"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta := fmt.Sprintf(`{"id":%q,"state":"active","project_path":%q,"last_activity":%d}`+"\n",
+		id, projectPath, time.Now().Unix())
+	if err := os.WriteFile(filepath.Join(sessionDir, "meta.json"), []byte(meta), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "compaction.json"), []byte(`{not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 // menuKeys returns a key source that navigates down n items and presses
@@ -1592,9 +1722,14 @@ func (r *recordingPermissionAdapter) RespondPermissionActionForSession(sessionID
 
 func newTestAgentWithBaseURL(t *testing.T, baseURL string) (*agent.Agent, string) {
 	t.Helper()
+	return newTestAgentAtHome(t, baseURL, t.TempDir(), t.TempDir())
+}
 
-	home := t.TempDir()
-	projectRoot := t.TempDir()
+// newTestAgentAtHome builds an owner over the given home and project root, so
+// several owners can share one home for cross-process claim testing.
+func newTestAgentAtHome(t *testing.T, baseURL, home, projectRoot string) (*agent.Agent, string) {
+	t.Helper()
+
 	projectName := filepath.Base(projectRoot)
 	lightcodeDir := filepath.Join(home, ".lightcode")
 	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
@@ -1635,6 +1770,55 @@ func newTestAgentWithBaseURL(t *testing.T, baseURL string) (*agent.Agent, string
 		t.Fatal(err)
 	}
 	return a, projectName
+}
+
+// newTestAgentPair builds two owners over the same home with distinct project
+// roots, so one owner's live sessions hold their claims against the other.
+func newTestAgentPair(t *testing.T) (*agent.Agent, *agent.Agent) {
+	t.Helper()
+	home := t.TempDir()
+	first, _ := newTestAgentAtHome(t, "http://127.0.0.1:9/v1", home, t.TempDir())
+	second, _ := newTestAgentAtHome(t, "http://127.0.0.1:9/v1", home, t.TempDir())
+	return first, second
+}
+
+// stampSessionActivity rewrites a session's persisted last activity so the
+// active-session listing order is deterministic instead of same-second ties.
+func stampSessionActivity(t *testing.T, a *agent.Agent, projectPath, id string, lastActivity int64) {
+	t.Helper()
+	proj, err := a.ProjectCurrentForPath(projectPath)
+	if err != nil {
+		t.Fatalf("project for %s: %v", projectPath, err)
+	}
+	metaPath := filepath.Join(a.Projects().SessionsRoot(proj.ID), id, "meta.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read meta: %v", err)
+	}
+	var meta snapshot.SessionMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("unmarshal meta: %v", err)
+	}
+	meta.LastActivity = lastActivity
+	out, err := json.Marshal(&meta)
+	if err != nil {
+		t.Fatalf("marshal meta: %v", err)
+	}
+	if err := os.WriteFile(metaPath, out, 0o600); err != nil {
+		t.Fatalf("rewrite meta: %v", err)
+	}
+}
+
+// listingFailSvc embeds a real owner but fails the active-session listing, so
+// a caller that reads the listing result must surface the error instead of
+// treating it as an empty project.
+type listingFailSvc struct {
+	agent.AdapterService
+	listErr error
+}
+
+func (f *listingFailSvc) SessionListForProjectPath(projectPath, state string) ([]agent.SessionSummary, error) {
+	return nil, f.listErr
 }
 
 func startTestAgent(t *testing.T, a *agent.Agent) context.Context {

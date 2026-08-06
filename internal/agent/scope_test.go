@@ -1,8 +1,16 @@
 package agent
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 // countingSvc embeds AdapterService so that any owner call other than the
@@ -78,5 +86,156 @@ func TestAcceptsEventForCurrentSubagentChildren(t *testing.T) {
 	// A child of a different parent is rejected.
 	if v.AcceptsEventForCurrent("root", Event{SubagentSessionID: "other", ParentSessionID: "elsewhere"}) {
 		t.Fatal("child of a different parent was accepted")
+	}
+}
+
+// stampSessionActivity rewrites a session's persisted last activity so the
+// active-session listing order is deterministic instead of same-second ties.
+func stampSessionActivity(t *testing.T, a *Agent, projectPath, id string, lastActivity int64) {
+	t.Helper()
+	proj, err := a.ensureProjectForPath(projectPath)
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	metaPath := filepath.Join(a.projects.SessionsRoot(proj.ID), id, "meta.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read meta: %v", err)
+	}
+	var meta snapshot.SessionMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("unmarshal meta: %v", err)
+	}
+	meta.LastActivity = lastActivity
+	out, err := json.Marshal(&meta)
+	if err != nil {
+		t.Fatalf("marshal meta: %v", err)
+	}
+	if err := os.WriteFile(metaPath, out, 0o600); err != nil {
+		t.Fatalf("rewrite meta: %v", err)
+	}
+}
+
+// listingFailSvc embeds a real owner but fails the active-session listing, so
+// a caller that reads the listing result must surface the error instead of
+// silently creating a session.
+type listingFailSvc struct {
+	AdapterService
+	listErr error
+}
+
+func (f *listingFailSvc) SessionListForProjectPath(projectPath, state string) ([]SessionSummary, error) {
+	return nil, f.listErr
+}
+
+// TestOpenOrCreateSessionSkipsContendedNewestSession proves
+// OpenOrCreateSession opens the newest candidate whose claim is acquirable:
+// the newest session is held by another owner, so the older one opens.
+func TestOpenOrCreateSessionSkipsContendedNewestSession(t *testing.T) {
+	first, second := newSharedHomeAgentPair(t)
+	projectPath := t.TempDir()
+	olderID, err := second.NewSessionForProjectPath(projectPath, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath older: %v", err)
+	}
+	newestID, err := first.NewSessionForProjectPath(projectPath, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath newest: %v", err)
+	}
+	stampSessionActivity(t, second, projectPath, olderID, 1)
+	stampSessionActivity(t, first, projectPath, newestID, 2)
+
+	scope := NewAdapterScope(second, projectPath)
+	summary, err := scope.OpenOrCreateSession(projectPath)
+	if err != nil {
+		t.Fatalf("OpenOrCreateSession over a contended newest session: %v", err)
+	}
+	if summary.ID != olderID {
+		t.Fatalf("opened session = %q, want the older session %q", summary.ID, olderID)
+	}
+}
+
+// TestOpenOrCreateSessionCreatesWhenEveryCandidateContended proves
+// OpenOrCreateSession falls through to creating a new session when every
+// active candidate is held by another owner.
+func TestOpenOrCreateSessionCreatesWhenEveryCandidateContended(t *testing.T) {
+	first, second := newSharedHomeAgentPair(t)
+	projectPath := t.TempDir()
+	olderID, err := first.NewSessionForProjectPath(projectPath, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath older: %v", err)
+	}
+	newestID, err := first.NewSessionForProjectPath(projectPath, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath newest: %v", err)
+	}
+	stampSessionActivity(t, first, projectPath, olderID, 1)
+	stampSessionActivity(t, first, projectPath, newestID, 2)
+
+	scope := NewAdapterScope(second, projectPath)
+	summary, err := scope.OpenOrCreateSession(projectPath)
+	if err != nil {
+		t.Fatalf("OpenOrCreateSession with every candidate contended: %v", err)
+	}
+	if summary.ID == "" || summary.ID == olderID || summary.ID == newestID {
+		t.Fatalf("opened session = %q, want a newly created session", summary.ID)
+	}
+}
+
+// TestOpenOrCreateSessionSurfacesListingFailure proves OpenOrCreateSession
+// reports a session-listing failure instead of silently creating a session.
+func TestOpenOrCreateSessionSurfacesListingFailure(t *testing.T) {
+	_, second := newSharedHomeAgentPair(t)
+	projectPath := t.TempDir()
+	listErr := fmt.Errorf("session listing failed")
+	scope := NewAdapterScope(&listingFailSvc{AdapterService: second, listErr: listErr}, projectPath)
+	_, err := scope.OpenOrCreateSession(projectPath)
+	if err == nil {
+		t.Fatal("OpenOrCreateSession with a failing listing = nil error, want the listing failure")
+	}
+	if !errors.Is(err, listErr) {
+		t.Fatalf("OpenOrCreateSession error = %v, want the listing failure", err)
+	}
+}
+
+// TestOpenOrCreateSessionSurfacesCorruptCandidate proves OpenOrCreateSession
+// surfaces an open failure other than contention instead of skipping the
+// candidate: this is user-initiated, so a corrupt session must not be passed
+// over silently. The contended newest candidate is skipped first, so the
+// corruption error can only be the scan reaching the corrupt candidate.
+func TestOpenOrCreateSessionSurfacesCorruptCandidate(t *testing.T) {
+	first, second := newSharedHomeAgentPair(t)
+	projectPath := t.TempDir()
+	// The newest candidate is driven by the other owner; the older one is
+	// corrupt: valid meta, broken compaction record.
+	heldID, err := first.NewSessionForProjectPath(projectPath, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath held: %v", err)
+	}
+	proj, err := second.ensureProjectForPath(projectPath)
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	const corruptID = "corrupt-session"
+	sessionDir := filepath.Join(second.projects.SessionsRoot(proj.ID), corruptID)
+	if err := os.MkdirAll(filepath.Join(sessionDir, "turns"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta := fmt.Sprintf(`{"id":%q,"state":"active","project_path":%q,"last_activity":%d}`+"\n",
+		corruptID, projectPath, time.Now().Unix()-100)
+	if err := os.WriteFile(filepath.Join(sessionDir, "meta.json"), []byte(meta), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "compaction.json"), []byte(`{not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scope := NewAdapterScope(second, projectPath)
+	summary, err := scope.OpenOrCreateSession(projectPath)
+	if err == nil {
+		t.Fatalf("OpenOrCreateSession over a corrupt candidate = %#v, nil error; want the corruption surfaced", summary)
+	}
+	if !strings.Contains(err.Error(), "compaction.json") {
+		t.Fatalf("OpenOrCreateSession error = %v, want the corrupt candidate's load failure (held candidate = %q)", err, heldID)
 	}
 }

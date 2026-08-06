@@ -306,9 +306,14 @@ func newAppTestAgent(t *testing.T) *agent.Agent {
 
 func newAppTestAgentAt(t *testing.T, baseURL string) *agent.Agent {
 	t.Helper()
+	return newAppTestAgentAtHome(t, baseURL, t.TempDir(), t.TempDir())
+}
 
-	home := t.TempDir()
-	projectRoot := t.TempDir()
+// newAppTestAgentAtHome builds an owner over the given home and project root,
+// so several owners can share one home for cross-process claim testing.
+func newAppTestAgentAtHome(t *testing.T, baseURL, home, projectRoot string) *agent.Agent {
+	t.Helper()
+
 	lightcodeDir := filepath.Join(home, ".lightcode")
 	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -346,6 +351,56 @@ func newAppTestAgentAt(t *testing.T, baseURL string) *agent.Agent {
 
 func newTestApp(svc *agent.Agent) *App {
 	return &App{svc: svc, routeProjectPath: svc.ProjectRoot()}
+}
+
+// newAppTestAgentPair builds two owners over the same home with distinct
+// project roots, so one owner's live sessions hold their claims against the
+// other.
+func newAppTestAgentPair(t *testing.T) (*agent.Agent, *agent.Agent) {
+	t.Helper()
+	home := t.TempDir()
+	first := newAppTestAgentAtHome(t, "http://127.0.0.1:9/v1", home, t.TempDir())
+	second := newAppTestAgentAtHome(t, "http://127.0.0.1:9/v1", home, t.TempDir())
+	return first, second
+}
+
+// stampSessionActivity rewrites a session's persisted last activity so the
+// active-session listing order is deterministic instead of same-second ties.
+func stampSessionActivity(t *testing.T, svc *agent.Agent, projectPath, id string, lastActivity int64) {
+	t.Helper()
+	proj, err := svc.ProjectCurrentForPath(projectPath)
+	if err != nil {
+		t.Fatalf("project for %s: %v", projectPath, err)
+	}
+	metaPath := filepath.Join(svc.Projects().SessionsRoot(proj.ID), id, "meta.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read meta: %v", err)
+	}
+	var meta snapshot.SessionMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("unmarshal meta: %v", err)
+	}
+	meta.LastActivity = lastActivity
+	out, err := json.Marshal(&meta)
+	if err != nil {
+		t.Fatalf("marshal meta: %v", err)
+	}
+	if err := os.WriteFile(metaPath, out, 0o600); err != nil {
+		t.Fatalf("rewrite meta: %v", err)
+	}
+}
+
+// listingFailSvc embeds a real owner but fails the active-session listing, so
+// a caller that reads the listing result must surface the error instead of
+// silently creating a session.
+type listingFailSvc struct {
+	agent.AdapterService
+	listErr error
+}
+
+func (f *listingFailSvc) SessionListForProjectPath(projectPath, state string) ([]agent.SessionSummary, error) {
+	return nil, f.listErr
 }
 
 func userContents(messages []agent.DisplayMessage) []string {
@@ -641,6 +696,80 @@ func TestProjectSwitchNoOpSameDir(t *testing.T) {
 	}
 	if got := app.SessionCurrent().ID; got != firstID {
 		t.Fatalf("current = %q, want %q (no-op switch should not change session)", got, firstID)
+	}
+}
+
+// TestProjectSwitchSkipsContendedNewestSession proves a project navigation
+// opens the newest candidate whose claim is acquirable: the newest session is
+// held by another owner, so the older one opens instead of the navigation
+// failing on contention.
+func TestProjectSwitchSkipsContendedNewestSession(t *testing.T) {
+	first, second := newAppTestAgentPair(t)
+	projectPath := t.TempDir()
+	olderID, err := second.NewSessionForProjectPath(projectPath, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath older: %v", err)
+	}
+	newestID, err := first.NewSessionForProjectPath(projectPath, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath newest: %v", err)
+	}
+	stampSessionActivity(t, second, projectPath, olderID, 1)
+	stampSessionActivity(t, first, projectPath, newestID, 2)
+
+	app := newTestApp(second)
+	if err := app.ProjectSwitch(projectPath); err != nil {
+		t.Fatalf("ProjectSwitch over a contended newest session: %v", err)
+	}
+	if got := app.SessionCurrent().ID; got != olderID {
+		t.Fatalf("current after switch = %q, want the older session %q", got, olderID)
+	}
+}
+
+// TestProjectSwitchCreatesWhenEveryCandidateContended proves a project
+// navigation with every active candidate held by another owner creates a new
+// session instead of failing the navigation.
+func TestProjectSwitchCreatesWhenEveryCandidateContended(t *testing.T) {
+	first, second := newAppTestAgentPair(t)
+	projectPath := t.TempDir()
+	olderID, err := first.NewSessionForProjectPath(projectPath, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath older: %v", err)
+	}
+	newestID, err := first.NewSessionForProjectPath(projectPath, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath newest: %v", err)
+	}
+	stampSessionActivity(t, first, projectPath, olderID, 1)
+	stampSessionActivity(t, first, projectPath, newestID, 2)
+
+	app := newTestApp(second)
+	if err := app.ProjectSwitch(projectPath); err != nil {
+		t.Fatalf("ProjectSwitch with every candidate contended: %v", err)
+	}
+	got := app.SessionCurrent().ID
+	if got == "" || got == olderID || got == newestID {
+		t.Fatalf("current after switch = %q, want a newly created session", got)
+	}
+}
+
+// TestProjectSwitchSurfacesListingFailure proves a project navigation that
+// cannot list the project's sessions reports the listing failure instead of
+// silently creating a new session.
+func TestProjectSwitchSurfacesListingFailure(t *testing.T) {
+	_, second := newAppTestAgentPair(t)
+	projectPath := t.TempDir()
+	listErr := fmt.Errorf("session listing failed")
+	app := &App{
+		svc:              &listingFailSvc{AdapterService: second, listErr: listErr},
+		routeProjectPath: second.ProjectRoot(),
+	}
+	err := app.ProjectSwitch(projectPath)
+	if err == nil {
+		t.Fatal("ProjectSwitch with a failing session listing = nil error, want the listing failure")
+	}
+	if !strings.Contains(err.Error(), "session listing failed") {
+		t.Fatalf("ProjectSwitch error = %v, want the listing failure", err)
 	}
 }
 

@@ -1,12 +1,14 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
@@ -233,5 +235,42 @@ func TestSessionSummaryForSessionOrPersistedTakesIdentityFromResolution(t *testi
 	}
 	if summary.ProjectPath != firstProject.Path {
 		t.Fatalf("summary project = %q, want the resolved project's path %q", summary.ProjectPath, firstProject.Path)
+	}
+}
+
+// TestStartupResumeSkipsContendedAndUnloadableCandidates proves Init's resume
+// scan skips a candidate another process drives and one whose history fails to
+// load, so neither blocks startup from producing a fresh session.
+func TestStartupResumeSkipsContendedAndUnloadableCandidates(t *testing.T) {
+	first, second := newSharedHomeAgentPair(t)
+	projectPath := second.ProjectRoot()
+	if _, err := first.NewSessionForProjectPath(projectPath, "primary"); err != nil {
+		t.Fatalf("NewSessionForProjectPath held: %v", err)
+	}
+	// Plant an active session whose history cannot load: valid meta, broken
+	// compaction record. Its activity is older than the held session's, so the
+	// scan meets the contended candidate first.
+	proj, err := second.ensureProjectForPath(projectPath)
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	const unloadableID = "unloadable-session"
+	sessionDir := filepath.Join(second.projects.SessionsRoot(proj.ID), unloadableID)
+	if err := os.MkdirAll(filepath.Join(sessionDir, "turns"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta := fmt.Sprintf(`{"id":%q,"state":"active","project_path":%q,"last_activity":%d}`+"\n",
+		unloadableID, projectPath, time.Now().Unix()-100)
+	if err := os.WriteFile(filepath.Join(sessionDir, "meta.json"), []byte(meta), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "compaction.json"), []byte(`{not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if resumed := second.Init(ctx); resumed != "" {
+		t.Fatalf("Init resumed %q, want no resume: a contended and an unloadable candidate must both be skipped", resumed)
 	}
 }
