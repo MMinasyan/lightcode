@@ -278,12 +278,15 @@ func (r *Runner) Run(ctx context.Context) error {
 	case <-sigCtx.Done():
 	}
 
-	// Teardown, once, in order: close admission under the gate so no further line is
-	// processed, join any in-flight dispatch, join the owner's turns/workers so their
-	// terminal events (e.g. turn_end) are still admitted, then drain and close the
+	// Teardown, once, in order: close admission under the gate so no further line
+	// is processed, join the owner's turns/workers first — so their terminal
+	// events (e.g. turn_end) are still admitted, and so a dispatch blocked on the
+	// owner can unwind: a compaction's summarizer call derives its context from
+	// the owner, only the owner's shutdown cancels it, and the provider client
+	// carries no timeout, so behind the dispatch join that cancellation is
+	// unreachable. Then join any in-flight dispatch, and drain and close the
 	// output writer. The deferred cancel then tears down the host context.
 	r.closeDispatch()
-	r.dispatchWG.Wait()
 	if r.owner != nil {
 		// An abandoned shutdown means work is still in flight when the host
 		// exits; fold that into the returned error so a script driving this
@@ -292,6 +295,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			err = errors.Join(err, fmt.Errorf("owner shutdown abandoned in-flight work"))
 		}
 	}
+	r.dispatchWG.Wait()
 	r.closeOutput()
 	return err
 }

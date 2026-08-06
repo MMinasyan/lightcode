@@ -1,6 +1,7 @@
 package acp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,12 +11,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -3639,12 +3642,149 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 	})
 }
 
+// TestACPShutdownReachesBlockedCompaction proves Run's teardown cancels the
+// work an admitted dispatch is blocked on before it joins that dispatch. A
+// compaction's summarizer call derives its context from the owner, so only the
+// owner's shutdown can cancel it, and the provider client carries no timeout —
+// behind the dispatch join that cancellation is unreachable and teardown hangs
+// forever. The cell has to be a subprocess receiving a real SIGTERM: cancelling
+// the context passed to Run also cancels the context passed to Agent.Init,
+// whose watcher runs ShutdownOwner immediately and cancels the compaction
+// before the join can block — the non-deadlocking sibling, which production
+// never reaches because the ACP host runs with context.Background and SIGTERM
+// cancels only the internal signal context.
+func TestACPShutdownReachesBlockedCompaction(t *testing.T) {
+	if os.Getenv(acpSignalChildEnv) == "1" {
+		runACPSignalShutdownChild(t)
+		return
+	}
+
+	// The parent half: spawn the child, wait until its admitted compaction is
+	// blocked in the summarizer call, then deliver a real SIGTERM and require
+	// the child to exit. Against the join-first teardown the child hangs behind
+	// the dispatch join and this times out.
+	cmd := exec.Command(os.Args[0], "-test.run=^TestACPShutdownReachesBlockedCompaction$")
+	cmd.Env = append(os.Environ(), acpSignalChildEnv+"=1")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("child stdout pipe: %v", err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+
+	ready := make(chan struct{})
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if strings.Contains(scanner.Text(), acpSignalBlockedMarker) {
+				close(ready)
+				return
+			}
+		}
+	}()
+	select {
+	case <-ready:
+	case <-time.After(30 * time.Second):
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatal("child never reported the blocked compaction")
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("signal child: %v", err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatalf("child exited with an error after SIGTERM: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		_ = cmd.Process.Kill()
+		<-waited
+		t.Fatal("child did not exit after SIGTERM: teardown hung behind the admitted compaction")
+	}
+}
+
+// runACPSignalShutdownChild is the child half of
+// TestACPShutdownReachesBlockedCompaction. It drives the production teardown
+// shape — Runner.Run with a Background host context, so only the internal
+// signal context is ever cancelled — with an admitted compaction blocked in the
+// summarizer call, reports readiness once the call is in flight, and returns
+// when the SIGTERM-triggered teardown completes.
+func runACPSignalShutdownChild(t *testing.T) {
+	reqSeen := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case reqSeen <- struct{}{}:
+		default:
+		}
+		// Hold the summarizer call open. The client side of the call is what
+		// the owner's shutdown cancels; the release is closed once the child's
+		// teardown completes, so the server itself never outlives the test.
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+
+	ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+	if err := ag.SetDefaultModel("test/test-model"); err != nil {
+		t.Fatalf("SetDefaultModel: %v", err)
+	}
+	ag.Init(context.Background())
+	id, err := ag.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if _, err := ag.AppendUserMessageToSession(id, "compact me"); err != nil {
+		t.Fatalf("AppendUserMessageToSession: %v", err)
+	}
+
+	line := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"compact","params":{"session_id":%q}}`+"\n", id)
+	r := &Runner{
+		agent: ag,
+		owner: ag,
+		in:    &onePromptThenBlockReader{line: []byte(line)},
+		out:   io.Discard,
+	}
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background()) }()
+
+	select {
+	case <-reqSeen:
+	case <-time.After(15 * time.Second):
+		t.Fatal("compaction was never admitted to the summarizer call")
+	}
+	fmt.Println(acpSignalBlockedMarker)
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
 // onePromptThenBlockReader yields exactly one line and then blocks every
 // further Read, so Run reaches teardown only through context cancellation.
 type onePromptThenBlockReader struct {
 	line []byte
 	sent bool
 }
+
+// acpSignalChildEnv gates the child half of
+// TestACPShutdownReachesBlockedCompaction, and acpSignalBlockedMarker is the
+// line the child prints once its admitted compaction is blocked in the
+// summarizer call.
+const (
+	acpSignalChildEnv      = "LIGHTCODE_ACP_SIGNAL_CHILD"
+	acpSignalBlockedMarker = "LIGHTCODE_ACP_SIGNAL_CHILD_BLOCKED"
+)
 
 func (r *onePromptThenBlockReader) Read(p []byte) (int, error) {
 	if !r.sent {
