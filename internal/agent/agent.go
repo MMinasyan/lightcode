@@ -16,6 +16,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/adaptation"
 	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 	"github.com/MMinasyan/lightcode/internal/compact"
@@ -1670,7 +1671,7 @@ func (a *Agent) persistTokensForSessionLocked(unit *session) {
 		return
 	}
 	a.fireDurableReadHook()
-	_ = os.WriteFile(filepath.Join(unit.store.Dir(), tokensFileName), append(data, '\n'), 0o600)
+	_ = atomicfs.Write(filepath.Join(unit.store.Dir(), tokensFileName), append(data, '\n'), 0o600)
 }
 
 func (a *Agent) runSweep() {
@@ -3532,30 +3533,7 @@ func writeAgentConfigAtomic(path string, value any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	return nil
+	return atomicfs.Write(path, data, 0o600)
 }
 
 // mutateProviderConfig reads the agent config, navigates to the specified
