@@ -600,11 +600,18 @@ func (a *Agent) lspManagerFor(projectRoot string) *lsp.Manager {
 }
 
 // startDetectLocked starts detection for e exactly once, and only once the owner
-// is running. Caller holds servicesMu.
+// is running. The Detect goroutine is tracked on the runtime's background group
+// like every other owner background goroutine, so shutdown joins it. Caller
+// holds servicesMu.
 func (a *Agent) startDetectLocked(e *lspEntry) {
 	if a.detectCtx != nil && !e.detecting {
 		e.detecting = true
-		go e.mgr.Detect(a.detectCtx)
+		rt := a.ensureRuntime()
+		rt.bgWG.Add(1)
+		go func() {
+			defer rt.bgWG.Done()
+			e.mgr.Detect(a.detectCtx)
+		}()
 	}
 }
 
@@ -1043,12 +1050,6 @@ func (rt *runtime) initOnceLocked(ctx context.Context) string {
 	}
 	go func() { defer rt.bgWG.Done(); a.periodicSweep(rt.ownerCtx) }()
 
-	// Host context cancellation drives the joined owner shutdown.
-	go func() {
-		<-ctx.Done()
-		a.ShutdownOwner()
-	}()
-
 	// The owner is now running: record the detection context and start detection
 	// once for every project manager created before Init (handlers are installed
 	// at creation). Managers created later start detection when built.
@@ -1058,6 +1059,15 @@ func (rt *runtime) initOnceLocked(ctx context.Context) string {
 		a.startDetectLocked(e)
 	}
 	a.servicesMu.Unlock()
+
+	// Host context cancellation drives the joined owner shutdown. It is started
+	// after detection above so an already-cancelled host context cannot let the
+	// watcher run ShutdownOwner — and join the background group — before
+	// detection has registered on it.
+	go func() {
+		<-ctx.Done()
+		a.ShutdownOwner()
+	}()
 
 	a.setWarningGroup("prompt", a.pendingPromptWarnings)
 	a.pendingPromptWarnings = nil
