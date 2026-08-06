@@ -49,6 +49,12 @@ func List(root, projectPath, state string) ([]SessionInfo, error) {
 		if err := readJSON(filepath.Join(root, e.Name(), "meta.json"), &meta); err != nil {
 			continue
 		}
+		// Identity comes from the directory: a record whose id is not its own
+		// directory's name is not that session, so it is skipped rather than
+		// listed under the id it declares.
+		if meta.ID != e.Name() {
+			continue
+		}
 		if projectPath != "" && meta.ProjectPath != projectPath {
 			continue
 		}

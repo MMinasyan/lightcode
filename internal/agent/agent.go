@@ -4183,15 +4183,17 @@ func sessionSummary(unit *session) SessionSummary {
 }
 
 // sessionSummaryFromUnit builds a session summary from an already-read meta
-// record, taking the project from the resolved unit unconditionally: the unit is
-// resolved from the session's actual project directory, while the persisted
-// metadata's project path is unvalidated and can be nonempty and stale. Every
-// boundary builder and the open-session result build through it, so a selection
-// always routes to the project the session actually lives in, for empty, stale
-// and correct metadata alike.
+// record, taking the identity and project from the resolved unit
+// unconditionally: the unit is resolved from the session's actual directory,
+// while the persisted metadata's id and project path are unvalidated and can
+// be nonempty and stale. Every boundary builder and the open-session result
+// build through it, so a selection always routes to the id the session
+// actually lives under and the project it lives in, for empty, stale and
+// correct metadata alike.
 func sessionSummaryFromUnit(unit *session, meta snapshot.SessionMeta) SessionSummary {
 	out := sessionSummaryFromMeta(meta)
 	out.ProjectPath = unit.projectRoot
+	out.ID = unit.store.SessionID()
 	return out
 }
 

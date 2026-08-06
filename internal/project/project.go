@@ -94,11 +94,11 @@ func List(root string) ([]Project, error) {
 		if strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
-		var p Project
-		if err := readJSON(filepath.Join(root, e.Name(), "meta.json"), &p); err != nil {
+		p, err := readProject(root, e.Name())
+		if err != nil {
 			continue
 		}
-		out = append(out, p)
+		out = append(out, *p)
 	}
 	return out, nil
 }
@@ -123,14 +123,21 @@ func FindByPath(root, absPath string) (*Project, error) {
 	if err != nil {
 		return nil, err
 	}
-	var p Project
-	if err := readJSON(metaPathFor(root, projectID(clean)), &p); err != nil {
+	p, err := readProject(root, projectID(clean))
+	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &p, nil
+	// The normalized path is the expected value here, so a record that
+	// belongs to another path is rejected with an error — never (nil, nil),
+	// which callers read as "no such project" and would answer by minting a
+	// second project over the corrupt record.
+	if p.Path != clean {
+		return nil, fmt.Errorf("project: %s: stored path %q does not match %q", p.ID, p.Path, clean)
+	}
+	return p, nil
 }
 
 // EnsureForPath returns the existing project record for absPath or creates
@@ -149,9 +156,15 @@ func EnsureForPath(root, absPath string) (*Project, error) {
 
 	var result Project
 	err = atomicfs.WithLock(identityLockPath(root, clean), func() error {
-		var existing Project
-		if err := readJSON(metaPath, &existing); err == nil {
-			result = existing
+		existing, err := readProject(root, id)
+		if err == nil {
+			// The normalized path is the expected value here, so a record
+			// that belongs to another path is rejected with an error rather
+			// than minting a second project over the corrupt record.
+			if existing.Path != clean {
+				return fmt.Errorf("project: %s: stored path %q does not match %q", id, existing.Path, clean)
+			}
+			result = *existing
 			return nil
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -189,8 +202,8 @@ func TouchActivity(root, projectID string) error {
 	}
 	metaPath := metaPathFor(root, projectID)
 	return atomicfs.WithLock(metaLockPath(root, projectID), func() error {
-		var p Project
-		if err := readJSON(metaPath, &p); err != nil {
+		p, err := readProject(root, projectID)
+		if err != nil {
 			return err
 		}
 		now := time.Now().Unix()
@@ -221,6 +234,20 @@ func pathHash(cleanAbs string) string {
 // path bytes. It is fully deterministic; there is no random or legacy id.
 func projectID(cleanAbs string) string {
 	return "p-" + pathHash(cleanAbs)
+}
+
+// readProject reads a project's meta.json and assigns the id the caller
+// resolved the directory under. The persisted record's own id is
+// unvalidated and can name a different project, so the directory's id wins:
+// every reader that already holds the id reports the record under it,
+// keeping a corrupt record from surfacing under a foreign id.
+func readProject(root, id string) (*Project, error) {
+	var p Project
+	if err := readJSON(metaPathFor(root, id), &p); err != nil {
+		return nil, err
+	}
+	p.ID = id
+	return &p, nil
 }
 
 func metaPathFor(root, id string) string {

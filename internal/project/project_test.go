@@ -141,6 +141,79 @@ func TestJSONHelpersRoundTrip(t *testing.T) {
 	}
 }
 
+// TestProjectIdentityComesFromDirectory proves every project reader reports
+// a record under its own directory's id: a record whose stored id names a
+// different project is listed, found and ensured under the directory's id,
+// never under the id it declares.
+func TestProjectIdentityComesFromDirectory(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(t.TempDir(), "proj")
+
+	clean, err := normalizePath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := projectID(clean)
+	dir := filepath.Join(root, id)
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The record declares another project's id; its stored path stays correct.
+	p := Project{ID: "p-declared-elsewhere", Name: "proj", Path: clean}
+	if err := writeJSON(metaPathFor(root, id), p); err != nil {
+		t.Fatal(err)
+	}
+
+	projects, err := List(root)
+	if err != nil || len(projects) != 1 {
+		t.Fatalf("List = %+v, %v; want one", projects, err)
+	}
+	if projects[0].ID != id {
+		t.Fatalf("List id = %q, want the directory's id %q", projects[0].ID, id)
+	}
+
+	found, err := FindByPath(root, path)
+	if err != nil || found == nil || found.ID != id {
+		t.Fatalf("FindByPath = %+v, %v; want %s", found, err, id)
+	}
+
+	ensured, err := EnsureForPath(root, path)
+	if err != nil || ensured == nil || ensured.ID != id {
+		t.Fatalf("EnsureForPath = %+v, %v; want %s", ensured, err, id)
+	}
+}
+
+// TestPathAwareReadersRejectRecordWhoseStoredPathDiffers proves FindByPath
+// and EnsureForPath reject a record whose stored path is not the path
+// searched for. The rejection is an error, never (nil, nil), which callers
+// read as "no such project" and would answer by minting a second project
+// over the corrupt record.
+func TestPathAwareReadersRejectRecordWhoseStoredPathDiffers(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(t.TempDir(), "proj")
+
+	clean, err := normalizePath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := projectID(clean)
+	dir := filepath.Join(root, id)
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := Project{ID: id, Name: "proj", Path: filepath.Join(t.TempDir(), "other")}
+	if err := writeJSON(metaPathFor(root, id), p); err != nil {
+		t.Fatal(err)
+	}
+
+	if found, err := FindByPath(root, path); err == nil {
+		t.Fatalf("FindByPath = %+v, nil error; want rejection of the stored path mismatch", found)
+	}
+	if _, err := EnsureForPath(root, path); err == nil {
+		t.Fatal("EnsureForPath accepted a record whose stored path does not match")
+	}
+}
+
 // TestProjectIdentityConcurrentEnsure: concurrent creators of the
 // same path converge on one record with one deterministic id and one
 // CreatedAt; neither misses the other and overwrites it.

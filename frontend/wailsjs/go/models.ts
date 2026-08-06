@@ -479,6 +479,7 @@ export namespace agent {
 	    queue: QueueState;
 	    warnings: PromptWarning[];
 	    permissions: permission.Request[];
+	    readOnly: boolean;
 
 	    static createFrom(source: any = {}) {
 	        return new HydrationState(source);
@@ -498,6 +499,7 @@ export namespace agent {
 	        this.queue = this.convertValues(source["queue"], QueueState);
 	        this.warnings = this.convertValues(source["warnings"], PromptWarning);
 	        this.permissions = this.convertValues(source["permissions"], permission.Request);
+	        this.readOnly = source["readOnly"];
 	    }
 
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

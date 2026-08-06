@@ -333,6 +333,42 @@ func TestCLISwitchKeepsCurrent(t *testing.T) {
 	}
 }
 
+// TestCLIResumeTakesIdentityFromDirectory proves the explicit /resume <id>
+// stores the directory-derived id as routing current: a session directory
+// whose meta declares another id must not route the CLI to the declared id.
+func TestCLIResumeTakesIdentityFromDirectory(t *testing.T) {
+	a, _ := newTestAgent(t)
+	projectPath := t.TempDir()
+	proj, err := a.ProjectCurrentForPath(projectPath)
+	if err != nil {
+		t.Fatalf("ProjectCurrentForPath: %v", err)
+	}
+	// Plant a session directory whose meta declares another id.
+	const dirID = "dirA"
+	dir := filepath.Join(a.Projects().SessionsRoot(proj.ID), dirID)
+	if err := os.MkdirAll(filepath.Join(dir, "snapshots"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "turns"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{"id":"dirB","state":"active","project_path":"` + projectPath + `"}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), []byte(meta), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := New(a)
+	var out bytes.Buffer
+	c.out = &out
+	c.cmdResume([]string{"/resume", dirID})
+	if got := c.currentSessionID(); got != dirID {
+		t.Fatalf("cli routing current = %q, want the directory's id %q", got, dirID)
+	}
+	if got := c.currentSessionSummary().ID; got != dirID {
+		t.Fatalf("cli current summary id = %q, want %q", got, dirID)
+	}
+}
+
 // TestCLIResumeSkipsContendedNewestSession proves the no-argument resume opens
 // the newest candidate whose claim is acquirable: the newest session is held
 // by another owner, so the older one resumes instead of the command failing.

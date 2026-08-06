@@ -196,6 +196,51 @@ func TestListAndLoadMostRecentUseCompletedSessionMetadata(t *testing.T) {
 	}
 }
 
+// TestListSkipsSessionWhoseMetaDeclaresAnotherID proves List takes a
+// session's identity from its directory: a record that declares a different
+// id is not listed under that id, and a correctly-declared session in the
+// same project is still listed under its own.
+func TestListSkipsSessionWhoseMetaDeclaresAnotherID(t *testing.T) {
+	root := t.TempDir()
+	project := t.TempDir()
+
+	real, err := NewForSessionsRoot(root, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := real.BeginNewSession(project); err != nil {
+		t.Fatal(err)
+	}
+	realID := real.SessionID()
+
+	// Plant a session directory whose meta.json declares another id.
+	const dirID = "dirA"
+	planted := filepath.Join(root, dirID)
+	if err := os.MkdirAll(filepath.Join(planted, "turns"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta := SessionMeta{ID: "dirB", ProjectPath: project, State: StateActive, LastActivity: 5}
+	if err := writeJSON(filepath.Join(planted, "meta.json"), meta); err != nil {
+		t.Fatal(err)
+	}
+
+	infos, err := List(root, project, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, info := range infos {
+		if info.ID == "dirB" {
+			t.Fatalf("List reported the planted session under its declared id %q", info.ID)
+		}
+	}
+	for _, info := range infos {
+		if info.ID == realID {
+			return
+		}
+	}
+	t.Fatalf("List = %+v, missing the correctly-declared session %q", infos, realID)
+}
+
 func TestLoadMostRecentSkipsChildSessions(t *testing.T) {
 	root := t.TempDir()
 	project := t.TempDir()

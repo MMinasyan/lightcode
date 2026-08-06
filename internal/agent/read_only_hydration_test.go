@@ -238,6 +238,42 @@ func TestSessionSummaryForSessionOrPersistedTakesIdentityFromResolution(t *testi
 	}
 }
 
+// TestOpenSessionTakesIdentityFromDirectory proves the live open takes the
+// session's identity from the directory it opened, not from the metadata: a
+// directory whose meta declares another id opens as the directory's id, so
+// routing state and every boundary built from the open agree with the
+// directory that resolved.
+func TestOpenSessionTakesIdentityFromDirectory(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	proj, err := a.projects.Ensure()
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	const dirID = "dirA"
+	dir := filepath.Join(a.projects.SessionsRoot(proj.ID), dirID)
+	if err := os.MkdirAll(filepath.Join(dir, "snapshots"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "turns"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{"id":"dirB","state":"active","project_path":"` + proj.Path + `"}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), []byte(meta), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := a.OpenSession(dirID)
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	if summary.ID != dirID {
+		t.Fatalf("open summary id = %q, want the directory's id %q", summary.ID, dirID)
+	}
+	if summary.ProjectPath != proj.Path {
+		t.Fatalf("open summary project = %q, want %q", summary.ProjectPath, proj.Path)
+	}
+}
+
 // TestStartupResumeSkipsContendedAndUnloadableCandidates proves Init's resume
 // scan skips a candidate another process drives and one whose history fails to
 // load, so neither blocks startup from producing a fresh session.

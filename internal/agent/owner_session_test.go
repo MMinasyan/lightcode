@@ -189,6 +189,42 @@ func TestLiveSessionsHaveSeparateHistoryAndQueues(t *testing.T) {
 	}
 }
 
+// TestSessionCreationLandsInDirectoryResolvedProject proves a session
+// created for the owner's project path lands in the project directory the
+// path resolves to even when the record's stored id names a different
+// project: the record's declared id never routes creation.
+func TestSessionCreationLandsInDirectoryResolvedProject(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	proj, err := project.EnsureForPath(a.projects.Root(), a.ProjectRoot())
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	realID := proj.ID
+	// Corrupt the record: the same directory now declares a different id.
+	corrupt := fmt.Sprintf(`{"id":"p-declared-elsewhere","name":%q,"path":%q}`+"\n", proj.Name, proj.Path)
+	if err := os.WriteFile(filepath.Join(a.projects.Root(), realID, "meta.json"), []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sid, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	a.ensureRuntime().mu.Lock()
+	unit := a.sessions[sid]
+	a.ensureRuntime().mu.Unlock()
+	if unit == nil {
+		t.Fatal("new session not live")
+	}
+	if unit.projectID != realID {
+		t.Fatalf("new session project = %q, want the directory-derived id %q", unit.projectID, realID)
+	}
+	wantRoot := filepath.Join(a.projects.Root(), realID, "sessions")
+	if !strings.HasPrefix(unit.store.Dir(), wantRoot) {
+		t.Fatalf("new session dir = %q, want it under %q", unit.store.Dir(), wantRoot)
+	}
+}
+
 func TestPermissionSessionMatch(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	events := make(chan Event, 16)
