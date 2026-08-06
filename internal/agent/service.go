@@ -69,8 +69,6 @@ type AdapterService interface {
 	ApplyTurnActionForSession(string, int, string, bool) (TurnActionResult, error)
 	ApplyTurnActionForSessionWithBoundary(string, int, string, bool, func(HydrationState, []snapshot.SkippedRevert)) (TurnActionResult, error)
 	RevertCodeForSession(string, int) (snapshot.RevertResult, error)
-	RevertHistoryForSession(string, int) error
-	RevertHistoryForSessionWithBoundary(string, int, func(HydrationState, []snapshot.SkippedRevert)) error
 	SnapshotListForSession(string) ([]Snapshot, error)
 
 	ReadFileContent(string) (string, error)

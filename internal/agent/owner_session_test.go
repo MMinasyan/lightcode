@@ -1987,8 +1987,8 @@ func TestMutationsRejectDuringTransition(t *testing.T) {
 	if _, err := a.RevertCodeForSession(id, 0); err == nil {
 		t.Error("RevertCodeForSession should reject during transition")
 	}
-	if err := a.RevertHistoryForSession(id, 1); err == nil {
-		t.Error("RevertHistoryForSession should reject during transition")
+	if _, err := a.ApplyTurnActionForSession(id, 1, TurnActionRevertHistory, false); err == nil {
+		t.Error("ApplyTurnActionForSession should reject during transition")
 	}
 	if err := a.ForkSessionForSession(id, 1); err == nil {
 		t.Error("ForkSessionForSession should reject during transition")

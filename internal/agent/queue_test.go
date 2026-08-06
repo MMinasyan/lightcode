@@ -385,8 +385,8 @@ func TestDirectRevertAndForkClearQueueAndBumpVersionMonotonically(t *testing.T) 
 		appendUserTurn(t, a, "turn two")
 
 		seedQueue(t, a, 40, "stale after direct revert")
-		if err := a.RevertHistoryForSession(a.SessionCurrent().ID, 1); err != nil {
-			t.Fatalf("RevertHistoryForSession: %v", err)
+		if _, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, 2, TurnActionRevertHistory, false); err != nil {
+			t.Fatalf("ApplyTurnActionForSession revert_history: %v", err)
 		}
 		assertQueueClearedAfterVersion(t, a, cap, 40)
 	})

@@ -884,7 +884,6 @@ func (a *App) RevertCode(turn int) (snapshot.RevertResult, error) {
 	return a.svc.RevertCodeForSession(sessionID, turn)
 }
 
-// RevertHistory truncates conversation after turn N.
 // turnActionBoundaryEmit is the owner's in-commit callback for a session-changing
 // revert/fork: it commits routing current, then appends the destination's complete
 // state and any code-revert skip notice as one ordered boundary, so state and notice
@@ -896,6 +895,9 @@ func (a *App) turnActionBoundaryEmit() func(agent.HydrationState, []snapshot.Ski
 	}
 }
 
+// RevertHistory truncates conversation above the given turn. It is the bound
+// alias of the turn-action route: the given turn is the first one removed, so
+// turns up to turn-1 survive, matching ApplyTurnAction's revert_history.
 func (a *App) RevertHistory(turn int) error {
 	a.navMu.Lock()
 	defer a.navMu.Unlock()
@@ -903,7 +905,8 @@ func (a *App) RevertHistory(turn int) error {
 	if err != nil {
 		return err
 	}
-	return a.svc.RevertHistoryForSessionWithBoundary(sessionID, turn, a.turnActionBoundaryEmit())
+	_, err = a.svc.ApplyTurnActionForSessionWithBoundary(sessionID, turn, agent.TurnActionRevertHistory, false, a.turnActionBoundaryEmit())
+	return err
 }
 
 // ForkSession creates a new session branched from turn N.
