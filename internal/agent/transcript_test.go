@@ -1566,11 +1566,31 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 			}
 		}()
 
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[id]
+		rt.mu.Unlock()
+
 		closeRun()
-		// Wait out the completion and the park: the commit feed now runs
-		// before the busy-clear section, so while it is parked the unit is
-		// still busy and no concurrent submit can claim.
-		time.Sleep(200 * time.Millisecond)
+		// Wait until turn N's loop has returned and its turn-end path is in
+		// flight instead of a fixed sleep: Run's deferred MarkTurnComplete
+		// writes the durable complete marker, and the held seqMu parks the
+		// commit feed from there on, so the racing submit lands while the
+		// commit is still pending and the unit is still busy — not while the
+		// turn is still running.
+		completeMarker := filepath.Join(unit.store.Dir(), "turns", strconv.Itoa(resN.Turn), "complete")
+		parkDeadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(parkDeadline) {
+			if _, err := os.Stat(completeMarker); err == nil {
+				break
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("stat complete marker: %v", err)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		if _, err := os.Stat(completeMarker); err != nil {
+			t.Fatal("turn N did not reach its complete marker before the racing submit")
+		}
 
 		// Submit turn N+1 racing the turn end while the commit is pending,
 		// and wait for the submit to complete while the commit is still
@@ -1816,7 +1836,14 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 			defer close(drained)
 			rt.tryDrainQueue(ctx)
 		}()
-		time.Sleep(100 * time.Millisecond)
+		// Wait until the drain has begun the first preseed turn instead of a
+		// fixed sleep: the held seqMu parks the drain at the turn-start feed
+		// once BeginTurn ran, so the arming below targets exactly that turn.
+		// The check after the loop reports a drain that never got there.
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) && unit.store.CurrentTurn() == 0 {
+			time.Sleep(2 * time.Millisecond)
+		}
 
 		// Arm the marker fault at the turn the parked drain just began. Then
 		// drive the concurrent message through the real submit path: the drain
@@ -1849,7 +1876,18 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 		if len(res.Queue) != 1 || res.Queue[0].Content != "meanwhile" {
 			t.Fatalf("submit snapshot = %#v, want one enqueued meanwhile item", res.Queue)
 		}
-		time.Sleep(100 * time.Millisecond)
+		// Wait until the background drainer has consumed the submit's wake
+		// token while the drain is still parked and busy instead of a fixed
+		// sleep: the token is what could wake a re-drain once the abort
+		// clears busy, so once it is gone no launch can follow the marker
+		// failure until the test nudges the drainer again.
+		wakeDeadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(wakeDeadline) && len(rt.queueWake) != 0 {
+			time.Sleep(2 * time.Millisecond)
+		}
+		if len(rt.queueWake) != 0 {
+			t.Fatal("background drainer did not consume the wake token while the drain was parked")
+		}
 
 		tr.seqMu.Unlock()
 		seqMuHeld = false
@@ -2015,7 +2053,19 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 			defer close(drained)
 			rt.tryDrainQueue(ctx)
 		}()
-		time.Sleep(100 * time.Millisecond)
+		// Wait until the drain has claimed the unit and begun the first
+		// preseed turn instead of a fixed sleep: the claim installed the turn
+		// context and the held seqMu parks the drain at the turn-start feed,
+		// so the shutdown below cancels a live claim-time context and the
+		// cancellation poll that follows cannot time out against an
+		// unclaimed unit.
+		parkDeadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(parkDeadline) && unit.store.CurrentTurn() == 0 {
+			time.Sleep(2 * time.Millisecond)
+		}
+		if unit.store.CurrentTurn() == 0 {
+			t.Fatal("drain did not begin a preseed turn before the shutdown")
+		}
 
 		shutdownDone := make(chan struct{})
 		go func() {
@@ -2143,7 +2193,18 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 			defer close(drained)
 			rt.tryDrainQueue(ctx)
 		}()
-		time.Sleep(100 * time.Millisecond)
+		// Wait until the drain has claimed the unit and begun the first
+		// preseed turn instead of a fixed sleep: the claim installed the turn
+		// context, and the held seqMu parks the drain at the turn-start feed,
+		// so the cancel below finds a live claim-time cancel and aborts the
+		// drain instead of silently no-op'ing against an unclaimed unit.
+		parkDeadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(parkDeadline) && unit.store.CurrentTurn() == 0 {
+			time.Sleep(2 * time.Millisecond)
+		}
+		if unit.store.CurrentTurn() == 0 {
+			t.Fatal("drain did not begin a preseed turn before the cancel")
+		}
 
 		if err := a.CancelSession(id); err != nil {
 			t.Fatalf("CancelSession: %v", err)

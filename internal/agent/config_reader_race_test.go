@@ -243,16 +243,25 @@ func waitSessionDrained(t *testing.T, a *Agent, sessionID string) {
 
 func waitSessionState(t *testing.T, a *Agent, sessionID string, requireEmptyQueue bool) {
 	t.Helper()
+	rt := a.ensureRuntime()
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
-		busy, err := a.BusyForSession(sessionID)
+		// Read busy and the queue in one hold of the runtime lock: the
+		// drainer's claim sets busy and empties the queue inside a single
+		// critical section, so two separate polls could observe a stale idle
+		// flag together with an already-emptied queue and return while the
+		// re-drained turn is still on its way to its model request. The test
+		// lives in the same package as the runtime, so it takes rt.mu
+		// directly.
+		rt.mu.Lock()
+		unit, err := a.liveSessionLocked(sessionID)
 		if err != nil {
-			t.Fatalf("BusyForSession: %v", err)
+			rt.mu.Unlock()
+			t.Fatalf("resolve session %q: %v", sessionID, err)
 		}
-		queue, err := a.QueueSnapshotForSession(sessionID)
-		if err != nil {
-			t.Fatalf("QueueSnapshotForSession: %v", err)
-		}
+		busy := rt.busySnapshotLocked(unit)
+		queue := rt.queueSnapshotLocked(unit)
+		rt.mu.Unlock()
 		if !busy && (!requireEmptyQueue || len(queue.Items) == 0) {
 			return
 		}
