@@ -42,6 +42,15 @@ func TestReadProjectNameAndSummaryIndex(t *testing.T) {
 	if _, ok := readSummaryIndex(noGen); ok {
 		t.Fatal("readSummaryIndex without generation = ok, want not ok")
 	}
+	// A generation that is not a single path component is joined into a path,
+	// so it must be rejected rather than read through.
+	escape := filepath.Join(dir, "escape.json")
+	if err := os.WriteFile(escape, []byte(`{"generation":"../.."}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readSummaryIndex(escape); ok {
+		t.Fatal("readSummaryIndex with escaping generation = ok, want not ok")
+	}
 }
 
 func TestStoreDeleteSessionSummaries(t *testing.T) {

@@ -442,7 +442,12 @@ func readSummaryIndex(path string) (summaryIndex, bool) {
 		return summaryIndex{}, false
 	}
 	var idx summaryIndex
-	if err := json.Unmarshal(data, &idx); err != nil || idx.Generation == "" {
+	if err := json.Unmarshal(data, &idx); err != nil {
+		return summaryIndex{}, false
+	}
+	// The generation is joined into a path, so it must be a safe single path
+	// segment, validated at the read so a bad value never reaches the join.
+	if err := snapshot.ValidateSessionID(idx.Generation); err != nil {
 		return summaryIndex{}, false
 	}
 	return idx, true
