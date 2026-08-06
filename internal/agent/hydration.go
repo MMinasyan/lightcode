@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
@@ -41,6 +42,10 @@ type HydrationState struct {
 	Queue       QueueState           `json:"queue"`
 	Warnings    []PromptWarning      `json:"warnings"`
 	Permissions []permission.Request `json:"permissions"`
+	// ReadOnly marks a hydration of a session that is not live in this owner:
+	// the durable transcript as of the read, and nothing live. The adapter
+	// must not admit a new turn against it.
+	ReadOnly bool `json:"readOnly"`
 }
 
 // HydrateSession captures a session's complete live state for an adapter to apply
@@ -48,8 +53,10 @@ type HydrationState struct {
 // revalidating live-selection shape: a compaction or commit landing between the
 // durable read and the locked read forces a retry, and exhausting the three
 // attempts surfaces an error rather than an empty session. A session id that is
-// not a live root resolves as a child: a live child from its registry entry, a
-// completed child from its durable store.
+// not a live root resolves as a read-only root when it is a persisted root
+// session — its durable transcript with nothing live, for a session another
+// process may be driving — and otherwise as a child: a live child from its
+// registry entry, a completed child from its durable store.
 func (a *Agent) HydrateSession(sessionID string) (HydrationState, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
@@ -64,6 +71,17 @@ func (a *Agent) HydrateSession(sessionID string) (HydrationState, error) {
 	unit, err := a.liveSessionLocked(sessionID)
 	rt.mu.Unlock()
 	if err != nil {
+		// A non-live id that resolves to a persisted root session opens
+		// read-only: another process may be driving it, so nothing live exists
+		// to capture. Children and compact transcripts fall through to the
+		// child path, and an unknown id errors there.
+		proj, perr := a.projectForExistingSession(sessionID)
+		if perr == nil {
+			meta, merr := snapshot.LoadSessionMeta(a.projects.SessionsRoot(proj.ID), sessionID)
+			if merr == nil && meta.ParentSessionID == "" && !isCompactSessionType(meta.ActiveAgentType) {
+				return a.hydrateReadOnlyRoot(proj, sessionID, meta)
+			}
+		}
 		return a.hydrateChildSession(sessionID)
 	}
 	summary, err := a.SessionSummaryForSession(sessionID)
@@ -75,6 +93,26 @@ func (a *Agent) HydrateSession(sessionID string) (HydrationState, error) {
 		return HydrationState{}, err
 	}
 	return hydrationStateFrom(summary, cs), nil
+}
+
+// hydrateReadOnlyRoot builds a persisted root session's read-only hydration:
+// the persisted summary, the durable transcript, and the read-only flag.
+// Nothing live is captured — tokens read zero, which is the honest answer,
+// since usage lives in the process driving the session.
+func (a *Agent) hydrateReadOnlyRoot(proj *project.Project, sessionID string, meta snapshot.SessionMeta) (HydrationState, error) {
+	store, err := snapshot.NewForSessionsRoot(a.projects.SessionsRoot(proj.ID), a.projects.Root(), proj.ID)
+	if err != nil {
+		return HydrationState{}, err
+	}
+	msgs, _, err := a.messagesForFrontendForStoreAndMaxTurn(store, sessionID)
+	if err != nil {
+		return HydrationState{}, err
+	}
+	return HydrationState{
+		Session:  persistedSessionSummary(sessionID, meta, proj),
+		Messages: msgs,
+		ReadOnly: true,
+	}, nil
 }
 
 // hydrateChildSession resolves a child session's complete transcript. A live

@@ -4124,6 +4124,29 @@ func (a *Agent) SessionSummaryForSession(sessionID string) (SessionSummary, erro
 	return sessionSummary(unit), nil
 }
 
+// SessionSummaryForSessionOrPersisted resolves a session's summary whether the
+// session is live in this owner or only persisted on disk: a live id takes the
+// SessionSummaryForSession path, and any other id is resolved against the
+// persisted sessions of every project. The resolved summary reports the id
+// that resolved and the project the session actually lives in, never the
+// metadata's unvalidated project path.
+func (a *Agent) SessionSummaryForSessionOrPersisted(sessionID string) (SessionSummary, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	unit, err := a.resolveLiveSession(sessionID)
+	if err == nil {
+		return sessionSummary(unit), nil
+	}
+	proj, err := a.projectForExistingSession(sessionID)
+	if err != nil {
+		return SessionSummary{}, err
+	}
+	meta, err := snapshot.LoadSessionMeta(a.projects.SessionsRoot(proj.ID), sessionID)
+	if err != nil {
+		return SessionSummary{}, err
+	}
+	return persistedSessionSummary(sessionID, meta, proj), nil
+}
+
 func (a *Agent) SessionPayloadForSession(sessionID string) (SessionPayload, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
@@ -4183,6 +4206,23 @@ func sessionSummaryFromMeta(meta snapshot.SessionMeta) SessionSummary {
 		State:           metaState(meta.State),
 		ArchivedAt:      meta.ArchivedAt,
 		ProjectPath:     meta.ProjectPath,
+		ParentSessionID: meta.ParentSessionID,
+	}
+}
+
+// persistedSessionSummary builds a session summary from a session's persisted
+// metadata and the project record it was resolved from, reporting the id that
+// resolved and the project the session actually lives in. The metadata's own
+// id and project path are unvalidated and can be stale, so neither is used —
+// exactly the two fields the live path deliberately overrides.
+func persistedSessionSummary(id string, meta snapshot.SessionMeta, proj *project.Project) SessionSummary {
+	return SessionSummary{
+		ID:              id,
+		CreatedAt:       meta.CreatedAt,
+		LastActivity:    meta.LastActivity,
+		State:           metaState(meta.State),
+		ArchivedAt:      meta.ArchivedAt,
+		ProjectPath:     proj.Path,
 		ParentSessionID: meta.ParentSessionID,
 	}
 }
@@ -4646,6 +4686,14 @@ func (a *Agent) ensureProjectForPath(projectPath string) (*project.Project, erro
 	return project.EnsureForPath(a.projects.Root(), abs)
 }
 
+// SessionContendedError builds the user-facing message for a session another
+// process is driving, with no package prefix. The snapshot sentinel stays the
+// store's internal cause, wrapped by acquireClaimLocked and recognised by
+// callers with errors.Is.
+func SessionContendedError(id string) error {
+	return fmt.Errorf("session %q is being driven by another process", id)
+}
+
 // claimPersistedOnlySession acquires a temporary claim for a session that is
 // not live in this owner, so a persisted-only archive/delete cannot mutate a
 // session another process is driving. The caller releases via the returned
@@ -4658,7 +4706,7 @@ func (a *Agent) claimPersistedOnlySession(sessionsRoot, id string) (func(), erro
 		return nil, err
 	}
 	if !ok {
-		return nil, fmt.Errorf("session %q is being driven by another process", id)
+		return nil, SessionContendedError(id)
 	}
 	return func() { _ = claim.Release() }, nil
 }

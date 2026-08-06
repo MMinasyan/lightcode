@@ -55,6 +55,7 @@ type AdapterService interface {
 
 	TokenUsageForSession(string) (TokenReport, error)
 	SessionSummaryForSession(string) (SessionSummary, error)
+	SessionSummaryForSessionOrPersisted(string) (SessionSummary, error)
 	SessionPayloadForSession(string) (SessionPayload, error)
 	SessionList(string) ([]SessionSummary, error)
 	OpenSession(string) (SessionSummary, error)
