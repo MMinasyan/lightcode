@@ -2463,6 +2463,365 @@ func TestAdapterExplicitSessionTargetingContract(t *testing.T) {
 	})
 }
 
+// TestACPProjectRoutesKeepSessionProjectAfterRemoval proves the project-scoped
+// routes keep answering for the project of the session they were routing to
+// after that session is removed — archived or deleted, the two removal shapes
+// that clear routing current through separate calls: the routing project is
+// committed with the session id on every set and deliberately survives the
+// current-session removal, so session/new, session/list and file/read do not
+// fall back to the startup project.
+func TestACPProjectRoutesKeepSessionProjectAfterRemoval(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*Runner, Request)
+	}{
+		{name: "archive", run: func(r *Runner, req Request) { r.handleSessionArchive(req) }},
+		{name: "delete", run: func(r *Runner, req Request) { r.handleSessionDelete(req) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newACPTestAgent(t)
+			startupID, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("NewSession startup: %v", err)
+			}
+			otherRoot := t.TempDir()
+			otherID, err := a.NewSessionForProjectPath(otherRoot, "primary")
+			if err != nil {
+				t.Fatalf("NewSessionForProjectPath: %v", err)
+			}
+			keptID, err := a.NewSessionForProjectPath(otherRoot, "primary")
+			if err != nil {
+				t.Fatalf("NewSessionForProjectPath kept: %v", err)
+			}
+			if startupID == otherID || otherID == keptID {
+				t.Fatal("test setup: sessions must be distinct")
+			}
+			readme := filepath.Join(otherRoot, "readme.txt")
+			if err := os.WriteFile(readme, []byte("b-content"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			out := new(bytes.Buffer)
+			r := &Runner{agent: a, owner: a, out: out}
+			r.setCurrentSessionID(startupID)
+
+			// Route to the other-project session, then remove it: routing
+			// current clears while the routing project stays the other project.
+			r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + otherID + `"}`)})
+			r.drainForTest()
+			out.Reset()
+			tc.run(r, Request{JSONRPC: "2.0", ID: "rem", Params: json.RawMessage(`{"id":"` + otherID + `"}`)})
+			r.drainForTest()
+			out.Reset()
+			if got, err := r.currentSession(); err == nil {
+				t.Fatalf("routing current after %s = %q, want cleared", tc.name, got)
+			}
+
+			// session/list still lists the other project, not the startup one.
+			r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "list", Method: "session/list"})
+			gotList := acpSessionListFromResponse(t, drainedLines(t, r, out, 1)[0])
+			wantList, err := a.SessionListForProjectPath(otherRoot, "active")
+			if err != nil {
+				t.Fatalf("SessionListForProjectPath: %v", err)
+			}
+			if len(gotList) != len(wantList) {
+				t.Fatalf("session/list returned %d sessions, want the routed project's %d: %#v", len(gotList), len(wantList), gotList)
+			}
+			for i := range wantList {
+				if gotList[i].ID != wantList[i].ID {
+					t.Fatalf("session/list[%d] = %q, want routed project session %q", i, gotList[i].ID, wantList[i].ID)
+				}
+			}
+			if len(gotList) != 1 || gotList[0].ID != keptID {
+				t.Fatalf("session/list = %#v, want the kept routed-project session %q", gotList, keptID)
+			}
+			out.Reset()
+
+			// session/new still creates in the other project.
+			r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "new", Method: "session/new"})
+			lines := drainedLines(t, r, out, 2)
+			assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+			summary := acpSessionSummaryFromResponse(t, lines[1])
+			if summary.ID == "" {
+				t.Fatal("session/new returned no session")
+			}
+			if summary.ProjectPath != otherRoot {
+				t.Fatalf("session/new created in project %q, want routed project %q", summary.ProjectPath, otherRoot)
+			}
+			out.Reset()
+
+			// file/read still reads from the other project.
+			if got := acpFileReadContent(t, r, out, readme); got != "b-content" {
+				t.Fatalf("file/read after %s = %q, want %q", tc.name, got, "b-content")
+			}
+		})
+	}
+}
+
+// TestACPProjectRoutesFollowExplicitPromptTarget proves the project-scoped
+// routes answer for the project of a session named explicitly in
+// session/prompt: the implicit switch inside submit admission commits the
+// routing project alongside the id, so a client that prompts another
+// project's session without ever calling session/switch has its subsequent
+// session/new, session/list and file/read scoped there.
+func TestACPProjectRoutesFollowExplicitPromptTarget(t *testing.T) {
+	a := newACPTestAgent(t)
+	startupID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	otherRoot := t.TempDir()
+	otherID, err := a.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath: %v", err)
+	}
+	readme := filepath.Join(otherRoot, "readme.txt")
+	if err := os.WriteFile(readme, []byte("b-content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out := new(bytes.Buffer)
+	r := &Runner{agent: a, owner: a, out: out}
+	a.SetEventHandler(r.handleEvent)
+	r.setCurrentSessionID(startupID)
+
+	// A live context admits the submit, so the implicit switch commits routing
+	// current and the routing project inside admission. The turn's own frames
+	// (turn_start, warnings) are enqueued by the failed turn's goroutine on no
+	// fixed schedule, so the route assertions below read the response frame by
+	// id and tolerate whatever else is on the wire around it.
+	r.handleSessionPrompt(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"session_id":"` + otherID + `","content":"hi"}`),
+	})
+	r.drainForTest()
+	out.Reset()
+	if got := r.currentSessionSummary().ID; got != otherID {
+		t.Fatalf("routing current = %q, want %q", got, otherID)
+	}
+
+	// session/list answers for the prompted session's project.
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "list", Method: "session/list"})
+	gotList := acpSessionListFromResponse(t, responseLineForID(t, r, out, "list"))
+	wantList, err := a.SessionListForProjectPath(otherRoot, "active")
+	if err != nil {
+		t.Fatalf("SessionListForProjectPath: %v", err)
+	}
+	if len(gotList) != len(wantList) {
+		t.Fatalf("session/list returned %d sessions, want the prompted project's %d: %#v", len(gotList), len(wantList), gotList)
+	}
+	for i := range wantList {
+		if gotList[i].ID != wantList[i].ID {
+			t.Fatalf("session/list[%d] = %q, want prompted project session %q", i, gotList[i].ID, wantList[i].ID)
+		}
+	}
+	if len(gotList) != 1 || gotList[0].ID != otherID {
+		t.Fatalf("session/list = %#v, want the prompted session %q", gotList, otherID)
+	}
+	out.Reset()
+
+	// session/new creates in the prompted session's project.
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "new", Method: "session/new"})
+	summary := acpSessionSummaryFromResponse(t, responseLineForID(t, r, out, "new"))
+	if summary.ID == "" {
+		t.Fatal("session/new returned no session")
+	}
+	if summary.ProjectPath != otherRoot {
+		t.Fatalf("session/new created in project %q, want prompted project %q", summary.ProjectPath, otherRoot)
+	}
+	out.Reset()
+
+	// file/read reads from the prompted session's project.
+	if got := acpFileReadContent(t, r, out, readme); got != "b-content" {
+		t.Fatalf("file/read after prompt = %q, want %q", got, "b-content")
+	}
+}
+
+// TestACPProjectRoutesKeepSessionProjectAfterEviction proves the routing
+// project survives a current-session eviction: a history revert whose
+// post-walk reload fails evicts the session and clears the current id, and the
+// empty-state boundary the eviction publishes through the turn-action callback
+// must clear the id without clearing the project the session was in, so the
+// project-scoped routes keep answering for it.
+func TestACPProjectRoutesKeepSessionProjectAfterEviction(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("file permissions do not block reads as root")
+	}
+	a, home := newACPTestAgentEnv(t, "http://127.0.0.1:9/v1", false)
+	startupID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	otherRoot := t.TempDir()
+	otherID, err := a.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath: %v", err)
+	}
+	for i := 1; i <= 10; i++ {
+		if _, err := a.AppendUserMessageToSession(otherID, fmt.Sprintf("turn %d", i)); err != nil {
+			t.Fatalf("append turn %d: %v", i, err)
+		}
+	}
+	readme := filepath.Join(otherRoot, "readme.txt")
+	if err := os.WriteFile(readme, []byte("b-content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Route to the other-project session first: opening re-hydrates the loop
+	// from disk, so the blocking below must come after it. Then make the
+	// reload fail after the walk ran: the walk stops at the blocked turn 7
+	// directory, and the reload then fails reading the surviving turn 7's
+	// messages file.
+	out := new(bytes.Buffer)
+	r := &Runner{agent: a, owner: a, out: out}
+	r.setCurrentSessionID(startupID)
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + otherID + `"}`)})
+	r.drainForTest()
+	out.Reset()
+
+	proj, err := a.ProjectCurrentForPath(otherRoot)
+	if err != nil {
+		t.Fatalf("ProjectCurrentForPath: %v", err)
+	}
+	sessionDir := filepath.Join(home, ".lightcode", "projects", proj.ID, "sessions", otherID)
+	blockedDir := filepath.Join(sessionDir, "turns", "7")
+	if err := os.Chmod(blockedDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blockedDir, 0o700) })
+	blockedMessages := filepath.Join(blockedDir, "messages.jsonl")
+	if err := os.Chmod(blockedMessages, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blockedMessages, 0o600) })
+
+	// The revert walks turns 10..7, stops at the blocked 7, and the reload
+	// failure evicts the session; the eviction boundary carries no session and
+	// clears the current id. The routing project must survive the empty-state
+	// boundary the callback receives.
+	r.handleRevertHistory(Request{JSONRPC: "2.0", ID: "rv", Params: json.RawMessage(`{"turn":6}`)})
+	r.drainForTest()
+	out.Reset()
+	if got, err := r.currentSession(); err == nil {
+		t.Fatalf("routing current after eviction = %q, want cleared", got)
+	}
+
+	// session/list still lists the other project, not the startup one.
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "list", Method: "session/list"})
+	gotList := acpSessionListFromResponse(t, drainedLines(t, r, out, 1)[0])
+	wantList, err := a.SessionListForProjectPath(otherRoot, "active")
+	if err != nil {
+		t.Fatalf("SessionListForProjectPath: %v", err)
+	}
+	if len(gotList) != len(wantList) {
+		t.Fatalf("session/list returned %d sessions, want the routed project's %d: %#v", len(gotList), len(wantList), gotList)
+	}
+	for i := range wantList {
+		if gotList[i].ID != wantList[i].ID {
+			t.Fatalf("session/list[%d] = %q, want routed project session %q", i, gotList[i].ID, wantList[i].ID)
+		}
+	}
+	if len(gotList) != 1 || gotList[0].ID != otherID {
+		t.Fatalf("session/list = %#v, want the evicted routed-project session %q", gotList, otherID)
+	}
+	out.Reset()
+
+	// session/new still creates in the other project.
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "new", Method: "session/new"})
+	lines := drainedLines(t, r, out, 2)
+	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+	summary := acpSessionSummaryFromResponse(t, lines[1])
+	if summary.ID == "" {
+		t.Fatal("session/new returned no session")
+	}
+	if summary.ProjectPath != otherRoot {
+		t.Fatalf("session/new created in project %q, want routed project %q", summary.ProjectPath, otherRoot)
+	}
+	out.Reset()
+
+	// file/read still reads from the other project.
+	if got := acpFileReadContent(t, r, out, readme); got != "b-content" {
+		t.Fatalf("file/read after eviction = %q, want %q", got, "b-content")
+	}
+}
+
+// TestACPRefusedPromptKeepsRoutingProject proves the explicit-id precheck does
+// not move the routing project: the project is committed with the id inside
+// submit admission, so a prompt whose submit is refused admission leaves both
+// the current id and the routing project on the previous session.
+func TestACPRefusedPromptKeepsRoutingProject(t *testing.T) {
+	a := newACPTestAgent(t)
+	startupID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	otherRoot := t.TempDir()
+	otherID, err := a.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath: %v", err)
+	}
+
+	// Park a turn on the target: without Init the failed provider call parks
+	// in the flush round-trip, so the unit stays busy and the prompt below is
+	// refused at the queue admission on the cancelled context, after the
+	// precheck has already resolved the session.
+	res, err := a.SubmitToSession(context.Background(), otherID, "park")
+	if err != nil {
+		t.Fatalf("SubmitToSession park: %v", err)
+	}
+	if !res.Started {
+		t.Fatalf("park submit was queued instead of started: %+v", res)
+	}
+
+	out := new(bytes.Buffer)
+	r := &Runner{agent: a, owner: a, out: out}
+	r.setCurrentSessionID(startupID)
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + startupID + `"}`)})
+	r.drainForTest()
+	out.Reset()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.handleSessionPrompt(ctx, Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"session_id":"` + otherID + `","content":"hi"}`),
+	})
+	var resp Response
+	if err := json.Unmarshal([]byte(responseLineForID(t, r, out, "prompt")), &resp); err != nil {
+		t.Fatalf("prompt response json: %v", err)
+	}
+	if resp.Error == nil {
+		t.Fatalf("refused prompt succeeded with %+v, want an error", resp.Result)
+	}
+
+	// Neither the current id nor the routing project moved.
+	if got, err := r.currentSession(); err != nil || got != startupID {
+		t.Fatalf("routing current = %q (err %v), want unchanged %q", got, err, startupID)
+	}
+	if got := r.currentProjectPath(); got != a.ProjectRoot() {
+		t.Fatalf("routing project after refused prompt = %q, want unchanged %q", got, a.ProjectRoot())
+	}
+	out.Reset()
+
+	// The project-scoped routes still answer for the previous project.
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "list", Method: "session/list"})
+	gotList := acpSessionListFromResponse(t, responseLineForID(t, r, out, "list"))
+	wantList, err := a.SessionListForProjectPath(a.ProjectRoot(), "active")
+	if err != nil {
+		t.Fatalf("SessionListForProjectPath: %v", err)
+	}
+	if len(gotList) != len(wantList) {
+		t.Fatalf("session/list after refused prompt returned %d sessions, want the previous project's %d: %#v", len(gotList), len(wantList), gotList)
+	}
+	for i := range wantList {
+		if gotList[i].ID != wantList[i].ID {
+			t.Fatalf("session/list[%d] after refused prompt = %q, want previous project session %q", i, gotList[i].ID, wantList[i].ID)
+		}
+	}
+}
+
 func TestACPClearRemovedCurrent(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -2619,6 +2978,15 @@ func newACPWarningTestAgent(t *testing.T) *agent.Agent {
 
 func newACPTestAgentWithProvider(t *testing.T, baseURL string, discovery bool) *agent.Agent {
 	t.Helper()
+	a, _ := newACPTestAgentEnv(t, baseURL, discovery)
+	return a
+}
+
+// newACPTestAgentEnv is newACPTestAgentWithProvider that also returns the
+// storage home directory the agent was built with, for tests that must reach
+// the session files on disk.
+func newACPTestAgentEnv(t *testing.T, baseURL string, discovery bool) (*agent.Agent, string) {
+	t.Helper()
 	home := t.TempDir()
 	projectRoot := t.TempDir()
 	lightcodeDir := filepath.Join(home, ".lightcode")
@@ -2650,7 +3018,7 @@ func newACPTestAgentWithProvider(t *testing.T, baseURL string, discovery bool) *
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
-	return a
+	return a, home
 }
 
 func appendACPUserTurn(t *testing.T, a *agent.Agent, content string) int {
@@ -2733,6 +3101,76 @@ func acpSessionSummaryFromResponse(t *testing.T, line string) agent.SessionSumma
 		t.Fatalf("session result json: %v", err)
 	}
 	return summary
+}
+
+func acpSessionListFromResponse(t *testing.T, line string) []agent.SessionSummary {
+	t.Helper()
+	var resp Response
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("session/list response error: %+v", resp.Error)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("session/list result marshal: %v", err)
+	}
+	var list []agent.SessionSummary
+	if err := json.Unmarshal(data, &list); err != nil {
+		t.Fatalf("session/list result json: %v", err)
+	}
+	return list
+}
+
+// responseLineForID drains the runner's output and returns the response frame
+// carrying id, tolerating any notifications a turn's goroutine enqueues around
+// it on no fixed schedule.
+func responseLineForID(t *testing.T, r *Runner, out *bytes.Buffer, id string) string {
+	t.Helper()
+	r.drainForTest()
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var resp Response
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("frame json: %v", err)
+		}
+		if resp.ID == id {
+			return line
+		}
+	}
+	t.Fatalf("no response with id %q among frames: %q", id, out.String())
+	return ""
+}
+
+// acpFileReadContent dispatches file/read for path and returns the content,
+// failing the test on any error response.
+func acpFileReadContent(t *testing.T, r *Runner, out *bytes.Buffer, path string) string {
+	t.Helper()
+	r.dispatch(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "read",
+		Method:  "file/read",
+		Params:  json.RawMessage(`{"path":` + strconv.Quote(path) + `}`),
+	})
+	line := responseLineForID(t, r, out, "read")
+	var resp Response
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("file/read %q errored: %+v", path, resp.Error)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("file/read result marshal: %v", err)
+	}
+	var payload struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("file/read result json: %v", err)
+	}
+	return payload.Content
 }
 
 func acpChunkContent(t *testing.T, line string) string {

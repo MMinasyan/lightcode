@@ -111,6 +111,16 @@ type Runner struct {
 
 	viewOnce sync.Once
 	view     *agent.SessionView
+
+	// routeProjectPath is the project the connection's project-implicit
+	// operations scope to, committed alongside the routing-current session id
+	// on every set and deliberately left in place when the current session is
+	// removed: the project the client was working in is still the right answer
+	// for the project-scoped routes. It is read and written only by the
+	// dispatch loop, plus the bootstrap that precedes it, so it needs no lock
+	// of its own. Empty until the first session is committed — the pre-session
+	// state currentProjectPath falls back to the owner-startup project for.
+	routeProjectPath string
 }
 
 // admitDispatch reserves the line-processing interval unless dispatch admission is
@@ -266,7 +276,14 @@ func (r *Runner) Run(ctx context.Context) error {
 			sessionID = id
 		}
 	}
-	r.setCurrentSessionID(sessionID)
+	// Seed the routing project from the resumed session's summary; if that
+	// read fails the id is still committed and the project path stays unset so
+	// the pre-session fallback applies by itself.
+	if summary, err := r.agent.SessionSummaryForSession(sessionID); err == nil {
+		r.setCurrent(sessionID, summary)
+	} else {
+		r.setCurrentSessionID(sessionID)
+	}
 	r.seedPresented(sessionID)
 
 	scanErr := make(chan error, 1)
@@ -573,6 +590,21 @@ func (r *Runner) setCurrentSessionID(id string) {
 	r.sv().SetCurrent(id)
 }
 
+// setCurrent commits the connection's routing current: the session id, and the
+// project path that scopes its project-implicit operations when the session's
+// summary carries one. The two move together on every set; a set that commits
+// only the id leaves the previous project answering for the switched-to
+// session. A summary carrying no project path — an eviction boundary, for
+// example — commits only the id, leaving the routing project in place: a set
+// site must never become a clear site. The path is stored as given; trimming
+// only tests whether it is empty.
+func (r *Runner) setCurrent(id string, summary agent.SessionSummary) {
+	if strings.TrimSpace(summary.ProjectPath) != "" {
+		r.routeProjectPath = summary.ProjectPath
+	}
+	r.setCurrentSessionID(id)
+}
+
 func (r *Runner) currentSession() (string, error) {
 	return r.sv().CurrentOrErr()
 }
@@ -612,19 +644,17 @@ func (r *Runner) projectCurrent() (agent.ProjectSummary, error) {
 	return out, err
 }
 
-// currentProjectPath resolves the project to scope a project-implicit operation to:
-// the connection's current session's project, else the owner-startup project — the
-// same fallback Run() uses before any session exists (acp.go:255-266).
+// currentProjectPath resolves the project to scope a project-implicit operation
+// to: the project the connection's routing current was committed with, else the
+// owner-startup project — the same fallback Run() uses before any session
+// exists. It is committed with the session id on every set and deliberately
+// survives a current-session removal, so the project-scoped routes keep
+// answering for the project the client was working in.
 func (r *Runner) currentProjectPath() string {
-	id, err := r.currentSession()
-	if err != nil {
+	if r.routeProjectPath == "" {
 		return r.agent.ProjectRoot()
 	}
-	summary, err := r.agent.SessionSummaryForSession(id)
-	if err != nil || strings.TrimSpace(summary.ProjectPath) == "" {
-		return r.agent.ProjectRoot()
-	}
-	return summary.ProjectPath
+	return r.routeProjectPath
 }
 
 func (r *Runner) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
@@ -640,7 +670,7 @@ func (r *Runner) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
 func (r *Runner) handleSessionNew(req Request) {
 	_, err := r.agent.NewSessionForProjectPathWithBoundary(r.currentProjectPath(), "primary", func(state agent.HydrationState) {
 		id := strings.TrimSpace(state.Session.ID)
-		r.setCurrentSessionID(id)
+		r.setCurrent(id, state.Session)
 		r.sendBoundary(Notification{
 			JSONRPC: "2.0",
 			Method:  "agent/session_changed",
@@ -668,8 +698,14 @@ func (r *Runner) handleSessionPrompt(ctx context.Context, req Request) {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
+	// The precheck resolves the explicit target's summary before admission;
+	// its project path is kept and committed alongside the id inside the
+	// admitted callback, never here, which runs before admission and must not
+	// move routing.
+	var summary agent.SessionSummary
 	if strings.TrimSpace(params.SessionID) != "" {
-		if _, err := r.agent.SessionSummaryForSession(sessionID); err != nil {
+		summary, err = r.agent.SessionSummaryForSession(sessionID)
+		if err != nil {
 			r.respondError(req.ID, -32000, err.Error())
 			return
 		}
@@ -683,7 +719,7 @@ func (r *Runner) handleSessionPrompt(ctx context.Context, req Request) {
 	res, err := r.agent.SubmitToSessionWithBoundary(ctx, sessionID, params.Content, func() {
 		if strings.TrimSpace(params.SessionID) != "" {
 			prev, _ := r.currentSession()
-			r.setCurrentSessionID(sessionID)
+			r.setCurrent(sessionID, summary)
 			if strings.TrimSpace(prev) != sessionID {
 				r.enqueueFrame(outFrame{kind: frameAdvance, sessionID: sessionID})
 			}
@@ -795,7 +831,7 @@ func (r *Runner) handleSessionSwitch(req Request) {
 	// success response. A failed switch calls emit never, leaving routing unchanged.
 	summary, err := r.agent.OpenSessionWithBoundary(params.ID, func(state agent.HydrationState) {
 		id := strings.TrimSpace(state.Session.ID)
-		r.setCurrentSessionID(id)
+		r.setCurrent(id, state.Session)
 		r.sendBoundary(Notification{
 			JSONRPC: "2.0",
 			Method:  "agent/session_changed",
@@ -889,7 +925,7 @@ func (r *Runner) handleTurnAction(req Request, action string) {
 	// the response; a code-only revert changes no session and emits nothing.
 	result, err := r.agent.ApplyTurnActionForSessionWithBoundary(sessionID, params.Turn, action, params.AlsoRevertCode, func(state agent.HydrationState, _ []snapshot.SkippedRevert) {
 		id := strings.TrimSpace(state.Session.ID)
-		r.setCurrentSessionID(id)
+		r.setCurrent(id, state.Session)
 		r.sendBoundary(Notification{
 			JSONRPC: "2.0",
 			Method:  "agent/session_changed",
