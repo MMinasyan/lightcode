@@ -78,7 +78,9 @@ type CLI struct {
 	// results, drained by mainLoop, which is the sole drainer and sole terminal
 	// writer. Producers (the owner callback, op-group members) only append and wake;
 	// they never render. A synchronous owner call may append more than the former
-	// bounded channel held while mainLoop is stalled, so appending never blocks.
+	// bounded channel held while mainLoop is stalled, so appending never waits for
+	// queue capacity or for mainLoop to drain — only for the queue mutex, behind
+	// another producer or mainLoop's own drain.
 	eventMu     sync.Mutex
 	eventFrames []func()
 	eventWake   chan struct{}
