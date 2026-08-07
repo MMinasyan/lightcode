@@ -661,8 +661,11 @@ func TestDispatchUpgradeInstallFlow(t *testing.T) {
 		if stdout != "" {
 			t.Fatalf("stdout must stay empty on install, got %q", stdout)
 		}
-		if !strings.Contains(stderr, "upgraded v1.0.0 -> v9.9.9; takes effect the next time lightcode starts - including the GUI's own relaunch when switching projects.") {
+		if !strings.Contains(stderr, "upgraded v1.0.0 -> v9.9.9; takes effect the next time lightcode starts.") {
 			t.Fatalf("stderr missing final message: %q", stderr)
+		}
+		if strings.Contains(stderr, "including the GUI's own relaunch when switching projects") {
+			t.Fatalf("stderr must not promise a GUI relaunch: %q", stderr)
 		}
 		if strings.Contains(stdout+stderr, "SMOKE_NOISE_MARKER") {
 			t.Fatal("smoke child output was forwarded")

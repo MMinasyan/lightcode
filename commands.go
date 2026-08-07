@@ -432,7 +432,7 @@ func runUpgrade(raw []string) error {
 	if err := selfupdate.Replace(staged, targetPath); err != nil {
 		return err
 	}
-	fmt.Fprintf(errW, "upgraded %s -> %s; takes effect the next time lightcode starts - including the GUI's own relaunch when switching projects.\n", version.String(), target)
+	fmt.Fprintf(errW, "upgraded %s -> %s; takes effect the next time lightcode starts.\n", version.String(), target)
 	return nil
 }
 

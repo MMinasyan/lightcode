@@ -13,8 +13,7 @@ import (
 // AdapterScope holds an adapter-local project path and routes the
 // project-scoped convenience methods through the *ForProjectPath variants.
 // It is used by in-process adapters (Wails, CLI) that need mutable project
-// paths for in-place project switching. The attached *server.Client has its
-// own equivalent routing fixed at attach time.
+// paths for in-place project switching.
 type AdapterScope struct {
 	svc  AdapterService
 	mu   sync.Mutex
