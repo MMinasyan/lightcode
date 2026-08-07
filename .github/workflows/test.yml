@@ -82,4 +82,7 @@ jobs:
           go-version: '1.26'
 
       - name: Integration tests
-        run: go test -race -tags integration -run TestIntegration ./internal/agent/...
+        # Integration-tagged tests are selected by name: every such test
+        # under ./internal/ must be named TestIntegration*, because
+        # -run TestIntegration is the only thing that picks them up.
+        run: go test -race -tags integration -run TestIntegration ./internal/...
