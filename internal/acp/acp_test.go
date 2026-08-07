@@ -1126,6 +1126,54 @@ func TestHandleTurnActionACPForkReturnsResultAndSessionChanged(t *testing.T) {
 	}
 }
 
+// TestHandleTurnActionACPForkWarningOnFailedCodeRevert proves the protocol
+// response for a fork whose best-effort code revert failed still returns the
+// fork's result — success — and carries the failed revert as the result's
+// warning: the host must not turn the published fork into an error response.
+func TestHandleTurnActionACPForkWarningOnFailedCodeRevert(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes as root")
+	}
+	a := newACPTestAgent(t)
+	var out bytes.Buffer
+	r := &Runner{agent: a, owner: a, out: &out}
+
+	_ = appendACPUserTurn(t, a, "first")
+	r.setCurrentSessionID(a.SessionCurrent().ID)
+	clickedTurn := appendACPUserTurn(t, a, "fork point")
+	sub := filepath.Join(a.ProjectRoot(), "sub")
+	path := filepath.Join(sub, "created-after-fork.txt")
+	_ = appendACPUserTurnWithSnapshot(t, a, "create after fork", path, "later\n")
+	beforeID := a.SessionCurrent().ID
+	if err := os.Chmod(sub, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(sub, 0o700) }()
+
+	r.handleSessionFork(Request{
+		JSONRPC: "2.0",
+		ID:      "fork",
+		Params:  json.RawMessage(`{"turn":` + itoa(clickedTurn) + `,"alsoRevertCode":true}`),
+	})
+
+	lines := drainedLines(t, r, &out, 2)
+	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	result := turnActionResultFromResponse(t, resp)
+	if resp.Error != nil {
+		t.Fatalf("a failed best-effort code revert must not fail the fork response: %+v", resp.Error)
+	}
+	if result.Action != agent.TurnActionFork || result.Session.ID == "" || result.Session.ID == beforeID {
+		t.Fatalf("response/result = %+v %#v, want successful fork result with new session", resp, result)
+	}
+	if result.Warning == "" || !strings.Contains(result.Warning, "code revert failed") {
+		t.Fatalf("fork response must carry the failed code revert warning, got %q", result.Warning)
+	}
+}
+
 // TestACPOrderedDelivery proves that every boundary-producing lifecycle
 // operation enqueues its session boundary before its success response (the nearest
 // forbidden sibling is response-before-boundary), and that a preparation/mutation

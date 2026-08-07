@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -680,6 +681,74 @@ func TestWailsOrderedDeliveryContract(t *testing.T) {
 			t.Fatalf("SaveProjectPermission on an already-resolved request returned an error: %v", err)
 		}
 	})
+}
+
+// TestWailsTurnActionFrameCarriesFailedRevertWarning drives a fork whose
+// best-effort code revert failed through the desktop adapter and proves the
+// turn_action boundary frame it emits carries the warning: the adapter's
+// mapping from the boundary callback onto the frame is the link between the
+// owner's emit and the frontend's render, and losing it would drop the warning
+// on the desktop while the agent and frontend tests still pass.
+func TestWailsTurnActionFrameCarriesFailedRevertWarning(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes as root")
+	}
+	ag := newAppTestAgent(t)
+	app := &App{svc: ag, agent: ag}
+	log := &wailsFrameLog{}
+	app.emitFn = log.append
+	app.startup(context.Background())
+
+	sourceID := app.currentSessionID()
+	if sourceID == "" {
+		t.Fatal("startup did not establish a current session")
+	}
+	if _, err := ag.AppendUserMessage("fork point"); err != nil {
+		t.Fatalf("seed fork point: %v", err)
+	}
+	sub := filepath.Join(ag.ProjectRoot(), "sub")
+	path := filepath.Join(sub, "created-after-fork.txt")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	turn, err := ag.AppendUserMessage("create after fork")
+	if err != nil {
+		t.Fatalf("seed snapshot turn: %v", err)
+	}
+	entryID, _, err := ag.Store().SnapshotResolvedEntry(turn, path, path)
+	if err != nil {
+		t.Fatalf("snapshot entry: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("later\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ag.Store().RecordSnapshotContent(turn, entryID, []byte("later\n")); err != nil {
+		t.Fatalf("record snapshot content: %v", err)
+	}
+	if err := os.Chmod(sub, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(sub, 0o700) }()
+
+	result, err := app.ApplyTurnAction(1, agent.TurnActionFork, true)
+	if err != nil {
+		t.Fatalf("best-effort code revert must not fail a committed fork: %v", err)
+	}
+	if result.Warning == "" {
+		t.Fatal("fork result must carry the failed code revert warning")
+	}
+
+	frame := waitForWailsFrame(t, log, "turn_action")
+	boundary, ok := frame.(turnActionBoundary)
+	if !ok {
+		t.Fatalf("turn_action frame payload is %T, want turnActionBoundary: %#v", frame, frame)
+	}
+	if boundary.Warning != result.Warning {
+		t.Fatalf("turn_action frame warning = %q, want the result's warning %q", boundary.Warning, result.Warning)
+	}
+	if boundary.State == nil || boundary.State.Session.ID == "" || boundary.State.Session.ID == sourceID {
+		t.Fatalf("turn_action frame must carry the fork destination's state, got %#v", boundary.State)
+	}
 }
 
 type wailsTestFrame struct {

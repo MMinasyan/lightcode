@@ -180,6 +180,17 @@ func TestTurnActionAppliesDestinationStateThroughOrderedBoundary(t *testing.T) {
 	if snap > notice {
 		t.Fatal("turn_action handler must apply the snapshot before the skip notice")
 	}
+	// A fork's failed-code-revert warning rides the same frame: it is appended
+	// after the snapshot and the skip notice, or the snapshot replace clobbers
+	// it. The warning arrives only on the frame; the handler reads nothing off
+	// the returned value.
+	warn := strings.Index(handler, "showError(data.warning)")
+	if warn < 0 {
+		t.Fatal("turn_action handler must append a fork's failed-code-revert warning")
+	}
+	if warn < notice {
+		t.Fatal("turn_action handler must append the warning after the skip notice")
+	}
 	for _, fn := range []string{"async function handleFork(", "async function handleRevertHistory(", "async function handleRevertCode("} {
 		fnBody, ok := extractSvelteFunctionBody(svelte, fn)
 		if !ok {
@@ -187,6 +198,9 @@ func TestTurnActionAppliesDestinationStateThroughOrderedBoundary(t *testing.T) {
 		}
 		if strings.Contains(fnBody, "applySnapshot(") || strings.Contains(fnBody, "appendRevertSkipNotice(") {
 			t.Fatalf("%s must not apply state or notice out of band; the ordered turn_action frame is authoritative", fn)
+		}
+		if strings.Contains(fnBody, "result.warning") || strings.Contains(fnBody, "result?.warning") {
+			t.Fatalf("%s must not apply the warning out of band; the ordered turn_action frame is authoritative", fn)
 		}
 	}
 }

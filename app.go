@@ -580,12 +580,14 @@ func (a *App) handleEvent(ev agent.Event) {
 
 // turnActionBoundary is the ordered frame a fork, history revert, or code revert
 // appends through the delivery FIFO: the destination session's complete state (nil
-// when the action changed no session) plus any files a code revert kept unchanged.
-// The ordered consumer applies the state and the skip notice together, so no live
-// frame interleaves between them or clobbers the notice.
+// when the action changed no session), any files a code revert kept unchanged, and
+// the warning a fork carries when its best-effort code revert failed. The ordered
+// consumer applies the state, the skip notice, and the warning in that order, so no
+// live frame interleaves between them or clobbers either notice.
 type turnActionBoundary struct {
 	State        *agent.HydrationState    `json:"state"`
 	SkippedFiles []snapshot.SkippedRevert `json:"skippedFiles"`
+	Warning      string                   `json:"warning,omitempty"`
 }
 
 // emitTurnActionNotice appends a code revert's skip notice as an ordered notice-only
@@ -946,12 +948,13 @@ func (a *App) RevertCode(turn int) (snapshot.RevertResult, error) {
 
 // turnActionBoundaryEmit is the owner's in-commit callback for a session-changing
 // revert/fork: it commits routing current, then appends the destination's complete
-// state and any code-revert skip notice as one ordered boundary, so state and notice
-// apply together and no live frame interleaves between them.
-func (a *App) turnActionBoundaryEmit() func(agent.HydrationState, []snapshot.SkippedRevert) {
-	return func(state agent.HydrationState, skipped []snapshot.SkippedRevert) {
+// state, any code-revert skip notice, and a fork's failed-code-revert warning as one
+// ordered boundary, so state and notices apply together and no live frame
+// interleaves between them.
+func (a *App) turnActionBoundaryEmit() func(agent.HydrationState, []snapshot.SkippedRevert, string) {
+	return func(state agent.HydrationState, skipped []snapshot.SkippedRevert, warning string) {
 		a.setCurrentSessionID(state.Session.ID)
-		a.enqueueBoundary("turn_action", turnActionBoundary{State: &state, SkippedFiles: skipped}, "", state.Session.ID)
+		a.enqueueBoundary("turn_action", turnActionBoundary{State: &state, SkippedFiles: skipped, Warning: warning}, "", state.Session.ID)
 	}
 }
 

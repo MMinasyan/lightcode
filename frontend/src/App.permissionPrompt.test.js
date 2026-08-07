@@ -385,3 +385,46 @@ describe('App permission prompt on a boundary', () => {
     unmount(app);
   });
 });
+
+describe('App turn-action fork warning', () => {
+  it('a fork whose code revert failed shows the warning after the state and the kept-files notice are applied', async () => {
+    const { app, target } = await mountApp();
+
+    // The fork's state arrives as the ordered turn_action boundary, which
+    // replaces the transcript wholesale; the failed code revert's warning must
+    // ride that same frame and be appended after the state and the skip
+    // notice, or the replace clobbers it.
+    fire('turn_action', {
+      state: { ...navState(), session: { id: 's2' } },
+      skippedFiles: [{ path: 'x.txt', reason: 'outside session' }],
+      warning: 'forked, but the code revert failed: boom',
+    });
+    await tick();
+
+    // The destination state is applied...
+    expect(target.querySelector('.label.session').textContent).toBe('s2');
+    expect(target.querySelector('.message.user .plain').textContent).toBe('hello');
+    // ...then the kept-files notice, then the warning, in that order.
+    const order = [...target.querySelector('.message-list').children].map((el) => el.className);
+    const iUser = order.findIndex((c) => c.includes('message user'));
+    const iSys = order.findIndex((c) => c.includes('system-msg'));
+    const iErr = order.findIndex((c) => c.includes('error-msg'));
+    expect(iUser).toBeGreaterThanOrEqual(0);
+    expect(iSys).toBeGreaterThan(iUser);
+    expect(iErr).toBeGreaterThan(iSys);
+    expect(target.querySelector('.error-msg').textContent).toContain('code revert failed');
+
+    unmount(app);
+  });
+
+  it('a turn-action frame without a warning renders none', async () => {
+    const { app, target } = await mountApp();
+
+    fire('turn_action', { state: { ...navState(), session: { id: 's2' } }, skippedFiles: [] });
+    await tick();
+    expect(target.querySelector('.label.session').textContent).toBe('s2');
+    expect(target.querySelector('.error-msg')).toBeNull();
+
+    unmount(app);
+  });
+});

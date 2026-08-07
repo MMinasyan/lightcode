@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 // TestForkStagedPublication verifies fork publishes the new session
@@ -152,6 +153,48 @@ func TestForkStagedPublication(t *testing.T) {
 		}
 		if res.Session.ID == "" || res.Session.ID == sourceID || a.SessionCurrent().ID != res.Session.ID {
 			t.Fatalf("fork not current after best-effort revert: res=%q current=%q source=%q", res.Session.ID, a.SessionCurrent().ID, sourceID)
+		}
+		// The fork is published, so the result reports success; the failed
+		// best-effort revert still has to reach the user, as a warning on the
+		// result rather than as an error that would make the adapter treat the
+		// published fork as a failure.
+		if res.Warning == "" {
+			t.Fatal("fork with a failed code revert must report the failure in Warning")
+		}
+	})
+
+	// The desktop applies the fork's state from the ordered boundary the action
+	// publishes, never from the returned value, so the failed code revert's
+	// warning must ride that same frame: the in-commit emit callback carries it
+	// to the adapter's frame. A warning that only comes back on the result is
+	// clobbered when the boundary's snapshot replaces the transcript.
+	t.Run("revert_failure_warning_rides_boundary", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("directory permissions do not block writes as root")
+		}
+		a := newCatalogBackedTestAgent(t)
+		clicked := appendUserTurn(t, a, "fork point")
+		sub := filepath.Join(a.ProjectRoot(), "sub")
+		path := filepath.Join(sub, "created-after-fork.txt")
+		appendUserTurnWithSnapshot(t, a, "create after fork", path, "later\n")
+		sourceID := a.SessionCurrent().ID
+		if err := os.Chmod(sub, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Chmod(sub, 0o700)
+
+		var boundaryWarning string
+		res, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, clicked, TurnActionFork, true, func(hs HydrationState, _ []snapshot.SkippedRevert, warning string) {
+			boundaryWarning = warning
+		})
+		if err != nil {
+			t.Fatalf("best-effort code revert must not fail a committed fork: %v", err)
+		}
+		if res.Warning == "" {
+			t.Fatal("fork with a failed code revert must report the failure in Warning")
+		}
+		if boundaryWarning != res.Warning {
+			t.Fatalf("boundary warning = %q, want result warning %q", boundaryWarning, res.Warning)
 		}
 	})
 

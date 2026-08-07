@@ -409,16 +409,21 @@ type SessionPayload struct {
 
 // TurnActionResult is returned after a user-message revert/fork action.
 type TurnActionResult struct {
-	Action         string                   `json:"action"`
-	Turn           int                      `json:"turn"`
-	TargetTurn     int                      `json:"targetTurn"`
-	SessionChanged bool                     `json:"sessionChanged"`
-	Prefill        string                   `json:"prefill,omitempty"`
-	RestoredFiles  []string                 `json:"restoredFiles,omitempty"`
-	SkippedFiles   []snapshot.SkippedRevert `json:"skippedFiles,omitempty"`
-	Session        SessionSummary           `json:"session"`
-	Messages       []DisplayMessage         `json:"messages,omitempty"`
-	Tokens         TokenReport              `json:"tokens"`
+	Action         string `json:"action"`
+	Turn           int    `json:"turn"`
+	TargetTurn     int    `json:"targetTurn"`
+	SessionChanged bool   `json:"sessionChanged"`
+	Prefill        string `json:"prefill,omitempty"`
+	// Warning carries a best-effort failure that does not fail the action
+	// itself — the action committed and the result is success, but part of
+	// what the user asked for did not run. Adapters present it as an error
+	// line without treating the action as failed.
+	Warning       string                   `json:"warning,omitempty"`
+	RestoredFiles []string                 `json:"restoredFiles,omitempty"`
+	SkippedFiles  []snapshot.SkippedRevert `json:"skippedFiles,omitempty"`
+	Session       SessionSummary           `json:"session"`
+	Messages      []DisplayMessage         `json:"messages,omitempty"`
+	Tokens        TokenReport              `json:"tokens"`
 }
 
 // ModelInfo holds the active model identity and catalog metadata.

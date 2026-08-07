@@ -5572,11 +5572,11 @@ func (a *Agent) ApplyTurnActionForSession(sessionID string, turn int, action str
 // operation's own prebuilt result under the mutating lock — so the adapter performs no
 // separate postcommit capture of the mutated session. Code-only revert changes no
 // session and never calls emit.
-func (a *Agent) ApplyTurnActionForSessionWithBoundary(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert)) (TurnActionResult, error) {
+func (a *Agent) ApplyTurnActionForSessionWithBoundary(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string)) (TurnActionResult, error) {
 	return a.applyTurnActionResolved(sessionID, turn, action, alsoRevertCode, emit)
 }
 
-func (a *Agent) applyTurnActionResolved(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert)) (TurnActionResult, error) {
+func (a *Agent) applyTurnActionResolved(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string)) (TurnActionResult, error) {
 	defer a.lockLifecycle()()
 	unit, err := a.resolveRootDriveSession(sessionID)
 	if err != nil {
@@ -5588,15 +5588,16 @@ func (a *Agent) applyTurnActionResolved(sessionID string, turn int, action strin
 // emitTurnActionBoundaryLocked publishes a revert/fork result as an in-commit boundary
 // while runtime.mu is held: the committed prefix is the result's prebuilt Messages, so
 // this captures only the live classes and appends the boundary under their locks. The
-// code-revert skips ride the boundary so the adapter reassembles its combined frame.
-// maxDurableTurn is the highest durable turn the result's Messages were read from, so
-// the locked capture can drop a retained tail the durable half already covers.
-func (a *Agent) emitTurnActionBoundaryLocked(unit *session, result TurnActionResult, maxDurableTurn int, emit func(HydrationState, []snapshot.SkippedRevert)) {
+// code-revert skips and a fork's failed-code-revert warning ride the boundary so the
+// adapter reassembles its combined frame. maxDurableTurn is the highest durable turn
+// the result's Messages were read from, so the locked capture can drop a retained tail
+// the durable half already covers.
+func (a *Agent) emitTurnActionBoundaryLocked(unit *session, result TurnActionResult, maxDurableTurn int, emit func(HydrationState, []snapshot.SkippedRevert, string)) {
 	if emit == nil || unit == nil {
 		return
 	}
 	a.captureUnderLocksRTHeld(unit, result.Messages, sessionIDOf(unit), maxDurableTurn, nil, func(cs completeState) {
-		emit(hydrationStateFrom(result.Session, cs), result.SkippedFiles)
+		emit(hydrationStateFrom(result.Session, cs), result.SkippedFiles, result.Warning)
 	})
 }
 
@@ -5630,7 +5631,7 @@ func (a *Agent) reserveTurnActionUnit(unit *session) (func(), error) {
 	return release, nil
 }
 
-func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert)) (TurnActionResult, error) {
+func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string)) (TurnActionResult, error) {
 	// The revert cases reserve the unit across their durable mutation with the
 	// same reservation pair the removal path uses: the unit must not be
 	// driveable while its loop state and its durable history disagree (history
@@ -5764,7 +5765,7 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 			}
 			release = nil
 			if emit != nil {
-				emit(HydrationState{}, nil)
+				emit(HydrationState{}, nil, "")
 			}
 			result, _ = a.populateTurnActionResultForSession(unit, result)
 			if revertErr != nil {
@@ -5815,7 +5816,7 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 // store, which retains the post-target snapshots needed to undo later changes:
 // a revert error keeps the partial result rather than failing the
 // already-committed fork.
-func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert)) (TurnActionResult, error) {
+func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string)) (TurnActionResult, error) {
 	result := TurnActionResult{Action: TurnActionFork, Turn: turn}
 	result.TargetTurn = turn
 	result.SessionChanged = true
@@ -5841,7 +5842,10 @@ func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool
 		result.RestoredFiles = revertResult.Restored
 		result.SkippedFiles = revertResult.Skipped
 		if revertErr != nil {
-			fmt.Fprintf(os.Stderr, "lightcode: fork code revert: %v\n", revertErr)
+			// The fork is published and stays successful; the revert is the
+			// only part that failed, so it rides the result and the in-commit
+			// boundary frame as a warning the adapters can show.
+			result.Warning = fmt.Sprintf("forked, but the code revert failed: %v", revertErr)
 		}
 	}
 	a.emitTurnActionBoundaryLocked(candidate, result, maxDurableTurn, emit)

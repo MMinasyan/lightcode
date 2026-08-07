@@ -959,7 +959,7 @@ func (r *Runner) handleTurnAction(req Request, action string) {
 	}
 	// The owner publishes the session-changing revert/fork boundary in-commit before
 	// the response; a code-only revert changes no session and emits nothing.
-	result, err := r.agent.ApplyTurnActionForSessionWithBoundary(sessionID, params.Turn, action, params.AlsoRevertCode, func(state agent.HydrationState, _ []snapshot.SkippedRevert) {
+	result, err := r.agent.ApplyTurnActionForSessionWithBoundary(sessionID, params.Turn, action, params.AlsoRevertCode, func(state agent.HydrationState, _ []snapshot.SkippedRevert, _ string) {
 		id := strings.TrimSpace(state.Session.ID)
 		r.setCurrent(id, state.Session)
 		r.sendBoundary(Notification{

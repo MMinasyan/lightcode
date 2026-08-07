@@ -748,6 +748,11 @@ func (c *CLI) showRevertMenu() error {
 		}
 		c.refreshSession()
 		c.printRevertSkipped(result)
+		// The fork committed; only the best-effort code revert may have
+		// failed, which the result carries as a warning on the success path.
+		if result.Warning != "" {
+			c.printLine(renderErrorMsg(result.Warning))
+		}
 
 	case "back":
 	}

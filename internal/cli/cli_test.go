@@ -2994,6 +2994,89 @@ func TestCLIRunShutdownContract(t *testing.T) {
 			t.Fatalf("source session changed on a failed confirmation read: %v", after)
 		}
 	})
+
+	t.Run("fork_revert_failure_reports_warning_on_success", func(t *testing.T) {
+		// Exception, recorded per the contract-test rule: Run cannot be driven
+		// in a test (term.MakeRaw on os.Stdin requires a real TTY), so the
+		// command chain is driven through handleKeyIdle — the key handler
+		// mainLoop calls — with an injected key source. A fork whose
+		// best-effort code revert fails is still a successful fork: the menu
+		// switches to the fork and the failure must reach the user as a
+		// warning on the success path, not as the operation's error.
+		if os.Geteuid() == 0 {
+			t.Skip("directory permissions do not block writes as root")
+		}
+		a, _ := newTestAgent(t)
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		if _, err := a.AppendUserMessage("fork point"); err != nil {
+			t.Fatalf("seed fork point: %v", err)
+		}
+		sub := filepath.Join(a.ProjectRoot(), "sub")
+		path := filepath.Join(sub, "created-after-fork.txt")
+		if err := os.MkdirAll(sub, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		turn, err := a.AppendUserMessage("create after fork")
+		if err != nil {
+			t.Fatalf("seed snapshot turn: %v", err)
+		}
+		entryID, _, err := a.Store().SnapshotResolvedEntry(turn, path, path)
+		if err != nil {
+			t.Fatalf("snapshot entry: %v", err)
+		}
+		if err := os.WriteFile(path, []byte("later\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Store().RecordSnapshotContent(turn, entryID, []byte("later\n")); err != nil {
+			t.Fatalf("record snapshot content: %v", err)
+		}
+		sourceID := a.SessionCurrent().ID
+		if err := os.Chmod(sub, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = os.Chmod(sub, 0o700) }()
+
+		c := New(a)
+		c.setCurrentSessionID(sourceID)
+		var out bytes.Buffer
+		c.out = &out
+
+		// Select the seeded turn, choose "Fork from here", and answer the
+		// code confirmation with Yes.
+		keys := []keyMsg{
+			{Special: keyEnter},
+			{Special: keyDown},
+			{Special: keyDown},
+			{Special: keyEnter},
+			{Special: keyEnter},
+		}
+		next := 0
+		c.readKeyFn = func() (keyMsg, error) {
+			if next < len(keys) {
+				k := keys[next]
+				next++
+				return k, nil
+			}
+			return keyMsg{}, fmt.Errorf("unexpected key read")
+		}
+
+		c.input.Set("/fork")
+		if err := c.handleKeyIdle(keyMsg{Special: keyEnter}); err != nil {
+			t.Fatalf("handleKeyIdle: %v", err)
+		}
+
+		// The fork is published and selected; the failed code revert is
+		// reported as a warning on that success path.
+		forkID := a.SessionCurrent().ID
+		if forkID == "" || forkID == sourceID {
+			t.Fatalf("fork current = %q, source %q", forkID, sourceID)
+		}
+		if !strings.Contains(out.String(), "code revert failed") {
+			t.Fatalf("failed code revert warning not shown in output:\n%s", out.String())
+		}
+	})
 }
 
 // TestCLIRestoreTerminalUnblockedByStalledWrite proves restoreTerminal only

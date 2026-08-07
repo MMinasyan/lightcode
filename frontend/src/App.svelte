@@ -354,12 +354,14 @@
     // queue, warnings, permissions). An empty state is a detach.
     EventsOn('navigation', buffered((data) => { applySnapshot(data); }));
 
-    // A turn-action boundary carries the fork/revert destination's complete state
-    // and any code-revert skip notice as one ordered frame; applying the snapshot
-    // and appending the notice together keeps the notice from being clobbered.
+    // A turn-action boundary carries the fork/revert destination's complete state,
+    // any code-revert skip notice, and a fork's failed-code-revert warning as one
+    // ordered frame; applying the snapshot and appending the notices together in
+    // that order keeps either notice from being clobbered by the replace.
     EventsOn('turn_action', buffered((data) => {
       applySnapshot(data?.state);
       appendRevertSkipNotice({ skippedFiles: data?.skippedFiles });
+      if (data?.warning) showError(data.warning);
     }));
 
     // A root-model item carries the committed model tagged with the root it
@@ -567,8 +569,9 @@
   async function handleFork(e) {
     const { turn, alsoRevertCode } = e.detail;
     try {
-      // The backend appends the forked session's complete state and any skip
-      // notice as one ordered turn_action boundary; nothing is applied here.
+      // The backend appends the forked session's complete state, any skip
+      // notice, and a failed code revert's warning as one ordered turn_action
+      // frame; nothing is applied here.
       await ApplyTurnAction(turn, 'fork', !!alsoRevertCode);
     }
     catch (err) { showError(err); }
