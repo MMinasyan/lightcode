@@ -2048,9 +2048,7 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 		// Arm the marker fault at the turn the parked drain just began. Then
 		// drive the concurrent message through the real submit path: the drain
 		// holds the claim (busy), so the submit enqueues, and the requeue must
-		// prepend the remainder ahead of it. The submit nudges the drainer;
-		// the settle sleep lets it consume the wake while the drain is still
-		// parked and busy, so it cannot re-drain after the abort.
+		// prepend the remainder ahead of it. The submit nudges the drainer.
 		failTurn := unit.store.CurrentTurn()
 		if failTurn == 0 {
 			t.Fatalf("drain did not begin a preseed turn before parking")
@@ -2066,6 +2064,16 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 		}
 		t.Cleanup(clearFault)
 
+		// Install the drain-pass hook before the submit that nudges the
+		// drainer. The settle below waits on it: once the background drainer
+		// has completed the pass its wake triggered, it is back waiting on
+		// the wake and cannot re-drain until the test nudges it again. The
+		// hook is one-shot, so the later explicit nudge's pass cannot signal
+		// into the same channel.
+		passDone := make(chan struct{})
+		var passOnce sync.Once
+		rt.queueDrainPassHook = func() { passOnce.Do(func() { close(passDone) }) }
+
 		res, err := a.SubmitToSession(ctx, id, "meanwhile")
 		if err != nil {
 			t.Fatalf("SubmitToSession meanwhile: %v", err)
@@ -2076,17 +2084,20 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 		if len(res.Queue) != 1 || res.Queue[0].Content != "meanwhile" {
 			t.Fatalf("submit snapshot = %#v, want one enqueued meanwhile item", res.Queue)
 		}
-		// Wait until the background drainer has consumed the submit's wake
-		// token while the drain is still parked and busy instead of a fixed
-		// sleep: the token is what could wake a re-drain once the abort
-		// clears busy, so once it is gone no launch can follow the marker
-		// failure until the test nudges the drainer again.
-		wakeDeadline := time.Now().Add(15 * time.Second)
-		for time.Now().Before(wakeDeadline) && len(rt.queueWake) != 0 {
-			time.Sleep(2 * time.Millisecond)
-		}
-		if len(rt.queueWake) != 0 {
-			t.Fatal("background drainer did not consume the wake token while the drain was parked")
+		// Wait until the background drainer has completed the pass the
+		// submit's wake triggered while the drain is still parked and busy.
+		// The wake token alone proves only that the receive happened: a
+		// drainer descheduled between consuming the token and attempting its
+		// claim would find the unit drainable once the abort clears busy and
+		// re-drain the requeued remainder, which the case requires not to
+		// happen until the explicit nudge below. The hook fires only after
+		// the pass returns — whether it took the claim or found the unit busy
+		// — so no launch can follow the marker failure until the test nudges
+		// the drainer again.
+		select {
+		case <-passDone:
+		case <-time.After(15 * time.Second):
+			t.Fatal("background drainer did not finish its pass while the drain was parked")
 		}
 
 		tr.seqMu.Unlock()

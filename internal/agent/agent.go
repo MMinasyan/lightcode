@@ -2850,6 +2850,13 @@ func (rt *runtime) runQueueDrainer(ctx context.Context) {
 				return
 			}
 			rt.tryDrainQueue(ctx)
+			// The pass has completed, whether it took the claim or found the
+			// unit busy and returned. The test seam observes exactly that
+			// fact; firing at the token receive would leave the descheduled
+			// window between the receive and the claim unobserved.
+			if rt.queueDrainPassHook != nil {
+				rt.queueDrainPassHook()
+			}
 		case <-ctx.Done():
 			return
 		}

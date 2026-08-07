@@ -61,6 +61,13 @@ type runtime struct {
 	queueWake    chan struct{}
 	signalSink   agentSignalSink
 
+	// queueDrainPassHook is a test seam invoked after each queue drain pass
+	// returns and before the drainer waits for its next wake, outside any
+	// lock. The seam is nil in production; tests swap it to observe that a
+	// pass completed — whether it took the claim or found the unit busy and
+	// returned — which the wake token alone does not prove.
+	queueDrainPassHook func()
+
 	eventMu sync.RWMutex
 	onEvent func(Event)
 
