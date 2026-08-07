@@ -1159,6 +1159,70 @@ func TestCLIExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
 	}
 }
 
+// TestCLISubmitResolvesTargetAtEnter proves the submit target is resolved when
+// the submit is admitted, not when the op goroutine happens to run: a session
+// switch that lands while the op is blocked cannot redirect the text to the new
+// session. Built on the read-only fixture: the held session is routing current,
+// the submit is blocked in the op-group, the switch commits the source session,
+// and the submit must still name the held session.
+func TestCLISubmitResolvesTargetAtEnter(t *testing.T) {
+	first, second := newTestAgentPair(t)
+	c := New(second)
+	out := new(bytes.Buffer)
+	c.out = out
+	rec := &recordingSubmitAdapter{AdapterService: second}
+	c.agent = rec
+	source, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession source: %v", err)
+	}
+	heldID, err := first.NewSessionForProjectPath(c.scope.ProjectPath(), "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath held: %v", err)
+	}
+	if _, err := first.AppendUserMessageToSession(heldID, "durable from the driving owner"); err != nil {
+		t.Fatalf("append durable message: %v", err)
+	}
+	c.setCurrentSessionID(source)
+
+	// The session menu opens the held session read-only.
+	selectSessionByID(t, c, heldID)
+	dispatchSelection(t, c, "/session", "")
+	if !c.sv().IsReadOnly(heldID) {
+		t.Fatal("held session not marked read-only after the menu open")
+	}
+
+	// Block the op before the submit body runs, commit the source session, then
+	// release: the target was fixed when the submit was admitted, so the text
+	// still names the held session.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	c.spawnOpHook = func() {
+		close(entered)
+		<-release
+	}
+	c.ctx = context.Background()
+	c.submitToBackend("hi")
+	<-entered
+	c.setCurrentSessionID(source)
+	close(release)
+	c.opWG.Wait()
+	c.drainEvents()
+
+	if got, _ := c.currentSession(); got != source {
+		t.Fatalf("current after the switch = %q, want %q", got, source)
+	}
+	if len(rec.submitted) != 1 || rec.submitted[0] != heldID {
+		t.Fatalf("submit target = %#v, want the held session %q resolved at Enter", rec.submitted, heldID)
+	}
+	// The read-only classification is captured at Enter with the id, so the
+	// failure the user sees after the switch still names the contention on the
+	// session that was current then, not the owner's "unknown session" refusal.
+	if !strings.Contains(out.String(), fmt.Sprintf("session %q is being driven by another process", heldID)) {
+		t.Fatalf("submit failure after the switch = %q, want the contention message naming the held session", out.String())
+	}
+}
+
 // selectionCLI builds a CLI over a fresh agent with one source session
 // selected and its output captured.
 func selectionCLI(t *testing.T) (*agent.Agent, *CLI, *bytes.Buffer, string) {
@@ -1973,6 +2037,19 @@ type recordingPermissionAdapter struct {
 func (r *recordingPermissionAdapter) RespondPermissionActionForSession(sessionID, id, action string) error {
 	r.answers = append(r.answers, action)
 	return r.AdapterService.RespondPermissionActionForSession(sessionID, id, action)
+}
+
+// recordingSubmitAdapter wraps the real agent and records the session each
+// submit names, so a test can assert which session a submit targeted without
+// inferring it from the agent's state.
+type recordingSubmitAdapter struct {
+	agent.AdapterService
+	submitted []string
+}
+
+func (r *recordingSubmitAdapter) SubmitToSession(ctx context.Context, sessionID, content string) (agent.SubmitResult, error) {
+	r.submitted = append(r.submitted, sessionID)
+	return r.AdapterService.SubmitToSession(ctx, sessionID, content)
 }
 
 func newTestAgentWithBaseURL(t *testing.T, baseURL string) (*agent.Agent, string) {

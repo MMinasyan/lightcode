@@ -53,7 +53,10 @@ type CLI struct {
 	input     *inputLine
 	history   inputHistory
 	readKeyFn func() (keyMsg, error)
-	ctx       context.Context
+	// spawnOpHook is a test-only seam invoked at the top of each op-group
+	// goroutine before the op body runs; nil in production.
+	spawnOpHook func()
+	ctx         context.Context
 
 	// Exit latch: requestExit stores the exit error and closes exitLatch once. Every
 	// key read (mainLoop and nested menus) and mainLoop's select observe it, so a
@@ -212,6 +215,9 @@ func (c *CLI) spawnOp(fn func()) bool {
 	c.opMu.Unlock()
 	go func() {
 		defer c.opWG.Done()
+		if c.spawnOpHook != nil {
+			c.spawnOpHook()
+		}
 		fn()
 	}()
 	return true
@@ -1637,15 +1643,20 @@ func (c *CLI) submitInputLocked(text string) {
 }
 
 // submitToBackend routes input through the agent's single Submit entry point.
-// The agent decides whether to start a turn or enqueue and emits queue_changed;
-// the CLI does not own the queue. On error it renders the message and, if idle,
-// restores the input prompt. Runs the call off the lock in a goroutine.
+// The target session and its read-only classification are resolved before the
+// op is admitted, so a session switch handled between Enter and the op running
+// can neither redirect the text to the new session nor change which failure
+// the submit reports. The agent decides whether to start a turn or enqueue and
+// emits queue_changed; the CLI does not own the queue. On error it renders the
+// message and, if idle, restores the input prompt. The submit runs off the lock
+// in the op-group goroutine.
 func (c *CLI) submitToBackend(text string) {
+	sessionID, err := c.currentSession()
+	readOnly := err == nil && c.sv().IsReadOnly(sessionID)
 	c.spawnOp(func() {
-		sessionID, err := c.currentSession()
 		if err == nil {
 			_, err = c.agent.SubmitToSession(c.ctx, sessionID, text)
-			if err != nil && c.sv().IsReadOnly(sessionID) {
+			if err != nil && readOnly {
 				// The session is read-only: another process drives it, so the
 				// owner refuses it as unknown. Say what is actually wrong.
 				err = agent.SessionContendedError(sessionID)
