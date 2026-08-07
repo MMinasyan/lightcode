@@ -217,6 +217,14 @@ func (rt *runtime) flushAndCommitTranscript(sessionID string, turn int) {
 	if rt == nil {
 		return
 	}
+	// Turn numbers begin at 1, so a call naming turn 0 names a turn that was
+	// never begun — BeginTurn returns 0 only for an inactive session. Feeding
+	// EventTurnEnd{Turn: 0} would drive commitLocked(0), wiping the tail and
+	// regressing the committed markers. Return before the flush and before
+	// feeding EventTurnEnd: the flush exists only to make the commit correct.
+	if turn == 0 {
+		return
+	}
 	done := make(chan struct{})
 	select {
 	case rt.loopFlush <- done:
