@@ -2000,8 +2000,14 @@ func (a *Agent) publishCompactionRewrite(unit *session, sessionID, projectID str
 	// error that survives the compaction disposition stays on screen after the
 	// rewrite instead of vanishing until a full hydration.
 	messages := append([]DisplayMessage(nil), committed...)
-	messages = append(messages, mergeLiveRowsLocked(tr.tailSnapshotLocked(), tr.errorSnapshotLocked())...)
-	payload := SessionPayload{Session: summary, Messages: messages, Tokens: tokens}
+	live := mergeLiveRowsLocked(tr.tailSnapshotLocked(), tr.errorSnapshotLocked())
+	messages = append(messages, live...)
+	payload := SessionPayload{
+		Session:       summary,
+		Messages:      messages,
+		Tokens:        tokens,
+		AssistantOpen: tr.assistantSpanOpenLocked(live),
+	}
 	a.emitEvent(Event{Kind: EventSessionRewrite, SessionID: sessionID, ProjectID: projectID, RewritePayload: &payload})
 	tr.seqMu.Unlock()
 }
@@ -5258,11 +5264,13 @@ func captureTranscriptLocked(tr *transcript, committed []DisplayMessage, maxDura
 		}
 		tail = nil
 	}
+	errors := tr.errorSnapshotLocked()
 	return completeTranscript{
-		committed: committed,
-		tail:      tail,
-		errors:    tr.errorSnapshotLocked(),
-		revision:  rev,
+		committed:     committed,
+		tail:          tail,
+		errors:        errors,
+		revision:      rev,
+		assistantOpen: tr.assistantSpanOpenLocked(mergeLiveRowsLocked(tail, errors)),
 	}, true
 }
 

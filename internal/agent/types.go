@@ -401,6 +401,10 @@ type SessionPayload struct {
 	Session  SessionSummary   `json:"session"`
 	Messages []DisplayMessage `json:"messages"`
 	Tokens   TokenReport      `json:"tokens"`
+	// AssistantOpen reports whether the last message is an assistant span
+	// still open in the producer, so the desktop view continues it instead of
+	// opening a second row.
+	AssistantOpen bool `json:"assistantOpen"`
 }
 
 // TurnActionResult is returned after a user-message revert/fork action.

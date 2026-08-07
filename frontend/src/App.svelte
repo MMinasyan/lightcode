@@ -170,8 +170,8 @@
     if ((data.session?.id || '') !== sessionId) return;
     tokens = data.tokens || defaultTokens();
     messages = rebuildFromHistory(data.messages || []);
-    streamingIdx = -1;
     gate = { highWater: 0 };
+    continueStreamingRow(data.assistantOpen);
   }
 
   // applySnapshot renders one complete-state hydration as the whole live view and
@@ -196,7 +196,7 @@
     sessionId = destinationId;
     messages = rebuildFromHistory(snapshotMessages(hs));
     gate = newTranscriptGate(hs);
-    streamingIdx = -1;
+    continueStreamingRow(hs.assistantOpen);
     tokens = hs.tokens || defaultTokens();
     busy = !!hs.busy;
     compacting = !!hs.compacting;
@@ -239,6 +239,25 @@
     pendingFrames = [];
     hydrated = true;
     for (const replay of buffered) replay();
+  }
+
+  // continueStreamingRow resumes a turn that was streaming when a snapshot or
+  // resync boundary was captured: when the published fact is true and the last
+  // rebuilt row is an assistant row, point the streaming index at it and mark
+  // it partial, so the next token extends that row instead of opening a second
+  // one. The published fact is the signal; the row-type check is a structural
+  // guard. The index is set whenever the row is marked, or the partial flag
+  // would be nothing the finalisation can clear; the array is reassigned when
+  // it is marked so the view reacts.
+  function continueStreamingRow(assistantOpen) {
+    const lastRow = messages[messages.length - 1];
+    if (assistantOpen && lastRow && lastRow.type === 'assistant') {
+      streamingIdx = messages.length - 1;
+      messages[streamingIdx] = { ...messages[streamingIdx], partial: true };
+      messages = messages;
+    } else {
+      streamingIdx = -1;
+    }
   }
 
   function closeStreaming() {
@@ -360,8 +379,16 @@
     EventsOn('turn_start', buffered((data) => {
       if (!snapshotApplied) return;
       busy = true;
-      streamingIdx = -1;
-      if (data?.turn) currentTurn = data.turn;
+      const turn = data?.turn || 0;
+      // A turn start names the turn its rows carry. A continuation's row
+      // already names the same turn, so a same-turn start replayed from the
+      // hydration buffer must not disturb it; a different turn closes it
+      // through the close helper. The comparison reads the row's turn before
+      // the arriving turn overwrites the current-turn tracking.
+      if (streamingIdx !== -1 && messages[streamingIdx] && messages[streamingIdx].turn !== turn) {
+        closeStreaming();
+      }
+      if (turn) currentTurn = turn;
     }));
 
     EventsOn('turn_end', buffered((data) => {

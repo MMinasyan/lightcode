@@ -480,6 +480,7 @@ export namespace agent {
 	    warnings: PromptWarning[];
 	    permissions: permission.Request[];
 	    readOnly: boolean;
+	    assistantOpen: boolean;
 
 	    static createFrom(source: any = {}) {
 	        return new HydrationState(source);
@@ -500,6 +501,7 @@ export namespace agent {
 	        this.warnings = this.convertValues(source["warnings"], PromptWarning);
 	        this.permissions = this.convertValues(source["permissions"], permission.Request);
 	        this.readOnly = source["readOnly"];
+	        this.assistantOpen = source["assistantOpen"];
 	    }
 
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

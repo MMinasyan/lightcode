@@ -46,6 +46,10 @@ type HydrationState struct {
 	// the durable transcript as of the read, and nothing live. The adapter
 	// must not admit a new turn against it.
 	ReadOnly bool `json:"readOnly"`
+	// AssistantOpen reports whether the last row the snapshot carries is an
+	// assistant span still open in the producer, so the desktop root view
+	// continues it instead of opening a second row.
+	AssistantOpen bool `json:"assistantOpen"`
 }
 
 // HydrateSession captures a session's complete live state for an adapter to apply
@@ -178,8 +182,9 @@ func (a *Agent) captureLiveChildSession(sessionID string, e *transcriptCursor) (
 
 func hydrationStateFrom(summary SessionSummary, cs completeState) HydrationState {
 	hs := HydrationState{
-		Session:  summary,
-		Messages: cs.transcript.committed,
+		Session:       summary,
+		Messages:      cs.transcript.committed,
+		AssistantOpen: cs.transcript.assistantOpen,
 		Cursor: HydrationCursor{
 			CommittedTurn: cs.transcript.revision.committedTurn,
 			CommittedSeq:  cs.transcript.revision.committedSeq,

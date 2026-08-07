@@ -1379,6 +1379,171 @@ func TestCompactionRewriteCarriesRetainedErrors(t *testing.T) {
 	}
 }
 
+// TestHydrationAssistantSpanFact verifies the hydration state publishes whether
+// the last row is an open assistant span — the fact the desktop root view uses
+// to continue a turn that was streaming when the snapshot was captured — and
+// that the fact is computed from the rows the snapshot actually carries rather
+// than copied from the coordinator's running flag: a capture that dropped a
+// duplicate tail, or one whose last row is a completed durable answer, must
+// publish false even while the coordinator's span is open.
+func TestHydrationAssistantSpanFact(t *testing.T) {
+	// The span is open while a text delta streamed and no boundary closed it.
+	t.Run("span=open", func(t *testing.T) {
+		a := newLiveCatalogBackedTestAgent(t)
+		unit := a.session
+		id := sessionIDOf(unit)
+		tr := a.transcriptForSessionID(id)
+		feedTranscript(tr, Event{Kind: EventTurnStart, SessionID: id, ProjectID: unit.projectID, Turn: 1})
+		feedTranscript(tr, Event{Kind: EventTextDelta, SessionID: id, Result: "streaming"})
+		hs, err := a.HydrateSession(id)
+		if err != nil {
+			t.Fatalf("HydrateSession: %v", err)
+		}
+		if !hs.AssistantOpen {
+			t.Fatal("assistantOpen = false, want true while the assistant span is open")
+		}
+	})
+
+	// Any boundary that closes the span reads false: a tool start after the
+	// text row closes it even though the tail still holds the assistant row.
+	t.Run("span=closed_by_tool_start", func(t *testing.T) {
+		a := newLiveCatalogBackedTestAgent(t)
+		unit := a.session
+		id := sessionIDOf(unit)
+		tr := a.transcriptForSessionID(id)
+		feedTranscript(tr, Event{Kind: EventTurnStart, SessionID: id, ProjectID: unit.projectID, Turn: 1})
+		feedTranscript(tr, Event{Kind: EventTextDelta, SessionID: id, Result: "streaming"})
+		feedTranscript(tr, Event{Kind: EventToolCallStart, SessionID: id, ToolCallID: "t1", ToolName: "x"})
+		hs, err := a.HydrateSession(id)
+		if err != nil {
+			t.Fatalf("HydrateSession: %v", err)
+		}
+		if hs.AssistantOpen {
+			t.Fatal("assistantOpen = true, want false after the boundary that closed the span")
+		}
+	})
+
+	// The duplicate window: a turn whose completion marker is durable while its
+	// commit has not run. The capture drops the retained tail as a duplicate of
+	// the durable half, so the snapshot carries no open row: the fact must be
+	// false even though the coordinator's span is still open.
+	t.Run("span=tail_dropped_as_duplicate", func(t *testing.T) {
+		a := newLiveCatalogBackedTestAgent(t)
+		unit := a.session
+		id := sessionIDOf(unit)
+		tr := a.transcriptForSessionID(id)
+
+		turn := unit.store.BeginTurn()
+		feedTranscript(tr, Event{Kind: EventTurnStart, SessionID: id, ProjectID: unit.projectID, Turn: turn})
+		feedTranscript(tr, Event{Kind: EventUserMessageDisplay, SessionID: id, Turn: turn, Result: "root window"})
+		feedTranscript(tr, Event{Kind: EventTextDelta, SessionID: id, Result: "root reply"})
+		for _, m := range []message.Message{
+			message.NewText(message.RoleUser, "root window"),
+			message.NewText(message.RoleAssistant, "root reply"),
+		} {
+			data, err := json.Marshal(m)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if err := unit.store.AppendMessage(turn, data); err != nil {
+				t.Fatalf("AppendMessage: %v", err)
+			}
+		}
+		if err := unit.store.MarkTurnComplete(turn); err != nil {
+			t.Fatalf("MarkTurnComplete: %v", err)
+		}
+
+		hs, err := a.HydrateSession(id)
+		if err != nil {
+			t.Fatalf("HydrateSession: %v", err)
+		}
+		if hs.AssistantOpen {
+			t.Fatal("assistantOpen = true, want false for a capture that dropped the duplicate tail")
+		}
+	})
+
+	// A completed turn that committed in the coordinator leaves no live rows:
+	// the snapshot's last row is the durable assistant answer, which nothing
+	// is streaming into.
+	t.Run("span=last_row_completed_answer", func(t *testing.T) {
+		a := newLiveCatalogBackedTestAgent(t)
+		unit := a.session
+		id := sessionIDOf(unit)
+		tr := a.transcriptForSessionID(id)
+
+		turn := unit.store.BeginTurn()
+		feedTranscript(tr, Event{Kind: EventTurnStart, SessionID: id, ProjectID: unit.projectID, Turn: turn})
+		feedTranscript(tr, Event{Kind: EventUserMessageDisplay, SessionID: id, Turn: turn, Result: "question"})
+		feedTranscript(tr, Event{Kind: EventTextDelta, SessionID: id, Result: "answer"})
+		for _, m := range []message.Message{
+			message.NewText(message.RoleUser, "question"),
+			message.NewText(message.RoleAssistant, "answer"),
+		} {
+			data, err := json.Marshal(m)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if err := unit.store.AppendMessage(turn, data); err != nil {
+				t.Fatalf("AppendMessage: %v", err)
+			}
+		}
+		if err := unit.store.MarkTurnComplete(turn); err != nil {
+			t.Fatalf("MarkTurnComplete: %v", err)
+		}
+		feedTranscript(tr, Event{Kind: EventTurnEnd, SessionID: id, ProjectID: unit.projectID, Turn: turn})
+
+		hs, err := a.HydrateSession(id)
+		if err != nil {
+			t.Fatalf("HydrateSession: %v", err)
+		}
+		if len(hs.Messages) == 0 || hs.Messages[len(hs.Messages)-1].Type != "assistant" {
+			t.Fatalf("fixture: snapshot must end with the completed assistant answer, got %+v", hs.Messages)
+		}
+		if hs.AssistantOpen {
+			t.Fatal("assistantOpen = true, want false when the last row is a completed durable answer")
+		}
+	})
+}
+
+// TestResyncPayloadCarriesAssistantSpanFact verifies the compaction rewrite
+// payload publishes the same open-assistant-span fact the hydration state
+// carries, computed from the rows the payload carries, so the desktop view
+// continues a turn that was streaming when the rewrite boundary landed.
+func TestResyncPayloadCarriesAssistantSpanFact(t *testing.T) {
+	a := newLiveCatalogBackedTestAgent(t)
+	unit := a.session
+	id := sessionIDOf(unit)
+	tr := a.transcriptForSessionID(id)
+
+	var rewrite Event
+	a.SetEventHandler(func(ev Event) {
+		if ev.Kind == EventSessionRewrite {
+			rewrite = ev
+		}
+	})
+
+	a.feedAndEmit(tr, Event{Kind: EventTurnStart, SessionID: id, ProjectID: unit.projectID, Turn: 1})
+	a.feedAndEmit(tr, Event{Kind: EventTextDelta, SessionID: id, Result: "streaming"})
+	a.publishCompactionRewrite(unit, id, unit.projectID, 1, SessionSummary{}, nil)
+	if rewrite.RewritePayload == nil {
+		t.Fatal("rewrite boundary not emitted")
+	}
+	if !rewrite.RewritePayload.AssistantOpen {
+		t.Fatal("resync assistantOpen = false, want true while the assistant span is open")
+	}
+
+	// A boundary that closes the span is carried as false.
+	a.feedAndEmit(tr, Event{Kind: EventToolCallStart, SessionID: id, ProjectID: unit.projectID, ToolCallID: "t1", ToolName: "x"})
+	rewrite = Event{}
+	a.publishCompactionRewrite(unit, id, unit.projectID, 1, SessionSummary{}, nil)
+	if rewrite.RewritePayload == nil {
+		t.Fatal("rewrite boundary not emitted")
+	}
+	if rewrite.RewritePayload.AssistantOpen {
+		t.Fatal("resync assistantOpen = true, want false after the boundary that closed the span")
+	}
+}
+
 // TestTranscriptCoordinatorCommit verifies the commit cursor partitions
 // state exactly: a committed turn clears the retained tail and advances the
 // committed markers to the sequence high-water, later preseeds keep sequence

@@ -258,6 +258,12 @@ type completeTranscript struct {
 	tail      []tailRow
 	errors    []errorRow
 	revision  captureRevision
+	// assistantOpen reports whether the last row the payload carries is an
+	// open assistant span, computed under seqMu from the rows the capture
+	// actually carries. It is published on the hydration state and the resync
+	// payload so a consumer can continue a turn that was streaming when the
+	// boundary was captured.
+	assistantOpen bool
 }
 
 // tailSnapshotLocked returns a copy of the retained tail preserving sequence.
@@ -299,4 +305,18 @@ func mergeLiveRowsLocked(tail []tailRow, errors []errorRow) []DisplayMessage {
 		}
 	}
 	return live
+}
+
+// assistantSpanOpenLocked reports whether the last row of live is an open
+// assistant span: the coordinator's text span is open and the span's row is
+// still among the retained rows the payload carries. live is the capture's
+// merged live rows — the retained tail after the duplicate-tail disposition
+// plus the retained errors ordered by sequence — so a capture that dropped a
+// duplicate tail carries no open row and reads false, and a span closed by any
+// boundary reads false. The caller holds seqMu.
+func (t *transcript) assistantSpanOpenLocked(live []DisplayMessage) bool {
+	if !t.textOpen || len(live) == 0 {
+		return false
+	}
+	return live[len(live)-1].Type == "assistant"
 }

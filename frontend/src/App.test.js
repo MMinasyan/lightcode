@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { runInNewContext } from 'node:vm';
-import { snapshotMessages, newTranscriptGate } from './lib/hydration.js';
+import { snapshotMessages, newTranscriptGate, admitSequenced } from './lib/hydration.js';
 import { permissionList, seedPermissions, upsertPermission } from './lib/permissions.js';
 
 // eventCallbackSource extracts the live event listener's arrow function
@@ -54,8 +54,19 @@ function functionBodySource(fnName) {
   return app.slice(start, close + 1);
 }
 
+// defineStreamingHelpers installs the real streaming-index helpers from
+// App.svelte into a sandbox, so extracted handler code that calls them runs as
+// written. Function declarations installed this way are non-enumerable globals,
+// so the definition must happen on the final sandbox object, not on an object
+// that is later spread.
+function defineStreamingHelpers(sandbox) {
+  runInNewContext(functionBodySource('closeStreaming'), sandbox);
+  runInNewContext(functionBodySource('continueStreamingRow'), sandbox);
+  return sandbox;
+}
+
 function applySnapshotSandbox(overrides = {}) {
-  return {
+  return defineStreamingHelpers({
     sessionId: 'prev-session',
     messages: [],
     gate: { highWater: 0 },
@@ -78,7 +89,7 @@ function applySnapshotSandbox(overrides = {}) {
     appendPermissionDismissedNotice: () => {},
     closeViewer: () => {},
     ...overrides,
-  };
+  });
 }
 
 describe('App permission resolution listener', () => {
@@ -257,5 +268,238 @@ describe('App snapshot closes the child viewer', () => {
       sandbox,
     );
     expect(sandbox.viewerClosed).toBe(true);
+  });
+});
+
+// rootStreamingSandbox is the state a root view holds while driving the real
+// snapshot, resync, token, user-message, and turn-start handlers out of
+// App.svelte: the transcript state plus the helpers those handlers call.
+function rootStreamingSandbox(overrides = {}) {
+  const sandbox = {
+    ...applySnapshotSandbox(),
+    snapshotApplied: true,
+    nextId: 0,
+    currentTurn: 0,
+    mid: () => sandbox.nextId++,
+    admitSequenced,
+    ...overrides,
+  };
+  // The real streaming helpers, so the handlers exercise the actual index
+  // continuation and finalisation. The spread above cannot carry them (vm
+  // globals are non-enumerable), so they are defined on this final object.
+  return defineStreamingHelpers(sandbox);
+}
+
+function openAssistantSnapshot(sandbox) {
+  runInNewContext(
+    `(${functionBodySource('applySnapshot')})({
+      session: { id: 'dest-session' },
+      messages: [{ type: 'user', content: 'question', turn: 1 }],
+      tail: [{ seq: 1, message: { type: 'assistant', content: 'thinking ', turn: 1 } }],
+      assistantOpen: true,
+      tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 },
+      queue: { items: [], version: 0 },
+      warnings: [],
+      permissions: [],
+    });`,
+    sandbox,
+  );
+}
+
+function openAssistantResync(sandbox) {
+  runInNewContext(
+    `(${functionBodySource('applyResync')})({
+      session: { id: 'dest-session' },
+      messages: [
+        { type: 'user', content: 'question', turn: 1 },
+        { type: 'assistant', content: 'thinking ', turn: 1 },
+      ],
+      assistantOpen: true,
+      tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 },
+    });`,
+    sandbox,
+  );
+}
+
+describe('App streaming continuation across boundaries', () => {
+  it('continues a turn a snapshot captured mid-stream instead of opening a second row', () => {
+    // A turn already streaming when the snapshot applies: the trailing
+    // assistant row from the retained tail is still open, so the first token
+    // after the snapshot must extend it, not open a fresh row.
+    const sandbox = rootStreamingSandbox();
+    openAssistantSnapshot(sandbox);
+    runInNewContext(`(${functionBodySource('applyToken')})({ content: 'more', seq: 2 });`, sandbox);
+    expect(sandbox.messages).toHaveLength(2);
+    expect(sandbox.messages[1].content).toBe('thinking more');
+    expect(sandbox.messages[1].partial).toBe(true);
+    expect(sandbox.streamingIdx).toBe(1);
+  });
+
+  it('leaves the continuation alone when a same-turn start replays after the snapshot', () => {
+    // A turn start replayed from the hydration buffer names the turn the
+    // snapshot already carried; it must not disturb the continuation.
+    const sandbox = rootStreamingSandbox();
+    openAssistantSnapshot(sandbox);
+    runInNewContext(`(${eventCallbackSource('turn_start')})({ turn: 1 });`, sandbox);
+    runInNewContext(`(${functionBodySource('applyToken')})({ content: 'more', seq: 2 });`, sandbox);
+    expect(sandbox.messages).toHaveLength(2);
+    expect(sandbox.messages[1].content).toBe('thinking more');
+    expect(sandbox.messages[1].partial).toBe(true);
+    expect(sandbox.streamingIdx).toBe(1);
+  });
+
+  it('closes the continuation and leaves it unmarked when a different turn starts', () => {
+    const sandbox = rootStreamingSandbox();
+    openAssistantSnapshot(sandbox);
+    runInNewContext(`(${eventCallbackSource('turn_start')})({ turn: 2 });`, sandbox);
+    expect(sandbox.messages[1].partial).toBe(false);
+    expect(sandbox.streamingIdx).toBe(-1);
+    // The next token opens a new row for the new turn.
+    runInNewContext(`(${functionBodySource('applyToken')})({ content: 'new turn', seq: 2 });`, sandbox);
+    expect(sandbox.messages).toHaveLength(3);
+    expect(sandbox.messages[2].content).toBe('new turn');
+  });
+
+  it('continues a turn a resync delivered mid-stream instead of opening a second row', () => {
+    const sandbox = rootStreamingSandbox({ sessionId: 'dest-session' });
+    runInNewContext(
+      `(${functionBodySource('applyResync')})({
+        session: { id: 'dest-session' },
+        messages: [
+          { type: 'user', content: 'question', turn: 1 },
+          { type: 'assistant', content: 'thinking ', turn: 1 },
+        ],
+        assistantOpen: true,
+        tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 },
+      });`,
+      sandbox,
+    );
+    runInNewContext(`(${functionBodySource('applyToken')})({ content: 'more', seq: 2 });`, sandbox);
+    expect(sandbox.messages).toHaveLength(2);
+    expect(sandbox.messages[1].content).toBe('thinking more');
+    expect(sandbox.messages[1].partial).toBe(true);
+    expect(sandbox.streamingIdx).toBe(1);
+  });
+
+  it('opens a new row after a finalising frame closes the continuation', () => {
+    // The finalisation works off the index: a boundary frame closes the
+    // marked row, and a token delivered after it must open a new row rather
+    // than extending the finalised one.
+    const sandbox = rootStreamingSandbox();
+    openAssistantSnapshot(sandbox);
+    runInNewContext(`(${functionBodySource('applyUserMessage')})({ content: 'follow-up', seq: 2 });`, sandbox);
+    expect(sandbox.messages[1].partial).toBe(false);
+    expect(sandbox.messages[1].content).toBe('thinking ');
+    expect(sandbox.streamingIdx).toBe(-1);
+    runInNewContext(`(${functionBodySource('applyToken')})({ content: 'reply', seq: 3 });`, sandbox);
+    expect(sandbox.messages).toHaveLength(4);
+    expect(sandbox.messages[3].content).toBe('reply');
+    expect(sandbox.messages[3].partial).toBe(true);
+  });
+
+  it('resets a snapshot continuation when the rebuilt state closes the span', () => {
+    // A rebuild arriving while a continuation is already established, with
+    // the published fact false, must clear the index: a following token opens
+    // a new row instead of appending to the row the previous continuation
+    // pointed at, and no row is left marked.
+    const sandbox = rootStreamingSandbox();
+    openAssistantSnapshot(sandbox);
+    runInNewContext(
+      `(${functionBodySource('applySnapshot')})({
+        session: { id: 'dest-session' },
+        messages: [
+          { type: 'user', content: 'question', turn: 1 },
+          { type: 'assistant', content: 'other', turn: 1 },
+        ],
+        assistantOpen: false,
+        tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 },
+        queue: { items: [], version: 0 },
+        warnings: [],
+        permissions: [],
+      });`,
+      sandbox,
+    );
+    runInNewContext(`(${functionBodySource('applyToken')})({ content: 'more', seq: 2 });`, sandbox);
+    expect(sandbox.messages).toHaveLength(3);
+    expect(sandbox.messages[1].content).toBe('other');
+    expect(sandbox.messages[1].partial).toBeFalsy();
+    expect(sandbox.messages[2].content).toBe('more');
+    expect(sandbox.messages[2].partial).toBe(true);
+  });
+
+  it('resets a snapshot continuation when the rebuilt last row is not an assistant row', () => {
+    // A rebuild whose published fact is true but whose last row is not an
+    // assistant row must also reset: the structural guard stops the marking,
+    // and a stale index must not survive to direct the next token into that
+    // row.
+    const sandbox = rootStreamingSandbox();
+    openAssistantSnapshot(sandbox);
+    runInNewContext(
+      `(${functionBodySource('applySnapshot')})({
+        session: { id: 'dest-session' },
+        messages: [
+          { type: 'user', content: 'question', turn: 1 },
+          { type: 'user', content: 'follow-up', turn: 1 },
+        ],
+        assistantOpen: true,
+        tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 },
+        queue: { items: [], version: 0 },
+        warnings: [],
+        permissions: [],
+      });`,
+      sandbox,
+    );
+    runInNewContext(`(${functionBodySource('applyToken')})({ content: 'reply', seq: 2 });`, sandbox);
+    expect(sandbox.messages).toHaveLength(3);
+    expect(sandbox.messages[1].content).toBe('follow-up');
+    expect(sandbox.messages[1].partial).toBeFalsy();
+    expect(sandbox.messages[2].content).toBe('reply');
+    expect(sandbox.messages[2].partial).toBe(true);
+  });
+
+  it('resets a resync continuation when the rebuilt state closes the span', () => {
+    const sandbox = rootStreamingSandbox({ sessionId: 'dest-session' });
+    openAssistantResync(sandbox);
+    runInNewContext(
+      `(${functionBodySource('applyResync')})({
+        session: { id: 'dest-session' },
+        messages: [
+          { type: 'user', content: 'question', turn: 1 },
+          { type: 'assistant', content: 'other', turn: 1 },
+        ],
+        assistantOpen: false,
+        tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 },
+      });`,
+      sandbox,
+    );
+    runInNewContext(`(${functionBodySource('applyToken')})({ content: 'more', seq: 2 });`, sandbox);
+    expect(sandbox.messages).toHaveLength(3);
+    expect(sandbox.messages[1].content).toBe('other');
+    expect(sandbox.messages[1].partial).toBeFalsy();
+    expect(sandbox.messages[2].content).toBe('more');
+    expect(sandbox.messages[2].partial).toBe(true);
+  });
+
+  it('resets a resync continuation when the rebuilt last row is not an assistant row', () => {
+    const sandbox = rootStreamingSandbox({ sessionId: 'dest-session' });
+    openAssistantResync(sandbox);
+    runInNewContext(
+      `(${functionBodySource('applyResync')})({
+        session: { id: 'dest-session' },
+        messages: [
+          { type: 'user', content: 'question', turn: 1 },
+          { type: 'user', content: 'follow-up', turn: 1 },
+        ],
+        assistantOpen: true,
+        tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 },
+      });`,
+      sandbox,
+    );
+    runInNewContext(`(${functionBodySource('applyToken')})({ content: 'reply', seq: 2 });`, sandbox);
+    expect(sandbox.messages).toHaveLength(3);
+    expect(sandbox.messages[1].content).toBe('follow-up');
+    expect(sandbox.messages[1].partial).toBeFalsy();
+    expect(sandbox.messages[2].content).toBe('reply');
+    expect(sandbox.messages[2].partial).toBe(true);
   });
 });
