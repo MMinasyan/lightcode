@@ -92,7 +92,12 @@ type Runner struct {
 	// sole drainer writes r.out, so protocol order is the drainer's write order, not
 	// merely non-interleaved bytes. Producers only append and wake the drainer; the
 	// drainer decides delivery against presented (presentation current), which
-	// advances only when the drainer consumes a boundary. Both fields are under mu.
+	// advances only when the drainer consumes a boundary. The queue is unbounded
+	// by design: a drainer blocked inside one write to the output stream grows it
+	// without limit rather than block a producer appending under an owner lock,
+	// so appending never waits for queue capacity or for the sink to accept the
+	// frame — only for the queue mutex, behind another producer or the drainer's
+	// critical section. Both fields are under mu.
 	mu        sync.Mutex
 	outFrames []outFrame
 	presented string

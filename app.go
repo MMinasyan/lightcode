@@ -107,7 +107,12 @@ type App struct {
 	// Delivery spine: every event and navigation payload is appended as a frame;
 	// the single drainer is the only goroutine that emits to the frontend, so
 	// delivery order is the drainer's write order. emitFn is the one emission
-	// choke point (overridable in tests).
+	// choke point (overridable in tests). The queue is unbounded by design: a
+	// drainer blocked inside one framework emit grows it without limit rather
+	// than block a producer appending under an owner lock, so appending never
+	// waits for queue capacity or for the sink to accept the frame — only for
+	// the queue mutex, behind another producer or the drainer's critical
+	// section.
 	emitFn         func(name string, payload any)
 	titleFn        func(title string)
 	deliveryMu     sync.Mutex
