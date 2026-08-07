@@ -2931,15 +2931,18 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 			// every exit of this closure — cancellation, a failed marker
 			// write, a launch abort, or a successful launch — leaves it
 			// counted exactly once. When no turn was launched, the claim is
-			// unwound completely: busy and the per-turn context are cleared,
-			// matching the residue launchTurn's receiving-end rejection
-			// leaves, so no later reader can tell the abort paths apart. A
-			// launched turn clears its own state in its turn-end section; the
-			// claim-time context is released here so a cancelled turn that
-			// never launched cannot outlive the drain.
+			// unwound — busy and the per-turn context are cleared — but only
+			// while the unit still holds this closure's claim. launchTurn's
+			// receiving-end rejection clears its own claim synchronously, so
+			// a concurrent submit can claim the unit again before this
+			// deferred cleanup runs; clearing then would drop the newer
+			// claim's gate while its loop is still running. A launched turn
+			// clears its own state in its turn-end section; the claim-time
+			// context is released here so a cancelled turn that never
+			// launched cannot outlive the drain.
 			defer func() {
 				rt.mu.Lock()
-				if launched == 0 {
+				if launched == 0 && unit.turnCtx == turnCtx {
 					unit.busy = false
 					unit.turnCancel = nil
 					unit.turnCtx = nil
@@ -3104,12 +3107,16 @@ func (rt *runtime) launchTurn(unit *session, turnCtx context.Context, cancel con
 	// create and emit a turn for a dead handoff. Reject before anything is
 	// created or emitted, and unwind the claim the way the abort path above
 	// does — release the wait-group count and clear the busy flag (and the
-	// per-turn context) — so the unit is not left wedged.
+	// per-turn context) — so the unit is not left wedged. The clear is
+	// guarded like the deferred cleanup's: only a claim the unit still holds
+	// is unwound, so the receiving end never clears a claim it does not own.
 	rt.mu.Lock()
 	if rt.closed || turnCtx.Err() != nil {
-		unit.busy = false
-		unit.turnCancel = nil
-		unit.turnCtx = nil
+		if unit.turnCtx == turnCtx {
+			unit.busy = false
+			unit.turnCancel = nil
+			unit.turnCtx = nil
+		}
 		rt.mu.Unlock()
 		rt.turnWG.Done()
 		return 0

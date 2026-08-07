@@ -2681,3 +2681,229 @@ func TestDeferredCleanupGuardContract(t *testing.T) {
 		}
 	})
 }
+
+// TestClaimCleanupKeepsLaterClaims pins the claim-ownership guard on the two
+// cleanup sites that clear a unit's per-turn claim: the drain's deferred
+// cleanup and launchTurn's receiving-end rejection. Each must unwind only the
+// claim it owns and leave a claim installed afterwards untouched. The drain's
+// defer is the dangerous one: launchTurn's rejection has already cleared the
+// drain's own claim and released busy by the time the closure returns, so a
+// concurrent submit can claim the unit again before the defer fires, and
+// clearing then would drop the newer claim's gate while its loop is still
+// running.
+func TestClaimCleanupKeepsLaterClaims(t *testing.T) {
+	// A later claim is taken while the drain is parked mid-preseed, after
+	// its own claim was invalidated the way launchTurn's receiving-end
+	// rejection leaves it: the claim-time context cancelled, busy cleared,
+	// the per-turn fields nilled. The drain's deferred cleanup must leave
+	// the later claim in place, and the owner shutdown that follows must
+	// still drain its turn join. The drain is let to finish touching the
+	// loop before the later claim's launch enters it — the two never touch
+	// the loop concurrently, exactly as the busy gate serializes them in
+	// production — while the later claim exists strictly before the deferred
+	// cleanup runs. The claim and the launch are the same calls the submit
+	// path makes (claimTurnLocked, launchTurn); only their atomic
+	// claim-and-launch wrapper is stepped around, because the wrapper would
+	// enter the loop before the parked drain has finished its preseed
+	// append. The later turn is parked on the model request so its claim is
+	// live when its state is asserted; the pre-fix cleanup clears it and the
+	// first assertion fails.
+	t.Run("drain_defer", func(t *testing.T) {
+		release := make(chan struct{})
+		reqSeen := make(chan struct{}, 1)
+		var reqSeenOnce, runOnce sync.Once
+		closeReqSeen := func() { reqSeenOnce.Do(func() { close(reqSeen) }) }
+		closeRun := func() { runOnce.Do(func() { close(release) }) }
+		// Register the server close before closeRun: cleanup runs LIFO, so a
+		// parked handler is released before the server is allowed to close.
+		// closeRun itself is registered after startEventOrderAgent so the
+		// release runs before that cleanup's ShutdownOwner: a turn parked on
+		// the request must be able to finish before the owner join.
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			closeReqSeen()
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+			writeTextResponse(w, "ok")
+		}))
+		t.Cleanup(func() { server.Close() })
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		ctx := startEventOrderAgent(t, a, &eventCapture{})
+		t.Cleanup(closeRun)
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[id]
+		rt.mu.Unlock()
+
+		// Two queued items: the first parks the drain mid-preseed, and the
+		// second is the remainder the drain aborts over once its claim is
+		// invalidated.
+		rt.mu.Lock()
+		unit.queue = []QueuedItem{
+			{ID: "q-1", Content: "preseed"},
+			{ID: "q-2", Content: "remainder"},
+		}
+		unit.queueSeq = 2
+		unit.queueVersion = 1
+		rt.mu.Unlock()
+
+		// Park the drain at the first preseed's turn-start feed, then start
+		// it.
+		tr := a.transcriptForSessionID(id)
+		tr.seqMu.Lock()
+		seqMuHeld := true
+		defer func() {
+			if seqMuHeld {
+				tr.seqMu.Unlock()
+			}
+		}()
+
+		drained := make(chan struct{})
+		go func() {
+			defer close(drained)
+			rt.tryDrainQueue(ctx)
+		}()
+		// Wait until the drain has claimed the unit and begun the first
+		// preseed turn instead of a fixed sleep: the claim installed the turn
+		// context, and the held transcript lock parks the drain at the
+		// turn-start feed.
+		parkDeadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(parkDeadline) && unit.store.CurrentTurn() == 0 {
+			time.Sleep(2 * time.Millisecond)
+		}
+		if unit.store.CurrentTurn() == 0 {
+			t.Fatal("drain did not begin a preseed turn before the claim was invalidated")
+		}
+
+		// Invalidate the drain's claim the way launchTurn's receiving-end
+		// rejection does — cancel the claim-time context and clear the three
+		// claim fields — then take the later claim through the same
+		// claimTurnLocked the submit path uses, all in one runtime.mu
+		// section. The later claim is installed strictly before the drain's
+		// deferred cleanup can run, while the drain is still parked.
+		rt.mu.Lock()
+		unit.turnCancel()
+		unit.busy = false
+		unit.turnCancel = nil
+		unit.turnCtx = nil
+		laterCtx, laterCancel, err := rt.claimTurnLocked(ctx, unit)
+		if err != nil {
+			rt.mu.Unlock()
+			t.Fatalf("claimTurnLocked: %v", err)
+		}
+		rt.mu.Unlock()
+
+		// Let the drain finish its preseed — the only loop access this test
+		// allows it — abort over the invalidated claim, and reach its
+		// deferred cleanup. The cleanup runs against the live later claim
+		// and must leave it in place.
+		tr.seqMu.Unlock()
+		seqMuHeld = false
+		select {
+		case <-drained:
+		case <-time.After(15 * time.Second):
+			t.Fatal("drain did not return")
+		}
+
+		// The later turn enters the loop only now, after the drain has
+		// finished touching it; the launch is the same launchTurn the submit
+		// path calls after its claim. Its model request parks, so the claim
+		// is still live when its state is asserted.
+		if launched := rt.launchTurn(unit, laterCtx, laterCancel, []string{"later claim"}); launched == 0 {
+			t.Fatal("launchTurn refused the later claim")
+		}
+		select {
+		case <-reqSeen:
+		case <-time.After(15 * time.Second):
+			t.Fatal("later turn did not reach the model")
+		}
+
+		// The drain's deferred cleanup must leave the later claim in place:
+		// busy, the turn context, and the cancel, by pointer identity.
+		rt.mu.Lock()
+		busy := unit.busy
+		turnCtx := unit.turnCtx
+		turnCancel := unit.turnCancel
+		rt.mu.Unlock()
+		if !busy {
+			t.Fatal("drain's deferred cleanup cleared the later claim's busy flag")
+		}
+		if turnCtx != laterCtx {
+			t.Fatal("drain's deferred cleanup replaced the later claim's context")
+		}
+		if turnCancel == nil || reflect.ValueOf(turnCancel).Pointer() != reflect.ValueOf(laterCancel).Pointer() {
+			t.Fatal("drain's deferred cleanup replaced the later claim's cancel")
+		}
+
+		// The counterpart: after that interleaving the owner shutdown's turn
+		// join must drain — the deferred cleanup releases its wait-group
+		// count even when it cleared nothing. An identity check wrapped
+		// around the whole defer body skips the release and the join times
+		// out.
+		if !a.ShutdownOwner() {
+			t.Fatal("ShutdownOwner reported an undrained turn join after the interleaving")
+		}
+	})
+
+	// The receiving-end rejection clears its own claim synchronously while
+	// busy still blocks a newer claim, so the guard at that site is
+	// defensive; it must still never clear a claim it does not own. Drive
+	// launchTurn directly with the unit holding a later claim and a
+	// cancelled handoff context: the rejection must leave the later claim
+	// untouched.
+	t.Run("launch_reject", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeTextResponse(w, "unreachable")
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		startEventOrderAgent(t, a, &eventCapture{})
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[id]
+		rt.mu.Unlock()
+
+		laterCtx, laterCancel := context.WithCancel(context.Background())
+		defer laterCancel()
+		rejCtx, rejCancel := context.WithCancel(context.Background())
+		defer rejCancel()
+		rejCancel()
+
+		rt.mu.Lock()
+		unit.busy = true
+		unit.turnCtx = laterCtx
+		unit.turnCancel = laterCancel
+		rt.mu.Unlock()
+		rt.turnWG.Add(1)
+
+		if launched := rt.launchTurn(unit, rejCtx, rejCancel, []string{"x"}); launched != 0 {
+			t.Fatalf("launchTurn accepted a cancelled handoff, returned turn %d", launched)
+		}
+		rt.mu.Lock()
+		busy := unit.busy
+		turnCtx := unit.turnCtx
+		turnCancel := unit.turnCancel
+		rt.mu.Unlock()
+		if !busy {
+			t.Fatal("rejected handoff cleared the later claim's busy flag")
+		}
+		if turnCtx != laterCtx {
+			t.Fatal("rejected handoff replaced the later claim's context")
+		}
+		if turnCancel == nil || reflect.ValueOf(turnCancel).Pointer() != reflect.ValueOf(laterCancel).Pointer() {
+			t.Fatal("rejected handoff replaced the later claim's cancel")
+		}
+	})
+}
