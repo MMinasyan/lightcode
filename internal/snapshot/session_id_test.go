@@ -1,10 +1,12 @@
 package snapshot
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 )
 
@@ -311,5 +313,84 @@ func TestMintRedrawsOnLostClaim(t *testing.T) {
 	}
 	if err := store.releaseClaimLocked(id); err != nil {
 		t.Fatalf("release winning claim: %v", err)
+	}
+}
+
+// TestMintFailsOnNonContendedClaimError proves a claim error that is not
+// contention fails the mint after exactly one draw: only a lost claim means
+// another process took the id and warrants a redraw; every other claim error
+// is a real failure and must not be hidden by retrying.
+func TestMintFailsOnNonContendedClaimError(t *testing.T) {
+	projectsRoot := t.TempDir()
+	projectID := "p-claim-err"
+	store, err := NewForSessionsRoot(filepath.Join(projectsRoot, projectID, "sessions"), projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A regular file where the claim lock directory must be created makes the
+	// claim's directory creation fail with ENOTDIR — a filesystem claim error
+	// that is not contention.
+	lockDir := filepath.Join(projectsRoot, projectID, ".locks")
+	if err := os.WriteFile(lockDir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origMint := mintSessionIDFunc
+	defer func() { mintSessionIDFunc = origMint }()
+	draws := 0
+	mintSessionIDFunc = func() (string, error) {
+		draws++
+		return "claimfail01", nil
+	}
+
+	_, err = store.mintReservedSessionID(t.TempDir(), SessionMeta{}, true)
+	if err == nil {
+		t.Fatal("mint with a non-contended claim error = nil error")
+	}
+	if !errors.Is(err, syscall.ENOTDIR) {
+		t.Fatalf("mint error = %v, want the claim's filesystem cause", err)
+	}
+	if draws != 1 {
+		t.Fatalf("draws = %d, want 1: a non-contended claim error must fail the mint, not redraw", draws)
+	}
+}
+
+// TestMintExhaustsAttemptsWithTerminalError proves a mint whose every draw
+// collides draws exactly the bounded number of ids and then returns the
+// terminal error: the retry bound is a guarantee, not an accident of the
+// collision distribution.
+func TestMintExhaustsAttemptsWithTerminalError(t *testing.T) {
+	projectsRoot := t.TempDir()
+	projectID := "p-exhaust"
+	sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+	store, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Reserve the id every draw produces, so every attempt collides.
+	if err := os.MkdirAll(filepath.Join(sessionsRoot, "collide"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	origMint := mintSessionIDFunc
+	defer func() { mintSessionIDFunc = origMint }()
+	draws := 0
+	mintSessionIDFunc = func() (string, error) {
+		draws++
+		return "collide", nil
+	}
+
+	_, err = store.mintReservedSessionID(t.TempDir(), SessionMeta{}, true)
+	if err == nil {
+		t.Fatal("mint with every draw colliding = nil error")
+	}
+	if draws != mintSessionIDMaxAttempts {
+		t.Fatalf("draws = %d, want the %d-attempt bound", draws, mintSessionIDMaxAttempts)
+	}
+	want := fmt.Sprintf("snapshot: could not mint a unique session id in %d attempts (collision or contention)", mintSessionIDMaxAttempts)
+	if err.Error() != want {
+		t.Fatalf("mint error = %q, want %q", err, want)
 	}
 }

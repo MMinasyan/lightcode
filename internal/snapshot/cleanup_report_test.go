@@ -167,8 +167,9 @@ func TestMintMetaWriteFailureJoinsFailedClaimRelease(t *testing.T) {
 
 // TestMintMetaWriteFailureLeavesNothingBehind proves a mint whose metadata
 // write fails removes the reservation directory it created under the create
-// root and releases the claim: a failed mint leaves no orphan the id scan
-// would avoid forever, and the create root itself survives.
+// root and releases the claim — the same session id is immediately
+// reacquirable — so a failed mint leaves no orphan the id scan would avoid
+// forever, and the create root itself survives.
 func TestMintMetaWriteFailureLeavesNothingBehind(t *testing.T) {
 	// A failing temp sync makes the meta publication fail after the
 	// reservation directories were created.
@@ -190,14 +191,66 @@ func TestMintMetaWriteFailureLeavesNothingBehind(t *testing.T) {
 	if err == nil {
 		t.Fatal("mint with failing meta write = nil error")
 	}
+	if !strings.Contains(err.Error(), "write session meta") {
+		t.Fatalf("mint error = %q, want the meta publication failure", err)
+	}
 	if _, serr := os.Stat(filepath.Join(createRoot, "orphan001")); !os.IsNotExist(serr) {
 		t.Fatalf("reservation directory still present after failed mint (stat err = %v)", serr)
 	}
 	if _, serr := os.Stat(createRoot); serr != nil {
 		t.Fatalf("create root removed by failed mint: %v", serr)
 	}
+	// The claim must be released, not merely cleared from the store: a
+	// release that failed would leave the field nil while the lock stayed
+	// held, so reclaiming the same id is the real proof.
+	reclaimed, ok, err := AcquireSessionClaim(projectsRoot, projectID, "orphan001")
+	if err != nil || !ok {
+		t.Fatalf("reacquire claim on orphan001 after failed mint: ok=%v err=%v", ok, err)
+	}
+	if err := reclaimed.Release(); err != nil {
+		t.Fatalf("release reacquired claim: %v", err)
+	}
 	if store.claim != nil {
 		t.Fatal("failed mint retained the session claim")
+	}
+}
+
+// TestForkMintFailureLeavesNoReservationDirectory proves a fork whose mint
+// fails at the metadata publication removes the reservation directory it
+// created under the destination root. The fork path mints without a claim,
+// so directory removal is its only cleanup; the failure is forced after the
+// reservation directory and its children exist, so a removal that only ran
+// on the claim branch would leave the directory behind and fail this test.
+func TestForkMintFailureLeavesNoReservationDirectory(t *testing.T) {
+	projectsRoot := t.TempDir()
+	projectID := "p-fork-mint"
+	store, err := NewForSessionsRoot(filepath.Join(projectsRoot, projectID, "sessions"), projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginNewSession(t.TempDir()); err != nil {
+		t.Fatalf("BeginNewSession: %v", err)
+	}
+
+	// A failing temp sync makes the meta publication fail after the
+	// reservation directories were created.
+	atomicfs.SyncFileFunc = func(*os.File) error { return errors.New("injected sync failure") }
+	t.Cleanup(func() { atomicfs.SyncFileFunc = nil })
+
+	origMint := mintSessionIDFunc
+	defer func() { mintSessionIDFunc = origMint }()
+	mintSessionIDFunc = func() (string, error) { return "forkfail01", nil }
+
+	destRoot := t.TempDir()
+	_, _, err = store.ForkInto(0, destRoot)
+	if err == nil {
+		t.Fatal("fork with failing mint = nil error")
+	}
+	if !strings.Contains(err.Error(), "write session meta") {
+		t.Fatalf("fork error = %q, want the mint's meta publication failure", err)
+	}
+	if _, serr := os.Stat(filepath.Join(destRoot, "forkfail01")); !os.IsNotExist(serr) {
+		t.Fatalf("reservation directory still present after failed fork (stat err = %v)", serr)
 	}
 }
 
