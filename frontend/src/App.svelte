@@ -134,6 +134,19 @@
     }];
   }
 
+  // A boundary replaces the view wholesale, so a permission prompt open for the
+  // session being left closes unanswered. The request is not lost — it stays
+  // pending for its own session — so name what was dismissed instead of letting
+  // it vanish without a trace.
+  function appendPermissionDismissedNotice(p) {
+    if (!p) return;
+    messages = [...messages, {
+      _id: mid(),
+      type: 'system',
+      content: `System: Dismissed a pending permission request for [${p.tool}] ${p.args} from session ${p.sessionId}; it is still pending for that session.`,
+    }];
+  }
+
   function rebuildFromHistory(persisted) {
     currentTurn = 0;
     pendingSubagentSessionLinks = {};
@@ -174,7 +187,13 @@
     closeViewer();
     snapshotApplied = true;
     readOnly = !!hs.readOnly;
-    sessionId = hs.session?.id || '';
+    const destinationId = hs.session?.id || '';
+    // A boundary also replaces the pending permission map, so a prompt open for
+    // the session being left is dismissed unanswered. The request is not lost —
+    // it stays pending for its own session — and the notice below says so when
+    // the reseed dismisses one.
+    const dismissedPrompt = permissionList(permissions)[0];
+    sessionId = destinationId;
     messages = rebuildFromHistory(snapshotMessages(hs));
     gate = newTranscriptGate(hs);
     streamingIdx = -1;
@@ -192,6 +211,9 @@
     const m = hs.model || {};
     modelRef = m.ref || ((m.provider && m.model) ? `${m.provider}/${m.model}` : '');
     modelName = m.displayName || modelRef;
+    if (dismissedPrompt && dismissedPrompt.sessionId !== destinationId) {
+      appendPermissionDismissedNotice(dismissedPrompt);
+    }
   }
 
   async function hydrate() {

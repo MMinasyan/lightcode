@@ -288,3 +288,100 @@ describe('App boot barrier over unseeded state', () => {
     unmount(app);
   });
 });
+
+describe('App permission prompt on a boundary', () => {
+  // A snapshot replaces the view wholesale, so a prompt open for the session
+  // being left closes unanswered. The request is not lost — it stays pending
+  // for its own session — so the snapshot-apply path must say so in a system
+  // row naming what was dismissed.
+
+  function promptForA() {
+    fire('permission_request', { id: 'a', sessionId: 's1', projectId: 'p1', tool: 'bash', args: 'rm a', canSaveProject: true });
+  }
+
+  it('a navigation boundary for another session closes the prompt with a notice, and the request still answers through its own session', async () => {
+    const responses = [];
+    backend.RespondPermission = async (sessionId, id, action) => { responses.push({ sessionId, id, action }); };
+    const { app, target } = await mountApp();
+
+    // A prompt is open for session s1.
+    promptForA();
+    await tick();
+    expect(target.querySelector('.prompt .args').textContent).toContain('rm a');
+
+    // A navigation boundary for s2 replaces the view: the prompt closes and a
+    // notice names what was dismissed instead of letting it vanish silently.
+    fire('navigation', { ...navState(), session: { id: 's2' } });
+    await tick();
+    expect(target.querySelector('.prompt')).toBeNull();
+    expect(target.querySelector('.label.session').textContent).toBe('s2');
+    const notice = target.querySelector('.system-msg');
+    expect(notice?.textContent).toContain('rm a');
+    expect(notice?.textContent).toContain('s1');
+
+    // The request was not lost: a boundary back to s1 carrying the pending
+    // request shows the prompt again, and answering it resolves through s1.
+    fire('navigation', { ...navState(), session: { id: 's1' }, permissions: [{ id: 'a', session_id: 's1', project_id: 'p1', tool: 'bash', args: 'rm a' }] });
+    await tick();
+    expect(target.querySelector('.prompt .args').textContent).toContain('rm a');
+    target.querySelector('.prompt .actions .allow').click();
+    await settle();
+    expect(responses).toEqual([{ sessionId: 's1', id: 'a', action: 'allow' }]);
+
+    unmount(app);
+  });
+
+  it('a read-only navigation destination closes the prompt the same way', async () => {
+    const { app, target } = await mountApp();
+
+    promptForA();
+    await tick();
+    expect(target.querySelector('.prompt')).toBeTruthy();
+
+    // The destination is a session another process drives, opened read-only;
+    // the dismissal notice appears the same as for an ordinary destination.
+    fire('navigation', { ...navState(), session: { id: 's2' }, readOnly: true });
+    await tick();
+    expect(target.querySelector('.prompt')).toBeNull();
+    const notice = target.querySelector('.system-msg');
+    expect(notice?.textContent).toContain('rm a');
+    expect(notice?.textContent).toContain('s1');
+
+    unmount(app);
+  });
+
+  it('a turn-action boundary for a fork destination closes the prompt the same way', async () => {
+    const { app, target } = await mountApp();
+
+    promptForA();
+    await tick();
+    expect(target.querySelector('.prompt')).toBeTruthy();
+
+    // A fork boundary for a new session reaches the same snapshot-apply path
+    // as navigation, so it carries the same dismissal notice without a second
+    // guard at the event handler.
+    fire('turn_action', { state: { ...navState(), session: { id: 's2' } }, skippedFiles: [] });
+    await tick();
+    expect(target.querySelector('.prompt')).toBeNull();
+    const notice = target.querySelector('.system-msg');
+    expect(notice?.textContent).toContain('rm a');
+    expect(notice?.textContent).toContain('s1');
+
+    unmount(app);
+  });
+
+  it('a boundary for the same session does not invent a dismissal notice', async () => {
+    const { app, target } = await mountApp();
+
+    // A prompt open for s1 survives a boundary that stays on s1: the snapshot
+    // carries the pending request, so the prompt is re-seeded, not dismissed.
+    promptForA();
+    await tick();
+    fire('navigation', { ...navState(), session: { id: 's1' }, permissions: [{ id: 'a', session_id: 's1', project_id: 'p1', tool: 'bash', args: 'rm a' }] });
+    await tick();
+    expect(target.querySelector('.prompt .args').textContent).toContain('rm a');
+    expect(target.querySelector('.system-msg')).toBeNull();
+
+    unmount(app);
+  });
+});

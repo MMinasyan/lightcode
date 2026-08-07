@@ -74,6 +74,8 @@ function applySnapshotSandbox(overrides = {}) {
     newTranscriptGate,
     defaultTokens: () => ({ total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 }),
     seedPermissions,
+    permissionList,
+    appendPermissionDismissedNotice: () => {},
     closeViewer: () => {},
     ...overrides,
   };
