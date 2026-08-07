@@ -1279,11 +1279,13 @@ func (a *App) SessionSwitch(id string) error {
 	// adapter routing current — including the destination project, since the id may
 	// resolve in another project — before appending the boundary, both while this
 	// goroutine holds navMu, so a failed switch leaves routing and presentation
-	// unchanged.
+	// unchanged. The native window title is computed from the destination's project
+	// path, exactly as a project switch does, so a cross-project switch moves the
+	// window title with the boundary.
 	_, err := a.svc.OpenSessionWithBoundary(id, func(state agent.HydrationState) {
 		a.setRouteProjectPathLocked(state.Session.ProjectPath)
 		a.setCurrentSessionID(state.Session.ID)
-		a.enqueueBoundary("navigation", state, "", state.Session.ID)
+		a.enqueueBoundary("navigation", state, "Lightcode — "+filepath.Base(state.Session.ProjectPath), state.Session.ID)
 	})
 	if err != nil {
 		if !errors.Is(err, snapshot.ErrSessionContended) {
@@ -1300,7 +1302,7 @@ func (a *App) SessionSwitch(id string) error {
 		a.setRouteProjectPathLocked(state.Session.ProjectPath)
 		a.setCurrentSessionID(state.Session.ID)
 		a.markRouteReadOnly(state.Session.ID)
-		a.enqueueBoundary("navigation", state, "", state.Session.ID)
+		a.enqueueBoundary("navigation", state, "Lightcode — "+filepath.Base(state.Session.ProjectPath), state.Session.ID)
 		return nil
 	}
 	return nil

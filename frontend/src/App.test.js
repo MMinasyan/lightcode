@@ -68,6 +68,7 @@ function defineStreamingHelpers(sandbox) {
 function applySnapshotSandbox(overrides = {}) {
   return defineStreamingHelpers({
     sessionId: 'prev-session',
+    projectName: 'prev-project',
     messages: [],
     gate: { highWater: 0 },
     streamingIdx: -1,
@@ -235,15 +236,76 @@ describe('App snapshot model application', () => {
   });
 });
 
-describe('App project-switch model ordering', () => {
-  it('does not fetch the current model on project switch; the navigation boundary carries it', () => {
+describe('App snapshot project label', () => {
+  it('moves the toolbar project label to the destination session project', () => {
+    const sandbox = applySnapshotSandbox();
+    runInNewContext(
+      `(${functionBodySource('applySnapshot')})({
+        session: { id: 'dest-session', projectPath: '/home/user/code/other-project' },
+        messages: [],
+        tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 },
+        queue: { items: [], version: 0 },
+        warnings: [],
+        permissions: [],
+      });`,
+      sandbox,
+    );
+    // The toolbar shows the basename of the destination project, so a session
+    // switch into another project moves the label with it instead of leaving it
+    // on the previous project.
+    expect(sandbox.projectName).toBe('other-project');
+  });
+
+  it('updates the label to the path itself for a root project, matching the backend title', () => {
+    // The backend's basename of a root directory is the root itself, so a
+    // switch to a root project titles the window with the root; the toolbar
+    // label must agree instead of keeping the previous project.
+    const sandbox = applySnapshotSandbox();
+    runInNewContext(
+      `(${functionBodySource('applySnapshot')})({
+        session: { id: 'dest-session', projectPath: '/' },
+        messages: [],
+        tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 },
+        queue: { items: [], version: 0 },
+        warnings: [],
+        permissions: [],
+      });`,
+      sandbox,
+    );
+    expect(sandbox.projectName).toBe('/');
+  });
+
+  it('leaves the toolbar project label alone when the snapshot carries no project path', () => {
+    const sandbox = applySnapshotSandbox();
+    runInNewContext(
+      `(${functionBodySource('applySnapshot')})({
+        session: { id: 'dest-session' },
+        messages: [],
+        tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 },
+        queue: { items: [], version: 0 },
+        warnings: [],
+        permissions: [],
+      });`,
+      sandbox,
+    );
+    expect(sandbox.projectName).toBe('prev-project');
+  });
+});
+
+describe('App project-switch no-fetch', () => {
+  it('keeps no project-switch handler: the navigation boundary carries the destination state', () => {
     // A project switch delivers an ordered navigation boundary carrying the
-    // destination's model, which the snapshot applies. An out-of-band
-    // CurrentModel here could surface the destination's model before its
-    // boundary does, so it must not be fetched.
-    const body = functionBodySource('handleProjectSwitched');
-    expect(body).not.toMatch(/CurrentModel\(/);
-    expect(body).not.toMatch(/refreshCurrentModel\(/);
+    // destination's model and project name, which the snapshot applies; a
+    // separate fetch could surface the destination's project name before its
+    // boundary does. The project-name fetch is therefore called exactly once,
+    // at mount, for the startup case where no session exists and no snapshot
+    // can answer — a second call site anywhere, under any name, is an
+    // out-of-band fetch of the destination project.
+    const code = readFileSync(resolve('src/App.svelte'), 'utf8')
+      .split('\n')
+      .filter((line) => !line.trim().startsWith('//'))
+      .join('\n');
+    expect(code.match(/ProjectName\(/g) || []).toHaveLength(1);
   });
 });
 

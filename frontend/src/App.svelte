@@ -194,6 +194,22 @@
     // the reseed dismisses one.
     const dismissedPrompt = permissionList(permissions)[0];
     sessionId = destinationId;
+    // The toolbar project label follows the destination: the snapshot's session
+    // carries the project record's normalized path, and the toolbar shows its
+    // basename, so a session switch into another project moves the label with
+    // it. A project switch delivers an ordered navigation boundary carrying the
+    // destination's model and project name, which this snapshot applies — the
+    // model below, the label here — so no out-of-band fetch remains for a
+    // switch; the onMount ProjectName() call stays only for the no-session
+    // startup, which no snapshot can answer.
+    const projectPath = hs.session?.projectPath || '';
+    if (projectPath) {
+      const base = projectPath.split(/[\\/]+/).filter(Boolean).pop();
+      // A root path splits into no segment; the backend's basename of a root
+      // directory is the root itself, so the label follows the path then
+      // instead of keeping the previous project.
+      projectName = base || projectPath;
+    }
     messages = rebuildFromHistory(snapshotMessages(hs));
     gate = newTranscriptGate(hs);
     continueStreamingRow(hs.assistantOpen);
@@ -526,13 +542,6 @@
     } catch (e) { showError(e, 'Load model failed'); }
   }
 
-  async function handleProjectSwitched() {
-    // The destination's model rides the ordered navigation boundary the switch
-    // delivers, which the snapshot applies; no out-of-band fetch that could
-    // surface it before its boundary does.
-    try { projectName = await ProjectName(); } catch (e) { showError(e, 'Load project failed'); }
-  }
-
   async function handleRevertCode(e) {
     const { turn } = e.detail;
     try {
@@ -620,7 +629,7 @@
     <SessionSelector on:close={() => showSessionSelector=false} on:error={(e) => showError(e.detail)} />
   {/if}
   {#if showProjectSelector}
-    <ProjectSelector on:switched={handleProjectSwitched} on:close={() => showProjectSelector=false} on:error={(e) => showError(e.detail)} />
+    <ProjectSelector on:close={() => showProjectSelector=false} on:error={(e) => showError(e.detail)} />
   {/if}
   {#if showWarnings}
     <WarningDetails {warnings} on:close={() => showWarnings=false} />

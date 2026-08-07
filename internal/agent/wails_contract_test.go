@@ -296,10 +296,12 @@ func TestWailsModelSwitchAppendsOrderedPresentationItem(t *testing.T) {
 
 // TestSnapshotCarriesModelAndProjectSwitchFetchesNone proves the hydration
 // snapshot applies the destination's resolved model alongside the rest of the
-// session classes, and that a project switch never fetches the current model
-// out of band: the destination's navigation boundary carries its model, and an
-// out-of-band CurrentModel would surface the destination's model before its
-// boundary does.
+// session classes, and that a project switch performs no out-of-band fetch of
+// the destination's project name or model: the ordered navigation boundary
+// carries both, which the snapshot applies. The project-name fetch is called
+// exactly once, at mount, for the startup case where no session exists and no
+// snapshot can answer; any second call site, under any name, is an out-of-band
+// fetch.
 func TestSnapshotCarriesModelAndProjectSwitchFetchesNone(t *testing.T) {
 	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
 	body, ok := extractSvelteFunctionBody(svelte, "function applySnapshot(")
@@ -310,12 +312,8 @@ func TestSnapshotCarriesModelAndProjectSwitchFetchesNone(t *testing.T) {
 		t.Fatal("applySnapshot must apply the destination session's resolved model to the selector")
 	}
 
-	switched, ok := extractSvelteFunctionBody(svelte, "async function handleProjectSwitched(")
-	if !ok {
-		t.Fatal("handleProjectSwitched not found in App.svelte")
-	}
-	if strings.Contains(switched, "CurrentModel(") || strings.Contains(switched, "refreshCurrentModel(") {
-		t.Fatal("handleProjectSwitched must not fetch the current model out of band; the navigation boundary carries the destination's model")
+	if got := strings.Count(svelteCodeWithoutCommentLines(svelte), "ProjectName("); got != 1 {
+		t.Fatalf("App.svelte calls ProjectName() %d times, want exactly 1 (the mount-time startup fetch; a second call site anywhere would fetch the destination project out of band)", got)
 	}
 }
 
@@ -598,6 +596,21 @@ func TestHydrateSurfacesCurrentSessionLookupFailure(t *testing.T) {
 	if !strings.Contains(body, "showError(e, 'Load session failed')") {
 		t.Fatal("hydrate must surface the current-session lookup failure through showError")
 	}
+}
+
+// svelteCodeWithoutCommentLines returns source with // comment lines removed,
+// so a symbol-count assertion counts call sites rather than prose that happens
+// to name the function.
+func svelteCodeWithoutCommentLines(source string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(source, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 // extractSvelteFunctionBody returns the brace-balanced body of the first JS

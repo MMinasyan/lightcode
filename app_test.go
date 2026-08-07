@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -481,6 +482,62 @@ func TestAdapterExplicitSessionTargetingContract(t *testing.T) {
 			t.Fatalf("SessionList after cross-project switch = %#v, want only %q", sessions, otherID)
 		}
 	})
+}
+
+// TestWailsSessionSwitchAppliesCrossProjectTitle proves a session switch into
+// another project applies the destination project's native window title through
+// the consumed navigation boundary, exactly as a project switch does: the
+// boundary carries "Lightcode — <basename>" computed from the destination
+// session's project path, so the window does not stay on the previous project.
+func TestWailsSessionSwitchAppliesCrossProjectTitle(t *testing.T) {
+	svc := newAppTestAgent(t)
+	startupID, err := svc.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	otherRoot := t.TempDir()
+	otherID, err := svc.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath: %v", err)
+	}
+
+	app := newTestApp(svc)
+	app.agent = svc
+	var mu sync.Mutex
+	var titles []string
+	app.emitFn = func(string, any) {}
+	app.titleFn = func(title string) {
+		mu.Lock()
+		titles = append(titles, title)
+		mu.Unlock()
+	}
+	app.startDelivery()
+	defer app.closeDelivery()
+	app.setCurrentSessionID(startupID)
+
+	if err := app.SessionSwitch(otherID); err != nil {
+		t.Fatalf("SessionSwitch: %v", err)
+	}
+
+	want := "Lightcode — " + filepath.Base(otherRoot)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		got := append([]string(nil), titles...)
+		mu.Unlock()
+		if len(got) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no window title applied after a cross-project SessionSwitch; the navigation boundary must carry the destination project's title")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(titles) != 1 || titles[0] != want {
+		t.Fatalf("titles after SessionSwitch = %v, want [%s]", titles, want)
+	}
 }
 
 // TestSessionSwitchUnreadableMetaStillRoutesDestination proves a session switch
