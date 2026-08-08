@@ -1,14 +1,27 @@
 package agent
 
 import (
+	"context"
+	"errors"
+	"flag"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
+
+// forkContendedChild is the sole selector for this test's child branch: the
+// parent runs the same binary with this flag set, so an inherited
+// environment value alone can never put a parent test process into child
+// mode.
+var forkContendedChild = flag.Bool("lightcode.fork-contended-child", false, "run as the fork-contention test child")
 
 // TestForkStagedPublication verifies fork publishes the new session
 // through staged rename while the source stays live and claimed: the source is
@@ -256,4 +269,150 @@ func assertActiveListed(t *testing.T, a *Agent, id string) {
 		}
 	}
 	t.Fatalf("session %q not in active list: %#v", id, list)
+}
+
+// TestForkCandidateContendedAborts proves a fork whose candidate claim is
+// contended — another live process already drives the minted candidate id —
+// aborts cleanly: the fork returns ErrSessionContended, the source stays
+// live, current and claimed, the candidate's staging directory is removed,
+// and the boundary callback never runs. A contended fork candidate is
+// deliberately terminal: unlike the mint, it does not redraw. This test does
+// not change mint behavior and asserts no mint redraw — the foreign claim is
+// taken only after the mint has already drawn and published the id.
+//
+// The complete scenario runs in a self-exec child of this test, selected only
+// by the dedicated child flag, so a mutation that hangs the fork is killed
+// and reaped by the parent's five-second CommandContext deadline instead of
+// hanging the test process. The parent asserts a successful child exit; a
+// deadline or nonzero child output fails with diagnostics. The child's TMPDIR
+// is a parent-created temporary directory, so the parent's t.TempDir cleanup
+// removes the child's test filesystem state even when the child is killed at
+// the deadline.
+func TestForkCandidateContendedAborts(t *testing.T) {
+	if *forkContendedChild {
+		// Child mode: run the complete scenario synchronously and return; the
+		// parent branch below is not re-entered.
+		forkCandidateContendedScenario(t)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestForkCandidateContendedAborts$", "-lightcode.fork-contended-child")
+	cmd.Env = append(os.Environ(), "TMPDIR="+t.TempDir())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("fork contender child failed: %v\n%s", err, out)
+	}
+}
+
+// forkCandidateContendedScenario is the whole fork-contention scenario, run
+// synchronously in the child process. The fork mints its candidate id inside
+// ForkInto with claim=false, so the id is unknown to the caller and
+// unclaimed; the claim is taken later, by candidateStore.LoadSession inside
+// forkCommitStagedLocked. durableReadHook fires one statement before that
+// load, under rt.mu, with the staged tree already on disk. It fires more
+// than once on this path, so the hook is one-shot and conditioned on the
+// staged candidate being discoverable: nothing happens before the candidate
+// exists, and after the load has taken its claim there is nothing left to
+// act on. The foreign claim stays held until the fork call has returned,
+// then is released; a release failure is an explicit test failure.
+func forkCandidateContendedScenario(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	turn := appendUserTurn(t, a, "fork point")
+	sourceID := a.SessionCurrent().ID
+	if sourceID == "" {
+		t.Fatal("no source session id")
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	projectID := a.session.projectID
+	sessionsRoot := a.session.store.Root()
+	rt.mu.Unlock()
+	if projectID == "" {
+		t.Fatal("source session has no project id")
+	}
+	projectsRoot := a.projects.Root()
+	stagingParent := filepath.Join(filepath.Dir(sessionsRoot), ".staging", "sessions")
+
+	var (
+		once         sync.Once
+		foreignClaim *atomicfs.Lock
+		candidateID  string
+	)
+	a.durableReadHook = func() {
+		// The hook fires before the candidate exists (the forkCopyTree fire,
+		// before ForkInto has run): return immediately unless a staged
+		// candidate is discoverable, and act only the first time one is.
+		entries, err := os.ReadDir(stagingParent)
+		if err != nil || len(entries) == 0 {
+			return
+		}
+		once.Do(func() {
+			for _, nonce := range entries {
+				candEntries, err := os.ReadDir(filepath.Join(stagingParent, nonce.Name()))
+				if err != nil || len(candEntries) == 0 {
+					continue
+				}
+				candidateID = candEntries[0].Name()
+				lock, ok, err := snapshot.AcquireSessionClaim(projectsRoot, projectID, candidateID)
+				if err != nil || !ok {
+					// The fork minted the candidate with claim=false, so the
+					// claim is free here; a refusal is a test bug.
+					return
+				}
+				foreignClaim = lock
+				return
+			}
+		})
+	}
+	defer func() { a.durableReadHook = nil }()
+
+	var emitted bool
+	_, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, turn, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string) {
+		emitted = true
+	})
+	// The foreign claim stays held until the fork call has returned; only
+	// then is it released. Releasing inside the hook would free the claim
+	// before candidateStore.LoadSession runs, the load would succeed, and the
+	// fork would complete against correct code.
+	if foreignClaim != nil {
+		if relErr := foreignClaim.Release(); relErr != nil {
+			t.Fatalf("release foreign claim: %v", relErr)
+		}
+	} else {
+		t.Fatalf("the candidate claim was never taken: the hook did not fire on the staged candidate %q", candidateID)
+	}
+
+	if !errors.Is(err, snapshot.ErrSessionContended) {
+		t.Fatalf("fork = %v, want ErrSessionContended", err)
+	}
+	// The source stays live, current and claimed.
+	rt.mu.Lock()
+	src := a.sessions[sourceID]
+	srcActive := src != nil && src.store != nil && src.store.Active()
+	rt.mu.Unlock()
+	if !srcActive {
+		t.Fatal("source unit missing or store closed after the aborted fork")
+	}
+	if a.SessionCurrent().ID != sourceID {
+		t.Fatalf("current = %q after the aborted fork, want source %q", a.SessionCurrent().ID, sourceID)
+	}
+	if lock, ok, aerr := snapshot.AcquireSessionClaim(projectsRoot, projectID, sourceID); aerr != nil || ok {
+		if lock != nil {
+			_ = lock.Release()
+		}
+		t.Fatalf("source claim released by the aborted fork: ok=%v err=%v", ok, aerr)
+	}
+	// The candidate's staging directory is gone: the namespace must be
+	// readable before asserting it is empty.
+	entries, err := os.ReadDir(stagingParent)
+	if err != nil {
+		t.Fatalf("read staging namespace: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("staging left uncleaned after the aborted fork: %v", entries)
+	}
+	if emitted {
+		t.Fatal("boundary emitted for an aborted fork")
+	}
 }
