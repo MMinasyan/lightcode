@@ -161,12 +161,11 @@ func TestDetectRunningAtShutdownIsJoined(t *testing.T) {
 // registered on the background group and joined by shutdown even when the
 // host context is already cancelled: the cancelled context drives shutdown
 // while the detection blocks in its swapped warning handler, and the join
-// must wait on it. It does not establish the ordering of the watcher spawn
-// against the detection block in initOnceLocked — measured at 0/40 against
-// that re-inversion, because the init goroutine reaches the registration
-// before the watcher completes its shutdown preamble. The ordering is what
-// makes the race structurally impossible rather than benignly won; the
-// comment above the watcher in initOnceLocked is its guard.
+// must wait on it. The ordering of the watcher spawn against the detection
+// block in initOnceLocked — what makes the race structurally impossible
+// rather than benignly won — is asserted by
+// TestInitRegistersDetectionBeforeHostCancelWatcher, not re-established
+// here.
 func TestInitWithCancelledHostContextJoinsDetection(t *testing.T) {
 	home, projectRoot := t.TempDir(), t.TempDir()
 	a, pidfile, stalled, release := startDetectionAgent(t, home, projectRoot)
@@ -207,4 +206,58 @@ func TestInitWithCancelledHostContextJoinsDetection(t *testing.T) {
 	if !a.ShutdownOwner() {
 		t.Fatal("clean shutdown reported abandoned in-flight work")
 	}
+}
+
+// TestInitRegistersDetectionBeforeHostCancelWatcher pins the ordering of the
+// two blocks in initOnceLocked: detection registers on the background group
+// before the host-cancel watcher goroutine is started, so an already-cancelled
+// host context cannot let the watcher run ShutdownOwner — and join the
+// background group — before detection has registered on it. Exception,
+// recorded per the contract-test rule: the wait group's counter is unreadable,
+// so the registration leaves no trace a behavioural test could observe, and
+// the ordering is pinned structurally on initOnceLocked's own body — the file
+// mentions both markers elsewhere, so a file-wide comparison would not be
+// measuring this function. Reversing the two blocks fails the test.
+func TestInitRegistersDetectionBeforeHostCancelWatcher(t *testing.T) {
+	src, err := os.ReadFile("agent.go")
+	if err != nil {
+		t.Fatalf("read agent.go: %v", err)
+	}
+	body, ok := extractFunctionBody(string(src), "func (rt *runtime) initOnceLocked(")
+	if !ok {
+		t.Fatal("initOnceLocked not found")
+	}
+	det := strings.Index(body, "a.startDetectLocked(e)")
+	watcher := strings.Index(body, "a.ShutdownOwner()")
+	if det < 0 || watcher < 0 || det > watcher {
+		t.Fatalf("initOnceLocked must register detection (a.startDetectLocked) before starting the host-cancel watcher (a.ShutdownOwner); detection@%d watcher@%d", det, watcher)
+	}
+}
+
+// extractFunctionBody returns the brace-delimited body of the first function
+// whose definition line starts with prefix. It does not understand strings or
+// comments containing braces, so callers should pass production code only.
+func extractFunctionBody(source, prefix string) (string, bool) {
+	idx := strings.Index(source, prefix)
+	if idx < 0 {
+		return "", false
+	}
+	rest := source[idx:]
+	open := strings.Index(rest, "{")
+	if open < 0 {
+		return "", false
+	}
+	depth := 1
+	for i := open + 1; i < len(rest); i++ {
+		switch rest[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return rest[open+1 : i], true
+			}
+		}
+	}
+	return "", false
 }
