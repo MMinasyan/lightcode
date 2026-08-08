@@ -77,12 +77,17 @@ func (a *Agent) HydrateSession(sessionID string) (HydrationState, error) {
 	if err != nil {
 		// A non-live id that resolves to a persisted root session opens
 		// read-only: another process may be driving it, so nothing live exists
-		// to capture. Children and compact transcripts fall through to the
-		// child path, and an unknown id errors there.
+		// to capture. A metadata read that fails is an error — a corrupt
+		// record cannot present as a successful open. Children and compact
+		// transcripts fall through to the child path, and an unknown id
+		// errors there.
 		proj, perr := a.projectForExistingSession(sessionID)
 		if perr == nil {
 			meta, merr := snapshot.LoadSessionMeta(a.projects.SessionsRoot(proj.ID), sessionID)
-			if merr == nil && meta.ParentSessionID == "" && !isCompactSessionType(meta.ActiveAgentType) {
+			if merr != nil {
+				return HydrationState{}, merr
+			}
+			if meta.ParentSessionID == "" && !isCompactSessionType(meta.ActiveAgentType) {
 				return a.hydrateReadOnlyRoot(proj, sessionID, meta)
 			}
 		}

@@ -102,6 +102,50 @@ func TestHydrateSessionReadOnlyBranchLeavesChildrenToChildPath(t *testing.T) {
 	}
 }
 
+// TestHydrateSessionCorruptMetaReturnsError pins the non-live branch's
+// metadata-read failure: a persisted root session whose meta.json cannot be
+// parsed must surface that error instead of falling through to the child
+// path, which would present an empty-identity success. Corrupting the
+// compaction record instead would reach a different failure and pass either
+// way, so the metadata is corrupted specifically. The same session with
+// meta.json deleted still errors through the child path, and must continue
+// to.
+func TestHydrateSessionCorruptMetaReturnsError(t *testing.T) {
+	first, second := newSharedHomeAgentPair(t)
+	id, err := first.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if _, err := first.AppendUserMessageToSession(id, "durable from the driving owner"); err != nil {
+		t.Fatalf("AppendUserMessageToSession: %v", err)
+	}
+	proj, err := second.projectForExistingSession(id)
+	if err != nil {
+		t.Fatalf("projectForExistingSession: %v", err)
+	}
+	metaPath := filepath.Join(second.projects.SessionsRoot(proj.ID), id, "meta.json")
+
+	if err := os.WriteFile(metaPath, []byte(`{not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = second.HydrateSession(id)
+	if err == nil {
+		t.Fatal("HydrateSession on a corrupt meta.json = nil error, want the metadata read failure")
+	}
+	if !strings.Contains(err.Error(), "meta.json") {
+		t.Fatalf("HydrateSession on a corrupt meta.json error = %q, want the metadata read failure", err)
+	}
+
+	// Nearest sibling: the same session with meta.json deleted already errors
+	// through the child path, and must still.
+	if err := os.Remove(metaPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.HydrateSession(id); err == nil {
+		t.Fatal("HydrateSession on a deleted meta.json = nil error, want an error")
+	}
+}
+
 // TestContendedSessionErrorIsRecognisedByErrorsIs pins the wrapped-sentinel
 // contract the read-only open depends on: an explicit open of a session the
 // other owner drives fails with acquireClaimLocked's %w wrap of the snapshot
