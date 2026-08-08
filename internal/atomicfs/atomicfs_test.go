@@ -1,13 +1,18 @@
 package atomicfs
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestWriteReplacesAtomicallyWithMode(t *testing.T) {
@@ -121,6 +126,79 @@ func TestWriteSyncFailureBeforePublicationAborts(t *testing.T) {
 	}
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 0 {
+		t.Fatalf("leftover entries after the aborted write: %v", entries)
+	}
+}
+
+// TestWriteSyncFailureBeforePublicationPreservesExistingContent proves a
+// pre-publication temp sync failure on a present target is an ordinary
+// failed write that leaves the old complete contents intact: Write returns
+// the error, removes the temp, and the destination still holds the bytes it
+// held before the call. The sibling
+// TestWriteSyncFailureBeforePublicationAborts starts from an absent path, so
+// its assertions cannot distinguish removing the temp from removing the
+// target — only a present target can see the difference.
+func TestWriteSyncFailureBeforePublicationPreservesExistingContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rec.json")
+	if err := Write(path, []byte("original"), 0o600); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	injected := errors.New("injected temp sync failure")
+	SyncFileFunc = func(*os.File) error { return injected }
+	defer func() { SyncFileFunc = nil }()
+
+	err := Write(path, []byte("replacement"), 0o600)
+	if err == nil {
+		t.Fatal("Write succeeded; want the injected temp sync failure")
+	}
+	got, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatalf("read destination: %v", readErr)
+	}
+	if string(got) != "original" {
+		t.Fatalf("destination = %q after the failed write, want original", got)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 || entries[0].Name() != "rec.json" {
+		t.Fatalf("leftover entries after the aborted write: %v", entries)
+	}
+}
+
+// TestCreateExclusiveSyncFailureBeforePublicationPreservesExistingContent
+// proves the same present-target rule for the link-based publisher:
+// CreateExclusive returns the error, leaves no temp behind (its defer removes
+// it), and the existing file keeps its original contents.
+func TestCreateExclusiveSyncFailureBeforePublicationPreservesExistingContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rec.json")
+
+	created, err := CreateExclusive(path, []byte("original"), 0o600)
+	if err != nil || !created {
+		t.Fatalf("seed create: (%v, %v)", created, err)
+	}
+
+	injected := errors.New("injected temp sync failure")
+	SyncFileFunc = func(*os.File) error { return injected }
+	defer func() { SyncFileFunc = nil }()
+
+	created, err = CreateExclusive(path, []byte("replacement"), 0o600)
+	if err == nil {
+		t.Fatal("CreateExclusive succeeded; want the injected temp sync failure")
+	}
+	if created {
+		t.Fatal("created = true on a failed write")
+	}
+	got, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatalf("read destination: %v", readErr)
+	}
+	if string(got) != "original" {
+		t.Fatalf("destination = %q after the failed write, want original", got)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 || entries[0].Name() != "rec.json" {
 		t.Fatalf("leftover entries after the aborted write: %v", entries)
 	}
 }
@@ -458,4 +536,151 @@ func TestWithLockSerializesReadModifyWrite(t *testing.T) {
 	if n != workers {
 		t.Fatalf("counter = %d, want %d (lost updates)", n, workers)
 	}
+}
+
+// crashChildDestEnv selects the child half of
+// TestCrashBeforeRenameLeavesReadableOrphanTemp and names the destination it
+// publishes to; crashChildCreateEnv selects the CreateExclusive shape.
+const (
+	crashChildDestEnv   = "LIGHTCODE_ATOMICFS_CRASH_DEST"
+	crashChildCreateEnv = "LIGHTCODE_ATOMICFS_CRASH_CREATE"
+)
+
+// TestCrashBeforeRenameLeavesReadableOrphanTemp proves the crash-before-
+// rename state: when a writer process dies while its temp holds the complete
+// new data but before Close and rename/link have run, the destination is
+// untouched and the temp survives as an orphan — residue a writer's crash
+// leaves behind, which readers ignore. This test asserts both halves of
+// "harmless": the old content is intact (or the new record absent) and the
+// orphan is present and readable. A self-exec child installs SyncFileFunc as
+// a function that prints a ready marker and blocks forever; the hook fires
+// after the data is written to the temp and before Close and rename/link, so
+// the parent, on seeing the marker, kills the child and inspects exactly
+// that state. Both publisher shapes run: Write (rename-based, destination
+// seeded present) and CreateExclusive (link-based, destination absent).
+func TestCrashBeforeRenameLeavesReadableOrphanTemp(t *testing.T) {
+	if dest := os.Getenv(crashChildDestEnv); dest != "" {
+		// Child: block the publication inside the temp sync, leaving the temp
+		// on disk with complete data and the destination untouched.
+		block := make(chan struct{})
+		SyncFileFunc = func(*os.File) error {
+			fmt.Println("synced")
+			<-block
+			return nil
+		}
+		if os.Getenv(crashChildCreateEnv) == "1" {
+			if _, err := CreateExclusive(dest, []byte("replacement"), 0o600); err != nil {
+				fmt.Fprintf(os.Stderr, "create: %v\n", err)
+				os.Exit(2)
+			}
+		} else {
+			if err := Write(dest, []byte("replacement"), 0o600); err != nil {
+				fmt.Fprintf(os.Stderr, "write: %v\n", err)
+				os.Exit(2)
+			}
+		}
+		os.Exit(3) // unreachable: the hook blocks forever
+	}
+
+	t.Run("write", func(t *testing.T) {
+		dir := t.TempDir()
+		dest := filepath.Join(dir, "rec.json")
+		if err := Write(dest, []byte("original"), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		runCrashChild(t, dir, dest, false)
+		got, err := os.ReadFile(dest)
+		if err != nil {
+			t.Fatalf("read destination: %v", err)
+		}
+		if string(got) != "original" {
+			t.Fatalf("destination = %q after the crash, want original", got)
+		}
+		orphan := readOrphan(t, dir)
+		if string(orphan) != "replacement" {
+			t.Fatalf("orphan = %q, want the complete replacement data", orphan)
+		}
+	})
+	t.Run("create", func(t *testing.T) {
+		dir := t.TempDir()
+		dest := filepath.Join(dir, "rec.json")
+		runCrashChild(t, dir, dest, true)
+		if _, err := os.Stat(dest); !os.IsNotExist(err) {
+			t.Fatalf("destination exists after the crash: %v", err)
+		}
+		orphan := readOrphan(t, dir)
+		if string(orphan) != "replacement" {
+			t.Fatalf("orphan = %q, want the complete replacement data", orphan)
+		}
+	})
+}
+
+// runCrashChild spawns the child half of
+// TestCrashBeforeRenameLeavesReadableOrphanTemp, waits for its ready marker
+// (the temp sync is in flight), kills it mid-publication, and reaps it.
+func runCrashChild(t *testing.T, dir, dest string, create bool) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCrashBeforeRenameLeavesReadableOrphanTemp$")
+	cmd.Env = append(os.Environ(), crashChildDestEnv+"="+dest)
+	if create {
+		cmd.Env = append(cmd.Env, crashChildCreateEnv+"=1")
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("child stdout pipe: %v", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	ready := make(chan struct{})
+	scannerDone := make(chan struct{})
+	go func() {
+		defer close(scannerDone)
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if scanner.Text() == "synced" {
+				close(ready)
+				return
+			}
+		}
+	}()
+	select {
+	case <-ready:
+	case <-time.After(30 * time.Second):
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		<-scannerDone
+		t.Fatalf("child never reached the temp sync\n%s", stderr.String())
+	}
+	// The temp is on disk with complete data; kill the child there. The child
+	// is always reaped — also when Kill reports the process already exited —
+	// and the scanner joined before the test can fail, so neither the child
+	// nor the goroutine outlives the test. The kill is intentional, so the
+	// non-nil Wait error is expected.
+	killErr := cmd.Process.Kill()
+	_ = cmd.Wait()
+	<-scannerDone
+	if killErr != nil {
+		t.Fatalf("kill child: %v", killErr)
+	}
+}
+
+// readOrphan returns the single *.tmp-* orphan in dir, failing the test when
+// none (or more than one) exists.
+func readOrphan(t *testing.T, dir string) []byte {
+	t.Helper()
+	orphans, err := filepath.Glob(filepath.Join(dir, "*.tmp-*"))
+	if err != nil {
+		t.Fatalf("glob orphans: %v", err)
+	}
+	if len(orphans) != 1 {
+		t.Fatalf("orphans = %v, want exactly one", orphans)
+	}
+	data, err := os.ReadFile(orphans[0])
+	if err != nil {
+		t.Fatalf("read orphan %s: %v", orphans[0], err)
+	}
+	return data
 }

@@ -1,12 +1,20 @@
 package project
 
 import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 func TestResolverEnsureCurrentAndSessionsRoot(t *testing.T) {
@@ -280,5 +288,151 @@ func setActivityForTest(t *testing.T, root, id string, activity int64) {
 	p.LastActivity = activity
 	if err := writeJSON(metaPath, p); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// projectMetaLockHolderRootEnv and projectMetaLockHolderIDEnv select the
+// child half of TestTouchActivityLockBlocksSecondProcess and name the
+// project whose meta lock it holds.
+const (
+	projectMetaLockHolderRootEnv = "LIGHTCODE_PROJECT_META_LOCK_HOLDER_ROOT"
+	projectMetaLockHolderIDEnv   = "LIGHTCODE_PROJECT_META_LOCK_HOLDER_ID"
+)
+
+// TestTouchActivityLockBlocksSecondProcess proves the project meta
+// read-modify-write is serialized across processes, not just goroutines: the
+// meta record is written by more than one process, so while a second process
+// holds the record's own metaLockPath, this process's TouchActivity must not
+// complete. WithLock excludes goroutines too, so a same-process test cannot
+// tell flock from a sync.Mutex — which is why this test runs two processes.
+// The child (a self-exec of the test binary) takes atomicfs.Acquire on the
+// meta lock and holds it until the parent closes its stdin; the parent then
+// observes that its own TouchActivity is blocked, releases the child, and
+// observes the call complete and the record whole.
+// The record is seeded with LastActivity far in the past so the write
+// actually happens: TouchActivity returns without writing when now <=
+// LastActivity, at second granularity, so a fresh record would make the call
+// a no-op and the test vacuous.
+func TestTouchActivityLockBlocksSecondProcess(t *testing.T) {
+	const holdBound = 30 * time.Second
+	const blockWindow = time.Second
+
+	if root := os.Getenv(projectMetaLockHolderRootEnv); root != "" {
+		// Child: hold the meta lock until the parent closes stdin.
+		id := os.Getenv(projectMetaLockHolderIDEnv)
+		l, err := atomicfs.Acquire(metaLockPath(root, id))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		fmt.Println("ready")
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		if err := l.Release(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(3)
+		}
+		os.Exit(0)
+	}
+
+	root := t.TempDir()
+	path := filepath.Join(t.TempDir(), "proj")
+	p := ensureForTest(t, root, path)
+	setActivityForTest(t, root, p.ID, 1)
+
+	holderCtx, holderCancel := context.WithTimeout(context.Background(), holdBound)
+	defer holderCancel()
+	cmd := exec.CommandContext(holderCtx, os.Args[0], "-test.run=^TestTouchActivityLockBlocksSecondProcess$")
+	cmd.Env = append(os.Environ(),
+		projectMetaLockHolderRootEnv+"="+root,
+		projectMetaLockHolderIDEnv+"="+p.ID,
+	)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("child stdin pipe: %v", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("child stdout pipe: %v", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	// One cleanup path for every outcome: close the child's stdin (releasing
+	// its lock), reap it, and join the marker scanner at pipe EOF. The
+	// bounded context kills the child at the deadline if it ever hangs, so a
+	// started child cannot outlive the test. Repeating the call after the
+	// success path is harmless.
+	ready := make(chan struct{})
+	scannerDone := make(chan struct{})
+	go func() {
+		defer close(scannerDone)
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if scanner.Text() == "ready" {
+				close(ready)
+				return
+			}
+		}
+	}()
+	reap := func() error {
+		_ = stdin.Close()
+		err := cmd.Wait()
+		<-scannerDone
+		return err
+	}
+	// fail kills the child (cancelling its context), reaps it, and only then
+	// returns its stderr for diagnostics: the buffer is never read while the
+	// child can still write to it.
+	fail := func() string {
+		holderCancel()
+		_ = reap()
+		return stderr.String()
+	}
+	defer func() { holderCancel(); _ = reap() }()
+
+	select {
+	case <-ready:
+	case <-holderCtx.Done():
+		t.Fatalf("child never held the meta lock within %v: %v\n%s", holdBound, holderCtx.Err(), fail())
+	}
+
+	// The writer goroutine announces itself immediately before invoking
+	// TouchActivity, so the bounded wait below cannot be satisfied by a call
+	// that never began.
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		done <- TouchActivity(root, p.ID)
+	}()
+
+	<-started
+	select {
+	case err := <-done:
+		t.Fatalf("TouchActivity returned %v while the child held the meta lock; only a process-local exclusion can do that", err)
+	case <-time.After(blockWindow):
+		// Blocked, as required.
+	}
+
+	if err := reap(); err != nil {
+		t.Fatalf("child after release: %v\n%s", err, stderr.String())
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("TouchActivity after the child released: %v", err)
+		}
+	case <-time.After(holdBound):
+		t.Fatal("TouchActivity did not return after the child released the lock")
+	}
+
+	found, err := FindByPath(root, path)
+	if err != nil {
+		t.Fatalf("FindByPath: %v", err)
+	}
+	if found.LastActivity <= 1 {
+		t.Fatalf("LastActivity = %d, want the touch advanced past the seeded 1", found.LastActivity)
 	}
 }

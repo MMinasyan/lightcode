@@ -1,10 +1,19 @@
 package permission
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 func TestSaveLocalHappyPath(t *testing.T) {
@@ -260,5 +269,144 @@ func TestLoadLocalProjectIDScoping(t *testing.T) {
 	}
 	if len(got.Allow) != 0 {
 		t.Fatalf("projY Allow = %v, want empty", got.Allow)
+	}
+}
+
+// permLockHolderRootEnv selects the child half of
+// TestSaveLocalLockBlocksSecondProcess and names the projects root whose
+// permissions lock it holds.
+const permLockHolderRootEnv = "LIGHTCODE_PERM_LOCK_HOLDER_ROOT"
+
+// TestSaveLocalLockBlocksSecondProcess proves the permissions read-modify-
+// write is serialized across processes, not just goroutines: the permissions
+// file is written by more than one process, so while a second process holds
+// the record's own lock path, this process's SaveLocal must not complete.
+// WithLock excludes goroutines too, so a same-process test cannot tell flock
+// from a sync.Mutex — which is why this test runs two processes. The child
+// (a self-exec of the test binary) takes atomicfs.Acquire on the permissions
+// lock and holds it until the parent closes its stdin; the parent then
+// observes that its own SaveLocal is blocked, releases the child, and
+// observes the call complete and the record whole.
+func TestSaveLocalLockBlocksSecondProcess(t *testing.T) {
+	const pid = "proj-lock"
+	const holdBound = 30 * time.Second
+	const blockWindow = time.Second
+
+	if root := os.Getenv(permLockHolderRootEnv); root != "" {
+		// Child: hold the permissions lock until the parent closes stdin.
+		l, err := atomicfs.Acquire(lockPath(root, pid))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		fmt.Println("ready")
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		if err := l.Release(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(3)
+		}
+		os.Exit(0)
+	}
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, pid), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveLocal(root, pid, Rules{Allow: []string{"orig"}}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	holderCtx, holderCancel := context.WithTimeout(context.Background(), holdBound)
+	defer holderCancel()
+	cmd := exec.CommandContext(holderCtx, os.Args[0], "-test.run=^TestSaveLocalLockBlocksSecondProcess$")
+	cmd.Env = append(os.Environ(), permLockHolderRootEnv+"="+root)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("child stdin pipe: %v", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("child stdout pipe: %v", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	// One cleanup path for every outcome: close the child's stdin (releasing
+	// its lock), reap it, and join the marker scanner at pipe EOF. The
+	// bounded context kills the child at the deadline if it ever hangs, so a
+	// started child cannot outlive the test. Repeating the call after the
+	// success path is harmless.
+	ready := make(chan struct{})
+	scannerDone := make(chan struct{})
+	go func() {
+		defer close(scannerDone)
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if scanner.Text() == "ready" {
+				close(ready)
+				return
+			}
+		}
+	}()
+	reap := func() error {
+		_ = stdin.Close()
+		err := cmd.Wait()
+		<-scannerDone
+		return err
+	}
+	// fail kills the child (cancelling its context), reaps it, and only then
+	// returns its stderr for diagnostics: the buffer is never read while the
+	// child can still write to it.
+	fail := func() string {
+		holderCancel()
+		_ = reap()
+		return stderr.String()
+	}
+	defer func() { holderCancel(); _ = reap() }()
+
+	select {
+	case <-ready:
+	case <-holderCtx.Done():
+		t.Fatalf("child never held the permissions lock within %v: %v\n%s", holdBound, holderCtx.Err(), fail())
+	}
+
+	// The writer goroutine announces itself immediately before invoking
+	// SaveLocal, so the bounded wait below cannot be satisfied by a call that
+	// never began.
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		done <- SaveLocal(root, pid, Rules{Allow: []string{"added"}})
+	}()
+
+	<-started
+	select {
+	case err := <-done:
+		t.Fatalf("SaveLocal returned %v while the child held the permissions lock; only a process-local exclusion can do that", err)
+	case <-time.After(blockWindow):
+		// Blocked, as required.
+	}
+
+	if err := reap(); err != nil {
+		t.Fatalf("child after release: %v\n%s", err, stderr.String())
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SaveLocal after the child released: %v", err)
+		}
+	case <-time.After(holdBound):
+		t.Fatal("SaveLocal did not return after the child released the lock")
+	}
+
+	got, err := LoadLocal(root, pid)
+	if err != nil {
+		t.Fatalf("LoadLocal: %v", err)
+	}
+	if len(got.Allow) != 2 || got.Allow[0] != "orig" || got.Allow[1] != "added" {
+		t.Fatalf("Allow = %v, want [orig added]", got.Allow)
 	}
 }
