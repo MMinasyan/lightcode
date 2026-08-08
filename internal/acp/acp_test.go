@@ -2168,6 +2168,23 @@ func TestACPExplicitSwitchToContendedSessionIsReadOnly(t *testing.T) {
 		t.Fatalf("compact over the read-only session = %+v, want the contention message", compactResp.Error)
 	}
 
+	// An explicit-id compact names the contention too, instead of the owner's
+	// "unknown session" answer for a session this connection holds read-only.
+	out.Reset()
+	r.handleCompact(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "compact",
+		Params:  json.RawMessage(`{"session_id":"` + heldID + `"}`),
+	})
+	lines = drainedLines(t, r, &out, 1)
+	var explicitCompactResp Response
+	if err := json.Unmarshal([]byte(lines[0]), &explicitCompactResp); err != nil {
+		t.Fatalf("explicit-id compact response json: %v", err)
+	}
+	if explicitCompactResp.Error == nil || !strings.Contains(explicitCompactResp.Error.Message, "driven by another process") {
+		t.Fatalf("explicit-id compact over the read-only session = %+v, want the contention message", explicitCompactResp.Error)
+	}
+
 	out.Reset()
 	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "snaps", Method: "snapshot/list"})
 	lines = drainedLines(t, r, &out, 1)

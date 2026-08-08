@@ -689,6 +689,17 @@ func (r *Runner) handleSessionNew(req Request) {
 	r.respond(req.ID, r.currentSessionSummary())
 }
 
+// contentionIfReadOnly returns the contention error when the connection's
+// read-only marker names sessionID, and otherwise returns err unchanged. The
+// marker is adapter-local: the owner's original refusal stays authoritative
+// outside this adapter's translation.
+func (r *Runner) contentionIfReadOnly(sessionID string, err error) error {
+	if r.sv().IsReadOnly(sessionID) {
+		return agent.SessionContendedError(sessionID)
+	}
+	return err
+}
+
 func (r *Runner) handleSessionPrompt(ctx context.Context, req Request) {
 	var params struct {
 		SessionID string `json:"session_id"`
@@ -712,10 +723,7 @@ func (r *Runner) handleSessionPrompt(ctx context.Context, req Request) {
 	if strings.TrimSpace(params.SessionID) != "" {
 		summary, err = r.agent.SessionSummaryForSession(sessionID)
 		if err != nil {
-			if r.sv().IsReadOnly(sessionID) {
-				err = agent.SessionContendedError(sessionID)
-			}
-			r.respondError(req.ID, -32000, err.Error())
+			r.respondError(req.ID, -32000, r.contentionIfReadOnly(sessionID, err).Error())
 			return
 		}
 	}
@@ -735,12 +743,9 @@ func (r *Runner) handleSessionPrompt(ctx context.Context, req Request) {
 		}
 	})
 	if err != nil {
-		if r.sv().IsReadOnly(sessionID) {
-			// The session is read-only: another process drives it, so the
-			// owner refuses it as unknown. Say what is actually wrong.
-			err = agent.SessionContendedError(sessionID)
-		}
-		r.respondError(req.ID, -32000, err.Error())
+		// The read-only marker names the session: another process drives it,
+		// so the owner refuses it as unknown. Say what is actually wrong.
+		r.respondError(req.ID, -32000, r.contentionIfReadOnly(sessionID, err).Error())
 		return
 	}
 	r.respond(req.ID, map[string]any{
@@ -1145,7 +1150,7 @@ func (r *Runner) handleCompact(ctx context.Context, req Request) {
 		}
 	}
 	if err := r.agent.CompactNowForSession(ctx, sessionID); err != nil {
-		r.respondError(req.ID, -32000, err.Error())
+		r.respondError(req.ID, -32000, r.contentionIfReadOnly(sessionID, err).Error())
 		return
 	}
 	r.respond(req.ID, map[string]any{"ok": true})
