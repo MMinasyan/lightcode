@@ -386,6 +386,99 @@ describe('App permission prompt on a boundary', () => {
   });
 });
 
+describe('App hydration replay and queue guard', () => {
+  // The boot barrier's buffering path (agents.md §2): every event listener is
+  // registered before the first hydration read, one snapshot of the
+  // adapter-current session is applied, then whatever arrived during that
+  // window replays in order — so a turn already streaming when the frontend
+  // attaches is never silently lost, while the transcript gate drops anything
+  // the snapshot already covers (sequence at or below its high-water).
+
+  it('replays sequenced frames buffered during the pending read, in delivery order, dropping the frame the snapshot already covers', async () => {
+    // Hold the hydration read unresolved so frames delivered now are buffered
+    // by the listener wrappers rather than applied to the view.
+    let resolveHydrate;
+    backend.HydrateSession = () => new Promise((resolve) => { resolveHydrate = resolve; });
+    const { app, target } = await mountApp();
+
+    // The stale frame is deliberately first: admitSequenced advances the
+    // high-water on every admitted frame, so a stale frame placed after the
+    // two live ones would be dropped by the advanced gate even if snapshot
+    // cursor seeding were broken. Placed first, it is tested against the
+    // seeded high-water alone.
+    fire('user_message', { seq: 1, turn: 1, content: 'stale' });
+    fire('user_message', { seq: 2, turn: 1, content: 'second' });
+    fire('user_message', { seq: 3, turn: 1, content: 'third' });
+
+    // Nothing renders while the read is pending: the frames are buffered, not
+    // applied (the snapshot must land first, or its replace clobbers them).
+    expect(target.querySelector('.message.user')).toBeNull();
+
+    // The snapshot's high-water comes only from cursor.committedSeq, tail[].seq
+    // and errors[].seq; the file's default mock returns none of them, so its
+    // gate would be {highWater: 0} and every frame admitted. Carrying
+    // committedSeq 1 seeds the gate above the stale seq-1 frame.
+    resolveHydrate({ ...navState(), messages: [], cursor: { committedTurn: 1, committedSeq: 1, rewriteEpoch: 0 } });
+    await settle();
+
+    // The two live frames replay in delivery order; the stale frame is absent.
+    const rows = [...target.querySelectorAll('.message.user .plain')].map((el) => el.textContent);
+    expect(rows).toEqual(['second', 'third']);
+
+    unmount(app);
+  });
+
+  it('buffers a queue_changed event delivered while hydration is pending and replays it after the snapshot', async () => {
+    let resolveHydrate;
+    backend.HydrateSession = () => new Promise((resolve) => { resolveHydrate = resolve; });
+    const { app, target } = await mountApp();
+
+    // The event is versioned above the default watermark (0) but must be held:
+    // applied immediately, it would mutate messageQueue, and the snapshot then
+    // clobbers the queue and re-seeds the watermark, so the live update is
+    // lost and never replayed.
+    fire('queue_changed', { version: 1, items: [{ id: 'q1', content: 'queued during read' }] });
+    expect(target.querySelector('.queued-msg')).toBeNull();
+
+    resolveHydrate(navState());
+    await settle();
+
+    expect(target.querySelector('.queued-msg')?.textContent).toBe('queued during read');
+
+    unmount(app);
+  });
+
+  it('drops stale queue_changed versions, applies higher ones, and re-seeds the watermark from a boundary', async () => {
+    const { app, target } = await mountApp();
+
+    // The default hydration mock carries no queue, so the watermark is 0.
+    fire('queue_changed', { version: 5, items: [{ id: 'a', content: 'A' }] });
+    await tick();
+    expect(target.querySelector('.queued-msg')?.textContent).toBe('A');
+
+    // Equal to the watermark: ignored. The equality is the load-bearing half
+    // of the guard: an older version would be dropped even if the guard
+    // regressed from `<=` to `<`, while an equal one only drops under `<=`.
+    fire('queue_changed', { version: 5, items: [{ id: 'x', content: 'X' }] });
+    await tick();
+    expect(target.querySelector('.queued-msg')?.textContent).toBe('A');
+
+    // A navigation boundary re-seeds the watermark from the snapshot's queue
+    // version (2), below the live watermark (5)...
+    fire('navigation', { ...navState(), queue: { version: 2, items: [{ id: 'b', content: 'B' }] } });
+    await tick();
+    expect(target.querySelector('.queued-msg')?.textContent).toBe('B');
+
+    // ...so a version above the re-seeded watermark applies; without the
+    // re-seed it would be dropped against the stale 5.
+    fire('queue_changed', { version: 3, items: [{ id: 'c', content: 'C' }] });
+    await tick();
+    expect(target.querySelector('.queued-msg')?.textContent).toBe('C');
+
+    unmount(app);
+  });
+});
+
 describe('App turn-action fork warning', () => {
   it('a fork whose code revert failed shows the warning after the state and the kept-files notice are applied', async () => {
     const { app, target } = await mountApp();
