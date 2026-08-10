@@ -53,10 +53,11 @@ type Manager struct {
 	maxProcs      int
 	outputOptions cmdoutput.Options
 	workspaceRoot string
-	// closed rejects new starts after Close. cbClosed suppresses exit callbacks
-	// not yet admitted; cbWG tracks callbacks admitted before close, both guarded
-	// by mu so admission cannot race Close's wait. closeOnce/closeDone make Close
-	// a single shared join so concurrent callers all wait for the same cleanup.
+	// closed rejects new starts after CloseAdmission. cbClosed suppresses exit
+	// callbacks not yet admitted; cbWG tracks callbacks admitted before close,
+	// both guarded by mu so admission cannot race CloseWait's wait.
+	// closeOnce/closeDone make CloseWait a single shared join so concurrent
+	// callers all wait for the same cleanup.
 	closed    bool
 	cbClosed  bool
 	cbWG      sync.WaitGroup
@@ -396,14 +397,25 @@ func (m *Manager) kill(id string, sessionID string, enforceSession bool) error {
 	return nil
 }
 
-// Close stops accepting new starts, terminates and reaps every registered child,
-// and joins every exit callback admitted before close; callbacks not yet
-// admitted are suppressed. It is idempotent.
-func (m *Manager) Close() {
+// CloseAdmission stops accepting new starts without waiting: it takes m.mu,
+// sets closed and cbClosed (so a child admitted before close still runs its
+// callback and one admitted after never does), and returns. It is the owner's
+// process-admission boundary, taken at the start of shutdown so no process can
+// be launched while shutdown waits on admitted work.
+func (m *Manager) CloseAdmission() {
+	m.mu.Lock()
+	m.closed = true
+	m.cbClosed = true
+	m.mu.Unlock()
+}
+
+// CloseWait snapshots the IDs admitted before admission closed, terminates and
+// reaps every one of them, and joins every exit callback admitted before close
+// through the shared closeDone; callbacks not yet admitted are suppressed. It
+// is idempotent and returns no value.
+func (m *Manager) CloseWait() {
 	m.closeOnce.Do(func() {
 		m.mu.Lock()
-		m.closed = true
-		m.cbClosed = true
 		ids := make([]string, 0, len(m.procs))
 		for id := range m.procs {
 			ids = append(ids, id)
@@ -416,8 +428,16 @@ func (m *Manager) Close() {
 		close(m.closeDone)
 	})
 	// Every caller, including the one that performed the work, waits for the
-	// shared cleanup to complete so Close is a real join.
+	// shared cleanup to complete so CloseWait is a real join.
 	<-m.closeDone
+}
+
+// Close stops accepting new starts, terminates and reaps every registered
+// child, and joins every exit callback admitted before close; callbacks not
+// yet admitted are suppressed. It is idempotent.
+func (m *Manager) Close() {
+	m.CloseAdmission()
+	m.CloseWait()
 }
 
 func (cs *CommandStarted) markReason(reason ExitReason) bool {

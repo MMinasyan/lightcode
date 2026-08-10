@@ -4,7 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestEndOfTurnOrderingPersistsMessagesBeforeCompleteMarker(t *testing.T) {
@@ -284,4 +286,110 @@ func TestLoadMostRecentSkipsChildSessions(t *testing.T) {
 	if mostRecent != parentID {
 		t.Fatalf("LoadMostRecent = %q, want parent %q", mostRecent, parentID)
 	}
+}
+
+// TestSweepCloseFirstRefusesWithoutClaim proves a close-first sweep candidate
+// is refused by the lifecycle serializer before any claim: a candidate whose
+// serializer reports not-admitted performs no claim, metadata re-read, archive
+// write, or delete, so it stays active on disk and its claim stays
+// acquirable. The serializer's admitted result is the owner-close admission
+// carried into the sweep.
+func TestSweepCloseFirstRefusesWithoutClaim(t *testing.T) {
+	projectsRoot := t.TempDir()
+	projectID := "p-sweep-close"
+	sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+	if err := os.MkdirAll(sessionsRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const id = "close1"
+	if err := os.MkdirAll(filepath.Join(sessionsRoot, id), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(sessionsRoot, id, "meta.json"), SessionMeta{ID: id, State: StateActive, LastActivity: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := LifecycleConfig{Enabled: true, ArchiveAfterDays: 1, DeleteAfterArchiveDays: 3650}
+	archived, deleted, err := SweepAllProjects(projectsRoot, cfg, nil, func() (func(), bool) {
+		// Owner close won before this candidate was admitted.
+		return nil, false
+	})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if archived != 0 || deleted != 0 {
+		t.Fatalf("sweep counts = archived:%d deleted:%d, want 0/0 for a refused candidate", archived, deleted)
+	}
+
+	meta, err := LoadSessionMeta(sessionsRoot, id)
+	if err != nil {
+		t.Fatalf("load meta: %v", err)
+	}
+	if effectiveState(meta.State) != StateActive {
+		t.Fatalf("refused candidate state = %q, want active (no archive write)", meta.State)
+	}
+	lock, ok, err := AcquireSessionClaim(projectsRoot, projectID, id)
+	if err != nil || !ok {
+		t.Fatalf("refused candidate claim: ok=%v err=%v, want acquirable (no claim taken)", ok, err)
+	}
+	_ = lock.Release()
+}
+
+// TestSweepCloseFirstRefusedCandidatePerformsNoMetaRead proves the refusal
+// happens before the candidate's metadata is read at all: the candidate's
+// meta.json is a FIFO, so any read would block forever. A close-first sweep
+// must return promptly without touching it. If a pre-fix ordering read the
+// meta before the serializer, the sweep blocks on the FIFO; the test then
+// opens the FIFO read/write to unblock it before failing, so the pre-fix
+// ordering is detected without any production test seam.
+func TestSweepCloseFirstRefusedCandidatePerformsNoMetaRead(t *testing.T) {
+	projectsRoot := t.TempDir()
+	projectID := "p-sweep-fifo"
+	sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+	if err := os.MkdirAll(sessionsRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const id = "fifo1"
+	if err := os.MkdirAll(filepath.Join(sessionsRoot, id), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(sessionsRoot, id, "meta.json")
+	if err := syscall.Mkfifo(metaPath, 0o600); err != nil {
+		t.Fatalf("mkfifo %s: %v", metaPath, err)
+	}
+
+	cfg := LifecycleConfig{Enabled: true, ArchiveAfterDays: 1, DeleteAfterArchiveDays: 3650}
+	done := make(chan struct{})
+	go func() {
+		_, _, _ = SweepAllProjects(projectsRoot, cfg, nil, func() (func(), bool) {
+			// Owner close won before this candidate was admitted.
+			return nil, false
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// The refused candidate never opened the FIFO: no metadata read.
+	case <-time.After(2 * time.Second):
+		// Pre-fix ordering: the sweep blocked reading the FIFO. Open it
+		// read/write so the blocked read unblocks and the sweep can finish,
+		// then fail — the block itself is the detected defect.
+		if w, err := os.OpenFile(metaPath, os.O_RDWR, 0); err == nil {
+			w.Close()
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("sweep did not finish even after the FIFO was unblocked")
+		}
+		t.Fatal("close-first sweep blocked reading the candidate meta: a refused candidate performed a metadata read")
+	}
+
+	// The refused candidate still took no claim: the session stays claimable.
+	lock, ok, err := AcquireSessionClaim(projectsRoot, projectID, id)
+	if err != nil || !ok {
+		t.Fatalf("refused candidate claim: ok=%v err=%v, want acquirable (no claim taken)", ok, err)
+	}
+	_ = lock.Release()
 }

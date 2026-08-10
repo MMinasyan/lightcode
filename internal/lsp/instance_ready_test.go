@@ -10,11 +10,15 @@ package lsp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -42,6 +46,7 @@ init_delay = float(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else 0.0
 ready_delay = float(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else 0.0
 crash = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else ""
 stubborn = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else ""
+requests_log = os.environ.get("FAKE_LSP_REQUESTS_LOG", "")
 
 first_launch = False
 if crash:
@@ -78,6 +83,9 @@ while True:
         continue
     body = json.loads(stdin.read(length))
     method = body.get("method")
+    if requests_log:
+        with open(requests_log, "a") as f:
+            f.write(method + "\n")
     if method == "initialize":
         if init_delay:
             time.sleep(init_delay)
@@ -403,6 +411,262 @@ func TestStartRefusedWhileReady(t *testing.T) {
 	}
 	if n := countLaunches(log); n != 1 {
 		t.Fatalf("server processes launched = %d, want 1", n)
+	}
+}
+
+// TestStartAfterPermanentCloseSelfReaps proves the close-loser path: a start
+// whose process was already launched when permanent close won must kill and
+// reap that process itself — it is the sole cmd.Wait owner before procDone and
+// watchProcess are installed — and return the unavailable error, so no
+// launched process is ever left untracked. The barrier holds the start
+// between cmd.Start and the post-launch attempt-identity recheck, and the
+// waitCommand seam counts exactly one wait on this side of the handoff.
+func TestStartAfterPermanentCloseSelfReaps(t *testing.T) {
+	home := t.TempDir()
+	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", "fake")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(cacheDir, "fake-lsp.py")
+	if err := os.WriteFile(real, []byte(fakeServerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The wrapper records the launched process's pid before exec'ing the real
+	// script, so the test can assert the close loser was actually reaped.
+	wrapper := filepath.Join(cacheDir, "fake-lsp")
+	wrapperScript := "#!/bin/sh\necho $$ > \"${FAKE_PIDFILE:?}\"\nexec python3 \"$(dirname \"$0\")/fake-lsp.py\" \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pidfile := filepath.Join(t.TempDir(), "lsp.pid")
+	t.Setenv("FAKE_PIDFILE", pidfile)
+
+	log := filepath.Join(t.TempDir(), "launches.log")
+	inst := newInstance(&server.Definition{
+		Name:    "fake",
+		Command: "fake-lsp",
+		Args:    []string{log, "", "0", "0", "", "1"},
+	}, t.TempDir(), home, nil)
+	t.Cleanup(func() { inst.shutdown() })
+
+	// Count every instance-owned process wait through the seam.
+	var waits atomic.Int64
+	oldWait := waitCommand
+	waitCommand = func(cmd *exec.Cmd) error { waits.Add(1); return oldWait(cmd) }
+	t.Cleanup(func() { waitCommand = oldWait })
+
+	// Hold the start after cmd.Start and before the attempt-identity recheck.
+	launched := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	oldProbe := startProbe
+	startProbe = func() { once.Do(func() { close(launched) }); <-release }
+	t.Cleanup(func() { startProbe = oldProbe })
+
+	started := make(chan error, 1)
+	go func() { _, err := inst.start(context.Background()); started <- err }()
+	select {
+	case <-launched:
+	case <-time.After(10 * time.Second):
+		t.Fatal("start never reached the post-launch identity recheck")
+	}
+
+	// The process is running when permanent close wins. Wait for the launch
+	// log too: the wrapper writes the pidfile before exec'ing the script, so
+	// the log write is what proves the server process itself is up.
+	var pid int
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if countLaunches(log) >= 1 {
+			if data, err := os.ReadFile(pidfile); err == nil {
+				if p, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && p > 0 {
+					pid = p
+					break
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pid == 0 {
+		t.Fatal("language server process never launched")
+	}
+
+	inst.closeAdmission()
+	close(release)
+
+	if err := <-started; err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("start after permanent close = %v, want the unavailable error", err)
+	}
+	// The close loser's process is gone and reaped by the start goroutine
+	// itself: kill(pid, 0) returns ESRCH only once reaped.
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("close-loser process %d still alive after start returned (kill err = %v)", pid, err)
+	}
+	// Exactly one wait happened, and it was this start goroutine's: procDone
+	// and the watcher were never installed, so no other waiter exists.
+	if n := waits.Load(); n != 1 {
+		t.Fatalf("process waits before watcher installation = %d, want exactly 1 (the close loser's own reap)", n)
+	}
+	inst.mu.Lock()
+	state := inst.state
+	procDone := inst.procDone
+	cmd := inst.cmd
+	inst.mu.Unlock()
+	if state != stateFailed {
+		t.Fatalf("state = %d (%s), want %d (failed)", state, stateName(state), stateFailed)
+	}
+	if procDone != nil || cmd != nil {
+		t.Fatalf("close loser installed handles: procDone = %v, cmd = %v", procDone, cmd)
+	}
+	// Permanent close cannot restart: a later ordinary start is a refused
+	// no-op and launches no process.
+	if _, err := inst.start(context.Background()); err != nil {
+		t.Fatalf("start on the failed instance: %v, want a refused no-op", err)
+	}
+	if n := countLaunches(log); n != 1 {
+		t.Fatalf("server processes launched = %d, want 1", n)
+	}
+}
+
+// TestOpenFileAfterPermanentCloseRefusesWithoutProtocolWrite proves the
+// retained-instance terminal admission on openFile: after permanent close wins
+// on a ready instance, openFile must return the unavailable error before
+// reading the file or sending didOpen — no protocol write reaches the server.
+// It fails with the pre-fix openFile, which reads the file and sends didOpen
+// over the still-live connection.
+func TestOpenFileAfterPermanentCloseRefusesWithoutProtocolWrite(t *testing.T) {
+	reqLog := filepath.Join(t.TempDir(), "requests.log")
+	t.Setenv("FAKE_LSP_REQUESTS_LOG", reqLog)
+	log := filepath.Join(t.TempDir(), "launches.log")
+	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
+	if err := inst.waitReady(context.Background()); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	inst.closeAdmission()
+
+	target := filepath.Join(t.TempDir(), "existing.txt")
+	if err := os.WriteFile(target, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := inst.openFile(context.Background(), target); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("openFile after permanent close = %v, want the unavailable error", err)
+	}
+	// No protocol write: the server saw the startup initialize/initialized
+	// requests but never a didOpen.
+	data, err := os.ReadFile(reqLog)
+	if err != nil {
+		t.Fatalf("read requests log: %v", err)
+	}
+	if strings.Contains(string(data), "textDocument/didOpen") {
+		t.Fatal("openFile after permanent close sent didOpen to the server")
+	}
+}
+
+// TestIdleRetirementRestartsWithFreshBudget is the positive idle-retirement
+// sibling of permanent close: a ready instance retired by the idle path
+// reaches ordinary stateShutdown, and a later ordinary waitReady restarts it
+// with a fresh crash budget — the allowed restart row that permanent close's
+// final stateFailed must not collapse.
+func TestIdleRetirementRestartsWithFreshBudget(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "launches.log")
+	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
+
+	if err := inst.waitReady(context.Background()); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	// The idle-retirement path: retire the ready instance without permanent
+	// close.
+	inst.shutdown()
+	inst.mu.Lock()
+	state := inst.state
+	inst.mu.Unlock()
+	if state != stateShutdown {
+		t.Fatalf("state after idle retirement = %d (%s), want %d (shutdown)", state, stateName(state), stateShutdown)
+	}
+
+	// A later ordinary request restarts the retired instance.
+	if err := inst.waitReady(context.Background()); err != nil {
+		t.Fatalf("waitReady after idle retirement: %v, want a restart", err)
+	}
+	inst.mu.Lock()
+	state = inst.state
+	restarts := inst.restarts
+	inst.mu.Unlock()
+	if state != stateReady {
+		t.Fatalf("state after restart = %d (%s), want %d (ready)", state, stateName(state), stateReady)
+	}
+	if restarts != 0 {
+		t.Fatalf("restarts after idle retirement = %d, want a fresh budget", restarts)
+	}
+	if n := countLaunches(log); n != 2 {
+		t.Fatalf("server processes launched = %d, want 2 (initial plus idle-retirement restart)", n)
+	}
+}
+
+// TestPermanentCloseWatcherReapsWithoutRestart is the permanent-close watcher
+// sibling: close admission wins on a ready instance, then its process exits;
+// the watcher reaps it (the sole post-handoff waiter, counted through the
+// waitCommand seam) but must not relaunch it, leaving stateFailed and exactly
+// one launch. It is the forbidden restart row for permanent close.
+func TestPermanentCloseWatcherReapsWithoutRestart(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "launches.log")
+	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
+
+	// Count every instance-owned process wait through the seam from before
+	// the initial launch: the watcher installed by that launch is the only
+	// waiter that should ever reap.
+	var waits atomic.Int64
+	oldWait := waitCommand
+	waitCommand = func(cmd *exec.Cmd) error { waits.Add(1); return oldWait(cmd) }
+	t.Cleanup(func() { waitCommand = oldWait })
+
+	if err := inst.waitReady(context.Background()); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	inst.closeAdmission()
+	inst.mu.Lock()
+	procDone := inst.procDone
+	cmd := inst.cmd
+	inst.mu.Unlock()
+	if procDone == nil || cmd == nil {
+		t.Fatal("ready instance has no procDone or cmd")
+	}
+
+	// The process exits after permanent close: the watcher reaps it.
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill the ready server: %v", err)
+	}
+	select {
+	case <-procDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("watcher never reaped the killed process")
+	}
+	// Exactly one wait happened after the procDone/watcher handoff: the
+	// watcher's own. No teardown path, restart, or second waiter touched the
+	// process.
+	if n := waits.Load(); n != 1 {
+		t.Fatalf("process waits after the watcher handoff = %d, want exactly 1 (the watcher's reap)", n)
+	}
+
+	inst.mu.Lock()
+	state := inst.state
+	restarts := inst.restarts
+	inst.mu.Unlock()
+	if state != stateFailed {
+		t.Fatalf("state = %d (%s), want %d (failed)", state, stateName(state), stateFailed)
+	}
+	if restarts != 0 {
+		t.Fatalf("restarts = %d, want 0: the watcher relaunched after permanent close", restarts)
+	}
+	if n := countLaunches(log); n != 1 {
+		t.Fatalf("server processes launched = %d, want 1 (no relaunch after permanent close)", n)
+	}
+	// A later ordinary request refuses: permanent close cannot restart.
+	if err := inst.waitReady(context.Background()); err == nil {
+		t.Fatal("waitReady after permanent close: error = nil, want unavailable")
+	}
+	if n := countLaunches(log); n != 1 {
+		t.Fatalf("server processes launched after refused wait = %d, want 1", n)
 	}
 }
 

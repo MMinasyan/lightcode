@@ -429,6 +429,58 @@ func TestACPCloseRejectsLaterAdmission(t *testing.T) {
 	}
 }
 
+// TestACPArchiveDeleteCloseRaceRefuses proves an archive/delete request
+// admitted by the ACP host before close but entering the owner after close is
+// refused at the owner admission boundary: the dispatch was admitted while the
+// owner was still open, but the owner had already published closed by the time
+// the handler reached the owner, so the removal must refuse with the
+// owner-closed error instead of taking a claim and mutating durably.
+func TestACPArchiveDeleteCloseRaceRefuses(t *testing.T) {
+	cases := []struct {
+		name   string
+		handle func(*Runner, Request)
+	}{
+		{name: "archive", handle: func(r *Runner, req Request) { r.handleSessionArchive(req) }},
+		{name: "delete", handle: func(r *Runner, req Request) { r.handleSessionDelete(req) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newACPTestAgent(t)
+			id, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("NewSession: %v", err)
+			}
+			var out bytes.Buffer
+			r := &Runner{agent: a, owner: a, out: &out}
+			// The archive/delete line is admitted by the host before close.
+			if !r.admitDispatch() {
+				t.Fatal("dispatch admission refused before close")
+			}
+			defer r.dispatchWG.Done()
+
+			// The owner publishes close before the admitted dispatch reaches it.
+			if !a.ShutdownOwner() {
+				t.Fatal("clean shutdown reported abandoned in-flight work")
+			}
+
+			req := Request{JSONRPC: "2.0", ID: tc.name, Params: json.RawMessage(`{"id":"` + id + `"}`)}
+			tc.handle(r, req)
+
+			lines := drainedLines(t, r, &out, 1)
+			var resp Response
+			if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+				t.Fatalf("response json: %v", err)
+			}
+			if resp.Error == nil || !strings.Contains(resp.Error.Message, "owner is shutting down") {
+				t.Fatalf("admitted-after-close %s response = %+v, want the owner-closed error", tc.name, resp)
+			}
+			if resp.Result != nil {
+				t.Fatalf("%s response carried a result: %#v", tc.name, resp.Result)
+			}
+		})
+	}
+}
+
 // TestACPShutdownJoinsAdmittedDispatchResponse proves shutdown waits for an
 // in-flight dispatch and that the dispatch's response is enqueued before shutdown
 // completes.

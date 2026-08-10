@@ -160,6 +160,13 @@ type Agent struct {
 	// statement before shutdown blocks on the admission barrier. The seam is
 	// nil in production; tests swap it to observe that moment.
 	shutdownBarrierHook func()
+
+	// lifecycleAdmissionHook is a test seam invoked immediately before the
+	// owner lifecycle lock is acquired, with no locks held, at the single
+	// lockLifecycle chokepoint. Tests park a lifecycle operation there so the
+	// owner can publish close and complete while the operation is
+	// mid-admission; the seam is nil in production.
+	lifecycleAdmissionHook func()
 }
 
 type agentSignalSink interface {
@@ -911,6 +918,18 @@ func New(c Config) (*Agent, error) {
 	})
 	procMgr.SetExitHandler(func(event process.ExitEvent) {
 		rt := a.ensureRuntime()
+		// A child background-process completion routes to the live child loop
+		// through the transcript cursor's optional callback — looked up under
+		// transcriptMu only, never under rt.mu — and does not nudge the root
+		// signal scheduler, matching the former per-child manager behavior.
+		// When no callback is registered for the event's session, the root
+		// resolution path below is unchanged.
+		if event.SessionID != "" {
+			if cb := rt.childSignalForSessionID(event.SessionID); cb != nil {
+				cb(backgroundTerminalSignal(event))
+				return
+			}
+		}
 		rt.mu.Lock()
 		var unit *session
 		if event.SessionID != "" {
@@ -926,30 +945,7 @@ func New(c Config) (*Agent, error) {
 			rt.mu.Unlock()
 			return
 		}
-		output := ""
-		if event.FormatOutput != nil {
-			output = event.FormatOutput()
-		}
-		if output == "" {
-			output = "(No output)"
-		}
-		reason := event.Reason
-		if reason == "" {
-			reason = process.ExitReasonCompleted
-		}
-		payload := backgroundTerminalPayload(event, output)
-		unit.lp.AddPendingSignal(loop.PendingSignal{
-			Payload: payload,
-			Wake:    true,
-			Persist: true,
-			BackgroundProcess: &loop.BackgroundProcessDisplay{
-				ID:       event.ID,
-				Command:  event.Command,
-				Reason:   string(reason),
-				ExitCode: event.ExitCode,
-				Output:   output,
-			},
-		})
+		unit.lp.AddPendingSignal(backgroundTerminalSignal(event))
 		rt.mu.Unlock()
 		rt.nudgeSignalScheduler()
 	})
@@ -1017,29 +1013,12 @@ func (rt *runtime) initOnceLocked(ctx context.Context) string {
 	// after the in-flight turn join so the drainer stays alive to deliver
 	// terminal events.
 	rt.ownerCtx, rt.ownerCancel = context.WithCancel(context.Background())
-	// The project LSP teardown watches the owner context and is tracked on the
-	// same bgWG: ShutdownOwner cancels the owner context immediately before
-	// joining bgWG, so the teardown fires and completes inside that join. It
-	// cannot watch the host context — two of the three hosts cancel that only
-	// after shutdown returns, so the trigger would never fire while the join
-	// waits.
-	rt.bgWG.Add(5)
+	// ShutdownOwner closes LSP admission and calls ShutdownAll directly, so no
+	// owner-context watcher is needed for the project LSP teardown.
+	rt.bgWG.Add(4)
 	go func() { defer rt.bgWG.Done(); rt.drainLoopEvents(rt.ownerCtx) }()
 	go func() { defer rt.bgWG.Done(); rt.runSignalScheduler(rt.ownerCtx) }()
 	go func() { defer rt.bgWG.Done(); rt.runQueueDrainer(rt.ownerCtx) }()
-	go func() {
-		defer rt.bgWG.Done()
-		<-rt.ownerCtx.Done()
-		a.servicesMu.Lock()
-		mgrs := make([]*lsp.Manager, 0, len(a.lspManagers))
-		for _, e := range a.lspManagers {
-			mgrs = append(mgrs, e.mgr)
-		}
-		a.servicesMu.Unlock()
-		for _, m := range mgrs {
-			m.ShutdownAll()
-		}
-	}()
 	if a.memoryHooks != nil {
 		_ = a.memoryHooks.Reconcile()
 	}
@@ -1276,6 +1255,35 @@ func backgroundTerminalPayload(event process.ExitEvent, output string) string {
 		reason = process.ExitReasonCompleted
 	}
 	return fmt.Sprintf("Background process %s (%q) finished: %s, exit code %d.\nOutput:\n%s", event.ID, event.Command, reason, event.ExitCode, output)
+}
+
+// backgroundTerminalSignal builds the loop pending-signal that announces one
+// background-process completion, shared by the root exit-handler path and the
+// child process-signal callback.
+func backgroundTerminalSignal(event process.ExitEvent) loop.PendingSignal {
+	output := ""
+	if event.FormatOutput != nil {
+		output = event.FormatOutput()
+	}
+	if output == "" {
+		output = "(No output)"
+	}
+	reason := event.Reason
+	if reason == "" {
+		reason = process.ExitReasonCompleted
+	}
+	return loop.PendingSignal{
+		Payload: backgroundTerminalPayload(event, output),
+		Wake:    true,
+		Persist: true,
+		BackgroundProcess: &loop.BackgroundProcessDisplay{
+			ID:       event.ID,
+			Command:  event.Command,
+			Reason:   string(reason),
+			ExitCode: event.ExitCode,
+			Output:   output,
+		},
+	}
 }
 
 func agentBackgroundProcessDisplay(bg *loop.BackgroundProcessDisplay) *BackgroundProcessDisplay {
@@ -1717,7 +1725,23 @@ func (a *Agent) runSweep() {
 			}
 		}
 	}
-	if _, _, err := snapshot.SweepAllProjects(a.projects.Root(), cfg, onDelete, a.lockLifecycle); err != nil {
+	// The serializer carries owner-close admission into the sweep: it holds
+	// lifecycleMu per candidate and refuses a close-first candidate before any
+	// claim, so a sweep candidate cannot archive or delete a session after the
+	// owner published closed.
+	sweepAdmission := func() (func(), bool) {
+		rt := a.ensureRuntime()
+		release := a.lockLifecycle()
+		rt.mu.Lock()
+		closed := rt.closed
+		rt.mu.Unlock()
+		if closed {
+			release()
+			return nil, false
+		}
+		return release, true
+	}
+	if _, _, err := snapshot.SweepAllProjects(a.projects.Root(), cfg, onDelete, sweepAdmission); err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: sweep: %v\n", err)
 	}
 }
@@ -2486,6 +2510,15 @@ func (a *Agent) fireShutdownBarrierHook() {
 	}
 }
 
+// fireLifecycleAdmissionHook invokes the lifecycleAdmissionHook test seam when
+// installed. The seam is nil in production, so the call site guards through
+// this helper.
+func (a *Agent) fireLifecycleAdmissionHook() {
+	if a.lifecycleAdmissionHook != nil {
+		a.lifecycleAdmissionHook()
+	}
+}
+
 func (a *Agent) loadTokensFromDiskForSession(unit *session) {
 	if unit == nil {
 		return
@@ -2801,6 +2834,7 @@ func (rt *runtime) beginTransition() {
 // committed outcome.
 func (a *Agent) lockLifecycle() func() {
 	rt := a.ensureRuntime()
+	a.fireLifecycleAdmissionHook()
 	rt.lifecycleMu.Lock()
 	return rt.lifecycleMu.Unlock
 }
@@ -3858,19 +3892,23 @@ func waitGroupOrTimeout(wg *sync.WaitGroup, d time.Duration) bool {
 }
 
 // ShutdownOwner closes turn admission, cancels live turns and permission timers,
-// joins in-flight turns so their terminal events flush through the still-running
-// drainer, then cancels and joins the background goroutines and closes the
-// subordinate services. It is one shared join: every caller waits for the same
-// cleanup, and it runs exactly once. When every turn has actually finished, the
-// live session stores are detached — releasing their claims — and the shared
-// embedder is closed; an abandoned turn keeps both, so a still-running turn
-// never loses its store or hits a closed embedder, and the process-exit
-// boundary releases what shutdown did not.
+// closes process and LSP admission, kills and reaps every admitted process and
+// server, joins in-flight turns so their terminal events flush through the
+// still-running drainer, then cancels and joins the background goroutines. It
+// is one shared join: every caller waits for the same cleanup, and it runs
+// exactly once. When every turn has actually finished, the live session stores
+// are detached — releasing their claims — and the shared embedder is closed;
+// an abandoned turn keeps both, so a still-running turn never loses its store
+// or hits a closed embedder, and the process-exit boundary releases what
+// shutdown did not.
 //
 // It also closes session-identity admission: closed is published under the
 // lifecycle lock, so every open/resume/new/fork either completes before the
 // flag is visible or refuses at its entry check, and no session can register
 // after the live stores are snapshotted with a claim nothing will detach.
+// Process and LSP admission close in the same lifecycleMu hold — before any
+// wait — so no process or server launch can begin after close and then be
+// missed by the joins.
 //
 // It reports whether shutdown completed every join — both the turn join and
 // the background join drained. The result is stored on the runtime rather than
@@ -3885,8 +3923,11 @@ func (a *Agent) ShutdownOwner() bool {
 		// published under lifecycleMu, so an open/resume/new/fork already running
 		// finishes completely before the flag is visible, and one starting
 		// afterwards sees the flag at its entry check — before it acquires any
-		// claim or registers anything. The lifecycle lock is released before the
-		// turn join, so in-flight turn teardown never waits on it.
+		// claim or registers anything. Process and LSP admission close in the
+		// same lifecycleMu hold, so no process or server can be launched while
+		// shutdown waits on admitted work. The lifecycle lock is released before
+		// the kill/reap and turn joins, so in-flight turn teardown never waits
+		// on it.
 		a.fireShutdownBarrierHook()
 		releaseLifecycle := a.lockLifecycle()
 		rt.mu.Lock()
@@ -3905,6 +3946,18 @@ func (a *Agent) ShutdownOwner() bool {
 			stores = append(stores, unit.store)
 		}
 		rt.mu.Unlock()
+		if a.procMgr != nil {
+			a.procMgr.CloseAdmission()
+		}
+		a.servicesMu.Lock()
+		lspMgrs := make([]*lsp.Manager, 0, len(a.lspManagers))
+		for _, e := range a.lspManagers {
+			lspMgrs = append(lspMgrs, e.mgr)
+		}
+		a.servicesMu.Unlock()
+		for _, m := range lspMgrs {
+			m.CloseAdmission()
+		}
 		for _, cancel := range cancels {
 			cancel()
 		}
@@ -3914,6 +3967,15 @@ func (a *Agent) ShutdownOwner() bool {
 			}
 		}
 		releaseLifecycle()
+		// Kill and reap every admitted process and server before the joins:
+		// any start admitted before close is either rejected already or dies
+		// here, so no launch can outlive the owner joins.
+		if a.procMgr != nil {
+			a.procMgr.CloseWait()
+		}
+		for _, m := range lspMgrs {
+			m.ShutdownAll()
+		}
 		// Join in-flight turns and mutations first, while the drainer is still
 		// alive, so their terminal events are delivered before delivery stops.
 		turnsDrained := waitGroupOrTimeout(&rt.turnWG, shutdownJoinTimeout)
@@ -3939,9 +4001,6 @@ func (a *Agent) ShutdownOwner() bool {
 		bgDrained := waitGroupOrTimeout(&rt.bgWG, shutdownJoinTimeout)
 		if !bgDrained {
 			fmt.Fprintf(os.Stderr, "lightcode: owner shutdown abandoned background workers after %s\n", shutdownJoinTimeout)
-		}
-		if a.procMgr != nil {
-			a.procMgr.Close()
 		}
 		// Close the shared embedder only once every turn has actually finished, so
 		// an abandoned turn never hits a closed embedder; a leaked embedder is
@@ -4787,6 +4846,16 @@ func (a *Agent) SessionDelete(id string) error {
 // re-nudges the drainers.
 func (a *Agent) removeSession(id string, durable func(sessionsRoot string, id string) error) error {
 	defer a.lockLifecycle()()
+	// Post-lifecycleMu admission recheck: an archive/delete admitted by the
+	// host before close but entering the owner after close refuses here,
+	// before any claim, reservation, or durable write.
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	closed := rt.closed
+	rt.mu.Unlock()
+	if closed {
+		return errOwnerClosed
+	}
 	id = strings.TrimSpace(id)
 	sessionsRoot, err := a.sessionsRootForUserManagedSession(id)
 	if err != nil {
@@ -5585,6 +5654,16 @@ func (a *Agent) ApplyTurnActionForSessionWithBoundary(sessionID string, turn int
 
 func (a *Agent) applyTurnActionResolved(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string)) (TurnActionResult, error) {
 	defer a.lockLifecycle()()
+	// Post-lifecycleMu admission recheck: a turn action admitted by the host
+	// before close but entering the owner after close refuses here, before
+	// any reservation or durable mutation.
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	closed := rt.closed
+	rt.mu.Unlock()
+	if closed {
+		return TurnActionResult{}, errOwnerClosed
+	}
 	unit, err := a.resolveRootDriveSession(sessionID)
 	if err != nil {
 		return TurnActionResult{}, err
@@ -5909,12 +5988,40 @@ func (a *Agent) userMessageContentForTurnForSession(unit *session, turn int) str
 	return ""
 }
 
-// RevertCode restores files to their state at the given turn.
+// RevertCode restores files to their state at the given turn. It is a
+// lifecycle mutation: it takes the owner lifecycle lock at entry and refuses
+// after close, so a direct revert admitted by the host before close but
+// entering the owner after close cannot mutate files. The last-kept-turn
+// semantics of store.RevertCode(turn) are unchanged: this entry only adds
+// the owner admission guard, and both revert APIs keep their current turn
+// convention.
 func (a *Agent) RevertCode(turn int) (snapshot.RevertResult, error) {
+	defer a.lockLifecycle()()
+	// Post-lifecycleMu admission recheck, same as every other lifecycle op.
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	closed := rt.closed
+	rt.mu.Unlock()
+	if closed {
+		return snapshot.RevertResult{}, errOwnerClosed
+	}
 	return a.revertCodeForSession(a.session, turn)
 }
 
+// RevertCodeForSession restores files to their state at the given turn. It is
+// a lifecycle mutation: it takes the owner lifecycle lock at entry and refuses
+// after close, so a direct revert admitted by the host before close but
+// entering the owner after close cannot mutate files.
 func (a *Agent) RevertCodeForSession(sessionID string, turn int) (snapshot.RevertResult, error) {
+	defer a.lockLifecycle()()
+	// Post-lifecycleMu admission recheck, same as every other lifecycle op.
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	closed := rt.closed
+	rt.mu.Unlock()
+	if closed {
+		return snapshot.RevertResult{}, errOwnerClosed
+	}
 	unit, err := a.resolveRootDriveSession(sessionID)
 	if err != nil {
 		return snapshot.RevertResult{}, err

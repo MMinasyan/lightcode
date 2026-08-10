@@ -157,54 +157,45 @@ func TestDetectRunningAtShutdownIsJoined(t *testing.T) {
 	}
 }
 
-// TestInitWithCancelledHostContextJoinsDetection asserts that detection is
-// registered on the background group and joined by shutdown even when the
-// host context is already cancelled: the cancelled context drives shutdown
-// while the detection blocks in its swapped warning handler, and the join
-// must wait on it. The ordering of the watcher spawn against the detection
-// block in initOnceLocked — what makes the race structurally impossible
-// rather than benignly won — is asserted by
-// TestInitRegistersDetectionBeforeHostCancelWatcher, not re-established
-// here.
+// TestInitWithCancelledHostContextJoinsDetection asserts the cancelled-context
+// invariant that holds for both permitted detection outcomes: the
+// already-cancelled host context drives ShutdownOwner immediately, the owner
+// joins the detection (whether its start was rejected before launch or was
+// admitted just before close and then torn down), shutdown completes clean,
+// and any server process that did launch is reaped by the time ShutdownOwner
+// returns. Which outcome occurs is a scheduling race between the Detect
+// goroutine's start admission and the owner's admission close, so the test
+// must not require either one. The deterministic ordering proofs live
+// elsewhere: registration-before-watcher in
+// TestInitRegistersDetectionBeforeHostCancelWatcher, and the in-flight
+// detection join in TestDetectRunningAtShutdownIsJoined.
 func TestInitWithCancelledHostContextJoinsDetection(t *testing.T) {
 	home, projectRoot := t.TempDir(), t.TempDir()
-	a, pidfile, stalled, release := startDetectionAgent(t, home, projectRoot)
+	a, pidfile, _, release := startDetectionAgent(t, home, projectRoot)
+	// The helper's warning handler blocks; replace it with a no-op before
+	// Init so a detection start that was admitted before close (and then
+	// failed) cannot stall the background join — both outcomes must complete
+	// cleanly.
+	a.lspManagerFor(projectRoot).SetWarningHandler(func(string, string) {})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	a.Init(ctx)
 	t.Cleanup(func() { release(); a.ShutdownOwner() })
 
-	// The cancelled host context has driven ShutdownOwner by now; the
-	// detection started under it fails immediately and blocks in the warning
-	// handler, and the background join must still be waiting on it.
-	select {
-	case <-stalled:
-	case <-time.After(5 * time.Second):
-		t.Fatal("detection never started under Init")
+	// ShutdownOwner joins the detection and completes clean in either outcome.
+	if !a.ShutdownOwner() {
+		t.Fatal("clean shutdown reported abandoned in-flight work")
 	}
-	shutdownDone := make(chan struct{})
-	go func() {
-		a.ShutdownOwner()
-		close(shutdownDone)
-	}()
-	select {
-	case <-shutdownDone:
-		t.Fatal("ShutdownOwner returned while detection was still running: the Detect goroutine was abandoned rather than joined")
-	case <-time.After(2 * time.Second):
-	}
-	release()
-	<-shutdownDone
-
+	// If the detection start was admitted before close, the server process was
+	// launched; whatever the outcome, any recorded pid must be reaped when
+	// shutdown returns — kill(pid, 0) returns ESRCH only once reaped.
 	if data, err := os.ReadFile(pidfile); err == nil {
 		if p, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && p > 0 {
 			if err := syscall.Kill(p, 0); !errors.Is(err, syscall.ESRCH) {
-				t.Fatalf("language server process %d still alive when owner shutdown returned: detection cleanup did not complete inside the join", p)
+				t.Fatalf("language server process %d still alive when owner shutdown returned (kill err = %v)", p, err)
 			}
 		}
-	}
-	if !a.ShutdownOwner() {
-		t.Fatal("clean shutdown reported abandoned in-flight work")
 	}
 }
 

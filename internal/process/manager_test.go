@@ -1,12 +1,15 @@
 package process
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -613,15 +616,64 @@ func extractSpillPath(t *testing.T, result string) string {
 	return strings.TrimSpace(path)
 }
 
-// TestProcessManagerClose covers the Close/start-admission/reap protocol:
-// Close rejects new starts, and killing a process reaps it (unblocking the kill)
-// before running the exit callback, so a blocked callback never stalls the kill.
+// TestProcessManagerClose covers the CloseAdmission/CloseWait/Close protocol:
+// CloseAdmission rejects new starts without waiting, CloseWait kills and reaps
+// the IDs admitted before closure (reaping unblocks the kill) and joins
+// admitted callbacks, and Close is the ordered pair. A start admitted before
+// CloseAdmission is in the CloseWait snapshot; one after is rejected before OS
+// start.
 func TestProcessManagerClose(t *testing.T) {
-	t.Run("close_rejects_new_start", func(t *testing.T) {
+	t.Run("close_admission_rejects_new_start", func(t *testing.T) {
 		m := NewManager(0, cmdoutput.Options{})
+		pidfile := filepath.Join(t.TempDir(), "pid")
+		m.CloseAdmission()
+		if _, err := m.StartForSession("s", "echo $$ > "+pidfile, 0); err == nil {
+			t.Fatal("StartForSession after CloseAdmission should be rejected before OS start")
+		}
+		// The rejection happened before OS start: the command's shell never
+		// ran, so the pidfile it would have written never appears. The wait
+		// bounds the async OS-start window — a start that moved cmd.Start
+		// before the closed check launches the shell, which writes the
+		// pidfile within microseconds.
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(pidfile); err == nil {
+				t.Fatalf("pidfile exists after rejected start: OS start ran before the closed check")
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		// CloseWait after CloseAdmission is a shared no-op join, and Close is
+		// the ordered pair.
+		m.CloseWait()
 		m.Close()
-		if _, err := m.StartForSession("s", "true", 0); err == nil {
-			t.Fatal("StartForSession after Close should be rejected")
+	})
+
+	t.Run("close_wait_reaps_admitted_start", func(t *testing.T) {
+		m := NewManager(0, cmdoutput.Options{})
+		pidfile := filepath.Join(t.TempDir(), "pid")
+		id, err := m.StartForSession("s", "echo $$ > "+pidfile+"; exec sleep 30", 0)
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		var pid int
+		for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+			if data, rerr := os.ReadFile(pidfile); rerr == nil {
+				if p, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && p > 0 {
+					pid = p
+					break
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if pid == 0 {
+			t.Fatalf("process %s never started", id)
+		}
+		// The admitted start is in the CloseWait snapshot: CloseWait must kill
+		// and reap it (kill(pid,0) returns ESRCH only once reaped).
+		m.CloseAdmission()
+		m.CloseWait()
+		if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+			t.Fatalf("admitted process %d still alive after CloseWait (kill err = %v)", pid, err)
 		}
 	})
 

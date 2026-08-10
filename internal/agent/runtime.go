@@ -125,6 +125,13 @@ type runtime struct {
 type transcriptCursor struct {
 	coord *transcript
 	store *snapshot.Store
+	// childSignal is the optional child process-signal callback: set after a
+	// child's loop is constructed (before the child can call a tool) so the
+	// owner process manager's exit handler can deliver a child background-
+	// process completion to the child loop, and removed with the entry by
+	// unregisterTranscript. It is looked up under transcriptMu only, never
+	// under rt.mu.
+	childSignal func(loop.PendingSignal)
 }
 
 // registerTranscript inserts a fresh coordinator entry for id if none exists.
@@ -144,7 +151,8 @@ func (rt *runtime) registerTranscript(id string, store *snapshot.Store) {
 
 // unregisterTranscript drops the entry for id. It is called when a session
 // stops being live; a feed resolving after the drop lands nowhere, matching
-// the pre-registry window where a unit left the live map mid-feed.
+// the pre-registry window where a unit left the live map mid-feed. Dropping
+// the entry also removes any child process-signal callback registered on it.
 func (rt *runtime) unregisterTranscript(id string) {
 	if id == "" {
 		return
@@ -152,6 +160,38 @@ func (rt *runtime) unregisterTranscript(id string) {
 	rt.transcriptMu.Lock()
 	delete(rt.transcriptState, id)
 	rt.transcriptMu.Unlock()
+}
+
+// setChildSignalCallback attaches the child process-signal callback to the
+// transcript entry for id. It is set after the child's loop is constructed —
+// before lp.Run can call a tool — and is removed with the entry by
+// unregisterTranscript. The caller holds no rt.mu.
+func (rt *runtime) setChildSignalCallback(id string, cb func(loop.PendingSignal)) {
+	if id == "" || cb == nil {
+		return
+	}
+	rt.transcriptMu.Lock()
+	if e := rt.transcriptState[id]; e != nil {
+		e.childSignal = cb
+	}
+	rt.transcriptMu.Unlock()
+}
+
+// childSignalForSessionID returns the child process-signal callback registered
+// for id, or nil. It takes only transcriptMu and never rt.mu, so the owner
+// process manager's exit handler can look a child completion up without
+// holding an owner lock.
+func (rt *runtime) childSignalForSessionID(id string) func(loop.PendingSignal) {
+	if id == "" {
+		return nil
+	}
+	rt.transcriptMu.Lock()
+	var cb func(loop.PendingSignal)
+	if e := rt.transcriptState[id]; e != nil {
+		cb = e.childSignal
+	}
+	rt.transcriptMu.Unlock()
+	return cb
 }
 
 // transcriptForSessionID resolves the live coordinator owning a session id, or

@@ -114,12 +114,16 @@ func LoadMostRecent(root, projectPath string) (string, error) {
 }
 
 // CandidateSerializer, when non-nil, serializes each sweep candidate against
-// foreground lifecycle operations: it is invoked before a candidate is claimed
-// and its returned func is called after the candidate is processed. The owner
+// foreground lifecycle operations and carries owner-close admission: it is
+// invoked before a candidate's metadata is read, returns (release, admitted),
+// and the release is called after the candidate is processed. A refused
+// candidate (admitted == false) is skipped entirely — no metadata read, no
+// claim, no archive write, and no delete — which is how the owner closes sweep
+// admission at the same boundary as every other lifecycle operation. The owner
 // passes a hook that holds the lifecycle lock per candidate, so a foreground
 // op and a sweep candidate on the same id never interleave, without blocking
 // foreground ops for the whole sweep.
-type CandidateSerializer func() (release func())
+type CandidateSerializer func() (release func(), admitted bool)
 
 // SweepAllProjects runs Sweep over every project's sessions/ dir under
 // projectsRoot. Returns combined counts across all projects.
@@ -147,9 +151,11 @@ func SweepAllProjects(projectsRoot string, cfg LifecycleConfig, onDelete func(se
 }
 
 // Sweep walks one project's session dirs and applies state transitions per
-// cfg. Each eligible candidate is processed under the lifecycle serializer (if
-// any) and its session claim, so a session driven by any live process is
-// skipped and no foreground op interleaves. Returns (archived, deleted).
+// cfg. Every candidate passes the lifecycle serializer (if any) before its
+// metadata is read — a close-first refusal performs no metadata read — and an
+// admitted candidate is processed under the serializer and its session claim,
+// so a session driven by any live process is skipped and no foreground op
+// interleaves.
 func Sweep(projectsRoot, projectID string, cfg LifecycleConfig, onDelete func(sessionID string), serialize CandidateSerializer) (int, int, error) {
 	if !cfg.Enabled {
 		return 0, 0, nil
@@ -181,21 +187,28 @@ func Sweep(projectsRoot, projectID string, cfg LifecycleConfig, onDelete func(se
 	return archived, deleted, nil
 }
 
-// sweepCandidate processes one candidate. The lifecycle serializer (if any) is
-// held from before the claim through the mutation, and both are released on
-// return. Eligibility is pre-filtered lock-free, then rechecked under the
-// claim since state is only stable once held.
+// sweepCandidate processes one candidate. The lifecycle serializer (if any)
+// runs before the candidate's metadata is read, so a close-first refusal
+// performs no metadata read, claim, archive write, or delete — it cannot even
+// block on the candidate's meta. For an admitted candidate the release stays
+// deferred until the candidate completes. Eligibility is then pre-filtered
+// lock-free and rechecked under the claim since state is only stable once
+// held.
 func sweepCandidate(projectsRoot, projectID, root, sessionID string, now, archiveCutoff, deleteCutoff int64, onDelete func(sessionID string), serialize CandidateSerializer) (int, int) {
 	metaPath := filepath.Join(root, sessionID, "meta.json")
+	if serialize != nil {
+		release, admitted := serialize()
+		if !admitted {
+			return 0, 0
+		}
+		defer release()
+	}
 	var meta SessionMeta
 	if readJSON(metaPath, &meta) != nil {
 		return 0, 0
 	}
 	if !sweepEligible(meta, now, archiveCutoff, deleteCutoff) {
 		return 0, 0
-	}
-	if serialize != nil {
-		defer serialize()()
 	}
 	claim, ok, err := AcquireSessionClaim(projectsRoot, projectID, sessionID)
 	if err != nil || !ok {

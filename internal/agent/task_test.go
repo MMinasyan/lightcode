@@ -879,6 +879,87 @@ func TestTaskToolChildBackgroundProcessStaysChildScoped(t *testing.T) {
 	}
 }
 
+// TestTaskChildBackgroundProcessUsesOwnerAdmissionBoundary proves an actual
+// child run_command(background=true) goes through the owner process manager's
+// admission boundary: closing a.procMgr admission before the child tool
+// request makes the child's start refuse before any process launch, so no
+// command PID file appears, no owner-managed child process is active, and the
+// child receives the manager-closed outcome. This fails with the former fresh
+// per-child manager, whose admission was never closed.
+func TestTaskChildBackgroundProcessUsesOwnerAdmissionBoundary(t *testing.T) {
+	var calls atomic.Int32
+	pidfile := filepath.Join(t.TempDir(), "child.pid")
+	var a *Agent
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req := readTaskTestRequest(t, r)
+		switch calls.Add(1) {
+		case 1:
+			writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"run background command","subagent_type":"runner"}]}`)
+		case 2:
+			writeTaskToolCallResponse(w, "call_bg", "run_command", `{"command":"echo $$ > `+pidfile+`; exec sleep 3","background":true}`)
+		case 3:
+			if !strings.Contains(taskTestMessageContent(req), "manager is closed") {
+				t.Fatalf("child follow-up messages missing the closed-manager outcome: %#v", req.Messages)
+			}
+			writeTextResponse(w, "child saw closed manager")
+		case 4:
+			if !strings.Contains(taskTestMessageContent(req), "child saw closed manager") {
+				t.Fatalf("parent follow-up messages missing the child result: %#v", req.Messages)
+			}
+			writeTextResponse(w, "parent done")
+		default:
+			t.Fatalf("unexpected provider call")
+		}
+	}))
+	defer server.Close()
+
+	a = newEventOrderAgent(t, server.URL+"/v1")
+	writeTaskAgentTypes(t, a, `"runner": {
+		"description": "test runner",
+		"tools": ["run_command"],
+		"prompt": "Test runner.",
+		"subagent": true
+	}`)
+	cap := &eventCapture{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.SetEventHandler(func(ev Event) {
+		cap.handler(ev)
+		if ev.Kind == EventPermissionRequest && ev.PermReq != nil {
+			// Respond off the callback goroutine, as a real adapter does.
+			id := ev.PermReq.ID
+			go func() { _ = a.RespondPermission(id, true) }()
+		}
+	})
+	a.Init(ctx)
+
+	// Close the owner process manager's admission before the child tool runs:
+	// the child request is now deterministic — no process can launch.
+	a.procMgr.CloseAdmission()
+
+	if _, err := a.Submit(ctx, "delegate background"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	waitUntilEventOrderTurnEndCount(t, cap, 1)
+
+	// The child received the manager-closed outcome and no owner-managed child
+	// process was ever admitted.
+	childID := findSubagentStart(t, cap).SubagentSessionID
+	if childID == "" {
+		t.Fatal("no child session id in the subagent start event")
+	}
+	if active := a.procMgr.ActiveIDsForSession(childID); len(active) != 0 {
+		t.Fatalf("owner manager has active child processes after the refused child start: %v", active)
+	}
+	if active := a.procMgr.ActiveIDs(); len(active) != 0 {
+		t.Fatalf("owner manager has active processes after the refused child start: %v", active)
+	}
+	// No command PID file appeared: the child process was never launched.
+	if _, err := os.Stat(pidfile); !os.IsNotExist(err) {
+		t.Fatalf("pidfile exists: a child process was launched after owner admission closed (stat err = %v)", err)
+	}
+}
+
 func writeTaskToolCallResponse(w http.ResponseWriter, callID, name, args string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	fmt.Fprintf(w, `data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":%q,"type":"function","function":{"name":%q,"arguments":%q}}]},"finish_reason":"tool_calls"}]}`+"\n\n", callID, name, args)

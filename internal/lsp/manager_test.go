@@ -140,8 +140,10 @@ func TestManagerShutdownAllKillsUnresponsiveServers(t *testing.T) {
 		rpc := s.inst.rpc
 		cmd := s.inst.cmd
 		s.inst.mu.Unlock()
-		if state != stateShutdown {
-			t.Errorf("server %d state = %d (%s), want %d (shutdown)", i, state, stateName(state), stateShutdown)
+		// Permanent close lands every instance in stateFailed (final and
+		// unclaimable), not the restartable idle-retirement shutdown state.
+		if state != stateFailed {
+			t.Errorf("server %d state = %d (%s), want %d (failed)", i, state, stateName(state), stateFailed)
 		}
 		if rpc != nil || cmd != nil {
 			t.Errorf("server %d handles not cleared: rpc = %v, cmd = %v", i, rpc, cmd)
@@ -149,12 +151,11 @@ func TestManagerShutdownAllKillsUnresponsiveServers(t *testing.T) {
 	}
 }
 
-func TestStartServerAfterClosedKillsInsteadOfNegotiating(t *testing.T) {
-	// A server that finishes starting and only then discovers the manager is
-	// closed must be disposed of the same way the teardown does: killed and
-	// reaped, not negotiated with. The server never answers the shutdown
-	// request, so the old negotiate path would be held for its full bound
-	// after the owner has stopped waiting for anything.
+func TestStartServerAfterClosedRejectsBeforeStart(t *testing.T) {
+	// A server whose start would only be discovered after the fact must be
+	// rejected before instance.start: permanent close refuses before OS start,
+	// so no process is ever launched after close. The old launched-then-killed
+	// path is gone.
 	home := t.TempDir()
 	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", "fake")
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
@@ -165,7 +166,7 @@ func TestStartServerAfterClosedKillsInsteadOfNegotiating(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A wrapper records the launched process's pid before exec'ing the real
-	// script, so the test can assert the process is actually gone and reaped.
+	// script, so the test can assert no process was ever launched.
 	wrapper := filepath.Join(cacheDir, "fake-lsp")
 	wrapperScript := "#!/bin/sh\necho $$ > \"${FAKE_PIDFILE:?}\"\nexec python3 \"$(dirname \"$0\")/fake-lsp.py\" \"$@\"\n"
 	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
@@ -189,24 +190,261 @@ func TestStartServerAfterClosedKillsInsteadOfNegotiating(t *testing.T) {
 	start := time.Now()
 	m.startServer(context.Background(), def)
 	elapsed := time.Since(start)
-	t.Logf("startServer after closed with an unresponsive server took %s", elapsed)
-	// The negotiate path waits shutdownWait before killing; this path must
-	// kill instead, well below that.
+	t.Logf("startServer after closed took %s", elapsed)
+	// Rejection happens before any start or negotiation, so it is prompt.
 	if elapsed >= 2*time.Second {
-		t.Fatalf("startServer after closed took %s, want a prompt teardown (the negotiate path waited %s)", elapsed, shutdownWait)
+		t.Fatalf("startServer after closed took %s, want an immediate rejection", elapsed)
 	}
 
-	// The process must be gone and reaped, not merely left to the owner's own
-	// process exit: kill(pid, 0) returns ESRCH only once reaped.
-	data, err := os.ReadFile(pidfile)
-	if err != nil {
-		t.Fatalf("read pid file: %v", err)
+	// No process was ever launched: the wrapper never wrote the pidfile.
+	if _, err := os.Stat(pidfile); !os.IsNotExist(err) {
+		t.Fatalf("pidfile exists after rejected start: a process was launched after close (stat err = %v)", err)
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 {
-		t.Fatalf("pid = %q, err = %v", data, err)
+	// And no instance was registered.
+	m.mu.Lock()
+	_, mapped := m.instances[def.Name]
+	m.mu.Unlock()
+	if mapped {
+		t.Fatal("startServer after closed registered an instance")
 	}
+}
+
+// TestStartServerAfterClosedSkipsInstall covers the LSP close-before-install
+// sibling: a server whose binary is missing and whose Install would otherwise
+// run must be rejected by the early admission check before any resource or
+// process start — no Install call, no instance mapping, no warning or signal,
+// and no process launch. The map-time closed check stays as the positive
+// sibling for starts admitted before close (TestStartServerCloseRaceMapped
+// InstanceIsTornDown).
+func TestStartServerAfterClosedSkipsInstall(t *testing.T) {
+	home := t.TempDir() // no fake binary anywhere: ResolveBinary finds nothing
+	installed := false
+	def := &server.Definition{
+		Name:    "missing",
+		Command: "missing-lsp",
+		Args:    []string{},
+		Install: func(cacheDir string) error {
+			installed = true
+			return nil
+		},
+	}
+
+	m := NewManager(t.TempDir(), home)
+	var warnings, signals atomic.Int64
+	m.SetWarningHandler(func(string, string) { warnings.Add(1) })
+	m.SetSignalHandler(func(string) { signals.Add(1) })
+
+	m.CloseAdmission()
+	start := time.Now()
+	m.startServer(context.Background(), def)
+	elapsed := time.Since(start)
+	t.Logf("startServer after CloseAdmission with missing binary took %s", elapsed)
+	if elapsed >= 2*time.Second {
+		t.Fatalf("startServer after CloseAdmission took %s, want an immediate rejection", elapsed)
+	}
+	if installed {
+		t.Fatal("Install was called after CloseAdmission: the early admission check did not reject")
+	}
+	if warnings.Load() != 0 || signals.Load() != 0 {
+		t.Fatalf("warnings=%d signals=%d after rejected start, want none", warnings.Load(), signals.Load())
+	}
+	m.mu.Lock()
+	_, mapped := m.instances[def.Name]
+	m.mu.Unlock()
+	if mapped {
+		t.Fatal("startServer after CloseAdmission mapped an instance")
+	}
+}
+
+// TestStartServerCloseRaceProvisionalMappingHoldsTerminalAdmission proves the
+// deterministic barrier after provisional mapping: with the start held
+// at the post-handoff probe, permanent close (ShutdownAll) returns promptly
+// while the start is still blocked, and once released the start cannot launch
+// an OS process (no pidfile) because the mapped instance is already terminal
+// stateFailed. Removing the provisional map insertion makes close miss the
+// instance and the released start launch it — the regression this test pins.
+func TestStartServerCloseRaceProvisionalMappingHoldsTerminalAdmission(t *testing.T) {
+	home := t.TempDir()
+	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", "fake")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(cacheDir, "fake-lsp.py")
+	if err := os.WriteFile(real, []byte(fakeServerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The wrapper records the launched process's pid before exec'ing the real
+	// script, so the test can assert no process was ever launched.
+	wrapper := filepath.Join(cacheDir, "fake-lsp")
+	wrapperScript := "#!/bin/sh\necho $$ > \"${FAKE_PIDFILE:?}\"\nexec python3 \"$(dirname \"$0\")/fake-lsp.py\" \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pidfile := filepath.Join(t.TempDir(), "lsp.pid")
+	t.Setenv("FAKE_PIDFILE", pidfile)
+
+	log := filepath.Join(t.TempDir(), "launches.log")
+	def := &server.Definition{
+		Name:    "fake",
+		Command: "fake-lsp",
+		Args:    []string{log, "", "0", "0", "", "1"},
+	}
+
+	m := NewManager(t.TempDir(), home)
+	t.Cleanup(func() { m.ShutdownAll() })
+
+	// Hold the start at the post-handoff probe.
+	probeEntered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	oldProbe := startServerProbe
+	startServerProbe = func() { once.Do(func() { close(probeEntered) }); <-release }
+	t.Cleanup(func() { startServerProbe = oldProbe })
+
+	started := make(chan struct{})
+	go func() {
+		m.startServer(context.Background(), def)
+		close(started)
+	}()
+	select {
+	case <-probeEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("startServer never reached the post-handoff probe")
+	}
+
+	// Permanent close while the start is blocked after the handoff must
+	// return promptly and must not wait on the probe.
+	start := time.Now()
+	m.ShutdownAll()
+	elapsed := time.Since(start)
+	t.Logf("ShutdownAll with a probe-blocked start took %s", elapsed)
+	if elapsed >= 2*time.Second {
+		t.Fatalf("ShutdownAll took %s, want a prompt permanent close", elapsed)
+	}
+
+	close(release)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("startServer did not return after the probe was released")
+	}
+
+	// The released start could not launch an OS process: the mapped instance
+	// was already terminal, so inst.start refused before cmd.Start.
+	if _, err := os.Stat(pidfile); !os.IsNotExist(err) {
+		t.Fatalf("pidfile exists: the released start launched a process after permanent close (stat err = %v)", err)
+	}
+	if n := countLaunches(log); n != 0 {
+		t.Fatalf("server processes launched = %d, want 0", n)
+	}
+	m.mu.Lock()
+	inst := m.instances[def.Name]
+	m.mu.Unlock()
+	if inst == nil {
+		t.Fatal("provisionally mapped instance missing after permanent close")
+	}
+	inst.mu.Lock()
+	state := inst.state
+	inst.mu.Unlock()
+	if state != stateFailed {
+		t.Fatalf("mapped instance state = %d (%s), want %d (failed)", state, stateName(state), stateFailed)
+	}
+}
+
+// TestStartServerCloseRaceMappedInstanceIsTornDown covers the "LSP start wins
+// before permanent close" axis: a server whose start was admitted (the
+// instance is provisionally mapped) before ShutdownAll begins is in the close
+// snapshot, so ShutdownAll must kill and reap its process before returning —
+// even though the start itself is still in flight (blocked in initialize).
+// On the old branch the instance was mapped only after start completed, so
+// ShutdownAll's snapshot missed it and the process survived the call.
+func TestStartServerCloseRaceMappedInstanceIsTornDown(t *testing.T) {
+	home := t.TempDir()
+	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", "fake")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(cacheDir, "fake-lsp.py")
+	if err := os.WriteFile(real, []byte(fakeServerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(cacheDir, "fake-lsp")
+	wrapperScript := "#!/bin/sh\necho $$ > \"${FAKE_PIDFILE:?}\"\nexec python3 \"$(dirname \"$0\")/fake-lsp.py\" \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pidfile := filepath.Join(t.TempDir(), "lsp.pid")
+	t.Setenv("FAKE_PIDFILE", pidfile)
+
+	// init_delay holds the start in the initialize call after the process has
+	// launched and the instance has been provisionally mapped.
+	log := filepath.Join(t.TempDir(), "launches.log")
+	def := &server.Definition{
+		Name:    "fake",
+		Command: "fake-lsp",
+		Args:    []string{log, "", "2", "0", "", "1"},
+	}
+
+	m := NewManager(t.TempDir(), home)
+	started := make(chan struct{})
+	go func() {
+		m.startServer(context.Background(), def)
+		close(started)
+	}()
+
+	// Wait for the provisional mapping: the admission handoff that puts the
+	// mid-start instance into the close snapshot.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		_, mapped := m.instances[def.Name]
+		m.mu.Unlock()
+		if mapped {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	m.mu.Lock()
+	_, mapped := m.instances[def.Name]
+	m.mu.Unlock()
+	if !mapped {
+		t.Fatal("startServer never mapped the instance")
+	}
+	// The process is running (the wrapper wrote the pidfile).
+	var pid int
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(pidfile); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && p > 0 {
+				pid = p
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pid == 0 {
+		t.Fatal("language server process never launched")
+	}
+
+	start := time.Now()
+	m.ShutdownAll()
+	elapsed := time.Since(start)
+	t.Logf("ShutdownAll with a mid-start mapped server took %s", elapsed)
+	if elapsed >= 2*time.Second {
+		t.Fatalf("ShutdownAll took %s, want a prompt teardown (no negotiation with the unresponsive server)", elapsed)
+	}
+
+	// The mapped mid-start instance's process is killed and reaped inside the
+	// call: kill(pid, 0) returns ESRCH only once reaped.
 	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-		t.Fatalf("language server process %d still alive after startServer returned (kill err = %v)", pid, err)
+		t.Fatalf("mid-start server process %d still alive after ShutdownAll returned (kill err = %v)", pid, err)
+	}
+	// The instance ended terminal and the failed start cleans the mapping.
+	<-started
+	m.mu.Lock()
+	_, stillMapped := m.instances[def.Name]
+	m.mu.Unlock()
+	if stillMapped {
+		t.Fatal("failed start left its instance mapped")
 	}
 }
