@@ -584,3 +584,230 @@ func TestResetProviderFieldTransportNoOpSkipsDiscovery(t *testing.T) {
 		t.Fatalf("no-op transport reset wrote a discovery attempt: %#v", attempts)
 	}
 }
+
+// TestResetProviderFieldAPIKeyEnvDuringConnectRejected proves the final
+// commit rechecks the api_key_env guard against the currently persisted raw
+// override, including deletion: a reset prepared while the provider was
+// disconnected must refuse when a concurrent ConnectProvider makes the live
+// provider connected before the reset's commit lands — before any config or
+// cache write. It fails against a commit guard that only compares the
+// candidate value against the live catalog, which sees an empty candidate
+// value and lets the reset silently delete the override the connect just
+// activated.
+func TestResetProviderFieldAPIKeyEnvDuringConnectRejected(t *testing.T) {
+	gate := make(chan struct{})
+	var closeGate sync.Once
+	releaseGate := func() { closeGate.Do(func() { close(gate) }) }
+	entered := make(chan struct{}, 1)
+	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		<-gate
+		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-test","name":"GPT Test","context_window":4096}]}`))
+	}))
+	t.Cleanup(discoveryServer.Close)
+	var a *Agent
+	t.Cleanup(func() {
+		if a != nil {
+			a.ShutdownOwner()
+		}
+	})
+	t.Cleanup(releaseGate)
+
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	lightcodeDir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dotenvPath := filepath.Join(lightcodeDir, ".env")
+	if err := os.WriteFile(dotenvPath, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The bundled env name OPENAI_API_KEY resolves (so the post-reset
+	// candidate — which inherits it — is connected and fetches discovery),
+	// while the user override LIGHTCODE_OPENAI_KEY does not (so the live
+	// provider is disconnected and the reset prepares).
+	t.Setenv("OPENAI_API_KEY", "bundled-key")
+	// ConnectProvider persists the key with a plain os.Setenv; unset it at the
+	// end so repeated runs in one process never see the provider connected at
+	// construction (which would make New's catalog load refresh discovery).
+	t.Cleanup(func() { _ = os.Unsetenv("LIGHTCODE_OPENAI_KEY") })
+	configPath := filepath.Join(lightcodeDir, "config.json")
+	configJSON := fmt.Sprintf(`{
+  "providers": {
+    "openai": {
+      "transport": { "base_url": %q, "api_key_env": "LIGHTCODE_OPENAI_KEY" }
+    }
+  },
+  "default_model": ""
+}`, discoveryServer.URL+"/v1")
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err = New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, Env: config.NewManagedEnvForTest(dotenvPath)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The reset removes the user api_key_env override, so the candidate
+	// inherits the bundled env name and is connected; candidate discovery runs
+	// against the gated endpoint and holds the commit open.
+	resetDone := make(chan error, 1)
+	go func() {
+		resetDone <- a.ResetProviderField("openai", "api_key_env")
+	}()
+	select {
+	case <-entered:
+		// The reset's candidate discovery fetch is in flight; its commit is
+		// held until the gate opens.
+	case <-time.After(5 * time.Second):
+		t.Fatal("reset never reached its candidate discovery fetch")
+	}
+
+	// Connect the provider while the reset is in flight: the key lands in the
+	// managed env under the current override name and the live catalog becomes
+	// connected.
+	if err := a.ConnectProvider("openai", "secret-key"); err != nil {
+		t.Fatalf("ConnectProvider: %v", err)
+	}
+
+	releaseGate()
+	select {
+	case err := <-resetDone:
+		if err == nil || !strings.Contains(err.Error(), "disconnect provider") {
+			t.Fatalf("reset during connect = %v, want the disconnect refusal", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reset never reached its final commit recheck")
+	}
+
+	// The refusal wrote nothing: the persisted override the connect activated
+	// is intact, and no discovery cache entry exists.
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"api_key_env": "LIGHTCODE_OPENAI_KEY"`) {
+		t.Fatalf("reset removed the persisted api_key_env override: %q", data)
+	}
+	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
+	if _, ok := cache["openai"]; ok {
+		t.Fatalf("refused reset wrote the discovery cache: %#v", cache["openai"])
+	}
+}
+
+// TestResetProviderFieldUnrelatedTransportFieldNotBlockedByAPIKeyEnv proves
+// the commit guard compares raw api_key_env overrides, not merged/live state:
+// an unrelated transport-field reset succeeds on a connected provider whose
+// raw override is unchanged, and on a built-in that only inherits a bundled
+// env name (no raw override on either side). A guard that compared the
+// candidate override against the live catalog's merged env would reject both.
+func TestResetProviderFieldUnrelatedTransportFieldNotBlockedByAPIKeyEnv(t *testing.T) {
+	t.Run("custom_override_unchanged", func(t *testing.T) {
+		home := t.TempDir()
+		projectRoot := t.TempDir()
+		lightcodeDir := filepath.Join(home, ".lightcode")
+		if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		configPath := filepath.Join(lightcodeDir, "config.json")
+		configJSON := `{
+  "providers": {
+    "disc": {
+      "name": "Discovery Provider",
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_DISC_KEY", "headers": { "X-Old": "1" } },
+      "discovery": false,
+      "models": { "disc-model": { "name": "Disc Model", "context_window": 4096 } }
+    }
+  },
+  "default_model": ""
+}`
+		if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := config.Load(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("LIGHTCODE_DISC_KEY", "disc-key")
+
+		if err := a.ResetProviderField("disc", "headers"); err != nil {
+			t.Fatalf("headers reset on a connected provider with an unchanged env override: %v", err)
+		}
+		data, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(data)
+		if !strings.Contains(body, `"api_key_env": "LIGHTCODE_DISC_KEY"`) {
+			t.Fatalf("unrelated reset removed the env override: %q", body)
+		}
+		if strings.Contains(body, "X-Old") {
+			t.Fatalf("headers override not reset: %q", body)
+		}
+		view, err := a.GetProviderConfig("disc")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(view.UserHeaders) != 0 {
+			t.Fatalf("effective headers after reset = %#v, want none", view.UserHeaders)
+		}
+	})
+
+	t.Run("builtin_inherits_bundled_env", func(t *testing.T) {
+		home := t.TempDir()
+		projectRoot := t.TempDir()
+		lightcodeDir := filepath.Join(home, ".lightcode")
+		if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		configPath := filepath.Join(lightcodeDir, "config.json")
+		configJSON := `{
+  "providers": {
+    "openai": {
+      "discovery": false,
+      "transport": { "headers": { "X-Test": "1" } }
+    }
+  },
+  "default_model": ""
+}`
+		if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := config.Load(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// OPENAI_API_KEY is the bundled env name openai inherits; with no raw
+		// override on either side the provider is connected, and the headers
+		// reset must not trip the env guard.
+		t.Setenv("OPENAI_API_KEY", "test-key")
+
+		if err := a.ResetProviderField("openai", "headers"); err != nil {
+			t.Fatalf("headers reset on a built-in inheriting a bundled env name: %v", err)
+		}
+		data, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(data)
+		if strings.Contains(body, "api_key_env") {
+			t.Fatalf("unrelated reset added an env override: %q", body)
+		}
+		if strings.Contains(body, "X-Test") {
+			t.Fatalf("headers override not reset: %q", body)
+		}
+	})
+}

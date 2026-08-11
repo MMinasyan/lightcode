@@ -696,29 +696,46 @@ func (a *Agent) commitProviderConfigCandidateLocked(candidate providerConfigCand
 	if rt.sessionLocked().transitioning {
 		return fmt.Errorf("session is changing; retry")
 	}
-	// Recheck the api_key_env guard against the live catalog: the state may
-	// have changed since preparation, and the refusal must land before any
-	// write. Concurrent complete config edits are not compared byte-wise; the
-	// whole candidate root is written atomically and the commit landing last
-	// wins.
+	// Recheck the api_key_env guard against the currently persisted raw
+	// override: preparation validated the edit against the live catalog, but a
+	// concurrent connect or reset may have changed the persisted override
+	// (including deleting it) and made the live provider connected in the
+	// meantime. The refusal must land before any config or cache write. The
+	// comparison is raw override vs raw override, so unrelated edits on
+	// providers that only inherit a bundled env name are not blocked.
+	// Concurrent complete config edits are not compared byte-wise; the whole
+	// candidate root is written atomically and the commit landing last wins.
 	prov := a.catalog.Providers[candidate.providerID]
 	if prov == nil {
 		return fmt.Errorf("provider %q not found", candidate.providerID)
 	}
-	var newEnv string
+	candidateEnv := ""
 	if providers, ok := candidate.root["providers"].(map[string]any); ok {
 		if pm, ok := providers[candidate.providerID].(map[string]any); ok {
 			if tr, ok := pm["transport"].(map[string]any); ok {
-				newEnv, _ = tr["api_key_env"].(string)
+				candidateEnv, _ = tr["api_key_env"].(string)
 			}
 		}
 	}
-	if newEnv != "" && newEnv != prov.Transport.APIKeyEnv {
+	persistedEnv := ""
+	if data, err := os.ReadFile(a.configPath); err == nil {
+		var persistedRoot map[string]any
+		if err := json.Unmarshal(data, &persistedRoot); err == nil {
+			if providers, ok := persistedRoot["providers"].(map[string]any); ok {
+				if pm, ok := providers[candidate.providerID].(map[string]any); ok {
+					if tr, ok := pm["transport"].(map[string]any); ok {
+						persistedEnv, _ = tr["api_key_env"].(string)
+					}
+				}
+			}
+		}
+	}
+	if candidateEnv != persistedEnv {
 		if providerConnected(prov) {
 			return fmt.Errorf("disconnect provider %q before changing its API key variable", candidate.providerID)
 		}
-		if a.apiKeyEnvInUseLocked(newEnv, candidate.providerID) {
-			return fmt.Errorf("API key variable %q is already used by another provider", newEnv)
+		if candidateEnv != "" && a.apiKeyEnvInUseLocked(candidateEnv, candidate.providerID) {
+			return fmt.Errorf("API key variable %q is already used by another provider", candidateEnv)
 		}
 	}
 	if err := writeAgentConfigAtomic(a.configPath, candidate.root); err != nil {
