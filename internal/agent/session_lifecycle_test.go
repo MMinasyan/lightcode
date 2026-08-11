@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 
 	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
@@ -478,6 +482,56 @@ func TestSessionLifecycleTransactionContract(t *testing.T) {
 			t.Fatal("claim released by the failed revert; another process could drive the session")
 		}
 	})
+
+	// shape=D is the fork shape: reserve (transitioning) across the staged
+	// copy and publication, release. A fork whose preparation fails after the
+	// staging root exists must join its precommit cleanup failure onto the
+	// operation error through the removeStagingTree seam and leave the source
+	// live, current, claimed and released — the same reservation disposition
+	// the other shapes assert.
+	t.Run("shape=D/case=fork_precommit_cleanup_failure_joins_and_releases", func(t *testing.T) {
+		a := newCatalogBackedTestAgent(t)
+		clicked := appendUserTurn(t, a, "fork point")
+		sourceID := a.SessionCurrent().ID
+		// Corrupt the source meta so ForkInto fails after the staging root
+		// exists, exercising the precommit cleanup seam.
+		if err := os.WriteFile(filepath.Join(a.session.store.Dir(), "meta.json"), []byte("{not json"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		origRemove := removeStagingTree
+		removeStagingTree = func(string) error { return errors.New("injected staging removal failure") }
+		defer func() { removeStagingTree = origRemove }()
+
+		_, err := a.ApplyTurnActionForSession(sourceID, clicked, TurnActionFork, false)
+		if err == nil {
+			t.Fatal("fork should fail when the source meta is unreadable")
+		}
+		if !strings.Contains(err.Error(), "injected staging removal failure") {
+			t.Fatalf("fork error = %q, want the precommit cleanup failure joined", err.Error())
+		}
+		// The source stays live, current, claimed, and the reservation is
+		// released so the unit is driveable again.
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[sourceID]
+		transitioning := false
+		if unit != nil {
+			transitioning = unit.transitioning
+		}
+		rt.mu.Unlock()
+		if unit == nil || unit.store == nil || !unit.store.Active() {
+			t.Fatal("failed fork evicted or detached the source")
+		}
+		if a.SessionCurrent().ID != sourceID {
+			t.Fatalf("SessionCurrent = %q, want the source %q", a.SessionCurrent().ID, sourceID)
+		}
+		if transitioning {
+			t.Fatal("transitioning reservation not released after a failed fork")
+		}
+		if err := unitMutableLocked(unit); err != nil {
+			t.Fatalf("source not driveable after a failed fork: %v", err)
+		}
+	})
 }
 
 // seedUnitQueue plants a queue item on a live unit. The volatile queue has no
@@ -861,4 +915,351 @@ func assertSessionListedActive(t *testing.T, sessionsRoot, projectPath, id strin
 		}
 	}
 	t.Fatalf("session %q not listed as active after failed removal: %#v", id, list)
+}
+
+// installNewSessionCandidateHook installs a durableReadHook acting at the nth
+// fire where a staged candidate is discoverable (newSession candidate-aware
+// ordinals: prepared SetModel=1, tokens read=2, prepared Meta=3). act receives
+// the candidate directory and id. The hook is left installed — inert once the
+// ordinal passes and the operation returns — to avoid teardown races.
+func installNewSessionCandidateHook(a *Agent, sessionsRoot string, target int, act func(candDir, candidateID string)) {
+	seen := 0
+	a.durableReadHook = func() {
+		parent := filepath.Join(filepath.Dir(sessionsRoot), ".staging", "sessions")
+		entries, err := os.ReadDir(parent)
+		if err != nil || len(entries) == 0 {
+			return
+		}
+		nonce := entries[0].Name()
+		candEntries, err := os.ReadDir(filepath.Join(parent, nonce))
+		if err != nil || len(candEntries) == 0 {
+			return
+		}
+		seen++
+		if seen == target {
+			act(filepath.Join(parent, nonce, candEntries[0].Name()), candEntries[0].Name())
+		}
+	}
+}
+
+// assertNewSessionFailureState asserts the precommit disposition shared by
+// every staged newSession failure: no final session directory, no listed
+// session, nothing registered or selected, no boundary, staging absent, and
+// the candidate claim immediately reacquirable from the recorded id.
+func assertNewSessionFailureState(t *testing.T, a *Agent, projectID, projectPath, sessionsRoot, stagingParent, candidateID string, emitted *bool) {
+	t.Helper()
+	if emitted != nil && *emitted {
+		t.Fatal("boundary emitted for a failed new session")
+	}
+	entries, err := os.ReadDir(sessionsRoot)
+	if err != nil {
+		t.Fatalf("read sessions root: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			t.Fatalf("session directory %q left in the sessions root after the failed creation", e.Name())
+		}
+	}
+	list, err := snapshot.List(sessionsRoot, projectPath, snapshot.StateActive)
+	if err != nil {
+		t.Fatalf("list sessions: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("failed creation left listed sessions: %#v", list)
+	}
+	if staging, _ := os.ReadDir(stagingParent); len(staging) != 0 {
+		t.Fatalf("staging left uncleaned: %v", staging)
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	registered := len(a.sessions)
+	current := a.currentSessionID
+	rt.mu.Unlock()
+	if registered != 0 {
+		t.Fatalf("failed creation registered %d live sessions", registered)
+	}
+	if current != "" {
+		t.Fatalf("failed creation selected session %q", current)
+	}
+	if candidateID != "" {
+		claim, ok, err := snapshot.AcquireSessionClaim(a.projects.Root(), projectID, candidateID)
+		if err != nil {
+			t.Fatalf("claim check: %v", err)
+		}
+		if !ok {
+			t.Fatal("candidate claim still held after the failed creation")
+		}
+		_ = claim.Release()
+	}
+}
+
+// TestNewSessionCleanupOwnershipProvesSingleSeamCall covers the newSession
+// cleanup owner: the named-error defer joins precommit operation and cleanup
+// failures with exactly one removeStagingTree call, and the post-publish
+// cleanup failure prints exactly once while publication and registration
+// succeed and the defer does not call again.
+func TestNewSessionCleanupOwnershipProvesSingleSeamCall(t *testing.T) {
+	t.Run("precommit_failure_joins_with_one_seam_call", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("directory permissions do not block writes as root")
+		}
+		a := newCatalogBackedTestAgent(t)
+		proj, err := a.projects.Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sessionsRoot := a.projects.SessionsRoot(proj.ID)
+		// Make the durable rename fail (precommit) and inject a cleanup
+		// failure: the returned error joins the operation and cleanup
+		// failures, and the seam is called exactly once (the defer).
+		if err := os.Chmod(sessionsRoot, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = os.Chmod(sessionsRoot, 0o700) }()
+		seamCalls := 0
+		origRemove := removeStagingTree
+		removeStagingTree = func(string) error {
+			seamCalls++
+			return errors.New("injected staging removal failure")
+		}
+		defer func() { removeStagingTree = origRemove }()
+
+		_, err = a.NewSession(proj.ID, "primary")
+		if err == nil {
+			t.Fatal("NewSession should fail when the sessions root is unwritable")
+		}
+		if !strings.Contains(err.Error(), "injected staging removal failure") {
+			t.Fatalf("NewSession error = %q, want the injected cleanup failure joined", err.Error())
+		}
+		if !strings.Contains(err.Error(), "snapshot: new-session staging cleanup") {
+			t.Fatalf("NewSession error = %q, want new-session cleanup context", err.Error())
+		}
+		if seamCalls != 1 {
+			t.Fatalf("removeStagingTree calls = %d, want exactly 1", seamCalls)
+		}
+	})
+
+	t.Run("postpublish_cleanup_failure_prints_once_and_commits", func(t *testing.T) {
+		a := newCatalogBackedTestAgent(t)
+		proj, err := a.projects.Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		seamCalls := 0
+		origRemove := removeStagingTree
+		removeStagingTree = func(string) error {
+			seamCalls++
+			return errors.New("injected staging removal failure")
+		}
+		defer func() { removeStagingTree = origRemove }()
+		stderr := captureStderr(t)
+
+		id, err := a.NewSession(proj.ID, "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		// Publication and registration succeeded despite the cleanup failure.
+		if id == "" || a.SessionCurrent().ID != id {
+			t.Fatalf("SessionCurrent = %q, want the published session %q", a.SessionCurrent().ID, id)
+		}
+		out := stderr()
+		if !strings.Contains(out, "injected staging removal failure") {
+			t.Fatalf("NewSession stderr = %q, want the injected cleanup failure", out)
+		}
+		if seamCalls != 1 {
+			t.Fatalf("removeStagingTree calls = %d, want exactly 1 (the post-publish call only; the defer must not call again)", seamCalls)
+		}
+		// The published session is usable through its store.
+		if err := a.store.SetActiveAgentType("primary"); err != nil {
+			t.Fatalf("published session unusable: %v", err)
+		}
+	})
+}
+
+// TestNewSessionStagedFailureCoverage proves the newSession staged failures
+// return their exact errors and the shared precommit disposition — one
+// cleanup call, staging removed, no final/listed/registered/selected session,
+// no boundary, the candidate claim immediately reacquirable, and a later
+// NewSession succeeding — with the failure injected deterministically through
+// the existing durableReadHook (candidate-aware ordinals: prepared SetModel=1,
+// tokens read=2, prepared Meta=3).
+func TestNewSessionStagedFailureCoverage(t *testing.T) {
+	t.Run("setmodel_meta_corruption", func(t *testing.T) {
+		a := newCatalogBackedTestAgent(t)
+		proj, err := a.projects.Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sessionsRoot := a.projects.SessionsRoot(proj.ID)
+		stagingParent := filepath.Join(filepath.Dir(sessionsRoot), ".staging", "sessions")
+		var recordedID string
+		var emitted bool
+		seamCalls := 0
+		origRemove := removeStagingTree
+		removeStagingTree = func(p string) error {
+			seamCalls++
+			return origRemove(p)
+		}
+		defer func() { removeStagingTree = origRemove }()
+		installNewSessionCandidateHook(a, sessionsRoot, 1, func(candDir, candidateID string) {
+			recordedID = candidateID
+			if err := os.WriteFile(filepath.Join(candDir, "meta.json"), []byte("{not json"), 0o600); err != nil {
+				t.Error(err)
+			}
+		})
+
+		_, err = a.NewSessionWithBoundary(proj.ID, "primary", func(HydrationState) { emitted = true })
+		if err == nil {
+			t.Fatal("NewSessionWithBoundary should fail when the staged meta is corrupt before SetModel")
+		}
+		if !strings.Contains(err.Error(), "persist model") {
+			t.Fatalf("NewSession error = %q, want the exact persist-model error", err.Error())
+		}
+		if seamCalls != 1 {
+			t.Fatalf("removeStagingTree calls = %d, want exactly 1", seamCalls)
+		}
+		assertNewSessionFailureState(t, a, proj.ID, proj.Path, sessionsRoot, stagingParent, recordedID, &emitted)
+		// A later creation succeeds.
+		id, err := a.NewSession(proj.ID, "primary")
+		if err != nil {
+			t.Fatalf("NewSession after the failed creation: %v", err)
+		}
+		if a.SessionCurrent().ID != id {
+			t.Fatalf("SessionCurrent = %q, want %q", a.SessionCurrent().ID, id)
+		}
+	})
+
+	t.Run("meta_read_corruption", func(t *testing.T) {
+		a := newCatalogBackedTestAgent(t)
+		proj, err := a.projects.Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sessionsRoot := a.projects.SessionsRoot(proj.ID)
+		stagingParent := filepath.Join(filepath.Dir(sessionsRoot), ".staging", "sessions")
+		var recordedID string
+		var emitted bool
+		seamCalls := 0
+		origRemove := removeStagingTree
+		removeStagingTree = func(p string) error {
+			seamCalls++
+			return origRemove(p)
+		}
+		defer func() { removeStagingTree = origRemove }()
+		installNewSessionCandidateHook(a, sessionsRoot, 3, func(candDir, candidateID string) {
+			recordedID = candidateID
+			if err := os.WriteFile(filepath.Join(candDir, "meta.json"), []byte("{not json"), 0o600); err != nil {
+				t.Error(err)
+			}
+		})
+
+		_, err = a.NewSessionWithBoundary(proj.ID, "primary", func(HydrationState) { emitted = true })
+		if err == nil {
+			t.Fatal("NewSessionWithBoundary should fail when the staged meta is corrupt at the summary read")
+		}
+		if !strings.Contains(err.Error(), "read session meta") {
+			t.Fatalf("NewSession error = %q, want the exact read-session-meta error", err.Error())
+		}
+		if seamCalls != 1 {
+			t.Fatalf("removeStagingTree calls = %d, want exactly 1", seamCalls)
+		}
+		assertNewSessionFailureState(t, a, proj.ID, proj.Path, sessionsRoot, stagingParent, recordedID, &emitted)
+	})
+}
+
+// TestCompactSetupErrorJoinsCloseCleanupFailure proves the compact setup error
+// path joins the ensuing empty-store Close cleanup failure: through the real
+// compact setup path, a setup metadata write is made to fail (the existing
+// atomicfs SyncFileFunc hook parked at the second file sync — the first is the
+// child mint's own meta write) while the fresh child dir is made unremovable,
+// and the returned error preserves the primary setup error joined with the
+// cleanup error. After cleanup returns the child claim is reacquirable.
+func TestCompactSetupErrorJoinsCloseCleanupFailure(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	proj, err := a.projects.Ensure()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.NewSession(proj.ID, "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	seedCompleteTurns(t, a, 3)
+	sessionsRoot := a.projects.SessionsRoot(proj.ID)
+	parentID := a.SessionCurrent().ID
+
+	syncCalls := 0
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	origSync := atomicfs.SyncFileFunc
+	atomicfs.SyncFileFunc = func(*os.File) error {
+		syncCalls++
+		if syncCalls == 1 {
+			return nil
+		}
+		close(parked)
+		<-release
+		return errors.New("injected sync failure")
+	}
+	defer func() { atomicfs.SyncFileFunc = origSync }()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- a.runCompaction(context.Background(), false)
+	}()
+	select {
+	case <-parked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("compact setup write never parked")
+	}
+	// Find the fresh child dir (the only session dir that is not the parent)
+	// and make it unremovable so the ensuing empty-store Close cleanup fails.
+	entries, err := os.ReadDir(sessionsRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childDir := ""
+	for _, e := range entries {
+		if e.IsDir() && e.Name() != parentID {
+			childDir = filepath.Join(sessionsRoot, e.Name())
+			break
+		}
+	}
+	if childDir == "" {
+		t.Fatal("compact child dir not found")
+	}
+	if err := os.Chmod(childDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	err = <-done
+	if err == nil {
+		t.Fatal("compact setup should fail when the metadata write fails")
+	}
+	// The primary setup error is preserved and joined with the cleanup error.
+	if !strings.Contains(err.Error(), "injected sync failure") {
+		t.Fatalf("compact setup error = %q, want the primary setup write error", err.Error())
+	}
+	if !strings.Contains(err.Error(), "discard empty session") {
+		t.Fatalf("compact setup error = %q, want the Close cleanup error joined", err.Error())
+	}
+	// Restore the permissions before reacquiring the child claim.
+	if err := os.Chmod(childDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	childID := filepath.Base(childDir)
+	claim, ok, err := snapshot.AcquireSessionClaim(a.projects.Root(), proj.ID, childID)
+	if err != nil {
+		t.Fatalf("claim check: %v", err)
+	}
+	if !ok {
+		t.Fatal("child claim still held after the failed compact setup")
+	}
+	_ = claim.Release()
 }

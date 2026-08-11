@@ -12,6 +12,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
+	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
 // seedCompleteTurns persists n complete turns, one user message each, through
@@ -83,7 +84,7 @@ func TestRevertPartialWalkReloadsLoopAndPublishesBoundary(t *testing.T) {
 	blockTurnDir(t, a, 7)
 
 	var got []HydrationState
-	_, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string) {
+	result, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string) {
 		got = append(got, hs)
 	})
 	if err == nil {
@@ -106,6 +107,27 @@ func TestRevertPartialWalkReloadsLoopAndPublishesBoundary(t *testing.T) {
 	}
 	if c := userContents(got[0].Messages); !equalStrings(c, []string{"turn 1", "turn 2", "turn 3", "turn 4", "turn 5", "turn 6", "turn 7"}) {
 		t.Fatalf("boundary messages = %q, want turns 1-7", c)
+	}
+	// The reconciled failure rides the result as a warning.
+	if result.Warning != err.Error() {
+		t.Fatalf("result.Warning = %q, want the walk error %q", result.Warning, err.Error())
+	}
+	// The coordinator mutation committed exactly once: the rewrite epoch
+	// advanced, and the committed bound was lowered to the stop turn (this
+	// unit never committed a turn, so the bound stays 0 — the epoch advance is
+	// what makes a racing live capture re-read the truncated prefix).
+	tr := a.transcriptForSessionID(id)
+	if tr == nil {
+		t.Fatal("no live coordinator for the session")
+	}
+	tr.seqMu.Lock()
+	rev := tr.revisionLocked()
+	tr.seqMu.Unlock()
+	if rev.committedTurn != 0 {
+		t.Fatalf("committedTurn = %d, want 0 (nothing was committed on this unit)", rev.committedTurn)
+	}
+	if rev.rewriteEpoch != 1 {
+		t.Fatalf("rewriteEpoch = %d, want exactly 1 after the partial walk", rev.rewriteEpoch)
 	}
 }
 
@@ -176,8 +198,10 @@ func TestRevertPartialWalkReloadFailureEvictsUnit(t *testing.T) {
 	blockTurnDir(t, a, 7)
 
 	var got []HydrationState
-	_, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string) {
+	var evictWarning string
+	_, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, warning string) {
 		got = append(got, hs)
+		evictWarning = warning
 	})
 	// Restore the messages file before any assertion reads the surviving
 	// turns, so a later read cannot fail for the injected reason.
@@ -189,6 +213,16 @@ func TestRevertPartialWalkReloadFailureEvictsUnit(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "turn 7") {
 		t.Fatalf("revert error = %q, want the walk's error naming turn 7", err.Error())
+	}
+	// The reload error is joined onto the walk error, never substituted for
+	// it, so neither cause is lost.
+	if !strings.Contains(err.Error(), "messages.jsonl") {
+		t.Fatalf("revert error = %q, want the reload's cause joined onto the walk error", err.Error())
+	}
+	// The eviction boundary is the empty state carrying the error, so the
+	// adapter learns the session was evicted because of it.
+	if evictWarning == "" {
+		t.Fatal("eviction boundary carries no error warning")
 	}
 	assertEvicted(t, a, id, got)
 }
@@ -274,18 +308,53 @@ func TestRevertPartialWalkClearsQueue(t *testing.T) {
 	if got.Version <= 7 {
 		t.Fatalf("queue version = %d, want > 7", got.Version)
 	}
+	// The coordinator mutation committed alongside the queue clear: the
+	// rewrite epoch advanced exactly once.
+	tr := a.transcriptForSessionID(a.SessionCurrent().ID)
+	if tr == nil {
+		t.Fatal("no live coordinator for the session")
+	}
+	tr.seqMu.Lock()
+	epoch := tr.rewriteEpoch
+	tr.seqMu.Unlock()
+	if epoch != 1 {
+		t.Fatalf("rewriteEpoch = %d, want exactly 1 after the partial walk", epoch)
+	}
 }
 
 // TestRevertFirstRemovalFailureKeepsQueue covers the queue rule when the walk
-// removed nothing: the first removal failed, so the queued input is kept.
+// removed nothing: the first removal failed, so the queued input is kept. The
+// same failure is a zero-history-mutation failure — no compaction record was
+// removed and no turn was removed — so it is returned as a precommit failure
+// with no boundary, no coordinator mutation, and no tracker reset, and the
+// loop and disk stay exactly as they were.
 func TestRevertFirstRemovalFailureKeepsQueue(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	seedCompleteTurns(t, a, 10)
 	seedQueue(t, a, 7, "stale after failed first removal")
 	blockTurnDir(t, a, 10)
+	id := a.SessionCurrent().ID
+	// Track one read so a tracker reset is observable.
+	path := filepath.Join(a.projectRoot, "tracked.txt")
+	if err := os.WriteFile(path, []byte("v1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.fileTracker.TrackIdentity(path, 0, 0, tool.FileIdentity{Valid: true})
+	if !agentTrackerHasRead(a, path) {
+		t.Fatal("setup: tracker missing read state")
+	}
 
-	if _, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, 6, TurnActionRevertHistory, false); err == nil {
+	var boundaries int
+	var warnings []string
+	_, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(_ HydrationState, _ []snapshot.SkippedRevert, warning string) {
+		boundaries++
+		warnings = append(warnings, warning)
+	})
+	if err == nil {
 		t.Fatal("first-removal failure reported success")
+	}
+	if !strings.Contains(err.Error(), "turn 10") {
+		t.Fatalf("revert error = %q, want it to name turn 10 where removal stopped", err.Error())
 	}
 	got := a.QueueSnapshot()
 	if len(got.Items) != 1 || got.Items[0].Content != "stale after failed first removal" {
@@ -293,6 +362,39 @@ func TestRevertFirstRemovalFailureKeepsQueue(t *testing.T) {
 	}
 	if got.Version != 7 {
 		t.Fatalf("queue version = %d, want unchanged 7", got.Version)
+	}
+	// Zero-history-mutation failure: nothing was durably removed, so the error
+	// is the whole outcome — no boundary, no coordinator mutation, no tracker
+	// reset, and the loop and disk stay exactly as they were.
+	if boundaries != 0 {
+		t.Fatalf("boundaries emitted = %d, want 0 for a zero-history-mutation failure (%v)", boundaries, warnings)
+	}
+	tr := a.transcriptForSessionID(id)
+	if tr == nil {
+		t.Fatal("no live coordinator for the session")
+	}
+	tr.seqMu.Lock()
+	epoch := tr.rewriteEpoch
+	tr.seqMu.Unlock()
+	if epoch != 0 {
+		t.Fatalf("rewriteEpoch = %d, want 0 (no coordinator mutation)", epoch)
+	}
+	if !agentTrackerHasRead(a, path) {
+		t.Fatal("tracker reset by a zero-history-mutation failure")
+	}
+	if c := loopUserContents(a.lp.Messages()); !equalStrings(c, []string{"turn 1", "turn 2", "turn 3", "turn 4", "turn 5", "turn 6", "turn 7", "turn 8", "turn 9", "turn 10"}) {
+		t.Fatalf("loop history changed by a zero-history-mutation failure: %q", c)
+	}
+	turns, err := a.store.LoadCompleteTurns()
+	if err != nil {
+		t.Fatalf("load complete turns: %v", err)
+	}
+	var numbers []int
+	for _, t := range turns {
+		numbers = append(numbers, t.Turn)
+	}
+	if !reflect.DeepEqual(numbers, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
+		t.Fatalf("turns on disk changed by a zero-history-mutation failure: %v", numbers)
 	}
 }
 
@@ -360,6 +462,20 @@ func TestRevertPartialWalkPrunesToStoppedTurn(t *testing.T) {
 	if turns := retainedErrorTurns(t, a, id); !reflect.DeepEqual(turns, []int{5, 6, 7}) {
 		t.Fatalf("retained error turns after partial walk = %v, want [5 6 7]: errors tagged to surviving turns must stay", turns)
 	}
+	// The coordinator mutation committed exactly once alongside the prune: the
+	// rewrite epoch advanced even though the committed bound did not change
+	// (nothing was committed on this unit), so a racing live capture still
+	// re-reads the truncated durable prefix.
+	tr.seqMu.Lock()
+	epoch := tr.rewriteEpoch
+	committedTurn := tr.committedTurn
+	tr.seqMu.Unlock()
+	if epoch != 1 {
+		t.Fatalf("rewriteEpoch = %d, want exactly 1 after the partial walk", epoch)
+	}
+	if committedTurn != 0 {
+		t.Fatalf("committedTurn = %d, want 0 (the bound is never raised)", committedTurn)
+	}
 }
 
 // TestRevertBelowCompactionBoundaryDropsRecordAndRendersFullHistory asserts
@@ -401,11 +517,17 @@ func TestRevertBelowCompactionBoundaryDropsRecordAndRendersFullHistory(t *testin
 // TestRevertCompactionRecordSyncFailurePublishesFullTurns pins the
 // sync-failure outcome at the reload: the unlink succeeded, so the record is
 // gone and the reload publishes all ten turns with no summary, while the
-// error still fails the revert with no turn removed.
+// error still fails the revert with no turn removed. The record removal is a
+// durable history mutation (historyChanged), so the queued input is
+// invalidated even though no turn was removed: cleared, version advanced, the
+// matching queue-changed event emitted, and nothing retained to rearm.
 func TestRevertCompactionRecordSyncFailurePublishesFullTurns(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
+	cap := &eventCapture{}
+	a.SetEventHandler(cap.handler)
 	seedCompleteTurns(t, a, 10)
 	id := a.SessionCurrent().ID
+	seedQueue(t, a, 7, "stale after record unlink")
 	if err := a.store.SaveCompaction(snapshot.CompactionRecord{BoundaryTurn: 10, Summary: "summary of turns 1-10"}); err != nil {
 		t.Fatalf("SaveCompaction: %v", err)
 	}
@@ -438,6 +560,173 @@ func TestRevertCompactionRecordSyncFailurePublishesFullTurns(t *testing.T) {
 	}
 	if c := userContents(got[0].Messages); !equalStrings(c, []string{"turn 1", "turn 2", "turn 3", "turn 4", "turn 5", "turn 6", "turn 7", "turn 8", "turn 9", "turn 10"}) {
 		t.Fatalf("boundary messages = %q, want turns 1-10 in full with no summary", c)
+	}
+	// The record removal invalidated the queue: cleared, version advanced,
+	// the matching queue-changed event emitted, and nothing retained to
+	// rearm.
+	q := a.QueueSnapshot()
+	if len(q.Items) != 0 || q.Items == nil {
+		t.Fatalf("queue after record-unlink sync failure = %#v, want empty", q.Items)
+	}
+	if q.Version <= 7 {
+		t.Fatalf("queue version = %d, want > 7", q.Version)
+	}
+	assertQueueChangedPayloadForVersion(t, cap, q.Version, q.Items)
+}
+
+// TestCombinedRevertNoOpCodePhaseFirstRemovalFailureIsPrecommit: a prior
+// code-only revert already removed the only snapshot turn above the target,
+// so the combined revert's code phase restores nothing (codeChanged=false);
+// the first history deletion failure then leaves the operation with no
+// durable mutation and returns as a precommit failure — no boundary, no epoch
+// advance, no tracker reset.
+func TestCombinedRevertNoOpCodePhaseFirstRemovalFailureIsPrecommit(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	seedCompleteTurns(t, a, 10)
+	path := filepath.Join(a.projectRoot, "tracked.txt")
+	if err := os.WriteFile(path, []byte("v1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	appendUserTurnWithSnapshot(t, a, "modify", path, "v2")
+	id := a.SessionCurrent().ID
+	// The prior code-only revert removes the only snapshot turn above the
+	// combined target.
+	if _, err := a.ApplyTurnActionForSession(id, 11, TurnActionRevertCode, false); err != nil {
+		t.Fatalf("prior code revert: %v", err)
+	}
+	a.fileTracker.TrackIdentity(path, 0, 0, tool.FileIdentity{Valid: true})
+	if !agentTrackerHasRead(a, path) {
+		t.Fatal("setup: tracker missing read state")
+	}
+	blockTurnDir(t, a, 11)
+
+	var boundaries int
+	result, err := a.ApplyTurnActionForSessionWithBoundary(id, 11, TurnActionRevertHistory, true, func(_ HydrationState, _ []snapshot.SkippedRevert, _ string) {
+		boundaries++
+	})
+	if err == nil {
+		t.Fatal("first history deletion failure reported success")
+	}
+	if !strings.Contains(err.Error(), "turn 11") {
+		t.Fatalf("revert error = %q, want it to name turn 11 where removal stopped", err.Error())
+	}
+	if len(result.RestoredFiles) != 0 || len(result.SkippedFiles) != 0 {
+		t.Fatalf("combined result = restored %v skipped %v, want empty (no-op code phase)", result.RestoredFiles, result.SkippedFiles)
+	}
+	if boundaries != 0 {
+		t.Fatalf("boundaries emitted = %d, want 0 (no-op code phase, no history mutation)", boundaries)
+	}
+	tr := a.transcriptForSessionID(id)
+	tr.seqMu.Lock()
+	epoch := tr.rewriteEpoch
+	tr.seqMu.Unlock()
+	if epoch != 0 {
+		t.Fatalf("rewriteEpoch = %d, want 0", epoch)
+	}
+	if !agentTrackerHasRead(a, path) {
+		t.Fatal("tracker reset by a zero-mutation combined revert")
+	}
+}
+
+// TestCombinedRevertSkippedCodePhaseFirstRemovalFailureIsPrecommit: the code
+// phase skips every file (the current content diverged from the recorded
+// post-write identity), so no file was mutated (codeChanged=false); the first
+// history deletion failure returns as a precommit failure carrying the exact
+// skips, with no boundary, no epoch advance, and no tracker reset.
+func TestCombinedRevertSkippedCodePhaseFirstRemovalFailureIsPrecommit(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	seedCompleteTurns(t, a, 10)
+	path := filepath.Join(a.projectRoot, "tracked.txt")
+	if err := os.WriteFile(path, []byte("v2"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	appendUserTurnWithSnapshot(t, a, "modify", path, "v2")
+	// Divergence: the file changed since the recorded post-write identity, so
+	// the code phase skips it.
+	if err := os.WriteFile(path, []byte("external"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	id := a.SessionCurrent().ID
+	a.fileTracker.TrackIdentity(path, 0, 0, tool.FileIdentity{Valid: true})
+	if !agentTrackerHasRead(a, path) {
+		t.Fatal("setup: tracker missing read state")
+	}
+	blockTurnDir(t, a, 11)
+
+	var boundaries int
+	result, err := a.ApplyTurnActionForSessionWithBoundary(id, 11, TurnActionRevertHistory, true, func(_ HydrationState, _ []snapshot.SkippedRevert, _ string) {
+		boundaries++
+	})
+	if err == nil {
+		t.Fatal("first history deletion failure reported success")
+	}
+	if len(result.RestoredFiles) != 0 {
+		t.Fatalf("RestoredFiles = %v, want none", result.RestoredFiles)
+	}
+	if len(result.SkippedFiles) != 1 || result.SkippedFiles[0].Path != path {
+		t.Fatalf("SkippedFiles = %+v, want exactly the diverged file", result.SkippedFiles)
+	}
+	if boundaries != 0 {
+		t.Fatalf("boundaries emitted = %d, want 0 (skipped-only code phase, no history mutation)", boundaries)
+	}
+	tr := a.transcriptForSessionID(id)
+	tr.seqMu.Lock()
+	epoch := tr.rewriteEpoch
+	tr.seqMu.Unlock()
+	if epoch != 0 {
+		t.Fatalf("rewriteEpoch = %d, want 0", epoch)
+	}
+	if !agentTrackerHasRead(a, path) {
+		t.Fatal("tracker reset by a zero-mutation combined revert")
+	}
+}
+
+// TestCombinedRevertRestoredCodePhaseFirstRemovalFailureReconciles: the code
+// phase actually restored a file (codeChanged=true), so the first history
+// deletion failure keeps the reconciled treatment — tracker reset, epoch
+// advance, warning, and boundary.
+func TestCombinedRevertRestoredCodePhaseFirstRemovalFailureReconciles(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	seedCompleteTurns(t, a, 10)
+	path := filepath.Join(a.projectRoot, "tracked.txt")
+	if err := os.WriteFile(path, []byte("v1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	appendUserTurnWithSnapshot(t, a, "modify", path, "v2")
+	id := a.SessionCurrent().ID
+	a.fileTracker.TrackIdentity(path, 0, 0, tool.FileIdentity{Valid: true})
+	if !agentTrackerHasRead(a, path) {
+		t.Fatal("setup: tracker missing read state")
+	}
+	blockTurnDir(t, a, 11)
+
+	var boundaries int
+	var warning string
+	result, err := a.ApplyTurnActionForSessionWithBoundary(id, 11, TurnActionRevertHistory, true, func(_ HydrationState, _ []snapshot.SkippedRevert, w string) {
+		boundaries++
+		warning = w
+	})
+	if err == nil {
+		t.Fatal("first history deletion failure reported success")
+	}
+	if len(result.RestoredFiles) != 1 || result.RestoredFiles[0] != path {
+		t.Fatalf("RestoredFiles = %v, want exactly the restored file", result.RestoredFiles)
+	}
+	if boundaries != 1 {
+		t.Fatalf("boundaries emitted = %d, want 1 (reconciled)", boundaries)
+	}
+	if warning == "" {
+		t.Fatal("reconciled boundary carries no walk warning")
+	}
+	tr := a.transcriptForSessionID(id)
+	tr.seqMu.Lock()
+	epoch := tr.rewriteEpoch
+	tr.seqMu.Unlock()
+	if epoch != 1 {
+		t.Fatalf("rewriteEpoch = %d, want 1", epoch)
+	}
+	if agentTrackerHasRead(a, path) {
+		t.Fatal("tracker not reset by the reconciled combined revert")
 	}
 }
 

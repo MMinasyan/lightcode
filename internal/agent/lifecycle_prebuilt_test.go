@@ -1,7 +1,11 @@
 package agent
 
 import (
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
@@ -157,6 +161,101 @@ func TestLifecycleReturnsPrebuiltReplacement(t *testing.T) {
 		}
 		if len(got) != 0 {
 			t.Fatalf("failed activation published %d boundaries, want 0 (no detach after a failed prep)", len(got))
+		}
+	})
+
+	// The fork's boundary is prebuilt before the durable rename: with the
+	// published candidate's history unreadable at the post-rename cleanup
+	// seam, the fork still publishes the replacement rendered from the staged
+	// copy — no fallible read runs after the rename, so the boundary cannot be
+	// a postcommit capture.
+	t.Run("case=fork_prebuilt_survives_candidate_history_loss", func(t *testing.T) {
+		a := newCatalogBackedTestAgent(t)
+		appendUserTurn(t, a, "first")
+		clicked := appendUserTurn(t, a, "fork point")
+		appendUserTurn(t, a, "after")
+		id := a.SessionCurrent().ID
+		sessionsRoot := a.session.store.Root()
+
+		// Hold the fork at the post-rename cleanup seam, then make the
+		// published candidate's history unreadable.
+		seamFired := make(chan struct{})
+		releaseSeam := make(chan struct{})
+		var seamOnce sync.Once
+		origRemove := removeStagingTree
+		removeStagingTree = func(string) error {
+			seamOnce.Do(func() { close(seamFired) })
+			<-releaseSeam
+			return nil
+		}
+		defer func() { removeStagingTree = origRemove }()
+		defer func() {
+			select {
+			case <-releaseSeam:
+			default:
+				close(releaseSeam)
+			}
+		}()
+
+		var got []HydrationState
+		forkDone := make(chan error, 1)
+		go func() {
+			_, err := a.ApplyTurnActionForSessionWithBoundary(id, clicked, TurnActionFork, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string) {
+				got = append(got, hs)
+			})
+			forkDone <- err
+		}()
+		select {
+		case <-seamFired:
+		case <-time.After(10 * time.Second):
+			t.Fatal("post-rename cleanup seam never fired")
+		}
+		// Atomically relocate the published candidate's history away at the
+		// barrier: the cached candidate-store paths point at the missing
+		// originals, so any post-publication durable read fails with ENOENT
+		// for every UID (no permissions involved, root and non-root alike).
+		entries, err := os.ReadDir(sessionsRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var candidateID string
+		for _, e := range entries {
+			if e.IsDir() && e.Name() != id {
+				candidateID = e.Name()
+				break
+			}
+		}
+		if candidateID == "" {
+			t.Fatal("published fork candidate not found")
+		}
+		candDir := filepath.Join(sessionsRoot, candidateID)
+		restoreCandidateHistory := func() {
+			for _, d := range []string{"turns", "snapshots"} {
+				_ = os.Rename(filepath.Join(candDir, d+".orphan"), filepath.Join(candDir, d))
+			}
+		}
+		for _, d := range []string{"turns", "snapshots"} {
+			if err := os.Rename(filepath.Join(candDir, d), filepath.Join(candDir, d+".orphan")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		defer restoreCandidateHistory()
+		t.Cleanup(restoreCandidateHistory)
+		close(releaseSeam)
+		if err := <-forkDone; err != nil {
+			t.Fatalf("fork: %v", err)
+		}
+		// Restore the candidate history immediately after the fork returns,
+		// before any later candidate use.
+		restoreCandidateHistory()
+		if len(got) != 1 {
+			t.Fatalf("emit called %d times, want exactly 1", len(got))
+		}
+		if got[0].Session.ID != candidateID {
+			t.Fatalf("boundary session = %q, want the candidate %q", got[0].Session.ID, candidateID)
+		}
+		if c := userContents(got[0].Messages); !equalStrings(c, []string{"first", "fork point"}) {
+			t.Fatalf("fork boundary messages = %q, want the prebuilt [first, fork point]", c)
 		}
 	})
 }

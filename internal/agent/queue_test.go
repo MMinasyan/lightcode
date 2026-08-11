@@ -406,7 +406,12 @@ func TestDirectRevertAndForkClearQueueAndBumpVersionMonotonically(t *testing.T) 
 		if got := a.SessionCurrent().ID; got == "" || got == before {
 			t.Fatalf("current session after ForkSessionForSession = %q, before %q", got, before)
 		}
-		assertForkQueuePreservesSource(t, a, before, 50)
+		// The fork held the source's transitioning reservation across its
+		// publication; the release re-arms the retained queue, so the item
+		// seeded before the fork drains into the source on its own (the model
+		// endpoint is unreachable, so the turn fails fast and the queue ends
+		// empty with the version bumped past the seeded one).
+		assertForkQueueRearmsSource(t, a, before, 50)
 	})
 }
 
@@ -971,4 +976,28 @@ func assertForkQueuePreservesSource(t *testing.T, a *Agent, sourceID string, sou
 	if cur := a.QueueSnapshot(); len(cur.Items) != 0 {
 		t.Fatalf("fork queue = %#v, want empty", cur.Items)
 	}
+}
+
+// assertForkQueueRearmsSource waits for the source's retained queue to drain
+// after the fork's reservation release and asserts the version advanced past
+// the seeded one: the fork blocks admission during publication, and the
+// release re-arms the retained work without any manual nudge.
+func assertForkQueueRearmsSource(t *testing.T, a *Agent, sourceID string, sourceVersion int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		src, err := a.QueueSnapshotForSession(sourceID)
+		if err != nil {
+			t.Fatalf("source queue after fork: %v", err)
+		}
+		if len(src.Items) == 0 && src.Version >= sourceVersion {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	src, err := a.QueueSnapshotForSession(sourceID)
+	if err != nil {
+		t.Fatalf("source queue after fork: %v", err)
+	}
+	t.Fatalf("source queue never drained after the fork release = %#v (version %d), want empty at version >= %d", src.Items, src.Version, sourceVersion)
 }

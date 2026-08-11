@@ -491,8 +491,10 @@ func (unit *session) syncEventOwner() {
 	unit.lp.SetEventOwner(unit.store.SessionID(), unit.projectID)
 }
 
-func (a *Agent) permissionCheckForProject(projectID, projectRoot string) tool.CheckFunc {
-	cfg := a.cfg
+// permissionCheckForProjectWith builds the tool permission check from a
+// snapshotted config pointer and the owner's stable resolver, so the closure
+// can be constructed outside rt.mu (the shared running-unit constructor).
+func (a *Agent) permissionCheckForProjectWith(cfg *config.Config, projectID, projectRoot string) tool.CheckFunc {
 	return tool.CheckFunc(func(toolName, arg string) permission.Decision {
 		var local permission.Rules
 		if projectID != "" && a.projects != nil {
@@ -622,41 +624,120 @@ func (a *Agent) startDetectLocked(e *lspEntry) {
 	}
 }
 
-func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType string, projectID string, projectName string, projectRoot string) (*session, []prompt.Warning, error) {
-	if activeAgentType == "" {
-		activeAgentType = "primary"
+// rootUnitSnapshot is the value-copied configuration a fresh running unit is
+// built from. It is captured under rt.mu in the caller's first lock hold; the
+// shared constructor consumes only these values (plus the owner's stable,
+// self-synchronized services) so the construction never reads reloadable
+// owner state and never performs durable I/O under rt.mu.
+type rootUnitSnapshot struct {
+	resolved      agentcfg.Resolved
+	resolveErr    error
+	agentTypes    *agentcfg.Config
+	modelCatalog  *catalog.Catalog
+	cfg           *config.Config
+	toolsConfig   config.ToolsConfig
+	maxConcurrent int
+	taggedEvents  chan TaggedLoopEvent
+}
+
+// rootUnitSnapshotLocked captures the reloadable configuration for a fresh
+// running unit under rt.mu: the resolved agent type (resolved against an
+// explicit resolve context so no project metadata is read under the lock),
+// the agent-config/catalog/config pointers, the tools config and subagent
+// limit values, and the tagged-event channel. Caller holds rt.mu.
+func (a *Agent) rootUnitSnapshotLocked(rt *runtime, activeAgentType, projectID string) rootUnitSnapshot {
+	snap := rootUnitSnapshot{
+		agentTypes:   a.agents,
+		modelCatalog: a.catalog,
+		cfg:          a.cfg,
 	}
-	if projectRoot == "" {
-		projectRoot = a.projectRoot
+	snap.resolved, snap.resolveErr = a.resolvedAgentTypeWithContextLocked(activeAgentType, agentcfg.ResolveContext{Home: a.home, ProjectID: projectID})
+	if snap.cfg != nil {
+		snap.toolsConfig = snap.cfg.Tools
+		snap.maxConcurrent = snap.cfg.Subagents.MaxConcurrent
 	}
-	resolved, err := a.resolvedAgentTypeForProjectLocked(activeAgentType, projectID)
+	if rt.taggedEvents == nil {
+		rt.taggedEvents = make(chan TaggedLoopEvent, 512)
+	}
+	snap.taggedEvents = rt.taggedEvents
+	return snap
+}
+
+// rootUnitModelInstall is a fresh root unit's prepared model state, installed
+// directly in the running unit config so no post-construction model setter
+// (and no second prompt assembly) runs. It is prepared under rt.mu — by the
+// fork's first lock hold (from the source's live ref) or by the locked model
+// preparer (newSession's initial model state) — and applied to the
+// unregistered unit in the released construction section.
+type rootUnitModelInstall struct {
+	ref    coremodel.ModelRef
+	client *provider.Client
+	window int
+	adapt  *adaptation.Adaptation
+}
+
+// preparedModelForLocked prepares a fresh root unit's initial model install
+// under rt.mu, mirroring ensureActiveModelForSessionLocked's resolution
+// semantics without mutating a unit: when the resolved agent model is
+// connected/configured it builds the ref/client/context-window/adaptation
+// value (adaptation via the nil-safe resolveAdaptation); when no usable model
+// exists it returns nil, exactly the no-model state newSession preserves
+// today. No network or durable I/O runs under the lock (the resolve context is
+// explicit). Caller holds rt.mu.
+func (a *Agent) preparedModelForLocked(agentType, projectID string) *rootUnitModelInstall {
+	resolved, err := a.resolvedAgentTypeWithContextLocked(agentType, agentcfg.ResolveContext{Home: a.home, ProjectID: projectID})
+	if err != nil || resolved.Model == "" {
+		return nil
+	}
+	ref, err := coremodel.Parse(resolved.Model)
 	if err != nil {
-		return nil, nil, err
+		return nil
 	}
+	if !a.modelRefConnected(ref) {
+		return nil
+	}
+	client, model, err := newProviderClient(a.catalog, ref)
+	if err != nil {
+		return nil
+	}
+	return &rootUnitModelInstall{
+		ref:    ref,
+		client: client,
+		window: model.ContextWindow,
+		adapt:  a.resolveAdaptation(ref.Model),
+	}
+}
+
+// rootRunningUnit builds a fresh running unit from a rootUnitSnapshot and the
+// owner's stable, self-synchronized services. It performs the project/LSP
+// lookup, the tool registry and unit construction, and the prompt (rules-file)
+// assembly — durable reads that must not run under rt.mu — and, when model is
+// non-nil (the fork), installs the prepared model/client/adaptation directly
+// in the running unit config. Callers either hold rt.mu across the whole call
+// (the locked wrapper's other callers, whose behavior is unchanged) or run it
+// entirely outside rt.mu (the fork's released section).
+func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, activeAgentType string, projectID string, projectName string, projectRoot string, model *rootUnitModelInstall) (*session, []prompt.Warning, error) {
 	rt := a.ensureRuntime()
 	lspMgr := a.lspManagerFor(projectRoot)
 	var unit *session
 	unitRef := func() *session { return unit }
-	checkPolicy := a.permissionCheckForProject(projectID, projectRoot)
+	checkPolicy := a.permissionCheckForProjectWith(snap.cfg, projectID, projectRoot)
 	askPolicy := a.permissionAskForSession(unitRef, projectID, true)
 	askActionPolicy := a.permissionAskActionForSession(unitRef, projectID, false)
 	fileTracker := tool.NewFileTracker()
-	writeDir := strings.TrimSpace(resolved.WriteDir)
+	writeDir := strings.TrimSpace(snap.resolved.WriteDir)
 	options := tool.CapabilityOptions{WriteDir: writeDir}
 	registry := tool.NewRegistry()
-	for _, tl := range tool.CoreToolListWithOptions(store, fileTracker, a.cfg.Tools, projectRoot, checkPolicy, askPolicy, options) {
-		if resolved.Readonly && writeDir == "" && isAgentWriteTool(tl.Name()) {
+	for _, tl := range tool.CoreToolListWithOptions(store, fileTracker, snap.toolsConfig, projectRoot, checkPolicy, askPolicy, options) {
+		if snap.resolved.Readonly && writeDir == "" && isAgentWriteTool(tl.Name()) {
 			continue
 		}
 		registry.Register(tl)
 	}
 	registry.Register(tool.WrapWithPermission(tool.ExecutePending{}, checkPolicy, askPolicy))
 
-	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(store, fileTracker, a.cfg.Tools, projectRoot, checkPolicy, askActionPolicy, options)
+	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(store, fileTracker, snap.toolsConfig, projectRoot, checkPolicy, askActionPolicy, options)
 
-	if rt.taggedEvents == nil {
-		rt.taggedEvents = make(chan TaggedLoopEvent, 512)
-	}
 	memoriesDir := ""
 	if projectID != "" && a.projects != nil {
 		memoriesDir = filepath.Join(a.projects.Root(), projectID, "memories")
@@ -666,14 +747,14 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 		projectsRoot = a.projects.Root()
 	}
 	tt := newTaskTool(taskToolConfig{
-		AgentTypes:    a.agents,
+		AgentTypes:    snap.agentTypes,
 		ParentStore:   store,
 		ParentTracker: fileTracker,
-		MaxConcurrent: a.cfg.Subagents.MaxConcurrent,
-		TaggedEvents:  rt.taggedEvents,
+		MaxConcurrent: snap.maxConcurrent,
+		TaggedEvents:  snap.taggedEvents,
 		Runtime:       rt,
-		ModelCatalog:  a.catalog,
-		ToolsConfig:   a.cfg.Tools,
+		ModelCatalog:  snap.modelCatalog,
+		ToolsConfig:   snap.toolsConfig,
 		HomeDir:       a.home,
 		WorkspaceRoot: projectRoot,
 		ProcMgr:       a.procMgr,
@@ -693,8 +774,8 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 		func() string { return sessionIDOf(unitRef()) },
 		func() string { return projectRootOf(unitRef()) },
 	)
-	rc := tool.NewRunCommandAtRoot(a.cfg.Tools, a.home, projectRoot, processes)
-	if resolved.Readonly {
+	rc := tool.NewRunCommandAtRoot(snap.toolsConfig, a.home, projectRoot, processes)
+	if snap.resolved.Readonly {
 		registry.Register(tool.WrapWithPermission(tool.NewReadOnlyRunCommand(rc), checkPolicy, askPolicy))
 	} else {
 		registry.Register(tool.WrapWithPermission(rc, checkPolicy, askPolicy))
@@ -712,8 +793,22 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 
 	sessionStart := time.Now()
 	promptUnit := &session{activeAgentType: activeAgentType, projectID: projectID, projectName: projectName, projectRoot: projectRoot, sessionStart: sessionStart}
-	res := a.assembleSystemPromptForSessionLocked(promptUnit)
-	unit = newRunningUnit(runningUnitConfig{
+	if model != nil {
+		// The fork's adaptation participates in the single prompt assembly:
+		// the candidate's prompt is built once, adaptation-aware, so the same
+		// ref/client/window/adaptation installed in the running unit config
+		// needs no second assembly and no post-construction model setter.
+		promptUnit.activeAdapt = model.adapt
+	}
+	res := a.assembleSystemPromptForSessionResolved(promptUnit, snap.resolved, snap.resolveErr)
+	loopCfg := runningUnitLoopConfig{
+		Registry:        registry,
+		SystemPrompt:    res.Prompt,
+		Store:           store,
+		Events:          rt.loopEvents,
+		PendingExecutor: pendingExecutor,
+	}
+	unitCfg := runningUnitConfig{
 		Runtime:         rt,
 		ActiveAgentType: activeAgentType,
 		ProjectID:       projectID,
@@ -726,19 +821,39 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 		PendingExecutor: pendingExecutor,
 		FileTracker:     fileTracker,
 		LSPDiagnostics:  lspDiag,
-		Loop: runningUnitLoopConfig{
-			Registry:        registry,
-			SystemPrompt:    res.Prompt,
-			Store:           store,
-			Events:          rt.loopEvents,
-			PendingExecutor: pendingExecutor,
-		},
-	})
+		Loop:            loopCfg,
+	}
+	if model != nil {
+		unitCfg.CurrentRef = model.ref
+		unitCfg.ContextWindowSize = model.window
+		unitCfg.Loop.Client = model.client
+		unitCfg.Loop.ActiveAdaptation = model.adapt
+	}
+	unit = newRunningUnit(unitCfg)
 	unit.lp.SetContextTransformer(sessionLoopHooks{agent: a, unit: unit})
 	unit.lp.SetUsageRecorder(sessionLoopHooks{agent: a, unit: unit})
 	tt.usageRecorder = sessionLoopHooks{agent: a, unit: unit}
 	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 	return unit, res.Warnings, nil
+}
+
+// rootRunningUnitLocked builds a fresh running unit for a root session. It
+// resolves the agent type and snapshots the reloadable configuration under
+// rt.mu, then delegates the prompt assembly and the registry/tool construction
+// to the shared rootRunningUnit constructor. Caller holds rt.mu.
+func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType string, projectID string, projectName string, projectRoot string) (*session, []prompt.Warning, error) {
+	if activeAgentType == "" {
+		activeAgentType = "primary"
+	}
+	if projectRoot == "" {
+		projectRoot = a.projectRoot
+	}
+	rt := a.ensureRuntime()
+	snap := a.rootUnitSnapshotLocked(rt, activeAgentType, projectID)
+	if snap.resolveErr != nil {
+		return nil, nil, snap.resolveErr
+	}
+	return a.rootRunningUnit(snap, store, activeAgentType, projectID, projectName, projectRoot, nil)
 }
 
 func (a *Agent) compactRunningUnitForSession(parent *session) (*session, int, error) {
@@ -796,12 +911,18 @@ func (a *Agent) compactRunningUnitForSession(parent *session) (*session, int, er
 		return nil, 0, err
 	}
 	if err := store.SetActiveAgentType("compact"); err != nil {
-		_, _ = store.Close()
+		// Setup failure: join the close failure so the abandoned child's
+		// cleanup cannot be silent, while the setup error stays the cause.
+		if _, cerr := store.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
 		return nil, 0, err
 	}
 	if ref.Provider != "" || ref.Model != "" {
 		if err := store.SetModel(ref.Provider, ref.Model); err != nil {
-			_, _ = store.Close()
+			if _, cerr := store.Close(); cerr != nil {
+				err = errors.Join(err, cerr)
+			}
 			return nil, 0, err
 		}
 	}
@@ -1146,6 +1267,7 @@ func (rt *runtime) tryStartSignalTurn(ctx context.Context) {
 		turnCtx, cancel, err := rt.claimTurnLocked(ctx, unit)
 		rt.mu.Unlock()
 		if err != nil {
+
 			if !errors.Is(err, errOwnerClosed) && !strings.Contains(err.Error(), "turn is already in progress") {
 				a.emitEvent(Event{Kind: EventError, Error: err.Error()})
 			}
@@ -1877,9 +1999,7 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 	if err != nil {
 		return activeStart, err
 	}
-	defer func() {
-		_, _ = compactUnit.store.Close()
-	}()
+	defer closeStoreDeferred(compactUnit.store, "compact")
 	if summarizerWindow <= 0 {
 		summarizerWindow = unit.contextWindowSize
 	}
@@ -2201,6 +2321,21 @@ func (a *Agent) resumeMostRecent() (string, error) {
 		if err := a.store.LoadSession(info.ID); err != nil {
 			continue
 		}
+		// Revalidate the candidate's durable state under the claim LoadSession
+		// just took: the listing is pre-claim, and a stale listing must never
+		// register archived or corrupt identity live. An archived candidate
+		// detaches and is skipped; a corrupt one detaches and the scan
+		// continues.
+		a.fireDurableReadHook()
+		meta, err := a.store.Meta()
+		if err != nil {
+			a.store.Detach()
+			continue
+		}
+		if metaState(meta.State) != snapshot.StateActive {
+			a.store.Detach()
+			continue
+		}
 		a.fireDurableReadHook()
 		if err := a.loadHistoryIntoLoop(); err != nil {
 			a.store.Detach()
@@ -2383,7 +2518,10 @@ func (a *Agent) assembleSystemPromptForSessionLocked(unit *session) prompt.Resul
 // unlocked caller (refreshSystemPromptForSession) can snapshot the resolved
 // values under runtime.mu and release before the rules-file I/O below, while
 // locked callers resolve under their existing hold. The resolved values are a
-// copy, not pointers into the agents config.
+// copy, not pointers into the agents config. The rules-file read is durable
+// I/O, so the durable-read seam fires immediately before it; the fork's
+// candidate construction runs with rt.mu released, and the fork lock-position
+// tests observe the prompt read through that fire.
 func (a *Agent) assembleSystemPromptForSessionResolved(unit *session, resolved agentcfg.Resolved, resolveErr error) prompt.Result {
 	if unit == nil || a.promptSvc == nil {
 		return prompt.Result{}
@@ -2394,6 +2532,7 @@ func (a *Agent) assembleSystemPromptForSessionResolved(unit *session, resolved a
 		spec.Body = resolved.Prompt
 		spec.Memory = resolved.Memory
 	}
+	a.fireDurableReadHook()
 	return a.promptSvc.Assemble(unit.projectRoot, unit.sessionStart, spec)
 }
 
@@ -2417,42 +2556,22 @@ func (a *Agent) restoreModelFromSessionForSession(unit *session) {
 	a.setActiveModelForSessionLocked(unit, ref, client, model)
 }
 
-// inheritActiveModelForForkedSession gives the fork candidate the source
-// unit's live active model, preferring the in-memory selection over persisted
-// metadata so an unpersisted model switch is not lost, and persists it into
-// the candidate so the fork reopens on the same model. srcRef is the source's
-// currentRef snapshotted under rt.mu by the caller in the fork's first lock
-// half (currentRef is rt.mu-guarded) and consumed in the re-acquired commit
-// half. A source with no live selection keeps the persisted model.
-// Reconstruction or persistence of a live selection fails the fork before
-// publication rather than silently substituting a different model.
-func (a *Agent) inheritActiveModelForForkedSession(candidate *session, srcRef coremodel.ModelRef) error {
-	if srcRef.Provider == "" || srcRef.Model == "" {
-		a.restoreModelFromSessionForSession(candidate)
-		return nil
-	}
-	client, model, err := newProviderClient(a.catalog, srcRef)
-	if err != nil {
-		return fmt.Errorf("fork model %s/%s: %w", srcRef.Provider, srcRef.Model, err)
-	}
-	a.setActiveModelForSessionLocked(candidate, srcRef, client, model)
-	if err := candidate.store.SetModel(srcRef.Provider, srcRef.Model); err != nil {
-		return fmt.Errorf("fork persist model: %w", err)
-	}
-	return nil
-}
-
 func (a *Agent) loadHistoryIntoLoop() error {
-	return a.loadHistoryIntoLoopForSession(a.session)
+	_, err := a.loadHistoryIntoLoopForSession(a.session)
+	return err
 }
 
-func (a *Agent) loadHistoryIntoLoopForSession(unit *session) error {
+// loadHistoryIntoLoopForSession reloads the loop's history from the unit's
+// durable turns and returns the raw surviving turn records it loaded, so the
+// caller can render the same set for a prebuilt replacement without a second
+// durable read.
+func (a *Agent) loadHistoryIntoLoopForSession(unit *session) ([]snapshot.TurnMessages, error) {
 	if unit == nil || unit.store == nil || unit.lp == nil {
-		return snapshot.ErrNoSession
+		return nil, snapshot.ErrNoSession
 	}
 	rec, err := unit.store.LoadCompaction()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var raw []snapshot.TurnMessages
@@ -2462,7 +2581,7 @@ func (a *Agent) loadHistoryIntoLoopForSession(unit *session) error {
 		raw, err = unit.store.LoadCompleteTurns()
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	decoded := make([][]message.Message, 0, len(raw))
@@ -2485,7 +2604,7 @@ func (a *Agent) loadHistoryIntoLoopForSession(unit *session) error {
 	} else {
 		unit.lp.LoadHistory(decoded)
 	}
-	return nil
+	return raw, nil
 }
 
 func (a *Agent) loadTokensFromDisk() {
@@ -2519,30 +2638,53 @@ func (a *Agent) fireLifecycleAdmissionHook() {
 	}
 }
 
+// tokenFileOutcome is the tri-state result of reading a session's tokens
+// file: entries with no error (present), nil entries with no error (the file
+// is absent, which is valid and yields empty known totals), or an error for an
+// unreadable file or invalid JSON. The error is surfaced only by fork
+// preparation; the tolerant reopen/load callers keep their current
+// absent/error-to-empty behavior.
+type tokenFileOutcome struct {
+	entries []TokenEntry
+	err     error
+}
+
+// readTokensFile reads and parses a session's tokens file, returning the
+// tri-state outcome. The read is durable and fallible and must not run while
+// the unit's tokens mutex is held; the durable-read seam fires immediately
+// before it.
+func (a *Agent) readTokensFile(unit *session) tokenFileOutcome {
+	if unit == nil || unit.store == nil || !unit.store.Active() {
+		return tokenFileOutcome{}
+	}
+	a.fireDurableReadHook()
+	data, err := os.ReadFile(filepath.Join(unit.store.Dir(), tokensFileName))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return tokenFileOutcome{} // absent: valid, empty
+		}
+		return tokenFileOutcome{err: err}
+	}
+	var entries []TokenEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return tokenFileOutcome{err: err}
+	}
+	return tokenFileOutcome{entries: entries}
+}
+
 func (a *Agent) loadTokensFromDiskForSession(unit *session) {
 	if unit == nil {
 		return
 	}
-	// Read the tokens file before taking the tokens mutex: the read is durable
-	// and fallible and must not run while the mutex is held. The parsed entries
-	// replace unit.tokens atomically under the mutex.
-	var entries []TokenEntry
-	valid := false
-	if unit.store != nil && unit.store.Active() {
-		a.fireDurableReadHook()
-		data, err := os.ReadFile(filepath.Join(unit.store.Dir(), tokensFileName))
-		if err == nil {
-			valid = json.Unmarshal(data, &entries) == nil
-		}
-	}
+	out := a.readTokensFile(unit)
 	unit.tokensMu.Lock()
 	defer unit.tokensMu.Unlock()
 	unit.tokens = map[string]*TokenEntry{}
-	if !valid {
+	if out.err != nil {
 		return
 	}
-	for i := range entries {
-		e := entries[i]
+	for i := range out.entries {
+		e := out.entries[i]
 		e.Known = true
 		unit.tokens[e.Provider+"/"+e.Model] = &e
 	}
@@ -2994,7 +3136,21 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 					unit.turnCancel = nil
 					unit.turnCtx = nil
 				}
+				// Rearm retained work on a live owner: every abort disposition
+				// (marker failure, cancellation, shutdown, refused launch)
+				// requeues the untouched remainder, and this pass consumed a
+				// wake token, so the requeued work would strand without a
+				// nudge. Shutdown performs no rearm — the owner context is
+				// cancelled and admission closed, and re-draining after close
+				// would launch work the shutdown snapshot no longer covers.
+				// The single rearm boolean is computed under rt.mu after this
+				// pass's claim state is cleared; the wake itself is sent only
+				// after rt.mu is released.
+				rearm := launched == 0 && ctx.Err() == nil && !rt.closed && drainableSession(unit)
 				rt.mu.Unlock()
+				if rearm {
+					rt.nudgeQueueDrainer()
+				}
 				if launched == 0 {
 					cancel()
 				}
@@ -3135,7 +3291,6 @@ func wakeableSession(unit *session) bool {
 		!unit.busy &&
 		!unit.transitioning &&
 		unit.store != nil &&
-		unit.store.Active() &&
 		unit.lp != nil &&
 		len(unit.queue) == 0 &&
 		unit.lp.HasPendingWakeSignal()
@@ -3143,8 +3298,14 @@ func wakeableSession(unit *session) bool {
 
 func (rt *runtime) launchTurn(unit *session, turnCtx context.Context, cancel context.CancelFunc, contents []string) int {
 	a := rt.agent
+	// The claimed-but-cannot-launch check reads unit fields that the owner
+	// mutates under rt.mu, so it runs inside the same locked section as the
+	// admission recheck below; in production these fields are immutable for a
+	// live unit, and the lock makes the test-swapped values race-free.
+	rt.mu.Lock()
 	if unit == nil || unit.store == nil || unit.lp == nil {
 		// The turn was claimed (and counted) but cannot launch; release the count.
+		rt.mu.Unlock()
 		rt.turnWG.Done()
 		return 0
 	}
@@ -3157,7 +3318,6 @@ func (rt *runtime) launchTurn(unit *session, turnCtx context.Context, cancel con
 	// per-turn context) — so the unit is not left wedged. The clear is
 	// guarded like the deferred cleanup's: only a claim the unit still holds
 	// is unwound, so the receiving end never clears a claim it does not own.
-	rt.mu.Lock()
 	if rt.closed || turnCtx.Err() != nil {
 		if unit.turnCtx == turnCtx {
 			unit.busy = false
@@ -4468,7 +4628,7 @@ func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummar
 	}
 	// Validate history before any reactivation, so a corrupt session is never
 	// flipped from archived to active.
-	if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
+	if _, err := a.loadHistoryIntoLoopForSession(unit); err != nil {
 		unit.store.Detach()
 		return SessionSummary{}, err
 	}
@@ -4630,30 +4790,63 @@ func (a *Agent) NewSessionWithBoundary(projectID string, agentType string, emit 
 	return a.newSession(projectID, agentType, emit)
 }
 
-func (a *Agent) newSession(projectID string, agentType string, emit func(HydrationState)) (string, error) {
+func (a *Agent) newSession(projectID string, agentType string, emit func(HydrationState)) (sid string, err error) {
 	defer a.lockLifecycle()()
 	rt := a.ensureRuntime()
+
+	// Initial short hold: a previously closed owner refuses before any
+	// project I/O, staged preparation, or claim acquisition.
 	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	// Admission check at entry, before any staged preparation or publication: a
-	// new session starting after shutdown published closed must publish nothing
-	// and acquire no claim.
-	if rt.closed {
+	closed := rt.closed
+	rt.mu.Unlock()
+	if closed {
 		return "", errOwnerClosed
 	}
-	resolvedType, err := a.explicitRootSessionTypeLocked(agentType)
+
+	// Resolve/ensure the target project under lifecycleMu with no rt.mu held,
+	// using only the stable project resolver.
+	proj, err := a.projectForSessionCreate(projectID)
 	if err != nil {
 		return "", err
 	}
-	proj, err := a.projectForSessionCreateLocked(projectID)
+
+	// Second short hold: recheck admission, resolve the explicit root agent
+	// type against the target project, create the root-unit value snapshot,
+	// fail unresolved config, and prepare the initial model state as a value.
+	// All of these are in-memory resolution reads under the lock.
+	resolvedType, snap, modelInstall, err := func() (string, rootUnitSnapshot, *rootUnitModelInstall, error) {
+		rt.mu.Lock()
+		defer rt.mu.Unlock()
+		if rt.closed {
+			return "", rootUnitSnapshot{}, nil, errOwnerClosed
+		}
+		typeName := strings.TrimSpace(agentType)
+		if typeName == "" {
+			typeName = "primary"
+		}
+		snap := a.rootUnitSnapshotLocked(rt, typeName, proj.ID)
+		if snap.resolveErr != nil {
+			return "", rootUnitSnapshot{}, nil, snap.resolveErr
+		}
+		if snap.resolved.Name == "compact" {
+			return "", rootUnitSnapshot{}, nil, fmt.Errorf("agent type %q cannot be started as a session", snap.resolved.Name)
+		}
+		return snap.resolved.Name, snap, a.preparedModelForLocked(snap.resolved.Name, proj.ID), nil
+	}()
 	if err != nil {
 		return "", err
 	}
+
+	// The released section: every durable step — project-permission/prompt
+	// reads, the receiver store construction, the unregistered root unit
+	// construction (with the prepared model install and the adaptation-aware
+	// single prompt assembly), the staged preparation, the model/meta/token
+	// I/O, and the publish — runs without rt.mu.
 	store, err := snapshot.NewForSessionsRoot(a.projects.SessionsRoot(proj.ID), a.projects.Root(), proj.ID)
 	if err != nil {
 		return "", err
 	}
-	unit, _, err := a.rootRunningUnitLocked(store, resolvedType, proj.ID, proj.Name, proj.Path)
+	unit, _, err := a.rootRunningUnit(snap, store, resolvedType, proj.ID, proj.Name, proj.Path, modelInstall)
 	if err != nil {
 		return "", err
 	}
@@ -4669,13 +4862,25 @@ func (a *Agent) newSession(projectID string, agentType string, emit func(Hydrati
 	if err != nil {
 		return "", err
 	}
-	a.ensureActiveModelForSessionLocked(unit)
-	if unit.currentRef.Provider != "" && unit.currentRef.Model != "" {
-		if err := prepared.SetModel(unit.currentRef.Provider, unit.currentRef.Model); err != nil {
-			stagingRoot := prepared.Root()
+	// One named-error defer is the sole cleanup owner of the staging tree from
+	// this point: every precommit/error return removes it exactly once through
+	// the same seam the fork uses and joins a cleanup failure onto the
+	// operation error. After the successful publish the post-publish seam call
+	// clears the root, so this defer cannot run again.
+	stagingRoot := prepared.Root()
+	defer func() {
+		if err != nil && stagingRoot != "" {
+			if cerr := removeStagingTree(stagingRoot); cerr != nil {
+				err = errors.Join(err, fmt.Errorf("snapshot: new-session staging cleanup: %w", cerr))
+			}
+		}
+	}()
+	if modelInstall != nil {
+		a.fireDurableReadHook()
+		if err := prepared.SetModel(modelInstall.ref.Provider, modelInstall.ref.Model); err != nil {
 			prepared.Detach()
 			store.Detach()
-			return "", cleanupStaging(stagingRoot, fmt.Errorf("persist model: %w", err))
+			return "", fmt.Errorf("persist model: %w", err)
 		}
 	}
 	unit.lp.ResetHistory()
@@ -4688,12 +4893,12 @@ func (a *Agent) newSession(projectID string, agentType string, emit func(Hydrati
 	// fallible read runs after that commit.
 	var prebuiltSummary SessionSummary
 	if emit != nil {
+		a.fireDurableReadHook()
 		meta, merr := prepared.Meta()
 		if merr != nil {
-			stagingRoot := prepared.Root()
 			prepared.Detach()
 			store.Detach()
-			return "", cleanupStaging(stagingRoot, fmt.Errorf("read session meta: %w", merr))
+			return "", fmt.Errorf("read session meta: %w", merr)
 		}
 		prebuiltSummary = sessionSummaryFromUnit(unit, meta)
 	}
@@ -4704,11 +4909,25 @@ func (a *Agent) newSession(projectID string, agentType string, emit func(Hydrati
 	if err := store.PublishPreparedSession(prepared); err != nil {
 		return "", err
 	}
+	// Post-publish: the staging parent is now empty; remove it exactly once
+	// through the same seam the precommit defer uses. A cleanup failure prints
+	// one stderr diagnostic and cannot change the committed publication;
+	// clearing the root makes the precommit defer a no-op.
+	if cerr := removeStagingTree(stagingRoot); cerr != nil {
+		fmt.Fprintf(os.Stderr, "lightcode: remove empty staging %s: %v\n", stagingRoot, cerr)
+	}
+	stagingRoot = ""
+
+	// Final short hold: register/select the published unit and append the
+	// ordered boundary from the prebuilt data. On registration failure the
+	// receiver claim is detached. No postcommit durable read runs.
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 	if err := a.setCurrentSessionLocked(unit); err != nil {
 		unit.store.Detach()
 		return "", err
 	}
-	sid := unit.store.SessionID()
+	sid = unit.store.SessionID()
 	if emit != nil {
 		// New sessions have empty durable history, so the in-commit capture appends the
 		// boundary from the prebuilt summary with no further read.
@@ -4737,21 +4956,11 @@ func (a *Agent) newSessionForProjectPath(projectPath string, agentType string, e
 	return a.newSession(proj.ID, agentType, emit)
 }
 
-func (a *Agent) explicitRootSessionTypeLocked(agentType string) (string, error) {
-	if strings.TrimSpace(agentType) == "" {
-		agentType = "primary"
-	}
-	resolved, err := a.resolvedAgentTypeLocked(agentType)
-	if err != nil {
-		return "", err
-	}
-	if resolved.Name == "compact" {
-		return "", fmt.Errorf("agent type %q cannot be started as a session", resolved.Name)
-	}
-	return resolved.Name, nil
-}
-
-func (a *Agent) projectForSessionCreateLocked(projectID string) (*project.Project, error) {
+// projectForSessionCreate resolves the project a new session is created in,
+// using only the stable project resolver: the current project for an empty id,
+// or a listed project for an explicit id. It performs durable project I/O and
+// therefore runs without rt.mu (the caller holds lifecycleMu).
+func (a *Agent) projectForSessionCreate(projectID string) (*project.Project, error) {
 	if strings.TrimSpace(projectID) == "" {
 		return a.projects.Ensure()
 	}
@@ -5671,18 +5880,17 @@ func (a *Agent) applyTurnActionResolved(sessionID string, turn int, action strin
 	return a.applyTurnActionForSession(unit, turn, action, alsoRevertCode, emit)
 }
 
-// emitTurnActionBoundaryLocked publishes a revert/fork result as an in-commit boundary
-// while runtime.mu is held: the committed prefix is the result's prebuilt Messages, so
-// this captures only the live classes and appends the boundary under their locks. The
-// code-revert skips and a fork's failed-code-revert warning ride the boundary so the
-// adapter reassembles its combined frame. maxDurableTurn is the highest durable turn
-// the result's Messages were read from, so the locked capture can drop a retained tail
-// the durable half already covers.
-func (a *Agent) emitTurnActionBoundaryLocked(unit *session, result TurnActionResult, maxDurableTurn int, emit func(HydrationState, []snapshot.SkippedRevert, string)) {
+// emitTurnActionBoundaryLocked publishes a revert/fork result as an in-commit
+// boundary while runtime.mu is held: the committed prefix is the result's
+// prebuilt Messages, so this captures only the live classes and appends the
+// boundary under their locks. The code-revert skips and a fork's
+// failed-code-revert warning ride the boundary so the adapter reassembles its
+// combined frame.
+func (a *Agent) emitTurnActionBoundaryLocked(unit *session, result TurnActionResult, emit func(HydrationState, []snapshot.SkippedRevert, string)) {
 	if emit == nil || unit == nil {
 		return
 	}
-	a.captureUnderLocksRTHeld(unit, result.Messages, sessionIDOf(unit), maxDurableTurn, nil, func(cs completeState) {
+	a.captureUnderLocksRTHeld(unit, result.Messages, sessionIDOf(unit), 0, nil, func(cs completeState) {
 		emit(hydrationStateFrom(result.Session, cs), result.SkippedFiles, result.Warning)
 	})
 }
@@ -5718,61 +5926,36 @@ func (a *Agent) reserveTurnActionUnit(unit *session) (func(), error) {
 }
 
 func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string)) (TurnActionResult, error) {
-	// The revert cases reserve the unit across their durable mutation with the
-	// same reservation pair the removal path uses: the unit must not be
-	// driveable while its loop state and its durable history disagree (history
-	// truncation) or while its files are mid-restore. The release
-	// (endLiveTransition) is registered before the runtime.mu defer, so it runs
-	// after the lock is dropped and re-arms the drainers. The fork case is not
-	// reserved: it publishes a new session and changes no durable state of the
-	// source unit.
-	var release func()
-	switch action {
-	case TurnActionRevertCode, TurnActionRevertHistory:
-		var err error
-		release, err = a.reserveTurnActionUnit(unit)
-		if err != nil {
-			return TurnActionResult{}, err
-		}
+	// Every turn action — the fork and the two reverts — reserves the unit
+	// across its durable mutation with the same reservation pair the removal
+	// path uses: the unit must not be driveable while its loop state and its
+	// durable history disagree (history truncation), while its files are
+	// mid-restore, or while the fork's staged copy and publication are in
+	// flight. The release (endLiveTransition) is registered before any lock or
+	// I/O, so it runs after every return — success and failure alike — and
+	// re-arms the drainers. A committed eviction leaves the unit inactive, so
+	// the release is a no-op there.
+	release, err := a.reserveTurnActionUnit(unit)
+	if err != nil {
+		return TurnActionResult{}, err
 	}
-	// The release must run on success as well as failure because the unit
-	// stays live after a successful revert; the release is what clears its
-	// transitioning reservation. That is why a successful revert emits one
-	// extra queue-changed event, which is idempotent for consumers.
 	defer func() {
 		if release != nil {
 			release()
 		}
 	}()
-
-	// The fork case runs outside the locked body below: its durable tree copy
-	// must run with rt.mu released, so the fork manages its own lock split and
-	// validations (see forkUnitAtTurn).
-	if action == TurnActionFork {
-		return a.applyForkTurnAction(unit, turn, alsoRevertCode, emit)
-	}
-
-	// The remaining actions (the reverts) change the session; revert_history
-	// clears the queue at the irreversible store mutation and enqueues the
-	// event in the same runtime.mu section. Both were validated by the
-	// reservation.
-	var eventSessionID string
-	var eventProjectID string
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
-	if unit == nil || unit.store == nil || !unit.store.Active() {
-		return TurnActionResult{}, snapshot.ErrNoSession
-	}
 	if turn < 1 {
 		return TurnActionResult{}, fmt.Errorf("turn must be >= 1")
 	}
 
-	eventSessionID = sessionIDOf(unit)
-	eventProjectID = unit.projectID
-	prefill := a.userMessageContentForTurnForSession(unit, turn)
 	result := TurnActionResult{Action: action, Turn: turn}
-
 	switch action {
+	case TurnActionFork:
+		// The fork manages its own rt.mu split: the staged copy and every
+		// candidate read run released, and only registration and the boundary
+		// run under the lock (see forkUnitAtTurn).
+		return a.applyForkTurnAction(unit, turn, alsoRevertCode, emit)
+
 	case TurnActionRevertCode:
 		target := turn - 1
 		result.TargetTurn = target
@@ -5781,26 +5964,51 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		result.SkippedFiles = revertResult.Skipped
 		if err != nil {
 			// Some files may already be restored and some skipped; report the
-			// partial outcome alongside the error.
-			result, _ = a.populateTurnActionResultForSession(unit, result)
+			// partial outcome alongside the error. The result stays bare — no
+			// hydrated Session/Messages/Tokens replacement — because a
+			// code-only revert emits no boundary and the adapters discard the
+			// result (Wails, ACP) or consume only the skips (CLI). The
+			// tracker is not reset on failure.
 			return result, err
 		}
+		// A successful code-only revert changes no session and therefore
+		// carries no replacement payload, exactly as before.
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
 		a.resetFileTrackerForSession(unit)
+		rt.mu.Unlock()
 		return result, nil
 
 	case TurnActionRevertHistory:
 		target := turn - 1
 		result.TargetTurn = target
-		result.Prefill = prefill
+		result.Prefill = a.userMessageContentForTurnForSession(unit, turn)
 		result.SessionChanged = true
+		// The summary and token report are prepared before the mutation: the
+		// revert changes no metadata and no in-memory token state, so the
+		// pre-mutation values are the post-revert values. The messages come
+		// from the mandatory reconciliation read (the reload) below.
+		summary, _, tokens := a.prepareTurnActionResultState(unit)
+		var codeChanged bool
+		var preMutationMessages []DisplayMessage
 		if alsoRevertCode {
+			// The code restore is best-effort and runs first: when it fails,
+			// the history revert does not run and the unit is unchanged, so
+			// the result carries the pre-mutation view — read before the
+			// restore, never after it.
+			_, preMutationMessages, _ = a.prepareTurnActionResultState(unit)
 			revertResult, err := unit.store.RevertCode(target)
 			result.RestoredFiles = revertResult.Restored
 			result.SkippedFiles = revertResult.Skipped
 			if err != nil {
-				result, _ = a.populateTurnActionResultForSession(unit, result)
-				return result, err
+				return a.buildTurnActionResult(result, summary, preMutationMessages, tokens), err
 			}
+			// Only actually restored files count as a code mutation:
+			// skipped-only results do not mutate files (the snapshot entries
+			// are retained), and the removal of emptied snapshot-turn dirs is
+			// internal bookkeeping that needs no replacement or coordinator
+			// mutation.
+			codeChanged = len(revertResult.Restored) > 0
 		}
 		// One rule, keyed on the reload: the loop must match what the revert
 		// achieved, whatever that was. The walk stops at the first failed
@@ -5817,8 +6025,8 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		// covered by the same call. The delete has committed, so a failed
 		// removal cannot fail the revert; the residue is reported to stderr.
 		if removedRecord && a.memoryHooks != nil {
-			if err := a.memoryHooks.DeleteSessionSummaries(eventSessionID); err != nil {
-				fmt.Fprintf(os.Stderr, "lightcode: delete summaries for session %s: %v\n", eventSessionID, err)
+			if err := a.memoryHooks.DeleteSessionSummaries(sessionIDOf(unit)); err != nil {
+				fmt.Fprintf(os.Stderr, "lightcode: delete summaries for session %s: %v\n", sessionIDOf(unit), err)
 			}
 		}
 		// The store maintains the post-walk turn for all three outcomes: the
@@ -5827,81 +6035,133 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		// prune point for retained errors and the queue rule alike, so it is
 		// read once.
 		after := unit.store.CurrentTurn()
-		if err := a.loadHistoryIntoLoopForSession(unit); err != nil {
+		// historyChanged is the true durable-history-mutation predicate for
+		// this operation, derived only from existing outcomes: the compaction
+		// record was durably removed or at least one turn was removed.
+		historyChanged := removedRecord || after < before
+		// Zero-operation-mutation failure: when the revert changed nothing
+		// durably — no compaction record removed, no turn removed, and the
+		// optional code phase restored no file (codeChanged) — the error is
+		// the whole outcome regardless of whether a code phase was requested.
+		// It is returned as a precommit failure without a loop reload,
+		// queue/tracker/coordinator mutation, warning, or boundary, and the
+		// existing reservation is released normally. Any durable history
+		// mutation or any actually restored file keeps the reconciled
+		// treatment: the loop must match disk and the boundary must publish
+		// the survivors.
+		if revertErr != nil && !historyChanged && !codeChanged {
+			return result, revertErr
+		}
+		raw, err := a.loadHistoryIntoLoopForSession(unit)
+		if err != nil {
 			// The loop can no longer match disk, so the unit must not stay
 			// live: releasing the reservation would re-arm the drainers over
 			// the mismatched loop, and leaving it set fails unitMutableLocked
 			// forever. Evict instead — the files are untouched and reopening
-			// loads them again.
-			id := sessionIDOf(unit)
-			if unit == a.session {
-				a.store.Detach()
-				if a.currentSessionID == id {
-					a.currentSessionID = ""
-				}
-				delete(a.sessions, id)
-				a.ensureRuntime().unregisterTranscript(id)
-				a.ensureRuntime().clearQueueLocked()
-				a.resetCurrentSessionStateLocked()
-			} else {
-				unit.store.Detach()
-				a.ensureRuntime().clearQueueLockedForSession(unit)
-				delete(a.sessions, id)
-				a.ensureRuntime().unregisterTranscript(id)
-			}
-			release = nil
-			if emit != nil {
-				emit(HydrationState{}, nil, "")
-			}
-			result, _ = a.populateTurnActionResultForSession(unit, result)
-			if revertErr != nil {
-				return result, revertErr
-			}
-			return result, err
+			// loads them again. The eviction never releases a still-live
+			// mismatched unit.
+			return a.evictRevertUnit(unit, result, revertErr, err, emit)
 		}
-		// The loop now matches disk. History irreversibly truncated: the
-		// queued input no longer applies whenever the walk removed at least
-		// one turn, and is kept when the walk removed nothing.
-		if after < before {
-			_, clearedVersion, queueCleared := a.ensureRuntime().clearQueueLockedForSession(unit)
+		result = a.buildTurnActionResult(result, summary, a.renderCompleteTurns(raw), tokens)
+		// The final section commits the coordinator mutation and publishes the
+		// boundary under rt.mu: clear the queue when history changed, reset
+		// the tracker, lower the committed bound to the surviving turn, prune
+		// retained errors above it, and advance the rewrite epoch exactly once
+		// — every completed or partial revert advances it, even when the
+		// committed bound did not change, so a live capture that raced the
+		// truncation re-reads the durable prefix. committedSeq and curTurn are
+		// left unchanged: retained rows above the new bound carry sequences at
+		// or below the old high-water, so consumers gate them as already
+		// present and they disappear with the replacement.
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		// Every reconciled historyChanged outcome invalidates the queue: the
+		// queued input no longer applies once the record was durably removed
+		// or any turn was removed — including a compaction unlink followed by
+		// a sync failure and a record removal followed by a first walk
+		// failure, where no turn was removed but the record is already gone.
+		// Every reconciled historyChanged outcome invalidates the queue: the
+		// queued input no longer applies once the record was durably removed
+		// or any turn was removed — including a compaction unlink followed by
+		// a sync failure and a record removal followed by a first walk
+		// failure, where no turn was removed but the record is already gone.
+		if historyChanged {
+			_, clearedVersion, queueCleared := rt.clearQueueLockedForSession(unit)
 			if queueCleared {
-				a.emitEvent(Event{Kind: EventQueueChanged, SessionID: eventSessionID, ProjectID: eventProjectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
+				a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionIDOf(unit), ProjectID: unit.projectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
 			}
 		}
 		a.resetFileTrackerForSession(unit)
-		// Retained errors tagged to turns the revert removed point at history
-		// that is gone; prune them before the boundary capture, so the
-		// published state carries the survivor set once. This is the only
-		// thing a revert does to the coordinator: no cursor moves.
-		if tr := a.transcriptForSessionID(eventSessionID); tr != nil {
+		if tr := a.transcriptForSessionID(sessionIDOf(unit)); tr != nil {
 			tr.seqMu.Lock()
+			if after < tr.committedTurn {
+				tr.committedTurn = after
+			}
 			tr.dropErrorsAboveTurnLocked(after)
+			tr.rewriteEpoch++
 			tr.seqMu.Unlock()
 		}
-		result, maxDurableTurn := a.populateTurnActionResultForSession(unit, result)
 		// A reconciled walk failure still publishes the boundary: the loop is
 		// reconciled, so the capture is over state that matches disk, and the
-		// adapters learn the turns are gone from both.
-		a.emitTurnActionBoundaryLocked(unit, result, maxDurableTurn, emit)
+		// adapters learn the turns are gone from both. The failure rides the
+		// result and the boundary as a warning.
+		if revertErr != nil {
+			result.Warning = revertErr.Error()
+		}
+		a.emitTurnActionBoundaryLocked(unit, result, emit)
+		rt.mu.Unlock()
 		if revertErr != nil {
 			return result, revertErr
 		}
 		return result, nil
-
-	default:
-		return TurnActionResult{}, fmt.Errorf("unknown turn action %q", action)
 	}
+	return TurnActionResult{}, fmt.Errorf("unknown turn action %q", action)
 }
 
-// applyForkTurnAction applies the fork turn action. It runs outside
-// applyTurnActionForSession's locked body because the fork's durable tree copy
-// must run with rt.mu released; the fork manages its own lock split and
-// validations (see forkUnitAtTurn). The caller holds lifecycleMu. The code
-// revert, when requested, runs only after the fork is published, so a fork
-// failure never mutates the working tree; it is best-effort against the source
-// store, which retains the post-target snapshots needed to undo later changes:
-// a revert error keeps the partial result rather than failing the
-// already-committed fork.
+// evictRevertUnit evicts a unit whose loop reload failed after a history
+// revert: the loop can no longer match disk, so the unit must not stay live.
+// It detaches the store, clears routing only when the unit was current,
+// unregisters transcript state, clears the unit's queue, emits one
+// error-bearing empty boundary, and returns the reload error joined with the
+// walk error when both exist. The caller holds the reservation; the deferred
+// release no-ops over the detached store, so the mismatched unit is never
+// re-armed.
+func (a *Agent) evictRevertUnit(unit *session, result TurnActionResult, revertErr, reloadErr error, emit func(HydrationState, []snapshot.SkippedRevert, string)) (TurnActionResult, error) {
+	id := sessionIDOf(unit)
+	joined := errors.Join(revertErr, reloadErr)
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	if unit == a.session {
+		a.store.Detach()
+		if a.currentSessionID == id {
+			a.currentSessionID = ""
+		}
+		delete(a.sessions, id)
+		rt.unregisterTranscript(id)
+		rt.clearQueueLocked()
+		a.resetCurrentSessionStateLocked()
+	} else {
+		unit.store.Detach()
+		rt.clearQueueLockedForSession(unit)
+		delete(a.sessions, id)
+		rt.unregisterTranscript(id)
+	}
+	rt.mu.Unlock()
+	if emit != nil {
+		emit(HydrationState{}, nil, joined.Error())
+	}
+	return result, joined
+}
+
+// applyForkTurnAction applies the fork turn action. The caller holds
+// lifecycleMu and the source's transitioning reservation; the fork manages its
+// own rt.mu split — the source snapshot under the first short hold, the staged
+// copy and every candidate read released, and registration, the source code
+// revert, and the ordered boundary in the final section. The code revert, when
+// requested, runs only after the fork is published, so a fork failure never
+// mutates the working tree; it is best-effort against the source store: a
+// revert error keeps the partial result and rides the result and the boundary
+// as a warning rather than failing the already-committed fork.
 func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string)) (TurnActionResult, error) {
 	result := TurnActionResult{Action: TurnActionFork, Turn: turn}
 	result.TargetTurn = turn
@@ -5909,33 +6169,89 @@ func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool
 	if turn < 1 {
 		return TurnActionResult{}, fmt.Errorf("turn must be >= 1")
 	}
-	candidate, err := a.forkUnitAtTurn(unit, turn)
+	candidate, prepared, err := a.forkUnitAtTurn(unit, turn)
 	if err != nil {
-		// The fork never published; the source unit is unchanged, so its
-		// state is still the accurate result payload.
-		result, _ = a.populateTurnActionResultForSession(unit, result)
+		// The fork never published; the source unit is unchanged, and the
+		// error is the outcome. The result carries no payload: nothing is
+		// read after the failed attempt.
 		return result, err
 	}
-	result, maxDurableTurn := a.populateTurnActionResultForSession(candidate, result)
-	// The revert and the in-commit boundary both run under rt.mu; the result
-	// payload above was built before the lock so no durable read runs inside
-	// it.
+	result = a.buildTurnActionResult(result, prepared.summary, prepared.messages, prepared.tokens)
 	rt := a.ensureRuntime()
+	// The final section: infallible fresh-ID registration/current selection
+	// under rt.mu, then for a combined code revert release rt.mu, restore the
+	// source tree, and reacquire rt.mu for the successful tracker reset,
+	// result warning, and the ordered boundary. The reservation stays held
+	// across every phase.
 	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	if a.currentSessionID == sessionIDOf(unit) {
+		err = a.setCurrentSessionLocked(candidate)
+	} else {
+		err = a.registerLiveSessionLocked(candidate)
+	}
+	if err != nil {
+		rt.mu.Unlock()
+		return result, err
+	}
+	rt.mu.Unlock()
 	if alsoRevertCode {
+		// The fork input N is inclusive in the candidate (ForkInto copies
+		// turns 1..N), so the source tree is restored to the state at N: only
+		// source changes after the clicked turn are reverted. This is distinct
+		// from the direct/shared code-revert APIs, whose input is the first
+		// restored turn and which therefore call store.RevertCode(N-1).
 		revertResult, revertErr := unit.store.RevertCode(turn)
 		result.RestoredFiles = revertResult.Restored
 		result.SkippedFiles = revertResult.Skipped
+		rt.mu.Lock()
 		if revertErr != nil {
 			// The fork is published and stays successful; the revert is the
 			// only part that failed, so it rides the result and the in-commit
 			// boundary frame as a warning the adapters can show.
 			result.Warning = fmt.Sprintf("forked, but the code revert failed: %v", revertErr)
+		} else {
+			a.resetFileTrackerForSession(unit)
 		}
+		a.emitTurnActionBoundaryLocked(candidate, result, emit)
+		rt.mu.Unlock()
+		return result, nil
 	}
-	a.emitTurnActionBoundaryLocked(candidate, result, maxDurableTurn, emit)
+	rt.mu.Lock()
+	a.emitTurnActionBoundaryLocked(candidate, result, emit)
+	rt.mu.Unlock()
 	return result, nil
+}
+
+// buildTurnActionResult assembles a turn-action result from prepared values —
+// the session summary, the durable display messages, and the token report —
+// with no durable read. Callers prepare every value before the operation's
+// irreversible commit or from the transaction's mandatory reconciliation read.
+func (a *Agent) buildTurnActionResult(result TurnActionResult, summary SessionSummary, messages []DisplayMessage, tokens TokenReport) TurnActionResult {
+	result.Session = summary
+	result.Messages = messages
+	result.Tokens = tokens
+	return result
+}
+
+// prepareTurnActionResultState reads the session summary, the durable display
+// history, and the token report for a turn-action result before the
+// operation's irreversible mutation. The summary and the token report are
+// unchanged across the code/history reverts, so the pre-mutation values are
+// the post-revert values; the messages are the pre-mutation view, used only
+// where the mutation does not change them.
+func (a *Agent) prepareTurnActionResultState(unit *session) (SessionSummary, []DisplayMessage, TokenReport) {
+	summary := sessionSummary(unit)
+	var messages []DisplayMessage
+	if unit != nil && unit.store != nil && unit.store.Active() {
+		messages, _ = a.messagesForFrontendForStore(unit.store, unit.store.SessionID())
+	}
+	var tokens TokenReport
+	if unit != nil {
+		unit.tokensMu.Lock()
+		tokens = a.buildReportForSessionLocked(unit)
+		unit.tokensMu.Unlock()
+	}
+	return summary, messages, tokens
 }
 
 func turnActionVerb(action string) string {
@@ -5947,28 +6263,6 @@ func turnActionVerb(action string) string {
 	default:
 		return "apply turn action"
 	}
-}
-
-func (a *Agent) populateTurnActionResult(result TurnActionResult) TurnActionResult {
-	r, _ := a.populateTurnActionResultForSession(a.session, result)
-	return r
-}
-
-// populateTurnActionResultForSession fills a turn-action result with the
-// session's complete post-mutation view: the summary, the durable display
-// history (prebuilt before the boundary emission), and the token report. It
-// also reports the highest durable turn in that history, which the boundary
-// capture needs to drop a retained tail the durable half already covers.
-func (a *Agent) populateTurnActionResultForSession(unit *session, result TurnActionResult) (TurnActionResult, int) {
-	result.Session = sessionSummary(unit)
-	maxDurableTurn := 0
-	if unit != nil && unit.store != nil && unit.store.Active() {
-		result.Messages, maxDurableTurn, _ = a.messagesForFrontendForStoreAndMaxTurn(unit.store, unit.store.SessionID())
-		unit.tokensMu.Lock()
-		result.Tokens = a.buildReportForSessionLocked(unit)
-		unit.tokensMu.Unlock()
-	}
-	return result, maxDurableTurn
 }
 
 func (a *Agent) userMessageContentForTurn(turn int) string {
@@ -5988,13 +6282,12 @@ func (a *Agent) userMessageContentForTurnForSession(unit *session, turn int) str
 	return ""
 }
 
-// RevertCode restores files to their state at the given turn. It is a
-// lifecycle mutation: it takes the owner lifecycle lock at entry and refuses
-// after close, so a direct revert admitted by the host before close but
-// entering the owner after close cannot mutate files. The last-kept-turn
-// semantics of store.RevertCode(turn) are unchanged: this entry only adds
-// the owner admission guard, and both revert APIs keep their current turn
-// convention.
+// RevertCode restores the source tree through the direct code-revert
+// convention: N is the first restored turn, so the store keeps turns up to
+// N-1, matching the shared revert_code turn action. It is a lifecycle
+// mutation: it takes the owner lifecycle lock at entry and refuses after
+// close, so a direct revert admitted by the host before close but entering the
+// owner after close cannot mutate files.
 func (a *Agent) RevertCode(turn int) (snapshot.RevertResult, error) {
 	defer a.lockLifecycle()()
 	// Post-lifecycleMu admission recheck, same as every other lifecycle op.
@@ -6008,8 +6301,9 @@ func (a *Agent) RevertCode(turn int) (snapshot.RevertResult, error) {
 	return a.revertCodeForSession(a.session, turn)
 }
 
-// RevertCodeForSession restores files to their state at the given turn. It is
-// a lifecycle mutation: it takes the owner lifecycle lock at entry and refuses
+// RevertCodeForSession is RevertCode scoped to a session: N is the first
+// restored turn, matching the shared revert_code turn action. It is a
+// lifecycle mutation: it takes the owner lifecycle lock at entry and refuses
 // after close, so a direct revert admitted by the host before close but
 // entering the owner after close cannot mutate files.
 func (a *Agent) RevertCodeForSession(sessionID string, turn int) (snapshot.RevertResult, error) {
@@ -6029,191 +6323,276 @@ func (a *Agent) RevertCodeForSession(sessionID string, turn int) (snapshot.Rever
 	return a.revertCodeForSession(unit, turn)
 }
 
+// revertCodeForSession restores the source tree through the direct code-revert
+// convention: N is the first restored turn, so the store keeps turns up to
+// N-1. The caller holds lifecycleMu; the same transitioning reservation the
+// shared turn actions use is taken here, so a direct revert is mutually
+// exclusive with submit, queue drain, signal turns, and conflicting lifecycle
+// work. The tracker is reset only after a successful restore; a partial error
+// preserves the restored and skipped file reports.
 func (a *Agent) revertCodeForSession(unit *session, turn int) (snapshot.RevertResult, error) {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
-	if unit == nil || unit.store == nil || !unit.store.Active() {
-		return snapshot.RevertResult{}, snapshot.ErrNoSession
-	}
-	if err := unitMutableLocked(unit); err != nil {
+	release, err := a.reserveTurnActionUnit(unit)
+	if err != nil {
 		return snapshot.RevertResult{}, err
 	}
-	result, err := unit.store.RevertCode(turn)
+	defer release()
+	result, err := unit.store.RevertCode(turn - 1)
 	if err != nil {
 		return result, err
 	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
 	a.resetFileTrackerForSession(unit)
+	rt.mu.Unlock()
 	return result, nil
 }
 
-// cleanupStaging removes a candidate's staging directory after a preparation
-// failure, joining any cleanup error with the original cause so neither is lost.
-func cleanupStaging(stagingRoot string, cause error) error {
-	if err := os.RemoveAll(stagingRoot); err != nil {
-		return errors.Join(cause, fmt.Errorf("snapshot: fork staging cleanup: %w", err))
+// removeStagingTree is the package seam for staging-tree removal. Production
+// behavior is os.RemoveAll; tests swap it to force deterministic cleanup
+// failures and to hold the post-rename barrier. It is the sole seam for
+// staging cleanup: the fork's precommit defer, the fork's post-rename
+// empty-parent removal, and newSession's staging ownership all call it.
+var removeStagingTree = os.RemoveAll
+
+// closeStoreDeferred closes a child or compact store from a deferred cleanup.
+// It keeps the caller's primary result: a cleanup failure is reported to
+// stderr (the store error names the session) and cannot change the outcome of
+// the operation being cleaned up after.
+func closeStoreDeferred(store *snapshot.Store, what string) {
+	if store == nil {
+		return
 	}
-	return cause
+	if _, err := store.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "lightcode: close %s store: %v\n", what, err)
+	}
+}
+
+// forkSourceSnapshot is the fork's source identity and model snapshot, taken
+// under rt.mu in the fork's first lock half: the source session id and
+// sessions root (the copy destination), the source's project/agent identity,
+// its live model ref, and the provider client constructed for that model.
+type forkSourceSnapshot struct {
+	sessionID    string
+	sessionsRoot string
+	projectID    string
+	projectName  string
+	projectRoot  string
+	agentType    string
+	srcRef       coremodel.ModelRef
+	client       *provider.Client
+	model        *catalog.Model
+}
+
+// forkPreparedResult is the fork's read-free result payload, prepared from the
+// staged candidate before the durable rename: the display history rendered
+// from the candidate's loaded turns, the summary from the candidate's staged
+// meta, and the token report from the candidate's loaded tokens.
+type forkPreparedResult struct {
+	messages []DisplayMessage
+	summary  SessionSummary
+	tokens   TokenReport
 }
 
 // forkUnitAtTurn forks unit at turn through the split shape: the source is
-// validated and the copy inputs snapshotted under rt.mu, the durable tree copy
-// into staging runs with rt.mu released, then rt.mu is re-acquired and — only
-// after the source is re-validated — the candidate is built and published.
-// Each lock half's unlock is deferred within its own scope, so a panic cannot
-// leave the bracket unbalanced. The caller holds lifecycleMu; any failure
-// removes only the staging directory and leaves the source unchanged.
-func (a *Agent) forkUnitAtTurn(unit *session, turn int) (*session, error) {
+// validated and the copy inputs snapshotted under the first short rt.mu hold,
+// the durable tree copy and every candidate preparation read run with rt.mu
+// released, and rt.mu is reacquired only for the infallible registration and
+// the ordered boundary (see applyForkTurnAction). One named-error defer owns
+// every precommit cleanup: any failure after the staging root exists removes
+// the staging tree, joining a cleanup failure onto the operation error. After
+// the rename and path relocation, the same seam removes the now-empty staging
+// parent once; its failure prints one stderr line and cannot change the
+// committed success. The caller holds lifecycleMu and the source's
+// transitioning reservation; any failure leaves the source unchanged.
+func (a *Agent) forkUnitAtTurn(unit *session, turn int) (candidate *session, prepared forkPreparedResult, err error) {
 	rt := a.ensureRuntime()
 
-	// First half: validate the source and snapshot the copy inputs under rt.mu.
-	sessionID, sessionsRoot, srcRef, err := func() (string, string, coremodel.ModelRef, error) {
+	// First half: validate the source, snapshot the copy inputs, construct the
+	// provider client for the active model, and capture the reloadable
+	// configuration for the candidate construction — all under rt.mu. An
+	// unresolvable agent type fails here, before any staging, copy, or
+	// publication.
+	src, snap, err := func() (forkSourceSnapshot, rootUnitSnapshot, error) {
 		rt.mu.Lock()
 		defer rt.mu.Unlock()
-		return a.forkSnapshotSourceLocked(unit)
+		src, err := a.forkSnapshotSourceLocked(unit)
+		if err != nil {
+			return forkSourceSnapshot{}, rootUnitSnapshot{}, err
+		}
+		snap := a.rootUnitSnapshotLocked(rt, src.agentType, src.projectID)
+		if snap.resolveErr != nil {
+			return forkSourceSnapshot{}, rootUnitSnapshot{}, snap.resolveErr
+		}
+		return src, snap, nil
 	}()
 	if err != nil {
-		return nil, err
+		return nil, forkPreparedResult{}, err
 	}
 
-	// The released section: only the durable tree copy runs without rt.mu.
-	stagingRoot, newID, err := a.forkCopyTree(unit, sessionsRoot, turn)
+	// The released section: staging creation, the durable tree copy, and every
+	// candidate preparation read run without rt.mu.
+	stagingRoot, err := snapshot.NewStagingSessionsRoot(src.sessionsRoot)
 	if err != nil {
-		return nil, err
+		return nil, forkPreparedResult{}, err
+	}
+	// One named-error defer owns every precommit cleanup: any return with err
+	// set removes the staging tree, joining a cleanup failure onto the
+	// operation error. After the durable rename, the post-rename seam call
+	// clears the root, so this defer removes nothing further.
+	defer func() {
+		if err != nil && stagingRoot != "" {
+			if cerr := removeStagingTree(stagingRoot); cerr != nil {
+				err = errors.Join(err, fmt.Errorf("snapshot: fork staging cleanup: %w", cerr))
+			}
+		}
+	}()
+
+	a.fireDurableReadHook()
+	newID, _, err := unit.store.ForkInto(turn, stagingRoot)
+	if err != nil {
+		return nil, forkPreparedResult{}, err
 	}
 
-	// Second half: re-acquire rt.mu, re-validate the source, then build and
-	// publish the candidate.
-	return func() (*session, error) {
-		rt.mu.Lock()
-		defer rt.mu.Unlock()
-		return a.forkCommitStagedLocked(unit, sessionID, sessionsRoot, srcRef, stagingRoot, newID)
-	}()
+	// Prepare a separate candidate store and unit against the staged copy. The
+	// source (src.sessionID) and candidate (newID) claims are both held here.
+	var candidateStore *snapshot.Store
+	candidateStore, err = unit.store.NewStagingStore(stagingRoot)
+	if err != nil {
+		return nil, forkPreparedResult{}, err
+	}
+	a.fireDurableReadHook()
+	if err = candidateStore.LoadSession(newID); err != nil {
+		return nil, forkPreparedResult{}, err
+	}
+	// Candidate unit construction runs entirely outside rt.mu: it is fed the
+	// value-snapshotted configuration captured in the first hold plus the
+	// fork's prepared model install, so the prompt (rules-file) assembly and
+	// every other durable read run with the lock free. The candidate is not
+	// registered yet, so installing the model/adaptation directly in its
+	// running unit config is safe and performs no second prompt assembly.
+	candidate, _, err = a.rootRunningUnit(snap, candidateStore, src.agentType, src.projectID, src.projectName, src.projectRoot, &rootUnitModelInstall{
+		ref:    src.srcRef,
+		client: src.client,
+		window: src.model.ContextWindow,
+		adapt:  a.resolveAdaptation(src.srcRef.Model),
+	})
+	if err != nil {
+		candidateStore.Detach()
+		return nil, forkPreparedResult{}, err
+	}
+
+	a.fireDurableReadHook()
+	raw, err := a.loadHistoryIntoLoopForSession(candidate)
+	if err != nil {
+		candidateStore.Detach()
+		return nil, forkPreparedResult{}, err
+	}
+	// Prepare all remaining candidate state from the staged copy before the
+	// durable commit, so no fallible read runs after the rename. The tokens
+	// preparation is strict: a missing tokens file is valid (empty known
+	// totals), while an unreadable or invalid file fails the fork before
+	// publication.
+	a.resetFileTrackerForSession(candidate)
+	tokenOut := a.readTokensFile(candidate)
+	if tokenOut.err != nil {
+		candidateStore.Detach()
+		return nil, forkPreparedResult{}, fmt.Errorf("fork read tokens: %w", tokenOut.err)
+	}
+	candidate.tokensMu.Lock()
+	candidate.tokens = map[string]*TokenEntry{}
+	for i := range tokenOut.entries {
+		e := tokenOut.entries[i]
+		e.Known = true
+		candidate.tokens[e.Provider+"/"+e.Model] = &e
+	}
+	candidate.tokensMu.Unlock()
+	a.fireDurableReadHook()
+	if err = candidate.store.SetModel(src.srcRef.Provider, src.srcRef.Model); err != nil {
+		candidateStore.Detach()
+		return nil, forkPreparedResult{}, fmt.Errorf("fork persist model: %w", err)
+	}
+	// Prepare the read-free result payload: the display history rendered from
+	// the loaded turns, the summary from the staged meta, and the token report
+	// from the loaded tokens.
+	a.fireDurableReadHook()
+	var meta snapshot.SessionMeta
+	meta, err = candidate.store.Meta()
+	if err != nil {
+		candidateStore.Detach()
+		return nil, forkPreparedResult{}, err
+	}
+	prepared = forkPreparedResult{
+		messages: a.renderCompleteTurns(raw),
+		summary:  sessionSummaryFromUnit(candidate, meta),
+	}
+	candidate.tokensMu.Lock()
+	prepared.tokens = a.buildReportForSessionLocked(candidate)
+	candidate.tokensMu.Unlock()
+
+	// Durable commit: the atomic rename publishes the candidate.
+	if err = snapshot.PublishStagedSession(stagingRoot, src.sessionsRoot, newID); err != nil {
+		candidate.store.Detach()
+		return nil, forkPreparedResult{}, err
+	}
+	if err = candidate.store.RelocateActiveSessionPaths(src.sessionsRoot); err != nil {
+		candidate.store.Detach()
+		return nil, forkPreparedResult{}, err
+	}
+	// Post-commit publication is infallible: drop the now-empty staging parent.
+	// Its failure prints one stderr line and cannot change success.
+	if cerr := removeStagingTree(stagingRoot); cerr != nil {
+		fmt.Fprintf(os.Stderr, "lightcode: remove empty fork staging %s: %v\n", stagingRoot, cerr)
+	}
+	stagingRoot = ""
+	return candidate, prepared, nil
 }
 
 // forkSnapshotSourceLocked validates the source and snapshots the fork inputs
-// under rt.mu: the source session id and sessions root (the copy destination)
-// and the source's live model ref (currentRef is rt.mu-guarded). Caller holds
-// rt.mu.
-func (a *Agent) forkSnapshotSourceLocked(unit *session) (sessionID, sessionsRoot string, srcRef coremodel.ModelRef, err error) {
+// under rt.mu: the source session id and sessions root (the copy destination),
+// the source's project/agent identity, its live model ref, and the provider
+// client constructed for that model. The transitioning reservation the caller
+// already holds covers mutability, so only admission, liveness, and identity
+// are checked here. Caller holds rt.mu.
+func (a *Agent) forkSnapshotSourceLocked(unit *session) (forkSourceSnapshot, error) {
 	// Admission check at the fork's entry, before the staged copy and the
 	// publication: a fork starting after shutdown published closed must not
 	// copy the tree or publish a new session.
 	if a.ensureRuntime().closed {
-		return "", "", coremodel.ModelRef{}, errOwnerClosed
+		return forkSourceSnapshot{}, errOwnerClosed
 	}
 	if unit == nil || unit.store == nil || !unit.store.Active() {
-		return "", "", coremodel.ModelRef{}, snapshot.ErrNoSession
+		return forkSourceSnapshot{}, snapshot.ErrNoSession
 	}
-	if err := unitMutableLocked(unit); err != nil {
-		return "", "", coremodel.ModelRef{}, err
+	ref := unit.currentRef
+	if ref.Provider == "" || ref.Model == "" {
+		return forkSourceSnapshot{}, fmt.Errorf("fork source session has no active model")
 	}
-	return unit.store.SessionID(), unit.store.Root(), unit.currentRef, nil
-}
-
-// forkCopyTree copies the source session's tree into a fresh unlisted staging
-// root. It is the fork's only hoisted durable I/O and runs with rt.mu
-// released; its inputs were snapshotted under rt.mu by the caller. Returns the
-// new session id and the staging root; the source store stays authoritative.
-func (a *Agent) forkCopyTree(unit *session, sessionsRoot string, turn int) (stagingRoot, newID string, err error) {
-	stagingRoot, err = snapshot.NewStagingSessionsRoot(sessionsRoot)
+	client, model, err := newProviderClient(a.catalog, ref)
 	if err != nil {
-		return "", "", err
+		return forkSourceSnapshot{}, fmt.Errorf("fork model %s/%s: %w", ref.Provider, ref.Model, err)
 	}
-	a.fireDurableReadHook()
-	newID, _, err = unit.store.ForkInto(turn, stagingRoot)
-	if err != nil {
-		return "", "", cleanupStaging(stagingRoot, err)
+	agentType := unit.activeAgentType
+	if agentType == "" {
+		agentType = "primary"
 	}
-	return stagingRoot, newID, nil
-}
-
-// forkCommitStagedLocked re-validates the source under rt.mu — the copy ran
-// without it, so a concurrent close, replacement, or turn start may have made
-// the source unforkable — and only then builds the candidate from the staged
-// copy and publishes it with the single atomic rename into the session
-// namespace, registering the fork as its own live unit and selecting it when
-// the source was current. The source is still authoritative until the rename
-// succeeds; any failure leaves the source unchanged and removes only its
-// staging directory. Caller holds rt.mu.
-func (a *Agent) forkCommitStagedLocked(unit *session, sessionID, sessionsRoot string, srcRef coremodel.ModelRef, stagingRoot, newID string) (*session, error) {
-	// Re-validate the source before committing on the staged copy: the source
-	// was validated and snapshotted under rt.mu before the copy released it,
-	// so never commit on state read before the release.
-	if unit == nil || unit.store == nil || !unit.store.Active() {
-		return nil, snapshot.ErrNoSession
-	}
-	if unit.store.SessionID() != sessionID {
-		return nil, snapshot.ErrNoSession
-	}
-	if err := unitMutableLocked(unit); err != nil {
-		return nil, err
-	}
-	// Prepare a separate candidate store and unit against the staged copy. The
-	// source (sessionID) and candidate (newID) claims are both held here.
-	candidateStore, err := unit.store.NewStagingStore(stagingRoot)
-	if err != nil {
-		return nil, cleanupStaging(stagingRoot, err)
-	}
-	a.fireDurableReadHook()
-	if err := candidateStore.LoadSession(newID); err != nil {
-		return nil, cleanupStaging(stagingRoot, err)
-	}
-	candidate, _, err := a.rootRunningUnitLocked(candidateStore, unit.activeAgentType, unit.projectID, unit.projectName, unit.projectRoot)
-	if err != nil {
-		candidateStore.Detach()
-		return nil, cleanupStaging(stagingRoot, err)
-	}
-	a.fireDurableReadHook()
-	if err := a.loadHistoryIntoLoopForSession(candidate); err != nil {
-		candidateStore.Detach()
-		return nil, cleanupStaging(stagingRoot, err)
-	}
-	// Prepare all remaining candidate state from the staged copy before the
-	// durable commit, so no fallible read runs after the rename.
-	a.resetFileTrackerForSession(candidate)
-	a.loadTokensFromDiskForSession(candidate)
-	if err := a.inheritActiveModelForForkedSession(candidate, srcRef); err != nil {
-		candidateStore.Detach()
-		return nil, cleanupStaging(stagingRoot, err)
-	}
-	// Durable commit: the atomic rename publishes the candidate.
-	if err := snapshot.PublishStagedSession(stagingRoot, sessionsRoot, newID); err != nil {
-		candidate.store.Detach()
-		return nil, cleanupStaging(stagingRoot, err)
-	}
-	if err := candidate.store.RelocateActiveSessionPaths(sessionsRoot); err != nil {
-		candidate.store.Detach()
-		return nil, err
-	}
-	// Post-commit publication is infallible: drop the empty staging parent, then
-	// register the fork as its own live unit, selecting it only when the source
-	// was current.
-	_ = os.RemoveAll(stagingRoot)
-	if a.currentSessionID == sessionID {
-		if err := a.setCurrentSessionLocked(candidate); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := a.registerLiveSessionLocked(candidate); err != nil {
-			return nil, err
-		}
-	}
-	return candidate, nil
+	return forkSourceSnapshot{
+		sessionID:    unit.store.SessionID(),
+		sessionsRoot: unit.store.Root(),
+		projectID:    unit.projectID,
+		projectName:  unit.projectName,
+		projectRoot:  unit.projectRoot,
+		agentType:    agentType,
+		srcRef:       ref,
+		client:       client,
+		model:        model,
+	}, nil
 }
 
 func (a *Agent) ForkSessionForSession(sessionID string, turn int) error {
-	defer a.lockLifecycle()()
-	unit, err := a.resolveRootDriveSession(sessionID)
-	if err != nil {
-		return err
-	}
-	return a.forkSessionForSession(unit, turn)
-}
-
-// forkSessionForSession forks unit through forkUnitAtTurn's snapshot/copy/
-// revalidate-commit split, which owns the rt.mu bracket.
-func (a *Agent) forkSessionForSession(unit *session, turn int) error {
-	_, err := a.forkUnitAtTurn(unit, turn)
+	// The fork routes through the shared turn-action implementation, so it
+	// takes the same transitioning reservation, admission recheck, and
+	// publication path as the fork turn action.
+	_, err := a.applyTurnActionResolved(sessionID, turn, TurnActionFork, false, nil)
 	return err
 }
 

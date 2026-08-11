@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -13,10 +14,11 @@ import (
 )
 
 // TestDurableIOAgainstOwnerLocks asserts the position of each site's durable
-// I/O relative to its owner lock under the current arrangement: the fork
-// staging tree copy runs outside runtime.mu while every candidate read runs
-// under it, resume's listing/history loads run under lifecycleMu, the tokens
-// file read runs outside the unit's tokensMu, and the tokens file write runs
+// I/O relative to its owner lock under the current arrangement: the fork's
+// staged copy and every candidate read run outside runtime.mu (only the
+// source admission snapshot and the registration/boundary section hold it),
+// resume's listing/meta/history loads run under lifecycleMu, the tokens file
+// read runs outside the unit's tokensMu, and the tokens file write runs
 // inside it.
 //
 // The assertion needs durableReadHook because lock ownership is unobservable
@@ -36,18 +38,16 @@ func TestDurableIOAgainstOwnerLocks(t *testing.T) {
 		if err := a.ForkSessionForSession(sourceID, 1); err != nil {
 			t.Fatalf("fork: %v", err)
 		}
-		// First fire is the hoisted tree copy; the candidate reads that follow
-		// run back under the re-acquired lock.
+		// The staged copy and every candidate read run outside runtime.mu; the
+		// lock is held only for the admission snapshot and the final
+		// registration/boundary section, neither of which performs durable I/O.
 		got := obs()
 		if len(got) == 0 {
 			t.Fatal("no durable fork I/O observed")
 		}
-		if got[0] {
-			t.Fatal("fork tree copy ran while runtime.mu was held")
-		}
-		for i, held := range got[1:] {
-			if !held {
-				t.Fatalf("fork candidate read %d ran outside runtime.mu", i+1)
+		for i, held := range got {
+			if held {
+				t.Fatalf("fork durable I/O %d ran while runtime.mu was held", i+1)
 			}
 		}
 	})
@@ -65,12 +65,9 @@ func TestDurableIOAgainstOwnerLocks(t *testing.T) {
 		if len(got) == 0 {
 			t.Fatal("no durable fork I/O observed")
 		}
-		if got[0] {
-			t.Fatal("fork tree copy ran while runtime.mu was held")
-		}
-		for i, held := range got[1:] {
-			if !held {
-				t.Fatalf("fork candidate read %d ran outside runtime.mu", i+1)
+		for i, held := range got {
+			if held {
+				t.Fatalf("fork durable I/O %d ran while runtime.mu was held", i+1)
 			}
 		}
 	})
@@ -181,6 +178,33 @@ func TestDurableIOAgainstOwnerLocks(t *testing.T) {
 			t.Fatalf("persisted entries = %#v, want one cache 1 / input 2 / output 3 entry", entries)
 		}
 	})
+	t.Run("new_session_all_durable_io_outside_runtime_lock", func(t *testing.T) {
+		a := newCatalogBackedTestAgent(t)
+		proj, err := a.projects.Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		obs := probeOwnerLock(a, &a.ensureRuntime().mu)
+		defer func() { obs() }()
+		if _, err := a.NewSessionWithBoundary(proj.ID, "primary", func(HydrationState) {}); err != nil {
+			t.Fatalf("NewSessionWithBoundary: %v", err)
+		}
+		// The newSession durable fires — the prompt/rules read, the prepared
+		// SetModel and Meta writes/reads, and the tokens read — all run
+		// outside runtime.mu; the lock is held only for the admission checks,
+		// the config/model snapshot, and the final registration/boundary
+		// section, none of which performs durable I/O.
+		got := obs()
+		if len(got) == 0 {
+			t.Fatal("no durable newSession I/O observed")
+		}
+		for i, held := range got {
+			if held {
+				t.Fatalf("newSession durable I/O %d ran while runtime.mu was held", i+1)
+			}
+		}
+	})
+
 }
 
 // probeOwnerLock installs a durableReadHook that records, for every fire,
@@ -200,4 +224,65 @@ func probeOwnerLock(a *Agent, m *sync.Mutex) func() []bool {
 		a.durableReadHook = nil
 		return obs
 	}
+}
+
+// TestPreseedRearmWakeSentAfterRuntimeUnlock is a structural regression for
+// the deferred preseed claim cleanup's lock order: the rearm wake must be sent
+// only after rt.mu is released, so a wake can never be delivered while the
+// runtime mutex is held. A structural assertion is used because the
+// nonblocking channel wake has no observable lock-ownership effect — the
+// receiver merely finds a token, and the send's lock context cannot be
+// observed without production instrumentation — and adding a runtime hook to
+// observe the send would add the production mechanism the design forbids. The
+// test extracts the deferred cleanup body from agent.go's source and requires
+// the runtime-mutex unlock to precede the nudge call within it.
+func TestPreseedRearmWakeSentAfterRuntimeUnlock(t *testing.T) {
+	src, err := os.ReadFile("agent.go")
+	if err != nil {
+		t.Fatalf("read agent.go: %v", err)
+	}
+	const marker = "// Rearm retained work on a live owner"
+	start := bytes.Index(src, []byte(marker))
+	if start < 0 {
+		t.Fatalf("deferred preseed cleanup marker %q not found in agent.go", marker)
+	}
+	body := src[start:]
+	unlockAt := bytes.Index(body, []byte("rt.mu.Unlock()"))
+	nudgeAt := bytes.Index(body, []byte("rt.nudgeQueueDrainer()"))
+	if unlockAt < 0 {
+		t.Fatalf("no rt.mu.Unlock() after the preseed cleanup marker")
+	}
+	if nudgeAt < 0 {
+		t.Fatalf("no nudgeQueueDrainer() after the preseed cleanup marker")
+	}
+	if unlockAt > nudgeAt {
+		t.Fatalf("the preseed rearm nudge is sent while rt.mu is still held (unlock at byte %d, nudge at byte %d in the deferred cleanup body)", unlockAt, nudgeAt)
+	}
+	t.Run("new_session_all_durable_io_outside_runtime_lock", func(t *testing.T) {
+		a := newCatalogBackedTestAgent(t)
+		proj, err := a.projects.Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		obs := probeOwnerLock(a, &a.ensureRuntime().mu)
+		defer func() { obs() }()
+		if _, err := a.NewSessionWithBoundary(proj.ID, "primary", func(HydrationState) {}); err != nil {
+			t.Fatalf("NewSessionWithBoundary: %v", err)
+		}
+		// The newSession durable fires — the prompt/rules read, the prepared
+		// SetModel and Meta writes/reads, and the tokens read — all run
+		// outside runtime.mu; the lock is held only for the admission checks,
+		// the config/model snapshot, and the final registration/boundary
+		// section, none of which performs durable I/O.
+		got := obs()
+		if len(got) == 0 {
+			t.Fatal("no durable newSession I/O observed")
+		}
+		for i, held := range got {
+			if held {
+				t.Fatalf("newSession durable I/O %d ran while runtime.mu was held", i+1)
+			}
+		}
+	})
+
 }

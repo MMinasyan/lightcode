@@ -177,15 +177,38 @@ func (s *Store) BeginNewSession(projectRoot string) error {
 // and atomically publishes it into the store's sessions root, so a partially
 // initialized final session directory is never listed. It is the prepare-then-
 // publish sequence over PrepareStagedNewSession and PublishPreparedSession. The
-// Store must not have an active session; on any failure it is left inactive and
-// only staging is removed. On success the store is active and rebound to the
-// final location.
-func (s *Store) BeginNewSessionStaged(projectRoot string) error {
+// Store must not have an active session; on any failure it is left inactive.
+// This wrapper is the sole cleanup owner of the staging tree from the moment
+// prepare returns: a named-error defer removes it exactly once on every
+// precommit error return (joining a cleanup failure onto the operation error),
+// and after a successful publish the now-empty staging parent is removed once —
+// an optional cleanup failure is reported to stderr and cannot change success.
+// PrepareStagedNewSession continues owning failures before it returns. On
+// success the store is active and rebound to the final location.
+func (s *Store) BeginNewSessionStaged(projectRoot string) (err error) {
 	prepared, err := s.PrepareStagedNewSession(projectRoot)
 	if err != nil {
 		return err
 	}
-	return s.PublishPreparedSession(prepared)
+	stagingRoot := prepared.Root()
+	defer func() {
+		if err != nil && stagingRoot != "" {
+			if cerr := os.RemoveAll(stagingRoot); cerr != nil {
+				err = errors.Join(err, fmt.Errorf("snapshot: staging cleanup: %w", cerr))
+			}
+		}
+	}()
+	if err := s.PublishPreparedSession(prepared); err != nil {
+		return err
+	}
+	// Post-publish: the staging parent is now empty; remove it exactly once.
+	// An optional cleanup failure is reported and cannot change success;
+	// clearing the root makes the precommit defer a no-op.
+	if cerr := os.RemoveAll(stagingRoot); cerr != nil {
+		fmt.Fprintf(os.Stderr, "lightcode: remove empty staging %s: %v\n", stagingRoot, cerr)
+	}
+	stagingRoot = ""
+	return nil
 }
 
 // PrepareStagedNewSession prepares a fresh session under an unlisted staging
@@ -241,14 +264,17 @@ func (s *Store) PrepareStagedNewSession(projectRoot string) (*Store, error) {
 // PublishPreparedSession atomically publishes a session prepared by
 // PrepareStagedNewSession: it renames the candidate from its staging root into
 // this store's sessions root and rebinds the prepared store to the final
-// location, so reads and writes through it keep working after publication. Its
-// failure semantics are asymmetric around the rename. A failure before the
-// rename (the publish step) leaves nothing published: the session state is
-// dropped, both stores are left inactive, and only staging is removed, so the
-// sessions root never holds a partial session. A failure after the rename (the
-// relocation step) leaves the session published with the receiver still owning
-// it: the receiver stays active and claim-holding on the published session, and
-// only the prepared store is detached as unusable.
+// location, so reads and writes through it keep working after publication. It
+// owns only the prepared-store detach/receiver state and the publish/relocate
+// steps; the staging tree is owned by the caller (the wrapper that prepared
+// it), which removes the now-empty staging parent after a successful publish
+// and cleans it up on precommit failures. Its failure semantics are asymmetric
+// around the rename. A failure before the rename (the publish step) leaves
+// nothing published: the session state is dropped and both stores are left
+// inactive, so the sessions root never holds a partial session. A failure
+// after the rename (the relocation step) leaves the session published with the
+// receiver still owning it: the receiver stays active and claim-holding on the
+// published session, and only the prepared store is detached as unusable.
 //
 // Between the prepare call and this call the receiver is mid-transaction: it is
 // bound to a session that is not yet published, and it holds that session's
@@ -267,23 +293,21 @@ func (s *Store) PublishPreparedSession(prepared *Store) error {
 	finalRoot := s.root
 	if err := PublishStagedSession(stagingRoot, finalRoot, s.sessionID); err != nil {
 		// The session is active but its files are still under staging; drop it.
+		// The staging tree stays for the caller's cleanup owner.
 		s.clearLocked()
 		s.mu.Unlock()
 		prepared.Detach()
-		return cleanupStagingRoot(stagingRoot, err)
+		return err
 	}
 	s.mu.Unlock()
 	if err := prepared.RelocateActiveSessionPaths(finalRoot); err != nil {
 		// The rename already committed: the session is published and the
 		// receiver keeps its claim on it. Only the prepared store is broken;
-		// detach it, remove the now-empty staging parent (post-commit
-		// cleanup, as on the success path), and leave the receiver active.
+		// detach it and leave the receiver active. The caller's cleanup owner
+		// removes the now-empty staging parent.
 		prepared.Detach()
-		_ = os.RemoveAll(stagingRoot)
 		return err
 	}
-	// Files now live at s.dir; the empty staging parent is post-commit cleanup.
-	_ = os.RemoveAll(stagingRoot)
 	return nil
 }
 
@@ -387,7 +411,12 @@ func (s *Store) LoadSession(id string) (err error) {
 // Close detaches the Store from its current session. If the session
 // has no complete turns, the entire session dir is deleted (orphan
 // cleanup for "opened a new session, switched away without using it").
-// Returns (wasDiscarded, err). A Store with no session is a no-op.
+// The claim and active authority remain held through the optional
+// empty-directory removal, and clearLocked always runs before the function
+// returns success or failure, so a cleanup failure can never retain the
+// session claim until process exit (the release is never ordered before the
+// deletion completes). Returns (wasDiscarded, err). A Store with no session
+// is a no-op.
 func (s *Store) Close() (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -395,14 +424,16 @@ func (s *Store) Close() (bool, error) {
 		return false, nil
 	}
 	discarded := false
+	var cleanupErr error
 	if s.hasAnyCompleteTurnLocked() == false {
 		if err := os.RemoveAll(s.dir); err != nil {
-			return false, fmt.Errorf("snapshot: discard empty session %s: %w", s.sessionID, err)
+			cleanupErr = fmt.Errorf("snapshot: discard empty session %s: %w", s.sessionID, err)
+		} else {
+			discarded = true
 		}
-		discarded = true
 	}
 	s.clearLocked()
-	return discarded, nil
+	return discarded, cleanupErr
 }
 
 // RelocateActiveSessionPaths rewrites the active store's cached directory

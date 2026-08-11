@@ -2126,55 +2126,39 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 			t.Fatal("marker failure was not delivered live")
 		}
 
-		// The drain aborted: no further turn launched.
-		if got := reqs.Load(); got != 0 {
-			t.Fatalf("a model turn launched after the marker failure (%d requests)", got)
+		// The abort's exit disposition re-arms the retained work on the live
+		// owner: the drainer re-drains the requeued remainder on its own — the
+		// fault is armed only at the failed turn, so the re-drain succeeds and
+		// launches the final item. No manual nudge is required.
+		rearmDeadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(rearmDeadline) && reqs.Load() == 0 {
+			time.Sleep(5 * time.Millisecond)
 		}
-		for _, ev := range cap.snapshot() {
-			if ev.Kind == EventTurnStart {
-				t.Fatalf("a turn_start was delivered after the marker failure: %#v", ev)
-			}
+		if got := reqs.Load(); got != 1 {
+			t.Fatalf("retained work never re-drained after the marker-failure abort (model requests = %d, want 1)", got)
 		}
+		// The requeue event carried the real remainder — the failed item is
+		// not requeued, and the item appended meanwhile is prepended behind
+		// the survivors — with the original ids preserved.
+		assertQueueChangedPayloadPresent(t, cap, []QueuedItem{{ID: "q-2", Content: "survivor"}, {ID: "q-3", Content: "meanwhile"}})
 
-		// The untouched remainder is back on the queue — the failed item is
-		// not — prepended ahead of the item appended meanwhile, with the
-		// original ids preserved.
-		q, err := a.QueueSnapshotForSession(id)
-		if err != nil {
-			t.Fatalf("QueueSnapshotForSession: %v", err)
+		// Exactly one model turn launched after the abort — the rearm's final
+		// item — and the failed message rendered exactly once in the live
+		// stream and once in loop history, not once per attempt.
+		if got := reqs.Load(); got != 1 {
+			t.Fatalf("model requests after the rearm = %d, want exactly 1 (the retained final item launched once)", got)
 		}
-		if len(q.Items) != 2 ||
-			q.Items[0].Content != "survivor" || q.Items[0].ID != "q-2" ||
-			q.Items[1].Content != "meanwhile" {
-			t.Fatalf("requeued queue = %#v, want [survivor(q-2), meanwhile]", q.Items)
-		}
-		// The requeue event must carry the real queue, not an empty snapshot:
-		// a bare emptyQueue() here would tell every host the queue is empty
-		// while items sit in it.
-		assertQueueChangedPayloadForVersion(t, cap, q.Version, q.Items)
-
-		// The unit is drainable: the abort cleared the claimed-but-not-launched
-		// busy marker instead of wedging the session.
-		if busy, err := a.BusyForSession(id); err != nil || busy {
-			t.Fatalf("unit busy after failed drain: busy=%v err=%v", busy, err)
-		}
-		// The abort leaves the same residue as the other abort paths: the
-		// per-turn context is cleared, not left installed-cancelled.
 		rt.mu.Lock()
+		busy := unit.busy
 		turnCtxSet := unit.turnCtx != nil
 		turnCancelSet := unit.turnCancel != nil
 		rt.mu.Unlock()
-		if turnCtxSet || turnCancelSet {
-			t.Fatal("failed drain left the per-turn context installed")
+		if busy {
+			t.Fatal("unit still busy after the rearm completed")
 		}
-
-		// Clear the fault and drain again: the failed message renders exactly
-		// once in the live stream and once in loop history, not once per
-		// attempt (a requeue of the failed item would re-append it).
-		clearFault()
-		rt.nudgeQueueDrainer()
-		waitSessionDrained(t, a, id)
-
+		if turnCtxSet || turnCancelSet {
+			t.Fatal("rearm completed but left the per-turn context installed")
+		}
 		var liveFail, liveSurvivor, liveMeanwhile int
 		for _, ev := range cap.snapshot() {
 			if ev.Kind == EventUserMessageDisplay {
@@ -2428,42 +2412,54 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 			t.Fatal("drain did not return after the cancel")
 		}
 
-		// No turn launched after the cancel.
+		// The cancelled attempt itself launched nothing: no model request and
+		// no turn_start existed before the abort's requeue. The requeue event
+		// carried the real remainder with its original id.
 		if got := reqs.Load(); got != 0 {
-			t.Fatalf("a model turn launched after the cancel (%d requests)", got)
+			t.Fatalf("a model turn launched by the cancelled attempt (%d requests)", got)
 		}
-		for _, ev := range cap.snapshot() {
-			if ev.Kind == EventTurnStart {
-				t.Fatalf("a turn_start was delivered after the cancel: %#v", ev)
+		assertQueueChangedPayloadPresent(t, cap, []QueuedItem{{ID: "q-2", Content: "launch"}})
+
+		// The abort's exit disposition re-arms the retained work on the live
+		// owner: the requeued remainder is re-drained and launched without any
+		// manual nudge.
+		rearmDeadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(rearmDeadline) && reqs.Load() == 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if got := reqs.Load(); got != 1 {
+			t.Fatalf("retained work never re-drained after the cancel abort (model requests = %d, want 1)", got)
+		}
+		// The rearm's launch delivered the turn_start after the requeue; the
+		// cancelled attempt delivered none.
+		evs := cap.snapshot()
+		requeueAt := -1
+		firstTurnStart := -1
+		for i, ev := range evs {
+			if ev.Kind == EventQueueChanged && requeueAt < 0 && reflect.DeepEqual(ev.Queue, []QueuedItem{{ID: "q-2", Content: "launch"}}) {
+				requeueAt = i
+			}
+			if ev.Kind == EventTurnStart && firstTurnStart < 0 {
+				firstTurnStart = i
 			}
 		}
-
-		// The untouched remainder is back on the queue with its original id.
-		q, err := a.QueueSnapshotForSession(id)
-		if err != nil {
-			t.Fatalf("QueueSnapshotForSession: %v", err)
+		if requeueAt < 0 {
+			t.Fatalf("no requeue event carrying [launch(q-2)] in %#v", evs)
 		}
-		if len(q.Items) != 1 || q.Items[0].Content != "launch" || q.Items[0].ID != "q-2" {
-			t.Fatalf("queue after cancel abort = %#v, want [launch(q-2)]", q.Items)
+		if firstTurnStart >= 0 && requeueAt > firstTurnStart {
+			t.Fatal("a turn_start preceded the abort's requeue: the cancelled attempt launched")
 		}
-		assertQueueChangedPayloadForVersion(t, cap, q.Version, q.Items)
 
-		// The abort leaves the same residue as the other abort paths: the
-		// per-turn context is cleared, not left installed-cancelled.
+		// The rearm completed: the session is idle again, and the abort left
+		// the same residue as the other abort paths — the per-turn context is
+		// cleared, not left installed-cancelled.
+		waitSessionDrained(t, a, id)
 		rt.mu.Lock()
 		turnCtxSet := unit.turnCtx != nil
 		turnCancelSet := unit.turnCancel != nil
 		rt.mu.Unlock()
 		if turnCtxSet || turnCancelSet {
 			t.Fatal("cancel abort left the per-turn context installed")
-		}
-
-		// The unit is not wedged: the next drain launches the remainder
-		// normally.
-		rt.nudgeQueueDrainer()
-		waitSessionDrained(t, a, id)
-		if got := reqs.Load(); got != 1 {
-			t.Fatalf("model requests after re-drain = %d, want exactly 1 (the remainder launched once)", got)
 		}
 	})
 
@@ -2575,7 +2571,9 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 		// Second half: a launch refused through the real drain must not drop
 		// the final item. Seed the queue, make launchTurn refuse the handoff
 		// deterministically (lp nil returns 0 before anything is created),
-		// and drain.
+		// and drain. The rearm keeps re-draining while lp is nil — each
+		// attempt creates nothing and requeues — and the moment lp is
+		// restored the rearm launches the item exactly once.
 		before2 := unit.store.CurrentTurn()
 		turnStartsBefore := 0
 		for _, ev := range cap.snapshot() {
@@ -2609,49 +2607,25 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 			t.Fatalf("model requests after the refused launch = %d, want still 1", got)
 		}
 
-		// The final item is back on the queue with its original id, and the
-		// requeue event carries it.
-		q, err := a.QueueSnapshotForSession(id)
-		if err != nil {
-			t.Fatalf("QueueSnapshotForSession: %v", err)
-		}
-		if len(q.Items) != 1 || q.Items[0].Content != "late cancel" || q.Items[0].ID != "q-1" {
-			t.Fatalf("queue after the refused launch = %#v, want [late cancel(q-1)]", q.Items)
-		}
-		assertQueueChangedPayloadForVersion(t, cap, q.Version, q.Items)
+		// The requeue event carried the final item with its original id — the
+		// refused launch put it back the same way the other abort paths do.
+		assertQueueChangedPayloadPresent(t, cap, []QueuedItem{{ID: "q-1", Content: "late cancel"}})
 
-		// The claim was unwound: busy, the per-turn context, and the count.
-		rt.mu.Lock()
-		busy = unit.busy
-		turnCtxSet = unit.turnCtx != nil
-		turnCancelSet = unit.turnCancel != nil
-		rt.mu.Unlock()
-		if busy {
-			t.Fatal("unit still busy after the refused launch")
-		}
-		if turnCtxSet || turnCancelSet {
-			t.Fatal("unit still holds the per-turn context after the refused launch")
-		}
-		wgDone = make(chan struct{})
-		go func() {
-			rt.turnWG.Wait()
-			close(wgDone)
-		}()
-		select {
-		case <-wgDone:
-		case <-time.After(2 * time.Second):
-			t.Fatal("refused launch did not release the wait-group count")
-		}
-
-		// A later drain launches the requeued item exactly once.
+		// The abort's exit disposition re-arms the retained work on the live
+		// owner: while lp is nil every rearm attempt is refused again and
+		// requeues, and the moment lp is restored the rearm launches the item
+		// exactly once — no manual nudge required.
 		rt.mu.Lock()
 		unit.lp = savedLP
 		rt.mu.Unlock()
-		rt.nudgeQueueDrainer()
-		waitSessionDrained(t, a, id)
-		if got := reqs.Load(); got != 2 {
-			t.Fatalf("model requests after re-drain = %d, want exactly 2 (the requeued item launched once)", got)
+		rearmDeadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(rearmDeadline) && reqs.Load() != 2 {
+			time.Sleep(5 * time.Millisecond)
 		}
+		if got := reqs.Load(); got != 2 {
+			t.Fatalf("retained work never re-drained after the refused launch (model requests = %d, want 2)", got)
+		}
+		waitSessionDrained(t, a, id)
 		var liveLate int
 		for _, ev := range cap.snapshot() {
 			if ev.Kind == EventUserMessageDisplay && ev.Result == "late cancel" {
@@ -2666,12 +2640,13 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 
 // TestTurnBegunAfterRevertRendersOnceThroughHydration proves the
 // disjoint-halves guard against a reused turn number: after a combined
-// code+history revert the coordinator's committedTurn stays at the pre-revert
-// high-water, so a turn begun after the revert that reissued an old number
-// would compare a stale cursor against a reused number, keep its tail, and
-// render the turn twice — once from the durable half and once from the tail.
-// The store-level high-water keeps the new turn above every issued number, the
-// guard fires, and the hydration capture renders the turn exactly once.
+// code+history revert the coordinator's committedTurn is lowered to the
+// surviving turn (min(committedTurn, after)), so a turn begun after the revert
+// that reissued an old number would compare a stale cursor against a reused
+// number, keep its tail, and render the turn twice — once from the durable
+// half and once from the tail. The store-level high-water keeps the new turn
+// above every issued number, the guard fires, and the hydration capture
+// renders the turn exactly once.
 func TestTurnBegunAfterRevertRendersOnceThroughHydration(t *testing.T) {
 	a := newLiveCatalogBackedTestAgent(t)
 	id := a.SessionCurrent().ID
@@ -2753,6 +2728,20 @@ func assertQueueChangedPayloadForVersion(t *testing.T, cap *eventCapture, versio
 		}
 	}
 	t.Fatalf("no queue_changed event for version %d in %#v", version, cap.snapshot())
+}
+
+// assertQueueChangedPayloadPresent asserts at least one EventQueueChanged
+// carries exactly items. It is the version-free form used where the live queue
+// has already moved on (the abort's rearm re-drained it), so the requeue
+// content is proven from the ordered event log instead.
+func assertQueueChangedPayloadPresent(t *testing.T, cap *eventCapture, items []QueuedItem) {
+	t.Helper()
+	for _, ev := range cap.snapshot() {
+		if ev.Kind == EventQueueChanged && reflect.DeepEqual(ev.Queue, items) {
+			return
+		}
+	}
+	t.Fatalf("no queue_changed event carrying %#v in %#v", items, cap.snapshot())
 }
 
 // TestDeferredCleanupGuardContract pins launchTurn's deferred cleanup guard

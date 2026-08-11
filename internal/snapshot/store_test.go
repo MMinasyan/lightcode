@@ -1086,7 +1086,10 @@ func TestPrepareStagedNewSessionWindow(t *testing.T) {
 	}
 
 	// Publish succeeds, the prepared store is rebound to the final location, and
-	// reads and writes through it keep working there.
+	// reads and writes through it keep working there. The staging root is
+	// captured before the publish: after it, prepared.Root() names the final
+	// root.
+	stagingRoot := prepared.Root()
 	if err := store.PublishPreparedSession(prepared); err != nil {
 		t.Fatalf("PublishPreparedSession: %v", err)
 	}
@@ -1101,12 +1104,19 @@ func TestPrepareStagedNewSessionWindow(t *testing.T) {
 	} else if meta.ActiveAgentType != "primary" {
 		t.Fatalf("pre-publish write lost after publish: %+v", meta)
 	}
+	// PublishPreparedSession owns only the publish/relocate steps; the direct
+	// two-step caller is the cleanup owner of the now-empty staging parent.
+	if err := os.RemoveAll(stagingRoot); err != nil {
+		t.Fatal(err)
+	}
 	assertNoStagingCandidate(t, projectsRoot, projectID)
 	store.Detach()
 
 	// Half 2 — a failure between prepare and publish (the sessions root is a
-	// file, so the publish rename cannot happen) leaves the sessions root clean,
-	// drops the session state, and removes the staging candidate.
+	// file, so the publish rename cannot happen) leaves the sessions root clean
+	// and drops the session state. PublishPreparedSession performs no staging
+	// cleanup: the staging candidate remains for the direct caller's cleanup
+	// owner, which removes it here.
 	failStore := &Store{root: sessionsRoot, projectsRoot: projectsRoot, projectID: projectID}
 	if err := os.RemoveAll(sessionsRoot); err != nil {
 		t.Fatal(err)
@@ -1118,6 +1128,7 @@ func TestPrepareStagedNewSessionWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare against failing root: %v", err)
 	}
+	failStagingRoot := orphaned.Root()
 	if err := failStore.PublishPreparedSession(orphaned); err == nil {
 		t.Fatal("PublishPreparedSession should fail when the sessions root is not a directory")
 	}
@@ -1129,6 +1140,14 @@ func TestPrepareStagedNewSessionWindow(t *testing.T) {
 	}
 	if info, _ := os.Stat(sessionsRoot); info == nil || info.IsDir() {
 		t.Fatal("sessions root changed by a failed publish")
+	}
+	// The staging candidate was left in place by the failed publish: the
+	// direct caller owns its removal.
+	if _, err := os.Stat(failStagingRoot); err != nil {
+		t.Fatalf("staging candidate missing after a failed publish (PublishPreparedSession must not clean): %v", err)
+	}
+	if err := os.RemoveAll(failStagingRoot); err != nil {
+		t.Fatal(err)
 	}
 	assertNoStagingCandidate(t, projectsRoot, projectID)
 }
@@ -1816,6 +1835,138 @@ func TestPR11Closure_ForkIntoSerializesWithConcurrentMutation(t *testing.T) {
 		}
 		if got := readIntDirs(filepath.Join(fr.newDir, "turns")); !reflect.DeepEqual(got, wantTurns) {
 			t.Fatalf("forked turns = %v, want %v (Close-concurrent fork lost turns)", got, wantTurns)
+		}
+	})
+}
+
+// TestStoreCloseFailureLeavesClaimReacquirable proves Store.Close holds the
+// claim and active authority through the optional empty-directory removal and
+// always runs clearLocked before returning success or failure: when the
+// removal fails, Close returns the failure after the store is inactive and the
+// claim released, so the session claim is reacquirable — a cleanup error can
+// never retain drive authority until process exit, and the release is never
+// ordered before the deletion completes.
+func TestStoreCloseFailureLeavesClaimReacquirable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes as root")
+	}
+	projectsRoot := t.TempDir()
+	projectID := "p-close-fail"
+	sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+	store, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginNewSession(t.TempDir()); err != nil {
+		t.Fatalf("BeginNewSession: %v", err)
+	}
+	id := store.SessionID()
+	// The empty session's discard (RemoveAll of the session dir) fails when the
+	// dir is not writable; the claim lives outside the dir and is unaffected.
+	if err := os.Chmod(store.Dir(), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	discarded, closeErr := store.Close()
+	if err := os.Chmod(filepath.Join(sessionsRoot, id), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if closeErr == nil {
+		t.Fatal("Close must report the failed empty-session discard")
+	}
+	if discarded {
+		t.Fatal("discarded = true alongside a failed removal")
+	}
+	if store.Active() {
+		t.Fatal("store still active after a failed discard")
+	}
+	// The claim was released despite the cleanup failure.
+	claim, ok, err := AcquireSessionClaim(projectsRoot, projectID, id)
+	if err != nil {
+		t.Fatalf("claim check: %v", err)
+	}
+	if !ok {
+		t.Fatal("claim still held after Close's failed discard")
+	}
+	_ = claim.Release()
+	// The store is reusable for another session.
+	if err := store.BeginNewSession(t.TempDir()); err != nil {
+		t.Fatalf("reuse after failed discard: %v", err)
+	}
+	store.Detach()
+}
+
+// TestBeginNewSessionStagedOwnsStagingCleanup proves BeginNewSessionStaged is
+// the sole cleanup owner of the staging tree from the moment prepare returns:
+// a successful publish removes the now-empty staging parent with no
+// diagnostic, a pre-rename failure removes it without modifying the operation
+// error, and a prepare-internal failure is owned by PrepareStagedNewSession
+// before the wrapper runs (nothing is left to clean).
+func TestBeginNewSessionStagedOwnsStagingCleanup(t *testing.T) {
+	t.Run("success_leaves_no_staging_and_no_diagnostic", func(t *testing.T) {
+		projectsRoot := t.TempDir()
+		projectID := "p-staged-owner"
+		sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+		store, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stderr := captureStderr(t)
+		if err := store.BeginNewSessionStaged(t.TempDir()); err != nil {
+			t.Fatalf("BeginNewSessionStaged: %v", err)
+		}
+		assertNoStagingCandidate(t, projectsRoot, projectID)
+		if out := stderr(); out != "" {
+			t.Fatalf("BeginNewSessionStaged stderr = %q, want none on success", out)
+		}
+		store.Detach()
+	})
+
+	t.Run("prename_failure_removes_staging_and_returns_operation_error", func(t *testing.T) {
+		projectsRoot := t.TempDir()
+		projectID := "p-staged-owner-fail"
+		sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+		if err := os.MkdirAll(filepath.Dir(sessionsRoot), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(sessionsRoot, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		store := &Store{root: sessionsRoot, projectsRoot: projectsRoot, projectID: projectID}
+		err := store.BeginNewSessionStaged(t.TempDir())
+		if err == nil {
+			t.Fatal("BeginNewSessionStaged should fail when the sessions root is not a directory")
+		}
+		assertNoStagingCandidate(t, projectsRoot, projectID)
+		// The wrapper's cleanup succeeded, so the operation error is returned
+		// unmodified (no cleanup join).
+		if strings.Contains(err.Error(), "staging cleanup") {
+			t.Fatalf("BeginNewSessionStaged error = %q, want the plain operation error", err.Error())
+		}
+	})
+
+	t.Run("prepare_owned_failure_leaves_no_staging", func(t *testing.T) {
+		projectsRoot := t.TempDir()
+		projectID := "p-staged-owner-prep"
+		sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+		if err := os.MkdirAll(filepath.Join(projectsRoot, projectID, ".staging"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// A file where the staging sessions dir must be created makes the
+		// prepare fail before any candidate exists; the wrapper never runs.
+		if err := os.WriteFile(filepath.Join(projectsRoot, projectID, ".staging", "sessions"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		store := &Store{root: sessionsRoot, projectsRoot: projectsRoot, projectID: projectID}
+		if err := store.BeginNewSessionStaged(t.TempDir()); err == nil {
+			t.Fatal("BeginNewSessionStaged should fail when staging cannot be created")
+		}
+		if store.Active() {
+			t.Fatal("store left active after a failed staged begin")
+		}
+		// The prepare failed before any candidate existed: the blocking file is
+		// untouched and nothing else was created under .staging.
+		if info, err := os.Stat(filepath.Join(projectsRoot, projectID, ".staging", "sessions")); err != nil || info.IsDir() {
+			t.Fatalf(".staging/sessions after failed prepare = %v, %v; want the blocking file untouched", info, err)
 		}
 	})
 }

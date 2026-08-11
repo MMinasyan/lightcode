@@ -790,7 +790,7 @@ func TestRevertCodeClearsFileTrackerState(t *testing.T) {
 		t.Fatal("setup: tracker missing read state")
 	}
 
-	result, err := a.RevertCode(clickedTurn - 1)
+	result, err := a.RevertCode(clickedTurn)
 	if err != nil {
 		t.Fatalf("RevertCode error: %v", err)
 	}
@@ -811,6 +811,31 @@ func TestRevertCodeClearsFileTrackerState(t *testing.T) {
 	}
 }
 
+// TestDirectRevertCodeUsesFirstRestoredTurn pins the direct code-revert
+// convention: RevertCode(N) and RevertCodeForSession(N) take N as the first
+// restored turn, matching the shared revert_code turn action — the store keeps
+// turns up to N-1, so a file created in turn N is removed.
+func TestDirectRevertCodeUsesFirstRestoredTurn(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	path := filepath.Join(a.projectRoot, "created.txt")
+	appendUserTurn(t, a, "first")
+	clickedTurn := appendUserTurnWithSnapshot(t, a, "create file", path, "created\n")
+	id := a.SessionCurrent().ID
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected created file before revert: %v", err)
+	}
+
+	if _, err := a.RevertCodeForSession(id, clickedTurn); err != nil {
+		t.Fatalf("RevertCodeForSession: %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("file created in the first restored turn still exists; stat err=%v", err)
+	}
+}
+
 func TestRevertCodeReturnsSkippedFiles(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	if _, err := a.NewSession("", "primary"); err != nil {
@@ -827,7 +852,7 @@ func TestRevertCodeReturnsSkippedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := a.RevertCode(clickedTurn - 1)
+	result, err := a.RevertCode(clickedTurn)
 	if err != nil {
 		t.Fatalf("RevertCode: %v", err)
 	}
@@ -925,4 +950,76 @@ func waitUntilIdle(t *testing.T, a *Agent) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("agent did not become idle")
+}
+
+// TestCodeRevertPartialErrorKeepsBareResult proves a partial code-only revert
+// returns the exact restored/skipped outcome with the error and no hydrated
+// replacement payload: a code-only revert emits no boundary, and the adapters
+// discard the result (Wails, ACP) or consume only the skips (CLI). The
+// fixture makes the higher turn restore successfully and the lower turn fail:
+// the lower turn's created-file snapshot is mutated to the legacy
+// Existed:false shape (its canonical witness — the canonical_path field —
+// removed), so its delete refuses with "no canonical proof".
+func TestCodeRevertPartialErrorKeepsBareResult(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	// Turn 1 (lower): a created file whose snapshot is mutated to the legacy
+	// Existed:false shape.
+	legacyPath := filepath.Join(a.ProjectRoot(), "legacy.txt")
+	appendUserTurnWithSnapshot(t, a, "create legacy", legacyPath, "legacy\n")
+	entryDir := filepath.Join(a.store.Dir(), "snapshots", "1")
+	entries, err := os.ReadDir(entryDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("turn 1 snapshot entries = %v, %v; want exactly one", entries, err)
+	}
+	legacyEntry := filepath.Join(entryDir, entries[0].Name())
+	var meta map[string]any
+	data, err := os.ReadFile(filepath.Join(legacyEntry, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatal(err)
+	}
+	delete(meta, "canonical_path")
+	mutated, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyEntry, "meta.json"), mutated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Turn 2 (higher): a valid created-file snapshot.
+	laterPath := filepath.Join(a.ProjectRoot(), "later.txt")
+	appendUserTurnWithSnapshot(t, a, "create later", laterPath, "later\n")
+
+	result, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, 1, TurnActionRevertCode, false)
+	if err == nil {
+		t.Fatal("partial code revert reported success")
+	}
+	if !strings.Contains(err.Error(), "canonical proof") {
+		t.Fatalf("revert error = %q, want the legacy delete refusal naming the missing canonical proof", err.Error())
+	}
+	// The higher turn restored exactly; the lower turn produced no skip (its
+	// failure is an error, not a skip).
+	if len(result.RestoredFiles) != 1 || result.RestoredFiles[0] != laterPath {
+		t.Fatalf("RestoredFiles = %v, want exactly [%s]", result.RestoredFiles, laterPath)
+	}
+	if len(result.SkippedFiles) != 0 {
+		t.Fatalf("SkippedFiles = %+v, want none", result.SkippedFiles)
+	}
+	// The result is bare: no hydrated Session/Messages/Tokens replacement.
+	if result.Session.ID != "" || len(result.Messages) != 0 || len(result.Tokens.PerModel) != 0 || result.Tokens.Total.Input != 0 || result.Tokens.Total.Output != 0 {
+		t.Fatalf("partial code revert result carries a hydrated replacement: session=%q messages=%d tokens=%+v", result.Session.ID, len(result.Messages), result.Tokens)
+	}
+	// Durable outcome: the higher turn's file is removed, the lower turn's
+	// failed restore leaves its file in place.
+	if _, err := os.Stat(laterPath); !os.IsNotExist(err) {
+		t.Fatalf("later file still exists after the successful higher-turn restore: %v", err)
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("legacy file removed despite the failed lower-turn restore: %v", err)
+	}
 }

@@ -383,9 +383,7 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 	if err := childStore.BeginChildSession(t.workspaceRoot, parentSessionID); err != nil {
 		return taskResult{index: index, err: err}
 	}
-	defer func() {
-		_, _ = childStore.Close()
-	}()
+	defer closeStoreDeferred(childStore, "subagent")
 	if err := childStore.SetModel(ref.Provider, ref.Model); err != nil {
 		return taskResult{index: index, err: err}
 	}

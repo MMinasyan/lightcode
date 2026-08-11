@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 // failingDeleteMemoryHooks is a memory-hooks fake whose summary deletion
@@ -176,4 +177,62 @@ func TestPersistedOnlyDeleteSurvivesFailedClaimRelease(t *testing.T) {
 	if !strings.Contains(out, id) || !strings.Contains(out, "injected release failure") {
 		t.Fatalf("persisted-only delete stderr = %q, want the session id and the release failure", out)
 	}
+}
+
+// TestDeferredStoreCloseFailureReportsStderr proves a deferred child/compact
+// store close keeps the caller's primary result and reports the cleanup
+// failure to stderr: the store's empty-session discard fails, yet the store is
+// left inactive and its claim released, so the cleanup failure cannot retain
+// drive authority. The real deferred sites (runSubagent and the compaction
+// caller) always complete the child turn before closing, so the discard path
+// is unreachable through them; it is exercised through the same production
+// helper the deferred sites call, with a real child store.
+func TestDeferredStoreCloseFailureReportsStderr(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes as root")
+	}
+	a := newCatalogBackedTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	proj, err := a.projects.Current()
+	if err != nil || proj == nil {
+		t.Fatalf("current project: %v", err)
+	}
+	parentID := a.SessionCurrent().ID
+	childStore, err := snapshot.NewForSessionsRoot(a.projects.SessionsRoot(proj.ID), a.projects.Root(), proj.ID)
+	if err != nil {
+		t.Fatalf("child store: %v", err)
+	}
+	if err := childStore.BeginChildSession(a.ProjectRoot(), parentID); err != nil {
+		t.Fatalf("BeginChildSession: %v", err)
+	}
+	childID := childStore.SessionID()
+	// Make the empty child dir's discard fail; the claim lives outside the dir.
+	childDir := childStore.Dir()
+	if err := os.Chmod(childDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(childDir, 0o700) }()
+	stderr := captureStderr(t)
+
+	closeStoreDeferred(childStore, "subagent")
+
+	out := stderr()
+	if !strings.Contains(out, childID) || !strings.Contains(out, "subagent") {
+		t.Fatalf("deferred close stderr = %q, want the child session and the caller named", out)
+	}
+	if childStore.Active() {
+		t.Fatal("deferred close left the child store active")
+	}
+	// The claim was released despite the failed removal: a fresh store can
+	// load the child.
+	fresh, err := snapshot.NewForSessionsRoot(a.projects.SessionsRoot(proj.ID), a.projects.Root(), proj.ID)
+	if err != nil {
+		t.Fatalf("fresh store: %v", err)
+	}
+	if err := fresh.LoadSession(childID); err != nil {
+		t.Fatalf("child claim still held after the failed deferred close: %v", err)
+	}
+	fresh.Detach()
 }

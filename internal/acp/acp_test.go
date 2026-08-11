@@ -3401,6 +3401,12 @@ func newACPTestAgentAtHome(t *testing.T, baseURL string, discovery bool, home st
 }`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The agents config gives every session a resolvable live model, which the
+	// fork now requires of a driveable source (the persisted-model fallback is
+	// gone).
+	if err := os.WriteFile(filepath.Join(lightcodeDir, "agents.json"), []byte(`{"primary": {"model": "test/test-model"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := lcconfig.Load(configPath)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
