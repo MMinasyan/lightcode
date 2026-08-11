@@ -1,6 +1,8 @@
 // @vitest-environment happy-dom
 import { describe, expect, it, beforeAll, afterEach } from 'vitest';
 import { flushSync, mount, tick, unmount } from 'svelte';
+import { get } from 'svelte/store';
+import { closeViewer, viewer } from './lib/viewer.js';
 
 // The permission prompt keeps its own in-progress selection (open suggestion
 // list, chosen rules, pending save). The render site in App.svelte must rebuild
@@ -518,6 +520,161 @@ describe('App turn-action fork warning', () => {
     expect(target.querySelector('.label.session').textContent).toBe('s2');
     expect(target.querySelector('.error-msg')).toBeNull();
 
+    unmount(app);
+  });
+});
+
+describe('App ordered presentation boundaries', () => {
+  it('a buffered navigation boundary survives stale hydration success and failure', async () => {
+    // Success half: the navigation boundary for B is buffered while the
+    // hydration read (for A) is still in flight; the stale A snapshot applies
+    // first and the buffered boundary replaces it — B wins.
+    let resolveHydrate;
+    backend.HydrateSession = () => new Promise((resolve) => { resolveHydrate = resolve; });
+    let { app, target } = await mountApp();
+
+    fire('navigation', { ...navState(), session: { id: 'B' }, messages: [{ type: 'user', content: 'B row' }] });
+    await tick();
+    expect(target.querySelector('.label.session').textContent).toBe('new session');
+
+    resolveHydrate({ ...navState(), session: { id: 'A' }, messages: [{ type: 'user', content: 'A row' }] });
+    await settle();
+    expect(target.querySelector('.label.session').textContent).toBe('B');
+    expect(target.querySelector('.message.user .plain').textContent).toBe('B row');
+    unmount(app);
+
+    // Failure half: the buffered boundary is the first stateful frame, so the
+    // failed hydration discards nothing before it; the boundary seeds the
+    // view and its gate stays open for live frames after it.
+    let failHydrate;
+    backend.HydrateSession = () => new Promise((resolve, reject) => { failHydrate = reject; });
+    ({ app, target } = await mountApp());
+    fire('navigation', { ...navState(), session: { id: 'B' }, messages: [{ type: 'user', content: 'B row' }] });
+    fire('token', { seq: 2, content: 'live after B' });
+    failHydrate(new Error('session unavailable'));
+    await settle();
+
+    expect(target.querySelector('.label.session').textContent).toBe('B');
+    expect(target.querySelector('.message.user .plain').textContent).toBe('B row');
+    // The live frame after the boundary renders; partial assistant markdown is
+    // debounced, so wait out the timer before reading the text.
+    await new Promise((r) => setTimeout(r, 60));
+    expect(target.querySelector('.message.assistant')?.textContent).toContain('live after B');
+    expect((await setDraft(target, 'hello')).disabled).toBe(false);
+    unmount(app);
+  });
+
+  it('a partial history revert renders its ordered warning exactly once', async () => {
+    // The reconciled partial revert publishes the ordered turn_action frame
+    // (state + warning) first; the direct method settles after it. The
+    // changed presentation generation must drop the late rejection — the
+    // warning renders once, through the ordered frame only.
+    let rejectRevert;
+    backend.ApplyTurnAction = () => new Promise((resolve, reject) => { rejectRevert = reject; });
+    const { app, target } = await mountApp();
+
+    // A user row with a turn so the revert affordance is reachable.
+    fire('navigation', { ...navState(), messages: [{ type: 'user', content: 'hello', turn: 1 }] });
+    await tick();
+    target.querySelector('.revert-icon').click();
+    await settle();
+    [...target.querySelectorAll('.revert-menu .menu-item')].find((b) => b.textContent === 'Revert history').click();
+    await tick();
+    target.querySelector('.confirm-btn.yes').click();
+    await settle();
+
+    fire('turn_action', {
+      state: { ...navState(), session: { id: 's1' } },
+      skippedFiles: [],
+      warning: 'kept 2 files changed outside this session',
+    });
+    await tick();
+    rejectRevert(new Error('kept 2 files changed outside this session'));
+    await settle();
+
+    // Exactly one error row, and it is the frame's warning: a second renderer
+    // or an ungated promise rejection would duplicate it.
+    const errs = [...target.querySelectorAll('.error-msg')];
+    expect(errs).toHaveLength(1);
+    expect(errs[0].textContent).toContain('kept 2 files changed outside this session');
+    unmount(app);
+  });
+});
+
+describe('App child link survives navigation', () => {
+  it('a live subagent link on a parent tool row still opens the same child viewer after navigating away and back', async () => {
+    const { app, target } = await mountApp();
+
+    // Seed the transcript gate from the navigation boundary, then deliver the
+    // parent task row live: the row exists without any child association yet.
+    fire('navigation', navState());
+    await tick();
+    fire('tool_start', { seq: 2, id: 'parent-task', name: 'task', args: JSON.stringify({ tasks: [{ subagent_type: 'explore', prompt: 'find the bug' }] }) });
+    await tick();
+
+    // Without the id-keyed association the row opens no child viewer: the
+    // click is a no-op until the link exists.
+    target.querySelector('.subtask-row').click();
+    await settle();
+    expect(get(viewer)).toBeNull();
+
+    // The live subagent start folds the link into the row; the same click now
+    // opens the child viewer.
+    fire('subagent_session_start', { taskIndex: 0, sessionId: 'child-1', taskToolCallId: 'parent-task' });
+    await tick();
+    target.querySelector('.subtask-row').click();
+    await settle();
+    expect(get(viewer).sessionId).toBe('child-1');
+    expect(get(viewer).live).toBe(true);
+    closeViewer();
+
+    // Navigate away: the view is replaced wholesale and the row is gone.
+    fire('navigation', { ...navState(), session: { id: 'other' }, messages: [] });
+    await tick();
+    expect(target.querySelector('.label.session').textContent).toBe('other');
+    expect(target.querySelector('.subtask-row')).toBeNull();
+
+    // Navigate back before child completion. The authoritative live tail
+    // carries the linked in-progress tool row, so it opens the same child
+    // viewer while the child hydration read is still pending.
+    let childResolve;
+    backend.HydrateSession = () => new Promise((resolve) => { childResolve = resolve; });
+    fire('navigation', {
+      ...navState(),
+      session: { id: 's1' },
+      busy: true,
+      tail: [{
+        seq: 2,
+        message: {
+          type: 'tool',
+          id: 'parent-task',
+          name: 'task',
+          args: JSON.stringify({ tasks: [{ subagent_type: 'explore', prompt: 'find the bug' }] }),
+          done: false,
+          success: true,
+          result: '',
+          subagentSessionIds: [{ index: 0, sessionId: 'child-1' }],
+        },
+      }],
+    });
+    await tick();
+    target.querySelector('.subtask-row').click();
+    await settle();
+
+    // Before completion: the same child viewer is open and still reading.
+    const v = get(viewer);
+    expect(v.sessionId).toBe('child-1');
+    expect(v.live).toBe(true);
+    expect(v.reading).toBe(true);
+    expect(v.messages).toEqual([]);
+
+    // The read completes into that viewer.
+    childResolve({ messages: [{ type: 'assistant', content: 'child answer' }], tail: [], errors: [], cursor: { committedTurn: 1, committedSeq: 0, rewriteEpoch: 0 } });
+    await settle();
+    expect(get(viewer).messages).toEqual([{ type: 'assistant', content: 'child answer' }]);
+    expect(get(viewer).reading).toBe(false);
+
+    closeViewer();
     unmount(app);
   });
 });

@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -746,8 +748,129 @@ func TestWailsTurnActionFrameCarriesFailedRevertWarning(t *testing.T) {
 	if boundary.Warning != result.Warning {
 		t.Fatalf("turn_action frame warning = %q, want the result's warning %q", boundary.Warning, result.Warning)
 	}
+	if !reflect.DeepEqual(boundary.SkippedFiles, result.SkippedFiles) {
+		t.Fatalf("turn_action frame skipped files = %#v, want the result's %#v", boundary.SkippedFiles, result.SkippedFiles)
+	}
 	if boundary.State == nil || boundary.State.Session.ID == "" || boundary.State.Session.ID == sourceID {
 		t.Fatalf("turn_action frame must carry the fork destination's state, got %#v", boundary.State)
+	}
+}
+
+// seedAppCompleteTurns persists n complete turns, one user message each,
+// through the owner's public append route: the dead model URL fails the model
+// call, but the user turn is durably persisted, so a history revert has turns
+// to walk.
+func seedAppCompleteTurns(t *testing.T, ag *agent.Agent, n int) string {
+	t.Helper()
+	id := ag.SessionCurrent().ID
+	if id == "" {
+		var err error
+		id, err = ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+	}
+	for i := 1; i <= n; i++ {
+		if _, err := ag.AppendUserMessageToSession(id, fmt.Sprintf("turn %d", i)); err != nil {
+			t.Fatalf("append turn %d: %v", i, err)
+		}
+	}
+	return id
+}
+
+// blockAppTurnDir makes one turn directory's removal fail: an unwritable
+// directory blocks os.RemoveAll exactly there, so the descending history walk
+// stops at it.
+func blockAppTurnDir(t *testing.T, ag *agent.Agent, turn int) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes as root")
+	}
+	blocked := filepath.Join(ag.Store().Dir(), "turns", strconv.Itoa(turn))
+	if err := os.Chmod(blocked, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o700) })
+}
+
+// TestWailsPartialRevertDisposition proves the ApplyTurnAction route resolves
+// a reconciled partial history revert as success: the walk removed some turns,
+// published the surviving state as an ordered turn_action frame, and rode the
+// failure onto the frame as the warning. The direct method must not also
+// reject — the frontend would then render the error twice, once from the frame
+// and once from the promise.
+func TestWailsPartialRevertDisposition(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes as root")
+	}
+	ag := newAppTestAgent(t)
+	app := &App{svc: ag, agent: ag}
+	log := &wailsFrameLog{}
+	app.emitFn = log.append
+	app.startup(context.Background())
+	id := seedAppCompleteTurns(t, ag, 5)
+	// Reverting to turn 4 removes turns 4 and 5; blocking turn 4 makes the
+	// walk stop there — a partial failure whose history changed, so the
+	// revert reconciles and publishes the boundary.
+	blockAppTurnDir(t, ag, 4)
+
+	result, err := app.ApplyTurnAction(4, agent.TurnActionRevertHistory, false)
+	if err != nil {
+		t.Fatalf("ApplyTurnAction on a reconciled partial revert = %v, want success: the emitted frame owns the error", err)
+	}
+	if result.Warning == "" || !strings.Contains(result.Warning, "turn 4") {
+		t.Fatalf("result.Warning = %q, want the walk error naming turn 4", result.Warning)
+	}
+
+	frame := waitForWailsFrame(t, log, "turn_action")
+	boundary, ok := frame.(turnActionBoundary)
+	if !ok {
+		t.Fatalf("turn_action frame payload is %T, want turnActionBoundary: %#v", frame, frame)
+	}
+	if boundary.Warning != result.Warning {
+		t.Fatalf("frame warning = %q, want the result's %q", boundary.Warning, result.Warning)
+	}
+	if boundary.State == nil || boundary.State.Session.ID != id {
+		t.Fatalf("frame state = %#v, want the surviving session %q", boundary.State, id)
+	}
+	if c := userContents(boundary.State.Messages); !equalStrings(c, []string{"turn 1", "turn 2", "turn 3", "turn 4"}) {
+		t.Fatalf("frame state messages = %q, want turns 1-4 (the blocked turn survives)", c)
+	}
+}
+
+// TestWailsRevertHistoryPartialDisposition proves the exported RevertHistory
+// alias follows the same disposition: a reconciled partial revert returns nil
+// because the ordered turn_action frame owns the error, so the direct binding
+// call cannot render a second error.
+func TestWailsRevertHistoryPartialDisposition(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes as root")
+	}
+	ag := newAppTestAgent(t)
+	app := &App{svc: ag, agent: ag}
+	log := &wailsFrameLog{}
+	app.emitFn = log.append
+	app.startup(context.Background())
+	id := seedAppCompleteTurns(t, ag, 5)
+	blockAppTurnDir(t, ag, 4)
+
+	if err := app.RevertHistory(4); err != nil {
+		t.Fatalf("RevertHistory on a reconciled partial revert = %v, want nil: the emitted frame owns the error", err)
+	}
+
+	frame := waitForWailsFrame(t, log, "turn_action")
+	boundary, ok := frame.(turnActionBoundary)
+	if !ok {
+		t.Fatalf("turn_action frame payload is %T, want turnActionBoundary: %#v", frame, frame)
+	}
+	if boundary.State == nil || boundary.State.Session.ID != id {
+		t.Fatalf("frame state = %#v, want the surviving session %q", boundary.State, id)
+	}
+	if !strings.Contains(boundary.Warning, "turn 4") {
+		t.Fatalf("frame warning = %q, want the walk error naming turn 4", boundary.Warning)
+	}
+	if c := userContents(boundary.State.Messages); !equalStrings(c, []string{"turn 1", "turn 2", "turn 3", "turn 4"}) {
+		t.Fatalf("frame state messages = %q, want turns 1-4 (the blocked turn survives)", c)
 	}
 }
 

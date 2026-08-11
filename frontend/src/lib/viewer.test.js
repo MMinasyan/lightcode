@@ -28,13 +28,13 @@ describe('viewer store', () => {
 
   it('opens live subagent viewers', () => {
     const generation = openSubagentViewer('Explore', 'session-1');
-    expect(get(viewer)).toEqual({ title: 'Explore', sessionId: 'session-1', live: true, generation, messages: [] });
+    expect(get(viewer)).toEqual({ title: 'Explore', sessionId: 'session-1', live: true, generation, gate: { highWater: 0 }, reading: true, pending: [], messages: [] });
   });
 
   it('opens subagent viewers with persisted messages', () => {
     const messages = [{ type: 'assistant', content: 'done' }];
     const generation = openSubagentViewer('Explore', 'session-1', messages);
-    expect(get(viewer)).toEqual({ title: 'Explore', sessionId: 'session-1', live: true, generation, messages });
+    expect(get(viewer)).toEqual({ title: 'Explore', sessionId: 'session-1', live: true, generation, gate: { highWater: 0 }, reading: true, pending: [], messages });
   });
 
   it('hydrates the matching live subagent viewer with a state snapshot', () => {
@@ -361,5 +361,48 @@ describe('child stream lifecycle', () => {
     // own high-water still streams, where a stale-seeded gate would drop it.
     appendSubagentEvent('session-1', { type: 'token', seq: 3, content: ' still here' });
     expect(get(viewer).messages).toEqual([{ type: 'assistant', content: 'live still here', partial: true, seq: 3 }]);
+  });
+
+  // The gate and the pending buffer live on the viewer object itself, not in
+  // module-level per-session maps: a fresh open owns its own gate, read
+  // window, and buffer; buffered frames live on that object; closing drops
+  // the object with them; and a new open owns distinct objects/arrays with no
+  // old pending state. This fails against the module-map design, which keeps
+  // the state off the object entirely (no gate/reading/pending fields and no
+  // per-open identity).
+  it('owns the child stream state on the viewer object itself', () => {
+    // A fresh open owns its own gate, read window, and buffer.
+    const firstGen = openSubagentViewer('Explore', 'session-1');
+    const first = get(viewer);
+    expect(first.gate).toEqual({ highWater: 0 });
+    expect(first.reading).toBe(true);
+    expect(first.pending).toEqual([]);
+
+    // Buffered frames live on that object: the same viewer object carries
+    // them in its own pending array while the read is in flight.
+    appendSubagentEvent('session-1', { type: 'token', seq: 2, content: 'buffered' });
+    const buffered = get(viewer);
+    expect(buffered.pending).toEqual([{ type: 'token', seq: 2, content: 'buffered' }]);
+    expect(buffered.messages).toEqual([{ type: 'assistant', content: 'buffered', partial: true, seq: 2 }]);
+
+    // Close drops the object; the old gate and buffer go with it.
+    closeViewer();
+    expect(get(viewer)).toBeNull();
+
+    // A new open owns distinct objects and arrays, with no old pending state.
+    const secondGen = openSubagentViewer('Explore', 'session-1');
+    const second = get(viewer);
+    expect(secondGen).toBe(firstGen + 1);
+    expect(second.gate).not.toBe(first.gate);
+    expect(second.pending).not.toBe(buffered.pending);
+    expect(second.reading).toBe(true);
+    expect(second.pending).toEqual([]);
+    expect(second.messages).toEqual([]);
+
+    // The new open's own buffer takes its own frames; the old buffered frame
+    // never reappears.
+    appendSubagentEvent('session-1', { type: 'token', seq: 1, content: 'fresh' });
+    expect(get(viewer).pending).toEqual([{ type: 'token', seq: 1, content: 'fresh' }]);
+    expect(get(viewer).messages).toEqual([{ type: 'assistant', content: 'fresh', partial: true, seq: 1 }]);
   });
 });

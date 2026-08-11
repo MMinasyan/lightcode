@@ -1655,21 +1655,29 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 			unit.seenSessions = make(map[string]bool)
 		}
 		isNew = tev.SessionID != "" && !unit.seenSessions[tev.SessionID]
-		if isNew {
-			unit.seenSessions[tev.SessionID] = true
-		}
 	}
 	rt.mu.Unlock()
 	if isNew {
-		a.emitEvent(Event{
-			SessionID:         tev.SessionID,
-			ParentSessionID:   tev.ParentSessionID,
-			ProjectID:         tev.ProjectID,
-			Kind:              EventSubagentStart,
-			SubagentSessionID: tev.SessionID,
-			TaskIndex:         tev.TaskIndex,
-			ToolCallID:        tev.ToolCallID,
-		})
+		// A new child's start folds into the parent's already-sequenced tool
+		// row, so the row must exist before the start is emitted. Production
+		// ordering guarantees it: the blocking parent ToolCallStart send
+		// precedes any tagged child event, so the row is already in the
+		// coordinator or its event remains in rt.loopEvents. Consume pending
+		// root events until the row exists. A direct-injection tagged child
+		// with no row and an empty root queue is an invariant violation: emit
+		// and retain no EventSubagentStart and no id-keyed association, keep
+		// the child unmarked so a later event retries once the row exists, and
+		// continue dispatching the child event itself below.
+		if rt.foldSubagentStartIntoParent(tev) {
+			rt.mu.Lock()
+			if u := a.sessions[tev.ParentSessionID]; u != nil {
+				if u.seenSessions == nil {
+					u.seenSessions = make(map[string]bool)
+				}
+				u.seenSessions[tev.SessionID] = true
+			}
+			rt.mu.Unlock()
+		}
 	}
 
 	ev := tev.Event
@@ -1749,6 +1757,48 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 		return
 	default:
 		return
+	}
+}
+
+// foldSubagentStartIntoParent makes the parent tool-start row exist before a
+// new child's start is published: it consumes root events still queued in
+// rt.loopEvents until the matching tool row exists, folds the child
+// association into the row idempotently without changing its sequence, and
+// emits EventSubagentStart in the same seqMu section, so no capture or
+// boundary interleaves between the row update and the control frame. It
+// reports whether the association was published. A direct-injection tagged
+// child whose parent row never exists and whose root queue is empty is an
+// invariant violation: nothing is emitted or retained and the caller still
+// dispatches the child event itself.
+func (rt *runtime) foldSubagentStartIntoParent(tev TaggedLoopEvent) bool {
+	a := rt.agent
+	tr := a.transcriptForSessionID(tev.ParentSessionID)
+	if tr == nil {
+		return false
+	}
+	link := SubagentSessionLink{Index: tev.TaskIndex, SessionID: tev.SessionID}
+	for {
+		tr.seqMu.Lock()
+		if tr.foldSubagentAssociationLocked(tev.ToolCallID, link) {
+			a.emitEvent(Event{
+				SessionID:         tev.SessionID,
+				ParentSessionID:   tev.ParentSessionID,
+				ProjectID:         tev.ProjectID,
+				Kind:              EventSubagentStart,
+				SubagentSessionID: tev.SessionID,
+				TaskIndex:         tev.TaskIndex,
+				ToolCallID:        tev.ToolCallID,
+			})
+			tr.seqMu.Unlock()
+			return true
+		}
+		tr.seqMu.Unlock()
+		select {
+		case ev := <-rt.loopEvents:
+			rt.dispatchLoopEvent(ev)
+		default:
+			return false
+		}
 	}
 }
 

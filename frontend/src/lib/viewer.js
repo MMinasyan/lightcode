@@ -2,7 +2,7 @@ import { writable } from 'svelte/store';
 import { admitSequenced, snapshotHighWater, snapshotMessages } from './hydration.js';
 
 // viewer holds the currently displayed full-screen content.
-// Shape: { title, content } | { title, editPreview, hunks } | { title, sessionId, live, generation, messages } | null
+// Shape: { title, content } | { title, editPreview, hunks } | { title, sessionId, live, generation, gate, reading, pending, messages } | null
 export const viewer = writable(null);
 
 // nextSubagentGeneration numbers every open of a child viewer. Each open
@@ -11,28 +11,6 @@ export const viewer = writable(null);
 // the same child can be told apart from the newer open's own read: the id
 // alone no longer identifies the open.
 let nextSubagentGeneration = 0;
-
-// childGates holds one transcript gate per child session id, seeded from the
-// cursor delivered with the child's snapshot and advanced by every admitted
-// sequenced frame. It is a map, not a per-open value, so a child's gate stays
-// consistent across opens and switches while its run is in flight.
-const childGates = new Map();
-
-function gateFor(sessionId) {
-  let gate = childGates.get(sessionId);
-  if (!gate) {
-    gate = { highWater: 0 };
-    childGates.set(sessionId, gate);
-  }
-  return gate;
-}
-
-// pendingFrames holds, per child session, the frames received while a
-// hydration read is in flight (between opening the viewer and applying its
-// snapshot). They are replayed on top of the snapshot at apply time, each by
-// its own kind's rules, so nothing delivered during the read is lost when the
-// snapshot replaces the state.
-const pendingFrames = new Map();
 
 export function openViewer(title, content) {
   viewer.set({ title, content });
@@ -48,10 +26,20 @@ export function openSubagentViewer(title, sessionId, messages = []) {
   // hydration read that follows re-seeds the gate from the snapshot's cursor.
   // The generation tags this open; the caller passes it back with the
   // hydration result so an earlier open's read cannot resolve into this one.
+  // The gate and the pending buffer live on the viewer object itself, so
+  // closing or replacing the viewer drops them with it: an abandoned read can
+  // never reach a newer open's gate or replay into its buffer.
   const generation = ++nextSubagentGeneration;
-  childGates.delete(sessionId);
-  pendingFrames.set(sessionId, []);
-  viewer.set({ title, sessionId, live: true, generation, messages: messages || [] });
+  viewer.set({
+    title,
+    sessionId,
+    live: true,
+    generation,
+    gate: { highWater: 0 },
+    reading: true,
+    pending: [],
+    messages: messages || [],
+  });
   return generation;
 }
 
@@ -65,12 +53,13 @@ export function openSubagentViewer(title, sessionId, messages = []) {
 // in place without advancing the sequence, so the gate cannot protect them).
 // generation is the value openSubagentViewer returned for the open this read
 // belongs to; when the viewer was closed and reopened for the same child in
-// the meantime, the read is stale and applies nothing.
+// the meantime, the read is stale and applies nothing — the object it would
+// have mutated is gone, so it cannot reach the newer viewer's gate or buffer.
 export function hydrateSubagentViewer(sessionId, state, generation) {
   viewer.update(v => {
     if (!v || !v.live || v.sessionId !== sessionId) return v;
     if (v.generation !== generation) return v;
-    const gate = gateFor(sessionId);
+    const gate = v.gate;
     gate.highWater = snapshotHighWater(state || {});
     const messages = snapshotMessages(state || {});
     // A live child's retained tail holds the current turn's rows and the
@@ -81,13 +70,11 @@ export function hydrateSubagentViewer(sessionId, state, generation) {
     if (state?.tail?.length > 0 && messages.length > 0 && messages[messages.length - 1].type === 'assistant') {
       messages[messages.length - 1] = { ...messages[messages.length - 1], partial: true };
     }
-    const pending = pendingFrames.get(sessionId) || [];
-    pendingFrames.delete(sessionId);
     let out = messages;
-    for (const frame of pending) {
+    for (const frame of v.pending) {
       out = applyFrame(out, frame, gate);
     }
-    return { ...v, messages: out };
+    return { ...v, reading: false, pending: [], messages: out };
   });
 }
 
@@ -161,9 +148,11 @@ function applyFrame(messages, event, gate) {
 export function appendSubagentEvent(sessionId, event) {
   viewer.update(v => {
     if (!v || !v.live || v.sessionId !== sessionId) return v;
-    const pending = pendingFrames.get(sessionId);
-    if (pending) pending.push(event);
-    return { ...v, messages: applyFrame(v.messages, event, gateFor(sessionId)) };
+    // Frames delivered while the hydration read is in flight are buffered on
+    // this viewer object for replay at apply time; once the read completes,
+    // nothing more buffers.
+    const pending = v.reading ? [...v.pending, event] : v.pending;
+    return { ...v, pending, messages: applyFrame(v.messages, event, v.gate) };
   });
 }
 

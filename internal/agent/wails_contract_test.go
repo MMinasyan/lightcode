@@ -153,18 +153,33 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 // commits routing and appends a turn_action boundary (never a legacy
 // session_changed or navigation frame), and the frontend's turn_action handler
 // applies the snapshot before the skip notice so the two land atomically; the
-// handlers apply nothing out of band.
+// handlers apply nothing out of band. A reconciled postcommit partial error
+// resolves the direct method: the wrapper records synchronously whether the
+// boundary callback emitted and treats the error as frame-owned when it did.
 func TestTurnActionAppliesDestinationStateThroughOrderedBoundary(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
-	body, ok := extractSvelteFunctionBody(app, "func (a *App) ApplyTurnAction(")
+	body, ok := extractSvelteFunctionBody(app, "func (a *App) applyTurnActionWithOwnedBoundary(")
 	if !ok {
-		t.Fatal("ApplyTurnAction not found in app.go")
+		t.Fatal("applyTurnActionWithOwnedBoundary not found in app.go")
 	}
-	if !strings.Contains(body, "ApplyTurnActionForSessionWithBoundary") || !strings.Contains(body, "turnActionBoundaryEmit") {
-		t.Fatal("ApplyTurnAction must publish the turn_action boundary in-commit through turnActionBoundaryEmit")
+	if !strings.Contains(body, "ApplyTurnActionForSessionWithBoundary") {
+		t.Fatal("the turn-action wrapper must publish through the shared ApplyTurnActionForSessionWithBoundary route")
+	}
+	if !strings.Contains(body, "emitted = true") {
+		t.Fatal("the turn-action wrapper must record synchronously whether the owner boundary callback emitted")
+	}
+	if !strings.Contains(body, "err != nil && emitted") {
+		t.Fatal("the turn-action wrapper must resolve a postcommit error as frame-owned (the boundary owns the error through its warning)")
 	}
 	if strings.Contains(body, "emitSessionChanged") || strings.Contains(body, "emitNavigationBoundary") {
 		t.Fatal("ApplyTurnAction must not emit a legacy session_changed or navigation frame")
+	}
+	applyBody, ok := extractSvelteFunctionBody(app, "func (a *App) ApplyTurnAction(")
+	if !ok {
+		t.Fatal("ApplyTurnAction not found in app.go")
+	}
+	if !strings.Contains(applyBody, "applyTurnActionWithOwnedBoundary(") {
+		t.Fatal("ApplyTurnAction must route through the frame-owning wrapper")
 	}
 
 	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
@@ -211,12 +226,13 @@ func TestTurnActionAppliesDestinationStateThroughOrderedBoundary(t *testing.T) {
 // populated result alongside the error, and the CLI prints the skipped set
 // before returning. A branch that returns before the action is invoked — the
 // confirmation-read abort for the exiting-terminal case — has no result to
-// render and is not in this scan's scope. The desktop host cannot receive a
-// result on a failing call at all — its binding layer attaches the return
-// value only on success, and that layer is vendored — and the protocol host
-// answers with an error string. Both therefore surface the enriched error
-// text naming where the revert stopped, not the skipped set, and no plumbing
-// exists to carry the skipped set to them.
+// render and is not in this scan's scope. A precommit desktop failure carries
+// the enriched error text naming where the revert stopped: the binding layer
+// attaches the return value only on success, and the frontend renders the
+// enriched text from the rejection. A reconciled postcommit partial error no
+// longer rejects on the desktop at all — the wrapper resolves it because the
+// ordered turn_action frame owns the error through its warning — so no second
+// renderer exists and the frame's warning is the single copy.
 func TestAdapterRevertOutcomeContract(t *testing.T) {
 	menu := mustReadContractFile(t, filepath.Join("..", "cli", "menu.go"))
 	for _, action := range []string{`"code"`, `"history"`, `"fork"`} {
@@ -276,7 +292,9 @@ func TestAdapterRevertOutcomeContract(t *testing.T) {
 // updates the selector through an ordered, presentation-scoped item, not an
 // out-of-band immediate update: SwitchModel appends a model item to the FIFO, the
 // frontend applies it only when its root is the presented session, and the switch
-// handler never sets the model itself.
+// handler never sets the model itself — it only invokes the switch against the
+// captured session/generation and closes the picker (or shows the error) when
+// both still match.
 func TestWailsModelSwitchAppendsOrderedPresentationItem(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
 	body, ok := extractSvelteFunctionBody(app, "func (a *App) SwitchModel(")
@@ -299,12 +317,18 @@ func TestWailsModelSwitchAppendsOrderedPresentationItem(t *testing.T) {
 		t.Fatal("model handler must update the selector from the ordered item")
 	}
 
-	switched, ok := extractSvelteFunctionBody(svelte, "function handleModelSwitched(")
+	switched, ok := extractSvelteFunctionBody(svelte, "async function handleModelSelect(")
 	if !ok {
-		t.Fatal("handleModelSwitched not found in App.svelte")
+		t.Fatal("handleModelSelect not found in App.svelte")
 	}
 	if strings.Contains(switched, "modelRef =") {
-		t.Fatal("handleModelSwitched must not set the model out of band; the ordered item does")
+		t.Fatal("handleModelSelect must not set the model out of band; the ordered item does")
+	}
+	if !strings.Contains(switched, "await SwitchModel(") {
+		t.Fatal("handleModelSelect must invoke the switch through the backend entry point")
+	}
+	if !strings.Contains(switched, "presentationGeneration !== opGen") {
+		t.Fatal("handleModelSelect must gate closing the picker and showing errors on the captured session and generation")
 	}
 }
 
@@ -540,14 +564,25 @@ func TestFrontendUserAndSystemTranscriptEntriesArriveViaBackendEvents(t *testing
 
 func TestWailsSubagentTaskLinksAreOrderIndependent(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
-	for _, want := range []string{
+	// The backend folds the child association into the parent's tool row before
+	// emitting the start frame, so the frontend keeps no pending-link storage or
+	// module-level link authority: the row exists by the time the id-keyed
+	// update arrives.
+	for _, forbidden := range []string{
 		"pendingSubagentSessionLinks",
-		"rememberSubagentLink(pendingSubagentSessionLinks, data.taskToolCallId",
-		"takePendingSubagentLinks(pendingSubagentSessionLinks, data.id",
+		"rememberSubagentLink",
+		"takePendingSubagentLinks",
+	} {
+		if strings.Contains(app, forbidden) {
+			t.Fatalf("App.svelte must not keep pending subagent-link storage %q; the backend folds the association into the tool row before the start frame", forbidden)
+		}
+	}
+	for _, want := range []string{
 		"subagentLinksFromMetadata(metadata)",
+		"mergeSubagentLinks(m.subagentSessionIds, [link])",
 	} {
 		if !strings.Contains(app, want) {
-			t.Fatalf("App.svelte missing subagent task-link ordering guard %q", want)
+			t.Fatalf("App.svelte missing subagent task-link path %q", want)
 		}
 	}
 
@@ -556,6 +591,9 @@ func TestWailsSubagentTaskLinksAreOrderIndependent(t *testing.T) {
 		if !strings.Contains(helpers, want) {
 			t.Fatalf("subagentLinks.js missing metadata recovery path %q", want)
 		}
+	}
+	if strings.Contains(helpers, "rememberSubagentLink") || strings.Contains(helpers, "takePendingSubagentLinks") {
+		t.Fatal("subagentLinks.js must not keep pending-link helpers; the backend owns the association")
 	}
 }
 

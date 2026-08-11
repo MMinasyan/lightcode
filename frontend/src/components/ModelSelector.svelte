@@ -1,5 +1,5 @@
 <script>
-  import { ModelList, SwitchModel } from '../../wailsjs/go/main/App';
+  import { ModelList } from '../../wailsjs/go/main/App';
   import { createEventDispatcher, onMount } from 'svelte';
   import { errorText } from '../lib/errors.js';
   import { groupByProvider } from '../lib/format.js';
@@ -28,9 +28,11 @@
     );
   }
 
-  async function select(entry) {
-    try { await SwitchModel(entry.ref); dispatch('switched', { ref: entry.ref, displayName: entry.displayName || entry.model || entry.ref }); }
-    catch (e) { dispatch('error', errorText(e)); }
+  // The selector only names the choice; App.svelte invokes the switch against
+  // the session/generation captured at click time and closes the picker or
+  // shows the error only while that view is still presented.
+  function select(entry) {
+    dispatch('select', { ref: entry.ref, displayName: entry.displayName || entry.model || entry.ref });
   }
 
   function isActive(entry) { return entry.ref === currentRef; }

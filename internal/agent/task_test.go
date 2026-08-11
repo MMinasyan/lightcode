@@ -156,14 +156,81 @@ func TestDrainPendingLoopEventsDrainsTaggedSubagentEvents(t *testing.T) {
 	}
 	a.drainPendingLoopEvents()
 
-	if len(got) != 2 {
-		t.Fatalf("events = %#v, want subagent start and tool start", got)
+	// Direct injection with no parent tool-start row and an empty root queue:
+	// an invariant violation. No EventSubagentStart and no id-keyed
+	// association may be emitted or retained; the child event itself still
+	// dispatches.
+	if len(got) != 1 {
+		t.Fatalf("events = %#v, want only the child tool start (no association for a rowless parent)", got)
 	}
-	if got[0].Kind != EventSubagentStart || got[0].SubagentSessionID != "child-session" || got[0].ParentSessionID != "parent-session" || got[0].ProjectID != "project-a" {
-		t.Fatalf("event[0] = %+v, want subagent start", got[0])
+	if got[0].Kind != EventToolCallStart || got[0].SubagentSessionID != "child-session" || got[0].ParentSessionID != "parent-session" || got[0].ProjectID != "project-a" || got[0].ToolCallID != "child-tool" {
+		t.Fatalf("event[0] = %+v, want child tool start", got[0])
 	}
-	if got[1].Kind != EventToolCallStart || got[1].SubagentSessionID != "child-session" || got[1].ParentSessionID != "parent-session" || got[1].ProjectID != "project-a" || got[1].ToolCallID != "child-tool" {
-		t.Fatalf("event[1] = %+v, want child tool start", got[1])
+}
+
+// TestDrainQueuedParentToolStartBeforeTaggedChildStart proves the production
+// ordering the association depends on: the parent's ToolCallStart is queued in
+// rt.loopEvents ahead of the child's tagged events, and the drainer consumes
+// the root event before the first tagged dispatch so the child association
+// folds into the already-sequenced row. The row keeps its identity and its
+// original sequence, and the control frame follows in the same section.
+func TestDrainQueuedParentToolStartBeforeTaggedChildStart(t *testing.T) {
+	a := &Agent{}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	a.ensureSessionMapLocked()
+	parentUnit := &session{rt: rt}
+	a.sessions["parent-session"] = parentUnit
+	rt.mu.Unlock()
+	rt.registerTranscript("parent-session", nil)
+	rt.loopEvents = make(chan loop.Event, 2)
+	rt.taggedEvents = make(chan TaggedLoopEvent, 2)
+	var got []Event
+	a.SetEventHandler(func(ev Event) {
+		got = append(got, ev)
+	})
+
+	rt.loopEvents <- loop.Event{Kind: loop.ToolCallStart, SessionID: "parent-session", ProjectID: "project-a", ToolCallID: "parent-task", ToolName: "task"}
+	rt.taggedEvents <- TaggedLoopEvent{
+		SessionID:       "child-session",
+		ParentSessionID: "parent-session",
+		ProjectID:       "project-a",
+		TaskIndex:       1,
+		ToolCallID:      "parent-task",
+		Event:           loop.Event{Kind: loop.ToolCallStart, ToolCallID: "child-tool", ToolName: "read_file"},
+	}
+	a.drainPendingLoopEvents()
+
+	// Parent tool start, then the child start carrying the association, then
+	// the child tool start.
+	if len(got) != 3 {
+		t.Fatalf("events = %#v, want parent tool start, child start, child tool start", got)
+	}
+	if got[0].Kind != EventToolCallStart || got[0].SessionID != "parent-session" || got[0].ToolCallID != "parent-task" {
+		t.Fatalf("event[0] = %+v, want the parent tool start", got[0])
+	}
+	if got[1].Kind != EventSubagentStart || got[1].SubagentSessionID != "child-session" || got[1].ParentSessionID != "parent-session" || got[1].ToolCallID != "parent-task" || got[1].TaskIndex != 1 {
+		t.Fatalf("event[1] = %+v, want the child start carrying the parent association", got[1])
+	}
+	if got[2].Kind != EventToolCallStart || got[2].SubagentSessionID != "child-session" || got[2].ToolCallID != "child-tool" {
+		t.Fatalf("event[2] = %+v, want the child tool start", got[2])
+	}
+
+	// The association folded into the parent's existing row: the same row at
+	// its original sequence, with the child link attached idempotently.
+	tr := rt.transcriptForSessionID("parent-session")
+	tr.seqMu.Lock()
+	defer tr.seqMu.Unlock()
+	if len(tr.tail) != 1 {
+		t.Fatalf("parent tail = %#v, want exactly the one tool row", tr.tail)
+	}
+	row := tr.tail[0]
+	if row.msg.ID != "parent-task" || row.seq != 1 {
+		t.Fatalf("parent row = %+v, want the task row unchanged at its original sequence", row)
+	}
+	want := []SubagentSessionLink{{Index: 1, SessionID: "child-session"}}
+	if !reflect.DeepEqual(row.msg.SubagentSessionIDs, want) {
+		t.Fatalf("row links = %#v, want %#v", row.msg.SubagentSessionIDs, want)
 	}
 }
 

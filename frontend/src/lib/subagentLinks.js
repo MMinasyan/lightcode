@@ -28,21 +28,3 @@ export function mergeSubagentLinks(...groups) {
   }
   return merged;
 }
-
-export function rememberSubagentLink(pending, taskToolCallId, link) {
-  if (!taskToolCallId || !link?.sessionId || !Number.isFinite(Number(link.index))) {
-    return pending || {};
-  }
-  return {
-    ...(pending || {}),
-    [taskToolCallId]: mergeSubagentLinks((pending || {})[taskToolCallId], [link]),
-  };
-}
-
-export function takePendingSubagentLinks(pending, taskToolCallId) {
-  const links = (pending || {})[taskToolCallId] || [];
-  if (links.length === 0) return { links: [], pending: pending || {} };
-  const next = { ...(pending || {}) };
-  delete next[taskToolCallId];
-  return { links, pending: next };
-}

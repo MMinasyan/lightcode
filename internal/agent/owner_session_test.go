@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -1751,10 +1752,27 @@ func TestTaggedEventDedupByParent(t *testing.T) {
 		}
 	})
 
+	// Feed the parent's real task tool-start row first: production ordering
+	// guarantees the blocking parent ToolCallStart send precedes any tagged
+	// child event, so the row exists before the child start folds into it.
+	a.dispatchLoopEvent(loop.Event{Kind: loop.ToolCallStart, SessionID: firstID, ProjectID: a.session.projectID, ToolCallID: "parent-task", ToolName: "task"})
+	tr := a.transcriptForSessionID(firstID)
+	if tr == nil {
+		t.Fatal("no live coordinator for the parent session")
+	}
+	tr.seqMu.Lock()
+	if len(tr.tail) != 1 || tr.tail[0].msg.ID != "parent-task" {
+		tr.seqMu.Unlock()
+		t.Fatalf("parent tool row = %#v, want exactly the task row", tr.tail)
+	}
+	originalSeq := tr.tail[0].seq
+	tr.seqMu.Unlock()
+
 	tev := TaggedLoopEvent{
 		SessionID:       "child-session",
 		ParentSessionID: firstID,
 		ProjectID:       a.session.projectID,
+		ToolCallID:      "parent-task",
 		Event:           loop.Event{Kind: loop.TextDelta, Result: "child output"},
 	}
 	a.dispatchTaggedEvent(tev)
@@ -1765,6 +1783,20 @@ func TestTaggedEventDedupByParent(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("first tagged child event did not emit subagent_start")
+	}
+
+	// The association folded into the original row: same row, same sequence,
+	// the child link attached idempotently.
+	tr.seqMu.Lock()
+	if len(tr.tail) != 1 || tr.tail[0].seq != originalSeq || tr.tail[0].msg.ID != "parent-task" {
+		tr.seqMu.Unlock()
+		t.Fatalf("parent row after fold = %+v, want the task row unchanged at its original sequence", tr.tail)
+	}
+	folded := append([]SubagentSessionLink(nil), tr.tail[0].msg.SubagentSessionIDs...)
+	tr.seqMu.Unlock()
+	want := []SubagentSessionLink{{Index: 0, SessionID: "child-session"}}
+	if !reflect.DeepEqual(folded, want) {
+		t.Fatalf("folded links = %#v, want %#v", folded, want)
 	}
 
 	a.ensureRuntime().mu.Lock()

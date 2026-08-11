@@ -147,6 +147,27 @@ func (t *transcript) appendRowLocked(msg DisplayMessage) int {
 	return seq
 }
 
+// foldSubagentAssociationLocked attaches a new child session's start to the
+// matching tool row idempotently, without changing the row's sequence, and
+// reports whether the row exists. It scans from the tail end, matching the
+// last-end-wins rule of EventToolCallEnd. The caller holds seqMu.
+func (t *transcript) foldSubagentAssociationLocked(toolCallID string, link SubagentSessionLink) bool {
+	for i := len(t.tail) - 1; i >= 0; i-- {
+		r := &t.tail[i]
+		if r.msg.Type != "tool" || r.msg.ID != toolCallID {
+			continue
+		}
+		for _, existing := range r.msg.SubagentSessionIDs {
+			if existing.Index == link.Index && existing.SessionID == link.SessionID {
+				return true
+			}
+		}
+		r.msg.SubagentSessionIDs = append(r.msg.SubagentSessionIDs, link)
+		return true
+	}
+	return false
+}
+
 // commitLocked records that turn is durably persisted. The just-completed turn's
 // rows become readable from durable history, so the tail is cleared and the
 // committed markers advance to the current high-water. Sequence stays monotonic.

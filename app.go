@@ -958,6 +958,27 @@ func (a *App) turnActionBoundaryEmit() func(agent.HydrationState, []snapshot.Ski
 	}
 }
 
+// applyTurnActionWithOwnedBoundary runs a turn action through the owner's
+// in-commit boundary callback and records synchronously whether the callback
+// emitted. A postcommit partial error — a reconciled history revert whose walk
+// failed after the boundary published the survivors — then resolves the method
+// as success: the ordered turn_action frame owns the error through its warning,
+// and a second, unowned direct error would duplicate it in the frontend. A
+// precommit error emits no frame and still rejects/returns; the typed return
+// error is kept for the ACP/CLI disposition.
+func (a *App) applyTurnActionWithOwnedBoundary(sessionID string, turn int, action string, alsoRevertCode bool) (agent.TurnActionResult, error) {
+	var emitted bool
+	result, err := a.svc.ApplyTurnActionForSessionWithBoundary(sessionID, turn, action, alsoRevertCode, func(state agent.HydrationState, skipped []snapshot.SkippedRevert, warning string) {
+		emitted = true
+		a.setCurrentSessionID(state.Session.ID)
+		a.enqueueBoundary("turn_action", turnActionBoundary{State: &state, SkippedFiles: skipped, Warning: warning}, "", state.Session.ID)
+	})
+	if err != nil && emitted {
+		return result, nil
+	}
+	return result, err
+}
+
 // RevertHistory truncates conversation above the given turn. It is the bound
 // alias of the turn-action route: the given turn is the first one removed, so
 // turns up to turn-1 survive, matching ApplyTurnAction's revert_history.
@@ -968,7 +989,7 @@ func (a *App) RevertHistory(turn int) error {
 	if err != nil {
 		return err
 	}
-	_, err = a.svc.ApplyTurnActionForSessionWithBoundary(sessionID, turn, agent.TurnActionRevertHistory, false, a.turnActionBoundaryEmit())
+	_, err = a.applyTurnActionWithOwnedBoundary(sessionID, turn, agent.TurnActionRevertHistory, false)
 	return err
 }
 
@@ -992,7 +1013,7 @@ func (a *App) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (age
 	if err != nil {
 		return agent.TurnActionResult{}, err
 	}
-	result, err := a.svc.ApplyTurnActionForSessionWithBoundary(sessionID, turn, action, alsoRevertCode, a.turnActionBoundaryEmit())
+	result, err := a.applyTurnActionWithOwnedBoundary(sessionID, turn, action, alsoRevertCode)
 	if err != nil {
 		return result, err
 	}

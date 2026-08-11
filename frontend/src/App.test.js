@@ -81,6 +81,7 @@ function applySnapshotSandbox(overrides = {}) {
     permissions: new Map(),
     modelRef: 'prev/model',
     modelName: 'Prev Model',
+    presentationGeneration: 0,
     rebuildFromHistory: (persisted) => (persisted || []).map((m) => ({ ...m })),
     snapshotMessages,
     newTranscriptGate,
@@ -563,5 +564,260 @@ describe('App streaming continuation across boundaries', () => {
     expect(sandbox.messages[1].partial).toBeFalsy();
     expect(sandbox.messages[2].content).toBe('reply');
     expect(sandbox.messages[2].partial).toBe(true);
+  });
+});
+
+// pendingSubmitSandbox is the state a mounted view holds while a submit promise
+// is in flight: the captured session/generation plus the continuation hooks
+// (error row, draft prefill) the stale-completion tests assert against.
+function pendingSubmitSandbox(overrides = {}) {
+  const sandbox = {
+    ...rootStreamingSandbox(),
+    sessionId: 'A',
+    presentationGeneration: 1,
+    snapshotApplied: true,
+    readOnly: false,
+    busy: false,
+    streamingIdx: -1,
+    currentTurn: 1,
+    shown: null,
+    prefilled: null,
+    submitResolve: null,
+    submitReject: null,
+    Submit: () => new Promise((resolve, reject) => {
+      sandbox.submitResolve = resolve;
+      sandbox.submitReject = reject;
+    }),
+    showError: (err) => { sandbox.shown = err; },
+    inputArea: { prefill: (c) => { sandbox.prefilled = c; } },
+    ...overrides,
+  };
+  return sandbox;
+}
+
+function navigateSandboxTo(sandbox, id) {
+  runInNewContext(
+    `(${functionBodySource('applySnapshot')})({
+      session: { id: ${JSON.stringify(id)} },
+      messages: [],
+      tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 },
+      queue: { items: [], version: 0 },
+      warnings: [],
+      permissions: [],
+    });`,
+    sandbox,
+  );
+}
+
+describe('App promise continuation gate table (session + generation)', () => {
+  // Every accepted-operation promise path: a completion captured on A must not
+  // touch the view when it settles after A was replaced by B and re-selected
+  // (A→B→A). The session id alone cannot reject it — it matches again — so
+  // only the generation term can; each row therefore fails if the generation
+  // term is removed from the gate. The same settlement on the still-current
+  // view must still apply.
+
+  function pathSandbox(backend, overrides = {}) {
+    const sandbox = {
+      ...rootStreamingSandbox(),
+      sessionId: 'A',
+      presentationGeneration: 1,
+      snapshotApplied: true,
+      readOnly: false,
+      showModelSelector: true,
+      shown: null,
+      prefilled: null,
+      inputArea: { prefill: (c) => { sandbox.prefilled = c; } },
+      showError: (err) => { sandbox.shown = err; },
+      ...overrides,
+    };
+    sandbox[backend] = () => new Promise((resolve, reject) => {
+      sandbox[`${backend}Resolve`] = resolve;
+      sandbox[`${backend}Reject`] = reject;
+    });
+    return sandbox;
+  }
+
+  const cases = [
+    {
+      name: 'submit',
+      newSandbox: () => pathSandbox('Submit'),
+      invoke: () => `(async ${functionBodySource('handleSubmit')})({ detail: 'hello' })`,
+      staleSettle: (s) => s.SubmitReject(new Error('submit failed')),
+      staleAssert: (s) => {
+        expect(s.shown).toBeNull();
+        expect(s.prefilled).toBeNull();
+      },
+      currentSettle: (s) => s.SubmitReject(new Error('submit failed')),
+      currentAssert: (s) => {
+        expect(s.shown).toBeTruthy();
+        expect(s.prefilled).toBe('hello');
+      },
+    },
+    {
+      name: 'compact',
+      newSandbox: () => pathSandbox('CompactNow'),
+      invoke: () => `(async ${functionBodySource('handleCompact')})()`,
+      staleSettle: (s) => s.CompactNowReject(new Error('compact failed')),
+      staleAssert: (s) => { expect(s.shown).toBeNull(); },
+      currentSettle: (s) => s.CompactNowReject(new Error('compact failed')),
+      currentAssert: (s) => { expect(s.shown).toBeTruthy(); },
+    },
+    {
+      name: 'model',
+      newSandbox: () => pathSandbox('SwitchModel'),
+      invoke: () => `(async ${functionBodySource('handleModelSelect')})({ detail: { ref: 'prov/new', displayName: 'New Model' } })`,
+      staleSettle: (s) => s.SwitchModelResolve({}),
+      staleAssert: (s) => {
+        expect(s.showModelSelector).toBe(true);
+        expect(s.shown).toBeNull();
+      },
+      currentSettle: (s) => s.SwitchModelResolve({}),
+      currentAssert: (s) => { expect(s.showModelSelector).toBe(false); },
+    },
+    {
+      name: 'revert-code',
+      newSandbox: () => pathSandbox('ApplyTurnAction'),
+      invoke: () => `(async ${functionBodySource('handleRevertCode')})({ detail: { turn: 3 } })`,
+      staleSettle: (s) => s.ApplyTurnActionReject(new Error('revert failed')),
+      staleAssert: (s) => { expect(s.shown).toBeNull(); },
+      currentSettle: (s) => s.ApplyTurnActionReject(new Error('revert failed')),
+      currentAssert: (s) => { expect(s.shown).toBeTruthy(); },
+    },
+    {
+      name: 'revert-history',
+      newSandbox: () => pathSandbox('ApplyTurnAction'),
+      invoke: () => `(async ${functionBodySource('handleRevertHistory')})({ detail: { turn: 3, alsoRevertCode: false } })`,
+      staleSettle: (s) => s.ApplyTurnActionReject(new Error('revert failed')),
+      staleAssert: (s) => {
+        expect(s.shown).toBeNull();
+        expect(s.prefilled).toBeNull();
+      },
+      currentSettle: (s) => s.ApplyTurnActionReject(new Error('revert failed')),
+      currentAssert: (s) => { expect(s.shown).toBeTruthy(); },
+    },
+    {
+      name: 'fork',
+      newSandbox: () => pathSandbox('ApplyTurnAction'),
+      invoke: () => `(async ${functionBodySource('handleFork')})({ detail: { turn: 3, alsoRevertCode: false } })`,
+      staleSettle: (s) => s.ApplyTurnActionReject(new Error('fork failed')),
+      staleAssert: (s) => { expect(s.shown).toBeNull(); },
+      currentSettle: (s) => s.ApplyTurnActionReject(new Error('fork failed')),
+      currentAssert: (s) => { expect(s.shown).toBeTruthy(); },
+    },
+  ];
+
+  it('A→B→A stale settlement never mutates the re-selected view; current-view settlement still applies', async () => {
+    for (const tc of cases) {
+      // Stale: captured on A, settles after A was replaced by B and then
+      // re-selected. Session matches again; only the generation can reject.
+      const stale = tc.newSandbox();
+      runInNewContext(tc.invoke(), stale);
+      navigateSandboxTo(stale, 'B');
+      navigateSandboxTo(stale, 'A');
+      tc.staleSettle(stale);
+      await new Promise((r) => setTimeout(r, 0));
+      tc.staleAssert(stale);
+      expect(stale.sessionId).toBe('A');
+      expect(stale.presentationGeneration).toBe(3);
+
+      // Positive: the same settlement on the still-current view applies.
+      const current = tc.newSandbox();
+      runInNewContext(tc.invoke(), current);
+      tc.currentSettle(current);
+      await new Promise((r) => setTimeout(r, 0));
+      tc.currentAssert(current);
+    }
+  });
+});
+
+describe('App promise completion gated by presentation', () => {
+  it('a stale A promise completion cannot mutate the newer B view', async () => {
+    // Success half: the submit captured on A settles after a navigation
+    // boundary replaced the view with B. The activity fields are owned by the
+    // ordered turn frames, and a stale completion must not raise busy,
+    // streaming, or the turn counter on the newer view.
+    const sandbox = pendingSubmitSandbox();
+    runInNewContext(`(async ${functionBodySource('handleSubmit')})({ detail: 'hello' });`, sandbox);
+    navigateSandboxTo(sandbox, 'B');
+    sandbox.submitResolve({ started: true, turn: 5 });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(sandbox.shown).toBeNull();
+    expect(sandbox.prefilled).toBeNull();
+    expect(sandbox.busy).toBe(false);
+    expect(sandbox.streamingIdx).toBe(-1);
+    // The sandbox's rebuildFromHistory stub does not reset currentTurn, so the
+    // pre-navigation value 1 must survive untouched: the stale completion must
+    // not advance it to the settled turn.
+    expect(sandbox.currentTurn).toBe(1);
+    expect(sandbox.sessionId).toBe('B');
+    expect(sandbox.presentationGeneration).toBe(2);
+
+    // Rejection half: a stale failure is equally inert on the newer view.
+    const sandbox2 = pendingSubmitSandbox();
+    runInNewContext(`(async ${functionBodySource('handleSubmit')})({ detail: 'hello' });`, sandbox2);
+    navigateSandboxTo(sandbox2, 'B');
+    sandbox2.submitReject(new Error('submission failed'));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox2.shown).toBeNull();
+    expect(sandbox2.prefilled).toBeNull();
+    expect(sandbox2.sessionId).toBe('B');
+
+    // Positive half: a precommit error on the still-current view still shows
+    // exactly once, with the draft kept — the gate must not over-drop.
+    const sandbox3 = pendingSubmitSandbox();
+    runInNewContext(`(async ${functionBodySource('handleSubmit')})({ detail: 'hello' });`, sandbox3);
+    sandbox3.submitReject(new Error('precommit'));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox3.shown).toBeTruthy();
+    expect(sandbox3.prefilled).toBe('hello');
+    expect(sandbox3.sessionId).toBe('A');
+  });
+
+  it('a stale model switch cannot close or error the newer session selector', async () => {
+    // A model switch captured on A settles after navigation replaced the view
+    // with B: B's selector stays open and B shows no error, on success and on
+    // failure alike.
+    const sandbox = {
+      ...applySnapshotSandbox(),
+      sessionId: 'A',
+      presentationGeneration: 1,
+      showModelSelector: true,
+      shown: null,
+      switchResolve: null,
+      switchReject: null,
+      SwitchModel: () => new Promise((resolve, reject) => {
+        sandbox.switchResolve = resolve;
+        sandbox.switchReject = reject;
+      }),
+      showError: (err) => { sandbox.shown = err; },
+    };
+    runInNewContext(`(async ${functionBodySource('handleModelSelect')})({ detail: { ref: 'prov/new', displayName: 'New Model' } });`, sandbox);
+    navigateSandboxTo(sandbox, 'B');
+    sandbox.switchResolve({});
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.showModelSelector).toBe(true);
+    expect(sandbox.shown).toBeNull();
+
+    // A stale failure (captured on B, settling after B was replaced) is
+    // equally inert.
+    runInNewContext(`(async ${functionBodySource('handleModelSelect')})({ detail: { ref: 'prov/new', displayName: 'New Model' } });`, sandbox);
+    navigateSandboxTo(sandbox, 'C');
+    sandbox.switchReject(new Error('switch failed'));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.showModelSelector).toBe(true);
+    expect(sandbox.shown).toBeNull();
+
+    // A switch that settles on the still-current view closes the selector and
+    // shows its error — the gate must not over-drop.
+    runInNewContext(`(async ${functionBodySource('handleModelSelect')})({ detail: { ref: 'prov/current', displayName: 'Current' } });`, sandbox);
+    sandbox.switchResolve({});
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.showModelSelector).toBe(false);
+    runInNewContext(`(async ${functionBodySource('handleModelSelect')})({ detail: { ref: 'prov/current', displayName: 'Current' } });`, sandbox);
+    sandbox.switchReject(new Error('switch failed'));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.shown).toBeTruthy();
   });
 });

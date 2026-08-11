@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { EventsOn } from '../wailsjs/runtime/runtime';
-  import { Submit, ApplyTurnAction, CurrentModel, ProjectName, SessionCurrent, CompactNow, HydrateSession } from '../wailsjs/go/main/App';
+  import { Submit, ApplyTurnAction, CurrentModel, ProjectName, SessionCurrent, CompactNow, HydrateSession, SwitchModel } from '../wailsjs/go/main/App';
   import { admitSequenced, newTranscriptGate, snapshotMessages } from './lib/hydration.js';
   import { permissionList, removePermission, seedPermissions, upsertPermission } from './lib/permissions.js';
   import Toolbar from './components/Toolbar.svelte';
@@ -22,9 +22,7 @@
   import { errorText } from './lib/errors.js';
   import {
     mergeSubagentLinks,
-    rememberSubagentLink,
     subagentLinksFromMetadata,
-    takePendingSubagentLinks,
   } from './lib/subagentLinks.js';
 
   const VIEWER_THRESHOLD = 1100;
@@ -84,7 +82,12 @@
   let showTokens = false;
   let warnings = [];
   let showWarnings = false;
-  let pendingSubagentSessionLinks = {};
+  // presentationGeneration advances on every complete-state snapshot applied
+  // (hydration, navigation, turn_action). Promise continuations — submit,
+  // compact, model switch, revert, fork — capture {sessionId, generation}
+  // before the call and may only touch the view while both still match, so a
+  // completion that settles after a navigation can never mutate the newer view.
+  let presentationGeneration = 0;
 
   // Complete-state hydration: listeners register before the snapshot is read, so
   // transcript frames arriving during the read are buffered and replayed after the
@@ -110,10 +113,18 @@
   // buffered wraps a delivered-frame handler so it holds until the snapshot is
   // applied, then replays in delivery order. Applying the snapshot first and every
   // buffered frame after it keeps a frame delivered during the read from being
-  // overwritten by the older captured state.
-  function buffered(handler) {
+  // overwritten by the older captured state. stateful marks a frame that seeds
+  // the view (navigation, a state-carrying turn_action): on a failed hydration
+  // the frames before the first stateful boundary are discarded, the boundary
+  // and everything after it replay, and the gate stays closed only when no
+  // boundary seeded the view.
+  function buffered(handler, stateful = false) {
     return (data) => {
-      if (!hydrated) { pendingFrames.push(() => handler(data)); return; }
+      if (!hydrated) {
+        const marked = typeof stateful === 'function' ? stateful(data) : stateful;
+        pendingFrames.push({ handler, data, stateful: marked });
+        return;
+      }
       handler(data);
     };
   }
@@ -149,7 +160,6 @@
 
   function rebuildFromHistory(persisted) {
     currentTurn = 0;
-    pendingSubagentSessionLinks = {};
     return (persisted || []).map(m => {
       if ((m.turn || 0) > currentTurn) currentTurn = m.turn;
       return { ...m, _id: mid() };
@@ -177,8 +187,11 @@
   // applySnapshot renders one complete-state hydration as the whole live view and
   // seeds the transcript gate at its high-water. The queue guard resets to the
   // snapshot's session and version; later same-session versions must increase.
+  // Every applied snapshot advances presentationGeneration: the newest applied
+  // boundary always wins, and promise continuations captured earlier reject.
   function applySnapshot(hs) {
     if (!hs) return;
+    presentationGeneration++;
     // A snapshot replaces the root view wholesale (navigation, detach, the
     // failed-hydration recovery path), so a child viewer open for the previous
     // session closes here: the backend stops delivering that child's frames
@@ -243,18 +256,24 @@
       catch (e) { showError(e, 'Load session failed'); }
     }
     if (!snapshotApplied) {
-      // No snapshot was applied (a hydration failure or an empty startup), so
-      // nothing is loaded: close the gate so replayed or live transcript
-      // frames cannot render into the empty view, and drop the buffered
-      // frames instead of replaying them. The gate re-opens when a
-      // navigation boundary later applies complete state.
-      gate.highWater = Infinity;
-      pendingFrames = [];
+      // A failed hydration or an empty startup: frames buffered before the
+      // first stateful boundary describe a session the view never loaded, so
+      // they are discarded; the first stateful boundary (a navigation or
+      // state-carrying turn_action frame) and everything after it seed the
+      // view instead. The gate closes below only when no boundary seeded it.
+      const firstStateful = pendingFrames.findIndex((f) => f.stateful);
+      pendingFrames = firstStateful === -1 ? [] : pendingFrames.slice(firstStateful);
     }
     const buffered = pendingFrames;
     pendingFrames = [];
     hydrated = true;
-    for (const replay of buffered) replay();
+    for (const frame of buffered) frame.handler(frame.data);
+    if (!snapshotApplied) {
+      // No boundary seeded the view: close the gate so replayed or live
+      // transcript frames cannot render into the empty view. A boundary
+      // applied above re-seeded the gate from its own cursor.
+      gate.highWater = Infinity;
+    }
   }
 
   // continueStreamingRow resumes a turn that was streaming when a snapshot or
@@ -297,9 +316,10 @@
   function applyToolStart(data) {
     if (!admitSequenced(gate, data.seq)) return;
     closeStreaming();
-    const pending = takePendingSubagentLinks(pendingSubagentSessionLinks, data.id);
-    pendingSubagentSessionLinks = pending.pending;
-    messages = [...messages, { _id: mid(), type: 'tool', id: data.id, name: data.name, args: data.args, done: false, success: true, result: '', subagentSessionIds: pending.links }];
+    // Child-session links arrive id-keyed afterwards: the backend folds the
+    // association into the row before the start frame, so no pending storage
+    // is needed here.
+    messages = [...messages, { _id: mid(), type: 'tool', id: data.id, name: data.name, args: data.args, done: false, success: true, result: '', subagentSessionIds: [] }];
   }
 
   function applyToolResult(data) {
@@ -351,18 +371,21 @@
 
     // A navigation boundary carries the destination session's complete state;
     // applying it replaces the whole live view (messages, gate, tokens, activity,
-    // queue, warnings, permissions). An empty state is a detach.
-    EventsOn('navigation', buffered((data) => { applySnapshot(data); }));
+    // queue, warnings, permissions). An empty state is a detach. It is a
+    // stateful frame: buffered during a failed hydration, it seeds the view.
+    EventsOn('navigation', buffered((data) => { applySnapshot(data); }, true));
 
     // A turn-action boundary carries the fork/revert destination's complete state,
     // any code-revert skip notice, and a fork's failed-code-revert warning as one
     // ordered frame; applying the snapshot and appending the notices together in
-    // that order keeps either notice from being clobbered by the replace.
+    // that order keeps either notice from being clobbered by the replace. A
+    // state-carrying frame is stateful: buffered during a failed hydration, it
+    // seeds the view.
     EventsOn('turn_action', buffered((data) => {
       applySnapshot(data?.state);
       appendRevertSkipNotice({ skippedFiles: data?.skippedFiles });
       if (data?.warning) showError(data.warning);
-    }));
+    }, (data) => !!data?.state));
 
     // A root-model item carries the committed model tagged with the root it
     // switched; apply it to the selector only while that root is the presented
@@ -470,9 +493,11 @@
       appendSubagentEvent(data.sessionId, { type: 'system_signal', seq: data.seq, content: data.content });
     }));
     EventsOn('subagent_session_start', buffered((data) => {
+      // The backend folds the association into the parent tool row before the
+      // start frame is emitted, so the row exists by the time this id-keyed
+      // update arrives; the merge is idempotent either way. No pending-link
+      // storage exists: the backend owns the ordering.
       const link = { index: Number(data.taskIndex), sessionId: data.sessionId };
-      const rowExists = messages.some(m => m.type === 'tool' && m.id === data.taskToolCallId);
-      if (!rowExists) pendingSubagentSessionLinks = rememberSubagentLink(pendingSubagentSessionLinks, data.taskToolCallId, link);
       messages = messages.map(m =>
         m.type === 'tool' && m.id === data.taskToolCallId
           ? { ...m, subagentSessionIds: mergeSubagentLinks(m.subagentSessionIds, [link]) }
@@ -492,10 +517,16 @@
   });
 
   async function handleCompact() {
-    compacting = true;
+    // The compaction indicator is owned by the ordered compaction_start/end
+    // frames; the promise mutates no activity state. Its error shows only
+    // while the captured view is still the presented one.
+    const opSession = sessionId;
+    const opGen = presentationGeneration;
     try { await CompactNow(); }
-    catch (err) { showError(err, 'Compaction failed'); }
-    finally { compacting = false; }
+    catch (err) {
+      if (sessionId !== opSession || presentationGeneration !== opGen) return;
+      showError(err, 'Compaction failed');
+    }
     // Compaction does not change the queue (backend-owned); nothing to flush.
   }
 
@@ -514,17 +545,19 @@
       inputArea?.prefill(content);
       return;
     }
+    // busy, streaming, and the turn counter are owned by the ordered
+    // turn_start/turn_end frames; the submit promise mutates none of them.
+    // Its error and prefill continuation apply only while the captured view
+    // is still the presented one.
+    const opSession = sessionId;
+    const opGen = presentationGeneration;
     try {
-      const r = await Submit(content);
-      if (r?.started) {
-        busy = true;
-        streamingIdx = -1;
-        currentTurn = r.turn || currentTurn;
-      }
+      await Submit(content);
       // If queued (!started), the queue_changed event drives the dimmed
       // indicator; do not touch busy here.
     }
     catch (err) {
+      if (sessionId !== opSession || presentationGeneration !== opGen) return;
       // Rejected (e.g. a session change is in flight): keep the draft so the
       // user can resubmit. InputArea cleared its text on dispatch.
       showError(err);
@@ -534,8 +567,20 @@
 
   function handleManageSettings() { showModelSelector = false; settingsSection = 'models'; showSettings = true; }
   // The backend appends an ordered model item that updates the selector; the
-  // switch handler only closes the picker, never sets the model out of band.
-  function handleModelSwitched() { showModelSelector = false; }
+  // switch handler only invokes the switch against the captured view and
+  // closes the picker, never sets the model out of band.
+  async function handleModelSelect(e) {
+    const opSession = sessionId;
+    const opGen = presentationGeneration;
+    try { await SwitchModel(e.detail.ref); }
+    catch (err) {
+      if (sessionId !== opSession || presentationGeneration !== opGen) return;
+      showError(err);
+      return;
+    }
+    if (sessionId !== opSession || presentationGeneration !== opGen) return;
+    showModelSelector = false;
+  }
   async function refreshCurrentModel() {
     try {
       const r = await CurrentModel();
@@ -546,35 +591,52 @@
 
   async function handleRevertCode(e) {
     const { turn } = e.detail;
+    const opSession = sessionId;
+    const opGen = presentationGeneration;
     try {
       // The backend appends the skip notice as an ordered turn_action frame; no
       // out-of-band append here that a queued refresh could clobber.
       await ApplyTurnAction(turn, 'revert_code', false);
     }
-    catch (err) { showError(err); }
+    catch (err) {
+      if (sessionId !== opSession || presentationGeneration !== opGen) return;
+      showError(err);
+    }
   }
 
   async function handleRevertHistory(e) {
     const { turn, alsoRevertCode } = e.detail;
+    const opSession = sessionId;
+    const opGen = presentationGeneration;
     try {
       const result = await ApplyTurnAction(turn, 'revert_history', !!alsoRevertCode);
       // The backend appends the reverted session's complete state and any skip
       // notice as one ordered turn_action boundary; only the input prefill is
-      // applied from the direct result here.
+      // applied from the direct result here, and only while the captured view
+      // is still the presented one.
+      if (sessionId !== opSession || presentationGeneration !== opGen) return;
       inputArea?.prefill(result?.prefill || '');
     }
-    catch (err) { showError(err); }
+    catch (err) {
+      if (sessionId !== opSession || presentationGeneration !== opGen) return;
+      showError(err);
+    }
   }
 
   async function handleFork(e) {
     const { turn, alsoRevertCode } = e.detail;
+    const opSession = sessionId;
+    const opGen = presentationGeneration;
     try {
       // The backend appends the forked session's complete state, any skip
       // notice, and a failed code revert's warning as one ordered turn_action
       // frame; nothing is applied here.
       await ApplyTurnAction(turn, 'fork', !!alsoRevertCode);
     }
-    catch (err) { showError(err); }
+    catch (err) {
+      if (sessionId !== opSession || presentationGeneration !== opGen) return;
+      showError(err);
+    }
   }
   function handleKeydown(e) {
     if ((e.ctrlKey||e.metaKey) && e.key==='m') { e.preventDefault(); showModelSelector = !showModelSelector; }
@@ -613,7 +675,7 @@
     <StatusBar {modelName} on:openModelSelector={() => showModelSelector=true} />
   </InputArea>
   {#if showModelSelector}
-    <ModelSelector currentRef={modelRef} on:switched={handleModelSwitched} on:close={() => showModelSelector=false} on:manageSettings={handleManageSettings} on:error={(e) => showError(e.detail)} />
+    <ModelSelector currentRef={modelRef} on:select={handleModelSelect} on:close={() => showModelSelector=false} on:manageSettings={handleManageSettings} on:error={(e) => showError(e.detail)} />
   {/if}
 
   {#if showSettings}
