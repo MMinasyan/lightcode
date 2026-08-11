@@ -1640,9 +1640,6 @@ func TestCLIProjectListsBeforeReservingSource(t *testing.T) {
 	c.out = out
 	c.setCurrentSessionID(source)
 	dest, otherRoot := sessionInOtherProject(t, c)
-	// The menu keys are wired against the real listing before the adapter
-	// swap, so wiring itself cannot block on the staged project list.
-	selectProjectByPath(t, c, otherRoot)
 	adapter := &stagedNavigationAdapter{
 		AdapterService: a,
 		blockProject:   true,
@@ -1684,6 +1681,15 @@ func TestCLIProjectListsBeforeReservingSource(t *testing.T) {
 	}
 	close(firstRelease)
 	waitUntilSourceIdleAndDrained(t, a, source)
+
+	// Wire the menu selection only now, from the real agent's current
+	// listing: Phase A's source turns advance the source project's
+	// activity (second granularity), which can flip the activity-sorted
+	// project order between a pre-Phase-A listing and the menu render.
+	// Nothing writes project activity between this read and the render
+	// (the staged adapter forwards the same listing), so the wired index
+	// and the rendered order are identical.
+	selectProjectByPathListed(t, c, a, otherRoot)
 
 	// Phase B: the menu selects the destination project; projectSwitch
 	// acquires the reservation immediately before OpenOrCreateSession, whose
@@ -2148,7 +2154,16 @@ func selectSessionByID(t *testing.T, c *CLI, id string) {
 // project menu, using the host's own listing order.
 func selectProjectByPath(t *testing.T, c *CLI, path string) {
 	t.Helper()
-	projects, err := c.agent.ProjectList()
+	selectProjectByPathListed(t, c, c.agent, path)
+}
+
+// selectProjectByPathListed wires the key source to select the given project
+// in the project menu from the listing of the given service, which must be
+// the listing the menu will render. Tests whose CLI agent is a staged adapter
+// with a blocking ProjectList pass the real agent here.
+func selectProjectByPathListed(t *testing.T, c *CLI, lister agent.AdapterService, path string) {
+	t.Helper()
+	projects, err := lister.ProjectList()
 	if err != nil {
 		t.Fatalf("ProjectList: %v", err)
 	}
