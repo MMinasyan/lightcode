@@ -7,12 +7,16 @@ import (
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 )
 
+// TestRecordUsagePrefersEventModelRef runs against a live session whose store
+// is active, because usage publication is durable: the record persists the
+// entries under the same section that mutates memory, and an inactive store
+// refuses with no event.
 func TestRecordUsagePrefersEventModelRef(t *testing.T) {
 	parentRef := coremodel.ModelRef{Provider: "parent-provider", Model: "parent-model"}
 	childRef := coremodel.ModelRef{Provider: "child-provider", Model: "child-model"}
-	a := &Agent{session: &session{currentRef: parentRef}}
+	a := newLiveCatalogBackedTestAgent(t)
 
-	a.recordUsage(loop.Event{
+	a.recordUsageForSession(a.session, loop.Event{
 		Kind:       loop.Usage,
 		Model:      childRef.Model,
 		ModelRef:   childRef,
@@ -40,9 +44,10 @@ func TestRecordUsagePrefersEventModelRef(t *testing.T) {
 // TestRecordUsageCarriesCumulativeReport verifies each EventUsage carries the
 // session's absolute cumulative token report (a replacement a consumer applies
 // without querying the owner) while the delta fields still carry only that
-// event's contribution.
+// event's contribution. It runs against a live session whose store is active,
+// so every record durably publishes before memory and the event advance.
 func TestRecordUsageCarriesCumulativeReport(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
+	a := newLiveCatalogBackedTestAgent(t)
 
 	a.session.tokensMu.Lock()
 	a.session.tokens = nil

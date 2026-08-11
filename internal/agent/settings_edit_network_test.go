@@ -7,10 +7,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 )
@@ -149,5 +152,435 @@ func TestSettingsEditDoesNotBlockSubmitDuringDiscoveryFetch(t *testing.T) {
 	}
 	if _, ok := disc.Models["disc-model"]; !ok {
 		t.Fatalf("discovery cache for disc = %#v, want disc-model", disc.Models)
+	}
+}
+
+// discoveryEnabledConfig builds a config with a "test" model provider and a
+// "disc" discovery-enabled provider whose base_url points at discBase. The
+// disc key is intentionally not set so construction and Init never refresh:
+// tests set LIGHTCODE_DISC_KEY after the agent exists to make the provider
+// connected and due for the edit under test.
+func discoveryEnabledConfig(t *testing.T, modelBase, discBase string) (string, *Agent, func()) {
+	t.Helper()
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	lightcodeDir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LIGHTCODE_TEST_KEY", "test")
+	configPath := filepath.Join(lightcodeDir, "config.json")
+	configJSON := fmt.Sprintf(`{
+  "providers": {
+    "test": {
+      "name": "Test Provider",
+      "transport": { "base_url": %q, "api_key_env": "LIGHTCODE_TEST_KEY" },
+      "discovery": false,
+      "models": { "test-model": { "name": "Test Model", "context_window": 8192 } }
+    },
+    "disc": {
+      "name": "Discovery Provider",
+      "transport": { "base_url": %q, "api_key_env": "LIGHTCODE_DISC_KEY" },
+      "discovery": true,
+      "models": { "disc-model": { "name": "Disc Model", "context_window": 4096 } }
+    }
+  },
+  "default_model": "test/test-model"
+}`, modelBase, discBase)
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentsTestConfig(t, configPath, `{"primary": {"model": "test/test-model"}}`)
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return configPath, a, func() { t.Setenv("LIGHTCODE_DISC_KEY", "disc-key") }
+}
+
+// TestSetProviderConfigTransportEditQueriesCandidateEndpoint proves a
+// transport edit's discovery targets the candidate transport B, never the old
+// endpoint A: with A healthy and counting requests, the edit must perform zero
+// A requests, fetch B exactly once, and commit B's metadata as authoritative.
+// It fails against the old pre-edit warm path, which read the pre-edit config
+// from disk, fetched A, and let that attempt suppress the B fetch.
+func TestSetProviderConfigTransportEditQueriesCandidateEndpoint(t *testing.T) {
+	var aRequests, bRequests atomic.Int32
+	serverA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		aRequests.Add(1)
+		_, _ = w.Write([]byte(`{"data":[{"id":"a-model","name":"A Model","context_window":1024}]}`))
+	}))
+	serverB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bRequests.Add(1)
+		_, _ = w.Write([]byte(`{"data":[{"id":"b-model","name":"B Model","context_window":2048}]}`))
+	}))
+	defer serverA.Close()
+	defer serverB.Close()
+
+	_, a, setDiscKey := discoveryEnabledConfig(t, "http://127.0.0.1:9/v1", serverA.URL+"/v1")
+	setDiscKey()
+
+	if err := a.SetProviderConfig("disc", ProviderConfigInput{BaseURL: serverB.URL + "/v1"}); err != nil {
+		t.Fatalf("SetProviderConfig transport edit: %v", err)
+	}
+	if got := aRequests.Load(); got != 0 {
+		t.Fatalf("old endpoint A received %d discovery requests, want 0", got)
+	}
+	if got := bRequests.Load(); got != 1 {
+		t.Fatalf("candidate endpoint B received %d discovery requests, want 1", got)
+	}
+	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
+	disc, ok := cache["disc"]
+	if !ok {
+		t.Fatal("candidate discovery did not land in the cache")
+	}
+	if _, ok := disc.Models["b-model"]; !ok {
+		t.Fatalf("cache models = %#v, want B's b-model authoritative", disc.Models)
+	}
+	if _, ok := disc.Models["a-model"]; ok {
+		t.Fatalf("cache models = %#v, want no A model", disc.Models)
+	}
+	st := providerStatusByID(t, a.ProviderList(), "disc")
+	if st.BaseURL != serverB.URL+"/v1" {
+		t.Fatalf("effective base_url = %q, want %s", st.BaseURL, serverB.URL+"/v1")
+	}
+}
+
+// TestSetProviderConfigCandidateDiscoveryDoesNotBlockSubmit proves both halves
+// of the candidate-fetch contract: a submit admitted while the edit's
+// discovery fetch is in flight completes without waiting for the HTTP call,
+// and the edit's final owner-state recheck refuses once the fetch lands while
+// the turn is still running — before any config or cache write. It fails
+// against the old pre-edit warm path, which wrote the discovery attempt and
+// cache during the fetch, so the refused edit leaves cache residue behind.
+func TestSetProviderConfigCandidateDiscoveryDoesNotBlockSubmit(t *testing.T) {
+	discoveryGate := make(chan struct{})
+	var closeDiscoveryGate sync.Once
+	releaseDiscoveryGate := func() { closeDiscoveryGate.Do(func() { close(discoveryGate) }) }
+	entered := make(chan struct{}, 1)
+	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		<-discoveryGate
+		_, _ = w.Write([]byte(`{"data":[{"id":"disc-model","name":"Disc Model","context_window":4096}]}`))
+	}))
+	modelGate := make(chan struct{})
+	var closeModelGate sync.Once
+	releaseModelGate := func() { closeModelGate.Do(func() { close(modelGate) }) }
+	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-modelGate
+		writeTextResponse(w, "hi")
+	}))
+	t.Cleanup(discoveryServer.Close)
+	t.Cleanup(modelServer.Close)
+	var a *Agent
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		if a != nil {
+			a.ShutdownOwner()
+		}
+	})
+	t.Cleanup(releaseDiscoveryGate)
+	t.Cleanup(releaseModelGate)
+
+	configPath, agent, setDiscKey := discoveryEnabledConfig(t, modelServer.URL+"/v1", discoveryServer.URL+"/v1")
+	a = agent
+	a.Init(ctx)
+	setDiscKey()
+
+	// The edit changes a mixed payload (base URL unchanged, name changed): a
+	// committed edit would observably rename the provider, so the refusal's
+	// no-write property is assertable from the config file.
+	editDone := make(chan error, 1)
+	go func() {
+		editDone <- a.SetProviderConfig("disc", ProviderConfigInput{
+			BaseURL: discoveryServer.URL + "/v1",
+			Name:    "Edited Provider",
+		})
+	}()
+
+	select {
+	case <-entered:
+		// The edit's candidate discovery fetch is in flight.
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider edit never reached the candidate discovery fetch")
+	}
+
+	// A concurrent submit must complete while the fetch is still blocked on
+	// the gate; the model endpoint is gated so the turn stays running.
+	submitDone := make(chan error, 1)
+	go func() {
+		_, err := a.Submit(ctx, "hello")
+		submitDone <- err
+	}()
+	select {
+	case err := <-submitDone:
+		if err != nil {
+			t.Fatalf("Submit while candidate discovery fetch in flight: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Submit blocked while the provider edit's discovery fetch held runtime.mu")
+	}
+
+	// The turn is still running, so the edit's final owner-state recheck must
+	// refuse before any config or cache write.
+	releaseDiscoveryGate()
+	select {
+	case err := <-editDone:
+		if err == nil || !strings.Contains(err.Error(), "turn is running") {
+			t.Fatalf("edit after release = %v, want the busy refusal", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider edit never reached the final owner-state recheck")
+	}
+
+	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
+	if _, ok := cache["disc"]; ok {
+		t.Fatalf("refused edit wrote the discovery cache: %#v", cache["disc"])
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "Edited Provider") {
+		t.Fatalf("refused edit wrote the config: %q", data)
+	}
+	releaseModelGate()
+	waitUntilFullyDrained(t, a)
+}
+
+// TestSetProviderConfigConcurrentEditLastWriterWins proves two concurrent
+// complete edits to one provider both succeed and the one whose commit lands
+// last wins: the first edit's candidate fetch is held on a gate while the
+// second edit commits, then the first commits after it, and the final config
+// carries the first edit's complete root — never a torn merge.
+func TestSetProviderConfigConcurrentEditLastWriterWins(t *testing.T) {
+	gate := make(chan struct{})
+	var closeGate sync.Once
+	releaseGate := func() { closeGate.Do(func() { close(gate) }) }
+	entered := make(chan struct{}, 1)
+	gatedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		<-gate
+		_, _ = w.Write([]byte(`{"data":[{"id":"g-model","name":"G Model","context_window":4096}]}`))
+	}))
+	plainServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"p-model","name":"P Model","context_window":2048}]}`))
+	}))
+	t.Cleanup(gatedServer.Close)
+	t.Cleanup(plainServer.Close)
+	var a *Agent
+	t.Cleanup(func() {
+		if a != nil {
+			a.ShutdownOwner()
+		}
+	})
+	t.Cleanup(releaseGate)
+
+	// Both edits start from the gated endpoint; edit 1 targets it again (its
+	// candidate fetch is the one held on the gate), edit 2 targets the plain
+	// server and commits first.
+	_, agent, setDiscKey := discoveryEnabledConfig(t, "http://127.0.0.1:9/v1", gatedServer.URL+"/v1")
+	a = agent
+	setDiscKey()
+
+	edit1Done := make(chan error, 1)
+	go func() {
+		edit1Done <- a.SetProviderConfig("disc", ProviderConfigInput{BaseURL: gatedServer.URL + "/v1"})
+	}()
+	select {
+	case <-entered:
+		// Edit 1's candidate discovery fetch is in flight; its commit cannot
+		// land until the gate opens.
+	case <-time.After(5 * time.Second):
+		t.Fatal("first edit never reached its candidate discovery fetch")
+	}
+
+	// The second edit commits completely while the first is still in flight.
+	if err := a.SetProviderConfig("disc", ProviderConfigInput{BaseURL: plainServer.URL + "/v1"}); err != nil {
+		t.Fatalf("second edit: %v", err)
+	}
+
+	releaseGate()
+	select {
+	case err := <-edit1Done:
+		if err != nil {
+			t.Fatalf("first edit: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first edit never completed")
+	}
+
+	// The first edit's commit landed last, so its complete root wins; the
+	// config stays one complete provider object, never a torn merge.
+	st := providerStatusByID(t, a.ProviderList(), "disc")
+	if st.BaseURL != gatedServer.URL+"/v1" {
+		t.Fatalf("final base_url = %q, want the last-committed %s", st.BaseURL, gatedServer.URL+"/v1")
+	}
+	data, err := os.ReadFile(a.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), gatedServer.URL+"/v1") {
+		t.Fatalf("config does not carry the last commit: %q", data)
+	}
+	if strings.Contains(string(data), plainServer.URL+"/v1") {
+		t.Fatalf("config carries a stale full root: %q", data)
+	}
+}
+
+// TestSetProviderConfigNameEditUsesCandidateDiscovery proves a name-only
+// payload still runs the candidate discovery path: the discovery fetch lands
+// before the config write is published (the config directory is synced before
+// the cache directory), the provider's /models endpoint is queried exactly
+// once, and the fetched metadata lands in the cache. It fails against the old
+// pre-edit warm path, which published the cache before the config write, and
+// against any candidate implementation that classifies payloads by field.
+func TestSetProviderConfigNameEditUsesCandidateDiscovery(t *testing.T) {
+	var requests atomic.Int32
+	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte(`{"data":[{"id":"disc-model","name":"Disc Model","context_window":4096}]}`))
+	}))
+	defer discoveryServer.Close()
+
+	_, a, setDiscKey := discoveryEnabledConfig(t, "http://127.0.0.1:9/v1", discoveryServer.URL+"/v1")
+	setDiscKey()
+
+	var synced []string
+	atomicfs.SyncDirFunc = func(dir string) error {
+		synced = append(synced, dir)
+		return nil
+	}
+	t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+	if err := a.SetProviderConfig("disc", ProviderConfigInput{Name: "Renamed Provider"}); err != nil {
+		t.Fatalf("SetProviderConfig name edit: %v", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("discovery requests = %d, want exactly 1 for the candidate path", got)
+	}
+	// The config write is the first publication; the discovery cache write
+	// follows it inside the same commit hold.
+	if len(synced) == 0 || synced[0] != filepath.Dir(a.configPath) {
+		t.Fatalf("first directory sync = %v, want the config directory (config before cache)", synced)
+	}
+	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
+	disc, ok := cache["disc"]
+	if !ok {
+		t.Fatal("candidate discovery did not land in the cache")
+	}
+	if _, ok := disc.Models["disc-model"]; !ok {
+		t.Fatalf("cache models = %#v, want disc-model", disc.Models)
+	}
+	st := providerStatusByID(t, a.ProviderList(), "disc")
+	if st.Name != "Renamed Provider" {
+		t.Fatalf("effective name = %q, want Renamed Provider", st.Name)
+	}
+}
+
+// TestResetProviderFieldTransportUsesCandidateEndpoint proves a transport
+// field reset's discovery uses the candidate transport — the post-reset
+// transport, without the overridden headers — not the pre-edit disk state.
+// The reset removes a user header, so the single discovery request must not
+// carry that header. It fails against the old pre-edit warm path, which
+// fetched with the pre-edit transport (header still present).
+func TestResetProviderFieldTransportUsesCandidateEndpoint(t *testing.T) {
+	var sawOldHeader atomic.Bool
+	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Old") != "" {
+			sawOldHeader.Store(true)
+		}
+		_, _ = w.Write([]byte(`{"data":[{"id":"disc-model","name":"Disc Model","context_window":4096}]}`))
+	}))
+	defer discoveryServer.Close()
+
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	lightcodeDir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LIGHTCODE_TEST_KEY", "test")
+	configPath := filepath.Join(lightcodeDir, "config.json")
+	configJSON := fmt.Sprintf(`{
+  "providers": {
+    "disc": {
+      "name": "Discovery Provider",
+      "transport": { "base_url": %q, "api_key_env": "LIGHTCODE_DISC_KEY", "headers": { "X-Old": "1" } },
+      "discovery": true,
+      "models": { "disc-model": { "name": "Disc Model", "context_window": 4096 } }
+    }
+  },
+  "default_model": ""
+}`, discoveryServer.URL+"/v1")
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LIGHTCODE_DISC_KEY", "disc-key")
+
+	if err := a.ResetProviderField("disc", "headers"); err != nil {
+		t.Fatalf("ResetProviderField headers: %v", err)
+	}
+	if sawOldHeader.Load() {
+		t.Fatal("discovery request carried the pre-reset X-Old header; the fetch did not use the candidate transport")
+	}
+	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
+	disc, ok := cache["disc"]
+	if !ok {
+		t.Fatal("transport reset's candidate discovery did not land in the cache")
+	}
+	if _, ok := disc.Models["disc-model"]; !ok {
+		t.Fatalf("cache models = %#v, want disc-model", disc.Models)
+	}
+	view, err := a.GetProviderConfig("disc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.UserHeaders) != 0 {
+		t.Fatalf("headers after reset = %#v, want the override removed", view.UserHeaders)
+	}
+}
+
+// TestResetProviderFieldTransportNoOpSkipsDiscovery proves a transport reset
+// that removes nothing performs no discovery fetch, no config write, and no
+// attempt or cache write: the candidate preparation returns immediately. It
+// fails against the old warm path, which fetched and wrote the cache before
+// discovering the reset was a no-op.
+func TestResetProviderFieldTransportNoOpSkipsDiscovery(t *testing.T) {
+	var requests atomic.Int32
+	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte(`{"data":[{"id":"disc-model","name":"Disc Model","context_window":4096}]}`))
+	}))
+	defer discoveryServer.Close()
+
+	_, a, setDiscKey := discoveryEnabledConfig(t, "http://127.0.0.1:9/v1", discoveryServer.URL+"/v1")
+	setDiscKey()
+
+	if err := a.ResetProviderField("disc", "headers"); err != nil {
+		t.Fatalf("no-op ResetProviderField: %v", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("no-op transport reset performed %d discovery requests, want 0", got)
+	}
+	cache, attempts, _ := catalog.ReadDiscoveryCache(a.home)
+	if _, ok := cache["disc"]; ok {
+		t.Fatalf("no-op transport reset wrote the discovery cache: %#v", cache["disc"])
+	}
+	if _, ok := attempts["disc"]; ok {
+		t.Fatalf("no-op transport reset wrote a discovery attempt: %#v", attempts)
 	}
 }

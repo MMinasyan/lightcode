@@ -538,6 +538,58 @@ func TestWithLockSerializesReadModifyWrite(t *testing.T) {
 	}
 }
 
+// TestWithLockReportsReleaseFailureToStderr proves WithLock retains the
+// callback result and reports a failed release exactly once: the callback
+// error is returned unchanged, and stderr carries exactly
+// `lightcode: release lock <lockPath>: <error>`. It fails against the old
+// defer-based release, which ignored the release error silently.
+func TestWithLockReportsReleaseFailureToStderr(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, ".locks", "rec.lock")
+
+	injected := errors.New("injected release failure")
+	ReleaseFunc = func(*Lock) error { return injected }
+	defer func() { ReleaseFunc = nil }()
+	stderr := captureStderr(t)
+
+	callbackErr := errors.New("callback failure")
+	err := WithLock(lockPath, func() error { return callbackErr })
+	if err != callbackErr {
+		t.Fatalf("WithLock = %v, want the callback result unchanged", err)
+	}
+	if out := stderr(); out != "lightcode: release lock "+lockPath+": "+injected.Error()+"\n" {
+		t.Fatalf("stderr = %q, want the one exact release diagnostic", out)
+	}
+}
+
+// TestWithLockReleasesOnCallbackPanic proves WithLock releases the lock even
+// when the callback panics: the release runs through defer, so a recovered
+// panic cannot strand the lock and block the next acquirer. It fails against a
+// non-deferred release, which skips Release during panic unwinding and leaves
+// the flock held.
+func TestWithLockReleasesOnCallbackPanic(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, ".locks", "rec.lock")
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("WithLock callback did not panic")
+			}
+		}()
+		_ = WithLock(lockPath, func() error { panic("callback panic") })
+	}()
+
+	regained, ok, err := TryAcquire(lockPath)
+	if err != nil {
+		t.Fatalf("TryAcquire after the recovered panic: %v", err)
+	}
+	if !ok {
+		t.Fatal("lock still held after a panicking WithLock callback; the release did not run")
+	}
+	regained.Release()
+}
+
 // crashChildDestEnv selects the child half of
 // TestCrashBeforeRenameLeavesReadableOrphanTemp and names the destination it
 // publishes to; crashChildCreateEnv selects the CreateExclusive shape.

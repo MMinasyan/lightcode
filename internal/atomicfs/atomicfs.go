@@ -227,12 +227,19 @@ func (l *Lock) Release() error {
 
 // WithLock runs fn while holding the exclusive lock at lockPath, releasing
 // it afterward. It is the standard wrapper for a serialized read-modify-write
-// publication.
+// publication. The release runs through defer so a panicking callback still
+// releases the lock exactly once. The callback result is authoritative: a
+// release failure is a postcommit diagnostic — reported once to stderr — that
+// never replaces or rolls back the callback's result.
 func WithLock(lockPath string, fn func() error) error {
 	l, err := Acquire(lockPath)
 	if err != nil {
 		return err
 	}
-	defer l.Release()
+	defer func() {
+		if err := l.Release(); err != nil {
+			fmt.Fprintf(os.Stderr, "lightcode: release lock %s: %v\n", lockPath, err)
+		}
+	}()
 	return fn()
 }

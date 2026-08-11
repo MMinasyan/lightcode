@@ -80,11 +80,10 @@ type Spec struct {
 }
 
 // Service assembles system prompts. It is stateless: it owns no cache and no
-// per-session state, so one instance is shared across every unit. Each call
-// reads the current global and project rules fresh and renders the caller's
-// project root and session start, returning one immutable prompt. Callers keep
-// their own last installed prompt and compare against it to decide whether to
-// reinstall.
+// per-session state, so one instance is shared across every unit. Simple/full
+// calls read current global and project rules; none skips rules reads. Every
+// call renders the caller's project root and session start, returning one
+// immutable prompt. Callers compare it with their own last installed prompt.
 type Service struct {
 	home string
 }
@@ -94,8 +93,9 @@ func NewService(home string) *Service {
 }
 
 // Assemble builds the system prompt for one unit: its project root, its fixed
-// session start, and the given spec. It reads the current global and project
-// rules on every call and holds nothing between calls.
+// session start, and the given spec. For the simple and full sizes it reads
+// the current global and project rules fresh on every call (none skips rules
+// reads) and holds nothing between calls.
 func (s *Service) Assemble(projectRoot string, sessionStart time.Time, spec Spec) Result {
 	spec = normalizeSpec(spec)
 	var warnings []Warning

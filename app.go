@@ -935,7 +935,9 @@ func (a *App) ResetModelField(providerID string, modelID string, field string) e
 	return a.svc.ResetModelField(providerID, modelID, field)
 }
 
-// RevertCode restores files to their state at turn N.
+// RevertCode restores files through the direct code-revert convention: N is
+// the first restored turn, so the store target is N-1, matching the shared
+// revert_code turn action.
 func (a *App) RevertCode(turn int) (snapshot.RevertResult, error) {
 	a.navMu.Lock()
 	defer a.navMu.Unlock()

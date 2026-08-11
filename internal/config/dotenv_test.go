@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 // envKeyForTest returns a key unlikely to collide with anything in the real
@@ -581,4 +583,103 @@ func TestReadDotEnvKeysQuotedEmptyValues(t *testing.T) {
 	if !keys["QUOTED_VALUE"] {
 		t.Fatal("QUOTED_VALUE: a quoted non-empty value must resolve")
 	}
+}
+
+// captureStderr redirects os.Stderr into a temp file for the test's duration
+// and returns a func that reads what was written.
+func captureStderr(t *testing.T) func() string {
+	t.Helper()
+	old := os.Stderr
+	f, err := os.CreateTemp(t.TempDir(), "stderr-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = f
+	t.Cleanup(func() {
+		os.Stderr = old
+		f.Close()
+	})
+	return func() string {
+		data, _ := os.ReadFile(f.Name())
+		return string(data)
+	}
+}
+
+// TestDotEnvWritesReportLockReleaseFailure proves both public dotenv write
+// paths — ManagedEnv.Set (writeDotEnvLine) and ManagedEnv.Remove
+// (removeDotEnvLine) — serialize through atomicfs.WithLock: an injected
+// release failure keeps the committed callback result (the write still lands
+// and the public call still succeeds) and prints exactly one
+// `lightcode: release lock <lockPath>: <error>` diagnostic. It fails against
+// the old direct Acquire/Release sites, which ignored the release error
+// silently.
+func TestDotEnvWritesReportLockReleaseFailure(t *testing.T) {
+	injected := errors.New("injected release failure")
+
+	atomicfs.ReleaseFunc = func(*atomicfs.Lock) error { return injected }
+	t.Cleanup(func() { atomicfs.ReleaseFunc = nil })
+
+	// Each subtest uses its own directory: the injected release never drops
+	// the underlying flock (ReleaseFunc replaces the real unlock), so a second
+	// blocking Acquire on the same lock path would wait forever.
+	t.Run("write", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".env")
+		lockPath := filepath.Join(dir, ".locks", "env.lock")
+		key := envKeyForTest(t, "RLF_WRITE")
+		m := NewManagedEnvForTest(path)
+		stderr := captureStderr(t)
+
+		if err := m.Set(key, "hello"); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+		// The committed callback result is preserved: the write landed and
+		// the process env was updated despite the release failure.
+		if got := os.Getenv(key); got != "hello" {
+			t.Fatalf("env %s = %q, want hello", key, got)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), key+"=hello") {
+			t.Fatalf("file missing key line: %q", data)
+		}
+		if out := stderr(); out != "lightcode: release lock "+lockPath+": "+injected.Error()+"\n" {
+			t.Fatalf("write stderr = %q, want the one exact release diagnostic", out)
+		}
+	})
+
+	t.Run("remove", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".env")
+		lockPath := filepath.Join(dir, ".locks", "env.lock")
+		key := envKeyForTest(t, "RLF_REMOVE")
+		seed := "# header\n" + key + "=val\nKEEP=me\n"
+		if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.Setenv(key, "val")
+		m := NewManagedEnvForTest(path)
+		m.managed[key] = struct{}{}
+		stderr := captureStderr(t)
+
+		if err := m.Remove(key); err != nil {
+			t.Fatalf("Remove: %v", err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(data)
+		if strings.Contains(body, key+"=") {
+			t.Fatalf("key line still in file: %q", body)
+		}
+		if !strings.Contains(body, "KEEP=me") {
+			t.Fatalf("unrelated line lost: %q", body)
+		}
+		if out := stderr(); out != "lightcode: release lock "+lockPath+": "+injected.Error()+"\n" {
+			t.Fatalf("remove stderr = %q, want the one exact release diagnostic", out)
+		}
+	})
 }

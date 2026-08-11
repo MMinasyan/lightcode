@@ -331,103 +331,95 @@ func isValidEnvKey(key string) bool {
 // mode 0600. If the file exists, its permissions are preserved when possible;
 // new files are created with 0600.
 func writeDotEnvLine(path, key, value string) error {
-	lock, err := atomicfs.Acquire(envLockPath(path))
-	if err != nil {
-		return err
-	}
-	defer lock.Release()
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-
-	existing, readErr := os.ReadFile(path)
-	var lines []string
-	if readErr == nil {
-		lines = strings.Split(string(existing), "\n")
-		// A trailing newline produces an empty final element; keep it so we
-		// can reproduce the file faithfully.
-	} else if !os.IsNotExist(readErr) {
-		return readErr
-	}
-
-	encoded := key + "=" + quoteEnvValue(value)
-	replaced := false
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		trimmed = strings.TrimPrefix(trimmed, "export ")
-		if strings.HasPrefix(trimmed, "#") || trimmed == "" {
-			continue
+	return atomicfs.WithLock(envLockPath(path), func() error {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return err
 		}
-		eq := strings.IndexByte(trimmed, '=')
-		if eq <= 0 {
-			continue
-		}
-		k := strings.TrimSpace(trimmed[:eq])
-		if k == key {
-			lines[i] = encoded
-			replaced = true
-			// Keep going only if we want to replace the first occurrence;
-			// .env convention is first-wins for duplicates, but we replace
-			// all occurrences of the same key for simplicity.
-		}
-	}
-	if !replaced {
-		// Append. If the file ended with a newline, the split left an empty
-		// trailing element; insert before it so we don't get a blank line
-		// between the last real line and the new entry.
-		if len(lines) > 0 && lines[len(lines)-1] == "" {
-			lines = append(lines[:len(lines)-1], encoded, "")
-		} else {
-			lines = append(lines, encoded)
-		}
-	}
 
-	body := strings.Join(lines, "\n")
-	return writeDotEnvAtomic(path, []byte(body))
+		existing, readErr := os.ReadFile(path)
+		var lines []string
+		if readErr == nil {
+			lines = strings.Split(string(existing), "\n")
+			// A trailing newline produces an empty final element; keep it so we
+			// can reproduce the file faithfully.
+		} else if !os.IsNotExist(readErr) {
+			return readErr
+		}
+
+		encoded := key + "=" + quoteEnvValue(value)
+		replaced := false
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			trimmed = strings.TrimPrefix(trimmed, "export ")
+			if strings.HasPrefix(trimmed, "#") || trimmed == "" {
+				continue
+			}
+			eq := strings.IndexByte(trimmed, '=')
+			if eq <= 0 {
+				continue
+			}
+			k := strings.TrimSpace(trimmed[:eq])
+			if k == key {
+				lines[i] = encoded
+				replaced = true
+				// Keep going only if we want to replace the first occurrence;
+				// .env convention is first-wins for duplicates, but we replace
+				// all occurrences of the same key for simplicity.
+			}
+		}
+		if !replaced {
+			// Append. If the file ended with a newline, the split left an empty
+			// trailing element; insert before it so we don't get a blank line
+			// between the last real line and the new entry.
+			if len(lines) > 0 && lines[len(lines)-1] == "" {
+				lines = append(lines[:len(lines)-1], encoded, "")
+			} else {
+				lines = append(lines, encoded)
+			}
+		}
+
+		body := strings.Join(lines, "\n")
+		return writeDotEnvAtomic(path, []byte(body))
+	})
 }
 
 // removeDotEnvLine atomically removes every line defining key from path,
 // preserving comments, blank lines, and other keys. If path does not exist,
 // it is a no-op.
 func removeDotEnvLine(path, key string) error {
-	lock, err := atomicfs.Acquire(envLockPath(path))
-	if err != nil {
-		return err
-	}
-	defer lock.Release()
-
-	existing, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+	return atomicfs.WithLock(envLockPath(path), func() error {
+		existing, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
 		}
-		return err
-	}
 
-	lines := strings.Split(string(existing), "\n")
-	var kept []string
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		probe := strings.TrimPrefix(trimmed, "export ")
-		if strings.HasPrefix(probe, "#") || trimmed == "" {
+		lines := strings.Split(string(existing), "\n")
+		var kept []string
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			probe := strings.TrimPrefix(trimmed, "export ")
+			if strings.HasPrefix(probe, "#") || trimmed == "" {
+				kept = append(kept, line)
+				continue
+			}
+			eq := strings.IndexByte(probe, '=')
+			if eq <= 0 {
+				kept = append(kept, line)
+				continue
+			}
+			k := strings.TrimSpace(probe[:eq])
+			if k == key {
+				continue // drop
+			}
 			kept = append(kept, line)
-			continue
 		}
-		eq := strings.IndexByte(probe, '=')
-		if eq <= 0 {
-			kept = append(kept, line)
-			continue
-		}
-		k := strings.TrimSpace(probe[:eq])
-		if k == key {
-			continue // drop
-		}
-		kept = append(kept, line)
-	}
 
-	body := strings.Join(kept, "\n")
-	return writeDotEnvAtomic(path, []byte(body))
+		body := strings.Join(kept, "\n")
+		return writeDotEnvAtomic(path, []byte(body))
+	})
 }
 
 // quoteEnvValue returns value wrapped in double quotes if it contains

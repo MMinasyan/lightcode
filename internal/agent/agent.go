@@ -1822,25 +1822,40 @@ func (a *Agent) recordUsageForSession(unit *session, ev loop.Event) {
 	key := prov + "/" + model
 
 	unit.tokensMu.Lock()
-	if unit.tokens == nil {
-		unit.tokens = map[string]*TokenEntry{}
+	// Copy the current entries and context into candidate values, apply the
+	// delta to the candidates, and publish them only after the durable write
+	// succeeds: memory, the cumulative report, and the usage event can never
+	// outrun the tokens.json commit. A failed write retains the old values and
+	// emits nothing; the failure is reported after the lock is released.
+	candidates := make(map[string]*TokenEntry, len(unit.tokens))
+	for k, e := range unit.tokens {
+		c := *e
+		candidates[k] = &c
 	}
-	entry, ok := unit.tokens[key]
+	entry, ok := candidates[key]
 	if !ok {
 		entry = &TokenEntry{Provider: prov, Model: model, Known: true}
-		unit.tokens[key] = entry
+		candidates[key] = entry
 	}
 	entry.Cache += ev.Cache
 	entry.Input += ev.Input
 	entry.Output += ev.Output
+	candidateContext := unit.lastContextUsed
 	if ev.UsageKnown {
-		unit.lastContextUsed = ev.Cache + ev.Input
+		candidateContext = ev.Cache + ev.Input
 	}
-	// Persist the snapshot inside the same tokensMu section that mutated the
-	// entries: the marshal cannot be hoisted ahead of the lock, and the file
-	// write is small and local, so writing it inside the section keeps two
-	// concurrent writers from landing their snapshots in the opposite order.
-	a.persistTokensForSessionLocked(unit)
+	if err := a.persistTokensForSessionLocked(unit, candidates); err != nil {
+		// Capture the report inputs under tokensMu, then report once after the
+		// section ends: addWarning takes warningsMu, so taking it here would
+		// introduce a tokensMu -> warningsMu edge on the failure path.
+		sessionID := sessionIDOf(unit)
+		unit.tokensMu.Unlock()
+		a.addWarning("protocol", prompt.Warning{Kind: "protocol_warning", Message: fmt.Sprintf("failed to persist token usage: %v", err)})
+		fmt.Fprintf(os.Stderr, "lightcode: failed to persist token usage for session %s: %v\n", sessionID, err)
+		return
+	}
+	unit.tokens = candidates
+	unit.lastContextUsed = candidateContext
 	report := a.buildReportForSessionLocked(unit)
 	// Enqueue the usage event inside the tokensMu section that produced the report,
 	// so a navigation capture (which reads the report under tokensMu and appends its
@@ -1884,26 +1899,26 @@ func (a *Agent) buildReportForSessionLocked(unit *session) TokenReport {
 	}
 }
 
-// persistTokensForSessionLocked serializes the unit's token entries and
-// durably writes them to the session's tokens file. Caller holds
-// unit.tokensMu: the entries are mutated inside the caller's same section, so
-// the marshal cannot be hoisted ahead of the lock, and the small local write
-// stays inside the section so concurrent writers cannot land their snapshots
-// out of order.
-func (a *Agent) persistTokensForSessionLocked(unit *session) {
+// persistTokensForSessionLocked serializes the given token entries and durably
+// writes them to the session's tokens file. Caller holds unit.tokensMu: the
+// entries are the caller's candidates, so the marshal cannot be hoisted ahead
+// of the lock, and the small local write stays inside the section so
+// concurrent writers cannot land their snapshots out of order. An inactive
+// store refuses with snapshot.ErrNoSession and writes nothing.
+func (a *Agent) persistTokensForSessionLocked(unit *session, entries map[string]*TokenEntry) error {
 	if unit == nil || unit.store == nil || !unit.store.Active() {
-		return
+		return snapshot.ErrNoSession
 	}
-	entries := make([]TokenEntry, 0, len(unit.tokens))
-	for _, e := range unit.tokens {
-		entries = append(entries, *e)
+	out := make([]TokenEntry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, *e)
 	}
-	data, err := json.MarshalIndent(entries, "", "  ")
+	data, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
 	a.fireDurableReadHook()
-	_ = atomicfs.Write(filepath.Join(unit.store.Dir(), tokensFileName), append(data, '\n'), 0o600)
+	return atomicfs.Write(filepath.Join(unit.store.Dir(), tokensFileName), append(data, '\n'), 0o600)
 }
 
 func (a *Agent) runSweep() {
@@ -2533,8 +2548,9 @@ func (a *Agent) clearActiveModelForSessionLocked(unit *session) {
 
 // applyActiveAdaptationPromptLocked reassembles the system prompt for the current
 // activeAdapt and installs it when changed. Called by the two model chokepoints with
-// rt.mu held; the assembler never re-acquires rt.mu. If the active adaptation is nil,
-// the baseline prompt cache path avoids UpdateSystemPrompt churn.
+// rt.mu held; the assembler never re-acquires rt.mu. Every fresh assembly is
+// compared against the unit's last installed prompt, so an unchanged prompt —
+// including the baseline — skips UpdateSystemPrompt churn.
 func (a *Agent) applyActiveAdaptationPromptLocked() {
 	a.applyActiveAdaptationPromptForSessionLocked(a.session)
 }
