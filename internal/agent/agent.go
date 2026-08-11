@@ -5448,6 +5448,35 @@ func (a *Agent) beginLiveSessionClose(id string) (func(), error) {
 	return func() { a.endLiveTransition(unit) }, nil
 }
 
+// ReserveSelectionSource reserves the selection's source session while a
+// navigation command creates, opens, or switches to a destination. Owner
+// busy/transitioning state — not delivered turn_start presentation — decides
+// whether the source may be replaced: an empty, non-live, or read-only source
+// (a session another process drives is not live in this owner) returns a
+// no-op release and navigation proceeds; a busy or transitioning live source
+// refuses with the existing mutability error and the selection stays
+// unchanged; an idle live source takes the existing transitioning
+// reservation, released by endLiveTransition. The reservation never stops,
+// cancels, closes, or detaches the source: it only blocks new turns, queue
+// drains, signal turns, and conflicting lifecycle work while the destination
+// commits.
+func (a *Agent) ReserveSelectionSource(sessionID string) (func(), error) {
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	unit, err := a.liveSessionLocked(sessionID)
+	if err != nil {
+		// No current source, or a session that is not live in this owner
+		// (read-only: another process drives it): nothing to reserve.
+		return func() {}, nil
+	}
+	if err := unitMutableLocked(unit); err != nil {
+		return nil, err
+	}
+	unit.transitioning = true
+	return func() { a.endLiveTransition(unit) }, nil
+}
+
 func (a *Agent) closeLiveSession(id string) (bool, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {

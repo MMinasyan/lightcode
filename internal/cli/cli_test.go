@@ -6,11 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -831,17 +835,26 @@ func TestCLISelectionOnlyContract(t *testing.T) {
 		})
 
 		t.Run(cmd+"/busy=rejected_unchanged", func(t *testing.T) {
-			_, c, out, source := selectionCLI(t)
-			busyCmd := cmd
-			if cmd == "/resume" {
-				busyCmd = "/resume x"
+			// The source is busy in the OWNER (a real claimed turn held open by
+			// the provider) while the CLI's own event-derived busy is not set —
+			// exactly the batch-race shape. Each command is driven through its
+			// real path, and the source reservation must refuse with the
+			// owner's mutability error, leaving the selection unchanged.
+			_, c, out, source, _ := busySourceCLI(t)
+			switch cmd {
+			case "/session":
+				dest := secondSession(t, c)
+				selectSessionByID(t, c, dest)
+			case "/project":
+				_, otherRoot := sessionInOtherProject(t, c)
+				selectProjectByPath(t, c, otherRoot)
 			}
-			c.handleSlashWhileBusy(busyCmd)
-			if !strings.Contains(out.String(), "cannot run this command while a turn is running") {
-				t.Fatalf("%q while busy = %q, want rejection", cmd, out.String())
+			dispatchSelection(t, c, cmd, "x")
+			if !strings.Contains(out.String(), "a turn is running") {
+				t.Fatalf("%q over a busy source = %q, want the owner mutability error", cmd, out.String())
 			}
 			if got, _ := c.currentSession(); got != source {
-				t.Fatalf("%q while busy changed current to %q, want unchanged %q", cmd, got, source)
+				t.Fatalf("%q over a busy source changed current to %q, want unchanged %q", cmd, got, source)
 			}
 		})
 
@@ -892,6 +905,13 @@ func TestCLISelectionOnlyContract(t *testing.T) {
 			if !sourceClaimRetained(c, source) {
 				t.Fatalf("source session %q lost its live claim", source)
 			}
+			// The release ran before the error rendered: the source is no
+			// longer transitioning, so it is immediately usable again.
+			release2, err := a.ReserveSelectionSource(source)
+			if err != nil {
+				t.Fatalf("source %q not usable after the failed %s: %v", source, cmd, err)
+			}
+			release2()
 		})
 
 		t.Run(cmd+"/queue_version=destination_lower_than_source_replaces", func(t *testing.T) {
@@ -926,6 +946,74 @@ func TestCLISelectionOnlyContract(t *testing.T) {
 		})
 	}
 
+	// The no-source and read-only-source rows: no current session means the
+	// CLI never calls the owner; a read-only current (another process drives
+	// it) reaches the owner but the reservation is a no-op — navigation
+	// proceeds in both cases, with no invented live-mutation guard.
+	t.Run("no_source=noop_reservation_proceeds", func(t *testing.T) {
+		a, c, _, _ := selectionCLI(t)
+		rec := &recordingReserveAdapter{AdapterService: a}
+		c.agent = rec
+		c.sv().SetCurrent("")
+		dispatchSelection(t, c, "/new", "")
+		if len(rec.reserves) != 0 {
+			t.Fatalf("no-source /new reserved: %v", rec.reserves)
+		}
+		if got, err := c.currentSession(); err != nil || got == "" {
+			t.Fatalf("current after no-source /new = %q (err %v), want a fresh session", got, err)
+		}
+	})
+
+	t.Run("read_only_source=noop_reservation_proceeds", func(t *testing.T) {
+		first, second := newTestAgentPair(t)
+		c := New(second)
+		out := new(bytes.Buffer)
+		c.out = out
+		rec := &recordingReserveAdapter{AdapterService: second}
+		c.agent = rec
+		heldID, err := first.NewSessionForProjectPath(c.scope.ProjectPath(), "primary")
+		if err != nil {
+			t.Fatalf("NewSessionForProjectPath held: %v", err)
+		}
+		selectSessionByID(t, c, heldID)
+		dispatchSelection(t, c, "/session", "")
+		if !c.sv().IsReadOnly(heldID) {
+			t.Fatal("held session not read-only after the menu open")
+		}
+		// The read-only source is current; /new calls the owner, whose
+		// reservation is a no-op (the source is not live in this owner), and
+		// the navigation commits a fresh live session.
+		out.Reset()
+		dispatchSelection(t, c, "/new", "")
+		if len(rec.reserves) != 1 || rec.reserves[0] != heldID {
+			t.Fatalf("read-only-source /new reservations = %v, want the no-op call for %q", rec.reserves, heldID)
+		}
+		if got, _ := c.currentSession(); got == "" || got == heldID {
+			t.Fatalf("current after read-only-source /new = %q, want a fresh session", got)
+		}
+	})
+
+	// The idle-success row: the reservation is acquired for the source and
+	// held through the destination commit, then released — a second
+	// navigation still succeeds, which a leaked transitioning would refuse.
+	t.Run("idle_success=reserves_through_commit_and_releases", func(t *testing.T) {
+		a, c, _, source := selectionCLI(t)
+		rec := &recordingReserveAdapter{AdapterService: a}
+		c.agent = rec
+		dispatchSelection(t, c, "/new", "")
+		first := c.currentSessionID()
+		if first == "" || first == source {
+			t.Fatalf("first /new current = %q, want a fresh session distinct from %q", first, source)
+		}
+		dispatchSelection(t, c, "/new", "")
+		if len(rec.reserves) != 2 || rec.reserves[0] != source || rec.reserves[1] != first {
+			t.Fatalf("reservations = %v, want [%q, %q]", rec.reserves, source, first)
+		}
+		if !sourceClaimRetained(c, source) {
+			t.Fatalf("source session %q lost its live claim", source)
+		}
+	})
+
 	// The no-teardown barrier: no selection path calls a teardown operation,
 	// so the source session is never stopped, cancelled, closed, detached,
 	// evicted, or shut down by a selection.
@@ -949,6 +1037,719 @@ func TestCLISelectionOnlyContract(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestCLINavigationBlockedBySynchronousSubmitClaim proves the same-batch
+// contract: a prompt key and a navigation key drained from one key batch
+// cannot navigate away from the source, because the synchronous submit claims
+// the owner unit before the next key is handled. EventTurnStart is still
+// queued undrained when the navigation key runs — the CLI's event-derived
+// busy flag is not set — yet the owner's busy state refuses the navigation
+// with the mutability error and the selection stays on the source.
+func TestCLINavigationBlockedBySynchronousSubmitClaim(t *testing.T) {
+	block := make(chan struct{})
+	var once sync.Once
+	releaseHold := func() { once.Do(func() { close(block) }) }
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-block
+		http.Error(w, "released", http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	a, _ := newTestAgentWithBaseURL(t, server.URL)
+	startTestAgent(t, a)
+	source, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("source NewSession: %v", err)
+	}
+	c := New(a)
+	c.agent.SetEventHandler(c.enqueueEvent)
+	out := new(bytes.Buffer)
+	c.out = out
+	c.setCurrentSessionID(source)
+	rec := &recordingSubmitAdapter{AdapterService: a}
+	c.agent = rec
+	c.ctx = context.Background()
+	t.Cleanup(func() {
+		releaseHold()
+		_ = a.CancelSession(source)
+	})
+
+	// The source starts idle: the prompt in the buffered batch is the only
+	// owner claim this test makes.
+	if busy, err := a.BusyForSession(source); err != nil || busy {
+		t.Fatalf("source busy before the batch = %v (err %v), want idle", busy, err)
+	}
+
+	// One real key batch: the prompt "hi" followed by /new. The keys are
+	// drained in order exactly as mainLoop drains them; the turn_start the
+	// submit emits stays queued behind the batch, the delayed-turn_start
+	// shape.
+	batch := []keyMsg{
+		{Rune: 'h'}, {Rune: 'i'}, {Special: keyEnter},
+		{Rune: '/'}, {Rune: 'n'}, {Rune: 'e'}, {Rune: 'w'}, {Special: keyEnter},
+	}
+	for _, k := range batch {
+		c.enqueueKey(k)
+	}
+	for i, k := range batch {
+		if err := c.handleKey(k); err != nil {
+			t.Fatalf("handleKey: %v", err)
+		}
+		if i != 2 {
+			continue
+		}
+		// Right after the prompt's Enter, before any navigation key is
+		// handled, the synchronous submit must already own the unit: the
+		// claim is the batch's only owner claim.
+		if len(rec.submitted) != 1 || rec.submitted[0] != source {
+			t.Fatalf("submit target right after the prompt key = %#v, want the source %q claimed synchronously", rec.submitted, source)
+		}
+		busy, err := a.BusyForSession(source)
+		if err != nil || !busy {
+			t.Fatalf("source busy right after the prompt key = %v (err %v), want the synchronous claim", busy, err)
+		}
+		// ...but its turn_start is still queued: the CLI's event-derived busy
+		// is not set, so the rejection below cannot have come from the CLI's
+		// own presentation state.
+		if c.busy {
+			t.Fatal("CLI busy flag set before the turn_start event drained; the rejection must not depend on event-derived busy")
+		}
+	}
+
+	// The /new key refused with the owner's mutability error and the
+	// selection is unchanged.
+	if !strings.Contains(out.String(), "a turn is running") {
+		t.Fatalf("/new after the same-batch submit = %q, want the owner mutability error", out.String())
+	}
+	if got, _ := c.currentSession(); got != source {
+		t.Fatalf("current after same-batch submit+navigation = %q, want unchanged %q", got, source)
+	}
+
+	// The delayed turn_start lands only after the batch: draining the
+	// delivery FIFO sets the CLI's presentation busy from the owner's claim.
+	c.drainEvents()
+	if !c.busy {
+		t.Fatal("turn_start did not set the CLI busy flag once drained")
+	}
+}
+
+// TestCLIArchiveDeleteDoNotReserveSelection proves archive/delete stay
+// lifecycle operations: the session menu's archive and delete branches run
+// the lifecycle path without acquiring a selection reservation, while the new
+// branch (a navigation sibling) does reserve the source.
+func TestCLIArchiveDeleteDoNotReserveSelection(t *testing.T) {
+	t.Run("archive=no_reservation", func(t *testing.T) {
+		_, c, _, source := selectionCLI(t)
+		rec := &recordingReserveAdapter{AdapterService: c.agent}
+		c.agent = rec
+		victim := secondSession(t, c)
+
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, victim), keyMsg{Rune: 'a'})
+		dispatchSelection(t, c, "/session", "")
+
+		if len(rec.reserves) != 0 {
+			t.Fatalf("archive acquired a selection reservation: %v", rec.reserves)
+		}
+		if _, err := c.agent.SessionSummaryForSession(victim); err == nil {
+			t.Fatal("archive did not run the lifecycle path; the victim session still resolves")
+		}
+		if got, _ := c.currentSession(); got != source {
+			t.Fatalf("current after archiving another session = %q, want unchanged %q", got, source)
+		}
+	})
+
+	t.Run("delete=no_reservation", func(t *testing.T) {
+		_, c, _, source := selectionCLI(t)
+		rec := &recordingReserveAdapter{AdapterService: c.agent}
+		c.agent = rec
+		victim := secondSession(t, c)
+
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, victim), keyMsg{Rune: 'd'})
+		dispatchSelection(t, c, "/session", "")
+
+		if len(rec.reserves) != 0 {
+			t.Fatalf("delete acquired a selection reservation: %v", rec.reserves)
+		}
+		if _, err := c.agent.SessionSummaryForSession(victim); err == nil {
+			t.Fatal("delete did not run the lifecycle path; the victim session still resolves")
+		}
+		if got, _ := c.currentSession(); got != source {
+			t.Fatalf("current after deleting another session = %q, want unchanged %q", got, source)
+		}
+	})
+
+	t.Run("new=reserves_source", func(t *testing.T) {
+		// Positive control: the navigation sibling (new) does acquire the
+		// selection reservation.
+		_, c, _, source := selectionCLI(t)
+		rec := &recordingReserveAdapter{AdapterService: c.agent}
+		c.agent = rec
+		c.readKeyFn = func() (keyMsg, error) { return keyMsg{Rune: 'n'}, nil }
+		dispatchSelection(t, c, "/session", "")
+
+		if len(rec.reserves) != 1 || rec.reserves[0] != source {
+			t.Fatalf("new reservations = %v, want exactly the source %q", rec.reserves, source)
+		}
+		if got, _ := c.currentSession(); got == "" || got == source {
+			t.Fatalf("current after menu new = %q, want a fresh session distinct from %q", got, source)
+		}
+	})
+}
+
+// TestCLICompactCompletionGatedBySelection proves the compact/navigation
+// ordering: /compact stays async, but the completion mutates and renders only
+// while the session it was started for is still selected. A compact from the
+// source that completes after a same-batch navigation to the destination must
+// not erase the destination's prompt, change its state, or render the source
+// errors, and the navigation commit itself must reset the compacting/streaming
+// presentation even though a compact sets no stream fields.
+func TestCLICompactCompletionGatedBySelection(t *testing.T) {
+	// driveBatch runs one real key batch — /compact Enter /new Enter — exactly
+	// as mainLoop drains it, then waits for the compact op to enter the
+	// blocking adapter and commits the navigation.
+	driveBatch := func(t *testing.T, c *CLI, out *bytes.Buffer, adapter *blockingCompactAdapter) (source, dest string, outAfterNav string) {
+		t.Helper()
+		source = c.currentSessionID()
+		for _, k := range []keyMsg{
+			{Rune: '/'}, {Rune: 'c'}, {Rune: 'o'}, {Rune: 'm'}, {Rune: 'p'}, {Rune: 'a'}, {Rune: 'c'}, {Rune: 't'}, {Special: keyEnter},
+			{Rune: '/'}, {Rune: 'n'}, {Rune: 'e'}, {Rune: 'w'}, {Special: keyEnter},
+		} {
+			c.enqueueKey(k)
+		}
+		for {
+			k, ok := c.popKey()
+			if !ok {
+				break
+			}
+			if err := c.handleKey(k); err != nil {
+				t.Fatalf("handleKey: %v", err)
+			}
+		}
+		select {
+		case <-adapter.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("compact op did not enter the adapter")
+		}
+		dest = c.currentSessionID()
+		if dest == "" || dest == source {
+			t.Fatalf("current after the same-batch /new = %q, want a fresh session distinct from %q", dest, source)
+		}
+		c.mu.Lock()
+		compacting, state, animActive, busy := c.compacting, cliState(c.state.Load()), c.animActive, c.busy
+		c.mu.Unlock()
+		if compacting || state != stateIdle || animActive || busy {
+			t.Fatalf("presentation after the navigation commit = compacting:%v state:%v anim:%v busy:%v, want all reset", compacting, state, animActive, busy)
+		}
+		return source, dest, out.String()
+	}
+
+	t.Run("error_completion_after_navigation_renders_nothing", func(t *testing.T) {
+		a, c, out, _ := selectionCLI(t)
+		adapter := &blockingCompactAdapter{AdapterService: a, entered: make(chan struct{}), release: make(chan struct{})}
+		c.agent = adapter
+		_, dest, outAfterNav := driveBatch(t, c, out, adapter)
+
+		// The compact fails only after the navigation committed: the stale
+		// completion must render nothing into the destination view.
+		adapter.err = errors.New("compact failed")
+		close(adapter.release)
+		c.opWG.Wait() // the op's enqueuePost landed before the group done
+		c.drainEvents()
+		if got := out.String(); got != outAfterNav {
+			t.Fatalf("stale compact error rendered into the destination view: %q", got)
+		}
+		c.mu.Lock()
+		compacting, state, busy := c.compacting, cliState(c.state.Load()), c.busy
+		c.mu.Unlock()
+		if compacting || state != stateIdle || busy {
+			t.Fatalf("destination state after the stale completion = compacting:%v state:%v busy:%v, want untouched", compacting, state, busy)
+		}
+		if got, _ := c.currentSession(); got != dest {
+			t.Fatalf("current after the stale completion = %q, want %q", got, dest)
+		}
+	})
+
+	t.Run("success_completion_after_navigation_renders_nothing", func(t *testing.T) {
+		a, c, out, _ := selectionCLI(t)
+		adapter := &blockingCompactAdapter{AdapterService: a, entered: make(chan struct{}), release: make(chan struct{})}
+		c.agent = adapter
+		_, _, outAfterNav := driveBatch(t, c, out, adapter)
+
+		close(adapter.release)
+		c.opWG.Wait()
+		c.drainEvents()
+		if got := out.String(); got != outAfterNav {
+			t.Fatalf("stale compact success rendered into the destination view: %q", got)
+		}
+	})
+
+	t.Run("completion_while_still_current_renders", func(t *testing.T) {
+		// Positive control: a compact that completes while its own session is
+		// still selected finishes exactly as before — the error renders and
+		// the idle prompt returns.
+		a, c, out, source := selectionCLI(t)
+		adapter := &blockingCompactAdapter{AdapterService: a, entered: make(chan struct{}), release: make(chan struct{})}
+		c.agent = adapter
+		if err := c.dispatchCommand("/compact"); err != nil {
+			t.Fatalf("/compact: %v", err)
+		}
+		select {
+		case <-adapter.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("compact op did not enter the adapter")
+		}
+		adapter.err = errors.New("compact failed")
+		close(adapter.release)
+		c.opWG.Wait()
+		c.drainEvents()
+		if !strings.Contains(out.String(), "compact failed") {
+			t.Fatalf("current-session compact error not rendered: %q", out.String())
+		}
+		c.mu.Lock()
+		compacting, state := c.compacting, cliState(c.state.Load())
+		c.mu.Unlock()
+		if compacting || state != stateIdle {
+			t.Fatalf("state after the current-session compact = compacting:%v state:%v, want idle", compacting, state)
+		}
+		if got, _ := c.currentSession(); got != source {
+			t.Fatalf("current after the current-session compact = %q, want %q", got, source)
+		}
+	})
+}
+
+// TestCLINavigationReleasesSourceBeforeDestinationRender proves the release
+// timing contract on every navigation path: the source reservation ends at
+// the selection commit, before the destination render, so a stalled render
+// cannot hold the source transitioning. While the destination prompt write is
+// blocked, the source must already be usable again — a fresh reservation
+// succeeds and a submit starts a turn.
+func TestCLINavigationReleasesSourceBeforeDestinationRender(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTestResponse(w, "ok")
+	}))
+	t.Cleanup(server.Close)
+
+	rows := []struct {
+		name string
+		run  func(t *testing.T, c *CLI, a *agent.Agent) error
+	}{
+		{
+			name: "new",
+			run: func(t *testing.T, c *CLI, a *agent.Agent) error {
+				return c.dispatchCommand("/new")
+			},
+		},
+		{
+			name: "resume",
+			run: func(t *testing.T, c *CLI, a *agent.Agent) error {
+				dest := secondSession(t, c)
+				return c.dispatchCommand("/resume " + dest)
+			},
+		},
+		{
+			name: "session_select",
+			run: func(t *testing.T, c *CLI, a *agent.Agent) error {
+				dest := secondSession(t, c)
+				selectSessionByID(t, c, dest)
+				return c.dispatchCommand("/session")
+			},
+		},
+		{
+			name: "session_new",
+			run: func(t *testing.T, c *CLI, a *agent.Agent) error {
+				c.readKeyFn = func() (keyMsg, error) { return keyMsg{Rune: 'n'}, nil }
+				return c.dispatchCommand("/session")
+			},
+		},
+		{
+			name: "project_select",
+			run: func(t *testing.T, c *CLI, a *agent.Agent) error {
+				_, otherRoot := sessionInOtherProject(t, c)
+				selectProjectByPath(t, c, otherRoot)
+				return c.dispatchCommand("/project")
+			},
+		},
+	}
+
+	for _, row := range rows {
+		row := row
+		t.Run(row.name, func(t *testing.T) {
+			a, _ := newTestAgentWithBaseURL(t, server.URL)
+			startTestAgent(t, a)
+			source, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("source NewSession: %v", err)
+			}
+			c := New(a)
+			entered := make(chan struct{})
+			releaseWrite := make(chan struct{})
+			c.out = &markerBlockingWriter{marker: "> ", entered: entered, release: releaseWrite}
+			c.setCurrentSessionID(source)
+
+			done := make(chan error, 1)
+			go func() { done <- row.run(t, c, a) }()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("destination prompt write did not stall")
+			}
+
+			// The destination render is stalled at the prompt: the source
+			// reservation was released before rendering began, so the source
+			// is immediately usable again.
+			release2, err := a.ReserveSelectionSource(source)
+			if err != nil {
+				t.Fatalf("source still reserved while the destination render is stalled: %v", err)
+			}
+			release2()
+			res, err := a.SubmitToSession(context.Background(), source, "after commit")
+			if err != nil || !res.Started {
+				t.Fatalf("submit to the source during the stalled render = started:%v err:%v, want the released source to start a turn", res.Started, err)
+			}
+			busy, err := a.BusyForSession(source)
+			if err != nil || !busy {
+				t.Fatalf("source busy after the submit = %v (err %v), want the started turn", busy, err)
+			}
+
+			close(releaseWrite)
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("navigation: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("navigation did not return after the writer unblocked")
+			}
+			if got, _ := c.currentSession(); got == "" || got == source {
+				t.Fatalf("current after the navigation = %q, want the destination", got)
+			}
+			waitUntilAgentIdle(t, a)
+		})
+	}
+}
+
+// TestCLINavigationFailureReleasesSourceBeforeErrorRender proves the
+// destination-failure release timing on every navigation path: the source
+// reservation ends before the failure error renders, so a blocked error write
+// cannot hold the source transitioning. While the error render is stalled,
+// the source must already be usable again.
+func TestCLINavigationFailureReleasesSourceBeforeErrorRender(t *testing.T) {
+	rows := []struct {
+		name string
+		run  func(t *testing.T, c *CLI, a *agent.Agent) error
+	}{
+		{
+			name: "resume",
+			run: func(t *testing.T, c *CLI, a *agent.Agent) error {
+				return c.dispatchCommand("/resume does-not-exist")
+			},
+		},
+		{
+			name: "new",
+			run: func(t *testing.T, c *CLI, a *agent.Agent) error {
+				// The destination project is unreadable: its meta record is
+				// corrupt, so the new-session create cannot proceed.
+				badPath := filepath.Join(t.TempDir(), "blocked")
+				proj, err := project.EnsureForPath(a.Projects().Root(), badPath)
+				if err != nil {
+					t.Fatalf("EnsureForPath(%q): %v", badPath, err)
+				}
+				if err := os.WriteFile(filepath.Join(a.Projects().Root(), proj.ID, "meta.json"), []byte("{not json"), 0o600); err != nil {
+					t.Fatalf("corrupt destination project meta: %v", err)
+				}
+				c.scope.SetProjectPath(badPath)
+				return c.dispatchCommand("/new")
+			},
+		},
+		{
+			name: "session_select",
+			run: func(t *testing.T, c *CLI, a *agent.Agent) error {
+				dest := corruptSessionHistory(t, a, c.scope.ProjectPath())
+				selectSessionByID(t, c, dest)
+				return c.dispatchCommand("/session")
+			},
+		},
+		{
+			name: "project_select",
+			run: func(t *testing.T, c *CLI, a *agent.Agent) error {
+				otherRoot := t.TempDir()
+				corruptSessionHistory(t, a, otherRoot)
+				selectProjectByPath(t, c, otherRoot)
+				return c.dispatchCommand("/project")
+			},
+		},
+	}
+
+	for _, row := range rows {
+		row := row
+		t.Run(row.name, func(t *testing.T) {
+			a, c, _, source := selectionCLI(t)
+			entered := make(chan struct{})
+			releaseWrite := make(chan struct{})
+			c.out = &markerBlockingWriter{marker: "✕", entered: entered, release: releaseWrite}
+
+			done := make(chan error, 1)
+			go func() { done <- row.run(t, c, a) }()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("failure error write did not stall")
+			}
+
+			// The error render is stalled: the source reservation was
+			// released before it began, so the source is usable again.
+			release2, err := a.ReserveSelectionSource(source)
+			if err != nil {
+				t.Fatalf("source still reserved while the failure error render is stalled: %v", err)
+			}
+			release2()
+			if got, _ := c.currentSession(); got != source {
+				t.Fatalf("current while the failure error renders = %q, want unchanged %q", got, source)
+			}
+
+			close(releaseWrite)
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("navigation: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("navigation did not return after the writer unblocked")
+			}
+		})
+	}
+}
+
+// TestCLIResumeNoIDListsBeforeReservingSource proves the no-ID /resume lists
+// its destination candidates before reserving the source: while the candidate
+// list is blocked, the idle source stays claimable — a fresh reservation
+// succeeds and a submitted queue drains — and only once the chosen candidate
+// opens is the source protected by the reservation.
+func TestCLIResumeNoIDListsBeforeReservingSource(t *testing.T) {
+	server, firstEntered, firstRelease := blockingProvider(t)
+
+	a, _ := newTestAgentWithBaseURL(t, server.URL)
+	startTestAgent(t, a)
+	source, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("source NewSession: %v", err)
+	}
+	dest, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("dest NewSession: %v", err)
+	}
+
+	c := New(a)
+	out := new(bytes.Buffer)
+	c.out = out
+	c.setCurrentSessionID(source)
+	adapter := &stagedNavigationAdapter{
+		AdapterService: a,
+		blockList:      true,
+		listEntered:    make(chan struct{}),
+		listRelease:    make(chan struct{}),
+		blockOpen:      true,
+		openEntered:    make(chan struct{}),
+		openRelease:    make(chan struct{}),
+	}
+	c.agent = adapter
+	c.scope = agent.NewAdapterScope(adapter, c.scope.ProjectRoot())
+
+	done := make(chan error, 1)
+	go func() { done <- c.dispatchCommand("/resume") }()
+	select {
+	case <-adapter.listEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("resume candidate list did not block")
+	}
+
+	// Phase A: the candidate list runs with NO reservation held. The idle
+	// source stays claimable while listing...
+	release2, err := a.ReserveSelectionSource(source)
+	if err != nil {
+		t.Fatalf("source reserved while the candidate list is blocked: %v", err)
+	}
+	release2()
+	// ...and can submit and drain a queue: turn 1 holds on the provider,
+	// turn 2 queues and drains when turn 1 ends — all while the list is
+	// still blocked.
+	if res, err := a.SubmitToSession(context.Background(), source, "first"); err != nil || !res.Started {
+		t.Fatalf("submit while listing = started:%v err:%v, want a started turn", res.Started, err)
+	}
+	select {
+	case <-firstEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first turn request did not reach the provider")
+	}
+	if res, err := a.SubmitToSession(context.Background(), source, "second"); err != nil || res.Started {
+		t.Fatalf("second submit while the first turn runs = started:%v err:%v, want queued", res.Started, err)
+	}
+	close(firstRelease)
+	waitUntilSourceIdleAndDrained(t, a, source)
+
+	// Phase B: the list releases; the reservation is acquired immediately
+	// before the chosen candidate opens, which blocks. The source is now
+	// protected during the actual destination operation. The phase-A turns
+	// bumped the source's activity, so the destination is stamped newest to
+	// keep the candidate order deterministic.
+	stampSessionActivity(t, a, c.scope.ProjectPath(), dest, time.Now().Unix()+10)
+	close(adapter.listRelease)
+	select {
+	case <-adapter.openEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("destination open did not block")
+	}
+	if _, err := a.SubmitToSession(context.Background(), source, "during open"); err == nil ||
+		!strings.Contains(err.Error(), "session is changing") {
+		t.Fatalf("submit during the destination open = %v, want the reservation refusal", err)
+	}
+
+	close(adapter.openRelease)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("/resume: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("/resume did not return after the open released")
+	}
+	if got, _ := c.currentSession(); got != dest {
+		t.Fatalf("current after the no-ID resume = %q, want %q", got, dest)
+	}
+}
+
+// TestCLIProjectListsBeforeReservingSource proves /project lists and selects
+// its destinations before reserving the source: while the project list is
+// blocked, the idle source stays claimable — a fresh reservation succeeds and
+// a submitted queue drains — and only during the destination project's
+// open/create (its candidate scan) is the source protected by the
+// reservation.
+func TestCLIProjectListsBeforeReservingSource(t *testing.T) {
+	server, firstEntered, firstRelease := blockingProvider(t)
+
+	a, _ := newTestAgentWithBaseURL(t, server.URL)
+	startTestAgent(t, a)
+	source, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("source NewSession: %v", err)
+	}
+
+	c := New(a)
+	out := new(bytes.Buffer)
+	c.out = out
+	c.setCurrentSessionID(source)
+	dest, otherRoot := sessionInOtherProject(t, c)
+	// The menu keys are wired against the real listing before the adapter
+	// swap, so wiring itself cannot block on the staged project list.
+	selectProjectByPath(t, c, otherRoot)
+	adapter := &stagedNavigationAdapter{
+		AdapterService: a,
+		blockProject:   true,
+		projEntered:    make(chan struct{}),
+		projRelease:    make(chan struct{}),
+		blockList:      true,
+		listEntered:    make(chan struct{}),
+		listRelease:    make(chan struct{}),
+	}
+	c.agent = adapter
+	c.scope = agent.NewAdapterScope(adapter, c.scope.ProjectRoot())
+
+	done := make(chan error, 1)
+	go func() { done <- c.dispatchCommand("/project") }()
+	select {
+	case <-adapter.projEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("project list did not block")
+	}
+
+	// Phase A: the project list runs with NO reservation held. The idle
+	// source stays claimable while listing...
+	release2, err := a.ReserveSelectionSource(source)
+	if err != nil {
+		t.Fatalf("source reserved while the project list is blocked: %v", err)
+	}
+	release2()
+	// ...and can submit and drain a queue while the list is still blocked.
+	if res, err := a.SubmitToSession(context.Background(), source, "first"); err != nil || !res.Started {
+		t.Fatalf("submit while listing = started:%v err:%v, want a started turn", res.Started, err)
+	}
+	select {
+	case <-firstEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first turn request did not reach the provider")
+	}
+	if res, err := a.SubmitToSession(context.Background(), source, "second"); err != nil || res.Started {
+		t.Fatalf("second submit while the first turn runs = started:%v err:%v, want queued", res.Started, err)
+	}
+	close(firstRelease)
+	waitUntilSourceIdleAndDrained(t, a, source)
+
+	// Phase B: the menu selects the destination project; projectSwitch
+	// acquires the reservation immediately before OpenOrCreateSession, whose
+	// destination candidate scan blocks. The source is now protected during
+	// the actual destination operation.
+	close(adapter.projRelease)
+	select {
+	case <-adapter.listEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("destination candidate scan did not block")
+	}
+	if _, err := a.SubmitToSession(context.Background(), source, "during open"); err == nil ||
+		!strings.Contains(err.Error(), "session is changing") {
+		t.Fatalf("submit during the destination scan = %v, want the reservation refusal", err)
+	}
+
+	close(adapter.listRelease)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("/project: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("/project did not return after the scan released")
+	}
+	if got, _ := c.currentSession(); got != dest {
+		t.Fatalf("current after the project switch = %q, want %q", got, dest)
+	}
+	if got := c.scope.ProjectPath(); got != otherRoot {
+		t.Fatalf("project path after the switch = %q, want %q", got, otherRoot)
+	}
+}
+
+// selectIndex returns the 0-based menu index of the given session in the
+// CLI's own project-scoped listing order.
+func selectIndex(t *testing.T, c *CLI, id string) int {
+	t.Helper()
+	sessions, err := c.agent.SessionListForProjectPath(c.scope.ProjectPath(), "active")
+	if err != nil {
+		t.Fatalf("SessionListForProjectPath: %v", err)
+	}
+	for i, s := range sessions {
+		if s.ID == id {
+			return i
+		}
+	}
+	t.Fatalf("session %q not listed in the session menu", id)
+	return -1
+}
+
+// menuKeysWithTail returns a key source that navigates down n items, presses
+// Enter to select the n-th item, then yields the tail keys (e.g. the 'a' or
+// 'd' menu action).
+func menuKeysWithTail(n int, tail ...keyMsg) func() (keyMsg, error) {
+	return func() (keyMsg, error) {
+		if n > 0 {
+			n--
+			return keyMsg{Special: keyDown}, nil
+		}
+		if len(tail) > 0 {
+			k := tail[0]
+			tail = tail[1:]
+			return k, nil
+		}
+		return keyMsg{Special: keyEnter}, nil
+	}
 }
 
 // TestCLIProjectSwitchCreatesWhenEveryCandidateHeld proves /project over a
@@ -1101,7 +1902,6 @@ func TestCLIExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
 
 	// A turn refuses with the contention message, not "unknown session".
 	c.submitToBackend("hi")
-	c.opWG.Wait()
 	c.drainEvents()
 	if !strings.Contains(out.String(), "driven by another process") {
 		t.Fatalf("submit over the read-only session = %q, want the contention message", out.String())
@@ -1143,7 +1943,6 @@ func TestCLIExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
 	}
 	c.ctx = context.Background()
 	c.submitToBackend("hi")
-	c.opWG.Wait()
 	c.drainEvents()
 	if strings.Contains(out.String(), "driven by another process") {
 		t.Fatalf("submit after reopen reported contention: %q", out.String())
@@ -1192,21 +1991,15 @@ func TestCLISubmitResolvesTargetAtEnter(t *testing.T) {
 		t.Fatal("held session not marked read-only after the menu open")
 	}
 
-	// Block the op before the submit body runs, commit the source session, then
-	// release: the target was fixed when the submit was admitted, so the text
-	// still names the held session.
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	c.spawnOpHook = func() {
-		close(entered)
-		<-release
-	}
+	// The submit is synchronous: the target and its read-only classification
+	// are resolved and the owner call lands in one key-processing step, so a
+	// session switch can no longer interleave between Enter and the call. The
+	// error render is deferred through the delivery FIFO, so a switch after
+	// the call cannot redirect the error either: it still names the session
+	// that was current at Enter.
 	c.ctx = context.Background()
 	c.submitToBackend("hi")
-	<-entered
 	c.setCurrentSessionID(source)
-	close(release)
-	c.opWG.Wait()
 	c.drainEvents()
 
 	if got, _ := c.currentSession(); got != source {
@@ -1216,8 +2009,8 @@ func TestCLISubmitResolvesTargetAtEnter(t *testing.T) {
 		t.Fatalf("submit target = %#v, want the held session %q resolved at Enter", rec.submitted, heldID)
 	}
 	// The read-only classification is captured at Enter with the id, so the
-	// failure the user sees after the switch still names the contention on the
-	// session that was current then, not the owner's "unknown session" refusal.
+	// failure the user sees still names the contention on the session that
+	// was current then, not the owner's "unknown session" refusal.
 	if !strings.Contains(out.String(), fmt.Sprintf("session %q is being driven by another process", heldID)) {
 		t.Fatalf("submit failure after the switch = %q, want the contention message naming the held session", out.String())
 	}
@@ -1777,6 +2570,29 @@ func TestCLIExitLatchUnwindsKeyRead(t *testing.T) {
 	if !errors.As(err, &exit) || exit.ExitCode() != 7 {
 		t.Fatalf("nextKey after exit = %v, want ExitError code 7 (latch priority over buffered key)", err)
 	}
+
+	// stdin EOF through the real reader establishes the exit authority too:
+	// the reader observes EOF on the pipe, sets the latch, and a later key
+	// read unwinds with the EOF exit even with a key buffered.
+	t.Run("reader_eof_sets_latch", func(t *testing.T) {
+		c := New(nil)
+		c.ctx = context.Background()
+		r, w := io.Pipe()
+		defer r.Close()
+		go c.readKeysFrom(r)
+		w.Close()
+		select {
+		case <-c.exitLatch:
+		case <-time.After(5 * time.Second):
+			t.Fatal("EOF did not set the exit latch")
+		}
+		c.enqueueKey(keyMsg{Rune: 'x'})
+		_, err := c.nextKey(context.Background())
+		var exit interface{ ExitCode() int }
+		if !errors.As(err, &exit) || exit.ExitCode() != 0 {
+			t.Fatalf("nextKey after EOF = %v, want ExitError code 0", err)
+		}
+	})
 }
 
 // TestCLITickAnimationRendersWhenActiveOnly proves mainLoop's ticker renders a
@@ -1860,17 +2676,22 @@ func TestCLIOpGroupJoinsMembers(t *testing.T) {
 	}
 }
 
-// TestCLIAsyncOpsUseOpGroup proves submit and compact run through the op-group (so
-// they are admission-gated and joined on exit) rather than bare goroutines.
+// TestCLIAsyncOpsUseOpGroup proves compact and copy run through the op-group
+// (so they are admission-gated and joined on exit) rather than bare
+// goroutines, and that submit is synchronous by contract: the owner's claim
+// must land before the next key in the same batch, so it runs inline on the
+// key handler's goroutine with no spawnOp and no bare goroutine, posting only
+// its error render through the delivery FIFO.
 func TestCLIAsyncOpsUseOpGroup(t *testing.T) {
 	src, err := os.ReadFile("cli.go")
 	if err != nil {
 		t.Fatalf("read cli.go: %v", err)
 	}
 	s := string(src)
-	// submit and compact always run through the op-group; cmdCopy runs its clipboard
-	// fallback through it (its OSC-52 fast path is synchronous mainLoop output).
-	for _, fn := range []string{"func (c *CLI) submitToBackend(", "func (c *CLI) cmdCompact(", "func (c *CLI) cmdCopy("} {
+	// compact and copy always run through the op-group; cmdCopy runs its
+	// clipboard fallback through it (its OSC-52 fast path is synchronous
+	// mainLoop output).
+	for _, fn := range []string{"func (c *CLI) cmdCompact(", "func (c *CLI) cmdCopy("} {
 		body, ok := extractFunctionBody(s, fn)
 		if !ok {
 			t.Fatalf("%s not found", fn)
@@ -1881,6 +2702,22 @@ func TestCLIAsyncOpsUseOpGroup(t *testing.T) {
 		if !strings.Contains(body, "c.spawnOp(") {
 			t.Fatalf("%s must run through the op-group (spawnOp)", fn)
 		}
+	}
+	// submit is synchronous: the owner claim lands before the next key in the
+	// same batch, so the op-group (which could schedule the claim arbitrarily
+	// late) is not used.
+	body, ok := extractFunctionBody(s, "func (c *CLI) submitToBackend(")
+	if !ok {
+		t.Fatal("submitToBackend not found")
+	}
+	if strings.Contains(body, "c.spawnOp(") {
+		t.Fatal("submitToBackend must be synchronous, not op-group-spawned: the owner claim must land before the next key in the same batch")
+	}
+	if strings.Contains(body, "go func") {
+		t.Fatal("submitToBackend must not start a bare goroutine")
+	}
+	if !strings.Contains(body, "c.enqueuePost(") {
+		t.Fatal("submitToBackend must post its error render through the delivery FIFO")
 	}
 }
 
@@ -1951,14 +2788,14 @@ func TestCLIReadKeysSetsExitLatchBeforeClosingKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read cli.go: %v", err)
 	}
-	body, ok := extractFunctionBody(string(src), "func (c *CLI) readKeys(")
+	body, ok := extractFunctionBody(string(src), "func (c *CLI) readKeysFrom(")
 	if !ok {
-		t.Fatal("readKeys not found")
+		t.Fatal("readKeysFrom not found")
 	}
 	req := strings.Index(body, "c.requestExit(")
 	clo := strings.Index(body, "c.closeKeys()")
 	if req < 0 || clo < 0 || req > clo {
-		t.Fatalf("readKeys must set the exit latch (requestExit) before closing key admission (closeKeys); requestExit@%d closeKeys@%d", req, clo)
+		t.Fatalf("readKeysFrom must set the exit latch (requestExit) before closing key admission (closeKeys); requestExit@%d closeKeys@%d", req, clo)
 	}
 }
 
@@ -2050,6 +2887,203 @@ type recordingSubmitAdapter struct {
 func (r *recordingSubmitAdapter) SubmitToSession(ctx context.Context, sessionID, content string) (agent.SubmitResult, error) {
 	r.submitted = append(r.submitted, sessionID)
 	return r.AdapterService.SubmitToSession(ctx, sessionID, content)
+}
+
+// recordingReserveAdapter wraps the real agent and records every selection
+// reservation the CLI acquires, so a test can assert which navigation paths
+// reserve the source and that archive/delete acquire none.
+type recordingReserveAdapter struct {
+	agent.AdapterService
+	reserves []string
+}
+
+func (r *recordingReserveAdapter) ReserveSelectionSource(sessionID string) (func(), error) {
+	r.reserves = append(r.reserves, sessionID)
+	return r.AdapterService.ReserveSelectionSource(sessionID)
+}
+
+// blockingCompactAdapter wraps the real agent and blocks every
+// CompactNowForSession until release closes, then returns the configured
+// error, so a test can hold a compact in flight across a navigation and
+// decide its completion outcome deterministically.
+type blockingCompactAdapter struct {
+	agent.AdapterService
+	entered chan struct{}
+	release chan struct{}
+	err     error
+	once    sync.Once
+}
+
+func (b *blockingCompactAdapter) CompactNowForSession(ctx context.Context, sessionID string) error {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	return b.err
+}
+
+// stagedNavigationAdapter wraps the real agent and can hold each navigation
+// stage open until the test releases it: the destination candidate list
+// (SessionListForProjectPath), the destination open, and the project list.
+// While a stage is held, the test drives the owner directly to observe
+// whether the source reservation is held.
+type stagedNavigationAdapter struct {
+	agent.AdapterService
+	blockList    bool
+	listEntered  chan struct{}
+	listRelease  chan struct{}
+	listOnce     sync.Once
+	blockOpen    bool
+	openEntered  chan struct{}
+	openRelease  chan struct{}
+	openOnce     sync.Once
+	blockProject bool
+	projEntered  chan struct{}
+	projRelease  chan struct{}
+	projOnce     sync.Once
+}
+
+func (s *stagedNavigationAdapter) SessionListForProjectPath(projectPath, state string) ([]agent.SessionSummary, error) {
+	if s.blockList {
+		s.listOnce.Do(func() { close(s.listEntered) })
+		<-s.listRelease
+	}
+	return s.AdapterService.SessionListForProjectPath(projectPath, state)
+}
+
+func (s *stagedNavigationAdapter) OpenSession(id string) (agent.SessionSummary, error) {
+	if s.blockOpen {
+		s.openOnce.Do(func() { close(s.openEntered) })
+		<-s.openRelease
+	}
+	return s.AdapterService.OpenSession(id)
+}
+
+func (s *stagedNavigationAdapter) ProjectList() ([]agent.ProjectSummary, error) {
+	if s.blockProject {
+		s.projOnce.Do(func() { close(s.projEntered) })
+		<-s.projRelease
+	}
+	return s.AdapterService.ProjectList()
+}
+
+// waitUntilSourceIdleAndDrained waits until the source session is neither
+// busy nor carrying queued items, sustained briefly so a pending auto-drain
+// cannot still be about to start another turn.
+func waitUntilSourceIdleAndDrained(t *testing.T, a *agent.Agent, source string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	stable := 0
+	for time.Now().Before(deadline) {
+		busy, err := a.BusyForSession(source)
+		if err == nil && !busy {
+			if q, err := a.QueueSnapshotForSession(source); err == nil && len(q.Items) == 0 {
+				stable++
+				if stable >= 3 {
+					return
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("source did not become idle and drained")
+}
+
+// blockingProvider holds the first request open until released and answers
+// every later request immediately, so a test can hold turn 1 in flight while
+// a second submit queues, then let the queue drain.
+func blockingProvider(t *testing.T) (server *httptest.Server, firstEntered, firstRelease chan struct{}) {
+	t.Helper()
+	firstEntered = make(chan struct{})
+	firstRelease = make(chan struct{})
+	var reqs atomic.Int32
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if reqs.Add(1) == 1 {
+			close(firstEntered)
+			<-firstRelease
+		}
+		writeTestResponse(w, "ok")
+	}))
+	t.Cleanup(server.Close)
+	return server, firstEntered, firstRelease
+}
+
+// writeTestResponse answers a provider request with a plain-text body, the
+// shape the CLI test agents' engine loop accepts as a completed turn.
+func writeTestResponse(w http.ResponseWriter, content string) {
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprint(w, content)
+}
+
+// markerBlockingWriter passes writes through until one contains the marker,
+// then blocks every write until release closes, so a test can stall a render
+// at a chosen point — the input prompt ("> ") after a successful commit, or
+// the error marker ("✕") of a failure render. The session menu renders never
+// contain either marker, so the block lands only on the commit or failure
+// render.
+type markerBlockingWriter struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	marker  string
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	blocked bool
+}
+
+func (w *markerBlockingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	if !w.blocked {
+		w.buf.Write(p)
+		if strings.Contains(string(p), w.marker) {
+			w.blocked = true
+			w.mu.Unlock()
+			w.once.Do(func() { close(w.entered) })
+			<-w.release
+			return len(p), nil
+		}
+	}
+	w.mu.Unlock()
+	return len(p), nil
+}
+
+// busySourceCLI builds a CLI over an agent whose provider server holds every
+// request open until release, so a submitted turn stays claimed/running in
+// the owner deterministically for the whole test. The CLI's event handler is
+// wired to the delivery FIFO but nothing drains it unless the test does, so
+// the CLI's own event-derived presentation state stays exactly what the test
+// drives.
+func busySourceCLI(t *testing.T) (*agent.Agent, *CLI, *bytes.Buffer, string, func()) {
+	t.Helper()
+	block := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(block) }) }
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-block
+		http.Error(w, "released", http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	a, _ := newTestAgentWithBaseURL(t, server.URL)
+	startTestAgent(t, a)
+	source, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("source NewSession: %v", err)
+	}
+	c := New(a)
+	c.agent.SetEventHandler(c.enqueueEvent)
+	out := new(bytes.Buffer)
+	c.out = out
+	c.setCurrentSessionID(source)
+	// Submit a real turn: the claim is synchronous, so the source unit is
+	// busy as soon as SubmitToSession returns, and the blocked provider holds
+	// the turn open until release.
+	if _, err := a.SubmitToSession(context.Background(), source, "hold"); err != nil {
+		t.Fatalf("submit hold turn: %v", err)
+	}
+	t.Cleanup(func() {
+		release()
+		_ = a.CancelSession(source)
+	})
+	return a, c, out, source, release
 }
 
 func newTestAgentWithBaseURL(t *testing.T, baseURL string) (*agent.Agent, string) {
@@ -2465,7 +3499,7 @@ func TestCLIRunShutdownContract(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		mainDone := make(chan error, 1)
-		go func() { mainDone <- c.mainLoop(ctx) }()
+		go func() { mainDone <- c.mainLoop(ctx, nil) }()
 
 		// Pump one event so mainLoop enters handleEvent -> writeRaw and stalls
 		// inside the write, holding c.mu.
@@ -2519,24 +3553,35 @@ func TestCLIRunShutdownContract(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read cli.go: %v", err)
 		}
-		body, ok := extractFunctionBody(string(src), "func (c *CLI) Run(")
+		// runInteractive must not run mainLoop inline: the inline form puts
+		// the whole teardown behind a blocked terminal write.
+		body, ok := extractFunctionBody(string(src), "func (c *CLI) runInteractive(")
 		if !ok {
-			t.Fatal("Run not found")
+			t.Fatal("runInteractive not found")
 		}
-		// mainLoop must not run inline in Run: the inline form puts the whole
-		// teardown behind a blocked terminal write.
-		if strings.Contains(body, "err = c.mainLoop(ctx)") {
-			t.Fatal("Run must not run mainLoop inline; teardown would sit behind a blocked terminal write")
+		if strings.Contains(body, "= c.mainLoop(") {
+			t.Fatal("runInteractive must not run mainLoop inline; teardown would sit behind a blocked terminal write")
 		}
-		// Run must wait on the exit latch, so a signal starts teardown while
-		// mainLoop is still blocked, and the teardown must follow that wait.
+		// runInteractive must wait on the exit latch, so a signal starts
+		// teardown while mainLoop is still blocked, and the teardown must
+		// follow that wait.
 		latchIdx := strings.Index(body, "case <-c.exitLatch:")
 		teardownIdx := strings.Index(body, "c.closeKeys()")
 		if latchIdx < 0 {
-			t.Fatal("Run must wait on the exit latch so teardown does not sit behind mainLoop")
+			t.Fatal("runInteractive must wait on the exit latch so teardown does not sit behind mainLoop")
 		}
 		if teardownIdx < 0 || teardownIdx < latchIdx {
-			t.Fatal("Run's teardown must follow the latch wait, not mainLoop's return")
+			t.Fatal("runInteractive's teardown must follow the latch wait, not mainLoop's return")
+		}
+		// Run must not launch mainLoop itself: the startup presentation and
+		// the loop launch belong to runInteractive, so the exit authority and
+		// the reader exist before the first startup write.
+		runBody, ok := extractFunctionBody(string(src), "func (c *CLI) Run(")
+		if !ok {
+			t.Fatal("Run not found")
+		}
+		if strings.Contains(runBody, "c.mainLoop(") {
+			t.Fatal("Run must not launch mainLoop; runInteractive establishes the exit authority and the reader before the startup write")
 		}
 	})
 
@@ -2601,15 +3646,15 @@ func TestCLIRunShutdownContract(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read cli.go: %v", err)
 		}
-		body, ok := extractFunctionBody(string(src), "func (c *CLI) Run(")
+		body, ok := extractFunctionBody(string(src), "func (c *CLI) runInteractive(")
 		if !ok {
-			t.Fatal("Run not found")
+			t.Fatal("runInteractive not found")
 		}
 		signals := []string{"syscall.SIGWINCH", "syscall.SIGINT", "syscall.SIGTERM"}
 		for _, sig := range signals {
 			idx := strings.Index(body, sig)
 			if idx < 0 {
-				t.Fatalf("Run no longer registers %s", sig)
+				t.Fatalf("runInteractive no longer registers %s", sig)
 			}
 			notifyStart := strings.LastIndex(body[:idx], "signal.Notify(")
 			if notifyStart < 0 {
@@ -2713,6 +3758,143 @@ func TestCLIRunShutdownContract(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatalf("terminate did not reach the exit latch after a resize burst (delivered=%v)", terminateDelivered)
 		}
+	})
+
+	t.Run("startup=renders_first_on_main_loop", func(t *testing.T) {
+		// Exception, recorded per the contract-test rule: Run cannot be driven
+		// in a test (term.MakeRaw on os.Stdin requires a real TTY), so
+		// mainLoop is driven directly with the prepared startup closure, the
+		// exact shape runInteractive launches. Keys and events are already
+		// buffered before mainLoop starts; the startup closure is its first
+		// action, so the startup output is the first rendered content and
+		// nothing overtakes it.
+		c := New(nil)
+		var out bytes.Buffer
+		c.out = &out
+		c.enqueueKey(keyMsg{Rune: 'k'})
+		c.enqueueEvent(agent.Event{Kind: agent.EventUserMessageDisplay, Result: "ready-event"})
+
+		started := make(chan struct{})
+		startup := func() {
+			c.printLine("STARTUP-MARKER")
+			close(started)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- c.mainLoop(ctx, startup) }()
+
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("startup closure did not run as mainLoop's first action")
+		}
+		c.requestExit(ExitError{Code: 0})
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("mainLoop did not unwind after the startup marker")
+		}
+		// mainLoop has returned; the buffer is quiescent.
+		s := out.String()
+		if !strings.HasPrefix(s, "STARTUP-MARKER") {
+			t.Fatalf("startup did not render first (buffered key/event overtook it): %q", s)
+		}
+	})
+
+	t.Run("startup=blocked_write_sigterm_unwinds", func(t *testing.T) {
+		// Exception, recorded per the contract-test rule: Run cannot be
+		// driven in a test (term.MakeRaw on os.Stdin requires a real TTY), so
+		// runInteractive is driven directly with a pipe input and a blocked
+		// startup write. The startup write stalls inside mainLoop, yet SIGTERM
+		// still unwinds to the joined owner cleanup: the exit authority and
+		// the reader existed before the first startup write.
+		a, _ := newTestAgent(t)
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		startTestAgent(t, a)
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		c := New(a)
+		c.out = &blockingWriter{entered: entered, release: release}
+		c.rawFd = 0
+
+		r, w := io.Pipe()
+		defer r.Close()
+		defer w.Close()
+
+		done := make(chan error, 1)
+		go func() { done <- c.runInteractive(context.Background(), func() { c.printLine("startup") }, r) }()
+
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("startup write did not enter the blocked output")
+		}
+		c.handleSignal(syscall.SIGTERM)
+		select {
+		case err := <-done:
+			var exit ExitError
+			if !errors.As(err, &exit) || exit.Code != 130 {
+				t.Fatalf("runInteractive returned %v, want the clean ExitError{130} (owner cleanup completed)", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("runInteractive did not unwind to owner cleanup while the startup write was blocked")
+		}
+		// The blocked write is still stalled: teardown did not wait for it.
+		select {
+		case <-release:
+			t.Fatal("teardown released the blocked write")
+		default:
+		}
+		close(release)
+	})
+
+	t.Run("startup=blocked_write_eof_unwinds", func(t *testing.T) {
+		// Exception, recorded per the contract-test rule: Run cannot be
+		// driven in a test (term.MakeRaw on os.Stdin requires a real TTY), so
+		// runInteractive is driven directly with a pipe input and a blocked
+		// startup write. Closing the pipe (stdin EOF) starts owner cleanup
+		// independently of the blocked write.
+		a, _ := newTestAgent(t)
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		startTestAgent(t, a)
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		c := New(a)
+		c.out = &blockingWriter{entered: entered, release: release}
+		c.rawFd = 0
+
+		r, w := io.Pipe()
+		defer r.Close()
+
+		done := make(chan error, 1)
+		go func() { done <- c.runInteractive(context.Background(), func() { c.printLine("startup") }, r) }()
+
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("startup write did not enter the blocked output")
+		}
+		w.Close() // stdin EOF
+		select {
+		case err := <-done:
+			var exit ExitError
+			if !errors.As(err, &exit) || exit.Code != 0 {
+				t.Fatalf("runInteractive returned %v, want the clean EOF ExitError{0} (owner cleanup completed)", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("runInteractive did not unwind to owner cleanup on EOF while the startup write was blocked")
+		}
+		select {
+		case <-release:
+			t.Fatal("teardown released the blocked write")
+		default:
+		}
+		close(release)
 	})
 
 	t.Run("permission_prompt=exit_performs_no_answer", func(t *testing.T) {
@@ -3167,6 +4349,51 @@ func TestCLIRestoreTerminalUnblockedByStalledWrite(t *testing.T) {
 			t.Fatal("restoreTerminal wrote to a stalled output")
 		default:
 		}
+	})
+
+	t.Run("startup_write_stalled=restore_still_runs", func(t *testing.T) {
+		// Exception, recorded per the contract-test rule: Run cannot be
+		// driven in a test (term.MakeRaw on os.Stdin requires a real TTY), so
+		// runInteractive is driven directly. The finding-6 shape: the startup
+		// write itself is the blocked one. runInteractive returns (teardown
+		// never waits for the abandoned mainLoop) and the deferred
+		// restoreTerminal still runs with the write stalled — the mode
+		// restore is a control operation on the descriptor and cannot block
+		// on the output.
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		c := New(nil)
+		c.out = &blockingWriter{entered: entered, release: release}
+		c.rawFd = 0
+		c.oldState = &term.State{}
+
+		r, w := io.Pipe()
+		defer r.Close()
+		defer w.Close()
+
+		done := make(chan error, 1)
+		go func() { done <- c.runInteractive(context.Background(), func() { c.printLine("startup") }, r) }()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("startup write did not stall")
+		}
+		c.handleSignal(syscall.SIGTERM)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("runInteractive did not return while the startup write was stalled")
+		}
+		select {
+		case <-release:
+			t.Fatal("teardown released the blocked write")
+		default:
+		}
+		c.restoreTerminal()
+		if c.oldState != nil {
+			t.Fatal("restoreTerminal did not restore the terminal mode")
+		}
+		close(release)
 	})
 }
 

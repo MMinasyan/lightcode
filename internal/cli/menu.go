@@ -430,9 +430,21 @@ func (c *CLI) showSessionMenuInner(state string) {
 	case "select":
 		if result.selected >= 0 {
 			id := result.extra.(string)
+			// The source is reserved immediately before the destination open
+			// and released at the selection commit: a busy or transitioning
+			// source refuses here with the owner's mutability error, and an
+			// idle source cannot start a turn while the destination commits.
+			// The release comes before the render, so a blocked render cannot
+			// hold the source transitioning.
+			release, err := c.reserveSelection()
+			if err != nil {
+				c.printLine(renderErrorMsg(err.Error()))
+				return
+			}
 			summary, err := c.agent.OpenSession(id)
 			if err != nil {
 				if !errors.Is(err, snapshot.ErrSessionContended) {
+					release()
 					c.printLine(renderErrorMsg(err.Error()))
 					return
 				}
@@ -441,6 +453,7 @@ func (c *CLI) showSessionMenuInner(state string) {
 				// routing current only once the view is available.
 				state, herr := c.owner.HydrateSession(id)
 				if herr != nil {
+					release()
 					c.printLine(renderErrorMsg(herr.Error()))
 					return
 				}
@@ -451,19 +464,32 @@ func (c *CLI) showSessionMenuInner(state string) {
 				// than re-read, so routing moves only once the view is in
 				// hand: a presentation that cannot be produced leaves the
 				// previous session and project in place.
+				release()
 				c.refreshFromHydration(state)
 				return
 			}
 			c.setCurrentSessionID(summary.ID)
+			release()
 			c.refreshSession()
 		}
 	case "new":
-		id, err := c.scope.NewSession("primary")
+		// The source is reserved immediately before the destination create
+		// and released at the selection commit, exactly as the select branch
+		// reserves it. Archive/delete are lifecycle operations and do not
+		// reserve.
+		release, err := c.reserveSelection()
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
+		id, err := c.scope.NewSession("primary")
+		if err != nil {
+			release()
+			c.printLine(renderErrorMsg(err.Error()))
+			return
+		}
 		c.setCurrentSessionID(id)
+		release()
 		c.refreshSession()
 	case "archive":
 		if result.selected >= 0 {

@@ -53,10 +53,7 @@ type CLI struct {
 	input     *inputLine
 	history   inputHistory
 	readKeyFn func() (keyMsg, error)
-	// spawnOpHook is a test-only seam invoked at the top of each op-group
-	// goroutine before the op body runs; nil in production.
-	spawnOpHook func()
-	ctx         context.Context
+	ctx       context.Context
 
 	// Exit latch: requestExit stores the exit error and closes exitLatch once. Every
 	// key read (mainLoop and nested menus) and mainLoop's select observe it, so a
@@ -217,9 +214,6 @@ func (c *CLI) spawnOp(fn func()) bool {
 	c.opMu.Unlock()
 	go func() {
 		defer c.opWG.Done()
-		if c.spawnOpHook != nil {
-			c.spawnOpHook()
-		}
 		fn()
 	}()
 	return true
@@ -356,6 +350,25 @@ func (c *CLI) sv() *agent.SessionView {
 
 func (c *CLI) setCurrentSessionID(id string) {
 	c.sv().SetCurrent(id)
+	// A selection commit replaces the source; any busy/streaming/compacting
+	// presentation the CLI carried belonged to the previous current, whose
+	// terminal events are now filtered. The reservation proved the source
+	// idle or the commit could not have happened, so the presentation
+	// returns to idle and the destination's own turn events drive it from
+	// here. The reset is unconditional: a compact in flight sets no stream
+	// fields, so a guard on them would leave the compacting state, the
+	// streaming state, and the spinner stuck on the destination.
+	c.mu.Lock()
+	c.busy = false
+	c.streamStarted = false
+	c.streamDisplayActive = false
+	c.streamBuf.Reset()
+	c.streamVisibleBuf.Reset()
+	c.streamNeedsNL = false
+	c.compacting = false
+	c.state.Store(int32(stateIdle))
+	c.stopAnimationLocked()
+	c.mu.Unlock()
 }
 
 func (c *CLI) currentSessionID() string {
@@ -469,6 +482,48 @@ func (c *CLI) Run(ctx context.Context) error {
 		c.setWidth(w)
 	}
 
+	c.agent.SetEventHandler(c.enqueueEvent)
+
+	// Init resumes the most recent acquirable session and returns its id, so
+	// the adapter adopts exactly the session that was resumed; a new session
+	// is created only when nothing was resumed. This is owner work, not
+	// presentation: the header/history/prompt closure below runs only on
+	// mainLoop's goroutine, after the reader and the signal watcher exist, so
+	// a blocked startup write cannot retain the owner.
+	sessionID := c.agent.Init(ctx)
+	if sessionID == "" {
+		if id, err := c.scope.NewSession("primary"); err == nil {
+			sessionID = id
+		}
+	}
+	c.setCurrentSessionID(sessionID)
+
+	c.refreshState()
+
+	msgs := c.sessionMessages()
+	c.messages = buildDisplayMsgs(msgs)
+	c.seedInputHistory()
+
+	return c.runInteractive(ctx, func() {
+		c.printHeader()
+		for _, m := range c.messages {
+			c.printDisplayEntry(m)
+		}
+		c.printInputPrompt()
+	}, os.Stdin)
+}
+
+// runInteractive runs the terminal session: signal observation, the key
+// reader, and mainLoop are established before the startup presentation runs
+// (mainLoop's first action), so the sole terminal writer is the abandonable
+// main-loop goroutine and SIGTERM or stdin EOF can start owner cleanup even
+// while a startup write is blocked. It observes mainLoop's completion or the
+// exit latch, then performs the host teardown order without waiting for an
+// abandoned blocked writer.
+func (c *CLI) runInteractive(ctx context.Context, startup func(), input io.Reader) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	// Signals are split by kind: every signal that can independently require
 	// its own action gets its own registration and channel, so a full
 	// channel can only drop another of the same signal — one of that kind is
@@ -489,53 +544,28 @@ func (c *CLI) Run(ctx context.Context) error {
 	c.ctx = ctx
 	c.readKeyFn = func() (keyMsg, error) { return c.nextKey(ctx) }
 
-	c.agent.SetEventHandler(c.enqueueEvent)
-
-	// Init resumes the most recent acquirable session and returns its id, so
-	// the adapter adopts exactly the session that was resumed; a new session
-	// is created only when nothing was resumed.
-	sessionID := c.agent.Init(ctx)
-	if sessionID == "" {
-		if id, err := c.scope.NewSession("primary"); err == nil {
-			sessionID = id
-		}
-	}
-	c.setCurrentSessionID(sessionID)
-
-	c.refreshState()
-
-	msgs := c.sessionMessages()
-	c.messages = buildDisplayMsgs(msgs)
-	c.seedInputHistory()
-
-	c.printHeader()
-
-	for _, m := range c.messages {
-		c.printDisplayEntry(m)
-	}
-
-	c.printInputPrompt()
-
-	go c.readKeys(ctx)
+	go c.readKeysFrom(input)
 
 	// mainLoop runs on its own goroutine: a terminal write can block forever
 	// (stdout stopped being read) and teardown must not sit behind it. Only
 	// mainLoop is abandoned in that one blocked write; the op-group and the
 	// owner are still joined below.
 	mainDone := make(chan error, 1)
-	go func() { mainDone <- c.mainLoop(ctx) }()
+	go func() { mainDone <- c.mainLoop(ctx, startup) }()
 
+	var err error
 	select {
 	case err = <-mainDone:
 	case <-c.exitLatch:
 		err = c.exitErr
 	}
 
-	// Teardown in the one host-shutdown order: stop ingress (close key and op-group
-	// admission), cancel the input/signal goroutines and release members blocked in
-	// owner calls, join the owner so a cancelled turn's terminal events are still
-	// admitted, join the op-group members, then close delivery. restoreTerminal runs
-	// via the deferred cleanup, after the owner join.
+	// Teardown in the one host-shutdown order: stop ingress (close key and
+	// op-group admission), cancel the input/signal goroutines and release
+	// members blocked in owner calls, join the owner so a cancelled turn's
+	// terminal events are still admitted, join the op-group members, then
+	// close delivery. restoreTerminal runs via the deferred cleanup in Run,
+	// after the owner join.
 	c.closeKeys()
 	c.closeOpAdmission()
 	cancel()
@@ -610,15 +640,20 @@ func (c *CLI) watchSignals(termCh, intCh, resizeCh <-chan os.Signal, ctx context
 	}
 }
 
-func (c *CLI) readKeys(ctx context.Context) {
+// readKeysFrom parses keys from input until EOF or the host context ends.
+// On EOF it sets the exit latch BEFORE closing key admission, so the wake
+// closeKeys issues can never let mainLoop or a nested menu pop and act on a
+// buffered key while the latch still looks open. Production passes os.Stdin;
+// tests pass a pipe.
+func (c *CLI) readKeysFrom(input io.Reader) {
 	var buf [256]byte
 	for {
 		select {
-		case <-ctx.Done():
+		case <-c.ctx.Done():
 			return
 		default:
 		}
-		n, err := os.Stdin.Read(buf[:])
+		n, err := input.Read(buf[:])
 		if err != nil {
 			// stdin ended: set the exit latch BEFORE closing key admission, so the
 			// wake closeKeys issues can never let mainLoop or a nested menu pop and
@@ -634,7 +669,16 @@ func (c *CLI) readKeys(ctx context.Context) {
 	}
 }
 
-func (c *CLI) mainLoop(ctx context.Context) error {
+// mainLoop is the sole terminal writer. Its first action is the prepared
+// startup presentation closure (header, restored history, prompt), so startup
+// output runs on the same abandonable goroutine as every later write and
+// cannot precede the exit authority runInteractive established; then it
+// services keys, owner events, the animation ticker, the exit latch, and the
+// host context.
+func (c *CLI) mainLoop(ctx context.Context, startup func()) error {
+	if startup != nil {
+		startup()
+	}
 	anim := time.NewTicker(80 * time.Millisecond)
 	defer anim.Stop()
 	for {
@@ -1644,34 +1688,32 @@ func (c *CLI) submitInputLocked(text string) {
 	c.submitToBackend(text)
 }
 
-// submitToBackend routes input through the agent's single Submit entry point.
-// The target session and its read-only classification are resolved before the
-// op is admitted, so a session switch handled between Enter and the op running
-// can neither redirect the text to the new session nor change which failure
-// the submit reports. The agent decides whether to start a turn or enqueue and
-// emits queue_changed; the CLI does not own the queue. On error it renders the
-// message and, if idle, restores the input prompt. The submit runs off the lock
-// in the op-group goroutine.
+// submitToBackend routes input through the agent's single Submit entry point
+// synchronously: the owner's claim lands before the next key in the same
+// batch is processed, so same-batch navigation sees the source busy and is
+// refused by owner state. It performs no terminal write and takes no CLI
+// lock; the returned error is rendered through the delivery FIFO after the
+// caller's key-processing lock frame exits, so rendering stays on mainLoop's
+// goroutine in order with owner events. The agent decides whether to start a
+// turn or enqueue and emits queue_changed; the CLI does not own the queue.
 func (c *CLI) submitToBackend(text string) {
 	sessionID, err := c.currentSession()
 	readOnly := err == nil && c.sv().IsReadOnly(sessionID)
-	c.spawnOp(func() {
-		if err == nil {
-			_, err = c.agent.SubmitToSession(c.ctx, sessionID, text)
-			if err != nil && readOnly {
-				// The session is read-only: another process drives it, so the
-				// owner refuses it as unknown. Say what is actually wrong.
-				err = agent.SessionContendedError(sessionID)
-			}
+	if err == nil {
+		_, err = c.agent.SubmitToSession(c.ctx, sessionID, text)
+		if err != nil && readOnly {
+			// The session is read-only: another process drives it, so the
+			// owner refuses it as unknown. Say what is actually wrong.
+			err = agent.SessionContendedError(sessionID)
 		}
-		if err != nil {
-			c.enqueuePost(func() {
-				c.mu.Lock()
-				c.handleSubmitErrorLocked(text, err)
-				c.mu.Unlock()
-			})
-		}
-	})
+	}
+	if err != nil {
+		c.enqueuePost(func() {
+			c.mu.Lock()
+			c.handleSubmitErrorLocked(text, err)
+			c.mu.Unlock()
+		})
+	}
 }
 
 func (c *CLI) handleSubmitErrorLocked(text string, err error) {
@@ -1685,6 +1727,22 @@ func (c *CLI) handleSubmitErrorLocked(text string, err error) {
 		c.state.Store(int32(stateIdle))
 		c.printInputPromptLocked()
 	}
+}
+
+// reserveSelection reserves the current selection's source session against
+// destination create/open/switch. Owner busy/transitioning state — not the
+// CLI's event-derived busy flag — is the navigation authority: an idle live
+// source stays reserved through the destination commit, and a busy or
+// transitioning source refuses with the owner's mutability error, leaving the
+// selection unchanged. A no-op reservation (no current source, or a
+// read-only session another process drives, which is not live in this owner)
+// lets navigation proceed.
+func (c *CLI) reserveSelection() (func(), error) {
+	sessionID, err := c.currentSession()
+	if err != nil {
+		return func() {}, nil
+	}
+	return c.agent.ReserveSelectionSource(sessionID)
 }
 
 func (c *CLI) refreshSession() {
@@ -1782,9 +1840,19 @@ func (c *CLI) handleSlashWhileBusy(text string) {
 		c.mu.Unlock()
 		c.cmdCopy()
 		c.mu.Lock()
+	case "/session", "/project", "/new", "/resume":
+		// Navigation while the CLI streams: the owner's state decides, not
+		// the CLI's event-derived busy. Dispatch through the real path — the
+		// source reservation refuses a busy or transitioning source with the
+		// owner's mutability error and leaves the selection unchanged, and a
+		// successful commit resets the streaming presentation in
+		// setCurrentSessionID. The spinner restarts only when the source is
+		// still current and still streaming.
+		c.mu.Unlock()
+		_ = c.dispatchCommand(text)
+		c.mu.Lock()
 	default:
-		if cmd == "/model" || cmd == "/session" || cmd == "/project" || cmd == "/new" ||
-			cmd == "/resume" || cmd == "/revert" || cmd == "/fork" ||
+		if cmd == "/model" || cmd == "/revert" || cmd == "/fork" ||
 			cmd == "/compact" || cmd == "/exit" {
 			c.writeRaw(renderErrorMsg("cannot run this command while a turn is running"))
 		} else {
@@ -1792,7 +1860,9 @@ func (c *CLI) handleSlashWhileBusy(text string) {
 		}
 	}
 
-	c.startAnimationLocked(label)
+	if c.busy {
+		c.startAnimationLocked(label)
+	}
 	c.mu.Unlock()
 }
 
@@ -1812,12 +1882,22 @@ func (c *CLI) dispatchCommand(text string) error {
 	case "/project":
 		c.showProjectMenu()
 	case "/new":
-		id, err := c.scope.NewSession("primary")
+		release, err := c.reserveSelection()
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return nil
 		}
+		id, err := c.scope.NewSession("primary")
+		if err != nil {
+			release()
+			c.printLine(renderErrorMsg(err.Error()))
+			return nil
+		}
 		c.setCurrentSessionID(id)
+		// The source reservation ends at the selection commit, before the
+		// destination render: a blocked render must not hold the source
+		// transitioning, so its queue and signal turns can proceed.
+		release()
 		c.refreshSession()
 	case "/resume":
 		c.cmdResume(parts)
@@ -1883,11 +1963,25 @@ func (c *CLI) clearTerminalLocked() {
 }
 
 func (c *CLI) cmdResume(parts []string) {
+	// The source is reserved across the destination open and the selection
+	// commit: a busy or transitioning source refuses here with the owner's
+	// mutability error, and an idle source cannot start a turn while the
+	// destination commits. The reservation ends at the commit or at the
+	// failure, before any terminal I/O, so a blocked render or error write
+	// cannot hold the source transitioning.
 	if len(parts) > 1 {
+		// Direct /resume <id>: the destination is chosen by the argument, so
+		// the source is reserved immediately before the open.
+		release, err := c.reserveSelection()
+		if err != nil {
+			c.printLine(renderErrorMsg(err.Error()))
+			return
+		}
 		id := parts[1]
 		summary, err := c.agent.OpenSession(id)
 		if err != nil {
 			if !errors.Is(err, snapshot.ErrSessionContended) {
+				release()
 				c.printLine(renderErrorMsg(err.Error()))
 				return
 			}
@@ -1896,6 +1990,7 @@ func (c *CLI) cmdResume(parts []string) {
 			// current only once the view is available.
 			state, herr := c.owner.HydrateSession(id)
 			if herr != nil {
+				release()
 				c.printLine(renderErrorMsg(herr.Error()))
 				return
 			}
@@ -1906,6 +2001,7 @@ func (c *CLI) cmdResume(parts []string) {
 			// re-read, so routing moves only once the view is in hand: a
 			// presentation that cannot be produced leaves the previous session
 			// and project in place.
+			release()
 			c.refreshFromHydration(state)
 			return
 		}
@@ -1914,10 +2010,17 @@ func (c *CLI) cmdResume(parts []string) {
 		// the session against its project, so the summary always carries one.
 		c.scope.SetProjectPath(summary.ProjectPath)
 		c.setCurrentSessionID(summary.ID)
+		release()
 		c.refreshSession()
 		return
 	}
 
+	// No-ID resume: the destination candidates are listed first with NO
+	// reservation held, so the idle source stays claimable (submit, queue
+	// drain, signal turns) while the list runs. The reservation is acquired
+	// immediately before each candidate open and released at that candidate's
+	// commit or failure; a contended candidate is skipped and the next is
+	// tried.
 	sessions, err := c.scope.SessionList("active")
 	if err != nil {
 		c.printLine(renderErrorMsg(err.Error()))
@@ -1933,16 +2036,24 @@ func (c *CLI) cmdResume(parts []string) {
 	// surfaces: this is user-initiated, so a corrupt session must not be
 	// skipped silently.
 	for _, s := range sessions {
+		release, err := c.reserveSelection()
+		if err != nil {
+			c.printLine(renderErrorMsg(err.Error()))
+			return
+		}
 		summary, err := c.agent.OpenSession(s.ID)
 		if err == nil {
 			c.setCurrentSessionID(summary.ID)
+			release()
 			c.refreshSession()
 			return
 		}
 		if !errors.Is(err, snapshot.ErrSessionContended) {
+			release()
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
+		release()
 	}
 	c.printLine(renderErrorMsg("no active sessions"))
 }
@@ -1993,6 +2104,16 @@ func (c *CLI) cmdCompact() {
 	c.spawnOp(func() {
 		err := c.agent.CompactNowForSession(c.ctx, sessionID)
 		c.enqueuePost(func() {
+			// The compact ran for the source session captured at start. If a
+			// navigation committed meanwhile, the destination owns the
+			// terminal: the completion must not erase its prompt, change its
+			// state, or render the source's errors. setCurrentSessionID
+			// already cleared the compacting presentation on that commit, so
+			// a stale completion has nothing to finish. A compact still on
+			// its own session finishes exactly as before.
+			if c.sv().Current() != sessionID {
+				return
+			}
 			c.mu.Lock()
 			idle := c.finishCompactLocked()
 			c.mu.Unlock()
@@ -2047,13 +2168,26 @@ func (c *CLI) cmdCopy() {
 }
 
 func (c *CLI) projectSwitch(targetPath string) {
+	// The source is reserved across the destination open and the selection
+	// commit: a busy or transitioning source refuses here with the owner's
+	// mutability error, and an idle source cannot start a turn while the
+	// destination commits. The reservation ends at the commit or at the
+	// failure, before any terminal I/O, so a blocked render or error write
+	// cannot hold the source transitioning.
+	release, err := c.reserveSelection()
+	if err != nil {
+		c.printLine(renderErrorMsg(err.Error()))
+		return
+	}
 	summary, err := c.scope.OpenOrCreateSession(targetPath)
 	if err != nil {
+		release()
 		c.printLine(renderErrorMsg(err.Error()))
 		return
 	}
 	c.scope.SetProjectPath(targetPath)
 	c.setCurrentSessionID(summary.ID)
+	release()
 	c.refreshSession()
 }
 

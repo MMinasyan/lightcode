@@ -60,6 +60,12 @@ type AdapterService interface {
 	SessionList(string) ([]SessionSummary, error)
 	OpenSession(string) (SessionSummary, error)
 	OpenSessionWithBoundary(string, func(HydrationState)) (SessionSummary, error)
+	// ReserveSelectionSource reserves the selection's source session while a
+	// navigation command creates, opens, or switches to a destination. A
+	// no-op release for an empty/non-live/read-only source; the existing
+	// mutability error for a busy or transitioning source; the transitioning
+	// reservation (released by the returned func) for an idle live source.
+	ReserveSelectionSource(string) (func(), error)
 	NewSession(string, string) (string, error)
 	NewSessionWithBoundary(string, string, func(HydrationState)) (string, error)
 	NewSessionForProjectPath(string, string) (string, error)
