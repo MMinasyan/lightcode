@@ -475,10 +475,9 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 	if turn = childStore.BeginTurn(); turn == 0 {
 		return finish(taskResult{index: index, err: fmt.Errorf("subagent: child session is not active")})
 	}
-	// Feed the turn start into the child's coordinator so curTurn names the
-	// turn being persisted: the capture's disjoint-halves guard compares
-	// curTurn against the highest durable turn, and a child that completed its
-	// turn durably without advancing curTurn would keep that window open.
+	// Record the child's turn in its coordinator before any rows are
+	// sequenced: the rows must carry the turn being persisted, which the
+	// flush commit and the revert/compaction error dispositions key off.
 	if t.rt != nil {
 		feedTranscript(t.rt.transcriptForSessionID(sessionID), Event{Kind: EventTurnStart, SessionID: sessionID, ProjectID: t.projectID, Turn: turn})
 	}

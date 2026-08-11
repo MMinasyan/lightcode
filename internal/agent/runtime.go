@@ -136,15 +136,28 @@ type transcriptCursor struct {
 
 // registerTranscript inserts a fresh coordinator entry for id if none exists.
 // It is called when a session becomes live and is idempotent so re-registering
-// a still-live session keeps its coordinator (and its sequenced rows). The
-// caller may hold rt.mu; this takes only transcriptMu.
+// a still-live session keeps its coordinator (and its sequenced rows). A fresh
+// coordinator adopts the store's current complete turn as its committed bound —
+// a loaded store names the highest marker-backed complete turn, a fresh store
+// zero. The bound is read before transcriptMu is taken, so registration never
+// reads store state while holding transcript locks; the existing-entry check
+// and insert run under the lock, so a concurrently created coordinator is
+// preserved. Every production caller first-registers outside rt.mu — the
+// locked live registration only verifies the pre-registered entry — so the
+// store read never runs under rt.mu.
 func (rt *runtime) registerTranscript(id string, store *snapshot.Store) {
 	if id == "" {
 		return
 	}
+	var initialCommitted int
+	if store != nil {
+		initialCommitted = store.HighestCompleteTurn()
+	}
 	rt.transcriptMu.Lock()
 	if _, ok := rt.transcriptState[id]; !ok {
-		rt.transcriptState[id] = &transcriptCursor{coord: newTranscript(), store: store}
+		coord := newTranscript()
+		coord.committedTurn = initialCommitted
+		rt.transcriptState[id] = &transcriptCursor{coord: coord, store: store}
 	}
 	rt.transcriptMu.Unlock()
 }

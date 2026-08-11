@@ -66,13 +66,6 @@ func TestUnknownSessionIDsAreRejected(t *testing.T) {
 			},
 		},
 		{
-			name: "messages",
-			run: func() error {
-				_, err := a.SessionMessagesByID("missing-session")
-				return err
-			},
-		},
-		{
 			name: "current model",
 			run: func() error {
 				_, err := a.CurrentModelForSession("missing-session")
@@ -141,11 +134,11 @@ func TestLiveSessionsHaveSeparateHistoryAndQueues(t *testing.T) {
 		t.Fatalf("append second: %v", err)
 	}
 
-	firstMessages, err := a.SessionMessagesByID(firstID)
+	firstMessages, err := a.SessionMessagesFor(firstID)
 	if err != nil {
 		t.Fatalf("messages first: %v", err)
 	}
-	secondMessages, err := a.SessionMessagesByID(secondID)
+	secondMessages, err := a.SessionMessagesFor(secondID)
 	if err != nil {
 		t.Fatalf("messages second: %v", err)
 	}
@@ -557,7 +550,7 @@ func TestQueuedInputDrainsFromInactiveSession(t *testing.T) {
 	a.ensureRuntime().tryDrainQueue(ctx)
 
 	waitUntilSessionQueueEmpty(t, a, firstID)
-	firstMessages, err := a.SessionMessagesByID(firstID)
+	firstMessages, err := a.SessionMessagesFor(firstID)
 	if err != nil {
 		t.Fatalf("messages first: %v", err)
 	}
@@ -797,7 +790,7 @@ func TestTurnActionsUseSelectedSessionHistory(t *testing.T) {
 	if got := userContents(result.Messages); !equalStrings(got, []string{"keep"}) {
 		t.Fatalf("result messages = %#v, want keep", got)
 	}
-	firstMessages, err := first.SessionMessagesByID(firstID)
+	firstMessages, err := first.SessionMessagesFor(firstID)
 	if err != nil {
 		t.Fatalf("messages first: %v", err)
 	}

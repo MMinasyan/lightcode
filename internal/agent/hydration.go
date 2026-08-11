@@ -107,13 +107,15 @@ func (a *Agent) HydrateSession(sessionID string) (HydrationState, error) {
 // hydrateReadOnlyRoot builds a persisted root session's read-only hydration:
 // the persisted summary, the durable transcript, and the read-only flag.
 // Nothing live is captured — tokens read zero, which is the honest answer,
-// since usage lives in the process driving the session.
+// since usage lives in the process driving the session. The transcript is the
+// unbounded complete durable history: a read-only point lookup carries no
+// replay cursor.
 func (a *Agent) hydrateReadOnlyRoot(proj *project.Project, sessionID string, meta snapshot.SessionMeta) (HydrationState, error) {
 	store, err := snapshot.NewForSessionsRoot(a.projects.SessionsRoot(proj.ID), a.projects.Root(), proj.ID)
 	if err != nil {
 		return HydrationState{}, err
 	}
-	msgs, _, err := a.messagesForFrontendForStoreAndMaxTurn(store, sessionID)
+	msgs, err := a.messagesForFrontendForStore(store, sessionID)
 	if err != nil {
 		return HydrationState{}, err
 	}
@@ -129,9 +131,11 @@ func (a *Agent) hydrateReadOnlyRoot(proj *project.Project, sessionID string, met
 // entry's store plus the retained tail, errors, and cursor — while a completed
 // child resolves from its durable store exactly as SessionMessagesFor's
 // non-live branch does, with an empty tail and errors so the frontend's gate is
-// a no-op. The registry entry's presence is the liveness signal: a lookup miss
-// is the common case (the viewer opens a completed subtask's transcript far
-// more often than a live one) and is not an error.
+// a no-op. The completed child's transcript is the unbounded complete durable
+// history, matching the point-lookup exception. The registry entry's presence
+// is the liveness signal: a lookup miss is the common case (the viewer opens a
+// completed subtask's transcript far more often than a live one) and is not an
+// error.
 func (a *Agent) hydrateChildSession(sessionID string) (HydrationState, error) {
 	rt := a.ensureRuntime()
 	rt.transcriptMu.Lock()
@@ -148,7 +152,7 @@ func (a *Agent) hydrateChildSession(sessionID string) (HydrationState, error) {
 	if err != nil {
 		return HydrationState{}, err
 	}
-	msgs, _, err := a.messagesForFrontendForStoreAndMaxTurn(store, sessionID)
+	msgs, err := a.messagesForFrontendForStore(store, sessionID)
 	if err != nil {
 		return HydrationState{}, err
 	}
@@ -157,11 +161,14 @@ func (a *Agent) hydrateChildSession(sessionID string) (HydrationState, error) {
 
 // captureLiveChildSession captures a live child's complete transcript with the
 // same revalidating shape a root hydration uses: the durable prefix is read
-// outside the coordinator lock, and a commit landing between the read and the
-// locked revalidation forces a retry rather than a torn snapshot. Only the
-// transcript portion is read — a child has no live unit classes — and it comes
-// from the shared locked capture, so the disjoint-halves guard applies to a
-// child exactly as it does to a root turn.
+// outside the coordinator lock, through the committed turn read under it, and
+// a commit landing between the read and the locked revalidation forces a retry
+// rather than a torn snapshot. The capture probe fires in that window exactly
+// as it does for a root turn, so tests inject the revision change or read
+// error where a real producer would land it. Only the transcript portion is
+// read — a child has no live unit classes — and it comes from the shared
+// locked capture, so the bounded rule applies to a child exactly as it does to
+// a root turn.
 func (a *Agent) captureLiveChildSession(sessionID string, e *transcriptCursor) (HydrationState, error) {
 	tr := e.coord
 	for attempt := 1; attempt <= 3; attempt++ {
@@ -169,13 +176,21 @@ func (a *Agent) captureLiveChildSession(sessionID string, e *transcriptCursor) (
 		rev0 := tr.revisionLocked()
 		tr.seqMu.Unlock()
 
-		committed, maxDurableTurn, err := a.messagesForFrontendForStoreAndMaxTurn(e.store, sessionID)
+		committed, err := a.messagesThroughTurn(e.store, sessionID, rev0.committedTurn)
 		if err != nil {
 			return HydrationState{}, err
 		}
+		// The probe fires in the window the retry exists for: after the durable
+		// read, before the locked revalidation. A test injects the revision
+		// change or read error here, where a real producer would land it.
+		if a.captureProbe != nil {
+			if err := a.captureProbe(attempt); err != nil {
+				return HydrationState{}, err
+			}
+		}
 
 		tr.seqMu.Lock()
-		ct, ok := captureTranscriptLocked(tr, committed, maxDurableTurn, &rev0)
+		ct, ok := captureTranscriptLocked(tr, committed, &rev0)
 		tr.seqMu.Unlock()
 		if !ok {
 			continue

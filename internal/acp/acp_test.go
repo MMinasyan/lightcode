@@ -1999,6 +1999,53 @@ func TestHandleSessionMessagesByIDDoesNotSwitchCurrentSession(t *testing.T) {
 	}
 }
 
+// TestSessionMessagesPointLookupHasNoCursor proves the session/messages point
+// lookup keeps its bare-array response shape: the result is a message array,
+// not a hydration-state object, so it carries no cursor — the point lookup is
+// the unbounded complete-history exception to the committed-turn bound.
+func TestSessionMessagesPointLookupHasNoCursor(t *testing.T) {
+	a := newACPTestAgent(t)
+	appendACPUserTurn(t, a, "point lookup")
+	id := a.SessionCurrent().ID
+	if id == "" {
+		t.Fatal("missing session id")
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: a, out: &out}
+	r.setCurrentSessionID(id)
+	r.handleSessionMessages(Request{
+		JSONRPC: "2.0",
+		ID:      "point-lookup",
+		Params:  json.RawMessage(`{"id":"` + id + `"}`),
+	})
+
+	lines := drainedLines(t, r, &out, 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("session/messages error = %+v", resp.Error)
+	}
+	msgs := displayMessagesFromResponse(t, resp)
+	if got := acpUserMessageContents(msgs); !equalStringSlices(got, []string{"point lookup"}) {
+		t.Fatalf("point lookup messages = %q", got)
+	}
+	// The result is a bare array: it decodes into the message list alone and
+	// cannot decode into an object carrying a cursor.
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	var shape struct {
+		Cursor json.RawMessage `json:"cursor"`
+	}
+	if err := json.Unmarshal(data, &shape); err == nil {
+		t.Fatal("point lookup result decodes as an object with a cursor, want a bare message array (no cursor)")
+	}
+}
+
 func TestACPPromptSelectsSession(t *testing.T) {
 	a := newACPTestAgent(t)
 	_ = appendACPUserTurn(t, a, "first")
@@ -2395,14 +2442,42 @@ func TestACPReopenAfterHolderReleasesIsLive(t *testing.T) {
 }
 
 func TestACPSwitchKeepsCurrent(t *testing.T) {
-	a := newACPTestAgent(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeACPSSE(w,
+			acpTextChunk("switch-turn", "test-model", "ok"),
+			acpStopChunk("switch-turn", "test-model"),
+			"[DONE]")
+	}))
+	t.Cleanup(server.Close)
+
+	a := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+	// The ACP test config declares no agents.json, so the primary agent type
+	// has no model; bootstrap it through the adapter-facing method.
+	if err := a.SetDefaultModel("test/test-model"); err != nil {
+		t.Fatalf("SetDefaultModel: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	_ = a.Init(ctx)
+
 	firstID, err := a.NewSession("", "primary")
 	if err != nil {
 		t.Fatalf("NewSession first: %v", err)
 	}
-	if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
-		t.Fatalf("append first: %v", err)
+	var out bytes.Buffer
+	r := &Runner{agent: a, owner: a, out: &out}
+	a.SetEventHandler(r.handleEvent)
+	r.seedPresented(firstID)
+	// Run a real turn so the coordinator commits it: a marked-but-uncommitted
+	// turn stays below the bounded switch boundary. The commit runs before the
+	// turn_end event is emitted, so observing the notification makes the
+	// switch's bounded read deterministic.
+	if res, err := a.SubmitToSession(ctx, firstID, "first"); err != nil || !res.Started {
+		t.Fatalf("SubmitToSession first = %+v, %v; want started", res, err)
 	}
+	waitForACPMethod(t, r, &out, "agent/turn_end")
+	out.Reset()
+
 	secondID, err := a.NewSession("", "primary")
 	if err != nil {
 		t.Fatalf("NewSession second: %v", err)
@@ -2411,8 +2486,6 @@ func TestACPSwitchKeepsCurrent(t *testing.T) {
 		t.Fatalf("append second: %v", err)
 	}
 
-	var out bytes.Buffer
-	r := &Runner{agent: a, owner: a, out: &out}
 	r.setCurrentSessionID(secondID)
 	r.handleSessionSwitch(Request{
 		JSONRPC: "2.0",

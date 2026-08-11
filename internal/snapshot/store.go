@@ -573,6 +573,18 @@ func (s *Store) CurrentTurn() int {
 	return s.currentTurn
 }
 
+// HighestCompleteTurn returns the highest turn with a durable completion
+// marker, 0 when none. Unlike CurrentTurn it never names an in-flight
+// incomplete turn: BeginTurn creates the turn directory, while the completion
+// marker is what makes the turn complete. A loaded store returns the highest
+// marker-backed complete turn after incomplete cleanup; a fresh store returns
+// zero.
+func (s *Store) HighestCompleteTurn() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.highestCompleteTurnLocked()
+}
+
 // Snapshot captures the pre-turn state of absPath. First-write-wins per
 // (turn, path).
 func (s *Store) Snapshot(turn int, absPath string) error {

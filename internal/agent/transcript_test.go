@@ -412,17 +412,16 @@ func TestCaptureStateForSelectionRevalidation(t *testing.T) {
 }
 
 // TestCompleteLiveSessionStateContract verifies the hydration capture shape:
-// the revalidating three-attempt read with the durable half and the retained
-// tail disjoint at the locked point. A compaction or commit landing between the
+// the revalidating three-attempt read with the durable half bounded by the
+// coordinator's committed turn. A compaction or commit landing between the
 // durable read and the locked read forces a retry rather than a torn snapshot;
-// exhausting the attempts surfaces an error rather than an empty session; and a
-// turn whose completion marker is durable while its commit has not run is
-// returned from the durable half alone, with the tail dropped and the reported
-// cursor raised over the dropped sequences so replayed frames gate as already
-// present.
+// exhausting the attempts surfaces an error rather than an empty session; and
+// a turn whose completion marker is durable while its commit has not run stays
+// below the bound, so it is carried by the retained tail alone and renders
+// exactly once with an unraised cursor.
 //
-// Exception, named per the contract-test rule: the disjointness decision and
-// the cursor raise live in captureUnderLocksRTHeld, which is unexported and not
+// Exception, named per the contract-test rule: the bounded decision and the
+// revalidation live in captureUnderLocksRTHeld, which is unexported and not
 // adapter-facing. The tests enter through the exported HydrateSession, the
 // production hydration entry point, and observe the capture through the
 // exported HydrationState plus the existing captureProbe and durableReadHook
@@ -447,8 +446,13 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
 		id := sessionIDOf(unit)
-		appendUserTurn(t, a, "pre-compaction")
-		appendUserTurn(t, a, "post-compaction")
+		tr := a.transcriptForSessionID(id)
+		for _, content := range []string{"pre-compaction", "post-compaction"} {
+			turn := appendUserTurn(t, a, content)
+			// Commit each turn in the coordinator so the bounded durable read
+			// covers it: a marked-but-uncommitted turn stays below the bound.
+			feedTranscript(tr, Event{Kind: EventTurnEnd, SessionID: id, ProjectID: unit.projectID, Turn: turn})
+		}
 
 		attempts := 0
 		a.captureProbe = func(attempt int) error {
@@ -562,10 +566,10 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 	})
 
 	// The duplicate window: a turn whose completion marker is durable while its
-	// commit has not run is in the durable half AND the retained tail, so the
-	// capture must drop the tail and return the turn once. The fixture builds
-	// the window the way a root turn reaches it: rows fed into the tail, the
-	// marker on disk, no commit.
+	// commit has not run is above the committed bound, so the durable half
+	// stops before it and the retained tail carries it alone. The fixture
+	// builds the window the way a root turn reaches it: rows fed into the
+	// tail, the marker on disk, no commit.
 	t.Run("shape=B/durable_tail_disjoint=root_turn", func(t *testing.T) {
 		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
@@ -598,17 +602,20 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 		}
 		for _, content := range []string{"root window", "root reply"} {
 			if got := countHydrationContent(hs, content); got != 1 {
-				t.Fatalf("hydrated %q %d times, want exactly once (the durable half and the retained tail must be disjoint)", content, got)
+				t.Fatalf("hydrated %q %d times, want exactly once (the marked turn renders from the retained tail alone)", content, got)
 			}
 		}
-		// The dropped tail's rows are now durable, so the reported cursor must
-		// cover them: committedSeq equals the highest dropped sequence — the
-		// value the frontend gate reads to build its high-water mark.
+		if len(hs.Messages) != 0 {
+			t.Fatalf("hydration has %d durable rows, want 0 (the marked turn stays below the committed bound)", len(hs.Messages))
+		}
 		if seqUser <= 0 || seqReply <= seqUser {
 			t.Fatalf("fixture sequences = user %d, reply %d, want reply > user > 0", seqUser, seqReply)
 		}
-		if hs.Cursor.CommittedSeq != seqReply {
-			t.Fatalf("cursor committedSeq = %d, want %d (the highest dropped sequence)", hs.Cursor.CommittedSeq, seqReply)
+		// The cursor is not raised over the tail: the tail rows themselves seed
+		// the frontend's high-water, so the coordinator's own committedSeq is
+		// the honest bound.
+		if hs.Cursor.CommittedSeq != 0 {
+			t.Fatalf("cursor committedSeq = %d, want 0 (the uncommitted bound is not raised)", hs.Cursor.CommittedSeq)
 		}
 	})
 
@@ -623,7 +630,7 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 
 		turn := unit.store.BeginTurn()
 		feedTranscript(tr, Event{Kind: EventTurnStart, SessionID: id, ProjectID: unit.projectID, Turn: turn})
-		seqPreseed := feedTranscript(tr, Event{Kind: EventUserMessageDisplay, SessionID: id, Turn: turn, Result: "preseed window"})
+		feedTranscript(tr, Event{Kind: EventUserMessageDisplay, SessionID: id, Turn: turn, Result: "preseed window"})
 		data, err := json.Marshal(message.NewText(message.RoleUser, "preseed window"))
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
@@ -640,17 +647,20 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 			t.Fatalf("HydrateSession: %v", err)
 		}
 		if got := countHydrationContent(hs, "preseed window"); got != 1 {
-			t.Fatalf("hydrated %q %d times, want exactly once (the preseed's durable turn and retained tail must be disjoint)", "preseed window", got)
+			t.Fatalf("hydrated %q %d times, want exactly once (the marked preseed turn renders from the retained tail alone)", "preseed window", got)
 		}
-		if hs.Cursor.CommittedSeq != seqPreseed {
-			t.Fatalf("cursor committedSeq = %d, want %d (the highest dropped sequence)", hs.Cursor.CommittedSeq, seqPreseed)
+		if len(hs.Messages) != 0 {
+			t.Fatalf("hydration has %d durable rows, want 0 (the marked preseed turn stays below the committed bound)", len(hs.Messages))
+		}
+		if hs.Cursor.CommittedSeq != 0 {
+			t.Fatalf("cursor committedSeq = %d, want 0 (the uncommitted bound is not raised)", hs.Cursor.CommittedSeq)
 		}
 	})
 
 	// A session reattached in a fresh process with prior durable turns must
-	// show full history — a committedTurn bound would blank it, since the new
-	// coordinator reads committedTurn 0 — and the window turn must render
-	// exactly once.
+	// show full history: registration adopts the store's highest complete
+	// turn, so the bounded read covers the prior turns — and the window turn
+	// (marked, uncommitted) must render exactly once from the retained tail.
 	t.Run("shape=B/durable_tail_disjoint=reattached_session", func(t *testing.T) {
 		home := t.TempDir()
 		projectRoot := t.TempDir()
@@ -687,7 +697,7 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 
 		turn := unit.store.BeginTurn()
 		feedTranscript(tr, Event{Kind: EventTurnStart, SessionID: id, ProjectID: unit.projectID, Turn: turn})
-		seqWindow := feedTranscript(tr, Event{Kind: EventUserMessageDisplay, SessionID: id, Turn: turn, Result: "window row"})
+		feedTranscript(tr, Event{Kind: EventUserMessageDisplay, SessionID: id, Turn: turn, Result: "window row"})
 		data, err := json.Marshal(message.NewText(message.RoleUser, "window row"))
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
@@ -705,17 +715,21 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 		}
 		for _, content := range []string{"prior one", "prior two", "prior three", "window row"} {
 			if got := countHydrationContent(hs, content); got != 1 {
-				t.Fatalf("hydrated %q %d times, want exactly once (full history with the window turn disjoint)", content, got)
+				t.Fatalf("hydrated %q %d times, want exactly once (prior turns from the adopted bound, the window turn from the tail)", content, got)
 			}
 		}
-		if hs.Cursor.CommittedSeq != seqWindow {
-			t.Fatalf("cursor committedSeq = %d, want %d (the highest dropped sequence)", hs.Cursor.CommittedSeq, seqWindow)
+		if hs.Cursor.CommittedTurn != 3 {
+			t.Fatalf("cursor committedTurn = %d, want 3 (registration adopted the highest complete turn)", hs.Cursor.CommittedTurn)
+		}
+		if hs.Cursor.CommittedSeq != 0 {
+			t.Fatalf("cursor committedSeq = %d, want 0 (a fresh coordinator has committed nothing)", hs.Cursor.CommittedSeq)
 		}
 	})
 
 	// A turn whose only content is a system signal renders rows carrying no
-	// Turn, so the durable-turn maximum must come from the raw turn records,
-	// not from the rendered rows: the turn still renders exactly once.
+	// Turn. The durable bound is applied to the raw turn records, not the
+	// rendered rows, so the marked turn stays below the bound and the signal
+	// renders exactly once from the retained tail.
 	t.Run("shape=B/durable_tail_disjoint=no_titled_row", func(t *testing.T) {
 		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
@@ -724,7 +738,7 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 
 		turn := unit.store.BeginTurn()
 		feedTranscript(tr, Event{Kind: EventTurnStart, SessionID: id, ProjectID: unit.projectID, Turn: turn})
-		seqSignal := feedTranscript(tr, Event{Kind: EventGenericSystemSignal, SessionID: id, Result: "background finished"})
+		feedTranscript(tr, Event{Kind: EventGenericSystemSignal, SessionID: id, Result: "background finished"})
 		data, err := json.Marshal(loop.NewSystemSignalMessage("background finished"))
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
@@ -741,18 +755,18 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 			t.Fatalf("HydrateSession: %v", err)
 		}
 		if got := countHydrationContent(hs, "System: background finished"); got != 1 {
-			t.Fatalf("hydrated %q %d times, want exactly once (a turn rendering no titled row still renders once)", "System: background finished", got)
+			t.Fatalf("hydrated %q %d times, want exactly once (a turn rendering no titled row still renders once from the tail)", "System: background finished", got)
 		}
-		if hs.Cursor.CommittedSeq != seqSignal {
-			t.Fatalf("cursor committedSeq = %d, want %d (the highest dropped sequence)", hs.Cursor.CommittedSeq, seqSignal)
+		if hs.Cursor.CommittedSeq != 0 {
+			t.Fatalf("cursor committedSeq = %d, want 0 (the uncommitted bound is not raised)", hs.Cursor.CommittedSeq)
 		}
 	})
 
 	// The lower bound: a row appended after the commit carries the same curTurn
-	// but is not durable, so it stays in the retained tail. This subtest cannot
-	// fail against the unfixed tree — the disjointness filter does not exist
-	// there, so the tail is always kept — it pins the lower bound against a
-	// future implementation that drops by curTurn alone.
+	// but is not durable, so it stays in the retained tail. The committed turn
+	// renders from the durable half and the post-commit row from the tail —
+	// each exactly once, because the bound never drops a row that is not
+	// durably covered.
 	t.Run("shape=B/durable_tail_disjoint=post_commit_tail_kept", func(t *testing.T) {
 		a := newLiveCatalogBackedTestAgent(t)
 		unit := a.session
@@ -1112,6 +1126,464 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 	})
 }
 
+// TestLiveHydrationUsesCommittedTurn verifies the coordinator's committedTurn
+// is the sole durable visibility bound for a live cursor-bearing hydration: a
+// turn whose completion marker is durable while its commit has not run appears
+// only through the retained tail/live events, never through the durable half;
+// after the coordinator commits, the bounded read covers it exactly once; a
+// fresh coordinator registration adopts the store's highest complete turn
+// (never its current, possibly in-flight, turn); and the three-attempt
+// revision revalidation never issues a fourth durable read.
+//
+// Exception, named per the contract-test rule: the bounded read and the
+// registration seeding are unexported; the tests enter through the exported
+// HydrateSession and observe the exported HydrationState plus the existing
+// captureProbe and durableReadHook test seams.
+func TestLiveHydrationUsesCommittedTurn(t *testing.T) {
+	bumpCommit := func(tr *transcript) {
+		tr.seqMu.Lock()
+		tr.commitLocked(tr.committedTurn + 1)
+		tr.seqMu.Unlock()
+	}
+
+	// Zero-tail window: the marker is durable, the commit has not run, and no
+	// event has been dispatched yet, so the retained tail is empty. The turn
+	// must stay invisible until the coordinator commits; the dispatched
+	// turn-end then commits it and the bounded read returns it exactly once.
+	// The unbounded-helper mutation makes the pre-commit read see the turn on
+	// disk and fails this subtest.
+	t.Run("marked_turn_zero_tail_invisible_until_commit", func(t *testing.T) {
+		a := newLiveCatalogBackedTestAgent(t)
+		unit := a.session
+		id := sessionIDOf(unit)
+		tr := a.transcriptForSessionID(id)
+
+		turn := unit.store.BeginTurn()
+		data, err := json.Marshal(message.NewText(message.RoleUser, "zero tail"))
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := unit.store.AppendMessage(turn, data); err != nil {
+			t.Fatalf("AppendMessage: %v", err)
+		}
+		if err := unit.store.MarkTurnComplete(turn); err != nil {
+			t.Fatalf("MarkTurnComplete: %v", err)
+		}
+
+		hs, err := a.HydrateSession(id)
+		if err != nil {
+			t.Fatalf("HydrateSession: %v", err)
+		}
+		if got := countHydrationContent(hs, "zero tail"); got != 0 {
+			t.Fatalf("pre-commit hydration returns %q %d times, want 0 (a marked turn is invisible until the coordinator commits)", "zero tail", got)
+		}
+
+		// The drain dispatches the turn's events and commits it.
+		feedTranscript(tr, Event{Kind: EventTurnStart, SessionID: id, ProjectID: unit.projectID, Turn: turn})
+		feedTranscript(tr, Event{Kind: EventUserMessageDisplay, SessionID: id, Turn: turn, Result: "zero tail"})
+		feedTranscript(tr, Event{Kind: EventTurnEnd, SessionID: id, ProjectID: unit.projectID, Turn: turn})
+
+		hs, err = a.HydrateSession(id)
+		if err != nil {
+			t.Fatalf("HydrateSession after commit: %v", err)
+		}
+		if got := countHydrationContent(hs, "zero tail"); got != 1 {
+			t.Fatalf("post-commit hydration returns %q %d times, want exactly once (the committed turn is durable through the bound)", "zero tail", got)
+		}
+		if len(hs.Tail) != 0 {
+			t.Fatalf("post-commit hydration has %d tail rows, want none (the commit cleared the tail)", len(hs.Tail))
+		}
+		if hs.Cursor.CommittedTurn != turn {
+			t.Fatalf("cursor committedTurn = %d, want %d", hs.Cursor.CommittedTurn, turn)
+		}
+		if hs.Cursor.CommittedSeq == 0 {
+			t.Fatal("cursor committedSeq = 0, want the committed row's sequence (committedSeq suppresses replay)")
+		}
+	})
+
+	// Partial-tail window: the marked turn's rows are also in the retained
+	// tail. The bounded read stops before the turn, so the snapshot renders
+	// the rows from the tail alone — never from the durable half — exactly
+	// once. The unbounded-helper mutation duplicates the rows (durable half
+	// plus tail) and fails this subtest.
+	t.Run("marked_turn_partial_tail_renders_once", func(t *testing.T) {
+		a := newLiveCatalogBackedTestAgent(t)
+		unit := a.session
+		id := sessionIDOf(unit)
+		tr := a.transcriptForSessionID(id)
+
+		turn := unit.store.BeginTurn()
+		feedTranscript(tr, Event{Kind: EventTurnStart, SessionID: id, ProjectID: unit.projectID, Turn: turn})
+		feedTranscript(tr, Event{Kind: EventUserMessageDisplay, SessionID: id, Turn: turn, Result: "partial tail"})
+		data, err := json.Marshal(message.NewText(message.RoleUser, "partial tail"))
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := unit.store.AppendMessage(turn, data); err != nil {
+			t.Fatalf("AppendMessage: %v", err)
+		}
+		if err := unit.store.MarkTurnComplete(turn); err != nil {
+			t.Fatalf("MarkTurnComplete: %v", err)
+		}
+
+		hs, err := a.HydrateSession(id)
+		if err != nil {
+			t.Fatalf("HydrateSession: %v", err)
+		}
+		if len(hs.Messages) != 0 {
+			t.Fatalf("hydration has %d durable rows, want 0 (the marked turn stays below the committed bound)", len(hs.Messages))
+		}
+		if got := countHydrationContent(hs, "partial tail"); got != 1 {
+			t.Fatalf("hydrated %q %d times, want exactly once (the tail carries the uncommitted row)", "partial tail", got)
+		}
+	})
+
+	// Registration during a begun incomplete turn: the fresh coordinator must
+	// adopt the store's highest COMPLETE turn (zero here), never the current
+	// in-flight turn. Seeding from CurrentTurn would adopt the begun turn and
+	// expose its durably marked rows through the bounded read too early — the
+	// mutation this subtest catches.
+	t.Run("registration_adopts_highest_complete_turn", func(t *testing.T) {
+		a := newLiveCatalogBackedTestAgent(t)
+		unit := a.session
+		id := sessionIDOf(unit)
+
+		// Begin an incomplete turn, then re-register the live id while it is
+		// begun but has no completion marker: the fresh coordinator must adopt
+		// the complete-turn bound (0), not the current (begun) turn (1).
+		turn := unit.store.BeginTurn()
+		rt := a.ensureRuntime()
+		rt.unregisterTranscript(id)
+		rt.registerTranscript(id, unit.store)
+		tr := a.transcriptForSessionID(id)
+
+		// Build the marked-uncommitted window after the registration: rows in
+		// the tail, the marker on disk, the commit not run.
+		feedTranscript(tr, Event{Kind: EventTurnStart, SessionID: id, ProjectID: unit.projectID, Turn: turn})
+		feedTranscript(tr, Event{Kind: EventUserMessageDisplay, SessionID: id, Turn: turn, Result: "begun turn"})
+		data, err := json.Marshal(message.NewText(message.RoleUser, "begun turn"))
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := unit.store.AppendMessage(turn, data); err != nil {
+			t.Fatalf("AppendMessage: %v", err)
+		}
+		if err := unit.store.MarkTurnComplete(turn); err != nil {
+			t.Fatalf("MarkTurnComplete: %v", err)
+		}
+
+		hs, err := a.HydrateSession(id)
+		if err != nil {
+			t.Fatalf("HydrateSession: %v", err)
+		}
+		if hs.Cursor.CommittedTurn != 0 {
+			t.Fatalf("seeded committedTurn = %d, want 0 (a begun incomplete turn must not be adopted as committed)", hs.Cursor.CommittedTurn)
+		}
+		if len(hs.Messages) != 0 {
+			t.Fatalf("hydration has %d durable rows, want 0 (the begun turn must not be exposed through the durable half before its commit)", len(hs.Messages))
+		}
+		if got := countHydrationContent(hs, "begun turn"); got != 1 {
+			t.Fatalf("hydrated %q %d times, want exactly once (the tail carries the uncommitted row)", "begun turn", got)
+		}
+	})
+
+	// The three-attempt bound is a bound on durable reads: a revision change
+	// on every attempt exhausts the retries with a typed failure and never
+	// issues a fourth read.
+	t.Run("revision_change_all_three_attempts_no_fourth_read", func(t *testing.T) {
+		a := newLiveCatalogBackedTestAgent(t)
+		tr := a.transcriptForSessionID(sessionIDOf(a.session))
+		var reads atomic.Int32
+		a.durableReadHook = func() { reads.Add(1) }
+		defer func() { a.durableReadHook = nil }()
+		a.captureProbe = func(int) error {
+			bumpCommit(tr)
+			return nil
+		}
+		if _, err := a.HydrateSession(sessionIDOf(a.session)); !errors.Is(err, errCaptureRevisionChanged) {
+			t.Fatalf("err = %v, want errCaptureRevisionChanged", err)
+		}
+		if got := reads.Load(); got != 3 {
+			t.Fatalf("durable reads = %d, want exactly 3 (one per attempt, never a fourth)", got)
+		}
+	})
+}
+
+// TestLiveChildHydrationUsesCommittedTurn extends the committed-turn contract
+// to the live child route across the mark-commit-unregister lifecycle. The
+// child's turn is durably marked while the coordinator has not committed (no
+// EventTurnEnd) and the registry entry is still live: before the commit the
+// durable rows stay excluded (zero-tail renders nothing, partial-tail renders
+// once from the retained tail); after the coordinator commits while the entry
+// is still registered the durable rows render once with a suppression cursor
+// (committedSeq covers the row, so replayed frames gate); after unregister the
+// completed-child point lookup remains complete. No production seam is added:
+// the tests enter through the exported HydrateSession with the child registry
+// entry and coordinator fed through the production registration and the shared
+// feed helper, exactly as the subagent run does.
+func TestLiveChildHydrationUsesCommittedTurn(t *testing.T) {
+	// newLiveChildFixture builds a live child over the agent's project: a
+	// fresh child store with a registered transcript entry, mirroring the
+	// subagent run's registration. The cleanup unregisters the entry and
+	// detaches the store.
+	newLiveChildFixture := func(t *testing.T) (*Agent, *snapshot.Store, string, *transcript, func()) {
+		t.Helper()
+		a := newLiveCatalogBackedTestAgent(t)
+		proj, err := a.projects.Ensure()
+		if err != nil {
+			t.Fatalf("ensure project: %v", err)
+		}
+		childStore, err := snapshot.NewForSessionsRoot(a.projects.SessionsRoot(proj.ID), a.projects.Root(), proj.ID)
+		if err != nil {
+			t.Fatalf("child store: %v", err)
+		}
+		if err := childStore.BeginChildSession(a.projectRoot, "parent-1"); err != nil {
+			t.Fatalf("BeginChildSession: %v", err)
+		}
+		childID := childStore.SessionID()
+		rt := a.ensureRuntime()
+		rt.registerTranscript(childID, childStore)
+		cleanup := func() {
+			rt.unregisterTranscript(childID)
+			childStore.Detach()
+		}
+		return a, childStore, childID, a.transcriptForSessionID(childID), cleanup
+	}
+
+	persistChildTurn := func(t *testing.T, store *snapshot.Store, tr *transcript, childID string, content string) int {
+		t.Helper()
+		turn := store.BeginTurn()
+		feedTranscript(tr, Event{Kind: EventTurnStart, SessionID: childID, Turn: turn})
+		feedTranscript(tr, Event{Kind: EventUserMessageDisplay, SessionID: childID, Turn: turn, Result: content})
+		data, err := json.Marshal(message.NewText(message.RoleUser, content))
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := store.AppendMessage(turn, data); err != nil {
+			t.Fatalf("AppendMessage: %v", err)
+		}
+		if err := store.MarkTurnComplete(turn); err != nil {
+			t.Fatalf("MarkTurnComplete: %v", err)
+		}
+		return turn
+	}
+
+	// Zero-tail: the marker is durable, the commit has not run, and no event
+	// has been dispatched — the live child hydration must exclude the turn
+	// entirely until the coordinator commits.
+	t.Run("zero_tail_excluded_before_commit", func(t *testing.T) {
+		a, store, childID, _, cleanup := newLiveChildFixture(t)
+		defer cleanup()
+		const content = "child zero tail"
+		turn := store.BeginTurn()
+		data, err := json.Marshal(message.NewText(message.RoleUser, content))
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := store.AppendMessage(turn, data); err != nil {
+			t.Fatalf("AppendMessage: %v", err)
+		}
+		if err := store.MarkTurnComplete(turn); err != nil {
+			t.Fatalf("MarkTurnComplete: %v", err)
+		}
+
+		hs, err := a.HydrateSession(childID)
+		if err != nil {
+			t.Fatalf("HydrateSession(live child): %v", err)
+		}
+		if len(hs.Messages) != 0 {
+			t.Fatalf("live child hydration has %d durable rows, want 0 (the marked turn stays below the committed bound)", len(hs.Messages))
+		}
+		if len(hs.Tail) != 0 {
+			t.Fatalf("live child hydration has %d tail rows, want 0 (no event dispatched yet)", len(hs.Tail))
+		}
+		if got := countHydrationContent(hs, content); got != 0 {
+			t.Fatalf("hydrated %q %d times, want 0 before the coordinator commit", content, got)
+		}
+		if hs.Cursor.CommittedTurn != 0 {
+			t.Fatalf("cursor committedTurn = %d, want 0 (nothing committed yet)", hs.Cursor.CommittedTurn)
+		}
+	})
+
+	// Partial-tail: the same marked turn has its row in the retained tail, so
+	// the live child hydration renders it exactly once from the tail while the
+	// durable half stays excluded.
+	t.Run("partial_tail_renders_once_before_commit", func(t *testing.T) {
+		a, store, childID, tr, cleanup := newLiveChildFixture(t)
+		defer cleanup()
+		const content = "child partial tail"
+		persistChildTurn(t, store, tr, childID, content)
+
+		hs, err := a.HydrateSession(childID)
+		if err != nil {
+			t.Fatalf("HydrateSession(live child): %v", err)
+		}
+		if len(hs.Messages) != 0 {
+			t.Fatalf("live child hydration has %d durable rows, want 0 (the marked turn stays below the committed bound)", len(hs.Messages))
+		}
+		if got := countHydrationContent(hs, content); got != 1 {
+			t.Fatalf("hydrated %q %d times, want exactly once (the tail carries the uncommitted row)", content, got)
+		}
+		if len(hs.Tail) != 1 {
+			t.Fatalf("live child hydration has %d tail rows, want 1", len(hs.Tail))
+		}
+		if hs.Cursor.CommittedSeq != 0 {
+			t.Fatalf("cursor committedSeq = %d, want 0 (the uncommitted bound is not raised)", hs.Cursor.CommittedSeq)
+		}
+	})
+
+	// Commit while the entry is still registered: the coordinator's turn-end
+	// lands, the bounded read covers the turn, and the suppression cursor
+	// (committedSeq = the row's sequence) gates any replayed frame.
+	t.Run("committed_while_registered_renders_once_with_suppression_cursor", func(t *testing.T) {
+		a, store, childID, tr, cleanup := newLiveChildFixture(t)
+		defer cleanup()
+		const content = "child committed row"
+		turn := persistChildTurn(t, store, tr, childID, content)
+		feedTranscript(tr, Event{Kind: EventTurnEnd, SessionID: childID, Turn: turn})
+
+		hs, err := a.HydrateSession(childID)
+		if err != nil {
+			t.Fatalf("HydrateSession(live child): %v", err)
+		}
+		if got := countHydrationContent(hs, content); got != 1 {
+			t.Fatalf("hydrated %q %d times, want exactly once (the committed turn is durable through the bound)", content, got)
+		}
+		if len(hs.Tail) != 0 {
+			t.Fatalf("live child hydration has %d tail rows, want none (the commit cleared the tail)", len(hs.Tail))
+		}
+		if hs.Cursor.CommittedTurn != turn {
+			t.Fatalf("cursor committedTurn = %d, want %d", hs.Cursor.CommittedTurn, turn)
+		}
+		if hs.Cursor.CommittedSeq != 1 {
+			t.Fatalf("cursor committedSeq = %d, want 1 (the row's sequence, so replay suppresses)", hs.Cursor.CommittedSeq)
+		}
+	})
+
+	// After unregister, the completed-child route is the unbounded point
+	// lookup: the durable turn renders once and no cursor is carried.
+	t.Run("completed_point_lookup_remains_complete_after_unregister", func(t *testing.T) {
+		a, store, childID, tr, cleanup := newLiveChildFixture(t)
+		defer cleanup()
+		const content = "child completed row"
+		turn := persistChildTurn(t, store, tr, childID, content)
+		feedTranscript(tr, Event{Kind: EventTurnEnd, SessionID: childID, Turn: turn})
+		a.ensureRuntime().unregisterTranscript(childID)
+
+		hs, err := a.HydrateSession(childID)
+		if err != nil {
+			t.Fatalf("HydrateSession(completed child): %v", err)
+		}
+		if got := countHydrationContent(hs, content); got != 1 {
+			t.Fatalf("hydrated %q %d times, want exactly once (the completed point lookup reads every complete turn)", content, got)
+		}
+		if len(hs.Tail) != 0 {
+			t.Fatalf("completed child hydration has %d live rows, want none", len(hs.Tail))
+		}
+		if hs.Cursor != (HydrationCursor{}) {
+			t.Fatalf("completed child cursor = %+v, want none (the point lookup carries no cursor)", hs.Cursor)
+		}
+	})
+
+	// The child capture probe fires in the same read-to-revalidation window a
+	// root capture's does: a commit injected there forces one retry, and the
+	// retry's bounded read returns the committed turn exactly once with the
+	// correct cursor. Removing the child probe (or the retry) makes this
+	// subtest fail — the mutation the probe's existence gates.
+	t.Run("probe_window_commit_forces_one_retry", func(t *testing.T) {
+		a, store, childID, tr, cleanup := newLiveChildFixture(t)
+		defer cleanup()
+		const content = "child commit window"
+		turn := persistChildTurn(t, store, tr, childID, content)
+
+		attempts := 0
+		a.captureProbe = func(attempt int) error {
+			attempts++
+			if attempt == 1 {
+				feedTranscript(tr, Event{Kind: EventTurnEnd, SessionID: childID, Turn: turn})
+			}
+			return nil
+		}
+		defer func() { a.captureProbe = nil }()
+
+		hs, err := a.HydrateSession(childID)
+		if err != nil {
+			t.Fatalf("HydrateSession(live child): %v", err)
+		}
+		if attempts != 2 {
+			t.Fatalf("attempts = %d, want 2 (the commit in the read-to-revalidation window forced one retry)", attempts)
+		}
+		if got := countHydrationContent(hs, content); got != 1 {
+			t.Fatalf("hydrated %q %d times, want exactly once (the committed turn is durable through the bound)", content, got)
+		}
+		if len(hs.Tail) != 0 {
+			t.Fatalf("hydration has %d tail rows, want none (the commit cleared the tail)", len(hs.Tail))
+		}
+		if hs.Cursor.CommittedTurn != turn {
+			t.Fatalf("cursor committedTurn = %d, want %d", hs.Cursor.CommittedTurn, turn)
+		}
+		if hs.Cursor.CommittedSeq != 1 {
+			t.Fatalf("cursor committedSeq = %d, want 1 (the row's sequence, so replay suppresses)", hs.Cursor.CommittedSeq)
+		}
+	})
+
+	// A revision change on every attempt exhausts the three-attempt bound with
+	// a typed failure: exactly three reads/attempts (the probe fires once per
+	// durable read), never a fourth, and no partial state is published.
+	t.Run("probe_revision_change_all_three_attempts", func(t *testing.T) {
+		a, store, childID, tr, cleanup := newLiveChildFixture(t)
+		defer cleanup()
+		persistChildTurn(t, store, tr, childID, "child churn")
+
+		attempts := 0
+		a.captureProbe = func(int) error {
+			attempts++
+			tr.seqMu.Lock()
+			tr.commitLocked(tr.committedTurn + 1)
+			tr.seqMu.Unlock()
+			return nil
+		}
+		defer func() { a.captureProbe = nil }()
+
+		hs, err := a.HydrateSession(childID)
+		if !errors.Is(err, errCaptureRevisionChanged) {
+			t.Fatalf("err = %v, want errCaptureRevisionChanged (the exhausted hydration surfaces an error, never partial state)", err)
+		}
+		if attempts != 3 {
+			t.Fatalf("attempts = %d, want exactly 3 (one durable read per attempt, never a fourth)", attempts)
+		}
+		if hs.Session.ID != "" || len(hs.Messages) != 0 || len(hs.Tail) != 0 {
+			t.Fatalf("hydration returned partial state %+v alongside the error", hs)
+		}
+	})
+
+	// A probe error propagates immediately, with no further attempt — the
+	// same disposition the root capture applies.
+	t.Run("probe_error_propagates_without_retry", func(t *testing.T) {
+		a, store, childID, tr, cleanup := newLiveChildFixture(t)
+		defer cleanup()
+		persistChildTurn(t, store, tr, childID, "child probe error")
+
+		sentinel := errors.New("child probe boom")
+		attempts := 0
+		a.captureProbe = func(attempt int) error {
+			attempts++
+			if attempt == 1 {
+				return sentinel
+			}
+			return nil
+		}
+		defer func() { a.captureProbe = nil }()
+
+		if _, err := a.HydrateSession(childID); !errors.Is(err, sentinel) {
+			t.Fatalf("err = %v, want the probe's sentinel (probe errors propagate)", err)
+		}
+		if attempts != 1 {
+			t.Fatalf("attempts = %d, want 1 (a probe error returns immediately, no later attempt)", attempts)
+		}
+	})
+}
+
 // TestCaptureStateInvokesBoundaryWithBuiltState verifies the capture invokes the
 // boundary callback with the immutable state it built, so an adapter can append
 // its boundary while the capture still holds the locks.
@@ -1383,9 +1855,9 @@ func TestCompactionRewriteCarriesRetainedErrors(t *testing.T) {
 // the last row is an open assistant span — the fact the desktop root view uses
 // to continue a turn that was streaming when the snapshot was captured — and
 // that the fact is computed from the rows the snapshot actually carries rather
-// than copied from the coordinator's running flag: a capture that dropped a
-// duplicate tail, or one whose last row is a completed durable answer, must
-// publish false even while the coordinator's span is open.
+// than copied from the coordinator's running flag: a capture whose last row is
+// a completed durable answer must publish false even while the coordinator's
+// span is open.
 func TestHydrationAssistantSpanFact(t *testing.T) {
 	// The span is open while a text delta streamed and no boundary closed it.
 	t.Run("span=open", func(t *testing.T) {
@@ -1420,45 +1892,6 @@ func TestHydrationAssistantSpanFact(t *testing.T) {
 		}
 		if hs.AssistantOpen {
 			t.Fatal("assistantOpen = true, want false after the boundary that closed the span")
-		}
-	})
-
-	// The duplicate window: a turn whose completion marker is durable while its
-	// commit has not run. The capture drops the retained tail as a duplicate of
-	// the durable half, so the snapshot carries no open row: the fact must be
-	// false even though the coordinator's span is still open.
-	t.Run("span=tail_dropped_as_duplicate", func(t *testing.T) {
-		a := newLiveCatalogBackedTestAgent(t)
-		unit := a.session
-		id := sessionIDOf(unit)
-		tr := a.transcriptForSessionID(id)
-
-		turn := unit.store.BeginTurn()
-		feedTranscript(tr, Event{Kind: EventTurnStart, SessionID: id, ProjectID: unit.projectID, Turn: turn})
-		feedTranscript(tr, Event{Kind: EventUserMessageDisplay, SessionID: id, Turn: turn, Result: "root window"})
-		feedTranscript(tr, Event{Kind: EventTextDelta, SessionID: id, Result: "root reply"})
-		for _, m := range []message.Message{
-			message.NewText(message.RoleUser, "root window"),
-			message.NewText(message.RoleAssistant, "root reply"),
-		} {
-			data, err := json.Marshal(m)
-			if err != nil {
-				t.Fatalf("marshal: %v", err)
-			}
-			if err := unit.store.AppendMessage(turn, data); err != nil {
-				t.Fatalf("AppendMessage: %v", err)
-			}
-		}
-		if err := unit.store.MarkTurnComplete(turn); err != nil {
-			t.Fatalf("MarkTurnComplete: %v", err)
-		}
-
-		hs, err := a.HydrateSession(id)
-		if err != nil {
-			t.Fatalf("HydrateSession: %v", err)
-		}
-		if hs.AssistantOpen {
-			t.Fatal("assistantOpen = true, want false for a capture that dropped the duplicate tail")
 		}
 	})
 
@@ -2638,15 +3071,13 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 	})
 }
 
-// TestTurnBegunAfterRevertRendersOnceThroughHydration proves the
-// disjoint-halves guard against a reused turn number: after a combined
-// code+history revert the coordinator's committedTurn is lowered to the
-// surviving turn (min(committedTurn, after)), so a turn begun after the revert
-// that reissued an old number would compare a stale cursor against a reused
-// number, keep its tail, and render the turn twice — once from the durable
-// half and once from the tail. The store-level high-water keeps the new turn
-// above every issued number, the guard fires, and the hydration capture
-// renders the turn exactly once.
+// TestTurnBegunAfterRevertRendersOnceThroughHydration proves the committed
+// bound against a reused turn number: after a combined code+history revert the
+// coordinator's committedTurn is lowered to the surviving turn, so a turn
+// begun after the revert that reissued an old number would compare a stale
+// bound against a reused number. The bounded durable read stops at the
+// surviving committed turn, the fresh turn's rows stay in the retained tail,
+// and the hydration capture renders the turn exactly once.
 func TestTurnBegunAfterRevertRendersOnceThroughHydration(t *testing.T) {
 	a := newLiveCatalogBackedTestAgent(t)
 	id := a.SessionCurrent().ID
@@ -2669,7 +3100,7 @@ func TestTurnBegunAfterRevertRendersOnceThroughHydration(t *testing.T) {
 
 	// Begin and persist the next turn, feeding its rows into the coordinator
 	// without a turn end: the completion marker lands on disk while the commit
-	// has not run — the window the disjoint-halves guard exists for.
+	// has not run — the window the committed bound exists for.
 	fresh := a.store.BeginTurn()
 	const content = "fresh turn"
 	a.lp.AppendUserMessage(fresh, content)

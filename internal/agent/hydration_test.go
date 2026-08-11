@@ -1,7 +1,10 @@
 package agent
 
 import (
+	"encoding/json"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/engine/message"
 )
 
 // TestHydrationStateFromCompleteState verifies the conversion maps every captured
@@ -84,5 +87,64 @@ func TestHydrateSessionResolvesAndCaptures(t *testing.T) {
 
 	if _, err := a.HydrateSession("missing-session"); err == nil {
 		t.Fatal("HydrateSession(missing) = nil error, want unknown session")
+	}
+}
+
+// TestSessionMessagesPointLookupIgnoresCommittedTurn proves the point-lookup
+// exception: SessionMessagesFor reads the complete durable history with no
+// committed bound, so the same durably marked turn is visible to the point
+// lookup while live hydration excludes it from the durable half until the
+// coordinator commits. The marked turn renders exactly once in the live
+// snapshot (from the retained tail), never twice.
+func TestSessionMessagesPointLookupIgnoresCommittedTurn(t *testing.T) {
+	a := newLiveCatalogBackedTestAgent(t)
+	unit := a.session
+	id := sessionIDOf(unit)
+	tr := a.transcriptForSessionID(id)
+
+	turn := unit.store.BeginTurn()
+	feedTranscript(tr, Event{Kind: EventTurnStart, SessionID: id, ProjectID: unit.projectID, Turn: turn})
+	feedTranscript(tr, Event{Kind: EventUserMessageDisplay, SessionID: id, Turn: turn, Result: "marked row"})
+	data, err := json.Marshal(message.NewText(message.RoleUser, "marked row"))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := unit.store.AppendMessage(turn, data); err != nil {
+		t.Fatalf("AppendMessage: %v", err)
+	}
+	if err := unit.store.MarkTurnComplete(turn); err != nil {
+		t.Fatalf("MarkTurnComplete: %v", err)
+	}
+
+	// The point lookup is unbounded: the marked turn is visible here.
+	msgs, err := a.SessionMessagesFor(id)
+	if err != nil {
+		t.Fatalf("SessionMessagesFor: %v", err)
+	}
+	found := 0
+	for _, m := range msgs {
+		if m.Content == "marked row" {
+			found++
+		}
+	}
+	if found != 1 {
+		t.Fatalf("point lookup returns %q %d times, want exactly once (the unbounded lookup reads every complete turn)", "marked row", found)
+	}
+
+	// Live hydration is bounded by the coordinator's committed turn: the
+	// marked turn is excluded from the durable half and renders once from the
+	// retained tail.
+	hs, err := a.HydrateSession(id)
+	if err != nil {
+		t.Fatalf("HydrateSession: %v", err)
+	}
+	if len(hs.Messages) != 0 {
+		t.Fatalf("live hydration has %d durable rows, want 0 (the marked turn stays below the committed bound)", len(hs.Messages))
+	}
+	if got := countHydrationContent(hs, "marked row"); got != 1 {
+		t.Fatalf("live hydration returns %q %d times, want exactly once (the tail carries the uncommitted row)", "marked row", got)
+	}
+	if hs.Cursor.CommittedTurn != 0 {
+		t.Fatalf("cursor committedTurn = %d, want 0 (nothing committed yet)", hs.Cursor.CommittedTurn)
 	}
 }

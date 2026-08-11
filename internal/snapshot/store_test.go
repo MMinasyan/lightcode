@@ -97,6 +97,63 @@ func TestRevertHistoryDeletesLaterTurnsAndUpdatesCurrentTurn(t *testing.T) {
 	}
 }
 
+// TestHighestCompleteTurnIgnoresIncompleteTurn proves HighestCompleteTurn
+// names only marker-backed complete turns: a begun/unmarked turn is never
+// adopted as committed, and a loaded store returns the highest complete turn
+// after the incomplete cleanup removed unmarked turn dirs.
+func TestHighestCompleteTurnIgnoresIncompleteTurn(t *testing.T) {
+	projectsRoot := t.TempDir()
+	projectID := "p-hct"
+	sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+	store, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginNewSession(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	id := store.SessionID()
+	if got := store.HighestCompleteTurn(); got != 0 {
+		t.Fatalf("fresh store HighestCompleteTurn = %d, want 0", got)
+	}
+
+	// A begun/unmarked turn must never be adopted as committed.
+	begun := store.BeginTurn()
+	if got := store.HighestCompleteTurn(); got != 0 {
+		t.Fatalf("HighestCompleteTurn with begun turn %d = %d, want 0 (the begun turn has no completion marker)", begun, got)
+	}
+	if err := store.MarkTurnComplete(begun); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.HighestCompleteTurn(); got != begun {
+		t.Fatalf("HighestCompleteTurn after marking = %d, want %d", got, begun)
+	}
+	// Another begun turn above the complete one: still ignored.
+	if got := store.BeginTurn(); got != begun+1 {
+		t.Fatalf("second BeginTurn = %d, want %d", got, begun+1)
+	}
+	if got := store.HighestCompleteTurn(); got != begun {
+		t.Fatalf("HighestCompleteTurn with a second begun turn = %d, want %d", got, begun)
+	}
+
+	// A loaded store drops the unmarked dir during activation cleanup and
+	// returns the highest marker-backed complete turn.
+	if _, err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.LoadSession(id); err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.HighestCompleteTurn(); got != begun {
+		t.Fatalf("loaded store HighestCompleteTurn = %d, want %d (incomplete cleanup dropped the begun turn)", got, begun)
+	}
+	reopened.Detach()
+}
+
 func TestSnapshotDeduplicatesSymlinkAndRealPath(t *testing.T) {
 	for _, symlinkFirst := range []bool{true, false} {
 		name := "real-first"

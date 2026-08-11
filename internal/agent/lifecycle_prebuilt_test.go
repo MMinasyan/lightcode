@@ -41,7 +41,11 @@ func TestLifecycleReturnsPrebuiltReplacement(t *testing.T) {
 
 	t.Run("case=live_selection", func(t *testing.T) {
 		a := newCatalogBackedTestAgent(t)
-		appendUserTurn(t, a, "hello")
+		turn := appendUserTurn(t, a, "hello")
+		// Commit the turn in the coordinator so the bounded live-selection
+		// boundary covers it: a marked-but-uncommitted turn stays below the
+		// committed bound.
+		feedTranscript(a.transcriptForSessionID(a.SessionCurrent().ID), Event{Kind: EventTurnEnd, SessionID: a.SessionCurrent().ID, Turn: turn})
 		id := a.SessionCurrent().ID
 		var got []HydrationState
 		if _, err := a.OpenSessionWithBoundary(id, func(hs HydrationState) {
