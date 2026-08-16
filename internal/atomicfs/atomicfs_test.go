@@ -590,6 +590,97 @@ func TestWithLockReleasesOnCallbackPanic(t *testing.T) {
 	regained.Release()
 }
 
+// TestTryWithLockRows covers the one-attempt TryWithLock contract: success
+// runs the callback and returns its result, contention returns (false, nil)
+// without invoking the callback, a callback error is preserved, a release
+// failure is a one-line stderr diagnostic that never replaces the callback
+// result, and a panicking callback still releases the lock.
+func TestTryWithLockRows(t *testing.T) {
+	t.Run("success_runs_callback", func(t *testing.T) {
+		dir := t.TempDir()
+		lockPath := filepath.Join(dir, ".locks", "rec.lock")
+		called := false
+		ok, err := TryWithLock(lockPath, func() error {
+			called = true
+			return nil
+		})
+		if !ok || err != nil {
+			t.Fatalf("TryWithLock = (%v, %v), want (true, nil)", ok, err)
+		}
+		if !called {
+			t.Fatal("callback was not invoked")
+		}
+	})
+	t.Run("contention_skips_callback", func(t *testing.T) {
+		dir := t.TempDir()
+		lockPath := filepath.Join(dir, ".locks", "rec.lock")
+		held, ok, err := TryAcquire(lockPath)
+		if err != nil || !ok {
+			t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
+		}
+		defer held.Release()
+		called := false
+		got, err := TryWithLock(lockPath, func() error {
+			called = true
+			return nil
+		})
+		if got {
+			t.Fatal("TryWithLock acquired while the lock was held")
+		}
+		if err != nil {
+			t.Fatalf("TryWithLock contention err = %v, want nil", err)
+		}
+		if called {
+			t.Fatal("callback ran despite contention")
+		}
+	})
+	t.Run("callback_error_preserved", func(t *testing.T) {
+		dir := t.TempDir()
+		lockPath := filepath.Join(dir, ".locks", "rec.lock")
+		callbackErr := errors.New("callback failure")
+		ok, err := TryWithLock(lockPath, func() error { return callbackErr })
+		if !ok || err != callbackErr {
+			t.Fatalf("TryWithLock = (%v, %v), want (true, callbackErr)", ok, err)
+		}
+	})
+	t.Run("release_error_diagnostic_only", func(t *testing.T) {
+		dir := t.TempDir()
+		lockPath := filepath.Join(dir, ".locks", "rec.lock")
+		injected := errors.New("injected release failure")
+		ReleaseFunc = func(*Lock) error { return injected }
+		defer func() { ReleaseFunc = nil }()
+		stderr := captureStderr(t)
+		callbackErr := errors.New("callback failure")
+		ok, err := TryWithLock(lockPath, func() error { return callbackErr })
+		if !ok || err != callbackErr {
+			t.Fatalf("TryWithLock = (%v, %v), want (true, callbackErr)", ok, err)
+		}
+		if out := stderr(); out != "lightcode: release lock "+lockPath+": "+injected.Error()+"\n" {
+			t.Fatalf("stderr = %q, want the one exact release diagnostic", out)
+		}
+	})
+	t.Run("panic_releases", func(t *testing.T) {
+		dir := t.TempDir()
+		lockPath := filepath.Join(dir, ".locks", "rec.lock")
+		func() {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatal("callback did not panic")
+				}
+			}()
+			_, _ = TryWithLock(lockPath, func() error { panic("callback panic") })
+		}()
+		regained, ok, err := TryAcquire(lockPath)
+		if err != nil {
+			t.Fatalf("TryAcquire after the recovered panic: %v", err)
+		}
+		if !ok {
+			t.Fatal("lock still held after a panicking TryWithLock callback")
+		}
+		regained.Release()
+	})
+}
+
 // crashChildDestEnv selects the child half of
 // TestCrashBeforeRenameLeavesReadableOrphanTemp and names the destination it
 // publishes to; crashChildCreateEnv selects the CreateExclusive shape.

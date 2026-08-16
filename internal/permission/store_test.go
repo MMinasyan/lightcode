@@ -272,6 +272,61 @@ func TestLoadLocalProjectIDScoping(t *testing.T) {
 	}
 }
 
+// TestTrySaveLocalRows covers the one-attempt TrySaveLocal contract: success
+// performs the bounded read-merge-write, contention returns (false, nil)
+// without any payload operation, and empty arguments are an executed no-op.
+func TestTrySaveLocalRows(t *testing.T) {
+	t.Run("success_merges", func(t *testing.T) {
+		root := t.TempDir()
+		pid := "proj-try-ok"
+		if err := os.MkdirAll(filepath.Join(root, pid), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := SaveLocal(root, pid, Rules{Allow: []string{"orig"}}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		ok, err := TrySaveLocal(root, pid, Rules{Allow: []string{"added"}})
+		if !ok || err != nil {
+			t.Fatalf("TrySaveLocal = (%v, %v), want (true, nil)", ok, err)
+		}
+		got, err := LoadLocal(root, pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Allow) != 2 || got.Allow[0] != "orig" || got.Allow[1] != "added" {
+			t.Fatalf("Allow = %v, want [orig added]", got.Allow)
+		}
+	})
+	t.Run("contention_performs_no_payload", func(t *testing.T) {
+		root := t.TempDir()
+		pid := "proj-try-contend"
+		if err := os.MkdirAll(filepath.Join(root, pid), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		held, ok, err := atomicfs.TryAcquire(lockPath(root, pid))
+		if err != nil || !ok {
+			t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
+		}
+		defer held.Release()
+		got, err := TrySaveLocal(root, pid, Rules{Allow: []string{"added"}})
+		if got {
+			t.Fatal("TrySaveLocal acquired while the lock was held")
+		}
+		if err != nil {
+			t.Fatalf("TrySaveLocal contention err = %v, want nil", err)
+		}
+		if _, statErr := os.Stat(localPath(root, pid)); !os.IsNotExist(statErr) {
+			t.Fatalf("contended TrySaveLocal created permissions.json: %v", statErr)
+		}
+	})
+	t.Run("empty_args_noop", func(t *testing.T) {
+		ok, err := TrySaveLocal("", "pid", Rules{Allow: []string{"x"}})
+		if !ok || err != nil {
+			t.Fatalf("TrySaveLocal empty args = (%v, %v), want (true, nil)", ok, err)
+		}
+	})
+}
+
 // permLockHolderRootEnv selects the child half of
 // TestSaveLocalLockBlocksSecondProcess and names the projects root whose
 // permissions lock it holds.

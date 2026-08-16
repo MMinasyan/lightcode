@@ -39,15 +39,36 @@ func SaveLocal(projectsRoot, projectID string, add Rules) error {
 		return nil
 	}
 	return atomicfs.WithLock(lockPath(projectsRoot, projectID), func() error {
-		existing, err := LoadLocal(projectsRoot, projectID)
-		if err != nil {
-			return err
-		}
-		existing.Allow = mergeUnique(existing.Allow, add.Allow)
-		existing.Deny = mergeUnique(existing.Deny, add.Deny)
-		existing.Ask = mergeUnique(existing.Ask, add.Ask)
-		return writeLocalJSON(localPath(projectsRoot, projectID), existing)
+		return saveLocalPayload(projectsRoot, projectID, add)
 	})
+}
+
+// TrySaveLocal is the one-attempt counterpart of SaveLocal for owner paths
+// that must not block a shutting-down owner on a foreign permissions-lock
+// holder. On contention it returns (false, nil) without performing any payload
+// operation; otherwise it executes the shared locked payload and returns
+// (true, its result).
+func TrySaveLocal(projectsRoot, projectID string, add Rules) (bool, error) {
+	if projectsRoot == "" || projectID == "" {
+		return true, nil
+	}
+	return atomicfs.TryWithLock(lockPath(projectsRoot, projectID), func() error {
+		return saveLocalPayload(projectsRoot, projectID, add)
+	})
+}
+
+// saveLocalPayload is the locked read-merge-write body shared by SaveLocal and
+// TrySaveLocal. It runs under the project permissions lock held by the caller
+// and never reacquires it.
+func saveLocalPayload(projectsRoot, projectID string, add Rules) error {
+	existing, err := LoadLocal(projectsRoot, projectID)
+	if err != nil {
+		return err
+	}
+	existing.Allow = mergeUnique(existing.Allow, add.Allow)
+	existing.Deny = mergeUnique(existing.Deny, add.Deny)
+	existing.Ask = mergeUnique(existing.Ask, add.Ask)
+	return writeLocalJSON(localPath(projectsRoot, projectID), existing)
 }
 
 func localPath(projectsRoot, projectID string) string {

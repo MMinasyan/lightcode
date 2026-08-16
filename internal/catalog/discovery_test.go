@@ -1,12 +1,17 @@
 package catalog
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -14,6 +19,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 func TestFetchDiscoveryParsesModelsAndSendsHeaders(t *testing.T) {
@@ -594,5 +601,370 @@ func TestConcurrentDiscoveryWritesDoNotTearFile(t *testing.T) {
 		if !reflect.DeepEqual(got, keysA) && !reflect.DeepEqual(got, keysB) {
 			t.Fatalf("round %d: torn cache file mixing payloads: %v", round, got)
 		}
+	}
+}
+
+// TestTryDiscoveryWriterRows covers the one-attempt Try attempt/cache writers:
+// success performs the payload, contention returns (false, nil) without any
+// payload operation, and an unsafe provider id is refused.
+func TestTryDiscoveryWriterRows(t *testing.T) {
+	t.Run("attempt_success", func(t *testing.T) {
+		home := t.TempDir()
+		if err := WriteDiscoveryCache(home, "p", smallStale(), time.Now().Add(-48*time.Hour).UTC()); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		ok, err := TryWriteDiscoveryAttempt(home, "p", time.Now().UTC())
+		if !ok || err != nil {
+			t.Fatalf("TryWriteDiscoveryAttempt = (%v, %v), want (true, nil)", ok, err)
+		}
+		_, attempts, _ := ReadDiscoveryCache(home)
+		if attempts["p"].IsZero() {
+			t.Fatal("attempted_at not recorded by TryWriteDiscoveryAttempt")
+		}
+	})
+	t.Run("attempt_contention", func(t *testing.T) {
+		home := t.TempDir()
+		holder, ok, err := atomicfs.TryAcquire(discoveryLockPath(home, "p"))
+		if err != nil || !ok {
+			t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
+		}
+		defer holder.Release()
+		got, err := TryWriteDiscoveryAttempt(home, "p", time.Now().UTC())
+		if got {
+			t.Fatal("TryWriteDiscoveryAttempt acquired while the lock was held")
+		}
+		if err != nil {
+			t.Fatalf("contention err = %v, want nil", err)
+		}
+		if _, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json")); !os.IsNotExist(statErr) {
+			t.Fatalf("contended attempt write created the cache file: %v", statErr)
+		}
+	})
+	t.Run("cache_success", func(t *testing.T) {
+		home := t.TempDir()
+		discovered := DiscoveredProvider{Models: map[string]DiscoveredModel{"m": {Name: "M", ContextWindow: 4096}}}
+		ok, err := TryWriteDiscoveryCache(home, "p", discovered, time.Now().UTC())
+		if !ok || err != nil {
+			t.Fatalf("TryWriteDiscoveryCache = (%v, %v), want (true, nil)", ok, err)
+		}
+		cache, _, _ := ReadDiscoveryCache(home)
+		if _, ok := cache["p"].Models["m"]; !ok {
+			t.Fatalf("cache after TryWriteDiscoveryCache = %#v, want model m", cache["p"].Models)
+		}
+	})
+	t.Run("cache_contention", func(t *testing.T) {
+		home := t.TempDir()
+		holder, ok, err := atomicfs.TryAcquire(discoveryLockPath(home, "p"))
+		if err != nil || !ok {
+			t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
+		}
+		defer holder.Release()
+		got, err := TryWriteDiscoveryCache(home, "p", DiscoveredProvider{Models: map[string]DiscoveredModel{"m": {}}}, time.Now().UTC())
+		if got {
+			t.Fatal("TryWriteDiscoveryCache acquired while the lock was held")
+		}
+		if err != nil {
+			t.Fatalf("contention err = %v, want nil", err)
+		}
+		if _, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json")); !os.IsNotExist(statErr) {
+			t.Fatalf("contended cache write created the cache file: %v", statErr)
+		}
+	})
+	t.Run("unsafe_id", func(t *testing.T) {
+		home := t.TempDir()
+		if _, err := TryWriteDiscoveryAttempt(home, "a/b", time.Now().UTC()); err == nil {
+			t.Fatal("TryWriteDiscoveryAttempt accepted an unsafe provider id")
+		}
+		if _, err := TryWriteDiscoveryCache(home, "a/b", DiscoveredProvider{}, time.Now().UTC()); err == nil {
+			t.Fatal("TryWriteDiscoveryCache accepted an unsafe provider id")
+		}
+	})
+}
+
+// TestFetchDiscoveryIfDueRows covers the fetch-only core: it returns the
+// discovered data only on success, marks attempted once the network begins,
+// suppresses a fetch when an attempt is recent, and performs no disk write in
+// any outcome.
+func TestFetchDiscoveryIfDueRows(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		home := t.TempDir()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`{"data":[{"id":"m","name":"M","context_window":4096}]}`))
+		}))
+		defer server.Close()
+		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: server.URL + "/v1"}}
+		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
+		if !attempted {
+			t.Fatal("FetchDiscoveryIfDue did not mark the network attempt")
+		}
+		if discovered == nil || len(discovered.Models) != 1 {
+			t.Fatalf("discovered = %#v, want one model", discovered)
+		}
+		if len(warnings) != 0 {
+			t.Fatalf("warnings = %#v, want none", warnings)
+		}
+		if _, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json")); !os.IsNotExist(statErr) {
+			t.Fatalf("fetch-only core wrote the cache: %v", statErr)
+		}
+	})
+	t.Run("valid_request_failure_marks_attempt", func(t *testing.T) {
+		// Valid-request sibling: the models URL is well-formed, so the network
+		// boundary is crossed; the fetch failure stays attempted and preserves
+		// TTL suppression.
+		home := t.TempDir()
+		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1"}}
+		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
+		if !attempted {
+			t.Fatal("FetchDiscoveryIfDue did not mark the network attempt on a valid-request failure")
+		}
+		if discovered != nil {
+			t.Fatalf("discovered = %#v, want nil on failure", discovered)
+		}
+		if len(warnings) != 1 || warnings[0].Kind != "discovery_failure" {
+			t.Fatalf("warnings = %#v, want one discovery_failure", warnings)
+		}
+		if _, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json")); !os.IsNotExist(statErr) {
+			t.Fatalf("fetch-only core wrote the attempt on failure: %v", statErr)
+		}
+	})
+	t.Run("invalid_url_refuses_before_attempt", func(t *testing.T) {
+		// Invalid-request sibling: the models URL is rejected before the
+		// network-attempt boundary, so attempted stays false, the existing
+		// discovery_failure warning is returned, and no attempt/cache marker
+		// is created through either wrapper.
+		home := t.TempDir()
+		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "not an absolute url"}}
+		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
+		if attempted {
+			t.Fatal("FetchDiscoveryIfDue marked an attempt for a pre-network URL validation failure")
+		}
+		if discovered != nil {
+			t.Fatalf("discovered = %#v, want nil for an invalid request", discovered)
+		}
+		if len(warnings) != 1 || warnings[0].Kind != "discovery_failure" {
+			t.Fatalf("warnings = %#v, want one discovery_failure", warnings)
+		}
+		if _, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json")); !os.IsNotExist(statErr) {
+			t.Fatalf("invalid-request core created an attempt/cache marker: %v", statErr)
+		}
+	})
+	t.Run("recent_attempt_suppresses", func(t *testing.T) {
+		home := t.TempDir()
+		if err := WriteDiscoveryAttempt(home, "p", time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1"}}
+		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
+		if attempted || discovered != nil || len(warnings) != 0 {
+			t.Fatalf("FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) for a recent attempt", attempted, discovered, warnings)
+		}
+	})
+	t.Run("missing_key_suppresses", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("LIGHTCODE_FETCH_DUE_KEY", "")
+		_ = os.Unsetenv("LIGHTCODE_FETCH_DUE_KEY")
+		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1", APIKeyEnv: "LIGHTCODE_FETCH_DUE_KEY"}}
+		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
+		if attempted || discovered != nil || len(warnings) != 0 {
+			t.Fatalf("FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) without a key", attempted, discovered, warnings)
+		}
+	})
+	t.Run("disabled_provider_suppresses", func(t *testing.T) {
+		home := t.TempDir()
+		provider := &Provider{ID: "p", Discovery: false, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1"}}
+		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
+		if attempted || discovered != nil || len(warnings) != 0 {
+			t.Fatalf("FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) for a disabled provider", attempted, discovered, warnings)
+		}
+	})
+}
+
+// TestRefreshProviderDiscoveryTryContention proves the Try refresh wrapper
+// returns a warning and publishes nothing when a foreign process holds the
+// provider's discovery lock: no attempt, no cache, no catalog merge.
+func TestRefreshProviderDiscoveryTryContention(t *testing.T) {
+	home := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"m","name":"M","context_window":4096}]}`))
+	}))
+	defer server.Close()
+	cat := &Catalog{Providers: map[string]*Provider{
+		"p": {ID: "p", Builtin: true, Discovery: true, Models: map[string]*Model{}, Transport: Transport{BaseURL: server.URL + "/v1"}},
+	}}
+	holder, ok, err := atomicfs.TryAcquire(discoveryLockPath(home, "p"))
+	if err != nil || !ok {
+		t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
+	}
+	defer holder.Release()
+
+	changed, warnings := RefreshProviderDiscoveryTryWithConfigPath(context.Background(), home, "", cat, "p")
+	if changed {
+		t.Fatal("Try refresh reported a change under foreign lock contention")
+	}
+	if len(warnings) == 0 || !strings.Contains(warnings[0].Message, "lock") {
+		t.Fatalf("warnings = %#v, want a discovery lock contention warning", warnings)
+	}
+	if _, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("contended Try refresh wrote the cache: %v", statErr)
+	}
+	if len(cat.Providers["p"].Models) != 0 {
+		t.Fatalf("contended Try refresh merged models into the catalog: %#v", cat.Providers["p"].Models)
+	}
+}
+
+// discoveryBlockHolderEnv selects the child half of
+// TestRefreshProviderDiscoveryBlocksUntilRelease and names the discovery lock
+// path the child holds.
+const discoveryBlockHolderEnv = "LIGHTCODE_CATALOG_DISCOVERY_BLOCK_HOLDER"
+
+// TestRefreshProviderDiscoveryBlocksUntilRelease proves the blocking refresh
+// wrapper stays blocked for startup callers: with a foreign process holding
+// the provider's discovery lock, it stays parked and completes once the holder
+// releases. It is the positive control beside the one-attempt Try wrapper. The
+// holder is a self-exec child of this test binary, so the contention is a real
+// cross-process flock, not a same-process open.
+func TestRefreshProviderDiscoveryBlocksUntilRelease(t *testing.T) {
+	if lockPath := os.Getenv(discoveryBlockHolderEnv); lockPath != "" {
+		l, err := atomicfs.Acquire(lockPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		fmt.Println("ready")
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		if err := l.Release(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(3)
+		}
+		os.Exit(0)
+	}
+
+	home := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"m","name":"M","context_window":4096}]}`))
+	}))
+	defer server.Close()
+	cat := &Catalog{Providers: map[string]*Provider{
+		"p": {ID: "p", Builtin: true, Discovery: true, Models: map[string]*Model{}, Transport: Transport{BaseURL: server.URL + "/v1"}},
+	}}
+	lockPath := discoveryLockPath(home, "p")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRefreshProviderDiscoveryBlocksUntilRelease$")
+	cmd.Env = append(os.Environ(), discoveryBlockHolderEnv+"="+lockPath)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		t.Fatalf("child stdin pipe: %v", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		t.Fatalf("child stdout pipe: %v", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("start child: %v", err)
+	}
+	ready := make(chan struct{})
+	scannerDone := make(chan struct{})
+	go func() {
+		defer close(scannerDone)
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if scanner.Text() == "ready" {
+				close(ready)
+				return
+			}
+		}
+	}()
+	reap := func() error {
+		_ = stdin.Close()
+		err := cmd.Wait()
+		<-scannerDone
+		return err
+	}
+	fail := func() string {
+		cancel()
+		_ = reap()
+		return stderr.String()
+	}
+	t.Cleanup(func() { cancel(); _ = reap() })
+	select {
+	case <-ready:
+	case <-ctx.Done():
+		t.Fatalf("child never held the discovery lock within %v: %v\n%s", 30*time.Second, ctx.Err(), fail())
+	}
+
+	started := make(chan struct{})
+	done := make(chan struct {
+		changed  bool
+		warnings []Warning
+	}, 1)
+	go func() {
+		close(started)
+		changed, warnings := RefreshProviderDiscoveryWithConfigPath(context.Background(), home, "", cat, "p")
+		done <- struct {
+			changed  bool
+			warnings []Warning
+		}{changed, warnings}
+	}()
+	<-started
+	select {
+	case <-done:
+		t.Fatal("blocking refresh returned while the foreign process held the discovery lock; the startup wrapper must stay blocked")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := reap(); err != nil {
+		t.Fatalf("child after release: %v\n%s", err, stderr.String())
+	}
+	select {
+	case res := <-done:
+		if !res.changed || len(res.warnings) != 0 {
+			t.Fatalf("blocking refresh after release = (%v, %#v), want (true, none)", res.changed, res.warnings)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking refresh did not complete after the holder released")
+	}
+	if len(cat.Providers["p"].Models) != 1 {
+		t.Fatalf("merged models = %#v, want the fetched model", cat.Providers["p"].Models)
+	}
+}
+
+// TestRefreshWrappersDoNotMarkInvalidURLAttempt proves a pre-network URL
+// validation failure through either refresh wrapper creates no attempt or
+// cache marker: both the blocking and the one-attempt Try wrapper return the
+// existing discovery_failure warning with attempted=false, so no
+// discovery/<id>.json file is ever created for a request that never reached
+// the network.
+func TestRefreshWrappersDoNotMarkInvalidURLAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(home string, cat *Catalog) (bool, []Warning)
+	}{
+		{"blocking", func(home string, cat *Catalog) (bool, []Warning) {
+			return RefreshProviderDiscoveryWithConfigPath(context.Background(), home, "", cat, "p")
+		}},
+		{"try", func(home string, cat *Catalog) (bool, []Warning) {
+			return RefreshProviderDiscoveryTryWithConfigPath(context.Background(), home, "", cat, "p")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			cat := &Catalog{Providers: map[string]*Provider{
+				"p": {ID: "p", Discovery: true, Transport: Transport{BaseURL: "not an absolute url"}},
+			}}
+			changed, warnings := tc.run(home, cat)
+			if changed {
+				t.Fatal("invalid-URL refresh reported a change")
+			}
+			if len(warnings) != 1 || warnings[0].Kind != "discovery_failure" {
+				t.Fatalf("warnings = %#v, want one discovery_failure", warnings)
+			}
+			if _, err := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json")); !os.IsNotExist(err) {
+				t.Fatalf("invalid-URL %s wrapper created an attempt/cache marker: %v", tc.name, err)
+			}
+		})
 	}
 }

@@ -453,21 +453,50 @@ func WriteDiscoveryAttempt(home, providerID string, attemptedAt time.Time) error
 	}
 	path := filepath.Join(discoveryCacheDir(home), providerID+".json")
 	return withDiscoveryLock(home, providerID, func() error {
-		raw := discoveryCacheFile{Models: map[string]discoveryCacheModel{}}
-		data, err := os.ReadFile(path)
-		if err == nil {
-			if err := json.Unmarshal(data, &raw); err != nil {
-				return err
-			}
-			if raw.Models == nil {
-				raw.Models = map[string]discoveryCacheModel{}
-			}
-		} else if !os.IsNotExist(err) {
+		return writeDiscoveryAttemptPayload(path, attemptedAt)
+	})
+}
+
+// TryWriteDiscoveryAttempt is the one-attempt counterpart of
+// WriteDiscoveryAttempt for owner paths that must not block a shutting-down
+// owner on a foreign discovery-lock holder. On contention it returns
+// (false, nil) without touching the cache file; on success it returns
+// (true, the payload result), so a payload failure is distinguishable from
+// contention.
+func TryWriteDiscoveryAttempt(home, providerID string, attemptedAt time.Time) (bool, error) {
+	if !safeProviderID(providerID) {
+		return false, fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
+	}
+	if attemptedAt.IsZero() {
+		attemptedAt = time.Now().UTC()
+	}
+	path := filepath.Join(discoveryCacheDir(home), providerID+".json")
+	return atomicfs.TryWithLock(discoveryLockPath(home, providerID), func() error {
+		discoveryLockAcquiredHook(discoveryLockPath(home, providerID))
+		return writeDiscoveryAttemptPayload(path, attemptedAt)
+	})
+}
+
+// writeDiscoveryAttemptPayload stamps the attempted timestamp onto one
+// provider's cache file, preserving any cached models. It runs under the
+// per-provider discovery lock held by the caller (the blocking
+// withDiscoveryLock or the one-attempt TryWithLock), so it never reacquires
+// the leaf.
+func writeDiscoveryAttemptPayload(path string, attemptedAt time.Time) error {
+	raw := discoveryCacheFile{Models: map[string]discoveryCacheModel{}}
+	data, err := os.ReadFile(path)
+	if err == nil {
+		if err := json.Unmarshal(data, &raw); err != nil {
 			return err
 		}
-		raw.AttemptedAt = attemptedAt.UTC()
-		return writeDiscoveryCacheFile(path, raw)
-	})
+		if raw.Models == nil {
+			raw.Models = map[string]discoveryCacheModel{}
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	raw.AttemptedAt = attemptedAt.UTC()
+	return writeDiscoveryCacheFile(path, raw)
 }
 
 // WriteDiscoveryCache writes one provider's discovery cache file. It builds
@@ -481,20 +510,49 @@ func WriteDiscoveryCache(home, providerID string, discovered DiscoveredProvider,
 	if fetchedAt.IsZero() {
 		fetchedAt = time.Now().UTC()
 	}
+	path := filepath.Join(discoveryCacheDir(home), providerID+".json")
 	return withDiscoveryLock(home, providerID, func() error {
-		raw := discoveryCacheFile{FetchedAt: fetchedAt.UTC(), AttemptedAt: fetchedAt.UTC(), Models: map[string]discoveryCacheModel{}}
-		for modelID, model := range discovered.Models {
-			raw.Models[modelID] = discoveryCacheModel{
-				ID:              modelID,
-				Name:            model.Name,
-				ContextWindow:   model.ContextWindow,
-				MaxOutputTokens: model.MaxOutputTokens,
-				Cost:            model.Cost,
-				Metadata:        model.metadata,
-			}
-		}
-		return writeDiscoveryCacheFile(filepath.Join(discoveryCacheDir(home), providerID+".json"), raw)
+		return writeDiscoveryCachePayload(path, discovered, fetchedAt)
 	})
+}
+
+// TryWriteDiscoveryCache is the one-attempt counterpart of
+// WriteDiscoveryCache for owner paths that must not block a shutting-down
+// owner on a foreign discovery-lock holder. On contention it returns
+// (false, nil) without touching the cache file; on success it returns
+// (true, the payload result), so a payload failure is distinguishable from
+// contention.
+func TryWriteDiscoveryCache(home, providerID string, discovered DiscoveredProvider, fetchedAt time.Time) (bool, error) {
+	if !safeProviderID(providerID) {
+		return false, fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
+	}
+	if fetchedAt.IsZero() {
+		fetchedAt = time.Now().UTC()
+	}
+	path := filepath.Join(discoveryCacheDir(home), providerID+".json")
+	return atomicfs.TryWithLock(discoveryLockPath(home, providerID), func() error {
+		discoveryLockAcquiredHook(discoveryLockPath(home, providerID))
+		return writeDiscoveryCachePayload(path, discovered, fetchedAt)
+	})
+}
+
+// writeDiscoveryCachePayload publishes one provider's discovery cache file
+// fresh from the discovery result. It runs under the per-provider discovery
+// lock held by the caller (the blocking withDiscoveryLock or the one-attempt
+// TryWithLock), so it never reacquires the leaf.
+func writeDiscoveryCachePayload(path string, discovered DiscoveredProvider, fetchedAt time.Time) error {
+	raw := discoveryCacheFile{FetchedAt: fetchedAt.UTC(), AttemptedAt: fetchedAt.UTC(), Models: map[string]discoveryCacheModel{}}
+	for modelID, model := range discovered.Models {
+		raw.Models[modelID] = discoveryCacheModel{
+			ID:              modelID,
+			Name:            model.Name,
+			ContextWindow:   model.ContextWindow,
+			MaxOutputTokens: model.MaxOutputTokens,
+			Cost:            model.Cost,
+			Metadata:        model.metadata,
+		}
+	}
+	return writeDiscoveryCacheFile(path, raw)
 }
 
 func readDiscoveryCacheFile(path string) (DiscoveredProvider, time.Time, error) {

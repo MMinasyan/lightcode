@@ -236,6 +236,29 @@ func WithLock(lockPath string, fn func() error) error {
 	if err != nil {
 		return err
 	}
+	return runLocked(l, lockPath, fn)
+}
+
+// TryWithLock is the one-attempt counterpart of WithLock for owner paths that
+// must not block a shutting-down owner on a foreign lock holder. On contention
+// it returns (false, nil) without invoking fn; otherwise it executes the same
+// acquired body WithLock uses and returns (true, fn's result). No retry.
+func TryWithLock(lockPath string, fn func() error) (bool, error) {
+	l, ok, err := TryAcquire(lockPath)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	return true, runLocked(l, lockPath, fn)
+}
+
+// runLocked executes fn while l is held and releases it through defer, so a
+// panicking callback still releases the lock exactly once. The callback result
+// is authoritative: a release failure is a postcommit diagnostic — reported
+// once to stderr — that never replaces the callback's result.
+func runLocked(l *Lock, lockPath string, fn func() error) error {
 	defer func() {
 		if err := l.Release(); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: release lock %s: %v\n", lockPath, err)

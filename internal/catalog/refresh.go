@@ -20,43 +20,122 @@ func RefreshProviderDiscovery(ctx context.Context, home string, cat *Catalog, pr
 
 // RefreshProviderDiscoveryWithConfigPath is RefreshProviderDiscovery with an
 // explicit config path for preserving user-owned cost fields during merges.
+// It is the blocking wrapper for startup callers: the attempt and cache
+// publications block on the per-provider discovery lock until the holder
+// releases.
 func RefreshProviderDiscoveryWithConfigPath(ctx context.Context, home, configPath string, cat *Catalog, providerID string) (bool, []Warning) {
-	provider := catalogProvider(cat, providerID)
+	return refreshProviderDiscovery(ctx, home, configPath, cat, providerID, false)
+}
+
+// RefreshProviderDiscoveryTryWithConfigPath is the one-attempt counterpart of
+// RefreshProviderDiscoveryWithConfigPath for owner paths that must not block a
+// shutting-down owner on a foreign discovery-lock holder. Every publication
+// runs through the one-attempt Try writers; contention yields the existing
+// discovery_failure warning and publishes nothing.
+func RefreshProviderDiscoveryTryWithConfigPath(ctx context.Context, home, configPath string, cat *Catalog, providerID string) (bool, []Warning) {
+	return refreshProviderDiscovery(ctx, home, configPath, cat, providerID, true)
+}
+
+// FetchDiscoveryIfDue performs the fetch-only core of a discovery refresh:
+// readiness — including validation of the discovery models URL before the
+// network-attempt boundary — the current recent-attempt check, the bounded
+// timeout, and the network fetch. It performs no disk write, catalog merge,
+// owner mutation, or warning publication. attempted is true exactly once the
+// network begins; a pre-network URL validation error leaves it false, and a
+// valid-request failure after the boundary stays attempted. discovered carries
+// the fetched models only on success; warnings carry the existing
+// discovery_failure warnings. It is the shared core of the blocking and Try
+// refresh wrappers.
+func FetchDiscoveryIfDue(ctx context.Context, home string, provider *Provider, now time.Time) (attempted bool, discovered *DiscoveredProvider, warnings []Warning) {
 	if provider == nil {
-		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("unknown provider %q", providerID)}}
+		return false, nil, []Warning{{Kind: "discovery_failure", Message: "discovery provider is nil"}}
 	}
 	if !provider.Discovery {
-		return false, nil
+		return false, nil, nil
 	}
 	if provider.Transport.APIKeyEnv != "" && os.Getenv(provider.Transport.APIKeyEnv) == "" {
-		return false, nil
+		return false, nil, nil
 	}
-	now := time.Now().UTC()
-	recent, err := DiscoveryAttemptRecent(home, providerID, now)
+	// The discovery models URL is validated before the network-attempt
+	// boundary, using the same package logic FetchDiscovery applies. A
+	// pre-network validation error is a readiness failure: attempted stays
+	// false, so neither refresh wrapper creates an attempt marker for a
+	// request that never reached the network, and the existing
+	// discovery_failure warning is returned.
+	if _, err := discoveryModelsURL(provider.Transport.BaseURL); err != nil {
+		return false, nil, []Warning{{Kind: "discovery_failure", Provider: provider.ID, Message: err.Error()}}
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	recent, err := DiscoveryAttemptRecent(home, provider.ID, now)
 	if err != nil {
-		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("read discovery attempt: %v", err)}}
+		return false, nil, []Warning{{Kind: "discovery_failure", Provider: provider.ID, Message: fmt.Sprintf("read discovery attempt: %v", err)}}
 	}
 	if recent {
-		return false, nil
+		return false, nil, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	ctx, cancel := context.WithTimeout(ctx, discoveryFetchTimeout)
 	defer cancel()
-	if err := WriteDiscoveryAttempt(home, providerID, now); err != nil {
-		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery attempt: %v", err)}}
-	}
-	discovered, err := FetchDiscovery(ctx, http.DefaultClient, provider)
+	// The network-attempt boundary: attempted is set immediately before the
+	// existing FetchDiscovery call, so a valid-request failure after this
+	// point stays attempted and preserves TTL suppression.
+	attempted = true
+	got, err := FetchDiscovery(ctx, http.DefaultClient, provider)
 	if err != nil {
-		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: err.Error()}}
+		return attempted, nil, []Warning{{Kind: "discovery_failure", Provider: provider.ID, Message: err.Error()}}
 	}
-	if err := WriteDiscoveryCache(home, providerID, discovered, now); err != nil {
-		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)}}
+	return attempted, &got, nil
+}
+
+// refreshProviderDiscovery is the shared refresh body behind the blocking and
+// Try wrappers. Both preserve read-cost protection before publication/merge.
+func refreshProviderDiscovery(ctx context.Context, home, configPath string, cat *Catalog, providerID string, try bool) (bool, []Warning) {
+	provider := catalogProvider(cat, providerID)
+	if provider == nil {
+		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("unknown provider %q", providerID)}}
+	}
+	attempted, discovered, warnings := FetchDiscoveryIfDue(ctx, home, provider, time.Now().UTC())
+	if !attempted {
+		return false, warnings
+	}
+	if discovered == nil {
+		// The network failed: record the attempt so a duplicate fetch is
+		// suppressed inside the TTL, then surface the fetch failure.
+		if try {
+			ok, err := TryWriteDiscoveryAttempt(home, providerID, time.Now().UTC())
+			if err != nil {
+				return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery attempt: %v", err)})
+			}
+			if !ok {
+				return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("discovery lock is held for %q; attempt write skipped", providerID)})
+			}
+		} else {
+			if err := WriteDiscoveryAttempt(home, providerID, time.Now().UTC()); err != nil {
+				return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery attempt: %v", err)})
+			}
+		}
+		return false, warnings
+	}
+	if try {
+		ok, err := TryWriteDiscoveryCache(home, providerID, *discovered, time.Now().UTC())
+		if err != nil {
+			return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)})
+		}
+		if !ok {
+			return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("discovery lock is held for %q; cache write skipped", providerID)})
+		}
+	} else {
+		if err := WriteDiscoveryCache(home, providerID, *discovered, time.Now().UTC()); err != nil {
+			return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)})
+		}
 	}
 	protected := userCostProtectionForProviderAt(home, configPath, providerID)
-	if err := cat.MergeDiscoveredProviderWithCostProtection(providerID, discovered, protected); err != nil {
-		return false, []Warning{{Kind: "discovery_failure", Provider: providerID, Message: err.Error()}}
+	if err := cat.MergeDiscoveredProviderWithCostProtection(providerID, *discovered, protected); err != nil {
+		return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: err.Error()})
 	}
 	return true, nil
 }

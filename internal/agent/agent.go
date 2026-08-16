@@ -3768,6 +3768,14 @@ func (a *Agent) SaveProjectPermission(id string, patterns []string) error {
 	return a.SaveProjectPermissionForSession(a.currentPermissionSessionID(), id, patterns)
 }
 
+// SaveProjectPermissionForSession resolves the supported pending request and
+// project, then performs the save under the owner lifecycle lock: a final
+// owner-open check, one one-attempt TrySaveLocal, and the gate response all
+// happen before the lock is released, so a close-first save refuses with
+// nothing written and an operation-first save completes its bounded read-
+// merge-write and response before close. A foreign permissions-lock holder
+// yields a retryable error with the request left pending — the save never
+// blocks a shutting-down owner on the leaf.
 func (a *Agent) SaveProjectPermissionForSession(sessionID string, id string, patterns []string) error {
 	if a.gate == nil {
 		return permission.ErrUnknownRequest
@@ -3785,8 +3793,20 @@ func (a *Agent) SaveProjectPermissionForSession(sessionID string, id string, pat
 		projectID = proj.ID
 	}
 	add := permission.Rules{Allow: patterns}
-	if err := permission.SaveLocal(a.projects.Root(), projectID, add); err != nil {
+	defer a.lockLifecycle()()
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	closed := rt.closed
+	rt.mu.Unlock()
+	if closed {
+		return errOwnerClosed
+	}
+	ok, err := permission.TrySaveLocal(a.projects.Root(), projectID, add)
+	if err != nil {
 		return err
+	}
+	if !ok {
+		return fmt.Errorf("permission save is busy; retry")
 	}
 	if err := a.gate.RespondForSession(sessionID, id, true); err != nil {
 		if errors.Is(err, permission.ErrUnknownRequest) {
@@ -3863,8 +3883,12 @@ func (a *Agent) switchModelForSession(unit *session, refStr string) (ModelInfo, 
 
 // Reload reloads config and catalog state for future turns.
 func (a *Agent) Reload() error {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.closed {
+		return errOwnerClosed
+	}
 	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot reload while a turn is running")
 	}
@@ -3880,6 +3904,9 @@ func (a *Agent) reloadLockedNoRefresh() error {
 }
 
 func (a *Agent) reloadLockedWithRefresh(allowBackgroundDiscovery bool) error {
+	if err := a.requireOwnerOpenLocked(); err != nil {
+		return err
+	}
 	cfg, agentTypes, modelCatalog, catalogWarnings, err := a.loadReloadStateLocked(allowBackgroundDiscovery)
 	if err != nil {
 		return err
@@ -3909,8 +3936,15 @@ func (a *Agent) loadReloadStateLocked(allowBackgroundDiscovery bool) (*config.Co
 }
 
 // loadCatalogLocked loads and assembles the model catalog from the bundled
-// catalog, the user config, and the discovery cache. Caller holds runtime.mu.
+// catalog, the user config, and the discovery cache. It is guarded before the
+// runtime Loader publication and publishes through the Try Loader, so a
+// foreign discovery-lock holder yields the existing discovery_failure warning
+// instead of hanging the owner, and a close-first load creates no first-run
+// files. Caller holds runtime.mu.
 func (a *Agent) loadCatalogLocked(allowBackgroundDiscovery bool) (*catalog.Catalog, []catalog.Warning, error) {
+	if err := a.requireOwnerOpenLocked(); err != nil {
+		return nil, nil, err
+	}
 	modelLoader := catalog.NewLoaderWithConfigPath(a.home, nil, a.configPath)
 	modelLoader.AllowRefresh = func(_ string, prov *catalog.Provider) bool {
 		if !allowBackgroundDiscovery {
@@ -3918,7 +3952,7 @@ func (a *Agent) loadCatalogLocked(allowBackgroundDiscovery bool) (*catalog.Catal
 		}
 		return providerConnected(prov)
 	}
-	modelCatalog, catalogWarnings, err := modelLoader.Load()
+	modelCatalog, catalogWarnings, err := modelLoader.LoadTry()
 	if err != nil {
 		return nil, nil, fmt.Errorf("load model catalog: %w", err)
 	}
@@ -4009,6 +4043,27 @@ func writeAgentConfigAtomic(path string, value any) error {
 	return atomicfs.Write(path, data, 0o600)
 }
 
+// requireOwnerOpenLocked refuses an owner mutation after shutdown published
+// closed. It is the single entry check of every named first-write sink; the
+// caller holds runtime.mu.
+func (a *Agent) requireOwnerOpenLocked() error {
+	if a.ensureRuntime().closed {
+		return errOwnerClosed
+	}
+	return nil
+}
+
+// writeAgentConfigLocked publishes one whole config root through the owner's
+// first-write sink: the guard runs immediately before the atomicfs write, so
+// an absent first-run config is never created and an existing one never
+// replaced after owner close. Caller holds runtime.mu.
+func (a *Agent) writeAgentConfigLocked(value any) error {
+	if err := a.requireOwnerOpenLocked(); err != nil {
+		return err
+	}
+	return writeAgentConfigAtomic(a.configPath, value)
+}
+
 // mutateProviderConfig reads the agent config, navigates to the specified
 // provider map, calls mutate, and writes the config atomically.
 // Caller must hold the runtime mutex.
@@ -4044,7 +4099,7 @@ func (a *Agent) mutateProviderConfig(providerID string, mutate func(providerMap 
 			return err
 		}
 	}
-	return writeAgentConfigAtomic(path, root)
+	return a.writeAgentConfigLocked(root)
 }
 
 func validateRawProviderConfig(providerID string, providerMap map[string]any) error {
@@ -4091,8 +4146,12 @@ func (a *Agent) mutateModelConfig(ref coremodel.ModelRef, mutate func(modelMap m
 
 // RefreshDiscovery refreshes live model discovery for one enabled provider.
 func (a *Agent) RefreshDiscovery(provider string) error {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.closed {
+		return errOwnerClosed
+	}
 	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot refresh discovery while a turn is running")
 	}
@@ -4100,7 +4159,7 @@ func (a *Agent) RefreshDiscovery(provider string) error {
 }
 
 func (a *Agent) refreshDiscoveryLocked(provider string) error {
-	_, warnings := catalog.RefreshProviderDiscoveryWithConfigPath(context.Background(), a.home, a.configPath, a.catalog, provider)
+	_, warnings := catalog.RefreshProviderDiscoveryTryWithConfigPath(context.Background(), a.home, a.configPath, a.catalog, provider)
 	if len(warnings) == 0 {
 		return nil
 	}
@@ -4109,8 +4168,12 @@ func (a *Agent) refreshDiscoveryLocked(provider string) error {
 }
 
 func (a *Agent) CurrentModelForSession(sessionID string) (ModelInfo, error) {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.closed {
+		return ModelInfo{}, errOwnerClosed
+	}
 	unit, err := a.liveSessionLocked(sessionID)
 	if err != nil {
 		return ModelInfo{}, err
@@ -4467,7 +4530,7 @@ func (a *Agent) SetRuntimeConfig(settings RuntimeConfigSettings) error {
 	tools["read_line_max_chars"] = settings.Tools.ReadLineMaxChars
 	tools["command_timeout"] = settings.Tools.CommandTimeout
 	tools["max_background_processes"] = settings.Tools.MaxBackgroundProcesses
-	if err := writeAgentConfigAtomic(a.configPath, root); err != nil {
+	if err := a.writeAgentConfigLocked(root); err != nil {
 		return err
 	}
 	return a.reloadLockedNoRefresh()
@@ -4539,6 +4602,9 @@ func (a *Agent) SetDefaultModel(refStr string) error {
 }
 
 func (a *Agent) writePrimaryModelLocked(ref coremodel.ModelRef) error {
+	if err := a.requireOwnerOpenLocked(); err != nil {
+		return err
+	}
 	if a.agentsPath == "" {
 		a.agentsPath = agentcfg.PathForConfig(a.configPath)
 	}

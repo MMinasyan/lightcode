@@ -243,6 +243,10 @@ func applyProviderFields(pm map[string]any, cfg ProviderConfigInput) {
 // connected provider.
 func (a *Agent) DiscoverableModels(providerID string) ([]DiscoveryModelCandidate, error) {
 	a.ensureRuntime().mu.Lock()
+	if a.ensureRuntime().closed {
+		a.ensureRuntime().mu.Unlock()
+		return nil, errOwnerClosed
+	}
 	if a.ensureRuntime().sessionLocked().busy {
 		a.ensureRuntime().mu.Unlock()
 		return nil, fmt.Errorf("cannot discover models while a turn is running")
@@ -325,24 +329,30 @@ func lockedModelFields(cfg ModelConfigInput) error {
 
 // SaveModel adds or edits one model's fields under a provider (user-layer
 // overrides). Used for both editing and "add model". The discovery cache is
-// warmed for the providers the reload would refresh (outside runtime.mu, see
-// warmSettingsEditDiscovery); the config mutation and the locked reload then
-// share a single lock hold.
+// prepared under runtime.mu, fetched outside it (write-free), and published
+// through one one-attempt Try writer inside the final guarded hold: config
+// first, then discovery outcome, then the locked reload, then warning
+// publication.
 func (a *Agent) SaveModel(providerID, modelID string, cfg ModelConfigInput) error {
-	warmWarnings, err := a.warmSettingsEditDiscovery()
+	plan, err := a.planWarmSettingsEdit()
 	if err != nil {
 		return err
 	}
+	outcomes := a.fetchWarmSettingsEditDiscovery(plan)
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	if err := a.saveModelLocked(providerID, modelID, cfg); err != nil {
 		return err
 	}
+	warnings, err := a.publishWarmEditDiscovery(plan, outcomes)
+	if err != nil {
+		return err
+	}
 	if err := a.reloadLocked(); err != nil {
 		return err
 	}
-	a.surfaceCatalogWarnings(warmWarnings)
+	a.surfaceCatalogWarnings(warnings)
 	return nil
 }
 
@@ -376,24 +386,29 @@ func (a *Agent) saveModelLocked(providerID, modelID string, cfg ModelConfigInput
 
 // DeleteModel removes a user-added model from config. Bundled/discovered models
 // cannot be deleted (the merge would re-add them); hide or reset them instead.
-// The discovery cache is warmed for the providers the reload would refresh
-// (outside runtime.mu, see warmSettingsEditDiscovery); the config mutation and
-// the locked reload then share a single lock hold.
+// The discovery cache is prepared under runtime.mu, fetched outside it
+// (write-free), and published through one one-attempt Try writer inside the
+// final guarded hold.
 func (a *Agent) DeleteModel(providerID, modelID string) error {
-	warmWarnings, err := a.warmSettingsEditDiscovery()
+	plan, err := a.planWarmSettingsEdit()
 	if err != nil {
 		return err
 	}
+	outcomes := a.fetchWarmSettingsEditDiscovery(plan)
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	if err := a.deleteModelLocked(providerID, modelID); err != nil {
 		return err
 	}
+	warnings, err := a.publishWarmEditDiscovery(plan, outcomes)
+	if err != nil {
+		return err
+	}
 	if err := a.reloadLocked(); err != nil {
 		return err
 	}
-	a.surfaceCatalogWarnings(warmWarnings)
+	a.surfaceCatalogWarnings(warnings)
 	return nil
 }
 
@@ -432,14 +447,15 @@ var resettableModelFields = map[string]struct{}{
 
 // ResetModelField deletes a single user-layer override on a model, reverting it
 // to the bundled/discovery value. No-op (no write) when no override exists. The
-// discovery cache is warmed for the providers the reload would refresh (outside
-// runtime.mu, see warmSettingsEditDiscovery); the config mutation and the
-// locked reload then share a single lock hold.
+// discovery cache is prepared under runtime.mu, fetched outside it (write-free),
+// and published through one one-attempt Try writer inside the final guarded
+// hold; a no-op reset writes neither config nor discovery state.
 func (a *Agent) ResetModelField(providerID, modelID, field string) error {
-	warmWarnings, err := a.warmSettingsEditDiscovery()
+	plan, err := a.planWarmSettingsEdit()
 	if err != nil {
 		return err
 	}
+	outcomes := a.fetchWarmSettingsEditDiscovery(plan)
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -450,10 +466,14 @@ func (a *Agent) ResetModelField(providerID, modelID, field string) error {
 	if !changed {
 		return nil
 	}
+	warnings, err := a.publishWarmEditDiscovery(plan, outcomes)
+	if err != nil {
+		return err
+	}
 	if err := a.reloadLocked(); err != nil {
 		return err
 	}
-	a.surfaceCatalogWarnings(warmWarnings)
+	a.surfaceCatalogWarnings(warnings)
 	return nil
 }
 
@@ -738,25 +758,54 @@ func (a *Agent) commitProviderConfigCandidateLocked(candidate providerConfigCand
 			return fmt.Errorf("API key variable %q is already used by another provider", candidateEnv)
 		}
 	}
-	if err := writeAgentConfigAtomic(a.configPath, candidate.root); err != nil {
+	if err := a.writeAgentConfigLocked(candidate.root); err != nil {
 		return err
 	}
-	if attempted {
-		if discovered != nil {
-			if err := catalog.WriteDiscoveryCache(a.home, candidate.providerID, *discovered, time.Now().UTC()); err != nil {
-				warnings = append(warnings, catalog.Warning{Kind: "discovery_failure", Provider: candidate.providerID, Message: fmt.Sprintf("write discovery cache: %v", err)})
-			}
-		} else {
-			if err := catalog.WriteDiscoveryAttempt(a.home, candidate.providerID, time.Now().UTC()); err != nil {
-				warnings = append(warnings, catalog.Warning{Kind: "discovery_failure", Provider: candidate.providerID, Message: fmt.Sprintf("write discovery attempt: %v", err)})
-			}
-		}
+	var err error
+	warnings, err = a.publishDiscoveryOutcomeLocked(candidate.providerID, attempted, discovered, warnings)
+	if err != nil {
+		return err
 	}
 	if err := a.reloadLockedNoRefresh(); err != nil {
 		return err
 	}
 	a.surfaceCatalogWarnings(warnings)
 	return nil
+}
+
+// publishDiscoveryOutcomeLocked publishes one discovery fetch outcome through
+// the owner's guarded discovery sink. The sink itself enforces the final
+// owner-open authority immediately before its single one-attempt Try
+// attempt/cache publication, so a close-first caller can never publish through
+// it even when a caller-local guard is missed. A successful fetch writes the
+// cache, a failed fetch writes only the attempt marker. Contention or write
+// failure produces a discovery_failure warning and leaves discovery due;
+// nothing blocks on a foreign discovery-lock holder. Caller holds runtime.mu.
+func (a *Agent) publishDiscoveryOutcomeLocked(providerID string, attempted bool, discovered *catalog.DiscoveredProvider, warnings []catalog.Warning) ([]catalog.Warning, error) {
+	if !attempted {
+		return warnings, nil
+	}
+	if err := a.requireOwnerOpenLocked(); err != nil {
+		return warnings, err
+	}
+	if discovered != nil {
+		ok, err := catalog.TryWriteDiscoveryCache(a.home, providerID, *discovered, time.Now().UTC())
+		if err != nil {
+			return append(warnings, catalog.Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)}), nil
+		}
+		if !ok {
+			return append(warnings, catalog.Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("discovery lock is held for %q; cache write skipped", providerID)}), nil
+		}
+		return warnings, nil
+	}
+	ok, err := catalog.TryWriteDiscoveryAttempt(a.home, providerID, time.Now().UTC())
+	if err != nil {
+		return append(warnings, catalog.Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery attempt: %v", err)}), nil
+	}
+	if !ok {
+		return append(warnings, catalog.Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("discovery lock is held for %q; attempt write skipped", providerID)}), nil
+	}
+	return warnings, nil
 }
 
 func stripBundledHeaderKeys(headers map[string]string, providerID string) map[string]string {
@@ -808,10 +857,11 @@ var transportFields = map[string]struct{}{
 // publishing); other fields keep the warm discovery path.
 func (a *Agent) ResetProviderField(providerID, field string) error {
 	if _, isTransport := transportFields[field]; !isTransport {
-		warmWarnings, err := a.warmSettingsEditDiscovery()
+		plan, err := a.planWarmSettingsEdit()
 		if err != nil {
 			return err
 		}
+		outcomes := a.fetchWarmSettingsEditDiscovery(plan)
 		rt := a.ensureRuntime()
 		rt.mu.Lock()
 		defer rt.mu.Unlock()
@@ -822,10 +872,14 @@ func (a *Agent) ResetProviderField(providerID, field string) error {
 		if !changed {
 			return nil
 		}
+		warnings, err := a.publishWarmEditDiscovery(plan, outcomes)
+		if err != nil {
+			return err
+		}
 		if err := a.reloadLocked(); err != nil {
 			return err
 		}
-		a.surfaceCatalogWarnings(warmWarnings)
+		a.surfaceCatalogWarnings(warnings)
 		return nil
 	}
 	rt := a.ensureRuntime()
@@ -956,29 +1010,35 @@ func (a *Agent) resetProviderFieldLocked(providerID, field string) (bool, error)
 	return changed, nil
 }
 
-// warmSettingsEditDiscovery runs the first two phases of a settings edit's
-// reload. Under runtime.mu it builds the same no-refresh catalog the locked
+// warmEditPlan is the set of discovery providers one settings edit will fetch
+// outside the lock and publish under its final guarded hold.
+type warmEditPlan struct {
+	providers []*catalog.Provider
+}
+
+// warmEditOutcome is one planned provider's fetch-only result, carried into
+// the final guarded hold.
+type warmEditOutcome struct {
+	attempted  bool
+	discovered *catalog.DiscoveredProvider
+	warnings   []catalog.Warning
+}
+
+// planWarmSettingsEdit runs the first phase of a settings edit's
+// discovery: under runtime.mu it builds the same no-refresh catalog the locked
 // reload starts from and works out which providers that reload would fetch
-// discovery for; without the lock it then warms the discovery cache for
-// exactly those providers by calling the same refresh function the locked
-// reload calls (catalog.RefreshProviderDiscoveryWithConfigPath, which applies
-// its own timeout bound internally). Nothing is merged, rebuilt, or applied
-// here: the only effect is that the cache and attempt markers on disk are
-// fresh, so the reload that follows (in the edit's single lock hold) finds the
-// attempts recent and does no network I/O while holding runtime.mu. The
-// refresh warnings are returned so the caller can surface them next to the
-// reload's own catalog warnings.
-func (a *Agent) warmSettingsEditDiscovery() ([]catalog.Warning, error) {
+// discovery for. Nothing is written here.
+func (a *Agent) planWarmSettingsEdit() (warmEditPlan, error) {
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	modelCatalog, _, err := a.loadCatalogLocked(false)
 	if err != nil {
 		rt.mu.Unlock()
-		return nil, err
+		return warmEditPlan{}, err
 	}
 	_, attempts, _ := catalog.ReadDiscoveryCache(a.home)
 	now := time.Now().UTC()
-	var planned []string
+	var providers []*catalog.Provider
 	for _, providerID := range catalog.DiscoveryRefreshCandidates(modelCatalog, attempts, now) {
 		prov := modelCatalog.Providers[providerID]
 		if prov == nil || !providerConnected(prov) {
@@ -987,14 +1047,37 @@ func (a *Agent) warmSettingsEditDiscovery() ([]catalog.Warning, error) {
 		if prov.Transport.APIKeyEnv != "" && os.Getenv(prov.Transport.APIKeyEnv) == "" {
 			continue
 		}
-		planned = append(planned, providerID)
+		providers = append(providers, prov)
 	}
 	rt.mu.Unlock()
+	return warmEditPlan{providers: providers}, nil
+}
 
+// fetchWarmSettingsEditDiscovery runs the plan's fetch-only core outside
+// runtime.mu: per provider, FetchDiscoveryIfDue performs readiness, the
+// recent-attempt check, and the bounded network fetch, writing nothing.
+func (a *Agent) fetchWarmSettingsEditDiscovery(plan warmEditPlan) map[string]warmEditOutcome {
+	outcomes := make(map[string]warmEditOutcome, len(plan.providers))
+	for _, prov := range plan.providers {
+		attempted, discovered, warnings := catalog.FetchDiscoveryIfDue(context.Background(), a.home, prov, time.Now().UTC())
+		outcomes[prov.ID] = warmEditOutcome{attempted: attempted, discovered: discovered, warnings: warnings}
+	}
+	return outcomes
+}
+
+// publishWarmEditDiscovery publishes each planned provider's fetch outcome
+// through the owner's guarded discovery sink inside the edit's final guarded
+// hold. It returns the combined warnings; contention leaves the provider due.
+func (a *Agent) publishWarmEditDiscovery(plan warmEditPlan, outcomes map[string]warmEditOutcome) ([]catalog.Warning, error) {
 	var warnings []catalog.Warning
-	for _, providerID := range planned {
-		_, providerWarnings := catalog.RefreshProviderDiscoveryWithConfigPath(context.Background(), a.home, a.configPath, modelCatalog, providerID)
-		warnings = append(warnings, providerWarnings...)
+	for _, prov := range plan.providers {
+		outcome := outcomes[prov.ID]
+		warnings = append(warnings, outcome.warnings...)
+		var err error
+		warnings, err = a.publishDiscoveryOutcomeLocked(prov.ID, outcome.attempted, outcome.discovered, warnings)
+		if err != nil {
+			return warnings, err
+		}
 	}
 	return warnings, nil
 }

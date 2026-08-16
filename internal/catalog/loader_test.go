@@ -9,6 +9,8 @@ import (
 	"testing"
 	"testing/fstest"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 func TestLoaderReadsBundledUserConfigAndDiscoveryCache(t *testing.T) {
@@ -474,5 +476,90 @@ func TestDiscoveryRefreshCandidatesIsMechanical(t *testing.T) {
 	}
 	if got["no-discovery"] {
 		t.Fatalf("no-discovery provider should not be a candidate; got %v", candidates)
+	}
+}
+
+// TestLoaderLoadTryContentionWarnsAndDoesNotHang proves the Try Loader routes
+// discovery publication through the one-attempt Try writers: with a foreign
+// process holding a due provider's discovery lock, LoadTry returns the catalog
+// with the existing discovery_failure warning instead of hanging on the lock.
+func TestLoaderLoadTryContentionWarnsAndDoesNotHang(t *testing.T) {
+	disableBuiltinDiscoveryKeys(t)
+	home := t.TempDir()
+	writeLoaderFile(t, filepath.Join(home, ".lightcode", "config.json"), `{
+		"providers": {
+			"local": {
+				"transport": {"base_url": "http://127.0.0.1:9/v1", "api_key_env": ""},
+				"discovery": true,
+				"models": {}
+			}
+		}
+	}`)
+	holder, ok, err := atomicfs.TryAcquire(discoveryLockPath(home, "local"))
+	if err != nil || !ok {
+		t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
+	}
+	defer holder.Release()
+
+	done := make(chan struct {
+		cat      *Catalog
+		warnings []Warning
+		err      error
+	}, 1)
+	go func() {
+		cat, warnings, err := NewLoader(home, bundledFS).LoadTry()
+		done <- struct {
+			cat      *Catalog
+			warnings []Warning
+			err      error
+		}{cat, warnings, err}
+	}()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("LoadTry under discovery contention = %v, want a catalog plus warnings", res.err)
+		}
+		if res.cat == nil {
+			t.Fatal("LoadTry returned a nil catalog under discovery contention")
+		}
+		if !hasWarning(res.warnings, "discovery_failure") {
+			t.Fatalf("LoadTry warnings = %#v, want a discovery_failure warning", res.warnings)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("LoadTry hung on the foreign discovery lock; Try publication must not block shutdown")
+	}
+}
+
+// TestLoaderLoadTrySucceedsLikeLoad proves the Try Loader publishes through
+// the one-attempt writers exactly like the blocking Load when the lock is
+// free: the discovery cache is written and the catalog merged.
+func TestLoaderLoadTrySucceedsLikeLoad(t *testing.T) {
+	disableBuiltinDiscoveryKeys(t)
+	home := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"remote-model","name":"Remote Model","context_window":16384,"max_output_tokens":2048}]}`))
+	}))
+	t.Cleanup(server.Close)
+	fsys := fstest.MapFS{
+		"builtin/remote.json": {Data: []byte(`{
+			"id": "remote",
+			"name": "Remote",
+			"transport": {"base_url": "` + server.URL + `/v1", "api_key_env": ""},
+			"discovery": true,
+			"models": {}
+		}`)},
+	}
+	cat, warnings, err := NewLoader(home, fsys).LoadTry()
+	if err != nil {
+		t.Fatalf("LoadTry: %v", err)
+	}
+	if hasWarning(warnings, "discovery_failure") {
+		t.Fatalf("LoadTry warnings = %#v, want no discovery_failure", warnings)
+	}
+	if _, ok := cat.Providers["remote"].Models["remote-model"]; !ok {
+		t.Fatalf("LoadTry did not merge the fetched model: %#v", cat.Providers["remote"].Models)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json")); statErr != nil {
+		t.Fatalf("LoadTry did not write the discovery cache: %v", statErr)
 	}
 }

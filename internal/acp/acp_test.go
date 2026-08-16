@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	lcconfig "github.com/MMinasyan/lightcode/internal/config"
 )
 
@@ -1950,8 +1951,10 @@ func TestACPOrderedDeliveryContract(t *testing.T) {
 
 // acpPermissionPendingRunner wires an ACP runner whose first turn asks a
 // read_file permission request, submits a message, and waits until the request
-// is pending. It returns the session id, the output buffer, and the runner.
-func acpPermissionPendingRunner(t *testing.T) (string, *bytes.Buffer, *Runner) {
+// is pending. It returns the session id, the output buffer, the runner, the
+// pending request's id and project id, and the agent's storage home (the
+// projects root is <home>/.lightcode/projects).
+func acpPermissionPendingRunner(t *testing.T) (string, *bytes.Buffer, *Runner, string, string, string) {
 	t.Helper()
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1971,7 +1974,7 @@ func acpPermissionPendingRunner(t *testing.T) (string, *bytes.Buffer, *Runner) {
 	}))
 	t.Cleanup(server.Close)
 
-	a := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+	a, home := newACPTestAgentEnv(t, server.URL+"/v1", false)
 	// The ACP test config declares no agents.json, so the primary agent type
 	// has no model; bootstrap it through the adapter-facing method.
 	if err := a.SetDefaultModel("test/test-model"); err != nil {
@@ -2004,10 +2007,166 @@ func acpPermissionPendingRunner(t *testing.T) (string, *bytes.Buffer, *Runner) {
 	}
 
 	reqParams := waitForACPMethod(t, r, out, "agent/permission_request")
-	if id := acpParamString(t, reqParams, "id"); id == "" {
+	reqID := acpParamString(t, reqParams, "id")
+	if reqID == "" {
 		t.Fatalf("permission_request notification carries no id: %#v", reqParams)
 	}
-	return sessionID, out, r
+	projectID := acpParamString(t, reqParams, "projectId")
+	return sessionID, out, r, reqID, projectID, home
+}
+
+// permLockHolderEnv selects the child half of
+// TestACPPermissionSaveContentionShutdownJoined and names the permissions lock
+// path the child holds.
+const permLockHolderEnv = "LIGHTCODE_ACP_PERM_LOCK_HOLDER"
+
+// startPermLockHolder spawns a child of this test binary that acquires the
+// given permissions lock and holds it until the parent closes its stdin. It
+// returns the release func; the cleanup cancels and reaps the child.
+func startPermLockHolder(t *testing.T, lockPath string) func() {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestACPPermissionSaveContentionShutdownJoined$")
+	cmd.Env = append(os.Environ(), permLockHolderEnv+"="+lockPath)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		t.Fatalf("child stdin pipe: %v", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		t.Fatalf("child stdout pipe: %v", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("start child: %v", err)
+	}
+	ready := make(chan struct{})
+	scannerDone := make(chan struct{})
+	go func() {
+		defer close(scannerDone)
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if scanner.Text() == "ready" {
+				close(ready)
+				return
+			}
+		}
+	}()
+	reap := func() error {
+		_ = stdin.Close()
+		err := cmd.Wait()
+		<-scannerDone
+		return err
+	}
+	fail := func() string {
+		cancel()
+		_ = reap()
+		return stderr.String()
+	}
+	t.Cleanup(func() { cancel(); _ = reap() })
+	select {
+	case <-ready:
+	case <-ctx.Done():
+		t.Fatalf("child never held the permissions lock within %v: %v\n%s", 30*time.Second, ctx.Err(), fail())
+	}
+	return func() { _ = reap() }
+}
+
+// TestACPPermissionSaveContentionShutdownJoined proves a permission save
+// parked on a foreign permissions-lock holder cannot block owner shutdown and
+// cannot publish after it: the save returns a bounded retryable error, leaves
+// the request pending, writes no permissions.json, and shutdown joins cleanly.
+// It fails against the pre-fix blocking SaveLocal, which stays parked on the
+// foreign flock, writes permissions.json after the holder releases, and
+// resolves the request.
+func TestACPPermissionSaveContentionShutdownJoined(t *testing.T) {
+	if lockPath := os.Getenv(permLockHolderEnv); lockPath != "" {
+		// Child: hold the permissions lock until the parent closes stdin.
+		l, err := atomicfs.Acquire(lockPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		fmt.Println("ready")
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		if err := l.Release(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(3)
+		}
+		os.Exit(0)
+	}
+
+	sessionID, out, r, reqID, projectID, home := acpPermissionPendingRunner(t)
+	lockPath := filepath.Join(home, ".lightcode", "projects", projectID, ".locks", "permissions.lock")
+	releaseHolder := startPermLockHolder(t, lockPath)
+	permFile := filepath.Join(home, ".lightcode", "projects", projectID, "permissions.json")
+	assertNoPermFile := func() {
+		if _, err := os.Stat(permFile); !os.IsNotExist(err) {
+			t.Fatalf("permissions.json exists after the contended save: %v", err)
+		}
+	}
+
+	saveDone := make(chan struct{})
+	go func() {
+		r.dispatch(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "perm-save",
+			Method:  "permission/save",
+			Params:  json.RawMessage(fmt.Sprintf(`{"session_id":%q,"id":%q,"patterns":["write_file:*"]}`, sessionID, reqID)),
+		})
+		close(saveDone)
+	}()
+
+	select {
+	case <-saveDone:
+		// The save returned while the foreign lock is held: it must be a
+		// bounded retryable error, never a success.
+		r.drainForTest()
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+		var resp Response
+		found := false
+		for _, line := range lines {
+			if err := json.Unmarshal([]byte(line), &resp); err != nil {
+				continue
+			}
+			if id, ok := resp.ID.(string); ok && id == "perm-save" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("no perm-save response in output: %q", out.String())
+		}
+		if resp.Error == nil || !strings.Contains(resp.Error.Message, "retry") {
+			t.Fatalf("contended save response = %+v, want a retryable error", resp)
+		}
+		assertNoPermFile()
+		// The request is unresolved: a second save still sees the pending
+		// request and still contends instead of reporting an unknown id.
+		err := r.agent.SaveProjectPermissionForSession(sessionID, reqID, []string{"write_file:*"})
+		if err == nil || !strings.Contains(err.Error(), "retry") {
+			t.Fatalf("second save err = %v, want the same retryable contention (request must stay pending)", err)
+		}
+	case <-time.After(time.Second):
+		// Pre-fix: the blocking save is parked on the foreign flock. Shutdown
+		// must join cleanly; the aftermath assertions below fail pre-fix
+		// because the parked save writes permissions.json once released.
+	}
+
+	if !r.owner.ShutdownOwner() {
+		t.Fatal("shutdown reported abandoned in-flight work")
+	}
+	releaseHolder()
+	select {
+	case <-saveDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("save dispatch never returned after the holder released")
+	}
+	assertNoPermFile()
 }
 
 // TestACPStalledOutputPreservesBoundaryOrder proves that with the output drainer

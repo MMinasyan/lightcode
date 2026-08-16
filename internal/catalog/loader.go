@@ -45,8 +45,21 @@ func NewLoaderWithConfigPath(home string, bundled fs.FS, configPath string) *Loa
 	return loader
 }
 
-// Load reads the bundled catalog, user config, and discovery cache, then calls Build.
+// Load reads the bundled catalog, user config, and discovery cache, then calls
+// Build. It is the blocking entry used by pre-owner startup, where discovery
+// publication may block on the per-provider discovery lock.
 func (l *Loader) Load() (*Catalog, []Warning, error) {
+	return l.load(false)
+}
+
+// LoadTry is Load with every discovery publication routed through the
+// one-attempt Try writers, so a foreign discovery-lock holder yields the
+// existing discovery_failure warning instead of hanging the owner shutdown.
+func (l *Loader) LoadTry() (*Catalog, []Warning, error) {
+	return l.load(true)
+}
+
+func (l *Loader) load(try bool) (*Catalog, []Warning, error) {
 	home, err := l.resolvedHome()
 	if err != nil {
 		return nil, nil, err
@@ -62,7 +75,7 @@ func (l *Loader) Load() (*Catalog, []Warning, error) {
 	result := Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Cache: cache})
 	candidates := DiscoveryRefreshCandidates(result.Catalog, attempts, time.Now().UTC())
 	candidates = l.filterRefreshCandidates(candidates, result.Catalog)
-	discoveryWarnings, discoveryChanged, _ := refreshDiscoveryCandidatesFor(home, l.configPath, candidates, result.Catalog)
+	discoveryWarnings, discoveryChanged, _ := refreshDiscoveryCandidatesFor(home, l.configPath, candidates, result.Catalog, try)
 	warnings = append(warnings, discoveryWarnings...)
 	if discoveryChanged {
 		cache, _, cacheWarnings = ReadDiscoveryCache(home)
@@ -86,7 +99,7 @@ func (l *Loader) filterRefreshCandidates(candidateIDs []string, cat *Catalog) []
 	return filtered
 }
 
-func refreshDiscoveryCandidatesFor(home, configPath string, candidateIDs []string, cat *Catalog) ([]Warning, bool, []string) {
+func refreshDiscoveryCandidatesFor(home, configPath string, candidateIDs []string, cat *Catalog, try bool) ([]Warning, bool, []string) {
 	var warnings []Warning
 	var refreshed []string
 	changed := false
@@ -94,7 +107,13 @@ func refreshDiscoveryCandidatesFor(home, configPath string, candidateIDs []strin
 		return warnings, changed, refreshed
 	}
 	for _, providerID := range candidateIDs {
-		refreshedProvider, providerWarnings := RefreshProviderDiscoveryWithConfigPath(context.Background(), home, configPath, cat, providerID)
+		var refreshedProvider bool
+		var providerWarnings []Warning
+		if try {
+			refreshedProvider, providerWarnings = RefreshProviderDiscoveryTryWithConfigPath(context.Background(), home, configPath, cat, providerID)
+		} else {
+			refreshedProvider, providerWarnings = RefreshProviderDiscoveryWithConfigPath(context.Background(), home, configPath, cat, providerID)
+		}
 		if len(providerWarnings) != 0 {
 			warnings = append(warnings, providerWarnings...)
 			continue

@@ -1,11 +1,18 @@
 package config
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
@@ -582,6 +589,276 @@ func TestReadDotEnvKeysQuotedEmptyValues(t *testing.T) {
 	}
 	if !keys["QUOTED_VALUE"] {
 		t.Fatal("QUOTED_VALUE: a quoted non-empty value must resolve")
+	}
+}
+
+// TestManagedEnvTrySetRows covers the one-attempt TrySet contract: success
+// writes the file, process env, and managed set; contention returns an
+// operation error and mutates nothing; the external-key refusal is preserved.
+func TestManagedEnvTrySetRows(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".env")
+		if err := os.WriteFile(path, []byte("# keep\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		key := envKeyForTest(t, "TRYSET_OK")
+		m := NewManagedEnvForTest(path)
+		if err := m.TrySet(key, "hello"); err != nil {
+			t.Fatalf("TrySet: %v", err)
+		}
+		if got := os.Getenv(key); got != "hello" {
+			t.Fatalf("env %s = %q, want hello", key, got)
+		}
+		if !m.IsManaged(key) {
+			t.Fatal("key not managed after TrySet")
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), key+"=hello") || !strings.Contains(string(data), "# keep") {
+			t.Fatalf("file = %q, want the key line and the preserved comment", data)
+		}
+	})
+	t.Run("contention_mutates_nothing", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".env")
+		if err := os.WriteFile(path, []byte("KEEP=me\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		key := envKeyForTest(t, "TRYSET_CONTEND")
+		_ = os.Unsetenv(key)
+		m := NewManagedEnvForTest(path)
+		holder, ok, err := atomicfs.TryAcquire(envLockPath(path))
+		if err != nil || !ok {
+			t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
+		}
+		defer holder.Release()
+		if err := m.TrySet(key, "secret"); err == nil || !strings.Contains(err.Error(), "retry") {
+			t.Fatalf("TrySet under contention = %v, want a retryable error", err)
+		}
+		if _, set := os.LookupEnv(key); set {
+			t.Fatalf("process env %s was set under contention", key)
+		}
+		if m.IsManaged(key) {
+			t.Fatal("key was added to the managed set under contention")
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), key) {
+			t.Fatalf("file mutated under contention: %q", data)
+		}
+	})
+	t.Run("external_key_refused", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".env")
+		if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		key := envKeyForTest(t, "TRYSET_EXTERNAL")
+		t.Setenv(key, "external")
+		m := NewManagedEnvForTest(path)
+		err := m.TrySet(key, "overwrite")
+		if !errors.Is(err, ErrExternalKey) {
+			t.Fatalf("TrySet err = %v, want ErrExternalKey", err)
+		}
+		if got := os.Getenv(key); got != "external" {
+			t.Fatalf("env %s = %q, want the external value untouched", key, got)
+		}
+	})
+}
+
+// TestManagedEnvTryRemoveRows covers the one-attempt TryRemove contract:
+// success removes the line and unsets the key; contention returns an operation
+// error and mutates nothing; an unmanaged key is a no-op.
+func TestManagedEnvTryRemoveRows(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".env")
+		key := envKeyForTest(t, "TRYRM_OK")
+		seed := "# header\n" + key + "=val\nKEEP=me\n"
+		if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(key, "val")
+		m := NewManagedEnvForTest(path)
+		m.managed[key] = struct{}{}
+		if err := m.TryRemove(key); err != nil {
+			t.Fatalf("TryRemove: %v", err)
+		}
+		if _, ok := os.LookupEnv(key); ok {
+			t.Fatalf("env %s still set after TryRemove", key)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(data)
+		if strings.Contains(body, key+"=") {
+			t.Fatalf("key line still in file: %q", body)
+		}
+		if !strings.Contains(body, "KEEP=me") {
+			t.Fatalf("unrelated line lost: %q", body)
+		}
+	})
+	t.Run("contention_mutates_nothing", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".env")
+		key := envKeyForTest(t, "TRYRM_CONTEND")
+		seed := "# header\n" + key + "=val\nKEEP=me\n"
+		if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(key, "val")
+		m := NewManagedEnvForTest(path)
+		m.managed[key] = struct{}{}
+		holder, ok, err := atomicfs.TryAcquire(envLockPath(path))
+		if err != nil || !ok {
+			t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
+		}
+		defer holder.Release()
+		if err := m.TryRemove(key); err == nil || !strings.Contains(err.Error(), "retry") {
+			t.Fatalf("TryRemove under contention = %v, want a retryable error", err)
+		}
+		if got := os.Getenv(key); got != "val" {
+			t.Fatalf("env %s = %q, want val untouched", key, got)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), key+"=val") {
+			t.Fatalf("file mutated under contention: %q", data)
+		}
+	})
+	t.Run("unmanaged_noop", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".env")
+		key := envKeyForTest(t, "TRYRM_NOOP")
+		if err := os.WriteFile(path, []byte("KEEP=me\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(key, "external")
+		m := NewManagedEnvForTest(path)
+		if err := m.TryRemove(key); err != nil {
+			t.Fatalf("TryRemove unmanaged: %v", err)
+		}
+		if got := os.Getenv(key); got != "external" {
+			t.Fatalf("external env %s was touched: %q", key, got)
+		}
+	})
+}
+
+// envBlockHolderEnv selects the child half of
+// TestManagedEnvSetBlocksUntilForeignLockReleases and names the env lock path
+// the child holds.
+const envBlockHolderEnv = "LIGHTCODE_CONFIG_ENV_BLOCK_HOLDER"
+
+// TestManagedEnvSetBlocksUntilForeignLockReleases proves the blocking Set
+// wrapper stays blocking for startup/non-owner callers: with a foreign process
+// holding the env leaf lock, Set stays parked and completes once the holder
+// releases. It is the positive control beside the one-attempt TrySet. The
+// holder is a self-exec child of this test binary, so the contention is a real
+// cross-process flock, not a same-process open.
+func TestManagedEnvSetBlocksUntilForeignLockReleases(t *testing.T) {
+	if lockPath := os.Getenv(envBlockHolderEnv); lockPath != "" {
+		l, err := atomicfs.Acquire(lockPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		fmt.Println("ready")
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		if err := l.Release(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(3)
+		}
+		os.Exit(0)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	key := envKeyForTest(t, "BLOCK_SET")
+	_ = os.Unsetenv(key)
+	lockPath := envLockPath(path)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestManagedEnvSetBlocksUntilForeignLockReleases$")
+	cmd.Env = append(os.Environ(), envBlockHolderEnv+"="+lockPath)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		t.Fatalf("child stdin pipe: %v", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		t.Fatalf("child stdout pipe: %v", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("start child: %v", err)
+	}
+	ready := make(chan struct{})
+	scannerDone := make(chan struct{})
+	go func() {
+		defer close(scannerDone)
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if scanner.Text() == "ready" {
+				close(ready)
+				return
+			}
+		}
+	}()
+	reap := func() error {
+		_ = stdin.Close()
+		err := cmd.Wait()
+		<-scannerDone
+		return err
+	}
+	fail := func() string {
+		cancel()
+		_ = reap()
+		return stderr.String()
+	}
+	t.Cleanup(func() { cancel(); _ = reap() })
+	select {
+	case <-ready:
+	case <-ctx.Done():
+		t.Fatalf("child never held the env lock within %v: %v\n%s", 30*time.Second, ctx.Err(), fail())
+	}
+
+	m := NewManagedEnvForTest(path)
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		done <- m.Set(key, "hello")
+	}()
+	<-started
+	select {
+	case err := <-done:
+		t.Fatalf("Set returned %v while the foreign process held the env lock; the blocking wrapper must stay blocked", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := reap(); err != nil {
+		t.Fatalf("child after release: %v\n%s", err, stderr.String())
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Set after the holder released: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Set did not complete after the holder released the env lock")
+	}
+	if got := os.Getenv(key); got != "hello" {
+		t.Fatalf("env %s = %q, want hello", key, got)
 	}
 }
 
