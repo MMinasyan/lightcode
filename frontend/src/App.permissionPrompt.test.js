@@ -24,7 +24,7 @@ const listeners = new Map();
 const backend = {
   SessionCurrent: async () => ({ id: 's1' }),
   HydrateSession: async () => ({ session: { id: 's1' } }),
-  CurrentModel: async () => ({ ref: 'prov/model', provider: 'prov', model: 'model', displayName: 'Model' }),
+  CurrentModel: async () => ({ model: { ref: 'prov/model', provider: 'prov', model: 'model', displayName: 'Model' }, superseded: false }),
   ProjectName: async () => '',
   CompactNow: async () => ({}),
   RespondPermission: async () => ({}),
@@ -268,6 +268,83 @@ describe('App boot barrier over unseeded state', () => {
     await tick();
     expect(target.querySelector('.activity')).toBeNull();
     expect(target.querySelector('.prompt')).toBeNull();
+
+    unmount(app);
+  });
+
+  it('after a failed hydration the snapshot-gated listeners stay inert and a boundary recovers', async () => {
+    backend.HydrateSession = async () => { throw new Error('session unavailable'); };
+    const { app, target } = await mountApp();
+
+    expect(target.querySelector('.error-msg')?.textContent).toContain('Load session failed');
+    expect(target.querySelector('.label.session').textContent).toBe('new session');
+
+    // Warnings, usage, queue, compaction_start, and unsequenced error must all
+    // stay inert over the unseeded view. Usage is observed non-vacuously: the
+    // frame carries a non-zero context window that would create the context ring
+    // and repaint the token counts if it were applied, so their absence proves
+    // it was gated.
+    fire('warnings', [{ kind: 'rules_too_large', message: 'rules too large' }]);
+    fire('usage', { total: { cache: 100, input: 200, output: 300, known: true }, perModel: [], contextUsed: 50, contextWindow: 100 });
+    fire('queue_changed', { version: 1, items: [{ id: 'q1', content: 'queued' }] });
+    fire('compaction_start', null);
+    await tick();
+
+    expect(target.querySelector('.warn-icon')).toBeNull();
+    // Usage inert: the non-zero context window produced no context ring...
+    expect(target.querySelector('.context-ring')).toBeNull();
+    // ...and the token counts stayed at their empty default.
+    expect(target.querySelector('.tokens')?.textContent).toBe('⚡ 0 ↑ 0 ↓ 0');
+    expect(target.querySelector('.queued-msg')).toBeNull();
+    // compaction_start inert: no 'Compacting' activity over the unseeded view.
+    expect(target.querySelector('.activity')).toBeNull();
+    expect(target.querySelector('.system-msg')).toBeNull();
+    expect(target.querySelector('.message.user')).toBeNull();
+    expect(target.querySelector('.message.assistant')).toBeNull();
+
+    // compaction_end, the unsequenced error, and a notice-only turn_action
+    // arrive after a separate tick so start/end do not cancel within one tick;
+    // each stays inert too.
+    fire('compaction_end', null);
+    fire('error', { message: 'unsequenced boom' });
+    fire('turn_action', { skippedFiles: [{ path: 'x.txt', reason: 'outside session' }], warning: 'notice only boom' });
+    await tick();
+    expect(target.querySelector('.activity')).toBeNull();
+    expect(target.querySelector('.system-msg')).toBeNull();
+    // Only the hydration's own load-failure error renders; the fired unsequenced
+    // error and the notice-only turn_action warning must not add another.
+    const errs = [...target.querySelectorAll('.error-msg')];
+    expect(errs).toHaveLength(1);
+    expect(errs[0].textContent).toContain('Load session failed');
+
+    // A stateful navigation boundary seeds the view and recovers it; normal
+    // subsequent events apply again.
+    fire('navigation', navState());
+    await tick();
+    expect(target.querySelector('.label.session').textContent).toBe('s1');
+    expect(target.querySelector('.message.user .plain').textContent).toBe('hello');
+
+    fire('warnings', [{ kind: 'rules_too_large', message: 'rules too large' }]);
+    // Usage resumes: a non-zero context window now creates the context ring and
+    // repaints the token counts.
+    fire('usage', { total: { cache: 100, input: 200, output: 300, known: true }, perModel: [], contextUsed: 50, contextWindow: 100 });
+    fire('queue_changed', { version: 1, items: [{ id: 'q1', content: 'queued' }] });
+    fire('error', { message: 'admitted after recovery' });
+    await tick();
+    expect(target.querySelector('.warn-icon')).toBeTruthy();
+    expect(target.querySelector('.context-ring')).toBeTruthy();
+    expect(target.querySelector('.tokens')?.textContent).toBe('⚡ 100 ↑ 200 ↓ 300');
+    expect(target.querySelector('.queued-msg')?.textContent).toBe('queued');
+    expect(target.querySelector('.error-msg')?.textContent).toContain('admitted after recovery');
+
+    // Compaction resumes as an independent indicator: start raises 'Compacting'
+    // and end clears it, each after its own tick.
+    fire('compaction_start', null);
+    await tick();
+    expect(target.querySelector('.activity')?.textContent).toContain('Compacting');
+    fire('compaction_end', null);
+    await tick();
+    expect(target.querySelector('.activity')).toBeNull();
 
     unmount(app);
   });

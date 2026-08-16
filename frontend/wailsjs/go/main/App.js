@@ -34,8 +34,8 @@ export function ConnectProvider(arg1, arg2) {
   return window['go']['main']['App']['ConnectProvider'](arg1, arg2);
 }
 
-export function CurrentModel() {
-  return window['go']['main']['App']['CurrentModel']();
+export function CurrentModel(arg1) {
+  return window['go']['main']['App']['CurrentModel'](arg1);
 }
 
 export function CurrentWarnings() {

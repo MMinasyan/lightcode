@@ -1151,19 +1151,38 @@ func (a *App) ModelList() ([]agent.ModelListEntry, error) {
 	return a.svc.ModelList(), nil
 }
 
-// CurrentModel returns the active provider and model.
-func (a *App) CurrentModel() agent.ModelInfo {
+// CurrentModelResult carries the resolved model and whether the caller's
+// expected session no longer matches the routed presentation. Routing can
+// advance to B and enqueue its boundary while the frontend still presents A; a
+// settings refresh that resolves in that window must not write B's model into A,
+// so the adapter marks the result superseded instead of reading the owner.
+type CurrentModelResult struct {
+	Model      agent.ModelInfo `json:"model"`
+	Superseded bool            `json:"superseded"`
+}
+
+// CurrentModel returns the active provider and model for the frontend's
+// expected session. An empty expectation preserves mount-time routing behavior.
+// A nonempty expectation that differs from the bounded routing returns
+// Superseded without an owner lookup, so a settings refresh captured on a
+// session routing has already left cannot apply the new route's model. Matched
+// routing reads the matched session's model and propagates routing and owner
+// errors unchanged.
+func (a *App) CurrentModel(expectedSessionID string) (CurrentModelResult, error) {
 	a.navMu.Lock()
 	defer a.navMu.Unlock()
 	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
-		return agent.ModelInfo{}
+		return CurrentModelResult{}, err
+	}
+	if expectedSessionID != "" && expectedSessionID != sessionID {
+		return CurrentModelResult{Superseded: true}, nil
 	}
 	model, err := a.svc.CurrentModelForSession(sessionID)
 	if err != nil {
-		return agent.ModelInfo{}
+		return CurrentModelResult{}, err
 	}
-	return model
+	return CurrentModelResult{Model: model}, nil
 }
 
 // AllModelList returns every catalog model including hidden ones.

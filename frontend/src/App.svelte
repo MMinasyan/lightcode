@@ -361,8 +361,8 @@
     // Register every listener before the first hydration read, each buffered so the
     // snapshot applies first and every frame delivered during the read replays after
     // it in delivery order.
-    EventsOn('warnings', buffered((data) => { if (data) warnings = data; }));
-    EventsOn('usage', buffered((data) => { if (data) tokens = data; }));
+    EventsOn('warnings', buffered((data) => { if (!snapshotApplied) return; if (data) warnings = data; }));
+    EventsOn('usage', buffered((data) => { if (!snapshotApplied) return; if (data) tokens = data; }));
 
     // A resync boundary carries a compacted session's transcript and tokens;
     // applying it refreshes the view without touching activity or queue that
@@ -383,6 +383,10 @@
     // seeds the view.
     EventsOn('turn_action', buffered((data) => {
       applySnapshot(data?.state);
+      // A notice-only frame over a view no state has seeded must not apply its
+      // notices either: without a seed the notices describe a session the view
+      // never shows. A stateful frame may seed the view and then apply them.
+      if (!data?.state && !snapshotApplied) return;
       appendRevertSkipNotice({ skippedFiles: data?.skippedFiles });
       if (data?.warning) showError(data.warning);
     }, (data) => !!data?.state));
@@ -405,6 +409,7 @@
     EventsOn('system_signal', buffered(applySystemSignal));
 
     EventsOn('queue_changed', buffered((data) => {
+      if (!snapshotApplied) return;
       if (!data) return;
       const version = data.version || 0;
       if (version <= lastQueueVersion) return; // drop stale/reordered snapshots
@@ -447,9 +452,13 @@
     }));
 
     EventsOn('error', buffered((data) => {
+      if (!snapshotApplied) return;
       if (!admitSequenced(gate, data?.seq)) return;
       showError(data?.message || data);
-      busy = false;
+      // A lifecycle error carries no sequence and must never clear an unrelated
+      // busy turn; only a sequenced turn error (or the ordered turn_end frame)
+      // clears busy.
+      if (data?.seq) busy = false;
     }));
 
     EventsOn('status', buffered((data) => { status = data.state; }));
@@ -466,8 +475,8 @@
       if (data?.id) permissions = removePermission(permissions, data.id);
     }));
 
-    EventsOn('compaction_start', buffered(() => { compacting = true; }));
-    EventsOn('compaction_end', buffered(() => { compacting = false; }));
+    EventsOn('compaction_start', buffered(() => { if (!snapshotApplied) return; compacting = true; }));
+    EventsOn('compaction_end', buffered(() => { if (!snapshotApplied) return; compacting = false; }));
 
     // A subagent frame is gated per child by the child's transcript high-water
     // in viewer.js: a frame already represented in the child's snapshot is
@@ -505,11 +514,12 @@
       );
     }));
 
-    // Non-transcript scalars not carried by the snapshot: fetched directly.
+    // Non-transcript scalars not carried by the snapshot: fetched directly. The
+    // empty expected session preserves mount-time routing behavior.
     try {
-      const r = await CurrentModel();
-      modelRef = r.ref || ((r.provider && r.model) ? `${r.provider}/${r.model}` : '');
-      modelName = r.displayName || modelRef;
+      const r = await CurrentModel('');
+      modelRef = r.model?.ref || ((r.model?.provider && r.model?.model) ? `${r.model.provider}/${r.model.model}` : '');
+      modelName = r.model?.displayName || modelRef;
     } catch (e) { showError(e, 'Load model failed'); }
     try { projectName = await ProjectName(); } catch (e) { showError(e, 'Load project failed'); }
 
@@ -582,11 +592,28 @@
     showModelSelector = false;
   }
   async function refreshCurrentModel() {
+    // The settings-close reload must not overwrite a newer presentation: capture
+    // the session, generation, and both model fields, expect the captured session
+    // from the backend, and mutate only while all four still match. This blocks
+    // backend-route-before-boundary, A→B, a detach, a re-selected A (A→B→A), and
+    // a newer same-session model frame delivered before this promise resolves.
+    const opSession = sessionId;
+    const opGen = presentationGeneration;
+    const opRef = modelRef;
+    const opName = modelName;
     try {
-      const r = await CurrentModel();
-      modelRef = r.ref || ((r.provider && r.model) ? `${r.provider}/${r.model}` : '');
-      modelName = r.displayName || modelRef;
-    } catch (e) { showError(e, 'Load model failed'); }
+      const r = await CurrentModel(opSession);
+      // The backend marked the result superseded when the routed session no
+      // longer matches the expected one; ignore it entirely.
+      if (r?.superseded) return;
+      if (sessionId !== opSession || presentationGeneration !== opGen || modelRef !== opRef || modelName !== opName) return;
+      const m = r?.model || {};
+      modelRef = m.ref || ((m.provider && m.model) ? `${m.provider}/${m.model}` : '');
+      modelName = m.displayName || modelRef;
+    } catch (e) {
+      if (sessionId !== opSession || presentationGeneration !== opGen || modelRef !== opRef || modelName !== opName) return;
+      showError(e, 'Load model failed');
+    }
   }
 
   async function handleRevertCode(e) {

@@ -650,6 +650,128 @@ func TestHydrateSurfacesCurrentSessionLookupFailure(t *testing.T) {
 	}
 }
 
+// TestFrontendPresentationOwnershipGates proves the Wails presentation owns
+// each stale writer: the settings-refresh model path captures the session,
+// generation, and both model fields, and the snapshot-gated listeners
+// (warnings, usage, queue_changed, compaction start/end, error, turn_action)
+// refuse to mutate an unseeded view. The busy clear is reserved for sequenced
+// turn errors, and the turn_action handler applies a stateful frame first but
+// skips notices over an unseeded view.
+func TestFrontendPresentationOwnershipGates(t *testing.T) {
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+
+	// refreshCurrentModel must capture all four ownership terms and compare all
+	// four — session, generation, model ref, and model name — in both the
+	// resolution branch and the rejection branch. Each comparison term therefore
+	// appears once per branch (twice total); capture declarations alone cannot
+	// gate the continuation.
+	refresh, ok := extractSvelteFunctionBody(svelte, "async function refreshCurrentModel(")
+	if !ok {
+		t.Fatal("refreshCurrentModel not found in App.svelte")
+	}
+	for _, want := range []string{
+		"const opSession = sessionId",
+		"const opGen = presentationGeneration",
+		"const opRef = modelRef",
+		"const opName = modelName",
+	} {
+		if !strings.Contains(refresh, want) {
+			t.Fatalf("refreshCurrentModel must capture %q for the settings-refresh ownership guard", want)
+		}
+	}
+	for _, term := range []string{
+		"sessionId !== opSession",
+		"presentationGeneration !== opGen",
+		"modelRef !== opRef",
+		"modelName !== opName",
+	} {
+		if n := strings.Count(refresh, term); n < 2 {
+			t.Fatalf("refreshCurrentModel must compare %q in both the resolution and rejection branches (found %d occurrences)", term, n)
+		}
+	}
+	// The refresh expects the captured session from the backend, ignores a
+	// superseded result, and applies the returned model (not a bare model).
+	if !strings.Contains(refresh, "CurrentModel(opSession)") {
+		t.Fatal("refreshCurrentModel must expect the captured session from CurrentModel")
+	}
+	if !strings.Contains(refresh, "superseded") {
+		t.Fatal("refreshCurrentModel must ignore a superseded CurrentModel result")
+	}
+	if !strings.Contains(refresh, "r?.model") {
+		t.Fatal("refreshCurrentModel must apply the resolved CurrentModelResult.model")
+	}
+	// Mount-time loading expects no session: CurrentModel('') keeps startup
+	// routing behavior before hydration.
+	if !strings.Contains(svelte, "CurrentModel('')") {
+		t.Fatal("mount-time model loading must call CurrentModel('') to preserve pre-hydration routing")
+	}
+
+	// Every snapshot-gated listener must refuse to mutate an unseeded view.
+	for _, ev := range []string{"warnings", "usage", "queue_changed", "compaction_start", "compaction_end", "error", "turn_action"} {
+		body, ok := extractSvelteFunctionBody(svelte, "EventsOn('"+ev+"'")
+		if !ok {
+			t.Fatalf("listener '%s' not found in App.svelte", ev)
+		}
+		if !strings.Contains(body, "snapshotApplied") {
+			t.Fatalf("listener '%s' must gate its mutations on snapshotApplied", ev)
+		}
+	}
+
+	// queue_changed keeps its version guard after the snapshot gate.
+	queue, ok := extractSvelteFunctionBody(svelte, "EventsOn('queue_changed'")
+	if !ok {
+		t.Fatal("queue_changed listener not found")
+	}
+	if !strings.Contains(queue, "lastQueueVersion") || !strings.Contains(queue, "version <= lastQueueVersion") {
+		t.Fatal("queue_changed must keep the queue version guard after the snapshot gate")
+	}
+
+	// The error listener renders admitted sequenced and unsequenced errors but
+	// clears busy only when the frame carries a sequence.
+	errBody, ok := extractSvelteFunctionBody(svelte, "EventsOn('error'")
+	if !ok {
+		t.Fatal("error listener not found in App.svelte")
+	}
+	if !strings.Contains(errBody, "data?.seq") || !strings.Contains(errBody, "busy = false") {
+		t.Fatal("error listener must clear busy only when the frame carries a sequence")
+	}
+	if strings.Index(errBody, "busy = false") < strings.Index(errBody, "data?.seq") {
+		t.Fatal("error listener must not clear busy unconditionally; the sequence must gate it")
+	}
+
+	// The turn_action listener applies a stateful frame first, then skips
+	// notices when the view is still unseeded.
+	turnAction, ok := extractSvelteFunctionBody(svelte, "EventsOn('turn_action'")
+	if !ok {
+		t.Fatal("turn_action listener not found in App.svelte")
+	}
+	snapIdx := strings.Index(turnAction, "applySnapshot(")
+	guardIdx := strings.Index(turnAction, "!data?.state && !snapshotApplied")
+	noticeIdx := strings.Index(turnAction, "appendRevertSkipNotice(")
+	if snapIdx < 0 || guardIdx < 0 || noticeIdx < 0 {
+		t.Fatal("turn_action listener must apply the snapshot first and return over an unseeded view before notices")
+	}
+	if snapIdx > guardIdx || guardIdx > noticeIdx {
+		t.Fatal("turn_action listener must apply the snapshot, then the unseeded guard, then the notices")
+	}
+
+	// The existing ordered-model ownership and resync session checks are intact.
+	model, ok := extractSvelteFunctionBody(svelte, "EventsOn('model'")
+	if !ok {
+		t.Fatal("model listener not found in App.svelte")
+	}
+	if !strings.Contains(model, "data.rootId !== sessionId") {
+		t.Fatal("model listener must keep the root-ownership check")
+	}
+	resync, ok := extractSvelteFunctionBody(svelte, "function applyResync(")
+	if !ok {
+		t.Fatal("applyResync not found in App.svelte")
+	}
+	if !strings.Contains(resync, "!== sessionId") {
+		t.Fatal("applyResync must keep the session check")
+	}
+}
+
 // svelteCodeWithoutCommentLines returns source with // comment lines removed,
 // so a symbol-count assertion counts call sites rather than prose that happens
 // to name the function.

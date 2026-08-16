@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -68,6 +69,166 @@ func TestWailsStaleCurrent(t *testing.T) {
 	if _, err := app.Submit("hello"); err == nil {
 		t.Fatal("stale submit succeeded")
 	}
+}
+
+// TestWailsCurrentModelPropagatesOwnerAndRoutingErrors proves App.CurrentModel
+// returns the real owner and routing errors instead of suppressing them into a
+// zero model: a deleted/missing owner session and a closed routing (navMu won
+// by close) must surface as errors so the settings refresh can gate on them.
+func TestWailsCurrentModelPropagatesOwnerAndRoutingErrors(t *testing.T) {
+	// Missing/deleted owner session: routing current points at a session the
+	// owner no longer serves, so the owner error must propagate.
+	svc := newAppTestAgent(t)
+	if _, err := svc.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	id := svc.SessionCurrent().ID
+	if id == "" {
+		t.Fatal("missing session id")
+	}
+	app := newTestApp(svc)
+	app.setCurrentSessionID(id)
+	if err := svc.SessionDelete(id); err != nil {
+		t.Fatalf("SessionDelete: %v", err)
+	}
+	if _, err := app.CurrentModel(""); err == nil {
+		t.Fatal("CurrentModel for a deleted owner session returned no error; want the owner error propagated")
+	}
+
+	// Closed routing: close won navMu, so boundedSessionIDLocked rejects.
+	app2 := newTestApp(svc)
+	app2.navClosed = true
+	if _, err := app2.CurrentModel(""); !errors.Is(err, errAdapterClosed) {
+		t.Fatalf("CurrentModel with closed routing = %v, want errAdapterClosed", err)
+	}
+}
+
+// currentModelSpy is a deterministic AdapterService spy recording every
+// CurrentModelForSession call, so a superseded CurrentModel can be proven to
+// skip the owner read and a matched read can be counted exactly.
+type currentModelSpy struct {
+	agent.AdapterService
+	byID   map[string]agent.ModelInfo
+	errs   map[string]error
+	called []string
+}
+
+func (s *currentModelSpy) CurrentModelForSession(id string) (agent.ModelInfo, error) {
+	s.called = append(s.called, id)
+	if err := s.errs[id]; err != nil {
+		return agent.ModelInfo{}, err
+	}
+	return s.byID[id], nil
+}
+
+// TestWailsCurrentModelSupersededRouteMismatch proves App.CurrentModel marks a
+// nonempty expected session that no longer matches routing as superseded without
+// performing an owner model read. It drives the real no-drainer production
+// seams: presentation is seeded to A, routing commits to B, and B's navigation
+// boundary is enqueued without a drainer, so it stays queued and presentation
+// stays A. A settings refresh captured on A must not apply B's model to A, while
+// a matched expectation reads B's model exactly once. Matched owner errors and
+// empty expectations keep their mount-time siblings.
+func TestWailsCurrentModelSupersededRouteMismatch(t *testing.T) {
+	t.Run("no_drainer_route_presentation", func(t *testing.T) {
+		spy := &currentModelSpy{
+			byID: map[string]agent.ModelInfo{
+				"A": {Ref: "prov/a", Provider: "prov", Model: "a", DisplayName: "Model A"},
+				"B": {Ref: "prov/b", Provider: "prov", Model: "b", DisplayName: "Model B"},
+			},
+		}
+		app := &App{svc: spy}
+
+		// Seed backend presentation as A.
+		app.seedPresented("A")
+		// Commit routing to B.
+		app.setCurrentSessionID("B")
+		// Enqueue B's navigation/frameAdvance boundary without starting a drainer.
+		app.enqueueBoundary("navigation", map[string]any{"session": map[string]any{"id": "B"}}, "", "B")
+
+		// The boundary remains queued and presentation remains A: no drainer ran.
+		app.deliveryMu.Lock()
+		queuedCount := len(app.deliveryFrames)
+		var queuedKind frameKind
+		var queuedSession string
+		presented := app.presented
+		if queuedCount == 1 {
+			queuedKind = app.deliveryFrames[0].kind
+			queuedSession = app.deliveryFrames[0].sessionID
+		}
+		app.deliveryMu.Unlock()
+		if queuedCount != 1 {
+			t.Fatalf("queued boundary count = %d, want 1 (no drainer started)", queuedCount)
+		}
+		if queuedKind != frameAdvance || queuedSession != "B" {
+			t.Fatalf("queued boundary kind/session = %v/%q, want frameAdvance/B", queuedKind, queuedSession)
+		}
+		if presented != "A" {
+			t.Fatalf("presentation advanced to %q while the boundary stayed queued, want A", presented)
+		}
+
+		// Expected A while routing is B: superseded, with no owner model read.
+		res, err := app.CurrentModel("A")
+		if err != nil {
+			t.Fatalf("CurrentModel(expected A) while routing B = %v, want nil superseded", err)
+		}
+		if !res.Superseded {
+			t.Fatal("CurrentModel(expected A) while routing B must report Superseded")
+		}
+		if len(spy.called) != 0 {
+			t.Fatalf("superseded CurrentModel must not call CurrentModelForSession; got %v", spy.called)
+		}
+
+		// Matched expected B reads B's model exactly once.
+		matched, err := app.CurrentModel("B")
+		if err != nil {
+			t.Fatalf("CurrentModel(expected B) = %v, want B's model", err)
+		}
+		if matched.Superseded {
+			t.Fatal("matched expected B must not be superseded")
+		}
+		if matched.Model.Ref != "prov/b" {
+			t.Fatalf("matched expected B model = %q, want prov/b", matched.Model.Ref)
+		}
+		if len(spy.called) != 1 || spy.called[0] != "B" {
+			t.Fatalf("matched expected B owner reads = %v, want exactly ['B']", spy.called)
+		}
+	})
+
+	t.Run("matched_owner_error", func(t *testing.T) {
+		spy := &currentModelSpy{errs: map[string]error{"B": errors.New("owner unavailable")}}
+		app := &App{svc: spy}
+		app.setCurrentSessionID("B")
+		if _, err := app.CurrentModel("B"); err == nil {
+			t.Fatal("matched owner error must propagate")
+		}
+		if len(spy.called) != 1 || spy.called[0] != "B" {
+			t.Fatalf("matched owner-error owner reads = %v, want exactly ['B']", spy.called)
+		}
+	})
+
+	t.Run("empty_expectation", func(t *testing.T) {
+		spy := &currentModelSpy{
+			byID: map[string]agent.ModelInfo{
+				"B": {Ref: "prov/b", Provider: "prov", Model: "b", DisplayName: "Model B"},
+			},
+		}
+		app := &App{svc: spy}
+		app.setCurrentSessionID("B")
+		res, err := app.CurrentModel("")
+		if err != nil {
+			t.Fatalf("CurrentModel(\"\") = %v, want B's model", err)
+		}
+		if res.Superseded {
+			t.Fatal("empty expectation must not be superseded; it preserves mount-time routing")
+		}
+		if res.Model.Ref != "prov/b" {
+			t.Fatalf("empty expectation model = %q, want prov/b", res.Model.Ref)
+		}
+		if len(spy.called) != 1 || spy.called[0] != "B" {
+			t.Fatalf("empty expectation owner reads = %v, want exactly ['B']", spy.called)
+		}
+	})
 }
 
 func TestWailsNewSetsCurrent(t *testing.T) {

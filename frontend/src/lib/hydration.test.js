@@ -38,6 +38,7 @@ function errorHandlerSandbox(state) {
   const sandbox = {
     messages: snapshotMessages(state),
     busy: true,
+    snapshotApplied: true,
     gate: newTranscriptGate(state),
     admitSequenced,
   };
@@ -158,6 +159,47 @@ describe('transcript high-water gating', () => {
     });
     runInNewContext(`(${errorHandlerSource()})({ seq: 0, message: 'boom' });`, sandbox);
     expect(sandbox.messages.filter((m) => m.type === 'error')).toHaveLength(0);
+  });
+
+  // A live lifecycle error carries no sequence: it must render, but it must not
+  // clear an unrelated busy turn — the busy flag is cleared only by a sequenced
+  // turn error (or the ordered turn_end frame).
+  it('renders an unsequenced error but never clears an unrelated busy', () => {
+    const sandbox = errorHandlerSandbox({
+      messages: [{ type: 'user', content: 'q1' }],
+      cursor: { committedSeq: 4 },
+    });
+    sandbox.busy = true;
+    runInNewContext(`(${errorHandlerSource()})({ message: 'lifecycle boom' });`, sandbox);
+    expect(sandbox.messages.filter((m) => m.type === 'error')).toHaveLength(1);
+    expect(sandbox.busy).toBe(true);
+  });
+
+  // An admitted sequenced turn error is new above the high-water: it renders and
+  // clears the matching busy turn.
+  it('renders an admitted sequenced turn error and clears busy', () => {
+    const sandbox = errorHandlerSandbox({
+      messages: [{ type: 'user', content: 'q1' }],
+      cursor: { committedSeq: 4 },
+    });
+    sandbox.busy = true;
+    runInNewContext(`(${errorHandlerSource()})({ seq: 6, message: 'turn boom' });`, sandbox);
+    expect(sandbox.messages.filter((m) => m.type === 'error')).toHaveLength(1);
+    expect(sandbox.busy).toBe(false);
+  });
+
+  // A stale sequenced error already covered by the snapshot gates as shown: it
+  // neither renders a second row nor clears a busy that belongs to a newer turn.
+  it('a stale sequenced error neither renders nor clears busy', () => {
+    const sandbox = errorHandlerSandbox({
+      messages: [{ type: 'user', content: 'q1' }],
+      cursor: { committedSeq: 4 },
+      errors: [{ seq: 5, message: { type: 'error', content: 'already shown' } }],
+    });
+    sandbox.busy = true;
+    runInNewContext(`(${errorHandlerSource()})({ seq: 5, message: 'already shown' });`, sandbox);
+    expect(sandbox.messages.filter((m) => m.type === 'error')).toHaveLength(1);
+    expect(sandbox.busy).toBe(true);
   });
 });
 

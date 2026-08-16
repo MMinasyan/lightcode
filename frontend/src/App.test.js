@@ -821,3 +821,256 @@ describe('App promise completion gated by presentation', () => {
     expect(sandbox.shown).toBeTruthy();
   });
 });
+
+describe('App settings-refresh model gate', () => {
+  // refreshCurrentModel is the settings-close reload path. It captures the
+  // session id, presentation generation, and both model fields at call time and
+  // mutates only while all four still match, so a settings refresh captured on A
+  // cannot overwrite a newer B view (A→B), a detach, a re-selected A (A→B→A), or
+  // a newer same-session model frame delivered before the old promise resolves.
+
+  // deferredCurrentSandbox is a mounted settings view holding a pending
+  // CurrentModel promise plus the state applySnapshot/navigation need.
+  function deferredCurrentSandbox(overrides = {}) {
+    const sandbox = {
+      ...applySnapshotSandbox(),
+      sessionId: 'A',
+      presentationGeneration: 1,
+      modelRef: 'prov/a',
+      modelName: 'Model A',
+      shown: null,
+      currentResolve: null,
+      currentReject: null,
+      CurrentModel: () => new Promise((resolve, reject) => {
+        sandbox.currentResolve = resolve;
+        sandbox.currentReject = reject;
+      }),
+      showError: (err) => { sandbox.shown = err; },
+      ...overrides,
+    };
+    return sandbox;
+  }
+
+  // navigateSandboxToWithModel navigates to a session whose snapshot carries an
+  // explicit model, so a fixture can hold the model fields at their captured
+  // values and isolate the session or generation term of the refresh guard.
+  function navigateSandboxToWithModel(sandbox, id, ref, displayName) {
+    runInNewContext(
+      `(${functionBodySource('applySnapshot')})({
+        session: { id: ${JSON.stringify(id)} },
+        model: { ref: ${JSON.stringify(ref)}, displayName: ${JSON.stringify(displayName)} },
+        messages: [],
+        tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 },
+        queue: { items: [], version: 0 },
+        warnings: [],
+        permissions: [],
+      });`,
+      sandbox,
+    );
+  }
+
+  it('a settings refresh captured on A is inert after a B navigation whose model matches the capture (session ownership)', async () => {
+    const sandbox = deferredCurrentSandbox();
+    runInNewContext(`(async ${functionBodySource('refreshCurrentModel')})();`, sandbox);
+    // B carries the captured model values, so the model terms cannot reject: a
+    // model-only guard would apply the stale result. Only the session term can.
+    navigateSandboxToWithModel(sandbox, 'B', 'prov/a', 'Model A');
+    sandbox.currentResolve({ model: { ref: 'prov/new', provider: 'prov', model: 'new', displayName: 'New Model' }, superseded: false });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.sessionId).toBe('B');
+    expect(sandbox.presentationGeneration).toBe(2);
+    expect(sandbox.modelRef).toBe('prov/a');
+    expect(sandbox.modelName).toBe('Model A');
+    expect(sandbox.shown).toBeNull();
+  });
+
+  it('a settings refresh captured on A is inert after a detach leaves an empty route', async () => {
+    const sandbox = deferredCurrentSandbox();
+    runInNewContext(`(async ${functionBodySource('refreshCurrentModel')})();`, sandbox);
+    // A detach boundary carries an empty state: the view is replaced wholesale
+    // with no session and no model, and the stale result must not resurrect it.
+    runInNewContext(
+      `(${functionBodySource('applySnapshot')})({ session: {}, messages: [], tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 }, queue: { items: [], version: 0 }, warnings: [], permissions: [] });`,
+      sandbox,
+    );
+    sandbox.currentResolve({ model: { ref: 'prov/new', provider: 'prov', model: 'new', displayName: 'New Model' }, superseded: false });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.sessionId).toBe('');
+    expect(sandbox.presentationGeneration).toBe(2);
+    expect(sandbox.modelRef).toBe('');
+    expect(sandbox.modelName).toBe('');
+    expect(sandbox.shown).toBeNull();
+  });
+
+  it('a settings refresh captured on A is inert after a re-selected A whose model matches the capture (generation ownership)', async () => {
+    const sandbox = deferredCurrentSandbox();
+    runInNewContext(`(async ${functionBodySource('refreshCurrentModel')})();`, sandbox);
+    navigateSandboxTo(sandbox, 'B');
+    // Re-select A carrying the captured model values, so session and model terms
+    // all match again: only the advanced generation can reject the stale result.
+    navigateSandboxToWithModel(sandbox, 'A', 'prov/a', 'Model A');
+    sandbox.currentResolve({ model: { ref: 'prov/new', provider: 'prov', model: 'new', displayName: 'New Model' }, superseded: false });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.sessionId).toBe('A');
+    expect(sandbox.presentationGeneration).toBe(3);
+    expect(sandbox.modelRef).toBe('prov/a');
+    expect(sandbox.modelName).toBe('Model A');
+    expect(sandbox.shown).toBeNull();
+  });
+
+  it('a newer same-session model frame changing both model fields wins', async () => {
+    const sandbox = deferredCurrentSandbox();
+    runInNewContext(`(async ${functionBodySource('refreshCurrentModel')})();`, sandbox);
+    runInNewContext(
+      `(${eventCallbackSource('model')})({ rootId: 'A', model: { ref: 'prov/new', provider: 'prov', model: 'new', displayName: 'New Model' } });`,
+      sandbox,
+    );
+    sandbox.currentResolve({ model: { ref: 'prov/a', provider: 'prov', model: 'a', displayName: 'Model A' }, superseded: false });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.modelRef).toBe('prov/new');
+    expect(sandbox.modelName).toBe('New Model');
+    expect(sandbox.shown).toBeNull();
+  });
+
+  it('a newer same-session model frame changing only modelRef wins (modelRef ownership)', async () => {
+    const sandbox = deferredCurrentSandbox();
+    runInNewContext(`(async ${functionBodySource('refreshCurrentModel')})();`, sandbox);
+    // The newer frame changes modelRef while modelName stays at the capture, so
+    // a modelName-only guard would let the stale result through.
+    runInNewContext(
+      `(${eventCallbackSource('model')})({ rootId: 'A', model: { ref: 'prov/new', provider: 'prov', model: 'new', displayName: 'Model A' } });`,
+      sandbox,
+    );
+    sandbox.currentResolve({ model: { ref: 'prov/a', provider: 'prov', model: 'a', displayName: 'Model A' }, superseded: false });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.modelRef).toBe('prov/new');
+    expect(sandbox.modelName).toBe('Model A');
+    expect(sandbox.shown).toBeNull();
+  });
+
+  it('a newer same-session model frame changing only modelName wins (modelName ownership)', async () => {
+    const sandbox = deferredCurrentSandbox();
+    runInNewContext(`(async ${functionBodySource('refreshCurrentModel')})();`, sandbox);
+    // The newer frame changes modelName while modelRef stays at the capture, so
+    // a modelRef-only guard would let the stale result through.
+    runInNewContext(
+      `(${eventCallbackSource('model')})({ rootId: 'A', model: { ref: 'prov/a', provider: 'prov', model: 'a', displayName: 'Renamed Model' } });`,
+      sandbox,
+    );
+    sandbox.currentResolve({ model: { ref: 'prov/a', provider: 'prov', model: 'a', displayName: 'Model A' }, superseded: false });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.modelRef).toBe('prov/a');
+    expect(sandbox.modelName).toBe('Renamed Model');
+    expect(sandbox.shown).toBeNull();
+  });
+
+  it('applies the result on the unchanged current view, overwriting the old model', async () => {
+    const sandbox = deferredCurrentSandbox({ modelRef: 'prov/old', modelName: 'Old Model' });
+    runInNewContext(`(async ${functionBodySource('refreshCurrentModel')})();`, sandbox);
+    // The view begins with old model values and resolves a different result: the
+    // assertion proves the refresh actually applied, not that it matched in place.
+    sandbox.currentResolve({ model: { ref: 'prov/new', provider: 'prov', model: 'new', displayName: 'New Model' }, superseded: false });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.modelRef).toBe('prov/new');
+    expect(sandbox.modelName).toBe('New Model');
+  });
+
+  it('a superseded result is inert even while all four captures still match', async () => {
+    const sandbox = deferredCurrentSandbox();
+    runInNewContext(`(async ${functionBodySource('refreshCurrentModel')})();`, sandbox);
+    // All four frontend captures still match the unchanged view, but the backend
+    // marked the result superseded (routing advanced while the refresh was in
+    // flight), so the refresh must not apply anything.
+    sandbox.currentResolve({ superseded: true });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.modelRef).toBe('prov/a');
+    expect(sandbox.modelName).toBe('Model A');
+    expect(sandbox.shown).toBeNull();
+  });
+
+  it('a wrong-root model frame stays ignored by the model listener', async () => {
+    const sandbox = deferredCurrentSandbox();
+    // The root differs from the presented session, so the ordered model item
+    // must not touch the selector.
+    runInNewContext(
+      `(${eventCallbackSource('model')})({ rootId: 'X', model: { ref: 'prov/other', provider: 'prov', model: 'other', displayName: 'Other' } });`,
+      sandbox,
+    );
+    expect(sandbox.modelRef).toBe('prov/a');
+    expect(sandbox.modelName).toBe('Model A');
+  });
+
+  it('a stale refresh rejection is inert after a B navigation whose model matches the capture (session ownership)', async () => {
+    const sandbox = deferredCurrentSandbox();
+    runInNewContext(`(async ${functionBodySource('refreshCurrentModel')})();`, sandbox);
+    navigateSandboxToWithModel(sandbox, 'B', 'prov/a', 'Model A');
+    sandbox.currentReject(new Error('model load failed'));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.sessionId).toBe('B');
+    expect(sandbox.presentationGeneration).toBe(2);
+    expect(sandbox.shown).toBeNull();
+  });
+
+  it('a stale refresh rejection is inert after a detach leaves an empty route', async () => {
+    const sandbox = deferredCurrentSandbox();
+    runInNewContext(`(async ${functionBodySource('refreshCurrentModel')})();`, sandbox);
+    runInNewContext(
+      `(${functionBodySource('applySnapshot')})({ session: {}, messages: [], tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 }, queue: { items: [], version: 0 }, warnings: [], permissions: [] });`,
+      sandbox,
+    );
+    sandbox.currentReject(new Error('model load failed'));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.sessionId).toBe('');
+    expect(sandbox.shown).toBeNull();
+  });
+
+  it('a stale refresh rejection is inert after a re-selected A whose model matches the capture (generation ownership)', async () => {
+    const sandbox = deferredCurrentSandbox();
+    runInNewContext(`(async ${functionBodySource('refreshCurrentModel')})();`, sandbox);
+    navigateSandboxTo(sandbox, 'B');
+    navigateSandboxToWithModel(sandbox, 'A', 'prov/a', 'Model A');
+    sandbox.currentReject(new Error('model load failed'));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.sessionId).toBe('A');
+    expect(sandbox.presentationGeneration).toBe(3);
+    expect(sandbox.shown).toBeNull();
+  });
+
+  it('a stale refresh rejection is inert after a same-session model frame changing only modelRef (modelRef ownership)', async () => {
+    const sandbox = deferredCurrentSandbox();
+    runInNewContext(`(async ${functionBodySource('refreshCurrentModel')})();`, sandbox);
+    runInNewContext(
+      `(${eventCallbackSource('model')})({ rootId: 'A', model: { ref: 'prov/new', provider: 'prov', model: 'new', displayName: 'Model A' } });`,
+      sandbox,
+    );
+    sandbox.currentReject(new Error('model load failed'));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.modelRef).toBe('prov/new');
+    expect(sandbox.modelName).toBe('Model A');
+    expect(sandbox.shown).toBeNull();
+  });
+
+  it('a stale refresh rejection is inert after a same-session model frame changing only modelName (modelName ownership)', async () => {
+    const sandbox = deferredCurrentSandbox();
+    runInNewContext(`(async ${functionBodySource('refreshCurrentModel')})();`, sandbox);
+    runInNewContext(
+      `(${eventCallbackSource('model')})({ rootId: 'A', model: { ref: 'prov/a', provider: 'prov', model: 'a', displayName: 'Renamed Model' } });`,
+      sandbox,
+    );
+    sandbox.currentReject(new Error('model load failed'));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.modelRef).toBe('prov/a');
+    expect(sandbox.modelName).toBe('Renamed Model');
+    expect(sandbox.shown).toBeNull();
+  });
+
+  it('a refresh rejection on the still-current view remains visible', async () => {
+    const sandbox = deferredCurrentSandbox();
+    runInNewContext(`(async ${functionBodySource('refreshCurrentModel')})();`, sandbox);
+    sandbox.currentReject(new Error('model load failed'));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sandbox.shown).toBeTruthy();
+    expect(sandbox.shown.message).toBe('model load failed');
+    expect(sandbox.modelRef).toBe('prov/a');
+  });
+});
