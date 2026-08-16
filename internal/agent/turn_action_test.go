@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -623,6 +624,103 @@ func TestIdleBackgroundTerminalSignalStartsAgentTurn(t *testing.T) {
 	if bgEvent.BackgroundProcess.Command != "printf final-output" || bgEvent.BackgroundProcess.Reason != "completed" || bgEvent.BackgroundProcess.ExitCode != 0 || bgEvent.Result != "final-output" || bgEvent.IsError {
 		t.Fatalf("background event = %#v", bgEvent)
 	}
+}
+
+// TestSignalTurnRefusalBalancesClaim proves the signal scheduler's turn start
+// is the same commitment point as direct submit: a claimed start refused at
+// the receiving end is suppressed — no retry of the same wake, no event, no
+// model request — and its claim's Add is balanced exactly; a live owner
+// starts a nonzero signal turn whose claim is released when the turn ends.
+func TestSignalTurnRefusalBalancesClaim(t *testing.T) {
+	t.Run("refused=claimed_start_suppressed_add_balanced", func(t *testing.T) {
+		var reqs atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reqs.Add(1)
+			writeTextResponse(w, "ok")
+		}))
+		defer server.Close()
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		a.lp.AddPendingSignal(loop.PendingSignal{Payload: "wake", Persist: true, Wake: true})
+		rt := a.ensureRuntime()
+		// Cancel the owner context without publishing closed: the scheduler's
+		// claim still succeeds (its turn context derives from the cancelled
+		// owner context), so the receiving end refuses the claimed start —
+		// a claimed signal turn with its Add, refused at launch.
+		rt.ownerCancel()
+		done := make(chan struct{})
+		go func() {
+			rt.tryStartSignalTurn(ctx)
+			close(done)
+		}()
+		// The refused start is suppressed: the pass returns instead of
+		// immediately retrying the same wakeable unit.
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("refused signal start was immediately retried while the same wake remains")
+		}
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == EventTurnStart {
+				t.Fatalf("refused signal start emitted a turn: %#v", ev)
+			}
+		}
+		if got := reqs.Load(); got != 0 {
+			t.Fatalf("refused signal start made %d model requests", got)
+		}
+		// The claim's Add was released exactly once by the receiving-end
+		// refusal.
+		wgDone := make(chan struct{})
+		go func() {
+			rt.turnWG.Wait()
+			close(wgDone)
+		}()
+		select {
+		case <-wgDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("refused signal start leaked a wait-group count")
+		}
+	})
+
+	t.Run("live=nonzero_signal_turn", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeTextResponse(w, "ok")
+		}))
+		defer server.Close()
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		a.lp.AddPendingSignal(loop.PendingSignal{Payload: "wake", Persist: true, Wake: true})
+		rt := a.ensureRuntime()
+		rt.tryStartSignalTurn(ctx)
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		var started Event
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == EventTurnStart && ev.Turn > 0 {
+				started = ev
+			}
+		}
+		if started.Turn == 0 {
+			t.Fatalf("signal turn start missing or zero in %#v", cap.snapshot())
+		}
+		wgDone := make(chan struct{})
+		go func() {
+			rt.turnWG.Wait()
+			close(wgDone)
+		}()
+		select {
+		case <-wgDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("signal turn never released its wait-group count")
+		}
+	})
 }
 
 func TestBackgroundTerminalDisplayEventsForErrorAndTimeout(t *testing.T) {

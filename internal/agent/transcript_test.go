@@ -3071,6 +3071,178 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 	})
 }
 
+// TestPreseedRefusedFinalLaunchReleasesExactAdds proves the final-launch Add
+// ledger on a receiving-end refusal: the helper releases exactly the launch
+// Add, the preseed Add stays owned by the closure until its defer runs, and
+// the requeue restores the final item with its original ID plus a real
+// queue-changed event while the preseed Add still prevents shutdown
+// completion. No turn is created or emitted and no model call runs.
+func TestPreseedRefusedFinalLaunchReleasesExactAdds(t *testing.T) {
+	var reqs atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs.Add(1)
+		writeTextResponse(w, "ok")
+	}))
+	defer server.Close()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	id, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	unit := a.sessions[id]
+	rt.mu.Unlock()
+
+	// Park the drain's requeue inside its queue-changed emit. The event
+	// handler runs under rt.mu, so the closure is stuck between the helper's
+	// launch-Add release (done before the requeue) and its deferred preseed
+	// Add release (the defer runs after the requeue returns). The owner is
+	// deliberately not initialised: no background drainer exists, so the
+	// refused pass's rearm cannot start another pass and re-Add while the
+	// test observes the wait-group.
+	requeueParked := make(chan struct{})
+	releaseRequeue := make(chan struct{})
+	var parkOnce sync.Once
+	a.SetEventHandler(func(ev Event) {
+		if ev.Kind == EventQueueChanged && len(ev.Queue) > 0 {
+			parkOnce.Do(func() {
+				close(requeueParked)
+				<-releaseRequeue
+			})
+		}
+		cap.mu.Lock()
+		cap.events = append(cap.events, ev)
+		cap.mu.Unlock()
+	})
+
+	before := unit.store.CurrentTurn()
+	rt.mu.Lock()
+	unit.lp = nil // deterministic receiving-end refusal
+	unit.queue = []QueuedItem{{ID: "q-1", Content: "final"}}
+	unit.queueSeq = 1
+	unit.queueVersion = 0
+	rt.mu.Unlock()
+
+	drainDone := make(chan struct{})
+	go func() {
+		rt.tryDrainQueue(context.Background())
+		close(drainDone)
+	}()
+
+	// The drain is parked inside the requeue: the helper has already released
+	// the final-launch Add, so exactly one count — the preseed Add, still
+	// owned by the closure's defer — is outstanding. Shutdown completion must
+	// stay blocked on it.
+	select {
+	case <-requeueParked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("drain did not park inside the requeue")
+	}
+	wgDone := make(chan struct{})
+	go func() {
+		rt.turnWG.Wait()
+		close(wgDone)
+	}()
+	select {
+	case <-wgDone:
+		t.Fatal("preseed Add was released before the closure defer ran")
+	case <-time.After(200 * time.Millisecond):
+		// Expected: the preseed Add is still owned.
+	}
+
+	close(releaseRequeue)
+	select {
+	case <-drainDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("drain did not finish after the requeue release")
+	}
+	select {
+	case <-wgDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("closure defer never released the preseed Add")
+	}
+
+	// The final item was restored with its original ID, and the requeue event
+	// carried the real queue.
+	rt.mu.Lock()
+	restored := copyQueue(unit.queue)
+	rt.mu.Unlock()
+	if len(restored) != 1 || restored[0].ID != "q-1" || restored[0].Content != "final" {
+		t.Fatalf("restored queue = %#v, want the final item with its original id", restored)
+	}
+	assertQueueChangedPayloadPresent(t, cap, []QueuedItem{{ID: "q-1", Content: "final"}})
+
+	// No turn was created or emitted, and no model call ran.
+	if got := unit.store.CurrentTurn(); got != before {
+		t.Fatalf("CurrentTurn = %d after the refused launch, want unchanged %d", got, before)
+	}
+	for _, ev := range cap.snapshot() {
+		if ev.Kind == EventTurnStart {
+			t.Fatalf("refused launch emitted a turn: %#v", ev)
+		}
+	}
+	if got := reqs.Load(); got != 0 {
+		t.Fatalf("refused launch made %d model requests", got)
+	}
+}
+
+// TestPreseedCommittedLaunchNeverRestores proves a successful final launch
+// never restores the item: the queue stays empty, no queue-changed event
+// carries the item back, and the committed turn is nonzero.
+func TestPreseedCommittedLaunchNeverRestores(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTextResponse(w, "ok")
+	}))
+	defer server.Close()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+	id, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	unit := a.sessions[id]
+	rt.mu.Unlock()
+
+	rt.mu.Lock()
+	unit.queue = []QueuedItem{{ID: "q-1", Content: "final"}}
+	unit.queueSeq = 1
+	unit.queueVersion = 0
+	rt.mu.Unlock()
+
+	rt.tryDrainQueue(ctx)
+	waitUntilEventOrderTurnEndCount(t, cap, 1)
+
+	// The item was consumed by the committed turn, never restored.
+	rt.mu.Lock()
+	queue := copyQueue(unit.queue)
+	rt.mu.Unlock()
+	if len(queue) != 0 {
+		t.Fatalf("queue after committed launch = %#v, want empty (no restoration)", queue)
+	}
+	for _, ev := range cap.snapshot() {
+		if ev.Kind == EventQueueChanged && len(ev.Queue) > 0 {
+			t.Fatalf("committed launch emitted a restoration event: %#v", ev)
+		}
+	}
+	// The committed turn is nonzero and ran.
+	var started Event
+	for _, ev := range cap.snapshot() {
+		if ev.Kind == EventTurnStart && ev.Turn > 0 {
+			started = ev
+		}
+	}
+	if started.Turn == 0 {
+		t.Fatalf("no committed turn_start in %#v", cap.snapshot())
+	}
+}
+
 // TestTurnBegunAfterRevertRendersOnceThroughHydration proves the committed
 // bound against a reused turn number: after a combined code+history revert the
 // coordinator's committedTurn is lowered to the surviving turn, so a turn

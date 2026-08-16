@@ -2753,6 +2753,143 @@ func TestCLISignalPathDoesNotWriteTerminal(t *testing.T) {
 	}
 }
 
+// TestCLISIGINTAdmissionAuthority proves the SIGINT decision is the owner's
+// live busy unit, not the CLI's delayed presentation state: an owner-busy
+// selected live session cancels and keeps the host open even while turn_start
+// is still queued undrained, while idle, empty, missing, and read-only
+// selections still exit 130. The signal path never writes the terminal and
+// never waits on the CLI render lock.
+func TestCLISIGINTAdmissionAuthority(t *testing.T) {
+	assertExit130 := func(t *testing.T, c *CLI) {
+		t.Helper()
+		select {
+		case <-c.exitLatch:
+		default:
+			t.Fatal("SIGINT did not request exit 130")
+		}
+		c.keyMu.Lock()
+		err := c.exitErr
+		c.keyMu.Unlock()
+		var exit ExitError
+		if !errors.As(err, &exit) || exit.Code != 130 {
+			t.Fatalf("signal exit error = %v, want ExitError{130}", err)
+		}
+	}
+
+	t.Run("busy=owner_busy_presentation_idle_cancels_and_stays_open", func(t *testing.T) {
+		a, c, out, source, _ := busySourceCLI(t)
+		busy, err := a.BusyForSession(source)
+		if err != nil || !busy {
+			t.Fatalf("source busy after the hold submit = %v (err %v), want the owner claim", busy, err)
+		}
+		if c.busy {
+			t.Fatal("CLI busy flag set before the turn_start event drained; the SIGINT decision must not depend on event-derived busy")
+		}
+		if cliState(c.state.Load()) != stateIdle {
+			t.Fatalf("CLI state = %v, want idle (turn_start undrained)", cliState(c.state.Load()))
+		}
+		// The signal handler must never wait on the render lock: hold it.
+		c.mu.Lock()
+		done := make(chan struct{})
+		go func() {
+			c.handleSignal(syscall.SIGINT)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			c.mu.Unlock()
+			t.Fatal("handleSignal blocked behind the CLI render lock")
+		}
+		c.mu.Unlock()
+		select {
+		case <-c.exitLatch:
+			t.Fatal("busy selected live SIGINT must cancel and stay open, not exit 130")
+		default:
+		}
+		if out.Len() != 0 {
+			t.Fatalf("signal path wrote the terminal: %q", out.String())
+		}
+		// The signal cancelled the owner turn; it ends and the owner returns
+		// to idle (busySourceCLI's cleanup releases the blocked provider).
+		waitUntilAgentIdle(t, a)
+	})
+
+	t.Run("idle=exits_130", func(t *testing.T) {
+		a, _ := newTestAgentWithBaseURL(t, "http://127.0.0.1:9/v1")
+		startTestAgent(t, a)
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		c := New(a)
+		out := new(bytes.Buffer)
+		c.out = out
+		c.setCurrentSessionID(id)
+		c.handleSignal(syscall.SIGINT)
+		assertExit130(t, c)
+		if out.Len() != 0 {
+			t.Fatalf("signal path wrote the terminal: %q", out.String())
+		}
+	})
+
+	t.Run("empty=exits_130", func(t *testing.T) {
+		a, _ := newTestAgentWithBaseURL(t, "http://127.0.0.1:9/v1")
+		startTestAgent(t, a)
+		c := New(a)
+		c.out = new(bytes.Buffer)
+		c.setCurrentSessionID("")
+		c.handleSignal(syscall.SIGINT)
+		assertExit130(t, c)
+	})
+
+	t.Run("missing=exits_130_unrelated_busy_untouched", func(t *testing.T) {
+		// The owner is busy on an unrelated live unit while the CLI's selected
+		// attachment is missing: the SIGINT authority is the exact selected
+		// session, not the owner-global busy state or the backend current, so
+		// the signal exits 130 and leaves the unrelated busy turn uncancelled.
+		a, c, out, source, _ := busySourceCLI(t)
+		busy, err := a.BusyForSession(source)
+		if err != nil || !busy {
+			t.Fatalf("source busy before the signal = %v (err %v), want the unrelated busy turn", busy, err)
+		}
+		c.setCurrentSessionID("does-not-exist")
+		c.handleSignal(syscall.SIGINT)
+		assertExit130(t, c)
+		if out.Len() != 0 {
+			t.Fatalf("signal path wrote the terminal: %q", out.String())
+		}
+		busy, err = a.BusyForSession(source)
+		if err != nil || !busy {
+			t.Fatalf("unrelated busy turn was cancelled by the missing-selection SIGINT: busy=%v err=%v", busy, err)
+		}
+	})
+
+	t.Run("readonly=exits_130_unrelated_busy_untouched", func(t *testing.T) {
+		// The owner is busy on an unrelated live unit while the CLI's selected
+		// attachment is read-only (another process drives it, so it is not
+		// live in this owner): the signal exits 130 and leaves the unrelated
+		// busy turn uncancelled, rejecting owner-global/backend-current
+		// authority.
+		a, c, out, source, _ := busySourceCLI(t)
+		busy, err := a.BusyForSession(source)
+		if err != nil || !busy {
+			t.Fatalf("source busy before the signal = %v (err %v), want the unrelated busy turn", busy, err)
+		}
+		c.setCurrentSessionID("ro-session")
+		c.sv().SetReadOnly("ro-session")
+		c.handleSignal(syscall.SIGINT)
+		assertExit130(t, c)
+		if out.Len() != 0 {
+			t.Fatalf("signal path wrote the terminal: %q", out.String())
+		}
+		busy, err = a.BusyForSession(source)
+		if err != nil || !busy {
+			t.Fatalf("unrelated busy turn was cancelled by the read-only-selection SIGINT: busy=%v err=%v", busy, err)
+		}
+	})
+}
+
 // TestCLIAnimationHasNoSpinnerGoroutine proves the spinner runs through mainLoop's
 // ticker rather than a separate goroutine, keeping mainLoop the sole terminal writer.
 func TestCLIAnimationHasNoSpinnerGoroutine(t *testing.T) {

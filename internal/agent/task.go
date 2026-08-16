@@ -234,8 +234,38 @@ func (t *taskTool) Execute(ctx context.Context, params map[string]any) (string, 
 		wg.Add(1)
 		go func(idx int, td taskDef) {
 			defer wg.Done()
-			sem <- struct{}{}
+			// Cancellation-before-acquire creates nothing: a waiter that loses
+			// the semaphore race to the turn's cancellation returns a
+			// cancelled task result without minting a child.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				results[idx] = taskResult{index: idx, err: ctx.Err()}
+				return
+			}
 			defer func() { <-sem }()
+			// Post-acquire admission: the owner may have closed or the context
+			// been cancelled while this waiter waited. Both are read once
+			// under rt.mu; the semaphore is released and the waiter returns
+			// without running if either fails. Success after this check is
+			// operation-first — a later cancellation may retain an interrupted
+			// child, never a child minted after the failed check.
+			if t.rt != nil {
+				t.rt.mu.Lock()
+				closed := t.rt.closed
+				ctxErr := ctx.Err()
+				t.rt.mu.Unlock()
+				if closed || ctxErr != nil {
+					if ctxErr == nil {
+						ctxErr = errOwnerClosed
+					}
+					results[idx] = taskResult{index: idx, err: ctxErr}
+					return
+				}
+			} else if ctxErr := ctx.Err(); ctxErr != nil {
+				results[idx] = taskResult{index: idx, err: ctxErr}
+				return
+			}
 			results[idx] = t.runSubagent(ctx, idx, td, toolCallID)
 		}(i, task)
 	}

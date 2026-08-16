@@ -576,6 +576,301 @@ func TestTaskToolStateAndSessionID(t *testing.T) {
 	}
 }
 
+// TestTaskToolSemaphoreCancelFirst proves the subagent semaphore's
+// cancellation-before-acquire path creates nothing: a waiter blocked on the
+// full semaphore returns a cancelled task result when the turn is cancelled —
+// no child directory, claim, transcript, loop, or turn is minted — and only
+// the already-admitted sibling task's child is linked into the parent row.
+// The operation-first sibling proves the opposite edge: a waiter that
+// acquired before the cancel stays admitted, and the later cancellation is a
+// turn outcome (the interrupted child's link remains in the parent row).
+func TestTaskToolSemaphoreCancelFirst(t *testing.T) {
+	submitDelegation := func(t *testing.T, a *Agent, cap *eventCapture, ctx context.Context) {
+		t.Helper()
+		if _, err := a.Submit(ctx, "delegate"); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+	}
+
+	t.Run("cancel_first=waiter_mints_no_child", func(t *testing.T) {
+		var calls atomic.Int32
+		var mu sync.Mutex
+		var childRequests int
+		childReq := make(chan struct{}, 10)
+		block := make(chan struct{})
+		var blockOnce sync.Once
+		releaseBlock := func() { blockOnce.Do(func() { close(block) }) }
+		t.Cleanup(releaseBlock)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch calls.Add(1) {
+			case 1:
+				writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"t1","subagent_type":"explore"},{"prompt":"t2","subagent_type":"explore"}]}`)
+			default:
+				mu.Lock()
+				childRequests++
+				mu.Unlock()
+				select {
+				case childReq <- struct{}{}:
+				default:
+				}
+				select {
+				case <-block:
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		a.cfg.Subagents.MaxConcurrent = 1
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		submitDelegation(t, a, cap, ctx)
+		parentID := a.SessionCurrent().ID
+
+		// The first child's model request holds the only semaphore slot; the
+		// second task waits on the full semaphore. The admitted child's
+		// session directory is the baseline a waiter-minted child must not
+		// extend.
+		select {
+		case <-childReq:
+		case <-time.After(10 * time.Second):
+			t.Fatal("child 1 request did not arrive")
+		}
+		baselineDirs := sessionChildDirs(t, a, parentID)
+		// Cancel the turn while the second task is still waiting to acquire.
+		if err := a.CancelSession(parentID); err != nil {
+			t.Fatalf("CancelSession: %v", err)
+		}
+		releaseBlock()
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		// Full no-child state: no new child directory/claim/transcript/loop/
+		// turn, no extra provider request, no second subagent-start event.
+		assertNoWaiterChildState(t, a, cap, parentID, baselineDirs, &calls, 2)
+
+		parentMsgs := a.SessionMessages()
+		var taskRow *DisplayMessage
+		for i := range parentMsgs {
+			msg := parentMsgs[i]
+			if msg.Type == "tool" && msg.Name == "task" {
+				taskRow = &parentMsgs[i]
+			}
+		}
+		if taskRow == nil {
+			t.Fatalf("parent transcript missing task tool row: %#v", parentMsgs)
+		}
+		// Only the already-admitted sibling (child 1) may be linked: the
+		// cancelled waiter must not have minted child 2.
+		if got := len(taskRow.SubagentSessionIDs); got != 1 {
+			t.Fatalf("task subagent links = %d (%#v), want exactly 1 admitted child", got, taskRow.SubagentSessionIDs)
+		}
+	})
+
+	t.Run("owner_close=waiter_refused_after_acquire", func(t *testing.T) {
+		var calls atomic.Int32
+		childReq := make(chan struct{}, 10)
+		releaseChild1 := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch calls.Add(1) {
+			case 1:
+				writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"t1","subagent_type":"explore"},{"prompt":"t2","subagent_type":"explore"}]}`)
+			case 2:
+				select {
+				case childReq <- struct{}{}:
+				default:
+				}
+				select {
+				case <-releaseChild1:
+				case <-r.Context().Done():
+					return
+				}
+				writeTextResponse(w, "child one done")
+			default:
+				writeTextResponse(w, "parent done")
+			}
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		a.cfg.Subagents.MaxConcurrent = 1
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		submitDelegation(t, a, cap, ctx)
+		parentID := a.SessionCurrent().ID
+
+		// Child 1 holds the only semaphore slot; task 2 waits on the full
+		// semaphore with a live turn context. The admitted child's session
+		// directory is the baseline a waiter-minted child must not extend.
+		select {
+		case <-childReq:
+		case <-time.After(10 * time.Second):
+			t.Fatal("child 1 request did not arrive")
+		}
+		baselineDirs := sessionChildDirs(t, a, parentID)
+		// The owner closes while the waiter is parked. The turn context stays
+		// live (close is published without cancelling it), so when child 1
+		// finishes and frees the slot the waiter acquires deterministically —
+		// and the post-acquire check must refuse it on rt.closed before it
+		// mints any child directory, claim, transcript, loop, or turn.
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		rt.closed = true
+		rt.mu.Unlock()
+		close(releaseChild1)
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		// Full no-child state: no new child directory/claim/transcript/loop/
+		// turn, exactly the admitted child's request plus the parent
+		// follow-up (3 calls), and no second subagent-start event.
+		assertNoWaiterChildState(t, a, cap, parentID, baselineDirs, &calls, 3)
+
+		parentMsgs := a.SessionMessages()
+		var taskRow *DisplayMessage
+		for i := range parentMsgs {
+			msg := parentMsgs[i]
+			if msg.Type == "tool" && msg.Name == "task" {
+				taskRow = &parentMsgs[i]
+			}
+		}
+		if taskRow == nil {
+			t.Fatalf("parent transcript missing task tool row: %#v", parentMsgs)
+		}
+		// Only the pre-close admitted child (child 1) may be linked: the
+		// waiter acquired after close and was refused by the rt.closed check.
+		if got := len(taskRow.SubagentSessionIDs); got != 1 {
+			t.Fatalf("task subagent links = %d (%#v), want exactly the pre-close admitted child", got, taskRow.SubagentSessionIDs)
+		}
+	})
+
+	t.Run("operation_first=admitted_waiter_survives_cancel", func(t *testing.T) {
+		var calls atomic.Int32
+		childReq := make(chan struct{}, 10)
+		releaseChild1 := make(chan struct{})
+		releaseChild2 := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch calls.Add(1) {
+			case 1:
+				writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"t1","subagent_type":"explore"},{"prompt":"t2","subagent_type":"explore"}]}`)
+			default:
+				select {
+				case childReq <- struct{}{}:
+				default:
+				}
+				gate := releaseChild1
+				if calls.Load() > 2 {
+					gate = releaseChild2
+				}
+				select {
+				case <-gate:
+				case <-r.Context().Done():
+					return
+				}
+				writeTextResponse(w, "child done")
+			}
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		a.cfg.Subagents.MaxConcurrent = 1
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		submitDelegation(t, a, cap, ctx)
+
+		select {
+		case <-childReq:
+		case <-time.After(10 * time.Second):
+			t.Fatal("child 1 request did not arrive")
+		}
+		// Admit the waiter: child 1 completes, task 2 acquires while the turn
+		// context is still live, and child 2 starts.
+		close(releaseChild1)
+		select {
+		case <-childReq:
+		case <-time.After(10 * time.Second):
+			t.Fatal("child 2 request did not arrive after the semaphore freed")
+		}
+		// Cancellation lands after admission: both children were admitted, so
+		// both stay linked even though the later cancel interrupts them.
+		if err := a.CancelSession(a.SessionCurrent().ID); err != nil {
+			t.Fatalf("CancelSession: %v", err)
+		}
+		close(releaseChild2)
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+
+		parentMsgs := a.SessionMessages()
+		var taskRow *DisplayMessage
+		for i := range parentMsgs {
+			msg := parentMsgs[i]
+			if msg.Type == "tool" && msg.Name == "task" {
+				taskRow = &parentMsgs[i]
+			}
+		}
+		if taskRow == nil {
+			t.Fatalf("parent transcript missing task tool row: %#v", parentMsgs)
+		}
+		if got := len(taskRow.SubagentSessionIDs); got != 2 {
+			t.Fatalf("task subagent links = %d (%#v), want both admitted children linked", got, taskRow.SubagentSessionIDs)
+		}
+	})
+}
+
+// sessionChildDirs lists the session directories in the parent's project
+// sessions root other than the parent itself. os.ReadDir returns entries in
+// filename order, so the slice is deterministic.
+func sessionChildDirs(t *testing.T, a *Agent, parentID string) []string {
+	t.Helper()
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	projectID := a.session.projectID
+	rt.mu.Unlock()
+	entries, err := os.ReadDir(a.projects.SessionsRoot(projectID))
+	if err != nil {
+		t.Fatalf("read sessions root: %v", err)
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() && e.Name() != parentID {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// assertNoWaiterChildState asserts the full no-child state after a refused
+// semaphore waiter: no new child session directory (the baseline was captured
+// while the admitted child was running, so any waiter-minted directory would
+// extend it — a child directory also carries the child's claim, loop, and
+// turn), no transcript registration beyond the parent, no extra provider/child
+// request, and no subagent-start event beyond the admitted child.
+func assertNoWaiterChildState(t *testing.T, a *Agent, cap *eventCapture, parentID string, baselineDirs []string, calls *atomic.Int32, wantRequests int32) {
+	t.Helper()
+	rt := a.ensureRuntime()
+	rt.transcriptMu.Lock()
+	registered := make([]string, 0, len(rt.transcriptState))
+	for id := range rt.transcriptState {
+		registered = append(registered, id)
+	}
+	rt.transcriptMu.Unlock()
+	if len(registered) != 1 || registered[0] != parentID {
+		t.Fatalf("transcript registry = %v, want only the parent %q (no waiter-minted child registration)", registered, parentID)
+	}
+	if after := sessionChildDirs(t, a, parentID); !reflect.DeepEqual(after, baselineDirs) {
+		t.Fatalf("session dirs changed after the refused waiter: before=%v after=%v (waiter must not mint a child directory/claim/loop/turn)", baselineDirs, after)
+	}
+	if got := calls.Load(); got != wantRequests {
+		t.Fatalf("provider requests = %d, want %d (no waiter-minted child request)", got, wantRequests)
+	}
+	var subagentStarts int
+	for _, ev := range cap.snapshot() {
+		if ev.Kind == EventSubagentStart {
+			subagentStarts++
+		}
+	}
+	if subagentStarts != 1 {
+		t.Fatalf("EventSubagentStart count = %d, want exactly 1 (only the admitted child)", subagentStarts)
+	}
+}
+
 func TestTaskToolPersistsInspectableChildSession(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

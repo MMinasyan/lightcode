@@ -1806,6 +1806,146 @@ func TestACPOrderedDeliveryContract(t *testing.T) {
 			assertACPErrorResponse(t, respLine)
 		}
 	})
+
+	// The prompt's admission authority is the commitment point, not the
+	// callback: a refusal before the turn-start commitment must produce one
+	// error response with no current-route advance, no boundary frame, and no
+	// turn frame. The runner's normal event handler is wired so the row
+	// observes every agent event through the real delivery path — a refused
+	// submit must emit nothing that would become a frame. The cancel-before-
+	// callback refusal is the negative sibling of a callback that cancels its
+	// own committed turn.
+	t.Run("session/prompt=cancel_before_callback_keeps_routing", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		firstID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession first: %v", err)
+		}
+		secondID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession second: %v", err)
+		}
+
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		// Observe agent events through the runner's normal event handler, the
+		// same path the committed sibling uses.
+		a.SetEventHandler(r.handleEvent)
+		r.setCurrentSessionID(firstID)
+		r.seedPresented(firstID)
+
+		// A cancelled caller context refuses admission before any claim or
+		// callback: the implicit switch never commits and no event is emitted.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		r.handleSessionPrompt(ctx, Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"hi"}`),
+		})
+		// Exactly one error response through the wired event handler: no
+		// advance frame, no turn frame.
+		lines := drainedLines(t, r, out, 1)
+		assertACPErrorResponse(t, lines[0])
+		got, err := r.currentSession()
+		if err != nil {
+			t.Fatalf("current session: %v", err)
+		}
+		if got != firstID {
+			t.Fatalf("routing current = %q, want unchanged %q", got, firstID)
+		}
+		r.mu.Lock()
+		presented := r.presented
+		r.mu.Unlock()
+		if presented != firstID {
+			t.Fatalf("presentation current = %q, want unchanged %q", presented, firstID)
+		}
+	})
+
+	// A committed start owns the advance: the callback has already run inside
+	// the commitment block, so the response carries the nonzero committed turn
+	// (never started:true turn:0) and the destination's first frame —
+	// turn_start — is delivered before the response.
+	t.Run("session/prompt=committed_nonzero_turn_before_first_frames", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		firstID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession first: %v", err)
+		}
+		secondID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession second: %v", err)
+		}
+
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		a.SetEventHandler(r.handleEvent)
+		r.setCurrentSessionID(firstID)
+		r.seedPresented(firstID)
+
+		// A live context admits the submit against the dead provider; the
+		// turn commits synchronously, so its turn_start frame is enqueued
+		// ahead of the response and the committed turn is nonzero.
+		r.handleSessionPrompt(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"hi"}`),
+		})
+		r.drainForTest()
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+
+		turnStartIdx, responseIdx := -1, -1
+		for i, line := range lines {
+			var frame map[string]any
+			if err := json.Unmarshal([]byte(line), &frame); err != nil {
+				t.Fatalf("frame json: %v", err)
+			}
+			if m, _ := frame["method"].(string); m == "agent/turn_start" {
+				turnStartIdx = i
+			}
+			if _, ok := frame["id"]; ok {
+				responseIdx = i
+			}
+		}
+		if turnStartIdx < 0 {
+			t.Fatalf("no turn_start frame reached the client; frames: %q", out.String())
+		}
+		if responseIdx < 0 {
+			t.Fatalf("no prompt response among frames: %q", out.String())
+		}
+		if turnStartIdx > responseIdx {
+			t.Fatalf("turn_start frame (index %d) delivered after the response (index %d): %q", turnStartIdx, responseIdx, out.String())
+		}
+		var resp Response
+		if err := json.Unmarshal([]byte(lines[responseIdx]), &resp); err != nil {
+			t.Fatalf("response json: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("committed prompt response error = %+v", resp.Error)
+		}
+		result, ok := resp.Result.(map[string]any)
+		if !ok {
+			t.Fatalf("committed prompt result not an object: %#v", resp.Result)
+		}
+		started, _ := result["started"].(bool)
+		turn, _ := result["turn"].(float64)
+		if !started || turn <= 0 {
+			t.Fatalf("committed prompt = %#v, want started with a nonzero turn (never started:true turn:0)", result)
+		}
+		if got := r.currentSessionSummary().ID; got != secondID {
+			t.Fatalf("routing current = %q, want committed destination %q", got, secondID)
+		}
+		// The advance is a boundary: the presentation current adopted the
+		// destination before the first frame — which is exactly why the
+		// turn_start frame above was delivered at all instead of being
+		// filtered out.
+		r.mu.Lock()
+		presented := r.presented
+		r.mu.Unlock()
+		if presented != secondID {
+			t.Fatalf("presentation current = %q, want %q", presented, secondID)
+		}
+	})
 }
 
 // acpPermissionPendingRunner wires an ACP runner whose first turn asks a

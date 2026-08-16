@@ -609,13 +609,19 @@ func (c *CLI) handleSignal(sig os.Signal) {
 			c.setWidth(w)
 		}
 	case syscall.SIGINT:
-		if st := cliState(c.state.Load()); st == stateStreaming || st == statePermission {
-			c.cancelCurrent()
-		} else {
-			// Signal path never writes the terminal; requestExit unwinds
-			// mainLoop and the deferred restoreTerminal shows the cursor.
-			c.requestExit(ExitError{Code: 130})
+		// Admission authority is the owner's live busy unit, not the CLI's
+		// delayed presentation states: an owner-busy turn must be cancelled
+		// and the host stay open even while turn_start is still queued
+		// undrained. The concrete owner method inspects only the exact
+		// selected live session; idle, empty, missing, and read-only
+		// selections fall through to exit 130. This branch never writes the
+		// terminal and never takes the render lock.
+		if id := c.sv().Current(); id != "" && c.owner != nil {
+			if cancelled, _ := c.owner.CancelBusySession(id); cancelled {
+				return
+			}
 		}
+		c.requestExit(ExitError{Code: 130})
 	case syscall.SIGTERM:
 		c.requestExit(ExitError{Code: 130})
 	}

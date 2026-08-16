@@ -1309,7 +1309,14 @@ func (rt *runtime) tryStartSignalTurn(ctx context.Context) {
 			}
 			return
 		}
-		rt.launchTurn(unit, turnCtx, cancel, nil)
+		// The receiving end can still refuse the claimed start — a close or
+		// cancel landing after the claim, or a unit that cannot launch.
+		// Suppress a refused start and end this pass: the pending signal stays
+		// in the loop's queue and drains into the next accepted turn, and the
+		// same wake must not be immediately retried.
+		if launched := rt.launchTurn(unit, turnCtx, cancel, nil); launched == 0 {
+			return
+		}
 	}
 }
 
@@ -2864,12 +2871,17 @@ func (rt *runtime) submit(ctx context.Context, unit *session, content string, ad
 			rt.mu.Unlock()
 			return SubmitResult{}, err
 		}
-		if admitted != nil {
-			admitted()
+		turn, err := rt.startClaimedTurnLocked(unit, turnCtx, cancel, []string{content}, admitted)
+		if err != nil {
+			// A refusal is an explicit error, never an acknowledged
+			// Started:true Turn:0: nothing after the commitment block may
+			// refuse the accepted turn.
+			rt.mu.Unlock()
+			return SubmitResult{}, err
 		}
 		version := unit.queueVersion
 		rt.mu.Unlock()
-		turn := rt.launchTurn(unit, turnCtx, cancel, []string{content})
+		rt.launchCommittedTurn(unit, turnCtx, cancel, []string{content}, turn)
 		return SubmitResult{Started: true, Turn: turn, Queue: emptyQueue(), Version: version}, nil
 	}
 	// Busy or queue non-empty: enqueue and let the drainer pick it up. The
@@ -2977,7 +2989,9 @@ var errOwnerClosed = errors.New("agent: owner is shutting down")
 // claimTurnLocked checks the busy gate and claims a turn (sets busy, builds the
 // per-turn context). Caller must hold the runtime mutex. Returns a non-nil error if a turn
 // is already in progress or ensureSession fails; on error it leaves busy
-// unchanged (never half-claims). launchTurn must be called AFTER unlocking.
+// unchanged (never half-claims). The claim's commitment runs through
+// startClaimedTurnLocked (the direct submit path under the same hold) or, for
+// the signal scheduler, launchTurn after unlocking.
 // The caller's ctx gates admission only: an already-cancelled context refuses
 // the claim. The accepted turn's context derives from the owner context, so a
 // caller's cancellation after admission never severs the accepted turn — only
@@ -3004,8 +3018,6 @@ func (rt *runtime) claimTurnLocked(ctx context.Context, unit *session) (context.
 	} else if unit.store == nil || !unit.store.Active() {
 		return nil, nil, snapshot.ErrNoSession
 	}
-	a.ensureActiveModelForSessionLocked(unit)
-	a.setWarningGroup("setup", a.setupWarningsLocked())
 	unit.busy = true
 	unit.seenSessions = nil
 	// Track the turn from the moment it is claimed, under mu, so owner shutdown's
@@ -3183,8 +3195,8 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 		// honours it instead of launching afterwards. The turnWG count covers
 		// the preseed phase, which now runs unlocked and does durable store
 		// writes shutdown cannot see. This registration is independent of the
-		// pre-launch Add below: the closure releases it; launchTurn's
-		// goroutine (or its abort path) releases the launch's.
+		// pre-launch Add below: the closure releases it; the commitment
+		// helper (or the launched turn's goroutine) releases the launch's.
 		unit.busy = true
 		unit.seenSessions = nil
 		rt.turnWG.Add(1)
@@ -3213,6 +3225,7 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 		stop := func() bool {
 			tr := a.transcriptForSessionID(sessionID)
 			launched := 0
+			var launchErr error
 			// requeue puts the untouched remainder back on the queue,
 			// prepended ahead of anything submitted meanwhile, and publishes
 			// the real queue. It is the shared abort shape of the
@@ -3231,12 +3244,12 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 			// write, a launch abort, or a successful launch — leaves it
 			// counted exactly once. When no turn was launched, the claim is
 			// unwound — busy and the per-turn context are cleared — but only
-			// while the unit still holds this closure's claim. launchTurn's
-			// receiving-end rejection clears its own claim synchronously, so
-			// a concurrent submit can claim the unit again before this
-			// deferred cleanup runs; clearing then would drop the newer
-			// claim's gate while its loop is still running. A launched turn
-			// clears its own state in its turn-end section; the claim-time
+			// while the unit still holds this closure's claim. The commitment
+			// helper's receiving-end rejection clears its own claim
+			// synchronously, so a concurrent submit can claim the unit again
+			// before this deferred cleanup runs; clearing then would drop the
+			// newer claim's gate while its loop is still running. A launched
+			// turn clears its own state in its turn-end section; the claim-time
 			// context is released here so a cancelled turn that never
 			// launched cannot outlive the drain.
 			defer func() {
@@ -3330,14 +3343,14 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 				requeue(items[len(items)-1:])
 				return true
 			}
-			// The pre-launch registration stays here, immediately before
-			// launchTurn, exactly as before: it belongs to the launched turn,
-			// and launchTurn's goroutine — or its abort path, which returns 0
-			// after releasing this count — is its only releaser.
+			// The pre-launch registration stays here, immediately before the
+			// launch, exactly as before: it belongs to the launched turn, and
+			// startClaimedTurnLocked — or the launched turn's goroutine — is
+			// its only releaser.
 			rt.turnWG.Add(1)
+			launched, launchErr = rt.startClaimedTurnLocked(unit, turnCtx, cancel, []string{contents[len(contents)-1]}, nil)
 			rt.mu.Unlock()
-			launched = rt.launchTurn(unit, turnCtx, cancel, []string{contents[len(contents)-1]})
-			if launched == 0 {
+			if launchErr != nil {
 				// The handoff was refused (a cancel or shutdown landed after
 				// the revalidation above, or the unit cannot launch): the
 				// final item was already removed from the queue but never
@@ -3345,10 +3358,13 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 				// Requeue it the same way the other abort paths requeue the
 				// untouched remainder — prepended ahead of anything submitted
 				// meanwhile, with the version bumped and the queue-changed
-				// event carrying the real queue — and stop the drain.
+				// event carrying the real queue — and stop the drain. The
+				// preseed Add is still owned by the closure's defer, so the
+				// requeued item cannot vanish with a completed shutdown.
 				requeue(items[len(items)-1:])
 				return true
 			}
+			rt.launchCommittedTurn(unit, turnCtx, cancel, []string{contents[len(contents)-1]}, launched)
 			return false
 		}()
 		if stop {
@@ -3406,54 +3422,100 @@ func wakeableSession(unit *session) bool {
 		unit.lp.HasPendingWakeSignal()
 }
 
-func (rt *runtime) launchTurn(unit *session, turnCtx context.Context, cancel context.CancelFunc, contents []string) int {
+// startClaimedTurnLocked commits a claimed turn in one infallible order. The
+// caller must hold rt.mu and own exactly one Add-bound claim for this launch.
+// Every fallible receiving-end check runs before admitted — the exact
+// live-map pointer must still be the claimed unit, unit/store/loop must be
+// nonnil with an active store, the owner must not be closed, and the turn
+// context must not be cancelled. On refusal only the matching claim is
+// cleared and cancelled, exactly this launch's Add is released, no callback
+// runs, and the explicit refusal is returned. After admitted the commitment
+// is infallible: event ownership synchronizes, Store.BeginTurn allocates the
+// turn, EventTurnStart is enqueued, and the current model/config/warning
+// state is applied, all under rt.mu, so nothing after the callback can refuse
+// or produce turn zero. The caller then unlocks and hands the nonzero turn to
+// launchCommittedTurn.
+func (rt *runtime) startClaimedTurnLocked(unit *session, turnCtx context.Context, cancel context.CancelFunc, contents []string, admitted func()) (int, error) {
 	a := rt.agent
-	// The claimed-but-cannot-launch check reads unit fields that the owner
-	// mutates under rt.mu, so it runs inside the same locked section as the
-	// admission recheck below; in production these fields are immutable for a
-	// live unit, and the lock makes the test-swapped values race-free.
-	rt.mu.Lock()
-	if unit == nil || unit.store == nil || unit.lp == nil {
-		// The turn was claimed (and counted) but cannot launch; release the count.
-		rt.mu.Unlock()
-		rt.turnWG.Done()
-		return 0
-	}
-	// Reject a handoff whose turn context is already cancelled or whose
-	// runtime has closed. A cancel or shutdown can land after the caller's
-	// revalidation passed and before this call begins; accepting it would
-	// create and emit a turn for a dead handoff. Reject before anything is
-	// created or emitted, and unwind the claim the way the abort path above
-	// does — release the wait-group count and clear the busy flag (and the
-	// per-turn context) — so the unit is not left wedged. The clear is
-	// guarded like the deferred cleanup's: only a claim the unit still holds
-	// is unwound, so the receiving end never clears a claim it does not own.
-	if rt.closed || turnCtx.Err() != nil {
-		if unit.turnCtx == turnCtx {
+	refuse := func(err error) (int, error) {
+		// Clear only the claim the unit still holds, then cancel it: the
+		// receiving end never clears a claim it does not own, and a refused
+		// handoff must not outlive its context. Release exactly this launch's
+		// Add; a queued preseed Add stays owned by its closure's defer.
+		if unit != nil && unit.turnCtx == turnCtx {
 			unit.busy = false
 			unit.turnCancel = nil
 			unit.turnCtx = nil
 		}
-		rt.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
 		rt.turnWG.Done()
-		return 0
+		return 0, err
 	}
-	rt.mu.Unlock()
+	// A claimed-but-cannot-launch check reads unit fields that the owner
+	// mutates under rt.mu, so it runs inside the same locked section as the
+	// admission recheck below; in production these fields are immutable for a
+	// live unit, and the lock makes the test-swapped values race-free.
+	if unit == nil || unit.store == nil || unit.lp == nil || !unit.store.Active() {
+		return refuse(snapshot.ErrNoSession)
+	}
+	// The unit must still hold this handoff's claim: a later claim replaced
+	// the per-turn context, so committing would publish a turn under a claim
+	// the unit no longer owns. The refusal releases this launch's Add and
+	// leaves the newer claim untouched.
+	if unit.turnCtx != turnCtx {
+		return refuse(fmt.Errorf("agent: claimed turn context is no longer current"))
+	}
+	if rt.closed {
+		return refuse(errOwnerClosed)
+	}
+	// Reject a handoff whose turn context is already cancelled. A cancel can
+	// land after the caller's revalidation passed and before this call begins;
+	// accepting it would create and emit a turn for a dead handoff.
+	if err := turnCtx.Err(); err != nil {
+		return refuse(err)
+	}
+	// The exact live-map pointer must still be the claimed unit: a removal or
+	// re-registration would make the commit publish rows for a unit nothing
+	// owns. The id is empty only for a store that is not live, which the
+	// active check above already refused.
+	if id := sessionIDOf(unit); id != "" {
+		if live := a.sessions[id]; live != unit {
+			return refuse(fmt.Errorf("session %q is no longer live", id))
+		}
+	}
+	// Infallible commitment: nothing after this point may refuse or produce
+	// turn zero. The narrow local directory scan/create hold (BeginTurn) is
+	// accepted because the store cannot deactivate while the unit is busy and
+	// this lock is held, and it has no callback or reverse lock edge.
+	if admitted != nil {
+		admitted()
+	}
 	unit.syncEventOwner()
 	sessionID := sessionIDOf(unit)
 	projectID := unit.projectID
 	turn := unit.store.BeginTurn()
-
 	startEv := Event{Kind: EventTurnStart, SessionID: sessionID, ProjectID: projectID, Turn: turn}
-	rt.mu.Lock()
-	// Enqueue turn_start in a runtime.mu section — busy is already true under
-	// runtime.mu from the turn claim — so a capture observes busy consistent with the
-	// turn events it delivers.
+	// Enqueue turn_start in the runtime.mu section — busy is already true
+	// under runtime.mu from the turn claim — so a capture observes busy
+	// consistent with the turn events it delivers.
 	a.emitEvent(startEv)
 	a.ensureActiveModelForSessionLocked(unit)
 	a.applyUnitConfigLocked(unit)
 	a.setWarningGroup("setup", a.setupWarningsLocked())
-	rt.mu.Unlock()
+	return turn, nil
+}
+
+// launchCommittedTurn performs the post-commit handoff for a turn already
+// committed by startClaimedTurnLocked: it feeds the coordinator's turn_start,
+// updates the task-parent cancel state, and starts the turn goroutine. The
+// caller must hold no rt.mu and must pass the nonzero committed turn.
+func (rt *runtime) launchCommittedTurn(unit *session, turnCtx context.Context, cancel context.CancelFunc, contents []string, turn int) {
+	a := rt.agent
+	sessionID := sessionIDOf(unit)
+	projectID := unit.projectID
+	startEv := Event{Kind: EventTurnStart, SessionID: sessionID, ProjectID: projectID, Turn: turn}
 	feedTranscript(a.transcriptForSessionID(sessionID), startEv)
 
 	if unit.taskToolInst != nil {
@@ -3534,7 +3596,20 @@ func (rt *runtime) launchTurn(unit *session, turnCtx context.Context, cancel con
 		a.emitEvent(endEv)
 		rt.mu.Unlock()
 	}()
+}
 
+// launchTurn starts a claimed turn through the shared commitment helper with
+// a nil callback. It is the signal scheduler's entry point and the direct
+// test-call contract: lock, commit under the same hold, unlock, then hand the
+// committed turn to launchCommittedTurn. It returns 0 on refusal.
+func (rt *runtime) launchTurn(unit *session, turnCtx context.Context, cancel context.CancelFunc, contents []string) int {
+	rt.mu.Lock()
+	turn, err := rt.startClaimedTurnLocked(unit, turnCtx, cancel, contents, nil)
+	rt.mu.Unlock()
+	if err != nil {
+		return 0
+	}
+	rt.launchCommittedTurn(unit, turnCtx, cancel, contents, turn)
 	return turn
 }
 
@@ -3562,6 +3637,32 @@ func (a *Agent) CancelSession(sessionID string) error {
 	}
 	rt.mu.Unlock()
 	return err
+}
+
+// CancelBusySession cancels the turn of exactly one live, busy session and
+// reports whether it did. It inspects only the exact live map entry — no bare
+// id resolution, no disk scan, no backend-current fallback, no Agent.Busy —
+// so a session another process drives (read-only here), a missing id, or a
+// live but idle unit returns false and the caller keeps its non-cancel
+// disposition (the CLI's exit 130). The permission-gate cancellation mirrors
+// CancelSession.
+func (a *Agent) CancelBusySession(sessionID string) (bool, error) {
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	unit := a.sessions[sessionID]
+	if unit == nil || unit.store == nil || !unit.store.Active() || unit.store.SessionID() != sessionID || !unit.busy {
+		rt.mu.Unlock()
+		return false, nil
+	}
+	cancel := rt.turnCancelSnapshotLocked(unit)
+	rt.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if a.gate != nil {
+		a.gate.CancelSession(sessionID)
+	}
+	return true, nil
 }
 
 // Busy reports whether a turn is in progress.
