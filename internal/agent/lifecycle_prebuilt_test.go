@@ -97,7 +97,7 @@ func TestLifecycleReturnsPrebuiltReplacement(t *testing.T) {
 		appendUserTurn(t, a, "third")
 		id := a.SessionCurrent().ID
 		var got []HydrationState
-		if _, err := a.ApplyTurnActionForSessionWithBoundary(id, clicked, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string) {
+		if _, err := a.ApplyTurnActionForSessionWithBoundary(id, clicked, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
 			got = append(got, hs)
 		}); err != nil {
 			t.Fatalf("ApplyTurnActionForSessionWithBoundary revert: %v", err)
@@ -118,7 +118,7 @@ func TestLifecycleReturnsPrebuiltReplacement(t *testing.T) {
 		appendUserTurn(t, a, "after")
 		id := a.SessionCurrent().ID
 		var got []HydrationState
-		result, err := a.ApplyTurnActionForSessionWithBoundary(id, clicked, TurnActionFork, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string) {
+		result, err := a.ApplyTurnActionForSessionWithBoundary(id, clicked, TurnActionFork, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
 			got = append(got, hs)
 		})
 		if err != nil {
@@ -204,7 +204,7 @@ func TestLifecycleReturnsPrebuiltReplacement(t *testing.T) {
 		var got []HydrationState
 		forkDone := make(chan error, 1)
 		go func() {
-			_, err := a.ApplyTurnActionForSessionWithBoundary(id, clicked, TurnActionFork, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string) {
+			_, err := a.ApplyTurnActionForSessionWithBoundary(id, clicked, TurnActionFork, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
 				got = append(got, hs)
 			})
 			forkDone <- err

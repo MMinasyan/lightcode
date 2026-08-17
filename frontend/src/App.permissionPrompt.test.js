@@ -678,6 +678,163 @@ describe('App ordered presentation boundaries', () => {
   });
 });
 
+describe('App ordered turn-action outcomes', () => {
+  // revertHistoryBoundary is the ordered turn_action boundary a history revert
+  // publishes: the reverted session's complete state, the input prefill, the
+  // kept-files notice, and the warning, in that order.
+  function revertHistoryBoundary(overrides = {}) {
+    return {
+      state: { ...navState(), session: { id: 's1' } },
+      prefill: 'draft text',
+      skippedFiles: [{ path: 'x.txt', reason: 'outside session' }],
+      warning: 'committed sync failure',
+      ...overrides,
+    };
+  }
+
+  // mountRevertInFlight seeds a session with a user row, opens the revert
+  // history confirm flow, and holds the ApplyTurnAction promise unresolved so
+  // the test can drive the boundary and the promise settle in either order.
+  async function mountRevertInFlight() {
+    let resolveRevert;
+    let rejectRevert;
+    backend.ApplyTurnAction = () => new Promise((resolve, reject) => {
+      resolveRevert = resolve;
+      rejectRevert = reject;
+    });
+    const { app, target } = await mountApp();
+    fire('navigation', { ...navState(), messages: [{ type: 'user', content: 'hello', turn: 1 }] });
+    await tick();
+    target.querySelector('.revert-icon').click();
+    await settle();
+    [...target.querySelectorAll('.revert-menu .menu-item')].find((b) => b.textContent === 'Revert history').click();
+    await tick();
+    target.querySelector('.confirm-btn.yes').click();
+    await settle();
+    return { app, target, resolveRevert, rejectRevert };
+  }
+
+  async function setDraftText(target, text) {
+    const ta = target.querySelector('textarea');
+    ta.value = text;
+    ta.dispatchEvent(new Event('input'));
+    await tick();
+  }
+
+  it('a history revert boundary applies prefill between the snapshot and the notices, never from the promise', async () => {
+    const { app, target, resolveRevert } = await mountRevertInFlight();
+
+    // The promise settles before the ordered boundary delivers: its result
+    // prefill must not be applied — the ordered boundary is the input prefill
+    // authority.
+    resolveRevert({ prefill: 'ignored by promise' });
+    await settle();
+    fire('turn_action', revertHistoryBoundary());
+    await tick();
+
+    expect(target.querySelector('textarea').value).toBe('draft text');
+    // The kept-files notice and the warning follow the state and the prefill
+    // in one ordered frame.
+    const order = [...target.querySelector('.message-list').children].map((el) => el.className);
+    const iUser = order.findIndex((c) => c.includes('message user'));
+    const iSys = order.findIndex((c) => c.includes('system-msg'));
+    const iErr = order.findIndex((c) => c.includes('error-msg'));
+    expect(iUser).toBeGreaterThanOrEqual(0);
+    expect(iSys).toBeGreaterThan(iUser);
+    expect(iErr).toBeGreaterThan(iSys);
+    const errs = [...target.querySelectorAll('.error-msg')];
+    expect(errs).toHaveLength(1);
+    expect(errs[0].textContent).toContain('committed sync failure');
+
+    unmount(app);
+  });
+
+  it('a legitimate empty prefill clears the composer', async () => {
+    const { app, target, resolveRevert } = await mountRevertInFlight();
+    await setDraftText(target, 'typed draft');
+
+    fire('turn_action', revertHistoryBoundary({ prefill: '' }));
+    await tick();
+    expect(target.querySelector('textarea').value).toBe('');
+
+    resolveRevert({});
+    await settle();
+    unmount(app);
+  });
+
+  it('a nil prefill (fork or code revert) leaves the composer untouched', async () => {
+    const { app, target, resolveRevert } = await mountRevertInFlight();
+    await setDraftText(target, 'typed draft');
+
+    fire('turn_action', { state: { ...navState(), session: { id: 's2' } }, skippedFiles: [] });
+    await tick();
+    expect(target.querySelector('textarea').value).toBe('typed draft');
+
+    resolveRevert({});
+    await settle();
+    unmount(app);
+  });
+
+  it('typed committed history settles to one warning when the boundary arrives first', async () => {
+    const { app, target, rejectRevert } = await mountRevertInFlight();
+
+    fire('turn_action', revertHistoryBoundary());
+    await tick();
+    rejectRevert(new Error('committed sync failure'));
+    await settle();
+
+    expect(target.querySelector('textarea').value).toBe('draft text');
+    const errs = [...target.querySelectorAll('.error-msg')];
+    expect(errs).toHaveLength(1);
+    expect(errs[0].textContent).toContain('committed sync failure');
+
+    unmount(app);
+  });
+
+  it('typed committed history settles to one warning when the rejection arrives first', async () => {
+    const { app, target, rejectRevert } = await mountRevertInFlight();
+
+    rejectRevert(new Error('committed sync failure'));
+    await settle();
+    fire('turn_action', revertHistoryBoundary());
+    await tick();
+
+    // The transient rejection error was replaced by the stateful boundary:
+    // exactly one warning remains, with the prefill applied.
+    expect(target.querySelector('textarea').value).toBe('draft text');
+    const errs = [...target.querySelectorAll('.error-msg')];
+    expect(errs).toHaveLength(1);
+    expect(errs[0].textContent).toContain('committed sync failure');
+
+    unmount(app);
+  });
+
+  it('an unrelated navigation between the rejection and the revert boundary stays deterministic', async () => {
+    const { app, target, rejectRevert } = await mountRevertInFlight();
+
+    // The unrelated navigation lands first: its generation advance suppresses
+    // the stale rejection on B...
+    fire('navigation', { ...navState(), session: { id: 'B' }, messages: [{ type: 'user', content: 'B row' }] });
+    await tick();
+    rejectRevert(new Error('committed sync failure'));
+    await settle();
+    expect(target.querySelector('.label.session').textContent).toBe('B');
+    expect(target.querySelector('.error-msg')).toBeNull();
+
+    // ...and the revert boundary still applies when delivered, as the ordered
+    // authority over the reverted session.
+    fire('turn_action', revertHistoryBoundary());
+    await tick();
+    expect(target.querySelector('.label.session').textContent).toBe('s1');
+    expect(target.querySelector('textarea').value).toBe('draft text');
+    const errs = [...target.querySelectorAll('.error-msg')];
+    expect(errs).toHaveLength(1);
+    expect(errs[0].textContent).toContain('committed sync failure');
+
+    unmount(app);
+  });
+});
+
 describe('App child link survives navigation', () => {
   it('a live subagent link on a parent tool row still opens the same child viewer after navigating away and back', async () => {
     const { app, target } = await mountApp();

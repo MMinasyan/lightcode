@@ -2,6 +2,8 @@ package snapshot
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -93,5 +95,28 @@ func TestSnapshotMetaBackwardsCompatibleWithoutCanonicalPath(t *testing.T) {
 	}
 	if got.OriginalPath != "/project/file.go" || got.CanonicalPath != "" || !got.Existed {
 		t.Fatalf("old snapshot meta decode = %+v, want original path with empty canonical path", got)
+	}
+}
+
+// TestCommittedMutationErrorErrorAndUnwrap covers the sole committed-error
+// class: Error surfaces the cause's text and Unwrap makes errors.Is/errors.As
+// reach it, including through one more wrapping layer. No real producer returns
+// it yet; later steps adopt the namespace producers.
+func TestCommittedMutationErrorErrorAndUnwrap(t *testing.T) {
+	cause := errors.New("durable mutation committed")
+	e := &CommittedMutationError{Err: cause}
+	if e.Error() != cause.Error() {
+		t.Fatalf("Error() = %q, want the cause text %q", e.Error(), cause.Error())
+	}
+	if !errors.Is(e, cause) {
+		t.Fatal("errors.Is must reach the wrapped cause through Unwrap")
+	}
+	var target *CommittedMutationError
+	if !errors.As(e, &target) || target != e {
+		t.Fatalf("errors.As must match the committed type, got %#v", target)
+	}
+	wrapped := fmt.Errorf("snapshot: %w", e)
+	if !errors.As(wrapped, &target) || target != e {
+		t.Fatalf("errors.As must reach the committed type through a wrapping layer, got %#v", target)
 	}
 }

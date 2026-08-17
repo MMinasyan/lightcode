@@ -84,7 +84,7 @@ func TestRevertPartialWalkReloadsLoopAndPublishesBoundary(t *testing.T) {
 	blockTurnDir(t, a, 7)
 
 	var got []HydrationState
-	result, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string) {
+	result, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
 		got = append(got, hs)
 	})
 	if err == nil {
@@ -199,7 +199,7 @@ func TestRevertPartialWalkReloadFailureEvictsUnit(t *testing.T) {
 
 	var got []HydrationState
 	var evictWarning string
-	_, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, warning string) {
+	_, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, warning string, _ *snapshot.CommittedMutationError, _ *string) {
 		got = append(got, hs)
 		evictWarning = warning
 	})
@@ -243,7 +243,7 @@ func TestRevertCompleteWalkReloadFailureEvictsUnit(t *testing.T) {
 	blockTurnMessages(t, a, 5)
 
 	var got []HydrationState
-	_, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string) {
+	_, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
 		got = append(got, hs)
 	})
 	// Restore the messages file before any assertion reads the surviving
@@ -346,7 +346,7 @@ func TestRevertFirstRemovalFailureKeepsQueue(t *testing.T) {
 
 	var boundaries int
 	var warnings []string
-	_, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(_ HydrationState, _ []snapshot.SkippedRevert, warning string) {
+	_, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(_ HydrationState, _ []snapshot.SkippedRevert, warning string, _ *snapshot.CommittedMutationError, _ *string) {
 		boundaries++
 		warnings = append(warnings, warning)
 	})
@@ -491,7 +491,7 @@ func TestRevertBelowCompactionBoundaryDropsRecordAndRendersFullHistory(t *testin
 	}
 
 	var got []HydrationState
-	if _, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string) {
+	if _, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
 		got = append(got, hs)
 	}); err != nil {
 		t.Fatalf("revert: %v", err)
@@ -535,7 +535,7 @@ func TestRevertCompactionRecordSyncFailurePublishesFullTurns(t *testing.T) {
 	defer func() { atomicfs.SyncDirFunc = nil }()
 
 	var got []HydrationState
-	_, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string) {
+	_, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
 		got = append(got, hs)
 	})
 	if err == nil {
@@ -601,7 +601,7 @@ func TestCombinedRevertNoOpCodePhaseFirstRemovalFailureIsPrecommit(t *testing.T)
 	blockTurnDir(t, a, 11)
 
 	var boundaries int
-	result, err := a.ApplyTurnActionForSessionWithBoundary(id, 11, TurnActionRevertHistory, true, func(_ HydrationState, _ []snapshot.SkippedRevert, _ string) {
+	result, err := a.ApplyTurnActionForSessionWithBoundary(id, 11, TurnActionRevertHistory, true, func(_ HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
 		boundaries++
 	})
 	if err == nil {
@@ -654,7 +654,7 @@ func TestCombinedRevertSkippedCodePhaseFirstRemovalFailureIsPrecommit(t *testing
 	blockTurnDir(t, a, 11)
 
 	var boundaries int
-	result, err := a.ApplyTurnActionForSessionWithBoundary(id, 11, TurnActionRevertHistory, true, func(_ HydrationState, _ []snapshot.SkippedRevert, _ string) {
+	result, err := a.ApplyTurnActionForSessionWithBoundary(id, 11, TurnActionRevertHistory, true, func(_ HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
 		boundaries++
 	})
 	if err == nil {
@@ -702,7 +702,7 @@ func TestCombinedRevertRestoredCodePhaseFirstRemovalFailureReconciles(t *testing
 
 	var boundaries int
 	var warning string
-	result, err := a.ApplyTurnActionForSessionWithBoundary(id, 11, TurnActionRevertHistory, true, func(_ HydrationState, _ []snapshot.SkippedRevert, w string) {
+	result, err := a.ApplyTurnActionForSessionWithBoundary(id, 11, TurnActionRevertHistory, true, func(_ HydrationState, _ []snapshot.SkippedRevert, w string, _ *snapshot.CommittedMutationError, _ *string) {
 		boundaries++
 		warning = w
 	})
@@ -746,7 +746,7 @@ func TestRevertWalkFailureBelowCompactionBoundaryRendersSurvivors(t *testing.T) 
 			blockTurnDir(t, a, failTurn)
 
 			var got []HydrationState
-			_, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string) {
+			_, err := a.ApplyTurnActionForSessionWithBoundary(id, 6, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
 				got = append(got, hs)
 			})
 			if err == nil {

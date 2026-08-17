@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 // TestWailsErrorFrameOmitsSequenceForSessionlessError verifies the error frame
@@ -690,7 +692,11 @@ func TestWailsOrderedDeliveryContract(t *testing.T) {
 // turn_action boundary frame it emits carries the warning: the adapter's
 // mapping from the boundary callback onto the frame is the link between the
 // owner's emit and the frontend's render, and losing it would drop the warning
-// on the desktop while the agent and frontend tests still pass.
+// on the desktop while the agent and frontend tests still pass. It also pins
+// the producer prefill semantics for fork at this layer: a real fork emits no
+// composer draft (Prefill == nil), unlike history revert whose ordered frame
+// carries its nonnil prepared prefill — direct event injection alone cannot
+// prove what the owner actually puts on the wire here.
 func TestWailsTurnActionFrameCarriesFailedRevertWarning(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("directory permissions do not block writes as root")
@@ -753,6 +759,9 @@ func TestWailsTurnActionFrameCarriesFailedRevertWarning(t *testing.T) {
 	}
 	if boundary.State == nil || boundary.State.Session.ID == "" || boundary.State.Session.ID == sourceID {
 		t.Fatalf("turn_action frame must carry the fork destination's state, got %#v", boundary.State)
+	}
+	if boundary.Prefill != nil {
+		t.Fatalf("fork turn_action prefill = %q, want nil: only history revert prepares a composer draft on its ordered frame", *boundary.Prefill)
 	}
 }
 
@@ -874,6 +883,199 @@ func TestWailsRevertHistoryPartialDisposition(t *testing.T) {
 	}
 }
 
+// committedHistoryService is a fake AdapterService proving the Wails
+// turn-action wrapper classifies a typed committed history failure with
+// errors.As: the boundary emits with the prepared state/warning/prefill/
+// committed error and the service returns the same wrapped error, so the
+// method stays a typed rejection while an ordinary partial error still
+// resolves as success because its boundary owns the warning.
+type committedHistoryService struct {
+	agent.AdapterService
+	committed bool
+}
+
+func (s *committedHistoryService) ApplyTurnActionForSessionWithBoundary(sessionID string, turn int, action string, alsoRevertCode bool, emit func(agent.HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (agent.TurnActionResult, error) {
+	prefill := "draft"
+	result := agent.TurnActionResult{
+		Action:         action,
+		Turn:           turn,
+		Prefill:        prefill,
+		Warning:        "committed sync failure",
+		SessionChanged: true,
+		Session:        agent.SessionSummary{ID: sessionID},
+	}
+	state := agent.HydrationState{Session: result.Session}
+	if s.committed {
+		committed := &snapshot.CommittedMutationError{Err: errors.New("committed sync failure")}
+		emit(state, nil, result.Warning, committed, &prefill)
+		return result, fmt.Errorf("wrap: %w", committed)
+	}
+	emit(state, nil, result.Warning, nil, &prefill)
+	return result, errors.New("ordinary partial failure")
+}
+
+// TestWailsCommittedHistoryRejectsWhileOrdinaryPartialResolves proves the
+// Wails turn-action wrapper distinguishes the typed committed-history failure
+// from the ordinary partial one through errors.As: each outcome settles to exactly
+// one stateful boundary and no adjacent "error" frame — under either frontend
+// schedule (boundary-first or rejection-first) both drain this same FIFO, so the
+// settled counts are what every consumer sees. The committed half rejects typed;
+// the ordinary partial half resolves as success with its warning on the boundary.
+func TestWailsCommittedHistoryRejectsWhileOrdinaryPartialResolves(t *testing.T) {
+	svc := &committedHistoryService{committed: true}
+	app := &App{svc: svc}
+	log := &wailsFrameLog{}
+	app.emitFn = log.append
+	app.startDelivery()
+	defer app.closeDelivery()
+	app.setCurrentSessionID("A")
+
+	_, err := app.ApplyTurnAction(1, agent.TurnActionRevertHistory, false)
+	var committed *snapshot.CommittedMutationError
+	if !errors.As(err, &committed) {
+		t.Fatalf("typed committed history = %v, want a wrapped CommittedMutationError rejection", err)
+	}
+	frame := waitForWailsFrame(t, log, "turn_action")
+	boundary, ok := frame.(turnActionBoundary)
+	if !ok {
+		t.Fatalf("turn_action frame payload is %T, want turnActionBoundary: %#v", frame, frame)
+	}
+	if boundary.Prefill == nil || *boundary.Prefill != "draft" {
+		t.Fatalf("boundary prefill = %#v, want the prepared nonnil prefill %q", boundary.Prefill, "draft")
+	}
+	if boundary.Warning != "committed sync failure" {
+		t.Fatalf("boundary warning = %q, want the prepared warning", boundary.Warning)
+	}
+	if boundary.State == nil || boundary.State.Session.ID != "A" {
+		t.Fatalf("boundary state = %#v, want the prepared session A", boundary.State)
+	}
+
+	counts := settledFrameCounts(t, log)
+	if n := counts["turn_action"]; n != 1 {
+		t.Fatalf("settled turn_action frames = %d, want exactly one stateful boundary: %#v", n, counts)
+	}
+	assertNoAdjacentErrorFrame(t, counts)
+
+	// Ordinary partial history still resolves as success: its single boundary owns
+	// the warning, and an adjacent direct error would duplicate it.
+	ordinary := &committedHistoryService{}
+	app2 := &App{svc: ordinary}
+	log2 := &wailsFrameLog{}
+	app2.emitFn = log2.append
+	app2.startDelivery()
+	defer app2.closeDelivery()
+	app2.setCurrentSessionID("A")
+	if _, err := app2.ApplyTurnAction(1, agent.TurnActionRevertHistory, false); err != nil {
+		t.Fatalf("ordinary partial history = %v, want success: the emitted frame owns the warning", err)
+	}
+	frame2 := waitForWailsFrame(t, log2, "turn_action")
+	boundary2, ok := frame2.(turnActionBoundary)
+	if !ok {
+		t.Fatalf("turn_action frame payload is %T, want turnActionBoundary: %#v", frame2, frame2)
+	}
+	if boundary2.State == nil || boundary2.State.Session.ID != "A" {
+		t.Fatalf("ordinary partial boundary state = %#v, want the prepared session A", boundary2.State)
+	}
+
+	counts2 := settledFrameCounts(t, log2)
+	if n := counts2["turn_action"]; n != 1 {
+		t.Fatalf("settled turn_action frames = %d, want exactly one stateful boundary: %#v", n, counts2)
+	}
+	assertNoAdjacentErrorFrame(t, counts2)
+}
+
+// TestWailsCodeRevertStaysNoticeOnly proves the desktop keeps its notice-only
+// code-revert surface: a code-only success publishes no complete state
+// boundary — the turn_action frame carries nil state with the skipped files,
+// exactly as before the owner started prebuilding the protocol boundary.
+func TestWailsCodeRevertStaysNoticeOnly(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes as root")
+	}
+	ag := newAppTestAgent(t)
+	app := &App{svc: ag, agent: ag}
+	log := &wailsFrameLog{}
+	app.emitFn = log.append
+	app.startup(context.Background())
+	seedAppCompleteTurns(t, ag, 1)
+	path := filepath.Join(ag.ProjectRoot(), "created.txt")
+	entryID, _, err := ag.Store().SnapshotResolvedEntry(1, path, path)
+	if err != nil {
+		t.Fatalf("snapshot entry: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("created\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ag.Store().RecordSnapshotContent(1, entryID, []byte("created\n")); err != nil {
+		t.Fatalf("record snapshot content: %v", err)
+	}
+	// Diverging the file's identity after the snapshot makes the restore skip
+	// it, so the notice has skipped files to carry.
+	if err := os.WriteFile(path, []byte("diverged\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := app.ApplyTurnAction(1, agent.TurnActionRevertCode, false)
+	if err != nil {
+		t.Fatalf("ApplyTurnAction code revert = %v, want success", err)
+	}
+	if len(result.SkippedFiles) == 0 {
+		t.Fatalf("code revert result = %#v, want at least one skipped file", result)
+	}
+
+	frame := waitForWailsFrame(t, log, "turn_action")
+	boundary, ok := frame.(turnActionBoundary)
+	if !ok {
+		t.Fatalf("turn_action frame payload is %T, want turnActionBoundary: %#v", frame, frame)
+	}
+	if boundary.State != nil {
+		t.Fatalf("code revert boundary state = %#v, want nil (notice-only, no complete state)", boundary.State)
+	}
+	if boundary.Prefill != nil {
+		t.Fatalf("code revert boundary prefill = %#v, want nil", boundary.Prefill)
+	}
+	if !reflect.DeepEqual(boundary.SkippedFiles, result.SkippedFiles) {
+		t.Fatalf("code revert boundary skipped = %#v, want the result's %#v", boundary.SkippedFiles, result.SkippedFiles)
+	}
+}
+
+// TestWailsHistoryEmptyPrefillIsNonnil proves the producer-side prefill disposition end to end: a history revert whose clicked user message is legitimately empty emits a non-nil EMPTY boundary prefill through the real Agent and Wails delivery — distinct from fork/code-revert's nil (TestWailsCodeRevertStaysNoticeOnly). The frontend event-injection tests only prove consumer application; this exercises the actual producer that builds the pointer.
+func TestWailsHistoryEmptyPrefillIsNonnil(t *testing.T) {
+	ag := newAppTestAgent(t)
+	app := &App{svc: ag, agent: ag}
+	log := &wailsFrameLog{}
+	app.emitFn = log.append
+	app.startup(context.Background())
+	seedAppCompleteTurns(t, ag, 1)
+	// The clicked turn's user message is legitimately empty content.
+	if _, err := ag.AppendUserMessage(""); err != nil {
+		t.Fatalf("append empty user message: %v", err)
+	}
+
+	result, err := app.ApplyTurnAction(2, agent.TurnActionRevertHistory, false)
+	if err != nil {
+		t.Fatalf("ApplyTurnAction history revert = %v, want success (the boundary owns every notice)", err)
+	}
+	if result.Prefill != "" {
+		t.Fatalf("result prefill = %q, want the empty clicked message", result.Prefill)
+	}
+
+	frame := waitForWailsFrame(t, log, "turn_action")
+	boundary, ok := frame.(turnActionBoundary)
+	if !ok {
+		t.Fatalf("turn_action frame payload is %T, want turnActionBoundary: %#v", frame, boundary)
+	}
+	if boundary.State == nil || boundary.State.Session.ID != result.Session.ID {
+		t.Fatalf("history revert boundary state = %#v, want the reverted session's complete state", boundary.State)
+	}
+	if boundary.Prefill == nil {
+		t.Fatal("empty user message must emit a nonnil prefill pointer (it still clears the composer)")
+	}
+	if *boundary.Prefill != "" {
+		t.Fatalf("boundary prefill = %q, want empty content for an empty clicked message", *boundary.Prefill)
+	}
+}
+
 type wailsTestFrame struct {
 	name    string
 	payload any
@@ -925,6 +1127,85 @@ func wailsFrameIndex(t *testing.T, log *wailsFrameLog, name string) int {
 		t.Fatalf("frame %q not present", name)
 	}
 	return idx
+}
+
+// settledFrameCounts waits until the delivery FIFO stops producing new frames,
+// then returns per-name counts of everything drained so far. An "exactly N" or
+// "no adjacent error frame" assertion is only sound once no further enqueue can
+// still be in flight behind it — both turn-action schedules (boundary-first and
+// rejection-first) drain through this same FIFO, so the settled counts are what
+// either schedule will see.
+func settledFrameCounts(t *testing.T, log *wailsFrameLog) map[string]int {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		counts := snapshotFrameCounts(log)
+		time.Sleep(20 * time.Millisecond)
+		log.mu.Lock()
+		n := len(log.frames)
+		stable := n == countTotal(counts) && countsEqual(snapshotFrameCountsLocked(log), counts)
+		frames := append([]wailsTestFrame(nil), log.frames...)
+		log.mu.Unlock()
+		if stable {
+			return counts
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delivery FIFO never settled; frames: %#v", frames)
+		}
+	}
+}
+
+func snapshotFrameCounts(log *wailsFrameLog) map[string]int {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	return countFramesLocked(log)
+}
+
+// countsEqual compares two per-name frame count maps.
+func countsEqual(a, b map[string]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// countTotal sums the per-name frame counts.
+func countTotal(counts map[string]int) int {
+	total := 0
+	for _, n := range counts {
+		total += n
+	}
+	return total
+}
+
+// snapshotFrameCountsLocked re-counts under a lock the caller already holds.
+func snapshotFrameCountsLocked(log *wailsFrameLog) map[string]int {
+	return countFramesLocked(log)
+}
+
+// countFramesLocked builds per-name counts; callers must hold log.mu.
+func countFramesLocked(log *wailsFrameLog) map[string]int {
+	counts := make(map[string]int, len(log.frames))
+	for _, f := range log.frames {
+		counts[f.name]++
+	}
+	return counts
+}
+
+// assertNoAdjacentErrorFrame fails when the settled frame set carries any Wails
+// error frame next to a turn-action boundary: for history and fork outcomes the
+// ordered boundary owns every warning, so an adjacent error frame would make
+// both frontend schedules render it twice.
+func assertNoAdjacentErrorFrame(t *testing.T, counts map[string]int) {
+	t.Helper()
+	if n := counts["error"]; n != 0 {
+		t.Fatalf("settled frames carry %d \"error\" frame(s), want none: the ordered boundary owns its warning %#v", n, counts)
+	}
 }
 
 // wailsPermissionPendingApp wires a Wails app whose first turn asks a read_file

@@ -580,12 +580,16 @@ func (a *App) handleEvent(ev agent.Event) {
 
 // turnActionBoundary is the ordered frame a fork, history revert, or code revert
 // appends through the delivery FIFO: the destination session's complete state (nil
-// when the action changed no session), any files a code revert kept unchanged, and
-// the warning a fork carries when its best-effort code revert failed. The ordered
-// consumer applies the state, the skip notice, and the warning in that order, so no
-// live frame interleaves between them or clobbers either notice.
+// when the action changed no session), the history revert's input prefill (nil for
+// fork and code revert; a nonnil pointer even when the content is empty, so an
+// empty string still clears the composer), any files a code revert kept unchanged,
+// and the warning a fork carries when its best-effort code revert failed. The
+// ordered consumer applies the state, the prefill, the skip notice, and the
+// warning in that order, so no live frame interleaves between them or clobbers
+// either notice.
 type turnActionBoundary struct {
 	State        *agent.HydrationState    `json:"state"`
+	Prefill      *string                  `json:"prefill,omitempty"`
 	SkippedFiles []snapshot.SkippedRevert `json:"skippedFiles"`
 	Warning      string                   `json:"warning,omitempty"`
 }
@@ -953,10 +957,10 @@ func (a *App) RevertCode(turn int) (snapshot.RevertResult, error) {
 // state, any code-revert skip notice, and a fork's failed-code-revert warning as one
 // ordered boundary, so state and notices apply together and no live frame
 // interleaves between them.
-func (a *App) turnActionBoundaryEmit() func(agent.HydrationState, []snapshot.SkippedRevert, string) {
-	return func(state agent.HydrationState, skipped []snapshot.SkippedRevert, warning string) {
+func (a *App) turnActionBoundaryEmit() func(agent.HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string) {
+	return func(state agent.HydrationState, skipped []snapshot.SkippedRevert, warning string, _ *snapshot.CommittedMutationError, prefill *string) {
 		a.setCurrentSessionID(state.Session.ID)
-		a.enqueueBoundary("turn_action", turnActionBoundary{State: &state, SkippedFiles: skipped, Warning: warning}, "", state.Session.ID)
+		a.enqueueBoundary("turn_action", turnActionBoundary{State: &state, Prefill: prefill, SkippedFiles: skipped, Warning: warning}, "", state.Session.ID)
 	}
 }
 
@@ -966,16 +970,37 @@ func (a *App) turnActionBoundaryEmit() func(agent.HydrationState, []snapshot.Ski
 // failed after the boundary published the survivors — then resolves the method
 // as success: the ordered turn_action frame owns the error through its warning,
 // and a second, unowned direct error would duplicate it in the frontend. A
+// typed committed history failure (wrapped CommittedMutationError) is the
+// exception: it emits its warning-bearing boundary but rejects, so the typed
+// outcome reaches the frontend while no adjacent error frame is enqueued. A
 // precommit error emits no frame and still rejects/returns; the typed return
-// error is kept for the ACP/CLI disposition.
+// error is kept for the ACP/CLI disposition. A code-only revert's complete
+// boundary is prepared for the protocol consumer; Wails suppresses it and keeps
+// its existing notice-only result/skips surface.
 func (a *App) applyTurnActionWithOwnedBoundary(sessionID string, turn int, action string, alsoRevertCode bool) (agent.TurnActionResult, error) {
 	var emitted bool
-	result, err := a.svc.ApplyTurnActionForSessionWithBoundary(sessionID, turn, action, alsoRevertCode, func(state agent.HydrationState, skipped []snapshot.SkippedRevert, warning string) {
+	result, err := a.svc.ApplyTurnActionForSessionWithBoundary(sessionID, turn, action, alsoRevertCode, func(state agent.HydrationState, skipped []snapshot.SkippedRevert, warning string, committed *snapshot.CommittedMutationError, prefill *string) {
 		emitted = true
+		if action == agent.TurnActionRevertCode {
+			// A code-only revert changes no session; the owner's complete
+			// boundary serves the protocol consumer, and the desktop keeps its
+			// existing notice-only delivery of the skip notice.
+			return
+		}
 		a.setCurrentSessionID(state.Session.ID)
-		a.enqueueBoundary("turn_action", turnActionBoundary{State: &state, SkippedFiles: skipped, Warning: warning}, "", state.Session.ID)
+		a.enqueueBoundary("turn_action", turnActionBoundary{State: &state, Prefill: prefill, SkippedFiles: skipped, Warning: warning}, "", state.Session.ID)
 	})
 	if err != nil && emitted {
+		var committed *snapshot.CommittedMutationError
+		if errors.As(err, &committed) {
+			// A typed committed history failure stays a typed rejection: its
+			// boundary owns the warning, and the frontend settles to exactly
+			// one warning through the ordered frame.
+			return result, err
+		}
+		// Ordinary partial history resolves as success: the ordered turn_action
+		// frame owns the error through its warning, and a second, unowned
+		// direct error would duplicate it in the frontend.
 		return result, nil
 	}
 	return result, err
@@ -1020,9 +1045,11 @@ func (a *App) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (age
 		return result, err
 	}
 	if !result.SessionChanged {
-		// A code-only revert changes no session, so the owner emits no boundary;
-		// deliver its skip notice through the same ordered FIFO so a queued refresh
-		// cannot clobber it.
+		// A code-only revert changes no routing: the owner publishes its prebuilt
+		// complete boundary through the in-commit callback and ACP consumes it
+		// before responding, while applyTurnActionWithOwnedBoundary suppresses that
+		// full state here. Deliver Wails's own skip notice as an ordered frame so a
+		// queued refresh cannot clobber it.
 		a.emitTurnActionNotice(result.SkippedFiles)
 	}
 	return result, nil

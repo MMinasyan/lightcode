@@ -90,6 +90,20 @@ type SkippedRevert struct {
 	Reason string `json:"reason"`
 }
 
+// CommittedMutationError marks an operation whose durable mutation committed
+// before the caller's error returned: the failure is typed so a shared adapter
+// can distinguish an already-committed outcome — whose boundary already owns
+// the prepared state and warning — from a precommit failure that emitted
+// nothing. No producer returns it yet; namespace producers adopt it in later
+// steps.
+type CommittedMutationError struct {
+	Err error
+}
+
+func (e *CommittedMutationError) Error() string { return e.Err.Error() }
+
+func (e *CommittedMutationError) Unwrap() error { return e.Err }
+
 // CompactionRecord is persisted to compaction.json when context
 // lifecycle management summarizes the conversation.
 type CompactionRecord struct {

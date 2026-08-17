@@ -34,10 +34,15 @@ type Response struct {
 	Error   *RPCError `json:"error,omitempty"`
 }
 
-// RPCError is a JSON-RPC 2.0 error object.
+// RPCError is a JSON-RPC 2.0 error object. Data is boundary-based: whenever a
+// committed/partial operation emitted a typed result boundary, the same prepared
+// result rides here, so a consumer that observed the boundary gets the identical
+// payload. History/fork carry the prepared TurnActionResult; new carries the
+// prepared SessionSummary; archive/delete and every precommit failure omit data.
 type RPCError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
 }
 
 // Notification is an outgoing JSON-RPC 2.0 notification (no id).
@@ -962,9 +967,14 @@ func (r *Runner) handleTurnAction(req Request, action string) {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	// The owner publishes the session-changing revert/fork boundary in-commit before
-	// the response; a code-only revert changes no session and emits nothing.
-	result, err := r.agent.ApplyTurnActionForSessionWithBoundary(sessionID, params.Turn, action, params.AlsoRevertCode, func(state agent.HydrationState, _ []snapshot.SkippedRevert, _ string) {
+	// The owner publishes the session-changing revert/fork boundary in-commit
+	// before the response; a code-only revert publishes its complete state the
+	// same way. The handler records whether the callback emitted so a
+	// post-boundary error can ride the same prepared result as error data,
+	// while a precommit failure stays bare.
+	emitted := false
+	result, err := r.agent.ApplyTurnActionForSessionWithBoundary(sessionID, params.Turn, action, params.AlsoRevertCode, func(state agent.HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
+		emitted = true
 		id := strings.TrimSpace(state.Session.ID)
 		r.setCurrent(id, state.Session)
 		r.sendBoundary(Notification{
@@ -974,7 +984,14 @@ func (r *Runner) handleTurnAction(req Request, action string) {
 		}, id)
 	})
 	if err != nil {
-		r.respondError(req.ID, -32000, err.Error())
+		if emitted {
+			// Partial/committed history and fork return boundary-before-error:
+			// the same prepared result the boundary was built from goes in
+			// error.data.
+			r.respondErrorData(req.ID, -32000, err.Error(), result)
+		} else {
+			r.respondError(req.ID, -32000, err.Error())
+		}
 		return
 	}
 	r.respond(req.ID, result)
@@ -1216,7 +1233,13 @@ func (r *Runner) respond(id any, result any) {
 }
 
 func (r *Runner) respondError(id any, code int, msg string) {
-	r.sendResponse(Response{JSONRPC: "2.0", ID: id, Error: &RPCError{Code: code, Message: msg}})
+	r.respondErrorData(id, code, msg, nil)
+}
+
+// respondErrorData emits an error response whose data rides the same prepared
+// result the emitted boundary was built from; a nil data keeps the error bare.
+func (r *Runner) respondErrorData(id any, code int, msg string, data any) {
+	r.sendResponse(Response{JSONRPC: "2.0", ID: id, Error: &RPCError{Code: code, Message: msg, Data: data}})
 }
 
 func (r *Runner) sendResponse(resp Response) {
