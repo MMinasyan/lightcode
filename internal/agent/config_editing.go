@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -12,6 +14,22 @@ import (
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 )
+
+func decodeJSONUseNumber(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("unexpected trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
 
 // GetProviderConfig returns the merged effective config of a provider and its
 // models for the config editor. Read-only.
@@ -129,14 +147,14 @@ func (a *Agent) bundledModelIDsLocked() map[string]map[string]struct{} {
 
 // discoveryCacheLocked reads the discovery cache (best-effort; empty on error).
 // Caller holds the runtime mutex.
-func (a *Agent) discoveryCacheLocked() map[string]catalog.DiscoveredProvider {
-	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
-	return cache
+func (a *Agent) discoveryCacheLocked() map[string]catalog.DiscoveryRecord {
+	records, _ := catalog.ReadDiscoveryCache(a.home)
+	return records
 }
 
 // classifyModelSource returns a model's provenance. Discovery never adds models
 // to non-bundled providers, so every model under a custom provider is user-added.
-func classifyModelSource(prov *catalog.Provider, modelID string, bundled map[string]map[string]struct{}, disc map[string]catalog.DiscoveredProvider) string {
+func classifyModelSource(prov *catalog.Provider, modelID string, bundled map[string]map[string]struct{}, disc map[string]catalog.DiscoveryRecord) string {
 	if prov == nil || !prov.Builtin {
 		return modelSourceUser
 	}
@@ -145,8 +163,8 @@ func classifyModelSource(prov *catalog.Provider, modelID string, bundled map[str
 			return modelSourceBundled
 		}
 	}
-	if dp, ok := disc[prov.ID]; ok {
-		if _, isDiscovered := dp.Models[modelID]; isDiscovered {
+	if record, ok := disc[prov.ID]; ok && record.BoundTo(prov.Transport) {
+		if _, isDiscovered := record.Models[modelID]; isDiscovered {
 			return modelSourceDiscovered
 		}
 	}
@@ -510,6 +528,7 @@ func (a *Agent) resetModelFieldLocked(providerID, modelID, field string) (bool, 
 type providerConfigCandidate struct {
 	providerID string
 	root       map[string]any
+	transport  catalog.Transport
 }
 
 // SetProviderConfig edits an existing provider's transport and provider-level
@@ -527,7 +546,7 @@ func (a *Agent) SetProviderConfig(providerID string, cfg ProviderConfigInput) er
 	if err != nil {
 		return err
 	}
-	attempted, discovered, warnings, err := a.discoverProviderCandidate(candidate)
+	attempted, discovered, warnings, err := a.discoverProviderCandidate(&candidate)
 	if err != nil {
 		return err
 	}
@@ -595,7 +614,7 @@ func (a *Agent) prepareSetProviderConfigLocked(providerID string, cfg ProviderCo
 		return providerConfigCandidate{}, err
 	}
 	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
+	if err := decodeJSONUseNumber(data, &root); err != nil {
 		return providerConfigCandidate{}, fmt.Errorf("parse config %s: %w", a.configPath, err)
 	}
 	if err := mutateProviderConfigRoot(root, providerID, func(pm map[string]any) error {
@@ -615,7 +634,7 @@ func (a *Agent) prepareSetProviderConfigLocked(providerID string, cfg ProviderCo
 	if err != nil {
 		return providerConfigCandidate{}, err
 	}
-	if err := json.Unmarshal(normalized, &root); err != nil {
+	if err := decodeJSONUseNumber(normalized, &root); err != nil {
 		return providerConfigCandidate{}, err
 	}
 	if !prov.Builtin {
@@ -660,7 +679,7 @@ func mutateProviderConfigRoot(root map[string]any, providerID string, mutate fun
 // fetches /models through the candidate transport. Fetch performs no config,
 // attempt, cache, or owner-state write; the caller publishes those under the
 // final lock hold.
-func (a *Agent) discoverProviderCandidate(candidate providerConfigCandidate) (attempted bool, discovered *catalog.DiscoveredProvider, warnings []catalog.Warning, err error) {
+func (a *Agent) discoverProviderCandidate(candidate *providerConfigCandidate) (attempted bool, discovered *catalog.DiscoveredProvider, warnings []catalog.Warning, err error) {
 	providers, ok := candidate.root["providers"].(map[string]any)
 	if !ok {
 		return false, nil, nil, fmt.Errorf("provider %q is unavailable after edit", candidate.providerID)
@@ -673,13 +692,14 @@ func (a *Agent) discoverProviderCandidate(candidate providerConfigCandidate) (at
 	if prov == nil {
 		return false, nil, nil, fmt.Errorf("provider %q is unavailable after edit", candidate.providerID)
 	}
-	if !providerConnected(prov) || !prov.Discovery {
+	candidate.transport = prov.Transport
+	if !catalog.DiscoveryTransportReady(prov, func(name string) bool { return os.Getenv(name) != "" }) {
 		return false, nil, nil, nil
 	}
-	_, attempts, _ := catalog.ReadDiscoveryCache(a.home)
+	records, _ := catalog.ReadDiscoveryCache(a.home)
 	now := time.Now().UTC()
 	due := false
-	for _, id := range catalog.DiscoveryRefreshCandidates(buildResult.Catalog, attempts, now) {
+	for _, id := range catalog.DiscoveryRefreshCandidates(buildResult.Catalog, records, now) {
 		if id == candidate.providerID {
 			due = true
 			break
@@ -737,18 +757,25 @@ func (a *Agent) commitProviderConfigCandidateLocked(candidate providerConfigCand
 			}
 		}
 	}
+	data, err := os.ReadFile(a.configPath)
+	if err != nil {
+		return fmt.Errorf("read current config %s: %w", a.configPath, err)
+	}
+	var persistedRoot map[string]any
+	if err := decodeJSONUseNumber(data, &persistedRoot); err != nil {
+		return fmt.Errorf("parse current config %s: %w", a.configPath, err)
+	}
+	persistedProviders, ok := persistedRoot["providers"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("provider %q is unavailable in current config", candidate.providerID)
+	}
+	persistedProvider, ok := persistedProviders[candidate.providerID].(map[string]any)
+	if !ok {
+		return fmt.Errorf("provider %q is unavailable in current config", candidate.providerID)
+	}
 	persistedEnv := ""
-	if data, err := os.ReadFile(a.configPath); err == nil {
-		var persistedRoot map[string]any
-		if err := json.Unmarshal(data, &persistedRoot); err == nil {
-			if providers, ok := persistedRoot["providers"].(map[string]any); ok {
-				if pm, ok := providers[candidate.providerID].(map[string]any); ok {
-					if tr, ok := pm["transport"].(map[string]any); ok {
-						persistedEnv, _ = tr["api_key_env"].(string)
-					}
-				}
-			}
-		}
+	if tr, ok := persistedProvider["transport"].(map[string]any); ok {
+		persistedEnv, _ = tr["api_key_env"].(string)
 	}
 	if candidateEnv != persistedEnv {
 		if providerConnected(prov) {
@@ -761,8 +788,7 @@ func (a *Agent) commitProviderConfigCandidateLocked(candidate providerConfigCand
 	if err := a.writeAgentConfigLocked(candidate.root); err != nil {
 		return err
 	}
-	var err error
-	warnings, err = a.publishDiscoveryOutcomeLocked(candidate.providerID, attempted, discovered, warnings)
+	warnings, err = a.publishDiscoveryOutcomeLocked(candidate.providerID, candidate.transport, attempted, discovered, warnings)
 	if err != nil {
 		return err
 	}
@@ -781,7 +807,7 @@ func (a *Agent) commitProviderConfigCandidateLocked(candidate providerConfigCand
 // cache, a failed fetch writes only the attempt marker. Contention or write
 // failure produces a discovery_failure warning and leaves discovery due;
 // nothing blocks on a foreign discovery-lock holder. Caller holds runtime.mu.
-func (a *Agent) publishDiscoveryOutcomeLocked(providerID string, attempted bool, discovered *catalog.DiscoveredProvider, warnings []catalog.Warning) ([]catalog.Warning, error) {
+func (a *Agent) publishDiscoveryOutcomeLocked(providerID string, transport catalog.Transport, attempted bool, discovered *catalog.DiscoveredProvider, warnings []catalog.Warning) ([]catalog.Warning, error) {
 	if !attempted {
 		return warnings, nil
 	}
@@ -789,7 +815,7 @@ func (a *Agent) publishDiscoveryOutcomeLocked(providerID string, attempted bool,
 		return warnings, err
 	}
 	if discovered != nil {
-		ok, err := catalog.TryWriteDiscoveryCache(a.home, providerID, *discovered, time.Now().UTC())
+		ok, err := catalog.TryWriteDiscoveryCache(a.home, providerID, transport, *discovered, time.Now().UTC())
 		if err != nil {
 			return append(warnings, catalog.Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)}), nil
 		}
@@ -798,7 +824,7 @@ func (a *Agent) publishDiscoveryOutcomeLocked(providerID string, attempted bool,
 		}
 		return warnings, nil
 	}
-	ok, err := catalog.TryWriteDiscoveryAttempt(a.home, providerID, time.Now().UTC())
+	ok, err := catalog.TryWriteDiscoveryAttempt(a.home, providerID, transport, time.Now().UTC())
 	if err != nil {
 		return append(warnings, catalog.Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery attempt: %v", err)}), nil
 	}
@@ -892,7 +918,7 @@ func (a *Agent) ResetProviderField(providerID, field string) error {
 	if !changed {
 		return nil
 	}
-	attempted, discovered, warnings, err := a.discoverProviderCandidate(candidate)
+	attempted, discovered, warnings, err := a.discoverProviderCandidate(&candidate)
 	if err != nil {
 		return err
 	}
@@ -931,7 +957,7 @@ func (a *Agent) prepareResetProviderFieldLocked(providerID, field string) (provi
 		return providerConfigCandidate{}, false, err
 	}
 	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
+	if err := decodeJSONUseNumber(data, &root); err != nil {
 		return providerConfigCandidate{}, false, fmt.Errorf("parse config %s: %w", a.configPath, err)
 	}
 	changed := false
@@ -959,7 +985,7 @@ func (a *Agent) prepareResetProviderFieldLocked(providerID, field string) (provi
 	if err != nil {
 		return providerConfigCandidate{}, false, err
 	}
-	if err := json.Unmarshal(normalized, &root); err != nil {
+	if err := decodeJSONUseNumber(normalized, &root); err != nil {
 		return providerConfigCandidate{}, false, err
 	}
 	if prov := a.catalog.Providers[providerID]; prov != nil && !prov.Builtin {
@@ -1022,6 +1048,7 @@ type warmEditOutcome struct {
 	attempted  bool
 	discovered *catalog.DiscoveredProvider
 	warnings   []catalog.Warning
+	transport  catalog.Transport
 }
 
 // planWarmSettingsEdit runs the first phase of a settings edit's
@@ -1036,15 +1063,12 @@ func (a *Agent) planWarmSettingsEdit() (warmEditPlan, error) {
 		rt.mu.Unlock()
 		return warmEditPlan{}, err
 	}
-	_, attempts, _ := catalog.ReadDiscoveryCache(a.home)
+	records, _ := catalog.ReadDiscoveryCache(a.home)
 	now := time.Now().UTC()
 	var providers []*catalog.Provider
-	for _, providerID := range catalog.DiscoveryRefreshCandidates(modelCatalog, attempts, now) {
+	for _, providerID := range catalog.DiscoveryRefreshCandidates(modelCatalog, records, now) {
 		prov := modelCatalog.Providers[providerID]
-		if prov == nil || !providerConnected(prov) {
-			continue
-		}
-		if prov.Transport.APIKeyEnv != "" && os.Getenv(prov.Transport.APIKeyEnv) == "" {
+		if prov == nil || !catalog.DiscoveryTransportReady(prov, func(name string) bool { return os.Getenv(name) != "" }) {
 			continue
 		}
 		providers = append(providers, prov)
@@ -1060,7 +1084,7 @@ func (a *Agent) fetchWarmSettingsEditDiscovery(plan warmEditPlan) map[string]war
 	outcomes := make(map[string]warmEditOutcome, len(plan.providers))
 	for _, prov := range plan.providers {
 		attempted, discovered, warnings := catalog.FetchDiscoveryIfDue(context.Background(), a.home, prov, time.Now().UTC())
-		outcomes[prov.ID] = warmEditOutcome{attempted: attempted, discovered: discovered, warnings: warnings}
+		outcomes[prov.ID] = warmEditOutcome{attempted: attempted, discovered: discovered, warnings: warnings, transport: prov.Transport}
 	}
 	return outcomes
 }
@@ -1074,7 +1098,7 @@ func (a *Agent) publishWarmEditDiscovery(plan warmEditPlan, outcomes map[string]
 		outcome := outcomes[prov.ID]
 		warnings = append(warnings, outcome.warnings...)
 		var err error
-		warnings, err = a.publishDiscoveryOutcomeLocked(prov.ID, outcome.attempted, outcome.discovered, warnings)
+		warnings, err = a.publishDiscoveryOutcomeLocked(prov.ID, outcome.transport, outcome.attempted, outcome.discovered, warnings)
 		if err != nil {
 			return warnings, err
 		}

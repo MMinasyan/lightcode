@@ -1,8 +1,10 @@
 package catalog
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -10,7 +12,7 @@ import (
 type BuildInputs struct {
 	Bundled map[string]json.RawMessage
 	UserRaw map[string]any
-	Cache   map[string]DiscoveredProvider
+	Records map[string]DiscoveryRecord
 }
 
 // DiscoveredProvider is provider metadata loaded from discovery cache.
@@ -74,7 +76,13 @@ func Build(inputs BuildInputs) BuildResult {
 		_, bundledProvider := bundled[providerID]
 		merged := DeepMergeCatalog(bundled[providerID], user[providerID])
 		applyProviderDefaults(providerID, merged)
-		applyDiscovery(providerID, merged, inputs.Cache[providerID], user[providerID], bundledProvider)
+		record := DiscoveryRecord{}
+		if transportRaw, ok := merged["transport"].(map[string]any); ok {
+			if candidate, exists := inputs.Records[providerID]; exists && candidate.BoundTo(rawToTransport(transportRaw)) {
+				record = candidate
+			}
+		}
+		applyDiscovery(providerID, merged, record, user[providerID], bundledProvider)
 		errs := ValidateRaw(providerID, merged, true)
 		if len(errs) != 0 {
 			result.Warnings = append(result.Warnings, validationWarning(providerID, "", warningKind(providerID, user), errs))
@@ -110,8 +118,20 @@ func decodeBundledProviders(raw map[string]json.RawMessage, result *BuildResult)
 	providers := map[string]map[string]any{}
 	for providerID, data := range raw {
 		var decoded map[string]any
-		if err := json.Unmarshal(data, &decoded); err != nil {
-			result.Warnings = append(result.Warnings, Warning{Kind: "bundled_config_skip", Provider: providerID, Message: fmt.Sprintf("parse bundled provider: %v", err)})
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.UseNumber()
+		decodeErr := decoder.Decode(&decoded)
+		if decodeErr == nil {
+			var trailing any
+			decodeErr = decoder.Decode(&trailing)
+			if decodeErr == nil {
+				decodeErr = fmt.Errorf("unexpected trailing JSON value")
+			} else if decodeErr == io.EOF {
+				decodeErr = nil
+			}
+		}
+		if decodeErr != nil {
+			result.Warnings = append(result.Warnings, Warning{Kind: "bundled_config_skip", Provider: providerID, Message: fmt.Sprintf("parse bundled provider: %v", decodeErr)})
 			continue
 		}
 		providers[providerID] = decoded
@@ -216,8 +236,8 @@ func applyProviderDefaults(providerID string, raw map[string]any) {
 	}
 }
 
-func applyDiscovery(providerID string, raw map[string]any, discovered DiscoveredProvider, userRaw map[string]any, bundledProvider bool) {
-	if len(discovered.Models) == 0 {
+func applyDiscovery(providerID string, raw map[string]any, record DiscoveryRecord, userRaw map[string]any, bundledProvider bool) {
+	if len(record.Models) == 0 {
 		return
 	}
 	discovery, ok := raw["discovery"].(bool)
@@ -232,7 +252,7 @@ func applyDiscovery(providerID string, raw map[string]any, discovered Discovered
 	} else if !ok {
 		return
 	}
-	for modelID, modelDiscovery := range discovered.Models {
+	for modelID, modelDiscovery := range record.Models {
 		modelRaw, ok := models[modelID].(map[string]any)
 		if !ok {
 			if !bundledProvider {

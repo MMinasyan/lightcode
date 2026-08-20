@@ -201,12 +201,12 @@ func TestConnectProviderDiscoveryLockContentionReturnsBeforeEnvOrReload(t *testi
 		t.Fatal("ConnectProvider blocked on the foreign discovery lock; the cache publication must be one-attempt Try")
 	}
 	// No cache or attempt publication.
-	cache, attempts, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	if _, ok := cache["disc"]; ok {
 		t.Fatalf("contended ConnectProvider wrote the discovery cache: %#v", cache["disc"])
 	}
-	if _, ok := attempts["disc"]; ok {
-		t.Fatalf("contended ConnectProvider wrote a discovery attempt: %#v", attempts)
+	if record, ok := cache["disc"]; ok && !record.AttemptedAt.IsZero() {
+		t.Fatalf("contended ConnectProvider wrote a discovery attempt: %#v", record)
 	}
 	// No env publication.
 	if _, set := os.LookupEnv(keyEnv); set {
@@ -273,7 +273,7 @@ func TestConnectProviderDiscoveryEnvContentionRetainsCache(t *testing.T) {
 		t.Fatal("ConnectProvider blocked on the foreign env lock after the cache commit; the env write must be one-attempt Try")
 	}
 	// The committed cache is retained: the env contention does not roll it back.
-	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	disc, ok := cache["disc"]
 	if !ok {
 		t.Fatal("committed discovery cache was rolled back by the env contention")
@@ -428,12 +428,12 @@ func TestRefreshDiscoveryForeignLockReturnsPromptly(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("RefreshDiscovery blocked on the foreign discovery lock; owner discovery writes must be one-attempt Try")
 	}
-	cache, attempts, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	if _, ok := cache["disc"]; ok {
 		t.Fatalf("contended RefreshDiscovery wrote the discovery cache: %#v", cache["disc"])
 	}
-	if _, ok := attempts["disc"]; ok {
-		t.Fatalf("contended RefreshDiscovery wrote a discovery attempt: %#v", attempts)
+	if record, ok := cache["disc"]; ok && !record.AttemptedAt.IsZero() {
+		t.Fatalf("contended RefreshDiscovery wrote a discovery attempt: %#v", record)
 	}
 }
 
@@ -493,12 +493,12 @@ func TestWarmSettingsEditCloseFirstPublishesNothing(t *testing.T) {
 	if strings.Contains(string(data), "9000") {
 		t.Fatalf("close-first warm edit wrote the config: %q", data)
 	}
-	cache, attempts, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	if _, ok := cache["disc"]; ok {
 		t.Fatalf("close-first warm edit wrote the discovery cache: %#v", cache["disc"])
 	}
-	if _, ok := attempts["disc"]; ok {
-		t.Fatalf("close-first warm edit wrote a discovery attempt: %#v", attempts)
+	if record, ok := cache["disc"]; ok && !record.AttemptedAt.IsZero() {
+		t.Fatalf("close-first warm edit wrote a discovery attempt: %#v", record)
 	}
 	if a.cfg != cfgBefore || a.catalog != catBefore {
 		t.Fatal("close-first warm edit applied a reload")
@@ -563,7 +563,7 @@ func TestConnectProviderFetchCloseFirstPublishesNothing(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("ConnectProvider never completed after close")
 	}
-	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	if _, ok := cache["disc"]; ok {
 		t.Fatalf("close-first ConnectProvider wrote the discovery cache: %#v", cache["disc"])
 	}
@@ -1145,14 +1145,14 @@ func TestWarmSettingsEditDiscoveryContentionLeavesConfigAndDue(t *testing.T) {
 		t.Fatalf("warm edit did not commit its config under discovery contention: %q", data)
 	}
 	// No cache was written and the provider stays due.
-	cache, attempts, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	if _, ok := cache["disc"]; ok {
 		t.Fatalf("contended warm edit wrote the discovery cache: %#v", cache["disc"])
 	}
-	if _, ok := attempts["disc"]; ok {
-		t.Fatalf("contended warm edit wrote a discovery attempt: %#v", attempts)
+	if record, ok := cache["disc"]; ok && !record.AttemptedAt.IsZero() {
+		t.Fatalf("contended warm edit wrote a discovery attempt: %#v", record)
 	}
-	recent, err := catalog.DiscoveryAttemptRecent(a.home, "disc", time.Now().UTC())
+	recent, err := catalog.DiscoveryAttemptRecent(a.home, "disc", a.catalog.Providers["disc"].Transport, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1225,12 +1225,12 @@ func TestSetProviderConfigCloseFirstPublishesNothing(t *testing.T) {
 	if strings.Contains(string(data), discoveryServer.URL) {
 		t.Fatalf("close-first provider edit wrote the config: %q", data)
 	}
-	cache, attempts, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	if _, ok := cache["disc"]; ok {
 		t.Fatalf("close-first provider edit wrote the discovery cache: %#v", cache["disc"])
 	}
-	if _, ok := attempts["disc"]; ok {
-		t.Fatalf("close-first provider edit wrote a discovery attempt: %#v", attempts)
+	if record, ok := cache["disc"]; ok && !record.AttemptedAt.IsZero() {
+		t.Fatalf("close-first provider edit wrote a discovery attempt: %#v", record)
 	}
 	if a.cfg != cfgBefore || a.catalog != catBefore {
 		t.Fatal("close-first provider edit applied a reload")
@@ -1274,14 +1274,14 @@ func TestSetProviderConfigDiscoveryContentionCommitsConfigWithWarning(t *testing
 		t.Fatalf("contended provider edit did not commit its complete root: %q", data)
 	}
 	// No cache was written and the provider stays due.
-	cache, attempts, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	if _, ok := cache["disc"]; ok {
 		t.Fatalf("contended provider edit wrote the discovery cache: %#v", cache["disc"])
 	}
-	if _, ok := attempts["disc"]; ok {
-		t.Fatalf("contended provider edit wrote a discovery attempt: %#v", attempts)
+	if record, ok := cache["disc"]; ok && !record.AttemptedAt.IsZero() {
+		t.Fatalf("contended provider edit wrote a discovery attempt: %#v", record)
 	}
-	recent, err := catalog.DiscoveryAttemptRecent(a.home, "disc", time.Now().UTC())
+	recent, err := catalog.DiscoveryAttemptRecent(a.home, "disc", a.catalog.Providers["disc"].Transport, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}

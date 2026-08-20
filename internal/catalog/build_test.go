@@ -3,6 +3,7 @@ package catalog
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -103,8 +104,9 @@ func TestBuildConfigOnlyProviderDoesNotAddDiscoveredModelsFromCache(t *testing.T
 				"models":    map[string]any{},
 			},
 		},
-		Cache: map[string]DiscoveredProvider{
+		Records: map[string]DiscoveryRecord{
 			"local": {
+				TransportFingerprint: transportFingerprint(Transport{BaseURL: "http://localhost:11434/v1"}),
 				Models: map[string]DiscoveredModel{
 					"qwen3": {Name: "Qwen 3", ContextWindow: 32768, MaxOutputTokens: 8192},
 				},
@@ -128,8 +130,9 @@ func TestBuildDoesNotMaskInvalidModelsWithDiscoveryCache(t *testing.T) {
 				"discovery": true,
 			},
 		},
-		Cache: map[string]DiscoveredProvider{
+		Records: map[string]DiscoveryRecord{
 			"local": {
+				TransportFingerprint: transportFingerprint(Transport{BaseURL: "http://localhost:11434/v1"}),
 				Models: map[string]DiscoveredModel{
 					"qwen3": {Name: "Qwen 3", ContextWindow: 32768, MaxOutputTokens: 8192},
 				},
@@ -141,6 +144,85 @@ func TestBuildDoesNotMaskInvalidModelsWithDiscoveryCache(t *testing.T) {
 	}
 	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "local", Model: "qwen3"}); !errors.Is(err, ErrUnknownProvider) {
 		t.Fatalf("Lookup error = %v, want ErrUnknownProvider", err)
+	}
+}
+
+func TestBuildMalformedTransportSkipsOnlyInvalidProvider(t *testing.T) {
+	for _, transport := range []any{"bad", []any{"bad"}, nil} {
+		t.Run(fmt.Sprintf("%T", transport), func(t *testing.T) {
+			result := Build(BuildInputs{UserRaw: map[string]any{
+				"invalid": map[string]any{
+					"transport": transport,
+					"models":    map[string]any{},
+				},
+				"valid": map[string]any{
+					"transport": map[string]any{"base_url": "http://valid.test/v1", "api_key_env": ""},
+					"models":    map[string]any{"m": map[string]any{"context_window": 1}},
+				},
+			}})
+			if _, ok := result.Catalog.Providers["invalid"]; ok {
+				t.Fatal("invalid provider was retained")
+			}
+			if _, ok := result.Catalog.Providers["valid"]; !ok {
+				t.Fatalf("valid sibling was omitted: %#v", result.Warnings)
+			}
+			if !hasWarningForProvider(result.Warnings, "user_config_skip", "invalid") {
+				t.Fatalf("warnings = %#v, want user_config_skip for invalid", result.Warnings)
+			}
+		})
+	}
+	t.Run("missing", func(t *testing.T) {
+		result := Build(BuildInputs{UserRaw: map[string]any{
+			"invalid": map[string]any{"models": map[string]any{}},
+			"valid": map[string]any{
+				"transport": map[string]any{"base_url": "http://valid.test/v1", "api_key_env": ""},
+				"models":    map[string]any{"m": map[string]any{"context_window": 1}},
+			},
+		}})
+		if _, ok := result.Catalog.Providers["invalid"]; ok {
+			t.Fatal("provider with missing transport was retained")
+		}
+		if _, ok := result.Catalog.Providers["valid"]; !ok {
+			t.Fatalf("valid sibling was omitted: %#v", result.Warnings)
+		}
+		if !hasWarningForProvider(result.Warnings, "user_config_skip", "invalid") {
+			t.Fatalf("warnings = %#v, want user_config_skip for invalid", result.Warnings)
+		}
+	})
+}
+
+func TestBuildRejectsTrailingBundledProviderData(t *testing.T) {
+	result := Build(BuildInputs{Bundled: map[string]json.RawMessage{
+		"invalid": json.RawMessage(`{"id":"invalid","transport":{"base_url":"http://invalid.test/v1","api_key_env":""},"models":{}} {"extra":1}`),
+		"valid":   rawProviderJSON(`{"id":"valid","transport":{"base_url":"http://valid.test/v1","api_key_env":""},"models":{"m":{"context_window":1}}}`),
+	}})
+	if _, ok := result.Catalog.Providers["invalid"]; ok {
+		t.Fatal("bundled provider with trailing data was retained")
+	}
+	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "valid", Model: "m"}); err != nil {
+		t.Fatalf("valid bundled sibling missing: %v", err)
+	}
+	if len(result.Warnings) != 1 || result.Warnings[0].Kind != "bundled_config_skip" {
+		t.Fatalf("warnings = %#v, want one bundled_config_skip", result.Warnings)
+	}
+}
+
+func TestBuildIgnoresForeignDiscoveryRecord(t *testing.T) {
+	transport := Transport{BaseURL: "http://configured.test/v1"}
+	foreign := Transport{BaseURL: "http://foreign.test/v1"}
+	result := Build(BuildInputs{
+		UserRaw: map[string]any{
+			"local": map[string]any{
+				"transport": map[string]any{"base_url": transport.BaseURL, "api_key_env": ""},
+				"models":    map[string]any{},
+			},
+		},
+		Records: map[string]DiscoveryRecord{
+			"local": {TransportFingerprint: transportFingerprint(foreign), Models: map[string]DiscoveredModel{"stale": {ContextWindow: 4096}}},
+		},
+	})
+	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "local", Model: "stale"}); !errors.Is(err, ErrUnknownModel) {
+		t.Fatalf("foreign discovery model lookup = %v, want unknown model", err)
 	}
 }
 
@@ -271,8 +353,9 @@ func TestBuildConfigOnlyDiscoveryCacheOnlyUpdatesKnownModelCost(t *testing.T) {
 				},
 			},
 		},
-		Cache: map[string]DiscoveredProvider{
+		Records: map[string]DiscoveryRecord{
 			"local": {
+				TransportFingerprint: transportFingerprint(Transport{BaseURL: "http://localhost:11434/v1"}),
 				Models: map[string]DiscoveredModel{
 					"known": {Name: "Discovered", ContextWindow: 32768, MaxOutputTokens: 8192, Cost: &Cost{Input: ptrFloat64(0.2)}},
 					"new":   {Name: "New Model", ContextWindow: 65536, MaxOutputTokens: 4096, Cost: &Cost{Input: ptrFloat64(0.4)}},
@@ -313,8 +396,9 @@ func TestBuildConfigOnlyDiscoveryDoesNotOverrideUserCostFields(t *testing.T) {
 				},
 			},
 		},
-		Cache: map[string]DiscoveredProvider{
+		Records: map[string]DiscoveryRecord{
 			"local": {
+				TransportFingerprint: transportFingerprint(Transport{BaseURL: "http://localhost:11434/v1"}),
 				Models: map[string]DiscoveredModel{
 					"known": {Name: "Discovered", ContextWindow: 32768, MaxOutputTokens: 8192, Cost: &Cost{Input: ptrFloat64(0.2), Output: ptrFloat64(0.4)}},
 					"new":   {Name: "New Model", ContextWindow: 65536, MaxOutputTokens: 4096, Cost: &Cost{Input: ptrFloat64(0.8), Output: ptrFloat64(1.2)}},
@@ -357,8 +441,9 @@ func TestBuildBundledDiscoveryCacheCanAddModels(t *testing.T) {
 				"models": {}
 			}`),
 		},
-		Cache: map[string]DiscoveredProvider{
+		Records: map[string]DiscoveryRecord{
 			"openrouter": {
+				TransportFingerprint: transportFingerprint(Transport{BaseURL: "https://openrouter.ai/api/v1", APIKeyEnv: "OPENROUTER_API_KEY"}),
 				Models: map[string]DiscoveredModel{
 					"remote": {Name: "Remote", ContextWindow: 32768, MaxOutputTokens: 8192},
 				},
@@ -386,8 +471,9 @@ func TestBuildFiltersRejectedDiscoveredOnlyModels(t *testing.T) {
 				"models": {}
 			}`),
 		},
-		Cache: map[string]DiscoveredProvider{
+		Records: map[string]DiscoveryRecord{
 			"openrouter": {
+				TransportFingerprint: transportFingerprint(Transport{BaseURL: "https://openrouter.ai/api/v1", APIKeyEnv: "OPENROUTER_API_KEY"}),
 				Models: map[string]DiscoveredModel{
 					"image-only": {
 						Name:          "Image Only",
@@ -442,8 +528,9 @@ func TestBuildDoesNotDeleteConfiguredModelRejectedByDiscoveryMetadata(t *testing
 				}
 			}`),
 		},
-		Cache: map[string]DiscoveredProvider{
+		Records: map[string]DiscoveryRecord{
 			"openrouter": {
+				TransportFingerprint: transportFingerprint(Transport{BaseURL: "https://openrouter.ai/api/v1", APIKeyEnv: "OPENROUTER_API_KEY"}),
 				Models: map[string]DiscoveredModel{
 					"configured": {
 						Name:          "Discovered",
@@ -545,8 +632,9 @@ func TestBuildDiscoveryUpdatesBundledCostFields(t *testing.T) {
 				}
 			}`),
 		},
-		Cache: map[string]DiscoveredProvider{
+		Records: map[string]DiscoveryRecord{
 			"openai": {
+				TransportFingerprint: transportFingerprint(Transport{BaseURL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY"}),
 				Models: map[string]DiscoveredModel{
 					"gpt-5.4-mini": {
 						Name:          "GPT-5.4 mini",
@@ -598,8 +686,9 @@ func TestBuildDiscoveryMergesCostSubfieldsOverBundled(t *testing.T) {
 				}
 			}`),
 		},
-		Cache: map[string]DiscoveredProvider{
+		Records: map[string]DiscoveryRecord{
 			"openai": {
+				TransportFingerprint: transportFingerprint(Transport{BaseURL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY"}),
 				Models: map[string]DiscoveredModel{
 					"gpt-5.4-mini": {
 						Name:          "GPT-5.4 mini",
@@ -660,8 +749,9 @@ func TestBuildDiscoveryDoesNotOverrideUserCostFields(t *testing.T) {
 				},
 			},
 		},
-		Cache: map[string]DiscoveredProvider{
+		Records: map[string]DiscoveryRecord{
 			"openai": {
+				TransportFingerprint: transportFingerprint(Transport{BaseURL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY"}),
 				Models: map[string]DiscoveredModel{
 					"gpt-5.4-mini": {
 						Name:          "GPT-5.4 mini",
@@ -714,8 +804,9 @@ func TestBuildDiscoveryPreservesExistingCostFieldsItDoesNotProvide(t *testing.T)
 				}
 			}`),
 		},
-		Cache: map[string]DiscoveredProvider{
+		Records: map[string]DiscoveryRecord{
 			"openai": {
+				TransportFingerprint: transportFingerprint(Transport{BaseURL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY"}),
 				Models: map[string]DiscoveredModel{
 					"gpt-5.4-mini": {
 						Name:          "GPT-5.4 mini",

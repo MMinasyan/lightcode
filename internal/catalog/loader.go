@@ -69,18 +69,18 @@ func (l *Loader) load(try bool) (*Catalog, []Warning, error) {
 		return nil, nil, fmt.Errorf("read bundled catalog: %w", err)
 	}
 	userRaw, warnings := readUserConfigProvidersAt(home, l.configPath)
-	cache, attempts, cacheWarnings := ReadDiscoveryCache(home)
+	records, cacheWarnings := ReadDiscoveryCache(home)
 	warnings = append(warnings, cacheWarnings...)
 
-	result := Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Cache: cache})
-	candidates := DiscoveryRefreshCandidates(result.Catalog, attempts, time.Now().UTC())
+	result := Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Records: records})
+	candidates := DiscoveryRefreshCandidates(result.Catalog, records, time.Now().UTC())
 	candidates = l.filterRefreshCandidates(candidates, result.Catalog)
 	discoveryWarnings, discoveryChanged, _ := refreshDiscoveryCandidatesFor(home, l.configPath, candidates, result.Catalog, try)
 	warnings = append(warnings, discoveryWarnings...)
 	if discoveryChanged {
-		cache, _, cacheWarnings = ReadDiscoveryCache(home)
+		records, cacheWarnings = ReadDiscoveryCache(home)
 		warnings = append(warnings, cacheWarnings...)
-		result = Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Cache: cache})
+		result = Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Records: records})
 	}
 	warnings = append(warnings, result.Warnings...)
 	return result.Catalog, warnings, nil
@@ -199,7 +199,6 @@ func readUserConfigProvidersAt(home, configPath string) (map[string]any, []Warni
 	}
 	return cloneJSONValue(providers).(map[string]any), nil
 }
-
 func writeEmptyCatalogConfig(configPath string) error {
 	if _, err := atomicfs.CreateExclusive(configPath, []byte(catalogEmptyConfigTemplate), 0o600); err != nil {
 		return err

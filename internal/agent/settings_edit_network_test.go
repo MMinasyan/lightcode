@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -145,7 +146,7 @@ func TestSettingsEditDoesNotBlockSubmitDuringDiscoveryFetch(t *testing.T) {
 	// The warm-phase fetch's result landed on disk: the discovery cache now
 	// carries the provider fetched while the submit ran, and the locked reload
 	// that followed read it from there.
-	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	disc, ok := cache["disc"]
 	if !ok {
 		t.Fatal("settings edit's discovery refresh did not land in the cache")
@@ -233,7 +234,7 @@ func TestSetProviderConfigTransportEditQueriesCandidateEndpoint(t *testing.T) {
 	if got := bRequests.Load(); got != 1 {
 		t.Fatalf("candidate endpoint B received %d discovery requests, want 1", got)
 	}
-	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	disc, ok := cache["disc"]
 	if !ok {
 		t.Fatal("candidate discovery did not land in the cache")
@@ -338,7 +339,7 @@ func TestSetProviderConfigCandidateDiscoveryDoesNotBlockSubmit(t *testing.T) {
 		t.Fatal("provider edit never reached the final owner-state recheck")
 	}
 
-	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	if _, ok := cache["disc"]; ok {
 		t.Fatalf("refused edit wrote the discovery cache: %#v", cache["disc"])
 	}
@@ -351,6 +352,153 @@ func TestSetProviderConfigCandidateDiscoveryDoesNotBlockSubmit(t *testing.T) {
 	}
 	releaseModelGate()
 	waitUntilFullyDrained(t, a)
+}
+
+func TestSetProviderConfigFinalAuthorityFailuresPublishNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		replacement string
+		remove      bool
+		wantErr     string
+	}{
+		{name: "missing_provider", replacement: `{"providers": {}}`},
+		{name: "parse_failure", replacement: `{not json`},
+		{name: "trailing_value", replacement: `{"providers": {"disc": {}}} {"extra": 1}`, wantErr: "unexpected trailing JSON value"},
+		{name: "trailing_junk", replacement: `{"providers": {"disc": {}}} junk`, wantErr: "invalid character"},
+		{name: "read_failure", remove: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gate := make(chan struct{})
+			var release sync.Once
+			releaseGate := func() { release.Do(func() { close(gate) }) }
+			entered := make(chan struct{}, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				entered <- struct{}{}
+				<-gate
+				_, _ = w.Write([]byte(`{"data":[{"id":"disc-model","context_window":4096}]}`))
+			}))
+			t.Cleanup(server.Close)
+			t.Cleanup(releaseGate)
+			configPath, a, setDiscKey := discoveryEnabledConfig(t, "http://127.0.0.1:9/v1", server.URL+"/v1")
+			setDiscKey()
+			cfgBefore := a.cfg
+			catalogBefore := a.catalog
+			warningsBefore := a.CurrentWarnings()
+			done := make(chan error, 1)
+			go func() {
+				done <- a.SetProviderConfig("disc", ProviderConfigInput{Name: "Edited Provider"})
+			}()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("provider edit did not reach candidate discovery")
+			}
+			var finalAuthorityBytes string
+			if tc.remove {
+				if err := os.Remove(configPath); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(configPath, []byte(tc.replacement), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if !tc.remove {
+				data, err := os.ReadFile(configPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				finalAuthorityBytes = string(data)
+			}
+			releaseGate()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("provider edit succeeded without current config authority")
+				}
+				if tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("provider edit error = %v, want %q", err, tc.wantErr)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("provider edit did not finish after authority failure")
+			}
+			if records, _ := catalog.ReadDiscoveryCache(a.home); len(records) != 0 {
+				t.Fatalf("authority failure wrote discovery records: %#v", records)
+			}
+			if a.cfg != cfgBefore || a.catalog != catalogBefore {
+				t.Fatal("authority failure performed a reload")
+			}
+			if !reflect.DeepEqual(a.CurrentWarnings(), warningsBefore) {
+				t.Fatalf("authority failure published warnings: %#v", a.CurrentWarnings())
+			}
+			if !tc.remove {
+				data, err := os.ReadFile(configPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(data) != finalAuthorityBytes {
+					t.Fatal("authority failure rewrote the current config")
+				}
+			}
+		})
+	}
+}
+
+func TestWarmDiscoveryBindsFetchToPlannedTransport(t *testing.T) {
+	gate := make(chan struct{})
+	var release sync.Once
+	releaseGate := func() { release.Do(func() { close(gate) }) }
+	entered := make(chan struct{}, 1)
+	var aRequests, bRequests atomic.Int32
+	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Transport") != "B" {
+			aRequests.Add(1)
+			entered <- struct{}{}
+			<-gate
+			_, _ = w.Write([]byte(`{"data":[{"id":"a-model","context_window":4096}]}`))
+			return
+		}
+		bRequests.Add(1)
+		_, _ = w.Write([]byte(`{"data":[{"id":"unexpected-b-model","context_window":8192}]}`))
+	}))
+	t.Cleanup(discoveryServer.Close)
+	t.Cleanup(releaseGate)
+	configPath, a, setDiscKey := discoveryEnabledConfig(t, "http://127.0.0.1:9/v1", discoveryServer.URL+"/v1")
+	setDiscKey()
+
+	done := make(chan error, 1)
+	go func() { done <- a.SaveModel("test", "test-model", ModelConfigInput{ContextWindow: 9000}) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm settings edit did not reach discovery")
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldTransport := fmt.Sprintf(`"transport": { "base_url": %q, "api_key_env": "LIGHTCODE_DISC_KEY" }`, discoveryServer.URL+"/v1")
+	newTransport := fmt.Sprintf(`"transport": { "base_url": %q, "api_key_env": "LIGHTCODE_DISC_KEY", "headers": { "X-Transport": "B" } }`, discoveryServer.URL+"/v1")
+	changed := strings.Replace(string(data), oldTransport, newTransport, 1)
+	if changed == string(data) {
+		t.Fatal("test failed to change persisted transport")
+	}
+	changed = strings.Replace(changed, `"discovery": true,`, `"discovery": false,`, 1)
+	if err := os.WriteFile(configPath, []byte(changed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.ensureRuntime().mu.Lock()
+	a.catalog.Providers["disc"].Transport.Headers = map[string]string{"X-Transport": "B"}
+	a.catalog.Providers["disc"].Discovery = false
+	a.ensureRuntime().mu.Unlock()
+	releaseGate()
+	if err := <-done; err != nil {
+		t.Fatalf("SaveModel after transport change: %v", err)
+	}
+	records, _ := catalog.ReadDiscoveryCache(a.home)
+	record := records["disc"]
+	planned := catalog.Transport{BaseURL: discoveryServer.URL + "/v1", APIKeyEnv: "LIGHTCODE_DISC_KEY"}
+	if !record.BoundTo(planned) || record.BoundTo(a.catalog.Providers["disc"].Transport) {
+		t.Fatalf("warm fetch was not bound to planned transport: record=%#v, planned=%#v, current=%#v (A requests=%d, B requests=%d)", record, planned, a.catalog.Providers["disc"].Transport, aRequests.Load(), bRequests.Load())
+	}
 }
 
 // TestSetProviderConfigConcurrentEditLastWriterWins proves two concurrent
@@ -469,7 +617,7 @@ func TestSetProviderConfigNameEditUsesCandidateDiscovery(t *testing.T) {
 	if len(synced) == 0 || synced[0] != filepath.Dir(a.configPath) {
 		t.Fatalf("first directory sync = %v, want the config directory (config before cache)", synced)
 	}
-	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	disc, ok := cache["disc"]
 	if !ok {
 		t.Fatal("candidate discovery did not land in the cache")
@@ -537,7 +685,7 @@ func TestResetProviderFieldTransportUsesCandidateEndpoint(t *testing.T) {
 	if sawOldHeader.Load() {
 		t.Fatal("discovery request carried the pre-reset X-Old header; the fetch did not use the candidate transport")
 	}
-	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	disc, ok := cache["disc"]
 	if !ok {
 		t.Fatal("transport reset's candidate discovery did not land in the cache")
@@ -576,12 +724,12 @@ func TestResetProviderFieldTransportNoOpSkipsDiscovery(t *testing.T) {
 	if got := requests.Load(); got != 0 {
 		t.Fatalf("no-op transport reset performed %d discovery requests, want 0", got)
 	}
-	cache, attempts, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	if _, ok := cache["disc"]; ok {
 		t.Fatalf("no-op transport reset wrote the discovery cache: %#v", cache["disc"])
 	}
-	if _, ok := attempts["disc"]; ok {
-		t.Fatalf("no-op transport reset wrote a discovery attempt: %#v", attempts)
+	if record, ok := cache["disc"]; ok && !record.AttemptedAt.IsZero() {
+		t.Fatalf("no-op transport reset wrote a discovery attempt: %#v", record)
 	}
 }
 
@@ -694,7 +842,7 @@ func TestResetProviderFieldAPIKeyEnvDuringConnectRejected(t *testing.T) {
 	if !strings.Contains(string(data), `"api_key_env": "LIGHTCODE_OPENAI_KEY"`) {
 		t.Fatalf("reset removed the persisted api_key_env override: %q", data)
 	}
-	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
+	cache, _ := catalog.ReadDiscoveryCache(a.home)
 	if _, ok := cache["openai"]; ok {
 		t.Fatalf("refused reset wrote the discovery cache: %#v", cache["openai"])
 	}

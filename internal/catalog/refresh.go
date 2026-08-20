@@ -50,10 +50,7 @@ func FetchDiscoveryIfDue(ctx context.Context, home string, provider *Provider, n
 	if provider == nil {
 		return false, nil, []Warning{{Kind: "discovery_failure", Message: "discovery provider is nil"}}
 	}
-	if !provider.Discovery {
-		return false, nil, nil
-	}
-	if provider.Transport.APIKeyEnv != "" && os.Getenv(provider.Transport.APIKeyEnv) == "" {
+	if !DiscoveryTransportReady(provider, func(name string) bool { return os.Getenv(name) != "" }) {
 		return false, nil, nil
 	}
 	// The discovery models URL is validated before the network-attempt
@@ -68,7 +65,7 @@ func FetchDiscoveryIfDue(ctx context.Context, home string, provider *Provider, n
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	recent, err := DiscoveryAttemptRecent(home, provider.ID, now)
+	recent, err := DiscoveryAttemptRecent(home, provider.ID, provider.Transport, now)
 	if err != nil {
 		return false, nil, []Warning{{Kind: "discovery_failure", Provider: provider.ID, Message: fmt.Sprintf("read discovery attempt: %v", err)}}
 	}
@@ -106,7 +103,7 @@ func refreshProviderDiscovery(ctx context.Context, home, configPath string, cat 
 		// The network failed: record the attempt so a duplicate fetch is
 		// suppressed inside the TTL, then surface the fetch failure.
 		if try {
-			ok, err := TryWriteDiscoveryAttempt(home, providerID, time.Now().UTC())
+			ok, err := TryWriteDiscoveryAttempt(home, providerID, provider.Transport, time.Now().UTC())
 			if err != nil {
 				return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery attempt: %v", err)})
 			}
@@ -114,14 +111,14 @@ func refreshProviderDiscovery(ctx context.Context, home, configPath string, cat 
 				return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("discovery lock is held for %q; attempt write skipped", providerID)})
 			}
 		} else {
-			if err := WriteDiscoveryAttempt(home, providerID, time.Now().UTC()); err != nil {
+			if err := WriteDiscoveryAttempt(home, providerID, provider.Transport, time.Now().UTC()); err != nil {
 				return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery attempt: %v", err)})
 			}
 		}
 		return false, warnings
 	}
 	if try {
-		ok, err := TryWriteDiscoveryCache(home, providerID, *discovered, time.Now().UTC())
+		ok, err := TryWriteDiscoveryCache(home, providerID, provider.Transport, *discovered, time.Now().UTC())
 		if err != nil {
 			return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)})
 		}
@@ -129,7 +126,7 @@ func refreshProviderDiscovery(ctx context.Context, home, configPath string, cat 
 			return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("discovery lock is held for %q; cache write skipped", providerID)})
 		}
 	} else {
-		if err := WriteDiscoveryCache(home, providerID, *discovered, time.Now().UTC()); err != nil {
+		if err := WriteDiscoveryCache(home, providerID, provider.Transport, *discovered, time.Now().UTC()); err != nil {
 			return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)})
 		}
 	}
@@ -166,7 +163,7 @@ func userCostProtectionForProviderAt(home, configPath, providerID string) map[st
 
 // DiscoveryRefreshCandidates returns enabled discovery providers that have not
 // had a real discovery attempt in the last 24 hours.
-func DiscoveryRefreshCandidates(cat *Catalog, attempts map[string]time.Time, now time.Time) []string {
+func DiscoveryRefreshCandidates(cat *Catalog, records map[string]DiscoveryRecord, now time.Time) []string {
 	if cat == nil {
 		return nil
 	}
@@ -175,7 +172,8 @@ func DiscoveryRefreshCandidates(cat *Catalog, attempts map[string]time.Time, now
 		if provider == nil || !provider.Discovery {
 			continue
 		}
-		if discoveryAttemptDue(attempts[providerID], now) {
+		record, exists := records[providerID]
+		if !exists || !record.BoundTo(provider.Transport) || discoveryAttemptDue(record.AttemptedAt, now) {
 			ids = append(ids, providerID)
 		}
 	}

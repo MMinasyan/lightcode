@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
 )
@@ -16,7 +17,8 @@ const editCfg = `{
       "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "" },
       "discovery": false,
       "models": { "m1": { "context_window": 1000 } }
-    }
+    },
+    "openrouter": {}
   },
   "default_model": ""
 }`
@@ -50,8 +52,9 @@ func readModelConfig(t *testing.T, configPath, provider, model string) map[strin
 
 func TestClassifyModelSource(t *testing.T) {
 	bundled := map[string]map[string]struct{}{"p": {"bm": {}}}
-	disc := map[string]catalog.DiscoveredProvider{"p": {Models: map[string]catalog.DiscoveredModel{"dm": {}}}}
+	disc := map[string]catalog.DiscoveryRecord{"p": {TransportFingerprint: "13f5d4facbd1ec285812e559e9702d707823babdb84570dca1a8aab164b89ec6", Models: map[string]catalog.DiscoveredModel{"dm": {}}}}
 	builtin := &catalog.Provider{ID: "p", Builtin: true}
+	foreign := &catalog.Provider{ID: "p", Builtin: true, Transport: catalog.Transport{BaseURL: "http://foreign.test/v1"}}
 	custom := &catalog.Provider{ID: "c", Builtin: false}
 
 	cases := []struct {
@@ -61,6 +64,7 @@ func TestClassifyModelSource(t *testing.T) {
 	}{
 		{builtin, "bm", modelSourceBundled},
 		{builtin, "dm", modelSourceDiscovered},
+		{foreign, "dm", modelSourceUser},
 		{builtin, "um", modelSourceUser},
 		{custom, "anything", modelSourceUser},
 		{nil, "x", modelSourceUser},
@@ -69,6 +73,63 @@ func TestClassifyModelSource(t *testing.T) {
 		if got := classifyModelSource(c.prov, c.id, bundled, disc); got != c.want {
 			t.Errorf("classifyModelSource(%v, %q) = %q, want %q", c.prov, c.id, got, c.want)
 		}
+	}
+}
+
+func TestGetProviderConfigUsesOnlyBoundDiscoveryRecord(t *testing.T) {
+	a := newProviderManagementAgent(t, editCfg)
+	configured := a.catalog.Providers["openrouter"].Transport
+	if err := catalog.WriteDiscoveryCache(a.home, "openrouter", configured, catalog.DiscoveredProvider{Models: map[string]catalog.DiscoveredModel{
+		"bound-model": {Name: "Bound", ContextWindow: 4096},
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	view, err := a.GetProviderConfig("openrouter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, model := range view.Models {
+		if model.ID == "bound-model" {
+			found = true
+			if model.Source != modelSourceDiscovered {
+				t.Fatalf("bound model source = %q, want discovered", model.Source)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("bound model missing from provider config: %#v", view.Models)
+	}
+	t.Setenv("OPENROUTER_API_KEY", "model-list-key")
+	if _, ok := modelEntry(t, a.ModelList(), "openrouter/bound-model"); !ok {
+		t.Fatalf("bound model missing from ModelList: %#v", a.ModelList())
+	}
+	_ = os.Unsetenv("OPENROUTER_API_KEY")
+	foreign := configured
+	foreign.BaseURL = "http://foreign.test/v1"
+	if err := catalog.WriteDiscoveryCache(a.home, "openrouter", foreign, catalog.DiscoveredProvider{Models: map[string]catalog.DiscoveredModel{
+		"bound-model": {Name: "Foreign", ContextWindow: 4096},
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	view, err = a.GetProviderConfig("openrouter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range view.Models {
+		if model.ID == "bound-model" {
+			t.Fatalf("foreign discovery model remained in provider config: %#v", model)
+		}
+	}
+	t.Setenv("OPENROUTER_API_KEY", "model-list-key")
+	if _, ok := modelEntry(t, a.ModelList(), "openrouter/bound-model"); ok {
+		t.Fatalf("foreign discovery model remained in ModelList: %#v", a.ModelList())
 	}
 }
 

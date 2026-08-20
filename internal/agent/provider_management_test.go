@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -118,7 +119,11 @@ func TestConnectBundledEmptyRunsDiscoveryBeforePersistingKey(t *testing.T) {
 	a := newProviderManagementAgent(t, `{
   "providers": {
     "groq": {
-      "transport": { "base_url": "`+server.URL+`/v1", "api_key_env": "LIGHTCODE_PROVIDER_EMPTY_DISC" }
+      "transport": {
+        "base_url": "`+server.URL+`/v1",
+        "api_key_env": "LIGHTCODE_PROVIDER_EMPTY_DISC",
+        "headers": {"Authorization": "Bearer configured-secret"}
+      }
     }
   },
   "default_model": ""
@@ -144,6 +149,188 @@ func TestConnectBundledEmptyRunsDiscoveryBeforePersistingKey(t *testing.T) {
 	}
 	if !foundRemote {
 		t.Fatalf("ModelList missing groq/remote-model: %#v", a.ModelList())
+	}
+	cachePath := filepath.Join(a.home, ".lightcode", "cache", "discovery", "groq.json")
+	cacheData, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cacheData), "secret") || strings.Contains(string(cacheData), "Authorization") {
+		t.Fatalf("discovery cache persisted provisional credentials: %q", cacheData)
+	}
+	records, warnings := catalog.ReadDiscoveryCache(a.home)
+	if len(warnings) != 0 {
+		t.Fatalf("discovery cache warnings = %#v", warnings)
+	}
+	record, ok := records["groq"]
+	if !ok {
+		t.Fatalf("discovery cache missing groq record: %#v", records)
+	}
+	configured := a.catalog.Providers["groq"].Transport
+	if !record.BoundTo(configured) {
+		t.Fatal("discovery cache was not bound to the captured configured Authorization")
+	}
+	provisional := configured
+	provisional.Headers = map[string]string{"Authorization": "Bearer secret"}
+	if record.BoundTo(provisional) {
+		t.Fatal("provisional Authorization injection changed the captured transport identity")
+	}
+}
+
+func TestConnectProviderRejectsConfiguredTransportChange(t *testing.T) {
+	gate := make(chan struct{})
+	var release sync.Once
+	releaseGate := func() { release.Do(func() { close(gate) }) }
+	entered := make(chan struct{}, 1)
+	var authorization string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		entered <- struct{}{}
+		<-gate
+		_, _ = w.Write([]byte(`{"data":[{"id":"remote-model","context_window":4096}]}`))
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(releaseGate)
+	keyEnv := "LIGHTCODE_TRANSPORT_CHANGE_KEY"
+	_ = os.Unsetenv(keyEnv)
+	t.Cleanup(func() { _ = os.Unsetenv(keyEnv) })
+	a := newProviderManagementAgent(t, `{
+  "providers": {
+    "disc": {
+      "transport": { "base_url": "`+server.URL+`/v1", "api_key_env": "`+keyEnv+`" },
+      "discovery": true,
+      "models": {}
+    }
+  }
+}`)
+	done := make(chan error, 1)
+	go func() { done <- a.ConnectProvider("disc", "secret") }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConnectProvider did not reach the gated discovery request")
+	}
+	changedConfig := `{
+  "providers": {
+    "disc": {
+      "transport": { "base_url": "http://changed.test/v1", "api_key_env": "` + keyEnv + `" },
+      "discovery": true,
+      "models": {}
+    }
+  }
+}`
+	if err := os.WriteFile(a.configPath, []byte(changedConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Reload(); err != nil {
+		t.Fatalf("reload changed transport: %v", err)
+	}
+	catalogAfterChange := a.catalog
+	releaseGate()
+	select {
+	case err := <-done:
+		if err == nil || err.Error() != "provider disc changed while connecting; retry" {
+			t.Fatalf("ConnectProvider after transport change = %v, want exact retry error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConnectProvider did not finish after releasing discovery")
+	}
+	if authorization != "Bearer secret" {
+		t.Fatalf("provisional Authorization = %q, want Bearer secret", authorization)
+	}
+	if a.catalog != catalogAfterChange {
+		t.Fatal("transport-mismatch rejection performed a final reload")
+	}
+	if _, ok := os.LookupEnv(keyEnv); ok {
+		t.Fatal("transport-mismatch rejection persisted the API key")
+	}
+	if records, _ := catalog.ReadDiscoveryCache(a.home); len(records) != 0 {
+		t.Fatalf("transport-mismatch rejection wrote discovery records: %#v", records)
+	}
+}
+
+func TestConnectProviderRevalidatesNonDiscoveryTransportBeforePublication(t *testing.T) {
+	const keyEnv = "LIGHTCODE_NON_DISCOVERY_REVALIDATION_KEY"
+	for _, tc := range []struct {
+		name       string
+		remove     bool
+		wantErr    string
+		mutateLive func(*catalog.Provider)
+	}{
+		{name: "changed transport", wantErr: "provider managed changed while connecting; retry", mutateLive: func(prov *catalog.Provider) {
+			prov.Transport.BaseURL = "http://changed.test/v1"
+		}},
+		{name: "provider removed", remove: true, wantErr: `provider "managed" not found`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = os.Unsetenv(keyEnv)
+			t.Cleanup(func() { _ = os.Unsetenv(keyEnv) })
+			a := newProviderManagementAgent(t, `{
+  "providers": {
+    "managed": {
+      "transport": {"base_url": "http://configured.test/v1", "api_key_env": "`+keyEnv+`"},
+      "discovery": false,
+      "models": {"m": {"context_window": 1000}}
+    }
+  }
+}`)
+			catalogBefore := a.catalog
+			cfgBefore := a.cfg
+			a.connectProviderBeforeFinalLock = func() {
+				if tc.remove {
+					delete(a.catalog.Providers, "managed")
+					return
+				}
+				tc.mutateLive(a.catalog.Providers["managed"])
+			}
+			err := a.ConnectProvider("managed", "secret")
+			if err == nil || err.Error() != tc.wantErr {
+				t.Fatalf("ConnectProvider error = %v, want %q", err, tc.wantErr)
+			}
+			if _, ok := os.LookupEnv(keyEnv); ok {
+				t.Fatal("final revalidation failure persisted API key")
+			}
+			if records, warnings := catalog.ReadDiscoveryCache(a.home); len(records) != 0 || len(warnings) != 0 {
+				t.Fatalf("final revalidation failure wrote discovery state: records=%#v warnings=%#v", records, warnings)
+			}
+			if a.catalog != catalogBefore || a.cfg != cfgBefore {
+				t.Fatal("final revalidation failure reloaded catalog/config")
+			}
+		})
+	}
+}
+
+func TestConnectProviderRejectsRemovedDiscoveryProviderBeforePublication(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"remote-model","context_window":4096}]}`))
+	}))
+	t.Cleanup(server.Close)
+	const keyEnv = "LIGHTCODE_DISCOVERY_REVALIDATION_KEY"
+	_ = os.Unsetenv(keyEnv)
+	t.Cleanup(func() { _ = os.Unsetenv(keyEnv) })
+	a := newProviderManagementAgent(t, `{
+  "providers": {
+    "disc": {
+      "transport": {"base_url": "`+server.URL+`/v1", "api_key_env": "`+keyEnv+`"},
+      "discovery": true,
+      "models": {}
+    }
+  }
+}`)
+	catalogBefore := a.catalog
+	a.connectProviderBeforeFinalLock = func() { delete(a.catalog.Providers, "disc") }
+	err := a.ConnectProvider("disc", "secret")
+	if err == nil || err.Error() != `provider "disc" not found` {
+		t.Fatalf("ConnectProvider error = %v, want provider-not-found", err)
+	}
+	if _, ok := os.LookupEnv(keyEnv); ok {
+		t.Fatal("discovery provider removal failure persisted API key")
+	}
+	if records, warnings := catalog.ReadDiscoveryCache(a.home); len(records) != 0 || len(warnings) != 0 {
+		t.Fatalf("discovery provider removal failure wrote state: records=%#v warnings=%#v", records, warnings)
+	}
+	if a.catalog != catalogBefore {
+		t.Fatal("discovery provider removal failure reloaded catalog")
 	}
 }
 

@@ -146,6 +146,11 @@ type Agent struct {
 	// a read error in the window the retry exists for; nil in production.
 	captureProbe func(attempt int) error
 
+	// connectProviderBeforeFinalLock is a test seam invoked after the
+	// write-free ConnectProvider phase and immediately before its final lock
+	// reacquisition; nil in production.
+	connectProviderBeforeFinalLock func()
+
 	// durableReadHook is a test seam invoked immediately before each observed
 	// durable I/O at the four owner-lock sites: the fork staging tree copy
 	// (which must run outside runtime.mu), resume's listing/history loads
@@ -991,7 +996,7 @@ func New(c Config) (*Agent, error) {
 	}
 	modelLoader := catalog.NewLoaderWithConfigPath(c.Home, nil, configPath)
 	modelLoader.AllowRefresh = func(_ string, prov *catalog.Provider) bool {
-		return providerConnected(prov)
+		return catalog.DiscoveryTransportReady(prov, func(name string) bool { return os.Getenv(name) != "" })
 	}
 	modelCatalog, catalogWarnings, err := modelLoader.Load()
 	if err != nil {
@@ -3950,7 +3955,7 @@ func (a *Agent) loadCatalogLocked(allowBackgroundDiscovery bool) (*catalog.Catal
 		if !allowBackgroundDiscovery {
 			return false
 		}
-		return providerConnected(prov)
+		return catalog.DiscoveryTransportReady(prov, func(name string) bool { return os.Getenv(name) != "" })
 	}
 	modelCatalog, catalogWarnings, err := modelLoader.LoadTry()
 	if err != nil {
@@ -4074,7 +4079,7 @@ func (a *Agent) mutateProviderConfig(providerID string, mutate func(providerMap 
 		return err
 	}
 	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
+	if err := decodeJSONUseNumber(data, &root); err != nil {
 		return fmt.Errorf("parse config %s: %w", path, err)
 	}
 	providers, ok := root["providers"].(map[string]any)
@@ -4108,7 +4113,7 @@ func validateRawProviderConfig(providerID string, providerMap map[string]any) er
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(encoded, &providerForValidation); err != nil {
+	if err := decodeJSONUseNumber(encoded, &providerForValidation); err != nil {
 		return err
 	}
 	if errs := catalog.ValidateRaw(providerID, providerForValidation, true); len(errs) != 0 {
@@ -4512,7 +4517,7 @@ func (a *Agent) SetRuntimeConfig(settings RuntimeConfigSettings) error {
 		return err
 	}
 	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
+	if err := decodeJSONUseNumber(data, &root); err != nil {
 		return fmt.Errorf("parse config %s: %w", a.configPath, err)
 	}
 	sessions := objectMap(root, "sessions")

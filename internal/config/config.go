@@ -8,9 +8,11 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -162,7 +164,7 @@ func Parse(data []byte) (*Config, error) {
 	}
 
 	var c Config
-	if err := json.Unmarshal(data, &c); err != nil {
+	if err := decodeJSONUseNumber(data, &c); err != nil {
 		return nil, err
 	}
 	if c.Providers == nil {
@@ -241,6 +243,22 @@ func Parse(data []byte) (*Config, error) {
 	}
 
 	return &c, nil
+}
+
+func decodeJSONUseNumber(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("unexpected trailing JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 func rejectOldShape(data []byte) error {
