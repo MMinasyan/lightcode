@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -128,6 +129,78 @@ func TestRevertPartialWalkReloadsLoopAndPublishesBoundary(t *testing.T) {
 	}
 	if rev.rewriteEpoch != 1 {
 		t.Fatalf("rewriteEpoch = %d, want exactly 1 after the partial walk", rev.rewriteEpoch)
+	}
+}
+
+func TestRevertTurnSyncFailureReconcilesOwner(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	cap := &eventCapture{}
+	a.SetEventHandler(cap.handler)
+	seedCompleteTurns(t, a, 3)
+	id := a.SessionCurrent().ID
+	tr := a.transcriptForSessionID(id)
+	if tr == nil {
+		t.Fatal("no live coordinator for the session")
+	}
+	for _, turn := range []int{1, 2, 3} {
+		a.feedAndEmit(tr, Event{Kind: EventError, SessionID: id, Error: fmt.Sprintf("error at %d", turn), Turn: turn})
+	}
+	seedQueue(t, a, 4, "stale after turn removal")
+	turnsDir := filepath.Join(a.store.Dir(), "turns")
+	injected := errors.New("injected turns directory sync failure")
+	atomicfs.SyncDirFunc = func(dir string) error {
+		if dir == turnsDir {
+			return injected
+		}
+		return nil
+	}
+	t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+	var boundary []HydrationState
+	var boundaryWarning string
+	var boundaryErr *snapshot.CommittedMutationError
+	result, err := a.ApplyTurnActionForSessionWithBoundary(id, 2, TurnActionRevertHistory, false, func(state HydrationState, _ []snapshot.SkippedRevert, warning string, committed *snapshot.CommittedMutationError, _ *string) {
+		boundary = append(boundary, state)
+		boundaryWarning = warning
+		boundaryErr = committed
+	})
+	var committed *snapshot.CommittedMutationError
+	if !errors.As(err, &committed) || !errors.Is(err, injected) {
+		t.Fatalf("revert error = %v, want the committed turns-dir sync error", err)
+	}
+	if result.Session.ID != id || result.TargetTurn != 1 || result.Warning != err.Error() {
+		t.Fatalf("result = session:%q target:%d warning:%q, want surviving session, target 1, and typed error warning", result.Session.ID, result.TargetTurn, result.Warning)
+	}
+	if !a.store.Active() || a.currentSessionID != id {
+		t.Fatalf("owner after committed turn sync failure = active:%v current:%q, want retained live unit", a.store.Active(), a.currentSessionID)
+	}
+	a.ensureRuntime().mu.Lock()
+	_, live := a.sessions[id]
+	a.ensureRuntime().mu.Unlock()
+	if !live || a.transcriptForSessionID(id) == nil {
+		t.Fatalf("owner reconciliation lost live unit or transcript: live=%v transcript=%v", live, a.transcriptForSessionID(id) != nil)
+	}
+	if got := a.store.CurrentTurn(); got != 2 {
+		t.Fatalf("current turn after turn removal sync failure = %d, want surviving bound 2", got)
+	}
+	if got := loopUserContents(a.lp.Messages()); !equalStrings(got, []string{"turn 1", "turn 2"}) {
+		t.Fatalf("reloaded loop history = %q, want surviving turns 1-2", got)
+	}
+	assertQueueClearedAfterVersion(t, a, cap, 4)
+	if got := retainedErrorTurns(t, a, id); !reflect.DeepEqual(got, []int{1, 2}) {
+		t.Fatalf("retained error turns = %v, want surviving turns [1 2]", got)
+	}
+	tr.seqMu.Lock()
+	epoch := tr.rewriteEpoch
+	tr.seqMu.Unlock()
+	if epoch != 1 {
+		t.Fatalf("transcript rewrite epoch = %d, want 1 after reconciliation", epoch)
+	}
+	if len(boundary) != 1 || boundary[0].Session.ID != id || !equalStrings(userContents(boundary[0].Messages), []string{"turn 1", "turn 2"}) {
+		t.Fatalf("boundary = %#v, want one surviving-history state", boundary)
+	}
+	if boundaryErr == nil || boundaryWarning != err.Error() {
+		t.Fatalf("boundary error/warning = %v/%q, want typed error and the same warning", boundaryErr, boundaryWarning)
 	}
 }
 

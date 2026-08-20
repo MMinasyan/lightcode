@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
@@ -127,6 +128,194 @@ func TestWailsAppOwnsConcreteAgentLifecycle(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("app.shutdown hung joining the owner")
 	}
+}
+
+func TestWailsStartupRealCommittedCreationAdoptsWithoutBoundary(t *testing.T) {
+	ag := newAppTestAgent(t)
+	app := &App{svc: ag, agent: ag}
+	var frames []string
+	app.emitFn = func(name string, _ any) { frames = append(frames, name) }
+	root := ag.Projects().Root()
+	atomicfs.SyncDirFunc = func(dir string) error {
+		if strings.HasSuffix(dir, string(filepath.Separator)+"sessions") {
+			return errors.New("injected startup publication sync failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+	app.startup(context.Background())
+	if app.currentSessionID() == "" {
+		t.Fatal("startup did not adopt committed destination")
+	}
+	for _, frame := range frames {
+		if frame == "navigation" || frame == "session_changed" {
+			t.Fatalf("startup emitted lifecycle frame %q; startup must not emit a startup event", frame)
+		}
+	}
+	if !strings.HasPrefix(root, filepath.Dir(ag.Projects().Root())) {
+		t.Fatal("startup test did not use the real project namespace")
+	}
+}
+
+func TestWailsRealCommittedNamespaceProducers(t *testing.T) {
+	t.Run("archive", func(t *testing.T) {
+		ag := newAppTestAgent(t)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatal(err)
+		}
+		project, err := ag.Projects().Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		app := newTestApp(ag)
+		app.setCurrentSessionID(id)
+		sessionDir := filepath.Join(ag.Projects().SessionsRoot(project.ID), id)
+		var syncCalls int
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == sessionDir {
+				syncCalls++
+				if syncCalls == 2 {
+					return errors.New("injected Wails archive sync failure")
+				}
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+		err = app.SessionArchive(id)
+		var committed *snapshot.CommittedMutationError
+		if !errors.As(err, &committed) {
+			t.Fatalf("Wails archive error = %v, want committed error", err)
+		}
+		if app.currentSessionID() != "" {
+			t.Fatalf("Wails current after committed archive = %q, want detached", app.currentSessionID())
+		}
+		meta, err := snapshot.LoadSessionMeta(ag.Projects().SessionsRoot(project.ID), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if meta.State != snapshot.StateArchived {
+			t.Fatalf("Wails archive state = %q, want archived", meta.State)
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		ag := newAppTestAgent(t)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatal(err)
+		}
+		project, err := ag.Projects().Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		app := newTestApp(ag)
+		app.setCurrentSessionID(id)
+		sessionsRoot := ag.Projects().SessionsRoot(project.ID)
+		injected := errors.New("injected Wails delete sync failure")
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == sessionsRoot {
+				return injected
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+		err = app.SessionDelete(id)
+		var committed *snapshot.CommittedMutationError
+		if !errors.As(err, &committed) {
+			t.Fatalf("Wails delete error = %v, want committed error", err)
+		}
+		if app.currentSessionID() != "" {
+			t.Fatalf("Wails current after committed delete = %q, want detached", app.currentSessionID())
+		}
+		if _, err := os.Stat(filepath.Join(sessionsRoot, id)); !os.IsNotExist(err) {
+			t.Fatalf("Wails deleted source = %v, want absent", err)
+		}
+	})
+
+	t.Run("history", func(t *testing.T) {
+		ag := newAppTestAgent(t)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lastTurn := 0
+		for _, text := range []string{"one", "two", "three"} {
+			lastTurn, err = ag.AppendUserMessageToSession(id, text)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		project, err := ag.Projects().Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		app := newTestApp(ag)
+		app.setCurrentSessionID(id)
+		turnsDir := filepath.Join(ag.Projects().SessionsRoot(project.ID), id, "turns")
+		injected := errors.New("injected Wails history sync failure")
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == turnsDir {
+				return injected
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+		err = app.RevertHistory(lastTurn)
+		var committed *snapshot.CommittedMutationError
+		if !errors.As(err, &committed) {
+			t.Fatalf("Wails history error = %v, want committed error", err)
+		}
+		if app.currentSessionID() != id {
+			t.Fatalf("Wails current after committed history = %q, want %q", app.currentSessionID(), id)
+		}
+		if _, err := os.Stat(filepath.Join(turnsDir, fmt.Sprint(lastTurn))); !os.IsNotExist(err) {
+			t.Fatalf("Wails reverted turn = %v, want removed", err)
+		}
+	})
+
+	t.Run("fork", func(t *testing.T) {
+		ag := newAppTestAgent(t)
+		sourceID, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatal(err)
+		}
+		turn, err := ag.AppendUserMessageToSession(sourceID, "fork source")
+		if err != nil {
+			t.Fatal(err)
+		}
+		project, err := ag.Projects().Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		app := newTestApp(ag)
+		app.setCurrentSessionID(sourceID)
+		sessionsRoot := ag.Projects().SessionsRoot(project.ID)
+		injected := errors.New("injected Wails fork sync failure")
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == sessionsRoot {
+				return injected
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+		err = app.ForkSession(turn)
+		var committed *snapshot.CommittedMutationError
+		if !errors.As(err, &committed) {
+			t.Fatalf("Wails fork error = %v, want committed error", err)
+		}
+		destinationID := app.currentSessionID()
+		if destinationID == "" || destinationID == sourceID {
+			t.Fatalf("Wails current after committed fork = %q, want adopted destination", destinationID)
+		}
+		if _, err := os.Stat(filepath.Join(sessionsRoot, destinationID, "meta.json")); err != nil {
+			t.Fatalf("Wails fork destination metadata: %v", err)
+		}
+	})
 }
 
 // TestWailsShutdownBeforeStartupIsSafe verifies a close that wins the race against

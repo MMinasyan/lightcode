@@ -43,6 +43,11 @@ func NewResolver(home, projectRoot string) (*Resolver, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, fmt.Errorf("project: create %s: %w", root, err)
 	}
+	for _, dir := range []string{root, filepath.Dir(root), filepath.Dir(filepath.Dir(root))} {
+		if err := atomicfs.SyncDir(dir); err != nil {
+			return nil, fmt.Errorf("project: sync %s: %w", dir, err)
+		}
+	}
 	abs, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return nil, fmt.Errorf("project: resolve cwd: %w", err)
@@ -165,6 +170,12 @@ func EnsureForPath(root, absPath string) (*Project, error) {
 				return fmt.Errorf("project: %s: stored path %q does not match %q", id, existing.Path, clean)
 			}
 			result = *existing
+			if err := atomicfs.SyncDir(dir); err != nil {
+				return fmt.Errorf("project: sync %s: %w", dir, err)
+			}
+			if err := atomicfs.SyncDir(root); err != nil {
+				return fmt.Errorf("project: sync %s: %w", root, err)
+			}
 			return nil
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -182,6 +193,12 @@ func EnsureForPath(root, absPath string) (*Project, error) {
 		}
 		if err := writeJSON(metaPath, p); err != nil {
 			return err
+		}
+		if err := atomicfs.SyncDir(dir); err != nil {
+			return fmt.Errorf("project: sync %s: %w", dir, err)
+		}
+		if err := atomicfs.SyncDir(root); err != nil {
+			return fmt.Errorf("project: sync %s: %w", root, err)
 		}
 		result = p
 		return nil

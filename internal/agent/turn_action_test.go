@@ -403,6 +403,9 @@ func TestCompactionWritesCompactTranscript(t *testing.T) {
 	if meta.ActiveAgentType != "compact" {
 		t.Fatalf("compact child active agent type = %q, want compact", meta.ActiveAgentType)
 	}
+	if meta.Provider != "test" || meta.Model != "test-model" {
+		t.Fatalf("compact child model metadata = %s/%s, want test/test-model", meta.Provider, meta.Model)
+	}
 	sessions, err := a.SessionList(snapshot.StateActive)
 	if err != nil {
 		t.Fatalf("SessionList: %v", err)

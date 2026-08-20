@@ -5181,7 +5181,12 @@ func (a *Agent) newSession(projectID string, agentType string, emit func(Hydrati
 	defer func() {
 		if err != nil && stagingRoot != "" {
 			if cerr := removeStagingTree(stagingRoot); cerr != nil {
-				err = errors.Join(err, fmt.Errorf("snapshot: new-session staging cleanup: %w", cerr))
+				var committed *snapshot.CommittedMutationError
+				if errors.As(err, &committed) {
+					fmt.Fprintf(os.Stderr, "lightcode: remove committed new-session staging %s: %v\n", stagingRoot, cerr)
+				} else {
+					err = errors.Join(err, fmt.Errorf("snapshot: new-session staging cleanup: %w", cerr))
+				}
 			}
 		}
 	}()
@@ -5217,6 +5222,25 @@ func (a *Agent) newSession(projectID string, agentType string, emit func(Hydrati
 	// the unit keeps the receiver as its store, so the claim is released only
 	// when the session closes. Post-commit publication is infallible.
 	if err := store.PublishPreparedSession(prepared); err != nil {
+		var committed *snapshot.CommittedMutationError
+		if errors.As(err, &committed) {
+			sid = unit.store.SessionID()
+			rt.registerTranscript(sid, unit.store)
+			rt.mu.Lock()
+			if adoptErr := a.setCurrentSessionLocked(unit); adoptErr != nil {
+				rt.unregisterTranscript(sid)
+				unit.store.Detach()
+				rt.mu.Unlock()
+				return sid, adoptErr
+			}
+			if emit != nil {
+				a.captureUnderLocksRTHeld(unit, nil, sid, nil, func(cs completeState) {
+					emit(hydrationStateFrom(prebuiltSummary, cs), err)
+				})
+			}
+			rt.mu.Unlock()
+			return sid, err
+		}
 		return "", err
 	}
 	// Post-publish: the staging parent is now empty; remove it exactly once
@@ -5348,18 +5372,20 @@ func (a *Agent) SessionArchive(id string) error {
 // SessionDelete removes a session from disk.
 func (a *Agent) SessionDelete(id string) error {
 	return a.removeSession(id, func(sessionsRoot, id string) error {
-		if err := snapshot.DeleteSession(sessionsRoot, id); err != nil {
+		err := snapshot.DeleteSession(sessionsRoot, id)
+		var committed *snapshot.CommittedMutationError
+		if err != nil && !errors.As(err, &committed) {
 			return err
 		}
 		// The delete committed; a failed summaries removal cannot fail it.
 		// The residue keeps the deleted session's sections and vectors in
 		// search_history, so it is reported rather than dropped.
 		if a.memoryHooks != nil {
-			if err := a.memoryHooks.DeleteSessionSummaries(id); err != nil {
-				fmt.Fprintf(os.Stderr, "lightcode: delete summaries for session %s: %v\n", id, err)
+			if cleanupErr := a.memoryHooks.DeleteSessionSummaries(id); cleanupErr != nil {
+				fmt.Fprintf(os.Stderr, "lightcode: delete summaries for session %s: %v\n", id, cleanupErr)
 			}
 		}
-		return nil
+		return err
 	})
 }
 
@@ -5429,8 +5455,10 @@ func (a *Agent) removeSession(id string, durable func(sessionsRoot string, id st
 	}
 
 	// Point of no return: commit durably with the claim held.
-	if err := durable(sessionsRoot, id); err != nil {
-		return err
+	durableErr := durable(sessionsRoot, id)
+	var committed *snapshot.CommittedMutationError
+	if durableErr != nil && !errors.As(durableErr, &committed) {
+		return durableErr
 	}
 	if a.gate != nil {
 		a.gate.CancelSession(id)
@@ -5451,10 +5479,14 @@ func (a *Agent) removeSession(id string, durable func(sessionsRoot string, id st
 		rt.mu.Unlock()
 		a.resetCurrentSessionState()
 	} else if _, err := a.closeLiveSession(id); err != nil {
-		return err
+		if durableErr == nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "lightcode: close removed session %s: %v\n", id, err)
+		releaseReservation()
 	}
 	releaseReservation = nil
-	return nil
+	return durableErr
 }
 
 // SessionMessages returns the persisted messages for the current session.
@@ -6481,9 +6513,11 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		if revertErr != nil {
 			result.Warning = revertErr.Error()
 		}
-		// No producer returns a committed error yet; the typed classification
-		// exists for the namespace producers later steps adopt.
-		a.emitTurnActionBoundaryLocked(unit, result, emit, nil, prefill)
+		var committed *snapshot.CommittedMutationError
+		if revertErr != nil {
+			_ = errors.As(revertErr, &committed)
+		}
+		a.emitTurnActionBoundaryLocked(unit, result, emit, committed, prefill)
 		rt.mu.Unlock()
 		if revertErr != nil {
 			return result, revertErr
@@ -6557,10 +6591,42 @@ func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool
 	}
 	candidate, prepared, err := a.forkUnitAtTurn(unit, turn)
 	if err != nil {
-		// The fork never published; the source unit is unchanged, and the
-		// error is the outcome. The result carries no payload: nothing is
-		// read after the failed attempt.
-		return result, err
+		var committed *snapshot.CommittedMutationError
+		if !errors.As(err, &committed) || candidate == nil {
+			// The fork never published; the source unit is unchanged, and the
+			// error is the outcome. The result carries no payload: nothing is
+			// read after the failed attempt.
+			return result, err
+		}
+		result = a.buildTurnActionResult(result, prepared.summary, prepared.messages, prepared.tokens)
+		rt := a.ensureRuntime()
+		rt.registerTranscript(sessionIDOf(candidate), candidate.store)
+		rt.mu.Lock()
+		if a.currentSessionID == sessionIDOf(unit) {
+			err = a.setCurrentSessionLocked(candidate)
+		} else {
+			err = a.registerLiveSessionLocked(candidate)
+		}
+		if err == nil {
+			if alsoRevertCode {
+				rt.mu.Unlock()
+				revertResult, revertErr := unit.store.RevertCode(turn)
+				result.RestoredFiles = revertResult.Restored
+				result.SkippedFiles = revertResult.Skipped
+				rt.mu.Lock()
+				if revertErr != nil {
+					result.Warning = fmt.Sprintf("forked, but the code revert failed: %v", revertErr)
+				} else {
+					a.resetFileTrackerForSession(unit)
+				}
+			}
+			a.emitTurnActionBoundaryLocked(candidate, result, emit, committed, nil)
+		}
+		rt.mu.Unlock()
+		if err != nil {
+			return result, err
+		}
+		return result, committed
 	}
 	result = a.buildTurnActionResult(result, prepared.summary, prepared.messages, prepared.tokens)
 	rt := a.ensureRuntime()
@@ -6851,7 +6917,12 @@ func (a *Agent) forkUnitAtTurn(unit *session, turn int) (candidate *session, pre
 	defer func() {
 		if err != nil && stagingRoot != "" {
 			if cerr := removeStagingTree(stagingRoot); cerr != nil {
-				err = errors.Join(err, fmt.Errorf("snapshot: fork staging cleanup: %w", cerr))
+				var committed *snapshot.CommittedMutationError
+				if errors.As(err, &committed) {
+					fmt.Fprintf(os.Stderr, "lightcode: remove committed fork staging %s: %v\n", stagingRoot, cerr)
+				} else {
+					err = errors.Join(err, fmt.Errorf("snapshot: fork staging cleanup: %w", cerr))
+				}
 			}
 		}
 	}()
@@ -6940,6 +7011,11 @@ func (a *Agent) forkUnitAtTurn(unit *session, turn int) (candidate *session, pre
 
 	// Durable commit: the atomic rename publishes the candidate.
 	if err = snapshot.PublishStagedSession(stagingRoot, src.sessionsRoot, newID); err != nil {
+		var committed *snapshot.CommittedMutationError
+		if errors.As(err, &committed) {
+			_ = candidate.store.RelocateActiveSessionPaths(src.sessionsRoot)
+			return candidate, prepared, err
+		}
 		candidate.store.Detach()
 		return nil, forkPreparedResult{}, err
 	}

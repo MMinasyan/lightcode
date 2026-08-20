@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
@@ -285,6 +286,11 @@ func (s *committedCreateSpy) NewSessionForProjectPath(_, _ string) (string, erro
 	return s.id, s.createErr
 }
 
+func (s *committedCreateSpy) NewSessionForProjectPathWithBoundary(_, _ string, _ func(HydrationState, error)) (string, error) {
+	s.newCalls++
+	return s.id, s.createErr
+}
+
 func (s *committedCreateSpy) SessionSummaryForSessionOrPersisted(id string) (SessionSummary, error) {
 	s.summaryCalls++
 	return SessionSummary{ID: id}, nil
@@ -353,6 +359,38 @@ func TestOpenOrCreateSessionCommittedFallbackReturnsIDOnlySummary(t *testing.T) 
 			t.Fatalf("summary lookups on success = %d, want exactly one normal lookup", spy.summaryCalls)
 		}
 	})
+}
+
+func TestOpenOrCreateSessionRealCommittedFallbackReturnsIDOnly(t *testing.T) {
+	_, second := newSharedHomeAgentPair(t)
+	projectPath := t.TempDir()
+	project, err := second.ProjectCurrentForPath(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var syncCalls int
+	atomicfs.SyncDirFunc = func(dir string) error {
+		if dir == second.Projects().SessionsRoot(project.ID) {
+			syncCalls++
+			if syncCalls >= 1 {
+				return errors.New("injected scope publication sync failure")
+			}
+		}
+		return nil
+	}
+	t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+	scope := NewAdapterScope(second, projectPath)
+	summary, err := scope.OpenOrCreateSession(projectPath)
+	var committed *snapshot.CommittedMutationError
+	if !errors.As(err, &committed) {
+		t.Fatalf("OpenOrCreateSession real committed fallback = %#v, %v; want typed error", summary, err)
+	}
+	if summary.ID == "" {
+		t.Fatal("real committed fallback returned no destination id")
+	}
+	if summary != (SessionSummary{ID: summary.ID}) {
+		t.Fatalf("real committed fallback summary = %#v, want ID-only", summary)
+	}
 }
 
 // TestOpenOrCreateSessionSurfacesCorruptCandidate proves OpenOrCreateSession

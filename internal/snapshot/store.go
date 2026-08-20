@@ -194,7 +194,12 @@ func (s *Store) BeginNewSessionStaged(projectRoot string) (err error) {
 	defer func() {
 		if err != nil && stagingRoot != "" {
 			if cerr := os.RemoveAll(stagingRoot); cerr != nil {
-				err = errors.Join(err, fmt.Errorf("snapshot: staging cleanup: %w", cerr))
+				var committed *CommittedMutationError
+				if errors.As(err, &committed) {
+					fmt.Fprintf(os.Stderr, "lightcode: staging cleanup %s: %v\n", stagingRoot, cerr)
+				} else {
+					err = errors.Join(err, fmt.Errorf("snapshot: staging cleanup: %w", cerr))
+				}
 			}
 		}
 	}()
@@ -292,6 +297,12 @@ func (s *Store) PublishPreparedSession(prepared *Store) error {
 	stagingRoot := prepared.root
 	finalRoot := s.root
 	if err := PublishStagedSession(stagingRoot, finalRoot, s.sessionID); err != nil {
+		var committed *CommittedMutationError
+		if errors.As(err, &committed) {
+			_ = prepared.RelocateActiveSessionPaths(finalRoot)
+			s.mu.Unlock()
+			return err
+		}
 		// The session is active but its files are still under staging; drop it.
 		// The staging tree stays for the caller's cleanup owner.
 		s.clearLocked()
@@ -349,6 +360,16 @@ func (s *Store) beginNewSessionAtLocked(projectRoot, parentSessionID, createRoot
 	sessionID, err := s.mintReservedSessionID(createRoot, meta, true)
 	if err != nil {
 		return err
+	}
+	if createRoot == s.root {
+		if err := atomicfs.SyncDir(filepath.Join(createRoot, sessionID)); err != nil {
+			_ = s.releaseClaimLocked(sessionID)
+			return &CommittedMutationError{Err: fmt.Errorf("snapshot: sync child session dir: %w", err)}
+		}
+		if err := atomicfs.SyncDir(createRoot); err != nil {
+			_ = s.releaseClaimLocked(sessionID)
+			return &CommittedMutationError{Err: fmt.Errorf("snapshot: sync sessions root: %w", err)}
+		}
 	}
 	dir := filepath.Join(s.root, sessionID)
 	s.active = true
@@ -1173,7 +1194,7 @@ func (s *Store) RevertHistory(toTurn int) (bool, error) {
 		}
 		removedRecord = true
 		if err := atomicfs.SyncDir(s.dir); err != nil {
-			return removedRecord, fmt.Errorf("snapshot: sync session dir: %w", err)
+			return removedRecord, &CommittedMutationError{Err: fmt.Errorf("snapshot: sync session dir: %w", err)}
 		}
 	}
 	// Walk descending and stop at the first failed removal, exactly like
@@ -1194,6 +1215,12 @@ func (s *Store) RevertHistory(toTurn int) (bool, error) {
 				s.currentTurn = t
 			}
 			return removedRecord, fmt.Errorf("snapshot: revert history turn %d: %w", t, err)
+		}
+		if t <= s.currentTurn {
+			s.currentTurn = t - 1
+		}
+		if err := atomicfs.SyncDir(s.turnsDir); err != nil {
+			return removedRecord, &CommittedMutationError{Err: fmt.Errorf("snapshot: sync turns dir: %w", err)}
 		}
 	}
 	if toTurn >= 0 && toTurn < s.currentTurn {

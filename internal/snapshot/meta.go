@@ -94,8 +94,7 @@ type SkippedRevert struct {
 // before the caller's error returned: the failure is typed so a shared adapter
 // can distinguish an already-committed outcome — whose boundary already owns
 // the prepared state and warning — from a precommit failure that emitted
-// nothing. No producer returns it yet; namespace producers adopt it in later
-// steps.
+// nothing.
 type CommittedMutationError struct {
 	Err error
 }

@@ -100,8 +100,7 @@ func TestSnapshotMetaBackwardsCompatibleWithoutCanonicalPath(t *testing.T) {
 
 // TestCommittedMutationErrorErrorAndUnwrap covers the sole committed-error
 // class: Error surfaces the cause's text and Unwrap makes errors.Is/errors.As
-// reach it, including through one more wrapping layer. No real producer returns
-// it yet; later steps adopt the namespace producers.
+// reach it, including through one more wrapping layer.
 func TestCommittedMutationErrorErrorAndUnwrap(t *testing.T) {
 	cause := errors.New("durable mutation committed")
 	e := &CommittedMutationError{Err: cause}

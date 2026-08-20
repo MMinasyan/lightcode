@@ -18,6 +18,7 @@ import (
 	"time"
 
 	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/config"
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/lsp"
@@ -955,6 +956,213 @@ func TestTaskToolPersistsInspectableChildSession(t *testing.T) {
 
 	if err := a.SessionSwitch(subEv.SubagentSessionID); err == nil {
 		t.Fatal("SessionSwitch child should reject internal session")
+	}
+}
+
+func assertMintedChildHasNoRuntime(t *testing.T, a *Agent, parentID, childID string, cap *eventCapture, beforeTurn int) {
+	t.Helper()
+	if got := a.store.CurrentTurn(); got != beforeTurn {
+		t.Fatalf("parent current turn after failed child mint = %d, want unchanged %d", got, beforeTurn)
+	}
+	if meta, err := snapshot.LoadSessionMeta(a.store.Root(), childID); err != nil {
+		t.Fatalf("load failed child meta: %v", err)
+	} else if meta.ParentSessionID != parentID {
+		t.Fatalf("failed child parent id = %q, want %q", meta.ParentSessionID, parentID)
+	}
+	turnEntries, err := os.ReadDir(filepath.Join(a.store.Root(), childID, "turns"))
+	if err != nil {
+		t.Fatalf("read failed child turns: %v", err)
+	}
+	for _, entry := range turnEntries {
+		if entry.IsDir() {
+			t.Fatalf("failed child retained turn directory %q, want no child turn", entry.Name())
+		}
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	for id := range a.sessions {
+		if id != parentID {
+			rt.mu.Unlock()
+			t.Fatalf("failed child %q created live loop/session unit %q", childID, id)
+		}
+	}
+	rt.mu.Unlock()
+	rt.transcriptMu.Lock()
+	for id := range rt.transcriptState {
+		if id != parentID {
+			rt.transcriptMu.Unlock()
+			t.Fatalf("failed child %q registered transcript %q", childID, id)
+		}
+	}
+	rt.transcriptMu.Unlock()
+	if cap != nil {
+		for _, ev := range cap.snapshot() {
+			if ev.SubagentSessionID == childID || ev.SessionID == childID || ev.Kind == EventSubagentStart {
+				t.Fatalf("failed child produced runtime event: %+v", ev)
+			}
+		}
+	}
+	projectID := ""
+	rt.mu.Lock()
+	if a.session != nil {
+		projectID = a.session.projectID
+	}
+	rt.mu.Unlock()
+	claim, ok, err := snapshot.AcquireSessionClaim(a.projects.Root(), projectID, childID)
+	if err != nil || !ok {
+		t.Fatalf("failed child claim = ok:%v err:%v, want released", ok, err)
+	}
+	_ = claim.Release()
+}
+
+func TestTaskChildSyncFailureStopsBeforeChildRuntime(t *testing.T) {
+	for _, row := range []struct {
+		name string
+		fail func(root, parentDir, dir string) bool
+	}{
+		{
+			name: "child_directory",
+			fail: func(root, parentDir, dir string) bool {
+				return filepath.Dir(dir) == root && dir != parentDir
+			},
+		},
+		{
+			name: "sessions_root",
+			fail: func(root, _, dir string) bool { return dir == root },
+		},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				switch calls.Add(1) {
+				case 1:
+					writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"child must not start","subagent_type":"explore"}]}`)
+				case 2:
+					writeTextResponse(w, "parent finished")
+				default:
+					t.Fatalf("unexpected provider call")
+				}
+			}))
+			defer server.Close()
+
+			a := newEventOrderAgent(t, server.URL+"/v1")
+			parentID, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cap := &eventCapture{}
+			ctx := startEventOrderAgent(t, a, cap)
+			root := a.store.Root()
+			parentDir := a.store.Dir()
+			injected := errors.New("injected task child sync failure")
+			atomicfs.SyncDirFunc = func(dir string) error {
+				if row.fail(root, parentDir, dir) {
+					return injected
+				}
+				return nil
+			}
+			t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+			if _, err := a.Submit(ctx, "delegate failed child"); err != nil {
+				t.Fatalf("Submit: %v", err)
+			}
+			waitUntilEventOrderTurnEndCount(t, cap, 1)
+			waitUntilEventOrderAgentIdle(t, a)
+			childIDs := sessionChildDirs(t, a, parentID)
+			if len(childIDs) != 1 {
+				t.Fatalf("child rows after failed task mint = %v, want one retained Store row", childIDs)
+			}
+			assertMintedChildHasNoRuntime(t, a, parentID, childIDs[0], cap, 1)
+			if calls.Load() != 2 {
+				t.Fatalf("provider calls = %d, want task plus parent completion", calls.Load())
+			}
+		})
+	}
+}
+
+func TestCompactChildSyncFailureStopsBeforeChildRuntime(t *testing.T) {
+	for _, row := range []struct {
+		name string
+		fail func(root, parentDir, dir string) bool
+	}{
+		{
+			name: "child_directory",
+			fail: func(root, parentDir, dir string) bool {
+				return filepath.Dir(dir) == root && dir != parentDir
+			},
+		},
+		{
+			name: "sessions_root",
+			fail: func(root, _, dir string) bool { return dir == root },
+		},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			a := newCatalogBackedTestAgent(t)
+			appendUserTurn(t, a, "compact this")
+			parentID := a.store.SessionID()
+			beforeTurn := a.store.CurrentTurn()
+			root := a.store.Root()
+			parentDir := a.store.Dir()
+			injected := errors.New("injected compact child sync failure")
+			atomicfs.SyncDirFunc = func(dir string) error {
+				if row.fail(root, parentDir, dir) {
+					return injected
+				}
+				return nil
+			}
+			t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+			err := a.runCompaction(context.Background(), false)
+			var committed *snapshot.CommittedMutationError
+			if !errors.As(err, &committed) {
+				t.Fatalf("compact child sync error = %v, want committed error", err)
+			}
+			childIDs := sessionChildDirs(t, a, parentID)
+			if len(childIDs) != 1 {
+				t.Fatalf("child rows after failed compact mint = %v, want one retained Store row", childIDs)
+			}
+			assertMintedChildHasNoRuntime(t, a, parentID, childIDs[0], nil, beforeTurn)
+			if _, err := os.Stat(filepath.Join(a.store.Dir(), "compaction.json")); !os.IsNotExist(err) {
+				t.Fatalf("parent compaction record after failed child mint = %v, want absent", err)
+			}
+		})
+	}
+}
+
+func TestCompactChildPostActivationMetadataFailuresRemainOrdinary(t *testing.T) {
+	for _, row := range []struct {
+		name    string
+		failOn  int32
+		message string
+	}{
+		{name: "set_active_agent_type", failOn: 2, message: "injected active-agent metadata failure"},
+		{name: "set_model", failOn: 3, message: "injected model metadata failure"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			a := newCatalogBackedTestAgent(t)
+			appendUserTurn(t, a, "compact this")
+			var metaWrites atomic.Int32
+			injected := errors.New(row.message)
+			atomicfs.SyncFileFunc = func(file *os.File) error {
+				if strings.HasPrefix(filepath.Base(file.Name()), "meta.json.tmp-") && metaWrites.Add(1) == row.failOn {
+					return injected
+				}
+				return nil
+			}
+			t.Cleanup(func() { atomicfs.SyncFileFunc = nil })
+
+			_, _, err := a.compactRunningUnitForSession(a.session)
+			if !errors.Is(err, injected) {
+				t.Fatalf("post-activation metadata error = %v, want %v", err, injected)
+			}
+			var committed *snapshot.CommittedMutationError
+			if errors.As(err, &committed) {
+				t.Fatalf("post-activation metadata error = %v, want ordinary error, not committed", err)
+			}
+			if got := metaWrites.Load(); got != row.failOn {
+				t.Fatalf("meta writes before injected failure = %d, want %d", got, row.failOn)
+			}
+		})
 	}
 }
 

@@ -166,8 +166,23 @@ func (a *App) startup(ctx context.Context) {
 	sessionID := a.svc.Init(hostCtx)
 	a.routeProjectPath = a.svc.ProjectRoot()
 	if sessionID == "" {
-		if id, err := a.svc.NewSessionForProjectPath(a.routeProjectPath, "primary"); err == nil {
+		var prepared agent.HydrationState
+		emitted := false
+		id, err := a.svc.NewSessionForProjectPathWithBoundary(a.routeProjectPath, "primary", func(state agent.HydrationState, _ error) {
+			prepared = state
+			emitted = true
+		})
+		if err != nil {
+			var committed *snapshot.CommittedMutationError
+			if emitted && errors.As(err, &committed) {
+				sessionID = id
+				fmt.Fprintf(os.Stderr, "lightcode: startup session: %v\n", err)
+			}
+		} else if emitted {
 			sessionID = id
+			if sessionID == "" {
+				sessionID = prepared.Session.ID
+			}
 		}
 	}
 	a.setCurrentSessionID(sessionID)

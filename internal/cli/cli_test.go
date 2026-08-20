@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
 	"github.com/MMinasyan/lightcode/internal/project"
@@ -4626,6 +4627,15 @@ func (f *lifecycleOutcomeAdapter) NewSessionForProjectPath(_, _ string) (string,
 	return f.newID, f.outcome
 }
 
+func (f *lifecycleOutcomeAdapter) NewSessionForProjectPathWithBoundary(_, _ string, emit func(agent.HydrationState, error)) (string, error) {
+	f.log("new:" + f.newID)
+	var committed *snapshot.CommittedMutationError
+	if emit != nil && f.newID != "" && (f.outcome == nil || errors.As(f.outcome, &committed)) {
+		emit(agent.HydrationState{Session: agent.SessionSummary{ID: f.newID}}, f.outcome)
+	}
+	return f.newID, f.outcome
+}
+
 // SessionListForProjectPath feeds menu construction and selectIndex; it returns the prepared list.
 func (f *lifecycleOutcomeAdapter) SessionListForProjectPath(_, _ string) ([]agent.SessionSummary, error) {
 	f.log("list")
@@ -5151,6 +5161,222 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 		s := out.String()
 		if !strings.Contains(s, "session deleted") || strings.Contains(s, committed.Error()) || strings.Contains(s, plain.Error()) {
 			t.Fatalf("output = %q, want the success line and no rejection", s)
+		}
+	})
+}
+
+func TestCLIStartupRealCommittedCreationAdoptsDestination(t *testing.T) {
+	ag, _ := newTestAgent(t)
+	c := New(ag)
+	c.out = new(bytes.Buffer)
+	root := ag.Projects().Root()
+	atomicfs.SyncDirFunc = func(dir string) error {
+		if strings.HasSuffix(dir, string(filepath.Separator)+"sessions") {
+			return errors.New("injected startup publication sync failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+	err := c.initializeSession(context.Background())
+	if err == nil {
+		t.Fatal("CLI startup committed publication failure returned nil")
+	}
+	var committed *snapshot.CommittedMutationError
+	if !errors.As(err, &committed) {
+		t.Fatalf("CLI startup committed creation error = %v, want committed error", err)
+	}
+	if c.currentSessionID() == "" {
+		t.Fatal("CLI startup did not adopt committed destination")
+	}
+	if !strings.HasPrefix(root, filepath.Dir(ag.Projects().Root())) {
+		t.Fatal("CLI startup test did not use the real project namespace")
+	}
+}
+
+func TestCLIStartupPlainCreationFailureDoesNotAdopt(t *testing.T) {
+	ag, _ := newTestAgent(t)
+	if _, err := ag.Projects().Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected startup metadata sync failure")
+	atomicfs.SyncFileFunc = func(*os.File) error { return injected }
+	t.Cleanup(func() { atomicfs.SyncFileFunc = nil })
+
+	c := New(ag)
+	c.out = new(bytes.Buffer)
+	err := c.initializeSession(context.Background())
+	if !errors.Is(err, injected) {
+		t.Fatalf("CLI startup plain creation error = %v, want injected failure", err)
+	}
+	var committed *snapshot.CommittedMutationError
+	if errors.As(err, &committed) {
+		t.Fatalf("CLI startup plain creation error = %v, want no committed classification", err)
+	}
+	if c.currentSessionID() != "" {
+		t.Fatalf("CLI current after plain startup failure = %q, want empty", c.currentSessionID())
+	}
+}
+
+func TestCLIRealCommittedNamespaceProducers(t *testing.T) {
+	t.Run("archive", func(t *testing.T) {
+		ag, _ := newTestAgent(t)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatal(err)
+		}
+		project, err := ag.Projects().Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := New(ag)
+		c.out = new(bytes.Buffer)
+		c.setCurrentSessionID(id)
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, id), keyMsg{Rune: 'a'})
+		sessionDir := filepath.Join(ag.Projects().SessionsRoot(project.ID), id)
+		var syncCalls int
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == sessionDir {
+				syncCalls++
+				if syncCalls == 2 {
+					return errors.New("injected CLI archive sync failure")
+				}
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+		dispatchSelection(t, c, "/session", "")
+		wantCurrent(t, c, "")
+		if !strings.Contains(c.out.(*bytes.Buffer).String(), "CLI archive sync failure") {
+			t.Fatalf("CLI archive output = %q, want committed rejection", c.out.(*bytes.Buffer).String())
+		}
+		meta, err := snapshot.LoadSessionMeta(ag.Projects().SessionsRoot(project.ID), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if meta.State != snapshot.StateArchived {
+			t.Fatalf("CLI archive state = %q, want archived", meta.State)
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		ag, _ := newTestAgent(t)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatal(err)
+		}
+		project, err := ag.Projects().Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := New(ag)
+		c.out = new(bytes.Buffer)
+		c.setCurrentSessionID(id)
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, id), keyMsg{Rune: 'd'})
+		sessionsRoot := ag.Projects().SessionsRoot(project.ID)
+		injected := errors.New("injected CLI delete sync failure")
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == sessionsRoot {
+				return injected
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+		dispatchSelection(t, c, "/session", "")
+		wantCurrent(t, c, "")
+		if !strings.Contains(c.out.(*bytes.Buffer).String(), "CLI delete sync failure") {
+			t.Fatalf("CLI delete output = %q, want committed rejection", c.out.(*bytes.Buffer).String())
+		}
+		if _, err := os.Stat(filepath.Join(sessionsRoot, id)); !os.IsNotExist(err) {
+			t.Fatalf("CLI deleted source = %v, want absent", err)
+		}
+	})
+
+	seed := func(t *testing.T) (*CLI, string, string, int) {
+		t.Helper()
+		ag, _ := newTestAgent(t)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lastTurn := 0
+		for _, text := range []string{"one", "two", "three"} {
+			lastTurn, err = ag.AppendUserMessageToSession(id, text)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		project, err := ag.Projects().Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := New(ag)
+		c.out = new(bytes.Buffer)
+		c.setCurrentSessionID(id)
+		return c, id, ag.Projects().SessionsRoot(project.ID), lastTurn
+	}
+
+	t.Run("history", func(t *testing.T) {
+		c, id, sessionsRoot, lastTurn := seed(t)
+		turnsDir := filepath.Join(sessionsRoot, id, "turns")
+		injected := errors.New("injected CLI history sync failure")
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == turnsDir {
+				return injected
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+		c.readKeyFn = keySequence(
+			keyMsg{Special: keyEnter},
+			keyMsg{Special: keyDown},
+			keyMsg{Special: keyEnter},
+			keyMsg{Special: keyEnter},
+		)
+
+		if err := c.dispatchCommand("/revert"); err != nil {
+			t.Fatal(err)
+		}
+		wantCurrent(t, c, id)
+		if !strings.Contains(c.out.(*bytes.Buffer).String(), "CLI history sync failure") {
+			t.Fatalf("CLI history output = %q, want committed rejection", c.out.(*bytes.Buffer).String())
+		}
+		if _, err := os.Stat(filepath.Join(turnsDir, fmt.Sprint(lastTurn))); !os.IsNotExist(err) {
+			t.Fatalf("CLI reverted turn = %v, want removed", err)
+		}
+	})
+
+	t.Run("fork", func(t *testing.T) {
+		c, sourceID, sessionsRoot, _ := seed(t)
+		injected := errors.New("injected CLI fork sync failure")
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == sessionsRoot {
+				return injected
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+		c.readKeyFn = keySequence(
+			keyMsg{Special: keyEnter},
+			keyMsg{Special: keyDown},
+			keyMsg{Special: keyDown},
+			keyMsg{Special: keyEnter},
+			keyMsg{Special: keyEnter},
+		)
+
+		if err := c.dispatchCommand("/revert"); err != nil {
+			t.Fatal(err)
+		}
+		destinationID, _ := c.currentSession()
+		if destinationID == "" || destinationID == sourceID {
+			t.Fatalf("CLI current after committed fork = %q, want adopted destination", destinationID)
+		}
+		if !strings.Contains(c.out.(*bytes.Buffer).String(), "CLI fork sync failure") {
+			t.Fatalf("CLI fork output = %q, want committed rejection", c.out.(*bytes.Buffer).String())
+		}
+		if _, err := os.Stat(filepath.Join(sessionsRoot, destinationID, "meta.json")); err != nil {
+			t.Fatalf("CLI fork destination metadata: %v", err)
 		}
 	})
 }

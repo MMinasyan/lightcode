@@ -484,33 +484,43 @@ func (c *CLI) Run(ctx context.Context) error {
 
 	c.agent.SetEventHandler(c.enqueueEvent)
 
-	// Init resumes the most recent acquirable session and returns its id, so
-	// the adapter adopts exactly the session that was resumed; a new session
-	// is created only when nothing was resumed. This is owner work, not
-	// presentation: the header/history/prompt closure below runs only on
-	// mainLoop's goroutine, after the reader and the signal watcher exist, so
-	// a blocked startup write cannot retain the owner.
-	sessionID := c.agent.Init(ctx)
-	if sessionID == "" {
-		if id, err := c.scope.NewSession("primary"); err == nil {
-			sessionID = id
-		}
-	}
-	c.setCurrentSessionID(sessionID)
-
-	c.refreshState()
-
-	msgs := c.sessionMessages()
-	c.messages = buildDisplayMsgs(msgs)
-	c.seedInputHistory()
-
+	startupErr := c.initializeSession(ctx)
 	return c.runInteractive(ctx, func() {
+		if startupErr != nil {
+			c.printLine(renderErrorMsg(startupErr.Error()))
+		}
 		c.printHeader()
 		for _, m := range c.messages {
 			c.printDisplayEntry(m)
 		}
 		c.printInputPrompt()
 	}, os.Stdin)
+}
+
+// initializeSession performs owner startup and prepares the first terminal
+// view. A committed creation keeps its returned destination selected before the
+// startup error is rendered; plain failure keeps the prior selection.
+func (c *CLI) initializeSession(ctx context.Context) error {
+	sessionID := c.agent.Init(ctx)
+	var startupErr error
+	if sessionID == "" {
+		id, err := c.scope.NewSession("primary")
+		if err != nil {
+			startupErr = err
+			var committed *snapshot.CommittedMutationError
+			if id != "" && errors.As(err, &committed) {
+				startupErr = err
+				sessionID = id
+			}
+		} else {
+			sessionID = id
+		}
+	}
+	c.setCurrentSessionID(sessionID)
+	c.refreshState()
+	c.messages = buildDisplayMsgs(c.sessionMessages())
+	c.seedInputHistory()
+	return startupErr
 }
 
 // runInteractive runs the terminal session: signal observation, the key

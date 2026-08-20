@@ -365,6 +365,226 @@ func TestACPOwnsConcreteAgentLifecycle(t *testing.T) {
 	}
 }
 
+func TestACPStartupRealCommittedCreationReturnsTypedErrorAfterAdoption(t *testing.T) {
+	ag := newACPTestAgent(t)
+	var out bytes.Buffer
+	r := &Runner{agent: ag, owner: ag, in: strings.NewReader(""), out: &out}
+	root := ag.Projects().Root()
+	atomicfs.SyncDirFunc = func(dir string) error {
+		if strings.HasSuffix(dir, string(filepath.Separator)+"sessions") {
+			return errors.New("injected startup publication sync failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+	err := r.Run(context.Background())
+	if err == nil {
+		t.Fatal("ACP startup committed publication failure returned nil")
+	}
+	var committed *snapshot.CommittedMutationError
+	if !errors.As(err, &committed) {
+		t.Fatalf("ACP startup committed creation error = %v, want committed error", err)
+	}
+	if r.sv().Current() == "" {
+		t.Fatal("ACP startup did not adopt committed destination")
+	}
+	if !strings.HasPrefix(root, filepath.Dir(ag.Projects().Root())) {
+		t.Fatal("ACP startup test did not use the real project namespace")
+	}
+}
+
+func TestACPStartupPlainCreationFailureDoesNotAdopt(t *testing.T) {
+	ag := newACPTestAgent(t)
+	if _, err := ag.Projects().Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected startup metadata sync failure")
+	atomicfs.SyncFileFunc = func(*os.File) error { return injected }
+	t.Cleanup(func() { atomicfs.SyncFileFunc = nil })
+
+	r := &Runner{agent: ag, owner: ag, in: strings.NewReader(""), out: new(bytes.Buffer)}
+	err := r.Run(context.Background())
+	if !errors.Is(err, injected) {
+		t.Fatalf("ACP startup plain creation error = %v, want injected failure", err)
+	}
+	var committed *snapshot.CommittedMutationError
+	if errors.As(err, &committed) {
+		t.Fatalf("ACP startup plain creation error = %v, want no committed classification", err)
+	}
+	if r.sv().Current() != "" {
+		t.Fatalf("ACP current after plain startup failure = %q, want empty", r.sv().Current())
+	}
+}
+
+func TestACPRealCommittedNamespaceProducers(t *testing.T) {
+	newRunner := func(t *testing.T) (*Runner, *agent.Agent, string, string) {
+		t.Helper()
+		ag := newACPTestAgent(t)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatal(err)
+		}
+		project, err := ag.Projects().Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := new(bytes.Buffer)
+		r := &Runner{agent: ag, owner: ag, out: out}
+		r.setCurrentSessionID(id)
+		return r, ag, id, ag.Projects().SessionsRoot(project.ID)
+	}
+
+	t.Run("archive", func(t *testing.T) {
+		r, _, id, sessionsRoot := newRunner(t)
+		sessionDir := filepath.Join(sessionsRoot, id)
+		var syncCalls int
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == sessionDir {
+				syncCalls++
+				if syncCalls == 2 {
+					return errors.New("injected ACP archive sync failure")
+				}
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+		r.handleSessionArchive(Request{JSONRPC: "2.0", ID: "archive", Method: "session/archive", Params: json.RawMessage(`{"id":"` + id + `"}`)})
+		lines := drainedLines(t, r, r.out.(*bytes.Buffer), 2)
+		var response Response
+		if err := json.Unmarshal([]byte(lines[1]), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Error == nil || !strings.Contains(response.Error.Message, "ACP archive sync failure") {
+			t.Fatalf("archive response = %q, want committed rejection", lines[1])
+		}
+		if r.sv().Current() != "" {
+			t.Fatalf("ACP current after committed archive = %q, want detached", r.sv().Current())
+		}
+		meta, err := snapshot.LoadSessionMeta(sessionsRoot, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if meta.State != snapshot.StateArchived {
+			t.Fatalf("ACP archive state = %q, want archived", meta.State)
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		r, _, id, sessionsRoot := newRunner(t)
+		injected := errors.New("injected ACP delete sync failure")
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == sessionsRoot {
+				return injected
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+		r.handleSessionDelete(Request{JSONRPC: "2.0", ID: "delete", Method: "session/delete", Params: json.RawMessage(`{"id":"` + id + `"}`)})
+		lines := drainedLines(t, r, r.out.(*bytes.Buffer), 2)
+		var response Response
+		if err := json.Unmarshal([]byte(lines[1]), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Error == nil || !strings.Contains(response.Error.Message, "ACP delete sync failure") {
+			t.Fatalf("delete response = %q, want committed rejection", lines[1])
+		}
+		if r.sv().Current() != "" {
+			t.Fatalf("ACP current after committed delete = %q, want detached", r.sv().Current())
+		}
+		if _, err := os.Stat(filepath.Join(sessionsRoot, id)); !os.IsNotExist(err) {
+			t.Fatalf("ACP deleted source = %v, want absent", err)
+		}
+	})
+
+	t.Run("history", func(t *testing.T) {
+		r, ag, id, sessionsRoot := newRunner(t)
+		lastTurn := 0
+		var err error
+		for _, text := range []string{"one", "two", "three"} {
+			lastTurn, err = ag.AppendUserMessageToSession(id, text)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		turnsDir := filepath.Join(sessionsRoot, id, "turns")
+		injected := errors.New("injected ACP history sync failure")
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == turnsDir {
+				return injected
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+		params, err := json.Marshal(turnActionParams{SessionID: id, Turn: lastTurn})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.handleRevertHistory(Request{JSONRPC: "2.0", ID: "history", Method: "session/revert_history", Params: params})
+		lines := drainedLines(t, r, r.out.(*bytes.Buffer), 2)
+		var response Response
+		if err := json.Unmarshal([]byte(lines[1]), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Error == nil || response.Error.Data == nil || !strings.Contains(response.Error.Message, "ACP history sync failure") {
+			t.Fatalf("history response = %q, want typed rejection with prepared result", lines[1])
+		}
+		var result agent.TurnActionResult
+		if err := unmarshalInto(t, response.Error.Data, &result); err != nil || result.Session.ID != id {
+			t.Fatalf("history error data = %#v (%v), want prepared current session", response.Error.Data, err)
+		}
+		if r.sv().Current() != id {
+			t.Fatalf("ACP current after committed history = %q, want %q", r.sv().Current(), id)
+		}
+		if _, err := os.Stat(filepath.Join(turnsDir, fmt.Sprint(lastTurn))); !os.IsNotExist(err) {
+			t.Fatalf("ACP reverted turn = %v, want removed", err)
+		}
+	})
+
+	t.Run("fork", func(t *testing.T) {
+		r, ag, sourceID, sessionsRoot := newRunner(t)
+		turn, err := ag.AppendUserMessageToSession(sourceID, "fork source")
+		if err != nil {
+			t.Fatal(err)
+		}
+		injected := errors.New("injected ACP fork sync failure")
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == sessionsRoot {
+				return injected
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+		params, err := json.Marshal(turnActionParams{SessionID: sourceID, Turn: turn})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.handleSessionFork(Request{JSONRPC: "2.0", ID: "fork", Method: "session/fork", Params: params})
+		lines := drainedLines(t, r, r.out.(*bytes.Buffer), 2)
+		var response Response
+		if err := json.Unmarshal([]byte(lines[1]), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Error == nil || response.Error.Data == nil || !strings.Contains(response.Error.Message, "ACP fork sync failure") {
+			t.Fatalf("fork response = %q, want typed rejection with prepared result", lines[1])
+		}
+		var result agent.TurnActionResult
+		if err := unmarshalInto(t, response.Error.Data, &result); err != nil {
+			t.Fatalf("fork error data: %v", err)
+		}
+		destinationID := result.Session.ID
+		if destinationID == "" || destinationID == sourceID || r.sv().Current() != destinationID {
+			t.Fatalf("ACP fork destination = %q, current = %q, want adopted destination", destinationID, r.sv().Current())
+		}
+		if _, err := os.Stat(filepath.Join(sessionsRoot, destinationID, "meta.json")); err != nil {
+			t.Fatalf("ACP fork destination metadata: %v", err)
+		}
+	})
+}
+
 // blockingReader blocks every Read until release is closed, modeling stdin with no
 // input so a Scan stays blocked until shutdown abandons it.
 type blockingReader struct{ release <-chan struct{} }

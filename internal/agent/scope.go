@@ -62,7 +62,7 @@ func (s *AdapterScope) SessionList(state string) ([]SessionSummary, error) {
 
 // NewSession creates a session in the adapter-local project.
 func (s *AdapterScope) NewSession(agentType string) (string, error) {
-	return s.svc.NewSessionForProjectPath(s.ProjectPath(), agentType)
+	return s.svc.NewSessionForProjectPathWithBoundary(s.ProjectPath(), agentType, func(HydrationState, error) {})
 }
 
 // ReadFileContent reads a file scoped to the adapter-local project.
@@ -90,7 +90,7 @@ func (s *AdapterScope) OpenOrCreateSession(projectPath string) (SessionSummary, 
 			return SessionSummary{}, err
 		}
 	}
-	id, err := s.svc.NewSessionForProjectPath(projectPath, "primary")
+	id, err := s.svc.NewSessionForProjectPathWithBoundary(projectPath, "primary", func(HydrationState, error) {})
 	if err != nil {
 		var committed *snapshot.CommittedMutationError
 		if id != "" && errors.As(err, &committed) {

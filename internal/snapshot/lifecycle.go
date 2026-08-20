@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 // SessionInfo is the summary returned by List for the session switcher.
@@ -136,18 +138,19 @@ func SweepAllProjects(projectsRoot string, cfg LifecycleConfig, onDelete func(se
 		return 0, 0, fmt.Errorf("snapshot: sweep projects: %w", err)
 	}
 	archived, deleted := 0, 0
+	var firstErr error
 	for _, e := range entries {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
 		a, d, err := Sweep(projectsRoot, e.Name(), cfg, onDelete, serialize)
-		if err != nil {
-			continue
-		}
 		archived += a
 		deleted += d
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	return archived, deleted, nil
+	return archived, deleted, firstErr
 }
 
 // Sweep walks one project's session dirs and applies state transitions per
@@ -172,6 +175,7 @@ func Sweep(projectsRoot, projectID string, cfg LifecycleConfig, onDelete func(se
 	archiveCutoff := int64(cfg.ArchiveAfterDays) * 86400
 	deleteCutoff := int64(cfg.DeleteAfterArchiveDays) * 86400
 	archived, deleted := 0, 0
+	var firstErr error
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -180,11 +184,20 @@ func Sweep(projectsRoot, projectID string, cfg LifecycleConfig, onDelete func(se
 		if ValidateSessionID(sessionID) != nil {
 			continue
 		}
-		a, d := sweepCandidate(projectsRoot, projectID, root, sessionID, now, archiveCutoff, deleteCutoff, onDelete, serialize)
-		archived += a
-		deleted += d
+		result := sweepCandidate(projectsRoot, projectID, root, sessionID, now, archiveCutoff, deleteCutoff, onDelete, serialize)
+		archived += result.archived
+		deleted += result.deleted
+		if result.err != nil && firstErr == nil {
+			firstErr = result.err
+		}
 	}
-	return archived, deleted, nil
+	return archived, deleted, firstErr
+}
+
+type sweepResult struct {
+	archived int
+	deleted  int
+	err      error
 }
 
 // sweepCandidate processes one candidate. The lifecycle serializer (if any)
@@ -194,54 +207,58 @@ func Sweep(projectsRoot, projectID string, cfg LifecycleConfig, onDelete func(se
 // deferred until the candidate completes. Eligibility is then pre-filtered
 // lock-free and rechecked under the claim since state is only stable once
 // held.
-func sweepCandidate(projectsRoot, projectID, root, sessionID string, now, archiveCutoff, deleteCutoff int64, onDelete func(sessionID string), serialize CandidateSerializer) (int, int) {
+func sweepCandidate(projectsRoot, projectID, root, sessionID string, now, archiveCutoff, deleteCutoff int64, onDelete func(sessionID string), serialize CandidateSerializer) sweepResult {
 	metaPath := filepath.Join(root, sessionID, "meta.json")
 	if serialize != nil {
 		release, admitted := serialize()
 		if !admitted {
-			return 0, 0
+			return sweepResult{}
 		}
 		defer release()
 	}
 	var meta SessionMeta
 	if readJSON(metaPath, &meta) != nil {
-		return 0, 0
+		return sweepResult{}
 	}
 	if !sweepEligible(meta, now, archiveCutoff, deleteCutoff) {
-		return 0, 0
+		return sweepResult{}
 	}
 	claim, ok, err := AcquireSessionClaim(projectsRoot, projectID, sessionID)
 	if err != nil || !ok {
-		return 0, 0
+		return sweepResult{}
 	}
 	// ReleaseSessionClaim reports a failed release to stderr; the sweep's
 	// return shape has no error to carry it in, so it is discarded here.
 	defer func() { _ = ReleaseSessionClaim(claim, sessionID) }()
 	if readJSON(metaPath, &meta) != nil {
-		return 0, 0
+		return sweepResult{}
 	}
 	switch effectiveState(meta.State) {
 	case StateActive:
 		if archiveCutoff > 0 && meta.LastActivity > 0 && now-meta.LastActivity > archiveCutoff {
-			meta.State = StateArchived
-			meta.ArchivedAt = now
-			if writeJSON(metaPath, meta) == nil {
-				return 1, 0
+			err := ArchiveSession(root, sessionID)
+			var committed *CommittedMutationError
+			if err == nil || errors.As(err, &committed) {
+				return sweepResult{archived: 1, err: err}
 			}
+			return sweepResult{err: err}
 		}
 	case StateArchived:
 		if deleteCutoff > 0 && meta.ArchivedAt > 0 && now-meta.ArchivedAt > deleteCutoff {
 			// Commit the durable delete first; only then run post-commit cleanup
 			// so a rename failure never loses summaries for a still-listed session.
-			if DeleteSession(root, sessionID) == nil {
+			err := DeleteSession(root, sessionID)
+			var committed *CommittedMutationError
+			if err == nil || errors.As(err, &committed) {
 				if onDelete != nil {
 					onDelete(sessionID)
 				}
-				return 0, 1
+				return sweepResult{deleted: 1, err: err}
 			}
+			return sweepResult{err: err}
 		}
 	}
-	return 0, 0
+	return sweepResult{}
 }
 
 func sweepEligible(meta SessionMeta, now, archiveCutoff, deleteCutoff int64) bool {
@@ -271,7 +288,13 @@ func ArchiveSession(sessionsRoot, id string) error {
 	}
 	meta.State = StateArchived
 	meta.ArchivedAt = time.Now().Unix()
-	return writeJSON(metaPath, meta)
+	if err := writeJSON(metaPath, meta); err != nil {
+		return err
+	}
+	if err := atomicfs.SyncDir(filepath.Dir(metaPath)); err != nil {
+		return &CommittedMutationError{Err: fmt.Errorf("snapshot: sync archive metadata parent: %w", err)}
+	}
+	return nil
 }
 
 // DeleteSession removes a session. The durable commit is an atomic rename of
@@ -304,8 +327,18 @@ func DeleteSession(sessionsRoot, id string) error {
 		}
 		return fmt.Errorf("snapshot: delete %s: %w", id, err)
 	}
+	var syncErr error
+	if err := atomicfs.SyncDir(sessionsRoot); err != nil {
+		syncErr = fmt.Errorf("snapshot: sync delete source parent: %w", err)
+	}
+	if err := atomicfs.SyncDir(filepath.Dir(dst)); err != nil && syncErr == nil {
+		syncErr = fmt.Errorf("snapshot: sync delete destination parent: %w", err)
+	}
 	// Post-commit cleanup only; failure leaves an ignored orphan under .deleting.
 	_ = os.RemoveAll(dst)
+	if syncErr != nil {
+		return &CommittedMutationError{Err: syncErr}
+	}
 	return nil
 }
 
@@ -341,8 +374,40 @@ func PublishStagedSession(stagingRoot, finalSessionsRoot, id string) error {
 	if err := os.MkdirAll(finalSessionsRoot, 0o700); err != nil {
 		return fmt.Errorf("snapshot: publish staged: %w", err)
 	}
-	if err := os.Rename(filepath.Join(stagingRoot, id), filepath.Join(finalSessionsRoot, id)); err != nil {
+	candidateDir := filepath.Join(stagingRoot, id)
+	if err := syncCandidateTree(candidateDir); err != nil {
+		return err
+	}
+	if err := os.Rename(candidateDir, filepath.Join(finalSessionsRoot, id)); err != nil {
 		return fmt.Errorf("snapshot: publish staged %s: %w", id, err)
+	}
+	var syncErr error
+	if err := atomicfs.SyncDir(stagingRoot); err != nil {
+		syncErr = fmt.Errorf("snapshot: sync staging parent: %w", err)
+	}
+	if err := atomicfs.SyncDir(finalSessionsRoot); err != nil && syncErr == nil {
+		syncErr = fmt.Errorf("snapshot: sync sessions root: %w", err)
+	}
+	if syncErr != nil {
+		return &CommittedMutationError{Err: syncErr}
+	}
+	return nil
+}
+
+func syncCandidateTree(root string) error {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return fmt.Errorf("snapshot: sync candidate tree: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			if err := syncCandidateTree(filepath.Join(root, entry.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	if err := atomicfs.SyncDir(root); err != nil {
+		return fmt.Errorf("snapshot: sync candidate directory %s: %w", root, err)
 	}
 	return nil
 }

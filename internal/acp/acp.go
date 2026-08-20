@@ -281,20 +281,56 @@ func (r *Runner) Run(ctx context.Context) error {
 	// the adapter adopts exactly the session that was resumed; a new session
 	// is created only when nothing was resumed.
 	sessionID := r.agent.Init(ctx)
+	var startupErr error
+	startupPrepared := false
+	var prepared agent.SessionSummary
 	if sessionID == "" {
-		if id, err := r.agent.NewSession("", "primary"); err == nil {
+		emitted := false
+		id, err := r.agent.NewSessionForProjectPathWithBoundary(r.agent.ProjectRoot(), "primary", func(state agent.HydrationState, _ error) {
+			prepared = state.Session
+			emitted = true
+		})
+		if err != nil {
+			startupErr = err
+			var committed *snapshot.CommittedMutationError
+			if emitted && errors.As(err, &committed) {
+				sessionID = id
+				r.setCurrent(id, prepared)
+				startupPrepared = true
+			}
+		} else if emitted {
 			sessionID = id
+			if sessionID == "" {
+				sessionID = prepared.ID
+			}
+			r.setCurrent(sessionID, prepared)
+			startupPrepared = true
 		}
+	}
+	if startupErr != nil && sessionID == "" {
+		r.setCurrentSessionID("")
 	}
 	// Seed the routing project from the resumed session's summary; if that
 	// read fails the id is still committed and the project path stays unset so
 	// the pre-session fallback applies by itself.
-	if summary, err := r.agent.SessionSummaryForSession(sessionID); err == nil {
-		r.setCurrent(sessionID, summary)
-	} else {
-		r.setCurrentSessionID(sessionID)
+	if startupErr == nil && !startupPrepared {
+		if summary, err := r.agent.SessionSummaryForSession(sessionID); err == nil {
+			r.setCurrent(sessionID, summary)
+		} else {
+			r.setCurrentSessionID(sessionID)
+		}
+	} else if sessionID == "" {
+		r.setCurrentSessionID("")
 	}
 	r.seedPresented(sessionID)
+	if startupErr != nil {
+		r.closeDispatch()
+		if r.owner != nil && !r.owner.ShutdownOwner() {
+			startupErr = errors.Join(startupErr, fmt.Errorf("owner shutdown abandoned in-flight work"))
+		}
+		r.closeOutput()
+		return startupErr
+	}
 
 	scanErr := make(chan error, 1)
 	go func() { scanErr <- r.scanLoop(sigCtx) }()
