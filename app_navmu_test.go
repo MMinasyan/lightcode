@@ -33,9 +33,9 @@ func (s *recordingProjectSvc) SessionSummaryForSession(id string) (agent.Session
 	return agent.SessionSummary{ID: id}, nil
 }
 
-func (s *recordingProjectSvc) NewSessionForProjectPathWithBoundary(_, _ string, emit func(agent.HydrationState)) (string, error) {
+func (s *recordingProjectSvc) NewSessionForProjectPathWithBoundary(_, _ string, emit func(agent.HydrationState, error)) (string, error) {
 	if emit != nil {
-		emit(agent.HydrationState{Session: agent.SessionSummary{ID: "sess"}})
+		emit(agent.HydrationState{Session: agent.SessionSummary{ID: "sess"}}, nil)
 	}
 	return "sess", nil
 }

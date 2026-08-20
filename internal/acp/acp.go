@@ -678,8 +678,17 @@ func (r *Runner) tokenUsageForEvent(ev agent.Event) agent.TokenReport {
 }
 
 func (r *Runner) handleSessionNew(req Request) {
-	_, err := r.agent.NewSessionForProjectPathWithBoundary(r.currentProjectPath(), "primary", func(state agent.HydrationState) {
+	// The callback captures the prepared destination summary from its own boundary
+	// data: success and committed failure both respond with that capture — never a
+	// postcommit owner read, which for a committed outcome would resolve state this
+	// connection cannot promise. A plain precommit error invokes no callback at all
+	// and stays bare.
+	var prepared agent.SessionSummary
+	emitted := false
+	_, err := r.agent.NewSessionForProjectPathWithBoundary(r.currentProjectPath(), "primary", func(state agent.HydrationState, cbErr error) {
 		id := strings.TrimSpace(state.Session.ID)
+		prepared = state.Session
+		emitted = true
 		r.setCurrent(id, state.Session)
 		r.sendBoundary(Notification{
 			JSONRPC: "2.0",
@@ -688,10 +697,22 @@ func (r *Runner) handleSessionNew(req Request) {
 		}, id)
 	})
 	if err != nil {
-		r.respondError(req.ID, -32000, err.Error())
+		var committed *snapshot.CommittedMutationError
+		switch {
+		case emitted && errors.As(err, &committed):
+			r.respondErrorData(req.ID, -32000, err.Error(), prepared)
+		default:
+			r.respondError(req.ID, -32000, err.Error())
+		}
 		return
 	}
-	r.respond(req.ID, r.currentSessionSummary())
+	if !emitted {
+		// Contract violation (a nil error without the in-commit boundary): no current
+		// was committed and nothing to respond with.
+		r.respondError(req.ID, -32603, "session created without its boundary")
+		return
+	}
+	r.respond(req.ID, prepared)
 }
 
 // contentionIfReadOnly returns the contention error when the connection's
@@ -891,6 +912,56 @@ func (r *Runner) handleSessionSwitch(req Request) {
 	r.respond(req.ID, summary)
 }
 
+// applyLifecycleRemoval runs one durable archive/delete and disposes of its outcome
+// in FIFO order. The dispatch loop owns the connection serially, so routing current is
+// captured before the owner call — that capture alone decides which side of the table a
+// target sits on: success detaches (or nil-advances) exactly as removal did; any plain
+// error emits only its bare rejection with no boundary at all and routing untouched; a
+// committed failure adopts what was in fact removed — reconciling the removed current or
+// preserving it otherwise — sends that boundary first, then rides back typed with no
+// data: archive/delete has no prepared result beyond the id already in flight.
+func (r *Runner) applyLifecycleRemoval(req Request, target string, op func(string) error) {
+	target = strings.TrimSpace(target)
+	capturedID, _ := r.currentSession() // "" when nothing is current; captured before the call
+	err := op(target)
+	if err == nil {
+		switch {
+		case capturedID != "" && capturedID == target:
+			r.sv().RemovedCurrent(target)
+			r.sendDetachBoundary()
+		default:
+			// A noncurrent removal always advances presentation to its unchanged current — with an empty (global) tag when nothing is routed, so the client's drainer re-adopts exactly what was there. The advance carries no wire bytes; it exists for ordering and adoption alone.
+			r.enqueueFrame(outFrame{kind: frameAdvance, sessionID: capturedID})
+		}
+		r.respond(req.ID, map[string]any{"ok": true})
+		return
+	}
+	var committed *snapshot.CommittedMutationError
+	if errors.As(err, &committed) {
+		switch {
+		case capturedID != "" && capturedID == target:
+			r.sv().RemovedCurrent(target)
+			r.sendDetachBoundary()
+		default: // same nil advance as the success path — a committed noncurrent outcome still re-adopts its unchanged current before rejecting typed, with no error data on either side of it.
+			r.enqueueFrame(outFrame{kind: frameAdvance, sessionID: capturedID})
+		}
+		r.respondError(req.ID, -32000, err.Error()) // no data — committed archive/delete outcomes carry none
+		return
+	}
+	r.respondError(req.ID, -32000, err.Error())
+}
+
+// sendDetachBoundary appends the deterministic no-session boundary a removed current
+// removal publishes before its response: no complete-state capture of the removed
+// session, and an empty destination so presentation detaches with it.
+func (r *Runner) sendDetachBoundary() {
+	r.sendBoundary(Notification{
+		JSONRPC: "2.0",
+		Method:  "agent/session_changed",
+		Params:  agent.HydrationState{},
+	}, "")
+}
+
 func (r *Runner) handleSessionArchive(req Request) {
 	var params struct {
 		ID string `json:"id"`
@@ -899,21 +970,7 @@ func (r *Runner) handleSessionArchive(req Request) {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	if err := r.agent.SessionArchive(params.ID); err != nil {
-		r.respondError(req.ID, -32000, err.Error())
-		return
-	}
-	wasCurrent := r.sv().RemovedCurrent(params.ID)
-	if wasCurrent {
-		// Current removal: deterministic no-session boundary before the response, with no
-		// complete-state capture of the removed session.
-		r.sendBoundary(Notification{
-			JSONRPC: "2.0",
-			Method:  "agent/session_changed",
-			Params:  agent.HydrationState{},
-		}, "")
-	}
-	r.respond(req.ID, map[string]any{"ok": true})
+	r.applyLifecycleRemoval(req, params.ID, func(id string) error { return r.agent.SessionArchive(id) })
 }
 
 func (r *Runner) handleSessionDelete(req Request) {
@@ -924,21 +981,7 @@ func (r *Runner) handleSessionDelete(req Request) {
 		r.respondError(req.ID, -32602, "invalid params")
 		return
 	}
-	if err := r.agent.SessionDelete(params.ID); err != nil {
-		r.respondError(req.ID, -32000, err.Error())
-		return
-	}
-	wasCurrent := r.sv().RemovedCurrent(params.ID)
-	if wasCurrent {
-		// Current removal: deterministic no-session boundary before the response, with no
-		// complete-state capture of the removed session.
-		r.sendBoundary(Notification{
-			JSONRPC: "2.0",
-			Method:  "agent/session_changed",
-			Params:  agent.HydrationState{},
-		}, "")
-	}
-	r.respond(req.ID, map[string]any{"ok": true})
+	r.applyLifecycleRemoval(req, params.ID, func(id string) error { return r.agent.SessionDelete(id) })
 }
 
 func (r *Runner) handleSessionFork(req Request) {

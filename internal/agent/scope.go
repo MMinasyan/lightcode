@@ -92,6 +92,14 @@ func (s *AdapterScope) OpenOrCreateSession(projectPath string) (SessionSummary, 
 	}
 	id, err := s.svc.NewSessionForProjectPath(projectPath, "primary")
 	if err != nil {
+		var committed *snapshot.CommittedMutationError
+		if id != "" && errors.As(err, &committed) {
+			// The destination was created durably before the failure: adopt it as an
+			// ID-only summary and reject typed. No postcommit lookup runs — a session
+			// whose durable state is not what this owner can promise must never be
+			// resolved through one, and its consumers only need the id to route on.
+			return SessionSummary{ID: id}, err
+		}
 		return SessionSummary{}, err
 	}
 	return s.svc.SessionSummaryForSessionOrPersisted(id)

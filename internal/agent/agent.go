@@ -5093,12 +5093,14 @@ func (a *Agent) NewSession(projectID string, agentType string) (string, error) {
 // NewSessionWithBoundary is NewSession that publishes the fresh session's complete
 // state through emit in the same section that commits it. A new session has empty
 // durable history and a deterministic summary, so the capture appends the boundary
-// under the live-state locks with no fallible read.
-func (a *Agent) NewSessionWithBoundary(projectID string, agentType string, emit func(HydrationState)) (string, error) {
+// under the live-state locks with no fallible read. The callback also carries the
+// in-commit outcome: nil while every producer still rejects precommit; plain
+// failures never invoke it at all.
+func (a *Agent) NewSessionWithBoundary(projectID string, agentType string, emit func(HydrationState, error)) (string, error) {
 	return a.newSession(projectID, agentType, emit)
 }
 
-func (a *Agent) newSession(projectID string, agentType string, emit func(HydrationState)) (sid string, err error) {
+func (a *Agent) newSession(projectID string, agentType string, emit func(HydrationState, error)) (sid string, err error) {
 	defer a.lockLifecycle()()
 	rt := a.ensureRuntime()
 
@@ -5246,9 +5248,10 @@ func (a *Agent) newSession(projectID string, agentType string, emit func(Hydrati
 	}
 	if emit != nil {
 		// New sessions have empty durable history, so the in-commit capture appends the
-		// boundary from the prebuilt summary with no further read.
+		// boundary from the prebuilt summary with no further read. The outcome is nil:
+		// every failure above this point rejected before committing anything.
 		a.captureUnderLocksRTHeld(unit, nil, sid, nil, func(cs completeState) {
-			emit(hydrationStateFrom(prebuiltSummary, cs))
+			emit(hydrationStateFrom(prebuiltSummary, cs), nil)
 		})
 	}
 	return sid, nil
@@ -5259,12 +5262,13 @@ func (a *Agent) NewSessionForProjectPath(projectPath string, agentType string) (
 }
 
 // NewSessionForProjectPathWithBoundary is NewSessionForProjectPath that publishes the
-// fresh session's boundary in-commit.
-func (a *Agent) NewSessionForProjectPathWithBoundary(projectPath string, agentType string, emit func(HydrationState)) (string, error) {
+// fresh session's boundary in-commit; its callback carries both the prepared state and
+// the in-commit outcome (nil until a producer can fail after committing).
+func (a *Agent) NewSessionForProjectPathWithBoundary(projectPath string, agentType string, emit func(HydrationState, error)) (string, error) {
 	return a.newSessionForProjectPath(projectPath, agentType, emit)
 }
 
-func (a *Agent) newSessionForProjectPath(projectPath string, agentType string, emit func(HydrationState)) (string, error) {
+func (a *Agent) newSessionForProjectPath(projectPath string, agentType string, emit func(HydrationState, error)) (string, error) {
 	proj, err := a.ensureProjectForPath(projectPath)
 	if err != nil {
 		return "", err

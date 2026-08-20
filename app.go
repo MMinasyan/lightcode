@@ -289,6 +289,39 @@ func (a *App) enqueueBoundary(name string, payload any, title, sessionID string)
 	})
 }
 
+// enqueueBoundaryWithError atomically appends a boundary and, only when committedMsg
+// is nonempty, one existing unsequenced error frame directly after it. Both frames
+// are appended under one deliveryMu hold with exactly one wake, so the drainer can
+// never interleave an older queued frame between them: the frontend applies the
+// advance (or detach) and then sees the rejection as its own row — never reversed or
+// split by a stale token. The error inherits sessionID's tag on purpose: after a
+// current-detach adopt, only that empty/global tag survives; after a noncurrent nil
+// advance, it is exactly the unchanged-current tag a deleted-session tag would fail.
+// No owner call, callback, title update, or I/O runs under the hold — message and
+// payload are prepared by the caller beforehand.
+func (a *App) enqueueBoundaryWithError(name string, payload any, title, sessionID, committedMsg string) {
+	a.deliveryMu.Lock()
+	if a.deliveryClosed {
+		a.deliveryMu.Unlock()
+		return
+	}
+	tag := strings.TrimSpace(sessionID)
+	frames := []deliveryFrame{{name: name, payload: payload, title: title, kind: frameAdvance, sessionID: tag}}
+	if committedMsg != "" {
+		frames = append(frames, deliveryFrame{name: "error", payload: map[string]any{"message": committedMsg}, sessionID: tag})
+	}
+	a.deliveryFrames = append(a.deliveryFrames, frames...)
+	a.deliveryMu.Unlock()
+	select {
+	case a.deliveryWake <- struct{}{}:
+	default:
+	}
+}
+
+// lifecycleErrorMessage renders the adapter's rejection as its ordered error frame's
+// message text — the same full string every other consumer surfaces.
+func lifecycleErrorMessage(err error) string { return err.Error() }
+
 // seedPresented sets presentation current at startup, before the frontend's
 // hydration pull, so live frames for the initially-current session reach it. It
 // takes deliveryMu because the drainer is already running.
@@ -750,17 +783,6 @@ func (a *App) tokenUsage() agent.TokenReport {
 	return report
 }
 
-// removedCurrent clears the routing current when the removed id was it, and
-// reports whether the adapter should refresh its view.
-func (a *App) removedCurrent(id string) bool {
-	id = strings.TrimSpace(id)
-	wasCurrent := a.currentSessionID() == id
-	if wasCurrent {
-		a.setCurrentSessionID("")
-	}
-	return wasCurrent
-}
-
 func (a *App) sessionMessages() []agent.DisplayMessage {
 	a.navMu.Lock()
 	if a.navClosed {
@@ -952,31 +974,22 @@ func (a *App) RevertCode(turn int) (snapshot.RevertResult, error) {
 	return a.svc.RevertCodeForSession(sessionID, turn)
 }
 
-// turnActionBoundaryEmit is the owner's in-commit callback for a session-changing
-// revert/fork: it commits routing current, then appends the destination's complete
-// state, any code-revert skip notice, and a fork's failed-code-revert warning as one
-// ordered boundary, so state and notices apply together and no live frame
-// interleaves between them.
-func (a *App) turnActionBoundaryEmit() func(agent.HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string) {
-	return func(state agent.HydrationState, skipped []snapshot.SkippedRevert, warning string, _ *snapshot.CommittedMutationError, prefill *string) {
-		a.setCurrentSessionID(state.Session.ID)
-		a.enqueueBoundary("turn_action", turnActionBoundary{State: &state, Prefill: prefill, SkippedFiles: skipped, Warning: warning}, "", state.Session.ID)
-	}
-}
-
-// applyTurnActionWithOwnedBoundary runs a turn action through the owner's
-// in-commit boundary callback and records synchronously whether the callback
-// emitted. A postcommit partial error — a reconciled history revert whose walk
-// failed after the boundary published the survivors — then resolves the method
-// as success: the ordered turn_action frame owns the error through its warning,
-// and a second, unowned direct error would duplicate it in the frontend. A
-// typed committed history failure (wrapped CommittedMutationError) is the
-// exception: it emits its warning-bearing boundary but rejects, so the typed
-// outcome reaches the frontend while no adjacent error frame is enqueued. A
-// precommit error emits no frame and still rejects/returns; the typed return
-// error is kept for the ACP/CLI disposition. A code-only revert's complete
-// boundary is prepared for the protocol consumer; Wails suppresses it and keeps
-// its existing notice-only result/skips surface.
+// applyTurnActionWithOwnedBoundary is the desktop's one shared choke point for a
+// turn action's committed disposition (ForkSession and ApplyTurnAction both run
+// through it): the owner's in-commit callback adopts any session-changing result,
+// then enqueues its boundary — atomically paired with exactly one unsequenced
+// error frame when a fork carries a typed committed failure. A postcommit partial
+// error — a reconciled history revert whose walk failed after the boundary
+// published the survivors — resolves the method as success: the ordered turn_action
+// frame owns the error through its warning, and a second, unowned direct error would
+// duplicate it in the frontend. A typed committed failure is always a rejection; only
+// fork pairs one adjacent error frame with its destination boundary (the prepared
+// view plus exactly that one row), while history keeps Step 4's warning-only
+// disposition — no adjacent frame on either side of its single ordered boundary. A
+// precommit error emits no frame and still rejects/returns; the typed return error is
+// kept for the ACP/CLI disposition. A code-only revert's complete boundary is prepared
+// for the protocol consumer; Wails suppresses it and keeps its existing notice-only
+// result/skips surface.
 func (a *App) applyTurnActionWithOwnedBoundary(sessionID string, turn int, action string, alsoRevertCode bool) (agent.TurnActionResult, error) {
 	var emitted bool
 	result, err := a.svc.ApplyTurnActionForSessionWithBoundary(sessionID, turn, action, alsoRevertCode, func(state agent.HydrationState, skipped []snapshot.SkippedRevert, warning string, committed *snapshot.CommittedMutationError, prefill *string) {
@@ -988,7 +1001,13 @@ func (a *App) applyTurnActionWithOwnedBoundary(sessionID string, turn int, actio
 			return
 		}
 		a.setCurrentSessionID(state.Session.ID)
-		a.enqueueBoundary("turn_action", turnActionBoundary{State: &state, Prefill: prefill, SkippedFiles: skipped, Warning: warning}, "", state.Session.ID)
+		boundary := turnActionBoundary{State: &state, Prefill: prefill, SkippedFiles: skipped, Warning: warning}
+		if committed != nil && action == agent.TurnActionFork {
+			// A fork's committed failure adopts the prepared destination and settles to its view plus exactly one error row; history never pairs.
+			a.enqueueBoundaryWithError("turn_action", boundary, "", state.Session.ID, lifecycleErrorMessage(committed))
+			return
+		}
+		a.enqueueBoundary("turn_action", boundary, "", state.Session.ID)
 	})
 	if err != nil && emitted {
 		var committed *snapshot.CommittedMutationError
@@ -1020,7 +1039,10 @@ func (a *App) RevertHistory(turn int) error {
 	return err
 }
 
-// ForkSession creates a new session branched from turn N.
+// ForkSession creates a new session branched from turn N. It shares the GUI's fork
+// disposition with ApplyTurnAction: both run through applyTurnActionWithOwnedBoundary,
+// so one code path settles every committed failure to its destination boundary plus
+// exactly one error row — an adapter-only fix cannot drift between the two routes.
 func (a *App) ForkSession(turn int) error {
 	a.navMu.Lock()
 	defer a.navMu.Unlock()
@@ -1028,7 +1050,7 @@ func (a *App) ForkSession(turn int) error {
 	if err != nil {
 		return err
 	}
-	_, err = a.svc.ApplyTurnActionForSessionWithBoundary(sessionID, turn, agent.TurnActionFork, false, a.turnActionBoundaryEmit())
+	_, err = a.applyTurnActionWithOwnedBoundary(sessionID, turn, agent.TurnActionFork, false)
 	return err
 }
 
@@ -1285,8 +1307,13 @@ func (a *App) setRouteProjectPathLocked(path string) {
 }
 
 // openOrCreateSession opens the most recent active session for a project path, or
-// creates one. The caller holds navMu across it as part of a navigation.
-func (a *App) openOrCreateSession(projectPath string, emit func(agent.HydrationState)) (agent.SessionSummary, error) {
+// creates one. The caller holds navMu across it as part of a navigation. emitOpen is
+// the existing-session boundary callback (unchanged: success only); createOutcome is
+// the staged-new result callback — invoked with nil on success and with a wrapped
+// committed error when creation failed after committing, so its destination routing
+// commit and atomic boundary+error pair stay owned by the caller. A plain precommit
+// failure invokes no callback at all: the old route stays exactly as it was.
+func (a *App) openOrCreateSession(projectPath string, emitOpen func(agent.HydrationState), createOutcome func(agent.HydrationState, error)) (agent.SessionSummary, error) {
 	sessions, err := a.svc.SessionListForProjectPath(projectPath, "active")
 	if err != nil {
 		return agent.SessionSummary{}, err
@@ -1296,7 +1323,7 @@ func (a *App) openOrCreateSession(projectPath string, emit func(agent.HydrationS
 	// failure surfaces: this is user-initiated, so a corrupt session must not
 	// be skipped silently.
 	for _, s := range sessions {
-		summary, err := a.svc.OpenSessionWithBoundary(s.ID, emit)
+		summary, err := a.svc.OpenSessionWithBoundary(s.ID, emitOpen)
 		if err == nil {
 			return summary, nil
 		}
@@ -1304,7 +1331,7 @@ func (a *App) openOrCreateSession(projectPath string, emit func(agent.HydrationS
 			return agent.SessionSummary{}, err
 		}
 	}
-	id, err := a.svc.NewSessionForProjectPathWithBoundary(projectPath, "primary", emit)
+	id, err := a.svc.NewSessionForProjectPathWithBoundary(projectPath, "primary", createOutcome)
 	if err != nil {
 		return agent.SessionSummary{}, err
 	}
@@ -1380,6 +1407,43 @@ func (a *App) SessionSwitch(id string) error {
 	return nil
 }
 
+// applyLifecycleRemoval runs one durable archive/delete and disposes of its outcome
+// through the delivery FIFO. The caller holds navMu across it, so routing current is
+// captured before the service call — that capture alone decides which side of the
+// table a target sits on: success detaches (or nil-advances) exactly as removal did;
+// any plain error appends one standalone unsequenced error frame and no advance at
+// all, then rejects with routing untouched; a committed failure adopts what was in
+// fact removed — clearing current for the removed-current target or preserving it
+// otherwise — and atomically pairs that boundary (empty detach / nil unchanged-
+// current advance) with exactly one unsequenced error frame before rejecting typed.
+func (a *App) applyLifecycleRemoval(id string, op func(string) error) error {
+	id = strings.TrimSpace(id)
+	captured := a.currentSessionID()
+	err := op(id)
+	if err == nil {
+		if captured == id {
+			a.clearRouteIfCurrent(id)
+			a.enqueueBoundary("navigation", agent.HydrationState{}, "", "")
+		} else {
+			a.enqueueBoundary("navigation", nil, "", captured)
+		}
+		return nil
+	}
+	var committed *snapshot.CommittedMutationError
+	if errors.As(err, &committed) {
+		msg := lifecycleErrorMessage(err)
+		if captured == id {
+			a.clearRouteIfCurrent(id)
+			a.enqueueBoundaryWithError("navigation", agent.HydrationState{}, "", "", msg)
+		} else {
+			a.enqueueBoundaryWithError("navigation", nil, "", captured, msg)
+		}
+		return err
+	}
+	a.emitFrame("error", map[string]any{"message": lifecycleErrorMessage(err)})
+	return err
+}
+
 // SessionArchive archives a session.
 func (a *App) SessionArchive(id string) error {
 	a.navMu.Lock()
@@ -1389,16 +1453,7 @@ func (a *App) SessionArchive(id string) error {
 	}
 	// Durable archive then the deterministic detach, together under navMu so a
 	// concurrent switch to the same session cannot interleave between them.
-	if err := a.svc.SessionArchive(id); err != nil {
-		return err
-	}
-	// Removing the current session performs no complete-state capture of the removed session: current
-	// removal appends a deterministic no-session boundary the frontend applies as a
-	// detach; non-current removal leaves selection/presentation unchanged.
-	if a.removedCurrent(id) {
-		a.enqueueBoundary("navigation", agent.HydrationState{}, "", "")
-	}
-	return nil
+	return a.applyLifecycleRemoval(id, func(target string) error { return a.svc.SessionArchive(target) })
 }
 
 // SessionDelete removes a session from disk.
@@ -1408,26 +1463,35 @@ func (a *App) SessionDelete(id string) error {
 	if a.navClosed {
 		return errAdapterClosed
 	}
-	if err := a.svc.SessionDelete(id); err != nil {
-		return err
-	}
-	// Current removal: deterministic no-session boundary, no capture.
-	if a.removedCurrent(id) {
-		a.enqueueBoundary("navigation", agent.HydrationState{}, "", "")
-	}
-	return nil
+	return a.applyLifecycleRemoval(id, func(target string) error { return a.svc.SessionDelete(target) })
 }
 
-// SessionNew starts a fresh session in the adapter-local project.
+// SessionNew starts a fresh session in the adapter-local project. The callback is
+// invoked only for an outcome that owns presentation: success and committed failure
+// both carry the prepared destination state, so it adopts routing current first and
+// then appends either the boundary alone or the atomic boundary+error pair — never
+// reversed by a stale frame already queued ahead of them. A plain precommit error
+// invokes no callback at all: routing, presentation generation, and every queued
+// frame stay exactly as they were when the call returned its rejection.
 func (a *App) SessionNew() error {
 	a.navMu.Lock()
 	defer a.navMu.Unlock()
 	if a.navClosed {
 		return errAdapterClosed
 	}
-	_, err := a.svc.NewSessionForProjectPathWithBoundary(a.routeProjectPath, "primary", func(state agent.HydrationState) {
-		a.setCurrentSessionID(state.Session.ID)
-		a.enqueueBoundary("navigation", state, "", state.Session.ID)
+	_, err := a.svc.NewSessionForProjectPathWithBoundary(a.routeProjectPath, "primary", func(state agent.HydrationState, cbErr error) {
+		var committed *snapshot.CommittedMutationError
+		switch {
+		case cbErr == nil:
+			a.setCurrentSessionID(state.Session.ID)
+			a.enqueueBoundary("navigation", state, "", state.Session.ID)
+		case errors.As(cbErr, &committed):
+			a.setCurrentSessionID(state.Session.ID)
+			a.enqueueBoundaryWithError("navigation", state, "", state.Session.ID, lifecycleErrorMessage(cbErr))
+		default:
+			// Contract violation (a plain failure invoking the callback): append no
+			// frame and adopt nothing; the method still returns the rejection.
+		}
 	})
 	return err
 }
@@ -1487,6 +1551,24 @@ func (a *App) ProjectSwitch(targetPath string) error {
 		a.setRouteProjectPathLocked(abs)
 		a.setCurrentSessionID(state.Session.ID)
 		a.enqueueBoundary("navigation", state, title, state.Session.ID)
+	}, func(state agent.HydrationState, cbErr error) {
+		var committed *snapshot.CommittedMutationError
+		switch {
+		case cbErr == nil:
+			a.setRouteProjectPathLocked(abs)
+			a.setCurrentSessionID(state.Session.ID)
+			a.enqueueBoundary("navigation", state, title, state.Session.ID)
+		case errors.As(cbErr, &committed):
+			// The destination project/session committed durably before the failure:
+			// commit its routing first so a rejection never leaves the old route, then
+			// append the atomic boundary+error pair no stale frame can split.
+			a.setRouteProjectPathLocked(abs)
+			a.setCurrentSessionID(state.Session.ID)
+			a.enqueueBoundaryWithError("navigation", state, title, state.Session.ID, lifecycleErrorMessage(cbErr))
+		default:
+			// Contract violation (a plain failure invoking the callback): leave routing
+			// and presentation unchanged; the method still returns the rejection.
+		}
 	})
 	return err
 }

@@ -66,10 +66,14 @@ type AdapterService interface {
 	// mutability error for a busy or transitioning source; the transitioning
 	// reservation (released by the returned func) for an idle live source.
 	ReserveSelectionSource(string) (func(), error)
+	// Staged-new boundary callbacks carry the in-commit outcome alongside the
+	// prepared state: nil while every producer still rejects precommit, and a
+	// wrapped *snapshot.CommittedMutationError once a committed failure can be
+	// returned with its destination id. Plain failures invoke no callback at all.
 	NewSession(string, string) (string, error)
-	NewSessionWithBoundary(string, string, func(HydrationState)) (string, error)
+	NewSessionWithBoundary(string, string, func(HydrationState, error)) (string, error)
 	NewSessionForProjectPath(string, string) (string, error)
-	NewSessionForProjectPathWithBoundary(string, string, func(HydrationState)) (string, error)
+	NewSessionForProjectPathWithBoundary(string, string, func(HydrationState, error)) (string, error)
 	SessionArchive(string) error
 	SessionDelete(string) error
 	SessionMessagesFor(string) ([]DisplayMessage, error)

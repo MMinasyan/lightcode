@@ -263,6 +263,98 @@ func TestOpenOrCreateSessionSurfacesListingFailure(t *testing.T) {
 	}
 }
 
+// committedCreateSpy embeds a nil AdapterService and overrides only the three
+// owner calls OpenOrCreateSession's create fallback can make: the listing, the
+// create itself (returning a prepared destination id plus its outcome), and the
+// postcreate summary lookup. Any other call panics on the embedded nil interface,
+// so an unexpected probe fails loudly instead of silently succeeding.
+type committedCreateSpy struct {
+	AdapterService
+	id           string
+	createErr    error
+	newCalls     int
+	summaryCalls int
+}
+
+func (s *committedCreateSpy) SessionListForProjectPath(_, _ string) ([]SessionSummary, error) {
+	return nil, nil
+}
+
+func (s *committedCreateSpy) NewSessionForProjectPath(_, _ string) (string, error) {
+	s.newCalls++
+	return s.id, s.createErr
+}
+
+func (s *committedCreateSpy) SessionSummaryForSessionOrPersisted(id string) (SessionSummary, error) {
+	s.summaryCalls++
+	return SessionSummary{ID: id}, nil
+}
+
+// TestOpenOrCreateSessionCommittedFallbackReturnsIDOnlySummary proves the
+// create fallback distinguishes a committed destination from a precommit failure:
+// a returned destination id plus a wrapped CommittedMutationError yields an ID-only
+// summary and the typed rejection without any postcreate summary lookup; a plain
+// error returns the zero summary with no lookup either; success keeps the normal
+// single-summary-lookup behavior. A committed fallback that ran the lookup would
+// read a session whose durable state is not what this owner can promise, or fail
+// on one it cannot resolve at all.
+func TestOpenOrCreateSessionCommittedFallbackReturnsIDOnlySummary(t *testing.T) {
+	committed := &snapshot.CommittedMutationError{Err: errors.New("committed sync failure")}
+
+	t.Run("case=committed_fallback_returns_id_only_summary", func(t *testing.T) {
+		spy := &committedCreateSpy{id: "dest", createErr: fmt.Errorf("wrap: %w", committed)}
+		scope := NewAdapterScope(spy, t.TempDir())
+		summary, err := scope.OpenOrCreateSession(scope.ProjectPath())
+		var target *snapshot.CommittedMutationError
+		if !errors.As(err, &target) {
+			t.Fatalf("OpenOrCreateSession = %#v, %v; want the wrapped committed rejection", summary, err)
+		}
+		if summary != (SessionSummary{ID: "dest"}) {
+			t.Fatalf("summary = %#v, want the ID-only prepared destination with no other fields", summary)
+		}
+		if spy.newCalls != 1 {
+			t.Fatalf("create calls = %d, want exactly one fallback create", spy.newCalls)
+		}
+		if spy.summaryCalls != 0 {
+			t.Fatalf("summary lookups after the committed fallback = %d, want none (no postcommit read)", spy.summaryCalls)
+		}
+	})
+
+	t.Run("case=plain_error_returns_zero_summary", func(t *testing.T) {
+		spy := &committedCreateSpy{id: "dest", createErr: errors.New("precommit failure")}
+		scope := NewAdapterScope(spy, t.TempDir())
+		summary, err := scope.OpenOrCreateSession(scope.ProjectPath())
+		if err == nil || !errors.Is(err, spy.createErr) {
+			t.Fatalf("OpenOrCreateSession = %#v, %v; want the plain precommit error", summary, err)
+		}
+		var target *snapshot.CommittedMutationError
+		if errors.As(err, &target) {
+			t.Fatal("a plain create failure must not classify as committed")
+		}
+		if summary != (SessionSummary{}) {
+			t.Fatalf("summary = %#v, want the zero summary for a precommit error", summary)
+		}
+		if spy.summaryCalls != 0 {
+			t.Fatalf("summary lookups after a plain failure = %d, want none", spy.summaryCalls)
+		}
+	})
+
+	t.Run("case=success_keeps_normal_summary_lookup", func(t *testing.T) {
+		spy := &committedCreateSpy{id: "dest"}
+		scope := NewAdapterScope(spy, t.TempDir())
+		summary, err := scope.OpenOrCreateSession(scope.ProjectPath())
+		if err != nil {
+			t.Fatalf("OpenOrCreateSession success = %v", err)
+		}
+		if summary.ID != "dest" {
+			t.Fatalf("summary id = %q, want the created session's resolved summary", summary.ID)
+		}
+		if spy.summaryCalls != 1 {
+			t.Fatalf("summary lookups on success = %d, want exactly one normal lookup", spy.summaryCalls)
+		}
+	})
+}
+
 // TestOpenOrCreateSessionSurfacesCorruptCandidate proves OpenOrCreateSession
 // surfaces an open failure other than contention instead of skipping the
 // candidate: this is user-initiated, so a corrupt session must not be passed

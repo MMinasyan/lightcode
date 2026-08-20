@@ -4,17 +4,32 @@
   import { errorText } from '../lib/errors.js';
   const dispatch = createEventDispatcher();
 
+  // App passes the presented state down: whether a snapshot has seeded the view,
+  // which session it presents, and at what presentation generation. Every mutation
+  // captures these before calling the backend so its rejection can be classified
+  // against whatever owns presentation by settle time — not against live props a
+  // boundary may already have moved on.
+  export let seeded = false;
+  export let currentSessionId = '';
+  export let generation = 0;
+
   let state = 'active';
   let sessions = [];
   let loading = true;
-  let currentId = '';
+  // Unseeded views read the presented session from the owner at load — this is the
+  // only SessionCurrent call in steady state. Seeded views use the presented id App
+  // passes down, so an open selector never re-resolves identity out of band.
+  let liveCurrentId = '';
+  $: currentId = seeded ? (currentSessionId || '') : liveCurrentId;
 
   async function load() {
     loading = true;
     try {
       sessions = await SessionList(state) || [];
-      const cur = await SessionCurrent();
-      currentId = cur?.id || '';
+      if (!seeded) {
+        const cur = await SessionCurrent();
+        liveCurrentId = cur?.id || '';
+      }
     } catch (e) { dispatch('error', errorText(e)); }
     loading = false;
   }
@@ -23,25 +38,85 @@
 
   function setState(s) { if (s !== state) { state = s; load(); } }
 
-  async function pick(id) {
-    try { await SessionSwitch(id); dispatch('close'); }
-    catch (e) { dispatch('error', errorText(e)); }
-  }
+  // Every mutation captures the presented state into its OWN lexical scope before calling
+  // the backend, so its rejection classifies against what owned presentation at ITS call time —
+  // not live props a boundary may already have moved on, and not whatever an overlapping action
+  // captured later. Only ever one surface may show a given failure: this catch or the backend
+  // frames it owns.
 
-  async function newSession() {
-    try { await SessionNew(); dispatch('close'); }
-    catch (e) { dispatch('error', errorText(e)); }
+  // settleRemoval disposes one rejected archive/delete against that action's own capture cap =
+  // {seeded, gen, currentId}. The selector closes on every error: its list is stale against
+  // whatever ran durably, or about to be replaced by a boundary either way. Visibility then
+  // follows ownership of presentation at settle time — only ever one surface may show the failure:
+  // - generation advanced since THIS action's capture ⇒ some boundary applied (a committed outcome
+  //   or a newer navigation) and owns the view; suppress.
+  // - seeded at this call time ⇒ App shows this path's own unsequenced backend error frame
+  //   (every rejected removal carries one, plain or committed); showing here would double it —
+  //   suppress. Noncurrent outcomes are generation-neutral, so only the seed gate can tell their
+  //   frames apart from a stale catch.
+  // - an unseeded rejection has no visible surface at all until some snapshot seeds the view (App
+  //   drops its error frames meanwhile): the gated catch stays sole — except for one mandated
+  //   distinction, below.
+    async function settleRemoval(id, err, cap) {
+      dispatch('close');
+      if (generation !== cap.gen || cap.seeded) return;
+      // The rejection's own text is derived from this action's error: it is what this catch shows
+      // whenever no frame owns the failure — including when the distinction read below fails under
+      // it. Only ever one surface may show a given failure.
+      const text = errorText(err);
+      if (id === cap.currentId && id !== '') {
+        try {
+          // Rejected removal of this action's presented session: one owner read — the only one any
+          // mutation may trigger, and it is never retried — tells a precommit failure, where the
+          // target is still current and this catch stays sole, from a committed detach or newer
+          // navigation that already left it, whose frames own the error once they land. A read that
+          // fails under the rejection settles nothing: its own error would be a second surface for
+          // this one failure, so it falls through to this action's text and shows as-is.
+          const cur = await SessionCurrent();
+          liveCurrentId = cur?.id || '';
+          if (liveCurrentId !== id) { sessions = sessions.filter(s => s.id !== id); return; }
+        } catch (e) { /* the distinction itself failed: retain this same-generation error below */ }
+      }
+      // The awaited read above yields to the event loop, and a boundary can apply in that gap —
+      // A→B→A included, where even an owner still reporting the target has moved on underneath.
+      // Recheck THIS action's capture against what is presented now: any applied snapshot advanced
+      // the generation (and re-seeded views move their presented session with it), so a capture no
+      // longer matching presentation owns this error through its own frames, not this catch. An
+      // overlapping action settling in between changes nothing here — cap is lexical to this call.
+      if (generation !== cap.gen || currentSessionId !== '' && currentSessionId !== cap.currentId) return;
+      dispatch('error', text);
+    }
+
+  // settleNavigation disposes one rejected open/new against that action's own capture {gen}. These
+  // paths emit no backend frame for a plain failure — only committed outcomes carry boundary+error
+  // pairs — so the generation alone settles them: same-generation rejections surface here as the sole
+  // visible error; an advanced generation means the committed pair (or newer navigation) owns
+  // presentation, and its stateful snapshot wipes any transient shown first.
+  function settleNavigation(err, cap) {
+    dispatch('close');
+    if (generation === cap.gen) dispatch('error', errorText(err));
   }
 
   async function archive(id) {
-    try { await SessionArchive(id); await load(); }
-    catch (e) { dispatch('error', errorText(e)); }
+    const cap = { seeded, gen: generation, currentId }; // this action's own capture — an overlapping call cannot overwrite it
+    try { await SessionArchive(id); sessions = sessions.filter(s => s.id !== id); } // local removal on success — never a reload: every other outcome is owned by backend frames, and a re-list could race them or resurrect a row a boundary already removed.
+    catch (e) { settleRemoval(id, e, cap); }
   }
 
   async function remove(id) {
-    try { await SessionDelete(id); await load(); }
-    catch (e) { dispatch('error', errorText(e)); }
+    const cap = { seeded, gen: generation, currentId }; // this action's own capture — an overlapping call cannot overwrite it
+    try { await SessionDelete(id); sessions = sessions.filter(s => s.id !== id); }
+    catch (e) { settleRemoval(id, e, cap); }
   }
+
+  async function switchRow(mutate) {
+    const cap = { gen: generation }; // navigation paths need no read and classify on generation alone; the capture is still lexical to this action
+    try { await mutate(); dispatch('close'); }
+    catch (e) { settleNavigation(e, cap); }
+  }
+
+  const pick = id => switchRow(() => SessionSwitch(id));
+  const newSession = () => switchRow(SessionNew);
 
   function fmtTs(unix) {
     if (!unix) return '';

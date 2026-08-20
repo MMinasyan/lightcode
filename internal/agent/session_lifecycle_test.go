@@ -63,7 +63,7 @@ func TestSessionLifecycleTransactionContract(t *testing.T) {
 		defer func() { _ = os.Chmod(sessionsRoot, 0o700) }()
 
 		emitCalled := false
-		if _, err := a.NewSessionWithBoundary(proj.ID, "primary", func(HydrationState) { emitCalled = true }); err == nil {
+		if _, err := a.NewSessionWithBoundary(proj.ID, "primary", func(_ HydrationState, _ error) { emitCalled = true }); err == nil {
 			t.Fatal("NewSessionWithBoundary should fail when the sessions root is unwritable")
 		}
 
@@ -1108,7 +1108,7 @@ func TestNewSessionStagedFailureCoverage(t *testing.T) {
 			}
 		})
 
-		_, err = a.NewSessionWithBoundary(proj.ID, "primary", func(HydrationState) { emitted = true })
+		_, err = a.NewSessionWithBoundary(proj.ID, "primary", func(_ HydrationState, _ error) { emitted = true })
 		if err == nil {
 			t.Fatal("NewSessionWithBoundary should fail when the staged meta is corrupt before SetModel")
 		}
@@ -1153,7 +1153,7 @@ func TestNewSessionStagedFailureCoverage(t *testing.T) {
 			}
 		})
 
-		_, err = a.NewSessionWithBoundary(proj.ID, "primary", func(HydrationState) { emitted = true })
+		_, err = a.NewSessionWithBoundary(proj.ID, "primary", func(_ HydrationState, _ error) { emitted = true })
 		if err == nil {
 			t.Fatal("NewSessionWithBoundary should fail when the staged meta is corrupt at the summary read")
 		}

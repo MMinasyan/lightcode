@@ -190,7 +190,7 @@ func TestDurableIOAgainstOwnerLocks(t *testing.T) {
 		}
 		obs := probeOwnerLock(a, &a.ensureRuntime().mu)
 		defer func() { obs() }()
-		if _, err := a.NewSessionWithBoundary(proj.ID, "primary", func(HydrationState) {}); err != nil {
+		if _, err := a.NewSessionWithBoundary(proj.ID, "primary", func(_ HydrationState, _ error) {}); err != nil {
 			t.Fatalf("NewSessionWithBoundary: %v", err)
 		}
 		// The newSession durable fires — the prompt/rules read, the prepared
@@ -335,7 +335,7 @@ func TestPreseedRearmWakeSentAfterRuntimeUnlock(t *testing.T) {
 		}
 		obs := probeOwnerLock(a, &a.ensureRuntime().mu)
 		defer func() { obs() }()
-		if _, err := a.NewSessionWithBoundary(proj.ID, "primary", func(HydrationState) {}); err != nil {
+		if _, err := a.NewSessionWithBoundary(proj.ID, "primary", func(_ HydrationState, _ error) {}); err != nil {
 			t.Fatalf("NewSessionWithBoundary: %v", err)
 		}
 		// The newSession durable fires — the prompt/rules read, the prepared

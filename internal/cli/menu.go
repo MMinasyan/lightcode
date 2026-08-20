@@ -484,8 +484,17 @@ func (c *CLI) showSessionMenuInner(state string) {
 		}
 		id, err := c.scope.NewSession("primary")
 		if err != nil {
-			release()
-			c.printLine(renderErrorMsg(err.Error()))
+			var committed *snapshot.CommittedMutationError
+			switch {
+			case id != "" && errors.As(err, &committed): // the destination was created durably before the failure: adopt it and reject typed after release+refresh
+				c.setCurrentSessionID(id)
+				release()
+				c.refreshSession()
+				c.printLine(renderErrorMsg(err.Error()))
+			default: // a plain precommit error retains the source exactly as it was
+				release()
+				c.printLine(renderErrorMsg(err.Error()))
+			}
 			return
 		}
 		c.setCurrentSessionID(id)
@@ -494,7 +503,13 @@ func (c *CLI) showSessionMenuInner(state string) {
 	case "archive":
 		if result.selected >= 0 {
 			id := result.extra.(string)
-			if err := c.agent.SessionArchive(id); err != nil {
+			err := c.agent.SessionArchive(id)
+			if err != nil {
+				var committed *snapshot.CommittedMutationError
+				switch {
+				case errors.As(err, &committed): // the removal ran durably before failing: run exactly the success reconciliation — stale-safe, so a noncurrent target preserves current — then surface the rejection. A plain precommit error reconciles nothing.
+					c.clearRemovedCurrent(id)
+				}
 				c.printLine(renderErrorMsg(err.Error()))
 				return
 			}
@@ -504,7 +519,13 @@ func (c *CLI) showSessionMenuInner(state string) {
 	case "delete":
 		if result.selected >= 0 {
 			id := result.extra.(string)
-			if err := c.agent.SessionDelete(id); err != nil {
+			err := c.agent.SessionDelete(id)
+			if err != nil {
+				var committed *snapshot.CommittedMutationError
+				switch {
+				case errors.As(err, &committed): // the removal ran durably before failing: run exactly the success reconciliation — stale-safe, so a noncurrent target preserves current — then surface the rejection. A plain precommit error reconciles nothing.
+					c.clearRemovedCurrent(id)
+				}
 				c.printLine(renderErrorMsg(err.Error()))
 				return
 			}
@@ -765,8 +786,16 @@ func (c *CLI) showRevertMenu() error {
 		}
 		result, err := c.agent.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionFork, alsoCode)
 		if err != nil {
-			c.printLine(renderErrorMsg(err.Error()))
-			c.printRevertSkipped(result)
+			var committed *snapshot.CommittedMutationError
+			switch {
+			case result.Session.ID != "" && errors.As(err, &committed): // The destination committed; adopt and refresh it, then show kept files before the error.
+				c.setCurrentSessionID(result.Session.ID)
+				c.refreshSession()
+				c.printRevertSkipped(result)
+				c.printLine(renderErrorMsg(err.Error()))
+			default: // a plain precommit error retains the source; its partial result carries no adopted session
+				c.printLine(renderErrorMsg(err.Error()))
+			}
 			return nil
 		}
 		if result.Session.ID != "" {

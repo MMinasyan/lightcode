@@ -19,7 +19,7 @@ func TestLifecycleReturnsPrebuiltReplacement(t *testing.T) {
 	t.Run("case=new_session", func(t *testing.T) {
 		a := newCatalogBackedTestAgent(t)
 		var got []HydrationState
-		id, err := a.NewSessionWithBoundary("", "primary", func(hs HydrationState) {
+		id, err := a.NewSessionWithBoundary("", "primary", func(hs HydrationState, _ error) {
 			got = append(got, hs)
 		})
 		if err != nil {

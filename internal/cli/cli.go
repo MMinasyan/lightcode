@@ -1895,8 +1895,17 @@ func (c *CLI) dispatchCommand(text string) error {
 		}
 		id, err := c.scope.NewSession("primary")
 		if err != nil {
-			release()
-			c.printLine(renderErrorMsg(err.Error()))
+			var committed *snapshot.CommittedMutationError
+			switch {
+			case id != "" && errors.As(err, &committed): // the destination was created durably before the failure: adopt it and reject typed after release+refresh
+				c.setCurrentSessionID(id)
+				release()
+				c.refreshSession()
+				c.printLine(renderErrorMsg(err.Error()))
+			default: // a plain precommit error retains the source exactly as it was
+				release()
+				c.printLine(renderErrorMsg(err.Error()))
+			}
 			return nil
 		}
 		c.setCurrentSessionID(id)
@@ -2187,8 +2196,18 @@ func (c *CLI) projectSwitch(targetPath string) {
 	}
 	summary, err := c.scope.OpenOrCreateSession(targetPath)
 	if err != nil {
-		release()
-		c.printLine(renderErrorMsg(err.Error()))
+		var committed *snapshot.CommittedMutationError
+		switch {
+		case summary.ID != "" && errors.As(err, &committed): // the create fallback durably committed its destination before failing: adopt project and session, reject typed after release+refresh
+			c.scope.SetProjectPath(targetPath)
+			c.setCurrentSessionID(summary.ID)
+			release()
+			c.refreshSession()
+			c.printLine(renderErrorMsg(err.Error()))
+		default: // a plain precommit error retains the old route and source exactly as they were
+			release()
+			c.printLine(renderErrorMsg(err.Error()))
+		}
 		return
 	}
 	c.scope.SetProjectPath(targetPath)

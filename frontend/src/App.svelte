@@ -722,10 +722,10 @@
     <TokenDetails {tokens} on:close={() => showTokens=false} />
   {/if}
   {#if showSessionSelector}
-    <SessionSelector on:close={() => showSessionSelector=false} on:error={(e) => showError(e.detail)} />
+    <SessionSelector seeded={snapshotApplied} currentSessionId={sessionId} generation={presentationGeneration} on:close={() => showSessionSelector=false} on:error={(e) => showError(e.detail)} />
   {/if}
   {#if showProjectSelector}
-    <ProjectSelector on:close={() => showProjectSelector=false} on:error={(e) => showError(e.detail)} />
+    <ProjectSelector seeded={snapshotApplied} currentSessionId={sessionId} generation={presentationGeneration} on:close={() => showProjectSelector=false} on:error={(e) => showError(e.detail)} />
   {/if}
   {#if showWarnings}
     <WarningDetails {warnings} on:close={() => showWarnings=false} />

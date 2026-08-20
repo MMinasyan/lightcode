@@ -26,6 +26,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	lcconfig "github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 // TestACPOutputIsWrittenOnlyByDrainer proves the single output drainer is the only
@@ -5471,4 +5472,465 @@ func waitForACPRequest(t *testing.T, ch <-chan struct{}, what string) {
 	case <-time.After(15 * time.Second):
 		t.Fatalf("timed out waiting for %s", what)
 	}
+}
+
+// acpLifecycleFake is a prepared-outcome AdapterService for the ACP lifecycle routes —
+// new, fork, archive/delete. Each route mirrors the owner contract exactly: success
+// emits its prepared boundary with a nil outcome; a committed failure emits that same
+// prepared destination while still returning it (new) or riding back as error data
+// (fork); any plain precommit failure invokes no callback and advances nothing. Every
+// other owner call panics on the embedded nil interface, so an unexpected probe fails
+// loudly instead of silently succeeding; nothing here activates a real producer — only
+// consumer classification, FIFO order, routing adoption, and data shape are under test.
+type acpLifecycleFake struct {
+	agent.AdapterService // embedded nil: any unoverridden probe panics
+
+	newID      string // new's prepared destination id ("" = none)
+	newErr     error  // new outcome: nil / plain / wrapped committed
+	forkResult agent.TurnActionResult
+	forkErr    error // fork outcome, same split as newErr
+	rmErr      error // archive/delete shared outcome; the row decides current vs noncurrent via routing
+}
+
+func (f *acpLifecycleFake) ProjectRoot() string { return "/proj" }
+
+// emitPreparedState is the owner contract for a staged route's in-commit callback:
+// success emits with nil; committed failure emits prepared destination plus its wrapped
+// rejection and returns that id too; plain precommit invokes nothing.
+func (f *acpLifecycleFake) NewSessionForProjectPathWithBoundary(_, _ string, emit func(agent.HydrationState, error)) (string, error) {
+	state := agent.HydrationState{Session: agent.SessionSummary{ID: f.newID}}
+	var committed *snapshot.CommittedMutationError
+	if f.newErr == nil && f.newID != "" {
+		emit(state, nil)
+		return f.newID, nil
+	}
+	if f.newID != "" && errors.As(f.newErr, &committed) {
+		emit(state, f.newErr)
+		return f.newID, f.newErr // the destination id still returns with its rejection
+	}
+	return "", f.newErr // plain precommit: no callback at all
+}
+
+func (f *acpLifecycleFake) ApplyTurnActionForSessionWithBoundary(_ string, _ int, action string, _ bool, emit func(agent.HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (agent.TurnActionResult, error) {
+	if action != agent.TurnActionFork {
+		panic("acp lifecycle fake received a non-fork turn action; only fork is under test here")
+	}
+	var committed *snapshot.CommittedMutationError
+	switch {
+	case f.forkErr == nil && f.forkResult.Session.ID != "":
+		emit(agent.HydrationState{Session: f.forkResult.Session}, nil, "", nil, nil)
+		return f.forkResult, nil
+	default:
+		if f.forkResult.Session.ID != "" && errors.As(f.forkErr, &committed) {
+			emit(agent.HydrationState{Session: f.forkResult.Session}, nil, "", committed, nil)
+			return f.forkResult, f.forkErr // the prepared result rides back with its rejection
+		}
+		return agent.TurnActionResult{}, f.forkErr // plain precommit: no callback at all
+	}
+}
+
+func (f *acpLifecycleFake) SessionArchive(string) error { return f.rmErr }
+func (f *acpLifecycleFake) SessionDelete(string) error  { return f.rmErr }
+
+// acpLineIsNotification reports whether one drained ACP output line is a notification —
+// the boundary lines these rows assert on FIFO position. Responses carry an id and no
+// method; notifications the reverse, so both fields together discriminate exactly.
+func acpLineIsNotification(t *testing.T, line string) bool {
+	t.Helper()
+	var probe struct {
+		ID     any    `json:"id"`
+		Method string `json:"method"`
+	}
+	if err := json.Unmarshal([]byte(line), &probe); err != nil {
+		t.Fatalf("drained line is not valid JSON: %q (%v)", line, err)
+	}
+	return probe.Method != "" && probe.ID == nil
+}
+
+// presentedForTest reads the drainer-owned presentation current after a drain, so an
+// invisible nil advance (a frameAdvance with no data) stays observable in tests.
+func (r *Runner) presentedForTest() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.presented
+}
+
+// isPlainOutcome reports whether an outcome is neither success nor committed — a
+// precommit failure that emits no boundary at all and advances nothing.
+func isPlainOutcome(t *testing.T, out error) bool {
+	t.Helper()
+	if out == nil {
+		return false
+	}
+	var c *snapshot.CommittedMutationError
+	return !errors.As(out, &c)
+}
+
+// unmarshalInto round-trips one JSON value into dst for exact-shape assertions on the
+// prepared data these rows carry.
+func unmarshalInto(t *testing.T, from any, dst any) error {
+	t.Helper()
+	data, err := json.Marshal(from)
+	if err != nil {
+		return fmt.Errorf("re-marshal %T: %w", from, err)
+	}
+	if err := json.Unmarshal(data, dst); err != nil {
+		return fmt.Errorf("unmarshal into %T: %w (from %#v)", dst, err, from)
+	}
+	return nil
+}
+
+// TestACPLifecycleCommittedOutcomeTable proves the ACP lifecycle consumer table with a
+// fake service seam: new and fork emit boundary-then-response in exact FIFO order —
+// success rides its prepared data as result (new's SessionSummary, fork's TurnActionResult),
+// committed failure rides that same prepared data on a typed error; any plain precommit
+// failure stays one bare error line with no routing advance. Archive/delete send their
+// visible detach or invisible nil advance before the response and omit all error data even
+// when committed: removed current clears, unchanged current is preserved by its re-adopted
+// presentation — observable through presentedForTest because a nil advance carries no wire bytes.
+func TestACPLifecycleCommittedOutcomeTable(t *testing.T) {
+	committed := &snapshot.CommittedMutationError{Err: errors.New("committed sync failure")}
+
+	t.Run("route=new", func(t *testing.T) {
+		rows := []struct {
+			name      string // outcome class
+			newID     string // prepared destination ("" for a plain precommit with nothing created)
+			out       error  // nil = success; wrapped committed or plain failure
+			wantLines int    // exact drained line count: boundary + response, or bare rejection alone
+			wantCur   string // routing current after the call
+		}{
+			{name: "success", newID: "dest", wantLines: 2, wantCur: "dest"},
+			{name: "committed", newID: "dest", out: fmt.Errorf("wrap: %w", committed), wantLines: 2, wantCur: "dest"},
+			{name: "plain_error", out: errors.New("precommit failure"), wantLines: 1},
+		}
+		for _, row := range rows {
+			t.Run(row.name, func(t *testing.T) {
+				fake := &acpLifecycleFake{newID: row.newID, newErr: row.out}
+				var out bytes.Buffer
+				r := &Runner{agent: fake, out: &out}
+
+				req := Request{JSONRPC: "2.0", ID: "new-" + row.name, Method: "session/new"}
+				r.handleSessionNew(req)
+
+				lines := drainedLines(t, r, &out, row.wantLines) // exact count proves no interleaving or extras
+
+				if row.name != "plain_error" && !acpLineIsNotification(t, lines[0]) {
+					t.Fatalf("line 1 = %q; the prepared destination boundary must precede its response", lines[0])
+				}
+
+				var resp Response
+				respIdx := len(lines) - 1 // the response is always the final line of every row
+				if err := json.Unmarshal([]byte(lines[respIdx]), &resp); err != nil || (resp.Result == nil && resp.Error == nil) {
+					t.Fatalf("line %d = %q; want the response for id new-%s", respIdx+1, lines[respIdx], row.name)
+				}
+
+				switch {
+				case row.out == nil: // success rides its prepared summary as the result — no postcommit owner read
+					if resp.Error != nil {
+						t.Fatalf("success response = %q; want a bare result", lines[respIdx])
+					}
+					var got agent.SessionSummary
+					if err := unmarshalInto(t, resp.Result, &got); err != nil || got.ID != "dest" {
+						t.Fatalf("success result = %#v (err %v), want the prepared destination summary", resp.Result, err)
+					}
+				case errors.As(row.out, new(*snapshot.CommittedMutationError)): // committed: typed error carrying that same prepared data
+					if resp.Error == nil || resp.Result != nil {
+						t.Fatalf("committed response = %q; want the typed rejection with its data", lines[respIdx])
+					}
+					if resp.Error.Message != row.out.Error() {
+						t.Fatalf("error message = %q, want the full wrapped rejection text %q", resp.Error.Message, row.out.Error())
+					}
+					var got agent.SessionSummary
+					if err := unmarshalInto(t, resp.Error.Data, &got); err != nil || got.ID != "dest" {
+						t.Fatalf("committed error data = %#v (err %v), want the prepared destination summary", resp.Error.Data, err)
+					}
+				default: // plain precommit: one bare line only — no boundary ahead of it, no routing advance behind it
+					if len(lines) != 1 {
+						t.Fatalf("a plain failure emitted %d lines; it must stay a single bare rejection", len(lines))
+					}
+					var probe struct {
+						ID any `json:"id"`
+					}
+					if err := json.Unmarshal([]byte(lines[0]), &probe); err == nil && acpLineIsNotification(t, lines[0]) {
+						t.Fatalf("a plain precommit failure must not emit a boundary line: %q", lines[0])
+					}
+				}
+
+				if cur := r.sv().Current(); cur != row.wantCur {
+					t.Fatalf("routing current after %s new = %q, want %q", row.name, cur, row.wantCur)
+				}
+			})
+		}
+	})
+
+	t.Run("route=fork", func(t *testing.T) {
+		prepared := agent.TurnActionResult{SessionChanged: true, Session: agent.SessionSummary{ID: "forkdest"}}
+		rows := []struct {
+			name      string // outcome class
+			out       error  // nil = success; wrapped committed or plain failure
+			wantLines int    // boundary + response on every emitted row; bare rejection alone for precommit
+			wantCur   string // the prepared destination when adopted, else the retained source
+		}{
+			{name: "success", wantLines: 2, wantCur: "forkdest"},
+			{name: "committed", out: fmt.Errorf("wrap: %w", committed), wantLines: 2, wantCur: "forkdest"},
+			{name: "plain_error", out: errors.New("precommit failure"), wantLines: 1, wantCur: "src"},
+		}
+		for _, row := range rows {
+			t.Run(row.name, func(t *testing.T) {
+				fake := &acpLifecycleFake{forkResult: prepared, forkErr: row.out}
+				var out bytes.Buffer
+				r := &Runner{agent: fake, out: &out}
+				r.setCurrentSessionID("src") // the action's source; a plain failure must keep it
+
+				req := Request{JSONRPC: "2.0", ID: "fork-" + row.name, Method: "session/fork"}
+				params, _ := json.Marshal(turnActionParams{SessionID: "src", Turn: 1})
+				req.Params = params
+				r.handleTurnAction(req, agent.TurnActionFork)
+
+				lines := drainedLines(t, r, &out, row.wantLines) // exact count proves no interleaving or extras
+
+				if row.name != "plain_error" {
+					if !acpLineIsNotification(t, lines[0]) {
+						t.Fatalf("line 1 = %q; the destination boundary must precede its response", lines[0])
+					}
+					var notif struct {
+						Method string               `json:"method"`
+						Params agent.HydrationState `json:"params"`
+					}
+					if err := json.Unmarshal([]byte(lines[0]), &notif); err != nil || notif.Method != "agent/session_changed" || notif.Params.Session.ID != "forkdest" {
+						t.Fatalf("line 1 = %q; want the fork destination's session_changed boundary", lines[0])
+					}
+				}
+
+				var resp Response
+				if err := json.Unmarshal([]byte(lines[len(lines)-1]), &resp); err != nil || (resp.Result == nil && resp.Error == nil) {
+					t.Fatalf("final line = %q; want the response for id fork-%s", lines[len(lines)-1], row.name)
+				}
+
+				switch {
+				case row.out == nil: // success rides its prepared turn-action outcome as the result
+					if resp.Error != nil {
+						t.Fatalf("fork success response = %q; want a bare result", lines[len(lines)-1])
+					}
+					var got agent.TurnActionResult
+					if err := unmarshalInto(t, resp.Result, &got); err != nil || !reflect.DeepEqual(got, prepared) {
+						t.Fatalf("fork success result = %#v (err %v), want the prepared turn-action outcome", got, err)
+					}
+				case errors.As(row.out, new(*snapshot.CommittedMutationError)): // committed: typed error riding that same prepared result
+					if resp.Error == nil || resp.Result != nil {
+						t.Fatalf("fork committed response = %q; want the typed rejection with its data", lines[len(lines)-1])
+					}
+					if resp.Error.Message != row.out.Error() {
+						t.Fatalf("error message = %q, want the full wrapped rejection text %q", resp.Error.Message, row.out.Error())
+					}
+					var got agent.TurnActionResult
+					if err := unmarshalInto(t, resp.Error.Data, &got); err != nil || !reflect.DeepEqual(got, prepared) {
+						t.Fatalf("fork committed data = %#v (err %v), want the same prepared result its boundary was built from", got, err)
+					}
+				default: // plain precommit: one bare line only — no boundary ahead of it, source retained behind it
+					if acpLineIsNotification(t, lines[0]) {
+						t.Fatalf("a plain precommit failure must not emit a boundary line: %q", lines[0])
+					}
+				}
+
+				if cur := r.sv().Current(); cur != row.wantCur {
+					t.Fatalf("routing current after %s fork = %q, want %q", row.name, cur, row.wantCur)
+				}
+			})
+		}
+	})
+
+	for _, op := range []struct {
+		name   string // archive / delete — one shared consumer seam under test
+		handle func(*Runner, Request)
+	}{
+		{name: "archive", handle: func(r *Runner, req Request) { r.handleSessionArchive(req) }},
+		{name: "delete", handle: func(r *Runner, req Request) { r.handleSessionDelete(req) }},
+	} {
+		t.Run("route="+op.name, func(t *testing.T) {
+			rows := []struct {
+				name      string // outcome class × target position (routing current is A in every row)
+				target    string // the id archive/delete is called with
+				out       error  // nil = success; wrapped committed or plain failure
+				wantLines int    // visible wire lines: detach + response, invisible advance leaves one line alone
+				wantCur   string // routing current after the call ("" reconciled away for a removed current)
+			}{
+				{name: "success_current", target: "A", wantLines: 2},
+				{name: "success_noncurrent", target: "B", wantLines: 1, wantCur: "A"},
+				{name: "plain_error_current", target: "A", out: errors.New("precommit failure"), wantLines: 1, wantCur: "A"},
+				{name: "plain_error_noncurrent", target: "B", out: errors.New("precommit failure"), wantLines: 1, wantCur: "A"},
+				{name: "committed_current", target: "A", out: fmt.Errorf("wrap: %w", committed), wantLines: 2},
+				{name: "committed_noncurrent", target: "B", out: fmt.Errorf("wrap: %w", committed), wantLines: 1, wantCur: "A"},
+			}
+			for _, row := range rows {
+				t.Run(row.name, func(t *testing.T) {
+					fake := &acpLifecycleFake{rmErr: row.out}
+					var out bytes.Buffer
+					r := &Runner{agent: fake, out: &out}
+					r.setCurrentSessionID("A") // routing current before the call; target may or may not be it
+
+					req := Request{JSONRPC: "2.0", ID: op.name + "-" + row.name, Method: "session/" + op.name, Params: json.RawMessage(`{"id":"` + row.target + `"}`)}
+					op.handle(r, req)
+
+					lines := drainedLines(t, r, &out, row.wantLines) // exact count proves the advance's visibility class and FIFO order
+
+					if strings.HasSuffix(row.name, "_current") && (row.out == nil || errors.As(row.out, new(*snapshot.CommittedMutationError))) {
+						// A removed current publishes its visible detach ahead of the response.
+						if !acpLineIsNotification(t, lines[0]) {
+							t.Fatalf("line 1 = %q; the removal's advance must precede its response", lines[0])
+						}
+						var notif struct {
+							Method string               `json:"method"`
+							Params agent.HydrationState `json:"params"`
+						}
+						if err := json.Unmarshal([]byte(lines[0]), &notif); err != nil || notif.Method != "agent/session_changed" {
+							t.Fatalf("line 1 = %q; want the session_changed boundary", lines[0])
+						}
+						if notif.Params.Session.ID != "" || len(notif.Params.Messages) > 0 || notif.Params.Busy {
+							t.Fatalf("current-removal boundary = %#v; want the deterministic empty detach, not a capture of the removed session", notif.Params)
+						}
+					}
+
+					var resp Response
+					if err := json.Unmarshal([]byte(lines[len(lines)-1]), &resp); err != nil || (resp.Result == nil && resp.Error == nil) {
+						t.Fatalf("final line = %q; want the response for id %s-%s", lines[len(lines)-1], op.name, row.name)
+					}
+
+					switch {
+					case row.out == nil: // success resolves after its advance (visible or invisible)
+						if resp.Error != nil || resp.Result == nil {
+							t.Fatalf("%s response = %q; want a bare ok result", row.name, lines[len(lines)-1])
+						}
+					default:
+						var committedErr *snapshot.CommittedMutationError
+						if errors.As(row.out, &committedErr) { // committed rejects typed — and omits all error data for archive/delete
+							if resp.Error == nil || resp.Result != nil {
+								t.Fatalf("committed %s line = %q; want the typed rejection", op.name, lines[len(lines)-1])
+							}
+							if resp.Error.Data != nil {
+								t.Fatalf("a committed archive/delete outcome must omit all error data: %q", lines[len(lines)-1])
+							}
+						} else if acpLineIsNotification(t, lines[0]) { // a plain failure emits no advance line at all — the sole line is its rejection
+							t.Fatalf("a plain precommit failure emitted an advance line: %q", lines[0])
+						}
+					}
+
+					if cur := r.sv().Current(); cur != row.wantCur {
+						t.Fatalf("routing current after %s = %q, want %q", op.name+" "+row.name, cur, row.wantCur)
+					}
+
+					wantPresented := "" // current rows detach presentation to empty; plain rows never touch it (it started there too)
+					if strings.HasSuffix(row.name, "_noncurrent") && !isPlainOutcome(t, row.out) {
+						wantPresented = "A" // the success/committed nil advance re-adopts the unchanged A — a plain error emits no boundary at all
+					}
+					if got := r.presentedForTest(); got != wantPresented {
+						t.Fatalf("presentation after %s %s = %q, want %q", op.name, row.name, got, wantPresented)
+					}
+				})
+			}
+		})
+	}
+
+	// No routed current session: a noncurrent removal is still a noncurrent outcome — the nil
+	// advance must be enqueued with its empty (global) tag exactly as before, ahead of the
+	// response or typed error line in FIFO order. The advance carries no wire bytes and an
+	// empty→empty presented transition is unobservable through drainedLines/presentedForTest,
+	// so these rows read the drainer's queue directly: op.handle enqueues synchronously before
+	// returning, making existence and position exact at that instant. Plain precommit stays its
+	// forbidden sibling — error only, no advance of any kind.
+	t.Run("route=noncurrent_no_current", func(t *testing.T) {
+		for _, op := range []struct {
+			name   string // archive / delete — one shared consumer seam under test
+			handle func(*Runner, Request)
+		}{
+			{name: "archive", handle: func(r *Runner, req Request) { r.handleSessionArchive(req) }},
+			{name: "delete", handle: func(r *Runner, req Request) { r.handleSessionDelete(req) }},
+		} {
+			t.Run("route="+op.name, func(t *testing.T) {
+				rows := []struct {
+					name        string // outcome class; target B is noncurrent by construction (nothing is routed current)
+					out         error  // nil = success; wrapped committed or plain failure
+					wantLines   int    // visible wire lines: the invisible advance leaves exactly one line alone
+					wantAdvance bool   // a nil advance with an empty tag enqueued ahead of the response
+				}{
+					{name: "success_noncurrent", wantLines: 1, wantAdvance: true},
+					{name: "committed_noncurrent", out: fmt.Errorf("wrap: %w", committed), wantLines: 1, wantAdvance: true},
+					{name: "plain_error_noncurrent", out: errors.New("precommit failure"), wantLines: 1}, // forbidden sibling of the two rows above: no advance at all
+				}
+				for _, row := range rows {
+					t.Run(row.name, func(t *testing.T) {
+						fake := &acpLifecycleFake{rmErr: row.out}
+						var out bytes.Buffer
+						r := &Runner{agent: fake, out: &out} // no setCurrentSessionID — nothing is routed current before the call
+
+						req := Request{JSONRPC: "2.0", ID: op.name + "-" + row.name, Method: "session/" + op.name, Params: json.RawMessage(`{"id":"B"}`)}
+						op.handle(r, req) // enqueues synchronously; queue inspection below runs before any drain
+
+						if got := r.queuedNilAdvanceBeforeLast(t); got != row.wantAdvance {
+							t.Fatalf("%s %s queued a nil advance ahead of its response = %v, want %v: queue=%q", op.name, row.name, got, row.wantAdvance, r.frameKindsForTest())
+						}
+
+						lines := drainedLines(t, r, &out, row.wantLines) // exact count proves the advance stays invisible on the wire and nothing else leaked
+
+						var resp Response
+						if err := json.Unmarshal([]byte(lines[len(lines)-1]), &resp); err != nil || (resp.Result == nil && resp.Error == nil) {
+							t.Fatalf("final line = %q; want the response for id %s-%s", lines[len(lines)-1], op.name, row.name)
+						}
+						switch {
+						case row.out == nil: // success resolves after its invisible advance
+							if resp.Error != nil || resp.Result == nil {
+								t.Fatalf("%s response = %q; want a bare ok result", row.name, lines[len(lines)-1])
+							}
+						default:
+							var committedErr *snapshot.CommittedMutationError
+							if errors.As(row.out, &committedErr) { // committed rejects typed and omits all error data — same as with a routed current
+								if resp.Error == nil || resp.Result != nil {
+									t.Fatalf("committed %s line = %q; want the typed rejection", op.name, lines[len(lines)-1])
+								}
+								if resp.Error.Data != nil {
+									t.Fatalf("a committed archive/delete outcome must omit all error data: %q", lines[len(lines)-1])
+								}
+							} else if acpLineIsNotification(t, lines[0]) { // a plain failure emits no advance line at all — the sole line is its rejection
+								t.Fatalf("a plain precommit failure emitted an advance line: %q", lines[0])
+							}
+						}
+
+						if got, _ := r.currentSession(); got != "" { // current preservation with nothing routed: still nothing after the removal
+							t.Fatalf("routing current after %s %s = %q, want none preserved as-is", op.name, row.name, got)
+						}
+					})
+				}
+			})
+		}
+	})
+}
+
+// queuedNilAdvanceBeforeLast reports whether the operation enqueued exactly one nil advance — a
+// frameAdvance carrying no wire bytes and tagged to whatever current was captured (empty when
+// nothing is routed) — ahead of its response. It reads the drainer's queue under mu before any
+// drain, so existence and FIFO position are exact at that instant; it never writes anything back.
+func (r *Runner) queuedNilAdvanceBeforeLast(t *testing.T) bool {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.outFrames) < 2 {
+		return false // a response alone: no advance was enqueued at all
+	}
+	f := r.outFrames[0] // the operation's frames are [advance?, response]; head position is its FIFO slot
+	return f.kind == frameAdvance && strings.TrimSpace(f.sessionID) == ""
+}
+
+// frameKindsForTest renders one queue snapshot for failure diagnostics only.
+func (r *Runner) frameKindsForTest() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ks := make([]string, 0, len(r.outFrames))
+	for _, f := range r.outFrames {
+		if f.kind == frameAdvance {
+			ks = append(ks, "advance["+f.sessionID+"]")
+		} else {
+			ks = append(ks, "frame["+f.sessionID+"]")
+		}
+	}
+	return ks
 }

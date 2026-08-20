@@ -4588,3 +4588,569 @@ func TestFoldAbandonedShutdown(t *testing.T) {
 		}
 	})
 }
+
+// lifecycleOutcomeAdapter drives committed and plain outcomes through every
+// CLI mutation path (inline/menu new, project switch with create fallback,
+// fork, archive/delete). It records probe events in order so tests can assert
+// release-before-render ordering and reconciliation behavior without touching
+// real persistence or snapshots. Every unoverridden probe panics on the nil-
+// embedded interface: an unexpected owner call fails loudly instead of
+// silently succeeding; nothing here activates a real producer — only consumer
+// classification is under test.
+type lifecycleOutcomeAdapter struct {
+	agent.AdapterService
+
+	newID   string                 // destination id new/create fallback returns for success and committed rows
+	outcome error                  // nil = success; plain, or the wrapped committed failure (shared by every mutation path)
+	forkRes agent.TurnActionResult // prepared fork result for the revert menu's fork action
+	list    []agent.SessionSummary // /session menu content and selectIndex lookup
+
+	events *[]string
+}
+
+func (f *lifecycleOutcomeAdapter) log(ev string) {
+	if f.events != nil {
+		*f.events = append(*f.events, ev)
+	}
+}
+
+// ReserveSelectionSource records the reservation; its release records where it ends.
+func (f *lifecycleOutcomeAdapter) ReserveSelectionSource(sessionID string) (func(), error) {
+	f.log("reserve:" + sessionID)
+	return func() { f.log("release") }, nil
+}
+
+// NewSessionForProjectPath is the create path for inline/menu new and project-switch fallback.
+func (f *lifecycleOutcomeAdapter) NewSessionForProjectPath(_, _ string) (string, error) {
+	f.log("new:" + f.newID)
+	return f.newID, f.outcome
+}
+
+// SessionListForProjectPath feeds menu construction and selectIndex; it returns the prepared list.
+func (f *lifecycleOutcomeAdapter) SessionListForProjectPath(_, _ string) ([]agent.SessionSummary, error) {
+	f.log("list")
+	return f.list, nil
+}
+
+// ApplyTurnActionForSession serves only showRevertMenu's fork action: any other
+// action panics on the nil embed if it reaches the owner.
+func (f *lifecycleOutcomeAdapter) ApplyTurnActionForSession(_ string, _ int, _ string, _ bool) (agent.TurnActionResult, error) {
+	f.log("fork")
+	return f.forkRes, f.outcome
+}
+
+// SessionArchive returns the prepared outcome.
+func (f *lifecycleOutcomeAdapter) SessionArchive(id string) error {
+	f.log("archive:" + id)
+	return f.outcome
+}
+
+// SessionDelete returns the prepared outcome.
+func (f *lifecycleOutcomeAdapter) SessionDelete(id string) error {
+	f.log("delete:" + id)
+	return f.outcome
+}
+
+// --- Refresh and menu probes: recorded only; their values are irrelevant to these assertions, and any probe not overridden here fails loudly on the nil embed. ---
+
+func (f *lifecycleOutcomeAdapter) CurrentModelForSession(_ string) (agent.ModelInfo, error) {
+	f.log("model")
+	return agent.ModelInfo{}, errors.New("not available in this test")
+}
+
+func (f *lifecycleOutcomeAdapter) SessionSummaryForSessionOrPersisted(id string) (agent.SessionSummary, error) {
+	f.log("summary:" + id)
+	return agent.SessionSummary{ID: id}, nil
+}
+
+func (f *lifecycleOutcomeAdapter) SessionMessagesFor(_ string) ([]agent.DisplayMessage, error) {
+	f.log("messages")
+	return []agent.DisplayMessage{{Type: "user", Content: "seed turn", Turn: 1}}, nil
+}
+
+func (f *lifecycleOutcomeAdapter) QueueSnapshotForSession(_ string) (agent.QueueState, error) {
+	f.log("queue")
+	return agent.QueueState{}, nil
+}
+
+// newLifecycleCLI builds a headless CLI wired to f on both the adapter and scope surfaces.
+func newLifecycleCLI(t *testing.T, f *lifecycleOutcomeAdapter) (*CLI, *bytes.Buffer) {
+	t.Helper()
+	out := new(bytes.Buffer)
+	c := &CLI{out: out, mu: &sync.Mutex{}, input: newInputLine(), history: newInputHistory()}
+	c.width.Store(80)
+	if f.events == nil {
+		evs := []string{}
+		f.events = &evs
+	}
+	c.agent = f
+	c.scope = agent.NewAdapterScope(f, "/proj")
+	return c, out
+}
+
+func indexEv(evs []string, want string) int {
+	for i, ev := range evs {
+		if ev == want {
+			return i
+		}
+	}
+	return -1
+}
+
+func hasEventPrefix(evs []string, prefix string) bool {
+	for _, ev := range evs {
+		if strings.HasPrefix(ev, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// keySequence yields the prepared keys in order; a read past the end is an error so any unexpected menu over-read fails loudly.
+func keySequence(keys ...keyMsg) func() (keyMsg, error) {
+	next := 0
+	return func() (keyMsg, error) {
+		if next < len(keys) {
+			k := keys[next]
+			next++
+			return k, nil
+		}
+		return keyMsg{}, errors.New("no more prepared keys")
+	}
+}
+
+// TestCLILifecycleCommittedOutcomes proves the CLI consumer table row by row: a committed outcome adopts its durable destination (new/fork/project fallback) or runs exactly the stale-safe success reconciliation (archive/delete), releases before rendering, and surfaces the rejection; plain outcomes retain source and routing exactly as they were.
+func TestCLILifecycleCommittedOutcomes(t *testing.T) {
+	committed := &snapshot.CommittedMutationError{Err: errors.New("commit failed")}
+	plain := errors.New("precommit failure")
+
+	t.Run("inline_new_committed_adopts_destination", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{newID: "dest", outcome: committed}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("src")
+		dispatchSelection(t, c, "/new", "")
+
+		wantCurrent(t, c, "dest")
+		evs := *f.events
+		r := indexEv(evs, "release")
+		if r < 0 || !hasEventPrefix(evs[:r+1], "reserve:src") {
+			t.Fatalf("events = %v, want the source reserved and released", evs)
+		}
+		if m := indexEv(evs, "model"); m <= r {
+			t.Fatalf("events = %v, want release before the destination render", evs)
+		}
+		if !strings.Contains(out.String(), committed.Error()) {
+			t.Fatalf("output = %q, want the rejection", out.String())
+		}
+	})
+
+	t.Run("inline_new_plain_retains_source", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{newID: "dest", outcome: plain}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("src")
+		dispatchSelection(t, c, "/new", "")
+
+		wantCurrent(t, c, "src")
+		evs := *f.events
+		if indexEv(evs, "model") >= 0 || indexEv(evs, "summary:dest") >= 0 {
+			t.Fatalf("events = %v, want no destination render after a plain failure", evs)
+		}
+		if r := indexEv(evs, "release"); r != len(evs)-1 {
+			t.Fatalf("events = %v, want the release to end the path — nothing renders after it", evs)
+		}
+		if !strings.Contains(out.String(), plain.Error()) {
+			t.Fatalf("output = %q, want the rejection", out.String())
+		}
+	})
+
+	t.Run("inline_new_success_releases_before_render", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{newID: "dest"} // nil outcome = success
+		c, _ := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("src")
+		dispatchSelection(t, c, "/new", "")
+
+		wantCurrent(t, c, "dest")
+		evs := *f.events
+		if r := indexEv(evs, "release"); r < 0 || indexEv(evs, "model") <= r {
+			t.Fatalf("events = %v, want release before the destination render", evs)
+		}
+	})
+
+	t.Run("menu_new_committed_adopts_destination", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{newID: "dest", outcome: committed, list: []agent.SessionSummary{{ID: "src"}}}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("src")
+		c.readKeyFn = keySequence(keyMsg{Rune: 'n'})
+		dispatchSelection(t, c, "/session", "")
+
+		wantCurrent(t, c, "dest")
+		evs := *f.events
+		r := indexEv(evs, "release")
+		if r < 0 || !hasEventPrefix(evs[:r+1], "reserve:src") {
+			t.Fatalf("events = %v, want the source reserved and released", evs)
+		}
+		if m := indexEv(evs, "model"); m <= r {
+			t.Fatalf("events = %v, want release before the destination render", evs)
+		}
+		if !strings.Contains(out.String(), committed.Error()) {
+			t.Fatalf("output = %q, want the rejection", out.String())
+		}
+	})
+
+	t.Run("menu_new_plain_retains_source", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{newID: "dest", outcome: plain, list: []agent.SessionSummary{{ID: "src"}}}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("src")
+		c.readKeyFn = keySequence(keyMsg{Rune: 'n'})
+		dispatchSelection(t, c, "/session", "")
+
+		wantCurrent(t, c, "src")
+		evs := *f.events
+		if indexEv(evs, "model") >= 0 || indexEv(evs, "summary:dest") >= 0 {
+			t.Fatalf("events = %v, want no destination render after a plain failure", evs)
+		}
+		if !strings.Contains(out.String(), plain.Error()) {
+			t.Fatalf("output = %q, want the rejection", out.String())
+		}
+	})
+
+	t.Run("project_fallback_committed_adopts_project_and_destination", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{newID: "dest", outcome: committed}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("src")
+		c.projectSwitch("/other")
+
+		wantProjectPath(t, c, "/other")
+		wantCurrent(t, c, "dest")
+		evs := *f.events
+		r := indexEv(evs, "release")
+		if r < 0 || !hasEventPrefix(evs[:r+1], "reserve:src") {
+			t.Fatalf("events = %v, want the source reserved and released", evs)
+		}
+		if m := indexEv(evs, "model"); m <= r {
+			t.Fatalf("events = %v, want release before the destination render", evs)
+		}
+		if !strings.Contains(out.String(), committed.Error()) {
+			t.Fatalf("output = %q, want the rejection", out.String())
+		}
+	})
+
+	t.Run("project_fallback_plain_retains_route_and_source", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{newID: "dest", outcome: plain}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("src")
+		c.projectSwitch("/other")
+
+		wantProjectPath(t, c, "/proj")
+		wantCurrent(t, c, "src")
+		if !strings.Contains(out.String(), plain.Error()) {
+			t.Fatalf("output = %q, want the rejection", out.String())
+		}
+	})
+
+	t.Run("project_fallback_success_releases_before_render", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{newID: "dest"} // nil outcome = success
+		c, _ := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("src")
+		c.projectSwitch("/other")
+
+		wantProjectPath(t, c, "/other")
+		wantCurrent(t, c, "dest")
+		evs := *f.events
+		if r := indexEv(evs, "release"); r < 0 || indexEv(evs, "model") <= r {
+			t.Fatalf("events = %v, want release before the destination render", evs)
+		}
+	})
+
+	// forkKeys yields a fresh key source that walks the revert menu to the
+	// fork action and confirms it: select the single seeded turn, move from
+	// "Revert code" past "Revert history" onto "Fork from here", choose it,
+	// then accept the also-revert-code question (its Yes/No menu answers with Enter on "Yes"). Each row builds its own copy — a key source is consumed by reads.
+	forkKeys := func() func() (keyMsg, error) {
+		return keySequence(
+			keyMsg{Special: keyEnter}, // select the single seeded turn
+			keyMsg{Special: keyDown},  // Revert code -> Revert history
+			keyMsg{Special: keyDown},  // -> Fork from here
+			keyMsg{Special: keyEnter}, // choose fork
+			keyMsg{Special: keyEnter}, // accept "also revert code?" (Yes is the default)
+		)
+	}
+
+	t.Run("fork_committed_adopts_destination", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{outcome: committed, forkRes: agent.TurnActionResult{Session: agent.SessionSummary{ID: "forkdest"}}}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("src")
+		c.readKeyFn = forkKeys()
+		if err := c.dispatchCommand("/revert"); err != nil {
+			t.Fatalf("dispatchCommand(/revert): %v", err)
+		}
+
+		wantCurrent(t, c, "forkdest")
+		evs := *f.events
+		if hasEventPrefix(evs, "reserve:") {
+			t.Fatalf("events = %v, want no selection reservation on the fork path", evs)
+		}
+		if r := indexEv(evs, "fork"); r < 0 || indexEv(evs, "summary:forkdest") <= r {
+			t.Fatalf("events = %v, want the destination render after the committed fork", evs)
+		}
+		if !strings.Contains(out.String(), committed.Error()) {
+			t.Fatalf("output = %q, want the rejection", out.String())
+		}
+	})
+
+	t.Run("fork_plain_retains_source", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{outcome: plain} // zero forkRes carries no adopted session
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("src")
+		c.readKeyFn = forkKeys()
+		if err := c.dispatchCommand("/revert"); err != nil {
+			t.Fatalf("dispatchCommand(/revert): %v", err)
+		}
+
+		wantCurrent(t, c, "src")
+		evs := *f.events
+		if r := indexEv(evs, "fork"); r < 0 || r != len(evs)-1 {
+			t.Fatalf("events = %v, want the plain fork to end without a destination render", evs)
+		}
+		if !strings.Contains(out.String(), plain.Error()) {
+			t.Fatalf("output = %q, want the rejection", out.String())
+		}
+	})
+
+	t.Run("fork_success_adopts_destination", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{forkRes: agent.TurnActionResult{Session: agent.SessionSummary{ID: "forkdest"}}} // nil outcome = success
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("src")
+		c.readKeyFn = forkKeys()
+		if err := c.dispatchCommand("/revert"); err != nil {
+			t.Fatalf("dispatchCommand(/revert): %v", err)
+		}
+
+		wantCurrent(t, c, "forkdest")
+		s := out.String()
+		if strings.Contains(s, committed.Error()) || strings.Contains(s, plain.Error()) {
+			t.Fatalf("output = %q, want no rejection on a successful fork", s)
+		}
+	})
+
+	// A committed fork's returned result still carries the best-effort code revert's skipped restores:
+	// they must stay visible exactly as on success — adopt and refresh the destination first, print the
+	// skips from that same returned result, then surface the rejection. The order is what this row pins:
+	// no reservation exists on a fork path (the source-retention rows above prove it), so the sequence is
+	// adoption → refresh probes → skipped restores → error text in one output stream.
+	t.Run("fork_committed_with_skips_prints_them_before_error", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{outcome: committed, forkRes: agent.TurnActionResult{Session: agent.SessionSummary{ID: "forkdest"}, SkippedFiles: []snapshot.SkippedRevert{{Path: "/proj/kept.txt", Reason: "diverged"}}}}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("src")
+		c.readKeyFn = forkKeys()
+		if err := c.dispatchCommand("/revert"); err != nil {
+			t.Fatalf("dispatchCommand(/revert): %v", err)
+		}
+
+		wantCurrent(t, c, "forkdest") // the destination was adopted before its rejection surfaced — same as every committed row here
+		evs := *f.events
+		if hasEventPrefix(evs, "reserve:") {
+			t.Fatalf("events = %v; a fork path never reserves a selection source", evs)
+		}
+		if r := indexEv(evs, "fork"); r < 0 || indexEv(evs, "summary:forkdest") <= r {
+			t.Fatalf("events = %v; the destination refresh must follow the committed fork's adoption", evs)
+		}
+
+		s := out.String()
+		const skipsHeader = "kept 1 file changed outside this session:"
+		if i, e := strings.Index(s, skipsHeader), strings.Index(s, "/proj/kept.txt (diverged)"); i < 0 || e < 0 {
+			t.Fatalf("output = %q; the returned fork result's skipped restores must stay visible on a committed failure", s)
+		} else if errIdx := strings.Index(s, committed.Error()); errIdx < 0 || i > errIdx || e > errIdx {
+			t.Fatalf("skips at index %d/%d, error at %d; want adopt → refresh → skipped restores → rejection in that order: %q", i, e, errIdx, s)
+		}
+	})
+
+	lifecycleList := []agent.SessionSummary{{ID: "a"}, {ID: "b"}}
+
+	// The committed × plain grid is completed per operation so neither op's reconciliation behavior rests on the other's rows: archive already had its current cells and delete its noncurrent ones; these add each op's inverse committed case plus that case's nearest forbidden plain sibling, and give archive its own success control (delete_success_control_clears_current pins delete's).
+	t.Run("archive_committed_noncurrent_preserves_current", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{outcome: committed, list: lifecycleList}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("a") // target b is noncurrent; the stale-safe reconciliation must preserve it exactly as a plain failure would leave it — only the rejection differs
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), keyMsg{Rune: 'a'})
+		dispatchSelection(t, c, "/session", "")
+
+		wantCurrent(t, c, "a") // committed noncurrent removal preserves current — delete_committed_noncurrent_preserves_current is the same cell through the other op; both must hold per operation
+		evs := *f.events
+		if hasEventPrefix(evs, "reserve:") {
+			t.Fatalf("events = %v; an archive path never reserves a selection source", evs)
+		}
+		if last := evs[len(evs)-1]; last != "archive:b" {
+			t.Fatalf("events end at %q; removing a noncurrent session must refresh nothing even when committed: %v", last, evs)
+		}
+		if !strings.Contains(out.String(), committed.Error()) {
+			t.Fatalf("output = %q, want the rejection", out.String())
+		}
+	})
+
+	t.Run("delete_committed_current_clears_and_rejects", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{outcome: committed, list: lifecycleList}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("b") // target b IS the current session: exactly the success reconciliation runs before the rejection
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), keyMsg{Rune: 'd'})
+		dispatchSelection(t, c, "/session", "")
+
+		if got, _ := c.currentSession(); got != "" {
+			t.Fatalf("current after committed delete of the current session = %q, want cleared by the stale-safe reconciliation before the rejection", got)
+		}
+		evs := *f.events
+		if last := evs[len(evs)-1]; last != "delete:b" {
+			t.Fatalf("events end at %q; reconciling a removed current to empty runs without owner reads: %v", last, evs)
+		}
+		if !strings.Contains(out.String(), committed.Error()) {
+			t.Fatalf("output = %q, want the rejection after the reconciliation", out.String())
+		}
+	})
+
+	t.Run("archive_plain_noncurrent_retains_selection_without_refresh", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{outcome: plain, list: lifecycleList}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("a") // the nearest forbidden sibling of archive_committed_noncurrent_preserves_current above: same op and position; only the outcome class may differ in behavior — a plain failure reconciles nothing at all
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), keyMsg{Rune: 'a'})
+		dispatchSelection(t, c, "/session", "")
+
+		wantCurrent(t, c, "a") // retained exactly as it was — no reconciliation ran that could have cleared or re-adopted anything
+		evs := *f.events
+		if last := evs[len(evs)-1]; last != "archive:b" {
+			t.Fatalf("events end at %q; a plain archive must refresh nothing: %v", last, evs)
+		}
+		if !strings.Contains(out.String(), plain.Error()) || strings.Contains(out.String(), committed.Error()) {
+			t.Fatalf("output = %q, want the plain rejection and no committed classification of it", out.String())
+		}
+	})
+
+	t.Run("delete_plain_current_retains_selection_without_refresh", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{outcome: plain, list: lifecycleList}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("b") // the nearest forbidden sibling of delete_committed_current_clears_and_rejects above: same op and position; a plain failure must NOT run the removed-current reconciliation that its committed twin does — archive_plain_current_retains_selection pins this cell through the other op, so both ops hold it independently
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), keyMsg{Rune: 'd'})
+		dispatchSelection(t, c, "/session", "")
+
+		wantCurrent(t, c, "b") // still current — the deletion never ran durably and nothing may reconcile it away
+		evs := *f.events
+		if last := evs[len(evs)-1]; last != "delete:b" {
+			t.Fatalf("events end at %q; a plain delete of the current session must clear/reconcile nothing: %v", last, evs)
+		}
+		if !strings.Contains(out.String(), plain.Error()) || strings.Contains(out.String(), committed.Error()) {
+			t.Fatalf("output = %q, want the plain rejection and no committed classification of it", out.String())
+		}
+	})
+
+	t.Run("archive_success_control_clears_current", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{list: lifecycleList} // nil outcome = success; target is current — archive's own success control, mirroring delete_success_control_clears_current through the other op with its own rendered line
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("a")
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "a"), keyMsg{Rune: 'a'})
+		dispatchSelection(t, c, "/session", "")
+
+		if got, _ := c.currentSession(); got != "" {
+			t.Fatalf("current after archiving the current session = %q, want cleared by the success reconciliation", got)
+		}
+		evs := *f.events
+		if last := evs[len(evs)-1]; last != "archive:a" {
+			t.Fatalf("events end at %q; a successful archive reconciles to empty without owner reads: %v", last, evs)
+		}
+		s := out.String()
+		if !strings.Contains(s, "session archived") || strings.Contains(s, committed.Error()) || strings.Contains(s, plain.Error()) {
+			t.Fatalf("output = %q; want the archive success line and no rejection", s)
+		}
+	})
+
+	t.Run("archive_committed_current_clears_and_rejects", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{outcome: committed, list: lifecycleList}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("a")
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "a"), keyMsg{Rune: 'a'})
+		dispatchSelection(t, c, "/session", "")
+
+		if got, _ := c.currentSession(); got != "" {
+			t.Fatalf("current after committed archive of the current session = %q, want cleared by the success reconciliation", got)
+		}
+		evs := *f.events
+		if hasEventPrefix(evs, "reserve:") {
+			t.Fatalf("events = %v, want no selection reservation on an archive path", evs)
+		}
+		if last := evs[len(evs)-1]; last != "archive:a" {
+			t.Fatalf("events end at %q; the reconcile to empty must run without owner reads: %v", last, evs)
+		}
+		if !strings.Contains(out.String(), committed.Error()) {
+			t.Fatalf("output = %q, want the rejection", out.String())
+		}
+	})
+
+	t.Run("delete_committed_noncurrent_preserves_current", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{outcome: committed, list: lifecycleList}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("a")
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), keyMsg{Rune: 'd'})
+		dispatchSelection(t, c, "/session", "")
+
+		wantCurrent(t, c, "a") // stale-safe reconciliation preserves a current the target is not
+		evs := *f.events
+		if last := evs[len(evs)-1]; last != "delete:b" {
+			t.Fatalf("events end at %q; removing a noncurrent session must refresh nothing: %v", last, evs)
+		}
+		if !strings.Contains(out.String(), committed.Error()) {
+			t.Fatalf("output = %q, want the rejection", out.String())
+		}
+	})
+
+	t.Run("delete_plain_noncurrent_retains_current_without_refresh", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{outcome: plain, list: lifecycleList}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("a")
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), keyMsg{Rune: 'd'})
+		dispatchSelection(t, c, "/session", "")
+
+		wantCurrent(t, c, "a") // a plain precommit failure reconciles nothing — delete_committed_noncurrent_preserves_current is its forbidden sibling (same op and position, the outcome class that must not trigger it)
+		evs := *f.events
+		if last := evs[len(evs)-1]; last != "delete:b" {
+			t.Fatalf("events end at %q; no reconciliation may run after a plain delete of a noncurrent session: %v", last, evs)
+		}
+		if !strings.Contains(out.String(), plain.Error()) {
+			t.Fatalf("output = %q, want the rejection", out.String())
+		}
+	})
+
+	t.Run("archive_plain_current_retains_selection", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{outcome: plain, list: lifecycleList}
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("a")
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "a"), keyMsg{Rune: 'a'})
+		dispatchSelection(t, c, "/session", "")
+
+		wantCurrent(t, c, "a") // a plain precommit failure reconciles nothing — the committed row above is its forbidden sibling
+		evs := *f.events
+		if last := evs[len(evs)-1]; last != "archive:a" {
+			t.Fatalf("events end at %q; no reconciliation may run after a plain archive: %v", last, evs)
+		}
+		if !strings.Contains(out.String(), plain.Error()) {
+			t.Fatalf("output = %q, want the rejection", out.String())
+		}
+	})
+
+	t.Run("delete_success_control_clears_current", func(t *testing.T) {
+		f := &lifecycleOutcomeAdapter{list: lifecycleList} // nil outcome = success; target is current
+		c, out := newLifecycleCLI(t, f)
+		c.setCurrentSessionID("b")
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), keyMsg{Rune: 'd'})
+		dispatchSelection(t, c, "/session", "")
+
+		if got, _ := c.currentSession(); got != "" {
+			t.Fatalf("current after deleting the current session = %q, want cleared", got)
+		}
+		evs := *f.events
+		if last := evs[len(evs)-1]; last != "delete:b" {
+			t.Fatalf("events end at %q; success reconciliation to empty reads nothing: %v", last, evs)
+		}
+		s := out.String()
+		if !strings.Contains(s, "session deleted") || strings.Contains(s, committed.Error()) || strings.Contains(s, plain.Error()) {
+			t.Fatalf("output = %q, want the success line and no rejection", s)
+		}
+	})
+}
