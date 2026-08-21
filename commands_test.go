@@ -1851,10 +1851,35 @@ func TestRemovedOwnerTransportSymbols(t *testing.T) {
 		}
 	}
 
+	// The full removed surface: the owner lock file and its liveness probes,
+	// the shutdown endpoint and its trigger, the adapter lease/attachment
+	// machinery, the HTTP service and its handlers, the serve/stop command
+	// bodies, and the transport package with its client. Unqualified Client
+	// and NewClient stay out of the list: they name the surviving provider and
+	// LSP clients, which have nothing to do with this transport.
 	symbols := []string{
-		"internal/server",
+		"owner.lock",
+		"IsStale",
+		"WaitForOwnerExit",
+		"WaitForOwnerExitContext",
+		"LockFile",
+		"RequestShutdown",
+		"/v1/owner/shutdown",
+		"AttachLocalAdapter",
+		"DetachAdapter",
+		"adapterLease",
+		"hasLocalAdapterLeaseLocked",
+		"newAdapterID",
+		"LocalService",
+		"handleAdapterSSE",
+		"streamEvents",
+		"rpcHandlers",
+		"attachAdapter",
+		"adapterRPCRequest",
+		"rpcEnvelope",
 		"runServe",
 		"runStop",
+		"internal/server",
 		"server.NewClient",
 		"AttachAdapter",
 		"WaitOwner",
