@@ -443,7 +443,7 @@ func (a *Agent) liveSessionLocked(id string) (*session, error) {
 		return nil, fmt.Errorf("session id is required")
 	}
 	a.ensureSessionMapLocked()
-	if unit := a.sessions[id]; unit != nil && unit.store != nil && unit.store.Active() && unit.store.SessionID() == id {
+	if unit := a.liveUnitLocked(id); unit != nil && unit.store != nil && unit.store.Active() && unit.store.SessionID() == id {
 		return unit, nil
 	}
 	if current := sessionIDOf(a.session); current == id {
@@ -455,12 +455,89 @@ func (a *Agent) liveSessionLocked(id string) (*session, error) {
 	return nil, fmt.Errorf("unknown session %q", id)
 }
 
+// liveUnitLocked returns the exact map entry. Callers must hold rt.mu; it is a
+// pointer helper, not an id resolver.
+func (a *Agent) liveUnitLocked(id string) *session {
+	a.ensureSessionMapLocked()
+	return a.sessions[id]
+}
+
+// liveSessionLockedForOperation is the lock-local pointer entry point for
+// operations that only accept sessions already live in this owner.
+func (a *Agent) liveSessionLockedForOperation(id string) (*session, error) {
+	return a.liveSessionLocked(id)
+}
+
 func (a *Agent) resolveLiveSession(id string) (*session, error) {
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	unit, err := a.liveSessionLocked(id)
 	rt.mu.Unlock()
 	return unit, err
+}
+
+type resolvedSession struct {
+	id      string
+	project *project.Project
+	root    string
+	unit    *session
+}
+
+// resolveUnambiguousLiveSession performs the one global bare-id lookup before
+// consulting the owner's live pointer. The project scan is intentionally
+// outside rt.mu; the locked half only retains and validates the exact pointer.
+func (a *Agent) resolveUnambiguousLiveSession(id string) (resolvedSession, error) {
+	id = strings.TrimSpace(id)
+	proj, err := a.projectForExistingSession(id)
+	if err != nil {
+		return resolvedSession{}, err
+	}
+	resolved := resolvedSession{
+		id:      id,
+		project: proj,
+		root:    a.projects.SessionsRoot(proj.ID),
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	unit, liveErr := a.liveSessionLocked(id)
+	if liveErr == nil {
+		if unit.store == nil || !unit.store.Active() || unit.store.SessionID() != id || unit.projectID != proj.ID || unit.projectRoot != proj.Path {
+			rt.mu.Unlock()
+			return resolvedSession{}, fmt.Errorf("live session %q no longer matches its resolved project", id)
+		}
+		resolved.unit = unit
+	}
+	rt.mu.Unlock()
+	return resolved, nil
+}
+
+// revalidateResolvedSessionLocked requires the map to retain the exact live
+// pointer selected by resolveUnambiguousLiveSession. A nil pointer means the
+// persisted-only branch must still have no live replacement.
+func (a *Agent) revalidateResolvedSessionLocked(resolved resolvedSession) error {
+	current := a.liveUnitLocked(resolved.id)
+	if current != resolved.unit {
+		return fmt.Errorf("session %q changed while it was being resolved", resolved.id)
+	}
+	if resolved.unit == nil {
+		return nil
+	}
+	if resolved.project == nil || resolved.unit.store == nil || !resolved.unit.store.Active() || resolved.unit.store.SessionID() != resolved.id || resolved.unit.projectID != resolved.project.ID || resolved.unit.projectRoot != resolved.project.Path {
+		return fmt.Errorf("live session %q no longer matches its resolved project", resolved.id)
+	}
+	return nil
+}
+
+// rejectAmbiguousExplicitSession performs the global lookup for permission
+// routes while retaining their existing gate errors for unknown or empty ids.
+func (a *Agent) rejectAmbiguousExplicitSession(id string) error {
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	if _, err := a.resolveUnambiguousLiveSession(id); err != nil && strings.Contains(err.Error(), "ambiguous") {
+		return err
+	}
+	return nil
 }
 
 // resolveRootDriveSession resolves a live session for a root-only drive
@@ -1095,8 +1172,7 @@ func New(c Config) (*Agent, error) {
 		rt.mu.Lock()
 		var unit *session
 		if event.SessionID != "" {
-			a.ensureSessionMapLocked()
-			unit = a.sessions[event.SessionID]
+			unit = a.liveUnitLocked(event.SessionID)
 			if unit == nil && sessionIDOf(a.session) == event.SessionID {
 				unit = a.session
 			}
@@ -1659,7 +1735,7 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 	rt.mu.Lock()
 	var unit *session
 	if tev.ParentSessionID != "" {
-		unit = a.sessions[tev.ParentSessionID]
+		unit = a.liveUnitLocked(tev.ParentSessionID)
 	}
 	isNew := false
 	if unit != nil {
@@ -1682,7 +1758,7 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 		// continue dispatching the child event itself below.
 		if rt.foldSubagentStartIntoParent(tev) {
 			rt.mu.Lock()
-			if u := a.sessions[tev.ParentSessionID]; u != nil {
+			if u := a.liveUnitLocked(tev.ParentSessionID); u != nil {
 				if u.seenSessions == nil {
 					u.seenSessions = make(map[string]bool)
 				}
@@ -2353,7 +2429,7 @@ func (a *Agent) CompactNowForSession(ctx context.Context, sessionID string) erro
 	}
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
-	unit, err := a.liveSessionLocked(sessionID)
+	unit, err := a.liveSessionLockedForOperation(sessionID)
 	if err != nil {
 		rt.mu.Unlock()
 		return err
@@ -2838,7 +2914,7 @@ func (a *Agent) SubmitToSession(ctx context.Context, sessionID string, content s
 func (a *Agent) SubmitToSessionWithBoundary(ctx context.Context, sessionID string, content string, admitted func()) (SubmitResult, error) {
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
-	unit, err := a.liveSessionLocked(sessionID)
+	unit, err := a.liveSessionLockedForOperation(sessionID)
 	rt.mu.Unlock()
 	if err != nil {
 		return SubmitResult{}, err
@@ -2920,7 +2996,7 @@ func (a *Agent) QueueSnapshotForSession(sessionID string) (QueueState, error) {
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	unit, err := a.liveSessionLocked(sessionID)
+	unit, err := a.liveSessionLockedForOperation(sessionID)
 	if err != nil {
 		return QueueState{}, err
 	}
@@ -2953,7 +3029,7 @@ func (a *Agent) AppendUserMessageToSession(sessionID string, content string) (in
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	unit, err := a.liveSessionLocked(sessionID)
+	unit, err := a.liveSessionLockedForOperation(sessionID)
 	if err != nil {
 		return 0, err
 	}
@@ -3486,7 +3562,7 @@ func (rt *runtime) startClaimedTurnLocked(unit *session, turnCtx context.Context
 	// owns. The id is empty only for a store that is not live, which the
 	// active check above already refused.
 	if id := sessionIDOf(unit); id != "" {
-		if live := a.sessions[id]; live != unit {
+		if live := a.liveUnitLocked(id); live != unit {
 			return refuse(fmt.Errorf("session %q is no longer live", id))
 		}
 	}
@@ -3628,7 +3704,7 @@ func (a *Agent) turnErrorMessage(err error) string {
 func (a *Agent) CancelSession(sessionID string) error {
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
-	unit, err := a.liveSessionLocked(sessionID)
+	unit, err := a.liveSessionLockedForOperation(sessionID)
 	if err == nil {
 		cancel := rt.turnCancelSnapshotLocked(unit)
 		rt.mu.Unlock()
@@ -3679,7 +3755,7 @@ func (a *Agent) BusyForSession(sessionID string) (bool, error) {
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	unit, err := a.liveSessionLocked(sessionID)
+	unit, err := a.liveSessionLockedForOperation(sessionID)
 	if err != nil {
 		return false, err
 	}
@@ -3720,6 +3796,9 @@ func (a *Agent) RespondPermissionAction(id string, action string) error {
 }
 
 func (a *Agent) RespondPermissionForSession(sessionID string, id string, allow bool) error {
+	if err := a.rejectAmbiguousExplicitSession(sessionID); err != nil {
+		return err
+	}
 	if a.gate == nil {
 		return permission.ErrUnknownRequest
 	}
@@ -3727,6 +3806,9 @@ func (a *Agent) RespondPermissionForSession(sessionID string, id string, allow b
 }
 
 func (a *Agent) RespondPermissionActionForSession(sessionID string, id string, action string) error {
+	if err := a.rejectAmbiguousExplicitSession(sessionID); err != nil {
+		return err
+	}
 	if a.gate == nil {
 		return permission.ErrUnknownRequest
 	}
@@ -3782,6 +3864,9 @@ func (a *Agent) SaveProjectPermission(id string, patterns []string) error {
 // yields a retryable error with the request left pending — the save never
 // blocks a shutting-down owner on the leaf.
 func (a *Agent) SaveProjectPermissionForSession(sessionID string, id string, patterns []string) error {
+	if err := a.rejectAmbiguousExplicitSession(sessionID); err != nil {
+		return err
+	}
 	if a.gate == nil {
 		return permission.ErrUnknownRequest
 	}
@@ -4179,7 +4264,7 @@ func (a *Agent) CurrentModelForSession(sessionID string) (ModelInfo, error) {
 	if rt.closed {
 		return ModelInfo{}, errOwnerClosed
 	}
-	unit, err := a.liveSessionLocked(sessionID)
+	unit, err := a.liveSessionLockedForOperation(sessionID)
 	if err != nil {
 		return ModelInfo{}, err
 	}
@@ -4668,19 +4753,25 @@ func (a *Agent) SessionSummaryForSession(sessionID string) (SessionSummary, erro
 // metadata's unvalidated project path.
 func (a *Agent) SessionSummaryForSessionOrPersisted(sessionID string) (SessionSummary, error) {
 	sessionID = strings.TrimSpace(sessionID)
-	unit, err := a.resolveLiveSession(sessionID)
-	if err == nil {
-		return sessionSummary(unit), nil
-	}
-	proj, err := a.projectForExistingSession(sessionID)
+	resolved, err := a.resolveUnambiguousLiveSession(sessionID)
 	if err != nil {
 		return SessionSummary{}, err
 	}
-	meta, err := snapshot.LoadSessionMeta(a.projects.SessionsRoot(proj.ID), sessionID)
+	if resolved.unit != nil {
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		err := a.revalidateResolvedSessionLocked(resolved)
+		rt.mu.Unlock()
+		if err != nil {
+			return SessionSummary{}, err
+		}
+		return sessionSummary(resolved.unit), nil
+	}
+	meta, err := snapshot.LoadSessionMeta(resolved.root, sessionID)
 	if err != nil {
 		return SessionSummary{}, err
 	}
-	return persistedSessionSummary(sessionID, meta, proj), nil
+	return persistedSessionSummary(sessionID, meta, resolved.project), nil
 }
 
 func (a *Agent) SessionPayloadForSession(sessionID string) (SessionPayload, error) {
@@ -4848,13 +4939,24 @@ func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummar
 		rt.mu.Unlock()
 		return SessionSummary{}, errOwnerClosed
 	}
-	if unit, err := a.liveSessionLocked(id); err == nil {
+	rt.mu.Unlock()
+
+	resolved, err := a.resolveUnambiguousLiveSession(id)
+	if err != nil {
+		return SessionSummary{}, err
+	}
+	if resolved.unit != nil {
+		rt.mu.Lock()
+		err := a.revalidateResolvedSessionLocked(resolved)
+		rt.mu.Unlock()
+		if err != nil {
+			return SessionSummary{}, err
+		}
+		unit := resolved.unit
 		if isCompactSessionType(unit.activeAgentType) {
-			rt.mu.Unlock()
 			return SessionSummary{}, internalTranscriptSessionError(id)
 		}
 		summary := sessionSummary(unit)
-		rt.mu.Unlock()
 		// Live selection performs no durable mutation: capture with the three-attempt
 		// revision revalidation before returning, so a concurrent commit forces a retry
 		// rather than a stale prefix and the boundary is atomic with the live state.
@@ -4867,39 +4969,21 @@ func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummar
 		}
 		return summary, nil
 	}
-	rt.mu.Unlock()
-
-	proj, err := a.projectForExistingSession(id)
-	if err != nil {
-		return SessionSummary{}, err
-	}
-	if err := a.rejectInternalSession(a.projects.SessionsRoot(proj.ID), id); err != nil {
+	proj := resolved.project
+	if err := a.rejectInternalSession(resolved.root, id); err != nil {
 		return SessionSummary{}, err
 	}
 
-	store, err := snapshot.NewForSessionsRoot(a.projects.SessionsRoot(proj.ID), a.projects.Root(), proj.ID)
+	store, err := snapshot.NewForSessionsRoot(resolved.root, a.projects.Root(), proj.ID)
 	if err != nil {
 		return SessionSummary{}, err
 	}
+	var unit *session
 
 	rt.mu.Lock()
-	unit, err := a.liveSessionLocked(id)
-	if err == nil {
+	if err := a.revalidateResolvedSessionLocked(resolved); err != nil {
 		rt.mu.Unlock()
-		// Live-open race: the session became live between the two lookups.
-		// Publish the same bounded three-attempt capture the main live path
-		// uses, outside rt.mu — the capture takes rt.mu itself — so a
-		// concurrent commit forces a retry rather than a stale prefix. A
-		// capture failure publishes no boundary and is not propagated: the
-		// open result stands, matching the old in-commit boundary's
-		// disposition.
-		if emit != nil {
-			summary := sessionSummary(unit)
-			_, _ = a.captureStateForSelection(unit, func(cs completeState) {
-				emit(hydrationStateFrom(summary, cs))
-			})
-		}
-		return sessionSummary(unit), nil
+		return SessionSummary{}, err
 	}
 	// The persisted path's second short hold: the required locked reload/config
 	// work and the root-unit snapshot run under rt.mu; every durable read and
@@ -4973,6 +5057,13 @@ func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummar
 		}
 	}
 	if reactivate {
+		rt.mu.Lock()
+		if err := a.revalidateResolvedSessionLocked(resolved); err != nil {
+			rt.mu.Unlock()
+			unit.store.Detach()
+			return SessionSummary{}, err
+		}
+		rt.mu.Unlock()
 		if err := unit.store.SetState(snapshot.StateActive); err != nil {
 			// Reactivation must reach disk; otherwise the owner would drive a
 			// session that stays archived and absent from active listings.
@@ -5002,6 +5093,11 @@ func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummar
 	// Final hold: the live registration and the in-commit boundary
 	// publication. No store, history, or prompt read runs under it.
 	rt.mu.Lock()
+	if err := a.revalidateResolvedSessionLocked(resolved); err != nil {
+		rt.mu.Unlock()
+		unit.store.Detach()
+		return SessionSummary{}, err
+	}
 	if err := a.registerLiveSessionLocked(unit); err != nil {
 		rt.unregisterTranscript(id)
 		rt.mu.Unlock()
@@ -5417,27 +5513,35 @@ func (a *Agent) removeSession(id string, durable func(sessionsRoot string, id st
 		return errOwnerClosed
 	}
 	id = strings.TrimSpace(id)
-	sessionsRoot, err := a.sessionsRootForUserManagedSession(id)
+	resolved, err := a.resolveUserManagedSession(id)
 	if err != nil {
 		return err
 	}
+	sessionsRoot := resolved.root
+	unit := resolved.unit
+	rt.mu.Lock()
+	if err := a.revalidateResolvedSessionLocked(resolved); err != nil {
+		rt.mu.Unlock()
+		return err
+	}
+	rt.mu.Unlock()
 
 	// Reserve before the durable mutation. The current session quiesces its
 	// running turn while staying attached, so its claim is held across the
 	// commit; a live non-current unit gets the same transitioning reservation
 	// while its claim stays held. Neither releases the claim nor touches the
 	// queue here, so a failed commit leaves everything intact.
-	isCurrent := a.store.Active() && a.store.SessionID() == id
+	isCurrent := unit != nil && unit == a.session
 	var releaseReservation func()
 	if isCurrent {
 		a.ensureRuntime().beginTransition()
 		if err := a.cancelAndWaitIdle(); err != nil {
-			a.endLiveTransition(a.session)
+			a.endLiveTransition(unit)
 			return err
 		}
-		releaseReservation = func() { a.endLiveTransition(a.session) }
+		releaseReservation = func() { a.endLiveTransition(unit) }
 	} else {
-		releaseReservation, err = a.beginLiveSessionClose(id)
+		releaseReservation, err = a.beginLiveSessionCloseForUnit(unit, id)
 		if err != nil {
 			return err
 		}
@@ -5474,16 +5578,28 @@ func (a *Agent) removeSession(id string, durable func(sessionsRoot string, id st
 		// selection and the queue.
 		rt := a.ensureRuntime()
 		rt.mu.Lock()
-		a.store.Detach()
-		if a.currentSessionID == id {
-			a.currentSessionID = ""
+		if err := a.revalidateResolvedSessionLocked(resolved); err != nil {
+			rt.mu.Unlock()
+			if releaseReservation != nil {
+				releaseReservation()
+				releaseReservation = nil
+			}
+			if durableErr == nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "lightcode: remove committed session %s: %v\n", id, err)
+		} else {
+			unit.store.Detach()
+			if a.currentSessionID == id {
+				a.currentSessionID = ""
+			}
+			delete(a.sessions, id)
+			rt.unregisterTranscript(id)
+			rt.clearQueueLocked()
 		}
-		delete(a.sessions, id)
-		rt.unregisterTranscript(id)
-		rt.clearQueueLocked()
 		rt.mu.Unlock()
 		a.resetCurrentSessionState()
-	} else if _, err := a.closeLiveSession(id); err != nil {
+	} else if _, err := a.closeLiveSessionForUnit(unit, id); err != nil {
 		if durableErr == nil {
 			return err
 		}
@@ -5509,20 +5625,23 @@ func (a *Agent) SessionMessagesFor(id string) ([]DisplayMessage, error) {
 		msgs, _ := a.messagesForFrontendForSession("")
 		return msgs, nil
 	}
-	a.ensureRuntime().mu.Lock()
-	unit, err := a.liveSessionLocked(id)
-	a.ensureRuntime().mu.Unlock()
-	if err == nil {
-		return a.messagesForFrontendForStore(unit.store, id)
+	resolved, err := a.resolveUnambiguousLiveSession(id)
+	if err != nil {
+		return nil, err
 	}
-	// Not live: resolve the session's owning project and read it read-only,
-	// without a mutating load or a claim, rather than falling back to the
-	// current session (which would return a different session's messages).
-	root, rerr := a.sessionsRootForSession(id)
-	if rerr != nil {
-		return nil, rerr
+	if resolved.unit != nil {
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		err := a.revalidateResolvedSessionLocked(resolved)
+		rt.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return a.messagesForFrontendForStore(resolved.unit.store, id)
 	}
-	store, serr := snapshot.NewForSessionsRoot(root, "", "")
+	// Not live: read the uniquely resolved owning project read-only, without a
+	// mutating load or a claim, rather than falling back to the current session.
+	store, serr := snapshot.NewForSessionsRoot(resolved.root, "", "")
 	if serr != nil {
 		return nil, serr
 	}
@@ -5545,61 +5664,44 @@ func (a *Agent) sessionsRootForSession(id string) (string, error) {
 	if id == "" {
 		return a.currentSessionsRoot()
 	}
-	if err := snapshot.ValidateSessionID(id); err != nil {
-		return "", err
-	}
-	if a.projects != nil {
-		if root, ok := a.liveSessionsRoot(id); ok {
-			return root, nil
-		}
-		projects, err := project.List(a.projects.Root())
-		if err != nil {
-			return "", err
-		}
-		var found string
-		for _, proj := range projects {
-			root := a.projects.SessionsRoot(proj.ID)
-			_, err := os.Stat(filepath.Join(root, id, "meta.json"))
-			if err == nil {
-				if found != "" {
-					return "", fmt.Errorf("session %q is ambiguous: it exists in more than one project", id)
-				}
-				found = root
-			}
-			if err != nil && !os.IsNotExist(err) {
-				return "", err
-			}
-		}
-		if found != "" {
-			return found, nil
-		}
-	}
-	return a.currentSessionsRoot()
-}
-
-func (a *Agent) sessionsRootForUserManagedSession(id string) (string, error) {
-	root, err := a.sessionsRootForSession(id)
+	resolved, err := a.resolveUnambiguousLiveSession(id)
 	if err != nil {
 		return "", err
 	}
-	// For live sessions, check the in-memory unit directly — child sessions
-	// are never registered live, and compact is identifiable by agent type.
-	// This avoids a disk read that may fail if the session directory was
-	// created by a different store instance.
-	rt := a.ensureRuntime()
-	rt.mu.Lock()
-	unit := a.sessions[id]
-	rt.mu.Unlock()
-	if unit != nil {
-		if isCompactSessionType(unit.activeAgentType) {
-			return "", internalTranscriptSessionError(id)
-		}
-		return root, nil
+	return resolved.root, nil
+}
+
+func (a *Agent) resolveUserManagedSession(id string) (resolvedSession, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return resolvedSession{}, fmt.Errorf("session id is required")
 	}
-	if err := a.rejectInternalSession(root, id); err != nil {
+	resolved, err := a.resolveUnambiguousLiveSession(id)
+	if err != nil {
+		return resolvedSession{}, err
+	}
+	if resolved.unit != nil {
+		if isCompactSessionType(resolved.unit.activeAgentType) {
+			return resolvedSession{}, internalTranscriptSessionError(id)
+		}
+		return resolved, nil
+	}
+	if err := a.rejectInternalSession(resolved.root, id); err != nil {
+		return resolvedSession{}, err
+	}
+	return resolved, nil
+}
+
+func (a *Agent) sessionsRootForUserManagedSession(id string) (string, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return a.currentSessionsRoot()
+	}
+	resolved, err := a.resolveUserManagedSession(id)
+	if err != nil {
 		return "", err
 	}
-	return root, nil
+	return resolved.root, nil
 }
 
 func (a *Agent) rejectInternalSession(root, id string) error {
@@ -5626,7 +5728,7 @@ func (a *Agent) liveSessionsRoot(id string) (string, bool) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	a.ensureSessionMapLocked()
-	unit := a.sessions[id]
+	unit := a.liveUnitLocked(id)
 	if unit == nil || unit.projectID == "" || a.projects == nil {
 		return "", false
 	}
@@ -5653,11 +5755,25 @@ func (a *Agent) beginLiveSessionClose(id string) (func(), error) {
 	}
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
-	a.ensureSessionMapLocked()
-	unit := a.sessions[id]
+	unit := a.liveUnitLocked(id)
+	rt.mu.Unlock()
+	return a.beginLiveSessionCloseForUnit(unit, id)
+}
+
+func (a *Agent) beginLiveSessionCloseForUnit(unit *session, id string) (func(), error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, nil
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
 	if unit == nil || unit == a.session {
 		rt.mu.Unlock()
 		return nil, nil
+	}
+	if a.liveUnitLocked(id) != unit {
+		rt.mu.Unlock()
+		return nil, fmt.Errorf("session %q is no longer live", id)
 	}
 	if unit.store == nil || !unit.store.Active() || unit.store.SessionID() != id {
 		rt.mu.Unlock()
@@ -5688,7 +5804,7 @@ func (a *Agent) ReserveSelectionSource(sessionID string) (func(), error) {
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	unit, err := a.liveSessionLocked(sessionID)
+	unit, err := a.liveSessionLockedForOperation(sessionID)
 	if err != nil {
 		// No current source, or a session that is not live in this owner
 		// (read-only: another process drives it): nothing to reserve.
@@ -5708,9 +5824,22 @@ func (a *Agent) closeLiveSession(id string) (bool, error) {
 	}
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
+	unit := a.liveUnitLocked(id)
+	rt.mu.Unlock()
+	return a.closeLiveSessionForUnit(unit, id)
+}
+
+func (a *Agent) closeLiveSessionForUnit(unit *session, id string) (bool, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, nil
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	a.ensureSessionMapLocked()
-	unit := a.sessions[id]
+	if a.liveUnitLocked(id) != unit {
+		return false, fmt.Errorf("session %q is no longer live", id)
+	}
 	if unit == nil {
 		return false, nil
 	}

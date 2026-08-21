@@ -776,14 +776,13 @@ func (r *Runner) handleSessionPrompt(ctx context.Context, req Request) {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	// The precheck resolves the explicit target's summary before admission;
-	// its project path is kept and committed alongside the id inside the
-	// admitted callback, never here, which runs before admission and must not
-	// move routing. The resolution stays live-only: for an explicit id naming
-	// the read-only session it refuses, and the refusal names the contention.
+	// The precheck resolves the explicit target's unambiguous summary before
+	// admission; its project path is kept and committed alongside the id inside
+	// the admitted callback, never here, which runs before admission and must not
+	// move routing. The shared submit root remains live-only.
 	var summary agent.SessionSummary
 	if strings.TrimSpace(params.SessionID) != "" {
-		summary, err = r.agent.SessionSummaryForSession(sessionID)
+		summary, err = r.agent.SessionSummaryForSessionOrPersisted(sessionID)
 		if err != nil {
 			r.respondError(req.ID, -32000, r.contentionIfReadOnly(sessionID, err).Error())
 			return

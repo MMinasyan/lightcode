@@ -70,38 +70,38 @@ func (a *Agent) HydrateSession(sessionID string) (HydrationState, error) {
 	// archive/delete cannot detach the session between resolving it, reading its
 	// summary, and capturing its state, which would yield a hybrid snapshot.
 	defer a.lockLifecycle()()
-	rt := a.ensureRuntime()
-	rt.mu.Lock()
-	unit, err := a.liveSessionLocked(sessionID)
-	rt.mu.Unlock()
+	resolved, err := a.resolveUnambiguousLiveSession(sessionID)
 	if err != nil {
-		// A non-live id that resolves to a persisted root session opens
-		// read-only: another process may be driving it, so nothing live exists
-		// to capture. A metadata read that fails is an error — a corrupt
-		// record cannot present as a successful open. Children and compact
-		// transcripts fall through to the child path, and an unknown id
-		// errors there.
-		proj, perr := a.projectForExistingSession(sessionID)
-		if perr == nil {
-			meta, merr := snapshot.LoadSessionMeta(a.projects.SessionsRoot(proj.ID), sessionID)
-			if merr != nil {
-				return HydrationState{}, merr
-			}
-			if meta.ParentSessionID == "" && !isCompactSessionType(meta.ActiveAgentType) {
-				return a.hydrateReadOnlyRoot(proj, sessionID, meta)
-			}
+		return HydrationState{}, err
+	}
+	if resolved.unit != nil {
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		err := a.revalidateResolvedSessionLocked(resolved)
+		rt.mu.Unlock()
+		if err != nil {
+			return HydrationState{}, err
 		}
-		return a.hydrateChildSession(sessionID)
+		summary := sessionSummary(resolved.unit)
+		cs, err := a.captureStateForSelection(resolved.unit, nil)
+		if err != nil {
+			return HydrationState{}, err
+		}
+		return hydrationStateFrom(summary, cs), nil
 	}
-	summary, err := a.SessionSummaryForSession(sessionID)
+	// A non-live id that resolves to a persisted root session opens read-only:
+	// another process may be driving it, so nothing live exists to capture. A
+	// metadata read that fails is an error — a corrupt record cannot present as a
+	// successful open. Children and compact transcripts use the same resolved
+	// sessions root.
+	meta, err := snapshot.LoadSessionMeta(resolved.root, sessionID)
 	if err != nil {
 		return HydrationState{}, err
 	}
-	cs, err := a.captureStateForSelection(unit, nil)
-	if err != nil {
-		return HydrationState{}, err
+	if meta.ParentSessionID == "" && !isCompactSessionType(meta.ActiveAgentType) {
+		return a.hydrateReadOnlyRoot(resolved.project, sessionID, meta)
 	}
-	return hydrationStateFrom(summary, cs), nil
+	return a.hydrateChildSession(sessionID, resolved.root)
 }
 
 // hydrateReadOnlyRoot builds a persisted root session's read-only hydration:
@@ -136,17 +136,13 @@ func (a *Agent) hydrateReadOnlyRoot(proj *project.Project, sessionID string, met
 // is the liveness signal: a lookup miss is the common case (the viewer opens a
 // completed subtask's transcript far more often than a live one) and is not an
 // error.
-func (a *Agent) hydrateChildSession(sessionID string) (HydrationState, error) {
+func (a *Agent) hydrateChildSession(sessionID, root string) (HydrationState, error) {
 	rt := a.ensureRuntime()
 	rt.transcriptMu.Lock()
 	e := rt.transcriptState[sessionID]
 	rt.transcriptMu.Unlock()
 	if e != nil {
 		return a.captureLiveChildSession(sessionID, e)
-	}
-	root, err := a.sessionsRootForSession(sessionID)
-	if err != nil {
-		return HydrationState{}, err
 	}
 	store, err := snapshot.NewForSessionsRoot(root, "", "")
 	if err != nil {

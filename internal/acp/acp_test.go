@@ -26,6 +26,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	lcconfig "github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
@@ -2840,6 +2841,189 @@ func TestACPPromptSelectsSession(t *testing.T) {
 	if got := r.currentSessionSummary().ID; got != secondID {
 		t.Fatalf("current session = %q, want %q", got, secondID)
 	}
+}
+
+type acpPromptAmbiguityFixture struct {
+	agent      *agent.Agent
+	currentID  string
+	targetID   string
+	first      *project.Project
+	second     *project.Project
+	secondMeta []byte
+}
+
+func newACPPromptAmbiguityFixture(t *testing.T) acpPromptAmbiguityFixture {
+	t.Helper()
+	a := newACPTestAgent(t)
+	first, err := a.Projects().Ensure()
+	if err != nil {
+		t.Fatalf("ensure first project: %v", err)
+	}
+	second, err := project.EnsureForPath(a.Projects().Root(), t.TempDir())
+	if err != nil {
+		t.Fatalf("ensure second project: %v", err)
+	}
+	currentID, err := a.NewSession(first.ID, "primary")
+	if err != nil {
+		t.Fatalf("new current session: %v", err)
+	}
+	targetID, err := a.NewSession(first.ID, "primary")
+	if err != nil {
+		t.Fatalf("new target session: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(targetID, "target marker"); err != nil {
+		t.Fatalf("append target marker: %v", err)
+	}
+	secondDir := filepath.Join(a.Projects().SessionsRoot(second.ID), targetID)
+	if err := os.MkdirAll(filepath.Join(secondDir, "snapshots"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(secondDir, "turns"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	secondMeta := []byte(`{"id":"` + targetID + `","state":"active","project_path":"` + second.Path + `","last_activity":222}` + "\n")
+	if err := os.WriteFile(filepath.Join(secondDir, "meta.json"), secondMeta, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return acpPromptAmbiguityFixture{
+		agent:      a,
+		currentID:  currentID,
+		targetID:   targetID,
+		first:      first,
+		second:     second,
+		secondMeta: secondMeta,
+	}
+}
+
+func TestACPExplicitPromptRejectsLivePersistedAmbiguityBeforeAdmission(t *testing.T) {
+	f := newACPPromptAmbiguityFixture(t)
+	beforeQueue, err := f.agent.QueueSnapshotForSession(f.targetID)
+	if err != nil {
+		t.Fatalf("target queue before prompt: %v", err)
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: f.agent, owner: f.agent, out: &out}
+	f.agent.SetEventHandler(r.handleEvent)
+	r.setCurrentSessionID(f.currentID)
+	r.seedPresented(f.currentID)
+	r.handleSessionPrompt(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"session_id":"` + f.targetID + `","content":"must not submit"}`),
+	})
+	lines := drainedLines(t, r, &out, 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("prompt response json: %v", err)
+	}
+	if resp.Error == nil || !strings.Contains(resp.Error.Message, "ambiguous") {
+		t.Fatalf("prompt response = %+v, want ambiguity error", resp)
+	}
+	if resp.Result != nil {
+		t.Fatalf("ambiguous prompt returned success result: %#v", resp.Result)
+	}
+	if got := r.currentSessionSummary().ID; got != f.currentID {
+		t.Fatalf("routing current = %q, want unchanged %q", got, f.currentID)
+	}
+	r.mu.Lock()
+	presented := r.presented
+	r.mu.Unlock()
+	if presented != f.currentID {
+		t.Fatalf("presentation current = %q, want unchanged %q", presented, f.currentID)
+	}
+	afterQueue, err := f.agent.QueueSnapshotForSession(f.targetID)
+	if err != nil {
+		t.Fatalf("target queue after prompt: %v", err)
+	}
+	if !reflect.DeepEqual(afterQueue, beforeQueue) {
+		t.Fatalf("target queue changed across rejected prompt: before=%+v after=%+v", beforeQueue, afterQueue)
+	}
+	if got := f.agent.SessionCurrent().ID; got != f.targetID {
+		t.Fatalf("backend current = %q, want unchanged target %q", got, f.targetID)
+	}
+	if !strings.Contains(out.String(), "ambiguous") {
+		t.Fatalf("prompt output = %q, want ambiguity response only", out.String())
+	}
+	if got, err := os.ReadFile(filepath.Join(f.agent.Projects().SessionsRoot(f.second.ID), f.targetID, "meta.json")); err != nil {
+		t.Fatalf("read duplicate metadata: %v", err)
+	} else if string(got) != string(f.secondMeta) {
+		t.Fatalf("duplicate metadata changed: got %q want %q", got, f.secondMeta)
+	}
+}
+
+func TestACPExplicitPromptUniqueLiveAndPersistedControls(t *testing.T) {
+	t.Run("unique_live_still_admits", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		currentID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("new current session: %v", err)
+		}
+		targetID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("new target session: %v", err)
+		}
+		var out bytes.Buffer
+		r := &Runner{agent: a, owner: a, out: &out}
+		r.setCurrentSessionID(currentID)
+		r.handleSessionPrompt(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + targetID + `","content":"unique live"}`),
+		})
+		lines := drainedLines(t, r, &out, 1)
+		assertACPSuccessResponse(t, lines[0])
+		if got := r.currentSessionSummary().ID; got != targetID {
+			t.Fatalf("routing current = %q, want %q", got, targetID)
+		}
+	})
+
+	t.Run("unique_persisted_only_still_reaches_submit_disposition", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		proj, err := a.Projects().Ensure()
+		if err != nil {
+			t.Fatalf("ensure project: %v", err)
+		}
+		currentID, err := a.NewSession(proj.ID, "primary")
+		if err != nil {
+			t.Fatalf("new current session: %v", err)
+		}
+		const persistedID = "persisted1"
+		dir := filepath.Join(a.Projects().SessionsRoot(proj.ID), persistedID)
+		if err := os.MkdirAll(filepath.Join(dir, "snapshots"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(dir, "turns"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		meta := []byte(`{"id":"` + persistedID + `","state":"active","project_path":"` + proj.Path + `"}` + "\n")
+		if err := os.WriteFile(filepath.Join(dir, "meta.json"), meta, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if summary, err := a.SessionSummaryForSessionOrPersisted(persistedID); err != nil || summary.ID != persistedID {
+			t.Fatalf("persisted-only summary = %+v, %v", summary, err)
+		}
+
+		var out bytes.Buffer
+		r := &Runner{agent: a, owner: a, out: &out}
+		r.setCurrentSessionID(currentID)
+		r.handleSessionPrompt(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + persistedID + `","content":"must remain owner-unknown"}`),
+		})
+		lines := drainedLines(t, r, &out, 1)
+		var resp Response
+		if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+			t.Fatalf("prompt response json: %v", err)
+		}
+		if resp.Error == nil || !strings.Contains(resp.Error.Message, "unknown session") {
+			t.Fatalf("persisted-only prompt response = %+v, want unknown-session error", resp.Error)
+		}
+		if got := r.currentSessionSummary().ID; got != currentID {
+			t.Fatalf("routing current = %q, want unchanged %q", got, currentID)
+		}
+	})
 }
 
 // TestACPPromptSwitchAdvancesPresentation proves prompting an explicit different
