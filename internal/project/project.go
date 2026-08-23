@@ -73,6 +73,12 @@ func (r *Resolver) Ensure() (*Project, error) {
 	return EnsureForPath(r.root, r.projectRoot)
 }
 
+// TryEnsure attempts to resolve or create the resolver's current project
+// without waiting for another process's identity lock.
+func (r *Resolver) TryEnsure() (*Project, bool, error) {
+	return TryEnsureForPath(r.root, r.projectRoot)
+}
+
 // SessionsRoot returns the sessions dir for the given project id
 // (caller already holds a project record).
 func (r *Resolver) SessionsRoot(projectID string) string {
@@ -156,57 +162,78 @@ func EnsureForPath(root, absPath string) (*Project, error) {
 		return nil, err
 	}
 	id := projectID(clean)
-	dir := filepath.Join(root, id)
-	metaPath := filepath.Join(dir, "meta.json")
-
 	var result Project
 	err = atomicfs.WithLock(identityLockPath(root, clean), func() error {
-		existing, err := readProject(root, id)
-		if err == nil {
-			// The normalized path is the expected value here, so a record
-			// that belongs to another path is rejected with an error rather
-			// than minting a second project over the corrupt record.
-			if existing.Path != clean {
-				return fmt.Errorf("project: %s: stored path %q does not match %q", id, existing.Path, clean)
-			}
-			result = *existing
-			if err := atomicfs.SyncDir(dir); err != nil {
-				return fmt.Errorf("project: sync %s: %w", dir, err)
-			}
-			if err := atomicfs.SyncDir(root); err != nil {
-				return fmt.Errorf("project: sync %s: %w", root, err)
-			}
-			return nil
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
+		return ensureForPathBody(root, clean, id, &result)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// TryEnsureForPath is the one-attempt counterpart of EnsureForPath. A
+// contended identity lock returns without invoking the publication body.
+func TryEnsureForPath(root, absPath string) (*Project, bool, error) {
+	clean, err := normalizePath(absPath)
+	if err != nil {
+		return nil, false, err
+	}
+	id := projectID(clean)
+	var result Project
+	ok, err := atomicfs.TryWithLock(identityLockPath(root, clean), func() error {
+		return ensureForPathBody(root, clean, id, &result)
+	})
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	return &result, true, nil
+}
+
+func ensureForPathBody(root, clean, id string, result *Project) error {
+	dir := filepath.Join(root, id)
+	metaPath := filepath.Join(dir, "meta.json")
+	existing, err := readProject(root, id)
+	if err == nil {
+		// The normalized path is the expected value here, so a record
+		// that belongs to another path is rejected with an error rather
+		// than minting a second project over the corrupt record.
+		if existing.Path != clean {
+			return fmt.Errorf("project: %s: stored path %q does not match %q", id, existing.Path, clean)
 		}
-		if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o700); err != nil {
-			return fmt.Errorf("project: create %s: %w", dir, err)
-		}
-		now := time.Now()
-		p := Project{
-			ID:           id,
-			Name:         filepath.Base(clean),
-			Path:         clean,
-			CreatedAt:    now.UTC().Format(time.RFC3339),
-			LastActivity: now.Unix(),
-		}
-		if err := writeJSON(metaPath, p); err != nil {
-			return err
-		}
+		*result = *existing
 		if err := atomicfs.SyncDir(dir); err != nil {
 			return fmt.Errorf("project: sync %s: %w", dir, err)
 		}
 		if err := atomicfs.SyncDir(root); err != nil {
 			return fmt.Errorf("project: sync %s: %w", root, err)
 		}
-		result = p
 		return nil
-	})
-	if err != nil {
-		return nil, err
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
-	return &result, nil
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o700); err != nil {
+		return fmt.Errorf("project: create %s: %w", dir, err)
+	}
+	now := time.Now()
+	p := Project{
+		ID:           id,
+		Name:         filepath.Base(clean),
+		Path:         clean,
+		CreatedAt:    now.UTC().Format(time.RFC3339),
+		LastActivity: now.Unix(),
+	}
+	if err := writeJSON(metaPath, p); err != nil {
+		return err
+	}
+	if err := atomicfs.SyncDir(dir); err != nil {
+		return fmt.Errorf("project: sync %s: %w", dir, err)
+	}
+	if err := atomicfs.SyncDir(root); err != nil {
+		return fmt.Errorf("project: sync %s: %w", root, err)
+	}
+	*result = p
+	return nil
 }
 
 // TouchActivity advances LastActivity on the project's meta.json to now.
@@ -219,17 +246,34 @@ func TouchActivity(root, projectID string) error {
 	}
 	metaPath := metaPathFor(root, projectID)
 	return atomicfs.WithLock(metaLockPath(root, projectID), func() error {
-		p, err := readProject(root, projectID)
-		if err != nil {
-			return err
-		}
-		now := time.Now().Unix()
-		if now <= p.LastActivity {
-			return nil
-		}
-		p.LastActivity = now
-		return writeJSON(metaPath, p)
+		return touchActivityBody(root, projectID, metaPath)
 	})
+}
+
+// TryTouchActivity updates project activity once, without waiting for a
+// foreign metadata lock. It is used by owner turn/reactivation paths where a
+// best-effort project touch must not delay shutdown.
+func TryTouchActivity(root, projectID string) (bool, error) {
+	if projectID == "" {
+		return true, nil
+	}
+	metaPath := metaPathFor(root, projectID)
+	return atomicfs.TryWithLock(metaLockPath(root, projectID), func() error {
+		return touchActivityBody(root, projectID, metaPath)
+	})
+}
+
+func touchActivityBody(root, projectID, metaPath string) error {
+	p, err := readProject(root, projectID)
+	if err != nil {
+		return err
+	}
+	now := time.Now().Unix()
+	if now <= p.LastActivity {
+		return nil
+	}
+	p.LastActivity = now
+	return writeJSON(metaPath, p)
 }
 
 // normalizePath is the canonical project-path identity: the cleaned

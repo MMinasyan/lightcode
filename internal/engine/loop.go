@@ -105,7 +105,7 @@ func IsToolResultErrorMessage(msg message.Message) bool {
 type Store interface {
 	AppendMessage(turn int, msg []byte) error
 	MarkTurnComplete(turn int) error
-	TouchActivity() error
+	TouchSessionActivity() error
 	CurrentTurn() int
 }
 
@@ -730,7 +730,7 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		l.persistUserMessage(turn, input)
 	}
 	if l.store != nil {
-		_ = l.store.TouchActivity()
+		_ = l.store.TouchSessionActivity()
 	}
 	defer func() {
 		if ctx.Err() != nil {

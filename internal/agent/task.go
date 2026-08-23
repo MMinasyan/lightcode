@@ -511,6 +511,9 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 	if t.rt != nil {
 		feedTranscript(t.rt.transcriptForSessionID(sessionID), Event{Kind: EventTurnStart, SessionID: sessionID, ProjectID: t.projectID, Turn: turn})
 	}
+	if t.rt != nil {
+		t.rt.touchProjectActivityBeforeRun(childStore)
+	}
 	result, err := lp.Run(ctx, td.Prompt)
 	if result == "Tool denied by user." {
 		return finish(taskResult{index: index, result: result, denied: true})

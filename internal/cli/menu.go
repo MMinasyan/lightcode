@@ -650,7 +650,11 @@ func (c *CLI) showProjectMenu() {
 		return
 	}
 
-	cur := c.scope.ProjectCurrent()
+	cur, err := c.scope.ProjectCurrent()
+	if err != nil {
+		c.printLine(renderErrorMsg(err.Error()))
+		return
+	}
 
 	var items []menuItem
 	for _, p := range projects {

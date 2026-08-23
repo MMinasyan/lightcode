@@ -246,6 +246,9 @@ func (s compactUnitSummarizer) Chat(ctx context.Context, req modelclient.ChatReq
 	if turn == 0 {
 		return modelclient.ChatResponse{}, fmt.Errorf("compact session is not active")
 	}
+	if s.unit.rt != nil {
+		s.unit.rt.touchProjectActivityBeforeRun(s.unit.store)
+	}
 	result, err := s.unit.lp.Run(ctx, userContent)
 	if err != nil {
 		return modelclient.ChatResponse{}, err
@@ -1046,6 +1049,7 @@ func (a *Agent) compactRunningUnitForSession(parent *session) (*session, int, er
 	}
 
 	unit := newRunningUnit(runningUnitConfig{
+		Runtime:           parent.rt,
 		ActiveAgentType:   "compact",
 		ProjectID:         parent.projectID,
 		ProjectName:       parent.projectName,
@@ -1075,7 +1079,7 @@ func New(c Config) (*Agent, error) {
 	modelLoader.AllowRefresh = func(_ string, prov *catalog.Provider) bool {
 		return catalog.DiscoveryTransportReady(prov, func(name string) bool { return os.Getenv(name) != "" })
 	}
-	modelCatalog, catalogWarnings, err := modelLoader.Load()
+	modelCatalog, catalogWarnings, err := modelLoader.LoadTry()
 	if err != nil {
 		return nil, fmt.Errorf("load model catalog: %w", err)
 	}
@@ -3067,6 +3071,10 @@ func (rt *runtime) appendUserMessageLocked(unit *session, content string) (int, 
 // admits new turns or mutations.
 var errOwnerClosed = errors.New("agent: owner is shutting down")
 
+// ErrProjectBusy reports that a project identity lock could not be acquired
+// without waiting.
+var ErrProjectBusy = errors.New("agent: project is busy")
+
 // claimTurnLocked checks the busy gate and claims a turn (sets busy, builds the
 // per-turn context). Caller must hold the runtime mutex. Returns a non-nil error if a turn
 // is already in progress or ensureSession fails; on error it leaves busy
@@ -3646,6 +3654,7 @@ func (rt *runtime) launchCommittedTurn(unit *session, turnCtx context.Context, c
 		if rt.ownerShuttingDown() {
 			return
 		}
+		rt.touchProjectActivityBeforeRun(unit.store)
 		_, err := unit.lp.Run(turnCtx, contents...)
 
 		// The flush and the commit funnel through the shared helper, which
@@ -3876,11 +3885,7 @@ func (a *Agent) SaveProjectPermissionForSession(sessionID string, id string, pat
 	}
 	projectID := req.ProjectID
 	if projectID == "" {
-		proj, err := a.projects.Ensure()
-		if err != nil {
-			return err
-		}
-		projectID = proj.ID
+		return fmt.Errorf("permission project id is required")
 	}
 	add := permission.Rules{Allow: patterns}
 	defer a.lockLifecycle()()
@@ -4879,7 +4884,7 @@ func (a *Agent) SessionListForProjectPath(projectPath string, state string) ([]S
 	if state != snapshot.StateActive && state != snapshot.StateArchived {
 		return nil, fmt.Errorf("invalid state %q", state)
 	}
-	proj, err := a.ensureProjectForPath(projectPath)
+	proj, err := a.resolveProjectForPath(projectPath, false)
 	if err != nil {
 		return nil, err
 	}
@@ -5078,7 +5083,7 @@ func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummar
 		if unit.store.SetLastActivity(ts) == nil {
 			prebuiltSummary.LastActivity = ts
 		}
-		_ = unit.store.TouchProjectActivity()
+		_, _ = unit.store.TryTouchProjectActivity()
 	}
 	a.resetFileTrackerForSession(unit)
 	a.loadTokensFromDiskForSession(unit)
@@ -5203,6 +5208,17 @@ func (a *Agent) NewSessionWithBoundary(projectID string, agentType string, emit 
 
 func (a *Agent) newSession(projectID string, agentType string, emit func(HydrationState, error)) (sid string, err error) {
 	defer a.lockLifecycle()()
+	proj, err := a.projectForSessionCreate(projectID)
+	if err != nil {
+		return "", err
+	}
+	return a.newSessionInProject(proj, agentType, emit)
+}
+
+// newSessionInProject creates one root session after the caller has admitted
+// and resolved its project under lifecycleMu. It never resolves the project
+// again, so publication cannot lose the owner admission boundary.
+func (a *Agent) newSessionInProject(proj *project.Project, agentType string, emit func(HydrationState, error)) (sid string, err error) {
 	rt := a.ensureRuntime()
 
 	// Initial short hold: a previously closed owner refuses before any
@@ -5212,13 +5228,6 @@ func (a *Agent) newSession(projectID string, agentType string, emit func(Hydrati
 	rt.mu.Unlock()
 	if closed {
 		return "", errOwnerClosed
-	}
-
-	// Resolve/ensure the target project under lifecycleMu with no rt.mu held,
-	// using only the stable project resolver.
-	proj, err := a.projectForSessionCreate(projectID)
-	if err != nil {
-		return "", err
 	}
 
 	// Second short hold: recheck admission, resolve the explicit root agent
@@ -5394,11 +5403,12 @@ func (a *Agent) NewSessionForProjectPathWithBoundary(projectPath string, agentTy
 }
 
 func (a *Agent) newSessionForProjectPath(projectPath string, agentType string, emit func(HydrationState, error)) (string, error) {
-	proj, err := a.ensureProjectForPath(projectPath)
+	defer a.lockLifecycle()()
+	proj, err := a.resolveProjectForPathLocked(projectPath, true)
 	if err != nil {
 		return "", err
 	}
-	return a.newSession(proj.ID, agentType, emit)
+	return a.newSessionInProject(proj, agentType, emit)
 }
 
 // projectForSessionCreate resolves the project a new session is created in,
@@ -5407,7 +5417,10 @@ func (a *Agent) newSessionForProjectPath(projectPath string, agentType string, e
 // therefore runs without rt.mu (the caller holds lifecycleMu).
 func (a *Agent) projectForSessionCreate(projectID string) (*project.Project, error) {
 	if strings.TrimSpace(projectID) == "" {
-		return a.projects.Ensure()
+		return a.resolveProjectForPathLocked(a.projectRoot, true)
+	}
+	if a.projects == nil {
+		return nil, fmt.Errorf("project resolver unavailable")
 	}
 	projects, err := project.List(a.projects.Root())
 	if err != nil {
@@ -5415,11 +5428,66 @@ func (a *Agent) projectForSessionCreate(projectID string) (*project.Project, err
 	}
 	for i := range projects {
 		if projects[i].ID == projectID {
-			p := projects[i]
-			return &p, nil
+			listed := projects[i]
+			resolved, err := project.FindByPath(a.projects.Root(), listed.Path)
+			if err != nil {
+				return nil, err
+			}
+			if resolved == nil {
+				return nil, fmt.Errorf("project: %s: stored path %q does not match its directory identity", projectID, listed.Path)
+			}
+			if resolved.ID != projectID {
+				return nil, fmt.Errorf("project: %s: resolved directory identity is %q", projectID, resolved.ID)
+			}
+			return a.resolveProjectForPathLocked(resolved.Path, true)
 		}
 	}
 	return nil, fmt.Errorf("unknown project %q", projectID)
+}
+
+// resolveProjectForPathLocked resolves a project while the caller holds
+// lifecycleMu. Reads use the existing record without the identity lock;
+// writers always take the one-attempt identity lock so existing projects get
+// their directory-sync repair before child publication.
+func (a *Agent) resolveProjectForPathLocked(projectPath string, writer bool) (*project.Project, error) {
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	closed := rt.closed
+	rt.mu.Unlock()
+	if closed {
+		return nil, errOwnerClosed
+	}
+	if strings.TrimSpace(projectPath) == "" {
+		return nil, fmt.Errorf("project path is required")
+	}
+	if a.projects == nil {
+		return nil, fmt.Errorf("project resolver unavailable")
+	}
+	abs, err := filepath.Abs(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if !writer {
+		proj, err := project.FindByPath(a.projects.Root(), abs)
+		if err != nil || proj != nil {
+			return proj, err
+		}
+	}
+	proj, acquired, err := project.TryEnsureForPath(a.projects.Root(), abs)
+	if err != nil {
+		return nil, err
+	}
+	if !acquired {
+		return nil, fmt.Errorf("%w: %s", ErrProjectBusy, abs)
+	}
+	return proj, nil
+}
+
+// resolveProjectForPath admits a project operation and then resolves it
+// without holding runtime.mu during filesystem work.
+func (a *Agent) resolveProjectForPath(projectPath string, writer bool) (*project.Project, error) {
+	defer a.lockLifecycle()()
+	return a.resolveProjectForPathLocked(projectPath, writer)
 }
 
 func (a *Agent) ensureProjectForPath(projectPath string) (*project.Project, error) {
@@ -7304,7 +7372,7 @@ func (a *Agent) ReadFileContent(path string) (string, error) {
 }
 
 func (a *Agent) ReadFileContentForProjectPath(projectPath string, path string) (string, error) {
-	proj, err := a.ensureProjectForPath(projectPath)
+	proj, err := a.resolveProjectForPath(projectPath, false)
 	if err != nil {
 		return "", err
 	}
@@ -7357,10 +7425,13 @@ func (a *Agent) Store() *snapshot.Store {
 }
 
 // ProjectCurrent returns the project record for the current cwd.
-func (a *Agent) ProjectCurrent() ProjectSummary {
-	p, err := a.projects.Current()
-	if err != nil || p == nil {
-		return ProjectSummary{Path: a.projectRoot, Name: filepath.Base(a.projectRoot)}
+func (a *Agent) ProjectCurrent() (ProjectSummary, error) {
+	p, err := a.resolveProjectForPath(a.projectRoot, false)
+	if err != nil {
+		return ProjectSummary{}, err
+	}
+	if p == nil {
+		return ProjectSummary{Path: a.projectRoot, Name: filepath.Base(a.projectRoot)}, nil
 	}
 	return ProjectSummary{
 		ID:           p.ID,
@@ -7368,11 +7439,11 @@ func (a *Agent) ProjectCurrent() ProjectSummary {
 		Path:         p.Path,
 		CreatedAt:    p.CreatedAt,
 		LastActivity: p.LastActivity,
-	}
+	}, nil
 }
 
 func (a *Agent) ProjectCurrentForPath(projectPath string) (ProjectSummary, error) {
-	proj, err := a.ensureProjectForPath(projectPath)
+	proj, err := a.resolveProjectForPath(projectPath, false)
 	if err != nil {
 		return ProjectSummary{}, err
 	}

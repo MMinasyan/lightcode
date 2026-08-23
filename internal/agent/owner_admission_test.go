@@ -545,13 +545,9 @@ func TestShutdownOwnerClosesProcessAdmissionBeforeJoins(t *testing.T) {
 	}
 }
 
-// TestNewSessionForProjectPathAfterShutdownLeavesInertProject pins the one
-// durable mutation that sits above the admission gate: ensureProjectForPath
-// runs before the checked path, so after shutdown a NewSessionForProjectPath
-// on a new path refuses but may leave the project record it created — a
-// meta.json and an empty sessions directory, no session and no claim, inert
-// on the next start.
-func TestNewSessionForProjectPathAfterShutdownLeavesInertProject(t *testing.T) {
+// TestNewSessionForProjectPathAfterShutdownPublishesNothing proves a refused
+// new-session call does not create a project or session after owner shutdown.
+func TestNewSessionForProjectPathAfterShutdownPublishesNothing(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	if !a.ShutdownOwner() {
 		t.Fatal("clean shutdown reported abandoned in-flight work")
@@ -562,20 +558,11 @@ func TestNewSessionForProjectPathAfterShutdownLeavesInertProject(t *testing.T) {
 		t.Fatalf("NewSessionForProjectPath after shutdown = %v, want errOwnerClosed", err)
 	}
 
-	// The project record the pre-gate mutation created is inert: it carries
-	// no session.
 	proj, err := project.FindByPath(a.projects.Root(), newPath)
 	if err != nil {
 		t.Fatalf("find created project: %v", err)
 	}
-	if proj == nil {
-		t.Fatal("project record not created by the refused new-session call")
-	}
-	entries, err := os.ReadDir(filepath.Join(a.projects.Root(), proj.ID, "sessions"))
-	if err != nil {
-		t.Fatalf("read sessions dir: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("sessions dir has %d entries, want none (the refused call published nothing)", len(entries))
+	if proj != nil {
+		t.Fatal("project record created by the refused new-session call")
 	}
 }

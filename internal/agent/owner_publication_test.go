@@ -937,8 +937,8 @@ func TestOwnerPublicationSinkStructure(t *testing.T) {
 	// No owner path may remain on a blocking leaf wrapper: the blocking
 	// permission save, the non-Try discovery writers, and the blocking
 	// managed-env Set/Remove appear nowhere in the three agent production files.
-	// The blocking Loader.Load appears exactly once — in the pre-owner New
-	// startup exception. Raw config writes appear exactly twice in agent.go —
+	// Catalog loading uses the one-attempt Loader.LoadTry on startup and reload.
+	// Raw config writes appear exactly twice in agent.go —
 	// the definition and writeAgentConfigLocked's own call — and nowhere else.
 	for _, file := range []struct {
 		name string
@@ -955,12 +955,8 @@ func TestOwnerPublicationSinkStructure(t *testing.T) {
 				t.Errorf("%s contains %s; no owner path may use a blocking leaf wrapper", file.name, banned)
 			}
 		}
-		wantLoad := 0
-		if file.name == "agent.go" {
-			wantLoad = 1
-		}
-		if got := strings.Count(file.src, "modelLoader.Load()"); got != wantLoad {
-			t.Errorf("%s calls the blocking modelLoader.Load() %d times, want %d (only pre-owner New may)", file.name, got, wantLoad)
+		if got := strings.Count(file.src, "modelLoader.Load()"); got != 0 {
+			t.Errorf("%s calls the blocking modelLoader.Load() %d times, want 0 on owner paths", file.name, got)
 		}
 		wantRaw := 0
 		if file.name == "agent.go" {
@@ -986,8 +982,8 @@ func TestOwnerPublicationSinkStructure(t *testing.T) {
 		t.Error("loadCatalogLocked must publish through the Try Loader.LoadTry")
 	}
 	startup, ok := extractFunctionBody(agentSrc, "func New(c Config) (*Agent, error) {")
-	if !ok || !strings.Contains(startup, "modelLoader.Load()") {
-		t.Error("New must keep the blocking Loader.Load startup exception")
+	if !ok || !strings.Contains(startup, "modelLoader.LoadTry()") {
+		t.Error("New must publish startup discovery through Loader.LoadTry")
 	}
 	setEnv, ok := extractFunctionBody(providerSrc, "func (a *Agent) setManagedKeyLocked(")
 	if !ok || !strings.Contains(setEnv, "a.env.TrySet(") {
@@ -1102,6 +1098,34 @@ func TestPermissionSaveCloseFirstRefusesWithoutWrite(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(resolver.Root(), "p-save-close", "permissions.json")); !os.IsNotExist(err) {
 		t.Fatalf("close-first permission save wrote permissions.json: %v", err)
+	}
+}
+
+func TestPermissionSaveWithoutProjectIdentityPublishesNothing(t *testing.T) {
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	resolver, err := project.NewResolver(home, projectRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idCh := make(chan string, 1)
+	gate := permission.NewGate(func(_ context.Context, req permission.Request) { idCh <- req.ID })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		_ = gate.AskRequest(ctx, permission.Request{ToolName: "write_file", Arg: "{}"})
+	}()
+	id := <-idCh
+
+	a := &Agent{projects: resolver, gate: gate}
+	err = a.SaveProjectPermissionForSession("session-a", id, []string{"write_file:*"})
+	if err == nil || !strings.Contains(err.Error(), "project id is required") {
+		t.Fatalf("unbound permission save = %v, want project identity error", err)
+	}
+	if p, findErr := project.FindByPath(resolver.Root(), projectRoot); findErr != nil {
+		t.Fatal(findErr)
+	} else if p != nil {
+		t.Fatal("unbound permission save created a project record")
 	}
 }
 

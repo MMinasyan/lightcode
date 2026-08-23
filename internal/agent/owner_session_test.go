@@ -339,6 +339,7 @@ func TestPermissionStampOwner(t *testing.T) {
 }
 
 func TestPermissionSaveProject(t *testing.T) {
+	foreignLockHolderChild()
 	home := t.TempDir()
 	firstRoot := t.TempDir()
 	secondRoot := t.TempDir()
@@ -372,6 +373,8 @@ func TestPermissionSaveProject(t *testing.T) {
 	if current := a.SessionCurrent().ID; current != firstID {
 		t.Fatalf("current session = %q, want first %q", current, firstID)
 	}
+	releaseIdentity := startForeignLockHolder(t, "TestPermissionSaveProject", projectIdentityLock(a.projects.Root(), secondProject.Path))
+	defer releaseIdentity()
 
 	a.ensureRuntime().mu.Lock()
 	second := a.sessions[secondID]

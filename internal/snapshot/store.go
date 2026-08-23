@@ -1381,10 +1381,16 @@ func (s *Store) updateMeta(mutate func(*SessionMeta)) error {
 // every user message. Also advances the owning project's meta.json when
 // the store is project-aware.
 func (s *Store) TouchActivity() error {
-	if err := s.SetLastActivity(time.Now().Unix()); err != nil {
+	if err := s.TouchSessionActivity(); err != nil {
 		return err
 	}
 	return s.TouchProjectActivity()
+}
+
+// TouchSessionActivity updates only the session's LastActivity. Owner turns
+// use this method so project publication can be admitted separately.
+func (s *Store) TouchSessionActivity() error {
+	return s.SetLastActivity(time.Now().Unix())
 }
 
 // SetLastActivity stamps only the session meta's LastActivity to ts. It does not touch
@@ -1408,6 +1414,20 @@ func (s *Store) TouchProjectActivity() error {
 		return project.TouchActivity(projectsRoot, projectID)
 	}
 	return nil
+}
+
+// TryTouchProjectActivity performs one best-effort project activity attempt.
+// Contention is reported as false and does not wait for a foreign metadata
+// lock.
+func (s *Store) TryTouchProjectActivity() (bool, error) {
+	s.mu.Lock()
+	projectsRoot := s.projectsRoot
+	projectID := s.projectID
+	s.mu.Unlock()
+	if projectsRoot == "" || projectID == "" {
+		return true, nil
+	}
+	return project.TryTouchActivity(projectsRoot, projectID)
 }
 
 // Meta reads the session's meta.json.

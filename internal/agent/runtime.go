@@ -264,6 +264,26 @@ func (rt *runtime) ownerShuttingDown() bool {
 	}
 }
 
+// touchProjectActivityBeforeRun admits the best-effort project publication
+// separately from the session turn. The lifecycle lock makes the closed check
+// and the one-attempt filesystem operation one shutdown boundary, while the
+// runtime mutex is released before any filesystem work.
+func (rt *runtime) touchProjectActivityBeforeRun(store *snapshot.Store) {
+	if rt == nil || store == nil {
+		return
+	}
+	rt.lifecycleMu.Lock()
+	rt.mu.Lock()
+	closed := rt.closed
+	rt.mu.Unlock()
+	if closed {
+		rt.lifecycleMu.Unlock()
+		return
+	}
+	_, _ = store.TryTouchProjectActivity()
+	rt.lifecycleMu.Unlock()
+}
+
 // flushAndCommitTranscript waits for the loop event drainer to dispatch every
 // queued event, then commits the session's turn. The round-trip is required,
 // not defensive: nextSeq is assigned inside dispatchLoopEvent and

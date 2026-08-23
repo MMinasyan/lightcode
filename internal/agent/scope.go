@@ -50,9 +50,8 @@ func (s *AdapterScope) ProjectRoot() string {
 }
 
 // ProjectCurrent returns the project record for the adapter-local project.
-func (s *AdapterScope) ProjectCurrent() ProjectSummary {
-	out, _ := s.svc.ProjectCurrentForPath(s.ProjectPath())
-	return out
+func (s *AdapterScope) ProjectCurrent() (ProjectSummary, error) {
+	return s.svc.ProjectCurrentForPath(s.ProjectPath())
 }
 
 // SessionList returns sessions for the adapter-local project.

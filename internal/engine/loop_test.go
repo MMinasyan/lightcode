@@ -34,7 +34,7 @@ func (s *fakeStore) AppendMessage(turn int, msg []byte) error {
 }
 
 func (s *fakeStore) MarkTurnComplete(turn int) error { return nil }
-func (s *fakeStore) TouchActivity() error            { return nil }
+func (s *fakeStore) TouchSessionActivity() error     { return nil }
 func (s *fakeStore) CurrentTurn() int                { return s.turn }
 
 type parsedTestStream struct {

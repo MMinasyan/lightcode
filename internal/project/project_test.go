@@ -436,3 +436,69 @@ func TestTouchActivityLockBlocksSecondProcess(t *testing.T) {
 		t.Fatalf("LastActivity = %d, want the touch advanced past the seeded 1", found.LastActivity)
 	}
 }
+
+func TestTryEnsureForPathReportsContentionWithoutPublication(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "projects")
+	path := filepath.Join(home, "workspace")
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	clean, err := normalizePath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hold, err := atomicfs.Acquire(identityLockPath(root, clean))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hold.Release()
+	got, ok, err := TryEnsureForPath(root, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || got != nil {
+		t.Fatalf("TryEnsureForPath = (%#v, %v, %v), want (nil, false, nil)", got, ok, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, projectID(clean), "meta.json")); !os.IsNotExist(err) {
+		t.Fatalf("contended TryEnsureForPath published metadata: %v", err)
+	}
+}
+
+func TestTryTouchActivityReportsContentionWithoutWaiting(t *testing.T) {
+	home := t.TempDir()
+	resolver, err := NewResolver(home, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := resolver.Ensure()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hold, err := atomicfs.Acquire(metaLockPath(resolver.Root(), p.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hold.Release()
+	ok, err := TryTouchActivity(resolver.Root(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("TryTouchActivity acquired a contended metadata lock")
+	}
+}
+
+func TestTryEnsureForPathReportsAcquisitionErrorSeparatelyFromContention(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(root, []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, ok, err := TryEnsureForPath(root, filepath.Join(t.TempDir(), "project"))
+	if err == nil {
+		t.Fatal("TryEnsureForPath returned nil error for an uncreatable lock parent")
+	}
+	if ok {
+		t.Fatal("TryEnsureForPath reported lock acquisition after a lock-parent error")
+	}
+}

@@ -614,7 +614,11 @@ func TestAdapterExplicitSessionTargetingContract(t *testing.T) {
 		if err := app.SessionSwitch(otherID); err != nil {
 			t.Fatalf("SessionSwitch: %v", err)
 		}
-		if got := app.ProjectCurrent().ID; got != wantOther.ID {
+		gotProject, err := app.ProjectCurrent()
+		if err != nil {
+			t.Fatalf("ProjectCurrent: %v", err)
+		}
+		if got := gotProject.ID; got != wantOther.ID {
 			t.Fatalf("ProjectCurrent after cross-project switch = %q, want %q", got, wantOther.ID)
 		}
 	})
@@ -733,7 +737,11 @@ func TestSessionSwitchUnreadableMetaStillRoutesDestination(t *testing.T) {
 	if got := app.routeProjectPath; got != otherRoot {
 		t.Fatalf("route after switch with unreadable meta = %q, want destination %q", got, otherRoot)
 	}
-	if got := app.ProjectCurrent().ID; got != proj.ID {
+	gotProject, err := app.ProjectCurrent()
+	if err != nil {
+		t.Fatalf("ProjectCurrent: %v", err)
+	}
+	if got := gotProject.ID; got != proj.ID {
 		t.Fatalf("ProjectCurrent after switch = %q, want destination project %q", got, proj.ID)
 	}
 }
@@ -793,7 +801,11 @@ func TestSessionSwitchArchivedSessionRoutesDestination(t *testing.T) {
 	if got := app.routeProjectPath; got != otherRoot {
 		t.Fatalf("route after switch to archived session with empty meta project = %q, want destination %q", got, otherRoot)
 	}
-	if got := app.ProjectCurrent().ID; got != proj.ID {
+	gotProject, err := app.ProjectCurrent()
+	if err != nil {
+		t.Fatalf("ProjectCurrent: %v", err)
+	}
+	if got := gotProject.ID; got != proj.ID {
 		t.Fatalf("ProjectCurrent after switch = %q, want destination project %q", got, proj.ID)
 	}
 }
@@ -856,7 +868,11 @@ func TestSessionSwitchArchivedStaleMetaRoutesActualProject(t *testing.T) {
 	if got := app.routeProjectPath; got != otherRoot {
 		t.Fatalf("route after switch to archived session with stale meta project = %q, want the project it lives in %q", got, otherRoot)
 	}
-	if got := app.ProjectCurrent().ID; got != proj.ID {
+	gotProject, err := app.ProjectCurrent()
+	if err != nil {
+		t.Fatalf("ProjectCurrent: %v", err)
+	}
+	if got := gotProject.ID; got != proj.ID {
 		t.Fatalf("ProjectCurrent after switch = %q, want the project it lives in %q", got, proj.ID)
 	}
 }

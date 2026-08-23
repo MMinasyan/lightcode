@@ -177,6 +177,8 @@ func (a *App) startup(ctx context.Context) {
 			if emitted && errors.As(err, &committed) {
 				sessionID = id
 				fmt.Fprintf(os.Stderr, "lightcode: startup session: %v\n", err)
+			} else if errors.Is(err, agent.ErrProjectBusy) {
+				fmt.Fprintf(os.Stderr, "lightcode: startup project: %v\n", err)
 			}
 		} else if emitted {
 			sessionID = id
@@ -1527,9 +1529,8 @@ func (a *App) ProjectList() ([]agent.ProjectSummary, error) {
 }
 
 // ProjectCurrent returns the project record for the adapter-local project.
-func (a *App) ProjectCurrent() agent.ProjectSummary {
-	out, _ := a.svc.ProjectCurrentForPath(a.routeProjectPathCaptured())
-	return out
+func (a *App) ProjectCurrent() (agent.ProjectSummary, error) {
+	return a.svc.ProjectCurrentForPath(a.routeProjectPathCaptured())
 }
 
 // ProjectSwitch navigates to a different project in-place over the existing
