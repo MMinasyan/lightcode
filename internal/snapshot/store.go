@@ -12,11 +12,14 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
+	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/safefs"
 	"golang.org/x/sys/unix"
 )
@@ -38,6 +41,38 @@ var copyDirFunc = copyDir
 // s.mu. Production no-op; tests use it to detect early release of the
 // lock from the fork copy region.
 var forkIntoLockReleasedHook = func() {}
+
+// mintMu serializes the session-id reservation sequence — draw, collision
+// scan, claim, directory creation, and the metadata write — across every
+// creation path in this process. The directory is the reservation: a second
+// mint can only scan after the winning id's directory exists on disk, so it
+// can never draw the same id. The hold spans only local filesystem work —
+// never a call that takes an owner lock — and is released before any turn
+// or loop work.
+var mintMu sync.Mutex
+
+// mintSessionIDMaxAttempts bounds how many ids the mint draws before giving
+// up on a persistent collision.
+const mintSessionIDMaxAttempts = 8
+
+// mintSessionIDFunc supplies the next raw session id for the mint. Production
+// draws from the crypto RNG; tests swap it to force collisions
+// deterministically. Follows the copyDirFunc precedent.
+var mintSessionIDFunc = newSessionID
+
+// RemoveHistoryTurnFunc optionally replaces history-turn removal in tests.
+// Production leaves it nil and uses os.RemoveAll directly.
+var RemoveHistoryTurnFunc func(string) error
+
+// RevertHistoryOutcome describes the durable result of a history removal
+// attempt. HistoryStateKnown is false when the surviving state cannot be
+// trusted for reconciliation.
+type RevertHistoryOutcome struct {
+	CompactionRemoved bool
+	HistoryChanged    bool
+	HistoryStateKnown bool
+	CurrentTurn       int
+}
 
 // Store owns one session directory at a time. Its session may be
 // swapped (Close + BeginNewSession / LoadSession) while tool and loop
@@ -67,8 +102,21 @@ type Store struct {
 	projectRoot  string
 	projectHash  string
 	currentTurn  int
-	snapshotTx   map[string]*snapshotTxState
-	mutationLock map[string]*snapshotMutationLock
+	// highWaterTurn is the highest turn number this Store has issued in the
+	// live session. RevertHistory and RevertCode remove turn directories, so
+	// allocation from disk alone would reissue a number the session already
+	// used; nextTurnLocked never allocates at or below this mark. It is
+	// per-session in-memory state: cleared with the rest of the session in
+	// clearLocked, so a Store that moves to another session restarts from disk.
+	highWaterTurn int
+	snapshotTx    map[string]*snapshotTxState
+	mutationLock  map[string]*snapshotMutationLock
+
+	// claim is the cross-process exclusion held while this process drives the
+	// session. It is acquired before a mutating load or new-session
+	// publication and released on Close. Nil for stores with no project
+	// context (legacy/test stores that never drive across processes).
+	claim *atomicfs.Lock
 }
 
 type snapshotTxState struct {
@@ -95,6 +143,17 @@ func NewForSessionsRoot(sessionsRoot, projectsRoot, projectID string) (*Store, e
 		projectsRoot: projectsRoot,
 		projectID:    projectID,
 	}, nil
+}
+
+// NewStagingStore returns a Store rooted at stagingRoot but carrying this
+// store's project context, so a candidate prepared under staging claims the
+// same per-session lock namespace as this store and, once its directory is
+// renamed into the real sessions root, needs no reclaim.
+func (s *Store) NewStagingStore(stagingRoot string) (*Store, error) {
+	s.mu.Lock()
+	projectsRoot, projectID := s.projectsRoot, s.projectID
+	s.mu.Unlock()
+	return NewForSessionsRoot(stagingRoot, projectsRoot, projectID)
 }
 
 // AttachSessionsRoot swaps the store's sessions root and project
@@ -128,6 +187,155 @@ func (s *Store) BeginNewSession(projectRoot string) error {
 	return s.beginNewSessionLocked(projectRoot, "")
 }
 
+// BeginNewSessionStaged creates a fresh session in an unlisted staging directory
+// and atomically publishes it into the store's sessions root, so a partially
+// initialized final session directory is never listed. It is the prepare-then-
+// publish sequence over PrepareStagedNewSession and PublishPreparedSession. The
+// Store must not have an active session; on any failure it is left inactive.
+// This wrapper is the sole cleanup owner of the staging tree from the moment
+// prepare returns: a named-error defer removes it exactly once on every
+// precommit error return (joining a cleanup failure onto the operation error),
+// and after a successful publish the now-empty staging parent is removed once —
+// an optional cleanup failure is reported to stderr and cannot change success.
+// PrepareStagedNewSession continues owning failures before it returns. On
+// success the store is active and rebound to the final location.
+func (s *Store) BeginNewSessionStaged(projectRoot string) (err error) {
+	prepared, err := s.PrepareStagedNewSession(projectRoot)
+	if err != nil {
+		return err
+	}
+	stagingRoot := prepared.Root()
+	defer func() {
+		if err != nil && stagingRoot != "" {
+			if cerr := os.RemoveAll(stagingRoot); cerr != nil {
+				var committed *CommittedMutationError
+				if errors.As(err, &committed) {
+					fmt.Fprintf(os.Stderr, "lightcode: staging cleanup %s: %v\n", stagingRoot, cerr)
+				} else {
+					err = errors.Join(err, fmt.Errorf("snapshot: staging cleanup: %w", cerr))
+				}
+			}
+		}
+	}()
+	if err := s.PublishPreparedSession(prepared); err != nil {
+		return err
+	}
+	// Post-publish: the staging parent is now empty; remove it exactly once.
+	// An optional cleanup failure is reported and cannot change success;
+	// clearing the root makes the precommit defer a no-op.
+	if cerr := os.RemoveAll(stagingRoot); cerr != nil {
+		fmt.Fprintf(os.Stderr, "lightcode: remove empty staging %s: %v\n", stagingRoot, cerr)
+	}
+	stagingRoot = ""
+	return nil
+}
+
+// PrepareStagedNewSession prepares a fresh session under an unlisted staging
+// directory and returns a staging-bound store the caller can write to before
+// publication: the session files live at <staging>/<id>, so reads and writes
+// through the returned store address the candidate in that window. This store
+// is marked active and holds the session claim, but its own cached paths stay
+// bound to the final location under s.root, which the candidate has not reached
+// yet. Nothing is written to the sessions root, so abandoning the prepared
+// store without publishing leaves no trace there. On any preparation failure
+// the store is left inactive and only staging is removed.
+//
+// Between the prepare call and the publish call the receiver is mid-transaction:
+// it is bound to a session that is not yet published, and it holds that session's
+// claim. The caller is responsible for serializing these two calls against any
+// other use of the receiver; the store does not serialize them for you. The
+// prepared store returned here carries no claim of its own — the receiver holds
+// it — so a caller that intends to keep using the prepared store after publish
+// must account for that.
+func (s *Store) PrepareStagedNewSession(projectRoot string) (*Store, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active {
+		return nil, fmt.Errorf("snapshot: session %q already open", s.sessionID)
+	}
+	stagingRoot, err := NewStagingSessionsRoot(s.root)
+	if err != nil {
+		return nil, err
+	}
+	// Prepare under staging while the cached paths stay bound to the final
+	// location, then publish by atomic rename; s.root never becomes a staging
+	// path, so a concurrent reader never observes an unpublished candidate.
+	if err := s.beginNewSessionAtLocked(projectRoot, "", stagingRoot); err != nil {
+		return nil, cleanupStagingRoot(stagingRoot, err)
+	}
+	// The returned store mirrors the active session with its paths rooted at
+	// staging, where the candidate's files actually live. It carries no claim:
+	// this store holds the claim until Close, matching the single-call behavior.
+	return &Store{
+		root:         stagingRoot,
+		projectsRoot: s.projectsRoot,
+		projectID:    s.projectID,
+		active:       true,
+		dir:          filepath.Join(stagingRoot, s.sessionID),
+		snapshotsDir: filepath.Join(stagingRoot, s.sessionID, "snapshots"),
+		turnsDir:     filepath.Join(stagingRoot, s.sessionID, "turns"),
+		sessionID:    s.sessionID,
+		projectRoot:  s.projectRoot,
+		projectHash:  s.projectHash,
+	}, nil
+}
+
+// PublishPreparedSession atomically publishes a session prepared by
+// PrepareStagedNewSession: it renames the candidate from its staging root into
+// this store's sessions root and rebinds the prepared store to the final
+// location, so reads and writes through it keep working after publication. It
+// owns only the prepared-store detach/receiver state and the publish/relocate
+// steps; the staging tree is owned by the caller (the wrapper that prepared
+// it), which removes the now-empty staging parent after a successful publish
+// and cleans it up on precommit failures. Its failure semantics are asymmetric
+// around the rename. A failure before the rename (the publish step) leaves
+// nothing published: the session state is dropped and both stores are left
+// inactive, so the sessions root never holds a partial session. A failure
+// after the rename (the relocation step) leaves the session published with the
+// receiver still owning it: the receiver stays active and claim-holding on the
+// published session, and only the prepared store is detached as unusable.
+//
+// Between the prepare call and this call the receiver is mid-transaction: it is
+// bound to a session that is not yet published, and it holds that session's
+// claim. The caller is responsible for serializing these two calls against any
+// other use of the receiver; the store does not serialize them for you. The
+// prepared store returned by the prepare step carries no claim of its own — the
+// receiver holds it — so a caller that intends to keep using the prepared store
+// after publish must account for that.
+func (s *Store) PublishPreparedSession(prepared *Store) error {
+	s.mu.Lock()
+	if !s.active {
+		s.mu.Unlock()
+		return ErrNoSession
+	}
+	stagingRoot := prepared.root
+	finalRoot := s.root
+	if err := PublishStagedSession(stagingRoot, finalRoot, s.sessionID); err != nil {
+		var committed *CommittedMutationError
+		if errors.As(err, &committed) {
+			_ = prepared.RelocateActiveSessionPaths(finalRoot)
+			s.mu.Unlock()
+			return err
+		}
+		// The session is active but its files are still under staging; drop it.
+		// The staging tree stays for the caller's cleanup owner.
+		s.clearLocked()
+		s.mu.Unlock()
+		prepared.Detach()
+		return err
+	}
+	s.mu.Unlock()
+	if err := prepared.RelocateActiveSessionPaths(finalRoot); err != nil {
+		// The rename already committed: the session is published and the
+		// receiver keeps its claim on it. Only the prepared store is broken;
+		// detach it and leave the receiver active. The caller's cleanup owner
+		// removes the now-empty staging parent.
+		prepared.Detach()
+		return err
+	}
+	return nil
+}
+
 // BeginChildSession creates a fresh session linked to a parent session.
 func (s *Store) BeginChildSession(projectRoot, parentSessionID string) error {
 	s.mu.Lock()
@@ -139,60 +347,81 @@ func (s *Store) BeginChildSession(projectRoot, parentSessionID string) error {
 }
 
 func (s *Store) beginNewSessionLocked(projectRoot, parentSessionID string) error {
+	return s.beginNewSessionAtLocked(projectRoot, parentSessionID, s.root)
+}
+
+// beginNewSessionAtLocked creates a fresh session's directory and meta under
+// createRoot but binds the store's cached paths to its permanent location under
+// s.root. For an in-place begin createRoot == s.root; for staged publication
+// createRoot is an unlisted staging root and the caller renames <createRoot>/<id>
+// into <s.root>/<id> before any store I/O, so the cached paths (and s.root) are
+// never a staging path. Caller holds s.mu.
+func (s *Store) beginNewSessionAtLocked(projectRoot, parentSessionID, createRoot string) error {
 	absProject, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return fmt.Errorf("snapshot: resolve project root: %w", err)
 	}
-	sessionID, err := newSessionID()
-	if err != nil {
-		return fmt.Errorf("snapshot: generate session id: %w", err)
-	}
-	dir := filepath.Join(s.root, sessionID)
-	snapshotsDir := filepath.Join(dir, "snapshots")
-	turnsDir := filepath.Join(dir, "turns")
-	for _, p := range []string{snapshotsDir, turnsDir} {
-		if err := os.MkdirAll(p, 0o700); err != nil {
-			return fmt.Errorf("snapshot: create %s: %w", p, err)
-		}
-	}
-	projectHash := hashString(absProject)
 	now := time.Now().Unix()
 	meta := SessionMeta{
-		ID:               sessionID,
 		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
 		ProjectPath:      absProject,
-		ProjectHash:      projectHash,
+		ProjectHash:      hashString(absProject),
 		LightcodeVersion: lightcodeVersion,
 		State:            StateActive,
 		LastActivity:     now,
 		ParentSessionID:  parentSessionID,
 	}
-	if err := writeJSON(filepath.Join(dir, "meta.json"), meta); err != nil {
-		return fmt.Errorf("snapshot: write session meta: %w", err)
+	sessionID, err := s.mintReservedSessionID(createRoot, meta, true)
+	if err != nil {
+		return err
 	}
+	if createRoot == s.root {
+		if err := atomicfs.SyncDir(filepath.Join(createRoot, sessionID)); err != nil {
+			_ = s.releaseClaimLocked(sessionID)
+			return &CommittedMutationError{Err: fmt.Errorf("snapshot: sync child session dir: %w", err)}
+		}
+		if err := atomicfs.SyncDir(createRoot); err != nil {
+			_ = s.releaseClaimLocked(sessionID)
+			return &CommittedMutationError{Err: fmt.Errorf("snapshot: sync sessions root: %w", err)}
+		}
+	}
+	dir := filepath.Join(s.root, sessionID)
 	s.active = true
 	s.dir = dir
-	s.snapshotsDir = snapshotsDir
-	s.turnsDir = turnsDir
+	s.snapshotsDir = filepath.Join(dir, "snapshots")
+	s.turnsDir = filepath.Join(dir, "turns")
 	s.sessionID = sessionID
 	s.projectRoot = absProject
-	s.projectHash = projectHash
+	s.projectHash = meta.ProjectHash
 	s.currentTurn = 0
 	return nil
 }
 
 // LoadSession attaches this Store to an existing on-disk session.
 // Discards any incomplete turn dirs (crash recovery).
-func (s *Store) LoadSession(id string) error {
+func (s *Store) LoadSession(id string) (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.active {
 		return fmt.Errorf("snapshot: session %q already open", s.sessionID)
 	}
+	if verr := ValidateSessionID(id); verr != nil {
+		return verr
+	}
+	// Claim the session before the crash-recovery mutation below, so only one
+	// process ever discards this session's incomplete turns.
+	if cerr := s.acquireClaimLocked(id); cerr != nil {
+		return cerr
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, s.releaseClaimLocked(id))
+		}
+	}()
 	dir := filepath.Join(s.root, id)
 	var meta SessionMeta
-	if err := readJSON(filepath.Join(dir, "meta.json"), &meta); err != nil {
-		return fmt.Errorf("snapshot: load %s: %w", id, err)
+	if rerr := readJSON(filepath.Join(dir, "meta.json"), &meta); rerr != nil {
+		return fmt.Errorf("snapshot: load %s: %w", id, rerr)
 	}
 	snapshotsDir := filepath.Join(dir, "snapshots")
 	turnsDir := filepath.Join(dir, "turns")
@@ -217,7 +446,12 @@ func (s *Store) LoadSession(id string) error {
 // Close detaches the Store from its current session. If the session
 // has no complete turns, the entire session dir is deleted (orphan
 // cleanup for "opened a new session, switched away without using it").
-// Returns (wasDiscarded, err). A Store with no session is a no-op.
+// The claim and active authority remain held through the optional
+// empty-directory removal, and clearLocked always runs before the function
+// returns success or failure, so a cleanup failure can never retain the
+// session claim until process exit (the release is never ordered before the
+// deletion completes). Returns (wasDiscarded, err). A Store with no session
+// is a no-op.
 func (s *Store) Close() (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -225,17 +459,60 @@ func (s *Store) Close() (bool, error) {
 		return false, nil
 	}
 	discarded := false
+	var cleanupErr error
 	if s.hasAnyCompleteTurnLocked() == false {
 		if err := os.RemoveAll(s.dir); err != nil {
-			return false, fmt.Errorf("snapshot: discard empty session %s: %w", s.sessionID, err)
+			cleanupErr = fmt.Errorf("snapshot: discard empty session %s: %w", s.sessionID, err)
+		} else {
+			discarded = true
 		}
-		discarded = true
 	}
 	s.clearLocked()
-	return discarded, nil
+	return discarded, cleanupErr
+}
+
+// RelocateActiveSessionPaths rewrites the active store's cached directory
+// paths to a new sessions root after its session directory has been
+// atomically renamed there (staged fork/new publication). It performs no I/O:
+// it recomputes root/dir/snapshotsDir/turnsDir from the known session id. The
+// claim path derives from projectsRoot/projectID and is unaffected. The store
+// must be active.
+func (s *Store) RelocateActiveSessionPaths(finalSessionsRoot string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active {
+		return ErrNoSession
+	}
+	s.relocateActiveSessionPathsLocked(finalSessionsRoot)
+	return nil
+}
+
+// relocateActiveSessionPathsLocked recomputes the cached session paths from the
+// known session id and a new sessions root. Caller holds s.mu.
+func (s *Store) relocateActiveSessionPathsLocked(finalSessionsRoot string) {
+	s.root = finalSessionsRoot
+	s.dir = filepath.Join(finalSessionsRoot, s.sessionID)
+	s.snapshotsDir = filepath.Join(s.dir, "snapshots")
+	s.turnsDir = filepath.Join(s.dir, "turns")
+}
+
+// Detach releases the store's claim and resets it to the no-session state
+// without discarding the session directory. Used when an open fails after the
+// claim was acquired but the persisted session must remain on disk (unlike
+// Close, which discards a session that has no complete turns).
+func (s *Store) Detach() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active {
+		return
+	}
+	s.clearLocked()
 }
 
 func (s *Store) clearLocked() {
+	// Detach and Close do not surface the release result — no caller can act
+	// on it — so a failure is left to ReleaseSessionClaim's stderr report.
+	_ = s.releaseClaimLocked(s.sessionID)
 	s.active = false
 	s.dir = ""
 	s.snapshotsDir = ""
@@ -244,6 +521,7 @@ func (s *Store) clearLocked() {
 	s.projectRoot = ""
 	s.projectHash = ""
 	s.currentTurn = 0
+	s.highWaterTurn = 0
 	s.snapshotTx = nil
 	s.mutationLock = nil
 }
@@ -296,6 +574,17 @@ func (s *Store) BeginTurn() int {
 }
 
 func (s *Store) nextTurnLocked() int {
+	max := s.maxTurnLocked()
+	if s.highWaterTurn > max {
+		max = s.highWaterTurn
+	}
+	return max + 1
+}
+
+// maxTurnLocked returns the highest turn directory present on disk, across
+// both the snapshots and the turns trees — the same union nextTurnLocked
+// allocates from. Caller holds s.mu.
+func (s *Store) maxTurnLocked() int {
 	snap := readIntDirs(s.snapshotsDir)
 	turn := readIntDirs(s.turnsDir)
 	max := 0
@@ -309,7 +598,7 @@ func (s *Store) nextTurnLocked() int {
 			max = n
 		}
 	}
-	return max + 1
+	return max
 }
 
 // CurrentTurn returns the last BeginTurn result, 0 if unset.
@@ -317,6 +606,18 @@ func (s *Store) CurrentTurn() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.currentTurn
+}
+
+// HighestCompleteTurn returns the highest turn with a durable completion
+// marker, 0 when none. Unlike CurrentTurn it never names an in-flight
+// incomplete turn: BeginTurn creates the turn directory, while the completion
+// marker is what makes the turn complete. A loaded store returns the highest
+// marker-backed complete turn after incomplete cleanup; a fresh store returns
+// zero.
+func (s *Store) HighestCompleteTurn() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.highestCompleteTurnLocked()
 }
 
 // Snapshot captures the pre-turn state of absPath. First-write-wins per
@@ -765,8 +1066,8 @@ func loadCompleteTurnsFromDir(turnsDir string, after int, filterAfter bool) ([]T
 }
 
 func (s *Store) sessionReadDirs(id string) (string, string, error) {
-	if id == "" || id == "." || id == ".." || filepath.Base(id) != id {
-		return "", "", fmt.Errorf("snapshot: invalid session id %q", id)
+	if err := ValidateSessionID(id); err != nil {
+		return "", "", err
 	}
 	s.mu.Lock()
 	root := s.root
@@ -832,6 +1133,13 @@ func (s *Store) RevertCode(toTurn int) (RevertResult, error) {
 	if toTurn < 0 {
 		toTurn = 0
 	}
+	// Record the highest turn number this session has issued before any
+	// removal: the walk deletes snapshot turn dirs, so allocation from disk
+	// alone would reissue numbers the session already used. The mark is raised,
+	// never assigned — a later revert can scan a union maximum below it.
+	if m := s.maxTurnLocked(); m > s.highWaterTurn {
+		s.highWaterTurn = m
+	}
 	turns := readIntDirs(s.snapshotsDir)
 	var result RevertResult
 	skippedEntries := make(map[string]struct{})
@@ -856,32 +1164,118 @@ func (s *Store) RevertCode(toTurn int) (RevertResult, error) {
 }
 
 // RevertHistory deletes message turn dirs strictly greater than toTurn
-// and updates currentTurn. Files on disk are NOT touched.
-func (s *Store) RevertHistory(toTurn int) error {
+// and updates currentTurn. Files on disk are NOT touched. The outcome reports
+// whether the compaction record or history changed and whether the surviving
+// history state is authoritative after a failed removal.
+func (s *Store) RevertHistory(toTurn int) (RevertHistoryOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.active {
-		return ErrNoSession
+		return RevertHistoryOutcome{}, ErrNoSession
 	}
 	if toTurn < 0 {
 		toTurn = 0
 	}
+	// Record the highest turn number this session has issued before any
+	// removal: the walk deletes message turn dirs, so allocation from disk
+	// alone would reissue numbers the session already used. The mark is raised,
+	// never assigned — a later revert can scan a union maximum below it.
+	if m := s.maxTurnLocked(); m > s.highWaterTurn {
+		s.highWaterTurn = m
+	}
+	outcome := RevertHistoryOutcome{HistoryStateKnown: true, CurrentTurn: s.currentTurn}
+	// A revert below a compaction boundary empties the conversation: the
+	// summary record would survive untouched and the load path would drop
+	// every surviving turn behind the boundary it names. The record is
+	// therefore removed before any turn, and the removal is a precondition of
+	// the walk — a failed removal or a failed directory sync returns with no
+	// turn removed, and so does an unreadable record, because walking on a
+	// record whose survival is unknown truncates below a boundary whose
+	// record may still exist, which is exactly the state this removal exists
+	// to prevent.
+	rec, err := loadCompactionFromDir(s.dir)
+	if err != nil {
+		return outcome, fmt.Errorf("snapshot: read compaction record: %w", err)
+	}
+	if rec != nil && toTurn < rec.BoundaryTurn {
+		if err := os.Remove(filepath.Join(s.dir, "compaction.json")); err != nil {
+			return outcome, fmt.Errorf("snapshot: remove compaction record: %w", err)
+		}
+		outcome.CompactionRemoved = true
+		outcome.HistoryChanged = true
+		if err := atomicfs.SyncDir(s.dir); err != nil {
+			outcome.CurrentTurn = s.currentTurn
+			return outcome, &CommittedMutationError{Err: fmt.Errorf("snapshot: sync session dir: %w", err)}
+		}
+	}
+	// Walk descending and stop at the first failed removal, exactly like
+	// RevertCode: the load path reads complete turns by scanning completion
+	// markers with no upper bound, so a surviving turn directory above the
+	// recorded truncation point would be re-read after a reload and the
+	// reverted turn would come back. The truncation point is therefore lowered
+	// only as far as removal actually reached — the failed turn survives, so
+	// the recorded point stops at it.
 	msgTurns := readIntDirs(s.turnsDir)
-	for _, t := range msgTurns {
-		if t > toTurn {
-			_ = os.RemoveAll(filepath.Join(s.turnsDir, strconv.Itoa(t)))
+	for i := len(msgTurns) - 1; i >= 0; i-- {
+		t := msgTurns[i]
+		if t <= toTurn {
+			break
+		}
+		turnDir := filepath.Join(s.turnsDir, strconv.Itoa(t))
+		before, inspectErr := inspectHistoryTurn(turnDir)
+		if inspectErr != nil {
+			outcome.HistoryStateKnown = !outcome.HistoryChanged
+			outcome.CurrentTurn = s.currentTurn
+			return outcome, fmt.Errorf("snapshot: inspect history turn %d: %w", t, inspectErr)
+		}
+		removeFn := RemoveHistoryTurnFunc
+		if removeFn == nil {
+			removeFn = os.RemoveAll
+		}
+		if removeErr := removeFn(turnDir); removeErr != nil {
+			after, postErr := inspectHistoryTurn(turnDir)
+			if postErr != nil {
+				outcome.HistoryChanged = true
+				outcome.HistoryStateKnown = false
+				outcome.CurrentTurn = s.currentTurn
+				return outcome, fmt.Errorf("snapshot: revert history turn %d: %w", t, errors.Join(removeErr, postErr))
+			}
+			if before != after {
+				outcome.HistoryChanged = true
+			}
+			if outcome.HistoryChanged {
+				if reconcileErr := s.reconcileFailedHistoryTurnLocked(t, after); reconcileErr != nil {
+					outcome.HistoryStateKnown = false
+					outcome.CurrentTurn = s.currentTurn
+					return outcome, fmt.Errorf("snapshot: reconcile history turn %d: %w", t, errors.Join(removeErr, reconcileErr))
+				}
+			}
+			outcome.CurrentTurn = s.currentTurn
+			return outcome, fmt.Errorf("snapshot: revert history turn %d: %w", t, removeErr)
+		}
+		outcome.HistoryChanged = true
+		if t <= s.currentTurn {
+			s.currentTurn = t - 1
+		}
+		if err := atomicfs.SyncDir(s.turnsDir); err != nil {
+			outcome.CurrentTurn = s.currentTurn
+			return outcome, &CommittedMutationError{Err: fmt.Errorf("snapshot: sync turns dir: %w", err)}
 		}
 	}
 	if toTurn >= 0 && toTurn < s.currentTurn {
 		s.currentTurn = toTurn
 	}
-	return nil
+	outcome.CurrentTurn = s.currentTurn
+	return outcome, nil
 }
 
-// ForkInto copies turns 1..toTurn (both snapshots and messages) into a
-// new session directory. The current session is untouched. Returns the
-// path of the new session dir. Caller is responsible for switching to it.
-func (s *Store) ForkInto(toTurn int) (string, string, error) {
+// ForkInto copies turns 1..toTurn (both snapshots and messages) from the
+// current session into a new session directory under destSessionsRoot. The
+// current session is untouched. Returns the new session id and dir. The caller
+// loads the copy through a store rooted at destSessionsRoot; for staged
+// publication destSessionsRoot is an unlisted staging root later renamed
+// atomically into the session namespace.
+func (s *Store) ForkInto(toTurn int, destSessionsRoot string) (string, string, error) {
 	s.mu.Lock()
 	defer func() {
 		forkIntoLockReleasedHook()
@@ -891,62 +1285,18 @@ func (s *Store) ForkInto(toTurn int) (string, string, error) {
 		return "", "", ErrNoSession
 	}
 	srcDir := s.dir
-	root := s.root
 	projectRoot := s.projectRoot
 
-	newID, err := newSessionID()
-	if err != nil {
-		return "", "", fmt.Errorf("snapshot: fork: generate id: %w", err)
-	}
-	newDir := filepath.Join(root, newID)
-	newSnapshots := filepath.Join(newDir, "snapshots")
-	newTurns := filepath.Join(newDir, "turns")
-	for _, p := range []string{newSnapshots, newTurns} {
-		if err := os.MkdirAll(p, 0o700); err != nil {
-			return "", "", fmt.Errorf("snapshot: fork: mkdir %s: %w", p, err)
-		}
-	}
-
-	// Copy snapshot and turn dirs for turns 1..toTurn.
-	for turn := 1; turn <= toTurn; turn++ {
-		ts := strconv.Itoa(turn)
-		srcSnap := filepath.Join(srcDir, "snapshots", ts)
-		if info, err := os.Stat(srcSnap); err == nil && info.IsDir() {
-			if err := copyDirFunc(srcSnap, filepath.Join(newSnapshots, ts)); err != nil {
-				return "", "", fmt.Errorf("snapshot: fork: copy snapshots/%d: %w", turn, err)
-			}
-		}
-		srcTurn := filepath.Join(srcDir, "turns", ts)
-		if info, err := os.Stat(srcTurn); err == nil && info.IsDir() {
-			if err := copyDirFunc(srcTurn, filepath.Join(newTurns, ts)); err != nil {
-				return "", "", fmt.Errorf("snapshot: fork: copy turns/%d: %w", turn, err)
-			}
-		}
-	}
-
-	// Copy tokens.json if present.
-	srcTokens := filepath.Join(srcDir, "tokens.json")
-	if _, err := os.Stat(srcTokens); err == nil {
-		_ = copyFile(srcTokens, filepath.Join(newDir, "tokens.json"))
-	}
-
-	// Copy compaction.json only when its boundary exists in the forked history.
-	srcCompaction := filepath.Join(srcDir, "compaction.json")
-	if _, err := os.Stat(srcCompaction); err == nil {
-		var rec CompactionRecord
-		if err := readJSON(srcCompaction, &rec); err == nil && rec.BoundaryTurn <= toTurn {
-			_ = copyFile(srcCompaction, filepath.Join(newDir, "compaction.json"))
-		}
-	}
-
-	// Read source meta to carry over model fields.
+	// Read source meta first so the mint can write the full fork meta under
+	// the reservation lock; a read error fails the fork rather than
+	// publishing a candidate with blank metadata.
 	var srcMeta SessionMeta
-	_ = readJSON(filepath.Join(srcDir, "meta.json"), &srcMeta)
+	if err := readJSON(filepath.Join(srcDir, "meta.json"), &srcMeta); err != nil {
+		return "", "", fmt.Errorf("snapshot: fork: read source meta: %w", err)
+	}
 
-	// Write meta.json for the new session.
 	now := time.Now()
 	meta := SessionMeta{
-		ID:               newID,
 		CreatedAt:        now.UTC().Format(time.RFC3339),
 		ProjectPath:      projectRoot,
 		ProjectHash:      hashString(projectRoot),
@@ -955,9 +1305,69 @@ func (s *Store) ForkInto(toTurn int) (string, string, error) {
 		LastActivity:     now.Unix(),
 		Provider:         srcMeta.Provider,
 		Model:            srcMeta.Model,
+		ActiveAgentType:  srcMeta.ActiveAgentType,
 	}
-	if err := writeJSON(filepath.Join(newDir, "meta.json"), meta); err != nil {
-		return "", "", fmt.Errorf("snapshot: fork: write meta: %w", err)
+	newID, err := s.mintReservedSessionID(destSessionsRoot, meta, false)
+	if err != nil {
+		return "", "", fmt.Errorf("snapshot: fork: %w", err)
+	}
+	newDir := filepath.Join(destSessionsRoot, newID)
+	newSnapshots := filepath.Join(newDir, "snapshots")
+	newTurns := filepath.Join(newDir, "turns")
+
+	// Copy snapshot and turn dirs for turns 1..toTurn. A missing turn dir is
+	// skipped; any other stat or copy error fails the fork so a partial or
+	// silently truncated candidate is never published.
+	for turn := 1; turn <= toTurn; turn++ {
+		ts := strconv.Itoa(turn)
+		srcSnap := filepath.Join(srcDir, "snapshots", ts)
+		if info, err := os.Stat(srcSnap); err == nil {
+			if !info.IsDir() {
+				return "", "", fmt.Errorf("snapshot: fork: snapshots/%d is not a directory", turn)
+			}
+			if err := copyDirFunc(srcSnap, filepath.Join(newSnapshots, ts)); err != nil {
+				return "", "", fmt.Errorf("snapshot: fork: copy snapshots/%d: %w", turn, err)
+			}
+		} else if !os.IsNotExist(err) {
+			return "", "", fmt.Errorf("snapshot: fork: stat snapshots/%d: %w", turn, err)
+		}
+		srcTurn := filepath.Join(srcDir, "turns", ts)
+		if info, err := os.Stat(srcTurn); err == nil {
+			if !info.IsDir() {
+				return "", "", fmt.Errorf("snapshot: fork: turns/%d is not a directory", turn)
+			}
+			if err := copyDirFunc(srcTurn, filepath.Join(newTurns, ts)); err != nil {
+				return "", "", fmt.Errorf("snapshot: fork: copy turns/%d: %w", turn, err)
+			}
+		} else if !os.IsNotExist(err) {
+			return "", "", fmt.Errorf("snapshot: fork: stat turns/%d: %w", turn, err)
+		}
+	}
+
+	// Copy tokens.json if present; a real read/copy error fails the fork.
+	srcTokens := filepath.Join(srcDir, "tokens.json")
+	if _, err := os.Stat(srcTokens); err == nil {
+		if err := copyFile(srcTokens, filepath.Join(newDir, "tokens.json")); err != nil {
+			return "", "", fmt.Errorf("snapshot: fork: copy tokens: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", "", fmt.Errorf("snapshot: fork: stat tokens: %w", err)
+	}
+
+	// Copy compaction.json only when its boundary exists in the forked history.
+	srcCompaction := filepath.Join(srcDir, "compaction.json")
+	if _, err := os.Stat(srcCompaction); err == nil {
+		var rec CompactionRecord
+		if err := readJSON(srcCompaction, &rec); err != nil {
+			return "", "", fmt.Errorf("snapshot: fork: read compaction: %w", err)
+		}
+		if rec.BoundaryTurn <= toTurn {
+			if err := copyFile(srcCompaction, filepath.Join(newDir, "compaction.json")); err != nil {
+				return "", "", fmt.Errorf("snapshot: fork: copy compaction: %w", err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return "", "", fmt.Errorf("snapshot: fork: stat compaction: %w", err)
 	}
 
 	return newID, newDir, nil
@@ -988,37 +1398,76 @@ func copyDir(src, dst string) error {
 	return nil
 }
 
-// TouchActivity updates LastActivity in meta.json to now. Called on
-// every user message. Also bumps the owning project's meta.json when
-// the store is project-aware.
-func (s *Store) TouchActivity() error {
+// updateMeta reads, mutates, and rewrites the session meta.json while
+// holding the store lock, so two concurrent field updates cannot lose each
+// other, and the rewrite is atomic so a reader always sees old-or-new
+// complete JSON.
+func (s *Store) updateMeta(mutate func(*SessionMeta)) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.active {
-		s.mu.Unlock()
 		return ErrNoSession
 	}
-	dir := s.dir
-	projectsRoot := s.projectsRoot
-	projectID := s.projectID
-	s.mu.Unlock()
-	metaPath := filepath.Join(dir, "meta.json")
+	metaPath := filepath.Join(s.dir, "meta.json")
 	var meta SessionMeta
 	if err := readJSON(metaPath, &meta); err != nil {
 		return err
 	}
-	meta.LastActivity = time.Now().Unix()
-	if err := writeJSON(metaPath, meta); err != nil {
+	mutate(&meta)
+	return writeJSON(metaPath, meta)
+}
+
+// TouchActivity updates LastActivity in meta.json to now. Called on
+// every user message. Also advances the owning project's meta.json when
+// the store is project-aware.
+func (s *Store) TouchActivity() error {
+	if err := s.TouchSessionActivity(); err != nil {
 		return err
 	}
+	return s.TouchProjectActivity()
+}
+
+// TouchSessionActivity updates only the session's LastActivity. Owner turns
+// use this method so project publication can be admitted separately.
+func (s *Store) TouchSessionActivity() error {
+	return s.SetLastActivity(time.Now().Unix())
+}
+
+// SetLastActivity stamps only the session meta's LastActivity to ts. It does not touch
+// project activity, so a caller can report the session's committed LastActivity in a
+// boundary summary based solely on this write's success.
+func (s *Store) SetLastActivity(ts int64) error {
+	return s.updateMeta(func(m *SessionMeta) {
+		m.LastActivity = ts
+	})
+}
+
+// TouchProjectActivity records project-level recent activity; it never affects the
+// session's own LastActivity, so its failure does not make a boundary summary that
+// already reported the session's LastActivity inconsistent with disk.
+func (s *Store) TouchProjectActivity() error {
+	s.mu.Lock()
+	projectsRoot := s.projectsRoot
+	projectID := s.projectID
+	s.mu.Unlock()
 	if projectsRoot != "" && projectID != "" {
-		projectMeta := filepath.Join(projectsRoot, projectID, "meta.json")
-		var pm map[string]any
-		if err := readJSON(projectMeta, &pm); err == nil {
-			pm["last_activity"] = time.Now().Unix()
-			_ = writeJSON(projectMeta, pm)
-		}
+		return project.TouchActivity(projectsRoot, projectID)
 	}
 	return nil
+}
+
+// TryTouchProjectActivity performs one best-effort project activity attempt.
+// Contention is reported as false and does not wait for a foreign metadata
+// lock.
+func (s *Store) TryTouchProjectActivity() (bool, error) {
+	s.mu.Lock()
+	projectsRoot := s.projectsRoot
+	projectID := s.projectID
+	s.mu.Unlock()
+	if projectsRoot == "" || projectID == "" {
+		return true, nil
+	}
+	return project.TryTouchActivity(projectsRoot, projectID)
 }
 
 // Meta reads the session's meta.json.
@@ -1037,65 +1486,113 @@ func (s *Store) Meta() (SessionMeta, error) {
 
 // SetModel writes provider + model fields into meta.json.
 func (s *Store) SetModel(provider, model string) error {
-	s.mu.Lock()
-	if !s.active {
-		s.mu.Unlock()
-		return ErrNoSession
-	}
-	dir := s.dir
-	s.mu.Unlock()
-	metaPath := filepath.Join(dir, "meta.json")
-	var meta SessionMeta
-	if err := readJSON(metaPath, &meta); err != nil {
-		return err
-	}
-	meta.Provider = provider
-	meta.Model = model
-	return writeJSON(metaPath, meta)
+	return s.updateMeta(func(m *SessionMeta) {
+		m.Provider = provider
+		m.Model = model
+	})
 }
 
 // SetActiveAgentType writes the active_agent_type field into meta.json.
 func (s *Store) SetActiveAgentType(agentType string) error {
-	s.mu.Lock()
-	if !s.active {
-		s.mu.Unlock()
-		return ErrNoSession
-	}
-	dir := s.dir
-	s.mu.Unlock()
-	metaPath := filepath.Join(dir, "meta.json")
-	var meta SessionMeta
-	if err := readJSON(metaPath, &meta); err != nil {
-		return err
-	}
-	meta.ActiveAgentType = agentType
-	return writeJSON(metaPath, meta)
+	return s.updateMeta(func(m *SessionMeta) {
+		m.ActiveAgentType = agentType
+	})
 }
 
 // SetState writes state + archived_at fields into meta.json.
 func (s *Store) SetState(state string) error {
-	s.mu.Lock()
-	if !s.active {
-		s.mu.Unlock()
-		return ErrNoSession
-	}
-	dir := s.dir
-	s.mu.Unlock()
-	metaPath := filepath.Join(dir, "meta.json")
-	var meta SessionMeta
-	if err := readJSON(metaPath, &meta); err != nil {
-		return err
-	}
-	meta.State = state
-	if state == StateArchived {
-		meta.ArchivedAt = time.Now().Unix()
-	} else {
-		meta.ArchivedAt = 0
-	}
-	return writeJSON(metaPath, meta)
+	return s.updateMeta(func(m *SessionMeta) {
+		m.State = state
+		if state == StateArchived {
+			m.ArchivedAt = time.Now().Unix()
+		} else {
+			m.ArchivedAt = 0
+		}
+	})
 }
 
 // --- internal helpers ---
+
+type historyTurnState struct {
+	dir      bool
+	complete bool
+	messages bool
+}
+
+func inspectHistoryTurn(dir string) (historyTurnState, error) {
+	var state historyTurnState
+	info, err := os.Stat(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return state, nil
+		}
+		return state, err
+	}
+	if !info.IsDir() {
+		return state, fmt.Errorf("%s is not a directory", dir)
+	}
+	state.dir = true
+	if _, err := os.Stat(filepath.Join(dir, "complete")); err == nil {
+		state.complete = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return historyTurnState{}, err
+	}
+	if _, err := os.Stat(filepath.Join(dir, "messages.jsonl")); err == nil {
+		state.messages = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return historyTurnState{}, err
+	}
+	return state, nil
+}
+
+func (s *Store) reconcileFailedHistoryTurnLocked(turn int, state historyTurnState) error {
+	if !state.dir {
+		s.currentTurn = s.highestCompleteTurnLocked()
+		return nil
+	}
+	if state.complete {
+		s.currentTurn = turn
+		return nil
+	}
+	if !state.messages {
+		s.currentTurn = s.highestCompleteTurnLocked()
+		return nil
+	}
+	recovered, err := recoverTurnMessages(filepath.Join(s.turnsDir, strconv.Itoa(turn)))
+	if err != nil {
+		return err
+	}
+	if len(recovered) > 0 {
+		turnDir := filepath.Join(s.turnsDir, strconv.Itoa(turn))
+		if err := atomicfs.Write(filepath.Join(turnDir, "messages.jsonl"), recovered, 0o600); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(turnDir, "complete"), nil, 0o600); err != nil {
+			return err
+		}
+		after, err := inspectHistoryTurn(turnDir)
+		if err != nil {
+			return err
+		}
+		if !after.complete {
+			return fmt.Errorf("recovery did not recreate complete marker")
+		}
+		s.currentTurn = turn
+		return nil
+	}
+	if err := os.RemoveAll(filepath.Join(s.turnsDir, strconv.Itoa(turn))); err != nil {
+		return err
+	}
+	after, err := inspectHistoryTurn(filepath.Join(s.turnsDir, strconv.Itoa(turn)))
+	if err != nil {
+		return err
+	}
+	if after.dir {
+		return fmt.Errorf("unrecoverable history turn remains")
+	}
+	s.currentTurn = s.highestCompleteTurnLocked()
+	return nil
+}
 
 func (s *Store) discardIncompleteTurnsLocked() {
 	if s.turnsDir == "" {
@@ -1107,12 +1604,16 @@ func (s *Store) discardIncompleteTurnsLocked() {
 			continue
 		}
 		// Attempt crash recovery.
-		recovered := recoverTurnMessages(dir)
+		recovered, err := recoverTurnMessages(dir)
+		if err != nil {
+			_ = os.RemoveAll(dir)
+			continue
+		}
 		if len(recovered) == 0 {
 			_ = os.RemoveAll(dir)
 			continue
 		}
-		if err := os.WriteFile(filepath.Join(dir, "messages.jsonl"), recovered, 0o600); err != nil {
+		if err := atomicfs.Write(filepath.Join(dir, "messages.jsonl"), recovered, 0o600); err != nil {
 			_ = os.RemoveAll(dir)
 			continue
 		}
@@ -1123,11 +1624,15 @@ func (s *Store) discardIncompleteTurnsLocked() {
 // recoverTurnMessages attempts to recover complete iterations from a
 // partially-written messages.jsonl. Returns the recovered JSONL content
 // or nil if nothing can be recovered.
-func recoverTurnMessages(dir string) []byte {
+func recoverTurnMessages(dir string) ([]byte, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "messages.jsonl"))
 	if err != nil {
-		return nil
+		return nil, err
 	}
+	return recoverTurnMessagesData(data), nil
+}
+
+func recoverTurnMessagesData(data []byte) []byte {
 	lines := splitJSONL(data)
 
 	if len(lines) == 0 {
@@ -1218,10 +1723,6 @@ func recoverTurnMessages(dir string) []byte {
 	// Discard last incomplete iteration.
 	if len(iters) > 0 && !iters[len(iters)-1].complete {
 		iters = iters[:len(iters)-1]
-	}
-
-	if len(iters) == 0 {
-		return nil
 	}
 
 	// Rebuild: keep user messages and complete iterations, preserving order.
@@ -1593,6 +2094,157 @@ func newSessionID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf[:]), nil
+}
+
+// mintReservedSessionID draws a fresh session id and reserves it on disk
+// while holding mintMu: it scans both namespaces of every project under the
+// store's projects root for an existing use of the drawn id, retrying on a
+// collision, and on a clean scan claims the id (when claim is set), creates
+// its directory under createRoot, and writes its meta. The directory is the
+// reservation, so the lock must span its creation: if it were released
+// before the winning id's directory existed, a second mint could scan the
+// same roots, see no collision, and draw the same id. A collided attempt
+// creates nothing, so no cleanup is needed between retries. A lost claim on
+// a fresh draw redraws for the same reason: another process took the id, and
+// nothing was created. A failure after the claim removes the reservation
+// directory before returning, so a failed mint leaves nothing behind. The
+// hold covers local filesystem work only and is released before any turn or
+// loop work.
+func (s *Store) mintReservedSessionID(createRoot string, meta SessionMeta, claim bool) (string, error) {
+	mintMu.Lock()
+	defer mintMu.Unlock()
+	for attempt := 0; attempt < mintSessionIDMaxAttempts; attempt++ {
+		id, err := mintSessionIDFunc()
+		if err != nil {
+			return "", fmt.Errorf("snapshot: generate session id: %w", err)
+		}
+		used, err := s.sessionIDExistsAnywhere(id)
+		if err != nil {
+			return "", fmt.Errorf("snapshot: scan session id %s: %w", id, err)
+		}
+		if used {
+			continue
+		}
+		if claim {
+			if cerr := s.acquireClaimLocked(id); cerr != nil {
+				// A lost claim means another process took this exact id, the
+				// same event as the scan collision above: redraw rather than
+				// abort. Any other error — validation or filesystem — fails
+				// the mint.
+				if errors.Is(cerr, ErrSessionContended) {
+					continue
+				}
+				return "", cerr
+			}
+		}
+		createDir := filepath.Join(createRoot, id)
+		for _, p := range []string{filepath.Join(createDir, "snapshots"), filepath.Join(createDir, "turns")} {
+			if err := os.MkdirAll(p, 0o700); err != nil {
+				if claim {
+					err = errors.Join(err, s.releaseClaimLocked(id))
+				}
+				err = errors.Join(err, removeMintedDir(createDir))
+				return "", fmt.Errorf("snapshot: create %s: %w", p, err)
+			}
+		}
+		meta.ID = id
+		if err := writeJSON(filepath.Join(createDir, "meta.json"), meta); err != nil {
+			if claim {
+				err = errors.Join(err, s.releaseClaimLocked(id))
+			}
+			err = errors.Join(err, removeMintedDir(createDir))
+			return "", fmt.Errorf("snapshot: write session meta: %w", err)
+		}
+		return id, nil
+	}
+	return "", fmt.Errorf("snapshot: could not mint a unique session id in %d attempts (collision or contention)", mintSessionIDMaxAttempts)
+}
+
+// removeMintedDir removes the reservation directory a failed mint created
+// under its create root, so the id can be drawn again and a lost mint leaves
+// nothing behind. It never removes the create root itself. Safe because
+// mintMu is held, the id appeared in no namespace, and nothing else can hold
+// a reference to a directory this call created moments earlier. A removal
+// failure is returned so the caller can join it onto the error it already
+// carries.
+func removeMintedDir(createDir string) error {
+	if err := os.RemoveAll(createDir); err != nil {
+		return fmt.Errorf("snapshot: remove %s: %w", createDir, err)
+	}
+	return nil
+}
+
+// sessionIDExistsAnywhere reports whether id is already present on disk in
+// either namespace of any project the store can see: the visible sessions
+// directories under each project and the staged candidates under
+// <project>/.staging/sessions/<nonce>. Staged candidates are deliberately
+// invisible to session enumeration but are already minted, so a scan of only
+// the visible directories cannot see them; the nonce is not known, only
+// enumerated. Only a store without a projects root (legacy and test stores)
+// falls back to scanning its own root instead.
+func (s *Store) sessionIDExistsAnywhere(id string) (bool, error) {
+	if s.projectsRoot != "" {
+		entries, err := os.ReadDir(s.projectsRoot)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		for _, e := range entries {
+			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			projectDir := filepath.Join(s.projectsRoot, e.Name())
+			used, err := sessionIDInNamespaces(filepath.Join(projectDir, "sessions"), projectDir, id)
+			if used || err != nil {
+				return used, err
+			}
+		}
+		return false, nil
+	}
+	if s.root != "" {
+		return sessionIDInNamespaces(s.root, filepath.Dir(s.root), id)
+	}
+	return false, nil
+}
+
+// scanPathMissing reports whether err means the scanned path cannot hold a
+// session id: the parent is missing, or a component is not a directory (Go
+// no longer folds ENOTDIR into os.IsNotExist). Either way the id is absent.
+func scanPathMissing(err error) bool {
+	return os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR)
+}
+
+// sessionIDInNamespaces reports whether id exists under visibleRoot (the
+// visible sessions namespace) or under any staged candidate at
+// <projectDir>/.staging/sessions/<nonce>/<id> — one level deeper in the same
+// per-project walk the lifecycle sweep performs.
+func sessionIDInNamespaces(visibleRoot, projectDir, id string) (bool, error) {
+	if _, err := os.Stat(filepath.Join(visibleRoot, id)); err == nil {
+		return true, nil
+	} else if !scanPathMissing(err) {
+		return false, err
+	}
+	stagingRoot := filepath.Join(projectDir, ".staging", "sessions")
+	nonces, err := os.ReadDir(stagingRoot)
+	if err != nil {
+		if scanPathMissing(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, n := range nonces {
+		if !n.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(stagingRoot, n.Name(), id)); err == nil {
+			return true, nil
+		} else if !scanPathMissing(err) {
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 func hashString(s string) string {

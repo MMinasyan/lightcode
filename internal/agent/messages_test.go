@@ -17,8 +17,8 @@ import (
 
 func TestSessionMessagesDoesNotRecoverCompleteActiveTurn(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1")
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	turn := a.store.BeginTurn()
 	if turn == 0 {
@@ -63,8 +63,8 @@ func TestSessionMessagesDoesNotRecoverCompleteActiveTurn(t *testing.T) {
 
 func TestSessionMessagesReadOnlyAfterCompactionBoundaryDoesNotRecoverActiveTurn(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1")
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	turn1 := a.store.BeginTurn()
 	completeMsg := message.NewText(message.RoleUser, "before compaction")
@@ -122,8 +122,8 @@ func TestSessionMessagesReadOnlyAfterCompactionBoundaryDoesNotRecoverActiveTurn(
 
 func TestSessionMessagesForReadOnlyDoesNotRecoverIncompleteOtherSession(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1")
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	parentID := a.SessionCurrent().ID
 	childStore, err := snapshot.NewForSessionsRoot(a.store.Root(), "", "")
@@ -239,8 +239,8 @@ func appendLegacyUnmarkedStagedEditTurn(t *testing.T, a *Agent, editArgs string,
 
 func TestSessionMessagesRendersCanonicalMessagesWithoutExtra(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession returned error: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession returned error: %v", err)
 	}
 	turn := a.store.BeginTurn()
 
@@ -294,8 +294,8 @@ func TestSessionMessagesRendersCanonicalMessagesWithoutExtra(t *testing.T) {
 
 func TestSessionMessagesRendersBackgroundProcessSystemSignal(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession returned error: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession returned error: %v", err)
 	}
 	turn := a.store.BeginTurn()
 	output := "final <output> & marker"
@@ -335,8 +335,8 @@ func TestSessionMessagesRendersBackgroundProcessSystemSignal(t *testing.T) {
 
 func TestSessionMessagesRendersGenericSystemSignalWithPrefix(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession returned error: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession returned error: %v", err)
 	}
 	turn := a.store.BeginTurn()
 
@@ -377,8 +377,8 @@ func TestSessionMessagesRendersGenericSystemSignalWithPrefix(t *testing.T) {
 
 func TestSessionMessagesRendersLiteralSystemSignalUserText(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession returned error: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession returned error: %v", err)
 	}
 	turn := a.store.BeginTurn()
 	backgroundLiteral := loop.SystemSignal(backgroundTerminalPayload(process.ExitEvent{
@@ -418,8 +418,8 @@ func TestSessionMessagesRendersLiteralSystemSignalUserText(t *testing.T) {
 
 func TestSessionMessagesUsesPersistedToolResultErrorMarker(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession returned error: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession returned error: %v", err)
 	}
 	turn := a.store.BeginTurn()
 	result := toolResult("call_1", "run_command", "plain failure output")
@@ -457,8 +457,8 @@ func TestSessionMessagesUsesPersistedToolResultErrorMarker(t *testing.T) {
 
 func TestSessionMessagesTreatsLegacyExecutePendingFailureSummariesAsErrors(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession returned error: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession returned error: %v", err)
 	}
 	turn := a.store.BeginTurn()
 	msgs := []message.Message{
@@ -494,8 +494,8 @@ func TestSessionMessagesTreatsLegacyExecutePendingFailureSummariesAsErrors(t *te
 
 func TestSessionMessagesAppliesStagedFlushOverlayToToolStub(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	args := `{"path":"file.txt","old_string":"a","new_string":"b"}`
 	realResult := "Edited file.txt (1 replacement, lines 1-2)."
@@ -546,8 +546,8 @@ func TestSessionMessagesAppliesStagedFlushOverlayToToolStub(t *testing.T) {
 
 func TestSessionMessagesAppliesLegacyUnmarkedStagedFlushOverlay(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	args := `{"path":"file.txt","old_string":"a","new_string":"b"}`
 	realResult := "Edited file.txt (1 replacement, lines 1-2)."
@@ -565,8 +565,8 @@ func TestSessionMessagesAppliesLegacyUnmarkedStagedFlushOverlay(t *testing.T) {
 
 func TestSessionMessagesStagedFlushOrphanIDIgnored(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	// Wrapper references an unknown tool_call id; the real call_1 has no entry.
 	args := `{"path":"file.txt","old_string":"a","new_string":"b"}`
@@ -585,8 +585,8 @@ func TestSessionMessagesStagedFlushOrphanIDIgnored(t *testing.T) {
 
 func TestSessionMessagesStagedFlushDoesNotOverlayAcrossTurns(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	turn1 := a.store.BeginTurn()
 	msgs := []message.Message{
@@ -638,8 +638,8 @@ func TestSessionMessagesStagedFlushDoesNotOverlayAcrossTurns(t *testing.T) {
 
 func TestSessionMessagesMalformedStagedFlushLeavesStubUntouched(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	turn := a.store.BeginTurn()
 	wrapper, ok := loop.NewStagedFlushMessage([]tool.BatchResult{{ToolCallID: "call_1", Result: "unused"}})
@@ -678,8 +678,8 @@ func TestSessionMessagesMalformedStagedFlushLeavesStubUntouched(t *testing.T) {
 
 func TestSessionMessagesRendersLiteralStagedFlushUserText(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	appendStagedEditTurn(t, a, `{"path":"file.txt","old_string":"a","new_string":"b"}`, []tool.BatchResult{{ToolCallID: "call_1", Result: "Edited file.txt (1 replacement, lines 1-2)."}})
 	turn := a.store.BeginTurn()

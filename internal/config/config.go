@@ -8,13 +8,16 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/permission"
 )
 
@@ -136,10 +139,7 @@ func defaultCompactionConfig() CompactionConfig {
 // with explicit cutover errors; no migration is attempted.
 func Load(path string) (*Config, error) {
 	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return nil, fmt.Errorf("create config dir: %w", err)
-		}
-		if err := os.WriteFile(path, []byte(emptyConfigTemplate), 0o600); err != nil {
+		if _, err := atomicfs.CreateExclusive(path, []byte(emptyConfigTemplate), 0o600); err != nil {
 			return nil, fmt.Errorf("create config %s: %w", path, err)
 		}
 	}
@@ -164,7 +164,7 @@ func Parse(data []byte) (*Config, error) {
 	}
 
 	var c Config
-	if err := json.Unmarshal(data, &c); err != nil {
+	if err := decodeJSONUseNumber(data, &c); err != nil {
 		return nil, err
 	}
 	if c.Providers == nil {
@@ -243,6 +243,22 @@ func Parse(data []byte) (*Config, error) {
 	}
 
 	return &c, nil
+}
+
+func decodeJSONUseNumber(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("unexpected trailing JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 func rejectOldShape(data []byte) error {

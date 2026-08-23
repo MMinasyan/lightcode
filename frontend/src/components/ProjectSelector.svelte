@@ -4,6 +4,18 @@
   import { errorText } from '../lib/errors.js';
   const dispatch = createEventDispatcher();
 
+  // App passes the presented state down: whether a snapshot has seeded the view and at
+  // what presentation generation. A switch captures it before calling the backend so its
+  // rejection classifies against what owned presentation at call time — not live props a
+  // boundary may already have moved on. This component never reads SessionCurrent: project
+  // identity is settled by the ordered navigation boundaries, and an out-of-band session
+  // lookup could resurrect a route a concurrent switch already left. `seeded` completes
+  // the shared three-prop capture interface; every ProjectSwitch frame is stateful, so no
+  // seed-specific disposition exists here — generation plus presented session settle it all.
+  export let seeded = false;
+  export let currentSessionId = '';
+  export let generation = 0;
+
   let projects = [];
   let loading = true;
   let currentPath = '';
@@ -14,20 +26,40 @@
       projects = await ProjectList() || [];
       const cur = await ProjectCurrent();
       currentPath = cur?.path || '';
-    } catch (e) { dispatch('error', errorText(e)); }
+    } catch (e) { dispatch('error', errorText(e)); } // ordinary load failure: no mutation ran, nothing to settle against — stays visible as-is.
     loading = false;
   }
 
   onMount(load);
 
+  // Every switch captures the presented state into its OWN lexical scope before calling the
+  // backend, so its rejection classifies against what owned presentation at ITS call time — not
+  // live props a boundary may already have moved on, and not whatever an overlapping action
+  // captured later.
+
+  // A rejected switch closes the selector (its list is stale against whatever ran durably, or
+  // about to be replaced) and surfaces an error only while nothing newer owns presentation: a
+  // committed ProjectSwitch fallback carries boundary+error pairs whose stateful snapshot wipes
+  // any transient shown first — so once generation has moved on past THIS action's capture, or
+  // the presented session itself changed since it (any navigation), this catch stays silent.
+  // Same-generation rejections are plain precommit failures with no backend frame at all, and stay
+  // sole here in seeded or unseeded views alike. cap = {gen, session} is lexical to one action:
+  // an overlapping switch settling before or after it changes nothing about this classification.
+  function settleSwitch(err, cap) {
+    dispatch('close');
+    if (generation === cap.gen && currentSessionId === cap.session) dispatch('error', errorText(err));
+  }
+
   async function pick(path) {
+    const cap = { gen: generation, session: currentSessionId || '' }; // this action's own capture — an overlapping call cannot overwrite it; every ProjectSwitch frame is stateful, so the disposition settles on generation+session alone (no seed-specific term exists here)
     try { await ProjectSwitch(path); dispatch('switched'); dispatch('close'); }
-    catch (e) { dispatch('error', errorText(e)); }
+    catch (e) { settleSwitch(e, cap); }
   }
 
   async function addProject() {
+    const cap = { gen: generation, session: currentSessionId || '' }; // same shared capture contract as pick — lexical to this action
     try { await ProjectPickAndSwitch(); dispatch('switched'); dispatch('close'); }
-    catch (e) { dispatch('error', errorText(e)); }
+    catch (e) { settleSwitch(e, cap); }
   }
 </script>
 

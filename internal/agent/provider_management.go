@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -158,6 +157,7 @@ func (a *Agent) ConnectProvider(providerID, apiKey string) error {
 		key            string
 		shouldPersist  bool
 		prov           *catalog.Provider
+		transport      catalog.Transport
 	}
 	var plan connectPlan
 	a.ensureRuntime().mu.Lock()
@@ -170,7 +170,17 @@ func (a *Agent) ConnectProvider(providerID, apiKey string) error {
 		a.ensureRuntime().mu.Unlock()
 		return fmt.Errorf("provider %q not found", providerID)
 	}
+	capturedTransport := prov.Transport
 	if prov.Transport.APIKeyEnv == "" {
+		current := a.catalog.Providers[providerID]
+		if current == nil {
+			a.ensureRuntime().mu.Unlock()
+			return fmt.Errorf("provider %q not found", providerID)
+		}
+		if !catalog.SameTransport(capturedTransport, current.Transport) {
+			a.ensureRuntime().mu.Unlock()
+			return fmt.Errorf("provider %s changed while connecting; retry", providerID)
+		}
 		err := a.reloadLockedNoRefresh()
 		a.ensureRuntime().mu.Unlock()
 		return err
@@ -185,9 +195,9 @@ func (a *Agent) ConnectProvider(providerID, apiKey string) error {
 			a.ensureRuntime().mu.Unlock()
 			return err
 		}
-		plan = connectPlan{needsDiscovery: true, apiKeyEnv: prov.Transport.APIKeyEnv, key: key, shouldPersist: shouldPersist, prov: prov}
+		plan = connectPlan{needsDiscovery: true, apiKeyEnv: prov.Transport.APIKeyEnv, key: key, shouldPersist: shouldPersist, prov: prov, transport: capturedTransport}
 	} else {
-		plan = connectPlan{apiKeyEnv: prov.Transport.APIKeyEnv, prov: prov}
+		plan = connectPlan{apiKeyEnv: prov.Transport.APIKeyEnv, prov: prov, transport: capturedTransport}
 	}
 	a.ensureRuntime().mu.Unlock()
 
@@ -202,9 +212,18 @@ func (a *Agent) ConnectProvider(providerID, apiKey string) error {
 		if usableDiscoveredModelCount(discovered) == 0 {
 			return fmt.Errorf("provider %q discovery returned no usable models", providerID)
 		}
-		// Phase 3: re-acquire lock, re-validate, persist.
+		if a.connectProviderBeforeFinalLock != nil {
+			a.connectProviderBeforeFinalLock()
+		}
+		// Phase 3: re-acquire lock, re-validate, persist. The final hold checks
+		// owner open before anything, publishes the discovery cache through a
+		// one-attempt Try (contention errors before env/reload), publishes the
+		// key through the guarded Try env sink, then reloads.
 		a.ensureRuntime().mu.Lock()
 		defer a.ensureRuntime().mu.Unlock()
+		if err := a.requireOwnerOpenLocked(); err != nil {
+			return err
+		}
 		if a.ensureRuntime().sessionLocked().busy {
 			return fmt.Errorf("cannot connect provider while a turn is running")
 		}
@@ -212,10 +231,19 @@ func (a *Agent) ConnectProvider(providerID, apiKey string) error {
 		if current == nil {
 			return fmt.Errorf("provider %q not found", providerID)
 		}
+		if !catalog.SameTransport(plan.transport, current.Transport) {
+			return fmt.Errorf("provider %s changed while connecting; retry", providerID)
+		}
 		if usableModelCount(current) > 0 {
 			// Another path populated models while we were fetching; skip cache write.
-		} else if err := catalog.WriteDiscoveryCache(a.home, providerID, discovered, time.Now().UTC()); err != nil {
-			return err
+		} else {
+			ok, err := catalog.TryWriteDiscoveryCache(a.home, providerID, plan.transport, discovered, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("discovery lock is held for %q; retry", providerID)
+			}
 		}
 		if plan.shouldPersist {
 			if err := a.setManagedKeyLocked(plan.apiKeyEnv, apiKey); err != nil {
@@ -225,11 +253,25 @@ func (a *Agent) ConnectProvider(providerID, apiKey string) error {
 		return a.reloadLockedNoRefresh()
 	}
 
-	// Non-discovery path: persist key and reload.
+	// Non-discovery path: persist key and reload. The final hold checks owner
+	// open, publishes the key through the guarded Try env sink, then reloads.
+	if a.connectProviderBeforeFinalLock != nil {
+		a.connectProviderBeforeFinalLock()
+	}
 	a.ensureRuntime().mu.Lock()
 	defer a.ensureRuntime().mu.Unlock()
+	if err := a.requireOwnerOpenLocked(); err != nil {
+		return err
+	}
 	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot connect provider while a turn is running")
+	}
+	current := a.catalog.Providers[providerID]
+	if current == nil {
+		return fmt.Errorf("provider %q not found", providerID)
+	}
+	if !catalog.SameTransport(plan.transport, current.Transport) {
+		return fmt.Errorf("provider %s changed while connecting; retry", providerID)
 	}
 	if apiKey != "" {
 		if err := a.setManagedKeyLocked(plan.apiKeyEnv, apiKey); err != nil {
@@ -274,6 +316,10 @@ func (a *Agent) resolveConnectKeyLocked(apiKeyEnv, apiKey string) (key string, s
 	return apiKey, true, nil
 }
 
+// setManagedKeyLocked persists one API key through the owner's guarded env
+// sink: the guard refuses after owner close and the env write is a single
+// one-attempt Try, so a foreign env-lock holder returns an operation error
+// instead of blocking a shutting-down owner. Caller holds runtime.mu.
 func (a *Agent) setManagedKeyLocked(apiKeyEnv, apiKey string) error {
 	if apiKeyEnv == "" || apiKey == "" {
 		return nil
@@ -281,7 +327,26 @@ func (a *Agent) setManagedKeyLocked(apiKeyEnv, apiKey string) error {
 	if a.env == nil {
 		return fmt.Errorf("managed env is not initialized")
 	}
-	return a.env.Set(apiKeyEnv, apiKey)
+	if err := a.requireOwnerOpenLocked(); err != nil {
+		return err
+	}
+	return a.env.TrySet(apiKeyEnv, apiKey)
+}
+
+// removeManagedKeyLocked removes one API key through the owner's guarded env
+// sink: the guard refuses after owner close and the env write is a single
+// one-attempt Try. Caller holds runtime.mu.
+func (a *Agent) removeManagedKeyLocked(apiKeyEnv string) error {
+	if apiKeyEnv == "" {
+		return nil
+	}
+	if a.env == nil {
+		return fmt.Errorf("managed env is not initialized")
+	}
+	if err := a.requireOwnerOpenLocked(); err != nil {
+		return err
+	}
+	return a.env.TryRemove(apiKeyEnv)
 }
 
 func fetchConnectDiscovery(ctx context.Context, client *http.Client, prov *catalog.Provider, apiKey string) (catalog.DiscoveredProvider, error) {
@@ -309,8 +374,13 @@ func cloneHeaders(in map[string]string) map[string]string {
 // It persists nothing. The network fetch runs outside runtime.mu so a stalled
 // endpoint cannot block other adapter calls.
 func (a *Agent) DiscoverCustomProvider(req CustomProviderRequest) ([]DiscoveryModelCandidate, error) {
-	// Phase 1: validate inputs under the lock.
+	// Phase 1: validate inputs under the lock. The write-free fetch refuses at
+	// entry after owner close; it publishes nothing, so it needs no final guard.
 	a.ensureRuntime().mu.Lock()
+	if a.ensureRuntime().closed {
+		a.ensureRuntime().mu.Unlock()
+		return nil, errOwnerClosed
+	}
 	if a.ensureRuntime().sessionLocked().busy {
 		a.ensureRuntime().mu.Unlock()
 		return nil, fmt.Errorf("cannot discover provider while a turn is running")
@@ -541,7 +611,7 @@ func (a *Agent) DisconnectProvider(providerID string) error {
 		}
 		return nil
 	}
-	if err := a.env.Remove(apiKeyEnv); err != nil {
+	if err := a.removeManagedKeyLocked(apiKeyEnv); err != nil {
 		return err
 	}
 	return a.reloadLockedNoRefresh()
@@ -626,7 +696,7 @@ func (a *Agent) mutateConfigRootLocked(mutate func(root map[string]any) error) e
 		return err
 	}
 	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
+	if err := decodeJSONUseNumber(data, &root); err != nil {
 		return fmt.Errorf("parse config %s: %w", a.configPath, err)
 	}
 	if root == nil {
@@ -635,7 +705,7 @@ func (a *Agent) mutateConfigRootLocked(mutate func(root map[string]any) error) e
 	if err := mutate(root); err != nil {
 		return err
 	}
-	return writeAgentConfigAtomic(a.configPath, root)
+	return a.writeAgentConfigLocked(root)
 }
 
 func providerRootMap(root map[string]any) (map[string]any, error) {

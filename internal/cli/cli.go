@@ -2,12 +2,15 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -15,6 +18,8 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
+	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 type cliState int
@@ -27,7 +32,11 @@ const (
 )
 
 type CLI struct {
+	// agent is the concrete local owner this adapter constructs and shuts down;
+	// owner is the same object typed for the concrete-only surface (ShutdownOwner).
+	// Most CLI code uses the AdapterService interface, so agent keeps that type.
 	agent agent.AdapterService
+	owner *agent.Agent
 	scope *agent.AdapterScope
 	out   io.Writer
 	mu    *sync.Mutex
@@ -35,25 +44,60 @@ type CLI struct {
 	viewOnce sync.Once
 	view     *agent.SessionView
 
-	width    int
+	width    atomic.Int32
 	oldState *term.State
 	rawFd    int
 
-	state     cliState
+	state     atomic.Int32
 	busy      bool
 	input     *inputLine
 	history   inputHistory
-	keyCh     chan keyMsg
-	events    chan agent.Event
-	exitCh    chan error
-	exitOnce  sync.Once
 	readKeyFn func() (keyMsg, error)
 	ctx       context.Context
 
+	// Exit latch: requestExit stores the exit error and closes exitLatch once. Every
+	// key read (mainLoop and nested menus) and mainLoop's select observe it, so a
+	// signal or stdin EOF unwinds all of them and reaches shutdown.
+	exitOnce  sync.Once
+	exitLatch chan struct{}
+	exitErr   error
+
+	// Key ingest spine: readKeys appends parsed keys here and wakes a reader; the key
+	// reader (mainLoop or a nested menu) pops without blocking on a bounded channel,
+	// so a stalled mainLoop can never wedge the reader mid-send. Closed on stdin EOF
+	// and host exit.
+	keyMu     sync.Mutex
+	keyFrames []keyMsg
+	keyWake   chan struct{}
+	keyClosed bool
+
+	// Delivery spine: one FIFO of closures carrying owner events and async-operation
+	// results, drained by mainLoop, which is the sole drainer and sole terminal
+	// writer. Producers (the owner callback, op-group members) only append and wake;
+	// they never render. A synchronous owner call may append more than the former
+	// bounded channel held while mainLoop is stalled, so appending never waits for
+	// queue capacity or for mainLoop to drain — only for the queue mutex, behind
+	// another producer or mainLoop's own drain.
+	eventMu     sync.Mutex
+	eventFrames []func()
+	eventWake   chan struct{}
+	eventClosed bool
+
+	// Async op-group: submit, compact, and the clipboard fallback run here. spawnOp
+	// admits and starts a member unless closed; each runs on the adapter context and
+	// posts its result to the delivery FIFO. Close sets closed under opMu before the
+	// join, so an admitting Add cannot race the shutdown Wait.
+	opMu     sync.Mutex
+	opClosed bool
+	opWG     sync.WaitGroup
+
 	modelRef string
 
-	animStop  chan struct{}
-	animLabel string
+	// Animation state rendered by mainLoop's ticker case; there is no spinner
+	// goroutine, so mainLoop stays the sole terminal writer.
+	animActive bool
+	animLabel  string
+	animFrame  int
 
 	streamStarted       bool
 	streamDisplayActive bool
@@ -88,23 +132,191 @@ type CLI struct {
 	lastWarningSnapshot map[string]bool
 }
 
-func New(a agent.AdapterService) *CLI {
+func New(a *agent.Agent) *CLI {
 	c := &CLI{
-		agent:               a,
 		out:                 os.Stdout,
 		mu:                  &sync.Mutex{},
 		input:               newInputLine(),
 		history:             newInputHistory(),
-		keyCh:               make(chan keyMsg, 64),
-		events:              make(chan agent.Event, 256),
-		exitCh:              make(chan error, 1),
-		width:               80,
+		keyWake:             make(chan struct{}, 1),
+		eventWake:           make(chan struct{}, 1),
+		exitLatch:           make(chan struct{}),
 		lastWarningSnapshot: make(map[string]bool),
 	}
+	c.width.Store(int32(80))
+	// A nil concrete agent must leave the interface field nil (not an interface
+	// wrapping a nil pointer), so tests that construct a headless CLI still see no
+	// owner.
 	if a != nil {
+		c.agent = a
+		c.owner = a
 		c.scope = agent.NewAdapterScope(a, a.ProjectRoot())
 	}
 	return c
+}
+
+// enqueueItem appends one delivery closure and wakes mainLoop. It never blocks or
+// renders, so it is safe to call from the owner's event callback (while a synchronous
+// owner call is in flight and mainLoop is stalled) or from an op-group member.
+func (c *CLI) enqueueItem(item func()) {
+	c.eventMu.Lock()
+	if c.eventClosed {
+		c.eventMu.Unlock()
+		return
+	}
+	c.eventFrames = append(c.eventFrames, item)
+	c.eventMu.Unlock()
+	select {
+	case c.eventWake <- struct{}{}:
+	default:
+	}
+}
+
+// enqueueEvent posts one owner event to the delivery FIFO.
+func (c *CLI) enqueueEvent(ev agent.Event) {
+	c.enqueueItem(func() { c.handleEvent(ev) })
+}
+
+// enqueuePost posts one async-operation result to the delivery FIFO, so it renders
+// on mainLoop's goroutine in order with owner events rather than from the member's
+// own goroutine.
+func (c *CLI) enqueuePost(render func()) {
+	c.enqueueItem(render)
+}
+
+// drainEvents runs every queued delivery closure in FIFO order. It runs on
+// mainLoop's goroutine and pops under eventMu but runs each closure (which takes the
+// render mutex) without holding it, so producers can keep appending while items run.
+func (c *CLI) drainEvents() {
+	for {
+		c.eventMu.Lock()
+		if len(c.eventFrames) == 0 {
+			c.eventMu.Unlock()
+			return
+		}
+		item := c.eventFrames[0]
+		c.eventFrames = c.eventFrames[1:]
+		c.eventMu.Unlock()
+		item()
+	}
+}
+
+// spawnOp admits and starts one async op unless the op-group is closed. The op runs
+// on the adapter context and must post any result to the delivery FIFO via
+// enqueuePost, never rendering from its own goroutine.
+func (c *CLI) spawnOp(fn func()) bool {
+	c.opMu.Lock()
+	if c.opClosed {
+		c.opMu.Unlock()
+		return false
+	}
+	c.opWG.Add(1)
+	c.opMu.Unlock()
+	go func() {
+		defer c.opWG.Done()
+		fn()
+	}()
+	return true
+}
+
+// closeOpAdmission rejects further ops under opMu, so no new member starts after it
+// returns. The Run teardown then cancels the adapter context (releasing members
+// blocked in owner calls) and joins opWG; because admission closed under opMu first,
+// no admitting Add can race that Wait.
+func (c *CLI) closeOpAdmission() {
+	c.opMu.Lock()
+	c.opClosed = true
+	c.opMu.Unlock()
+}
+
+// closeEvents rejects further owner events and discards whatever is still queued.
+// Shutdown joins the owner before calling it, so a cancelled turn's terminal events
+// are admitted during the join rather than dropped at admission. The discard of the
+// already-queued backlog is deliberate, unlike the protocol host's close, which
+// drains its backlog because its client process is still reading the pipe: mainLoop
+// has already returned by teardown and the teardown never calls drainEvents again,
+// so nothing queued here would ever be rendered.
+func (c *CLI) closeEvents() {
+	c.eventMu.Lock()
+	c.eventClosed = true
+	c.eventFrames = nil
+	c.eventMu.Unlock()
+}
+
+// enqueueKey appends one parsed key and wakes a reader. It never blocks, so a
+// stalled mainLoop cannot wedge the key reader in a send and keep it from its next
+// stdin read.
+func (c *CLI) enqueueKey(k keyMsg) {
+	c.keyMu.Lock()
+	if c.keyClosed {
+		c.keyMu.Unlock()
+		return
+	}
+	c.keyFrames = append(c.keyFrames, k)
+	c.keyMu.Unlock()
+	select {
+	case c.keyWake <- struct{}{}:
+	default:
+	}
+}
+
+// popKey removes the next buffered key, reporting whether one was available. Once
+// the exit latch is set it reports empty even with keys buffered, so mainLoop and
+// nested menus stop dequeuing and unwind to shutdown; the latch check is under keyMu,
+// so it is atomic with requestExit's latch close and no key is dequeued after exit.
+// This is the exit's "stop ingress" boundary: a key already dequeued when the latch
+// closes completes its handling (pop and handling cannot be atomic — handling blocks
+// on nested menus and owner calls), then the next read observes the latch and unwinds.
+func (c *CLI) popKey() (keyMsg, bool) {
+	c.keyMu.Lock()
+	defer c.keyMu.Unlock()
+	select {
+	case <-c.exitLatch:
+		return keyMsg{}, false
+	default:
+	}
+	if len(c.keyFrames) == 0 {
+		return keyMsg{}, false
+	}
+	k := c.keyFrames[0]
+	c.keyFrames = c.keyFrames[1:]
+	return k, true
+}
+
+// closeKeys rejects further keys and wakes any waiting reader so it re-checks and
+// observes the exit latch. Called on stdin EOF and at host exit.
+func (c *CLI) closeKeys() {
+	c.keyMu.Lock()
+	c.keyClosed = true
+	c.keyMu.Unlock()
+	select {
+	case c.keyWake <- struct{}{}:
+	default:
+	}
+}
+
+// nextKey is the single key source shared by mainLoop and every nested menu. popKey
+// enforces exit priority (it reports empty once the latch is set), so a returned key
+// is always one the exit latch had not yet claimed; otherwise nextKey reports the
+// exit error, or the context error on cancellation.
+func (c *CLI) nextKey(ctx context.Context) (keyMsg, error) {
+	for {
+		if k, ok := c.popKey(); ok {
+			return k, nil
+		}
+		select {
+		case <-c.exitLatch:
+			return keyMsg{}, c.exitErr
+		default:
+		}
+		select {
+		case <-c.keyWake:
+		case <-c.exitLatch:
+			return keyMsg{}, c.exitErr
+		case <-ctx.Done():
+			return keyMsg{}, ctx.Err()
+		}
+	}
 }
 
 type ExitError struct {
@@ -121,7 +333,13 @@ func (e ExitError) ExitCode() int {
 
 func (c *CLI) requestExit(err error) {
 	c.exitOnce.Do(func() {
-		c.exitCh <- err
+		// Close the latch under keyMu so it is atomic with popKey's latch check: a
+		// key read either observes the open latch and pops, or observes the closed
+		// latch and unwinds — never pops a key after exit was requested.
+		c.keyMu.Lock()
+		c.exitErr = err
+		close(c.exitLatch)
+		c.keyMu.Unlock()
 	})
 }
 
@@ -132,6 +350,25 @@ func (c *CLI) sv() *agent.SessionView {
 
 func (c *CLI) setCurrentSessionID(id string) {
 	c.sv().SetCurrent(id)
+	// A selection commit replaces the source; any busy/streaming/compacting
+	// presentation the CLI carried belonged to the previous current, whose
+	// terminal events are now filtered. The reservation proved the source
+	// idle or the commit could not have happened, so the presentation
+	// returns to idle and the destination's own turn events drive it from
+	// here. The reset is unconditional: a compact in flight sets no stream
+	// fields, so a guard on them would leave the compacting state, the
+	// streaming state, and the spinner stuck on the destination.
+	c.mu.Lock()
+	c.busy = false
+	c.streamStarted = false
+	c.streamDisplayActive = false
+	c.streamBuf.Reset()
+	c.streamVisibleBuf.Reset()
+	c.streamNeedsNL = false
+	c.compacting = false
+	c.state.Store(int32(stateIdle))
+	c.stopAnimationLocked()
+	c.mu.Unlock()
 }
 
 func (c *CLI) currentSessionID() string {
@@ -157,7 +394,8 @@ func (c *CLI) acceptsSessionEvent(sessionID string) bool {
 }
 
 func (c *CLI) acceptsEvent(ev agent.Event) bool {
-	return c.sv().AcceptsEvent(ev)
+	v := c.sv()
+	return v.AcceptsEventForCurrent(v.Current(), ev)
 }
 
 func (c *CLI) acceptsSubagentEvent(ev agent.Event) bool {
@@ -197,7 +435,7 @@ func (c *CLI) sessionMessages() []agent.DisplayMessage {
 	if id == "" {
 		return nil
 	}
-	if _, err := c.agent.SessionSummaryForSession(id); err != nil {
+	if _, err := c.agent.SessionSummaryForSessionOrPersisted(id); err != nil {
 		c.setCurrentSessionID("")
 		return nil
 	}
@@ -241,142 +479,244 @@ func (c *CLI) Run(ctx context.Context) error {
 	defer c.restoreTerminal()
 
 	if w, _, err := term.GetSize(rawFd); err == nil && w > 0 {
-		c.width = w
+		c.setWidth(w)
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
-	go func() {
-		for {
-			select {
-			case sig := <-sigCh:
-				switch sig {
-				case syscall.SIGWINCH:
-					if w, _, err := term.GetSize(rawFd); err == nil && w > 0 {
-						c.mu.Lock()
-						c.width = w
-						c.mu.Unlock()
-					}
-				case syscall.SIGINT:
-					c.mu.Lock()
-					st := c.state
-					c.mu.Unlock()
-					if st == stateStreaming || st == statePermission {
-						c.cancelCurrent()
-					} else {
-						fmt.Fprint(os.Stdout, "\r\n\x1b[?25h")
-						c.requestExit(ExitError{Code: 130})
-					}
-				case syscall.SIGTERM:
-					fmt.Fprint(os.Stdout, "\r\n\x1b[?25h")
-					c.requestExit(ExitError{Code: 130})
-				}
-			case <-ctx.Done():
-				return
-			}
+	c.agent.SetEventHandler(c.enqueueEvent)
+
+	startupErr := c.initializeSession(ctx)
+	return c.runInteractive(ctx, func() {
+		if startupErr != nil {
+			c.printLine(renderErrorMsg(startupErr.Error()))
 		}
-	}()
-
-	c.ctx = ctx
-	c.readKeyFn = func() (keyMsg, error) {
-		select {
-		case k := <-c.keyCh:
-			return k, nil
-		case <-ctx.Done():
-			return keyMsg{}, ctx.Err()
+		c.printHeader()
+		for _, m := range c.messages {
+			c.printDisplayEntry(m)
 		}
-	}
+		c.printInputPrompt()
+	}, os.Stdin)
+}
 
-	c.agent.SetEventHandler(func(ev agent.Event) {
-		c.events <- ev
-	})
-
-	c.agent.Init(ctx)
-	if detach := c.attachAdapter(ctx); detach != nil {
-		defer detach()
-	}
-	sessionID := ""
-	if sessions, err := c.scope.SessionList("active"); err == nil && len(sessions) > 0 {
-		if summary, err := c.agent.OpenSession(sessions[0].ID); err == nil {
-			sessionID = summary.ID
-		}
-	}
+// initializeSession performs owner startup and prepares the first terminal
+// view. A committed creation keeps its returned destination selected before the
+// startup error is rendered; plain failure keeps the prior selection.
+func (c *CLI) initializeSession(ctx context.Context) error {
+	sessionID := c.agent.Init(ctx)
+	var startupErr error
 	if sessionID == "" {
-		if id, err := c.scope.NewSession("primary"); err == nil {
+		id, err := c.scope.NewSession("primary")
+		if err != nil {
+			startupErr = err
+			var committed *snapshot.CommittedMutationError
+			if id != "" && errors.As(err, &committed) {
+				startupErr = err
+				sessionID = id
+			}
+		} else {
 			sessionID = id
 		}
 	}
 	c.setCurrentSessionID(sessionID)
-
 	c.refreshState()
-
-	msgs := c.sessionMessages()
-	c.messages = buildDisplayMsgs(msgs)
+	c.messages = buildDisplayMsgs(c.sessionMessages())
 	c.seedInputHistory()
-
-	c.printHeader()
-
-	for _, m := range c.messages {
-		c.printDisplayEntry(m)
-	}
-
-	c.printInputPrompt()
-
-	go c.readKeys(ctx)
-
-	return c.mainLoop(ctx)
+	return startupErr
 }
 
-func (c *CLI) attachAdapter(ctx context.Context) func() {
-	lifecycle, ok := c.agent.(interface {
-		AttachAdapter(context.Context) error
-		DetachAdapter(context.Context) error
-	})
-	if !ok {
-		return nil
+// runInteractive runs the terminal session: signal observation, the key
+// reader, and mainLoop are established before the startup presentation runs
+// (mainLoop's first action), so the sole terminal writer is the abandonable
+// main-loop goroutine and SIGTERM or stdin EOF can start owner cleanup even
+// while a startup write is blocked. It observes mainLoop's completion or the
+// exit latch, then performs the host teardown order without waiting for an
+// abandoned blocked writer.
+func (c *CLI) runInteractive(ctx context.Context, startup func(), input io.Reader) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Signals are split by kind: every signal that can independently require
+	// its own action gets its own registration and channel, so a full
+	// channel can only drop another of the same signal — one of that kind is
+	// already queued and will be acted on. No capacity on a shared channel
+	// closes the loss, because signals that do not terminate can fill it:
+	// two queued cancelling interrupts would drop the terminate behind them.
+	// The interrupt channel holds two so a cancel-then-exit double press
+	// survives a delivery window; the others need one, since a dropped
+	// duplicate is already covered by the queued instance.
+	resizeCh := make(chan os.Signal, 1)
+	signal.Notify(resizeCh, syscall.SIGWINCH)
+	intCh := make(chan os.Signal, 2)
+	signal.Notify(intCh, syscall.SIGINT)
+	termCh := make(chan os.Signal, 1)
+	signal.Notify(termCh, syscall.SIGTERM)
+	go c.watchSignals(termCh, intCh, resizeCh, ctx)
+
+	c.ctx = ctx
+	c.readKeyFn = func() (keyMsg, error) { return c.nextKey(ctx) }
+
+	go c.readKeysFrom(input)
+
+	// mainLoop runs on its own goroutine: a terminal write can block forever
+	// (stdout stopped being read) and teardown must not sit behind it. Only
+	// mainLoop is abandoned in that one blocked write; the op-group and the
+	// owner are still joined below.
+	mainDone := make(chan error, 1)
+	go func() { mainDone <- c.mainLoop(ctx, startup) }()
+
+	var err error
+	select {
+	case err = <-mainDone:
+	case <-c.exitLatch:
+		err = c.exitErr
 	}
-	if err := lifecycle.AttachAdapter(ctx); err != nil {
-		return nil
+
+	// Teardown in the one host-shutdown order: stop ingress (close key and
+	// op-group admission), cancel the input/signal goroutines and release
+	// members blocked in owner calls, join the owner so a cancelled turn's
+	// terminal events are still admitted, join the op-group members, then
+	// close delivery. restoreTerminal runs via the deferred cleanup in Run,
+	// after the owner join.
+	c.closeKeys()
+	c.closeOpAdmission()
+	cancel()
+	if c.owner != nil {
+		// An abandoned shutdown means work is still in flight when the host
+		// exits; fold that into the returned error so a script driving this
+		// process detects it from the exit code.
+		if !c.owner.ShutdownOwner() {
+			err = foldAbandonedShutdown(err)
+		}
 	}
-	return func() {
-		_ = lifecycle.DetachAdapter(context.Background())
-	}
+	c.opWG.Wait()
+	c.closeEvents()
+	return err
 }
 
-func (c *CLI) readKeys(ctx context.Context) {
-	var buf [256]byte
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
+// foldAbandonedShutdown folds the abandoned-shutdown report onto the error
+// Run is about to return, so a script driving this process detects the
+// abandonment from the exit code. The fold must force a non-zero exit and
+// never lower or overwrite a non-zero one already present: when the existing
+// error carries a non-zero ExitError (a signal), the message joins after it
+// and the code survives; otherwise ExitError{Code: 1} joins ahead of it, so
+// the exit-code selector reaches the forced code first.
+func foldAbandonedShutdown(err error) error {
+	var exit ExitError
+	if errors.As(err, &exit) && exit.Code != 0 {
+		return errors.Join(err, fmt.Errorf("owner shutdown abandoned in-flight work"))
+	}
+	return errors.Join(ExitError{Code: 1}, fmt.Errorf("owner shutdown abandoned in-flight work"), err)
+}
+
+// handleSignal decides the host's response to one signal on the watcher
+// goroutine. It never writes the terminal and never takes the render lock:
+// a stalled write holds that lock, and any branch that waits on it strands
+// every later signal, including the one that would trigger the exit. Exit
+// unwinds through requestExit.
+func (c *CLI) handleSignal(sig os.Signal) {
+	switch sig {
+	case syscall.SIGWINCH:
+		if w, _, err := term.GetSize(c.rawFd); err == nil && w > 0 {
+			c.setWidth(w)
 		}
-		n, err := os.Stdin.Read(buf[:])
-		if err != nil {
-			return
-		}
-		keys := parseInputBytes(buf[:n])
-		for _, k := range keys {
-			select {
-			case c.keyCh <- k:
-			case <-ctx.Done():
+	case syscall.SIGINT:
+		// Admission authority is the owner's live busy unit, not the CLI's
+		// delayed presentation states: an owner-busy turn must be cancelled
+		// and the host stay open even while turn_start is still queued
+		// undrained. The concrete owner method inspects only the exact
+		// selected live session; idle, empty, missing, and read-only
+		// selections fall through to exit 130. This branch never writes the
+		// terminal and never takes the render lock.
+		if id := c.sv().Current(); id != "" && c.owner != nil {
+			if cancelled, _ := c.owner.CancelBusySession(id); cancelled {
 				return
 			}
 		}
+		c.requestExit(ExitError{Code: 130})
+	case syscall.SIGTERM:
+		c.requestExit(ExitError{Code: 130})
 	}
 }
 
-func (c *CLI) mainLoop(ctx context.Context) error {
+// watchSignals services the signal channels until the host context ends:
+// every signal that can independently require its own action has its own
+// channel, so a full channel can only drop another of the same signal. One
+// watcher, one loop.
+func (c *CLI) watchSignals(termCh, intCh, resizeCh <-chan os.Signal, ctx context.Context) {
 	for {
 		select {
-		case k := <-c.keyCh:
-			if err := c.handleKey(k); err != nil {
-				return err
+		case sig := <-termCh:
+			c.handleSignal(sig)
+		case sig := <-intCh:
+			c.handleSignal(sig)
+		case sig := <-resizeCh:
+			c.handleSignal(sig)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// readKeysFrom parses keys from input until EOF or the host context ends.
+// On EOF it sets the exit latch BEFORE closing key admission, so the wake
+// closeKeys issues can never let mainLoop or a nested menu pop and act on a
+// buffered key while the latch still looks open. Production passes os.Stdin;
+// tests pass a pipe.
+func (c *CLI) readKeysFrom(input io.Reader) {
+	var buf [256]byte
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
+		n, err := input.Read(buf[:])
+		if err != nil {
+			// stdin ended: set the exit latch BEFORE closing key admission, so the
+			// wake closeKeys issues can never let mainLoop or a nested menu pop and
+			// act on a buffered key while the latch still looks open. The latch is
+			// established first, so a full key backlog unwinds to shutdown instead.
+			c.requestExit(ExitError{Code: 0})
+			c.closeKeys()
+			return
+		}
+		for _, k := range parseInputBytes(buf[:n]) {
+			c.enqueueKey(k)
+		}
+	}
+}
+
+// mainLoop is the sole terminal writer. Its first action is the prepared
+// startup presentation closure (header, restored history, prompt), so startup
+// output runs on the same abandonable goroutine as every later write and
+// cannot precede the exit authority runInteractive established; then it
+// services keys, owner events, the animation ticker, the exit latch, and the
+// host context.
+func (c *CLI) mainLoop(ctx context.Context, startup func()) error {
+	if startup != nil {
+		startup()
+	}
+	anim := time.NewTicker(80 * time.Millisecond)
+	defer anim.Stop()
+	for {
+		select {
+		case <-c.keyWake:
+			// Drain buffered keys. popKey reports empty once the exit latch is set,
+			// so this loop stops draining at exit and the outer select returns.
+			for {
+				k, ok := c.popKey()
+				if !ok {
+					break
+				}
+				if err := c.handleKey(k); err != nil {
+					return err
+				}
 			}
-		case ev := <-c.events:
-			c.handleEvent(ev)
-		case err := <-c.exitCh:
-			return err
+		case <-c.eventWake:
+			c.drainEvents()
+		case <-anim.C:
+			c.tickAnimation()
+		case <-c.exitLatch:
+			return c.exitErr
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -384,13 +724,13 @@ func (c *CLI) mainLoop(ctx context.Context) error {
 }
 
 func (c *CLI) handleKey(k keyMsg) error {
-	switch c.state {
+	switch cliState(c.state.Load()) {
 	case stateIdle:
 		return c.handleKeyIdle(k)
 	case stateStreaming:
 		c.handleKeyStreaming(k)
 	case statePermission:
-		c.handleKeyPermission(k)
+		return c.handleKeyPermission(k)
 	case stateMenu:
 	}
 	return nil
@@ -540,9 +880,9 @@ func (c *CLI) handleKeyStreaming(k keyMsg) {
 	}
 }
 
-func (c *CLI) handleKeyPermission(k keyMsg) {
+func (c *CLI) handleKeyPermission(k keyMsg) error {
 	if len(c.permQueue) == 0 {
-		return
+		return nil
 	}
 
 	req := c.permQueue[0]
@@ -553,19 +893,18 @@ func (c *CLI) handleKeyPermission(k keyMsg) {
 			c.permSelected--
 			c.redrawPermissionBlock(req)
 		}
-		return
+		return nil
 	case keyDown:
 		if c.permSelected < permissionActionCount(req)-1 {
 			c.permSelected++
 			c.redrawPermissionBlock(req)
 		}
-		return
+		return nil
 	case keyEnter:
-		c.choosePermission(req)
-		return
+		return c.choosePermission(req)
 	case keyCtrlC, keyEscape:
 		c.popAndRespond(req, false)
-		return
+		return nil
 	}
 
 	switch k.Rune {
@@ -575,19 +914,20 @@ func (c *CLI) handleKeyPermission(k keyMsg) {
 		c.popAndRespond(req, false)
 	case 'p', 'P':
 		if !req.DisableProjectSave {
-			c.showPermissionSuggestions(req)
+			return c.showPermissionSuggestions(req)
 		}
 	case 'a', 'A':
 		if req.CanAllowAll {
 			c.popAndRespondAction(req, "allow_all")
 		}
 	}
+	return nil
 }
 
-func (c *CLI) choosePermission(req *agent.PermissionRequest) {
+func (c *CLI) choosePermission(req *agent.PermissionRequest) error {
 	actions := permissionActions(req)
 	if c.permSelected < 0 || c.permSelected >= len(actions) {
-		return
+		return nil
 	}
 	action, _ := actions[c.permSelected].extra.(string)
 	switch action {
@@ -596,10 +936,11 @@ func (c *CLI) choosePermission(req *agent.PermissionRequest) {
 	case "deny":
 		c.popAndRespond(req, false)
 	case "project":
-		c.showPermissionSuggestions(req)
+		return c.showPermissionSuggestions(req)
 	case "allow_all":
 		c.popAndRespondAction(req, "allow_all")
 	}
+	return nil
 }
 
 func (c *CLI) popAndRespond(req *agent.PermissionRequest, allow bool) {
@@ -612,18 +953,34 @@ func (c *CLI) popAndRespond(req *agent.PermissionRequest, allow bool) {
 
 func (c *CLI) popAndRespondAction(req *agent.PermissionRequest, action string) {
 	c.mu.Lock()
-	c.erasePermissionBlockLocked()
-	c.advancePermissionQueueLocked()
+	stillDisplayed := len(c.permQueue) > 0 && c.permQueue[0].ID == req.ID
 	c.mu.Unlock()
+
+	if stillDisplayed {
+		// The prompt is on screen: deliver the answer as it advances the display.
+		c.mu.Lock()
+		c.erasePermissionBlockLocked()
+		c.advancePermissionQueueLocked()
+		c.mu.Unlock()
+	}
 
 	sessionID, err := c.resolveSessionID(req.SessionID)
 	if err != nil {
 		return
 	}
-	_ = c.agent.RespondPermissionActionForSession(sessionID, req.ID, action)
+	if err := c.agent.RespondPermissionActionForSession(sessionID, req.ID, action); err != nil {
+		if errors.Is(err, permission.ErrUnknownRequest) {
+			// The answered id can only have come from a prompt this host was
+			// given — the queue's only writer is the request event — so an
+			// unknown-request outcome means the prompt was resolved underneath
+			// the user. Benign.
+			return
+		}
+		c.printLine(renderErrorMsg(err.Error()))
+	}
 }
 
-func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
+func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) error {
 	suggestArg := req.Arg
 	if req.ResolvedArg != "" {
 		suggestArg = req.ResolvedArg
@@ -645,7 +1002,7 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 	if err != nil {
 		c.printLine(renderErrorMsg(err.Error()))
 		c.printPermissionBlock(req)
-		return
+		return nil
 	}
 	if len(suggestions) == 0 {
 		c.mu.Lock()
@@ -653,7 +1010,7 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 		c.mu.Unlock()
 		c.printLine(renderErrorMsg("no suggestions available"))
 		c.printPermissionBlock(req)
-		return
+		return nil
 	}
 
 	c.mu.Lock()
@@ -685,33 +1042,51 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) {
 	for {
 		k, err := c.readKeyFn()
 		if err != nil {
-			c.popAndRespond(req, false)
-			return
+			// The key read reports the exit error once the exit latch is set.
+			// Abort and return it rather than answering: a terminal exit must
+			// not be recorded as a deny the user never made.
+			return err
 		}
 
 		switch k.Special {
 		case keyEscape, keyCtrlC:
 			eraseSuggestions()
 			c.printPermissionBlock(req)
-			return
+			return nil
 		case keyEnter:
 			patterns := []string{suggestions[selected].Rule}
 			eraseSuggestions()
+			c.mu.Lock()
+			stillDisplayed := len(c.permQueue) > 0 && c.permQueue[0].ID == req.ID
+			c.mu.Unlock()
 			sessionID, err := c.resolveSessionID(req.SessionID)
 			if err != nil {
 				c.printLine(renderErrorMsg(err.Error()))
-				c.printPermissionBlock(req)
-				return
+				if stillDisplayed {
+					c.printPermissionBlock(req)
+				}
+				return nil
 			}
 			if err := c.agent.SaveProjectPermissionForSession(sessionID, req.ID, patterns); err != nil {
+				if errors.Is(err, permission.ErrUnknownRequest) {
+					// Same soundness as the answer path: the saved id can only
+					// have come from a prompt this host was given, so an
+					// unknown-request outcome means it was resolved underneath
+					// the user. Benign.
+					return nil
+				}
 				c.printLine(renderErrorMsg(err.Error()))
-				c.printPermissionBlock(req)
-				return
+				if stillDisplayed {
+					c.printPermissionBlock(req)
+				}
+				return nil
 			}
-			c.mu.Lock()
-			c.advancePermissionQueueLocked()
-			c.mu.Unlock()
-			return
+			if stillDisplayed {
+				c.mu.Lock()
+				c.advancePermissionQueueLocked()
+				c.mu.Unlock()
+			}
+			return nil
 		case keyUp:
 			if selected > 0 {
 				selected--
@@ -760,7 +1135,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 	case agent.EventTurnStart:
 		c.stopAnimationLocked()
 		c.busy = true
-		c.state = stateStreaming
+		c.state.Store(int32(stateStreaming))
 		c.streamStarted = false
 		c.streamDisplayActive = false
 		c.streamBuf.Reset()
@@ -834,7 +1209,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 					c.writeRaw(renderToolCall(ev.ToolName, ev.Args, ev.Metadata))
 				}
 			}
-			c.writeRaw(renderToolResult(ev.ToolName, ev.Args, ev.Result, !ev.IsError, c.toolExpanded, c.width, ev.Metadata))
+			c.writeRaw(renderToolResult(ev.ToolName, ev.Args, ev.Result, !ev.IsError, c.toolExpanded, int(c.width.Load()), ev.Metadata))
 		} else {
 			// Late completion (e.g. a staged-flush result arriving at turn end,
 			// far below its row): render a fresh block without cursor-relative
@@ -847,7 +1222,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			}
 			c.writeRaw("\r\x1b[2K")
 			c.writeRaw(renderToolCall(name, args, meta))
-			c.writeRaw(renderToolResult(name, args, ev.Result, !ev.IsError, c.toolExpanded, c.width, meta))
+			c.writeRaw(renderToolResult(name, args, ev.Result, !ev.IsError, c.toolExpanded, int(c.width.Load()), meta))
 		}
 		c.writeRaw(nl)
 		if c.busy {
@@ -880,7 +1255,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			bg:      ev.BackgroundProcess,
 		})
 		c.writeRaw(renderBackgroundProcessCall(ev.BackgroundProcess, success))
-		if result := renderToolResult("background_process", "", ev.Result, success, c.toolExpanded, c.width, nil); result != "" {
+		if result := renderToolResult("background_process", "", ev.Result, success, c.toolExpanded, int(c.width.Load()), nil); result != "" {
 			c.writeRaw(result)
 			c.writeRaw(nl)
 		}
@@ -905,7 +1280,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			content: ev.Result,
 			turn:    ev.Turn,
 		})
-		c.printLineLocked(renderUserMsg(ev.Result, c.width))
+		c.printLineLocked(renderUserMsg(ev.Result, int(c.width.Load())))
 		if c.busy {
 			c.startAnimationLocked("Thinking")
 		}
@@ -952,7 +1327,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			c.finalizeStreamBufLocked()
 		}
 		c.busy = false
-		c.state = stateIdle
+		c.state.Store(int32(stateIdle))
 		c.streamStarted = false
 		c.streamDisplayActive = false
 		c.permQueue = nil
@@ -961,11 +1336,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.permFrame = transientMenuFrame{}
 		// Queue draining is backend-owned: the agent auto-drains after the turn
 		// ends and emits turn_start for the next turn. The CLI just re-prompts.
-		if ev.RefreshSession {
-			c.refreshSessionLocked()
-		} else {
-			c.printInputPromptLocked()
-		}
+		c.printInputPromptLocked()
 
 	case agent.EventError:
 		c.activeToolID = ""
@@ -974,7 +1345,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.writeRaw("\r\x1b[2K")
 		c.writeRaw(renderErrorMsg(ev.Error))
 		c.busy = false
-		c.state = stateIdle
+		c.state.Store(int32(stateIdle))
 		c.printInputPromptLocked()
 
 	case agent.EventPermissionRequest:
@@ -983,9 +1354,34 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.writeRaw("\r\x1b[2K")
 		c.permQueue = append(c.permQueue, ev.PermReq)
 		if len(c.permQueue) == 1 {
-			c.state = statePermission
+			c.state.Store(int32(statePermission))
 			c.permSelected = 0
 			c.printPermissionBlockLocked(ev.PermReq)
+		}
+
+	case agent.EventPermissionResolved:
+		// The backend removed a pending request (answered or cancelled). Drop the
+		// matching entry so a cancelled prompt is not still shown — and answerable —
+		// until turn end, and redraw the head when the removed entry was shown.
+		if ev.PermReq == nil {
+			return
+		}
+		for i, req := range c.permQueue {
+			if req == nil || req.ID != ev.PermReq.ID {
+				continue
+			}
+			c.permQueue = append(c.permQueue[:i], c.permQueue[i+1:]...)
+			if i == 0 {
+				c.erasePermissionBlockLocked()
+				c.permSelected = 0
+				if len(c.permQueue) > 0 {
+					c.state.Store(int32(statePermission))
+					c.printPermissionBlockLocked(c.permQueue[0])
+				} else {
+					c.state.Store(int32(stateStreaming))
+				}
+			}
+			return
 		}
 
 	case agent.EventUsage:
@@ -995,9 +1391,8 @@ func (c *CLI) handleEvent(ev agent.Event) {
 
 	case agent.EventCompactionEnd:
 		c.compacting = false
-		if ev.RefreshSession {
-			c.refreshSessionLocked()
-		}
+	case agent.EventSessionRewrite:
+		c.applyResyncLocked(ev.RewritePayload)
 
 	case agent.EventWarning:
 		c.activeToolID = ""
@@ -1012,7 +1407,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			c.writeRaw(renderWarningMsg(w.Kind + ": " + w.Message))
 		}
 		c.lastWarningSnapshot = current
-		if c.state == stateIdle {
+		if cliState(c.state.Load()) == stateIdle {
 			c.printInputPromptLocked()
 		}
 	}
@@ -1043,7 +1438,7 @@ func (c *CLI) handleSubagentEvent(ev agent.Event) {
 		if !ev.IsError && ev.ToolName == "edit_file" {
 			line = status
 			if preview, ok := editpreview.FromMetadata(ev.Metadata); ok {
-				line += "\n" + strings.TrimRight(renderEditPreview(preview, "", c.width, false), "\r\n")
+				line += "\n" + strings.TrimRight(renderEditPreview(preview, "", int(c.width.Load()), false), "\r\n")
 			}
 		}
 		c.writeRaw(renderSubagentMsg(tag, line))
@@ -1072,11 +1467,11 @@ func (c *CLI) handleSubagentEvent(ev agent.Event) {
 func (c *CLI) finalizeStreamBufLocked() {
 	text := c.streamBuf.String()
 	if text != "" {
-		rows := terminalRowsForText(c.streamVisibleBuf.String(), c.width)
+		rows := terminalRowsForText(c.streamVisibleBuf.String(), int(c.width.Load()))
 		if rows > 0 {
 			c.writeRaw(eraseBlock(rows + 1))
 		}
-		c.writeRaw(renderAssistantMsg(text, c.width))
+		c.writeRaw(renderAssistantMsg(text, int(c.width.Load())))
 
 		c.messages = append(c.messages, displayEntry{
 			typ:     "assistant",
@@ -1110,23 +1505,43 @@ func terminalRowsForText(text string, width int) int {
 }
 
 func (c *CLI) refreshState() {
-	m := c.currentModel()
-	c.modelRef = m.Ref
-	if c.modelRef == "" && m.Provider != "" && m.Model != "" {
-		c.modelRef = m.Provider + "/" + m.Model
+	c.modelRef = modelRefOf(c.currentModel())
+}
+
+// modelRefOf renders a model info as its provider-prefixed reference, the form
+// the header displays.
+func modelRefOf(m agent.ModelInfo) string {
+	ref := m.Ref
+	if ref == "" && m.Provider != "" && m.Model != "" {
+		ref = m.Provider + "/" + m.Model
 	}
+	return ref
+}
+
+// setWidth records a terminal width reported by the OS. The clamp is honest
+// rather than a workaround: a width below one, or beyond what the atomic can
+// hold, is nonsense for a terminal, and bounding it first makes the
+// conversion provably safe instead of merely asserted.
+func (c *CLI) setWidth(w int) {
+	if w < 1 {
+		w = 1
+	} else if w > math.MaxInt32 {
+		w = math.MaxInt32
+	}
+	c.width.Store(int32(w))
 }
 
 func (c *CLI) currentWidth() int {
 	if c.rawFd > 0 {
 		if w, _, err := term.GetSize(c.rawFd); err == nil && w > 0 {
-			c.width = w
+			c.setWidth(w)
 		}
 	}
-	if c.width < 30 {
+	width := int(c.width.Load())
+	if width < 30 {
 		return 30
 	}
-	return c.width
+	return width
 }
 
 func (c *CLI) seedInputHistory() {
@@ -1146,7 +1561,13 @@ func (c *CLI) printHeader() {
 }
 
 func (c *CLI) printHeaderLocked() {
-	session := c.currentSessionSummary()
+	c.printHeaderFromSummaryLocked(c.currentSessionSummary())
+}
+
+// printHeaderFromSummaryLocked renders the header row for an explicit summary,
+// so a render that already holds the presentation (a read-only open's
+// hydration state) does not re-read the owner for it.
+func (c *CLI) printHeaderFromSummaryLocked(session agent.SessionSummary) {
 	sid := session.ID
 	if sid == "" {
 		sid = "(no session)"
@@ -1177,8 +1598,9 @@ func (c *CLI) printInputPromptLocked() {
 	}
 
 	promptLen := 2 + visibleWidth(text)
-	if c.width > 0 && promptLen > c.width {
-		c.promptLines = (promptLen + c.width - 1) / c.width
+	width := int(c.width.Load())
+	if width > 0 && promptLen > width {
+		c.promptLines = (promptLen + width - 1) / width
 	} else {
 		c.promptLines = 1
 	}
@@ -1206,13 +1628,13 @@ func (c *CLI) printDisplayEntry(e displayEntry) {
 func (c *CLI) printDisplayEntryLocked(e displayEntry) {
 	switch e.typ {
 	case "user":
-		c.printLineLocked(renderUserMsg(e.content, c.width))
+		c.printLineLocked(renderUserMsg(e.content, int(c.width.Load())))
 	case "assistant":
-		c.printLineLocked(renderAssistantMsg(e.content, c.width))
+		c.printLineLocked(renderAssistantMsg(e.content, int(c.width.Load())))
 	case "tool":
 		c.printLineLocked(renderToolCall(e.name, e.args, e.metadata))
 		if e.done {
-			result := renderToolResult(e.name, e.args, e.result, e.success, c.toolExpanded, c.width, e.metadata)
+			result := renderToolResult(e.name, e.args, e.result, e.success, c.toolExpanded, int(c.width.Load()), e.metadata)
 			if result != "" {
 				c.printLineLocked(result)
 			}
@@ -1221,7 +1643,7 @@ func (c *CLI) printDisplayEntryLocked(e displayEntry) {
 	case "background_process":
 		c.printLineLocked(renderBackgroundProcessCall(e.bg, e.success))
 		if e.done {
-			result := renderToolResult("background_process", "", e.result, e.success, c.toolExpanded, c.width, nil)
+			result := renderToolResult("background_process", "", e.result, e.success, c.toolExpanded, int(c.width.Load()), nil)
 			if result != "" {
 				c.printLineLocked(result)
 			}
@@ -1229,6 +1651,8 @@ func (c *CLI) printDisplayEntryLocked(e displayEntry) {
 		}
 	case "system":
 		c.printLineLocked(renderSystemMsg(e.content))
+	case "error":
+		c.printLineLocked(renderErrorMsg(e.content))
 	}
 }
 
@@ -1255,11 +1679,11 @@ func (c *CLI) advancePermissionQueueLocked() {
 	}
 	c.permSelected = 0
 	if len(c.permQueue) > 0 {
-		c.state = statePermission
+		c.state.Store(int32(statePermission))
 		c.printPermissionBlockLocked(c.permQueue[0])
 		return
 	}
-	c.state = stateStreaming
+	c.state.Store(int32(stateStreaming))
 }
 
 func (c *CLI) redrawPermissionBlock(req *agent.PermissionRequest) {
@@ -1280,22 +1704,32 @@ func (c *CLI) submitInputLocked(text string) {
 	c.submitToBackend(text)
 }
 
-// submitToBackend routes input through the agent's single Submit entry point.
-// The agent decides whether to start a turn or enqueue and emits queue_changed;
-// the CLI does not own the queue. On error it renders the message and, if idle,
-// restores the input prompt. Runs the call off the lock in a goroutine.
+// submitToBackend routes input through the agent's single Submit entry point
+// synchronously: the owner's claim lands before the next key in the same
+// batch is processed, so same-batch navigation sees the source busy and is
+// refused by owner state. It performs no terminal write and takes no CLI
+// lock; the returned error is rendered through the delivery FIFO after the
+// caller's key-processing lock frame exits, so rendering stays on mainLoop's
+// goroutine in order with owner events. The agent decides whether to start a
+// turn or enqueue and emits queue_changed; the CLI does not own the queue.
 func (c *CLI) submitToBackend(text string) {
-	go func() {
-		sessionID, err := c.currentSession()
-		if err == nil {
-			_, err = c.agent.SubmitToSession(c.ctx, sessionID, text)
+	sessionID, err := c.currentSession()
+	readOnly := err == nil && c.sv().IsReadOnly(sessionID)
+	if err == nil {
+		_, err = c.agent.SubmitToSession(c.ctx, sessionID, text)
+		if err != nil && readOnly {
+			// The session is read-only: another process drives it, so the
+			// owner refuses it as unknown. Say what is actually wrong.
+			err = agent.SessionContendedError(sessionID)
 		}
-		if err != nil {
+	}
+	if err != nil {
+		c.enqueuePost(func() {
 			c.mu.Lock()
 			c.handleSubmitErrorLocked(text, err)
 			c.mu.Unlock()
-		}
-	}()
+		})
+	}
 }
 
 func (c *CLI) handleSubmitErrorLocked(text string, err error) {
@@ -1306,15 +1740,58 @@ func (c *CLI) handleSubmitErrorLocked(text string, err error) {
 		c.input.Set(text)
 	}
 	if !c.busy {
-		c.state = stateIdle
+		c.state.Store(int32(stateIdle))
 		c.printInputPromptLocked()
 	}
+}
+
+// reserveSelection reserves the current selection's source session against
+// destination create/open/switch. Owner busy/transitioning state — not the
+// CLI's event-derived busy flag — is the navigation authority: an idle live
+// source stays reserved through the destination commit, and a busy or
+// transitioning source refuses with the owner's mutability error, leaving the
+// selection unchanged. A no-op reservation (no current source, or a
+// read-only session another process drives, which is not live in this owner)
+// lets navigation proceed.
+func (c *CLI) reserveSelection() (func(), error) {
+	sessionID, err := c.currentSession()
+	if err != nil {
+		return func() {}, nil
+	}
+	return c.agent.ReserveSelectionSource(sessionID)
 }
 
 func (c *CLI) refreshSession() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.refreshSessionLocked()
+}
+
+// refreshFromHydration re-renders the session view from a hydration state an
+// open already produced, without re-reading the owner: the summary and the
+// durable messages it carries are the presentation, and a fresh read could
+// fail after routing already committed, leaving routing moved with nothing
+// rendered. The read-only hydration carries nothing live, so model and queue
+// render as their empty values.
+func (c *CLI) refreshFromHydration(state agent.HydrationState) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.refreshFromHydrationLocked(state)
+}
+
+func (c *CLI) refreshFromHydrationLocked(state agent.HydrationState) {
+	c.modelRef = modelRefOf(state.Model)
+	c.messages = buildDisplayMsgs(state.Messages)
+	c.queueDisplay = state.Queue.Items
+	c.lastQueueVersion = state.Queue.Version
+	c.seedInputHistory()
+
+	c.printLineLocked("")
+	c.printHeaderFromSummaryLocked(state.Session)
+	for _, m := range c.messages {
+		c.printDisplayEntryLocked(m)
+	}
+	c.printInputPromptLocked()
 }
 
 func (c *CLI) refreshSessionLocked() {
@@ -1324,6 +1801,26 @@ func (c *CLI) refreshSessionLocked() {
 	q := c.queueSnapshot()
 	c.queueDisplay = q.Items
 	c.lastQueueVersion = q.Version
+	c.seedInputHistory()
+
+	c.printLineLocked("")
+	c.printHeaderLocked()
+	for _, m := range c.messages {
+		c.printDisplayEntryLocked(m)
+	}
+	c.printInputPromptLocked()
+}
+
+// applyResyncLocked re-renders the transcript from the compaction snapshot the
+// producer carried on the event. It never queries the owner: compaction changes
+// only the transcript, so model and queue state stay as the live stream left
+// them. A nil payload (the rare build failure) just re-prompts.
+func (c *CLI) applyResyncLocked(payload *agent.SessionPayload) {
+	if payload == nil {
+		c.printInputPromptLocked()
+		return
+	}
+	c.messages = buildDisplayMsgs(payload.Messages)
 	c.seedInputHistory()
 
 	c.printLineLocked("")
@@ -1359,9 +1856,19 @@ func (c *CLI) handleSlashWhileBusy(text string) {
 		c.mu.Unlock()
 		c.cmdCopy()
 		c.mu.Lock()
+	case "/session", "/project", "/new", "/resume":
+		// Navigation while the CLI streams: the owner's state decides, not
+		// the CLI's event-derived busy. Dispatch through the real path — the
+		// source reservation refuses a busy or transitioning source with the
+		// owner's mutability error and leaves the selection unchanged, and a
+		// successful commit resets the streaming presentation in
+		// setCurrentSessionID. The spinner restarts only when the source is
+		// still current and still streaming.
+		c.mu.Unlock()
+		_ = c.dispatchCommand(text)
+		c.mu.Lock()
 	default:
-		if cmd == "/model" || cmd == "/session" || cmd == "/project" || cmd == "/new" ||
-			cmd == "/resume" || cmd == "/revert" || cmd == "/fork" ||
+		if cmd == "/model" || cmd == "/revert" || cmd == "/fork" ||
 			cmd == "/compact" || cmd == "/exit" {
 			c.writeRaw(renderErrorMsg("cannot run this command while a turn is running"))
 		} else {
@@ -1369,7 +1876,9 @@ func (c *CLI) handleSlashWhileBusy(text string) {
 		}
 	}
 
-	c.startAnimationLocked(label)
+	if c.busy {
+		c.startAnimationLocked(label)
+	}
 	c.mu.Unlock()
 }
 
@@ -1389,19 +1898,38 @@ func (c *CLI) dispatchCommand(text string) error {
 	case "/project":
 		c.showProjectMenu()
 	case "/new":
-		id, err := c.scope.NewSession("primary")
+		release, err := c.reserveSelection()
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return nil
 		}
+		id, err := c.scope.NewSession("primary")
+		if err != nil {
+			var committed *snapshot.CommittedMutationError
+			switch {
+			case id != "" && errors.As(err, &committed): // the destination was created durably before the failure: adopt it and reject typed after release+refresh
+				c.setCurrentSessionID(id)
+				release()
+				c.refreshSession()
+				c.printLine(renderErrorMsg(err.Error()))
+			default: // a plain precommit error retains the source exactly as it was
+				release()
+				c.printLine(renderErrorMsg(err.Error()))
+			}
+			return nil
+		}
 		c.setCurrentSessionID(id)
+		// The source reservation ends at the selection commit, before the
+		// destination render: a blocked render must not hold the source
+		// transitioning, so its queue and signal turns can proceed.
+		release()
 		c.refreshSession()
 	case "/resume":
 		c.cmdResume(parts)
 	case "/revert":
-		c.showRevertMenu()
+		return c.showRevertMenu()
 	case "/fork":
-		c.showRevertMenu()
+		return c.showRevertMenu()
 	case "/context":
 		c.cmdContext()
 	case "/compact":
@@ -1460,18 +1988,64 @@ func (c *CLI) clearTerminalLocked() {
 }
 
 func (c *CLI) cmdResume(parts []string) {
+	// The source is reserved across the destination open and the selection
+	// commit: a busy or transitioning source refuses here with the owner's
+	// mutability error, and an idle source cannot start a turn while the
+	// destination commits. The reservation ends at the commit or at the
+	// failure, before any terminal I/O, so a blocked render or error write
+	// cannot hold the source transitioning.
 	if len(parts) > 1 {
-		id := parts[1]
-		summary, err := c.agent.OpenSession(id)
+		// Direct /resume <id>: the destination is chosen by the argument, so
+		// the source is reserved immediately before the open.
+		release, err := c.reserveSelection()
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
+		id := parts[1]
+		summary, err := c.agent.OpenSession(id)
+		if err != nil {
+			if !errors.Is(err, snapshot.ErrSessionContended) {
+				release()
+				c.printLine(renderErrorMsg(err.Error()))
+				return
+			}
+			// The user named a session another process is driving: it opens
+			// read-only. Present its durable transcript, committing routing
+			// current only once the view is available.
+			state, herr := c.owner.HydrateSession(id)
+			if herr != nil {
+				release()
+				c.printLine(renderErrorMsg(herr.Error()))
+				return
+			}
+			c.scope.SetProjectPath(state.Session.ProjectPath)
+			c.setCurrentSessionID(state.Session.ID)
+			c.sv().SetReadOnly(state.Session.ID)
+			// The render is fed from the state this open returned rather than
+			// re-read, so routing moves only once the view is in hand: a
+			// presentation that cannot be produced leaves the previous session
+			// and project in place.
+			release()
+			c.refreshFromHydration(state)
+			return
+		}
+		// The free-text id can resolve in another project; commit the destination
+		// project so later project-scoped commands route to it. The owner resolves
+		// the session against its project, so the summary always carries one.
+		c.scope.SetProjectPath(summary.ProjectPath)
 		c.setCurrentSessionID(summary.ID)
+		release()
 		c.refreshSession()
 		return
 	}
 
+	// No-ID resume: the destination candidates are listed first with NO
+	// reservation held, so the idle source stays claimable (submit, queue
+	// drain, signal turns) while the list runs. The reservation is acquired
+	// immediately before each candidate open and released at that candidate's
+	// commit or failure; a contended candidate is skipped and the next is
+	// tried.
 	sessions, err := c.scope.SessionList("active")
 	if err != nil {
 		c.printLine(renderErrorMsg(err.Error()))
@@ -1482,13 +2056,31 @@ func (c *CLI) cmdResume(parts []string) {
 		return
 	}
 
-	summary, err := c.agent.OpenSession(sessions[0].ID)
-	if err != nil {
-		c.printLine(renderErrorMsg(err.Error()))
-		return
+	// Scan newest-first and skip a candidate another process is driving, so a
+	// contended session does not fail the whole resume. Any other open failure
+	// surfaces: this is user-initiated, so a corrupt session must not be
+	// skipped silently.
+	for _, s := range sessions {
+		release, err := c.reserveSelection()
+		if err != nil {
+			c.printLine(renderErrorMsg(err.Error()))
+			return
+		}
+		summary, err := c.agent.OpenSession(s.ID)
+		if err == nil {
+			c.setCurrentSessionID(summary.ID)
+			release()
+			c.refreshSession()
+			return
+		}
+		if !errors.Is(err, snapshot.ErrSessionContended) {
+			release()
+			c.printLine(renderErrorMsg(err.Error()))
+			return
+		}
+		release()
 	}
-	c.setCurrentSessionID(summary.ID)
-	c.refreshSession()
+	c.printLine(renderErrorMsg("no active sessions"))
 }
 
 func (c *CLI) cmdContext() {
@@ -1521,32 +2113,44 @@ func (c *CLI) cmdCompact() {
 		c.printLine(renderErrorMsg("cannot compact while a turn is running"))
 		return
 	}
-	sessionID := c.liveCurrentSessionID()
-	if sessionID == "" {
-		c.printLine(renderErrorMsg("no current session"))
+	sessionID, err := c.sv().LiveCurrentOrErr()
+	if err != nil {
+		c.printLine(renderErrorMsg(err.Error()))
 		return
 	}
 
 	c.mu.Lock()
 	c.compacting = true
-	c.state = stateStreaming
+	c.state.Store(int32(stateStreaming))
 	c.mu.Unlock()
 
 	c.startAnimation("Compacting")
 
-	go func() {
+	c.spawnOp(func() {
 		err := c.agent.CompactNowForSession(c.ctx, sessionID)
-		c.mu.Lock()
-		idle := c.finishCompactLocked()
-		c.mu.Unlock()
-
-		if err != nil {
-			c.printLine(renderErrorMsg(err.Error()))
-			if idle {
-				c.printInputPrompt()
+		c.enqueuePost(func() {
+			// The compact ran for the source session captured at start. If a
+			// navigation committed meanwhile, the destination owns the
+			// terminal: the completion must not erase its prompt, change its
+			// state, or render the source's errors. setCurrentSessionID
+			// already cleared the compacting presentation on that commit, so
+			// a stale completion has nothing to finish. A compact still on
+			// its own session finishes exactly as before.
+			if c.sv().Current() != sessionID {
+				return
 			}
-		}
-	}()
+			c.mu.Lock()
+			idle := c.finishCompactLocked()
+			c.mu.Unlock()
+
+			if err != nil {
+				c.printLine(renderErrorMsg(err.Error()))
+				if idle {
+					c.printInputPrompt()
+				}
+			}
+		})
+	})
 }
 
 func (c *CLI) finishCompactLocked() bool {
@@ -1556,18 +2160,32 @@ func (c *CLI) finishCompactLocked() bool {
 	if c.busy {
 		return false
 	}
-	c.state = stateIdle
+	c.state.Store(int32(stateIdle))
 	return true
 }
 
 func (c *CLI) cmdCopy() {
 	for i := len(c.messages) - 1; i >= 0; i-- {
 		if c.messages[i].typ == "assistant" && c.messages[i].content != "" {
-			if err := writeClipboard(c.out, c.messages[i].content); err != nil {
-				c.printLine(renderErrorMsg(err.Error()))
+			text := c.messages[i].content
+			// OSC-52 is ordinary mainLoop output.
+			if err := writeClipboardOSC52(c.out, text); err == nil {
+				c.printLine(renderSystemMsg("copied to clipboard"))
 				return
 			}
-			c.printLine(renderSystemMsg("copied to clipboard"))
+			// The write failed: run the shell-out fallback in the op-group so a
+			// blocking clipboard tool cannot wedge mainLoop, and post the result to
+			// the delivery FIFO.
+			c.spawnOp(func() {
+				err := writeClipboardFallback(c.ctx, text)
+				c.enqueuePost(func() {
+					if err != nil {
+						c.printLine(renderErrorMsg(err.Error()))
+					} else {
+						c.printLine(renderSystemMsg("copied to clipboard"))
+					}
+				})
+			})
 			return
 		}
 	}
@@ -1575,24 +2193,50 @@ func (c *CLI) cmdCopy() {
 }
 
 func (c *CLI) projectSwitch(targetPath string) {
-	summary, err := c.scope.OpenOrCreateSession(targetPath)
+	// The source is reserved across the destination open and the selection
+	// commit: a busy or transitioning source refuses here with the owner's
+	// mutability error, and an idle source cannot start a turn while the
+	// destination commits. The reservation ends at the commit or at the
+	// failure, before any terminal I/O, so a blocked render or error write
+	// cannot hold the source transitioning.
+	release, err := c.reserveSelection()
 	if err != nil {
 		c.printLine(renderErrorMsg(err.Error()))
 		return
 	}
+	summary, err := c.scope.OpenOrCreateSession(targetPath)
+	if err != nil {
+		var committed *snapshot.CommittedMutationError
+		switch {
+		case summary.ID != "" && errors.As(err, &committed): // the create fallback durably committed its destination before failing: adopt project and session, reject typed after release+refresh
+			c.scope.SetProjectPath(targetPath)
+			c.setCurrentSessionID(summary.ID)
+			release()
+			c.refreshSession()
+			c.printLine(renderErrorMsg(err.Error()))
+		default: // a plain precommit error retains the old route and source exactly as they were
+			release()
+			c.printLine(renderErrorMsg(err.Error()))
+		}
+		return
+	}
 	c.scope.SetProjectPath(targetPath)
 	c.setCurrentSessionID(summary.ID)
+	release()
 	c.refreshSession()
 }
 
 func (c *CLI) restoreTerminal() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// The mode restore is a control operation on the descriptor: it cannot
+	// block on an unread output, so it runs without the render lock. Leaving
+	// the terminal in raw mode is real damage; a stalled write must not
+	// prevent undoing it. Nothing else happens here: no exit path may write
+	// to the output, because nothing available at exit establishes that it
+	// drains.
 	if c.oldState != nil {
 		_ = term.Restore(c.rawFd, c.oldState)
 		c.oldState = nil
 	}
-	c.writeRaw("\x1b[?25h")
 }
 
 func (c *CLI) startAnimation(label string) {
@@ -1601,44 +2245,35 @@ func (c *CLI) startAnimation(label string) {
 	c.startAnimationLocked(label)
 }
 
-func (c *CLI) startAnimationLocked(label string) {
-	c.stopAnimationLocked()
-	c.animLabel = label
-	stop := make(chan struct{})
-	c.animStop = stop
+var animFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
-	go func() {
-		frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-		i := 0
-		c.mu.Lock()
-		c.writeRaw("\x1b[?25l")
-		c.mu.Unlock()
-		for {
-			select {
-			case <-stop:
-				c.mu.Lock()
-				c.writeRaw("\x1b[?25h")
-				c.mu.Unlock()
-				return
-			case <-time.After(80 * time.Millisecond):
-				c.mu.Lock()
-				if c.animStop == nil {
-					c.mu.Unlock()
-					return
-				}
-				c.writeRaw(fmt.Sprintf("\r\x1b[2K%s %s", frames[i%len(frames)], label))
-				c.mu.Unlock()
-				i++
-			}
-		}
-	}()
+func (c *CLI) startAnimationLocked(label string) {
+	c.animLabel = label
+	if !c.animActive {
+		c.animActive = true
+		c.animFrame = 0
+		c.writeRaw("\x1b[?25l") // hide cursor while the spinner runs
+	}
 }
 
 func (c *CLI) stopAnimationLocked() {
-	if c.animStop != nil {
-		close(c.animStop)
-		c.animStop = nil
+	if c.animActive {
+		c.animActive = false
+		c.writeRaw("\x1b[?25h") // show cursor
 	}
+}
+
+// tickAnimation renders the next spinner frame if animation is active. It runs on
+// mainLoop's goroutine from the ticker case, so the spinner shares mainLoop's single
+// terminal-writer discipline instead of a separate goroutine.
+func (c *CLI) tickAnimation() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.animActive {
+		return
+	}
+	c.writeRaw(fmt.Sprintf("\r\x1b[2K%s %s", animFrames[c.animFrame%len(animFrames)], c.animLabel))
+	c.animFrame++
 }
 
 func (c *CLI) writeRaw(s string) {

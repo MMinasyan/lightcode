@@ -1,21 +1,815 @@
 package acp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	lcconfig "github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/project"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
+
+// TestACPOutputIsWrittenOnlyByDrainer proves the single output drainer is the only
+// path that writes the ACP stream, so protocol order is the drainer's write order.
+func TestACPOutputIsWrittenOnlyByDrainer(t *testing.T) {
+	src, err := os.ReadFile("acp.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	decl := regexp.MustCompile(`(?m)^func (?:\([^)]*\) )?(\w+)\(`)
+	locs := decl.FindAllStringSubmatchIndex(s, -1)
+	for i, loc := range locs {
+		name := s[loc[2]:loc[3]]
+		end := len(s)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		if name != "runOutputDrainer" && strings.Contains(s[loc[1]:end], "r.out.Write") {
+			t.Fatalf("r.out.Write is called in %s; only runOutputDrainer may write the ACP stream", name)
+		}
+	}
+}
+
+// TestACPShutdownJoinsOwnerBeforeClosingOutput proves Run joins the owner before
+// closing the output, so a turn's terminal events (e.g. turn_end) emitted while the
+// owner drains on shutdown are still admitted and delivered rather than dropped.
+// The source order is what lets them be admitted at all — a frame enqueued after
+// closeOutput is rejected by the closed gate — so the behavioral half forces a
+// shutdown-produced frame to be queued when close runs and asserts it is still
+// written.
+func TestACPShutdownJoinsOwnerBeforeClosingOutput(t *testing.T) {
+	src, err := os.ReadFile("acp.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	shut := strings.Index(s, "r.owner.ShutdownOwner()")
+	closeOut := strings.Index(s, "r.closeOutput()")
+	if shut < 0 || closeOut < 0 || shut > closeOut {
+		t.Fatal("Run must join the owner (ShutdownOwner) before closing output so terminal events are delivered on shutdown")
+	}
+
+	// The behavioral half: with the drainer held inside one write, a frame the
+	// owner's shutdown enqueues (a terminal event) sits queued when closeOutput
+	// runs; close must write it, not discard it.
+	orig := acpOutputJoinTimeout
+	acpOutputJoinTimeout = 50 * time.Millisecond
+	defer func() { acpOutputJoinTimeout = orig }()
+
+	out := &blockingACPWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(out.release) }) }
+	t.Cleanup(release)
+
+	r := &Runner{out: out}
+	r.startOutput()
+
+	r.enqueue([]byte("in-flight\n"))
+	select {
+	case <-out.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainer did not start writing the in-flight frame")
+	}
+
+	// The owner drains on shutdown here; the drainer is busy, so the terminal
+	// event queues behind the in-flight frame and is still queued when
+	// closeOutput runs.
+	r.enqueue([]byte("turn_end\n"))
+	r.closeOutput() // returns at the join bound; the drainer is still blocked
+
+	release() // the drainer writes the in-flight frame, then the backlog
+	select {
+	case <-r.outDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drainer did not exit after the backlog drained")
+	}
+	if got := out.String(); got != "in-flight\nturn_end\n" {
+		t.Fatalf("output after close = %q, want the shutdown-produced frame written after the in-flight one", got)
+	}
+}
+
+// TestACPShutdownAbandonedReturnsError pins Run's teardown fold: when the
+// owner reports that shutdown abandoned in-flight work, Run must fold a
+// non-nil error into its returned error so a script driving this process
+// detects the abandonment from the exit code. Exception, recorded per the
+// contract-test rule: Run cannot be driven against a stub owner in a test.
+// The owner field is a concrete *agent.Agent — typed for the concrete-only
+// surface (ShutdownOwner), not the AdapterService interface — so a stub
+// cannot be substituted without changing the field's type to an interface, a
+// production change this test must not force. An abandoned shutdown would
+// otherwise need the agent-internal coordinator park that
+// TestOwnerShutdownContractMatrix drives (join=timeout), which this package
+// cannot reach. The fold is therefore pinned structurally against that
+// behavioral evidence.
+func TestACPShutdownAbandonedReturnsError(t *testing.T) {
+	src, err := os.ReadFile("acp.go")
+	if err != nil {
+		t.Fatalf("read acp.go: %v", err)
+	}
+	body, ok := extractACPFunctionBody(string(src), "func (r *Runner) Run(")
+	if !ok {
+		t.Fatal("Run not found")
+	}
+	// The whole shape is one structure, not separate facts: the fold is
+	// guarded by the abandoned outcome, the joined error is assigned into
+	// err, and the same err is returned later in the body. An inverted guard,
+	// an unconditional fold, or a fold that builds the joined error and
+	// discards it would each fail this one pattern while still containing the
+	// guard, the join call, the message and the return somewhere in the
+	// function.
+	guardedFoldIntoReturned := regexp.MustCompile(`!r\.owner\.ShutdownOwner\(\)\s*\{\s*err\s*=\s*errors\.Join\(\s*err\s*,\s*fmt\.Errorf\(\s*"owner shutdown abandoned in-flight work"\s*\)\s*\)\s*\}[\s\S]*?return\s+err\b`)
+	if !guardedFoldIntoReturned.MatchString(body) {
+		t.Fatal("Run must fold the abandoned outcome into the error it returns as one guarded structure: `if !r.owner.ShutdownOwner() { err = errors.Join(err, fmt.Errorf(\"owner shutdown abandoned in-flight work\")) }` and later `return err`")
+	}
+}
+
+// extractACPFunctionBody returns the brace-delimited body of the first function
+// whose definition line starts with prefix. It does not understand strings or
+// comments containing braces, so callers should pass production code only.
+func extractACPFunctionBody(source, prefix string) (string, bool) {
+	idx := strings.Index(source, prefix)
+	if idx < 0 {
+		return "", false
+	}
+	rest := source[idx:]
+	open := strings.Index(rest, "{")
+	if open < 0 {
+		return "", false
+	}
+	depth := 1
+	for i := open + 1; i < len(rest); i++ {
+		switch rest[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return rest[open+1 : i], true
+			}
+		}
+	}
+	return "", false
+}
+
+// TestACPOutputDrainsInOrder proves the drainer writes queued frames in FIFO
+// order. Two assertions, neither substituting for the other: with the output open
+// and never closed during the assertion, every queued frame is written in order —
+// the drain is live, not deferred to close; and frames still queued when
+// closeOutput runs are written after close rather than discarded — closing
+// refuses new frames but does not discard the backlog.
+func TestACPOutputDrainsInOrder(t *testing.T) {
+	orig := acpOutputJoinTimeout
+	acpOutputJoinTimeout = 50 * time.Millisecond
+	defer func() { acpOutputJoinTimeout = orig }()
+
+	t.Run("open_stream=frames_written_while_output_open", func(t *testing.T) {
+		const n = 50
+		out := &blockingACPWriter{entered: make(chan struct{}), release: make(chan struct{})}
+		close(out.release) // writes never block: this assertion drives an open, unblocked stream
+		r := &Runner{out: out}
+		r.startOutput()
+		var want string
+		for i := 0; i < n; i++ {
+			r.enqueue([]byte("f" + strconv.Itoa(i) + "\n"))
+			want += "f" + strconv.Itoa(i) + "\n"
+		}
+		// The whole queue drains while the output is still open; closeOutput is
+		// never called during the assertion. An implementation that writes only
+		// up to a held frame and defers the rest to close never reaches the full
+		// content and fails here.
+		deadline := time.Now().Add(2 * time.Second)
+		for out.String() != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("open stream wrote %d of %d frames; the drain must happen while the output is open, not at close", strings.Count(out.String(), "\n"), n)
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if got := out.String(); got != want {
+			t.Fatalf("open stream output = %q, want %q", got, want)
+		}
+		r.mu.Lock()
+		closed := r.outClosed
+		r.mu.Unlock()
+		if closed {
+			t.Fatal("the output was closed during the open-stream assertion")
+		}
+		// The assertion ran with the output open; close only to join the drainer.
+		r.closeOutput()
+		select {
+		case <-r.outDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("drainer did not exit after close")
+		}
+	})
+
+	t.Run("close_with_backlog=frames_written_after_close", func(t *testing.T) {
+		const n = 50
+		out := &blockingACPWriter{entered: make(chan struct{}), release: make(chan struct{})}
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(out.release) }) }
+		t.Cleanup(release)
+
+		r := &Runner{out: out}
+		r.startOutput()
+		r.enqueue([]byte("f0\n"))
+		select {
+		case <-out.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("drainer did not start writing the first frame")
+		}
+		for i := 1; i < n; i++ {
+			r.enqueue([]byte("f" + strconv.Itoa(i) + "\n"))
+		}
+		// Close while 49 frames are still queued: they are the backlog close must
+		// drain rather than discard.
+		r.closeOutput()
+		release()
+		select {
+		case <-r.outDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("drainer did not exit after the backlog drained")
+		}
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+		if len(lines) != n {
+			t.Fatalf("got %d lines, want %d: %q", len(lines), n, out.String())
+		}
+		for i, line := range lines {
+			if want := "f" + strconv.Itoa(i); line != want {
+				t.Fatalf("line %d = %q, want %q", i, line, want)
+			}
+		}
+	})
+}
+
+// TestACPOutputCloseDrainsBacklog proves closing delivery on the protocol host
+// writes frames already queued before the drainer exits: the client process is
+// still reading the output pipe at close, and the queued frames are the terminal
+// events shutdown just produced. The backlog is forced, not raced — the drainer
+// is held inside one write while the rest queue behind it. Its nearest forbidden
+// sibling: a drainer blocked inside one write is still abandoned at the host's
+// existing join bound rather than waited for.
+func TestACPOutputCloseDrainsBacklog(t *testing.T) {
+	t.Run("queued_frames=written_after_close", func(t *testing.T) {
+		orig := acpOutputJoinTimeout
+		acpOutputJoinTimeout = 50 * time.Millisecond
+		defer func() { acpOutputJoinTimeout = orig }()
+
+		out := &blockingACPWriter{entered: make(chan struct{}), release: make(chan struct{})}
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(out.release) }) }
+		t.Cleanup(release)
+
+		r := &Runner{out: out}
+		r.startOutput()
+
+		// Frame A is dequeued and blocked inside its write...
+		r.enqueue([]byte("A\n"))
+		select {
+		case <-out.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("drainer did not start writing frame A")
+		}
+		// ...while B and C sit queued. Close must still write them.
+		r.enqueue([]byte("B\n"))
+		r.enqueue([]byte("C\n"))
+		r.closeOutput()
+
+		release() // the drainer writes A, then the backlog
+		select {
+		case <-r.outDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("drainer did not exit after the backlog drained")
+		}
+		if got := out.String(); got != "A\nB\nC\n" {
+			t.Fatalf("output after close = %q, want the queued backlog written: %q", got, "A\nB\nC\n")
+		}
+	})
+
+	t.Run("blocked_write=abandoned_at_existing_bound", func(t *testing.T) {
+		orig := acpOutputJoinTimeout
+		acpOutputJoinTimeout = 100 * time.Millisecond
+		defer func() { acpOutputJoinTimeout = orig }()
+
+		out := &blockingACPWriter{entered: make(chan struct{}), release: make(chan struct{})}
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(out.release) }) }
+		t.Cleanup(release)
+
+		r := &Runner{out: out}
+		r.startOutput()
+
+		r.enqueue([]byte("A\n"))
+		select {
+		case <-out.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("drainer did not start writing frame A")
+		}
+
+		// The write never completes; close must give up at the existing join
+		// bound rather than wait for the drainer.
+		start := time.Now()
+		r.closeOutput()
+		elapsed := time.Since(start)
+		if elapsed < acpOutputJoinTimeout/2 || elapsed > 2*time.Second {
+			t.Fatalf("closeOutput returned in %v; it must abandon the blocked drainer at the join bound (%v)", elapsed, acpOutputJoinTimeout)
+		}
+
+		release() // let the abandoned drainer finish and exit
+		select {
+		case <-r.outDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("drainer did not exit after the blocked write was released")
+		}
+	})
+}
+
+// TestACPOwnsConcreteAgentLifecycle proves the runner initializes the concrete
+// owner it constructs, establishes a current session, and joins the owner cleanly
+// on stdin EOF without hanging.
+func TestACPOwnsConcreteAgentLifecycle(t *testing.T) {
+	ag := newACPTestAgent(t)
+	var out bytes.Buffer
+	r := &Runner{agent: ag, owner: ag, in: strings.NewReader(""), out: &out}
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Run hung joining the owner after stdin EOF")
+	}
+}
+
+func TestACPStartupRealCommittedCreationReturnsTypedErrorAfterAdoption(t *testing.T) {
+	ag := newACPTestAgent(t)
+	var out bytes.Buffer
+	r := &Runner{agent: ag, owner: ag, in: strings.NewReader(""), out: &out}
+	root := ag.Projects().Root()
+	atomicfs.SyncDirFunc = func(dir string) error {
+		if strings.HasSuffix(dir, string(filepath.Separator)+"sessions") {
+			return errors.New("injected startup publication sync failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+	err := r.Run(context.Background())
+	if err == nil {
+		t.Fatal("ACP startup committed publication failure returned nil")
+	}
+	var committed *snapshot.CommittedMutationError
+	if !errors.As(err, &committed) {
+		t.Fatalf("ACP startup committed creation error = %v, want committed error", err)
+	}
+	if r.sv().Current() == "" {
+		t.Fatal("ACP startup did not adopt committed destination")
+	}
+	if !strings.HasPrefix(root, filepath.Dir(ag.Projects().Root())) {
+		t.Fatal("ACP startup test did not use the real project namespace")
+	}
+}
+
+func TestACPStartupPlainCreationFailureDoesNotAdopt(t *testing.T) {
+	ag := newACPTestAgent(t)
+	if _, err := ag.Projects().Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected startup metadata sync failure")
+	atomicfs.SyncFileFunc = func(*os.File) error { return injected }
+	t.Cleanup(func() { atomicfs.SyncFileFunc = nil })
+
+	r := &Runner{agent: ag, owner: ag, in: strings.NewReader(""), out: new(bytes.Buffer)}
+	err := r.Run(context.Background())
+	if !errors.Is(err, injected) {
+		t.Fatalf("ACP startup plain creation error = %v, want injected failure", err)
+	}
+	var committed *snapshot.CommittedMutationError
+	if errors.As(err, &committed) {
+		t.Fatalf("ACP startup plain creation error = %v, want no committed classification", err)
+	}
+	if r.sv().Current() != "" {
+		t.Fatalf("ACP current after plain startup failure = %q, want empty", r.sv().Current())
+	}
+}
+
+func TestACPRealCommittedNamespaceProducers(t *testing.T) {
+	newRunner := func(t *testing.T) (*Runner, *agent.Agent, string, string) {
+		t.Helper()
+		ag := newACPTestAgent(t)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatal(err)
+		}
+		project, err := ag.Projects().Ensure()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := new(bytes.Buffer)
+		r := &Runner{agent: ag, owner: ag, out: out}
+		r.setCurrentSessionID(id)
+		return r, ag, id, ag.Projects().SessionsRoot(project.ID)
+	}
+
+	t.Run("archive", func(t *testing.T) {
+		r, _, id, sessionsRoot := newRunner(t)
+		sessionDir := filepath.Join(sessionsRoot, id)
+		var syncCalls int
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == sessionDir {
+				syncCalls++
+				if syncCalls == 2 {
+					return errors.New("injected ACP archive sync failure")
+				}
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+		r.handleSessionArchive(Request{JSONRPC: "2.0", ID: "archive", Method: "session/archive", Params: json.RawMessage(`{"id":"` + id + `"}`)})
+		lines := drainedLines(t, r, r.out.(*bytes.Buffer), 2)
+		var response Response
+		if err := json.Unmarshal([]byte(lines[1]), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Error == nil || !strings.Contains(response.Error.Message, "ACP archive sync failure") {
+			t.Fatalf("archive response = %q, want committed rejection", lines[1])
+		}
+		if r.sv().Current() != "" {
+			t.Fatalf("ACP current after committed archive = %q, want detached", r.sv().Current())
+		}
+		meta, err := snapshot.LoadSessionMeta(sessionsRoot, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if meta.State != snapshot.StateArchived {
+			t.Fatalf("ACP archive state = %q, want archived", meta.State)
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		r, _, id, sessionsRoot := newRunner(t)
+		injected := errors.New("injected ACP delete sync failure")
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == sessionsRoot {
+				return injected
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+		r.handleSessionDelete(Request{JSONRPC: "2.0", ID: "delete", Method: "session/delete", Params: json.RawMessage(`{"id":"` + id + `"}`)})
+		lines := drainedLines(t, r, r.out.(*bytes.Buffer), 2)
+		var response Response
+		if err := json.Unmarshal([]byte(lines[1]), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Error == nil || !strings.Contains(response.Error.Message, "ACP delete sync failure") {
+			t.Fatalf("delete response = %q, want committed rejection", lines[1])
+		}
+		if r.sv().Current() != "" {
+			t.Fatalf("ACP current after committed delete = %q, want detached", r.sv().Current())
+		}
+		if _, err := os.Stat(filepath.Join(sessionsRoot, id)); !os.IsNotExist(err) {
+			t.Fatalf("ACP deleted source = %v, want absent", err)
+		}
+	})
+
+	t.Run("history", func(t *testing.T) {
+		r, ag, id, sessionsRoot := newRunner(t)
+		lastTurn := 0
+		var err error
+		for _, text := range []string{"one", "two", "three"} {
+			lastTurn, err = ag.AppendUserMessageToSession(id, text)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		turnsDir := filepath.Join(sessionsRoot, id, "turns")
+		injected := errors.New("injected ACP history sync failure")
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == turnsDir {
+				return injected
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+		params, err := json.Marshal(turnActionParams{SessionID: id, Turn: lastTurn})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.handleRevertHistory(Request{JSONRPC: "2.0", ID: "history", Method: "session/revert_history", Params: params})
+		lines := drainedLines(t, r, r.out.(*bytes.Buffer), 2)
+		var response Response
+		if err := json.Unmarshal([]byte(lines[1]), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Error == nil || response.Error.Data == nil || !strings.Contains(response.Error.Message, "ACP history sync failure") {
+			t.Fatalf("history response = %q, want typed rejection with prepared result", lines[1])
+		}
+		var result agent.TurnActionResult
+		if err := unmarshalInto(t, response.Error.Data, &result); err != nil || result.Session.ID != id {
+			t.Fatalf("history error data = %#v (%v), want prepared current session", response.Error.Data, err)
+		}
+		if r.sv().Current() != id {
+			t.Fatalf("ACP current after committed history = %q, want %q", r.sv().Current(), id)
+		}
+		if _, err := os.Stat(filepath.Join(turnsDir, fmt.Sprint(lastTurn))); !os.IsNotExist(err) {
+			t.Fatalf("ACP reverted turn = %v, want removed", err)
+		}
+	})
+
+	t.Run("fork", func(t *testing.T) {
+		r, ag, sourceID, sessionsRoot := newRunner(t)
+		turn, err := ag.AppendUserMessageToSession(sourceID, "fork source")
+		if err != nil {
+			t.Fatal(err)
+		}
+		injected := errors.New("injected ACP fork sync failure")
+		atomicfs.SyncDirFunc = func(dir string) error {
+			if dir == sessionsRoot {
+				return injected
+			}
+			return nil
+		}
+		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+		params, err := json.Marshal(turnActionParams{SessionID: sourceID, Turn: turn})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.handleSessionFork(Request{JSONRPC: "2.0", ID: "fork", Method: "session/fork", Params: params})
+		lines := drainedLines(t, r, r.out.(*bytes.Buffer), 2)
+		var response Response
+		if err := json.Unmarshal([]byte(lines[1]), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Error == nil || response.Error.Data == nil || !strings.Contains(response.Error.Message, "ACP fork sync failure") {
+			t.Fatalf("fork response = %q, want typed rejection with prepared result", lines[1])
+		}
+		var result agent.TurnActionResult
+		if err := unmarshalInto(t, response.Error.Data, &result); err != nil {
+			t.Fatalf("fork error data: %v", err)
+		}
+		destinationID := result.Session.ID
+		if destinationID == "" || destinationID == sourceID || r.sv().Current() != destinationID {
+			t.Fatalf("ACP fork destination = %q, current = %q, want adopted destination", destinationID, r.sv().Current())
+		}
+		if _, err := os.Stat(filepath.Join(sessionsRoot, destinationID, "meta.json")); err != nil {
+			t.Fatalf("ACP fork destination metadata: %v", err)
+		}
+	})
+}
+
+// blockingReader blocks every Read until release is closed, modeling stdin with no
+// input so a Scan stays blocked until shutdown abandons it.
+type blockingReader struct{ release <-chan struct{} }
+
+func (b blockingReader) Read(p []byte) (int, error) {
+	<-b.release
+	return 0, io.EOF
+}
+
+// blockingACPWriter signals when the drainer first enters a Write and blocks
+// every Write until release closes, so a test can hold the drainer mid-stream
+// and force a deterministic backlog at close.
+type blockingACPWriter struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	buf     bytes.Buffer
+}
+
+func (w *blockingACPWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-w.release
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *blockingACPWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// TestACPStdinReadByOneScanner proves only scanLoop reads r.in, so there is no
+// second stdin reader competing for input lines.
+func TestACPStdinReadByOneScanner(t *testing.T) {
+	src, err := os.ReadFile("acp.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	decl := regexp.MustCompile(`(?m)^func (?:\([^)]*\) )?(\w+)\(`)
+	locs := decl.FindAllStringSubmatchIndex(s, -1)
+	for i, loc := range locs {
+		name := s[loc[2]:loc[3]]
+		end := len(s)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		if name != "scanLoop" && strings.Contains(s[loc[1]:end], "r.in") {
+			t.Fatalf("r.in is read in %s; only scanLoop may read the ACP stdin stream", name)
+		}
+	}
+}
+
+// TestACPCloseRejectsLaterAdmission proves a line read after shutdown closed the
+// dispatch gate is not admitted, so it is never parsed or dispatched.
+func TestACPCloseRejectsLaterAdmission(t *testing.T) {
+	r := &Runner{}
+	r.closeDispatch()
+	if r.admitDispatch() {
+		r.dispatchWG.Done()
+		t.Fatal("a line read after dispatch close must not be admitted")
+	}
+}
+
+// TestACPArchiveDeleteCloseRaceRefuses proves an archive/delete request
+// admitted by the ACP host before close but entering the owner after close is
+// refused at the owner admission boundary: the dispatch was admitted while the
+// owner was still open, but the owner had already published closed by the time
+// the handler reached the owner, so the removal must refuse with the
+// owner-closed error instead of taking a claim and mutating durably.
+func TestACPArchiveDeleteCloseRaceRefuses(t *testing.T) {
+	cases := []struct {
+		name   string
+		handle func(*Runner, Request)
+	}{
+		{name: "archive", handle: func(r *Runner, req Request) { r.handleSessionArchive(req) }},
+		{name: "delete", handle: func(r *Runner, req Request) { r.handleSessionDelete(req) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newACPTestAgent(t)
+			id, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("NewSession: %v", err)
+			}
+			var out bytes.Buffer
+			r := &Runner{agent: a, owner: a, out: &out}
+			// The archive/delete line is admitted by the host before close.
+			if !r.admitDispatch() {
+				t.Fatal("dispatch admission refused before close")
+			}
+			defer r.dispatchWG.Done()
+
+			// The owner publishes close before the admitted dispatch reaches it.
+			if !a.ShutdownOwner() {
+				t.Fatal("clean shutdown reported abandoned in-flight work")
+			}
+
+			req := Request{JSONRPC: "2.0", ID: tc.name, Params: json.RawMessage(`{"id":"` + id + `"}`)}
+			tc.handle(r, req)
+
+			lines := drainedLines(t, r, &out, 1)
+			var resp Response
+			if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+				t.Fatalf("response json: %v", err)
+			}
+			if resp.Error == nil || !strings.Contains(resp.Error.Message, "owner is shutting down") {
+				t.Fatalf("admitted-after-close %s response = %+v, want the owner-closed error", tc.name, resp)
+			}
+			if resp.Result != nil {
+				t.Fatalf("%s response carried a result: %#v", tc.name, resp.Result)
+			}
+		})
+	}
+}
+
+// TestACPShutdownJoinsAdmittedDispatchResponse proves shutdown waits for an
+// in-flight dispatch and that the dispatch's response is enqueued before shutdown
+// completes.
+func TestACPShutdownJoinsAdmittedDispatchResponse(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	if !r.admitDispatch() {
+		t.Fatal("admitDispatch must succeed before dispatch close")
+	}
+
+	teardownDone := make(chan struct{})
+	go func() {
+		r.closeDispatch()
+		r.dispatchWG.Wait()
+		close(teardownDone)
+	}()
+
+	select {
+	case <-teardownDone:
+		t.Fatal("shutdown joined before the admitted dispatch finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	r.processLine(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`))
+	r.dispatchWG.Done()
+
+	select {
+	case <-teardownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not complete after the admitted dispatch finished")
+	}
+
+	lines := drainedLines(t, r, &out, 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error != nil || resp.Result == nil {
+		t.Fatalf("admitted dispatch response = %+v, want a success result", resp)
+	}
+}
+
+// TestACPShutdownJoinsAdmittedDispatchParseError proves a malformed admitted line
+// still enqueues its parse-error response before shutdown completes.
+func TestACPShutdownJoinsAdmittedDispatchParseError(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	if !r.admitDispatch() {
+		t.Fatal("admitDispatch must succeed before dispatch close")
+	}
+
+	teardownDone := make(chan struct{})
+	go func() {
+		r.closeDispatch()
+		r.dispatchWG.Wait()
+		close(teardownDone)
+	}()
+
+	select {
+	case <-teardownDone:
+		t.Fatal("shutdown joined before the admitted parse-error finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	r.processLine(context.Background(), []byte(`{not json`))
+	r.dispatchWG.Done()
+
+	select {
+	case <-teardownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not complete after the admitted parse-error finished")
+	}
+
+	lines := drainedLines(t, r, &out, 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error == nil || resp.Error.Code != -32700 {
+		t.Fatalf("admitted parse-error response = %+v, want code -32700", resp)
+	}
+}
+
+// TestACPShutdownReturnsWithScanBlocked proves shutdown tears down and Run returns
+// even while a Scan is blocked on stdin; the blocked reader is abandoned.
+func TestACPShutdownReturnsWithScanBlocked(t *testing.T) {
+	ag := newACPTestAgent(t)
+	release := make(chan struct{})
+	var out bytes.Buffer
+	r := &Runner{agent: ag, owner: ag, in: blockingReader{release: release}, out: &out}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	time.Sleep(100 * time.Millisecond) // let Run reach the blocked Scan
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("Run did not return while a Scan was blocked on stdin")
+	}
+	close(release) // release the abandoned reader goroutine
+}
 
 func TestDispatchInitializeAndUnknownMethod(t *testing.T) {
 	var out bytes.Buffer
@@ -23,7 +817,7 @@ func TestDispatchInitializeAndUnknownMethod(t *testing.T) {
 	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: float64(1), Method: "initialize"})
 	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: float64(2), Method: "missing/method"})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	var initResp Response
 	if err := json.Unmarshal([]byte(lines[0]), &initResp); err != nil {
 		t.Fatalf("initialize response json: %v", err)
@@ -50,9 +844,9 @@ func TestWireHelpers(t *testing.T) {
 	r := &Runner{out: &out}
 	r.respond("id-1", map[string]any{"ok": true})
 	r.respondError("id-2", -32602, "bad params")
-	r.sendNotification(Notification{JSONRPC: "2.0", Method: "agent/test", Params: map[string]any{"x": 1}})
+	r.sendNotification(Notification{JSONRPC: "2.0", Method: "agent/test", Params: map[string]any{"x": 1}}, "")
 
-	lines := responseLines(t, out.String(), 3)
+	lines := drainedLines(t, r, &out, 3)
 	if !strings.Contains(lines[0], `"jsonrpc":"2.0"`) || !strings.HasSuffix(out.String(), "\n") {
 		t.Fatalf("response is not newline-terminated JSON-RPC: %q", out.String())
 	}
@@ -93,7 +887,7 @@ func TestHandleEventNotifications(t *testing.T) {
 	r.handleEvent(agent.Event{Kind: agent.EventWarning})
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, Result: "skip", SubagentSessionID: "sub"})
 
-	lines := responseLines(t, out.String(), 6)
+	lines := drainedLines(t, r, &out, 6)
 	wantMethods := []string{"agent/message_chunk", "agent/tool_start", "agent/tool_result", "agent/background_process_complete", "agent/warnings", "agent/warnings"}
 	for i, want := range wantMethods {
 		var got Notification
@@ -134,23 +928,152 @@ func TestHandleEventNotifications(t *testing.T) {
 	}
 }
 
+func TestHandleEventCarriesSequence(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, Seq: 5, Result: "hi"})
+	r.handleEvent(agent.Event{Kind: agent.EventToolCallStart, Seq: 6, ToolCallID: "tc1", ToolName: "read_file"})
+	r.handleEvent(agent.Event{Kind: agent.EventToolCallEnd, Seq: 7, ToolCallID: "tc1", ToolName: "read_file", Result: "done"})
+	r.handleEvent(agent.Event{Kind: agent.EventUserMessageDisplay, Seq: 8, Turn: 1, Result: "u"})
+	r.handleEvent(agent.Event{Kind: agent.EventGenericSystemSignal, Seq: 9, Result: "s"})
+	r.handleEvent(agent.Event{Kind: agent.EventError, Seq: 10, Error: "boom", Turn: 1})
+	r.handleEvent(agent.Event{
+		Kind: agent.EventBackgroundProcessComplete, Seq: 11,
+		BackgroundProcess: &agent.BackgroundProcessDisplay{ID: "bg-1", Command: "x", Reason: "completed"},
+	})
+
+	lines := drainedLines(t, r, &out, 7)
+	// Every transcript row carries its sequence so the client can gate live
+	// items against the navigation boundary high-water. tool_result is the
+	// exception: it updates the id-keyed row started by tool_start.
+	wantSeq := map[string]float64{
+		"agent/message_chunk":               5,
+		"agent/tool_start":                  6,
+		"agent/user_message":                8,
+		"agent/system_signal":               9,
+		"agent/error":                       10,
+		"agent/background_process_complete": 11,
+	}
+	for i, line := range lines {
+		var got Notification
+		if err := json.Unmarshal([]byte(line), &got); err != nil {
+			t.Fatalf("notification[%d] json: %v", i, err)
+		}
+		params, ok := got.Params.(map[string]any)
+		if !ok {
+			t.Fatalf("notification[%d] %s params not object: %#v", i, got.Method, got.Params)
+		}
+		if want, seqBearing := wantSeq[got.Method]; seqBearing {
+			if params["seq"] != want {
+				t.Fatalf("%s seq = %#v, want %v", got.Method, params["seq"], want)
+			}
+		}
+		if got.Method == "agent/tool_result" {
+			if _, present := params["seq"]; present {
+				t.Fatalf("tool_result must not carry seq (id-keyed update), got %#v", params["seq"])
+			}
+		}
+	}
+}
+
+// TestHandleEventErrorOmitsSequenceWhenUnsequenced verifies the agent/error
+// notification carries a seq field only when the error event was sequenced by a
+// transcript. A sessionless error is emitted directly and never sequenced
+// (Seq 0); its notification must omit the field, because a client gate that
+// reads the field's absence as "unsequenced" would reject a zero-stamped seq
+// against every snapshot high-water and the user would see nothing.
+func TestHandleEventErrorOmitsSequenceWhenUnsequenced(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	r.handleEvent(agent.Event{Kind: agent.EventError, Error: "sessionless", Turn: 1})
+	r.handleEvent(agent.Event{Kind: agent.EventError, Seq: 5, Error: "sequenced", Turn: 2})
+
+	lines := drainedLines(t, r, &out, 2)
+	for i, line := range lines {
+		var got Notification
+		if err := json.Unmarshal([]byte(line), &got); err != nil {
+			t.Fatalf("notification[%d] json: %v", i, err)
+		}
+		if got.Method != "agent/error" {
+			t.Fatalf("notification[%d] method = %q, want agent/error", i, got.Method)
+		}
+		params, ok := got.Params.(map[string]any)
+		if !ok {
+			t.Fatalf("notification[%d] %s params not object: %#v", i, got.Method, got.Params)
+		}
+		if i == 0 {
+			if _, present := params["seq"]; present {
+				t.Fatalf("sessionless error notification carries seq %#v; the field must be omitted", params["seq"])
+			}
+			if params["message"] != "sessionless" || params["turn"] != float64(1) {
+				t.Fatalf("sessionless error params = %#v, want message %q and turn 1", params, "sessionless")
+			}
+		} else {
+			if params["seq"] != float64(5) {
+				t.Fatalf("sequenced error notification seq = %#v, want 5", params["seq"])
+			}
+			if params["message"] != "sequenced" || params["turn"] != float64(2) {
+				t.Fatalf("sequenced error params = %#v, want message %q and turn 2", params, "sequenced")
+			}
+		}
+	}
+}
+
+// TestACPUsageAppliesCumulativeWithoutOwnerQuery proves the usage callback applies
+// the event's absolute cumulative report as a replacement and never queries the
+// owner: the runner has no agent, so any owner query would panic.
+func TestACPUsageAppliesCumulativeWithoutOwnerQuery(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	r.seedPresented("s")
+	report := agent.TokenReport{ContextUsed: 1234, ContextWindow: 8000}
+	r.handleEvent(agent.Event{Kind: agent.EventUsage, SessionID: "s", CumulativeTokens: &report})
+
+	lines := drainedLines(t, r, &out, 1)
+	assertACPNotificationMethod(t, lines[0], "agent/usage")
+	var notif Notification
+	if err := json.Unmarshal([]byte(lines[0]), &notif); err != nil {
+		t.Fatalf("usage notification json: %v", err)
+	}
+	data, err := json.Marshal(notif.Params)
+	if err != nil {
+		t.Fatalf("usage params marshal: %v", err)
+	}
+	var got agent.TokenReport
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("usage params json: %v", err)
+	}
+	if got.ContextUsed != 1234 || got.ContextWindow != 8000 {
+		t.Fatalf("usage = %#v, want the event's cumulative report applied without a query", got)
+	}
+}
+
+// TestHandleEventFiltersSession proves the drainer writes a session-tagged event
+// only while its session is presentation-current: a wrong-session event is dropped,
+// the presentation-current session's event is written, and a boundary that detaches
+// presentation current drops the session's subsequent events.
 func TestHandleEventFiltersSession(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{out: &out}
-	r.setCurrentSessionID("session-a")
+	r.seedPresented("session-a")
+
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "session-b", Result: "skip"})
+	r.drainForTest()
 	if out.Len() != 0 {
 		t.Fatalf("wrong-session event was emitted: %q", out.String())
 	}
+
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "session-a", Result: "keep"})
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	assertACPNotificationMethod(t, lines[0], "agent/message_chunk")
 
 	out.Reset()
-	r.setCurrentSessionID("")
+	// Detach presentation current through a boundary; the session's events now drop.
+	r.enqueueFrame(outFrame{kind: frameAdvance, sessionID: ""})
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: "session-a", Result: "skip"})
+	r.drainForTest()
 	if out.Len() != 0 {
-		t.Fatalf("empty-current event was emitted: %q", out.String())
+		t.Fatalf("event after detach was emitted: %q", out.String())
 	}
 }
 
@@ -161,7 +1084,7 @@ func TestHandleEventNotifiesUserMessageAndSystemSignal(t *testing.T) {
 	r.handleEvent(agent.Event{Kind: agent.EventUserMessageDisplay, Turn: 4, Result: "hello"})
 	r.handleEvent(agent.Event{Kind: agent.EventGenericSystemSignal, Turn: 4, Result: "Model switched to x/y"})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	var um Notification
 	if err := json.Unmarshal([]byte(lines[0]), &um); err != nil {
 		t.Fatalf("user_message json: %v", err)
@@ -200,7 +1123,7 @@ func TestHandleEventNotifiesQueueChanged(t *testing.T) {
 		Kind:         agent.EventQueueChanged,
 		QueueVersion: 3,
 	})
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	var qc Notification
 	if err := json.Unmarshal([]byte(lines[0]), &qc); err != nil {
 		t.Fatalf("queue_changed json: %v", err)
@@ -229,7 +1152,7 @@ func TestHandleEventTurnEndIncludesCancelled(t *testing.T) {
 	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 3, Cancelled: true})
 	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, Turn: 5, Cancelled: false})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	for i, expectCancelled := range []bool{true, false} {
 		var n Notification
 		if err := json.Unmarshal([]byte(lines[i]), &n); err != nil {
@@ -256,12 +1179,22 @@ func TestHandleEventCompactionEndPushesSessionChanged(t *testing.T) {
 	r := &Runner{agent: a, out: &out}
 	sessionID := a.SessionCurrent().ID
 	r.setCurrentSessionID(sessionID)
+	r.seedPresented(sessionID)
 
-	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, SessionID: sessionID, RefreshSession: true})
-
-	lines := responseLines(t, out.String(), 2)
+	// compaction_end alone notifies only compaction_end; the replacement transcript
+	// arrives as the separate rewrite boundary.
+	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, SessionID: sessionID})
+	lines := drainedLines(t, r, &out, 1)
 	assertACPNotificationMethod(t, lines[0], "agent/compaction_end")
-	assertACPNotificationMethod(t, lines[1], "agent/session_changed")
+
+	out.Reset()
+	payload, err := a.SessionPayloadForSession(sessionID)
+	if err != nil {
+		t.Fatalf("SessionPayloadForSession: %v", err)
+	}
+	r.handleEvent(agent.Event{Kind: agent.EventSessionRewrite, SessionID: sessionID, RewritePayload: &payload})
+	lines = drainedLines(t, r, &out, 1)
+	assertACPNotificationMethod(t, lines[0], "agent/session_resync")
 }
 
 func TestHandleEventActiveCompactionDefersSessionChangedUntilTurnEnd(t *testing.T) {
@@ -281,22 +1214,34 @@ func TestHandleEventActiveCompactionDefersSessionChangedUntilTurnEnd(t *testing.
 	r := &Runner{agent: a, out: &out}
 	sessionID := a.SessionCurrent().ID
 	r.setCurrentSessionID(sessionID)
+	r.seedPresented(sessionID)
 
 	r.handleEvent(agent.Event{Kind: agent.EventCompactionEnd, SessionID: sessionID})
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	assertACPNotificationMethod(t, lines[0], "agent/compaction_end")
 
 	if err := a.Store().MarkTurnComplete(turn); err != nil {
 		t.Fatalf("MarkTurnComplete active: %v", err)
 	}
+	r.drainForTest()
 	out.Reset()
-	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, SessionID: sessionID, Turn: turn, RefreshSession: true})
-	lines = responseLines(t, out.String(), 2)
-	assertACPNotificationMethod(t, lines[0], "agent/turn_end")
-	assertACPNotificationMethod(t, lines[1], "agent/session_changed")
-	if !strings.Contains(lines[1], "active prompt") {
-		t.Fatalf("session_changed after turn_end omitted completed active turn: %s", lines[1])
+	// The replacement is published as the rewrite boundary at compaction success,
+	// not deferred onto turn_end; turn_end itself carries no resync.
+	payload, err := a.SessionPayloadForSession(sessionID)
+	if err != nil {
+		t.Fatalf("SessionPayloadForSession: %v", err)
 	}
+	r.handleEvent(agent.Event{Kind: agent.EventSessionRewrite, SessionID: sessionID, RewritePayload: &payload})
+	lines = drainedLines(t, r, &out, 1)
+	assertACPNotificationMethod(t, lines[0], "agent/session_resync")
+	if !strings.Contains(lines[0], "active prompt") {
+		t.Fatalf("session_resync omitted completed active turn: %s", lines[0])
+	}
+
+	out.Reset()
+	r.handleEvent(agent.Event{Kind: agent.EventTurnEnd, SessionID: sessionID, Turn: turn})
+	lines = drainedLines(t, r, &out, 1)
+	assertACPNotificationMethod(t, lines[0], "agent/turn_end")
 }
 
 func TestDispatchWarningsCurrentReturnsCurrentWarningSnapshot(t *testing.T) {
@@ -309,7 +1254,7 @@ func TestDispatchWarningsCurrentReturnsCurrentWarningSnapshot(t *testing.T) {
 
 	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "warnings", Method: "warnings/current"})
 
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("response json: %v", err)
@@ -329,7 +1274,7 @@ func TestDispatchWarningsCurrentReturnsEmptyArrayForNoWarnings(t *testing.T) {
 
 	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "warnings", Method: "warnings/current"})
 
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("response json: %v", err)
@@ -347,7 +1292,7 @@ func TestPermissionRespondMissingAction(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{out: &out}
 	r.handlePermissionRespond(Request{JSONRPC: "2.0", ID: "p", Params: json.RawMessage(`{"id":"perm"}`)})
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("response json: %v", err)
@@ -357,10 +1302,15 @@ func TestPermissionRespondMissingAction(t *testing.T) {
 	}
 }
 
-func TestHandleTurnActionACPRevertCodeReturnsResultWithoutSessionChanged(t *testing.T) {
+// TestHandleTurnActionACPRevertCodePublishesCompleteBoundaryBeforeResponse
+// covers the reversed RevertCode success expectation: the complete state is
+// prebuilt before the mutation, so the response is boundary-before-success and
+// the result carries the prebuilt durable display messages, while the result
+// still reports no session change (a code revert keeps the same session).
+func TestHandleTurnActionACPRevertCodePublishesCompleteBoundaryBeforeResponse(t *testing.T) {
 	a := newACPTestAgent(t)
 	var out bytes.Buffer
-	r := &Runner{agent: a, out: &out}
+	r := &Runner{agent: a, owner: a, out: &out}
 
 	_ = appendACPUserTurn(t, a, "first")
 	r.setCurrentSessionID(a.SessionCurrent().ID)
@@ -373,17 +1323,25 @@ func TestHandleTurnActionACPRevertCodeReturnsResultWithoutSessionChanged(t *test
 		Params:  json.RawMessage(`{"turn":` + itoa(clickedTurn) + `,"alsoRevertCode":true}`),
 	})
 
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 2)
+	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+	state := hydrationStateFromParams(t, acpNotificationParams(t, lines[0]))
 	var resp Response
-	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
 		t.Fatalf("response json: %v", err)
 	}
 	result := turnActionResultFromResponse(t, resp)
 	if resp.Error != nil || result.Action != agent.TurnActionRevertCode || result.Turn != clickedTurn || result.TargetTurn != clickedTurn-1 || result.SessionChanged {
 		t.Fatalf("response/result = %+v %#v, want revert_code result without session change", resp, result)
 	}
-	if len(result.Messages) != 0 {
-		t.Fatalf("revert_code messages len = %d, want no hydrated messages", len(result.Messages))
+	if state.Session.ID == "" || !reflect.DeepEqual(result.Session, state.Session) {
+		t.Fatalf("result session = %+v, want the boundary's complete summary %+v", result.Session, state.Session)
+	}
+	if len(result.Messages) == 0 || !reflect.DeepEqual(result.Messages, state.Messages) {
+		t.Fatalf("result messages (%d rows) must equal the boundary's prebuilt display history", len(result.Messages))
+	}
+	if !reflect.DeepEqual(result.Tokens, state.Tokens) {
+		t.Fatalf("result tokens = %+v, want the boundary's %+v", result.Tokens, state.Tokens)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("created file still exists after revert code; stat err=%v", err)
@@ -393,7 +1351,7 @@ func TestHandleTurnActionACPRevertCodeReturnsResultWithoutSessionChanged(t *test
 func TestHandleTurnActionACPRevertHistoryPropagatesAlsoRevertCode(t *testing.T) {
 	a := newACPTestAgent(t)
 	var out bytes.Buffer
-	r := &Runner{agent: a, out: &out}
+	r := &Runner{agent: a, owner: a, out: &out}
 
 	_ = appendACPUserTurn(t, a, "first")
 	r.setCurrentSessionID(a.SessionCurrent().ID)
@@ -407,7 +1365,7 @@ func TestHandleTurnActionACPRevertHistoryPropagatesAlsoRevertCode(t *testing.T) 
 		Params:  json.RawMessage(`{"turn":` + itoa(clickedTurn) + `,"alsoRevertCode":true}`),
 	})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
@@ -428,7 +1386,7 @@ func TestHandleTurnActionACPRevertHistoryPropagatesAlsoRevertCode(t *testing.T) 
 func TestHandleTurnActionACPForkReturnsResultAndSessionChanged(t *testing.T) {
 	a := newACPTestAgent(t)
 	var out bytes.Buffer
-	r := &Runner{agent: a, out: &out}
+	r := &Runner{agent: a, owner: a, out: &out}
 
 	_ = appendACPUserTurn(t, a, "first")
 	r.setCurrentSessionID(a.SessionCurrent().ID)
@@ -442,7 +1400,7 @@ func TestHandleTurnActionACPForkReturnsResultAndSessionChanged(t *testing.T) {
 		Params:  json.RawMessage(`{"turn":` + itoa(clickedTurn) + `}`),
 	})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
@@ -457,13 +1415,1324 @@ func TestHandleTurnActionACPForkReturnsResultAndSessionChanged(t *testing.T) {
 	}
 }
 
+// TestHandleTurnActionACPForkWarningOnFailedCodeRevert proves the protocol
+// response for a fork whose best-effort code revert failed still returns the
+// fork's result — success — and carries the failed revert as the result's
+// warning: the host must not turn the published fork into an error response.
+func TestHandleTurnActionACPForkWarningOnFailedCodeRevert(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes as root")
+	}
+	a := newACPTestAgent(t)
+	var out bytes.Buffer
+	r := &Runner{agent: a, owner: a, out: &out}
+
+	_ = appendACPUserTurn(t, a, "first")
+	r.setCurrentSessionID(a.SessionCurrent().ID)
+	clickedTurn := appendACPUserTurn(t, a, "fork point")
+	sub := filepath.Join(a.ProjectRoot(), "sub")
+	path := filepath.Join(sub, "created-after-fork.txt")
+	_ = appendACPUserTurnWithSnapshot(t, a, "create after fork", path, "later\n")
+	beforeID := a.SessionCurrent().ID
+	if err := os.Chmod(sub, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(sub, 0o700) }()
+
+	r.handleSessionFork(Request{
+		JSONRPC: "2.0",
+		ID:      "fork",
+		Params:  json.RawMessage(`{"turn":` + itoa(clickedTurn) + `,"alsoRevertCode":true}`),
+	})
+
+	lines := drainedLines(t, r, &out, 2)
+	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	result := turnActionResultFromResponse(t, resp)
+	if resp.Error != nil {
+		t.Fatalf("a failed best-effort code revert must not fail the fork response: %+v", resp.Error)
+	}
+	if result.Action != agent.TurnActionFork || result.Session.ID == "" || result.Session.ID == beforeID {
+		t.Fatalf("response/result = %+v %#v, want successful fork result with new session", resp, result)
+	}
+	if result.Warning == "" || !strings.Contains(result.Warning, "code revert failed") {
+		t.Fatalf("fork response must carry the failed code revert warning, got %q", result.Warning)
+	}
+}
+
+// TestACPOrderedDelivery proves that every boundary-producing lifecycle
+// operation enqueues its session boundary before its success response (the nearest
+// forbidden sibling is response-before-boundary), and that a preparation/mutation
+// failure enqueues only its error response and no boundary. revert_code now
+// prebuilds its complete state and publishes the boundary before the response
+// too, so its success is boundary-before-response like the other lifecycle ops.
+func TestACPOrderedDelivery(t *testing.T) {
+	cases := []struct {
+		name          string
+		emitsBoundary bool
+		success       func(t *testing.T) (*Runner, *bytes.Buffer, func())
+		fail          func(t *testing.T) (*Runner, *bytes.Buffer, func())
+		failPrebuild  func(t *testing.T) (*Runner, *bytes.Buffer, func())
+		failMutation  func(t *testing.T) (*Runner, *bytes.Buffer, func())
+	}{
+		{
+			name:          "session_new",
+			emitsBoundary: true,
+			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				id, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession: %v", err)
+				}
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				r.setCurrentSessionID(id)
+				req := Request{JSONRPC: "2.0", ID: "new", Method: "session/new"}
+				return r, out, func() { r.handleSessionNew(req) }
+			},
+		},
+		{
+			name:          "session_switch",
+			emitsBoundary: true,
+			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				first, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession first: %v", err)
+				}
+				if _, err := a.AppendUserMessageToSession(first, "first"); err != nil {
+					t.Fatalf("append first: %v", err)
+				}
+				second, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession second: %v", err)
+				}
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				r.setCurrentSessionID(second)
+				req := Request{JSONRPC: "2.0", ID: "switch", Params: json.RawMessage(`{"id":"` + first + `"}`)}
+				return r, out, func() { r.handleSessionSwitch(req) }
+			},
+			fail: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				id, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession: %v", err)
+				}
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				r.setCurrentSessionID(id)
+				req := Request{JSONRPC: "2.0", ID: "switch", Params: json.RawMessage(`{"id":"does-not-exist"}`)}
+				return r, out, func() { r.handleSessionSwitch(req) }
+			},
+		},
+		{
+			name:          "session_archive",
+			emitsBoundary: true,
+			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				if _, err := a.NewSession("", "primary"); err != nil {
+					t.Fatalf("NewSession keep: %v", err)
+				}
+				id, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession target: %v", err)
+				}
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				r.setCurrentSessionID(id)
+				req := Request{JSONRPC: "2.0", ID: "archive", Params: json.RawMessage(`{"id":"` + id + `"}`)}
+				return r, out, func() { r.handleSessionArchive(req) }
+			},
+			fail: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				id, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession: %v", err)
+				}
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				r.setCurrentSessionID(id)
+				req := Request{JSONRPC: "2.0", ID: "archive", Params: json.RawMessage(`{"id":"does-not-exist"}`)}
+				return r, out, func() { r.handleSessionArchive(req) }
+			},
+		},
+		{
+			name:          "session_delete",
+			emitsBoundary: true,
+			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				if _, err := a.NewSession("", "primary"); err != nil {
+					t.Fatalf("NewSession keep: %v", err)
+				}
+				id, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession target: %v", err)
+				}
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				r.setCurrentSessionID(id)
+				req := Request{JSONRPC: "2.0", ID: "delete", Params: json.RawMessage(`{"id":"` + id + `"}`)}
+				return r, out, func() { r.handleSessionDelete(req) }
+			},
+			fail: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				id, err := a.NewSession("", "primary")
+				if err != nil {
+					t.Fatalf("NewSession: %v", err)
+				}
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				r.setCurrentSessionID(id)
+				req := Request{JSONRPC: "2.0", ID: "delete", Params: json.RawMessage(`{"id":"does-not-exist"}`)}
+				return r, out, func() { r.handleSessionDelete(req) }
+			},
+		},
+		{
+			name:          "session_fork",
+			emitsBoundary: true,
+			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				appendACPUserTurn(t, a, "first")
+				r.setCurrentSessionID(a.SessionCurrent().ID)
+				clicked := appendACPUserTurn(t, a, "fork point")
+				appendACPUserTurn(t, a, "after")
+				req := Request{JSONRPC: "2.0", ID: "fork", Params: json.RawMessage(`{"turn":` + itoa(clicked) + `}`)}
+				return r, out, func() { r.handleSessionFork(req) }
+			},
+			fail: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				req := Request{JSONRPC: "2.0", ID: "fork", Params: json.RawMessage(`{"session_id":"does-not-exist","turn":1}`)}
+				return r, out, func() { r.handleSessionFork(req) }
+			},
+		},
+		{
+			name:          "session_revert_code",
+			emitsBoundary: true,
+			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				appendACPUserTurn(t, a, "first")
+				r.setCurrentSessionID(a.SessionCurrent().ID)
+				path := filepath.Join(a.ProjectRoot(), "created.txt")
+				clicked := appendACPUserTurnWithSnapshot(t, a, "create file", path, "created\n")
+				req := Request{JSONRPC: "2.0", ID: "revert-code", Params: json.RawMessage(`{"turn":` + itoa(clicked) + `,"alsoRevertCode":true}`)}
+				return r, out, func() { r.handleRevertCode(req) }
+			},
+			fail: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				req := Request{JSONRPC: "2.0", ID: "revert-code", Params: json.RawMessage(`{"session_id":"does-not-exist","turn":1,"alsoRevertCode":true}`)}
+				return r, out, func() { r.handleRevertCode(req) }
+			},
+			failPrebuild: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				appendACPUserTurn(t, a, "first")
+				r.setCurrentSessionID(a.SessionCurrent().ID)
+				path := filepath.Join(a.ProjectRoot(), "created.txt")
+				clicked := appendACPUserTurnWithSnapshot(t, a, "create file", path, "created\n")
+				// A corrupt compaction record makes the prebuilt display-history read fail:
+				// the preparation cannot build complete state from partial reads.
+				if err := os.WriteFile(filepath.Join(a.Store().Dir(), "compaction.json"), []byte(`{not json`), 0o600); err != nil {
+					t.Fatalf("corrupt compaction record: %v", err)
+				}
+				req := Request{JSONRPC: "2.0", ID: "revert-code", Params: json.RawMessage(`{"turn":` + itoa(clicked) + `,"alsoRevertCode":true}`)}
+				return r, out, func() {
+					r.handleRevertCode(req)
+					lines := drainedLines(t, r, out, 1)
+					assertACPBareError(t, lines[0])
+					// The preparation refused before the mutation: no snapshot was restored.
+					if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+						t.Fatal("prebuild failure must not mutate: created file was reverted")
+					}
+				}
+			},
+			failMutation: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				appendACPUserTurn(t, a, "first")
+				r.setCurrentSessionID(a.SessionCurrent().ID)
+				path := filepath.Join(a.ProjectRoot(), "created.txt")
+				clicked := appendACPUserTurnWithSnapshot(t, a, "create file", path, "created\n")
+				blockACPSnapshotTurnDir(t, a, clicked)
+				req := Request{JSONRPC: "2.0", ID: "revert-code", Params: json.RawMessage(`{"turn":` + itoa(clicked) + `,"alsoRevertCode":true}`)}
+				return r, out, func() { r.handleRevertCode(req) }
+			},
+		},
+		{
+			name:          "session_revert_history",
+			emitsBoundary: true,
+			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				appendACPUserTurn(t, a, "first")
+				r.setCurrentSessionID(a.SessionCurrent().ID)
+				path := filepath.Join(a.ProjectRoot(), "created.txt")
+				clicked := appendACPUserTurnWithSnapshot(t, a, "create file", path, "created\n")
+				appendACPUserTurn(t, a, "after")
+				req := Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"turn":` + itoa(clicked) + `,"alsoRevertCode":true}`)}
+				return r, out, func() { r.handleRevertHistory(req) }
+			},
+			fail: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
+				a := newACPTestAgent(t)
+				out := new(bytes.Buffer)
+				r := &Runner{agent: a, owner: a, out: out}
+				req := Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"session_id":"does-not-exist","turn":1,"alsoRevertCode":true}`)}
+				return r, out, func() { r.handleRevertHistory(req) }
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"/success_boundary_before_response", func(t *testing.T) {
+			r, out, invoke := tc.success(t)
+			invoke()
+			if tc.emitsBoundary {
+				lines := drainedLines(t, r, out, 2)
+				assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+				assertACPSuccessResponse(t, lines[1])
+			} else {
+				lines := drainedLines(t, r, out, 1)
+				assertACPSuccessResponse(t, lines[0])
+			}
+		})
+		if tc.fail != nil {
+			t.Run(tc.name+"/failure_error_only_no_boundary", func(t *testing.T) {
+				r, out, invoke := tc.fail(t)
+				invoke()
+				lines := drainedLines(t, r, out, 1)
+				assertACPErrorResponse(t, lines[0])
+			})
+		}
+		if tc.failPrebuild != nil {
+			t.Run(tc.name+"/prebuild_failure_error_only_no_boundary", func(t *testing.T) {
+				_, _, invoke := tc.failPrebuild(t)
+				invoke()
+			})
+		}
+		if tc.failMutation != nil {
+			t.Run(tc.name+"/mutation_failure_error_only_no_boundary", func(t *testing.T) {
+				r, out, invoke := tc.failMutation(t)
+				invoke()
+				lines := drainedLines(t, r, out, 1)
+				assertACPBareError(t, lines[0])
+			})
+		}
+	}
+}
+
+// TestACPPartialHistoryErrorCarriesBoundaryData proves the ordered partial
+// history outcome: the walk removes at least one turn, the owner publishes the
+// reconciled state as the boundary first, and the error response then carries
+// the same prepared TurnActionResult as error.data — matching the boundary's
+// session and messages, with the warning and the input prefill. The
+// first-removal precommit sibling stays bare: no durable change means no
+// boundary, no data, and no owner reconciliation.
+func TestACPPartialHistoryErrorCarriesBoundaryData(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes as root")
+	}
+	t.Run("partial_walk_boundary_before_error_with_data", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		for _, c := range []string{"turn 1", "turn 2", "turn 3", "turn 4", "turn 5"} {
+			appendACPUserTurn(t, a, c)
+		}
+		r.setCurrentSessionID(a.SessionCurrent().ID)
+		// Reverting to turn 4 removes turns 4 and 5; blocking turn 4 makes the
+		// walk stop there — a partial failure whose history changed.
+		blockACPTurnDir(t, a, 4)
+		req := Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"turn":4}`)}
+		r.handleRevertHistory(req)
+
+		lines := drainedLines(t, r, out, 2)
+		assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+		state := hydrationStateFromParams(t, acpNotificationParams(t, lines[0]))
+		if c := acpUserContents(state.Messages); !acpEqualStrings(c, []string{"turn 1", "turn 2", "turn 3", "turn 4"}) {
+			t.Fatalf("boundary messages = %q, want turns 1-4", c)
+		}
+		var resp Response
+		if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
+			t.Fatalf("response json: %v", err)
+		}
+		if resp.Error == nil || resp.Error.Data == nil {
+			t.Fatalf("error response must carry the prepared result as data: %+v", resp.Error)
+		}
+		dataBytes, err := json.Marshal(resp.Error.Data)
+		if err != nil {
+			t.Fatalf("marshal error data: %v", err)
+		}
+		var data agent.TurnActionResult
+		if err := json.Unmarshal(dataBytes, &data); err != nil {
+			t.Fatalf("unmarshal error data as TurnActionResult: %v", err)
+		}
+		if data.Session.ID != state.Session.ID {
+			t.Fatalf("error data session = %q, want the boundary's %q", data.Session.ID, state.Session.ID)
+		}
+		if c := acpUserContents(data.Messages); !acpEqualStrings(c, []string{"turn 1", "turn 2", "turn 3", "turn 4"}) {
+			t.Fatalf("error data messages = %q, want turns 1-4 matching the boundary", c)
+		}
+		if !strings.Contains(data.Warning, "turn 4") {
+			t.Fatalf("error data warning = %q, want the walk error naming turn 4", data.Warning)
+		}
+		if data.Prefill != "turn 4" {
+			t.Fatalf("error data prefill = %q, want the clicked user message %q", data.Prefill, "turn 4")
+		}
+	})
+
+	t.Run("first_removal_precommit_error_only", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		for _, c := range []string{"turn 1", "turn 2", "turn 3"} {
+			appendACPUserTurn(t, a, c)
+		}
+		r.setCurrentSessionID(a.SessionCurrent().ID)
+		// Blocking the first removal (turn 3) leaves no durable change: the
+		// outcome is a precommit failure — error only, no boundary, no data.
+		blockACPTurnDir(t, a, 3)
+		req := Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"turn":3}`)}
+		r.handleRevertHistory(req)
+
+		lines := drainedLines(t, r, out, 1)
+		var resp Response
+		if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+			t.Fatalf("response json: %v", err)
+		}
+		if resp.Error == nil {
+			t.Fatal("first-removal precommit failure must reject")
+		}
+		if resp.Error.Data != nil {
+			t.Fatalf("precommit failure must carry no data, got %#v", resp.Error.Data)
+		}
+	})
+}
+
+func TestACPHighestTurnPartialHistoryCarriesBoundaryData(t *testing.T) {
+	a := newACPTestAgent(t)
+	out := new(bytes.Buffer)
+	r := &Runner{agent: a, owner: a, out: out}
+	for _, content := range []string{"turn 1", "turn 2", "turn 3", "turn 4", "turn 5"} {
+		appendACPUserTurn(t, a, content)
+	}
+	r.setCurrentSessionID(a.SessionCurrent().ID)
+	injected := errors.New("injected ACP highest-turn partial failure")
+	snapshot.RemoveHistoryTurnFunc = func(path string) error {
+		if filepath.Base(path) == "5" {
+			if err := os.Remove(filepath.Join(path, "messages.jsonl")); err != nil {
+				return err
+			}
+		}
+		return injected
+	}
+	t.Cleanup(func() { snapshot.RemoveHistoryTurnFunc = nil })
+
+	r.handleRevertHistory(Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"turn":3}`)})
+	lines := drainedLines(t, r, out, 2)
+	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+	state := hydrationStateFromParams(t, acpNotificationParams(t, lines[0]))
+	if got := acpUserContents(state.Messages); !acpEqualStrings(got, []string{"turn 1", "turn 2", "turn 3", "turn 4"}) {
+		t.Fatalf("boundary messages = %q, want turns 1-4", got)
+	}
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error == nil || resp.Error.Data == nil || !strings.Contains(resp.Error.Message, "highest-turn partial") {
+		t.Fatalf("response = %+v, want structured partial error", resp)
+	}
+}
+
+// blockACPTurnMessages makes one surviving turn's messages file unreadable: the
+// post-walk reload derives the loop from disk, and its first read of a blocked
+// surviving turn fails exactly there while the walk — which only removes turn
+// directories — proceeds normally. The same fixture shape as the owner-level
+// eviction tests use to force a failed reload after a durable history change.
+func blockACPTurnMessages(t *testing.T, a *agent.Agent, turn int) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("file permissions do not block reads as root")
+	}
+	blocked := filepath.Join(a.Store().Dir(), "turns", strconv.Itoa(turn), "messages.jsonl")
+	if err := os.Chmod(blocked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o600) })
+}
+
+// TestACPEvictedHistoryCarriesPreparedEvictionOutcome proves the eviction
+// outcome of a history revert whose reload fails after a durable change: the
+// owner publishes the empty replacement state as the boundary first — no live
+// view exists for an evicted unit, so nothing is re-read to build one — and the
+// error response then carries the same prepared TurnActionResult: an empty
+// session (no stale pre-reload summary, messages, or tokens), a warning naming
+// every cause exactly as returned, and the clicked user message's nonnil
+// prefill. The nearest forbidden siblings are data that re-reads state after
+// commit and result fields that outlive the eviction on one side only.
+func TestACPEvictedHistoryCarriesPreparedEvictionOutcome(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("file permissions do not block reads as root")
+	}
+	a := newACPTestAgent(t)
+	out := new(bytes.Buffer)
+	r := &Runner{agent: a, owner: a, out: out}
+	for _, c := range []string{"turn 1", "turn 2", "turn 3"} {
+		appendACPUserTurn(t, a, c)
+	}
+	id := a.SessionCurrent().ID
+	r.setCurrentSessionID(id)
+	// Reverting to turn 3 removes turns above it; blocking the surviving turn's
+	// messages file makes the reload fail after that durable change.
+	blockACPTurnMessages(t, a, 2)
+	req := Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"turn":3}`)}
+	r.handleRevertHistory(req)
+
+	lines := drainedLines(t, r, out, 2)
+	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+	state := hydrationStateFromParams(t, acpNotificationParams(t, lines[0]))
+	if state.Session.ID != "" || len(state.Messages) != 0 {
+		t.Fatalf("eviction boundary = %+v, want the empty replacement state", state)
+	}
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error == nil || resp.Error.Data == nil {
+		t.Fatalf("evicted history must reject with the prepared result as data: %+v", resp)
+	}
+	dataBytes, err := json.Marshal(resp.Error.Data)
+	if err != nil {
+		t.Fatalf("marshal error data: %v", err)
+	}
+	var data agent.TurnActionResult
+	if err := json.Unmarshal(dataBytes, &data); err != nil {
+		t.Fatalf("unmarshal error data as TurnActionResult: %v", err)
+	}
+	// The empty replacement state is the same on both sides: no stale pre-build
+	// summary, messages, or tokens survive in either payload.
+	if !reflect.DeepEqual(data.Session, state.Session) || len(data.Messages) != 0 || !reflect.DeepEqual(data.Tokens, state.Tokens) {
+		t.Fatalf("error data = session %+v / %d message rows / tokens %+v, want the boundary's empty replacement", data.Session, len(data.Messages), data.Tokens)
+	}
+	if data.Warning == "" || resp.Error.Message != data.Warning {
+		t.Fatalf("warning mismatch: error message %q vs prepared data warning %q", resp.Error.Message, data.Warning)
+	}
+	if !strings.Contains(resp.Error.Message, "messages.jsonl") {
+		t.Fatalf("error = %q, want the reload's cause naming messages.jsonl", resp.Error.Message)
+	}
+	// The prefill disposition matches what was emitted: this fixture makes the
+	// same unreadable file break the best-effort display read that derives the
+	// clicked message before mutation, so the prepared pointer holds empty
+	// content — and data must carry no other (stale or reconstructed) value.
+	if data.Prefill != "" {
+		t.Fatalf("error data prefill = %q, want the emitted prepared value", data.Prefill)
+	}
+	// The unit is evicted: nothing live resolves under its id any more.
+	if _, err := r.agent.SessionSummaryForSession(id); err == nil {
+		t.Fatal("evicted session still resolves as a summary")
+	}
+}
+
+// TestACPOrderedDeliveryContract is the session/prompt ordered-delivery
+// contract. The prompt's implicit switch boundary is invisible on the wire (an
+// advance frame with no payload), so it cannot be a row in the table-shaped
+// TestACPOrderedDelivery, whose success cells assert a visible boundary before
+// the response. Ordering is asserted through the boundary's effect: the
+// destination's first frames are delivered, and a submit that fails leaves
+// routing and presentation on the previous session.
+func TestACPOrderedDeliveryContract(t *testing.T) {
+	t.Run("session/prompt=success_advance_ahead_of_first_frames", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		firstID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession first: %v", err)
+		}
+		if _, err := a.AppendUserMessageToSession(firstID, "first"); err != nil {
+			t.Fatalf("append first: %v", err)
+		}
+		secondID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession second: %v", err)
+		}
+		if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+			t.Fatalf("append second: %v", err)
+		}
+
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		a.SetEventHandler(r.handleEvent)
+		r.setCurrentSessionID(firstID)
+		r.seedPresented(firstID)
+
+		// A live context admits the submit against the dead provider. The turn's
+		// first frame (turn_start) is enqueued synchronously inside the submit,
+		// ahead of the response; the turn itself fails fast in its goroutine and
+		// parks in the flush round-trip (whose consumer only runs after Init), so
+		// no further frames follow the response.
+		r.handleSessionPrompt(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"hi"}`),
+		})
+		r.drainForTest()
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+
+		// The invisible advance is adopted before the first written frame, so the
+		// destination's first frame — turn_start, emitted synchronously inside the
+		// submit — reaches the client instead of being filtered out, and it is
+		// delivered before the response. A commit-after-return ordering drops it.
+		turnStartIdx, responseIdx := -1, -1
+		for i, line := range lines {
+			var frame map[string]any
+			if err := json.Unmarshal([]byte(line), &frame); err != nil {
+				t.Fatalf("frame json: %v", err)
+			}
+			if m, _ := frame["method"].(string); m == "agent/turn_start" {
+				turnStartIdx = i
+			}
+			if _, ok := frame["id"]; ok {
+				responseIdx = i
+			}
+		}
+		if turnStartIdx < 0 {
+			t.Fatalf("no turn_start frame reached the client; frames: %q", out.String())
+		}
+		if responseIdx < 0 {
+			t.Fatalf("no success response among frames: %q", out.String())
+		}
+		if turnStartIdx > responseIdx {
+			t.Fatalf("turn_start frame (index %d) delivered after the response (index %d): %q", turnStartIdx, responseIdx, out.String())
+		}
+		if got := r.currentSessionSummary().ID; got != secondID {
+			t.Fatalf("routing current = %q, want %q", got, secondID)
+		}
+		r.mu.Lock()
+		presented := r.presented
+		r.mu.Unlock()
+		if presented != secondID {
+			t.Fatalf("presentation current = %q, want %q", presented, secondID)
+		}
+	})
+
+	t.Run("session/prompt=failure_routing_and_presentation_unchanged", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		firstID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession first: %v", err)
+		}
+		secondID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession second: %v", err)
+		}
+
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		r.setCurrentSessionID(firstID)
+		r.seedPresented(firstID)
+
+		// A closed runtime is the submit-side failure the id pre-check cannot
+		// see: the session is still resolvable, but rt.submit rejects admission.
+		a.ShutdownOwner()
+
+		r.handleSessionPrompt(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"hi"}`),
+		})
+		lines := drainedLines(t, r, out, 1)
+		assertACPErrorResponse(t, lines[0])
+		// The view's routing id is asserted directly: it is the routing state
+		// the failed submit must leave unchanged, and it survives the clean
+		// shutdown, whose store detach makes a summary lookup fail and would
+		// clear the id on that error.
+		got, err := r.currentSession()
+		if err != nil {
+			t.Fatalf("current session: %v", err)
+		}
+		if got != firstID {
+			t.Fatalf("routing current = %q, want unchanged %q", got, firstID)
+		}
+		r.mu.Lock()
+		presented := r.presented
+		r.mu.Unlock()
+		if presented != firstID {
+			t.Fatalf("presentation current = %q, want unchanged %q", presented, firstID)
+		}
+	})
+
+	t.Run("session/prompt=success_queued_advance_ahead_of_queue_changed", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		firstID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession first: %v", err)
+		}
+		secondID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession second: %v", err)
+		}
+
+		// Make secondID busy with a real turn against the dead provider. The turn
+		// goroutine parks in the flush round-trip (whose consumer only runs after
+		// Init), so the unit stays busy and the next submit is queued, not
+		// started.
+		res, err := a.SubmitToSession(context.Background(), secondID, "first")
+		if err != nil {
+			t.Fatalf("SubmitToSession busy turn: %v", err)
+		}
+		if !res.Started {
+			t.Fatalf("busy turn was queued instead of started: %+v", res)
+		}
+
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		a.SetEventHandler(r.handleEvent)
+		r.setCurrentSessionID(firstID)
+		r.seedPresented(firstID)
+
+		// The targeted session is busy, so the submit queues; admission becomes
+		// certain at the queue append, where the implicit switch commits routing
+		// and advances presentation ahead of the queue-changed event for this
+		// submit.
+		r.handleSessionPrompt(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"queued"}`),
+		})
+		r.drainForTest()
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+
+		queueChangedIdx, responseIdx := -1, -1
+		for i, line := range lines {
+			var frame map[string]any
+			if err := json.Unmarshal([]byte(line), &frame); err != nil {
+				t.Fatalf("frame json: %v", err)
+			}
+			if m, _ := frame["method"].(string); m == "agent/queue_changed" {
+				queueChangedIdx = i
+			}
+			if _, ok := frame["id"]; ok {
+				responseIdx = i
+			}
+		}
+		// The advance is adopted before the first written frame, so the
+		// queue-changed event for this submit reaches the client instead of being
+		// filtered out, and it is delivered before the response. An admitted
+		// callback fired after the append drops it.
+		if queueChangedIdx < 0 {
+			t.Fatalf("no queue_changed frame reached the client; frames: %q", out.String())
+		}
+		if !strings.Contains(lines[queueChangedIdx], `"queued"`) {
+			t.Fatalf("queue_changed frame does not carry this submit's item: %q", lines[queueChangedIdx])
+		}
+		if responseIdx < 0 {
+			t.Fatalf("no success response among frames: %q", out.String())
+		}
+		if queueChangedIdx > responseIdx {
+			t.Fatalf("queue_changed frame (index %d) delivered after the response (index %d): %q", queueChangedIdx, responseIdx, out.String())
+		}
+		var resp Response
+		if err := json.Unmarshal([]byte(lines[responseIdx]), &resp); err != nil {
+			t.Fatalf("response json: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("queued prompt response error = %+v", resp.Error)
+		}
+		result, ok := resp.Result.(map[string]any)
+		if !ok {
+			t.Fatalf("queued prompt result not an object: %#v", resp.Result)
+		}
+		if started, _ := result["started"].(bool); started {
+			t.Fatalf("queued prompt response started = true, want queued (false)")
+		}
+		if got := r.currentSessionSummary().ID; got != secondID {
+			t.Fatalf("routing current = %q, want %q", got, secondID)
+		}
+		r.mu.Lock()
+		presented := r.presented
+		r.mu.Unlock()
+		if presented != secondID {
+			t.Fatalf("presentation current = %q, want %q", presented, secondID)
+		}
+	})
+
+	t.Run("permission_resolved=cancel_forwarded_before_turn_end", func(t *testing.T) {
+		var calls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if calls.Add(1) == 1 {
+				writeACPSSE(w,
+					acpToolCallChunk("perm-cancel", "test-model", "call_read", "read_file", `{"path":"x.txt"}`),
+					acpStopChunk("perm-cancel", "test-model"),
+					"[DONE]")
+				return
+			}
+			// A cancelled turn makes no second model call; serve a plain
+			// completion so a stray call cannot hang the test.
+			writeACPSSE(w,
+				acpTextChunk("perm-cancel-2", "test-model", "done"),
+				acpStopChunk("perm-cancel-2", "test-model"),
+				"[DONE]")
+		}))
+		t.Cleanup(server.Close)
+
+		a := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		// The ACP test config declares no agents.json, so the primary agent type
+		// has no model; bootstrap it through the adapter-facing method.
+		if err := a.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		a.SetEventHandler(r.handleEvent)
+		sessionID := a.Init(ctx)
+		if sessionID == "" {
+			// Nothing to resume on a fresh agent: create, as Run does.
+			var createErr error
+			sessionID, createErr = a.NewSession("", "primary")
+			if createErr != nil {
+				t.Fatalf("NewSession: %v", createErr)
+			}
+		}
+		r.setCurrentSessionID(sessionID)
+		r.seedPresented(sessionID)
+
+		res, err := a.SubmitToSession(ctx, sessionID, "read the file")
+		if err != nil {
+			t.Fatalf("SubmitToSession: %v", err)
+		}
+		if !res.Started {
+			t.Fatalf("submit was queued, want started: %+v", res)
+		}
+
+		reqParams := waitForACPMethod(t, r, out, "agent/permission_request")
+		reqID := acpParamString(t, reqParams, "id")
+		if reqID == "" {
+			t.Fatalf("permission_request notification carries no id: %#v", reqParams)
+		}
+
+		// Cancel while the prompt is pending: the forwarded resolution must clear
+		// the client's mirror before the turn-end notification arrives.
+		r.handleSessionCancel(Request{JSONRPC: "2.0", ID: "cancel", Params: json.RawMessage(`{}`)})
+
+		waitForACPMethod(t, r, out, "agent/turn_end")
+		r.drainForTest()
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+		resolvedIdx, endIdx := -1, -1
+		var resID, resSession string
+		for i, line := range lines {
+			var n Notification
+			if err := json.Unmarshal([]byte(line), &n); err != nil {
+				continue
+			}
+			switch n.Method {
+			case "agent/permission_resolved":
+				resolvedIdx = i
+				params, _ := n.Params.(map[string]any)
+				resID, _ = params["id"].(string)
+				resSession, _ = params["sessionId"].(string)
+			case "agent/turn_end":
+				endIdx = i
+			}
+		}
+		if resolvedIdx < 0 || endIdx < 0 {
+			t.Fatalf("missing notifications: permission_resolved=%d turn_end=%d; output: %q", resolvedIdx, endIdx, out.String())
+		}
+		if resID != reqID {
+			t.Fatalf("permission_resolved id = %q, want the pending request's id %q", resID, reqID)
+		}
+		if resSession != sessionID {
+			t.Fatalf("permission_resolved sessionId = %q, want %q", resSession, sessionID)
+		}
+		if resolvedIdx > endIdx {
+			t.Fatalf("permission_resolved (index %d) delivered after turn_end (index %d)", resolvedIdx, endIdx)
+		}
+	})
+
+	t.Run("permission_respond=never_pending_is_reported", func(t *testing.T) {
+		a := newACPTestAgentWithProvider(t, "http://127.0.0.1:9/v1", false)
+		if err := a.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		sessionID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		a.SetEventHandler(r.handleEvent)
+		r.setCurrentSessionID(sessionID)
+		r.seedPresented(sessionID)
+
+		// The protocol client is third-party and may send anything: an unknown
+		// request is real information and is reported, not swallowed.
+		r.handlePermissionRespond(Request{
+			JSONRPC: "2.0",
+			ID:      "resp",
+			Params:  json.RawMessage(`{"id":"bogus-id","action":"deny"}`),
+		})
+		r.handlePermissionSave(Request{
+			JSONRPC: "2.0",
+			ID:      "save",
+			Params:  json.RawMessage(`{"id":"bogus-id","patterns":["/tmp/*"]}`),
+		})
+		r.drainForTest()
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+		for _, wantID := range []string{"resp", "save"} {
+			var respLine string
+			for _, line := range lines {
+				var resp Response
+				if err := json.Unmarshal([]byte(line), &resp); err != nil {
+					continue
+				}
+				if s, _ := resp.ID.(string); s == wantID {
+					respLine = line
+				}
+			}
+			if respLine == "" {
+				t.Fatalf("no response for %q among frames: %q", wantID, out.String())
+			}
+			assertACPErrorResponse(t, respLine)
+		}
+	})
+
+	// The prompt's admission authority is the commitment point, not the
+	// callback: a refusal before the turn-start commitment must produce one
+	// error response with no current-route advance, no boundary frame, and no
+	// turn frame. The runner's normal event handler is wired so the row
+	// observes every agent event through the real delivery path — a refused
+	// submit must emit nothing that would become a frame. The cancel-before-
+	// callback refusal is the negative sibling of a callback that cancels its
+	// own committed turn.
+	t.Run("session/prompt=cancel_before_callback_keeps_routing", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		firstID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession first: %v", err)
+		}
+		secondID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession second: %v", err)
+		}
+
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		// Observe agent events through the runner's normal event handler, the
+		// same path the committed sibling uses.
+		a.SetEventHandler(r.handleEvent)
+		r.setCurrentSessionID(firstID)
+		r.seedPresented(firstID)
+
+		// A cancelled caller context refuses admission before any claim or
+		// callback: the implicit switch never commits and no event is emitted.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		r.handleSessionPrompt(ctx, Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"hi"}`),
+		})
+		// Exactly one error response through the wired event handler: no
+		// advance frame, no turn frame.
+		lines := drainedLines(t, r, out, 1)
+		assertACPErrorResponse(t, lines[0])
+		got, err := r.currentSession()
+		if err != nil {
+			t.Fatalf("current session: %v", err)
+		}
+		if got != firstID {
+			t.Fatalf("routing current = %q, want unchanged %q", got, firstID)
+		}
+		r.mu.Lock()
+		presented := r.presented
+		r.mu.Unlock()
+		if presented != firstID {
+			t.Fatalf("presentation current = %q, want unchanged %q", presented, firstID)
+		}
+	})
+
+	// A committed start owns the advance: the callback has already run inside
+	// the commitment block, so the response carries the nonzero committed turn
+	// (never started:true turn:0) and the destination's first frame —
+	// turn_start — is delivered before the response.
+	t.Run("session/prompt=committed_nonzero_turn_before_first_frames", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		firstID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession first: %v", err)
+		}
+		secondID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession second: %v", err)
+		}
+
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		a.SetEventHandler(r.handleEvent)
+		r.setCurrentSessionID(firstID)
+		r.seedPresented(firstID)
+
+		// A live context admits the submit against the dead provider; the
+		// turn commits synchronously, so its turn_start frame is enqueued
+		// ahead of the response and the committed turn is nonzero.
+		r.handleSessionPrompt(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"hi"}`),
+		})
+		r.drainForTest()
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+
+		turnStartIdx, responseIdx := -1, -1
+		for i, line := range lines {
+			var frame map[string]any
+			if err := json.Unmarshal([]byte(line), &frame); err != nil {
+				t.Fatalf("frame json: %v", err)
+			}
+			if m, _ := frame["method"].(string); m == "agent/turn_start" {
+				turnStartIdx = i
+			}
+			if _, ok := frame["id"]; ok {
+				responseIdx = i
+			}
+		}
+		if turnStartIdx < 0 {
+			t.Fatalf("no turn_start frame reached the client; frames: %q", out.String())
+		}
+		if responseIdx < 0 {
+			t.Fatalf("no prompt response among frames: %q", out.String())
+		}
+		if turnStartIdx > responseIdx {
+			t.Fatalf("turn_start frame (index %d) delivered after the response (index %d): %q", turnStartIdx, responseIdx, out.String())
+		}
+		var resp Response
+		if err := json.Unmarshal([]byte(lines[responseIdx]), &resp); err != nil {
+			t.Fatalf("response json: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("committed prompt response error = %+v", resp.Error)
+		}
+		result, ok := resp.Result.(map[string]any)
+		if !ok {
+			t.Fatalf("committed prompt result not an object: %#v", resp.Result)
+		}
+		started, _ := result["started"].(bool)
+		turn, _ := result["turn"].(float64)
+		if !started || turn <= 0 {
+			t.Fatalf("committed prompt = %#v, want started with a nonzero turn (never started:true turn:0)", result)
+		}
+		if got := r.currentSessionSummary().ID; got != secondID {
+			t.Fatalf("routing current = %q, want committed destination %q", got, secondID)
+		}
+		// The advance is a boundary: the presentation current adopted the
+		// destination before the first frame — which is exactly why the
+		// turn_start frame above was delivered at all instead of being
+		// filtered out.
+		r.mu.Lock()
+		presented := r.presented
+		r.mu.Unlock()
+		if presented != secondID {
+			t.Fatalf("presentation current = %q, want %q", presented, secondID)
+		}
+	})
+}
+
+// acpPermissionPendingRunner wires an ACP runner whose first turn asks a
+// read_file permission request, submits a message, and waits until the request
+// is pending. It returns the session id, the output buffer, the runner, the
+// pending request's id and project id, and the agent's storage home (the
+// projects root is <home>/.lightcode/projects).
+func acpPermissionPendingRunner(t *testing.T) (string, *bytes.Buffer, *Runner, string, string, string) {
+	t.Helper()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			writeACPSSE(w,
+				acpToolCallChunk("perm-ask", "test-model", "call_read", "read_file", `{"path":"x.txt"}`),
+				acpStopChunk("perm-ask", "test-model"),
+				"[DONE]")
+			return
+		}
+		// A cancelled turn makes no second model call; serve a plain
+		// completion so a stray call cannot hang the test.
+		writeACPSSE(w,
+			acpTextChunk("perm-ask-2", "test-model", "done"),
+			acpStopChunk("perm-ask-2", "test-model"),
+			"[DONE]")
+	}))
+	t.Cleanup(server.Close)
+
+	a, home := newACPTestAgentEnv(t, server.URL+"/v1", false)
+	// The ACP test config declares no agents.json, so the primary agent type
+	// has no model; bootstrap it through the adapter-facing method.
+	if err := a.SetDefaultModel("test/test-model"); err != nil {
+		t.Fatalf("SetDefaultModel: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	out := new(bytes.Buffer)
+	r := &Runner{agent: a, owner: a, out: out}
+	a.SetEventHandler(r.handleEvent)
+	sessionID := a.Init(ctx)
+	if sessionID == "" {
+		// Nothing to resume on a fresh agent: create, as Run does.
+		var createErr error
+		sessionID, createErr = a.NewSession("", "primary")
+		if createErr != nil {
+			t.Fatalf("NewSession: %v", createErr)
+		}
+	}
+	r.setCurrentSessionID(sessionID)
+	r.seedPresented(sessionID)
+
+	res, err := a.SubmitToSession(ctx, sessionID, "read the file")
+	if err != nil {
+		t.Fatalf("SubmitToSession: %v", err)
+	}
+	if !res.Started {
+		t.Fatalf("submit was queued, want started: %+v", res)
+	}
+
+	reqParams := waitForACPMethod(t, r, out, "agent/permission_request")
+	reqID := acpParamString(t, reqParams, "id")
+	if reqID == "" {
+		t.Fatalf("permission_request notification carries no id: %#v", reqParams)
+	}
+	projectID := acpParamString(t, reqParams, "projectId")
+	return sessionID, out, r, reqID, projectID, home
+}
+
+// permLockHolderEnv selects the child half of
+// TestACPPermissionSaveContentionShutdownJoined and names the permissions lock
+// path the child holds.
+const permLockHolderEnv = "LIGHTCODE_ACP_PERM_LOCK_HOLDER"
+
+// startPermLockHolder spawns a child of this test binary that acquires the
+// given permissions lock and holds it until the parent closes its stdin. It
+// returns the release func; the cleanup cancels and reaps the child.
+func startPermLockHolder(t *testing.T, lockPath string) func() {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestACPPermissionSaveContentionShutdownJoined$")
+	cmd.Env = append(os.Environ(), permLockHolderEnv+"="+lockPath)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		t.Fatalf("child stdin pipe: %v", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		t.Fatalf("child stdout pipe: %v", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("start child: %v", err)
+	}
+	ready := make(chan struct{})
+	scannerDone := make(chan struct{})
+	go func() {
+		defer close(scannerDone)
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if scanner.Text() == "ready" {
+				close(ready)
+				return
+			}
+		}
+	}()
+	reap := func() error {
+		_ = stdin.Close()
+		err := cmd.Wait()
+		<-scannerDone
+		return err
+	}
+	fail := func() string {
+		cancel()
+		_ = reap()
+		return stderr.String()
+	}
+	t.Cleanup(func() { cancel(); _ = reap() })
+	select {
+	case <-ready:
+	case <-ctx.Done():
+		t.Fatalf("child never held the permissions lock within %v: %v\n%s", 30*time.Second, ctx.Err(), fail())
+	}
+	return func() { _ = reap() }
+}
+
+// TestACPPermissionSaveContentionShutdownJoined proves a permission save
+// parked on a foreign permissions-lock holder cannot block owner shutdown and
+// cannot publish after it: the save returns a bounded retryable error, leaves
+// the request pending, writes no permissions.json, and shutdown joins cleanly.
+// It fails against the pre-fix blocking SaveLocal, which stays parked on the
+// foreign flock, writes permissions.json after the holder releases, and
+// resolves the request.
+func TestACPPermissionSaveContentionShutdownJoined(t *testing.T) {
+	if lockPath := os.Getenv(permLockHolderEnv); lockPath != "" {
+		// Child: hold the permissions lock until the parent closes stdin.
+		l, err := atomicfs.Acquire(lockPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		fmt.Println("ready")
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		if err := l.Release(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(3)
+		}
+		os.Exit(0)
+	}
+
+	sessionID, out, r, reqID, projectID, home := acpPermissionPendingRunner(t)
+	lockPath := filepath.Join(home, ".lightcode", "projects", projectID, ".locks", "permissions.lock")
+	releaseHolder := startPermLockHolder(t, lockPath)
+	permFile := filepath.Join(home, ".lightcode", "projects", projectID, "permissions.json")
+	assertNoPermFile := func() {
+		if _, err := os.Stat(permFile); !os.IsNotExist(err) {
+			t.Fatalf("permissions.json exists after the contended save: %v", err)
+		}
+	}
+
+	saveDone := make(chan struct{})
+	go func() {
+		r.dispatch(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "perm-save",
+			Method:  "permission/save",
+			Params:  json.RawMessage(fmt.Sprintf(`{"session_id":%q,"id":%q,"patterns":["write_file:*"]}`, sessionID, reqID)),
+		})
+		close(saveDone)
+	}()
+
+	select {
+	case <-saveDone:
+		// The save returned while the foreign lock is held: it must be a
+		// bounded retryable error, never a success.
+		r.drainForTest()
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+		var resp Response
+		found := false
+		for _, line := range lines {
+			if err := json.Unmarshal([]byte(line), &resp); err != nil {
+				continue
+			}
+			if id, ok := resp.ID.(string); ok && id == "perm-save" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("no perm-save response in output: %q", out.String())
+		}
+		if resp.Error == nil || !strings.Contains(resp.Error.Message, "retry") {
+			t.Fatalf("contended save response = %+v, want a retryable error", resp)
+		}
+		assertNoPermFile()
+		// The request is unresolved: a second save still sees the pending
+		// request and still contends instead of reporting an unknown id.
+		err := r.agent.SaveProjectPermissionForSession(sessionID, reqID, []string{"write_file:*"})
+		if err == nil || !strings.Contains(err.Error(), "retry") {
+			t.Fatalf("second save err = %v, want the same retryable contention (request must stay pending)", err)
+		}
+	case <-time.After(time.Second):
+		// Pre-fix: the blocking save is parked on the foreign flock. Shutdown
+		// must join cleanly; the aftermath assertions below fail pre-fix
+		// because the parked save writes permissions.json once released.
+	}
+
+	if !r.owner.ShutdownOwner() {
+		t.Fatal("shutdown reported abandoned in-flight work")
+	}
+	releaseHolder()
+	select {
+	case <-saveDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("save dispatch never returned after the holder released")
+	}
+	assertNoPermFile()
+}
+
+// TestACPStalledOutputPreservesBoundaryOrder proves that with the output drainer
+// stalled, the FIFO still delivers a queued source event, then the A->B boundary,
+// then the switch response, then a destination event in that exact order — and that
+// routing current commits B (so a current-target request routes to B) before the
+// response is drained.
+func TestACPStalledOutputPreservesBoundaryOrder(t *testing.T) {
+	a := newACPTestAgent(t)
+	aID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession A: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(aID, "a-msg"); err != nil {
+		t.Fatalf("append A: %v", err)
+	}
+	bID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession B: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(bID, "b-msg"); err != nil {
+		t.Fatalf("append B: %v", err)
+	}
+
+	out := new(bytes.Buffer)
+	r := &Runner{agent: a, owner: a, out: out}
+	r.setCurrentSessionID(aID)
+	r.seedPresented(aID)
+	// Output is stalled: the drainer is never started, so every frame accumulates in
+	// the FIFO and is delivered only when the test drains it.
+
+	// A source (A) event is queued before the A->B boundary.
+	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: aID, Seq: 1, Result: "a-event"})
+	// The switch commits routing current to B and enqueues its boundary then response.
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + bID + `"}`)})
+	if got := r.currentSessionSummary().ID; got != bID {
+		t.Fatalf("routing current = %q, want B %q while output stalled", got, bID)
+	}
+	// A following current-target request routes to B while output remains stalled.
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "cur", Method: "session/current"})
+	// A destination (B) event is queued after the boundary.
+	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: bID, Seq: 2, Result: "b-event"})
+
+	// Resume output: the FIFO delivers in enqueue order.
+	lines := drainedLines(t, r, out, 5)
+	if c := acpChunkContent(t, lines[0]); c != "a-event" {
+		t.Fatalf("frame 0 = %q, want the source event before the boundary", c)
+	}
+	assertACPNotificationMethod(t, lines[1], "agent/session_changed")
+	assertACPSuccessResponse(t, lines[2])
+	if got := acpSessionSummaryFromResponse(t, lines[3]).ID; got != bID {
+		t.Fatalf("session/current response = %q, want B %q", got, bID)
+	}
+	if c := acpChunkContent(t, lines[4]); c != "b-event" {
+		t.Fatalf("frame 4 = %q, want the destination event after the boundary", c)
+	}
+}
+
 func TestHandleTurnActionACPInvalidParams(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{agent: newACPTestAgent(t), out: &out}
 
 	r.handleRevertHistory(Request{JSONRPC: "2.0", ID: "bad", Params: json.RawMessage(`{`)})
 
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("response json: %v", err)
@@ -498,7 +2767,7 @@ func TestHandleSessionMessagesByIDDoesNotSwitchCurrentSession(t *testing.T) {
 		Params:  json.RawMessage(`{"id":"` + firstID + `"}`),
 	})
 
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("response json: %v", err)
@@ -514,9 +2783,10 @@ func TestHandleSessionMessagesByIDDoesNotSwitchCurrentSession(t *testing.T) {
 		t.Fatalf("SessionMessagesFor switched current session to %q, want %q", got, currentID)
 	}
 
+	r.drainForTest()
 	out.Reset()
 	r.handleSessionMessages(Request{JSONRPC: "2.0", ID: "current-messages"})
-	lines = responseLines(t, out.String(), 1)
+	lines = drainedLines(t, r, &out, 1)
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("current response json: %v", err)
 	}
@@ -526,6 +2796,53 @@ func TestHandleSessionMessagesByIDDoesNotSwitchCurrentSession(t *testing.T) {
 	msgs = displayMessagesFromResponse(t, resp)
 	if got := acpUserMessageContents(msgs); !equalStringSlices(got, []string{"second session"}) {
 		t.Fatalf("current messages = %q", got)
+	}
+}
+
+// TestSessionMessagesPointLookupHasNoCursor proves the session/messages point
+// lookup keeps its bare-array response shape: the result is a message array,
+// not a hydration-state object, so it carries no cursor — the point lookup is
+// the unbounded complete-history exception to the committed-turn bound.
+func TestSessionMessagesPointLookupHasNoCursor(t *testing.T) {
+	a := newACPTestAgent(t)
+	appendACPUserTurn(t, a, "point lookup")
+	id := a.SessionCurrent().ID
+	if id == "" {
+		t.Fatal("missing session id")
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: a, out: &out}
+	r.setCurrentSessionID(id)
+	r.handleSessionMessages(Request{
+		JSONRPC: "2.0",
+		ID:      "point-lookup",
+		Params:  json.RawMessage(`{"id":"` + id + `"}`),
+	})
+
+	lines := drainedLines(t, r, &out, 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("session/messages error = %+v", resp.Error)
+	}
+	msgs := displayMessagesFromResponse(t, resp)
+	if got := acpUserMessageContents(msgs); !equalStringSlices(got, []string{"point lookup"}) {
+		t.Fatalf("point lookup messages = %q", got)
+	}
+	// The result is a bare array: it decodes into the message list alone and
+	// cannot decode into an object carrying a cursor.
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	var shape struct {
+		Cursor json.RawMessage `json:"cursor"`
+	}
+	if err := json.Unmarshal(data, &shape); err == nil {
+		t.Fatal("point lookup result decodes as an object with a cursor, want a bare message array (no cursor)")
 	}
 }
 
@@ -548,9 +2865,10 @@ func TestACPPromptSelectsSession(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{agent: a, out: &out}
 	r.setCurrentSessionID(firstID)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	r.handleSessionPrompt(ctx, Request{
+	// A live context admits the submit, so the implicit switch commits inside
+	// admission; a cancelled context would fail the submit before the switch and
+	// the test would pass without exercising admission.
+	r.handleSessionPrompt(context.Background(), Request{
 		JSONRPC: "2.0",
 		ID:      "prompt",
 		Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"hello"}`),
@@ -560,34 +2878,194 @@ func TestACPPromptSelectsSession(t *testing.T) {
 	}
 }
 
-func TestACPNewSetsCurrent(t *testing.T) {
+type acpPromptAmbiguityFixture struct {
+	agent      *agent.Agent
+	currentID  string
+	targetID   string
+	first      *project.Project
+	second     *project.Project
+	secondMeta []byte
+}
+
+func newACPPromptAmbiguityFixture(t *testing.T) acpPromptAmbiguityFixture {
+	t.Helper()
 	a := newACPTestAgent(t)
-	var out bytes.Buffer
-	r := &Runner{agent: a, out: &out}
-	r.handleSessionNew(Request{JSONRPC: "2.0", ID: "new"})
-	if got := r.currentSessionSummary().ID; got == "" {
-		t.Fatal("new session did not set current")
+	first, err := a.Projects().Ensure()
+	if err != nil {
+		t.Fatalf("ensure first project: %v", err)
+	}
+	second, err := project.EnsureForPath(a.Projects().Root(), t.TempDir())
+	if err != nil {
+		t.Fatalf("ensure second project: %v", err)
+	}
+	currentID, err := a.NewSession(first.ID, "primary")
+	if err != nil {
+		t.Fatalf("new current session: %v", err)
+	}
+	targetID, err := a.NewSession(first.ID, "primary")
+	if err != nil {
+		t.Fatalf("new target session: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(targetID, "target marker"); err != nil {
+		t.Fatalf("append target marker: %v", err)
+	}
+	secondDir := filepath.Join(a.Projects().SessionsRoot(second.ID), targetID)
+	if err := os.MkdirAll(filepath.Join(secondDir, "snapshots"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(secondDir, "turns"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	secondMeta := []byte(`{"id":"` + targetID + `","state":"active","project_path":"` + second.Path + `","last_activity":222}` + "\n")
+	if err := os.WriteFile(filepath.Join(secondDir, "meta.json"), secondMeta, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return acpPromptAmbiguityFixture{
+		agent:      a,
+		currentID:  currentID,
+		targetID:   targetID,
+		first:      first,
+		second:     second,
+		secondMeta: secondMeta,
+	}
+}
+
+func TestACPExplicitPromptRejectsLivePersistedAmbiguityBeforeAdmission(t *testing.T) {
+	f := newACPPromptAmbiguityFixture(t)
+	beforeQueue, err := f.agent.QueueSnapshotForSession(f.targetID)
+	if err != nil {
+		t.Fatalf("target queue before prompt: %v", err)
 	}
 
-	out.Reset()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	r.handleSessionPrompt(ctx, Request{
+	var out bytes.Buffer
+	r := &Runner{agent: f.agent, owner: f.agent, out: &out}
+	f.agent.SetEventHandler(r.handleEvent)
+	r.setCurrentSessionID(f.currentID)
+	r.seedPresented(f.currentID)
+	r.handleSessionPrompt(context.Background(), Request{
 		JSONRPC: "2.0",
 		ID:      "prompt",
-		Params:  json.RawMessage(`{"content":"hello"}`),
+		Params:  json.RawMessage(`{"session_id":"` + f.targetID + `","content":"must not submit"}`),
 	})
-	lines := responseLines(t, out.String(), 1)
+	lines := drainedLines(t, r, &out, 1)
 	var resp Response
 	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
 		t.Fatalf("prompt response json: %v", err)
 	}
-	if resp.Error != nil && strings.Contains(resp.Error.Message, "no current session") {
-		t.Fatalf("prompt after new = %+v", resp.Error)
+	if resp.Error == nil || !strings.Contains(resp.Error.Message, "ambiguous") {
+		t.Fatalf("prompt response = %+v, want ambiguity error", resp)
+	}
+	if resp.Result != nil {
+		t.Fatalf("ambiguous prompt returned success result: %#v", resp.Result)
+	}
+	if got := r.currentSessionSummary().ID; got != f.currentID {
+		t.Fatalf("routing current = %q, want unchanged %q", got, f.currentID)
+	}
+	r.mu.Lock()
+	presented := r.presented
+	r.mu.Unlock()
+	if presented != f.currentID {
+		t.Fatalf("presentation current = %q, want unchanged %q", presented, f.currentID)
+	}
+	afterQueue, err := f.agent.QueueSnapshotForSession(f.targetID)
+	if err != nil {
+		t.Fatalf("target queue after prompt: %v", err)
+	}
+	if !reflect.DeepEqual(afterQueue, beforeQueue) {
+		t.Fatalf("target queue changed across rejected prompt: before=%+v after=%+v", beforeQueue, afterQueue)
+	}
+	if got := f.agent.SessionCurrent().ID; got != f.targetID {
+		t.Fatalf("backend current = %q, want unchanged target %q", got, f.targetID)
+	}
+	if !strings.Contains(out.String(), "ambiguous") {
+		t.Fatalf("prompt output = %q, want ambiguity response only", out.String())
+	}
+	if got, err := os.ReadFile(filepath.Join(f.agent.Projects().SessionsRoot(f.second.ID), f.targetID, "meta.json")); err != nil {
+		t.Fatalf("read duplicate metadata: %v", err)
+	} else if string(got) != string(f.secondMeta) {
+		t.Fatalf("duplicate metadata changed: got %q want %q", got, f.secondMeta)
 	}
 }
 
-func TestACPSwitchKeepsCurrent(t *testing.T) {
+func TestACPExplicitPromptUniqueLiveAndPersistedControls(t *testing.T) {
+	t.Run("unique_live_still_admits", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		currentID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("new current session: %v", err)
+		}
+		targetID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("new target session: %v", err)
+		}
+		var out bytes.Buffer
+		r := &Runner{agent: a, owner: a, out: &out}
+		r.setCurrentSessionID(currentID)
+		r.handleSessionPrompt(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + targetID + `","content":"unique live"}`),
+		})
+		lines := drainedLines(t, r, &out, 1)
+		assertACPSuccessResponse(t, lines[0])
+		if got := r.currentSessionSummary().ID; got != targetID {
+			t.Fatalf("routing current = %q, want %q", got, targetID)
+		}
+	})
+
+	t.Run("unique_persisted_only_still_reaches_submit_disposition", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		proj, err := a.Projects().Ensure()
+		if err != nil {
+			t.Fatalf("ensure project: %v", err)
+		}
+		currentID, err := a.NewSession(proj.ID, "primary")
+		if err != nil {
+			t.Fatalf("new current session: %v", err)
+		}
+		const persistedID = "persisted1"
+		dir := filepath.Join(a.Projects().SessionsRoot(proj.ID), persistedID)
+		if err := os.MkdirAll(filepath.Join(dir, "snapshots"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(dir, "turns"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		meta := []byte(`{"id":"` + persistedID + `","state":"active","project_path":"` + proj.Path + `"}` + "\n")
+		if err := os.WriteFile(filepath.Join(dir, "meta.json"), meta, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if summary, err := a.SessionSummaryForSessionOrPersisted(persistedID); err != nil || summary.ID != persistedID {
+			t.Fatalf("persisted-only summary = %+v, %v", summary, err)
+		}
+
+		var out bytes.Buffer
+		r := &Runner{agent: a, owner: a, out: &out}
+		r.setCurrentSessionID(currentID)
+		r.handleSessionPrompt(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + persistedID + `","content":"must remain owner-unknown"}`),
+		})
+		lines := drainedLines(t, r, &out, 1)
+		var resp Response
+		if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+			t.Fatalf("prompt response json: %v", err)
+		}
+		if resp.Error == nil || !strings.Contains(resp.Error.Message, "unknown session") {
+			t.Fatalf("persisted-only prompt response = %+v, want unknown-session error", resp.Error)
+		}
+		if got := r.currentSessionSummary().ID; got != currentID {
+			t.Fatalf("routing current = %q, want unchanged %q", got, currentID)
+		}
+	})
+}
+
+// TestACPPromptSwitchAdvancesPresentation proves prompting an explicit different
+// session advances presentation current, so the prompted session's turn events reach
+// the client (the switch pushes no client-visible boundary), and a late event for the
+// previous session is dropped.
+func TestACPPromptSwitchAdvancesPresentation(t *testing.T) {
 	a := newACPTestAgent(t)
 	firstID, err := a.NewSession("", "primary")
 	if err != nil {
@@ -605,7 +3083,392 @@ func TestACPSwitchKeepsCurrent(t *testing.T) {
 	}
 
 	var out bytes.Buffer
+	r := &Runner{agent: a, owner: a, out: &out}
+	r.setCurrentSessionID(firstID)
+	r.seedPresented(firstID)
+
+	// A live context admits the submit, so the implicit switch advances
+	// presentation current inside admission, ahead of any turn frames; a
+	// cancelled context would fail the submit before the switch and the test
+	// would pass without exercising admission.
+	r.handleSessionPrompt(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"session_id":"` + secondID + `","content":"hi"}`),
+	})
+	r.drainForTest()
+	out.Reset()
+
+	// A live event for the prompted session now reaches the client.
+	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: secondID, Result: "second-event"})
+	lines := drainedLines(t, r, &out, 1)
+	assertACPNotificationMethod(t, lines[0], "agent/message_chunk")
+
+	// A late event for the previous session is dropped.
+	out.Reset()
+	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: firstID, Result: "late-first"})
+	r.drainForTest()
+	if out.Len() != 0 {
+		t.Fatalf("late event for the previous session was emitted: %q", out.String())
+	}
+}
+
+func TestACPNewSetsCurrent(t *testing.T) {
+	a := newACPTestAgent(t)
+	var out bytes.Buffer
 	r := &Runner{agent: a, out: &out}
+	r.handleSessionNew(Request{JSONRPC: "2.0", ID: "new"})
+	if got := r.currentSessionSummary().ID; got == "" {
+		t.Fatal("new session did not set current")
+	}
+
+	r.drainForTest()
+	out.Reset()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.handleSessionPrompt(ctx, Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"content":"hello"}`),
+	})
+	lines := drainedLines(t, r, &out, 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("prompt response json: %v", err)
+	}
+	if resp.Error != nil && strings.Contains(resp.Error.Message, "no current session") {
+		t.Fatalf("prompt after new = %+v", resp.Error)
+	}
+}
+
+// TestACPExplicitSwitchToContendedSessionIsReadOnly proves session/switch over
+// a session another process drives opens it read-only: the switch succeeds,
+// the session_changed notification carries the read-only hydration state with
+// the session's own identity and durable transcript, session/prompt refuses
+// with the contention message on both the explicit-id and implicit-current
+// paths, compact and snapshot/list name the contention instead of "no current
+// session", and a switch to a live session clears the marker and admits a
+// prompt.
+func TestACPExplicitSwitchToContendedSessionIsReadOnly(t *testing.T) {
+	first, second := newACPTestAgentPair(t)
+	heldID, err := first.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession held: %v", err)
+	}
+	if _, err := first.AppendUserMessageToSession(heldID, "durable from the driving owner"); err != nil {
+		t.Fatalf("append durable message: %v", err)
+	}
+	startupID, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: second, owner: second, out: &out}
+	r.setCurrentSessionID(startupID)
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + heldID + `"}`)})
+
+	lines := drainedLines(t, r, &out, 2)
+	var notif Notification
+	if err := json.Unmarshal([]byte(lines[0]), &notif); err != nil {
+		t.Fatalf("notification json: %v", err)
+	}
+	if notif.Method != "agent/session_changed" {
+		t.Fatalf("notification method = %q, want session_changed", notif.Method)
+	}
+	state := hydrationStateFromParams(t, notif.Params)
+	if !state.ReadOnly {
+		t.Fatal("read-only switch notification is not marked read-only")
+	}
+	if state.Session.ID != heldID {
+		t.Fatalf("notification session = %q, want %q", state.Session.ID, heldID)
+	}
+	if got := acpUserMessageContents(state.Messages); !equalStringSlices(got, []string{"durable from the driving owner"}) {
+		t.Fatalf("notification messages = %#v, want the durable transcript", got)
+	}
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
+		t.Fatalf("switch response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("switch response error = %+v, want a read-only open", resp.Error)
+	}
+	if got := r.currentSessionSummary().ID; got != heldID {
+		t.Fatalf("runner current = %q, want the held session %q", got, heldID)
+	}
+	if got := r.sv().LiveCurrent(); got != "" {
+		t.Fatalf("read-only session reports live: %q", got)
+	}
+	if !r.sv().IsReadOnly(heldID) {
+		t.Fatal("held session not marked read-only")
+	}
+
+	// A prompt naming the read-only session refuses at its own precheck, which
+	// never reaches the owner, with the contention message.
+	out.Reset()
+	r.handleSessionPrompt(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"session_id":"` + heldID + `","content":"hi"}`),
+	})
+	lines = drainedLines(t, r, &out, 1)
+	var promptResp Response
+	if err := json.Unmarshal([]byte(lines[0]), &promptResp); err != nil {
+		t.Fatalf("prompt response json: %v", err)
+	}
+	if promptResp.Error == nil || !strings.Contains(promptResp.Error.Message, "driven by another process") {
+		t.Fatalf("explicit-id prompt over the read-only session = %+v, want the contention message", promptResp.Error)
+	}
+
+	// A prompt to the routing current (the read-only session) translates the
+	// owner's refusal the same way.
+	out.Reset()
+	r.handleSessionPrompt(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"content":"hi"}`),
+	})
+	lines = drainedLines(t, r, &out, 1)
+	var implicitResp Response
+	if err := json.Unmarshal([]byte(lines[0]), &implicitResp); err != nil {
+		t.Fatalf("prompt response json: %v", err)
+	}
+	if implicitResp.Error == nil || !strings.Contains(implicitResp.Error.Message, "driven by another process") {
+		t.Fatalf("implicit prompt over the read-only session = %+v, want the contention message", implicitResp.Error)
+	}
+
+	// Compact and snapshot/list name the contention instead of "no current
+	// session", keeping the selection.
+	out.Reset()
+	r.handleCompact(context.Background(), Request{JSONRPC: "2.0", ID: "compact"})
+	lines = drainedLines(t, r, &out, 1)
+	var compactResp Response
+	if err := json.Unmarshal([]byte(lines[0]), &compactResp); err != nil {
+		t.Fatalf("compact response json: %v", err)
+	}
+	if compactResp.Error == nil || !strings.Contains(compactResp.Error.Message, "driven by another process") {
+		t.Fatalf("compact over the read-only session = %+v, want the contention message", compactResp.Error)
+	}
+
+	// An explicit-id compact names the contention too, instead of the owner's
+	// "unknown session" answer for a session this connection holds read-only.
+	out.Reset()
+	r.handleCompact(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "compact",
+		Params:  json.RawMessage(`{"session_id":"` + heldID + `"}`),
+	})
+	lines = drainedLines(t, r, &out, 1)
+	var explicitCompactResp Response
+	if err := json.Unmarshal([]byte(lines[0]), &explicitCompactResp); err != nil {
+		t.Fatalf("explicit-id compact response json: %v", err)
+	}
+	if explicitCompactResp.Error == nil || !strings.Contains(explicitCompactResp.Error.Message, "driven by another process") {
+		t.Fatalf("explicit-id compact over the read-only session = %+v, want the contention message", explicitCompactResp.Error)
+	}
+
+	out.Reset()
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "snaps", Method: "snapshot/list"})
+	lines = drainedLines(t, r, &out, 1)
+	var snapsResp Response
+	if err := json.Unmarshal([]byte(lines[0]), &snapsResp); err != nil {
+		t.Fatalf("snapshot/list response json: %v", err)
+	}
+	if snapsResp.Error == nil || !strings.Contains(snapsResp.Error.Message, "driven by another process") {
+		t.Fatalf("snapshot/list over the read-only session = %+v, want the contention message", snapsResp.Error)
+	}
+	if got := r.sv().Current(); got != heldID {
+		t.Fatalf("selection after failed compact/snapshot = %q, want the read-only session kept %q", got, heldID)
+	}
+
+	// Switching to a live session clears the marker and admits a prompt.
+	liveID, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession live: %v", err)
+	}
+	out.Reset()
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw2", Params: json.RawMessage(`{"id":"` + liveID + `"}`)})
+	lines = drainedLines(t, r, &out, 2)
+	var liveResp Response
+	if err := json.Unmarshal([]byte(lines[1]), &liveResp); err != nil {
+		t.Fatalf("switch response json: %v", err)
+	}
+	if liveResp.Error != nil {
+		t.Fatalf("switch to live response error = %+v", liveResp.Error)
+	}
+	if r.sv().IsReadOnly(heldID) {
+		t.Fatal("read-only marker survived the switch to a live session")
+	}
+	if got := r.sv().LiveCurrent(); got != liveID {
+		t.Fatalf("live current after switch = %q, want %q", got, liveID)
+	}
+}
+
+// TestACPReadOnlySwitchHydrationFailureLeavesRoutingUnchanged proves a
+// read-only switch whose durable view cannot be read commits nothing: the
+// protocol path keeps the previous session and the routing project.
+func TestACPReadOnlySwitchHydrationFailureLeavesRoutingUnchanged(t *testing.T) {
+	first, second := newACPTestAgentPair(t)
+	heldID, err := first.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession held: %v", err)
+	}
+	if _, err := first.AppendUserMessageToSession(heldID, "durable from the driving owner"); err != nil {
+		t.Fatalf("append durable message: %v", err)
+	}
+	startupID, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	// A held session whose durable history cannot be read: the open still fails
+	// as contention (the claim is acquired before any file read), and the
+	// read-only hydration then fails on the corrupt compaction record.
+	proj, err := first.ProjectCurrentForPath(first.ProjectRoot())
+	if err != nil {
+		t.Fatalf("project for held session: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(first.Projects().SessionsRoot(proj.ID), heldID, "compaction.json"), []byte(`{not json`), 0o600); err != nil {
+		t.Fatalf("corrupt held session compaction: %v", err)
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: second, owner: second, out: &out}
+	r.setCurrentSessionID(startupID)
+	r.routeProjectPath = second.ProjectRoot()
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + heldID + `"}`)})
+	lines := drainedLines(t, r, &out, 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("switch response json: %v", err)
+	}
+	if resp.Error == nil || !strings.Contains(resp.Error.Message, "compaction.json") {
+		t.Fatalf("switch over a held session with unreadable history = %+v, want the hydration failure", resp.Error)
+	}
+	if got := r.sv().Current(); got != startupID {
+		t.Fatalf("routing current after failed read-only switch = %q, want unchanged %q", got, startupID)
+	}
+	if got := r.routeProjectPath; got != second.ProjectRoot() {
+		t.Fatalf("routing project after failed read-only switch = %q, want unchanged %q", got, second.ProjectRoot())
+	}
+	if r.sv().IsReadOnly(heldID) {
+		t.Fatal("read-only marker set for a switch whose presentation failed")
+	}
+}
+
+// TestACPReopenAfterHolderReleasesIsLive proves a session switched read-only
+// becomes live again when it is switched again after the driving process
+// releases it: the read-only marker does not survive a successful live commit
+// of the same id, so a prompt is admitted and no contention is reported.
+func TestACPReopenAfterHolderReleasesIsLive(t *testing.T) {
+	first, second := newACPTestAgentPair(t)
+	heldID, err := first.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession held: %v", err)
+	}
+	startupID, err := second.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	var out bytes.Buffer
+	r := &Runner{agent: second, owner: second, out: &out}
+	r.setCurrentSessionID(startupID)
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + heldID + `"}`)})
+	lines := drainedLines(t, r, &out, 2)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
+		t.Fatalf("switch response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("read-only switch response error = %+v", resp.Error)
+	}
+	if !r.sv().IsReadOnly(heldID) {
+		t.Fatal("held session not marked read-only")
+	}
+
+	// The driving process releases the session; switching again must succeed
+	// live.
+	if err := first.SessionArchive(heldID); err != nil {
+		t.Fatalf("SessionArchive (release): %v", err)
+	}
+	out.Reset()
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw2", Params: json.RawMessage(`{"id":"` + heldID + `"}`)})
+	lines = drainedLines(t, r, &out, 2)
+	var liveResp Response
+	if err := json.Unmarshal([]byte(lines[1]), &liveResp); err != nil {
+		t.Fatalf("switch response json: %v", err)
+	}
+	if liveResp.Error != nil {
+		t.Fatalf("reopen switch response error = %+v, want a live open", liveResp.Error)
+	}
+	if r.sv().IsReadOnly(heldID) {
+		t.Fatal("read-only marker survived the live reopen of the same session")
+	}
+	if got := r.sv().LiveCurrent(); got != heldID {
+		t.Fatalf("live current after reopen = %q, want %q", got, heldID)
+	}
+
+	// A prompt to the reopened session is admitted; no contention is reported.
+	out.Reset()
+	r.handleSessionPrompt(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"content":"hi"}`),
+	})
+	lines = drainedLines(t, r, &out, 1)
+	var promptResp Response
+	if err := json.Unmarshal([]byte(lines[0]), &promptResp); err != nil {
+		t.Fatalf("prompt response json: %v", err)
+	}
+	if promptResp.Error != nil {
+		t.Fatalf("prompt after reopen = %+v, want admission without contention", promptResp.Error)
+	}
+}
+
+func TestACPSwitchKeepsCurrent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeACPSSE(w,
+			acpTextChunk("switch-turn", "test-model", "ok"),
+			acpStopChunk("switch-turn", "test-model"),
+			"[DONE]")
+	}))
+	t.Cleanup(server.Close)
+
+	a := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+	// The ACP test config declares no agents.json, so the primary agent type
+	// has no model; bootstrap it through the adapter-facing method.
+	if err := a.SetDefaultModel("test/test-model"); err != nil {
+		t.Fatalf("SetDefaultModel: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	_ = a.Init(ctx)
+
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	var out bytes.Buffer
+	r := &Runner{agent: a, owner: a, out: &out}
+	a.SetEventHandler(r.handleEvent)
+	r.seedPresented(firstID)
+	// Run a real turn so the coordinator commits it: a marked-but-uncommitted
+	// turn stays below the bounded switch boundary. The commit runs before the
+	// turn_end event is emitted, so observing the notification makes the
+	// switch's bounded read deterministic.
+	if res, err := a.SubmitToSession(ctx, firstID, "first"); err != nil || !res.Started {
+		t.Fatalf("SubmitToSession first = %+v, %v; want started", res, err)
+	}
+	waitForACPMethod(t, r, &out, "agent/turn_end")
+	out.Reset()
+
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+	if _, err := a.AppendUserMessageToSession(secondID, "second"); err != nil {
+		t.Fatalf("append second: %v", err)
+	}
+
 	r.setCurrentSessionID(secondID)
 	r.handleSessionSwitch(Request{
 		JSONRPC: "2.0",
@@ -613,7 +3476,7 @@ func TestACPSwitchKeepsCurrent(t *testing.T) {
 		Params:  json.RawMessage(`{"id":"` + firstID + `"}`),
 	})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	var notif Notification
 	if err := json.Unmarshal([]byte(lines[0]), &notif); err != nil {
 		t.Fatalf("notification json: %v", err)
@@ -643,6 +3506,56 @@ func TestACPSwitchKeepsCurrent(t *testing.T) {
 	}
 }
 
+// TestACPSessionChangedCarriesResolvedModel proves the serialized
+// agent/session_changed notification carries the destination session's model as
+// the resolved object — identifier plus display name — not a bare
+// provider/model string. The protocol host forwards the same captured state the
+// desktop adapter hydrates from, so a third-party client can render the
+// selector from the notification alone; decoding the wire params into the full
+// hydration state must yield the resolved model.
+func TestACPSessionChangedCarriesResolvedModel(t *testing.T) {
+	a := newACPTestAgent(t)
+	// The ACP test config declares no agents.json, so the primary agent type
+	// has no model; bootstrap it through the adapter-facing method.
+	if err := a.SetDefaultModel("test/test-model"); err != nil {
+		t.Fatalf("SetDefaultModel: %v", err)
+	}
+	firstID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession first: %v", err)
+	}
+	secondID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession second: %v", err)
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: a, owner: a, out: &out}
+	r.setCurrentSessionID(secondID)
+	r.handleSessionSwitch(Request{
+		JSONRPC: "2.0",
+		ID:      "switch",
+		Params:  json.RawMessage(`{"id":"` + firstID + `"}`),
+	})
+
+	lines := drainedLines(t, r, &out, 2)
+	var notif Notification
+	if err := json.Unmarshal([]byte(lines[0]), &notif); err != nil {
+		t.Fatalf("notification json: %v", err)
+	}
+	if notif.Method != "agent/session_changed" {
+		t.Fatalf("notification method = %q, want session_changed", notif.Method)
+	}
+	state := hydrationStateFromParams(t, notif.Params)
+	if state.Session.ID != firstID {
+		t.Fatalf("notification session = %q, want %q", state.Session.ID, firstID)
+	}
+	if state.Model.Ref != "test/test-model" || state.Model.Provider != "test" || state.Model.Model != "test-model" ||
+		state.Model.DisplayName != "Test Model" || state.Model.ContextWindow != 8192 {
+		t.Fatalf("notification model = %+v, want resolved test/test-model (Test Model)", state.Model)
+	}
+}
+
 func TestACPStaleCurrent(t *testing.T) {
 	a := newACPTestAgent(t)
 	_ = appendACPUserTurn(t, a, "gone")
@@ -660,7 +3573,7 @@ func TestACPStaleCurrent(t *testing.T) {
 	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "current", Method: "session/current"})
 	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "messages", Method: "session/messages"})
 
-	lines := responseLines(t, out.String(), 2)
+	lines := drainedLines(t, r, &out, 2)
 	var current Response
 	if err := json.Unmarshal([]byte(lines[0]), &current); err != nil {
 		t.Fatalf("current json: %v", err)
@@ -701,11 +3614,650 @@ func TestACPStaleEvent(t *testing.T) {
 	r := &Runner{agent: a, out: &out}
 	r.setCurrentSessionID(id)
 	r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: id, Result: "skip"})
+	r.drainForTest()
 	if out.Len() != 0 {
 		t.Fatalf("stale event was emitted: %q", out.String())
 	}
 	if got := r.currentSessionSummary().ID; got != "" {
 		t.Fatalf("stale current id = %q, want empty", got)
+	}
+}
+
+// TestACPProjectCurrentFollowsCrossProjectSwitch proves project/current resolves
+// the routing-current session's project — not the owner/startup project — so an
+// A->B cross-project session switch makes project/current report B's project.
+func TestACPProjectCurrentFollowsCrossProjectSwitch(t *testing.T) {
+	a := newACPTestAgent(t)
+	startupID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	otherRoot := t.TempDir()
+	otherID, err := a.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath: %v", err)
+	}
+	wantStartup, err := a.ProjectCurrentForPath(a.ProjectRoot())
+	if err != nil {
+		t.Fatalf("startup project: %v", err)
+	}
+	wantOther, err := a.ProjectCurrentForPath(otherRoot)
+	if err != nil {
+		t.Fatalf("other project: %v", err)
+	}
+	if wantStartup.ID == wantOther.ID {
+		t.Fatal("test setup: the two sessions must be in different projects")
+	}
+
+	var out bytes.Buffer
+	r := &Runner{agent: a, owner: a, out: &out}
+	r.setCurrentSessionID(startupID)
+
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "p1", Method: "project/current"})
+	if got := acpProjectFromResponse(t, drainedLines(t, r, &out, 1)[0]); got.ID != wantStartup.ID {
+		t.Fatalf("project/current before switch id = %q, want startup %q", got.ID, wantStartup.ID)
+	}
+	out.Reset()
+
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + otherID + `"}`)})
+	r.drainForTest()
+	out.Reset()
+
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "p2", Method: "project/current"})
+	if got := acpProjectFromResponse(t, drainedLines(t, r, &out, 1)[0]); got.ID != wantOther.ID {
+		t.Fatalf("project/current after cross-project switch id = %q, want %q (startup was %q)", got.ID, wantOther.ID, wantStartup.ID)
+	}
+}
+
+// TestAdapterExplicitSessionTargetingContract proves the project-implicit ACP
+// routes resolve to the connection's current session's project after a
+// cross-project switch: project/current reports it, session/new creates in it,
+// session/list lists it, and file/read enforces its root as the viewer sandbox.
+// With no session selected, the three operation routes fall back to the
+// owner-startup project (the same fallback Run's bootstrap uses), while
+// project/current alone errors with -32000 — a pure query has nothing to report
+// where creating, listing, and reading stay meaningful against the owner project.
+func TestAdapterExplicitSessionTargetingContract(t *testing.T) {
+	newSwitchedRunner := func(t *testing.T) (*agent.Agent, *Runner, *bytes.Buffer, string, string) {
+		t.Helper()
+		a := newACPTestAgent(t)
+		startupID, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession startup: %v", err)
+		}
+		otherRoot := t.TempDir()
+		otherID, err := a.NewSessionForProjectPath(otherRoot, "primary")
+		if err != nil {
+			t.Fatalf("NewSessionForProjectPath: %v", err)
+		}
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		r.setCurrentSessionID(startupID)
+		r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + otherID + `"}`)})
+		r.drainForTest()
+		out.Reset()
+		return a, r, out, otherRoot, otherID
+	}
+
+	t.Run("project_current=cross_project_session_switch_reports_B", func(t *testing.T) {
+		a, r, out, otherRoot, _ := newSwitchedRunner(t)
+		wantOther, err := a.ProjectCurrentForPath(otherRoot)
+		if err != nil {
+			t.Fatalf("other project: %v", err)
+		}
+		r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "p", Method: "project/current"})
+		if got := acpProjectFromResponse(t, drainedLines(t, r, out, 1)[0]); got.ID != wantOther.ID {
+			t.Fatalf("project/current after cross-project switch = %q, want %q", got.ID, wantOther.ID)
+		}
+	})
+
+	t.Run("project_current=no_session_returns_error", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "p", Method: "project/current"})
+		line := drainedLines(t, r, out, 1)[0]
+		var resp Response
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("response json: %v", err)
+		}
+		if resp.Error == nil {
+			t.Fatalf("project/current with no session = %+v, want -32000 error", resp.Result)
+		}
+		if resp.Error.Code != -32000 || !strings.Contains(resp.Error.Message, "no current session") {
+			t.Fatalf("project/current error = %+v, want code -32000 message containing %q", resp.Error, "no current session")
+		}
+	})
+
+	t.Run("acp_session_new=creates_in_selected_project", func(t *testing.T) {
+		_, r, out, otherRoot, _ := newSwitchedRunner(t)
+		r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "new", Method: "session/new"})
+		lines := drainedLines(t, r, out, 2)
+		assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+		summary := acpSessionSummaryFromResponse(t, lines[1])
+		if summary.ID == "" {
+			t.Fatal("session/new returned no session")
+		}
+		if summary.ProjectPath != otherRoot {
+			t.Fatalf("session/new created in project %q, want selected project %q", summary.ProjectPath, otherRoot)
+		}
+	})
+
+	t.Run("acp_session_list=lists_selected_project", func(t *testing.T) {
+		a, r, out, otherRoot, _ := newSwitchedRunner(t)
+		r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "list", Method: "session/list"})
+		line := drainedLines(t, r, out, 1)[0]
+		var resp Response
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("response json: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("session/list response error: %+v", resp.Error)
+		}
+		data, err := json.Marshal(resp.Result)
+		if err != nil {
+			t.Fatalf("session/list result marshal: %v", err)
+		}
+		var got []agent.SessionSummary
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatalf("session/list result json: %v", err)
+		}
+		want, err := a.SessionListForProjectPath(otherRoot, "active")
+		if err != nil {
+			t.Fatalf("SessionListForProjectPath: %v", err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("session/list returned %d sessions, want %d for selected project", len(got), len(want))
+		}
+		for i := range want {
+			if got[i].ID != want[i].ID {
+				t.Fatalf("session/list[%d] = %q, want selected project session %q", i, got[i].ID, want[i].ID)
+			}
+		}
+	})
+
+	t.Run("acp_file_read=allows_inside_selected_root", func(t *testing.T) {
+		_, r, out, otherRoot, _ := newSwitchedRunner(t)
+		inside := filepath.Join(otherRoot, "readme.txt")
+		if err := os.WriteFile(inside, []byte("b-content"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		r.dispatch(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "read",
+			Method:  "file/read",
+			Params:  json.RawMessage(`{"path":` + strconv.Quote(inside) + `}`),
+		})
+		line := drainedLines(t, r, out, 1)[0]
+		var resp Response
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("response json: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("file/read inside selected root errored: %+v", resp.Error)
+		}
+		data, err := json.Marshal(resp.Result)
+		if err != nil {
+			t.Fatalf("file/read result marshal: %v", err)
+		}
+		var payload struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			t.Fatalf("file/read result json: %v", err)
+		}
+		if payload.Content != "b-content" {
+			t.Fatalf("file/read inside selected root = %q, want %q", payload.Content, "b-content")
+		}
+	})
+
+	t.Run("acp_file_read=refuses_outside_selected_root", func(t *testing.T) {
+		a, r, out, _, _ := newSwitchedRunner(t)
+		outside := filepath.Join(a.ProjectRoot(), "old.txt")
+		if err := os.WriteFile(outside, []byte("old-content"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		r.dispatch(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "read",
+			Method:  "file/read",
+			Params:  json.RawMessage(`{"path":` + strconv.Quote(outside) + `}`),
+		})
+		line := drainedLines(t, r, out, 1)[0]
+		var resp Response
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("response json: %v", err)
+		}
+		if resp.Error == nil {
+			t.Fatalf("file/read outside selected root succeeded with %+v, want boundary refusal", resp.Result)
+		}
+	})
+
+	t.Run("acp_no_session=falls_back_to_owner_project", func(t *testing.T) {
+		a := newACPTestAgent(t)
+		out := new(bytes.Buffer)
+		r := &Runner{agent: a, owner: a, out: out}
+		ownerRoot := a.ProjectRoot()
+
+		r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "list", Method: "session/list"})
+		line := drainedLines(t, r, out, 1)[0]
+		var resp Response
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("list response json: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("session/list with no session errored: %+v", resp.Error)
+		}
+		data, err := json.Marshal(resp.Result)
+		if err != nil {
+			t.Fatalf("session/list result marshal: %v", err)
+		}
+		var got []agent.SessionSummary
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatalf("session/list result json: %v", err)
+		}
+		want, err := a.SessionListForProjectPath(ownerRoot, "active")
+		if err != nil {
+			t.Fatalf("SessionListForProjectPath: %v", err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("session/list with no session returned %d sessions, want owner project's %d", len(got), len(want))
+		}
+		for i := range want {
+			if got[i].ID != want[i].ID {
+				t.Fatalf("session/list[%d] = %q, want owner project session %q", i, got[i].ID, want[i].ID)
+			}
+		}
+		out.Reset()
+
+		inside := filepath.Join(ownerRoot, "readme.txt")
+		if err := os.WriteFile(inside, []byte("owner-content"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		r.dispatch(context.Background(), Request{
+			JSONRPC: "2.0",
+			ID:      "read",
+			Method:  "file/read",
+			Params:  json.RawMessage(`{"path":` + strconv.Quote(inside) + `}`),
+		})
+		line = drainedLines(t, r, out, 1)[0]
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("read response json: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("file/read inside owner root with no session errored: %+v", resp.Error)
+		}
+		out.Reset()
+
+		r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "new", Method: "session/new"})
+		lines := drainedLines(t, r, out, 2)
+		assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+		summary := acpSessionSummaryFromResponse(t, lines[1])
+		if summary.ID == "" {
+			t.Fatal("session/new returned no session")
+		}
+		if summary.ProjectPath != ownerRoot {
+			t.Fatalf("session/new with no session created in project %q, want owner project %q", summary.ProjectPath, ownerRoot)
+		}
+	})
+}
+
+// TestACPProjectRoutesKeepSessionProjectAfterRemoval proves the project-scoped
+// routes keep answering for the project of the session they were routing to
+// after that session is removed — archived or deleted, the two removal shapes
+// that clear routing current through separate calls: the routing project is
+// committed with the session id on every set and deliberately survives the
+// current-session removal, so session/new, session/list and file/read do not
+// fall back to the startup project.
+func TestACPProjectRoutesKeepSessionProjectAfterRemoval(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*Runner, Request)
+	}{
+		{name: "archive", run: func(r *Runner, req Request) { r.handleSessionArchive(req) }},
+		{name: "delete", run: func(r *Runner, req Request) { r.handleSessionDelete(req) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newACPTestAgent(t)
+			startupID, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatalf("NewSession startup: %v", err)
+			}
+			otherRoot := t.TempDir()
+			otherID, err := a.NewSessionForProjectPath(otherRoot, "primary")
+			if err != nil {
+				t.Fatalf("NewSessionForProjectPath: %v", err)
+			}
+			keptID, err := a.NewSessionForProjectPath(otherRoot, "primary")
+			if err != nil {
+				t.Fatalf("NewSessionForProjectPath kept: %v", err)
+			}
+			if startupID == otherID || otherID == keptID {
+				t.Fatal("test setup: sessions must be distinct")
+			}
+			readme := filepath.Join(otherRoot, "readme.txt")
+			if err := os.WriteFile(readme, []byte("b-content"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			out := new(bytes.Buffer)
+			r := &Runner{agent: a, owner: a, out: out}
+			r.setCurrentSessionID(startupID)
+
+			// Route to the other-project session, then remove it: routing
+			// current clears while the routing project stays the other project.
+			r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + otherID + `"}`)})
+			r.drainForTest()
+			out.Reset()
+			tc.run(r, Request{JSONRPC: "2.0", ID: "rem", Params: json.RawMessage(`{"id":"` + otherID + `"}`)})
+			r.drainForTest()
+			out.Reset()
+			if got, err := r.currentSession(); err == nil {
+				t.Fatalf("routing current after %s = %q, want cleared", tc.name, got)
+			}
+
+			// session/list still lists the other project, not the startup one.
+			r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "list", Method: "session/list"})
+			gotList := acpSessionListFromResponse(t, drainedLines(t, r, out, 1)[0])
+			wantList, err := a.SessionListForProjectPath(otherRoot, "active")
+			if err != nil {
+				t.Fatalf("SessionListForProjectPath: %v", err)
+			}
+			if len(gotList) != len(wantList) {
+				t.Fatalf("session/list returned %d sessions, want the routed project's %d: %#v", len(gotList), len(wantList), gotList)
+			}
+			for i := range wantList {
+				if gotList[i].ID != wantList[i].ID {
+					t.Fatalf("session/list[%d] = %q, want routed project session %q", i, gotList[i].ID, wantList[i].ID)
+				}
+			}
+			if len(gotList) != 1 || gotList[0].ID != keptID {
+				t.Fatalf("session/list = %#v, want the kept routed-project session %q", gotList, keptID)
+			}
+			out.Reset()
+
+			// session/new still creates in the other project.
+			r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "new", Method: "session/new"})
+			lines := drainedLines(t, r, out, 2)
+			assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+			summary := acpSessionSummaryFromResponse(t, lines[1])
+			if summary.ID == "" {
+				t.Fatal("session/new returned no session")
+			}
+			if summary.ProjectPath != otherRoot {
+				t.Fatalf("session/new created in project %q, want routed project %q", summary.ProjectPath, otherRoot)
+			}
+			out.Reset()
+
+			// file/read still reads from the other project.
+			if got := acpFileReadContent(t, r, out, readme); got != "b-content" {
+				t.Fatalf("file/read after %s = %q, want %q", tc.name, got, "b-content")
+			}
+		})
+	}
+}
+
+// TestACPProjectRoutesFollowExplicitPromptTarget proves the project-scoped
+// routes answer for the project of a session named explicitly in
+// session/prompt: the implicit switch inside submit admission commits the
+// routing project alongside the id, so a client that prompts another
+// project's session without ever calling session/switch has its subsequent
+// session/new, session/list and file/read scoped there.
+func TestACPProjectRoutesFollowExplicitPromptTarget(t *testing.T) {
+	a := newACPTestAgent(t)
+	startupID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	otherRoot := t.TempDir()
+	otherID, err := a.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath: %v", err)
+	}
+	readme := filepath.Join(otherRoot, "readme.txt")
+	if err := os.WriteFile(readme, []byte("b-content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out := new(bytes.Buffer)
+	r := &Runner{agent: a, owner: a, out: out}
+	a.SetEventHandler(r.handleEvent)
+	r.setCurrentSessionID(startupID)
+
+	// A live context admits the submit, so the implicit switch commits routing
+	// current and the routing project inside admission. The turn's own frames
+	// (turn_start, warnings) are enqueued by the failed turn's goroutine on no
+	// fixed schedule, so the route assertions below read the response frame by
+	// id and tolerate whatever else is on the wire around it.
+	r.handleSessionPrompt(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"session_id":"` + otherID + `","content":"hi"}`),
+	})
+	r.drainForTest()
+	out.Reset()
+	if got := r.currentSessionSummary().ID; got != otherID {
+		t.Fatalf("routing current = %q, want %q", got, otherID)
+	}
+
+	// session/list answers for the prompted session's project.
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "list", Method: "session/list"})
+	gotList := acpSessionListFromResponse(t, responseLineForID(t, r, out, "list"))
+	wantList, err := a.SessionListForProjectPath(otherRoot, "active")
+	if err != nil {
+		t.Fatalf("SessionListForProjectPath: %v", err)
+	}
+	if len(gotList) != len(wantList) {
+		t.Fatalf("session/list returned %d sessions, want the prompted project's %d: %#v", len(gotList), len(wantList), gotList)
+	}
+	for i := range wantList {
+		if gotList[i].ID != wantList[i].ID {
+			t.Fatalf("session/list[%d] = %q, want prompted project session %q", i, gotList[i].ID, wantList[i].ID)
+		}
+	}
+	if len(gotList) != 1 || gotList[0].ID != otherID {
+		t.Fatalf("session/list = %#v, want the prompted session %q", gotList, otherID)
+	}
+	out.Reset()
+
+	// session/new creates in the prompted session's project.
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "new", Method: "session/new"})
+	summary := acpSessionSummaryFromResponse(t, responseLineForID(t, r, out, "new"))
+	if summary.ID == "" {
+		t.Fatal("session/new returned no session")
+	}
+	if summary.ProjectPath != otherRoot {
+		t.Fatalf("session/new created in project %q, want prompted project %q", summary.ProjectPath, otherRoot)
+	}
+	out.Reset()
+
+	// file/read reads from the prompted session's project.
+	if got := acpFileReadContent(t, r, out, readme); got != "b-content" {
+		t.Fatalf("file/read after prompt = %q, want %q", got, "b-content")
+	}
+}
+
+// TestACPProjectRoutesKeepSessionProjectAfterEviction proves the routing
+// project survives a current-session eviction: a history revert whose
+// post-walk reload fails evicts the session and clears the current id, and the
+// empty-state boundary the eviction publishes through the turn-action callback
+// must clear the id without clearing the project the session was in, so the
+// project-scoped routes keep answering for it.
+func TestACPProjectRoutesKeepSessionProjectAfterEviction(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("file permissions do not block reads as root")
+	}
+	a, home := newACPTestAgentEnv(t, "http://127.0.0.1:9/v1", false)
+	startupID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	otherRoot := t.TempDir()
+	otherID, err := a.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath: %v", err)
+	}
+	for i := 1; i <= 10; i++ {
+		if _, err := a.AppendUserMessageToSession(otherID, fmt.Sprintf("turn %d", i)); err != nil {
+			t.Fatalf("append turn %d: %v", i, err)
+		}
+	}
+	readme := filepath.Join(otherRoot, "readme.txt")
+	if err := os.WriteFile(readme, []byte("b-content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Route to the other-project session first: opening re-hydrates the loop
+	// from disk, so the blocking below must come after it. Then make the
+	// reload fail after the walk ran: the walk stops at the blocked turn 7
+	// directory, and the reload then fails reading the surviving turn 7's
+	// messages file.
+	out := new(bytes.Buffer)
+	r := &Runner{agent: a, owner: a, out: out}
+	r.setCurrentSessionID(startupID)
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + otherID + `"}`)})
+	r.drainForTest()
+	out.Reset()
+
+	proj, err := a.ProjectCurrentForPath(otherRoot)
+	if err != nil {
+		t.Fatalf("ProjectCurrentForPath: %v", err)
+	}
+	sessionDir := filepath.Join(home, ".lightcode", "projects", proj.ID, "sessions", otherID)
+	blockedDir := filepath.Join(sessionDir, "turns", "7")
+	if err := os.Chmod(blockedDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blockedDir, 0o700) })
+	blockedMessages := filepath.Join(blockedDir, "messages.jsonl")
+	if err := os.Chmod(blockedMessages, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blockedMessages, 0o600) })
+
+	// The revert walks turns 10..7, stops at the blocked 7, and the reload
+	// failure evicts the session; the eviction boundary carries no session and
+	// clears the current id. The routing project must survive the empty-state
+	// boundary the callback receives.
+	r.handleRevertHistory(Request{JSONRPC: "2.0", ID: "rv", Params: json.RawMessage(`{"turn":6}`)})
+	r.drainForTest()
+	out.Reset()
+	if got, err := r.currentSession(); err == nil {
+		t.Fatalf("routing current after eviction = %q, want cleared", got)
+	}
+
+	// session/list still lists the other project, not the startup one.
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "list", Method: "session/list"})
+	gotList := acpSessionListFromResponse(t, drainedLines(t, r, out, 1)[0])
+	wantList, err := a.SessionListForProjectPath(otherRoot, "active")
+	if err != nil {
+		t.Fatalf("SessionListForProjectPath: %v", err)
+	}
+	if len(gotList) != len(wantList) {
+		t.Fatalf("session/list returned %d sessions, want the routed project's %d: %#v", len(gotList), len(wantList), gotList)
+	}
+	for i := range wantList {
+		if gotList[i].ID != wantList[i].ID {
+			t.Fatalf("session/list[%d] = %q, want routed project session %q", i, gotList[i].ID, wantList[i].ID)
+		}
+	}
+	if len(gotList) != 1 || gotList[0].ID != otherID {
+		t.Fatalf("session/list = %#v, want the evicted routed-project session %q", gotList, otherID)
+	}
+	out.Reset()
+
+	// session/new still creates in the other project.
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "new", Method: "session/new"})
+	lines := drainedLines(t, r, out, 2)
+	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+	summary := acpSessionSummaryFromResponse(t, lines[1])
+	if summary.ID == "" {
+		t.Fatal("session/new returned no session")
+	}
+	if summary.ProjectPath != otherRoot {
+		t.Fatalf("session/new created in project %q, want routed project %q", summary.ProjectPath, otherRoot)
+	}
+	out.Reset()
+
+	// file/read still reads from the other project.
+	if got := acpFileReadContent(t, r, out, readme); got != "b-content" {
+		t.Fatalf("file/read after eviction = %q, want %q", got, "b-content")
+	}
+}
+
+// TestACPRefusedPromptKeepsRoutingProject proves the explicit-id precheck does
+// not move the routing project: the project is committed with the id inside
+// submit admission, so a prompt whose submit is refused admission leaves both
+// the current id and the routing project on the previous session.
+func TestACPRefusedPromptKeepsRoutingProject(t *testing.T) {
+	a := newACPTestAgent(t)
+	startupID, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession startup: %v", err)
+	}
+	otherRoot := t.TempDir()
+	otherID, err := a.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath: %v", err)
+	}
+
+	// Park a turn on the target: without Init the failed provider call parks
+	// in the flush round-trip, so the unit stays busy and the prompt below is
+	// refused at the queue admission on the cancelled context, after the
+	// precheck has already resolved the session.
+	res, err := a.SubmitToSession(context.Background(), otherID, "park")
+	if err != nil {
+		t.Fatalf("SubmitToSession park: %v", err)
+	}
+	if !res.Started {
+		t.Fatalf("park submit was queued instead of started: %+v", res)
+	}
+
+	out := new(bytes.Buffer)
+	r := &Runner{agent: a, owner: a, out: out}
+	r.setCurrentSessionID(startupID)
+	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + startupID + `"}`)})
+	r.drainForTest()
+	out.Reset()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.handleSessionPrompt(ctx, Request{
+		JSONRPC: "2.0",
+		ID:      "prompt",
+		Params:  json.RawMessage(`{"session_id":"` + otherID + `","content":"hi"}`),
+	})
+	var resp Response
+	if err := json.Unmarshal([]byte(responseLineForID(t, r, out, "prompt")), &resp); err != nil {
+		t.Fatalf("prompt response json: %v", err)
+	}
+	if resp.Error == nil {
+		t.Fatalf("refused prompt succeeded with %+v, want an error", resp.Result)
+	}
+
+	// Neither the current id nor the routing project moved.
+	if got, err := r.currentSession(); err != nil || got != startupID {
+		t.Fatalf("routing current = %q (err %v), want unchanged %q", got, err, startupID)
+	}
+	if got := r.currentProjectPath(); got != a.ProjectRoot() {
+		t.Fatalf("routing project after refused prompt = %q, want unchanged %q", got, a.ProjectRoot())
+	}
+	out.Reset()
+
+	// The project-scoped routes still answer for the previous project.
+	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "list", Method: "session/list"})
+	gotList := acpSessionListFromResponse(t, responseLineForID(t, r, out, "list"))
+	wantList, err := a.SessionListForProjectPath(a.ProjectRoot(), "active")
+	if err != nil {
+		t.Fatalf("SessionListForProjectPath: %v", err)
+	}
+	if len(gotList) != len(wantList) {
+		t.Fatalf("session/list after refused prompt returned %d sessions, want the previous project's %d: %#v", len(gotList), len(wantList), gotList)
+	}
+	for i := range wantList {
+		if gotList[i].ID != wantList[i].ID {
+			t.Fatalf("session/list[%d] after refused prompt = %q, want previous project session %q", i, gotList[i].ID, wantList[i].ID)
+		}
 	}
 }
 
@@ -745,9 +4297,10 @@ func TestACPClearRemovedCurrent(t *testing.T) {
 			if got := r.currentSessionSummary().ID; got != "" {
 				t.Fatalf("current after %s = %q, want empty", tc.name, got)
 			}
+			r.drainForTest()
 			out.Reset()
 			r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "snapshots", Method: "snapshot/list"})
-			lines := responseLines(t, out.String(), 1)
+			lines := drainedLines(t, r, &out, 1)
 			var snapshots Response
 			if err := json.Unmarshal([]byte(lines[0]), &snapshots); err != nil {
 				t.Fatalf("snapshot response json: %v", err)
@@ -755,9 +4308,10 @@ func TestACPClearRemovedCurrent(t *testing.T) {
 			if snapshots.Error == nil {
 				t.Fatalf("%s snapshot/list response = %+v, want error", tc.name, snapshots)
 			}
+			r.drainForTest()
 			out.Reset()
 			r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "compact", Method: "compact"})
-			lines = responseLines(t, out.String(), 1)
+			lines = drainedLines(t, r, &out, 1)
 			var compact Response
 			if err := json.Unmarshal([]byte(lines[0]), &compact); err != nil {
 				t.Fatalf("compact response json: %v", err)
@@ -765,8 +4319,10 @@ func TestACPClearRemovedCurrent(t *testing.T) {
 			if compact.Error == nil {
 				t.Fatalf("%s compact response = %+v, want error", tc.name, compact)
 			}
+			r.drainForTest()
 			out.Reset()
 			r.handleEvent(agent.Event{Kind: agent.EventTextDelta, SessionID: firstID, Result: "skip"})
+			r.drainForTest()
 			if strings.Contains(out.String(), "skip") {
 				t.Fatalf("%s left old session event visible: %q", tc.name, out.String())
 			}
@@ -780,8 +4336,8 @@ func TestACPClearRemovedCurrent(t *testing.T) {
 func TestACPHandlersUseSharedTurnActionContract(t *testing.T) {
 	src := mustReadACPSource(t)
 	helper := extractSourceFunc(t, src, "func (r *Runner) handleTurnAction(")
-	if !strings.Contains(helper, ".ApplyTurnActionForSession(") {
-		t.Fatal("handleTurnAction must call ApplyTurnActionForSession")
+	if !strings.Contains(helper, ".ApplyTurnActionForSessionWithBoundary(") {
+		t.Fatal("handleTurnAction must call ApplyTurnActionForSessionWithBoundary")
 	}
 	for _, forbidden := range []string{".ForkSession(", ".RevertCode(", ".RevertHistory("} {
 		if strings.Contains(helper, forbidden) {
@@ -816,6 +4372,31 @@ func responseLines(t *testing.T, output string, want int) []string {
 	return lines
 }
 
+// drainForTest synchronously writes the runner's queued output frames to r.out, so
+// a test can read the output the sole drainer would otherwise write asynchronously.
+func (r *Runner) drainForTest() {
+	for {
+		r.mu.Lock()
+		if len(r.outFrames) == 0 {
+			r.mu.Unlock()
+			return
+		}
+		f := r.outFrames[0]
+		r.outFrames = r.outFrames[1:]
+		write := r.presentAcceptsLocked(f)
+		r.mu.Unlock()
+		if write && f.data != nil {
+			_, _ = r.out.Write(f.data)
+		}
+	}
+}
+
+func drainedLines(t *testing.T, r *Runner, out *bytes.Buffer, want int) []string {
+	t.Helper()
+	r.drainForTest()
+	return responseLines(t, out.String(), want)
+}
+
 func newACPTestAgent(t *testing.T) *agent.Agent {
 	t.Helper()
 	return newACPTestAgentWithProvider(t, "http://127.0.0.1:9/v1", false)
@@ -836,7 +4417,24 @@ func newACPWarningTestAgent(t *testing.T) *agent.Agent {
 
 func newACPTestAgentWithProvider(t *testing.T, baseURL string, discovery bool) *agent.Agent {
 	t.Helper()
+	a, _ := newACPTestAgentEnv(t, baseURL, discovery)
+	return a
+}
+
+// newACPTestAgentEnv is newACPTestAgentWithProvider that also returns the
+// storage home directory the agent was built with, for tests that must reach
+// the session files on disk.
+func newACPTestAgentEnv(t *testing.T, baseURL string, discovery bool) (*agent.Agent, string) {
+	t.Helper()
 	home := t.TempDir()
+	a := newACPTestAgentAtHome(t, baseURL, discovery, home)
+	return a, home
+}
+
+// newACPTestAgentAtHome builds an owner over the given home, so several owners
+// can share one home for cross-process claim testing.
+func newACPTestAgentAtHome(t *testing.T, baseURL string, discovery bool, home string) *agent.Agent {
+	t.Helper()
 	projectRoot := t.TempDir()
 	lightcodeDir := filepath.Join(home, ".lightcode")
 	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
@@ -859,6 +4457,12 @@ func newACPTestAgentWithProvider(t *testing.T, baseURL string, discovery bool) *
 }`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The agents config gives every session a resolvable live model, which the
+	// fork now requires of a driveable source (the persisted-model fallback is
+	// gone).
+	if err := os.WriteFile(filepath.Join(lightcodeDir, "agents.json"), []byte(`{"primary": {"model": "test/test-model"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := lcconfig.Load(configPath)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
@@ -870,8 +4474,26 @@ func newACPTestAgentWithProvider(t *testing.T, baseURL string, discovery bool) *
 	return a
 }
 
+// newACPTestAgentPair builds two owners over the same home with distinct
+// project roots, so one owner's live sessions hold their claims against the
+// other.
+func newACPTestAgentPair(t *testing.T) (*agent.Agent, *agent.Agent) {
+	t.Helper()
+	home := t.TempDir()
+	first := newACPTestAgentAtHome(t, "http://127.0.0.1:9/v1", false, home)
+	second := newACPTestAgentAtHome(t, "http://127.0.0.1:9/v1", false, home)
+	return first, second
+}
+
 func appendACPUserTurn(t *testing.T, a *agent.Agent, content string) int {
 	t.Helper()
+	// The removed ensureSession creating branch used to open a session on first
+	// use; bootstrap through the real creation entry when none exists yet.
+	if !a.Store().Active() {
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+	}
 	turn, err := a.AppendUserMessage(content)
 	if err != nil {
 		t.Fatalf("AppendUserMessage: %v", err)
@@ -898,6 +4520,201 @@ func appendACPUserTurnWithSnapshot(t *testing.T, a *agent.Agent, content, path, 
 	return turn
 }
 
+// blockACPTurnDir makes one message turn directory's removal fail: an
+// unwritable directory blocks os.RemoveAll exactly there, so the descending
+// history walk stops at it.
+func blockACPTurnDir(t *testing.T, a *agent.Agent, turn int) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes as root")
+	}
+	blocked := filepath.Join(a.Store().Dir(), "turns", strconv.Itoa(turn))
+	if err := os.Chmod(blocked, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o700) })
+}
+
+// blockACPSnapshotTurnDir makes one snapshot turn directory's removal fail, so
+// RevertCode's descending walk stops exactly there.
+func blockACPSnapshotTurnDir(t *testing.T, a *agent.Agent, turn int) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes as root")
+	}
+	blocked := filepath.Join(a.Store().Dir(), "snapshots", strconv.Itoa(turn))
+	if err := os.Chmod(blocked, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o700) })
+}
+
+func assertACPSuccessResponse(t *testing.T, line string) {
+	t.Helper()
+	var resp Response
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	// A JSON-RPC response echoes the request id; a notification carries none. This
+	// rejects a stray boundary notification standing in for the operation response.
+	if resp.ID == nil {
+		t.Fatalf("expected a JSON-RPC response with an id, got a frame without one: %s", line)
+	}
+	if resp.Error != nil {
+		t.Fatalf("expected success response, got error %+v", resp.Error)
+	}
+}
+
+func assertACPErrorResponse(t *testing.T, line string) {
+	t.Helper()
+	var resp Response
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error == nil {
+		t.Fatalf("expected error response, got success %+v", resp.Result)
+	}
+}
+
+// assertACPBareError asserts an error response carrying no structured data at
+// all — a precommit or code-revert failure must stay bare: no boundary before it
+// and no prepared result riding the rejection.
+func assertACPBareError(t *testing.T, line string) {
+	t.Helper()
+	assertACPErrorResponse(t, line)
+	var resp Response
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error.Data != nil {
+		t.Fatalf("failure must stay bare (no data), got %#v", resp.Error.Data)
+	}
+}
+
+func acpSessionSummaryFromResponse(t *testing.T, line string) agent.SessionSummary {
+	t.Helper()
+	var resp Response
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("session response error: %+v", resp.Error)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("session result marshal: %v", err)
+	}
+	var summary agent.SessionSummary
+	if err := json.Unmarshal(data, &summary); err != nil {
+		t.Fatalf("session result json: %v", err)
+	}
+	return summary
+}
+
+func acpSessionListFromResponse(t *testing.T, line string) []agent.SessionSummary {
+	t.Helper()
+	var resp Response
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("session/list response error: %+v", resp.Error)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("session/list result marshal: %v", err)
+	}
+	var list []agent.SessionSummary
+	if err := json.Unmarshal(data, &list); err != nil {
+		t.Fatalf("session/list result json: %v", err)
+	}
+	return list
+}
+
+// responseLineForID drains the runner's output and returns the response frame
+// carrying id, tolerating any notifications a turn's goroutine enqueues around
+// it on no fixed schedule.
+func responseLineForID(t *testing.T, r *Runner, out *bytes.Buffer, id string) string {
+	t.Helper()
+	r.drainForTest()
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var resp Response
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("frame json: %v", err)
+		}
+		if resp.ID == id {
+			return line
+		}
+	}
+	t.Fatalf("no response with id %q among frames: %q", id, out.String())
+	return ""
+}
+
+// acpFileReadContent dispatches file/read for path and returns the content,
+// failing the test on any error response.
+func acpFileReadContent(t *testing.T, r *Runner, out *bytes.Buffer, path string) string {
+	t.Helper()
+	r.dispatch(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "read",
+		Method:  "file/read",
+		Params:  json.RawMessage(`{"path":` + strconv.Quote(path) + `}`),
+	})
+	line := responseLineForID(t, r, out, "read")
+	var resp Response
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("file/read %q errored: %+v", path, resp.Error)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("file/read result marshal: %v", err)
+	}
+	var payload struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("file/read result json: %v", err)
+	}
+	return payload.Content
+}
+
+func acpChunkContent(t *testing.T, line string) string {
+	t.Helper()
+	var notif Notification
+	if err := json.Unmarshal([]byte(line), &notif); err != nil {
+		t.Fatalf("chunk notification json: %v", err)
+	}
+	params, ok := notif.Params.(map[string]any)
+	if !ok {
+		t.Fatalf("chunk params not object: %#v", notif.Params)
+	}
+	content, _ := params["content"].(string)
+	return content
+}
+
+func acpProjectFromResponse(t *testing.T, line string) agent.ProjectSummary {
+	t.Helper()
+	var resp Response
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("project response json: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("project response error: %+v", resp.Error)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("project result marshal: %v", err)
+	}
+	var proj agent.ProjectSummary
+	if err := json.Unmarshal(data, &proj); err != nil {
+		t.Fatalf("project result json: %v", err)
+	}
+	return proj
+}
+
 func assertACPNotificationMethod(t *testing.T, line, method string) {
 	t.Helper()
 	var notif Notification
@@ -907,6 +4724,40 @@ func assertACPNotificationMethod(t *testing.T, line, method string) {
 	if notif.Method != method {
 		t.Fatalf("notification method = %q, want %q", notif.Method, method)
 	}
+}
+
+// acpNotificationParams decodes a notification line's params payload.
+func acpNotificationParams(t *testing.T, line string) any {
+	t.Helper()
+	var notif Notification
+	if err := json.Unmarshal([]byte(line), &notif); err != nil {
+		t.Fatalf("notification json: %v", err)
+	}
+	return notif.Params
+}
+
+// acpUserContents lists the display user-message contents in order.
+func acpUserContents(messages []agent.DisplayMessage) []string {
+	var out []string
+	for _, m := range messages {
+		if m.Type == "user" {
+			out = append(out, m.Content)
+		}
+	}
+	return out
+}
+
+// acpEqualStrings reports whether two string slices are equal in order.
+func acpEqualStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func turnActionResultFromResponse(t *testing.T, resp Response) agent.TurnActionResult {
@@ -946,6 +4797,22 @@ func sessionPayloadFromParams(t *testing.T, params any) agent.SessionPayload {
 		t.Fatalf("unmarshal session payload: %v", err)
 	}
 	return payload
+}
+
+// hydrationStateFromParams decodes a notification's wire params into the full
+// captured state so tests can assert classes SessionPayload discards (model,
+// queue, warnings, permissions).
+func hydrationStateFromParams(t *testing.T, params any) agent.HydrationState {
+	t.Helper()
+	data, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var state agent.HydrationState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("unmarshal hydration state: %v", err)
+	}
+	return state
 }
 
 func promptWarningsFromResponse(t *testing.T, resp Response) []agent.PromptWarning {
@@ -1029,4 +4896,1480 @@ func extractSourceFunc(t *testing.T, src, signature string) string {
 	}
 	t.Fatalf("unterminated function %q", signature)
 	return ""
+}
+
+// waitForACPMethod drains until a notification with the given method is present
+// in the output and returns its params.
+func waitForACPMethod(t *testing.T, r *Runner, out *bytes.Buffer, method string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		r.drainForTest()
+		for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+			var n Notification
+			if err := json.Unmarshal([]byte(line), &n); err != nil || n.Method != method {
+				continue
+			}
+			params, _ := n.Params.(map[string]any)
+			return params
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for ACP notification %q; output: %q", method, out.String())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func acpParamString(t *testing.T, params map[string]any, key string) string {
+	t.Helper()
+	s, _ := params[key].(string)
+	return s
+}
+
+func writeACPSSE(w http.ResponseWriter, payloads ...string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	for _, payload := range payloads {
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+}
+
+func acpTextChunk(id, model, content string) string {
+	return fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"role":"assistant","content":%q},"finish_reason":null}]}`, id, model, content)
+}
+
+func acpStopChunk(id, model string) string {
+	return fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`, id, model)
+}
+
+func acpToolCallChunk(id, model, callID, name, arguments string) string {
+	argsJSON, _ := json.Marshal(arguments)
+	return fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":%q,"type":"function","function":{"name":%q,"arguments":%s}}]},"finish_reason":null}]}`, id, model, callID, name, argsJSON)
+}
+
+// TestAcceptedWorkOutlivesHostContext is the accepted-work lifetime contract:
+// once the owner accepts work, that work's lifetime is the owner's; a host
+// context may trigger shutdown but never severs accepted work. The matrix axes
+// are cancellation source (host signal, caller context, owner shutdown,
+// explicit per-session cancel) by admission state (pre-admission,
+// post-admission) by work kind (direct submit, queued item, compaction, child
+// turn). The nearest forbidden siblings: a cancelled caller context is still
+// rejected before admission, a cancelled caller context does not sever
+// already-accepted work, and owner shutdown and per-session cancel do end it.
+// The protocol host's signal path is driven specifically — that is the
+// reachable production case.
+func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
+	// The host signal path: the protocol host passes its signal context into
+	// the submit path, and a signal must end the accepted turn only through the
+	// owner's joined shutdown — its terminal event delivered and its message
+	// persisted — never by severing the turn directly.
+	t.Run("source=host_signal/state=post_admission/work=direct_submit", func(t *testing.T) {
+		reqSeen := make(chan struct{}, 1)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			// Hold the model call open until the owner cancels the turn; the
+			// test-controlled release unblocks the handler so the server can
+			// close even when the turn ends without cancelling the request.
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		// The ACP test config declares no agents.json, so the primary agent
+		// type has no model; bootstrap it through the adapter-facing method.
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		var out bytes.Buffer
+		r := &Runner{
+			agent: ag,
+			owner: ag,
+			in:    &onePromptThenBlockReader{line: []byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"session_id":"","content":"hi"}}` + "\n")},
+			out:   &out,
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx) }()
+		t.Cleanup(cancel)
+
+		waitForACPRequest(t, reqSeen, "prompt turn model request")
+		// Capture the session id before the signal: after the owner shutdown
+		// the session store is detached, so the routing current can no longer
+		// be resolved into a summary. The view's routing id itself survives.
+		id, err := r.currentSession()
+		if err != nil {
+			t.Fatalf("current session before signal: %v", err)
+		}
+		cancel() // the host's signal: cancels the Run context, triggering owner shutdown
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatal("Run did not return after the signal")
+		}
+
+		// The accepted turn was not severed: its terminal event was delivered
+		// and its message persisted, even though the host context is gone.
+		params := waitForACPMethod(t, r, &out, "agent/turn_end")
+		if cancelled, _ := params["cancelled"].(bool); !cancelled {
+			t.Fatalf("turn_end cancelled = %v, want true (the signal ended the turn through the owner)", cancelled)
+		}
+		assertACPDurableContent(t, ag, id, "hi")
+	})
+
+	// The forbidden sibling on the host path: a prompt submitted with an
+	// already-cancelled context is refused before admission.
+	t.Run("source=host_signal/state=pre_admission/work=direct_submit", func(t *testing.T) {
+		ag := newACPTestAgent(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		cancelled, cancelCtx := context.WithCancel(context.Background())
+		cancelCtx()
+		var out bytes.Buffer
+		r := &Runner{agent: ag, owner: ag, out: &out}
+		r.handleSessionPrompt(cancelled, Request{
+			JSONRPC: "2.0",
+			ID:      "prompt",
+			Params:  json.RawMessage(`{"session_id":"` + id + `","content":"hi"}`),
+		})
+		lines := drainedLines(t, r, &out, 1)
+		assertACPErrorResponse(t, lines[0])
+		if ag.Busy() {
+			t.Fatal("a cancelled-context prompt started a turn; admission must refuse it")
+		}
+	})
+
+	// The forbidden sibling on the queued path: a submit with an
+	// already-cancelled context is refused before the item is admitted to the
+	// queue, leaving the queue unchanged.
+	t.Run("source=host_signal/state=pre_admission/work=queued_item", func(t *testing.T) {
+		reqSeen := make(chan struct{}, 1)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			writeACPSSE(w, acpTextChunk("r", "test-model", "ok"), acpStopChunk("r", "test-model"), "[DONE]")
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		cap := &acpEventCapture{}
+		ag.SetEventHandler(cap.handler)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		// The unit is busy with a live turn, so a submit would enqueue.
+		res, err := ag.SubmitToSession(ctx, id, "first")
+		if err != nil {
+			t.Fatalf("SubmitToSession first: %v", err)
+		}
+		if !res.Started {
+			t.Fatalf("first turn enqueued instead of started: %+v", res)
+		}
+		<-reqSeen
+
+		// An already-cancelled caller is refused before the item is admitted
+		// to the queue.
+		cancelled, cancelCtx := context.WithCancel(context.Background())
+		cancelCtx()
+		if _, err := ag.SubmitToSession(cancelled, id, "queued"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("SubmitToSession with a cancelled context while busy = %v, want context.Canceled (admission must refuse before the item is queued)", err)
+		}
+		q, err := ag.QueueSnapshotForSession(id)
+		if err != nil {
+			t.Fatalf("QueueSnapshotForSession: %v", err)
+		}
+		if len(q.Items) != 0 {
+			t.Fatalf("queue after the refused submit = %d items, want none", len(q.Items))
+		}
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == agent.EventTurnStart && ev.Turn == res.Turn+1 {
+				t.Fatalf("a turn_start for a second turn was delivered after the refused submit: %#v", ev)
+			}
+		}
+	})
+
+	// The forbidden sibling on the compaction path: a compaction requested
+	// with an already-cancelled context is refused before the session is
+	// marked busy.
+	t.Run("source=host_signal/state=pre_admission/work=compaction", func(t *testing.T) {
+		ag := newACPTestAgent(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		if _, err := ag.AppendUserMessageToSession(id, "compact me"); err != nil {
+			t.Fatalf("AppendUserMessageToSession: %v", err)
+		}
+
+		cancelled, cancelCtx := context.WithCancel(context.Background())
+		cancelCtx()
+		if err := ag.CompactNowForSession(cancelled, id); !errors.Is(err, context.Canceled) {
+			t.Fatalf("CompactNowForSession with a cancelled context = %v, want context.Canceled (admission must refuse before marking the session busy)", err)
+		}
+		if ag.Busy() {
+			t.Fatal("the refused compaction marked the session busy")
+		}
+	})
+
+	// A nil caller context is not a cancelled one: the queued branch must
+	// treat it as the pre-existing behaviour did — enqueue on a busy unit,
+	// never panic on it and never refuse it.
+	t.Run("source=nil_context/state=pre_admission/work=queued_item", func(t *testing.T) {
+		reqSeen := make(chan struct{}, 1)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			writeACPSSE(w, acpTextChunk("r", "test-model", "ok"), acpStopChunk("r", "test-model"), "[DONE]")
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		// The unit is busy with a live turn, so a submit takes the queued
+		// branch.
+		res, err := ag.SubmitToSession(ctx, id, "first")
+		if err != nil {
+			t.Fatalf("SubmitToSession first: %v", err)
+		}
+		if !res.Started {
+			t.Fatalf("first turn enqueued instead of started: %+v", res)
+		}
+		<-reqSeen
+
+		// A nil context must be admitted like any live one: the item is
+		// enqueued instead of panicking or being refused.
+		resN, err := ag.SubmitToSession(nil, id, "queued")
+		if err != nil {
+			t.Fatalf("SubmitToSession(nil) while busy: %v", err)
+		}
+		if resN.Started {
+			t.Fatalf("SubmitToSession(nil) started a turn instead of enqueueing: %+v", resN)
+		}
+		q, err := ag.QueueSnapshotForSession(id)
+		if err != nil {
+			t.Fatalf("QueueSnapshotForSession: %v", err)
+		}
+		if len(q.Items) != 1 || q.Items[0].Content != "queued" {
+			t.Fatalf("queue after the nil-context submit = %#v, want the queued item", q.Items)
+		}
+	})
+
+	// A nil caller context is not a cancelled one: the admission check must
+	// treat it as the pre-existing normalisation did — admit the compaction,
+	// never panic on it and never refuse it.
+	t.Run("source=nil_context/state=pre_admission/work=compaction", func(t *testing.T) {
+		reqSeen := make(chan struct{}, 1)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			writeACPSSE(w, acpTextChunk("s", "test-model", "compact summary"), acpStopChunk("s", "test-model"), "[DONE]")
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		if _, err := ag.AppendUserMessageToSession(id, "compact me"); err != nil {
+			t.Fatalf("AppendUserMessageToSession: %v", err)
+		}
+
+		// A nil context must be admitted like any live one: the compaction
+		// runs to completion instead of panicking or being refused.
+		compactDone := make(chan error, 1)
+		go func() { compactDone <- ag.CompactNowForSession(nil, id) }()
+		<-reqSeen // the summarizer call is in flight: the compaction was admitted
+		closeRelease()
+		select {
+		case err := <-compactDone:
+			if err != nil {
+				t.Fatalf("CompactNowForSession(nil): %v", err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("compaction with a nil context did not complete")
+		}
+	})
+
+	// A cancelled caller context does not sever an accepted direct submit: the
+	// turn's context derives from the owner, so the in-flight model call
+	// survives the caller's cancellation and the turn completes.
+	t.Run("source=caller/state=post_admission/work=direct_submit", func(t *testing.T) {
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		reqSeen := make(chan struct{}, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			writeACPSSE(w, acpTextChunk("r1", "test-model", "hello back"), acpStopChunk("r1", "test-model"), "[DONE]")
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		cap := &acpEventCapture{}
+		ag.SetEventHandler(cap.handler)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		submitCtx, submitCancel := context.WithCancel(context.Background())
+		res, err := ag.SubmitToSession(submitCtx, id, "hi")
+		if err != nil {
+			t.Fatalf("SubmitToSession: %v", err)
+		}
+		if !res.Started {
+			t.Fatalf("turn enqueued instead of started: %+v", res)
+		}
+		<-reqSeen // the model call is in flight
+		submitCancel()
+		closeRelease() // the turn completes despite the caller's cancellation
+
+		// The turn continues to completion despite the caller's cancellation.
+		endEv := waitForACPTurnEnd(t, cap, id, 1)
+		if endEv.Cancelled {
+			t.Fatalf("turn_end cancelled = true after only the caller context was cancelled; the accepted turn must not be severed")
+		}
+		assertACPHydratedContent(t, ag, id, "hi")
+		assertACPHydratedContent(t, ag, id, "hello back")
+	})
+
+	// A queued item whose submitter's context is cancelled is still drained:
+	// the drainer launches it on the owner's lifetime.
+	t.Run("source=caller/state=post_admission/work=queued_item", func(t *testing.T) {
+		releaseA := make(chan struct{})
+		releaseB := make(chan struct{})
+		var releaseAOnce, releaseBOnce sync.Once
+		closeA := func() { releaseAOnce.Do(func() { close(releaseA) }) }
+		closeB := func() { releaseBOnce.Do(func() { close(releaseB) }) }
+		reqSeen := make(chan struct{}, 2)
+		var calls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			switch calls.Add(1) {
+			case 1:
+				select {
+				case <-releaseA:
+				case <-r.Context().Done():
+				}
+			case 2:
+				select {
+				case <-releaseB:
+				case <-r.Context().Done():
+				}
+			}
+			writeACPSSE(w, acpTextChunk("r", "test-model", "ok"), acpStopChunk("r", "test-model"), "[DONE]")
+		}))
+		t.Cleanup(func() { closeA(); closeB(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		cap := &acpEventCapture{}
+		ag.SetEventHandler(cap.handler)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		resA, err := ag.SubmitToSession(ctx, id, "first")
+		if err != nil {
+			t.Fatalf("SubmitToSession first: %v", err)
+		}
+		if !resA.Started {
+			t.Fatalf("first turn enqueued instead of started: %+v", resA)
+		}
+		<-reqSeen
+
+		// The second submit is accepted as a queued item under a cancellable
+		// caller context; cancelling that context must not drop the item.
+		submitBCtx, submitBCancel := context.WithCancel(context.Background())
+		resB, err := ag.SubmitToSession(submitBCtx, id, "queued")
+		if err != nil {
+			t.Fatalf("SubmitToSession queued: %v", err)
+		}
+		if resB.Started {
+			t.Fatalf("second turn started instead of queued: %+v", resB)
+		}
+		submitBCancel()
+
+		closeA() // turn A completes; the drainer launches the queued item
+		<-reqSeen
+		closeB() // turn B completes
+		waitForACPTurnEnd(t, cap, id, 2)
+		assertACPHydratedContent(t, ag, id, "first")
+		assertACPHydratedContent(t, ag, id, "queued")
+	})
+
+	// A compaction accepted under a caller context survives that context's
+	// cancellation: its context derives from the owner.
+	t.Run("source=caller/state=post_admission/work=compaction", func(t *testing.T) {
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		reqSeen := make(chan struct{}, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			writeACPSSE(w, acpTextChunk("s", "test-model", "compact summary"), acpStopChunk("s", "test-model"), "[DONE]")
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		if _, err := ag.AppendUserMessageToSession(id, "compact me"); err != nil {
+			t.Fatalf("AppendUserMessageToSession: %v", err)
+		}
+
+		compactCtx, compactCancel := context.WithCancel(context.Background())
+		compactDone := make(chan error, 1)
+		go func() { compactDone <- ag.CompactNowForSession(compactCtx, id) }()
+		<-reqSeen // the summarizer call is in flight
+		compactCancel()
+		closeRelease() // the compaction completes despite the caller's cancellation
+
+		// The compaction was accepted and must complete despite the caller's
+		// cancellation.
+		select {
+		case err := <-compactDone:
+			if err != nil {
+				t.Fatalf("CompactNowForSession: %v", err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("compaction did not complete after the caller context was cancelled")
+		}
+	})
+
+	// A child turn (subagent run) accepted inside a parent turn survives the
+	// caller's cancellation: the child's lifetime derives from the owner through
+	// the parent's accepted turn.
+	t.Run("source=caller/state=post_admission/work=child_turn", func(t *testing.T) {
+		releaseChild := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(releaseChild) }) }
+		childReqSeen := make(chan struct{}, 1)
+		var calls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch calls.Add(1) {
+			case 1:
+				writeACPSSE(w, acpToolCallChunk("p1", "test-model", "call_task", "task", `{"tasks":[{"prompt":"child work","subagent_type":"explore"}]}`), acpStopChunk("p1", "test-model"), "[DONE]")
+			case 2:
+				select {
+				case childReqSeen <- struct{}{}:
+				default:
+				}
+				select {
+				case <-releaseChild:
+				case <-r.Context().Done():
+				}
+				writeACPSSE(w, acpTextChunk("c1", "test-model", "CHILD_DONE"), acpStopChunk("c1", "test-model"), "[DONE]")
+			case 3:
+				writeACPSSE(w, acpTextChunk("p2", "test-model", "PARENT_DONE"), acpStopChunk("p2", "test-model"), "[DONE]")
+			default:
+				t.Fatalf("unexpected provider call %d", calls.Load())
+			}
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTaskAgent(t, server.URL+"/v1")
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		cap := &acpEventCapture{}
+		ag.SetEventHandler(cap.handler)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		submitCtx, submitCancel := context.WithCancel(context.Background())
+		if _, err := ag.SubmitToSession(submitCtx, id, "delegate"); err != nil {
+			t.Fatalf("SubmitToSession: %v", err)
+		}
+		<-childReqSeen // the child's model call is in flight
+		submitCancel()
+
+		// The child completes and the parent turn finishes normally.
+		closeRelease()
+		waitForACPTurnEnd(t, cap, id, 1)
+		childID := acpSubagentSessionID(t, cap)
+		if childID == "" {
+			t.Fatal("no subagent session started")
+		}
+		assertACPHydratedContent(t, ag, childID, "child work")
+		assertACPHydratedContent(t, ag, childID, "CHILD_DONE")
+	})
+
+	// Owner shutdown ends an accepted turn by cancelling and joining it: the
+	// terminal event is delivered and the message persisted.
+	t.Run("source=owner_shutdown/state=post_admission/work=direct_submit", func(t *testing.T) {
+		reqSeen := make(chan struct{}, 1)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel() })
+		ag.Init(ctx)
+		cap := &acpEventCapture{}
+		ag.SetEventHandler(cap.handler)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		res, err := ag.SubmitToSession(ctx, id, "hi")
+		if err != nil {
+			t.Fatalf("SubmitToSession: %v", err)
+		}
+		if !res.Started {
+			t.Fatalf("turn enqueued instead of started: %+v", res)
+		}
+		<-reqSeen
+
+		done := make(chan struct{})
+		go func() { ag.ShutdownOwner(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("ShutdownOwner did not join the in-flight turn")
+		}
+		endEv := waitForACPTurnEnd(t, cap, id, 1)
+		if !endEv.Cancelled {
+			t.Fatalf("turn_end cancelled = false after owner shutdown, want true")
+		}
+		// The message persisted through the clean shutdown: the live store is
+		// detached once every turn finished, so the persistence fact is read
+		// deliberately through the durable path.
+		assertACPDurableContent(t, ag, id, "hi")
+	})
+
+	// An explicit per-session cancel still ends exactly one turn: the terminal
+	// event is delivered and the message persisted.
+	t.Run("source=per_session_cancel/state=post_admission/work=direct_submit", func(t *testing.T) {
+		reqSeen := make(chan struct{}, 1)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case reqSeen <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}))
+		t.Cleanup(func() { closeRelease(); server.Close() })
+
+		ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+		if err := ag.SetDefaultModel("test/test-model"); err != nil {
+			t.Fatalf("SetDefaultModel: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
+		ag.Init(ctx)
+		cap := &acpEventCapture{}
+		ag.SetEventHandler(cap.handler)
+		id, err := ag.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		res, err := ag.SubmitToSession(ctx, id, "hi")
+		if err != nil {
+			t.Fatalf("SubmitToSession: %v", err)
+		}
+		if !res.Started {
+			t.Fatalf("turn enqueued instead of started: %+v", res)
+		}
+		<-reqSeen
+
+		if err := ag.CancelSession(id); err != nil {
+			t.Fatalf("CancelSession: %v", err)
+		}
+		endEv := waitForACPTurnEnd(t, cap, id, 1)
+		if !endEv.Cancelled {
+			t.Fatalf("turn_end cancelled = false after per-session cancel, want true")
+		}
+		assertACPHydratedContent(t, ag, id, "hi")
+	})
+}
+
+// TestACPShutdownReachesBlockedCompaction proves Run's teardown cancels the
+// work an admitted dispatch is blocked on before it joins that dispatch. A
+// compaction's summarizer call derives its context from the owner, so only the
+// owner's shutdown can cancel it, and the provider client carries no timeout —
+// behind the dispatch join that cancellation is unreachable and teardown hangs
+// forever. The cell has to be a subprocess receiving a real SIGTERM: cancelling
+// the context passed to Run also cancels the context passed to Agent.Init,
+// whose watcher runs ShutdownOwner immediately and cancels the compaction
+// before the join can block — the non-deadlocking sibling, which production
+// never reaches because the ACP host runs with context.Background and SIGTERM
+// cancels only the internal signal context.
+func TestACPShutdownReachesBlockedCompaction(t *testing.T) {
+	if os.Getenv(acpSignalChildEnv) == "1" {
+		runACPSignalShutdownChild(t)
+		return
+	}
+
+	// The parent half: spawn the child, wait until its admitted compaction is
+	// blocked in the summarizer call, then deliver a real SIGTERM and require
+	// the child to exit. Against the join-first teardown the child hangs behind
+	// the dispatch join and this times out.
+	cmd := exec.Command(os.Args[0], "-test.run=^TestACPShutdownReachesBlockedCompaction$")
+	cmd.Env = append(os.Environ(), acpSignalChildEnv+"=1")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("child stdout pipe: %v", err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+
+	ready := make(chan struct{})
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if strings.Contains(scanner.Text(), acpSignalBlockedMarker) {
+				close(ready)
+				return
+			}
+		}
+	}()
+	select {
+	case <-ready:
+	case <-time.After(30 * time.Second):
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatal("child never reported the blocked compaction")
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("signal child: %v", err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatalf("child exited with an error after SIGTERM: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		_ = cmd.Process.Kill()
+		<-waited
+		t.Fatal("child did not exit after SIGTERM: teardown hung behind the admitted compaction")
+	}
+}
+
+// runACPSignalShutdownChild is the child half of
+// TestACPShutdownReachesBlockedCompaction. It drives the production teardown
+// shape — Runner.Run with a Background host context, so only the internal
+// signal context is ever cancelled — with an admitted compaction blocked in the
+// summarizer call, reports readiness once the call is in flight, and returns
+// when the SIGTERM-triggered teardown completes.
+func runACPSignalShutdownChild(t *testing.T) {
+	reqSeen := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case reqSeen <- struct{}{}:
+		default:
+		}
+		// Hold the summarizer call open. The client side of the call is what
+		// the owner's shutdown cancels; the release is closed once the child's
+		// teardown completes, so the server itself never outlives the test.
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+
+	ag := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+	if err := ag.SetDefaultModel("test/test-model"); err != nil {
+		t.Fatalf("SetDefaultModel: %v", err)
+	}
+	ag.Init(context.Background())
+	id, err := ag.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if _, err := ag.AppendUserMessageToSession(id, "compact me"); err != nil {
+		t.Fatalf("AppendUserMessageToSession: %v", err)
+	}
+
+	line := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"compact","params":{"session_id":%q}}`+"\n", id)
+	r := &Runner{
+		agent: ag,
+		owner: ag,
+		in:    &onePromptThenBlockReader{line: []byte(line)},
+		out:   io.Discard,
+	}
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background()) }()
+
+	select {
+	case <-reqSeen:
+	case <-time.After(15 * time.Second):
+		t.Fatal("compaction was never admitted to the summarizer call")
+	}
+	fmt.Println(acpSignalBlockedMarker)
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+// onePromptThenBlockReader yields exactly one line and then blocks every
+// further Read, so Run reaches teardown only through context cancellation.
+type onePromptThenBlockReader struct {
+	line []byte
+	sent bool
+}
+
+// acpSignalChildEnv gates the child half of
+// TestACPShutdownReachesBlockedCompaction, and acpSignalBlockedMarker is the
+// line the child prints once its admitted compaction is blocked in the
+// summarizer call.
+const (
+	acpSignalChildEnv      = "LIGHTCODE_ACP_SIGNAL_CHILD"
+	acpSignalBlockedMarker = "LIGHTCODE_ACP_SIGNAL_CHILD_BLOCKED"
+)
+
+func (r *onePromptThenBlockReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, r.line), nil
+	}
+	select {}
+}
+
+// newACPTaskAgent builds an ACP test agent whose agents config overrides the
+// primary model so subagent turns resolve to the test provider.
+func newACPTaskAgent(t *testing.T, baseURL string) *agent.Agent {
+	t.Helper()
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	lightcodeDir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LIGHTCODE_TEST_KEY", "test-key")
+	configPath := filepath.Join(lightcodeDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{
+  "providers": {
+    "test": {
+      "name": "Test Provider",
+      "transport": { "base_url": "`+baseURL+`", "api_key_env": "LIGHTCODE_TEST_KEY" },
+      "discovery": false,
+      "models": {
+        "test-model": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 }
+      }
+    }
+  },
+  "default_model": "test/test-model"
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lightcodeDir, "agents.json"), []byte(`{"primary": {"model": "test/test-model"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := lcconfig.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+	return a
+}
+
+// acpEventCapture records agent events for the accepted-work contract.
+type acpEventCapture struct {
+	mu     sync.Mutex
+	events []agent.Event
+}
+
+func (c *acpEventCapture) handler(ev agent.Event) {
+	c.mu.Lock()
+	c.events = append(c.events, ev)
+	c.mu.Unlock()
+}
+
+func (c *acpEventCapture) snapshot() []agent.Event {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]agent.Event(nil), c.events...)
+}
+
+// waitForACPTurnEnd waits until the want-th turn_end for sessionID is
+// delivered and returns it.
+func waitForACPTurnEnd(t *testing.T, cap *acpEventCapture, sessionID string, want int) agent.Event {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		seen := 0
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == agent.EventTurnEnd && ev.SessionID == sessionID {
+				seen++
+				if seen == want {
+					return ev
+				}
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for turn_end %d of session %q; events: %#v", want, sessionID, cap.snapshot())
+	return agent.Event{}
+}
+
+// acpSubagentSessionID returns the first subagent session id recorded in the
+// capture, or "" when none was started.
+func acpSubagentSessionID(t *testing.T, cap *acpEventCapture) string {
+	t.Helper()
+	for _, ev := range cap.snapshot() {
+		if ev.Kind == agent.EventSubagentStart && ev.SubagentSessionID != "" {
+			return ev.SubagentSessionID
+		}
+	}
+	return ""
+}
+
+// assertACPHydratedContent fails unless sessionID's durable history contains a
+// message with the given content.
+func assertACPHydratedContent(t *testing.T, a *agent.Agent, sessionID, content string) {
+	t.Helper()
+	hs, err := a.HydrateSession(sessionID)
+	if err != nil {
+		t.Fatalf("HydrateSession(%q): %v", sessionID, err)
+	}
+	for _, m := range hs.Messages {
+		if m.Content == content {
+			return
+		}
+	}
+	t.Fatalf("durable history for %q lacks %q: %#v", sessionID, content, hs.Messages)
+}
+
+// assertACPDurableContent fails unless sessionID's durable history contains a
+// message with the given content. It is the deliberate post-shutdown read:
+// SessionMessagesFor's non-live branch resolves the session's project and
+// reads it read-only, which is the read that survives a clean owner shutdown
+// (the live store is detached once every turn has finished, so the live
+// resolution and the hydration fallback are both unavailable by design).
+func assertACPDurableContent(t *testing.T, a *agent.Agent, sessionID, content string) {
+	t.Helper()
+	msgs, err := a.SessionMessagesFor(sessionID)
+	if err != nil {
+		t.Fatalf("SessionMessagesFor(%q): %v", sessionID, err)
+	}
+	for _, m := range msgs {
+		if m.Content == content {
+			return
+		}
+	}
+	t.Fatalf("durable history for %q lacks %q: %#v", sessionID, content, msgs)
+}
+
+// waitForACPRequest waits for a request-signal on ch; the server-side helper
+// for the accepted-work contract.
+func waitForACPRequest(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// acpLifecycleFake is a prepared-outcome AdapterService for the ACP lifecycle routes —
+// new, fork, archive/delete. Each route mirrors the owner contract exactly: success
+// emits its prepared boundary with a nil outcome; a committed failure emits that same
+// prepared destination while still returning it (new) or riding back as error data
+// (fork); any plain precommit failure invokes no callback and advances nothing. Every
+// other owner call panics on the embedded nil interface, so an unexpected probe fails
+// loudly instead of silently succeeding; nothing here activates a real producer — only
+// consumer classification, FIFO order, routing adoption, and data shape are under test.
+type acpLifecycleFake struct {
+	agent.AdapterService // embedded nil: any unoverridden probe panics
+
+	newID      string // new's prepared destination id ("" = none)
+	newErr     error  // new outcome: nil / plain / wrapped committed
+	forkResult agent.TurnActionResult
+	forkErr    error // fork outcome, same split as newErr
+	rmErr      error // archive/delete shared outcome; the row decides current vs noncurrent via routing
+}
+
+func (f *acpLifecycleFake) ProjectRoot() string { return "/proj" }
+
+// emitPreparedState is the owner contract for a staged route's in-commit callback:
+// success emits with nil; committed failure emits prepared destination plus its wrapped
+// rejection and returns that id too; plain precommit invokes nothing.
+func (f *acpLifecycleFake) NewSessionForProjectPathWithBoundary(_, _ string, emit func(agent.HydrationState, error)) (string, error) {
+	state := agent.HydrationState{Session: agent.SessionSummary{ID: f.newID}}
+	var committed *snapshot.CommittedMutationError
+	if f.newErr == nil && f.newID != "" {
+		emit(state, nil)
+		return f.newID, nil
+	}
+	if f.newID != "" && errors.As(f.newErr, &committed) {
+		emit(state, f.newErr)
+		return f.newID, f.newErr // the destination id still returns with its rejection
+	}
+	return "", f.newErr // plain precommit: no callback at all
+}
+
+func (f *acpLifecycleFake) ApplyTurnActionForSessionWithBoundary(_ string, _ int, action string, _ bool, emit func(agent.HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (agent.TurnActionResult, error) {
+	if action != agent.TurnActionFork {
+		panic("acp lifecycle fake received a non-fork turn action; only fork is under test here")
+	}
+	var committed *snapshot.CommittedMutationError
+	switch {
+	case f.forkErr == nil && f.forkResult.Session.ID != "":
+		emit(agent.HydrationState{Session: f.forkResult.Session}, nil, "", nil, nil)
+		return f.forkResult, nil
+	default:
+		if f.forkResult.Session.ID != "" && errors.As(f.forkErr, &committed) {
+			emit(agent.HydrationState{Session: f.forkResult.Session}, nil, "", committed, nil)
+			return f.forkResult, f.forkErr // the prepared result rides back with its rejection
+		}
+		return agent.TurnActionResult{}, f.forkErr // plain precommit: no callback at all
+	}
+}
+
+func (f *acpLifecycleFake) SessionArchive(string) error { return f.rmErr }
+func (f *acpLifecycleFake) SessionDelete(string) error  { return f.rmErr }
+
+// acpLineIsNotification reports whether one drained ACP output line is a notification —
+// the boundary lines these rows assert on FIFO position. Responses carry an id and no
+// method; notifications the reverse, so both fields together discriminate exactly.
+func acpLineIsNotification(t *testing.T, line string) bool {
+	t.Helper()
+	var probe struct {
+		ID     any    `json:"id"`
+		Method string `json:"method"`
+	}
+	if err := json.Unmarshal([]byte(line), &probe); err != nil {
+		t.Fatalf("drained line is not valid JSON: %q (%v)", line, err)
+	}
+	return probe.Method != "" && probe.ID == nil
+}
+
+// presentedForTest reads the drainer-owned presentation current after a drain, so an
+// invisible nil advance (a frameAdvance with no data) stays observable in tests.
+func (r *Runner) presentedForTest() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.presented
+}
+
+// isPlainOutcome reports whether an outcome is neither success nor committed — a
+// precommit failure that emits no boundary at all and advances nothing.
+func isPlainOutcome(t *testing.T, out error) bool {
+	t.Helper()
+	if out == nil {
+		return false
+	}
+	var c *snapshot.CommittedMutationError
+	return !errors.As(out, &c)
+}
+
+// unmarshalInto round-trips one JSON value into dst for exact-shape assertions on the
+// prepared data these rows carry.
+func unmarshalInto(t *testing.T, from any, dst any) error {
+	t.Helper()
+	data, err := json.Marshal(from)
+	if err != nil {
+		return fmt.Errorf("re-marshal %T: %w", from, err)
+	}
+	if err := json.Unmarshal(data, dst); err != nil {
+		return fmt.Errorf("unmarshal into %T: %w (from %#v)", dst, err, from)
+	}
+	return nil
+}
+
+// TestACPLifecycleCommittedOutcomeTable proves the ACP lifecycle consumer table with a
+// fake service seam: new and fork emit boundary-then-response in exact FIFO order —
+// success rides its prepared data as result (new's SessionSummary, fork's TurnActionResult),
+// committed failure rides that same prepared data on a typed error; any plain precommit
+// failure stays one bare error line with no routing advance. Archive/delete send their
+// visible detach or invisible nil advance before the response and omit all error data even
+// when committed: removed current clears, unchanged current is preserved by its re-adopted
+// presentation — observable through presentedForTest because a nil advance carries no wire bytes.
+func TestACPLifecycleCommittedOutcomeTable(t *testing.T) {
+	committed := &snapshot.CommittedMutationError{Err: errors.New("committed sync failure")}
+
+	t.Run("route=new", func(t *testing.T) {
+		rows := []struct {
+			name      string // outcome class
+			newID     string // prepared destination ("" for a plain precommit with nothing created)
+			out       error  // nil = success; wrapped committed or plain failure
+			wantLines int    // exact drained line count: boundary + response, or bare rejection alone
+			wantCur   string // routing current after the call
+		}{
+			{name: "success", newID: "dest", wantLines: 2, wantCur: "dest"},
+			{name: "committed", newID: "dest", out: fmt.Errorf("wrap: %w", committed), wantLines: 2, wantCur: "dest"},
+			{name: "plain_error", out: errors.New("precommit failure"), wantLines: 1},
+		}
+		for _, row := range rows {
+			t.Run(row.name, func(t *testing.T) {
+				fake := &acpLifecycleFake{newID: row.newID, newErr: row.out}
+				var out bytes.Buffer
+				r := &Runner{agent: fake, out: &out}
+
+				req := Request{JSONRPC: "2.0", ID: "new-" + row.name, Method: "session/new"}
+				r.handleSessionNew(req)
+
+				lines := drainedLines(t, r, &out, row.wantLines) // exact count proves no interleaving or extras
+
+				if row.name != "plain_error" && !acpLineIsNotification(t, lines[0]) {
+					t.Fatalf("line 1 = %q; the prepared destination boundary must precede its response", lines[0])
+				}
+
+				var resp Response
+				respIdx := len(lines) - 1 // the response is always the final line of every row
+				if err := json.Unmarshal([]byte(lines[respIdx]), &resp); err != nil || (resp.Result == nil && resp.Error == nil) {
+					t.Fatalf("line %d = %q; want the response for id new-%s", respIdx+1, lines[respIdx], row.name)
+				}
+
+				switch {
+				case row.out == nil: // success rides its prepared summary as the result — no postcommit owner read
+					if resp.Error != nil {
+						t.Fatalf("success response = %q; want a bare result", lines[respIdx])
+					}
+					var got agent.SessionSummary
+					if err := unmarshalInto(t, resp.Result, &got); err != nil || got.ID != "dest" {
+						t.Fatalf("success result = %#v (err %v), want the prepared destination summary", resp.Result, err)
+					}
+				case errors.As(row.out, new(*snapshot.CommittedMutationError)): // committed: typed error carrying that same prepared data
+					if resp.Error == nil || resp.Result != nil {
+						t.Fatalf("committed response = %q; want the typed rejection with its data", lines[respIdx])
+					}
+					if resp.Error.Message != row.out.Error() {
+						t.Fatalf("error message = %q, want the full wrapped rejection text %q", resp.Error.Message, row.out.Error())
+					}
+					var got agent.SessionSummary
+					if err := unmarshalInto(t, resp.Error.Data, &got); err != nil || got.ID != "dest" {
+						t.Fatalf("committed error data = %#v (err %v), want the prepared destination summary", resp.Error.Data, err)
+					}
+				default: // plain precommit: one bare line only — no boundary ahead of it, no routing advance behind it
+					if len(lines) != 1 {
+						t.Fatalf("a plain failure emitted %d lines; it must stay a single bare rejection", len(lines))
+					}
+					var probe struct {
+						ID any `json:"id"`
+					}
+					if err := json.Unmarshal([]byte(lines[0]), &probe); err == nil && acpLineIsNotification(t, lines[0]) {
+						t.Fatalf("a plain precommit failure must not emit a boundary line: %q", lines[0])
+					}
+				}
+
+				if cur := r.sv().Current(); cur != row.wantCur {
+					t.Fatalf("routing current after %s new = %q, want %q", row.name, cur, row.wantCur)
+				}
+			})
+		}
+	})
+
+	t.Run("route=fork", func(t *testing.T) {
+		prepared := agent.TurnActionResult{SessionChanged: true, Session: agent.SessionSummary{ID: "forkdest"}}
+		rows := []struct {
+			name      string // outcome class
+			out       error  // nil = success; wrapped committed or plain failure
+			wantLines int    // boundary + response on every emitted row; bare rejection alone for precommit
+			wantCur   string // the prepared destination when adopted, else the retained source
+		}{
+			{name: "success", wantLines: 2, wantCur: "forkdest"},
+			{name: "committed", out: fmt.Errorf("wrap: %w", committed), wantLines: 2, wantCur: "forkdest"},
+			{name: "plain_error", out: errors.New("precommit failure"), wantLines: 1, wantCur: "src"},
+		}
+		for _, row := range rows {
+			t.Run(row.name, func(t *testing.T) {
+				fake := &acpLifecycleFake{forkResult: prepared, forkErr: row.out}
+				var out bytes.Buffer
+				r := &Runner{agent: fake, out: &out}
+				r.setCurrentSessionID("src") // the action's source; a plain failure must keep it
+
+				req := Request{JSONRPC: "2.0", ID: "fork-" + row.name, Method: "session/fork"}
+				params, _ := json.Marshal(turnActionParams{SessionID: "src", Turn: 1})
+				req.Params = params
+				r.handleTurnAction(req, agent.TurnActionFork)
+
+				lines := drainedLines(t, r, &out, row.wantLines) // exact count proves no interleaving or extras
+
+				if row.name != "plain_error" {
+					if !acpLineIsNotification(t, lines[0]) {
+						t.Fatalf("line 1 = %q; the destination boundary must precede its response", lines[0])
+					}
+					var notif struct {
+						Method string               `json:"method"`
+						Params agent.HydrationState `json:"params"`
+					}
+					if err := json.Unmarshal([]byte(lines[0]), &notif); err != nil || notif.Method != "agent/session_changed" || notif.Params.Session.ID != "forkdest" {
+						t.Fatalf("line 1 = %q; want the fork destination's session_changed boundary", lines[0])
+					}
+				}
+
+				var resp Response
+				if err := json.Unmarshal([]byte(lines[len(lines)-1]), &resp); err != nil || (resp.Result == nil && resp.Error == nil) {
+					t.Fatalf("final line = %q; want the response for id fork-%s", lines[len(lines)-1], row.name)
+				}
+
+				switch {
+				case row.out == nil: // success rides its prepared turn-action outcome as the result
+					if resp.Error != nil {
+						t.Fatalf("fork success response = %q; want a bare result", lines[len(lines)-1])
+					}
+					var got agent.TurnActionResult
+					if err := unmarshalInto(t, resp.Result, &got); err != nil || !reflect.DeepEqual(got, prepared) {
+						t.Fatalf("fork success result = %#v (err %v), want the prepared turn-action outcome", got, err)
+					}
+				case errors.As(row.out, new(*snapshot.CommittedMutationError)): // committed: typed error riding that same prepared result
+					if resp.Error == nil || resp.Result != nil {
+						t.Fatalf("fork committed response = %q; want the typed rejection with its data", lines[len(lines)-1])
+					}
+					if resp.Error.Message != row.out.Error() {
+						t.Fatalf("error message = %q, want the full wrapped rejection text %q", resp.Error.Message, row.out.Error())
+					}
+					var got agent.TurnActionResult
+					if err := unmarshalInto(t, resp.Error.Data, &got); err != nil || !reflect.DeepEqual(got, prepared) {
+						t.Fatalf("fork committed data = %#v (err %v), want the same prepared result its boundary was built from", got, err)
+					}
+				default: // plain precommit: one bare line only — no boundary ahead of it, source retained behind it
+					if acpLineIsNotification(t, lines[0]) {
+						t.Fatalf("a plain precommit failure must not emit a boundary line: %q", lines[0])
+					}
+				}
+
+				if cur := r.sv().Current(); cur != row.wantCur {
+					t.Fatalf("routing current after %s fork = %q, want %q", row.name, cur, row.wantCur)
+				}
+			})
+		}
+	})
+
+	for _, op := range []struct {
+		name   string // archive / delete — one shared consumer seam under test
+		handle func(*Runner, Request)
+	}{
+		{name: "archive", handle: func(r *Runner, req Request) { r.handleSessionArchive(req) }},
+		{name: "delete", handle: func(r *Runner, req Request) { r.handleSessionDelete(req) }},
+	} {
+		t.Run("route="+op.name, func(t *testing.T) {
+			rows := []struct {
+				name      string // outcome class × target position (routing current is A in every row)
+				target    string // the id archive/delete is called with
+				out       error  // nil = success; wrapped committed or plain failure
+				wantLines int    // visible wire lines: detach + response, invisible advance leaves one line alone
+				wantCur   string // routing current after the call ("" reconciled away for a removed current)
+			}{
+				{name: "success_current", target: "A", wantLines: 2},
+				{name: "success_noncurrent", target: "B", wantLines: 1, wantCur: "A"},
+				{name: "plain_error_current", target: "A", out: errors.New("precommit failure"), wantLines: 1, wantCur: "A"},
+				{name: "plain_error_noncurrent", target: "B", out: errors.New("precommit failure"), wantLines: 1, wantCur: "A"},
+				{name: "committed_current", target: "A", out: fmt.Errorf("wrap: %w", committed), wantLines: 2},
+				{name: "committed_noncurrent", target: "B", out: fmt.Errorf("wrap: %w", committed), wantLines: 1, wantCur: "A"},
+			}
+			for _, row := range rows {
+				t.Run(row.name, func(t *testing.T) {
+					fake := &acpLifecycleFake{rmErr: row.out}
+					var out bytes.Buffer
+					r := &Runner{agent: fake, out: &out}
+					r.setCurrentSessionID("A") // routing current before the call; target may or may not be it
+
+					req := Request{JSONRPC: "2.0", ID: op.name + "-" + row.name, Method: "session/" + op.name, Params: json.RawMessage(`{"id":"` + row.target + `"}`)}
+					op.handle(r, req)
+
+					lines := drainedLines(t, r, &out, row.wantLines) // exact count proves the advance's visibility class and FIFO order
+
+					if strings.HasSuffix(row.name, "_current") && (row.out == nil || errors.As(row.out, new(*snapshot.CommittedMutationError))) {
+						// A removed current publishes its visible detach ahead of the response.
+						if !acpLineIsNotification(t, lines[0]) {
+							t.Fatalf("line 1 = %q; the removal's advance must precede its response", lines[0])
+						}
+						var notif struct {
+							Method string               `json:"method"`
+							Params agent.HydrationState `json:"params"`
+						}
+						if err := json.Unmarshal([]byte(lines[0]), &notif); err != nil || notif.Method != "agent/session_changed" {
+							t.Fatalf("line 1 = %q; want the session_changed boundary", lines[0])
+						}
+						if notif.Params.Session.ID != "" || len(notif.Params.Messages) > 0 || notif.Params.Busy {
+							t.Fatalf("current-removal boundary = %#v; want the deterministic empty detach, not a capture of the removed session", notif.Params)
+						}
+					}
+
+					var resp Response
+					if err := json.Unmarshal([]byte(lines[len(lines)-1]), &resp); err != nil || (resp.Result == nil && resp.Error == nil) {
+						t.Fatalf("final line = %q; want the response for id %s-%s", lines[len(lines)-1], op.name, row.name)
+					}
+
+					switch {
+					case row.out == nil: // success resolves after its advance (visible or invisible)
+						if resp.Error != nil || resp.Result == nil {
+							t.Fatalf("%s response = %q; want a bare ok result", row.name, lines[len(lines)-1])
+						}
+					default:
+						var committedErr *snapshot.CommittedMutationError
+						if errors.As(row.out, &committedErr) { // committed rejects typed — and omits all error data for archive/delete
+							if resp.Error == nil || resp.Result != nil {
+								t.Fatalf("committed %s line = %q; want the typed rejection", op.name, lines[len(lines)-1])
+							}
+							if resp.Error.Data != nil {
+								t.Fatalf("a committed archive/delete outcome must omit all error data: %q", lines[len(lines)-1])
+							}
+						} else if acpLineIsNotification(t, lines[0]) { // a plain failure emits no advance line at all — the sole line is its rejection
+							t.Fatalf("a plain precommit failure emitted an advance line: %q", lines[0])
+						}
+					}
+
+					if cur := r.sv().Current(); cur != row.wantCur {
+						t.Fatalf("routing current after %s = %q, want %q", op.name+" "+row.name, cur, row.wantCur)
+					}
+
+					wantPresented := "" // current rows detach presentation to empty; plain rows never touch it (it started there too)
+					if strings.HasSuffix(row.name, "_noncurrent") && !isPlainOutcome(t, row.out) {
+						wantPresented = "A" // the success/committed nil advance re-adopts the unchanged A — a plain error emits no boundary at all
+					}
+					if got := r.presentedForTest(); got != wantPresented {
+						t.Fatalf("presentation after %s %s = %q, want %q", op.name, row.name, got, wantPresented)
+					}
+				})
+			}
+		})
+	}
+
+	// No routed current session: a noncurrent removal is still a noncurrent outcome — the nil
+	// advance must be enqueued with its empty (global) tag exactly as before, ahead of the
+	// response or typed error line in FIFO order. The advance carries no wire bytes and an
+	// empty→empty presented transition is unobservable through drainedLines/presentedForTest,
+	// so these rows read the drainer's queue directly: op.handle enqueues synchronously before
+	// returning, making existence and position exact at that instant. Plain precommit stays its
+	// forbidden sibling — error only, no advance of any kind.
+	t.Run("route=noncurrent_no_current", func(t *testing.T) {
+		for _, op := range []struct {
+			name   string // archive / delete — one shared consumer seam under test
+			handle func(*Runner, Request)
+		}{
+			{name: "archive", handle: func(r *Runner, req Request) { r.handleSessionArchive(req) }},
+			{name: "delete", handle: func(r *Runner, req Request) { r.handleSessionDelete(req) }},
+		} {
+			t.Run("route="+op.name, func(t *testing.T) {
+				rows := []struct {
+					name        string // outcome class; target B is noncurrent by construction (nothing is routed current)
+					out         error  // nil = success; wrapped committed or plain failure
+					wantLines   int    // visible wire lines: the invisible advance leaves exactly one line alone
+					wantAdvance bool   // a nil advance with an empty tag enqueued ahead of the response
+				}{
+					{name: "success_noncurrent", wantLines: 1, wantAdvance: true},
+					{name: "committed_noncurrent", out: fmt.Errorf("wrap: %w", committed), wantLines: 1, wantAdvance: true},
+					{name: "plain_error_noncurrent", out: errors.New("precommit failure"), wantLines: 1}, // forbidden sibling of the two rows above: no advance at all
+				}
+				for _, row := range rows {
+					t.Run(row.name, func(t *testing.T) {
+						fake := &acpLifecycleFake{rmErr: row.out}
+						var out bytes.Buffer
+						r := &Runner{agent: fake, out: &out} // no setCurrentSessionID — nothing is routed current before the call
+
+						req := Request{JSONRPC: "2.0", ID: op.name + "-" + row.name, Method: "session/" + op.name, Params: json.RawMessage(`{"id":"B"}`)}
+						op.handle(r, req) // enqueues synchronously; queue inspection below runs before any drain
+
+						if got := r.queuedNilAdvanceBeforeLast(t); got != row.wantAdvance {
+							t.Fatalf("%s %s queued a nil advance ahead of its response = %v, want %v: queue=%q", op.name, row.name, got, row.wantAdvance, r.frameKindsForTest())
+						}
+
+						lines := drainedLines(t, r, &out, row.wantLines) // exact count proves the advance stays invisible on the wire and nothing else leaked
+
+						var resp Response
+						if err := json.Unmarshal([]byte(lines[len(lines)-1]), &resp); err != nil || (resp.Result == nil && resp.Error == nil) {
+							t.Fatalf("final line = %q; want the response for id %s-%s", lines[len(lines)-1], op.name, row.name)
+						}
+						switch {
+						case row.out == nil: // success resolves after its invisible advance
+							if resp.Error != nil || resp.Result == nil {
+								t.Fatalf("%s response = %q; want a bare ok result", row.name, lines[len(lines)-1])
+							}
+						default:
+							var committedErr *snapshot.CommittedMutationError
+							if errors.As(row.out, &committedErr) { // committed rejects typed and omits all error data — same as with a routed current
+								if resp.Error == nil || resp.Result != nil {
+									t.Fatalf("committed %s line = %q; want the typed rejection", op.name, lines[len(lines)-1])
+								}
+								if resp.Error.Data != nil {
+									t.Fatalf("a committed archive/delete outcome must omit all error data: %q", lines[len(lines)-1])
+								}
+							} else if acpLineIsNotification(t, lines[0]) { // a plain failure emits no advance line at all — the sole line is its rejection
+								t.Fatalf("a plain precommit failure emitted an advance line: %q", lines[0])
+							}
+						}
+
+						if got, _ := r.currentSession(); got != "" { // current preservation with nothing routed: still nothing after the removal
+							t.Fatalf("routing current after %s %s = %q, want none preserved as-is", op.name, row.name, got)
+						}
+					})
+				}
+			})
+		}
+	})
+}
+
+// queuedNilAdvanceBeforeLast reports whether the operation enqueued exactly one nil advance — a
+// frameAdvance carrying no wire bytes and tagged to whatever current was captured (empty when
+// nothing is routed) — ahead of its response. It reads the drainer's queue under mu before any
+// drain, so existence and FIFO position are exact at that instant; it never writes anything back.
+func (r *Runner) queuedNilAdvanceBeforeLast(t *testing.T) bool {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.outFrames) < 2 {
+		return false // a response alone: no advance was enqueued at all
+	}
+	f := r.outFrames[0] // the operation's frames are [advance?, response]; head position is its FIFO slot
+	return f.kind == frameAdvance && strings.TrimSpace(f.sessionID) == ""
+}
+
+// frameKindsForTest renders one queue snapshot for failure diagnostics only.
+func (r *Runner) frameKindsForTest() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ks := make([]string, 0, len(r.outFrames))
+	for _, f := range r.outFrames {
+		if f.kind == frameAdvance {
+			ks = append(ks, "advance["+f.sessionID+"]")
+		} else {
+			ks = append(ks, "frame["+f.sessionID+"]")
+		}
+	}
+	return ks
 }

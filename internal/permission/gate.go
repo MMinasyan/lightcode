@@ -47,6 +47,17 @@ type Gate struct {
 
 	// OnRequest is called when a new permission request is registered.
 	OnRequest func(ctx context.Context, req Request)
+
+	// OnResolved is called when a pending request is removed — answered,
+	// cancelled, or dropped with its context. It fires under the gate mutex,
+	// in the same section as the removal, so a consumer can publish the
+	// resolution atomically with the state change.
+	OnResolved func(req Request)
+
+	// RegisterBarrier, when set, runs at the start of AskRequest before the gate
+	// mutex is taken. Tests set it to deterministically interleave a registration
+	// with a concurrent capture; production leaves it nil.
+	RegisterBarrier func()
 }
 
 type pendingRequest struct {
@@ -80,13 +91,21 @@ func (g *Gate) AskRequest(ctx context.Context, req Request) ResponseAction {
 	ch := make(chan ResponseAction, 1)
 	req.ID = id
 
+	if g.RegisterBarrier != nil {
+		g.RegisterBarrier()
+	}
+
+	// Insert the pending request and enqueue its event in one mutex section, so a
+	// navigation capture that reads the pending set under this mutex either includes
+	// the request in its snapshot or delivers its event after the boundary, never
+	// splitting the two. OnRequest only appends to an adapter's leaf queue, so it
+	// takes no lock above this one.
 	g.mu.Lock()
 	g.pending[id] = pendingRequest{ch: ch, req: req}
-	g.mu.Unlock()
-
 	if g.OnRequest != nil {
 		g.OnRequest(ctx, req)
 	}
+	g.mu.Unlock()
 
 	select {
 	case result := <-ch:
@@ -107,6 +126,9 @@ func (g *Gate) AskRequest(ctx context.Context, req Request) ResponseAction {
 		}
 		if current, ok := g.pending[id]; ok && current.ch == ch {
 			delete(g.pending, id)
+			if g.OnResolved != nil {
+				g.OnResolved(current.req)
+			}
 		}
 		g.mu.Unlock()
 		return ResponseDeny
@@ -117,13 +139,50 @@ func (g *Gate) AskRequest(ctx context.Context, req Request) ResponseAction {
 func (g *Gate) CancelAll() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	for id, ch := range g.pending {
+	for id, pending := range g.pending {
+		// Publish before unblocking the waiter (see respondAction).
+		if g.OnResolved != nil {
+			g.OnResolved(pending.req)
+		}
 		select {
-		case ch.ch <- ResponseDeny:
+		case pending.ch <- ResponseDeny:
 		default:
 		}
 		delete(g.pending, id)
 	}
+}
+
+// Lock and Unlock expose the gate mutex so a navigation capture can hold it
+// across its boundary append. Registration (AskRequest) inserts under this mutex,
+// so holding it across the boundary makes a new request captured in the snapshot
+// or delivered after the boundary — never lost.
+func (g *Gate) Lock()   { g.mu.Lock() }
+func (g *Gate) Unlock() { g.mu.Unlock() }
+
+// PendingForSession returns a snapshot of the pending requests owned by
+// sessionID, keyed by request id. The order is unspecified: consumers key by
+// Request.ID.
+func (g *Gate) PendingForSession(sessionID string) []Request {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.PendingForSessionLocked(sessionID)
+}
+
+// PendingForSessionLocked is PendingForSession for a caller already holding the
+// gate mutex through Lock.
+func (g *Gate) PendingForSessionLocked(sessionID string) []Request {
+	var out []Request
+	for _, p := range g.pending {
+		if p.req.SessionID == sessionID {
+			req := p.req
+			// Detach the batch slices so the snapshot shares no backing array
+			// with the gate's live request.
+			req.BatchFiles = append([]string(nil), p.req.BatchFiles...)
+			req.BatchResolvedFiles = append([]string(nil), p.req.BatchResolvedFiles...)
+			out = append(out, req)
+		}
+	}
+	return out
 }
 
 // CancelSession resolves pending requests owned by sessionID as denied.
@@ -138,6 +197,10 @@ func (g *Gate) CancelSession(sessionID string) int {
 	for id, pending := range g.pending {
 		if pending.req.SessionID != sessionID {
 			continue
+		}
+		// Publish before unblocking the waiter (see respondAction).
+		if g.OnResolved != nil {
+			g.OnResolved(pending.req)
 		}
 		select {
 		case pending.ch <- ResponseDeny:
@@ -195,6 +258,12 @@ func (g *Gate) respondAction(sessionID, id string, action string, requireSession
 	}
 	if response == ResponseAllowAll && !pending.req.CanAllowAll {
 		response = ResponseAllow
+	}
+	// Publish the resolution before unblocking the waiter: once the response is
+	// on the channel the waiter can run to turn end, and the host must never
+	// observe turn end before the resolution that precedes it.
+	if g.OnResolved != nil {
+		g.OnResolved(pending.req)
 	}
 	pending.ch <- response
 	delete(g.pending, id)

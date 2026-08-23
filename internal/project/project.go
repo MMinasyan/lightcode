@@ -6,14 +6,17 @@
 package project
 
 import (
-	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 // Project is persisted to projects/<id>/meta.json.
@@ -40,6 +43,11 @@ func NewResolver(home, projectRoot string) (*Resolver, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, fmt.Errorf("project: create %s: %w", root, err)
 	}
+	for _, dir := range []string{root, filepath.Dir(root), filepath.Dir(filepath.Dir(root))} {
+		if err := atomicfs.SyncDir(dir); err != nil {
+			return nil, fmt.Errorf("project: sync %s: %w", dir, err)
+		}
+	}
 	abs, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return nil, fmt.Errorf("project: resolve cwd: %w", err)
@@ -65,6 +73,12 @@ func (r *Resolver) Ensure() (*Project, error) {
 	return EnsureForPath(r.root, r.projectRoot)
 }
 
+// TryEnsure attempts to resolve or create the resolver's current project
+// without waiting for another process's identity lock.
+func (r *Resolver) TryEnsure() (*Project, bool, error) {
+	return TryEnsureForPath(r.root, r.projectRoot)
+}
+
 // SessionsRoot returns the sessions dir for the given project id
 // (caller already holds a project record).
 func (r *Resolver) SessionsRoot(projectID string) string {
@@ -86,11 +100,16 @@ func List(root string) ([]Project, error) {
 		if !e.IsDir() {
 			continue
 		}
-		var p Project
-		if err := readJSON(filepath.Join(root, e.Name(), "meta.json"), &p); err != nil {
+		// Skip reserved sidecar dirs (.locks, .staging, .deleting) that are
+		// not project records.
+		if strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
-		out = append(out, p)
+		p, err := readProject(root, e.Name())
+		if err != nil {
+			continue
+		}
+		out = append(out, *p)
 	}
 	return out, nil
 }
@@ -107,77 +126,199 @@ func ListSortedByActivity(root string) ([]Project, error) {
 	return out, nil
 }
 
-// FindByPath returns the first project whose Path == absPath, or (nil, nil).
+// FindByPath returns the project record for absPath, or (nil, nil) if none
+// has been created. The project id is a deterministic function of the
+// normalized path, so this reads exactly that project's meta.json.
 func FindByPath(root, absPath string) (*Project, error) {
-	projects, err := List(root)
+	clean, err := normalizePath(absPath)
 	if err != nil {
 		return nil, err
 	}
-	for i := range projects {
-		if projects[i].Path == absPath {
-			p := projects[i]
-			return &p, nil
+	p, err := readProject(root, projectID(clean))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
 		}
+		return nil, err
 	}
-	return nil, nil
+	// The normalized path is the expected value here, so a record that
+	// belongs to another path is rejected with an error — never (nil, nil),
+	// which callers read as "no such project" and would answer by minting a
+	// second project over the corrupt record.
+	if p.Path != clean {
+		return nil, fmt.Errorf("project: %s: stored path %q does not match %q", p.ID, p.Path, clean)
+	}
+	return p, nil
 }
 
-// EnsureForPath returns the existing project record for absPath or
-// creates a new one. The new project's sessions/ subdir is also created.
+// EnsureForPath returns the existing project record for absPath or creates
+// one. The project id is the deterministic id of the normalized path, so a
+// path maps to exactly one project. Creation is serialized under the
+// per-path identity lock, so two concurrent creators converge on one record
+// with one CreatedAt rather than racing to overwrite each other.
 func EnsureForPath(root, absPath string) (*Project, error) {
-	if existing, err := FindByPath(root, absPath); err != nil {
-		return nil, err
-	} else if existing != nil {
-		return existing, nil
-	}
-	id, err := newProjectID()
+	clean, err := normalizePath(absPath)
 	if err != nil {
 		return nil, err
 	}
+	id := projectID(clean)
+	var result Project
+	err = atomicfs.WithLock(identityLockPath(root, clean), func() error {
+		return ensureForPathBody(root, clean, id, &result)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// TryEnsureForPath is the one-attempt counterpart of EnsureForPath. A
+// contended identity lock returns without invoking the publication body.
+func TryEnsureForPath(root, absPath string) (*Project, bool, error) {
+	clean, err := normalizePath(absPath)
+	if err != nil {
+		return nil, false, err
+	}
+	id := projectID(clean)
+	var result Project
+	ok, err := atomicfs.TryWithLock(identityLockPath(root, clean), func() error {
+		return ensureForPathBody(root, clean, id, &result)
+	})
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	return &result, true, nil
+}
+
+func ensureForPathBody(root, clean, id string, result *Project) error {
 	dir := filepath.Join(root, id)
+	metaPath := filepath.Join(dir, "meta.json")
+	existing, err := readProject(root, id)
+	if err == nil {
+		// The normalized path is the expected value here, so a record
+		// that belongs to another path is rejected with an error rather
+		// than minting a second project over the corrupt record.
+		if existing.Path != clean {
+			return fmt.Errorf("project: %s: stored path %q does not match %q", id, existing.Path, clean)
+		}
+		*result = *existing
+		if err := atomicfs.SyncDir(dir); err != nil {
+			return fmt.Errorf("project: sync %s: %w", dir, err)
+		}
+		if err := atomicfs.SyncDir(root); err != nil {
+			return fmt.Errorf("project: sync %s: %w", root, err)
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o700); err != nil {
-		return nil, fmt.Errorf("project: create %s: %w", dir, err)
+		return fmt.Errorf("project: create %s: %w", dir, err)
 	}
 	now := time.Now()
 	p := Project{
 		ID:           id,
-		Name:         filepath.Base(absPath),
-		Path:         absPath,
+		Name:         filepath.Base(clean),
+		Path:         clean,
 		CreatedAt:    now.UTC().Format(time.RFC3339),
 		LastActivity: now.Unix(),
 	}
-	if err := writeJSON(filepath.Join(dir, "meta.json"), p); err != nil {
-		return nil, err
+	if err := writeJSON(metaPath, p); err != nil {
+		return err
 	}
-	return &p, nil
+	if err := atomicfs.SyncDir(dir); err != nil {
+		return fmt.Errorf("project: sync %s: %w", dir, err)
+	}
+	if err := atomicfs.SyncDir(root); err != nil {
+		return fmt.Errorf("project: sync %s: %w", root, err)
+	}
+	*result = p
+	return nil
 }
 
-// TouchActivity bumps LastActivity on the project's meta.json to now.
+// TouchActivity advances LastActivity on the project's meta.json to now.
+// The whole read-modify-write runs under the project meta lock and never
+// moves activity backward, so concurrent touches serialize to a monotonic
+// value instead of losing an update.
 func TouchActivity(root, projectID string) error {
 	if projectID == "" {
 		return nil
 	}
-	metaPath := filepath.Join(root, projectID, "meta.json")
-	var p Project
-	if err := readJSON(metaPath, &p); err != nil {
+	metaPath := metaPathFor(root, projectID)
+	return atomicfs.WithLock(metaLockPath(root, projectID), func() error {
+		return touchActivityBody(root, projectID, metaPath)
+	})
+}
+
+// TryTouchActivity updates project activity once, without waiting for a
+// foreign metadata lock. It is used by owner turn/reactivation paths where a
+// best-effort project touch must not delay shutdown.
+func TryTouchActivity(root, projectID string) (bool, error) {
+	if projectID == "" {
+		return true, nil
+	}
+	metaPath := metaPathFor(root, projectID)
+	return atomicfs.TryWithLock(metaLockPath(root, projectID), func() error {
+		return touchActivityBody(root, projectID, metaPath)
+	})
+}
+
+func touchActivityBody(root, projectID, metaPath string) error {
+	p, err := readProject(root, projectID)
+	if err != nil {
 		return err
 	}
-	p.LastActivity = time.Now().Unix()
+	now := time.Now().Unix()
+	if now <= p.LastActivity {
+		return nil
+	}
+	p.LastActivity = now
 	return writeJSON(metaPath, p)
 }
 
-func newProjectID() (string, error) {
-	var buf [16]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return "", fmt.Errorf("project: random: %w", err)
+// normalizePath is the canonical project-path identity: the cleaned
+// absolute path, with no symlink or case rewriting.
+func normalizePath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("project: resolve path: %w", err)
 	}
-	buf[6] = (buf[6] & 0x0f) | 0x40
-	buf[8] = (buf[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%s-%s-%s-%s-%s",
-		hex.EncodeToString(buf[0:4]),
-		hex.EncodeToString(buf[4:6]),
-		hex.EncodeToString(buf[6:8]),
-		hex.EncodeToString(buf[8:10]),
-		hex.EncodeToString(buf[10:16]),
-	), nil
+	return filepath.Clean(abs), nil
+}
+
+func pathHash(cleanAbs string) string {
+	sum := sha256.Sum256([]byte(cleanAbs))
+	return hex.EncodeToString(sum[:])
+}
+
+// projectID is p- plus the full lowercase SHA-256 hex of the normalized
+// path bytes. It is fully deterministic; there is no random or legacy id.
+func projectID(cleanAbs string) string {
+	return "p-" + pathHash(cleanAbs)
+}
+
+// readProject reads a project's meta.json and assigns the id the caller
+// resolved the directory under. The persisted record's own id is
+// unvalidated and can name a different project, so the directory's id wins:
+// every reader that already holds the id reports the record under it,
+// keeping a corrupt record from surfacing under a foreign id.
+func readProject(root, id string) (*Project, error) {
+	var p Project
+	if err := readJSON(metaPathFor(root, id), &p); err != nil {
+		return nil, err
+	}
+	p.ID = id
+	return &p, nil
+}
+
+func metaPathFor(root, id string) string {
+	return filepath.Join(root, id, "meta.json")
+}
+
+func identityLockPath(root, cleanAbs string) string {
+	return filepath.Join(root, ".locks", "identity", pathHash(cleanAbs)+".lock")
+}
+
+func metaLockPath(root, id string) string {
+	return filepath.Join(root, id, ".locks", "meta.lock")
 }

@@ -16,13 +16,19 @@ import (
 )
 
 const (
-	stateStarting = iota
+	stateIdle = iota
+	stateStarting
 	stateReady
 	stateFailed
 	stateShutdown
 
-	maxRestarts  = 3
-	idleTimeout  = 30 * time.Minute
+	maxRestarts = 3
+	idleTimeout = 30 * time.Minute
+)
+
+// readyTimeout and shutdownWait are variables so tests can shorten the waits;
+// they never change outside tests.
+var (
 	readyTimeout = 30 * time.Second
 	shutdownWait = 5 * time.Second
 )
@@ -39,7 +45,6 @@ type instance struct {
 	procDone  chan struct{}
 	restarts  int
 	readyCh   chan struct{}
-	readyOnce sync.Once
 	idleTimer *time.Timer
 	openedVer map[string]int
 
@@ -61,10 +66,40 @@ func newInstance(def *server.Definition, projectRoot, home string, onCrash func(
 	}
 }
 
-func (inst *instance) start(ctx context.Context) error {
+// waitCommand is the one cmd.Wait seam for instance-owned processes: every
+// instance-owned wait routes through it, so tests can count exactly one
+// waiter on each side of the procDone/watcher ownership handoff. It is
+// nil-free in production and simply delegates to cmd.Wait.
+var waitCommand = func(cmd *exec.Cmd) error { return cmd.Wait() }
+
+// startProbe is a test seam invoked after cmd.Start and before the
+// post-launch attempt-identity recheck, so tests can deterministically
+// interleave a permanent close between the process launch and the check.
+// nil in production.
+var startProbe = func() {}
+
+// start claims a fresh launch and returns the ready channel of the attempt it
+// claimed (or of the current attempt when it refuses to claim). The returned
+// channel is the one the caller must wait on.
+func (inst *instance) start(ctx context.Context) (chan struct{}, error) {
+	inst.mu.Lock()
+	switch inst.state {
+	case stateStarting, stateFailed, stateReady:
+		// Another launch is already under way, the instance failed and is not
+		// startable again, or a launch is already running: do not launch.
+		ch := inst.readyCh
+		inst.mu.Unlock()
+		return ch, nil
+	}
+	inst.state = stateStarting
+	inst.readyCh = make(chan struct{})
+	readyCh := inst.readyCh
+	inst.mu.Unlock()
+
 	binary := server.ResolveBinary(inst.home, inst.def)
 	if binary == "" {
-		return fmt.Errorf("binary not found: %s", inst.def.Command)
+		inst.endAttempt(readyCh)
+		return nil, fmt.Errorf("binary not found: %s", inst.def.Command)
 	}
 
 	cmd := exec.Command(binary, inst.def.Args...)
@@ -73,27 +108,42 @@ func (inst *instance) start(ctx context.Context) error {
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return fmt.Errorf("stdin pipe: %w", err)
+		inst.endAttempt(readyCh)
+		return nil, fmt.Errorf("stdin pipe: %w", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("stdout pipe: %w", err)
+		inst.endAttempt(readyCh)
+		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("stderr pipe: %w", err)
+		inst.endAttempt(readyCh)
+		return nil, fmt.Errorf("stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start %s: %w", inst.def.Name, err)
+		inst.endAttempt(readyCh)
+		return nil, fmt.Errorf("start %s: %w", inst.def.Name, err)
 	}
 
+	startProbe()
+
 	inst.mu.Lock()
+	if inst.readyCh != readyCh || inst.state != stateStarting {
+		// Permanent manager close invalidated this attempt between the
+		// process launch and the handle installation (or a newer attempt
+		// replaced it). This start goroutine is the sole cmd.Wait owner for
+		// this process: kill and reap it here, so no launched process is ever
+		// left untracked, then report unavailable.
+		inst.mu.Unlock()
+		_ = cmd.Process.Kill()
+		_ = waitCommand(cmd)
+		return nil, fmt.Errorf("%s is unavailable", inst.def.Name)
+	}
 	inst.cmd = cmd
 	inst.procDone = make(chan struct{})
-	inst.state = stateStarting
-	inst.readyCh = make(chan struct{})
-	inst.readyOnce = sync.Once{}
+	procDone := inst.procDone
 	inst.openedVer = make(map[string]int)
 	inst.mu.Unlock()
 
@@ -101,7 +151,12 @@ func (inst *instance) start(ctx context.Context) error {
 	inst.diagnostics = make(map[string][]protocol.Diagnostic)
 	inst.diagMu.Unlock()
 
-	rpc := jsonrpc.NewClient(stdin, stdout, stderr, inst.handleNotification)
+	rpc := jsonrpc.NewClient(stdin, stdout, stderr, func(method string, params json.RawMessage) {
+		// Bind the handler to this launch's ready channel so a notification
+		// from an attempt that has since been replaced can never mark a newer
+		// attempt ready.
+		inst.handleNotification(method, params, readyCh)
+	})
 	rpc.Start()
 
 	inst.mu.Lock()
@@ -115,24 +170,28 @@ func (inst *instance) start(ctx context.Context) error {
 	if err != nil {
 		rpc.Close()
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return fmt.Errorf("initialize %s: %w", inst.def.Name, err)
+		_ = waitCommand(cmd)
+		close(procDone)
+		inst.endAttempt(readyCh)
+		return nil, fmt.Errorf("initialize %s: %w", inst.def.Name, err)
 	}
 	_ = result
 
 	if err := rpc.Notify("initialized", struct{}{}); err != nil {
 		rpc.Close()
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return fmt.Errorf("initialized notification: %w", err)
+		_ = waitCommand(cmd)
+		close(procDone)
+		inst.endAttempt(readyCh)
+		return nil, fmt.Errorf("initialized notification: %w", err)
 	}
 
 	inst.resetIdle()
 
 	// #nosec G118 -- watchProcess is tied to the LSP process lifetime (cmd.Wait), not the start ctx; cleanup is via instance shutdown.
-	go inst.watchProcess()
+	go inst.watchProcess(cmd, procDone)
 
-	return nil
+	return readyCh, nil
 }
 
 func buildInitializeParams(pid int, projectRoot string) protocol.InitializeParams {
@@ -150,7 +209,7 @@ func buildInitializeParams(pid int, projectRoot string) protocol.InitializeParam
 	}
 }
 
-func (inst *instance) handleNotification(method string, params json.RawMessage) {
+func (inst *instance) handleNotification(method string, params json.RawMessage, readyCh chan struct{}) {
 	switch method {
 	case "textDocument/publishDiagnostics":
 		var p protocol.PublishDiagnosticsParams
@@ -171,7 +230,7 @@ func (inst *instance) handleNotification(method string, params json.RawMessage) 
 			return
 		}
 		if val.Kind == "end" {
-			inst.markReady()
+			inst.markReady(readyCh)
 		}
 
 	case "window/logMessage", "window/showMessage":
@@ -179,44 +238,129 @@ func (inst *instance) handleNotification(method string, params json.RawMessage) 
 	}
 }
 
-func (inst *instance) markReady() {
-	inst.readyOnce.Do(func() {
-		inst.mu.Lock()
-		inst.state = stateReady
-		inst.mu.Unlock()
-		close(inst.readyCh)
-	})
-}
-
-func (inst *instance) watchProcess() {
+// markReady marks the launch that owns readyCh as ready. Under one lock hold
+// it verifies the launch is still the current one and only then sets ready and
+// closes the channel, so a notification from a replaced, failed or already
+// finished attempt does nothing.
+func (inst *instance) markReady(readyCh chan struct{}) {
 	inst.mu.Lock()
-	cmd := inst.cmd
-	procDone := inst.procDone
-	inst.mu.Unlock()
-
-	if cmd == nil {
+	defer inst.mu.Unlock()
+	if inst.readyCh != readyCh || inst.state != stateStarting {
 		return
 	}
-	_ = cmd.Wait()
+	inst.state = stateReady
+	close(readyCh)
+}
+
+// setTerminal records the given state and releases any caller waiting on the
+// current ready channel. A failed start attempt ends by returning the instance
+// to idle, keeping it claimable. The failed state is reserved for crash-budget
+// exhaustion and is final: no later transition overwrites it, so shutdown
+// cannot turn a crashed instance back into a restartable one.
+func (inst *instance) setTerminal(state int) {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	inst.setTerminalLocked(state)
+}
+
+// setTerminalLocked performs the transition while inst.mu is held, closing the
+// current ready channel when the previous state was starting.
+func (inst *instance) setTerminalLocked(state int) {
+	prev := inst.state
+	if prev == stateFailed {
+		return
+	}
+	inst.state = state
+	if prev == stateStarting {
+		close(inst.readyCh)
+	}
+}
+
+// endAttempt returns the instance to idle, ending the launch that installed
+// readyCh. It is a no-op unless that launch is still the current one and still
+// starting, so it can neither clobber a shutdown nor a newer attempt. The
+// identity check and the transition share one lock hold.
+func (inst *instance) endAttempt(readyCh chan struct{}) {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if inst.readyCh != readyCh || inst.state != stateStarting {
+		return
+	}
+	inst.setTerminalLocked(stateIdle)
+}
+
+// closeAdmission is the nonblocking permanent-close admission: under the
+// instance mutex it stops the idle timer, invalidates the current start
+// attempt, and moves every nonterminal state to stateFailed, which is final
+// and unclaimable. A start already in flight sees the failed state at its
+// post-launch identity recheck and reaps its own process; every later
+// ordinary request, watcher restart, or idle restart refuses instead of
+// launching another process. Idle retirement keeps its own restartable
+// stateShutdown; only permanent manager close lands here.
+func (inst *instance) closeAdmission() {
+	inst.mu.Lock()
+	if inst.idleTimer != nil {
+		inst.idleTimer.Stop()
+		inst.idleTimer = nil
+	}
+	if inst.state != stateFailed {
+		prev := inst.state
+		inst.state = stateFailed
+		if prev == stateStarting {
+			close(inst.readyCh)
+		}
+	}
+	inst.mu.Unlock()
+}
+
+func stateName(state int) string {
+	switch state {
+	case stateIdle:
+		return "idle"
+	case stateStarting:
+		return "starting"
+	case stateReady:
+		return "ready"
+	case stateFailed:
+		return "failed"
+	case stateShutdown:
+		return "shutdown"
+	}
+	return fmt.Sprintf("unknown (%d)", state)
+}
+
+// watchProcess waits for the process of the attempt it was bound to at
+// creation and applies that attempt's crash accounting. A watcher whose
+// attempt has since been replaced is inert: it closes only the procDone it was
+// bound to and touches nothing else. It is the sole process waiter after the
+// procDone/watcher handoff; every instance-owned wait routes through
+// waitCommand so tests can prove exactly one waiter on each side.
+func (inst *instance) watchProcess(cmd *exec.Cmd, procDone chan struct{}) {
+	_ = waitCommand(cmd)
 
 	inst.mu.Lock()
 	close(procDone)
 
+	// The attempt this watcher launched must still be the current one: if a
+	// shutdown and restart replaced it, the watcher is superseded and must
+	// not touch state, count a crash, or restart anything. The check and
+	// everything it guards happen in this one hold.
+	if inst.procDone != procDone {
+		inst.mu.Unlock()
+		return
+	}
 	if inst.state == stateFailed || inst.state == stateShutdown {
 		inst.mu.Unlock()
 		return
 	}
-
-	rpc := inst.rpc
-	inst.mu.Unlock()
-
-	if rpc != nil && !rpc.IsClosed() {
+	if rpc := inst.rpc; rpc != nil && !rpc.IsClosed() {
 		rpc.Close()
 	}
-
-	inst.mu.Lock()
 	if inst.restarts >= maxRestarts {
-		inst.state = stateFailed
+		// Budget exhausted: the terminal transition lands in the same hold
+		// that checked the budget, so a shutdown cannot slip in between and
+		// leave the state claimable.
+		inst.setTerminalLocked(stateFailed)
 		inst.mu.Unlock()
 		if inst.onCrash != nil {
 			inst.onCrash(inst.def.Name)
@@ -224,14 +368,17 @@ func (inst *instance) watchProcess() {
 		return
 	}
 	inst.restarts++
+	// The attempt that just died is over: return the instance to idle so its
+	// waiters are released and the restart below can claim it. Failed cannot
+	// be used here — it is final and unclaimable by design.
+	inst.setTerminalLocked(stateIdle)
 	inst.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	if err := inst.start(ctx); err != nil {
-		inst.mu.Lock()
-		inst.state = stateFailed
-		inst.mu.Unlock()
+	if _, err := inst.start(ctx); err != nil {
+		// The restart attempt failed; start() already ended it by returning
+		// the instance to idle, so it stays claimable.
 		if inst.onCrash != nil {
 			inst.onCrash(inst.def.Name)
 		}
@@ -240,45 +387,68 @@ func (inst *instance) watchProcess() {
 
 func (inst *instance) waitReady(ctx context.Context) error {
 	inst.mu.Lock()
-	state := inst.state
-	ch := inst.readyCh
+	switch inst.state {
+	case stateReady:
+		inst.mu.Unlock()
+		return nil
+	case stateStarting:
+		ch := inst.readyCh
+		inst.mu.Unlock()
+		return inst.waitForReady(ctx, ch)
+	case stateFailed:
+		// Failed is final: the restart budget is spent, so an ordinary wait
+		// must not launch another process.
+		inst.mu.Unlock()
+		return fmt.Errorf("%s is unavailable", inst.def.Name)
+	case stateShutdown:
+		// Starting an instance that was shut down is an explicit restart and
+		// gets a fresh crash budget; crash-restarts keep counting toward the
+		// limit.
+		inst.restarts = 0
+	}
 	inst.mu.Unlock()
 
-	if state == stateReady {
-		return nil
+	// Idle or shutdown: start a fresh launch. The start context is decoupled
+	// from the caller so cancelling this wait does not abort the launch for
+	// other callers, and bounded like the crash-restart path.
+	startCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	ch, err := inst.start(startCtx)
+	if err != nil {
+		return fmt.Errorf("%s start failed: %w", inst.def.Name, err)
 	}
-	if state == stateFailed {
-		return fmt.Errorf("%s is unavailable", inst.def.Name)
-	}
-	if state == stateShutdown {
-		if err := inst.restart(ctx); err != nil {
-			return fmt.Errorf("%s restart failed: %w", inst.def.Name, err)
-		}
-		inst.mu.Lock()
-		ch = inst.readyCh
-		inst.mu.Unlock()
-	}
+	return inst.waitForReady(ctx, ch)
+}
 
+func (inst *instance) waitForReady(ctx context.Context, ch chan struct{}) error {
 	timer := time.NewTimer(readyTimeout)
 	defer timer.Stop()
 
 	select {
 	case <-ch:
-		return nil
 	case <-timer.C:
-		inst.markReady()
-		return nil
+		// Report the state as it reads now rather than success; the attempt
+		// is left alone — if the server announces readiness later the attempt
+		// completes normally, and if it never does the idle path reaps it.
+		inst.mu.Lock()
+		state := inst.state
+		inst.mu.Unlock()
+		return fmt.Errorf("%s: timed out waiting for the server to become ready (state: %s)", inst.def.Name, stateName(state))
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
 
-func (inst *instance) restart(ctx context.Context) error {
+	// The channel this caller waited on must still be current: if a newer
+	// launch replaced it, the tracked launch ended without becoming ready and
+	// the newer launch's state is not this caller's outcome.
 	inst.mu.Lock()
-	inst.state = stateStarting
-	inst.restarts = 0
+	state := inst.state
+	current := inst.readyCh
 	inst.mu.Unlock()
-	return inst.start(ctx)
+	if state == stateReady && current == ch {
+		return nil
+	}
+	return fmt.Errorf("%s is unavailable", inst.def.Name)
 }
 
 func (inst *instance) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
@@ -307,9 +477,14 @@ func (inst *instance) openFile(ctx context.Context, absPath string) error {
 	inst.mu.Lock()
 	ver := inst.openedVer[absPath]
 	rpc := inst.rpc
+	state := inst.state
 	inst.mu.Unlock()
 
-	if rpc == nil {
+	// Permanent close is terminal admission for retained instance handles: a
+	// failed/shutdown instance refuses before reading the file or sending
+	// didOpen, matching call and the terminal-admission rule for retained
+	// instance handles.
+	if state == stateFailed || state == stateShutdown || rpc == nil {
 		return fmt.Errorf("%s is unavailable", inst.def.Name)
 	}
 
@@ -372,6 +547,55 @@ func (inst *instance) resetIdle() {
 	})
 }
 
+// killForTeardown is the manager-wide teardown path (owner shutdown): the
+// process is killed and reaped directly instead of negotiating a shutdown,
+// because the owner is exiting on every host and the servers are our own child
+// processes. It keeps shutdown's bookkeeping — the connection close and the
+// captured handles cleared under the same attempt-identity check, so a
+// concurrent restart is not clobbered. The terminal state was already fixed
+// by closeAdmission (stateFailed is final), so the captured process is the one
+// this teardown actually waits on.
+func (inst *instance) killForTeardown() {
+	inst.mu.Lock()
+	rpc := inst.rpc
+	cmd := inst.cmd
+	procDone := inst.procDone
+	if inst.idleTimer != nil {
+		inst.idleTimer.Stop()
+		inst.idleTimer = nil
+	}
+	inst.setTerminalLocked(stateShutdown)
+	inst.mu.Unlock()
+
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		// The watcher (or the start path of an attempt still launching) reaps
+		// the process and closes procDone, so the wait returns promptly.
+		<-procDone
+	}
+
+	if rpc != nil {
+		rpc.Close()
+	}
+
+	// Clear the captured attempt's handles only if it is still the current
+	// one — procDone is the field this teardown actually waited on and the
+	// identity of the attempt it captured.
+	inst.mu.Lock()
+	if inst.procDone == procDone {
+		inst.rpc = nil
+		inst.cmd = nil
+		inst.openedVer = make(map[string]int)
+		inst.mu.Unlock()
+
+		inst.diagMu.Lock()
+		inst.diagnostics = make(map[string][]protocol.Diagnostic)
+		inst.diagMu.Unlock()
+	} else {
+		inst.mu.Unlock()
+	}
+}
+
 func (inst *instance) shutdown() {
 	inst.mu.Lock()
 	rpc := inst.rpc
@@ -381,7 +605,10 @@ func (inst *instance) shutdown() {
 		inst.idleTimer.Stop()
 		inst.idleTimer = nil
 	}
-	inst.state = stateShutdown
+	// The capture and the transition share one hold, so the transition can
+	// only end the attempt captured above; a newer attempt that becomes
+	// current later is left intact.
+	inst.setTerminalLocked(stateShutdown)
 	inst.mu.Unlock()
 
 	if rpc == nil {
@@ -403,8 +630,11 @@ func (inst *instance) shutdown() {
 		}
 	}
 
+	// Clear the captured attempt's handles only if it is still the current
+	// one — procDone is the field this shutdown actually waited on and the
+	// identity of the attempt it captured.
 	inst.mu.Lock()
-	if inst.rpc == rpc {
+	if inst.procDone == procDone {
 		inst.rpc = nil
 		inst.cmd = nil
 		inst.openedVer = make(map[string]int)

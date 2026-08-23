@@ -7,6 +7,25 @@ import (
 	"time"
 )
 
+// --- PendingForSession snapshots only the named session's requests ---
+
+func TestGatePendingForSession(t *testing.T) {
+	gate := NewGate(func(ctx context.Context, req Request) {})
+
+	go gate.AskRequest(context.Background(), Request{SessionID: "s1", ToolName: "write_file", Arg: "a"})
+	go gate.AskRequest(context.Background(), Request{SessionID: "s2", ToolName: "write_file", Arg: "b"})
+	waitForPending(t, gate, 2)
+
+	if got := gate.PendingForSession("s1"); len(got) != 1 || got[0].SessionID != "s1" || got[0].ToolName != "write_file" {
+		t.Fatalf("PendingForSession(s1) = %#v, want one s1 write_file request", got)
+	}
+	if got := gate.PendingForSession("nope"); len(got) != 0 {
+		t.Fatalf("PendingForSession(nope) = %#v, want none", got)
+	}
+
+	gate.CancelAll()
+}
+
 // --- AskRequest happy path: Respond before ctx cancel ---
 
 func TestGateAskRequestHappyPath(t *testing.T) {
@@ -554,4 +573,248 @@ func waitForPending(t *testing.T, gate *Gate, want int) {
 	got := len(gate.pending)
 	gate.mu.Unlock()
 	t.Fatalf("pending = %d, want %d", got, want)
+}
+
+// TestGateOnResolvedFiresOnEveryRemovalPath proves the removal-side callback
+// fires under the gate mutex for each way a pending request can be removed:
+// answered, cancelled by session, and dropped by its context. The gate is not
+// reachable from an adapter surface for the context-cancellation interleaving
+// (the ask blocks the very turn that could cancel its context), so the coverage
+// lives at the package level.
+func TestGateOnResolvedFiresOnEveryRemovalPath(t *testing.T) {
+	t.Run("removal=answered", func(t *testing.T) {
+		idCh := make(chan string, 1)
+		var resolved Request
+		gate := NewGate(func(ctx context.Context, req Request) { idCh <- req.ID })
+		gate.OnResolved = func(req Request) { resolved = req }
+
+		result := make(chan ResponseAction, 1)
+		go func() {
+			result <- gate.AskRequest(context.Background(), Request{SessionID: "s1", ToolName: "write_file", Arg: "a"})
+		}()
+		waitForPending(t, gate, 1)
+		id := <-idCh
+
+		if err := gate.RespondAction(id, string(ResponseAllow)); err != nil {
+			t.Fatal(err)
+		}
+		if got := <-result; got != ResponseAllow {
+			t.Fatalf("AskRequest = %q, want allow", got)
+		}
+		if resolved.ID != id || resolved.SessionID != "s1" || resolved.ToolName != "write_file" {
+			t.Fatalf("OnResolved request = %#v, want the answered request (id %q)", resolved, id)
+		}
+		if n := len(gate.PendingForSession("s1")); n != 0 {
+			t.Fatalf("pending after answer = %d, want 0", n)
+		}
+	})
+
+	t.Run("removal=cancelled", func(t *testing.T) {
+		idCh := make(chan string, 1)
+		var resolved Request
+		gate := NewGate(func(ctx context.Context, req Request) { idCh <- req.ID })
+		gate.OnResolved = func(req Request) { resolved = req }
+
+		result := make(chan ResponseAction, 1)
+		go func() {
+			result <- gate.AskRequest(context.Background(), Request{SessionID: "s2", ToolName: "write_file", Arg: "b"})
+		}()
+		waitForPending(t, gate, 1)
+		id := <-idCh
+
+		if n := gate.CancelSession("s2"); n != 1 {
+			t.Fatalf("CancelSession cancelled = %d, want 1", n)
+		}
+		if got := <-result; got != ResponseDeny {
+			t.Fatalf("AskRequest = %q, want deny", got)
+		}
+		if resolved.ID != id || resolved.SessionID != "s2" {
+			t.Fatalf("OnResolved request = %#v, want the cancelled request (id %q)", resolved, id)
+		}
+	})
+
+	t.Run("removal=context_cancelled", func(t *testing.T) {
+		idCh := make(chan string, 1)
+		var resolved Request
+		gate := NewGate(func(ctx context.Context, req Request) { idCh <- req.ID })
+		gate.OnResolved = func(req Request) { resolved = req }
+
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan ResponseAction, 1)
+		go func() {
+			result <- gate.AskRequest(ctx, Request{SessionID: "s3", ToolName: "write_file", Arg: "c"})
+		}()
+		waitForPending(t, gate, 1)
+		id := <-idCh
+
+		cancel()
+		if got := <-result; got != ResponseDeny {
+			t.Fatalf("AskRequest = %q, want deny", got)
+		}
+		if resolved.ID != id || resolved.SessionID != "s3" {
+			t.Fatalf("OnResolved request = %#v, want the context-dropped request (id %q)", resolved, id)
+		}
+		if n := len(gate.PendingForSession("s3")); n != 0 {
+			t.Fatalf("pending after context cancellation = %d, want 0", n)
+		}
+	})
+
+	t.Run("removal=cancel_all", func(t *testing.T) {
+		idCh := make(chan string, 2)
+		var resolved []Request
+		gate := NewGate(func(ctx context.Context, req Request) { idCh <- req.ID })
+		gate.OnResolved = func(req Request) { resolved = append(resolved, req) }
+
+		results := make(chan ResponseAction, 2)
+		go func() {
+			results <- gate.AskRequest(context.Background(), Request{SessionID: "s1", ToolName: "write_file", Arg: "a"})
+		}()
+		go func() {
+			results <- gate.AskRequest(context.Background(), Request{SessionID: "s2", ToolName: "write_file", Arg: "b"})
+		}()
+		waitForPending(t, gate, 2)
+		id1, id2 := <-idCh, <-idCh
+
+		gate.CancelAll()
+		for i := 0; i < 2; i++ {
+			if got := <-results; got != ResponseDeny {
+				t.Fatalf("AskRequest %d = %q, want deny", i, got)
+			}
+		}
+		if len(resolved) != 2 {
+			t.Fatalf("OnResolved fired %d times, want 2", len(resolved))
+		}
+		gotIDs := map[string]bool{}
+		gotSessions := map[string]bool{}
+		for _, r := range resolved {
+			gotIDs[r.ID] = true
+			gotSessions[r.SessionID] = true
+		}
+		if !gotIDs[id1] || !gotIDs[id2] {
+			t.Fatalf("OnResolved requests = %#v, want ids %q and %q", resolved, id1, id2)
+		}
+		if !gotSessions["s1"] || !gotSessions["s2"] {
+			t.Fatalf("OnResolved requests = %#v, want sessions s1 and s2", resolved)
+		}
+	})
+}
+
+// TestGateResolutionPublishedBeforeWaiterUnblocked proves every removal path
+// publishes the resolution before unblocking the waiting goroutine: while the
+// publish is in progress, the waiter cannot proceed, so a host can never observe
+// turn end before the resolution that precedes it. The waiter still observes
+// exactly what it observed before — the same response action and the removal of
+// the pending entry; only the publish moves ahead of the unblocking.
+func TestGateResolutionPublishedBeforeWaiterUnblocked(t *testing.T) {
+	run := func(t *testing.T, want ResponseAction, remove func(*Gate, chan ResponseAction, string)) {
+		t.Helper()
+		var resolved Request
+		publishStarted := make(chan struct{})
+		release := make(chan struct{})
+		gate := NewGate(nil)
+		gate.OnResolved = func(req Request) {
+			resolved = req
+			close(publishStarted)
+			<-release
+		}
+
+		result := make(chan ResponseAction, 1)
+		go func() {
+			result <- gate.AskRequest(context.Background(), Request{SessionID: "s1", ToolName: "write_file", Arg: "a"})
+		}()
+		waitForPending(t, gate, 1)
+		pend := gate.PendingForSession("s1")
+		if len(pend) != 1 {
+			t.Fatalf("pending = %d, want 1", len(pend))
+		}
+		id := pend[0].ID
+
+		done := make(chan struct{})
+		go func() {
+			remove(gate, result, id)
+			close(done)
+		}()
+		<-publishStarted
+
+		// While the publish is blocked, the waiter must not proceed: with the
+		// resolution published before the unblocking, the result cannot arrive.
+		select {
+		case <-result:
+			t.Fatal("waiter proceeded before the resolution was published")
+		case <-time.After(200 * time.Millisecond):
+		}
+		close(release)
+		<-done
+		if got := <-result; got != want {
+			t.Fatalf("AskRequest = %q, want %q", got, want)
+		}
+		if resolved.ID != id || resolved.SessionID != "s1" {
+			t.Fatalf("OnResolved request = %#v, want the removed request (id %q)", resolved, id)
+		}
+	}
+
+	t.Run("removal=answered", func(t *testing.T) {
+		run(t, ResponseAllow, func(g *Gate, _ chan ResponseAction, id string) {
+			_ = g.RespondAction(id, string(ResponseAllow))
+		})
+	})
+	t.Run("removal=cancelled", func(t *testing.T) {
+		run(t, ResponseDeny, func(g *Gate, _ chan ResponseAction, id string) {
+			g.CancelSession("s1")
+		})
+	})
+	t.Run("removal=cancel_all", func(t *testing.T) {
+		run(t, ResponseDeny, func(g *Gate, _ chan ResponseAction, id string) {
+			g.CancelAll()
+		})
+	})
+}
+
+// TestGateResolutionPublishedInsideRemovalLock pins the part of the contract
+// that says the resolution is published in the same locked section as the
+// removal: the callback probes the gate mutex, so a version that removed under
+// the lock, released, and then published would fail it. The probe is safe — the
+// callback runs on the removal's own goroutine, which already holds the mutex,
+// so TryLock reports whether the section is still held.
+func TestGateResolutionPublishedInsideRemovalLock(t *testing.T) {
+	run := func(t *testing.T, remove func(*Gate, string)) {
+		t.Helper()
+		inSection := false
+		gate := NewGate(nil)
+		gate.OnResolved = func(req Request) {
+			if !gate.mu.TryLock() {
+				inSection = true
+			} else {
+				gate.mu.Unlock()
+			}
+		}
+		result := make(chan ResponseAction, 1)
+		go func() {
+			result <- gate.AskRequest(context.Background(), Request{SessionID: "s1", ToolName: "write_file", Arg: "a"})
+		}()
+		waitForPending(t, gate, 1)
+		pend := gate.PendingForSession("s1")
+		if len(pend) != 1 {
+			t.Fatalf("pending = %d, want 1", len(pend))
+		}
+		id := pend[0].ID
+
+		remove(gate, id)
+		if got := <-result; got != ResponseDeny && got != ResponseAllow {
+			t.Fatalf("AskRequest = %q, want a resolution", got)
+		}
+		if !inSection {
+			t.Fatal("resolution was not published inside the removal's locked section")
+		}
+	}
+
+	t.Run("removal=answered", func(t *testing.T) {
+		run(t, func(g *Gate, id string) { _ = g.RespondAction(id, string(ResponseAllow)) })
+	})
+	t.Run("removal=cancelled", func(t *testing.T) {
+		run(t, func(g *Gate, id string) { g.CancelSession("s1") })
+	})
+	t.Run("removal=cancel_all", func(t *testing.T) {
+		run(t, func(g *Gate, id string) { g.CancelAll() })
+	})
 }

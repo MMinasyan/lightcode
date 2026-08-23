@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/config"
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/lsp"
@@ -155,14 +157,81 @@ func TestDrainPendingLoopEventsDrainsTaggedSubagentEvents(t *testing.T) {
 	}
 	a.drainPendingLoopEvents()
 
-	if len(got) != 2 {
-		t.Fatalf("events = %#v, want subagent start and tool start", got)
+	// Direct injection with no parent tool-start row and an empty root queue:
+	// an invariant violation. No EventSubagentStart and no id-keyed
+	// association may be emitted or retained; the child event itself still
+	// dispatches.
+	if len(got) != 1 {
+		t.Fatalf("events = %#v, want only the child tool start (no association for a rowless parent)", got)
 	}
-	if got[0].Kind != EventSubagentStart || got[0].SubagentSessionID != "child-session" || got[0].ParentSessionID != "parent-session" || got[0].ProjectID != "project-a" {
-		t.Fatalf("event[0] = %+v, want subagent start", got[0])
+	if got[0].Kind != EventToolCallStart || got[0].SubagentSessionID != "child-session" || got[0].ParentSessionID != "parent-session" || got[0].ProjectID != "project-a" || got[0].ToolCallID != "child-tool" {
+		t.Fatalf("event[0] = %+v, want child tool start", got[0])
 	}
-	if got[1].Kind != EventToolCallStart || got[1].SubagentSessionID != "child-session" || got[1].ParentSessionID != "parent-session" || got[1].ProjectID != "project-a" || got[1].ToolCallID != "child-tool" {
-		t.Fatalf("event[1] = %+v, want child tool start", got[1])
+}
+
+// TestDrainQueuedParentToolStartBeforeTaggedChildStart proves the production
+// ordering the association depends on: the parent's ToolCallStart is queued in
+// rt.loopEvents ahead of the child's tagged events, and the drainer consumes
+// the root event before the first tagged dispatch so the child association
+// folds into the already-sequenced row. The row keeps its identity and its
+// original sequence, and the control frame follows in the same section.
+func TestDrainQueuedParentToolStartBeforeTaggedChildStart(t *testing.T) {
+	a := &Agent{}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	a.ensureSessionMapLocked()
+	parentUnit := &session{rt: rt}
+	a.sessions["parent-session"] = parentUnit
+	rt.mu.Unlock()
+	rt.registerTranscript("parent-session", nil)
+	rt.loopEvents = make(chan loop.Event, 2)
+	rt.taggedEvents = make(chan TaggedLoopEvent, 2)
+	var got []Event
+	a.SetEventHandler(func(ev Event) {
+		got = append(got, ev)
+	})
+
+	rt.loopEvents <- loop.Event{Kind: loop.ToolCallStart, SessionID: "parent-session", ProjectID: "project-a", ToolCallID: "parent-task", ToolName: "task"}
+	rt.taggedEvents <- TaggedLoopEvent{
+		SessionID:       "child-session",
+		ParentSessionID: "parent-session",
+		ProjectID:       "project-a",
+		TaskIndex:       1,
+		ToolCallID:      "parent-task",
+		Event:           loop.Event{Kind: loop.ToolCallStart, ToolCallID: "child-tool", ToolName: "read_file"},
+	}
+	a.drainPendingLoopEvents()
+
+	// Parent tool start, then the child start carrying the association, then
+	// the child tool start.
+	if len(got) != 3 {
+		t.Fatalf("events = %#v, want parent tool start, child start, child tool start", got)
+	}
+	if got[0].Kind != EventToolCallStart || got[0].SessionID != "parent-session" || got[0].ToolCallID != "parent-task" {
+		t.Fatalf("event[0] = %+v, want the parent tool start", got[0])
+	}
+	if got[1].Kind != EventSubagentStart || got[1].SubagentSessionID != "child-session" || got[1].ParentSessionID != "parent-session" || got[1].ToolCallID != "parent-task" || got[1].TaskIndex != 1 {
+		t.Fatalf("event[1] = %+v, want the child start carrying the parent association", got[1])
+	}
+	if got[2].Kind != EventToolCallStart || got[2].SubagentSessionID != "child-session" || got[2].ToolCallID != "child-tool" {
+		t.Fatalf("event[2] = %+v, want the child tool start", got[2])
+	}
+
+	// The association folded into the parent's existing row: the same row at
+	// its original sequence, with the child link attached idempotently.
+	tr := rt.transcriptForSessionID("parent-session")
+	tr.seqMu.Lock()
+	defer tr.seqMu.Unlock()
+	if len(tr.tail) != 1 {
+		t.Fatalf("parent tail = %#v, want exactly the one tool row", tr.tail)
+	}
+	row := tr.tail[0]
+	if row.msg.ID != "parent-task" || row.seq != 1 {
+		t.Fatalf("parent row = %+v, want the task row unchanged at its original sequence", row)
+	}
+	want := []SubagentSessionLink{{Index: 1, SessionID: "child-session"}}
+	if !reflect.DeepEqual(row.msg.SubagentSessionIDs, want) {
+		t.Fatalf("row links = %#v, want %#v", row.msg.SubagentSessionIDs, want)
 	}
 }
 
@@ -508,6 +577,301 @@ func TestTaskToolStateAndSessionID(t *testing.T) {
 	}
 }
 
+// TestTaskToolSemaphoreCancelFirst proves the subagent semaphore's
+// cancellation-before-acquire path creates nothing: a waiter blocked on the
+// full semaphore returns a cancelled task result when the turn is cancelled —
+// no child directory, claim, transcript, loop, or turn is minted — and only
+// the already-admitted sibling task's child is linked into the parent row.
+// The operation-first sibling proves the opposite edge: a waiter that
+// acquired before the cancel stays admitted, and the later cancellation is a
+// turn outcome (the interrupted child's link remains in the parent row).
+func TestTaskToolSemaphoreCancelFirst(t *testing.T) {
+	submitDelegation := func(t *testing.T, a *Agent, cap *eventCapture, ctx context.Context) {
+		t.Helper()
+		if _, err := a.Submit(ctx, "delegate"); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+	}
+
+	t.Run("cancel_first=waiter_mints_no_child", func(t *testing.T) {
+		var calls atomic.Int32
+		var mu sync.Mutex
+		var childRequests int
+		childReq := make(chan struct{}, 10)
+		block := make(chan struct{})
+		var blockOnce sync.Once
+		releaseBlock := func() { blockOnce.Do(func() { close(block) }) }
+		t.Cleanup(releaseBlock)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch calls.Add(1) {
+			case 1:
+				writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"t1","subagent_type":"explore"},{"prompt":"t2","subagent_type":"explore"}]}`)
+			default:
+				mu.Lock()
+				childRequests++
+				mu.Unlock()
+				select {
+				case childReq <- struct{}{}:
+				default:
+				}
+				select {
+				case <-block:
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		a.cfg.Subagents.MaxConcurrent = 1
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		submitDelegation(t, a, cap, ctx)
+		parentID := a.SessionCurrent().ID
+
+		// The first child's model request holds the only semaphore slot; the
+		// second task waits on the full semaphore. The admitted child's
+		// session directory is the baseline a waiter-minted child must not
+		// extend.
+		select {
+		case <-childReq:
+		case <-time.After(10 * time.Second):
+			t.Fatal("child 1 request did not arrive")
+		}
+		baselineDirs := sessionChildDirs(t, a, parentID)
+		// Cancel the turn while the second task is still waiting to acquire.
+		if err := a.CancelSession(parentID); err != nil {
+			t.Fatalf("CancelSession: %v", err)
+		}
+		releaseBlock()
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		// Full no-child state: no new child directory/claim/transcript/loop/
+		// turn, no extra provider request, no second subagent-start event.
+		assertNoWaiterChildState(t, a, cap, parentID, baselineDirs, &calls, 2)
+
+		parentMsgs := a.SessionMessages()
+		var taskRow *DisplayMessage
+		for i := range parentMsgs {
+			msg := parentMsgs[i]
+			if msg.Type == "tool" && msg.Name == "task" {
+				taskRow = &parentMsgs[i]
+			}
+		}
+		if taskRow == nil {
+			t.Fatalf("parent transcript missing task tool row: %#v", parentMsgs)
+		}
+		// Only the already-admitted sibling (child 1) may be linked: the
+		// cancelled waiter must not have minted child 2.
+		if got := len(taskRow.SubagentSessionIDs); got != 1 {
+			t.Fatalf("task subagent links = %d (%#v), want exactly 1 admitted child", got, taskRow.SubagentSessionIDs)
+		}
+	})
+
+	t.Run("owner_close=waiter_refused_after_acquire", func(t *testing.T) {
+		var calls atomic.Int32
+		childReq := make(chan struct{}, 10)
+		releaseChild1 := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch calls.Add(1) {
+			case 1:
+				writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"t1","subagent_type":"explore"},{"prompt":"t2","subagent_type":"explore"}]}`)
+			case 2:
+				select {
+				case childReq <- struct{}{}:
+				default:
+				}
+				select {
+				case <-releaseChild1:
+				case <-r.Context().Done():
+					return
+				}
+				writeTextResponse(w, "child one done")
+			default:
+				writeTextResponse(w, "parent done")
+			}
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		a.cfg.Subagents.MaxConcurrent = 1
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		submitDelegation(t, a, cap, ctx)
+		parentID := a.SessionCurrent().ID
+
+		// Child 1 holds the only semaphore slot; task 2 waits on the full
+		// semaphore with a live turn context. The admitted child's session
+		// directory is the baseline a waiter-minted child must not extend.
+		select {
+		case <-childReq:
+		case <-time.After(10 * time.Second):
+			t.Fatal("child 1 request did not arrive")
+		}
+		baselineDirs := sessionChildDirs(t, a, parentID)
+		// The owner closes while the waiter is parked. The turn context stays
+		// live (close is published without cancelling it), so when child 1
+		// finishes and frees the slot the waiter acquires deterministically —
+		// and the post-acquire check must refuse it on rt.closed before it
+		// mints any child directory, claim, transcript, loop, or turn.
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		rt.closed = true
+		rt.mu.Unlock()
+		close(releaseChild1)
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		// Full no-child state: no new child directory/claim/transcript/loop/
+		// turn, exactly the admitted child's request plus the parent
+		// follow-up (3 calls), and no second subagent-start event.
+		assertNoWaiterChildState(t, a, cap, parentID, baselineDirs, &calls, 3)
+
+		parentMsgs := a.SessionMessages()
+		var taskRow *DisplayMessage
+		for i := range parentMsgs {
+			msg := parentMsgs[i]
+			if msg.Type == "tool" && msg.Name == "task" {
+				taskRow = &parentMsgs[i]
+			}
+		}
+		if taskRow == nil {
+			t.Fatalf("parent transcript missing task tool row: %#v", parentMsgs)
+		}
+		// Only the pre-close admitted child (child 1) may be linked: the
+		// waiter acquired after close and was refused by the rt.closed check.
+		if got := len(taskRow.SubagentSessionIDs); got != 1 {
+			t.Fatalf("task subagent links = %d (%#v), want exactly the pre-close admitted child", got, taskRow.SubagentSessionIDs)
+		}
+	})
+
+	t.Run("operation_first=admitted_waiter_survives_cancel", func(t *testing.T) {
+		var calls atomic.Int32
+		childReq := make(chan struct{}, 10)
+		releaseChild1 := make(chan struct{})
+		releaseChild2 := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch calls.Add(1) {
+			case 1:
+				writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"t1","subagent_type":"explore"},{"prompt":"t2","subagent_type":"explore"}]}`)
+			default:
+				select {
+				case childReq <- struct{}{}:
+				default:
+				}
+				gate := releaseChild1
+				if calls.Load() > 2 {
+					gate = releaseChild2
+				}
+				select {
+				case <-gate:
+				case <-r.Context().Done():
+					return
+				}
+				writeTextResponse(w, "child done")
+			}
+		}))
+		defer server.Close()
+
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		a.cfg.Subagents.MaxConcurrent = 1
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		submitDelegation(t, a, cap, ctx)
+
+		select {
+		case <-childReq:
+		case <-time.After(10 * time.Second):
+			t.Fatal("child 1 request did not arrive")
+		}
+		// Admit the waiter: child 1 completes, task 2 acquires while the turn
+		// context is still live, and child 2 starts.
+		close(releaseChild1)
+		select {
+		case <-childReq:
+		case <-time.After(10 * time.Second):
+			t.Fatal("child 2 request did not arrive after the semaphore freed")
+		}
+		// Cancellation lands after admission: both children were admitted, so
+		// both stay linked even though the later cancel interrupts them.
+		if err := a.CancelSession(a.SessionCurrent().ID); err != nil {
+			t.Fatalf("CancelSession: %v", err)
+		}
+		close(releaseChild2)
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+
+		parentMsgs := a.SessionMessages()
+		var taskRow *DisplayMessage
+		for i := range parentMsgs {
+			msg := parentMsgs[i]
+			if msg.Type == "tool" && msg.Name == "task" {
+				taskRow = &parentMsgs[i]
+			}
+		}
+		if taskRow == nil {
+			t.Fatalf("parent transcript missing task tool row: %#v", parentMsgs)
+		}
+		if got := len(taskRow.SubagentSessionIDs); got != 2 {
+			t.Fatalf("task subagent links = %d (%#v), want both admitted children linked", got, taskRow.SubagentSessionIDs)
+		}
+	})
+}
+
+// sessionChildDirs lists the session directories in the parent's project
+// sessions root other than the parent itself. os.ReadDir returns entries in
+// filename order, so the slice is deterministic.
+func sessionChildDirs(t *testing.T, a *Agent, parentID string) []string {
+	t.Helper()
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	projectID := a.session.projectID
+	rt.mu.Unlock()
+	entries, err := os.ReadDir(a.projects.SessionsRoot(projectID))
+	if err != nil {
+		t.Fatalf("read sessions root: %v", err)
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() && e.Name() != parentID {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// assertNoWaiterChildState asserts the full no-child state after a refused
+// semaphore waiter: no new child session directory (the baseline was captured
+// while the admitted child was running, so any waiter-minted directory would
+// extend it — a child directory also carries the child's claim, loop, and
+// turn), no transcript registration beyond the parent, no extra provider/child
+// request, and no subagent-start event beyond the admitted child.
+func assertNoWaiterChildState(t *testing.T, a *Agent, cap *eventCapture, parentID string, baselineDirs []string, calls *atomic.Int32, wantRequests int32) {
+	t.Helper()
+	rt := a.ensureRuntime()
+	rt.transcriptMu.Lock()
+	registered := make([]string, 0, len(rt.transcriptState))
+	for id := range rt.transcriptState {
+		registered = append(registered, id)
+	}
+	rt.transcriptMu.Unlock()
+	if len(registered) != 1 || registered[0] != parentID {
+		t.Fatalf("transcript registry = %v, want only the parent %q (no waiter-minted child registration)", registered, parentID)
+	}
+	if after := sessionChildDirs(t, a, parentID); !reflect.DeepEqual(after, baselineDirs) {
+		t.Fatalf("session dirs changed after the refused waiter: before=%v after=%v (waiter must not mint a child directory/claim/loop/turn)", baselineDirs, after)
+	}
+	if got := calls.Load(); got != wantRequests {
+		t.Fatalf("provider requests = %d, want %d (no waiter-minted child request)", got, wantRequests)
+	}
+	var subagentStarts int
+	for _, ev := range cap.snapshot() {
+		if ev.Kind == EventSubagentStart {
+			subagentStarts++
+		}
+	}
+	if subagentStarts != 1 {
+		t.Fatalf("EventSubagentStart count = %d, want exactly 1 (only the admitted child)", subagentStarts)
+	}
+}
+
 func TestTaskToolPersistsInspectableChildSession(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -595,6 +959,213 @@ func TestTaskToolPersistsInspectableChildSession(t *testing.T) {
 	}
 }
 
+func assertMintedChildHasNoRuntime(t *testing.T, a *Agent, parentID, childID string, cap *eventCapture, beforeTurn int) {
+	t.Helper()
+	if got := a.store.CurrentTurn(); got != beforeTurn {
+		t.Fatalf("parent current turn after failed child mint = %d, want unchanged %d", got, beforeTurn)
+	}
+	if meta, err := snapshot.LoadSessionMeta(a.store.Root(), childID); err != nil {
+		t.Fatalf("load failed child meta: %v", err)
+	} else if meta.ParentSessionID != parentID {
+		t.Fatalf("failed child parent id = %q, want %q", meta.ParentSessionID, parentID)
+	}
+	turnEntries, err := os.ReadDir(filepath.Join(a.store.Root(), childID, "turns"))
+	if err != nil {
+		t.Fatalf("read failed child turns: %v", err)
+	}
+	for _, entry := range turnEntries {
+		if entry.IsDir() {
+			t.Fatalf("failed child retained turn directory %q, want no child turn", entry.Name())
+		}
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	for id := range a.sessions {
+		if id != parentID {
+			rt.mu.Unlock()
+			t.Fatalf("failed child %q created live loop/session unit %q", childID, id)
+		}
+	}
+	rt.mu.Unlock()
+	rt.transcriptMu.Lock()
+	for id := range rt.transcriptState {
+		if id != parentID {
+			rt.transcriptMu.Unlock()
+			t.Fatalf("failed child %q registered transcript %q", childID, id)
+		}
+	}
+	rt.transcriptMu.Unlock()
+	if cap != nil {
+		for _, ev := range cap.snapshot() {
+			if ev.SubagentSessionID == childID || ev.SessionID == childID || ev.Kind == EventSubagentStart {
+				t.Fatalf("failed child produced runtime event: %+v", ev)
+			}
+		}
+	}
+	projectID := ""
+	rt.mu.Lock()
+	if a.session != nil {
+		projectID = a.session.projectID
+	}
+	rt.mu.Unlock()
+	claim, ok, err := snapshot.AcquireSessionClaim(a.projects.Root(), projectID, childID)
+	if err != nil || !ok {
+		t.Fatalf("failed child claim = ok:%v err:%v, want released", ok, err)
+	}
+	_ = claim.Release()
+}
+
+func TestTaskChildSyncFailureStopsBeforeChildRuntime(t *testing.T) {
+	for _, row := range []struct {
+		name string
+		fail func(root, parentDir, dir string) bool
+	}{
+		{
+			name: "child_directory",
+			fail: func(root, parentDir, dir string) bool {
+				return filepath.Dir(dir) == root && dir != parentDir
+			},
+		},
+		{
+			name: "sessions_root",
+			fail: func(root, _, dir string) bool { return dir == root },
+		},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				switch calls.Add(1) {
+				case 1:
+					writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"child must not start","subagent_type":"explore"}]}`)
+				case 2:
+					writeTextResponse(w, "parent finished")
+				default:
+					t.Fatalf("unexpected provider call")
+				}
+			}))
+			defer server.Close()
+
+			a := newEventOrderAgent(t, server.URL+"/v1")
+			parentID, err := a.NewSession("", "primary")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cap := &eventCapture{}
+			ctx := startEventOrderAgent(t, a, cap)
+			root := a.store.Root()
+			parentDir := a.store.Dir()
+			injected := errors.New("injected task child sync failure")
+			atomicfs.SyncDirFunc = func(dir string) error {
+				if row.fail(root, parentDir, dir) {
+					return injected
+				}
+				return nil
+			}
+			t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+			if _, err := a.Submit(ctx, "delegate failed child"); err != nil {
+				t.Fatalf("Submit: %v", err)
+			}
+			waitUntilEventOrderTurnEndCount(t, cap, 1)
+			waitUntilEventOrderAgentIdle(t, a)
+			childIDs := sessionChildDirs(t, a, parentID)
+			if len(childIDs) != 1 {
+				t.Fatalf("child rows after failed task mint = %v, want one retained Store row", childIDs)
+			}
+			assertMintedChildHasNoRuntime(t, a, parentID, childIDs[0], cap, 1)
+			if calls.Load() != 2 {
+				t.Fatalf("provider calls = %d, want task plus parent completion", calls.Load())
+			}
+		})
+	}
+}
+
+func TestCompactChildSyncFailureStopsBeforeChildRuntime(t *testing.T) {
+	for _, row := range []struct {
+		name string
+		fail func(root, parentDir, dir string) bool
+	}{
+		{
+			name: "child_directory",
+			fail: func(root, parentDir, dir string) bool {
+				return filepath.Dir(dir) == root && dir != parentDir
+			},
+		},
+		{
+			name: "sessions_root",
+			fail: func(root, _, dir string) bool { return dir == root },
+		},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			a := newCatalogBackedTestAgent(t)
+			appendUserTurn(t, a, "compact this")
+			parentID := a.store.SessionID()
+			beforeTurn := a.store.CurrentTurn()
+			root := a.store.Root()
+			parentDir := a.store.Dir()
+			injected := errors.New("injected compact child sync failure")
+			atomicfs.SyncDirFunc = func(dir string) error {
+				if row.fail(root, parentDir, dir) {
+					return injected
+				}
+				return nil
+			}
+			t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+
+			err := a.runCompaction(context.Background(), false)
+			var committed *snapshot.CommittedMutationError
+			if !errors.As(err, &committed) {
+				t.Fatalf("compact child sync error = %v, want committed error", err)
+			}
+			childIDs := sessionChildDirs(t, a, parentID)
+			if len(childIDs) != 1 {
+				t.Fatalf("child rows after failed compact mint = %v, want one retained Store row", childIDs)
+			}
+			assertMintedChildHasNoRuntime(t, a, parentID, childIDs[0], nil, beforeTurn)
+			if _, err := os.Stat(filepath.Join(a.store.Dir(), "compaction.json")); !os.IsNotExist(err) {
+				t.Fatalf("parent compaction record after failed child mint = %v, want absent", err)
+			}
+		})
+	}
+}
+
+func TestCompactChildPostActivationMetadataFailuresRemainOrdinary(t *testing.T) {
+	for _, row := range []struct {
+		name    string
+		failOn  int32
+		message string
+	}{
+		{name: "set_active_agent_type", failOn: 2, message: "injected active-agent metadata failure"},
+		{name: "set_model", failOn: 3, message: "injected model metadata failure"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			a := newCatalogBackedTestAgent(t)
+			appendUserTurn(t, a, "compact this")
+			var metaWrites atomic.Int32
+			injected := errors.New(row.message)
+			atomicfs.SyncFileFunc = func(file *os.File) error {
+				if strings.HasPrefix(filepath.Base(file.Name()), "meta.json.tmp-") && metaWrites.Add(1) == row.failOn {
+					return injected
+				}
+				return nil
+			}
+			t.Cleanup(func() { atomicfs.SyncFileFunc = nil })
+
+			_, _, err := a.compactRunningUnitForSession(a.session)
+			if !errors.Is(err, injected) {
+				t.Fatalf("post-activation metadata error = %v, want %v", err, injected)
+			}
+			var committed *snapshot.CommittedMutationError
+			if errors.As(err, &committed) {
+				t.Fatalf("post-activation metadata error = %v, want ordinary error, not committed", err)
+			}
+			if got := metaWrites.Load(); got != row.failOn {
+				t.Fatalf("meta writes before injected failure = %d, want %d", got, row.failOn)
+			}
+		})
+	}
+}
+
 func TestTaskToolChildStagedEditUsesParentTurnSnapshot(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -616,13 +1187,20 @@ func TestTaskToolChildStagedEditUsesParentTurnSnapshot(t *testing.T) {
 	defer server.Close()
 
 	a := newEventOrderAgent(t, server.URL+"/v1")
-	a.cfg.Permissions.Allow = []string{"read_file(/**)", "edit_file(/**)", "write_file(/**)"}
 	writeTaskAgentTypes(t, a, `"editor": {
 		"description": "test editor",
 		"tools": ["read_file", "edit_file", "execute_pending"],
 		"prompt": "Test editor.",
 		"subagent": true
 	}`)
+	// Bootstrap the session before mutating permissions: the live unit's
+	// permission policy captures a.cfg at build time, and writeTaskAgentTypes's
+	// Reload replaces a.cfg with a fresh pointer, so the Allow edit must land on
+	// the config the live policy holds.
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	a.cfg.Permissions.Allow = []string{"read_file(/**)", "edit_file(/**)", "write_file(/**)"}
 	target := filepath.Join(a.projectRoot, "target.txt")
 	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
 		t.Fatalf("write target: %v", err)
@@ -638,8 +1216,8 @@ func TestTaskToolChildStagedEditUsesParentTurnSnapshot(t *testing.T) {
 	if got, err := os.ReadFile(target); err != nil || string(got) != "new" {
 		t.Fatalf("target after child staged edit = %q, %v; want new", got, err)
 	}
-	if _, err := a.ApplyTurnAction(res.Turn, TurnActionRevertCode, false); err != nil {
-		t.Fatalf("ApplyTurnAction revert_code: %v", err)
+	if _, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, res.Turn, TurnActionRevertCode, false); err != nil {
+		t.Fatalf("ApplyTurnActionForSession revert_code: %v", err)
 	}
 	if got, err := os.ReadFile(target); err != nil || string(got) != "old" {
 		t.Fatalf("target after parent revert = %q, %v; want old", got, err)
@@ -751,9 +1329,10 @@ func TestTaskToolAllDeniedSubagentsCancelParentTurn(t *testing.T) {
 	a.SetEventHandler(func(ev Event) {
 		cap.handler(ev)
 		if ev.Kind == EventPermissionRequest && ev.PermReq != nil {
-			if err := a.RespondPermission(ev.PermReq.ID, false); err != nil {
-				t.Errorf("RespondPermission deny: %v", err)
-			}
+			// The request event is delivered under the gate mutex, so respond off the
+			// callback goroutine (as a real adapter does) rather than re-entering it.
+			id := ev.PermReq.ID
+			go func() { _ = a.RespondPermission(id, false) }()
 		}
 	})
 	a.Init(ctx)
@@ -822,9 +1401,10 @@ func TestTaskToolChildBackgroundProcessStaysChildScoped(t *testing.T) {
 	a.SetEventHandler(func(ev Event) {
 		cap.handler(ev)
 		if ev.Kind == EventPermissionRequest && ev.PermReq != nil {
-			if err := a.RespondPermission(ev.PermReq.ID, true); err != nil {
-				t.Errorf("RespondPermission allow: %v", err)
-			}
+			// The request event is delivered under the gate mutex, so respond off the
+			// callback goroutine (as a real adapter does) rather than re-entering it.
+			id := ev.PermReq.ID
+			go func() { _ = a.RespondPermission(id, true) }()
 		}
 	})
 	a.Init(ctx)
@@ -866,6 +1446,87 @@ func TestTaskToolChildBackgroundProcessStaysChildScoped(t *testing.T) {
 		if msg.Type == "background_process" {
 			t.Fatalf("parent transcript contains child background row: %#v", msg)
 		}
+	}
+}
+
+// TestTaskChildBackgroundProcessUsesOwnerAdmissionBoundary proves an actual
+// child run_command(background=true) goes through the owner process manager's
+// admission boundary: closing a.procMgr admission before the child tool
+// request makes the child's start refuse before any process launch, so no
+// command PID file appears, no owner-managed child process is active, and the
+// child receives the manager-closed outcome. This fails with the former fresh
+// per-child manager, whose admission was never closed.
+func TestTaskChildBackgroundProcessUsesOwnerAdmissionBoundary(t *testing.T) {
+	var calls atomic.Int32
+	pidfile := filepath.Join(t.TempDir(), "child.pid")
+	var a *Agent
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req := readTaskTestRequest(t, r)
+		switch calls.Add(1) {
+		case 1:
+			writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"run background command","subagent_type":"runner"}]}`)
+		case 2:
+			writeTaskToolCallResponse(w, "call_bg", "run_command", `{"command":"echo $$ > `+pidfile+`; exec sleep 3","background":true}`)
+		case 3:
+			if !strings.Contains(taskTestMessageContent(req), "manager is closed") {
+				t.Fatalf("child follow-up messages missing the closed-manager outcome: %#v", req.Messages)
+			}
+			writeTextResponse(w, "child saw closed manager")
+		case 4:
+			if !strings.Contains(taskTestMessageContent(req), "child saw closed manager") {
+				t.Fatalf("parent follow-up messages missing the child result: %#v", req.Messages)
+			}
+			writeTextResponse(w, "parent done")
+		default:
+			t.Fatalf("unexpected provider call")
+		}
+	}))
+	defer server.Close()
+
+	a = newEventOrderAgent(t, server.URL+"/v1")
+	writeTaskAgentTypes(t, a, `"runner": {
+		"description": "test runner",
+		"tools": ["run_command"],
+		"prompt": "Test runner.",
+		"subagent": true
+	}`)
+	cap := &eventCapture{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.SetEventHandler(func(ev Event) {
+		cap.handler(ev)
+		if ev.Kind == EventPermissionRequest && ev.PermReq != nil {
+			// Respond off the callback goroutine, as a real adapter does.
+			id := ev.PermReq.ID
+			go func() { _ = a.RespondPermission(id, true) }()
+		}
+	})
+	a.Init(ctx)
+
+	// Close the owner process manager's admission before the child tool runs:
+	// the child request is now deterministic — no process can launch.
+	a.procMgr.CloseAdmission()
+
+	if _, err := a.Submit(ctx, "delegate background"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	waitUntilEventOrderTurnEndCount(t, cap, 1)
+
+	// The child received the manager-closed outcome and no owner-managed child
+	// process was ever admitted.
+	childID := findSubagentStart(t, cap).SubagentSessionID
+	if childID == "" {
+		t.Fatal("no child session id in the subagent start event")
+	}
+	if active := a.procMgr.ActiveIDsForSession(childID); len(active) != 0 {
+		t.Fatalf("owner manager has active child processes after the refused child start: %v", active)
+	}
+	if active := a.procMgr.ActiveIDs(); len(active) != 0 {
+		t.Fatalf("owner manager has active processes after the refused child start: %v", active)
+	}
+	// No command PID file appeared: the child process was never launched.
+	if _, err := os.Stat(pidfile); !os.IsNotExist(err) {
+		t.Fatalf("pidfile exists: a child process was launched after owner admission closed (stat err = %v)", err)
 	}
 }
 
@@ -1041,4 +1702,141 @@ func TestPR11Closure_SeenSessionsNoRace(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+// TestSessionClaimLifecycleContract proves a live task-child session holds the
+// cross-process session claim for the whole subagent turn: a second process
+// must be refused the child's claim while it runs, and must acquire it once the
+// child closes. It drives the real task-tool construction (runSubagent's
+// NewForSessionsRoot with the task tool's project context) through a live
+// subagent turn and contends with a real second process, following the
+// subprocess convention of the snapshot claim tests.
+func TestSessionClaimLifecycleContract(t *testing.T) {
+	if root := os.Getenv("LIGHTCODE_CLAIM_LIVENESS_PROJECTS_ROOT"); root != "" {
+		// Child process: attempt the claim on the given session.
+		_, ok, err := snapshot.AcquireSessionClaim(
+			root,
+			os.Getenv("LIGHTCODE_CLAIM_LIVENESS_PROJECT_ID"),
+			os.Getenv("LIGHTCODE_CLAIM_LIVENESS_SESSION_ID"),
+		)
+		if err != nil {
+			os.Exit(3) // unexpected error, not a contention verdict
+		}
+		if !ok {
+			os.Exit(2) // refused: another process holds the claim
+		}
+		os.Exit(0) // acquired
+	}
+
+	childHeld := make(chan struct{})
+	releaseChild := make(chan struct{})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch calls.Add(1) {
+		case 1:
+			writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"claim probe","subagent_type":"explore"}]}`)
+		case 2:
+			// The child's first provider request means its store is active and
+			// holds the session claim; keep it live until the test is done.
+			close(childHeld)
+			<-releaseChild
+			writeTextResponse(w, "child done")
+		case 3:
+			writeTextResponse(w, "parent done")
+		default:
+			t.Fatalf("unexpected provider call %d", calls.Load())
+		}
+	}))
+	defer server.Close()
+	// Release a blocked child turn on any exit path before server.Close, so a
+	// failed assertion cannot deadlock cleanup on the still-open request.
+	defer func() {
+		select {
+		case <-releaseChild:
+		default:
+			close(releaseChild)
+		}
+	}()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	proj, err := a.projects.Current()
+	if err != nil || proj == nil {
+		t.Fatalf("current project: %v", err)
+	}
+	parentID := a.SessionCurrent().ID
+
+	submitDone := make(chan error, 1)
+	go func() {
+		_, err := a.Submit(ctx, "claim probe")
+		submitDone <- err
+	}()
+
+	select {
+	case <-childHeld:
+	case <-time.After(10 * time.Second):
+		t.Fatal("task-child never reached its live turn")
+	}
+
+	// The child session is published in the project sessions root; it is the
+	// only session directory there other than the parent's.
+	sessionsRoot := a.projects.SessionsRoot(proj.ID)
+	childID := ""
+	deadline := time.Now().Add(5 * time.Second)
+	for childID == "" && time.Now().Before(deadline) {
+		entries, err := os.ReadDir(sessionsRoot)
+		if err != nil {
+			t.Fatalf("read sessions root: %v", err)
+		}
+		for _, e := range entries {
+			if e.IsDir() && e.Name() != parentID {
+				childID = e.Name()
+				break
+			}
+		}
+		if childID == "" {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if childID == "" {
+		t.Fatal("task-child session directory not found")
+	}
+
+	attemptClaim := func() (int, string) {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestSessionClaimLifecycleContract$")
+		cmd.Env = append(os.Environ(),
+			"LIGHTCODE_CLAIM_LIVENESS_PROJECTS_ROOT="+a.projects.Root(),
+			"LIGHTCODE_CLAIM_LIVENESS_PROJECT_ID="+proj.ID,
+			"LIGHTCODE_CLAIM_LIVENESS_SESSION_ID="+childID,
+		)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return 0, ""
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return exitErr.ExitCode(), ""
+		}
+		return -1, fmt.Sprintf("%v\n%s", err, out)
+	}
+
+	// While the child runs, a second process must be refused the claim.
+	if code, detail := attemptClaim(); code != 2 {
+		t.Fatalf("second process claim while child live = exit %d %s, want refusal (2)", code, detail)
+	}
+
+	close(releaseChild)
+	if err := <-submitDone; err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	waitUntilEventOrderTurnEndCount(t, cap, 1)
+
+	// Once the child closed, the same claim is acquirable again.
+	if code, detail := attemptClaim(); code != 0 {
+		t.Fatalf("second process claim after child close = exit %d %s, want acquisition (0)", code, detail)
+	}
 }

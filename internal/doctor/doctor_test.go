@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -542,69 +541,6 @@ func TestSymlinkDataDirWarns(t *testing.T) {
 	c := find(t, report, "data", "dir")
 	if c.Status != StatusWarn {
 		t.Fatalf("symlinked data dir = %+v, want warn", c)
-	}
-}
-
-func TestLockfiles(t *testing.T) {
-	home := t.TempDir()
-	writeConfig(t, home, `{"providers": {}, "default_model": ""}`)
-	ownerPath := filepath.Join(home, ".lightcode", "owner.lock")
-	if err := os.MkdirAll(filepath.Dir(ownerPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	livePID := os.Getpid()
-	cmd := exec.Command("true")
-	if err := cmd.Run(); err != nil {
-		t.Fatal(err)
-	}
-	stalePID := cmd.Process.Pid
-
-	write := func(body string) {
-		if err := os.WriteFile(ownerPath, []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write(fmt.Sprintf(`{"port": 4321, "token": "t", "pid": %d}`, livePID))
-
-	report, _ := run(t, params(home))
-	if c := find(t, report, "daemon", "owner"); c.Status != StatusOK {
-		t.Fatalf("live lockfile = %+v", c)
-	}
-
-	write(fmt.Sprintf(`{"port": 4322, "token": "t", "pid": %d}`, stalePID))
-	report, _ = run(t, params(home))
-	if c := find(t, report, "daemon", "owner"); c.Status != StatusWarn {
-		t.Fatalf("stale lockfile = %+v", c)
-	}
-
-	write("{garbage")
-	report, _ = run(t, params(home))
-	if c := find(t, report, "daemon", "owner"); c.Status != StatusWarn {
-		t.Fatalf("malformed lockfile = %+v", c)
-	}
-	if report.Failures != 0 {
-		t.Fatal("lockfile problems are warnings, not failures")
-	}
-}
-
-func TestProjectRecordFound(t *testing.T) {
-	home := t.TempDir()
-	workDir := filepath.Join(home, "work")
-	projDir := filepath.Join(home, ".lightcode", "projects", "test-id")
-	if err := os.MkdirAll(projDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	meta := fmt.Sprintf(`{"id": "test-id", "name": "work", "path": %q, "created_at": "2026-01-01T00:00:00Z", "last_activity": 1}`, workDir)
-	if err := os.WriteFile(filepath.Join(projDir, "meta.json"), []byte(meta), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	p := params(home)
-	p.WorkDir = workDir
-	report, _ := run(t, p)
-	c := find(t, report, "daemon", "project")
-	if c.Status != StatusOK || c.Detail != "project work (test-id)" {
-		t.Fatalf("daemon/project = %+v", c)
 	}
 }
 

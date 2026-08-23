@@ -8,8 +8,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -121,6 +123,69 @@ func TestSubmitWhileBusyEnqueuesAndEmits(t *testing.T) {
 	waitUntilFullyDrained(t, a)
 }
 
+// TestQueuedSubmitBoundaryCallbackOnceAtAppend proves the queued-append
+// callback contract: the admitted callback fires exactly once, at the append,
+// the real queued payload and its queue version are emitted, and the
+// drainer's final launch never invokes the callback again.
+func TestQueuedSubmitBoundaryCallbackOnceAtAppend(t *testing.T) {
+	hold := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-hold
+		writeTextResponse(w, "ok")
+	}))
+	defer server.Close()
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if _, err := a.Submit(ctx, "first"); err != nil {
+		t.Fatalf("Submit first: %v", err)
+	}
+	waitUntilBusy(t, a)
+
+	cbCalls := 0
+	res, err := a.SubmitToSessionWithBoundary(ctx, a.SessionCurrent().ID, "queued", func() { cbCalls++ })
+	if err != nil {
+		t.Fatalf("SubmitToSessionWithBoundary queued: %v", err)
+	}
+	if res.Started {
+		t.Fatalf("queued submit started instead of appending: %#v", res)
+	}
+	// The callback fired exactly once, at the append, and the result carries
+	// the real queued payload and version.
+	if cbCalls != 1 {
+		t.Fatalf("callback calls at append = %d, want exactly 1", cbCalls)
+	}
+	if len(res.Queue) != 1 || res.Queue[0].Content != "queued" || res.Version == 0 {
+		t.Fatalf("queued result = %#v, want the real item and a nonzero version", res)
+	}
+	// The append emitted the real queue payload at the returned version.
+	var sawPayload bool
+	for _, ev := range cap.snapshot() {
+		if ev.Kind == EventQueueChanged && ev.QueueVersion == res.Version {
+			if len(ev.Queue) != 1 || ev.Queue[0].Content != "queued" {
+				t.Fatalf("queue_changed payload for v%d = %#v, want the real queued item", res.Version, ev.Queue)
+			}
+			sawPayload = true
+		}
+	}
+	if !sawPayload {
+		t.Fatalf("no queue_changed with the queued version %d in %#v", res.Version, cap.snapshot())
+	}
+
+	// Final launch consumes the item without firing the callback again.
+	close(hold)
+	waitUntilFullyDrained(t, a)
+	if cbCalls != 1 {
+		t.Fatalf("callback calls after final launch = %d, want still exactly 1 (append-only)", cbCalls)
+	}
+	if got := userContents(a.SessionMessages()); !contains(got, "queued") {
+		t.Fatalf("queued message never launched; user turns=%q", got)
+	}
+}
+
 func TestQueueDrainEmitsEmptyArraySnapshot(t *testing.T) {
 	var reqs int
 	var mu sync.Mutex
@@ -191,8 +256,8 @@ func TestQueuedInputWinsOverPendingWakeSignal(t *testing.T) {
 	a := newEventOrderAgent(t, server.URL+"/v1")
 	cap := &eventCapture{}
 	_ = startEventOrderAgent(t, a, cap)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 
 	a.lp.AddPendingSignal(loop.PendingSignal{Payload: "wake signal", Persist: true, Wake: true})
@@ -235,6 +300,9 @@ func TestSubmitRejectsDuringTransition(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
 	cap := &eventCapture{}
 	_ = startEventOrderAgent(t, a, cap)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
 
 	a.ensureRuntime().mu.Lock()
 	a.ensureRuntime().sessionLocked().transitioning = true
@@ -256,8 +324,8 @@ func TestSubmitRejectsDuringTransition(t *testing.T) {
 
 func TestTryDrainQueueCanceledContextDoesNotPersistQueuedDraft(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	a.ensureRuntime().mu.Lock()
 	a.ensureRuntime().sessionLocked().queue = []QueuedItem{{ID: "q-1", Content: "queued draft"}}
@@ -280,8 +348,8 @@ func TestSessionNewClearsQueueAndBumpsVersionMonotonically(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
 	cap := &eventCapture{}
 	_ = startEventOrderAgent(t, a, cap)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 
 	// White-box: seed a non-empty queue at a known version.
@@ -307,16 +375,16 @@ func TestSessionSwitchClearsQueueAndBumpsVersionMonotonically(t *testing.T) {
 	a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
 	cap := &eventCapture{}
 	_ = startEventOrderAgent(t, a, cap)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	appendUserTurn(t, a, "first session turn")
 	firstID := a.store.SessionID()
 	if err := a.SessionNew(); err != nil {
 		t.Fatalf("SessionNew: %v", err)
 	}
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensure second session: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession second session: %v", err)
 	}
 	appendUserTurn(t, a, "second session turn")
 	secondID := a.store.SessionID()
@@ -343,9 +411,9 @@ func TestApplyTurnActionSessionChangesClearQueueAndBumpVersionMonotonically(t *t
 		appendUserTurn(t, a, "turn two")
 
 		seedQueue(t, a, 20, "stale after revert")
-		res, err := a.ApplyTurnAction(2, TurnActionRevertHistory, false)
+		res, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, 2, TurnActionRevertHistory, false)
 		if err != nil {
-			t.Fatalf("ApplyTurnAction revert_history: %v", err)
+			t.Fatalf("ApplyTurnActionForSession revert_history: %v", err)
 		}
 		if !res.SessionChanged {
 			t.Fatalf("revert_history result = %#v, want SessionChanged", res)
@@ -362,14 +430,14 @@ func TestApplyTurnActionSessionChangesClearQueueAndBumpVersionMonotonically(t *t
 		before := a.SessionCurrent().ID
 
 		seedQueue(t, a, 30, "stale after fork")
-		res, err := a.ApplyTurnAction(2, TurnActionFork, false)
+		res, err := a.ApplyTurnActionForSession(before, 2, TurnActionFork, false)
 		if err != nil {
-			t.Fatalf("ApplyTurnAction fork: %v", err)
+			t.Fatalf("ApplyTurnActionForSession fork: %v", err)
 		}
 		if !res.SessionChanged || res.Session.ID == "" || res.Session.ID == before {
 			t.Fatalf("fork result = %#v, before session %q", res, before)
 		}
-		assertQueueClearedAfterVersion(t, a, cap, 30)
+		assertForkQueueRearmsSource(t, a, before, 30)
 	})
 }
 
@@ -382,8 +450,8 @@ func TestDirectRevertAndForkClearQueueAndBumpVersionMonotonically(t *testing.T) 
 		appendUserTurn(t, a, "turn two")
 
 		seedQueue(t, a, 40, "stale after direct revert")
-		if err := a.RevertHistory(1); err != nil {
-			t.Fatalf("RevertHistory: %v", err)
+		if _, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, 2, TurnActionRevertHistory, false); err != nil {
+			t.Fatalf("ApplyTurnActionForSession revert_history: %v", err)
 		}
 		assertQueueClearedAfterVersion(t, a, cap, 40)
 	})
@@ -397,13 +465,18 @@ func TestDirectRevertAndForkClearQueueAndBumpVersionMonotonically(t *testing.T) 
 		before := a.SessionCurrent().ID
 
 		seedQueue(t, a, 50, "stale after direct fork")
-		if err := a.ForkSession(2); err != nil {
-			t.Fatalf("ForkSession: %v", err)
+		if err := a.ForkSessionForSession(before, 2); err != nil {
+			t.Fatalf("ForkSessionForSession: %v", err)
 		}
 		if got := a.SessionCurrent().ID; got == "" || got == before {
-			t.Fatalf("current session after ForkSession = %q, before %q", got, before)
+			t.Fatalf("current session after ForkSessionForSession = %q, before %q", got, before)
 		}
-		assertQueueClearedAfterVersion(t, a, cap, 50)
+		// The fork held the source's transitioning reservation across its
+		// publication; the release re-arms the retained queue, so the item
+		// seeded before the fork drains into the source on its own (the model
+		// endpoint is unreachable, so the turn fails fast and the queue ends
+		// empty with the version bumped past the seeded one).
+		assertForkQueueRearmsSource(t, a, before, 50)
 	})
 }
 
@@ -590,6 +663,7 @@ func TestAutoCompactionEventOrderInsideTurn(t *testing.T) {
 	}
 	turnStart := index(func(ev Event) bool { return ev.Kind == EventTurnStart && ev.Turn == 2 })
 	compactStart := index(func(ev Event) bool { return ev.Kind == EventCompactionStart })
+	rewrite := index(func(ev Event) bool { return ev.Kind == EventSessionRewrite })
 	compactEnd := index(func(ev Event) bool { return ev.Kind == EventCompactionEnd })
 	userDisplay := index(func(ev Event) bool { return ev.Kind == EventUserMessageDisplay && ev.Turn == 2 })
 	textDelta := index(func(ev Event) bool { return ev.Kind == EventTextDelta })
@@ -597,6 +671,7 @@ func TestAutoCompactionEventOrderInsideTurn(t *testing.T) {
 	for name, idx := range map[string]int{
 		"turn start":       turnStart,
 		"compaction start": compactStart,
+		"session rewrite":  rewrite,
 		"compaction end":   compactEnd,
 		"user display":     userDisplay,
 		"text delta":       textDelta,
@@ -606,14 +681,14 @@ func TestAutoCompactionEventOrderInsideTurn(t *testing.T) {
 			t.Fatalf("missing %s event in %#v", name, events)
 		}
 	}
-	if !(turnStart < compactStart && compactStart < compactEnd && compactEnd < userDisplay && userDisplay < textDelta && textDelta < turnEnd) {
-		t.Fatalf("unexpected auto-compaction event order: turnStart=%d compactStart=%d compactEnd=%d userDisplay=%d textDelta=%d turnEnd=%d events=%#v", turnStart, compactStart, compactEnd, userDisplay, textDelta, turnEnd, events)
+	if !(turnStart < compactStart && compactStart < rewrite && rewrite < compactEnd && compactEnd < userDisplay && userDisplay < textDelta && textDelta < turnEnd) {
+		t.Fatalf("unexpected auto-compaction event order: turnStart=%d compactStart=%d rewrite=%d compactEnd=%d userDisplay=%d textDelta=%d turnEnd=%d events=%#v", turnStart, compactStart, rewrite, compactEnd, userDisplay, textDelta, turnEnd, events)
 	}
-	if events[compactEnd].RefreshSession {
-		t.Fatalf("active-turn compaction_end must not request immediate history refresh: %#v", events[compactEnd])
-	}
-	if !events[turnEnd].RefreshSession {
-		t.Fatalf("active-turn compaction must request deferred history refresh on turn_end: %#v", events[turnEnd])
+	// The compaction publishes its replacement as a rewrite boundary at compaction
+	// success, not deferred onto turn_end, and carries the producer-built payload so
+	// no adapter re-enters the owner.
+	if events[rewrite].RewritePayload == nil {
+		t.Fatalf("rewrite boundary must carry the producer-built replacement: %#v", events[rewrite])
 	}
 }
 
@@ -653,11 +728,15 @@ func TestAutoCompactionBeforeFollowUpPreservesActiveToolTail(t *testing.T) {
 	defer server.Close()
 
 	a := newEventOrderAgent(t, server.URL+"/v1")
-	a.registry.Register(compactionCheckpointTool{})
 	a.memoryHooks = nil
 	cap := &eventCapture{}
 	ctx := startEventOrderAgent(t, a, cap)
-
+	// Bootstrap the session first: newSession builds a fresh registry, so the
+	// checkpoint tool must be registered on the live unit's registry.
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	a.registry.Register(compactionCheckpointTool{})
 	appendUserTurn(t, a, "completed prior turn")
 	a.cfg.Compaction.Enabled = true
 	a.cfg.Compaction.ThresholdPct = 0.50
@@ -906,6 +985,194 @@ func TestMultiItemDrainAllButLastAreUserOnlyTurns(t *testing.T) {
 	}
 }
 
+// TestSubmitDirectCommitmentContract proves direct-submit admission is one
+// commitment point, never acknowledge-then-launch: a refusal before the
+// turn-start commitment returns an explicit error with no callback, no
+// events, no transcript, no model request, and no task-parent update, and a
+// callback that cancels its own turn cannot turn a committed start into
+// Started:true Turn:0 — the turn is nonzero and ends cancelled.
+func TestSubmitDirectCommitmentContract(t *testing.T) {
+	// transcriptNextSeq snapshots the coordinator's next sequence under seqMu.
+	transcriptNextSeq := func(t *testing.T, a *Agent, id string) int {
+		t.Helper()
+		tr := a.transcriptForSessionID(id)
+		if tr == nil {
+			return 0
+		}
+		tr.seqMu.Lock()
+		seq := tr.nextSeq
+		tr.seqMu.Unlock()
+		return seq
+	}
+	taskParentUpdated := func(t *testing.T, a *Agent, id string) bool {
+		t.Helper()
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[id]
+		rt.mu.Unlock()
+		if unit == nil || unit.taskToolInst == nil {
+			return false
+		}
+		unit.taskToolInst.mu.Lock()
+		updated := unit.taskToolInst.cancelParent != nil
+		unit.taskToolInst.mu.Unlock()
+		return updated
+	}
+	assertNoAdmission := func(t *testing.T, a *Agent, cap *eventCapture, id string, beforeSeq int) {
+		t.Helper()
+		// Only the events a submit itself can produce are barred: NewSession
+		// legitimately emits prompt/setup warning events.
+		for _, ev := range cap.snapshot() {
+			switch ev.Kind {
+			case EventTurnStart, EventTurnEnd, EventQueueChanged, EventUserMessageDisplay, EventTextDelta, EventError:
+				t.Fatalf("refused submit emitted a turn event: %#v", ev)
+			}
+		}
+		// The transcript must be untouched by the refused submit: NewSession's
+		// own boundary may have sequenced rows, so compare against the capture
+		// taken before the submit.
+		if tr := a.transcriptForSessionID(id); tr != nil {
+			tr.seqMu.Lock()
+			seq := tr.nextSeq
+			tr.seqMu.Unlock()
+			if seq != beforeSeq {
+				t.Fatalf("refused submit fed the transcript: nextSeq=%d, want unchanged %d", seq, beforeSeq)
+			}
+		}
+		if taskParentUpdated(t, a, id) {
+			t.Fatal("refused submit updated the task-parent state")
+		}
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[id]
+		busy := unit != nil && unit.busy
+		rt.mu.Unlock()
+		if busy {
+			t.Fatal("refused submit left the unit busy")
+		}
+	}
+
+	t.Run("closed=refused_before_commit", func(t *testing.T) {
+		var reqs atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reqs.Add(1)
+			writeTextResponse(w, "ok")
+		}))
+		defer server.Close()
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		_ = startEventOrderAgent(t, a, cap)
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		rt.closed = true
+		rt.mu.Unlock()
+
+		beforeSeq := transcriptNextSeq(t, a, id)
+		cbCalled := false
+		_, err = a.SubmitToSessionWithBoundary(context.Background(), id, "x", func() { cbCalled = true })
+		if err == nil {
+			t.Fatal("submit against a closed owner must return an explicit error")
+		}
+		if cbCalled {
+			t.Fatal("refused submit fired the admitted callback")
+		}
+		assertNoAdmission(t, a, cap, id, beforeSeq)
+		if got := reqs.Load(); got != 0 {
+			t.Fatalf("refused submit made %d model requests", got)
+		}
+	})
+
+	t.Run("cancel=refused_before_commit", func(t *testing.T) {
+		var reqs atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reqs.Add(1)
+			writeTextResponse(w, "ok")
+		}))
+		defer server.Close()
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		_ = startEventOrderAgent(t, a, cap)
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		beforeSeq := transcriptNextSeq(t, a, id)
+		cbCalled := false
+		_, err = a.SubmitToSessionWithBoundary(ctx, id, "x", func() { cbCalled = true })
+		if err == nil {
+			t.Fatal("submit with a cancelled caller context must return an explicit error")
+		}
+		if cbCalled {
+			t.Fatal("refused submit fired the admitted callback")
+		}
+		assertNoAdmission(t, a, cap, id, beforeSeq)
+		if got := reqs.Load(); got != 0 {
+			t.Fatalf("refused submit made %d model requests", got)
+		}
+	})
+
+	t.Run("callback_cancels_commits_nonzero_turn", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeTextResponse(w, "ok")
+		}))
+		defer server.Close()
+		a := newEventOrderAgent(t, server.URL+"/v1")
+		cap := &eventCapture{}
+		ctx := startEventOrderAgent(t, a, cap)
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		rt := a.ensureRuntime()
+		// The callback runs inside submit's commitment hold (rt.mu is held by
+		// the caller), so reading the claimed unit's cancel under that hold is
+		// the only non-deadlocking way for the callback to cancel its own turn.
+		res, err := a.SubmitToSessionWithBoundary(ctx, id, "x", func() {
+			unit := rt.agent.sessions[id]
+			if unit != nil && unit.turnCancel != nil {
+				unit.turnCancel()
+			}
+		})
+		if err != nil {
+			t.Fatalf("callback-cancelled submit: %v", err)
+		}
+		if !res.Started || res.Turn == 0 {
+			t.Fatalf("callback-cancelled submit = %#v, want a committed nonzero turn (never Started:true Turn:0)", res)
+		}
+		waitUntilEventOrderTurnEndCount(t, cap, 1)
+		var end Event
+		for _, ev := range cap.snapshot() {
+			if ev.Kind == EventTurnEnd && ev.Turn == res.Turn {
+				end = ev
+			}
+		}
+		if end.Turn == 0 {
+			t.Fatalf("no turn_end for turn %d in %#v", res.Turn, cap.snapshot())
+		}
+		if !end.Cancelled {
+			t.Fatal("callback-cancelled turn must end Cancelled")
+		}
+		// Exactly one Done: the claim's Add is released when the turn ends.
+		wgDone := make(chan struct{})
+		go func() {
+			rt.turnWG.Wait()
+			close(wgDone)
+		}()
+		select {
+		case <-wgDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("committed turn never released its wait-group count")
+		}
+	})
+}
+
 func contains(ss []string, want string) bool {
 	for _, s := range ss {
 		if s == want {
@@ -913,6 +1180,155 @@ func contains(ss []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestSubmitDirectCommitmentBetweenClaimAndCommit proves the receiving-end
+// commitment block refuses a claim invalidated between claim and commit: a
+// close or a cancel landing there clears exactly the matching claim and
+// cancels it, releases exactly the launch Add, invokes no callback, and never
+// produces a turn.
+func TestSubmitDirectCommitmentBetweenClaimAndCommit(t *testing.T) {
+	assertRefused := func(t *testing.T, a *Agent, cap *eventCapture, id string, turn int, err error, cb *bool) {
+		t.Helper()
+		if turn != 0 || err == nil {
+			t.Fatalf("between-claim start = (turn %d, err %v), want a refusal", turn, err)
+		}
+		if *cb {
+			t.Fatal("refusal invoked the admitted callback")
+		}
+		for _, ev := range cap.snapshot() {
+			switch ev.Kind {
+			case EventTurnStart, EventTurnEnd, EventQueueChanged, EventUserMessageDisplay, EventTextDelta, EventError:
+				t.Fatalf("refusal emitted a turn event: %#v", ev)
+			}
+		}
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[id]
+		busy := unit.busy
+		turnCtx := unit.turnCtx
+		turnCancel := unit.turnCancel
+		rt.mu.Unlock()
+		if busy || turnCtx != nil || turnCancel != nil {
+			t.Fatalf("refused claim left busy=%v turnCtx=%v turnCancel=%v, want all cleared", busy, turnCtx != nil, turnCancel != nil)
+		}
+		// Exactly one Done: the launch Add is released synchronously by the
+		// helper, and nothing else holds a count.
+		wgDone := make(chan struct{})
+		go func() {
+			rt.turnWG.Wait()
+			close(wgDone)
+		}()
+		select {
+		case <-wgDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("refused claim did not release exactly its wait-group count")
+		}
+	}
+
+	t.Run("close=between_claim_and_commit", func(t *testing.T) {
+		a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
+		cap := &eventCapture{}
+		_ = startEventOrderAgent(t, a, cap)
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[id]
+		turnCtx, cancel, err := rt.claimTurnLocked(context.Background(), unit)
+		if err != nil {
+			rt.mu.Unlock()
+			t.Fatalf("claimTurnLocked: %v", err)
+		}
+		rt.closed = true
+		cb := false
+		turn, err := rt.startClaimedTurnLocked(unit, turnCtx, cancel, []string{"x"}, func() { cb = true })
+		rt.mu.Unlock()
+		assertRefused(t, a, cap, id, turn, err, &cb)
+	})
+
+	t.Run("cancel=between_claim_and_commit", func(t *testing.T) {
+		a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
+		cap := &eventCapture{}
+		_ = startEventOrderAgent(t, a, cap)
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[id]
+		turnCtx, cancel, err := rt.claimTurnLocked(context.Background(), unit)
+		if err != nil {
+			rt.mu.Unlock()
+			t.Fatalf("claimTurnLocked: %v", err)
+		}
+		cancel()
+		cb := false
+		turn, err := rt.startClaimedTurnLocked(unit, turnCtx, cancel, []string{"x"}, func() { cb = true })
+		rt.mu.Unlock()
+		assertRefused(t, a, cap, id, turn, err, &cb)
+	})
+
+	t.Run("stale_claim=refused_without_touching_newer_claim", func(t *testing.T) {
+		a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
+		cap := &eventCapture{}
+		_ = startEventOrderAgent(t, a, cap)
+		id, err := a.NewSession("", "primary")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		unit := a.sessions[id]
+		// The unit holds a later live claim while a stale handoff is offered:
+		// the commitment helper must refuse the stale handoff before admitted
+		// and leave the newer claim untouched.
+		laterCtx, laterCancel := context.WithCancel(context.Background())
+		defer laterCancel()
+		unit.busy = true
+		unit.turnCtx = laterCtx
+		unit.turnCancel = laterCancel
+		staleCtx, staleCancel := context.WithCancel(context.Background())
+		defer staleCancel()
+		rt.turnWG.Add(1)
+		cb := false
+		turn, err := rt.startClaimedTurnLocked(unit, staleCtx, staleCancel, []string{"x"}, func() { cb = true })
+		rt.mu.Unlock()
+		if turn != 0 || err == nil {
+			t.Fatalf("stale-claim start = (turn %d, err %v), want a refusal", turn, err)
+		}
+		if cb {
+			t.Fatal("stale-claim refusal invoked the admitted callback")
+		}
+		for _, ev := range cap.snapshot() {
+			switch ev.Kind {
+			case EventTurnStart, EventTurnEnd, EventQueueChanged, EventUserMessageDisplay, EventTextDelta, EventError:
+				t.Fatalf("stale-claim refusal emitted a turn event: %#v", ev)
+			}
+		}
+		rt.mu.Lock()
+		busy := unit.busy
+		turnCtxAfter := unit.turnCtx
+		turnCancelAfter := unit.turnCancel
+		rt.mu.Unlock()
+		if !busy || turnCtxAfter != laterCtx || turnCancelAfter == nil || reflect.ValueOf(turnCancelAfter).Pointer() != reflect.ValueOf(laterCancel).Pointer() {
+			t.Fatalf("stale-claim refusal touched the newer claim: busy=%v turnCtx=%v turnCancel-set=%v", busy, turnCtxAfter == laterCtx, turnCancelAfter != nil)
+		}
+		// Exactly one Done: the stale handoff's own Add is released.
+		wgDone := make(chan struct{})
+		go func() {
+			rt.turnWG.Wait()
+			close(wgDone)
+		}()
+		select {
+		case <-wgDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("stale-claim refusal did not release exactly its wait-group count")
+		}
+	})
 }
 
 func seedQueue(t *testing.T, a *Agent, version int, content string) {
@@ -945,4 +1361,28 @@ func assertQueueClearedAfterVersion(t *testing.T, a *Agent, cap *eventCapture, p
 	if !sawEvent {
 		t.Fatalf("missing queue_changed event for version %d: %#v", got.Version, cap.snapshot())
 	}
+}
+
+// assertForkQueueRearmsSource waits for the source's retained queue to drain
+// after the fork's reservation release and asserts the version advanced past
+// the seeded one: the fork blocks admission during publication, and the
+// release re-arms the retained work without any manual nudge.
+func assertForkQueueRearmsSource(t *testing.T, a *Agent, sourceID string, sourceVersion int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		src, err := a.QueueSnapshotForSession(sourceID)
+		if err != nil {
+			t.Fatalf("source queue after fork: %v", err)
+		}
+		if len(src.Items) == 0 && src.Version >= sourceVersion {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	src, err := a.QueueSnapshotForSession(sourceID)
+	if err != nil {
+		t.Fatalf("source queue after fork: %v", err)
+	}
+	t.Fatalf("source queue never drained after the fork release = %#v (version %d), want empty at version >= %d", src.Items, src.Version, sourceVersion)
 }

@@ -19,6 +19,7 @@ const (
 	EventTurnEnd                                    // Agent finished processing a turn.
 	EventError                                      // The agentic loop returned an error.
 	EventPermissionRequest                          // A tool needs user approval.
+	EventPermissionResolved                         // A pending permission request was removed (answered or cancelled).
 	EventCompactionStart                            // Compaction beginning.
 	EventCompactionEnd                              // Compaction finished.
 	EventWarning                                    // Current warning snapshot changed.
@@ -27,6 +28,7 @@ const (
 	EventUserMessageDisplay                         // A user-role message was appended to history.
 	EventGenericSystemSignal                        // A non-background <system-signal> was appended to history.
 	EventQueueChanged                               // The backend-owned input queue changed; carries a versioned snapshot.
+	EventSessionRewrite                             // Compaction rewrote the durable prefix; carries the replacement transcript state.
 )
 
 // Event is the unified event type emitted by the Agent to adapters.
@@ -50,19 +52,33 @@ type Event struct {
 	Metadata   map[string]any
 
 	// Agent-level fields:
-	Turn              int
-	Cancelled         bool
-	Error             string
-	RefreshSession    bool
+	Turn      int
+	Cancelled bool
+	Error     string
+	// RewritePayload (EventSessionRewrite) is the compacted session's replacement
+	// transcript/token snapshot, built by the producer under the transcript lock, so
+	// the adapter callback applies it without re-entering the owner.
+	RewritePayload    *SessionPayload
 	PermReq           *PermissionRequest
 	Warnings          []PromptWarning
 	SubagentSessionID string
 	TaskIndex         int
 	BackgroundProcess *BackgroundProcessDisplay
 
+	// CumulativeTokens (EventUsage) is the session's absolute cumulative token
+	// report computed under tokensMu, so a consumer applies it as a replacement
+	// rather than querying the owner. The Cache/Input/Output fields above remain
+	// this event's delta.
+	CumulativeTokens *TokenReport
+
 	// Queue fields (EventQueueChanged): a versioned snapshot of the input queue.
 	Queue        []QueuedItem
 	QueueVersion int
+
+	// Seq is the transcript sequence the coordinator assigned to this event's
+	// display row, set before delivery so an adapter can gate the item against a
+	// capture high-water. Zero for events that produce no row.
+	Seq int
 }
 
 // BackgroundProcessDisplay is the adapter-facing display payload for a
@@ -385,20 +401,29 @@ type SessionPayload struct {
 	Session  SessionSummary   `json:"session"`
 	Messages []DisplayMessage `json:"messages"`
 	Tokens   TokenReport      `json:"tokens"`
+	// AssistantOpen reports whether the last message is an assistant span
+	// still open in the producer, so the desktop view continues it instead of
+	// opening a second row.
+	AssistantOpen bool `json:"assistantOpen"`
 }
 
 // TurnActionResult is returned after a user-message revert/fork action.
 type TurnActionResult struct {
-	Action         string                   `json:"action"`
-	Turn           int                      `json:"turn"`
-	TargetTurn     int                      `json:"targetTurn"`
-	SessionChanged bool                     `json:"sessionChanged"`
-	Prefill        string                   `json:"prefill,omitempty"`
-	RestoredFiles  []string                 `json:"restoredFiles,omitempty"`
-	SkippedFiles   []snapshot.SkippedRevert `json:"skippedFiles,omitempty"`
-	Session        SessionSummary           `json:"session"`
-	Messages       []DisplayMessage         `json:"messages,omitempty"`
-	Tokens         TokenReport              `json:"tokens"`
+	Action         string `json:"action"`
+	Turn           int    `json:"turn"`
+	TargetTurn     int    `json:"targetTurn"`
+	SessionChanged bool   `json:"sessionChanged"`
+	Prefill        string `json:"prefill,omitempty"`
+	// Warning carries a best-effort failure that does not fail the action
+	// itself — the action committed and the result is success, but part of
+	// what the user asked for did not run. Adapters present it as an error
+	// line without treating the action as failed.
+	Warning       string                   `json:"warning,omitempty"`
+	RestoredFiles []string                 `json:"restoredFiles,omitempty"`
+	SkippedFiles  []snapshot.SkippedRevert `json:"skippedFiles,omitempty"`
+	Session       SessionSummary           `json:"session"`
+	Messages      []DisplayMessage         `json:"messages,omitempty"`
+	Tokens        TokenReport              `json:"tokens"`
 }
 
 // ModelInfo holds the active model identity and catalog metadata.

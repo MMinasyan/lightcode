@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 func TestForkIntoCopiesCompaction(t *testing.T) {
@@ -29,7 +31,7 @@ func TestForkIntoCopiesCompaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, forkDir, err := store.ForkInto(turn)
+	_, forkDir, err := store.ForkInto(turn, store.Root())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +64,7 @@ func TestForkIntoOmitsCompactionPastForkTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, forkDir, err := store.ForkInto(2)
+	_, forkDir, err := store.ForkInto(2, store.Root())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,8 +85,12 @@ func TestRevertHistoryDeletesLaterTurnsAndUpdatesCurrentTurn(t *testing.T) {
 		}
 	}
 
-	if err := store.RevertHistory(1); err != nil {
+	outcome, err := store.RevertHistory(1)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !outcome.HistoryChanged || !outcome.HistoryStateKnown || outcome.CurrentTurn != 1 {
+		t.Fatalf("outcome = %+v, want changed/known/current 1", outcome)
 	}
 
 	if got := readIntDirs(store.turnsDir); !reflect.DeepEqual(got, []int{1}) {
@@ -93,6 +99,80 @@ func TestRevertHistoryDeletesLaterTurnsAndUpdatesCurrentTurn(t *testing.T) {
 	if got := store.CurrentTurn(); got != 1 {
 		t.Fatalf("current turn = %d, want 1", got)
 	}
+	if got := store.BeginTurn(); got != 4 {
+		t.Fatalf("next turn = %d, want 4 above the historical high-water mark 3", got)
+	}
+}
+
+func TestRevertHistoryPreservesHighWaterAfterSnapshotTreeGone(t *testing.T) {
+	store := newTestStore(t)
+	seedTurns(t, store, 3)
+	if err := os.RemoveAll(store.snapshotsDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RevertHistory(1); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.BeginTurn(); got != 4 {
+		t.Fatalf("next turn after history removal with no snapshot tree = %d, want 4", got)
+	}
+}
+
+// TestHighestCompleteTurnIgnoresIncompleteTurn proves HighestCompleteTurn
+// names only marker-backed complete turns: a begun/unmarked turn is never
+// adopted as committed, and a loaded store returns the highest complete turn
+// after the incomplete cleanup removed unmarked turn dirs.
+func TestHighestCompleteTurnIgnoresIncompleteTurn(t *testing.T) {
+	projectsRoot := t.TempDir()
+	projectID := "p-hct"
+	sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+	store, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginNewSession(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	id := store.SessionID()
+	if got := store.HighestCompleteTurn(); got != 0 {
+		t.Fatalf("fresh store HighestCompleteTurn = %d, want 0", got)
+	}
+
+	// A begun/unmarked turn must never be adopted as committed.
+	begun := store.BeginTurn()
+	if got := store.HighestCompleteTurn(); got != 0 {
+		t.Fatalf("HighestCompleteTurn with begun turn %d = %d, want 0 (the begun turn has no completion marker)", begun, got)
+	}
+	if err := store.MarkTurnComplete(begun); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.HighestCompleteTurn(); got != begun {
+		t.Fatalf("HighestCompleteTurn after marking = %d, want %d", got, begun)
+	}
+	// Another begun turn above the complete one: still ignored.
+	if got := store.BeginTurn(); got != begun+1 {
+		t.Fatalf("second BeginTurn = %d, want %d", got, begun+1)
+	}
+	if got := store.HighestCompleteTurn(); got != begun {
+		t.Fatalf("HighestCompleteTurn with a second begun turn = %d, want %d", got, begun)
+	}
+
+	// A loaded store drops the unmarked dir during activation cleanup and
+	// returns the highest marker-backed complete turn.
+	if _, err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.LoadSession(id); err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.HighestCompleteTurn(); got != begun {
+		t.Fatalf("loaded store HighestCompleteTurn = %d, want %d (incomplete cleanup dropped the begun turn)", got, begun)
+	}
+	reopened.Detach()
 }
 
 func TestSnapshotDeduplicatesSymlinkAndRealPath(t *testing.T) {
@@ -929,14 +1009,66 @@ func TestLoadCompleteTurnsReturnsMessagesInOrderAndDeletesIncomplete(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(turns) != 1 || turns[0].Turn != 1 || len(turns[0].Messages) != 2 {
-		t.Fatalf("turns = %+v, want one complete turn with two messages", turns)
+	if len(turns) != 2 || turns[0].Turn != 1 || len(turns[0].Messages) != 2 || turns[1].Turn != 2 || len(turns[1].Messages) != 1 {
+		t.Fatalf("turns = %+v, want two complete turns with recovered user history", turns)
 	}
 	if string(turns[0].Messages[0]) != `{"role":"user","content":"one"}` || string(turns[0].Messages[1]) != `{"role":"assistant","content":"two"}` {
 		t.Fatalf("messages = %q, want append order", turns[0].Messages)
 	}
-	if _, err := os.Stat(filepath.Join(store.turnsDir, "2")); !os.IsNotExist(err) {
-		t.Fatalf("incomplete turn should be deleted, stat err = %v", err)
+	if string(turns[1].Messages[0]) != `{"role":"user","content":"incomplete"}` {
+		t.Fatalf("recovered messages = %q, want the valid user row", turns[1].Messages)
+	}
+}
+
+func TestIncompleteTurnRecoveryRewritesCanonicalTextBeforeToolSuffix(t *testing.T) {
+	store := newTestStore(t)
+	turn := store.BeginTurn()
+	mustAppendMessage(t, store, turn, `{"role":"user","content":"ask"}`)
+	mustAppendMessage(t, store, turn, `{"role":"assistant","content":"text"}`)
+	mustAppendMessage(t, store, turn, `{"role":"assistant","content":"","tool_calls":[{"id":"call-1"}]}`)
+
+	turns, err := store.LoadCompleteTurns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 1 || len(turns[0].Messages) != 2 {
+		t.Fatalf("recovered turns = %+v, want user/text rows only", turns)
+	}
+	want := []string{
+		`{"role":"user","content":"ask"}`,
+		`{"role":"assistant","content":"text"}`,
+	}
+	for i, msg := range turns[0].Messages {
+		if string(msg) != want[i] {
+			t.Fatalf("recovered message %d = %q, want %q", i, msg, want[i])
+		}
+	}
+	recoveredBytes, err := os.ReadFile(filepath.Join(store.turnsDir, "1", "messages.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(recoveredBytes) != want[0]+"\n"+want[1]+"\n" {
+		t.Fatalf("rewritten messages = %q, want canonical user/text bytes", recoveredBytes)
+	}
+	if _, err := os.Stat(filepath.Join(store.turnsDir, "1", "complete")); err != nil {
+		t.Fatalf("recovered complete marker: %v", err)
+	}
+
+	id := store.SessionID()
+	store.Detach()
+	restarted, err := NewForSessionsRoot(store.Root(), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.LoadSession(id); err != nil {
+		t.Fatal(err)
+	}
+	restartedTurns, err := restarted.LoadCompleteTurns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(turns, restartedTurns) {
+		t.Fatalf("live recovery = %+v, restart recovery = %+v", turns, restartedTurns)
 	}
 }
 
@@ -977,6 +1109,218 @@ func TestLoadCompleteTurnsWithoutSessionReturnsErrNoSession(t *testing.T) {
 	}
 }
 
+// TestBeginNewSessionStagedPublishesAtomically proves a new session is prepared
+// under staging and published by atomic rename: the final session exists and is
+// readable, the store is rebound to the final root, and no staging candidate is
+// left behind.
+func TestBeginNewSessionStagedPublishesAtomically(t *testing.T) {
+	projectsRoot := t.TempDir()
+	projectID := "p-staged-new"
+	sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+	store, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginNewSessionStaged(t.TempDir()); err != nil {
+		t.Fatalf("BeginNewSessionStaged: %v", err)
+	}
+	id := store.SessionID()
+	if store.Root() != sessionsRoot || store.Dir() != filepath.Join(sessionsRoot, id) {
+		t.Fatalf("store not rebound to final root: root=%q dir=%q", store.Root(), store.Dir())
+	}
+	if _, err := os.Stat(filepath.Join(sessionsRoot, id, "meta.json")); err != nil {
+		t.Fatalf("published session missing: %v", err)
+	}
+	assertNoStagingCandidate(t, projectsRoot, projectID)
+	if _, err := store.Meta(); err != nil {
+		t.Fatalf("Meta after publish: %v", err)
+	}
+	store.Detach()
+}
+
+// TestBeginNewSessionStagedPartialFailureLeavesNoFinalDir proves a staged new
+// session whose publication fails leaves no final session directory, leaves the
+// store inactive, and removes the staging candidate.
+func TestBeginNewSessionStagedPartialFailureLeavesNoFinalDir(t *testing.T) {
+	projectsRoot := t.TempDir()
+	projectID := "p-staged-fail"
+	sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+	if err := os.MkdirAll(filepath.Dir(sessionsRoot), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Make the sessions root a file so publication (rename into it) fails.
+	if err := os.WriteFile(sessionsRoot, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{root: sessionsRoot, projectsRoot: projectsRoot, projectID: projectID}
+
+	if err := store.BeginNewSessionStaged(t.TempDir()); err == nil {
+		t.Fatal("BeginNewSessionStaged should fail when the sessions root is not a directory")
+	}
+	if store.Active() {
+		t.Fatal("store left active after a failed staged begin")
+	}
+	if info, _ := os.Stat(sessionsRoot); info == nil || info.IsDir() {
+		t.Fatal("sessions root changed by a failed staged begin")
+	}
+	assertNoStagingCandidate(t, projectsRoot, projectID)
+}
+
+// TestPrepareStagedNewSessionWindow proves both halves of the prepared-new-session
+// window: the store returned by PrepareStagedNewSession is addressable and mutable
+// against the staging candidate before publish (while the sessions root stays
+// empty) and is rebound to the published location after a successful publish; and
+// a failure between prepare and publish leaves nothing in the sessions root, drops
+// the session state, and removes the staging candidate.
+func TestPrepareStagedNewSessionWindow(t *testing.T) {
+	projectsRoot := t.TempDir()
+	projectID := "p-staged-window"
+	sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+	store, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, err := store.PrepareStagedNewSession(t.TempDir())
+	if err != nil {
+		t.Fatalf("PrepareStagedNewSession: %v", err)
+	}
+
+	// Half 1 — the prepared store is addressable and mutable before publish, and
+	// nothing has been published into the sessions root.
+	if !prepared.Active() {
+		t.Fatal("prepared store not active before publish")
+	}
+	if prepared.SessionID() == "" || prepared.SessionID() != store.SessionID() {
+		t.Fatalf("prepared session id %q != store session id %q", prepared.SessionID(), store.SessionID())
+	}
+	if prepared.Dir() == store.Dir() {
+		t.Fatalf("prepared store not staging-bound: dir=%q store dir=%q", prepared.Dir(), store.Dir())
+	}
+	if _, err := os.Stat(filepath.Join(prepared.Dir(), "meta.json")); err != nil {
+		t.Fatalf("prepared session dir not addressable: %v", err)
+	}
+	if _, err := prepared.Meta(); err != nil {
+		t.Fatalf("Meta through prepared store before publish: %v", err)
+	}
+	if err := prepared.SetActiveAgentType("primary"); err != nil {
+		t.Fatalf("write through prepared store before publish: %v", err)
+	}
+	if meta, err := prepared.Meta(); err != nil {
+		t.Fatalf("Meta after pre-publish write: %v", err)
+	} else if meta.ActiveAgentType != "primary" {
+		t.Fatalf("pre-publish write not visible through prepared store: %+v", meta)
+	}
+	if _, err := os.Stat(filepath.Join(sessionsRoot, prepared.SessionID())); !os.IsNotExist(err) {
+		t.Fatalf("candidate visible in sessions root before publish: %v", err)
+	}
+
+	// Publish succeeds, the prepared store is rebound to the final location, and
+	// reads and writes through it keep working there. The staging root is
+	// captured before the publish: after it, prepared.Root() names the final
+	// root.
+	stagingRoot := prepared.Root()
+	if err := store.PublishPreparedSession(prepared); err != nil {
+		t.Fatalf("PublishPreparedSession: %v", err)
+	}
+	if prepared.Root() != sessionsRoot || prepared.Dir() != filepath.Join(sessionsRoot, prepared.SessionID()) {
+		t.Fatalf("prepared store not rebound after publish: root=%q dir=%q", prepared.Root(), prepared.Dir())
+	}
+	if _, err := os.Stat(filepath.Join(sessionsRoot, prepared.SessionID(), "meta.json")); err != nil {
+		t.Fatalf("published session missing: %v", err)
+	}
+	if meta, err := prepared.Meta(); err != nil {
+		t.Fatalf("Meta through prepared store after publish: %v", err)
+	} else if meta.ActiveAgentType != "primary" {
+		t.Fatalf("pre-publish write lost after publish: %+v", meta)
+	}
+	// PublishPreparedSession owns only the publish/relocate steps; the direct
+	// two-step caller is the cleanup owner of the now-empty staging parent.
+	if err := os.RemoveAll(stagingRoot); err != nil {
+		t.Fatal(err)
+	}
+	assertNoStagingCandidate(t, projectsRoot, projectID)
+	store.Detach()
+
+	// Half 2 — a failure between prepare and publish (the sessions root is a
+	// file, so the publish rename cannot happen) leaves the sessions root clean
+	// and drops the session state. PublishPreparedSession performs no staging
+	// cleanup: the staging candidate remains for the direct caller's cleanup
+	// owner, which removes it here.
+	failStore := &Store{root: sessionsRoot, projectsRoot: projectsRoot, projectID: projectID}
+	if err := os.RemoveAll(sessionsRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sessionsRoot, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orphaned, err := failStore.PrepareStagedNewSession(t.TempDir())
+	if err != nil {
+		t.Fatalf("prepare against failing root: %v", err)
+	}
+	failStagingRoot := orphaned.Root()
+	if err := failStore.PublishPreparedSession(orphaned); err == nil {
+		t.Fatal("PublishPreparedSession should fail when the sessions root is not a directory")
+	}
+	if failStore.Active() {
+		t.Fatal("store left active after a failed publish")
+	}
+	if orphaned.Active() {
+		t.Fatal("prepared store left active after a failed publish")
+	}
+	if info, _ := os.Stat(sessionsRoot); info == nil || info.IsDir() {
+		t.Fatal("sessions root changed by a failed publish")
+	}
+	// The staging candidate was left in place by the failed publish: the
+	// direct caller owns its removal.
+	if _, err := os.Stat(failStagingRoot); err != nil {
+		t.Fatalf("staging candidate missing after a failed publish (PublishPreparedSession must not clean): %v", err)
+	}
+	if err := os.RemoveAll(failStagingRoot); err != nil {
+		t.Fatal(err)
+	}
+	assertNoStagingCandidate(t, projectsRoot, projectID)
+}
+
+// assertNoStagingCandidate fails if any staged session candidate remains under
+// the project's staging namespace (an absent namespace is clean).
+func assertNoStagingCandidate(t *testing.T, projectsRoot, projectID string) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(projectsRoot, projectID, ".staging", "sessions"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		t.Fatalf("read staging: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("staging candidate left behind: %v", entries)
+	}
+}
+
+func TestForkIntoPreservesActiveAgentType(t *testing.T) {
+	store := newTestStore(t)
+	turn := store.BeginTurn()
+	mustAppendMessage(t, store, turn, `{"role":"user","content":"turn"}`)
+	if err := store.MarkTurnComplete(turn); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetActiveAgentType("reviewer"); err != nil {
+		t.Fatal(err)
+	}
+	newID, _, err := store.ForkInto(1, store.Root())
+	if err != nil {
+		t.Fatalf("ForkInto: %v", err)
+	}
+	meta, err := LoadSessionMeta(store.Root(), newID)
+	if err != nil {
+		t.Fatalf("LoadSessionMeta: %v", err)
+	}
+	if meta.ActiveAgentType != "reviewer" {
+		t.Fatalf("fork ActiveAgentType = %q, want reviewer", meta.ActiveAgentType)
+	}
+}
+
 func TestForkIntoCopiesTurnsUpToTargetAndCanBeLoaded(t *testing.T) {
 	store := newTestStore(t)
 	if err := store.SetModel("openrouter", "test/model"); err != nil {
@@ -990,7 +1334,7 @@ func TestForkIntoCopiesTurnsUpToTargetAndCanBeLoaded(t *testing.T) {
 		}
 	}
 
-	newID, newDir, err := store.ForkInto(2)
+	newID, newDir, err := store.ForkInto(2, store.Root())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1126,7 +1470,7 @@ func TestRevertHistoryNegativeTurnClearsHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.RevertHistory(-1); err != nil {
+	if _, err := store.RevertHistory(-1); err != nil {
 		t.Fatal(err)
 	}
 	if got := readIntDirs(store.turnsDir); len(got) != 0 {
@@ -1134,6 +1478,179 @@ func TestRevertHistoryNegativeTurnClearsHistory(t *testing.T) {
 	}
 	if got := store.CurrentTurn(); got != 0 {
 		t.Fatalf("CurrentTurn = %d, want 0", got)
+	}
+}
+
+// seedTurns persists n complete turns, one message each, through the store.
+func seedTurns(t *testing.T, store *Store, n int) {
+	t.Helper()
+	for i := 1; i <= n; i++ {
+		turn := store.BeginTurn()
+		mustAppendMessage(t, store, turn, `{"role":"user","content":"msg"}`)
+		if err := store.MarkTurnComplete(turn); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func compactionRecordAt10() CompactionRecord {
+	return CompactionRecord{BoundaryTurn: 10, Summary: "summary of turns 1-10"}
+}
+
+// TestRevertHistoryRemovesCompactionRecordBelowBoundary asserts that a revert
+// whose target lies below a compaction boundary removes the record: the
+// summary names turns the revert deletes, and a record that survived would
+// drop every remaining turn behind the boundary it names.
+func TestRevertHistoryRemovesCompactionRecordBelowBoundary(t *testing.T) {
+	store := newTestStore(t)
+	seedTurns(t, store, 10)
+	if err := store.SaveCompaction(compactionRecordAt10()); err != nil {
+		t.Fatal(err)
+	}
+
+	outcome, err := store.RevertHistory(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.CompactionRemoved {
+		t.Fatal("RevertHistory(5) below boundary 10 reported no record removal")
+	}
+	if got := readIntDirs(store.turnsDir); !reflect.DeepEqual(got, []int{1, 2, 3, 4, 5}) {
+		t.Fatalf("turn dirs = %v, want [1 2 3 4 5]", got)
+	}
+	rec, err := store.LoadCompaction()
+	if err != nil {
+		t.Fatalf("LoadCompaction: %v", err)
+	}
+	if rec != nil {
+		t.Fatalf("compaction record survived a revert below its boundary: %+v", rec)
+	}
+	if got := store.CurrentTurn(); got != 5 {
+		t.Fatalf("current turn = %d, want 5", got)
+	}
+}
+
+// TestRevertHistoryKeepsCompactionRecordAtOrAboveBoundary asserts the removal
+// is keyed strictly below the boundary: a revert to the boundary itself or
+// beyond leaves the record alone, because the summary still names every
+// surviving turn.
+func TestRevertHistoryKeepsCompactionRecordAtOrAboveBoundary(t *testing.T) {
+	store := newTestStore(t)
+	seedTurns(t, store, 10)
+	if err := store.SaveCompaction(compactionRecordAt10()); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, to := range []int{10, 12} {
+		outcome, err := store.RevertHistory(to)
+		if err != nil {
+			t.Fatalf("RevertHistory(%d): %v", to, err)
+		}
+		if outcome.CompactionRemoved {
+			t.Fatalf("RevertHistory(%d) at or above boundary 10 reported a record removal", to)
+		}
+		rec, err := store.LoadCompaction()
+		if err != nil {
+			t.Fatalf("LoadCompaction: %v", err)
+		}
+		if rec == nil || rec.BoundaryTurn != 10 {
+			t.Fatalf("compaction record after RevertHistory(%d) = %+v, want it to survive with boundary 10", to, rec)
+		}
+	}
+	if got := readIntDirs(store.turnsDir); !reflect.DeepEqual(got, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
+		t.Fatalf("turn dirs = %v, want [1..10] intact", got)
+	}
+}
+
+// TestRevertHistoryUnreadableCompactionRecordFailsClosed asserts an unreadable
+// record fails the revert with no turn removed: walking on a record whose
+// survival is unknown can truncate below a boundary whose record still
+// exists, which is exactly the state the removal exists to prevent.
+func TestRevertHistoryUnreadableCompactionRecordFailsClosed(t *testing.T) {
+	store := newTestStore(t)
+	seedTurns(t, store, 10)
+	if err := os.WriteFile(filepath.Join(store.dir, "compaction.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	outcome, err := store.RevertHistory(5)
+	if err == nil {
+		t.Fatal("unreadable compaction record reported success")
+	}
+	if outcome.CompactionRemoved {
+		t.Fatal("unreadable compaction record reported a removal")
+	}
+	if got := readIntDirs(store.turnsDir); !reflect.DeepEqual(got, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
+		t.Fatalf("turn dirs after unreadable record = %v, want [1..10] intact", got)
+	}
+}
+
+// TestRevertHistoryUnlinkFailureRemovesNoTurn asserts a failed record removal
+// fails the revert before the walk: the removal is a precondition of the
+// walk, so an undeliverable unlink must leave every turn in place and the
+// record loadable.
+func TestRevertHistoryUnlinkFailureRemovesNoTurn(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes as root")
+	}
+	store := newTestStore(t)
+	seedTurns(t, store, 10)
+	if err := store.SaveCompaction(compactionRecordAt10()); err != nil {
+		t.Fatal(err)
+	}
+	// An unwritable session directory blocks the unlink of compaction.json.
+	if err := os.Chmod(store.dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(store.dir, 0o700) }()
+
+	outcome, err := store.RevertHistory(5)
+	if err == nil {
+		t.Fatal("blocked record unlink reported success")
+	}
+	if outcome.CompactionRemoved {
+		t.Fatal("blocked record unlink reported a removal")
+	}
+	if err := os.Chmod(store.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if got := readIntDirs(store.turnsDir); !reflect.DeepEqual(got, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
+		t.Fatalf("turn dirs after blocked unlink = %v, want [1..10] intact", got)
+	}
+	rec, err := store.LoadCompaction()
+	if err != nil {
+		t.Fatalf("LoadCompaction: %v", err)
+	}
+	if rec == nil || rec.BoundaryTurn != 10 {
+		t.Fatalf("compaction record after blocked unlink = %+v, want it still loadable with boundary 10", rec)
+	}
+}
+
+// TestRevertHistorySyncFailureAfterUnlinkRemovesNoTurn asserts the
+// sync-failure outcome: the unlink already removed the record from every
+// reader, so the revert fails with no turn removed rather than walking on
+// top of an un-durable removal.
+func TestRevertHistorySyncFailureAfterUnlinkRemovesNoTurn(t *testing.T) {
+	store := newTestStore(t)
+	seedTurns(t, store, 10)
+	if err := store.SaveCompaction(compactionRecordAt10()); err != nil {
+		t.Fatal(err)
+	}
+	atomicfs.SyncDirFunc = func(string) error { return errors.New("injected sync failure") }
+	defer func() { atomicfs.SyncDirFunc = nil }()
+
+	outcome, err := store.RevertHistory(5)
+	if err == nil {
+		t.Fatal("failed directory sync reported success")
+	}
+	if !outcome.CompactionRemoved {
+		t.Fatal("failed directory sync after the unlink reported no removal")
+	}
+	if got := readIntDirs(store.turnsDir); !reflect.DeepEqual(got, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
+		t.Fatalf("turn dirs after failed sync = %v, want [1..10] intact", got)
+	}
+	if _, err := os.Stat(filepath.Join(store.dir, "compaction.json")); !os.IsNotExist(err) {
+		t.Fatalf("compaction.json after failed sync = %v, want it gone (the unlink succeeded)", err)
 	}
 }
 
@@ -1328,7 +1845,7 @@ func TestPR11Closure_ForkIntoSerializesWithConcurrentMutation(t *testing.T) {
 		}
 		forkResults := make(chan forkResult, 1)
 		go func() {
-			_, newDir, err := store.ForkInto(5)
+			_, newDir, err := store.ForkInto(5, store.Root())
 			forkResults <- forkResult{newDir, err}
 		}()
 		<-firstCopyStarted
@@ -1414,7 +1931,7 @@ func TestPR11Closure_ForkIntoSerializesWithConcurrentMutation(t *testing.T) {
 		}
 		forkResults := make(chan forkResult, 1)
 		go func() {
-			_, newDir, err := store.ForkInto(3)
+			_, newDir, err := store.ForkInto(3, store.Root())
 			forkResults <- forkResult{newDir, err}
 		}()
 		<-firstCopyStarted
@@ -1448,6 +1965,138 @@ func TestPR11Closure_ForkIntoSerializesWithConcurrentMutation(t *testing.T) {
 		}
 		if got := readIntDirs(filepath.Join(fr.newDir, "turns")); !reflect.DeepEqual(got, wantTurns) {
 			t.Fatalf("forked turns = %v, want %v (Close-concurrent fork lost turns)", got, wantTurns)
+		}
+	})
+}
+
+// TestStoreCloseFailureLeavesClaimReacquirable proves Store.Close holds the
+// claim and active authority through the optional empty-directory removal and
+// always runs clearLocked before returning success or failure: when the
+// removal fails, Close returns the failure after the store is inactive and the
+// claim released, so the session claim is reacquirable — a cleanup error can
+// never retain drive authority until process exit, and the release is never
+// ordered before the deletion completes.
+func TestStoreCloseFailureLeavesClaimReacquirable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes as root")
+	}
+	projectsRoot := t.TempDir()
+	projectID := "p-close-fail"
+	sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+	store, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginNewSession(t.TempDir()); err != nil {
+		t.Fatalf("BeginNewSession: %v", err)
+	}
+	id := store.SessionID()
+	// The empty session's discard (RemoveAll of the session dir) fails when the
+	// dir is not writable; the claim lives outside the dir and is unaffected.
+	if err := os.Chmod(store.Dir(), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	discarded, closeErr := store.Close()
+	if err := os.Chmod(filepath.Join(sessionsRoot, id), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if closeErr == nil {
+		t.Fatal("Close must report the failed empty-session discard")
+	}
+	if discarded {
+		t.Fatal("discarded = true alongside a failed removal")
+	}
+	if store.Active() {
+		t.Fatal("store still active after a failed discard")
+	}
+	// The claim was released despite the cleanup failure.
+	claim, ok, err := AcquireSessionClaim(projectsRoot, projectID, id)
+	if err != nil {
+		t.Fatalf("claim check: %v", err)
+	}
+	if !ok {
+		t.Fatal("claim still held after Close's failed discard")
+	}
+	_ = claim.Release()
+	// The store is reusable for another session.
+	if err := store.BeginNewSession(t.TempDir()); err != nil {
+		t.Fatalf("reuse after failed discard: %v", err)
+	}
+	store.Detach()
+}
+
+// TestBeginNewSessionStagedOwnsStagingCleanup proves BeginNewSessionStaged is
+// the sole cleanup owner of the staging tree from the moment prepare returns:
+// a successful publish removes the now-empty staging parent with no
+// diagnostic, a pre-rename failure removes it without modifying the operation
+// error, and a prepare-internal failure is owned by PrepareStagedNewSession
+// before the wrapper runs (nothing is left to clean).
+func TestBeginNewSessionStagedOwnsStagingCleanup(t *testing.T) {
+	t.Run("success_leaves_no_staging_and_no_diagnostic", func(t *testing.T) {
+		projectsRoot := t.TempDir()
+		projectID := "p-staged-owner"
+		sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+		store, err := NewForSessionsRoot(sessionsRoot, projectsRoot, projectID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stderr := captureStderr(t)
+		if err := store.BeginNewSessionStaged(t.TempDir()); err != nil {
+			t.Fatalf("BeginNewSessionStaged: %v", err)
+		}
+		assertNoStagingCandidate(t, projectsRoot, projectID)
+		if out := stderr(); out != "" {
+			t.Fatalf("BeginNewSessionStaged stderr = %q, want none on success", out)
+		}
+		store.Detach()
+	})
+
+	t.Run("prename_failure_removes_staging_and_returns_operation_error", func(t *testing.T) {
+		projectsRoot := t.TempDir()
+		projectID := "p-staged-owner-fail"
+		sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+		if err := os.MkdirAll(filepath.Dir(sessionsRoot), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(sessionsRoot, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		store := &Store{root: sessionsRoot, projectsRoot: projectsRoot, projectID: projectID}
+		err := store.BeginNewSessionStaged(t.TempDir())
+		if err == nil {
+			t.Fatal("BeginNewSessionStaged should fail when the sessions root is not a directory")
+		}
+		assertNoStagingCandidate(t, projectsRoot, projectID)
+		// The wrapper's cleanup succeeded, so the operation error is returned
+		// unmodified (no cleanup join).
+		if strings.Contains(err.Error(), "staging cleanup") {
+			t.Fatalf("BeginNewSessionStaged error = %q, want the plain operation error", err.Error())
+		}
+	})
+
+	t.Run("prepare_owned_failure_leaves_no_staging", func(t *testing.T) {
+		projectsRoot := t.TempDir()
+		projectID := "p-staged-owner-prep"
+		sessionsRoot := filepath.Join(projectsRoot, projectID, "sessions")
+		if err := os.MkdirAll(filepath.Join(projectsRoot, projectID, ".staging"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// A file where the staging sessions dir must be created makes the
+		// prepare fail before any candidate exists; the wrapper never runs.
+		if err := os.WriteFile(filepath.Join(projectsRoot, projectID, ".staging", "sessions"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		store := &Store{root: sessionsRoot, projectsRoot: projectsRoot, projectID: projectID}
+		if err := store.BeginNewSessionStaged(t.TempDir()); err == nil {
+			t.Fatal("BeginNewSessionStaged should fail when staging cannot be created")
+		}
+		if store.Active() {
+			t.Fatal("store left active after a failed staged begin")
+		}
+		// The prepare failed before any candidate existed: the blocking file is
+		// untouched and nothing else was created under .staging.
+		if info, err := os.Stat(filepath.Join(projectsRoot, projectID, ".staging", "sessions")); err != nil || info.IsDir() {
+			t.Fatalf(".staging/sessions after failed prepare = %v, %v; want the blocking file untouched", info, err)
 		}
 	})
 }

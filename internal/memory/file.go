@@ -1,6 +1,8 @@
 package memory
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +10,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 type Section struct {
@@ -28,8 +32,6 @@ func WriteMemoryFile(dir, title, content string) (string, error) {
 	if len(slug) > 40 {
 		slug = slug[:40]
 	}
-	name := fmt.Sprintf("%s-%s.md", ts, slug)
-	fp := filepath.Join(dir, name)
 
 	createdAt := now.Format(time.RFC3339)
 	var b strings.Builder
@@ -39,11 +41,27 @@ func WriteMemoryFile(dir, title, content string) (string, error) {
 	b.WriteString("---\n\n")
 	b.WriteString(content)
 	b.WriteString("\n")
+	body := []byte(b.String())
 
-	if err := os.WriteFile(fp, []byte(b.String()), 0644); err != nil {
-		return "", err
+	// Publish the .md with exclusive creation plus a random suffix so its base
+	// name is unique even when two saves share the same second and title; a
+	// name collision retries with a fresh suffix rather than overwriting an
+	// unrelated memory. The matching .vec inherits this unique name.
+	for attempt := 0; attempt < 8; attempt++ {
+		var nonce [4]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return "", err
+		}
+		fp := filepath.Join(dir, fmt.Sprintf("%s-%s-%s.md", ts, slug, hex.EncodeToString(nonce[:])))
+		created, err := atomicfs.CreateExclusive(fp, body, 0644)
+		if err != nil {
+			return "", err
+		}
+		if created {
+			return fp, nil
+		}
 	}
-	return fp, nil
+	return "", fmt.Errorf("memory: could not allocate a unique file for %q", title)
 }
 
 func ReadMemoryFile(path string) (title, content, createdAt string, err error) {

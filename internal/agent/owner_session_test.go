@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
+	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
@@ -61,13 +63,6 @@ func TestUnknownSessionIDsAreRejected(t *testing.T) {
 			name: "append",
 			run: func() error {
 				_, err := a.AppendUserMessageToSession("missing-session", "hello")
-				return err
-			},
-		},
-		{
-			name: "messages",
-			run: func() error {
-				_, err := a.SessionMessagesByID("missing-session")
 				return err
 			},
 		},
@@ -140,11 +135,11 @@ func TestLiveSessionsHaveSeparateHistoryAndQueues(t *testing.T) {
 		t.Fatalf("append second: %v", err)
 	}
 
-	firstMessages, err := a.SessionMessagesByID(firstID)
+	firstMessages, err := a.SessionMessagesFor(firstID)
 	if err != nil {
 		t.Fatalf("messages first: %v", err)
 	}
-	secondMessages, err := a.SessionMessagesByID(secondID)
+	secondMessages, err := a.SessionMessagesFor(secondID)
 	if err != nil {
 		t.Fatalf("messages second: %v", err)
 	}
@@ -185,6 +180,42 @@ func TestLiveSessionsHaveSeparateHistoryAndQueues(t *testing.T) {
 	}
 	if len(secondQueue.Items) != 1 || secondQueue.Items[0].Content != "queued second" {
 		t.Fatalf("second queue = %#v, want queued second", secondQueue.Items)
+	}
+}
+
+// TestSessionCreationLandsInDirectoryResolvedProject proves a session
+// created for the owner's project path lands in the project directory the
+// path resolves to even when the record's stored id names a different
+// project: the record's declared id never routes creation.
+func TestSessionCreationLandsInDirectoryResolvedProject(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	proj, err := project.EnsureForPath(a.projects.Root(), a.ProjectRoot())
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	realID := proj.ID
+	// Corrupt the record: the same directory now declares a different id.
+	corrupt := fmt.Sprintf(`{"id":"p-declared-elsewhere","name":%q,"path":%q}`+"\n", proj.Name, proj.Path)
+	if err := os.WriteFile(filepath.Join(a.projects.Root(), realID, "meta.json"), []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sid, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	a.ensureRuntime().mu.Lock()
+	unit := a.sessions[sid]
+	a.ensureRuntime().mu.Unlock()
+	if unit == nil {
+		t.Fatal("new session not live")
+	}
+	if unit.projectID != realID {
+		t.Fatalf("new session project = %q, want the directory-derived id %q", unit.projectID, realID)
+	}
+	wantRoot := filepath.Join(a.projects.Root(), realID, "sessions")
+	if !strings.HasPrefix(unit.store.Dir(), wantRoot) {
+		t.Fatalf("new session dir = %q, want it under %q", unit.store.Dir(), wantRoot)
 	}
 }
 
@@ -307,38 +338,8 @@ func TestPermissionStampOwner(t *testing.T) {
 	}
 }
 
-func TestEventFanout(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
-	legacy := make(chan Event, 2)
-	extra := make(chan Event, 2)
-	a.SetEventHandler(func(ev Event) {
-		legacy <- ev
-	})
-	unsubscribe := a.SubscribeEvents(func(ev Event) {
-		extra <- ev
-	})
-
-	a.emitEvent(Event{Kind: EventWarning, Warnings: []PromptWarning{{Kind: "test", Message: "first"}}})
-	if got := waitEvent(t, legacy).Warnings[0].Message; got != "first" {
-		t.Fatalf("legacy handler saw %q, want first", got)
-	}
-	if got := waitEvent(t, extra).Warnings[0].Message; got != "first" {
-		t.Fatalf("extra subscriber saw %q, want first", got)
-	}
-
-	unsubscribe()
-	a.emitEvent(Event{Kind: EventWarning, Warnings: []PromptWarning{{Kind: "test", Message: "second"}}})
-	if got := waitEvent(t, legacy).Warnings[0].Message; got != "second" {
-		t.Fatalf("legacy handler after unsubscribe saw %q, want second", got)
-	}
-	select {
-	case ev := <-extra:
-		t.Fatalf("unsubscribed handler saw event %#v", ev)
-	default:
-	}
-}
-
 func TestPermissionSaveProject(t *testing.T) {
+	foreignLockHolderChild()
 	home := t.TempDir()
 	firstRoot := t.TempDir()
 	secondRoot := t.TempDir()
@@ -372,6 +373,8 @@ func TestPermissionSaveProject(t *testing.T) {
 	if current := a.SessionCurrent().ID; current != firstID {
 		t.Fatalf("current session = %q, want first %q", current, firstID)
 	}
+	releaseIdentity := startForeignLockHolder(t, "TestPermissionSaveProject", projectIdentityLock(a.projects.Root(), secondProject.Path))
+	defer releaseIdentity()
 
 	a.ensureRuntime().mu.Lock()
 	second := a.sessions[secondID]
@@ -480,8 +483,8 @@ func TestStagedPermissionOwner(t *testing.T) {
 
 func TestTaskProjectSync(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	if err := a.ensureSession(); err != nil {
-		t.Fatalf("ensureSession: %v", err)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
 	projectID := a.session.projectID
 	if projectID == "" {
@@ -551,7 +554,7 @@ func TestQueuedInputDrainsFromInactiveSession(t *testing.T) {
 	a.ensureRuntime().tryDrainQueue(ctx)
 
 	waitUntilSessionQueueEmpty(t, a, firstID)
-	firstMessages, err := a.SessionMessagesByID(firstID)
+	firstMessages, err := a.SessionMessagesFor(firstID)
 	if err != nil {
 		t.Fatalf("messages first: %v", err)
 	}
@@ -791,7 +794,7 @@ func TestTurnActionsUseSelectedSessionHistory(t *testing.T) {
 	if got := userContents(result.Messages); !equalStrings(got, []string{"keep"}) {
 		t.Fatalf("result messages = %#v, want keep", got)
 	}
-	firstMessages, err := first.SessionMessagesByID(firstID)
+	firstMessages, err := first.SessionMessagesFor(firstID)
 	if err != nil {
 		t.Fatalf("messages first: %v", err)
 	}
@@ -840,7 +843,10 @@ func TestCompactionIndexesSelectedSessionProject(t *testing.T) {
 
 	first.ensureRuntime().mu.Lock()
 	second := first.sessions[secondID]
-	first.setCurrentSessionLocked(first.sessions[firstID])
+	if err := first.setCurrentSessionLocked(first.sessions[firstID]); err != nil {
+		first.ensureRuntime().mu.Unlock()
+		t.Fatalf("setCurrentSessionLocked: %v", err)
+	}
 	first.ensureRuntime().mu.Unlock()
 	if err := first.runCompactionForSession(context.Background(), second, false); err != nil {
 		t.Fatalf("runCompactionForSession second: %v", err)
@@ -1073,6 +1079,84 @@ func TestRootProcessRoutesBySession(t *testing.T) {
 	}
 	if _, err := firstProcess.Execute(context.Background(), map[string]any{"action": "kill", "id": id}); err != nil {
 		t.Fatalf("first kill: %v", err)
+	}
+}
+
+// TestProjectServiceRoutingContract proves a background command started from a
+// session in one project runs with that project's root while another project's
+// session is current: the per-session process view resolves its own workspace
+// root instead of the owner-global one. The command runs through the running
+// unit's own tools — the seam the existing root-process tests use — because
+// tool execution is reachable only inside the loop during a turn, not through
+// an adapter-facing method.
+func TestProjectServiceRoutingContract(t *testing.T) {
+	home := t.TempDir()
+	firstRoot := t.TempDir()
+	secondRoot := t.TempDir()
+	a := newCatalogBackedTestAgentForRoot(t, home, firstRoot)
+	a.cfg.Permissions.Allow = []string{
+		"run_command(*)",
+		"process(process)",
+		"process(process:*)",
+	}
+	firstProject, err := a.projects.Ensure()
+	if err != nil {
+		t.Fatalf("ensure first project: %v", err)
+	}
+	secondProject, err := project.EnsureForPath(a.projects.Root(), secondRoot)
+	if err != nil {
+		t.Fatalf("ensure second project: %v", err)
+	}
+
+	// Create the second-project session first so the first-project session is
+	// the current one when the background command starts.
+	secondID, err := a.NewSession(secondProject.ID, "primary")
+	if err != nil {
+		t.Fatalf("NewSession second project: %v", err)
+	}
+	firstID, err := a.NewSession(firstProject.ID, "primary")
+	if err != nil {
+		t.Fatalf("NewSession first project: %v", err)
+	}
+	if current := a.SessionCurrent().ID; current != firstID {
+		t.Fatalf("current session = %q, want first %q", current, firstID)
+	}
+
+	a.ensureRuntime().mu.Lock()
+	second := a.sessions[secondID]
+	a.ensureRuntime().mu.Unlock()
+	secondRun, ok := second.registry.Get("run_command")
+	if !ok {
+		t.Fatal("second run_command missing")
+	}
+	secondProcess, ok := second.registry.Get("process")
+	if !ok {
+		t.Fatal("second process missing")
+	}
+
+	result, err := secondRun.Execute(context.Background(), map[string]any{
+		"command":    "pwd; sleep 5",
+		"background": true,
+	})
+	if err != nil {
+		t.Fatalf("start background: %v", err)
+	}
+	id := backgroundID(t, result)
+	defer a.procMgr.KillAll()
+
+	var got string
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		out, err := secondProcess.Execute(context.Background(), map[string]any{"action": "read", "id": id})
+		if err == nil {
+			if trimmed := strings.TrimSpace(out); trimmed != "" && trimmed != "(No output yet)" {
+				got = trimmed
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got != secondRoot {
+		t.Fatalf("background pwd from second-project session = %q, want its project root %q while the first project is current", got, secondRoot)
 	}
 }
 
@@ -1350,17 +1434,6 @@ func waitPermissionEvent(t *testing.T, events <-chan Event) Event {
 		case <-time.After(time.Second):
 			t.Fatal("timed out waiting for permission request")
 		}
-	}
-}
-
-func waitEvent(t *testing.T, events <-chan Event) Event {
-	t.Helper()
-	select {
-	case ev := <-events:
-		return ev
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for event")
-		return Event{}
 	}
 }
 
@@ -1682,10 +1755,27 @@ func TestTaggedEventDedupByParent(t *testing.T) {
 		}
 	})
 
+	// Feed the parent's real task tool-start row first: production ordering
+	// guarantees the blocking parent ToolCallStart send precedes any tagged
+	// child event, so the row exists before the child start folds into it.
+	a.dispatchLoopEvent(loop.Event{Kind: loop.ToolCallStart, SessionID: firstID, ProjectID: a.session.projectID, ToolCallID: "parent-task", ToolName: "task"})
+	tr := a.transcriptForSessionID(firstID)
+	if tr == nil {
+		t.Fatal("no live coordinator for the parent session")
+	}
+	tr.seqMu.Lock()
+	if len(tr.tail) != 1 || tr.tail[0].msg.ID != "parent-task" {
+		tr.seqMu.Unlock()
+		t.Fatalf("parent tool row = %#v, want exactly the task row", tr.tail)
+	}
+	originalSeq := tr.tail[0].seq
+	tr.seqMu.Unlock()
+
 	tev := TaggedLoopEvent{
 		SessionID:       "child-session",
 		ParentSessionID: firstID,
 		ProjectID:       a.session.projectID,
+		ToolCallID:      "parent-task",
 		Event:           loop.Event{Kind: loop.TextDelta, Result: "child output"},
 	}
 	a.dispatchTaggedEvent(tev)
@@ -1696,6 +1786,20 @@ func TestTaggedEventDedupByParent(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("first tagged child event did not emit subagent_start")
+	}
+
+	// The association folded into the original row: same row, same sequence,
+	// the child link attached idempotently.
+	tr.seqMu.Lock()
+	if len(tr.tail) != 1 || tr.tail[0].seq != originalSeq || tr.tail[0].msg.ID != "parent-task" {
+		tr.seqMu.Unlock()
+		t.Fatalf("parent row after fold = %+v, want the task row unchanged at its original sequence", tr.tail)
+	}
+	folded := append([]SubagentSessionLink(nil), tr.tail[0].msg.SubagentSessionIDs...)
+	tr.seqMu.Unlock()
+	want := []SubagentSessionLink{{Index: 0, SessionID: "child-session"}}
+	if !reflect.DeepEqual(folded, want) {
+		t.Fatalf("folded links = %#v, want %#v", folded, want)
 	}
 
 	a.ensureRuntime().mu.Lock()
@@ -1947,8 +2051,8 @@ func TestMutationsRejectDuringTransition(t *testing.T) {
 	if _, err := a.RevertCodeForSession(id, 0); err == nil {
 		t.Error("RevertCodeForSession should reject during transition")
 	}
-	if err := a.RevertHistoryForSession(id, 1); err == nil {
-		t.Error("RevertHistoryForSession should reject during transition")
+	if _, err := a.ApplyTurnActionForSession(id, 1, TurnActionRevertHistory, false); err == nil {
+		t.Error("ApplyTurnActionForSession should reject during transition")
 	}
 	if err := a.ForkSessionForSession(id, 1); err == nil {
 		t.Error("ForkSessionForSession should reject during transition")

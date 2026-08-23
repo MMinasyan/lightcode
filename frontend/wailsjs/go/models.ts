@@ -234,6 +234,296 @@ export namespace agent {
 		    return a;
 		}
 	}
+	export class HydrationCursor {
+	    committedTurn: number;
+	    committedSeq: number;
+	    rewriteEpoch: number;
+
+	    static createFrom(source: any = {}) {
+	        return new HydrationCursor(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.committedTurn = source["committedTurn"];
+	        this.committedSeq = source["committedSeq"];
+	        this.rewriteEpoch = source["rewriteEpoch"];
+	    }
+	}
+	export class HydrationRow {
+	    seq: number;
+	    message: DisplayMessage;
+
+	    static createFrom(source: any = {}) {
+	        return new HydrationRow(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.seq = source["seq"];
+	        this.message = this.convertValues(source["message"], DisplayMessage);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class PromptWarning {
+	    kind: string;
+	    message: string;
+
+	    static createFrom(source: any = {}) {
+	        return new PromptWarning(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.kind = source["kind"];
+	        this.message = source["message"];
+	    }
+	}
+	export class QueuedItem {
+	    id: string;
+	    content: string;
+
+	    static createFrom(source: any = {}) {
+	        return new QueuedItem(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.content = source["content"];
+	    }
+	}
+	export class QueueState {
+	    items: QueuedItem[];
+	    version: number;
+
+	    static createFrom(source: any = {}) {
+	        return new QueueState(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.items = this.convertValues(source["items"], QueuedItem);
+	        this.version = source["version"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class ModelInfo {
+	    ref: string;
+	    provider: string;
+	    model: string;
+	    displayName: string;
+	    contextWindow: number;
+	    cost?: catalog.Cost;
+	    incomplete: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new ModelInfo(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ref = source["ref"];
+	        this.provider = source["provider"];
+	        this.model = source["model"];
+	        this.displayName = source["displayName"];
+	        this.contextWindow = source["contextWindow"];
+	        this.cost = this.convertValues(source["cost"], catalog.Cost);
+	        this.incomplete = source["incomplete"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class TokenEntry {
+	    provider: string;
+	    model: string;
+	    cache: number;
+	    input: number;
+	    output: number;
+	    known: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new TokenEntry(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.provider = source["provider"];
+	        this.model = source["model"];
+	        this.cache = source["cache"];
+	        this.input = source["input"];
+	        this.output = source["output"];
+	        this.known = source["known"];
+	    }
+	}
+	export class TokenReport {
+	    total: TokenEntry;
+	    perModel: TokenEntry[];
+	    contextUsed: number;
+	    contextWindow: number;
+
+	    static createFrom(source: any = {}) {
+	        return new TokenReport(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.total = this.convertValues(source["total"], TokenEntry);
+	        this.perModel = this.convertValues(source["perModel"], TokenEntry);
+	        this.contextUsed = source["contextUsed"];
+	        this.contextWindow = source["contextWindow"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class SessionSummary {
+	    id: string;
+	    createdAt: string;
+	    lastActivity: number;
+	    state: string;
+	    archivedAt: number;
+	    projectPath: string;
+	    parentSessionId?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new SessionSummary(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.createdAt = source["createdAt"];
+	        this.lastActivity = source["lastActivity"];
+	        this.state = source["state"];
+	        this.archivedAt = source["archivedAt"];
+	        this.projectPath = source["projectPath"];
+	        this.parentSessionId = source["parentSessionId"];
+	    }
+	}
+	export class HydrationState {
+	    session: SessionSummary;
+	    messages: DisplayMessage[];
+	    tail: HydrationRow[];
+	    errors: HydrationRow[];
+	    cursor: HydrationCursor;
+	    transcriptReplay: boolean;
+	    tokens: TokenReport;
+	    model: ModelInfo;
+	    busy: boolean;
+	    compacting: boolean;
+	    queue: QueueState;
+	    warnings: PromptWarning[];
+	    permissions: permission.Request[];
+	    readOnly: boolean;
+	    assistantOpen: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new HydrationState(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.session = this.convertValues(source["session"], SessionSummary);
+	        this.messages = this.convertValues(source["messages"], DisplayMessage);
+	        this.tail = this.convertValues(source["tail"], HydrationRow);
+	        this.errors = this.convertValues(source["errors"], HydrationRow);
+	        this.cursor = this.convertValues(source["cursor"], HydrationCursor);
+	        this.transcriptReplay = source["transcriptReplay"];
+	        this.tokens = this.convertValues(source["tokens"], TokenReport);
+	        this.model = this.convertValues(source["model"], ModelInfo);
+	        this.busy = source["busy"];
+	        this.compacting = source["compacting"];
+	        this.queue = this.convertValues(source["queue"], QueueState);
+	        this.warnings = this.convertValues(source["warnings"], PromptWarning);
+	        this.permissions = this.convertValues(source["permissions"], permission.Request);
+	        this.readOnly = source["readOnly"];
+	        this.assistantOpen = source["assistantOpen"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class ModelCompletion {
 	    context_window: number;
 	    max_output_tokens: number;
@@ -346,48 +636,7 @@ export namespace agent {
 		    return a;
 		}
 	}
-	export class ModelInfo {
-	    ref: string;
-	    provider: string;
-	    model: string;
-	    displayName: string;
-	    contextWindow: number;
-	    cost?: catalog.Cost;
-	    incomplete: boolean;
 
-	    static createFrom(source: any = {}) {
-	        return new ModelInfo(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.ref = source["ref"];
-	        this.provider = source["provider"];
-	        this.model = source["model"];
-	        this.displayName = source["displayName"];
-	        this.contextWindow = source["contextWindow"];
-	        this.cost = this.convertValues(source["cost"], catalog.Cost);
-	        this.incomplete = source["incomplete"];
-	    }
-
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
 	export class ModelListEntry {
 	    ref: string;
 	    provider: string;
@@ -462,20 +711,7 @@ export namespace agent {
 	        this.lastActivity = source["lastActivity"];
 	    }
 	}
-	export class PromptWarning {
-	    kind: string;
-	    message: string;
 
-	    static createFrom(source: any = {}) {
-	        return new PromptWarning(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.kind = source["kind"];
-	        this.message = source["message"];
-	    }
-	}
 	export class ProviderConfigInput {
 	    name: string;
 	    baseURL: string;
@@ -624,52 +860,7 @@ export namespace agent {
 	        this.usableModels = source["usableModels"];
 	    }
 	}
-	export class QueuedItem {
-	    id: string;
-	    content: string;
 
-	    static createFrom(source: any = {}) {
-	        return new QueuedItem(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.id = source["id"];
-	        this.content = source["content"];
-	    }
-	}
-	export class QueueState {
-	    items: QueuedItem[];
-	    version: number;
-
-	    static createFrom(source: any = {}) {
-	        return new QueueState(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.items = this.convertValues(source["items"], QueuedItem);
-	        this.version = source["version"];
-	    }
-
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
 
 	export class RuntimeCompactionConfig {
 	    threshold_pct: number;
@@ -768,30 +959,7 @@ export namespace agent {
 
 
 
-	export class SessionSummary {
-	    id: string;
-	    createdAt: string;
-	    lastActivity: number;
-	    state: string;
-	    archivedAt: number;
-	    projectPath: string;
-	    parentSessionId?: string;
 
-	    static createFrom(source: any = {}) {
-	        return new SessionSummary(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.id = source["id"];
-	        this.createdAt = source["createdAt"];
-	        this.lastActivity = source["lastActivity"];
-	        this.state = source["state"];
-	        this.archivedAt = source["archivedAt"];
-	        this.projectPath = source["projectPath"];
-	        this.parentSessionId = source["parentSessionId"];
-	    }
-	}
 	export class SnapshotFile {
 	    path: string;
 	    existed: boolean;
@@ -876,70 +1044,15 @@ export namespace agent {
 		    return a;
 		}
 	}
-	export class TokenEntry {
-	    provider: string;
-	    model: string;
-	    cache: number;
-	    input: number;
-	    output: number;
-	    known: boolean;
 
-	    static createFrom(source: any = {}) {
-	        return new TokenEntry(source);
-	    }
 
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.provider = source["provider"];
-	        this.model = source["model"];
-	        this.cache = source["cache"];
-	        this.input = source["input"];
-	        this.output = source["output"];
-	        this.known = source["known"];
-	    }
-	}
-	export class TokenReport {
-	    total: TokenEntry;
-	    perModel: TokenEntry[];
-	    contextUsed: number;
-	    contextWindow: number;
-
-	    static createFrom(source: any = {}) {
-	        return new TokenReport(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.total = this.convertValues(source["total"], TokenEntry);
-	        this.perModel = this.convertValues(source["perModel"], TokenEntry);
-	        this.contextUsed = source["contextUsed"];
-	        this.contextWindow = source["contextWindow"];
-	    }
-
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
 	export class TurnActionResult {
 	    action: string;
 	    turn: number;
 	    targetTurn: number;
 	    sessionChanged: boolean;
 	    prefill?: string;
+	    warning?: string;
 	    restoredFiles?: string[];
 	    skippedFiles?: snapshot.SkippedRevert[];
 	    session: SessionSummary;
@@ -957,6 +1070,7 @@ export namespace agent {
 	        this.targetTurn = source["targetTurn"];
 	        this.sessionChanged = source["sessionChanged"];
 	        this.prefill = source["prefill"];
+	        this.warning = source["warning"];
 	        this.restoredFiles = source["restoredFiles"];
 	        this.skippedFiles = this.convertValues(source["skippedFiles"], snapshot.SkippedRevert);
 	        this.session = this.convertValues(source["session"], SessionSummary);
@@ -1024,8 +1138,93 @@ export namespace catalog {
 
 }
 
+export namespace main {
+
+	export class CurrentModelResult {
+	    model: agent.ModelInfo;
+	    superseded: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new CurrentModelResult(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.model = this.convertValues(source["model"], agent.ModelInfo);
+	        this.superseded = source["superseded"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class ReadFileContentResult {
+	    content: string;
+	    superseded: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new ReadFileContentResult(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.content = source["content"];
+	        this.superseded = source["superseded"];
+	    }
+	}
+
+}
+
 export namespace permission {
 
+	export class Request {
+	    id: string;
+	    session_id?: string;
+	    project_id?: string;
+	    tool: string;
+	    args: string;
+	    resolved_arg?: string;
+	    can_allow_all?: boolean;
+	    disable_project_save?: boolean;
+	    batch_index?: number;
+	    batch_total?: number;
+	    batch_files?: string[];
+	    batch_resolved_files?: string[];
+
+	    static createFrom(source: any = {}) {
+	        return new Request(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.session_id = source["session_id"];
+	        this.project_id = source["project_id"];
+	        this.tool = source["tool"];
+	        this.args = source["args"];
+	        this.resolved_arg = source["resolved_arg"];
+	        this.can_allow_all = source["can_allow_all"];
+	        this.disable_project_save = source["disable_project_save"];
+	        this.batch_index = source["batch_index"];
+	        this.batch_total = source["batch_total"];
+	        this.batch_files = source["batch_files"];
+	        this.batch_resolved_files = source["batch_resolved_files"];
+	    }
+	}
 	export class Suggestion {
 	    rule: string;
 	    label: string;

@@ -15,8 +15,6 @@ import (
 	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/project"
-	"github.com/MMinasyan/lightcode/internal/server"
 )
 
 // Check statuses.
@@ -119,8 +117,6 @@ func Run(p Params) (Report, bool) {
 	if agentsCfg != nil {
 		setupModelCheck(agentsCfg, result.Catalog, envIsSet, add)
 	}
-
-	daemonChecks(p, add)
 
 	return summarize(checks), !anyConnected
 }
@@ -307,35 +303,6 @@ func setupModelCheck(agentsCfg *agentcfg.Config, cat *catalog.Catalog, envIsSet 
 		return
 	}
 	add("setup", "model", StatusOK, resolved.Model)
-}
-
-func daemonChecks(p Params, add func(group, name, status, detail string)) {
-	projectsRoot := filepath.Join(p.Home, ".lightcode", "projects")
-	current, err := project.FindByPath(projectsRoot, p.WorkDir)
-	switch {
-	case err != nil:
-		add("daemon", "project", StatusWarn, err.Error())
-	case current == nil:
-		add("daemon", "project", StatusOK, "no project record yet")
-	default:
-		add("daemon", "project", StatusOK, fmt.Sprintf("project %s (%s)", current.Name, current.ID))
-	}
-
-	lockPath := server.Path(p.Home)
-	lf, err := server.Read(p.Home)
-	if os.IsNotExist(err) {
-		add("daemon", "lockfiles", StatusOK, "none")
-		return
-	}
-	if err != nil {
-		add("daemon", "owner", StatusWarn, fmt.Sprintf("malformed lockfile: %v", err))
-		return
-	}
-	if server.IsStale(lf) {
-		add("daemon", "owner", StatusWarn, fmt.Sprintf("stale lockfile (pid %d not running)", lf.PID))
-		return
-	}
-	add("daemon", "owner", StatusOK, fmt.Sprintf("running (pid %d, port %d, lock %s)", lf.PID, lf.Port, lockPath))
 }
 
 func summarize(checks []Check) Report {

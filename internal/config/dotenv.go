@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 // DotEnvPath returns the path where Lightcode expects its .env file.
@@ -17,6 +19,12 @@ func DotEnvPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".lightcode", ".env"), nil
+}
+
+// envLockPath is the cross-process lock serializing read-modify-write of the
+// .env file, held so two processes cannot lose each other's updates.
+func envLockPath(envPath string) string {
+	return filepath.Join(filepath.Dir(envPath), ".locks", "env.lock")
 }
 
 // dotEnvTemplate is written to ~/.lightcode/.env the first time Lightcode
@@ -107,7 +115,51 @@ func (m *ManagedEnv) Set(key, value string) error {
 		}
 	}
 
-	if err := writeDotEnvLine(m.path, key, value); err != nil {
+	return atomicfs.WithLock(envLockPath(m.path), func() error {
+		return m.setEnvPayloadLocked(key, value)
+	})
+}
+
+// TrySet is the one-attempt counterpart of Set for owner paths that must not
+// block a shutting-down owner on a foreign env-lock holder. It applies the
+// same external-key checks and the same payload as Set; on leaf contention it
+// returns an operation error and mutates neither the file, the process env,
+// nor the managed set.
+func (m *ManagedEnv) TrySet(key, value string) error {
+	if m == nil {
+		return fmt.Errorf("managed env is not initialized")
+	}
+	if !isValidEnvKey(key) {
+		return fmt.Errorf("invalid env key %q", key)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, managed := m.managed[key]; !managed {
+		if _, external := os.LookupEnv(key); external {
+			return ErrExternalKey
+		}
+	}
+
+	ok, err := atomicfs.TryWithLock(envLockPath(m.path), func() error {
+		return m.setEnvPayloadLocked(key, value)
+	})
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("managed env lock is busy; retry")
+	}
+	return nil
+}
+
+// setEnvPayloadLocked rewrites the .env file, updates the process env, and
+// records the key as managed. It runs under the env leaf lock held by the
+// caller (the blocking WithLock in Set or the one-attempt TryWithLock in
+// TrySet), so it never reacquires the leaf. The caller holds m.mu.
+func (m *ManagedEnv) setEnvPayloadLocked(key, value string) error {
+	if err := writeDotEnvLinePayload(m.path, key, value); err != nil {
 		return err
 	}
 	if err := os.Setenv(key, value); err != nil {
@@ -133,7 +185,45 @@ func (m *ManagedEnv) Remove(key string) error {
 	if _, managed := m.managed[key]; !managed {
 		return nil
 	}
-	if err := removeDotEnvLine(m.path, key); err != nil {
+	return atomicfs.WithLock(envLockPath(m.path), func() error {
+		return m.removeEnvPayloadLocked(key)
+	})
+}
+
+// TryRemove is the one-attempt counterpart of Remove for owner paths that must
+// not block a shutting-down owner on a foreign env-lock holder. It applies the
+// same unmanaged no-op and the same payload as Remove; on leaf contention it
+// returns an operation error and mutates neither the file, the process env,
+// nor the managed set.
+func (m *ManagedEnv) TryRemove(key string) error {
+	if m == nil {
+		return fmt.Errorf("managed env is not initialized")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, managed := m.managed[key]; !managed {
+		return nil
+	}
+	ok, err := atomicfs.TryWithLock(envLockPath(m.path), func() error {
+		return m.removeEnvPayloadLocked(key)
+	})
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("managed env lock is busy; retry")
+	}
+	return nil
+}
+
+// removeEnvPayloadLocked removes every line defining key from the .env file,
+// unsets the key in the process env, and drops it from the managed set. It
+// runs under the env leaf lock held by the caller (the blocking WithLock in
+// Remove or the one-attempt TryWithLock in TryRemove), so it never reacquires
+// the leaf. The caller holds m.mu.
+func (m *ManagedEnv) removeEnvPayloadLocked(key string) error {
+	if err := removeDotEnvLinePayload(m.path, key); err != nil {
 		return err
 	}
 	_ = os.Unsetenv(key)
@@ -172,7 +262,7 @@ func LoadDotEnv() (*ManagedEnv, error) {
 			fmt.Fprintf(os.Stderr, "lightcode: could not create %s: %v\n", filepath.Dir(path), err)
 			return &ManagedEnv{path: path, managed: map[string]struct{}{}}, nil
 		}
-		if err := os.WriteFile(path, []byte(dotEnvTemplate), 0o600); err != nil {
+		if _, err := atomicfs.CreateExclusive(path, []byte(dotEnvTemplate), 0o600); err != nil {
 			fmt.Fprintf(os.Stderr, "lightcode: could not create %s: %v\n", path, err)
 			return &ManagedEnv{path: path, managed: map[string]struct{}{}}, nil
 		}
@@ -317,12 +407,11 @@ func isValidEnvKey(key string) bool {
 	return true
 }
 
-// writeDotEnvLine atomically writes key=value to path, replacing an existing
-// line with the same key (if any) and preserving all other lines (including
-// comments and blank lines). If the file does not exist, it is created with
-// mode 0600. If the file exists, its permissions are preserved when possible;
-// new files are created with 0600.
-func writeDotEnvLine(path, key, value string) error {
+// writeDotEnvLinePayload rewrites the .env file with key=value applied. It
+// runs under the env leaf lock held by the caller (the blocking WithLock in
+// ManagedEnv.Set or the one-attempt TryWithLock in ManagedEnv.TrySet), so it
+// never reacquires the leaf.
+func writeDotEnvLinePayload(path, key, value string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -373,10 +462,11 @@ func writeDotEnvLine(path, key, value string) error {
 	return writeDotEnvAtomic(path, []byte(body))
 }
 
-// removeDotEnvLine atomically removes every line defining key from path,
-// preserving comments, blank lines, and other keys. If path does not exist,
-// it is a no-op.
-func removeDotEnvLine(path, key string) error {
+// removeDotEnvLinePayload rewrites the .env file with every line defining key
+// removed. It runs under the env leaf lock held by the caller (the blocking
+// WithLock in ManagedEnv.Remove or the one-attempt TryWithLock in
+// ManagedEnv.TryRemove), so it never reacquires the leaf.
+func removeDotEnvLinePayload(path, key string) error {
 	existing, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -489,33 +579,5 @@ func parseEnvValue(value string) (string, error) {
 // Mirrors the pattern used by writeAgentConfigAtomic. On any failure the
 // temp file is removed so no partial artifact remains.
 func writeDotEnvAtomic(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".env-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	return nil
+	return atomicfs.Write(path, data, 0o600)
 }

@@ -25,7 +25,7 @@ func TestShowMenuDoesNotRedrawAtNavigationBounds(t *testing.T) {
 		{label: "Turn 1", detail: `write 3 test files. all the .txt files, containing only "test"`, selectable: true},
 	}
 
-	result := showMenu(&sync.Mutex{}, func(s string) { out.WriteString(s) }, nil, readKey, "Revert - pick turn", items, 80)
+	result := showMenu(&sync.Mutex{}, func(s string) { out.WriteString(s) }, readKey, "Revert - pick turn", items, 80)
 	if result.selected != -1 {
 		t.Fatalf("selected = %d, want cancel", result.selected)
 	}
@@ -52,7 +52,7 @@ func TestShowMenuRedrawUsesRenderedLineCount(t *testing.T) {
 		{label: "Turn 2", selectable: true},
 	}
 
-	_ = showMenu(&sync.Mutex{}, func(s string) { out.WriteString(s) }, nil, readKey, "Revert - pick turn", items, 80)
+	_ = showMenu(&sync.Mutex{}, func(s string) { out.WriteString(s) }, readKey, "Revert - pick turn", items, 80)
 	rendered := out.String()
 	if strings.Contains(rendered, "\x1b7") || strings.Contains(rendered, "\x1b8") || strings.Contains(rendered, "\x1b[J") {
 		t.Fatalf("menu redraw should not use cursor save/restore anchors:\n%q", rendered)
@@ -60,6 +60,62 @@ func TestShowMenuRedrawUsesRenderedLineCount(t *testing.T) {
 	if got := strings.Count(rendered, "\x1b[1A"); got != 8 {
 		t.Fatalf("cursor-up clears = %d, want 8 for redraw+exit of 5-row menu frame\n%q", got, rendered)
 	}
+}
+
+func TestConfirmYNDistinguishesReadErrorFromNo(t *testing.T) {
+	t.Run("enter_yes", func(t *testing.T) {
+		var out bytes.Buffer
+		readKey := func() (keyMsg, error) { return keyMsg{Special: keyEnter}, nil }
+		got, err := confirmYN(&sync.Mutex{}, func(s string) { out.WriteString(s) }, readKey, "also revert code?", 80)
+		if err != nil {
+			t.Fatalf("confirmYN err = %v, want nil", err)
+		}
+		if !got {
+			t.Fatal("confirmYN = false, want true on Enter at Yes")
+		}
+	})
+
+	t.Run("enter_no", func(t *testing.T) {
+		keys := []keyMsg{{Special: keyDown}, {Special: keyEnter}}
+		next := 0
+		readKey := func() (keyMsg, error) {
+			k := keys[next]
+			next++
+			return k, nil
+		}
+		var out bytes.Buffer
+		got, err := confirmYN(&sync.Mutex{}, func(s string) { out.WriteString(s) }, readKey, "also revert code?", 80)
+		if err != nil {
+			t.Fatalf("confirmYN err = %v, want nil", err)
+		}
+		if got {
+			t.Fatal("confirmYN = true, want false on Enter at No")
+		}
+	})
+
+	t.Run("escape_is_no", func(t *testing.T) {
+		var out bytes.Buffer
+		readKey := func() (keyMsg, error) { return keyMsg{Special: keyEscape}, nil }
+		got, err := confirmYN(&sync.Mutex{}, func(s string) { out.WriteString(s) }, readKey, "also revert code?", 80)
+		if err != nil {
+			t.Fatalf("confirmYN err = %v, want nil", err)
+		}
+		if got {
+			t.Fatal("confirmYN = true, want false on Escape")
+		}
+	})
+
+	t.Run("read_error_reported", func(t *testing.T) {
+		var out bytes.Buffer
+		readKey := func() (keyMsg, error) { return keyMsg{}, ExitError{Code: 130} }
+		got, err := confirmYN(&sync.Mutex{}, func(s string) { out.WriteString(s) }, readKey, "also revert code?", 80)
+		if err == nil {
+			t.Fatal("confirmYN err = nil, want the read error")
+		}
+		if got {
+			t.Fatal("confirmYN = true, want false with the error")
+		}
+	})
 }
 
 func TestRenderMenuConstrainsLineWidths(t *testing.T) {

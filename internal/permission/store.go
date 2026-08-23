@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 // LoadLocal reads the per-project permissions file.
@@ -28,9 +30,37 @@ func LoadLocal(projectsRoot, projectID string) (Rules, error) {
 	return r, nil
 }
 
-// SaveLocal writes to the per-project permissions file, merging new
-// patterns into the existing file (append-only, no duplicates).
+// SaveLocal merges new patterns into the per-project permissions file
+// (append-only, no duplicates). The read-merge-write cycle runs under the
+// project permissions lock, so concurrent savers each observe the previous
+// committed file and no rule is lost.
 func SaveLocal(projectsRoot, projectID string, add Rules) error {
+	if projectsRoot == "" || projectID == "" {
+		return nil
+	}
+	return atomicfs.WithLock(lockPath(projectsRoot, projectID), func() error {
+		return saveLocalPayload(projectsRoot, projectID, add)
+	})
+}
+
+// TrySaveLocal is the one-attempt counterpart of SaveLocal for owner paths
+// that must not block a shutting-down owner on a foreign permissions-lock
+// holder. On contention it returns (false, nil) without performing any payload
+// operation; otherwise it executes the shared locked payload and returns
+// (true, its result).
+func TrySaveLocal(projectsRoot, projectID string, add Rules) (bool, error) {
+	if projectsRoot == "" || projectID == "" {
+		return true, nil
+	}
+	return atomicfs.TryWithLock(lockPath(projectsRoot, projectID), func() error {
+		return saveLocalPayload(projectsRoot, projectID, add)
+	})
+}
+
+// saveLocalPayload is the locked read-merge-write body shared by SaveLocal and
+// TrySaveLocal. It runs under the project permissions lock held by the caller
+// and never reacquires it.
+func saveLocalPayload(projectsRoot, projectID string, add Rules) error {
 	existing, err := LoadLocal(projectsRoot, projectID)
 	if err != nil {
 		return err
@@ -45,13 +75,17 @@ func localPath(projectsRoot, projectID string) string {
 	return filepath.Join(projectsRoot, projectID, "permissions.json")
 }
 
+func lockPath(projectsRoot, projectID string) string {
+	return filepath.Join(projectsRoot, projectID, ".locks", "permissions.lock")
+}
+
 func writeLocalJSON(path string, v any) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o600)
+	return atomicfs.Write(path, data, 0o600)
 }
 
 func mergeUnique(existing, add []string) []string {

@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"testing"
 	"testing/fstest"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 func TestLoaderReadsBundledUserConfigAndDiscoveryCache(t *testing.T) {
@@ -27,6 +30,7 @@ func TestLoaderReadsBundledUserConfigAndDiscoveryCache(t *testing.T) {
 		"default_model": "local/known"
 	}`)
 	writeLoaderFile(t, filepath.Join(home, ".lightcode", "cache", "discovery", "local.json"), `{
+		"transport_fingerprint": "`+transportFingerprint(Transport{BaseURL: "http://localhost:11434/v1"})+`",
 		"fetched_at": "`+time.Now().Add(-48*time.Hour).UTC().Format(time.RFC3339)+`",
 		"attempted_at": "`+time.Now().UTC().Format(time.RFC3339)+`",
 		"models": {
@@ -118,6 +122,120 @@ func TestLoaderSkipsMalformedDiscoveryCacheWithWarning(t *testing.T) {
 	}
 }
 
+func TestLoaderMalformedTransportKeepsValidSibling(t *testing.T) {
+	home := t.TempDir()
+	writeLoaderFile(t, filepath.Join(home, ".lightcode", "config.json"), `{
+  "providers": {
+    "invalid": {"transport": "not an object", "discovery": false, "models": {}},
+    "valid": {"transport": {"base_url": "http://valid.test/v1", "api_key_env": ""}, "discovery": false, "models": {"m": {"context_window": 1}}}
+  }
+}`)
+	cat, warnings, err := NewLoader(home, fstest.MapFS{"builtin/base.json": {Data: []byte(`{
+      "id": "base",
+      "transport": {"base_url": "http://base.test/v1", "api_key_env": ""},
+      "discovery": false,
+      "models": {}
+    }`)}}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasWarningForProvider(warnings, "user_config_skip", "invalid") {
+		t.Fatalf("warnings = %#v, want user_config_skip for invalid malformed transport", warnings)
+	}
+	if _, _, err := cat.Lookup(ModelRef{Provider: "invalid", Model: "m"}); err == nil {
+		t.Fatal("malformed transport provider was retained")
+	}
+	if _, _, err := cat.Lookup(ModelRef{Provider: "valid", Model: "m"}); err != nil {
+		t.Fatalf("valid sibling missing: %v", err)
+	}
+}
+
+func TestLoaderTransportBoundRecentFailedAndLegacyRows(t *testing.T) {
+	newServer := func(t *testing.T, modelID string) (*httptest.Server, *int) {
+		t.Helper()
+		calls := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			_, _ = fmt.Fprintf(w, `{"data":[{"id":%q,"context_window":4096}]}`, modelID)
+		}))
+		t.Cleanup(server.Close)
+		return server, &calls
+	}
+	providerFS := func(baseURL string) fstest.MapFS {
+		return fstest.MapFS{"builtin/remote.json": {Data: []byte(fmt.Sprintf(`{
+  "id": "remote",
+  "transport": {"base_url": %q, "api_key_env": ""},
+  "discovery": true,
+  "models": {"known": {"context_window": 1}}
+}`, baseURL))}}
+	}
+	t.Run("recent A then B", func(t *testing.T) {
+		home := t.TempDir()
+		serverA, callsA := newServer(t, "a-model")
+		serverB, callsB := newServer(t, "b-model")
+		transportA := Transport{BaseURL: serverA.URL + "/v1"}
+		if err := WriteDiscoveryCache(home, "remote", transportA, DiscoveredProvider{Models: map[string]DiscoveredModel{"a-cached": {ContextWindow: 4096}}}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		catA, _, err := NewLoader(home, providerFS(transportA.BaseURL)).Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if *callsA != 0 {
+			t.Fatalf("recent A discovery calls = %d, want 0", *callsA)
+		}
+		if _, _, err := catA.Lookup(ModelRef{Provider: "remote", Model: "a-cached"}); err != nil {
+			t.Fatalf("matching A cache model missing: %v", err)
+		}
+		catB, _, err := NewLoader(home, providerFS(serverB.URL+"/v1")).Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if *callsB != 1 {
+			t.Fatalf("B discovery calls = %d, want 1 after foreign recent A", *callsB)
+		}
+		if _, _, err := catB.Lookup(ModelRef{Provider: "remote", Model: "b-model"}); err != nil {
+			t.Fatalf("B discovery model missing: %v", err)
+		}
+		if _, _, err := catB.Lookup(ModelRef{Provider: "remote", Model: "a-cached"}); err == nil {
+			t.Fatal("foreign A model survived the B rebuild")
+		}
+	})
+	t.Run("failed A then B", func(t *testing.T) {
+		home := t.TempDir()
+		serverA, _ := newServer(t, "unused-a")
+		serverB, callsB := newServer(t, "b-model")
+		transportA := Transport{BaseURL: serverA.URL + "/v1"}
+		if err := WriteDiscoveryAttempt(home, "remote", transportA, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := NewLoader(home, providerFS(serverB.URL+"/v1")).Load(); err != nil {
+			t.Fatal(err)
+		}
+		if *callsB != 1 {
+			t.Fatalf("B discovery calls after failed A = %d, want 1", *callsB)
+		}
+	})
+	t.Run("legacy is unbound", func(t *testing.T) {
+		home := t.TempDir()
+		server, calls := newServer(t, "b-model")
+		writeLoaderFile(t, filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"), `{
+  "attempted_at": "`+time.Now().UTC().Format(time.RFC3339)+`",
+  "models": {"legacy": {"context_window": 4096}}
+}`)
+		cat, _, err := NewLoader(home, providerFS(server.URL+"/v1")).Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if *calls != 1 {
+			t.Fatalf("legacy cache discovery calls = %d, want 1", *calls)
+		}
+		if _, _, err := cat.Lookup(ModelRef{Provider: "remote", Model: "legacy"}); err == nil {
+			t.Fatal("legacy model was used as bound discovery")
+		}
+	})
+}
+
 func TestLoaderFetchesDiscoveryWhenAttemptDueForBundledProvider(t *testing.T) {
 	home := t.TempDir()
 	calls := 0
@@ -169,6 +287,7 @@ func TestLoaderSkipsDiscoveryWhenAttemptRecent(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	writeLoaderFile(t, filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"), `{
+		"transport_fingerprint": "`+transportFingerprint(Transport{BaseURL: server.URL + "/v1"})+`",
 		"attempted_at": "`+time.Now().UTC().Format(time.RFC3339)+`",
 		"models": {}
 	}`)
@@ -302,6 +421,15 @@ func writeLoaderFile(t *testing.T, path, content string) {
 func hasWarning(warnings []Warning, kind string) bool {
 	for _, warning := range warnings {
 		if warning.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func hasWarningForProvider(warnings []Warning, kind, provider string) bool {
+	for _, warning := range warnings {
+		if warning.Kind == kind && warning.Provider == provider {
 			return true
 		}
 	}
@@ -474,5 +602,90 @@ func TestDiscoveryRefreshCandidatesIsMechanical(t *testing.T) {
 	}
 	if got["no-discovery"] {
 		t.Fatalf("no-discovery provider should not be a candidate; got %v", candidates)
+	}
+}
+
+// TestLoaderLoadTryContentionWarnsAndDoesNotHang proves the Try Loader routes
+// discovery publication through the one-attempt Try writers: with a foreign
+// process holding a due provider's discovery lock, LoadTry returns the catalog
+// with the existing discovery_failure warning instead of hanging on the lock.
+func TestLoaderLoadTryContentionWarnsAndDoesNotHang(t *testing.T) {
+	disableBuiltinDiscoveryKeys(t)
+	home := t.TempDir()
+	writeLoaderFile(t, filepath.Join(home, ".lightcode", "config.json"), `{
+		"providers": {
+			"local": {
+				"transport": {"base_url": "http://127.0.0.1:9/v1", "api_key_env": ""},
+				"discovery": true,
+				"models": {}
+			}
+		}
+	}`)
+	holder, ok, err := atomicfs.TryAcquire(discoveryLockPath(home, "local"))
+	if err != nil || !ok {
+		t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
+	}
+	defer holder.Release()
+
+	done := make(chan struct {
+		cat      *Catalog
+		warnings []Warning
+		err      error
+	}, 1)
+	go func() {
+		cat, warnings, err := NewLoader(home, bundledFS).LoadTry()
+		done <- struct {
+			cat      *Catalog
+			warnings []Warning
+			err      error
+		}{cat, warnings, err}
+	}()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("LoadTry under discovery contention = %v, want a catalog plus warnings", res.err)
+		}
+		if res.cat == nil {
+			t.Fatal("LoadTry returned a nil catalog under discovery contention")
+		}
+		if !hasWarning(res.warnings, "discovery_failure") {
+			t.Fatalf("LoadTry warnings = %#v, want a discovery_failure warning", res.warnings)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("LoadTry hung on the foreign discovery lock; Try publication must not block shutdown")
+	}
+}
+
+// TestLoaderLoadTrySucceedsLikeLoad proves the Try Loader publishes through
+// the one-attempt writers exactly like the blocking Load when the lock is
+// free: the discovery cache is written and the catalog merged.
+func TestLoaderLoadTrySucceedsLikeLoad(t *testing.T) {
+	disableBuiltinDiscoveryKeys(t)
+	home := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"remote-model","name":"Remote Model","context_window":16384,"max_output_tokens":2048}]}`))
+	}))
+	t.Cleanup(server.Close)
+	fsys := fstest.MapFS{
+		"builtin/remote.json": {Data: []byte(`{
+			"id": "remote",
+			"name": "Remote",
+			"transport": {"base_url": "` + server.URL + `/v1", "api_key_env": ""},
+			"discovery": true,
+			"models": {}
+		}`)},
+	}
+	cat, warnings, err := NewLoader(home, fsys).LoadTry()
+	if err != nil {
+		t.Fatalf("LoadTry: %v", err)
+	}
+	if hasWarning(warnings, "discovery_failure") {
+		t.Fatalf("LoadTry warnings = %#v, want no discovery_failure", warnings)
+	}
+	if _, ok := cat.Providers["remote"].Models["remote-model"]; !ok {
+		t.Fatalf("LoadTry did not merge the fetched model: %#v", cat.Providers["remote"].Models)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json")); statErr != nil {
+		t.Fatalf("LoadTry did not write the discovery cache: %v", statErr)
 	}
 }

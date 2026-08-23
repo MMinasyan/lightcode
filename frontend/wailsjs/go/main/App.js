@@ -34,8 +34,8 @@ export function ConnectProvider(arg1, arg2) {
   return window['go']['main']['App']['ConnectProvider'](arg1, arg2);
 }
 
-export function CurrentModel() {
-  return window['go']['main']['App']['CurrentModel']();
+export function CurrentModel(arg1) {
+  return window['go']['main']['App']['CurrentModel'](arg1);
 }
 
 export function CurrentWarnings() {
@@ -74,6 +74,10 @@ export function GetRuntimeConfig() {
   return window['go']['main']['App']['GetRuntimeConfig']();
 }
 
+export function HydrateSession(arg1) {
+  return window['go']['main']['App']['HydrateSession'](arg1);
+}
+
 export function ModelList() {
   return window['go']['main']['App']['ModelList']();
 }
@@ -110,8 +114,8 @@ export function QueueSnapshot() {
   return window['go']['main']['App']['QueueSnapshot']();
 }
 
-export function ReadFileContent(arg1) {
-  return window['go']['main']['App']['ReadFileContent'](arg1);
+export function ReadFileContent(arg1, arg2) {
+  return window['go']['main']['App']['ReadFileContent'](arg1, arg2);
 }
 
 export function Reload() {

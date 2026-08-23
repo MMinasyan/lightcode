@@ -28,6 +28,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 // SessionState values stored in meta.json.
@@ -88,6 +90,19 @@ type SkippedRevert struct {
 	Reason string `json:"reason"`
 }
 
+// CommittedMutationError marks an operation whose durable mutation committed
+// before the caller's error returned: the failure is typed so a shared adapter
+// can distinguish an already-committed outcome — whose boundary already owns
+// the prepared state and warning — from a precommit failure that emitted
+// nothing.
+type CommittedMutationError struct {
+	Err error
+}
+
+func (e *CommittedMutationError) Error() string { return e.Err.Error() }
+
+func (e *CommittedMutationError) Unwrap() error { return e.Err }
+
 // CompactionRecord is persisted to compaction.json when context
 // lifecycle management summarizes the conversation.
 type CompactionRecord struct {
@@ -106,7 +121,7 @@ func writeJSON(path string, v any) error {
 		return fmt.Errorf("marshal %s: %w", path, err)
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := atomicfs.Write(path, data, 0o600); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil

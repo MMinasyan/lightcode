@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 type menuItem struct {
@@ -206,7 +208,7 @@ func firstSelectableMenuItem(items []menuItem) int {
 	return -1
 }
 
-func showMenu(mu *sync.Mutex, out func(string), keyCh chan keyMsg, readKeyFn func() (keyMsg, error), title string, items []menuItem, width int) menuResult {
+func showMenu(mu *sync.Mutex, out func(string), readKeyFn func() (keyMsg, error), title string, items []menuItem, width int) menuResult {
 	if width < 30 {
 		width = 30
 	}
@@ -273,13 +275,56 @@ func showMenu(mu *sync.Mutex, out func(string), keyCh chan keyMsg, readKeyFn fun
 	}
 }
 
-func confirmYN(mu *sync.Mutex, out func(string), readKeyFn func() (keyMsg, error), question string, width int) bool {
+// confirmYN asks a Yes/No question and reports the choice, distinguishing a
+// deliberate No from a failed key read: a read error means the terminal is
+// exiting, and the caller must abort rather than treat it as an answer.
+// Escape cancels as No, exactly as showMenu's cancel does. It reads keys
+// itself because showMenu collapses a read error into selected -1, which
+// would be indistinguishable from No.
+func confirmYN(mu *sync.Mutex, out func(string), readKeyFn func() (keyMsg, error), question string, width int) (bool, error) {
 	items := []menuItem{
 		{label: "Yes", selectable: true},
 		{label: "No", selectable: true},
 	}
-	result := showMenu(mu, out, nil, readKeyFn, question, items, width)
-	return result.selected == 0
+	if width < 30 {
+		width = 30
+	}
+	sel := 0
+	var frame transientMenuFrame
+	draw := func() {
+		mu.Lock()
+		frame.draw(out, renderMenu(question, items, sel, width, defaultMenuFooter), width)
+		mu.Unlock()
+	}
+	draw()
+	for {
+		k, err := readKeyFn()
+		if err != nil {
+			return false, err
+		}
+		switch k.Special {
+		case keyEscape, keyCtrlC:
+			mu.Lock()
+			frame.clear(out)
+			mu.Unlock()
+			return false, nil
+		case keyEnter:
+			mu.Lock()
+			frame.clear(out)
+			mu.Unlock()
+			return sel == 0, nil
+		case keyUp:
+			if sel > 0 {
+				sel--
+				draw()
+			}
+		case keyDown:
+			if sel < len(items)-1 {
+				sel++
+				draw()
+			}
+		}
+	}
 }
 
 func (c *CLI) showModelMenu() {
@@ -320,7 +365,7 @@ func (c *CLI) showModelMenu() {
 		})
 	}
 
-	result := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, "Model", items, c.currentWidth())
+	result := showMenu(c.mu, c.writeRaw, c.readKeyFn, "Model", items, c.currentWidth())
 	if result.selected >= 0 {
 		choice := result.extra.(modelChoice)
 		sessionID, err := c.currentSession()
@@ -385,26 +430,86 @@ func (c *CLI) showSessionMenuInner(state string) {
 	case "select":
 		if result.selected >= 0 {
 			id := result.extra.(string)
-			summary, err := c.agent.OpenSession(id)
+			// The source is reserved immediately before the destination open
+			// and released at the selection commit: a busy or transitioning
+			// source refuses here with the owner's mutability error, and an
+			// idle source cannot start a turn while the destination commits.
+			// The release comes before the render, so a blocked render cannot
+			// hold the source transitioning.
+			release, err := c.reserveSelection()
 			if err != nil {
 				c.printLine(renderErrorMsg(err.Error()))
 				return
 			}
+			summary, err := c.agent.OpenSession(id)
+			if err != nil {
+				if !errors.Is(err, snapshot.ErrSessionContended) {
+					release()
+					c.printLine(renderErrorMsg(err.Error()))
+					return
+				}
+				// The user named a session another process is driving: it
+				// opens read-only. Present its durable transcript, committing
+				// routing current only once the view is available.
+				state, herr := c.owner.HydrateSession(id)
+				if herr != nil {
+					release()
+					c.printLine(renderErrorMsg(herr.Error()))
+					return
+				}
+				c.scope.SetProjectPath(state.Session.ProjectPath)
+				c.setCurrentSessionID(state.Session.ID)
+				c.sv().SetReadOnly(state.Session.ID)
+				// The render is fed from the state this open returned rather
+				// than re-read, so routing moves only once the view is in
+				// hand: a presentation that cannot be produced leaves the
+				// previous session and project in place.
+				release()
+				c.refreshFromHydration(state)
+				return
+			}
 			c.setCurrentSessionID(summary.ID)
+			release()
 			c.refreshSession()
 		}
 	case "new":
-		id, err := c.scope.NewSession("primary")
+		// The source is reserved immediately before the destination create
+		// and released at the selection commit, exactly as the select branch
+		// reserves it. Archive/delete are lifecycle operations and do not
+		// reserve.
+		release, err := c.reserveSelection()
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
 			return
 		}
+		id, err := c.scope.NewSession("primary")
+		if err != nil {
+			var committed *snapshot.CommittedMutationError
+			switch {
+			case id != "" && errors.As(err, &committed): // the destination was created durably before the failure: adopt it and reject typed after release+refresh
+				c.setCurrentSessionID(id)
+				release()
+				c.refreshSession()
+				c.printLine(renderErrorMsg(err.Error()))
+			default: // a plain precommit error retains the source exactly as it was
+				release()
+				c.printLine(renderErrorMsg(err.Error()))
+			}
+			return
+		}
 		c.setCurrentSessionID(id)
+		release()
 		c.refreshSession()
 	case "archive":
 		if result.selected >= 0 {
 			id := result.extra.(string)
-			if err := c.agent.SessionArchive(id); err != nil {
+			err := c.agent.SessionArchive(id)
+			if err != nil {
+				var committed *snapshot.CommittedMutationError
+				switch {
+				case errors.As(err, &committed): // the removal ran durably before failing: run exactly the success reconciliation — stale-safe, so a noncurrent target preserves current — then surface the rejection. A plain precommit error reconciles nothing.
+					c.clearRemovedCurrent(id)
+				}
 				c.printLine(renderErrorMsg(err.Error()))
 				return
 			}
@@ -414,7 +519,13 @@ func (c *CLI) showSessionMenuInner(state string) {
 	case "delete":
 		if result.selected >= 0 {
 			id := result.extra.(string)
-			if err := c.agent.SessionDelete(id); err != nil {
+			err := c.agent.SessionDelete(id)
+			if err != nil {
+				var committed *snapshot.CommittedMutationError
+				switch {
+				case errors.As(err, &committed): // the removal ran durably before failing: run exactly the success reconciliation — stale-safe, so a noncurrent target preserves current — then surface the rejection. A plain precommit error reconciles nothing.
+					c.clearRemovedCurrent(id)
+				}
 				c.printLine(renderErrorMsg(err.Error()))
 				return
 			}
@@ -539,7 +650,11 @@ func (c *CLI) showProjectMenu() {
 		return
 	}
 
-	cur := c.scope.ProjectCurrent()
+	cur, err := c.scope.ProjectCurrent()
+	if err != nil {
+		c.printLine(renderErrorMsg(err.Error()))
+		return
+	}
 
 	var items []menuItem
 	for _, p := range projects {
@@ -556,7 +671,7 @@ func (c *CLI) showProjectMenu() {
 		})
 	}
 
-	result := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, "Project", items, c.currentWidth())
+	result := showMenu(c.mu, c.writeRaw, c.readKeyFn, "Project", items, c.currentWidth())
 	if result.selected >= 0 {
 		path := result.extra.(string)
 		c.printLine(renderSystemMsg("  switching to " + path + "..."))
@@ -564,7 +679,12 @@ func (c *CLI) showProjectMenu() {
 	}
 }
 
-func (c *CLI) showRevertMenu() {
+// showRevertMenu runs the revert/fork picker flow. A failed key read inside
+// the confirmation is returned to the caller rather than consumed: the read
+// reports the exit error once the latch is set, and the command dispatch must
+// hand it to the key handler so the loop unwinds instead of rendering another
+// prompt. The pickers fail safe as menu cancels and are not errors.
+func (c *CLI) showRevertMenu() error {
 	c.mu.Lock()
 	c.stopAnimationLocked()
 	c.mu.Unlock()
@@ -572,7 +692,7 @@ func (c *CLI) showRevertMenu() {
 	msgs := c.sessionMessages()
 	if len(msgs) == 0 {
 		c.printLine(renderErrorMsg("no messages to revert"))
-		return
+		return nil
 	}
 
 	type userTurn struct {
@@ -588,7 +708,7 @@ func (c *CLI) showRevertMenu() {
 
 	if len(turns) == 0 {
 		c.printLine(renderErrorMsg("no user turns to revert"))
-		return
+		return nil
 	}
 
 	var items []menuItem
@@ -601,9 +721,9 @@ func (c *CLI) showRevertMenu() {
 		})
 	}
 
-	result := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, "Revert — pick turn", items, c.currentWidth())
+	result := showMenu(c.mu, c.writeRaw, c.readKeyFn, "Revert — pick turn", items, c.currentWidth())
 	if result.selected < 0 {
-		return
+		return nil
 	}
 	turn := result.extra.(int)
 
@@ -614,33 +734,45 @@ func (c *CLI) showRevertMenu() {
 		{label: "Back", selectable: true, extra: "back"},
 	}
 
-	actionResult := showMenu(c.mu, c.writeRaw, c.keyCh, c.readKeyFn, fmt.Sprintf("Turn %d — action", turn), actionItems, c.currentWidth())
+	actionResult := showMenu(c.mu, c.writeRaw, c.readKeyFn, fmt.Sprintf("Turn %d — action", turn), actionItems, c.currentWidth())
 	if actionResult.selected < 0 {
-		return
+		return nil
 	}
 
 	action := actionResult.extra.(string)
 	sessionID, err := c.currentSession()
 	if err != nil {
 		c.printLine(renderErrorMsg(err.Error()))
-		return
+		return nil
 	}
 	switch action {
 	case "code":
 		result, err := c.agent.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertCode, false)
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
-			return
+			c.printRevertSkipped(result)
+			return nil
 		}
 		c.printLine(renderSystemMsg(fmt.Sprintf("  reverted code to before turn %d", turn)))
 		c.printRevertSkipped(result)
 
 	case "history":
-		alsoCode := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
+		alsoCode, err := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
+		if err != nil {
+			// The confirmation read failed (the terminal is exiting): abort the
+			// revert rather than performing it as a "no", and hand the error to
+			// the caller so the loop unwinds.
+			return err
+		}
 		result, err := c.agent.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertHistory, alsoCode)
 		if err != nil {
 			c.printLine(renderErrorMsg(err.Error()))
-			return
+			c.printRevertSkipped(result)
+			// The owner reconciles the loop to disk after a history revert,
+			// even when the walk stopped partway, so the transcript the user
+			// is looking at is stale; re-render it over the reconciled state.
+			c.refreshSession()
+			return nil
 		}
 		if result.Session.ID != "" {
 			c.setCurrentSessionID(result.Session.ID)
@@ -649,20 +781,41 @@ func (c *CLI) showRevertMenu() {
 		c.printRevertSkipped(result)
 
 	case "fork":
-		alsoCode := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
+		alsoCode, err := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
+		if err != nil {
+			// The confirmation read failed (the terminal is exiting): abort the
+			// fork rather than performing it as a "no", and hand the error to
+			// the caller so the loop unwinds.
+			return err
+		}
 		result, err := c.agent.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionFork, alsoCode)
 		if err != nil {
-			c.printLine(renderErrorMsg(err.Error()))
-			return
+			var committed *snapshot.CommittedMutationError
+			switch {
+			case result.Session.ID != "" && errors.As(err, &committed): // The destination committed; adopt and refresh it, then show kept files before the error.
+				c.setCurrentSessionID(result.Session.ID)
+				c.refreshSession()
+				c.printRevertSkipped(result)
+				c.printLine(renderErrorMsg(err.Error()))
+			default: // a plain precommit error retains the source; its partial result carries no adopted session
+				c.printLine(renderErrorMsg(err.Error()))
+			}
+			return nil
 		}
 		if result.Session.ID != "" {
 			c.setCurrentSessionID(result.Session.ID)
 		}
 		c.refreshSession()
 		c.printRevertSkipped(result)
+		// The fork committed; only the best-effort code revert may have
+		// failed, which the result carries as a warning on the success path.
+		if result.Warning != "" {
+			c.printLine(renderErrorMsg(result.Warning))
+		}
 
 	case "back":
 	}
+	return nil
 }
 
 func (c *CLI) printRevertSkipped(result agent.TurnActionResult) {

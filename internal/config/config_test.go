@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -147,6 +148,48 @@ func TestParseAcceptsEmptySkeleton(t *testing.T) {
 	}
 	if !cfg.Compaction.Enabled || cfg.Compaction.ThresholdPct != 0.90 {
 		t.Fatalf("Compaction defaults not applied: %+v", cfg.Compaction)
+	}
+}
+
+func TestParsePreservesExactProviderOptionNumbers(t *testing.T) {
+	cfg, err := Parse([]byte(` 
+{
+  "providers": {
+    "local": {
+      "transport": {
+        "base_url": "http://localhost:11434/v1",
+        "api_key_env": "",
+        "options": {"large": 90071992547409931234567890}
+      }
+    }
+  }
+}
+
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	providers := cfg.Providers["local"].(map[string]any)
+	transport := providers["transport"].(map[string]any)
+	options := transport["options"].(map[string]any)
+	if got, ok := options["large"].(json.Number); !ok || got.String() != "90071992547409931234567890" {
+		t.Fatalf("provider option number = %#v (%T), want exact json.Number", options["large"], options["large"])
+	}
+}
+
+func TestParseRejectsTrailingWholeDocumentData(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		{name: "second value", data: `{"providers": {}} {"extra": 1}`},
+		{name: "junk", data: `{"providers": {}} junk`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Parse([]byte(tc.data)); err == nil {
+				t.Fatal("Parse accepted trailing whole-document data")
+			}
+		})
 	}
 }
 

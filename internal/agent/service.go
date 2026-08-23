@@ -9,10 +9,13 @@ import (
 // AdapterService is the owner surface used by user-facing adapters.
 type AdapterService interface {
 	SetEventHandler(func(Event))
-	Init(context.Context)
+	// Init starts the owner and returns the id of the session it resumed,
+	// or "" when none was resumed — the adapter's startup selection.
+	Init(context.Context) string
 
 	CurrentWarnings() []PromptWarning
 	SubmitToSession(context.Context, string, string) (SubmitResult, error)
+	SubmitToSessionWithBoundary(context.Context, string, string, func()) (SubmitResult, error)
 	QueueSnapshotForSession(string) (QueueState, error)
 	CancelSession(string) error
 	CompactNowForSession(context.Context, string) error
@@ -52,24 +55,39 @@ type AdapterService interface {
 
 	TokenUsageForSession(string) (TokenReport, error)
 	SessionSummaryForSession(string) (SessionSummary, error)
+	SessionSummaryForSessionOrPersisted(string) (SessionSummary, error)
 	SessionPayloadForSession(string) (SessionPayload, error)
 	SessionList(string) ([]SessionSummary, error)
 	OpenSession(string) (SessionSummary, error)
+	OpenSessionWithBoundary(string, func(HydrationState)) (SessionSummary, error)
+	// ReserveSelectionSource reserves the selection's source session while a
+	// navigation command creates, opens, or switches to a destination. A
+	// no-op release for an empty/non-live/read-only source; the existing
+	// mutability error for a busy or transitioning source; the transitioning
+	// reservation (released by the returned func) for an idle live source.
+	ReserveSelectionSource(string) (func(), error)
+	// Staged-new boundary callbacks carry the in-commit outcome alongside the
+	// prepared state: nil while every producer still rejects precommit, and a
+	// wrapped *snapshot.CommittedMutationError once a committed failure can be
+	// returned with its destination id. Plain failures invoke no callback at all.
 	NewSession(string, string) (string, error)
+	NewSessionWithBoundary(string, string, func(HydrationState, error)) (string, error)
 	NewSessionForProjectPath(string, string) (string, error)
+	NewSessionForProjectPathWithBoundary(string, string, func(HydrationState, error)) (string, error)
 	SessionArchive(string) error
 	SessionDelete(string) error
 	SessionMessagesFor(string) ([]DisplayMessage, error)
 	ApplyTurnActionForSession(string, int, string, bool) (TurnActionResult, error)
+	ApplyTurnActionForSessionWithBoundary(string, int, string, bool, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (TurnActionResult, error)
 	RevertCodeForSession(string, int) (snapshot.RevertResult, error)
-	RevertHistoryForSession(string, int) error
 	SnapshotListForSession(string) ([]Snapshot, error)
 
 	ReadFileContent(string) (string, error)
 	ReadFileContentForProjectPath(string, string) (string, error)
+	ProjectPathForSession(string) (string, error)
 	ProjectName() string
 	ProjectRoot() string
-	ProjectCurrent() ProjectSummary
+	ProjectCurrent() (ProjectSummary, error)
 	ProjectCurrentForPath(string) (ProjectSummary, error)
 	ProjectList() ([]ProjectSummary, error)
 	SessionListForProjectPath(string, string) ([]SessionSummary, error)

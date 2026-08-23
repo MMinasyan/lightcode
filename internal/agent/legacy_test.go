@@ -60,7 +60,16 @@ func (rt *runtime) compactNow(ctx context.Context) error {
 // than accepting input it would then discard. Any queue mutation emits a
 // versioned EventQueueChanged.
 func (a *Agent) Submit(ctx context.Context, content string) (SubmitResult, error) {
-	return a.ensureRuntime().submit(ctx, a.session, content)
+	if !a.store.Active() {
+		// Test-only bootstrap: the deleted ensureSession creating branch used to
+		// open a session on first use. Tests reach Submit with a freshly
+		// constructed agent, so route the bootstrap through the real creation
+		// entry point instead.
+		if _, err := a.NewSession("", "primary"); err != nil {
+			return SubmitResult{}, err
+		}
+	}
+	return a.ensureRuntime().submit(ctx, a.session, content, nil)
 }
 
 // QueueSnapshot returns a versioned copy of the current queue, for adapter
@@ -102,7 +111,7 @@ func (a *Agent) SessionSwitch(id string) error {
 	// fires on every return — including the pre-lock error return below — and
 	// never leaves transitioning stuck true.
 	a.ensureRuntime().beginTransition()
-	defer a.ensureRuntime().endTransition()
+	defer a.endLiveTransition(a.session)
 	if err := a.cancelAndWaitIdle(); err != nil {
 		return err
 	}
@@ -130,7 +139,9 @@ func (a *Agent) SessionSwitch(id string) error {
 	}
 	a.setSessionProject(a.session, proj)
 	delete(a.sessions, oldID)
-	a.setCurrentSessionLocked(a.session)
+	if err := a.setCurrentSessionLocked(a.session); err != nil {
+		return err
+	}
 	meta, err := a.store.Meta()
 	if err == nil && metaState(meta.State) == snapshot.StateArchived {
 		_ = a.store.SetState(snapshot.StateActive)

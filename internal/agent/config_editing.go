@@ -1,15 +1,35 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 )
+
+func decodeJSONUseNumber(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("unexpected trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
 
 // GetProviderConfig returns the merged effective config of a provider and its
 // models for the config editor. Read-only.
@@ -127,14 +147,14 @@ func (a *Agent) bundledModelIDsLocked() map[string]map[string]struct{} {
 
 // discoveryCacheLocked reads the discovery cache (best-effort; empty on error).
 // Caller holds the runtime mutex.
-func (a *Agent) discoveryCacheLocked() map[string]catalog.DiscoveredProvider {
-	cache, _, _ := catalog.ReadDiscoveryCache(a.home)
-	return cache
+func (a *Agent) discoveryCacheLocked() map[string]catalog.DiscoveryRecord {
+	records, _ := catalog.ReadDiscoveryCache(a.home)
+	return records
 }
 
 // classifyModelSource returns a model's provenance. Discovery never adds models
 // to non-bundled providers, so every model under a custom provider is user-added.
-func classifyModelSource(prov *catalog.Provider, modelID string, bundled map[string]map[string]struct{}, disc map[string]catalog.DiscoveredProvider) string {
+func classifyModelSource(prov *catalog.Provider, modelID string, bundled map[string]map[string]struct{}, disc map[string]catalog.DiscoveryRecord) string {
 	if prov == nil || !prov.Builtin {
 		return modelSourceUser
 	}
@@ -143,8 +163,8 @@ func classifyModelSource(prov *catalog.Provider, modelID string, bundled map[str
 			return modelSourceBundled
 		}
 	}
-	if dp, ok := disc[prov.ID]; ok {
-		if _, isDiscovered := dp.Models[modelID]; isDiscovered {
+	if record, ok := disc[prov.ID]; ok && record.BoundTo(prov.Transport) {
+		if _, isDiscovered := record.Models[modelID]; isDiscovered {
 			return modelSourceDiscovered
 		}
 	}
@@ -241,6 +261,10 @@ func applyProviderFields(pm map[string]any, cfg ProviderConfigInput) {
 // connected provider.
 func (a *Agent) DiscoverableModels(providerID string) ([]DiscoveryModelCandidate, error) {
 	a.ensureRuntime().mu.Lock()
+	if a.ensureRuntime().closed {
+		a.ensureRuntime().mu.Unlock()
+		return nil, errOwnerClosed
+	}
 	if a.ensureRuntime().sessionLocked().busy {
 		a.ensureRuntime().mu.Unlock()
 		return nil, fmt.Errorf("cannot discover models while a turn is running")
@@ -322,10 +346,36 @@ func lockedModelFields(cfg ModelConfigInput) error {
 }
 
 // SaveModel adds or edits one model's fields under a provider (user-layer
-// overrides). Used for both editing and "add model".
+// overrides). Used for both editing and "add model". The discovery cache is
+// prepared under runtime.mu, fetched outside it (write-free), and published
+// through one one-attempt Try writer inside the final guarded hold: config
+// first, then discovery outcome, then the locked reload, then warning
+// publication.
 func (a *Agent) SaveModel(providerID, modelID string, cfg ModelConfigInput) error {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
+	plan, err := a.planWarmSettingsEdit()
+	if err != nil {
+		return err
+	}
+	outcomes := a.fetchWarmSettingsEditDiscovery(plan)
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if err := a.saveModelLocked(providerID, modelID, cfg); err != nil {
+		return err
+	}
+	warnings, err := a.publishWarmEditDiscovery(plan, outcomes)
+	if err != nil {
+		return err
+	}
+	if err := a.reloadLocked(); err != nil {
+		return err
+	}
+	a.surfaceCatalogWarnings(warnings)
+	return nil
+}
+
+// saveModelLocked validates and writes a model edit. Caller holds runtime.mu.
+func (a *Agent) saveModelLocked(providerID, modelID string, cfg ModelConfigInput) error {
 	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot edit model while a turn is running")
 	}
@@ -346,20 +396,42 @@ func (a *Agent) SaveModel(providerID, modelID string, cfg ModelConfigInput) erro
 		}
 	}
 	ref := coremodel.ModelRef{Provider: providerID, Model: modelID}
-	if err := a.mutateModelConfig(ref, func(m map[string]any) error {
+	return a.mutateModelConfig(ref, func(m map[string]any) error {
 		applyModelFields(m, cfg)
 		return nil
-	}); err != nil {
-		return err
-	}
-	return a.reloadLocked()
+	})
 }
 
 // DeleteModel removes a user-added model from config. Bundled/discovered models
 // cannot be deleted (the merge would re-add them); hide or reset them instead.
+// The discovery cache is prepared under runtime.mu, fetched outside it
+// (write-free), and published through one one-attempt Try writer inside the
+// final guarded hold.
 func (a *Agent) DeleteModel(providerID, modelID string) error {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
+	plan, err := a.planWarmSettingsEdit()
+	if err != nil {
+		return err
+	}
+	outcomes := a.fetchWarmSettingsEditDiscovery(plan)
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if err := a.deleteModelLocked(providerID, modelID); err != nil {
+		return err
+	}
+	warnings, err := a.publishWarmEditDiscovery(plan, outcomes)
+	if err != nil {
+		return err
+	}
+	if err := a.reloadLocked(); err != nil {
+		return err
+	}
+	a.surfaceCatalogWarnings(warnings)
+	return nil
+}
+
+// deleteModelLocked validates and writes a model deletion. Caller holds runtime.mu.
+func (a *Agent) deleteModelLocked(providerID, modelID string) error {
 	if a.ensureRuntime().sessionLocked().busy {
 		return fmt.Errorf("cannot delete model while a turn is running")
 	}
@@ -368,7 +440,7 @@ func (a *Agent) DeleteModel(providerID, modelID string) error {
 	if a.modelSourceLocked(providerID, modelID) != modelSourceUser {
 		return fmt.Errorf("cannot delete model %q: only user-added models can be removed; hide or reset it instead", modelID)
 	}
-	if err := a.mutateConfigRootLocked(func(root map[string]any) error {
+	return a.mutateConfigRootLocked(func(root map[string]any) error {
 		providers, err := providerRootMap(root)
 		if err != nil {
 			return err
@@ -383,10 +455,7 @@ func (a *Agent) DeleteModel(providerID, modelID string) error {
 		}
 		delete(models, modelID)
 		return nil
-	}); err != nil {
-		return err
-	}
-	return a.reloadLocked()
+	})
 }
 
 var resettableModelFields = map[string]struct{}{
@@ -395,20 +464,50 @@ var resettableModelFields = map[string]struct{}{
 }
 
 // ResetModelField deletes a single user-layer override on a model, reverting it
-// to the bundled/discovery value. No-op (no write) when no override exists.
+// to the bundled/discovery value. No-op (no write) when no override exists. The
+// discovery cache is prepared under runtime.mu, fetched outside it (write-free),
+// and published through one one-attempt Try writer inside the final guarded
+// hold; a no-op reset writes neither config nor discovery state.
 func (a *Agent) ResetModelField(providerID, modelID, field string) error {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
+	plan, err := a.planWarmSettingsEdit()
+	if err != nil {
+		return err
+	}
+	outcomes := a.fetchWarmSettingsEditDiscovery(plan)
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	changed, err := a.resetModelFieldLocked(providerID, modelID, field)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	warnings, err := a.publishWarmEditDiscovery(plan, outcomes)
+	if err != nil {
+		return err
+	}
+	if err := a.reloadLocked(); err != nil {
+		return err
+	}
+	a.surfaceCatalogWarnings(warnings)
+	return nil
+}
+
+// resetModelFieldLocked validates and writes a model field reset, reporting
+// whether the write actually removed an override. Caller holds runtime.mu.
+func (a *Agent) resetModelFieldLocked(providerID, modelID, field string) (bool, error) {
 	if a.ensureRuntime().sessionLocked().busy {
-		return fmt.Errorf("cannot reset model field while a turn is running")
+		return false, fmt.Errorf("cannot reset model field while a turn is running")
 	}
 	if _, ok := resettableModelFields[field]; !ok {
-		return fmt.Errorf("field %q cannot be reset", field)
+		return false, fmt.Errorf("field %q cannot be reset", field)
 	}
 	providerID = strings.TrimSpace(providerID)
 	modelID = strings.TrimSpace(modelID)
 	if field == "context_window" && a.modelSourceLocked(providerID, modelID) == modelSourceUser {
-		return fmt.Errorf("cannot reset context_window for user-added model %q", modelID)
+		return false, fmt.Errorf("cannot reset context_window for user-added model %q", modelID)
 	}
 	changed := false
 	if err := a.mutateModelConfig(coremodel.ModelRef{Provider: providerID, Model: modelID}, func(m map[string]any) error {
@@ -418,48 +517,85 @@ func (a *Agent) ResetModelField(providerID, modelID, field string) error {
 		}
 		return nil
 	}); err != nil {
-		return err
+		return false, err
 	}
-	if !changed {
-		return nil
-	}
-	return a.reloadLocked()
+	return changed, nil
+}
+
+// providerConfigCandidate carries one provider edit through preparation,
+// discovery, and commit. root is a private copy of the full config root with
+// the edit applied but not yet written; nothing is published until commit.
+type providerConfigCandidate struct {
+	providerID string
+	root       map[string]any
+	transport  catalog.Transport
 }
 
 // SetProviderConfig edits an existing provider's transport and provider-level
-// fields (user-layer overrides). The API key value is never written here.
+// fields (user-layer overrides). The API key value is never written here. The
+// edit runs through the candidate path: preparation applies the edit to a
+// private config root under a short runtime lock hold, live discovery fetches
+// the candidate transport outside the lock, and commit rechecks the owner
+// state and atomically publishes the root and any discovery result under a
+// final hold. No HTTP runs under runtime.mu.
 func (a *Agent) SetProviderConfig(providerID string, cfg ProviderConfigInput) error {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().sessionLocked().busy {
-		return fmt.Errorf("cannot edit provider while a turn is running")
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	candidate, err := a.prepareSetProviderConfigLocked(providerID, cfg)
+	rt.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	attempted, discovered, warnings, err := a.discoverProviderCandidate(&candidate)
+	if err != nil {
+		return err
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return a.commitProviderConfigCandidateLocked(candidate, attempted, discovered, warnings)
+}
+
+// prepareSetProviderConfigLocked validates a provider edit against the live
+// catalog and applies it to a private copy of the config root without writing
+// anything. Caller holds runtime.mu; the returned candidate's root carries the
+// applied edit for the discovery and commit phases.
+func (a *Agent) prepareSetProviderConfigLocked(providerID string, cfg ProviderConfigInput) (providerConfigCandidate, error) {
+	rt := a.ensureRuntime()
+	if rt.closed {
+		return providerConfigCandidate{}, errOwnerClosed
+	}
+	if rt.sessionLocked().busy {
+		return providerConfigCandidate{}, fmt.Errorf("cannot edit provider while a turn is running")
+	}
+	if rt.sessionLocked().transitioning {
+		return providerConfigCandidate{}, fmt.Errorf("session is changing; retry")
 	}
 	providerID = strings.TrimSpace(providerID)
 	if providerID == "" {
-		return fmt.Errorf("provider id is required")
+		return providerConfigCandidate{}, fmt.Errorf("provider id is required")
 	}
 	prov := a.catalog.Providers[providerID]
 	if prov == nil {
-		return fmt.Errorf("provider %q not found", providerID)
+		return providerConfigCandidate{}, fmt.Errorf("provider %q not found", providerID)
 	}
 	// Built-in providers lock their identity/protocol fields.
 	if prov.Builtin {
 		if err := lockedProviderFields(cfg); err != nil {
-			return err
+			return providerConfigCandidate{}, err
 		}
 	}
 	if len(cfg.Headers) != 0 {
 		if err := validateCustomHeaders(cfg.Headers); err != nil {
-			return err
+			return providerConfigCandidate{}, err
 		}
 	}
 	newEnv := strings.TrimSpace(cfg.APIKeyEnv)
 	if newEnv != "" && newEnv != prov.Transport.APIKeyEnv {
 		if providerConnected(prov) {
-			return fmt.Errorf("disconnect provider %q before changing its API key variable", providerID)
+			return providerConfigCandidate{}, fmt.Errorf("disconnect provider %q before changing its API key variable", providerID)
 		}
 		if a.apiKeyEnvInUseLocked(newEnv, providerID) {
-			return fmt.Errorf("API key variable %q is already used by another provider", newEnv)
+			return providerConfigCandidate{}, fmt.Errorf("API key variable %q is already used by another provider", newEnv)
 		}
 	}
 	// Headers are written wholesale so removals/clears take effect (not just
@@ -473,16 +609,229 @@ func (a *Agent) SetProviderConfig(providerID string, cfg ProviderConfigInput) er
 		}
 		cfg.Headers = nil
 	}
-	if err := a.mutateProviderConfig(providerID, func(pm map[string]any) error {
+	data, err := os.ReadFile(a.configPath)
+	if err != nil {
+		return providerConfigCandidate{}, err
+	}
+	var root map[string]any
+	if err := decodeJSONUseNumber(data, &root); err != nil {
+		return providerConfigCandidate{}, fmt.Errorf("parse config %s: %w", a.configPath, err)
+	}
+	if err := mutateProviderConfigRoot(root, providerID, func(pm map[string]any) error {
 		applyProviderFields(pm, cfg)
 		if headersProvided {
 			writeTransportHeaders(pm, cleaned)
 		}
 		return nil
 	}); err != nil {
+		return providerConfigCandidate{}, err
+	}
+	// Normalize the candidate root through a JSON round trip, mirroring the
+	// write-then-reload the warm path performs: in-memory mutation injects
+	// Go-native shapes (map[string]string headers, *bool toggles) that the
+	// catalog builder and the committed file expect in JSON shape.
+	normalized, err := json.Marshal(root)
+	if err != nil {
+		return providerConfigCandidate{}, err
+	}
+	if err := decodeJSONUseNumber(normalized, &root); err != nil {
+		return providerConfigCandidate{}, err
+	}
+	if !prov.Builtin {
+		providers, _ := root["providers"].(map[string]any)
+		pm, _ := providers[providerID].(map[string]any)
+		if err := validateRawProviderConfig(providerID, pm); err != nil {
+			return providerConfigCandidate{}, err
+		}
+	}
+	return providerConfigCandidate{providerID: providerID, root: root}, nil
+}
+
+// mutateProviderConfigRoot navigates to the specified provider map inside an
+// in-memory config root and calls mutate on it, without reading or writing any
+// file. It mirrors the read-modify half of mutateProviderConfig for the
+// candidate path.
+func mutateProviderConfigRoot(root map[string]any, providerID string, mutate func(providerMap map[string]any) error) error {
+	if root == nil {
+		root = map[string]any{}
+	}
+	providers, ok := root["providers"].(map[string]any)
+	if !ok {
+		providers = map[string]any{}
+		root["providers"] = providers
+	}
+	providerRaw, ok := providers[providerID]
+	if !ok {
+		providerRaw = map[string]any{}
+		providers[providerID] = providerRaw
+	}
+	providerMap, ok := providerRaw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("providers.%s must be an object", providerID)
+	}
+	return mutate(providerMap)
+}
+
+// discoverProviderCandidate runs the candidate edit's live discovery outside
+// runtime.mu. It builds an offline catalog from the candidate's provider map,
+// refuses when the edited provider is unavailable after the edit, and — only
+// when the candidate provider is connected, discovery-enabled, and due —
+// fetches /models through the candidate transport. Fetch performs no config,
+// attempt, cache, or owner-state write; the caller publishes those under the
+// final lock hold.
+func (a *Agent) discoverProviderCandidate(candidate *providerConfigCandidate) (attempted bool, discovered *catalog.DiscoveredProvider, warnings []catalog.Warning, err error) {
+	providers, ok := candidate.root["providers"].(map[string]any)
+	if !ok {
+		return false, nil, nil, fmt.Errorf("provider %q is unavailable after edit", candidate.providerID)
+	}
+	buildResult, err := catalog.BuildOffline(a.home, providers)
+	if err != nil {
+		return false, nil, nil, err
+	}
+	prov := buildResult.Catalog.Providers[candidate.providerID]
+	if prov == nil {
+		return false, nil, nil, fmt.Errorf("provider %q is unavailable after edit", candidate.providerID)
+	}
+	candidate.transport = prov.Transport
+	if !catalog.DiscoveryTransportReady(prov, func(name string) bool { return os.Getenv(name) != "" }) {
+		return false, nil, nil, nil
+	}
+	records, _ := catalog.ReadDiscoveryCache(a.home)
+	now := time.Now().UTC()
+	due := false
+	for _, id := range catalog.DiscoveryRefreshCandidates(buildResult.Catalog, records, now) {
+		if id == candidate.providerID {
+			due = true
+			break
+		}
+	}
+	if !due {
+		return false, nil, nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), discoveryTimeout)
+	defer cancel()
+	discoveredProvider, err := catalog.FetchDiscovery(ctx, discoveryHTTPClient, prov)
+	if err != nil {
+		return true, nil, []catalog.Warning{{Kind: "discovery_failure", Provider: candidate.providerID, Message: err.Error()}}, nil
+	}
+	return true, &discoveredProvider, nil, nil
+}
+
+// commitProviderConfigCandidateLocked atomically publishes a prepared provider
+// edit under the final runtime lock hold. It rechecks close, busy,
+// transitioning, and the connected-provider api_key_env guard before writing
+// anything; a refusal discards the fetched data. On success it writes the
+// candidate root, then records the discovery outcome (a successful fetch
+// writes the cache with both fetched and attempted time; a failed fetch writes
+// only the attempt), reloads without refresh, and appends the candidate
+// warnings to the catalog warning group. No HTTP runs under runtime.mu.
+func (a *Agent) commitProviderConfigCandidateLocked(candidate providerConfigCandidate, attempted bool, discovered *catalog.DiscoveredProvider, warnings []catalog.Warning) error {
+	rt := a.ensureRuntime()
+	if rt.closed {
+		return errOwnerClosed
+	}
+	if rt.sessionLocked().busy {
+		return fmt.Errorf("cannot edit provider while a turn is running")
+	}
+	if rt.sessionLocked().transitioning {
+		return fmt.Errorf("session is changing; retry")
+	}
+	// Recheck the api_key_env guard against the currently persisted raw
+	// override: preparation validated the edit against the live catalog, but a
+	// concurrent connect or reset may have changed the persisted override
+	// (including deleting it) and made the live provider connected in the
+	// meantime. The refusal must land before any config or cache write. The
+	// comparison is raw override vs raw override, so unrelated edits on
+	// providers that only inherit a bundled env name are not blocked.
+	// Concurrent complete config edits are not compared byte-wise; the whole
+	// candidate root is written atomically and the commit landing last wins.
+	prov := a.catalog.Providers[candidate.providerID]
+	if prov == nil {
+		return fmt.Errorf("provider %q not found", candidate.providerID)
+	}
+	candidateEnv := ""
+	if providers, ok := candidate.root["providers"].(map[string]any); ok {
+		if pm, ok := providers[candidate.providerID].(map[string]any); ok {
+			if tr, ok := pm["transport"].(map[string]any); ok {
+				candidateEnv, _ = tr["api_key_env"].(string)
+			}
+		}
+	}
+	data, err := os.ReadFile(a.configPath)
+	if err != nil {
+		return fmt.Errorf("read current config %s: %w", a.configPath, err)
+	}
+	var persistedRoot map[string]any
+	if err := decodeJSONUseNumber(data, &persistedRoot); err != nil {
+		return fmt.Errorf("parse current config %s: %w", a.configPath, err)
+	}
+	persistedProviders, ok := persistedRoot["providers"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("provider %q is unavailable in current config", candidate.providerID)
+	}
+	persistedProvider, ok := persistedProviders[candidate.providerID].(map[string]any)
+	if !ok {
+		return fmt.Errorf("provider %q is unavailable in current config", candidate.providerID)
+	}
+	persistedEnv := ""
+	if tr, ok := persistedProvider["transport"].(map[string]any); ok {
+		persistedEnv, _ = tr["api_key_env"].(string)
+	}
+	if candidateEnv != persistedEnv {
+		if providerConnected(prov) {
+			return fmt.Errorf("disconnect provider %q before changing its API key variable", candidate.providerID)
+		}
+		if candidateEnv != "" && a.apiKeyEnvInUseLocked(candidateEnv, candidate.providerID) {
+			return fmt.Errorf("API key variable %q is already used by another provider", candidateEnv)
+		}
+	}
+	if err := a.writeAgentConfigLocked(candidate.root); err != nil {
 		return err
 	}
-	return a.reloadLocked()
+	warnings, err = a.publishDiscoveryOutcomeLocked(candidate.providerID, candidate.transport, attempted, discovered, warnings)
+	if err != nil {
+		return err
+	}
+	if err := a.reloadLockedNoRefresh(); err != nil {
+		return err
+	}
+	a.surfaceCatalogWarnings(warnings)
+	return nil
+}
+
+// publishDiscoveryOutcomeLocked publishes one discovery fetch outcome through
+// the owner's guarded discovery sink. The sink itself enforces the final
+// owner-open authority immediately before its single one-attempt Try
+// attempt/cache publication, so a close-first caller can never publish through
+// it even when a caller-local guard is missed. A successful fetch writes the
+// cache, a failed fetch writes only the attempt marker. Contention or write
+// failure produces a discovery_failure warning and leaves discovery due;
+// nothing blocks on a foreign discovery-lock holder. Caller holds runtime.mu.
+func (a *Agent) publishDiscoveryOutcomeLocked(providerID string, transport catalog.Transport, attempted bool, discovered *catalog.DiscoveredProvider, warnings []catalog.Warning) ([]catalog.Warning, error) {
+	if !attempted {
+		return warnings, nil
+	}
+	if err := a.requireOwnerOpenLocked(); err != nil {
+		return warnings, err
+	}
+	if discovered != nil {
+		ok, err := catalog.TryWriteDiscoveryCache(a.home, providerID, transport, *discovered, time.Now().UTC())
+		if err != nil {
+			return append(warnings, catalog.Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)}), nil
+		}
+		if !ok {
+			return append(warnings, catalog.Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("discovery lock is held for %q; cache write skipped", providerID)}), nil
+		}
+		return warnings, nil
+	}
+	ok, err := catalog.TryWriteDiscoveryAttempt(a.home, providerID, transport, time.Now().UTC())
+	if err != nil {
+		return append(warnings, catalog.Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery attempt: %v", err)}), nil
+	}
+	if !ok {
+		return append(warnings, catalog.Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("discovery lock is held for %q; attempt write skipped", providerID)}), nil
+	}
+	return warnings, nil
 }
 
 func stripBundledHeaderKeys(headers map[string]string, providerID string) map[string]string {
@@ -528,18 +877,141 @@ var transportFields = map[string]struct{}{
 
 // ResetProviderField deletes a single user-layer override on a provider,
 // reverting it to the bundled value. No-op (no write) when no override exists.
+// Transport-field resets run through the candidate path (preparation applies
+// the reset to a private config root, live discovery fetches the candidate
+// transport outside the lock, and commit rechecks owner state before
+// publishing); other fields keep the warm discovery path.
 func (a *Agent) ResetProviderField(providerID, field string) error {
-	a.ensureRuntime().mu.Lock()
-	defer a.ensureRuntime().mu.Unlock()
-	if a.ensureRuntime().sessionLocked().busy {
-		return fmt.Errorf("cannot reset provider field while a turn is running")
+	if _, isTransport := transportFields[field]; !isTransport {
+		plan, err := a.planWarmSettingsEdit()
+		if err != nil {
+			return err
+		}
+		outcomes := a.fetchWarmSettingsEditDiscovery(plan)
+		rt := a.ensureRuntime()
+		rt.mu.Lock()
+		defer rt.mu.Unlock()
+		changed, err := a.resetProviderFieldLocked(providerID, field)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return nil
+		}
+		warnings, err := a.publishWarmEditDiscovery(plan, outcomes)
+		if err != nil {
+			return err
+		}
+		if err := a.reloadLocked(); err != nil {
+			return err
+		}
+		a.surfaceCatalogWarnings(warnings)
+		return nil
+	}
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	candidate, changed, err := a.prepareResetProviderFieldLocked(providerID, field)
+	rt.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	attempted, discovered, warnings, err := a.discoverProviderCandidate(&candidate)
+	if err != nil {
+		return err
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return a.commitProviderConfigCandidateLocked(candidate, attempted, discovered, warnings)
+}
+
+// prepareResetProviderFieldLocked applies a transport-field provider reset to
+// a private copy of the config root without writing anything, reporting
+// whether the reset actually removed an override. Caller holds runtime.mu. A
+// no-op reset (no override present) returns changed=false so the caller can
+// skip discovery and commit entirely.
+func (a *Agent) prepareResetProviderFieldLocked(providerID, field string) (providerConfigCandidate, bool, error) {
+	rt := a.ensureRuntime()
+	if rt.closed {
+		return providerConfigCandidate{}, false, errOwnerClosed
+	}
+	if rt.sessionLocked().busy {
+		return providerConfigCandidate{}, false, fmt.Errorf("cannot reset provider field while a turn is running")
+	}
+	if rt.sessionLocked().transitioning {
+		return providerConfigCandidate{}, false, fmt.Errorf("session is changing; retry")
 	}
 	if _, ok := resettableProviderFields[field]; !ok {
-		return fmt.Errorf("field %q cannot be reset", field)
+		return providerConfigCandidate{}, false, fmt.Errorf("field %q cannot be reset", field)
 	}
 	if field == "api_key_env" {
 		if prov := a.catalog.Providers[providerID]; prov != nil && providerConnected(prov) {
-			return fmt.Errorf("disconnect provider %q before resetting its API key variable", providerID)
+			return providerConfigCandidate{}, false, fmt.Errorf("disconnect provider %q before resetting its API key variable", providerID)
+		}
+	}
+	_, isTransport := transportFields[field]
+	data, err := os.ReadFile(a.configPath)
+	if err != nil {
+		return providerConfigCandidate{}, false, err
+	}
+	var root map[string]any
+	if err := decodeJSONUseNumber(data, &root); err != nil {
+		return providerConfigCandidate{}, false, fmt.Errorf("parse config %s: %w", a.configPath, err)
+	}
+	changed := false
+	if err := mutateProviderConfigRoot(root, providerID, func(pm map[string]any) error {
+		target := pm
+		if isTransport {
+			transport, ok := pm["transport"].(map[string]any)
+			if !ok {
+				return nil
+			}
+			target = transport
+		}
+		if _, present := target[field]; present {
+			delete(target, field)
+			changed = true
+		}
+		return nil
+	}); err != nil {
+		return providerConfigCandidate{}, false, err
+	}
+	// Normalize the candidate root through a JSON round trip, mirroring the
+	// write-then-reload the warm path performs (see
+	// prepareSetProviderConfigLocked).
+	normalized, err := json.Marshal(root)
+	if err != nil {
+		return providerConfigCandidate{}, false, err
+	}
+	if err := decodeJSONUseNumber(normalized, &root); err != nil {
+		return providerConfigCandidate{}, false, err
+	}
+	if prov := a.catalog.Providers[providerID]; prov != nil && !prov.Builtin {
+		providers, _ := root["providers"].(map[string]any)
+		pm, _ := providers[providerID].(map[string]any)
+		if err := validateRawProviderConfig(providerID, pm); err != nil {
+			return providerConfigCandidate{}, false, err
+		}
+	}
+	return providerConfigCandidate{providerID: providerID, root: root}, changed, nil
+}
+
+// resetProviderFieldLocked validates and writes a non-transport provider field
+// reset, reporting whether the write actually removed an override. Caller
+// holds runtime.mu. Transport-field resets go through the candidate path
+// instead (prepareResetProviderFieldLocked).
+func (a *Agent) resetProviderFieldLocked(providerID, field string) (bool, error) {
+	if a.ensureRuntime().sessionLocked().busy {
+		return false, fmt.Errorf("cannot reset provider field while a turn is running")
+	}
+	if _, ok := resettableProviderFields[field]; !ok {
+		return false, fmt.Errorf("field %q cannot be reset", field)
+	}
+	if field == "api_key_env" {
+		if prov := a.catalog.Providers[providerID]; prov != nil && providerConnected(prov) {
+			return false, fmt.Errorf("disconnect provider %q before resetting its API key variable", providerID)
 		}
 	}
 	_, isTransport := transportFields[field]
@@ -559,10 +1031,86 @@ func (a *Agent) ResetProviderField(providerID, field string) error {
 		}
 		return nil
 	}); err != nil {
-		return err
+		return false, err
 	}
-	if !changed {
-		return nil
+	return changed, nil
+}
+
+// warmEditPlan is the set of discovery providers one settings edit will fetch
+// outside the lock and publish under its final guarded hold.
+type warmEditPlan struct {
+	providers []*catalog.Provider
+}
+
+// warmEditOutcome is one planned provider's fetch-only result, carried into
+// the final guarded hold.
+type warmEditOutcome struct {
+	attempted  bool
+	discovered *catalog.DiscoveredProvider
+	warnings   []catalog.Warning
+	transport  catalog.Transport
+}
+
+// planWarmSettingsEdit runs the first phase of a settings edit's
+// discovery: under runtime.mu it builds the same no-refresh catalog the locked
+// reload starts from and works out which providers that reload would fetch
+// discovery for. Nothing is written here.
+func (a *Agent) planWarmSettingsEdit() (warmEditPlan, error) {
+	rt := a.ensureRuntime()
+	rt.mu.Lock()
+	modelCatalog, _, err := a.loadCatalogLocked(false)
+	if err != nil {
+		rt.mu.Unlock()
+		return warmEditPlan{}, err
 	}
-	return a.reloadLocked()
+	records, _ := catalog.ReadDiscoveryCache(a.home)
+	now := time.Now().UTC()
+	var providers []*catalog.Provider
+	for _, providerID := range catalog.DiscoveryRefreshCandidates(modelCatalog, records, now) {
+		prov := modelCatalog.Providers[providerID]
+		if prov == nil || !catalog.DiscoveryTransportReady(prov, func(name string) bool { return os.Getenv(name) != "" }) {
+			continue
+		}
+		providers = append(providers, prov)
+	}
+	rt.mu.Unlock()
+	return warmEditPlan{providers: providers}, nil
+}
+
+// fetchWarmSettingsEditDiscovery runs the plan's fetch-only core outside
+// runtime.mu: per provider, FetchDiscoveryIfDue performs readiness, the
+// recent-attempt check, and the bounded network fetch, writing nothing.
+func (a *Agent) fetchWarmSettingsEditDiscovery(plan warmEditPlan) map[string]warmEditOutcome {
+	outcomes := make(map[string]warmEditOutcome, len(plan.providers))
+	for _, prov := range plan.providers {
+		attempted, discovered, warnings := catalog.FetchDiscoveryIfDue(context.Background(), a.home, prov, time.Now().UTC())
+		outcomes[prov.ID] = warmEditOutcome{attempted: attempted, discovered: discovered, warnings: warnings, transport: prov.Transport}
+	}
+	return outcomes
+}
+
+// publishWarmEditDiscovery publishes each planned provider's fetch outcome
+// through the owner's guarded discovery sink inside the edit's final guarded
+// hold. It returns the combined warnings; contention leaves the provider due.
+func (a *Agent) publishWarmEditDiscovery(plan warmEditPlan, outcomes map[string]warmEditOutcome) ([]catalog.Warning, error) {
+	var warnings []catalog.Warning
+	for _, prov := range plan.providers {
+		outcome := outcomes[prov.ID]
+		warnings = append(warnings, outcome.warnings...)
+		var err error
+		warnings, err = a.publishDiscoveryOutcomeLocked(prov.ID, outcome.transport, outcome.attempted, outcome.discovered, warnings)
+		if err != nil {
+			return warnings, err
+		}
+	}
+	return warnings, nil
+}
+
+// surfaceCatalogWarnings appends a settings edit's warm-phase discovery
+// refresh warnings to the catalog warning group, next to the locked reload's
+// own warnings.
+func (a *Agent) surfaceCatalogWarnings(warnings []catalog.Warning) {
+	for _, w := range catalogWarningsToPromptWarnings(warnings) {
+		a.addWarning("catalog", w)
+	}
 }

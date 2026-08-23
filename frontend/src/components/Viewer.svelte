@@ -3,6 +3,7 @@
   import { settings } from '../lib/settings.js';
   import EditPreview from './EditPreview.svelte';
   import ToolCall from './ToolCall.svelte';
+  export let viewerOwner = null;
 </script>
 
 {#if $viewer}
@@ -20,9 +21,9 @@
           {:else if msg.type === 'user'}
             <div class="sa-user">{msg.content}</div>
           {:else if msg.type === 'tool'}
-            <ToolCall name={msg.name} args={msg.args} result={msg.result} success={msg.success} done={msg.done} metadata={msg.metadata} subagentSessionIds={msg.subagentSessionIds || []} />
+            <ToolCall name={msg.name} args={msg.args} result={msg.result} success={msg.success} done={msg.done} metadata={msg.metadata} subagentSessionIds={msg.subagentSessionIds || []} {viewerOwner} />
           {:else if msg.type === 'background_process'}
-            <ToolCall name="background_process" args={JSON.stringify(msg.backgroundProcess || {})} result={msg.result || ''} success={msg.success !== false} done={true} />
+            <ToolCall name="background_process" args={JSON.stringify(msg.backgroundProcess || {})} result={msg.result || ''} success={msg.success !== false} done={true} {viewerOwner} />
           {:else if msg.type === 'system'}
             <div class="sa-system">{msg.content}</div>
           {:else if msg.type === 'error'}

@@ -9,51 +9,18 @@ import (
 	"github.com/MMinasyan/lightcode/internal/adaptation"
 )
 
-// Bullet 1: AssembleFor(nil) is byte-identical to Assemble() and shares the
-// baseline Rebuilt cadence.
-func TestAssembleForNilMatchesAssemble(t *testing.T) {
-	home := t.TempDir()
-	projectRoot := t.TempDir()
-	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("some user rules"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	a1 := New(projectRoot, home)
-	a2 := New(projectRoot, home)
-	a2.sessionStart = a1.sessionStart // pin time so the environment block matches
-
-	base := a1.Assemble()
-	nilRes := a2.AssembleFor(nil)
-	if base.Prompt != nilRes.Prompt {
-		t.Fatalf("AssembleFor(nil) prompt != Assemble() prompt\n--- Assemble ---\n%s\n--- AssembleFor(nil) ---\n%s", base.Prompt, nilRes.Prompt)
-	}
-	if !base.Rebuilt || !nilRes.Rebuilt {
-		t.Fatalf("first build Rebuilt: Assemble=%v AssembleFor(nil)=%v, want both true", base.Rebuilt, nilRes.Rebuilt)
-	}
-	// Cadence: a second baseline assemble is a cache hit.
-	if second := a2.AssembleFor(nil); second.Rebuilt {
-		t.Fatal("second AssembleFor(nil) Rebuilt=true, want cached false")
-	}
-}
-
-// A named adaptation with no additions produces the same section region as
-// baseline; the only difference is the cache key, so it rebuilds once.
+// A named adaptation with no additions produces the same prompt as baseline;
+// only the presence of additions/blocks changes the output.
 func TestAssembleForNoAdditionsMatchesBaseline(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := t.TempDir()
 	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("some user rules"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	a1 := New(projectRoot, home)
-	a2 := New(projectRoot, home)
-	a2.sessionStart = a1.sessionStart
-
-	base := a1.Assemble()
-	adapt := a2.AssembleFor(&adaptation.Adaptation{Name: "no-additions"})
-	if base.Prompt != adapt.Prompt {
-		t.Fatalf("adaptation with no additions changed the prompt\n--- baseline ---\n%s\n--- adaptation ---\n%s", base.Prompt, adapt.Prompt)
-	}
-	if !base.Rebuilt || !adapt.Rebuilt {
-		t.Fatalf("first build Rebuilt: baseline=%v adaptation=%v, want both true", base.Rebuilt, adapt.Rebuilt)
+	base := assembleFull(projectRoot, home, nil).Prompt
+	adapt := assembleFull(projectRoot, home, &adaptation.Adaptation{Name: "no-additions"}).Prompt
+	if base != adapt {
+		t.Fatalf("adaptation with no additions changed the prompt\n--- baseline ---\n%s\n--- adaptation ---\n%s", base, adapt)
 	}
 }
 
@@ -67,9 +34,7 @@ func TestAssembleForInsertsBlocksAfterSectionsBeforeRules(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_USER_RULES_MARKER"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	a := New(projectRoot, home)
-	res := a.AssembleFor(&adaptation.Adaptation{Name: "fix", Blocks: []string{"COACHING_BLOCK_MARKER"}})
-	prompt := res.Prompt
+	prompt := assembleFull(projectRoot, home, &adaptation.Adaptation{Name: "fix", Blocks: []string{"COACHING_BLOCK_MARKER"}}).Prompt
 
 	idxLanguage := strings.Index(prompt, strings.TrimSpace(languageSection)) // last overridable section
 	idxBlock := strings.Index(prompt, "COACHING_BLOCK_MARKER")
@@ -93,38 +58,6 @@ func TestAssembleForInsertsBlocksAfterSectionsBeforeRules(t *testing.T) {
 	}
 }
 
-// Bullet 3: the cache key is (rules hash, adaptation name) — both must be unchanged
-// for a hit; either changing forces a rebuild.
-func TestAssembleForCacheKeyMatrix(t *testing.T) {
-	home := t.TempDir()
-	projectRoot := t.TempDir()
-	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("rules v1"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	a := New(projectRoot, home)
-	fix := &adaptation.Adaptation{Name: "fix"}
-	other := &adaptation.Adaptation{Name: "other"}
-
-	if r := a.AssembleFor(fix); !r.Rebuilt {
-		t.Fatal("first AssembleFor(fix) Rebuilt=false, want true")
-	}
-	if r := a.AssembleFor(fix); r.Rebuilt {
-		t.Fatal("same (rules, name) Rebuilt=true, want cached false")
-	}
-	if r := a.AssembleFor(other); !r.Rebuilt {
-		t.Fatal("name change with identical rules Rebuilt=false, want true")
-	}
-	if r := a.AssembleFor(other); r.Rebuilt {
-		t.Fatal("same (rules, name) after name change Rebuilt=true, want false")
-	}
-	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("rules v2"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if r := a.AssembleFor(other); !r.Rebuilt {
-		t.Fatal("rules change with identical name Rebuilt=false, want true")
-	}
-}
-
 // Section additions: an adaptation with Additions but no Blocks renders each
 // addition immediately after its section main and before the next section.
 func TestAssembleForRendersSectionAddition(t *testing.T) {
@@ -133,12 +66,11 @@ func TestAssembleForRendersSectionAddition(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_USER_RULES_MARKER"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	a := New(projectRoot, home)
 	adapt := &adaptation.Adaptation{
 		Name:      "additions",
 		Additions: map[string]string{"tone": "TONE_ADDITION_MARKER"},
 	}
-	prompt := a.AssembleFor(adapt).Prompt
+	prompt := assembleFull(projectRoot, home, adapt).Prompt
 
 	idxToneMain := strings.Index(prompt, strings.TrimSpace(toneSection))
 	idxToneAdd := strings.Index(prompt, "TONE_ADDITION_MARKER")
@@ -161,12 +93,11 @@ func TestAssembleForAdditionRendersUnderUserOverride(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("# tone\n\nUSER_TONE_RULES_MARKER"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	a := New(projectRoot, home)
 	adapt := &adaptation.Adaptation{
 		Name:      "additions",
 		Additions: map[string]string{"tone": "TONE_ADDITION_MARKER"},
 	}
-	prompt := a.AssembleFor(adapt).Prompt
+	prompt := assembleFull(projectRoot, home, adapt).Prompt
 
 	if strings.Contains(prompt, strings.TrimSpace(toneSection)) {
 		t.Fatal("user override did not suppress the tone main")
@@ -191,13 +122,12 @@ func TestAssembleForAdditionPerSection(t *testing.T) {
 
 	for _, name := range overridableOrder {
 		t.Run(name, func(t *testing.T) {
-			a := New(projectRoot, home)
 			marker := strings.ToUpper(name) + "_ADDITION_MARKER"
 			adapt := &adaptation.Adaptation{
 				Name:      "per-section",
 				Additions: map[string]string{name: marker},
 			}
-			prompt := a.AssembleFor(adapt).Prompt
+			prompt := assembleFull(projectRoot, home, adapt).Prompt
 			if !strings.Contains(prompt, marker) {
 				t.Fatalf("addition for %q missing from prompt", name)
 			}
@@ -210,23 +140,5 @@ func TestAssembleForAdditionPerSection(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// Bullet 3 (continued): an empty adaptation name shares the baseline rules-only key,
-// so nil / Name:"" / Assemble() are mutually cache-compatible.
-func TestAssembleForEmptyNameSharesBaselineKey(t *testing.T) {
-	home := t.TempDir()
-	projectRoot := t.TempDir()
-	a := New(projectRoot, home)
-
-	if r := a.AssembleFor(nil); !r.Rebuilt {
-		t.Fatal("first AssembleFor(nil) Rebuilt=false, want true")
-	}
-	if r := a.Assemble(); r.Rebuilt {
-		t.Fatal("Assemble() after AssembleFor(nil) Rebuilt=true, want cached false")
-	}
-	if r := a.AssembleFor(&adaptation.Adaptation{Name: ""}); r.Rebuilt {
-		t.Fatal("AssembleFor(empty name) Rebuilt=true, want cached false (shares baseline key)")
 	}
 }

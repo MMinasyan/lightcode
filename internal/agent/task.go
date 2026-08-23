@@ -10,7 +10,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/adaptation"
 	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/cmdoutput"
 	"github.com/MMinasyan/lightcode/internal/config"
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
@@ -51,6 +50,11 @@ type taskTool struct {
 	parentTracker *tool.FileTracker
 	maxConcurrent int
 	taggedEvents  chan<- TaggedLoopEvent
+	// rt carries what a child session's transcript lifecycle needs — its
+	// registry entry, the flush channel, and the owner context — so a child is
+	// registered when its store is created, committed and removed when its run
+	// finishes. Nil in task-tool-only unit tests, which never run a child.
+	rt *runtime
 
 	mu           sync.Mutex
 	modelCatalog *catalog.Catalog
@@ -64,6 +68,7 @@ type taskTool struct {
 	procMgr       *process.Manager
 	memoryStore   *memory.Store
 	projectID     string
+	projectsRoot  string
 	memoriesDir   string
 	lspManager    *lsp.Manager
 	check         tool.CheckFunc
@@ -80,6 +85,7 @@ type taskToolConfig struct {
 	ParentTracker *tool.FileTracker
 	MaxConcurrent int
 	TaggedEvents  chan<- TaggedLoopEvent
+	Runtime       *runtime
 
 	ModelCatalog *catalog.Catalog
 
@@ -91,6 +97,7 @@ type taskToolConfig struct {
 	ProcMgr       *process.Manager
 	MemoryStore   *memory.Store
 	ProjectID     string
+	ProjectsRoot  string
 	MemoriesDir   string
 	LSPManager    *lsp.Manager
 	Check         tool.CheckFunc
@@ -109,6 +116,7 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		parentTracker: cfg.ParentTracker,
 		maxConcurrent: cfg.MaxConcurrent,
 		taggedEvents:  cfg.TaggedEvents,
+		rt:            cfg.Runtime,
 		modelCatalog:  cfg.ModelCatalog,
 		resolveAdapt:  cfg.ResolveAdapt,
 		toolsConfig:   cfg.ToolsConfig,
@@ -117,6 +125,7 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		procMgr:       cfg.ProcMgr,
 		memoryStore:   cfg.MemoryStore,
 		projectID:     cfg.ProjectID,
+		projectsRoot:  cfg.ProjectsRoot,
 		memoriesDir:   cfg.MemoriesDir,
 		lspManager:    cfg.LSPManager,
 		check:         cfg.Check,
@@ -225,8 +234,38 @@ func (t *taskTool) Execute(ctx context.Context, params map[string]any) (string, 
 		wg.Add(1)
 		go func(idx int, td taskDef) {
 			defer wg.Done()
-			sem <- struct{}{}
+			// Cancellation-before-acquire creates nothing: a waiter that loses
+			// the semaphore race to the turn's cancellation returns a
+			// cancelled task result without minting a child.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				results[idx] = taskResult{index: idx, err: ctx.Err()}
+				return
+			}
 			defer func() { <-sem }()
+			// Post-acquire admission: the owner may have closed or the context
+			// been cancelled while this waiter waited. Both are read once
+			// under rt.mu; the semaphore is released and the waiter returns
+			// without running if either fails. Success after this check is
+			// operation-first — a later cancellation may retain an interrupted
+			// child, never a child minted after the failed check.
+			if t.rt != nil {
+				t.rt.mu.Lock()
+				closed := t.rt.closed
+				ctxErr := ctx.Err()
+				t.rt.mu.Unlock()
+				if closed || ctxErr != nil {
+					if ctxErr == nil {
+						ctxErr = errOwnerClosed
+					}
+					results[idx] = taskResult{index: idx, err: ctxErr}
+					return
+				}
+			} else if ctxErr := ctx.Err(); ctxErr != nil {
+				results[idx] = taskResult{index: idx, err: ctxErr}
+				return
+			}
 			results[idx] = t.runSubagent(ctx, idx, td, toolCallID)
 		}(i, task)
 	}
@@ -367,20 +406,24 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		return taskResult{index: index, err: fmt.Errorf("subagent: parent turn is not active")}
 	}
 
-	childStore, err := snapshot.NewForSessionsRoot(t.parentStore.Root(), "", "")
+	childStore, err := snapshot.NewForSessionsRoot(t.parentStore.Root(), t.projectsRoot, t.projectID)
 	if err != nil {
 		return taskResult{index: index, err: err}
 	}
 	if err := childStore.BeginChildSession(t.workspaceRoot, parentSessionID); err != nil {
 		return taskResult{index: index, err: err}
 	}
-	defer func() {
-		_, _ = childStore.Close()
-	}()
+	defer closeStoreDeferred(childStore, "subagent")
 	if err := childStore.SetModel(ref.Provider, ref.Model); err != nil {
 		return taskResult{index: index, err: err}
 	}
 	sessionID := childStore.SessionID()
+	// A child is live from the moment its store exists: register its transcript
+	// entry before the forwarder starts, so every dispatched child event finds
+	// its coordinator. The entry is removed in the same closure that commits.
+	if t.rt != nil {
+		t.rt.registerTranscript(sessionID, childStore)
+	}
 
 	scope := parentMutationScope{
 		store:         t.parentStore,
@@ -390,15 +433,20 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 	}
 
 	var lp *loop.Loop
-	childProcMgr := t.newChildProcessManager(sessionID, func(signal loop.PendingSignal) {
-		if lp != nil {
-			lp.AddPendingSignal(signal)
-		}
-	})
-	registry := t.buildRegistry(at, scope, childProcMgr)
+	// The child shares the owner process manager through a per-session view
+	// bound to the immutable child session id and the child workspace root, so
+	// every child process passes the owner's admission boundary and is tagged
+	// with the child session. The owner manager's exit handler delivers a child
+	// completion to the child loop through the transcript callback set below.
+	var childProcs *process.SessionManager
+	if t.procMgr != nil {
+		childProcs = t.procMgr.ForSession(func() string { return sessionID }, func() string { return t.workspaceRoot })
+	}
+	registry := t.buildRegistry(at, scope, childProcs)
 
 	var events chan loop.Event
 	var forwardDone chan struct{}
+	var turn int
 	if t.taggedEvents != nil {
 		events = make(chan loop.Event, 128)
 		forwardDone = make(chan struct{})
@@ -407,14 +455,31 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 			t.forwardEvents(events, index, sessionID, parentSessionID, t.projectID, parentToolCallID)
 		}()
 	}
+	// finish is the single exit closure every subagent outcome funnels through
+	// — normal completion, denial, error, and cancellation — so the child's
+	// turn is committed and its registry entry removed exactly once, on every
+	// path. The commit runs only after the forwarding channel is closed, the
+	// forwarder joined (every event handed off), and the loop drainer has
+	// acknowledged the flush (every event dispatched and sequenced); then the
+	// entry is dropped, so no live lookup resolves it afterwards.
 	finish := func(result taskResult) taskResult {
 		result.sessionID = sessionID
-		if childProcMgr != nil {
-			childProcMgr.KillAll()
+		if childProcs != nil {
+			// The child finishes by killing and reaping its own remaining
+			// background processes through the bound per-session view, before
+			// the transcript flush and unregistration. The shared owner
+			// manager itself is never closed here.
+			for _, id := range childProcs.ActiveIDs() {
+				_ = childProcs.Kill(id)
+			}
 		}
 		if events != nil {
 			close(events)
 			<-forwardDone
+		}
+		if t.rt != nil {
+			t.rt.flushAndCommitTranscript(sessionID, turn)
+			t.rt.unregisterTranscript(sessionID)
 		}
 		return result
 	}
@@ -429,9 +494,25 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 	})
 	lp.SetEventOwner(sessionID, t.projectID)
 	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
+	// The child process-signal callback is registered after the child loop is
+	// constructed and before lp.Run can call a tool, so a child background
+	// process that completes during the run reaches this live loop. It is
+	// removed with the transcript entry by finish's unregisterTranscript.
+	if t.rt != nil {
+		t.rt.setChildSignalCallback(sessionID, lp.AddPendingSignal)
+	}
 
-	if turn := childStore.BeginTurn(); turn == 0 {
+	if turn = childStore.BeginTurn(); turn == 0 {
 		return finish(taskResult{index: index, err: fmt.Errorf("subagent: child session is not active")})
+	}
+	// Record the child's turn in its coordinator before any rows are
+	// sequenced: the rows must carry the turn being persisted, which the
+	// flush commit and the revert/compaction error dispositions key off.
+	if t.rt != nil {
+		feedTranscript(t.rt.transcriptForSessionID(sessionID), Event{Kind: EventTurnStart, SessionID: sessionID, ProjectID: t.projectID, Turn: turn})
+	}
+	if t.rt != nil {
+		t.rt.touchProjectActivityBeforeRun(childStore)
 	}
 	result, err := lp.Run(ctx, td.Prompt)
 	if result == "Tool denied by user." {
@@ -443,7 +524,7 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 	return finish(taskResult{index: index, result: result})
 }
 
-func (t *taskTool) buildRegistry(at agentcfg.Resolved, scope parentMutationScope, procMgr *process.Manager) *tool.Registry {
+func (t *taskTool) buildRegistry(at agentcfg.Resolved, scope parentMutationScope, procMgr *process.SessionManager) *tool.Registry {
 	root := scope.workspaceRoot
 	exposure := taskToolExposure(at)
 	core := tool.CoreToolsWithOptions(scope.snapshotStore(), scope.tracker, t.toolsConfig, root, t.permissionCheck(), t.permissionAsk(), tool.CapabilityOptions{
@@ -541,7 +622,7 @@ func (s parentTurnSnapshotStore) LockSnapshotMutation(_ int, entryID string) (fu
 	return s.store.LockSnapshotMutation(s.turn, entryID)
 }
 
-func (t *taskTool) newChildTool(name string, readonly bool, scope parentMutationScope, procMgr *process.Manager) tool.Tool {
+func (t *taskTool) newChildTool(name string, readonly bool, scope parentMutationScope, procMgr *process.SessionManager) tool.Tool {
 	check := t.permissionCheck()
 	ask := t.permissionAsk()
 	root := scope.workspaceRoot
@@ -587,51 +668,6 @@ func (t *taskTool) newChildTool(name string, readonly bool, scope parentMutation
 	default:
 		return nil
 	}
-}
-
-func (t *taskTool) newChildProcessManager(sessionID string, addSignal func(loop.PendingSignal)) *process.Manager {
-	if t.procMgr == nil {
-		return nil
-	}
-	mgr := process.NewManagerAtRoot(t.toolsConfig.MaxBackgroundProcesses, cmdoutput.Options{
-		HomeDir:      t.homeDir,
-		SpillPrefix:  "proc_output_",
-		MaxBytes:     t.toolsConfig.MaxOutputBytes,
-		MaxLineChars: t.toolsConfig.ReadLineMaxChars,
-	}, t.workspaceRoot)
-	mgr.SetSessionProvider(func() string { return sessionID })
-	mgr.SetExitHandler(func(event process.ExitEvent) {
-		if addSignal == nil {
-			return
-		}
-		if event.SessionID != "" && event.SessionID != sessionID {
-			return
-		}
-		output := ""
-		if event.FormatOutput != nil {
-			output = event.FormatOutput()
-		}
-		if output == "" {
-			output = "(No output)"
-		}
-		reason := event.Reason
-		if reason == "" {
-			reason = process.ExitReasonCompleted
-		}
-		addSignal(loop.PendingSignal{
-			Payload: backgroundTerminalPayload(event, output),
-			Wake:    true,
-			Persist: true,
-			BackgroundProcess: &loop.BackgroundProcessDisplay{
-				ID:       event.ID,
-				Command:  event.Command,
-				Reason:   string(reason),
-				ExitCode: event.ExitCode,
-				Output:   output,
-			},
-		})
-	})
-	return mgr
 }
 
 func (t *taskTool) permissionCheck() tool.CheckFunc {

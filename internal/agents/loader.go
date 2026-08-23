@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 )
 
@@ -34,10 +35,7 @@ type Config struct {
 
 func Load(path string) (*Config, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return nil, fmt.Errorf("create agents dir: %w", err)
-		}
-		if err := os.WriteFile(path, []byte(emptyAgentsTemplate), 0o600); err != nil {
+		if _, err := atomicfs.CreateExclusive(path, []byte(emptyAgentsTemplate), 0o600); err != nil {
 			return nil, fmt.Errorf("create agents %s: %w", path, err)
 		}
 	}
@@ -283,10 +281,7 @@ func WriteModel(path, name, ref string) error {
 
 func readRoot(path string) (map[string]any, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return nil, fmt.Errorf("create agents dir: %w", err)
-		}
-		if err := os.WriteFile(path, []byte(emptyAgentsTemplate), 0o600); err != nil {
+		if _, err := atomicfs.CreateExclusive(path, []byte(emptyAgentsTemplate), 0o600); err != nil {
 			return nil, fmt.Errorf("create agents %s: %w", path, err)
 		}
 	}
@@ -310,33 +305,7 @@ func writeAtomic(path string, value any) error {
 		return err
 	}
 	data = append(data, '\n')
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".agents-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	return nil
+	return atomicfs.Write(path, data, 0o600)
 }
 
 func validateCustom(name string, def Definition) error {

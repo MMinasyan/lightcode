@@ -14,8 +14,10 @@ import "regexp"
 // *Adaptation means baseline (no adaptation); every field is optional, and a
 // zero-value Adaptation is a valid no-op.
 type Adaptation struct {
-	// Name identifies the adaptation. It participates in the prompt cache key,
-	// so a switch between adaptations (or to/from baseline) forces a rebuild.
+	// Name identifies the adaptation for the binding table. It does not affect
+	// assembly: prompt bytes change only through Blocks and Additions, so a
+	// name-only switch produces an identical prompt that the unit's
+	// last-installed-prompt comparison leaves installed.
 	Name string
 
 	// ExcludeTools lists registered tool names hidden from this model.

@@ -75,6 +75,9 @@ func TestWailsModelSelectorUsesPrefixRefContract(t *testing.T) {
 	if !strings.Contains(models, "export class RevertResult") || !strings.Contains(models, "restored?: string[]") || !strings.Contains(models, "skipped?: SkippedRevert[]") {
 		t.Fatalf("generated models must include snapshot.RevertResult with restored/skipped fields")
 	}
+	if !strings.Contains(models, "transcriptReplay: boolean") || !strings.Contains(models, "source[\"transcriptReplay\"]") {
+		t.Fatalf("generated HydrationState model must include transcriptReplay")
+	}
 }
 
 func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
@@ -146,6 +149,215 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 	}
 }
 
+// TestTurnActionAppliesDestinationStateThroughOrderedBoundary proves the Wails
+// turn-action path (fork / history revert) applies the destination's complete
+// state and the code-revert skip notice through one ordered delivery frame, not an
+// out-of-band read that could race live frames or lose the notice. The backend
+// commits routing and appends a turn_action boundary (never a legacy
+// session_changed or navigation frame), and the frontend's turn_action handler
+// applies the snapshot before the skip notice so the two land atomically; the
+// handlers apply nothing out of band. A reconciled postcommit partial error
+// resolves the direct method: the wrapper records synchronously whether the
+// boundary callback emitted and treats the error as frame-owned when it did.
+func TestTurnActionAppliesDestinationStateThroughOrderedBoundary(t *testing.T) {
+	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
+	body, ok := extractSvelteFunctionBody(app, "func (a *App) applyTurnActionWithOwnedBoundary(")
+	if !ok {
+		t.Fatal("applyTurnActionWithOwnedBoundary not found in app.go")
+	}
+	if !strings.Contains(body, "ApplyTurnActionForSessionWithBoundary") {
+		t.Fatal("the turn-action wrapper must publish through the shared ApplyTurnActionForSessionWithBoundary route")
+	}
+	if !strings.Contains(body, "emitted = true") {
+		t.Fatal("the turn-action wrapper must record synchronously whether the owner boundary callback emitted")
+	}
+	if !strings.Contains(body, "err != nil && emitted") {
+		t.Fatal("the turn-action wrapper must resolve a postcommit error as frame-owned (the boundary owns the error through its warning)")
+	}
+	if strings.Contains(body, "emitSessionChanged") || strings.Contains(body, "emitNavigationBoundary") {
+		t.Fatal("ApplyTurnAction must not emit a legacy session_changed or navigation frame")
+	}
+	applyBody, ok := extractSvelteFunctionBody(app, "func (a *App) ApplyTurnAction(")
+	if !ok {
+		t.Fatal("ApplyTurnAction not found in app.go")
+	}
+	if !strings.Contains(applyBody, "applyTurnActionWithOwnedBoundary(") {
+		t.Fatal("ApplyTurnAction must route through the frame-owning wrapper")
+	}
+
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	handler, ok := extractSvelteFunctionBody(svelte, "EventsOn('turn_action'")
+	if !ok {
+		t.Fatal("turn_action handler not found in App.svelte")
+	}
+	snap := strings.Index(handler, "applySnapshot(")
+	notice := strings.Index(handler, "appendRevertSkipNotice(")
+	if snap < 0 || notice < 0 {
+		t.Fatal("turn_action handler must apply the snapshot and append the skip notice")
+	}
+	if snap > notice {
+		t.Fatal("turn_action handler must apply the snapshot before the skip notice")
+	}
+	// A fork's failed-code-revert warning rides the same frame: it is appended
+	// after the snapshot and the skip notice, or the snapshot replace clobbers
+	// it. The warning arrives only on the frame; the handler reads nothing off
+	// the returned value.
+	warn := strings.Index(handler, "showError(data.warning)")
+	if warn < 0 {
+		t.Fatal("turn_action handler must append a fork's failed-code-revert warning")
+	}
+	if warn < notice {
+		t.Fatal("turn_action handler must append the warning after the skip notice")
+	}
+	for _, fn := range []string{"async function handleFork(", "async function handleRevertHistory(", "async function handleRevertCode("} {
+		fnBody, ok := extractSvelteFunctionBody(svelte, fn)
+		if !ok {
+			t.Fatalf("%s not found in App.svelte", fn)
+		}
+		if strings.Contains(fnBody, "applySnapshot(") || strings.Contains(fnBody, "appendRevertSkipNotice(") {
+			t.Fatalf("%s must not apply state or notice out of band; the ordered turn_action frame is authoritative", fn)
+		}
+		if strings.Contains(fnBody, "result.warning") || strings.Contains(fnBody, "result?.warning") {
+			t.Fatalf("%s must not apply the warning out of band; the ordered turn_action frame is authoritative", fn)
+		}
+	}
+}
+
+// TestAdapterRevertOutcomeContract pins what each host renders when a revert
+// fails midway. Only the terminal host renders the skipped set, on every error
+// branch that follows the action call: ApplyTurnActionForSession returns the
+// populated result alongside the error, and the CLI prints the skipped set
+// before returning. A branch that returns before the action is invoked — the
+// confirmation-read abort for the exiting-terminal case — has no result to
+// render and is not in this scan's scope. A precommit desktop failure carries
+// the enriched error text naming where the revert stopped: the binding layer
+// attaches the return value only on success, and the frontend renders the
+// enriched text from the rejection. A reconciled postcommit partial error no
+// longer rejects on the desktop at all — the wrapper resolves it because the
+// ordered turn_action frame owns the error through its warning — so no second
+// renderer exists and the frame's warning is the single copy.
+func TestAdapterRevertOutcomeContract(t *testing.T) {
+	menu := mustReadContractFile(t, filepath.Join("..", "cli", "menu.go"))
+	for _, action := range []string{`"code"`, `"history"`, `"fork"`} {
+		body := extractSwitchCase(t, menu, "case "+action+":")
+		// Anchor at the action call: an error branch that precedes it returns
+		// before any action was attempted, so there is nothing to render.
+		actionIdx := strings.Index(body, "ApplyTurnActionForSession(")
+		if actionIdx < 0 {
+			t.Fatalf("CLI revert menu %s case has no action call:\n%s", action, body)
+		}
+		errIdx := strings.Index(body[actionIdx:], "if err != nil {")
+		if errIdx < 0 {
+			t.Fatalf("CLI revert menu %s case has no post-action error branch:\n%s", action, body)
+		}
+		errIdx += actionIdx
+		retIdx := strings.Index(body[errIdx:], "return")
+		if retIdx < 0 {
+			t.Fatalf("CLI revert menu %s post-action error branch has no return:\n%s", action, body)
+		}
+		errBranch := body[errIdx : errIdx+retIdx]
+		if !strings.Contains(errBranch, "c.printRevertSkipped(result)") {
+			t.Fatalf("CLI revert menu %s post-action error branch must render the skipped set before returning:\n%s", action, errBranch)
+		}
+	}
+
+	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
+	body, ok := extractSvelteFunctionBody(app, "func (a *App) ApplyTurnAction(")
+	if !ok {
+		t.Fatal("ApplyTurnAction not found in app.go")
+	}
+	if !strings.Contains(body, "return result, err") {
+		t.Fatal("ApplyTurnAction must return the populated result alongside the error; the desktop binding attaches the return value only on success, so a failing call surfaces only the enriched error text naming where the revert stopped")
+	}
+
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	for _, fn := range []string{"async function handleRevertCode(", "async function handleRevertHistory(", "async function handleFork("} {
+		fnBody, ok := extractSvelteFunctionBody(svelte, fn)
+		if !ok {
+			t.Fatalf("%s not found in App.svelte", fn)
+		}
+		if !strings.Contains(fnBody, "showError(err)") {
+			t.Fatalf("%s must render the enriched error text (naming where the revert stopped) via showError", fn)
+		}
+	}
+
+	acp := mustReadContractFile(t, filepath.Join("..", "acp", "acp.go"))
+	acpBody, ok := extractSvelteFunctionBody(acp, "func (r *Runner) handleTurnAction(")
+	if !ok {
+		t.Fatal("handleTurnAction not found in acp.go")
+	}
+	if !strings.Contains(acpBody, "r.respondError(req.ID, -32000, err.Error())") {
+		t.Fatal("handleTurnAction must carry the enriched error string (naming where the revert stopped) in the protocol error response")
+	}
+}
+
+// TestWailsModelSwitchAppendsOrderedPresentationItem proves a root-model switch
+// updates the selector through an ordered, presentation-scoped item, not an
+// out-of-band immediate update: SwitchModel appends a model item to the FIFO, the
+// frontend applies it only when its root is the presented session, and the switch
+// handler never sets the model itself — it only invokes the switch against the
+// captured session/generation and closes the picker (or shows the error) when
+// both still match.
+func TestWailsModelSwitchAppendsOrderedPresentationItem(t *testing.T) {
+	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
+	body, ok := extractSvelteFunctionBody(app, "func (a *App) SwitchModel(")
+	if !ok {
+		t.Fatal("SwitchModel not found in app.go")
+	}
+	if !strings.Contains(body, `emitFrame("model"`) {
+		t.Fatal("SwitchModel must append a model item to the ordered delivery FIFO")
+	}
+
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	handler, ok := extractSvelteFunctionBody(svelte, "EventsOn('model'")
+	if !ok {
+		t.Fatal("model handler not found in App.svelte")
+	}
+	if !strings.Contains(handler, "data.rootId !== sessionId") {
+		t.Fatal("model handler must apply only for the presentation-current root")
+	}
+	if !strings.Contains(handler, "modelRef =") {
+		t.Fatal("model handler must update the selector from the ordered item")
+	}
+
+	switched, ok := extractSvelteFunctionBody(svelte, "async function handleModelSelect(")
+	if !ok {
+		t.Fatal("handleModelSelect not found in App.svelte")
+	}
+	if strings.Contains(switched, "modelRef =") {
+		t.Fatal("handleModelSelect must not set the model out of band; the ordered item does")
+	}
+	if !strings.Contains(switched, "await SwitchModel(") {
+		t.Fatal("handleModelSelect must invoke the switch through the backend entry point")
+	}
+	if !strings.Contains(switched, "presentationGeneration !== opGen") {
+		t.Fatal("handleModelSelect must gate closing the picker and showing errors on the captured session and generation")
+	}
+}
+
+// TestSnapshotCarriesModelAndProjectSwitchFetchesNone proves the hydration
+// snapshot applies the destination's resolved model alongside the rest of the
+// session classes, and that a project switch performs no out-of-band fetch of
+// the destination's project name or model: the ordered navigation boundary
+// carries both, which the snapshot applies. The project-name fetch is called
+// exactly once, at mount, for the startup case where no session exists and no
+// snapshot can answer; any second call site, under any name, is an out-of-band
+// fetch.
+func TestSnapshotCarriesModelAndProjectSwitchFetchesNone(t *testing.T) {
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	body, ok := extractSvelteFunctionBody(svelte, "function applySnapshot(")
+	if !ok {
+		t.Fatal("applySnapshot not found in App.svelte")
+	}
+	if !strings.Contains(body, "modelRef =") || !strings.Contains(body, "modelName =") {
+		t.Fatal("applySnapshot must apply the destination session's resolved model to the selector")
+	}
+
+	if got := strings.Count(svelteCodeWithoutCommentLines(svelte), "ProjectName("); got != 1 {
+		t.Fatalf("App.svelte calls ProjectName() %d times, want exactly 1 (the mount-time startup fetch; a second call site anywhere would fetch the destination project out of band)", got)
+	}
+}
+
 func TestProjectSwitchDoesNotCloseOwnerSession(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
 	if strings.Contains(app, "CloseForProjectSwitch") || strings.Contains(app, "close current session") {
@@ -154,8 +366,8 @@ func TestProjectSwitchDoesNotCloseOwnerSession(t *testing.T) {
 	if strings.Contains(app, "relaunchIn") || strings.Contains(app, "wailsRuntime.Quit") {
 		t.Fatalf("ProjectSwitch must not relaunch the process or quit the adapter")
 	}
-	if !strings.Contains(app, "OpenOrCreateSession") {
-		t.Fatalf("ProjectSwitch must navigate in-place via OpenOrCreateSession")
+	if !strings.Contains(app, "openOrCreateSession") {
+		t.Fatalf("ProjectSwitch must navigate in-place via openOrCreateSession")
 	}
 
 	cli := mustReadContractFile(t, filepath.Join("..", "cli", "cli.go"))
@@ -204,7 +416,7 @@ func TestFrontendRuntimeConfigTabExcludesMasterTogglesAndPermissions(t *testing.
 func TestFrontendNoActiveModelSendGate(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
 	input := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "components", "InputArea.svelte"))
-	if !strings.Contains(app, "hasActiveModel={!!modelRef}") {
+	if !strings.Contains(app, "hasActiveModel={!!modelRef") {
 		t.Fatalf("App.svelte must pass active-model state into InputArea")
 	}
 	if !strings.Contains(app, "Connect a provider or pick a model before sending.") {
@@ -258,21 +470,71 @@ func TestWailsLifecycleSurfaceContract(t *testing.T) {
 	}
 }
 
-func TestWailsDefersActiveCompactionSessionRefreshUntilTurnEnd(t *testing.T) {
+func TestWailsCompactionResyncPublishesThroughRewriteBoundary(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
 	compactionEnd := extractSwitchCase(t, app, "case agent.EventCompactionEnd:")
-	if !strings.Contains(compactionEnd, `EventsEmit(a.ctx, "compaction_end"`) {
+	if !strings.Contains(compactionEnd, `emit("compaction_end"`) {
 		t.Fatalf("EventCompactionEnd must still emit compaction_end; case:\n%s", compactionEnd)
 	}
-	if !strings.Contains(compactionEnd, "if ev.RefreshSession") || !strings.Contains(compactionEnd, "a.emitSessionChangedForEvent(ev)") {
-		t.Fatalf("EventCompactionEnd must refresh history only when backend marks it safe; case:\n%s", compactionEnd)
+	if strings.Contains(compactionEnd, "emitResyncBoundary") {
+		t.Fatalf("EventCompactionEnd must not resync; the rewrite boundary does; case:\n%s", compactionEnd)
 	}
 	turnEnd := extractSwitchCase(t, app, "case agent.EventTurnEnd:")
-	if !strings.Contains(turnEnd, `EventsEmit(a.ctx, "turn_end"`) {
+	if !strings.Contains(turnEnd, `emit("turn_end"`) {
 		t.Fatalf("EventTurnEnd must still emit turn_end; case:\n%s", turnEnd)
 	}
-	if !strings.Contains(turnEnd, "if ev.RefreshSession") || !strings.Contains(turnEnd, "a.emitSessionChangedForEvent(ev)") {
-		t.Fatalf("EventTurnEnd must perform deferred compaction history refresh; case:\n%s", turnEnd)
+	if strings.Contains(turnEnd, "emitResyncBoundary") {
+		t.Fatalf("EventTurnEnd must not resync; the rewrite boundary does; case:\n%s", turnEnd)
+	}
+	rewrite := extractSwitchCase(t, app, "case agent.EventSessionRewrite:")
+	if !strings.Contains(rewrite, "a.emitResyncBoundary(ev.SessionID, ev.RewritePayload)") {
+		t.Fatalf("EventSessionRewrite must apply the producer-built replacement; case:\n%s", rewrite)
+	}
+}
+
+// TestCompactionResyncRefreshesTranscriptWithoutRestickingActivity proves the
+// compaction resync applies only the transcript and tokens — never activity or
+// queue. Compaction changes none of those, and the resync runs at turn end before
+// the deferred busy clear, so applying busy from it would re-stick a stale busy the
+// turn_end frame already cleared.
+func TestCompactionResyncRefreshesTranscriptWithoutRestickingActivity(t *testing.T) {
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	body, ok := extractSvelteFunctionBody(svelte, "function applyResync(")
+	if !ok {
+		t.Fatal("applyResync not found in App.svelte")
+	}
+	for _, forbidden := range []string{"busy =", "compacting =", "messageQueue =", "lastQueueVersion =", "warnings =", "permissions ="} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("applyResync must not apply %q: compaction does not change it and a turn-end refresh's busy is stale", strings.TrimSpace(forbidden))
+		}
+	}
+	if !strings.Contains(body, "messages =") || !strings.Contains(body, "tokens =") {
+		t.Fatal("applyResync must refresh the transcript and tokens")
+	}
+	// A resync never switches sessions: it must reject a payload for a session the
+	// frontend has navigated away from, or a stale resync would restore it over the
+	// destination of a concurrent switch.
+	if !strings.Contains(body, "!== sessionId") {
+		t.Fatal("applyResync must reject a resync whose session differs from the current session")
+	}
+	if strings.Contains(body, "sessionId =") {
+		t.Fatal("applyResync must not assign sessionId; a resync never changes the session")
+	}
+}
+
+// TestTurnEndDoesNotReresolveSession proves the turn_end handler never reassigns
+// sessionId. Session identity is owned by the ordered navigation/turn_action/
+// hydration boundaries; an out-of-band SessionCurrent() at turn end could restore a
+// session a concurrent switch already navigated away from, defeating the resync
+// guard that compares against the current session.
+func TestTurnEndDoesNotReresolveSession(t *testing.T) {
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	body, ok := extractSvelteFunctionBody(svelte, "EventsOn('turn_end'")
+	if !ok {
+		t.Fatal("turn_end handler not found in App.svelte")
+	}
+	if strings.Contains(body, "sessionId =") || strings.Contains(body, "SessionCurrent(") {
+		t.Fatal("turn_end must not re-resolve sessionId; only navigation/turn_action/hydration boundaries own session identity")
 	}
 }
 
@@ -305,14 +567,25 @@ func TestFrontendUserAndSystemTranscriptEntriesArriveViaBackendEvents(t *testing
 
 func TestWailsSubagentTaskLinksAreOrderIndependent(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
-	for _, want := range []string{
+	// The backend folds the child association into the parent's tool row before
+	// emitting the start frame, so the frontend keeps no pending-link storage or
+	// module-level link authority: the row exists by the time the id-keyed
+	// update arrives.
+	for _, forbidden := range []string{
 		"pendingSubagentSessionLinks",
-		"rememberSubagentLink(pendingSubagentSessionLinks, data.taskToolCallId",
-		"takePendingSubagentLinks(pendingSubagentSessionLinks, data.id",
+		"rememberSubagentLink",
+		"takePendingSubagentLinks",
+	} {
+		if strings.Contains(app, forbidden) {
+			t.Fatalf("App.svelte must not keep pending subagent-link storage %q; the backend folds the association into the tool row before the start frame", forbidden)
+		}
+	}
+	for _, want := range []string{
 		"subagentLinksFromMetadata(metadata)",
+		"mergeSubagentLinks(m.subagentSessionIds, [link])",
 	} {
 		if !strings.Contains(app, want) {
-			t.Fatalf("App.svelte missing subagent task-link ordering guard %q", want)
+			t.Fatalf("App.svelte missing subagent task-link path %q", want)
 		}
 	}
 
@@ -321,6 +594,9 @@ func TestWailsSubagentTaskLinksAreOrderIndependent(t *testing.T) {
 		if !strings.Contains(helpers, want) {
 			t.Fatalf("subagentLinks.js missing metadata recovery path %q", want)
 		}
+	}
+	if strings.Contains(helpers, "rememberSubagentLink") || strings.Contains(helpers, "takePendingSubagentLinks") {
+		t.Fatal("subagentLinks.js must not keep pending-link helpers; the backend owns the association")
 	}
 }
 
@@ -341,7 +617,7 @@ func TestFrontendTaskSubagentLinksRemainClickableAfterCompletion(t *testing.T) {
 			t.Fatalf("task branch missing persisted child-session affordance path %q", want)
 		}
 	}
-	for _, want := range []string{"SessionMessagesFor", "hydrateSubagentViewer"} {
+	for _, want := range []string{"HydrateSession", "hydrateSubagentViewer"} {
 		if !strings.Contains(toolCall, want) {
 			t.Fatalf("ToolCall.svelte missing persisted child-session hydration path %q", want)
 		}
@@ -355,6 +631,163 @@ func TestFrontendTaskSubagentLinksRemainClickableAfterCompletion(t *testing.T) {
 	if !strings.Contains(taskBlock, "{#if done}") || !strings.Contains(taskBlock, "toggleOrOpenOutput('task results')") {
 		t.Fatalf("task branch must still gate task output on done while keeping subtask rows visible")
 	}
+}
+
+// TestHydrateSurfacesCurrentSessionLookupFailure proves hydrate() surfaces a
+// failed current-session lookup through showError instead of swallowing it: the
+// silent empty catch left id empty, skipped hydration entirely, and still ran
+// hydrated = true — a silently empty transcript indistinguishable from a
+// genuinely empty one. Only the lookup catch is silent; the HydrateSession
+// catch already surfaces through showError.
+func TestHydrateSurfacesCurrentSessionLookupFailure(t *testing.T) {
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+	body, ok := extractSvelteFunctionBody(svelte, "async function hydrate(")
+	if !ok {
+		t.Fatal("hydrate not found in App.svelte")
+	}
+	if strings.Contains(body, "catch (e) {}") {
+		t.Fatal("hydrate must not swallow the current-session lookup failure: the silent empty session is indistinguishable from a genuinely empty one")
+	}
+	if !strings.Contains(body, "showError(e, 'Load session failed')") {
+		t.Fatal("hydrate must surface the current-session lookup failure through showError")
+	}
+}
+
+// TestFrontendPresentationOwnershipGates proves the Wails presentation owns
+// each stale writer: the settings-refresh model path captures the session,
+// generation, and both model fields, and the snapshot-gated listeners
+// (warnings, usage, queue_changed, compaction start/end, error, turn_action)
+// refuse to mutate an unseeded view. The busy clear is reserved for sequenced
+// turn errors, and the turn_action handler applies a stateful frame first but
+// skips notices over an unseeded view.
+func TestFrontendPresentationOwnershipGates(t *testing.T) {
+	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
+
+	// refreshCurrentModel must capture all four ownership terms and compare all
+	// four — session, generation, model ref, and model name — in both the
+	// resolution branch and the rejection branch. Each comparison term therefore
+	// appears once per branch (twice total); capture declarations alone cannot
+	// gate the continuation.
+	refresh, ok := extractSvelteFunctionBody(svelte, "async function refreshCurrentModel(")
+	if !ok {
+		t.Fatal("refreshCurrentModel not found in App.svelte")
+	}
+	for _, want := range []string{
+		"const opSession = sessionId",
+		"const opGen = presentationGeneration",
+		"const opRef = modelRef",
+		"const opName = modelName",
+	} {
+		if !strings.Contains(refresh, want) {
+			t.Fatalf("refreshCurrentModel must capture %q for the settings-refresh ownership guard", want)
+		}
+	}
+	for _, term := range []string{
+		"sessionId !== opSession",
+		"presentationGeneration !== opGen",
+		"modelRef !== opRef",
+		"modelName !== opName",
+	} {
+		if n := strings.Count(refresh, term); n < 2 {
+			t.Fatalf("refreshCurrentModel must compare %q in both the resolution and rejection branches (found %d occurrences)", term, n)
+		}
+	}
+	// The refresh expects the captured session from the backend, ignores a
+	// superseded result, and applies the returned model (not a bare model).
+	if !strings.Contains(refresh, "CurrentModel(opSession)") {
+		t.Fatal("refreshCurrentModel must expect the captured session from CurrentModel")
+	}
+	if !strings.Contains(refresh, "superseded") {
+		t.Fatal("refreshCurrentModel must ignore a superseded CurrentModel result")
+	}
+	if !strings.Contains(refresh, "r?.model") {
+		t.Fatal("refreshCurrentModel must apply the resolved CurrentModelResult.model")
+	}
+	// Mount-time loading expects no session: CurrentModel('') keeps startup
+	// routing behavior before hydration.
+	if !strings.Contains(svelte, "CurrentModel('')") {
+		t.Fatal("mount-time model loading must call CurrentModel('') to preserve pre-hydration routing")
+	}
+
+	// Every snapshot-gated listener must refuse to mutate an unseeded view.
+	for _, ev := range []string{"warnings", "usage", "queue_changed", "compaction_start", "compaction_end", "error", "turn_action"} {
+		body, ok := extractSvelteFunctionBody(svelte, "EventsOn('"+ev+"'")
+		if !ok {
+			t.Fatalf("listener '%s' not found in App.svelte", ev)
+		}
+		if !strings.Contains(body, "snapshotApplied") {
+			t.Fatalf("listener '%s' must gate its mutations on snapshotApplied", ev)
+		}
+	}
+
+	// queue_changed keeps its version guard after the snapshot gate.
+	queue, ok := extractSvelteFunctionBody(svelte, "EventsOn('queue_changed'")
+	if !ok {
+		t.Fatal("queue_changed listener not found")
+	}
+	if !strings.Contains(queue, "lastQueueVersion") || !strings.Contains(queue, "version <= lastQueueVersion") {
+		t.Fatal("queue_changed must keep the queue version guard after the snapshot gate")
+	}
+
+	// The error listener renders admitted sequenced and unsequenced errors but
+	// clears busy only when the frame carries a sequence.
+	errBody, ok := extractSvelteFunctionBody(svelte, "EventsOn('error'")
+	if !ok {
+		t.Fatal("error listener not found in App.svelte")
+	}
+	if !strings.Contains(errBody, "data?.seq") || !strings.Contains(errBody, "busy = false") {
+		t.Fatal("error listener must clear busy only when the frame carries a sequence")
+	}
+	if strings.Index(errBody, "busy = false") < strings.Index(errBody, "data?.seq") {
+		t.Fatal("error listener must not clear busy unconditionally; the sequence must gate it")
+	}
+
+	// The turn_action listener applies a stateful frame first, then skips
+	// notices when the view is still unseeded.
+	turnAction, ok := extractSvelteFunctionBody(svelte, "EventsOn('turn_action'")
+	if !ok {
+		t.Fatal("turn_action listener not found in App.svelte")
+	}
+	snapIdx := strings.Index(turnAction, "applySnapshot(")
+	guardIdx := strings.Index(turnAction, "!data?.state && !snapshotApplied")
+	noticeIdx := strings.Index(turnAction, "appendRevertSkipNotice(")
+	if snapIdx < 0 || guardIdx < 0 || noticeIdx < 0 {
+		t.Fatal("turn_action listener must apply the snapshot first and return over an unseeded view before notices")
+	}
+	if snapIdx > guardIdx || guardIdx > noticeIdx {
+		t.Fatal("turn_action listener must apply the snapshot, then the unseeded guard, then the notices")
+	}
+
+	// The existing ordered-model ownership and resync session checks are intact.
+	model, ok := extractSvelteFunctionBody(svelte, "EventsOn('model'")
+	if !ok {
+		t.Fatal("model listener not found in App.svelte")
+	}
+	if !strings.Contains(model, "data.rootId !== sessionId") {
+		t.Fatal("model listener must keep the root-ownership check")
+	}
+	resync, ok := extractSvelteFunctionBody(svelte, "function applyResync(")
+	if !ok {
+		t.Fatal("applyResync not found in App.svelte")
+	}
+	if !strings.Contains(resync, "!== sessionId") {
+		t.Fatal("applyResync must keep the session check")
+	}
+}
+
+// svelteCodeWithoutCommentLines returns source with // comment lines removed,
+// so a symbol-count assertion counts call sites rather than prose that happens
+// to name the function.
+func svelteCodeWithoutCommentLines(source string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(source, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 // extractSvelteFunctionBody returns the brace-balanced body of the first JS
@@ -385,7 +818,7 @@ func extractSvelteFunctionBody(source, prefix string) (string, bool) {
 }
 
 func TestBackendEmittedEventsAreListenedToByFrontend(t *testing.T) {
-	emitted := collectContractMatches(t, filepath.Join("..", ".."), ".go", `EventsEmit\([^,]+,\s*["']([^"']+)["']`)
+	emitted := collectContractMatches(t, filepath.Join("..", ".."), ".go", `(?:EventsEmit\([^,]+,\s*|emit(?:Frame)?\(\s*|enqueueBoundary\(\s*|emitSessionFrame\([^,]+,\s*)["']([^"']+)["']`)
 	listened := stringSet(collectContractMatches(t, filepath.Join("..", "..", "frontend", "src"), ".svelte", `EventsOn\(["']([^"']+)["']`))
 	if len(emitted) == 0 {
 		t.Fatal("no runtime.EventsEmit calls found")
@@ -403,7 +836,7 @@ func TestBackendEmittedEventsAreListenedToByFrontend(t *testing.T) {
 
 func TestFrontendEventListenersHaveBackendEmitters(t *testing.T) {
 	listened := collectContractMatches(t, filepath.Join("..", "..", "frontend", "src"), ".svelte", `EventsOn\(["']([^"']+)["']`)
-	emitted := stringSet(collectContractMatches(t, filepath.Join("..", ".."), ".go", `EventsEmit\([^,]+,\s*["']([^"']+)["']`))
+	emitted := stringSet(collectContractMatches(t, filepath.Join("..", ".."), ".go", `(?:EventsEmit\([^,]+,\s*|emit(?:Frame)?\(\s*|enqueueBoundary\(\s*|emitSessionFrame\([^,]+,\s*)["']([^"']+)["']`))
 	if len(listened) == 0 {
 		t.Fatal("no frontend EventsOn calls found")
 	}
@@ -441,6 +874,11 @@ func collectContractMatches(t *testing.T, root, ext, pattern string) []string {
 			return nil
 		}
 		if filepath.Ext(path) != ext {
+			return nil
+		}
+		// Contracts live in production code; test files may reference the same
+		// helpers with throwaway names.
+		if strings.HasSuffix(d.Name(), "_test.go") {
 			return nil
 		}
 		for _, match := range extractUniqueMatches(mustReadContractFile(t, path), pattern) {

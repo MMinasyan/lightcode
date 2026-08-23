@@ -3,6 +3,7 @@ module github.com/MMinasyan/lightcode
 go 1.26.0
 
 require (
+	github.com/gofrs/flock v0.13.0
 	github.com/knights-analytics/hugot v0.7.2
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/sashabaranov/go-openai v1.41.2
@@ -21,7 +22,6 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
-	github.com/gofrs/flock v0.13.0 // indirect
 	github.com/gomlx/exceptions v0.0.3 // indirect
 	github.com/gomlx/go-huggingface v0.3.5 // indirect
 	github.com/gomlx/go-xla v0.2.2 // indirect

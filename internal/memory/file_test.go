@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 func TestSlugifyAndYamlQuote(t *testing.T) {
@@ -45,8 +47,9 @@ func TestWriteReadMemoryFileRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteMemoryFile: %v", err)
 	}
-	if !strings.HasPrefix(filepath.Base(path), "20") || !strings.HasSuffix(path, "a-title.md") {
-		t.Fatalf("path = %q, want timestamped slug", path)
+	base := filepath.Base(path)
+	if !strings.HasPrefix(base, "20") || !strings.Contains(base, "a-title") || !strings.HasSuffix(base, ".md") {
+		t.Fatalf("path = %q, want timestamped slug with .md suffix", path)
 	}
 	title, content, createdAt, err := ReadMemoryFile(path)
 	if err != nil {
@@ -66,5 +69,44 @@ func TestWriteReadMemoryFileRoundTrip(t *testing.T) {
 	}
 	if title != "" || content != "plain body" || createdAt != "" {
 		t.Fatalf("plain read = %q/%q/%q", title, content, createdAt)
+	}
+}
+
+// TestWriteMemoryFilePublishesThroughAtomicfs proves the memory writer
+// publishes its record through atomicfs.CreateExclusive: both of the
+// publisher's sync hooks are observed — the temp file is synced through the
+// file hook before publication, and the destination directory after it.
+// Memory files are written by more than one process, so they must be
+// published atomically — never torn — and the publisher itself is covered by
+// its own tests, so a swap to a plain os.WriteFile bypass would leave those
+// green. Requiring both hooks means even a direct write followed by a
+// directory sync fails: the temp was never synced through the file hook. Two
+// things stay uncovered and are named rather than implied away: the retry
+// loop has no seam (the nonce comes from crypto/rand inline, so a name
+// collision cannot be forced), and two saves sharing a second, a title and a
+// nonce would collide — precisely what the retry is for; it is merely too
+// unlikely to provoke.
+func TestWriteMemoryFilePublishesThroughAtomicfs(t *testing.T) {
+	dir := t.TempDir()
+	var synced []string
+	atomicfs.SyncDirFunc = func(d string) error {
+		synced = append(synced, d)
+		return nil
+	}
+	t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
+	tempSyncs := 0
+	atomicfs.SyncFileFunc = func(*os.File) error { tempSyncs++; return nil }
+	t.Cleanup(func() { atomicfs.SyncFileFunc = nil })
+
+	if _, err := WriteMemoryFile(dir, "Title", "body"); err != nil {
+		t.Fatalf("WriteMemoryFile: %v", err)
+	}
+	if tempSyncs != 1 {
+		t.Fatalf("temp syncs = %d, want 1: the memory file's temp was not synced through the atomicfs file hook before publication", tempSyncs)
+	}
+	// CreateExclusive syncs the ancestor chain before publication and the
+	// destination directory after it, so the memories dir is the last sync.
+	if len(synced) == 0 || synced[len(synced)-1] != dir {
+		t.Fatalf("dir syncs = %v, want the memories dir %q synced last after publication", synced, dir)
 	}
 }

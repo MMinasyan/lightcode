@@ -68,7 +68,7 @@ func projectEvents(events []Event) []transcriptRow {
 			assistant = append(assistant, ev.Result...)
 		case EventToolCallStart:
 			flush()
-			rows = append(rows, transcriptRow{Type: "tool", ID: ev.ToolCallID, Name: ev.ToolName, Args: ev.Args})
+			rows = append(rows, transcriptRow{Type: "tool", Turn: currentTurn, ID: ev.ToolCallID, Name: ev.ToolName, Args: ev.Args})
 		case EventToolCallEnd:
 			// Last-end-wins: a staged edit emits a second ToolCallEnd (the real
 			// result, at flush) after its stage-time "Staged." end; the later end
@@ -93,10 +93,10 @@ func projectEvents(events []Event) []transcriptRow {
 			rows = append(rows, transcriptRow{Type: "user", Content: ev.Result, Turn: ev.Turn})
 		case EventGenericSystemSignal:
 			flush()
-			rows = append(rows, transcriptRow{Type: "system", Content: "System: " + ev.Result})
+			rows = append(rows, transcriptRow{Type: "system", Turn: ev.Turn, Content: "System: " + ev.Result})
 		case EventBackgroundProcessComplete:
 			flush()
-			row := transcriptRow{Type: "background_process", Done: true, Success: !ev.IsError, Result: ev.Result}
+			row := transcriptRow{Type: "background_process", Turn: ev.Turn, Done: true, Success: !ev.IsError, Result: ev.Result}
 			if ev.BackgroundProcess != nil {
 				row.BGID = ev.BackgroundProcess.ID
 				row.BGCommand = ev.BackgroundProcess.Command
@@ -122,11 +122,11 @@ func projectDisplay(msgs []DisplayMessage) []transcriptRow {
 		case "assistant":
 			rows = append(rows, transcriptRow{Type: "assistant", Content: m.Content, Turn: m.Turn})
 		case "tool":
-			rows = append(rows, transcriptRow{Type: "tool", ID: m.ID, Name: m.Name, Args: m.Args, Done: m.Done, Success: m.Success, Result: m.Result})
+			rows = append(rows, transcriptRow{Type: "tool", Turn: m.Turn, ID: m.ID, Name: m.Name, Args: m.Args, Done: m.Done, Success: m.Success, Result: m.Result})
 		case "system":
-			rows = append(rows, transcriptRow{Type: "system", Content: m.Content})
+			rows = append(rows, transcriptRow{Type: "system", Turn: m.Turn, Content: m.Content})
 		case "background_process":
-			row := transcriptRow{Type: "background_process", Done: m.Done, Success: m.Success, Result: m.Result, ID: m.ID}
+			row := transcriptRow{Type: "background_process", Turn: m.Turn, Done: m.Done, Success: m.Success, Result: m.Result, ID: m.ID}
 			if m.BackgroundProcess != nil {
 				row.BGID = m.BackgroundProcess.ID
 				row.BGCommand = m.BackgroundProcess.Command
@@ -198,7 +198,12 @@ func newEventOrderAgent(t *testing.T, baseURL string) *Agent {
 func startEventOrderAgent(t *testing.T, a *Agent, cap *eventCapture) context.Context {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	// Join the owner on cleanup so the background goroutines stop before the
+	// test's temp dir is removed.
+	t.Cleanup(func() {
+		cancel()
+		a.ShutdownOwner()
+	})
 	a.SetEventHandler(cap.handler)
 	a.Init(ctx)
 	return ctx
@@ -281,6 +286,93 @@ func writeHangingResponse(w http.ResponseWriter, ctx context.Context) {
 	<-ctx.Done()
 }
 
+// TestTranscriptCoordinatorLiveFeedRootTurn verifies the live event path feeds the
+// session coordinator: a delivered root turn commits, clears the retained tail,
+// and sequences exactly the display rows that the delivered event stream folds to.
+func TestTranscriptCoordinatorLiveFeedRootTurn(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTextResponse(w, "hello back")
+	}))
+	defer server.Close()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+	if _, err := a.Submit(ctx, "hello"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	waitUntilEventOrderTurnEndCount(t, cap, 1)
+	// The commit feed runs inside the busy-clear section, before EventTurnEnd
+	// is delivered, so idle guarantees the commit is visible.
+	waitUntilEventOrderAgentIdle(t, a)
+
+	tr := a.transcriptForSessionID(sessionIDOf(a.session))
+	if tr == nil {
+		t.Fatal("session has no transcript coordinator")
+	}
+	tr.seqMu.Lock()
+	committedTurn := tr.committedTurn
+	committedSeq := tr.committedSeq
+	tailLen := len(tr.tail)
+	tr.seqMu.Unlock()
+
+	rows := projectEvents(cap.snapshot())
+	if committedTurn != 1 {
+		t.Fatalf("committedTurn = %d, want 1", committedTurn)
+	}
+	if tailLen != 0 {
+		t.Fatalf("retained tail = %d rows after commit, want 0", tailLen)
+	}
+	// committedSeq is the sequence high-water, not a row count: each display row
+	// consumes at least one sequence, and a coalesced text row consumes one per
+	// delta, so the high-water is at least the number of delivered display rows.
+	if committedSeq < len(rows) {
+		t.Fatalf("committedSeq = %d, want >= %d (delivered display rows)", committedSeq, len(rows))
+	}
+	if committedSeq == 0 {
+		t.Fatal("coordinator sequenced no rows from the live feed")
+	}
+}
+
+// TestDeliveredTextDeltasCarrySequence verifies the dispatch sequences a row before
+// delivering it: every delivered text delta carries a strictly increasing nonzero
+// coordinator sequence, while lifecycle events that produce no row carry none.
+func TestDeliveredTextDeltasCarrySequence(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTextResponse(w, "hello back")
+	}))
+	defer server.Close()
+
+	a := newEventOrderAgent(t, server.URL+"/v1")
+	cap := &eventCapture{}
+	ctx := startEventOrderAgent(t, a, cap)
+	if _, err := a.Submit(ctx, "hello"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	waitUntilEventOrderTurnEndCount(t, cap, 1)
+	waitUntilEventOrderAgentIdle(t, a)
+
+	var lastDeltaSeq int
+	sawDelta := false
+	for _, ev := range cap.snapshot() {
+		switch ev.Kind {
+		case EventTextDelta:
+			if ev.Seq <= lastDeltaSeq {
+				t.Fatalf("delivered text delta seq = %d, want > previous %d", ev.Seq, lastDeltaSeq)
+			}
+			lastDeltaSeq = ev.Seq
+			sawDelta = true
+		case EventTurnStart, EventTurnEnd:
+			if ev.Seq != 0 {
+				t.Fatalf("lifecycle event %v carried seq %d, want 0", ev.Kind, ev.Seq)
+			}
+		}
+	}
+	if !sawDelta {
+		t.Fatal("no text delta events delivered to assert sequence on")
+	}
+}
+
 func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 	t.Run("direct_submit_no_signal", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -307,8 +399,8 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		a := newEventOrderAgent(t, server.URL+"/v1")
 		cap := &eventCapture{}
 		ctx := startEventOrderAgent(t, a, cap)
-		if err := a.ensureSession(); err != nil {
-			t.Fatalf("ensureSession: %v", err)
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
 		}
 		a.lp.AddPendingSignal(loop.PendingSignal{Payload: "Model switched to test/test-model", Persist: true})
 		if _, err := a.Submit(ctx, "after switch"); err != nil {
@@ -345,8 +437,8 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		a := newEventOrderAgent(t, server.URL+"/v1")
 		cap := &eventCapture{}
 		ctx := startEventOrderAgent(t, a, cap)
-		if err := a.ensureSession(); err != nil {
-			t.Fatalf("ensureSession: %v", err)
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
 		}
 		a.lp.AddPendingSignal(loop.PendingSignal{Payload: "Model switched to test/test-model", Persist: true})
 		for _, m := range []string{"alpha", "beta"} {
@@ -367,8 +459,8 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		a := newEventOrderAgent(t, server.URL+"/v1")
 		cap := &eventCapture{}
 		ctx := startEventOrderAgent(t, a, cap)
-		if err := a.ensureSession(); err != nil {
-			t.Fatalf("ensureSession: %v", err)
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
 		}
 		bg := &loop.BackgroundProcessDisplay{
 			ID:       "bg-1",
@@ -495,6 +587,11 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		defer server.Close()
 
 		a := newEventOrderAgent(t, server.URL+"/v1")
+		// Bootstrap the session first: newSession builds a fresh loop, so the
+		// fake pending executor must be installed on the live unit's loop.
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
 		a.lp.SetPendingExecutor(fakeAgentPendingExecutor{results: map[string]tool.BatchResult{
 			"call_1": {Success: true, Result: "Edited file.txt (1 replacement, lines 1-1)."},
 		}})
@@ -519,6 +616,9 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		defer server.Close()
 
 		a := newEventOrderAgent(t, server.URL+"/v1")
+		if _, err := a.NewSession("", "primary"); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
 		a.lp.SetPendingExecutor(fakeAgentPendingExecutor{results: map[string]tool.BatchResult{
 			"call_1": {Success: false, Error: "error: no match"},
 		}})

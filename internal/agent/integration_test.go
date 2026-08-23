@@ -275,9 +275,10 @@ func TestIntegrationToolCallPermissionAllowContinues(t *testing.T) {
 			if ev.PermReq.ToolName != "read_file" {
 				t.Errorf("permission tool = %q, want read_file", ev.PermReq.ToolName)
 			}
-			if err := a.RespondPermission(ev.PermReq.ID, true); err != nil {
-				t.Errorf("RespondPermission allow: %v", err)
-			}
+			// The request event is delivered under the gate mutex, so respond off the
+			// callback goroutine (as a real adapter does) rather than re-entering it.
+			id := ev.PermReq.ID
+			go func() { _ = a.RespondPermission(id, true) }()
 		}
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -315,9 +316,10 @@ func TestIntegrationToolCallPermissionDenyCompletes(t *testing.T) {
 	a.SetEventHandler(func(ev Event) {
 		log.collect(ev)
 		if ev.Kind == EventPermissionRequest && ev.PermReq != nil {
-			if err := a.RespondPermission(ev.PermReq.ID, false); err != nil {
-				t.Errorf("RespondPermission deny: %v", err)
-			}
+			// The request event is delivered under the gate mutex, so respond off the
+			// callback goroutine (as a real adapter does) rather than re-entering it.
+			id := ev.PermReq.ID
+			go func() { _ = a.RespondPermission(id, false) }()
 		}
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -390,9 +392,9 @@ func TestIntegrationForkSessionContinuesConversation(t *testing.T) {
 	}
 	log.waitFor(t, EventTurnEnd)
 	before := a.SessionCurrent().ID
-	result, err := a.ApplyTurnAction(res.Turn, TurnActionFork, false)
+	result, err := a.ApplyTurnActionForSession(before, res.Turn, TurnActionFork, false)
 	if err != nil {
-		t.Fatalf("ApplyTurnAction fork: %v", err)
+		t.Fatalf("ApplyTurnActionForSession fork: %v", err)
 	}
 	if result.Session.ID == "" || result.Session.ID == before {
 		t.Fatalf("fork session ID = %q, before %q", result.Session.ID, before)
@@ -502,6 +504,14 @@ func TestIntegrationCrashRecoveryLoadsCleanHistory(t *testing.T) {
 	}
 	log1.waitFor(t, EventTurnEnd)
 	firstSession := a1.SessionCurrent().ID
+
+	// A crash ends the owner process, which releases its per-session flock claim
+	// via the OS. Simulate that release in-process (the same one process cannot
+	// otherwise drop a flock it still holds) so a fresh owner can reclaim and
+	// recover the durable session persisted on disk.
+	if _, err := a1.store.Close(); err != nil {
+		t.Fatalf("release first agent claim: %v", err)
+	}
 
 	a2 := newIntegrationAgentWithRoots(t, home, projectRoot, server.URL, opts)
 	log2, ctx2 := startIntegrationAgent(t, a2)
@@ -614,15 +624,16 @@ func TestIntegrationReadOnlySubagentRunCommandUsesParentPermission(t *testing.T)
 			if len(suggestions) == 0 || suggestions[0].Rule != "run_command(echo subagent-ok)" {
 				t.Errorf("suggestions = %#v, want exact run_command rule first", suggestions)
 			}
-			if len(suggestions) == 0 {
-				if err := a.RespondPermission(ev.PermReq.ID, false); err != nil {
-					t.Errorf("RespondPermission deny after missing suggestions: %v", err)
+			// The request event is delivered under the gate mutex, so respond off the
+			// callback goroutine (as a real adapter does) rather than re-entering it.
+			id := ev.PermReq.ID
+			go func() {
+				if len(suggestions) == 0 {
+					_ = a.RespondPermission(id, false)
+					return
 				}
-				return
-			}
-			if err := a.SaveProjectPermission(ev.PermReq.ID, []string{suggestions[0].Rule}); err != nil {
-				t.Errorf("SaveProjectPermission run_command: %v", err)
-			}
+				_ = a.SaveProjectPermission(id, []string{suggestions[0].Rule})
+			}()
 		}
 	})
 	ctx, cancel := context.WithCancel(context.Background())

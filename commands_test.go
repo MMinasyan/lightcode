@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -20,10 +19,7 @@ import (
 	"testing"
 	"time"
 
-	agentpkg "github.com/MMinasyan/lightcode/internal/agent"
-	lcconfig "github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/selfupdate"
-	"github.com/MMinasyan/lightcode/internal/server"
 	"github.com/MMinasyan/lightcode/internal/version"
 )
 
@@ -85,7 +81,7 @@ func TestDispatchHelpForms(t *testing.T) {
 		}
 		for _, want := range []string{
 			"Usage: lightcode [command]",
-			"desktop", "cli", "serve", "stop", "acp", "help",
+			"desktop", "cli", "acp", "help",
 			"(default)",
 			"Exit codes: 0 success, 1 failure, 2 usage error.",
 		} {
@@ -96,132 +92,19 @@ func TestDispatchHelpForms(t *testing.T) {
 	}
 }
 
-func TestRunStopNoOwner(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	var out bytes.Buffer
-	oldOut := outW
-	outW = &out
-	t.Cleanup(func() { outW = oldOut })
-	if err := runStop(); err != nil {
-		t.Fatalf("runStop: %v", err)
-	}
-	if got := out.String(); !strings.Contains(got, "lightcode: no owner running") {
-		t.Fatalf("runStop output = %q", got)
-	}
-}
-
-func TestRunStopRemovesStaleOwnerLock(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	if err := server.Write(home, server.LockFile{Port: 1, Token: "stale", PID: -1}); err != nil {
-		t.Fatalf("write lock: %v", err)
-	}
-	var out bytes.Buffer
-	oldOut := outW
-	outW = &out
-	t.Cleanup(func() { outW = oldOut })
-	if err := runStop(); err != nil {
-		t.Fatalf("runStop: %v", err)
-	}
-	if got := out.String(); !strings.Contains(got, "lightcode: removed stale owner lock") {
-		t.Fatalf("runStop output = %q", got)
-	}
-	if _, err := server.Read(home); !os.IsNotExist(err) {
-		t.Fatalf("owner lock after stale stop = %v, want removed", err)
-	}
-}
-
-func TestRunStopLiveOwner(t *testing.T) {
-	home := t.TempDir()
-	projectRoot := t.TempDir()
-	t.Setenv("HOME", home)
-	a := newCommandTestAgent(t, home, projectRoot)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	srv := server.New(a, server.Config{})
-	_, done, err := srv.Start(ctx, home)
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	var out bytes.Buffer
-	oldOut := outW
-	outW = &out
-	t.Cleanup(func() { outW = oldOut })
-	if err := runStop(); err != nil {
-		t.Fatalf("runStop: %v", err)
-	}
-	waitCommandOwnerDone(t, done)
-	if got := out.String(); !strings.Contains(got, "lightcode: owner stopped") {
-		t.Fatalf("runStop output = %q", got)
-	}
-	if _, err := server.Read(home); !os.IsNotExist(err) {
-		t.Fatalf("owner lock after live stop = %v, want removed", err)
-	}
-}
-
 func TestDispatchHelpForCommand(t *testing.T) {
-	_, code, stdout, stderr := capture(t, []string{"lightcode", "help", "serve"})
+	_, code, stdout, stderr := capture(t, []string{"lightcode", "help", "doctor"})
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
 	if stderr != "" {
 		t.Fatalf("stderr must be empty, got %q", stderr)
 	}
-	if !strings.Contains(stdout, "Usage: lightcode serve [flags]") {
-		t.Fatalf("stdout missing serve usage: %q", stdout)
+	if !strings.Contains(stdout, "Usage: lightcode doctor [flags]") {
+		t.Fatalf("stdout missing doctor usage: %q", stdout)
 	}
-	if !strings.Contains(stdout, "-port") {
-		t.Fatalf("stdout missing -port flag: %q", stdout)
-	}
-}
-
-func newCommandTestAgent(t *testing.T, home string, projectRoot string) *agentpkg.Agent {
-	t.Helper()
-	lightcodeDir := filepath.Join(home, ".lightcode")
-	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("LIGHTCODE_TEST_KEY", "test-key")
-	configPath := filepath.Join(lightcodeDir, "config.json")
-	if err := os.WriteFile(configPath, []byte(`{
-  "providers": {
-    "test": {
-      "name": "Test Provider",
-      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_TEST_KEY" },
-      "discovery": false,
-      "models": {
-        "test-model": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 }
-      }
-    }
-  },
-  "default_model": "test/test-model"
-}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(lightcodeDir, "agents.json"), []byte(`{"primary": {"model": "test/test-model"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := lcconfig.Load(configPath)
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	a, err := agentpkg.New(agentpkg.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
-	if err != nil {
-		t.Fatalf("new agent: %v", err)
-	}
-	return a
-}
-
-func waitCommandOwnerDone(t *testing.T, done <-chan error) {
-	t.Helper()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("owner shutdown: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("owner did not shut down")
+	if !strings.Contains(stdout, "-json") {
+		t.Fatalf("stdout missing -json flag: %q", stdout)
 	}
 }
 
@@ -280,7 +163,7 @@ func TestShouldDetachRespectsEnv(t *testing.T) {
 }
 
 func TestDispatchPerCommandHelpFlag(t *testing.T) {
-	for _, name := range []string{"desktop", "cli", "serve", "acp", "doctor", "completion", "models", "config", "help"} {
+	for _, name := range []string{"desktop", "cli", "acp", "doctor", "completion", "models", "config", "help"} {
 		_, code, stdout, stderr := capture(t, []string{"lightcode", name, "-h"})
 		if code != 0 {
 			t.Fatalf("%s -h: exit code = %d, want 0", name, code)
@@ -295,7 +178,7 @@ func TestDispatchPerCommandHelpFlag(t *testing.T) {
 }
 
 func TestDispatchBadFlagPrintsUsageOnce(t *testing.T) {
-	_, code, stdout, stderr := capture(t, []string{"lightcode", "serve", "-port=abc"})
+	_, code, stdout, stderr := capture(t, []string{"lightcode", "doctor", "-json=abc"})
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2", code)
 	}
@@ -305,7 +188,7 @@ func TestDispatchBadFlagPrintsUsageOnce(t *testing.T) {
 	if !strings.HasPrefix(stderr, "lightcode: ") {
 		t.Fatalf("stderr missing error prefix: %q", stderr)
 	}
-	if n := strings.Count(stderr, "Usage: lightcode serve"); n != 1 {
+	if n := strings.Count(stderr, "Usage: lightcode doctor"); n != 1 {
 		t.Fatalf("usage printed %d times, want exactly once:\n%s", n, stderr)
 	}
 }
@@ -315,7 +198,6 @@ func TestDispatchUnexpectedPositionals(t *testing.T) {
 		{"lightcode", "cli", "extra"},
 		{"lightcode", "acp", "extra"},
 		{"lightcode", "desktop", "extra"},
-		{"lightcode", "serve", "extra"},
 		{"lightcode", "doctor", "extra"},
 		{"lightcode", "uninstall", "extra"},
 		{"lightcode", "config", "extra"},
@@ -779,8 +661,11 @@ func TestDispatchUpgradeInstallFlow(t *testing.T) {
 		if stdout != "" {
 			t.Fatalf("stdout must stay empty on install, got %q", stdout)
 		}
-		if !strings.Contains(stderr, "upgraded v1.0.0 -> v9.9.9; takes effect the next time lightcode starts - including the GUI's own relaunch when switching projects.") {
+		if !strings.Contains(stderr, "upgraded v1.0.0 -> v9.9.9; takes effect the next time lightcode starts.") {
 			t.Fatalf("stderr missing final message: %q", stderr)
+		}
+		if strings.Contains(stderr, "including the GUI's own relaunch when switching projects") {
+			t.Fatalf("stderr must not promise a GUI relaunch: %q", stderr)
 		}
 		if strings.Contains(stdout+stderr, "SMOKE_NOISE_MARKER") {
 			t.Fatal("smoke child output was forwarded")
@@ -1953,4 +1838,90 @@ func TestDispatchConfig(t *testing.T) {
 			t.Fatalf("exit=%d stderr=%q", code, stderr)
 		}
 	})
+}
+
+// TestRemovedOwnerTransportSymbols proves the removed daemon transport cannot
+// silently return: serve and stop resolve as unknown commands through
+// findCommand's nil path, and zero references to the transport's package and
+// symbols exist anywhere in the tree.
+func TestRemovedOwnerTransportSymbols(t *testing.T) {
+	for _, name := range []string{"serve", "stop"} {
+		if cmd := findCommand(name); cmd != nil {
+			t.Fatalf("%q must resolve as an unknown command, got %#v", name, cmd)
+		}
+	}
+
+	// The full removed surface: the owner lock file and its liveness probes,
+	// the shutdown endpoint and its trigger, the adapter lease/attachment
+	// machinery, the HTTP service and its handlers, the serve/stop command
+	// bodies, and the transport package with its client. Unqualified Client
+	// and NewClient stay out of the list: they name the surviving provider and
+	// LSP clients, which have nothing to do with this transport.
+	symbols := []string{
+		"owner.lock",
+		"IsStale",
+		"WaitForOwnerExit",
+		"WaitForOwnerExitContext",
+		"LockFile",
+		"RequestShutdown",
+		"/v1/owner/shutdown",
+		"AttachLocalAdapter",
+		"DetachAdapter",
+		"adapterLease",
+		"hasLocalAdapterLeaseLocked",
+		"newAdapterID",
+		"LocalService",
+		"handleAdapterSSE",
+		"streamEvents",
+		"rpcHandlers",
+		"attachAdapter",
+		"adapterRPCRequest",
+		"rpcEnvelope",
+		"runServe",
+		"runStop",
+		"internal/server",
+		"server.NewClient",
+		"AttachAdapter",
+		"WaitOwner",
+		"/v1/adapter",
+	}
+	// The scan covers every code file in the product tree — Go, the
+	// frontend's Svelte/TS/JS/JSON/HTML — so a reference added anywhere in
+	// the repo (including the frontend) fails. Dot-directories are the
+	// repo's private/local material (.git, .office, .claude, .opencode),
+	// and node_modules/dist/build are dependencies and build output; none
+	// is product code. Test files may carry these symbols as the data of
+	// absence assertions, which is not a reference to the removed transport.
+	codeExts := map[string]bool{
+		".go": true, ".svelte": true, ".ts": true, ".js": true,
+		".mjs": true, ".cjs": true, ".json": true, ".html": true,
+	}
+	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name != "." && (strings.HasPrefix(name, ".") || name == "node_modules" || name == "dist" || name == "build") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !codeExts[filepath.Ext(path)] || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, symbol := range symbols {
+			if strings.Contains(string(b), symbol) {
+				t.Errorf("%s references removed owner transport symbol %q", path, symbol)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
 }

@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -16,76 +18,459 @@ import (
 	"github.com/MMinasyan/lightcode/internal/version"
 )
 
+// deliveryJoinTimeout bounds how long close waits for the delivery drainer to
+// finish. A drainer blocked inside a framework emit is abandoned after it; it
+// holds no lock or state and process exit owns the blocked call.
+var deliveryJoinTimeout = 5 * time.Second
+
+// errAdapterClosed is returned by a current-target or navigation call that
+// acquires navMu after close has won it.
+var errAdapterClosed = errors.New("adapter is closed")
+
+// frameKind selects how the sole drainer filters a frame against presentation
+// current before emitting it.
+type frameKind uint8
+
+const (
+	// frameNormal is delivered while its sessionID is presentation-current; an
+	// empty sessionID is a global frame the drainer always delivers.
+	frameNormal frameKind = iota
+	// frameSubagent is delivered for a child registered under the presented root.
+	frameSubagent
+	// frameAdvance is a navigation/turn-action boundary: always delivered, and it
+	// adopts sessionID as the new presentation current (empty for a detach).
+	frameAdvance
+)
+
+// deliveryFrame is one immutable item the delivery FIFO carries: a named event
+// with its payload, plus an optional native window title a navigation boundary
+// carries so the drainer applies the title in the same ordered step as the
+// boundary. kind and the session/subagent tags let the sole drainer filter it
+// against presentation current at drain time, so the event callback that appends
+// it never queries the owner. The sole drainer emits it.
+type deliveryFrame struct {
+	name      string
+	payload   any
+	title     string
+	kind      frameKind
+	sessionID string // frameNormal tag / frameAdvance destination
+	parent    string // frameSubagent parent (root) session
+	child     string // frameSubagent child session
+}
+
 // App is the Wails-bound struct that bridges the Go backend to the
 // frontend. All exported methods are callable from JavaScript.
 type App struct {
-	ctx             context.Context
-	svc             agent.AdapterService
-	scope           *agent.AdapterScope
-	viewOnce        sync.Once
-	view            *agent.SessionView
-	adapterAttached bool
+	ctx context.Context
+	svc agent.AdapterService
+	// agent is the concrete local owner this adapter constructs, initializes, and
+	// shuts down. It also backs the concrete-only complete-state hydration surface,
+	// which is intentionally not part of AdapterService.
+	agent *agent.Agent
+
+	// lifecycleMu serializes startup against shutdown. Startup initializes the owner
+	// under it and records started; shutdown takes it, records closed, and tears down
+	// only an owner startup actually initialized. This makes an early close that races
+	// an asynchronous startup safe: shutdown before startup short-circuits both.
+	lifecycleMu sync.Mutex
+	started     bool
+	closed      bool
+	hostCancel  context.CancelFunc
+
+	// navMu is the operation gate owning routing-current (session id + project
+	// path). Ordinary current-target calls hold it across owner entry; a
+	// cancellable/long call captures its id under it and releases before invoking
+	// the owner; navigation holds it across the routing commit. Lock order is
+	// lifecycleMu (App startup/shutdown) -> navMu -> the owner's own locks.
+	// navClosed, set under navMu on close, makes a call waiting on navMu reject.
+	navMu     sync.Mutex
+	navClosed bool
+
+	// routeMu guards the adapter's routing-current session id — a leaf below navMu.
+	// Navigation and current-target operations take navMu then routeMu. Routing
+	// current is where operations route; presentation current (owned by the drainer)
+	// is what the frontend shows, and the two diverge while a boundary is in flight.
+	// routeReadOnly sits beside it: the id of the routing-current session that was
+	// opened read-only because another process holds its claim. The two states are
+	// explicit: the routing setter clears it on every commit, and only the read-only
+	// open path sets it, after committing the id it names — so a successful live
+	// commit of the same session can never leave it stale.
+	routeMu       sync.Mutex
+	routeCurrent  string
+	routeReadOnly string
+
+	// routeProjectPath is the adapter's routing-current project path, owned by
+	// navMu: navigation commits it and every project-scoped read captures it under
+	// navMu. Nothing reads it off the operation gate, so it needs no leaf lock.
+	routeProjectPath string
+
+	// Delivery spine: every event and navigation payload is appended as a frame;
+	// the single drainer is the only goroutine that emits to the frontend, so
+	// delivery order is the drainer's write order. emitFn is the one emission
+	// choke point (overridable in tests). The queue is unbounded by design: a
+	// drainer blocked inside one framework emit grows it without limit rather
+	// than block a producer appending under an owner lock, so appending never
+	// waits for queue capacity or for the sink to accept the frame — only for
+	// the queue mutex, behind another producer or the drainer's critical
+	// section.
+	emitFn         func(name string, payload any)
+	titleFn        func(title string)
+	deliveryMu     sync.Mutex
+	deliveryFrames []deliveryFrame
+	deliveryWake   chan struct{}
+	deliveryClosed bool
+	deliveryDone   chan struct{}
+	deliveryOnce   sync.Once
+
+	// presented is presentation current: the session id the drainer is currently
+	// showing. It advances only when the drainer consumes a navigation/turn-action
+	// boundary, so a stalled sink keeps presenting the prior session while routing
+	// current has already moved. presentedChildren holds the subagent children
+	// registered under it. Both are owned by the drainer and read or written only
+	// under deliveryMu (the startup seed included).
+	presented         string
+	presentedChildren map[string]struct{}
 }
 
 type ModelCompletion = agent.ModelCompletion
 
-// startup is called by Wails after the window is created.
+// startup is called by Wails after the window is created. Wails runs it
+// asynchronously, so it holds lifecycleMu across owner initialization: a close
+// that races it either waits here or, if it already ran, short-circuits.
 func (a *App) startup(ctx context.Context) {
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
+	if a.closed {
+		return
+	}
 	a.ctx = ctx
+	// The host context only triggers the joined owner shutdown (the Init
+	// watcher); the project LSP teardown runs on the owner context inside that
+	// join. Initialize under a cancelable child so shutdown can release the
+	// watcher. Delivery keeps using the original ctx, which stays valid until
+	// the drainer is closed.
+	hostCtx, cancel := context.WithCancel(ctx)
+	a.hostCancel = cancel
+	// Hold navMu across the whole startup so it is a readiness barrier. Wails loads
+	// the frontend concurrently with this asynchronous startup, so every routing
+	// operation waits here until routing is fully set up: it can neither read a
+	// half-initialized route nor commit a project switch that startup would then
+	// overwrite. Owner initialization takes no adapter lock, so this cannot deadlock.
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	a.startDelivery()
 	a.svc.SetEventHandler(a.handleEvent)
-	a.svc.Init(ctx)
-	a.scope = agent.NewAdapterScope(a.svc, a.svc.ProjectRoot())
-	if lifecycle, ok := a.svc.(interface{ AttachAdapter(context.Context) error }); ok {
-		a.adapterAttached = lifecycle.AttachAdapter(ctx) == nil
-	}
-	sessionID := ""
-	if sessions, err := a.scope.SessionList("active"); err == nil && len(sessions) > 0 {
-		if summary, err := a.svc.OpenSession(sessions[0].ID); err == nil {
-			sessionID = summary.ID
-		}
-	}
+	// Init resumes the most recent acquirable session and returns its id, so
+	// the adapter adopts exactly the session that was resumed; a new session
+	// is created only when nothing was resumed.
+	sessionID := a.svc.Init(hostCtx)
+	a.routeProjectPath = a.svc.ProjectRoot()
 	if sessionID == "" {
-		if id, err := a.scope.NewSession("primary"); err == nil {
+		var prepared agent.HydrationState
+		emitted := false
+		id, err := a.svc.NewSessionForProjectPathWithBoundary(a.routeProjectPath, "primary", func(state agent.HydrationState, _ error) {
+			prepared = state
+			emitted = true
+		})
+		if err != nil {
+			var committed *snapshot.CommittedMutationError
+			if emitted && errors.As(err, &committed) {
+				sessionID = id
+				fmt.Fprintf(os.Stderr, "lightcode: startup session: %v\n", err)
+			} else if errors.Is(err, agent.ErrProjectBusy) {
+				fmt.Fprintf(os.Stderr, "lightcode: startup project: %v\n", err)
+			}
+		} else if emitted {
 			sessionID = id
+			if sessionID == "" {
+				sessionID = prepared.Session.ID
+			}
 		}
 	}
 	a.setCurrentSessionID(sessionID)
+	a.seedPresented(sessionID)
+	a.started = true
 }
 
-func (a *App) shutdown(ctx context.Context) {
-	if !a.adapterAttached {
+func (a *App) shutdown(_ context.Context) {
+	a.lifecycleMu.Lock()
+	a.closed = true
+	started := a.started
+	hostCancel := a.hostCancel
+	// Win navMu so a current-target/navigation call waiting on it rejects instead
+	// of racing teardown.
+	a.navMu.Lock()
+	a.navClosed = true
+	a.navMu.Unlock()
+	a.lifecycleMu.Unlock()
+
+	a.closeDelivery()
+	if !started {
 		return
 	}
-	if lifecycle, ok := a.svc.(interface{ DetachAdapter(context.Context) error }); ok {
-		_ = lifecycle.DetachAdapter(ctx)
+	// Join the owner's turns and workers first: ShutdownOwner drains in-flight turns
+	// while the internal event drainer is still alive, then stops the workers, tears
+	// down the LSP services on the owner context inside the join, and detaches the
+	// session stores when every turn finished. Only then cancel the host context,
+	// whose sole watcher is the shutdown trigger goroutine.
+	if a.agent != nil {
+		// The Wails shutdown hook has no return channel: the stderr diagnostic
+		// inside ShutdownOwner is this host's only available signal.
+		_ = a.agent.ShutdownOwner()
+	}
+	if hostCancel != nil {
+		hostCancel()
 	}
 }
 
-func (a *App) sv() *agent.SessionView {
-	a.viewOnce.Do(func() { a.view = agent.NewSessionView(a.svc) })
-	return a.view
+// HydrateSession returns a session's complete live state for the frontend to
+// apply as one snapshot before replaying subsequent live events. It reaches the
+// concrete owner directly because complete-state hydration is not part of the
+// shared AdapterService.
+func (a *App) HydrateSession(sessionID string) (agent.HydrationState, error) {
+	if a.agent == nil {
+		return agent.HydrationState{}, fmt.Errorf("hydration is unavailable")
+	}
+	return a.agent.HydrateSession(sessionID)
+}
+
+// startDelivery installs the emission choke point and starts the sole drainer
+// before any event callback is connected. emitFn defaults to the framework emit
+// and is left untouched when a test set it first.
+func (a *App) startDelivery() {
+	if a.emitFn == nil {
+		a.emitFn = func(name string, payload any) {
+			wailsRuntime.EventsEmit(a.ctx, name, payload)
+		}
+	}
+	if a.titleFn == nil {
+		a.titleFn = func(title string) {
+			wailsRuntime.WindowSetTitle(a.ctx, title)
+		}
+	}
+	a.deliveryWake = make(chan struct{}, 1)
+	a.deliveryDone = make(chan struct{})
+	go a.runDeliveryDrainer()
+}
+
+// enqueueFrame appends one frame and wakes the drainer. It never blocks, emits,
+// or queries the owner, so it is safe to call from an event callback that runs
+// under an owner lock.
+func (a *App) enqueueFrame(f deliveryFrame) {
+	a.deliveryMu.Lock()
+	if a.deliveryClosed {
+		a.deliveryMu.Unlock()
+		return
+	}
+	a.deliveryFrames = append(a.deliveryFrames, f)
+	a.deliveryMu.Unlock()
+	select {
+	case a.deliveryWake <- struct{}{}:
+	default:
+	}
+}
+
+// emitFrame appends a global frame the drainer always delivers.
+func (a *App) emitFrame(name string, payload any) {
+	a.enqueueFrame(deliveryFrame{name: name, payload: payload})
+}
+
+// emitSessionFrame appends a session-tagged frame the drainer delivers only while
+// that session is presentation-current. An empty session id is a global frame.
+func (a *App) emitSessionFrame(sessionID, name string, payload any) {
+	a.enqueueFrame(deliveryFrame{name: name, payload: payload, sessionID: strings.TrimSpace(sessionID)})
+}
+
+// emitSubagentFrame appends a subagent frame the drainer delivers only for a child
+// registered under the presentation-current root.
+func (a *App) emitSubagentFrame(ev agent.Event, name string, payload any) {
+	a.enqueueFrame(deliveryFrame{
+		name:    name,
+		payload: payload,
+		kind:    frameSubagent,
+		parent:  strings.TrimSpace(ev.ParentSessionID),
+		child:   strings.TrimSpace(ev.SubagentSessionID),
+	})
+}
+
+// enqueueBoundary appends a navigation/turn-action boundary: the drainer delivers
+// it and then adopts sessionID as presentation current (empty for a detach). A
+// native window title, if any, rides the same ordered step.
+func (a *App) enqueueBoundary(name string, payload any, title, sessionID string) {
+	a.enqueueFrame(deliveryFrame{
+		name:      name,
+		payload:   payload,
+		title:     title,
+		kind:      frameAdvance,
+		sessionID: strings.TrimSpace(sessionID),
+	})
+}
+
+// enqueueBoundaryWithError atomically appends a boundary and, only when committedMsg
+// is nonempty, one existing unsequenced error frame directly after it. Both frames
+// are appended under one deliveryMu hold with exactly one wake, so the drainer can
+// never interleave an older queued frame between them: the frontend applies the
+// advance (or detach) and then sees the rejection as its own row — never reversed or
+// split by a stale token. The error inherits sessionID's tag on purpose: after a
+// current-detach adopt, only that empty/global tag survives; after a noncurrent nil
+// advance, it is exactly the unchanged-current tag a deleted-session tag would fail.
+// No owner call, callback, title update, or I/O runs under the hold — message and
+// payload are prepared by the caller beforehand.
+func (a *App) enqueueBoundaryWithError(name string, payload any, title, sessionID, committedMsg string) {
+	a.deliveryMu.Lock()
+	if a.deliveryClosed {
+		a.deliveryMu.Unlock()
+		return
+	}
+	tag := strings.TrimSpace(sessionID)
+	frames := []deliveryFrame{{name: name, payload: payload, title: title, kind: frameAdvance, sessionID: tag}}
+	if committedMsg != "" {
+		frames = append(frames, deliveryFrame{name: "error", payload: map[string]any{"message": committedMsg}, sessionID: tag})
+	}
+	a.deliveryFrames = append(a.deliveryFrames, frames...)
+	a.deliveryMu.Unlock()
+	select {
+	case a.deliveryWake <- struct{}{}:
+	default:
+	}
+}
+
+// lifecycleErrorMessage renders the adapter's rejection as its ordered error frame's
+// message text — the same full string every other consumer surfaces.
+func lifecycleErrorMessage(err error) string { return err.Error() }
+
+// seedPresented sets presentation current at startup, before the frontend's
+// hydration pull, so live frames for the initially-current session reach it. It
+// takes deliveryMu because the drainer is already running.
+func (a *App) seedPresented(id string) {
+	a.deliveryMu.Lock()
+	a.presented = strings.TrimSpace(id)
+	a.presentedChildren = nil
+	a.deliveryMu.Unlock()
+}
+
+// runDeliveryDrainer is the only goroutine that emits to the frontend. It drains
+// frames in FIFO order and exits once closed and drained.
+func (a *App) runDeliveryDrainer() {
+	defer close(a.deliveryDone)
+	for {
+		a.deliveryMu.Lock()
+		if a.deliveryClosed {
+			// Once closed, stop emitting and drop pending frames — including any
+			// queued behind an abandoned blocked emit, which must not reach the
+			// frontend after shutdown has proceeded. The drop is deliberate,
+			// unlike the protocol host's close, which drains its backlog because
+			// its client process is still reading the pipe: the Wails framework
+			// stops its main loop and releases the window and webview before
+			// invoking the shutdown hook (verified in Wails v2.12.0 on all three
+			// platforms), so an emit from inside that hook is never dispatched —
+			// on Linux the idle source never fires and the queued entry leaks.
+			a.deliveryMu.Unlock()
+			return
+		}
+		if len(a.deliveryFrames) == 0 {
+			a.deliveryMu.Unlock()
+			<-a.deliveryWake
+			continue
+		}
+		frame := a.deliveryFrames[0]
+		a.deliveryFrames = a.deliveryFrames[1:]
+		deliver := a.presentAcceptsLocked(frame)
+		a.deliveryMu.Unlock()
+		if !deliver {
+			continue
+		}
+		a.emitFn(frame.name, frame.payload)
+		if frame.title != "" {
+			// Recheck close before applying the title: if emitFn blocked and close
+			// abandoned the drainer meanwhile, the window is going away and the title
+			// must not change after shutdown has proceeded.
+			a.deliveryMu.Lock()
+			closed := a.deliveryClosed
+			a.deliveryMu.Unlock()
+			if !closed {
+				a.titleFn(frame.title)
+			}
+		}
+	}
+}
+
+// presentAcceptsLocked decides whether a frame reaches the frontend and adopts a
+// boundary's destination as presentation current. It runs under deliveryMu on the
+// sole drainer, so presented and its subagent child set are drainer-owned and
+// never queried from the owner: a session-tagged frame reaches the frontend only
+// while its session is presentation-current, a boundary always passes and advances
+// presented (empty for a detach), and a subagent frame passes through the child
+// set registered under the presented root.
+func (a *App) presentAcceptsLocked(f deliveryFrame) bool {
+	switch f.kind {
+	case frameAdvance:
+		a.presented = f.sessionID
+		a.presentedChildren = nil
+		return true
+	case frameSubagent:
+		if a.presented == "" {
+			return false
+		}
+		if f.parent == a.presented {
+			if a.presentedChildren == nil {
+				a.presentedChildren = make(map[string]struct{})
+			}
+			a.presentedChildren[f.child] = struct{}{}
+			return true
+		}
+		_, ok := a.presentedChildren[f.child]
+		return ok
+	default:
+		return f.sessionID == "" || f.sessionID == a.presented
+	}
+}
+
+// closeDelivery rejects further frames and joins the drainer, abandoning it if
+// it is blocked inside one framework emit.
+func (a *App) closeDelivery() {
+	a.deliveryOnce.Do(func() {
+		a.deliveryMu.Lock()
+		a.deliveryClosed = true
+		a.deliveryMu.Unlock()
+		select {
+		case a.deliveryWake <- struct{}{}:
+		default:
+		}
+		if a.deliveryDone == nil {
+			return
+		}
+		select {
+		case <-a.deliveryDone:
+		case <-time.After(deliveryJoinTimeout):
+		}
+	})
 }
 
 func (a *App) handleEvent(ev agent.Event) {
-	if !a.acceptsEvent(ev) {
-		return
-	}
 	if ev.SubagentSessionID != "" {
+		emit := func(name string, payload any) { a.emitSubagentFrame(ev, name, payload) }
 		switch ev.Kind {
 		case agent.EventTextDelta:
-			wailsRuntime.EventsEmit(a.ctx, "subagent_token", map[string]any{
+			emit("subagent_token", map[string]any{
 				"sessionId": ev.SubagentSessionID,
+				"seq":       ev.Seq,
 				"content":   ev.Result,
 			})
 		case agent.EventToolCallStart:
-			wailsRuntime.EventsEmit(a.ctx, "subagent_tool_start", map[string]any{
+			emit("subagent_tool_start", map[string]any{
 				"sessionId": ev.SubagentSessionID,
+				"seq":       ev.Seq,
 				"id":        ev.ToolCallID,
 				"name":      ev.ToolName,
 				"args":      ev.Args,
 			})
 		case agent.EventToolCallEnd:
-			wailsRuntime.EventsEmit(a.ctx, "subagent_tool_result", map[string]any{
+			// Not sequence-gated: a tool result updates its row in place without
+			// advancing the sequence, so gating it would drop every result whose
+			// start already advanced the high-water. Delivered id-keyed and
+			// applied idempotently, exactly as the root branch handles it.
+			emit("subagent_tool_result", map[string]any{
 				"sessionId": ev.SubagentSessionID,
 				"id":        ev.ToolCallID,
 				"name":      ev.ToolName,
@@ -95,15 +480,16 @@ func (a *App) handleEvent(ev agent.Event) {
 				"metadata":  ev.Metadata,
 			})
 		case agent.EventSubagentStart:
-			wailsRuntime.EventsEmit(a.ctx, "subagent_session_start", map[string]any{
+			emit("subagent_session_start", map[string]any{
 				"sessionId":      ev.SubagentSessionID,
 				"taskToolCallId": ev.ToolCallID,
 				"taskIndex":      ev.TaskIndex,
 			})
 		case agent.EventBackgroundProcessComplete:
 			if ev.BackgroundProcess != nil {
-				wailsRuntime.EventsEmit(a.ctx, "subagent_background_process_complete", map[string]any{
+				emit("subagent_background_process_complete", map[string]any{
 					"sessionId": ev.SubagentSessionID,
+					"seq":       ev.Seq,
 					"id":        ev.BackgroundProcess.ID,
 					"command":   ev.BackgroundProcess.Command,
 					"reason":    ev.BackgroundProcess.Reason,
@@ -112,22 +498,41 @@ func (a *App) handleEvent(ev agent.Event) {
 					"output":    ev.Result,
 				})
 			}
+		case agent.EventUserMessageDisplay:
+			emit("subagent_user_message", map[string]any{
+				"sessionId": ev.SubagentSessionID,
+				"seq":       ev.Seq,
+				"turn":      ev.Turn,
+				"content":   ev.Result,
+			})
+		case agent.EventGenericSystemSignal:
+			emit("subagent_system_signal", map[string]any{
+				"sessionId": ev.SubagentSessionID,
+				"seq":       ev.Seq,
+				"content":   "System: " + ev.Result,
+			})
 		}
 		return
 	}
+	// Every frame this callback appends carries the event's session tag; the sole
+	// drainer, not this callback, decides delivery against presentation current, so
+	// the callback never queries the owner for liveness.
+	emit := func(name string, payload any) { a.emitSessionFrame(ev.SessionID, name, payload) }
 	switch ev.Kind {
 	case agent.EventTextDelta:
-		wailsRuntime.EventsEmit(a.ctx, "token", map[string]any{
+		emit("token", map[string]any{
+			"seq":     ev.Seq,
 			"content": ev.Result,
 		})
 	case agent.EventToolCallStart:
-		wailsRuntime.EventsEmit(a.ctx, "tool_start", map[string]any{
+		emit("tool_start", map[string]any{
+			"seq":  ev.Seq,
 			"id":   ev.ToolCallID,
 			"name": ev.ToolName,
 			"args": ev.Args,
 		})
 	case agent.EventToolCallEnd:
-		wailsRuntime.EventsEmit(a.ctx, "tool_result", map[string]any{
+		emit("tool_result", map[string]any{
 			"id":       ev.ToolCallID,
 			"name":     ev.ToolName,
 			"args":     ev.Args,
@@ -137,7 +542,8 @@ func (a *App) handleEvent(ev agent.Event) {
 		})
 	case agent.EventBackgroundProcessComplete:
 		if ev.BackgroundProcess != nil {
-			wailsRuntime.EventsEmit(a.ctx, "background_process_complete", map[string]any{
+			emit("background_process_complete", map[string]any{
+				"seq":      ev.Seq,
 				"id":       ev.BackgroundProcess.ID,
 				"command":  ev.BackgroundProcess.Command,
 				"reason":   ev.BackgroundProcess.Reason,
@@ -147,12 +553,14 @@ func (a *App) handleEvent(ev agent.Event) {
 			})
 		}
 	case agent.EventUserMessageDisplay:
-		wailsRuntime.EventsEmit(a.ctx, "user_message", map[string]any{
+		emit("user_message", map[string]any{
+			"seq":     ev.Seq,
 			"turn":    ev.Turn,
 			"content": ev.Result,
 		})
 	case agent.EventGenericSystemSignal:
-		wailsRuntime.EventsEmit(a.ctx, "system_signal", map[string]any{
+		emit("system_signal", map[string]any{
+			"seq":     ev.Seq,
 			"content": "System: " + ev.Result,
 		})
 	case agent.EventQueueChanged:
@@ -160,25 +568,37 @@ func (a *App) handleEvent(ev agent.Event) {
 		if queue == nil {
 			queue = []agent.QueuedItem{}
 		}
-		wailsRuntime.EventsEmit(a.ctx, "queue_changed", map[string]any{
+		emit("queue_changed", map[string]any{
 			"items":   queue,
 			"version": ev.QueueVersion,
 		})
 	case agent.EventUsage:
-		wailsRuntime.EventsEmit(a.ctx, "usage", a.tokenUsage())
-	case agent.EventTurnStart:
-		wailsRuntime.EventsEmit(a.ctx, "turn_start", map[string]any{"turn": ev.Turn})
-		wailsRuntime.EventsEmit(a.ctx, "status", map[string]any{"state": "streaming"})
-	case agent.EventTurnEnd:
-		wailsRuntime.EventsEmit(a.ctx, "turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
-		wailsRuntime.EventsEmit(a.ctx, "status", map[string]any{"state": "idle"})
-		if ev.RefreshSession {
-			a.emitSessionChangedForEvent(ev)
+		// Apply the event's absolute cumulative report as a replacement rather than
+		// querying the owner, so this callback never re-enters the owner while it is
+		// emitting under tokensMu.
+		report := agent.TokenReport{}
+		if ev.CumulativeTokens != nil {
+			report = *ev.CumulativeTokens
 		}
+		emit("usage", report)
+	case agent.EventTurnStart:
+		emit("turn_start", map[string]any{"turn": ev.Turn})
+		emit("status", map[string]any{"state": "streaming"})
+	case agent.EventTurnEnd:
+		emit("turn_end", map[string]any{"turn": ev.Turn, "cancelled": ev.Cancelled})
+		emit("status", map[string]any{"state": "idle"})
 	case agent.EventError:
-		wailsRuntime.EventsEmit(a.ctx, "error", map[string]any{"message": ev.Error})
+		// A frame carries a sequence only when the event actually has one: a
+		// sessionless error is emitted directly, never sequenced, and a
+		// zero-stamped seq would gate it as already shown against every
+		// snapshot high-water, dropping the error.
+		errorFrame := map[string]any{"message": ev.Error}
+		if ev.Seq != 0 {
+			errorFrame["seq"] = ev.Seq
+		}
+		emit("error", errorFrame)
 	case agent.EventPermissionRequest:
-		wailsRuntime.EventsEmit(a.ctx, "permission_request", map[string]any{
+		emit("permission_request", map[string]any{
 			"id":                 ev.PermReq.ID,
 			"sessionId":          ev.PermReq.SessionID,
 			"projectId":          ev.PermReq.ProjectID,
@@ -192,92 +612,211 @@ func (a *App) handleEvent(ev agent.Event) {
 			"batchFiles":         ev.PermReq.BatchFiles,
 			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		})
+	case agent.EventPermissionResolved:
+		emit("permission_resolved", map[string]any{
+			"id":        ev.PermReq.ID,
+			"sessionId": ev.PermReq.SessionID,
+		})
 	case agent.EventCompactionStart:
-		wailsRuntime.EventsEmit(a.ctx, "compaction_start", nil)
+		emit("compaction_start", nil)
 	case agent.EventCompactionEnd:
-		wailsRuntime.EventsEmit(a.ctx, "compaction_end", nil)
-		if ev.RefreshSession {
-			a.emitSessionChangedForEvent(ev)
-		}
+		emit("compaction_end", nil)
+	case agent.EventSessionRewrite:
+		a.emitResyncBoundary(ev.SessionID, ev.RewritePayload)
 	case agent.EventWarning:
-		wailsRuntime.EventsEmit(a.ctx, "warnings", ev.Warnings)
+		emit("warnings", ev.Warnings)
 	}
 }
 
-// emitSessionChanged tells the frontend to replace its message list.
-func (a *App) emitSessionChanged() {
-	a.emitSessionChangedForSession(a.currentSessionID())
+// turnActionBoundary is the ordered frame a fork, history revert, or code revert
+// appends through the delivery FIFO: the destination session's complete state (nil
+// when the action changed no session), the history revert's input prefill (nil for
+// fork and code revert; a nonnil pointer even when the content is empty, so an
+// empty string still clears the composer), any files a code revert kept unchanged,
+// and the warning a fork carries when its best-effort code revert failed. The
+// ordered consumer applies the state, the prefill, the skip notice, and the
+// warning in that order, so no live frame interleaves between them or clobbers
+// either notice.
+type turnActionBoundary struct {
+	State        *agent.HydrationState    `json:"state"`
+	Prefill      *string                  `json:"prefill,omitempty"`
+	SkippedFiles []snapshot.SkippedRevert `json:"skippedFiles"`
+	Warning      string                   `json:"warning,omitempty"`
 }
 
-func (a *App) emitSessionChangedForEvent(ev agent.Event) {
-	if strings.TrimSpace(ev.SessionID) != "" {
-		a.emitSessionChangedForSession(ev.SessionID)
+// emitTurnActionNotice appends a code revert's skip notice as an ordered notice-only
+// frame (no state change), so a refresh already queued ahead of it applies first and
+// cannot clobber the notice appended after.
+func (a *App) emitTurnActionNotice(skipped []snapshot.SkippedRevert) {
+	if a.ctx == nil || len(skipped) == 0 {
 		return
 	}
-	a.emitSessionChanged()
+	a.emitFrame("turn_action", turnActionBoundary{SkippedFiles: skipped})
 }
 
-func (a *App) emitSessionChangedForSession(sessionID string) {
+// emitResyncBoundary re-syncs a compacted session's transcript and tokens through
+// one ordered frame. The payload is built by the producer and carried on the
+// event, so this callback only enqueues it and never re-enters the owner. The
+// frontend applies the compaction-affected transcript and tokens, leaving
+// activity and queue that compaction did not change to the live stream.
+func (a *App) emitResyncBoundary(sessionID string, payload *agent.SessionPayload) {
 	if a.ctx == nil {
 		return
 	}
-	payload := a.sv().SessionChangedPayload(sessionID)
-	wailsRuntime.EventsEmit(a.ctx, "session_changed", payload)
+	p := agent.SessionPayload{}
+	if payload != nil {
+		p = *payload
+	}
+	a.emitSessionFrame(sessionID, "resync", p)
 }
 
 func (a *App) setCurrentSessionID(id string) {
-	a.sv().SetCurrent(id)
+	id = strings.TrimSpace(id)
+	a.routeMu.Lock()
+	// Every routing commit clears the read-only marker unconditionally: only
+	// the read-only open path sets it, after committing the id it names, so a
+	// successful live commit of the same session can never leave it stale.
+	a.routeReadOnly = ""
+	a.routeCurrent = id
+	a.routeMu.Unlock()
+}
+
+// markRouteReadOnly records that the routing current was opened read-only
+// because another process holds the session's claim. The routing setter clears
+// the marker on every commit, so it must be set after committing the id it
+// names.
+func (a *App) markRouteReadOnly(id string) {
+	id = strings.TrimSpace(id)
+	a.routeMu.Lock()
+	a.routeReadOnly = id
+	a.routeMu.Unlock()
+}
+
+// routeReadOnlyNames reports whether the given id is the read-only-marked
+// routing current.
+func (a *App) routeReadOnlyNames(id string) bool {
+	a.routeMu.Lock()
+	defer a.routeMu.Unlock()
+	return a.routeReadOnly != "" && a.routeReadOnly == id
+}
+
+// clearRouteIfCurrent clears the routing current only when it still equals id, so
+// a stale validation cannot clear a session another goroutine has since selected.
+func (a *App) clearRouteIfCurrent(id string) {
+	id = strings.TrimSpace(id)
+	a.routeMu.Lock()
+	if a.routeCurrent == id {
+		a.routeCurrent = ""
+	}
+	a.routeMu.Unlock()
 }
 
 func (a *App) currentSessionID() string {
-	return a.sv().Current()
+	a.routeMu.Lock()
+	defer a.routeMu.Unlock()
+	return a.routeCurrent
 }
 
 func (a *App) currentSession() (string, error) {
-	return a.sv().CurrentOrErr()
+	id := a.currentSessionID()
+	if id == "" {
+		return "", fmt.Errorf("no current session")
+	}
+	return id, nil
 }
 
-func (a *App) acceptsSessionEvent(sessionID string) bool {
-	return a.sv().AcceptsSessionEvent(sessionID)
-}
-
-func (a *App) acceptsEvent(ev agent.Event) bool {
-	return a.sv().AcceptsEvent(ev)
-}
-
-func (a *App) acceptsSubagentEvent(ev agent.Event) bool {
-	return a.sv().AcceptsSubagentEvent(ev)
-}
-
-func (a *App) acceptsSubagentEventForCurrent(current string, ev agent.Event) bool {
-	return a.sv().AcceptsSubagentEventForCurrent(current, ev)
+// boundedSessionIDLocked returns the routing-current session id for an ordinary
+// current-target call. The caller holds navMu across the owner call so the id it
+// targets cannot change under it; a close that won navMu first rejects here.
+func (a *App) boundedSessionIDLocked() (string, error) {
+	if a.navClosed {
+		return "", errAdapterClosed
+	}
+	return a.currentSession()
 }
 
 func (a *App) liveCurrentSessionID() string {
-	return a.sv().LiveCurrent()
+	id := a.currentSessionID()
+	if id == "" {
+		return ""
+	}
+	if a.routeReadOnlyNames(id) {
+		// The routing current was opened read-only because another process
+		// drives it; it stays routed, just not live here.
+		return ""
+	}
+	if _, err := a.svc.SessionSummaryForSession(id); err != nil {
+		a.clearRouteIfCurrent(id)
+		return ""
+	}
+	return id
+}
+
+// liveCurrentSessionOrErr is liveCurrentSessionID for a caller that must
+// distinguish why no live session is current: the read-only-marked session is
+// current, so another process drives it, or there is no current session at all.
+func (a *App) liveCurrentSessionOrErr() (string, error) {
+	id := a.liveCurrentSessionID()
+	if id != "" {
+		return id, nil
+	}
+	current := a.currentSessionID()
+	if a.routeReadOnlyNames(current) {
+		return "", agent.SessionContendedError(current)
+	}
+	return "", fmt.Errorf("no current session")
 }
 
 func (a *App) resolveSessionID(id string) (string, error) {
-	return a.sv().Resolve(id)
+	id = strings.TrimSpace(id)
+	if id != "" {
+		return id, nil
+	}
+	return a.currentSession()
 }
 
 func (a *App) currentSessionSummary() agent.SessionSummary {
-	return a.sv().CurrentSummary()
+	id := a.currentSessionID()
+	if id == "" {
+		return agent.SessionSummary{}
+	}
+	s, err := a.svc.SessionSummaryForSessionOrPersisted(id)
+	if err != nil {
+		a.setCurrentSessionID("")
+		return agent.SessionSummary{}
+	}
+	return s
 }
 
 func (a *App) tokenUsage() agent.TokenReport {
-	return a.sv().TokenUsage()
+	id := a.currentSessionID()
+	if id == "" {
+		return agent.TokenReport{}
+	}
+	report, err := a.svc.TokenUsageForSession(id)
+	if err != nil {
+		return agent.TokenReport{}
+	}
+	return report
 }
 
 func (a *App) sessionMessages() []agent.DisplayMessage {
+	a.navMu.Lock()
+	if a.navClosed {
+		a.navMu.Unlock()
+		return nil
+	}
 	id := a.currentSessionID()
 	if id == "" {
+		a.navMu.Unlock()
 		return nil
 	}
-	if _, err := a.svc.SessionSummaryForSession(id); err != nil {
+	if _, err := a.svc.SessionSummaryForSessionOrPersisted(id); err != nil {
 		a.setCurrentSessionID("")
+		a.navMu.Unlock()
 		return nil
 	}
+	a.navMu.Unlock()
 	msgs, err := a.svc.SessionMessagesFor(id)
 	if err != nil {
 		return nil
@@ -299,17 +838,27 @@ func (a *App) AppVersion() string {
 // or queues the input in the backend, returning whether it started and a
 // versioned queue snapshot.
 func (a *App) Submit(content string) (agent.SubmitResult, error) {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return agent.SubmitResult{}, err
 	}
-	return a.svc.SubmitToSession(a.ctx, sessionID, content)
+	result, err := a.svc.SubmitToSession(a.ctx, sessionID, content)
+	if err != nil && a.routeReadOnlyNames(sessionID) {
+		// The session is read-only: another process drives it, so the owner
+		// refuses it as unknown. Say what is actually wrong.
+		return agent.SubmitResult{}, agent.SessionContendedError(sessionID)
+	}
+	return result, err
 }
 
 // QueueSnapshot returns the backend's versioned input-queue snapshot for
 // frontend hydration (register the queue_changed listener before calling).
 func (a *App) QueueSnapshot() agent.QueueState {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return agent.QueueState{}
 	}
@@ -322,11 +871,31 @@ func (a *App) QueueSnapshot() agent.QueueState {
 
 // SwitchModel changes the active model by provider-prefixed catalog ref.
 func (a *App) SwitchModel(ref string) error {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return err
 	}
-	return a.svc.SwitchModelForSession(sessionID, ref)
+	if a.agent == nil {
+		return a.svc.SwitchModelForSession(sessionID, ref)
+	}
+	// The owner returns the committed model from the same mutation; append it as an
+	// ordered item tagged with the root it switched, so the selector updates only
+	// while that root is presentation-current — never out of band or on another root.
+	model, err := a.agent.SwitchModelForSessionInfo(sessionID, ref)
+	if err != nil {
+		return err
+	}
+	a.emitFrame("model", modelItem{RootID: sessionID, Model: model})
+	return nil
+}
+
+// modelItem is the ordered frame a root-model switch appends: the committed model
+// info tagged with the root it switched.
+type modelItem struct {
+	RootID string          `json:"rootId"`
+	Model  agent.ModelInfo `json:"model"`
 }
 
 // Reload reloads config and catalog state for future turns.
@@ -409,77 +978,151 @@ func (a *App) ResetModelField(providerID string, modelID string, field string) e
 	return a.svc.ResetModelField(providerID, modelID, field)
 }
 
-// RevertCode restores files to their state at turn N.
+// RevertCode restores files through the direct code-revert convention: N is
+// the first restored turn, so the store target is N-1, matching the shared
+// revert_code turn action.
 func (a *App) RevertCode(turn int) (snapshot.RevertResult, error) {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return snapshot.RevertResult{}, err
 	}
 	return a.svc.RevertCodeForSession(sessionID, turn)
 }
 
-// RevertHistory truncates conversation after turn N.
-func (a *App) RevertHistory(turn int) error {
-	sessionID, err := a.currentSession()
-	if err != nil {
-		return err
+// applyTurnActionWithOwnedBoundary is the desktop's one shared choke point for a
+// turn action's committed disposition (ForkSession and ApplyTurnAction both run
+// through it): the owner's in-commit callback adopts any session-changing result,
+// then enqueues its boundary — atomically paired with exactly one unsequenced
+// error frame when a fork carries a typed committed failure. A postcommit partial
+// error — a reconciled history revert whose walk failed after the boundary
+// published the survivors — resolves the method as success: the ordered turn_action
+// frame owns the error through its warning, and a second, unowned direct error would
+// duplicate it in the frontend. A typed committed failure is always a rejection; only
+// fork pairs one adjacent error frame with its destination boundary (the prepared
+// view plus exactly that one row), while history keeps Step 4's warning-only
+// disposition — no adjacent frame on either side of its single ordered boundary. A
+// precommit error emits no frame and still rejects/returns; the typed return error is
+// kept for the ACP/CLI disposition. A code-only revert's complete boundary is prepared
+// for the protocol consumer; Wails suppresses it and keeps its existing notice-only
+// result/skips surface.
+func (a *App) applyTurnActionWithOwnedBoundary(sessionID string, turn int, action string, alsoRevertCode bool) (agent.TurnActionResult, error) {
+	var emitted bool
+	result, err := a.svc.ApplyTurnActionForSessionWithBoundary(sessionID, turn, action, alsoRevertCode, func(state agent.HydrationState, skipped []snapshot.SkippedRevert, warning string, committed *snapshot.CommittedMutationError, prefill *string) {
+		emitted = true
+		if action == agent.TurnActionRevertCode {
+			// A code-only revert changes no session; the owner's complete
+			// boundary serves the protocol consumer, and the desktop keeps its
+			// existing notice-only delivery of the skip notice.
+			return
+		}
+		a.setCurrentSessionID(state.Session.ID)
+		boundary := turnActionBoundary{State: &state, Prefill: prefill, SkippedFiles: skipped, Warning: warning}
+		if committed != nil && action == agent.TurnActionFork {
+			// A fork's committed failure adopts the prepared destination and settles to its view plus exactly one error row; history never pairs.
+			a.enqueueBoundaryWithError("turn_action", boundary, "", state.Session.ID, lifecycleErrorMessage(committed))
+			return
+		}
+		a.enqueueBoundary("turn_action", boundary, "", state.Session.ID)
+	})
+	if err != nil && emitted {
+		var committed *snapshot.CommittedMutationError
+		if errors.As(err, &committed) {
+			// A typed committed history failure stays a typed rejection: its
+			// boundary owns the warning, and the frontend settles to exactly
+			// one warning through the ordered frame.
+			return result, err
+		}
+		// Ordinary partial history resolves as success: the ordered turn_action
+		// frame owns the error through its warning, and a second, unowned
+		// direct error would duplicate it in the frontend.
+		return result, nil
 	}
-	if err := a.svc.RevertHistoryForSession(sessionID, turn); err != nil {
-		return err
-	}
-	a.emitSessionChangedForSession(sessionID)
-	return nil
+	return result, err
 }
 
-// ForkSession creates a new session branched from turn N.
+// RevertHistory truncates conversation above the given turn. It is the bound
+// alias of the turn-action route: the given turn is the first one removed, so
+// turns up to turn-1 survive, matching ApplyTurnAction's revert_history.
+func (a *App) RevertHistory(turn int) error {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
+	if err != nil {
+		return err
+	}
+	_, err = a.applyTurnActionWithOwnedBoundary(sessionID, turn, agent.TurnActionRevertHistory, false)
+	return err
+}
+
+// ForkSession creates a new session branched from turn N. It shares the GUI's fork
+// disposition with ApplyTurnAction: both run through applyTurnActionWithOwnedBoundary,
+// so one code path settles every committed failure to its destination boundary plus
+// exactly one error row — an adapter-only fix cannot drift between the two routes.
 func (a *App) ForkSession(turn int) error {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return err
 	}
-	result, err := a.svc.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionFork, false)
-	if err != nil {
-		return err
-	}
-	if result.Session.ID != "" {
-		a.setCurrentSessionID(result.Session.ID)
-	}
-	a.emitSessionChangedForSession(result.Session.ID)
-	return nil
+	_, err = a.applyTurnActionWithOwnedBoundary(sessionID, turn, agent.TurnActionFork, false)
+	return err
 }
 
 // ApplyTurnAction applies a user-message revert/fork action.
 func (a *App) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (agent.TurnActionResult, error) {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return agent.TurnActionResult{}, err
 	}
-	result, err := a.svc.ApplyTurnActionForSession(sessionID, turn, action, alsoRevertCode)
+	result, err := a.applyTurnActionWithOwnedBoundary(sessionID, turn, action, alsoRevertCode)
 	if err != nil {
 		return result, err
 	}
-	if result.SessionChanged {
-		if result.Session.ID != "" {
-			a.setCurrentSessionID(result.Session.ID)
-			a.emitSessionChangedForSession(result.Session.ID)
-		} else {
-			a.emitSessionChangedForSession(sessionID)
-		}
+	if !result.SessionChanged {
+		// A code-only revert changes no routing: the owner publishes its prebuilt
+		// complete boundary through the in-commit callback and ACP consumes it
+		// before responding, while applyTurnActionWithOwnedBoundary suppresses that
+		// full state here. Deliver Wails's own skip notice as an ordered frame so a
+		// queued refresh cannot clobber it.
+		a.emitTurnActionNotice(result.SkippedFiles)
 	}
 	return result, nil
 }
 
 // RespondPermission answers a pending permission prompt.
 func (a *App) RespondPermission(sessionID string, id string, action string) error {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return errAdapterClosed
+	}
 	sessionID, err := a.resolveSessionID(sessionID)
 	if err != nil {
 		return err
 	}
-	return a.svc.RespondPermissionActionForSession(sessionID, id, action)
+	err = a.svc.RespondPermissionActionForSession(sessionID, id, action)
+	if errors.Is(err, permission.ErrUnknownRequest) {
+		// The bound methods are reachable only by the bundled frontend, which
+		// never constructs an id — every id it answers came from a request event
+		// or a gate-captured snapshot. An unknown-request outcome can therefore
+		// only mean the prompt was resolved underneath the user. Benign.
+		return nil
+	}
+	return err
 }
 
 // PermissionSuggest returns pattern suggestions for the "Allow for project" UI.
 func (a *App) PermissionSuggest(sessionID string, projectID string, toolName string, arg string) []permission.Suggestion {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return nil
+	}
 	var (
 		suggestions []permission.Suggestion
 		err         error
@@ -500,18 +1143,38 @@ func (a *App) PermissionSuggest(sessionID string, projectID string, toolName str
 
 // SaveProjectPermission appends patterns to project permissions and allows the request.
 func (a *App) SaveProjectPermission(sessionID string, id string, patterns []string) error {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return errAdapterClosed
+	}
 	sessionID, err := a.resolveSessionID(sessionID)
 	if err != nil {
 		return err
 	}
-	return a.svc.SaveProjectPermissionForSession(sessionID, id, patterns)
+	err = a.svc.SaveProjectPermissionForSession(sessionID, id, patterns)
+	if errors.Is(err, permission.ErrUnknownRequest) {
+		// Same soundness as RespondPermission: the id can only have come from a
+		// prompt this host was given, so an unknown-request outcome means it was
+		// resolved underneath the user. Benign.
+		return nil
+	}
+	return err
 }
 
 // CompactNow triggers manual context compaction.
 func (a *App) CompactNow() error {
-	sessionID := a.liveCurrentSessionID()
-	if sessionID == "" {
-		return fmt.Errorf("no current session")
+	a.navMu.Lock()
+	if a.navClosed {
+		a.navMu.Unlock()
+		return errAdapterClosed
+	}
+	// Capture the id under navMu, then release it before the long owner call so it
+	// stays free for Cancel/Close.
+	sessionID, err := a.liveCurrentSessionOrErr()
+	a.navMu.Unlock()
+	if err != nil {
+		return err
 	}
 	ctx := a.ctx
 	if ctx == nil {
@@ -525,7 +1188,9 @@ func (a *App) CompactNow() error {
 
 // Cancel aborts the current agentic loop iteration.
 func (a *App) Cancel() error {
-	sessionID, err := a.currentSession()
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
 		return err
 	}
@@ -534,9 +1199,15 @@ func (a *App) Cancel() error {
 
 // SnapshotList returns the timeline of all snapshots in the session.
 func (a *App) SnapshotList() ([]agent.Snapshot, error) {
-	sessionID := a.liveCurrentSessionID()
-	if sessionID == "" {
-		return nil, fmt.Errorf("no current session")
+	a.navMu.Lock()
+	if a.navClosed {
+		a.navMu.Unlock()
+		return nil, errAdapterClosed
+	}
+	sessionID, err := a.liveCurrentSessionOrErr()
+	a.navMu.Unlock()
+	if err != nil {
+		return nil, err
 	}
 	return a.svc.SnapshotListForSession(sessionID)
 }
@@ -546,17 +1217,45 @@ func (a *App) ModelList() ([]agent.ModelListEntry, error) {
 	return a.svc.ModelList(), nil
 }
 
-// CurrentModel returns the active provider and model.
-func (a *App) CurrentModel() agent.ModelInfo {
-	sessionID, err := a.currentSession()
+// CurrentModelResult carries the resolved model and whether the caller's
+// expected session no longer matches the routed presentation. Routing can
+// advance to B and enqueue its boundary while the frontend still presents A; a
+// settings refresh that resolves in that window must not write B's model into A,
+// so the adapter marks the result superseded instead of reading the owner.
+type CurrentModelResult struct {
+	Model      agent.ModelInfo `json:"model"`
+	Superseded bool            `json:"superseded"`
+}
+
+// ReadFileContentResult carries inline viewer content and whether the read no
+// longer belongs to the presentation that started it.
+type ReadFileContentResult struct {
+	Content    string `json:"content"`
+	Superseded bool   `json:"superseded"`
+}
+
+// CurrentModel returns the active provider and model for the frontend's
+// expected session. An empty expectation preserves mount-time routing behavior.
+// A nonempty expectation that differs from the bounded routing returns
+// Superseded without an owner lookup, so a settings refresh captured on a
+// session routing has already left cannot apply the new route's model. Matched
+// routing reads the matched session's model and propagates routing and owner
+// errors unchanged.
+func (a *App) CurrentModel(expectedSessionID string) (CurrentModelResult, error) {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	sessionID, err := a.boundedSessionIDLocked()
 	if err != nil {
-		return agent.ModelInfo{}
+		return CurrentModelResult{}, err
+	}
+	if expectedSessionID != "" && expectedSessionID != sessionID {
+		return CurrentModelResult{Superseded: true}, nil
 	}
 	model, err := a.svc.CurrentModelForSession(sessionID)
 	if err != nil {
-		return agent.ModelInfo{}
+		return CurrentModelResult{}, err
 	}
-	return model
+	return CurrentModelResult{Model: model}, nil
 }
 
 // AllModelList returns every catalog model including hidden ones.
@@ -591,73 +1290,255 @@ func (a *App) SetRuntimeConfig(settings agent.RuntimeConfigSettings) error {
 
 // ProjectName returns the basename of the adapter-local project directory.
 func (a *App) ProjectName() string {
-	return a.scope.ProjectName()
+	return filepath.Base(a.routeProjectPathCaptured())
 }
 
-// ReadFileContent loads a file's contents for the in-app viewer.
-func (a *App) ReadFileContent(path string) (string, error) {
-	return a.scope.ReadFileContent(path)
+// ReadFileContent loads a file's contents for the in-app viewer while keeping
+// the result tied to the expected presentation session.
+func (a *App) ReadFileContent(expectedSessionID, path string) (ReadFileContentResult, error) {
+	expectedSessionID = strings.TrimSpace(expectedSessionID)
+	a.deliveryMu.Lock()
+	if a.deliveryClosed || a.presented != expectedSessionID {
+		a.deliveryMu.Unlock()
+		return ReadFileContentResult{Superseded: true}, nil
+	}
+	presented := a.presented
+	a.deliveryMu.Unlock()
+
+	root, err := a.svc.ProjectPathForSession(presented)
+	if err != nil {
+		return ReadFileContentResult{}, err
+	}
+	content, readErr := a.svc.ReadFileContentForProjectPath(root, path)
+
+	a.deliveryMu.Lock()
+	superseded := a.deliveryClosed || a.presented != presented
+	a.deliveryMu.Unlock()
+	if superseded {
+		return ReadFileContentResult{Superseded: true}, nil
+	}
+	if readErr != nil {
+		return ReadFileContentResult{}, readErr
+	}
+	return ReadFileContentResult{Content: content}, nil
+}
+
+// routeProjectPathCaptured reads the routing-current project path under navMu and
+// releases it, so the value is a consistent snapshot linearized against a project
+// switch without holding the gate across the read that follows.
+func (a *App) routeProjectPathCaptured() string {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	return a.routeProjectPath
+}
+
+// routeProjectPathBounded is routeProjectPathCaptured for a route that must reject
+// after the adapter is closed.
+func (a *App) routeProjectPathBounded() (string, error) {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return "", errAdapterClosed
+	}
+	return a.routeProjectPath, nil
+}
+
+// setRouteProjectPathLocked commits the routing-current project path. The caller
+// holds navMu. The owner always resolves a selectable session against its
+// project, so the boundary summary carries a project path; the commit is
+// unconditional.
+func (a *App) setRouteProjectPathLocked(path string) {
+	a.routeProjectPath = path
+}
+
+// openOrCreateSession opens the most recent active session for a project path, or
+// creates one. The caller holds navMu across it as part of a navigation. emitOpen is
+// the existing-session boundary callback (unchanged: success only); createOutcome is
+// the staged-new result callback — invoked with nil on success and with a wrapped
+// committed error when creation failed after committing, so its destination routing
+// commit and atomic boundary+error pair stay owned by the caller. A plain precommit
+// failure invokes no callback at all: the old route stays exactly as it was.
+func (a *App) openOrCreateSession(projectPath string, emitOpen func(agent.HydrationState), createOutcome func(agent.HydrationState, error)) (agent.SessionSummary, error) {
+	sessions, err := a.svc.SessionListForProjectPath(projectPath, "active")
+	if err != nil {
+		return agent.SessionSummary{}, err
+	}
+	// Scan newest-first and skip a candidate another process is driving, so a
+	// contended session does not fail the whole navigation. Any other open
+	// failure surfaces: this is user-initiated, so a corrupt session must not
+	// be skipped silently.
+	for _, s := range sessions {
+		summary, err := a.svc.OpenSessionWithBoundary(s.ID, emitOpen)
+		if err == nil {
+			return summary, nil
+		}
+		if !errors.Is(err, snapshot.ErrSessionContended) {
+			return agent.SessionSummary{}, err
+		}
+	}
+	id, err := a.svc.NewSessionForProjectPathWithBoundary(projectPath, "primary", createOutcome)
+	if err != nil {
+		return agent.SessionSummary{}, err
+	}
+	return agent.SessionSummary{ID: id}, nil
 }
 
 // TokenUsage returns the current cumulative token usage for the session.
 func (a *App) TokenUsage() agent.TokenReport {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return agent.TokenReport{}
+	}
 	return a.tokenUsage()
 }
 
 // SessionCurrent returns the active session.
 func (a *App) SessionCurrent() agent.SessionSummary {
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return agent.SessionSummary{}
+	}
 	return a.currentSessionSummary()
 }
 
 // SessionList returns sessions filtered by state.
 func (a *App) SessionList(state string) ([]agent.SessionSummary, error) {
-	return a.scope.SessionList(state)
+	root, err := a.routeProjectPathBounded()
+	if err != nil {
+		return nil, err
+	}
+	return a.svc.SessionListForProjectPath(root, state)
 }
 
 // SessionSwitch switches to another session.
 func (a *App) SessionSwitch(id string) error {
-	summary, err := a.svc.OpenSession(id)
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return errAdapterClosed
+	}
+	// The owner publishes the destination boundary in-commit; the callback commits
+	// adapter routing current — including the destination project, since the id may
+	// resolve in another project — before appending the boundary, both while this
+	// goroutine holds navMu, so a failed switch leaves routing and presentation
+	// unchanged. The native window title is computed from the destination's project
+	// path, exactly as a project switch does, so a cross-project switch moves the
+	// window title with the boundary.
+	_, err := a.svc.OpenSessionWithBoundary(id, func(state agent.HydrationState) {
+		a.setRouteProjectPathLocked(state.Session.ProjectPath)
+		a.setCurrentSessionID(state.Session.ID)
+		a.enqueueBoundary("navigation", state, "Lightcode — "+filepath.Base(state.Session.ProjectPath), state.Session.ID)
+	})
 	if err != nil {
+		if !errors.Is(err, snapshot.ErrSessionContended) {
+			return err
+		}
+		// The user named a session another process is driving: the open
+		// succeeds as a read-only one. Present its durable transcript through
+		// the same navigation frame, committing routing current only once the
+		// view is available, so a failed presentation leaves routing unchanged.
+		state, herr := a.HydrateSession(id)
+		if herr != nil {
+			return herr
+		}
+		a.setRouteProjectPathLocked(state.Session.ProjectPath)
+		a.setCurrentSessionID(state.Session.ID)
+		a.markRouteReadOnly(state.Session.ID)
+		a.enqueueBoundary("navigation", state, "Lightcode — "+filepath.Base(state.Session.ProjectPath), state.Session.ID)
+		return nil
+	}
+	return nil
+}
+
+// applyLifecycleRemoval runs one durable archive/delete and disposes of its outcome
+// through the delivery FIFO. The caller holds navMu across it, so routing current is
+// captured before the service call — that capture alone decides which side of the
+// table a target sits on: success detaches (or nil-advances) exactly as removal did;
+// any plain error appends one standalone unsequenced error frame and no advance at
+// all, then rejects with routing untouched; a committed failure adopts what was in
+// fact removed — clearing current for the removed-current target or preserving it
+// otherwise — and atomically pairs that boundary (empty detach / nil unchanged-
+// current advance) with exactly one unsequenced error frame before rejecting typed.
+func (a *App) applyLifecycleRemoval(id string, op func(string) error) error {
+	id = strings.TrimSpace(id)
+	captured := a.currentSessionID()
+	err := op(id)
+	if err == nil {
+		if captured == id {
+			a.clearRouteIfCurrent(id)
+			a.enqueueBoundary("navigation", agent.HydrationState{}, "", "")
+		} else {
+			a.enqueueBoundary("navigation", nil, "", captured)
+		}
+		return nil
+	}
+	var committed *snapshot.CommittedMutationError
+	if errors.As(err, &committed) {
+		msg := lifecycleErrorMessage(err)
+		if captured == id {
+			a.clearRouteIfCurrent(id)
+			a.enqueueBoundaryWithError("navigation", agent.HydrationState{}, "", "", msg)
+		} else {
+			a.enqueueBoundaryWithError("navigation", nil, "", captured, msg)
+		}
 		return err
 	}
-	a.setCurrentSessionID(summary.ID)
-	a.emitSessionChangedForSession(summary.ID)
-	return nil
+	a.emitFrame("error", map[string]any{"message": lifecycleErrorMessage(err)})
+	return err
 }
 
 // SessionArchive archives a session.
 func (a *App) SessionArchive(id string) error {
-	if err := a.svc.SessionArchive(id); err != nil {
-		return err
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return errAdapterClosed
 	}
-	wasCurrent := a.sv().RemovedCurrent(id)
-	if wasCurrent {
-		a.emitSessionChangedForSession(strings.TrimSpace(id))
-	}
-	return nil
+	// Durable archive then the deterministic detach, together under navMu so a
+	// concurrent switch to the same session cannot interleave between them.
+	return a.applyLifecycleRemoval(id, func(target string) error { return a.svc.SessionArchive(target) })
 }
 
 // SessionDelete removes a session from disk.
 func (a *App) SessionDelete(id string) error {
-	if err := a.svc.SessionDelete(id); err != nil {
-		return err
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return errAdapterClosed
 	}
-	wasCurrent := a.sv().RemovedCurrent(id)
-	if wasCurrent {
-		a.emitSessionChangedForSession(strings.TrimSpace(id))
-	}
-	return nil
+	return a.applyLifecycleRemoval(id, func(target string) error { return a.svc.SessionDelete(target) })
 }
 
-// SessionNew starts a fresh session in the adapter-local project.
+// SessionNew starts a fresh session in the adapter-local project. The callback is
+// invoked only for an outcome that owns presentation: success and committed failure
+// both carry the prepared destination state, so it adopts routing current first and
+// then appends either the boundary alone or the atomic boundary+error pair — never
+// reversed by a stale frame already queued ahead of them. A plain precommit error
+// invokes no callback at all: routing, presentation generation, and every queued
+// frame stay exactly as they were when the call returned its rejection.
 func (a *App) SessionNew() error {
-	id, err := a.scope.NewSession("primary")
-	if err != nil {
-		return err
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return errAdapterClosed
 	}
-	a.setCurrentSessionID(id)
-	a.emitSessionChangedForSession(id)
-	return nil
+	_, err := a.svc.NewSessionForProjectPathWithBoundary(a.routeProjectPath, "primary", func(state agent.HydrationState, cbErr error) {
+		var committed *snapshot.CommittedMutationError
+		switch {
+		case cbErr == nil:
+			a.setCurrentSessionID(state.Session.ID)
+			a.enqueueBoundary("navigation", state, "", state.Session.ID)
+		case errors.As(cbErr, &committed):
+			a.setCurrentSessionID(state.Session.ID)
+			a.enqueueBoundaryWithError("navigation", state, "", state.Session.ID, lifecycleErrorMessage(cbErr))
+		default:
+			// Contract violation (a plain failure invoking the callback): append no
+			// frame and adopt nothing; the method still returns the rejection.
+		}
+	})
+	return err
 }
 
 // SessionMessages returns persisted history for the current session.
@@ -676,8 +1557,8 @@ func (a *App) ProjectList() ([]agent.ProjectSummary, error) {
 }
 
 // ProjectCurrent returns the project record for the adapter-local project.
-func (a *App) ProjectCurrent() agent.ProjectSummary {
-	return a.scope.ProjectCurrent()
+func (a *App) ProjectCurrent() (agent.ProjectSummary, error) {
+	return a.svc.ProjectCurrentForPath(a.routeProjectPathCaptured())
 }
 
 // ProjectSwitch navigates to a different project in-place over the existing
@@ -697,21 +1578,43 @@ func (a *App) ProjectSwitch(targetPath string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("%s is not a directory", abs)
 	}
-	if abs == a.scope.ProjectRoot() {
+
+	a.navMu.Lock()
+	defer a.navMu.Unlock()
+	if a.navClosed {
+		return errAdapterClosed
+	}
+	if abs == a.routeProjectPath {
 		return nil
 	}
-
-	summary, err := a.scope.OpenOrCreateSession(abs)
-	if err != nil {
-		return err
-	}
-	a.scope.SetProjectPath(abs)
-	a.setCurrentSessionID(summary.ID)
-	a.emitSessionChangedForSession(summary.ID)
-	if a.ctx != nil {
-		wailsRuntime.WindowSetTitle(a.ctx, "Lightcode — "+a.scope.ProjectName())
-	}
-	return nil
+	// Commit the project path, session id, title, and boundary together in-commit under
+	// navMu so a following current-target call never sees one without the other. The
+	// native title rides the boundary, so it changes only when the boundary is consumed.
+	title := "Lightcode — " + filepath.Base(abs)
+	_, err = a.openOrCreateSession(abs, func(state agent.HydrationState) {
+		a.setRouteProjectPathLocked(abs)
+		a.setCurrentSessionID(state.Session.ID)
+		a.enqueueBoundary("navigation", state, title, state.Session.ID)
+	}, func(state agent.HydrationState, cbErr error) {
+		var committed *snapshot.CommittedMutationError
+		switch {
+		case cbErr == nil:
+			a.setRouteProjectPathLocked(abs)
+			a.setCurrentSessionID(state.Session.ID)
+			a.enqueueBoundary("navigation", state, title, state.Session.ID)
+		case errors.As(cbErr, &committed):
+			// The destination project/session committed durably before the failure:
+			// commit its routing first so a rejection never leaves the old route, then
+			// append the atomic boundary+error pair no stale frame can split.
+			a.setRouteProjectPathLocked(abs)
+			a.setCurrentSessionID(state.Session.ID)
+			a.enqueueBoundaryWithError("navigation", state, title, state.Session.ID, lifecycleErrorMessage(cbErr))
+		default:
+			// Contract violation (a plain failure invoking the callback): leave routing
+			// and presentation unchanged; the method still returns the rejection.
+		}
+	})
+	return err
 }
 
 // ProjectPickAndSwitch opens a native directory picker.

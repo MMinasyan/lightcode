@@ -1,5 +1,5 @@
 <script>
-  import { ReadFileContent, SessionMessagesFor } from '../../wailsjs/go/main/App';
+  import { ReadFileContent, HydrateSession } from '../../wailsjs/go/main/App';
   import { openViewer, openEditPreview, openSubagentViewer, hydrateSubagentViewer } from '../lib/viewer.js';
   import { settings } from '../lib/settings.js';
   import { collapsedPreviewLines, maxInlineExpandLines } from '../lib/uiConstants.js';
@@ -11,6 +11,7 @@
   export let done = false;
   export let subagentSessionIds = [];
   export let metadata = null;
+  export let viewerOwner = null;
 
   let expanded = false;
   let commandExpanded = false;
@@ -38,12 +39,18 @@
     try { return JSON.parse(s); } catch { return {}; }
   }
 
-  async function openPath(path) {
+  async function openPath(path, owner = viewerOwner) {
     if (!path) return;
+    const operation = owner ? owner() : null;
     try {
-      const content = await ReadFileContent(path);
+      const result = await ReadFileContent(operation?.sessionId || '', path);
+      const current = owner ? owner() : null;
+      if (result?.superseded || (operation && current && (operation.sessionId !== current.sessionId || operation.presentationGeneration !== current.presentationGeneration))) return;
+      const content = result?.content || '';
       openViewer(path, content);
     } catch (e) {
+      const current = owner ? owner() : null;
+      if (operation && current && (operation.sessionId !== current.sessionId || operation.presentationGeneration !== current.presentationGeneration)) return;
       openViewer(path, 'Error: ' + (e?.message || e));
     }
   }
@@ -66,12 +73,17 @@
 
   async function openSubagentTranscript(title, sessionId) {
     if (!sessionId) return;
-    openSubagentViewer(title, sessionId, []);
+    const generation = openSubagentViewer(title, sessionId, []);
     try {
-      const messages = await SessionMessagesFor(sessionId);
-      hydrateSubagentViewer(sessionId, messages || []);
+      // The child hydration read returns the messages and the transcript cursor
+      // together, so the viewer's gate can reject frames the snapshot already
+      // contains instead of reconciling by message shape. The generation tags
+      // this open: if the viewer was closed and reopened while the read was in
+      // flight, the result applies to nothing.
+      const state = await HydrateSession(sessionId);
+      hydrateSubagentViewer(sessionId, state, generation);
     } catch (e) {
-      hydrateSubagentViewer(sessionId, [{ type: 'error', content: 'Error: ' + (e?.message || e) }]);
+      hydrateSubagentViewer(sessionId, { messages: [{ type: 'error', content: 'Error: ' + (e?.message || e) }] }, generation);
     }
   }
 
@@ -149,7 +161,7 @@
     <div class="line">
       <span class="tool-name">{name}</span>
       <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-      <span class="arg path" on:click={() => openPath(parsed.path)} title={parsed.path || ''}>{parsed.path || ''}</span>
+      <span class="arg path" on:click={() => openPath(parsed.path, viewerOwner)} title={parsed.path || ''}>{parsed.path || ''}</span>
       {#if name === 'write_file' && writeAddedLines > 0}<span class="change add">+{writeAddedLines}</span>{/if}
     </div>
     {#if name === 'read_file' && done && !success && result}

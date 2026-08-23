@@ -157,6 +157,32 @@ func TestProviderConnected(t *testing.T) {
 	}
 }
 
+func TestDiscoveryTransportReadyDoesNotRequireModels(t *testing.T) {
+	lookup := func(set bool) func(string) bool {
+		return func(string) bool { return set }
+	}
+	cases := []struct {
+		name string
+		prov *Provider
+		set  func(string) bool
+		want bool
+	}{
+		{"nil", nil, lookup(true), false},
+		{"disabled", &Provider{Discovery: false, Transport: Transport{BaseURL: "http://x"}}, lookup(true), false},
+		{"keyed empty models with key", &Provider{Discovery: true, Transport: Transport{APIKeyEnv: "K"}}, lookup(true), true},
+		{"keyed without key", &Provider{Discovery: true, Transport: Transport{APIKeyEnv: "K"}}, lookup(false), false},
+		{"keyless empty models", &Provider{Discovery: true, Transport: Transport{BaseURL: "http://x"}}, lookup(false), true},
+		{"keyless without base url", &Provider{Discovery: true}, lookup(false), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DiscoveryTransportReady(tc.prov, tc.set); got != tc.want {
+				t.Fatalf("DiscoveryTransportReady = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // Doctor-context resolution: LoadDotEnv never ran, so a .env-only key is not
 // in the process env — it resolves because the ReadDotEnvKeys map (name ->
 // value is non-empty) is part of the injected lookup; the shell, even an

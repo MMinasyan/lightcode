@@ -5,6 +5,8 @@ import (
 	"math"
 	"os"
 	"sort"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 func WriteVec(path string, vec []float32) error {
@@ -12,7 +14,7 @@ func WriteVec(path string, vec []float32) error {
 	for i, v := range vec {
 		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(v))
 	}
-	return os.WriteFile(path, buf, 0644)
+	return atomicfs.Write(path, buf, 0644)
 }
 
 func ReadVec(path string) ([]float32, error) {

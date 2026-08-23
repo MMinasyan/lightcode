@@ -1,14 +1,12 @@
 package prompt
 
 import (
-	"crypto/sha256"
 	_ "embed"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/adaptation"
@@ -71,7 +69,6 @@ type Warning struct {
 
 type Result struct {
 	Prompt   string
-	Rebuilt  bool
 	Warnings []Warning
 }
 
@@ -82,57 +79,37 @@ type Spec struct {
 	Adapt  *adaptation.Adaptation
 }
 
-type Assembler struct {
-	mu sync.Mutex
-
-	projectRoot  string
-	home         string
-	sessionStart time.Time
-
-	cachedPrompt    string
-	cachedRulesHash [32]byte
-	cachedAdaptName string
-	cachedSize      string
-	cachedBody      string
-	cachedMemory    bool
+// Service assembles system prompts. It is stateless: it owns no cache and no
+// per-session state, so one instance is shared across every unit. Simple/full
+// calls read current global and project rules; none skips rules reads. Every
+// call renders the caller's project root and session start, returning one
+// immutable prompt. Callers compare it with their own last installed prompt.
+type Service struct {
+	home string
 }
 
-func New(projectRoot, home string) *Assembler {
-	return &Assembler{
-		projectRoot:  projectRoot,
-		home:         home,
-		sessionStart: time.Now(),
-	}
+func NewService(home string) *Service {
+	return &Service{home: home}
 }
 
-// Assemble builds the baseline system prompt (no adaptation).
-func (a *Assembler) Assemble() Result { return a.AssembleFor(nil) }
-
-// AssembleFor builds the full system prompt for adapt (nil = baseline). The
-// rules hash is computed exactly as for the baseline; the adaptation name is a
-// companion cache key, so a cache hit requires both the rules and the name to
-// be unchanged. An empty name (baseline) reproduces the baseline hit/miss
-// cadence; a name change forces a rebuild.
-func (a *Assembler) AssembleFor(adapt *adaptation.Adaptation) Result {
-	return a.AssembleForSpec(Spec{Size: SizeFull, Memory: true, Adapt: adapt})
-}
-
-func (a *Assembler) AssembleForSpec(spec Spec) Result {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+// Assemble builds the system prompt for one unit: its project root, its fixed
+// session start, and the given spec. For the simple and full sizes it reads
+// the current global and project rules fresh on every call (none skips rules
+// reads) and holds nothing between calls.
+func (s *Service) Assemble(projectRoot string, sessionStart time.Time, spec Spec) Result {
 	spec = normalizeSpec(spec)
 	var warnings []Warning
 
 	var globalContent, projectContent string
 	if spec.Size != SizeNone {
 		var err error
-		globalContent, err = readRulesFile(filepath.Join(a.home, ".lightcode"))
+		globalContent, err = readRulesFile(filepath.Join(s.home, ".lightcode"))
 		if err != nil {
 			warnings = append(warnings, Warning{Kind: WarnRulesReadError, Message: "Failed to read global rules file: " + err.Error()})
 			globalContent = ""
 		}
 
-		projectContent, err = readRulesFile(a.projectRoot)
+		projectContent, err = readRulesFile(projectRoot)
 		if err != nil {
 			warnings = append(warnings, Warning{Kind: WarnRulesReadError, Message: "Failed to read project rules file: " + err.Error()})
 			projectContent = ""
@@ -149,41 +126,13 @@ func (a *Assembler) AssembleForSpec(spec Spec) Result {
 		warnings = append(warnings, Warning{Kind: WarnRulesTooLarge, Message: fmt.Sprintf("Rules file exceeds 20,000 characters (%d chars). Consider trimming it.", len(combined))})
 	}
 
-	h := sha256.Sum256([]byte(combined))
-	adaptName := ""
-	if spec.Adapt != nil && spec.Size != SizeNone {
-		adaptName = spec.Adapt.Name
+	return Result{
+		Prompt:   buildSpec(projectRoot, sessionStart, globalContent, projectContent, spec),
+		Warnings: warnings,
 	}
-	// Cache key is the prompt spec plus (rules hash, adaptation name).
-	// defaultAdditions is a compile-time constant, so the name is sufficient;
-	// a Name:"" adaptation carrying additions would be mis-cached against
-	// baseline, but matched table entries always have names and Blocks shares
-	// the same hazard.
-	if a.cachedPrompt != "" &&
-		h == a.cachedRulesHash &&
-		adaptName == a.cachedAdaptName &&
-		spec.Size == a.cachedSize &&
-		spec.Body == a.cachedBody &&
-		spec.Memory == a.cachedMemory {
-		return Result{Prompt: a.cachedPrompt, Rebuilt: false, Warnings: warnings}
-	}
-
-	prompt := a.buildSpec(globalContent, projectContent, spec)
-
-	a.cachedPrompt = prompt
-	a.cachedRulesHash = h
-	a.cachedAdaptName = adaptName
-	a.cachedSize = spec.Size
-	a.cachedBody = spec.Body
-	a.cachedMemory = spec.Memory
-	return Result{Prompt: prompt, Rebuilt: true, Warnings: warnings}
 }
 
-func (a *Assembler) build(globalRules, projectRules string, adapt *adaptation.Adaptation) string {
-	return a.buildSpec(globalRules, projectRules, Spec{Size: SizeFull, Memory: true, Adapt: adapt})
-}
-
-func (a *Assembler) buildSpec(globalRules, projectRules string, spec Spec) string {
+func buildSpec(projectRoot string, sessionStart time.Time, globalRules, projectRules string, spec Spec) string {
 	spec = normalizeSpec(spec)
 	var b strings.Builder
 
@@ -201,7 +150,7 @@ func (a *Assembler) buildSpec(globalRules, projectRules string, spec Spec) strin
 		b.WriteString("\n\n")
 	}
 
-	b.WriteString(renderEnvironment(a.projectRoot, a.sessionStart))
+	b.WriteString(renderEnvironment(projectRoot, sessionStart))
 	b.WriteString("\n\n")
 
 	if spec.Memory {
