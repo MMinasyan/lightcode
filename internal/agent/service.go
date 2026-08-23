@@ -84,6 +84,7 @@ type AdapterService interface {
 
 	ReadFileContent(string) (string, error)
 	ReadFileContentForProjectPath(string, string) (string, error)
+	ProjectPathForSession(string) (string, error)
 	ProjectName() string
 	ProjectRoot() string
 	ProjectCurrent() (ProjectSummary, error)

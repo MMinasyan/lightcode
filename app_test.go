@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -22,7 +23,8 @@ import (
 // agent.ReadFileContent. The Wails adapter must propagate the agent's
 // boundary refusal.
 func TestPR11Closure_AppReadFileContentPropagatesViewerBoundaryRefusal(t *testing.T) {
-	app := newTestApp(newAppTestAgent(t))
+	svc := newAppTestAgent(t)
+	app := newTestApp(svc)
 
 	outsideDir := t.TempDir()
 	outsideSecret := filepath.Join(outsideDir, "secret.txt")
@@ -30,11 +32,12 @@ func TestPR11Closure_AppReadFileContentPropagatesViewerBoundaryRefusal(t *testin
 		t.Fatal(err)
 	}
 
-	content, err := app.ReadFileContent(outsideSecret)
+	app.seedPresented(svc.SessionCurrent().ID)
+	result, err := app.ReadFileContent(svc.SessionCurrent().ID, outsideSecret)
 	if err == nil {
-		t.Fatalf("App.ReadFileContent(%q) succeeded with content %q; want boundary refusal propagated from agent", outsideSecret, content)
+		t.Fatalf("App.ReadFileContent(%q) succeeded with content %q; want boundary refusal propagated from agent", outsideSecret, result.Content)
 	}
-	if strings.Contains(content, "outside-secret") {
+	if strings.Contains(result.Content, "outside-secret") {
 		t.Fatalf("App.ReadFileContent(%q) leaked outside content despite returning error", outsideSecret)
 	}
 }
@@ -227,6 +230,205 @@ func TestWailsCurrentModelSupersededRouteMismatch(t *testing.T) {
 		}
 		if len(spy.called) != 1 || spy.called[0] != "B" {
 			t.Fatalf("empty expectation owner reads = %v, want exactly ['B']", spy.called)
+		}
+	})
+}
+
+type readFileContentSpy struct {
+	agent.AdapterService
+	roots        map[string]string
+	content      string
+	readErr      error
+	readStarted  chan struct{}
+	readRelease  chan struct{}
+	readStartOne sync.Once
+	mu           sync.Mutex
+	projectCalls []string
+	readCalls    []string
+}
+
+func (s *readFileContentSpy) ProjectPathForSession(sessionID string) (string, error) {
+	s.mu.Lock()
+	s.projectCalls = append(s.projectCalls, sessionID)
+	s.mu.Unlock()
+	return s.roots[sessionID], nil
+}
+
+func (s *readFileContentSpy) ReadFileContentForProjectPath(root, path string) (string, error) {
+	s.mu.Lock()
+	s.readCalls = append(s.readCalls, root+":"+path)
+	s.mu.Unlock()
+	if s.readStarted != nil {
+		s.readStartOne.Do(func() { close(s.readStarted) })
+	}
+	if s.readRelease != nil {
+		<-s.readRelease
+	}
+	return s.content, s.readErr
+}
+
+func (s *readFileContentSpy) calls() (projects, reads []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.projectCalls...), append([]string(nil), s.readCalls...)
+}
+
+func TestWailsReadFileContentPresentationOwnership(t *testing.T) {
+	newSpy := func() *readFileContentSpy {
+		return &readFileContentSpy{
+			AdapterService: nil,
+			roots:          map[string]string{"A": "/project-a", "B": "/project-b"},
+			content:        "file contents",
+		}
+	}
+
+	t.Run("same_presentation_success_and_error", func(t *testing.T) {
+		spy := newSpy()
+		app := &App{svc: spy}
+		app.seedPresented("A")
+
+		got, err := app.ReadFileContent("A", "main.go")
+		if err != nil || got.Superseded || got.Content != "file contents" {
+			t.Fatalf("same-presentation read = %#v, %v; want content", got, err)
+		}
+		spy.readErr = errors.New("read failed")
+		got, err = app.ReadFileContent("A", "main.go")
+		if err == nil || got.Superseded {
+			t.Fatalf("same-presentation error = %#v, %v; want ordinary read error", got, err)
+		}
+		projects, reads := spy.calls()
+		if !reflect.DeepEqual(projects, []string{"A", "A"}) || !reflect.DeepEqual(reads, []string{"/project-a:main.go", "/project-a:main.go"}) {
+			t.Fatalf("ownership calls = projects %v reads %v; want A and project-a", projects, reads)
+		}
+	})
+
+	t.Run("forged_expected_and_detach_drop_before_io", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			expected  string
+			presented string
+		}{
+			{name: "forged", expected: "B", presented: "A"},
+			{name: "detach", expected: "A", presented: ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				spy := newSpy()
+				app := &App{svc: spy}
+				app.seedPresented(tc.presented)
+				got, err := app.ReadFileContent(tc.expected, "main.go")
+				if err != nil || !got.Superseded {
+					t.Fatalf("pre-read mismatch = %#v, %v; want superseded", got, err)
+				}
+				projects, reads := spy.calls()
+				if len(projects) != 0 || len(reads) != 0 {
+					t.Fatalf("superseded read performed I/O: projects %v reads %v", projects, reads)
+				}
+			})
+		}
+	})
+
+	t.Run("routing_B_while_presenting_A_reads_A", func(t *testing.T) {
+		spy := newSpy()
+		app := &App{svc: spy}
+		app.seedPresented("A")
+		app.setCurrentSessionID("B")
+
+		got, err := app.ReadFileContent("A", "main.go")
+		if err != nil || got.Superseded {
+			t.Fatalf("routing-B read = %#v, %v; want A content", got, err)
+		}
+		projects, reads := spy.calls()
+		if !reflect.DeepEqual(projects, []string{"A"}) || !reflect.DeepEqual(reads, []string{"/project-a:main.go"}) {
+			t.Fatalf("routing-B ownership calls = projects %v reads %v; want A/project-a", projects, reads)
+		}
+	})
+
+	for _, tc := range []struct {
+		name       string
+		readErr    error
+		change     func(*App)
+		wantClosed bool
+	}{
+		{name: "A_to_B_success", change: func(app *App) { app.seedPresented("B") }},
+		{name: "A_to_B_error", readErr: errors.New("read failed"), change: func(app *App) { app.seedPresented("B") }},
+		{name: "detach_error", readErr: errors.New("read failed"), change: func(app *App) { app.seedPresented("") }},
+		{name: "close_error", readErr: errors.New("read failed"), change: func(app *App) { app.closeDelivery() }, wantClosed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spy := newSpy()
+			spy.readErr = tc.readErr
+			spy.readStarted = make(chan struct{})
+			spy.readRelease = make(chan struct{})
+			app := &App{svc: spy}
+			app.seedPresented("A")
+			resultCh := make(chan struct {
+				result ReadFileContentResult
+				err    error
+			}, 1)
+			go func() {
+				result, err := app.ReadFileContent("A", "main.go")
+				resultCh <- struct {
+					result ReadFileContentResult
+					err    error
+				}{result, err}
+			}()
+			select {
+			case <-spy.readStarted:
+			case <-time.After(time.Second):
+				t.Fatal("read did not reach the viewer boundary")
+			}
+			tc.change(app)
+			close(spy.readRelease)
+			out := <-resultCh
+			if out.err != nil || !out.result.Superseded || out.result.Content != "" {
+				t.Fatalf("stale read = %#v, %v; want superseded without content", out.result, out.err)
+			}
+			if tc.wantClosed {
+				app.closeDelivery()
+			}
+		})
+	}
+
+	t.Run("stalled_read_does_not_block_delivery_or_close", func(t *testing.T) {
+		spy := newSpy()
+		spy.readStarted = make(chan struct{})
+		spy.readRelease = make(chan struct{})
+		app := &App{svc: spy}
+		app.seedPresented("A")
+		resultCh := make(chan ReadFileContentResult, 1)
+		go func() {
+			result, _ := app.ReadFileContent("A", "main.go")
+			resultCh <- result
+		}()
+		select {
+		case <-spy.readStarted:
+		case <-time.After(time.Second):
+			t.Fatal("read did not reach the viewer boundary")
+		}
+
+		enqueued := make(chan struct{})
+		go func() {
+			app.enqueueFrame(deliveryFrame{name: "probe"})
+			close(enqueued)
+		}()
+		select {
+		case <-enqueued:
+		case <-time.After(time.Second):
+			t.Fatal("delivery enqueue blocked behind viewer I/O")
+		}
+		closed := make(chan struct{})
+		go func() {
+			app.closeDelivery()
+			close(closed)
+		}()
+		select {
+		case <-closed:
+		case <-time.After(time.Second):
+			t.Fatal("delivery close blocked behind viewer I/O")
+		}
+		close(spy.readRelease)
+		if result := <-resultCh; !result.Superseded {
+			t.Fatalf("read after close = %#v; want superseded", result)
 		}
 	})
 }

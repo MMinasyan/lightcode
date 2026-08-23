@@ -13,12 +13,9 @@ import { closeViewer, viewer } from '../lib/viewer.js';
 // Go source-text contract check cannot see a threading break either. This
 // mounts the real component and clicks the real row.
 
-// The backend surface this path touches: HydrateSession is the only binding
-// openSubagentTranscript calls. ReadFileContent is imported by the component
-// but only reached from the read_file/write_file path, which this test does
-// not exercise, so it needs no stub.
 const backend = {
   HydrateSession: async () => ({}),
+  ReadFileContent: async () => ({ content: '', superseded: false }),
 };
 
 const taskRow = {
@@ -36,6 +33,7 @@ beforeEach(() => {
     errors: [],
     cursor: { committedTurn: 1, committedSeq: 0, rewriteEpoch: 0 },
   });
+  backend.ReadFileContent = async () => ({ content: '', superseded: false });
 });
 
 afterEach(() => {
@@ -53,6 +51,22 @@ async function mountTaskRow() {
   const target = document.createElement('div');
   document.body.appendChild(target);
   const toolCall = mount(ToolCall, { target, props: taskRow });
+  await tick();
+  return { toolCall, target };
+}
+
+async function mountReadRow(viewerOwner) {
+  const { default: ToolCall } = await import('./ToolCall.svelte');
+  const target = document.createElement('div');
+  document.body.appendChild(target);
+  const toolCall = mount(ToolCall, {
+    target,
+    props: {
+      name: 'read_file',
+      args: JSON.stringify({ path: 'src/main.go' }),
+      viewerOwner,
+    },
+  });
   await tick();
   return { toolCall, target };
 }
@@ -95,5 +109,80 @@ describe('ToolCall subtask viewer threading', () => {
     expect(v.messages).toEqual([{ type: 'error', content: 'Error: boom' }]);
 
     unmount(toolCall);
+  });
+});
+
+describe('ToolCall file viewer ownership', () => {
+  it('opens same-presentation success and error results', async () => {
+    const ownerState = { sessionId: 'A', presentationGeneration: 1 };
+    const owner = () => ({ ...ownerState });
+    backend.ReadFileContent = async (sessionID, path) => {
+      expect(sessionID).toBe('A');
+      expect(path).toBe('src/main.go');
+      return { content: 'package main', superseded: false };
+    };
+    let mounted = await mountReadRow(owner);
+    mounted.target.querySelector('.arg.path').click();
+    await settle();
+    expect(get(viewer)).toMatchObject({ title: 'src/main.go', content: 'package main' });
+    unmount(mounted.toolCall);
+
+    closeViewer();
+    backend.ReadFileContent = async () => { throw new Error('read failed'); };
+    mounted = await mountReadRow(owner);
+    mounted.target.querySelector('.arg.path').click();
+    await settle();
+    expect(get(viewer)).toMatchObject({ title: 'src/main.go', content: 'Error: read failed' });
+    unmount(mounted.toolCall);
+  });
+
+  it.each([
+    ['stale success', (resolve) => resolve({ content: 'old', superseded: false })],
+    ['stale error', (_resolve, reject) => reject(new Error('old failure'))],
+  ])('%s does not reopen the viewer after A-to-B navigation', async (_name, settleRead) => {
+    const ownerState = { sessionId: 'A', presentationGeneration: 1 };
+    const owner = () => ({ ...ownerState });
+    let resolveRead;
+    let rejectRead;
+    backend.ReadFileContent = () => new Promise((resolve, reject) => {
+      resolveRead = resolve;
+      rejectRead = reject;
+    });
+    const mounted = await mountReadRow(owner);
+    mounted.target.querySelector('.arg.path').click();
+    ownerState.sessionId = 'B';
+    ownerState.presentationGeneration = 2;
+    closeViewer();
+    settleRead(resolveRead, rejectRead);
+    await settle();
+    expect(get(viewer)).toBeNull();
+    unmount(mounted.toolCall);
+  });
+
+  it('drops an A-to-B-to-A result using the presentation generation', async () => {
+    const ownerState = { sessionId: 'A', presentationGeneration: 1 };
+    const owner = () => ({ ...ownerState });
+    let resolveRead;
+    backend.ReadFileContent = () => new Promise(resolve => { resolveRead = resolve; });
+    const mounted = await mountReadRow(owner);
+    mounted.target.querySelector('.arg.path').click();
+    ownerState.sessionId = 'B';
+    ownerState.presentationGeneration = 2;
+    ownerState.sessionId = 'A';
+    ownerState.presentationGeneration = 3;
+    resolveRead({ content: 'old A', superseded: false });
+    await settle();
+    expect(get(viewer)).toBeNull();
+    unmount(mounted.toolCall);
+  });
+
+  it('drops a backend-superseded result', async () => {
+    const ownerState = { sessionId: 'A', presentationGeneration: 1 };
+    backend.ReadFileContent = async () => ({ superseded: true });
+    const mounted = await mountReadRow(() => ({ ...ownerState }));
+    mounted.target.querySelector('.arg.path').click();
+    await settle();
+    expect(get(viewer)).toBeNull();
+    unmount(mounted.toolCall);
   });
 });

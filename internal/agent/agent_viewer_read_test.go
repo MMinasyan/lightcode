@@ -9,6 +9,24 @@ import (
 	"github.com/MMinasyan/lightcode/internal/config"
 )
 
+func TestProjectPathForSessionUsesSessionProjectAuthority(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	id, err := a.NewSession("", "primary")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	root, err := a.ProjectPathForSession(id)
+	if err != nil {
+		t.Fatalf("ProjectPathForSession(%q): %v", id, err)
+	}
+	if root != a.ProjectRoot() {
+		t.Fatalf("ProjectPathForSession(%q) = %q, want %q", id, root, a.ProjectRoot())
+	}
+	if _, err := a.ProjectPathForSession("missing"); err == nil {
+		t.Fatalf("ProjectPathForSession(missing) = %v, want an error", err)
+	}
+}
+
 // Agent.ReadFileContent (and the adapter paths that share it) must
 // enforce the project-root boundary: no absolute outside-project paths,
 // no `..` escape, no symlink escape, no hardlinks, no sensitive-name

@@ -61,7 +61,7 @@ export function ProviderList():Promise<Array<agent.ProviderStatus>>;
 
 export function QueueSnapshot():Promise<agent.QueueState>;
 
-export function ReadFileContent(arg1:string):Promise<string>;
+export function ReadFileContent(arg1:string,arg2:string):Promise<main.ReadFileContentResult>;
 
 export function Reload():Promise<void>;
 

@@ -1172,6 +1172,20 @@ export namespace main {
 		    return a;
 		}
 	}
+	export class ReadFileContentResult {
+	    content: string;
+	    superseded: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new ReadFileContentResult(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.content = source["content"];
+	        this.superseded = source["superseded"];
+	    }
+	}
 
 }
 

@@ -114,8 +114,8 @@ export function QueueSnapshot() {
   return window['go']['main']['App']['QueueSnapshot']();
 }
 
-export function ReadFileContent(arg1) {
-  return window['go']['main']['App']['ReadFileContent'](arg1);
+export function ReadFileContent(arg1, arg2) {
+  return window['go']['main']['App']['ReadFileContent'](arg1, arg2);
 }
 
 export function Reload() {

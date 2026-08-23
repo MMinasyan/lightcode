@@ -107,6 +107,10 @@
 
   function mid() { return nextId++; }
 
+  function viewerOwner() {
+    return { sessionId, presentationGeneration };
+  }
+
   function defaultTokens() {
     return { total: { cache:0, input:0, output:0, known:true }, perModel: [], contextUsed: 0, contextWindow: 0 };
   }
@@ -692,17 +696,17 @@
     on:openSettings={() => { settingsSection = 'providers'; showSettings = true; }}
     on:openWarnings={() => showWarnings=true} />
   <div class="content" bind:this={contentEl} bind:clientWidth={contentWidth}>
-    <MessageList {messages} {busy} {compacting} {messageQueue}
+    <MessageList {messages} {busy} {compacting} {messageQueue} {viewerOwner}
       on:revertcode={handleRevertCode}
       on:reverthistory={handleRevertHistory}
       on:fork={handleFork} />
     {#if $viewer}
       {#if viewerOverlay}
-        <div class="viewer-pane overlay"><Viewer /></div>
+        <div class="viewer-pane overlay"><Viewer {viewerOwner} /></div>
       {:else}
         <!-- svelte-ignore a11y-no-static-element-interactions -->
         <div class="divider" class:dragging={dividerDragging} on:mousedown={startDividerDrag} title="Drag to resize"></div>
-        <div class="viewer-pane" style="flex:0 0 {viewerWidth}px"><Viewer /></div>
+        <div class="viewer-pane" style="flex:0 0 {viewerWidth}px"><Viewer {viewerOwner} /></div>
       {/if}
     {/if}
   </div>

@@ -1227,6 +1227,13 @@ type CurrentModelResult struct {
 	Superseded bool            `json:"superseded"`
 }
 
+// ReadFileContentResult carries inline viewer content and whether the read no
+// longer belongs to the presentation that started it.
+type ReadFileContentResult struct {
+	Content    string `json:"content"`
+	Superseded bool   `json:"superseded"`
+}
+
 // CurrentModel returns the active provider and model for the frontend's
 // expected session. An empty expectation preserves mount-time routing behavior.
 // A nonempty expectation that differs from the bounded routing returns
@@ -1286,13 +1293,34 @@ func (a *App) ProjectName() string {
 	return filepath.Base(a.routeProjectPathCaptured())
 }
 
-// ReadFileContent loads a file's contents for the in-app viewer.
-func (a *App) ReadFileContent(path string) (string, error) {
-	root, err := a.routeProjectPathBounded()
-	if err != nil {
-		return "", err
+// ReadFileContent loads a file's contents for the in-app viewer while keeping
+// the result tied to the expected presentation session.
+func (a *App) ReadFileContent(expectedSessionID, path string) (ReadFileContentResult, error) {
+	expectedSessionID = strings.TrimSpace(expectedSessionID)
+	a.deliveryMu.Lock()
+	if a.deliveryClosed || a.presented != expectedSessionID {
+		a.deliveryMu.Unlock()
+		return ReadFileContentResult{Superseded: true}, nil
 	}
-	return a.svc.ReadFileContentForProjectPath(root, path)
+	presented := a.presented
+	a.deliveryMu.Unlock()
+
+	root, err := a.svc.ProjectPathForSession(presented)
+	if err != nil {
+		return ReadFileContentResult{}, err
+	}
+	content, readErr := a.svc.ReadFileContentForProjectPath(root, path)
+
+	a.deliveryMu.Lock()
+	superseded := a.deliveryClosed || a.presented != presented
+	a.deliveryMu.Unlock()
+	if superseded {
+		return ReadFileContentResult{Superseded: true}, nil
+	}
+	if readErr != nil {
+		return ReadFileContentResult{}, readErr
+	}
+	return ReadFileContentResult{Content: content}, nil
 }
 
 // routeProjectPathCaptured reads the routing-current project path under navMu and

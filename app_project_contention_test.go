@@ -50,8 +50,8 @@ func TestWailsProjectContentionProductionPaths(t *testing.T) {
 	if _, err = app.ProjectCurrent(); err != nil || time.Since(start) > time.Second {
 		t.Fatalf("present Wails ProjectCurrent = %v after %v", err, time.Since(start))
 	}
-	if content, readErr := app.ReadFileContent("visible.txt"); readErr != nil || content != "source" {
-		t.Fatalf("present Wails ReadFileContent = %q, %v", content, readErr)
+	if result, readErr := app.ReadFileContent(sourceID, "visible.txt"); readErr != nil || result.Content != "source" {
+		t.Fatalf("present Wails ReadFileContent = %q, %v", result.Content, readErr)
 	}
 	if err := lock.Release(); err != nil {
 		t.Fatal(err)
@@ -82,8 +82,8 @@ func TestWailsProjectContentionProductionPaths(t *testing.T) {
 	if err := app.SessionNew(); !errors.Is(err, agent.ErrProjectBusy) {
 		t.Fatalf("Wails SessionNew under identity contention = %v, want ErrProjectBusy", err)
 	}
-	if content, err := app.ReadFileContent("visible.txt"); err != nil || content != "destination" {
-		t.Fatalf("Wails present destination file read under identity contention = %q, %v", content, err)
+	if result, err := app.ReadFileContent(sourceID, "visible.txt"); err != nil || result.Content != "source" {
+		t.Fatalf("Wails presented source file read under routing contention = %q, %v", result.Content, err)
 	}
 	if sessions, listErr := svc.SessionListForProjectPath(other, "active"); listErr == nil && len(sessions) != 0 {
 		t.Fatalf("contended existing destination published %d sessions", len(sessions))

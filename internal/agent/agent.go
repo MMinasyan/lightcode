@@ -4277,6 +4277,16 @@ func (a *Agent) CurrentModelForSession(sessionID string) (ModelInfo, error) {
 	return a.modelInfo(unit.currentRef), nil
 }
 
+// ProjectPathForSession resolves an existing session through the unambiguous
+// session authority and returns its project path.
+func (a *Agent) ProjectPathForSession(sessionID string) (string, error) {
+	resolved, err := a.resolveUnambiguousLiveSession(sessionID)
+	if err != nil {
+		return "", err
+	}
+	return resolved.project.Path, nil
+}
+
 // modelListFrom builds enriched model list entries from the given refs.
 // Caller must hold the runtime mutex.
 func (a *Agent) modelListFrom(refs []catalog.ModelRef) []ModelListEntry {
