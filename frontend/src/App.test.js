@@ -357,7 +357,10 @@ function openAssistantSnapshot(sandbox) {
   runInNewContext(
     `(${functionBodySource('applySnapshot')})({
       session: { id: 'dest-session' },
-      messages: [{ type: 'user', content: 'question', turn: 1 }],
+       messages: [
+         { type: 'user', content: 'question', turn: 1 },
+         { type: 'assistant', content: 'thinking ', turn: 1 },
+       ],
       tail: [{ seq: 1, message: { type: 'assistant', content: 'thinking ', turn: 1 } }],
       assistantOpen: true,
       tokens: { total: { cache: 0, input: 0, output: 0, known: true }, perModel: [], contextUsed: 0, contextWindow: 0 },

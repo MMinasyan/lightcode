@@ -64,8 +64,8 @@ func TestTranscriptCoordinatorProjectionMatchesEventFold(t *testing.T) {
 		{Kind: EventToolCallStart, ToolCallID: "t1", ToolName: "read_file", Args: `{"path":"a"}`},
 		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "ok"},
 		{Kind: EventTextDelta, Result: "after tool"},
-		{Kind: EventGenericSystemSignal, Result: "a signal"},
-		{Kind: EventBackgroundProcessComplete, Result: "bg done", BackgroundProcess: &BackgroundProcessDisplay{
+		{Kind: EventGenericSystemSignal, Turn: 1, Result: "a signal"},
+		{Kind: EventBackgroundProcessComplete, Turn: 1, Result: "bg done", BackgroundProcess: &BackgroundProcessDisplay{
 			ID: "bg1", Command: "sleep 1", Reason: "completed", Output: "out", ExitCode: 0,
 		}},
 		{Kind: EventTurnEnd, Turn: 1},
@@ -81,6 +81,51 @@ func TestTranscriptCoordinatorProjectionMatchesEventFold(t *testing.T) {
 	want := projectEvents(events)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("coordinator tail projection != event fold\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestTranscriptRowsCarryTheirOwningTurns(t *testing.T) {
+	tr := newTranscript()
+	feedTranscriptEvents(tr, []Event{
+		{Kind: EventTurnStart, Turn: 7},
+		{Kind: EventToolCallStart, ToolCallID: "tool", ToolName: "read_file"},
+		{Kind: EventGenericSystemSignal, Turn: 7, Result: "signal"},
+		{Kind: EventBackgroundProcessComplete, Turn: 7, Result: "background", BackgroundProcess: &BackgroundProcessDisplay{ID: "bg"}},
+	})
+
+	tr.seqMu.Lock()
+	defer tr.seqMu.Unlock()
+	for _, row := range tr.tail {
+		if row.msg.Turn != 7 {
+			t.Fatalf("live %s row turn = %d, want 7", row.msg.Type, row.msg.Turn)
+		}
+	}
+}
+
+func TestDurableRowsCarryTheirOwningTurns(t *testing.T) {
+	a := &Agent{}
+	toolCall := message.Message{
+		Role:      message.RoleAssistant,
+		ToolCalls: []message.ToolCall{{ID: "tool", Function: message.FunctionCall{Name: "read_file", Arguments: "{}"}}},
+	}
+	system := loop.NewSystemSignalMessage("status")
+	background := loop.NewSystemSignalMessage("Background process bg-1 (\"printf ok\") finished: completed, exit code 0.\nOutput:\nok")
+	var raw [][]byte
+	for _, msg := range []message.Message{toolCall, system, background} {
+		data, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		raw = append(raw, data)
+	}
+	rows := a.renderCompleteTurns([]snapshot.TurnMessages{{Turn: 4, Messages: raw}})
+	if len(rows) != 3 {
+		t.Fatalf("durable rows = %#v, want tool, system, background", rows)
+	}
+	for _, row := range rows {
+		if row.Turn != 4 {
+			t.Fatalf("durable %s row turn = %d, want 4", row.Type, row.Turn)
+		}
 	}
 }
 
@@ -605,8 +650,8 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 				t.Fatalf("hydrated %q %d times, want exactly once (the marked turn renders from the retained tail alone)", content, got)
 			}
 		}
-		if len(hs.Messages) != 0 {
-			t.Fatalf("hydration has %d durable rows, want 0 (the marked turn stays below the committed bound)", len(hs.Messages))
+		if len(hs.Messages) != 2 {
+			t.Fatalf("hydration has %d display rows, want 2 (the marked turn is represented by the projection)", len(hs.Messages))
 		}
 		if seqUser <= 0 || seqReply <= seqUser {
 			t.Fatalf("fixture sequences = user %d, reply %d, want reply > user > 0", seqUser, seqReply)
@@ -649,8 +694,8 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 		if got := countHydrationContent(hs, "preseed window"); got != 1 {
 			t.Fatalf("hydrated %q %d times, want exactly once (the marked preseed turn renders from the retained tail alone)", "preseed window", got)
 		}
-		if len(hs.Messages) != 0 {
-			t.Fatalf("hydration has %d durable rows, want 0 (the marked preseed turn stays below the committed bound)", len(hs.Messages))
+		if len(hs.Messages) != 1 {
+			t.Fatalf("hydration has %d display rows, want 1 (the marked preseed turn is represented by the projection)", len(hs.Messages))
 		}
 		if hs.Cursor.CommittedSeq != 0 {
 			t.Fatalf("cursor committedSeq = %d, want 0 (the uncommitted bound is not raised)", hs.Cursor.CommittedSeq)
@@ -862,6 +907,9 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 		}
 		if len(hs.Tail) != 0 || len(hs.Errors) != 0 {
 			t.Fatalf("completed child hydration has live rows: tail=%d errors=%d", len(hs.Tail), len(hs.Errors))
+		}
+		if hs.TranscriptReplay {
+			t.Fatal("completed child hydration transcriptReplay = true, want false")
 		}
 	})
 
@@ -1096,14 +1144,17 @@ func TestCompleteLiveSessionStateContract(t *testing.T) {
 		if got := countHydrationContent(hs, "child live"); got != 1 {
 			t.Fatalf("hydrated live child %q %d times, want exactly once (the live route returns the tail row once)", "child live", got)
 		}
-		if len(hs.Messages) != 0 {
-			t.Fatalf("live child hydration has %d durable rows, want none (the turn is not complete yet)", len(hs.Messages))
+		if len(hs.Messages) != 1 {
+			t.Fatalf("live child hydration has %d display rows, want one (the turn is not complete yet)", len(hs.Messages))
 		}
 		if len(hs.Tail) == 0 {
 			t.Fatal("live child hydration has no retained tail")
 		}
 		if hs.Cursor.CommittedTurn != 0 {
 			t.Fatalf("live child cursor committedTurn = %d, want 0 (nothing committed yet)", hs.Cursor.CommittedTurn)
+		}
+		if !hs.TranscriptReplay {
+			t.Fatal("live child hydration transcriptReplay = false, want true")
 		}
 
 		close(release)
@@ -1230,8 +1281,8 @@ func TestLiveHydrationUsesCommittedTurn(t *testing.T) {
 		if err != nil {
 			t.Fatalf("HydrateSession: %v", err)
 		}
-		if len(hs.Messages) != 0 {
-			t.Fatalf("hydration has %d durable rows, want 0 (the marked turn stays below the committed bound)", len(hs.Messages))
+		if len(hs.Messages) != 1 {
+			t.Fatalf("hydration has %d display rows, want 1 (the marked turn is represented by the projection)", len(hs.Messages))
 		}
 		if got := countHydrationContent(hs, "partial tail"); got != 1 {
 			t.Fatalf("hydrated %q %d times, want exactly once (the tail carries the uncommitted row)", "partial tail", got)
@@ -1279,8 +1330,8 @@ func TestLiveHydrationUsesCommittedTurn(t *testing.T) {
 		if hs.Cursor.CommittedTurn != 0 {
 			t.Fatalf("seeded committedTurn = %d, want 0 (a begun incomplete turn must not be adopted as committed)", hs.Cursor.CommittedTurn)
 		}
-		if len(hs.Messages) != 0 {
-			t.Fatalf("hydration has %d durable rows, want 0 (the begun turn must not be exposed through the durable half before its commit)", len(hs.Messages))
+		if len(hs.Messages) != 1 {
+			t.Fatalf("hydration has %d display rows, want 1 (the begun turn is represented by the projection)", len(hs.Messages))
 		}
 		if got := countHydrationContent(hs, "begun turn"); got != 1 {
 			t.Fatalf("hydrated %q %d times, want exactly once (the tail carries the uncommitted row)", "begun turn", got)
@@ -1392,7 +1443,7 @@ func TestLiveChildHydrationUsesCommittedTurn(t *testing.T) {
 			t.Fatalf("HydrateSession(live child): %v", err)
 		}
 		if len(hs.Messages) != 0 {
-			t.Fatalf("live child hydration has %d durable rows, want 0 (the marked turn stays below the committed bound)", len(hs.Messages))
+			t.Fatalf("live child hydration has %d display rows, want 0 (no event was dispatched before the coordinator commit)", len(hs.Messages))
 		}
 		if len(hs.Tail) != 0 {
 			t.Fatalf("live child hydration has %d tail rows, want 0 (no event dispatched yet)", len(hs.Tail))
@@ -1418,8 +1469,8 @@ func TestLiveChildHydrationUsesCommittedTurn(t *testing.T) {
 		if err != nil {
 			t.Fatalf("HydrateSession(live child): %v", err)
 		}
-		if len(hs.Messages) != 0 {
-			t.Fatalf("live child hydration has %d durable rows, want 0 (the marked turn stays below the committed bound)", len(hs.Messages))
+		if len(hs.Messages) != 1 {
+			t.Fatalf("live child hydration has %d display rows, want 1 (the marked turn is represented by the projection)", len(hs.Messages))
 		}
 		if got := countHydrationContent(hs, content); got != 1 {
 			t.Fatalf("hydrated %q %d times, want exactly once (the tail carries the uncommitted row)", content, got)
@@ -3292,24 +3343,12 @@ func TestTurnBegunAfterRevertRendersOnceThroughHydration(t *testing.T) {
 	}
 }
 
-// countHydrationContent counts how many times content appears across a
-// hydration's durable messages, retained tail rows, and retained error rows —
-// the three halves the frontend concatenates. A row present in both the
-// durable half and the tail counts twice.
+// countHydrationContent counts rows in the producer-ordered hydration display
+// projection. Tail and error rows are replay evidence, not a second display list.
 func countHydrationContent(hs HydrationState, content string) int {
 	n := 0
 	for _, m := range hs.Messages {
 		if m.Content == content {
-			n++
-		}
-	}
-	for _, r := range hs.Tail {
-		if r.Message.Content == content {
-			n++
-		}
-	}
-	for _, e := range hs.Errors {
-		if e.Message.Content == content {
 			n++
 		}
 	}

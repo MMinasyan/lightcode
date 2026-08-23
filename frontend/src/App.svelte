@@ -103,6 +103,7 @@
   let readOnly = false;
   let pendingFrames = [];
   let gate = { highWater: 0 };
+  let transcriptReplay = true;
 
   function mid() { return nextId++; }
 
@@ -200,6 +201,7 @@
     closeViewer();
     snapshotApplied = true;
     readOnly = !!hs.readOnly;
+    transcriptReplay = hs.transcriptReplay !== false;
     const destinationId = hs.session?.id || '';
     // A boundary also replaces the pending permission map, so a prompt open for
     // the session being left is dismissed unanswered. The request is not lost —
@@ -267,7 +269,9 @@
     const buffered = pendingFrames;
     pendingFrames = [];
     hydrated = true;
-    for (const frame of buffered) frame.handler(frame.data);
+    if (transcriptReplay) {
+      for (const frame of buffered) frame.handler(frame.data);
+    }
     if (!snapshotApplied) {
       // No boundary seeded the view: close the gate so replayed or live
       // transcript frames cannot render into the empty view. A boundary

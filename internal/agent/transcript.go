@@ -93,7 +93,7 @@ func (t *transcript) appendEventLocked(ev Event) int {
 		return seq
 	case EventToolCallStart:
 		t.textOpen = false
-		return t.appendRowLocked(DisplayMessage{Type: "tool", ID: ev.ToolCallID, Name: ev.ToolName, Args: ev.Args})
+		return t.appendRowLocked(DisplayMessage{Type: "tool", ID: ev.ToolCallID, Name: ev.ToolName, Args: ev.Args, Turn: t.curTurn})
 	case EventToolCallEnd:
 		// Last end wins: a staged edit emits a second end (the real result) after
 		// its stage-time end, and the later end overwrites the row. Display metadata
@@ -127,10 +127,10 @@ func (t *transcript) appendEventLocked(ev Event) int {
 		return t.appendRowLocked(DisplayMessage{Type: "user", Content: ev.Result, Turn: ev.Turn})
 	case EventGenericSystemSignal:
 		t.textOpen = false
-		return t.appendRowLocked(DisplayMessage{Type: "system", Content: "System: " + ev.Result})
+		return t.appendRowLocked(DisplayMessage{Type: "system", Content: "System: " + ev.Result, Turn: ev.Turn})
 	case EventBackgroundProcessComplete:
 		t.textOpen = false
-		msg := DisplayMessage{Type: "background_process", Done: true, Success: !ev.IsError, Result: ev.Result}
+		msg := DisplayMessage{Type: "background_process", Done: true, Success: !ev.IsError, Result: ev.Result, Turn: ev.Turn}
 		if ev.BackgroundProcess != nil {
 			msg.BackgroundProcess = ev.BackgroundProcess
 			msg.ID = ev.BackgroundProcess.ID
@@ -326,6 +326,45 @@ func mergeLiveRowsLocked(tail []tailRow, errors []errorRow) []DisplayMessage {
 		}
 	}
 	return live
+}
+
+// projectHydrationMessages builds the producer-ordered display projection for a
+// complete hydration. Retained errors belonging to a committed turn are placed
+// after that turn's committed rows, while the remaining tail and errors keep
+// their shared live sequence. Turn-zero errors have no committed merge key and
+// therefore remain in the live suffix.
+func projectHydrationMessages(committed []DisplayMessage, tail []tailRow, errors []errorRow) []DisplayMessage {
+	if len(committed) == 0 {
+		return mergeLiveRowsLocked(tail, errors)
+	}
+
+	lastCommittedIndex := make(map[int]int)
+	for i, msg := range committed {
+		lastCommittedIndex[msg.Turn] = i
+	}
+	consumed := make([]bool, len(errors))
+	out := make([]DisplayMessage, 0, len(committed)+len(tail)+len(errors))
+	for i, msg := range committed {
+		out = append(out, msg)
+		if msg.Turn == 0 || lastCommittedIndex[msg.Turn] != i {
+			continue
+		}
+		for j, err := range errors {
+			if !consumed[j] && err.turn == msg.Turn {
+				out = append(out, err.msg)
+				consumed[j] = true
+			}
+		}
+	}
+
+	remainingErrors := make([]errorRow, 0, len(errors))
+	for i, err := range errors {
+		if !consumed[i] {
+			remainingErrors = append(remainingErrors, err)
+		}
+	}
+	out = append(out, mergeLiveRowsLocked(tail, remainingErrors)...)
+	return out
 }
 
 // assistantSpanOpenLocked reports whether the last row of live is an open

@@ -202,7 +202,10 @@ describe('child stream lifecycle', () => {
     // assistant row in the coordinator and folds into it here.
     appendSubagentEvent('session-1', { type: 'token', seq: 2, content: 'live' });
     hydrateSubagentViewer('session-1', {
-      messages: [{ type: 'user', content: 'prompt' }],
+      messages: [
+        { type: 'user', content: 'prompt' },
+        { type: 'assistant', content: 'earlier' },
+      ],
       tail: [{ seq: 1, message: { type: 'assistant', content: 'earlier' } }],
       cursor: { committedSeq: 0 },
     }, generation);
@@ -218,6 +221,7 @@ describe('child stream lifecycle', () => {
   it('continues a live child in-flight assistant row from the snapshot', () => {
     const generation = openSubagentViewer('Explore', 'session-1');
     hydrateSubagentViewer('session-1', {
+      messages: [{ type: 'assistant', content: 'thinking ' }],
       tail: [{ seq: 1, message: { type: 'assistant', content: 'thinking ' } }],
       cursor: { committedSeq: 0 },
     }, generation);
@@ -244,6 +248,17 @@ describe('child stream lifecycle', () => {
     ]);
   });
 
+  it('discards frames buffered before a terminal completed-child hydration', () => {
+    const generation = openSubagentViewer('Explore', 'session-1');
+    appendSubagentEvent('session-1', { type: 'token', seq: 2, content: 'stale live frame' });
+    hydrateSubagentViewer('session-1', {
+      messages: [{ type: 'assistant', content: 'durable answer' }],
+      transcriptReplay: false,
+      cursor: { committedSeq: 1 },
+    }, generation);
+    expect(get(viewer).messages).toEqual([{ type: 'assistant', content: 'durable answer' }]);
+  });
+
   // A tool result is id-keyed and never gated, so the gate cannot protect it
   // when the snapshot replaces the state: a result received during the read
   // must be applied on top of the snapshot's running row, not discarded with
@@ -255,6 +270,7 @@ describe('child stream lifecycle', () => {
     // view, so only the snapshot apply can carry it.
     appendSubagentEvent('session-1', { type: 'tool_result', id: 'call-1', success: true, output: 'patched', metadata: { ok: true } });
     hydrateSubagentViewer('session-1', {
+      messages: [{ type: 'tool', id: 'call-1', name: 'apply_patch', args: '{}', done: false, success: true, result: '' }],
       tail: [{ seq: 2, message: { type: 'tool', id: 'call-1', name: 'apply_patch', args: '{}', done: false, success: true, result: '' } }],
       cursor: { committedSeq: 2 },
     }, generation);
@@ -271,7 +287,10 @@ describe('child stream lifecycle', () => {
     appendSubagentEvent('session-1', { type: 'tool_start', seq: 2, id: 'call-1', name: 'read_file', args: '{}' });
     appendSubagentEvent('session-1', { type: 'tool_result', id: 'call-1', success: false, output: 'denied' });
     hydrateSubagentViewer('session-1', {
-      messages: [{ type: 'assistant', content: 'later' }],
+      messages: [
+        { type: 'assistant', content: 'later' },
+        { type: 'tool', id: 'call-1', name: 'read_file', args: '{}', done: false, success: true, result: '' },
+      ],
       cursor: { committedSeq: 0 },
     }, generation);
     const row = get(viewer).messages.find((m) => m.type === 'tool' && m.id === 'call-1');
@@ -308,7 +327,10 @@ describe('child stream lifecycle', () => {
     const generation = openSubagentViewer('Explore', 'session-1');
     appendSubagentEvent('session-1', { type: 'tool_start', seq: 2, id: 'call-1', name: 'read_file', args: '{}' });
     hydrateSubagentViewer('session-1', {
-      messages: [{ type: 'assistant', content: 'later' }],
+      messages: [
+        { type: 'assistant', content: 'later' },
+        { type: 'tool', id: 'call-1', name: 'read_file', args: '{}', done: false, success: true, result: '' },
+      ],
       tail: [{ seq: 2, message: { type: 'tool', id: 'call-1', name: 'read_file', args: '{}', done: false, success: true, result: '' } }],
       cursor: { committedSeq: 5 },
     }, generation);
@@ -326,6 +348,7 @@ describe('child stream lifecycle', () => {
     const generation = openSubagentViewer('Explore', 'session-1');
     appendSubagentEvent('session-1', { type: 'tool_start', seq: 2, id: 'call-1', name: 'apply_patch', args: '{}' });
     hydrateSubagentViewer('session-1', {
+      messages: [{ type: 'tool', id: 'call-1', name: 'apply_patch', args: '{}', done: false, success: true, result: '' }],
       tail: [{ seq: 2, message: { type: 'tool', id: 'call-1', name: 'apply_patch', args: '{}', done: false, success: true, result: '' } }],
       cursor: { committedSeq: 5 },
     }, generation);

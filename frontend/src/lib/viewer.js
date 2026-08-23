@@ -70,9 +70,14 @@ export function hydrateSubagentViewer(sessionId, state, generation) {
     if (state?.tail?.length > 0 && messages.length > 0 && messages[messages.length - 1].type === 'assistant') {
       messages[messages.length - 1] = { ...messages[messages.length - 1], partial: true };
     }
+    // A durable-only completed-child read is terminal for this viewer open:
+    // the pending frames belong to the live read window that ended before the
+    // child completed and must not be replayed over the durable transcript.
     let out = messages;
-    for (const frame of v.pending) {
-      out = applyFrame(out, frame, gate);
+    if (state?.transcriptReplay !== false) {
+      for (const frame of v.pending) {
+        out = applyFrame(out, frame, gate);
+      }
     }
     return { ...v, reading: false, pending: [], messages: out };
   });

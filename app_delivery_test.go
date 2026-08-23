@@ -130,6 +130,82 @@ func TestWailsAppOwnsConcreteAgentLifecycle(t *testing.T) {
 	}
 }
 
+// TestWailsHydrationNavigationPreservesRetainedErrorOrder exercises the real
+// failed-turn, retained-error, navigation, and complete-state capture path. A
+// failed turn 1 is followed by a completed turn 2; switching away and back
+// publishes the same HydrationState a Wails frontend applies at navigation.
+func TestWailsHydrationNavigationPreservesRetainedErrorOrder(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			http.Error(w, "turn 1 failed", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"role":"assistant","content":"turn 2 answer"},"finish_reason":"stop"}]}`)
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "data: [DONE]")
+		fmt.Fprintln(w)
+	}))
+	defer server.Close()
+
+	ag := newAppTestAgentAt(t, server.URL+"/v1")
+	app := &App{svc: ag, agent: ag}
+	log := &wailsFrameLog{}
+	app.emitFn = log.append
+	app.titleFn = func(string) {}
+	app.startup(context.Background())
+	t.Cleanup(func() { app.shutdown(context.Background()) })
+
+	sessionID := app.currentSessionID()
+	if sessionID == "" {
+		t.Fatal("startup did not establish a current session")
+	}
+	if _, err := ag.SubmitToSession(context.Background(), sessionID, "turn 1 question"); err != nil {
+		t.Fatalf("failed turn submit: %v", err)
+	}
+	waitForWailsFrame(t, log, "turn_end")
+	if _, err := ag.SubmitToSession(context.Background(), sessionID, "turn 2 question"); err != nil {
+		t.Fatalf("completed turn submit: %v", err)
+	}
+	log.mu.Lock()
+	log.frames = nil
+	log.mu.Unlock()
+	waitForWailsFrame(t, log, "turn_end")
+
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("provider calls = %d, want 2 (one failed turn and one completed turn)", got)
+	}
+	if err := app.SessionNew(); err != nil {
+		t.Fatalf("navigate away with SessionNew: %v", err)
+	}
+	waitForWailsFrame(t, log, "navigation")
+	log.mu.Lock()
+	log.frames = nil
+	log.mu.Unlock()
+
+	if err := app.SessionSwitch(sessionID); err != nil {
+		t.Fatalf("navigate back with SessionSwitch: %v", err)
+	}
+	payload := waitForWailsFrame(t, log, "navigation")
+	state, ok := payload.(agent.HydrationState)
+	if !ok {
+		t.Fatalf("navigation payload = %T, want agent.HydrationState", payload)
+	}
+	if !state.TranscriptReplay {
+		t.Fatal("live navigation hydration transcriptReplay = false, want true")
+	}
+
+	var got []string
+	for _, msg := range state.Messages {
+		got = append(got, fmt.Sprintf("%s/%d", msg.Type, msg.Turn))
+	}
+	want := []string{"user/1", "error/1", "user/2", "assistant/2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rehydrated navigation messages = %v, want %v", got, want)
+	}
+}
+
 func TestWailsStartupRealCommittedCreationAdoptsWithoutBoundary(t *testing.T) {
 	ag := newAppTestAgent(t)
 	app := &App{svc: ag, agent: ag}

@@ -32,7 +32,7 @@ func TestHydrationStateFromCompleteState(t *testing.T) {
 	if hs.Session.ID != "s1" {
 		t.Fatalf("session = %+v", hs.Session)
 	}
-	if len(hs.Messages) != 1 || hs.Messages[0].Content != "q" {
+	if len(hs.Messages) != 3 || hs.Messages[0].Content != "q" || hs.Messages[1].Content != "hi" || hs.Messages[2].Content != "boom" {
 		t.Fatalf("messages = %#v", hs.Messages)
 	}
 	if len(hs.Tail) != 1 || hs.Tail[0].Seq != 5 || hs.Tail[0].Message.Content != "hi" {
@@ -43,6 +43,9 @@ func TestHydrationStateFromCompleteState(t *testing.T) {
 	}
 	if hs.Cursor != (HydrationCursor{CommittedTurn: 1, CommittedSeq: 4, RewriteEpoch: 2}) {
 		t.Fatalf("cursor = %+v", hs.Cursor)
+	}
+	if !hs.TranscriptReplay {
+		t.Fatal("live hydration transcriptReplay = false, want true")
 	}
 	if hs.Tokens.Total.Input != 7 {
 		t.Fatalf("tokens = %+v", hs.Tokens)
@@ -58,6 +61,40 @@ func TestHydrationStateFromCompleteState(t *testing.T) {
 	}
 	if len(hs.Warnings) != 1 || hs.Warnings[0].Kind != "k" {
 		t.Fatalf("warnings = %#v", hs.Warnings)
+	}
+}
+
+func TestProjectHydrationMessagesPreservesTurnAndLiveOrder(t *testing.T) {
+	committed := []DisplayMessage{
+		{Type: "user", Content: "turn one", Turn: 1},
+		{Type: "tool", Content: "tool one", Turn: 1},
+		{Type: "user", Content: "turn two", Turn: 2},
+	}
+	tail := []tailRow{
+		{seq: 13, msg: DisplayMessage{Type: "assistant", Content: "live", Turn: 3}},
+		{seq: 16, msg: DisplayMessage{Type: "tool", Content: "later live", Turn: 2}},
+	}
+	errors := []errorRow{
+		{seq: 10, turn: 1, msg: DisplayMessage{Type: "error", Content: "first error", Turn: 1}},
+		{seq: 11, turn: 1, msg: DisplayMessage{Type: "error", Content: "second error", Turn: 1}},
+		{seq: 12, turn: 2, msg: DisplayMessage{Type: "error", Content: "second turn error", Turn: 2}},
+		{seq: 14, turn: 3, msg: DisplayMessage{Type: "error", Content: "live error", Turn: 3}},
+		{seq: 15, turn: 0, msg: DisplayMessage{Type: "error", Content: "unattributed", Turn: 0}},
+	}
+
+	got := projectHydrationMessages(committed, tail, errors)
+	var contents []string
+	for _, msg := range got {
+		contents = append(contents, msg.Content)
+	}
+	want := []string{"turn one", "tool one", "first error", "second error", "turn two", "second turn error", "live", "live error", "unattributed", "later live"}
+	if len(contents) != len(want) {
+		t.Fatalf("projection length = %d, want %d: %v", len(contents), len(want), contents)
+	}
+	for i := range want {
+		if contents[i] != want[i] {
+			t.Fatalf("projection[%d] = %q, want %q: %v", i, contents[i], want[i], contents)
+		}
 	}
 }
 
@@ -138,8 +175,8 @@ func TestSessionMessagesPointLookupIgnoresCommittedTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HydrateSession: %v", err)
 	}
-	if len(hs.Messages) != 0 {
-		t.Fatalf("live hydration has %d durable rows, want 0 (the marked turn stays below the committed bound)", len(hs.Messages))
+	if len(hs.Messages) != 1 {
+		t.Fatalf("live hydration has %d display rows, want 1 (the marked turn is carried by the projection)", len(hs.Messages))
 	}
 	if got := countHydrationContent(hs, "marked row"); got != 1 {
 		t.Fatalf("live hydration returns %q %d times, want exactly once (the tail carries the uncommitted row)", "marked row", got)

@@ -46,6 +46,9 @@ func TestHydrateSessionReadOnlyRootForPersistedSession(t *testing.T) {
 	if !hs.ReadOnly {
 		t.Fatal("non-live root hydration is not read-only")
 	}
+	if hs.TranscriptReplay {
+		t.Fatal("read-only root hydration transcriptReplay = true, want false")
+	}
 	if hs.Session.ID != id {
 		t.Fatalf("read-only hydration session = %q, want %q", hs.Session.ID, id)
 	}

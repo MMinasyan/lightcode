@@ -68,7 +68,7 @@ func projectEvents(events []Event) []transcriptRow {
 			assistant = append(assistant, ev.Result...)
 		case EventToolCallStart:
 			flush()
-			rows = append(rows, transcriptRow{Type: "tool", ID: ev.ToolCallID, Name: ev.ToolName, Args: ev.Args})
+			rows = append(rows, transcriptRow{Type: "tool", Turn: currentTurn, ID: ev.ToolCallID, Name: ev.ToolName, Args: ev.Args})
 		case EventToolCallEnd:
 			// Last-end-wins: a staged edit emits a second ToolCallEnd (the real
 			// result, at flush) after its stage-time "Staged." end; the later end
@@ -93,10 +93,10 @@ func projectEvents(events []Event) []transcriptRow {
 			rows = append(rows, transcriptRow{Type: "user", Content: ev.Result, Turn: ev.Turn})
 		case EventGenericSystemSignal:
 			flush()
-			rows = append(rows, transcriptRow{Type: "system", Content: "System: " + ev.Result})
+			rows = append(rows, transcriptRow{Type: "system", Turn: ev.Turn, Content: "System: " + ev.Result})
 		case EventBackgroundProcessComplete:
 			flush()
-			row := transcriptRow{Type: "background_process", Done: true, Success: !ev.IsError, Result: ev.Result}
+			row := transcriptRow{Type: "background_process", Turn: ev.Turn, Done: true, Success: !ev.IsError, Result: ev.Result}
 			if ev.BackgroundProcess != nil {
 				row.BGID = ev.BackgroundProcess.ID
 				row.BGCommand = ev.BackgroundProcess.Command
@@ -122,11 +122,11 @@ func projectDisplay(msgs []DisplayMessage) []transcriptRow {
 		case "assistant":
 			rows = append(rows, transcriptRow{Type: "assistant", Content: m.Content, Turn: m.Turn})
 		case "tool":
-			rows = append(rows, transcriptRow{Type: "tool", ID: m.ID, Name: m.Name, Args: m.Args, Done: m.Done, Success: m.Success, Result: m.Result})
+			rows = append(rows, transcriptRow{Type: "tool", Turn: m.Turn, ID: m.ID, Name: m.Name, Args: m.Args, Done: m.Done, Success: m.Success, Result: m.Result})
 		case "system":
-			rows = append(rows, transcriptRow{Type: "system", Content: m.Content})
+			rows = append(rows, transcriptRow{Type: "system", Turn: m.Turn, Content: m.Content})
 		case "background_process":
-			row := transcriptRow{Type: "background_process", Done: m.Done, Success: m.Success, Result: m.Result, ID: m.ID}
+			row := transcriptRow{Type: "background_process", Turn: m.Turn, Done: m.Done, Success: m.Success, Result: m.Result, ID: m.ID}
 			if m.BackgroundProcess != nil {
 				row.BGID = m.BackgroundProcess.ID
 				row.BGCommand = m.BackgroundProcess.Command

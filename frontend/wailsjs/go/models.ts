@@ -472,6 +472,7 @@ export namespace agent {
 	    tail: HydrationRow[];
 	    errors: HydrationRow[];
 	    cursor: HydrationCursor;
+	    transcriptReplay: boolean;
 	    tokens: TokenReport;
 	    model: ModelInfo;
 	    busy: boolean;
@@ -493,6 +494,7 @@ export namespace agent {
 	        this.tail = this.convertValues(source["tail"], HydrationRow);
 	        this.errors = this.convertValues(source["errors"], HydrationRow);
 	        this.cursor = this.convertValues(source["cursor"], HydrationCursor);
+	        this.transcriptReplay = source["transcriptReplay"];
 	        this.tokens = this.convertValues(source["tokens"], TokenReport);
 	        this.model = this.convertValues(source["model"], ModelInfo);
 	        this.busy = source["busy"];

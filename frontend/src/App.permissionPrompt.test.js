@@ -877,6 +877,19 @@ describe('App child link survives navigation', () => {
       ...navState(),
       session: { id: 's1' },
       busy: true,
+      messages: [
+        { type: 'user', content: 'hello' },
+        {
+          type: 'tool',
+          id: 'parent-task',
+          name: 'task',
+          args: JSON.stringify({ tasks: [{ subagent_type: 'explore', prompt: 'find the bug' }] }),
+          done: false,
+          success: true,
+          result: '',
+          subagentSessionIds: [{ index: 0, sessionId: 'child-1' }],
+        },
+      ],
       tail: [{
         seq: 2,
         message: {

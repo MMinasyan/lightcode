@@ -126,7 +126,7 @@ describe('transcript high-water gating', () => {
   // gate as already shown or the error renders twice.
   it('renders a retained error once when the buffered frame replays after the snapshot', () => {
     const state = {
-      messages: [{ type: 'user', content: 'q1' }],
+      messages: [{ type: 'user', content: 'q1' }, { type: 'error', content: 'boom', turn: 1 }],
       cursor: { committedSeq: 4 },
       errors: [{ seq: 5, message: { type: 'error', content: 'boom' } }],
     };
@@ -152,9 +152,9 @@ describe('transcript high-water gating', () => {
   // The sessionless case fails against the old zero-stamped frame: seq 0 is at
   // or below every snapshot high-water, so the gate drops it and the error
   // never renders. The producer must omit the field, never stamp a zero.
-  it('drops a sessionless error whose frame zero-stamps the sequence', () => {
-    const sandbox = errorHandlerSandbox({
-      messages: [{ type: 'user', content: 'q1' }],
+   it('drops a sessionless error whose frame zero-stamps the sequence', () => {
+     const sandbox = errorHandlerSandbox({
+       messages: [{ type: 'user', content: 'q1' }],
       cursor: { committedSeq: 4 },
     });
     runInNewContext(`(${errorHandlerSource()})({ seq: 0, message: 'boom' });`, sandbox);
@@ -190,9 +190,9 @@ describe('transcript high-water gating', () => {
 
   // A stale sequenced error already covered by the snapshot gates as shown: it
   // neither renders a second row nor clears a busy that belongs to a newer turn.
-  it('a stale sequenced error neither renders nor clears busy', () => {
-    const sandbox = errorHandlerSandbox({
-      messages: [{ type: 'user', content: 'q1' }],
+   it('a stale sequenced error neither renders nor clears busy', () => {
+     const sandbox = errorHandlerSandbox({
+       messages: [{ type: 'user', content: 'q1' }, { type: 'error', content: 'already shown', turn: 1 }],
       cursor: { committedSeq: 4 },
       errors: [{ seq: 5, message: { type: 'error', content: 'already shown' } }],
     });
@@ -203,23 +203,20 @@ describe('transcript high-water gating', () => {
   });
 });
 
-describe('snapshot message merge', () => {
-  it('puts committed messages first, then tail and errors merged by sequence', () => {
+describe('snapshot message projection', () => {
+  it('uses the producer-ordered messages without appending replay evidence', () => {
     const state = {
-      messages: [{ type: 'user', content: 'q1' }, { type: 'assistant', content: 'a1' }],
-      tail: [
-        { seq: 7, message: { type: 'assistant', content: 'streaming' } },
-        { seq: 5, message: { type: 'user', content: 'q2' } },
+      messages: [
+        { type: 'user', content: 'q1' },
+        { type: 'error', content: 'boom', turn: 1 },
+        { type: 'assistant', content: 'streaming', turn: 2 },
       ],
-      errors: [{ seq: 6, message: { type: 'error', content: 'boom' } }],
+      tail: [
+        { seq: 7, message: { type: 'assistant', content: 'duplicate evidence' } },
+      ],
+      errors: [{ seq: 8, message: { type: 'error', content: 'duplicate error evidence' } }],
     };
-    expect(snapshotMessages(state).map((m) => m.content)).toEqual([
-      'q1',
-      'a1',
-      'q2',
-      'boom',
-      'streaming',
-    ]);
+    expect(snapshotMessages(state)).toBe(state.messages);
   });
 
   it('returns only committed messages when there is no live tail or errors', () => {

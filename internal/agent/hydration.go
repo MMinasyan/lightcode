@@ -30,18 +30,21 @@ type HydrationCursor struct {
 // every live class, captured as one consistent set. It is intentionally not part
 // of the shared AdapterService — the owning adapter holds the concrete agent.
 type HydrationState struct {
-	Session     SessionSummary       `json:"session"`
-	Messages    []DisplayMessage     `json:"messages"`
-	Tail        []HydrationRow       `json:"tail"`
-	Errors      []HydrationRow       `json:"errors"`
-	Cursor      HydrationCursor      `json:"cursor"`
-	Tokens      TokenReport          `json:"tokens"`
-	Model       ModelInfo            `json:"model"`
-	Busy        bool                 `json:"busy"`
-	Compacting  bool                 `json:"compacting"`
-	Queue       QueueState           `json:"queue"`
-	Warnings    []PromptWarning      `json:"warnings"`
-	Permissions []permission.Request `json:"permissions"`
+	Session  SessionSummary   `json:"session"`
+	Messages []DisplayMessage `json:"messages"`
+	Tail     []HydrationRow   `json:"tail"`
+	Errors   []HydrationRow   `json:"errors"`
+	Cursor   HydrationCursor  `json:"cursor"`
+	// TranscriptReplay authorizes a consumer to replay frames buffered while
+	// this hydration was being read. Durable-only snapshots are terminal.
+	TranscriptReplay bool                 `json:"transcriptReplay"`
+	Tokens           TokenReport          `json:"tokens"`
+	Model            ModelInfo            `json:"model"`
+	Busy             bool                 `json:"busy"`
+	Compacting       bool                 `json:"compacting"`
+	Queue            QueueState           `json:"queue"`
+	Warnings         []PromptWarning      `json:"warnings"`
+	Permissions      []permission.Request `json:"permissions"`
 	// ReadOnly marks a hydration of a session that is not live in this owner:
 	// the durable transcript as of the read, and nothing live. The adapter
 	// must not admit a new turn against it.
@@ -120,9 +123,10 @@ func (a *Agent) hydrateReadOnlyRoot(proj *project.Project, sessionID string, met
 		return HydrationState{}, err
 	}
 	return HydrationState{
-		Session:  persistedSessionSummary(sessionID, meta, proj),
-		Messages: msgs,
-		ReadOnly: true,
+		Session:          persistedSessionSummary(sessionID, meta, proj),
+		Messages:         msgs,
+		TranscriptReplay: false,
+		ReadOnly:         true,
 	}, nil
 }
 
@@ -152,7 +156,7 @@ func (a *Agent) hydrateChildSession(sessionID, root string) (HydrationState, err
 	if err != nil {
 		return HydrationState{}, err
 	}
-	return HydrationState{Messages: msgs}, nil
+	return HydrationState{Messages: msgs, TranscriptReplay: false}, nil
 }
 
 // captureLiveChildSession captures a live child's complete transcript with the
@@ -198,9 +202,10 @@ func (a *Agent) captureLiveChildSession(sessionID string, e *transcriptCursor) (
 
 func hydrationStateFrom(summary SessionSummary, cs completeState) HydrationState {
 	hs := HydrationState{
-		Session:       summary,
-		Messages:      cs.transcript.committed,
-		AssistantOpen: cs.transcript.assistantOpen,
+		Session:          summary,
+		Messages:         projectHydrationMessages(cs.transcript.committed, cs.transcript.tail, cs.transcript.errors),
+		TranscriptReplay: true,
+		AssistantOpen:    cs.transcript.assistantOpen,
 		Cursor: HydrationCursor{
 			CommittedTurn: cs.transcript.revision.committedTurn,
 			CommittedSeq:  cs.transcript.revision.committedSeq,

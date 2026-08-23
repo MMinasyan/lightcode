@@ -75,6 +75,9 @@ func TestWailsModelSelectorUsesPrefixRefContract(t *testing.T) {
 	if !strings.Contains(models, "export class RevertResult") || !strings.Contains(models, "restored?: string[]") || !strings.Contains(models, "skipped?: SkippedRevert[]") {
 		t.Fatalf("generated models must include snapshot.RevertResult with restored/skipped fields")
 	}
+	if !strings.Contains(models, "transcriptReplay: boolean") || !strings.Contains(models, "source[\"transcriptReplay\"]") {
+		t.Fatalf("generated HydrationState model must include transcriptReplay")
+	}
 }
 
 func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {

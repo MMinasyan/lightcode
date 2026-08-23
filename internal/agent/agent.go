@@ -1816,6 +1816,7 @@ func (rt *runtime) dispatchTaggedEvent(tev TaggedLoopEvent) {
 		base.Kind = EventBackgroundProcessComplete
 		base.Result = ev.Result
 		base.IsError = ev.IsError
+		base.Turn = ev.Turn
 		if ev.BackgroundProcess != nil {
 			base.BackgroundProcess = &BackgroundProcessDisplay{
 				ID:       ev.BackgroundProcess.ID,
@@ -2331,19 +2332,17 @@ func (a *Agent) publishCompactionRewrite(unit *session, sessionID, projectID str
 	tr.seqMu.Lock()
 	tr.compactionRewriteLocked()
 	tr.dropErrorsThroughTurnLocked(boundaryTurn)
-	// The replacement carries the committed prefix followed by the retained tail
-	// and the surviving retained errors merged by their shared display sequence,
-	// the ordering the desktop snapshot applies to those two live classes — so an
-	// error that survives the compaction disposition stays on screen after the
-	// rewrite instead of vanishing until a full hydration.
-	messages := append([]DisplayMessage(nil), committed...)
-	live := mergeLiveRowsLocked(tr.tailSnapshotLocked(), tr.errorSnapshotLocked())
-	messages = append(messages, live...)
+	// The replacement uses the same producer-ordered projection as hydration, so
+	// a retained error that survives the compaction disposition stays beside its
+	// committed turn instead of moving below a later turn.
+	tail := tr.tailSnapshotLocked()
+	errors := tr.errorSnapshotLocked()
+	messages := projectHydrationMessages(committed, tail, errors)
 	payload := SessionPayload{
 		Session:       summary,
 		Messages:      messages,
 		Tokens:        tokens,
-		AssistantOpen: tr.assistantSpanOpenLocked(live),
+		AssistantOpen: tr.assistantSpanOpenLocked(messages),
 	}
 	a.emitEvent(Event{Kind: EventSessionRewrite, SessionID: sessionID, ProjectID: projectID, RewritePayload: &payload})
 	tr.seqMu.Unlock()
@@ -6100,12 +6099,13 @@ func captureTranscriptLocked(tr *transcript, committed []DisplayMessage, wantRev
 	rev := tr.revisionLocked()
 	tail := tr.tailSnapshotLocked()
 	errors := tr.errorSnapshotLocked()
+	messages := projectHydrationMessages(committed, tail, errors)
 	return completeTranscript{
 		committed:     committed,
 		tail:          tail,
 		errors:        errors,
 		revision:      rev,
-		assistantOpen: tr.assistantSpanOpenLocked(mergeLiveRowsLocked(tail, errors)),
+		assistantOpen: tr.assistantSpanOpenLocked(messages),
 	}, true
 }
 
@@ -6152,9 +6152,8 @@ func (a *Agent) messagesForFrontendForStore(store *snapshot.Store, sessionID str
 // durable while its commit has not run stays invisible to the durable half
 // until the coordinator commits it (it appears only through the retained
 // tail/live events before that). The bound is applied to the raw records,
-// where every element carries its turn: tool, system, and background rows
-// carry no turn, and a staged-flush wrapper produces no row at all, so a turn
-// made only of such rows would render nothing carrying a turn.
+// where every element carries its turn, and a staged-flush wrapper produces no
+// row at all.
 func (a *Agent) messagesThroughTurn(store *snapshot.Store, sessionID string, committedTurn int) ([]DisplayMessage, error) {
 	if store == nil {
 		return nil, snapshot.ErrNoSession
@@ -6250,6 +6249,7 @@ func (a *Agent) renderCompleteTurns(raw []snapshot.TurnMessages) []DisplayMessag
 						out = append(out, DisplayMessage{
 							Type:              "background_process",
 							ID:                bg.ID,
+							Turn:              t.Turn,
 							Done:              true,
 							Success:           backgroundProcessSuccess(bg),
 							Result:            bg.Output,
@@ -6259,6 +6259,7 @@ func (a *Agent) renderCompleteTurns(raw []snapshot.TurnMessages) []DisplayMessag
 						out = append(out, DisplayMessage{
 							Type:    "system",
 							Content: "System: " + collapseOneLine(signal),
+							Turn:    t.Turn,
 						})
 					}
 				} else {
@@ -6280,6 +6281,7 @@ func (a *Agent) renderCompleteTurns(raw []snapshot.TurnMessages) []DisplayMessag
 						ID:   tc.ID,
 						Name: tc.Function.Name,
 						Args: tc.Function.Arguments,
+						Turn: t.Turn,
 					})
 				}
 
@@ -6701,6 +6703,8 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		a.resetFileTrackerForSession(unit)
 		if tr := a.transcriptForSessionID(sessionIDOf(unit)); tr != nil {
 			tr.seqMu.Lock()
+			tr.tail = nil
+			tr.textOpen = false
 			if after < tr.committedTurn {
 				tr.committedTurn = after
 			}
