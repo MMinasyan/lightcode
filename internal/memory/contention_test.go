@@ -66,9 +66,10 @@ const (
 // actually wrote rather than returning through a skip branch. resultPrefix
 // carries the operation's outcome, and doneMarker closes the run.
 const (
-	writeEntryMarker = "write-entry"
-	resultPrefix     = "result="
-	doneMarker       = "done"
+	writeEntryMarker     = "write-entry"
+	candidateReadyMarker = "candidate_ready"
+	resultPrefix         = "result="
+	doneMarker           = "done"
 )
 
 // contentionBound bounds every child, marker wait and reader loop, so no
@@ -80,11 +81,18 @@ const contentionBound = 30 * time.Second
 // returns io.EOF or an error, so the production retry loop sees exactly the
 // scripted sequence of candidate names and nothing else changes.
 type scriptedNonceReader struct {
-	script [][]byte
-	next   int
+	script   [][]byte
+	released <-chan struct{}
+	next     int
+	ready    bool
 }
 
 func (r *scriptedNonceReader) Read(p []byte) (int, error) {
+	if !r.ready {
+		r.ready = true
+		fmt.Println(candidateReadyMarker)
+		<-r.released
+	}
 	for n := 0; n < len(p); {
 		chunk := r.script[r.next%len(r.script)]
 		r.next++
@@ -114,9 +122,14 @@ func memoryContentionChild(t *testing.T) {
 	if role == "" {
 		return
 	}
+	released := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		close(released)
+	}()
 	if script := os.Getenv(memoryContentionScriptEnv); script != "" {
 		original := rand.Reader
-		rand.Reader = &scriptedNonceReader{script: parseNonceScript(t, script)}
+		rand.Reader = &scriptedNonceReader{script: parseNonceScript(t, script), released: released}
 		t.Cleanup(func() { rand.Reader = original })
 	}
 
@@ -135,11 +148,6 @@ func memoryContentionChild(t *testing.T) {
 
 	injected := errors.New("injected memory temp sync failure")
 	parked := make(chan struct{})
-	released := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(io.Discard, os.Stdin)
-		close(released)
-	}()
 	calls := 0
 	atomicfs.SyncFileFunc = func(f *os.File) error {
 		calls++
@@ -561,12 +569,9 @@ func envScript(s ...string) string { return memoryContentionScriptEnv + "=" + st
 func envPath(p string) string      { return memoryContentionPathEnv + "=" + p }
 func envData(d string) string      { return memoryContentionDataEnv + "=" + d }
 
-// nonceWindowSeconds is how many consecutive UTC seconds the parent preplants
-// a candidate name for. It is far wider than a child's start-up, so the
-// child's own second is inside it; a child whose second escapes the window
-// never collides, which the caller detects and answers with a bounded
-// replant and rerun.
-const nonceWindowSeconds = 30
+// nonceWindowSeconds covers the bounded child lifetime plus a one-second
+// margin.
+const nonceWindowSeconds = int(contentionBound/time.Second) + 2
 
 // preplantNonces writes a complete memory file for every scripted nonce over
 // a window of UTC seconds around now, using the production timestamp and slug
@@ -584,7 +589,7 @@ func preplantNonces(t *testing.T, dir, title string, nonces []string) map[string
 		slug = slug[:40]
 	}
 	planted := make(map[string][]byte)
-	start := time.Now().UTC().Add(-5 * time.Second)
+	start := time.Now().UTC().Add(-(contentionBound + time.Second))
 	for i := 0; i < nonceWindowSeconds; i++ {
 		second := start.Add(time.Duration(i) * time.Second)
 		ts := second.Format("20060102-150405")
@@ -740,39 +745,35 @@ func TestWriteMemoryFileRetriesPastACollidingName(t *testing.T) {
 	const first = "aa000001"
 	const second = "bb000002"
 
-	for attempt := 0; attempt < 3; attempt++ {
-		dir := filepath.Join(t.TempDir(), "memories")
-		planted := preplantNonces(t, dir, title, []string{first})
-		readers := startMemoryReaders(publishedMarkdownCheck(dir, title))
-		child := startContentionChild(t, "writer", "TestWriteMemoryFileRetriesPastACollidingName", roleWriteMD,
-			envDir(dir), envTitle(title), envContent("retry body"), envMode(modeComplete),
-			envScript(first, second))
-		result := child.runOK(t)
-		readers.finish(t)
-		if strings.HasPrefix(result, "error:") {
-			t.Fatalf("WriteMemoryFile = %s", result)
-		}
-		if nonceOf(result) == first {
-			// The child's UTC second fell outside the preplanted window, so
-			// nothing collided. Replant and rerun rather than assert on a
-			// collision that never happened.
-			continue
-		}
-		if nonceOf(result) != second {
-			t.Fatalf("published nonce = %q, want the scripted retry %q", nonceOf(result), second)
-		}
-		if got := child.count(writeEntryMarker); got != 2 {
-			t.Fatalf("temp syncs = %d, want one per attempt across the collision and the retry", got)
-		}
-		title2, content, createdAt, err := ReadMemoryFile(result)
-		if err != nil || title2 != title || strings.TrimSpace(content) != "retry body" || createdAt == "" {
-			t.Fatalf("published record = %q/%q/%q, %v", title2, content, createdAt, err)
-		}
-		requirePreplantedIntact(t, planted)
-		requireNoProducerTemps(t, dir, result)
-		return
+	dir := filepath.Join(t.TempDir(), "memories")
+	planted := preplantNonces(t, dir, title, []string{first})
+	readers := startMemoryReaders(publishedMarkdownCheck(dir, title))
+	child := startContentionChild(t, "writer", "TestWriteMemoryFileRetriesPastACollidingName", roleWriteMD,
+		envDir(dir), envTitle(title), envContent("retry body"), envMode(modeComplete),
+		envScript(first, second))
+	child.await(t, candidateReadyMarker)
+	child.release()
+	result := child.runOK(t)
+	readers.acknowledge(t)
+	readers.finish(t)
+	if strings.HasPrefix(result, "error:") {
+		t.Fatalf("WriteMemoryFile = %s", result)
 	}
-	t.Fatal("every attempt escaped the preplanted second window; the collision was never provoked")
+	if nonceOf(result) != second {
+		t.Fatalf("published nonce = %q, want the scripted retry %q", nonceOf(result), second)
+	}
+	if got := child.count(writeEntryMarker); got != 2 {
+		t.Fatalf("temp syncs = %d, want one per attempt across the collision and the retry", got)
+	}
+	title2, content, createdAt, err := ReadMemoryFile(result)
+	if err != nil || title2 != title || strings.TrimSpace(content) != "retry body" || createdAt == "" {
+		t.Fatalf("published record = %q/%q/%q, %v", title2, content, createdAt, err)
+	}
+	if got := countSuffix(t, dir, ".md"); got != len(planted)+1 {
+		t.Fatalf(".md files = %d, want the fixtures plus one published record", got)
+	}
+	requirePreplantedIntact(t, planted)
+	requireNoProducerTemps(t, dir, result)
 }
 
 // TestWriteMemoryFileExhaustsItsRetryBudget preplants every name the writer's
@@ -785,36 +786,30 @@ func TestWriteMemoryFileExhaustsItsRetryBudget(t *testing.T) {
 	const title = "Exhaustion Row"
 	nonces := []string{"a1000001", "a2000002", "a3000003", "a4000004", "a5000005", "a6000006", "a7000007", "a8000008"}
 
-	for attempt := 0; attempt < 3; attempt++ {
-		dir := filepath.Join(t.TempDir(), "memories")
-		planted := preplantNonces(t, dir, title, nonces)
-		readers := startMemoryReaders(publishedMarkdownCheck(dir, title))
-		child := startContentionChild(t, "writer", "TestWriteMemoryFileExhaustsItsRetryBudget", roleWriteMD,
-			envDir(dir), envTitle(title), envContent("exhaustion body"), envMode(modeComplete),
-			envScript(nonces...))
-		result := child.runOK(t)
-		readers.finish(t)
-		if !strings.HasPrefix(result, "error:") {
-			// The child's UTC second fell outside the preplanted window, so
-			// its first candidate was free. Replant and rerun.
-			continue
-		}
-		if !strings.Contains(result, "could not allocate a unique file") {
-			t.Fatalf("WriteMemoryFile = %s, want the exhausted-retry report", result)
-		}
-		if got := child.count(writeEntryMarker); got != len(nonces) {
-			t.Fatalf("temp syncs = %d, want one per scripted attempt (%d)", got, len(nonces))
-		}
-		if got := countSuffix(t, dir, ".md"); got != len(planted) {
-			t.Fatalf(".md files = %d, want the %d preplanted records and nothing new", got, len(planted))
-		}
-		if temps := memoryTemps(t, dir); len(temps) != 0 {
-			t.Fatalf("temps = %v, want none after the exhausted retry", temps)
-		}
-		requirePreplantedIntact(t, planted)
-		return
+	dir := filepath.Join(t.TempDir(), "memories")
+	planted := preplantNonces(t, dir, title, nonces)
+	readers := startMemoryReaders(publishedMarkdownCheck(dir, title))
+	child := startContentionChild(t, "writer", "TestWriteMemoryFileExhaustsItsRetryBudget", roleWriteMD,
+		envDir(dir), envTitle(title), envContent("exhaustion body"), envMode(modeComplete),
+		envScript(nonces...))
+	child.await(t, candidateReadyMarker)
+	child.release()
+	result := child.runOK(t)
+	readers.acknowledge(t)
+	readers.finish(t)
+	if !strings.Contains(result, "could not allocate a unique file") {
+		t.Fatalf("WriteMemoryFile = %s, want the exhausted-retry report", result)
 	}
-	t.Fatal("every attempt escaped the preplanted second window; the exhaustion was never provoked")
+	if got := child.count(writeEntryMarker); got != len(nonces) {
+		t.Fatalf("temp syncs = %d, want one per scripted attempt (%d)", got, len(nonces))
+	}
+	if got := countSuffix(t, dir, ".md"); got != len(planted) {
+		t.Fatalf(".md files = %d, want the %d preplanted records and nothing new", got, len(planted))
+	}
+	if temps := memoryTemps(t, dir); len(temps) != 0 {
+		t.Fatalf("temps = %v, want none after the exhausted retry", temps)
+	}
+	requirePreplantedIntact(t, planted)
 }
 
 // TestTwoProcessMemoryWritersPublishDistinctRetryNames runs two real
@@ -832,55 +827,58 @@ func TestTwoProcessMemoryWritersPublishDistinctRetryNames(t *testing.T) {
 	const second = "c2000002"
 	const third = "c3000003"
 
-	for attempt := 0; attempt < 3; attempt++ {
-		dir := filepath.Join(t.TempDir(), "memories")
-		planted := preplantNonces(t, dir, title, []string{first})
-		readers := startMemoryReaders(publishedMarkdownCheck(dir, title))
-		env := []string{envDir(dir), envTitle(title), envContent("two writer body"), envMode(modeComplete), envScript(first, second, third)}
-		a := startContentionChild(t, "writer-a", "TestTwoProcessMemoryWritersPublishDistinctRetryNames", roleWriteMD, env...)
-		b := startContentionChild(t, "writer-b", "TestTwoProcessMemoryWritersPublishDistinctRetryNames", roleWriteMD, env...)
-		pathA := a.await(t, resultPrefix)
-		pathB := b.await(t, resultPrefix)
-		a.finish(t)
-		b.finish(t)
-		readers.finish(t)
+	dir := filepath.Join(t.TempDir(), "memories")
+	planted := preplantNonces(t, dir, title, []string{first})
+	readers := startMemoryReaders(publishedMarkdownCheck(dir, title))
+	env := []string{envDir(dir), envTitle(title), envContent("two writer body"), envMode(modeComplete), envScript(first, second, third)}
+	a := startContentionChild(t, "writer-a", "TestTwoProcessMemoryWritersPublishDistinctRetryNames", roleWriteMD, env...)
+	b := startContentionChild(t, "writer-b", "TestTwoProcessMemoryWritersPublishDistinctRetryNames", roleWriteMD, env...)
+	a.await(t, candidateReadyMarker)
+	b.await(t, candidateReadyMarker)
+	a.release()
+	b.release()
+	pathA := a.await(t, resultPrefix)
+	pathB := b.await(t, resultPrefix)
+	a.finish(t)
+	b.finish(t)
+	readers.acknowledge(t)
+	readers.finish(t)
 
-		if strings.HasPrefix(pathA, "error:") || strings.HasPrefix(pathB, "error:") {
-			t.Fatalf("writers = %s / %s, want two published records", pathA, pathB)
-		}
-		if nonceOf(pathA) == first || nonceOf(pathB) == first {
-			// One writer's UTC second escaped the preplanted window.
-			continue
-		}
-		if pathA == pathB {
-			t.Fatalf("both writers published %s; exclusive creation must give each its own name", pathA)
-		}
-		for _, writer := range []*contentionChild{a, b} {
-			if got := writer.count(writeEntryMarker); got < 2 {
-				t.Fatalf("%s temp syncs = %d, want at least the collision and the retry", writer.name, got)
-			}
-		}
-		if stampOf(pathA) == stampOf(pathB) {
-			got := []string{nonceOf(pathA), nonceOf(pathB)}
-			if !(got[0] == second && got[1] == third) && !(got[0] == third && got[1] == second) {
-				t.Fatalf("same-second nonces = %v, want the arbitrated %q and %q", got, second, third)
-			}
-		} else {
-			if nonceOf(pathA) != second || nonceOf(pathB) != second {
-				t.Fatalf("distinct-second nonces = %q/%q, want both at the free second candidate %q", nonceOf(pathA), nonceOf(pathB), second)
-			}
-		}
-		for _, path := range []string{pathA, pathB} {
-			gotTitle, content, createdAt, err := ReadMemoryFile(path)
-			if err != nil || gotTitle != title || strings.TrimSpace(content) != "two writer body" || createdAt == "" {
-				t.Fatalf("published %s = %q/%q/%q, %v", filepath.Base(path), gotTitle, content, createdAt, err)
-			}
-		}
-		requirePreplantedIntact(t, planted)
-		requireNoProducerTemps(t, dir, pathA, pathB)
-		return
+	if strings.HasPrefix(pathA, "error:") || strings.HasPrefix(pathB, "error:") {
+		t.Fatalf("writers = %s / %s, want two published records", pathA, pathB)
 	}
-	t.Fatal("every attempt escaped the preplanted second window; the collision was never provoked")
+	if nonceOf(pathA) == first || nonceOf(pathB) == first {
+		t.Fatalf("published first candidate: %q / %q", pathA, pathB)
+	}
+	if pathA == pathB {
+		t.Fatalf("both writers published %s; exclusive creation must give each its own name", pathA)
+	}
+	for _, writer := range []*contentionChild{a, b} {
+		if got := writer.count(writeEntryMarker); got < 2 {
+			t.Fatalf("%s temp syncs = %d, want at least the collision and the retry", writer.name, got)
+		}
+	}
+	if stampOf(pathA) == stampOf(pathB) {
+		got := []string{nonceOf(pathA), nonceOf(pathB)}
+		if !(got[0] == second && got[1] == third) && !(got[0] == third && got[1] == second) {
+			t.Fatalf("same-second nonces = %v, want the arbitrated %q and %q", got, second, third)
+		}
+	} else {
+		if nonceOf(pathA) != second || nonceOf(pathB) != second {
+			t.Fatalf("distinct-second nonces = %q/%q, want both at the free second candidate %q", nonceOf(pathA), nonceOf(pathB), second)
+		}
+	}
+	for _, path := range []string{pathA, pathB} {
+		gotTitle, content, createdAt, err := ReadMemoryFile(path)
+		if err != nil || gotTitle != title || strings.TrimSpace(content) != "two writer body" || createdAt == "" {
+			t.Fatalf("published %s = %q/%q/%q, %v", filepath.Base(path), gotTitle, content, createdAt, err)
+		}
+	}
+	if got := countSuffix(t, dir, ".md"); got != len(planted)+2 {
+		t.Fatalf(".md files = %d, want the fixtures plus two published records", got)
+	}
+	requirePreplantedIntact(t, planted)
+	requireNoProducerTemps(t, dir, pathA, pathB)
 }
 
 // TestExclusiveCreateArbitratesOneWinnerAtAnExactPath removes the timestamp

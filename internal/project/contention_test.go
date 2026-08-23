@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -80,14 +81,23 @@ func projectContentionChild() {
 	mode := os.Getenv(projectContentionModeEnv)
 
 	injected := errors.New("injected project temp sync failure")
-	parked := make(chan struct{})
+	released := make(chan struct{})
+	if mode == modePark {
+		go func() {
+			_, _ = io.Copy(io.Discard, os.Stdin)
+			close(released)
+		}()
+	}
 	atomicfs.SyncFileFunc = func(f *os.File) error {
 		fmt.Println(writeEntryMarker)
 		switch mode {
 		case modeFail:
 			return injected
 		case modePark:
-			<-parked // released only by this process being killed
+			if err := f.Sync(); err != nil {
+				return err
+			}
+			<-released
 			return nil
 		default:
 			return f.Sync()
@@ -111,9 +121,6 @@ func projectContentionChild() {
 			fmt.Fprintf(os.Stderr, "%s error = %v, want the injected temp sync failure\n", role, err)
 			os.Exit(3)
 		}
-	case modePark:
-		fmt.Fprintf(os.Stderr, "%s returned %v; the parked temp sync must never complete\n", role, err)
-		os.Exit(4)
 	default:
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", role, err)
@@ -245,6 +252,8 @@ func (c *contentionChild) finish(t *testing.T) {
 	}
 }
 
+func (c *contentionChild) release() { _ = c.stdin.Close() }
+
 // kill terminates a parked child, standing in for a process that dies
 // between a complete temp and its rename. It proves process and reader
 // behavior at that point; it is not a power-loss simulation.
@@ -270,12 +279,14 @@ type projectObservations struct {
 	reads      int
 	absent     int
 	present    int
+	activities []int64
 	violations []string
 }
 
 type projectReaderLoop struct {
-	stop chan struct{}
-	out  chan projectObservations
+	stop         chan struct{}
+	checkpointCh chan chan struct{}
+	out          chan projectObservations
 }
 
 // startProjectReaders runs FindByPath and List in a loop for the whole life
@@ -285,7 +296,11 @@ type projectReaderLoop struct {
 // replaced by rename, so it must never disappear even for one read. Activity
 // is required to be monotonic across observations.
 func startProjectReaders(root, path string, allowAbsent bool, check func(*Project) string) *projectReaderLoop {
-	l := &projectReaderLoop{stop: make(chan struct{}), out: make(chan projectObservations, 1)}
+	l := &projectReaderLoop{
+		stop:         make(chan struct{}),
+		checkpointCh: make(chan chan struct{}),
+		out:          make(chan projectObservations, 1),
+	}
 	go func() {
 		var obs projectObservations
 		var high int64
@@ -314,6 +329,7 @@ func startProjectReaders(root, path string, allowAbsent bool, check func(*Projec
 				}
 			default:
 				obs.present++
+				obs.activities = append(obs.activities, found.LastActivity)
 				if msg := check(found); msg != "" {
 					obs.violations = append(obs.violations, "FindByPath: "+msg)
 				}
@@ -340,10 +356,32 @@ func startProjectReaders(root, path string, allowAbsent bool, check func(*Projec
 			if !seen && !allowAbsent {
 				obs.violations = append(obs.violations, "List: the present record disappeared")
 			}
+			select {
+			case ack := <-l.checkpointCh:
+				close(ack)
+			default:
+			}
 			time.Sleep(time.Millisecond)
 		}
 	}()
 	return l
+}
+
+func (l *projectReaderLoop) acknowledge(t *testing.T) {
+	t.Helper()
+	ack := make(chan struct{})
+	timer := time.NewTimer(contentionBound)
+	defer timer.Stop()
+	select {
+	case l.checkpointCh <- ack:
+	case <-timer.C:
+		t.Fatal("project reader checkpoint was not acknowledged")
+	}
+	select {
+	case <-ack:
+	case <-timer.C:
+		t.Fatal("project reader checkpoint did not complete")
+	}
 }
 
 func (l *projectReaderLoop) finish(t *testing.T) projectObservations {
@@ -423,6 +461,67 @@ func requireCompleteTemp(t *testing.T, dir, wantID, wantPath string) {
 	}
 	if msg := completeProjectCheck(t, wantPath)(&p); msg != "" {
 		t.Fatalf("orphan record = %+v: %s", p, msg)
+	}
+}
+
+func readProjectTemp(t *testing.T, dir, wantPath string) Project {
+	t.Helper()
+	temps := projectTemps(t, dir)
+	if len(temps) != 1 {
+		t.Fatalf("temps = %v, want one complete writer temp", temps)
+	}
+	data, err := os.ReadFile(temps[0])
+	if err != nil {
+		t.Fatalf("read writer temp: %v", err)
+	}
+	var p Project
+	if err := json.Unmarshal(data, &p); err != nil {
+		t.Fatalf("writer temp is not complete JSON: %v", err)
+	}
+	if msg := completeProjectCheck(t, wantPath)(&p); msg != "" {
+		t.Fatalf("writer temp = %+v: %s", p, msg)
+	}
+	return p
+}
+
+func awaitProjectLockWait(t *testing.T, done <-chan error, write <-chan struct{}) {
+	t.Helper()
+	timer := time.NewTimer(contentionBound)
+	defer timer.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-done:
+			t.Fatalf("second writer returned before the lock-wait evidence: %v", err)
+		case <-write:
+			t.Fatal("second writer reached its write hook before the lock-wait evidence")
+		case <-timer.C:
+			t.Fatalf("second writer did not reach the lock wait within %v", contentionBound)
+		case <-ticker.C:
+			stack := make([]byte, 64*1024)
+			n := runtime.Stack(stack, true)
+			text := string(stack[:n])
+			if strings.Contains(text, "project.TouchActivity") &&
+				strings.Contains(text, "atomicfs.WithLock") &&
+				strings.Contains(text, "atomicfs.Acquire") &&
+				strings.Contains(text, "gofrs/flock") {
+				return
+			}
+		}
+	}
+}
+
+func requireProjectActivitySequence(t *testing.T, activities []int64, want ...int64) {
+	t.Helper()
+	next := 0
+	for _, activity := range activities {
+		if next < len(want) && activity == want[next] {
+			next++
+		}
+	}
+	if next != len(want) {
+		t.Fatalf("reader activities = %v, want observations old/A/B = %v", activities, want)
 	}
 }
 
@@ -590,14 +689,10 @@ func TestProjectAbsentKilledWriterReleasesLockAndSecondPublishes(t *testing.T) {
 	requireCompleteTemp(t, dir, id, clean)
 }
 
-// TestProjectPresentTwoProcessTouchWrites proves the present-target row
-// cannot pass through a no-op. TouchActivity writes only when the current
-// second is past the stored one, so the seeded record starts far in the past
-// and the second process is started only after the next Unix second begins.
-// Both processes must announce their own real temp sync, the first stays
-// alive while the second writes, and the final record is complete and
-// monotonic. Which write survives is a last-writer-wins outcome and is not
-// asserted; that both processes wrote is.
+// TestProjectPresentTwoProcessTouchWrites proves the present-target read,
+// modify, and publish sequence is serialized by the project metadata lock.
+// Writer A is held after its complete temp is written and before publication;
+// writer B must be observed waiting for that lock, then publish only after A.
 func TestProjectPresentTwoProcessTouchWrites(t *testing.T) {
 	projectContentionChild()
 
@@ -609,36 +704,114 @@ func TestProjectPresentTwoProcessTouchWrites(t *testing.T) {
 
 	readers := startProjectReaders(root, path, false, completeProjectCheck(t, path))
 	first := startContentionChild(t, "touch-a", "TestProjectPresentTwoProcessTouchWrites", roleTouch,
-		projectChildEnv(root, path, seeded.ID, modeHold)...)
+		projectChildEnv(root, path, seeded.ID, modePark)...)
 	first.await(t, writeEntryMarker)
+	a := readProjectTemp(t, dir, path)
+	if a.LastActivity <= 1 {
+		t.Fatalf("first temp activity = %d, want past the seeded 1", a.LastActivity)
+	}
+	readers.acknowledge(t)
+	old, err := FindByPath(root, path)
+	if err != nil || old == nil {
+		t.Fatalf("FindByPath while first temp is parked = %+v, %v", old, err)
+	}
+	if old.LastActivity != 1 {
+		t.Fatalf("published activity while first temp is parked = %d, want the old 1", old.LastActivity)
+	}
+
+	originalSync := atomicfs.SyncFileFunc
+	bWrite := make(chan struct{})
+	bRelease := make(chan struct{})
+	var releaseB sync.Once
+	var bWriteOnce sync.Once
+	bWrites := 0
+	releaseSecond := func() { releaseB.Do(func() { close(bRelease) }) }
+	atomicfs.SyncFileFunc = func(f *os.File) error {
+		bWrites++
+		bWriteOnce.Do(func() { close(bWrite) })
+		if err := f.Sync(); err != nil {
+			return err
+		}
+		<-bRelease
+		return nil
+	}
+	done := make(chan error, 1)
+	bFinished := false
+	go func() { done <- TouchActivity(root, seeded.ID) }()
+	defer func() {
+		releaseSecond()
+		first.cancel()
+		_ = first.reap()
+		if !bFinished {
+			select {
+			case <-done:
+			case <-time.After(contentionBound):
+				t.Errorf("second writer did not finish within %v", contentionBound)
+			}
+		}
+		atomicfs.SyncFileFunc = originalSync
+	}()
+
+	awaitProjectLockWait(t, done, bWrite)
+	deadline := time.NewTimer(contentionBound)
+	for time.Now().Unix() <= a.LastActivity {
+		select {
+		case err := <-done:
+			deadline.Stop()
+			t.Fatalf("second writer returned before the first was released: %v", err)
+		case <-bWrite:
+			deadline.Stop()
+			t.Fatal("second writer reached its write hook before the first was released")
+		case <-deadline.C:
+			t.Fatalf("clock did not pass first activity %d within %v", a.LastActivity, contentionBound)
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	deadline.Stop()
+
+	first.release()
 	first.await(t, doneMarker)
-
-	afterFirst, err := FindByPath(root, path)
-	if err != nil || afterFirst == nil {
-		t.Fatalf("FindByPath after the first write = %+v, %v", afterFirst, err)
-	}
-	if afterFirst.LastActivity <= 1 {
-		t.Fatalf("last_activity = %d, want the first write past the seeded 1", afterFirst.LastActivity)
-	}
-	// The second process can only write once its own second is past the
-	// stored one; until then TouchActivity is a no-op by contract.
-	for time.Now().Unix() <= afterFirst.LastActivity {
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	second := startContentionChild(t, "touch-b", "TestProjectPresentTwoProcessTouchWrites", roleTouch,
-		projectChildEnv(root, path, seeded.ID, modeComplete)...)
-	second.await(t, writeEntryMarker)
-	second.await(t, doneMarker)
-	second.finish(t)
 	first.finish(t)
-	readers.finish(t)
+	readers.acknowledge(t)
+	afterA, err := FindByPath(root, path)
+	if err != nil || afterA == nil {
+		t.Fatalf("FindByPath after first publication = %+v, %v", afterA, err)
+	}
+	if afterA.LastActivity != a.LastActivity {
+		t.Fatalf("published activity after first release = %d, want %d", afterA.LastActivity, a.LastActivity)
+	}
 
+	select {
+	case <-bWrite:
+	case err := <-done:
+		t.Fatalf("second writer returned before its parked write was inspected: %v", err)
+	case <-time.After(contentionBound):
+		t.Fatalf("second writer did not reach its write hook within %v", contentionBound)
+	}
+	b := readProjectTemp(t, dir, path)
+	if b.LastActivity <= a.LastActivity {
+		t.Fatalf("second temp activity = %d, want greater than first %d", b.LastActivity, a.LastActivity)
+	}
+	readers.acknowledge(t)
+	if published, err := FindByPath(root, path); err != nil || published == nil {
+		t.Fatalf("FindByPath while second temp is parked = %+v, %v", published, err)
+	} else if published.LastActivity != a.LastActivity {
+		t.Fatalf("published activity while second temp is parked = %d, want first %d", published.LastActivity, a.LastActivity)
+	}
+
+	releaseSecond()
+	if err := <-done; err != nil {
+		t.Fatalf("second TouchActivity: %v", err)
+	}
+	bFinished = true
+	readers.acknowledge(t)
+	obs := readers.finish(t)
 	if got := first.count(writeEntryMarker); got != 1 {
 		t.Fatalf("first process write entries = %d, want exactly one real write", got)
 	}
-	if got := second.count(writeEntryMarker); got != 1 {
-		t.Fatalf("second process write entries = %d, want exactly one real write", got)
+	if bWrites != 1 {
+		t.Fatalf("second writer write entries = %d, want exactly one real write", bWrites)
 	}
 	final, err := FindByPath(root, path)
 	if err != nil || final == nil {
@@ -647,9 +820,10 @@ func TestProjectPresentTwoProcessTouchWrites(t *testing.T) {
 	if msg := completeProjectCheck(t, path)(final); msg != "" {
 		t.Fatalf("final record: %s", msg)
 	}
-	if final.LastActivity <= afterFirst.LastActivity {
-		t.Fatalf("last_activity = %d, want the second write past the first's %d", final.LastActivity, afterFirst.LastActivity)
+	if final.LastActivity != b.LastActivity {
+		t.Fatalf("final activity = %d, want second %d", final.LastActivity, b.LastActivity)
 	}
+	requireProjectActivitySequence(t, obs.activities, 1, a.LastActivity, b.LastActivity)
 	if temps := projectTemps(t, dir); len(temps) != 0 {
 		t.Fatalf("temps = %v, want none after two completed writes", temps)
 	}
