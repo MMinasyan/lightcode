@@ -113,13 +113,16 @@ func TestRevertHistoryClassifiesTurnDirectorySyncFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
 
-	_, err := store.RevertHistory(1)
+	outcome, err := store.RevertHistory(1)
 	var committed *CommittedMutationError
 	if !errors.As(err, &committed) {
 		t.Fatalf("turn sync error = %v, want committed error", err)
 	}
 	if got := store.CurrentTurn(); got != 2 {
 		t.Fatalf("current turn after first successful removal = %d, want 2", got)
+	}
+	if !outcome.HistoryChanged || !outcome.HistoryStateKnown || outcome.CurrentTurn != 2 {
+		t.Fatalf("outcome = %+v, want changed/known/current 2", outcome)
 	}
 	if got := readIntDirs(turnsDir); !reflect.DeepEqual(got, []int{1, 2}) {
 		t.Fatalf("turn dirs after sync failure = %v, want [1 2]", got)

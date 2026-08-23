@@ -1115,6 +1115,56 @@ func TestWailsPartialRevertDisposition(t *testing.T) {
 	}
 }
 
+func TestWailsHighestTurnPartialMutationDisposition(t *testing.T) {
+	ag := newAppTestAgent(t)
+	app := &App{svc: ag, agent: ag}
+	log := &wailsFrameLog{}
+	app.emitFn = log.append
+	app.startup(context.Background())
+	id := seedAppCompleteTurns(t, ag, 5)
+	injected := errors.New("injected Wails highest-turn partial failure")
+	snapshot.RemoveHistoryTurnFunc = func(path string) error {
+		if filepath.Base(path) == "5" {
+			if err := os.Remove(filepath.Join(path, "messages.jsonl")); err != nil {
+				return err
+			}
+		}
+		return injected
+	}
+	t.Cleanup(func() { snapshot.RemoveHistoryTurnFunc = nil })
+
+	result, err := app.ApplyTurnAction(3, agent.TurnActionRevertHistory, false)
+	if err != nil {
+		t.Fatalf("ApplyTurnAction = %v, want boundary-owned ordinary partial failure", err)
+	}
+	if !strings.Contains(result.Warning, "highest-turn partial") {
+		t.Fatalf("result warning = %q, want injected warning", result.Warning)
+	}
+	frame := waitForWailsFrame(t, log, "turn_action")
+	boundary, ok := frame.(turnActionBoundary)
+	if !ok || boundary.Warning != result.Warning {
+		t.Fatalf("frame = %#v, want one matching warning boundary", frame)
+	}
+	if boundary.State == nil || boundary.State.Session.ID != id || len(boundary.State.Messages) == 0 {
+		t.Fatalf("boundary state = %#v, want reconciled session state", boundary.State)
+	}
+
+	ag2 := newAppTestAgent(t)
+	app2 := &App{svc: ag2, agent: ag2}
+	log2 := &wailsFrameLog{}
+	app2.emitFn = log2.append
+	app2.startup(context.Background())
+	id2 := seedAppCompleteTurns(t, ag2, 5)
+	if err := app2.RevertHistory(3); err != nil {
+		t.Fatalf("RevertHistory = %v, want the boundary-owned ordinary partial failure", err)
+	}
+	frame2 := waitForWailsFrame(t, log2, "turn_action")
+	boundary2, ok := frame2.(turnActionBoundary)
+	if !ok || boundary2.State == nil || boundary2.State.Session.ID != id2 || !strings.Contains(boundary2.Warning, "highest-turn partial") {
+		t.Fatalf("bound RevertHistory frame = %#v, want one reconciled warning boundary", frame2)
+	}
+}
+
 // TestWailsRevertHistoryPartialDisposition proves the exported RevertHistory
 // alias follows the same disposition: a reconciled partial revert returns nil
 // because the ordered turn_action frame owns the error, so the direct binding

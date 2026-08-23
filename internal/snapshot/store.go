@@ -60,6 +60,20 @@ const mintSessionIDMaxAttempts = 8
 // deterministically. Follows the copyDirFunc precedent.
 var mintSessionIDFunc = newSessionID
 
+// RemoveHistoryTurnFunc optionally replaces history-turn removal in tests.
+// Production leaves it nil and uses os.RemoveAll directly.
+var RemoveHistoryTurnFunc func(string) error
+
+// RevertHistoryOutcome describes the durable result of a history removal
+// attempt. HistoryStateKnown is false when the surviving state cannot be
+// trusted for reconciliation.
+type RevertHistoryOutcome struct {
+	CompactionRemoved bool
+	HistoryChanged    bool
+	HistoryStateKnown bool
+	CurrentTurn       int
+}
+
 // Store owns one session directory at a time. Its session may be
 // swapped (Close + BeginNewSession / LoadSession) while tool and loop
 // references to the Store remain valid — they call methods on the same
@@ -1150,19 +1164,14 @@ func (s *Store) RevertCode(toTurn int) (RevertResult, error) {
 }
 
 // RevertHistory deletes message turn dirs strictly greater than toTurn
-// and updates currentTurn. Files on disk are NOT touched. The bool reports
-// whether the compaction record was unlinked: it becomes true the moment
-// the unlink succeeds, before the directory sync, so every return after
-// that point carries it — the sync failure, a walk failure, and success
-// alike, because the record is already gone from every reader. It is false
-// on every path where no unlink happened: an inactive session, an
-// unreadable record, a failed unlink, no record present, or a target at or
-// above the boundary.
-func (s *Store) RevertHistory(toTurn int) (bool, error) {
+// and updates currentTurn. Files on disk are NOT touched. The outcome reports
+// whether the compaction record or history changed and whether the surviving
+// history state is authoritative after a failed removal.
+func (s *Store) RevertHistory(toTurn int) (RevertHistoryOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.active {
-		return false, ErrNoSession
+		return RevertHistoryOutcome{}, ErrNoSession
 	}
 	if toTurn < 0 {
 		toTurn = 0
@@ -1174,6 +1183,7 @@ func (s *Store) RevertHistory(toTurn int) (bool, error) {
 	if m := s.maxTurnLocked(); m > s.highWaterTurn {
 		s.highWaterTurn = m
 	}
+	outcome := RevertHistoryOutcome{HistoryStateKnown: true, CurrentTurn: s.currentTurn}
 	// A revert below a compaction boundary empties the conversation: the
 	// summary record would survive untouched and the load path would drop
 	// every surviving turn behind the boundary it names. The record is
@@ -1185,16 +1195,17 @@ func (s *Store) RevertHistory(toTurn int) (bool, error) {
 	// to prevent.
 	rec, err := loadCompactionFromDir(s.dir)
 	if err != nil {
-		return false, fmt.Errorf("snapshot: read compaction record: %w", err)
+		return outcome, fmt.Errorf("snapshot: read compaction record: %w", err)
 	}
-	removedRecord := false
 	if rec != nil && toTurn < rec.BoundaryTurn {
 		if err := os.Remove(filepath.Join(s.dir, "compaction.json")); err != nil {
-			return false, fmt.Errorf("snapshot: remove compaction record: %w", err)
+			return outcome, fmt.Errorf("snapshot: remove compaction record: %w", err)
 		}
-		removedRecord = true
+		outcome.CompactionRemoved = true
+		outcome.HistoryChanged = true
 		if err := atomicfs.SyncDir(s.dir); err != nil {
-			return removedRecord, &CommittedMutationError{Err: fmt.Errorf("snapshot: sync session dir: %w", err)}
+			outcome.CurrentTurn = s.currentTurn
+			return outcome, &CommittedMutationError{Err: fmt.Errorf("snapshot: sync session dir: %w", err)}
 		}
 	}
 	// Walk descending and stop at the first failed removal, exactly like
@@ -1210,23 +1221,52 @@ func (s *Store) RevertHistory(toTurn int) (bool, error) {
 		if t <= toTurn {
 			break
 		}
-		if err := os.RemoveAll(filepath.Join(s.turnsDir, strconv.Itoa(t))); err != nil {
-			if t < s.currentTurn {
-				s.currentTurn = t
-			}
-			return removedRecord, fmt.Errorf("snapshot: revert history turn %d: %w", t, err)
+		turnDir := filepath.Join(s.turnsDir, strconv.Itoa(t))
+		before, inspectErr := inspectHistoryTurn(turnDir)
+		if inspectErr != nil {
+			outcome.HistoryStateKnown = !outcome.HistoryChanged
+			outcome.CurrentTurn = s.currentTurn
+			return outcome, fmt.Errorf("snapshot: inspect history turn %d: %w", t, inspectErr)
 		}
+		removeFn := RemoveHistoryTurnFunc
+		if removeFn == nil {
+			removeFn = os.RemoveAll
+		}
+		if removeErr := removeFn(turnDir); removeErr != nil {
+			after, postErr := inspectHistoryTurn(turnDir)
+			if postErr != nil {
+				outcome.HistoryChanged = true
+				outcome.HistoryStateKnown = false
+				outcome.CurrentTurn = s.currentTurn
+				return outcome, fmt.Errorf("snapshot: revert history turn %d: %w", t, errors.Join(removeErr, postErr))
+			}
+			if before != after {
+				outcome.HistoryChanged = true
+			}
+			if outcome.HistoryChanged {
+				if reconcileErr := s.reconcileFailedHistoryTurnLocked(t, after); reconcileErr != nil {
+					outcome.HistoryStateKnown = false
+					outcome.CurrentTurn = s.currentTurn
+					return outcome, fmt.Errorf("snapshot: reconcile history turn %d: %w", t, errors.Join(removeErr, reconcileErr))
+				}
+			}
+			outcome.CurrentTurn = s.currentTurn
+			return outcome, fmt.Errorf("snapshot: revert history turn %d: %w", t, removeErr)
+		}
+		outcome.HistoryChanged = true
 		if t <= s.currentTurn {
 			s.currentTurn = t - 1
 		}
 		if err := atomicfs.SyncDir(s.turnsDir); err != nil {
-			return removedRecord, &CommittedMutationError{Err: fmt.Errorf("snapshot: sync turns dir: %w", err)}
+			outcome.CurrentTurn = s.currentTurn
+			return outcome, &CommittedMutationError{Err: fmt.Errorf("snapshot: sync turns dir: %w", err)}
 		}
 	}
 	if toTurn >= 0 && toTurn < s.currentTurn {
 		s.currentTurn = toTurn
 	}
-	return removedRecord, nil
+	outcome.CurrentTurn = s.currentTurn
+	return outcome, nil
 }
 
 // ForkInto copies turns 1..toTurn (both snapshots and messages) from the
@@ -1473,6 +1513,87 @@ func (s *Store) SetState(state string) error {
 
 // --- internal helpers ---
 
+type historyTurnState struct {
+	dir      bool
+	complete bool
+	messages bool
+}
+
+func inspectHistoryTurn(dir string) (historyTurnState, error) {
+	var state historyTurnState
+	info, err := os.Stat(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return state, nil
+		}
+		return state, err
+	}
+	if !info.IsDir() {
+		return state, fmt.Errorf("%s is not a directory", dir)
+	}
+	state.dir = true
+	if _, err := os.Stat(filepath.Join(dir, "complete")); err == nil {
+		state.complete = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return historyTurnState{}, err
+	}
+	if _, err := os.Stat(filepath.Join(dir, "messages.jsonl")); err == nil {
+		state.messages = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return historyTurnState{}, err
+	}
+	return state, nil
+}
+
+func (s *Store) reconcileFailedHistoryTurnLocked(turn int, state historyTurnState) error {
+	if !state.dir {
+		s.currentTurn = s.highestCompleteTurnLocked()
+		return nil
+	}
+	if state.complete {
+		s.currentTurn = turn
+		return nil
+	}
+	if !state.messages {
+		s.currentTurn = s.highestCompleteTurnLocked()
+		return nil
+	}
+	recovered, err := recoverTurnMessages(filepath.Join(s.turnsDir, strconv.Itoa(turn)))
+	if err != nil {
+		return err
+	}
+	if len(recovered) > 0 {
+		turnDir := filepath.Join(s.turnsDir, strconv.Itoa(turn))
+		if err := atomicfs.Write(filepath.Join(turnDir, "messages.jsonl"), recovered, 0o600); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(turnDir, "complete"), nil, 0o600); err != nil {
+			return err
+		}
+		after, err := inspectHistoryTurn(turnDir)
+		if err != nil {
+			return err
+		}
+		if !after.complete {
+			return fmt.Errorf("recovery did not recreate complete marker")
+		}
+		s.currentTurn = turn
+		return nil
+	}
+	if err := os.RemoveAll(filepath.Join(s.turnsDir, strconv.Itoa(turn))); err != nil {
+		return err
+	}
+	after, err := inspectHistoryTurn(filepath.Join(s.turnsDir, strconv.Itoa(turn)))
+	if err != nil {
+		return err
+	}
+	if after.dir {
+		return fmt.Errorf("unrecoverable history turn remains")
+	}
+	s.currentTurn = s.highestCompleteTurnLocked()
+	return nil
+}
+
 func (s *Store) discardIncompleteTurnsLocked() {
 	if s.turnsDir == "" {
 		return
@@ -1483,12 +1604,16 @@ func (s *Store) discardIncompleteTurnsLocked() {
 			continue
 		}
 		// Attempt crash recovery.
-		recovered := recoverTurnMessages(dir)
+		recovered, err := recoverTurnMessages(dir)
+		if err != nil {
+			_ = os.RemoveAll(dir)
+			continue
+		}
 		if len(recovered) == 0 {
 			_ = os.RemoveAll(dir)
 			continue
 		}
-		if err := os.WriteFile(filepath.Join(dir, "messages.jsonl"), recovered, 0o600); err != nil {
+		if err := atomicfs.Write(filepath.Join(dir, "messages.jsonl"), recovered, 0o600); err != nil {
 			_ = os.RemoveAll(dir)
 			continue
 		}
@@ -1499,11 +1624,15 @@ func (s *Store) discardIncompleteTurnsLocked() {
 // recoverTurnMessages attempts to recover complete iterations from a
 // partially-written messages.jsonl. Returns the recovered JSONL content
 // or nil if nothing can be recovered.
-func recoverTurnMessages(dir string) []byte {
+func recoverTurnMessages(dir string) ([]byte, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "messages.jsonl"))
 	if err != nil {
-		return nil
+		return nil, err
 	}
+	return recoverTurnMessagesData(data), nil
+}
+
+func recoverTurnMessagesData(data []byte) []byte {
 	lines := splitJSONL(data)
 
 	if len(lines) == 0 {
@@ -1594,10 +1723,6 @@ func recoverTurnMessages(dir string) []byte {
 	// Discard last incomplete iteration.
 	if len(iters) > 0 && !iters[len(iters)-1].complete {
 		iters = iters[:len(iters)-1]
-	}
-
-	if len(iters) == 0 {
-		return nil
 	}
 
 	// Rebuild: keep user messages and complete iterations, preserving order.

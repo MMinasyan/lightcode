@@ -85,8 +85,12 @@ func TestRevertHistoryDeletesLaterTurnsAndUpdatesCurrentTurn(t *testing.T) {
 		}
 	}
 
-	if _, err := store.RevertHistory(1); err != nil {
+	outcome, err := store.RevertHistory(1)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !outcome.HistoryChanged || !outcome.HistoryStateKnown || outcome.CurrentTurn != 1 {
+		t.Fatalf("outcome = %+v, want changed/known/current 1", outcome)
 	}
 
 	if got := readIntDirs(store.turnsDir); !reflect.DeepEqual(got, []int{1}) {
@@ -94,6 +98,23 @@ func TestRevertHistoryDeletesLaterTurnsAndUpdatesCurrentTurn(t *testing.T) {
 	}
 	if got := store.CurrentTurn(); got != 1 {
 		t.Fatalf("current turn = %d, want 1", got)
+	}
+	if got := store.BeginTurn(); got != 4 {
+		t.Fatalf("next turn = %d, want 4 above the historical high-water mark 3", got)
+	}
+}
+
+func TestRevertHistoryPreservesHighWaterAfterSnapshotTreeGone(t *testing.T) {
+	store := newTestStore(t)
+	seedTurns(t, store, 3)
+	if err := os.RemoveAll(store.snapshotsDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RevertHistory(1); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.BeginTurn(); got != 4 {
+		t.Fatalf("next turn after history removal with no snapshot tree = %d, want 4", got)
 	}
 }
 
@@ -988,14 +1009,66 @@ func TestLoadCompleteTurnsReturnsMessagesInOrderAndDeletesIncomplete(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(turns) != 1 || turns[0].Turn != 1 || len(turns[0].Messages) != 2 {
-		t.Fatalf("turns = %+v, want one complete turn with two messages", turns)
+	if len(turns) != 2 || turns[0].Turn != 1 || len(turns[0].Messages) != 2 || turns[1].Turn != 2 || len(turns[1].Messages) != 1 {
+		t.Fatalf("turns = %+v, want two complete turns with recovered user history", turns)
 	}
 	if string(turns[0].Messages[0]) != `{"role":"user","content":"one"}` || string(turns[0].Messages[1]) != `{"role":"assistant","content":"two"}` {
 		t.Fatalf("messages = %q, want append order", turns[0].Messages)
 	}
-	if _, err := os.Stat(filepath.Join(store.turnsDir, "2")); !os.IsNotExist(err) {
-		t.Fatalf("incomplete turn should be deleted, stat err = %v", err)
+	if string(turns[1].Messages[0]) != `{"role":"user","content":"incomplete"}` {
+		t.Fatalf("recovered messages = %q, want the valid user row", turns[1].Messages)
+	}
+}
+
+func TestIncompleteTurnRecoveryRewritesCanonicalTextBeforeToolSuffix(t *testing.T) {
+	store := newTestStore(t)
+	turn := store.BeginTurn()
+	mustAppendMessage(t, store, turn, `{"role":"user","content":"ask"}`)
+	mustAppendMessage(t, store, turn, `{"role":"assistant","content":"text"}`)
+	mustAppendMessage(t, store, turn, `{"role":"assistant","content":"","tool_calls":[{"id":"call-1"}]}`)
+
+	turns, err := store.LoadCompleteTurns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 1 || len(turns[0].Messages) != 2 {
+		t.Fatalf("recovered turns = %+v, want user/text rows only", turns)
+	}
+	want := []string{
+		`{"role":"user","content":"ask"}`,
+		`{"role":"assistant","content":"text"}`,
+	}
+	for i, msg := range turns[0].Messages {
+		if string(msg) != want[i] {
+			t.Fatalf("recovered message %d = %q, want %q", i, msg, want[i])
+		}
+	}
+	recoveredBytes, err := os.ReadFile(filepath.Join(store.turnsDir, "1", "messages.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(recoveredBytes) != want[0]+"\n"+want[1]+"\n" {
+		t.Fatalf("rewritten messages = %q, want canonical user/text bytes", recoveredBytes)
+	}
+	if _, err := os.Stat(filepath.Join(store.turnsDir, "1", "complete")); err != nil {
+		t.Fatalf("recovered complete marker: %v", err)
+	}
+
+	id := store.SessionID()
+	store.Detach()
+	restarted, err := NewForSessionsRoot(store.Root(), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.LoadSession(id); err != nil {
+		t.Fatal(err)
+	}
+	restartedTurns, err := restarted.LoadCompleteTurns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(turns, restartedTurns) {
+		t.Fatalf("live recovery = %+v, restart recovery = %+v", turns, restartedTurns)
 	}
 }
 
@@ -1435,11 +1508,11 @@ func TestRevertHistoryRemovesCompactionRecordBelowBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	removedRecord, err := store.RevertHistory(5)
+	outcome, err := store.RevertHistory(5)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !removedRecord {
+	if !outcome.CompactionRemoved {
 		t.Fatal("RevertHistory(5) below boundary 10 reported no record removal")
 	}
 	if got := readIntDirs(store.turnsDir); !reflect.DeepEqual(got, []int{1, 2, 3, 4, 5}) {
@@ -1469,11 +1542,11 @@ func TestRevertHistoryKeepsCompactionRecordAtOrAboveBoundary(t *testing.T) {
 	}
 
 	for _, to := range []int{10, 12} {
-		removedRecord, err := store.RevertHistory(to)
+		outcome, err := store.RevertHistory(to)
 		if err != nil {
 			t.Fatalf("RevertHistory(%d): %v", to, err)
 		}
-		if removedRecord {
+		if outcome.CompactionRemoved {
 			t.Fatalf("RevertHistory(%d) at or above boundary 10 reported a record removal", to)
 		}
 		rec, err := store.LoadCompaction()
@@ -1500,11 +1573,11 @@ func TestRevertHistoryUnreadableCompactionRecordFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	removedRecord, err := store.RevertHistory(5)
+	outcome, err := store.RevertHistory(5)
 	if err == nil {
 		t.Fatal("unreadable compaction record reported success")
 	}
-	if removedRecord {
+	if outcome.CompactionRemoved {
 		t.Fatal("unreadable compaction record reported a removal")
 	}
 	if got := readIntDirs(store.turnsDir); !reflect.DeepEqual(got, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
@@ -1531,11 +1604,11 @@ func TestRevertHistoryUnlinkFailureRemovesNoTurn(t *testing.T) {
 	}
 	defer func() { _ = os.Chmod(store.dir, 0o700) }()
 
-	removedRecord, err := store.RevertHistory(5)
+	outcome, err := store.RevertHistory(5)
 	if err == nil {
 		t.Fatal("blocked record unlink reported success")
 	}
-	if removedRecord {
+	if outcome.CompactionRemoved {
 		t.Fatal("blocked record unlink reported a removal")
 	}
 	if err := os.Chmod(store.dir, 0o700); err != nil {
@@ -1566,11 +1639,11 @@ func TestRevertHistorySyncFailureAfterUnlinkRemovesNoTurn(t *testing.T) {
 	atomicfs.SyncDirFunc = func(string) error { return errors.New("injected sync failure") }
 	defer func() { atomicfs.SyncDirFunc = nil }()
 
-	removedRecord, err := store.RevertHistory(5)
+	outcome, err := store.RevertHistory(5)
 	if err == nil {
 		t.Fatal("failed directory sync reported success")
 	}
-	if !removedRecord {
+	if !outcome.CompactionRemoved {
 		t.Fatal("failed directory sync after the unlink reported no removal")
 	}
 	if got := readIntDirs(store.turnsDir); !reflect.DeepEqual(got, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {

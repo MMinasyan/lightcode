@@ -55,11 +55,11 @@ func TestEndOfTurnOrderingIncompleteTurnIsHiddenUntilComplete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(turns) != 1 || turns[0].Turn != complete {
-		t.Fatalf("turns = %+v, want only completed turn", turns)
+	if len(turns) != 2 || turns[0].Turn != complete || turns[1].Turn != incomplete {
+		t.Fatalf("turns = %+v, want completed turn plus recovered text turn", turns)
 	}
-	if _, err := os.Stat(filepath.Join(store.turnsDir, "2")); !os.IsNotExist(err) {
-		t.Fatalf("incomplete turn should be deleted, stat err = %v", err)
+	if string(turns[1].Messages[0]) != `{"role":"assistant","content":"not done"}` {
+		t.Fatalf("recovered messages = %q, want the valid text response", turns[1].Messages)
 	}
 }
 

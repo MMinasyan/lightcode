@@ -6635,29 +6635,22 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		// stopped at; the loop is therefore re-derived from disk after the
 		// walk, and the pre-walk truncation point tells the queue rule whether
 		// any turn was removed.
-		before := unit.store.CurrentTurn()
-		removedRecord, revertErr := unit.store.RevertHistory(target)
+		revertOutcome, revertErr := unit.store.RevertHistory(target)
 		// A revert below a compaction boundary invalidates the session's
 		// indexed summary along with the record: search_history would keep
 		// serving a "Full summary" path that no longer resolves. Delete the
 		// session's summaries before the reload, so the eviction path is
 		// covered by the same call. The delete has committed, so a failed
 		// removal cannot fail the revert; the residue is reported to stderr.
-		if removedRecord && a.memoryHooks != nil {
+		if revertOutcome.CompactionRemoved && a.memoryHooks != nil {
 			if err := a.memoryHooks.DeleteSessionSummaries(sessionIDOf(unit)); err != nil {
 				fmt.Fprintf(os.Stderr, "lightcode: delete summaries for session %s: %v\n", sessionIDOf(unit), err)
 			}
 		}
-		// The store maintains the post-walk turn for all three outcomes: the
-		// target on a completed walk, the turn the walk stopped at on a
-		// partial failure, unchanged when the first removal failed. It is the
-		// prune point for retained errors and the queue rule alike, so it is
-		// read once.
-		after := unit.store.CurrentTurn()
-		// historyChanged is the true durable-history-mutation predicate for
-		// this operation, derived only from existing outcomes: the compaction
-		// record was durably removed or at least one turn was removed.
-		historyChanged := removedRecord || after < before
+		// HistoryChanged is the durable-mutation predicate from the store. The
+		// operational allocation point is kept separately from the visible
+		// endpoint, which is derived from the successful reload below.
+		historyChanged := revertOutcome.HistoryChanged
 		// Zero-operation-mutation failure: when the revert changed nothing
 		// durably — no compaction record removed, no turn removed, and the
 		// optional code phase restored no file (codeChanged) — the error is
@@ -6668,6 +6661,9 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		// mutation or any actually restored file keeps the reconciled
 		// treatment: the loop must match disk and the boundary must publish
 		// the survivors.
+		if revertErr != nil && !revertOutcome.HistoryStateKnown {
+			return a.evictRevertUnit(unit, result, revertErr, nil, emit, prefill)
+		}
 		if revertErr != nil && !historyChanged && !codeChanged {
 			return result, revertErr
 		}
@@ -6711,14 +6707,15 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 			}
 		}
 		a.resetFileTrackerForSession(unit)
+		visibleTurn := highestLoadedTurn(raw)
 		if tr := a.transcriptForSessionID(sessionIDOf(unit)); tr != nil {
 			tr.seqMu.Lock()
 			tr.tail = nil
 			tr.textOpen = false
-			if after < tr.committedTurn {
-				tr.committedTurn = after
+			if visibleTurn < tr.committedTurn {
+				tr.committedTurn = visibleTurn
 			}
-			tr.dropErrorsAboveTurnLocked(after)
+			tr.dropErrorsAboveTurnLocked(visibleTurn)
 			tr.rewriteEpoch++
 			tr.seqMu.Unlock()
 		}
@@ -6906,6 +6903,16 @@ func (a *Agent) buildTurnActionResult(result TurnActionResult, summary SessionSu
 	result.Messages = messages
 	result.Tokens = tokens
 	return result
+}
+
+func highestLoadedTurn(turns []snapshot.TurnMessages) int {
+	highest := 0
+	for _, turn := range turns {
+		if turn.Turn > highest {
+			highest = turn.Turn
+		}
+	}
+	return highest
 }
 
 // prepareTurnActionResultState reads the session summary, the durable display

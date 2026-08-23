@@ -132,6 +132,135 @@ func TestRevertPartialWalkReloadsLoopAndPublishesBoundary(t *testing.T) {
 	}
 }
 
+func TestRevertHighestTurnPartialMutationUsesExplicitOutcome(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	seedCompleteTurns(t, a, 5)
+	id := a.SessionCurrent().ID
+	tr := a.transcriptForSessionID(id)
+	if tr == nil {
+		t.Fatal("no live coordinator")
+	}
+	a.feedAndEmit(tr, Event{Kind: EventError, SessionID: id, Error: "surviving error", Turn: 4})
+	a.feedAndEmit(tr, Event{Kind: EventError, SessionID: id, Error: "removed error", Turn: 5})
+	injected := errors.New("injected highest-turn partial failure")
+	snapshot.RemoveHistoryTurnFunc = func(path string) error {
+		if filepath.Base(path) == "5" {
+			if err := os.Remove(filepath.Join(path, "messages.jsonl")); err != nil {
+				return err
+			}
+		}
+		return injected
+	}
+	t.Cleanup(func() { snapshot.RemoveHistoryTurnFunc = nil })
+
+	var boundaries int
+	result, err := a.ApplyTurnActionForSessionWithBoundary(id, 3, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, warning string, _ *snapshot.CommittedMutationError, _ *string) {
+		boundaries++
+		if hs.Session.ID == "" || warning == "" {
+			t.Errorf("boundary = %#v warning=%q, want reconciled session and warning", hs, warning)
+		}
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("revert error = %v, want injected failure", err)
+	}
+	if result.Warning == "" || boundaries != 1 {
+		t.Fatalf("result warning=%q boundaries=%d, want one reconciled boundary", result.Warning, boundaries)
+	}
+	if got := loopUserContents(a.lp.Messages()); !equalStrings(got, []string{"turn 1", "turn 2", "turn 3", "turn 4"}) {
+		t.Fatalf("loop after highest-turn partial mutation = %q, want turns 1-4", got)
+	}
+	if got := a.store.CurrentTurn(); got != 5 {
+		t.Fatalf("operational current turn = %d, want 5", got)
+	}
+	if got := retainedErrorTurns(t, a, id); !reflect.DeepEqual(got, []int{4}) {
+		t.Fatalf("retained errors after visible history lowered = %v, want [4]", got)
+	}
+}
+
+func TestDirectRevertHighestTurnPartialMutationReconcilesWithoutCallback(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	seedCompleteTurns(t, a, 5)
+	id := a.SessionCurrent().ID
+	tr := a.transcriptForSessionID(id)
+	if tr == nil {
+		t.Fatal("no live coordinator")
+	}
+	a.feedAndEmit(tr, Event{Kind: EventError, SessionID: id, Error: "surviving error", Turn: 4})
+	a.feedAndEmit(tr, Event{Kind: EventError, SessionID: id, Error: "removed error", Turn: 5})
+	seedQueue(t, a, 7, "stale after direct partial revert")
+	tracked := filepath.Join(a.projectRoot, "tracked.txt")
+	if err := os.WriteFile(tracked, []byte("tracked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.fileTracker.TrackIdentity(tracked, 0, 0, tool.FileIdentity{Valid: true})
+	if !agentTrackerHasRead(a, tracked) {
+		t.Fatal("setup: tracker missing read state")
+	}
+	injected := errors.New("injected direct highest-turn partial failure")
+	snapshot.RemoveHistoryTurnFunc = func(path string) error {
+		if filepath.Base(path) == "5" {
+			if err := os.Remove(filepath.Join(path, "messages.jsonl")); err != nil {
+				return err
+			}
+		}
+		return injected
+	}
+	t.Cleanup(func() { snapshot.RemoveHistoryTurnFunc = nil })
+
+	result, err := a.ApplyTurnActionForSession(id, 3, TurnActionRevertHistory, false)
+	if !errors.Is(err, injected) || result.Warning == "" {
+		t.Fatalf("result = %+v err=%v, want reconciled warning and injected error", result, err)
+	}
+	if got := loopUserContents(a.lp.Messages()); !equalStrings(got, []string{"turn 1", "turn 2", "turn 3", "turn 4"}) {
+		t.Fatalf("loop after direct partial revert = %q, want turns 1-4", got)
+	}
+	queue := a.QueueSnapshot()
+	if len(queue.Items) != 0 || queue.Items == nil || queue.Version <= 7 {
+		t.Fatalf("queue after direct partial revert = %#v, want empty version > 7", queue)
+	}
+	if agentTrackerHasRead(a, tracked) {
+		t.Fatal("tracker not reset by direct partial revert")
+	}
+	if got := retainedErrorTurns(t, a, id); !reflect.DeepEqual(got, []int{4}) {
+		t.Fatalf("retained errors after direct partial revert = %v, want [4]", got)
+	}
+	tr.seqMu.Lock()
+	epoch := tr.rewriteEpoch
+	tr.seqMu.Unlock()
+	if epoch != 1 {
+		t.Fatalf("rewrite epoch after direct partial revert = %d, want 1", epoch)
+	}
+}
+
+func TestRevertUnknownPostStateEvictsOwner(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	seedCompleteTurns(t, a, 3)
+	id := a.SessionCurrent().ID
+	injected := errors.New("injected unreadable post-state")
+	snapshot.RemoveHistoryTurnFunc = func(path string) error {
+		if err := os.Remove(filepath.Join(path, "complete")); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(path, "messages.jsonl")); err != nil {
+			return err
+		}
+		if err := os.Mkdir(filepath.Join(path, "messages.jsonl"), 0o700); err != nil {
+			return err
+		}
+		return injected
+	}
+	t.Cleanup(func() { snapshot.RemoveHistoryTurnFunc = nil })
+
+	var boundaries []HydrationState
+	_, err := a.ApplyTurnActionForSessionWithBoundary(id, 3, TurnActionRevertHistory, false, func(state HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
+		boundaries = append(boundaries, state)
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("revert error = %v, want injected unreadable post-state", err)
+	}
+	assertEvicted(t, a, id, boundaries)
+}
+
 func TestRevertTurnSyncFailureReconcilesOwner(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	cap := &eventCapture{}

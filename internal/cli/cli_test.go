@@ -5347,6 +5347,37 @@ func TestCLIRealCommittedNamespaceProducers(t *testing.T) {
 		}
 	})
 
+	t.Run("highest-turn partial history refreshes reconciled state", func(t *testing.T) {
+		c, id, _, _ := seed(t)
+		injected := errors.New("injected CLI highest-turn partial failure")
+		snapshot.RemoveHistoryTurnFunc = func(path string) error {
+			if filepath.Base(path) == "3" {
+				if err := os.Remove(filepath.Join(path, "messages.jsonl")); err != nil {
+					return err
+				}
+			}
+			return injected
+		}
+		t.Cleanup(func() { snapshot.RemoveHistoryTurnFunc = nil })
+		c.readKeyFn = keySequence(
+			keyMsg{Special: keyEnter},
+			keyMsg{Special: keyDown},
+			keyMsg{Special: keyEnter},
+			keyMsg{Special: keyEnter},
+		)
+
+		if err := c.dispatchCommand("/revert"); err != nil {
+			t.Fatal(err)
+		}
+		wantCurrent(t, c, id)
+		if len(c.messages) != 2 {
+			t.Fatalf("CLI messages after highest-turn partial history = %d, want 2 surviving rows", len(c.messages))
+		}
+		if !strings.Contains(c.out.(*bytes.Buffer).String(), "highest-turn partial") {
+			t.Fatalf("CLI output = %q, want partial warning", c.out.(*bytes.Buffer).String())
+		}
+	})
+
 	t.Run("fork", func(t *testing.T) {
 		c, sourceID, sessionsRoot, _ := seed(t)
 		injected := errors.New("injected CLI fork sync failure")

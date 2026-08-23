@@ -1821,6 +1821,41 @@ func TestACPPartialHistoryErrorCarriesBoundaryData(t *testing.T) {
 	})
 }
 
+func TestACPHighestTurnPartialHistoryCarriesBoundaryData(t *testing.T) {
+	a := newACPTestAgent(t)
+	out := new(bytes.Buffer)
+	r := &Runner{agent: a, owner: a, out: out}
+	for _, content := range []string{"turn 1", "turn 2", "turn 3", "turn 4", "turn 5"} {
+		appendACPUserTurn(t, a, content)
+	}
+	r.setCurrentSessionID(a.SessionCurrent().ID)
+	injected := errors.New("injected ACP highest-turn partial failure")
+	snapshot.RemoveHistoryTurnFunc = func(path string) error {
+		if filepath.Base(path) == "5" {
+			if err := os.Remove(filepath.Join(path, "messages.jsonl")); err != nil {
+				return err
+			}
+		}
+		return injected
+	}
+	t.Cleanup(func() { snapshot.RemoveHistoryTurnFunc = nil })
+
+	r.handleRevertHistory(Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"turn":3}`)})
+	lines := drainedLines(t, r, out, 2)
+	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
+	state := hydrationStateFromParams(t, acpNotificationParams(t, lines[0]))
+	if got := acpUserContents(state.Messages); !acpEqualStrings(got, []string{"turn 1", "turn 2", "turn 3", "turn 4"}) {
+		t.Fatalf("boundary messages = %q, want turns 1-4", got)
+	}
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error == nil || resp.Error.Data == nil || !strings.Contains(resp.Error.Message, "highest-turn partial") {
+		t.Fatalf("response = %+v, want structured partial error", resp)
+	}
+}
+
 // blockACPTurnMessages makes one surviving turn's messages file unreadable: the
 // post-walk reload derives the loop from disk, and its first read of a blocked
 // surviving turn fails exactly there while the walk — which only removes turn
