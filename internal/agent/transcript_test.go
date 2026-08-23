@@ -2474,12 +2474,26 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 	// nextTurnLocked scan, so every preseed takes max+1 and skips the armed
 	// dir.
 	t.Run("preseed=marker_failure_aborts_and_requeues", func(t *testing.T) {
+		rearmedReqSeen := make(chan struct{}, 1)
+		releaseRearmedReq := make(chan struct{})
+		var releaseRearmedOnce sync.Once
+		releaseRearmed := func() {
+			releaseRearmedOnce.Do(func() { close(releaseRearmedReq) })
+		}
 		var reqs atomic.Int32
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			reqs.Add(1)
+			if reqs.Add(1) == 1 {
+				rearmedReqSeen <- struct{}{}
+				select {
+				case <-releaseRearmedReq:
+				case <-r.Context().Done():
+					return
+				}
+			}
 			writeTextResponse(w, "ok")
 		}))
-		defer server.Close()
+		t.Cleanup(server.Close)
+		t.Cleanup(releaseRearmed)
 
 		a := newEventOrderAgent(t, server.URL+"/v1")
 		cap := &eventCapture{}
@@ -2614,12 +2628,27 @@ func TestTranscriptCommitContractMatrix(t *testing.T) {
 		// owner: the drainer re-drains the requeued remainder on its own — the
 		// fault is armed only at the failed turn, so the re-drain succeeds and
 		// launches the final item. No manual nudge is required.
-		rearmDeadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(rearmDeadline) && reqs.Load() == 0 {
-			time.Sleep(5 * time.Millisecond)
-		}
+		waitForSignal(t, rearmedReqSeen, "rearmed model request")
 		if got := reqs.Load(); got != 1 {
 			t.Fatalf("retained work never re-drained after the marker-failure abort (model requests = %d, want 1)", got)
+		}
+		releaseRearmed()
+		completionDeadline := time.Now().Add(10 * time.Second)
+		completed := false
+		for time.Now().Before(completionDeadline) {
+			rt.mu.Lock()
+			busy := unit.busy
+			turnCtxSet := unit.turnCtx != nil
+			turnCancelSet := unit.turnCancel != nil
+			rt.mu.Unlock()
+			if !busy && !turnCtxSet && !turnCancelSet {
+				completed = true
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if !completed {
+			t.Fatal("unit did not complete the rearmed request")
 		}
 		// The requeue event carried the real remainder — the failed item is
 		// not requeued, and the item appended meanwhile is prepended behind
