@@ -28,13 +28,13 @@ describe('viewer store', () => {
 
   it('opens live subagent viewers', () => {
     const generation = openSubagentViewer('Explore', 'session-1');
-    expect(get(viewer)).toEqual({ title: 'Explore', sessionId: 'session-1', live: true, generation, gate: { highWater: 0 }, reading: true, pending: [], messages: [] });
+    expect(get(viewer)).toEqual({ title: 'Explore', sessionId: 'session-1', live: true, generation, gate: { highWater: 0 }, reading: true, transcriptReplay: true, pending: [], messages: [] });
   });
 
   it('opens subagent viewers with persisted messages', () => {
     const messages = [{ type: 'assistant', content: 'done' }];
     const generation = openSubagentViewer('Explore', 'session-1', messages);
-    expect(get(viewer)).toEqual({ title: 'Explore', sessionId: 'session-1', live: true, generation, gate: { highWater: 0 }, reading: true, pending: [], messages });
+    expect(get(viewer)).toEqual({ title: 'Explore', sessionId: 'session-1', live: true, generation, gate: { highWater: 0 }, reading: true, transcriptReplay: true, pending: [], messages });
   });
 
   it('hydrates the matching live subagent viewer with a state snapshot', () => {
@@ -257,6 +257,43 @@ describe('child stream lifecycle', () => {
       cursor: { committedSeq: 1 },
     }, generation);
     expect(get(viewer).messages).toEqual([{ type: 'assistant', content: 'durable answer' }]);
+  });
+
+  it('drops a sequenced frame delivered after terminal hydration resolves', async () => {
+    const generation = openSubagentViewer('Explore', 'session-1');
+    let resolveHydration;
+    const hydration = new Promise(resolve => { resolveHydration = resolve; });
+    const applied = hydration.then(state => hydrateSubagentViewer('session-1', state, generation));
+
+    resolveHydration({
+      messages: [{ type: 'assistant', content: 'durable answer' }],
+      transcriptReplay: false,
+      cursor: { committedSeq: 1 },
+    });
+    await applied;
+    appendSubagentEvent('session-1', { type: 'token', seq: 2, content: 'late frame' });
+
+    expect(get(viewer).messages).toEqual([{ type: 'assistant', content: 'durable answer' }]);
+  });
+
+  it('applies an above-cursor frame delivered after live hydration resolves', async () => {
+    const generation = openSubagentViewer('Explore', 'session-1');
+    let resolveHydration;
+    const hydration = new Promise(resolve => { resolveHydration = resolve; });
+    const applied = hydration.then(state => hydrateSubagentViewer('session-1', state, generation));
+
+    resolveHydration({
+      messages: [{ type: 'assistant', content: 'durable prefix' }],
+      transcriptReplay: true,
+      cursor: { committedSeq: 1 },
+    });
+    await applied;
+    appendSubagentEvent('session-1', { type: 'token', seq: 2, content: 'live frame' });
+
+    expect(get(viewer).messages).toEqual([
+      { type: 'assistant', content: 'durable prefix' },
+      { type: 'assistant', content: 'live frame', partial: true, seq: 2 },
+    ]);
   });
 
   // A tool result is id-keyed and never gated, so the gate cannot protect it

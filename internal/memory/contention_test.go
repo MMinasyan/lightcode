@@ -569,14 +569,10 @@ func envScript(s ...string) string { return memoryContentionScriptEnv + "=" + st
 func envPath(p string) string      { return memoryContentionPathEnv + "=" + p }
 func envData(d string) string      { return memoryContentionDataEnv + "=" + d }
 
-// nonceWindowSeconds covers the bounded child lifetime plus a one-second
-// margin.
-const nonceWindowSeconds = int(contentionBound/time.Second) + 2
-
 // preplantNonces writes a complete memory file for every scripted nonce over
-// a window of UTC seconds around now, using the production timestamp and slug
-// format, so the child's first candidate names already exist.
-func preplantNonces(t *testing.T, dir, title string, nonces []string) map[string][]byte {
+// the closed range of UTC seconds in which parked children could have sampled
+// their timestamps, using the production timestamp and slug format.
+func preplantNonces(t *testing.T, dir, title string, nonces []string, lower, upper time.Time) map[string][]byte {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -589,9 +585,9 @@ func preplantNonces(t *testing.T, dir, title string, nonces []string) map[string
 		slug = slug[:40]
 	}
 	planted := make(map[string][]byte)
-	start := time.Now().UTC().Add(-(contentionBound + time.Second))
-	for i := 0; i < nonceWindowSeconds; i++ {
-		second := start.Add(time.Duration(i) * time.Second)
+	start := lower.UTC().Add(-time.Second).Truncate(time.Second)
+	end := upper.UTC().Add(time.Second).Truncate(time.Second)
+	for second := start; !second.After(end); second = second.Add(time.Second) {
 		ts := second.Format("20060102-150405")
 		for _, nonce := range nonces {
 			path := filepath.Join(dir, fmt.Sprintf("%s-%s-%s.md", ts, slug, nonce))
@@ -746,12 +742,13 @@ func TestWriteMemoryFileRetriesPastACollidingName(t *testing.T) {
 	const second = "bb000002"
 
 	dir := filepath.Join(t.TempDir(), "memories")
-	planted := preplantNonces(t, dir, title, []string{first})
-	readers := startMemoryReaders(publishedMarkdownCheck(dir, title))
+	lower := time.Now().UTC()
 	child := startContentionChild(t, "writer", "TestWriteMemoryFileRetriesPastACollidingName", roleWriteMD,
 		envDir(dir), envTitle(title), envContent("retry body"), envMode(modeComplete),
 		envScript(first, second))
 	child.await(t, candidateReadyMarker)
+	planted := preplantNonces(t, dir, title, []string{first}, lower, time.Now().UTC())
+	readers := startMemoryReaders(publishedMarkdownCheck(dir, title))
 	child.release()
 	result := child.runOK(t)
 	readers.acknowledge(t)
@@ -787,12 +784,13 @@ func TestWriteMemoryFileExhaustsItsRetryBudget(t *testing.T) {
 	nonces := []string{"a1000001", "a2000002", "a3000003", "a4000004", "a5000005", "a6000006", "a7000007", "a8000008"}
 
 	dir := filepath.Join(t.TempDir(), "memories")
-	planted := preplantNonces(t, dir, title, nonces)
-	readers := startMemoryReaders(publishedMarkdownCheck(dir, title))
+	lower := time.Now().UTC()
 	child := startContentionChild(t, "writer", "TestWriteMemoryFileExhaustsItsRetryBudget", roleWriteMD,
 		envDir(dir), envTitle(title), envContent("exhaustion body"), envMode(modeComplete),
 		envScript(nonces...))
 	child.await(t, candidateReadyMarker)
+	planted := preplantNonces(t, dir, title, nonces, lower, time.Now().UTC())
+	readers := startMemoryReaders(publishedMarkdownCheck(dir, title))
 	child.release()
 	result := child.runOK(t)
 	readers.acknowledge(t)
@@ -828,13 +826,14 @@ func TestTwoProcessMemoryWritersPublishDistinctRetryNames(t *testing.T) {
 	const third = "c3000003"
 
 	dir := filepath.Join(t.TempDir(), "memories")
-	planted := preplantNonces(t, dir, title, []string{first})
-	readers := startMemoryReaders(publishedMarkdownCheck(dir, title))
+	lower := time.Now().UTC()
 	env := []string{envDir(dir), envTitle(title), envContent("two writer body"), envMode(modeComplete), envScript(first, second, third)}
 	a := startContentionChild(t, "writer-a", "TestTwoProcessMemoryWritersPublishDistinctRetryNames", roleWriteMD, env...)
 	b := startContentionChild(t, "writer-b", "TestTwoProcessMemoryWritersPublishDistinctRetryNames", roleWriteMD, env...)
 	a.await(t, candidateReadyMarker)
 	b.await(t, candidateReadyMarker)
+	planted := preplantNonces(t, dir, title, []string{first}, lower, time.Now().UTC())
+	readers := startMemoryReaders(publishedMarkdownCheck(dir, title))
 	a.release()
 	b.release()
 	pathA := a.await(t, resultPrefix)

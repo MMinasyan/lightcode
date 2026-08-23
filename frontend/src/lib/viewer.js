@@ -37,6 +37,7 @@ export function openSubagentViewer(title, sessionId, messages = []) {
     generation,
     gate: { highWater: 0 },
     reading: true,
+    transcriptReplay: true,
     pending: [],
     messages: messages || [],
   });
@@ -73,13 +74,14 @@ export function hydrateSubagentViewer(sessionId, state, generation) {
     // A durable-only completed-child read is terminal for this viewer open:
     // the pending frames belong to the live read window that ended before the
     // child completed and must not be replayed over the durable transcript.
+    const transcriptReplay = v.transcriptReplay && state?.transcriptReplay !== false;
     let out = messages;
-    if (state?.transcriptReplay !== false) {
+    if (transcriptReplay) {
       for (const frame of v.pending) {
         out = applyFrame(out, frame, gate);
       }
     }
-    return { ...v, reading: false, pending: [], messages: out };
+    return { ...v, reading: false, transcriptReplay, pending: [], messages: out };
   });
 }
 
@@ -153,6 +155,7 @@ function applyFrame(messages, event, gate) {
 export function appendSubagentEvent(sessionId, event) {
   viewer.update(v => {
     if (!v || !v.live || v.sessionId !== sessionId) return v;
+    if (!v.transcriptReplay) return v;
     // Frames delivered while the hydration read is in flight are buffered on
     // this viewer object for replay at apply time; once the read completes,
     // nothing more buffers.
