@@ -1338,24 +1338,24 @@ func TestCLINavigationReleasesSourceBeforeDestinationRender(t *testing.T) {
 
 	rows := []struct {
 		name string
-		run  func(t *testing.T, c *CLI, a *agent.Agent) error
+		run  func(t *testing.T, c *CLI, a *agent.Agent, projectRoot string) error
 	}{
 		{
 			name: "new",
-			run: func(t *testing.T, c *CLI, a *agent.Agent) error {
+			run: func(t *testing.T, c *CLI, a *agent.Agent, projectRoot string) error {
 				return c.dispatchCommand("/new")
 			},
 		},
 		{
 			name: "resume",
-			run: func(t *testing.T, c *CLI, a *agent.Agent) error {
+			run: func(t *testing.T, c *CLI, a *agent.Agent, projectRoot string) error {
 				dest := secondSession(t, c)
 				return c.dispatchCommand("/resume " + dest)
 			},
 		},
 		{
 			name: "session_select",
-			run: func(t *testing.T, c *CLI, a *agent.Agent) error {
+			run: func(t *testing.T, c *CLI, a *agent.Agent, projectRoot string) error {
 				dest := secondSession(t, c)
 				selectSessionByID(t, c, dest)
 				return c.dispatchCommand("/session")
@@ -1363,15 +1363,18 @@ func TestCLINavigationReleasesSourceBeforeDestinationRender(t *testing.T) {
 		},
 		{
 			name: "session_new",
-			run: func(t *testing.T, c *CLI, a *agent.Agent) error {
+			run: func(t *testing.T, c *CLI, a *agent.Agent, projectRoot string) error {
 				c.readKeyFn = func() (keyMsg, error) { return keyMsg{Rune: 'n'}, nil }
 				return c.dispatchCommand("/session")
 			},
 		},
 		{
 			name: "project_select",
-			run: func(t *testing.T, c *CLI, a *agent.Agent) error {
-				_, otherRoot := sessionInOtherProject(t, c)
+			run: func(t *testing.T, c *CLI, a *agent.Agent, projectRoot string) error {
+				if _, err := c.agent.NewSessionForProjectPath(projectRoot, "primary"); err != nil {
+					t.Fatalf("NewSessionForProjectPath: %v", err)
+				}
+				otherRoot := projectRoot
 				selectProjectByPath(t, c, otherRoot)
 				return c.dispatchCommand("/project")
 			},
@@ -1381,6 +1384,10 @@ func TestCLINavigationReleasesSourceBeforeDestinationRender(t *testing.T) {
 	for _, row := range rows {
 		row := row
 		t.Run(row.name, func(t *testing.T) {
+			projectRoot := ""
+			if row.name == "project_select" {
+				projectRoot = t.TempDir()
+			}
 			a, _ := newTestAgentWithBaseURL(t, server.URL)
 			startTestAgent(t, a)
 			source, err := a.NewSession("", "primary")
@@ -1394,7 +1401,7 @@ func TestCLINavigationReleasesSourceBeforeDestinationRender(t *testing.T) {
 			c.setCurrentSessionID(source)
 
 			done := make(chan error, 1)
-			go func() { done <- row.run(t, c, a) }()
+			go func() { done <- row.run(t, c, a, projectRoot) }()
 			select {
 			case <-entered:
 			case <-time.After(5 * time.Second):
@@ -1634,6 +1641,7 @@ func TestCLIResumeNoIDListsBeforeReservingSource(t *testing.T) {
 func TestCLIProjectListsBeforeReservingSource(t *testing.T) {
 	server, firstEntered, firstRelease := blockingProvider(t)
 
+	otherRoot := t.TempDir()
 	a, _ := newTestAgentWithBaseURL(t, server.URL)
 	startTestAgent(t, a)
 	source, err := a.NewSession("", "primary")
@@ -1645,7 +1653,10 @@ func TestCLIProjectListsBeforeReservingSource(t *testing.T) {
 	out := new(bytes.Buffer)
 	c.out = out
 	c.setCurrentSessionID(source)
-	dest, otherRoot := sessionInOtherProject(t, c)
+	dest, err := a.NewSessionForProjectPath(otherRoot, "primary")
+	if err != nil {
+		t.Fatalf("NewSessionForProjectPath: %v", err)
+	}
 	adapter := &stagedNavigationAdapter{
 		AdapterService: a,
 		blockProject:   true,
@@ -1880,6 +1891,8 @@ func TestCLIReadOnlyOpenHydrationFailureLeavesSelectionAndProject(t *testing.T) 
 // session clears the marker.
 func TestCLIExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
 	first, second := newTestAgentPair(t)
+	startTestAgent(t, first)
+	startTestAgent(t, second)
 	c := New(second)
 	out := new(bytes.Buffer)
 	c.out = out
@@ -1957,6 +1970,7 @@ func TestCLIExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
 	c.ctx = context.Background()
 	c.submitToBackend("hi")
 	c.drainEvents()
+	waitUntilSourceIdleAndDrained(t, second, heldID)
 	if strings.Contains(out.String(), "driven by another process") {
 		t.Fatalf("submit after reopen reported contention: %q", out.String())
 	}
@@ -3353,7 +3367,12 @@ func startTestAgent(t *testing.T, a *agent.Agent) context.Context {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	a.Init(ctx)
-	t.Cleanup(cancel)
+	t.Cleanup(func() {
+		cancel()
+		if !a.ShutdownOwner() {
+			t.Error("CLI agent shutdown reported abandoned work")
+		}
+	})
 	return ctx
 }
 

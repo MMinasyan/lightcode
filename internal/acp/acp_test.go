@@ -1956,6 +1956,7 @@ func TestACPEvictedHistoryCarriesPreparedEvictionOutcome(t *testing.T) {
 func TestACPOrderedDeliveryContract(t *testing.T) {
 	t.Run("session/prompt=success_advance_ahead_of_first_frames", func(t *testing.T) {
 		a := newACPTestAgent(t)
+		_, _ = startACPTestAgent(t, a)
 		firstID, err := a.NewSession("", "primary")
 		if err != nil {
 			t.Fatalf("NewSession first: %v", err)
@@ -1979,9 +1980,8 @@ func TestACPOrderedDeliveryContract(t *testing.T) {
 
 		// A live context admits the submit against the dead provider. The turn's
 		// first frame (turn_start) is enqueued synchronously inside the submit,
-		// ahead of the response; the turn itself fails fast in its goroutine and
-		// parks in the flush round-trip (whose consumer only runs after Init), so
-		// no further frames follow the response.
+		// ahead of the response; the initialized owner keeps the accepted work
+		// within its lifecycle for checked cleanup.
 		r.handleSessionPrompt(context.Background(), Request{
 			JSONRPC: "2.0",
 			ID:      "prompt",
@@ -2075,6 +2075,7 @@ func TestACPOrderedDeliveryContract(t *testing.T) {
 
 	t.Run("session/prompt=success_queued_advance_ahead_of_queue_changed", func(t *testing.T) {
 		a := newACPTestAgent(t)
+		_, _ = startACPTestAgent(t, a)
 		firstID, err := a.NewSession("", "primary")
 		if err != nil {
 			t.Fatalf("NewSession first: %v", err)
@@ -2084,10 +2085,9 @@ func TestACPOrderedDeliveryContract(t *testing.T) {
 			t.Fatalf("NewSession second: %v", err)
 		}
 
-		// Make secondID busy with a real turn against the dead provider. The turn
-		// goroutine parks in the flush round-trip (whose consumer only runs after
-		// Init), so the unit stays busy and the next submit is queued, not
-		// started.
+		// Make secondID busy with a real turn against the dead provider. The
+		// initialized owner keeps the accepted turn within its lifecycle, so the
+		// unit stays busy and the next submit is queued, not started.
 		res, err := a.SubmitToSession(context.Background(), secondID, "first")
 		if err != nil {
 			t.Fatalf("SubmitToSession busy turn: %v", err)
@@ -2193,13 +2193,11 @@ func TestACPOrderedDeliveryContract(t *testing.T) {
 		if err := a.SetDefaultModel("test/test-model"); err != nil {
 			t.Fatalf("SetDefaultModel: %v", err)
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(cancel)
+		ctx, sessionID := startACPTestAgent(t, a)
 
 		out := new(bytes.Buffer)
 		r := &Runner{agent: a, owner: a, out: out}
 		a.SetEventHandler(r.handleEvent)
-		sessionID := a.Init(ctx)
 		if sessionID == "" {
 			// Nothing to resume on a fresh agent: create, as Run does.
 			var createErr error
@@ -2382,6 +2380,7 @@ func TestACPOrderedDeliveryContract(t *testing.T) {
 
 		out := new(bytes.Buffer)
 		r := &Runner{agent: a, owner: a, out: out}
+		_, _ = startACPTestAgent(t, a)
 		a.SetEventHandler(r.handleEvent)
 		r.setCurrentSessionID(firstID)
 		r.seedPresented(firstID)
@@ -2482,13 +2481,11 @@ func acpPermissionPendingRunner(t *testing.T) (string, *bytes.Buffer, *Runner, s
 	if err := a.SetDefaultModel("test/test-model"); err != nil {
 		t.Fatalf("SetDefaultModel: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	ctx, sessionID := startACPTestAgent(t, a)
 
 	out := new(bytes.Buffer)
 	r := &Runner{agent: a, owner: a, out: out}
 	a.SetEventHandler(r.handleEvent)
-	sessionID := a.Init(ctx)
 	if sessionID == "" {
 		// Nothing to resume on a fresh agent: create, as Run does.
 		var createErr error
@@ -2849,6 +2846,7 @@ func TestSessionMessagesPointLookupHasNoCursor(t *testing.T) {
 
 func TestACPPromptSelectsSession(t *testing.T) {
 	a := newACPTestAgent(t)
+	_, _ = startACPTestAgent(t, a)
 	_ = appendACPUserTurn(t, a, "first")
 	firstID := a.SessionCurrent().ID
 	if firstID == "" {
@@ -2991,6 +2989,7 @@ func TestACPExplicitPromptRejectsLivePersistedAmbiguityBeforeAdmission(t *testin
 func TestACPExplicitPromptUniqueLiveAndPersistedControls(t *testing.T) {
 	t.Run("unique_live_still_admits", func(t *testing.T) {
 		a := newACPTestAgent(t)
+		_, _ = startACPTestAgent(t, a)
 		currentID, err := a.NewSession("", "primary")
 		if err != nil {
 			t.Fatalf("new current session: %v", err)
@@ -3068,6 +3067,7 @@ func TestACPExplicitPromptUniqueLiveAndPersistedControls(t *testing.T) {
 // previous session is dropped.
 func TestACPPromptSwitchAdvancesPresentation(t *testing.T) {
 	a := newACPTestAgent(t)
+	_, _ = startACPTestAgent(t, a)
 	firstID, err := a.NewSession("", "primary")
 	if err != nil {
 		t.Fatalf("NewSession first: %v", err)
@@ -3362,6 +3362,7 @@ func TestACPReadOnlySwitchHydrationFailureLeavesRoutingUnchanged(t *testing.T) {
 // of the same id, so a prompt is admitted and no contention is reported.
 func TestACPReopenAfterHolderReleasesIsLive(t *testing.T) {
 	first, second := newACPTestAgentPair(t)
+	_, _ = startACPTestAgent(t, second)
 	heldID, err := first.NewSession("", "primary")
 	if err != nil {
 		t.Fatalf("NewSession held: %v", err)
@@ -3440,9 +3441,7 @@ func TestACPSwitchKeepsCurrent(t *testing.T) {
 	if err := a.SetDefaultModel("test/test-model"); err != nil {
 		t.Fatalf("SetDefaultModel: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	_ = a.Init(ctx)
+	ctx, _ := startACPTestAgent(t, a)
 
 	firstID, err := a.NewSession("", "primary")
 	if err != nil {
@@ -4006,6 +4005,7 @@ func TestACPProjectRoutesKeepSessionProjectAfterRemoval(t *testing.T) {
 // session/new, session/list and file/read scoped there.
 func TestACPProjectRoutesFollowExplicitPromptTarget(t *testing.T) {
 	a := newACPTestAgent(t)
+	_, _ = startACPTestAgent(t, a)
 	startupID, err := a.NewSession("", "primary")
 	if err != nil {
 		t.Fatalf("NewSession startup: %v", err)
@@ -4398,6 +4398,18 @@ func drainedLines(t *testing.T, r *Runner, out *bytes.Buffer, want int) []string
 	return responseLines(t, out.String(), want)
 }
 
+func startACPTestAgent(t *testing.T, a *agent.Agent) (context.Context, string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		if !a.ShutdownOwner() {
+			t.Error("ACP agent shutdown reported abandoned work")
+		}
+	})
+	return ctx, a.Init(ctx)
+}
+
 func newACPTestAgent(t *testing.T) *agent.Agent {
 	t.Helper()
 	return newACPTestAgentWithProvider(t, "http://127.0.0.1:9/v1", false)
@@ -4410,9 +4422,7 @@ func newACPWarningTestAgent(t *testing.T) *agent.Agent {
 	}))
 	t.Cleanup(server.Close)
 	a := newACPTestAgentWithProvider(t, server.URL+"/v1", true)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	a.Init(ctx)
+	_, _ = startACPTestAgent(t, a)
 	return a
 }
 
@@ -5037,9 +5047,7 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 	// already-cancelled context is refused before admission.
 	t.Run("source=host_signal/state=pre_admission/work=direct_submit", func(t *testing.T) {
 		ag := newACPTestAgent(t)
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
-		ag.Init(ctx)
+		_, _ = startACPTestAgent(t, ag)
 		id, err := ag.NewSession("", "primary")
 		if err != nil {
 			t.Fatalf("NewSession: %v", err)
@@ -5086,9 +5094,7 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 		if err := ag.SetDefaultModel("test/test-model"); err != nil {
 			t.Fatalf("SetDefaultModel: %v", err)
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
-		ag.Init(ctx)
+		ctx, _ := startACPTestAgent(t, ag)
 		cap := &acpEventCapture{}
 		ag.SetEventHandler(cap.handler)
 		id, err := ag.NewSession("", "primary")
@@ -5132,9 +5138,7 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 	// marked busy.
 	t.Run("source=host_signal/state=pre_admission/work=compaction", func(t *testing.T) {
 		ag := newACPTestAgent(t)
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
-		ag.Init(ctx)
+		_, _ = startACPTestAgent(t, ag)
 		id, err := ag.NewSession("", "primary")
 		if err != nil {
 			t.Fatalf("NewSession: %v", err)
@@ -5178,9 +5182,7 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 		if err := ag.SetDefaultModel("test/test-model"); err != nil {
 			t.Fatalf("SetDefaultModel: %v", err)
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
-		ag.Init(ctx)
+		ctx, _ := startACPTestAgent(t, ag)
 		id, err := ag.NewSession("", "primary")
 		if err != nil {
 			t.Fatalf("NewSession: %v", err)
@@ -5240,9 +5242,7 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 		if err := ag.SetDefaultModel("test/test-model"); err != nil {
 			t.Fatalf("SetDefaultModel: %v", err)
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
-		ag.Init(ctx)
+		_, _ = startACPTestAgent(t, ag)
 		id, err := ag.NewSession("", "primary")
 		if err != nil {
 			t.Fatalf("NewSession: %v", err)
@@ -5292,9 +5292,7 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 		if err := ag.SetDefaultModel("test/test-model"); err != nil {
 			t.Fatalf("SetDefaultModel: %v", err)
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
-		ag.Init(ctx)
+		_, _ = startACPTestAgent(t, ag)
 		cap := &acpEventCapture{}
 		ag.SetEventHandler(cap.handler)
 		id, err := ag.NewSession("", "primary")
@@ -5358,9 +5356,7 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 		if err := ag.SetDefaultModel("test/test-model"); err != nil {
 			t.Fatalf("SetDefaultModel: %v", err)
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
-		ag.Init(ctx)
+		ctx, _ := startACPTestAgent(t, ag)
 		cap := &acpEventCapture{}
 		ag.SetEventHandler(cap.handler)
 		id, err := ag.NewSession("", "primary")
@@ -5421,9 +5417,7 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 		if err := ag.SetDefaultModel("test/test-model"); err != nil {
 			t.Fatalf("SetDefaultModel: %v", err)
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
-		ag.Init(ctx)
+		_, _ = startACPTestAgent(t, ag)
 		id, err := ag.NewSession("", "primary")
 		if err != nil {
 			t.Fatalf("NewSession: %v", err)
@@ -5483,9 +5477,7 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 		t.Cleanup(func() { closeRelease(); server.Close() })
 
 		ag := newACPTaskAgent(t, server.URL+"/v1")
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
-		ag.Init(ctx)
+		_, _ = startACPTestAgent(t, ag)
 		cap := &acpEventCapture{}
 		ag.SetEventHandler(cap.handler)
 		id, err := ag.NewSession("", "primary")
@@ -5534,9 +5526,7 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 		if err := ag.SetDefaultModel("test/test-model"); err != nil {
 			t.Fatalf("SetDefaultModel: %v", err)
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(func() { cancel() })
-		ag.Init(ctx)
+		ctx, _ := startACPTestAgent(t, ag)
 		cap := &acpEventCapture{}
 		ag.SetEventHandler(cap.handler)
 		id, err := ag.NewSession("", "primary")
@@ -5593,9 +5583,7 @@ func TestAcceptedWorkOutlivesHostContext(t *testing.T) {
 		if err := ag.SetDefaultModel("test/test-model"); err != nil {
 			t.Fatalf("SetDefaultModel: %v", err)
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(func() { cancel(); ag.ShutdownOwner() })
-		ag.Init(ctx)
+		ctx, _ := startACPTestAgent(t, ag)
 		cap := &acpEventCapture{}
 		ag.SetEventHandler(cap.handler)
 		id, err := ag.NewSession("", "primary")

@@ -719,6 +719,18 @@ func newTestApp(svc *agent.Agent) *App {
 	return &App{svc: svc, routeProjectPath: svc.ProjectRoot()}
 }
 
+func startAppTestAgent(t *testing.T, a *agent.Agent) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	a.Init(ctx)
+	t.Cleanup(func() {
+		cancel()
+		if !a.ShutdownOwner() {
+			t.Error("Wails test agent shutdown reported abandoned work")
+		}
+	})
+}
+
 // newAppTestAgentPair builds two owners over the same home with distinct
 // project roots, so one owner's live sessions hold their claims against the
 // other.
@@ -1090,6 +1102,7 @@ func TestSessionSwitchArchivedStaleMetaRoutesActualProject(t *testing.T) {
 // the marker and admits a turn.
 func TestWailsExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
 	first, second := newAppTestAgentPair(t)
+	startAppTestAgent(t, second)
 	heldID, err := first.NewSession("", "primary")
 	if err != nil {
 		t.Fatalf("NewSession held: %v", err)
@@ -1155,6 +1168,7 @@ func TestWailsExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
 // id, so a turn is admitted and no contention is reported.
 func TestWailsReopenAfterHolderReleasesIsLive(t *testing.T) {
 	first, second := newAppTestAgentPair(t)
+	startAppTestAgent(t, second)
 	heldID, err := first.NewSession("", "primary")
 	if err != nil {
 		t.Fatalf("NewSession held: %v", err)

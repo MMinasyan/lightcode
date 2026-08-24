@@ -1648,7 +1648,12 @@ func TestBackgroundWakeStartsNonCurrentSession(t *testing.T) {
 func TestWakeNonCurrentWhileCurrentBusy(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	t.Cleanup(func() {
+		cancel()
+		if !a.ShutdownOwner() {
+			t.Error("agent shutdown reported abandoned work")
+		}
+	})
 	a.Init(ctx)
 
 	firstID, err := a.NewSession("", "primary")

@@ -141,7 +141,12 @@ func startIntegrationAgent(t *testing.T, a *Agent) (*integrationEventLog, contex
 	log := newIntegrationEventLog()
 	a.SetEventHandler(log.collect)
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	t.Cleanup(func() {
+		cancel()
+		if !a.ShutdownOwner() {
+			t.Error("integration agent shutdown reported abandoned work")
+		}
+	})
 	a.Init(ctx)
 	return log, ctx
 }
