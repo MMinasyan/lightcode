@@ -1544,7 +1544,7 @@ func newCatalogBackedTestAgentForRoot(t *testing.T, home, projectRoot string) *A
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
@@ -1648,7 +1648,12 @@ func TestBackgroundWakeStartsNonCurrentSession(t *testing.T) {
 func TestWakeNonCurrentWhileCurrentBusy(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	t.Cleanup(func() {
+		cancel()
+		if !a.ShutdownOwner() {
+			t.Error("agent shutdown reported abandoned work")
+		}
+	})
 	a.Init(ctx)
 
 	firstID, err := a.NewSession("", "primary")

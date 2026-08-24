@@ -94,7 +94,7 @@ func TestSettingsEditDoesNotBlockSubmitDuringDiscoveryFetch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err = New(Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
+	a, err = New(Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func discoveryEnabledConfig(t *testing.T, modelBase, discBase string) (string, *
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -673,7 +673,7 @@ func TestResetProviderFieldTransportUsesCandidateEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -796,7 +796,7 @@ func TestResetProviderFieldAPIKeyEnvDuringConnectRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err = New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, Env: config.NewManagedEnvForTest(dotenvPath)})
+	a, err = New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, Env: config.NewManagedEnvForTest(dotenvPath), NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -881,7 +881,7 @@ func TestResetProviderFieldUnrelatedTransportFieldNotBlockedByAPIKeyEnv(t *testi
 		if err != nil {
 			t.Fatal(err)
 		}
-		a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+		a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -934,7 +934,7 @@ func TestResetProviderFieldUnrelatedTransportFieldNotBlockedByAPIKeyEnv(t *testi
 		if err != nil {
 			t.Fatal(err)
 		}
-		a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+		a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -53,11 +53,60 @@ func newCatalogBackedTestAgent(t *testing.T) *Agent {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
 	return a
+}
+
+func disabledMemoryEmbedder(string) (*memory.Embedder, error) {
+	return nil, nil
+}
+
+func TestAgentUsesConfiguredMemoryEmbedderFactory(t *testing.T) {
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	lightcodeDir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(lightcodeDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"providers": {}, "default_model": ""}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotHome string
+	factoryCalls := 0
+	a, err := New(Config{
+		Cfg:         cfg,
+		ConfigPath:  configPath,
+		ProjectRoot: projectRoot,
+		Home:        home,
+		NewMemoryEmbedder: func(homeArg string) (*memory.Embedder, error) {
+			factoryCalls++
+			gotHome = homeArg
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	if factoryCalls != 1 {
+		t.Fatalf("memory embedder factory calls = %d, want exactly one", factoryCalls)
+	}
+	if gotHome != home {
+		t.Fatalf("memory embedder factory home = %q, want %q", gotHome, home)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "models")); !os.IsNotExist(err) {
+		t.Fatalf("model cache stat error = %v, want cache not to exist", err)
+	}
+	if a == nil {
+		t.Fatal("New returned nil agent")
+	}
 }
 
 func TestAgentNewAllowsUnconfiguredAndDisconnectedDefaults(t *testing.T) {
@@ -112,7 +161,7 @@ func TestAgentNewAllowsUnconfiguredAndDisconnectedDefaults(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load config: %v", err)
 			}
-			a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+			a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 			if err != nil {
 				t.Fatalf("New returned error: %v", err)
 			}
@@ -161,7 +210,7 @@ func TestAgentSetupWarningsForUnconfiguredStartup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
@@ -215,21 +264,17 @@ func TestAgentDegradedMemoryStartupUsesHomeAndKeepsToolsAvailable(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	oldNewMemoryEmbedder := newMemoryEmbedder
 	var gotHome string
-	newMemoryEmbedder = func(homeArg string) (*memory.Embedder, error) {
+	failingMemoryEmbedder := func(homeArg string) (*memory.Embedder, error) {
 		gotHome = homeArg
 		return nil, fmt.Errorf("forced embedder failure")
 	}
-	t.Cleanup(func() {
-		newMemoryEmbedder = oldNewMemoryEmbedder
-	})
 
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: failingMemoryEmbedder})
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
@@ -300,7 +345,7 @@ func TestAgentSetDefaultModelWritesConfigAndUpdatesWarnings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
@@ -535,7 +580,7 @@ func TestAgentSetRuntimeConfigDoesNotTriggerDiscoveryHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
@@ -662,7 +707,7 @@ func TestAgentUsesConfiguredConfigPathForWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
@@ -1370,7 +1415,7 @@ func TestAgentModelListOmitsUnconnectedProviders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
@@ -1416,7 +1461,7 @@ func TestAgentModelListFreshInstallListsNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}

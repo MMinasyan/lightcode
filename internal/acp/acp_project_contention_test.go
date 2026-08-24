@@ -21,6 +21,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
@@ -55,7 +56,7 @@ func TestACPSessionNewUnderIdentityContentionReturnsBusyAndJoins(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		a, err := agent.New(agent.Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: root, Home: home})
+		a, err := agent.New(agent.Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: root, Home: home, NewMemoryEmbedder: func(string) (*memory.Embedder, error) { return nil, nil }})
 		if err != nil {
 			t.Fatal(err)
 		}

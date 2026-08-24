@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/engine/message"
+	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
@@ -706,7 +708,7 @@ func newAppTestAgentAtHome(t *testing.T, baseURL, home, projectRoot string) *age
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
+	a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: func(string) (*memory.Embedder, error) { return nil, nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -717,6 +719,18 @@ func newTestApp(svc *agent.Agent) *App {
 	return &App{svc: svc, routeProjectPath: svc.ProjectRoot()}
 }
 
+func startAppTestAgent(t *testing.T, a *agent.Agent) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	a.Init(ctx)
+	t.Cleanup(func() {
+		cancel()
+		if !a.ShutdownOwner() {
+			t.Error("Wails test agent shutdown reported abandoned work")
+		}
+	})
+}
+
 // newAppTestAgentPair builds two owners over the same home with distinct
 // project roots, so one owner's live sessions hold their claims against the
 // other.
@@ -725,6 +739,10 @@ func newAppTestAgentPair(t *testing.T) (*agent.Agent, *agent.Agent) {
 	home := t.TempDir()
 	first := newAppTestAgentAtHome(t, "http://127.0.0.1:9/v1", home, t.TempDir())
 	second := newAppTestAgentAtHome(t, "http://127.0.0.1:9/v1", home, t.TempDir())
+	t.Cleanup(func() {
+		runtime.KeepAlive(first)
+		runtime.KeepAlive(second)
+	})
 	return first, second
 }
 
@@ -1088,6 +1106,7 @@ func TestSessionSwitchArchivedStaleMetaRoutesActualProject(t *testing.T) {
 // the marker and admits a turn.
 func TestWailsExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
 	first, second := newAppTestAgentPair(t)
+	startAppTestAgent(t, second)
 	heldID, err := first.NewSession("", "primary")
 	if err != nil {
 		t.Fatalf("NewSession held: %v", err)
@@ -1144,6 +1163,7 @@ func TestWailsExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
 	if _, err := app.Submit("hi"); err != nil {
 		t.Fatalf("submit after switching to a live session = %v, want admission", err)
 	}
+	runtime.KeepAlive(first)
 }
 
 // TestWailsReopenAfterHolderReleasesIsLive proves a session opened read-only
@@ -1152,6 +1172,7 @@ func TestWailsExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
 // id, so a turn is admitted and no contention is reported.
 func TestWailsReopenAfterHolderReleasesIsLive(t *testing.T) {
 	first, second := newAppTestAgentPair(t)
+	startAppTestAgent(t, second)
 	heldID, err := first.NewSession("", "primary")
 	if err != nil {
 		t.Fatalf("NewSession held: %v", err)
@@ -1236,6 +1257,7 @@ func TestWailsReadOnlyOpenHydrationFailureLeavesRoutingUnchanged(t *testing.T) {
 	if app.routeReadOnlyNames(heldID) {
 		t.Fatal("read-only marker set for an open whose presentation failed")
 	}
+	runtime.KeepAlive(first)
 }
 
 func TestProjectSwitchInPlaceKeepsOwnerAlive(t *testing.T) {
@@ -1319,6 +1341,7 @@ func TestProjectSwitchSkipsContendedNewestSession(t *testing.T) {
 	if got := app.SessionCurrent().ID; got != olderID {
 		t.Fatalf("current after switch = %q, want the older session %q", got, olderID)
 	}
+	runtime.KeepAlive(first)
 }
 
 // TestProjectSwitchCreatesWhenEveryCandidateContended proves a project
@@ -1346,6 +1369,7 @@ func TestProjectSwitchCreatesWhenEveryCandidateContended(t *testing.T) {
 	if got == "" || got == olderID || got == newestID {
 		t.Fatalf("current after switch = %q, want a newly created session", got)
 	}
+	runtime.KeepAlive(first)
 }
 
 // TestProjectSwitchSurfacesListingFailure proves a project navigation that
