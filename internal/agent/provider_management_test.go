@@ -36,7 +36,7 @@ func newProviderManagementAgent(t *testing.T, cfg string) *Agent {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: loaded, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, Env: config.NewManagedEnvForTest(dotenvPath)})
+	a, err := New(Config{Cfg: loaded, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, Env: config.NewManagedEnvForTest(dotenvPath), NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}

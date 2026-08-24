@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -128,7 +129,7 @@ func newIntegrationAgentWithRoots(t *testing.T, home, projectRoot, baseURL strin
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
@@ -143,6 +144,70 @@ func startIntegrationAgent(t *testing.T, a *Agent) (*integrationEventLog, contex
 	t.Cleanup(cancel)
 	a.Init(ctx)
 	return log, ctx
+}
+
+func TestIntegrationDefaultMemoryEmbedder(t *testing.T) {
+	home := t.TempDir()
+	projectRoot := t.TempDir()
+	lightcodeDir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(projectRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LIGHTCODE_TEST_KEY", "test-key")
+	configPath := filepath.Join(lightcodeDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{
+  "providers": {
+    "test": {
+      "name": "Test Provider",
+      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_TEST_KEY" },
+      "discovery": false,
+      "models": { "test-model": { "name": "Test Model", "context_window": 2000, "max_output_tokens": 256 } }
+    }
+  },
+  "default_model": "test/test-model"
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentsTestConfig(t, configPath, `{"primary": {"model": "test/test-model"}}`)
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := New(Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		if !a.ShutdownOwner() {
+			t.Error("default embedder agent shutdown reported abandoned work")
+		}
+	})
+	a.Init(ctx)
+	if a.embedder == nil {
+		t.Fatal("default memory embedder is nil")
+	}
+	vector, err := a.embedder.Embed("short integration text")
+	if err != nil {
+		t.Fatalf("embed: %v", err)
+	}
+	if len(vector) != 384 {
+		t.Fatalf("vector length = %d, want 384", len(vector))
+	}
+	var sumSquares float64
+	for i, value := range vector {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			t.Fatalf("vector[%d] = %v, want finite value", i, value)
+		}
+		sumSquares += float64(value) * float64(value)
+	}
+	if norm := math.Sqrt(sumSquares); math.Abs(norm-1) > 1e-4 {
+		t.Fatalf("vector norm = %f, want normalized vector", norm)
+	}
 }
 
 func readIntegrationRequest(t *testing.T, r *http.Request) integrationRequest {

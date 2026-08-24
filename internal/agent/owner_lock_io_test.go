@@ -496,7 +496,7 @@ func TestReopenUsesAdmissionSnapshotModelAcrossReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	seed, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	seed, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatalf("new seed agent: %v", err)
 	}
@@ -537,7 +537,7 @@ func TestReopenUsesAdmissionSnapshotModelAcrossReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatalf("new reopen agent: %v", err)
 	}

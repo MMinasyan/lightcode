@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
+	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"golang.org/x/term"
@@ -437,6 +439,7 @@ func TestCLIResumeSkipsContendedNewestSession(t *testing.T) {
 	if got := c.currentSessionSummary().ID; got != olderID {
 		t.Fatalf("cli current after resume = %q, want the older session %q", got, olderID)
 	}
+	runtime.KeepAlive(first)
 }
 
 // TestCLIResumeReportsNoActiveSessionsWhenEveryCandidateContended proves the
@@ -467,6 +470,7 @@ func TestCLIResumeReportsNoActiveSessionsWhenEveryCandidateContended(t *testing.
 	if got := c.currentSessionID(); got != "" {
 		t.Fatalf("cli current after resume = %q, want empty", got)
 	}
+	runtime.KeepAlive(first)
 }
 
 // TestCLIResumeSurfacesListingFailure proves the no-argument resume reports a
@@ -992,6 +996,7 @@ func TestCLISelectionOnlyContract(t *testing.T) {
 		if got, _ := c.currentSession(); got == "" || got == heldID {
 			t.Fatalf("current after read-only-source /new = %q, want a fresh session", got)
 		}
+		runtime.KeepAlive(first)
 	})
 
 	// The idle-success row: the reservation is acquired for the source and
@@ -1863,6 +1868,7 @@ func TestCLIReadOnlyOpenHydrationFailureLeavesSelectionAndProject(t *testing.T) 
 			t.Fatal("read-only marker set for an open whose presentation failed")
 		}
 	})
+	runtime.KeepAlive(first)
 }
 
 // TestCLIExplicitOpenOfContendedSessionIsReadOnly proves an explicit open of a
@@ -1963,6 +1969,7 @@ func TestCLIExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
 	if got := c.liveCurrentSessionID(); got != source {
 		t.Fatalf("live current after switch = %q, want %q", got, source)
 	}
+	runtime.KeepAlive(first)
 }
 
 // TestCLISubmitResolvesTargetAtEnter proves the submit target is resolved when
@@ -2021,6 +2028,7 @@ func TestCLISubmitResolvesTargetAtEnter(t *testing.T) {
 	if !strings.Contains(out.String(), fmt.Sprintf("session %q is being driven by another process", heldID)) {
 		t.Fatalf("submit failure after the switch = %q, want the contention message naming the held session", out.String())
 	}
+	runtime.KeepAlive(first)
 }
 
 // selectionCLI builds a CLI over a fresh agent with one source session
@@ -3281,9 +3289,10 @@ func newTestAgentAtHome(t *testing.T, baseURL, home, projectRoot string) (*agent
 	}
 
 	a, err := agent.New(agent.Config{
-		Cfg:         cfg,
-		ProjectRoot: projectRoot,
-		Home:        home,
+		Cfg:               cfg,
+		ProjectRoot:       projectRoot,
+		Home:              home,
+		NewMemoryEmbedder: func(string) (*memory.Embedder, error) { return nil, nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -4195,7 +4204,7 @@ func TestCLIRunShutdownContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
+		a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: func(string) (*memory.Embedder, error) { return nil, nil }})
 		if err != nil {
 			t.Fatalf("new agent: %v", err)
 		}

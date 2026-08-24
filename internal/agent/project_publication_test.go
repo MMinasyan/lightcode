@@ -521,7 +521,7 @@ func TestAgentNewDiscoveryContentionThenReloadRecovery(t *testing.T) {
 	}
 	lockPath := filepath.Join(home, ".lightcode", "cache", "discovery", ".locks", "disc.lock")
 	release := startForeignLockHolder(t, "TestAgentNewDiscoveryContentionThenReloadRecovery", lockPath)
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		release()
 		t.Fatal(err)

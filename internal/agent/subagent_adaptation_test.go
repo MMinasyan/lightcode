@@ -279,7 +279,7 @@ func newChildModelEventAgent(t *testing.T, baseURL string) *Agent {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatal(err)
 	}

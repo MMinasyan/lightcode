@@ -1544,7 +1544,7 @@ func newCatalogBackedTestAgentForRoot(t *testing.T, home, projectRoot string) *A
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}

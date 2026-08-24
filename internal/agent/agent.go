@@ -42,11 +42,12 @@ const tokensFileName = "tokens.json"
 
 // Config carries constructor parameters for New.
 type Config struct {
-	Cfg         *config.Config
-	ConfigPath  string // absolute path the config was loaded from; used for reloads and writes
-	ProjectRoot string
-	Home        string
-	Env         *config.ManagedEnv // live .env state; may be nil in tests
+	Cfg               *config.Config
+	ConfigPath        string // absolute path the config was loaded from; used for reloads and writes
+	ProjectRoot       string
+	Home              string
+	Env               *config.ManagedEnv // live .env state; may be nil in tests
+	NewMemoryEmbedder func(string) (*memory.Embedder, error)
 }
 
 // session holds the mutable state for one live conversation.
@@ -224,8 +225,6 @@ func (h sessionLoopHooks) RecordUsage(ev loop.Event) {
 		h.agent.recordUsageForSession(h.unit, ev)
 	}
 }
-
-var newMemoryEmbedder = memory.NewEmbedder
 
 type compactUnitSummarizer struct {
 	unit         *session
@@ -1192,6 +1191,10 @@ func New(c Config) (*Agent, error) {
 		rt.nudgeSignalScheduler()
 	})
 
+	newMemoryEmbedder := c.NewMemoryEmbedder
+	if newMemoryEmbedder == nil {
+		newMemoryEmbedder = memory.NewEmbedder
+	}
 	embedder, err := newMemoryEmbedder(c.Home)
 	if err != nil {
 		// Embedder failure is non-fatal: semantic memory search will be disabled.

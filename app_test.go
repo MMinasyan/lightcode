@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/engine/message"
+	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
@@ -706,7 +708,7 @@ func newAppTestAgentAtHome(t *testing.T, baseURL, home, projectRoot string) *age
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
+	a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: func(string) (*memory.Embedder, error) { return nil, nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1144,6 +1146,7 @@ func TestWailsExplicitOpenOfContendedSessionIsReadOnly(t *testing.T) {
 	if _, err := app.Submit("hi"); err != nil {
 		t.Fatalf("submit after switching to a live session = %v, want admission", err)
 	}
+	runtime.KeepAlive(first)
 }
 
 // TestWailsReopenAfterHolderReleasesIsLive proves a session opened read-only
@@ -1236,6 +1239,7 @@ func TestWailsReadOnlyOpenHydrationFailureLeavesRoutingUnchanged(t *testing.T) {
 	if app.routeReadOnlyNames(heldID) {
 		t.Fatal("read-only marker set for an open whose presentation failed")
 	}
+	runtime.KeepAlive(first)
 }
 
 func TestProjectSwitchInPlaceKeepsOwnerAlive(t *testing.T) {
@@ -1319,6 +1323,7 @@ func TestProjectSwitchSkipsContendedNewestSession(t *testing.T) {
 	if got := app.SessionCurrent().ID; got != olderID {
 		t.Fatalf("current after switch = %q, want the older session %q", got, olderID)
 	}
+	runtime.KeepAlive(first)
 }
 
 // TestProjectSwitchCreatesWhenEveryCandidateContended proves a project
@@ -1346,6 +1351,7 @@ func TestProjectSwitchCreatesWhenEveryCandidateContended(t *testing.T) {
 	if got == "" || got == olderID || got == newestID {
 		t.Fatalf("current after switch = %q, want a newly created session", got)
 	}
+	runtime.KeepAlive(first)
 }
 
 // TestProjectSwitchSurfacesListingFailure proves a project navigation that
