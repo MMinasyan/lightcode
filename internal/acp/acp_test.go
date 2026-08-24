@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -4191,7 +4192,21 @@ func TestACPProjectRoutesKeepSessionProjectAfterEviction(t *testing.T) {
 // submit admission, so a prompt whose submit is refused admission leaves both
 // the current id and the routing project on the previous session.
 func TestACPRefusedPromptKeepsRoutingProject(t *testing.T) {
-	a := newACPTestAgent(t)
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		<-release
+		writeACPSSE(w,
+			acpTextChunk("refused-prompt", "test-model", "ok"),
+			acpStopChunk("refused-prompt", "test-model"),
+			"[DONE]")
+	}))
+	t.Cleanup(server.Close)
+
+	a := newACPTestAgentWithProvider(t, server.URL+"/v1", false)
+	_, _ = startACPTestAgent(t, a)
+	t.Cleanup(func() { close(release) })
 	startupID, err := a.NewSession("", "primary")
 	if err != nil {
 		t.Fatalf("NewSession startup: %v", err)
@@ -4202,16 +4217,19 @@ func TestACPRefusedPromptKeepsRoutingProject(t *testing.T) {
 		t.Fatalf("NewSessionForProjectPath: %v", err)
 	}
 
-	// Park a turn on the target: without Init the failed provider call parks
-	// in the flush round-trip, so the unit stays busy and the prompt below is
-	// refused at the queue admission on the cancelled context, after the
-	// precheck has already resolved the session.
+	// Park a turn on the target so the prompt below reaches queue admission and
+	// is refused on its cancelled context after the precheck resolves the session.
 	res, err := a.SubmitToSession(context.Background(), otherID, "park")
 	if err != nil {
 		t.Fatalf("SubmitToSession park: %v", err)
 	}
 	if !res.Started {
 		t.Fatalf("park submit was queued instead of started: %+v", res)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("parked turn did not reach the provider")
 	}
 
 	out := new(bytes.Buffer)
@@ -4493,6 +4511,10 @@ func newACPTestAgentPair(t *testing.T) (*agent.Agent, *agent.Agent) {
 	home := t.TempDir()
 	first := newACPTestAgentAtHome(t, "http://127.0.0.1:9/v1", false, home)
 	second := newACPTestAgentAtHome(t, "http://127.0.0.1:9/v1", false, home)
+	t.Cleanup(func() {
+		runtime.KeepAlive(first)
+		runtime.KeepAlive(second)
+	})
 	return first, second
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,10 @@ func newSharedHomeAgentPair(t *testing.T) (*Agent, *Agent) {
 	home := t.TempDir()
 	first := newCatalogBackedTestAgentForRoot(t, home, t.TempDir())
 	second := newCatalogBackedTestAgentForRoot(t, home, t.TempDir())
+	t.Cleanup(func() {
+		goruntime.KeepAlive(first)
+		goruntime.KeepAlive(second)
+	})
 	return first, second
 }
 

@@ -3321,6 +3321,10 @@ func newTestAgentPair(t *testing.T) (*agent.Agent, *agent.Agent) {
 	home := t.TempDir()
 	first, _ := newTestAgentAtHome(t, "http://127.0.0.1:9/v1", home, t.TempDir())
 	second, _ := newTestAgentAtHome(t, "http://127.0.0.1:9/v1", home, t.TempDir())
+	t.Cleanup(func() {
+		runtime.KeepAlive(first)
+		runtime.KeepAlive(second)
+	})
 	return first, second
 }
 
