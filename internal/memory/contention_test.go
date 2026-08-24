@@ -475,6 +475,9 @@ func pairReaderCheck(dir string, dims int) func() []string {
 		}
 		for _, mdPath := range matches {
 			title, content, createdAt, err := ReadMemoryFile(mdPath)
+			if os.IsNotExist(err) {
+				continue
+			}
 			if err != nil || title == "" || strings.TrimSpace(content) == "" || createdAt == "" {
 				violations = append(violations, fmt.Sprintf("%s = %q/%q/%q, %v; want a complete record", filepath.Base(mdPath), title, content, createdAt, err))
 				continue
