@@ -606,7 +606,7 @@ func TestFrontendTaskSubagentLinksRemainClickableAfterCompletion(t *testing.T) {
 	if taskStart < 0 {
 		t.Fatal("ToolCall.svelte task branch not found")
 	}
-	taskEnd := strings.Index(toolCall[taskStart:], "{:else if name === 'save_memory'}")
+	taskEnd := strings.Index(toolCall[taskStart:], "{:else if name === 'diagnostics'}")
 	if taskEnd < 0 {
 		t.Fatal("ToolCall.svelte task branch end not found")
 	}

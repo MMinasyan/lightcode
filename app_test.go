@@ -17,7 +17,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/engine/message"
-	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
@@ -708,7 +707,7 @@ func newAppTestAgentAtHome(t *testing.T, baseURL, home, projectRoot string) *age
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: func(string) (*memory.Embedder, error) { return nil, nil }})
+	a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
 	if err != nil {
 		t.Fatal(err)
 	}

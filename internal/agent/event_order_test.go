@@ -188,7 +188,7 @@ func newEventOrderAgent(t *testing.T, baseURL string) *Agent {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := New(Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
+	a, err := New(Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -17,7 +17,6 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/config"
 	loop "github.com/MMinasyan/lightcode/internal/engine"
-	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
@@ -496,13 +495,9 @@ func TestTaskProjectSync(t *testing.T) {
 	}
 	tt.mu.Lock()
 	taskProjectID := tt.projectID
-	memoriesDir := tt.memoriesDir
 	tt.mu.Unlock()
 	if taskProjectID != projectID {
 		t.Fatalf("task project id = %q, want %q", taskProjectID, projectID)
-	}
-	if memoriesDir == "" {
-		t.Fatal("task memories dir is empty")
 	}
 	parentSessionID := a.session.store.SessionID()
 	if parentSessionID == "" {
@@ -804,80 +799,6 @@ func TestTurnActionsUseSelectedSessionHistory(t *testing.T) {
 	}
 	if got := userContents(firstMessages); !equalStrings(got, []string{"first project only"}) {
 		t.Fatalf("first messages = %#v, want unchanged first project", got)
-	}
-}
-
-func TestCompactionIndexesSelectedSessionProject(t *testing.T) {
-	const summary = "## Goal\nremember second project detail"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeTextResponse(w, summary)
-	}))
-	defer server.Close()
-
-	home := t.TempDir()
-	firstRoot := t.TempDir()
-	secondRoot := t.TempDir()
-	first := newCatalogBackedTestAgentForRoot(t, home, firstRoot)
-	first.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
-	firstProject, err := first.projects.Ensure()
-	if err != nil {
-		t.Fatalf("ensure first project: %v", err)
-	}
-	firstID, err := first.NewSession(firstProject.ID, "primary")
-	if err != nil {
-		t.Fatalf("NewSession first: %v", err)
-	}
-
-	secondProjectAgent := newCatalogBackedTestAgentForRoot(t, home, secondRoot)
-	secondProject, err := secondProjectAgent.projects.Ensure()
-	if err != nil {
-		t.Fatalf("ensure second project: %v", err)
-	}
-	secondID, err := first.NewSession(secondProject.ID, "primary")
-	if err != nil {
-		t.Fatalf("NewSession second: %v", err)
-	}
-	if _, err := first.AppendUserMessageToSession(secondID, "second project context"); err != nil {
-		t.Fatalf("append second: %v", err)
-	}
-
-	memStore := memory.NewStoreWithEmbedder(deterministicMemoryEmbedder{}, first.projects.Root(), first.home)
-	hooks := &recordingMemoryHooks{store: memStore}
-	first.memoryHooks = hooks
-
-	first.ensureRuntime().mu.Lock()
-	second := first.sessions[secondID]
-	if err := first.setCurrentSessionLocked(first.sessions[firstID]); err != nil {
-		first.ensureRuntime().mu.Unlock()
-		t.Fatalf("setCurrentSessionLocked: %v", err)
-	}
-	first.ensureRuntime().mu.Unlock()
-	if err := first.runCompactionForSession(context.Background(), second, false); err != nil {
-		t.Fatalf("runCompactionForSession second: %v", err)
-	}
-
-	if hooks.sessionID != secondID {
-		t.Fatalf("indexed session id = %q, want %q", hooks.sessionID, secondID)
-	}
-	if hooks.projectID != secondProject.ID || hooks.projectName != secondProject.Name {
-		t.Fatalf("indexed project = %q/%q, want %q/%q", hooks.projectID, hooks.projectName, secondProject.ID, secondProject.Name)
-	}
-
-	secondSearch := tool.NewSearchHistory(memStore, secondProject.ID)
-	result, err := secondSearch.Execute(context.Background(), map[string]any{"query": "second project detail"})
-	if err != nil {
-		t.Fatalf("search_history second: %v", err)
-	}
-	if !strings.Contains(result, secondID) || !strings.Contains(result, "remember second project detail") {
-		t.Fatalf("second project search result = %q, want indexed second session summary", result)
-	}
-	firstSearch := tool.NewSearchHistory(memStore, firstProject.ID)
-	result, err = firstSearch.Execute(context.Background(), map[string]any{"query": "second project detail"})
-	if err != nil {
-		t.Fatalf("search_history first: %v", err)
-	}
-	if strings.Contains(result, secondID) {
-		t.Fatalf("first project search result = %q, should not include second project session %s", result, secondID)
 	}
 }
 
@@ -1567,7 +1488,7 @@ func newCatalogBackedTestAgentForRoot(t *testing.T, home, projectRoot string) *A
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}

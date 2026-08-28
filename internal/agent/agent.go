@@ -26,7 +26,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
 	"github.com/MMinasyan/lightcode/internal/lsp"
-	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/process"
@@ -42,12 +41,11 @@ const tokensFileName = "tokens.json"
 
 // Config carries constructor parameters for New.
 type Config struct {
-	Cfg               *config.Config
-	ConfigPath        string // absolute path the config was loaded from; used for reloads and writes
-	ProjectRoot       string
-	Home              string
-	Env               *config.ManagedEnv // live .env state; may be nil in tests
-	NewMemoryEmbedder func(string) (*memory.Embedder, error)
+	Cfg         *config.Config
+	ConfigPath  string // absolute path the config was loaded from; used for reloads and writes
+	ProjectRoot string
+	Home        string
+	Env         *config.ManagedEnv // live .env state; may be nil in tests
 }
 
 // session holds the mutable state for one live conversation.
@@ -118,17 +116,9 @@ type Agent struct {
 	pendingAgentWarnings   []prompt.Warning
 	pendingSetupWarnings   []prompt.Warning
 
-	embedderDegraded bool // true when memory embedder failed to initialize
-
-	memoryStore *memory.Store
-	memoryHooks agentMemoryHooks
-	// embedder is the one shared embedding model. Memory stores borrow it; the
-	// owner closes it exactly once at shutdown.
-	embedder *memory.Embedder
-
 	// servicesMu guards lspManagers and detectCtx. Each project owns one LSP
 	// manager, keyed by canonical project root and bound to it; the shared
-	// process manager and memory store remain owner-wide. detectCtx is set once
+	// process manager remain owner-wide. detectCtx is set once
 	// the owner is running, so detection starts exactly once per manager.
 	servicesMu  sync.Mutex
 	lspManagers map[string]*lspEntry
@@ -200,12 +190,6 @@ func (s loopSignalSink) AddSignal(signal loop.PendingSignal) {
 	if signal.Wake {
 		rt.nudgeSignalScheduler()
 	}
-}
-
-type agentMemoryHooks interface {
-	Reconcile() error
-	IndexSummary(sessionID, projectID, projectName, summary, createdAt, compactionPath string) error
-	DeleteSessionSummaries(sessionID string) error
 }
 
 type sessionLoopHooks struct {
@@ -574,7 +558,7 @@ func (a *Agent) setSessionProject(unit *session, proj *project.Project) {
 	if unit == nil || unit.taskToolInst == nil || proj == nil || a == nil || a.projects == nil {
 		return
 	}
-	unit.taskToolInst.setProject(proj.ID, filepath.Join(a.projects.Root(), proj.ID, "memories"))
+	unit.taskToolInst.setProject(proj.ID)
 }
 
 func (unit *session) syncEventOwner() {
@@ -856,10 +840,6 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 
 	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(store, fileTracker, snap.toolsConfig, projectRoot, checkPolicy, askActionPolicy, options)
 
-	memoriesDir := ""
-	if projectID != "" && a.projects != nil {
-		memoriesDir = filepath.Join(a.projects.Root(), projectID, "memories")
-	}
 	projectsRoot := ""
 	if a.projects != nil {
 		projectsRoot = a.projects.Root()
@@ -876,10 +856,8 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 		HomeDir:       a.home,
 		WorkspaceRoot: projectRoot,
 		ProcMgr:       a.procMgr,
-		MemoryStore:   a.memoryStore,
 		ProjectID:     projectID,
 		ProjectsRoot:  projectsRoot,
-		MemoriesDir:   memoriesDir,
 		LSPManager:    lspMgr,
 		Check:         checkPolicy,
 		Ask:           askPolicy,
@@ -900,9 +878,6 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 	}
 	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(processes), checkPolicy, askPolicy))
 	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkPolicy, askPolicy))
-	registry.Register(tool.WrapWithPermission(tool.NewSaveMemory(a.memoryStore, memoriesDir), checkPolicy, askPolicy))
-	registry.Register(tool.WrapWithPermission(tool.NewSearchMemory(a.memoryStore, projectID), checkPolicy, askPolicy))
-	registry.Register(tool.WrapWithPermission(tool.NewSearchHistory(a.memoryStore, projectID), checkPolicy, askPolicy))
 
 	lspClient := lsp.NewClient(lspMgr)
 	lspDiag := tool.NewLSPDiagnostics(lspClient, &snapshotDiagAdapter{store: store})
@@ -1189,21 +1164,6 @@ func New(c Config) (*Agent, error) {
 		rt.nudgeSignalScheduler()
 	})
 
-	newMemoryEmbedder := c.NewMemoryEmbedder
-	if newMemoryEmbedder == nil {
-		newMemoryEmbedder = memory.NewEmbedder
-	}
-	embedder, err := newMemoryEmbedder(c.Home)
-	if err != nil {
-		// Embedder failure is non-fatal: semantic memory search will be disabled.
-		a.embedderDegraded = true
-		embedder = nil
-	}
-	a.embedder = embedder
-	memStore := memory.NewStore(embedder, resolver.Root(), c.Home)
-	a.memoryStore = memStore
-	a.memoryHooks = memStore
-
 	rt.mu.Lock()
 	unit, promptWarnings, err := a.rootRunningUnitLocked(store, "primary", proj.ID, proj.Name, c.ProjectRoot)
 	rt.mu.Unlock()
@@ -1262,9 +1222,6 @@ func (rt *runtime) initOnceLocked(ctx context.Context) string {
 	go func() { defer rt.bgWG.Done(); rt.drainLoopEvents(rt.ownerCtx) }()
 	go func() { defer rt.bgWG.Done(); rt.runSignalScheduler(rt.ownerCtx) }()
 	go func() { defer rt.bgWG.Done(); rt.runQueueDrainer(rt.ownerCtx) }()
-	if a.memoryHooks != nil {
-		_ = a.memoryHooks.Reconcile()
-	}
 	a.runSweep()
 	resumed, err := a.resumeMostRecent()
 	if err != nil {
@@ -1918,9 +1875,9 @@ func (a *Agent) recordUsageForSession(unit *session, ev loop.Event) {
 	unit.tokensMu.Lock()
 	// Copy the current entries and context into candidate values, apply the
 	// delta to the candidates, and publish them only after the durable write
-	// succeeds: memory, the cumulative report, and the usage event can never
-	// outrun the tokens.json commit. A failed write retains the old values and
-	// emits nothing; the failure is reported after the lock is released.
+	// succeeds: the cumulative report and the usage event can never outrun the
+	// tokens.json commit. A failed write retains the old values and emits
+	// nothing; the failure is reported after the lock is released.
 	candidates := make(map[string]*TokenEntry, len(unit.tokens))
 	for k, e := range unit.tokens {
 		c := *e
@@ -2035,13 +1992,6 @@ func (a *Agent) runSweep() {
 		DeleteAfterArchiveDays: deleteAfterArchiveDays,
 	}
 	var onDelete func(string)
-	if a.memoryHooks != nil {
-		onDelete = func(sessionID string) {
-			if err := a.memoryHooks.DeleteSessionSummaries(sessionID); err != nil {
-				fmt.Fprintf(os.Stderr, "lightcode: delete summaries for session %s: %v\n", sessionID, err)
-			}
-		}
-	}
 	// The serializer carries owner-close admission into the sweep: it holds
 	// lifecycleMu per candidate and refuses a close-first candidate before any
 	// claim, so a sweep candidate cannot archive or delete a session after the
@@ -2246,9 +2196,9 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 		return activeStart, fmt.Errorf("save compaction: %w", err)
 	}
 	// Publish the rewrite boundary on durable success, before the loop-history
-	// rewrite and memory indexing, so a live-selection capture racing the compaction
-	// sees the revision advance promptly and re-reads the rewritten durable prefix
-	// rather than publishing the pre-compaction one.
+	// rewrite, so a live-selection capture racing the compaction sees the revision
+	// advance promptly and re-reads the rewritten durable prefix rather than
+	// publishing the pre-compaction one.
 	a.publishCompactionRewrite(unit, sessionID, projectID, boundaryTurn, summary, committed)
 
 	var activeReads []tool.ReadRecord
@@ -2260,16 +2210,6 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 		readMaxLines := a.cfg.Tools.ReadMaxLines
 		rt.mu.Unlock()
 		activeReads = activeTailReadRecords(messages[activeStart:], unit.fileTracker.Snapshot(), readMaxLines, unit.projectRoot)
-	}
-
-	if a.memoryHooks != nil {
-		sessionID := unit.store.SessionID()
-		projID := unit.projectID
-		projName := unit.projectName
-		compactionPath := filepath.Join(unit.store.Dir(), "compaction.json")
-		if err := a.memoryHooks.IndexSummary(sessionID, projID, projName, result.Summary, rec.CompactedAt, compactionPath); err != nil {
-			fmt.Fprintf(os.Stderr, "lightcode: memory index summary: %v\n", err)
-		}
 	}
 
 	newActiveStart := unit.lp.LoadHistoryWithSummaryAndActiveTail(result.Summary, result.SummarizerRef, activeStart)
@@ -2721,11 +2661,10 @@ func (a *Agent) assembleSystemPromptForSessionResolved(unit *session, resolved a
 	if unit == nil || a.promptSvc == nil {
 		return prompt.Result{}
 	}
-	spec := prompt.Spec{Size: prompt.SizeFull, Memory: true, Adapt: unit.activeAdapt}
+	spec := prompt.Spec{Size: prompt.SizeFull, Adapt: unit.activeAdapt}
 	if resolveErr == nil {
 		spec.Size = resolved.SystemPrompt
 		spec.Body = resolved.Prompt
-		spec.Memory = resolved.Memory
 	}
 	a.fireDurableReadHook()
 	return a.promptSvc.Assemble(unit.projectRoot, unit.sessionStart, spec)
@@ -4429,10 +4368,9 @@ func waitGroupOrTimeout(wg *sync.WaitGroup, d time.Duration) bool {
 // still-running drainer, then cancels and joins the background goroutines. It
 // is one shared join: every caller waits for the same cleanup, and it runs
 // exactly once. When every turn has actually finished, the live session stores
-// are detached — releasing their claims — and the shared embedder is closed;
-// an abandoned turn keeps both, so a still-running turn never loses its store
-// or hits a closed embedder, and the process-exit boundary releases what
-// shutdown did not.
+// are detached — releasing their claims — while an abandoned turn keeps its
+// claim, so a still-running turn never loses its store; the process-exit
+// boundary releases what shutdown did not.
 //
 // It also closes session-identity admission: closed is published under the
 // lifecycle lock, so every open/resume/new/fork either completes before the
@@ -4518,8 +4456,7 @@ func (a *Agent) ShutdownOwner() bool {
 		// finished. The join is bounded and may return while a turn still runs;
 		// detaching then would release that session's claim under the live turn,
 		// letting another process drive the same saved session — the condition
-		// the active-process marker exists to prevent. The embedder close below
-		// carries the same gate for the same reason. The gate is all-or-nothing
+		// the active-process marker exists to prevent. The gate is all-or-nothing
 		// across every live session; there is deliberately no per-session
 		// tracking.
 		if turnsDrained {
@@ -4533,12 +4470,6 @@ func (a *Agent) ShutdownOwner() bool {
 		bgDrained := waitGroupOrTimeout(&rt.bgWG, shutdownJoinTimeout)
 		if !bgDrained {
 			fmt.Fprintf(os.Stderr, "lightcode: owner shutdown abandoned background workers after %s\n", shutdownJoinTimeout)
-		}
-		// Close the shared embedder only once every turn has actually finished, so
-		// an abandoned turn never hits a closed embedder; a leaked embedder is
-		// released at process exit.
-		if turnsDrained && a.embedder != nil {
-			a.embedder.Close()
 		}
 		// Store the outcome before the close: only the caller that wins the Once
 		// executes this body, so a value returned from inside the Do would reach
@@ -5548,14 +5479,6 @@ func (a *Agent) SessionDelete(id string) error {
 		var committed *snapshot.CommittedMutationError
 		if err != nil && !errors.As(err, &committed) {
 			return err
-		}
-		// The delete committed; a failed summaries removal cannot fail it.
-		// The residue keeps the deleted session's sections and vectors in
-		// search_history, so it is reported rather than dropped.
-		if a.memoryHooks != nil {
-			if cleanupErr := a.memoryHooks.DeleteSessionSummaries(id); cleanupErr != nil {
-				fmt.Fprintf(os.Stderr, "lightcode: delete summaries for session %s: %v\n", id, cleanupErr)
-			}
 		}
 		return err
 	})
@@ -6630,17 +6553,6 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		// walk, and the pre-walk truncation point tells the queue rule whether
 		// any turn was removed.
 		revertOutcome, revertErr := unit.store.RevertHistory(target)
-		// A revert below a compaction boundary invalidates the session's
-		// indexed summary along with the record: search_history would keep
-		// serving a "Full summary" path that no longer resolves. Delete the
-		// session's summaries before the reload, so the eviction path is
-		// covered by the same call. The delete has committed, so a failed
-		// removal cannot fail the revert; the residue is reported to stderr.
-		if revertOutcome.CompactionRemoved && a.memoryHooks != nil {
-			if err := a.memoryHooks.DeleteSessionSummaries(sessionIDOf(unit)); err != nil {
-				fmt.Fprintf(os.Stderr, "lightcode: delete summaries for session %s: %v\n", sessionIDOf(unit), err)
-			}
-		}
 		// HistoryChanged is the durable-mutation predicate from the store. The
 		// operational allocation point is kept separately from the visible
 		// endpoint, which is derived from the successful reload below.
@@ -7686,12 +7598,6 @@ func (a *Agent) setupWarningsLocked() []prompt.Warning {
 		out = append(out, prompt.Warning{
 			Kind:    "setup_model_unavailable",
 			Message: fmt.Sprintf("Configured model %q is unavailable because its provider is not connected or the model is incomplete.", configuredModel),
-		})
-	}
-	if a.embedderDegraded {
-		out = append(out, prompt.Warning{
-			Kind:    "setup_embedder_degraded",
-			Message: "Memory embedder failed to initialize; semantic memory search is disabled.",
 		})
 	}
 	return out

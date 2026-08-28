@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
@@ -28,12 +27,12 @@ const (
 // TestSessionDeleteRefusedWhileAnotherProcessHoldsTheClaim covers delete
 // against a foreign-held claim, beside the archive and sweep rows that
 // already cover contention for their own operations. Delete is the only
-// destructive session operation that also removes summaries, so a refusal
-// that still ran the summaries removal would destroy a live session's
-// history. While a self-exec child owns the claim the delete is refused with
-// the user-facing contention message, the session directory and its indexed
-// summaries are both untouched, and the same delete succeeds once the child
-// releases.
+// destructive session operation that destroys the session's turns and
+// compaction data, so a refusal that still ran the teardown would destroy a
+// live session's history. While a self-exec child owns the claim the delete is
+// refused with the user-facing contention message, the session directory and
+// its compaction data are both untouched, and the same delete succeeds once
+// the child releases.
 func TestSessionDeleteRefusedWhileAnotherProcessHoldsTheClaim(t *testing.T) {
 	const holdBound = 30 * time.Second
 
@@ -78,18 +77,9 @@ func TestSessionDeleteRefusedWhileAnotherProcessHoldsTheClaim(t *testing.T) {
 		t.Fatalf("SessionArchive: %v", err)
 	}
 
-	memStore := memory.NewStoreWithEmbedder(deterministicMemoryEmbedder{}, projectsRoot, first.home)
-	if err := memStore.IndexSummary(id, proj.ID, proj.Name, "## Goal\nsummary body", "now", "/c.json"); err != nil {
-		t.Fatalf("IndexSummary: %v", err)
-	}
-	second.memoryHooks = memStore
-
 	sessionDir := filepath.Join(projectsRoot, proj.ID, "sessions", id)
-	summariesDir := filepath.Join(first.home, ".lightcode", "summaries", id)
-	for _, dir := range []string{sessionDir, summariesDir} {
-		if _, err := os.Stat(dir); err != nil {
-			t.Fatalf("seeded %s: %v", dir, err)
-		}
+	if _, err := os.Stat(sessionDir); err != nil {
+		t.Fatalf("seeded session dir: %v", err)
 	}
 
 	holderCtx, holderCancel := context.WithTimeout(context.Background(), holdBound)
@@ -160,10 +150,8 @@ func TestSessionDeleteRefusedWhileAnotherProcessHoldsTheClaim(t *testing.T) {
 	if err.Error() != want {
 		t.Fatalf("SessionDelete error = %q, want %q\n%s", err.Error(), want, fail())
 	}
-	for _, dir := range []string{sessionDir, summariesDir} {
-		if _, statErr := os.Stat(dir); statErr != nil {
-			t.Fatalf("%s after the refused delete: %v\n%s", dir, statErr, fail())
-		}
+	if _, statErr := os.Stat(sessionDir); statErr != nil {
+		t.Fatalf("session dir after the refused delete: %v\n%s", statErr, fail())
 	}
 
 	if err := reap(); err != nil {
@@ -174,8 +162,5 @@ func TestSessionDeleteRefusedWhileAnotherProcessHoldsTheClaim(t *testing.T) {
 	}
 	if _, err := os.Stat(sessionDir); !os.IsNotExist(err) {
 		t.Fatalf("session dir stat error = %v, want not exist after the delete", err)
-	}
-	if _, err := os.Stat(summariesDir); !os.IsNotExist(err) {
-		t.Fatalf("summaries dir stat error = %v, want not exist after the delete", err)
 	}
 }

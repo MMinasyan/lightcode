@@ -22,7 +22,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/config"
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/lsp"
-	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/tool"
@@ -435,45 +434,6 @@ func TestTaskToolCustomLSPCapabilityControlsLSPTools(t *testing.T) {
 	for _, name := range []string{"diagnostics", "workspace_symbol"} {
 		if _, ok := withoutRegistry.Get(name); ok {
 			t.Fatalf("lsp:false registry contains %s; names=%v", name, taskRegistryToolNames(withoutRegistry))
-		}
-	}
-}
-
-func TestTaskToolMemoryCapabilityControlsMemoryTools(t *testing.T) {
-	task := &taskTool{memoryStore: memory.NewStore(nil, t.TempDir(), t.TempDir())}
-
-	withMemory := task.buildRegistry(agentcfg.Resolved{
-		Tools:  []string{"read_file"},
-		Memory: true,
-	}, parentMutationScope{}, nil)
-	for _, name := range []string{"save_memory", "search_memory", "search_history"} {
-		if _, ok := withMemory.Get(name); !ok {
-			t.Fatalf("memory:true registry missing %s; names=%v", name, taskRegistryToolNames(withMemory))
-		}
-	}
-
-	withoutMemory := task.buildRegistry(agentcfg.Resolved{
-		Tools:  []string{"read_file"},
-		Memory: false,
-	}, parentMutationScope{}, nil)
-	for _, name := range []string{"save_memory", "search_memory", "search_history"} {
-		if _, ok := withoutMemory.Get(name); ok {
-			t.Fatalf("memory:false registry contains %s; names=%v", name, taskRegistryToolNames(withoutMemory))
-		}
-	}
-
-	onlyMemory := task.buildRegistry(agentcfg.Resolved{
-		Tools:  []string{},
-		Memory: true,
-	}, parentMutationScope{}, nil)
-	for _, name := range []string{"save_memory", "search_memory", "search_history"} {
-		if _, ok := onlyMemory.Get(name); !ok {
-			t.Fatalf("tools:[] memory:true registry missing %s; names=%v", name, taskRegistryToolNames(onlyMemory))
-		}
-	}
-	for _, name := range []string{"read_file", "write_file", "edit_file", "run_command", "process", "sleep", "diagnostics", "workspace_symbol"} {
-		if _, ok := onlyMemory.Get(name); ok {
-			t.Fatalf("tools:[] memory:true registry contains non-memory tool %s; names=%v", name, taskRegistryToolNames(onlyMemory))
 		}
 	}
 }
@@ -1564,8 +1524,8 @@ func taskRegistryToolNames(r *tool.Registry) []string {
 	var names []string
 	for _, name := range []string{
 		"read_file", "write_file", "edit_file", "apply_patch", "run_command",
-		"execute_pending", "process", "sleep", "task", "save_memory", "search_memory",
-		"search_history", "diagnostics", "workspace_symbol",
+		"execute_pending", "process", "sleep", "task",
+		"diagnostics", "workspace_symbol",
 	} {
 		if _, ok := r.Get(name); ok {
 			names = append(names, name)

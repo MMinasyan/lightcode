@@ -733,18 +733,6 @@ func formatToolArgs(name, args string) string {
 			return formatHeaderArg(prompt, 80)
 		}
 		return formatHeaderArg(args, 80)
-	case "save_memory":
-		t := extractJSONString(args, "title")
-		if t != "" {
-			return formatHeaderArg(t, 80)
-		}
-		return formatHeaderArg(args, 80)
-	case "search_memory", "search_history":
-		q := extractJSONString(args, "query")
-		if q != "" {
-			return formatHeaderArg(q, 80)
-		}
-		return formatHeaderArg(args, 80)
 	case "diagnostics":
 		return ""
 	case "workspace_symbol":

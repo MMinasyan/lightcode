@@ -28,7 +28,6 @@ type Definition struct {
 	SystemPrompt string    `json:"system_prompt,omitempty"`
 	Prompt       *string   `json:"prompt,omitempty"`
 	Tools        *[]string `json:"tools,omitempty"`
-	Memory       *bool     `json:"memory,omitempty"`
 	LSP          *bool     `json:"lsp,omitempty"`
 	Readonly     *bool     `json:"readonly,omitempty"`
 	WriteDir     *string   `json:"write_dir,omitempty"`
@@ -43,7 +42,6 @@ type Resolved struct {
 	SystemPrompt string
 	Prompt       string
 	Tools        []string
-	Memory       bool
 	LSP          bool
 	Readonly     bool
 	WriteDir     string

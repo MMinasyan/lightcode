@@ -14,7 +14,6 @@ import (
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 	"github.com/MMinasyan/lightcode/internal/lsp"
-	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/process"
 	"github.com/MMinasyan/lightcode/internal/provider"
@@ -66,10 +65,8 @@ type taskTool struct {
 	homeDir       string
 	workspaceRoot string
 	procMgr       *process.Manager
-	memoryStore   *memory.Store
 	projectID     string
 	projectsRoot  string
-	memoriesDir   string
 	lspManager    *lsp.Manager
 	check         tool.CheckFunc
 	ask           tool.AskFunc
@@ -95,10 +92,8 @@ type taskToolConfig struct {
 	HomeDir       string
 	WorkspaceRoot string
 	ProcMgr       *process.Manager
-	MemoryStore   *memory.Store
 	ProjectID     string
 	ProjectsRoot  string
-	MemoriesDir   string
 	LSPManager    *lsp.Manager
 	Check         tool.CheckFunc
 	Ask           tool.AskFunc
@@ -123,10 +118,8 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		homeDir:       cfg.HomeDir,
 		workspaceRoot: cfg.WorkspaceRoot,
 		procMgr:       cfg.ProcMgr,
-		memoryStore:   cfg.MemoryStore,
 		projectID:     cfg.ProjectID,
 		projectsRoot:  cfg.ProjectsRoot,
-		memoriesDir:   cfg.MemoriesDir,
 		lspManager:    cfg.LSPManager,
 		check:         cfg.Check,
 		ask:           cfg.Ask,
@@ -135,13 +128,12 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 	}
 }
 
-func (t *taskTool) setProject(projectID, memoriesDir string) {
+func (t *taskTool) setProject(projectID string) {
 	if t == nil {
 		return
 	}
 	t.mu.Lock()
 	t.projectID = projectID
-	t.memoriesDir = memoriesDir
 	t.mu.Unlock()
 }
 
@@ -640,21 +632,6 @@ func (t *taskTool) newChildTool(name string, readonly bool, scope parentMutation
 		return tool.WrapWithPermission(tool.NewProcessTool(procMgr), check, ask)
 	case "sleep":
 		return tool.WrapWithPermission(tool.Sleep{}, check, ask)
-	case "save_memory":
-		if t.memoryStore == nil {
-			return nil
-		}
-		return tool.WrapWithPermission(tool.NewSaveMemory(t.memoryStore, t.memoriesDir), check, ask)
-	case "search_memory":
-		if t.memoryStore == nil {
-			return nil
-		}
-		return tool.WrapWithPermission(tool.NewSearchMemory(t.memoryStore, t.projectID), check, ask)
-	case "search_history":
-		if t.memoryStore == nil {
-			return nil
-		}
-		return tool.WrapWithPermission(tool.NewSearchHistory(t.memoryStore, t.projectID), check, ask)
 	case "diagnostics":
 		if t.lspManager == nil {
 			return nil
@@ -709,13 +686,6 @@ type taskExposure struct {
 
 func taskToolExposure(at agentcfg.Resolved) taskExposure {
 	tools := append([]string(nil), at.Tools...)
-	if at.Memory {
-		tools = appendToolIfMissing(tools, "save_memory")
-		tools = appendToolIfMissing(tools, "search_memory")
-		tools = appendToolIfMissing(tools, "search_history")
-	} else {
-		tools = removeTools(tools, "save_memory", "search_memory", "search_history")
-	}
 	if at.LSP {
 		tools = appendToolIfMissing(tools, "diagnostics")
 		tools = appendToolIfMissing(tools, "workspace_symbol")

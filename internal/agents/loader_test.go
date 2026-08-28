@@ -34,8 +34,8 @@ func TestResolveBuiltinsInheritThroughPrimary(t *testing.T) {
 	if explore.SystemPrompt != SystemPromptSimple {
 		t.Fatalf("explore system prompt = %q, want simple", explore.SystemPrompt)
 	}
-	if !explore.Memory || !explore.LSP || !explore.Subagent || !explore.Readonly {
-		t.Fatalf("explore booleans = memory:%v lsp:%v subagent:%v readonly:%v", explore.Memory, explore.LSP, explore.Subagent, explore.Readonly)
+	if !explore.LSP || !explore.Subagent || !explore.Readonly {
+		t.Fatalf("explore booleans = lsp:%v subagent:%v readonly:%v", explore.LSP, explore.Subagent, explore.Readonly)
 	}
 
 	review, err := cfg.Resolve("review")
@@ -153,8 +153,8 @@ func TestBuiltinsExposeConcreteRootAndCodeOnlyCompact(t *testing.T) {
 	if primary.SystemPrompt != SystemPromptFull || !reflect.DeepEqual(primary.Tools, StandardTools) {
 		t.Fatalf("primary = %+v, want full prompt and standard tools", primary)
 	}
-	if !primary.Memory || !primary.LSP || primary.Readonly || primary.Subagent {
-		t.Fatalf("primary booleans = memory:%v lsp:%v readonly:%v subagent:%v", primary.Memory, primary.LSP, primary.Readonly, primary.Subagent)
+	if !primary.LSP || primary.Readonly || primary.Subagent {
+		t.Fatalf("primary booleans = lsp:%v readonly:%v subagent:%v", primary.LSP, primary.Readonly, primary.Subagent)
 	}
 
 	compactAgent, err := cfg.Resolve("compact")
@@ -164,7 +164,7 @@ func TestBuiltinsExposeConcreteRootAndCodeOnlyCompact(t *testing.T) {
 	if compactAgent.SystemPrompt != SystemPromptNone || compactAgent.Prompt != compact.DefaultSummarizerPrompt {
 		t.Fatalf("compact prompt = system:%q body:%q", compactAgent.SystemPrompt, compactAgent.Prompt)
 	}
-	if len(compactAgent.Tools) != 0 || compactAgent.Memory || compactAgent.LSP || !compactAgent.Readonly || compactAgent.Subagent {
+	if len(compactAgent.Tools) != 0 || compactAgent.LSP || !compactAgent.Readonly || compactAgent.Subagent {
 		t.Fatalf("compact capability fields = %+v", compactAgent)
 	}
 }

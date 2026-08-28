@@ -19,15 +19,15 @@ func assembleSpec(root, home string, spec Spec) Result {
 	return NewService(home).Assemble(root, testStart, spec)
 }
 
-// assembleFull renders the default full/memory-on prompt for adapt (nil = baseline).
+// assembleFull renders the default full prompt for adapt (nil = baseline).
 func assembleFull(root, home string, adapt *adaptation.Adaptation) Result {
-	return assembleSpec(root, home, Spec{Size: SizeFull, Memory: true, Adapt: adapt})
+	return assembleSpec(root, home, Spec{Size: SizeFull, Adapt: adapt})
 }
 
-// buildFull renders the full/memory-on body directly from rules strings, without
+// buildFull renders the full body directly from rules strings, without
 // reading rules files — used by the section-composition tests.
 func buildFull(root, globalRules, projectRules string, adapt *adaptation.Adaptation) string {
-	return buildSpec(root, testStart, globalRules, projectRules, Spec{Size: SizeFull, Memory: true, Adapt: adapt})
+	return buildSpec(root, testStart, globalRules, projectRules, Spec{Size: SizeFull, Adapt: adapt})
 }
 
 func TestDetectOverrides(t *testing.T) {
@@ -76,7 +76,6 @@ func TestBuildIncludesReadableSectionHeadings(t *testing.T) {
 		"## Rules File Guide",
 		"## Compaction Awareness",
 		"## Environment",
-		"## Memory Instructions",
 		"## Safety",
 		"## Tone",
 		"## Task Execution",
@@ -143,7 +142,7 @@ func TestServiceIsStatelessAcrossProjectsAndSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc := NewService(home)
-	spec := Spec{Size: SizeFull, Memory: true}
+	spec := Spec{Size: SizeFull}
 
 	// Different project roots: each prompt renders its own working directory and
 	// rules; neither leaks the other's.
@@ -175,6 +174,31 @@ func TestServiceIsStatelessAcrossProjectsAndSessions(t *testing.T) {
 	if !strings.Contains(early, testStart.Format("2006-01-02 15:04:05 MST")) ||
 		!strings.Contains(late, otherStart.Format("2006-01-02 15:04:05 MST")) {
 		t.Fatal("session start not rendered per call")
+	}
+}
+
+// TestAssembledBaselinePromptDoesNotAdvertiseMemoryTools is the Step-2 prompt
+// regression: with memory removed, the assembled baseline prompt must not advertise
+// the deleted save_memory / search_memory / search_history tools or any memory
+// tooling. Before removal the rules-file guide and the embedded memory instructions
+// directed the model to use memory tools; both are gone now, so no assembled prompt
+// (full/simple/none) may reintroduce them.
+func TestAssembledBaselinePromptDoesNotAdvertiseMemoryTools(t *testing.T) {
+	home := t.TempDir()
+	root := t.TempDir()
+	for _, size := range []string{SizeFull, SizeSimple, SizeNone} {
+		prompt := assembleSpec(root, home, Spec{Size: size}).Prompt
+		for _, forbidden := range []string{
+			"save_memory",
+			"search_memory",
+			"search_history",
+			"memory tools",
+			"Memory Instructions",
+		} {
+			if strings.Contains(prompt, forbidden) {
+				t.Fatalf("assembled %s prompt still advertises removed memory behavior (%q):\n%s", size, forbidden, prompt)
+			}
+		}
 	}
 }
 

@@ -1814,8 +1814,8 @@ func TestTranscriptCoordinatorSessionErrorRetention(t *testing.T) {
 // publishCompactionRewrite, which is unexported and not adapter-facing. The
 // exported route CompactNowForSession reaches the same boundary only after a
 // live multi-turn session, a model server, and a summarizer round-trip — none
-// of which participate in the pruning contract, and that full route is already
-// exercised end-to-end by TestCompactionIndexesSelectedSessionProject.
+// of which participate in the pruning contract; that full route is covered by
+// the existing CompactNowForSession regression coverage.
 func TestSessionErrorRetentionContract(t *testing.T) {
 	t.Run("attribution=compacted_away", func(t *testing.T) {
 		a := newLiveCatalogBackedTestAgent(t)

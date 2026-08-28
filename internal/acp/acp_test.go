@@ -27,7 +27,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	lcconfig "github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
@@ -4496,7 +4495,7 @@ func newACPTestAgentAtHome(t *testing.T, baseURL string, discovery bool, home st
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: func(string) (*memory.Embedder, error) { return nil, nil }})
+	a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
@@ -5819,7 +5818,7 @@ func newACPTaskAgent(t *testing.T, baseURL string) *agent.Agent {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: func(string) (*memory.Embedder, error) { return nil, nil }})
+	a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}

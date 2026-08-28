@@ -9,7 +9,6 @@ var builtins = map[string]Definition{
 		SystemPrompt: SystemPromptFull,
 		Prompt:       stringPtr(""),
 		Tools:        toolsPtr(StandardTools),
-		Memory:       boolPtr(true),
 		LSP:          boolPtr(true),
 		Readonly:     boolPtr(false),
 		WriteDir:     stringPtr(""),
@@ -19,7 +18,6 @@ var builtins = map[string]Definition{
 	"secondary": {
 		SystemPrompt: SystemPromptSimple,
 		Prompt:       stringPtr(secondaryPrompt),
-		Memory:       boolPtr(true),
 		LSP:          boolPtr(true),
 		Readonly:     boolPtr(false),
 		Description:  stringPtr(secondaryDescription),
@@ -40,7 +38,6 @@ var builtins = map[string]Definition{
 		SystemPrompt: SystemPromptNone,
 		Prompt:       stringPtr(compact.DefaultSummarizerPrompt),
 		Tools:        toolsPtr(nil),
-		Memory:       boolPtr(false),
 		LSP:          boolPtr(false),
 		Readonly:     boolPtr(true),
 		WriteDir:     stringPtr(""),

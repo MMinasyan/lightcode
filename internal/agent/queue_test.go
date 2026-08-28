@@ -556,7 +556,6 @@ func TestCompactNowNudgesQueueDrainer(t *testing.T) {
 	defer server.Close()
 
 	a := newEventOrderAgent(t, server.URL+"/v1")
-	a.memoryStore = nil
 	cap := &eventCapture{}
 	ctx := startEventOrderAgent(t, a, cap)
 	appendUserTurn(t, a, "before compaction")
@@ -623,7 +622,6 @@ func TestAutoCompactionEventOrderInsideTurn(t *testing.T) {
 	defer server.Close()
 
 	a := newEventOrderAgent(t, server.URL+"/v1")
-	a.memoryHooks = nil
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	a.SetEventHandler(func(Event) {})
@@ -728,7 +726,6 @@ func TestAutoCompactionBeforeFollowUpPreservesActiveToolTail(t *testing.T) {
 	defer server.Close()
 
 	a := newEventOrderAgent(t, server.URL+"/v1")
-	a.memoryHooks = nil
 	cap := &eventCapture{}
 	ctx := startEventOrderAgent(t, a, cap)
 	// Bootstrap the session first: newSession builds a fresh registry, so the
@@ -821,7 +818,6 @@ func TestAutoCompactionBeforeFollowUpPreservesActiveReadTracker(t *testing.T) {
 	}
 	rulePath := "//" + strings.TrimPrefix(filePath, "/")
 	a.cfg.Permissions.Allow = []string{"read_file(" + rulePath + ")", "edit_file(" + rulePath + ")"}
-	a.memoryHooks = nil
 	cap := &eventCapture{}
 	ctx := startEventOrderAgent(t, a, cap)
 

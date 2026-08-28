@@ -151,7 +151,7 @@ func TestPR11Closure_ViewerReadAcceptsSymlinkedProjectRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	a, err := New(Config{Cfg: cfg, ProjectRoot: symlinkRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
+	a, err := New(Config{Cfg: cfg, ProjectRoot: symlinkRoot, Home: home})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}

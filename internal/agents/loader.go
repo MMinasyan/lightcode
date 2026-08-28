@@ -231,9 +231,6 @@ func applyDefinition(out *Resolved, def Definition) {
 	if def.Tools != nil {
 		out.Tools = append([]string(nil), (*def.Tools)...)
 	}
-	if def.Memory != nil {
-		out.Memory = *def.Memory
-	}
 	if def.LSP != nil {
 		out.LSP = *def.LSP
 	}
@@ -363,9 +360,6 @@ func copyDefinition(def Definition) Definition {
 	}
 	if def.Tools != nil {
 		def.Tools = toolsPtr(*def.Tools)
-	}
-	if def.Memory != nil {
-		def.Memory = boolPtr(*def.Memory)
 	}
 	if def.LSP != nil {
 		def.LSP = boolPtr(*def.LSP)

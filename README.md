@@ -33,7 +33,7 @@
 
 Lightcode uses the OpenAI Chat Completions shape with streaming and tool calls. Provider compatibility still varies: some OpenAI-compatible models stream text correctly but do not reliably support streamed tool calls. Test a new provider/model with a real tool call before relying on it.
 
-**Tools** — `read_file` · `write_file` · `edit_file` · `apply_patch` · `run_command` · `execute_pending` · `process` · `sleep` · `save_memory` · `search_memory` · `search_history` · `diagnostics` · `workspace_symbol` · `task`
+**Tools** — `read_file` · `write_file` · `edit_file` · `apply_patch` · `run_command` · `execute_pending` · `process` · `sleep` · `diagnostics` · `workspace_symbol` · `task`
 
 **Snapshots** — Every file edit is snapshotted by turn. Revert code, revert history, or fork from any point. Copy-based, no git dependency.
 
@@ -44,8 +44,6 @@ Lightcode uses the OpenAI Chat Completions shape with streaming and tool calls. 
 **LSP** — Diagnostics and symbol search across Go, Python, TypeScript/JS, Rust, C/C++, C#. Auto-detected; servers auto-installed where supported.
 
 **Subagents** — Delegate tasks to concurrent LLM loops with scoped tools and independent context.
-
-**Memory** — Save and search project and global memories across sessions using embedded vector search (no external service).
 
 ---
 
@@ -69,7 +67,7 @@ Linux amd64 on Debian/Ubuntu and Fedora is the first supported release target. m
 
 #### Build from source
 
-Source builds are for development. They require Go 1.26+, Node.js, [Wails v2](https://wails.io/docs/gettingstarted/installation), Git LFS, and WebKitGTK development headers.
+Source builds are for development. They require Go 1.26+, Node.js, [Wails v2](https://wails.io/docs/gettingstarted/installation), and WebKitGTK development headers.
 
 ```bash
 # Debian / Ubuntu build dependencies
@@ -78,7 +76,6 @@ sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev
 ```
 
 ```bash
-git lfs pull
 wails build -tags webkit2_41
 ```
 
