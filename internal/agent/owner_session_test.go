@@ -679,6 +679,10 @@ func TestSessionsUseTheirProjectRoot(t *testing.T) {
 	}
 
 	first := newCatalogBackedTestAgentForRoot(t, home, firstRoot)
+	writeAgentsTestConfig(t, first.configPath, `{"primary": {"model": "test/test-model"}, "notes": {"readonly": true, "write_dir": "notes"}}`)
+	if err := first.Reload(); err != nil {
+		t.Fatalf("reload agents config: %v", err)
+	}
 	secondTarget := filepath.Join(secondRoot, "target.txt")
 	first.cfg.Permissions.Allow = []string{
 		"read_file(//" + strings.TrimPrefix(secondTarget, "/") + ")",
@@ -692,8 +696,8 @@ func TestSessionsUseTheirProjectRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensure second project: %v", err)
 	}
-	secondPlanTarget := filepath.Join(first.projects.Root(), secondProjectID.ID, "plans", "plan.md")
-	first.cfg.Permissions.Allow = append(first.cfg.Permissions.Allow, "write_file(//"+strings.TrimPrefix(secondPlanTarget, "/")+")")
+	secondNoteTarget := filepath.Join(secondRoot, "notes", "note.md")
+	first.cfg.Permissions.Allow = append(first.cfg.Permissions.Allow, "write_file(//"+strings.TrimPrefix(secondNoteTarget, "/")+")")
 
 	secondID, err := first.NewSession(secondProjectID.ID, "primary")
 	if err != nil {
@@ -729,30 +733,30 @@ func TestSessionsUseTheirProjectRoot(t *testing.T) {
 		t.Fatalf("run_command output = %q, want second project root only", out)
 	}
 
-	planID, err := first.NewSession(secondProjectID.ID, "plan")
+	notesID, err := first.NewSession(secondProjectID.ID, "notes")
 	if err != nil {
-		t.Fatalf("NewSession plan second project: %v", err)
+		t.Fatalf("NewSession notes second project: %v", err)
 	}
 	first.ensureRuntime().mu.Lock()
-	plan := first.sessions[planID]
-	writeTool, ok := plan.registry.Get("write_file")
+	notes := first.sessions[notesID]
+	writeTool, ok := notes.registry.Get("write_file")
 	first.ensureRuntime().mu.Unlock()
 	if !ok {
-		t.Fatal("write_file not registered on second project plan session")
+		t.Fatal("write_file not registered on second project notes session")
 	}
-	turn := plan.store.BeginTurn()
-	if _, err := writeTool.Execute(context.Background(), map[string]any{"path": secondPlanTarget, "content": "second project plan"}); err != nil {
-		t.Fatalf("write_file second project plan: %v", err)
+	turn := notes.store.BeginTurn()
+	if _, err := writeTool.Execute(context.Background(), map[string]any{"path": secondNoteTarget, "content": "second project note"}); err != nil {
+		t.Fatalf("write_file second project note: %v", err)
 	}
-	if err := plan.store.MarkTurnComplete(turn); err != nil {
-		t.Fatalf("complete plan write turn: %v", err)
+	if err := notes.store.MarkTurnComplete(turn); err != nil {
+		t.Fatalf("complete note write turn: %v", err)
 	}
-	data, err := os.ReadFile(secondPlanTarget)
+	data, err := os.ReadFile(secondNoteTarget)
 	if err != nil {
-		t.Fatalf("read second project plan: %v", err)
+		t.Fatalf("read second project note: %v", err)
 	}
-	if got := string(data); got != "second project plan" {
-		t.Fatalf("second project plan content = %q, want written content", got)
+	if got := string(data); got != "second project note" {
+		t.Fatalf("second project note content = %q, want written content", got)
 	}
 }
 
@@ -885,6 +889,25 @@ func TestCompactTypeCannotBeStartedByUser(t *testing.T) {
 	_, err := a.NewSession("", "compact")
 	if err == nil || !strings.Contains(err.Error(), `agent type "compact" cannot be started as a session`) {
 		t.Fatalf("NewSession compact error = %v, want code-only rejection", err)
+	}
+}
+
+func TestNewSessionRejectsUnknownAgentTypeBeforeUnitWork(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession primary: %v", err)
+	}
+
+	sid, err := a.NewSession("", "plan")
+	if sid != "" || err == nil || !strings.Contains(err.Error(), `unknown agent type`) {
+		t.Fatalf(`NewSession plan = (%q, %v), want admission failure for the unknown agent type`, sid, err)
+	}
+
+	a.ensureRuntime().mu.Lock()
+	units := len(a.sessions)
+	a.ensureRuntime().mu.Unlock()
+	if units != 1 {
+		t.Fatalf("live sessions after rejected creation = %d, want only the primary unit", units)
 	}
 }
 

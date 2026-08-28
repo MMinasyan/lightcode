@@ -66,12 +66,6 @@ func (w Warning) Error() string {
 	return fmt.Sprintf("%s: %s", w.Name, w.Message)
 }
 
-// ResolveContext carries values needed to resolve project-dependent built-ins.
-type ResolveContext struct {
-	Home      string
-	ProjectID string
-}
-
 func boolPtr(v bool) *bool { return &v }
 
 func stringPtr(v string) *string { return &v }

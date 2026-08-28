@@ -757,13 +757,12 @@ func removeTools(tools []string, names ...string) []string {
 func (t *taskTool) availableAgentTypes() []agentcfg.Resolved {
 	t.mu.Lock()
 	cfg := t.agentTypes
-	ctx := agentcfg.ResolveContext{Home: t.homeDir, ProjectID: t.projectID}
 	t.mu.Unlock()
 
 	if cfg == nil {
 		return nil
 	}
-	all := cfg.All(ctx)
+	all := cfg.All()
 	out := make([]agentcfg.Resolved, 0, len(all))
 	for _, at := range all {
 		if at.Subagent {
@@ -776,13 +775,12 @@ func (t *taskTool) availableAgentTypes() []agentcfg.Resolved {
 func (t *taskTool) resolveAgentType(name string) (agentcfg.Resolved, error) {
 	t.mu.Lock()
 	cfg := t.agentTypes
-	ctx := agentcfg.ResolveContext{Home: t.homeDir, ProjectID: t.projectID}
 	t.mu.Unlock()
 
 	if cfg == nil {
 		return agentcfg.Resolved{}, fmt.Errorf("agent types are not configured")
 	}
-	at, err := cfg.Resolve(name, ctx)
+	at, err := cfg.Resolve(name)
 	if err != nil {
 		return agentcfg.Resolved{}, err
 	}

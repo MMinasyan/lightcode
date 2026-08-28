@@ -734,17 +734,16 @@ type rootUnitSnapshot struct {
 }
 
 // rootUnitSnapshotLocked captures the reloadable configuration for a fresh
-// running unit under rt.mu: the resolved agent type (resolved against an
-// explicit resolve context so no project metadata is read under the lock),
+// running unit under rt.mu: the resolved agent type (a pure in-memory read),
 // the agent-config/catalog/config pointers, the tools config and subagent
 // limit values, and the tagged-event channel. Caller holds rt.mu.
-func (a *Agent) rootUnitSnapshotLocked(rt *runtime, activeAgentType, projectID string) rootUnitSnapshot {
+func (a *Agent) rootUnitSnapshotLocked(rt *runtime, activeAgentType string) rootUnitSnapshot {
 	snap := rootUnitSnapshot{
 		agentTypes:   a.agents,
 		modelCatalog: a.catalog,
 		cfg:          a.cfg,
 	}
-	snap.resolved, snap.resolveErr = a.resolvedAgentTypeWithContextLocked(activeAgentType, agentcfg.ResolveContext{Home: a.home, ProjectID: projectID})
+	snap.resolved, snap.resolveErr = a.resolvedAgentTypeLocked(activeAgentType)
 	if snap.cfg != nil {
 		snap.toolsConfig = snap.cfg.Tools
 		snap.maxConcurrent = snap.cfg.Subagents.MaxConcurrent
@@ -775,10 +774,9 @@ type rootUnitModelInstall struct {
 // connected/configured it builds the ref/client/context-window/adaptation
 // value (adaptation via the nil-safe resolveAdaptation); when no usable model
 // exists it returns nil, exactly the no-model state newSession preserves
-// today. No network or durable I/O runs under the lock (the resolve context is
-// explicit). Caller holds rt.mu.
-func (a *Agent) preparedModelForLocked(agentType, projectID string) *rootUnitModelInstall {
-	resolved, err := a.resolvedAgentTypeWithContextLocked(agentType, agentcfg.ResolveContext{Home: a.home, ProjectID: projectID})
+// today. No network or durable I/O runs under the lock. Caller holds rt.mu.
+func (a *Agent) preparedModelForLocked(agentType string) *rootUnitModelInstall {
+	resolved, err := a.resolvedAgentTypeLocked(agentType)
 	if err != nil || resolved.Model == "" {
 		return nil
 	}
@@ -969,7 +967,7 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 		projectRoot = a.projectRoot
 	}
 	rt := a.ensureRuntime()
-	snap := a.rootUnitSnapshotLocked(rt, activeAgentType, projectID)
+	snap := a.rootUnitSnapshotLocked(rt, activeAgentType)
 	if snap.resolveErr != nil {
 		return nil, nil, snap.resolveErr
 	}
@@ -999,7 +997,7 @@ func (a *Agent) compactRunningUnitForSession(parent *session) (*session, int, er
 		ref = compactRef
 	}
 	compactPrompt := compact.DefaultSummarizerPrompt
-	if resolved, err := a.resolvedAgentTypeForProjectLocked("compact", parent.projectID); err == nil && strings.TrimSpace(resolved.Prompt) != "" {
+	if resolved, err := a.resolvedAgentTypeLocked("compact"); err == nil && strings.TrimSpace(resolved.Prompt) != "" {
 		compactPrompt = strings.TrimSpace(resolved.Prompt)
 	}
 	client, model, err := newProviderClient(a.catalog, ref)
@@ -2680,18 +2678,11 @@ func (a *Agent) refreshSystemPromptForSession(unit *session) {
 	// switch (applyReloadStateLocked -> setAgentTypesLocked), and this runs on
 	// the turn goroutine without that lock. Resolve the agent type under
 	// runtime.mu and copy the resolved values out: resolution is a pure
-	// in-memory read, so only it runs under the lock. The resolve context is
-	// built first because the current project id is a durable read, and the
-	// prompt assembly (rules-file I/O) runs after release.
-	ctx := agentcfg.ResolveContext{Home: a.home}
-	if a.projects != nil {
-		if proj, err := a.projects.Current(); err == nil && proj != nil {
-			ctx.ProjectID = proj.ID
-		}
-	}
+	// in-memory read, so only it runs under the lock; the prompt assembly
+	// (rules-file I/O) runs after release.
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
-	resolved, resolveErr := a.resolvedAgentTypeWithContextLocked(agentType, ctx)
+	resolved, resolveErr := a.resolvedAgentTypeLocked(agentType)
 	rt.mu.Unlock()
 	res := a.assembleSystemPromptForSessionResolved(unit, resolved, resolveErr)
 	if res.Prompt != unit.installedPrompt {
@@ -5009,7 +5000,7 @@ func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummar
 		rt.mu.Unlock()
 		return SessionSummary{}, err
 	}
-	snap := a.rootUnitSnapshotLocked(rt, "primary", proj.ID)
+	snap := a.rootUnitSnapshotLocked(rt, "primary")
 	if snap.resolveErr != nil {
 		rt.mu.Unlock()
 		return SessionSummary{}, snap.resolveErr
@@ -5256,14 +5247,14 @@ func (a *Agent) newSessionInProject(proj *project.Project, agentType string, emi
 		if typeName == "" {
 			typeName = "primary"
 		}
-		snap := a.rootUnitSnapshotLocked(rt, typeName, proj.ID)
+		snap := a.rootUnitSnapshotLocked(rt, typeName)
 		if snap.resolveErr != nil {
 			return "", rootUnitSnapshot{}, nil, snap.resolveErr
 		}
 		if snap.resolved.Name == "compact" {
 			return "", rootUnitSnapshot{}, nil, fmt.Errorf("agent type %q cannot be started as a session", snap.resolved.Name)
 		}
-		return snap.resolved.Name, snap, a.preparedModelForLocked(snap.resolved.Name, proj.ID), nil
+		return snap.resolved.Name, snap, a.preparedModelForLocked(snap.resolved.Name), nil
 	}()
 	if err != nil {
 		return "", err
@@ -7120,7 +7111,7 @@ func (a *Agent) forkUnitAtTurn(unit *session, turn int) (candidate *session, pre
 		if err != nil {
 			return forkSourceSnapshot{}, rootUnitSnapshot{}, err
 		}
-		snap := a.rootUnitSnapshotLocked(rt, src.agentType, src.projectID)
+		snap := a.rootUnitSnapshotLocked(rt, src.agentType)
 		if snap.resolveErr != nil {
 			return forkSourceSnapshot{}, rootUnitSnapshot{}, snap.resolveErr
 		}
@@ -7620,39 +7611,16 @@ func (a *Agent) modelRefConnected(ref coremodel.ModelRef) bool {
 	return providerConnected(prov)
 }
 
-func (a *Agent) agentResolveContextLocked() agentcfg.ResolveContext {
-	ctx := agentcfg.ResolveContext{Home: a.home}
-	if a.projects != nil {
-		if proj, err := a.projects.Current(); err == nil && proj != nil {
-			ctx.ProjectID = proj.ID
-		}
-	}
-	return ctx
-}
-
-func (a *Agent) resolvedAgentTypeLocked(name string) (agentcfg.Resolved, error) {
-	return a.resolvedAgentTypeForProjectLocked(name, "")
-}
-
-func (a *Agent) resolvedAgentTypeForProjectLocked(name string, projectID string) (agentcfg.Resolved, error) {
-	ctx := a.agentResolveContextLocked()
-	if strings.TrimSpace(projectID) != "" {
-		ctx.ProjectID = projectID
-	}
-	return a.resolvedAgentTypeWithContextLocked(name, ctx)
-}
-
-// resolvedAgentTypeWithContextLocked resolves one agent type against the agents
-// config. The config is written under runtime.mu (applyReloadStateLocked ->
+// resolvedAgentTypeLocked resolves one agent type against the agents config.
+// The config is written under runtime.mu (applyReloadStateLocked ->
 // setAgentTypesLocked), so the caller must hold runtime.mu across this call;
 // resolution is a pure in-memory read returning a value copy, never pointers
-// into the config. The resolve context is prebuilt by the caller so no durable
-// read (the current project id) runs under the lock.
-func (a *Agent) resolvedAgentTypeWithContextLocked(name string, ctx agentcfg.ResolveContext) (agentcfg.Resolved, error) {
+// into the config.
+func (a *Agent) resolvedAgentTypeLocked(name string) (agentcfg.Resolved, error) {
 	if a.agents == nil {
 		return agentcfg.Resolved{}, fmt.Errorf("agents config is not loaded")
 	}
-	return a.agents.Resolve(name, ctx)
+	return a.agents.Resolve(name)
 }
 
 func (a *Agent) resolvedAgentModelLocked(name string) (coremodel.ModelRef, string, bool) {

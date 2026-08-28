@@ -367,7 +367,7 @@ func TestTaskToolBuiltInExploreUsesResolvedCapabilities(t *testing.T) {
 		check:      func(string, string) permission.Decision { return permission.DecisionAllow },
 		lspManager: lsp.NewManager(t.TempDir(), t.TempDir()),
 	}
-	at, err := agents.Resolve("explore", agentcfg.ResolveContext{})
+	at, err := agents.Resolve("explore")
 	if err != nil {
 		t.Fatalf("resolve explore: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestTaskToolCustomLSPCapabilityControlsLSPTools(t *testing.T) {
 	}`)
 	task := &taskTool{lspManager: lsp.NewManager(t.TempDir(), t.TempDir())}
 
-	withLSP, err := agents.Resolve("with_lsp", agentcfg.ResolveContext{})
+	withLSP, err := agents.Resolve("with_lsp")
 	if err != nil {
 		t.Fatalf("resolve with_lsp: %v", err)
 	}
@@ -427,7 +427,7 @@ func TestTaskToolCustomLSPCapabilityControlsLSPTools(t *testing.T) {
 		}
 	}
 
-	withoutLSP, err := agents.Resolve("without_lsp", agentcfg.ResolveContext{})
+	withoutLSP, err := agents.Resolve("without_lsp")
 	if err != nil {
 		t.Fatalf("resolve without_lsp: %v", err)
 	}

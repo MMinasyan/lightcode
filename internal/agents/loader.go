@@ -15,11 +15,10 @@ import (
 const emptyAgentsTemplate = "{}\n"
 
 var allowedTools = func() map[string]struct{} {
-	out := make(map[string]struct{}, len(StandardTools)+1)
+	out := make(map[string]struct{}, len(StandardTools))
 	for _, name := range StandardTools {
 		out[name] = struct{}{}
 	}
-	out[submitPlanTool] = struct{}{}
 	return out
 }()
 
@@ -141,21 +140,21 @@ func (c *Config) Warnings() []Warning {
 	return append([]Warning(nil), c.warnings...)
 }
 
-func (c *Config) Resolve(name string, ctx ResolveContext) (Resolved, error) {
+func (c *Config) Resolve(name string) (Resolved, error) {
 	if c == nil {
 		return Resolved{}, fmt.Errorf("unknown agent type %q", name)
 	}
-	return c.resolve(name, ctx, map[string]bool{})
+	return c.resolve(name, map[string]bool{})
 }
 
-func (c *Config) All(ctx ResolveContext) []Resolved {
+func (c *Config) All() []Resolved {
 	if c == nil {
 		return nil
 	}
 	var out []Resolved
 	seen := map[string]bool{}
 	for _, name := range builtinOrder {
-		resolved, err := c.Resolve(name, ctx)
+		resolved, err := c.Resolve(name)
 		if err == nil {
 			out = append(out, resolved)
 			seen[name] = true
@@ -169,7 +168,7 @@ func (c *Config) All(ctx ResolveContext) []Resolved {
 	}
 	sort.Strings(custom)
 	for _, name := range custom {
-		resolved, err := c.Resolve(name, ctx)
+		resolved, err := c.Resolve(name)
 		if err == nil {
 			out = append(out, resolved)
 		}
@@ -194,7 +193,7 @@ func (c *Config) applyBuiltinOverlay(name string, def Definition) {
 	c.defs[name] = current
 }
 
-func (c *Config) resolve(name string, ctx ResolveContext, seen map[string]bool) (Resolved, error) {
+func (c *Config) resolve(name string, seen map[string]bool) (Resolved, error) {
 	def, ok := c.defs[name]
 	if !ok {
 		return Resolved{}, fmt.Errorf("unknown agent type %q", name)
@@ -207,7 +206,7 @@ func (c *Config) resolve(name string, ctx ResolveContext, seen map[string]bool) 
 	var out Resolved
 	parent := parentName(name)
 	if parent != "" {
-		inherited, err := c.resolve(parent, ctx, seen)
+		inherited, err := c.resolve(parent, seen)
 		if err != nil {
 			return Resolved{}, err
 		}
@@ -215,11 +214,11 @@ func (c *Config) resolve(name string, ctx ResolveContext, seen map[string]bool) 
 	}
 	out.Name = name
 	out.Builtin = isBuiltin(name)
-	applyDefinition(&out, def, ctx)
+	applyDefinition(&out, def)
 	return out, nil
 }
 
-func applyDefinition(out *Resolved, def Definition, ctx ResolveContext) {
+func applyDefinition(out *Resolved, def Definition) {
 	if def.Model != "" {
 		out.Model = def.Model
 	}
@@ -242,7 +241,7 @@ func applyDefinition(out *Resolved, def Definition, ctx ResolveContext) {
 		out.Readonly = *def.Readonly
 	}
 	if def.WriteDir != nil {
-		out.WriteDir = expandWriteDir(*def.WriteDir, ctx)
+		out.WriteDir = *def.WriteDir
 	}
 	if def.Description != nil {
 		out.Description = *def.Description
@@ -338,7 +337,7 @@ func parentName(name string) string {
 	switch name {
 	case "primary":
 		return ""
-	case "secondary", "plan":
+	case "secondary":
 		return "primary"
 	default:
 		return "secondary"
@@ -348,16 +347,6 @@ func parentName(name string) string {
 func isBuiltin(name string) bool {
 	_, ok := builtins[name]
 	return ok
-}
-
-func expandWriteDir(value string, ctx ResolveContext) string {
-	if value != projectPlansWriteDir {
-		return value
-	}
-	if ctx.Home == "" || ctx.ProjectID == "" {
-		return "~/.lightcode/projects/<project-id>/plans/"
-	}
-	return filepath.Join(ctx.Home, ".lightcode", "projects", ctx.ProjectID, "plans")
 }
 
 func copyBuiltins() map[string]Definition {

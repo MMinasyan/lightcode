@@ -279,7 +279,7 @@ func providerChecks(cat *catalog.Catalog, dotenvKeys map[string]bool, lookupEnv 
 // setupModelCheck mirrors the agent's no-model / model-unavailable
 // unavailable warnings, which are mutually exclusive.
 func setupModelCheck(agentsCfg *agentcfg.Config, cat *catalog.Catalog, envIsSet func(string) bool, add func(group, name, status, detail string)) {
-	resolved, err := agentsCfg.Resolve("primary", agentcfg.ResolveContext{})
+	resolved, err := agentsCfg.Resolve("primary")
 	if err != nil {
 		add("setup", "model", StatusWarn, err.Error())
 		return
