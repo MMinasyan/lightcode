@@ -13,18 +13,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// applyPatchApplyAtRoot is the shared engine for immediate and staged
-// apply_patch execution. The flow is validate-first all-or-nothing: every op
-// is resolved and located against current files before any mutation. The only
-// path to a partial apply is a mid-write I/O error after validation passed; on
-// that rare failure, committed files stay on disk, remain snapshotted, and are
-// recoverable via turn revert. Partial failures return *ExitError carrying the
-// committed-files A/M/D summary for model-visible output.
+// applyPatchApplyAtRoot is the shared engine for apply_patch execution. The
+// flow is validate-first all-or-nothing: every op is resolved and located
+// against current files before any mutation. The only path to a partial apply
+// is a mid-write I/O error after validation passed; on that rare failure,
+// committed files stay on disk, remain snapshotted, and are recoverable via
+// turn revert. Partial failures return *ExitError carrying the committed-files
+// A/M/D summary for model-visible output.
 //
 // The engine captures per-op pre/post/hunk data during apply and returns it as
-// the second value. Callers attach those previews to immediate or staged
-// display metadata so renderers do not need post-write disk reads. Read-after-
-// apply is not viable for updates, deletes, or moves.
+// the second value. Callers attach those previews to display metadata so
+// renderers do not need post-write disk reads. Read-after-apply is not viable
+// for updates, deletes, or moves.
 func applyPatchApplyAtRoot(ctx context.Context, root string, store SnapshotStore, tracker *FileTracker, params map[string]any) (string, []appliedFilePreview, error) {
 	p, targets, err := validateApplyPatchReceipt(root, params)
 	if err != nil {

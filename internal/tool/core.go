@@ -9,8 +9,7 @@ import (
 // the single source of truth for these four tools; both the main agent
 // (agent.go) and the subagent (task.go) build their tool registries from
 // it so apply_patch enters the system through the same construction path
-// as every other core tool. execute_pending stays inline at each call site
-// because it has no snapshot/tracker wiring and is a one-liner.
+// as every other core tool.
 func CoreTools(
 	store SnapshotStore,
 	tracker *FileTracker,

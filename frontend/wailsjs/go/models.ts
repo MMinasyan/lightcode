@@ -1198,10 +1198,7 @@ export namespace permission {
 	    tool: string;
 	    args: string;
 	    resolved_arg?: string;
-	    can_allow_all?: boolean;
 	    disable_project_save?: boolean;
-	    batch_index?: number;
-	    batch_total?: number;
 	    batch_files?: string[];
 	    batch_resolved_files?: string[];
 
@@ -1217,10 +1214,7 @@ export namespace permission {
 	        this.tool = source["tool"];
 	        this.args = source["args"];
 	        this.resolved_arg = source["resolved_arg"];
-	        this.can_allow_all = source["can_allow_all"];
 	        this.disable_project_save = source["disable_project_save"];
-	        this.batch_index = source["batch_index"];
-	        this.batch_total = source["batch_total"];
 	        this.batch_files = source["batch_files"];
 	        this.batch_resolved_files = source["batch_resolved_files"];
 	    }

@@ -244,18 +244,6 @@ type Loop struct {
 
 	droppedEvents int
 
-	// pendingQueue holds staged tool calls for batch execution. Created fresh
-	// per turn.
-	pendingQueue *tool.PendingQueue
-
-	// consumedFlushResults accumulates the BatchResults of staged flushes
-	// triggered during one assistant message's tool dispatch (explicit flush
-	// or a flush-before-a-non-pending-tool). The Run dispatch loop persists a
-	// single <staged-flush> wrapper from these after the loop and resets it.
-	consumedFlushResults []tool.BatchResult
-
-	pendingExecutor tool.PendingExecutor
-
 	signalMu       sync.Mutex
 	pendingSignals []PendingSignal
 
@@ -316,18 +304,6 @@ func (l *Loop) SetContextTransformer(t ContextTransformer) { l.contextTransforme
 
 // SetUsageRecorder configures synchronous usage observation.
 func (l *Loop) SetUsageRecorder(r UsageRecorder) { l.usageRecorder = r }
-
-// SetPendingExecutor configures the executor used to flush staged calls.
-func (l *Loop) SetPendingExecutor(exec tool.PendingExecutor) {
-	l.pendingExecutor = exec
-	if l.registry != nil {
-		if coordinator, ok := l.registry.PendingCoordinator(); ok {
-			if setter, ok := coordinator.(interface{ SetPendingExecutor(tool.PendingExecutor) }); ok {
-				setter.SetPendingExecutor(exec)
-			}
-		}
-	}
-}
 
 func (l *Loop) emit(ev Event) {
 	if ev.Kind == Usage && l.usageRecorder != nil {
@@ -719,10 +695,6 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 		turn = l.store.CurrentTurn()
 	}
 
-	// Fresh pending queue per turn.
-	l.pendingQueue = tool.NewPendingQueue()
-	l.consumedFlushResults = nil
-
 	activeTurnStart := len(l.messages)
 	l.turnBoundaries = append(l.turnBoundaries, activeTurnStart)
 	l.DrainPendingSignalsForModel(turn)
@@ -777,7 +749,6 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 				l.messages = append(l.messages, msg)
 				l.persistMessage(turn, msg)
 			}
-			l.pendingQueue.Discard()
 			l.EnsureInterruptedSignal(turn)
 			return assistantVisibleText(msg), nil
 		}
@@ -792,18 +763,12 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 			l.activeAdapt.LeakPattern.MatchString(msg.TextContent())
 
 		if len(msg.ToolCalls) == 0 {
-			if l.pendingQueue.Len() > 0 {
-				results, err := l.flushPendingAtTurnEnd(ctx)
-				if err != nil {
-					return "", fmt.Errorf("flush pending at turn end: %w", err)
-				}
-				l.appendStagedFlushWrapper(turn, results)
-			}
 			// Pure leak: queue the steering signal (only on a non-final iteration so
-			// it cannot strand undrained) and continue. Queued after the flush so a
-			// flush error never strands a signal; the explicit continue means a
-			// detected leak never returns the leaked text, and a final-iteration leak
-			// exhausts the loop to the cap error below instead of stalling.
+			// it cannot strand undrained) and continue. The signal is drained at the
+			// next iteration's DrainPendingSignalsForModel, so it reaches the next
+			// model request in order; the explicit continue means a detected leak
+			// never returns the leaked text, and a final-iteration leak exhausts the
+			// loop to the cap error below instead of stalling.
 			if leaked {
 				if iter < maxIterations-1 {
 					l.AddPendingSignal(PendingSignal{Payload: leakRecoverySignal, Wake: true, Persist: true})
@@ -834,14 +799,6 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 				denied = true
 				break
 			}
-		}
-		// Persist the <staged-flush> wrapper for any flushes triggered during
-		// this assistant message's dispatch, BEFORE the denied early-return:
-		// a flush-before-a-denied-tool already emitted the real staged results
-		// live, so the wrapper must reach history or reload would stay "Staged.".
-		if len(l.consumedFlushResults) > 0 {
-			l.appendStagedFlushWrapper(turn, l.consumedFlushResults)
-			l.consumedFlushResults = nil
 		}
 		// Mixed leak: a leaked tool call alongside ≥1 valid structured call (already
 		// executed above). Queue the steering signal so it rides the next request,
@@ -1171,10 +1128,10 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) dispatchResult
 
 	// Advertisement gate: a registered tool the active adaptation withholds
 	// (excluded, or hidden and not included) is rejected here — ahead of the
-	// pending coordinator and the registry lookup — through the same finish
-	// closure, so it emits the same ToolCallStart+ToolCallEnd(error) row shape
-	// as the unknown-tool path below. Unknown (unregistered) tools are left to
-	// that path, so baseline behavior is unchanged when nothing is withheld.
+	// registry lookup — through the same finish closure, so it emits the same
+	// ToolCallStart+ToolCallEnd(error) row shape as the unknown-tool path below.
+	// Unknown (unregistered) tools are left to that path, so baseline behavior is
+	// unchanged when nothing is withheld.
 	if _, registered := l.registry.Get(tc.Function.Name); registered && !l.registry.Advertises(tc.Function.Name, l.activeAdapt) {
 		return finish(fmt.Sprintf("error: tool %q is not available", tc.Function.Name), true, tc.Function.Arguments)
 	}
@@ -1185,28 +1142,6 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) dispatchResult
 
 	metadataArgs := tc.Function.Arguments
 
-	if coordinator, ok := l.pendingCoordinatorForTool(tc.Function.Name); ok {
-		act, _ := params["action"].(string)
-		if act == "discard" {
-			l.pendingQueue.Discard()
-			return finish("Discarded all staged edits.", false, metadataArgs)
-		}
-		results, err := l.flushPendingQueue(ctx, coordinator)
-		if err != nil {
-			return finish("error: "+err.Error(), true, metadataArgs)
-		}
-		if len(results) == 0 {
-			return finish("No pending edits to execute.", false, metadataArgs)
-		}
-		// The per-staged ToolCallEnd events (emitted by flushPendingQueue)
-		// carry the real results live; the <staged-flush> wrapper (persisted
-		// from consumedFlushResults after the dispatch loop) reconstructs them
-		// on reload. This tool's own result is a short summary.
-		l.consumedFlushResults = append(l.consumedFlushResults, results...)
-		summary, isError := stagedFlushSummary(results)
-		return finish(summary, isError, metadataArgs)
-	}
-
 	t, ok := l.registry.Get(tc.Function.Name)
 	if !ok {
 		return finish(fmt.Sprintf("error: unknown tool %q", tc.Function.Name), true, metadataArgs)
@@ -1215,29 +1150,6 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) dispatchResult
 	params["_tool_call_id"] = tc.ID
 	if data, err := json.Marshal(params); err == nil {
 		metadataArgs = string(data)
-	}
-
-	pending, _ := params["pending"].(bool)
-	if pending {
-		stageable, ok := l.stageableTool(tc.Function.Name)
-		if ok {
-			if err := stageable.ValidateStaged(ctx, json.RawMessage(tc.Function.Arguments)); err != nil {
-				return finish(err.Error(), true, metadataArgs)
-			}
-			l.pendingQueue.Stage(tool.StagedCall{
-				ToolName:   tc.Function.Name,
-				ToolCallID: tc.ID,
-				Args:       tc.Function.Arguments,
-				Params:     params,
-			})
-			return finish(stageable.StagedResultMessage(), false, metadataArgs)
-		}
-	}
-
-	if results, flushed, err := l.autoFlushBefore(ctx, tc); err != nil {
-		return finish("error: "+err.Error(), true, metadataArgs)
-	} else if flushed {
-		l.consumedFlushResults = append(l.consumedFlushResults, results...)
 	}
 
 	result, err := t.Execute(ctx, params)
@@ -1256,82 +1168,6 @@ func (l *Loop) dispatch(ctx context.Context, tc message.ToolCall) dispatchResult
 	return finish(result, false, metadataArgs)
 }
 
-func (l *Loop) stageableTool(name string) (tool.StageableTool, bool) {
-	if l == nil || l.registry == nil {
-		return nil, false
-	}
-	return l.registry.StageableTool(name)
-}
-
-func (l *Loop) pendingCoordinator() tool.PendingCoordinator {
-	if l != nil && l.registry != nil {
-		if coordinator, ok := l.registry.PendingCoordinator(); ok {
-			return coordinator
-		}
-	}
-	return tool.NewPendingCoordinator("", l.pendingExecutorOrFallback())
-}
-
-func (l *Loop) pendingCoordinatorForTool(name string) (tool.PendingCoordinator, bool) {
-	coordinator := l.pendingCoordinator()
-	if coordinator == nil || coordinator.ExplicitFlushToolName() != name {
-		return nil, false
-	}
-	return coordinator, true
-}
-
-func (l *Loop) pendingExecutorOrFallback() tool.PendingExecutor {
-	if l.pendingExecutor != nil {
-		return l.pendingExecutor
-	}
-	return loopPendingExecutor{loop: l}
-}
-
-type loopPendingExecutor struct {
-	loop *Loop
-}
-
-func (e loopPendingExecutor) ExecutePending(ctx context.Context, staged []tool.StagedCall) []tool.BatchResult {
-	if e.loop == nil {
-		return nil
-	}
-	return e.loop.executePendingSequential(ctx, staged)
-}
-
-func (l *Loop) autoFlushBefore(ctx context.Context, tc message.ToolCall) ([]tool.BatchResult, bool, error) {
-	if l.pendingQueue == nil || l.pendingQueue.Len() == 0 {
-		return nil, false, nil
-	}
-	coordinator := l.pendingCoordinator()
-	if coordinator == nil {
-		return nil, false, nil
-	}
-	staged := l.pendingQueue.Staged()
-	results, flushed, err := coordinator.AutoFlushBefore(ctx, tool.ToolCall{
-		Name:      tc.Function.Name,
-		ID:        tc.ID,
-		Arguments: json.RawMessage(tc.Function.Arguments),
-	}, l.pendingQueue)
-	if err != nil || !flushed {
-		return results, flushed, err
-	}
-	l.emitPendingResults(ctx, results, staged)
-	return results, true, nil
-}
-
-func (l *Loop) flushPendingAtTurnEnd(ctx context.Context) ([]tool.BatchResult, error) {
-	if l.pendingQueue == nil || l.pendingQueue.Len() == 0 {
-		return nil, nil
-	}
-	staged := l.pendingQueue.Staged()
-	results, flushed, err := l.pendingCoordinator().FlushAtTurnEnd(ctx, l.pendingQueue)
-	if err != nil || !flushed {
-		return results, err
-	}
-	l.emitPendingResults(ctx, results, staged)
-	return results, nil
-}
-
 func (l *Loop) displayMetadata(ctx context.Context, name, args, result string) map[string]any {
 	if l == nil || l.registry == nil {
 		return nil
@@ -1341,191 +1177,6 @@ func (l *Loop) displayMetadata(ctx context.Context, name, args, result string) m
 		return nil
 	}
 	return provider.DisplayMetadata(ctx, json.RawMessage(args), result)
-}
-
-func (l *Loop) flushPendingQueue(ctx context.Context, coordinator tool.PendingCoordinator) ([]tool.BatchResult, error) {
-	if coordinator == nil {
-		coordinator = l.pendingCoordinator()
-	}
-	if l.pendingQueue == nil || l.pendingQueue.Len() == 0 {
-		return nil, nil
-	}
-	staged := l.pendingQueue.Staged()
-	results, flushed, err := coordinator.FlushPending(ctx, l.pendingQueue)
-	if err != nil || !flushed {
-		return results, err
-	}
-	l.emitPendingResults(ctx, results, staged)
-	return results, nil
-}
-
-func (l *Loop) emitPendingResults(ctx context.Context, results []tool.BatchResult, staged []tool.StagedCall) {
-	stagedByID := make(map[string]tool.StagedCall, len(staged))
-	for _, call := range staged {
-		stagedByID[call.ToolCallID] = call
-	}
-
-	for i := range results {
-		r := &results[i]
-		result := r.Result
-		isError := false
-		if r.Error != "" {
-			result = r.Error
-			isError = true
-		}
-		stagedCall := stagedByID[r.ToolCallID]
-		metadata := r.Metadata
-		if !isError {
-			if metadata == nil {
-				metadata = l.displayMetadata(ctx, r.ToolName, stagedCall.Args, result)
-			}
-			r.Metadata = metadata
-		} else {
-			r.Metadata = nil
-		}
-		l.emit(Event{
-			Kind:       ToolCallEnd,
-			ToolCallID: r.ToolCallID,
-			ToolName:   r.ToolName,
-			Args:       stagedCall.Args,
-			Result:     result,
-			IsError:    isError,
-			Metadata:   metadata,
-		})
-	}
-}
-
-func stagedFlushSummary(results []tool.BatchResult) (string, bool) {
-	failed := 0
-	for _, r := range results {
-		if r.Error != "" {
-			failed++
-		}
-	}
-	applied := len(results) - failed
-	if failed == 0 {
-		return fmt.Sprintf("Applied %d staged edits.", applied), false
-	}
-	if applied == 0 {
-		return fmt.Sprintf("Failed to apply %d staged edits.", failed), true
-	}
-	return fmt.Sprintf("Applied %d staged edits; %d failed.", applied, failed), true
-}
-
-const (
-	stagedFlushOpen         = "<staged-flush>"
-	stagedFlushClose        = "</staged-flush>"
-	stagedFlushInternalKind = "staged_flush"
-)
-
-// StagedFlushEntry is one staged tool's final result, carried in the
-// <staged-flush> reload wrapper.
-type StagedFlushEntry struct {
-	ID       string         `json:"id"`
-	Result   string         `json:"result"`
-	IsError  bool           `json:"isError"`
-	Metadata map[string]any `json:"metadata,omitempty"`
-}
-
-type stagedFlushPayload struct {
-	Results []StagedFlushEntry `json:"results"`
-}
-
-// BuildStagedFlush renders the <staged-flush> wrapper content for the given
-// flush results, mirroring the live ToolCallEnd semantics (error string wins,
-// IsError set when there was an error). Returns "" when there are no results.
-func BuildStagedFlush(results []tool.BatchResult) string {
-	if len(results) == 0 {
-		return ""
-	}
-	payload := stagedFlushPayload{Results: make([]StagedFlushEntry, 0, len(results))}
-	for _, r := range results {
-		e := StagedFlushEntry{ID: r.ToolCallID, Result: r.Result, Metadata: r.Metadata}
-		if r.Error != "" {
-			e.Result = r.Error
-			e.IsError = true
-			e.Metadata = nil
-		}
-		payload.Results = append(payload.Results, e)
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return ""
-	}
-	return stagedFlushOpen + string(data) + stagedFlushClose
-}
-
-// NewStagedFlushMessage renders a backend-owned staged-flush wrapper message.
-// The private marker distinguishes internal wrappers from literal user input
-// with the same text.
-func NewStagedFlushMessage(results []tool.BatchResult) (message.Message, bool) {
-	wrapper := BuildStagedFlush(results)
-	if wrapper == "" {
-		return message.Message{}, false
-	}
-	msg := message.NewText(message.RoleUser, wrapper)
-	msg.InternalKind = stagedFlushInternalKind
-	return msg, true
-}
-
-// ParseStagedFlush reports whether trusted content is a <staged-flush> wrapper
-// and, if so, returns its entries. The bool is true for any content bounded by
-// the markers, including malformed inner JSON where entries is nil.
-func ParseStagedFlush(content string) (entries []StagedFlushEntry, isWrapper bool) {
-	if !strings.HasPrefix(content, stagedFlushOpen) || !strings.HasSuffix(content, stagedFlushClose) {
-		return nil, false
-	}
-	inner := content[len(stagedFlushOpen) : len(content)-len(stagedFlushClose)]
-	var payload stagedFlushPayload
-	if json.Unmarshal([]byte(inner), &payload) != nil {
-		return nil, true
-	}
-	return payload.Results, true
-}
-
-// ParseStagedFlushMessage parses only backend-marked staged-flush messages.
-func ParseStagedFlushMessage(msg message.Message) (entries []StagedFlushEntry, isWrapper bool) {
-	if msg.Role != message.RoleUser || msg.InternalKind != stagedFlushInternalKind {
-		return nil, false
-	}
-	return ParseStagedFlush(msg.TextContent())
-}
-
-// appendStagedFlushWrapper persists exactly one <staged-flush> wrapper for the
-// given flush results: it appends a RoleUser message to in-memory history AND
-// persists it. The in-memory append is required so the running loop includes
-// the structured results in its next provider request (not only after reload).
-// No display event is emitted — the per-tool ToolCallEnd events already carried
-// the results to the live display; the wrapper is for reload + model context.
-func (l *Loop) appendStagedFlushWrapper(turn int, results []tool.BatchResult) {
-	msg, ok := NewStagedFlushMessage(results)
-	if !ok {
-		return
-	}
-	l.messages = append(l.messages, msg)
-	l.persistMessage(turn, msg)
-}
-
-func (l *Loop) executePendingSequential(ctx context.Context, staged []tool.StagedCall) []tool.BatchResult {
-	results := make([]tool.BatchResult, 0, len(staged))
-	for _, call := range staged {
-		r := tool.BatchResult{ToolName: call.ToolName, ToolCallID: call.ToolCallID}
-		t, ok := l.registry.Get(call.ToolName)
-		if !ok {
-			r.Error = fmt.Sprintf("unknown tool %q", call.ToolName)
-			results = append(results, r)
-			continue
-		}
-		result, err := t.Execute(ctx, call.Params)
-		if err != nil {
-			r.Error = err.Error()
-		} else {
-			r.Success = true
-			r.Result = result
-		}
-		results = append(results, r)
-	}
-	return results
 }
 
 // TurnCount returns the number of completed user turns in this session.

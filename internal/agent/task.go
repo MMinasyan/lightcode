@@ -70,7 +70,6 @@ type taskTool struct {
 	lspManager    *lsp.Manager
 	check         tool.CheckFunc
 	ask           tool.AskFunc
-	askAction     tool.AskActionFunc
 	usageRecorder loop.UsageRecorder
 
 	resultMetadata map[string]map[string]any
@@ -97,7 +96,6 @@ type taskToolConfig struct {
 	LSPManager    *lsp.Manager
 	Check         tool.CheckFunc
 	Ask           tool.AskFunc
-	AskAction     tool.AskActionFunc
 	UsageRecorder loop.UsageRecorder
 }
 
@@ -123,7 +121,6 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		lspManager:    cfg.LSPManager,
 		check:         cfg.Check,
 		ask:           cfg.Ask,
-		askAction:     cfg.AskAction,
 		usageRecorder: cfg.UsageRecorder,
 	}
 }
@@ -350,9 +347,8 @@ func appendAdaptationBlocks(prompt string, adapt *adaptation.Adaptation) string 
 // resolved from the child's OWN model: it appends the adaptation's coaching blocks to the prompt and
 // installs the adaptation on the loop (tool advertisement, dispatch gate, leak pattern).
 type childLoopRuntime struct {
-	store           *snapshot.Store
-	events          chan<- loop.Event
-	pendingExecutor tool.PendingExecutor
+	store  *snapshot.Store
+	events chan<- loop.Event
 }
 
 func (t *taskTool) buildChildLoop(at agentcfg.Resolved, client *provider.Client, registry *tool.Registry, ref coremodel.ModelRef, runtimeCfg ...childLoopRuntime) *loop.Loop {
@@ -372,7 +368,6 @@ func (t *taskTool) buildChildLoop(at agentcfg.Resolved, client *provider.Client,
 			Store:            rt.store,
 			Events:           rt.events,
 			UsageRecorder:    t.usageRecorder,
-			PendingExecutor:  rt.pendingExecutor,
 			ActiveAdaptation: adapt,
 		},
 	})
@@ -476,16 +471,11 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		return result
 	}
 
-	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(scope.snapshotStore(), scope.tracker, t.toolsConfig, scope.workspaceRoot, t.permissionCheck(), t.permissionAskAction(), tool.CapabilityOptions{
-		WriteDir: taskToolExposure(at).writeDir,
-	})
 	lp = t.buildChildLoop(at, client, registry, ref, childLoopRuntime{
-		store:           childStore,
-		events:          events,
-		pendingExecutor: pendingExecutor,
+		store:  childStore,
+		events: events,
 	})
 	lp.SetEventOwner(sessionID, t.projectID)
-	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 	// The child process-signal callback is registered after the child loop is
 	// constructed and before lp.Run can call a tool, so a child background
 	// process that completes during the run reaches this live loop. It is
@@ -525,13 +515,6 @@ func (t *taskTool) buildRegistry(at agentcfg.Resolved, scope parentMutationScope
 	reg := tool.NewRegistry()
 	for _, name := range exposure.tools {
 		if name == "task" {
-			continue
-		}
-		if name == "execute_pending" {
-			// execute_pending is not in CoreTools (no snapshot/tracker
-			// wiring). Register it only for subagent types that explicitly
-			// list it; read-only types must not receive mutation tools.
-			reg.Register(tool.WrapWithPermission(tool.ExecutePending{}, t.permissionCheck(), t.permissionAsk()))
 			continue
 		}
 		if tt, ok := core[name]; ok {
@@ -659,15 +642,6 @@ func (t *taskTool) permissionCheck() tool.CheckFunc {
 func (t *taskTool) permissionAsk() tool.AskFunc {
 	if t.ask != nil {
 		return t.ask
-	}
-	return func(context.Context, permission.Request) permission.ResponseAction {
-		return permission.ResponseDeny
-	}
-}
-
-func (t *taskTool) permissionAskAction() tool.AskActionFunc {
-	if t.askAction != nil {
-		return t.askAction
 	}
 	return func(context.Context, permission.Request) permission.ResponseAction {
 		return permission.ResponseDeny

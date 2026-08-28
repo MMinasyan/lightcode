@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/permission"
 )
 
 func TestFileToolsResolveRelativePathsFromWorkspaceRoot(t *testing.T) {
@@ -55,44 +54,6 @@ func TestFileToolsResolveRelativePathsFromWorkspaceRoot(t *testing.T) {
 	}
 }
 
-func TestStagedExecutorResolvesRelativePathsFromWorkspaceRoot(t *testing.T) {
-	root := t.TempDir()
-	other := t.TempDir()
-	t.Chdir(other)
-
-	path := filepath.Join(root, "batch.txt")
-	if err := os.WriteFile(path, []byte("old\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	tracker := NewFileTracker()
-	if _, err := NewReadFileAtRoot(config.ToolsConfig{ReadMaxLines: 500}, tracker, root).Execute(context.Background(), map[string]any{"path": "batch.txt"}); err != nil {
-		t.Fatalf("read_file: %v", err)
-	}
-
-	var checkedArg string
-	exec := NewStagedExecutorAtRoot(nil, tracker, config.ToolsConfig{}, root, func(toolName, arg string) permission.Decision {
-		checkedArg = arg
-		return permission.DecisionAllow
-	}, nil)
-	results := exec.ExecutePending(context.Background(), []StagedCall{{
-		ToolName:   "edit_file",
-		ToolCallID: "call-1",
-		Params: map[string]any{
-			"path":       "batch.txt",
-			"old_string": "old",
-			"new_string": "new",
-		},
-	}})
-	if len(results) != 1 || !results[0].Success {
-		t.Fatalf("results = %#v, want one successful staged edit", results)
-	}
-	if checkedArg != path {
-		t.Fatalf("permission arg = %q, want workspace-root path %q", checkedArg, path)
-	}
-	if got, err := os.ReadFile(path); err != nil || string(got) != "new\n" {
-		t.Fatalf("root batch.txt = %q, %v; want edited root file", got, err)
-	}
-}
 
 func TestRunCommandUsesWorkspaceRoot(t *testing.T) {
 	root := t.TempDir()

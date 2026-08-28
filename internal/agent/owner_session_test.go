@@ -423,63 +423,6 @@ func TestPermissionSaveProject(t *testing.T) {
 	}
 }
 
-func TestStagedPermissionOwner(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
-	events := make(chan Event, 16)
-	a.SetEventHandler(func(ev Event) {
-		events <- ev
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	a.Init(ctx)
-
-	sessionID, err := a.NewSession("", "primary")
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	a.ensureRuntime().mu.Lock()
-	unit := a.sessions[sessionID]
-	unit.turnCtx = ctx
-	projectID := unit.projectID
-	exec := unit.pendingExecutor
-	a.ensureRuntime().mu.Unlock()
-	if exec == nil {
-		t.Fatal("pending executor is nil")
-	}
-
-	staged := []tool.StagedCall{{
-		ToolName:   "write_file",
-		ToolCallID: "call-write",
-		Args:       `{"path":"staged.txt","content":"ok"}`,
-		Params: map[string]any{
-			"path":    "staged.txt",
-			"content": "ok",
-		},
-	}}
-	done := make(chan []tool.BatchResult, 1)
-	go func() {
-		done <- exec.ExecutePending(ctx, staged)
-	}()
-	req := waitPermissionEvent(t, events).PermReq
-	if req.SessionID != sessionID || req.ProjectID != projectID {
-		t.Fatalf("staged permission owner = %q/%q, want %q/%q", req.SessionID, req.ProjectID, sessionID, projectID)
-	}
-	if req.BatchIndex != 1 || req.BatchTotal != 1 {
-		t.Fatalf("staged batch position = %d/%d, want 1/1", req.BatchIndex, req.BatchTotal)
-	}
-	if err := a.RespondPermissionActionForSession(sessionID, req.ID, "deny"); err != nil {
-		t.Fatalf("deny staged permission: %v", err)
-	}
-	select {
-	case results := <-done:
-		if len(results) != 1 || results[0].Error != "denied by user" {
-			t.Fatalf("staged results = %#v, want denied by user", results)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("staged executor stayed blocked after denial")
-	}
-}
-
 func TestTaskProjectSync(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	if _, err := a.NewSession("", "primary"); err != nil {

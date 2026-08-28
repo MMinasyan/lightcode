@@ -72,13 +72,10 @@
     <div class="hdr" id="permission-prompt-title">Permission Required</div>
     <div class="tool-info">
       <span class="tool-badge">[{permission?.tool || 'tool'}]</span>
-      {#if permission?.canAllowAll && permission?.batchTotal}
-        <span class="batch-badge">{permission.batchIndex}/{permission.batchTotal}</span>
-      {/if}
     </div>
     {#if permission?.batchFiles?.length}
       <div class="batch-list">
-        <div class="batch-title">{permission?.canAllowAll ? 'Staged files' : 'Affected files'}</div>
+        <div class="batch-title">Affected files</div>
         {#each permission.batchFiles as file, i}
           <div class:current-file={file === permission.args}>
             {file}{#if permission.batchResolvedFiles?.[i] && permission.batchResolvedFiles[i] !== file} -> {permission.batchResolvedFiles[i]}{/if}
@@ -109,9 +106,6 @@
       </div>
     {:else}
       <div class="actions">
-        {#if permission?.canAllowAll}
-          <button class="btn allow" on:click={() => respond('allow_all')}>Allow all</button>
-        {/if}
         <button class="btn allow" on:click={() => respond('allow')}>Allow</button>
         <button class="btn deny" on:click={() => respond('deny')}>Deny</button>
         {#if permission?.canSaveProject !== false}
@@ -128,7 +122,6 @@
   .hdr { padding:8px 12px; font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--border); }
   .tool-info { padding:8px 12px 0; }
   .tool-badge { color:var(--text-dim); font-size:12px; font-family:var(--font-mono); }
-  .batch-badge { margin-left:8px; color:var(--accent); font-size:12px; font-family:var(--font-mono); }
   .batch-list { margin:8px 12px 0; padding:8px; border:1px solid var(--border); max-height:120px; overflow-y:auto; font-family:var(--font-mono); font-size:12px; color:var(--text-dim); }
   .batch-title { margin-bottom:4px; color:var(--text); font-family:var(--font-ui); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
   .current-file { color:var(--accent); }

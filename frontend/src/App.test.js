@@ -125,7 +125,7 @@ describe('App turn-end permission reset', () => {
         const onTurnEnd = ${eventCallbackSource('turn_end')};
         const onPermissionRequest = ${eventCallbackSource('permission_request')};
         onTurnEnd({});
-        onPermissionRequest({ id: 'p1', tool: 'bash', args: 'ls', canAllowAll: false });
+        onPermissionRequest({ id: 'p1', tool: 'bash', args: 'ls' });
       `,
       sandbox,
     );

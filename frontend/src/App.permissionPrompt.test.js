@@ -378,6 +378,39 @@ describe('App permission prompt on a boundary', () => {
     fire('permission_request', { id: 'a', sessionId: 's1', projectId: 'p1', tool: 'bash', args: 'rm a', canSaveProject: true });
   }
 
+  it('renders retained affected-file lists and hides staging-only controls and project save when disabled', async () => {
+    const { app, target } = await mountApp();
+
+    fire('permission_request', {
+      id: 'a', sessionId: 's1', projectId: 'p1', tool: 'apply_patch',
+      args: '/tmp/project/a.txt',
+      canSaveProject: false,
+      batchFiles: ['/tmp/project/a.txt', '/tmp/project/.env'],
+      batchResolvedFiles: ['/tmp/project/a.txt', '/tmp/project/.env'],
+    });
+    await tick();
+
+    // The retained affected-file list renders as a list.
+    const batch = target.querySelector('.prompt .batch-list');
+    expect(batch).toBeTruthy();
+    expect(batch.textContent).toContain('/tmp/project/a.txt');
+    expect(batch.textContent).toContain('/tmp/project/.env');
+    expect(batch.textContent).toContain('Affected files');
+
+    // Staging-only controls are absent: no Allow-all action and no batch
+    // position indicator.
+    const actions = [...target.querySelectorAll('.prompt .actions button')].map(b => b.textContent);
+    expect(actions).not.toContain('Allow all');
+    expect(target.querySelector('.prompt').textContent).not.toMatch(/\(\d+\/\d+\)/);
+
+    // DisableProjectSave is delivered as canSaveProject=false: the project-save
+    // button is hidden, leaving only Allow and Deny.
+    expect(target.querySelector('.prompt .actions .project')).toBeNull();
+    expect(actions).toEqual(['Allow', 'Deny']);
+
+    unmount(app);
+  });
+
   it('a navigation boundary for another session closes the prompt with a notice, and the request still answers through its own session', async () => {
     const responses = [];
     backend.RespondPermission = async (sessionId, id, action) => { responses.push({ sessionId, id, action }); };

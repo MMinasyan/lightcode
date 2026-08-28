@@ -12,8 +12,8 @@ import (
 	"github.com/MMinasyan/lightcode/internal/editpreview"
 )
 
-// EditFile implements the edit_file tool with O(1) results with line ranges
-// and pending support.
+// EditFile implements the edit_file tool, returning updated content and the
+// line ranges each edit touched.
 type EditFile struct {
 	tracker       *FileTracker
 	cfg           config.ToolsConfig
@@ -38,9 +38,7 @@ func (e *EditFile) Description() string {
 - When using text from read_file output, never include the line number prefix in old_string or new_string. The prefix format is: number + tab. Everything after the tab is the actual file content.
 - The edit will FAIL if old_string is not unique in the file. Provide more surrounding context to make it unique, or use replace_all to change every instance.
 - old_string and new_string must be different. old_string must not be empty.
-- ALWAYS prefer editing existing files. Use write_file only for new files or complete rewrites.
-- ALWAYS use pending=true when your task requires multiple edits or writes. Pending calls will be applied AUTOMATICALLY with next tool call or after your response.
-- Do not use pending in the last edit or write tool call if you need them applied immediately, OR use execute_pending tool separately after it. ALWAYS prefer non-pending last edit over execute_pending.`
+- ALWAYS prefer editing existing files. Use write_file only for new files or complete rewrites.`
 }
 
 func (e *EditFile) ParametersSchema() map[string]any {
@@ -63,10 +61,6 @@ func (e *EditFile) ParametersSchema() map[string]any {
 				"type":        "boolean",
 				"description": "If true, replace every occurrence. If false (default), old_string must be unique in the file.",
 			},
-			"pending": map[string]any{
-				"type":        "boolean",
-				"description": "If true, stage this edit for batch execution with other pending edits.",
-			},
 		},
 		"required": []string{"path", "old_string", "new_string"},
 	}
@@ -82,12 +76,6 @@ type editResult struct {
 func (e *EditFile) Execute(_ context.Context, params map[string]any) (string, error) {
 	return e.editFileExec(params)
 }
-
-func (e *EditFile) ValidateStaged(_ context.Context, args json.RawMessage) error {
-	return validateEditStagedArgs(args)
-}
-
-func (e *EditFile) StagedResultMessage() string { return "Staged." }
 
 func (e *EditFile) DisplayMetadata(_ context.Context, args json.RawMessage, result string) map[string]any {
 	return editMetadataFromArgs(args, result)
@@ -118,12 +106,6 @@ func (*EditFileWithSnapshot) Description() string { return (&EditFile{}).Descrip
 func (*EditFileWithSnapshot) ParametersSchema() map[string]any {
 	return (&EditFile{}).ParametersSchema()
 }
-
-func (*EditFileWithSnapshot) ValidateStaged(_ context.Context, args json.RawMessage) error {
-	return validateEditStagedArgs(args)
-}
-
-func (*EditFileWithSnapshot) StagedResultMessage() string { return "Staged." }
 
 func (*EditFileWithSnapshot) DisplayMetadata(_ context.Context, args json.RawMessage, result string) map[string]any {
 	return editMetadataFromArgs(args, result)
@@ -170,26 +152,6 @@ func (e *EditFileWithSnapshot) Execute(_ context.Context, params map[string]any)
 	}
 	retainMutatedSnapshot(snapshot)
 	return res.Result, nil
-}
-
-func validateEditStagedArgs(args json.RawMessage) error {
-	var params map[string]any
-	if err := json.Unmarshal(args, &params); err != nil {
-		return fmt.Errorf("edit_file: invalid staged arguments: %w", err)
-	}
-	path, _ := params["path"].(string)
-	if path == "" {
-		return fmt.Errorf("edit_file: path is required")
-	}
-	oldStr, _ := params["old_string"].(string)
-	newStr, _ := params["new_string"].(string)
-	if oldStr == "" {
-		return fmt.Errorf("edit_file: old_string must not be empty")
-	}
-	if oldStr == newStr {
-		return fmt.Errorf("edit_file: old_string and new_string are identical")
-	}
-	return nil
 }
 
 func editMetadataFromArgs(args json.RawMessage, result string) map[string]any {
@@ -313,8 +275,8 @@ type EditBufferResult struct {
 }
 
 // ApplyEdit performs a string replacement on content without touching the
-// filesystem. Used by the staging system to apply sequential edits to a
-// running buffer.
+// filesystem. It is the pure-buffer helper edit_file uses to compute the
+// updated content and per-replacement line ranges before the write.
 func ApplyEdit(content, oldString, newString string, replaceAll bool, path string) (*EditBufferResult, error) {
 	n := strings.Count(content, oldString)
 	if n == 0 {

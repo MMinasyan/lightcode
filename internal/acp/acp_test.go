@@ -929,6 +929,63 @@ func TestHandleEventNotifications(t *testing.T) {
 	}
 }
 
+func TestHandleEventPermissionRequestCarriesRetainedPayload(t *testing.T) {
+	var out bytes.Buffer
+	r := &Runner{out: &out}
+	r.handleEvent(agent.Event{
+		Kind: agent.EventPermissionRequest,
+		PermReq: &agent.PermissionRequest{
+			ID:                 "req-1",
+			SessionID:          "s1",
+			ProjectID:          "p1",
+			ToolName:           "apply_patch",
+			Arg:                "/tmp/project/a.txt",
+			ResolvedArg:        "/tmp/project/.env",
+			DisableProjectSave: true,
+			BatchFiles:         []string{"/tmp/project/a.txt", "/tmp/project/.env"},
+			BatchResolvedFiles: []string{"/tmp/project/a.txt", "/tmp/project/.env"},
+		},
+	})
+
+	lines := drainedLines(t, r, &out, 1)
+	var notif Notification
+	if err := json.Unmarshal([]byte(lines[0]), &notif); err != nil {
+		t.Fatalf("notification json: %v", err)
+	}
+	if notif.Method != "agent/permission_request" {
+		t.Fatalf("notification method = %q, want agent/permission_request", notif.Method)
+	}
+	params, ok := notif.Params.(map[string]any)
+	if !ok {
+		t.Fatalf("params = %#v, want map", notif.Params)
+	}
+	if got := acpParamString(t, params, "id"); got != "req-1" {
+		t.Fatalf("id = %q, want req-1", got)
+	}
+	if got := acpParamString(t, params, "tool"); got != "apply_patch" {
+		t.Fatalf("tool = %q, want apply_patch", got)
+	}
+	// Retained affected-file lists survive the payload.
+	batchFiles, _ := params["batchFiles"].([]any)
+	if len(batchFiles) != 2 || batchFiles[0] != "/tmp/project/a.txt" || batchFiles[1] != "/tmp/project/.env" {
+		t.Fatalf("batchFiles = %#v, want the two retained affected files", batchFiles)
+	}
+	batchResolved, _ := params["batchResolvedFiles"].([]any)
+	if len(batchResolved) != 2 || batchResolved[0] != "/tmp/project/a.txt" || batchResolved[1] != "/tmp/project/.env" {
+		t.Fatalf("batchResolvedFiles = %#v, want the two retained resolved files", batchResolved)
+	}
+	// DisableProjectSave is delivered pre-negated as canSaveProject.
+	if got, _ := params["canSaveProject"].(bool); got {
+		t.Fatalf("canSaveProject = true, want false (DisableProjectSave set)")
+	}
+	// Staging-only payload fields are absent.
+	for _, absent := range []string{"canAllowAll", "batchIndex", "batchTotal", "allow_all", "allowAll"} {
+		if _, ok := params[absent]; ok {
+			t.Fatalf("permission_request params carry staging-only field %q: %#v", absent, params)
+		}
+	}
+}
+
 func TestHandleEventCarriesSequence(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{out: &out}

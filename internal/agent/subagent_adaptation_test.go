@@ -434,20 +434,3 @@ func TestReadOnlySubagentDoesNotReceiveApplyPatch(t *testing.T) {
 		t.Fatalf("apply_patch leaked into a read-only child's advertised set: %v", names)
 	}
 }
-
-func TestReadOnlySubagentDoesNotReceiveExecutePending(t *testing.T) {
-	task := newSubagentTaskTool(t, nil)
-	at := agentcfg.Resolved{
-		Name:   "explore",
-		Tools:  []string{"read_file", "run_command", "diagnostics", "workspace_symbol"},
-		Prompt: "p",
-	}
-	registry := task.buildRegistry(at, parentMutationScope{}, nil)
-	names := advertisedToolNames(registry, nil)
-	if slices.Contains(names, "execute_pending") {
-		t.Fatalf("execute_pending leaked into a read-only child's advertised set: %v", names)
-	}
-	if _, ok := registry.Get("execute_pending"); ok {
-		t.Fatal("execute_pending registered on a read-only child registry")
-	}
-}

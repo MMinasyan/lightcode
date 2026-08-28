@@ -51,16 +51,6 @@ type DisplayMetadataProvider interface {
 	DisplayMetadata(ctx context.Context, args json.RawMessage, result string) map[string]any
 }
 
-// StageableTool can stage a call for later batch execution.
-type StageableTool interface {
-	ValidateStaged(ctx context.Context, args json.RawMessage) error
-	StagedResultMessage() string
-}
-
-type StageableToolProvider interface {
-	StageableTool() (StageableTool, bool)
-}
-
 // ToolCall is the generic identity of a model-requested tool call.
 type ToolCall struct {
 	Name      string
@@ -72,9 +62,8 @@ type ToolCall struct {
 // so that OpenAITools() emits a stable sequence, which helps with logging
 // and debugging across runs.
 type Registry struct {
-	tools              map[string]Tool
-	order              []string
-	pendingCoordinator PendingCoordinator
+	tools map[string]Tool
+	order []string
 }
 
 // NewRegistry returns an empty Registry.
@@ -132,36 +121,6 @@ func (r *Registry) DisplayMetadataProvider(name string) (DisplayMetadataProvider
 	}
 	p, ok := t.(DisplayMetadataProvider)
 	return p, ok
-}
-
-// StageableTool returns a registered tool's staging capability.
-func (r *Registry) StageableTool(name string) (StageableTool, bool) {
-	t, ok := r.Get(name)
-	if !ok {
-		return nil, false
-	}
-	if provider, ok := t.(StageableToolProvider); ok {
-		return provider.StageableTool()
-	}
-	t, ok = r.capabilityTool(name)
-	if !ok {
-		return nil, false
-	}
-	s, ok := t.(StageableTool)
-	return s, ok
-}
-
-// RegisterPendingCoordinator wires pending-queue behavior for this registry.
-func (r *Registry) RegisterPendingCoordinator(c PendingCoordinator) {
-	r.pendingCoordinator = c
-}
-
-// PendingCoordinator returns the registry-level pending coordinator.
-func (r *Registry) PendingCoordinator() (PendingCoordinator, bool) {
-	if r == nil || r.pendingCoordinator == nil {
-		return nil, false
-	}
-	return r.pendingCoordinator, true
 }
 
 // OpenAITools returns the tool definitions in the shape every OpenAI-

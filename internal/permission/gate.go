@@ -22,10 +22,7 @@ type Request struct {
 	ToolName           string   `json:"tool"`
 	Arg                string   `json:"args"`
 	ResolvedArg        string   `json:"resolved_arg,omitempty"`
-	CanAllowAll        bool     `json:"can_allow_all,omitempty"`
 	DisableProjectSave bool     `json:"disable_project_save,omitempty"`
-	BatchIndex         int      `json:"batch_index,omitempty"`
-	BatchTotal         int      `json:"batch_total,omitempty"`
 	BatchFiles         []string `json:"batch_files,omitempty"`
 	BatchResolvedFiles []string `json:"batch_resolved_files,omitempty"`
 }
@@ -34,9 +31,8 @@ type Request struct {
 type ResponseAction string
 
 const (
-	ResponseAllow    ResponseAction = "allow"
-	ResponseDeny     ResponseAction = "deny"
-	ResponseAllowAll ResponseAction = "allow_all"
+	ResponseAllow ResponseAction = "allow"
+	ResponseDeny  ResponseAction = "deny"
 )
 
 // Gate bridges synchronous permission checks to an async request/response
@@ -77,7 +73,7 @@ func NewGate(onRequest func(ctx context.Context, req Request)) *Gate {
 // ctx is cancelled. Returns true for allow, false for deny.
 func (g *Gate) Ask(ctx context.Context, toolName, arg string) bool {
 	action := g.AskRequest(ctx, Request{ToolName: toolName, Arg: arg})
-	return action == ResponseAllow || action == ResponseAllowAll
+	return action == ResponseAllow
 }
 
 // AskRequest registers a pending structured request and blocks until the
@@ -241,7 +237,7 @@ func (g *Gate) RespondActionForSession(sessionID, id string, action string) erro
 func (g *Gate) respondAction(sessionID, id string, action string, requireSession bool) error {
 	response := ResponseAction(action)
 	switch response {
-	case ResponseAllow, ResponseDeny, ResponseAllowAll:
+	case ResponseAllow, ResponseDeny:
 	default:
 		return fmt.Errorf("invalid permission response action %q", action)
 	}
@@ -255,9 +251,6 @@ func (g *Gate) respondAction(sessionID, id string, action string, requireSession
 	if requireSession && !requestMatchesSession(pending.req, sessionID) {
 		g.mu.Unlock()
 		return fmt.Errorf("%w: id %q", ErrSessionMismatch, id)
-	}
-	if response == ResponseAllowAll && !pending.req.CanAllowAll {
-		response = ResponseAllow
 	}
 	// Publish the resolution before unblocking the waiter: once the response is
 	// on the channel the waiter can run to turn end, and the host must never

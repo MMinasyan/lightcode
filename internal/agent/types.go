@@ -105,10 +105,7 @@ type PermissionRequest struct {
 	ToolName           string
 	Arg                string
 	ResolvedArg        string
-	CanAllowAll        bool
 	DisableProjectSave bool
-	BatchIndex         int
-	BatchTotal         int
 	BatchFiles         []string
 	BatchResolvedFiles []string
 }

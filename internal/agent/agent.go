@@ -81,10 +81,9 @@ type session struct {
 	tokens          map[string]*TokenEntry
 	lastContextUsed int
 
-	taskToolInst    *taskTool
-	pendingExecutor *tool.StagedExecutor
-	fileTracker     *tool.FileTracker
-	lspDiagnostics  *tool.LSPDiagnostics
+	taskToolInst   *taskTool
+	fileTracker    *tool.FileTracker
+	lspDiagnostics *tool.LSPDiagnostics
 }
 
 // Agent is the shared service facade used by all adapters (Wails, HTTP, ACP).
@@ -284,7 +283,6 @@ type runningUnitLoopConfig struct {
 	Events             chan<- loop.Event
 	ContextTransformer loop.ContextTransformer
 	UsageRecorder      loop.UsageRecorder
-	PendingExecutor    tool.PendingExecutor
 	ActiveAdaptation   *adaptation.Adaptation
 }
 
@@ -301,7 +299,6 @@ type runningUnitConfig struct {
 	SessionStart      time.Time
 	InstalledPrompt   string
 	TaskTool          *taskTool
-	PendingExecutor   *tool.StagedExecutor
 	FileTracker       *tool.FileTracker
 	LSPDiagnostics    *tool.LSPDiagnostics
 }
@@ -321,7 +318,6 @@ func newRunningUnit(cfg runningUnitConfig) *session {
 		sessionStart:      cfg.SessionStart,
 		installedPrompt:   cfg.InstalledPrompt,
 		taskToolInst:      cfg.TaskTool,
-		pendingExecutor:   cfg.PendingExecutor,
 		fileTracker:       cfg.FileTracker,
 		lspDiagnostics:    cfg.LSPDiagnostics,
 	}
@@ -345,9 +341,6 @@ func newRunningUnitLoop(cfg runningUnitLoopConfig) *loop.Loop {
 	}
 	if cfg.UsageRecorder != nil {
 		lp.SetUsageRecorder(cfg.UsageRecorder)
-	}
-	if cfg.PendingExecutor != nil {
-		lp.SetPendingExecutor(cfg.PendingExecutor)
 	}
 	if cfg.ActiveAdaptation != nil {
 		lp.SetActiveAdaptation(cfg.ActiveAdaptation)
@@ -599,12 +592,6 @@ func (a *Agent) permissionAskForSession(unitRef func() *session, projectID strin
 	})
 }
 
-func (a *Agent) permissionAskActionForSession(unitRef func() *session, projectID string, useTurnContext bool) tool.AskActionFunc {
-	return tool.AskActionFunc(func(ctx context.Context, req permission.Request) permission.ResponseAction {
-		return a.askPermissionForSession(ctx, unitRef(), req, projectID, useTurnContext)
-	})
-}
-
 func (a *Agent) askPermissionForSession(ctx context.Context, unit *session, req permission.Request, projectID string, useTurnContext bool) permission.ResponseAction {
 	if a.gate == nil {
 		return permission.ResponseDeny
@@ -825,7 +812,6 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 	unitRef := func() *session { return unit }
 	checkPolicy := a.permissionCheckForProjectWith(snap.cfg, projectID, projectRoot)
 	askPolicy := a.permissionAskForSession(unitRef, projectID, true)
-	askActionPolicy := a.permissionAskActionForSession(unitRef, projectID, false)
 	fileTracker := tool.NewFileTracker()
 	writeDir := strings.TrimSpace(snap.resolved.WriteDir)
 	options := tool.CapabilityOptions{WriteDir: writeDir}
@@ -836,9 +822,6 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 		}
 		registry.Register(tl)
 	}
-	registry.Register(tool.WrapWithPermission(tool.ExecutePending{}, checkPolicy, askPolicy))
-
-	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(store, fileTracker, snap.toolsConfig, projectRoot, checkPolicy, askActionPolicy, options)
 
 	projectsRoot := ""
 	if a.projects != nil {
@@ -861,7 +844,6 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 		LSPManager:    lspMgr,
 		Check:         checkPolicy,
 		Ask:           askPolicy,
-		AskAction:     askActionPolicy,
 		ResolveAdapt:  a.resolveAdapt,
 	})
 	registry.Register(tt)
@@ -895,11 +877,10 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 	}
 	res := a.assembleSystemPromptForSessionResolved(promptUnit, snap.resolved, snap.resolveErr)
 	loopCfg := runningUnitLoopConfig{
-		Registry:        registry,
-		SystemPrompt:    res.Prompt,
-		Store:           store,
-		Events:          rt.loopEvents,
-		PendingExecutor: pendingExecutor,
+		Registry:     registry,
+		SystemPrompt: res.Prompt,
+		Store:        store,
+		Events:       rt.loopEvents,
 	}
 	unitCfg := runningUnitConfig{
 		Runtime:         rt,
@@ -911,7 +892,6 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 		InstalledPrompt: res.Prompt,
 		Store:           store,
 		TaskTool:        tt,
-		PendingExecutor: pendingExecutor,
 		FileTracker:     fileTracker,
 		LSPDiagnostics:  lspDiag,
 		Loop:            loopCfg,
@@ -926,7 +906,6 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 	unit.lp.SetContextTransformer(sessionLoopHooks{agent: a, unit: unit})
 	unit.lp.SetUsageRecorder(sessionLoopHooks{agent: a, unit: unit})
 	tt.usageRecorder = sessionLoopHooks{agent: a, unit: unit}
-	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 	return unit, res.Warnings, nil
 }
 
@@ -1655,20 +1634,14 @@ func permissionRequestFromGateRequest(req permission.Request) *PermissionRequest
 		ToolName:           req.ToolName,
 		Arg:                req.Arg,
 		ResolvedArg:        req.ResolvedArg,
-		CanAllowAll:        req.CanAllowAll,
 		DisableProjectSave: req.DisableProjectSave,
-		BatchIndex:         req.BatchIndex,
-		BatchTotal:         req.BatchTotal,
 		BatchFiles:         req.BatchFiles,
 		BatchResolvedFiles: req.BatchResolvedFiles,
 	}
 }
 
 func permissionRequestFromLoopEvent(ev loop.Event, sessionID, projectID string) *PermissionRequest {
-	canAllowAll, _ := ev.Metadata["can_allow_all"].(bool)
 	disableProjectSave, _ := ev.Metadata["disable_project_save"].(bool)
-	batchIndex, _ := ev.Metadata["batch_index"].(int)
-	batchTotal, _ := ev.Metadata["batch_total"].(int)
 	batchFiles, _ := ev.Metadata["batch_files"].([]string)
 	batchResolvedFiles, _ := ev.Metadata["batch_resolved_files"].([]string)
 	resolvedArg, _ := ev.Metadata["resolved_arg"].(string)
@@ -1679,10 +1652,7 @@ func permissionRequestFromLoopEvent(ev loop.Event, sessionID, projectID string) 
 		ToolName:           ev.ToolName,
 		Arg:                ev.PermArg,
 		ResolvedArg:        resolvedArg,
-		CanAllowAll:        canAllowAll,
 		DisableProjectSave: disableProjectSave,
-		BatchIndex:         batchIndex,
-		BatchTotal:         batchTotal,
 		BatchFiles:         batchFiles,
 		BatchResolvedFiles: batchResolvedFiles,
 	}
@@ -4330,9 +4300,6 @@ func (a *Agent) applyUnitConfigLocked(unit *session) {
 			}
 		}
 	}
-	if unit.pendingExecutor != nil {
-		unit.pendingExecutor.SetToolsConfig(a.cfg.Tools)
-	}
 	if unit.taskToolInst != nil {
 		unit.taskToolInst.setCatalog(a.catalog)
 		unit.taskToolInst.setMaxConcurrent(a.cfg.Subagents.MaxConcurrent)
@@ -6079,8 +6046,7 @@ func (a *Agent) messagesForFrontendForStore(store *snapshot.Store, sessionID str
 // durable while its commit has not run stays invisible to the durable half
 // until the coordinator commits it (it appears only through the retained
 // tail/live events before that). The bound is applied to the raw records,
-// where every element carries its turn, and a staged-flush wrapper produces no
-// row at all.
+// where every element carries its turn.
 func (a *Agent) messagesThroughTurn(store *snapshot.Store, sessionID string, committedTurn int) ([]DisplayMessage, error) {
 	if store == nil {
 		return nil, snapshot.ErrNoSession
@@ -6130,7 +6096,6 @@ func (a *Agent) renderCompleteTurns(raw []snapshot.TurnMessages) []DisplayMessag
 
 	for _, t := range raw {
 		toolStubs := make(map[string]int)
-		legacyStagedFlushAllowed := false
 		for _, line := range t.Messages {
 			var m message.Message
 			if json.Unmarshal(line, &m) != nil {
@@ -6141,37 +6106,7 @@ func (a *Agent) renderCompleteTurns(raw []snapshot.TurnMessages) []DisplayMessag
 
 			case message.RoleUser:
 				c := m.TextContent()
-				entries, ok := loop.ParseStagedFlushMessage(m)
-				if !ok && legacyStagedFlushAllowed {
-					// Compatibility for sessions persisted by the short-lived
-					// unmarked wrapper format on this branch. Real typed user
-					// prompts are turn-leading messages, so only allow the old
-					// text marker after a staged tool result in the same turn.
-					entries, ok = loop.ParseStagedFlush(c)
-				}
-				if ok {
-					// <staged-flush> wrapper: overlay the real per-staged results
-					// onto the tool stubs (which currently hold "Staged."), so
-					// reload matches the live per-tool ToolCallEnd events. Produces
-					// no transcript row. New wrappers carry metadata; old wrappers
-					// fall back to registry-derived metadata from args+result.
-					for _, e := range entries {
-						idx, found := toolStubs[e.ID]
-						if !found {
-							continue
-						}
-						out[idx].Done = true
-						out[idx].Success = !e.IsError
-						out[idx].Result = e.Result
-						if out[idx].Success && e.Metadata != nil {
-							out[idx].Metadata = e.Metadata
-						} else if out[idx].Success {
-							out[idx].Metadata = a.displayMetadataForToolCall(out[idx].Name, out[idx].Args, e.Result)
-						} else {
-							out[idx].Metadata = nil
-						}
-					}
-				} else if signal, ok := loop.ParseSystemSignalMessage(m); ok {
+				if signal, ok := loop.ParseSystemSignalMessage(m); ok {
 					if bg, ok := parseBackgroundTerminalSignal(signal); ok {
 						out = append(out, DisplayMessage{
 							Type:              "background_process",
@@ -6216,9 +6151,6 @@ func (a *Agent) renderCompleteTurns(raw []snapshot.TurnMessages) []DisplayMessag
 				if idx, ok := toolStubs[m.ToolCallID]; ok {
 					out[idx].Done = true
 					content := m.TextContent()
-					if content == "Staged." {
-						legacyStagedFlushAllowed = true
-					}
 					out[idx].Success = !displayToolResultIsError(m, out[idx].Name, content)
 					out[idx].Result = content
 					if out[idx].Success {
@@ -6248,10 +6180,6 @@ func displayToolResultIsError(msg message.Message, toolName, content string) boo
 	}
 	if content == "denied by user" || strings.HasPrefix(content, "error: ") {
 		return true
-	}
-	if toolName == "execute_pending" {
-		return strings.HasPrefix(content, "Failed to apply ") ||
-			(strings.HasPrefix(content, "Applied ") && strings.Contains(content, " failed."))
 	}
 	return false
 }

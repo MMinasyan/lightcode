@@ -181,13 +181,13 @@ func TestTranscriptCoordinatorToolEndKeepsRowSequence(t *testing.T) {
 	}
 }
 
-// TestTranscriptCoordinatorStagedToolLastEndWins verifies a second tool end for the
-// same call overwrites the first in place, without adding a row or a sequence.
-func TestTranscriptCoordinatorStagedToolLastEndWins(t *testing.T) {
+// TestTranscriptCoordinatorLastEndWins verifies a second tool end for the same
+// call overwrites the first in place, without adding a row or a sequence.
+func TestTranscriptCoordinatorLastEndWins(t *testing.T) {
 	tr := newTranscript()
 	feedTranscriptEvents(tr, []Event{
 		{Kind: EventToolCallStart, ToolCallID: "t1", ToolName: "apply_patch"},
-		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "Staged."},
+		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "first"},
 		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "Applied.", ToolName: "apply_patch"},
 	})
 	tr.seqMu.Lock()
@@ -231,7 +231,7 @@ func TestTranscriptCoordinatorToolMetadataAndSubagentLinks(t *testing.T) {
 	tr2 := newTranscript()
 	feedTranscriptEvents(tr2, []Event{
 		{Kind: EventToolCallStart, ToolCallID: "t1", ToolName: "task"},
-		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "staged", Metadata: meta},
+		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "ok", Metadata: meta},
 		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "boom", IsError: true},
 	})
 	tr2.seqMu.Lock()

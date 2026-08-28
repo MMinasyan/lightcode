@@ -572,10 +572,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 			"tool":               ev.PermReq.ToolName,
 			"arg":                ev.PermReq.Arg,
 			"resolvedArg":        ev.PermReq.ResolvedArg,
-			"canAllowAll":        ev.PermReq.CanAllowAll,
 			"canSaveProject":     !ev.PermReq.DisableProjectSave,
-			"batchIndex":         ev.PermReq.BatchIndex,
-			"batchTotal":         ev.PermReq.BatchTotal,
 			"batchFiles":         ev.PermReq.BatchFiles,
 			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		}

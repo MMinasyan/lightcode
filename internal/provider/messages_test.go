@@ -17,7 +17,7 @@ func TestSerializeMessagesEmitsExtrasAndSystemRole(t *testing.T) {
 	history := []message.Message{
 		func() message.Message {
 			msg := message.NewText(message.RoleSystem, "instructions")
-			msg.InternalKind = "staged_flush"
+			msg.InternalKind = "kind_demo"
 			return msg
 		}(),
 		{

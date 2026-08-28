@@ -379,7 +379,7 @@ func TestGateRespondActionInvalid(t *testing.T) {
 
 	result := make(chan ResponseAction, 1)
 	go func() {
-		result <- gate.AskRequest(context.Background(), Request{ToolName: "write_file", Arg: "a.go", CanAllowAll: true})
+		result <- gate.AskRequest(context.Background(), Request{ToolName: "write_file", Arg: "a.go"})
 	}()
 	waitForPending(t, gate, 1)
 	id := <-idCh
@@ -406,7 +406,13 @@ func TestGateRespondActionInvalid(t *testing.T) {
 	}
 }
 
-func TestGateAskRequestForgedAllowAllBecomesAllow(t *testing.T) {
+// --- Forged allow_all cannot settle a request ---
+
+// TestGateRejectsForgedAllowAll asserts that allow_all — a staging-only
+// batch-settle action — no longer settles an ordinary (non-staged) request.
+// After staging removal it is rejected as an invalid response action, so a
+// forged call cannot bypass the per-call allow/deny gate.
+func TestGateRejectsForgedAllowAll(t *testing.T) {
 	idCh := make(chan string, 1)
 	gate := NewGate(func(ctx context.Context, req Request) {
 		idCh <- req.ID
@@ -414,77 +420,20 @@ func TestGateAskRequestForgedAllowAllBecomesAllow(t *testing.T) {
 
 	result := make(chan ResponseAction, 1)
 	go func() {
-		result <- gate.AskRequest(context.Background(), Request{ToolName: "apply_patch", Arg: "a.go", CanAllowAll: false})
+		result <- gate.AskRequest(context.Background(), Request{ToolName: "write_file", Arg: "a.go"})
 	}()
 	waitForPending(t, gate, 1)
 	id := <-idCh
 
-	if err := gate.RespondAction(id, string(ResponseAllowAll)); err != nil {
-		t.Fatal(err)
+	if err := gate.RespondAction(id, "allow_all"); err == nil {
+		t.Fatal("forged allow_all must not settle a request")
 	}
 
+	gate.Respond(id, false)
 	select {
-	case got := <-result:
-		if got != ResponseAllow {
-			t.Fatalf("got %q, want allow", got)
-		}
+	case <-result:
 	case <-time.After(time.Second):
 		t.Fatal("AskRequest did not return")
-	}
-}
-
-// --- AskRequest with AllowAll ---
-
-func TestGateAskRequestAllowAll(t *testing.T) {
-	idCh := make(chan string, 1)
-	gate := NewGate(func(ctx context.Context, req Request) {
-		idCh <- req.ID
-	})
-
-	result := make(chan ResponseAction, 1)
-	go func() {
-		result <- gate.AskRequest(context.Background(), Request{ToolName: "write_file", Arg: "a.go", CanAllowAll: true})
-	}()
-	waitForPending(t, gate, 1)
-	id := <-idCh
-
-	if err := gate.RespondAction(id, string(ResponseAllowAll)); err != nil {
-		t.Fatal(err)
-	}
-
-	select {
-	case got := <-result:
-		if got != ResponseAllowAll {
-			t.Fatalf("got %q, want allow_all", got)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("AskRequest did not return")
-	}
-}
-
-// --- Ask returns true for AllowAll ---
-
-func TestGateAskReturnsTrueForAllowAll(t *testing.T) {
-	idCh := make(chan string, 1)
-	gate := NewGate(func(ctx context.Context, req Request) {
-		idCh <- req.ID
-	})
-
-	result := make(chan bool, 1)
-	go func() {
-		result <- gate.Ask(context.Background(), "write_file", "a.go")
-	}()
-	waitForPending(t, gate, 1)
-	id := <-idCh
-
-	gate.RespondAction(id, string(ResponseAllowAll))
-	select {
-	case got := <-result:
-		if !got {
-			t.Fatal("Ask should return true for allow_all")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Ask did not return")
 	}
 }
 

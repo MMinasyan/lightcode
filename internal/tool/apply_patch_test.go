@@ -22,6 +22,7 @@ func applyPatchInput(t *testing.T, s string) string {
 // call. The real snapshot store does this; the test store used by
 // edit_file tests assumes a pre-existing file, which is wrong for
 // apply_patch's Add and Move-destination cases.
+
 type applyPatchStore struct {
 	turn            int
 	calls           []snapshotCall
@@ -864,10 +865,9 @@ func TestApplyPatchPreviewClearedOnError(t *testing.T) {
 
 func TestApplyPatchRegisteredAsDefaultHiddenExcludedFromBaseline(t *testing.T) {
 	// Build a registry that contains the same core tools as the main
-	// agent (read_file / write_file / edit_file / apply_patch) plus
-	// execute_pending, then verify apply_patch is hidden from the
-	// baseline advertisement and revealed only by an IncludeTools
-	// adaptation. This is the master-invariant guard.
+	// agent (read_file / write_file / edit_file / apply_patch), then verify
+	// apply_patch is hidden from the baseline advertisement and revealed
+	// only by an IncludeTools adaptation. This is the master-invariant guard.
 	dir := t.TempDir()
 	store := &applyPatchStore{turn: 1}
 	tracker := NewFileTracker()
@@ -876,7 +876,6 @@ func TestApplyPatchRegisteredAsDefaultHiddenExcludedFromBaseline(t *testing.T) {
 	for _, t := range core {
 		registry.Register(t)
 	}
-	registry.Register(ExecutePending{})
 
 	// Baseline: apply_patch must be absent.
 	baselineNames := openAIToolNames(registry, nil)

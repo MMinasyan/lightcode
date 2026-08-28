@@ -17,10 +17,7 @@ export function normalizePermission(p) {
     tool: p.tool,
     args: p.args,
     resolvedArg: p.resolvedArg ?? p.resolved_arg ?? '',
-    canAllowAll: p.canAllowAll ?? p.can_allow_all ?? false,
     canSaveProject,
-    batchIndex: p.batchIndex ?? p.batch_index ?? 0,
-    batchTotal: p.batchTotal ?? p.batch_total ?? 0,
     batchFiles: p.batchFiles ?? p.batch_files,
     batchResolvedFiles: p.batchResolvedFiles ?? p.batch_resolved_files,
   };

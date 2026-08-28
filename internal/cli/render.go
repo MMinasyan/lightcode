@@ -576,9 +576,6 @@ func renderWarningMsg(content string) string {
 
 func permissionActions(req *agent.PermissionRequest) []menuItem {
 	items := []menuItem{}
-	if req != nil && req.CanAllowAll {
-		items = append(items, menuItem{label: "Allow all", detail: "remaining staged calls", selectable: true, extra: "allow_all"})
-	}
 	items = append(items,
 		menuItem{label: "Allow", detail: "once", selectable: true, extra: "allow"},
 		menuItem{label: "Deny", detail: "this request", selectable: true, extra: "deny"},
@@ -595,9 +592,6 @@ func permissionActionCount(req *agent.PermissionRequest) int {
 
 func permissionMenuItems(req *agent.PermissionRequest) []menuItem {
 	label := req.Arg
-	if req.CanAllowAll && req.BatchTotal > 0 {
-		label = fmt.Sprintf("%s  (%d/%d)", req.Arg, req.BatchIndex, req.BatchTotal)
-	}
 	items := []menuItem{
 		{label: req.ToolName, selectable: false},
 		{label: label, selectable: false},
@@ -607,9 +601,6 @@ func permissionMenuItems(req *agent.PermissionRequest) []menuItem {
 	}
 	if len(req.BatchFiles) > 0 {
 		title := "Affected files:"
-		if req.CanAllowAll {
-			title = "Staged files:"
-		}
 		items = append(items, menuItem{label: title, selectable: false})
 		current := req.Arg
 		for i, file := range req.BatchFiles {
@@ -705,12 +696,6 @@ func formatToolArgs(name, args string) string {
 			return "$"
 		}
 		return "$ " + command
-	case "execute_pending":
-		act := extractJSONString(args, "action")
-		if act == "discard" {
-			return "discard"
-		}
-		return "apply"
 	case "process":
 		action := formatHeaderArg(extractJSONString(args, "action"), 80)
 		id := formatHeaderArg(extractJSONString(args, "id"), 80)

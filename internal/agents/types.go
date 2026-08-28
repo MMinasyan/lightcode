@@ -15,7 +15,6 @@ var StandardTools = []string{
 	"edit_file",
 	"apply_patch",
 	"run_command",
-	"execute_pending",
 	"process",
 	"sleep",
 	"task",

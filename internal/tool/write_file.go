@@ -2,7 +2,6 @@ package tool
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -157,7 +156,7 @@ func retainFailedMutatedSnapshot(entry snapshotEntry, path string, err error) er
 	return err
 }
 
-// WriteFile implements the write_file tool with pending support.
+// WriteFile implements the write_file tool.
 type WriteFile struct {
 	tracker       *FileTracker
 	cfg           config.ToolsConfig
@@ -180,8 +179,7 @@ func (w *WriteFile) Name() string { return "write_file" }
 func (w *WriteFile) Description() string {
 	return `Writes a file to disk.
 - Creates parent directories if they don't exist. Overwrites the file if it already exists.
-- Use this tool for new files or complete rewrites. For targeted changes to existing files, use edit_file instead. Writing to a path that already exists overwrites it entirely, so when creating a new file, use a path that does not already exist.
-- ALWAYS use pending=true when your task requires multiple edits or writes. Pending calls will be applied AUTOMATICALLY with next tool call or after your response.`
+- Use this tool for new files or complete rewrites. For targeted changes to existing files, use edit_file instead. Writing to a path that already exists overwrites it entirely, so when creating a new file, use a path that does not already exist.`
 }
 
 func (w *WriteFile) ParametersSchema() map[string]any {
@@ -195,10 +193,6 @@ func (w *WriteFile) ParametersSchema() map[string]any {
 			"content": map[string]any{
 				"type":        "string",
 				"description": "Full content to write to the file.",
-			},
-			"pending": map[string]any{
-				"type":        "boolean",
-				"description": "If true, stage this write for batch execution with other pending edits.",
 			},
 		},
 		"required": []string{"path", "content"},
@@ -216,12 +210,6 @@ func (w *WriteFile) Execute(_ context.Context, params map[string]any) (string, e
 	}
 	return res.Result, nil
 }
-
-func (w *WriteFile) ValidateStaged(_ context.Context, args json.RawMessage) error {
-	return validateWriteStagedArgs(args)
-}
-
-func (w *WriteFile) StagedResultMessage() string { return "Staged." }
 
 // WriteFileWithSnapshot wraps WriteFile so that every successful write
 // is preceded by a call to the snapshot store.
@@ -248,12 +236,6 @@ func (*WriteFileWithSnapshot) Description() string { return (&WriteFile{}).Descr
 func (*WriteFileWithSnapshot) ParametersSchema() map[string]any {
 	return (&WriteFile{}).ParametersSchema()
 }
-
-func (*WriteFileWithSnapshot) ValidateStaged(_ context.Context, args json.RawMessage) error {
-	return validateWriteStagedArgs(args)
-}
-
-func (*WriteFileWithSnapshot) StagedResultMessage() string { return "Staged." }
 
 func (w *WriteFileWithSnapshot) Execute(_ context.Context, params map[string]any) (string, error) {
 	path, _ := params["path"].(string)
@@ -297,21 +279,6 @@ func (w *WriteFileWithSnapshot) Execute(_ context.Context, params map[string]any
 	}
 	retainMutatedSnapshot(snapshot)
 	return res.Result, nil
-}
-
-func validateWriteStagedArgs(args json.RawMessage) error {
-	var params map[string]any
-	if err := json.Unmarshal(args, &params); err != nil {
-		return fmt.Errorf("write_file: invalid staged arguments: %w", err)
-	}
-	path, _ := params["path"].(string)
-	if path == "" {
-		return fmt.Errorf("write_file: path is required")
-	}
-	if _, ok := params["content"].(string); !ok {
-		return fmt.Errorf("write_file: content must be a string")
-	}
-	return nil
 }
 
 // writeFileExecCommon is the shared implementation.

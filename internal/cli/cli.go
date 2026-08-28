@@ -109,8 +109,7 @@ type CLI struct {
 	// terminal line (set on ToolCallStart, consumed by its ToolCallEnd,
 	// cleared by any other terminal-writing event). A ToolCallEnd matching it
 	// is an inline completion (safe to rewrite in place with a cursor-up);
-	// a non-matching end (e.g. a staged-flush result arriving at turn end,
-	// far below its row) is rendered as a fresh block instead.
+	// a non-matching end is rendered as a fresh block instead.
 	activeToolID string
 
 	// queueDisplay mirrors the backend-owned input queue (updated from
@@ -916,10 +915,6 @@ func (c *CLI) handleKeyPermission(k keyMsg) error {
 		if !req.DisableProjectSave {
 			return c.showPermissionSuggestions(req)
 		}
-	case 'a', 'A':
-		if req.CanAllowAll {
-			c.popAndRespondAction(req, "allow_all")
-		}
 	}
 	return nil
 }
@@ -937,8 +932,6 @@ func (c *CLI) choosePermission(req *agent.PermissionRequest) error {
 		c.popAndRespond(req, false)
 	case "project":
 		return c.showPermissionSuggestions(req)
-	case "allow_all":
-		c.popAndRespondAction(req, "allow_all")
 	}
 	return nil
 }
@@ -1180,9 +1173,8 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.stopAnimationLocked()
 		inline := ev.ToolCallID == c.activeToolID
 		c.activeToolID = ""
-		// Model update is last-end-wins (no !done guard): a staged edit emits
-		// a second ToolCallEnd (the real result, at flush) after its stage-time
-		// "Staged." end; the real result must overwrite the row to match reload.
+		// Model update is last-end-wins (no !done guard): a later ToolCallEnd
+		// for the same id overwrites the row to match reload.
 		var row *displayEntry
 		for i := len(c.messages) - 1; i >= 0; i-- {
 			if c.messages[i].typ == "tool" && c.messages[i].id == ev.ToolCallID {
@@ -1211,11 +1203,11 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			}
 			c.writeRaw(renderToolResult(ev.ToolName, ev.Args, ev.Result, !ev.IsError, c.toolExpanded, int(c.width.Load()), ev.Metadata))
 		} else {
-			// Late completion (e.g. a staged-flush result arriving at turn end,
-			// far below its row): render a fresh block without cursor-relative
-			// rewrite. Render the header from the MODEL row (the reload-equivalent
-			// source), since the staged-flush ToolCallEnd carries no Args and the
-			// row retains the original path from ToolCallStart.
+			// Late completion (a ToolCallEnd arriving after its row scrolled
+			// out of inline position): render a fresh block without
+			// cursor-relative rewrite. Render the header from the MODEL row
+			// (the reload-equivalent source), since the end may carry no Args
+			// and the row retains the original path from ToolCallStart.
 			name, args, meta := ev.ToolName, ev.Args, ev.Metadata
 			if row != nil {
 				name, args, meta = row.name, row.args, row.metadata

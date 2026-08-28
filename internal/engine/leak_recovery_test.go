@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"regexp"
 	"strings"
 	"testing"
@@ -83,20 +82,6 @@ func (c *cancellingClient) ProtocolWarnings([]message.Message) []modelclient.Pro
 func (c *cancellingClient) Model() string                { return c.ref.Model }
 func (c *cancellingClient) ModelRef() coremodel.ModelRef { return c.ref }
 
-// erroringFlushCoordinator fails the turn-end flush, exercising the flush-error
-// return that must precede (and therefore strand no) leak signal.
-type erroringFlushCoordinator struct{ name string }
-
-func (c erroringFlushCoordinator) ExplicitFlushToolName() string { return c.name }
-func (c erroringFlushCoordinator) FlushPending(context.Context, *tool.PendingQueue) ([]tool.BatchResult, bool, error) {
-	return nil, false, nil
-}
-func (c erroringFlushCoordinator) AutoFlushBefore(context.Context, tool.ToolCall, *tool.PendingQueue) ([]tool.BatchResult, bool, error) {
-	return nil, false, nil
-}
-func (c erroringFlushCoordinator) FlushAtTurnEnd(context.Context, *tool.PendingQueue) ([]tool.BatchResult, bool, error) {
-	return nil, false, errors.New("flush boom")
-}
 
 func historyHasSignal(msgs []message.Message, payload string) bool {
 	for _, m := range msgs {
@@ -120,15 +105,6 @@ func storeHasSignal(store *fakeStore, payload string) bool {
 func historyHasToolResult(msgs []message.Message, id, content string) bool {
 	for _, m := range msgs {
 		if m.Role == message.RoleTool && m.ToolCallID == id && m.TextContent() == content {
-			return true
-		}
-	}
-	return false
-}
-
-func historyHasStagedFlush(msgs []message.Message) bool {
-	for _, m := range msgs {
-		if _, ok := ParseStagedFlushMessage(m); ok {
 			return true
 		}
 	}
@@ -181,7 +157,7 @@ func TestLeakRecoveryMixedAllowedExecutesAndQueues(t *testing.T) {
 		},
 	}
 	registry := tool.NewRegistry()
-	registry.Register(stagedStubTool{name: "read_file", result: "file contents"})
+	registry.Register(	simpleStubTool{name: "read_file", result: "file contents"})
 	lp := New(client, registry, "system")
 	lp.SetActiveAdaptation(leakAdaptation())
 
@@ -213,7 +189,7 @@ func TestLeakRecoveryMixedDeniedQueuesNothing(t *testing.T) {
 		},
 	}
 	registry := tool.NewRegistry()
-	registry.Register(stagedStubTool{name: "write_file", denied: true})
+	registry.Register(	simpleStubTool{name: "write_file", denied: true})
 	lp := New(client, registry, "system")
 	lp.SetActiveAdaptation(leakAdaptation())
 
@@ -263,70 +239,6 @@ func TestLeakRecoveryRefusalNotScanned(t *testing.T) {
 	}
 	if len(client.requests) != 1 {
 		t.Fatalf("requests = %d, want 1 (refusal ends the turn)", len(client.requests))
-	}
-}
-
-// 6. Leak + non-empty pending queue: staged edits flush (wrapper persisted) THEN the
-// signal is queued and the loop continues.
-func TestLeakRecoveryFlushesPendingThenQueues(t *testing.T) {
-	client := &sequenceModelClient{
-		ref: coremodel.ModelRef{Provider: "p", Model: "m"},
-		streams: []modelclient.ChatStream{
-			mixedStream("", "call_1", "edit_file", `{"path":"f.txt","old_string":"a","new_string":"b","pending":true}`),
-			contentStream("LEAKED_CALL after staging"),
-			contentStream("done"),
-		},
-	}
-	registry := tool.NewRegistry()
-	registry.Register(stagedStubTool{name: "edit_file"})
-	lp := New(client, registry, "system")
-	store := &fakeStore{}
-	lp.SetStore(store)
-	setTestPendingExecutor(lp, registry, fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
-		"call_1": {Success: true, Result: "Edited f.txt."},
-	}})
-	lp.SetActiveAdaptation(leakAdaptation())
-
-	out, err := lp.Run(context.Background(), "go")
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if out != "done" {
-		t.Fatalf("Run = %q, want done", out)
-	}
-	if len(client.requests) != 3 {
-		t.Fatalf("requests = %d, want 3", len(client.requests))
-	}
-	if !historyHasStagedFlush(lp.Messages()) {
-		t.Fatal("staged edit was not flushed at the leak turn end")
-	}
-	if !historyHasSignal(client.requests[2].Messages, leakRecoverySignal) {
-		t.Fatal("leak signal not drained before the third request")
-	}
-}
-
-// 7. Leak + non-empty pending queue + flush error: Run returns the flush error and no
-// wake signal remains (the signal is queued only after a successful flush).
-func TestLeakRecoveryFlushErrorStrandsNoSignal(t *testing.T) {
-	client := &sequenceModelClient{
-		ref: coremodel.ModelRef{Provider: "p", Model: "m"},
-		streams: []modelclient.ChatStream{
-			mixedStream("", "call_1", "edit_file", `{"path":"f.txt","old_string":"a","new_string":"b","pending":true}`),
-			contentStream("LEAKED_CALL after staging"),
-		},
-	}
-	registry := tool.NewRegistry()
-	registry.Register(stagedStubTool{name: "edit_file"})
-	registry.RegisterPendingCoordinator(erroringFlushCoordinator{name: "execute_pending"})
-	lp := New(client, registry, "system")
-	lp.SetActiveAdaptation(leakAdaptation())
-
-	_, err := lp.Run(context.Background(), "go")
-	if err == nil || !strings.Contains(err.Error(), "flush pending at turn end") {
-		t.Fatalf("Run err = %v, want flush error", err)
-	}
-	if lp.HasPendingWakeSignal() {
-		t.Fatal("a wake signal is queued despite the flush error (fourth strand path)")
 	}
 }
 

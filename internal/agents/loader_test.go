@@ -140,6 +140,35 @@ func TestSubmitPlanToolIsRejectedInCustomDefinitions(t *testing.T) {
 	}
 }
 
+func TestExecutePendingToolIsRejectedInCustomDefinitions(t *testing.T) {
+	cfg, err := Parse([]byte(`{
+  "stager": {"tools":["read_file","execute_pending"]},
+  "reader": {"tools":["read_file"]}
+}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if _, err := cfg.Resolve("stager"); err == nil || !strings.Contains(err.Error(), `unknown agent type`) {
+		t.Fatalf(`Resolve(stager with execute_pending) error = %v, want the entry dropped as unknown`, err)
+	}
+	reader, err := cfg.Resolve("reader")
+	if err != nil {
+		t.Fatalf("Resolve(reader): %v", err)
+	}
+	if !reflect.DeepEqual(reader.Tools, []string{"read_file"}) {
+		t.Fatalf("known-tool custom definition tools = %v, want it retained", reader.Tools)
+	}
+
+	warnings := cfg.Warnings()
+	if len(warnings) != 1 || warnings[0].Kind != "invalid_agent_type" || warnings[0].Name != "stager" {
+		t.Fatalf("warnings = %#v, want one invalid custom warning naming stager", warnings)
+	}
+	if !strings.Contains(warnings[0].Message, `unknown tool "execute_pending"`) {
+		t.Fatalf(`warning message = %q, want the unknown execute_pending tool named`, warnings[0].Message)
+	}
+}
+
 func TestBuiltinsExposeConcreteRootAndCodeOnlyCompact(t *testing.T) {
 	cfg, err := Parse([]byte(`{}`))
 	if err != nil {

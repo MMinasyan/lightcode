@@ -378,9 +378,9 @@ describe('child stream lifecycle', () => {
     expect(row.result).toBe('denied');
   });
 
-  // An apply_patch child tool call emits two ends on the same row (stage-time
-  // and real result); the last one wins. Both carry the row's original
-  // sequence, so a uniformly-gated implementation would drop both.
+  // Two tool_result ends for the same apply_patch row: the last one wins.
+  // Both carry the row's original sequence, so a uniformly-gated
+  // implementation would drop both.
   it('renders the last of two apply_patch ends', () => {
     const generation = openSubagentViewer('Explore', 'session-1');
     appendSubagentEvent('session-1', { type: 'tool_start', seq: 2, id: 'call-1', name: 'apply_patch', args: '{}' });
@@ -389,7 +389,7 @@ describe('child stream lifecycle', () => {
       tail: [{ seq: 2, message: { type: 'tool', id: 'call-1', name: 'apply_patch', args: '{}', done: false, success: true, result: '' } }],
       cursor: { committedSeq: 5 },
     }, generation);
-    appendSubagentEvent('session-1', { type: 'tool_result', seq: 2, id: 'call-1', success: true, output: 'staged' });
+    appendSubagentEvent('session-1', { type: 'tool_result', seq: 2, id: 'call-1', success: true, output: 'first result' });
     appendSubagentEvent('session-1', { type: 'tool_result', seq: 2, id: 'call-1', success: true, output: 'real result' });
     const row = get(viewer).messages.find((m) => m.type === 'tool' && m.id === 'call-1');
     expect(row.done).toBe(true);

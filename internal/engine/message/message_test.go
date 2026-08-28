@@ -31,7 +31,7 @@ func TestMessageJSONFlattensExtraAndSource(t *testing.T) {
 		}},
 		Extra:        Extra{"reasoning_content": json.RawMessage(`"thinking"`)},
 		Source:       coremodel.ModelRef{Provider: "xiaomi", Model: "mimo-v2.5-pro"},
-		InternalKind: "staged_flush",
+		InternalKind: "kind_demo",
 		DisplayMetadata: map[string]any{
 			"subagent_session_ids": []map[string]any{{"index": 0, "sessionId": "child"}},
 		},
@@ -52,7 +52,7 @@ func TestMessageJSONFlattensExtraAndSource(t *testing.T) {
 	if raw["_lightcode_source"] != "xiaomi/mimo-v2.5-pro" {
 		t.Fatalf("_lightcode_source = %#v", raw["_lightcode_source"])
 	}
-	if raw["_lightcode_internal"] != "staged_flush" {
+	if raw["_lightcode_internal"] != "kind_demo" {
 		t.Fatalf("_lightcode_internal = %#v", raw["_lightcode_internal"])
 	}
 	if _, ok := raw["_lightcode_display_metadata"].(map[string]any); !ok {
@@ -71,8 +71,8 @@ func TestMessageJSONFlattensExtraAndSource(t *testing.T) {
 	if decoded.Source != msg.Source {
 		t.Fatalf("Source = %#v, want %#v", decoded.Source, msg.Source)
 	}
-	if decoded.InternalKind != "staged_flush" {
-		t.Fatalf("InternalKind = %q, want staged_flush", decoded.InternalKind)
+	if decoded.InternalKind != "kind_demo" {
+		t.Fatalf("InternalKind = %q, want kind_demo", decoded.InternalKind)
 	}
 	if decoded.DisplayMetadata["subagent_session_ids"] == nil {
 		t.Fatalf("DisplayMetadata = %#v, want subagent links", decoded.DisplayMetadata)
