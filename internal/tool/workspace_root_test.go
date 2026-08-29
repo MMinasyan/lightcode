@@ -54,7 +54,6 @@ func TestFileToolsResolveRelativePathsFromWorkspaceRoot(t *testing.T) {
 	}
 }
 
-
 func TestRunCommandUsesWorkspaceRoot(t *testing.T) {
 	root := t.TempDir()
 	other := t.TempDir()

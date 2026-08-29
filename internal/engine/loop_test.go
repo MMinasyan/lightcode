@@ -990,7 +990,6 @@ func TestWakeSignalDuringTextModelCallStartsNextModelRequest(t *testing.T) {
 	}
 }
 
-
 type queueSignalTool struct {
 	queue func()
 }
@@ -1007,7 +1006,6 @@ func (t queueSignalTool) Execute(context.Context, map[string]any) (string, error
 	t.queue()
 	return "tool result", nil
 }
-
 
 func TestConsumeStreamDoesNotMergeToolCallsWhenProviderOmitsIndices(t *testing.T) {
 	stream := newParsedTestStream(strings.Join([]string{

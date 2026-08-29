@@ -371,7 +371,6 @@ func TestWriteDirConfinementAllowsActualWritesOutsideProject(t *testing.T) {
 	}
 }
 
-
 func TestWriteDirConfinementCanonicalBypassMatrix(t *testing.T) {
 	root := t.TempDir()
 	writeDir := filepath.Join(root, "write")

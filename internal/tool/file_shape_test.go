@@ -132,7 +132,6 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 				return err
 			},
 		},
-
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path, release := tc.target(t)
@@ -212,7 +211,6 @@ func TestNonRegularFileToolsDoNotSnapshot(t *testing.T) {
 				return err
 			},
 		},
-
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := &recordingNonRegularSnapshotStore{turn: 1}

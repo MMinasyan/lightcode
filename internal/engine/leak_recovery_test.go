@@ -82,7 +82,6 @@ func (c *cancellingClient) ProtocolWarnings([]message.Message) []modelclient.Pro
 func (c *cancellingClient) Model() string                { return c.ref.Model }
 func (c *cancellingClient) ModelRef() coremodel.ModelRef { return c.ref }
 
-
 func historyHasSignal(msgs []message.Message, payload string) bool {
 	for _, m := range msgs {
 		if m.InternalKind == systemSignalInternalKind && strings.Contains(m.TextContent(), payload) {
@@ -157,7 +156,7 @@ func TestLeakRecoveryMixedAllowedExecutesAndQueues(t *testing.T) {
 		},
 	}
 	registry := tool.NewRegistry()
-	registry.Register(	simpleStubTool{name: "read_file", result: "file contents"})
+	registry.Register(simpleStubTool{name: "read_file", result: "file contents"})
 	lp := New(client, registry, "system")
 	lp.SetActiveAdaptation(leakAdaptation())
 
@@ -189,7 +188,7 @@ func TestLeakRecoveryMixedDeniedQueuesNothing(t *testing.T) {
 		},
 	}
 	registry := tool.NewRegistry()
-	registry.Register(	simpleStubTool{name: "write_file", denied: true})
+	registry.Register(simpleStubTool{name: "write_file", denied: true})
 	lp := New(client, registry, "system")
 	lp.SetActiveAdaptation(leakAdaptation())
 
