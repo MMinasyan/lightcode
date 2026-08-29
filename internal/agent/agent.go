@@ -6371,6 +6371,11 @@ func (a *Agent) reserveTurnActionUnit(unit *session) (func(), error) {
 }
 
 func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError)) (TurnActionResult, error) {
+	switch action {
+	case TurnActionFork, TurnActionRevertCode:
+	default:
+		return TurnActionResult{}, fmt.Errorf("unknown turn action %q", action)
+	}
 	// Every turn action — the fork and the code rewind — reserves the unit
 	// across its durable mutation with the same reservation pair the removal
 	// path uses: the unit must not be driveable while its files are mid-restore

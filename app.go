@@ -1028,15 +1028,9 @@ func (a *App) ForkSession(turn int) error {
 	return err
 }
 
-// ApplyTurnAction applies a user-message revert/fork action. Only the retained
-// actions are admitted at this boundary; anything else is rejected before it can
-// reach the owner, so an unknown kind never reserves or mutates through Wails.
+// ApplyTurnAction applies a user-message revert/fork action. The owner admits
+// only the retained action kinds before reserving or mutating the session.
 func (a *App) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (agent.TurnActionResult, error) {
-	switch action {
-	case agent.TurnActionRevertCode, agent.TurnActionFork:
-	default:
-		return agent.TurnActionResult{}, fmt.Errorf("unsupported turn action %q (only revert_code and fork are admitted)", action)
-	}
 	a.navMu.Lock()
 	defer a.navMu.Unlock()
 	sessionID, err := a.boundedSessionIDLocked()

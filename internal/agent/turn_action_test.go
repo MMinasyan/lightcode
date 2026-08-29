@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -64,14 +65,32 @@ func TestApplyTurnActionRejectedActionsPerformNoMutation(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("expected created file before the forged actions: %v", err)
 	}
+	sessionID := a.SessionCurrent().ID
+	seedUnitQueue(t, a, sessionID, "queued draft")
+	queueBefore, err := a.QueueSnapshotForSession(sessionID)
+	if err != nil {
+		t.Fatalf("QueueSnapshotForSession before forged actions: %v", err)
+	}
+	events := &eventCapture{}
+	a.SetEventHandler(events.handler)
 
 	for _, action := range []string{"revert_history", "bogus_action"} {
-		result, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, clickedTurn, action, true)
+		result, err := a.ApplyTurnActionForSession(sessionID, clickedTurn, action, true)
 		if err == nil || !strings.Contains(err.Error(), `unknown turn action`) {
 			t.Fatalf("ApplyTurnActionForSession(%q) = %#v %v, want an unknown-action error with no mutation", action, result, err)
 		}
 		if result.SessionChanged {
 			t.Fatalf("%s forged action reported a session change: %#v", action, result)
+		}
+		queueAfter, err := a.QueueSnapshotForSession(sessionID)
+		if err != nil {
+			t.Fatalf("QueueSnapshotForSession after %q: %v", action, err)
+		}
+		if !reflect.DeepEqual(queueAfter, queueBefore) {
+			t.Fatalf("queue after %q = %#v, want unchanged %#v", action, queueAfter, queueBefore)
+		}
+		if got := countQueueChanged(events); got != 0 {
+			t.Fatalf("%q entered the transition reservation and emitted %d queue_changed event(s)", action, got)
 		}
 	}
 

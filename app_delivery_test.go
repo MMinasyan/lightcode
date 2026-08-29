@@ -1097,18 +1097,18 @@ func TestWailsForgedRevertHistoryFailsWithoutFrame(t *testing.T) {
 		log.mu.Unlock()
 	}
 	time.Sleep(20 * time.Millisecond) // quiesce: near-simultaneous seed frames land before the baseline
+	log.mu.Lock()
+	baseline := len(log.frames)
+	log.mu.Unlock()
 
 	result, err := app.ApplyTurnAction(2, "revert_history", true)
 	if err == nil {
 		t.Fatalf("forged revert_history via ApplyTurnAction succeeded: %#v, want an unknown-action error", result)
 	}
-	if !strings.Contains(err.Error(), "unsupported turn action") {
-		t.Fatalf("error = %q; the Wails boundary must reject it before reaching the owner (whose message says unknown, not unsupported)", err)
+	if !strings.Contains(err.Error(), "unknown turn action") {
+		t.Fatalf("error = %q, want the owner's unknown-action rejection", err)
 	}
 
-	log.mu.Lock()
-	baseline := len(log.frames)
-	log.mu.Unlock()
 	time.Sleep(15 * time.Millisecond) // let any (forbidden) enqueue drain through the drainer
 	log.mu.Lock()
 	n := len(log.frames)
