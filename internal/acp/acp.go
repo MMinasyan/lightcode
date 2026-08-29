@@ -37,8 +37,8 @@ type Response struct {
 // RPCError is a JSON-RPC 2.0 error object. Data is boundary-based: whenever a
 // committed/partial operation emitted a typed result boundary, the same prepared
 // result rides here, so a consumer that observed the boundary gets the identical
-// payload. History/fork carry the prepared TurnActionResult; new carries the
-// prepared SessionSummary; archive/delete and every precommit failure omit data.
+// payload. Committed fork failures carry the prepared TurnActionResult; new carries
+// the prepared SessionSummary; archive/delete and every precommit failure omit data.
 type RPCError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
