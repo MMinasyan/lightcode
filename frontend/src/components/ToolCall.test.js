@@ -186,3 +186,52 @@ describe('ToolCall file viewer ownership', () => {
     unmount(mounted.toolCall);
   });
 });
+
+describe('ToolCall removed-memory vs retained-tool rendering', () => {
+  async function mountRow(props) {
+    const { default: ToolCall } = await import('./ToolCall.svelte');
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    const toolCall = mount(ToolCall, { target, props });
+    await tick();
+    return { toolCall, target };
+  }
+
+  it('renders a forged removed memory tool through the generic renderer', async () => {
+    for (const name of ['save_memory', 'search_memory', 'search_history']) {
+      const { toolCall, target } = await mountRow({
+        name,
+        args: JSON.stringify({ key: 'value' }),
+        done: true,
+      });
+      // The removed tools fell through to the generic {:else} branch once their
+      // dedicated branches were deleted: a plain tool-name + arg line with no
+      // read-file-specific .arg.path affordance. A regression that re-added a
+      // dedicated branch would change this shape and fail here.
+      const nameEl = target.querySelector('.tool-name');
+      expect(nameEl).toBeTruthy();
+      expect(nameEl.textContent).toBe(name);
+      expect(target.querySelector('.arg.path')).toBeNull();
+      const arg = target.querySelector('.arg');
+      expect(arg).toBeTruthy();
+      expect(arg.textContent).toBe(JSON.stringify({ key: 'value' }));
+      unmount(toolCall);
+    }
+  });
+
+  it('renders a retained ordinary tool through its dedicated renderer', async () => {
+    const { toolCall, target } = await mountRow({
+      name: 'read_file',
+      args: JSON.stringify({ path: 'src/main.go' }),
+      done: true,
+    });
+    // The retained read_file takes its dedicated branch, which renders a clickable
+    // .arg.path affordance the generic renderer never produces — the distinguishing
+    // shape between a removed tool and a retained one.
+    const nameEl = target.querySelector('.tool-name');
+    expect(nameEl).toBeTruthy();
+    expect(nameEl.textContent).toBe('read_file');
+    expect(target.querySelector('.arg.path')).toBeTruthy();
+    unmount(toolCall);
+  });
+});

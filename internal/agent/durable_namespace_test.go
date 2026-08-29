@@ -177,7 +177,7 @@ func TestForkAdoptsDestinationOnCommittedPublicationError(t *testing.T) {
 	}
 	t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
 
-	result, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(state HydrationState, _ []snapshot.SkippedRevert, _ string, callbackErr *snapshot.CommittedMutationError, _ *string) {
+	result, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(state HydrationState, _ []snapshot.SkippedRevert, _ string, callbackErr *snapshot.CommittedMutationError) {
 		emitted = true
 		committedBoundary = callbackErr != nil && state.Session.ID != "" && state.Session.ID != sourceID
 	})
@@ -232,7 +232,7 @@ func TestForkCommittedPublicationAlsoRevertsSourceCode(t *testing.T) {
 		var boundarySkipped []snapshot.SkippedRevert
 		var boundaryWarning string
 		var boundaryErr *snapshot.CommittedMutationError
-		result, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, true, func(state HydrationState, skipped []snapshot.SkippedRevert, warning string, committed *snapshot.CommittedMutationError, _ *string) {
+		result, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, true, func(state HydrationState, skipped []snapshot.SkippedRevert, warning string, committed *snapshot.CommittedMutationError) {
 			boundaryState = state
 			boundarySkipped = skipped
 			boundaryWarning = warning
@@ -297,7 +297,7 @@ func TestForkCommittedPublicationAlsoRevertsSourceCode(t *testing.T) {
 
 		var boundaryWarning string
 		var boundaryErr *snapshot.CommittedMutationError
-		result, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, true, func(_ HydrationState, _ []snapshot.SkippedRevert, warning string, committed *snapshot.CommittedMutationError, _ *string) {
+		result, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, true, func(_ HydrationState, _ []snapshot.SkippedRevert, warning string, committed *snapshot.CommittedMutationError) {
 			boundaryWarning = warning
 			boundaryErr = committed
 		})
@@ -472,7 +472,7 @@ func TestRealStagedCandidateTreePrecommitFailureCleansUp(t *testing.T) {
 		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
 
 		sourceID := a.SessionCurrent().ID
-		_, err = a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string) {
+		_, err = a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError) {
 			emitted = true
 		})
 		if !errors.Is(err, injected) {
@@ -559,7 +559,7 @@ func TestRealStagedPublicationRetainsDestinationOnStagingParentSyncFailure(t *te
 		sourceID := a.SessionCurrent().ID
 		var emitted bool
 		var boundaryID string
-		result, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(state HydrationState, _ []snapshot.SkippedRevert, _ string, callbackErr *snapshot.CommittedMutationError, _ *string) {
+		result, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(state HydrationState, _ []snapshot.SkippedRevert, _ string, callbackErr *snapshot.CommittedMutationError) {
 			emitted = true
 			boundaryID = state.Session.ID
 			if callbackErr == nil {

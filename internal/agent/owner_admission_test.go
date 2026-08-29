@@ -246,13 +246,13 @@ func TestLifecycleOpsAfterClosedRefuseWithoutClaim(t *testing.T) {
 			run: func(a *Agent, id string) error { return a.SessionDelete(id) },
 		},
 		{
-			name: "revert_history_turn_action",
+			name: "revert_code_turn_action",
 			setup: func(t *testing.T, a *Agent) (string, *session) {
 				appendUserTurn(t, a, "persisted")
 				return a.SessionCurrent().ID, a.session
 			},
 			run: func(a *Agent, id string) error {
-				_, err := a.ApplyTurnActionForSession(id, 1, TurnActionRevertHistory, false)
+				_, err := a.ApplyTurnActionForSession(id, 1, TurnActionRevertCode, false)
 				return err
 			},
 		},

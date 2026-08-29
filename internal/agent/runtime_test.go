@@ -33,7 +33,4 @@ func TestRuntimeDefaultPermissionPolicyFailsClosed(t *testing.T) {
 	if got := rt.permissionPolicy.askFunc()(context.Background(), permission.Request{}); got != permission.ResponseDeny {
 		t.Fatalf("default permission ask = %v, want deny", got)
 	}
-	if got := rt.permissionPolicy.askActionFunc()(context.Background(), permission.Request{}); got != permission.ResponseDeny {
-		t.Fatalf("default permission ask action = %v, want deny", got)
-	}
 }

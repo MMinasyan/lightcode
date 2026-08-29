@@ -605,10 +605,7 @@ func (a *App) handleEvent(ev agent.Event) {
 			"tool":               ev.PermReq.ToolName,
 			"args":               ev.PermReq.Arg,
 			"resolvedArg":        ev.PermReq.ResolvedArg,
-			"canAllowAll":        ev.PermReq.CanAllowAll,
 			"canSaveProject":     !ev.PermReq.DisableProjectSave,
-			"batchIndex":         ev.PermReq.BatchIndex,
-			"batchTotal":         ev.PermReq.BatchTotal,
 			"batchFiles":         ev.PermReq.BatchFiles,
 			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		})
@@ -628,18 +625,14 @@ func (a *App) handleEvent(ev agent.Event) {
 	}
 }
 
-// turnActionBoundary is the ordered frame a fork, history revert, or code revert
-// appends through the delivery FIFO: the destination session's complete state (nil
-// when the action changed no session), the history revert's input prefill (nil for
-// fork and code revert; a nonnil pointer even when the content is empty, so an
-// empty string still clears the composer), any files a code revert kept unchanged,
-// and the warning a fork carries when its best-effort code revert failed. The
-// ordered consumer applies the state, the prefill, the skip notice, and the
-// warning in that order, so no live frame interleaves between them or clobbers
-// either notice.
+// turnActionBoundary is the ordered frame a fork or code revert appends through
+// the delivery FIFO: the destination session's complete state (nil when the action
+// changed no session), any files a code revert kept unchanged, and the warning a
+// fork carries when its best-effort code revert failed. The ordered consumer applies
+// the state, the skip notice, and the warning in that order, so no live frame
+// interleaves between them or clobbers either notice.
 type turnActionBoundary struct {
 	State        *agent.HydrationState    `json:"state"`
-	Prefill      *string                  `json:"prefill,omitempty"`
 	SkippedFiles []snapshot.SkippedRevert `json:"skippedFiles"`
 	Warning      string                   `json:"warning,omitempty"`
 }
@@ -995,22 +988,13 @@ func (a *App) RevertCode(turn int) (snapshot.RevertResult, error) {
 // turn action's committed disposition (ForkSession and ApplyTurnAction both run
 // through it): the owner's in-commit callback adopts any session-changing result,
 // then enqueues its boundary — atomically paired with exactly one unsequenced
-// error frame when a fork carries a typed committed failure. A postcommit partial
-// error — a reconciled history revert whose walk failed after the boundary
-// published the survivors — resolves the method as success: the ordered turn_action
-// frame owns the error through its warning, and a second, unowned direct error would
-// duplicate it in the frontend. A typed committed failure is always a rejection; only
-// fork pairs one adjacent error frame with its destination boundary (the prepared
-// view plus exactly that one row), while history keeps Step 4's warning-only
-// disposition — no adjacent frame on either side of its single ordered boundary. A
-// precommit error emits no frame and still rejects/returns; the typed return error is
-// kept for the ACP/CLI disposition. A code-only revert's complete boundary is prepared
-// for the protocol consumer; Wails suppresses it and keeps its existing notice-only
-// result/skips surface.
+// error frame when a fork carries a typed committed failure. A precommit error emits
+// no frame; the returned result and error are passed through as-is (the typed return
+// error is kept for the protocol consumers' disposition). A code-only revert's complete
+// boundary is prepared for the protocol consumer; Wails suppresses it and keeps its
+// existing notice-only result/skips surface.
 func (a *App) applyTurnActionWithOwnedBoundary(sessionID string, turn int, action string, alsoRevertCode bool) (agent.TurnActionResult, error) {
-	var emitted bool
-	result, err := a.svc.ApplyTurnActionForSessionWithBoundary(sessionID, turn, action, alsoRevertCode, func(state agent.HydrationState, skipped []snapshot.SkippedRevert, warning string, committed *snapshot.CommittedMutationError, prefill *string) {
-		emitted = true
+	result, err := a.svc.ApplyTurnActionForSessionWithBoundary(sessionID, turn, action, alsoRevertCode, func(state agent.HydrationState, skipped []snapshot.SkippedRevert, warning string, committed *snapshot.CommittedMutationError) {
 		if action == agent.TurnActionRevertCode {
 			// A code-only revert changes no session; the owner's complete
 			// boundary serves the protocol consumer, and the desktop keeps its
@@ -1018,42 +1002,15 @@ func (a *App) applyTurnActionWithOwnedBoundary(sessionID string, turn int, actio
 			return
 		}
 		a.setCurrentSessionID(state.Session.ID)
-		boundary := turnActionBoundary{State: &state, Prefill: prefill, SkippedFiles: skipped, Warning: warning}
+		boundary := turnActionBoundary{State: &state, SkippedFiles: skipped, Warning: warning}
 		if committed != nil && action == agent.TurnActionFork {
-			// A fork's committed failure adopts the prepared destination and settles to its view plus exactly one error row; history never pairs.
+			// A fork's committed failure adopts the prepared destination and settles to its view plus exactly one error row.
 			a.enqueueBoundaryWithError("turn_action", boundary, "", state.Session.ID, lifecycleErrorMessage(committed))
 			return
 		}
 		a.enqueueBoundary("turn_action", boundary, "", state.Session.ID)
 	})
-	if err != nil && emitted {
-		var committed *snapshot.CommittedMutationError
-		if errors.As(err, &committed) {
-			// A typed committed history failure stays a typed rejection: its
-			// boundary owns the warning, and the frontend settles to exactly
-			// one warning through the ordered frame.
-			return result, err
-		}
-		// Ordinary partial history resolves as success: the ordered turn_action
-		// frame owns the error through its warning, and a second, unowned
-		// direct error would duplicate it in the frontend.
-		return result, nil
-	}
 	return result, err
-}
-
-// RevertHistory truncates conversation above the given turn. It is the bound
-// alias of the turn-action route: the given turn is the first one removed, so
-// turns up to turn-1 survive, matching ApplyTurnAction's revert_history.
-func (a *App) RevertHistory(turn int) error {
-	a.navMu.Lock()
-	defer a.navMu.Unlock()
-	sessionID, err := a.boundedSessionIDLocked()
-	if err != nil {
-		return err
-	}
-	_, err = a.applyTurnActionWithOwnedBoundary(sessionID, turn, agent.TurnActionRevertHistory, false)
-	return err
 }
 
 // ForkSession creates a new session branched from turn N. It shares the GUI's fork
@@ -1071,7 +1028,8 @@ func (a *App) ForkSession(turn int) error {
 	return err
 }
 
-// ApplyTurnAction applies a user-message revert/fork action.
+// ApplyTurnAction applies a user-message revert/fork action. The owner admits
+// only the retained action kinds before reserving or mutating the session.
 func (a *App) ApplyTurnAction(turn int, action string, alsoRevertCode bool) (agent.TurnActionResult, error) {
 	a.navMu.Lock()
 	defer a.navMu.Unlock()

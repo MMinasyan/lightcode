@@ -61,55 +61,6 @@ func TestDirectWritesIgnoreReadFileIdentity(t *testing.T) {
 	}
 }
 
-func TestStagedWritesIgnoreReadFileIdentity(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		run  func(t *testing.T, path string, tracker *FileTracker) []BatchResult
-	}{
-		{
-			name: "write deleted after read",
-			run: func(t *testing.T, path string, tracker *FileTracker) []BatchResult {
-				if err := os.Remove(path); err != nil {
-					t.Fatal(err)
-				}
-				return NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-					stagedWrite(path, "call-1", "after"),
-				})
-			},
-		},
-		{
-			name: "write recreated after read",
-			run: func(t *testing.T, path string, tracker *FileTracker) []BatchResult {
-				recreateWithSameMtimeForIdentity(t, path, "external")
-				return NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-					stagedWrite(path, "call-1", "after"),
-				})
-			},
-		},
-		{
-			name: "edit recreated after read",
-			run: func(t *testing.T, path string, tracker *FileTracker) []BatchResult {
-				recreateWithSameMtimeForIdentity(t, path, "external")
-				return NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-					stagedEdit(path, "call-1", "external", "after", false),
-				})
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			path := readIdentityTrackedFile(t, "before")
-			tracker := NewFileTracker()
-			if _, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, tracker).Execute(context.Background(), map[string]any{"path": path}); err != nil {
-				t.Fatal(err)
-			}
-
-			results := tc.run(t, path, tracker)
-			assertSingleSuccessfulBatch(t, results)
-			assertFileContent(t, path, "after")
-		})
-	}
-}
-
 func TestSnapshotAwareFileToolsRecordPostWriteIdentityAfterRevalidation(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -230,16 +181,6 @@ func recreateWithSameMtimeForIdentity(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 	setTrackerFileMtime(t, path, mtime)
-}
-
-func assertSingleSuccessfulBatch(t *testing.T, results []BatchResult) {
-	t.Helper()
-	if len(results) != 1 {
-		t.Fatalf("results len = %d, want 1", len(results))
-	}
-	if !results[0].Success || results[0].Error != "" {
-		t.Fatalf("result = %+v, want success", results[0])
-	}
 }
 
 func fileIdentityForPath(t *testing.T, path string) FileIdentity {

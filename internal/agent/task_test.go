@@ -17,12 +17,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/adaptation"
 	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/config"
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/lsp"
-	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/tool"
@@ -344,13 +344,13 @@ func TestTaskToolWriteDirKeepsWriteToolsConfinedAndRunCommandReadOnly(t *testing
 		check: func(string, string) permission.Decision { return permission.DecisionAllow },
 	}
 	at := agentcfg.Resolved{
-		Tools:    []string{"write_file", "edit_file", "apply_patch", "execute_pending", "run_command"},
+		Tools:    []string{"write_file", "edit_file", "apply_patch", "run_command"},
 		Readonly: true,
 		WriteDir: writeDir,
 	}
 
 	registry := task.buildRegistry(at, parentMutationScope{}, nil)
-	for _, name := range []string{"write_file", "edit_file", "apply_patch", "execute_pending", "run_command"} {
+	for _, name := range []string{"write_file", "edit_file", "apply_patch", "run_command"} {
 		if _, ok := registry.Get(name); !ok {
 			t.Fatalf("write_dir registry missing %s; names=%v", name, taskRegistryToolNames(registry))
 		}
@@ -367,7 +367,7 @@ func TestTaskToolBuiltInExploreUsesResolvedCapabilities(t *testing.T) {
 		check:      func(string, string) permission.Decision { return permission.DecisionAllow },
 		lspManager: lsp.NewManager(t.TempDir(), t.TempDir()),
 	}
-	at, err := agents.Resolve("explore", agentcfg.ResolveContext{})
+	at, err := agents.Resolve("explore")
 	if err != nil {
 		t.Fatalf("resolve explore: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestTaskToolCustomLSPCapabilityControlsLSPTools(t *testing.T) {
 	}`)
 	task := &taskTool{lspManager: lsp.NewManager(t.TempDir(), t.TempDir())}
 
-	withLSP, err := agents.Resolve("with_lsp", agentcfg.ResolveContext{})
+	withLSP, err := agents.Resolve("with_lsp")
 	if err != nil {
 		t.Fatalf("resolve with_lsp: %v", err)
 	}
@@ -427,7 +427,7 @@ func TestTaskToolCustomLSPCapabilityControlsLSPTools(t *testing.T) {
 		}
 	}
 
-	withoutLSP, err := agents.Resolve("without_lsp", agentcfg.ResolveContext{})
+	withoutLSP, err := agents.Resolve("without_lsp")
 	if err != nil {
 		t.Fatalf("resolve without_lsp: %v", err)
 	}
@@ -435,45 +435,6 @@ func TestTaskToolCustomLSPCapabilityControlsLSPTools(t *testing.T) {
 	for _, name := range []string{"diagnostics", "workspace_symbol"} {
 		if _, ok := withoutRegistry.Get(name); ok {
 			t.Fatalf("lsp:false registry contains %s; names=%v", name, taskRegistryToolNames(withoutRegistry))
-		}
-	}
-}
-
-func TestTaskToolMemoryCapabilityControlsMemoryTools(t *testing.T) {
-	task := &taskTool{memoryStore: memory.NewStore(nil, t.TempDir(), t.TempDir())}
-
-	withMemory := task.buildRegistry(agentcfg.Resolved{
-		Tools:  []string{"read_file"},
-		Memory: true,
-	}, parentMutationScope{}, nil)
-	for _, name := range []string{"save_memory", "search_memory", "search_history"} {
-		if _, ok := withMemory.Get(name); !ok {
-			t.Fatalf("memory:true registry missing %s; names=%v", name, taskRegistryToolNames(withMemory))
-		}
-	}
-
-	withoutMemory := task.buildRegistry(agentcfg.Resolved{
-		Tools:  []string{"read_file"},
-		Memory: false,
-	}, parentMutationScope{}, nil)
-	for _, name := range []string{"save_memory", "search_memory", "search_history"} {
-		if _, ok := withoutMemory.Get(name); ok {
-			t.Fatalf("memory:false registry contains %s; names=%v", name, taskRegistryToolNames(withoutMemory))
-		}
-	}
-
-	onlyMemory := task.buildRegistry(agentcfg.Resolved{
-		Tools:  []string{},
-		Memory: true,
-	}, parentMutationScope{}, nil)
-	for _, name := range []string{"save_memory", "search_memory", "search_history"} {
-		if _, ok := onlyMemory.Get(name); !ok {
-			t.Fatalf("tools:[] memory:true registry missing %s; names=%v", name, taskRegistryToolNames(onlyMemory))
-		}
-	}
-	for _, name := range []string{"read_file", "write_file", "edit_file", "run_command", "process", "sleep", "diagnostics", "workspace_symbol"} {
-		if _, ok := onlyMemory.Get(name); ok {
-			t.Fatalf("tools:[] memory:true registry contains non-memory tool %s; names=%v", name, taskRegistryToolNames(onlyMemory))
 		}
 	}
 }
@@ -1166,61 +1127,127 @@ func TestCompactChildPostActivationMetadataFailuresRemainOrdinary(t *testing.T) 
 	}
 }
 
-func TestTaskToolChildStagedEditUsesParentTurnSnapshot(t *testing.T) {
-	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch calls.Add(1) {
-		case 1:
-			writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"edit target","subagent_type":"editor"}]}`)
-		case 2:
-			writeTaskToolCallResponse(w, "call_read", "read_file", `{"path":"target.txt"}`)
-		case 3:
-			writeTaskToolCallResponse(w, "call_edit", "edit_file", `{"path":"target.txt","old_string":"old","new_string":"new","pending":true}`)
-		case 4:
-			writeTextResponse(w, "child edited")
-		case 5:
-			writeTextResponse(w, "parent done")
-		default:
-			t.Fatalf("unexpected provider call")
-		}
-	}))
-	defer server.Close()
+func TestTaskToolChildForgedPendingExecutesImmediately(t *testing.T) {
+	cases := []struct {
+		name       string
+		tool       string
+		args       string
+		target     string
+		seed       string
+		want       string
+		childTools string
+	}{
+		{
+			name:       "write_file",
+			tool:       "write_file",
+			args:       `{"path":"target.txt","content":"new","pending":true}`,
+			target:     "target.txt",
+			seed:       "old",
+			want:       "new",
+			childTools: `"tools": ["write_file"]`,
+		},
+		{
+			name:       "edit_file",
+			tool:       "edit_file",
+			args:       `{"path":"target.txt","old_string":"old","new_string":"new","pending":true}`,
+			target:     "target.txt",
+			seed:       "old",
+			want:       "new",
+			childTools: `"tools": ["read_file", "edit_file"]`,
+		},
+		{
+			name:       "apply_patch",
+			tool:       "apply_patch",
+			args:       `{"input":"*** Begin Patch\n*** Update File: target.txt\n@@\n-old\n+new\n*** End Patch","pending":true}`,
+			target:     "target.txt",
+			seed:       "old",
+			want:       "new",
+			childTools: `"tools": ["apply_patch"]`,
+		},
+	}
 
-	a := newEventOrderAgent(t, server.URL+"/v1")
-	writeTaskAgentTypes(t, a, `"editor": {
-		"description": "test editor",
-		"tools": ["read_file", "edit_file", "execute_pending"],
-		"prompt": "Test editor.",
-		"subagent": true
-	}`)
-	// Bootstrap the session before mutating permissions: the live unit's
-	// permission policy captures a.cfg at build time, and writeTaskAgentTypes's
-	// Reload replaces a.cfg with a fresh pointer, so the Allow edit must land on
-	// the config the live policy holds.
-	if _, err := a.NewSession("", "primary"); err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	a.cfg.Permissions.Allow = []string{"read_file(/**)", "edit_file(/**)", "write_file(/**)"}
-	target := filepath.Join(a.projectRoot, "target.txt")
-	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
-		t.Fatalf("write target: %v", err)
-	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch calls.Add(1) {
+				case 1:
+					writeTaskToolCallResponse(w, "call_task", "task", `{"tasks":[{"prompt":"apply change","subagent_type":"editor"}]}`)
+				case 2:
+					writeTaskToolCallResponse(w, "call_child", tc.tool, tc.args)
+				case 3:
+					writeTextResponse(w, "child edited")
+				case 4:
+					writeTextResponse(w, "parent done")
+				default:
+					t.Fatalf("unexpected provider call")
+				}
+			}))
+			defer server.Close()
 
-	cap := &eventCapture{}
-	ctx := startEventOrderAgent(t, a, cap)
-	res, err := a.Submit(ctx, "delegate edit")
-	if err != nil {
-		t.Fatalf("Submit: %v", err)
-	}
-	waitUntilEventOrderTurnEndCount(t, cap, 1)
-	if got, err := os.ReadFile(target); err != nil || string(got) != "new" {
-		t.Fatalf("target after child staged edit = %q, %v; want new", got, err)
-	}
-	if _, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, res.Turn, TurnActionRevertCode, false); err != nil {
-		t.Fatalf("ApplyTurnActionForSession revert_code: %v", err)
-	}
-	if got, err := os.ReadFile(target); err != nil || string(got) != "old" {
-		t.Fatalf("target after parent revert = %q, %v; want old", got, err)
+			a := newEventOrderAgent(t, server.URL+"/v1")
+			writeTaskAgentTypes(t, a, `"editor": {
+				"description": "test editor",
+				`+tc.childTools+`,
+				"prompt": "Test editor.",
+				"subagent": true
+			}`)
+			// apply_patch is DefaultHidden; the child loop resolves its own
+			// adaptation, so surface it through the agent resolver for the
+			// apply_patch case (no-op for the others).
+			a.resolveAdapt = func(string) *adaptation.Adaptation {
+				return &adaptation.Adaptation{IncludeTools: []string{"apply_patch"}}
+			}
+			// Bootstrap the session before mutating permissions: the live unit's
+			// permission policy captures a.cfg at build time, and writeTaskAgentTypes's
+			// Reload replaces a.cfg with a fresh pointer, so the Allow must land on
+			// the config the live policy holds.
+			if _, err := a.NewSession("", "primary"); err != nil {
+				t.Fatalf("NewSession: %v", err)
+			}
+			a.cfg.Permissions.Allow = []string{"read_file(/**)", "edit_file(/**)", "write_file(/**)", "apply_patch(/**)"}
+			target := filepath.Join(a.projectRoot, tc.target)
+			if err := os.WriteFile(target, []byte(tc.seed), 0o644); err != nil {
+				t.Fatalf("write target: %v", err)
+			}
+
+			cap := &eventCapture{}
+			ctx := startEventOrderAgent(t, a, cap)
+			res, err := a.Submit(ctx, "delegate change")
+			if err != nil {
+				t.Fatalf("Submit: %v", err)
+			}
+			waitUntilEventOrderTurnEndCount(t, cap, 1)
+
+			// Immediate on-disk effect through the child's parent-turn snapshot
+			// scope: the child's tool call with pending=true applies before the
+			// turn ends (no deferred flush).
+			if got, err := os.ReadFile(target); err != nil || string(got) != tc.want {
+				t.Fatalf("target after child forged-pending %s = %q, %v; want %q", tc.tool, got, err, tc.want)
+			}
+
+			// Exactly one child ToolCallEnd for the child's tool call: a staging
+			// flush would emit a second late end for the same child call id.
+			childEnds := 0
+			for _, ev := range cap.snapshot() {
+				if ev.Kind == EventToolCallEnd && ev.SubagentSessionID != "" && ev.ToolCallID == "call_child" {
+					childEnds++
+				}
+			}
+			if childEnds != 1 {
+				t.Fatalf("child %s ToolCallEnd count for call_child = %d, want exactly 1", tc.tool, childEnds)
+			}
+
+			// Parent-turn snapshot scope: revert restores the pre-mutation state,
+			// proving the child's write was captured against the parent turn.
+			if _, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, res.Turn, TurnActionRevertCode, false); err != nil {
+				t.Fatalf("ApplyTurnActionForSession revert_code: %v", err)
+			}
+			if got, err := os.ReadFile(target); err != nil || string(got) != tc.seed {
+				t.Fatalf("target after parent revert = %q, %v; want %q", got, err, tc.seed)
+			}
+		})
 	}
 }
 
@@ -1564,8 +1591,8 @@ func taskRegistryToolNames(r *tool.Registry) []string {
 	var names []string
 	for _, name := range []string{
 		"read_file", "write_file", "edit_file", "apply_patch", "run_command",
-		"execute_pending", "process", "sleep", "task", "save_memory", "search_memory",
-		"search_history", "diagnostics", "workspace_symbol",
+		"process", "sleep", "task",
+		"diagnostics", "workspace_symbol",
 	} {
 		if _, ok := r.Get(name); ok {
 			names = append(names, name)

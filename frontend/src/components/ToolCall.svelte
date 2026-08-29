@@ -279,31 +279,6 @@
         {#if hasMore && expanded}<div class="more">collapse</div>{/if}
       </div>
     {/if}
-  {:else if name === 'save_memory'}
-    <div class="line">
-      <span class="tool-name">{name}</span>
-      <span class="arg">{parsed.title || ''}</span>
-    </div>
-    {#if done && result}
-      <pre class="output bare">{result}</pre>
-    {/if}
-  {:else if name === 'search_memory' || name === 'search_history'}
-    <div class="line">
-      <span class="tool-name">{name}</span>
-      <span class="arg">{parsed.query || ''}</span>
-    </div>
-    {#if done && result}
-      {#if hasMore}
-        <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-        <div class="output-block" class:expandable={hasMore} on:click={() => toggleOrOpenOutput(name + ' results')}>
-          <pre class="output">{shownOutput}</pre>
-          {#if !expanded}<div class="more">show all ({lines.length} lines)</div>{/if}
-          {#if expanded}<div class="more">collapse</div>{/if}
-        </div>
-      {:else}
-        <pre class="output bare">{result}</pre>
-      {/if}
-    {/if}
   {:else if name === 'diagnostics'}
     <div class="line">
       <span class="tool-name">{name}</span>

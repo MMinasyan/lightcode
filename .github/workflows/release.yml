@@ -60,10 +60,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ steps.release_ref.outputs.ref }}
-          fetch-depth: 0
-          lfs: true
-          persist-credentials: false
+           ref: ${{ steps.release_ref.outputs.ref }}
+           fetch-depth: 0
+           persist-credentials: false
 
       - name: Verify tag checkout
         env:

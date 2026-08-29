@@ -2,7 +2,6 @@ package tool
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"path/filepath"
 
@@ -105,54 +104,10 @@ func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (strin
 	}
 }
 
-func (p *PermWrapped) StageableTool() (StageableTool, bool) {
-	stageable, ok := p.inner.(StageableTool)
-	if !ok {
-		return nil, false
-	}
-	if !p.options.hasWriteDir() || !isWriteTool(p.inner.Name()) {
-		return stageable, true
-	}
-	return writeDirStageable{
-		inner: stageable,
-		name:  p.inner.Name(),
-		root:  p.workspaceRoot,
-		opts:  p.options,
-	}, true
-}
-
-type writeDirStageable struct {
-	inner StageableTool
-	name  string
-	root  string
-	opts  CapabilityOptions
-}
-
-func (s writeDirStageable) ValidateStaged(ctx context.Context, args json.RawMessage) error {
-	if err := s.inner.ValidateStaged(ctx, args); err != nil {
-		return err
-	}
-	var params map[string]any
-	if err := json.Unmarshal(args, &params); err != nil {
-		return fmt.Errorf("%s: invalid staged arguments: %w", s.name, err)
-	}
-	if s.name == "apply_patch" {
-		_, _, err := resolveApplyPatchTargetsWithOptions(s.root, params, s.opts)
-		return err
-	}
-	_, err := resolveFileToolParamsAtRootWithOptions(s.root, s.name, params, s.opts)
-	return err
-}
-
-func (s writeDirStageable) StagedResultMessage() string {
-	return s.inner.StagedResultMessage()
-}
-
 // applyPatchAskRequest builds the permission ask for apply_patch: BatchFiles
 // lists every touched file; Arg and ResolvedArg are the first touched path
-// (the representative path the rule engine sees). The batch-level fields
-// (BatchIndex, BatchTotal, CanAllowAll) are set by the staged caller; the
-// immediate path leaves them zero, which is correct (single-call).
+// (the representative path the rule engine sees). DisableProjectSave is set so
+// a multi-file patch does not trigger a project-save prompt.
 func applyPatchAskRequest(targets []applyPatchTarget) permission.Request {
 	arg := ""
 	resolved := ""
@@ -173,7 +128,7 @@ func applyPatchAskRequest(targets []applyPatchTarget) permission.Request {
 }
 
 func permissionAllows(action permission.ResponseAction) bool {
-	return action == permission.ResponseAllow || action == permission.ResponseAllowAll
+	return action == permission.ResponseAllow
 }
 
 func permissionRequest(toolName string, params, execParams map[string]any) permission.Request {

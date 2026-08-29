@@ -28,7 +28,7 @@ func TestRootOnlySnapshotAuthority(t *testing.T) {
 	if _, err := a.RevertCodeForSession(rootID, 0); err == nil {
 		t.Fatal("RevertCodeForSession accepted a compact session")
 	}
-	if _, err := a.ApplyTurnActionForSession(rootID, 0, TurnActionRevertHistory, false); err == nil {
+	if _, err := a.ApplyTurnActionForSession(rootID, 0, TurnActionRevertCode, false); err == nil {
 		t.Fatal("ApplyTurnActionForSession accepted a compact session")
 	}
 	if err := a.ForkSessionForSession(rootID, 0); err == nil {

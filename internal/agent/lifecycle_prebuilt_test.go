@@ -90,27 +90,6 @@ func TestLifecycleReturnsPrebuiltReplacement(t *testing.T) {
 		}
 	})
 
-	t.Run("case=revert_typed_outcome", func(t *testing.T) {
-		a := newCatalogBackedTestAgent(t)
-		appendUserTurn(t, a, "first")
-		clicked := appendUserTurn(t, a, "second")
-		appendUserTurn(t, a, "third")
-		id := a.SessionCurrent().ID
-		var got []HydrationState
-		if _, err := a.ApplyTurnActionForSessionWithBoundary(id, clicked, TurnActionRevertHistory, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
-			got = append(got, hs)
-		}); err != nil {
-			t.Fatalf("ApplyTurnActionForSessionWithBoundary revert: %v", err)
-		}
-		if len(got) != 1 {
-			t.Fatalf("emit called %d times, want exactly 1", len(got))
-		}
-		// RevertHistory targets the clicked turn minus one, so only "first" survives.
-		if c := userContents(got[0].Messages); !equalStrings(c, []string{"first"}) {
-			t.Fatalf("revert boundary messages = %q, want [first]", c)
-		}
-	})
-
 	t.Run("case=fork", func(t *testing.T) {
 		a := newCatalogBackedTestAgent(t)
 		appendUserTurn(t, a, "first")
@@ -118,7 +97,7 @@ func TestLifecycleReturnsPrebuiltReplacement(t *testing.T) {
 		appendUserTurn(t, a, "after")
 		id := a.SessionCurrent().ID
 		var got []HydrationState
-		result, err := a.ApplyTurnActionForSessionWithBoundary(id, clicked, TurnActionFork, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
+		result, err := a.ApplyTurnActionForSessionWithBoundary(id, clicked, TurnActionFork, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError) {
 			got = append(got, hs)
 		})
 		if err != nil {
@@ -204,7 +183,7 @@ func TestLifecycleReturnsPrebuiltReplacement(t *testing.T) {
 		var got []HydrationState
 		forkDone := make(chan error, 1)
 		go func() {
-			_, err := a.ApplyTurnActionForSessionWithBoundary(id, clicked, TurnActionFork, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
+			_, err := a.ApplyTurnActionForSessionWithBoundary(id, clicked, TurnActionFork, false, func(hs HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError) {
 				got = append(got, hs)
 			})
 			forkDone <- err

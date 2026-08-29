@@ -24,7 +24,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
-	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"golang.org/x/term"
@@ -653,58 +652,6 @@ func TestFinishCompactReturnsIdleWhenNoTurnRunning(t *testing.T) {
 	}
 	if c.compacting {
 		t.Fatal("finishCompactLocked should clear compacting")
-	}
-}
-
-func TestStagedFlushTerminalLateEndNoCursorUpAndLastEndWins(t *testing.T) {
-	var buf bytes.Buffer
-	c := &CLI{out: &buf, mu: &sync.Mutex{}}
-	args := `{"path":"x.go","old_string":"a","new_string":"b"}`
-
-	// State as if ToolCallStart already rendered the staged tool's header and
-	// its stage-time "Staged." end already completed it in the model — i.e. the
-	// row is far above and activeToolID was consumed (a later, non-matching end
-	// is the staged-flush "late" case).
-	c.messages = []displayEntry{
-		{typ: "assistant", content: "intro"},
-		{typ: "tool", id: "call_1", name: "edit_file", args: args, done: true, success: true, result: "Staged."},
-		{typ: "assistant", content: "more text below the tool row"},
-	}
-	c.activeToolID = ""
-
-	meta := editpreview.MetadataFromArgs(args, "Edited x.go (1 replacement, lines 1-2).")
-	if meta == nil {
-		t.Fatal("test setup: expected non-nil edit_preview metadata")
-	}
-	// Production: the staged-flush ToolCallEnd carries NO Args (flushPendingQueue
-	// emits only id/name/result/metadata). The CLI must still render the path
-	// from the model row, matching reload.
-	c.handleEvent(agent.Event{
-		Kind:       agent.EventToolCallEnd,
-		ToolCallID: "call_1",
-		ToolName:   "edit_file",
-		Result:     "Edited x.go (1 replacement, lines 1-2).",
-		Metadata:   meta,
-	})
-
-	// Late end must NOT emit a cursor-up against the (far-below) current line.
-	if strings.Contains(buf.String(), "\x1b[1A") {
-		t.Fatalf("late staged-flush end performed a cursor-up against the wrong line: %q", buf.String())
-	}
-	// The rendered header must still show the path even though the event had no
-	// Args (rendered from the model row's retained args) — no live/reload drift.
-	if !strings.Contains(buf.String(), "x.go") {
-		t.Fatalf("late staged-flush header dropped the path: %q", buf.String())
-	}
-	// Model is last-end-wins: the row now holds the real result, not "Staged.".
-	var row *displayEntry
-	for i := range c.messages {
-		if c.messages[i].typ == "tool" && c.messages[i].id == "call_1" {
-			row = &c.messages[i]
-		}
-	}
-	if row == nil || row.result != "Edited x.go (1 replacement, lines 1-2)." {
-		t.Fatalf("tool row not overwritten with real result: %#v", row)
 	}
 }
 
@@ -2388,9 +2335,10 @@ func TestAdapterOperationParity(t *testing.T) {
 		{"cli", "revert_code", true, []string{`case "/revert":`, "TurnActionRevertCode"}},
 		{"acp", "revert_code", true, []string{`"session/revert_code"`}},
 
-		{"wails", "revert_history", true, []string{"func (a *App) RevertHistory("}},
-		{"cli", "revert_history", true, []string{"TurnActionRevertHistory"}},
-		{"acp", "revert_history", true, []string{`"session/revert_history"`}},
+		// History reversion is gone from every host; only code rewind and fork remain.
+		{"wails", "revert_history", false, []string{"func (a *App) RevertHistory("}},
+		{"cli", "revert_history", false, []string{"TurnActionRevertHistory"}},
+		{"acp", "revert_history", false, []string{`"session/revert_history"`}},
 
 		// Host shutdown trigger — and no shutdown RPC anywhere.
 		{"wails", "shutdown_trigger", true, []string{"OnShutdown: app.shutdown"}},
@@ -3303,10 +3251,9 @@ func newTestAgentAtHome(t *testing.T, baseURL, home, projectRoot string) (*agent
 	}
 
 	a, err := agent.New(agent.Config{
-		Cfg:               cfg,
-		ProjectRoot:       projectRoot,
-		Home:              home,
-		NewMemoryEmbedder: func(string) (*memory.Embedder, error) { return nil, nil },
+		Cfg:         cfg,
+		ProjectRoot: projectRoot,
+		Home:        home,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -4126,14 +4073,14 @@ func TestCLIRunShutdownContract(t *testing.T) {
 		}
 	})
 
-	t.Run("revert_confirm=exit_performs_no_revert", func(t *testing.T) {
+	t.Run("action_confirm_exit_performs_no_mutation", func(t *testing.T) {
 		// Exception, recorded per the contract-test rule: Run cannot be driven
 		// in a test (term.MakeRaw on os.Stdin requires a real TTY), so the
 		// command chain is driven through handleKeyIdle — the key handler
 		// mainLoop calls — with an injected key source; the confirmation read
 		// failure is the exit error nextKey reports once the latch is set. The
 		// error must reach the handler: a confirmation that consumes it lets
-		// the loop render another prompt, and the revert proceeds as a "no".
+		// the loop render another prompt, and the fork proceeds as a "no".
 		a, _ := newTestAgent(t)
 		if _, err := a.NewSession("", "primary"); err != nil {
 			t.Fatalf("NewSession: %v", err)
@@ -4152,7 +4099,7 @@ func TestCLIRunShutdownContract(t *testing.T) {
 			t.Fatalf("SessionMessagesFor before: %v", err)
 		}
 
-		// Select the seeded turn, then "Revert history"; the confirmation key
+		// Select the seeded turn, then "Fork from here"; the confirmation key
 		// read then reports the exit error.
 		keys := []keyMsg{
 			{Special: keyEnter},
@@ -4186,120 +4133,6 @@ func TestCLIRunShutdownContract(t *testing.T) {
 		}
 	})
 
-	t.Run("revert_error_refreshes_reconciled_transcript", func(t *testing.T) {
-		// Exception, recorded per the contract-test rule: Run cannot be driven
-		// in a test (term.MakeRaw on os.Stdin requires a real TTY), so the
-		// command chain is driven through handleKeyIdle with an injected key
-		// source. A history revert that stops partway still removed every turn
-		// above the one it stopped at, so the loop is reconciled to disk and
-		// the error branch must refresh the view: the user must not keep
-		// looking at turns that are gone from both loop and disk.
-		if os.Geteuid() == 0 {
-			t.Skip("directory permissions do not block writes as root")
-		}
-		home := t.TempDir()
-		projectRoot := t.TempDir()
-		lightcodeDir := filepath.Join(home, ".lightcode")
-		if err := os.MkdirAll(lightcodeDir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		t.Setenv("LIGHTCODE_TEST_KEY", "test")
-		configPath := filepath.Join(lightcodeDir, "config.json")
-		if err := os.WriteFile(configPath, []byte(`{
-  "providers": {
-    "test": {
-      "name": "Test Provider",
-      "transport": { "base_url": "http://127.0.0.1:9/v1", "api_key_env": "LIGHTCODE_TEST_KEY" },
-      "discovery": false,
-      "models": {
-        "test-model": { "name": "Test Model", "context_window": 8192, "max_output_tokens": 1024 }
-      }
-    }
-  },
-  "default_model": "test/test-model"
-}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(lightcodeDir, "agents.json"), []byte(`{"primary": {"model": "test/test-model"}}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		cfg, err := config.Load(configPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		a, err := agent.New(agent.Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: func(string) (*memory.Embedder, error) { return nil, nil }})
-		if err != nil {
-			t.Fatalf("new agent: %v", err)
-		}
-		if _, err := a.NewSession("", "primary"); err != nil {
-			t.Fatalf("NewSession: %v", err)
-		}
-		for i := 1; i <= 10; i++ {
-			if _, err := a.AppendUserMessage(fmt.Sprintf("turn %d", i)); err != nil {
-				t.Fatalf("seed turn %d: %v", i, err)
-			}
-		}
-		sid := a.SessionCurrent().ID
-		matches, err := filepath.Glob(filepath.Join(lightcodeDir, "projects", "*", "sessions", sid))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(matches) != 1 {
-			t.Fatalf("session dirs matching %q = %v, want exactly one", sid, matches)
-		}
-		blocked := filepath.Join(matches[0], "turns", "7")
-		if err := os.Chmod(blocked, 0o555); err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = os.Chmod(blocked, 0o700) }()
-
-		c := New(a)
-		c.setCurrentSessionID(sid)
-		var out bytes.Buffer
-		c.out = &out
-		c.refreshSession()
-		if len(c.messages) != 10 {
-			t.Fatalf("initial transcript has %d entries, want 10", len(c.messages))
-		}
-
-		// Pick the first user turn, choose "Revert history", and answer the
-		// code confirmation with Escape (No).
-		keys := []keyMsg{
-			{Special: keyEnter},
-			{Special: keyDown},
-			{Special: keyEnter},
-			{Special: keyEscape},
-		}
-		next := 0
-		c.readKeyFn = func() (keyMsg, error) {
-			if next < len(keys) {
-				k := keys[next]
-				next++
-				return k, nil
-			}
-			return keyMsg{}, fmt.Errorf("unexpected key read")
-		}
-
-		c.input.Set("/revert")
-		if err := c.handleKeyIdle(keyMsg{Special: keyEnter}); err != nil {
-			t.Fatalf("handleKeyIdle: %v", err)
-		}
-		// The error branch re-renders the transcript over the reconciled
-		// loop: turns 8-10 are gone from both loop and disk, so they must be
-		// gone from the display too.
-		if len(c.messages) != 7 {
-			t.Fatalf("transcript after partial revert = %d entries, want 7 (turns 1-7): the error branch must refresh the view", len(c.messages))
-		}
-		for i, m := range c.messages {
-			if m.turn != i+1 {
-				t.Fatalf("display entry %d = turn %d, want turn %d", i, m.turn, i+1)
-			}
-		}
-		if !strings.Contains(out.String(), "turn 7") {
-			t.Fatalf("revert error not shown in output:\n%s", out.String())
-		}
-	})
-
 	t.Run("fork_confirm=exit_performs_no_fork", func(t *testing.T) {
 		// Exception, recorded per the contract-test rule: Run cannot be driven
 		// in a test (term.MakeRaw on os.Stdin requires a real TTY), so the
@@ -4326,7 +4159,6 @@ func TestCLIRunShutdownContract(t *testing.T) {
 		// read then reports the exit error.
 		keys := []keyMsg{
 			{Special: keyEnter},
-			{Special: keyDown},
 			{Special: keyDown},
 			{Special: keyEnter},
 		}
@@ -4414,7 +4246,6 @@ func TestCLIRunShutdownContract(t *testing.T) {
 		// code confirmation with Yes.
 		keys := []keyMsg{
 			{Special: keyEnter},
-			{Special: keyDown},
 			{Special: keyDown},
 			{Special: keyEnter},
 			{Special: keyEnter},
@@ -4906,13 +4737,12 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 
 	// forkKeys yields a fresh key source that walks the revert menu to the
 	// fork action and confirms it: select the single seeded turn, move from
-	// "Revert code" past "Revert history" onto "Fork from here", choose it,
-	// then accept the also-revert-code question (its Yes/No menu answers with Enter on "Yes"). Each row builds its own copy — a key source is consumed by reads.
+	// "Revert code" onto "Fork from here", choose it, then accept the
+	// also-revert-code question (its Yes/No menu answers with Enter on "Yes"). Each row builds its own copy — a key source is consumed by reads.
 	forkKeys := func() func() (keyMsg, error) {
 		return keySequence(
 			keyMsg{Special: keyEnter}, // select the single seeded turn
-			keyMsg{Special: keyDown},  // Revert code -> Revert history
-			keyMsg{Special: keyDown},  // -> Fork from here
+			keyMsg{Special: keyDown},  // Revert code -> Fork from here
 			keyMsg{Special: keyEnter}, // choose fork
 			keyMsg{Special: keyEnter}, // accept "also revert code?" (Yes is the default)
 		)
@@ -5249,6 +5079,49 @@ func TestCLIStartupPlainCreationFailureDoesNotAdopt(t *testing.T) {
 	}
 }
 
+// TestCLIReturnsOnlyCodeAndForkOptions proves the revert menu's action list offers
+// exactly the retained operations: code rewind and fork, with no history option.
+// Both positive flows keep their own coverage; this pins the removed entry point at
+// the surface a user reaches it on — picking the turn renders the action list, then
+// canceling leaves every message intact (the menu is fail-safe as an escape).
+func TestCLIReturnsOnlyCodeAndForkOptions(t *testing.T) {
+	ag, _ := newTestAgent(t)
+	id, err := ag.NewSession("", "primary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ag.AppendUserMessage("seed message"); err != nil {
+		t.Fatalf("AppendUserMessage: %v", err)
+	}
+	c := New(ag)
+	c.out = new(bytes.Buffer)
+	c.setCurrentSessionID(id)
+
+	// Pick the seeded turn, then cancel the action menu before choosing.
+	c.readKeyFn = keySequence(keyMsg{Special: keyEnter}, keyMsg{Special: keyEscape})
+	if err := c.dispatchCommand("/revert"); err != nil {
+		t.Fatalf("dispatchCommand(/revert): %v", err)
+	}
+
+	rendered := c.out.(*bytes.Buffer).String()
+	for _, want := range []string{"Revert code", "Fork from here"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("/revert action menu = %q, must offer the retained option %q", rendered, want)
+		}
+	}
+	if strings.Contains(rendered, "Revert history") {
+		t.Fatalf("/revert action menu still offers a removed history option: %q", rendered)
+	}
+
+	msgs, err := ag.SessionMessagesFor(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) == 0 {
+		t.Fatal("canceled revert menu left no messages")
+	}
+}
+
 func TestCLIRealCommittedNamespaceProducers(t *testing.T) {
 	t.Run("archive", func(t *testing.T) {
 		ag, _ := newTestAgent(t)
@@ -5325,7 +5198,7 @@ func TestCLIRealCommittedNamespaceProducers(t *testing.T) {
 		}
 	})
 
-	seed := func(t *testing.T) (*CLI, string, string, int) {
+	seed := func(t *testing.T) (*CLI, string, string, int, *agent.Agent) {
 		t.Helper()
 		ag, _ := newTestAgent(t)
 		id, err := ag.NewSession("", "primary")
@@ -5346,72 +5219,11 @@ func TestCLIRealCommittedNamespaceProducers(t *testing.T) {
 		c := New(ag)
 		c.out = new(bytes.Buffer)
 		c.setCurrentSessionID(id)
-		return c, id, ag.Projects().SessionsRoot(project.ID), lastTurn
+		return c, id, ag.Projects().SessionsRoot(project.ID), lastTurn, ag
 	}
 
-	t.Run("history", func(t *testing.T) {
-		c, id, sessionsRoot, lastTurn := seed(t)
-		turnsDir := filepath.Join(sessionsRoot, id, "turns")
-		injected := errors.New("injected CLI history sync failure")
-		atomicfs.SyncDirFunc = func(dir string) error {
-			if dir == turnsDir {
-				return injected
-			}
-			return nil
-		}
-		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
-		c.readKeyFn = keySequence(
-			keyMsg{Special: keyEnter},
-			keyMsg{Special: keyDown},
-			keyMsg{Special: keyEnter},
-			keyMsg{Special: keyEnter},
-		)
-
-		if err := c.dispatchCommand("/revert"); err != nil {
-			t.Fatal(err)
-		}
-		wantCurrent(t, c, id)
-		if !strings.Contains(c.out.(*bytes.Buffer).String(), "CLI history sync failure") {
-			t.Fatalf("CLI history output = %q, want committed rejection", c.out.(*bytes.Buffer).String())
-		}
-		if _, err := os.Stat(filepath.Join(turnsDir, fmt.Sprint(lastTurn))); !os.IsNotExist(err) {
-			t.Fatalf("CLI reverted turn = %v, want removed", err)
-		}
-	})
-
-	t.Run("highest-turn partial history refreshes reconciled state", func(t *testing.T) {
-		c, id, _, _ := seed(t)
-		injected := errors.New("injected CLI highest-turn partial failure")
-		snapshot.RemoveHistoryTurnFunc = func(path string) error {
-			if filepath.Base(path) == "3" {
-				if err := os.Remove(filepath.Join(path, "messages.jsonl")); err != nil {
-					return err
-				}
-			}
-			return injected
-		}
-		t.Cleanup(func() { snapshot.RemoveHistoryTurnFunc = nil })
-		c.readKeyFn = keySequence(
-			keyMsg{Special: keyEnter},
-			keyMsg{Special: keyDown},
-			keyMsg{Special: keyEnter},
-			keyMsg{Special: keyEnter},
-		)
-
-		if err := c.dispatchCommand("/revert"); err != nil {
-			t.Fatal(err)
-		}
-		wantCurrent(t, c, id)
-		if len(c.messages) != 2 {
-			t.Fatalf("CLI messages after highest-turn partial history = %d, want 2 surviving rows", len(c.messages))
-		}
-		if !strings.Contains(c.out.(*bytes.Buffer).String(), "highest-turn partial") {
-			t.Fatalf("CLI output = %q, want partial warning", c.out.(*bytes.Buffer).String())
-		}
-	})
-
 	t.Run("fork", func(t *testing.T) {
-		c, sourceID, sessionsRoot, _ := seed(t)
+		c, sourceID, sessionsRoot, _, _ := seed(t)
 		injected := errors.New("injected CLI fork sync failure")
 		atomicfs.SyncDirFunc = func(dir string) error {
 			if dir == sessionsRoot {
@@ -5422,7 +5234,6 @@ func TestCLIRealCommittedNamespaceProducers(t *testing.T) {
 		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
 		c.readKeyFn = keySequence(
 			keyMsg{Special: keyEnter},
-			keyMsg{Special: keyDown},
 			keyMsg{Special: keyDown},
 			keyMsg{Special: keyEnter},
 			keyMsg{Special: keyEnter},
@@ -5440,6 +5251,85 @@ func TestCLIRealCommittedNamespaceProducers(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(sessionsRoot, destinationID, "meta.json")); err != nil {
 			t.Fatalf("CLI fork destination metadata: %v", err)
+		}
+	})
+
+	// Positive code-rewind through the retained /revert menu on a real agent:
+	// rewinding from a chosen turn restores this session's file changes via its
+	// snapshots, reports every externally diverged file it must not touch, and
+	// leaves routing and conversation history exactly where they were. The fork
+	// subtest above is the retained sibling; TestCLIReturnsOnlyCodeAndForkOptions
+	// pins the removed history option at this same menu surface.
+	t.Run("revert_code_restores_files_and_keeps_history", func(t *testing.T) {
+		c, id, _, _, ag := seed(t)
+
+		createTurn, err := ag.AppendUserMessageToSession(id, "create files")
+		if err != nil {
+			t.Fatalf("AppendUserMessageToSession: %v", err)
+		}
+		root := ag.ProjectRoot()
+		createdPath := filepath.Join(root, "rewound.txt")
+		divergedPath := filepath.Join(root, "kept.txt")
+		for _, path := range []string{createdPath, divergedPath} {
+			entryID, _, err := ag.Store().SnapshotResolvedEntry(createTurn, path, path)
+			if err != nil {
+				t.Fatalf("snapshot entry for %s: %v", path, err)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			content := []byte("created\n")
+			if err := os.WriteFile(path, content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := ag.Store().RecordSnapshotContent(createTurn, entryID, content); err != nil {
+				t.Fatalf("record snapshot content for %s: %v", path, err)
+			}
+		}
+		diverged := []byte("diverged\n")
+		if err := os.WriteFile(divergedPath, diverged, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		c.readKeyFn = keySequence(
+			keyMsg{Special: keyDown},  // one -> two
+			keyMsg{Special: keyDown},  // two -> three
+			keyMsg{Special: keyDown},  // three -> create files (last selectable turn)
+			keyMsg{Special: keyEnter}, // pick the seeded create-files turn
+			keyMsg{Special: keyEnter}, // choose "Revert code" (first action item; no confirm on this path)
+		)
+
+		if err := c.dispatchCommand("/revert"); err != nil {
+			t.Fatalf("dispatchCommand(/revert): %v", err)
+		}
+
+		s := c.out.(*bytes.Buffer).String()
+		wantSuccess := fmt.Sprintf("reverted code to before turn %d", createTurn)
+		if !strings.Contains(s, wantSuccess) {
+			t.Fatalf("output = %q; must render the rewind success line naming clicked turn %d: %s", s, createTurn, wantSuccess)
+		}
+
+		const skipsHeader = "kept 1 file changed outside this session:"
+		wantSkipped := fmt.Sprintf("- %s (file content changed since this session last wrote it)", divergedPath)
+		if i, e := strings.Index(s, skipsHeader), strings.Index(s, wantSkipped); i < 0 || e < 0 {
+			t.Fatalf("output = %q; the kept-files notice must name the diverged file with its reason", s)
+		}
+
+		if _, err := os.Stat(createdPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("created file still present after rewind (stat err=%v); it was created by this session and must be restored to absent", err)
+		}
+		got, err := os.ReadFile(divergedPath)
+		if err != nil || !bytes.Equal(got, diverged) {
+			t.Fatalf("diverged file after rewind = %q (err=%v); an externally changed file must stay byte-identical", got, err)
+		}
+
+		wantCurrent(t, c, id) // code rewind keeps the same session; nothing may be adopted or cleared
+		msgs, err := ag.SessionMessagesFor(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cliUserContents(msgs); !equalStringSlices(got, []string{"one", "two", "three", "create files"}) {
+			t.Fatalf("history after code rewind = %q; conversation history must stay intact (system prompt + all four user turns)", got)
 		}
 	})
 }

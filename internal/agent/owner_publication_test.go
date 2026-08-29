@@ -703,7 +703,7 @@ func TestCloseFirstSinksCreateNoFiles(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
+		a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
 		if err != nil {
 			t.Fatal(err)
 		}

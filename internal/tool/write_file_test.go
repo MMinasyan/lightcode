@@ -4,11 +4,23 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
 )
+
+func TestWriteFileDescriptionIsWellFormed(t *testing.T) {
+	tool := NewWriteFile(NewFileTracker(), config.ToolsConfig{})
+	desc := tool.Description()
+	if strings.Contains(desc, "}") {
+		t.Fatalf("write_file description contains a stray closing brace:\n%s", desc)
+	}
+	if !strings.Contains(desc, "Writes a file to disk.") {
+		t.Fatalf("write_file description missing its lead line:\n%s", desc)
+	}
+}
 
 func TestWriteFileCreatesNewFileAndParentDirs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "new.txt")

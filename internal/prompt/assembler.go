@@ -24,9 +24,6 @@ var rulesFileGuideSection string
 //go:embed compaction_awareness.md
 var compactionAwarenessSection string
 
-//go:embed memory_instructions.md
-var memoryInstructionsSection string
-
 //go:embed safety.md
 var safetySection string
 
@@ -73,10 +70,9 @@ type Result struct {
 }
 
 type Spec struct {
-	Size   string
-	Body   string
-	Memory bool
-	Adapt  *adaptation.Adaptation
+	Size  string
+	Body  string
+	Adapt *adaptation.Adaptation
 }
 
 // Service assembles system prompts. It is stateless: it owns no cache and no
@@ -137,10 +133,6 @@ func buildSpec(projectRoot string, sessionStart time.Time, globalRules, projectR
 	var b strings.Builder
 
 	if spec.Size == SizeNone {
-		if spec.Memory {
-			b.WriteString(strings.TrimSpace(memoryInstructionsSection))
-			b.WriteString("\n\n")
-		}
 		writeAgentBody(&b, spec.Body)
 		return strings.TrimSpace(b.String())
 	}
@@ -152,11 +144,6 @@ func buildSpec(projectRoot string, sessionStart time.Time, globalRules, projectR
 
 	b.WriteString(renderEnvironment(projectRoot, sessionStart))
 	b.WriteString("\n\n")
-
-	if spec.Memory {
-		b.WriteString(strings.TrimSpace(memoryInstructionsSection))
-		b.WriteString("\n\n")
-	}
 
 	rulesContent := strings.TrimSpace(globalRules + "\n\n" + projectRules)
 	overridden := detectOverrides(rulesContent)

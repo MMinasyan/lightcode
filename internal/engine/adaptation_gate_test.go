@@ -2,14 +2,18 @@ package engine
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/adaptation"
+	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
 	"github.com/MMinasyan/lightcode/internal/engine/tool"
-	runtimetool "github.com/MMinasyan/lightcode/internal/tool"
+	"github.com/MMinasyan/lightcode/internal/provider"
 )
 
 func textOnlyStream(content string) *sliceModelStream {
@@ -46,12 +50,12 @@ func (h hiddenStubTool) DefaultHidden() bool { return true }
 
 // TestAdaptationFiltersAdvertisedTools proves the request's Tools array reflects
 // the active adaptation: excluded tools are dropped, others kept; baseline keeps
-// all.
+// all. Retained generic tools stand in for the removed staged-execution toolset.
 func TestAdaptationFiltersAdvertisedTools(t *testing.T) {
 	newRegistry := func() *tool.Registry {
 		r := tool.NewRegistry()
-		r.Register(stagedStubTool{name: "edit_file"})
-		r.Register(runtimetool.ExecutePending{})
+		r.Register(simpleStubTool{name: "edit_file"})
+		r.Register(simpleStubTool{name: "read_file"})
 		return r
 	}
 
@@ -69,7 +73,7 @@ func TestAdaptationFiltersAdvertisedTools(t *testing.T) {
 		if requestHasTool(req, "edit_file") {
 			t.Fatal("advertised tools still contain excluded edit_file")
 		}
-		if !requestHasTool(req, "execute_pending") {
+		if !requestHasTool(req, "read_file") {
 			t.Fatal("advertised tools dropped a non-excluded tool")
 		}
 	})
@@ -84,7 +88,7 @@ func TestAdaptationFiltersAdvertisedTools(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 		req := client.requests[0]
-		if !requestHasTool(req, "edit_file") || !requestHasTool(req, "execute_pending") {
+		if !requestHasTool(req, "edit_file") || !requestHasTool(req, "read_file") {
 			t.Fatalf("baseline advertisement missing tools: %+v", req.Tools)
 		}
 	})
@@ -100,112 +104,6 @@ func toolResult(t *testing.T, lp *Loop, id string) string {
 	}
 	t.Fatalf("no tool result for %q", id)
 	return ""
-}
-
-// TestGateBlocksExcludedExecutePendingBeforeCoordinator proves the gate intercepts an
-// excluded execute_pending ahead of the pending coordinator and the registry, WITH a
-// staged edit present. If the gate did not precede the coordinator, call_2 would flush
-// the staged edit and return "Applied 1 staged edits."; instead the gate returns the
-// error, so the call reaches neither the coordinator (1101) nor the registry — the
-// "does NOT flush staged edits" guarantee, scoped to the call. The staged edit is
-// committed intent and still flushes at turn end via the separate flushPendingAtTurnEnd
-// path (asserted below as the <staged-flush> wrapper), which the gate does not, and
-// should not, suppress.
-func TestGateBlocksExcludedExecutePendingBeforeCoordinator(t *testing.T) {
-	body := twoToolCallChunk(
-		"call_1", "edit_file", `{\"path\":\"file.txt\",\"old_string\":\"a\",\"new_string\":\"b\",\"pending\":true}`,
-		"call_2", "execute_pending", `{}`,
-	)
-	srv := sseServer(t, body, textChunk("done"))
-	registry := tool.NewRegistry()
-	registry.Register(stagedStubTool{name: "edit_file"})
-	registry.Register(runtimetool.ExecutePending{})
-	lp := loopForServer(srv, registry)
-	setTestPendingExecutor(lp, registry, fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
-		"call_1": {Success: true, Result: "Edited file.txt."},
-	}})
-	lp.SetActiveAdaptation(&adaptation.Adaptation{ExcludeTools: []string{"execute_pending"}})
-	lp.SetEvents(make(chan Event, 32))
-	if _, err := lp.Run(context.Background(), "go"); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-
-	var execResult string
-	var turnEndEntries []StagedFlushEntry
-	for _, m := range lp.Messages() {
-		if m.Role == message.RoleTool && m.ToolCallID == "call_2" {
-			execResult = m.TextContent()
-		}
-		if entries, ok := ParseStagedFlushMessage(m); ok {
-			turnEndEntries = entries
-		}
-	}
-	// The gated call returns the gate error, never the coordinator's flush summary.
-	if execResult != `error: tool "execute_pending" is not available` {
-		t.Fatalf("execute_pending result = %q, want gate error (coordinator/registry not reached)", execResult)
-	}
-	// The staged edit was not flushed by the gated call, but is preserved and flushed
-	// at turn end as committed intent — proving the gate suppresses only the call.
-	if len(turnEndEntries) != 1 || turnEndEntries[0].ID != "call_1" {
-		t.Fatalf("turn-end staged-flush entries = %#v, want one entry for call_1", turnEndEntries)
-	}
-}
-
-// TestCoordinatorFlushesStagedEditsUnderAdaptation proves the coordinator stays intact:
-// a staged edit followed by an ALLOWED execute_pending flushes via the coordinator
-// ("Applied 1 staged edits." + a <staged-flush> wrapper) under both baseline and an
-// active-but-non-excluding adaptation. The "Applied" summary is producible only by the
-// coordinator (ExecutePending.Execute() is a no-op returning "No pending edits to
-// execute."), so this distinguishes the coordinator from the registry path; the
-// coordinator flushes at the call, emptying the queue before turn end (no turn-end
-// flush). An active adaptation never replaces the coordinator with the no-op tool.
-func TestCoordinatorFlushesStagedEditsUnderAdaptation(t *testing.T) {
-	body := twoToolCallChunk(
-		"call_1", "edit_file", `{\"path\":\"file.txt\",\"old_string\":\"a\",\"new_string\":\"b\",\"pending\":true}`,
-		"call_2", "execute_pending", `{}`,
-	)
-	run := func(t *testing.T, adapt *adaptation.Adaptation) (result string, wrapper bool) {
-		srv := sseServer(t, body, textChunk("done"))
-		registry := tool.NewRegistry()
-		registry.Register(stagedStubTool{name: "edit_file"})
-		registry.Register(runtimetool.ExecutePending{})
-		lp := loopForServer(srv, registry)
-		setTestPendingExecutor(lp, registry, fakeFlushExecutor{resultByID: map[string]tool.BatchResult{
-			"call_1": {Success: true, Result: "Edited file.txt."},
-		}})
-		lp.SetActiveAdaptation(adapt)
-		lp.SetEvents(make(chan Event, 32))
-		if _, err := lp.Run(context.Background(), "go"); err != nil {
-			t.Fatalf("Run: %v", err)
-		}
-		for _, m := range lp.Messages() {
-			if m.Role == message.RoleTool && m.ToolCallID == "call_2" {
-				result = m.TextContent()
-			}
-			if _, ok := ParseStagedFlushMessage(m); ok {
-				wrapper = true
-			}
-		}
-		return result, wrapper
-	}
-
-	for _, tc := range []struct {
-		name  string
-		adapt *adaptation.Adaptation
-	}{
-		{"baseline", nil},
-		{"active non-excluding adaptation", &adaptation.Adaptation{ExcludeTools: []string{"read_file"}}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, wrapper := run(t, tc.adapt)
-			if got != "Applied 1 staged edits." {
-				t.Fatalf("execute_pending result = %q, want \"Applied 1 staged edits.\" (coordinator flush)", got)
-			}
-			if !wrapper {
-				t.Fatal("expected a <staged-flush> wrapper from the coordinator flush")
-			}
-		})
-	}
 }
 
 // TestGateBlocksDefaultHiddenToolUnlessIncluded proves the dispatch gate (not just
@@ -242,7 +140,7 @@ func TestGateBlocksDefaultHiddenToolUnlessIncluded(t *testing.T) {
 func TestGateBlockedToolEmitsErrorRow(t *testing.T) {
 	srv := sseServer(t, toolCallChunk("call_1", "edit_file"), textChunk("done"))
 	registry := tool.NewRegistry()
-	registry.Register(stagedStubTool{name: "edit_file"})
+	registry.Register(simpleStubTool{name: "edit_file"})
 	lp := loopForServer(srv, registry)
 	lp.SetActiveAdaptation(&adaptation.Adaptation{ExcludeTools: []string{"edit_file"}})
 	events := make(chan Event, 16)
@@ -271,30 +169,13 @@ func TestGateBlockedToolEmitsErrorRow(t *testing.T) {
 	}
 }
 
-// TestGateBlocksPendingStagingForExcludedTool proves an excluded tool called with
-// pending=true is rejected before staging (result is the gate error, not "Staged.").
-func TestGateBlocksPendingStagingForExcludedTool(t *testing.T) {
-	srv := sseServer(t, editToolCallChunk("call_1"), textChunk("done"))
-	registry := tool.NewRegistry()
-	registry.Register(stagedStubTool{name: "edit_file"})
-	lp := loopForServer(srv, registry)
-	lp.SetActiveAdaptation(&adaptation.Adaptation{ExcludeTools: []string{"edit_file"}})
-	lp.SetEvents(make(chan Event, 16))
-	if _, err := lp.Run(context.Background(), "go"); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if got := toolResult(t, lp, "call_1"); got != `error: tool "edit_file" is not available` {
-		t.Fatalf("staged excluded tool result = %q, want gate error (not \"Staged.\")", got)
-	}
-}
-
 // TestGateLeavesUnknownToolMessageUnchanged proves an unregistered tool name falls
 // through to the existing unknown-tool path (byte-identity under baseline), not the
 // gate's "not available" message.
 func TestGateLeavesUnknownToolMessageUnchanged(t *testing.T) {
 	srv := sseServer(t, toolCallChunk("call_1", "ghost_tool"), textChunk("done"))
 	registry := tool.NewRegistry()
-	registry.Register(stagedStubTool{name: "edit_file"})
+	registry.Register(simpleStubTool{name: "edit_file"})
 	lp := loopForServer(srv, registry)
 	lp.SetEvents(make(chan Event, 16))
 	if _, err := lp.Run(context.Background(), "go"); err != nil {
@@ -302,5 +183,75 @@ func TestGateLeavesUnknownToolMessageUnchanged(t *testing.T) {
 	}
 	if got := toolResult(t, lp, "call_1"); got != `error: unknown tool "ghost_tool"` {
 		t.Fatalf("unknown tool result = %q, want unknown-tool message", got)
+	}
+}
+
+// simpleStubTool is a minimal tool registered so dispatch's registry.Get
+// succeeds; Execute returns a fixed result, or ErrDenied when denied is set.
+type simpleStubTool struct {
+	name   string
+	result string
+	denied bool
+}
+
+func (s simpleStubTool) Name() string                     { return s.name }
+func (s simpleStubTool) Description() string              { return s.name }
+func (s simpleStubTool) ParametersSchema() map[string]any { return map[string]any{"type": "object"} }
+func (s simpleStubTool) Execute(context.Context, map[string]any) (string, error) {
+	if s.denied {
+		return "", tool.ErrDenied
+	}
+	return s.result, nil
+}
+
+// sseServer serves one SSE body per request, indexed by call count.
+func sseServer(t *testing.T, bodies ...string) *httptest.Server {
+	t.Helper()
+	var n int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		i := n
+		n++
+		if i >= len(bodies) {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprint(w, bodies[i])
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func loopForServer(srv *httptest.Server, registry *tool.Registry) *Loop {
+	prov := &catalog.Provider{
+		ID:        "test",
+		Transport: catalog.Transport{BaseURL: srv.URL + "/v1"},
+		Models:    map[string]*catalog.Model{"model-a": {ID: "model-a"}},
+	}
+	client := provider.New(prov, prov.Models["model-a"], "")
+	return New(provider.NewAdapter(client), registry, "system")
+}
+
+// toolCallChunk renders an assistant SSE chunk calling a named tool with no args.
+func toolCallChunk(id, name string) string {
+	return `data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"` + id +
+		`","type":"function","function":{"name":"` + name + `","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+}
+
+func textChunk(content string) string {
+	return `data: {"choices":[{"delta":{"role":"assistant","content":"` + content + `"},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+}
+
+func drainEvents(ch chan Event) []Event {
+	var out []Event
+	for {
+		select {
+		case ev := <-ch:
+			out = append(out, ev)
+		default:
+			return out
+		}
 	}
 }

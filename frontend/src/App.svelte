@@ -383,24 +383,17 @@
     // stateful frame: buffered during a failed hydration, it seeds the view.
     EventsOn('navigation', buffered((data) => { applySnapshot(data); }, true));
 
-    // A turn-action boundary carries the fork/revert destination's complete state,
-    // the history revert's input prefill (a nonnull value even when empty, so an
-    // empty string still clears the composer; fork and code revert carry none),
-    // any code-revert skip notice, and a fork's failed-code-revert warning as one
-    // ordered frame; applying the snapshot, the prefill, and the notices together
-    // in that order keeps either notice from being clobbered by the replace. A
-    // state-carrying frame is stateful: buffered during a failed hydration, it
-    // seeds the view.
+    // A turn-action boundary carries the fork destination's complete state, any
+    // code-revert skip notice, and a fork's failed-code-revert warning as one
+    // ordered frame; applying the snapshot and the notices together in that order
+    // keeps either notice from being clobbered by the replace. A state-carrying
+    // frame is stateful: buffered during a failed hydration, it seeds the view.
     EventsOn('turn_action', buffered((data) => {
       applySnapshot(data?.state);
       // A notice-only frame over a view no state has seeded must not apply its
       // notices either: without a seed the notices describe a session the view
       // never shows. A stateful frame may seed the view and then apply them.
       if (!data?.state && !snapshotApplied) return;
-      // The prefill is applied before the notices: null/undefined means "do not
-      // touch the composer" (fork, code revert), while an explicit empty string
-      // still clears it.
-      if (data?.prefill != null) inputArea?.prefill(data.prefill);
       appendRevertSkipNotice({ skippedFiles: data?.skippedFiles });
       if (data?.warning) showError(data.warning);
     }, (data) => !!data?.state));
@@ -645,23 +638,6 @@
     }
   }
 
-  async function handleRevertHistory(e) {
-    const { turn, alsoRevertCode } = e.detail;
-    const opSession = sessionId;
-    const opGen = presentationGeneration;
-    try {
-      // The backend appends the reverted session's complete state, the input
-      // prefill, any skip notice, and the warning as one ordered turn_action
-      // boundary; the prefill is applied only there, never from this promise,
-      // so its delivery cannot reorder against the boundary.
-      await ApplyTurnAction(turn, 'revert_history', !!alsoRevertCode);
-    }
-    catch (err) {
-      if (sessionId !== opSession || presentationGeneration !== opGen) return;
-      showError(err);
-    }
-  }
-
   async function handleFork(e) {
     const { turn, alsoRevertCode } = e.detail;
     const opSession = sessionId;
@@ -698,7 +674,6 @@
   <div class="content" bind:this={contentEl} bind:clientWidth={contentWidth}>
     <MessageList {messages} {busy} {compacting} {messageQueue} {viewerOwner}
       on:revertcode={handleRevertCode}
-      on:reverthistory={handleRevertHistory}
       on:fork={handleFork} />
     {#if $viewer}
       {#if viewerOverlay}

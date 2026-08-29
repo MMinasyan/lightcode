@@ -22,6 +22,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
@@ -205,7 +206,7 @@ func TestForkStagedPublication(t *testing.T) {
 		defer os.Chmod(sub, 0o700)
 
 		var boundaryWarning string
-		res, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, clicked, TurnActionFork, true, func(hs HydrationState, _ []snapshot.SkippedRevert, warning string, _ *snapshot.CommittedMutationError, _ *string) {
+		res, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, clicked, TurnActionFork, true, func(hs HydrationState, _ []snapshot.SkippedRevert, warning string, _ *snapshot.CommittedMutationError) {
 			boundaryWarning = warning
 		})
 		if err != nil {
@@ -376,7 +377,7 @@ func forkCandidateContendedScenario(t *testing.T) {
 	defer func() { a.durableReadHook = nil }()
 
 	var emitted bool
-	_, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, turn, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string) {
+	_, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, turn, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError) {
 		emitted = true
 	})
 	// The foreign claim stays held until the fork call has returned; only
@@ -682,7 +683,7 @@ func TestForkPostRenameCleanupFailureReportsStderr(t *testing.T) {
 	var boundaryWarning string
 	forkDone := make(chan error, 1)
 	go func() {
-		_, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, clicked, TurnActionFork, true, func(hs HydrationState, _ []snapshot.SkippedRevert, warning string, _ *snapshot.CommittedMutationError, _ *string) {
+		_, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, clicked, TurnActionFork, true, func(hs HydrationState, _ []snapshot.SkippedRevert, warning string, _ *snapshot.CommittedMutationError) {
 			boundary = hs
 			boundaryWarning = warning
 		})
@@ -847,7 +848,7 @@ func TestForkUnresolvableAgentTypeFailsBeforeWork(t *testing.T) {
 	}
 
 	var emitted bool
-	_, err = a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string) {
+	_, err = a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError) {
 		emitted = true
 	})
 	if err == nil {
@@ -1026,7 +1027,7 @@ func TestForkPostRenameSourceTurnSurvives(t *testing.T) {
 
 	forkDone := make(chan error, 1)
 	go func() {
-		_, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, clicked, TurnActionFork, true, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string) {})
+		_, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, clicked, TurnActionFork, true, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError) {})
 		forkDone <- err
 	}()
 	select {
@@ -1207,7 +1208,7 @@ func assertForkStagedFailureInvariants(t *testing.T, a *Agent, sourceID, project
 func TestForkStagedFailureCoverage(t *testing.T) {
 	runFork := func(t *testing.T, a *Agent, sourceID string, emitted *bool) error {
 		t.Helper()
-		_, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string) {
+		_, err := a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError) {
 			*emitted = true
 		})
 		return err
@@ -1436,7 +1437,7 @@ func TestForkSourceCopyFailureMatrix(t *testing.T) {
 		}
 		defer restoreTurn()
 		var emitted bool
-		_, err = a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string) {
+		_, err = a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError) {
 			emitted = true
 		})
 		if err == nil {
@@ -1475,7 +1476,7 @@ func TestForkSourceCopyFailureMatrix(t *testing.T) {
 		}
 		defer restoreTokens()
 		var emitted bool
-		_, err = a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string) {
+		_, err = a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError) {
 			emitted = true
 		})
 		if err == nil {
@@ -1516,7 +1517,7 @@ func TestForkSourceCopyFailureMatrix(t *testing.T) {
 		}
 		defer restoreComp()
 		var emitted bool
-		_, err = a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string) {
+		_, err = a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError) {
 			emitted = true
 		})
 		if err == nil {
@@ -1557,7 +1558,7 @@ func TestForkStagedFileReadFailureMatrix(t *testing.T) {
 			}
 		})
 
-		_, err = a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string) {
+		_, err = a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError) {
 			emitted = true
 		})
 		if err == nil {
@@ -1597,7 +1598,7 @@ func TestForkStagedFileReadFailureMatrix(t *testing.T) {
 			}
 		})
 
-		_, err = a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string) {
+		_, err = a.ApplyTurnActionForSessionWithBoundary(sourceID, 1, TurnActionFork, false, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError) {
 			emitted = true
 		})
 		if err == nil {
@@ -1616,4 +1617,19 @@ func TestForkStagedFileReadFailureMatrix(t *testing.T) {
 		_ = claim.Release()
 		assertForkStagedFailureInvariants(t, a, sourceID, proj.ID, &emitted, stagingParent)
 	})
+}
+
+func loopUserContents(msgs []message.Message) []string {
+	var out []string
+	for _, m := range msgs {
+		if m.Role != message.RoleUser {
+			continue
+		}
+		var text string
+		for _, p := range m.Content {
+			text += p.Text
+		}
+		out = append(out, text)
+	}
+	return out
 }

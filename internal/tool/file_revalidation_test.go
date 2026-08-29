@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/permission"
 )
 
 func TestFileToolsRefuseRepointedApprovedSymlink(t *testing.T) {
@@ -92,58 +91,6 @@ func TestFileToolsRefuseFinalTargetReplacedBySymlink(t *testing.T) {
 	if _, err := NewEditFile(tracker, config.ToolsConfig{}).Execute(context.Background(), editParams); err == nil || !strings.Contains(err.Error(), "approved canonical path changed") {
 		t.Fatalf("edit_file error = %v, want canonical change refusal", err)
 	}
-	assertFileContent(t, secret, "secret")
-}
-
-func TestStagedAliasGroupFailsWhenAliasRepointedAfterApproval(t *testing.T) {
-	root := t.TempDir()
-	target := filepath.Join(root, "target.txt")
-	secret := filepath.Join(root, "secret.txt")
-	alias1 := filepath.Join(root, "alias1.txt")
-	alias2 := filepath.Join(root, "alias2.txt")
-	if err := os.WriteFile(target, []byte("before"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, alias1); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, alias2); err != nil {
-		t.Fatal(err)
-	}
-
-	tracker := NewFileTracker()
-	trackIdentityForPath(t, tracker, target, 1, 100)
-	checks := 0
-	executor := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, func(toolName, arg string) permission.Decision {
-		checks++
-		if checks == 2 && arg == target {
-			if err := os.Remove(alias2); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Symlink(secret, alias2); err != nil {
-				t.Fatal(err)
-			}
-		}
-		return permission.DecisionAllow
-	}, nil)
-
-	results := executor.ExecutePending(context.Background(), []StagedCall{
-		{ToolName: "write_file", ToolCallID: "a", Params: map[string]any{"path": alias1, "content": "first"}},
-		{ToolName: "write_file", ToolCallID: "b", Params: map[string]any{"path": alias2, "content": "second"}},
-	})
-
-	if len(results) != 2 {
-		t.Fatalf("results len = %d, want 2", len(results))
-	}
-	for i, result := range results {
-		if result.Success || !strings.Contains(result.Error, "approved canonical path changed") {
-			t.Fatalf("result[%d] = %+v, want canonical change failure", i, result)
-		}
-	}
-	assertFileContent(t, target, "before")
 	assertFileContent(t, secret, "secret")
 }
 

@@ -181,13 +181,13 @@ func TestTranscriptCoordinatorToolEndKeepsRowSequence(t *testing.T) {
 	}
 }
 
-// TestTranscriptCoordinatorStagedToolLastEndWins verifies a second tool end for the
-// same call overwrites the first in place, without adding a row or a sequence.
-func TestTranscriptCoordinatorStagedToolLastEndWins(t *testing.T) {
+// TestTranscriptCoordinatorLastEndWins verifies a second tool end for the same
+// call overwrites the first in place, without adding a row or a sequence.
+func TestTranscriptCoordinatorLastEndWins(t *testing.T) {
 	tr := newTranscript()
 	feedTranscriptEvents(tr, []Event{
 		{Kind: EventToolCallStart, ToolCallID: "t1", ToolName: "apply_patch"},
-		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "Staged."},
+		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "first"},
 		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "Applied.", ToolName: "apply_patch"},
 	})
 	tr.seqMu.Lock()
@@ -231,7 +231,7 @@ func TestTranscriptCoordinatorToolMetadataAndSubagentLinks(t *testing.T) {
 	tr2 := newTranscript()
 	feedTranscriptEvents(tr2, []Event{
 		{Kind: EventToolCallStart, ToolCallID: "t1", ToolName: "task"},
-		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "staged", Metadata: meta},
+		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "ok", Metadata: meta},
 		{Kind: EventToolCallEnd, ToolCallID: "t1", Result: "boom", IsError: true},
 	})
 	tr2.seqMu.Lock()
@@ -1755,9 +1755,8 @@ func TestCaptureStateReadsAllLiveClasses(t *testing.T) {
 }
 
 // TestTranscriptCoordinatorSessionErrorRetention verifies session-tagged errors are
-// retained as sequenced display rows, kept across ordinary commits, and disposed
-// per operation: history revert drops errors above its target turn and compaction
-// drops errors through its replaced range.
+// retained as sequenced display rows, kept across ordinary commits, and disposed by
+// compaction dropping the errors through its replaced range.
 func TestTranscriptCoordinatorSessionErrorRetention(t *testing.T) {
 	tr := newTranscript()
 
@@ -1786,15 +1785,6 @@ func TestTranscriptCoordinatorSessionErrorRetention(t *testing.T) {
 	}
 	tr.seqMu.Unlock()
 
-	// History revert to turn 1 drops errors above turn 1, keeps turn 1.
-	tr.seqMu.Lock()
-	tr.appendErrorLocked(Event{Kind: EventError, Error: "later", Turn: 2})
-	tr.dropErrorsAboveTurnLocked(1)
-	if len(tr.retainedErrors) != 1 || tr.retainedErrors[0].turn != 1 {
-		t.Fatalf("history-revert disposition wrong: %#v", tr.retainedErrors)
-	}
-	tr.seqMu.Unlock()
-
 	// Compaction through turn 1 removes the turn-1 error.
 	tr.seqMu.Lock()
 	tr.dropErrorsThroughTurnLocked(1)
@@ -1814,8 +1804,8 @@ func TestTranscriptCoordinatorSessionErrorRetention(t *testing.T) {
 // publishCompactionRewrite, which is unexported and not adapter-facing. The
 // exported route CompactNowForSession reaches the same boundary only after a
 // live multi-turn session, a model server, and a summarizer round-trip — none
-// of which participate in the pruning contract, and that full route is already
-// exercised end-to-end by TestCompactionIndexesSelectedSessionProject.
+// of which participate in the pruning contract; that full route is covered by
+// the existing CompactNowForSession regression coverage.
 func TestSessionErrorRetentionContract(t *testing.T) {
 	t.Run("attribution=compacted_away", func(t *testing.T) {
 		a := newLiveCatalogBackedTestAgent(t)
@@ -3320,55 +3310,6 @@ func TestPreseedCommittedLaunchNeverRestores(t *testing.T) {
 	}
 	if started.Turn == 0 {
 		t.Fatalf("no committed turn_start in %#v", cap.snapshot())
-	}
-}
-
-// TestTurnBegunAfterRevertRendersOnceThroughHydration proves the committed
-// bound against a reused turn number: after a combined code+history revert the
-// coordinator's committedTurn is lowered to the surviving turn, so a turn
-// begun after the revert that reissued an old number would compare a stale
-// bound against a reused number. The bounded durable read stops at the
-// surviving committed turn, the fresh turn's rows stay in the retained tail,
-// and the hydration capture renders the turn exactly once.
-func TestTurnBegunAfterRevertRendersOnceThroughHydration(t *testing.T) {
-	a := newLiveCatalogBackedTestAgent(t)
-	id := a.SessionCurrent().ID
-
-	// Ten complete turns through the store and the coordinator: the durable
-	// side records turns 1..10 and the coordinator commits each one.
-	for i := 1; i <= 10; i++ {
-		turn := a.store.BeginTurn()
-		a.lp.AppendUserMessage(turn, fmt.Sprintf("turn %d", i))
-		if err := a.store.MarkTurnComplete(turn); err != nil {
-			t.Fatalf("MarkTurnComplete(%d): %v", turn, err)
-		}
-		feedTranscript(a.transcriptForSessionID(id), Event{Kind: EventTurnStart, Turn: turn})
-		feedTranscript(a.transcriptForSessionID(id), Event{Kind: EventTurnEnd, Turn: turn})
-	}
-
-	if _, err := a.ApplyTurnActionForSession(id, 6, TurnActionRevertHistory, true); err != nil {
-		t.Fatalf("ApplyTurnActionForSession revert_history: %v", err)
-	}
-
-	// Begin and persist the next turn, feeding its rows into the coordinator
-	// without a turn end: the completion marker lands on disk while the commit
-	// has not run — the window the committed bound exists for.
-	fresh := a.store.BeginTurn()
-	const content = "fresh turn"
-	a.lp.AppendUserMessage(fresh, content)
-	if err := a.store.MarkTurnComplete(fresh); err != nil {
-		t.Fatalf("MarkTurnComplete(%d): %v", fresh, err)
-	}
-	tr := a.transcriptForSessionID(id)
-	feedTranscript(tr, Event{Kind: EventTurnStart, Turn: fresh})
-	feedTranscript(tr, Event{Kind: EventUserMessageDisplay, Result: content, Turn: fresh})
-
-	hs, err := a.HydrateSession(id)
-	if err != nil {
-		t.Fatalf("HydrateSession: %v", err)
-	}
-	if got := countHydrationContent(hs, content); got != 1 {
-		t.Fatalf("fresh turn rendered %d times through hydration, want exactly once (durable messages = %d, tail rows = %d)", got, len(hs.Messages), len(hs.Tail))
 	}
 }
 

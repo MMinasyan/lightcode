@@ -95,11 +95,11 @@ func (t *transcript) appendEventLocked(ev Event) int {
 		t.textOpen = false
 		return t.appendRowLocked(DisplayMessage{Type: "tool", ID: ev.ToolCallID, Name: ev.ToolName, Args: ev.Args, Turn: t.curTurn})
 	case EventToolCallEnd:
-		// Last end wins: a staged edit emits a second end (the real result) after
-		// its stage-time end, and the later end overwrites the row. Display metadata
-		// and subagent-session links attach on success and clear on failure, so the
-		// live tail carries the same edit previews and child links the durable
-		// projection derives from a successful tool result.
+		// Last end wins: a later ToolCallEnd for the same id overwrites the
+		// row, and display metadata and subagent-session links attach on
+		// success and clear on failure, so the live tail carries the same edit
+		// previews and child links the durable projection derives from a
+		// successful tool result.
 		for i := len(t.tail) - 1; i >= 0; i-- {
 			r := &t.tail[i]
 			if r.msg.Type == "tool" && r.msg.ID == ev.ToolCallID {
@@ -243,12 +243,6 @@ func (t *transcript) appendErrorLocked(ev Event) int {
 	})
 	t.nextSeq++
 	return seq
-}
-
-// dropErrorsAboveTurnLocked removes retained errors for turns above target. It is
-// the history-revert disposition: errors at or below the revert target survive.
-func (t *transcript) dropErrorsAboveTurnLocked(target int) {
-	t.retainedErrors = filterErrors(t.retainedErrors, func(e errorRow) bool { return e.turn <= target })
 }
 
 // dropErrorsThroughTurnLocked removes retained errors for turns at or below

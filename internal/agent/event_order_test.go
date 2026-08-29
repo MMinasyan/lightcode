@@ -18,7 +18,6 @@ import (
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/process"
 	"github.com/MMinasyan/lightcode/internal/prompt"
-	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
 // transcriptRow is the projection used by both projectEvents and
@@ -70,10 +69,9 @@ func projectEvents(events []Event) []transcriptRow {
 			flush()
 			rows = append(rows, transcriptRow{Type: "tool", Turn: currentTurn, ID: ev.ToolCallID, Name: ev.ToolName, Args: ev.Args})
 		case EventToolCallEnd:
-			// Last-end-wins: a staged edit emits a second ToolCallEnd (the real
-			// result, at flush) after its stage-time "Staged." end; the later end
-			// overwrites the row (no !Done guard), matching the live UIs and the
-			// reload <staged-flush> overlay.
+			// Last-end-wins: a later ToolCallEnd for the same id overwrites the
+			// earlier row (no !Done guard), so an updated result replaces the
+			// initial one in both live UIs and reload transcripts.
 			for i := len(rows) - 1; i >= 0; i-- {
 				if rows[i].Type == "tool" && rows[i].ID == ev.ToolCallID {
 					rows[i].Done = true
@@ -188,7 +186,7 @@ func newEventOrderAgent(t *testing.T, baseURL string) *Agent {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := New(Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
+	a, err := New(Config{Cfg: cfg, ProjectRoot: projectRoot, Home: home})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,13 +264,6 @@ func waitUntilEventOrderTurnEndCount(t *testing.T, cap *eventCapture, want int) 
 func writeTextResponse(w http.ResponseWriter, content string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	fmt.Fprintf(w, `data: {"choices":[{"delta":{"role":"assistant","content":%q},"finish_reason":"stop"}]}`+"\n\n", content)
-	fmt.Fprint(w, "data: [DONE]\n\n")
-}
-
-func writePendingEditToolCallResponse(w http.ResponseWriter, id string) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	args := `{"path":"file.txt","old_string":"a","new_string":"b","pending":true}`
-	fmt.Fprintf(w, `data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":%q,"type":"function","function":{"name":"edit_file","arguments":%q}}]},"finish_reason":"tool_calls"}]}`+"\n\n", id, args)
 	fmt.Fprint(w, "data: [DONE]\n\n")
 }
 
@@ -574,62 +565,6 @@ func TestEventOrderEqualsMessagesForFrontend(t *testing.T) {
 		waitUntilFullyDrained(t, a)
 		assertProjectionsMatch(t, a, cap)
 	})
-
-	t.Run("staged_edit", func(t *testing.T) {
-		var reqs atomic.Int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if reqs.Add(1) == 1 {
-				writePendingEditToolCallResponse(w, "call_1")
-				return
-			}
-			writeTextResponse(w, "done")
-		}))
-		defer server.Close()
-
-		a := newEventOrderAgent(t, server.URL+"/v1")
-		// Bootstrap the session first: newSession builds a fresh loop, so the
-		// fake pending executor must be installed on the live unit's loop.
-		if _, err := a.NewSession("", "primary"); err != nil {
-			t.Fatalf("NewSession: %v", err)
-		}
-		a.lp.SetPendingExecutor(fakeAgentPendingExecutor{results: map[string]tool.BatchResult{
-			"call_1": {Success: true, Result: "Edited file.txt (1 replacement, lines 1-1)."},
-		}})
-		cap := &eventCapture{}
-		ctx := startEventOrderAgent(t, a, cap)
-		if _, err := a.Submit(ctx, "stage edit"); err != nil {
-			t.Fatalf("Submit: %v", err)
-		}
-		waitUntilEventOrderTurnEndCount(t, cap, 1)
-		assertProjectionsMatch(t, a, cap)
-	})
-
-	t.Run("failed_staged_edit", func(t *testing.T) {
-		var reqs atomic.Int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if reqs.Add(1) == 1 {
-				writePendingEditToolCallResponse(w, "call_1")
-				return
-			}
-			writeTextResponse(w, "done")
-		}))
-		defer server.Close()
-
-		a := newEventOrderAgent(t, server.URL+"/v1")
-		if _, err := a.NewSession("", "primary"); err != nil {
-			t.Fatalf("NewSession: %v", err)
-		}
-		a.lp.SetPendingExecutor(fakeAgentPendingExecutor{results: map[string]tool.BatchResult{
-			"call_1": {Success: false, Error: "error: no match"},
-		}})
-		cap := &eventCapture{}
-		ctx := startEventOrderAgent(t, a, cap)
-		if _, err := a.Submit(ctx, "stage edit"); err != nil {
-			t.Fatalf("Submit: %v", err)
-		}
-		waitUntilEventOrderTurnEndCount(t, cap, 1)
-		assertProjectionsMatch(t, a, cap)
-	})
 }
 
 func TestTwoLiveSessionsRunTurnsConcurrently(t *testing.T) {
@@ -684,29 +619,6 @@ func TestTwoLiveSessionsRunTurnsConcurrently(t *testing.T) {
 	}
 	releaseOnce.Do(func() { close(release) })
 	waitUntilEventOrderTurnEndCount(t, cap, 2)
-}
-
-type fakeAgentPendingExecutor struct {
-	results map[string]tool.BatchResult
-}
-
-func (f fakeAgentPendingExecutor) ExecutePending(_ context.Context, staged []tool.StagedCall) []tool.BatchResult {
-	out := make([]tool.BatchResult, 0, len(staged))
-	for _, call := range staged {
-		if res, ok := f.results[call.ToolCallID]; ok {
-			res.ToolName = call.ToolName
-			res.ToolCallID = call.ToolCallID
-			out = append(out, res)
-			continue
-		}
-		out = append(out, tool.BatchResult{
-			ToolName:   call.ToolName,
-			ToolCallID: call.ToolCallID,
-			Success:    true,
-			Result:     "applied " + call.ToolCallID,
-		})
-	}
-	return out
 }
 
 func assertProjectionsMatch(t *testing.T, a *Agent, cap *eventCapture) {

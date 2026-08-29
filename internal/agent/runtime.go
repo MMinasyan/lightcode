@@ -16,9 +16,8 @@ type runtimeOptions struct {
 }
 
 type runtimePermissionPolicy struct {
-	Check     tool.CheckFunc
-	Ask       tool.AskFunc
-	AskAction tool.AskActionFunc
+	Check tool.CheckFunc
+	Ask   tool.AskFunc
 }
 
 func (p runtimePermissionPolicy) checkFunc() tool.CheckFunc {
@@ -33,15 +32,6 @@ func (p runtimePermissionPolicy) checkFunc() tool.CheckFunc {
 func (p runtimePermissionPolicy) askFunc() tool.AskFunc {
 	if p.Ask != nil {
 		return p.Ask
-	}
-	return func(context.Context, permission.Request) permission.ResponseAction {
-		return permission.ResponseDeny
-	}
-}
-
-func (p runtimePermissionPolicy) askActionFunc() tool.AskActionFunc {
-	if p.AskAction != nil {
-		return p.AskAction
 	}
 	return func(context.Context, permission.Request) permission.ResponseAction {
 		return permission.ResponseDeny

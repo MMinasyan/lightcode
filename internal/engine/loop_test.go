@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
@@ -991,39 +990,6 @@ func TestWakeSignalDuringTextModelCallStartsNextModelRequest(t *testing.T) {
 	}
 }
 
-func TestStageableWriteRequiresStringContent(t *testing.T) {
-	writer := runtimetool.NewWriteFile(nil, config.ToolsConfig{})
-	for _, tc := range []struct {
-		name   string
-		params map[string]any
-	}{
-		{
-			name: "missing",
-			params: map[string]any{
-				"path": "file.txt",
-			},
-		},
-		{
-			name: "non-string",
-			params: map[string]any{
-				"path":    "file.txt",
-				"content": 12,
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			args, err := json.Marshal(tc.params)
-			if err != nil {
-				t.Fatalf("marshal args: %v", err)
-			}
-			err = writer.ValidateStaged(context.Background(), args)
-			if err == nil || err.Error() != "write_file: content must be a string" {
-				t.Fatalf("ValidateStaged error = %v, want content type error", err)
-			}
-		})
-	}
-}
-
 type queueSignalTool struct {
 	queue func()
 }
@@ -1039,20 +1005,6 @@ func (queueSignalTool) ParametersSchema() map[string]any {
 func (t queueSignalTool) Execute(context.Context, map[string]any) (string, error) {
 	t.queue()
 	return "tool result", nil
-}
-
-func TestStageableWriteAllowsEmptyContent(t *testing.T) {
-	writer := runtimetool.NewWriteFile(nil, config.ToolsConfig{})
-	args, err := json.Marshal(map[string]any{
-		"path":    "file.txt",
-		"content": "",
-	})
-	if err != nil {
-		t.Fatalf("marshal args: %v", err)
-	}
-	if err := writer.ValidateStaged(context.Background(), args); err != nil {
-		t.Fatalf("ValidateStaged returned error for empty content: %v", err)
-	}
 }
 
 func TestConsumeStreamDoesNotMergeToolCallsWhenProviderOmitsIndices(t *testing.T) {

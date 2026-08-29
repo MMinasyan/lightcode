@@ -296,26 +296,6 @@ func TestRetainedPartialMutationRecordsCurrentIdentityAndReverts(t *testing.T) {
 			},
 		},
 		{
-			name: "staged_write",
-			run: func(t *testing.T, _ string, path string, store *snapshot.Store) error {
-				t.Helper()
-				results := NewStagedExecutor(store, nil, config.ToolsConfig{}, allowStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-					stagedWrite(path, "call-1", "after"),
-				})
-				return batchError(t, results)
-			},
-		},
-		{
-			name: "staged_edit",
-			run: func(t *testing.T, _ string, path string, store *snapshot.Store) error {
-				t.Helper()
-				results := NewStagedExecutor(store, nil, config.ToolsConfig{}, allowStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-					stagedEdit(path, "call-1", "before", "after", false),
-				})
-				return batchError(t, results)
-			},
-		},
-		{
 			name: "apply_patch",
 			run: func(t *testing.T, root, _ string, store *snapshot.Store) error {
 				t.Helper()
@@ -374,16 +354,6 @@ func TestRetainedPartialCreatedFileMutationRecordsCurrentIdentityAndDeletesOnRev
 			},
 		},
 		{
-			name: "staged_write_create",
-			run: func(t *testing.T, _ string, path string, store *snapshot.Store) error {
-				t.Helper()
-				results := NewStagedExecutor(store, nil, config.ToolsConfig{}, allowStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-					stagedWrite(path, "call-1", "after"),
-				})
-				return batchError(t, results)
-			},
-		},
-		{
 			name: "apply_patch_add",
 			run: func(t *testing.T, root, _ string, store *snapshot.Store) error {
 				t.Helper()
@@ -424,44 +394,6 @@ func TestRetainedPartialCreatedFileMutationRecordsCurrentIdentityAndDeletesOnRev
 			})
 		}
 	}
-}
-
-func TestStagedExecutorDiscardsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
-	root := t.TempDir()
-	target := snapshotLifecycleFile(t, root, "target.txt", "before")
-	secret := snapshotLifecycleFile(t, root, "secret.txt", "secret")
-	alias := filepath.Join(root, "alias.txt")
-	if err := os.Symlink(target, alias); err != nil {
-		t.Fatal(err)
-	}
-	store := newSnapshotLifecycleStore(t, root)
-	tracker := snapshotLifecycleTracker(t, target)
-	wrapped := &mutatingTransactionalSnapshotStore{
-		Store: store,
-		mutate: func() {
-			if err := os.Remove(alias); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Symlink(secret, alias); err != nil {
-				t.Fatal(err)
-			}
-		},
-	}
-
-	results := NewStagedExecutor(wrapped, tracker, config.ToolsConfig{}, allowStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-		stagedWrite(alias, "call-1", "after"),
-	})
-
-	assertStagedCanonicalChange(t, results, 0)
-	affected, err := store.RevertCode(0)
-	if err != nil {
-		t.Fatalf("RevertCode error = %v, want no active snapshot entry", err)
-	}
-	if len(affected.Restored) != 0 {
-		t.Fatalf("RevertCode affected = %v, want no files", affected)
-	}
-	assertFileContent(t, target, "before")
-	assertFileContent(t, secret, "secret")
 }
 
 type mutationFailureStep string
@@ -539,20 +471,6 @@ func withMutationFailure(t *testing.T, target string, step mutationFailureStep) 
 		openWriteTargetForMutationFunc = prevWrite
 		openExistingMutationFile = prevExisting
 	})
-}
-
-func batchError(t *testing.T, results []BatchResult) error {
-	t.Helper()
-	if len(results) != 1 {
-		return fmt.Errorf("results len = %d, want 1", len(results))
-	}
-	if results[0].Success {
-		return nil
-	}
-	if results[0].Error == "" {
-		return fmt.Errorf("result failed without error: %+v", results[0])
-	}
-	return fmt.Errorf("%s", results[0].Error)
 }
 
 type mutatingTransactionalSnapshotStore struct {

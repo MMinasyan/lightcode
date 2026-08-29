@@ -10,20 +10,19 @@ import {
 
 describe('permission normalization', () => {
   it('passes a live camelCase event through unchanged', () => {
-    const live = { id: 'p1', sessionId: 's', tool: 'edit_file', args: 'a', resolvedArg: 'r', canAllowAll: true, canSaveProject: false, batchIndex: 1, batchTotal: 2, batchFiles: ['f'], batchResolvedFiles: ['rf'] };
+    const live = { id: 'p1', sessionId: 's', tool: 'edit_file', args: 'a', resolvedArg: 'r', canSaveProject: false, batchFiles: ['f'], batchResolvedFiles: ['rf'] };
     expect(normalizePermission(live)).toMatchObject({
       id: 'p1', sessionId: 's', tool: 'edit_file', args: 'a', resolvedArg: 'r',
-      canAllowAll: true, canSaveProject: false, batchIndex: 1, batchTotal: 2,
+      canSaveProject: false,
       batchFiles: ['f'], batchResolvedFiles: ['rf'],
     });
   });
 
   it('maps hydration snake_case and inverts disable_project_save into canSaveProject', () => {
-    const snake = { id: 'p2', session_id: 's2', tool: 'edit_file', args: 'a', resolved_arg: 'r', can_allow_all: true, disable_project_save: true, batch_files: ['f'] };
+    const snake = { id: 'p2', session_id: 's2', tool: 'edit_file', args: 'a', resolved_arg: 'r', disable_project_save: true, batch_files: ['f'] };
     const n = normalizePermission(snake);
     expect(n.sessionId).toBe('s2');
     expect(n.resolvedArg).toBe('r');
-    expect(n.canAllowAll).toBe(true);
     expect(n.canSaveProject).toBe(false); // disable_project_save:true -> cannot save
     expect(n.batchFiles).toEqual(['f']);
   });

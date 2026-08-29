@@ -26,7 +26,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/engine/modelclient"
 	"github.com/MMinasyan/lightcode/internal/lsp"
-	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/process"
@@ -42,12 +41,11 @@ const tokensFileName = "tokens.json"
 
 // Config carries constructor parameters for New.
 type Config struct {
-	Cfg               *config.Config
-	ConfigPath        string // absolute path the config was loaded from; used for reloads and writes
-	ProjectRoot       string
-	Home              string
-	Env               *config.ManagedEnv // live .env state; may be nil in tests
-	NewMemoryEmbedder func(string) (*memory.Embedder, error)
+	Cfg         *config.Config
+	ConfigPath  string // absolute path the config was loaded from; used for reloads and writes
+	ProjectRoot string
+	Home        string
+	Env         *config.ManagedEnv // live .env state; may be nil in tests
 }
 
 // session holds the mutable state for one live conversation.
@@ -83,10 +81,9 @@ type session struct {
 	tokens          map[string]*TokenEntry
 	lastContextUsed int
 
-	taskToolInst    *taskTool
-	pendingExecutor *tool.StagedExecutor
-	fileTracker     *tool.FileTracker
-	lspDiagnostics  *tool.LSPDiagnostics
+	taskToolInst   *taskTool
+	fileTracker    *tool.FileTracker
+	lspDiagnostics *tool.LSPDiagnostics
 }
 
 // Agent is the shared service facade used by all adapters (Wails, HTTP, ACP).
@@ -118,17 +115,9 @@ type Agent struct {
 	pendingAgentWarnings   []prompt.Warning
 	pendingSetupWarnings   []prompt.Warning
 
-	embedderDegraded bool // true when memory embedder failed to initialize
-
-	memoryStore *memory.Store
-	memoryHooks agentMemoryHooks
-	// embedder is the one shared embedding model. Memory stores borrow it; the
-	// owner closes it exactly once at shutdown.
-	embedder *memory.Embedder
-
 	// servicesMu guards lspManagers and detectCtx. Each project owns one LSP
 	// manager, keyed by canonical project root and bound to it; the shared
-	// process manager and memory store remain owner-wide. detectCtx is set once
+	// process manager remain owner-wide. detectCtx is set once
 	// the owner is running, so detection starts exactly once per manager.
 	servicesMu  sync.Mutex
 	lspManagers map[string]*lspEntry
@@ -200,12 +189,6 @@ func (s loopSignalSink) AddSignal(signal loop.PendingSignal) {
 	if signal.Wake {
 		rt.nudgeSignalScheduler()
 	}
-}
-
-type agentMemoryHooks interface {
-	Reconcile() error
-	IndexSummary(sessionID, projectID, projectName, summary, createdAt, compactionPath string) error
-	DeleteSessionSummaries(sessionID string) error
 }
 
 type sessionLoopHooks struct {
@@ -300,7 +283,6 @@ type runningUnitLoopConfig struct {
 	Events             chan<- loop.Event
 	ContextTransformer loop.ContextTransformer
 	UsageRecorder      loop.UsageRecorder
-	PendingExecutor    tool.PendingExecutor
 	ActiveAdaptation   *adaptation.Adaptation
 }
 
@@ -317,7 +299,6 @@ type runningUnitConfig struct {
 	SessionStart      time.Time
 	InstalledPrompt   string
 	TaskTool          *taskTool
-	PendingExecutor   *tool.StagedExecutor
 	FileTracker       *tool.FileTracker
 	LSPDiagnostics    *tool.LSPDiagnostics
 }
@@ -337,7 +318,6 @@ func newRunningUnit(cfg runningUnitConfig) *session {
 		sessionStart:      cfg.SessionStart,
 		installedPrompt:   cfg.InstalledPrompt,
 		taskToolInst:      cfg.TaskTool,
-		pendingExecutor:   cfg.PendingExecutor,
 		fileTracker:       cfg.FileTracker,
 		lspDiagnostics:    cfg.LSPDiagnostics,
 	}
@@ -361,9 +341,6 @@ func newRunningUnitLoop(cfg runningUnitLoopConfig) *loop.Loop {
 	}
 	if cfg.UsageRecorder != nil {
 		lp.SetUsageRecorder(cfg.UsageRecorder)
-	}
-	if cfg.PendingExecutor != nil {
-		lp.SetPendingExecutor(cfg.PendingExecutor)
 	}
 	if cfg.ActiveAdaptation != nil {
 		lp.SetActiveAdaptation(cfg.ActiveAdaptation)
@@ -574,7 +551,7 @@ func (a *Agent) setSessionProject(unit *session, proj *project.Project) {
 	if unit == nil || unit.taskToolInst == nil || proj == nil || a == nil || a.projects == nil {
 		return
 	}
-	unit.taskToolInst.setProject(proj.ID, filepath.Join(a.projects.Root(), proj.ID, "memories"))
+	unit.taskToolInst.setProject(proj.ID)
 }
 
 func (unit *session) syncEventOwner() {
@@ -611,12 +588,6 @@ func (a *Agent) permissionCheckForProjectWith(cfg *config.Config, projectID, pro
 
 func (a *Agent) permissionAskForSession(unitRef func() *session, projectID string, useTurnContext bool) tool.AskFunc {
 	return tool.AskFunc(func(ctx context.Context, req permission.Request) permission.ResponseAction {
-		return a.askPermissionForSession(ctx, unitRef(), req, projectID, useTurnContext)
-	})
-}
-
-func (a *Agent) permissionAskActionForSession(unitRef func() *session, projectID string, useTurnContext bool) tool.AskActionFunc {
-	return tool.AskActionFunc(func(ctx context.Context, req permission.Request) permission.ResponseAction {
 		return a.askPermissionForSession(ctx, unitRef(), req, projectID, useTurnContext)
 	})
 }
@@ -734,17 +705,16 @@ type rootUnitSnapshot struct {
 }
 
 // rootUnitSnapshotLocked captures the reloadable configuration for a fresh
-// running unit under rt.mu: the resolved agent type (resolved against an
-// explicit resolve context so no project metadata is read under the lock),
+// running unit under rt.mu: the resolved agent type (a pure in-memory read),
 // the agent-config/catalog/config pointers, the tools config and subagent
 // limit values, and the tagged-event channel. Caller holds rt.mu.
-func (a *Agent) rootUnitSnapshotLocked(rt *runtime, activeAgentType, projectID string) rootUnitSnapshot {
+func (a *Agent) rootUnitSnapshotLocked(rt *runtime, activeAgentType string) rootUnitSnapshot {
 	snap := rootUnitSnapshot{
 		agentTypes:   a.agents,
 		modelCatalog: a.catalog,
 		cfg:          a.cfg,
 	}
-	snap.resolved, snap.resolveErr = a.resolvedAgentTypeWithContextLocked(activeAgentType, agentcfg.ResolveContext{Home: a.home, ProjectID: projectID})
+	snap.resolved, snap.resolveErr = a.resolvedAgentTypeLocked(activeAgentType)
 	if snap.cfg != nil {
 		snap.toolsConfig = snap.cfg.Tools
 		snap.maxConcurrent = snap.cfg.Subagents.MaxConcurrent
@@ -775,10 +745,9 @@ type rootUnitModelInstall struct {
 // connected/configured it builds the ref/client/context-window/adaptation
 // value (adaptation via the nil-safe resolveAdaptation); when no usable model
 // exists it returns nil, exactly the no-model state newSession preserves
-// today. No network or durable I/O runs under the lock (the resolve context is
-// explicit). Caller holds rt.mu.
-func (a *Agent) preparedModelForLocked(agentType, projectID string) *rootUnitModelInstall {
-	resolved, err := a.resolvedAgentTypeWithContextLocked(agentType, agentcfg.ResolveContext{Home: a.home, ProjectID: projectID})
+// today. No network or durable I/O runs under the lock. Caller holds rt.mu.
+func (a *Agent) preparedModelForLocked(agentType string) *rootUnitModelInstall {
+	resolved, err := a.resolvedAgentTypeLocked(agentType)
 	if err != nil || resolved.Model == "" {
 		return nil
 	}
@@ -843,7 +812,6 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 	unitRef := func() *session { return unit }
 	checkPolicy := a.permissionCheckForProjectWith(snap.cfg, projectID, projectRoot)
 	askPolicy := a.permissionAskForSession(unitRef, projectID, true)
-	askActionPolicy := a.permissionAskActionForSession(unitRef, projectID, false)
 	fileTracker := tool.NewFileTracker()
 	writeDir := strings.TrimSpace(snap.resolved.WriteDir)
 	options := tool.CapabilityOptions{WriteDir: writeDir}
@@ -854,14 +822,7 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 		}
 		registry.Register(tl)
 	}
-	registry.Register(tool.WrapWithPermission(tool.ExecutePending{}, checkPolicy, askPolicy))
 
-	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(store, fileTracker, snap.toolsConfig, projectRoot, checkPolicy, askActionPolicy, options)
-
-	memoriesDir := ""
-	if projectID != "" && a.projects != nil {
-		memoriesDir = filepath.Join(a.projects.Root(), projectID, "memories")
-	}
 	projectsRoot := ""
 	if a.projects != nil {
 		projectsRoot = a.projects.Root()
@@ -878,14 +839,11 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 		HomeDir:       a.home,
 		WorkspaceRoot: projectRoot,
 		ProcMgr:       a.procMgr,
-		MemoryStore:   a.memoryStore,
 		ProjectID:     projectID,
 		ProjectsRoot:  projectsRoot,
-		MemoriesDir:   memoriesDir,
 		LSPManager:    lspMgr,
 		Check:         checkPolicy,
 		Ask:           askPolicy,
-		AskAction:     askActionPolicy,
 		ResolveAdapt:  a.resolveAdapt,
 	})
 	registry.Register(tt)
@@ -902,9 +860,6 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 	}
 	registry.Register(tool.WrapWithPermission(tool.NewProcessTool(processes), checkPolicy, askPolicy))
 	registry.Register(tool.WrapWithPermission(tool.Sleep{}, checkPolicy, askPolicy))
-	registry.Register(tool.WrapWithPermission(tool.NewSaveMemory(a.memoryStore, memoriesDir), checkPolicy, askPolicy))
-	registry.Register(tool.WrapWithPermission(tool.NewSearchMemory(a.memoryStore, projectID), checkPolicy, askPolicy))
-	registry.Register(tool.WrapWithPermission(tool.NewSearchHistory(a.memoryStore, projectID), checkPolicy, askPolicy))
 
 	lspClient := lsp.NewClient(lspMgr)
 	lspDiag := tool.NewLSPDiagnostics(lspClient, &snapshotDiagAdapter{store: store})
@@ -922,11 +877,10 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 	}
 	res := a.assembleSystemPromptForSessionResolved(promptUnit, snap.resolved, snap.resolveErr)
 	loopCfg := runningUnitLoopConfig{
-		Registry:        registry,
-		SystemPrompt:    res.Prompt,
-		Store:           store,
-		Events:          rt.loopEvents,
-		PendingExecutor: pendingExecutor,
+		Registry:     registry,
+		SystemPrompt: res.Prompt,
+		Store:        store,
+		Events:       rt.loopEvents,
 	}
 	unitCfg := runningUnitConfig{
 		Runtime:         rt,
@@ -938,7 +892,6 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 		InstalledPrompt: res.Prompt,
 		Store:           store,
 		TaskTool:        tt,
-		PendingExecutor: pendingExecutor,
 		FileTracker:     fileTracker,
 		LSPDiagnostics:  lspDiag,
 		Loop:            loopCfg,
@@ -953,7 +906,6 @@ func (a *Agent) rootRunningUnit(snap rootUnitSnapshot, store *snapshot.Store, ac
 	unit.lp.SetContextTransformer(sessionLoopHooks{agent: a, unit: unit})
 	unit.lp.SetUsageRecorder(sessionLoopHooks{agent: a, unit: unit})
 	tt.usageRecorder = sessionLoopHooks{agent: a, unit: unit}
-	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 	return unit, res.Warnings, nil
 }
 
@@ -969,7 +921,7 @@ func (a *Agent) rootRunningUnitLocked(store *snapshot.Store, activeAgentType str
 		projectRoot = a.projectRoot
 	}
 	rt := a.ensureRuntime()
-	snap := a.rootUnitSnapshotLocked(rt, activeAgentType, projectID)
+	snap := a.rootUnitSnapshotLocked(rt, activeAgentType)
 	if snap.resolveErr != nil {
 		return nil, nil, snap.resolveErr
 	}
@@ -999,7 +951,7 @@ func (a *Agent) compactRunningUnitForSession(parent *session) (*session, int, er
 		ref = compactRef
 	}
 	compactPrompt := compact.DefaultSummarizerPrompt
-	if resolved, err := a.resolvedAgentTypeForProjectLocked("compact", parent.projectID); err == nil && strings.TrimSpace(resolved.Prompt) != "" {
+	if resolved, err := a.resolvedAgentTypeLocked("compact"); err == nil && strings.TrimSpace(resolved.Prompt) != "" {
 		compactPrompt = strings.TrimSpace(resolved.Prompt)
 	}
 	client, model, err := newProviderClient(a.catalog, ref)
@@ -1191,21 +1143,6 @@ func New(c Config) (*Agent, error) {
 		rt.nudgeSignalScheduler()
 	})
 
-	newMemoryEmbedder := c.NewMemoryEmbedder
-	if newMemoryEmbedder == nil {
-		newMemoryEmbedder = memory.NewEmbedder
-	}
-	embedder, err := newMemoryEmbedder(c.Home)
-	if err != nil {
-		// Embedder failure is non-fatal: semantic memory search will be disabled.
-		a.embedderDegraded = true
-		embedder = nil
-	}
-	a.embedder = embedder
-	memStore := memory.NewStore(embedder, resolver.Root(), c.Home)
-	a.memoryStore = memStore
-	a.memoryHooks = memStore
-
 	rt.mu.Lock()
 	unit, promptWarnings, err := a.rootRunningUnitLocked(store, "primary", proj.ID, proj.Name, c.ProjectRoot)
 	rt.mu.Unlock()
@@ -1264,9 +1201,6 @@ func (rt *runtime) initOnceLocked(ctx context.Context) string {
 	go func() { defer rt.bgWG.Done(); rt.drainLoopEvents(rt.ownerCtx) }()
 	go func() { defer rt.bgWG.Done(); rt.runSignalScheduler(rt.ownerCtx) }()
 	go func() { defer rt.bgWG.Done(); rt.runQueueDrainer(rt.ownerCtx) }()
-	if a.memoryHooks != nil {
-		_ = a.memoryHooks.Reconcile()
-	}
 	a.runSweep()
 	resumed, err := a.resumeMostRecent()
 	if err != nil {
@@ -1700,20 +1634,14 @@ func permissionRequestFromGateRequest(req permission.Request) *PermissionRequest
 		ToolName:           req.ToolName,
 		Arg:                req.Arg,
 		ResolvedArg:        req.ResolvedArg,
-		CanAllowAll:        req.CanAllowAll,
 		DisableProjectSave: req.DisableProjectSave,
-		BatchIndex:         req.BatchIndex,
-		BatchTotal:         req.BatchTotal,
 		BatchFiles:         req.BatchFiles,
 		BatchResolvedFiles: req.BatchResolvedFiles,
 	}
 }
 
 func permissionRequestFromLoopEvent(ev loop.Event, sessionID, projectID string) *PermissionRequest {
-	canAllowAll, _ := ev.Metadata["can_allow_all"].(bool)
 	disableProjectSave, _ := ev.Metadata["disable_project_save"].(bool)
-	batchIndex, _ := ev.Metadata["batch_index"].(int)
-	batchTotal, _ := ev.Metadata["batch_total"].(int)
 	batchFiles, _ := ev.Metadata["batch_files"].([]string)
 	batchResolvedFiles, _ := ev.Metadata["batch_resolved_files"].([]string)
 	resolvedArg, _ := ev.Metadata["resolved_arg"].(string)
@@ -1724,10 +1652,7 @@ func permissionRequestFromLoopEvent(ev loop.Event, sessionID, projectID string) 
 		ToolName:           ev.ToolName,
 		Arg:                ev.PermArg,
 		ResolvedArg:        resolvedArg,
-		CanAllowAll:        canAllowAll,
 		DisableProjectSave: disableProjectSave,
-		BatchIndex:         batchIndex,
-		BatchTotal:         batchTotal,
 		BatchFiles:         batchFiles,
 		BatchResolvedFiles: batchResolvedFiles,
 	}
@@ -1920,9 +1845,9 @@ func (a *Agent) recordUsageForSession(unit *session, ev loop.Event) {
 	unit.tokensMu.Lock()
 	// Copy the current entries and context into candidate values, apply the
 	// delta to the candidates, and publish them only after the durable write
-	// succeeds: memory, the cumulative report, and the usage event can never
-	// outrun the tokens.json commit. A failed write retains the old values and
-	// emits nothing; the failure is reported after the lock is released.
+	// succeeds: the cumulative report and the usage event can never outrun the
+	// tokens.json commit. A failed write retains the old values and emits
+	// nothing; the failure is reported after the lock is released.
 	candidates := make(map[string]*TokenEntry, len(unit.tokens))
 	for k, e := range unit.tokens {
 		c := *e
@@ -2037,13 +1962,6 @@ func (a *Agent) runSweep() {
 		DeleteAfterArchiveDays: deleteAfterArchiveDays,
 	}
 	var onDelete func(string)
-	if a.memoryHooks != nil {
-		onDelete = func(sessionID string) {
-			if err := a.memoryHooks.DeleteSessionSummaries(sessionID); err != nil {
-				fmt.Fprintf(os.Stderr, "lightcode: delete summaries for session %s: %v\n", sessionID, err)
-			}
-		}
-	}
 	// The serializer carries owner-close admission into the sweep: it holds
 	// lifecycleMu per candidate and refuses a close-first candidate before any
 	// claim, so a sweep candidate cannot archive or delete a session after the
@@ -2248,9 +2166,9 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 		return activeStart, fmt.Errorf("save compaction: %w", err)
 	}
 	// Publish the rewrite boundary on durable success, before the loop-history
-	// rewrite and memory indexing, so a live-selection capture racing the compaction
-	// sees the revision advance promptly and re-reads the rewritten durable prefix
-	// rather than publishing the pre-compaction one.
+	// rewrite, so a live-selection capture racing the compaction sees the revision
+	// advance promptly and re-reads the rewritten durable prefix rather than
+	// publishing the pre-compaction one.
 	a.publishCompactionRewrite(unit, sessionID, projectID, boundaryTurn, summary, committed)
 
 	var activeReads []tool.ReadRecord
@@ -2262,16 +2180,6 @@ func (a *Agent) compactAtCheckpointForSession(ctx context.Context, unit *session
 		readMaxLines := a.cfg.Tools.ReadMaxLines
 		rt.mu.Unlock()
 		activeReads = activeTailReadRecords(messages[activeStart:], unit.fileTracker.Snapshot(), readMaxLines, unit.projectRoot)
-	}
-
-	if a.memoryHooks != nil {
-		sessionID := unit.store.SessionID()
-		projID := unit.projectID
-		projName := unit.projectName
-		compactionPath := filepath.Join(unit.store.Dir(), "compaction.json")
-		if err := a.memoryHooks.IndexSummary(sessionID, projID, projName, result.Summary, rec.CompactedAt, compactionPath); err != nil {
-			fmt.Fprintf(os.Stderr, "lightcode: memory index summary: %v\n", err)
-		}
 	}
 
 	newActiveStart := unit.lp.LoadHistoryWithSummaryAndActiveTail(result.Summary, result.SummarizerRef, activeStart)
@@ -2680,18 +2588,11 @@ func (a *Agent) refreshSystemPromptForSession(unit *session) {
 	// switch (applyReloadStateLocked -> setAgentTypesLocked), and this runs on
 	// the turn goroutine without that lock. Resolve the agent type under
 	// runtime.mu and copy the resolved values out: resolution is a pure
-	// in-memory read, so only it runs under the lock. The resolve context is
-	// built first because the current project id is a durable read, and the
-	// prompt assembly (rules-file I/O) runs after release.
-	ctx := agentcfg.ResolveContext{Home: a.home}
-	if a.projects != nil {
-		if proj, err := a.projects.Current(); err == nil && proj != nil {
-			ctx.ProjectID = proj.ID
-		}
-	}
+	// in-memory read, so only it runs under the lock; the prompt assembly
+	// (rules-file I/O) runs after release.
 	rt := a.ensureRuntime()
 	rt.mu.Lock()
-	resolved, resolveErr := a.resolvedAgentTypeWithContextLocked(agentType, ctx)
+	resolved, resolveErr := a.resolvedAgentTypeLocked(agentType)
 	rt.mu.Unlock()
 	res := a.assembleSystemPromptForSessionResolved(unit, resolved, resolveErr)
 	if res.Prompt != unit.installedPrompt {
@@ -2730,11 +2631,10 @@ func (a *Agent) assembleSystemPromptForSessionResolved(unit *session, resolved a
 	if unit == nil || a.promptSvc == nil {
 		return prompt.Result{}
 	}
-	spec := prompt.Spec{Size: prompt.SizeFull, Memory: true, Adapt: unit.activeAdapt}
+	spec := prompt.Spec{Size: prompt.SizeFull, Adapt: unit.activeAdapt}
 	if resolveErr == nil {
 		spec.Size = resolved.SystemPrompt
 		spec.Body = resolved.Prompt
-		spec.Memory = resolved.Memory
 	}
 	a.fireDurableReadHook()
 	return a.promptSvc.Assemble(unit.projectRoot, unit.sessionStart, spec)
@@ -4400,9 +4300,6 @@ func (a *Agent) applyUnitConfigLocked(unit *session) {
 			}
 		}
 	}
-	if unit.pendingExecutor != nil {
-		unit.pendingExecutor.SetToolsConfig(a.cfg.Tools)
-	}
 	if unit.taskToolInst != nil {
 		unit.taskToolInst.setCatalog(a.catalog)
 		unit.taskToolInst.setMaxConcurrent(a.cfg.Subagents.MaxConcurrent)
@@ -4438,10 +4335,9 @@ func waitGroupOrTimeout(wg *sync.WaitGroup, d time.Duration) bool {
 // still-running drainer, then cancels and joins the background goroutines. It
 // is one shared join: every caller waits for the same cleanup, and it runs
 // exactly once. When every turn has actually finished, the live session stores
-// are detached — releasing their claims — and the shared embedder is closed;
-// an abandoned turn keeps both, so a still-running turn never loses its store
-// or hits a closed embedder, and the process-exit boundary releases what
-// shutdown did not.
+// are detached — releasing their claims — while an abandoned turn keeps its
+// claim, so a still-running turn never loses its store; the process-exit
+// boundary releases what shutdown did not.
 //
 // It also closes session-identity admission: closed is published under the
 // lifecycle lock, so every open/resume/new/fork either completes before the
@@ -4527,8 +4423,7 @@ func (a *Agent) ShutdownOwner() bool {
 		// finished. The join is bounded and may return while a turn still runs;
 		// detaching then would release that session's claim under the live turn,
 		// letting another process drive the same saved session — the condition
-		// the active-process marker exists to prevent. The embedder close below
-		// carries the same gate for the same reason. The gate is all-or-nothing
+		// the active-process marker exists to prevent. The gate is all-or-nothing
 		// across every live session; there is deliberately no per-session
 		// tracking.
 		if turnsDrained {
@@ -4542,12 +4437,6 @@ func (a *Agent) ShutdownOwner() bool {
 		bgDrained := waitGroupOrTimeout(&rt.bgWG, shutdownJoinTimeout)
 		if !bgDrained {
 			fmt.Fprintf(os.Stderr, "lightcode: owner shutdown abandoned background workers after %s\n", shutdownJoinTimeout)
-		}
-		// Close the shared embedder only once every turn has actually finished, so
-		// an abandoned turn never hits a closed embedder; a leaked embedder is
-		// released at process exit.
-		if turnsDrained && a.embedder != nil {
-			a.embedder.Close()
 		}
 		// Store the outcome before the close: only the caller that wins the Once
 		// executes this body, so a value returned from inside the Do would reach
@@ -5009,7 +4898,7 @@ func (a *Agent) openSession(id string, emit func(HydrationState)) (SessionSummar
 		rt.mu.Unlock()
 		return SessionSummary{}, err
 	}
-	snap := a.rootUnitSnapshotLocked(rt, "primary", proj.ID)
+	snap := a.rootUnitSnapshotLocked(rt, "primary")
 	if snap.resolveErr != nil {
 		rt.mu.Unlock()
 		return SessionSummary{}, snap.resolveErr
@@ -5256,14 +5145,14 @@ func (a *Agent) newSessionInProject(proj *project.Project, agentType string, emi
 		if typeName == "" {
 			typeName = "primary"
 		}
-		snap := a.rootUnitSnapshotLocked(rt, typeName, proj.ID)
+		snap := a.rootUnitSnapshotLocked(rt, typeName)
 		if snap.resolveErr != nil {
 			return "", rootUnitSnapshot{}, nil, snap.resolveErr
 		}
 		if snap.resolved.Name == "compact" {
 			return "", rootUnitSnapshot{}, nil, fmt.Errorf("agent type %q cannot be started as a session", snap.resolved.Name)
 		}
-		return snap.resolved.Name, snap, a.preparedModelForLocked(snap.resolved.Name, proj.ID), nil
+		return snap.resolved.Name, snap, a.preparedModelForLocked(snap.resolved.Name), nil
 	}()
 	if err != nil {
 		return "", err
@@ -5557,14 +5446,6 @@ func (a *Agent) SessionDelete(id string) error {
 		var committed *snapshot.CommittedMutationError
 		if err != nil && !errors.As(err, &committed) {
 			return err
-		}
-		// The delete committed; a failed summaries removal cannot fail it.
-		// The residue keeps the deleted session's sections and vectors in
-		// search_history, so it is reported rather than dropped.
-		if a.memoryHooks != nil {
-			if cleanupErr := a.memoryHooks.DeleteSessionSummaries(id); cleanupErr != nil {
-				fmt.Fprintf(os.Stderr, "lightcode: delete summaries for session %s: %v\n", id, cleanupErr)
-			}
 		}
 		return err
 	})
@@ -6165,8 +6046,7 @@ func (a *Agent) messagesForFrontendForStore(store *snapshot.Store, sessionID str
 // durable while its commit has not run stays invisible to the durable half
 // until the coordinator commits it (it appears only through the retained
 // tail/live events before that). The bound is applied to the raw records,
-// where every element carries its turn, and a staged-flush wrapper produces no
-// row at all.
+// where every element carries its turn.
 func (a *Agent) messagesThroughTurn(store *snapshot.Store, sessionID string, committedTurn int) ([]DisplayMessage, error) {
 	if store == nil {
 		return nil, snapshot.ErrNoSession
@@ -6216,7 +6096,6 @@ func (a *Agent) renderCompleteTurns(raw []snapshot.TurnMessages) []DisplayMessag
 
 	for _, t := range raw {
 		toolStubs := make(map[string]int)
-		legacyStagedFlushAllowed := false
 		for _, line := range t.Messages {
 			var m message.Message
 			if json.Unmarshal(line, &m) != nil {
@@ -6227,37 +6106,7 @@ func (a *Agent) renderCompleteTurns(raw []snapshot.TurnMessages) []DisplayMessag
 
 			case message.RoleUser:
 				c := m.TextContent()
-				entries, ok := loop.ParseStagedFlushMessage(m)
-				if !ok && legacyStagedFlushAllowed {
-					// Compatibility for sessions persisted by the short-lived
-					// unmarked wrapper format on this branch. Real typed user
-					// prompts are turn-leading messages, so only allow the old
-					// text marker after a staged tool result in the same turn.
-					entries, ok = loop.ParseStagedFlush(c)
-				}
-				if ok {
-					// <staged-flush> wrapper: overlay the real per-staged results
-					// onto the tool stubs (which currently hold "Staged."), so
-					// reload matches the live per-tool ToolCallEnd events. Produces
-					// no transcript row. New wrappers carry metadata; old wrappers
-					// fall back to registry-derived metadata from args+result.
-					for _, e := range entries {
-						idx, found := toolStubs[e.ID]
-						if !found {
-							continue
-						}
-						out[idx].Done = true
-						out[idx].Success = !e.IsError
-						out[idx].Result = e.Result
-						if out[idx].Success && e.Metadata != nil {
-							out[idx].Metadata = e.Metadata
-						} else if out[idx].Success {
-							out[idx].Metadata = a.displayMetadataForToolCall(out[idx].Name, out[idx].Args, e.Result)
-						} else {
-							out[idx].Metadata = nil
-						}
-					}
-				} else if signal, ok := loop.ParseSystemSignalMessage(m); ok {
+				if signal, ok := loop.ParseSystemSignalMessage(m); ok {
 					if bg, ok := parseBackgroundTerminalSignal(signal); ok {
 						out = append(out, DisplayMessage{
 							Type:              "background_process",
@@ -6302,9 +6151,6 @@ func (a *Agent) renderCompleteTurns(raw []snapshot.TurnMessages) []DisplayMessag
 				if idx, ok := toolStubs[m.ToolCallID]; ok {
 					out[idx].Done = true
 					content := m.TextContent()
-					if content == "Staged." {
-						legacyStagedFlushAllowed = true
-					}
 					out[idx].Success = !displayToolResultIsError(m, out[idx].Name, content)
 					out[idx].Result = content
 					if out[idx].Success {
@@ -6334,10 +6180,6 @@ func displayToolResultIsError(msg message.Message, toolName, content string) boo
 	}
 	if content == "denied by user" || strings.HasPrefix(content, "error: ") {
 		return true
-	}
-	if toolName == "execute_pending" {
-		return strings.HasPrefix(content, "Failed to apply ") ||
-			(strings.HasPrefix(content, "Applied ") && strings.Contains(content, " failed."))
 	}
 	return false
 }
@@ -6460,11 +6302,11 @@ func (a *Agent) ApplyTurnActionForSession(sessionID string, turn int, action str
 // no session; its prebuilt complete state is published the same way, and the
 // adapters decide whether to consume it (protocol) or keep a notice-only surface
 // (desktop).
-func (a *Agent) ApplyTurnActionForSessionWithBoundary(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (TurnActionResult, error) {
+func (a *Agent) ApplyTurnActionForSessionWithBoundary(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError)) (TurnActionResult, error) {
 	return a.applyTurnActionResolved(sessionID, turn, action, alsoRevertCode, emit)
 }
 
-func (a *Agent) applyTurnActionResolved(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (TurnActionResult, error) {
+func (a *Agent) applyTurnActionResolved(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError)) (TurnActionResult, error) {
 	defer a.lockLifecycle()()
 	// Post-lifecycleMu admission recheck: a turn action admitted by the host
 	// before close but entering the owner after close refuses here, before
@@ -6489,12 +6331,12 @@ func (a *Agent) applyTurnActionResolved(sessionID string, turn int, action strin
 // boundary under their locks. The code-revert skips and a fork's
 // failed-code-revert warning ride the boundary so the adapter reassembles its
 // combined frame.
-func (a *Agent) emitTurnActionBoundaryLocked(unit *session, result TurnActionResult, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string), committed *snapshot.CommittedMutationError, prefill *string) {
+func (a *Agent) emitTurnActionBoundaryLocked(unit *session, result TurnActionResult, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError), committed *snapshot.CommittedMutationError) {
 	if emit == nil || unit == nil {
 		return
 	}
 	a.captureUnderLocksRTHeld(unit, result.Messages, sessionIDOf(unit), nil, func(cs completeState) {
-		emit(hydrationStateFrom(result.Session, cs), result.SkippedFiles, result.Warning, committed, prefill)
+		emit(hydrationStateFrom(result.Session, cs), result.SkippedFiles, result.Warning, committed)
 	})
 }
 
@@ -6528,16 +6370,19 @@ func (a *Agent) reserveTurnActionUnit(unit *session) (func(), error) {
 	return release, nil
 }
 
-func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (TurnActionResult, error) {
-	// Every turn action — the fork and the two reverts — reserves the unit
+func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError)) (TurnActionResult, error) {
+	switch action {
+	case TurnActionFork, TurnActionRevertCode:
+	default:
+		return TurnActionResult{}, fmt.Errorf("unknown turn action %q", action)
+	}
+	// Every turn action — the fork and the code rewind — reserves the unit
 	// across its durable mutation with the same reservation pair the removal
-	// path uses: the unit must not be driveable while its loop state and its
-	// durable history disagree (history truncation), while its files are
-	// mid-restore, or while the fork's staged copy and publication are in
-	// flight. The release (endLiveTransition) is registered before any lock or
-	// I/O, so it runs after every return — success and failure alike — and
-	// re-arms the drainers. A committed eviction leaves the unit inactive, so
-	// the release is a no-op there.
+	// path uses: the unit must not be driveable while its files are mid-restore
+	// or while the fork's staged copy and publication are in flight. The release
+	// (endLiveTransition) is registered before any lock or I/O, so it runs after
+	// every return — success and failure alike — and re-arms the drainers. A
+	// committed eviction leaves the unit inactive, so the release is a no-op there.
 	release, err := a.reserveTurnActionUnit(unit)
 	if err != nil {
 		return TurnActionResult{}, err
@@ -6586,207 +6431,14 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		result = a.buildTurnActionResult(result, summary, messages, tokens)
 		// A successful code-only revert changes no session; the prebuilt
 		// replacement payload rides the boundary for the protocol consumer.
-		// Fork never sets prefill and neither does a code revert, so the
-		// boundary prefill is nil here.
 		rt := a.ensureRuntime()
 		rt.mu.Lock()
 		a.resetFileTrackerForSession(unit)
-		a.emitTurnActionBoundaryLocked(unit, result, emit, nil, nil)
+		a.emitTurnActionBoundaryLocked(unit, result, emit, nil)
 		rt.mu.Unlock()
-		return result, nil
-
-	case TurnActionRevertHistory:
-		target := turn - 1
-		result.TargetTurn = target
-		// The input prefill is the clicked user message read before the
-		// mutation and never re-read after the walk. History creates a pointer
-		// even for legitimate empty content — an empty prefill still clears
-		// the composer — while fork and code revert pass nil.
-		prefillText := a.userMessageContentForTurnForSession(unit, turn)
-		prefill := &prefillText
-		result.Prefill = prefillText
-		result.SessionChanged = true
-		// The summary and token report are prepared before the mutation: the
-		// revert changes no metadata and no in-memory token state, so the
-		// pre-mutation values are the post-revert values. The messages come
-		// from the mandatory reconciliation read (the reload) below.
-		summary, _, tokens := a.prepareTurnActionResultState(unit)
-		var codeChanged bool
-		var preMutationMessages []DisplayMessage
-		if alsoRevertCode {
-			// The code restore is best-effort and runs first: when it fails,
-			// the history revert does not run and the unit is unchanged, so
-			// the result carries the pre-mutation view — read before the
-			// restore, never after it.
-			_, preMutationMessages, _ = a.prepareTurnActionResultState(unit)
-			revertResult, err := unit.store.RevertCode(target)
-			result.RestoredFiles = revertResult.Restored
-			result.SkippedFiles = revertResult.Skipped
-			if err != nil {
-				return a.buildTurnActionResult(result, summary, preMutationMessages, tokens), err
-			}
-			// Only actually restored files count as a code mutation:
-			// skipped-only results do not mutate files (the snapshot entries
-			// are retained), and the removal of emptied snapshot-turn dirs is
-			// internal bookkeeping that needs no replacement or coordinator
-			// mutation.
-			codeChanged = len(revertResult.Restored) > 0
-		}
-		// One rule, keyed on the reload: the loop must match what the revert
-		// achieved, whatever that was. The walk stops at the first failed
-		// removal, so even a failed walk removed every turn above the one it
-		// stopped at; the loop is therefore re-derived from disk after the
-		// walk, and the pre-walk truncation point tells the queue rule whether
-		// any turn was removed.
-		revertOutcome, revertErr := unit.store.RevertHistory(target)
-		// A revert below a compaction boundary invalidates the session's
-		// indexed summary along with the record: search_history would keep
-		// serving a "Full summary" path that no longer resolves. Delete the
-		// session's summaries before the reload, so the eviction path is
-		// covered by the same call. The delete has committed, so a failed
-		// removal cannot fail the revert; the residue is reported to stderr.
-		if revertOutcome.CompactionRemoved && a.memoryHooks != nil {
-			if err := a.memoryHooks.DeleteSessionSummaries(sessionIDOf(unit)); err != nil {
-				fmt.Fprintf(os.Stderr, "lightcode: delete summaries for session %s: %v\n", sessionIDOf(unit), err)
-			}
-		}
-		// HistoryChanged is the durable-mutation predicate from the store. The
-		// operational allocation point is kept separately from the visible
-		// endpoint, which is derived from the successful reload below.
-		historyChanged := revertOutcome.HistoryChanged
-		// Zero-operation-mutation failure: when the revert changed nothing
-		// durably — no compaction record removed, no turn removed, and the
-		// optional code phase restored no file (codeChanged) — the error is
-		// the whole outcome regardless of whether a code phase was requested.
-		// It is returned as a precommit failure without a loop reload,
-		// queue/tracker/coordinator mutation, warning, or boundary, and the
-		// existing reservation is released normally. Any durable history
-		// mutation or any actually restored file keeps the reconciled
-		// treatment: the loop must match disk and the boundary must publish
-		// the survivors.
-		if revertErr != nil && !revertOutcome.HistoryStateKnown {
-			return a.evictRevertUnit(unit, result, revertErr, nil, emit, prefill)
-		}
-		if revertErr != nil && !historyChanged && !codeChanged {
-			return result, revertErr
-		}
-		raw, err := a.loadHistoryIntoLoopForSession(unit)
-		if err != nil {
-			// The loop can no longer match disk, so the unit must not stay
-			// live: releasing the reservation would re-arm the drainers over
-			// the mismatched loop, and leaving it set fails unitMutableLocked
-			// forever. Evict instead — the files are untouched and reopening
-			// loads them again. The eviction never releases a still-live
-			// mismatched unit.
-			return a.evictRevertUnit(unit, result, revertErr, err, emit, prefill)
-		}
-		result = a.buildTurnActionResult(result, summary, a.renderCompleteTurns(raw), tokens)
-		// The final section commits the coordinator mutation and publishes the
-		// boundary under rt.mu: clear the queue when history changed, reset
-		// the tracker, lower the committed bound to the surviving turn, prune
-		// retained errors above it, and advance the rewrite epoch exactly once
-		// — every completed or partial revert advances it, even when the
-		// committed bound did not change, so a live capture that raced the
-		// truncation re-reads the durable prefix. committedSeq and curTurn are
-		// left unchanged: retained rows above the new bound carry sequences at
-		// or below the old high-water, so consumers gate them as already
-		// present and they disappear with the replacement.
-		rt := a.ensureRuntime()
-		rt.mu.Lock()
-		// Every reconciled historyChanged outcome invalidates the queue: the
-		// queued input no longer applies once the record was durably removed
-		// or any turn was removed — including a compaction unlink followed by
-		// a sync failure and a record removal followed by a first walk
-		// failure, where no turn was removed but the record is already gone.
-		// Every reconciled historyChanged outcome invalidates the queue: the
-		// queued input no longer applies once the record was durably removed
-		// or any turn was removed — including a compaction unlink followed by
-		// a sync failure and a record removal followed by a first walk
-		// failure, where no turn was removed but the record is already gone.
-		if historyChanged {
-			_, clearedVersion, queueCleared := rt.clearQueueLockedForSession(unit)
-			if queueCleared {
-				a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionIDOf(unit), ProjectID: unit.projectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
-			}
-		}
-		a.resetFileTrackerForSession(unit)
-		visibleTurn := highestLoadedTurn(raw)
-		if tr := a.transcriptForSessionID(sessionIDOf(unit)); tr != nil {
-			tr.seqMu.Lock()
-			tr.tail = nil
-			tr.textOpen = false
-			if visibleTurn < tr.committedTurn {
-				tr.committedTurn = visibleTurn
-			}
-			tr.dropErrorsAboveTurnLocked(visibleTurn)
-			tr.rewriteEpoch++
-			tr.seqMu.Unlock()
-		}
-		// A reconciled walk failure still publishes the boundary: the loop is
-		// reconciled, so the capture is over state that matches disk, and the
-		// adapters learn the turns are gone from both. The failure rides the
-		// result and the boundary as a warning.
-		if revertErr != nil {
-			result.Warning = revertErr.Error()
-		}
-		var committed *snapshot.CommittedMutationError
-		if revertErr != nil {
-			_ = errors.As(revertErr, &committed)
-		}
-		a.emitTurnActionBoundaryLocked(unit, result, emit, committed, prefill)
-		rt.mu.Unlock()
-		if revertErr != nil {
-			return result, revertErr
-		}
 		return result, nil
 	}
 	return TurnActionResult{}, fmt.Errorf("unknown turn action %q", action)
-}
-
-// evictRevertUnit evicts a unit whose loop reload failed after a history
-// revert: the loop can no longer match disk, so the unit must not stay live.
-// It detaches the store, clears routing only when the unit was current,
-// unregisters transcript state, clears the unit's queue, emits one
-// error-bearing empty boundary, and returns the reload error joined with the
-// walk error when both exist. The caller holds the reservation; the deferred
-// release no-ops over the detached store, so the mismatched unit is never
-// re-armed.
-func (a *Agent) evictRevertUnit(unit *session, result TurnActionResult, revertErr, reloadErr error, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string), prefill *string) (TurnActionResult, error) {
-	id := sessionIDOf(unit)
-	joined := errors.Join(revertErr, reloadErr)
-	rt := a.ensureRuntime()
-	rt.mu.Lock()
-	if unit == a.session {
-		a.store.Detach()
-		if a.currentSessionID == id {
-			a.currentSessionID = ""
-		}
-		delete(a.sessions, id)
-		rt.unregisterTranscript(id)
-		rt.clearQueueLocked()
-		a.resetCurrentSessionStateLocked()
-	} else {
-		unit.store.Detach()
-		rt.clearQueueLockedForSession(unit)
-		delete(a.sessions, id)
-		rt.unregisterTranscript(id)
-	}
-	rt.mu.Unlock()
-	// One prepared eviction outcome feeds both consumers below and nothing is
-	// re-read after commit: an empty replacement state (the evicted unit has no
-	// live view to hydrate), the skips this operation's code phase produced,
-	// and the joined warning naming every cause. The boundary tuple and the
-	// returned result — which rides error.data for the protocol consumer — are
-	// derived from these same values, so a consumer that saw the empty state
-	// gets an identical payload in the rejection: no stale pre-reload summary,
-	// messages, or tokens survive on either side.
-	state := HydrationState{}
-	result = a.buildTurnActionResult(result, state.Session, nil, state.Tokens)
-	result.Warning = joined.Error()
-	if emit != nil {
-		emit(state, result.SkippedFiles, result.Warning, nil, prefill)
-	}
-	return result, joined
 }
 
 // applyForkTurnAction applies the fork turn action. The caller holds
@@ -6798,7 +6450,7 @@ func (a *Agent) evictRevertUnit(unit *session, result TurnActionResult, revertEr
 // mutates the working tree; it is best-effort against the source store: a
 // revert error keeps the partial result and rides the result and the boundary
 // as a warning rather than failing the already-committed fork.
-func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (TurnActionResult, error) {
+func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError)) (TurnActionResult, error) {
 	result := TurnActionResult{Action: TurnActionFork, Turn: turn}
 	result.TargetTurn = turn
 	result.SessionChanged = true
@@ -6836,7 +6488,7 @@ func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool
 					a.resetFileTrackerForSession(unit)
 				}
 			}
-			a.emitTurnActionBoundaryLocked(candidate, result, emit, committed, nil)
+			a.emitTurnActionBoundaryLocked(candidate, result, emit, committed)
 		}
 		rt.mu.Unlock()
 		if err != nil {
@@ -6887,12 +6539,12 @@ func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool
 		} else {
 			a.resetFileTrackerForSession(unit)
 		}
-		a.emitTurnActionBoundaryLocked(candidate, result, emit, nil, nil)
+		a.emitTurnActionBoundaryLocked(candidate, result, emit, nil)
 		rt.mu.Unlock()
 		return result, nil
 	}
 	rt.mu.Lock()
-	a.emitTurnActionBoundaryLocked(candidate, result, emit, nil, nil)
+	a.emitTurnActionBoundaryLocked(candidate, result, emit, nil)
 	rt.mu.Unlock()
 	return result, nil
 }
@@ -6908,38 +6560,7 @@ func (a *Agent) buildTurnActionResult(result TurnActionResult, summary SessionSu
 	return result
 }
 
-func highestLoadedTurn(turns []snapshot.TurnMessages) int {
-	highest := 0
-	for _, turn := range turns {
-		if turn.Turn > highest {
-			highest = turn.Turn
-		}
-	}
-	return highest
-}
-
-// prepareTurnActionResultState reads the session summary, the durable display
-// history, and the token report for a turn-action result before the
-// operation's irreversible mutation. The summary and the token report are
-// unchanged across the code/history reverts, so the pre-mutation values are
-// the post-revert values; the messages are the pre-mutation view, used only
-// where the mutation does not change them.
-func (a *Agent) prepareTurnActionResultState(unit *session) (SessionSummary, []DisplayMessage, TokenReport) {
-	summary := sessionSummary(unit)
-	var messages []DisplayMessage
-	if unit != nil && unit.store != nil && unit.store.Active() {
-		messages, _ = a.messagesForFrontendForStore(unit.store, unit.store.SessionID())
-	}
-	var tokens TokenReport
-	if unit != nil {
-		unit.tokensMu.Lock()
-		tokens = a.buildReportForSessionLocked(unit)
-		unit.tokensMu.Unlock()
-	}
-	return summary, messages, tokens
-}
-
-// prepareRevertCodeState reads the session metadata and the durable display history for a code revert before Store.RevertCode mutates anything: the revert changes neither, so the pre-mutation values are the post-revert ones. Unlike the best-effort preparation shared with history, every read failure is returned — complete state must never be built from partial reads, so a failed preparation stays a bare error and no mutation runs.
+// prepareRevertCodeState reads the session metadata and the durable display history for a code revert before Store.RevertCode mutates anything: the revert changes neither, so the pre-mutation values are the post-revert ones. Every read failure is returned — complete state must never be built from partial reads, so a failed preparation stays a bare error and no mutation runs.
 func (a *Agent) prepareRevertCodeState(unit *session) (SessionSummary, []DisplayMessage, TokenReport, error) {
 	meta, err := unit.store.Meta()
 	if err != nil {
@@ -6953,34 +6574,6 @@ func (a *Agent) prepareRevertCodeState(unit *session) (SessionSummary, []Display
 	tokens := a.buildReportForSessionLocked(unit)
 	unit.tokensMu.Unlock()
 	return sessionSummaryFromUnit(unit, meta), messages, tokens, nil
-}
-
-func turnActionVerb(action string) string {
-	switch action {
-	case TurnActionRevertCode, TurnActionRevertHistory:
-		return "revert"
-	case TurnActionFork:
-		return "fork"
-	default:
-		return "apply turn action"
-	}
-}
-
-func (a *Agent) userMessageContentForTurn(turn int) string {
-	return a.userMessageContentForTurnForSession(a.session, turn)
-}
-
-func (a *Agent) userMessageContentForTurnForSession(unit *session, turn int) string {
-	var msgs []DisplayMessage
-	if unit != nil && unit.store != nil && unit.store.Active() {
-		msgs, _ = a.messagesForFrontendForStore(unit.store, unit.store.SessionID())
-	}
-	for _, msg := range msgs {
-		if msg.Type == "user" && msg.Turn == turn {
-			return msg.Content
-		}
-	}
-	return ""
 }
 
 // RevertCode restores the source tree through the direct code-revert
@@ -7120,7 +6713,7 @@ func (a *Agent) forkUnitAtTurn(unit *session, turn int) (candidate *session, pre
 		if err != nil {
 			return forkSourceSnapshot{}, rootUnitSnapshot{}, err
 		}
-		snap := a.rootUnitSnapshotLocked(rt, src.agentType, src.projectID)
+		snap := a.rootUnitSnapshotLocked(rt, src.agentType)
 		if snap.resolveErr != nil {
 			return forkSourceSnapshot{}, rootUnitSnapshot{}, snap.resolveErr
 		}
@@ -7620,39 +7213,16 @@ func (a *Agent) modelRefConnected(ref coremodel.ModelRef) bool {
 	return providerConnected(prov)
 }
 
-func (a *Agent) agentResolveContextLocked() agentcfg.ResolveContext {
-	ctx := agentcfg.ResolveContext{Home: a.home}
-	if a.projects != nil {
-		if proj, err := a.projects.Current(); err == nil && proj != nil {
-			ctx.ProjectID = proj.ID
-		}
-	}
-	return ctx
-}
-
-func (a *Agent) resolvedAgentTypeLocked(name string) (agentcfg.Resolved, error) {
-	return a.resolvedAgentTypeForProjectLocked(name, "")
-}
-
-func (a *Agent) resolvedAgentTypeForProjectLocked(name string, projectID string) (agentcfg.Resolved, error) {
-	ctx := a.agentResolveContextLocked()
-	if strings.TrimSpace(projectID) != "" {
-		ctx.ProjectID = projectID
-	}
-	return a.resolvedAgentTypeWithContextLocked(name, ctx)
-}
-
-// resolvedAgentTypeWithContextLocked resolves one agent type against the agents
-// config. The config is written under runtime.mu (applyReloadStateLocked ->
+// resolvedAgentTypeLocked resolves one agent type against the agents config.
+// The config is written under runtime.mu (applyReloadStateLocked ->
 // setAgentTypesLocked), so the caller must hold runtime.mu across this call;
 // resolution is a pure in-memory read returning a value copy, never pointers
-// into the config. The resolve context is prebuilt by the caller so no durable
-// read (the current project id) runs under the lock.
-func (a *Agent) resolvedAgentTypeWithContextLocked(name string, ctx agentcfg.ResolveContext) (agentcfg.Resolved, error) {
+// into the config.
+func (a *Agent) resolvedAgentTypeLocked(name string) (agentcfg.Resolved, error) {
 	if a.agents == nil {
 		return agentcfg.Resolved{}, fmt.Errorf("agents config is not loaded")
 	}
-	return a.agents.Resolve(name, ctx)
+	return a.agents.Resolve(name)
 }
 
 func (a *Agent) resolvedAgentModelLocked(name string) (coremodel.ModelRef, string, bool) {
@@ -7718,12 +7288,6 @@ func (a *Agent) setupWarningsLocked() []prompt.Warning {
 		out = append(out, prompt.Warning{
 			Kind:    "setup_model_unavailable",
 			Message: fmt.Sprintf("Configured model %q is unavailable because its provider is not connected or the model is incomplete.", configuredModel),
-		})
-	}
-	if a.embedderDegraded {
-		out = append(out, prompt.Warning{
-			Kind:    "setup_embedder_degraded",
-			Message: "Memory embedder failed to initialize; semantic memory search is disabled.",
 		})
 	}
 	return out

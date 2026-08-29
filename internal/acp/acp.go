@@ -37,8 +37,8 @@ type Response struct {
 // RPCError is a JSON-RPC 2.0 error object. Data is boundary-based: whenever a
 // committed/partial operation emitted a typed result boundary, the same prepared
 // result rides here, so a consumer that observed the boundary gets the identical
-// payload. History/fork carry the prepared TurnActionResult; new carries the
-// prepared SessionSummary; archive/delete and every precommit failure omit data.
+// payload. Committed fork failures carry the prepared TurnActionResult; new carries
+// the prepared SessionSummary; archive/delete and every precommit failure omit data.
 type RPCError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
@@ -435,8 +435,6 @@ func (r *Runner) dispatch(ctx context.Context, req Request) {
 		r.handleSessionFork(req)
 	case "session/revert_code":
 		r.handleRevertCode(req)
-	case "session/revert_history":
-		r.handleRevertHistory(req)
 	case "model/current":
 		r.handleModelCurrent(req)
 	case "model/list":
@@ -572,10 +570,7 @@ func (r *Runner) handleEvent(ev agent.Event) {
 			"tool":               ev.PermReq.ToolName,
 			"arg":                ev.PermReq.Arg,
 			"resolvedArg":        ev.PermReq.ResolvedArg,
-			"canAllowAll":        ev.PermReq.CanAllowAll,
 			"canSaveProject":     !ev.PermReq.DisableProjectSave,
-			"batchIndex":         ev.PermReq.BatchIndex,
-			"batchTotal":         ev.PermReq.BatchTotal,
 			"batchFiles":         ev.PermReq.BatchFiles,
 			"batchResolvedFiles": ev.PermReq.BatchResolvedFiles,
 		}
@@ -1027,10 +1022,6 @@ func (r *Runner) handleRevertCode(req Request) {
 	r.handleTurnAction(req, agent.TurnActionRevertCode)
 }
 
-func (r *Runner) handleRevertHistory(req Request) {
-	r.handleTurnAction(req, agent.TurnActionRevertHistory)
-}
-
 func (r *Runner) handleTurnAction(req Request, action string) {
 	var params turnActionParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -1045,13 +1036,13 @@ func (r *Runner) handleTurnAction(req Request, action string) {
 		r.respondError(req.ID, -32000, err.Error())
 		return
 	}
-	// The owner publishes the session-changing revert/fork boundary in-commit
-	// before the response; a code-only revert publishes its complete state the
-	// same way. The handler records whether the callback emitted so a
-	// post-boundary error can ride the same prepared result as error data,
-	// while a precommit failure stays bare.
+	// The owner publishes the session-changing fork boundary in-commit before
+	// the response; a code-only revert publishes its complete state the same
+	// way. The handler records whether the callback emitted so a post-boundary
+	// error can ride the same prepared result as error data, while a precommit
+	// failure stays bare.
 	emitted := false
-	result, err := r.agent.ApplyTurnActionForSessionWithBoundary(sessionID, params.Turn, action, params.AlsoRevertCode, func(state agent.HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError, _ *string) {
+	result, err := r.agent.ApplyTurnActionForSessionWithBoundary(sessionID, params.Turn, action, params.AlsoRevertCode, func(state agent.HydrationState, _ []snapshot.SkippedRevert, _ string, _ *snapshot.CommittedMutationError) {
 		emitted = true
 		id := strings.TrimSpace(state.Session.ID)
 		r.setCurrent(id, state.Session)
@@ -1063,9 +1054,8 @@ func (r *Runner) handleTurnAction(req Request, action string) {
 	})
 	if err != nil {
 		if emitted {
-			// Partial/committed history and fork return boundary-before-error:
-			// the same prepared result the boundary was built from goes in
-			// error.data.
+			// A committed failure returns boundary-before-error: the same
+			// prepared result the boundary was built from goes in error.data.
 			r.respondErrorData(req.ID, -32000, err.Error(), result)
 		} else {
 			r.respondError(req.ID, -32000, err.Error())

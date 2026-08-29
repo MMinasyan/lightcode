@@ -4,15 +4,12 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/editpreview"
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/engine/message"
 	"github.com/MMinasyan/lightcode/internal/process"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
-	"github.com/MMinasyan/lightcode/internal/tool"
 )
 
 func TestSessionMessagesDoesNotRecoverCompleteActiveTurn(t *testing.T) {
@@ -175,65 +172,6 @@ func TestSessionMessagesForReadOnlyDoesNotRecoverIncompleteOtherSession(t *testi
 	}
 	if got := a.SessionCurrent().ID; got != parentID {
 		t.Fatalf("SessionMessagesFor switched current session to %q, want %q", got, parentID)
-	}
-}
-
-// appendStagedEditTurn persists one turn that stages an edit_file call (RoleTool
-// "Staged.") and then records a <staged-flush> wrapper carrying the real result,
-// mirroring what the loop persists on auto-flush. wrapper is built from results.
-func appendStagedEditTurn(t *testing.T, a *Agent, editArgs string, results []tool.BatchResult) {
-	t.Helper()
-	turn := a.store.BeginTurn()
-	wrapper, ok := loop.NewStagedFlushMessage(results)
-	if !ok {
-		t.Fatal("NewStagedFlushMessage returned false")
-	}
-	msgs := []message.Message{
-		message.NewText(message.RoleUser, "do edit"),
-		{
-			Role:      message.RoleAssistant,
-			ToolCalls: []message.ToolCall{{ID: "call_1", Type: "function", Function: message.FunctionCall{Name: "edit_file", Arguments: editArgs}}},
-		},
-		toolResult("call_1", "edit_file", "Staged."),
-		wrapper,
-	}
-	for _, m := range msgs {
-		data, err := json.Marshal(m)
-		if err != nil {
-			t.Fatalf("marshal: %v", err)
-		}
-		if err := a.store.AppendMessage(turn, data); err != nil {
-			t.Fatalf("AppendMessage: %v", err)
-		}
-	}
-	if err := a.store.MarkTurnComplete(turn); err != nil {
-		t.Fatalf("MarkTurnComplete: %v", err)
-	}
-}
-
-func appendLegacyUnmarkedStagedEditTurn(t *testing.T, a *Agent, editArgs string, results []tool.BatchResult) {
-	t.Helper()
-	turn := a.store.BeginTurn()
-	msgs := []message.Message{
-		message.NewText(message.RoleUser, "do edit"),
-		{
-			Role:      message.RoleAssistant,
-			ToolCalls: []message.ToolCall{{ID: "call_1", Type: "function", Function: message.FunctionCall{Name: "edit_file", Arguments: editArgs}}},
-		},
-		toolResult("call_1", "edit_file", "Staged."),
-		message.NewText(message.RoleUser, loop.BuildStagedFlush(results)),
-	}
-	for _, m := range msgs {
-		data, err := json.Marshal(m)
-		if err != nil {
-			t.Fatalf("marshal: %v", err)
-		}
-		if err := a.store.AppendMessage(turn, data); err != nil {
-			t.Fatalf("AppendMessage: %v", err)
-		}
-	}
-	if err := a.store.MarkTurnComplete(turn); err != nil {
-		t.Fatalf("MarkTurnComplete: %v", err)
 	}
 }
 
@@ -455,233 +393,11 @@ func TestSessionMessagesUsesPersistedToolResultErrorMarker(t *testing.T) {
 	}
 }
 
-func TestSessionMessagesTreatsLegacyExecutePendingFailureSummariesAsErrors(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
-	if _, err := a.NewSession("", "primary"); err != nil {
-		t.Fatalf("NewSession returned error: %v", err)
-	}
-	turn := a.store.BeginTurn()
-	msgs := []message.Message{
-		message.NewText(message.RoleUser, "apply"),
-		{
-			Role:      message.RoleAssistant,
-			ToolCalls: []message.ToolCall{{ID: "call_1", Type: "function", Function: message.FunctionCall{Name: "execute_pending", Arguments: `{}`}}},
-		},
-		toolResult("call_1", "execute_pending", "Applied 1 staged edits; 1 failed."),
-	}
-	for _, m := range msgs {
-		data, err := json.Marshal(m)
-		if err != nil {
-			t.Fatalf("marshal: %v", err)
-		}
-		if err := a.store.AppendMessage(turn, data); err != nil {
-			t.Fatalf("AppendMessage: %v", err)
-		}
-	}
-	if err := a.store.MarkTurnComplete(turn); err != nil {
-		t.Fatalf("MarkTurnComplete: %v", err)
-	}
-
-	display := a.SessionMessages()
-	if len(display) != 2 {
-		t.Fatalf("display messages len = %d, want 2: %#v", len(display), display)
-	}
-	got := display[1]
-	if got.Type != "tool" || got.Success {
-		t.Fatalf("legacy execute_pending failure display = %#v", got)
-	}
-}
-
-func TestSessionMessagesAppliesStagedFlushOverlayToToolStub(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
-	if _, err := a.NewSession("", "primary"); err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	args := `{"path":"file.txt","old_string":"a","new_string":"b"}`
-	realResult := "Edited file.txt (1 replacement, lines 1-2)."
-	wantMeta := editpreview.MetadataFromArgs(args, realResult)
-	if wantMeta == nil {
-		t.Fatal("test setup: expected non-nil edit_preview metadata for this args+result")
-	}
-	wantMeta["source"] = "persisted"
-	appendStagedEditTurn(t, a, args, []tool.BatchResult{{ToolCallID: "call_1", Result: realResult, Metadata: wantMeta}})
-
-	display := a.SessionMessages()
-	// Expect exactly: user "do edit", then the tool row with the REAL result —
-	// the <staged-flush> wrapper produces no row.
-	if len(display) != 2 {
-		t.Fatalf("display len = %d, want 2: %#v", len(display), display)
-	}
-	if display[0].Type != "user" || display[0].Content != "do edit" {
-		t.Fatalf("display[0] = %#v", display[0])
-	}
-	tr := display[1]
-	if tr.Type != "tool" || tr.ID != "call_1" || !tr.Done || !tr.Success {
-		t.Fatalf("tool row basics = %#v", tr)
-	}
-	if tr.Result != realResult {
-		t.Fatalf("tool row result = %q, want real result (not \"Staged.\")", tr.Result)
-	}
-	if tr.Metadata["source"] != "persisted" {
-		t.Fatalf("tool row metadata source = %#v, want persisted wrapper metadata", tr.Metadata["source"])
-	}
-	wantPreview, ok := editpreview.FromMetadata(wantMeta)
-	if !ok {
-		t.Fatal("test setup: expected preview from metadata")
-	}
-	gotPreview, ok := editpreview.FromMetadata(tr.Metadata)
-	if !ok {
-		t.Fatalf("tool row metadata did not contain edit preview: %#v", tr.Metadata)
-	}
-	if !reflect.DeepEqual(gotPreview, wantPreview) {
-		t.Fatalf("tool row preview = %#v, want %#v", gotPreview, wantPreview)
-	}
-	// No row should be a fake user bubble from the wrapper.
-	for _, m := range display {
-		if m.Type == "user" && m.Content != "do edit" {
-			t.Fatalf("unexpected user row from wrapper: %#v", m)
-		}
-	}
-}
-
-func TestSessionMessagesAppliesLegacyUnmarkedStagedFlushOverlay(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
-	if _, err := a.NewSession("", "primary"); err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	args := `{"path":"file.txt","old_string":"a","new_string":"b"}`
-	realResult := "Edited file.txt (1 replacement, lines 1-2)."
-	appendLegacyUnmarkedStagedEditTurn(t, a, args, []tool.BatchResult{{ToolCallID: "call_1", Result: realResult}})
-
-	display := a.SessionMessages()
-	if len(display) != 2 {
-		t.Fatalf("display len = %d, want 2: %#v", len(display), display)
-	}
-	tr := display[1]
-	if tr.Type != "tool" || tr.ID != "call_1" || tr.Result != realResult {
-		t.Fatalf("legacy staged-flush overlay = %#v", tr)
-	}
-}
-
-func TestSessionMessagesStagedFlushOrphanIDIgnored(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
-	if _, err := a.NewSession("", "primary"); err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	// Wrapper references an unknown tool_call id; the real call_1 has no entry.
-	args := `{"path":"file.txt","old_string":"a","new_string":"b"}`
-	appendStagedEditTurn(t, a, args, []tool.BatchResult{{ToolCallID: "call_99", Result: "orphan"}})
-
-	display := a.SessionMessages()
-	if len(display) != 2 {
-		t.Fatalf("display len = %d, want 2: %#v", len(display), display)
-	}
-	tr := display[1]
-	// call_1 stub is untouched by the orphan entry: stays at "Staged.".
-	if tr.Type != "tool" || tr.ID != "call_1" || tr.Result != "Staged." {
-		t.Fatalf("orphan should not touch call_1; got %#v", tr)
-	}
-}
-
-func TestSessionMessagesStagedFlushDoesNotOverlayAcrossTurns(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
-	if _, err := a.NewSession("", "primary"); err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	turn1 := a.store.BeginTurn()
-	msgs := []message.Message{
-		message.NewText(message.RoleUser, "first turn"),
-		{
-			Role:      message.RoleAssistant,
-			ToolCalls: []message.ToolCall{{ID: "call_dup", Type: "function", Function: message.FunctionCall{Name: "edit_file", Arguments: `{"path":"file.txt","old_string":"a","new_string":"b"}`}}},
-		},
-		toolResult("call_dup", "edit_file", "Staged."),
-	}
-	for _, m := range msgs {
-		data, err := json.Marshal(m)
-		if err != nil {
-			t.Fatalf("marshal: %v", err)
-		}
-		if err := a.store.AppendMessage(turn1, data); err != nil {
-			t.Fatalf("AppendMessage turn1: %v", err)
-		}
-	}
-	if err := a.store.MarkTurnComplete(turn1); err != nil {
-		t.Fatalf("MarkTurnComplete turn1: %v", err)
-	}
-
-	turn2 := a.store.BeginTurn()
-	wrapper, ok := loop.NewStagedFlushMessage([]tool.BatchResult{{ToolCallID: "call_dup", Result: "late result"}})
-	if !ok {
-		t.Fatal("NewStagedFlushMessage returned false")
-	}
-	data, err := json.Marshal(wrapper)
-	if err != nil {
-		t.Fatalf("marshal wrapper: %v", err)
-	}
-	if err := a.store.AppendMessage(turn2, data); err != nil {
-		t.Fatalf("AppendMessage turn2: %v", err)
-	}
-	if err := a.store.MarkTurnComplete(turn2); err != nil {
-		t.Fatalf("MarkTurnComplete turn2: %v", err)
-	}
-
-	display := a.SessionMessages()
-	if len(display) != 2 {
-		t.Fatalf("display len = %d, want 2: %#v", len(display), display)
-	}
-	tr := display[1]
-	if tr.Type != "tool" || tr.ID != "call_dup" || tr.Result != "Staged." {
-		t.Fatalf("later orphan wrapper must not rewrite earlier turn tool row; got %#v", tr)
-	}
-}
-
-func TestSessionMessagesMalformedStagedFlushLeavesStubUntouched(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
-	if _, err := a.NewSession("", "primary"); err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	turn := a.store.BeginTurn()
-	wrapper, ok := loop.NewStagedFlushMessage([]tool.BatchResult{{ToolCallID: "call_1", Result: "unused"}})
-	if !ok {
-		t.Fatal("NewStagedFlushMessage returned false")
-	}
-	wrapper.Content[0].Text = "<staged-flush>not valid json</staged-flush>"
-	msgs := []message.Message{
-		message.NewText(message.RoleUser, "do edit"),
-		{
-			Role:      message.RoleAssistant,
-			ToolCalls: []message.ToolCall{{ID: "call_1", Type: "function", Function: message.FunctionCall{Name: "edit_file", Arguments: `{"path":"file.txt","old_string":"a","new_string":"b"}`}}},
-		},
-		toolResult("call_1", "edit_file", "Staged."),
-		wrapper,
-	}
-	for _, m := range msgs {
-		data, _ := json.Marshal(m)
-		if err := a.store.AppendMessage(turn, data); err != nil {
-			t.Fatalf("AppendMessage: %v", err)
-		}
-	}
-	if err := a.store.MarkTurnComplete(turn); err != nil {
-		t.Fatalf("MarkTurnComplete: %v", err)
-	}
-
-	display := a.SessionMessages()
-	// Malformed wrapper: no row appended, stub stays at "Staged.".
-	if len(display) != 2 {
-		t.Fatalf("display len = %d, want 2: %#v", len(display), display)
-	}
-	if display[1].Type != "tool" || display[1].Result != "Staged." {
-		t.Fatalf("malformed wrapper should leave stub at \"Staged.\"; got %#v", display[1])
-	}
-}
-
 func TestSessionMessagesRendersLiteralStagedFlushUserText(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	if _, err := a.NewSession("", "primary"); err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
-	appendStagedEditTurn(t, a, `{"path":"file.txt","old_string":"a","new_string":"b"}`, []tool.BatchResult{{ToolCallID: "call_1", Result: "Edited file.txt (1 replacement, lines 1-2)."}})
 	turn := a.store.BeginTurn()
 	contents := []string{
 		`<staged-flush>{"results":[]}</staged-flush>`,
@@ -702,12 +418,11 @@ func TestSessionMessagesRendersLiteralStagedFlushUserText(t *testing.T) {
 	}
 
 	display := a.SessionMessages()
-	wantLen := 2 + len(contents)
-	if len(display) != wantLen {
-		t.Fatalf("display len = %d, want %d: %#v", len(display), wantLen, display)
+	if len(display) != len(contents) {
+		t.Fatalf("display len = %d, want %d: %#v", len(display), len(contents), display)
 	}
 	for i, content := range contents {
-		got := display[2+i]
+		got := display[i]
 		if got.Type != "user" || got.Content != content {
 			t.Fatalf("literal staged-flush user row %d = %#v", i, got)
 		}

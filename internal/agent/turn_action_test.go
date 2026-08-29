@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,66 +18,10 @@ import (
 	"github.com/MMinasyan/lightcode/internal/compact"
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/engine/message"
-	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/provider"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/tool"
 )
-
-type fakeMemoryHooks struct {
-	reconcileCalls int
-	indexCalls     int
-	deleteCalls    int
-	lastSummary    string
-}
-
-func (h *fakeMemoryHooks) Reconcile() error {
-	h.reconcileCalls++
-	return nil
-}
-
-func (h *fakeMemoryHooks) IndexSummary(sessionID, projectID, projectName, summary, createdAt, compactionPath string) error {
-	h.indexCalls++
-	h.lastSummary = summary
-	return nil
-}
-
-func (h *fakeMemoryHooks) DeleteSessionSummaries(sessionID string) error {
-	h.deleteCalls++
-	return nil
-}
-
-type deterministicMemoryEmbedder struct{}
-
-func (deterministicMemoryEmbedder) Embed(string) ([]float32, error) { return []float32{1, 0, 0}, nil }
-func (deterministicMemoryEmbedder) Close()                          {}
-
-type recordingMemoryHooks struct {
-	store *memory.Store
-
-	sessionID      string
-	projectID      string
-	projectName    string
-	summary        string
-	createdAt      string
-	compactionPath string
-}
-
-func (h *recordingMemoryHooks) Reconcile() error { return h.store.Reconcile() }
-
-func (h *recordingMemoryHooks) IndexSummary(sessionID, projectID, projectName, summary, createdAt, compactionPath string) error {
-	h.sessionID = sessionID
-	h.projectID = projectID
-	h.projectName = projectName
-	h.summary = summary
-	h.createdAt = createdAt
-	h.compactionPath = compactionPath
-	return h.store.IndexSummary(sessionID, projectID, projectName, summary, createdAt, compactionPath)
-}
-
-func (h *recordingMemoryHooks) DeleteSessionSummaries(sessionID string) error {
-	return h.store.DeleteSessionSummaries(sessionID)
-}
 
 func TestApplyTurnActionRevertCodeUsesClickedTurn(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
@@ -105,30 +50,55 @@ func TestApplyTurnActionRevertCodeUsesClickedTurn(t *testing.T) {
 	}
 }
 
-func TestApplyTurnActionRevertHistoryWithCodeUsesClickedTurn(t *testing.T) {
+// TestApplyTurnActionRejectedActionsPerformNoMutation proves a turn action the
+// owner does not know performs no queue, transcript, compaction, or durable
+// mutation: history reversion has no retained route under its old name, and an
+// arbitrary forged string is refused at the same point. The rejection returns
+// before any reservation, reload, or store call, so a seeded turn with a live
+// snapshot file stays byte-identical on disk and in memory.
+func TestApplyTurnActionRejectedActionsPerformNoMutation(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	path := filepath.Join(a.projectRoot, "created.txt")
 
 	appendUserTurn(t, a, "first")
 	clickedTurn := appendUserTurnWithSnapshot(t, a, "create file", path, "created\n")
-	appendUserTurn(t, a, "after")
-
-	result, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, clickedTurn, TurnActionRevertHistory, true)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected created file before the forged actions: %v", err)
+	}
+	sessionID := a.SessionCurrent().ID
+	seedUnitQueue(t, a, sessionID, "queued draft")
+	queueBefore, err := a.QueueSnapshotForSession(sessionID)
 	if err != nil {
-		t.Fatalf("ApplyTurnActionForSession returned error: %v", err)
+		t.Fatalf("QueueSnapshotForSession before forged actions: %v", err)
+	}
+	events := &eventCapture{}
+	a.SetEventHandler(events.handler)
+
+	for _, action := range []string{"revert_history", "bogus_action"} {
+		result, err := a.ApplyTurnActionForSession(sessionID, clickedTurn, action, true)
+		if err == nil || !strings.Contains(err.Error(), `unknown turn action`) {
+			t.Fatalf("ApplyTurnActionForSession(%q) = %#v %v, want an unknown-action error with no mutation", action, result, err)
+		}
+		if result.SessionChanged {
+			t.Fatalf("%s forged action reported a session change: %#v", action, result)
+		}
+		queueAfter, err := a.QueueSnapshotForSession(sessionID)
+		if err != nil {
+			t.Fatalf("QueueSnapshotForSession after %q: %v", action, err)
+		}
+		if !reflect.DeepEqual(queueAfter, queueBefore) {
+			t.Fatalf("queue after %q = %#v, want unchanged %#v", action, queueAfter, queueBefore)
+		}
+		if got := countQueueChanged(events); got != 0 {
+			t.Fatalf("%q entered the transition reservation and emitted %d queue_changed event(s)", action, got)
+		}
 	}
 
-	if result.TargetTurn != clickedTurn-1 {
-		t.Fatalf("TargetTurn = %d, want %d", result.TargetTurn, clickedTurn-1)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("created file missing after rejected actions: %v, want it untouched", err)
 	}
-	if result.Prefill != "create file" {
-		t.Fatalf("Prefill = %q, want selected user message", result.Prefill)
-	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("created file still exists after history+code revert; stat err=%v", err)
-	}
-	if got := userContents(a.SessionMessages()); !equalStrings(got, []string{"first"}) {
-		t.Fatalf("history after revert = %q, want only first turn", got)
+	if got := userContents(a.SessionMessages()); !equalStrings(got, []string{"first", "create file"}) {
+		t.Fatalf("history = %q after rejected actions, want both turns intact", got)
 	}
 }
 
@@ -202,151 +172,6 @@ func TestRunCompactionPreservesPendingSignalsForMainModel(t *testing.T) {
 	}
 	if !a.lp.HasPendingWakeSignal() {
 		t.Fatal("pending wake signal was lost during compaction reload")
-	}
-}
-
-func TestCompactionMemoryHookRunsOnlyAfterSuccessfulSummary(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			writeTextResponse(w, "hook summary")
-		}))
-		defer server.Close()
-
-		a := newCatalogBackedTestAgent(t)
-		appendUserTurn(t, a, "first")
-		a.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
-		hooks := &fakeMemoryHooks{}
-		a.memoryHooks = hooks
-
-		if err := a.runCompaction(context.Background(), false); err != nil {
-			t.Fatalf("runCompaction returned error: %v", err)
-		}
-		if hooks.indexCalls != 1 || hooks.lastSummary != "hook summary" {
-			t.Fatalf("memory hook calls=%d summary=%q, want one successful summary index", hooks.indexCalls, hooks.lastSummary)
-		}
-	})
-
-	t.Run("summarizer failure", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, "summary failed", http.StatusInternalServerError)
-		}))
-		defer server.Close()
-
-		a := newCatalogBackedTestAgent(t)
-		appendUserTurn(t, a, "first")
-		a.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
-		hooks := &fakeMemoryHooks{}
-		a.memoryHooks = hooks
-
-		if err := a.runCompaction(context.Background(), false); err == nil {
-			t.Fatal("runCompaction returned nil error for failed summarizer")
-		}
-		if hooks.indexCalls != 0 {
-			t.Fatalf("memory hook index calls=%d, want 0 on failed compaction", hooks.indexCalls)
-		}
-	})
-}
-
-func TestCompactionIndexesConversationSessionAndSearchHistoryRecallsSummary(t *testing.T) {
-	const summary = "## Goal\nremember alpha detail"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeTextResponse(w, summary)
-	}))
-	defer server.Close()
-
-	a := newCatalogBackedTestAgent(t)
-	appendUserTurn(t, a, "first")
-	sessionID := a.store.SessionID()
-	if sessionID == "" {
-		t.Fatal("conversation session id is empty")
-	}
-	a.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
-	memStore := memory.NewStoreWithEmbedder(deterministicMemoryEmbedder{}, a.projects.Root(), a.home)
-	hooks := &recordingMemoryHooks{store: memStore}
-	a.memoryHooks = hooks
-
-	if err := a.runCompaction(context.Background(), false); err != nil {
-		t.Fatalf("runCompaction returned error: %v", err)
-	}
-
-	if hooks.sessionID != sessionID {
-		t.Fatalf("indexed session id = %q, want conversation session %q", hooks.sessionID, sessionID)
-	}
-	wantCompactionPath := filepath.Join(a.store.Dir(), "compaction.json")
-	if hooks.compactionPath != wantCompactionPath {
-		t.Fatalf("indexed compaction path = %q, want %q", hooks.compactionPath, wantCompactionPath)
-	}
-
-	indexPath := filepath.Join(a.home, ".lightcode", "summaries", sessionID, "index.json")
-	data, err := os.ReadFile(indexPath)
-	if err != nil {
-		t.Fatalf("read summary index: %v", err)
-	}
-	var index struct {
-		CompactionPath string `json:"compaction_path"`
-	}
-	if err := json.Unmarshal(data, &index); err != nil {
-		t.Fatalf("decode summary index: %v", err)
-	}
-	if index.CompactionPath != wantCompactionPath {
-		t.Fatalf("summary index compaction_path = %q, want %q", index.CompactionPath, wantCompactionPath)
-	}
-
-	searchHistory := tool.NewSearchHistory(memStore, hooks.projectID)
-	result, err := searchHistory.Execute(context.Background(), map[string]any{"query": "alpha detail"})
-	if err != nil {
-		t.Fatalf("search_history returned error: %v", err)
-	}
-	if !strings.Contains(result, sessionID) || !strings.Contains(result, wantCompactionPath) || !strings.Contains(result, "remember alpha detail") {
-		t.Fatalf("search_history result = %q, want session id, compaction path, and summary", result)
-	}
-}
-
-// TestRevertBelowCompactionBoundaryDeletesIndexedSummaries covers the other
-// half of what a revert below a compaction boundary invalidates: the indexed
-// summary under the summaries root is deleted with the compaction record, so
-// search_history no longer returns the compacted conversation whose "Full
-// summary" path the revert just removed.
-func TestRevertBelowCompactionBoundaryDeletesIndexedSummaries(t *testing.T) {
-	const summary = "## Goal\nremember alpha detail"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeTextResponse(w, summary)
-	}))
-	defer server.Close()
-
-	a := newCatalogBackedTestAgent(t)
-	seedCompleteTurns(t, a, 10)
-	sessionID := a.store.SessionID()
-	if sessionID == "" {
-		t.Fatal("conversation session id is empty")
-	}
-	a.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
-	memStore := memory.NewStoreWithEmbedder(deterministicMemoryEmbedder{}, a.projects.Root(), a.home)
-	hooks := &recordingMemoryHooks{store: memStore}
-	a.memoryHooks = hooks
-
-	if err := a.runCompaction(context.Background(), false); err != nil {
-		t.Fatalf("runCompaction returned error: %v", err)
-	}
-	searchHistory := tool.NewSearchHistory(memStore, hooks.projectID)
-	before, err := searchHistory.Execute(context.Background(), map[string]any{"query": "alpha detail"})
-	if err != nil {
-		t.Fatalf("search_history returned error: %v", err)
-	}
-	if !strings.Contains(before, sessionID) || !strings.Contains(before, "remember alpha detail") {
-		t.Fatalf("setup: search_history before revert = %q, want the compacted session's summary", before)
-	}
-
-	if _, err := a.ApplyTurnActionForSession(sessionID, 6, TurnActionRevertHistory, false); err != nil {
-		t.Fatalf("revert: %v", err)
-	}
-
-	after, err := searchHistory.Execute(context.Background(), map[string]any{"query": "alpha detail"})
-	if err != nil {
-		t.Fatalf("search_history after revert returned error: %v", err)
-	}
-	if strings.Contains(after, sessionID) || strings.Contains(after, "remember alpha detail") {
-		t.Fatalf("search_history after revert = %q, want the reverted session's summaries gone", after)
 	}
 }
 

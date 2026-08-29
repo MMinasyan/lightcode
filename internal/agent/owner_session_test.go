@@ -17,7 +17,6 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/config"
 	loop "github.com/MMinasyan/lightcode/internal/engine"
-	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
@@ -424,63 +423,6 @@ func TestPermissionSaveProject(t *testing.T) {
 	}
 }
 
-func TestStagedPermissionOwner(t *testing.T) {
-	a := newCatalogBackedTestAgent(t)
-	events := make(chan Event, 16)
-	a.SetEventHandler(func(ev Event) {
-		events <- ev
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	a.Init(ctx)
-
-	sessionID, err := a.NewSession("", "primary")
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	a.ensureRuntime().mu.Lock()
-	unit := a.sessions[sessionID]
-	unit.turnCtx = ctx
-	projectID := unit.projectID
-	exec := unit.pendingExecutor
-	a.ensureRuntime().mu.Unlock()
-	if exec == nil {
-		t.Fatal("pending executor is nil")
-	}
-
-	staged := []tool.StagedCall{{
-		ToolName:   "write_file",
-		ToolCallID: "call-write",
-		Args:       `{"path":"staged.txt","content":"ok"}`,
-		Params: map[string]any{
-			"path":    "staged.txt",
-			"content": "ok",
-		},
-	}}
-	done := make(chan []tool.BatchResult, 1)
-	go func() {
-		done <- exec.ExecutePending(ctx, staged)
-	}()
-	req := waitPermissionEvent(t, events).PermReq
-	if req.SessionID != sessionID || req.ProjectID != projectID {
-		t.Fatalf("staged permission owner = %q/%q, want %q/%q", req.SessionID, req.ProjectID, sessionID, projectID)
-	}
-	if req.BatchIndex != 1 || req.BatchTotal != 1 {
-		t.Fatalf("staged batch position = %d/%d, want 1/1", req.BatchIndex, req.BatchTotal)
-	}
-	if err := a.RespondPermissionActionForSession(sessionID, req.ID, "deny"); err != nil {
-		t.Fatalf("deny staged permission: %v", err)
-	}
-	select {
-	case results := <-done:
-		if len(results) != 1 || results[0].Error != "denied by user" {
-			t.Fatalf("staged results = %#v, want denied by user", results)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("staged executor stayed blocked after denial")
-	}
-}
-
 func TestTaskProjectSync(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	if _, err := a.NewSession("", "primary"); err != nil {
@@ -496,13 +438,9 @@ func TestTaskProjectSync(t *testing.T) {
 	}
 	tt.mu.Lock()
 	taskProjectID := tt.projectID
-	memoriesDir := tt.memoriesDir
 	tt.mu.Unlock()
 	if taskProjectID != projectID {
 		t.Fatalf("task project id = %q, want %q", taskProjectID, projectID)
-	}
-	if memoriesDir == "" {
-		t.Fatal("task memories dir is empty")
 	}
 	parentSessionID := a.session.store.SessionID()
 	if parentSessionID == "" {
@@ -679,6 +617,10 @@ func TestSessionsUseTheirProjectRoot(t *testing.T) {
 	}
 
 	first := newCatalogBackedTestAgentForRoot(t, home, firstRoot)
+	writeAgentsTestConfig(t, first.configPath, `{"primary": {"model": "test/test-model"}, "notes": {"readonly": true, "write_dir": "notes"}}`)
+	if err := first.Reload(); err != nil {
+		t.Fatalf("reload agents config: %v", err)
+	}
 	secondTarget := filepath.Join(secondRoot, "target.txt")
 	first.cfg.Permissions.Allow = []string{
 		"read_file(//" + strings.TrimPrefix(secondTarget, "/") + ")",
@@ -692,8 +634,8 @@ func TestSessionsUseTheirProjectRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensure second project: %v", err)
 	}
-	secondPlanTarget := filepath.Join(first.projects.Root(), secondProjectID.ID, "plans", "plan.md")
-	first.cfg.Permissions.Allow = append(first.cfg.Permissions.Allow, "write_file(//"+strings.TrimPrefix(secondPlanTarget, "/")+")")
+	secondNoteTarget := filepath.Join(secondRoot, "notes", "note.md")
+	first.cfg.Permissions.Allow = append(first.cfg.Permissions.Allow, "write_file(//"+strings.TrimPrefix(secondNoteTarget, "/")+")")
 
 	secondID, err := first.NewSession(secondProjectID.ID, "primary")
 	if err != nil {
@@ -729,34 +671,34 @@ func TestSessionsUseTheirProjectRoot(t *testing.T) {
 		t.Fatalf("run_command output = %q, want second project root only", out)
 	}
 
-	planID, err := first.NewSession(secondProjectID.ID, "plan")
+	notesID, err := first.NewSession(secondProjectID.ID, "notes")
 	if err != nil {
-		t.Fatalf("NewSession plan second project: %v", err)
+		t.Fatalf("NewSession notes second project: %v", err)
 	}
 	first.ensureRuntime().mu.Lock()
-	plan := first.sessions[planID]
-	writeTool, ok := plan.registry.Get("write_file")
+	notes := first.sessions[notesID]
+	writeTool, ok := notes.registry.Get("write_file")
 	first.ensureRuntime().mu.Unlock()
 	if !ok {
-		t.Fatal("write_file not registered on second project plan session")
+		t.Fatal("write_file not registered on second project notes session")
 	}
-	turn := plan.store.BeginTurn()
-	if _, err := writeTool.Execute(context.Background(), map[string]any{"path": secondPlanTarget, "content": "second project plan"}); err != nil {
-		t.Fatalf("write_file second project plan: %v", err)
+	turn := notes.store.BeginTurn()
+	if _, err := writeTool.Execute(context.Background(), map[string]any{"path": secondNoteTarget, "content": "second project note"}); err != nil {
+		t.Fatalf("write_file second project note: %v", err)
 	}
-	if err := plan.store.MarkTurnComplete(turn); err != nil {
-		t.Fatalf("complete plan write turn: %v", err)
+	if err := notes.store.MarkTurnComplete(turn); err != nil {
+		t.Fatalf("complete note write turn: %v", err)
 	}
-	data, err := os.ReadFile(secondPlanTarget)
+	data, err := os.ReadFile(secondNoteTarget)
 	if err != nil {
-		t.Fatalf("read second project plan: %v", err)
+		t.Fatalf("read second project note: %v", err)
 	}
-	if got := string(data); got != "second project plan" {
-		t.Fatalf("second project plan content = %q, want written content", got)
+	if got := string(data); got != "second project note" {
+		t.Fatalf("second project note content = %q, want written content", got)
 	}
 }
 
-func TestTurnActionsUseSelectedSessionHistory(t *testing.T) {
+func TestTurnActionsUseTargetedSessionHistory(t *testing.T) {
 	home := t.TempDir()
 	firstRoot := t.TempDir()
 	secondRoot := t.TempDir()
@@ -784,15 +726,15 @@ func TestTurnActionsUseSelectedSessionHistory(t *testing.T) {
 	first.ensureRuntime().mu.Lock()
 	first.sessions[secondID] = second.sessions[secondID]
 	first.ensureRuntime().mu.Unlock()
-	result, err := first.ApplyTurnActionForSession(secondID, 2, TurnActionRevertHistory, false)
+	result, err := first.ApplyTurnActionForSession(secondID, 2, TurnActionFork, false)
 	if err != nil {
 		t.Fatalf("ApplyTurnActionForSession second: %v", err)
 	}
-	if result.Prefill != "selected" {
-		t.Fatalf("Prefill = %q, want selected", result.Prefill)
+	if result.Session.ID == "" || result.Session.ID == secondID {
+		t.Fatalf("fork destination = %q, want a new session distinct from source %q", result.Session.ID, secondID)
 	}
-	if got := userContents(result.Messages); !equalStrings(got, []string{"keep"}) {
-		t.Fatalf("result messages = %#v, want keep", got)
+	if got := userContents(result.Messages); !equalStrings(got, []string{"keep", "selected"}) {
+		t.Fatalf("result messages = %#v, want the forked turns [keep selected]", got)
 	}
 	firstMessages, err := first.SessionMessagesFor(firstID)
 	if err != nil {
@@ -800,80 +742,6 @@ func TestTurnActionsUseSelectedSessionHistory(t *testing.T) {
 	}
 	if got := userContents(firstMessages); !equalStrings(got, []string{"first project only"}) {
 		t.Fatalf("first messages = %#v, want unchanged first project", got)
-	}
-}
-
-func TestCompactionIndexesSelectedSessionProject(t *testing.T) {
-	const summary = "## Goal\nremember second project detail"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeTextResponse(w, summary)
-	}))
-	defer server.Close()
-
-	home := t.TempDir()
-	firstRoot := t.TempDir()
-	secondRoot := t.TempDir()
-	first := newCatalogBackedTestAgentForRoot(t, home, firstRoot)
-	first.catalog.Providers["test"].Transport.BaseURL = server.URL + "/v1"
-	firstProject, err := first.projects.Ensure()
-	if err != nil {
-		t.Fatalf("ensure first project: %v", err)
-	}
-	firstID, err := first.NewSession(firstProject.ID, "primary")
-	if err != nil {
-		t.Fatalf("NewSession first: %v", err)
-	}
-
-	secondProjectAgent := newCatalogBackedTestAgentForRoot(t, home, secondRoot)
-	secondProject, err := secondProjectAgent.projects.Ensure()
-	if err != nil {
-		t.Fatalf("ensure second project: %v", err)
-	}
-	secondID, err := first.NewSession(secondProject.ID, "primary")
-	if err != nil {
-		t.Fatalf("NewSession second: %v", err)
-	}
-	if _, err := first.AppendUserMessageToSession(secondID, "second project context"); err != nil {
-		t.Fatalf("append second: %v", err)
-	}
-
-	memStore := memory.NewStoreWithEmbedder(deterministicMemoryEmbedder{}, first.projects.Root(), first.home)
-	hooks := &recordingMemoryHooks{store: memStore}
-	first.memoryHooks = hooks
-
-	first.ensureRuntime().mu.Lock()
-	second := first.sessions[secondID]
-	if err := first.setCurrentSessionLocked(first.sessions[firstID]); err != nil {
-		first.ensureRuntime().mu.Unlock()
-		t.Fatalf("setCurrentSessionLocked: %v", err)
-	}
-	first.ensureRuntime().mu.Unlock()
-	if err := first.runCompactionForSession(context.Background(), second, false); err != nil {
-		t.Fatalf("runCompactionForSession second: %v", err)
-	}
-
-	if hooks.sessionID != secondID {
-		t.Fatalf("indexed session id = %q, want %q", hooks.sessionID, secondID)
-	}
-	if hooks.projectID != secondProject.ID || hooks.projectName != secondProject.Name {
-		t.Fatalf("indexed project = %q/%q, want %q/%q", hooks.projectID, hooks.projectName, secondProject.ID, secondProject.Name)
-	}
-
-	secondSearch := tool.NewSearchHistory(memStore, secondProject.ID)
-	result, err := secondSearch.Execute(context.Background(), map[string]any{"query": "second project detail"})
-	if err != nil {
-		t.Fatalf("search_history second: %v", err)
-	}
-	if !strings.Contains(result, secondID) || !strings.Contains(result, "remember second project detail") {
-		t.Fatalf("second project search result = %q, want indexed second session summary", result)
-	}
-	firstSearch := tool.NewSearchHistory(memStore, firstProject.ID)
-	result, err = firstSearch.Execute(context.Background(), map[string]any{"query": "second project detail"})
-	if err != nil {
-		t.Fatalf("search_history first: %v", err)
-	}
-	if strings.Contains(result, secondID) {
-		t.Fatalf("first project search result = %q, should not include second project session %s", result, secondID)
 	}
 }
 
@@ -885,6 +753,25 @@ func TestCompactTypeCannotBeStartedByUser(t *testing.T) {
 	_, err := a.NewSession("", "compact")
 	if err == nil || !strings.Contains(err.Error(), `agent type "compact" cannot be started as a session`) {
 		t.Fatalf("NewSession compact error = %v, want code-only rejection", err)
+	}
+}
+
+func TestNewSessionRejectsUnknownAgentTypeBeforeUnitWork(t *testing.T) {
+	a := newCatalogBackedTestAgent(t)
+	if _, err := a.NewSession("", "primary"); err != nil {
+		t.Fatalf("NewSession primary: %v", err)
+	}
+
+	sid, err := a.NewSession("", "plan")
+	if sid != "" || err == nil || !strings.Contains(err.Error(), `unknown agent type`) {
+		t.Fatalf(`NewSession plan = (%q, %v), want admission failure for the unknown agent type`, sid, err)
+	}
+
+	a.ensureRuntime().mu.Lock()
+	units := len(a.sessions)
+	a.ensureRuntime().mu.Unlock()
+	if units != 1 {
+		t.Fatalf("live sessions after rejected creation = %d, want only the primary unit", units)
 	}
 }
 
@@ -1544,7 +1431,7 @@ func newCatalogBackedTestAgentForRoot(t *testing.T, home, projectRoot string) *A
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
@@ -2055,9 +1942,6 @@ func TestMutationsRejectDuringTransition(t *testing.T) {
 	}
 	if _, err := a.RevertCodeForSession(id, 0); err == nil {
 		t.Error("RevertCodeForSession should reject during transition")
-	}
-	if _, err := a.ApplyTurnActionForSession(id, 1, TurnActionRevertHistory, false); err == nil {
-		t.Error("ApplyTurnActionForSession should reject during transition")
 	}
 	if err := a.ForkSessionForSession(id, 1); err == nil {
 		t.Error("ForkSessionForSession should reject during transition")

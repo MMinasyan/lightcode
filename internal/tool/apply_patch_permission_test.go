@@ -24,7 +24,14 @@ func TestApplyPatchFilesAtRootListsAllTouchedPaths(t *testing.T) {
 	params := map[string]any{
 		"input": "*** Begin Patch\n*** Add File: a.txt\n+x\n*** Update File: b.txt\n@@\n-x\n+y\n*** Delete File: c.txt\n*** Update File: d.txt\n*** Move to: e.txt\n@@\n-x\n+y\n*** End Patch",
 	}
-	paths := applyPatchFilesAtRoot(dir, params)
+	// Exercise the live helper: the shared target plan that PermWrapped.Execute
+	// uses for apply_patch permission checks, with the same display-file
+	// projection the affected-file lists are built from.
+	targets, _, _, err := applyPatchPermissionPlanWithOptions(nil, dir, params, CapabilityOptions{})
+	if err != nil {
+		t.Fatalf("applyPatchPermissionPlanWithOptions err = %v", err)
+	}
+	paths := applyPatchDisplayFiles(targets)
 	want := []string{
 		filepath.Join(dir, "a.txt"),
 		filepath.Join(dir, "b.txt"),
@@ -48,7 +55,10 @@ func TestApplyPatchPermissionDecisionAggregate(t *testing.T) {
 	params := map[string]any{
 		"input": "*** Begin Patch\n*** Add File: a.txt\n+x\n*** Update File: b.txt\n@@\n-x\n+y\n*** End Patch",
 	}
-	_, perPath, agg := applyPatchPermissionDecision(allowAll, dir, params)
+	_, perPath, agg, err := applyPatchPermissionPlanWithOptions(allowAll, dir, params, CapabilityOptions{})
+	if err != nil {
+		t.Fatalf("plan err = %v", err)
+	}
 	if agg != permission.DecisionAllow {
 		t.Fatalf("agg = %v, want Allow", agg)
 	}
@@ -71,7 +81,10 @@ func TestApplyPatchPermissionDecisionAnyDenyDeniesAll(t *testing.T) {
 	params := map[string]any{
 		"input": "*** Begin Patch\n*** Add File: a.txt\n+x\n*** Update File: b.txt\n@@\n-x\n+y\n*** End Patch",
 	}
-	_, perPath, agg := applyPatchPermissionDecision(check, dir, params)
+	_, perPath, agg, err := applyPatchPermissionPlanWithOptions(check, dir, params, CapabilityOptions{})
+	if err != nil {
+		t.Fatalf("plan err = %v", err)
+	}
 	if agg != permission.DecisionDeny {
 		t.Fatalf("agg = %v, want Deny (any-deny denies whole patch)", agg)
 	}
@@ -92,7 +105,10 @@ func TestApplyPatchPermissionDecisionAllAllowExceptOneAskIsAsk(t *testing.T) {
 	params := map[string]any{
 		"input": "*** Begin Patch\n*** Add File: a.txt\n+x\n*** Update File: b.txt\n@@\n-x\n+y\n*** End Patch",
 	}
-	_, _, agg := applyPatchPermissionDecision(check, dir, params)
+	_, _, agg, err := applyPatchPermissionPlanWithOptions(check, dir, params, CapabilityOptions{})
+	if err != nil {
+		t.Fatalf("plan err = %v", err)
+	}
 	if agg != permission.DecisionAsk {
 		t.Fatalf("agg = %v, want Ask (one path needs ask, none denied)", agg)
 	}
@@ -115,7 +131,10 @@ func TestApplyPatchPermissionDecisionDenyPreservedThroughLaterAsk(t *testing.T) 
 	params := map[string]any{
 		"input": "*** Begin Patch\n*** Add File: b.txt\n+x\n*** Update File: a.txt\n@@\n-x\n+y\n*** Update File: .env\n@@\n-SECRET=1\n+SECRET=2\n*** End Patch",
 	}
-	_, _, agg := applyPatchPermissionDecision(check, dir, params)
+	_, _, agg, err := applyPatchPermissionPlanWithOptions(check, dir, params, CapabilityOptions{})
+	if err != nil {
+		t.Fatalf("plan err = %v", err)
+	}
 	if agg != permission.DecisionDeny {
 		t.Fatalf("agg = %v, want Deny (deny must be sticky across later Ask)", agg)
 	}
@@ -130,7 +149,11 @@ func TestApplyPatchPermissionDecisionMoveDestIncluded(t *testing.T) {
 	params := map[string]any{
 		"input": "*** Begin Patch\n*** Update File: old.go\n*** Move to: new.go\n@@\n-x\n+y\n*** End Patch",
 	}
-	paths, perPath, agg := applyPatchPermissionDecision(check, dir, params)
+	targets, perPath, agg, err := applyPatchPermissionPlanWithOptions(check, dir, params, CapabilityOptions{})
+	if err != nil {
+		t.Fatalf("plan err = %v", err)
+	}
+	paths := applyPatchDisplayFiles(targets)
 	if agg != permission.DecisionDeny {
 		t.Fatalf("agg = %v, want Deny (move dest denied)", agg)
 	}
@@ -144,11 +167,14 @@ func TestApplyPatchPermissionDecisionMoveDestIncluded(t *testing.T) {
 
 func TestApplyPatchPermissionDecisionMalformedPatchIsAsk(t *testing.T) {
 	dir := t.TempDir()
-	paths, _, agg := applyPatchPermissionDecision(nil, dir, map[string]any{"input": "garbage"})
+	targets, _, agg, err := applyPatchPermissionPlanWithOptions(nil, dir, map[string]any{"input": "garbage"}, CapabilityOptions{})
+	if err == nil {
+		t.Fatalf("plan err = nil, want parse error for malformed patch")
+	}
 	if agg != permission.DecisionAsk {
 		t.Fatalf("agg = %v, want Ask for malformed patch", agg)
 	}
-	if paths != nil {
+	if paths := applyPatchDisplayFiles(targets); paths != nil {
 		t.Fatalf("paths = %v, want nil for malformed patch", paths)
 	}
 }
@@ -411,107 +437,5 @@ func TestApplyPatchImmediateEditFilePermissionUnchanged(t *testing.T) {
 	})
 	if !errors.Is(err, ErrDenied) {
 		t.Fatalf("edit_file err = %v, want ErrDenied (regression)", err)
-	}
-}
-
-func TestApplyPatchStagedAllAllowNoAsk(t *testing.T) {
-	dir := t.TempDir()
-	store := &applyPatchStore{turn: 1}
-	tracker := NewFileTracker()
-	executor := NewStagedExecutorAtRoot(store, tracker, config.ToolsConfig{}, dir,
-		rulesCheck(dir, permission.Rules{Allow: []string{ruleFor(dir, "**")}}),
-		func(_ context.Context, req permission.Request) permission.ResponseAction {
-			t.Errorf("ask called unexpectedly: %+v", req)
-			return permission.ResponseDeny
-		})
-
-	input := applyPatchInput(t, "*** Add File: a.txt\n+hi\n*** Add File: b.txt\n+there")
-	results := executor.ExecutePending(context.Background(), []StagedCall{
-		{
-			ToolName:   "apply_patch",
-			ToolCallID: "1",
-			Args:       input,
-			Params:     map[string]any{"input": input},
-		},
-	})
-	if len(results) != 1 {
-		t.Fatalf("results len = %d, want 1", len(results))
-	}
-	// The key point: the permission step did not call ask (all-allow).
-}
-
-func TestApplyPatchStagedAnyDenyNoAsk(t *testing.T) {
-	dir := t.TempDir()
-	store := &applyPatchStore{turn: 1}
-	tracker := NewFileTracker()
-	executor := NewStagedExecutorAtRoot(store, tracker, config.ToolsConfig{}, dir,
-		rulesCheck(dir, permission.Rules{
-			Allow: []string{ruleFor(dir, "a.txt")},
-			Deny:  []string{ruleFor(dir, "b.txt")},
-		}),
-		func(_ context.Context, req permission.Request) permission.ResponseAction {
-			t.Errorf("ask called unexpectedly: %+v", req)
-			return permission.ResponseDeny
-		})
-
-	input := applyPatchInput(t, "*** Add File: a.txt\n+hi\n*** Add File: b.txt\n+there")
-	results := executor.ExecutePending(context.Background(), []StagedCall{
-		{
-			ToolName:   "apply_patch",
-			ToolCallID: "1",
-			Args:       input,
-			Params:     map[string]any{"input": input},
-		},
-	})
-	if len(results) != 1 {
-		t.Fatalf("results len = %d, want 1", len(results))
-	}
-	if results[0].Error != "denied by user" {
-		t.Fatalf("results[0].Error = %q, want %q (any-deny returns immediately, no ask)", results[0].Error, "denied by user")
-	}
-}
-
-func TestApplyPatchStagedPermissionAsksWithPatchFiles(t *testing.T) {
-	// This verifies the ask request is built correctly (BatchFiles =
-	// patch's files, Arg/ResolvedArg = first path) by intercepting the ask
-	// and returning Deny so the executor never reaches the apply engine.
-	dir := t.TempDir()
-	store := &applyPatchStore{turn: 1}
-	tracker := NewFileTracker()
-	executor := NewStagedExecutorAtRoot(store, tracker, config.ToolsConfig{}, dir,
-		rulesCheck(dir, permission.Rules{Ask: []string{ruleFor(dir, "**")}}),
-		func(_ context.Context, req permission.Request) permission.ResponseAction {
-			if req.ToolName != "apply_patch" {
-				return permission.ResponseDeny
-			}
-			if len(req.BatchFiles) != 2 {
-				t.Errorf("ask BatchFiles len = %d, want 2: %v", len(req.BatchFiles), req.BatchFiles)
-			}
-			if !strings.HasSuffix(req.BatchFiles[0], "a.txt") || !strings.HasSuffix(req.BatchFiles[1], "b.txt") {
-				t.Errorf("ask BatchFiles = %v, want [a.txt b.txt]", req.BatchFiles)
-			}
-			if req.Arg != req.BatchFiles[0] {
-				t.Errorf("ask Arg = %q, want first BatchFiles entry %q", req.Arg, req.BatchFiles[0])
-			}
-			if req.ResolvedArg != req.Arg {
-				t.Errorf("ask ResolvedArg = %q, want %q", req.ResolvedArg, req.Arg)
-			}
-			return permission.ResponseDeny
-		})
-
-	input := applyPatchInput(t, "*** Add File: a.txt\n+hi\n*** Add File: b.txt\n+there")
-	results := executor.ExecutePending(context.Background(), []StagedCall{
-		{
-			ToolName:   "apply_patch",
-			ToolCallID: "1",
-			Args:       input,
-			Params:     map[string]any{"input": input},
-		},
-	})
-	if len(results) != 1 {
-		t.Fatalf("results len = %d, want 1", len(results))
-	}
-	if results[0].Error != "denied by user" {
-		t.Fatalf("results[0].Error = %q, want %q (deny intercepted before apply dispatch)", results[0].Error, "denied by user")
 	}
 }

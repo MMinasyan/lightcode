@@ -125,7 +125,7 @@ describe('App turn-end permission reset', () => {
         const onTurnEnd = ${eventCallbackSource('turn_end')};
         const onPermissionRequest = ${eventCallbackSource('permission_request')};
         onTurnEnd({});
-        onPermissionRequest({ id: 'p1', tool: 'bash', args: 'ls', canAllowAll: false });
+        onPermissionRequest({ id: 'p1', tool: 'bash', args: 'ls' });
       `,
       sandbox,
     );
@@ -684,18 +684,6 @@ describe('App promise continuation gate table (session + generation)', () => {
       invoke: () => `(async ${functionBodySource('handleRevertCode')})({ detail: { turn: 3 } })`,
       staleSettle: (s) => s.ApplyTurnActionReject(new Error('revert failed')),
       staleAssert: (s) => { expect(s.shown).toBeNull(); },
-      currentSettle: (s) => s.ApplyTurnActionReject(new Error('revert failed')),
-      currentAssert: (s) => { expect(s.shown).toBeTruthy(); },
-    },
-    {
-      name: 'revert-history',
-      newSandbox: () => pathSandbox('ApplyTurnAction'),
-      invoke: () => `(async ${functionBodySource('handleRevertHistory')})({ detail: { turn: 3, alsoRevertCode: false } })`,
-      staleSettle: (s) => s.ApplyTurnActionReject(new Error('revert failed')),
-      staleAssert: (s) => {
-        expect(s.shown).toBeNull();
-        expect(s.prefilled).toBeNull();
-      },
       currentSettle: (s) => s.ApplyTurnActionReject(new Error('revert failed')),
       currentAssert: (s) => { expect(s.shown).toBeTruthy(); },
     },

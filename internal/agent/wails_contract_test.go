@@ -88,7 +88,6 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 	}
 	app := string(appBytes)
 	if !strings.Contains(app, "ApplyTurnAction(turn, 'revert_code', false)") ||
-		!strings.Contains(app, "ApplyTurnAction(turn, 'revert_history', !!alsoRevertCode)") ||
 		!strings.Contains(app, "ApplyTurnAction(turn, 'fork', !!alsoRevertCode)") {
 		t.Fatalf("App.svelte must route revert/fork actions through ApplyTurnAction")
 	}
@@ -132,6 +131,9 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 	if strings.Contains(string(messageBytes), "turn - 1") || strings.Contains(string(messageBytes), "turn + 1") {
 		t.Fatalf("Message.svelte must pass the clicked turn without local arithmetic")
 	}
+	if strings.Contains(string(messageBytes), "'reverthistory'") {
+		t.Fatal("Message.svelte still offers a history revert action; only code rewind and fork are retained")
+	}
 
 	menuPath := filepath.Join("..", "cli", "menu.go")
 	menuBytes, err := os.ReadFile(menuPath)
@@ -140,9 +142,11 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 	}
 	menu := string(menuBytes)
 	if !strings.Contains(menu, "ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertCode") ||
-		!strings.Contains(menu, "ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertHistory") ||
 		!strings.Contains(menu, "ApplyTurnActionForSession(sessionID, turn, agent.TurnActionFork") {
 		t.Fatalf("CLI revert menu must route through ApplyTurnActionForSession")
+	}
+	if strings.Contains(menu, "TurnActionRevertHistory") {
+		t.Fatal("CLI revert menu still references the removed history revert action; only code rewind and fork are retained")
 	}
 	if strings.Contains(menu, "RevertCode(turn - 1)") || strings.Contains(menu, "ForkSession(turn") {
 		t.Fatalf("CLI revert menu still performs adapter-local turn action logic")
@@ -150,15 +154,13 @@ func TestAdaptersUseSharedTurnActionContracts(t *testing.T) {
 }
 
 // TestTurnActionAppliesDestinationStateThroughOrderedBoundary proves the Wails
-// turn-action path (fork / history revert) applies the destination's complete
-// state and the code-revert skip notice through one ordered delivery frame, not an
+// turn-action path (fork / code rewind) applies the destination's complete state
+// and the code-revert skip notice through one ordered delivery frame, not an
 // out-of-band read that could race live frames or lose the notice. The backend
 // commits routing and appends a turn_action boundary (never a legacy
 // session_changed or navigation frame), and the frontend's turn_action handler
 // applies the snapshot before the skip notice so the two land atomically; the
-// handlers apply nothing out of band. A reconciled postcommit partial error
-// resolves the direct method: the wrapper records synchronously whether the
-// boundary callback emitted and treats the error as frame-owned when it did.
+// handlers apply nothing out of band.
 func TestTurnActionAppliesDestinationStateThroughOrderedBoundary(t *testing.T) {
 	app := mustReadContractFile(t, filepath.Join("..", "..", "app.go"))
 	body, ok := extractSvelteFunctionBody(app, "func (a *App) applyTurnActionWithOwnedBoundary(")
@@ -167,12 +169,6 @@ func TestTurnActionAppliesDestinationStateThroughOrderedBoundary(t *testing.T) {
 	}
 	if !strings.Contains(body, "ApplyTurnActionForSessionWithBoundary") {
 		t.Fatal("the turn-action wrapper must publish through the shared ApplyTurnActionForSessionWithBoundary route")
-	}
-	if !strings.Contains(body, "emitted = true") {
-		t.Fatal("the turn-action wrapper must record synchronously whether the owner boundary callback emitted")
-	}
-	if !strings.Contains(body, "err != nil && emitted") {
-		t.Fatal("the turn-action wrapper must resolve a postcommit error as frame-owned (the boundary owns the error through its warning)")
 	}
 	if strings.Contains(body, "emitSessionChanged") || strings.Contains(body, "emitNavigationBoundary") {
 		t.Fatal("ApplyTurnAction must not emit a legacy session_changed or navigation frame")
@@ -209,7 +205,7 @@ func TestTurnActionAppliesDestinationStateThroughOrderedBoundary(t *testing.T) {
 	if warn < notice {
 		t.Fatal("turn_action handler must append the warning after the skip notice")
 	}
-	for _, fn := range []string{"async function handleFork(", "async function handleRevertHistory(", "async function handleRevertCode("} {
+	for _, fn := range []string{"async function handleFork(", "async function handleRevertCode("} {
 		fnBody, ok := extractSvelteFunctionBody(svelte, fn)
 		if !ok {
 			t.Fatalf("%s not found in App.svelte", fn)
@@ -223,22 +219,20 @@ func TestTurnActionAppliesDestinationStateThroughOrderedBoundary(t *testing.T) {
 	}
 }
 
-// TestAdapterRevertOutcomeContract pins what each host renders when a revert
-// fails midway. Only the terminal host renders the skipped set, on every error
+// TestAdapterRevertOutcomeContract pins what each host renders when a revert or
+// fork fails. Only the terminal host renders the skipped set, on every error
 // branch that follows the action call: ApplyTurnActionForSession returns the
 // populated result alongside the error, and the CLI prints the skipped set
 // before returning. A branch that returns before the action is invoked — the
 // confirmation-read abort for the exiting-terminal case — has no result to
 // render and is not in this scan's scope. A precommit desktop failure carries
-// the enriched error text naming where the revert stopped: the binding layer
-// attaches the return value only on success, and the frontend renders the
-// enriched text from the rejection. A reconciled postcommit partial error no
-// longer rejects on the desktop at all — the wrapper resolves it because the
-// ordered turn_action frame owns the error through its warning — so no second
-// renderer exists and the frame's warning is the single copy.
+// the enriched error text: the binding layer attaches the return value only on
+// success, so a failing call surfaces only the enriched error text from the
+// rejection; the ordered turn_action frame owns any warning carried by its own
+// boundary, and no second renderer exists for it.
 func TestAdapterRevertOutcomeContract(t *testing.T) {
 	menu := mustReadContractFile(t, filepath.Join("..", "cli", "menu.go"))
-	for _, action := range []string{`"code"`, `"history"`, `"fork"`} {
+	for _, action := range []string{`"code"`, `"fork"`} {
 		body := extractSwitchCase(t, menu, "case "+action+":")
 		// Anchor at the action call: an error branch that precedes it returns
 		// before any action was attempted, so there is nothing to render.
@@ -271,7 +265,7 @@ func TestAdapterRevertOutcomeContract(t *testing.T) {
 	}
 
 	svelte := mustReadContractFile(t, filepath.Join("..", "..", "frontend", "src", "App.svelte"))
-	for _, fn := range []string{"async function handleRevertCode(", "async function handleRevertHistory(", "async function handleFork("} {
+	for _, fn := range []string{"async function handleRevertCode(", "async function handleFork("} {
 		fnBody, ok := extractSvelteFunctionBody(svelte, fn)
 		if !ok {
 			t.Fatalf("%s not found in App.svelte", fn)
@@ -606,7 +600,7 @@ func TestFrontendTaskSubagentLinksRemainClickableAfterCompletion(t *testing.T) {
 	if taskStart < 0 {
 		t.Fatal("ToolCall.svelte task branch not found")
 	}
-	taskEnd := strings.Index(toolCall[taskStart:], "{:else if name === 'save_memory'}")
+	taskEnd := strings.Index(toolCall[taskStart:], "{:else if name === 'diagnostics'}")
 	if taskEnd < 0 {
 		t.Fatal("ToolCall.svelte task branch end not found")
 	}

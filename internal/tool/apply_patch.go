@@ -3,7 +3,6 @@ package tool
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"sync"
 
 	"github.com/MMinasyan/lightcode/internal/config"
@@ -19,8 +18,7 @@ const applyPatchDescription = `Edits, creates, deletes, or renames files using t
 - Start each section with a header: *** Add File: <path> (every following line is a + line of new content), *** Update File: <path> (edit in place), or *** Delete File: <path> (nothing follows).
 - To rename, put *** Move to: <new path> on the line right after *** Update File: <path>.
 - In an Update, write each change as a hunk starting with @@. Prefix context lines with a space, removed lines with -, and added lines with +. Include about 3 lines of context around each change, and add @@ <enclosing function or class> when that context is not unique.
-- Use file paths relative to the project root.
-- Use pending=true unless the patch is your last action; pending patches apply automatically with your next tool call or after your response. Leave it off only on a final patch you want applied immediately (prefer that over execute_pending).`
+- Use file paths relative to the project root.`
 
 // ApplyPatch implements the V4A patch tool. It is DefaultHidden so only model
 // adaptations that include it can see it. The patch is validated before any
@@ -62,10 +60,6 @@ func (*ApplyPatch) ParametersSchema() map[string]any {
 			"input": map[string]any{
 				"type":        "string",
 				"description": "The full patch text, from *** Begin Patch to *** End Patch.",
-			},
-			"pending": map[string]any{
-				"type":        "boolean",
-				"description": "If true, stage this patch instead of applying it immediately; staged patches apply with the next tool call or after your response.",
 			},
 		},
 		"required": []string{"input"},
@@ -156,28 +150,6 @@ func buildPreviewFromCaptured(p appliedFilePreview) editpreview.Preview {
 	}
 	return editpreview.Preview{Hunks: hunks}
 }
-
-// ValidateStaged is the structure-only parse for pending calls. It must not
-// touch the filesystem: permission and full filesystem validation happen when
-// the staged batch is flushed.
-func (*ApplyPatch) ValidateStaged(_ context.Context, args json.RawMessage) error {
-	var params map[string]any
-	if err := json.Unmarshal(args, &params); err != nil {
-		return fmt.Errorf("apply_patch: invalid staged arguments: %w", err)
-	}
-	input, _ := params["input"].(string)
-	if input == "" {
-		return fmt.Errorf("apply_patch: input is required")
-	}
-	if _, err := parsePatch(input); err != nil {
-		return err
-	}
-	return nil
-}
-
-// StagedResultMessage is the body returned to the model when the
-// staged call is queued, matching edit_file / write_file.
-func (*ApplyPatch) StagedResultMessage() string { return "Staged." }
 
 func (a *ApplyPatch) Execute(ctx context.Context, params map[string]any) (string, error) {
 	result, previews, err := applyPatchApplyAtRoot(ctx, a.workspaceRoot, a.store, a.tracker, params)

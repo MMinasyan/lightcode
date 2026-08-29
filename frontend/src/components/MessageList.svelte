@@ -27,7 +27,6 @@
     {#if msg.type === 'user'}
       <Message role="user" content={msg.content} turn={msg.turn}
         on:revertcode={(e) => dispatch('revertcode', e.detail)}
-        on:reverthistory={(e) => dispatch('reverthistory', e.detail)}
         on:fork={(e) => dispatch('fork', e.detail)} />
     {:else if msg.type === 'assistant'}
       <Message role="assistant" content={msg.content} turn={msg.turn} partial={msg.partial} />

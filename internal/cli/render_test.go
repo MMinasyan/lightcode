@@ -183,35 +183,32 @@ func TestPermissionPromptUsesSharedMenuRenderer(t *testing.T) {
 	}
 }
 
-func TestPermissionPromptShowsAllowAllForBatch(t *testing.T) {
+func TestPermissionPromptShowsAffectedFilesWithoutStagingControls(t *testing.T) {
 	req := &agent.PermissionRequest{
-		ToolName:    "edit_file",
-		Arg:         "/tmp/file.txt",
-		CanAllowAll: true,
-		BatchIndex:  1,
-		BatchTotal:  3,
-		BatchFiles:  []string{"/tmp/file.txt", "/tmp/other.txt"},
+		ToolName:   "edit_file",
+		Arg:        "/tmp/file.txt",
+		BatchFiles: []string{"/tmp/file.txt", "/tmp/other.txt"},
 	}
 
 	rendered := renderPermissionPrompt(req, 0, 80)
-	if !strings.Contains(rendered, "Allow all") {
-		t.Fatalf("permission prompt missing allow all:\n%s", rendered)
+	if !strings.Contains(rendered, "Affected files:") {
+		t.Fatalf("permission prompt missing affected files label:\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "(1/3)") {
-		t.Fatalf("permission prompt missing batch position:\n%s", rendered)
+	if !strings.Contains(rendered, "/tmp/other.txt") {
+		t.Fatalf("permission prompt missing affected file:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "Staged files:") || strings.Contains(rendered, "Allow all") || strings.Contains(rendered, "(1/3)") {
+		t.Fatalf("permission prompt must not expose staging-only controls:\n%s", rendered)
 	}
 	if got, want := strings.Count(rendered, nl)+1, permissionPromptRows(req); got != want {
 		t.Fatalf("rendered rows = %d, permissionPromptRows = %d\n%s", got, want, rendered)
 	}
-	if !strings.Contains(rendered, "Staged files:") || !strings.Contains(rendered, "/tmp/other.txt") {
-		t.Fatalf("permission prompt missing staged file list:\n%s", rendered)
-	}
 	actions := permissionActions(req)
-	if got := actions[0].label; got != "Allow all" {
-		t.Fatalf("first permission action = %q, want Allow all", got)
+	if got := actions[0].label; got != "Allow" {
+		t.Fatalf("first permission action = %q, want Allow", got)
 	}
-	if got := actions[1].label; got != "Allow" {
-		t.Fatalf("second permission action = %q, want Allow", got)
+	if got := actions[1].label; got != "Deny" {
+		t.Fatalf("second permission action = %q, want Deny", got)
 	}
 }
 

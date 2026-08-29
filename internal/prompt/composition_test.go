@@ -16,14 +16,14 @@ func TestAssembleFullSpecIsStatelessAndDeterministic(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_RULES_MARKER"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	spec := Spec{Size: SizeFull, Memory: true}
-	// A baseline (nil adapt) render and an explicit full/memory-on spec are the
-	// same prompt, and repeated renders are byte-identical: the service holds no
-	// state that would drift between calls.
+	spec := Spec{Size: SizeFull}
+	// A baseline (nil adapt) render and an explicit full spec are the same prompt,
+	// and repeated renders are byte-identical: the service holds no state that
+	// would drift between calls.
 	base := assembleFull(projectRoot, home, nil).Prompt
 	explicit := assembleSpec(projectRoot, home, spec).Prompt
 	if base != explicit {
-		t.Fatalf("full empty-body memory-on spec differs from baseline\n--- baseline ---\n%s\n--- spec ---\n%s", base, explicit)
+		t.Fatalf("full empty-body spec differs from baseline\n--- baseline ---\n%s\n--- spec ---\n%s", base, explicit)
 	}
 	if again := assembleSpec(projectRoot, home, spec).Prompt; again != explicit {
 		t.Fatalf("repeated render differs\n--- first ---\n%s\n--- again ---\n%s", explicit, again)
@@ -45,10 +45,9 @@ func TestAssembleConcurrent(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
 				res := svc.Assemble(projectRoot, testStart, Spec{
-					Size:   []string{SizeFull, SizeSimple, SizeNone}[j%3],
-					Body:   "body",
-					Memory: j%2 == 0,
-					Adapt:  adapt,
+					Size:  []string{SizeFull, SizeSimple, SizeNone}[j%3],
+					Body:  "body",
+					Adapt: adapt,
 				})
 				if strings.TrimSpace(res.Prompt) == "" {
 					t.Errorf("goroutine %d build %d produced empty prompt", i, j)
@@ -91,10 +90,9 @@ func TestAssembleForSpecSimpleIncludesOnlySimpleSectionsAndBodySlot(t *testing.T
 		Additions: map[string]string{"safety": "SIMPLE_SAFETY_ADDITION", "tone": "SIMPLE_TONE_ADDITION"},
 	}
 	prompt := assembleSpec(projectRoot, home, Spec{
-		Size:   SizeSimple,
-		Body:   "Do the focused job.",
-		Memory: true,
-		Adapt:  adapt,
+		Size:  SizeSimple,
+		Body:  "Do the focused job.",
+		Adapt: adapt,
 	}).Prompt
 
 	for _, want := range []string{
@@ -102,7 +100,6 @@ func TestAssembleForSpecSimpleIncludesOnlySimpleSectionsAndBodySlot(t *testing.T
 		strings.TrimSpace(coreRulesSection),
 		strings.TrimSpace(compactionAwarenessSection),
 		"## Environment",
-		strings.TrimSpace(memoryInstructionsSection),
 		strings.TrimSpace(safetySection),
 		"SIMPLE_SAFETY_ADDITION",
 		"SIMPLE_BLOCK_MARKER",
@@ -136,7 +133,7 @@ func TestAssembleForSpecSimpleIncludesOnlySimpleSectionsAndBodySlot(t *testing.T
 	)
 }
 
-func TestAssembleForSpecNoneOnlyMemoryAndBody(t *testing.T) {
+func TestAssembleForSpecNoneProducesBodyOnly(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := t.TempDir()
 	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_RULES_MARKER"), 0o600); err != nil {
@@ -144,21 +141,24 @@ func TestAssembleForSpecNoneOnlyMemoryAndBody(t *testing.T) {
 	}
 	body := "## Your Role and Instructions\n\nOnly compact this transcript."
 	prompt := assembleSpec(projectRoot, home, Spec{
-		Size:   SizeNone,
-		Body:   body,
-		Memory: true,
-		Adapt:  &adaptation.Adaptation{Name: "ignored", Blocks: []string{"IGNORED_BLOCK"}},
+		Size:  SizeNone,
+		Body:  body,
+		Adapt: &adaptation.Adaptation{Name: "ignored", Blocks: []string{"IGNORED_BLOCK"}},
 	}).Prompt
 
-	for _, want := range []string{strings.TrimSpace(memoryInstructionsSection), body} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("none prompt missing %q\n%s", want, prompt)
-		}
+	if !strings.Contains(prompt, body) {
+		t.Fatalf("none prompt missing body %q\n%s", body, prompt)
 	}
 	for _, forbidden := range []string{
 		strings.TrimSpace(identitySection),
+		strings.TrimSpace(coreRulesSection),
+		strings.TrimSpace(compactionAwarenessSection),
 		"## Environment",
 		strings.TrimSpace(safetySection),
+		strings.TrimSpace(rulesFileGuideSection),
+		strings.TrimSpace(toneSection),
+		strings.TrimSpace(taskExecutionSection),
+		strings.TrimSpace(languageSection),
 		"PROJECT_RULES_MARKER",
 		"IGNORED_BLOCK",
 	} {
@@ -168,26 +168,6 @@ func TestAssembleForSpecNoneOnlyMemoryAndBody(t *testing.T) {
 	}
 	if count := strings.Count(prompt, agentPromptHeading); count != 1 {
 		t.Fatalf("agent prompt heading count = %d, want 1\n%s", count, prompt)
-	}
-
-	withoutMemory := assembleSpec(projectRoot, home, Spec{Size: SizeNone, Body: body, Memory: false}).Prompt
-	if withoutMemory != body {
-		t.Fatalf("none memory-off prompt = %q, want body only", withoutMemory)
-	}
-}
-
-func TestAssembleForSpecMemoryGatingIsIndependentOfSize(t *testing.T) {
-	home := t.TempDir()
-	projectRoot := t.TempDir()
-
-	fullNoMemory := assembleSpec(projectRoot, home, Spec{Size: SizeFull, Memory: false}).Prompt
-	if strings.Contains(fullNoMemory, strings.TrimSpace(memoryInstructionsSection)) {
-		t.Fatalf("full memory-off prompt contains memory instructions\n%s", fullNoMemory)
-	}
-
-	noneWithMemory := assembleSpec(projectRoot, home, Spec{Size: SizeNone, Body: "Remember.", Memory: true}).Prompt
-	if !strings.Contains(noneWithMemory, strings.TrimSpace(memoryInstructionsSection)) {
-		t.Fatalf("none memory-on prompt missing memory instructions\n%s", noneWithMemory)
 	}
 }
 

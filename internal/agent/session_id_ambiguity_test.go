@@ -139,7 +139,6 @@ type persistedAmbiguousSessionFixture struct {
 	second     *project.Project
 	firstMeta  []byte
 	secondMeta []byte
-	hooks      *ambiguityMemoryHooks
 }
 
 func newPersistedAmbiguousSessionFixture(t *testing.T) persistedAmbiguousSessionFixture {
@@ -174,8 +173,6 @@ func newPersistedAmbiguousSessionFixture(t *testing.T) persistedAmbiguousSession
 			t.Fatal(err)
 		}
 	}
-	hooks := &ambiguityMemoryHooks{}
-	a.memoryHooks = hooks
 	return persistedAmbiguousSessionFixture{
 		agent:      a,
 		id:         sharedID,
@@ -183,7 +180,6 @@ func newPersistedAmbiguousSessionFixture(t *testing.T) persistedAmbiguousSession
 		second:     second,
 		firstMeta:  metas[0],
 		secondMeta: metas[1],
-		hooks:      hooks,
 	}
 }
 
@@ -218,9 +214,6 @@ func (f persistedAmbiguousSessionFixture) assertUntouched(t *testing.T) {
 	if unit != nil {
 		t.Fatal("ambiguous persisted id was registered as live")
 	}
-	if f.hooks.deleteCalls != 0 {
-		t.Fatalf("summary cleanup calls = %d, want 0", f.hooks.deleteCalls)
-	}
 	for _, proj := range []*project.Project{f.first, f.second} {
 		rules, err := permission.LoadLocal(f.agent.projects.Root(), proj.ID)
 		if err != nil {
@@ -239,23 +232,7 @@ type ambiguousSessionFixture struct {
 	second     *project.Project
 	firstMeta  []byte
 	secondMeta []byte
-	hooks      *ambiguityMemoryHooks
 	cancelled  *int
-}
-
-type ambiguityMemoryHooks struct {
-	deleteCalls int
-}
-
-func (h *ambiguityMemoryHooks) Reconcile() error { return nil }
-
-func (h *ambiguityMemoryHooks) IndexSummary(string, string, string, string, string, string) error {
-	return nil
-}
-
-func (h *ambiguityMemoryHooks) DeleteSessionSummaries(string) error {
-	h.deleteCalls++
-	return nil
 }
 
 func newLiveAmbiguousSessionFixture(t *testing.T) ambiguousSessionFixture {
@@ -280,9 +257,7 @@ func newLiveAmbiguousSessionFixture(t *testing.T) ambiguousSessionFixture {
 	if _, err := a.AppendUserMessageToSession(id, "live-marker"); err != nil {
 		t.Fatalf("append live marker: %v", err)
 	}
-	hooks := &ambiguityMemoryHooks{}
 	cancelled := 0
-	a.memoryHooks = hooks
 	a.ensureRuntime().mu.Lock()
 	unit := a.sessions[id]
 	unit.queue = []QueuedItem{{ID: "queue-marker", Content: "queued-marker"}}
@@ -314,7 +289,6 @@ func newLiveAmbiguousSessionFixture(t *testing.T) ambiguousSessionFixture {
 		second:     second,
 		firstMeta:  firstMeta,
 		secondMeta: secondMeta,
-		hooks:      hooks,
 		cancelled:  &cancelled,
 	}
 }
@@ -363,9 +337,6 @@ func (f ambiguousSessionFixture) assertLiveUnitUntouched(t *testing.T) {
 	}
 	if *f.cancelled != 0 {
 		t.Fatalf("live session cancellation count = %d, want 0", *f.cancelled)
-	}
-	if f.hooks.deleteCalls != 0 {
-		t.Fatalf("summary cleanup calls = %d, want 0", f.hooks.deleteCalls)
 	}
 	got, err := f.agent.messagesForFrontendForStore(unit.store, f.id)
 	if err != nil || !strings.Contains(displayText(got), "live-marker") {

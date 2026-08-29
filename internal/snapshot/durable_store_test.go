@@ -99,32 +99,3 @@ func TestBeginChildSessionSyncOrderAndActivation(t *testing.T) {
 		t.Fatal("child store inactive after successful durability proof")
 	}
 }
-
-func TestRevertHistoryClassifiesTurnDirectorySyncFailure(t *testing.T) {
-	store := newTestStore(t)
-	seedTurns(t, store, 3)
-	turnsDir := store.turnsDir
-	injected := errors.New("injected turns directory sync failure")
-	atomicfs.SyncDirFunc = func(dir string) error {
-		if dir == turnsDir {
-			return injected
-		}
-		return nil
-	}
-	t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
-
-	outcome, err := store.RevertHistory(1)
-	var committed *CommittedMutationError
-	if !errors.As(err, &committed) {
-		t.Fatalf("turn sync error = %v, want committed error", err)
-	}
-	if got := store.CurrentTurn(); got != 2 {
-		t.Fatalf("current turn after first successful removal = %d, want 2", got)
-	}
-	if !outcome.HistoryChanged || !outcome.HistoryStateKnown || outcome.CurrentTurn != 2 {
-		t.Fatalf("outcome = %+v, want changed/known/current 2", outcome)
-	}
-	if got := readIntDirs(turnsDir); !reflect.DeepEqual(got, []int{1, 2}) {
-		t.Fatalf("turn dirs after sync failure = %v, want [1 2]", got)
-	}
-}

@@ -14,7 +14,6 @@ import (
 	loop "github.com/MMinasyan/lightcode/internal/engine"
 	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
 	"github.com/MMinasyan/lightcode/internal/lsp"
-	"github.com/MMinasyan/lightcode/internal/memory"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/process"
 	"github.com/MMinasyan/lightcode/internal/provider"
@@ -66,14 +65,11 @@ type taskTool struct {
 	homeDir       string
 	workspaceRoot string
 	procMgr       *process.Manager
-	memoryStore   *memory.Store
 	projectID     string
 	projectsRoot  string
-	memoriesDir   string
 	lspManager    *lsp.Manager
 	check         tool.CheckFunc
 	ask           tool.AskFunc
-	askAction     tool.AskActionFunc
 	usageRecorder loop.UsageRecorder
 
 	resultMetadata map[string]map[string]any
@@ -95,14 +91,11 @@ type taskToolConfig struct {
 	HomeDir       string
 	WorkspaceRoot string
 	ProcMgr       *process.Manager
-	MemoryStore   *memory.Store
 	ProjectID     string
 	ProjectsRoot  string
-	MemoriesDir   string
 	LSPManager    *lsp.Manager
 	Check         tool.CheckFunc
 	Ask           tool.AskFunc
-	AskAction     tool.AskActionFunc
 	UsageRecorder loop.UsageRecorder
 }
 
@@ -123,25 +116,21 @@ func newTaskTool(cfg taskToolConfig) *taskTool {
 		homeDir:       cfg.HomeDir,
 		workspaceRoot: cfg.WorkspaceRoot,
 		procMgr:       cfg.ProcMgr,
-		memoryStore:   cfg.MemoryStore,
 		projectID:     cfg.ProjectID,
 		projectsRoot:  cfg.ProjectsRoot,
-		memoriesDir:   cfg.MemoriesDir,
 		lspManager:    cfg.LSPManager,
 		check:         cfg.Check,
 		ask:           cfg.Ask,
-		askAction:     cfg.AskAction,
 		usageRecorder: cfg.UsageRecorder,
 	}
 }
 
-func (t *taskTool) setProject(projectID, memoriesDir string) {
+func (t *taskTool) setProject(projectID string) {
 	if t == nil {
 		return
 	}
 	t.mu.Lock()
 	t.projectID = projectID
-	t.memoriesDir = memoriesDir
 	t.mu.Unlock()
 }
 
@@ -358,9 +347,8 @@ func appendAdaptationBlocks(prompt string, adapt *adaptation.Adaptation) string 
 // resolved from the child's OWN model: it appends the adaptation's coaching blocks to the prompt and
 // installs the adaptation on the loop (tool advertisement, dispatch gate, leak pattern).
 type childLoopRuntime struct {
-	store           *snapshot.Store
-	events          chan<- loop.Event
-	pendingExecutor tool.PendingExecutor
+	store  *snapshot.Store
+	events chan<- loop.Event
 }
 
 func (t *taskTool) buildChildLoop(at agentcfg.Resolved, client *provider.Client, registry *tool.Registry, ref coremodel.ModelRef, runtimeCfg ...childLoopRuntime) *loop.Loop {
@@ -380,7 +368,6 @@ func (t *taskTool) buildChildLoop(at agentcfg.Resolved, client *provider.Client,
 			Store:            rt.store,
 			Events:           rt.events,
 			UsageRecorder:    t.usageRecorder,
-			PendingExecutor:  rt.pendingExecutor,
 			ActiveAdaptation: adapt,
 		},
 	})
@@ -484,16 +471,11 @@ func (t *taskTool) runSubagent(ctx context.Context, index int, td taskDef, paren
 		return result
 	}
 
-	pendingExecutor := tool.NewStagedExecutorAtRootWithOptions(scope.snapshotStore(), scope.tracker, t.toolsConfig, scope.workspaceRoot, t.permissionCheck(), t.permissionAskAction(), tool.CapabilityOptions{
-		WriteDir: taskToolExposure(at).writeDir,
-	})
 	lp = t.buildChildLoop(at, client, registry, ref, childLoopRuntime{
-		store:           childStore,
-		events:          events,
-		pendingExecutor: pendingExecutor,
+		store:  childStore,
+		events: events,
 	})
 	lp.SetEventOwner(sessionID, t.projectID)
-	registry.RegisterPendingCoordinator(tool.NewPendingCoordinator(pendingExecutor))
 	// The child process-signal callback is registered after the child loop is
 	// constructed and before lp.Run can call a tool, so a child background
 	// process that completes during the run reaches this live loop. It is
@@ -533,13 +515,6 @@ func (t *taskTool) buildRegistry(at agentcfg.Resolved, scope parentMutationScope
 	reg := tool.NewRegistry()
 	for _, name := range exposure.tools {
 		if name == "task" {
-			continue
-		}
-		if name == "execute_pending" {
-			// execute_pending is not in CoreTools (no snapshot/tracker
-			// wiring). Register it only for subagent types that explicitly
-			// list it; read-only types must not receive mutation tools.
-			reg.Register(tool.WrapWithPermission(tool.ExecutePending{}, t.permissionCheck(), t.permissionAsk()))
 			continue
 		}
 		if tt, ok := core[name]; ok {
@@ -640,21 +615,6 @@ func (t *taskTool) newChildTool(name string, readonly bool, scope parentMutation
 		return tool.WrapWithPermission(tool.NewProcessTool(procMgr), check, ask)
 	case "sleep":
 		return tool.WrapWithPermission(tool.Sleep{}, check, ask)
-	case "save_memory":
-		if t.memoryStore == nil {
-			return nil
-		}
-		return tool.WrapWithPermission(tool.NewSaveMemory(t.memoryStore, t.memoriesDir), check, ask)
-	case "search_memory":
-		if t.memoryStore == nil {
-			return nil
-		}
-		return tool.WrapWithPermission(tool.NewSearchMemory(t.memoryStore, t.projectID), check, ask)
-	case "search_history":
-		if t.memoryStore == nil {
-			return nil
-		}
-		return tool.WrapWithPermission(tool.NewSearchHistory(t.memoryStore, t.projectID), check, ask)
 	case "diagnostics":
 		if t.lspManager == nil {
 			return nil
@@ -688,15 +648,6 @@ func (t *taskTool) permissionAsk() tool.AskFunc {
 	}
 }
 
-func (t *taskTool) permissionAskAction() tool.AskActionFunc {
-	if t.askAction != nil {
-		return t.askAction
-	}
-	return func(context.Context, permission.Request) permission.ResponseAction {
-		return permission.ResponseDeny
-	}
-}
-
 func isReadOnlyType(at agentcfg.Resolved) bool {
 	return at.Readonly
 }
@@ -709,13 +660,6 @@ type taskExposure struct {
 
 func taskToolExposure(at agentcfg.Resolved) taskExposure {
 	tools := append([]string(nil), at.Tools...)
-	if at.Memory {
-		tools = appendToolIfMissing(tools, "save_memory")
-		tools = appendToolIfMissing(tools, "search_memory")
-		tools = appendToolIfMissing(tools, "search_history")
-	} else {
-		tools = removeTools(tools, "save_memory", "search_memory", "search_history")
-	}
 	if at.LSP {
 		tools = appendToolIfMissing(tools, "diagnostics")
 		tools = appendToolIfMissing(tools, "workspace_symbol")
@@ -757,13 +701,12 @@ func removeTools(tools []string, names ...string) []string {
 func (t *taskTool) availableAgentTypes() []agentcfg.Resolved {
 	t.mu.Lock()
 	cfg := t.agentTypes
-	ctx := agentcfg.ResolveContext{Home: t.homeDir, ProjectID: t.projectID}
 	t.mu.Unlock()
 
 	if cfg == nil {
 		return nil
 	}
-	all := cfg.All(ctx)
+	all := cfg.All()
 	out := make([]agentcfg.Resolved, 0, len(all))
 	for _, at := range all {
 		if at.Subagent {
@@ -776,13 +719,12 @@ func (t *taskTool) availableAgentTypes() []agentcfg.Resolved {
 func (t *taskTool) resolveAgentType(name string) (agentcfg.Resolved, error) {
 	t.mu.Lock()
 	cfg := t.agentTypes
-	ctx := agentcfg.ResolveContext{Home: t.homeDir, ProjectID: t.projectID}
 	t.mu.Unlock()
 
 	if cfg == nil {
 		return agentcfg.Resolved{}, fmt.Errorf("agent types are not configured")
 	}
-	at, err := cfg.Resolve(name, ctx)
+	at, err := cfg.Resolve(name)
 	if err != nil {
 		return agentcfg.Resolved{}, err
 	}

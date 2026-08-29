@@ -2,7 +2,6 @@ package tool
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"golang.org/x/sys/unix"
 )
@@ -134,45 +132,6 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 				return err
 			},
 		},
-		{
-			name: "staged_directory",
-			target: func(t *testing.T) (string, func()) {
-				return nonRegularDirectoryTarget(t), func() {}
-			},
-			run: func(path string) error {
-				results := NewStagedExecutor(nil, nil, config.ToolsConfig{}, allowNonRegularStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-					stagedNonRegularWrite(path, "call-1", "after"),
-				})
-				return singleNonRegularBatchError(results)
-			},
-		},
-		{
-			name: "staged_FIFO",
-			target: func(t *testing.T) (string, func()) {
-				path := nonRegularFIFO(t)
-				return path, startNonRegularFIFOFeed(t, path, "before")
-			},
-			run: func(path string) error {
-				return runNonRegularTargetWithTimeout(func() error {
-					results := NewStagedExecutor(nil, nil, config.ToolsConfig{}, allowNonRegularStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-						stagedNonRegularWrite(path, "call-1", "after"),
-					})
-					return singleNonRegularBatchError(results)
-				})
-			},
-		},
-		{
-			name: "staged_socket",
-			target: func(t *testing.T) (string, func()) {
-				return nonRegularUnixSocket(t), func() {}
-			},
-			run: func(path string) error {
-				results := NewStagedExecutor(nil, nil, config.ToolsConfig{}, allowNonRegularStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-					stagedNonRegularWrite(path, "call-1", "after"),
-				})
-				return singleNonRegularBatchError(results)
-			},
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path, release := tc.target(t)
@@ -252,21 +211,6 @@ func TestNonRegularFileToolsDoNotSnapshot(t *testing.T) {
 				return err
 			},
 		},
-		{
-			name: "staged_FIFO",
-			target: func(t *testing.T) (string, func()) {
-				path := nonRegularFIFO(t)
-				return path, startNonRegularFIFOFeed(t, path, "before")
-			},
-			run: func(store *recordingNonRegularSnapshotStore, path string) error {
-				return runNonRegularTargetWithTimeout(func() error {
-					results := NewStagedExecutor(store, nil, config.ToolsConfig{}, allowNonRegularStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-						stagedNonRegularWrite(path, "call-1", "after"),
-					})
-					return singleNonRegularBatchError(results)
-				})
-			},
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := &recordingNonRegularSnapshotStore{turn: 1}
@@ -324,31 +268,6 @@ func (s *recordingNonRegularSnapshotStore) SnapshotResolved(turn int, originalPa
 
 func (s *recordingNonRegularSnapshotStore) CurrentTurn() int {
 	return s.turn
-}
-
-func allowNonRegularStagedCall(string, string) permission.Decision {
-	return permission.DecisionAllow
-}
-
-func stagedNonRegularWrite(path, id, content string) StagedCall {
-	return StagedCall{
-		ToolName:   "write_file",
-		ToolCallID: id,
-		Params: map[string]any{
-			"path":    path,
-			"content": content,
-		},
-	}
-}
-
-func singleNonRegularBatchError(results []BatchResult) error {
-	if len(results) != 1 {
-		return fmt.Errorf("batch returned %d results, want 1", len(results))
-	}
-	if results[0].Success {
-		return nil
-	}
-	return errors.New(results[0].Error)
 }
 
 func assertNonRegularRefusal(t *testing.T, path string, err error) {
@@ -451,7 +370,7 @@ func nonRegularUnixSocket(t *testing.T) string {
 
 // A hardlink inside the project pointing to an outside-boundary inode
 // must be refused at every file-tool entry point: read_file, write_file,
-// edit_file, the staged executor (write + edit), and snapshot capture.
+// edit_file, and snapshot capture.
 func TestPR11Closure_HardlinkRefusedAcrossAllOperations(t *testing.T) {
 	makeHardlink := func(t *testing.T) (hardlinked, outside string) {
 		t.Helper()
@@ -527,31 +446,6 @@ func TestPR11Closure_HardlinkRefusedAcrossAllOperations(t *testing.T) {
 				"new_string": "tampered",
 			})
 		assertHardlinkRefusal(t, err)
-	})
-
-	t.Run("staged_write", func(t *testing.T) {
-		hardlinked, _ := makeHardlink(t)
-		results := NewStagedExecutor(nil, nil, config.ToolsConfig{}, allowNonRegularStagedCall, nil).ExecutePending(
-			context.Background(), []StagedCall{stagedNonRegularWrite(hardlinked, "call-1", "mutated")})
-		assertHardlinkRefusal(t, singleNonRegularBatchError(results))
-	})
-
-	t.Run("staged_edit", func(t *testing.T) {
-		hardlinked, _ := makeHardlink(t)
-		tracker := NewFileTracker()
-		preTrack(t, tracker, hardlinked)
-		call := StagedCall{
-			ToolName:   "edit_file",
-			ToolCallID: "call-1",
-			Params: map[string]any{
-				"path":       hardlinked,
-				"old_string": "outside-content",
-				"new_string": "tampered",
-			},
-		}
-		results := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowNonRegularStagedCall, nil).ExecutePending(
-			context.Background(), []StagedCall{call})
-		assertHardlinkRefusal(t, singleNonRegularBatchError(results))
 	})
 
 	t.Run("snapshot_capture", func(t *testing.T) {

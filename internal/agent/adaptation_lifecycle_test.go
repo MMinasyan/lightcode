@@ -100,7 +100,7 @@ func newLifecycleAgent(t *testing.T, home, projectRoot, defaultModel string) *Ag
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestLifecyclePreambleKeepsBlockAcrossTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home, NewMemoryEmbedder: disabledMemoryEmbedder})
+	a, err := New(Config{Cfg: cfg, ConfigPath: configPath, ProjectRoot: projectRoot, Home: home})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}

@@ -11,7 +11,6 @@ What belongs in it:
 
 What does not belong in it:
 
-- Memory or notes — use the memory tools for cross-session memory, not this file
 - Status or progress tracking (checklists, done/pending state)
 - Things the system prompt already handles (tool usage, core rules, identity)
 - General coding knowledge you already have

@@ -15,7 +15,6 @@ var StandardTools = []string{
 	"edit_file",
 	"apply_patch",
 	"run_command",
-	"execute_pending",
 	"process",
 	"sleep",
 	"task",
@@ -28,7 +27,6 @@ type Definition struct {
 	SystemPrompt string    `json:"system_prompt,omitempty"`
 	Prompt       *string   `json:"prompt,omitempty"`
 	Tools        *[]string `json:"tools,omitempty"`
-	Memory       *bool     `json:"memory,omitempty"`
 	LSP          *bool     `json:"lsp,omitempty"`
 	Readonly     *bool     `json:"readonly,omitempty"`
 	WriteDir     *string   `json:"write_dir,omitempty"`
@@ -43,7 +41,6 @@ type Resolved struct {
 	SystemPrompt string
 	Prompt       string
 	Tools        []string
-	Memory       bool
 	LSP          bool
 	Readonly     bool
 	WriteDir     string
@@ -64,12 +61,6 @@ func (w Warning) Error() string {
 		return w.Message
 	}
 	return fmt.Sprintf("%s: %s", w.Name, w.Message)
-}
-
-// ResolveContext carries values needed to resolve project-dependent built-ins.
-type ResolveContext struct {
-	Home      string
-	ProjectID string
 }
 
 func boolPtr(v bool) *bool { return &v }
