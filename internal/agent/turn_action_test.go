@@ -49,30 +49,37 @@ func TestApplyTurnActionRevertCodeUsesClickedTurn(t *testing.T) {
 	}
 }
 
-func TestApplyTurnActionRevertHistoryWithCodeUsesClickedTurn(t *testing.T) {
+// TestApplyTurnActionRejectedActionsPerformNoMutation proves a turn action the
+// owner does not know performs no queue, transcript, compaction, or durable
+// mutation: history reversion has no retained route under its old name, and an
+// arbitrary forged string is refused at the same point. The rejection returns
+// before any reservation, reload, or store call, so a seeded turn with a live
+// snapshot file stays byte-identical on disk and in memory.
+func TestApplyTurnActionRejectedActionsPerformNoMutation(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
 	path := filepath.Join(a.projectRoot, "created.txt")
 
 	appendUserTurn(t, a, "first")
 	clickedTurn := appendUserTurnWithSnapshot(t, a, "create file", path, "created\n")
-	appendUserTurn(t, a, "after")
-
-	result, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, clickedTurn, TurnActionRevertHistory, true)
-	if err != nil {
-		t.Fatalf("ApplyTurnActionForSession returned error: %v", err)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected created file before the forged actions: %v", err)
 	}
 
-	if result.TargetTurn != clickedTurn-1 {
-		t.Fatalf("TargetTurn = %d, want %d", result.TargetTurn, clickedTurn-1)
+	for _, action := range []string{"revert_history", "bogus_action"} {
+		result, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, clickedTurn, action, true)
+		if err == nil || !strings.Contains(err.Error(), `unknown turn action`) {
+			t.Fatalf("ApplyTurnActionForSession(%q) = %#v %v, want an unknown-action error with no mutation", action, result, err)
+		}
+		if result.SessionChanged {
+			t.Fatalf("%s forged action reported a session change: %#v", action, result)
+		}
 	}
-	if result.Prefill != "create file" {
-		t.Fatalf("Prefill = %q, want selected user message", result.Prefill)
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("created file missing after rejected actions: %v, want it untouched", err)
 	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("created file still exists after history+code revert; stat err=%v", err)
-	}
-	if got := userContents(a.SessionMessages()); !equalStrings(got, []string{"first"}) {
-		t.Fatalf("history after revert = %q, want only first turn", got)
+	if got := userContents(a.SessionMessages()); !equalStrings(got, []string{"first", "create file"}) {
+		t.Fatalf("history = %q after rejected actions, want both turns intact", got)
 	}
 }
 

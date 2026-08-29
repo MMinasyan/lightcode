@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -308,48 +307,6 @@ func TestWailsRealCommittedNamespaceProducers(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(sessionsRoot, id)); !os.IsNotExist(err) {
 			t.Fatalf("Wails deleted source = %v, want absent", err)
-		}
-	})
-
-	t.Run("history", func(t *testing.T) {
-		ag := newAppTestAgent(t)
-		id, err := ag.NewSession("", "primary")
-		if err != nil {
-			t.Fatal(err)
-		}
-		lastTurn := 0
-		for _, text := range []string{"one", "two", "three"} {
-			lastTurn, err = ag.AppendUserMessageToSession(id, text)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-		project, err := ag.Projects().Ensure()
-		if err != nil {
-			t.Fatal(err)
-		}
-		app := newTestApp(ag)
-		app.setCurrentSessionID(id)
-		turnsDir := filepath.Join(ag.Projects().SessionsRoot(project.ID), id, "turns")
-		injected := errors.New("injected Wails history sync failure")
-		atomicfs.SyncDirFunc = func(dir string) error {
-			if dir == turnsDir {
-				return injected
-			}
-			return nil
-		}
-		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
-
-		err = app.RevertHistory(lastTurn)
-		var committed *snapshot.CommittedMutationError
-		if !errors.As(err, &committed) {
-			t.Fatalf("Wails history error = %v, want committed error", err)
-		}
-		if app.currentSessionID() != id {
-			t.Fatalf("Wails current after committed history = %q, want %q", app.currentSessionID(), id)
-		}
-		if _, err := os.Stat(filepath.Join(turnsDir, fmt.Sprint(lastTurn))); !os.IsNotExist(err) {
-			t.Fatalf("Wails reverted turn = %v, want removed", err)
 		}
 	})
 
@@ -1028,15 +985,11 @@ func TestWailsTurnActionFrameCarriesFailedRevertWarning(t *testing.T) {
 	if boundary.State == nil || boundary.State.Session.ID == "" || boundary.State.Session.ID == sourceID {
 		t.Fatalf("turn_action frame must carry the fork destination's state, got %#v", boundary.State)
 	}
-	if boundary.Prefill != nil {
-		t.Fatalf("fork turn_action prefill = %q, want nil: only history revert prepares a composer draft on its ordered frame", *boundary.Prefill)
-	}
 }
 
 // seedAppCompleteTurns persists n complete turns, one user message each,
 // through the owner's public append route: the dead model URL fails the model
-// call, but the user turn is durably persisted, so a history revert has turns
-// to walk.
+// call, but the user turn is durably persisted.
 func seedAppCompleteTurns(t *testing.T, ag *agent.Agent, n int) string {
 	t.Helper()
 	id := ag.SessionCurrent().ID
@@ -1053,253 +1006,6 @@ func seedAppCompleteTurns(t *testing.T, ag *agent.Agent, n int) string {
 		}
 	}
 	return id
-}
-
-// blockAppTurnDir makes one turn directory's removal fail: an unwritable
-// directory blocks os.RemoveAll exactly there, so the descending history walk
-// stops at it.
-func blockAppTurnDir(t *testing.T, ag *agent.Agent, turn int) {
-	t.Helper()
-	if os.Geteuid() == 0 {
-		t.Skip("directory permissions do not block writes as root")
-	}
-	blocked := filepath.Join(ag.Store().Dir(), "turns", strconv.Itoa(turn))
-	if err := os.Chmod(blocked, 0o555); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(blocked, 0o700) })
-}
-
-// TestWailsPartialRevertDisposition proves the ApplyTurnAction route resolves
-// a reconciled partial history revert as success: the walk removed some turns,
-// published the surviving state as an ordered turn_action frame, and rode the
-// failure onto the frame as the warning. The direct method must not also
-// reject — the frontend would then render the error twice, once from the frame
-// and once from the promise.
-func TestWailsPartialRevertDisposition(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("directory permissions do not block writes as root")
-	}
-	ag := newAppTestAgent(t)
-	app := &App{svc: ag, agent: ag}
-	log := &wailsFrameLog{}
-	app.emitFn = log.append
-	app.startup(context.Background())
-	id := seedAppCompleteTurns(t, ag, 5)
-	// Reverting to turn 4 removes turns 4 and 5; blocking turn 4 makes the
-	// walk stop there — a partial failure whose history changed, so the
-	// revert reconciles and publishes the boundary.
-	blockAppTurnDir(t, ag, 4)
-
-	result, err := app.ApplyTurnAction(4, agent.TurnActionRevertHistory, false)
-	if err != nil {
-		t.Fatalf("ApplyTurnAction on a reconciled partial revert = %v, want success: the emitted frame owns the error", err)
-	}
-	if result.Warning == "" || !strings.Contains(result.Warning, "turn 4") {
-		t.Fatalf("result.Warning = %q, want the walk error naming turn 4", result.Warning)
-	}
-
-	frame := waitForWailsFrame(t, log, "turn_action")
-	boundary, ok := frame.(turnActionBoundary)
-	if !ok {
-		t.Fatalf("turn_action frame payload is %T, want turnActionBoundary: %#v", frame, frame)
-	}
-	if boundary.Warning != result.Warning {
-		t.Fatalf("frame warning = %q, want the result's %q", boundary.Warning, result.Warning)
-	}
-	if boundary.State == nil || boundary.State.Session.ID != id {
-		t.Fatalf("frame state = %#v, want the surviving session %q", boundary.State, id)
-	}
-	if c := userContents(boundary.State.Messages); !equalStrings(c, []string{"turn 1", "turn 2", "turn 3", "turn 4"}) {
-		t.Fatalf("frame state messages = %q, want turns 1-4 (the blocked turn survives)", c)
-	}
-}
-
-func TestWailsHighestTurnPartialMutationDisposition(t *testing.T) {
-	ag := newAppTestAgent(t)
-	app := &App{svc: ag, agent: ag}
-	log := &wailsFrameLog{}
-	app.emitFn = log.append
-	app.startup(context.Background())
-	id := seedAppCompleteTurns(t, ag, 5)
-	injected := errors.New("injected Wails highest-turn partial failure")
-	snapshot.RemoveHistoryTurnFunc = func(path string) error {
-		if filepath.Base(path) == "5" {
-			if err := os.Remove(filepath.Join(path, "messages.jsonl")); err != nil {
-				return err
-			}
-		}
-		return injected
-	}
-	t.Cleanup(func() { snapshot.RemoveHistoryTurnFunc = nil })
-
-	result, err := app.ApplyTurnAction(3, agent.TurnActionRevertHistory, false)
-	if err != nil {
-		t.Fatalf("ApplyTurnAction = %v, want boundary-owned ordinary partial failure", err)
-	}
-	if !strings.Contains(result.Warning, "highest-turn partial") {
-		t.Fatalf("result warning = %q, want injected warning", result.Warning)
-	}
-	frame := waitForWailsFrame(t, log, "turn_action")
-	boundary, ok := frame.(turnActionBoundary)
-	if !ok || boundary.Warning != result.Warning {
-		t.Fatalf("frame = %#v, want one matching warning boundary", frame)
-	}
-	if boundary.State == nil || boundary.State.Session.ID != id || len(boundary.State.Messages) == 0 {
-		t.Fatalf("boundary state = %#v, want reconciled session state", boundary.State)
-	}
-
-	ag2 := newAppTestAgent(t)
-	app2 := &App{svc: ag2, agent: ag2}
-	log2 := &wailsFrameLog{}
-	app2.emitFn = log2.append
-	app2.startup(context.Background())
-	id2 := seedAppCompleteTurns(t, ag2, 5)
-	if err := app2.RevertHistory(3); err != nil {
-		t.Fatalf("RevertHistory = %v, want the boundary-owned ordinary partial failure", err)
-	}
-	frame2 := waitForWailsFrame(t, log2, "turn_action")
-	boundary2, ok := frame2.(turnActionBoundary)
-	if !ok || boundary2.State == nil || boundary2.State.Session.ID != id2 || !strings.Contains(boundary2.Warning, "highest-turn partial") {
-		t.Fatalf("bound RevertHistory frame = %#v, want one reconciled warning boundary", frame2)
-	}
-}
-
-// TestWailsRevertHistoryPartialDisposition proves the exported RevertHistory
-// alias follows the same disposition: a reconciled partial revert returns nil
-// because the ordered turn_action frame owns the error, so the direct binding
-// call cannot render a second error.
-func TestWailsRevertHistoryPartialDisposition(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("directory permissions do not block writes as root")
-	}
-	ag := newAppTestAgent(t)
-	app := &App{svc: ag, agent: ag}
-	log := &wailsFrameLog{}
-	app.emitFn = log.append
-	app.startup(context.Background())
-	id := seedAppCompleteTurns(t, ag, 5)
-	blockAppTurnDir(t, ag, 4)
-
-	if err := app.RevertHistory(4); err != nil {
-		t.Fatalf("RevertHistory on a reconciled partial revert = %v, want nil: the emitted frame owns the error", err)
-	}
-
-	frame := waitForWailsFrame(t, log, "turn_action")
-	boundary, ok := frame.(turnActionBoundary)
-	if !ok {
-		t.Fatalf("turn_action frame payload is %T, want turnActionBoundary: %#v", frame, frame)
-	}
-	if boundary.State == nil || boundary.State.Session.ID != id {
-		t.Fatalf("frame state = %#v, want the surviving session %q", boundary.State, id)
-	}
-	if !strings.Contains(boundary.Warning, "turn 4") {
-		t.Fatalf("frame warning = %q, want the walk error naming turn 4", boundary.Warning)
-	}
-	if c := userContents(boundary.State.Messages); !equalStrings(c, []string{"turn 1", "turn 2", "turn 3", "turn 4"}) {
-		t.Fatalf("frame state messages = %q, want turns 1-4 (the blocked turn survives)", c)
-	}
-}
-
-// committedHistoryService is a fake AdapterService proving the Wails
-// turn-action wrapper classifies a typed committed history failure with
-// errors.As: the boundary emits with the prepared state/warning/prefill/
-// committed error and the service returns the same wrapped error, so the
-// method stays a typed rejection while an ordinary partial error still
-// resolves as success because its boundary owns the warning.
-type committedHistoryService struct {
-	agent.AdapterService
-	committed bool
-}
-
-func (s *committedHistoryService) ApplyTurnActionForSessionWithBoundary(sessionID string, turn int, action string, alsoRevertCode bool, emit func(agent.HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (agent.TurnActionResult, error) {
-	prefill := "draft"
-	result := agent.TurnActionResult{
-		Action:         action,
-		Turn:           turn,
-		Prefill:        prefill,
-		Warning:        "committed sync failure",
-		SessionChanged: true,
-		Session:        agent.SessionSummary{ID: sessionID},
-	}
-	state := agent.HydrationState{Session: result.Session}
-	if s.committed {
-		committed := &snapshot.CommittedMutationError{Err: errors.New("committed sync failure")}
-		emit(state, nil, result.Warning, committed, &prefill)
-		return result, fmt.Errorf("wrap: %w", committed)
-	}
-	emit(state, nil, result.Warning, nil, &prefill)
-	return result, errors.New("ordinary partial failure")
-}
-
-// TestWailsCommittedHistoryRejectsWhileOrdinaryPartialResolves proves the
-// Wails turn-action wrapper distinguishes the typed committed-history failure
-// from the ordinary partial one through errors.As: each outcome settles to exactly
-// one stateful boundary and no adjacent "error" frame — under either frontend
-// schedule (boundary-first or rejection-first) both drain this same FIFO, so the
-// settled counts are what every consumer sees. The committed half rejects typed;
-// the ordinary partial half resolves as success with its warning on the boundary.
-func TestWailsCommittedHistoryRejectsWhileOrdinaryPartialResolves(t *testing.T) {
-	svc := &committedHistoryService{committed: true}
-	app := &App{svc: svc}
-	log := &wailsFrameLog{}
-	app.emitFn = log.append
-	app.startDelivery()
-	defer app.closeDelivery()
-	app.setCurrentSessionID("A")
-
-	_, err := app.ApplyTurnAction(1, agent.TurnActionRevertHistory, false)
-	var committed *snapshot.CommittedMutationError
-	if !errors.As(err, &committed) {
-		t.Fatalf("typed committed history = %v, want a wrapped CommittedMutationError rejection", err)
-	}
-	frame := waitForWailsFrame(t, log, "turn_action")
-	boundary, ok := frame.(turnActionBoundary)
-	if !ok {
-		t.Fatalf("turn_action frame payload is %T, want turnActionBoundary: %#v", frame, frame)
-	}
-	if boundary.Prefill == nil || *boundary.Prefill != "draft" {
-		t.Fatalf("boundary prefill = %#v, want the prepared nonnil prefill %q", boundary.Prefill, "draft")
-	}
-	if boundary.Warning != "committed sync failure" {
-		t.Fatalf("boundary warning = %q, want the prepared warning", boundary.Warning)
-	}
-	if boundary.State == nil || boundary.State.Session.ID != "A" {
-		t.Fatalf("boundary state = %#v, want the prepared session A", boundary.State)
-	}
-
-	counts := settledFrameCounts(t, log)
-	if n := counts["turn_action"]; n != 1 {
-		t.Fatalf("settled turn_action frames = %d, want exactly one stateful boundary: %#v", n, counts)
-	}
-	assertNoAdjacentErrorFrame(t, counts)
-
-	// Ordinary partial history still resolves as success: its single boundary owns
-	// the warning, and an adjacent direct error would duplicate it.
-	ordinary := &committedHistoryService{}
-	app2 := &App{svc: ordinary}
-	log2 := &wailsFrameLog{}
-	app2.emitFn = log2.append
-	app2.startDelivery()
-	defer app2.closeDelivery()
-	app2.setCurrentSessionID("A")
-	if _, err := app2.ApplyTurnAction(1, agent.TurnActionRevertHistory, false); err != nil {
-		t.Fatalf("ordinary partial history = %v, want success: the emitted frame owns the warning", err)
-	}
-	frame2 := waitForWailsFrame(t, log2, "turn_action")
-	boundary2, ok := frame2.(turnActionBoundary)
-	if !ok {
-		t.Fatalf("turn_action frame payload is %T, want turnActionBoundary: %#v", frame2, frame2)
-	}
-	if boundary2.State == nil || boundary2.State.Session.ID != "A" {
-		t.Fatalf("ordinary partial boundary state = %#v, want the prepared session A", boundary2.State)
-	}
-
-	counts2 := settledFrameCounts(t, log2)
-	if n := counts2["turn_action"]; n != 1 {
-		t.Fatalf("settled turn_action frames = %d, want exactly one stateful boundary: %#v", n, counts2)
-	}
-	assertNoAdjacentErrorFrame(t, counts2)
 }
 
 // TestWailsCodeRevertStaysNoticeOnly proves the desktop keeps its notice-only
@@ -1349,48 +1055,78 @@ func TestWailsCodeRevertStaysNoticeOnly(t *testing.T) {
 	if boundary.State != nil {
 		t.Fatalf("code revert boundary state = %#v, want nil (notice-only, no complete state)", boundary.State)
 	}
-	if boundary.Prefill != nil {
-		t.Fatalf("code revert boundary prefill = %#v, want nil", boundary.Prefill)
-	}
 	if !reflect.DeepEqual(boundary.SkippedFiles, result.SkippedFiles) {
 		t.Fatalf("code revert boundary skipped = %#v, want the result's %#v", boundary.SkippedFiles, result.SkippedFiles)
 	}
 }
 
-// TestWailsHistoryEmptyPrefillIsNonnil proves the producer-side prefill disposition end to end: a history revert whose clicked user message is legitimately empty emits a non-nil EMPTY boundary prefill through the real Agent and Wails delivery — distinct from fork/code-revert's nil (TestWailsCodeRevertStaysNoticeOnly). The frontend event-injection tests only prove consumer application; this exercises the actual producer that builds the pointer.
-func TestWailsHistoryEmptyPrefillIsNonnil(t *testing.T) {
+// TestWailsForgedRevertHistoryFailsWithoutFrame proves the desktop adapter's
+// route for the removed history action fails before any boundary reaches the
+// delivery FIFO: an unknown turn action enqueues no frame at all, so there is
+// nothing for the frontend to settle against — and a precommit failure must not
+// publish state that never changed. The durable session stays intact through it.
+func TestWailsForgedRevertHistoryFailsWithoutFrame(t *testing.T) {
 	ag := newAppTestAgent(t)
 	app := &App{svc: ag, agent: ag}
 	log := &wailsFrameLog{}
 	app.emitFn = log.append
 	app.startup(context.Background())
-	seedAppCompleteTurns(t, ag, 1)
-	// The clicked turn's user message is legitimately empty content.
-	if _, err := ag.AppendUserMessage(""); err != nil {
-		t.Fatalf("append empty user message: %v", err)
+	id := seedAppCompleteTurns(t, ag, 3)
+
+	// Settle every seed-derived delivery first (the last appended turn is the
+	// FIFO tail, so once it has drained nothing from seeding can still land), then
+	// measure what the forged action itself adds: exactly zero frames of any kind.
+	log.mu.Lock()
+	sawLast := false
+	for _, f := range log.frames {
+		if m, ok := f.payload.(map[string]interface{}); ok && f.name == "user_message" && m["content"] == "turn 3" {
+			sawLast = true
+		}
+	}
+	log.mu.Unlock()
+	deadline := time.Now().Add(10 * time.Second)
+	for !sawLast {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for the seed's last user_message frame to drain")
+		}
+		time.Sleep(2 * time.Millisecond)
+		log.mu.Lock()
+		sawLast = false
+		for _, f := range log.frames {
+			if m, ok := f.payload.(map[string]interface{}); ok && f.name == "user_message" && m["content"] == "turn 3" {
+				sawLast = true
+			}
+		}
+		log.mu.Unlock()
+	}
+	time.Sleep(20 * time.Millisecond) // quiesce: near-simultaneous seed frames land before the baseline
+
+	result, err := app.ApplyTurnAction(2, "revert_history", true)
+	if err == nil {
+		t.Fatalf("forged revert_history via ApplyTurnAction succeeded: %#v, want an unknown-action error", result)
+	}
+	if !strings.Contains(err.Error(), "unsupported turn action") {
+		t.Fatalf("error = %q; the Wails boundary must reject it before reaching the owner (whose message says unknown, not unsupported)", err)
 	}
 
-	result, err := app.ApplyTurnAction(2, agent.TurnActionRevertHistory, false)
+	log.mu.Lock()
+	baseline := len(log.frames)
+	log.mu.Unlock()
+	time.Sleep(15 * time.Millisecond) // let any (forbidden) enqueue drain through the drainer
+	log.mu.Lock()
+	n := len(log.frames)
+	frames := append([]wailsTestFrame(nil), log.frames[baseline:]...)
+	log.mu.Unlock()
+	if n != baseline {
+		t.Fatalf("forged action delivered %d frame(s): %#v; nothing of any kind may be published for an unknown action", n-baseline, frames)
+	}
+
+	msgs, err := ag.SessionMessagesFor(id)
 	if err != nil {
-		t.Fatalf("ApplyTurnAction history revert = %v, want success (the boundary owns every notice)", err)
+		t.Fatalf("messages after rejected action: %v", err)
 	}
-	if result.Prefill != "" {
-		t.Fatalf("result prefill = %q, want the empty clicked message", result.Prefill)
-	}
-
-	frame := waitForWailsFrame(t, log, "turn_action")
-	boundary, ok := frame.(turnActionBoundary)
-	if !ok {
-		t.Fatalf("turn_action frame payload is %T, want turnActionBoundary: %#v", frame, boundary)
-	}
-	if boundary.State == nil || boundary.State.Session.ID != result.Session.ID {
-		t.Fatalf("history revert boundary state = %#v, want the reverted session's complete state", boundary.State)
-	}
-	if boundary.Prefill == nil {
-		t.Fatal("empty user message must emit a nonnil prefill pointer (it still clears the composer)")
-	}
-	if *boundary.Prefill != "" {
-		t.Fatalf("boundary prefill = %q, want empty content for an empty clicked message", *boundary.Prefill)
+	if c := userContents(msgs); !equalStrings(c, []string{"turn 1", "turn 2", "turn 3"}) {
+		t.Fatalf("history = %q after a forged history action, want all three turns intact", c)
 	}
 }
 
@@ -1647,19 +1383,19 @@ func (s *stagedLifecycleSvc) NewSessionForProjectPathWithBoundary(_, _ string, e
 	}
 }
 
-func (s *stagedLifecycleSvc) ApplyTurnActionForSessionWithBoundary(_ string, _ int, action string, _ bool, emit func(agent.HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (agent.TurnActionResult, error) {
+func (s *stagedLifecycleSvc) ApplyTurnActionForSessionWithBoundary(_ string, _ int, action string, _ bool, emit func(agent.HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError)) (agent.TurnActionResult, error) {
 	if action != agent.TurnActionFork {
 		panic("staged lifecycle fake received a non-fork turn action; only fork is under test here")
 	}
 	result := agent.TurnActionResult{SessionChanged: true, Session: agent.SessionSummary{ID: s.forkID}}
 	switch {
 	case s.forkErr == nil && s.forkID != "":
-		emit(agent.HydrationState{Session: result.Session}, nil, "", nil, nil)
+		emit(agent.HydrationState{Session: result.Session}, nil, "", nil)
 		return result, nil
 	default:
 		var committed *snapshot.CommittedMutationError
 		if s.forkID != "" && errors.As(s.forkErr, &committed) {
-			emit(agent.HydrationState{Session: result.Session}, nil, "", committed, nil)
+			emit(agent.HydrationState{Session: result.Session}, nil, "", committed)
 			return result, s.forkErr
 		}
 		return agent.TurnActionResult{}, s.forkErr // plain precommit: no callback at all

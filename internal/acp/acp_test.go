@@ -500,51 +500,6 @@ func TestACPRealCommittedNamespaceProducers(t *testing.T) {
 		}
 	})
 
-	t.Run("history", func(t *testing.T) {
-		r, ag, id, sessionsRoot := newRunner(t)
-		lastTurn := 0
-		var err error
-		for _, text := range []string{"one", "two", "three"} {
-			lastTurn, err = ag.AppendUserMessageToSession(id, text)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-		turnsDir := filepath.Join(sessionsRoot, id, "turns")
-		injected := errors.New("injected ACP history sync failure")
-		atomicfs.SyncDirFunc = func(dir string) error {
-			if dir == turnsDir {
-				return injected
-			}
-			return nil
-		}
-		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
-
-		params, err := json.Marshal(turnActionParams{SessionID: id, Turn: lastTurn})
-		if err != nil {
-			t.Fatal(err)
-		}
-		r.handleRevertHistory(Request{JSONRPC: "2.0", ID: "history", Method: "session/revert_history", Params: params})
-		lines := drainedLines(t, r, r.out.(*bytes.Buffer), 2)
-		var response Response
-		if err := json.Unmarshal([]byte(lines[1]), &response); err != nil {
-			t.Fatal(err)
-		}
-		if response.Error == nil || response.Error.Data == nil || !strings.Contains(response.Error.Message, "ACP history sync failure") {
-			t.Fatalf("history response = %q, want typed rejection with prepared result", lines[1])
-		}
-		var result agent.TurnActionResult
-		if err := unmarshalInto(t, response.Error.Data, &result); err != nil || result.Session.ID != id {
-			t.Fatalf("history error data = %#v (%v), want prepared current session", response.Error.Data, err)
-		}
-		if r.sv().Current() != id {
-			t.Fatalf("ACP current after committed history = %q, want %q", r.sv().Current(), id)
-		}
-		if _, err := os.Stat(filepath.Join(turnsDir, fmt.Sprint(lastTurn))); !os.IsNotExist(err) {
-			t.Fatalf("ACP reverted turn = %v, want removed", err)
-		}
-	})
-
 	t.Run("fork", func(t *testing.T) {
 		r, ag, sourceID, sessionsRoot := newRunner(t)
 		turn, err := ag.AppendUserMessageToSession(sourceID, "fork source")
@@ -1406,41 +1361,6 @@ func TestHandleTurnActionACPRevertCodePublishesCompleteBoundaryBeforeResponse(t 
 	}
 }
 
-func TestHandleTurnActionACPRevertHistoryPropagatesAlsoRevertCode(t *testing.T) {
-	a := newACPTestAgent(t)
-	var out bytes.Buffer
-	r := &Runner{agent: a, owner: a, out: &out}
-
-	_ = appendACPUserTurn(t, a, "first")
-	r.setCurrentSessionID(a.SessionCurrent().ID)
-	path := filepath.Join(a.ProjectRoot(), "created.txt")
-	clickedTurn := appendACPUserTurnWithSnapshot(t, a, "create file", path, "created\n")
-	_ = appendACPUserTurn(t, a, "after")
-
-	r.handleRevertHistory(Request{
-		JSONRPC: "2.0",
-		ID:      "revert-history",
-		Params:  json.RawMessage(`{"turn":` + itoa(clickedTurn) + `,"alsoRevertCode":true}`),
-	})
-
-	lines := drainedLines(t, r, &out, 2)
-	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
-	var resp Response
-	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
-		t.Fatalf("response json: %v", err)
-	}
-	result := turnActionResultFromResponse(t, resp)
-	if resp.Error != nil || result.Action != agent.TurnActionRevertHistory || result.TargetTurn != clickedTurn-1 || !result.SessionChanged || result.Prefill != "create file" {
-		t.Fatalf("response/result = %+v %#v, want revert_history result", resp, result)
-	}
-	if got := acpUserMessageContents(result.Messages); !equalStringSlices(got, []string{"first"}) {
-		t.Fatalf("result messages = %q, want truncated history", got)
-	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("created file still exists after history+code revert; stat err=%v", err)
-	}
-}
-
 func TestHandleTurnActionACPForkReturnsResultAndSessionChanged(t *testing.T) {
 	a := newACPTestAgent(t)
 	var out bytes.Buffer
@@ -1518,6 +1438,48 @@ func TestHandleTurnActionACPForkWarningOnFailedCodeRevert(t *testing.T) {
 	}
 	if result.Warning == "" || !strings.Contains(result.Warning, "code revert failed") {
 		t.Fatalf("fork response must carry the failed code revert warning, got %q", result.Warning)
+	}
+}
+
+// TestDispatchRevertHistoryIsMethodNotFound proves the removed history method is
+// rejected by dispatch as a standard JSON-RPC method-not-found error and makes no
+// mutation or boundary: no session_changed notification, no truncated turns, and
+// no code phase — the forged alsoRevertCode flag cannot restore files either. The
+// retained revert_code and fork routes are unaffected (their own tests cover them).
+func TestDispatchRevertHistoryIsMethodNotFound(t *testing.T) {
+	a := newACPTestAgent(t)
+	var out bytes.Buffer
+	r := &Runner{agent: a, owner: a, out: &out}
+
+	_ = appendACPUserTurn(t, a, "first")
+	path := filepath.Join(a.ProjectRoot(), "created.txt")
+	appendACPUserTurnWithSnapshot(t, a, "create file", path, "created\n")
+	r.setCurrentSessionID(a.SessionCurrent().ID)
+
+	r.dispatch(context.Background(), Request{
+		JSONRPC: "2.0",
+		ID:      "revert-history",
+		Method:  "session/revert_history",
+		Params:  json.RawMessage(`{"turn":1,"alsoRevertCode":true}`),
+	})
+
+	lines := drainedLines(t, r, &out, 1)
+	var resp Response
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("response json: %v", err)
+	}
+	if resp.Error == nil || resp.Error.Code != -32601 || !strings.Contains(resp.Error.Message, "session/revert_history") {
+		t.Fatalf("dispatch of session/revert_history = %+v, want method-not-found naming the removed method", resp.Error)
+	}
+	msgs, err := a.SessionMessagesFor(a.SessionCurrent().ID)
+	if err != nil {
+		t.Fatalf("messages after rejected dispatch: %v", err)
+	}
+	if got := acpUserMessageContents(msgs); !equalStringSlices(got, []string{"first", "create file"}) {
+		t.Fatalf("history = %q after a removed-method dispatch, want both turns intact", got)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("created file missing: %v (want untouched — the forged code phase never ran)", err)
 	}
 }
 
@@ -1729,29 +1691,6 @@ func TestACPOrderedDelivery(t *testing.T) {
 				return r, out, func() { r.handleRevertCode(req) }
 			},
 		},
-		{
-			name:          "session_revert_history",
-			emitsBoundary: true,
-			success: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
-				a := newACPTestAgent(t)
-				out := new(bytes.Buffer)
-				r := &Runner{agent: a, owner: a, out: out}
-				appendACPUserTurn(t, a, "first")
-				r.setCurrentSessionID(a.SessionCurrent().ID)
-				path := filepath.Join(a.ProjectRoot(), "created.txt")
-				clicked := appendACPUserTurnWithSnapshot(t, a, "create file", path, "created\n")
-				appendACPUserTurn(t, a, "after")
-				req := Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"turn":` + itoa(clicked) + `,"alsoRevertCode":true}`)}
-				return r, out, func() { r.handleRevertHistory(req) }
-			},
-			fail: func(t *testing.T) (*Runner, *bytes.Buffer, func()) {
-				a := newACPTestAgent(t)
-				out := new(bytes.Buffer)
-				r := &Runner{agent: a, owner: a, out: out}
-				req := Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"session_id":"does-not-exist","turn":1,"alsoRevertCode":true}`)}
-				return r, out, func() { r.handleRevertHistory(req) }
-			},
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name+"/success_boundary_before_response", func(t *testing.T) {
@@ -1788,218 +1727,6 @@ func TestACPOrderedDelivery(t *testing.T) {
 				assertACPBareError(t, lines[0])
 			})
 		}
-	}
-}
-
-// TestACPPartialHistoryErrorCarriesBoundaryData proves the ordered partial
-// history outcome: the walk removes at least one turn, the owner publishes the
-// reconciled state as the boundary first, and the error response then carries
-// the same prepared TurnActionResult as error.data — matching the boundary's
-// session and messages, with the warning and the input prefill. The
-// first-removal precommit sibling stays bare: no durable change means no
-// boundary, no data, and no owner reconciliation.
-func TestACPPartialHistoryErrorCarriesBoundaryData(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("directory permissions do not block writes as root")
-	}
-	t.Run("partial_walk_boundary_before_error_with_data", func(t *testing.T) {
-		a := newACPTestAgent(t)
-		out := new(bytes.Buffer)
-		r := &Runner{agent: a, owner: a, out: out}
-		for _, c := range []string{"turn 1", "turn 2", "turn 3", "turn 4", "turn 5"} {
-			appendACPUserTurn(t, a, c)
-		}
-		r.setCurrentSessionID(a.SessionCurrent().ID)
-		// Reverting to turn 4 removes turns 4 and 5; blocking turn 4 makes the
-		// walk stop there — a partial failure whose history changed.
-		blockACPTurnDir(t, a, 4)
-		req := Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"turn":4}`)}
-		r.handleRevertHistory(req)
-
-		lines := drainedLines(t, r, out, 2)
-		assertACPNotificationMethod(t, lines[0], "agent/session_changed")
-		state := hydrationStateFromParams(t, acpNotificationParams(t, lines[0]))
-		if c := acpUserContents(state.Messages); !acpEqualStrings(c, []string{"turn 1", "turn 2", "turn 3", "turn 4"}) {
-			t.Fatalf("boundary messages = %q, want turns 1-4", c)
-		}
-		var resp Response
-		if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
-			t.Fatalf("response json: %v", err)
-		}
-		if resp.Error == nil || resp.Error.Data == nil {
-			t.Fatalf("error response must carry the prepared result as data: %+v", resp.Error)
-		}
-		dataBytes, err := json.Marshal(resp.Error.Data)
-		if err != nil {
-			t.Fatalf("marshal error data: %v", err)
-		}
-		var data agent.TurnActionResult
-		if err := json.Unmarshal(dataBytes, &data); err != nil {
-			t.Fatalf("unmarshal error data as TurnActionResult: %v", err)
-		}
-		if data.Session.ID != state.Session.ID {
-			t.Fatalf("error data session = %q, want the boundary's %q", data.Session.ID, state.Session.ID)
-		}
-		if c := acpUserContents(data.Messages); !acpEqualStrings(c, []string{"turn 1", "turn 2", "turn 3", "turn 4"}) {
-			t.Fatalf("error data messages = %q, want turns 1-4 matching the boundary", c)
-		}
-		if !strings.Contains(data.Warning, "turn 4") {
-			t.Fatalf("error data warning = %q, want the walk error naming turn 4", data.Warning)
-		}
-		if data.Prefill != "turn 4" {
-			t.Fatalf("error data prefill = %q, want the clicked user message %q", data.Prefill, "turn 4")
-		}
-	})
-
-	t.Run("first_removal_precommit_error_only", func(t *testing.T) {
-		a := newACPTestAgent(t)
-		out := new(bytes.Buffer)
-		r := &Runner{agent: a, owner: a, out: out}
-		for _, c := range []string{"turn 1", "turn 2", "turn 3"} {
-			appendACPUserTurn(t, a, c)
-		}
-		r.setCurrentSessionID(a.SessionCurrent().ID)
-		// Blocking the first removal (turn 3) leaves no durable change: the
-		// outcome is a precommit failure — error only, no boundary, no data.
-		blockACPTurnDir(t, a, 3)
-		req := Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"turn":3}`)}
-		r.handleRevertHistory(req)
-
-		lines := drainedLines(t, r, out, 1)
-		var resp Response
-		if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
-			t.Fatalf("response json: %v", err)
-		}
-		if resp.Error == nil {
-			t.Fatal("first-removal precommit failure must reject")
-		}
-		if resp.Error.Data != nil {
-			t.Fatalf("precommit failure must carry no data, got %#v", resp.Error.Data)
-		}
-	})
-}
-
-func TestACPHighestTurnPartialHistoryCarriesBoundaryData(t *testing.T) {
-	a := newACPTestAgent(t)
-	out := new(bytes.Buffer)
-	r := &Runner{agent: a, owner: a, out: out}
-	for _, content := range []string{"turn 1", "turn 2", "turn 3", "turn 4", "turn 5"} {
-		appendACPUserTurn(t, a, content)
-	}
-	r.setCurrentSessionID(a.SessionCurrent().ID)
-	injected := errors.New("injected ACP highest-turn partial failure")
-	snapshot.RemoveHistoryTurnFunc = func(path string) error {
-		if filepath.Base(path) == "5" {
-			if err := os.Remove(filepath.Join(path, "messages.jsonl")); err != nil {
-				return err
-			}
-		}
-		return injected
-	}
-	t.Cleanup(func() { snapshot.RemoveHistoryTurnFunc = nil })
-
-	r.handleRevertHistory(Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"turn":3}`)})
-	lines := drainedLines(t, r, out, 2)
-	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
-	state := hydrationStateFromParams(t, acpNotificationParams(t, lines[0]))
-	if got := acpUserContents(state.Messages); !acpEqualStrings(got, []string{"turn 1", "turn 2", "turn 3", "turn 4"}) {
-		t.Fatalf("boundary messages = %q, want turns 1-4", got)
-	}
-	var resp Response
-	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
-		t.Fatalf("response json: %v", err)
-	}
-	if resp.Error == nil || resp.Error.Data == nil || !strings.Contains(resp.Error.Message, "highest-turn partial") {
-		t.Fatalf("response = %+v, want structured partial error", resp)
-	}
-}
-
-// blockACPTurnMessages makes one surviving turn's messages file unreadable: the
-// post-walk reload derives the loop from disk, and its first read of a blocked
-// surviving turn fails exactly there while the walk — which only removes turn
-// directories — proceeds normally. The same fixture shape as the owner-level
-// eviction tests use to force a failed reload after a durable history change.
-func blockACPTurnMessages(t *testing.T, a *agent.Agent, turn int) {
-	t.Helper()
-	if os.Geteuid() == 0 {
-		t.Skip("file permissions do not block reads as root")
-	}
-	blocked := filepath.Join(a.Store().Dir(), "turns", strconv.Itoa(turn), "messages.jsonl")
-	if err := os.Chmod(blocked, 0o000); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(blocked, 0o600) })
-}
-
-// TestACPEvictedHistoryCarriesPreparedEvictionOutcome proves the eviction
-// outcome of a history revert whose reload fails after a durable change: the
-// owner publishes the empty replacement state as the boundary first — no live
-// view exists for an evicted unit, so nothing is re-read to build one — and the
-// error response then carries the same prepared TurnActionResult: an empty
-// session (no stale pre-reload summary, messages, or tokens), a warning naming
-// every cause exactly as returned, and the clicked user message's nonnil
-// prefill. The nearest forbidden siblings are data that re-reads state after
-// commit and result fields that outlive the eviction on one side only.
-func TestACPEvictedHistoryCarriesPreparedEvictionOutcome(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("file permissions do not block reads as root")
-	}
-	a := newACPTestAgent(t)
-	out := new(bytes.Buffer)
-	r := &Runner{agent: a, owner: a, out: out}
-	for _, c := range []string{"turn 1", "turn 2", "turn 3"} {
-		appendACPUserTurn(t, a, c)
-	}
-	id := a.SessionCurrent().ID
-	r.setCurrentSessionID(id)
-	// Reverting to turn 3 removes turns above it; blocking the surviving turn's
-	// messages file makes the reload fail after that durable change.
-	blockACPTurnMessages(t, a, 2)
-	req := Request{JSONRPC: "2.0", ID: "revert-history", Params: json.RawMessage(`{"turn":3}`)}
-	r.handleRevertHistory(req)
-
-	lines := drainedLines(t, r, out, 2)
-	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
-	state := hydrationStateFromParams(t, acpNotificationParams(t, lines[0]))
-	if state.Session.ID != "" || len(state.Messages) != 0 {
-		t.Fatalf("eviction boundary = %+v, want the empty replacement state", state)
-	}
-	var resp Response
-	if err := json.Unmarshal([]byte(lines[1]), &resp); err != nil {
-		t.Fatalf("response json: %v", err)
-	}
-	if resp.Error == nil || resp.Error.Data == nil {
-		t.Fatalf("evicted history must reject with the prepared result as data: %+v", resp)
-	}
-	dataBytes, err := json.Marshal(resp.Error.Data)
-	if err != nil {
-		t.Fatalf("marshal error data: %v", err)
-	}
-	var data agent.TurnActionResult
-	if err := json.Unmarshal(dataBytes, &data); err != nil {
-		t.Fatalf("unmarshal error data as TurnActionResult: %v", err)
-	}
-	// The empty replacement state is the same on both sides: no stale pre-build
-	// summary, messages, or tokens survive in either payload.
-	if !reflect.DeepEqual(data.Session, state.Session) || len(data.Messages) != 0 || !reflect.DeepEqual(data.Tokens, state.Tokens) {
-		t.Fatalf("error data = session %+v / %d message rows / tokens %+v, want the boundary's empty replacement", data.Session, len(data.Messages), data.Tokens)
-	}
-	if data.Warning == "" || resp.Error.Message != data.Warning {
-		t.Fatalf("warning mismatch: error message %q vs prepared data warning %q", resp.Error.Message, data.Warning)
-	}
-	if !strings.Contains(resp.Error.Message, "messages.jsonl") {
-		t.Fatalf("error = %q, want the reload's cause naming messages.jsonl", resp.Error.Message)
-	}
-	// The prefill disposition matches what was emitted: this fixture makes the
-	// same unreadable file break the best-effort display read that derives the
-	// clicked message before mutation, so the prepared pointer holds empty
-	// content — and data must carry no other (stale or reconstructed) value.
-	if data.Prefill != "" {
-		t.Fatalf("error data prefill = %q, want the emitted prepared value", data.Prefill)
-	}
-	// The unit is evicted: nothing live resolves under its id any more.
-	if _, err := r.agent.SessionSummaryForSession(id); err == nil {
-		t.Fatal("evicted session still resolves as a summary")
 	}
 }
 
@@ -2785,7 +2512,7 @@ func TestHandleTurnActionACPInvalidParams(t *testing.T) {
 	var out bytes.Buffer
 	r := &Runner{agent: newACPTestAgent(t), out: &out}
 
-	r.handleRevertHistory(Request{JSONRPC: "2.0", ID: "bad", Params: json.RawMessage(`{`)})
+	r.handleSessionFork(Request{JSONRPC: "2.0", ID: "bad", Params: json.RawMessage(`{`)})
 
 	lines := drainedLines(t, r, &out, 1)
 	var resp Response
@@ -4135,114 +3862,6 @@ func TestACPProjectRoutesFollowExplicitPromptTarget(t *testing.T) {
 	}
 }
 
-// TestACPProjectRoutesKeepSessionProjectAfterEviction proves the routing
-// project survives a current-session eviction: a history revert whose
-// post-walk reload fails evicts the session and clears the current id, and the
-// empty-state boundary the eviction publishes through the turn-action callback
-// must clear the id without clearing the project the session was in, so the
-// project-scoped routes keep answering for it.
-func TestACPProjectRoutesKeepSessionProjectAfterEviction(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("file permissions do not block reads as root")
-	}
-	a, home := newACPTestAgentEnv(t, "http://127.0.0.1:9/v1", false)
-	startupID, err := a.NewSession("", "primary")
-	if err != nil {
-		t.Fatalf("NewSession startup: %v", err)
-	}
-	otherRoot := t.TempDir()
-	otherID, err := a.NewSessionForProjectPath(otherRoot, "primary")
-	if err != nil {
-		t.Fatalf("NewSessionForProjectPath: %v", err)
-	}
-	for i := 1; i <= 10; i++ {
-		if _, err := a.AppendUserMessageToSession(otherID, fmt.Sprintf("turn %d", i)); err != nil {
-			t.Fatalf("append turn %d: %v", i, err)
-		}
-	}
-	readme := filepath.Join(otherRoot, "readme.txt")
-	if err := os.WriteFile(readme, []byte("b-content"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	// Route to the other-project session first: opening re-hydrates the loop
-	// from disk, so the blocking below must come after it. Then make the
-	// reload fail after the walk ran: the walk stops at the blocked turn 7
-	// directory, and the reload then fails reading the surviving turn 7's
-	// messages file.
-	out := new(bytes.Buffer)
-	r := &Runner{agent: a, owner: a, out: out}
-	r.setCurrentSessionID(startupID)
-	r.handleSessionSwitch(Request{JSONRPC: "2.0", ID: "sw", Params: json.RawMessage(`{"id":"` + otherID + `"}`)})
-	r.drainForTest()
-	out.Reset()
-
-	proj, err := a.ProjectCurrentForPath(otherRoot)
-	if err != nil {
-		t.Fatalf("ProjectCurrentForPath: %v", err)
-	}
-	sessionDir := filepath.Join(home, ".lightcode", "projects", proj.ID, "sessions", otherID)
-	blockedDir := filepath.Join(sessionDir, "turns", "7")
-	if err := os.Chmod(blockedDir, 0o555); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(blockedDir, 0o700) })
-	blockedMessages := filepath.Join(blockedDir, "messages.jsonl")
-	if err := os.Chmod(blockedMessages, 0o000); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(blockedMessages, 0o600) })
-
-	// The revert walks turns 10..7, stops at the blocked 7, and the reload
-	// failure evicts the session; the eviction boundary carries no session and
-	// clears the current id. The routing project must survive the empty-state
-	// boundary the callback receives.
-	r.handleRevertHistory(Request{JSONRPC: "2.0", ID: "rv", Params: json.RawMessage(`{"turn":6}`)})
-	r.drainForTest()
-	out.Reset()
-	if got, err := r.currentSession(); err == nil {
-		t.Fatalf("routing current after eviction = %q, want cleared", got)
-	}
-
-	// session/list still lists the other project, not the startup one.
-	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "list", Method: "session/list"})
-	gotList := acpSessionListFromResponse(t, drainedLines(t, r, out, 1)[0])
-	wantList, err := a.SessionListForProjectPath(otherRoot, "active")
-	if err != nil {
-		t.Fatalf("SessionListForProjectPath: %v", err)
-	}
-	if len(gotList) != len(wantList) {
-		t.Fatalf("session/list returned %d sessions, want the routed project's %d: %#v", len(gotList), len(wantList), gotList)
-	}
-	for i := range wantList {
-		if gotList[i].ID != wantList[i].ID {
-			t.Fatalf("session/list[%d] = %q, want routed project session %q", i, gotList[i].ID, wantList[i].ID)
-		}
-	}
-	if len(gotList) != 1 || gotList[0].ID != otherID {
-		t.Fatalf("session/list = %#v, want the evicted routed-project session %q", gotList, otherID)
-	}
-	out.Reset()
-
-	// session/new still creates in the other project.
-	r.dispatch(context.Background(), Request{JSONRPC: "2.0", ID: "new", Method: "session/new"})
-	lines := drainedLines(t, r, out, 2)
-	assertACPNotificationMethod(t, lines[0], "agent/session_changed")
-	summary := acpSessionSummaryFromResponse(t, lines[1])
-	if summary.ID == "" {
-		t.Fatal("session/new returned no session")
-	}
-	if summary.ProjectPath != otherRoot {
-		t.Fatalf("session/new created in project %q, want routed project %q", summary.ProjectPath, otherRoot)
-	}
-	out.Reset()
-
-	// file/read still reads from the other project.
-	if got := acpFileReadContent(t, r, out, readme); got != "b-content" {
-		t.Fatalf("file/read after eviction = %q, want %q", got, "b-content")
-	}
-}
-
 // TestACPRefusedPromptKeepsRoutingProject proves the explicit-id precheck does
 // not move the routing project: the project is committed with the id inside
 // submit admission, so a prompt whose submit is refused admission leaves both
@@ -4421,9 +4040,8 @@ func TestACPHandlersUseSharedTurnActionContract(t *testing.T) {
 	}
 
 	wrappers := map[string]string{
-		"func (r *Runner) handleSessionFork(":   "r.handleTurnAction(req, agent.TurnActionFork)",
-		"func (r *Runner) handleRevertCode(":    "r.handleTurnAction(req, agent.TurnActionRevertCode)",
-		"func (r *Runner) handleRevertHistory(": "r.handleTurnAction(req, agent.TurnActionRevertHistory)",
+		"func (r *Runner) handleSessionFork(": "r.handleTurnAction(req, agent.TurnActionFork)",
+		"func (r *Runner) handleRevertCode(":  "r.handleTurnAction(req, agent.TurnActionRevertCode)",
 	}
 	for signature, want := range wrappers {
 		body := extractSourceFunc(t, src, signature)
@@ -6017,18 +5635,18 @@ func (f *acpLifecycleFake) NewSessionForProjectPathWithBoundary(_, _ string, emi
 	return "", f.newErr // plain precommit: no callback at all
 }
 
-func (f *acpLifecycleFake) ApplyTurnActionForSessionWithBoundary(_ string, _ int, action string, _ bool, emit func(agent.HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (agent.TurnActionResult, error) {
+func (f *acpLifecycleFake) ApplyTurnActionForSessionWithBoundary(_ string, _ int, action string, _ bool, emit func(agent.HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError)) (agent.TurnActionResult, error) {
 	if action != agent.TurnActionFork {
 		panic("acp lifecycle fake received a non-fork turn action; only fork is under test here")
 	}
 	var committed *snapshot.CommittedMutationError
 	switch {
 	case f.forkErr == nil && f.forkResult.Session.ID != "":
-		emit(agent.HydrationState{Session: f.forkResult.Session}, nil, "", nil, nil)
+		emit(agent.HydrationState{Session: f.forkResult.Session}, nil, "", nil)
 		return f.forkResult, nil
 	default:
 		if f.forkResult.Session.ID != "" && errors.As(f.forkErr, &committed) {
-			emit(agent.HydrationState{Session: f.forkResult.Session}, nil, "", committed, nil)
+			emit(agent.HydrationState{Session: f.forkResult.Session}, nil, "", committed)
 			return f.forkResult, f.forkErr // the prepared result rides back with its rejection
 		}
 		return agent.TurnActionResult{}, f.forkErr // plain precommit: no callback at all

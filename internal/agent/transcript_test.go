@@ -1755,9 +1755,8 @@ func TestCaptureStateReadsAllLiveClasses(t *testing.T) {
 }
 
 // TestTranscriptCoordinatorSessionErrorRetention verifies session-tagged errors are
-// retained as sequenced display rows, kept across ordinary commits, and disposed
-// per operation: history revert drops errors above its target turn and compaction
-// drops errors through its replaced range.
+// retained as sequenced display rows, kept across ordinary commits, and disposed by
+// compaction dropping the errors through its replaced range.
 func TestTranscriptCoordinatorSessionErrorRetention(t *testing.T) {
 	tr := newTranscript()
 
@@ -1783,15 +1782,6 @@ func TestTranscriptCoordinatorSessionErrorRetention(t *testing.T) {
 	tr.commitLocked(1)
 	if len(tr.retainedErrors) != 1 {
 		t.Fatalf("commit pruned retained error: %#v", tr.retainedErrors)
-	}
-	tr.seqMu.Unlock()
-
-	// History revert to turn 1 drops errors above turn 1, keeps turn 1.
-	tr.seqMu.Lock()
-	tr.appendErrorLocked(Event{Kind: EventError, Error: "later", Turn: 2})
-	tr.dropErrorsAboveTurnLocked(1)
-	if len(tr.retainedErrors) != 1 || tr.retainedErrors[0].turn != 1 {
-		t.Fatalf("history-revert disposition wrong: %#v", tr.retainedErrors)
 	}
 	tr.seqMu.Unlock()
 
@@ -3320,55 +3310,6 @@ func TestPreseedCommittedLaunchNeverRestores(t *testing.T) {
 	}
 	if started.Turn == 0 {
 		t.Fatalf("no committed turn_start in %#v", cap.snapshot())
-	}
-}
-
-// TestTurnBegunAfterRevertRendersOnceThroughHydration proves the committed
-// bound against a reused turn number: after a combined code+history revert the
-// coordinator's committedTurn is lowered to the surviving turn, so a turn
-// begun after the revert that reissued an old number would compare a stale
-// bound against a reused number. The bounded durable read stops at the
-// surviving committed turn, the fresh turn's rows stay in the retained tail,
-// and the hydration capture renders the turn exactly once.
-func TestTurnBegunAfterRevertRendersOnceThroughHydration(t *testing.T) {
-	a := newLiveCatalogBackedTestAgent(t)
-	id := a.SessionCurrent().ID
-
-	// Ten complete turns through the store and the coordinator: the durable
-	// side records turns 1..10 and the coordinator commits each one.
-	for i := 1; i <= 10; i++ {
-		turn := a.store.BeginTurn()
-		a.lp.AppendUserMessage(turn, fmt.Sprintf("turn %d", i))
-		if err := a.store.MarkTurnComplete(turn); err != nil {
-			t.Fatalf("MarkTurnComplete(%d): %v", turn, err)
-		}
-		feedTranscript(a.transcriptForSessionID(id), Event{Kind: EventTurnStart, Turn: turn})
-		feedTranscript(a.transcriptForSessionID(id), Event{Kind: EventTurnEnd, Turn: turn})
-	}
-
-	if _, err := a.ApplyTurnActionForSession(id, 6, TurnActionRevertHistory, true); err != nil {
-		t.Fatalf("ApplyTurnActionForSession revert_history: %v", err)
-	}
-
-	// Begin and persist the next turn, feeding its rows into the coordinator
-	// without a turn end: the completion marker lands on disk while the commit
-	// has not run — the window the committed bound exists for.
-	fresh := a.store.BeginTurn()
-	const content = "fresh turn"
-	a.lp.AppendUserMessage(fresh, content)
-	if err := a.store.MarkTurnComplete(fresh); err != nil {
-		t.Fatalf("MarkTurnComplete(%d): %v", fresh, err)
-	}
-	tr := a.transcriptForSessionID(id)
-	feedTranscript(tr, Event{Kind: EventTurnStart, Turn: fresh})
-	feedTranscript(tr, Event{Kind: EventUserMessageDisplay, Result: content, Turn: fresh})
-
-	hs, err := a.HydrateSession(id)
-	if err != nil {
-		t.Fatalf("HydrateSession: %v", err)
-	}
-	if got := countHydrationContent(hs, content); got != 1 {
-		t.Fatalf("fresh turn rendered %d times through hydration, want exactly once (durable messages = %d, tail rows = %d)", got, len(hs.Messages), len(hs.Tail))
 	}
 }
 

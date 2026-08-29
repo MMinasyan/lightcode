@@ -698,7 +698,7 @@ func TestSessionsUseTheirProjectRoot(t *testing.T) {
 	}
 }
 
-func TestTurnActionsUseSelectedSessionHistory(t *testing.T) {
+func TestTurnActionsUseTargetedSessionHistory(t *testing.T) {
 	home := t.TempDir()
 	firstRoot := t.TempDir()
 	secondRoot := t.TempDir()
@@ -726,15 +726,15 @@ func TestTurnActionsUseSelectedSessionHistory(t *testing.T) {
 	first.ensureRuntime().mu.Lock()
 	first.sessions[secondID] = second.sessions[secondID]
 	first.ensureRuntime().mu.Unlock()
-	result, err := first.ApplyTurnActionForSession(secondID, 2, TurnActionRevertHistory, false)
+	result, err := first.ApplyTurnActionForSession(secondID, 2, TurnActionFork, false)
 	if err != nil {
 		t.Fatalf("ApplyTurnActionForSession second: %v", err)
 	}
-	if result.Prefill != "selected" {
-		t.Fatalf("Prefill = %q, want selected", result.Prefill)
+	if result.Session.ID == "" || result.Session.ID == secondID {
+		t.Fatalf("fork destination = %q, want a new session distinct from source %q", result.Session.ID, secondID)
 	}
-	if got := userContents(result.Messages); !equalStrings(got, []string{"keep"}) {
-		t.Fatalf("result messages = %#v, want keep", got)
+	if got := userContents(result.Messages); !equalStrings(got, []string{"keep", "selected"}) {
+		t.Fatalf("result messages = %#v, want the forked turns [keep selected]", got)
 	}
 	firstMessages, err := first.SessionMessagesFor(firstID)
 	if err != nil {
@@ -1942,9 +1942,6 @@ func TestMutationsRejectDuringTransition(t *testing.T) {
 	}
 	if _, err := a.RevertCodeForSession(id, 0); err == nil {
 		t.Error("RevertCodeForSession should reject during transition")
-	}
-	if _, err := a.ApplyTurnActionForSession(id, 1, TurnActionRevertHistory, false); err == nil {
-		t.Error("ApplyTurnActionForSession should reject during transition")
 	}
 	if err := a.ForkSessionForSession(id, 1); err == nil {
 		t.Error("ForkSessionForSession should reject during transition")

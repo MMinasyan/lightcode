@@ -729,7 +729,6 @@ func (c *CLI) showRevertMenu() error {
 
 	actionItems := []menuItem{
 		{label: "Revert code", detail: "restore files, keep history", selectable: true, extra: "code"},
-		{label: "Revert history", detail: "truncate conversation", selectable: true, extra: "history"},
 		{label: "Fork from here", detail: "new session from this point", selectable: true, extra: "fork"},
 		{label: "Back", selectable: true, extra: "back"},
 	}
@@ -754,30 +753,6 @@ func (c *CLI) showRevertMenu() error {
 			return nil
 		}
 		c.printLine(renderSystemMsg(fmt.Sprintf("  reverted code to before turn %d", turn)))
-		c.printRevertSkipped(result)
-
-	case "history":
-		alsoCode, err := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
-		if err != nil {
-			// The confirmation read failed (the terminal is exiting): abort the
-			// revert rather than performing it as a "no", and hand the error to
-			// the caller so the loop unwinds.
-			return err
-		}
-		result, err := c.agent.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertHistory, alsoCode)
-		if err != nil {
-			c.printLine(renderErrorMsg(err.Error()))
-			c.printRevertSkipped(result)
-			// The owner reconciles the loop to disk after a history revert,
-			// even when the walk stopped partway, so the transcript the user
-			// is looking at is stale; re-render it over the reconciled state.
-			c.refreshSession()
-			return nil
-		}
-		if result.Session.ID != "" {
-			c.setCurrentSessionID(result.Session.ID)
-		}
-		c.refreshSession()
 		c.printRevertSkipped(result)
 
 	case "fork":

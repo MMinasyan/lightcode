@@ -35,7 +35,7 @@
 
   // Revert popover state.
   let showMenu = false;
-  let confirmAction = null; // 'revertcode' | 'reverthistory' | 'fork'
+  let confirmAction = null; // 'revertcode' | 'fork'
 
   $: {
     if (role === 'assistant' && content) {
@@ -65,8 +65,6 @@
     const detail = { turn, content, alsoRevertCode };
     if (confirmAction === 'revertcode') {
       dispatch('revertcode', detail);
-    } else if (confirmAction === 'reverthistory') {
-      dispatch('reverthistory', detail);
     } else if (confirmAction === 'fork') {
       dispatch('fork', detail);
     }
@@ -75,7 +73,6 @@
 
   const labels = {
     revertcode: 'Revert code',
-    reverthistory: 'Revert history',
     fork: 'Fork from here',
   };
 
@@ -107,7 +104,6 @@
       <div class="revert-menu" style={menuStyle}>
         {#if !confirmAction}
           <button class="menu-item" on:click={() => pickAction('revertcode')}>Revert code</button>
-          <button class="menu-item" on:click={() => pickAction('reverthistory')}>Revert history</button>
           <button class="menu-item" on:click={() => pickAction('fork')}>Fork from here</button>
         {:else}
           <div class="confirm-label">{labels[confirmAction]}?</div>

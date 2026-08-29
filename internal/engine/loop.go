@@ -1182,20 +1182,6 @@ func (l *Loop) displayMetadata(ctx context.Context, name, args, result string) m
 // TurnCount returns the number of completed user turns in this session.
 func (l *Loop) TurnCount() int { return len(l.turnBoundaries) }
 
-// TruncateHistory drops every message from turn keepThrough+1 onward.
-func (l *Loop) TruncateHistory(keepThrough int) error {
-	if keepThrough < 0 || keepThrough > len(l.turnBoundaries) {
-		return fmt.Errorf("truncate history: keepThrough %d out of range [0, %d]", keepThrough, len(l.turnBoundaries))
-	}
-	if keepThrough == len(l.turnBoundaries) {
-		return nil
-	}
-	cut := l.turnBoundaries[keepThrough]
-	l.messages = l.messages[:cut]
-	l.turnBoundaries = l.turnBoundaries[:keepThrough]
-	return nil
-}
-
 func truncate(s string, max int) string {
 	flat := strings.ReplaceAll(s, "\n", " ⏎ ")
 	if len(flat) <= max {

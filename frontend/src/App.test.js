@@ -688,18 +688,6 @@ describe('App promise continuation gate table (session + generation)', () => {
       currentAssert: (s) => { expect(s.shown).toBeTruthy(); },
     },
     {
-      name: 'revert-history',
-      newSandbox: () => pathSandbox('ApplyTurnAction'),
-      invoke: () => `(async ${functionBodySource('handleRevertHistory')})({ detail: { turn: 3, alsoRevertCode: false } })`,
-      staleSettle: (s) => s.ApplyTurnActionReject(new Error('revert failed')),
-      staleAssert: (s) => {
-        expect(s.shown).toBeNull();
-        expect(s.prefilled).toBeNull();
-      },
-      currentSettle: (s) => s.ApplyTurnActionReject(new Error('revert failed')),
-      currentAssert: (s) => { expect(s.shown).toBeTruthy(); },
-    },
-    {
       name: 'fork',
       newSandbox: () => pathSandbox('ApplyTurnAction'),
       invoke: () => `(async ${functionBodySource('handleFork')})({ detail: { turn: 3, alsoRevertCode: false } })`,

@@ -63,49 +63,14 @@ func TestEndOfTurnOrderingIncompleteTurnIsHiddenUntilComplete(t *testing.T) {
 	}
 }
 
-func TestRevertHistoryAtomicAgainstBeginTurn(t *testing.T) {
-	store := newTestStore(t)
-	for i := 0; i < 5; i++ {
-		turn := store.BeginTurn()
-		mustAppendMessage(t, store, turn, `{"role":"user","content":"msg"}`)
-		if err := store.MarkTurnComplete(turn); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	done := make(chan error, 2)
-	go func() { _, err := store.RevertHistory(2); done <- err }()
-	go func() {
-		if turn := store.BeginTurn(); turn == 0 {
-			done <- ErrNoSession
-			return
-		}
-		done <- nil
-	}()
-
-	for i := 0; i < 2; i++ {
-		if err := <-done; err != nil {
-			t.Fatal(err)
-		}
-	}
-	turns := readIntDirs(store.turnsDir)
-	validTurns := reflect.DeepEqual(turns, []int{1, 2}) || reflect.DeepEqual(turns, []int{1, 2, 3}) || reflect.DeepEqual(turns, []int{1, 2, 6})
-	if !validTurns {
-		t.Fatalf("turn dirs after concurrent revert/begin = %v, want a serialized state", turns)
-	}
-	if got := store.CurrentTurn(); got != turns[len(turns)-1] {
-		t.Fatalf("CurrentTurn after concurrent revert/begin = %d, want last turn dir %d", got, turns[len(turns)-1])
-	}
-}
-
 // TestRevertNeverReissuesTurnNumber proves a live session never reuses a turn
-// number after a combined revert: RevertHistory removes the turns tree and
-// RevertCode removes the snapshots tree, so the disk maximum drops and
-// allocation from disk alone would reissue a number this session already used.
-// The recorded high-water mark must also survive a later revert whose
-// pre-revert union maximum is below it — a bare assignment would drop the mark
-// and reissue a used number — and must die with the session, so a Store that
-// moves to another session starts allocating from disk again.
+// number after a code rewind removes the snapshot dirs and the message tree is
+// lost on top of it: with both trees below previously used numbers, allocation
+// from disk alone would reissue them. The recorded high-water mark must also
+// survive later rewinds whose pre-rewind union maximum is below it — a bare
+// assignment would drop the mark and reissue a used number — and must die with
+// the session, so a Store that moves to another session starts allocating from
+// disk again.
 func TestRevertNeverReissuesTurnNumber(t *testing.T) {
 	store := newTestStore(t)
 	maxIssued := 0
@@ -115,23 +80,23 @@ func TestRevertNeverReissuesTurnNumber(t *testing.T) {
 			maxIssued = turn
 		}
 	}
-	// Combined revert to turn 5: both trees drop to 5, the disk maximum falls
-	// from 10 to 5.
-	if _, err := store.RevertHistory(5); err != nil {
-		t.Fatal(err)
-	}
-	// A deeper code revert scans a union whose maximum (8) is below the
-	// recorded mark (10); the mark must hold at 10, not drop to 8.
-	if _, err := store.RevertCode(8); err != nil {
-		t.Fatal(err)
-	}
+	// Code rewind to turn 5 removes the snapshot dirs above it, and a lost
+	// message tree on top drops both trees below every issued number.
 	if _, err := store.RevertCode(5); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(store.turnsDir); err != nil {
+		t.Fatal(err)
+	}
+	// A later rewind scans a union whose maximum (3) is below the recorded mark
+	// (10); the mark must hold at 10, not drop to 3.
+	if _, err := store.RevertCode(3); err != nil {
 		t.Fatal(err)
 	}
 
 	next := store.BeginTurn()
 	if next <= maxIssued {
-		t.Fatalf("BeginTurn after both reverts = %d, want a number above every issued turn %d", next, maxIssued)
+		t.Fatalf("BeginTurn after rewind and message-tree loss = %d, want a number above every issued turn %d", next, maxIssued)
 	}
 
 	// The mark is per-session: a Store that moves to another session restarts

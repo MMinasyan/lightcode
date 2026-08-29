@@ -6302,11 +6302,11 @@ func (a *Agent) ApplyTurnActionForSession(sessionID string, turn int, action str
 // no session; its prebuilt complete state is published the same way, and the
 // adapters decide whether to consume it (protocol) or keep a notice-only surface
 // (desktop).
-func (a *Agent) ApplyTurnActionForSessionWithBoundary(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (TurnActionResult, error) {
+func (a *Agent) ApplyTurnActionForSessionWithBoundary(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError)) (TurnActionResult, error) {
 	return a.applyTurnActionResolved(sessionID, turn, action, alsoRevertCode, emit)
 }
 
-func (a *Agent) applyTurnActionResolved(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (TurnActionResult, error) {
+func (a *Agent) applyTurnActionResolved(sessionID string, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError)) (TurnActionResult, error) {
 	defer a.lockLifecycle()()
 	// Post-lifecycleMu admission recheck: a turn action admitted by the host
 	// before close but entering the owner after close refuses here, before
@@ -6331,12 +6331,12 @@ func (a *Agent) applyTurnActionResolved(sessionID string, turn int, action strin
 // boundary under their locks. The code-revert skips and a fork's
 // failed-code-revert warning ride the boundary so the adapter reassembles its
 // combined frame.
-func (a *Agent) emitTurnActionBoundaryLocked(unit *session, result TurnActionResult, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string), committed *snapshot.CommittedMutationError, prefill *string) {
+func (a *Agent) emitTurnActionBoundaryLocked(unit *session, result TurnActionResult, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError), committed *snapshot.CommittedMutationError) {
 	if emit == nil || unit == nil {
 		return
 	}
 	a.captureUnderLocksRTHeld(unit, result.Messages, sessionIDOf(unit), nil, func(cs completeState) {
-		emit(hydrationStateFrom(result.Session, cs), result.SkippedFiles, result.Warning, committed, prefill)
+		emit(hydrationStateFrom(result.Session, cs), result.SkippedFiles, result.Warning, committed)
 	})
 }
 
@@ -6370,16 +6370,14 @@ func (a *Agent) reserveTurnActionUnit(unit *session) (func(), error) {
 	return release, nil
 }
 
-func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (TurnActionResult, error) {
-	// Every turn action — the fork and the two reverts — reserves the unit
+func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError)) (TurnActionResult, error) {
+	// Every turn action — the fork and the code rewind — reserves the unit
 	// across its durable mutation with the same reservation pair the removal
-	// path uses: the unit must not be driveable while its loop state and its
-	// durable history disagree (history truncation), while its files are
-	// mid-restore, or while the fork's staged copy and publication are in
-	// flight. The release (endLiveTransition) is registered before any lock or
-	// I/O, so it runs after every return — success and failure alike — and
-	// re-arms the drainers. A committed eviction leaves the unit inactive, so
-	// the release is a no-op there.
+	// path uses: the unit must not be driveable while its files are mid-restore
+	// or while the fork's staged copy and publication are in flight. The release
+	// (endLiveTransition) is registered before any lock or I/O, so it runs after
+	// every return — success and failure alike — and re-arms the drainers. A
+	// committed eviction leaves the unit inactive, so the release is a no-op there.
 	release, err := a.reserveTurnActionUnit(unit)
 	if err != nil {
 		return TurnActionResult{}, err
@@ -6428,196 +6426,14 @@ func (a *Agent) applyTurnActionForSession(unit *session, turn int, action string
 		result = a.buildTurnActionResult(result, summary, messages, tokens)
 		// A successful code-only revert changes no session; the prebuilt
 		// replacement payload rides the boundary for the protocol consumer.
-		// Fork never sets prefill and neither does a code revert, so the
-		// boundary prefill is nil here.
 		rt := a.ensureRuntime()
 		rt.mu.Lock()
 		a.resetFileTrackerForSession(unit)
-		a.emitTurnActionBoundaryLocked(unit, result, emit, nil, nil)
+		a.emitTurnActionBoundaryLocked(unit, result, emit, nil)
 		rt.mu.Unlock()
-		return result, nil
-
-	case TurnActionRevertHistory:
-		target := turn - 1
-		result.TargetTurn = target
-		// The input prefill is the clicked user message read before the
-		// mutation and never re-read after the walk. History creates a pointer
-		// even for legitimate empty content — an empty prefill still clears
-		// the composer — while fork and code revert pass nil.
-		prefillText := a.userMessageContentForTurnForSession(unit, turn)
-		prefill := &prefillText
-		result.Prefill = prefillText
-		result.SessionChanged = true
-		// The summary and token report are prepared before the mutation: the
-		// revert changes no metadata and no in-memory token state, so the
-		// pre-mutation values are the post-revert values. The messages come
-		// from the mandatory reconciliation read (the reload) below.
-		summary, _, tokens := a.prepareTurnActionResultState(unit)
-		var codeChanged bool
-		var preMutationMessages []DisplayMessage
-		if alsoRevertCode {
-			// The code restore is best-effort and runs first: when it fails,
-			// the history revert does not run and the unit is unchanged, so
-			// the result carries the pre-mutation view — read before the
-			// restore, never after it.
-			_, preMutationMessages, _ = a.prepareTurnActionResultState(unit)
-			revertResult, err := unit.store.RevertCode(target)
-			result.RestoredFiles = revertResult.Restored
-			result.SkippedFiles = revertResult.Skipped
-			if err != nil {
-				return a.buildTurnActionResult(result, summary, preMutationMessages, tokens), err
-			}
-			// Only actually restored files count as a code mutation:
-			// skipped-only results do not mutate files (the snapshot entries
-			// are retained), and the removal of emptied snapshot-turn dirs is
-			// internal bookkeeping that needs no replacement or coordinator
-			// mutation.
-			codeChanged = len(revertResult.Restored) > 0
-		}
-		// One rule, keyed on the reload: the loop must match what the revert
-		// achieved, whatever that was. The walk stops at the first failed
-		// removal, so even a failed walk removed every turn above the one it
-		// stopped at; the loop is therefore re-derived from disk after the
-		// walk, and the pre-walk truncation point tells the queue rule whether
-		// any turn was removed.
-		revertOutcome, revertErr := unit.store.RevertHistory(target)
-		// HistoryChanged is the durable-mutation predicate from the store. The
-		// operational allocation point is kept separately from the visible
-		// endpoint, which is derived from the successful reload below.
-		historyChanged := revertOutcome.HistoryChanged
-		// Zero-operation-mutation failure: when the revert changed nothing
-		// durably — no compaction record removed, no turn removed, and the
-		// optional code phase restored no file (codeChanged) — the error is
-		// the whole outcome regardless of whether a code phase was requested.
-		// It is returned as a precommit failure without a loop reload,
-		// queue/tracker/coordinator mutation, warning, or boundary, and the
-		// existing reservation is released normally. Any durable history
-		// mutation or any actually restored file keeps the reconciled
-		// treatment: the loop must match disk and the boundary must publish
-		// the survivors.
-		if revertErr != nil && !revertOutcome.HistoryStateKnown {
-			return a.evictRevertUnit(unit, result, revertErr, nil, emit, prefill)
-		}
-		if revertErr != nil && !historyChanged && !codeChanged {
-			return result, revertErr
-		}
-		raw, err := a.loadHistoryIntoLoopForSession(unit)
-		if err != nil {
-			// The loop can no longer match disk, so the unit must not stay
-			// live: releasing the reservation would re-arm the drainers over
-			// the mismatched loop, and leaving it set fails unitMutableLocked
-			// forever. Evict instead — the files are untouched and reopening
-			// loads them again. The eviction never releases a still-live
-			// mismatched unit.
-			return a.evictRevertUnit(unit, result, revertErr, err, emit, prefill)
-		}
-		result = a.buildTurnActionResult(result, summary, a.renderCompleteTurns(raw), tokens)
-		// The final section commits the coordinator mutation and publishes the
-		// boundary under rt.mu: clear the queue when history changed, reset
-		// the tracker, lower the committed bound to the surviving turn, prune
-		// retained errors above it, and advance the rewrite epoch exactly once
-		// — every completed or partial revert advances it, even when the
-		// committed bound did not change, so a live capture that raced the
-		// truncation re-reads the durable prefix. committedSeq and curTurn are
-		// left unchanged: retained rows above the new bound carry sequences at
-		// or below the old high-water, so consumers gate them as already
-		// present and they disappear with the replacement.
-		rt := a.ensureRuntime()
-		rt.mu.Lock()
-		// Every reconciled historyChanged outcome invalidates the queue: the
-		// queued input no longer applies once the record was durably removed
-		// or any turn was removed — including a compaction unlink followed by
-		// a sync failure and a record removal followed by a first walk
-		// failure, where no turn was removed but the record is already gone.
-		// Every reconciled historyChanged outcome invalidates the queue: the
-		// queued input no longer applies once the record was durably removed
-		// or any turn was removed — including a compaction unlink followed by
-		// a sync failure and a record removal followed by a first walk
-		// failure, where no turn was removed but the record is already gone.
-		if historyChanged {
-			_, clearedVersion, queueCleared := rt.clearQueueLockedForSession(unit)
-			if queueCleared {
-				a.emitEvent(Event{Kind: EventQueueChanged, SessionID: sessionIDOf(unit), ProjectID: unit.projectID, Queue: emptyQueue(), QueueVersion: clearedVersion})
-			}
-		}
-		a.resetFileTrackerForSession(unit)
-		visibleTurn := highestLoadedTurn(raw)
-		if tr := a.transcriptForSessionID(sessionIDOf(unit)); tr != nil {
-			tr.seqMu.Lock()
-			tr.tail = nil
-			tr.textOpen = false
-			if visibleTurn < tr.committedTurn {
-				tr.committedTurn = visibleTurn
-			}
-			tr.dropErrorsAboveTurnLocked(visibleTurn)
-			tr.rewriteEpoch++
-			tr.seqMu.Unlock()
-		}
-		// A reconciled walk failure still publishes the boundary: the loop is
-		// reconciled, so the capture is over state that matches disk, and the
-		// adapters learn the turns are gone from both. The failure rides the
-		// result and the boundary as a warning.
-		if revertErr != nil {
-			result.Warning = revertErr.Error()
-		}
-		var committed *snapshot.CommittedMutationError
-		if revertErr != nil {
-			_ = errors.As(revertErr, &committed)
-		}
-		a.emitTurnActionBoundaryLocked(unit, result, emit, committed, prefill)
-		rt.mu.Unlock()
-		if revertErr != nil {
-			return result, revertErr
-		}
 		return result, nil
 	}
 	return TurnActionResult{}, fmt.Errorf("unknown turn action %q", action)
-}
-
-// evictRevertUnit evicts a unit whose loop reload failed after a history
-// revert: the loop can no longer match disk, so the unit must not stay live.
-// It detaches the store, clears routing only when the unit was current,
-// unregisters transcript state, clears the unit's queue, emits one
-// error-bearing empty boundary, and returns the reload error joined with the
-// walk error when both exist. The caller holds the reservation; the deferred
-// release no-ops over the detached store, so the mismatched unit is never
-// re-armed.
-func (a *Agent) evictRevertUnit(unit *session, result TurnActionResult, revertErr, reloadErr error, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string), prefill *string) (TurnActionResult, error) {
-	id := sessionIDOf(unit)
-	joined := errors.Join(revertErr, reloadErr)
-	rt := a.ensureRuntime()
-	rt.mu.Lock()
-	if unit == a.session {
-		a.store.Detach()
-		if a.currentSessionID == id {
-			a.currentSessionID = ""
-		}
-		delete(a.sessions, id)
-		rt.unregisterTranscript(id)
-		rt.clearQueueLocked()
-		a.resetCurrentSessionStateLocked()
-	} else {
-		unit.store.Detach()
-		rt.clearQueueLockedForSession(unit)
-		delete(a.sessions, id)
-		rt.unregisterTranscript(id)
-	}
-	rt.mu.Unlock()
-	// One prepared eviction outcome feeds both consumers below and nothing is
-	// re-read after commit: an empty replacement state (the evicted unit has no
-	// live view to hydrate), the skips this operation's code phase produced,
-	// and the joined warning naming every cause. The boundary tuple and the
-	// returned result — which rides error.data for the protocol consumer — are
-	// derived from these same values, so a consumer that saw the empty state
-	// gets an identical payload in the rejection: no stale pre-reload summary,
-	// messages, or tokens survive on either side.
-	state := HydrationState{}
-	result = a.buildTurnActionResult(result, state.Session, nil, state.Tokens)
-	result.Warning = joined.Error()
-	if emit != nil {
-		emit(state, result.SkippedFiles, result.Warning, nil, prefill)
-	}
-	return result, joined
 }
 
 // applyForkTurnAction applies the fork turn action. The caller holds
@@ -6629,7 +6445,7 @@ func (a *Agent) evictRevertUnit(unit *session, result TurnActionResult, revertEr
 // mutates the working tree; it is best-effort against the source store: a
 // revert error keeps the partial result and rides the result and the boundary
 // as a warning rather than failing the already-committed fork.
-func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (TurnActionResult, error) {
+func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool, emit func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError)) (TurnActionResult, error) {
 	result := TurnActionResult{Action: TurnActionFork, Turn: turn}
 	result.TargetTurn = turn
 	result.SessionChanged = true
@@ -6667,7 +6483,7 @@ func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool
 					a.resetFileTrackerForSession(unit)
 				}
 			}
-			a.emitTurnActionBoundaryLocked(candidate, result, emit, committed, nil)
+			a.emitTurnActionBoundaryLocked(candidate, result, emit, committed)
 		}
 		rt.mu.Unlock()
 		if err != nil {
@@ -6718,12 +6534,12 @@ func (a *Agent) applyForkTurnAction(unit *session, turn int, alsoRevertCode bool
 		} else {
 			a.resetFileTrackerForSession(unit)
 		}
-		a.emitTurnActionBoundaryLocked(candidate, result, emit, nil, nil)
+		a.emitTurnActionBoundaryLocked(candidate, result, emit, nil)
 		rt.mu.Unlock()
 		return result, nil
 	}
 	rt.mu.Lock()
-	a.emitTurnActionBoundaryLocked(candidate, result, emit, nil, nil)
+	a.emitTurnActionBoundaryLocked(candidate, result, emit, nil)
 	rt.mu.Unlock()
 	return result, nil
 }
@@ -6739,38 +6555,7 @@ func (a *Agent) buildTurnActionResult(result TurnActionResult, summary SessionSu
 	return result
 }
 
-func highestLoadedTurn(turns []snapshot.TurnMessages) int {
-	highest := 0
-	for _, turn := range turns {
-		if turn.Turn > highest {
-			highest = turn.Turn
-		}
-	}
-	return highest
-}
-
-// prepareTurnActionResultState reads the session summary, the durable display
-// history, and the token report for a turn-action result before the
-// operation's irreversible mutation. The summary and the token report are
-// unchanged across the code/history reverts, so the pre-mutation values are
-// the post-revert values; the messages are the pre-mutation view, used only
-// where the mutation does not change them.
-func (a *Agent) prepareTurnActionResultState(unit *session) (SessionSummary, []DisplayMessage, TokenReport) {
-	summary := sessionSummary(unit)
-	var messages []DisplayMessage
-	if unit != nil && unit.store != nil && unit.store.Active() {
-		messages, _ = a.messagesForFrontendForStore(unit.store, unit.store.SessionID())
-	}
-	var tokens TokenReport
-	if unit != nil {
-		unit.tokensMu.Lock()
-		tokens = a.buildReportForSessionLocked(unit)
-		unit.tokensMu.Unlock()
-	}
-	return summary, messages, tokens
-}
-
-// prepareRevertCodeState reads the session metadata and the durable display history for a code revert before Store.RevertCode mutates anything: the revert changes neither, so the pre-mutation values are the post-revert ones. Unlike the best-effort preparation shared with history, every read failure is returned — complete state must never be built from partial reads, so a failed preparation stays a bare error and no mutation runs.
+// prepareRevertCodeState reads the session metadata and the durable display history for a code revert before Store.RevertCode mutates anything: the revert changes neither, so the pre-mutation values are the post-revert ones. Every read failure is returned — complete state must never be built from partial reads, so a failed preparation stays a bare error and no mutation runs.
 func (a *Agent) prepareRevertCodeState(unit *session) (SessionSummary, []DisplayMessage, TokenReport, error) {
 	meta, err := unit.store.Meta()
 	if err != nil {
@@ -6784,34 +6569,6 @@ func (a *Agent) prepareRevertCodeState(unit *session) (SessionSummary, []Display
 	tokens := a.buildReportForSessionLocked(unit)
 	unit.tokensMu.Unlock()
 	return sessionSummaryFromUnit(unit, meta), messages, tokens, nil
-}
-
-func turnActionVerb(action string) string {
-	switch action {
-	case TurnActionRevertCode, TurnActionRevertHistory:
-		return "revert"
-	case TurnActionFork:
-		return "fork"
-	default:
-		return "apply turn action"
-	}
-}
-
-func (a *Agent) userMessageContentForTurn(turn int) string {
-	return a.userMessageContentForTurnForSession(a.session, turn)
-}
-
-func (a *Agent) userMessageContentForTurnForSession(unit *session, turn int) string {
-	var msgs []DisplayMessage
-	if unit != nil && unit.store != nil && unit.store.Active() {
-		msgs, _ = a.messagesForFrontendForStore(unit.store, unit.store.SessionID())
-	}
-	for _, msg := range msgs {
-		if msg.Type == "user" && msg.Turn == turn {
-			return msg.Content
-		}
-	}
-	return ""
 }
 
 // RevertCode restores the source tree through the direct code-revert

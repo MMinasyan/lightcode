@@ -674,7 +674,7 @@ describe('App ordered presentation boundaries', () => {
     unmount(app);
   });
 
-  it('a partial history revert renders its ordered warning exactly once', async () => {
+  it('a partial fork code-revert renders its ordered warning exactly once', async () => {
     // The reconciled partial revert publishes the ordered turn_action frame
     // (state + warning) first; the direct method settles after it. The
     // changed presentation generation must drop the late rejection — the
@@ -683,18 +683,18 @@ describe('App ordered presentation boundaries', () => {
     backend.ApplyTurnAction = () => new Promise((resolve, reject) => { rejectRevert = reject; });
     const { app, target } = await mountApp();
 
-    // A user row with a turn so the revert affordance is reachable.
+    // A user row with a turn so the fork affordance is reachable.
     fire('navigation', { ...navState(), messages: [{ type: 'user', content: 'hello', turn: 1 }] });
     await tick();
     target.querySelector('.revert-icon').click();
     await settle();
-    [...target.querySelectorAll('.revert-menu .menu-item')].find((b) => b.textContent === 'Revert history').click();
+    [...target.querySelectorAll('.revert-menu .menu-item')].find((b) => b.textContent === 'Fork from here').click();
     await tick();
     target.querySelector('.confirm-btn.yes').click();
     await settle();
 
     fire('turn_action', {
-      state: { ...navState(), session: { id: 's1' } },
+      state: { ...navState(), session: { id: 's2' } },
       skippedFiles: [],
       warning: 'kept 2 files changed outside this session',
     });
@@ -702,8 +702,10 @@ describe('App ordered presentation boundaries', () => {
     rejectRevert(new Error('kept 2 files changed outside this session'));
     await settle();
 
-    // Exactly one error row, and it is the frame's warning: a second renderer
-    // or an ungated promise rejection would duplicate it.
+    // The destination state is applied and exactly one error row remains, the
+    // frame's warning: a second renderer or an ungated promise rejection would
+    // duplicate it.
+    expect(target.querySelector('.label.session').textContent).toBe('s2');
     const errs = [...target.querySelectorAll('.error-msg')];
     expect(errs).toHaveLength(1);
     expect(errs[0].textContent).toContain('kept 2 files changed outside this session');
@@ -712,23 +714,23 @@ describe('App ordered presentation boundaries', () => {
 });
 
 describe('App ordered turn-action outcomes', () => {
-  // revertHistoryBoundary is the ordered turn_action boundary a history revert
-  // publishes: the reverted session's complete state, the input prefill, the
-  // kept-files notice, and the warning, in that order.
-  function revertHistoryBoundary(overrides = {}) {
+  // forkBoundary is the ordered turn_action boundary a fork publishes: the
+  // destination session's complete state, the kept-files notice, and the
+  // failed code revert's warning. The frame carries no composer fields — an
+  // in-progress draft must survive it untouched.
+  function forkBoundary(overrides = {}) {
     return {
-      state: { ...navState(), session: { id: 's1' } },
-      prefill: 'draft text',
+      state: { ...navState(), session: { id: 's2' } },
       skippedFiles: [{ path: 'x.txt', reason: 'outside session' }],
       warning: 'committed sync failure',
       ...overrides,
     };
   }
 
-  // mountRevertInFlight seeds a session with a user row, opens the revert
-  // history confirm flow, and holds the ApplyTurnAction promise unresolved so
-  // the test can drive the boundary and the promise settle in either order.
-  async function mountRevertInFlight() {
+  // mountForkInFlight seeds a session with a user row, opens the fork confirm
+  // flow, and holds the ApplyTurnAction promise unresolved so the test can
+  // drive the boundary and the promise settle in either order.
+  async function mountForkInFlight() {
     let resolveRevert;
     let rejectRevert;
     backend.ApplyTurnAction = () => new Promise((resolve, reject) => {
@@ -740,7 +742,7 @@ describe('App ordered turn-action outcomes', () => {
     await tick();
     target.querySelector('.revert-icon').click();
     await settle();
-    [...target.querySelectorAll('.revert-menu .menu-item')].find((b) => b.textContent === 'Revert history').click();
+    [...target.querySelectorAll('.revert-menu .menu-item')].find((b) => b.textContent === 'Fork from here').click();
     await tick();
     target.querySelector('.confirm-btn.yes').click();
     await settle();
@@ -754,52 +756,11 @@ describe('App ordered turn-action outcomes', () => {
     await tick();
   }
 
-  it('a history revert boundary applies prefill between the snapshot and the notices, never from the promise', async () => {
-    const { app, target, resolveRevert } = await mountRevertInFlight();
-
-    // The promise settles before the ordered boundary delivers: its result
-    // prefill must not be applied — the ordered boundary is the input prefill
-    // authority.
-    resolveRevert({ prefill: 'ignored by promise' });
-    await settle();
-    fire('turn_action', revertHistoryBoundary());
-    await tick();
-
-    expect(target.querySelector('textarea').value).toBe('draft text');
-    // The kept-files notice and the warning follow the state and the prefill
-    // in one ordered frame.
-    const order = [...target.querySelector('.message-list').children].map((el) => el.className);
-    const iUser = order.findIndex((c) => c.includes('message user'));
-    const iSys = order.findIndex((c) => c.includes('system-msg'));
-    const iErr = order.findIndex((c) => c.includes('error-msg'));
-    expect(iUser).toBeGreaterThanOrEqual(0);
-    expect(iSys).toBeGreaterThan(iUser);
-    expect(iErr).toBeGreaterThan(iSys);
-    const errs = [...target.querySelectorAll('.error-msg')];
-    expect(errs).toHaveLength(1);
-    expect(errs[0].textContent).toContain('committed sync failure');
-
-    unmount(app);
-  });
-
-  it('a legitimate empty prefill clears the composer', async () => {
-    const { app, target, resolveRevert } = await mountRevertInFlight();
+  it('an ordered frame without composer fields leaves a typed draft untouched', async () => {
+    const { app, target, resolveRevert } = await mountForkInFlight();
     await setDraftText(target, 'typed draft');
 
-    fire('turn_action', revertHistoryBoundary({ prefill: '' }));
-    await tick();
-    expect(target.querySelector('textarea').value).toBe('');
-
-    resolveRevert({});
-    await settle();
-    unmount(app);
-  });
-
-  it('a nil prefill (fork or code revert) leaves the composer untouched', async () => {
-    const { app, target, resolveRevert } = await mountRevertInFlight();
-    await setDraftText(target, 'typed draft');
-
-    fire('turn_action', { state: { ...navState(), session: { id: 's2' } }, skippedFiles: [] });
+    fire('turn_action', forkBoundary());
     await tick();
     expect(target.querySelector('textarea').value).toBe('typed draft');
 
@@ -808,15 +769,15 @@ describe('App ordered turn-action outcomes', () => {
     unmount(app);
   });
 
-  it('typed committed history settles to one warning when the boundary arrives first', async () => {
-    const { app, target, rejectRevert } = await mountRevertInFlight();
+  it('committed code-revert settles to one warning when the boundary arrives first', async () => {
+    const { app, target, rejectRevert } = await mountForkInFlight();
 
-    fire('turn_action', revertHistoryBoundary());
+    fire('turn_action', forkBoundary());
     await tick();
     rejectRevert(new Error('committed sync failure'));
     await settle();
 
-    expect(target.querySelector('textarea').value).toBe('draft text');
+    expect(target.querySelector('.label.session').textContent).toBe('s2');
     const errs = [...target.querySelectorAll('.error-msg')];
     expect(errs).toHaveLength(1);
     expect(errs[0].textContent).toContain('committed sync failure');
@@ -824,17 +785,17 @@ describe('App ordered turn-action outcomes', () => {
     unmount(app);
   });
 
-  it('typed committed history settles to one warning when the rejection arrives first', async () => {
-    const { app, target, rejectRevert } = await mountRevertInFlight();
+  it('committed code-revert settles to one warning when the rejection arrives first', async () => {
+    const { app, target, rejectRevert } = await mountForkInFlight();
 
     rejectRevert(new Error('committed sync failure'));
     await settle();
-    fire('turn_action', revertHistoryBoundary());
+    fire('turn_action', forkBoundary());
     await tick();
 
     // The transient rejection error was replaced by the stateful boundary:
-    // exactly one warning remains, with the prefill applied.
-    expect(target.querySelector('textarea').value).toBe('draft text');
+    // exactly one warning remains.
+    expect(target.querySelector('.label.session').textContent).toBe('s2');
     const errs = [...target.querySelectorAll('.error-msg')];
     expect(errs).toHaveLength(1);
     expect(errs[0].textContent).toContain('committed sync failure');
@@ -842,8 +803,8 @@ describe('App ordered turn-action outcomes', () => {
     unmount(app);
   });
 
-  it('an unrelated navigation between the rejection and the revert boundary stays deterministic', async () => {
-    const { app, target, rejectRevert } = await mountRevertInFlight();
+  it('an unrelated navigation between the rejection and the fork boundary stays deterministic', async () => {
+    const { app, target, rejectRevert } = await mountForkInFlight();
 
     // The unrelated navigation lands first: its generation advance suppresses
     // the stale rejection on B...
@@ -854,15 +815,35 @@ describe('App ordered turn-action outcomes', () => {
     expect(target.querySelector('.label.session').textContent).toBe('B');
     expect(target.querySelector('.error-msg')).toBeNull();
 
-    // ...and the revert boundary still applies when delivered, as the ordered
-    // authority over the reverted session.
-    fire('turn_action', revertHistoryBoundary());
+    // ...and the fork boundary still applies when delivered, as the ordered
+    // authority over the destination session.
+    fire('turn_action', forkBoundary());
     await tick();
-    expect(target.querySelector('.label.session').textContent).toBe('s1');
-    expect(target.querySelector('textarea').value).toBe('draft text');
+    expect(target.querySelector('.label.session').textContent).toBe('s2');
     const errs = [...target.querySelectorAll('.error-msg')];
     expect(errs).toHaveLength(1);
     expect(errs[0].textContent).toContain('committed sync failure');
+
+    unmount(app);
+  });
+});
+
+// The mounted popover is the user-facing surface of every turn action: it must
+// offer exactly the retained operations (code rewind and fork) on a user row,
+// with no history option left behind.
+describe('Message revert popover offers only retained actions', () => {
+  it('offers code rewind and fork, never a removed history entry point', async () => {
+    const { app, target } = await mountApp();
+
+    fire('navigation', { ...navState(), messages: [{ type: 'user', content: 'hello', turn: 1 }] });
+    await tick();
+    target.querySelector('.revert-icon').click();
+    await settle();
+
+    const items = [...target.querySelectorAll('.revert-menu .menu-item')].map((b) => b.textContent);
+    expect(items).toContain('Revert code');
+    expect(items).toContain('Fork from here');
+    expect(items).not.toContain('Revert history');
 
     unmount(app);
   });

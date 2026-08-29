@@ -75,8 +75,6 @@ export function RespondPermission(arg1:string,arg2:string,arg3:string):Promise<v
 
 export function RevertCode(arg1:number):Promise<snapshot.RevertResult>;
 
-export function RevertHistory(arg1:number):Promise<void>;
-
 export function SaveModel(arg1:string,arg2:string,arg3:agent.ModelConfigInput):Promise<void>;
 
 export function SaveProjectPermission(arg1:string,arg2:string,arg3:Array<string>):Promise<void>;

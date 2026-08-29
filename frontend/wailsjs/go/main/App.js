@@ -142,10 +142,6 @@ export function RevertCode(arg1) {
   return window['go']['main']['App']['RevertCode'](arg1);
 }
 
-export function RevertHistory(arg1) {
-  return window['go']['main']['App']['RevertHistory'](arg1);
-}
-
 export function SaveModel(arg1, arg2, arg3) {
   return window['go']['main']['App']['SaveModel'](arg1, arg2, arg3);
 }

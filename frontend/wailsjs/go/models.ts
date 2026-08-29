@@ -1051,7 +1051,6 @@ export namespace agent {
 	    turn: number;
 	    targetTurn: number;
 	    sessionChanged: boolean;
-	    prefill?: string;
 	    warning?: string;
 	    restoredFiles?: string[];
 	    skippedFiles?: snapshot.SkippedRevert[];
@@ -1069,7 +1068,6 @@ export namespace agent {
 	        this.turn = source["turn"];
 	        this.targetTurn = source["targetTurn"];
 	        this.sessionChanged = source["sessionChanged"];
-	        this.prefill = source["prefill"];
 	        this.warning = source["warning"];
 	        this.restoredFiles = source["restoredFiles"];
 	        this.skippedFiles = this.convertValues(source["skippedFiles"], snapshot.SkippedRevert);

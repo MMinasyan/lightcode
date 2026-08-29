@@ -245,12 +245,6 @@ func (t *transcript) appendErrorLocked(ev Event) int {
 	return seq
 }
 
-// dropErrorsAboveTurnLocked removes retained errors for turns above target. It is
-// the history-revert disposition: errors at or below the revert target survive.
-func (t *transcript) dropErrorsAboveTurnLocked(target int) {
-	t.retainedErrors = filterErrors(t.retainedErrors, func(e errorRow) bool { return e.turn <= target })
-}
-
 // dropErrorsThroughTurnLocked removes retained errors for turns at or below
 // through. It is the compaction disposition: errors in the transcript range the
 // compacted record replaces are removed. An error carrying no turn attribution

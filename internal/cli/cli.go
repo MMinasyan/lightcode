@@ -1946,7 +1946,7 @@ func (c *CLI) cmdHelp() {
 	c.printLine("  /project       switch project")
 	c.printLine("  /new           start new session")
 	c.printLine("  /resume [id]   resume session")
-	c.printLine("  /revert        revert code/history/fork")
+	c.printLine("  /revert        revert code/fork")
 	c.printLine("  /fork          same as /revert")
 	c.printLine("  /context       show token usage")
 	c.printLine("  /compact       compact context")

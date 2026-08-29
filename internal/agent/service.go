@@ -78,7 +78,7 @@ type AdapterService interface {
 	SessionDelete(string) error
 	SessionMessagesFor(string) ([]DisplayMessage, error)
 	ApplyTurnActionForSession(string, int, string, bool) (TurnActionResult, error)
-	ApplyTurnActionForSessionWithBoundary(string, int, string, bool, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError, *string)) (TurnActionResult, error)
+	ApplyTurnActionForSessionWithBoundary(string, int, string, bool, func(HydrationState, []snapshot.SkippedRevert, string, *snapshot.CommittedMutationError)) (TurnActionResult, error)
 	RevertCodeForSession(string, int) (snapshot.RevertResult, error)
 	SnapshotListForSession(string) ([]Snapshot, error)
 

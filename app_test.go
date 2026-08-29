@@ -536,60 +536,6 @@ func TestWailsForkCurrent(t *testing.T) {
 	}
 }
 
-// TestWailsRevertHistoryTruncatesLikeApplyTurnAction proves the bound
-// App.RevertHistory route and the adapter-neutral App.ApplyTurnAction route are
-// the same revert implementation: given the same turn argument, both must leave
-// the same durable history. The bound route previously truncated one turn
-// higher than the turn-action route.
-func TestWailsRevertHistoryTruncatesLikeApplyTurnAction(t *testing.T) {
-	svc := newAppTestAgent(t)
-	app := newTestApp(svc)
-
-	seed := func() (string, int) {
-		id, err := svc.NewSession("", "primary")
-		if err != nil {
-			t.Fatalf("NewSession: %v", err)
-		}
-		var last int
-		for _, content := range []string{"one", "two", "three", "four"} {
-			last, err = svc.AppendUserMessageToSession(id, content)
-			if err != nil {
-				t.Fatalf("append %q: %v", content, err)
-			}
-		}
-		return id, last
-	}
-
-	boundID, boundTurn := seed()
-	actionID, actionTurn := seed()
-
-	app.setCurrentSessionID(boundID)
-	if err := app.RevertHistory(boundTurn); err != nil {
-		t.Fatalf("App.RevertHistory(%d): %v", boundTurn, err)
-	}
-	app.setCurrentSessionID(actionID)
-	if _, err := app.ApplyTurnAction(actionTurn, agent.TurnActionRevertHistory, false); err != nil {
-		t.Fatalf("App.ApplyTurnAction(%d, revert_history): %v", actionTurn, err)
-	}
-
-	bound, err := svc.SessionMessagesFor(boundID)
-	if err != nil {
-		t.Fatalf("SessionMessagesFor(bound): %v", err)
-	}
-	action, err := svc.SessionMessagesFor(actionID)
-	if err != nil {
-		t.Fatalf("SessionMessagesFor(action): %v", err)
-	}
-	got, want := userContents(bound), userContents(action)
-	if !equalStrings(got, want) {
-		t.Fatalf("App.RevertHistory(%d) left %q, App.ApplyTurnAction(%d) left %q; both must truncate to the same turn", boundTurn, got, actionTurn, want)
-	}
-	// The surviving semantic is turn-1: the given turn is the first one removed.
-	if expected := []string{"one", "two", "three"}; !equalStrings(want, expected) {
-		t.Fatalf("both routes left %q, want %q (given turn %d is the first removed)", want, expected, actionTurn)
-	}
-}
-
 func TestWailsSwitchKeepsCurrent(t *testing.T) {
 	svc := newAppTestAgent(t)
 	firstID, err := svc.NewSession("", "primary")

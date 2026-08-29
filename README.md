@@ -35,7 +35,7 @@ Lightcode uses the OpenAI Chat Completions shape with streaming and tool calls. 
 
 **Tools** — `read_file` · `write_file` · `edit_file` · `apply_patch` · `run_command` · `process` · `sleep` · `diagnostics` · `workspace_symbol` · `task`
 
-**Snapshots** — Every file edit is snapshotted by turn. Revert code, revert history, or fork from any point. Copy-based, no git dependency.
+**Snapshots** — Every file edit is snapshotted by turn. Revert code or fork from any point. Copy-based, no git dependency.
 
 **Permissions** — Glob-based allow/deny/ask rules at global and per-project levels. No bypass, no subagent escapes.
 
@@ -178,7 +178,7 @@ Useful CLI commands:
 - `/model` — switch model
 - `/session` — list or switch sessions
 - `/project` — switch project
-- `/revert` — revert code, revert history, or fork
+- `/revert` — revert code at the selected turn or fork from it
 - `/fork` — open the fork/revert menu
 - `/context` — show token usage
 - `/compact` — compact context now

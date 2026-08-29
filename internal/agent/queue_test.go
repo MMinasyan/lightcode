@@ -403,24 +403,6 @@ func TestSessionSwitchClearsQueueAndBumpsVersionMonotonically(t *testing.T) {
 }
 
 func TestApplyTurnActionSessionChangesClearQueueAndBumpVersionMonotonically(t *testing.T) {
-	t.Run("revert_history", func(t *testing.T) {
-		a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
-		cap := &eventCapture{}
-		_ = startEventOrderAgent(t, a, cap)
-		appendUserTurn(t, a, "turn one")
-		appendUserTurn(t, a, "turn two")
-
-		seedQueue(t, a, 20, "stale after revert")
-		res, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, 2, TurnActionRevertHistory, false)
-		if err != nil {
-			t.Fatalf("ApplyTurnActionForSession revert_history: %v", err)
-		}
-		if !res.SessionChanged {
-			t.Fatalf("revert_history result = %#v, want SessionChanged", res)
-		}
-		assertQueueClearedAfterVersion(t, a, cap, 20)
-	})
-
 	t.Run("fork", func(t *testing.T) {
 		a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
 		cap := &eventCapture{}
@@ -441,21 +423,7 @@ func TestApplyTurnActionSessionChangesClearQueueAndBumpVersionMonotonically(t *t
 	})
 }
 
-func TestDirectRevertAndForkClearQueueAndBumpVersionMonotonically(t *testing.T) {
-	t.Run("revert_history", func(t *testing.T) {
-		a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
-		cap := &eventCapture{}
-		_ = startEventOrderAgent(t, a, cap)
-		appendUserTurn(t, a, "turn one")
-		appendUserTurn(t, a, "turn two")
-
-		seedQueue(t, a, 40, "stale after direct revert")
-		if _, err := a.ApplyTurnActionForSession(a.SessionCurrent().ID, 2, TurnActionRevertHistory, false); err != nil {
-			t.Fatalf("ApplyTurnActionForSession revert_history: %v", err)
-		}
-		assertQueueClearedAfterVersion(t, a, cap, 40)
-	})
-
+func TestDirectForkClearsQueueAndBumpsVersionMonotonically(t *testing.T) {
 	t.Run("fork", func(t *testing.T) {
 		a := newEventOrderAgent(t, "http://127.0.0.1:9/v1")
 		cap := &eventCapture{}
