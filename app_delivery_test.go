@@ -917,11 +917,8 @@ func TestWailsOrderedDeliveryContract(t *testing.T) {
 // turn_action boundary frame it emits carries the warning: the adapter's
 // mapping from the boundary callback onto the frame is the link between the
 // owner's emit and the frontend's render, and losing it would drop the warning
-// on the desktop while the agent and frontend tests still pass. It also pins
-// the producer prefill semantics for fork at this layer: a real fork emits no
-// composer draft (Prefill == nil), unlike history revert whose ordered frame
-// carries its nonnil prepared prefill — direct event injection alone cannot
-// prove what the owner actually puts on the wire here.
+// on the desktop while the agent and frontend tests still pass. Direct event
+// injection alone cannot prove what the owner actually puts on the wire here.
 func TestWailsTurnActionFrameCarriesFailedRevertWarning(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("directory permissions do not block writes as root")
@@ -2219,17 +2216,6 @@ func countFramesLocked(log *wailsFrameLog) map[string]int {
 		counts[f.name]++
 	}
 	return counts
-}
-
-// assertNoAdjacentErrorFrame fails when the settled frame set carries any Wails
-// error frame next to a turn-action boundary: for history and fork outcomes the
-// ordered boundary owns every warning, so an adjacent error frame would make
-// both frontend schedules render it twice.
-func assertNoAdjacentErrorFrame(t *testing.T, counts map[string]int) {
-	t.Helper()
-	if n := counts["error"]; n != 0 {
-		t.Fatalf("settled frames carry %d \"error\" frame(s), want none: the ordered boundary owns its warning %#v", n, counts)
-	}
 }
 
 // wailsPermissionPendingApp wires a Wails app whose first turn asks a read_file

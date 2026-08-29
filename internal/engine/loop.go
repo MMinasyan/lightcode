@@ -226,11 +226,6 @@ type Loop struct {
 	contextTransformer ContextTransformer
 	usageRecorder      UsageRecorder
 
-	// turnBoundaries records the index of each user message in
-	// l.messages as it is appended. turnBoundaries[i] is the index of
-	// turn (i+1)'s user message.
-	turnBoundaries []int
-
 	// store is the persistence backing for messages + turn state.
 	// Tool calls and assistant messages are persisted to whichever
 	// session the store currently holds. May be nil for tests.
@@ -459,13 +454,12 @@ func (l *Loop) UpdateSystemPrompt(content string) {
 // AppendUserMessage adds a user message to the conversation and persists
 // it under the given turn. Does not run the model.
 func (l *Loop) AppendUserMessage(turn int, content string) {
-	l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
 	l.persistAndEmitUserMessage(turn, content)
 }
 
 // persistAndEmitUserMessage is the single chokepoint for appending a user-role
 // message into history: it appends to l.messages, persists to the store, and
-// emits a UserMessageDisplay event. Callers own turnBoundaries.
+// emits a UserMessageDisplay event.
 func (l *Loop) persistAndEmitUserMessage(turn int, content string) {
 	l.persistUserMessage(turn, content)
 	l.emitUserMessageDisplay(turn, content)
@@ -520,7 +514,8 @@ func (l *Loop) HasPendingSignal() bool {
 }
 
 // DrainPendingSignalsForModel appends pending system signals to history so the
-// next model request sees them. Signals do not create turn boundaries.
+// next model request sees them. Drained signals are appended into the current
+// turn; they never start a user turn of their own.
 func (l *Loop) DrainPendingSignalsForModel(turn int) {
 	l.signalMu.Lock()
 	signals := append([]PendingSignal(nil), l.pendingSignals...)
@@ -591,19 +586,17 @@ func (l *Loop) resetHistory(clearSignals bool) {
 	} else {
 		l.messages = nil
 	}
-	l.turnBoundaries = nil
 }
 
-// ResetHistory drops all messages and turn boundaries, leaving only
-// the system prompt. Used when switching sessions.
+// ResetHistory drops all messages, leaving only the system prompt. Used when
+// switching sessions.
 func (l *Loop) ResetHistory() {
 	l.resetHistory(true)
 }
 
-// LoadHistory restores a conversation from persisted turns. Each
-// turn's messages are appended in order. The first message of each
-// turn is assumed to be the user message (defines the turn boundary).
-// The existing system prompt is preserved.
+// LoadHistory restores a conversation from persisted turns. Each turn's
+// messages are appended in order after the preserved system prompt; empty
+// turns are skipped.
 func (l *Loop) LoadHistory(turns [][]message.Message) {
 	l.ResetHistory()
 	for _, turn := range turns {
@@ -611,7 +604,6 @@ func (l *Loop) LoadHistory(turns [][]message.Message) {
 		if len(turn) == 0 {
 			continue
 		}
-		l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
 		l.messages = append(l.messages, turn...)
 	}
 }
@@ -640,7 +632,6 @@ func (l *Loop) loadHistoryWithSummary(summary string, summarizer coremodel.Model
 		if len(turn) == 0 {
 			continue
 		}
-		l.turnBoundaries = append(l.turnBoundaries, len(l.messages))
 		l.messages = append(l.messages, turn...)
 	}
 }
@@ -658,10 +649,7 @@ func (l *Loop) LoadHistoryWithSummaryAndActiveTail(summary string, summarizer co
 	tail := append([]message.Message(nil), l.messages[activeTurnStart:]...)
 	l.loadHistoryWithSummary(summary, summarizer, nil, false)
 	newActiveTurnStart := len(l.messages)
-	if len(tail) > 0 {
-		l.turnBoundaries = append(l.turnBoundaries, newActiveTurnStart)
-		l.messages = append(l.messages, tail...)
-	}
+	l.messages = append(l.messages, tail...)
 	return newActiveTurnStart
 }
 
@@ -696,7 +684,6 @@ func (l *Loop) Run(ctx context.Context, userInputs ...string) (string, error) {
 	}
 
 	activeTurnStart := len(l.messages)
-	l.turnBoundaries = append(l.turnBoundaries, activeTurnStart)
 	l.DrainPendingSignalsForModel(turn)
 	for _, input := range userInputs {
 		l.persistUserMessage(turn, input)
@@ -1178,9 +1165,6 @@ func (l *Loop) displayMetadata(ctx context.Context, name, args, result string) m
 	}
 	return provider.DisplayMetadata(ctx, json.RawMessage(args), result)
 }
-
-// TurnCount returns the number of completed user turns in this session.
-func (l *Loop) TurnCount() int { return len(l.turnBoundaries) }
 
 func truncate(s string, max int) string {
 	flat := strings.ReplaceAll(s, "\n", " ⏎ ")

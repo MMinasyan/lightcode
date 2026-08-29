@@ -4227,21 +4227,6 @@ func appendACPUserTurnWithSnapshot(t *testing.T, a *agent.Agent, content, path, 
 	return turn
 }
 
-// blockACPTurnDir makes one message turn directory's removal fail: an
-// unwritable directory blocks os.RemoveAll exactly there, so the descending
-// history walk stops at it.
-func blockACPTurnDir(t *testing.T, a *agent.Agent, turn int) {
-	t.Helper()
-	if os.Geteuid() == 0 {
-		t.Skip("directory permissions do not block writes as root")
-	}
-	blocked := filepath.Join(a.Store().Dir(), "turns", strconv.Itoa(turn))
-	if err := os.Chmod(blocked, 0o555); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(blocked, 0o700) })
-}
-
 // blockACPSnapshotTurnDir makes one snapshot turn directory's removal fail, so
 // RevertCode's descending walk stops exactly there.
 func blockACPSnapshotTurnDir(t *testing.T, a *agent.Agent, turn int) {
@@ -4441,30 +4426,6 @@ func acpNotificationParams(t *testing.T, line string) any {
 		t.Fatalf("notification json: %v", err)
 	}
 	return notif.Params
-}
-
-// acpUserContents lists the display user-message contents in order.
-func acpUserContents(messages []agent.DisplayMessage) []string {
-	var out []string
-	for _, m := range messages {
-		if m.Type == "user" {
-			out = append(out, m.Content)
-		}
-	}
-	return out
-}
-
-// acpEqualStrings reports whether two string slices are equal in order.
-func acpEqualStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func turnActionResultFromResponse(t *testing.T, resp Response) agent.TurnActionResult {

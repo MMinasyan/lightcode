@@ -434,67 +434,6 @@ func assertCurrentRemovalFailureIntact(t *testing.T, a *Agent, id string, proj *
 	}
 }
 
-// assertCurrentRevertFailureIntact asserts that a failed current-session
-// revert left the unit live, claimed, selected and consistent: the durable
-// history is truncated only as far as the walk reached (all but the last
-// contents), the loop was reloaded to match it, and the transitioning
-// reservation is released so the unit is driveable again.
-func assertCurrentRevertFailureIntact(t *testing.T, a *Agent, id string, proj *project.Project, loopContents []string) {
-	t.Helper()
-	rt := a.ensureRuntime()
-	rt.mu.Lock()
-	unit := a.sessions[id]
-	if unit == nil {
-		rt.mu.Unlock()
-		t.Fatal("failed revert evicted the current session from the live map")
-	}
-	transitioning := unit.transitioning
-	queueLen := len(unit.queue)
-	loopMsgs := len(unit.lp.Messages())
-	current := a.currentSessionID
-	rt.mu.Unlock()
-	if unit.store == nil || !unit.store.Active() {
-		t.Fatal("failed revert detached the current session's store")
-	}
-	if unit.store.SessionID() != id {
-		t.Fatalf("store session id = %q, want %q", unit.store.SessionID(), id)
-	}
-	if current != id {
-		t.Fatalf("currentSessionID = %q, want %q", current, id)
-	}
-	if got := a.SessionCurrent().ID; got != id {
-		t.Fatalf("SessionCurrent = %q, want %q", got, id)
-	}
-	if transitioning {
-		t.Fatal("transitioning reservation not released after failed revert")
-	}
-	if queueLen != 0 {
-		t.Fatalf("queue length after failed revert = %d, want 0", queueLen)
-	}
-	if loopMsgs != len(loopContents) {
-		t.Fatalf("loop message count = %d, want %d (system prompt + %d surviving user turns; the loop was reloaded to match disk)", loopMsgs, len(loopContents), len(loopContents)-1)
-	}
-	msgs, err := a.SessionMessagesFor(id)
-	if err != nil {
-		t.Fatalf("messages for %q: %v", id, err)
-	}
-	if got := userContents(msgs); !equalStrings(got, loopContents[:len(loopContents)-1]) {
-		t.Fatalf("durable messages after failed revert = %q, want the surviving turns 1..%d %q", got, len(loopContents)-1, loopContents[:len(loopContents)-1])
-	}
-	if err := unitMutableLocked(unit); err != nil {
-		t.Fatalf("unit not driveable after failed revert: %v", err)
-	}
-	// The live store still holds the session's claim.
-	claim, ok, err := snapshot.AcquireSessionClaim(a.projects.Root(), proj.ID, id)
-	if err != nil {
-		t.Fatalf("claim check: %v", err)
-	}
-	if ok {
-		_ = claim.Release()
-		t.Fatal("claim released by the failed revert; another process could drive the session")
-	}
-}
-
 // assertNonCurrentRemovalFailureIntact asserts that a failed non-current
 // removal left the target unit live, claimed and queued, the current selection
 // unchanged, and the transitioning reservation released.

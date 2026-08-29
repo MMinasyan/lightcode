@@ -5198,7 +5198,7 @@ func TestCLIRealCommittedNamespaceProducers(t *testing.T) {
 		}
 	})
 
-	seed := func(t *testing.T) (*CLI, string, string, int) {
+	seed := func(t *testing.T) (*CLI, string, string, int, *agent.Agent) {
 		t.Helper()
 		ag, _ := newTestAgent(t)
 		id, err := ag.NewSession("", "primary")
@@ -5219,11 +5219,11 @@ func TestCLIRealCommittedNamespaceProducers(t *testing.T) {
 		c := New(ag)
 		c.out = new(bytes.Buffer)
 		c.setCurrentSessionID(id)
-		return c, id, ag.Projects().SessionsRoot(project.ID), lastTurn
+		return c, id, ag.Projects().SessionsRoot(project.ID), lastTurn, ag
 	}
 
 	t.Run("fork", func(t *testing.T) {
-		c, sourceID, sessionsRoot, _ := seed(t)
+		c, sourceID, sessionsRoot, _, _ := seed(t)
 		injected := errors.New("injected CLI fork sync failure")
 		atomicfs.SyncDirFunc = func(dir string) error {
 			if dir == sessionsRoot {
@@ -5251,6 +5251,85 @@ func TestCLIRealCommittedNamespaceProducers(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(sessionsRoot, destinationID, "meta.json")); err != nil {
 			t.Fatalf("CLI fork destination metadata: %v", err)
+		}
+	})
+
+	// Positive code-rewind through the retained /revert menu on a real agent:
+	// rewinding from a chosen turn restores this session's file changes via its
+	// snapshots, reports every externally diverged file it must not touch, and
+	// leaves routing and conversation history exactly where they were. The fork
+	// subtest above is the retained sibling; TestCLIReturnsOnlyCodeAndForkOptions
+	// pins the removed history option at this same menu surface.
+	t.Run("revert_code_restores_files_and_keeps_history", func(t *testing.T) {
+		c, id, _, _, ag := seed(t)
+
+		createTurn, err := ag.AppendUserMessageToSession(id, "create files")
+		if err != nil {
+			t.Fatalf("AppendUserMessageToSession: %v", err)
+		}
+		root := ag.ProjectRoot()
+		createdPath := filepath.Join(root, "rewound.txt")
+		divergedPath := filepath.Join(root, "kept.txt")
+		for _, path := range []string{createdPath, divergedPath} {
+			entryID, _, err := ag.Store().SnapshotResolvedEntry(createTurn, path, path)
+			if err != nil {
+				t.Fatalf("snapshot entry for %s: %v", path, err)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			content := []byte("created\n")
+			if err := os.WriteFile(path, content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := ag.Store().RecordSnapshotContent(createTurn, entryID, content); err != nil {
+				t.Fatalf("record snapshot content for %s: %v", path, err)
+			}
+		}
+		diverged := []byte("diverged\n")
+		if err := os.WriteFile(divergedPath, diverged, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		c.readKeyFn = keySequence(
+			keyMsg{Special: keyDown},  // one -> two
+			keyMsg{Special: keyDown},  // two -> three
+			keyMsg{Special: keyDown},  // three -> create files (last selectable turn)
+			keyMsg{Special: keyEnter}, // pick the seeded create-files turn
+			keyMsg{Special: keyEnter}, // choose "Revert code" (first action item; no confirm on this path)
+		)
+
+		if err := c.dispatchCommand("/revert"); err != nil {
+			t.Fatalf("dispatchCommand(/revert): %v", err)
+		}
+
+		s := c.out.(*bytes.Buffer).String()
+		wantSuccess := fmt.Sprintf("reverted code to before turn %d", createTurn)
+		if !strings.Contains(s, wantSuccess) {
+			t.Fatalf("output = %q; must render the rewind success line naming clicked turn %d: %s", s, createTurn, wantSuccess)
+		}
+
+		const skipsHeader = "kept 1 file changed outside this session:"
+		wantSkipped := fmt.Sprintf("- %s (file content changed since this session last wrote it)", divergedPath)
+		if i, e := strings.Index(s, skipsHeader), strings.Index(s, wantSkipped); i < 0 || e < 0 {
+			t.Fatalf("output = %q; the kept-files notice must name the diverged file with its reason", s)
+		}
+
+		if _, err := os.Stat(createdPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("created file still present after rewind (stat err=%v); it was created by this session and must be restored to absent", err)
+		}
+		got, err := os.ReadFile(divergedPath)
+		if err != nil || !bytes.Equal(got, diverged) {
+			t.Fatalf("diverged file after rewind = %q (err=%v); an externally changed file must stay byte-identical", got, err)
+		}
+
+		wantCurrent(t, c, id) // code rewind keeps the same session; nothing may be adopted or cleared
+		msgs, err := ag.SessionMessagesFor(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cliUserContents(msgs); !equalStringSlices(got, []string{"one", "two", "three", "create files"}) {
+			t.Fatalf("history after code rewind = %q; conversation history must stay intact (system prompt + all four user turns)", got)
 		}
 	})
 }

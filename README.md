@@ -195,7 +195,7 @@ Beyond the run modes above, the binary ships utility commands: `version`, `docto
 
 - `~/.lightcode/config.json` — user config
 - `~/.lightcode/.env` — local API keys
-- `~/.lightcode/projects/` — project metadata, sessions, snapshots, memories, and project permissions
+- `~/.lightcode/projects/` — project metadata, sessions, snapshots, and project permissions
 - `~/.lightcode/cache/` — discovery and runtime caches
 
 ---
