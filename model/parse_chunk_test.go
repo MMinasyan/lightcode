@@ -70,6 +70,18 @@ func TestParseStreamChunkRaw(t *testing.T) { // one table because every row exer
 			}
 		}},
 
+		{name: "negativeCachedAndOutputPassThroughUnchanged", raw: json.RawMessage(`{"usage":{"prompt_tokens":5,"completion_tokens":-2,"prompt_tokens_details":{"cached_tokens":-3}}}`), check: func(t *testing.T, d StreamDelta) { // the retained signed-int producer clamps ONLY the uncached derivation: cached and output keep every bit of their as-reported value, negative included (no range or clamping policy may be invented on either).
+			if !d.UsageMatches(8, -3, -2) { // input = 5 - (-3) = 8 by signed arithmetic; the two negative fields must survive byte-for-byte as ints.
+				t.Fatalf("signed usage = %+v; want input=8 while cached=-3 and output=-2 pass through unchanged", d.Usage) // all three values rendered so a clamp added to either negative field — or removed from the uncached one — is visible at a glance.
+			}
+		}},
+
+		{name: "floorAppliesToUncachedInputOnlyWhileOtherFieldsStayNegative", raw: json.RawMessage(`{"usage":{"prompt_tokens":1,"completion_tokens":-6,"prompt_tokens_details":{"cached_tokens":4}}}`), check: func(t *testing.T, d StreamDelta) { // the single max(prompt-cached, 0) floor fires here (1-4 → 0) while cached=4 and output=-6 remain untouched — proving the clamp's reach is exactly one field even when every other value on the same object is out of the nonnegative range.
+			if !d.UsageMatches(0, 4, -6) {
+				t.Fatalf("floored usage = %+v; want input=0 (floored from -3) with cached=4 and output=-6 untouched by any clamp", d.Usage) // full rendering pins each field's exact survival, so an over-reaching clamp trips this row on whichever field it touched.
+			}
+		}},
+
 		// --- raw pass-through fields --------------------------------------------------------
 
 		{name: "roleAndFinishReasonPassThroughVerbatim", raw: json.RawMessage(`{"choices":[{"delta":{"role":"assistant","content":"x"},"finish_reason":"stop"}]}`), check: func(t *testing.T, d StreamDelta) { // both values are RAW wire strings — normalization (developer→system etc.) is assembler work and must never happen at parse time or downstream replay would double-normalize.
@@ -89,6 +101,24 @@ func TestParseStreamChunkRaw(t *testing.T) { // one table because every row exer
 		{name: "wrongTypedRefusalRejectedNamingItsField", raw: json.RawMessage(`{"choices":[{"delta":{"refusal":true}}]}`), errSub: `choice.delta.refusal has the wrong type (want JSON string)`}, // same strictness at refusal scope with its exact field path named for wire-side diagnosis.
 
 		{name: "wrongTypedRoleRejectedNamingItsField", raw: json.RawMessage(`{"choices":[{"delta":{"role":7}}]}`), errSub: `choice.delta.role has the wrong type (want JSON string)`}, // role is a delta-scope string with identical rules — pinning it here keeps all three string fields' strictness provably uniform rather than spot-checked.
+
+		{name: "wrongTypedNameRejectedNamingItsField", raw: json.RawMessage(`{"choices":[{"delta":{"name":5}}]}`), errSub: `choice.delta.name has the wrong type (want JSON string)`}, // name is canonical at message-delta scope yet carries no StreamDelta field: its type must still be enforced before the exclusion drops it, or wrong-typed wire data would pass as silence.
+
+		{name: "wrongTypedToolCallIDRejectedNamingItsField", raw: json.RawMessage(`{"choices":[{"delta":{"tool_call_id":[]}}]}`), errSub: `choice.delta.tool_call_id has the wrong type (want JSON string)`}, // same rule as name: canonical-but-fieldless members are type-checked, never silently absorbed into extras or dropped unverified.
+
+		{name: "wrongTypedFunctionCallRejectedNamingItsField", raw: json.RawMessage(`{"choices":[{"delta":{"function_call":"read_file"}}]}`), errSub: `choice.delta.function_call has the wrong type (want JSON object)`}, // function_call is the object-typed member of the fieldless trio — a bare string where the legacy {name,arguments} object belongs is a protocol violation, not ignorable noise.
+
+		{name: "nullNameToolCallIDAndFunctionCallStayAbsent", raw: json.RawMessage(`{"choices":[{"delta":{"name":null,"tool_call_id":null,"function_call":null,"custom_field":1}}]}`), check: func(t *testing.T, d StreamDelta) { // null remains absent for every fieldless canonical member — the type checks must not turn null into a failure, and the exclusion must not let null re-enter extras.
+			if len(d.MessageExtra) != 1 || !d.ExtraEquals(d.MessageExtra, "custom_field", `1`) {
+				t.Fatalf("message extras = %#v; want exactly custom_field retained beside the null trio", d.MessageExtra) // full map rendered so any null-key retention or sibling loss is visible in one line.
+			} else if _, ok := d.MessageExtra["name"]; ok {
+				t.Fatalf("null name leaked into message extras: %#v", d.MessageExtra) // the absent-by-rule direction pinned explicitly rather than implied by map length alone.
+			} else if _, ok := d.MessageExtra["tool_call_id"]; ok {
+				t.Fatalf("null tool_call_id leaked into message extras: %#v", d.MessageExtra) // same per-key pin for the second fieldless member.
+			} else if _, ok := d.MessageExtra["function_call"]; ok {
+				t.Fatalf("null function_call leaked into message extras: %#v", d.MessageExtra) // third member pinned for the same reason as its siblings.
+			}
+		}},
 
 		{name: "contentWrongTypeRejected", raw: json.RawMessage(`{"choices":[{"delta":{"content":42}}]}`), errSub: `delta.content has a wrong type (want JSON string or array of part objects)`}, // neither wire form matches a bare number — rejecting loudly beats inventing either representation downstream.
 

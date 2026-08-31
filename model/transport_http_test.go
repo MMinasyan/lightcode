@@ -62,6 +62,104 @@ func TestNewTransportRejectsInvalidResolvedInput(t *testing.T) { // resolved-inp
 	}
 }
 
+// TestNewTransportRejectsInvalidResolvedExtras pins construction-time validation of the two resolved extra-body layers: reserved-key presence in either layer is rejected with the dedicated reserved-key error (presence precedes every malformed-value check), and malformed non-reserved values are rejected as typed invalid input naming their layer and field. Valid extras and empty layers still construct cleanly with no I/O side effect.
+func TestNewTransportRejectsInvalidResolvedExtras(t *testing.T) { // construction is the trust boundary that owns these two layers; Stream's per-call path must never see a transport carrying them invalid.
+
+	t.Run("reservedKeyInProviderLayerReturnsReservedKeyError", func(t *testing.T) {
+		rt := testResolved()
+		rt.ProviderExtraBody = Extra{"n": json.RawMessage(`1`)} // a reserved top-level key must fail construction itself, not wait for a Stream call.
+		_, err := NewTransport(rt)
+		if err == nil { // no error at all is THE failure mode under test here.
+			t.Fatalf("reserved key in the provider extra body accepted at construction; want rejection")
+		} else if !errors.Is(err, ErrReservedKeys) { // the dedicated identity must be reachable on the returned value.
+			t.Fatalf("error = %v; want one wrapping ErrReservedKeys", err)
+		} else if errors.Is(err, ErrInvalidInput) { // the invalid-input umbrella must never also attach — callers branch on these two classes exclusively.
+			t.Fatalf("reserved-key failure over-classified as ErrInvalidInput: %v; want the reserved identity only", err)
+		} else if !strings.Contains(err.Error(), "reserved keys in extra body: n") { // the retained rendering identifies the key without quotes — exact format pinned here.
+			t.Fatalf("reserved-key error = %q; want the retained rendering identifying the offending key n", err)
+		}
+	})
+
+	t.Run("reservedKeyInModelLayerReturnsReservedKeyError", func(t *testing.T) {
+		rt := testResolved()
+		rt.ModelExtraBody = Extra{"stream_options": json.RawMessage(`{}`)} // second layer, same ownership and same rejection shape.
+		_, err := NewTransport(rt)
+		if err == nil {
+			t.Fatalf("reserved key in the model extra body accepted at construction; want rejection")
+		} else if !errors.Is(err, ErrReservedKeys) || errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("error = %v; want ErrReservedKeys alone for the model-layer reserved key", err)
+		} else if !strings.Contains(err.Error(), "reserved keys in extra body: stream_options") {
+			t.Fatalf("reserved-key error = %q; want the retained rendering identifying stream_options", err)
+		}
+	})
+
+	t.Run("reservedPresencePrecedesMalformedValueInSameLayer", func(t *testing.T) {
+		rt := testResolved()
+		rt.ModelExtraBody = Extra{"stream_options": json.RawMessage(`{broken`)} // a reserved key whose own value cannot parse: identification must never depend on parsing it.
+		_, err := NewTransport(rt)
+		if !errors.Is(err, ErrReservedKeys) || errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("error = %v; want the reserved-key identity alone even though the reserved value itself is malformed", err)
+		}
+	})
+
+	t.Run("reservedPresencePrecedesMalformedSiblingLayer", func(t *testing.T) {
+		rt := testResolved()
+		rt.ProviderExtraBody = Extra{"n": json.RawMessage(`1`)}        // reserved key in provider layer...
+		rt.ModelExtraBody = Extra{"junk": json.RawMessage(`not-json`)} // ...and a malformed non-reserved value in the model layer: the reserved-key pass runs first across both layers.
+		_, err := NewTransport(rt)
+		if !errors.Is(err, ErrReservedKeys) || errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("error = %v; want ErrReservedKeys alone when a reserved key coexists with a malformed sibling value", err)
+		}
+	})
+
+	t.Run("malformedProviderExtraClassifiesAsTypedInvalidInput", func(t *testing.T) {
+		rt := testResolved()
+		rt.ProviderExtraBody = Extra{"custom": json.RawMessage(`not-json`)} // non-reserved key with an unparsable value.
+		_, err := NewTransport(rt)
+		if err == nil {
+			t.Fatalf("malformed provider extra value accepted at construction; want rejection")
+		} else if !errors.Is(err, ErrInvalidInput) { // the shared typed invalid-input identity is the classification for this boundary's value failures.
+			t.Fatalf("error = %v; want one wrapping ErrInvalidInput for a malformed resolved extra value", err)
+		} else if errors.Is(err, ErrReservedKeys) { // cross-class guard: value failures must not borrow the reserved identity either.
+			t.Fatalf("malformed provider extra mis-classified as ErrReservedKeys: %v", err)
+		} else if !strings.Contains(err.Error(), "provider extra body") || !strings.Contains(err.Error(), `"custom"`) { // field-and-detail: layer name plus the offending field.
+			t.Fatalf("error = %q; want layer context (provider extra body) and field (custom) named in the text", err)
+		}
+	})
+
+	t.Run("malformedModelExtraClassifiesAsTypedInvalidInput", func(t *testing.T) {
+		rt := testResolved()
+		rt.ModelExtraBody = Extra{"temperature": json.RawMessage(`{`)} // second layer carries the same contract through its own naming.
+		_, err := NewTransport(rt)
+		if !errors.Is(err, ErrInvalidInput) || errors.Is(err, ErrReservedKeys) {
+			t.Fatalf("error = %v; want ErrInvalidInput alone for the malformed model-layer value", err)
+		} else if !strings.Contains(err.Error(), "model extra body") || !strings.Contains(err.Error(), `"temperature"`) {
+			t.Fatalf("error = %q; want model-layer and field context named in the text", err)
+		}
+	})
+
+	t.Run("bothLayersMalformedNamesProviderFirstDeterministically", func(t *testing.T) {
+		rt := testResolved()
+		rt.ProviderExtraBody = Extra{"a": json.RawMessage(`{`)}
+		rt.ModelExtraBody = Extra{"b": json.RawMessage(`{`)}
+		_, err := NewTransport(rt)
+		if !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("error = %v; want ErrInvalidInput when both resolved layers are malformed", err)
+		} else if !strings.Contains(err.Error(), "provider extra body") {
+			t.Fatalf("error = %q; want deterministic provider-first reporting when both layers fail", err)
+		}
+	})
+
+	t.Run("validResolvedExtrasStillConstruct", func(t *testing.T) {
+		rt := testResolved()
+		rt.ProviderExtraBody = Extra{"temperature": json.RawMessage(`0.1`)} // well-formed non-reserved values succeed...
+		rt.ModelExtraBody = Extra{"top_k": json.RawMessage(`40`)}
+		if _, err := NewTransport(rt); err != nil {
+			t.Fatalf("valid resolved extras rejected at construction: %v", err) // ...the checks above must reject exactly malformed/reserved input and nothing else.
+		}
+	})
+}
+
 // TestNewTransportDeepCopiesResolvedInput pins the construction ownership rule end to end over the wire: mutating every reference-typed field of the caller's ResolvedTransport after building (header values, extra-body key deletion, in-place byte rewrite of an extra value) must never reach what a subsequent request from that transport actually posts.
 func TestNewTransportDeepCopiesResolvedInput(t *testing.T) { // one mutation pass over each retained map is observable only through the bytes/headers this server captures next — exactly why no reflection shortcut replaces a real round trip here... (a copy-on-construction bug would leak precisely these mutations onto the wire).
 	var gotHeader http.Header
@@ -759,8 +857,50 @@ func TestStreamClassifiesInvalidInputErrors(t *testing.T) { // one transport ove
 			t.Fatalf("Stream error for a reserved key = %v; want one wrapping ErrReservedKeys", err) // full cause rendered so any reclassification or lost identity is visible alongside its expected shape.
 		} else if errors.Is(err, ErrInvalidInput) { // THE core negative assertion of this row: the invalid-input umbrella must NOT also be reachable here — dual-classification would make caller-side branching between these two classes impossible to write correctly... (this exact conflation is what pinning both directions prevents forever).
 			t.Fatalf("reserved-key failure was over-classified as ErrInvalidInput too: %v; want its own identity ONLY", err) // names the specific regression direction so a future "simplify all encode failures into one class" rewrite fails loudly at this assertion rather than shipping silently.
-		} else if !strings.Contains(err.Error(), `"stream"`) { // field-and-detail for THIS class means every offending key is named by its own error shape (the retained reserved-key formatting) — pinning the quoted key's presence proves that detail channel stays intact alongside its identity... (uniformity of "field and detail everywhere, each via its OWN class's format").
-			t.Fatalf("reserved-key error = %q; want it to name the offending key \"stream\"", err) // full text rendered so any formatting drift in this dedicated shape is visible character-by-character against expectation.
+		} else if !strings.Contains(err.Error(), "reserved keys in extra body: stream") { // field-and-detail for THIS class means every offending key is identified through the exact retained legacy rendering — pinning the precise format proves it stays byte-compatible with the legacy producer's error shape rather than drifting into a local variant.
+			t.Fatalf("reserved-key error = %q; want the retained rendering identifying the offending key stream", err) // full text rendered so any formatting drift in this dedicated shape is visible character-by-character against expectation.
+		} else if reserved, ok := err.(*ReservedKeyError); !ok || len(reserved.Keys) != 1 || reserved.Keys[0] != "stream" { // the public typed shape carries exactly this one offending key — callers reaching for Keys get the distinct present set, not a message string to parse.
+			t.Fatalf("ReservedKeyError shape = %#v via %T; want Keys=[stream] reachable through the public type", err, err)
+		}
+	})
+
+	t.Run("malformedMessageExtraClassifiesAsTypedInvalidInput", func(t *testing.T) { // request-scope value failure with no validation sentinel of its own: the umbrella identity plus NewRequest's positional field/detail is its complete classification — the reserved and runtime classes must both stay absent.
+		req := Request{Messages: []Message{{Role: RoleUser, Extra: Extra{"junk": json.RawMessage(`not-json`)}}}} // struct literal bypasses NewMessage exactly like the sibling source-identity row — this IS how an invalid logical request reaches Stream.
+		stream, _, err := tr.Stream(context.Background(), req, nil)
+		if stream != nil {
+			t.Fatalf("Stream returned an accepted stream for a malformed message extra; want none")
+		} else if err == nil {
+			t.Fatalf("malformed message extra accepted; want encoding to reject it")
+		} else if !errors.Is(err, ErrInvalidInput) { // THE classification this boundary must attach to logical-request value failures.
+			t.Fatalf("Stream error for a malformed message extra = %v; want one wrapping ErrInvalidInput", err)
+		} else if errors.Is(err, ErrReservedKeys) { // cross-exclusion: value failures and reservation failures stay separate classes.
+			t.Fatalf("malformed message extra mis-classified as ErrReservedKeys: %v", err)
+		} else if !strings.Contains(err.Error(), "messages[0]") || !strings.Contains(err.Error(), `"junk"`) { // field-and-detail must survive verbatim from NewRequest's positional prefix plus the validator's own key naming.
+			t.Fatalf("error = %q; want messages[0] position and the offending field junk named in the text", err)
+		}
+	})
+
+	t.Run("malformedContentPartExtraClassifiesAsTypedInvalidInput", func(t *testing.T) { // second request scope: a content part's extra value — same boundary, same classification, its position surfaced through the shared validation chain.
+		req := Request{Messages: []Message{{Role: RoleUser, Content: []ContentPart{{Kind: PartText, Extra: Extra{"p": json.RawMessage(`{`)}}}}}} // malformed part-scope extra on an otherwise valid part...
+		stream, _, err := tr.Stream(context.Background(), req, nil)
+		if stream != nil {
+			t.Fatalf("Stream returned an accepted stream for a malformed content-part extra; want none")
+		} else if !errors.Is(err, ErrInvalidInput) || errors.Is(err, ErrReservedKeys) {
+			t.Fatalf("error = %v; want ErrInvalidInput alone for the malformed content-part extra", err)
+		} else if !strings.Contains(err.Error(), "messages[0]") || !strings.Contains(err.Error(), `"p"`) { // the nested scope's positional prefix must still be part of the returned detail.
+			t.Fatalf("error = %q; want messages[0] context and the offending field p named in the text", err)
+		}
+	})
+
+	t.Run("malformedToolCallExtraClassifiesAsTypedInvalidInput", func(t *testing.T) { // third request scope: an assistant tool call's extra value — the deepest extra-holding scope in the logical request, exercising the same boundary on the calls path.
+		req := Request{Messages: []Message{{Role: RoleAssistant, Source: ModelRef{Provider: "openai", Model: "gpt-test"}, ToolCalls: []ToolCall{{ID: "call_1", Name: "read_file", Extra: Extra{"t": json.RawMessage(`[`)}}}}}} // everything valid except the call-scope extra bytes...
+		stream, _, err := tr.Stream(context.Background(), req, nil)
+		if stream != nil {
+			t.Fatalf("Stream returned an accepted stream for a malformed tool-call extra; want none")
+		} else if !errors.Is(err, ErrInvalidInput) || errors.Is(err, ErrReservedKeys) {
+			t.Fatalf("error = %v; want ErrInvalidInput alone for the malformed tool-call extra", err)
+		} else if !strings.Contains(err.Error(), "messages[0]") || !strings.Contains(err.Error(), `"t"`) { // both the message position and the call-scope field name must be present for wire-side diagnosis.
+			t.Fatalf("error = %q; want messages[0] context and the offending field t named in the text", err)
 		}
 	})
 

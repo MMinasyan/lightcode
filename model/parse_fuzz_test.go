@@ -39,6 +39,7 @@ func FuzzParseStreamChunk(f *testing.F) { // fuzzing a pure function needs no se
 		`{"choices":[{"delta":{"role":null,"content":null,"refusal":null},"finish_reason":null}]}`,
 		`{"choices":[{"delta":{"tool_calls":[{"index":-1}]}]}}`,
 		`{"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7,"prompt_tokens_details":{"cached_tokens":9}}}`, // cached exceeding prompt: exercises the floor clamp under mutation.
+		`{"usage":{"prompt_tokens":5,"completion_tokens":-2,"prompt_tokens_details":{"cached_tokens":-3}}}`,                // negative cached and output as reported: the retained producer passes both through signed and unchanged.
 	} {
 		f.Add([]byte(seed))
 	}
@@ -57,8 +58,8 @@ func FuzzParseStreamChunk(f *testing.F) { // fuzzing a pure function needs no se
 			t.Fatalf("successfully-parsed delta fails NewStreamDelta validation: %v", derr) // both the validating error and implicit input bytes via f.Fuzz reproduction make this immediately actionable without additional instrumentation.
 		}
 
-		if delta.Usage != nil && (delta.Usage.InputTokens < 0 || delta.Usage.CachedInputTokens < 0 || delta.Usage.OutputTokens < 0) { // usage normalization's single floor guarantees nonnegative uncached input; cached/output pass through as-reported signed ints which real providers keep non-negative... pinning all three here catches any arithmetic regression in either direction (a clamp removed OR a new accidental one introduced on the wrong field).
-			t.Fatalf("normalized usage carries negative values: %+v", delta.Usage) // full struct rendered so whichever of the three fields went negative is named directly against its original wire input for comparison.
+		if delta.Usage != nil && delta.Usage.InputTokens < 0 { // usage normalization's single floor guarantees nonnegative UNCACHED input only; cached and output pass through as-reported signed ints with no range policy on either — pinning the floored field alone here keeps test space from inventing clamps the retained producer never had.
+			t.Fatalf("normalized uncached input carries a negative value: %+v", delta.Usage) // full struct rendered so any future regression on the one floored field is named directly against its original wire input for comparison.
 		}
 
 		for i, frag := range delta.ContentFragments { // content positions are nonnegative by construction (array index / fixed zero); NewStreamDelta above already re-validates this but naming it here keeps THIS target's coverage explicit independent of that helper ever changing... (defense-in-depth across two validation layers is cheap insurance against one being weakened while the other compensates silently).

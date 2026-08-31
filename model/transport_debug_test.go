@@ -147,6 +147,52 @@ func TestTransportWireDiagnosticsFailureNeverAltersResults(t *testing.T) { // no
 	}
 }
 
+// TestTransportWireDiagnosticsAttemptedBeforeRequestConstruction pins the retained diagnostic ordering: the request-body dump is attempted immediately after encoding succeeds and BEFORE the HTTP request is constructed, so an exchange whose request fails to construct still leaves its -req.json artifact; the diagnostic failure stays invisible to the construction error (identical text with a writable and an unwritable debug dir).
+func TestTransportWireDiagnosticsAttemptedBeforeRequestConstruction(t *testing.T) { // a control character in the base URL makes http.NewRequestWithContext fail at url.Parse — the attempt happens, dials nothing, and ends at construction, isolating the diagnostic phase from any network involvement.
+
+	t.Run("writableDirLeavesRequestArtifactDespiteConstructionFailure", func(t *testing.T) {
+		dir := t.TempDir() // writable target: the dump write itself must succeed for artifact assertions below to mean anything.
+		rt := testResolved()
+		rt.BaseURL = "http://transport.invalid/\n" // invalid control character: endpoint construction cannot produce a parsable URL for this input.
+		rt.WireDebugDir = dir
+
+		tr := mustTransport(t, rt)
+		stream, _, err := tr.Stream(context.Background(), baseRequest(), nil) // encoding succeeds, then the dump must be attempted before construction rejects the endpoint.
+		if stream != nil {
+			t.Fatalf("Stream returned an accepted stream for an unconstructable request; want none") // ownership can never transfer past a construction failure.
+		} else if err == nil {
+			t.Fatalf("malformed endpoint was not rejected; want a request-construction failure") // premise check: without a construction failure this whole row's isolation story collapses.
+		} else if entries, lerr := os.ReadDir(dir); lerr != nil {
+			t.Fatalf("read diagnostics dir: %v", lerr) // distinct filesystem-failure framing as in sibling rows rather than folding it into artifact-shape findings.
+		} else if len(entries) != 1 || !strings.HasSuffix(entries[0].Name(), "-req.json") {
+			t.Fatalf("diagnostics dir holds %#v; want exactly one -req.json artifact despite the construction failure", entryNames(entries)) // full name list rendered: pre-ordering-regression this list is empty because the dump never ran.
+		}
+	})
+
+	t.Run("unwritableDirLeavesConstructionErrorByteIdentical", func(t *testing.T) {
+		root := t.TempDir() // valid parent; the nonexistent child below makes the dump write fail through real OS paths.
+		rtWritable := testResolved()
+		rtWritable.BaseURL = "http://transport.invalid/\n"
+		rtWritable.WireDebugDir = root
+
+		trWritable := mustTransport(t, rtWritable)
+		_, _, writableErr := trWritable.Stream(context.Background(), baseRequest(), nil) // baseline error text with diagnostics succeeding.
+
+		rtUnwritable := testResolved()
+		rtUnwritable.BaseURL = "http://transport.invalid/\n"
+		rtUnwritable.WireDebugDir = filepath.Join(root, "does-not-exist") // dump write fails here; the construction error must not change a single byte for it.
+
+		trUnwritable := mustTransport(t, rtUnwritable)
+		_, _, unwritableErr := trUnwritable.Stream(context.Background(), baseRequest(), nil)
+
+		if writableErr == nil || unwritableErr == nil {
+			t.Fatalf("premise broken: construction failures expected in both cases, got writable=%v unwritable=%v", writableErr, unwritableErr) // both must fail at construction or the comparison below proves nothing about diagnostic isolation.
+		} else if writableErr.Error() != unwritableErr.Error() {
+			t.Fatalf("construction error changed under diagnostic failure:\nwritable   = %q\nunwritable = %q", writableErr, unwritableErr) // byte-identical text is the observable form of "diagnostic failure never alters results" on this path.
+		}
+	})
+}
+
 // entryNames renders directory entries' names only (not full structs) for compact failure-message rendering — enough to identify any unexpected artifact by name without dumping filesystem metadata noise into test output... (deliberately minimal helper since its sole consumer is this file's two Fatalf sites above).
 func entryNames(entries []os.DirEntry) []string { // one-liner kept as a named function rather than inlined lambda so both call sites read symmetrically and any future addition of sorting/deduplication logic has exactly ONE place to live... (premature abstraction avoided beyond what those two identical rendering needs already justify).
 	names := make([]string, 0, len(entries)) // preallocated at exact size since we know the full count upfront — no append-growth churn even though test-scale sizes would never measurably care about it anyway... (allocating correctly costs zero cognitive overhead versus a plain empty slice here).

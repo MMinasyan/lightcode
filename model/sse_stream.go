@@ -181,6 +181,17 @@ func parseStreamChunkRaw(raw json.RawMessage) (StreamDelta, error) { // shared b
 	}
 	out.RefusalFragment = rawRefusal
 
+	// The fieldless canonical members are type-checked here before their canonical exclusion applies: enforcement is validation-only, never retention or output.
+	if _, nameErr := decodeStringField(rawMap["name"], "stream event choice.delta.name"); nameErr != nil { // present non-null name must be a JSON string even though no StreamDelta field carries it.
+		return StreamDelta{}, nameErr
+	}
+	if _, idErr := decodeStringField(rawMap["tool_call_id"], "stream event choice.delta.tool_call_id"); idErr != nil { // same rule for call correlation identity.
+		return StreamDelta{}, idErr
+	}
+	if fnErr := decodeObjectField(rawMap["function_call"], "stream event choice.delta.function_call"); fnErr != nil { // legacy function-call shape must be an object when present non-null.
+		return StreamDelta{}, fnErr
+	}
+
 	if err := parseContentInto(rawMap, &out); err != nil { // polymorphic delta.content handled in one place so its two wire forms share every strictness rule.
 		return StreamDelta{}, err
 	}
@@ -224,6 +235,18 @@ func decodeStringField(raw json.RawMessage, field string) (string, error) { // r
 		return "", fmt.Errorf("%w: %s has the wrong type (want JSON string)", ErrProtocol, field) // wraps nothing further; the stdlib cause here is not actionable by callers above this boundary.
 	}
 	return value, nil
+}
+
+// decodeObjectField is the object-typed twin of decodeStringField: absent and null both pass (absence is never an error), a present non-null JSON object passes, and any other present non-null type fails with ErrProtocol naming the field. It checks shape only — no subfield typing or output policy lives here.
+func decodeObjectField(raw json.RawMessage, field string) error {
+	if len(raw) == 0 || isJSONNull(raw) {
+		return nil
+	}
+	var probe map[string]json.RawMessage // a scalar, string, array, or wrong-typed value fails this unmarshal as the wrong-typed canonical field it is.
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return fmt.Errorf("%w: %s has the wrong type (want JSON object)", ErrProtocol, field)
+	}
+	return nil
 }
 
 // parseContentInto normalizes delta.content into positioned content fragments under its two OpenAI wire forms: a JSON string becomes exactly one text fragment at position zero (string-form wire content), and an array of part objects uses each element's array index as its position with per-part strict typing. Absent or null content produces no fragments; any other top-level value type is a protocol error, not silently dropped data.
@@ -415,7 +438,7 @@ func parseToolFragments(delta map[string]json.RawMessage) ([]ToolCallFragment, e
 	return fragments, nil // one fragment per started call; denial/error continuation and correlation are assembler concerns consumed from these values.
 }
 
-// isCanonicalMessageDeltaField reports whether a delta-object key belongs to the retained producer's message-delta canonical set: those keys never become MessageExtra entries even though some of them (name/tool_call_id/function_call) carry no StreamDelta field at all — they stay excluded exactly like their encoding-side denylist siblings.
+// isCanonicalMessageDeltaField reports whether a delta-object key belongs to the retained producer's message-delta canonical set: those keys never become MessageExtra entries even though some of them (name/tool_call_id/function_call) carry no StreamDelta field at all — name/tool_call_id are type-checked as strings and function_call as an object just before exclusion, then all three stay excluded exactly like their encoding-side denylist siblings.
 func isCanonicalMessageDeltaField(key string) bool { // ported verbatim from the retained producer's parser scope list; do not widen it without a contract change since every member here suppresses one extra key on real streams.
 	switch key {
 	case "role", "content", "name", "tool_calls", "tool_call_id", "refusal", "function_call":

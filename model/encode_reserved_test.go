@@ -46,12 +46,12 @@ func TestReservedKeysRejectedInEverySidecarLayer(t *testing.T) { // rule 5: pres
 				if err == nil {                                // no error at all is the failure mode under test.
 					t.Fatalf("reserved key %q in layer %s was not rejected (body=%s)", key, tc.name, string(body))
 				}
-				var reserved *reservedKeyError // typed identity with exactly this one offending key.
+				var reserved *ReservedKeyError // typed identity with exactly this one offending key.
 				if !errors.As(err, &reserved) || !errors.Is(err, ErrReservedKeys) {
 					t.Fatalf("error is not the typed/sentinel reserved-key error: %v", err)
 				}
-				if len(reserved.keys) != 1 || reserved.keys[0] != key { // one and only this key.
-					t.Fatalf("keys = %#v want [%s]", reserved.keys, key)
+				if len(reserved.Keys) != 1 || reserved.Keys[0] != key { // one and only this key.
+					t.Fatalf("keys = %#v want [%s]", reserved.Keys, key)
 				}
 
 			})
@@ -75,31 +75,34 @@ func TestReservedErrorIdentifiesEveryPresentKey(t *testing.T) { // distinct keys
 
 	body, _, err := Encode(rt, req, runtimeExtras) // one error identifies every present reserved key exactly once each (set semantics).
 
-	var reserved *reservedKeyError // typed shape carries the full distinct set.
+	var reserved *ReservedKeyError // typed shape carries the full distinct set.
 	if !errors.As(err, &reserved) || !errors.Is(err, ErrReservedKeys) {
 		t.Fatalf("expected one typed reserved-key error, got %v (body=%s)", err, string(body))
 	}
 
 	got := map[string]int{} // duplicates must collapse; every distinct present key appears.
-	for _, k := range reserved.keys {
+	for _, k := range reserved.Keys {
 		if got[k]++; got[k] > 1 {
-			t.Fatalf("key %q reported more than once: %#v", k, reserved.keys)
+			t.Fatalf("key %q reported more than once: %#v", k, reserved.Keys)
 		}
 	}
 	wantSet := map[string]bool{"n": true, "stream_options": true, "model": true, "max_tokens": true} // four distinct keys across three layers.
-	if len(reserved.keys) != len(wantSet) {                                                          // absent keys (messages/tools/tool_choice/stream/max_completion_tokens) are not reported.
-		t.Fatalf("keys = %#v want exactly %d distinct present reserved keys", reserved.keys, len(wantSet))
+	if len(reserved.Keys) != len(wantSet) {                                                          // absent keys (messages/tools/tool_choice/stream/max_completion_tokens) are not reported.
+		t.Fatalf("keys = %#v want exactly %d distinct present reserved keys", reserved.Keys, len(wantSet))
 	}
 
 	for k := range got { // every reported key is one of the four expected ones.
 		if !wantSet[k] {
-			t.Fatalf("unexpected key %q in error: %#v", k, reserved.keys)
+			t.Fatalf("unexpected key %q in error: %#v", k, reserved.Keys)
 		}
 	}
 
-	msg := err.Error() // text identifies each present key (order itself is diagnostic and not pinned).
+	msg := err.Error()                                                              // text identifies each present key (order itself is diagnostic and not pinned).
+	if prefix := "reserved keys in extra body: "; !strings.HasPrefix(msg, prefix) { // THE retained legacy rendering pinned exactly: unreserved prefix plus bare key names, never the sentinel's own text as a prefix and never quoted keys.
+		t.Fatalf("error text lost the retained legacy prefix %q: %s", prefix, msg)
+	}
 	for _, k := range []string{"n", "stream_options", "model", "max_tokens"} {
-		if !strings.Contains(msg, `"`+k+`"`) && !strings.Contains(msg, k) {
+		if !strings.Contains(msg, k) { // each present key appears bare in the joined list (order between keys is diagnostic and not pinned).
 			t.Fatalf("error text does not identify %q: %s", k, msg)
 		}
 	}
@@ -119,12 +122,12 @@ func TestReservedKeysIdentifiedDespiteMalformedValues(t *testing.T) {
 		runtimeExtras := map[string]json.RawMessage{"junk_key": []byte("not-json")} // malformed non-reserved value in a different layer than the reserved one.
 
 		body, _, err := Encode(rt, req, runtimeExtras) // rejection names the present reserved key even though another layer fails raw-value validation too.
-		var reserved *reservedKeyError                 // typed shape carries exactly the distinct present keys.
+		var reserved *ReservedKeyError                 // typed shape carries exactly the distinct present keys.
 		if !errors.As(err, &reserved) || !errors.Is(err, ErrReservedKeys) {
 			t.Fatalf("want typed reserved-key error despite the malformed sibling value, got %v (body=%s)", err, string(body))
 		}
-		if len(reserved.keys) != 1 || reserved.keys[0] != "max_tokens" { // one and only this key; the malformed non-reserved entry is not a reservation.
-			t.Fatalf("keys = %#v want [max_tokens]", reserved.keys)
+		if len(reserved.Keys) != 1 || reserved.Keys[0] != "max_tokens" { // one and only this key; the malformed non-reserved entry is not a reservation.
+			t.Fatalf("keys = %#v want [max_tokens]", reserved.Keys)
 		}
 	})
 
@@ -134,23 +137,23 @@ func TestReservedKeysIdentifiedDespiteMalformedValues(t *testing.T) {
 		runtimeExtras := map[string]json.RawMessage{"n": json.RawMessage(`2`)}
 
 		body, _, err := Encode(rt, req, runtimeExtras) // both present keys identified in one pass before any raw-value validation runs.
-		var reserved *reservedKeyError                 // typed shape carries the full distinct set regardless of value validity.
+		var reserved *ReservedKeyError                 // typed shape carries the full distinct set regardless of value validity.
 		if !errors.As(err, &reserved) || !errors.Is(err, ErrReservedKeys) {
 			t.Fatalf("want typed reserved-key error despite the malformed reserved value, got %v (body=%s)", err, string(body))
 		}
 		got := map[string]int{} // set comparison with a duplicate check; key order is diagnostic formatting only.
-		for _, k := range reserved.keys {
+		for _, k := range reserved.Keys {
 			if got[k]++; got[k] > 1 {
-				t.Fatalf("key %q reported more than once: %#v", k, reserved.keys)
+				t.Fatalf("key %q reported more than once: %#v", k, reserved.Keys)
 			}
 		}
 		wantSet := map[string]bool{"stream_options": true, "n": true} // exactly the two present keys; nothing else.
 		if len(got) != len(wantSet) {
-			t.Fatalf("keys = %#v want exactly %d distinct present reserved keys", reserved.keys, len(wantSet))
+			t.Fatalf("keys = %#v want exactly %d distinct present reserved keys", reserved.Keys, len(wantSet))
 		}
 		for k := range got {
 			if !wantSet[k] {
-				t.Fatalf("unexpected key %q in error: %#v", k, reserved.keys)
+				t.Fatalf("unexpected key %q in error: %#v", k, reserved.Keys)
 			}
 		}
 	})

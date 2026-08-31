@@ -17,10 +17,10 @@ import (
 // ErrAuthFailed is joined with the HTTP status error on 401/403 responses so callers can classify authentication failures without parsing status codes. Retry classification of any kind belongs to later Harness work, not this value or its errors.
 var ErrAuthFailed = errors.New("authentication failed")
 
-// ErrInvalidInput wraps Stream's encoding failure exactly when the invalid value is a resolved-transport field or a logical-request value: one typed identity whose returned error also preserves every underlying validation sentinel through its unwrap chain, with the offending field and detail in its text. Reserved-key failures keep their own dedicated shape (ErrReservedKeys), as do extra-body value and runtime-extra failures — neither gains this classification.
+// ErrInvalidInput wraps invalid resolved or request values at the transport's two owning boundaries with one typed identity: NewTransport classifies malformed resolved extra-body values, and Stream classifies every logical-request validation failure through NewRequest — including malformed message/content/tool extras — preserving any underlying specific validation sentinel in the same unwrap chain, with the offending field and detail in the text. Reserved-key failures keep their own dedicated shape (ReservedKeyError), and per-call runtime-extra failures keep no classification at all.
 var ErrInvalidInput = errors.New("invalid resolved or request input")
 
-// invalidRequestValueIdentities is the closed set of validation sentinels Stream classifies under ErrInvalidInput: every logical-request identity NewRequest can return (messages scope, tools scope) plus the two resolved-value re-validations Encode performs on each call. Deliberately excluded are ErrReservedKeys and all extra-body value failures — their own shapes stay unclassified at this boundary.
+// invalidRequestValueIdentities is the closed set of validation sentinels classifyEncodeError matches inside Encode's error path: every logical-request identity NewRequest can return (messages scope, tools scope) plus the two resolved-value re-validations Encode performs on each call. With Stream pre-validating its request and NewTransport pre-validating the resolved layers, Encode's path can only fail this way if a validation rule stops being idempotent — the set keeps those defensive failures classified identically. Deliberately excluded are ErrReservedKeys and all extra-body value failures — their own shapes stay unclassified on Encode's path.
 var invalidRequestValueIdentities = []error{ // order is diagnostic only; matching short-circuits on first hit because every listed identity maps to the same wrapping shape.
 	ErrInvalidRole,
 	ErrMissingSource,
@@ -33,7 +33,7 @@ var invalidRequestValueIdentities = []error{ // order is diagnostic only; matchi
 	ErrInvalidWireSystemRole, // same reasoning as above for the wire system role closed set.
 }
 
-// classifyEncodeError wraps one encoding failure under ErrInvalidInput exactly when its unwrap chain carries a logical-request or resolved-value validation sentinel: double %w keeps both sentinels reachable through errors.Is on the single returned value while retaining NewRequest's field-position prefix and every validator detail in the text. Every other shape — reserved keys, extra-body values, runtime extras, marshal boundaries — passes through unchanged so each keeps exactly its own classification surface.
+// classifyEncodeError wraps one Encode failure under ErrInvalidInput exactly when its unwrap chain carries a logical-request or resolved-value validation sentinel: double %w keeps both sentinels reachable through errors.Is on the single returned value while retaining NewRequest's field-position prefix and every validator detail in the text. Every other shape — reserved keys, extra-body values, runtime extras, marshal boundaries — passes through unchanged so each keeps exactly its own classification surface.
 func classifyEncodeError(err error) error {
 	for _, identity := range invalidRequestValueIdentities {
 		if errors.Is(err, identity) {
@@ -49,7 +49,7 @@ type Transport struct {
 	client   *http.Client      // single standard-library HTTP client owned by this transport.
 }
 
-// NewTransport builds a fixed streaming chat transport from one immutable resolved input, deep-copying every map and slice it carries so later caller mutations cannot reach the retained values. It performs no network or filesystem I/O. Construction fails with a typed invalid-input error naming the offending field when the target model identity is not complete (zero or partial) or the wire system role falls outside the closed set; everything else — reserved extras, malformed extra bytes, request validation — is enforced at the Stream trust boundary through Encode on every invocation.
+// NewTransport builds a fixed streaming chat transport from one immutable resolved input, deep-copying every map and slice it carries so later caller mutations cannot reach the retained values. It performs no network or filesystem I/O. Construction fails with a typed invalid-input error naming the offending field when the target model identity is not complete (zero or partial) or the wire system role falls outside the closed set; the two resolved extra-body layers are validated here too — reserved-key presence rejects with the ReservedKeyError naming every present key (checked before any value parsing), and malformed non-reserved values reject as typed ErrInvalidInput with their layer and field. Request-level validation belongs to the Stream trust boundary.
 func NewTransport(in ResolvedTransport) (*Transport, error) {
 	resolved := cloneResolvedInput(in) // own every resolved value before retaining it.
 
@@ -60,20 +60,40 @@ func NewTransport(in ResolvedTransport) (*Transport, error) {
 		return nil, fmt.Errorf("resolved transport field WireSystemRole: %w", err)
 	}
 
+	var reserved []string // reserved-key pass over both resolved layers runs before any value parsing so a malformed value can never hide a reservation.
+	for _, layer := range []Extra{resolved.ProviderExtraBody, resolved.ModelExtraBody} {
+		reserved = collectReservedKeys(reserved, layer)
+	}
+	if len(reserved) > 0 {
+		return nil, &ReservedKeyError{Keys: reserved} // same shape and precedence as the per-call pass inside Encode.
+	}
+	if err := validateExtraValues(resolved.ProviderExtraBody); err != nil { // deterministic layer order: provider is reported first when both layers are malformed.
+		return nil, fmt.Errorf("%w: provider extra body: %w", ErrInvalidInput, err)
+	}
+	if err := validateExtraValues(resolved.ModelExtraBody); err != nil {
+		return nil, fmt.Errorf("%w: model extra body: %w", ErrInvalidInput, err)
+	}
+
 	return &Transport{
 		resolved: resolved,
 		client:   &http.Client{}, // zero-value client retains standard redirect handling and no retry behavior of its own.
 	}, nil
 }
 
-// Stream opens one physical streaming chat completion attempt for the given logical request and per-call runtime extra layer over this transport's immutable resolved input. Before a response stream is returned, failures are transport-level: invalid resolved or request values return typed errors with field and detail (re-validated here at this trust boundary through Encode), reserved extras return the ErrReservedKeys error identifying every present key, request construction/marshal/network failures wrap their standard-library cause, non-2xx responses return an HTTPStatusError carrying status code, status text, and provider message — joined with ErrAuthFailed on 401/403. Warnings are returned whenever encoding succeeded even if the attempt later fails; a 2xx response transfers body ownership to the returned stream and establishes accepted model work from that moment onward. The request uses ctx for its lifetime: cancelling it unblocks an in-progress body read, but this transport never turns any failure into another physical request — retry policy is Harness-owned.
+// Stream opens one physical streaming chat completion attempt for the given logical request and per-call runtime extra layer over this transport's immutable resolved input. Before a response stream is returned, failures are transport-level: the logical request is validated and owned through NewRequest here, with every failure returning the typed ErrInvalidInput identity (preserving each underlying validation sentinel) plus positional field/detail; resolved values were already validated at construction; reserved extras return the ReservedKeyError identifying every present key; request construction/marshal/network failures wrap their standard-library cause; non-2xx responses return an HTTPStatusError carrying status code, status text, and provider message — joined with ErrAuthFailed on 401/403. Per-call runtime extras keep no classification of their own. Warnings are returned whenever encoding succeeded even if the attempt later fails; a 2xx response transfers body ownership to the returned stream and establishes accepted model work from that moment onward. The request uses ctx for its lifetime: cancelling it unblocks an in-progress body read, but this transport never turns any failure into another physical request — retry policy is Harness-owned.
 func (t *Transport) Stream(ctx context.Context, req Request, runtimeExtras map[string]json.RawMessage) (Stream, []ProtocolWarning, error) {
-	body, warnings, err := Encode(t.resolved, req, runtimeExtras) // deep-copies resolved input, request, and the per-call layer on entry; reserved keys rejected before any value parsing.
+	request, err := NewRequest(req) // validate and own the logical request at this trust boundary: sentinel-carrying failures keep their specific identity, malformed message/content/tool extras carry none — both classify under the umbrella with NewRequest's positional detail intact.
 	if err != nil {
-		return nil, nil, classifyEncodeError(err) // encoding failed: no physical attempt happens and nothing to warn about yet; logical-request/resolved-value failures gain their typed identity here while every other shape passes through unchanged.
+		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidInput, err)
+	}
+
+	body, warnings, err := Encode(t.resolved, request, runtimeExtras) // reserved keys rejected inside before any value parsing; runtime extras stay unclassified and the validated request passes through its re-validation unchanged.
+	if err != nil {
+		return nil, nil, classifyEncodeError(err) // defensive for sentinel-carrying shapes only; reserved/runtime/marshal pass through unchanged.
 	}
 
 	endpoint := ChatEndpoint(t.resolved)
+	chunkPath := t.dumpRequest(body) // retained wire diagnostics: attempted immediately after encoding succeeds and BEFORE request construction (matching the retained legacy producer's ordering), so a request that fails to construct still leaves its dump behind; "" when disabled or any write fails — never alters results below.
 	httpReq, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if reqErr != nil {
 		return nil, warnings, fmt.Errorf("build chat completions request for %s: %w", endpoint, reqErr) // encoding already succeeded, so its warnings still go to the caller.
@@ -82,7 +102,6 @@ func (t *Transport) Stream(ctx context.Context, req Request, runtimeExtras map[s
 		httpReq.Header[key] = []string{value}
 	}
 
-	chunkPath := t.dumpRequest(body)    // retained wire diagnostics: "" when disabled or any write fails — never alters results below.
 	resp, doErr := t.client.Do(httpReq) // exactly one physical attempt per invocation; no retry loop exists anywhere in this type.
 	if doErr != nil {
 		return nil, warnings, fmt.Errorf("post chat completions request to %s: %w", endpoint, doErr) // wraps the standard-library cause (including a canceled context).

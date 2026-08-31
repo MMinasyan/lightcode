@@ -25,7 +25,7 @@ type ResolvedTransport struct {
 	WireDebugDir      string              // optional wire-debug directory consumed by the transport layer; empty disables diagnostics and Encode does not touch it.
 }
 
-// ErrReservedKeys is returned when any extra-body sidecar layer carries a key owned by this encoder's base body. The concrete error identifies every present reserved key exactly once each.
+// ErrReservedKeys is returned when any extra-body sidecar layer carries a key owned by this encoder's base body. The concrete ReservedKeyError identifies every present reserved key exactly once each and renders through the retained legacy format.
 var ErrReservedKeys = errors.New("extra body carries reserved keys")
 
 // ErrInvalidWireSystemRole is returned when the resolved wire system role is not one of system, user or developer (empty defaults to system and does not fail).
@@ -56,7 +56,7 @@ func Encode(in ResolvedTransport, req Request, runtimeExtras map[string]json.Raw
 		reserved = collectReservedKeys(reserved, layer)
 	}
 	if len(reserved) > 0 {
-		return nil, nil, &reservedKeyError{keys: reserved} // rejection produces no body bytes.
+		return nil, nil, &ReservedKeyError{Keys: reserved} // rejection produces no body bytes.
 	}
 
 	for name, layer := range map[string]Extra{"provider": rt.ProviderExtraBody, "model": rt.ModelExtraBody, "runtime": runtimeLayer} {
@@ -124,20 +124,16 @@ func Encode(in ResolvedTransport, req Request, runtimeExtras map[string]json.Raw
 	return bytesOut, warnings, nil
 }
 
-// reservedKeyError carries every present reserved key found across the sidecar layers so one error identifies them all without duplicating any. Key order is diagnostic formatting only.
-type reservedKeyError struct {
-	keys []string // distinct offending keys in first-seen layer order.
+// ReservedKeyError carries every present reserved key found across the sidecar layers so one error identifies them all without duplicating any. Key order is diagnostic formatting only.
+type ReservedKeyError struct {
+	Keys []string // distinct offending keys in first-seen layer order.
 }
 
-func (e *reservedKeyError) Error() string {
-	quoted := make([]string, len(e.keys))
-	for i, key := range e.keys {
-		quoted[i] = fmt.Sprintf("%q", key)
-	}
-	return fmt.Sprintf("%s: %s", ErrReservedKeys, strings.Join(quoted, ", "))
+func (e *ReservedKeyError) Error() string { // exact retained legacy rendering: unreserved prefix plus bare key names.
+	return fmt.Sprintf("reserved keys in extra body: %s", strings.Join(e.Keys, ", "))
 }
 
-func (e *reservedKeyError) Unwrap() error { return ErrReservedKeys } // errors.Is reaches the sentinel; errors.As reaches this typed shape.
+func (e *ReservedKeyError) Unwrap() error { return ErrReservedKeys } // errors.Is reaches the sentinel; errors.As reaches this typed shape.
 
 // collectReservedKeys appends each reserved key present in layer that has not already been reported.
 func collectReservedKeys(reported []string, layer Extra) []string {
