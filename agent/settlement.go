@@ -6,7 +6,7 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// validateSettlement checks one settlement returned by a model effect against the closed disposition table and the invocation's expected identity: ready is exactly its completed callback output with empty detail; continue exactly its errored output with empty detail (the caller has already settled any continuation facts); failure non-empty detail plus no accepted stream or that same errored output — a completed output never settles as failure; interruption non-empty detail plus one of three states, nothing before acceptance, the interrupted callback output while generation was in flight over it, or a retained completed output when cancellation followed successful completion. A present output must itself satisfy every ordinary model-output invariant and carry exactly the expected source identity field-for-field (String() rendering is lossy on first-slash splits, so both fields are compared separately). Every violation returns one typed boundary-protocol error naming the "model" boundary; nothing here coerces a malformed settlement into another shape.
+// validateSettlement checks one settlement returned by a model effect against the closed disposition table and the invocation's expected identity: ready is exactly its completed callback output with empty detail; continue exactly its errored output with empty detail (the caller has already settled any continuation facts); failure non-empty detail plus no accepted stream or that same errored output — a completed output never settles as failure; interruption non-empty detail plus one of three states, nothing before acceptance, the interrupted callback output while generation was in flight over it, or a retained completed output when cancellation followed successful completion. A present output must itself satisfy every ordinary model-output invariant and carry exactly the expected source identity field-for-field (String() rendering is lossy on first-slash splits, so both fields are compared separately) and its completed tool calls must carry pairwise-unique IDs. Every violation returns one typed boundary-protocol error naming the "model" boundary; nothing here coerces a malformed settlement into another shape.
 func validateSettlement(set ModelSettlement, expected model.ModelRef) error {
 	switch set.Disposition {
 	case DispoReady: // completed callback output only; empty detail checked below.
@@ -53,7 +53,24 @@ func validateSettlement(set ModelSettlement, expected model.ModelRef) error {
 	if _, err := model.NewOutput(out); err != nil {
 		return fmt.Errorf("%w: %v", newBoundaryViolation("model", "settlement output violates model-output invariants"), err)
 	}
+	if out.Message != nil {
+		if err := requireUniqueCallIDs("model", out.Message.ToolCalls); err != nil {
+			return err
+		}
+	}
 	return nil // well-formed.
+}
+
+// requireUniqueCallIDs enforces the completed-call identity invariant shared by settlements and terminal results: at most one call may carry any given ID, so a repeated ID never reaches dispatch, unstarted-call matching stays unambiguous, and a validated caller cannot drive the loop's internal terminal invariant route.
+func requireUniqueCallIDs(boundary string, calls []model.ToolCall) error {
+	seen := make(map[string]bool, len(calls))
+	for _, c := range calls {
+		if seen[c.ID] {
+			return newBoundaryViolation(boundary, fmt.Sprintf("completed output repeats tool call id %q", c.ID))
+		}
+		seen[c.ID] = true
+	}
+	return nil
 }
 
 // requireDispositionOutput enforces presence and exact status for ready (completed) and continue (errored): a nil output or any other closed status is an invalid combination settled as one typed error naming what was found.
@@ -78,7 +95,7 @@ func validateToolResult(res model.ToolResult, callID string) error {
 	return nil // well-formed settlement answering exactly its own call.
 }
 
-// validateTerminalResult checks one Agent terminal result against the closed status table: success is a valid completed last output with no tool calls, no unstarted calls and empty detail; failure is non-empty detail, no unstarted calls, and an optional valid completed or errored output; interruption is non-empty detail, an optional valid completed or interrupted output, and unstarted calls that must each identify a distinct call of that completed output in increasing original-call order. Every other shape or status is one typed boundary-protocol error naming the "agent" boundary; present outputs and unstarted calls are re-validated through the landed public model constructors first.
+// validateTerminalResult checks one Agent terminal result against the closed status table: success is a valid completed last output with no tool calls, no unstarted calls and empty detail; failure is non-empty detail, no unstarted calls, and an optional valid completed or errored output; interruption is non-empty detail, an optional valid completed or interrupted output, and unstarted calls that must each identify a distinct call of that completed output in increasing original-call order. Every other shape or status is one typed boundary-protocol error naming the "agent" boundary; present outputs and unstarted calls are re-validated through the landed public model constructors first, and a present completed output must carry pairwise-unique call IDs.
 func validateTerminalResult(res TerminalResult) error {
 	out := res.LastOutput
 	if out != nil {
@@ -87,6 +104,11 @@ func validateTerminalResult(res TerminalResult) error {
 			return fmt.Errorf("%w: %v", newBoundaryViolation("agent", "terminal last output violates model-output invariants"), err)
 		}
 		out = &validated
+		if out.Message != nil {
+			if err := requireUniqueCallIDs("agent", out.Message.ToolCalls); err != nil {
+				return err
+			}
+		}
 	}
 
 	switch res.Status {
