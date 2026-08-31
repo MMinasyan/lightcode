@@ -66,6 +66,38 @@ func TestAssembleFinishReasonMatrix(t *testing.T) { // nothing more to do on thi
 	}
 }
 
+// TestAssembleCleanEmptyResponseErrors pins the truly empty clean termination: a stream ending at EOF with no payload, no calls and no finish reason is an errored response, not a vacuous completion.
+func TestAssembleCleanEmptyResponseErrors(t *testing.T) {
+	out, s := assemble(t, context.Background(), testRef) // no scripted steps at all — the first Recv reports EOF.
+	expectStatus(t, out, model.OutputErrored)
+	assertSingleClose(t, s)
+
+	if out.Message != nil {
+		t.Fatalf("errored empty output unexpectedly carried a message: %#v", out.Message)
+	}
+}
+
+// TestAssembleRepeatedAgreeingRoleAndFinishReason pins the repeat side of the finalization agreement rules: the same assistant role and the same finish reason arriving across multiple chunks remain one valid completion, with no conflict recorded for identical repeats.
+func TestAssembleRepeatedAgreeingRoleAndFinishReason(t *testing.T) {
+	roleText := model.StreamDelta{HasChoice: true, Role: "assistant", ContentFragments: []model.ContentFragment{txtPos(0, "hi")}}
+	repeatRole := model.StreamDelta{HasChoice: true, Role: "assistant"}
+
+	out, s := assemble(t, context.Background(), testRef,
+		deltaStep(roleText),
+		deltaStep(repeatRole),  // identical non-empty role repeats silently.
+		deltaStep(stopDelta()), // first finish reason is accepted.
+		deltaStep(stopDelta()), // identical finish reason repeats silently, even after establishment.
+	)
+
+	expectStatus(t, out, model.OutputCompleted)
+	assertSingleClose(t, s)
+
+	parts := msgContent(out)
+	if len(parts) != 1 || parts[0].Text != "hi" {
+		t.Fatalf("completed parts = %#v, want one text part %q", out.Message, "hi")
+	}
+}
+
 // TestAssembleResponseRoleRules pins absent and raw-assistant roles completing normally; any other supplied value errors even with a full stop/payload combination, retaining eligible partials under the canonical assistant identity.
 func TestAssembleResponseRoleRules(t *testing.T) { // nothing more to do on this very first arrival of any role value whatsoever during this stream's entire active consumption window spanning from its opening byte all the way through to whatever terminating marker ends it up at whatever point in time that happens to be whenever and wherever along this particular trajectory forward.
 	cases := []struct {

@@ -63,6 +63,36 @@ func TestAssembleRepeatedFragmentsAgree(t *testing.T) {
 	}
 }
 
+// TestAssembleRepeatedOpaqueExtrasAccumulate pins the shared-accumulator rule for repeated opaque fragments: fragments at one position with the same non-empty structural wire type keep flowing through the ordinary Extra accumulator (strings concatenate, objects replace with latest), and only a different structural type records a conflict.
+func TestAssembleRepeatedOpaqueExtrasAccumulate(t *testing.T) {
+	f1 := opaquePos(0, "thinking")
+	f1.Extra = model.Extra{"d": json.RawMessage(`"a"`), "o": json.RawMessage(`{"v":1}`)}
+	f2 := opaquePos(0, "thinking") // identical repeated structural type adds nothing to check and must not short-circuit the fragment's extras below it.
+	f2.Extra = model.Extra{"d": json.RawMessage(`"b"`), "o": json.RawMessage(`{"v":2}`)}
+
+	out, s := assemble(t, context.Background(), testRef,
+		deltaStep(choiceDelta(f1)),
+		deltaStep(choiceDelta(f2)),
+		deltaStep(stopDelta()),
+	)
+
+	expectStatus(t, out, model.OutputCompleted)
+	assertSingleClose(t, s)
+
+	parts := msgContent(out)
+	if len(parts) != 1 || parts[0].Kind != model.PartOpaque || parts[0].OpaqueWireType != "thinking" {
+		t.Fatalf("parts = %#v, want one opaque part with wire type thinking", parts)
+	}
+
+	if got := string(parts[0].Extra["d"]); got != `"ab"` {
+		t.Fatalf("opaque part extra d = %s, want \"ab\" (every same-type repeat must reach the shared accumulator)", got)
+	}
+
+	if got := string(parts[0].Extra["o"]); got != `{"v":2}` {
+		t.Fatalf("opaque part extra o = %s, want {\"v\":2} (latest same-kind object wins)", got)
+	}
+}
+
 // TestAssembleContentExtrasAccumulation pins part-scope extras through the ordinary accumulator: strings concatenate, objects replace with latest same-kind value, and a kind change keeps the latest value without changing output classification.
 func TestAssembleContentExtrasAccumulation(t *testing.T) {
 	f1 := txtPos(0, "hi")                                                                // base text piece at position zero as always throughout every content test in this same file above these lines verbatim for consistency across sibling tests' shared positional conventions rather than inventing ad-hoc offsets per individual case body itself below it further ahead now.
@@ -100,6 +130,93 @@ func TestAssembleContentExtrasAccumulation(t *testing.T) {
 	oVal := string(part.Extra["o"])
 	if oVal != `{"v":2}` {
 		t.Fatalf("part.extra[o] = %s, want {\"v\":2} (latest same-kind object wins)", oVal) // report the divergent raw JSON bytes verbatim so whoever reads the failure later upstream/downstream along this particular trajectory forward can see exactly what unexpected accumulation outcome materialized instead of mandated latest-same-kind replacement above these lines now rather than scattered across multiple files' worth of prose below it further ahead in wire order.
+	}
+}
+
+// TestAssembleMessageExtrasKindChangeKeepsLatest pins the message-scope sibling of the part-scope extras rule: a key changing JSON kind stores the latest value through the ordinary accumulator, its error is never surfaced, and the output classification stays untouched.
+func TestAssembleMessageExtrasKindChangeKeepsLatest(t *testing.T) {
+	d1 := model.StreamDelta{HasChoice: true, MessageExtra: model.Extra{"s": json.RawMessage(`"a"`)}}
+	d2 := model.StreamDelta{HasChoice: true, MessageExtra: model.Extra{"s": json.RawMessage(`5`)}} // string→number kind change: latest value wins as the new baseline.
+
+	out, s := assemble(t, context.Background(), testRef,
+		deltaStep(d1),
+		deltaStep(d2),
+		deltaStep(stopDelta()),
+	)
+
+	expectStatus(t, out, model.OutputCompleted) // an Extra accumulator diagnostic never changes output classification at message scope either.
+	assertSingleClose(t, s)
+
+	if out.Message == nil {
+		t.Fatalf("completed output carries no message at all")
+	}
+
+	if got := string(out.Message.Extra["s"]); got != "5" {
+		t.Fatalf("message extra s = %s, want 5 (latest value kept after kind change)", got)
+	}
+}
+
+// TestAssembleUnknownKindFragmentsAreRejectedAtAdmission pins the closed-kind admission gate at the top of the one positioned accumulator path: any kind outside text, image_url and opaque — empty or not — pins one structural conflict and stores nothing on its position, neither kind fields nor extras, while the nearest known-kind sibling with the same extras shape still completes.
+func TestAssembleUnknownKindFragmentsAreRejectedAtAdmission(t *testing.T) {
+	unknownWithExtras := model.ContentFragment{Position: 1, Kind: "audio", Extra: model.Extra{"d": json.RawMessage(`"x"`)}}
+	unknownBare := model.ContentFragment{Position: 1, Kind: "audio"}
+	knownWithExtras := model.ContentFragment{Position: 1, Kind: model.PartOpaque, OpaqueWireType: "thinking", Extra: model.Extra{"d": json.RawMessage(`"x"`)}}
+
+	cases := []struct {
+		name      string
+		steps     []func() (model.StreamDelta, error)
+		wantDone  bool
+		wantTexts []string // eligible retained text parts on an errored output; nil means nothing was retained at all.
+	}{
+		{"unknown-kind-with-extras", []func() (model.StreamDelta, error){ // the invalid fragment is the stream's only data: classification must error through the shared conflict route — never panic through the output constructor — and the position must hold nothing.
+			deltaStep(choiceDelta(unknownWithExtras)),
+			deltaStep(stopDelta()),
+		}, false, nil},
+
+		{"unknown-kind-alongside-valid-text", []func() (model.StreamDelta, error){ // a bare unknown-kind fragment beside a fully valid text part must still error while retention keeps only the eligible valid text.
+			deltaStep(choiceDelta(txtPos(0, "hi"))),
+			deltaStep(choiceDelta(unknownBare)),
+			deltaStep(stopDelta()),
+		}, false, []string{"hi"}},
+
+		{"known-kind-with-extras-sibling", []func() (model.StreamDelta, error){ // nearest forbidden-sibling counter-check: the same fragment shape with a known kind keeps accumulating and completing normally.
+			deltaStep(choiceDelta(knownWithExtras)),
+			deltaStep(stopDelta()),
+		}, true, nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, s := assemble(t, context.Background(), testRef, tc.steps...)
+			assertSingleClose(t, s)
+
+			if tc.wantDone {
+				expectStatus(t, out, model.OutputCompleted)
+				parts := msgContent(out)
+				if len(parts) != 1 || parts[0].Kind != model.PartOpaque || parts[0].OpaqueWireType != "thinking" || string(parts[0].Extra["d"]) != `"x"` {
+					t.Fatalf("completed parts = %#v, want the known-kind part with its stored extras", parts)
+				}
+				return
+			}
+
+			expectStatus(t, out, model.OutputErrored)
+			if tc.wantTexts == nil { // invalid-only stream: nothing may have been stored, so no message at all may ride the errored output.
+				if out.Message != nil {
+					t.Fatalf("errored output unexpectedly carried a message: %#v", out.Message)
+				}
+				return
+			}
+
+			parts := msgContent(out)
+			if len(parts) != len(tc.wantTexts) {
+				t.Fatalf("errored retained parts = %#v, want only the eligible valid text", out.Message)
+			}
+			for i, want := range tc.wantTexts {
+				if parts[i].Kind != model.PartText || parts[i].Text != want {
+					t.Fatalf("retained part[%d] = %#v, want text %q", i, parts[i], want)
+				}
+			}
+		})
 	}
 }
 

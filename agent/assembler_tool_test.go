@@ -98,6 +98,59 @@ func TestAssembleToolWireTypeRules(t *testing.T) { // nothing more to do on this
 	}
 }
 
+// TestAssembleToolPositionKeepsFirstIdentity pins the position-to-ID side of the one-to-one identity invariant: a different non-empty ID arriving at an already-identified position never rebinds that slot — it correlates to a fresh normalized position, leaving each position mapped to at most one identity.
+func TestAssembleToolPositionKeepsFirstIdentity(t *testing.T) {
+	out, s := assemble(t, context.Background(), testRef,
+		deltaStep(toolDelta(model.ToolCallFragment{Position: posI(0), ID: "a", Name: "fnA"})), // position 0 records identity a.
+		deltaStep(toolDelta(model.ToolCallFragment{Position: posI(0), ID: "b", Name: "fnB"})), // same position, different identity: the reverse-direction pressure on the invariant.
+		deltaStep(toolCallsDelta()),
+	)
+
+	expectStatus(t, out, model.OutputCompleted) // neither mapping is torn down — the conflict-free outcome is the invariant holding.
+	assertSingleClose(t, s)
+
+	calls := msgCalls(out)
+	if len(calls) != 2 || calls[0].ID != "a" || calls[0].Name != "fnA" || calls[1].ID != "b" || calls[1].Name != "fnB" {
+		t.Fatalf("calls = %#v, want a@position0 then b@fresh-position1", calls)
+	}
+}
+
+// TestAssembleToolWireTypeRepeats pins the repeated-supply side of the wire-type rule: an equal repeated type passes silently through correlation, and a differing repeated type errors as a conflicting supply rather than overwriting the decided one.
+func TestAssembleToolWireTypeRepeats(t *testing.T) {
+	cases := []struct {
+		name     string
+		second   string
+		wantDone bool
+	}{
+		{"equal-repeat", "function", true},      // same supplied type on a later fragment of one slot adds no information and must not conflict.
+		{"conflicting-repeat", "custom", false}, // a different later type contradicts the decided one — errored, never replaced.
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f1 := model.ToolCallFragment{Position: posI(0), ID: "a", Name: "n", WireType: "function"} // first fragment decides the slot's supplied type.
+			f2 := model.ToolCallFragment{ArgumentFragment: "{}", WireType: tc.second}                 // singleton anonymous continuation lands on the same slot carrying the repeat value.
+
+			out, s := assemble(t, context.Background(), testRef,
+				deltaStep(toolDelta(f1)),
+				deltaStep(toolDelta(f2)),
+				deltaStep(toolCallsDelta()),
+			)
+			assertSingleClose(t, s)
+
+			if tc.wantDone {
+				expectStatus(t, out, model.OutputCompleted)
+				calls := msgCalls(out)
+				if len(calls) != 1 || calls[0].ID != "a" || string(calls[0].Arguments) != "{}" {
+					t.Fatalf("calls = %#v, want one slot-0 call carrying the continuation arguments", calls)
+				}
+			} else {
+				expectStatus(t, out, model.OutputErrored)
+			}
+		})
+	}
+}
+
 // TestAssembleMissingToolName pins that a call accumulating an ID but no name is dropped from the finalized calls — and with finish reason tool_calls plus zero surviving valid calls, the output errors for lack of any usable payload.
 func TestAssembleMissingToolName(t *testing.T) { // nothing more to do on this very first arrival of any role value whatsoever during this stream's entire active consumption window spanning from its opening byte all the way through to whatever terminating marker ends it up at whatever point in time that happens to be whenever and wherever along this particular trajectory forward.
 	out, s := assemble(t, context.Background(), testRef,

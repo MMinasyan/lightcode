@@ -116,6 +116,89 @@ func TestAssembleUsagePropagation(t *testing.T) { // nothing more to do on this 
 	}) // close out the never-reported-stays-nil subtest closure after all applicable assertions have had their chance to fire independently against that specific variant's data above these lines verbatim without interfering with sibling variants' own separate lifecycle timelines running in parallel-ish fashion across the whole t.Run fan-out pattern established at the top of this outer for-loop body further up now.
 }
 
+// TestAssembleCancelledReadErrorDropsIncompleteCalls pins interruption classification ahead of the incomplete-tool-call final validation: when no completed output was established and a non-EOF read fails while the run context is done, the output is interrupted, eligible assistant content is retained, and every tool-call block is discarded rather than erroring the response.
+func TestAssembleCancelledReadErrorDropsIncompleteCalls(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancelled so the cancellation observation at finalization is fully deterministic.
+
+	out, s := assemble(t, ctx, testRef,
+		deltaStep(choiceDelta(txtPos(0, "half"))),
+		deltaStep(toolDelta(model.ToolCallFragment{ID: "a"})),                   // identity-only arrival: its name never completes.
+		deltaStep(toolDelta(model.ToolCallFragment{ArgumentFragment: `{"x":`})), // anonymous continuation keeps that same slot structurally incomplete.
+		errStep(errors.New("boom")),                                             // non-EOF read failure observed while the run context is already done.
+	)
+
+	expectStatus(t, out, model.OutputInterrupted) // the incomplete call block must not outrank the interrupted classification; discarding it is the contract, erroring is not.
+	assertSingleClose(t, s)
+
+	parts := msgContent(out)
+	if len(parts) != 1 || parts[0].Text != "half" {
+		t.Fatalf("interrupted output retained parts = %#v, want one text part %q", out.Message, "half")
+	}
+
+	if len(msgCalls(out)) != 0 {
+		t.Fatalf("interrupted output unexpectedly retained tool calls: %#v", out.Message.ToolCalls)
+	}
+}
+
+// TestAssembleCleanEOFBeatsPreCancellation pins normal-EOF precedence over the cancellation check: a valid no-finish-reason payload terminated by EOF completes even when the run context was already done by finalization time — only a non-EOF read failure may classify as interrupted.
+func TestAssembleCleanEOFBeatsPreCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancelled BEFORE assembly begins, so EOF processing is the only thing standing between this stream and an interruption.
+
+	out, s := assemble(t, ctx, testRef, deltaStep(choiceDelta(txtPos(0, "x")))) // no finish-reason chunk; script exhaustion reports io.EOF.
+
+	expectStatus(t, out, model.OutputCompleted) // EOF wins over the cancellation observation; no finish reason is needed for this completion shape.
+	assertSingleClose(t, s)
+}
+
+// TestAssembleStopWithIncompleteCallStaysUnestablished pins that an observed incomplete tool slot blocks stop establishment: completion may only be established from a fully valid finish/payload state over every observed slot, so a cancelled non-EOF read failure still classifies as interrupted, retaining eligible partial content and discarding the unfinished call block.
+func TestAssembleStopWithIncompleteCallStaysUnestablished(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancelled so the cancellation observation at finalization is fully deterministic.
+
+	out, s := assemble(t, ctx, testRef,
+		deltaStep(choiceDelta(txtPos(0, "half"))),
+		deltaStep(toolDelta(model.ToolCallFragment{ID: "a"})), // identity only: the slot is observed but structurally incomplete.
+		deltaStep(stopDelta()),                                // stop beside an observed slot is not yet a valid completion state.
+		errStep(errors.New("boom")),
+	)
+
+	expectStatus(t, out, model.OutputInterrupted) // a bogus establishment must not route the cancelled failure through the final-state conflict instead of the interruption's call-discarding partial.
+	assertSingleClose(t, s)
+
+	parts := msgContent(out)
+	if len(parts) != 1 || parts[0].Text != "half" {
+		t.Fatalf("interrupted output retained parts = %#v, want one text part %q", out.Message, "half")
+	}
+
+	if len(msgCalls(out)) != 0 {
+		t.Fatalf("interrupted output unexpectedly retained tool calls: %#v", out.Message.ToolCalls)
+	}
+}
+
+// TestAssembleEstablishmentResumesAfterSlotCompletes pins the positive sibling: a slot that completes on a later delta passes the same shared establishment check, and the established tool_calls completion is then protected from a cancelled read failure.
+func TestAssembleEstablishmentResumesAfterSlotCompletes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	out, s := assemble(t, ctx, testRef,
+		deltaStep(choiceDelta(txtPos(0, "x"))),
+		deltaStep(toolDelta(model.ToolCallFragment{ID: "a"})),            // incomplete at this instant: no establishment.
+		deltaStep(toolDelta(model.ToolCallFragment{ID: "a", Name: "n"})), // same identity correlates back to the slot and completes it.
+		deltaStep(toolCallsDelta()),                                      // the shared check now sees every observed slot complete with one valid call.
+		errStep(errors.New("late-boom")),
+	)
+
+	expectStatus(t, out, model.OutputCompleted) // establishment protects the now-valid completion from the cancelled read failure.
+	assertSingleClose(t, s)
+
+	calls := msgCalls(out)
+	if len(calls) != 1 || calls[0].ID != "a" || calls[0].Name != "n" {
+		t.Fatalf("calls = %#v, want the single completed call retained", calls)
+	}
+}
+
 func TestAssembleCleanupCloseError(t *testing.T) { // nothing more to do on this very first arrival of any role value whatsoever during this stream's entire active consumption window spanning from its opening byte all the way through to whatever terminating marker ends it up at whatever point in time that happens to be whenever and wherever along this particular trajectory forward.
 	s := newFakeStream(deltaStep(choiceDelta(txtPos(0, "x"))), deltaStep(stopDelta())).withCloseError(errors.New("close-fail")) // build one scripted accepted stream whose Close deliberately reports a failure on every call — the test constructs its full receive script FIRST and only then decides whether closing itself may fail respectively per contract documented in fakeStream's own withCloseError helper further up above all of these lines verbatim without any other behavioral coupling between those two independent concerns anywhere downstream along this trajectory forward now.
 	out, err := Assemble(context.Background(), testRef, s)                                                                      // invoke the assembler under test directly rather than through the shared assemble() helper because THIS specific variant needs its own dedicated stream instance with a pre-configured close error which that convenience wrapper cannot inject on our behalf respectively left-to-right as they appear within its signature above these lines verbatim.

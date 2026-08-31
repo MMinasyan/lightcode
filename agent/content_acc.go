@@ -17,7 +17,7 @@ type partAcc struct {
 func (st *assemblyState) applyContent(f model.ContentFragment) {
 	acc := st.partAt(f.Position)
 
-	if f.Kind == "" || acc.kind != "" && acc.kind != f.Kind { // unknown/empty kind, or a fragment whose kind disagrees with the position's already-decided one: structural conflict — nothing from this fragment may touch the part after pinning it.
+	if !knownPartKind(f.Kind) || acc.kind != "" && acc.kind != f.Kind { // empty or any other kind outside the closed set, or a fragment whose kind disagrees with the position's already-decided one: structural conflict — nothing from this fragment may touch the part after pinning it, kind fields or extras alike.
 		st.noteConflict("content at position %d carries conflicting content kinds", f.Position)
 		return
 	}
@@ -39,13 +39,23 @@ func (st *assemblyState) applyContent(f model.ContentFragment) {
 		if !st.agreeOpaque(acc, f.Position, f.OpaqueWireType) { // structural wire type must agree when repeated non-empty; empty pieces carry no information.
 			return
 		}
-	default: // unknown kind already pinned above as a conflict; nothing else to accumulate for it here.
+	default: // closed-kind admission above means only the three known kinds reach their cases here; this arm is unreachable by construction.
 	}
 
 	for key, value := range f.Extra { // part-scope extras through the ordinary accumulator with its errors ignored for classification by contract.
 		if err := acc.extra.Add(key, value); err != nil {
 			_ = err
 		}
+	}
+}
+
+// knownPartKind admits only the three closed public content kinds; empty and any other non-empty kind is structural noise this accumulator must never store on a position.
+func knownPartKind(k model.PartKind) bool {
+	switch k {
+	case model.PartText, model.PartImageURL, model.PartOpaque:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -59,8 +69,9 @@ func (st *assemblyState) agreeOpaque(acc *partAcc, pos int, wt string) bool {
 	}
 	if acc.opaque != wt { // a different structural type at one position is a content conflict under this contract's rules above it in this file now.
 		st.noteConflict("content at position %d carries conflicting opaque wire types", pos)
+		return false
 	}
-	return false
+	return true // an equal repeated type adds nothing structural; the fragment continues through the ordinary Extra accumulator below.
 }
 
 func (st *assemblyState) partAt(pos int) *partAcc {

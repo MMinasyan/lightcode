@@ -8,20 +8,40 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
+// firstIncompleteToolSlot returns the lowest normalized position whose observed slot does not end structurally complete (non-empty id and name), or -1 when every observed slot is complete. It reads state only, so the per-delta establishment check and the final-state pin share one completeness rule.
+func (st *assemblyState) firstIncompleteToolSlot() int {
+	if len(st.toolDeltas) == 0 {
+		return -1
+	}
+
+	order := make([]int, 0, len(st.toolDeltas)) // sorted slots keep the reported position deterministic across runs even though the underlying state is a map.
+	for pos := range st.toolDeltas {
+		order = append(order, pos)
+	}
+	sort.Ints(order)
+
+	for _, pos := range order {
+		if entry := st.toolDeltas[pos]; entry.id == "" || entry.name == "" { // every slot materialized during correlation is an observation of a tool call; at its current state it must be complete in identity and name.
+			return pos
+		}
+	}
+
+	return -1
+}
+
 func (st *assemblyState) checkEstablishment() {
 	if st.established || st.finishReason == "" {
 		return
 	}
 
-	calls := st.buildCalls()
 	switch st.finishReason {
 	case "stop":
-		if len(calls) == 0 && st.hasPayload() { // both halves hold right now — mark establishment immediately so later read errors and cancellation cannot downgrade this output any further along the wire from here on.
+		if len(st.toolDeltas) == 0 && st.hasPayload() { // ANY observed tool slot — even one buildCalls would omit — breaks stop's no-tool-calls state, so establishment requires both halves fully valid right now: a call-free payload with nothing observed.
 			st.established = true
 		}
 
 	case "tool_calls":
-		if len(calls) > 0 {
+		if len(st.toolDeltas) > 0 && st.firstIncompleteToolSlot() < 0 { // at least one call exists and every observed slot is complete and valid; an incomplete slot may complete on a later delta, where this same check runs again.
 			st.established = true
 		}
 
@@ -35,28 +55,28 @@ func (st *assemblyState) finalize(ctx context.Context, readErr error) model.Outp
 		st.noteConflict("response role %q is not assistant", r)
 	}
 
-	st.pinIncompleteOpaque()   // final-state content completeness gates every downstream classification path before any of them can complete or retain this response.
+	st.pinIncompleteOpaque() // content completeness gates every downstream classification path, interruption included, before any of them can retain or complete this response.
+
+	if st.conflictDetail == "" && readErr != nil && !st.established && ctx.Err() != nil {
+		return st.interruptedOutput(ctx) // interruption classification runs ahead of the incomplete-tool-call final validation: every tool-call block, incomplete or not, is discarded from the retained partial rather than erroring the output.
+	}
+
 	st.pinIncompleteToolCall() // every observed normalized tool-call slot must end structurally complete — an unfinished one, with data in it or without, errors the whole response instead of being silently dropped when another valid call exists.
 
 	if st.conflictDetail != "" {
 		return st.erroredOutput(st.conflictDetail)
 	}
 
-	if readErr != nil { // a failed tail observation only downgrades streams that never established themselves — for those already completed on an earlier finish/payload combination the shared matrix must still agree with final state before completion is preserved respectively per contract documented inline within its own single-line comment further up over there now.
-		switch {
-		case st.established: // trust the flag only after re-running exactly the verdict cleanTermination applies below it — a late-arriving mismatch such as tool calls under an established stop errors with that matrix's own wording rather than silently completing or misclassifying into plain read-failure territory anywhere downstream of this shortcut moment along its trajectory forward now.
-			if ok, detail := st.finishStateVerdict(); !ok { // the finally observed semantic state no longer matches its own finish reason — completion is not preserved through either a live read error OR a pre-existing cancellation when that divergence exists respectively per contract above these lines verbatim left-to-right as they appear in wire order over there.
-				return st.erroredOutput(detail) // the mismatch itself explains this non-successful shape more precisely than any attribution to the failed tail observation could — no second diagnostic is needed alongside it anywhere downstream of that precedence decision further up now under exactly one shared rule documented inline within its own single-line comment rather than requiring additional checks beyond what's already pinned above these lines verbatim without duplication or redundancy whatsoever at all.
-			}
-
-			return st.completedOutput() // final semantic state still matches the reason that established it — completion is preserved through both read errors AND cancellation under exactly one shared rule documented here now (the positive sibling of the mismatch branch immediately above it in this same case body respectively left-to-right as they appear within these two statements further up over there).
-
-		case ctx.Err() != nil:
-			return st.interruptedOutput(ctx)
-
-		default:
+	if readErr != nil {
+		if !st.established { // a non-EOF read failure with a live run context and no established completion is an ordinary stream error.
 			return st.erroredOutput(fmt.Sprintf("stream read failed: %v", readErr))
 		}
+
+		if ok, detail := st.finishStateVerdict(); !ok { // an established output still undergoes the final semantic matrix before any read-error/cancellation protection: a late mismatch such as tool calls under an established stop errors with that matrix's own wording.
+			return st.erroredOutput(detail)
+		}
+
+		return st.completedOutput() // final semantic state still matches the reason that established it — completion is preserved through both read errors and cancellation.
 	}
 
 	return st.cleanTermination()
@@ -74,21 +94,8 @@ func (st *assemblyState) pinIncompleteOpaque() {
 
 // pinIncompleteToolCall pins a final-state conflict for every observed normalized tool-call slot that does not end structurally complete — whether it accumulated only part of its identity or nothing at all: an unfinished block must error the response rather than vanish silently when another valid call happens to exist in the same payload.
 func (st *assemblyState) pinIncompleteToolCall() {
-	if len(st.toolDeltas) == 0 {
-		return
-	}
-
-	order := make([]int, 0, len(st.toolDeltas)) // sorted slots keep the reported conflict position deterministic across runs even though the underlying state is a map.
-	for pos := range st.toolDeltas {
-		order = append(order, pos)
-	}
-	sort.Ints(order)
-
-	for _, pos := range order {
-		if entry := st.toolDeltas[pos]; entry.id == "" || entry.name == "" { // every slot materialized during correlation is an observation of a tool call; at final state it must be complete in identity and name regardless of what its fragments carried or omitted.
-			st.noteConflict("tool call at position %d is incomplete: missing id or name", pos)
-			return // first unfinished block wins; later ones add nothing to classification.
-		}
+	if pos := st.firstIncompleteToolSlot(); pos >= 0 { // the same non-mutating completeness predicate the establishment check consults, here turned into the shared set-once conflict detail.
+		st.noteConflict("tool call at position %d is incomplete: missing id or name", pos)
 	}
 }
 

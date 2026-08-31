@@ -114,6 +114,92 @@ func TestValidateToolResult(t *testing.T) { // nothing more to do on this very f
 	}
 }
 
+// mkCallsTerminalOutput builds one completed output carrying three ordered tool calls through the public constructor — a construction failure here means this test fixture itself is broken, not the code under test.
+func mkCallsTerminalOutput() *model.Output {
+	msg := model.Message{
+		Role:      model.RoleAssistant,
+		Source:    testRef,
+		Content:   []model.ContentPart{{Kind: model.PartText, Text: "x"}},
+		ToolCalls: []model.ToolCall{{ID: "a", Name: "fnA"}, {ID: "b", Name: "fnB"}, {ID: "c", Name: "fnC"}},
+	}
+	out, err := model.NewOutput(model.Output{Status: model.OutputCompleted, Source: testRef, Message: &msg})
+	if err != nil {
+		panic(fmt.Sprintf("test fixture failed model-output validation: %v", err))
+	}
+
+	return &out
+}
+
+// TestValidateTerminalResult pins the closed terminal-result status/payload table end to end: every only-valid combination passes, and each invalid shape — unknown status, wrong payload class, stray unstarted calls, calls not identified from the completed last output, or out-of-order identification — returns exactly one typed boundary-protocol error naming the "agent" boundary.
+func TestValidateTerminalResult(t *testing.T) {
+	completed := mkSettlementOutput(model.OutputCompleted, "")
+	errored := mkSettlementOutput(model.OutputErrored, "boom")
+	interrupted := mkSettlementOutput(model.OutputInterrupted, "stopped")
+	callsOut := mkCallsTerminalOutput()
+
+	unstarted := func(idx ...int) []model.ToolCall { // ordered picks from the completed output's own call list.
+		out := make([]model.ToolCall, 0, len(idx))
+		for _, i := range idx {
+			out = append(out, callsOut.Message.ToolCalls[i])
+		}
+		return out
+	}
+
+	// badLastOutput is a completed-shaped output that fails re-validation through the public model constructor: its message carries a foreign source identity.
+	badLastOutput := &model.Output{
+		Status: model.OutputCompleted,
+		Source: testRef,
+		Message: &model.Message{Role: model.RoleAssistant, Source: model.ModelRef{Provider: "acme", Model: "m-other"},
+			Content: []model.ContentPart{{Kind: model.PartText, Text: "x"}}},
+	}
+
+	cases := []struct {
+		name    string
+		res     TerminalResult
+		wantErr bool
+	}{
+		{"valid-success-completed-no-calls", TerminalResult{Status: TerminalSuccess, LastOutput: completed}, false},
+		{"valid-failure-no-output", TerminalResult{Status: TerminalFailure, Detail: "d"}, false},
+		{"valid-failure-with-errored", TerminalResult{Status: TerminalFailure, LastOutput: errored, Detail: "d"}, false},
+		{"valid-failure-with-completed", TerminalResult{Status: TerminalFailure, LastOutput: completed, Detail: "d"}, false},
+		{"valid-interruption-no-output", TerminalResult{Status: TerminalInterruption, Detail: "d"}, false},
+		{"valid-interruption-with-interrupted", TerminalResult{Status: TerminalInterruption, LastOutput: interrupted, Detail: "d"}, false},
+		{"valid-interruption-with-completed", TerminalResult{Status: TerminalInterruption, LastOutput: completed, Detail: "d"}, false},
+		{"valid-interruption-unstarted-suffix", TerminalResult{Status: TerminalInterruption, LastOutput: callsOut, UnstartedCalls: unstarted(1, 2), Detail: "d"}, false},
+		{"valid-interruption-unstarted-increasing", TerminalResult{Status: TerminalInterruption, LastOutput: callsOut, UnstartedCalls: unstarted(0, 2), Detail: "d"}, false},
+		{"invalid-unknown-status", TerminalResult{Status: "bogus", Detail: "d"}, true},
+		{"invalid-empty-status", TerminalResult{Detail: "d"}, true},
+		{"invalid-success-nil-last-output", TerminalResult{Status: TerminalSuccess}, true},
+		{"invalid-success-errored-output", TerminalResult{Status: TerminalSuccess, LastOutput: errored}, true},
+		{"invalid-success-nonempty-detail", TerminalResult{Status: TerminalSuccess, LastOutput: completed, Detail: "x"}, true},
+		{"invalid-success-unstarted-calls", TerminalResult{Status: TerminalSuccess, LastOutput: completed, UnstartedCalls: []model.ToolCall{{ID: "x", Name: "n"}}}, true},
+		{"invalid-success-output-with-tool-calls", TerminalResult{Status: TerminalSuccess, LastOutput: callsOut}, true},
+		{"invalid-success-model-invalid-output", TerminalResult{Status: TerminalSuccess, LastOutput: badLastOutput}, true}, // present outputs are re-validated through the public model constructor.
+		{"invalid-failure-empty-detail", TerminalResult{Status: TerminalFailure}, true},
+		{"invalid-failure-interrupted-output", TerminalResult{Status: TerminalFailure, LastOutput: interrupted, Detail: "d"}, true},
+		{"invalid-failure-unstarted-calls", TerminalResult{Status: TerminalFailure, LastOutput: errored, UnstartedCalls: []model.ToolCall{{ID: "x", Name: "n"}}, Detail: "d"}, true},
+		{"invalid-interruption-empty-detail", TerminalResult{Status: TerminalInterruption}, true},
+		{"invalid-interruption-errored-output", TerminalResult{Status: TerminalInterruption, LastOutput: errored, Detail: "d"}, true},
+		{"invalid-interruption-unstarted-without-output", TerminalResult{Status: TerminalInterruption, UnstartedCalls: []model.ToolCall{{ID: "a", Name: "fnA"}}, Detail: "d"}, true},
+		{"invalid-interruption-unstarted-on-interrupted-output", TerminalResult{Status: TerminalInterruption, LastOutput: interrupted, UnstartedCalls: []model.ToolCall{{ID: "a", Name: "fnA"}}, Detail: "d"}, true},
+		{"invalid-interruption-unstarted-not-from-output", TerminalResult{Status: TerminalInterruption, LastOutput: callsOut, UnstartedCalls: []model.ToolCall{{ID: "zz", Name: "n"}}, Detail: "d"}, true},
+		{"invalid-interruption-unstarted-reversed-order", TerminalResult{Status: TerminalInterruption, LastOutput: callsOut, UnstartedCalls: unstarted(2, 1), Detail: "d"}, true},
+		{"invalid-interruption-unstarted-duplicate-id", TerminalResult{Status: TerminalInterruption, LastOutput: callsOut, UnstartedCalls: unstarted(1, 1), Detail: "d"}, true},
+		{"invalid-interruption-unstarted-invalid-call", TerminalResult{Status: TerminalInterruption, LastOutput: callsOut, UnstartedCalls: []model.ToolCall{{ID: "a"}}, Detail: "d"}, true}, // present calls are re-validated through the public model constructor.
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateTerminalResult(tc.res)
+			if tc.wantErr {
+				requireBoundaryViolation(t, err, "agent")
+			} else if err != nil {
+				t.Fatalf("expected valid terminal result, got: %v", err)
+			}
+		})
+	}
+}
+
 func mkForeignSettlementOutput(status model.OutputStatus, detail string, src model.ModelRef) *model.Output { // nothing more to do on this very first arrival of any role value whatsoever during this stream's entire active consumption window spanning from its opening byte all the way through to whatever terminating marker ends it up at whatever point in time that happens to be whenever and wherever along this particular trajectory forward.
 	msg := model.Message{Role: model.RoleAssistant, Source: src} // one canonical assistant message carrying exactly THIS caller-supplied foreign identity per contract above these lines verbatim (both non-completed shapes below tolerate its presence; completed additionally requires the payload part appended further down now under exactly one rule documented inline within its own single-line comment rather than scattered across multiple files' worth of prose elsewhere in wire order).
 
