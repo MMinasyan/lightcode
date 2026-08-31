@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 )
 
@@ -12,7 +13,7 @@ type ResolvedTransport struct {
 	Model             ModelRef            // target model identity; must be complete (zero or partial is rejected).
 	BaseURL           string              // base URL for endpoint construction; empty uses the default OpenAI v1 endpoint.
 	APIKey            string              // resolved API key value; empty omits the Authorization header entirely.
-	Headers           map[string]string   // resolved headers that overwrite matching built-in defaults after they are set.
+	Headers           map[string]string   // resolved headers that overwrite matching built-in defaults (case-insensitively, http.Header.Set semantics) after they are set.
 	ProviderExtraBody Extra               // provider-level top-level extra-body layer, merged under model and runtime layers.
 	ModelExtraBody    Extra               // model-level top-level extra-body layer, merged under the runtime layer.
 	WireSystemRole    string              // effective wire role canonical system messages encode as: "system", "user" or "developer"; empty defaults to "system".
@@ -109,6 +110,9 @@ func Encode(in ResolvedTransport, req Request, runtimeExtras map[string]json.Raw
 
 	for _, layer := range []Extra{rt.ProviderExtraBody, rt.ModelExtraBody, runtimeLayer} { // shallow merge: later layers win per key; values are cloned into the body.
 		for k, v := range layer {
+			if strings.HasPrefix(k, "_lightcode_") {
+				continue // rule 9 at top-level scope too: private persistence fields never become wire data from any sidecar layer (reserved keys already rejected above).
+			}
 			body[k] = cloneRaw(v)
 		}
 	}
@@ -357,37 +361,37 @@ func allowedPartKeys(kind PartKind) func(string) bool { // opaque parts keep the
 	return contentPartExtraAllowed
 }
 
-// cloneResolvedInput deep-copies every reference-typed field of one resolved transport input; scalar fields move with the struct value copy itself, and empty collections stay nil exactly like their inputs (nil maps are safe to range).
+// cloneResolvedInput deep-copies every reference-typed field of one resolved transport input: scalar fields move with the struct value copy itself, and every non-nil map or slice is cloned even when empty so retained collections never alias caller storage (nil inputs stay nil). Both accepting boundaries — direct encoder invocation and transport construction — share this helper.
 func cloneResolvedInput(in ResolvedTransport) ResolvedTransport {
 	out := in // identity strings, endpoint/key values, flags, role, debug dir.
-	if len(out.Headers) > 0 {
-		headers := make(map[string]string, len(out.Headers)) // string values are immutable; copying the entries IS the deep copy here.
+	if out.Headers != nil {
+		headers := make(map[string]string, len(out.Headers)) // string values are immutable; copying the entries IS the deep copy here (an empty map still gets its own storage).
 		for k, v := range out.Headers {
 			headers[k] = v
 		}
 		out.Headers = headers
 	}
-	if len(out.ProviderExtraBody) > 0 {
-		out.ProviderExtraBody = in.ProviderExtraBody.Clone()
+	if in.ProviderExtraBody != nil {
+		out.ProviderExtraBody = in.ProviderExtraBody.Clone() // owned deep copy or the package's canonical empty form — never a shared reference.
 	}
-	if len(out.ModelExtraBody) > 0 {
+	if in.ModelExtraBody != nil {
 		out.ModelExtraBody = in.ModelExtraBody.Clone()
 	}
-	if len(out.MustPreserve) > 0 {
-		fields := make([]string, len(out.MustPreserve)) // ordered list: element order is contract-relevant for warning emission.
+	if out.MustPreserve != nil {
+		fields := make([]string, len(out.MustPreserve)) // ordered list: element order is contract-relevant for warning emission (empty lists cloned too).
 		copy(fields, out.MustPreserve)
 		out.MustPreserve = fields
 	}
-	if len(out.Drop) > 0 {
-		dropSet := make(map[string]bool, len(out.Drop)) // a key drops exactly when its boolean value is true (the retained check shape).
+	if out.Drop != nil {
+		dropSet := make(map[string]bool, len(out.Drop)) // a key drops exactly when its boolean value is true (the retained check shape; empty sets cloned too).
 		for k, v := range out.Drop {
 			dropSet[k] = v
 		}
 		out.Drop = dropSet
 	}
-	if len(out.SourceFamilies) > 0 {
-		fams := make(map[ModelRef]string, len(out.SourceFamilies)) // string values are immutable.
-		for k, v := range out.SourceFamilies {
+	if in.SourceFamilies != nil {
+		fams := make(map[ModelRef]string, len(in.SourceFamilies)) // string values are immutable.
+		for k, v := range in.SourceFamilies {
 			fams[k] = v
 		}
 		out.SourceFamilies = fams
@@ -395,31 +399,30 @@ func cloneResolvedInput(in ResolvedTransport) ResolvedTransport {
 	return out
 }
 
-// BuildHeaders returns the chat request headers for one resolved transport: JSON content type and SSE accept first, Bearer authorization only when a key is present, then every resolved header overwriting matching defaults (and adding new ones). Keys keep their exact case as given.
+// BuildHeaders returns the chat request headers for one resolved transport, built by a single helper path over an http.Header so every entry carries exactly its Set semantics: MIME-canonical storage and case-insensitive matching of existing entries. It sets JSON content type and SSE accept first, Bearer authorization only when a key is present, then applies each resolved header — which therefore overwrites any default (or earlier entry) it matches regardless of spelling, collapsing to one canonical-form entry per name rather than coexisting as separate case variants.
 func BuildHeaders(in ResolvedTransport) map[string]string { // pure helper shared by the encoder contract's tests; Commit 3's transport calls it for its physical requests too.
-	headers := map[string]string{
-		"Content-Type": "application/json",
-		"Accept":       "text/event-stream",
-	}
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Accept", "text/event-stream")
 	if in.APIKey != "" { // empty key omits the Authorization header entirely rather than emitting an empty bearer value.
-		headers["Authorization"] = "Bearer " + in.APIKey
+		headers.Set("Authorization", "Bearer "+in.APIKey)
 	}
-	for k, v := range in.Headers { // resolved headers win over matching defaults; iteration order is irrelevant because each final map holds one value per case-sensitive key.
-		headers[k] = v
+	for k, v := range in.Headers { // resolved entries win over every matching default or prior entry; Set matches case-insensitively and stores each name once in canonical form (last write wins among same-name inputs).
+		headers.Set(k, v)
 	}
-	return headers
+	out := make(map[string]string, len(headers))
+	for key, values := range headers { // one value per retained header by construction of the Set path above.
+		out[key] = values[0]
+	}
+	return out
 }
 
-// ChatEndpoint resolves the chat-completions endpoint: trailing slashes removed from a non-empty base plus /chat/completions, or the default OpenAI v1 URL when no base is configured. An empty-path scheme-relative input such as "https://host/" yields exactly one slash before the path segment (no double-slash).
+// ChatEndpoint resolves the chat-completions endpoint: trailing slashes removed from a non-empty base plus /chat/completions; the default OpenAI v1 URL is used only when the original BaseURL itself was empty, so every other input — however degenerate after trimming — resolves through trim-plus-suffix. A trailing-slash base such as "https://host/" yields exactly one slash before the path segment (no double-slash).
 func ChatEndpoint(in ResolvedTransport) string { // pure helper; Commit 3's transport calls it for its physical requests too.
-	if in.BaseURL == "" {
+	if in.BaseURL == "" { // only a truly empty original base takes the default endpoint — no post-trim special case exists or may be added here.
 		return defaultOpenAIChatEndpoint
 	}
-	base := strings.TrimRight(in.BaseURL, "/") // one or more trailing slashes collapse away before the fixed suffix is appended.
-	if base == "" {                            // a slash-only input has no host component: treat it as unset rather than emitting an invalid endpoint.
-		return defaultOpenAIChatEndpoint
-	}
-	return base + chatCompletionsPathSuffix
+	return strings.TrimRight(in.BaseURL, "/") + chatCompletionsPathSuffix // one or more trailing slashes collapse away before the fixed suffix is appended (a slash-only base trims to an empty host part and keeps exactly that).
 }
 
 const (

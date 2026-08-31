@@ -262,6 +262,42 @@ func TestNewRequestValidAndOwnership(t *testing.T) {
 	}
 }
 
+// TestNewRequestNeverRetainsZeroLengthSliceBacking pins the ownership rule for request/message slices through their shared clone path (the one Encode re-runs at its trust boundary): a zero-length slice accepted with spare capacity must not retain caller-owned backing storage, so later appends on either side cannot see into each other. Representation is deliberately unpinned — nil or an independently allocated empty both satisfy the alias-free rule this row asserts behaviorally only.
+func TestNewRequestNeverRetainsZeroLengthSliceBacking(t *testing.T) {
+	// zero length with real spare capacity on caller-owned storage: the exact retained-capacity shape under test. A literal empty slice would not exercise it (its backing carries no slots either side's appends could share).
+	zeroContent := make([]ContentPart, 0, 4)                                                 // four slots so both sides' two-part appends below fit inside one shared array if retention were buggy... (a smaller capacity would force an early reallocation and mask the aliasing this row exists to catch).
+	fullCallsBase := []ToolCall{{ID: "call-a", Name: "alpha"}, {ID: "call-b", Name: "beta"}} // two seed calls so truncating below leaves at least one shared slot of headroom for both sides' appends.
+	zeroCalls := fullCallsBase[:0]                                                           // zero length with that capacity now riding along on the caller's own array.
+
+	inMsg, err := NewMessage(Message{Role: RoleAssistant, Source: fullRef, Content: zeroContent, ToolCalls: zeroCalls}) // valid assistant shape so the fixture reaches the clone path exactly as Encode's boundary would.
+	if err != nil {
+		t.Fatalf("NewRequest(fixture) rejected a valid message with spare-capacity empty slices: %v", err)
+	}
+
+	out, outErr := NewRequest(Request{Messages: []Message{inMsg}}) // same shared clone path the encoder invokes per call — this row judges ITS retention behavior.
+	if outErr != nil {
+		t.Fatalf("NewRequest returned error for valid spare-capacity empty slices: %v", outErr)
+	}
+
+	out.Messages[0].Content = append(out.Messages[0].Content, ContentPart{Kind: PartText, Text: "out-1"}, ContentPart{Kind: PartText, Text: "out-2"}) // retained-side appends into whatever backing it was given... (must land in storage the caller never owned).
+	inMsg.Content = append(inMsg.Content, ContentPart{Kind: PartText, Text: "in-1"}, ContentPart{Kind: PartText, Text: "in-2"})                       // ...and vice versa from the caller side.
+
+	out.Messages[0].ToolCalls = append(out.Messages[0].ToolCalls, ToolCall{ID: "call-out", Name: "out-call"}) // same discipline on the calls scope... (one slot each fits inside a shared two-slot array if one existed).
+	inMsg.ToolCalls = append(inMsg.ToolCalls, ToolCall{ID: "call-in", Name: "in-call"})                       // ...so both fields of the message are judged by their own row.
+
+	if got := out.Messages[0].Content; len(got) != 2 || got[0].Text != "out-1" || got[1].Text != "out-2" {
+		t.Fatalf("retained content observed caller-side appends through shared backing storage: %#v (want exactly the two retained-side parts)", got) // pre-fix this slice is the caller's own header, so its slots were clobbered by the in-*-appends above — the precise leak shape.
+	} else if got := inMsg.Content; len(got) != 2 || got[0].Text != "in-1" || got[1].Text != "in-2" { // symmetric direction: the caller's view must hold exactly its own appends too.
+		t.Fatalf("caller content observed retained-side appends through shared backing storage: %#v (want exactly the two caller parts)", got)
+	}
+
+	if got := out.Messages[0].ToolCalls; len(got) != 1 || got[0].ID != "call-out" { // calls scope, retained side.
+		t.Fatalf("retained tool calls observed caller-side appends through shared backing storage: %#v (want exactly the one retained call)", got)
+	} else if got := inMsg.ToolCalls; len(got) != 1 || got[0].ID != "call-in" { // ...and its mirror direction.
+		t.Fatalf("caller tool calls observed retained-side appends through shared backing storage: %#v (want exactly the one caller call)", got)
+	}
+}
+
 // TestNewOutputSourceIdentityComparedByFields pins that output source identity is compared by struct fields (Provider and Model separately), not via the lossy String() rendering: two complete identities whose rendered forms collide at the first-slash split must be rejected, while identical field values are accepted even when a provider value contains slashes.
 func TestNewOutputSourceIdentityComparedByFields(t *testing.T) {
 	colliding := ModelRef{Provider: "openrouter", Model: "other/model"}  // renders as openrouter/other/model.

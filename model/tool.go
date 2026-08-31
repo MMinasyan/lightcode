@@ -144,17 +144,21 @@ func NewToolResult(in ToolResult) (ToolResult, error) {
 	return in, nil
 }
 
-// cloneOwnedMessage deep-copies a message whose validation already passed at the current boundary. It is shared by NewMessage and other accepting constructors so every ownership transfer copies parts, calls, argument bytes, and extras independently of the input.
+// cloneOwnedMessage deep-copies a message whose validation already passed at the current boundary. It is shared by NewMessage and other accepting constructors so every ownership transfer copies parts, calls, argument bytes, and extras independently of the input; zero-length slices never retain caller-owned backing storage (they normalize to nil per the package's empty form) even when they carry spare capacity.
 func cloneOwnedMessage(in Message) Message {
-	out := in
-	if len(out.Content) > 0 {
+	out := in // scalars move with the value copy itself; every reference-typed field below gets owned or normalized storage instead of a shared header.
+	if len(out.Content) == 0 {
+		out.Content = nil // zero-length input (with any spare capacity it may carry on caller-owned backing) normalizes to this package's empty form rather than keeping the caller's slice header and its storage.
+	} else {
 		out.Content = make([]ContentPart, len(in.Content))
 		for i, part := range in.Content {
 			part.Extra = part.Extra.Clone()
 			out.Content[i] = part
 		}
 	}
-	if len(out.ToolCalls) > 0 {
+	if len(out.ToolCalls) == 0 { // same rule as content parts: no retained caller header for an empty call list.
+		out.ToolCalls = nil
+	} else {
 		out.ToolCalls = make([]ToolCall, len(in.ToolCalls))
 		for i, call := range in.ToolCalls {
 			call.Arguments = cloneRaw(call.Arguments)
