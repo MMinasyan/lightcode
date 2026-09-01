@@ -109,7 +109,7 @@ func (t *Transport) Stream(ctx context.Context, req Request, runtimeExtras map[s
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		statusErr := httpStatusError(resp) // reads the error body through its retained limit before it is closed.
-		resp.Body.Close()
+		_ = resp.Body.Close()              // Cleanup cannot replace the status error.
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			return nil, warnings, errors.Join(ErrAuthFailed, statusErr) // auth failures keep every transport fact plus the sentinel identity.
 		}

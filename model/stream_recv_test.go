@@ -256,11 +256,11 @@ func (b *failingBody) Read(p []byte) (int, error) { // io.Reader contract with a
 }
 
 func (b *failingBody) Close() error { return nil } // no resources to release beyond what caller already owns: same minimalism as every other reader in this file by construction... (implementing ReadCloser keeps it drop-in compatible with newStream's body parameter without wrapper structs anywhere).
-// TestSSEReadFailureIsTypedAndTerminal pins non-EOF body read failures through the retained port semantics in order: a terminal read that still delivered an unterminated final event decodes it FIRST (the pending-first rule applies when termination is failure as well as clean EOF, exactly like its legacy source), then the injected fault itself surfaces on the following receive wrapped in ErrProtocol with its exact cause reachable via errors.Is — and every subsequent receive reports only io.EOF through the terminal done flag rather than re-surfacing the same failure.
+// TestSSEReadFailureIsTypedAndTerminal distinguishes a body failure from the pending-event rule for raw EOF.
 func TestSSEReadFailureIsTypedAndTerminal(t *testing.T) { // one well-formed event delivered first to prove normal path works up to that point, THEN a synthetic mid-read injection fault triggers the interesting behavior under test... (separating setup from exercise keeps each assertion's intent unambiguous in failure output).
 
 	body := "data:{\"choices\":[{\"delta\":{\"content\":\"before-fault\"}}]}\n\n" + // one complete well-formed event FIRST so normal delivery is proven working up to this exact moment... (its successful parse below doubles as precondition check for everything interesting that follows).
-		"data: {\"choices\":[{\"delta\":{\"content\":\"pending-at-fault\"}}]}" // trailing COMPLETE JSON without its terminating blank line — the retained pending-first rule decodes it when the terminal read arrives, even though that termination is our injected failure rather than clean EOF... (this sub-case and TestSSEPendsUnterminatedDataEventsAtEOF together pin both sides of "pending events decode at ANY terminal read").
+		"data: {\"choices\":[{\"delta\":{\"content\":\"dropped-at-fault\"}}]}"
 
 	src := &failingBody{prefix: []byte(body), fault: errors.New("synthetic mid-stream read failure")} // wire up exactly one deterministic cause at a known location within otherwise-healthy content... (determinism matters more than realism here for pure behavior-shape testing).
 	s := newStream(src, "")                                                                           // standard construction as everywhere else in this file set — the fault lives entirely inside src's Read semantics rather than anywhere near framing logic itself.
@@ -272,18 +272,16 @@ func TestSSEReadFailureIsTypedAndTerminal(t *testing.T) { // one well-formed eve
 		t.Fatalf("pre-fault delta = %#v; want proof that normal delivery worked before injecting our synthetic read error", first) // full rendering so any mismatch dimension is immediately visible without re-running under more detailed logging configuration than default provides.
 	}
 
-	pending, perr := s.Recv() // the terminal read delivered the unterminated final event together with our injected fault: retained rule decodes that complete payload before anything else... (identical pending-first behavior to its clean-EOF sibling — only the kind of termination differs).
-	if perr != nil {          // no error here precisely because those bytes formed a COMPLETE valid payload despite never receiving their blank-line terminator.
-		t.Fatalf("Recv delivering the pending-at-failure event = %v; want that complete final payload decoded first per retained rule", perr)
-	} else if !pending.HasChoice || len(pending.ContentFragments) != 1 || pending.ContentFragments[0].Text != "pending-at-fault" { // exact marker value distinguishes this delta from every sibling row's in aggregated verbose output.
-		t.Fatalf("pending-at-failure delta = %#v; want the complete unterminated final event decoded before any fault surfaces", pending)
+	dropped, derr := s.Recv()
+	if !errors.Is(derr, ErrProtocol) {
+		t.Fatalf("Recv at injected fault = %v, want ErrProtocol", derr)
+	} else if !errors.Is(derr, src.fault) {
+		t.Fatalf("injected fault not reachable through %v", derr)
+	} else if dropped.HasChoice || len(dropped.ContentFragments) != 0 {
+		t.Fatalf("non-EOF fault returned a non-zero delta %#v; want the pending event discarded", dropped)
 	}
 
-	if _, ferr := s.Recv(); !errors.Is(ferr, ErrProtocol) { // now that no payload remains to flush: THE injected fault itself must surface wrapped in the typed protocol sentinel — same umbrella identity as every other read-level failure class in this package.
-		t.Fatalf("Recv after pending-flush = %v; want an error wrapping ErrProtocol", ferr) // naming exactly which layer's expectation failed keeps output unambiguous when triaging against sibling malformed-payload rows elsewhere... (consistent phrasing across all such assertions is what lets humans find related coverage quickly).
-	} else if !errors.Is(ferr, src.fault) { // AND the specific synthetic cause itself must remain reachable through wrapping — proving no intermediate layer swallowed or replaced our deliberately-injected identity along the way.
-		t.Fatalf("injected fault not reachable through wrapped Recv error: %v (chain does not contain our sentinel)", ferr) // full value rendered so triage sees precisely which unrelated error surfaced instead when this regresses... (message phrasing mirrors sibling rows' convention of showing complete actual values alongside derived checks).
-	} else if _, again := s.Recv(); !errors.Is(again, io.EOF) { // post-fault terminal state: further receives see EOF through done flag rather than re-surfacing the same fault repeatedly... (uniformity across ALL read-error shapes is what callers can rely on above this boundary).
+	if _, again := s.Recv(); !errors.Is(again, io.EOF) { // post-fault terminal state: further receives see EOF through done flag rather than re-surfacing the same fault repeatedly... (uniformity across ALL read-error shapes is what callers can rely on above this boundary).
 		t.Fatalf("Recv after injected fault = %v; want sustained io.EOF", again) // mirrors every other post-failure terminal check in the suite for consistency — future readers should never have to wonder whether THIS particular shape was intentionally left unasserted.
 	} else if cerr := s.Close(); cerr != nil {
 		t.Fatalf("Close returned error following injected fault: %v", cerr) // releasing after a failed read must still behave like every other Close in the suite — quiet, idempotent-friendly cleanup with no transport facts surfaced to consumers at this point... (included because close-after-error is exactly the kind of edge where state corruption hides best).

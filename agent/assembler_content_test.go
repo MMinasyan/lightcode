@@ -8,6 +8,27 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
+func TestAssembleRejectsInvalidStreamDeltas(t *testing.T) {
+	malformed := json.RawMessage(`{`)
+	cases := []struct {
+		name  string
+		delta model.StreamDelta
+	}{
+		{"negative-content-position", choiceDelta(model.ContentFragment{Position: -1, Kind: model.PartText, Text: "x"})},
+		{"negative-tool-position", toolDelta(model.ToolCallFragment{Position: posI(-1), ID: "a", Name: "n"})},
+		{"cross-kind-content-field", choiceDelta(model.ContentFragment{Kind: model.PartText, Text: "x", URL: "https://example.com"})},
+		{"malformed-content-extra", choiceDelta(model.ContentFragment{Kind: model.PartText, Text: "x", Extra: model.Extra{"k": malformed}})},
+		{"malformed-tool-extra", toolDelta(model.ToolCallFragment{ID: "a", Name: "n", Extra: model.Extra{"k": malformed}})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, stream := assemble(t, context.Background(), testRef, deltaStep(tc.delta))
+			expectStatus(t, out, model.OutputErrored)
+			assertSingleClose(t, stream)
+		})
+	}
+}
+
 // TestAssembleContentPositionsAndOrdering pins one positioned accumulator across interleaved fragments arriving out of order: final parts are ordered by ascending position regardless of arrival sequence, text concatenates per position without separators, image URLs win first-seen.
 func TestAssembleContentPositionsAndOrdering(t *testing.T) {
 	out, s := assemble(t, context.Background(), testRef,

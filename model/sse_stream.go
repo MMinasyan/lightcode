@@ -41,13 +41,14 @@ func (s *httpStream) Recv() (StreamDelta, error) {
 
 		switch {
 		case line == "" && rerr != nil: // terminal read with no bytes this round (EOF or a body failure).
-			if len(data) > 0 {
-				return s.decode(data)
-			} // the last data lines arrived without their terminating blank line: flush that pending event first, then EOF/failure is reported on the next receive.
-			s.done = true // nothing remains after this round; later receives see only io.EOF through done (a read failure surfaces exactly once below).
 			if rerr != io.EOF {
+				s.done = true
 				return StreamDelta{}, protocolReadError(rerr)
 			}
+			if len(data) > 0 {
+				return s.decode(data)
+			} // Only raw EOF flushes a pending unterminated event first.
+			s.done = true
 			return StreamDelta{}, io.EOF
 
 		case line == "": // blank line ends an event; one without any data lines is ignored entirely (its other fields were discarded as they arrived).
@@ -66,13 +67,14 @@ func (s *httpStream) Recv() (StreamDelta, error) {
 		}
 
 		if rerr != nil { // terminal read that still delivered a final unterminated fragment; it was processed above as an ordinary line.
-			if len(data) > 0 {
-				return s.decode(data)
-			} // body EOF (or failure) with data lines pending decodes them first — this is also where [DONE] without trailing newline terminates, via decode's own terminator check.
-			s.done = true // no payload survived that final fragment: terminal from here on.
 			if rerr != io.EOF {
+				s.done = true
 				return StreamDelta{}, protocolReadError(rerr)
 			}
+			if len(data) > 0 {
+				return s.decode(data)
+			} // Only raw EOF flushes a final unterminated data fragment first.
+			s.done = true // no payload survived that final fragment: terminal from here on.
 			return StreamDelta{}, io.EOF
 		}
 	}

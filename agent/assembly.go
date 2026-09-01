@@ -57,7 +57,12 @@ func (st *assemblyState) assemble(ctx context.Context, stream model.Stream) mode
 			readErr = err
 			break
 		}
-		st.applyDelta(delta)
+		owned, verr := model.NewStreamDelta(delta) // Revalidate and own direct stream implementations at the Agent boundary.
+		if verr != nil {
+			st.noteConflict("received stream delta rejected: %v", verr)
+			continue
+		}
+		st.applyDelta(owned)
 	}
 
 	return st.finalize(ctx, readErr)

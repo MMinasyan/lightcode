@@ -42,13 +42,18 @@ func TestPublicFoundationDependencyIsolation(t *testing.T) {
 	}
 }
 
-// checkTrackedGoFile applies the baseline rules to one tracked production file from its module-root slash path and parsed imports: model/ accepts only authoritative stdlib members, agent/ accepts those plus the public model package, and every other file — under any directory name, with no path-based skipping — accepts neither new package.
+// checkTrackedGoFile applies the dependency baseline to one tracked production file.
 func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []string {
 	const modelPkg = publicModule + "/model"
 	const agentPkg = publicModule + "/agent"
 	var problems []string
+	dir := path.Dir(rel)
+	if dir != "model" && dir != "agent" && (strings.HasPrefix(dir, "model/") || strings.HasPrefix(dir, "agent/")) {
+		pkg := dir[:strings.IndexByte(dir, '/')]
+		return []string{rel + ": " + pkg + " must remain one public package without subpackages"}
+	}
 	for _, imp := range imports {
-		switch path.Dir(rel) {
+		switch dir {
 		case "model":
 			if !std[imp] {
 				problems = append(problems, rel+": model package imports "+imp+"; model may import only the standard library")
@@ -93,6 +98,14 @@ func TestDependencyRulesCheckEveryTrackedDirectory(t *testing.T) {
 				t.Errorf("tracked %q importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
 			}
 		}
+	}
+	for _, rel := range []string{"model/sub/x.go", "agent/sub/x.go"} {
+		if problems := checkTrackedGoFile(rel, []string{"fmt"}, std); len(problems) != 1 {
+			t.Errorf("subpackage file %q: %d problems, want 1: %v", rel, len(problems), problems)
+		}
+	}
+	if problems := checkTrackedGoFile("internal/model/x.go", []string{"fmt"}, std); len(problems) != 0 {
+		t.Errorf("unrelated internal/model file wrongly treated as a foundation subpackage: %v", problems)
 	}
 }
 

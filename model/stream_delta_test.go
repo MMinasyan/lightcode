@@ -95,6 +95,27 @@ type streamFakeImpl struct{}
 func (streamFakeImpl) Recv() (StreamDelta, error) { return StreamDelta{}, io.EOF }
 func (streamFakeImpl) Close() error               { return nil }
 
+func TestNewStreamDeltaNeverRetainsZeroLengthFragmentBacking(t *testing.T) {
+	zeroContent := make([]ContentFragment, 0, 1)
+	zeroTools := make([]ToolCallFragment, 0, 1)
+	out, err := NewStreamDelta(StreamDelta{HasChoice: true, ContentFragments: zeroContent, ToolFragments: zeroTools})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out.ContentFragments = append(out.ContentFragments, ContentFragment{Kind: PartText, Text: "out"})
+	zeroContent = append(zeroContent, ContentFragment{Kind: PartText, Text: "in"})
+	if out.ContentFragments[0].Text != "out" || zeroContent[0].Text != "in" {
+		t.Fatalf("content slices share backing: out=%#v in=%#v", out.ContentFragments, zeroContent)
+	}
+
+	out.ToolFragments = append(out.ToolFragments, ToolCallFragment{ID: "out", Name: "out"})
+	zeroTools = append(zeroTools, ToolCallFragment{ID: "in", Name: "in"})
+	if out.ToolFragments[0].ID != "out" || zeroTools[0].ID != "in" {
+		t.Fatalf("tool slices share backing: out=%#v in=%#v", out.ToolFragments, zeroTools)
+	}
+}
+
 // TestStreamInterfaceIsSatisfied pins the exact public stream contract shape.
 func TestStreamInterfaceIsSatisfied(t *testing.T) {
 	var s Stream = streamFakeImpl{}

@@ -93,14 +93,16 @@ func NewStreamDelta(in StreamDelta) (StreamDelta, error) {
 	}
 
 	out := in
-	if len(out.ContentFragments) > 0 {
+	if len(in.ContentFragments) > 0 {
 		out.ContentFragments = make([]ContentFragment, len(in.ContentFragments))
 		for i, frag := range in.ContentFragments {
 			frag.Extra = frag.Extra.Clone()
 			out.ContentFragments[i] = frag
 		}
+	} else { // Drop any caller-owned spare capacity on empty slices.
+		out.ContentFragments = nil
 	}
-	if len(out.ToolFragments) > 0 {
+	if len(in.ToolFragments) > 0 {
 		out.ToolFragments = make([]ToolCallFragment, len(in.ToolFragments))
 		for i, frag := range in.ToolFragments {
 			frag.Extra = frag.Extra.Clone()
@@ -110,6 +112,8 @@ func NewStreamDelta(in StreamDelta) (StreamDelta, error) {
 			}
 			out.ToolFragments[i] = frag
 		}
+	} else {
+		out.ToolFragments = nil
 	}
 	if in.Usage != nil {
 		usageCopy := *in.Usage
