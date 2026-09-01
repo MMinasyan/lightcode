@@ -33,20 +33,20 @@ func baseRequest() Request { return Request{Messages: []Message{userText("hi")}}
 // TestNewTransportRejectsInvalidResolvedInput pins construction-time validation with typed errors naming the offending field: zero and partial target identities fail via ErrInvalidModelRef, an out-of-set wire system role fails via ErrInvalidWireSystemRole (with the value in context), and every closed-set member plus a valid baseline construct cleanly without any I/O side effect.
 func TestNewTransportRejectsInvalidResolvedInput(t *testing.T) { // resolved-input validity at construction is exactly this matrix — nothing else may fail here, since request-level concerns belong to Stream's trust boundary instead... (that split keeps each error surface owning its own inputs).
 
-	if _, err := NewTransport(ResolvedTransport{}); !errors.Is(err, ErrInvalidModelRef) { // zero identity: provider and model both empty.
-		t.Fatalf("zero-model error = %v, want one wrapping ErrInvalidModelRef", err) // the field-and-detail requirement shows up in this message carrying which value was seen... (asserted below for partial too).
+	if _, err := NewTransport(ResolvedTransport{}); !errors.Is(err, ErrInvalidModelRef) || !errors.Is(err, ErrInvalidInput) { // zero identity: provider and model both empty.
+		t.Fatalf("zero-model error = %v, want ErrInvalidModelRef and ErrInvalidInput", err)
 	}
 
 	partial := testResolved()
 	partial.Model = ModelRef{Provider: "openai"} // provider-only is not complete — same rule as everywhere else in this package where a nonzero identity is required.
-	if _, err := NewTransport(partial); !errors.Is(err, ErrInvalidModelRef) {
-		t.Fatalf("partial-model error = %v, want one wrapping ErrInvalidModelRef", err) // partial must be rejected exactly like zero here; both are "not complete" for transport purposes... (the distinction never matters downstream because nothing can encode a request from either).
+	if _, err := NewTransport(partial); !errors.Is(err, ErrInvalidModelRef) || !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("partial-model error = %v, want ErrInvalidModelRef and ErrInvalidInput", err)
 	}
 
 	badRole := testResolved()
 	badRole.WireSystemRole = "assistant" // outside the closed system/user/developer wire-role set — assistant is a canonical conversation role, not a wire system role.
-	if _, err := NewTransport(badRole); !errors.Is(err, ErrInvalidWireSystemRole) {
-		t.Fatalf("bad-wire-role error = %v, want one wrapping ErrInvalidWireSystemRole", err) // the offending value must be identifiable from this chain (the helper's own message carries it; Is() is what callers classify on).
+	if _, err := NewTransport(badRole); !errors.Is(err, ErrInvalidWireSystemRole) || !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("bad-wire-role error = %v, want ErrInvalidWireSystemRole and ErrInvalidInput", err)
 	}
 
 	for _, role := range []string{"system", "user", "developer"} { // every closed-set member constructs — pinning that validation rejects exactly out-of-set values and nothing else... (an over-strict implementation would fail one of these rows instead of the badRole row above).

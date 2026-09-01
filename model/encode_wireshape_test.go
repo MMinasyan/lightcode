@@ -62,7 +62,8 @@ func TestMessageWireShapesPinsCanonicalFields(t *testing.T) {
 	}
 
 	namedResult := mustMsg(t, Message{Role: RoleTool, ToolCallID: "call_9", Name: "read_file", Content: []ContentPart{{Kind: PartText, Text: "file contents"}}}) // tool result carrying both its required call id and optional name.
-	refused, err := NewMessage(Message{Role: RoleAssistant, Source: targetRef, Content: []ContentPart{{Kind: PartText, Text: "no"}}, Refusal: "blocked"})        // positive side of the refusal field (message 1 above pins its negative absence).
+	emptyResult := mustMsg(t, Message{Role: RoleTool, ToolCallID: "call_empty"})
+	refused, err := NewMessage(Message{Role: RoleAssistant, Source: targetRef, Content: []ContentPart{{Kind: PartText, Text: "no"}}, Refusal: "blocked"}) // positive side of the refusal field (message 1 above pins its negative absence).
 	if err != nil {
 		t.Fatalf("NewMessage(refusal): %v", err)
 	}
@@ -120,6 +121,11 @@ func TestMessageWireShapesPinsCanonicalFields(t *testing.T) {
 	}
 	if _, ok := msgs2[0]["name"]; ok { // name still absent: empty-value omission does not change when other optional fields are present (per-field independence).
 		t.Fatalf("message must not carry an empty name key: %#v", msgs2[0])
+	}
+
+	emptyWire := decodeMessages(t, mustEncode(t, rt, Request{Messages: []Message{emptyResult}}))[0]
+	if content, ok := wireString(t, emptyWire, "content"); !ok || content != "" {
+		t.Fatalf("empty tool result content = %q, present=%v; want a present empty string", content, ok)
 	}
 }
 

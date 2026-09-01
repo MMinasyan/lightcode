@@ -220,6 +220,8 @@ func serializeMessage(msg Message, systemRole string, policy replayPolicy) map[s
 	content, ok := serializeContent(msg.Content, policy)
 	if ok {
 		obj["content"] = content // a message with no surviving parts omits the key entirely.
+	} else if msg.Role == RoleTool {
+		obj["content"] = "" // Tool results always carry content; successful results may be empty.
 	}
 	if msg.Refusal != "" {
 		obj["refusal"] = msg.Refusal

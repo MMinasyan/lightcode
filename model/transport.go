@@ -54,10 +54,10 @@ func NewTransport(in ResolvedTransport) (*Transport, error) {
 	resolved := cloneResolvedInput(in) // own every resolved value before retaining it.
 
 	if !resolved.Model.complete() { // a transport without a complete target identity cannot encode any request body.
-		return nil, fmt.Errorf("%w: resolved transport field Model is %s; a complete provider/model pair is required", ErrInvalidModelRef, describeRef(resolved.Model))
+		return nil, classifyEncodeError(fmt.Errorf("%w: resolved transport field Model is %s; a complete provider/model pair is required", ErrInvalidModelRef, describeRef(resolved.Model)))
 	}
 	if _, err := resolveWireSystemRole(resolved.WireSystemRole); err != nil { // same closed set the encoder enforces per call.
-		return nil, fmt.Errorf("resolved transport field WireSystemRole: %w", err)
+		return nil, classifyEncodeError(fmt.Errorf("resolved transport field WireSystemRole: %w", err))
 	}
 
 	var reserved []string // reserved-key pass over both resolved layers runs before any value parsing so a malformed value can never hide a reservation.
