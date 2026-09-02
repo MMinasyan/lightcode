@@ -16,7 +16,7 @@ import (
 
 const publicModule = "github.com/MMinasyan/lightcode"
 
-// TestPublicFoundationDependencyIsolation enforces the pre-cutover dependency baseline over the authoritative complete set of Git-tracked non-test Go files: the model package imports only the standard library; the agent package imports only the standard library and the public model package; the harness package is direct-test-only and imports only the standard library; every other tracked production file imports none of these packages, whatever its directory name is. Test files are exempt in every directory — external-package test files are exactly where direct and composition tests of the new packages live — and untracked or ignored files never gate the guard. When a later phase adds a new target package that must consume model or agent, it extends the allowlist for its own package only; existing root and internal/ production packages stay forbidden until their owning cutover or deletion phase.
+// TestPublicFoundationDependencyIsolation enforces the pre-cutover dependency baseline over the authoritative complete set of Git-tracked non-test Go files: the model package imports only the standard library; the agent package imports only the standard library and the public model package; the harness package is direct-test-only and imports only the standard library; internal/storage is direct-test-only, imports only the standard library plus the public harness contract, and stays one package without backend subpackages; every other tracked production file imports none of these packages, whatever its directory name is. Test files are exempt in every directory — external-package test files are exactly where direct and composition tests of the new packages live — and untracked or ignored files never gate the guard. When a later phase adds a new target package that must consume model, agent, or harness, it extends the allowlist for its own package only; existing root and internal/ production packages stay forbidden until their owning cutover or deletion phase.
 func TestPublicFoundationDependencyIsolation(t *testing.T) {
 	root := moduleRoot(t)
 	std := standardLibraryImports(t)
@@ -48,6 +48,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 		modelPkg   = publicModule + "/model"
 		agentPkg   = publicModule + "/agent"
 		harnessPkg = publicModule + "/harness"
+		storagePkg = publicModule + "/internal/storage"
 	)
 	var problems []string
 	dir := path.Dir(rel)
@@ -55,6 +56,9 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 		(strings.HasPrefix(dir, "model/") || strings.HasPrefix(dir, "agent/") || strings.HasPrefix(dir, "harness/")) {
 		pkg := dir[:strings.IndexByte(dir, '/')]
 		return []string{rel + ": " + pkg + " must remain one public package without subpackages"}
+	}
+	if dir != "internal/storage" && strings.HasPrefix(dir, "internal/storage/") {
+		return []string{rel + ": internal/storage must remain one package without backend subpackages"}
 	}
 	for _, imp := range imports {
 		switch dir {
@@ -70,8 +74,12 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 			if !std[imp] {
 				problems = append(problems, rel+": harness package imports "+imp+"; harness may import only the standard library")
 			}
+		case "internal/storage":
+			if imp != harnessPkg && !std[imp] {
+				problems = append(problems, rel+": internal/storage imports "+imp+"; internal/storage may import only the standard library and "+harnessPkg)
+			}
 		default:
-			if imp == modelPkg || imp == agentPkg || imp == harnessPkg {
+			if imp == modelPkg || imp == agentPkg || imp == harnessPkg || imp == storagePkg {
 				problems = append(problems, rel+": production file imports "+imp+"; no existing package may consume the public foundation before its cutover phase")
 			}
 		}
@@ -79,13 +87,13 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 	return problems
 }
 
-// TestDependencyRulesRejectNonStdlibDotlessImports proves the allowlists use authoritative standard-library membership, not a dot-in-path shape: the cgo pseudo-import "C" and a dotless path outside the stdlib set fail both the model and agent rows, while ordinary stdlib imports and the model dependency on agent's side still pass.
+// TestDependencyRulesRejectNonStdlibDotlessImports proves the allowlists use authoritative standard-library membership, not a dot-in-path shape: the cgo pseudo-import "C" and a dotless path outside the stdlib set fail every package row, while ordinary stdlib imports, the model dependency on agent's side, and internal/storage's dependency on harness still pass.
 func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	std := standardLibraryImports(t)
-	for _, pkg := range []string{"model", "agent", "harness"} {
+	for _, rel := range []string{"model/x.go", "agent/x.go", "harness/x.go", "internal/storage/x.go"} {
 		for _, imp := range []string{"C", "notreal/pkg"} {
-			if problems := checkTrackedGoFile(pkg+"/x.go", []string{imp}, std); len(problems) != 1 {
-				t.Errorf("%s file importing %q: %d problems, want 1: %v", pkg, imp, len(problems), problems)
+			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
+				t.Errorf("%s importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
 			}
 		}
 	}
@@ -98,19 +106,27 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	if problems := checkTrackedGoFile("harness/x.go", []string{"fmt", "encoding/json"}, std); len(problems) != 0 {
 		t.Errorf("stdlib imports flagged in harness: %v", problems)
 	}
+	if problems := checkTrackedGoFile("internal/storage/x.go", []string{"fmt", "context", publicModule + "/harness"}, std); len(problems) != 0 {
+		t.Errorf("allowed internal/storage imports flagged: %v", problems)
+	}
+	for _, imp := range []string{publicModule + "/model", publicModule + "/agent"} {
+		if problems := checkTrackedGoFile("internal/storage/x.go", []string{imp}, std); len(problems) != 1 {
+			t.Errorf("internal/storage importing %q: %d problems, want 1: %v", imp, len(problems), problems)
+		}
+	}
 }
 
-// TestDependencyRulesCheckEveryTrackedDirectory proves the file-set contract has no directory-name skipping: tracked-looking paths under previously-skipped names (.hidden, _underscore, frontend, node_modules, vendor) are ordinary production files whose imports of either new package are reported.
+// TestDependencyRulesCheckEveryTrackedDirectory proves the file-set contract has no directory-name skipping: tracked-looking paths under previously-skipped names (.hidden, _underscore, frontend, node_modules, vendor) are ordinary production files whose imports of any foundation package are reported, and internal/storage subpackages are rejected like public-package ones.
 func TestDependencyRulesCheckEveryTrackedDirectory(t *testing.T) {
 	std := standardLibraryImports(t)
 	for _, rel := range []string{".hidden/pkg/x.go", "_scaffold/pkg/x.go", "frontend/bindata.go", "node_modules/pkg/x.go", "vendor/pkg/x.go"} {
-		for _, imp := range []string{publicModule + "/model", publicModule + "/agent", publicModule + "/harness"} {
+		for _, imp := range []string{publicModule + "/model", publicModule + "/agent", publicModule + "/harness", publicModule + "/internal/storage"} {
 			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
 				t.Errorf("tracked %q importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
 			}
 		}
 	}
-	for _, rel := range []string{"model/sub/x.go", "agent/sub/x.go", "harness/sub/x.go"} {
+	for _, rel := range []string{"model/sub/x.go", "agent/sub/x.go", "harness/sub/x.go", "internal/storage/sub/x.go"} {
 		if problems := checkTrackedGoFile(rel, []string{"fmt"}, std); len(problems) != 1 {
 			t.Errorf("subpackage file %q: %d problems, want 1: %v", rel, len(problems), problems)
 		}
