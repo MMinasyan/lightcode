@@ -34,8 +34,11 @@ type conformanceBackend struct {
 	// orphanOperationRegister persists one structurally valid operation
 	// register for sessionID without that session's register.
 	orphanOperationRegister func(t *testing.T, store harness.Storage, sessionID string)
-	exhaustSequence         func(t *testing.T, store harness.Storage, sessionID string)
-	exhaustRevision         func(t *testing.T, store harness.Storage, sessionID string)
+	// malformedSessionRegister persists one session-register envelope carrying
+	// an operation identity for sessionID, which is not a valid parent.
+	malformedSessionRegister func(t *testing.T, store harness.Storage, sessionID string)
+	exhaustSequence          func(t *testing.T, store harness.Storage, sessionID string)
+	exhaustRevision          func(t *testing.T, store harness.Storage, sessionID string)
 }
 
 func runConformance(t *testing.T, b conformanceBackend) {
@@ -49,6 +52,7 @@ func runConformance(t *testing.T, b conformanceBackend) {
 		{"register mechanics", confRegisterMechanics},
 		{"structural ownership", confStructuralOwnership},
 		{"structural orphan corruption", confStructuralOrphan},
+		{"malformed session register", confMalformedSessionRegister},
 		{"transaction read-your-writes", confTransactionReadYourWrites},
 		{"transaction rollback", confTransactionRollback},
 		{"transaction ignored conflict", confTransactionIgnoredConflict},
@@ -635,6 +639,100 @@ func confStructuralOrphan(t *testing.T, b conformanceBackend) {
 	if !errors.As(err, &opOrphan) || opOrphan.SessionID != "ghost-op" {
 		t.Errorf("orphan operation register recovered %+v, want owning session ghost-op", opOrphan)
 	}
+
+	// Replacing that exact extant orphan Operation register is the same typed
+	// owning-session corruption, and the orphan stays unchanged: a second
+	// replacement at the original revision is still corruption, not a
+	// stale-revision conflict.
+	err = store.Transact(ctx, func(txn harness.Transaction) error {
+		_, err := txn.ReplaceRegister(confOpKey("ghost-op", "orphan-op"), 1, rawJSON(`{"operation":"replaced"}`))
+		return err
+	})
+	if !errors.Is(err, harness.ErrCorrupt) {
+		t.Fatalf("ReplaceRegister on an extant orphan Operation register: error = %v, want ErrCorrupt", err)
+	}
+	if !errors.As(err, &opOrphan) || opOrphan.SessionID != "ghost-op" {
+		t.Errorf("ReplaceRegister on an extant orphan Operation register recovered %+v, want owning session ghost-op", opOrphan)
+	}
+	if err = store.Transact(ctx, func(txn harness.Transaction) error {
+		_, err := txn.ReplaceRegister(confOpKey("ghost-op", "orphan-op"), 1, rawJSON(`{"operation":"replaced"}`))
+		return err
+	}); !errors.Is(err, harness.ErrCorrupt) {
+		t.Fatalf("second ReplaceRegister on the unchanged orphan: error = %v, want ErrCorrupt (a consumed revision would be ErrConflict)", err)
+	}
+}
+
+// confMalformedSessionRegister proves a persisted session-register envelope
+// carrying an operation identity is not a valid parent: with no canonical
+// session register but a register envelope present for the session, every
+// session-scoped read and mutation is the typed owning-Session corruption and
+// the session stays discoverable.
+func confMalformedSessionRegister(t *testing.T, b conformanceBackend) {
+	ctx := context.Background()
+	store := b.newStore(t)
+
+	b.malformedSessionRegister(t, store, "forged")
+
+	reads := map[string]func() error{
+		"ReadEntries":   func() error { _, err := store.ReadEntries(ctx, "forged", 0); return err },
+		"ReadRegister":  func() error { _, err := store.ReadRegister(ctx, confSessionKey("forged")); return err },
+		"ReadRegisters": func() error { _, err := store.ReadRegisters(ctx, "forged"); return err },
+	}
+	for name, read := range reads {
+		err := read()
+		if !errors.Is(err, harness.ErrCorrupt) {
+			t.Fatalf("%s on a malformed session register: error = %v, want ErrCorrupt", name, err)
+		}
+		var corrupt *harness.CorruptionError
+		if !errors.As(err, &corrupt) || corrupt.SessionID != "forged" {
+			t.Errorf("%s on a malformed session register recovered %+v, want owning session forged", name, corrupt)
+		}
+	}
+
+	err := store.Transact(ctx, func(txn harness.Transaction) error {
+		_, err := txn.InsertEntry(confEntry("forged", "e1"))
+		return err
+	})
+	if !errors.Is(err, harness.ErrCorrupt) {
+		t.Fatalf("InsertEntry on a malformed session register: error = %v, want ErrCorrupt", err)
+	}
+
+	ids, err := store.ListSessionIDs(ctx)
+	if err != nil || len(ids) != 1 || ids[0] != "forged" {
+		t.Errorf("ListSessionIDs = %v (error %v), want [forged]", ids, err)
+	}
+
+	if b.reopen != nil {
+		store = b.reopen(t, store)
+		if _, err := store.ReadEntries(ctx, "forged", 0); !errors.Is(err, harness.ErrCorrupt) {
+			t.Errorf("malformed session register after reopen: error = %v, want ErrCorrupt", err)
+		}
+	}
+
+	// The nearest valid-parent sibling: the same malformed session-register
+	// envelope beside a valid canonical Session register and a valid
+	// Operation register. ReadRegisters must surface the malformed envelope
+	// as owning-Session corruption instead of silently skipping it.
+	confCreateSession(t, ctx, store, "valid-parent")
+	confTxn(t, ctx, store, func(txn harness.Transaction) error {
+		if _, err := txn.InsertRegister(confOpRegister("valid-parent", "op1")); err != nil {
+			return err
+		}
+		return nil
+	})
+	validRegisters, err := store.ReadRegisters(ctx, "valid-parent")
+	if err != nil || len(validRegisters) != 2 || validRegisters[0].Key.Kind != harness.RegisterSession || validRegisters[1].Key.OperationID != "op1" {
+		t.Fatalf("valid parent ReadRegisters = %v (error %v), want the canonical Session register followed by the Operation register", validRegisters, err)
+	}
+	b.malformedSessionRegister(t, store, "valid-parent")
+	_, err = store.ReadRegisters(ctx, "valid-parent")
+	if !errors.Is(err, harness.ErrCorrupt) {
+		t.Fatalf("ReadRegisters beside a valid parent: error = %v, want ErrCorrupt", err)
+	}
+	var siblingCorrupt *harness.CorruptionError
+	if !errors.As(err, &siblingCorrupt) || siblingCorrupt.SessionID != "valid-parent" {
+		t.Errorf("ReadRegisters beside a valid parent recovered %+v, want owning session valid-parent", siblingCorrupt)
+	}
 }
 
 // confTransactionReadYourWrites proves transaction reads observe the committed
@@ -913,7 +1011,12 @@ func confTransactionQueuedCancellation(t *testing.T, b conformanceBackend) {
 }
 
 // confTransactionBarrier proves readers outside a transaction observe either
-// pre-commit or post-commit state, never a partial transition.
+// the complete pre-commit or the complete post-commit state, never a partial
+// transition. Memory readers wait for the writer and see the post-commit
+// state; backends whose reads run beside the writer, such as SQLite on
+// separate pooled connections, may return the pre-commit state until the
+// commit lands. The transaction stages two records so a partial observation
+// would be distinguishable from either complete state.
 func confTransactionBarrier(t *testing.T, b conformanceBackend) {
 	ctx := context.Background()
 	store := b.newStore(t)
@@ -930,21 +1033,30 @@ func confTransactionBarrier(t *testing.T, b conformanceBackend) {
 			if _, err := txn.InsertEntry(confEntry("s1", "e2")); err != nil {
 				return err
 			}
+			if _, err := txn.InsertEntry(confEntry("s1", "e3")); err != nil {
+				return err
+			}
 			close(staged)
 			return nil
 		})
 	}()
 	<-staged
 
-	entries, err := store.ReadEntries(ctx, "s1", 0) // blocks until the writer releases the store
+	entries, err := store.ReadEntries(ctx, "s1", 0)
 	if err != nil {
 		t.Fatalf("outside reader: %v", err)
 	}
-	if len(entries) != 2 || entries[0].ID != "e1" || entries[1].ID != "e2" {
-		t.Errorf("outside reader observed %v, want the complete committed transition [e1 e2]", entries)
+	preCommit := len(entries) == 1 && entries[0].ID == "e1"
+	postCommit := len(entries) == 3 && entries[0].ID == "e1" && entries[1].ID == "e2" && entries[2].ID == "e3"
+	if !preCommit && !postCommit {
+		t.Errorf("outside reader observed a partial transition %v, want exactly [e1] or [e1 e2 e3]", entries)
 	}
 	if err := <-committed; err != nil {
 		t.Fatalf("Transact: %v", err)
+	}
+	entries, err = store.ReadEntries(ctx, "s1", 0)
+	if err != nil || len(entries) != 3 || entries[2].ID != "e3" {
+		t.Errorf("post-commit read = %v (error %v), want the complete committed transition [e1 e2 e3]", entries, err)
 	}
 }
 
@@ -1359,14 +1471,17 @@ func confSessionDeletion(t *testing.T, b conformanceBackend) {
 		})
 	}()
 	<-staged
-	ids, err = store.ListSessionIDs(ctx) // blocks until the deletion commits
+	ids, err = store.ListSessionIDs(ctx) // the complete pre-commit or post-commit set, never partial
 	if err != nil {
 		t.Fatalf("outside reader during deletion: %v", err)
 	}
-	if len(ids) != 0 {
-		t.Errorf("outside reader observed a partially deleted session set: %v", ids)
+	if len(ids) > 1 || (len(ids) == 1 && ids[0] != "kept") {
+		t.Errorf("outside reader observed a partially deleted session set: %v, want exactly [kept] or empty", ids)
 	}
 	if err := <-committed; err != nil {
 		t.Fatalf("deletion Transact: %v", err)
+	}
+	if ids, err = store.ListSessionIDs(ctx); err != nil || len(ids) != 0 {
+		t.Errorf("session set after committed deletion = %v (error %v), want empty", ids, err)
 	}
 }

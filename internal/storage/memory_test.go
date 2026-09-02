@@ -86,12 +86,13 @@ func memoryBackend() conformanceBackend {
 			defer m.mu.Unlock()
 			sequence := maxSequence(m.state.entries[sessionID]) + 1
 			m.state.entries[sessionID] = append(m.state.entries[sessionID], harness.Entry{
-				SessionID:   sessionID,
-				ID:          "corrupt-entry",
-				Sequence:    sequence,
-				Kind:        harness.EntryInput,
-				CommittedAt: fixtureTime,
-				Payload:     json.RawMessage(`{"entry":`),
+				SessionID: sessionID,
+				ID:        "corrupt-entry",
+				Sequence:  sequence,
+				Kind:      harness.EntryInput,
+				// Valid in every envelope field except the zero commit time.
+				CommittedAt: time.Time{},
+				Payload:     json.RawMessage(`{"entry":"corrupt"}`),
 			})
 		},
 		corruptRegister: func(t *testing.T, store harness.Storage, sessionID string) {
@@ -120,6 +121,15 @@ func memoryBackend() conformanceBackend {
 			defer m.mu.Unlock()
 			key := confOpKey(sessionID, "orphan-op")
 			m.state.registers[key] = harness.Register{Key: key, Revision: 1, Payload: json.RawMessage(`{"operation":"orphan-op"}`)}
+		},
+		malformedSessionRegister: func(t *testing.T, store harness.Storage, sessionID string) {
+			m := store.(*Memory)
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			// A session-register envelope carrying an operation identity is
+			// not a valid parent for any dependent of the session.
+			key := harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession, OperationID: "forged"}
+			m.state.registers[key] = harness.Register{Key: key, Revision: 1, Payload: json.RawMessage(`{"session":"forged"}`)}
 		},
 		exhaustSequence: func(t *testing.T, store harness.Storage, sessionID string) {
 			m := store.(*Memory)

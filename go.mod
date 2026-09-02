@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/gofrs/flock v0.13.0
+	github.com/mattn/go-sqlite3 v1.14.50
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/sashabaranov/go-openai v1.41.2
 	github.com/wailsapp/wails/v2 v2.12.0

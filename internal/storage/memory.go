@@ -206,11 +206,22 @@ func (s *memoryState) readRegisters(sessionID string) ([]harness.Register, error
 	if err := validateStoredRegister(sessionRegister); err != nil {
 		return nil, err
 	}
+	registered := 0
 	var operations []harness.Register
 	for key, register := range s.registers {
-		if key.SessionID == sessionID && key.Kind == harness.RegisterOperation {
+		if key.SessionID != sessionID {
+			continue
+		}
+		registered++
+		if key.Kind == harness.RegisterOperation {
 			operations = append(operations, register)
 		}
+	}
+	if registered != 1+len(operations) {
+		// A register envelope of the wrong kind for its identity is malformed
+		// persisted state: ReadRegisters surfaces it instead of silently
+		// skipping it.
+		return nil, &harness.CorruptionError{SessionID: sessionID, Detail: "stored session register carries an operation identity"}
 	}
 	sort.Slice(operations, func(i, j int) bool {
 		return operations[i].Key.OperationID < operations[j].Key.OperationID
@@ -340,6 +351,11 @@ func (s *memoryState) replaceRegister(key harness.RegisterKey, expectedRevision 
 			return harness.Register{}, orphanCorruption(key.SessionID)
 		}
 		return harness.Register{}, notfoundf("register %v does not exist", key)
+	}
+	if s.sessionOrphaned(key.SessionID) {
+		// An extant register without its session register is an orphan:
+		// replacing it must not update dependent state.
+		return harness.Register{}, orphanCorruption(key.SessionID)
 	}
 	if current.Revision != expectedRevision {
 		return harness.Register{}, conflictf("register %v revision %d does not match expected %d", key, current.Revision, expectedRevision)
