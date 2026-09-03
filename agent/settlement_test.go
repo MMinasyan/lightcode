@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -39,8 +40,24 @@ func TestValidateSettlement(t *testing.T) { // nothing more to do on this very f
 	completed := mkSettlementOutput(model.OutputCompleted, "") // one canonical valid completed output fixture shared across every row below it further ahead now (built exactly once per test run rather than repeatedly inside the loop body itself above these lines verbatim for consistency's sake respectively).
 	errored := mkSettlementOutput(model.OutputErrored, "boom") // same for its errored sibling shape carrying non-empty diagnostic detail per contract documented inline within that helper call further up over there now.
 	interrupted := mkSettlementOutput(model.OutputInterrupted, "stopped")
+	callsOut := mkCallsTerminalOutput()
 	foreignSrc := model.ModelRef{Provider: "acme", Model: "m-other"} // one complete but foreign identity pair deliberately diverging from testRef in its second field only respectively left-to-right as they appear within these two struct fields' own declarations above this line now under exactly one rule documented inline within its own single-line comment.
 	foreignCompleted := mkForeignSettlementOutput(model.OutputCompleted, "", foreignSrc)
+
+	bare, ferr := model.NewOutput(model.Output{Status: model.OutputErrored, Source: testRef, Detail: "boom"}) // errored shape with no message at all: nothing model-visible was retained.
+	if ferr != nil {
+		t.Fatalf("fixture: %v", ferr)
+	}
+	refusalMsg := &model.Message{Role: model.RoleAssistant, Source: testRef, Refusal: "declined"}
+	refusalErrored, ferr := model.NewOutput(model.Output{Status: model.OutputErrored, Source: testRef, Detail: "boom", Message: refusalMsg})
+	if ferr != nil {
+		t.Fatalf("fixture: %v", ferr)
+	}
+	extraMsg := &model.Message{Role: model.RoleAssistant, Source: testRef, Extra: model.Extra{"k": json.RawMessage(`1`)}}
+	extraErrored, ferr := model.NewOutput(model.Output{Status: model.OutputErrored, Source: testRef, Detail: "boom", Message: extraMsg})
+	if ferr != nil {
+		t.Fatalf("fixture: %v", ferr)
+	}
 
 	cases := []struct {
 		name    string
@@ -49,14 +66,19 @@ func TestValidateSettlement(t *testing.T) { // nothing more to do on this very f
 	}{
 		{"valid-ready", ModelSettlement{Disposition: DispoReady, Output: completed}, false},
 		{"valid-continue", ModelSettlement{Disposition: DispoContinue, Output: errored}, false},
+		{"valid-continue-completed-no-calls", ModelSettlement{Disposition: DispoContinue, Output: completed}, false},            // newly permitted continuation row: a completed output carrying no tool calls may settle as continue.
+		{"valid-continue-errored-refusal-payload", ModelSettlement{Disposition: DispoContinue, Output: &refusalErrored}, false}, // the refusal arm of the retained-payload rule.
+		{"valid-continue-errored-extra-payload", ModelSettlement{Disposition: DispoContinue, Output: &extraErrored}, false},     // the finalized-extra arm of the retained-payload rule.
 		{"valid-failure-no-output", ModelSettlement{Disposition: DispoFailure, Detail: "d"}, false},
 		{"valid-failure-with-errored", ModelSettlement{Disposition: DispoFailure, Output: errored, Detail: "d"}, false},
 		{"valid-interruption-no-output", ModelSettlement{Disposition: DispoInterruption, Detail: "d"}, false},
 		{"valid-interruption-in-flight", ModelSettlement{Disposition: DispoInterruption, Output: interrupted, Detail: "d"}, false},
 		{"valid-interruption-retained-completed", ModelSettlement{Disposition: DispoInterruption, Output: completed, Detail: "d"}, false},
-		{"invalid-ready-nil-output", ModelSettlement{Disposition: DispoReady}, true},                                // ready demands its callback output unconditionally — absence is one typed violation respectively per contract documented in requireDispositionOutput's own guard condition further up over there without any tolerance for nil here anywhere downstream along this trajectory forward now.
-		{"invalid-ready-errored-status", ModelSettlement{Disposition: DispoReady, Output: errored}, true},           // ready demands COMPLETED specifically — an errored payload in its place is the wrong-direction violation respectively per contract documented in requireDispositionOutput's own status check further up over there without any tolerance for cross-class substitution anywhere downstream along this trajectory forward now.
-		{"invalid-continue-completed-status", ModelSettlement{Disposition: DispoContinue, Output: completed}, true}, // continue demands ERRORED specifically — a completed payload in its place is the opposite-direction violation respectively per contract documented in requireDispositionOutput's own status check further up over there without any tolerance for cross-class substitution anywhere downstream along this trajectory forward now.
+		{"invalid-ready-nil-output", ModelSettlement{Disposition: DispoReady}, true},                                    // ready demands its callback output unconditionally — absence is one typed violation respectively per contract documented in requireDispositionOutput's own guard condition further up over there without any tolerance for nil here anywhere downstream along this trajectory forward now.
+		{"invalid-ready-errored-status", ModelSettlement{Disposition: DispoReady, Output: errored}, true},               // ready demands COMPLETED specifically — an errored payload in its place is the wrong-direction violation respectively per contract documented in requireDispositionOutput's own status check further up over there without any tolerance for cross-class substitution anywhere downstream along this trajectory forward now.
+		{"invalid-continue-completed-with-calls", ModelSettlement{Disposition: DispoContinue, Output: callsOut}, true},  // a completed output still carrying tool calls cannot settle as continue: those calls would never dispatch.
+		{"invalid-continue-errored-without-payload", ModelSettlement{Disposition: DispoContinue, Output: &bare}, true},  // an errored output that retained nothing model-visible cannot continue (nearest forbidden sibling of the errored payload rows).
+		{"invalid-continue-interrupted-output", ModelSettlement{Disposition: DispoContinue, Output: interrupted}, true}, // an interrupted payload belongs to the interruption row only (nearest forbidden sibling of the completed continue row).
 		{"invalid-failure-empty-detail", ModelSettlement{Disposition: DispoFailure}, true},
 		{"invalid-failure-completed-output", ModelSettlement{Disposition: DispoFailure, Output: completed, Detail: "d"}, true}, // failure permits NO output or its own errored one ONLY — a completed payload in either slot position is explicitly forbidden per contract above these lines verbatim (this pins the nearest-forbidden-sibling boundary between valid-failure-with-errored and this specific row's divergent status value respectively left-to-right as they appear within settlement.go's failure-case switch further up over there).
 		{"invalid-interruption-empty-detail", ModelSettlement{Disposition: DispoInterruption}, true},
@@ -79,6 +101,67 @@ func TestValidateSettlement(t *testing.T) { // nothing more to do on this very f
 
 		}) // close out each settlement-shape subtest closure after all applicable assertions have had their chance to fire independently against that specific row's data above these lines verbatim without interfering with sibling rows' own separate lifecycle timelines running in parallel-ish fashion across the whole t.Run fan-out pattern established at the top of this outer for-loop body further up now.
 	}
+}
+
+// TestValidateModelSettlement pins the exported validator: an incomplete expected identity is rejected before any settlement row is consulted, an invalid settlement surfaces the same typed model-boundary error, and a valid settlement returns an independent owned copy that never aliases the input in either direction.
+func TestValidateModelSettlement(t *testing.T) {
+	completed := mkSettlementOutput(model.OutputCompleted, "")
+
+	t.Run("incomplete-expected-identity", func(t *testing.T) {
+		rows := []struct {
+			name     string
+			expected model.ModelRef
+		}{
+			{"zero-identity", model.ModelRef{}},
+			{"provider-only", model.ModelRef{Provider: "acme"}},
+			{"model-only", model.ModelRef{Model: "m-1"}},
+		}
+		for _, row := range rows {
+			t.Run(row.name, func(t *testing.T) {
+				_, err := ValidateModelSettlement(row.expected, ModelSettlement{Disposition: DispoReady, Output: completed})
+				requireBoundaryViolation(t, err, "model")
+			})
+		}
+	})
+
+	t.Run("invalid-settlement-same-violation", func(t *testing.T) {
+		if _, err := ValidateModelSettlement(testRef, ModelSettlement{Disposition: DispoReady}); !isBoundaryViolation(err, "model") {
+			t.Fatalf("missing ready output = %v, want the model-boundary violation", err)
+		}
+	})
+
+	t.Run("owned-copy-on-success", func(t *testing.T) {
+		in := mkSettlementOutput(model.OutputCompleted, "")
+		got, err := ValidateModelSettlement(testRef, ModelSettlement{Disposition: DispoReady, Output: in})
+		if err != nil {
+			t.Fatalf("valid settlement rejected: %v", err)
+		}
+		if got.Disposition != DispoReady || got.Detail != "" {
+			t.Fatalf("owned settlement = %#v, want disposition and detail copied as plain values", got)
+		}
+		if got.Output == nil || got.Output == in {
+			t.Fatalf("owned output must be a distinct pointer, got %p", got.Output)
+		}
+		in.Message.Content[0].Text = "input-side" // mutate the input after validation...
+		if got.Output.Message.Content[0].Text != "x" {
+			t.Fatalf("owned copy aliased the input message: %q", got.Output.Message.Content[0].Text)
+		}
+		got.Output.Message.Content[0].Text = "owned-side" // ...then the owned side; neither may reach the other.
+		if in.Message.Content[0].Text != "input-side" {
+			t.Fatalf("input aliased the owned copy: %q", in.Message.Content[0].Text)
+		}
+		in.Status = model.OutputErrored
+		if got.Output.Status != model.OutputCompleted {
+			t.Fatalf("owned copy aliased the input status: %s", got.Output.Status)
+		}
+	})
+
+	t.Run("outputless-owned", func(t *testing.T) {
+		got, err := ValidateModelSettlement(testRef, ModelSettlement{Disposition: DispoFailure, Detail: "d"})
+		if err != nil || got.Disposition != DispoFailure || got.Detail != "d" || got.Output != nil {
+			t.Fatalf("got %#v, %v; want the settlement copied with nil output retained", got, err)
+		}
+	})
 }
 
 // TestValidateToolResult pins the closed tool-result settlement contract at its trust boundary: valid shapes answering exactly their own call pass, while every malformed shape returns one typed boundary-protocol error naming the "tool" boundary.

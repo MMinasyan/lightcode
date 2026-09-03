@@ -6,16 +6,28 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// validateSettlement checks one settlement returned by a model effect against the closed disposition table and the invocation's expected identity: ready is exactly its completed callback output with empty detail; continue exactly its errored output with empty detail (the caller has already settled any continuation facts); failure non-empty detail plus no accepted stream or that same errored output — a completed output never settles as failure; interruption non-empty detail plus one of three states, nothing before acceptance, the interrupted callback output while generation was in flight over it, or a retained completed output when cancellation followed successful completion. A present output must itself satisfy every ordinary model-output invariant and carry exactly the expected source identity field-for-field (String() rendering is lossy on first-slash splits, so both fields are compared separately) and its completed tool calls must carry pairwise-unique IDs. Every violation returns one typed boundary-protocol error naming the "model" boundary; nothing here coerces a malformed settlement into another shape.
+// validateSettlement checks one settlement returned by a model effect against the closed disposition table and the invocation's expected identity: ready is exactly its completed callback output with empty detail; continue is its errored output that retains an assistant payload or its completed output carrying no tool calls, with empty detail (the caller has already settled any continuation facts); failure non-empty detail plus no accepted stream or that same errored output — a completed output never settles as failure; interruption non-empty detail plus one of three states, nothing before acceptance, the interrupted callback output while generation was in flight over it, or a retained completed output when cancellation followed successful completion. A present output must itself satisfy every ordinary model-output invariant and carry exactly the expected source identity field-for-field (String() rendering is lossy on first-slash splits, so both fields are compared separately) and its completed tool calls must carry pairwise-unique IDs. Every violation returns one typed boundary-protocol error naming the "model" boundary; nothing here coerces a malformed settlement into another shape.
 func validateSettlement(set ModelSettlement, expected model.ModelRef) error {
 	switch set.Disposition {
 	case DispoReady: // completed callback output only; empty detail checked below.
 		if err := requireDispositionOutput("ready", set.Output, model.OutputCompleted); err != nil {
 			return err
 		}
-	case DispoContinue: // errored callback output only; empty detail checked below.
-		if err := requireDispositionOutput("continue", set.Output, model.OutputErrored); err != nil {
-			return err
+	case DispoContinue: // errored output retaining an assistant payload, or a completed one carrying no tool calls; empty detail checked below.
+		if set.Output == nil {
+			return newBoundaryViolation("model", "continue disposition requires its callback output, got none")
+		}
+		switch set.Output.Status {
+		case model.OutputErrored:
+			if !hasAssistantPayload(set.Output.Message) {
+				return newBoundaryViolation("model", "continue disposition requires an errored output retaining an assistant payload (content part, refusal, or finalized extra)")
+			}
+		case model.OutputCompleted:
+			if set.Output.Message != nil && len(set.Output.Message.ToolCalls) > 0 {
+				return newBoundaryViolation("model", "continue disposition requires a completed output with no tool calls")
+			}
+		default:
+			return newBoundaryViolation("model", fmt.Sprintf("continue disposition requires an errored or completed callback output, got %s", string(set.Output.Status)))
 		}
 	case DispoFailure:
 		if set.Detail == "" { // failure always carries diagnostic text.
@@ -59,6 +71,41 @@ func validateSettlement(set ModelSettlement, expected model.ModelRef) error {
 		}
 	}
 	return nil // well-formed.
+}
+
+// hasAssistantPayload reports whether an assistant message carries model-visible payload under the finalization view — a non-empty finalized content part, a non-empty refusal, or at least one finalized non-null extra — written against exported fields only as the agent-side mirror of model's private predicate (tool calls are impossible on errored outputs and are governed by their own row rule).
+func hasAssistantPayload(m *model.Message) bool {
+	if m == nil {
+		return false
+	}
+	if m.Refusal != "" {
+		return true
+	}
+	for _, part := range m.Content {
+		if part.Text != "" || part.URL != "" || part.OpaqueWireType != "" || len(part.Extra.Finalize()) > 0 {
+			return true
+		}
+	}
+	return len(m.Extra.Finalize()) > 0
+}
+
+// ValidateModelSettlement validates one model settlement against the closed disposition table and the expected identity exactly like the run's internal validator, rejecting an incomplete expected identity before any settlement row is consulted. On success it returns an independent owned copy of the settlement: a present output is the validated deep copy from the public model constructor, while disposition and detail are plain value copies.
+func ValidateModelSettlement(expected model.ModelRef, set ModelSettlement) (ModelSettlement, error) {
+	if !nonzeroSource(expected) {
+		return ModelSettlement{}, newBoundaryViolation("model", "settlement validation requires a nonzero expected model identity")
+	}
+	if err := validateSettlement(set, expected); err != nil {
+		return ModelSettlement{}, err
+	}
+	owned := set // disposition and detail are plain value copies.
+	if set.Output != nil {
+		out, err := model.NewOutput(*set.Output) // the ownership copy; validateSettlement already accepted this exact value through the same constructor.
+		if err != nil {
+			return ModelSettlement{}, fmt.Errorf("%w: %v", newBoundaryViolation("model", "settlement output violates model-output invariants"), err)
+		}
+		owned.Output = &out
+	}
+	return owned, nil
 }
 
 // requireUniqueCallIDs enforces the completed-call identity invariant shared by settlements and terminal results: at most one call may carry any given ID, so a repeated ID never reaches dispatch, unstarted-call matching stays unambiguous, and a validated caller cannot drive the loop's internal terminal invariant route.

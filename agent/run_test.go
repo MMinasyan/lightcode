@@ -115,9 +115,9 @@ func readyOutputs(outs ...*model.Output) func(int, model.Request, AssemblyCallba
 }
 
 func mkOutput(status model.OutputStatus, detail string, calls []model.ToolCall) *model.Output {
-	var msg *model.Message
-	if status == model.OutputCompleted {
-		msg = &model.Message{Role: model.RoleAssistant, Source: testRef, Content: []model.ContentPart{{Kind: model.PartText, Text: "x"}}, ToolCalls: calls}
+	msg := &model.Message{Role: model.RoleAssistant, Source: testRef, Content: []model.ContentPart{{Kind: model.PartText, Text: "x"}}, ToolCalls: calls}
+	if status != model.OutputCompleted {
+		msg.ToolCalls = nil // non-completed outputs never carry tool calls; the retained partial payload keeps continue rows valid under the assistant-payload rule.
 	}
 	out, err := model.NewOutput(model.Output{Status: status, Source: testRef, Message: msg, Detail: detail})
 	if err != nil {
