@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"sync"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/agent"
@@ -55,11 +57,13 @@ func modelReturning(set agent.ModelSettlement) agent.ModelEffect {
 	}
 }
 
-// modelAssemblingOnce invokes the assembly callback exactly once, ignoring its
-// outcome, and returns one fixed settlement.
+// modelAssemblingOnce invokes the assembly callback exactly once over a fake
+// completed stream, ignoring its outcome, and returns one fixed settlement.
 func modelAssemblingOnce(set agent.ModelSettlement) agent.ModelEffect {
 	return func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		_, _ = assemble(testModelRef(), nil)
+		if err := assembleCompleted(assemble); err != nil {
+			return agent.ModelSettlement{}, err
+		}
 		return set, nil
 	}
 }
@@ -1173,4 +1177,861 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 			t.Fatalf("steering over a foreign archive = %v, want ErrInvalid", err)
 		}
 	})
+}
+
+// toolSpy records the dispatch order of one execution's tool calls and
+// answers every preparation with the configured plan.
+type toolSpy struct {
+	mu    sync.Mutex
+	order []string
+	plan  func(_ context.Context, call model.ToolCall) PreparedTool
+}
+
+func (s *toolSpy) tool(_ context.Context, call model.ToolCall) PreparedTool {
+	s.mu.Lock()
+	s.order = append(s.order, call.ID)
+	s.mu.Unlock()
+	if s.plan != nil {
+		return s.plan(context.Background(), call)
+	}
+	return PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}
+}
+
+func (s *toolSpy) dispatched() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string{}, s.order...)
+}
+
+// newExecutionHarness admits one running Operation ("op-1") under a cancelable
+// Harness context with both prepared effect functions, returning the pieces
+// the execution fixtures need.
+func newExecutionHarness(t *testing.T, modelFn agent.ModelEffect, toolFn func(context.Context, model.ToolCall) PreparedTool) (*Harness, *graphStorage, *coordinator, string, PreparedExecution, context.CancelFunc) {
+	t.Helper()
+	if toolFn == nil {
+		t.Fatalf("execution fixtures require a prepared tool function")
+	}
+	store := emptyStore(t)
+	prepared := PreparedExecution{Capture: testCapture(), Model: modelFn, Tool: toolFn}
+	hctx, cancel := context.WithCancel(context.Background())
+	h, err := New(hctx, Dependencies{Storage: store, Prepare: func(context.Context, PreparationRequest) (PreparedExecution, error) {
+		return prepared, nil
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, disposition, err := h.admit(context.Background(), admissionRequest{
+		SessionID:   session.Identity.SessionID,
+		OperationID: testOpID,
+		Origin:      InputOriginUser,
+		Content:     admissionContent("hello"),
+	}); err != nil || disposition != DispositionAdmitted {
+		t.Fatalf("admit: %v (%q)", err, disposition)
+	}
+	c, err := h.coordinatorFor(context.Background(), session.Identity.SessionID)
+	if err != nil {
+		t.Fatalf("coordinator: %v", err)
+	}
+	return h, store, c, session.Identity.SessionID, prepared, cancel
+}
+
+// invokeModelEffectCtx drives one model effect with an explicit context.
+func invokeModelEffectCtx(t *testing.T, me agent.ModelEffect, ctx context.Context, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+	t.Helper()
+	req, err := model.NewRequest(model.Request{
+		Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("hello")}},
+		Tools:    []model.ToolDefinition{testToolDefinition()},
+	})
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	return me(ctx, req, assemble)
+}
+
+// TestModelEffectGateSkipsCallbackOnCancellation proves execution cancellation
+// stops new callbacks: a context dying between the committed intent and the
+// prepared callback settles the Operation as terminal interruption without
+// ever starting the callback.
+func TestModelEffectGateSkipsCallbackOnCancellation(t *testing.T) {
+	invoked := 0
+	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		invoked++
+		_, _ = assemble(testModelRef(), nil)
+		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+	}
+	h, store, c, sessionID := newEffectHarness(t, modelFn)
+	ctx, cancel := context.WithCancel(context.Background())
+	store.txHook = func(step string) error {
+		if step == "replace_register" {
+			cancel() // the execution context dies between the committed intent and the callback
+		}
+		return nil
+	}
+	me := h.modelEffect(c, testOpID, modelFn)
+	set, err := invokeModelEffectCtx(t, me, ctx, func(model.ModelRef, model.Stream) (model.Output, error) {
+		return model.Output{}, nil
+	})
+	if err != nil {
+		t.Fatalf("model effect: %v", err)
+	}
+	if invoked != 0 {
+		t.Fatalf("prepared callback invoked %d times after cancellation, want zero", invoked)
+	}
+	if set.Disposition != agent.DispoInterruption || set.Detail != executionInterruptedDetail {
+		t.Fatalf("settlement = %+v, want the committed interruption settlement", set)
+	}
+	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	if err != nil {
+		t.Fatalf("ReadOperation: %v", err)
+	}
+	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
+		t.Fatalf("operation state = %+v, want terminal interruption", rec.State)
+	}
+	requireSessionCleared(t, h, sessionID)
+	if _, err := validateFixture(t, store, sessionID); err != nil {
+		t.Fatalf("graph after the gate: %v", err)
+	}
+}
+
+// TestExecuteSuccessSettlesOuterTerminal proves the private agent.Run
+// composition and the outer terminal settlement: a clean run settles success
+// through the common terminal helper with no detail.
+func TestExecuteSuccessSettlesOuterTerminal(t *testing.T) {
+	modelFn := modelAssemblingOnce(agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()})
+	spy := &toolSpy{}
+	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
+	if err := h.execute(c, testOpID, prepared); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	if err != nil {
+		t.Fatalf("ReadOperation: %v", err)
+	}
+	if rec.State.Status != OperationSuccess || rec.State.Terminal == nil || rec.State.Terminal.Detail != "" {
+		t.Fatalf("operation state = %+v, want terminal success without detail", rec.State)
+	}
+	requireSessionCleared(t, h, sessionID)
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("graph after success: %v", err)
+	}
+	settlements := 0
+	for _, entry := range graph.Entries {
+		if entry.Settlement != nil {
+			settlements++
+			if entry.Settlement.Status != OperationSuccess || entry.Settlement.Detail != "" {
+				t.Fatalf("settlement = %+v, want success without detail", entry.Settlement)
+			}
+		}
+	}
+	if settlements != 1 {
+		t.Fatalf("%d settlement entries, want exactly one", settlements)
+	}
+}
+
+// TestToolEffectPlansAndOutcomes proves the prepared-tool contract at the
+// effect boundary: an immediate plan commits its ordinary terminal result
+// without an effect intent, an executor-backed plan commits intent then one
+// validated outcome, and an invalid plan or normalized-argument shape maps to
+// the fixed validation-error result for the original call.
+func TestToolEffectPlansAndOutcomes(t *testing.T) {
+	publishCalls := func(t *testing.T, h *Harness, c *coordinator, sessionID string) {
+		t.Helper()
+		modelFn := modelAssemblingOnce(agent.ModelSettlement{
+			Disposition: agent.DispoReady,
+			Output:      completedOutputWith(testToolCall("call-1")),
+		})
+		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, modelFn), func(model.ModelRef, model.Stream) (model.Output, error) {
+			return model.Output{}, nil
+		}); err != nil {
+			t.Fatalf("model effect: %v", err)
+		}
+	}
+	success := func(_ context.Context, call model.ToolCall) PreparedTool {
+		return PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}
+	}
+	cases := []struct {
+		name         string
+		plan         func(_ context.Context, call model.ToolCall) PreparedTool
+		want         model.ToolResult
+		wantReplaces int
+	}{
+		{
+			name:         "immediate plan commits without an effect intent",
+			plan:         success,
+			want:         model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "done"},
+			wantReplaces: 2, // Operation + Session registers only: no intent
+		},
+		{
+			name: "executor plan commits intent then one validated outcome",
+			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
+				return PreparedTool{Execute: func(context.Context) model.ToolResult {
+					return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}
+				}}
+			},
+			want:         model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "ran"},
+			wantReplaces: 3, // intent + Operation + Session
+		},
+		{
+			name:         "plan without immediate result or executor maps to the validation error",
+			plan:         func(_ context.Context, call model.ToolCall) PreparedTool { return PreparedTool{} },
+			want:         model.ToolResult{CallID: "call-1", Status: model.ResultError, Content: invalidToolResultContent},
+			wantReplaces: 2,
+		},
+		{
+			name: "invalid normalized arguments map to the validation error",
+			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
+				return PreparedTool{Immediate: success(context.Background(), call).Immediate, NormalizedArguments: json.RawMessage("{broken")}
+			},
+			want:         model.ToolResult{CallID: "call-1", Status: model.ResultError, Content: invalidToolResultContent},
+			wantReplaces: 2,
+		},
+		{
+			name: "returned outcome answering another call maps to the validation error",
+			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
+				return PreparedTool{Execute: func(context.Context) model.ToolResult {
+					return model.ToolResult{CallID: "other-call", Status: model.ResultSuccess, Content: "ran"}
+				}}
+			},
+			want:         model.ToolResult{CallID: "call-1", Status: model.ResultError, Content: invalidToolResultContent},
+			wantReplaces: 3,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, store, c, sessionID := newEffectHarness(t, nil)
+			publishCalls(t, h, c, sessionID)
+			replaces := 0
+			store.txHook = func(step string) error {
+				if step == "replace_register" {
+					replaces++
+				}
+				return nil
+			}
+			got, err := h.toolEffect(c, testOpID, tc.plan)(context.Background(), testToolCall("call-1"))
+			if err != nil {
+				t.Fatalf("tool effect: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("committed result = %+v, want %+v", got, tc.want)
+			}
+			if replaces != tc.wantReplaces {
+				t.Fatalf("%d register replacements, want %d", replaces, tc.wantReplaces)
+			}
+			graph, err := validateFixture(t, store, sessionID)
+			if err != nil {
+				t.Fatalf("graph after the tool effect: %v", err)
+			}
+			results := 0
+			for _, entry := range graph.Entries {
+				if entry.ToolResult != nil {
+					results++
+					if entry.ToolResult.ToolCallID != "call-1" || entry.ToolResult.Status != tc.want.Status || entry.ToolResult.Content != tc.want.Content {
+						t.Fatalf("tool result = %+v, want %+v", entry.ToolResult, tc.want)
+					}
+				}
+			}
+			if results != 1 {
+				t.Fatalf("%d tool result entries, want exactly one", results)
+			}
+			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+			if err != nil {
+				t.Fatalf("ReadOperation: %v", err)
+			}
+			if rec.State.Status != OperationRunning || rec.State.ActiveEffect != nil || len(rec.State.PendingToolCalls) != 0 {
+				t.Fatalf("operation state = %+v, want running with the effect cleared and the call resolved", rec.State)
+			}
+		})
+	}
+}
+
+// TestExecuteOrderedBatchSettlesExactlyOnce proves the ordered batch: calls
+// dispatch in assembled order, every call receives exactly one terminal
+// result, and the run continues to the outer success settlement.
+func TestExecuteOrderedBatchSettlesExactlyOnce(t *testing.T) {
+	turn := 0
+	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		if err := assembleCompleted(assemble); err != nil {
+			return agent.ModelSettlement{}, err
+		}
+		turn++
+		if turn == 1 {
+			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"), testToolCall("call-2"))}, nil
+		}
+		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+	}
+	spy := &toolSpy{}
+	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
+	if err := h.execute(c, testOpID, prepared); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := spy.dispatched(); len(got) != 2 || got[0] != "call-1" || got[1] != "call-2" {
+		t.Fatalf("dispatch order = %v, want [call-1 call-2]", got)
+	}
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("graph after the batch: %v", err)
+	}
+	results := map[string]int{}
+	var lastSeq int64
+	for _, entry := range graph.Entries {
+		if entry.ToolResult != nil {
+			results[entry.ToolResult.ToolCallID]++
+			if entry.Envelope.Sequence <= lastSeq {
+				t.Fatalf("tool result %s committed out of order", entry.Envelope.ID)
+			}
+		}
+		lastSeq = entry.Envelope.Sequence
+	}
+	if results["call-1"] != 1 || results["call-2"] != 1 {
+		t.Fatalf("result counts = %v, want exactly one per call", results)
+	}
+	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	if err != nil {
+		t.Fatalf("ReadOperation: %v", err)
+	}
+	if rec.State.Status != OperationSuccess || len(rec.State.PendingToolCalls) != 0 {
+		t.Fatalf("operation state = %+v, want terminal success with every call resolved", rec.State)
+	}
+}
+
+// TestToolEffectRealOutcomeWinsCancellationRace proves a returned real outcome
+// publishes even when the execution context died during the execution.
+func TestToolEffectRealOutcomeWinsCancellationRace(t *testing.T) {
+	var cancel context.CancelFunc
+	turn := 0
+	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		if err := assembleCompleted(assemble); err != nil {
+			return agent.ModelSettlement{}, err
+		}
+		turn++
+		if turn == 1 {
+			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"))}, nil
+		}
+		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+	}
+	toolFn := func(_ context.Context, call model.ToolCall) PreparedTool {
+		return PreparedTool{Execute: func(ctx context.Context) model.ToolResult {
+			cancel() // the execution context dies during the concrete execution
+			return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}
+		}}
+	}
+	h, store, c, sessionID, prepared, harnessCancel := newExecutionHarness(t, modelFn, toolFn)
+	cancel = harnessCancel
+	if err := h.execute(c, testOpID, prepared); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("graph after the race: %v", err)
+	}
+	for _, entry := range graph.Entries {
+		if entry.ToolResult != nil && entry.ToolResult.ToolCallID == "call-1" {
+			if entry.ToolResult.Status != model.ResultSuccess || entry.ToolResult.Content != "ran" {
+				t.Fatalf("tool result = %+v, want the real outcome", entry.ToolResult)
+			}
+		}
+	}
+	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	if err != nil {
+		t.Fatalf("ReadOperation: %v", err)
+	}
+	if rec.State.Status != OperationInterruption {
+		t.Fatalf("operation status = %s, want the outer interruption after the real outcome", rec.State.Status)
+	}
+}
+
+// TestToolOriginatedInterruptionSettlesUnstartedCalls proves the reused
+// interrupted-result settlement: an executor returning the interrupted result
+// stops the batch and every remaining unstarted call receives the ordinary
+// interrupted result through the common terminal helper.
+func TestToolOriginatedInterruptionSettlesUnstartedCalls(t *testing.T) {
+	turn := 0
+	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		if err := assembleCompleted(assemble); err != nil {
+			return agent.ModelSettlement{}, err
+		}
+		turn++
+		if turn == 1 {
+			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"), testToolCall("call-2"))}, nil
+		}
+		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+	}
+	toolFn := func(_ context.Context, call model.ToolCall) PreparedTool {
+		return PreparedTool{Execute: func(context.Context) model.ToolResult {
+			return model.ToolResult{CallID: call.ID, Status: model.ResultInterrupted, Content: "stopped by the tool"}
+		}}
+	}
+	spy := &toolSpy{plan: toolFn}
+	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
+	if err := h.execute(c, testOpID, prepared); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := spy.dispatched(); len(got) != 1 || got[0] != "call-1" {
+		t.Fatalf("dispatch order = %v, want the batch stopped after call-1", got)
+	}
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("graph after the interruption: %v", err)
+	}
+	byCall := map[string]toolResultEntry{}
+	for _, entry := range graph.Entries {
+		if entry.ToolResult != nil {
+			byCall[entry.ToolResult.ToolCallID] = *entry.ToolResult
+		}
+	}
+	if got := byCall["call-1"]; got.Status != model.ResultInterrupted || got.Content != "stopped by the tool" {
+		t.Fatalf("call-1 result = %+v, want the executor's real interrupted result", got)
+	}
+	if got := byCall["call-2"]; got.Status != model.ResultInterrupted || got.Content != interruptedToolResultContent {
+		t.Fatalf("call-2 result = %+v, want the fixed interrupted-before-execution result", got)
+	}
+	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	if err != nil {
+		t.Fatalf("ReadOperation: %v", err)
+	}
+	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != "agent interrupted" {
+		t.Fatalf("operation state = %+v, want terminal interruption with the Agent's detail", rec.State)
+	}
+	requireSessionCleared(t, h, sessionID)
+}
+
+// TestExecuteBetweenEffectCancellationSettlesInterruption proves the outer
+// path owns between-effect cancellation: the run context dying between model
+// effects settles the Operation as terminal interruption through the common
+// terminal helper.
+func TestExecuteBetweenEffectCancellationSettlesInterruption(t *testing.T) {
+	turn := 0
+	var cancel context.CancelFunc
+	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		if err := assembleCompleted(assemble); err != nil {
+			return agent.ModelSettlement{}, err
+		}
+		turn++
+		if turn == 2 {
+			cancel() // the execution context dies between the first and second effect
+		}
+		return agent.ModelSettlement{Disposition: agent.DispoContinue, Output: erroredOutputWith()}, nil
+	}
+	h, store, c, sessionID, prepared, harnessCancel := newExecutionHarness(t, modelFn, func(_ context.Context, call model.ToolCall) PreparedTool {
+		return PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}
+	})
+	cancel = harnessCancel
+	if err := h.execute(c, testOpID, prepared); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	if err != nil {
+		t.Fatalf("ReadOperation: %v", err)
+	}
+	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != "agent interrupted" {
+		t.Fatalf("operation state = %+v, want terminal interruption with the Agent's detail", rec.State)
+	}
+	requireSessionCleared(t, h, sessionID)
+	if _, err := validateFixture(t, store, sessionID); err != nil {
+		t.Fatalf("graph after the cancellation: %v", err)
+	}
+}
+
+// TestExecuteCapSettlesFailure proves the model-effect cap exhausts through
+// the outer path: the Operation settles failure with the Agent's cap detail
+// after the last settled continuation.
+func TestExecuteCapSettlesFailure(t *testing.T) {
+	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		if err := assembleCompleted(assemble); err != nil {
+			return agent.ModelSettlement{}, err
+		}
+		return agent.ModelSettlement{Disposition: agent.DispoContinue, Output: erroredOutputWith()}, nil
+	}
+	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, func(_ context.Context, call model.ToolCall) PreparedTool {
+		return PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}
+	})
+	if err := h.execute(c, testOpID, prepared); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	if err != nil {
+		t.Fatalf("ReadOperation: %v", err)
+	}
+	if rec.State.Status != OperationFailure || rec.State.Terminal == nil || rec.State.Terminal.Detail != "agent exceeded 25 model effects" {
+		t.Fatalf("operation state = %+v, want terminal failure at the cap", rec.State)
+	}
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("graph at the cap: %v", err)
+	}
+	assistants, signals := 0, 0
+	for _, entry := range graph.Entries {
+		if entry.Assistant != nil {
+			assistants++
+		}
+		if entry.Signal != nil {
+			signals++
+		}
+	}
+	if assistants != 25 || signals != 25 {
+		t.Fatalf("%d assistants and %d signals committed, want 25 of each", assistants, signals)
+	}
+	requireSessionCleared(t, h, sessionID)
+}
+
+// completedStream is a fake accepted model stream yielding one completed text
+// response, for composition fixtures driving the real Agent assembly callback.
+type completedStream struct {
+	i int
+}
+
+func (s *completedStream) Recv() (model.StreamDelta, error) {
+	if s.i > 0 {
+		return model.StreamDelta{}, io.EOF
+	}
+	s.i++
+	return model.StreamDelta{
+		HasChoice:        true,
+		Role:             "assistant",
+		ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "done"}},
+		FinishReason:     "stop",
+	}, nil
+}
+
+func (s *completedStream) Close() error { return nil }
+
+// assembleCompleted runs the real assembly callback over one fake completed
+// stream; every output-bearing settlement of the composition fixtures needs
+// exactly one successful assembly behind it.
+func assembleCompleted(assemble agent.AssemblyCallback) error {
+	_, err := assemble(testModelRef(), &completedStream{})
+	return err
+}
+
+// TestToolResultAdoptsIntoView proves a committed tool result adopts into the
+// coordinator view: the next contextSource projection carries it as its
+// model.RoleTool message, and a second tool effect in the same Operation sees
+// the first one committed.
+func TestToolResultAdoptsIntoView(t *testing.T) {
+	h, _, c, sessionID := newEffectHarness(t, nil)
+	publishCalls(t, h, c, sessionID, testToolCall("call-1"), testToolCall("call-2"))
+	source := h.contextSource(c, testOpID)
+	immediate := func(_ context.Context, call model.ToolCall) PreparedTool {
+		return PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran " + call.ID}}
+	}
+	if _, err := h.toolEffect(c, testOpID, immediate)(context.Background(), testToolCall("call-1")); err != nil {
+		t.Fatalf("first tool effect: %v", err)
+	}
+	msgs, err := source(context.Background())
+	if err != nil {
+		t.Fatalf("projection after the first tool result: %v", err)
+	}
+	if len(msgs) != 4 { // system, input, assistant, tool result
+		t.Fatalf("projection carried %d messages, want the committed tool result included (4)", len(msgs))
+	}
+	tool := msgs[len(msgs)-1]
+	if tool.Role != model.RoleTool || tool.ToolCallID != "call-1" || tool.TextContent() != "ran call-1" {
+		t.Fatalf("projected tool message = %+v, want the committed call-1 result", tool)
+	}
+	if _, err := h.toolEffect(c, testOpID, immediate)(context.Background(), testToolCall("call-2")); err != nil {
+		t.Fatalf("second tool effect: %v", err)
+	}
+	msgs, err = source(context.Background())
+	if err != nil {
+		t.Fatalf("projection after the second tool result: %v", err)
+	}
+	if len(msgs) != 5 {
+		t.Fatalf("projection carried %d messages, want both tool results (5)", len(msgs))
+	}
+	if tool = msgs[len(msgs)-1]; tool.ToolCallID != "call-2" || tool.TextContent() != "ran call-2" {
+		t.Fatalf("projected tool message = %+v, want the committed call-2 result", tool)
+	}
+}
+
+// publishCalls drives one ready model effect publishing the given calls as
+// pending, for direct tool-effect fixtures.
+func publishCalls(t *testing.T, h *Harness, c *coordinator, sessionID string, calls ...model.ToolCall) {
+	t.Helper()
+	modelFn := modelAssemblingOnce(agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(calls...)})
+	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, modelFn), func(model.ModelRef, model.Stream) (model.Output, error) {
+		return model.Output{}, nil
+	}); err != nil {
+		t.Fatalf("model effect: %v", err)
+	}
+}
+
+// TestSettleAgentTerminalClassifiesRunError proves the outer settlement
+// classifies the run error: a storage-class error performs no compensating
+// write and leaves the committed running state for recovery; an
+// execution-context error is between-effect cancellation settling the fixed
+// interruption detail; anything else settles failure with the error's text.
+func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
+	t.Run("storage failure leaves the running state for recovery", func(t *testing.T) {
+		modelFn := modelAssemblingOnce(agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"))})
+		spy := &toolSpy{}
+		h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
+		replaces := 0
+		store.txHook = func(step string) error {
+			if step == "replace_register" {
+				replaces++
+				if replaces == 4 { // the tool result's Operation register
+					return fmt.Errorf("%w: injected storage failure", ErrStorage)
+				}
+			}
+			return nil
+		}
+		err := h.execute(c, testOpID, prepared)
+		if !errors.Is(err, ErrStorage) {
+			t.Fatalf("execute = %v, want the injected storage failure", err)
+		}
+		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+		if err != nil {
+			t.Fatalf("ReadOperation: %v", err)
+		}
+		if rec.State.Status != OperationRunning {
+			t.Fatalf("operation status = %s, want the committed running state left for recovery", rec.State.Status)
+		}
+		graph, err := validateFixture(t, store, sessionID)
+		if err != nil {
+			t.Fatalf("graph after the storage failure: %v", err)
+		}
+		for _, entry := range graph.Entries {
+			if entry.Settlement != nil {
+				t.Fatalf("settlement entry %s published over a storage failure", entry.Envelope.ID)
+			}
+		}
+	})
+	t.Run("execution-context error settles the fixed interruption detail", func(t *testing.T) {
+		for _, runErr := range []error{context.Canceled, context.DeadlineExceeded} {
+			h, store, c, sessionID := newEffectHarness(t, nil)
+			publishCalls(t, h, c, sessionID, testToolCall("call-1"))
+			if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{}, runErr); !errors.Is(err, runErr) {
+				t.Fatalf("settleAgentTerminal(%v) = %v, want the run error back", runErr, err)
+			}
+			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+			if err != nil {
+				t.Fatalf("ReadOperation: %v", err)
+			}
+			if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
+				t.Fatalf("operation state = %+v, want terminal interruption with the fixed detail", rec.State)
+			}
+			if _, err := validateFixture(t, store, sessionID); err != nil {
+				t.Fatalf("graph after the interruption: %v", err)
+			}
+		}
+	})
+	t.Run("non-storage protocol error still settles failure", func(t *testing.T) {
+		h, _, c, sessionID := newEffectHarness(t, nil)
+		runErr := errors.New("context source broke")
+		if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{}, runErr); !errors.Is(err, runErr) {
+			t.Fatalf("settleAgentTerminal = %v, want the run error back", err)
+		}
+		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+		if err != nil {
+			t.Fatalf("ReadOperation: %v", err)
+		}
+		if rec.State.Status != OperationFailure || rec.State.Terminal == nil || rec.State.Terminal.Detail != runErr.Error() {
+			t.Fatalf("operation state = %+v, want terminal failure with the error text", rec.State)
+		}
+	})
+}
+
+// TestToolEffectGateBeforePreparation proves execution cancellation prevents
+// later preparation: a context that is already done settles the call's
+// interrupted-before-execution result through the ordinary no-intent
+// transition without ever invoking the prepared function.
+func TestToolEffectGateBeforePreparation(t *testing.T) {
+	h, store, c, sessionID := newEffectHarness(t, nil)
+	publishCalls(t, h, c, sessionID, testToolCall("call-1"), testToolCall("call-2"))
+	spy := &toolSpy{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the execution context dies before the tool effect runs
+	replaces := 0
+	store.txHook = func(step string) error {
+		if step == "replace_register" {
+			replaces++
+		}
+		return nil
+	}
+	got, err := h.toolEffect(c, testOpID, spy.tool)(ctx, testToolCall("call-1"))
+	if err != nil {
+		t.Fatalf("tool effect: %v", err)
+	}
+	if dispatched := spy.dispatched(); len(dispatched) != 0 {
+		t.Fatalf("prepared invoked for %v, want zero preparations", dispatched)
+	}
+	if got != (model.ToolResult{CallID: "call-1", Status: model.ResultInterrupted, Content: interruptedToolResultContent}) {
+		t.Fatalf("committed result = %+v, want the interrupted-before-execution result", got)
+	}
+	if replaces != 2 { // Operation + Session registers only: no effect intent
+		t.Fatalf("%d register replacements, want the intent-free transition (2)", replaces)
+	}
+	// The run settles interruption and the terminal helper interrupts the
+	// remaining unstarted call.
+	if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{Status: agent.TerminalInterruption, Detail: executionInterruptedDetail}, nil); err != nil {
+		t.Fatalf("outer settlement: %v", err)
+	}
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("graph after the interruption: %v", err)
+	}
+	byCall := map[string]toolResultEntry{}
+	for _, entry := range graph.Entries {
+		if entry.ToolResult != nil {
+			byCall[entry.ToolResult.ToolCallID] = *entry.ToolResult
+		}
+	}
+	if got := byCall["call-2"]; got.Status != model.ResultInterrupted || got.Content != interruptedToolResultContent {
+		t.Fatalf("call-2 result = %+v, want the terminal helper's interrupted result", got)
+	}
+	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	if err != nil {
+		t.Fatalf("ReadOperation: %v", err)
+	}
+	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
+		t.Fatalf("operation state = %+v, want terminal interruption", rec.State)
+	}
+	requireSessionCleared(t, h, sessionID)
+}
+
+// TestAssistantEntryCarriesNormalizedArguments proves the assistant record
+// normalizes each call's raw argument payload when it is exactly one valid
+// non-null JSON value, and omits the field otherwise; the entry round-trips
+// through the codecs.
+func TestAssistantEntryCarriesNormalizedArguments(t *testing.T) {
+	malformed := model.ToolCall{ID: "call-2", Name: "echo", Arguments: json.RawMessage("{broken")}
+	modelFn := modelAssemblingOnce(agent.ModelSettlement{
+		Disposition: agent.DispoReady,
+		Output:      completedOutputWith(testToolCall("call-1"), malformed),
+	})
+	h, store, c, sessionID := newEffectHarness(t, modelFn)
+	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, modelFn), func(model.ModelRef, model.Stream) (model.Output, error) {
+		return model.Output{}, nil
+	}); err != nil {
+		t.Fatalf("model effect: %v", err)
+	}
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("graph after the model effect: %v", err)
+	}
+	for _, entry := range graph.Entries {
+		if entry.Assistant == nil || len(entry.Assistant.ToolCalls) != 2 {
+			continue
+		}
+		first, second := entry.Assistant.ToolCalls[0], entry.Assistant.ToolCalls[1]
+		if string(first.NormalizedArguments) != `{"x":1}` {
+			t.Fatalf("call-1 normalized arguments = %q, want the valid JSON value", first.NormalizedArguments)
+		}
+		if len(second.NormalizedArguments) != 0 {
+			t.Fatalf("call-2 normalized arguments = %q, want the field omitted for malformed bytes", second.NormalizedArguments)
+		}
+		return
+	}
+	t.Fatalf("no assistant entry with two calls committed")
+}
+
+// TestModelEffectIntentCancellationSettlesInterruption proves an intent
+// transaction aborted by cancellation settles the cancellation outcome: the
+// run ends in the fixed terminal interruption, never in a boundary violation.
+func TestModelEffectIntentCancellationSettlesInterruption(t *testing.T) {
+	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		if err := assembleCompleted(assemble); err != nil {
+			return agent.ModelSettlement{}, err
+		}
+		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+	}
+	spy := &toolSpy{}
+	var cancel context.CancelFunc
+	h, store, c, sessionID, prepared, harnessCancel := newExecutionHarness(t, modelFn, spy.tool)
+	cancel = harnessCancel
+	replaces := 0
+	store.txHook = func(step string) error {
+		if step == "replace_register" {
+			replaces++
+			if replaces == 1 { // the intent transaction of the first model effect
+				cancel()
+				return context.Canceled
+			}
+		}
+		return nil
+	}
+	if err := h.execute(c, testOpID, prepared); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	if err != nil {
+		t.Fatalf("ReadOperation: %v", err)
+	}
+	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
+		t.Fatalf("operation state = %+v, want terminal interruption with the fixed detail", rec.State)
+	}
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("graph after the cancellation: %v", err)
+	}
+	for _, entry := range graph.Entries {
+		if entry.Assistant != nil {
+			t.Fatalf("assistant entry %s published after an aborted intent", entry.Envelope.ID)
+		}
+	}
+	requireSessionCleared(t, h, sessionID)
+}
+
+// TestToolEffectIntentCancellationSettlesInterrupted proves a tool intent
+// transaction aborted by cancellation settles the call's
+// interrupted-before-execution result: the batch stops and the terminal helper
+// interrupts every remaining unstarted call.
+func TestToolEffectIntentCancellationSettlesInterrupted(t *testing.T) {
+	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		if err := assembleCompleted(assemble); err != nil {
+			return agent.ModelSettlement{}, err
+		}
+		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"), testToolCall("call-2"))}, nil
+	}
+	toolFn := func(_ context.Context, call model.ToolCall) PreparedTool {
+		return PreparedTool{Execute: func(context.Context) model.ToolResult {
+			return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}
+		}}
+	}
+	var cancel context.CancelFunc
+	h, store, c, sessionID, prepared, harnessCancel := newExecutionHarness(t, modelFn, toolFn)
+	cancel = harnessCancel
+	replaces := 0
+	store.txHook = func(step string) error {
+		if step == "replace_register" {
+			replaces++
+			if replaces == 4 { // the tool effect's intent transaction
+				cancel()
+				return context.Canceled
+			}
+		}
+		return nil
+	}
+	if err := h.execute(c, testOpID, prepared); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("graph after the cancellation: %v", err)
+	}
+	byCall := map[string]toolResultEntry{}
+	for _, entry := range graph.Entries {
+		if entry.ToolResult != nil {
+			byCall[entry.ToolResult.ToolCallID] = *entry.ToolResult
+		}
+	}
+	if got := byCall["call-1"]; got.Status != model.ResultInterrupted || got.Content != interruptedToolResultContent {
+		t.Fatalf("call-1 result = %+v, want the interrupted-before-execution result", got)
+	}
+	if got := byCall["call-2"]; got.Status != model.ResultInterrupted || got.Content != interruptedToolResultContent {
+		t.Fatalf("call-2 result = %+v, want the terminal helper's interrupted result", got)
+	}
+	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	if err != nil {
+		t.Fatalf("ReadOperation: %v", err)
+	}
+	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
+		t.Fatalf("operation state = %+v, want terminal interruption with the fixed detail", rec.State)
+	}
+	requireSessionCleared(t, h, sessionID)
 }
