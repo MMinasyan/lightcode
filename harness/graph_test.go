@@ -5,20 +5,37 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"sync"
 	"testing"
+	"time"
 )
 
-// graphStorage is the private read-only Storage substitute for the graph
-// validator fixtures: an in-package fake implementing harness.Storage, with
-// no dependency on any concrete storage backend.
+// graphStorage is the private Storage substitute for the validator and
+// admission fixtures: an in-package fake implementing harness.Storage with
+// transactional semantics, failure injection, and no dependency on any
+// concrete storage backend. Every transaction applies its mutations to the
+// shared state and rolls them back when the callback fails.
 type graphStorage struct {
-	registers    map[string][]Register
-	entries      map[string][]Entry
+	mu        sync.Mutex
+	registers map[string][]Register
+	entries   map[string][]Entry
+
 	registersErr error
 	entriesErr   error
+
+	// txHook, when set, runs before each transactional mutation step and
+	// aborts the transaction with its error when non-nil.
+	txHook func(step string) error
 }
 
 func (s *graphStorage) ReadEntries(_ context.Context, sessionID string, after int64) ([]Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readEntriesLocked(sessionID, after)
+}
+
+func (s *graphStorage) readEntriesLocked(sessionID string, after int64) ([]Entry, error) {
 	if s.entriesErr != nil {
 		return nil, s.entriesErr
 	}
@@ -32,6 +49,12 @@ func (s *graphStorage) ReadEntries(_ context.Context, sessionID string, after in
 }
 
 func (s *graphStorage) ReadRegister(_ context.Context, key RegisterKey) (Register, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readRegisterLocked(key)
+}
+
+func (s *graphStorage) readRegisterLocked(key RegisterKey) (Register, error) {
 	for _, reg := range s.registers[key.SessionID] {
 		if reg.Key == key {
 			return reg, nil
@@ -41,6 +64,8 @@ func (s *graphStorage) ReadRegister(_ context.Context, key RegisterKey) (Registe
 }
 
 func (s *graphStorage) ReadRegisters(_ context.Context, sessionID string) ([]Register, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.registersErr != nil {
 		return nil, s.registersErr
 	}
@@ -48,15 +73,192 @@ func (s *graphStorage) ReadRegisters(_ context.Context, sessionID string) ([]Reg
 }
 
 func (s *graphStorage) ListSessionIDs(_ context.Context) ([]string, error) {
-	var out []string
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := map[string]bool{}
 	for id := range s.registers {
+		seen[id] = true
+	}
+	for id := range s.entries {
+		seen[id] = true
+	}
+	out := make([]string, 0, len(seen))
+	for id := range seen {
 		out = append(out, id)
 	}
+	sort.Strings(out)
 	return out, nil
 }
 
-func (s *graphStorage) Transact(_ context.Context, _ func(Transaction) error) error {
-	return errors.New("graph fixture storage is read-only")
+func (s *graphStorage) Transact(ctx context.Context, fn func(Transaction) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx := &graphTx{store: s}
+	if err := fn(tx); err != nil {
+		tx.rollback()
+		return err
+	}
+	return nil
+}
+
+func (s *graphStorage) sessionRegisterLocked(sessionID string) (Register, bool) {
+	for _, reg := range s.registers[sessionID] {
+		if reg.Key.Kind == RegisterSession {
+			return reg, true
+		}
+	}
+	return Register{}, false
+}
+
+func (s *graphStorage) hook(step string) error {
+	if s.txHook == nil {
+		return nil
+	}
+	return s.txHook(step)
+}
+
+// graphTx is one transaction lifetime over the shared fake state. Mutations
+// are journaled as undo closures; Transact replays them in reverse when the
+// callback fails.
+type graphTx struct {
+	store *graphStorage
+	undo  []func()
+}
+
+func (t *graphTx) rollback() {
+	for i := len(t.undo) - 1; i >= 0; i-- {
+		t.undo[i]()
+	}
+}
+
+func (t *graphTx) ReadEntries(sessionID string, after int64) ([]Entry, error) {
+	return t.store.readEntriesLocked(sessionID, after)
+}
+
+func (t *graphTx) ReadRegister(key RegisterKey) (Register, error) {
+	return t.store.readRegisterLocked(key)
+}
+
+func (t *graphTx) InsertEntry(draft EntryDraft) (Entry, error) {
+	if err := t.store.hook("insert_entry"); err != nil {
+		return Entry{}, err
+	}
+	if draft.SessionID == "" || draft.ID == "" || !json.Valid(draft.Payload) {
+		return Entry{}, invalidInput("invalid entry draft")
+	}
+	if _, ok := t.store.sessionRegisterLocked(draft.SessionID); !ok {
+		return Entry{}, fmt.Errorf("%w: session %q does not exist", ErrNotFound, draft.SessionID)
+	}
+	for _, list := range t.store.entries {
+		for _, entry := range list {
+			if entry.ID == draft.ID {
+				return Entry{}, fmt.Errorf("%w: entry id %q already exists", ErrConflict, draft.ID)
+			}
+		}
+	}
+	list := t.store.entries[draft.SessionID]
+	var highest int64
+	for _, entry := range list {
+		if entry.Sequence > highest {
+			highest = entry.Sequence
+		}
+	}
+	entry := Entry{
+		SessionID:   draft.SessionID,
+		ID:          draft.ID,
+		Sequence:    highest + 1,
+		OperationID: draft.OperationID,
+		Kind:        draft.Kind,
+		CommittedAt: time.Now().UTC(),
+		Payload:     draft.Payload,
+	}
+	t.store.entries[draft.SessionID] = append(list, entry)
+	index := len(t.store.entries[draft.SessionID]) - 1
+	t.undo = append(t.undo, func() {
+		entries := t.store.entries[draft.SessionID]
+		t.store.entries[draft.SessionID] = entries[:index]
+	})
+	return entry, nil
+}
+
+func (t *graphTx) InsertRegister(draft RegisterDraft) (Register, error) {
+	if err := t.store.hook("insert_register"); err != nil {
+		return Register{}, err
+	}
+	if !json.Valid(draft.Payload) {
+		return Register{}, invalidInput("register payload is not valid JSON")
+	}
+	if draft.Key.Kind == RegisterOperation {
+		if _, ok := t.store.sessionRegisterLocked(draft.Key.SessionID); !ok {
+			return Register{}, fmt.Errorf("%w: session %q does not exist", ErrNotFound, draft.Key.SessionID)
+		}
+		for sessionID, regs := range t.store.registers {
+			for _, reg := range regs {
+				if reg.Key.Kind == RegisterOperation && reg.Key.OperationID == draft.Key.OperationID {
+					return Register{}, fmt.Errorf("%w: operation %q already exists in session %q", ErrConflict, draft.Key.OperationID, sessionID)
+				}
+			}
+		}
+	}
+	for _, reg := range t.store.registers[draft.Key.SessionID] {
+		if reg.Key == draft.Key {
+			return Register{}, fmt.Errorf("%w: register %v already exists", ErrConflict, draft.Key)
+		}
+	}
+	register := Register{Key: draft.Key, Revision: 1, Payload: draft.Payload}
+	t.store.registers[draft.Key.SessionID] = append(t.store.registers[draft.Key.SessionID], register)
+	index := len(t.store.registers[draft.Key.SessionID]) - 1
+	t.undo = append(t.undo, func() {
+		regs := t.store.registers[draft.Key.SessionID]
+		t.store.registers[draft.Key.SessionID] = regs[:index]
+	})
+	return register, nil
+}
+
+func (t *graphTx) ReplaceRegister(key RegisterKey, expectedRevision int64, payload json.RawMessage) (Register, error) {
+	if err := t.store.hook("replace_register"); err != nil {
+		return Register{}, err
+	}
+	if !json.Valid(payload) {
+		return Register{}, invalidInput("register payload is not valid JSON")
+	}
+	regs := t.store.registers[key.SessionID]
+	for i, reg := range regs {
+		if reg.Key != key {
+			continue
+		}
+		if reg.Revision != expectedRevision {
+			return Register{}, fmt.Errorf("%w: register %v revision %d does not match expected %d", ErrConflict, key, reg.Revision, expectedRevision)
+		}
+		updated := Register{Key: key, Revision: reg.Revision + 1, Payload: payload}
+		t.undo = append(t.undo, func() {
+			t.store.registers[key.SessionID][i] = reg
+		})
+		t.store.registers[key.SessionID][i] = updated
+		return updated, nil
+	}
+	return Register{}, fmt.Errorf("%w: register %v does not exist", ErrNotFound, key)
+}
+
+func (t *graphTx) DeleteSession(sessionID string) error {
+	if err := t.store.hook("delete_session"); err != nil {
+		return err
+	}
+	regs, ok := t.store.registers[sessionID]
+	if !ok {
+		return fmt.Errorf("%w: session %q does not exist", ErrNotFound, sessionID)
+	}
+	entries := t.store.entries[sessionID]
+	t.undo = append(t.undo, func() {
+		t.store.registers[sessionID] = regs
+		t.store.entries[sessionID] = entries
+	})
+	delete(t.store.registers, sessionID)
+	delete(t.store.entries, sessionID)
+	return nil
 }
 
 // testEntry is one fixture entry: the envelope identity plus exactly one
