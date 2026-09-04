@@ -348,9 +348,9 @@ type admissionRequest struct {
 // same-Session Operation has been read; it never escapes admit.
 var errAdmissionExisting = errors.New("harness: operation already admitted in this session")
 
-// errRevisionRace marks the revision-guard conflict of an admission or
-// agent-type transaction: durable state changed under the coordinator's
-// validated view. It keeps the landed conflict class reachable.
+// errRevisionRace marks the revision-guard conflict of an admission,
+// agent-type, or effect transaction: durable state changed under the
+// coordinator's validated view. It keeps the landed conflict class reachable.
 var errRevisionRace = fmt.Errorf("harness: session changed concurrently: %w", ErrConflict)
 
 // admit is the one normal admission path: validate the input, materialize the
