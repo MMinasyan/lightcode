@@ -50,10 +50,42 @@ func TestBundledCatalogFilesValidateAndBuild(t *testing.T) {
 		t.Fatalf("walk bundled catalog: %v", err)
 	}
 
-	for _, providerID := range []string{"openai", "openrouter"} {
+	for _, providerID := range []string{"openai", "openrouter", "atlascloud"} {
 		if !seen[providerID] {
 			t.Fatalf("bundled provider %q was not found", providerID)
 		}
+	}
+}
+
+func TestAtlasCloudBundledCatalog(t *testing.T) {
+	bundled, err := readBundledProviders(bundledFS)
+	if err != nil {
+		t.Fatalf("read bundled providers: %v", err)
+	}
+	raw := bundled["atlascloud"]
+	if raw == nil {
+		t.Fatal("atlascloud bundled provider missing")
+	}
+
+	result := Build(BuildInputs{Bundled: map[string]json.RawMessage{"atlascloud": raw}})
+	if len(result.Warnings) != 0 {
+		t.Fatalf("Build warnings = %#v, want none", result.Warnings)
+	}
+	prov := result.Catalog.Providers["atlascloud"]
+	if prov == nil {
+		t.Fatal("atlascloud provider missing after Build")
+	}
+	if prov.Transport.BaseURL != "https://api.atlascloud.ai/v1" {
+		t.Fatalf("base URL = %q, want Atlas Cloud LLM endpoint", prov.Transport.BaseURL)
+	}
+	if prov.Transport.APIKeyEnv != "ATLASCLOUD_API_KEY" {
+		t.Fatalf("api key env = %q, want ATLASCLOUD_API_KEY", prov.Transport.APIKeyEnv)
+	}
+	if prov.Models["deepseek-ai/deepseek-v4-pro"] == nil {
+		t.Fatal("DeepSeek V4 Pro model missing")
+	}
+	if prov.Models["qwen/qwen3.5-flash"] == nil {
+		t.Fatal("Qwen3.5 Flash model missing")
 	}
 }
 
