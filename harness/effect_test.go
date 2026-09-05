@@ -30,16 +30,7 @@ func newEffectHarness(t *testing.T, modelFn agent.ModelEffect) (*Harness, *graph
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	_, disposition, err := h.admit(context.Background(), admissionRequest{
-		SessionID:   session.Identity.SessionID,
-		OperationID: testOpID,
-		Origin:      InputOriginUser,
-		Content:     admissionContent("hello"),
-	})
-	if err != nil {
-		t.Fatalf("admit: %v", err)
-	}
-	if disposition != DispositionAdmitted {
+	if _, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello")); disposition != DispositionAdmitted {
 		t.Fatalf("disposition %q, want admitted", disposition)
 	}
 	c, err := h.coordinatorFor(context.Background(), session.Identity.SessionID)
@@ -860,28 +851,41 @@ func TestSignalProjectionEscaping(t *testing.T) {
 }
 
 // TestSteeringInputHelper proves the steering-input producer commits one
-// Operation-owned input entry and advances last activity to its commit time.
+// Operation-owned input entry, preserves the item's own submission origin,
+// and advances last activity to its commit time.
 func TestSteeringInputHelper(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
 	before, err := h.ReadSession(context.Background(), sessionID)
 	if err != nil {
 		t.Fatalf("ReadSession: %v", err)
 	}
-	if err := h.commitSteeringInput(context.Background(), c, testOpID, admissionContent("steering")); err != nil {
+	if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginUser, admissionContent("steering")); err != nil {
 		t.Fatalf("commitSteeringInput: %v", err)
+	}
+	if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginRuntime, admissionContent("steered-by-runtime")); err != nil {
+		t.Fatalf("commitSteeringInput with a non-user origin: %v", err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
 	if err != nil {
 		t.Fatalf("post-steering graph: %v", err)
 	}
-	var input *inputEntry
+	var user, runtime *inputEntry
 	for i := range graph.Entries {
-		if graph.Entries[i].Input != nil && graph.Entries[i].Input.Origin == InputOriginUser && graph.Entries[i].Envelope.OperationID == testOpID && graph.Entries[i].Input.Content[0].Text == "steering" {
-			input = graph.Entries[i].Input
+		if graph.Entries[i].Input == nil || graph.Entries[i].Envelope.OperationID != testOpID {
+			continue
+		}
+		switch graph.Entries[i].Input.Content[0].Text {
+		case "steering":
+			user = graph.Entries[i].Input
+		case "steered-by-runtime":
+			runtime = graph.Entries[i].Input
 		}
 	}
-	if input == nil {
-		t.Fatalf("steering input entry not committed as Operation-owned user input")
+	if user == nil || user.Origin != InputOriginUser {
+		t.Fatalf("user steering entry not committed with its own origin: %+v", user)
+	}
+	if runtime == nil || runtime.Origin != InputOriginRuntime {
+		t.Fatalf("runtime steering entry did not preserve its submission origin: %+v", runtime)
 	}
 	after, err := h.ReadSession(context.Background(), sessionID)
 	if err != nil {
@@ -985,7 +989,7 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 	t.Run("steering transaction", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
 		foreignEffectRace(t, store, sessionID, testOpID, "foreign")
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, admissionContent("steering")); !errors.Is(err, ErrConflict) {
+		if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginUser, admissionContent("steering")); !errors.Is(err, ErrConflict) {
 			t.Fatalf("steering over a foreign revision = %v, want the revision-race conflict", err)
 		}
 		if session, err := h.ReadSession(context.Background(), sessionID); err != nil || session.State.CurrentAgentType != "foreign" {
@@ -1065,7 +1069,7 @@ func TestSteeringInputPreconditions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("graph before steering: %v", err)
 		}
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, admissionContent("steering")); !errors.Is(err, ErrInvalid) {
+		if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginUser, admissionContent("steering")); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("steering after terminal settlement = %v, want ErrInvalid", err)
 		}
 		after, err := validateFixture(t, store, sessionID)
@@ -1083,7 +1087,7 @@ func TestSteeringInputPreconditions(t *testing.T) {
 			t.Fatalf("terminal effect: %v", err)
 		}
 		archiveSettledSession(t, c, store, sessionID)
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, admissionContent("steering")); !errors.Is(err, ErrInvalid) {
+		if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginUser, admissionContent("steering")); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("steering on an archived session = %v, want ErrInvalid", err)
 		}
 		after, err := validateFixture(t, store, sessionID)
@@ -1173,7 +1177,7 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 	t.Run("steering over a foreign archive", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
 		foreignArchive(t, store, sessionID)
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, admissionContent("steering")); !errors.Is(err, ErrInvalid) {
+		if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginUser, admissionContent("steering")); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("steering over a foreign archive = %v, want ErrInvalid", err)
 		}
 	})
@@ -1224,13 +1228,8 @@ func newExecutionHarness(t *testing.T, modelFn agent.ModelEffect, toolFn func(co
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if _, disposition, err := h.admit(context.Background(), admissionRequest{
-		SessionID:   session.Identity.SessionID,
-		OperationID: testOpID,
-		Origin:      InputOriginUser,
-		Content:     admissionContent("hello"),
-	}); err != nil || disposition != DispositionAdmitted {
-		t.Fatalf("admit: %v (%q)", err, disposition)
+	if _, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello")); disposition != DispositionAdmitted {
+		t.Fatalf("disposition %q, want admitted", disposition)
 	}
 	c, err := h.coordinatorFor(context.Background(), session.Identity.SessionID)
 	if err != nil {

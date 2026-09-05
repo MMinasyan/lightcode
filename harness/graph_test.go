@@ -27,6 +27,11 @@ type graphStorage struct {
 	// txHook, when set, runs before each transactional mutation step and
 	// aborts the transaction with its error when non-nil.
 	txHook func(step string) error
+
+	// entryHook, when set, runs before each entry insertion with the draft
+	// and aborts the transaction with its error when non-nil. It gives
+	// fixtures a deterministic barrier on one committed entry kind.
+	entryHook func(draft EntryDraft) error
 }
 
 func (s *graphStorage) ReadEntries(_ context.Context, sessionID string, after int64) ([]Entry, error) {
@@ -69,7 +74,10 @@ func (s *graphStorage) ReadRegisters(_ context.Context, sessionID string) ([]Reg
 	if s.registersErr != nil {
 		return nil, s.registersErr
 	}
-	return s.registers[sessionID], nil
+	regs := s.registers[sessionID]
+	out := make([]Register, len(regs)) // owned copy: register values mutate in place under the store lock
+	copy(out, regs)
+	return out, nil
 }
 
 func (s *graphStorage) ListSessionIDs(_ context.Context) ([]string, error) {
@@ -145,6 +153,11 @@ func (t *graphTx) ReadRegister(key RegisterKey) (Register, error) {
 func (t *graphTx) InsertEntry(draft EntryDraft) (Entry, error) {
 	if err := t.store.hook("insert_entry"); err != nil {
 		return Entry{}, err
+	}
+	if t.store.entryHook != nil {
+		if err := t.store.entryHook(draft); err != nil {
+			return Entry{}, err
+		}
 	}
 	if draft.SessionID == "" || draft.ID == "" || !json.Valid(draft.Payload) {
 		return Entry{}, invalidInput("invalid entry draft")

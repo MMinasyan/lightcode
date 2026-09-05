@@ -96,15 +96,46 @@ func newTestHarness(t *testing.T, store Storage, prepare func(context.Context, P
 }
 
 // validPrepared returns a prepared execution with a valid capture and
-// placeholder effect functions.
+// placeholder effect functions. The placeholder model function parks forever,
+// so an auto-started execution keeps its Operation current without settling
+// it: admission fixtures observe a stable running state.
 func validPrepared() PreparedExecution {
 	return PreparedExecution{
 		Capture: testCapture(),
 		Model: func(context.Context, model.Request, agent.AssemblyCallback) (agent.ModelSettlement, error) {
-			return agent.ModelSettlement{}, nil
+			select {} // the fixture owns the admitted Operation's state assertions
 		},
 		Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
 	}
+}
+
+// mustAdmitWithoutExecution runs the reserved admission body without
+// installing the execution — the shape the effect fixtures need to drive the
+// private wrappers directly on the admitted Operation.
+func mustAdmitWithoutExecution(t *testing.T, h *Harness, sessionID, operationID string, content []model.ContentPart) (OperationRecord, SubmitDisposition) {
+	t.Helper()
+	c, err := h.coordinatorFor(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("coordinator: %v", err)
+	}
+	release, err := c.reserve(context.Background())
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	defer release()
+	rec, prepared, disposition, err := h.admitReserved(context.Background(), c, admissionRequest{
+		SessionID:   sessionID,
+		OperationID: operationID,
+		Origin:      InputOriginUser,
+		Content:     content,
+	})
+	if err != nil {
+		t.Fatalf("admitReserved: %v", err)
+	}
+	if disposition != DispositionAdmitted || prepared == nil {
+		t.Fatalf("disposition %q (prepared %v), want a new admission", disposition, prepared != nil)
+	}
+	return rec, disposition
 }
 
 func admissionContent(text string) []model.ContentPart {
@@ -126,10 +157,15 @@ func mustAdmit(t *testing.T, h *Harness, sessionID, operationID string, content 
 }
 
 // storedSessionState reads back the store's session fixtures for one Session.
+// It returns stable snapshots: an auto-started execution mutates register
+// values in place, so callers never alias the store's backing arrays.
 func storedSessionState(s *graphStorage, sessionID string) (entries []Entry, regs []Register) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.entries[sessionID], s.registers[sessionID]
+	entries = append([]Entry(nil), s.entries[sessionID]...)
+	regs = make([]Register, len(s.registers[sessionID]))
+	copy(regs, s.registers[sessionID])
+	return entries, regs
 }
 
 // TestNewConstructionContract proves the constructor's input contract: a live

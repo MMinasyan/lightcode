@@ -58,26 +58,67 @@ type CreateSessionRequest struct {
 	AgentType string
 }
 
+// SubmitRequest is the input of one public Session message submission.
+type SubmitRequest struct {
+	SessionID   string
+	OperationID string
+	Origin      InputOrigin
+	Content     []model.ContentPart
+	Mode        MessageMode
+}
+
+// SubmitResult is the outcome of one public Submit. Operation is present for
+// admitted/existing only; a buffered item is not a durable Operation yet.
+type SubmitResult struct {
+	Disposition SubmitDisposition
+	Operation   *OperationRecord
+}
+
 // Harness is the public durable state machine over one Storage. It owns
-// Session materialization, reads, root creation, Agent-type change, and the
-// shared admission producer; it owns neither storage close nor Runtime
-// shutdown policy.
+// Session materialization, reads, root creation, Agent-type change, the shared
+// admission producer, public Submit with its two process-local buffers, and
+// execution; it owns neither storage close nor Runtime shutdown policy.
 type Harness struct {
 	ctx  context.Context
 	deps Dependencies
 
 	mu       sync.Mutex
 	sessions map[string]*coordinator
+
+	// storageFailure retains the first storage-class failure that stopped
+	// admitted work; Wait returns it after all process-local work has ended.
+	storageFailure error
+}
+
+// pendingMessage is one buffered Submit: a process-local FIFO item that is
+// neither a durable Operation nor a Session entry while it waits, carries no
+// idempotency, and is discarded on Harness-context loss.
+type pendingMessage struct {
+	operationID string
+	origin      InputOrigin
+	content     []model.ContentPart
+}
+
+// activeExecution is the one in-flight execution of a coordinator: installed
+// after the admission commit and released only after the terminal settlement
+// and the post-terminal buffer drain have converged.
+type activeExecution struct {
+	done chan struct{} // closed when the execution goroutine finishes
 }
 
 // coordinator is the one per-Session authority: the validated Session view,
-// a sticky corruption marker, and the single admission/fork reservation.
+// a sticky corruption marker, the single admission/fork reservation, the two
+// process-local message FIFOs, and the optional active execution.
 type coordinator struct {
 	mu    sync.Mutex
 	graph *sessionGraph
 	corru error
 
 	reserved chan struct{} // non-nil while one reservation is held; closed on release
+
+	steering []*pendingMessage // regular input waiting for the next model boundary
+	queued   []*pendingMessage // queued input waiting for the next Agent turn end
+	run      *activeExecution  // non-nil while one execution is in flight
 }
 
 // New constructs one Harness over the given dependencies. It requires a live
@@ -237,6 +278,73 @@ func (h *Harness) ChangeAgentType(ctx context.Context, sessionID, agentType stri
 	}
 }
 
+// Submit submits one Session message. While the Session is idle, regular and
+// queued input use normal admission; while an Operation is active, regular
+// input enters the steering FIFO and queued input enters the queued FIFO. The
+// buffers are process-local: a buffered item is not a durable Operation or
+// Session entry, has no idempotency, and is discarded on Harness-context
+// loss. An existing same-Session/message Operation resolves before routing.
+func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, error) {
+	if err := h.ctx.Err(); err != nil { // cancellation has closed admission
+		return SubmitResult{}, err
+	}
+	switch req.Mode {
+	case MessageModeRegular, MessageModeQueued:
+	default:
+		return SubmitResult{}, invalidInput("message mode %q is not one of regular or queued", req.Mode)
+	}
+	content, err := validateSubmitInput(req.OperationID, req.Origin, req.Content)
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	c, err := h.coordinatorFor(ctx, req.SessionID)
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	c.mu.Lock()
+	if rec, ok := c.graph.Operation(req.OperationID); ok { // existing resolves before routing
+		first := ownOperationRecord(rec)
+		c.mu.Unlock()
+		return SubmitResult{Disposition: DispositionExisting, Operation: &first}, nil
+	}
+	if c.graph.Session.State.Lifecycle != LifecycleOpen {
+		c.mu.Unlock()
+		return SubmitResult{}, invalidInput("session %q is archived; admission requires an open Session", req.SessionID)
+	}
+	if err := ctx.Err(); err != nil { // the routing gate: cancellation observed here publishes nothing
+		c.mu.Unlock()
+		return SubmitResult{}, err
+	}
+	if err := h.ctx.Err(); err != nil {
+		c.mu.Unlock()
+		return SubmitResult{}, err
+	}
+	if c.graph.Session.State.CurrentOperationID != "" || c.run != nil { // active: buffer by mode; the enqueue is the publication gate
+		item := &pendingMessage{operationID: req.OperationID, origin: req.Origin, content: content}
+		disposition := DispositionSteering
+		if req.Mode == MessageModeQueued {
+			c.queued = append(c.queued, item)
+			disposition = DispositionQueued
+		} else {
+			c.steering = append(c.steering, item)
+		}
+		c.mu.Unlock()
+		return SubmitResult{Disposition: disposition}, nil
+	}
+	c.mu.Unlock()
+
+	rec, disposition, err := h.admit(ctx, admissionRequest{
+		SessionID:   req.SessionID,
+		OperationID: req.OperationID,
+		Origin:      req.Origin,
+		Content:     content,
+	})
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	return SubmitResult{Disposition: disposition, Operation: &rec}, nil
+}
+
 // coordinatorFor returns the materialized coordinator of one Session,
 // validating its graph on first materialization. A persisted semantic
 // violation caches a sticky corruption marker that makes the Session
@@ -353,28 +461,37 @@ var errAdmissionExisting = errors.New("harness: operation already admitted in th
 // coordinator's validated view. It keeps the landed conflict class reachable.
 var errRevisionRace = fmt.Errorf("harness: session changed concurrently: %w", ErrConflict)
 
-// admit is the one normal admission path: validate the input, materialize the
-// Session, return an existing same-Session Operation without preparing again,
-// reserve admission, prepare outside locks and storage, then transactionally
-// publish the input entry, the running Operation, and the Session current
-// Operation. The reservation is the configuration-capture linearization
-// point; preparation failure publishes nothing.
-func (h *Harness) admit(ctx context.Context, req admissionRequest) (OperationRecord, SubmitDisposition, error) {
-	if err := validateOperationIdentity(req.OperationID, "operation id"); err != nil {
-		return OperationRecord{}, "", invalidInput("operation id: %v", err)
+// validateSubmitInput validates one submitted message's identity, origin, and
+// content, returning the owned content copy every downstream use consumes.
+func validateSubmitInput(operationID string, origin InputOrigin, content []model.ContentPart) ([]model.ContentPart, error) {
+	if err := validateOperationIdentity(operationID, "operation id"); err != nil {
+		return nil, invalidInput("operation id: %v", err)
 	}
-	switch req.Origin {
+	switch origin {
 	case InputOriginUser, InputOriginRuntime, InputOriginPlugin:
 	default:
-		return OperationRecord{}, "", invalidInput("input origin %q is not one of user, runtime or plugin", req.Origin)
+		return nil, invalidInput("input origin %q is not one of user, runtime or plugin", origin)
 	}
-	content := make([]model.ContentPart, 0, len(req.Content))
-	for i, part := range req.Content {
-		owned, err := model.NewContentPart(part) // the validated owned copy feeds every downstream use
+	owned := make([]model.ContentPart, 0, len(content))
+	for i, part := range content {
+		validated, err := model.NewContentPart(part) // the validated owned copy feeds every downstream use
 		if err != nil {
-			return OperationRecord{}, "", invalidInput("content[%d]: %v", i, err)
+			return nil, invalidInput("content[%d]: %v", i, err)
 		}
-		content = append(content, owned)
+		owned = append(owned, validated)
+	}
+	return owned, nil
+}
+
+// admit is the one normal admission path: validate the input, materialize the
+// Session, return an existing same-Session Operation without preparing again,
+// reserve admission, then run the reserved admission body. The reservation is
+// the configuration-capture linearization point; preparation failure
+// publishes nothing.
+func (h *Harness) admit(ctx context.Context, req admissionRequest) (OperationRecord, SubmitDisposition, error) {
+	content, err := validateSubmitInput(req.OperationID, req.Origin, req.Content)
+	if err != nil {
+		return OperationRecord{}, "", err
 	}
 	req.Content = content
 	c, err := h.coordinatorFor(ctx, req.SessionID)
@@ -395,7 +512,6 @@ func (h *Harness) admit(ctx context.Context, req admissionRequest) (OperationRec
 		c.mu.Unlock()
 		return OperationRecord{}, "", invalidInput("session %q already runs operation %q; admission requires an idle Session", req.SessionID, running)
 	}
-	view := c.graph.Session
 	c.mu.Unlock()
 
 	release, err := c.reserve(ctx)
@@ -403,22 +519,38 @@ func (h *Harness) admit(ctx context.Context, req admissionRequest) (OperationRec
 		return OperationRecord{}, "", err
 	}
 	defer release()
+	rec, prepared, disposition, err := h.admitReserved(ctx, c, req)
+	if err != nil {
+		return OperationRecord{}, "", err
+	}
+	if prepared != nil { // install process-local execution and start Agent only after commit
+		h.startExecution(c, rec.Admission.OperationID, *prepared)
+	}
+	return rec, disposition, nil
+}
 
+// admitReserved is the reserved admission body: the re-checked existing,
+// lifecycle, and idle guards, the outside-lock preparation, and the
+// transactional publication. The caller holds the Session's admission
+// reservation and releases it only after the returned execution, when present,
+// is installed. A prepared execution returns only for a newly admitted
+// Operation; an existing resolution carries none.
+func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissionRequest) (OperationRecord, *PreparedExecution, SubmitDisposition, error) {
 	c.mu.Lock()
 	if rec, ok := c.graph.Operation(req.OperationID); ok { // the prior reservation holder admitted it
 		c.mu.Unlock()
-		return ownOperationRecord(rec), DispositionExisting, nil
+		return ownOperationRecord(rec), nil, DispositionExisting, nil
 	}
 	if c.graph.Session.State.Lifecycle != LifecycleOpen {
 		c.mu.Unlock()
-		return OperationRecord{}, "", invalidInput("session %q is archived; admission requires an open Session", req.SessionID)
+		return OperationRecord{}, nil, "", invalidInput("session %q is archived; admission requires an open Session", req.SessionID)
 	}
 	if c.graph.Session.State.CurrentOperationID != "" {
 		running := c.graph.Session.State.CurrentOperationID
 		c.mu.Unlock()
-		return OperationRecord{}, "", invalidInput("session %q already runs operation %q; admission requires an idle Session", req.SessionID, running)
+		return OperationRecord{}, nil, "", invalidInput("session %q already runs operation %q; admission requires an idle Session", req.SessionID, running)
 	}
-	view = c.graph.Session // the state the reservation resolved on
+	view := c.graph.Session // the state the reservation resolved on
 	c.mu.Unlock()
 
 	prepCtx, cancel := context.WithCancel(h.ctx)
@@ -426,41 +558,44 @@ func (h *Harness) admit(ctx context.Context, req admissionRequest) (OperationRec
 	stop := context.AfterFunc(ctx, cancel)
 	defer stop()
 	if err := ctx.Err(); err != nil { // the combined preparation context is already done: never invoke Prepare
-		return OperationRecord{}, "", err
+		return OperationRecord{}, nil, "", err
 	}
 	if err := h.ctx.Err(); err != nil {
-		return OperationRecord{}, "", h.ctx.Err()
+		return OperationRecord{}, nil, "", h.ctx.Err()
 	}
 	prepared, prepErr := h.deps.Prepare(prepCtx, PreparationRequest{
 		Session:     PreparationSession{Identity: view.Identity, AgentType: view.State.CurrentAgentType},
 		RequestKind: RequestKindMessage,
 	})
 	if prepErr != nil {
-		return OperationRecord{}, "", prepErr
+		return OperationRecord{}, nil, "", prepErr
 	}
 	if prepared.Model == nil || prepared.Tool == nil {
-		return OperationRecord{}, "", invalidInput("prepared execution requires non-nil model and tool functions")
+		return OperationRecord{}, nil, "", invalidInput("prepared execution requires non-nil model and tool functions")
 	}
 	if err := validateExecutionCapture(prepared.Capture); err != nil {
-		return OperationRecord{}, "", invalidInput("prepared execution capture: %v", err)
+		return OperationRecord{}, nil, "", invalidInput("prepared execution capture: %v", err)
 	}
 	capture := ownCapture(prepared.Capture)
 
 	if err := ctx.Err(); err != nil { // caller cancellation wins when both contexts are done
-		return OperationRecord{}, "", err
+		return OperationRecord{}, nil, "", err
 	}
 	if err := h.ctx.Err(); err != nil {
-		return OperationRecord{}, "", h.ctx.Err()
+		return OperationRecord{}, nil, "", h.ctx.Err()
 	}
 
-	record, existing, err := h.publishAdmission(ctx, c, view, capture, req)
+	// the transaction runs on the combined preparation context: either
+	// cancellation before commit aborts it, and a committed publication wins
+	// later cancellation
+	record, existing, err := h.publishAdmission(prepCtx, c, view, capture, req)
 	if err != nil {
-		return OperationRecord{}, "", err
+		return OperationRecord{}, nil, "", err
 	}
 	if existing {
-		return ownOperationRecord(record), DispositionExisting, nil
+		return ownOperationRecord(record), nil, DispositionExisting, nil
 	}
-	return ownOperationRecord(record), DispositionAdmitted, nil
+	return ownOperationRecord(record), &prepared, DispositionAdmitted, nil
 }
 
 // publishAdmission runs the in-transaction admission producer: re-read the
@@ -628,6 +763,153 @@ func (h *Harness) rematerialize(ctx context.Context, c *coordinator, sessionID s
 	c.graph = graph
 	c.mu.Unlock()
 	return nil
+}
+
+// startExecution installs the coordinator's active execution and starts the
+// Agent composition on the Harness context after the admission commit. The
+// execution slot releases, and the post-terminal buffer drain completes,
+// before the execution's done channel closes.
+func (h *Harness) startExecution(c *coordinator, operationID string, prepared PreparedExecution) {
+	run := &activeExecution{done: make(chan struct{})}
+	c.mu.Lock()
+	c.run = run
+	c.mu.Unlock()
+	go func() {
+		defer func() {
+			c.mu.Lock()
+			if c.run == run { // a buffered drain may have installed the next execution already
+				c.run = nil
+			}
+			c.mu.Unlock()
+			close(run.done)
+		}()
+		err := h.execute(c, operationID, prepared)
+		h.recordStorageFailure(err)
+		h.drainBuffers(c, run)
+	}()
+}
+
+// drainBuffers runs the post-terminal buffer drain after the terminal commit:
+// undelivered steering first, then queued input, each in FIFO order through
+// ordinary admission. Every item receives one scheduled delivery attempt; a
+// failed attempt is final for the item and the drain advances to the next
+// buffered message. A successful admission starts the next execution, whose
+// own terminal re-drains. Harness-context loss discards both buffers without
+// delivery attempts. An empty FIFO scan retires this run's slot in the same
+// critical section — never a replacement run's — so no window remains where
+// the Session looks active without a pending drain.
+func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
+	c.mu.Lock()
+	sessionID := c.graph.Session.Identity.SessionID
+	c.mu.Unlock()
+	release, err := c.reserve(h.ctx)
+	if err != nil {
+		return
+	}
+	defer release()
+	for {
+		c.mu.Lock()
+		if h.ctx.Err() != nil { // Harness loss discards both buffers
+			c.steering, c.queued = nil, nil
+			c.mu.Unlock()
+			return
+		}
+		if c.graph.Session.State.CurrentOperationID != "" { // the drain publishes only after terminal commit
+			c.mu.Unlock()
+			return
+		}
+		var item *pendingMessage
+		switch {
+		case len(c.steering) > 0:
+			item, c.steering = c.steering[0], c.steering[1:]
+		case len(c.queued) > 0:
+			item, c.queued = c.queued[0], c.queued[1:]
+		default: // the FIFO scan is empty: retire this run's slot in the same critical section
+			if c.run == run { // never clear a replacement run
+				c.run = nil
+			}
+			c.mu.Unlock()
+			return
+		}
+		c.mu.Unlock()
+		rec, prepared, disposition, err := h.admitReserved(h.ctx, c, admissionRequest{
+			SessionID:   sessionID,
+			OperationID: item.operationID,
+			Origin:      item.origin,
+			Content:     item.content,
+		})
+		if err != nil || disposition != DispositionAdmitted || prepared == nil {
+			continue // one failed delivery attempt is final for the item; the next proceeds
+		}
+		h.startExecution(c, rec.Admission.OperationID, *prepared)
+		return
+	}
+}
+
+// recordStorageFailure retains the first storage-class failure that stopped
+// admitted work; later failures never replace it.
+func (h *Harness) recordStorageFailure(err error) {
+	if err == nil || !errors.Is(err, ErrStorage) {
+		return
+	}
+	h.mu.Lock()
+	if h.storageFailure == nil {
+		h.storageFailure = err
+	}
+	h.mu.Unlock()
+}
+
+// Wait joins the Harness after its context is canceled: it returns after
+// cancellation has closed admission and every in-flight preparation,
+// execution, and required settlement has converged. Its own context cancels
+// only the wait. If admitted work stopped because required storage
+// publication failed, it returns the first such recorded storage error after
+// all process-local work has ended.
+func (h *Harness) Wait(ctx context.Context) error {
+	select {
+	case <-h.ctx.Done():
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	for {
+		h.mu.Lock()
+		var waits []chan struct{}
+		for _, c := range h.sessions {
+			c.mu.Lock()
+			if c.reserved != nil {
+				waits = append(waits, c.reserved)
+			}
+			if c.run != nil {
+				waits = append(waits, c.run.done)
+			}
+			c.mu.Unlock()
+		}
+		h.mu.Unlock()
+		for _, done := range waits {
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		h.mu.Lock() // a waited reservation may have published a new execution: re-scan before converging
+		busy := false
+		for _, c := range h.sessions {
+			c.mu.Lock()
+			if c.reserved != nil || c.run != nil {
+				busy = true
+			}
+			c.steering, c.queued = nil, nil // Harness loss discards both buffers on every coordinator
+			c.mu.Unlock()
+		}
+		h.mu.Unlock()
+		if !busy {
+			h.mu.Lock()
+			failure := h.storageFailure
+			h.mu.Unlock()
+			return failure
+		}
+	}
 }
 
 // readExistingOperation reads one same-Session Operation register once inside

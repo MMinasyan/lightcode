@@ -159,6 +159,19 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, prepared agent
 		if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, res); err != nil {
 			return agent.ModelSettlement{}, err
 		}
+		// Coordinator decision at the model-result boundary, linearized
+		// against submissions: waiting steering keeps the Operation running
+		// independent of completed/errored status, text, or tool calls. The
+		// only shape where Agent would otherwise return is a ready settlement
+		// with no tool calls, so the wrapper bridges it with the continue
+		// disposition — the only source of a completed-output continue.
+		c.mu.Lock()
+		waiting := len(c.steering) > 0
+		c.mu.Unlock()
+		if waiting && owned.Disposition == agent.DispoReady &&
+			(owned.Output == nil || owned.Output.Message == nil || len(owned.Output.Message.ToolCalls) == 0) {
+			owned.Disposition = agent.DispoContinue
+		}
 		return owned, nil
 	}
 }

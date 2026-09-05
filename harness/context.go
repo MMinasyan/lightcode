@@ -12,11 +12,12 @@ import (
 )
 
 // contextSource returns the Agent context boundary of one Operation: before
-// every model effect it projects fresh model.Message history from the
-// committed entries plus the captured system prompt. Phase 3 accepts only full
-// immutable-history projection.
+// every model effect it drains eligible steering in FIFO order and projects
+// fresh model.Message history from the committed entries plus the captured
+// system prompt. Phase 3 accepts only full immutable-history projection.
 func (h *Harness) contextSource(c *coordinator, operationID string) agent.ContextSource {
-	return func(context.Context) ([]model.Message, error) {
+	return func(ctx context.Context) ([]model.Message, error) {
+		h.drainSteering(ctx, c, operationID)
 		c.mu.Lock()
 		op, ok := c.graph.Operation(operationID)
 		if !ok {
@@ -107,11 +108,37 @@ func signalProjectedText(content string) string {
 	return "<system-signal>" + strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(content) + "</system-signal>"
 }
 
+// drainSteering delivers the waiting steering FIFO at one model boundary: in
+// FIFO order, each item receives its one scheduled delivery attempt through
+// the active-Operation input transition. A failed attempt is final for the
+// item and the drain proceeds to the next buffered message. Harness-context
+// loss discards both buffers without delivery attempts.
+func (h *Harness) drainSteering(ctx context.Context, c *coordinator, operationID string) {
+	for {
+		c.mu.Lock()
+		if h.ctx.Err() != nil { // Harness loss discards both buffers
+			c.steering, c.queued = nil, nil
+			c.mu.Unlock()
+			return
+		}
+		if len(c.steering) == 0 {
+			c.mu.Unlock()
+			return
+		}
+		item := c.steering[0]
+		c.steering = c.steering[1:]
+		c.mu.Unlock()
+		if err := h.commitSteeringInput(ctx, c, operationID, item.origin, item.content); err != nil {
+			_ = err // one failed delivery attempt is final for the item; the next proceeds
+		}
+	}
+}
+
 // commitSteeringInput is the steering-input helper: it commits one waiting
-// steering message as an Operation-owned input entry immediately before the
-// next model request, advancing last activity to the entry's commit time in
-// the same transaction.
-func (h *Harness) commitSteeringInput(ctx context.Context, c *coordinator, operationID string, content []model.ContentPart) error {
+// steering message as an Operation-owned input entry with its own submission
+// origin immediately before the next model request, advancing last activity
+// to the entry's commit time in the same transaction.
+func (h *Harness) commitSteeringInput(ctx context.Context, c *coordinator, operationID string, origin InputOrigin, content []model.ContentPart) error {
 	owned := make([]model.ContentPart, 0, len(content))
 	for i, part := range content {
 		validated, err := model.NewContentPart(part)
@@ -135,7 +162,7 @@ func (h *Harness) commitSteeringInput(ctx context.Context, c *coordinator, opera
 		SessionID:   view.Identity.SessionID,
 		EntryID:     entryID,
 		OperationID: operationID,
-		Origin:      InputOriginUser,
+		Origin:      origin,
 		Content:     owned,
 	}
 	payload, err := encodeInputEntry(input)
