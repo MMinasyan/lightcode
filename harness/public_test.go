@@ -3,7 +3,8 @@
 // ChangeAgentType, ReopenSession, ArchiveSession, DeleteSession, Sweep, Fork,
 // and Wait — over both storage implementations, covering the preparation,
 // admission, idempotency, context, effect, settlement, usage, terminal,
-// coordination, lifetime, lifecycle, and fork rows through public operations.
+// coordination, lifetime, lifecycle, fork, and package/production-isolation
+// rows through public operations.
 package harness_test
 
 import (
@@ -16,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -4513,5 +4515,47 @@ func TestPublicForkRollbackOnTransactionFailure(t *testing.T) {
 		}
 		assertSessionIDs(t, store, source) // the rolled-back fork left no destination
 		assertForkSourceUnchanged(t, store, source, before)
+	})
+}
+
+// TestPublicCompositionProductionIsolation finalizes the Package-authority row
+// from external composition: the inactive public Harness composes from a fully
+// external caller through the public API only — caller-owned storage, the
+// landed agent effect contracts, and no other wiring. One complete turn over
+// each store leaves the caller's working directory untouched, so durable state
+// exists only in the storage the caller supplied.
+func TestPublicCompositionProductionIsolation(t *testing.T) {
+	state := t.TempDir()
+	t.Chdir(state)
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		script := newScriptModel()
+		script.gate = make(chan struct{})
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		sessionID := createSession(t, f.h)
+		res, err := submit(t, f.h, sessionID, "iso-1", harness.MessageModeRegular, "isolate")
+		if err != nil || res.Disposition != harness.DispositionAdmitted {
+			t.Fatalf("Submit = %+v err %v, want admitted", res, err)
+		}
+		<-script.arrived // parked at the model boundary: the Session is active
+		if _, err := submit(t, f.h, sessionID, "iso-2", harness.MessageModeQueued, "drain"); err != nil {
+			t.Fatalf("queued submit: %v", err)
+		}
+		script.releaseGate()
+		<-script.arrived // the drain admitted iso-2: iso-1's terminal success committed
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		op, err := f.h.ReadOperation(context.Background(), sessionID, "iso-1")
+		if err != nil || op.State.Status != harness.OperationSuccess {
+			t.Fatalf("composed isolation turn = %+v err %v, want success", op, err)
+		}
+		touched, err := os.ReadDir(state)
+		if err != nil {
+			t.Fatalf("read caller state directory: %v", err)
+		}
+		if len(touched) != 0 {
+			t.Fatalf("composed inactive Harness derived production state in the caller's working directory: %v", touched)
+		}
 	})
 }

@@ -91,7 +91,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 	return problems
 }
 
-// TestDependencyRulesRejectNonStdlibDotlessImports proves the allowlists use authoritative standard-library membership, not a dot-in-path shape: the cgo pseudo-import "C" and a dotless path outside the stdlib set fail every package row, while ordinary stdlib imports, the model dependency on agent's side, and internal/storage's dependency on harness still pass.
+// TestDependencyRulesRejectNonStdlibDotlessImports proves the allowlists use authoritative standard-library membership, not a dot-in-path shape: the cgo pseudo-import "C" and a dotless path outside the stdlib set fail every package row, while ordinary stdlib imports, the model dependency on agent's side, and internal/storage's dependency on harness still pass. The foundation's own reverse and skipping edges — model or agent reaching harness, any target package reaching internal/storage, and the driver reaching a target package — are each rejected exactly once.
 func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	std := standardLibraryImports(t)
 	for _, rel := range []string{"model/x.go", "agent/x.go", "harness/x.go", "internal/storage/x.go"} {
@@ -127,6 +127,21 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	for _, imp := range []string{publicModule + "/model", publicModule + "/agent"} {
 		if problems := checkTrackedGoFile("internal/storage/x.go", []string{imp}, std); len(problems) != 1 {
 			t.Errorf("internal/storage importing %q: %d problems, want 1: %v", imp, len(problems), problems)
+		}
+	}
+	// The final foundation graph is model <- agent <- harness with
+	// internal/storage beneath harness only: every reverse or skipping edge
+	// between the foundation packages is rejected.
+	for _, row := range []struct{ rel, imp string }{
+		{"model/x.go", publicModule + "/agent"},
+		{"model/x.go", publicModule + "/harness"},
+		{"model/x.go", publicModule + "/internal/storage"},
+		{"agent/x.go", publicModule + "/harness"},
+		{"agent/x.go", publicModule + "/internal/storage"},
+		{"harness/x.go", publicModule + "/internal/storage"},
+	} {
+		if problems := checkTrackedGoFile(row.rel, []string{row.imp}, std); len(problems) != 1 {
+			t.Errorf("%s importing %q: %d problems, want 1: %v", row.rel, row.imp, len(problems), problems)
 		}
 	}
 }
