@@ -1014,42 +1014,18 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 	view := c.graph.Session // the state the reservation resolved on
 	c.mu.Unlock()
 
-	prepCtx, cancel := context.WithCancel(h.ctx)
-	defer cancel()
-	stop := context.AfterFunc(ctx, cancel)
-	defer stop()
-	if err := ctx.Err(); err != nil { // the combined preparation context is already done: never invoke Prepare
-		return OperationRecord{}, nil, "", err
-	}
-	if err := h.ctx.Err(); err != nil {
-		return OperationRecord{}, nil, "", h.ctx.Err()
-	}
-	prepared, prepErr := h.deps.Prepare(prepCtx, PreparationRequest{
-		Session:     PreparationSession{Identity: view.Identity, AgentType: view.State.CurrentAgentType},
-		RequestKind: RequestKindMessage,
+	prepared, capture, err := h.prepareExecution(ctx, PreparationSession{
+		Identity:  view.Identity,
+		AgentType: view.State.CurrentAgentType,
 	})
-	if prepErr != nil {
-		return OperationRecord{}, nil, "", prepErr
-	}
-	if prepared.Model == nil || prepared.Tool == nil {
-		return OperationRecord{}, nil, "", invalidInput("prepared execution requires non-nil model and tool functions")
-	}
-	if err := validateExecutionCapture(prepared.Capture); err != nil {
-		return OperationRecord{}, nil, "", invalidInput("prepared execution capture: %v", err)
-	}
-	capture := ownCapture(prepared.Capture)
-
-	if err := ctx.Err(); err != nil { // caller cancellation wins when both contexts are done
+	if err != nil {
 		return OperationRecord{}, nil, "", err
-	}
-	if err := h.ctx.Err(); err != nil {
-		return OperationRecord{}, nil, "", h.ctx.Err()
 	}
 
 	// the transaction runs on the combined preparation context: either
 	// cancellation before commit aborts it, and a committed publication wins
 	// later cancellation
-	record, existing, err := h.publishAdmission(prepCtx, c, view, capture, req)
+	record, existing, err := h.publishAdmission(ctx, c, view, capture, req)
 	if err != nil {
 		return OperationRecord{}, nil, "", err
 	}
@@ -1057,6 +1033,47 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 		return ownOperationRecord(record), nil, DispositionExisting, nil
 	}
 	return ownOperationRecord(record), &prepared, DispositionAdmitted, nil
+}
+
+// prepareExecution is the shared outside-lock preparation and validation of
+// one admission producer, used by normal admission and Fork alike: it merges
+// the caller context with the Harness context, invokes the single preparation
+// callback, requires non-nil model and tool functions and a valid capture,
+// and returns the prepared execution with its owned durable capture. Caller
+// or Harness cancellation before or after preparation publishes nothing.
+func (h *Harness) prepareExecution(ctx context.Context, session PreparationSession) (PreparedExecution, ExecutionCapture, error) {
+	prepCtx, cancel := context.WithCancel(h.ctx)
+	defer cancel()
+	stop := context.AfterFunc(ctx, cancel)
+	defer stop()
+	if err := ctx.Err(); err != nil { // the combined preparation context is already done: never invoke Prepare
+		return PreparedExecution{}, ExecutionCapture{}, err
+	}
+	if err := h.ctx.Err(); err != nil {
+		return PreparedExecution{}, ExecutionCapture{}, h.ctx.Err()
+	}
+	prepared, prepErr := h.deps.Prepare(prepCtx, PreparationRequest{
+		Session:     session,
+		RequestKind: RequestKindMessage,
+	})
+	if prepErr != nil {
+		return PreparedExecution{}, ExecutionCapture{}, prepErr
+	}
+	if prepared.Model == nil || prepared.Tool == nil {
+		return PreparedExecution{}, ExecutionCapture{}, invalidInput("prepared execution requires non-nil model and tool functions")
+	}
+	if err := validateExecutionCapture(prepared.Capture); err != nil {
+		return PreparedExecution{}, ExecutionCapture{}, invalidInput("prepared execution capture: %v", err)
+	}
+	capture := ownCapture(prepared.Capture)
+
+	if err := ctx.Err(); err != nil { // caller cancellation wins when both contexts are done
+		return PreparedExecution{}, ExecutionCapture{}, err
+	}
+	if err := h.ctx.Err(); err != nil {
+		return PreparedExecution{}, ExecutionCapture{}, h.ctx.Err()
+	}
+	return prepared, capture, nil
 }
 
 // publishAdmission runs the in-transaction admission producer: re-read the
@@ -1103,88 +1120,23 @@ func (h *Harness) publishAdmission(ctx context.Context, c *coordinator, view Ses
 			}
 			return fmt.Errorf("%w: session %q revision %d changed concurrently to %d", errRevisionRace, req.SessionID, view.Revision, reg.Revision)
 		}
-		entryID, err := newHexID()
-		if err != nil {
-			return fmt.Errorf("%w: %v", ErrStorage, err)
-		}
-		input := inputEntry{
-			SessionID:   req.SessionID,
-			EntryID:     entryID,
-			OperationID: req.OperationID,
-			Origin:      req.Origin,
-			Content:     req.Content,
-		}
-		payload, err := encodeInputEntry(input)
-		if err != nil {
-			return err
-		}
-		inserted, err := tx.InsertEntry(EntryDraft{
-			SessionID:   req.SessionID,
-			ID:          entryID,
-			OperationID: req.OperationID,
-			Kind:        EntryInput,
-			Payload:     payload,
-		})
-		if err != nil {
-			return err
-		}
-		record := OperationRecord{
-			Admission: OperationAdmission{
-				SessionID:     req.SessionID,
-				OperationID:   req.OperationID,
-				RequestKind:   RequestKindMessage,
-				AdmittedEntry: EntryRef{SessionID: req.SessionID, EntryID: entryID},
-				AgentType:     view.State.CurrentAgentType,
-				Execution:     capture,
-				AdmittedAt:    inserted.CommittedAt,
-			},
-			State: OperationCurrentState{
-				Status:           OperationRunning,
-				StartedAt:        inserted.CommittedAt,
-				PendingToolCalls: []PendingToolCall{},
-				Usage:            UsageTotals{},
-			},
-		}
-		opPayload, err := encodeOperationRegister(record)
-		if err != nil {
-			return err
-		}
-		registered, err := tx.InsertRegister(RegisterDraft{
-			Key:     RegisterKey{SessionID: req.SessionID, Kind: RegisterOperation, OperationID: req.OperationID},
-			Payload: opPayload,
-		})
-		if err != nil {
-			if !errors.Is(err, ErrConflict) {
-				return err
+		record, committed, entry, perr := produceAdmission(tx, current, capture, req)
+		if perr != nil {
+			if errors.Is(perr, ErrConflict) { // first-writer resolution: the same-Session Operation read decides
+				rec, found, rerr := readExistingOperation(tx, req.SessionID, req.OperationID)
+				if rerr != nil {
+					return rerr
+				}
+				if found {
+					foreign = true
+					published, existing = rec, true
+					return errAdmissionExisting
+				}
+				return invalidInput("operation %q already exists in another session", req.OperationID)
 			}
-			rec, found, rerr := readExistingOperation(tx, req.SessionID, req.OperationID)
-			if rerr != nil {
-				return rerr
-			}
-			if found {
-				foreign = true
-				published, existing = rec, true
-				return errAdmissionExisting
-			}
-			return invalidInput("operation %q already exists in another session", req.OperationID)
+			return perr
 		}
-		record.Revision = registered.Revision
-		state := current.State
-		state.CurrentOperationID = req.OperationID
-		state.LastActivity = inserted.CommittedAt
-		committed := SessionRecord{Identity: current.Identity, State: state}
-		sessionPayload, err := encodeSessionRegister(committed)
-		if err != nil {
-			return err
-		}
-		replaced, err := tx.ReplaceRegister(sessionKey, reg.Revision, sessionPayload)
-		if err != nil {
-			return err
-		}
-		committed.Revision = replaced.Revision
-		published = record
-		newSession = committed
-		newEntry = graphEntry{Envelope: inserted, Input: &input}
+		published, newSession, newEntry = record, committed, entry
 		return nil
 	})
 	if existing {
@@ -1210,6 +1162,85 @@ func (h *Harness) publishAdmission(ctx context.Context, c *coordinator, view Ses
 	c.graph.Session = newSession
 	c.mu.Unlock()
 	return published, false, nil
+}
+
+// produceAdmission is the shared in-transaction destination admission
+// producer, used by normal admission and Fork alike: it inserts the input
+// entry and the running Operation register for one destination Session
+// record held at its current revision, and sets the Session current
+// Operation. First-writer resolution stays with the caller: an insertion
+// conflict returns the raw storage conflict for the caller to resolve —
+// the same-Session Operation read for normal admission, the exact
+// idempotency lookup for Fork.
+func produceAdmission(tx Transaction, session SessionRecord, capture ExecutionCapture, req admissionRequest) (OperationRecord, SessionRecord, graphEntry, error) {
+	entryID, err := newHexID()
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, graphEntry{}, fmt.Errorf("%w: %v", ErrStorage, err)
+	}
+	input := inputEntry{
+		SessionID:   req.SessionID,
+		EntryID:     entryID,
+		OperationID: req.OperationID,
+		Origin:      req.Origin,
+		Content:     req.Content,
+	}
+	payload, err := encodeInputEntry(input)
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, graphEntry{}, err
+	}
+	inserted, err := tx.InsertEntry(EntryDraft{
+		SessionID:   req.SessionID,
+		ID:          entryID,
+		OperationID: req.OperationID,
+		Kind:        EntryInput,
+		Payload:     payload,
+	})
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, graphEntry{}, err
+	}
+	record := OperationRecord{
+		Admission: OperationAdmission{
+			SessionID:     req.SessionID,
+			OperationID:   req.OperationID,
+			RequestKind:   RequestKindMessage,
+			AdmittedEntry: EntryRef{SessionID: req.SessionID, EntryID: entryID},
+			AgentType:     session.State.CurrentAgentType,
+			Execution:     capture,
+			AdmittedAt:    inserted.CommittedAt,
+		},
+		State: OperationCurrentState{
+			Status:           OperationRunning,
+			StartedAt:        inserted.CommittedAt,
+			PendingToolCalls: []PendingToolCall{},
+			Usage:            UsageTotals{},
+		},
+	}
+	opPayload, err := encodeOperationRegister(record)
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, graphEntry{}, err
+	}
+	registered, err := tx.InsertRegister(RegisterDraft{
+		Key:     RegisterKey{SessionID: req.SessionID, Kind: RegisterOperation, OperationID: req.OperationID},
+		Payload: opPayload,
+	})
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, graphEntry{}, err
+	}
+	record.Revision = registered.Revision
+	state := session.State
+	state.CurrentOperationID = req.OperationID
+	state.LastActivity = inserted.CommittedAt
+	committed := SessionRecord{Identity: session.Identity, State: state}
+	sessionPayload, err := encodeSessionRegister(committed)
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, graphEntry{}, err
+	}
+	replaced, err := tx.ReplaceRegister(RegisterKey{SessionID: req.SessionID, Kind: RegisterSession}, session.Revision, sessionPayload)
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, graphEntry{}, err
+	}
+	committed.Revision = replaced.Revision
+	return record, committed, graphEntry{Envelope: inserted, Input: &input}, nil
 }
 
 // rematerialize replaces the coordinator's validated view after a foreign

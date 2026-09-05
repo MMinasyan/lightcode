@@ -1,9 +1,9 @@
 // External-package public Harness suite: every fixture drives the landed
 // public API only — New, CreateSession, Submit, ReadSession, ReadOperation,
-// ChangeAgentType, ReopenSession, ArchiveSession, DeleteSession, Sweep, and
-// Wait — over both storage implementations, covering the preparation,
+// ChangeAgentType, ReopenSession, ArchiveSession, DeleteSession, Sweep, Fork,
+// and Wait — over both storage implementations, covering the preparation,
 // admission, idempotency, context, effect, settlement, usage, terminal,
-// coordination, lifetime, and lifecycle rows through public operations.
+// coordination, lifetime, lifecycle, and fork rows through public operations.
 package harness_test
 
 import (
@@ -1711,13 +1711,16 @@ func TestPublicDeleteVsMaterialization(t *testing.T) {
 var errInjectedRollback = errors.New("harness_test: injected post-mutation transaction failure")
 
 // rollbackProbeStore wraps one store to inject one post-mutation transaction
-// failure: while armed, the next ReplaceRegister (or DeleteSession) call
-// inside a transaction performs its real mutation and then returns the
-// sentinel, so the surrounding transaction rolls back after mutating.
+// failure: while armed, the next ReplaceRegister (or DeleteSession, or the
+// counted InsertRegister) call inside a transaction performs its real
+// mutation and then returns the sentinel, so the surrounding transaction
+// rolls back after mutating.
 type rollbackProbeStore struct {
 	harness.Storage
-	failReplace bool
-	failDelete  bool
+	failReplace      bool
+	failDelete       bool
+	failInsert       bool
+	insertsUntilFail int
 }
 
 func (s *rollbackProbeStore) Transact(ctx context.Context, fn func(harness.Transaction) error) error {
@@ -1749,6 +1752,18 @@ func (t *rollbackProbeTransaction) DeleteSession(sessionID string) error {
 		return errInjectedRollback
 	}
 	return err
+}
+
+func (t *rollbackProbeTransaction) InsertRegister(draft harness.RegisterDraft) (harness.Register, error) {
+	reg, err := t.Transaction.InsertRegister(draft)
+	if err == nil && t.probe.failInsert { // the counted insert performs its real mutation, then fails
+		t.probe.insertsUntilFail--
+		if t.probe.insertsUntilFail <= 0 {
+			t.probe.failInsert = false
+			return harness.Register{}, errInjectedRollback
+		}
+	}
+	return reg, err
 }
 
 // assertRollback verifies that a failed lifecycle transaction left the durable
@@ -3548,4 +3563,955 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 			})
 		})
 	}
+}
+
+// forkSiblingID sorts before every random 32-hex identity, so the lookup
+// scan reaches it before any real Session.
+const forkSiblingID = "00000000000000000000000000000000"
+
+// forkEntryOf returns one committed entry of one Session by kind and owning
+// Operation identity (empty matches operationless copied entries).
+func forkEntryOf(t *testing.T, store harness.Storage, sessionID string, kind harness.EntryKind, operationID string) harness.Entry {
+	t.Helper()
+	for _, entry := range recoverEntries(t, store, sessionID) {
+		if entry.Kind == kind && (operationID == "" || entry.OperationID == operationID) {
+			return entry
+		}
+	}
+	t.Fatalf("no %s entry owned by %q in session %q", kind, operationID, sessionID)
+	return harness.Entry{}
+}
+
+// assertForkSourceUnchanged verifies that a fork left one source Session's
+// complete durable state byte-identical at the same revisions.
+func assertForkSourceUnchanged(t *testing.T, store harness.Storage, sessionID string, before sessionSnapshot) {
+	t.Helper()
+	after := snapshotSession(t, store, sessionID)
+	if len(after.registers) != len(before.registers) || len(after.entries) != len(before.entries) {
+		t.Fatalf("fork changed the record count of source %q (registers %d -> %d, entries %d -> %d)",
+			sessionID, len(before.registers), len(after.registers), len(before.entries), len(after.entries))
+	}
+	for i := range before.registers {
+		b, a := before.registers[i], after.registers[i]
+		if b.Key != a.Key || b.Revision != a.Revision || !bytes.Equal(b.Payload, a.Payload) {
+			t.Fatalf("fork changed register %v of source %q (revision %d -> %d)", b.Key, sessionID, b.Revision, a.Revision)
+		}
+	}
+	for i := range before.entries {
+		b, a := before.entries[i], after.entries[i]
+		if b.ID != a.ID || b.Kind != a.Kind || b.Sequence != a.Sequence || b.OperationID != a.OperationID || !bytes.Equal(b.Payload, a.Payload) {
+			t.Fatalf("fork changed entry %s of source %q", b.ID, sessionID)
+		}
+	}
+}
+
+// assertSessionIDs asserts the exact Session listing of one store as a set
+// (storage returns it sorted).
+func assertSessionIDs(t *testing.T, store harness.Storage, want ...string) {
+	t.Helper()
+	ids, err := store.ListSessionIDs(context.Background())
+	if err != nil {
+		t.Fatalf("list sessions: %v", err)
+	}
+	got := append([]string(nil), ids...)
+	if len(got) != len(want) {
+		t.Fatalf("session listing = %v, want %v", got, want)
+	}
+	wantSet := make(map[string]bool, len(want))
+	for _, id := range want {
+		if wantSet[id] {
+			t.Fatalf("session listing expectation repeats %q", id)
+		}
+		wantSet[id] = true
+	}
+	for _, id := range got {
+		if !wantSet[id] {
+			t.Fatalf("session listing = %v, want %v", got, want)
+		}
+	}
+}
+
+// rawForkSessionRegister builds one open fork Session register payload with
+// the given source/boundary lineage.
+func rawForkSessionRegister(sessionID, sourceID, boundaryID, currentOp string) string {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	current := ""
+	if currentOp != "" {
+		current = fmt.Sprintf(`,"current_operation_id":%q`, currentOp)
+	}
+	return fmt.Sprintf(
+		`{"identity":{"session_id":%q,"workspace":"/tmp/works","created_at":%q,`+
+			`"source_session_id":%q,"source_boundary_entry_id":%q},`+
+			`"state":{"lifecycle":"open","current_agent_type":"coder"%s,"usage":{"by_model":[]},"last_activity":%q}}`,
+		sessionID, now, sourceID, boundaryID, current, now)
+}
+
+// seedForkDecoy seeds one valid fork destination look-alike Session owning a
+// running message Operation, with lineage when withLineage holds, and returns
+// its Session identity.
+func seedForkDecoy(t *testing.T, store harness.Storage, sourceID, boundaryID, operationID string, withLineage bool) string {
+	t.Helper()
+	sid, entryID := newRawSessionID(t), newRawSessionID(t)
+	payload := rawSessionRegister(sid, operationID)
+	if withLineage {
+		payload = rawForkSessionRegister(sid, sourceID, boundaryID, operationID)
+	}
+	insertRawRegister(t, store, harness.RegisterKey{SessionID: sid, Kind: harness.RegisterSession}, payload)
+	insertRawEntry(t, store, sid, entryID, operationID, harness.EntryInput, rawInputEntryPayload(sid, entryID, operationID))
+	insertRawRegister(t, store, harness.RegisterKey{SessionID: sid, Kind: harness.RegisterOperation, OperationID: operationID}, rawRunningOperationPayload(sid, operationID, entryID))
+	return sid
+}
+
+// racePrepared returns the fixture's ordinary prepared execution for a race
+// fixture whose preparation hook must still succeed.
+func racePrepared(f *publicFixture) harness.PreparedExecution {
+	return harness.PreparedExecution{
+		Capture: publicCapture(),
+		Model:   f.model.effect,
+		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+		},
+	}
+}
+
+// corruptReadStore serves one Session's register reads as Session-scoped
+// corruption and delegates everything else.
+type corruptReadStore struct {
+	harness.Storage
+	session string
+}
+
+func (s *corruptReadStore) ReadRegister(ctx context.Context, key harness.RegisterKey) (harness.Register, error) {
+	if key.SessionID == s.session {
+		return harness.Register{}, &harness.CorruptionError{SessionID: s.session, Detail: "injected register read corruption"}
+	}
+	return s.Storage.ReadRegister(ctx, key)
+}
+
+// TestPublicForkCopiesPrefixAndAdmits proves the fork row's positive core
+// through public operations: an idle source forks at a user-origin input
+// boundary; the destination inherits the source Workspace and current Agent
+// type with informational source/boundary lineage and zero usage; only the
+// strict-before-boundary input, assistant, tool_result, and signal entries
+// are copied, under new operationless identities with cleared usage, the
+// rewritten result/assistant references, and the copied signal's source
+// Operation left as informational history; settlements and the boundary
+// itself are excluded; the fresh admission is a user-origin input owning a
+// running message Operation; the source stays byte-identical; and the
+// destination execution starts after the commit and projects the copied
+// prefix before the fork input.
+func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		script := newScriptModel(
+			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompletedWithCalls("call-1")},                                                                              // turn 1 publishes a call
+			agent.ModelSettlement{Disposition: agent.DispoInterruption, Detail: "walkaway", Output: publicCompleted(&model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2})}, // turn 1 settles as an interruption terminal with a signal
+			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},                                                                                            // op-2 completes
+			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},                                                                                            // op-3 completes
+		)
+		f := newPublicFixture(t, store, script, nil)
+		f.prepareHook = func(_ int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
+			return harness.PreparedExecution{
+				Capture: publicCapture(),
+				Model:   script.effect,
+				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+					return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
+				},
+			}, nil
+		}
+		source := createSession(t, f.h)
+
+		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
+			t.Fatalf("first submit: %v", err)
+		}
+		<-script.arrived // the published call
+		<-script.arrived // the interruption turn
+		if _, err := f.h.Submit(ctx, harness.SubmitRequest{
+			SessionID:   source,
+			OperationID: "op-2",
+			Origin:      harness.InputOriginUser,
+			Content:     []model.ContentPart{{Kind: model.PartText, Text: "second"}},
+			Mode:        harness.MessageModeQueued,
+		}); err != nil {
+			t.Fatalf("queued submit: %v", err)
+		}
+		<-f.prepare // the drain admitted op-2: op-1's terminal committed
+		<-script.arrived
+		if _, err := f.h.Submit(ctx, harness.SubmitRequest{
+			SessionID:   source,
+			OperationID: "op-3",
+			Origin:      harness.InputOriginUser,
+			Content:     []model.ContentPart{{Kind: model.PartText, Text: "third"}},
+			Mode:        harness.MessageModeQueued,
+		}); err != nil {
+			t.Fatalf("queued submit: %v", err)
+		}
+		<-f.prepare // the drain admitted op-3: op-2's terminal committed
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+
+		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-2").ID
+		before := snapshotSession(t, store, source)
+
+		// the fork's own turn settles through its model-originated terminal,
+		// durable inside the effect transaction regardless of later cancellation
+		forkScript := newScriptModel(agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "fork turn settled"})
+		forkScript.gate = make(chan struct{})
+		f2 := newPublicFixture(t, store, forkScript, nil)
+		defer f2.close()
+		res, err := f2.h.Fork(ctx, harness.ForkRequest{
+			SourceSessionID: source,
+			BoundaryEntryID: boundary,
+			OperationID:     "fork-1",
+			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+		})
+		if err != nil {
+			t.Fatalf("Fork: %v", err)
+		}
+		dest := res.Session.Identity.SessionID
+		if dest == source || res.Session.Identity.SessionID == "" {
+			t.Fatalf("fork session identity = %+v, want one fresh identity", res.Session.Identity)
+		}
+		if res.Session.Identity.Workspace != "/tmp/works" || res.Session.Identity.SourceSessionID != source ||
+			res.Session.Identity.SourceBoundaryEntryID != boundary {
+			t.Fatalf("fork identity = %+v, want the inherited workspace and source/boundary lineage", res.Session.Identity)
+		}
+		if res.Session.State.Lifecycle != harness.LifecycleOpen || res.Session.State.CurrentAgentType != "coder" ||
+			len(res.Session.State.Usage.ByModel) != 0 || res.Session.State.CurrentOperationID != "fork-1" {
+			t.Fatalf("fork session state = %+v, want open, the source type, zero usage, and the running fork", res.Session.State)
+		}
+		if res.Operation.State.Status != harness.OperationRunning || res.Operation.Admission.OperationID != "fork-1" ||
+			res.Operation.Admission.RequestKind != harness.RequestKindMessage || res.Operation.Admission.AgentType != "coder" ||
+			res.Operation.Admission.AdmittedEntry.SessionID != dest ||
+			res.Operation.Admission.Execution.ConfigurationRevision != "rev-1" {
+			t.Fatalf("fork operation = %+v, want a running message admission with the fresh capture", res.Operation)
+		}
+
+		<-forkScript.arrived // the destination execution reached its model boundary
+		if got := texts(forkScript.seen()[0]); len(got) != 7 ||
+			got[0] != "system" || got[1] != "hello" || got[2] != "done" || got[3] != "ran call-1" || got[4] != "done" ||
+			got[5] != "<system-signal>Operation interrupted.</system-signal>" || got[6] != "fork input" {
+			t.Fatalf("fork projection = %v, want the copied prefix before the fork input", got)
+		}
+		forkScript.releaseGate()
+		if err := converge(t, f2); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+
+		calls := f2.preparationCalls()
+		if len(calls) != 1 || calls[0].Session.Identity.Workspace != "/tmp/works" || calls[0].Session.AgentType != "coder" {
+			t.Fatalf("fork preparation calls = %+v, want one call with the source workspace and Agent type", calls)
+		}
+
+		// the source is byte-identical after the fork
+		assertForkSourceUnchanged(t, store, source, before)
+
+		// the destination carries exactly the copied prefix, then the fresh
+		// user-origin admission input and the fork's model-originated terminal
+		entries := recoverEntries(t, store, dest)
+		wantKinds := []harness.EntryKind{harness.EntryInput, harness.EntryAssistant, harness.EntryToolResult, harness.EntryAssistant, harness.EntrySignal, harness.EntryInput, harness.EntryOperationSettlement}
+		if len(entries) != len(wantKinds) {
+			t.Fatalf("destination entries = %d, want the %d copied prefix entries, the fork admission, and the fork's settled turn", len(entries), 5)
+		}
+		sourceIDs := map[string]bool{}
+		for _, entry := range before.entries {
+			sourceIDs[entry.ID] = true
+		}
+		for i, entry := range entries {
+			if entry.Kind != wantKinds[i] {
+				t.Fatalf("destination entry %d is a %s entry, want %s", i, entry.Kind, wantKinds[i])
+			}
+			if entry.SessionID != dest {
+				t.Fatalf("destination entry %d addresses session %q", i, entry.SessionID)
+			}
+			if i < 5 { // copied prefix entries are operationless and freshly identified
+				if entry.OperationID != "" {
+					t.Fatalf("copied entry %s carries operation %q, want no source ownership", entry.ID, entry.OperationID)
+				}
+				if sourceIDs[entry.ID] {
+					t.Fatalf("copied entry %s reuses a source identity", entry.ID)
+				}
+			}
+		}
+		if entries[5].OperationID != "fork-1" {
+			t.Fatalf("fork admission entry = %+v, want it owned by fork-1", entries[5])
+		}
+		var copiedInput struct {
+			Origin string `json:"origin"`
+		}
+		if err := json.Unmarshal(entries[0].Payload, &copiedInput); err != nil {
+			t.Fatalf("decode copied input: %v", err)
+		}
+		if copiedInput.Origin != "user" {
+			t.Fatalf("copied input origin = %q, want the source origin preserved", copiedInput.Origin)
+		}
+		var copiedAssistant struct {
+			ToolCalls []struct {
+				ID            string `json:"id"`
+				ResultEntryID string `json:"result_entry_id"`
+			} `json:"tool_calls"`
+			Usage *struct{} `json:"usage"`
+		}
+		if err := json.Unmarshal(entries[1].Payload, &copiedAssistant); err != nil {
+			t.Fatalf("decode copied assistant: %v", err)
+		}
+		if copiedAssistant.Usage != nil {
+			t.Fatalf("copied assistant carries source usage")
+		}
+		if len(copiedAssistant.ToolCalls) != 1 || copiedAssistant.ToolCalls[0].ID != "call-1" ||
+			copiedAssistant.ToolCalls[0].ResultEntryID != entries[2].ID {
+			t.Fatalf("copied call reservation = %+v, want it rewritten to the copied result entry %s", copiedAssistant.ToolCalls, entries[2].ID)
+		}
+		var copiedResult struct {
+			AssistantEntry struct {
+				SessionID string `json:"session_id"`
+				EntryID   string `json:"entry_id"`
+			} `json:"assistant_entry"`
+			ToolCallID string `json:"tool_call_id"`
+		}
+		if err := json.Unmarshal(entries[2].Payload, &copiedResult); err != nil {
+			t.Fatalf("decode copied tool result: %v", err)
+		}
+		if copiedResult.AssistantEntry.SessionID != dest || copiedResult.AssistantEntry.EntryID != entries[1].ID ||
+			copiedResult.ToolCallID != "call-1" {
+			t.Fatalf("copied result reference = %+v, want it rewritten inside the copied prefix", copiedResult.AssistantEntry)
+		}
+		var copiedSignal struct {
+			RelatedOperation struct {
+				SessionID   string `json:"session_id"`
+				OperationID string `json:"operation_id"`
+			} `json:"related_operation"`
+		}
+		if err := json.Unmarshal(entries[4].Payload, &copiedSignal); err != nil {
+			t.Fatalf("decode copied signal: %v", err)
+		}
+		if copiedSignal.RelatedOperation.SessionID != source || copiedSignal.RelatedOperation.OperationID != "op-1" {
+			t.Fatalf("copied signal related operation = %+v, want the source Operation kept as informational history", copiedSignal.RelatedOperation)
+		}
+		var admission struct {
+			Origin string `json:"origin"`
+		}
+		if err := json.Unmarshal(entries[5].Payload, &admission); err != nil {
+			t.Fatalf("decode fork admission input: %v", err)
+		}
+		if admission.Origin != "user" {
+			t.Fatalf("fork admission origin = %q, want the fixed user origin", admission.Origin)
+		}
+
+		// the fork's own turn settled through its model-originated terminal
+		sess, err := f2.h.ReadSession(ctx, dest)
+		if err != nil || sess.State.CurrentOperationID != "" || len(sess.State.Usage.ByModel) != 0 {
+			t.Fatalf("fork session after convergence = %+v err %v, want it settled with zero usage", sess, err)
+		}
+		rec, err := f2.h.ReadOperation(ctx, dest, "fork-1")
+		if err != nil || rec.State.Status != harness.OperationFailure ||
+			rec.State.Terminal == nil || rec.State.Terminal.Detail != "fork turn settled" {
+			t.Fatalf("fork operation after convergence = %+v err %v, want its model-originated terminal", rec, err)
+		}
+	})
+}
+
+// TestPublicForkArchivedSource proves the archived-source axis: an archived
+// idle source is read without reopening, the fork succeeds, and the source
+// stays archived while the destination is open.
+func TestPublicForkArchivedSource(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		script := newScriptModel()
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		source := createSession(t, f.h)
+		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
+			t.Fatalf("first submit: %v", err)
+		}
+		<-script.arrived
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+
+		f2 := newPublicFixture(t, store, newScriptModel(), nil)
+		defer f2.close()
+		if _, err := f2.h.ArchiveSession(ctx, source); err != nil {
+			t.Fatalf("archive: %v", err)
+		}
+		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
+		res, err := f2.h.Fork(ctx, harness.ForkRequest{
+			SourceSessionID: source,
+			BoundaryEntryID: boundary,
+			OperationID:     "fork-1",
+			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+		})
+		if err != nil {
+			t.Fatalf("Fork of an archived source: %v", err)
+		}
+		if res.Session.State.Lifecycle != harness.LifecycleOpen {
+			t.Fatalf("fork lifecycle = %s, want open", res.Session.State.Lifecycle)
+		}
+		src, err := f2.h.ReadSession(ctx, source)
+		if err != nil || src.State.Lifecycle != harness.LifecycleArchived {
+			t.Fatalf("source after fork = %+v err %v, want it archived without reopening", src, err)
+		}
+		if err := converge(t, f2); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+	})
+}
+
+// TestPublicForkBoundaryValidation proves the boundary/precondition axis: a
+// running source, a missing boundary, a non-input boundary, a non-user
+// boundary origin, and malformed identities are all rejected with nothing
+// published.
+func TestPublicForkBoundaryValidation(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		script := newScriptModel()
+		script.gate = make(chan struct{})
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		source := createSession(t, f.h)
+
+		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
+			t.Fatalf("first submit: %v", err)
+		}
+		<-script.arrived // parked: the source is running
+		if _, err := f.h.Fork(ctx, harness.ForkRequest{
+			SourceSessionID: source,
+			BoundaryEntryID: newRawSessionID(t),
+			OperationID:     "fork-1",
+			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+		}); !errors.Is(err, harness.ErrInvalid) {
+			t.Fatalf("fork of a running source = err %v, want ErrInvalid", err)
+		}
+		if _, err := f.h.Fork(ctx, harness.ForkRequest{SourceSessionID: "short", BoundaryEntryID: newRawSessionID(t), OperationID: "fork-1"}); !errors.Is(err, harness.ErrInvalid) {
+			t.Fatalf("fork with a malformed source identity = err %v, want ErrInvalid", err)
+		}
+		if _, err := f.h.Fork(ctx, harness.ForkRequest{SourceSessionID: source, BoundaryEntryID: "short", OperationID: "fork-1"}); !errors.Is(err, harness.ErrInvalid) {
+			t.Fatalf("fork with a malformed boundary identity = err %v, want ErrInvalid", err)
+		}
+		if _, err := f.h.Fork(ctx, harness.ForkRequest{SourceSessionID: source, BoundaryEntryID: newRawSessionID(t), OperationID: ""}); !errors.Is(err, harness.ErrInvalid) {
+			t.Fatalf("fork without an operation identity = err %v, want ErrInvalid", err)
+		}
+		script.releaseGate()
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+
+		// an idle source with one runtime-origin input: non-user boundaries are invalid
+		runtimeScript := newScriptModel()
+		f2 := newPublicFixture(t, store, runtimeScript, nil)
+		defer f2.close()
+		if _, err := f2.h.Submit(ctx, harness.SubmitRequest{
+			SessionID:   source,
+			OperationID: "op-2",
+			Origin:      harness.InputOriginRuntime,
+			Content:     []model.ContentPart{{Kind: model.PartText, Text: "runtime input"}},
+			Mode:        harness.MessageModeRegular,
+		}); err != nil {
+			t.Fatalf("runtime submit: %v", err)
+		}
+		<-runtimeScript.arrived
+		if err := converge(t, f2); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+
+		f3 := newPublicFixture(t, store, newScriptModel(), nil)
+		defer f3.close()
+		runtimeBoundary := forkEntryOf(t, store, source, harness.EntryInput, "op-2").ID
+		assistantBoundary := forkEntryOf(t, store, source, harness.EntryAssistant, "op-1").ID
+		for _, tt := range []struct {
+			name     string
+			boundary string
+		}{
+			{"missing boundary", newRawSessionID(t)},
+			{"non-input boundary", assistantBoundary},
+			{"runtime-origin boundary", runtimeBoundary},
+		} {
+			if _, err := f3.h.Fork(ctx, harness.ForkRequest{
+				SourceSessionID: source,
+				BoundaryEntryID: tt.boundary,
+				OperationID:     "fork-1",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			}); !errors.Is(err, harness.ErrInvalid) {
+				t.Fatalf("fork with %s = err %v, want ErrInvalid", tt.name, err)
+			}
+		}
+		assertSessionIDs(t, store, source) // nothing was published by any rejection
+	})
+}
+
+// TestPublicForkExistingLookup proves the idempotency axis of the fork row:
+// the existing-ID lookup precedes source validation and preparation and
+// returns only graph-validated state — a retry returns the first destination
+// even with changed content and without re-preparing, it resolves after the
+// source is deleted, other lineage/request reuse of the ID is invalid, a
+// corrupt located owner surfaces its corruption, and Session-scoped
+// corruption before the owner is located is skipped. An affected Session
+// already materialized in the reporting Harness becomes sticky-corrupt for
+// its later reads while valid siblings remain usable.
+func TestPublicForkExistingLookup(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		script := newScriptModel()
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		source := createSession(t, f.h)
+		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
+			t.Fatalf("first submit: %v", err)
+		}
+		<-script.arrived
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
+		forkReq := harness.ForkRequest{
+			SourceSessionID: source,
+			BoundaryEntryID: boundary,
+			OperationID:     "fork-a",
+			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+		}
+
+		f2 := newPublicFixture(t, store, newScriptModel(), nil)
+		defer f2.close()
+		first, err := f2.h.Fork(ctx, forkReq)
+		if err != nil {
+			t.Fatalf("Fork: %v", err)
+		}
+		dest := first.Session.Identity.SessionID
+		if err := converge(t, f2); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+
+		// one further live idle source for the later subtests
+		otherScript := newScriptModel()
+		f3 := newPublicFixture(t, store, otherScript, nil)
+		defer f3.close()
+		other := createSession(t, f3.h)
+		if _, err := submit(t, f3.h, other, "fork-b", harness.MessageModeRegular, "reused"); err != nil {
+			t.Fatalf("cross-session submit: %v", err)
+		}
+		<-otherScript.arrived
+		if err := converge(t, f3); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		otherBoundary := forkEntryOf(t, store, other, harness.EntryInput, "fork-b").ID
+
+		t.Run("retry returns the first destination without re-preparing", func(t *testing.T) {
+			f4 := newPublicFixture(t, store, newScriptModel(), nil)
+			defer f4.close()
+			retry := forkReq
+			retry.Content = []model.ContentPart{{Kind: model.PartText, Text: "changed"}}
+			res, err := f4.h.Fork(ctx, retry)
+			if err != nil {
+				t.Fatalf("retry Fork: %v", err)
+			}
+			if res.Session.Identity.SessionID != dest ||
+				res.Operation.Admission.AdmittedEntry != first.Operation.Admission.AdmittedEntry {
+				t.Fatalf("retry = %+v, want the first destination", res)
+			}
+			if calls := f4.preparationCalls(); len(calls) != 0 {
+				t.Fatalf("retry prepared %d times, want the lookup to resolve before preparation", len(calls))
+			}
+			assertSessionIDs(t, store, dest, other, source)
+		})
+
+		t.Run("lookup precedes source validation", func(t *testing.T) {
+			f5 := newPublicFixture(t, store, newScriptModel(), nil)
+			defer f5.close()
+			if _, err := f5.h.ArchiveSession(ctx, source); err != nil {
+				t.Fatalf("archive: %v", err)
+			}
+			if err := f5.h.DeleteSession(ctx, source); err != nil {
+				t.Fatalf("delete: %v", err)
+			}
+			res, err := f5.h.Fork(ctx, forkReq)
+			if err != nil {
+				t.Fatalf("retry after source deletion: %v", err)
+			}
+			if res.Session.Identity.SessionID != dest {
+				t.Fatalf("retry after source deletion = %+v, want the first destination", res)
+			}
+		})
+
+		t.Run("other reuse of the ID is invalid", func(t *testing.T) {
+			f6 := newPublicFixture(t, store, newScriptModel(), nil)
+			defer f6.close()
+			if _, err := f6.h.Fork(ctx, harness.ForkRequest{
+				SourceSessionID: other,
+				BoundaryEntryID: otherBoundary,
+				OperationID:     "fork-b",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			}); !errors.Is(err, harness.ErrInvalid) {
+				t.Fatalf("fork reusing a root Session's operation ID = err %v, want ErrInvalid", err)
+			}
+		})
+
+		t.Run("corrupt located owner returns corruption", func(t *testing.T) {
+			f7 := newPublicFixture(t, store, newScriptModel(), nil)
+			defer f7.close()
+			res, err := f7.h.Fork(ctx, harness.ForkRequest{
+				SourceSessionID: other,
+				BoundaryEntryID: otherBoundary,
+				OperationID:     "fork-c",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			})
+			if err != nil {
+				t.Fatalf("Fork: %v", err)
+			}
+			if err := converge(t, f7); err != nil {
+				t.Fatalf("Wait: %v", err)
+			}
+			// corrupt the destination register directly through storage
+			reg := sessionRegister(t, store, res.Session.Identity.SessionID)
+			var obj map[string]json.RawMessage
+			if err := json.Unmarshal(reg.Payload, &obj); err != nil {
+				t.Fatalf("unmarshal session payload: %v", err)
+			}
+			var state map[string]json.RawMessage
+			if err := json.Unmarshal(obj["state"], &state); err != nil {
+				t.Fatalf("unmarshal state section: %v", err)
+			}
+			state["lifecycle"] = json.RawMessage(`"bogus"`)
+			newState, err := json.Marshal(state)
+			if err != nil {
+				t.Fatalf("marshal state section: %v", err)
+			}
+			obj["state"] = newState
+			bad, err := json.Marshal(obj)
+			if err != nil {
+				t.Fatalf("marshal session payload: %v", err)
+			}
+			key := harness.RegisterKey{SessionID: res.Session.Identity.SessionID, Kind: harness.RegisterSession}
+			f8 := newPublicFixture(t, store, newScriptModel(), nil)
+			defer f8.close()
+			// the affected destination is already materialized in the retry
+			// Harness before the corruption is reported
+			if _, err := f8.h.ReadSession(ctx, res.Session.Identity.SessionID); err != nil {
+				t.Fatalf("read the destination before corruption: %v", err)
+			}
+			if err := store.Transact(ctx, func(tx harness.Transaction) error {
+				_, err := tx.ReplaceRegister(key, reg.Revision, bad)
+				return err
+			}); err != nil {
+				t.Fatalf("corrupt the register: %v", err)
+			}
+			if _, err := f8.h.Fork(ctx, harness.ForkRequest{
+				SourceSessionID: other,
+				BoundaryEntryID: otherBoundary,
+				OperationID:     "fork-c",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			}); !errors.Is(err, harness.ErrCorrupt) {
+				t.Fatalf("retry over a corrupt located owner = err %v, want the corruption error", err)
+			}
+			// the affected cached Session is sticky-corrupt while valid siblings remain usable
+			if _, err := f8.h.ReadSession(ctx, res.Session.Identity.SessionID); !errors.Is(err, harness.ErrCorrupt) {
+				t.Fatalf("cached read of the corrupt located owner = err %v, want the sticky corruption error", err)
+			}
+			if _, err := f8.h.ReadSession(ctx, other); err != nil {
+				t.Fatalf("valid sibling after the corrupt located owner = err %v, want it usable", err)
+			}
+		})
+
+		t.Run("corrupt sibling before the owner is skipped", func(t *testing.T) {
+			insertRawRegister(t, store, harness.RegisterKey{SessionID: forkSiblingID, Kind: harness.RegisterSession}, rawSessionRegister(forkSiblingID, ""))
+			wrapped := &corruptReadStore{Storage: store, session: forkSiblingID}
+			f9 := newPublicFixture(t, wrapped, newScriptModel(), nil)
+			defer f9.close()
+			// the affected sibling is already materialized in this Harness
+			// before the corruption is reported
+			if _, err := f9.h.ReadSession(ctx, forkSiblingID); err != nil {
+				t.Fatalf("read the sibling before corruption: %v", err)
+			}
+			res, err := f9.h.Fork(ctx, forkReq)
+			if err != nil {
+				t.Fatalf("retry past a corrupt sibling: %v", err)
+			}
+			if res.Operation.Admission.OperationID != "fork-a" {
+				t.Fatalf("retry = %+v, want the existing destination", res)
+			}
+			// the skipped corruption sticks to the cached Session while valid siblings remain usable
+			if _, err := f9.h.ReadSession(ctx, forkSiblingID); !errors.Is(err, harness.ErrCorrupt) {
+				t.Fatalf("cached read of the corrupt sibling = err %v, want the sticky corruption error", err)
+			}
+			if _, err := f9.h.ReadSession(ctx, other); err != nil {
+				t.Fatalf("valid sibling after the corrupt sibling = err %v, want it usable", err)
+			}
+		})
+	})
+}
+
+// TestPublicForkFirstWriterRace proves the first-writer resolution axis: a
+// fork that loses a concurrent same-ID insertion race reruns neither
+// preparation nor the transaction — the same exact lookup runs once and
+// returns the matching first destination, a different lineage/request use of
+// the ID is invalid, and an unreadable owner preserves the original storage
+// conflict.
+func TestPublicForkFirstWriterRace(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		script := newScriptModel()
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		source := createSession(t, f.h)
+		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
+			t.Fatalf("first submit: %v", err)
+		}
+		<-script.arrived
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
+
+		t.Run("matching first destination is returned", func(t *testing.T) {
+			race := newPublicFixture(t, store, newScriptModel(), nil)
+			defer race.close()
+			decoyCh := make(chan string, 1)
+			race.prepareHook = func(int, harness.PreparationRequest) (harness.PreparedExecution, error) {
+				decoyCh <- seedForkDecoy(t, store, source, boundary, "race-1", true) // the concurrent winner commits during preparation
+				return racePrepared(race), nil
+			}
+			res, err := race.h.Fork(ctx, harness.ForkRequest{
+				SourceSessionID: source,
+				BoundaryEntryID: boundary,
+				OperationID:     "race-1",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			})
+			if err != nil {
+				t.Fatalf("fork losing the race = err %v, want the matching first destination", err)
+			}
+			decoy := <-decoyCh
+			if res.Session.Identity.SessionID != decoy || res.Session.Identity.SourceSessionID != source ||
+				res.Operation.Admission.OperationID != "race-1" {
+				t.Fatalf("race resolution = %+v, want the first destination session %q", res, decoy)
+			}
+			if calls := race.preparationCalls(); len(calls) != 1 {
+				t.Fatalf("preparation calls = %d, want the preparation never rerun", len(calls))
+			}
+			assertSessionIDs(t, store, decoy, source) // the losing transaction published nothing
+		})
+
+		t.Run("different lineage reuse is invalid", func(t *testing.T) {
+			race := newPublicFixture(t, store, newScriptModel(), nil)
+			defer race.close()
+			race.prepareHook = func(int, harness.PreparationRequest) (harness.PreparedExecution, error) {
+				seedForkDecoy(t, store, source, boundary, "race-2", false) // a root Session wins the ID
+				return racePrepared(race), nil
+			}
+			if _, err := race.h.Fork(ctx, harness.ForkRequest{
+				SourceSessionID: source,
+				BoundaryEntryID: boundary,
+				OperationID:     "race-2",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			}); !errors.Is(err, harness.ErrInvalid) {
+				t.Fatalf("fork losing to a different use of the ID = err %v, want ErrInvalid", err)
+			}
+		})
+
+		t.Run("unreadable owner preserves the conflict", func(t *testing.T) {
+			race := newPublicFixture(t, store, newScriptModel(), nil)
+			defer race.close()
+			race.prepareHook = func(int, harness.PreparationRequest) (harness.PreparedExecution, error) {
+				sid, entryID := newRawSessionID(t), newRawSessionID(t)
+				insertRawRegister(t, store, harness.RegisterKey{SessionID: sid, Kind: harness.RegisterSession}, `{}`) // the owner's Session is unreadable
+				insertRawEntry(t, store, sid, entryID, "race-3", harness.EntryInput, rawInputEntryPayload(sid, entryID, "race-3"))
+				insertRawRegister(t, store, harness.RegisterKey{SessionID: sid, Kind: harness.RegisterOperation, OperationID: "race-3"}, rawRunningOperationPayload(sid, "race-3", entryID))
+				return racePrepared(race), nil
+			}
+			if _, err := race.h.Fork(ctx, harness.ForkRequest{
+				SourceSessionID: source,
+				BoundaryEntryID: boundary,
+				OperationID:     "race-3",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			}); !errors.Is(err, harness.ErrConflict) {
+				t.Fatalf("fork losing to an unreadable owner = err %v, want the original storage conflict", err)
+			}
+		})
+	})
+}
+
+// TestPublicForkSourceRevisionRace proves the source-revalidation failure
+// point: a foreign writer that changes the source Session register between
+// materialization and the fork transaction makes the fork fail with the
+// conflict class, and nothing is published.
+func TestPublicForkSourceRevisionRace(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		script := newScriptModel()
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		source := createSession(t, f.h)
+		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
+			t.Fatalf("first submit: %v", err)
+		}
+		<-script.arrived
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
+		before := snapshotSession(t, store, source)
+
+		race := newPublicFixture(t, store, newScriptModel(), nil)
+		defer race.close()
+		race.prepareHook = func(int, harness.PreparationRequest) (harness.PreparedExecution, error) {
+			// a foreign writer changes the source under the reservation
+			reg := sessionRegister(t, store, source)
+			edited := editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+				state["current_agent_type"] = json.RawMessage(`"reviewer"`)
+			})
+			if err := store.Transact(ctx, func(tx harness.Transaction) error {
+				_, err := tx.ReplaceRegister(harness.RegisterKey{SessionID: source, Kind: harness.RegisterSession}, reg.Revision, edited)
+				return err
+			}); err != nil {
+				t.Errorf("foreign change: %v", err)
+				return harness.PreparedExecution{}, err
+			}
+			return racePrepared(race), nil
+		}
+		if _, err := race.h.Fork(ctx, harness.ForkRequest{
+			SourceSessionID: source,
+			BoundaryEntryID: boundary,
+			OperationID:     "race-1",
+			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+		}); !errors.Is(err, harness.ErrConflict) {
+			t.Fatalf("fork over a concurrently changed source = err %v, want ErrConflict", err)
+		}
+		assertSessionIDs(t, store, source) // nothing was published
+		after := sessionRegister(t, store, source)
+		if after.Revision != snapRegisterOf(&before, harness.RegisterSession, "").Revision+1 ||
+			!bytes.Equal(after.Payload, mustForeignPayload(t, before)) {
+			t.Fatalf("fork disturbed the foreign change: register = %+v", after)
+		}
+	})
+}
+
+// mustForeignPayload returns the pre-fork register payload with the foreign
+// writer's Agent-type change applied.
+func mustForeignPayload(t *testing.T, snap sessionSnapshot) json.RawMessage {
+	t.Helper()
+	for i := range snap.registers {
+		if snap.registers[i].Key.Kind == harness.RegisterSession {
+			return editStateObject(t, snap.registers[i].Payload, func(state map[string]json.RawMessage) {
+				state["current_agent_type"] = json.RawMessage(`"reviewer"`)
+			})
+		}
+	}
+	t.Fatalf("no session register in the snapshot")
+	return nil
+}
+
+// TestPublicForkIndependentSourceDeletion proves the independent-lifecycle
+// axis: lineage is informational only — deleting the source leaves the fork
+// readable and admissible, and forking from the deleted source resolves to
+// the not-found class.
+func TestPublicForkIndependentSourceDeletion(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		script := newScriptModel()
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		source := createSession(t, f.h)
+		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
+			t.Fatalf("first submit: %v", err)
+		}
+		<-script.arrived
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
+
+		f2 := newPublicFixture(t, store, newScriptModel(), nil)
+		defer f2.close()
+		res, err := f2.h.Fork(ctx, harness.ForkRequest{
+			SourceSessionID: source,
+			BoundaryEntryID: boundary,
+			OperationID:     "fork-1",
+			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+		})
+		if err != nil {
+			t.Fatalf("Fork: %v", err)
+		}
+		dest := res.Session.Identity.SessionID
+		if err := converge(t, f2); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+
+		// the source is archived and deleted; the fork stays usable
+		destScript := newScriptModel()
+		f3 := newPublicFixture(t, store, destScript, nil)
+		defer f3.close()
+		if _, err := f3.h.ArchiveSession(ctx, source); err != nil {
+			t.Fatalf("archive source: %v", err)
+		}
+		if err := f3.h.DeleteSession(ctx, source); err != nil {
+			t.Fatalf("delete source: %v", err)
+		}
+		if _, err := f3.h.ReadSession(ctx, dest); err != nil {
+			t.Fatalf("fork read after source deletion: %v", err)
+		}
+		if _, err := f3.h.ReadOperation(ctx, dest, "fork-1"); err != nil {
+			t.Fatalf("fork operation read after source deletion: %v", err)
+		}
+		if _, err := submit(t, f3.h, dest, "fork-2", harness.MessageModeRegular, "after source loss"); err != nil {
+			t.Fatalf("fork admission after source deletion: %v", err)
+		}
+		<-destScript.arrived
+		if _, err := submit(t, f3.h, dest, "fork-4", harness.MessageModeQueued, "settle barrier"); err != nil {
+			t.Fatalf("queued submit: %v", err)
+		}
+		<-f3.prepare // the drain admitted fork-4: fork-2's terminal committed
+		<-destScript.arrived
+		if err := converge(t, f3); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		rec, err := f3.h.ReadOperation(ctx, dest, "fork-2")
+		if err != nil || rec.State.Status != harness.OperationSuccess {
+			t.Fatalf("fork admission after source deletion = %+v err %v, want success", rec, err)
+		}
+		f4 := newPublicFixture(t, store, newScriptModel(), nil)
+		defer f4.close()
+		if _, err := f4.h.Fork(ctx, harness.ForkRequest{
+			SourceSessionID: source,
+			BoundaryEntryID: boundary,
+			OperationID:     "fork-3",
+			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+		}); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("fork from a deleted source = err %v, want ErrNotFound", err)
+		}
+	})
+}
+
+// TestPublicForkRollbackOnTransactionFailure proves the fork's failure
+// points: a post-mutation transaction failure rolls the whole fork back —
+// the destination exists nowhere in storage and the source is byte-identical.
+func TestPublicForkRollbackOnTransactionFailure(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		script := newScriptModel()
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		source := createSession(t, f.h)
+		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
+			t.Fatalf("first submit: %v", err)
+		}
+		<-script.arrived
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
+		before := snapshotSession(t, store, source)
+
+		probe := &rollbackProbeStore{Storage: store, failInsert: true, insertsUntilFail: 2} // the destination Operation-register insert fails after mutating
+		race := newPublicFixture(t, probe, newScriptModel(), nil)
+		defer race.close()
+		if _, err := race.h.Fork(ctx, harness.ForkRequest{
+			SourceSessionID: source,
+			BoundaryEntryID: boundary,
+			OperationID:     "fork-1",
+			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+		}); !errors.Is(err, errInjectedRollback) {
+			t.Fatalf("fork with injected post-mutation failure = err %v, want the injected rollback", err)
+		}
+		assertSessionIDs(t, store, source) // the rolled-back fork left no destination
+		assertForkSourceUnchanged(t, store, source, before)
+	})
 }
