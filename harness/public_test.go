@@ -589,6 +589,347 @@ func TestPublicWaitOwnContextCancelsOnlyTheWait(t *testing.T) {
 	})
 }
 
+// publicationCancelStore wraps one store to cancel one context at a chosen
+// point of the next transaction: at its entry, before the store observes the
+// call, or after a nil return, once the transaction has committed. The armed
+// hook fires once and disarms itself.
+type publicationCancelStore struct {
+	harness.Storage
+	atEntry     func()
+	afterCommit func()
+}
+
+func (s *publicationCancelStore) Transact(ctx context.Context, fn func(harness.Transaction) error) error {
+	if hook := s.atEntry; hook != nil {
+		s.atEntry = nil
+		hook()
+		// the harness-combined publication context may lag the canceled parent
+		// by one AfterFunc hop: wait until the context the transaction actually
+		// runs on observes the cancellation
+		deadline := time.Now().Add(5 * time.Second)
+		for ctx.Err() == nil && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	err := s.Storage.Transact(ctx, fn)
+	if err == nil {
+		if hook := s.afterCommit; hook != nil {
+			s.afterCommit = nil
+			hook()
+		}
+	}
+	return err
+}
+
+// submitRequest is one regular user-origin Submit request for the publication
+// fixtures.
+func submitRequest(sessionID, operationID, text string) harness.SubmitRequest {
+	return harness.SubmitRequest{
+		SessionID:   sessionID,
+		OperationID: operationID,
+		Origin:      harness.InputOriginUser,
+		Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
+		Mode:        harness.MessageModeRegular,
+	}
+}
+
+// assertNothingAdmitted verifies the durable state of one aborted admission:
+// the Session carries no entries and no Operation register.
+func assertNothingAdmitted(t *testing.T, store harness.Storage, sessionID, operationID string) {
+	t.Helper()
+	if entries := recoverEntries(t, store, sessionID); len(entries) != 0 {
+		t.Fatalf("aborted admission published %d entries, want none", len(entries))
+	}
+	key := harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID}
+	if _, err := store.ReadRegister(context.Background(), key); !errors.Is(err, harness.ErrNotFound) {
+		t.Fatalf("operation register after the aborted admission = err %v, want absence", err)
+	}
+}
+
+// seedIdleSource completes one regular message on a fresh Session and leaves
+// it idle, returning the source identity for the fork fixtures. The operation
+// identity is globally unique across the store, so each seed passes its own.
+func seedIdleSource(t *testing.T, store harness.Storage, operationID string) string {
+	t.Helper()
+	script := newScriptModel(agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)})
+	f := newPublicFixture(t, store, script, nil)
+	source := createSession(t, f.h)
+	if _, err := submit(t, f.h, source, operationID, harness.MessageModeRegular, "hello"); err != nil {
+		t.Fatalf("seed submit: %v", err)
+	}
+	<-script.arrived
+	if err := converge(t, f); err != nil {
+		t.Fatalf("seed Wait: %v", err)
+	}
+	return source
+}
+
+// TestPublicPublicationContextLifetime proves the context-lifetime,
+// publication-precedence, and caller-deadline rows on both stores: the
+// publication transaction runs on the combined caller/Harness context, so
+// cancellation of either context at the publication boundary aborts it —
+// Submit publishes nothing, Fork leaves no destination, and preparation is
+// never repeated — a caller deadline expiring during the gated publication
+// returns DeadlineExceeded at the caller-facing boundary, and a committed
+// publication wins a later caller cancellation and returns the committed
+// result.
+func TestPublicPublicationContextLifetime(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+
+		t.Run("harness cancellation at Submit publication publishes nothing", func(t *testing.T) {
+			probe := &publicationCancelStore{Storage: store}
+			f := newPublicFixture(t, probe, newScriptModel(), nil)
+			defer f.close()
+			session := createSession(t, f.h)
+			probe.atEntry = f.cancel // the Harness context dies as the publication transaction begins
+
+			res, err := f.h.Submit(ctx, submitRequest(session, "op-a", "hello"))
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("submit whose publication lost the Harness context = %+v err %v, want a context error", res, err)
+			}
+			if res.Operation != nil {
+				t.Fatalf("submit result = %+v, want no admitted operation", res)
+			}
+			assertNothingAdmitted(t, store, session, "op-a")
+			assertSessionIDs(t, store, session)
+			if calls := f.preparationCalls(); len(calls) != 1 {
+				t.Fatalf("preparation calls = %d, want exactly one with no retry", len(calls))
+			}
+		})
+
+		t.Run("caller cancellation at Submit publication publishes nothing", func(t *testing.T) {
+			probe := &publicationCancelStore{Storage: store}
+			f := newPublicFixture(t, probe, newScriptModel(), nil)
+			defer f.close()
+			session := createSession(t, f.h)
+			caller, cancelCaller := context.WithCancel(ctx)
+			defer cancelCaller()
+			probe.atEntry = cancelCaller
+
+			res, err := f.h.Submit(caller, submitRequest(session, "op-b", "hello"))
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("submit whose publication lost the caller context = %+v err %v, want a context error", res, err)
+			}
+			if res.Operation != nil {
+				t.Fatalf("submit result = %+v, want no admitted operation", res)
+			}
+			assertNothingAdmitted(t, store, session, "op-b")
+			if calls := f.preparationCalls(); len(calls) != 1 {
+				t.Fatalf("preparation calls = %d, want exactly one with no retry", len(calls))
+			}
+		})
+
+		t.Run("harness cancellation at Fork publication leaves no destination", func(t *testing.T) {
+			source := seedIdleSource(t, store, "seed-op-1")
+			boundary := forkEntryOf(t, store, source, harness.EntryInput, "seed-op-1").ID
+			before, err := store.ListSessionIDs(ctx) // subtests share the store: no destination means an unchanged listing
+			if err != nil {
+				t.Fatalf("list sessions: %v", err)
+			}
+
+			probe := &publicationCancelStore{Storage: store}
+			f := newPublicFixture(t, probe, newScriptModel(), nil)
+			defer f.close()
+			probe.atEntry = f.cancel
+
+			res, err := f.h.Fork(ctx, harness.ForkRequest{
+				SourceSessionID: source,
+				BoundaryEntryID: boundary,
+				OperationID:     "fork-1",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("fork whose publication lost the Harness context = %+v err %v, want a context error", res, err)
+			}
+			after, err := store.ListSessionIDs(ctx)
+			if err != nil {
+				t.Fatalf("list sessions: %v", err)
+			}
+			if len(after) != len(before) {
+				t.Fatalf("session listing after the aborted fork = %v, want it unchanged at %v", after, before)
+			}
+			for i := range after {
+				if after[i] != before[i] {
+					t.Fatalf("session listing after the aborted fork = %v, want it unchanged at %v", after, before)
+				}
+			}
+			if calls := f.preparationCalls(); len(calls) != 1 {
+				t.Fatalf("preparation calls = %d, want exactly one with no retry", len(calls))
+			}
+		})
+
+		t.Run("caller cancellation at Fork publication leaves no destination", func(t *testing.T) {
+			source := seedIdleSource(t, store, "seed-op-3")
+			boundary := forkEntryOf(t, store, source, harness.EntryInput, "seed-op-3").ID
+			before, err := store.ListSessionIDs(ctx) // subtests share the store: no destination means an unchanged listing
+			if err != nil {
+				t.Fatalf("list sessions: %v", err)
+			}
+
+			probe := &publicationCancelStore{Storage: store}
+			f := newPublicFixture(t, probe, newScriptModel(), nil)
+			defer f.close()
+			caller, cancelCaller := context.WithCancel(ctx)
+			defer cancelCaller()
+			probe.atEntry = cancelCaller
+
+			res, err := f.h.Fork(caller, harness.ForkRequest{
+				SourceSessionID: source,
+				BoundaryEntryID: boundary,
+				OperationID:     "fork-2",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("fork whose publication lost the caller context = %+v err %v, want a context error", res, err)
+			}
+			after, err := store.ListSessionIDs(ctx)
+			if err != nil {
+				t.Fatalf("list sessions: %v", err)
+			}
+			if len(after) != len(before) {
+				t.Fatalf("session listing after the aborted fork = %v, want it unchanged at %v", after, before)
+			}
+			for i := range after {
+				if after[i] != before[i] {
+					t.Fatalf("session listing after the aborted fork = %v, want it unchanged at %v", after, before)
+				}
+			}
+			if calls := f.preparationCalls(); len(calls) != 1 {
+				t.Fatalf("preparation calls = %d, want exactly one with no retry", len(calls))
+			}
+		})
+
+		t.Run("caller deadline expiring at Submit publication returns DeadlineExceeded", func(t *testing.T) {
+			probe := &publicationCancelStore{Storage: store}
+			f := newPublicFixture(t, probe, newScriptModel(), nil)
+			defer f.close()
+			session := createSession(t, f.h)
+			caller, cancelCaller := context.WithTimeout(ctx, 50*time.Millisecond) // the caller's own native deadline
+			defer cancelCaller()
+			probe.atEntry = func() { <-caller.Done() } // publication gated until the caller deadline expires
+
+			res, err := f.h.Submit(caller, submitRequest(session, "op-d", "hello"))
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("submit whose publication lost the caller deadline = %+v err %v, want DeadlineExceeded", res, err)
+			}
+			if res.Operation != nil {
+				t.Fatalf("submit result = %+v, want no admitted operation", res)
+			}
+			assertNothingAdmitted(t, store, session, "op-d")
+			if calls := f.preparationCalls(); len(calls) != 1 {
+				t.Fatalf("preparation calls = %d, want exactly one with no retry", len(calls))
+			}
+		})
+
+		t.Run("caller deadline expiring at Fork publication returns DeadlineExceeded", func(t *testing.T) {
+			source := seedIdleSource(t, store, "seed-op-4")
+			boundary := forkEntryOf(t, store, source, harness.EntryInput, "seed-op-4").ID
+			before, err := store.ListSessionIDs(ctx) // subtests share the store: no destination means an unchanged listing
+			if err != nil {
+				t.Fatalf("list sessions: %v", err)
+			}
+
+			probe := &publicationCancelStore{Storage: store}
+			f := newPublicFixture(t, probe, newScriptModel(), nil)
+			defer f.close()
+			caller, cancelCaller := context.WithTimeout(ctx, 50*time.Millisecond) // the caller's own native deadline
+			defer cancelCaller()
+			probe.atEntry = func() { <-caller.Done() } // publication gated until the caller deadline expires
+
+			res, err := f.h.Fork(caller, harness.ForkRequest{
+				SourceSessionID: source,
+				BoundaryEntryID: boundary,
+				OperationID:     "fork-3",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			})
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("fork whose publication lost the caller deadline = %+v err %v, want DeadlineExceeded", res, err)
+			}
+			after, err := store.ListSessionIDs(ctx)
+			if err != nil {
+				t.Fatalf("list sessions: %v", err)
+			}
+			if len(after) != len(before) {
+				t.Fatalf("session listing after the aborted fork = %v, want it unchanged at %v", after, before)
+			}
+			for i := range after {
+				if after[i] != before[i] {
+					t.Fatalf("session listing after the aborted fork = %v, want it unchanged at %v", after, before)
+				}
+			}
+			if calls := f.preparationCalls(); len(calls) != 1 {
+				t.Fatalf("preparation calls = %d, want exactly one with no retry", len(calls))
+			}
+		})
+
+		t.Run("post-commit caller cancellation returns the committed admission", func(t *testing.T) {
+			probe := &publicationCancelStore{Storage: store}
+			script := newScriptModel(agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "committed turn"}) // model-originated terminal, durable regardless of later cancellation
+			f := newPublicFixture(t, probe, script, nil)
+			defer f.close()
+			session := createSession(t, f.h)
+			caller, cancelCaller := context.WithCancel(ctx)
+			defer cancelCaller()
+			probe.afterCommit = cancelCaller
+
+			res, err := f.h.Submit(caller, submitRequest(session, "op-c", "hello"))
+			if err != nil || res.Disposition != harness.DispositionAdmitted || res.Operation == nil {
+				t.Fatalf("submit over a caller context canceled after the commit = %+v err %v, want the committed admission", res, err)
+			}
+			if caller.Err() == nil {
+				t.Fatalf("the caller context was not canceled after the commit")
+			}
+			<-script.arrived // the admitted execution reached its model boundary; its terminal commits in the effect's own transaction
+			if err := converge(t, f); err != nil {
+				t.Fatalf("Wait: %v", err)
+			}
+			rec, err := f.h.ReadOperation(ctx, session, "op-c")
+			if err != nil || rec.State.Status != harness.OperationFailure || rec.State.Terminal == nil || rec.State.Terminal.Detail != "committed turn" {
+				t.Fatalf("committed operation = %+v err %v, want the model-originated terminal", rec, err)
+			}
+		})
+
+		t.Run("post-commit caller cancellation returns the committed fork", func(t *testing.T) {
+			source := seedIdleSource(t, store, "seed-op-2")
+			boundary := forkEntryOf(t, store, source, harness.EntryInput, "seed-op-2").ID
+
+			probe := &publicationCancelStore{Storage: store}
+			script := newScriptModel(agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)})
+			f := newPublicFixture(t, probe, script, nil)
+			defer f.close()
+			caller, cancelCaller := context.WithCancel(ctx)
+			defer cancelCaller()
+			probe.afterCommit = cancelCaller
+
+			res, err := f.h.Fork(caller, harness.ForkRequest{
+				SourceSessionID: source,
+				BoundaryEntryID: boundary,
+				OperationID:     "fork-2",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			})
+			if err != nil {
+				t.Fatalf("fork over a caller context canceled after the commit = err %v, want the committed result", err)
+			}
+			dest := res.Session.Identity.SessionID
+			if dest == source || res.Session.Identity.SourceSessionID != source ||
+				res.Operation.Admission.OperationID != "fork-2" || res.Operation.State.Status != harness.OperationRunning {
+				t.Fatalf("fork result = %+v, want the committed destination and its running fork operation", res)
+			}
+			if caller.Err() == nil {
+				t.Fatalf("the caller context was not canceled after the commit")
+			}
+			if err := converge(t, f); err != nil {
+				t.Fatalf("Wait: %v", err)
+			}
+			assertForkSourceUnchanged(t, store, source, snapshotSession(t, store, source)) // the source is untouched
+			if entries := recoverEntries(t, store, dest); len(entries) == 0 {
+				t.Fatalf("committed destination %q has no entries", dest)
+			}
+		})
+	})
+}
+
 // TestPublicBufferedItemFailure proves the buffer-lifetime row through public
 // operations: a failed delivery attempt — failed preparation or a failed
 // delivered Operation — is final for the item, and the next buffered message
@@ -915,18 +1256,21 @@ func TestPublicOrderedToolCallsSettle(t *testing.T) {
 		}
 		f.prepareHook = func(int, harness.PreparationRequest) (harness.PreparedExecution, error) { return prepared, nil }
 
+		script.gate = make(chan struct{}) // the first turn parks at its model boundary until released below
 		session = createSession(t, f.h)
 		res, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
 		if err != nil || res.Disposition != harness.DispositionAdmitted {
 			t.Fatalf("first submit = %+v err %v, want the auto-started admission", res, err)
 		}
-		<-script.arrived // the first model boundary
+		<-f.prepare      // the initial admission prepared: the later prepare barrier is the drain's alone
+		<-script.arrived // the first model boundary — parked at the gate
 		if got := texts(script.seen()[0]); got[0] != "system" || got[1] != "hello" || len(got) != 2 {
 			t.Fatalf("first projection = %v, want the system prompt and the admitted input", got)
 		}
 		if queued, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1"); err != nil || queued.Disposition != harness.DispositionQueued {
 			t.Fatalf("queued submit = %+v err %v, want queued", queued, err)
 		}
+		script.releaseGate()
 
 		<-script.arrived // the second request: both committed results project before it
 		if got := texts(script.seen()[1]); len(got) != 5 || got[0] != "system" || got[1] != "hello" || got[2] != "done" ||
@@ -2045,12 +2389,14 @@ func TestPublicSweepMalformedRowSibling(t *testing.T) {
 	})
 }
 
-// TestPublicWaitConvergesWithCorruptingTransition proves there is no lock
-// inversion between Wait's scans and a lifecycle transition that discovers
-// corruption under the coordinator mutex (markCorrupt takes h.mu while holding
-// c.mu): with the register corrupted in storage after materialization,
-// ArchiveSession fails with the corruption error while a concurrent Wait over
-// the canceled Harness converges, and the Session stays unavailable.
+// TestPublicWaitConvergesWithCorruptingTransition proves the Wait and
+// corruption outcome row: with the register corrupted in storage after
+// materialization, ArchiveSession fails with the corruption error while a
+// concurrent Wait over the canceled Harness converges, and the Session stays
+// unavailable. This is outcome coverage only — it does not deterministically
+// reproduce any particular lock schedule between Wait's scans and the
+// corrupting transition; the registry-mutex release is covered
+// deterministically by the in-package snapshot postcondition test.
 func TestPublicWaitConvergesWithCorruptingTransition(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		f := newPublicFixture(t, store, newScriptModel(), nil)

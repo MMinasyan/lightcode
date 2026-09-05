@@ -86,16 +86,17 @@ func (h *Harness) Fork(ctx context.Context, req ForkRequest) (ForkResult, error)
 	if err != nil {
 		return ForkResult{}, fmt.Errorf("%w: %v", ErrStorage, err)
 	}
-	prepared, capture, err := h.prepareExecution(ctx, PreparationSession{
+	prepared, capture, prepCtx, cleanup, err := h.prepareExecution(ctx, PreparationSession{
 		Identity:  SessionIdentity{SessionID: destID, Workspace: view.Identity.Workspace},
 		AgentType: view.State.CurrentAgentType,
 	})
 	if err != nil {
 		return ForkResult{}, err
 	}
+	defer cleanup() // the combined context stays live until publication returns
 
 	var commit forkCommit
-	txErr := h.deps.Storage.Transact(ctx, func(tx Transaction) error {
+	txErr := h.deps.Storage.Transact(prepCtx, func(tx Transaction) error {
 		return h.forkTransaction(tx, destID, view, req, content, capture, &commit)
 	})
 	if txErr != nil {
@@ -105,7 +106,7 @@ func (h *Harness) Fork(ctx context.Context, req ForkRequest) (ForkResult, error)
 			// preparation and the transaction never rerun
 			return h.resolveForkConflict(ctx, req, txErr)
 		}
-		return ForkResult{}, txErr
+		return ForkResult{}, publicationError(ctx, txErr)
 	}
 
 	dest := &coordinator{graph: &sessionGraph{Session: commit.session, Operations: []OperationRecord{commit.operation}, Entries: commit.entries}}

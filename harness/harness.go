@@ -1014,20 +1014,21 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 	view := c.graph.Session // the state the reservation resolved on
 	c.mu.Unlock()
 
-	prepared, capture, err := h.prepareExecution(ctx, PreparationSession{
+	prepared, capture, prepCtx, cleanup, err := h.prepareExecution(ctx, PreparationSession{
 		Identity:  view.Identity,
 		AgentType: view.State.CurrentAgentType,
 	})
 	if err != nil {
 		return OperationRecord{}, nil, "", err
 	}
+	defer cleanup() // the combined context stays live until publication returns
 
 	// the transaction runs on the combined preparation context: either
 	// cancellation before commit aborts it, and a committed publication wins
 	// later cancellation
-	record, existing, err := h.publishAdmission(ctx, c, view, capture, req)
+	record, existing, err := h.publishAdmission(prepCtx, c, view, capture, req)
 	if err != nil {
-		return OperationRecord{}, nil, "", err
+		return OperationRecord{}, nil, "", publicationError(ctx, err)
 	}
 	if existing {
 		return ownOperationRecord(record), nil, DispositionExisting, nil
@@ -1039,41 +1040,67 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 // one admission producer, used by normal admission and Fork alike: it merges
 // the caller context with the Harness context, invokes the single preparation
 // callback, requires non-nil model and tool functions and a valid capture,
-// and returns the prepared execution with its owned durable capture. Caller
+// and returns the prepared execution with its owned durable capture plus the
+// combined context and its cleanup. A preparation failure returns with the
+// combined context already cleaned up; on success the caller keeps it live
+// through publication and runs the cleanup when publication returns. Caller
 // or Harness cancellation before or after preparation publishes nothing.
-func (h *Harness) prepareExecution(ctx context.Context, session PreparationSession) (PreparedExecution, ExecutionCapture, error) {
+func (h *Harness) prepareExecution(ctx context.Context, session PreparationSession) (PreparedExecution, ExecutionCapture, context.Context, context.CancelFunc, error) {
 	prepCtx, cancel := context.WithCancel(h.ctx)
-	defer cancel()
 	stop := context.AfterFunc(ctx, cancel)
-	defer stop()
+	cleanup := func() {
+		stop()
+		cancel()
+	}
 	if err := ctx.Err(); err != nil { // the combined preparation context is already done: never invoke Prepare
-		return PreparedExecution{}, ExecutionCapture{}, err
+		cleanup()
+		return PreparedExecution{}, ExecutionCapture{}, nil, nil, err
 	}
 	if err := h.ctx.Err(); err != nil {
-		return PreparedExecution{}, ExecutionCapture{}, h.ctx.Err()
+		cleanup()
+		return PreparedExecution{}, ExecutionCapture{}, nil, nil, h.ctx.Err()
 	}
 	prepared, prepErr := h.deps.Prepare(prepCtx, PreparationRequest{
 		Session:     session,
 		RequestKind: RequestKindMessage,
 	})
 	if prepErr != nil {
-		return PreparedExecution{}, ExecutionCapture{}, prepErr
+		cleanup()
+		return PreparedExecution{}, ExecutionCapture{}, nil, nil, prepErr
 	}
 	if prepared.Model == nil || prepared.Tool == nil {
-		return PreparedExecution{}, ExecutionCapture{}, invalidInput("prepared execution requires non-nil model and tool functions")
+		cleanup()
+		return PreparedExecution{}, ExecutionCapture{}, nil, nil, invalidInput("prepared execution requires non-nil model and tool functions")
 	}
 	if err := validateExecutionCapture(prepared.Capture); err != nil {
-		return PreparedExecution{}, ExecutionCapture{}, invalidInput("prepared execution capture: %v", err)
+		cleanup()
+		return PreparedExecution{}, ExecutionCapture{}, nil, nil, invalidInput("prepared execution capture: %v", err)
 	}
 	capture := ownCapture(prepared.Capture)
 
 	if err := ctx.Err(); err != nil { // caller cancellation wins when both contexts are done
-		return PreparedExecution{}, ExecutionCapture{}, err
+		cleanup()
+		return PreparedExecution{}, ExecutionCapture{}, nil, nil, err
 	}
 	if err := h.ctx.Err(); err != nil {
-		return PreparedExecution{}, ExecutionCapture{}, h.ctx.Err()
+		cleanup()
+		return PreparedExecution{}, ExecutionCapture{}, nil, nil, h.ctx.Err()
 	}
-	return prepared, capture, nil
+	return prepared, capture, prepCtx, cleanup, nil
+}
+
+// publicationError keeps the caller-facing cancellation class at the
+// publication boundary: the combined preparation context is canceled through
+// its AfterFunc hop, so a store abort that observed a caller deadline
+// expiring during publication surfaces as context.Canceled even though the
+// caller's own Err is context.DeadlineExceeded. The adapter restores that
+// deadline class; nil, success, and every other error pass through
+// unchanged.
+func publicationError(caller context.Context, err error) error {
+	if err != nil && errors.Is(err, context.Canceled) && caller.Err() == context.DeadlineExceeded {
+		return caller.Err()
+	}
+	return err
 }
 
 // publishAdmission runs the in-transaction admission producer: re-read the

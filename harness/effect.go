@@ -1,7 +1,6 @@
 package harness
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -683,17 +682,6 @@ func newSignalEntry(tx Transaction, sessionID, operationID string, kind SignalKi
 	return &adopted, nil
 }
 
-// normalizedArguments reports one call's raw argument payload as its durable
-// normalized form when it is exactly one valid non-null JSON value — the rule
-// the codecs enforce on stored normalized arguments.
-func normalizedArguments(raw json.RawMessage) (json.RawMessage, bool) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || !json.Valid(trimmed) || bytes.Equal(trimmed, []byte("null")) {
-		return nil, false
-	}
-	return trimmed, true
-}
-
 // newAssistantEntry builds one assistant entry from one validated model
 // output under the given entry identity, reserving one result identity per
 // completed call. An output without an eligible model-visible payload writes
@@ -729,9 +717,6 @@ func newAssistantEntry(sessionID, operationID, entryID string, out *model.Output
 				Name:            call.Name,
 				ArgumentsBase64: base64.StdEncoding.EncodeToString(call.Arguments),
 				Extra:           call.Extra,
-			}
-			if normalized, ok := normalizedArguments(call.Arguments); ok {
-				record.NormalizedArguments = normalized
 			}
 			entry.ToolCalls = append(entry.ToolCalls, record)
 		}

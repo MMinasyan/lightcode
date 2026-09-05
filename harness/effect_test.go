@@ -1893,15 +1893,20 @@ func TestToolEffectGateBeforePreparation(t *testing.T) {
 	requireSessionCleared(t, h, sessionID)
 }
 
-// TestAssistantEntryCarriesNormalizedArguments proves the assistant record
-// normalizes each call's raw argument payload when it is exactly one valid
-// non-null JSON value, and omits the field otherwise; the entry round-trips
-// through the codecs.
-func TestAssistantEntryCarriesNormalizedArguments(t *testing.T) {
-	malformed := model.ToolCall{ID: "call-2", Name: "echo", Arguments: json.RawMessage("{broken")}
+// TestAssistantEntryPreservesRawArgumentBytes proves the raw-argument row:
+// the assistant record stores each call's exact raw argument bytes and never
+// fabricates normalized arguments from JSON syntax — valid JSON alone does
+// not become a normalized value, and malformed, non-UTF-8 bytes are neither
+// altered nor lost; the entry round-trips through the codecs.
+func TestAssistantEntryPreservesRawArgumentBytes(t *testing.T) {
+	valid := json.RawMessage(` {"x": 1} `)      // valid JSON whose bytes are not canonical
+	malformed := json.RawMessage("\xff{broken") // invalid JSON and invalid UTF-8
 	modelFn := modelAssemblingOnce(agent.ModelSettlement{
 		Disposition: agent.DispoReady,
-		Output:      completedOutputWith(testToolCall("call-1"), malformed),
+		Output: completedOutputWith(
+			model.ToolCall{ID: "call-1", Name: "echo", Arguments: valid},
+			model.ToolCall{ID: "call-2", Name: "echo", Arguments: malformed},
+		),
 	})
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
 	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, modelFn), func(model.ModelRef, model.Stream) (model.Output, error) {
@@ -1918,11 +1923,17 @@ func TestAssistantEntryCarriesNormalizedArguments(t *testing.T) {
 			continue
 		}
 		first, second := entry.Assistant.ToolCalls[0], entry.Assistant.ToolCalls[1]
-		if string(first.NormalizedArguments) != `{"x":1}` {
-			t.Fatalf("call-1 normalized arguments = %q, want the valid JSON value", first.NormalizedArguments)
+		if raw, err := base64.StdEncoding.DecodeString(first.ArgumentsBase64); err != nil || string(raw) != string(valid) {
+			t.Fatalf("call-1 raw arguments = %q err %v, want the exact caller bytes", raw, err)
+		}
+		if len(first.NormalizedArguments) != 0 {
+			t.Fatalf("call-1 normalized arguments = %q, want none fabricated from valid JSON", first.NormalizedArguments)
+		}
+		if raw, err := base64.StdEncoding.DecodeString(second.ArgumentsBase64); err != nil || string(raw) != string(malformed) {
+			t.Fatalf("call-2 raw arguments = %q err %v, want the exact malformed bytes preserved", raw, err)
 		}
 		if len(second.NormalizedArguments) != 0 {
-			t.Fatalf("call-2 normalized arguments = %q, want the field omitted for malformed bytes", second.NormalizedArguments)
+			t.Fatalf("call-2 normalized arguments = %q, want the field absent for malformed bytes", second.NormalizedArguments)
 		}
 		return
 	}

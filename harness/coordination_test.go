@@ -1139,3 +1139,31 @@ func TestSessionsExecuteConcurrently(t *testing.T) {
 		t.Fatalf("first session settled %q, want success after its release", rec.State.Status)
 	}
 }
+
+// TestSnapshotCoordinatorsReleasesRegistryMutex proves the snapshot
+// postcondition deterministically: snapshotCoordinators returns with the
+// registry mutex released — observed with TryLock — including while a
+// coordinator mutex is held across the snapshot call, which also proves the
+// snapshot never takes the coordinator mutex.
+func TestSnapshotCoordinatorsReleasesRegistryMutex(t *testing.T) {
+	h := newTestHarness(t, freshSessionStore(t), nil)
+	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	c, err := h.coordinatorFor(context.Background(), session.Identity.SessionID)
+	if err != nil {
+		t.Fatalf("coordinator: %v", err)
+	}
+
+	c.mu.Lock() // a coordinator mutex held across the snapshot call
+	got := h.snapshotCoordinators()
+	c.mu.Unlock()
+	if len(got) != 1 || got[0] != c {
+		t.Fatalf("snapshot = %d coordinators, want exactly the materialized one", len(got))
+	}
+	if !h.mu.TryLock() { // the registry mutex is released once the snapshot returns
+		t.Fatalf("snapshotCoordinators retained the registry mutex")
+	}
+	h.mu.Unlock()
+}
