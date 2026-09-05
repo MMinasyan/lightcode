@@ -339,16 +339,27 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 			return fmt.Errorf("%w: operation %q revision %d changed concurrently to %d", errRevisionRace, operationID, viewOp.Revision, oreg.Revision)
 		}
 
+		// A terminal result runs the common terminal helper on this
+		// transaction's own decoded records.
+		if res.terminal != "" {
+			var usageModel model.ModelRef
+			if intent != nil {
+				usageModel = intent.expected
+			}
+			var err error
+			committedOp, committedSess, newEntries, err = commitTerminalSettlement(tx, sessionID, operationID, currentSession, currentOp, sreg.Revision, oreg.Revision, res.terminal, res.detail, res.assistant, usageModel, res.usage)
+			if err != nil {
+				return err
+			}
+			return nil
+		}
+
 		// The transaction's usage contribution rides the produced assistant
-		// entry, or the settlement entry when the terminal output reported
-		// usage without an eligible payload; the same totals land on the
-		// producer entry, the Operation, and the Session.
+		// entry; the same totals land on the producer entry, the Operation,
+		// and the Session.
 		var contribution UsageTotals
-		switch {
-		case res.assistant != nil && res.assistant.Usage != nil:
+		if res.assistant != nil && res.assistant.Usage != nil {
 			contribution = UsageTotals{ByModel: []ModelUsage{{Model: res.assistant.Source, Usage: *res.assistant.Usage}}}
-		case intent != nil && res.assistant == nil && res.usage != nil:
-			contribution = UsageTotals{ByModel: []ModelUsage{{Model: intent.expected, Usage: *res.usage}}}
 		}
 		opUsage, err := addUsageTotals(currentOp.State.Usage, contribution)
 		if err != nil {
@@ -387,47 +398,9 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 			}
 		}
 
-		// Terminal entries: one interrupted result under every remaining
-		// committed tool-result identity whose call will not execute — a
-		// terminal Operation leaves no unresolved call. Only the interruption
-		// terminal adds its signal.
-		if res.terminal != "" {
-			remaining := append(append([]PendingToolCall{}, currentOp.State.PendingToolCalls...), pending...)
-			for _, call := range remaining {
-				result := toolResultEntry{
-					SessionID:      sessionID,
-					EntryID:        call.ResultEntryID,
-					OperationID:    operationID,
-					AssistantEntry: call.AssistantEntry,
-					ToolCallID:     call.CallID,
-					Status:         model.ResultInterrupted,
-					Content:        interruptedToolResultContent,
-				}
-				payload, err := encodeToolResultEntry(result)
-				if err != nil {
-					return err
-				}
-				adopted, err := insertAndAdopt(tx, sessionID, EntryDraft{
-					SessionID:   sessionID,
-					ID:          result.EntryID,
-					OperationID: operationID,
-					Kind:        EntryToolResult,
-					Payload:     payload,
-				})
-				if err != nil {
-					return err
-				}
-				newEntries = append(newEntries, adopted)
-			}
-		}
-
-		// The interruption terminal appends exactly one interruption signal.
-		signalKind := res.signal
-		if res.terminal == OperationInterruption {
-			signalKind = SignalInterruption
-		}
-		if signalKind != "" {
-			entry, err := newSignalEntry(tx, sessionID, operationID, signalKind)
+		// A running continue result appends its fixed continuation signal.
+		if res.signal != "" {
+			entry, err := newSignalEntry(tx, sessionID, operationID, res.signal)
 			if err != nil {
 				return err
 			}
@@ -437,58 +410,8 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 		next := currentOp
 		next.State.ActiveEffect = nil
 		next.State.Usage = opUsage
-		if res.terminal == "" {
-			next.State.Status = OperationRunning
-			next.State.PendingToolCalls = append(next.State.PendingToolCalls, pending...)
-		} else {
-			// The settlement entry consumes the model effect's reserved
-			// identity when no assistant payload exists; every other
-			// settlement takes a fresh identity.
-			settlementID := ""
-			if intent != nil && res.assistant == nil {
-				settlementID = intent.resultID
-			}
-			if settlementID == "" {
-				if settlementID, err = newHexID(); err != nil {
-					return fmt.Errorf("%w: %v", ErrStorage, err)
-				}
-			}
-			settlement := operationSettlementEntry{
-				SessionID:   sessionID,
-				EntryID:     settlementID,
-				OperationID: operationID,
-				Status:      res.terminal,
-				Detail:      res.detail,
-			}
-			if res.assistant == nil && res.usage != nil { // terminal no-output model usage rides the settlement entry
-				modelRef := intent.expected
-				settlement.Model = &modelRef
-				settlement.Usage = res.usage
-			}
-			payload, err := encodeOperationSettlementEntry(settlement)
-			if err != nil {
-				return err
-			}
-			adopted, err := insertAndAdopt(tx, sessionID, EntryDraft{
-				SessionID:   sessionID,
-				ID:          settlement.EntryID,
-				OperationID: operationID,
-				Kind:        EntryOperationSettlement,
-				Payload:     payload,
-			})
-			if err != nil {
-				return err
-			}
-			newEntries = append(newEntries, adopted)
-			settled := adopted.Envelope.CommittedAt
-			next.State.Status = res.terminal
-			next.State.PendingToolCalls = []PendingToolCall{}
-			next.State.SettledAt = &settled
-			next.State.Terminal = &OperationTerminal{
-				SettlementEntry: EntryRef{SessionID: sessionID, EntryID: settlementID},
-				Detail:          res.detail,
-			}
-		}
+		next.State.Status = OperationRunning
+		next.State.PendingToolCalls = append(next.State.PendingToolCalls, pending...)
 		opPayload, err := encodeOperationRegister(next)
 		if err != nil {
 			return err
@@ -501,9 +424,6 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 
 		sessionState := currentSession.State
 		sessionState.Usage = sessionUsage
-		if res.terminal != "" {
-			sessionState.CurrentOperationID = ""
-		}
 		committedSess = SessionRecord{Identity: currentSession.Identity, State: sessionState}
 		sessionPayload, err := encodeSessionRegister(committedSess)
 		if err != nil {
@@ -534,6 +454,187 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 	c.graph.Session = committedSess
 	c.mu.Unlock()
 	return committedOp, nil
+}
+
+// commitTerminalSettlement performs the complete terminal transition in one
+// transaction against freshly decoded register records: it preserves any
+// produced assistant payload with its completed calls' reservations, writes
+// model.ResultInterrupted under every remaining committed tool-result identity
+// whose call will not execute — a terminal Operation leaves no unresolved
+// call — appends exactly one interruption signal for an interruption
+// terminal, appends the Operation settlement entry, writes the terminal
+// Operation with its usage totals, and clears the Session current Operation,
+// all atomically. The settlement entry consumes a committed model effect's
+// reserved identity when no assistant payload exists; every other settlement
+// takes a fresh identity. Live settlement calls it from the model-result
+// transaction after its own preconditions; recovery calls it from its own
+// re-reading transaction. It performs no precondition check of its own: the
+// caller passes only records whose state it may settle.
+func commitTerminalSettlement(tx Transaction, sessionID, operationID string, currentSession SessionRecord, currentOp OperationRecord, sregRevision, oregRevision int64, terminal OperationState, detail string, assistant *assistantEntry, usageModel model.ModelRef, usage *UsageCount) (OperationRecord, SessionRecord, []graphEntry, error) {
+	var newEntries []graphEntry
+
+	// The transaction's usage contribution rides the produced assistant
+	// entry, or the settlement entry when the terminal output reported
+	// usage without an eligible payload; the same totals land on the
+	// producer entry, the Operation, and the Session.
+	var contribution UsageTotals
+	switch {
+	case assistant != nil && assistant.Usage != nil:
+		contribution = UsageTotals{ByModel: []ModelUsage{{Model: assistant.Source, Usage: *assistant.Usage}}}
+	case usage != nil:
+		contribution = UsageTotals{ByModel: []ModelUsage{{Model: usageModel, Usage: *usage}}}
+	}
+	opUsage, err := addUsageTotals(currentOp.State.Usage, contribution)
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, nil, err
+	}
+	sessionUsage, err := addUsageTotals(currentSession.State.Usage, contribution)
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, nil, err
+	}
+
+	// The assistant entry consumes the effect's reserved identity; its
+	// completed calls become the durable tool-call intent.
+	var pending []PendingToolCall
+	if assistant != nil {
+		payload, err := encodeAssistantEntry(*assistant)
+		if err != nil {
+			return OperationRecord{}, SessionRecord{}, nil, err
+		}
+		adopted, err := insertAndAdopt(tx, sessionID, EntryDraft{
+			SessionID:   sessionID,
+			ID:          assistant.EntryID,
+			OperationID: operationID,
+			Kind:        EntryAssistant,
+			Payload:     payload,
+		})
+		if err != nil {
+			return OperationRecord{}, SessionRecord{}, nil, err
+		}
+		newEntries = append(newEntries, adopted)
+		for _, call := range assistant.ToolCalls {
+			pending = append(pending, PendingToolCall{
+				AssistantEntry: EntryRef{SessionID: sessionID, EntryID: assistant.EntryID},
+				CallID:         call.ID,
+				ResultEntryID:  call.ResultEntryID,
+			})
+		}
+	}
+
+	// One interrupted result under every remaining committed tool-result
+	// identity whose call will not execute.
+	remaining := append(append([]PendingToolCall{}, currentOp.State.PendingToolCalls...), pending...)
+	for _, call := range remaining {
+		result := toolResultEntry{
+			SessionID:      sessionID,
+			EntryID:        call.ResultEntryID,
+			OperationID:    operationID,
+			AssistantEntry: call.AssistantEntry,
+			ToolCallID:     call.CallID,
+			Status:         model.ResultInterrupted,
+			Content:        interruptedToolResultContent,
+		}
+		payload, err := encodeToolResultEntry(result)
+		if err != nil {
+			return OperationRecord{}, SessionRecord{}, nil, err
+		}
+		adopted, err := insertAndAdopt(tx, sessionID, EntryDraft{
+			SessionID:   sessionID,
+			ID:          result.EntryID,
+			OperationID: operationID,
+			Kind:        EntryToolResult,
+			Payload:     payload,
+		})
+		if err != nil {
+			return OperationRecord{}, SessionRecord{}, nil, err
+		}
+		newEntries = append(newEntries, adopted)
+	}
+
+	// The interruption terminal appends exactly one interruption signal.
+	if terminal == OperationInterruption {
+		entry, err := newSignalEntry(tx, sessionID, operationID, SignalInterruption)
+		if err != nil {
+			return OperationRecord{}, SessionRecord{}, nil, err
+		}
+		newEntries = append(newEntries, *entry)
+	}
+
+	// The settlement entry consumes the model effect's reserved identity
+	// when no assistant payload exists; every other settlement takes a fresh
+	// identity.
+	settlementID := ""
+	if assistant == nil && currentOp.State.ActiveEffect != nil && currentOp.State.ActiveEffect.Kind == EffectModel {
+		settlementID = currentOp.State.ActiveEffect.ResultEntryID
+	}
+	if settlementID == "" {
+		if settlementID, err = newHexID(); err != nil {
+			return OperationRecord{}, SessionRecord{}, nil, fmt.Errorf("%w: %v", ErrStorage, err)
+		}
+	}
+	settlement := operationSettlementEntry{
+		SessionID:   sessionID,
+		EntryID:     settlementID,
+		OperationID: operationID,
+		Status:      terminal,
+		Detail:      detail,
+	}
+	if assistant == nil && usage != nil { // terminal no-output model usage rides the settlement entry
+		modelRef := usageModel
+		settlement.Model = &modelRef
+		settlement.Usage = usage
+	}
+	payload, err := encodeOperationSettlementEntry(settlement)
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, nil, err
+	}
+	adopted, err := insertAndAdopt(tx, sessionID, EntryDraft{
+		SessionID:   sessionID,
+		ID:          settlement.EntryID,
+		OperationID: operationID,
+		Kind:        EntryOperationSettlement,
+		Payload:     payload,
+	})
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, nil, err
+	}
+	newEntries = append(newEntries, adopted)
+	settled := adopted.Envelope.CommittedAt
+
+	next := currentOp
+	next.State.ActiveEffect = nil
+	next.State.Usage = opUsage
+	next.State.Status = terminal
+	next.State.PendingToolCalls = []PendingToolCall{}
+	next.State.SettledAt = &settled
+	next.State.Terminal = &OperationTerminal{
+		SettlementEntry: EntryRef{SessionID: sessionID, EntryID: settlementID},
+		Detail:          detail,
+	}
+	opPayload, err := encodeOperationRegister(next)
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, nil, err
+	}
+	replaced, err := tx.ReplaceRegister(RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: operationID}, oregRevision, opPayload)
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, nil, err
+	}
+	next.Revision = replaced.Revision
+
+	sessionState := currentSession.State
+	sessionState.Usage = sessionUsage
+	sessionState.CurrentOperationID = ""
+	committedSess := SessionRecord{Identity: currentSession.Identity, State: sessionState}
+	sessionPayload, err := encodeSessionRegister(committedSess)
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, nil, err
+	}
+	replacedSession, err := tx.ReplaceRegister(RegisterKey{SessionID: sessionID, Kind: RegisterSession}, sregRevision, sessionPayload)
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, nil, err
+	}
+	committedSess.Revision = replacedSession.Revision
+	return next, committedSess, newEntries, nil
 }
 
 // insertAndAdopt inserts one entry draft and returns its codec-cloned view
