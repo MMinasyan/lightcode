@@ -193,6 +193,20 @@ func (g *sessionGraph) operationIndex() map[string]*OperationRecord {
 	return index
 }
 
+// replaceOperation updates the cached view record of exactly the addressed
+// Operation in place and reports whether the view carried it: one committed
+// state adoption replaces one slice record without allocating the full
+// validation index, which remains the validator's duplicate/reference map.
+func (g *sessionGraph) replaceOperation(operationID string, rec OperationRecord) bool {
+	for i := range g.Operations {
+		if g.Operations[i].Admission.OperationID == operationID {
+			g.Operations[i] = rec
+			return true
+		}
+	}
+	return false
+}
+
 func (v *graphValidation) corrupt(format string, args ...any) error {
 	return corruptSession(v.sessionID, format, args...)
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -2044,4 +2045,63 @@ func TestToolEffectIntentCancellationSettlesInterrupted(t *testing.T) {
 		t.Fatalf("operation state = %+v, want terminal interruption with the fixed detail", rec.State)
 	}
 	requireSessionCleared(t, h, sessionID)
+}
+
+// TestSessionGraphReplaceOperation pins the cached view's one-record state
+// adoption: replaceOperation updates exactly the addressed Operation among
+// several, leaves every sibling historical record untouched, is a no-op for
+// an identity the view does not carry, and never allocates — the full
+// operation index stays the graph validator's duplicate/reference map.
+func TestSessionGraphReplaceOperation(t *testing.T) {
+	record := func(id string, revision int64) OperationRecord {
+		return OperationRecord{
+			Admission: OperationAdmission{
+				SessionID:   testSessionID,
+				OperationID: id,
+				RequestKind: RequestKindMessage,
+				AgentType:   "coder",
+			},
+			State: OperationCurrentState{
+				Status:    OperationRunning,
+				StartedAt: testTime,
+				Usage:     UsageTotals{},
+			},
+			Revision: revision,
+		}
+	}
+
+	t.Run("replaces only the addressed record", func(t *testing.T) {
+		g := &sessionGraph{Operations: []OperationRecord{record("op-1", 1), record("op-2", 2), record("op-3", 3)}}
+		if !g.replaceOperation("op-2", record("op-2", 42)) {
+			t.Fatalf("replaceOperation of a carried identity = false, want true")
+		}
+		want := []OperationRecord{record("op-1", 1), record("op-2", 42), record("op-3", 3)}
+		if !reflect.DeepEqual(g.Operations, want) {
+			t.Fatalf("operations after replacement = %+v, want %+v", g.Operations, want)
+		}
+	})
+
+	t.Run("missing identity is a no-op", func(t *testing.T) {
+		g := &sessionGraph{Operations: []OperationRecord{record("op-1", 1), record("op-2", 2), record("op-3", 3)}}
+		if g.replaceOperation("op-ghost", record("op-ghost", 9)) {
+			t.Fatalf("replaceOperation of an absent identity = true, want false")
+		}
+		want := []OperationRecord{record("op-1", 1), record("op-2", 2), record("op-3", 3)}
+		if !reflect.DeepEqual(g.Operations, want) {
+			t.Fatalf("operations after a missing identity = %+v, want the untouched records %+v", g.Operations, want)
+		}
+	})
+
+	t.Run("replacement allocates nothing", func(t *testing.T) {
+		const count = 64
+		operations := make([]OperationRecord, count) // all 64 unique records are prepared outside the measured closure
+		for i := range operations {
+			operations[i] = record(fmt.Sprintf("op-%02d", i), int64(i))
+		}
+		g := &sessionGraph{Operations: operations}
+		updated := record("op-63", 999)
+		if n := testing.AllocsPerRun(100, func() { g.replaceOperation("op-63", updated) }); n != 0 {
+			t.Fatalf("one-record replacement over %d operations allocated %v times, want zero", count, n)
+		}
+	})
 }

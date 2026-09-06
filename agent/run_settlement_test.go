@@ -181,10 +181,10 @@ func TestDuplicateCallIDSharedValidator(t *testing.T) {
 	dup := mkOutput(model.OutputCompleted, "", []model.ToolCall{{ID: "a", Name: "fnA"}, {ID: "a", Name: "fnB"}})
 	distinct := mkCallsTerminalOutput()
 
-	if err := validateSettlement(ModelSettlement{Disposition: DispoReady, Output: dup}, testRef); !isBoundaryViolation(err, "model") {
+	if _, err := validateSettlement(ModelSettlement{Disposition: DispoReady, Output: dup}, testRef); !isBoundaryViolation(err, "model") {
 		t.Fatalf("settlement validator on duplicate IDs = %v, want a model-boundary violation", err)
 	}
-	if err := validateSettlement(ModelSettlement{Disposition: DispoReady, Output: distinct}, testRef); err != nil {
+	if _, err := validateSettlement(ModelSettlement{Disposition: DispoReady, Output: distinct}, testRef); err != nil {
 		t.Fatalf("settlement validator on distinct IDs = %v, want acceptance", err)
 	}
 

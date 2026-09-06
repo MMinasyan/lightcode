@@ -443,6 +443,60 @@ func TestRegisterPayloadRoundTrip(t *testing.T) {
 	}
 }
 
+// TestOperationStateEncodingShape pins the state section's encoding shape
+// directly: an absent pending array encodes as the required non-null empty
+// array, optional records encode by omission, and a model active effect never
+// carries the tool-effect-only tool_call_id key.
+func TestOperationStateEncodingShape(t *testing.T) {
+	v := validOperationRecord()
+	v.State.PendingToolCalls = nil // nil is a valid decoded shape for a quiet running Operation
+	raw, err := encodeOperationRegister(v)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if strings.Contains(string(raw), `"pending_tool_calls":null`) {
+		t.Fatalf("pending_tool_calls encoded as null: %s", raw)
+	}
+	obj := wireObject(t, raw)
+	stateObj, err := objectMember(obj, "state", true)
+	if err != nil {
+		t.Fatalf("state member: %v", err)
+	}
+	pending, err := arrayMember(stateObj, "pending_tool_calls", true)
+	if err != nil {
+		t.Fatalf("pending_tool_calls: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending_tool_calls = %v, want the empty array", pending)
+	}
+	for _, optional := range []string{"settled_at", "active_effect", "terminal"} {
+		if _, present := stateObj[optional]; present {
+			t.Fatalf("running state carries optional member %q", optional)
+		}
+	}
+	if _, err := decodeOperationRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: raw}); err != nil {
+		t.Fatalf("nil-pending state does not round-trip: %v", err)
+	}
+
+	effect := validOperationRecord()
+	effect.State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3)} // model effect: no tool call id
+	raw, err = encodeOperationRegister(effect)
+	if err != nil {
+		t.Fatalf("encode model effect: %v", err)
+	}
+	stateObj, err = objectMember(wireObject(t, raw), "state", true)
+	if err != nil {
+		t.Fatalf("state member: %v", err)
+	}
+	effectObj, err := objectMember(stateObj, "active_effect", true)
+	if err != nil {
+		t.Fatalf("active_effect: %v", err)
+	}
+	if _, present := effectObj["tool_call_id"]; present {
+		t.Fatalf("model active effect carries tool_call_id: %s", raw)
+	}
+}
+
 // TestRegisterPayloadRejectsInvalidWire proves the register payloads enforce
 // exact keys, containers, and envelope-key identity agreement.
 func TestRegisterPayloadRejectsInvalidWire(t *testing.T) {
@@ -887,14 +941,6 @@ func TestCodecRejectsInvalidValues(t *testing.T) {
 			v := validSettlementEntry()
 			v.Status = OperationFailure
 			_, err := encodeOperationSettlementEntry(v)
-			return err
-		}},
-		{"hook_result has no payload", func() error {
-			_, err := encodeUnsupportedEntry(EntryHookResult)
-			return err
-		}},
-		{"compaction has no payload", func() error {
-			_, err := encodeUnsupportedEntry(EntryCompaction)
 			return err
 		}},
 	}

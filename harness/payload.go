@@ -71,18 +71,6 @@ func decodeEntryRef(obj map[string]json.RawMessage) (EntryRef, error) {
 	return ref, nil
 }
 
-// encodeOperationRef renders one operation reference with exact keys and
-// durable identity shapes.
-func encodeOperationRef(ref operationRef) (json.RawMessage, error) {
-	if err := validateHexID(ref.SessionID, "operation reference session id"); err != nil {
-		return nil, invalidInput("%v", err)
-	}
-	if err := validateOperationIdentity(ref.OperationID, "operation reference operation id"); err != nil {
-		return nil, invalidInput("%v", err)
-	}
-	return json.Marshal(ref)
-}
-
 // decodeOperationRef reads one operation reference with exact keys.
 func decodeOperationRef(obj map[string]json.RawMessage) (operationRef, error) {
 	if err := rejectUnknownMembers(obj, "session_id", "operation_id"); err != nil {
@@ -248,39 +236,15 @@ func validateInputEntry(v inputEntry) error {
 	return nil
 }
 
-// encodeToolCallRecord renders one assistant tool-call record. Raw arguments
-// persist as the base64 standard-alphabet string so malformed JSON and
-// arbitrary bytes round-trip exactly.
+// encodeToolCallRecord renders one assistant tool-call record directly from
+// the validated tagged value. Raw arguments persist as the base64
+// standard-alphabet string so malformed JSON and arbitrary bytes round-trip
+// exactly; optional members omit when empty.
 func encodeToolCallRecord(c toolCallRecord) (json.RawMessage, error) {
 	if err := validateToolCallRecord(c); err != nil {
 		return nil, invalidInput("tool call: %v", err)
 	}
-	obj := map[string]json.RawMessage{}
-	var err error
-	if obj["id"], err = json.Marshal(c.ID); err != nil {
-		return nil, err
-	}
-	if obj["ordinal"], err = json.Marshal(c.Ordinal); err != nil {
-		return nil, err
-	}
-	if obj["name"], err = json.Marshal(c.Name); err != nil {
-		return nil, err
-	}
-	if obj["arguments_base64"], err = json.Marshal(c.ArgumentsBase64); err != nil {
-		return nil, err
-	}
-	if len(c.Extra) > 0 {
-		if obj["extra"], err = marshalExtra(c.Extra); err != nil {
-			return nil, err
-		}
-	}
-	if len(c.NormalizedArguments) > 0 {
-		obj["normalized_arguments"] = model.CloneRaw(c.NormalizedArguments)
-	}
-	if obj["result_entry_id"], err = json.Marshal(c.ResultEntryID); err != nil {
-		return nil, err
-	}
-	return json.Marshal(obj)
+	return json.Marshal(c)
 }
 
 // decodeToolCallRecord reads one assistant tool-call record with exact keys.
@@ -710,34 +674,14 @@ func validateToolResultEntry(v toolResultEntry) error {
 	return nil
 }
 
-// encodeSignalEntry renders one signal entry payload.
+// encodeSignalEntry renders one signal entry payload directly from the
+// validated tagged value; its related-operation identity was validated as
+// part of that value.
 func encodeSignalEntry(v signalEntry) (json.RawMessage, error) {
 	if err := validateSignalEntry(v); err != nil {
 		return nil, invalidInput("signal entry: %v", err)
 	}
-	related, err := encodeOperationRef(v.RelatedOperation)
-	if err != nil {
-		return nil, err
-	}
-	wire, err := json.Marshal(struct {
-		SessionID        string          `json:"session_id"`
-		EntryID          string          `json:"entry_id"`
-		OperationID      string          `json:"operation_id,omitempty"`
-		Signal           string          `json:"signal"`
-		RelatedOperation json.RawMessage `json:"related_operation"`
-		Content          string          `json:"content"`
-	}{
-		SessionID:        v.SessionID,
-		EntryID:          v.EntryID,
-		OperationID:      v.OperationID,
-		Signal:           string(v.Signal),
-		RelatedOperation: related,
-		Content:          v.Content,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return wire, nil
+	return json.Marshal(v)
 }
 
 // decodeSignalEntry reads one signal entry payload and enforces its agreement
@@ -981,14 +925,6 @@ func validateOperationSettlementEntry(v operationSettlementEntry) error {
 		return errors.New("settlement model is present exactly when the settlement carries usage")
 	}
 	return nil
-}
-
-// encodeUnsupportedEntry rejects persistence of the landed envelope kinds
-// that have no valid Phase 3 payload or producer: rejecting before persistence
-// uses the invalid-input class, while a stored record of these kinds surfaces
-// as corruption through the graph validator.
-func encodeUnsupportedEntry(kind EntryKind) (json.RawMessage, error) {
-	return nil, invalidInput("entry kind %q has no durable payload in this phase", kind)
 }
 
 // encodeUsageCountWire renders one usage count with all three signed counts
@@ -1692,76 +1628,35 @@ func encodeOperationState(v OperationCurrentState) (json.RawMessage, error) {
 		}
 		settledAt = &stamped
 	}
-	var activeEffect *activeEffectWire
-	if v.ActiveEffect != nil {
-		activeEffect = &activeEffectWire{
-			Kind:          string(v.ActiveEffect.Kind),
-			ResultEntryID: v.ActiveEffect.ResultEntryID,
-			ToolCallID:    v.ActiveEffect.ToolCallID,
-		}
-	}
-	pending := make([]pendingToolCallWire, 0, len(v.PendingToolCalls))
-	for _, call := range v.PendingToolCalls {
-		pending = append(pending, pendingToolCallWire{
-			AssistantEntry: entryRefWire{SessionID: call.AssistantEntry.SessionID, EntryID: call.AssistantEntry.EntryID},
-			CallID:         call.CallID,
-			ResultEntryID:  call.ResultEntryID,
-		})
-	}
 	usage, err := encodeUsageTotalsWire(v.Usage)
 	if err != nil {
 		return nil, err
 	}
-	var terminal *operationTerminalWire
-	if v.Terminal != nil {
-		terminal = &operationTerminalWire{
-			SettlementEntry: entryRefWire{SessionID: v.Terminal.SettlementEntry.SessionID, EntryID: v.Terminal.SettlementEntry.EntryID},
-			Detail:          v.Terminal.Detail,
-		}
+	pending := v.PendingToolCalls
+	if pending == nil { // required non-null array: absence encodes as the empty array
+		pending = []PendingToolCall{}
 	}
 	wire, err := json.Marshal(struct {
-		Status           string                 `json:"status"`
-		StartedAt        string                 `json:"started_at"`
-		SettledAt        *string                `json:"settled_at,omitempty"`
-		ActiveEffect     *activeEffectWire      `json:"active_effect,omitempty"`
-		PendingToolCalls []pendingToolCallWire  `json:"pending_tool_calls"`
-		Usage            json.RawMessage        `json:"usage"`
-		Terminal         *operationTerminalWire `json:"terminal,omitempty"`
+		Status           string             `json:"status"`
+		StartedAt        string             `json:"started_at"`
+		SettledAt        *string            `json:"settled_at,omitempty"`
+		ActiveEffect     *ActiveEffect      `json:"active_effect,omitempty"`
+		PendingToolCalls []PendingToolCall  `json:"pending_tool_calls"`
+		Usage            json.RawMessage    `json:"usage"`
+		Terminal         *OperationTerminal `json:"terminal,omitempty"`
 	}{
 		Status:           string(v.Status),
 		StartedAt:        startedAt,
 		SettledAt:        settledAt,
-		ActiveEffect:     activeEffect,
+		ActiveEffect:     v.ActiveEffect,
 		PendingToolCalls: pending,
 		Usage:            usage,
-		Terminal:         terminal,
+		Terminal:         v.Terminal,
 	})
 	if err != nil {
 		return nil, err
 	}
 	return wire, nil
-}
-
-type entryRefWire struct {
-	SessionID string `json:"session_id"`
-	EntryID   string `json:"entry_id"`
-}
-
-type activeEffectWire struct {
-	Kind          string `json:"kind"`
-	ResultEntryID string `json:"result_entry_id"`
-	ToolCallID    string `json:"tool_call_id,omitempty"`
-}
-
-type pendingToolCallWire struct {
-	AssistantEntry entryRefWire `json:"assistant_entry"`
-	CallID         string       `json:"call_id"`
-	ResultEntryID  string       `json:"result_entry_id"`
-}
-
-type operationTerminalWire struct {
-	SettlementEntry entryRefWire `json:"settlement_entry"`
-	Detail          string       `json:"detail,omitempty"`
 }
 
 // decodeOperationState reads the state section with exact keys.

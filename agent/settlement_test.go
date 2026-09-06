@@ -91,7 +91,7 @@ func TestValidateSettlement(t *testing.T) { // nothing more to do on this very f
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) { // spawn one isolated subtest per settlement shape so a single bad behavior doesn't mask sibling rows' own independent pass/fail outcomes anywhere downstream of this nested closure's opening brace below it further ahead now.
-			err := validateSettlement(tc.set, testRef)
+			_, err := validateSettlement(tc.set, testRef)
 			if tc.wantErr { // only the negative rows in THIS specific table expect a typed boundary-protocol violation below it further ahead now (the positive rows' nil-return contract is asserted through its own dedicated branch immediately after this if-block ends here respectively left-to-right as they appear within that else-statement's body over there).
 				requireBoundaryViolation(t, err, "model")
 			} else if err != nil { // positive rows must return NIL — any non-nil value here indicates either broken validation logic somewhere upstream inside validateSettlement itself OR an invalid fixture shape constructed by the helpers above these lines now rather than legitimately arising from anything within THIS specific row's own settlement data alone anywhere downstream along this trajectory forward.
@@ -162,6 +162,95 @@ func TestValidateModelSettlement(t *testing.T) {
 			t.Fatalf("got %#v, %v; want the settlement copied with nil output retained", got, err)
 		}
 	})
+
+	t.Run("owned-copy-nested-fields", func(t *testing.T) {
+		in := mkNestedSettlementOutput()
+		got, err := ValidateModelSettlement(testRef, ModelSettlement{Disposition: DispoReady, Output: in})
+		if err != nil {
+			t.Fatalf("valid settlement rejected: %v", err)
+		}
+
+		// Input-side mutations after validation never reach the owned copy:
+		// nested tool-call argument bytes, every Extra map, and usage.
+		in.Message.ToolCalls[0].Arguments[0] = 'z'
+		in.Message.ToolCalls[0].Extra["c"] = json.RawMessage(`"in"`)
+		in.Message.Content[0].Extra["p"] = json.RawMessage(`"in"`)
+		in.Message.Extra["m"] = json.RawMessage(`"in"`)
+		in.Usage.InputTokens = 99
+		if string(got.Output.Message.ToolCalls[0].Arguments) != `{"x":1}` {
+			t.Fatalf("owned copy aliased the input arguments: %q", got.Output.Message.ToolCalls[0].Arguments)
+		}
+		if string(got.Output.Message.ToolCalls[0].Extra["c"]) != `3` ||
+			string(got.Output.Message.Content[0].Extra["p"]) != `1` ||
+			string(got.Output.Message.Extra["m"]) != `2` {
+			t.Fatalf("owned copy aliased an input Extra map: call=%s part=%s message=%s",
+				got.Output.Message.ToolCalls[0].Extra["c"], got.Output.Message.Content[0].Extra["p"], got.Output.Message.Extra["m"])
+		}
+		if got.Output.Usage.InputTokens != 3 {
+			t.Fatalf("owned copy aliased the input usage: %+v", got.Output.Usage)
+		}
+
+		// Owned-side mutations never reach the input either: the input keeps
+		// exactly its own post-mutation values from the block above.
+		got.Output.Message.ToolCalls[0].Arguments[1] = 'z'
+		got.Output.Message.ToolCalls[0].Extra["c"] = json.RawMessage(`"owned"`)
+		got.Output.Message.Content[0].Extra["p"] = json.RawMessage(`"owned"`)
+		got.Output.Message.Extra["m"] = json.RawMessage(`"owned"`)
+		got.Output.Usage.InputTokens = 1
+		if string(in.Message.ToolCalls[0].Arguments) != `z"x":1}` {
+			t.Fatalf("input arguments aliased the owned copy: %q", in.Message.ToolCalls[0].Arguments)
+		}
+		if string(in.Message.ToolCalls[0].Extra["c"]) != `"in"` ||
+			string(in.Message.Content[0].Extra["p"]) != `"in"` ||
+			string(in.Message.Extra["m"]) != `"in"` {
+			t.Fatalf("input Extra maps aliased the owned copy: call=%s part=%s message=%s",
+				in.Message.ToolCalls[0].Extra["c"], in.Message.Content[0].Extra["p"], in.Message.Extra["m"])
+		}
+		if in.Usage.InputTokens != 99 {
+			t.Fatalf("input usage aliased the owned copy: %+v", in.Usage)
+		}
+	})
+
+	t.Run("one-copy-per-validation", func(t *testing.T) {
+		set := ModelSettlement{Disposition: DispoReady, Output: mkNestedSettlementOutput()}
+		two := testing.AllocsPerRun(200, func() { // the removed two-copy shape: validate (one internal copy, discarded) plus a second full copy
+			_, _ = validateSettlement(set, testRef)
+			_, _ = model.NewOutput(*set.Output)
+		})
+		one := testing.AllocsPerRun(200, func() {
+			_, _ = ValidateModelSettlement(testRef, set)
+		})
+		if one >= two {
+			t.Fatalf("public validator allocated %v times, not fewer than the removed two-copy shape's %v", one, two)
+		}
+	})
+}
+
+// mkNestedSettlementOutput builds one valid completed output carrying every
+// nested reference type the owned copy must isolate: tool-call argument bytes,
+// tool-call and content-part and message Extra maps, and a usage pointer.
+func mkNestedSettlementOutput() *model.Output {
+	out, err := model.NewOutput(model.Output{
+		Status: model.OutputCompleted,
+		Source: testRef,
+		Usage:  &model.Usage{InputTokens: 3, OutputTokens: 5},
+		Message: &model.Message{
+			Role:    model.RoleAssistant,
+			Source:  testRef,
+			Content: []model.ContentPart{{Kind: model.PartText, Text: "x", Extra: model.Extra{"p": json.RawMessage(`1`)}}},
+			Extra:   model.Extra{"m": json.RawMessage(`2`)},
+			ToolCalls: []model.ToolCall{{
+				ID:        "a",
+				Name:      "fnA",
+				Arguments: []byte(`{"x":1}`),
+				Extra:     model.Extra{"c": json.RawMessage(`3`)},
+			}},
+		},
+	})
+	if err != nil {
+		panic(fmt.Sprintf("test fixture failed model-output validation: %v", err))
+	}
+	return &out
 }
 
 // TestValidateToolResult pins the closed tool-result settlement contract at its trust boundary: valid shapes answering exactly their own call pass, while every malformed shape returns one typed boundary-protocol error naming the "tool" boundary.

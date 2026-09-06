@@ -260,9 +260,7 @@ func (h *Harness) beginModelEffect(ctx context.Context, c *coordinator, operatio
 		}
 		return modelEffectIntent{}, err
 	}
-	if ptr, ok := c.graph.operationIndex()[operationID]; ok { // the index's pointers alias the view's slice
-		*ptr = updated
-	}
+	c.graph.replaceOperation(operationID, updated)
 	c.mu.Unlock()
 	return modelEffectIntent{
 		sessionID: op.Admission.SessionID,
@@ -447,9 +445,7 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 		return OperationRecord{}, err
 	}
 	c.graph.Entries = append(c.graph.Entries, newEntries...)
-	if ptr, ok := c.graph.operationIndex()[operationID]; ok { // the index's pointers alias the view's slice
-		*ptr = committedOp
-	}
+	c.graph.replaceOperation(operationID, committedOp)
 	c.graph.Session = committedSess
 	c.mu.Unlock()
 	return committedOp, nil
@@ -899,9 +895,7 @@ func (h *Harness) beginToolEffect(ctx context.Context, c *coordinator, operation
 		}
 		return "", err
 	}
-	if ptr, ok := c.graph.operationIndex()[operationID]; ok { // the index's pointers alias the view's slice
-		*ptr = updated
-	}
+	c.graph.replaceOperation(operationID, updated)
 	c.mu.Unlock()
 	return resultID, nil
 }
@@ -1035,9 +1029,7 @@ func (h *Harness) commitToolResult(ctx context.Context, c *coordinator, operatio
 		return model.ToolResult{}, err
 	}
 	c.graph.Entries = append(c.graph.Entries, newEntries...)
-	if ptr, ok := c.graph.operationIndex()[operationID]; ok { // the index's pointers alias the view's slice
-		*ptr = updated
-	}
+	c.graph.replaceOperation(operationID, updated)
 	c.graph.Session = committedSess
 	c.mu.Unlock()
 	return result, nil
