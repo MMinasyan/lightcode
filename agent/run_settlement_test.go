@@ -20,7 +20,6 @@ func TestRunForgedModelSettlementsRejected(t *testing.T) {
 	}{
 		{"ready-nil-output", ModelSettlement{Disposition: DispoReady}},
 		{"ready-errored-output", ModelSettlement{Disposition: DispoReady, Output: errored}},
-		{"continue-completed-output", ModelSettlement{Disposition: DispoContinue, Output: completed}},
 		{"continue-nil-output", ModelSettlement{Disposition: DispoContinue}},
 		{"failure-completed-output", ModelSettlement{Disposition: DispoFailure, Output: completed, Detail: "d"}},
 		{"failure-empty-detail", ModelSettlement{Disposition: DispoFailure}},
@@ -42,6 +41,23 @@ func TestRunForgedModelSettlementsRejected(t *testing.T) {
 				t.Fatalf("model=%d tool=%d, want the run to stop at the forged settlement", f.modelCalls, f.toolCalls)
 			}
 		})
+	}
+}
+
+// TestRunContinueCompletedOutputContinues pins the newly permitted continuation row: a completed output carrying no tool calls settles as continue and the loop proceeds to the next model effect from a fresh snapshot.
+func TestRunContinueCompletedOutputContinues(t *testing.T) {
+	f := &runFakes{}
+	f.modelSet = setScript(
+		ModelSettlement{Disposition: DispoContinue, Output: mkOutput(model.OutputCompleted, "", nil)},
+		ModelSettlement{Disposition: DispoReady, Output: mkOutput(model.OutputCompleted, "", nil)},
+	)
+
+	res, err := Run(context.Background(), f.invocation())
+	if err != nil || res.Status != TerminalSuccess {
+		t.Fatalf("run = %#v, %v; want success after completed continuation", res, err)
+	}
+	if f.modelCalls != 2 || f.sourceCalls != 2 || f.toolCalls != 0 {
+		t.Fatalf("model=%d source=%d tool=%d, want the continuation to fetch a fresh snapshot", f.modelCalls, f.sourceCalls, f.toolCalls)
 	}
 }
 
@@ -165,10 +181,10 @@ func TestDuplicateCallIDSharedValidator(t *testing.T) {
 	dup := mkOutput(model.OutputCompleted, "", []model.ToolCall{{ID: "a", Name: "fnA"}, {ID: "a", Name: "fnB"}})
 	distinct := mkCallsTerminalOutput()
 
-	if err := validateSettlement(ModelSettlement{Disposition: DispoReady, Output: dup}, testRef); !isBoundaryViolation(err, "model") {
+	if _, err := validateSettlement(ModelSettlement{Disposition: DispoReady, Output: dup}, testRef); !isBoundaryViolation(err, "model") {
 		t.Fatalf("settlement validator on duplicate IDs = %v, want a model-boundary violation", err)
 	}
-	if err := validateSettlement(ModelSettlement{Disposition: DispoReady, Output: distinct}, testRef); err != nil {
+	if _, err := validateSettlement(ModelSettlement{Disposition: DispoReady, Output: distinct}, testRef); err != nil {
 		t.Fatalf("settlement validator on distinct IDs = %v, want acceptance", err)
 	}
 

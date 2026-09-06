@@ -71,7 +71,7 @@ func Run(ctx context.Context, inv Invocation) (TerminalResult, error) {
 		if err := cb.settlementFailure(set.Output); err != nil { // the callback discipline behind the settlement gates it before anything else: an ignored protocol or invalid-call failure cannot settle.
 			return TerminalResult{}, err
 		}
-		if err := validateSettlement(set, inv.ExpectedModel); err != nil {
+		if _, err := ValidateModelSettlement(inv.ExpectedModel, set); err != nil { // the exported validator; Run discards the owned copy and keeps its original settlement and output pointer.
 			return TerminalResult{}, err
 		}
 
@@ -85,7 +85,7 @@ func Run(ctx context.Context, inv Invocation) (TerminalResult, error) {
 			}
 			return interruptionTerminal(set.Detail, set.Output, unstarted)
 		case DispoContinue:
-			lastSettled = set.Output // an errored output can never ride an interruption terminal, so a later checkpoint simply carries nothing.
+			lastSettled = set.Output // the latest settled output rides later checkpoints; an errored one can never appear on an interruption terminal, so a checkpoint before any completed settlement simply carries nothing.
 			continue
 		}
 

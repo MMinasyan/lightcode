@@ -20,7 +20,7 @@ const publicModule = "github.com/MMinasyan/lightcode"
 // the SQLite driver is confined to internal/storage.
 const sqliteDriverPkg = "github.com/mattn/go-sqlite3"
 
-// TestPublicFoundationDependencyIsolation enforces the pre-cutover dependency baseline over the authoritative complete set of Git-tracked non-test Go files: the model package imports only the standard library; the agent package imports only the standard library and the public model package; the harness package is direct-test-only and imports only the standard library; internal/storage is direct-test-only, imports only the standard library plus the public harness contract plus the SQLite driver it implements the contract with, and stays one package without backend subpackages; every other tracked production file imports none of these packages and not the SQLite driver, whatever its directory name is. Test files are exempt in every directory — external-package test files are exactly where direct and composition tests of the new packages live — and untracked or ignored files never gate the guard. When a later phase adds a new target package that must consume model, agent, or harness, it extends the allowlist for its own package only; existing root and internal/ production packages stay forbidden until their owning cutover or deletion phase.
+// TestPublicFoundationDependencyIsolation enforces the pre-cutover dependency baseline over the authoritative complete set of Git-tracked non-test Go files: the model package imports only the standard library; the agent package imports only the standard library and the public model package; the harness package is direct-test-only and imports only the standard library plus the public model and agent packages; internal/storage is direct-test-only, imports only the standard library plus the public harness contract plus the SQLite driver it implements the contract with, and stays one package without backend subpackages; every other tracked production file imports none of these packages and not the SQLite driver, whatever its directory name is. Test files are exempt in every directory — external-package test files are exactly where direct and composition tests of the new packages live — and untracked or ignored files never gate the guard. When a later phase adds a new target package that must consume model, agent, or harness, it extends the allowlist for its own package only; existing root and internal/ production packages stay forbidden until their owning cutover or deletion phase.
 func TestPublicFoundationDependencyIsolation(t *testing.T) {
 	root := moduleRoot(t)
 	std := standardLibraryImports(t)
@@ -75,8 +75,8 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				problems = append(problems, rel+": agent package imports "+imp+"; agent may import only the standard library and "+modelPkg)
 			}
 		case "harness":
-			if !std[imp] {
-				problems = append(problems, rel+": harness package imports "+imp+"; harness may import only the standard library")
+			if imp != modelPkg && imp != agentPkg && !std[imp] {
+				problems = append(problems, rel+": harness package imports "+imp+"; harness may import only the standard library, "+modelPkg+", and "+agentPkg)
 			}
 		case "internal/storage":
 			if imp != harnessPkg && imp != sqliteDriverPkg && !std[imp] {
@@ -91,7 +91,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 	return problems
 }
 
-// TestDependencyRulesRejectNonStdlibDotlessImports proves the allowlists use authoritative standard-library membership, not a dot-in-path shape: the cgo pseudo-import "C" and a dotless path outside the stdlib set fail every package row, while ordinary stdlib imports, the model dependency on agent's side, and internal/storage's dependency on harness still pass.
+// TestDependencyRulesRejectNonStdlibDotlessImports proves the allowlists use authoritative standard-library membership, not a dot-in-path shape: the cgo pseudo-import "C" and a dotless path outside the stdlib set fail every package row, while ordinary stdlib imports, the model dependency on agent's side, and internal/storage's dependency on harness still pass. The foundation's own reverse and skipping edges — model or agent reaching harness, any target package reaching internal/storage, and the driver reaching a target package — are each rejected exactly once.
 func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	std := standardLibraryImports(t)
 	for _, rel := range []string{"model/x.go", "agent/x.go", "harness/x.go", "internal/storage/x.go"} {
@@ -110,6 +110,12 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	if problems := checkTrackedGoFile("harness/x.go", []string{"fmt", "encoding/json"}, std); len(problems) != 0 {
 		t.Errorf("stdlib imports flagged in harness: %v", problems)
 	}
+	if problems := checkTrackedGoFile("harness/x.go", []string{"fmt", publicModule + "/model"}, std); len(problems) != 0 {
+		t.Errorf("allowed harness imports flagged: %v", problems)
+	}
+	if problems := checkTrackedGoFile("harness/x.go", []string{"fmt", publicModule + "/agent"}, std); len(problems) != 0 {
+		t.Errorf("allowed harness-agent imports flagged: %v", problems)
+	}
 	if problems := checkTrackedGoFile("internal/storage/x.go", []string{"fmt", "context", publicModule + "/harness", sqliteDriverPkg}, std); len(problems) != 0 {
 		t.Errorf("allowed internal/storage imports flagged: %v", problems)
 	}
@@ -121,6 +127,21 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	for _, imp := range []string{publicModule + "/model", publicModule + "/agent"} {
 		if problems := checkTrackedGoFile("internal/storage/x.go", []string{imp}, std); len(problems) != 1 {
 			t.Errorf("internal/storage importing %q: %d problems, want 1: %v", imp, len(problems), problems)
+		}
+	}
+	// The final foundation graph is model <- agent <- harness with
+	// internal/storage beneath harness only: every reverse or skipping edge
+	// between the foundation packages is rejected.
+	for _, row := range []struct{ rel, imp string }{
+		{"model/x.go", publicModule + "/agent"},
+		{"model/x.go", publicModule + "/harness"},
+		{"model/x.go", publicModule + "/internal/storage"},
+		{"agent/x.go", publicModule + "/harness"},
+		{"agent/x.go", publicModule + "/internal/storage"},
+		{"harness/x.go", publicModule + "/internal/storage"},
+	} {
+		if problems := checkTrackedGoFile(row.rel, []string{row.imp}, std); len(problems) != 1 {
+			t.Errorf("%s importing %q: %d problems, want 1: %v", row.rel, row.imp, len(problems), problems)
 		}
 	}
 }

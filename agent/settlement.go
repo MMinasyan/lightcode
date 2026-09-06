@@ -6,59 +6,98 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// validateSettlement checks one settlement returned by a model effect against the closed disposition table and the invocation's expected identity: ready is exactly its completed callback output with empty detail; continue exactly its errored output with empty detail (the caller has already settled any continuation facts); failure non-empty detail plus no accepted stream or that same errored output — a completed output never settles as failure; interruption non-empty detail plus one of three states, nothing before acceptance, the interrupted callback output while generation was in flight over it, or a retained completed output when cancellation followed successful completion. A present output must itself satisfy every ordinary model-output invariant and carry exactly the expected source identity field-for-field (String() rendering is lossy on first-slash splits, so both fields are compared separately) and its completed tool calls must carry pairwise-unique IDs. Every violation returns one typed boundary-protocol error naming the "model" boundary; nothing here coerces a malformed settlement into another shape.
-func validateSettlement(set ModelSettlement, expected model.ModelRef) error {
+// validateSettlement is the shared settlement validator: it checks one settlement returned by a model effect against the closed disposition table and the invocation's expected identity and returns its first owned validated settlement. Ready is exactly its completed callback output with empty detail; continue is its errored output that retains an assistant payload or its completed output carrying no tool calls, with empty detail (the caller has already settled any continuation facts); failure non-empty detail plus no accepted stream or that same errored output — a completed output never settles as failure; interruption non-empty detail plus one of three states, nothing before acceptance, the interrupted callback output while generation was in flight over it, or a retained completed output when cancellation followed successful completion. A present output must itself satisfy every ordinary model-output invariant and carry exactly the expected source identity field-for-field (String() rendering is lossy on first-slash splits, so both fields are compared separately) and its completed tool calls must carry pairwise-unique IDs. The owned copy's output is the validated deep copy from the public model constructor built exactly once here; disposition and detail are plain value copies. Every violation returns one typed boundary-protocol error naming the "model" boundary; nothing here coerces a malformed settlement into another shape.
+func validateSettlement(set ModelSettlement, expected model.ModelRef) (ModelSettlement, error) {
 	switch set.Disposition {
 	case DispoReady: // completed callback output only; empty detail checked below.
 		if err := requireDispositionOutput("ready", set.Output, model.OutputCompleted); err != nil {
-			return err
+			return ModelSettlement{}, err
 		}
-	case DispoContinue: // errored callback output only; empty detail checked below.
-		if err := requireDispositionOutput("continue", set.Output, model.OutputErrored); err != nil {
-			return err
+	case DispoContinue: // errored output retaining an assistant payload, or a completed one carrying no tool calls; empty detail checked below.
+		if set.Output == nil {
+			return ModelSettlement{}, newBoundaryViolation("model", "continue disposition requires its callback output, got none")
+		}
+		switch set.Output.Status {
+		case model.OutputErrored:
+			if !hasAssistantPayload(set.Output.Message) {
+				return ModelSettlement{}, newBoundaryViolation("model", "continue disposition requires an errored output retaining an assistant payload (content part, refusal, or finalized extra)")
+			}
+		case model.OutputCompleted:
+			if set.Output.Message != nil && len(set.Output.Message.ToolCalls) > 0 {
+				return ModelSettlement{}, newBoundaryViolation("model", "continue disposition requires a completed output with no tool calls")
+			}
+		default:
+			return ModelSettlement{}, newBoundaryViolation("model", fmt.Sprintf("continue disposition requires an errored or completed callback output, got %s", string(set.Output.Status)))
 		}
 	case DispoFailure:
 		if set.Detail == "" { // failure always carries diagnostic text.
-			return newBoundaryViolation("model", "failure disposition requires non-empty detail")
+			return ModelSettlement{}, newBoundaryViolation("model", "failure disposition requires non-empty detail")
 		}
 		if set.Output != nil && set.Output.Status != model.OutputErrored { // no output or the errored callback output; completed and interrupted are both invalid here.
-			return newBoundaryViolation("model", fmt.Sprintf("failure disposition requires no output or an errored one, got %s", string(set.Output.Status)))
+			return ModelSettlement{}, newBoundaryViolation("model", fmt.Sprintf("failure disposition requires no output or an errored one, got %s", string(set.Output.Status)))
 		}
 	case DispoInterruption:
 		if set.Detail == "" { // interruption always carries diagnostic text.
-			return newBoundaryViolation("model", "interruption disposition requires non-empty detail")
+			return ModelSettlement{}, newBoundaryViolation("model", "interruption disposition requires non-empty detail")
 		}
 		switch { // three payload states are valid; errored never rides an interruption (that shape belongs to the continue and failure rows only).
 		case set.Output == nil: // nothing was accepted before cancellation.
 		case set.Output.Status != model.OutputInterrupted && set.Output.Status != model.OutputCompleted:
-			return newBoundaryViolation("model", fmt.Sprintf("interruption disposition requires no output, an interrupted one, or a completed one retained after successful completion, got %s", string(set.Output.Status)))
+			return ModelSettlement{}, newBoundaryViolation("model", fmt.Sprintf("interruption disposition requires no output, an interrupted one, or a completed one retained after successful completion, got %s", string(set.Output.Status)))
 		}
 	default: // unknown or empty dispositions fail before any other field is consulted.
-		return newBoundaryViolation("model", fmt.Sprintf("unknown disposition %q (closed set: ready, continue, failure, interruption)", string(set.Disposition)))
+		return ModelSettlement{}, newBoundaryViolation("model", fmt.Sprintf("unknown disposition %q (closed set: ready, continue, failure, interruption)", string(set.Disposition)))
 	}
 
 	if (set.Disposition == DispoReady || set.Disposition == DispoContinue) && set.Detail != "" { // the two empty-detail rows; non-emptiness was already enforced above for the other two.
-		return newBoundaryViolation("model", fmt.Sprintf("%s disposition requires an empty detail", string(set.Disposition)))
+		return ModelSettlement{}, newBoundaryViolation("model", fmt.Sprintf("%s disposition requires an empty detail", string(set.Disposition)))
 	}
 
 	if set.Output == nil { // no output to validate on this row.
-		return nil
+		return set, nil // disposition and detail are plain value copies.
 	}
 
 	out := *set.Output                                                                  // local copy so field reads below never alias the caller's pointer during validation.
 	if out.Source.Provider != expected.Provider || out.Source.Model != expected.Model { // field-based identity check (String() rendering is lossy); a partial or zero source cannot match either way.
-		return newBoundaryViolation("model", fmt.Sprintf("settlement output source %q does not equal invocation expected model identity %q", out.Source.String(), expected.String()))
+		return ModelSettlement{}, newBoundaryViolation("model", fmt.Sprintf("settlement output source %q does not equal invocation expected model identity %q", out.Source.String(), expected.String()))
 	}
 
-	if _, err := model.NewOutput(out); err != nil {
-		return fmt.Errorf("%w: %v", newBoundaryViolation("model", "settlement output violates model-output invariants"), err)
+	ownedOutput, err := model.NewOutput(out) // the one ownership copy every validation builds and returns.
+	if err != nil {
+		return ModelSettlement{}, fmt.Errorf("%w: %v", newBoundaryViolation("model", "settlement output violates model-output invariants"), err)
 	}
 	if out.Message != nil {
 		if err := requireUniqueCallIDs("model", out.Message.ToolCalls); err != nil {
-			return err
+			return ModelSettlement{}, err
 		}
 	}
-	return nil // well-formed.
+	owned := set // disposition and detail are plain value copies.
+	owned.Output = &ownedOutput
+	return owned, nil // well-formed.
+}
+
+// hasAssistantPayload reports whether an assistant message carries model-visible payload under the finalization view — a non-empty finalized content part, a non-empty refusal, or at least one finalized non-null extra — written against exported fields only as the agent-side mirror of model's private predicate (tool calls are impossible on errored outputs and are governed by their own row rule).
+func hasAssistantPayload(m *model.Message) bool {
+	if m == nil {
+		return false
+	}
+	if m.Refusal != "" {
+		return true
+	}
+	for _, part := range m.Content {
+		if part.Text != "" || part.URL != "" || part.OpaqueWireType != "" || len(part.Extra.Finalize()) > 0 {
+			return true
+		}
+	}
+	return len(m.Extra.Finalize()) > 0
+}
+
+// ValidateModelSettlement validates one model settlement against the closed disposition table and the expected identity exactly like the run's internal validator, rejecting an incomplete expected identity before any settlement row is consulted. On success it returns the shared validator's independent owned copy: a present output is the validated deep copy from the public model constructor, while disposition and detail are plain value copies.
+func ValidateModelSettlement(expected model.ModelRef, set ModelSettlement) (ModelSettlement, error) {
+	if !nonzeroSource(expected) {
+		return ModelSettlement{}, newBoundaryViolation("model", "settlement validation requires a nonzero expected model identity")
+	}
+	return validateSettlement(set, expected)
 }
 
 // requireUniqueCallIDs enforces the completed-call identity invariant shared by settlements and terminal results: at most one call may carry any given ID, so a repeated ID never reaches dispatch, unstarted-call matching stays unambiguous, and a validated caller cannot drive the loop's internal terminal invariant route.
