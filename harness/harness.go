@@ -313,7 +313,11 @@ func (h *Harness) ChangeAgentType(ctx context.Context, sessionID, agentType stri
 // input enters the steering FIFO and queued input enters the queued FIFO. The
 // buffers are process-local: a buffered item is not a durable Operation or
 // Session entry, has no idempotency, and is discarded on Harness-context
-// loss. An existing same-Session/message Operation resolves before routing.
+// loss. Submit holds the Session's admission reservation across its whole
+// routing decision: an existing same-Session/message Operation resolves
+// before routing, a waiter routes by mode only after the winning admission —
+// or its own enqueue — has settled, and an idle caller admits through the
+// held reservation, installing the prepared execution before releasing it.
 func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, error) {
 	if err := h.ctx.Err(); err != nil { // cancellation has closed admission
 		return SubmitResult{}, err
@@ -331,6 +335,11 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 	if err != nil {
 		return SubmitResult{}, err
 	}
+	release, err := c.reserve(ctx) // the reservation precedes every routing decision
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	defer release()
 	c.mu.Lock()
 	if c.gone { // a deletion committed after materialization: no buffer or admission on the absent Session
 		c.mu.Unlock()
@@ -367,7 +376,9 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 	}
 	c.mu.Unlock()
 
-	rec, disposition, err := h.admit(ctx, admissionRequest{
+	// the idle branch admits through the held reservation; the returned
+	// execution installs before the deferred release runs
+	rec, prepared, disposition, err := h.admitReserved(ctx, c, admissionRequest{
 		SessionID:   req.SessionID,
 		OperationID: req.OperationID,
 		Origin:      req.Origin,
@@ -375,6 +386,9 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 	})
 	if err != nil {
 		return SubmitResult{}, err
+	}
+	if prepared != nil { // install process-local execution and start Agent only after commit
+		h.startExecution(c, rec.Admission.OperationID, *prepared)
 	}
 	return SubmitResult{Disposition: disposition, Operation: &rec}, nil
 }

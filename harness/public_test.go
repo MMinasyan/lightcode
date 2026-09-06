@@ -475,6 +475,254 @@ func TestPublicIdempotency(t *testing.T) {
 	})
 }
 
+// waitContext observes one concurrent Submit's caller context: consulted
+// closes the first time Done is consulted, which for a Submit is the
+// reservation wait — the deterministic observation that the caller is parked
+// on the Session's admission reservation.
+type waitContext struct {
+	context.Context
+	once      sync.Once
+	consulted chan struct{}
+}
+
+func (w *waitContext) Done() <-chan struct{} {
+	w.once.Do(func() { close(w.consulted) })
+	return w.Context.Done()
+}
+
+// scriptPrepared returns the suite's prepared execution for the script's own
+// model effect.
+func scriptPrepared(script *scriptModel) harness.PreparedExecution {
+	return harness.PreparedExecution{
+		Capture: publicCapture(),
+		Model:   script.effect,
+		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+		},
+	}
+}
+
+// gateFirstPreparation parks the first preparation call until release closes:
+// the winning admission holds the Session's reservation inside its gated
+// preparation while the test parks the rest of the choreography.
+func gateFirstPreparation(f *publicFixture, prepared harness.PreparedExecution, release <-chan struct{}) {
+	f.prepareHook = func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error) {
+		if call == 0 {
+			<-release
+		}
+		return prepared, nil
+	}
+}
+
+// asyncSubmitOutcome is one concurrent Submit's result.
+type asyncSubmitOutcome struct {
+	res harness.SubmitResult
+	err error
+}
+
+// submitAsync runs one public Submit off the test goroutine.
+func submitAsync(ctx context.Context, h *harness.Harness, sessionID, operationID string, mode harness.MessageMode, text string) <-chan asyncSubmitOutcome {
+	done := make(chan asyncSubmitOutcome, 1)
+	go func() {
+		res, err := h.Submit(ctx, harness.SubmitRequest{
+			SessionID:   sessionID,
+			OperationID: operationID,
+			Origin:      harness.InputOriginUser,
+			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
+			Mode:        mode,
+		})
+		done <- asyncSubmitOutcome{res: res, err: err}
+	}()
+	return done
+}
+
+// TestPublicSubmitRoutesAfterReservationWinner proves the concurrent-routing
+// row through public operations: while one admission is parked inside its
+// gated preparation, concurrent Submits of distinct IDs wait on the Session's
+// reservation — consulting their caller contexts — and after the winner's
+// admission completes they route as steering and queued, without a busy
+// error, a second preparation, or a second active Operation while buffered.
+func TestPublicSubmitRoutesAfterReservationWinner(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		script := newScriptModel()
+		script.gate = make(chan struct{}) // the first model stays gated: the winner's Operation stays active
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		session := createSession(t, f.h)
+		releasePrep := make(chan struct{})
+		gateFirstPreparation(f, scriptPrepared(script), releasePrep)
+
+		winner := submitAsync(context.Background(), f.h, session, "op-1", harness.MessageModeRegular, "first")
+		<-f.prepare // the winner is parked inside its gated preparation, holding the reservation
+
+		waitSteer := &waitContext{Context: context.Background(), consulted: make(chan struct{})}
+		steerer := submitAsync(waitSteer, f.h, session, "op-2", harness.MessageModeRegular, "steer")
+		<-waitSteer.consulted // parked consulting its context in the reservation wait
+
+		waitQueued := &waitContext{Context: context.Background(), consulted: make(chan struct{})}
+		queuer := submitAsync(waitQueued, f.h, session, "op-3", harness.MessageModeQueued, "queued")
+		<-waitQueued.consulted
+
+		close(releasePrep) // the winner publishes and installs its execution; its model stays gated
+
+		out := <-winner
+		if out.err != nil || out.res.Disposition != harness.DispositionAdmitted || out.res.Operation == nil {
+			t.Fatalf("winning submit = %+v err %v, want admitted", out.res, out.err)
+		}
+		<-script.arrived // the winner is parked at its model boundary: the Session stays active
+
+		out = <-steerer
+		if out.err != nil || out.res.Disposition != harness.DispositionSteering || out.res.Operation != nil {
+			t.Fatalf("waiting regular submit = %+v err %v, want steering after the winner's admission", out.res, out.err)
+		}
+		out = <-queuer
+		if out.err != nil || out.res.Disposition != harness.DispositionQueued || out.res.Operation != nil {
+			t.Fatalf("waiting queued submit = %+v err %v, want queued after the winner's admission", out.res, out.err)
+		}
+		if calls := f.preparationCalls(); len(calls) != 1 {
+			t.Fatalf("preparation calls = %d, want only the winner's", len(calls))
+		}
+		if _, err := f.h.ReadOperation(context.Background(), session, "op-2"); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("buffered steering operation read = err %v, want ErrNotFound while buffered", err)
+		}
+		if _, err := f.h.ReadOperation(context.Background(), session, "op-3"); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("buffered queued operation read = err %v, want ErrNotFound while buffered", err)
+		}
+		rec, err := f.h.ReadSession(context.Background(), session)
+		if err != nil || rec.State.CurrentOperationID != "op-1" {
+			t.Fatalf("session while both items wait buffered = %+v err %v, want the winner as the one active Operation", rec, err)
+		}
+
+		script.releaseGate() // every buffered item is delivered or discarded per the landed lifetime semantics
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		if rec, err := f.h.ReadSession(context.Background(), session); err != nil ||
+			rec.State.CurrentOperationID != "" {
+			t.Fatalf("session after convergence = %+v err %v, want no operation left running", rec, err)
+		}
+	})
+}
+
+// TestPublicSubmitSameIDResolvesExistingUnderReservation proves the same-ID
+// concurrent row: a same-ID Submit waiting on the reservation returns the
+// first Operation as existing after the winner's admission, with no repeated
+// preparation, no buffered duplicate, no independent execution, and the
+// originally admitted content unchanged by the retry's.
+func TestPublicSubmitSameIDResolvesExistingUnderReservation(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		script := newScriptModel()
+		script.gate = make(chan struct{})
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		session := createSession(t, f.h)
+		releasePrep := make(chan struct{})
+		gateFirstPreparation(f, scriptPrepared(script), releasePrep)
+
+		winner := submitAsync(context.Background(), f.h, session, "op-1", harness.MessageModeRegular, "first")
+		<-f.prepare // parked inside its gated preparation, holding the reservation
+
+		waitRetry := &waitContext{Context: context.Background(), consulted: make(chan struct{})}
+		retry := submitAsync(waitRetry, f.h, session, "op-1", harness.MessageModeRegular, "second")
+		<-waitRetry.consulted // parked consulting its context in the reservation wait
+
+		close(releasePrep)
+
+		winOut := <-winner
+		if winOut.err != nil || winOut.res.Disposition != harness.DispositionAdmitted || winOut.res.Operation == nil {
+			t.Fatalf("winning submit = %+v err %v, want admitted", winOut.res, winOut.err)
+		}
+		<-script.arrived // the winner is parked at its model boundary
+		out := <-retry
+		if out.err != nil || out.res.Disposition != harness.DispositionExisting || out.res.Operation == nil ||
+			out.res.Operation.Admission.AdmittedEntry != winOut.res.Operation.Admission.AdmittedEntry {
+			t.Fatalf("same-ID retry = %+v err %v, want the first Operation as existing", out.res, out.err)
+		}
+		if calls := f.preparationCalls(); len(calls) != 1 {
+			t.Fatalf("preparation calls = %d, want no repeated preparation for the same ID", len(calls))
+		}
+		if got := texts(script.seen()[0]); got[len(got)-1] != "first" {
+			t.Fatalf("admitted projection = %v, want the originally admitted content, not the retry's", got)
+		}
+		if rec, err := f.h.ReadOperation(context.Background(), session, "op-1"); err != nil ||
+			rec.State.Status != harness.OperationRunning {
+			t.Fatalf("same-ID operation = %+v err %v, want the one running Operation", rec, err)
+		}
+		if rec, err := f.h.ReadSession(context.Background(), session); err != nil ||
+			rec.State.CurrentOperationID != "op-1" {
+			t.Fatalf("session = %+v err %v, want the same ID still current", rec, err)
+		}
+
+		script.releaseGate() // the winner settles; no buffered duplicate exists to drain
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		if calls := f.preparationCalls(); len(calls) != 1 {
+			t.Fatalf("preparation calls after convergence = %d, want the same ID never independently executed", len(calls))
+		}
+		if rec, err := f.h.ReadSession(context.Background(), session); err != nil ||
+			rec.State.CurrentOperationID != "" {
+			t.Fatalf("session after convergence = %+v err %v, want no buffered duplicate delivered", rec, err)
+		}
+	})
+}
+
+// TestPublicSubmitCanceledWaiterPublishesNothing proves the cancellation row:
+// a Submit canceled while waiting on the reservation returns a context error
+// and publishes or buffers nothing, the winner's admission still completes
+// afterward, and the canceled item is never delivered later.
+func TestPublicSubmitCanceledWaiterPublishesNothing(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		script := newScriptModel()
+		script.gate = make(chan struct{})
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		session := createSession(t, f.h)
+		releasePrep := make(chan struct{})
+		gateFirstPreparation(f, scriptPrepared(script), releasePrep)
+
+		winner := submitAsync(context.Background(), f.h, session, "op-1", harness.MessageModeRegular, "first")
+		<-f.prepare // parked inside its gated preparation, holding the reservation
+
+		waitCtx, cancelWait := context.WithCancel(context.Background())
+		defer cancelWait()
+		waiter := &waitContext{Context: waitCtx, consulted: make(chan struct{})}
+		canceled := submitAsync(waiter, f.h, session, "op-2", harness.MessageModeRegular, "late")
+		<-waiter.consulted // parked consulting its context in the reservation wait
+		cancelWait()
+
+		out := <-canceled
+		if !errors.Is(out.err, context.Canceled) || out.res.Operation != nil {
+			t.Fatalf("canceled waiter = %+v err %v, want a context error and no result", out.res, out.err)
+		}
+		if calls := f.preparationCalls(); len(calls) != 1 {
+			t.Fatalf("preparation calls = %d, want no preparation for the canceled caller", len(calls))
+		}
+		if _, err := f.h.ReadOperation(context.Background(), session, "op-2"); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("canceled operation read = err %v, want ErrNotFound: nothing published", err)
+		}
+		if rec, err := f.h.ReadSession(context.Background(), session); err != nil ||
+			rec.State.CurrentOperationID != "" {
+			t.Fatalf("session after the canceled waiter = %+v err %v, want nothing published", rec, err)
+		}
+
+		close(releasePrep) // the winner's publication wins after the waiter's cancellation
+		out = <-winner
+		if out.err != nil || out.res.Disposition != harness.DispositionAdmitted {
+			t.Fatalf("winner after a canceled waiter = %+v err %v, want admitted", out.res, out.err)
+		}
+		<-script.arrived
+
+		script.releaseGate()
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		if calls := f.preparationCalls(); len(calls) != 1 {
+			t.Fatalf("preparation calls after convergence = %d, want the canceled item never delivered", len(calls))
+		}
+	})
+}
+
 // TestPublicAgentTypeChange proves the Agent-type row through public
 // operations: the change during a running Operation succeeds without touching
 // the active capture, and the drained queued admission resolves the
