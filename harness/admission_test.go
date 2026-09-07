@@ -95,19 +95,42 @@ func newTestHarness(t *testing.T, store Storage, prepare func(context.Context, P
 	return h
 }
 
-// validPrepared returns a prepared execution with a valid capture and
-// placeholder effect functions. The placeholder model function parks forever,
-// so an auto-started execution keeps its Operation current without settling
-// it: admission fixtures observe a stable running state.
-func validPrepared() PreparedExecution {
-	return PreparedExecution{
-		Capture: testCapture(),
+// validExecution returns the fixtures' execution: a model function that never
+// returns, so an auto-started execution keeps its Operation current without
+// settling it, and a tool function returning an empty plan. Admission
+// fixtures observe a stable running state.
+func validExecution() Execution {
+	return Execution{
 		Model: func(context.Context, model.Request, agent.AssemblyCallback) (agent.ModelSettlement, error) {
 			select {} // the fixture owns the admitted Operation's state assertions
 		},
 		Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
 	}
 }
+
+// preparedExecuting returns a prepared execution with a valid capture and an
+// opener that always succeeds with the given execution.
+func preparedExecuting(exec Execution) PreparedExecution {
+	return PreparedExecution{
+		Capture: testCapture(),
+		Open:    func(context.Context, OperationAdmission) (Execution, error) { return exec, nil },
+	}
+}
+
+// modelPrepared returns the fixtures' prepared execution whose opener yields
+// the given model function over the default tool function.
+func modelPrepared(modelFn agent.ModelEffect) PreparedExecution {
+	exec := validExecution()
+	if modelFn != nil {
+		exec.Model = modelFn
+	}
+	return preparedExecuting(exec)
+}
+
+// validPrepared returns a prepared execution with a valid capture and an
+// opener yielding effect functions that never return, so an auto-started
+// execution keeps its Operation current without settling it.
+func validPrepared() PreparedExecution { return preparedExecuting(validExecution()) }
 
 // mustAdmitWithoutExecution runs the reserved admission body without
 // installing the execution — the shape the effect fixtures need to drive the
@@ -474,10 +497,9 @@ func TestAdmissionPreparationContract(t *testing.T) {
 
 	t.Run("invalid prepared execution publishes nothing", func(t *testing.T) {
 		for name, mutate := range map[string]func(*PreparedExecution){
-			"nil model function": func(p *PreparedExecution) { p.Model = nil },
-			"nil tool function":  func(p *PreparedExecution) { p.Tool = nil },
-			"partial model ref":  func(p *PreparedExecution) { p.Capture.Model = model.ModelRef{Provider: "prov"} },
-			"empty capture":      func(p *PreparedExecution) { p.Capture.ConfigurationRevision = "" },
+			"nil opener":        func(p *PreparedExecution) { p.Open = nil },
+			"partial model ref": func(p *PreparedExecution) { p.Capture.Model = model.ModelRef{Provider: "prov"} },
+			"empty capture":     func(p *PreparedExecution) { p.Capture.ConfigurationRevision = "" },
 			"duplicate tool name": func(p *PreparedExecution) {
 				p.Capture.Tools = []model.ToolDefinition{testToolDefinition(), testToolDefinition()}
 			},
@@ -1154,13 +1176,22 @@ func TestForeignChangeRefreshesTheView(t *testing.T) {
 }
 
 // TestHarnessCancellationGatesPublication proves publication never starts
-// once the Harness context is done: nothing is published and the Harness
-// context error is returned while the caller context stays live.
+// once the Harness context is done: nothing is published, the Harness
+// context error is returned while the caller context stays live, and the
+// discarded prepared values are never opened.
 func TestHarnessCancellationGatesPublication(t *testing.T) {
 	harnessCtx, cancelHarness := context.WithCancel(context.Background())
 	defer cancelHarness()
 	gate := make(chan struct{})
-	stub := newPrepareStub(validPrepared())
+	opens := 0
+	prepared := PreparedExecution{
+		Capture: testCapture(),
+		Open: func(context.Context, OperationAdmission) (Execution, error) {
+			opens++
+			return validExecution(), nil
+		},
+	}
+	stub := newPrepareStub(prepared)
 	stub.gate = gate
 	stub.ignoreCtx = true // preparation completes despite the canceled harness context
 	store := freshSessionStore(t)
@@ -1180,6 +1211,9 @@ func TestHarnessCancellationGatesPublication(t *testing.T) {
 	err = <-done
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("admission over a canceled harness context = %v, want a context error", err)
+	}
+	if opens != 0 {
+		t.Fatalf("opener calls = %d, want a failed publication to discard the prepared values without opening", opens)
 	}
 	entries, regs := storedSessionState(store, testSessionID)
 	if len(entries) != 0 || len(regs) != 1 || regs[0].Revision != 1 {

@@ -19,8 +19,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -164,6 +166,10 @@ type publicFixture struct {
 
 	model *scriptModel
 
+	// opens counts the opener invocations of the fixture's racePrepared
+	// executions: a discarded prepared execution must never open.
+	opens atomic.Int64
+
 	// prepareHook, when non-nil, answers one preparation call with its own
 	// result or error; the call index counts from zero.
 	prepareHook func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error)
@@ -177,9 +183,13 @@ func newPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, 
 	f := &publicFixture{store: store, cancel: func() {}, prepare: make(chan struct{}, 16), model: script}
 	prepared := harness.PreparedExecution{
 		Capture: publicCapture(),
-		Model:   modelFn,
-		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+			return harness.Execution{
+				Model: modelFn,
+				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+					return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+				},
+			}, nil
 		},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -422,13 +432,7 @@ func TestPublicIdempotency(t *testing.T) {
 			script.gate = gate
 			f := newPublicFixture(t, store, script, nil)
 			defer f.close()
-			prepared := harness.PreparedExecution{
-				Capture: publicCapture(),
-				Model:   script.effect,
-				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
-				},
-			}
+			prepared := scriptPrepared(script)
 			f.prepareHook = func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error) {
 				if call == 1 { // the drained queued item's preparation fails: the attempt is final for it
 					return harness.PreparedExecution{}, fmt.Errorf("preparation broke")
@@ -495,9 +499,13 @@ func (w *waitContext) Done() <-chan struct{} {
 func scriptPrepared(script *scriptModel) harness.PreparedExecution {
 	return harness.PreparedExecution{
 		Capture: publicCapture(),
-		Model:   script.effect,
-		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+			return harness.Execution{
+				Model: script.effect,
+				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+					return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+				},
+			}, nil
 		},
 	}
 }
@@ -1193,13 +1201,7 @@ func TestPublicBufferedItemFailure(t *testing.T) {
 			script.gate = gate
 			f := newPublicFixture(t, store, script, nil)
 			defer f.close()
-			prepared := harness.PreparedExecution{
-				Capture: publicCapture(),
-				Model:   script.effect,
-				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
-				},
-			}
+			prepared := scriptPrepared(script)
 			f.prepareHook = func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error) {
 				if call == 1 { // the first drained queued item's preparation fails
 					return harness.PreparedExecution{}, fmt.Errorf("preparation broke")
@@ -1475,31 +1477,35 @@ func TestPublicOrderedToolCallsSettle(t *testing.T) {
 		)
 		prepared := harness.PreparedExecution{
 			Capture: publicCapture(),
-			Model:   script.effect,
-			Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-				toolMu.Lock()
-				toolOrder = append(toolOrder, call.ID)
-				toolMu.Unlock()
-				if call.ID == "call-1" { // executor-backed: intent before execution, one result after
-					return harness.PreparedTool{Execute: func(context.Context) model.ToolResult {
-						reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterOperation, OperationID: "op-1"})
-						if err != nil {
-							t.Errorf("read operation register during execution: %v", err)
-							return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}
+			Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+				return harness.Execution{
+					Model: script.effect,
+					Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+						toolMu.Lock()
+						toolOrder = append(toolOrder, call.ID)
+						toolMu.Unlock()
+						if call.ID == "call-1" { // executor-backed: intent before execution, one result after
+							return harness.PreparedTool{Execute: func(context.Context) model.ToolResult {
+								reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterOperation, OperationID: "op-1"})
+								if err != nil {
+									t.Errorf("read operation register during execution: %v", err)
+									return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}
+								}
+								var wire opRegisterWire
+								if err := json.Unmarshal(reg.Payload, &wire); err != nil {
+									t.Errorf("decode operation register during execution: %v", err)
+									return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}
+								}
+								if wire.State.ActiveEffect == nil || wire.State.ActiveEffect.Kind != "tool" ||
+									wire.State.ActiveEffect.ToolCallID != "call-1" || wire.State.ActiveEffect.ResultEntryID == "" {
+									t.Errorf("tool intent during execution = %+v, want the committed call-1 intent with a reserved result", wire.State.ActiveEffect)
+								}
+								return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}
+							}}
 						}
-						var wire opRegisterWire
-						if err := json.Unmarshal(reg.Payload, &wire); err != nil {
-							t.Errorf("decode operation register during execution: %v", err)
-							return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}
-						}
-						if wire.State.ActiveEffect == nil || wire.State.ActiveEffect.Kind != "tool" ||
-							wire.State.ActiveEffect.ToolCallID != "call-1" || wire.State.ActiveEffect.ResultEntryID == "" {
-							t.Errorf("tool intent during execution = %+v, want the committed call-1 intent with a reserved result", wire.State.ActiveEffect)
-						}
-						return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}
-					}}
-				}
-				return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "immediate call-2"}} // no effect intent
+						return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "immediate call-2"}} // no effect intent
+					},
+				}, nil
 			},
 		}
 		f.prepareHook = func(int, harness.PreparationRequest) (harness.PreparedExecution, error) { return prepared, nil }
@@ -2203,13 +2209,7 @@ func TestPublicSweepWaitsForBlockedPreparation(t *testing.T) {
 
 		prepStarted := make(chan struct{}, 1)
 		releasePrep := make(chan struct{})
-		prepared := harness.PreparedExecution{
-			Capture: publicCapture(),
-			Model:   script.effect,
-			Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-				return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
-			},
-		}
+		prepared := scriptPrepared(script)
 		f.prepareHook = func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error) {
 			if call == 0 { // the first admission's preparation is blocked while the sweep waits
 				select {
@@ -4263,9 +4263,14 @@ func seedForkDecoy(t *testing.T, store harness.Storage, sourceID, boundaryID, op
 func racePrepared(f *publicFixture) harness.PreparedExecution {
 	return harness.PreparedExecution{
 		Capture: publicCapture(),
-		Model:   f.model.effect,
-		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+			f.opens.Add(1)
+			return harness.Execution{
+				Model: f.model.effect,
+				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+					return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+				},
+			}, nil
 		},
 	}
 }
@@ -4309,9 +4314,13 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		f.prepareHook = func(_ int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
 			return harness.PreparedExecution{
 				Capture: publicCapture(),
-				Model:   script.effect,
-				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
+				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+					return harness.Execution{
+						Model: script.effect,
+						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+							return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
+						},
+					}, nil
 				},
 			}, nil
 		}
@@ -4883,6 +4892,9 @@ func TestPublicForkFirstWriterRace(t *testing.T) {
 			if calls := race.preparationCalls(); len(calls) != 1 {
 				t.Fatalf("preparation calls = %d, want the preparation never rerun", len(calls))
 			}
+			if got := race.opens.Load(); got != 0 {
+				t.Fatalf("opener calls = %d, want the first-writer loser to discard its prepared values without opening", got)
+			}
 			assertSessionIDs(t, store, decoy, source) // the losing transaction published nothing
 		})
 
@@ -4900,6 +4912,9 @@ func TestPublicForkFirstWriterRace(t *testing.T) {
 				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
 			}); !errors.Is(err, harness.ErrInvalid) {
 				t.Fatalf("fork losing to a different use of the ID = err %v, want ErrInvalid", err)
+			}
+			if got := race.opens.Load(); got != 0 {
+				t.Fatalf("opener calls = %d, want an invalid fork resolution to discard the prepared values without opening", got)
 			}
 		})
 
@@ -4970,6 +4985,9 @@ func TestPublicForkSourceRevisionRace(t *testing.T) {
 			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
 		}); !errors.Is(err, harness.ErrConflict) {
 			t.Fatalf("fork over a concurrently changed source = err %v, want ErrConflict", err)
+		}
+		if got := race.opens.Load(); got != 0 {
+			t.Fatalf("opener calls = %d, want a failed fork publication to discard the prepared values without opening", got)
 		}
 		assertSessionIDs(t, store, source) // nothing was published
 		after := sessionRegister(t, store, source)
@@ -5150,6 +5168,114 @@ func TestPublicCompositionProductionIsolation(t *testing.T) {
 		}
 		if len(touched) != 0 {
 			t.Fatalf("composed inactive Harness derived production state in the caller's working directory: %v", touched)
+		}
+	})
+}
+
+// TestPublicExecutionResourceLifetime proves the shared post-admission
+// resource lifetime rows through public operations on both stores: each
+// admitted execution — root, queued-drain, and Fork alike — opens its effects
+// exactly once after its commit over the committed admission carrying the
+// prepared capture, closes them exactly once after its terminal settlement,
+// and closes before the successor opens; a plain successful turn's closer
+// observes its own durable terminal.
+func TestPublicExecutionResourceLifetime(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		events := make(chan string, 32)
+		var (
+			openMu sync.Mutex
+			opens  []harness.OperationAdmission
+		)
+		script := newScriptModel() // every turn completes with the default ready settlement
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		f.prepareHook = func(int, harness.PreparationRequest) (harness.PreparedExecution, error) {
+			return harness.PreparedExecution{
+				Capture: publicCapture(),
+				Open: func(_ context.Context, adm harness.OperationAdmission) (harness.Execution, error) {
+					openMu.Lock()
+					opens = append(opens, adm)
+					openMu.Unlock()
+					events <- "open:" + adm.OperationID
+					return harness.Execution{
+						Model: script.effect,
+						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+							return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+						},
+						Close: func() error {
+							rec, err := f.h.ReadOperation(ctx, adm.SessionID, adm.OperationID)
+							if err != nil {
+								t.Errorf("read operation from its own closer: %v", err)
+								return nil
+							}
+							events <- fmt.Sprintf("close:%s:%s", adm.OperationID, rec.State.Status)
+							return nil
+						},
+					}, nil
+				},
+			}, nil
+		}
+		source := createSession(t, f.h)
+
+		// nextEvent consumes one lifetime event, failing on any timeout or
+		// reordering instead of hanging the suite.
+		nextEvent := func(want string) {
+			t.Helper()
+			select {
+			case got := <-events:
+				if got != want {
+					t.Fatalf("lifetime event = %q, want %q", got, want)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatalf("timed out waiting for lifetime event %q", want)
+			}
+		}
+
+		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
+			t.Fatalf("root submit: %v", err)
+		}
+		nextEvent("open:op-1") // the root execution opens after its commit
+		if _, err := submit(t, f.h, source, "op-2", harness.MessageModeQueued, "queued"); err != nil {
+			t.Fatalf("queued submit: %v", err)
+		}
+		nextEvent("close:op-1:success") // closed once, with its own terminal settlement already durable
+		nextEvent("open:op-2")          // the drain's successor opens only after that close
+		nextEvent("close:op-2:success")
+
+		// Fork shares the same lifetime: the destination execution opens
+		// after the fork commit and closes after its own terminal.
+		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
+		res, err := f.h.Fork(ctx, harness.ForkRequest{
+			SourceSessionID: source,
+			BoundaryEntryID: boundary,
+			OperationID:     "fork-op",
+			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+		})
+		if err != nil {
+			t.Fatalf("fork: %v", err)
+		}
+		nextEvent("open:fork-op")
+		nextEvent("close:fork-op:success")
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+
+		openMu.Lock()
+		defer openMu.Unlock()
+		if len(opens) != 3 {
+			t.Fatalf("%d opener calls, want exactly one per admitted execution", len(opens))
+		}
+		for i, adm := range opens {
+			if !reflect.DeepEqual(adm.Execution, publicCapture()) {
+				t.Fatalf("open %d carries capture %+v, want the prepared capture", i, adm.Execution)
+			}
+		}
+		if opens[0].SessionID != source || opens[1].SessionID != source {
+			t.Fatalf("root/queued opens name sessions %q and %q, want the source", opens[0].SessionID, opens[1].SessionID)
+		}
+		if opens[2].SessionID != res.Session.Identity.SessionID {
+			t.Fatalf("fork open names session %q, want the destination", opens[2].SessionID)
 		}
 	})
 }

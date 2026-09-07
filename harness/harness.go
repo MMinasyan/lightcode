@@ -36,12 +36,24 @@ type PreparationRequest struct {
 }
 
 // PreparedExecution is the outcome of one preparation: the durable capture
-// plus the two process-local effect functions the Harness consumes. No
+// plus the one required opener that turns the committed admission into the
+// execution the Harness runs. A preparation returns values and an opener,
+// never short-lived resources: failed admission discards the values only. No
 // returned function is durable.
 type PreparedExecution struct {
 	Capture ExecutionCapture
-	Model   agent.ModelEffect
-	Tool    func(context.Context, model.ToolCall) PreparedTool
+	Open    func(context.Context, OperationAdmission) (Execution, error)
+}
+
+// Execution is one opened execution: the two process-local effect functions
+// the Harness drives, plus the cleanup of any external resources backing
+// them. A successful Model and Tool must be non-nil; Close is optional when
+// the concrete execution needs no external disposal. The opener owns
+// provisional cleanup on error.
+type Execution struct {
+	Model agent.ModelEffect
+	Tool  func(context.Context, model.ToolCall) PreparedTool
+	Close func() error
 }
 
 // PreparedTool is one tool plan: exactly one immediate result or executor,
@@ -103,6 +115,10 @@ type Harness struct {
 	// storageFailure retains the first storage-class failure that stopped
 	// admitted work; Wait returns it after all process-local work has ended.
 	storageFailure error
+
+	// cleanupFailure retains the first execution-cleanup failure alongside
+	// the first storage failure; Wait joins both after complete convergence.
+	cleanupFailure error
 }
 
 // pendingMessage is one buffered Submit: a process-local FIFO item that is
@@ -1053,12 +1069,12 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 // prepareExecution is the shared outside-lock preparation and validation of
 // one admission producer, used by normal admission and Fork alike: it merges
 // the caller context with the Harness context, invokes the single preparation
-// callback, requires non-nil model and tool functions and a valid capture,
-// and returns the prepared execution with its owned durable capture plus the
-// combined context and its cleanup. A preparation failure returns with the
-// combined context already cleaned up; on success the caller keeps it live
-// through publication and runs the cleanup when publication returns. Caller
-// or Harness cancellation before or after preparation publishes nothing.
+// callback, requires a non-nil opener and a valid capture, and returns the
+// prepared execution with its owned durable capture plus the combined context
+// and its cleanup. A preparation failure returns with the combined context
+// already cleaned up; on success the caller keeps it live through publication
+// and runs the cleanup when publication returns. Caller or Harness
+// cancellation before or after preparation publishes nothing.
 func (h *Harness) prepareExecution(ctx context.Context, session PreparationSession) (PreparedExecution, ExecutionCapture, context.Context, context.CancelFunc, error) {
 	prepCtx, cancel := context.WithCancel(h.ctx)
 	stop := context.AfterFunc(ctx, cancel)
@@ -1082,9 +1098,9 @@ func (h *Harness) prepareExecution(ctx context.Context, session PreparationSessi
 		cleanup()
 		return PreparedExecution{}, ExecutionCapture{}, nil, nil, prepErr
 	}
-	if prepared.Model == nil || prepared.Tool == nil {
+	if prepared.Open == nil {
 		cleanup()
-		return PreparedExecution{}, ExecutionCapture{}, nil, nil, invalidInput("prepared execution requires non-nil model and tool functions")
+		return PreparedExecution{}, ExecutionCapture{}, nil, nil, invalidInput("prepared execution requires a non-nil opener")
 	}
 	if err := validateExecutionCapture(prepared.Capture); err != nil {
 		cleanup()
@@ -1392,6 +1408,20 @@ func (h *Harness) recordStorageFailure(err error) {
 	h.mu.Unlock()
 }
 
+// recordCleanupFailure retains the first non-nil execution Close failure
+// alongside the first storage failure; later failures never replace it. A
+// cleanup failure never rewrites the Operation's terminal settlement.
+func (h *Harness) recordCleanupFailure(err error) {
+	if err == nil {
+		return
+	}
+	h.mu.Lock()
+	if h.cleanupFailure == nil {
+		h.cleanupFailure = err
+	}
+	h.mu.Unlock()
+}
+
 // snapshotCoordinators copies the registry's coordinator pointers under h.mu
 // and returns them with h.mu released: the caller inspects each pointer under
 // its own c.mu, so no lock is ever held across the other. A coordinator
@@ -1411,11 +1441,13 @@ func (h *Harness) snapshotCoordinators() []*coordinator {
 // cancellation has closed admission and every in-flight preparation,
 // execution, and required settlement has converged. Its own context cancels
 // only the wait. If admitted work stopped because required storage
-// publication failed, it returns the first such recorded storage error after
-// all process-local work has ended. Both scans copy the coordinator pointers
-// under h.mu, release it, and inspect each under its own c.mu — no h.mu ->
-// c.mu nesting, because a transition may hold c.mu while taking h.mu
-// (markCorrupt) concurrently.
+// publication failed, or an execution's resource cleanup failed, it returns
+// the errors.Join of the first retained storage failure and the first
+// retained cleanup failure after all process-local work has ended; neither
+// retained value is ever replaced by a later failure. Both scans copy the
+// coordinator pointers under h.mu, release it, and inspect each under its
+// own c.mu — no h.mu -> c.mu nesting, because a transition may hold c.mu
+// while taking h.mu (markCorrupt) concurrently.
 func (h *Harness) Wait(ctx context.Context) error {
 	select {
 	case <-h.ctx.Done():
@@ -1452,9 +1484,9 @@ func (h *Harness) Wait(ctx context.Context) error {
 		}
 		if !busy {
 			h.mu.Lock()
-			failure := h.storageFailure
+			storage, cleanup := h.storageFailure, h.cleanupFailure
 			h.mu.Unlock()
-			return failure
+			return errors.Join(storage, cleanup)
 		}
 	}
 }
