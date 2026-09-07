@@ -124,14 +124,18 @@ type UsageTotals struct {
 
 // ExecutionCapture is the complete non-secret configuration required to
 // interpret one Operation: the stable configuration revision, the complete
-// model identity, the system prompt, and the advertised tool definitions in
-// preserved order. No resolved secret, callback, plugin value, permission
-// representation, retry policy, or arbitrary plugin JSON is durable.
+// model identity, the system prompt, the advertised tool definitions in
+// preserved order, and the selected capability names in preserved order.
+// Capability names are validated for shape only: no plugin is loaded to
+// read a historical capture. No resolved secret, callback, plugin value,
+// permission representation, retry policy, or arbitrary plugin JSON is
+// durable.
 type ExecutionCapture struct {
 	ConfigurationRevision string                 `json:"configuration_revision"`
 	Model                 model.ModelRef         `json:"model"`
 	SystemPrompt          string                 `json:"system_prompt"`
 	Tools                 []model.ToolDefinition `json:"tools"`
+	Capabilities          []string               `json:"capabilities,omitempty"`
 }
 
 // SessionIdentity is the immutable identity section of one Session register.

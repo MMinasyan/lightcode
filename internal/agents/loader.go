@@ -49,7 +49,30 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// Parse loads the legacy on-disk shape: custom tool names must be members
+// of StandardTools and the target-only capabilities field is ignored.
 func Parse(data []byte) (*Config, error) {
+	return parse(data, nil, false)
+}
+
+// ParseWithCapabilities loads the Runtime target shape. Shape, inheritance
+// and every other definition rule are shared with Parse. Capability names
+// are validated against the supplied compiled declarations, with missing
+// inheritance, empty-list clearing, and the same invalid-custom
+// warning/drop behavior for unknown, duplicate, or empty IDs; built-ins keep
+// their locked fields and an empty default. Configured tool names are
+// retained as long as they are nonempty: there is no independent
+// available-tool list yet, and concrete tool resolution and unknown-tool
+// validation land with the Phase 5 tool contracts.
+func ParseWithCapabilities(data []byte, capabilities []string) (*Config, error) {
+	declared := make(map[string]struct{}, len(capabilities))
+	for _, id := range capabilities {
+		declared[id] = struct{}{}
+	}
+	return parse(data, declared, true)
+}
+
+func parse(data []byte, declaredCapabilities map[string]struct{}, target bool) (*Config, error) {
 	var user map[string]json.RawMessage
 	if err := json.Unmarshal(data, &user); err != nil {
 		return nil, err
@@ -79,7 +102,7 @@ func Parse(data []byte) (*Config, error) {
 			cfg.applyBuiltinOverlay(name, def)
 			continue
 		}
-		def, err := decodeDefinition(raw)
+		def, err := decodeDefinition(raw, target)
 		if err != nil {
 			cfg.warnings = append(cfg.warnings, Warning{
 				Kind:    "invalid_agent_type",
@@ -88,7 +111,7 @@ func Parse(data []byte) (*Config, error) {
 			})
 			continue
 		}
-		if err := validateCustom(name, def); err != nil {
+		if err := validateCustom(name, def, target, declaredCapabilities); err != nil {
 			cfg.warnings = append(cfg.warnings, Warning{
 				Kind:    "invalid_agent_type",
 				Name:    name,
@@ -101,15 +124,29 @@ func Parse(data []byte) (*Config, error) {
 	return cfg, nil
 }
 
-func decodeDefinition(raw json.RawMessage) (Definition, error) {
+// decodeDefinition decodes one custom definition entry. Legacy decoding
+// shadows the target-only capabilities member with a raw value, so its type
+// and value cannot reach the embedded Definition; every other field keeps
+// the ordinary decoder's behavior. Target decoding stays the typed decode.
+func decodeDefinition(raw json.RawMessage, target bool) (Definition, error) {
 	if err := ensureJSONObject(raw); err != nil {
 		return Definition{}, err
 	}
-	var def Definition
-	if err := json.Unmarshal(raw, &def); err != nil {
+	if target {
+		var def Definition
+		if err := json.Unmarshal(raw, &def); err != nil {
+			return Definition{}, err
+		}
+		return def, nil
+	}
+	var legacy struct {
+		Definition
+		Capabilities json.RawMessage `json:"capabilities"`
+	}
+	if err := json.Unmarshal(raw, &legacy); err != nil {
 		return Definition{}, err
 	}
-	return def, nil
+	return legacy.Definition, nil
 }
 
 func decodeBuiltinOverlay(raw json.RawMessage) (Definition, error) {
@@ -231,6 +268,13 @@ func applyDefinition(out *Resolved, def Definition) {
 	if def.Tools != nil {
 		out.Tools = append([]string(nil), (*def.Tools)...)
 	}
+	if def.Capabilities != nil {
+		if len(*def.Capabilities) == 0 {
+			out.Capabilities = nil // an empty list clears the inherited selection
+		} else {
+			out.Capabilities = append([]string(nil), (*def.Capabilities)...)
+		}
+	}
 	if def.LSP != nil {
 		out.LSP = *def.LSP
 	}
@@ -304,7 +348,7 @@ func writeAtomic(path string, value any) error {
 	return atomicfs.Write(path, data, 0o600)
 }
 
-func validateCustom(name string, def Definition) error {
+func validateCustom(name string, def Definition, target bool, declaredCapabilities map[string]struct{}) error {
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("name is empty")
 	}
@@ -322,9 +366,27 @@ func validateCustom(name string, def Definition) error {
 	}
 	if def.Tools != nil {
 		for _, name := range *def.Tools {
+			if target {
+				if name == "" {
+					return fmt.Errorf("tool name is empty")
+				}
+				continue
+			}
 			if _, ok := allowedTools[name]; !ok {
 				return fmt.Errorf("unknown tool %q", name)
 			}
+		}
+	}
+	if target && def.Capabilities != nil {
+		seen := make(map[string]bool, len(*def.Capabilities))
+		for _, id := range *def.Capabilities {
+			if _, ok := declaredCapabilities[id]; !ok {
+				return fmt.Errorf("unknown capability %q", id)
+			}
+			if seen[id] {
+				return fmt.Errorf("duplicate capability %q", id)
+			}
+			seen[id] = true
 		}
 	}
 	return nil
@@ -360,6 +422,9 @@ func copyDefinition(def Definition) Definition {
 	}
 	if def.Tools != nil {
 		def.Tools = toolsPtr(*def.Tools)
+	}
+	if def.Capabilities != nil {
+		def.Capabilities = toolsPtr(*def.Capabilities)
 	}
 	if def.LSP != nil {
 		def.LSP = boolPtr(*def.LSP)

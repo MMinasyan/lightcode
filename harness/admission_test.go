@@ -1438,6 +1438,46 @@ func TestOwnCaptureDropsZeroLengthBacking(t *testing.T) {
 	}
 }
 
+// TestOwnCaptureOwnsCapabilitySelection proves the admitted capture keeps the
+// prepared capability selection in its own storage: a zero-length selection
+// normalizes to nil and never keeps the caller's backing, and a caller
+// mutation after admission reaches neither the durable capture nor a later
+// read of the same prepared value.
+func TestOwnCaptureOwnsCapabilitySelection(t *testing.T) {
+	t.Run("zero-length backing", func(t *testing.T) {
+		prepared := validPrepared()
+		capabilities := make([]string, 0, 1) // zero length with spare capacity
+		prepared.Capture.Capabilities = capabilities
+		store := freshSessionStore(t)
+		h := newTestHarness(t, store, newPrepareStub(prepared).prepare)
+		mustAdmit(t, h, testSessionID, testOpID, admissionContent("x"))
+		_ = append(capabilities, "ghost") // the caller reuses its backing after admission
+		rec, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
+		if err != nil {
+			t.Fatalf("ReadOperation: %v", err)
+		}
+		if rec.Admission.Execution.Capabilities != nil {
+			t.Fatalf("admitted capture retained the caller's zero-length capability backing: %+v", rec.Admission.Execution.Capabilities)
+		}
+	})
+
+	t.Run("caller mutation after admission", func(t *testing.T) {
+		prepared := validPrepared()
+		capabilities := []string{"cap-a"}
+		prepared.Capture.Capabilities = capabilities
+		h := newTestHarness(t, freshSessionStore(t), newPrepareStub(prepared).prepare)
+		mustAdmit(t, h, testSessionID, testOpID, admissionContent("x"))
+		capabilities[0] = "tampered"
+		rec, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
+		if err != nil {
+			t.Fatalf("ReadOperation: %v", err)
+		}
+		if len(rec.Admission.Execution.Capabilities) != 1 || rec.Admission.Execution.Capabilities[0] != "cap-a" {
+			t.Fatalf("admitted capture aliases the caller's capability selection: %+v", rec.Admission.Execution.Capabilities)
+		}
+	})
+}
+
 // TestAdmittedOperationCarriesRegisterRevision proves the admitted Operation
 // record carries the revision storage assigned to its register at insert, in
 // both the returned value and the coordinator view a later read observes.

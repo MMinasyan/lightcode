@@ -1519,18 +1519,23 @@ func newHexID() (string, error) {
 }
 
 // ownCapture returns an independent owned copy of one execution capture. A
-// zero-length tool list normalizes to nil so no caller backing is retained,
-// even with spare capacity.
+// zero-length tool list or capability selection normalizes to nil so no
+// caller backing is retained, even with spare capacity.
 func ownCapture(c ExecutionCapture) ExecutionCapture {
 	out := c
 	if len(c.Tools) == 0 {
 		out.Tools = nil
-		return out
+	} else {
+		out.Tools = make([]model.ToolDefinition, len(c.Tools))
+		for i, tool := range c.Tools {
+			out.Tools[i] = tool
+			out.Tools[i].Parameters = model.CloneRaw(tool.Parameters)
+		}
 	}
-	out.Tools = make([]model.ToolDefinition, len(c.Tools))
-	for i, tool := range c.Tools {
-		out.Tools[i] = tool
-		out.Tools[i].Parameters = model.CloneRaw(tool.Parameters)
+	if len(c.Capabilities) == 0 {
+		out.Capabilities = nil
+	} else {
+		out.Capabilities = append([]string(nil), c.Capabilities...)
 	}
 	return out
 }

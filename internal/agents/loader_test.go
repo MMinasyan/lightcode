@@ -372,3 +372,130 @@ func namesOf(values []Resolved) []string {
 	}
 	return out
 }
+
+func TestParseWithCapabilitiesSelection(t *testing.T) {
+	cfg, err := ParseWithCapabilities([]byte(`{
+  "plan": {"capabilities": ["cap-b", "cap-a"]},
+  "sweeper": {"capabilities": []},
+  "plain": {},
+  "unknown_cap": {"capabilities": ["ghost"]},
+  "duplicate_cap": {"capabilities": ["cap-a", "cap-a"]},
+  "custom_tools": {"tools": ["own_tool", "own_tool", "read_file"]}
+}`), []string{"cap-a", "cap-b"})
+	if err != nil {
+		t.Fatalf("ParseWithCapabilities: %v", err)
+	}
+	for _, drop := range []string{"unknown_cap", "duplicate_cap"} {
+		if _, err := cfg.Resolve(drop); err == nil {
+			t.Fatalf("Resolve(%s) succeeded, want dropped", drop)
+		}
+	}
+	warnings := cfg.Warnings()
+	if len(warnings) != 2 {
+		t.Fatalf("warnings = %#v, want two invalid_agent_type drops", warnings)
+	}
+	for _, warning := range warnings {
+		if warning.Kind != "invalid_agent_type" {
+			t.Fatalf("warning kind = %q, want invalid_agent_type", warning.Kind)
+		}
+	}
+
+	plan, err := cfg.Resolve("plan")
+	if err != nil {
+		t.Fatalf("Resolve(plan): %v", err)
+	}
+	if want := []string{"cap-b", "cap-a"}; !reflect.DeepEqual(plan.Capabilities, want) {
+		t.Fatalf("plan capabilities = %q, want the selected order", plan.Capabilities)
+	}
+	// A custom type inherits through secondary and primary; the built-ins
+	// keep their locked fields and an empty capability default.
+	for _, name := range []string{"sweeper", "plain", "secondary"} {
+		resolved, err := cfg.Resolve(name)
+		if err != nil {
+			t.Fatalf("Resolve(%s): %v", name, err)
+		}
+		if resolved.Capabilities != nil {
+			t.Fatalf("%s capabilities = %q, want absent, cleared, or inherited-empty", name, resolved.Capabilities)
+		}
+	}
+	for _, resolved := range cfg.All() {
+		if resolved.Builtin && resolved.Capabilities != nil {
+			t.Fatalf("builtin %s capabilities = %q, want the empty default", resolved.Name, resolved.Capabilities)
+		}
+	}
+	// Configured tool names are retained without an available-tool list,
+	// duplicates included; a repeated name neither drops the definition nor
+	// changes the resolved order.
+	worker, err := cfg.Resolve("custom_tools")
+	if err != nil {
+		t.Fatalf("Resolve(custom_tools): %v", err)
+	}
+	if want := []string{"own_tool", "own_tool", "read_file"}; !reflect.DeepEqual(worker.Tools, want) {
+		t.Fatalf("custom_tools = %q, want %q retained", worker.Tools, want)
+	}
+}
+
+func TestParseWithCapabilitiesRejectsEmptyToolNames(t *testing.T) {
+	cfg, err := ParseWithCapabilities([]byte(`{"bad": {"tools": ["ok", ""]}}`), nil)
+	if err != nil {
+		t.Fatalf("ParseWithCapabilities: %v", err)
+	}
+	if _, err := cfg.Resolve("bad"); err == nil {
+		t.Fatal("Resolve(bad) succeeded, want dropped for an empty tool name")
+	}
+	warnings := cfg.Warnings()
+	if len(warnings) != 1 || warnings[0].Kind != "invalid_agent_type" {
+		t.Fatalf("warnings = %#v, want one invalid_agent_type drop", warnings)
+	}
+}
+
+func TestLegacyParseIgnoresCapabilitiesAndKeepsStandardTools(t *testing.T) {
+	// Decoder independence: the legacy reader ignores the target-only field
+	// with no warning, and the target ignores the legacy registry membership
+	// rule — the same document must not fail the same way in both.
+	doc := []byte(`{
+  "capable": {"capabilities": ["anything-not-declared"]},
+  "broken": {"capabilities": "not-a-list"},
+  "legacy_tool": {"tools": ["does_not_exist"]}
+}`)
+	legacy, err := Parse(doc)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	capable, err := legacy.Resolve("capable")
+	if err != nil {
+		t.Fatalf("Resolve(capable): %v", err)
+	}
+	if capable.Capabilities != nil {
+		t.Fatalf("legacy Parse retained capabilities: %q", capable.Capabilities)
+	}
+	// The member is removed from the raw definition before the typed decode,
+	// so neither its value nor its shape can affect legacy parsing.
+	broken, err := legacy.Resolve("broken")
+	if err != nil {
+		t.Fatalf("legacy Resolve(broken): %v, want the wrong-typed member ignored", err)
+	}
+	if broken.Capabilities != nil {
+		t.Fatalf("legacy broken capabilities = %q, want none", broken.Capabilities)
+	}
+	if _, err := legacy.Resolve("legacy_tool"); err == nil {
+		t.Fatal("legacy Parse accepted a tool outside StandardTools")
+	}
+	target, err := ParseWithCapabilities(doc, nil)
+	if err != nil {
+		t.Fatalf("ParseWithCapabilities: %v", err)
+	}
+	if _, err := target.Resolve("capable"); err == nil {
+		t.Fatal("target accepted a capability outside the compiled declarations")
+	}
+	if _, err := target.Resolve("broken"); err == nil {
+		t.Fatal("target accepted a wrong-typed capabilities value")
+	}
+	worker, err := target.Resolve("legacy_tool")
+	if err != nil {
+		t.Fatalf("target Resolve(legacy_tool): %v", err)
+	}
+	if want := []string{"does_not_exist"}; !reflect.DeepEqual(worker.Tools, want) {
+		t.Fatalf("target legacy_tool = %q, want %q retained without a registry", worker.Tools, want)
+	}
+}
