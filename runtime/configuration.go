@@ -45,31 +45,39 @@ type capturedConfigDocument struct {
 	Plugins   map[string]json.RawMessage `json:"plugins"`
 }
 
-// newConfiguration decodes the captured main-configuration and
-// agent-definition bytes once, assembles the effective catalog from the
-// supplied layers plus the captured providers (no entry point rereads the
-// main configuration), and returns the complete snapshot carrying the given
-// publication generation.
-func newConfiguration(generation uint64, configData, agentsData []byte, layers catalog.BuildInputs, capabilityIDs []string) (*configuration, error) {
+// decodeCapturedConfig decodes one captured main configuration document in a
+// single pass: only the catalog, sessions, and plugin sections are consumed,
+// numbers stay exact through the UseNumber decoder, and no legacy
+// whole-document shape or permission rule is enforced.
+func decodeCapturedConfig(configData []byte) (capturedConfigDocument, error) {
 	var doc capturedConfigDocument
 	decoder := json.NewDecoder(bytes.NewReader(configData))
 	decoder.UseNumber()
 	if err := decoder.Decode(&doc); err != nil {
-		return nil, fmt.Errorf("decode captured configuration: %w", err)
+		return doc, fmt.Errorf("decode captured configuration: %w", err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		if err == nil {
-			return nil, fmt.Errorf("decode captured configuration: unexpected trailing JSON value")
+			return doc, fmt.Errorf("decode captured configuration: unexpected trailing JSON value")
 		}
-		return nil, fmt.Errorf("decode captured configuration: %w", err)
+		return doc, fmt.Errorf("decode captured configuration: %w", err)
 	}
+	return doc, nil
+}
+
+// newConfiguration assembles the complete snapshot from one decoded captured
+// document, the provider assembly already performed for the captured
+// providers layer (a catalog entry never rereads the main configuration), and
+// the captured agent-definition bytes: it calls ParseSessions and
+// agents.ParseWithCapabilities against the supplied ordinary visible export
+// IDs and carries the given publication generation. Plugin-section validation
+// belongs to the publisher, not here.
+func newConfiguration(generation uint64, doc capturedConfigDocument, built catalog.BuildResult, agentsData []byte, capabilityIDs []string) (*configuration, error) {
 	sessions, err := config.ParseSessions(doc.Sessions)
 	if err != nil {
 		return nil, fmt.Errorf("captured configuration sessions: %w", err)
 	}
-	layers.UserRaw = doc.Providers
-	built := catalog.Build(layers)
 	definitions, err := agents.ParseWithCapabilities(agentsData, capabilityIDs)
 	if err != nil {
 		return nil, fmt.Errorf("decode captured agent definitions: %w", err)

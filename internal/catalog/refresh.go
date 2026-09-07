@@ -99,40 +99,54 @@ func refreshProviderDiscovery(ctx context.Context, home, configPath string, cat 
 	if !attempted {
 		return false, warnings
 	}
+	return publishDiscoveryResult(home, provider, providerID, discovered, warnings, try, cat, func() map[string]map[string]bool {
+		return userCostProtectionForProviderAt(home, configPath, providerID)
+	})
+}
+
+// publishDiscoveryResult is the shared per-provider publication code once the
+// network attempt has begun: a failed fetch records the attempt marker so a
+// duplicate fetch stays suppressed inside the TTL while the fetch failure
+// surfaces, and a fetched result writes the discovery cache and gap-fills the
+// catalog merge. costProtection supplies the user-declared cost fields to
+// retain, read lazily at merge time from the caller's own input source. try
+// routes every publication through the one-attempt Try writers. Once a write
+// starts it keeps the existing atomicfs semantics and may finish despite a
+// later cancellation.
+func publishDiscoveryResult(home string, provider *Provider, providerID string, discovered *DiscoveredProvider, fetchWarnings []Warning, try bool, cat *Catalog, costProtection func() map[string]map[string]bool) (bool, []Warning) {
 	if discovered == nil {
 		// The network failed: record the attempt so a duplicate fetch is
 		// suppressed inside the TTL, then surface the fetch failure.
 		if try {
 			ok, err := TryWriteDiscoveryAttempt(home, providerID, provider.Transport, time.Now().UTC())
 			if err != nil {
-				return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery attempt: %v", err)})
+				return false, append(fetchWarnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery attempt: %v", err)})
 			}
 			if !ok {
-				return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("discovery lock is held for %q; attempt write skipped", providerID)})
+				return false, append(fetchWarnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("discovery lock is held for %q; attempt write skipped", providerID)})
 			}
 		} else {
 			if err := WriteDiscoveryAttempt(home, providerID, provider.Transport, time.Now().UTC()); err != nil {
-				return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery attempt: %v", err)})
+				return false, append(fetchWarnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery attempt: %v", err)})
 			}
 		}
-		return false, warnings
+		return false, fetchWarnings
 	}
 	if try {
 		ok, err := TryWriteDiscoveryCache(home, providerID, provider.Transport, *discovered, time.Now().UTC())
 		if err != nil {
-			return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)})
+			return false, append(fetchWarnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)})
 		}
 		if !ok {
-			return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("discovery lock is held for %q; cache write skipped", providerID)})
+			return false, append(fetchWarnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("discovery lock is held for %q; cache write skipped", providerID)})
 		}
 	} else {
 		if err := WriteDiscoveryCache(home, providerID, provider.Transport, *discovered, time.Now().UTC()); err != nil {
-			return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)})
+			return false, append(fetchWarnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("write discovery cache: %v", err)})
 		}
 	}
-	protected := userCostProtectionForProviderAt(home, configPath, providerID)
-	if err := cat.MergeDiscoveredProviderWithCostProtection(providerID, *discovered, protected); err != nil {
-		return false, append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: err.Error()})
+	if err := cat.MergeDiscoveredProviderWithCostProtection(providerID, *discovered, costProtection()); err != nil {
+		return false, append(fetchWarnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: err.Error()})
 	}
 	return true, nil
 }
@@ -143,6 +157,13 @@ func userCostProtectionForProvider(home, providerID string) map[string]map[strin
 
 func userCostProtectionForProviderAt(home, configPath, providerID string) map[string]map[string]bool {
 	userRaw, _ := readUserConfigProvidersAt(home, configPath)
+	return userCostProtection(userRaw, providerID)
+}
+
+// userCostProtection extracts the user-declared cost fields to retain for one
+// provider from already-read user provider input, so a refresh publication
+// never needs to reread the main configuration.
+func userCostProtection(userRaw map[string]any, providerID string) map[string]map[string]bool {
 	providerRaw, _ := userRaw[providerID].(map[string]any)
 	if providerRaw == nil {
 		return nil

@@ -44,9 +44,20 @@ const testAgentsDocument = `{
 
 func testCapabilities() []string { return []string{"cap-a", "cap-b"} }
 
+// assembleConfiguration drives the factored snapshot entries exactly as a
+// caller with one captured document set does: decode once, assemble the
+// captured providers with the pure build, then hand both to newConfiguration.
+func assembleConfiguration(generation uint64, configData, agentsData string, capabilityIDs []string) (*configuration, error) {
+	doc, err := decodeCapturedConfig([]byte(configData))
+	if err != nil {
+		return nil, err
+	}
+	return newConfiguration(generation, doc, catalog.Build(catalog.BuildInputs{UserRaw: doc.Providers}), []byte(agentsData), capabilityIDs)
+}
+
 func testSnapshot(t *testing.T) *configuration {
 	t.Helper()
-	snapshot, err := newConfiguration(3, []byte(testConfigDocument), []byte(testAgentsDocument), catalog.BuildInputs{}, testCapabilities())
+	snapshot, err := assembleConfiguration(3, testConfigDocument, testAgentsDocument, testCapabilities())
 	if err != nil {
 		t.Fatalf("newConfiguration: %v", err)
 	}
@@ -116,7 +127,7 @@ func TestNewConfigurationSnapshot(t *testing.T) {
 // permission decoding) never reject the captured bytes.
 func TestNewConfigurationNullAndDefaults(t *testing.T) {
 	for _, doc := range []string{`{}`, `{"sessions":null,"plugins":null,"providers":null}`} {
-		snapshot, err := newConfiguration(1, []byte(doc), []byte(`null`), catalog.BuildInputs{}, nil)
+		snapshot, err := assembleConfiguration(1, doc, `null`, nil)
 		if err != nil {
 			t.Fatalf("newConfiguration(%s): %v", doc, err)
 		}
@@ -157,7 +168,7 @@ func TestNewConfigurationRejectsCandidates(t *testing.T) {
 		{name: "plugins not an object", configData: `{"plugins":[]}`, agentsData: `{}`},
 		{name: "agents not an object", configData: `{}`, agentsData: `[]`},
 	} {
-		if snapshot, err := newConfiguration(1, []byte(row.configData), []byte(row.agentsData), catalog.BuildInputs{}, nil); err == nil {
+		if snapshot, err := assembleConfiguration(1, row.configData, row.agentsData, nil); err == nil {
 			t.Fatalf("%s produced %+v, want rejection", row.name, snapshot)
 		}
 	}
@@ -167,10 +178,10 @@ func TestNewConfigurationRejectsCandidates(t *testing.T) {
 // definition problems are retained in the existing warning types instead of
 // failing the candidate.
 func TestNewConfigurationKeepsExistingWarningTypes(t *testing.T) {
-	snapshot, err := newConfiguration(0,
-		[]byte(`{"providers":{"broken":5}}`),
-		[]byte(`{"ghost":{"capabilities":["not-declared"]}}`),
-		catalog.BuildInputs{}, nil)
+	snapshot, err := assembleConfiguration(0,
+		`{"providers":{"broken":5}}`,
+		`{"ghost":{"capabilities":["not-declared"]}}`,
+		nil)
 	if err != nil {
 		t.Fatalf("newConfiguration: %v", err)
 	}
