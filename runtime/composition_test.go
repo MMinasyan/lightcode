@@ -667,7 +667,7 @@ func newWorkspaceFixture(t *testing.T) *workspaceFixture {
 	f.stopOwner = stop
 	t.Cleanup(stop)
 	f.rt = mustOpenScope(t, c, owner, runtimeScopeInfo(), nil)
-	f.w = newWorkspaceScopes(owner, c, []*scope{f.rt})
+	f.w = newWorkspaceScopes(owner, c, []*scope{f.rt}, newObservation())
 	return f
 }
 

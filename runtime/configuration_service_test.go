@@ -45,7 +45,7 @@ func (h *serviceHarness) service(owner context.Context, plugins ...Plugin) *conf
 	if err != nil {
 		h.t.Fatalf("newComposition: %v", err)
 	}
-	return newConfigurationService(owner, c, h.loader, h.configPath)
+	return newConfigurationService(owner, c, h.loader, h.configPath, newObservation())
 }
 
 func staticBundledFS() fstest.MapFS {

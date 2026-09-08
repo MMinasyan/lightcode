@@ -43,6 +43,7 @@ type Runtime struct {
 	work         context.Context
 	cancelWork   context.CancelFunc
 	config       *configurationService
+	obs          *observation
 	runtimeScope *scope
 	workspaces   *workspaceScopes
 	harness      *harness.Harness
@@ -128,7 +129,8 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		fmt.Fprintf(os.Stderr, "lightcode: .env: %v\n", err)
 	}
 
-	configService := newConfigurationService(work, c, catalog.NewLoader(home, nil), configPath)
+	obs := newObservation()
+	configService := newConfigurationService(work, c, catalog.NewLoader(home, nil), configPath, obs)
 	if _, err := configService.publish(work); err != nil {
 		// The service's owner-first cancellation rule reports its own bare
 		// ErrClosed sentinel value, but no owner is closed yet during
@@ -146,6 +148,10 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	if err != nil {
 		return unlock(err)
 	}
+	// The observation is attached after construction: no subscriber can
+	// exist before the owner is published, so the Runtime scope announces
+	// only its closure, and descendant scopes inherit the publisher from it.
+	runtimeScope.obs = obs
 	unwind := func(cause error) (*Runtime, error) {
 		cancelWork()
 		return nil, errors.Join(cause, runtimeScope.cleanup(), lock.Release())
@@ -159,7 +165,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		return unwind(err)
 	}
 
-	workspaces := newWorkspaceScopes(work, c, []*scope{runtimeScope})
+	workspaces := newWorkspaceScopes(work, c, []*scope{runtimeScope}, obs)
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: storage,
 		Prepare: newPreparation(configService, c, runtimeScope, workspaces, options.prepare).bind(),
@@ -173,6 +179,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		work:         work,
 		cancelWork:   cancelWork,
 		config:       configService,
+		obs:          obs,
 		runtimeScope: runtimeScope,
 		workspaces:   workspaces,
 		harness:      h,
@@ -340,8 +347,9 @@ func (r *Runtime) beginShutdown() {
 // Harness after its context cancellation has settled every in-flight
 // preparation, execution, and required terminal commit, then closes every
 // live Workspace scope in sorted path order and the Runtime scope in reverse
-// dependency order, and releases the lock as the final ownership action.
-// Every required close is attempted and all errors are joined; no
+// dependency order, closes every passive subscription once those cleanup
+// events have been published, and releases the lock as the final ownership
+// action. Every required close is attempted and all errors are joined; no
 // state-owning mutex is held across any of it.
 func (r *Runtime) joinShutdown() error {
 	var errs []error
@@ -355,6 +363,7 @@ func (r *Runtime) joinShutdown() error {
 	if err := r.runtimeScope.close(context.Background()); err != nil {
 		errs = append(errs, err)
 	}
+	r.obs.closeAll()
 	if err := r.lock.Release(); err != nil {
 		errs = append(errs, err)
 	}

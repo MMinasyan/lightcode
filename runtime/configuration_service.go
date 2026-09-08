@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -44,7 +45,9 @@ const (
 // readers Load once without a lock. A failed or canceled build publishes
 // nothing: initial publication uses generation 1, only a success increments
 // it, and the increment happens under the build mutex. Builds run outside any
-// Runtime-wide lock and start no plugin or other service work.
+// Runtime-wide lock and start no plugin or other service work. Each
+// publication carries its passive configuration event inside the same
+// observation section as its atomic Store.
 type configurationService struct {
 	loader        *catalog.Loader
 	configPath    string
@@ -54,18 +57,19 @@ type configurationService struct {
 	capabilityIDs []string
 
 	owner context.Context
+	obs   *observation
 
 	buildMu   sync.Mutex
 	published atomic.Pointer[configuration]
 }
 
 // newConfigurationService binds the service to the composition's owned
-// declarations, the Loader rooted at the home the Runtime resolved once, and
-// the Runtime owner context. Neither DataDir nor ConfigPath relocates the
-// home-based discovery cache or its locks and TTL records, and the service
-// reads no dotenv: that belongs to Runtime startup, not to any build or
-// reload.
-func newConfigurationService(owner context.Context, c *composition, loader *catalog.Loader, configPath string) *configurationService {
+// declarations, the Loader rooted at the home the Runtime resolved once, the
+// Runtime owner context, and the Runtime's passive observation. Neither
+// DataDir nor ConfigPath relocates the home-based discovery cache or its
+// locks and TTL records, and the service reads no dotenv: that belongs to
+// Runtime startup, not to any build or reload.
+func newConfigurationService(owner context.Context, c *composition, loader *catalog.Loader, configPath string, obs *observation) *configurationService {
 	pluginIDs := make(map[string]bool, len(c.plugins))
 	for _, p := range c.plugins {
 		pluginIDs[p.ID] = true
@@ -78,6 +82,7 @@ func newConfigurationService(owner context.Context, c *composition, loader *cata
 		pluginIDs:     pluginIDs,
 		capabilityIDs: c.capabilityIDs,
 		owner:         owner,
+		obs:           obs,
 	}
 }
 
@@ -88,36 +93,44 @@ func (s *configurationService) current() *configuration {
 }
 
 // publish runs one serialized initial-load or reload build and publishes the
-// complete candidate with its next generation as a single atomic Store.
+// complete candidate with its next generation as a single atomic Store,
+// carrying the configuration event in the same observation section as that
+// Store: the build mutex releases inside the commit, before the enqueue.
 func (s *configurationService) publish(ctx context.Context) (*configuration, error) {
 	if err := s.canceled(ctx); err != nil {
 		return nil, err
 	}
 	s.buildMu.Lock()
-	defer s.buildMu.Unlock()
 	// A cancellation observed while waiting is returned after the active
 	// builder releases the mutex, without starting another build.
 	if err := s.canceled(ctx); err != nil {
+		s.buildMu.Unlock()
 		return nil, err
 	}
 	generation := uint64(1)
 	if snapshot := s.published.Load(); snapshot != nil {
 		generation = snapshot.generation + 1
 		if generation == 0 {
+			s.buildMu.Unlock()
 			return nil, fmt.Errorf("configuration publication generation exhausted: %w", ErrConfiguration)
 		}
 	}
 	candidate, err := s.build(ctx, generation)
 	if err != nil {
+		s.buildMu.Unlock()
 		return nil, err
 	}
 	// Immediately before the atomic Store, owner and caller cancellation are
 	// checked once more. A publication that wins this check may finish despite
 	// later cancellation; shutdown joins it.
 	if err := s.canceled(ctx); err != nil {
+		s.buildMu.Unlock()
 		return nil, err
 	}
-	s.published.Store(candidate)
+	s.obs.publish(func() {
+		s.published.Store(candidate)
+		s.buildMu.Unlock()
+	}, Event{Kind: EventConfiguration, ConfigurationRevision: strconv.FormatUint(candidate.generation, 10)})
 	return candidate, nil
 }
 

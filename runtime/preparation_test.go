@@ -247,8 +247,9 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 	e.ownerCancel = cancel
 	e.comp = mustComposition(t, e.plugins()...)
 	e.runtime = mustOpenScope(t, e.comp, owner, ScopeInfo{Kind: ScopeRuntime, DataDir: sh.dataDir}, nil)
-	e.ws = newWorkspaceScopes(owner, e.comp, []*scope{e.runtime})
-	e.svc = newConfigurationService(owner, e.comp, sh.loader, sh.configPath)
+	obs := newObservation()
+	e.ws = newWorkspaceScopes(owner, e.comp, []*scope{e.runtime}, obs)
+	e.svc = newConfigurationService(owner, e.comp, sh.loader, sh.configPath, obs)
 	if _, err := e.svc.publish(context.Background()); err != nil {
 		t.Fatalf("initial publish: %v", err)
 	}

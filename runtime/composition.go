@@ -399,6 +399,9 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 		storages: make(map[string]any),
 		disposed: make(chan struct{}),
 	}
+	if len(ancestors) > 0 {
+		sc.obs = ancestors[0].obs
+	}
 	resolved := make(map[string]bindingEntry)
 	for _, ancestor := range ancestors {
 		for id, entry := range ancestor.bindings.entries {
@@ -432,7 +435,14 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 			return fail(fmt.Errorf("plugin %q: %w", p.ID, err))
 		}
 	}
-	sc.bindings = Bindings{entries: own}
+	commit := func() { sc.bindings = Bindings{entries: own} }
+	if sc.obs != nil && info.Kind != ScopeWorkspace {
+		// Construction completion is this scope's publication; a Workspace
+		// scope publishes later, at the registry commit in build.
+		sc.obs.publish(commit, scopeEvent(EventScopeOpened, info))
+	} else {
+		commit()
+	}
 	return sc, nil
 }
 
@@ -499,13 +509,19 @@ func selectCapabilities(scopes []*scope, selected []string) (Bindings, error) {
 // scope is one constructed instance set with its guard state. The complete
 // Core call tree runs under exactly one guard: work is registered under the
 // short state mutex, executed outside every lock on a context canceled by
-// either the scope or the caller, and deregistered once on release. Closing
-// first closes admission and cancels the scope context, then joins admitted
-// work and disposes instances in reverse construction order.
+// either the scope or the caller, and deregistered once on return. Closing
+// first commits closed admission — publishing its scope event through the
+// Runtime observation when one is attached — and cancels the scope context,
+// then joins admitted work and disposes instances in reverse construction
+// order.
 type scope struct {
 	info   ScopeInfo
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// obs is the Runtime's passive publisher inherited from the first
+	// ancestor; scopes constructed before the owner exists keep it nil.
+	obs *observation
 
 	bindings Bindings
 	storages map[string]any
@@ -570,9 +586,18 @@ func (s *scope) enter(ctx context.Context) (context.Context, func(), error) {
 // enter once closure has begun.
 func (s *scope) close(ctx context.Context) error {
 	s.closeOnce.Do(func() {
-		s.mu.Lock()
-		s.closed = true
-		s.mu.Unlock()
+		commit := func() {
+			s.mu.Lock()
+			s.closed = true
+			s.mu.Unlock()
+		}
+		if s.obs != nil {
+			// The observation section commits closed admission before the
+			// cancellation and disposal that follow.
+			s.obs.publish(commit, scopeEvent(EventScopeClosed, s.info))
+		} else {
+			commit()
+		}
 		s.cancel()
 		go func() {
 			s.wg.Wait()
@@ -622,10 +647,13 @@ type workspaceAttempt struct {
 // workspaceScopes is the Runtime-owned registry of shared Workspace scopes.
 // Same-key callers join one construction; other keys proceed independently.
 // Successful Workspaces live until Runtime shutdown, not Session deletion.
+// A successful publication happens inside one observation section with the
+// registry insertion, so subscribers and joined waiters see one commit order.
 type workspaceScopes struct {
 	owner     context.Context
 	c         *composition
 	ancestors []*scope
+	obs       *observation
 
 	mu       sync.Mutex
 	closed   bool
@@ -638,11 +666,12 @@ type workspaceScopes struct {
 	shutErr  error
 }
 
-func newWorkspaceScopes(owner context.Context, c *composition, ancestors []*scope) *workspaceScopes {
+func newWorkspaceScopes(owner context.Context, c *composition, ancestors []*scope, obs *observation) *workspaceScopes {
 	return &workspaceScopes{
 		owner:     owner,
 		c:         c,
 		ancestors: ancestors,
+		obs:       obs,
 		live:      make(map[string]*scope),
 		attempts:  make(map[string]*workspaceAttempt),
 		shutDone:  make(chan struct{}),
@@ -684,18 +713,30 @@ func (w *workspaceScopes) get(ctx context.Context, info ScopeInfo) (*scope, erro
 
 // build runs one construction attempt as Runtime-owned work and publishes the
 // complete scope or the shared failure without holding the registry lock
-// across factories.
+// across factories. A successful publication takes the observation mutex
+// before the registry lock and enqueues the scope_opened event in that same
+// section, so publication and enqueue share one order; a failed attempt
+// publishes nothing.
 func (w *workspaceScopes) build(key string, info ScopeInfo, attempt *workspaceAttempt) {
 	defer w.building.Done()
 	sc, err := w.c.openScope(w.owner, info, w.ancestors)
-	w.mu.Lock()
-	delete(w.attempts, key)
-	if err == nil {
-		w.live[key] = sc
+	if err != nil {
+		w.mu.Lock()
+		delete(w.attempts, key)
+		w.mu.Unlock()
+		attempt.sc, attempt.err = sc, err
+		close(attempt.done)
+		return
 	}
-	w.mu.Unlock()
-	attempt.sc, attempt.err = sc, err
-	close(attempt.done)
+	w.obs.publish(func() {
+		sc.obs = w.obs
+		w.mu.Lock()
+		delete(w.attempts, key)
+		w.live[key] = sc
+		w.mu.Unlock()
+		attempt.sc, attempt.err = sc, nil
+		close(attempt.done)
+	}, scopeEvent(EventScopeOpened, info))
 }
 
 // shutdown closes registry admission, joins in-flight construction as
