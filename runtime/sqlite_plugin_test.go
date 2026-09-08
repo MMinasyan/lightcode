@@ -495,3 +495,86 @@ func readSessionRegister(t *testing.T, store harness.Storage, sessionID string) 
 	}
 	return wire.State.CurrentOperationID
 }
+
+// nextComposedEvent reads one event with the test budget applied.
+func nextComposedEvent(t *testing.T, sub *runtime.Subscription) (runtime.Event, bool) {
+	t.Helper()
+	select {
+	case event, ok := <-sub.Events():
+		return event, ok
+	case <-time.After(10 * time.Second):
+		t.Fatal("no event arrived within the test budget")
+		return runtime.Event{}, false
+	}
+}
+
+// TestComposedSQLiteRuntimeObservationShutdownAndOwnership combines the
+// external composition surface over the real plugin: a saturated observer is
+// removed while a healthy one continues, shutdown converges and closes every
+// passive subscription, the data root stays the sole plugin-owned state, and
+// ownership transfers to the next composition after release.
+func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
+	ctx := context.Background()
+	e := newComposeEnv(t)
+	r, err := e.openComposed(ctx)
+	if err != nil {
+		t.Fatalf("OpenForTest: %v", err)
+	}
+	sat, err := r.Subscribe(1)
+	if err != nil {
+		t.Fatalf("Subscribe(saturated): %v", err)
+	}
+	healthy, err := r.Subscribe(8)
+	if err != nil {
+		t.Fatalf("Subscribe(healthy): %v", err)
+	}
+	for _, want := range []string{"2", "3"} {
+		if revision, err := r.Reload(ctx); err != nil || revision != want {
+			t.Fatalf("Reload = (%q, %v), want %s", revision, err, want)
+		}
+	}
+	first, ok := nextComposedEvent(t, sat)
+	if !ok || first.Kind != runtime.EventConfiguration || first.ConfigurationRevision != "2" {
+		t.Fatalf("saturated subscriber first event = %+v (ok=%v), want revision 2", first, ok)
+	}
+	if _, ok := nextComposedEvent(t, sat); ok {
+		t.Fatal("saturated subscriber still open at the second publication, want it removed and closed")
+	}
+	sat.Close()
+	var observed []runtime.Event
+	for _, want := range []string{"2", "3"} {
+		event, ok := nextComposedEvent(t, healthy)
+		if !ok || event.Kind != runtime.EventConfiguration || event.ConfigurationRevision != want {
+			t.Fatalf("healthy subscriber event = %+v (ok=%v), want configuration %s", event, ok, want)
+		}
+		observed = append(observed, event)
+	}
+	if err := r.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := sortedNames(t, e.dataDir); !slices.Equal(got, []string{"lightcode.db", "runtime.lock"}) {
+		t.Fatalf("data root after Close = %v, want exactly the ownership lock and the composed database", got)
+	}
+	for {
+		event, ok := nextComposedEvent(t, healthy)
+		if !ok {
+			break
+		}
+		observed = append(observed, event)
+	}
+	want := []runtime.Event{
+		{Kind: runtime.EventConfiguration, ConfigurationRevision: "2"},
+		{Kind: runtime.EventConfiguration, ConfigurationRevision: "3"},
+		{Kind: runtime.EventScopeClosed, Scope: runtime.ScopeInfo{Kind: runtime.ScopeRuntime}},
+	}
+	if !slices.Equal(observed, want) {
+		t.Fatalf("healthy subscriber events = %+v, want the observed revisions plus the Runtime closure in publication order %+v", observed, want)
+	}
+	again, err := e.openComposed(ctx)
+	if err != nil {
+		t.Fatalf("reopen after the shutdown released ownership: %v", err)
+	}
+	if err := again.Close(ctx); err != nil {
+		t.Fatalf("Close after reacquire: %v", err)
+	}
+}
