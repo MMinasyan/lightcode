@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
@@ -27,10 +28,14 @@ var ErrOwned = errors.New("runtime: data directory owned by another Runtime")
 // discovery cache keep their home-based paths: neither option relocates them
 // nor changes owner identity. prepare is the controlled preparation function
 // supplied by every caller until concrete production preparation lands.
+// sweepTicks optionally replaces the automatic sweep scheduler's owned
+// hourly ticker with a controlled tick stream whose sends carry each pass's
+// explicit time; the zero value keeps the production time.Ticker.
 type options struct {
 	DataDir, ConfigPath string
 	Plugins             []Plugin
 	prepare             prepare
+	sweepTicks          <-chan time.Time
 }
 
 // Runtime is the single live owner of one Harness, its durable Session
@@ -71,6 +76,8 @@ type Runtime struct {
 // storage export, run restart recovery against it, and construct the Harness
 // with the bound preparation. The storage factory initializes its backend
 // under the held ownership; other factories receive no canonical Storage.
+// The automatic sweep's owned ticker loop is then registered as Runtime work
+// and one initial pass runs, both before the completed-owner publication.
 // Failure or cancellation before completed construction unwinds every
 // acquired resource, closes state access before releasing the lock, and
 // preserves committed repair. Construction never returns a non-nil Runtime
@@ -185,6 +192,12 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		harness:      h,
 		shutdownDone: make(chan struct{}),
 	}
+	sweepTicks, stopSweepTicker := options.sweepTicks, func() {}
+	if sweepTicks == nil {
+		ticker := time.NewTicker(sweepInterval)
+		sweepTicks, stopSweepTicker = ticker.C, ticker.Stop
+	}
+	r.startMaintenance(sweepTicks, stopSweepTicker)
 	return r.publishOwner(work)
 }
 
