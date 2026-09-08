@@ -20,7 +20,7 @@ const publicModule = "github.com/MMinasyan/lightcode"
 // the SQLite driver is confined to internal/storage.
 const sqliteDriverPkg = "github.com/mattn/go-sqlite3"
 
-// TestPublicFoundationDependencyIsolation enforces the pre-cutover dependency baseline over the authoritative complete set of Git-tracked non-test Go files: the model package imports only the standard library; the agent package imports only the standard library and the public model package; the harness package is direct-test-only and imports only the standard library plus the public model and agent packages; internal/storage is direct-test-only, imports only the standard library plus the public harness contract plus the SQLite driver it implements the contract with, and stays one package without backend subpackages; the runtime package is direct-test-only and imports only the standard library plus the public model and harness packages plus the retained internal config, agents, catalog, and atomicfs helpers, never internal/agent, internal/storage, any concrete plugin under internal/plugins, or the SQLite driver; every other tracked production file imports none of these packages, not the SQLite driver, and not the target runtime or its concrete plugins, whatever its directory name is. Test files are exempt in every directory — external-package test files are exactly where direct and composition tests of the new packages live — and untracked or ignored files never gate the guard. When a later phase adds a new target package that must consume model, agent, or harness, it extends the allowlist for its own package only; existing root and internal/ production packages stay forbidden until their owning cutover or deletion phase.
+// TestPublicFoundationDependencyIsolation enforces the pre-cutover dependency baseline over the authoritative complete set of Git-tracked non-test Go files: the model package imports only the standard library; the agent package imports only the standard library and the public model package; the harness package is direct-test-only and imports only the standard library plus the public model and agent packages; internal/storage is direct-test-only, imports only the standard library plus the public harness contract plus the SQLite driver it implements the contract with, and stays one package without backend subpackages; the runtime package is direct-test-only and imports only the standard library plus the public model and harness packages plus the retained internal config, agents, catalog, and atomicfs helpers, never internal/agent, internal/storage, any concrete plugin under internal/plugins, or the SQLite driver; the internal/plugins/sqlite plugin imports only the standard library plus the public runtime and harness contracts and the internal/storage backend it declares; and every other tracked production file imports none of these packages, not the SQLite driver, and not the target runtime or its concrete plugins, whatever its directory name is. Test files are exempt in every directory — external-package test files are exactly where direct and composition tests of the new packages live — and untracked or ignored files never gate the guard. When a later phase adds a new target package that must consume model, agent, or harness, it extends the allowlist for its own package only; existing root and internal/ production packages stay forbidden until their owning cutover or deletion phase.
 func TestPublicFoundationDependencyIsolation(t *testing.T) {
 	root := moduleRoot(t)
 	std := standardLibraryImports(t)
@@ -93,6 +93,10 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 			if imp != harnessPkg && imp != sqliteDriverPkg && !std[imp] {
 				problems = append(problems, rel+": internal/storage imports "+imp+"; internal/storage may import only the standard library, "+harnessPkg+", and "+sqliteDriverPkg)
 			}
+		case "internal/plugins/sqlite":
+			if imp != runtimePkg && imp != harnessPkg && imp != storagePkg && !std[imp] {
+				problems = append(problems, rel+": internal/plugins/sqlite imports "+imp+"; the SQLite plugin may import only the standard library, "+runtimePkg+", "+harnessPkg+", and "+storagePkg)
+			}
 		default:
 			if imp == modelPkg || imp == agentPkg || imp == harnessPkg || imp == storagePkg || imp == sqliteDriverPkg ||
 				imp == runtimePkg || imp == pluginsPkg || strings.HasPrefix(imp, pluginsPkg+"/") {
@@ -139,6 +143,17 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	for _, imp := range []string{publicModule + "/model", publicModule + "/agent"} {
 		if problems := checkTrackedGoFile("internal/storage/x.go", []string{imp}, std); len(problems) != 1 {
 			t.Errorf("internal/storage importing %q: %d problems, want 1: %v", imp, len(problems), problems)
+		}
+	}
+	// The SQLite plugin declares the ordinary Runtime-scoped plugin over the
+	// public runtime and harness contracts and the storage backend it opens;
+	// the legacy owner, the driver, and sibling plugins never enter it.
+	if problems := checkTrackedGoFile("internal/plugins/sqlite/x.go", []string{"context", "path/filepath", publicModule + "/runtime", publicModule + "/harness", publicModule + "/internal/storage"}, std); len(problems) != 0 {
+		t.Errorf("allowed internal/plugins/sqlite imports flagged: %v", problems)
+	}
+	for _, imp := range []string{publicModule + "/agent", publicModule + "/internal/agent", sqliteDriverPkg, publicModule + "/internal/plugins/memory"} {
+		if problems := checkTrackedGoFile("internal/plugins/sqlite/x.go", []string{imp}, std); len(problems) != 1 {
+			t.Errorf("internal/plugins/sqlite importing %q: %d problems, want 1: %v", imp, len(problems), problems)
 		}
 	}
 	// The runtime target layer consumes the public model and harness
