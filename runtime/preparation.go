@@ -226,7 +226,8 @@ func requireCatalogModel(snapshot *configuration, ref model.ModelRef) error {
 
 // validateCaptureSelection checks the prepared capture's model and revision
 // against the selected view and its capability names against the Agent's full
-// selected names; Harness remains the final capture and admission validator.
+// selected names in the same order; nil and empty selections compare equal.
+// Harness remains the final capture and admission validator.
 func validateCaptureSelection(capture harness.ExecutionCapture, sel selection) error {
 	if capture.Model != sel.agent.Model {
 		return fmt.Errorf("capture model %s is not the selected model %s: %w", capture.Model.String(), sel.agent.Model.String(), harness.ErrInvalid)
@@ -234,14 +235,8 @@ func validateCaptureSelection(capture harness.ExecutionCapture, sel selection) e
 	if capture.ConfigurationRevision != sel.invocation.Revision() {
 		return fmt.Errorf("capture revision %q is not the captured revision %q: %w", capture.ConfigurationRevision, sel.invocation.Revision(), harness.ErrInvalid)
 	}
-	selected := make(map[string]bool, len(sel.agent.Capabilities))
-	for _, id := range sel.agent.Capabilities {
-		selected[id] = true
-	}
-	for _, name := range capture.Capabilities {
-		if !selected[name] {
-			return fmt.Errorf("capture capability %q is not a selected capability name: %w", name, harness.ErrInvalid)
-		}
+	if !slices.Equal(capture.Capabilities, sel.agent.Capabilities) {
+		return fmt.Errorf("capture capabilities %q are not the selected capabilities %q: %w", capture.Capabilities, sel.agent.Capabilities, harness.ErrInvalid)
 	}
 	return nil
 }

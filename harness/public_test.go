@@ -1186,6 +1186,112 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 	})
 }
 
+// tamper replaces an equal-length substring of one raw JSON buffer in place,
+// exactly the scratch mutation an uncooperative opener could apply to the
+// bytes it receives.
+func tamper(raw json.RawMessage, want, with string) {
+	if len(want) != len(with) {
+		panic("in-place tampering needs an equal-length replacement")
+	}
+	i := bytes.Index(raw, []byte(want))
+	if i < 0 {
+		panic("in-place tampering target absent")
+	}
+	copy(raw[i:], with)
+}
+
+// TestPublicOpenerInputMutationKeepsAdmittedExecution proves the captured
+// execution authority at the opener handoff: an opener that renames a tool
+// and tampers with its received admission's nested Parameters bytes and
+// capability names in place still faces the Agent with the admitted
+// definitions, and the durable Operation retains them too; the unchanged
+// opener is the positive sibling.
+func TestPublicOpenerInputMutationKeepsAdmittedExecution(t *testing.T) {
+	admittedParams := json.RawMessage(`{"type":"object","source":"admitted"}`)
+	admitted := model.ToolDefinition{Name: "echo", Description: "echoes", Parameters: admittedParams}
+	for _, mutate := range []bool{true, false} {
+		name := "unchanged opener keeps the admitted capture"
+		if mutate {
+			name = "mutating opener keeps the admitted capture"
+		}
+		t.Run(name, func(t *testing.T) {
+			eachStore(t, func(t *testing.T, store harness.Storage) {
+				script := newScriptModel()
+				f := newPublicFixture(t, store, script, nil)
+				defer f.close()
+				var opens atomic.Int64
+				settled := make(chan struct{}, 1)
+				capture := publicCapture()
+				capture.Tools = []model.ToolDefinition{admitted}
+				capture.Capabilities = []string{"cap.one", "cap.two"}
+				f.prepareHook = func(int, harness.PreparationRequest) (harness.PreparedExecution, error) {
+					return harness.PreparedExecution{
+						Capture: capture,
+						Open: func(_ context.Context, adm harness.OperationAdmission) (harness.Execution, error) {
+							opens.Add(1)
+							if mutate {
+								adm.Execution.Tools[0].Name = "renamed"
+								adm.Execution.Tools[0].Description = "renamed"
+								tamper(adm.Execution.Tools[0].Parameters, "admitted", "tampered")
+								adm.Execution.Capabilities[0] = "dropped"
+							}
+							return harness.Execution{
+								Model: script.effect,
+								Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+									return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+								},
+								Close: func() error { // runs after the terminal settlement commits
+									select {
+									case settled <- struct{}{}:
+									default:
+									}
+									return nil
+								},
+							}, nil
+						},
+					}, nil
+				}
+				session := createSession(t, f.h)
+				if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
+					t.Fatalf("submit: %v", err)
+				}
+				select {
+				case <-settled:
+				case <-time.After(10 * time.Second):
+					t.Fatalf("the execution cleanup never ran after the settlement")
+				}
+				if err := converge(t, f); err != nil {
+					t.Fatalf("Wait: %v", err)
+				}
+				if opens.Load() != 1 {
+					t.Fatalf("opener calls = %d, want the mutation assertion to run through a real open", opens.Load())
+				}
+				seen := script.seen()
+				if len(seen) != 1 {
+					t.Fatalf("%d model requests, want one", len(seen))
+				}
+				got := seen[0].Tools
+				if len(got) != 1 || got[0].Name != "echo" || got[0].Description != "echoes" || string(got[0].Parameters) != string(admittedParams) {
+					t.Fatalf("advertised tools = %+v, want the admitted definitions, not the opener's local mutations", got)
+				}
+				rec, err := f.h.ReadOperation(context.Background(), session, "op-1")
+				if err != nil {
+					t.Fatalf("ReadOperation: %v", err)
+				}
+				if rec.State.Status != harness.OperationSuccess {
+					t.Fatalf("operation status = %s, want success over the admitted capture", rec.State.Status)
+				}
+				durable := rec.Admission.Execution
+				if len(durable.Tools) != 1 || durable.Tools[0].Name != "echo" || durable.Tools[0].Description != "echoes" ||
+					string(durable.Tools[0].Parameters) != string(admittedParams) ||
+					!reflect.DeepEqual(durable.Capabilities, []string{"cap.one", "cap.two"}) {
+					t.Fatalf("durable capture = %+v, want the admitted values", durable)
+				}
+			})
+		})
+	}
+}
+
 // TestPublicBufferedItemFailure proves the buffer-lifetime row through public
 // operations: a failed delivery attempt — failed preparation or a failed
 // delivered Operation — is final for the item, and the next buffered message

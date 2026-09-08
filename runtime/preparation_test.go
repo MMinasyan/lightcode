@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -897,6 +898,7 @@ func TestPreparationRejectsAdmissionAtTheBoundary(t *testing.T) {
 		arm         func(e *prepEnv)
 		want        error
 		wantPrepars int
+		mismatch    bool // a selection mismatch must fail before any hook or opener runs
 	}{
 		{name: "unknown agent type", agentType: "ghost", want: harness.ErrInvalid},
 		{name: "selected model absent from the catalog", agentType: "ghostly", want: harness.ErrInvalid},
@@ -929,7 +931,7 @@ func TestPreparationRejectsAdmissionAtTheBoundary(t *testing.T) {
 					return c
 				}
 			},
-			want: harness.ErrInvalid, wantPrepars: 1,
+			want: harness.ErrInvalid, wantPrepars: 1, mismatch: true,
 		},
 		{
 			name: "capture names an unselected short-scope capability", agentType: "dual",
@@ -939,7 +941,47 @@ func TestPreparationRejectsAdmissionAtTheBoundary(t *testing.T) {
 					return c
 				}
 			},
-			want: harness.ErrInvalid, wantPrepars: 1,
+			want: harness.ErrInvalid, wantPrepars: 1, mismatch: true,
+		},
+		{
+			name: "capture omits a selected capability", agentType: "wide",
+			arm: func(e *prepEnv) {
+				e.mutateCapture = func(c harness.ExecutionCapture) harness.ExecutionCapture {
+					c.Capabilities = c.Capabilities[:len(c.Capabilities)-1]
+					return c
+				}
+			},
+			want: harness.ErrInvalid, wantPrepars: 1, mismatch: true,
+		},
+		{
+			name: "capture empties a non-empty selection", agentType: "wide",
+			arm: func(e *prepEnv) {
+				e.mutateCapture = func(c harness.ExecutionCapture) harness.ExecutionCapture {
+					c.Capabilities = nil
+					return c
+				}
+			},
+			want: harness.ErrInvalid, wantPrepars: 1, mismatch: true,
+		},
+		{
+			name: "capture reorders the selection", agentType: "wide",
+			arm: func(e *prepEnv) {
+				e.mutateCapture = func(c harness.ExecutionCapture) harness.ExecutionCapture {
+					c.Capabilities = []string{"hook.second", "hook.first", "cap.shared"}
+					return c
+				}
+			},
+			want: harness.ErrInvalid, wantPrepars: 1, mismatch: true,
+		},
+		{
+			name: "capture duplicates a selected name", agentType: "wide",
+			arm: func(e *prepEnv) {
+				e.mutateCapture = func(c harness.ExecutionCapture) harness.ExecutionCapture {
+					c.Capabilities = []string{"hook.first", "cap.shared", "hook.second", "hook.first"}
+					return c
+				}
+			},
+			want: harness.ErrInvalid, wantPrepars: 1, mismatch: true,
 		},
 		{
 			name: "nil opener prevents admission", agentType: "solo",
@@ -978,12 +1020,146 @@ func TestPreparationRejectsAdmissionAtTheBoundary(t *testing.T) {
 				if calls := e.counts(); calls != tc.wantPrepars {
 					t.Fatalf("preparation calls = %d, want %d", calls, tc.wantPrepars)
 				}
+				if tc.mismatch {
+					for _, event := range e.events.all() {
+						if strings.HasPrefix(event, "hook:") || strings.HasPrefix(event, "open:") {
+							t.Fatalf("selection mismatch ran %q before the admission was validated", event)
+						}
+					}
+				}
 				if err := e.converge(); err != nil {
 					t.Fatalf("Wait: %v", err)
 				}
 			})
 		})
 	}
+}
+
+// oneShotEmptySelection arms exactly the next supply call to return a capture
+// with an empty capability selection, so the delivery after it stays valid.
+func oneShotEmptySelection(e *prepEnv) {
+	var left int32 = 1
+	e.mutateCapture = func(c harness.ExecutionCapture) harness.ExecutionCapture {
+		if atomic.CompareAndSwapInt32(&left, 1, 0) {
+			c.Capabilities = nil
+		}
+		return c
+	}
+}
+
+// TestPreparationSelectionMismatchOnDrainedAndForkDelivery proves on both
+// stores that the queued-drain and Fork admission paths enforce the same
+// selection agreement: a mismatching delivered capture is rejected with no
+// Operation or input entry while the next delivery still admits, and a
+// mismatching Fork publishes no destination Session or prefix copy and
+// leaves the source unchanged.
+func TestPreparationSelectionMismatchOnDrainedAndForkDelivery(t *testing.T) {
+	t.Run("rejected queued delivery adds nothing and the next still admits", func(t *testing.T) {
+		eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+			e := newPrepEnv(t, store)
+			session := e.session("dual")
+			arrived := e.parkModels()
+			e.admit(session, "op-1", "one")
+			<-arrived
+			oneShotEmptySelection(e)
+			if res, err := e.submit(context.Background(), session, "op-2", "two", harness.MessageModeQueued); err != nil || res.Disposition != harness.DispositionQueued {
+				t.Fatalf("queued submit = %+v err %v, want queued", res, err)
+			}
+			if res, err := e.submit(context.Background(), session, "op-3", "three", harness.MessageModeQueued); err != nil || res.Disposition != harness.DispositionQueued {
+				t.Fatalf("queued submit = %+v err %v, want queued", res, err)
+			}
+			e.releaseModels()
+			e.awaitCleanups(2) // op-1 and op-3 each cleaned up; op-2 never ran
+			if _, err := e.h.ReadOperation(context.Background(), session, "op-2"); !errors.Is(err, harness.ErrNotFound) {
+				t.Fatalf("rejected delivery left an Operation: %v", err)
+			}
+			entries, err := e.store.ReadEntries(context.Background(), session, 0)
+			if err != nil {
+				t.Fatalf("ReadEntries: %v", err)
+			}
+			for _, entry := range entries {
+				if entry.OperationID == "op-2" {
+					t.Fatalf("rejected delivery left entry %s (%s) behind", entry.ID, entry.Kind)
+				}
+			}
+			admitted, err := e.h.ReadOperation(context.Background(), session, "op-3")
+			if err != nil || admitted.State.Status != harness.OperationSuccess {
+				t.Fatalf("later delivery = %+v err %v, want admitted and settled", admitted, err)
+			}
+			// The rejected delivery ran no hook and no opener: hook.first ran
+			// once for op-1 and once for op-3 only.
+			if calls := e.hooks[0].calls(); len(calls) != 2 {
+				t.Fatalf("hook.first calls = %v, want the rejected delivery to have run none", calls)
+			}
+			if opens := countEvents(e.events.all(), "open:op-2"); opens != 0 {
+				t.Fatalf("opener ran %d times for the rejected delivery", opens)
+			}
+			if err := e.converge(); err != nil {
+				t.Fatalf("Wait: %v", err)
+			}
+		})
+	})
+	t.Run("failed Fork publishes no destination and leaves the source unchanged", func(t *testing.T) {
+		eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+			e := newPrepEnv(t, store)
+			session := e.session("dual")
+			e.admit(session, "op-1", "one")
+			e.awaitCleanups(1)
+			boundary := e.inputEntry(session, "op-1")
+			sessionsBefore, err := e.store.ListSessionIDs(context.Background())
+			if err != nil {
+				t.Fatalf("ListSessionIDs: %v", err)
+			}
+			entriesBefore, err := e.store.ReadEntries(context.Background(), session, 0)
+			if err != nil {
+				t.Fatalf("ReadEntries: %v", err)
+			}
+			sourceBefore, err := e.h.ReadSession(context.Background(), session)
+			if err != nil {
+				t.Fatalf("ReadSession: %v", err)
+			}
+			oneShotEmptySelection(e)
+			res, err := e.h.Fork(context.Background(), harness.ForkRequest{
+				SourceSessionID: session,
+				BoundaryEntryID: boundary,
+				OperationID:     "fork-1",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			})
+			if !errors.Is(err, harness.ErrInvalid) {
+				t.Fatalf("fork with a mismatching capture = %+v err %v, want harness.ErrInvalid", res, err)
+			}
+			sessionsAfter, err := e.store.ListSessionIDs(context.Background())
+			if err != nil {
+				t.Fatalf("ListSessionIDs: %v", err)
+			}
+			if !slices.Equal(sessionsAfter, sessionsBefore) {
+				t.Fatalf("session listing after the failed fork = %v, want unchanged %v", sessionsAfter, sessionsBefore)
+			}
+			entriesAfter, err := e.store.ReadEntries(context.Background(), session, 0)
+			if err != nil {
+				t.Fatalf("ReadEntries: %v", err)
+			}
+			if len(entriesAfter) != len(entriesBefore) {
+				t.Fatalf("source entries after the failed fork = %d, want unchanged %d", len(entriesAfter), len(entriesBefore))
+			}
+			sourceAfter, err := e.h.ReadSession(context.Background(), session)
+			if err != nil {
+				t.Fatalf("ReadSession: %v", err)
+			}
+			if !reflect.DeepEqual(sourceAfter, sourceBefore) {
+				t.Fatalf("source session after the failed fork changed: %+v vs %+v", sourceAfter, sourceBefore)
+			}
+			if calls := e.counts(); calls != 2 {
+				t.Fatalf("preparation calls = %d, want the source admission plus the failed fork", calls)
+			}
+			if calls := e.hooks[0].calls(); len(calls) != 1 {
+				t.Fatalf("hook.first calls = %v, want the failed fork to have run none", calls)
+			}
+			if err := e.converge(); err != nil {
+				t.Fatalf("Wait: %v", err)
+			}
+		})
+	})
 }
 
 // TestPreparationHooksAreOrderedAndValidated exercises the pure hook boundary

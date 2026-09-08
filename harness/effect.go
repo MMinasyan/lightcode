@@ -1035,17 +1035,16 @@ func (h *Harness) commitToolResult(ctx context.Context, c *coordinator, operatio
 	return result, nil
 }
 
-// execute is the private agent.Run composition of one admitted execution: the
-// three Agent boundaries run over the coordinator's validated state on the
-// Harness context, then the outer terminal settlement converges the durable
-// state with the run's outcome.
 // execute is the private agent.Run composition of one admitted execution:
 // after the commit it invokes the preparation's opener exactly once with the
 // execution context and the owned committed admission, runs the Agent over
 // the opened effects, then the outer terminal settlement converges the
 // durable state with the run's outcome, and a non-nil resource cleanup runs
 // once after that settlement attempt — before the slot releases or the next
-// buffered delivery starts. An opener error resolves through the ordinary
+// buffered delivery starts. The Agent's expected model and advertised tools
+// come from an independent capture retained before the opener runs, so an
+// opener mutating its admission input locally never changes what is
+// advertised after admission. An opener error resolves through the ordinary
 // terminal settlement: cancellation interrupts, a storage failure retains the
 // running state for recovery, and any other error fails. A canceled
 // execution skips an unstarted opener. A successful invalid Execution has
@@ -1061,6 +1060,7 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		return fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
 	}
 	admission := ownOperationRecord(op).Admission
+	agentCapture := ownCapture(admission.Execution)
 	c.mu.Unlock()
 	if err := h.ctx.Err(); err != nil { // the execution is already canceled: the opener never starts
 		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{}, err)
@@ -1080,8 +1080,8 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		defer func() { h.recordCleanupFailure(exec.Close()) }()
 	}
 	res, err := agent.Run(h.ctx, agent.Invocation{
-		ExpectedModel: admission.Execution.Model,
-		Tools:         admission.Execution.Tools,
+		ExpectedModel: agentCapture.Model,
+		Tools:         agentCapture.Tools,
 		Context:       h.contextSource(c, operationID),
 		ModelEffect:   h.modelEffect(c, operationID, exec.Model),
 		ToolEffect:    h.toolEffect(c, operationID, exec.Tool),

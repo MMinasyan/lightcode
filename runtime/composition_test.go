@@ -55,6 +55,35 @@ func settingsOrNone(raw json.RawMessage) string {
 
 type stubCoreStorage struct{ harness.Storage }
 
+// hookValue implements PreparationHook with a value receiver, so both it and
+// its pointer implement the contract; ptrHookValue is reachable only through
+// its pointer type.
+type hookValue struct{}
+
+func (hookValue) Prepare(context.Context, Invocation, harness.ExecutionCapture) (harness.ExecutionCapture, error) {
+	return harness.ExecutionCapture{}, nil
+}
+
+type ptrHookValue struct{}
+
+func (*ptrHookValue) Prepare(context.Context, Invocation, harness.ExecutionCapture) (harness.ExecutionCapture, error) {
+	return harness.ExecutionCapture{}, nil
+}
+
+// tamperScratch rewrites an equal-length substring of one raw JSON buffer in
+// place: exactly the scratch mutation a synchronous validator could apply to
+// the bytes it receives.
+func tamperScratch(raw json.RawMessage, want, with string) {
+	if len(want) != len(with) {
+		panic("in-place scratch rewrite needs an equal-length replacement")
+	}
+	i := strings.Index(string(raw), want)
+	if i < 0 {
+		panic("in-place scratch rewrite target absent")
+	}
+	copy(raw[i:], with)
+}
+
 type traceLog struct {
 	mu     sync.Mutex
 	events []string
@@ -179,6 +208,10 @@ func TestCompositionRejectsInvalidDeclarations(t *testing.T) {
 			requires("b", ScopeWorkspace, Spec[greeter]("a.own")),
 		}},
 		{"self dependency", []Plugin{requires("a", ScopeWorkspace, Spec[greeter]("a.own"))}},
+		{"Operation-scoped PreparationHook interface export", []Plugin{provides("a", ScopeOperation, Spec[PreparationHook]("hook"))}},
+		{"Agent-scoped PreparationHook interface export", []Plugin{provides("a", ScopeAgent, Spec[PreparationHook]("hook"))}},
+		{"Operation-scoped concrete hook export", []Plugin{provides("a", ScopeOperation, Spec[hookValue]("hook"))}},
+		{"Agent-scoped pointer hook export", []Plugin{provides("a", ScopeAgent, Spec[*ptrHookValue]("hook"))}},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			opened = 0
@@ -190,6 +223,40 @@ func TestCompositionRejectsInvalidDeclarations(t *testing.T) {
 				t.Fatalf("%d factories ran for a rejected declaration set; validation must precede every factory", opened)
 			}
 		})
+	}
+}
+
+// TestCompositionAcceptsLongLivedHookDeclarations proves the hook-declaration
+// lifetime row: PreparationHook interface and both implementing concrete
+// types compose at Runtime and Workspace scope, ordinary short-scope exports
+// stay valid beside them, and the nearest forbidden sibling — a hook-typed
+// export at Operation scope — rejects the whole set before any factory.
+func TestCompositionAcceptsLongLivedHookDeclarations(t *testing.T) {
+	hookPlugin := func(id string, scope ScopeKind, specs ...CapabilitySpec) Plugin {
+		return Plugin{ID: id, Scope: scope, Provides: specs, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+			return Instance{Values: map[string]any{}}, nil
+		}}
+	}
+	plugins := []Plugin{
+		hookPlugin("rt", ScopeRuntime, Spec[PreparationHook]("hook.iface")),
+		hookPlugin("ws", ScopeWorkspace, Spec[hookValue]("hook.value"), Spec[*ptrHookValue]("hook.ptr")),
+		hookPlugin("op", ScopeOperation, Spec[greeter]("op.g")),
+		hookPlugin("ag", ScopeAgent, Spec[ptrHookValue]("ag.byvalue"), Spec[greeter]("ag.g")),
+	}
+	c := mustComposition(t, plugins...)
+	for _, kind := range []ScopeKind{ScopeRuntime, ScopeWorkspace, ScopeOperation, ScopeAgent} {
+		if got := len(c.plan[kind]); got != 1 {
+			t.Fatalf("%s plan holds %d plugins, want 1", kind, got)
+		}
+	}
+	ids := append([]string(nil), c.capabilityIDs...)
+	slices.Sort(ids)
+	if want := []string{"ag.byvalue", "ag.g", "hook.iface", "hook.ptr", "hook.value", "op.g"}; !slices.Equal(ids, want) {
+		t.Fatalf("capability universe = %v, want every export including the ordinary short-scope ones", ids)
+	}
+	forbidden := append(append([]Plugin(nil), plugins...), hookPlugin("op-hook", ScopeOperation, Spec[hookValue]("hook.op")))
+	if _, err := newComposition(forbidden); !errors.Is(err, ErrComposition) {
+		t.Fatalf("newComposition with an Operation-scoped hook export = %v, want ErrComposition", err)
 	}
 }
 
@@ -965,5 +1032,17 @@ func TestAcceptSettingsAppliesTheNoSettingsRule(t *testing.T) {
 	}
 	if err := acceptSettings(Plugin{ID: "cfg", ValidateConfig: validator}, json.RawMessage(`{"a":1}`)); !errors.Is(err, errValidator) {
 		t.Fatalf("validator failure = %v, want the source identity", err)
+	}
+	// A non-nil validator receives an independent clone: in-place scratch
+	// never reaches the caller's bytes.
+	caller := json.RawMessage(`{"a":"12345"}`)
+	if err := acceptSettings(Plugin{ID: "cfg", ValidateConfig: func(got json.RawMessage) error {
+		tamperScratch(got, "12345", "xxxxx")
+		return nil
+	}}, caller); err != nil {
+		t.Fatalf("cloned validator input: %v", err)
+	}
+	if string(caller) != `{"a":"12345"}` {
+		t.Fatalf("caller bytes after validator scratch = %s, want unchanged", caller)
 	}
 }

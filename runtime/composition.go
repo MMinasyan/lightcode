@@ -180,10 +180,11 @@ func (in Invocation) Config(pluginID string) json.RawMessage {
 // acceptSettings applies one declaration's configuration rule: a plugin with
 // a nil ValidateConfig accepts only absent configuration or the empty
 // object, and any other input document is rejected instead of silently
-// ignored. A non-nil validator receives the owned input unchanged.
+// ignored. A non-nil validator receives an independent clone of the input, so
+// its in-place scratch never reaches the caller's retained bytes.
 func acceptSettings(plugin Plugin, raw json.RawMessage) error {
 	if plugin.ValidateConfig != nil {
-		return plugin.ValidateConfig(raw)
+		return plugin.ValidateConfig(bytes.Clone(raw))
 	}
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
@@ -219,10 +220,11 @@ type composition struct {
 // newComposition validates the complete selected plugin set before any
 // factory can run: unique nonempty plugin IDs, valid scopes, non-nil Open,
 // at least one provider, unique nonempty export IDs globally and unique
-// nonempty dependency IDs per plugin, assignable provider types, same-or-
-// longer-lived dependency scopes, and an acyclic dependency graph. An
-// ordinary dependency on an ID reserved by a Core storage export is a plain
-// missing binding and is rejected.
+// nonempty dependency IDs per plugin, assignable provider types,
+// lifetime-compatible PreparationHook declarations (Runtime or Workspace
+// scope only), same-or-longer-lived dependency scopes, and an acyclic
+// dependency graph. An ordinary dependency on an ID reserved by a Core
+// storage export is a plain missing binding and is rejected.
 func newComposition(plugins []Plugin) (*composition, error) {
 	owned := make([]Plugin, len(plugins))
 	for i, p := range plugins {
@@ -276,6 +278,9 @@ func newComposition(plugins []Plugin) (*composition, error) {
 				return nil, fmt.Errorf("plugin %q: capability %q already exported by %q: %w", p.ID, prov.id, owned[src.plugin].ID, ErrComposition)
 			}
 			all[prov.id] = exportSource{plugin: i, spec: prov}
+			if prov.typ.Implements(preparationHookType) && p.Scope != ScopeRuntime && p.Scope != ScopeWorkspace {
+				return nil, fmt.Errorf("plugin %q (%s): capability %q declared as %s implements PreparationHook and requires Runtime or Workspace scope: %w", p.ID, p.Scope, prov.id, prov.typ, ErrComposition)
+			}
 			if prov.typ == storageType {
 				coreExports = append(coreExports, coreExportDecl{plugin: p.ID, scope: p.Scope, id: prov.id})
 			} else {

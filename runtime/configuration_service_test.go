@@ -288,6 +288,96 @@ func TestConfigurationServicePluginValidationRejectsPublication(t *testing.T) {
 	}
 }
 
+// pluginsConfigFile is providerConfigFile with one plugin section verbatim.
+func pluginsConfigFile(alpha string) string {
+	return `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"One","context_window":100}}}},"plugins":{"alpha":` + alpha + `}}`
+}
+
+// TestConfigurationServiceValidatorScratchCannotChangePublication proves the
+// owned-validator-input rows: a synchronous validator that uses its received
+// bytes as an in-place scratch buffer cannot change the retained candidate,
+// the published snapshot, or a later Invocation.Config handout; absent
+// settings still deliver nil to the validator; and a tampering rejected
+// candidate notifies nothing while leaving the prior pointer, generation,
+// and retained bytes intact.
+func TestConfigurationServiceValidatorScratchCannotChangePublication(t *testing.T) {
+	const admitted = `{"value":"original"}`
+	t.Run("in-place scratch never reaches the publication", func(t *testing.T) {
+		h := newServiceHarness(t)
+		writeServiceFile(t, h.configPath, pluginsConfigFile(admitted))
+		svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, func(raw json.RawMessage) error {
+			tamperScratch(raw, "original", "tampered")
+			return nil
+		}))
+		pub, err := svc.publish(context.Background())
+		if err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+		if string(pub.plugins["alpha"]) != admitted {
+			t.Fatalf("published snapshot bytes = %s, want the retained candidate", pub.plugins["alpha"])
+		}
+		if got := (Invocation{snapshot: pub}).Config("alpha"); string(got) != admitted {
+			t.Fatalf("Invocation.Config = %s, want the retained candidate", got)
+		}
+	})
+	t.Run("absent settings still pass nil through", func(t *testing.T) {
+		h := newServiceHarness(t)
+		writeServiceFile(t, h.configPath, providerConfigFile("One"))
+		sawNil := false
+		svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, func(raw json.RawMessage) error {
+			sawNil = raw == nil
+			return nil
+		}))
+		if _, err := svc.publish(context.Background()); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+		if !sawNil {
+			t.Fatal("absent settings reached the validator as something other than nil")
+		}
+	})
+	t.Run("rejected tampering leaves the prior publication intact", func(t *testing.T) {
+		h := newServiceHarness(t)
+		writeServiceFile(t, h.configPath, pluginsConfigFile(admitted))
+		var attempts atomic.Int32
+		svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, func(raw json.RawMessage) error {
+			tamperScratch(raw, "original", "tampered")
+			if attempts.Add(1) == 1 {
+				return nil
+			}
+			return errValidator
+		}))
+		sub, err := svc.obs.subscribe(4)
+		if err != nil {
+			t.Fatalf("subscribe: %v", err)
+		}
+		t.Cleanup(sub.Close)
+		first, err := svc.publish(context.Background())
+		if err != nil {
+			t.Fatalf("initial publish: %v", err)
+		}
+		if event, ok := nextEvent(t, sub); !ok || event.Kind != EventConfiguration || event.ConfigurationRevision != "1" {
+			t.Fatalf("initial publication event = %+v (ok=%v), want the generation 1 configuration event", event, ok)
+		}
+		if _, err := svc.publish(context.Background()); !errors.Is(err, ErrConfiguration) || !errors.Is(err, errValidator) {
+			t.Fatalf("reload = %v, want a rejection preserving the validator source error", err)
+		}
+		select {
+		case event, ok := <-sub.Events():
+			if ok {
+				t.Fatalf("rejected build published event %+v, want silence", event)
+			}
+			t.Fatal("the subscription closed around the rejected build, want silence with the subscription open")
+		default:
+		}
+		if svc.current() != first {
+			t.Fatal("a rejected candidate replaced the prior publication")
+		}
+		if first.generation != 1 || string(first.plugins["alpha"]) != admitted {
+			t.Fatalf("prior snapshot = generation %d bytes %s, want generation 1 with the retained bytes", first.generation, first.plugins["alpha"])
+		}
+	})
+}
+
 // TestConfigurationServiceCancellationBetweenValidatorsStopsTheRest proves a
 // cancellation observed between finite validators prevents later validation
 // and publication, and the context error stays unwrapped.
