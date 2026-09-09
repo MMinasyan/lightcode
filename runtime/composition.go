@@ -534,9 +534,6 @@ type scope struct {
 	mu     sync.Mutex
 	closed bool
 	wg     sync.WaitGroup
-
-	closeOnce sync.Once
-	closeErr  error
 }
 
 func (s *scope) unavailable() bool {
@@ -582,28 +579,20 @@ func (s *scope) enter(ctx context.Context) (context.Context, func(), error) {
 	}, nil
 }
 
-// close closes admission, cancels the scope context, and runs the common
-// scope cleanup — join admitted work, then dispose instances, attempting all
-// closers and joining their errors — synchronously. The sync.Once keeps one
-// cleanup: concurrent and repeated callers block until it completes and
-// return its retained result. No guard can enter once closure has begun.
+// close is called once by the scope owner. It closes admission before
+// cancellation, then joins admitted work and disposes instances synchronously.
 func (s *scope) close() error {
-	s.closeOnce.Do(func() {
-		commit := func() {
-			s.mu.Lock()
-			s.closed = true
-			s.mu.Unlock()
-		}
-		if s.obs != nil {
-			// The observation section commits closed admission before the
-			// cancellation and disposal that follow.
-			s.obs.publish(commit, scopeEvent(EventScopeClosed, s.info))
-		} else {
-			commit()
-		}
-		s.closeErr = s.cleanup()
-	})
-	return s.closeErr
+	commit := func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+	}
+	if s.obs != nil {
+		s.obs.publish(commit, scopeEvent(EventScopeClosed, s.info))
+	} else {
+		commit()
+	}
+	return s.cleanup()
 }
 
 // cleanup is the common scope cleanup used by both construction rollback and
@@ -653,9 +642,6 @@ type workspaceScopes struct {
 	live     map[string]*scope
 	attempts map[string]*workspaceAttempt
 	building sync.WaitGroup
-
-	shutOnce sync.Once
-	shutErr  error
 }
 
 func newWorkspaceScopes(owner context.Context, c *composition, ancestors []*scope, obs *observation) *workspaceScopes {
@@ -730,32 +716,27 @@ func (w *workspaceScopes) build(key string, info ScopeInfo, attempt *workspaceAt
 	}, scopeEvent(EventScopeOpened, info))
 }
 
-// shutdown closes registry admission, joins in-flight construction as
-// Runtime-owned work, and then closes every live Workspace scope in sorted
-// path order. The sync.Once keeps one shutdown: concurrent and repeated
-// callers block until it completes and return its retained joined result.
+// shutdown is called once by the Runtime owner. It closes registry admission,
+// joins construction, and closes live Workspace scopes in sorted path order.
 func (w *workspaceScopes) shutdown() error {
 	w.mu.Lock()
 	w.closed = true
 	w.mu.Unlock()
-	w.shutOnce.Do(func() {
-		w.building.Wait()
-		w.mu.Lock()
-		keys := make([]string, 0, len(w.live))
-		for key := range w.live {
-			keys = append(keys, key)
-		}
-		slices.Sort(keys)
-		live := make([]*scope, len(keys))
-		for i, key := range keys {
-			live[i] = w.live[key]
-		}
-		w.mu.Unlock()
-		var errs []error
-		for _, sc := range live {
-			errs = append(errs, sc.close())
-		}
-		w.shutErr = errors.Join(errs...)
-	})
-	return w.shutErr
+	w.building.Wait()
+	w.mu.Lock()
+	keys := make([]string, 0, len(w.live))
+	for key := range w.live {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	live := make([]*scope, len(keys))
+	for i, key := range keys {
+		live[i] = w.live[key]
+	}
+	w.mu.Unlock()
+	var errs []error
+	for _, sc := range live {
+		errs = append(errs, sc.close())
+	}
+	return errors.Join(errs...)
 }

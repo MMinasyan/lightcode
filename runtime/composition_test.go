@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
-	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
 )
@@ -573,91 +572,49 @@ func startBlockedCall(t *testing.T, f *guardFixture) (gctx context.Context, rele
 
 func TestScopeGuardOwnsAdmittedCallsThroughClose(t *testing.T) {
 	t.Run("closure joins the admitted call before disposing", func(t *testing.T) {
-		f := openGuardFixture(t, context.Background())
-		gctx, released, done := startBlockedCall(t, f)
-		closeResult := make(chan error, 1)
-		go func() { closeResult <- f.ws.close() }()
-		select {
-		case <-gctx.Done():
-		case <-time.After(2 * time.Second):
-			t.Fatal("scope closure did not cancel the admitted call context")
-		}
-		// The dependent's supplying dependency lives in the still-open
-		// Runtime scope, so the guarded call must succeed after closure
-		// began; a dispose-without-join would close while the call is
-		// blocked and land in this window.
-		time.Sleep(50 * time.Millisecond)
-		if got := f.trace.all(); !slices.Contains(got, "call-start") || slices.Contains(got, "close:cons") {
-			t.Errorf("state during the blocked call = %q, want the admitted call not yet disposed", got)
-		}
-		close(released)
-		<-done
-		firstErr := <-closeResult
-		if !errors.Is(firstErr, errCloser) {
-			t.Fatalf("close = %v, want the retained cleanup error", firstErr)
-		}
-		want := []string{"call-start", "greet:HI", "call-end", "close:cons"}
-		if got := f.trace.all(); !reflect.DeepEqual(got, want) {
-			t.Fatalf("guard trace = %q, want %q", got, want)
-		}
-		if _, _, err := f.ws.enter(context.Background()); !errors.Is(err, ErrClosed) {
-			t.Errorf("enter after closure: %v, want ErrClosed", err)
-		}
-		if _, err := Bind[int](f.ws.bindings, "cons.out"); !errors.Is(err, ErrClosed) {
-			t.Errorf("binding from the closed supplying scope: %v, want ErrClosed", err)
-		}
-		if _, err := Bind[greeter](f.rt.bindings, "dep.g"); err != nil {
-			t.Errorf("binding from the still-open supplying scope: %v", err)
-		}
-		if err := f.ws.close(); err != firstErr {
-			t.Errorf("repeated close: %v, want the retained shared result", err)
-		}
-		if err := f.rt.close(); err != nil {
-			t.Errorf("runtime close: %v", err)
-		}
-	})
-
-	t.Run("private close callers retain the completed cleanup result", func(t *testing.T) {
-		synctest.Test(t, func(tt *testing.T) {
-			f := openGuardFixture(tt, context.Background())
-			_, released, done := startBlockedCall(tt, f)
-			letGo := func() {
+		synctest.Test(t, func(t *testing.T) {
+			f := openGuardFixture(t, context.Background())
+			gctx, released, done := startBlockedCall(t, f)
+			defer func() {
 				if released != nil {
 					close(released)
-					released = nil
 				}
-			}
-			defer letGo() // held work can unwind even when an assertion fails
-			first := make(chan error, 1)
-			go func() { first <- f.ws.close() }()
-			// Quiescence: the admitted call is durably blocked on the
-			// fixture's release channel, so the first close can only have
-			// reached its join of that call.
+			}()
+			closeResult := make(chan error, 1)
+			go func() { closeResult <- f.ws.close() }()
 			synctest.Wait()
+			if !errors.Is(gctx.Err(), context.Canceled) {
+				t.Fatal("scope closure did not cancel the admitted call context")
+			}
 			select {
-			case err := <-first:
-				tt.Fatalf("first close completed without joining the admitted call: %v", err)
+			case err := <-closeResult:
+				t.Fatalf("close completed without joining the admitted call: %v", err)
 			default:
 			}
-			// A second caller may wait on Once's mutex, which synctest does
-			// not treat as durably blocked. Release the call before joining
-			// the results; this checks retention, not overlap inside Once.
-			second := make(chan error, 1)
-			go func() { second <- f.ws.close() }()
-			letGo()
-			<-done
-			firstErr := <-first
-			if !errors.Is(firstErr, errCloser) {
-				tt.Fatalf("first close = %v, want the retained cleanup error", firstErr)
+			if got := f.trace.all(); !slices.Contains(got, "call-start") || slices.Contains(got, "close:cons") {
+				t.Fatalf("state during the blocked call = %q, want the admitted call not yet disposed", got)
 			}
-			// The joined caller returns the same completed result, and the
-			// exact trace proves one join and one dispose.
-			if err := <-second; err != firstErr {
-				tt.Fatalf("joined close = %v, want the same completed result", err)
+			close(released)
+			released = nil
+			<-done
+			if err := <-closeResult; !errors.Is(err, errCloser) {
+				t.Fatalf("close = %v, want the cleanup error", err)
 			}
 			want := []string{"call-start", "greet:HI", "call-end", "close:cons"}
 			if got := f.trace.all(); !reflect.DeepEqual(got, want) {
-				tt.Fatalf("guard trace = %q, want %q", got, want)
+				t.Fatalf("guard trace = %q, want %q", got, want)
+			}
+			if _, _, err := f.ws.enter(context.Background()); !errors.Is(err, ErrClosed) {
+				t.Errorf("enter after closure: %v, want ErrClosed", err)
+			}
+			if _, err := Bind[int](f.ws.bindings, "cons.out"); !errors.Is(err, ErrClosed) {
+				t.Errorf("binding from the closed supplying scope: %v, want ErrClosed", err)
+			}
+			if _, err := Bind[greeter](f.rt.bindings, "dep.g"); err != nil {
+				t.Errorf("binding from the still-open supplying scope: %v", err)
+			}
+			if err := f.rt.close(); err != nil {
+				t.Errorf("runtime close: %v", err)
 			}
 		})
 	})
@@ -941,9 +898,6 @@ func TestWorkspaceScopesShutdownJoinsConstructionAndDisposesSorted(t *testing.T)
 		first, second := slices.Index(got, "close:/ws/1"), slices.Index(got, "close:/ws/2")
 		if first < 0 || second < 0 || first > second {
 			t.Fatalf("workspace close order = %q, want /ws/1 before /ws/2", got)
-		}
-		if err2 := f.w.shutdown(); !errors.Is(err2, errWorkspaceClo) {
-			t.Fatalf("repeated shutdown: %v, want the same shared result", err2)
 		}
 		if _, err := f.w.get(context.Background(), workspaceScopeInfo("/ws/1")); !errors.Is(err, ErrClosed) {
 			t.Fatalf("get after shutdown: %v, want ErrClosed", err)

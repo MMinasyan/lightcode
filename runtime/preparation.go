@@ -112,7 +112,10 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		}
 		defer release() // the one preparation guard covers the controlled call and every pure hook
 
-		capture, opener, err := p.prepare(callCtx, req, sel)
+		input := sel
+		input.agent.Tools = slices.Clone(agent.Tools)
+		input.agent.Capabilities = slices.Clone(agent.Capabilities)
+		capture, opener, err := p.prepare(callCtx, req, input)
 		if err != nil {
 			return harness.PreparedExecution{}, err
 		}

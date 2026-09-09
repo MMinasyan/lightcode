@@ -421,129 +421,55 @@ func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 }
 
 // TestMaintenanceFailedPassReportsAndWaitsForTheNextTick proves the failed
-// pass row: one non-cancellation storage error reaches the retained stderr
+// pass row: a storage error with a live owner reaches the retained stderr
 // diagnostic exactly once, with no retry, and the next tick runs again.
 func TestMaintenanceFailedPassReportsAndWaitsForTheNextTick(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
-		wrapped := newSweepStore(store)
-		ticks := make(chan time.Time)
-		opts := e.options(e.storagePlugin(wrapped))
-		opts.sweepTicks = ticks
-		r, err := open(context.Background(), opts)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
-		created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
-		stderr := captureSweepStderr(t)
-		wrapped.armFailOnce(errors.New("test sweep store listing failure"))
-		tick := created.State.LastActivity.Add(100 * time.Hour)
-		sendTick(t, ticks, tick) // this pass lists, fails, and reports
-		sendTick(t, ticks, tick) // the rendezvous proves the failed pass converged; this pass sweeps again
-		waitWritten(t, wrapped)  // the later tick committed the archive
-		if rec, err := readSweptSession(t, r, created.Identity.SessionID); err != nil || rec.State.Lifecycle != harness.LifecycleArchived {
-			t.Fatalf("Session after the later tick = %+v err %v, want the failed pass to leave no lasting damage", rec, err)
-		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-		out := stderr()
-		if n := strings.Count(out, "lightcode: sweep: test sweep store listing failure"); n != 1 {
-			t.Fatalf("stderr sweep diagnostics = %d in %q, want the failed pass reported exactly once", n, out)
-		}
-		if got := wrapped.listCount(); got != 4 {
-			t.Fatalf("storage lists = %d, want recovery, the initial pass, one failing pass, and one later pass: no immediate retry", got)
-		}
-	})
-}
-
-// TestMaintenanceDeadlineValuedFailureReportsWhileTheOwnerIsLive is the
-// nearest sibling of the silent deadline cancellation: a storage failure
-// carrying the deadline-expiry identity while the Runtime-owned context is
-// still alive is an ordinary pass failure, reaches the retained stderr
-// diagnostic exactly once, and leaves the later-tick cadence intact.
-func TestMaintenanceDeadlineValuedFailureReportsWhileTheOwnerIsLive(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
-		wrapped := newSweepStore(store)
-		ticks := make(chan time.Time)
-		opts := e.options(e.storagePlugin(wrapped))
-		opts.sweepTicks = ticks
-		r, err := open(context.Background(), opts)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
-		created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
-		stderr := captureSweepStderr(t)
-		wrapped.armFailOnce(context.DeadlineExceeded)
-		tick := created.State.LastActivity.Add(100 * time.Hour)
-		sendTick(t, ticks, tick) // this pass lists, fails with the deadline identity, and reports
-		sendTick(t, ticks, tick) // the rendezvous proves the deadline-failed pass converged; this pass sweeps again
-		waitWritten(t, wrapped)  // the later tick committed the archive
-		if rec, err := readSweptSession(t, r, created.Identity.SessionID); err != nil || rec.State.Lifecycle != harness.LifecycleArchived {
-			t.Fatalf("Session after the later tick = %+v err %v, want the deadline-failed pass to leave no lasting damage", rec, err)
-		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-		if out := stderr(); strings.Count(out, "lightcode: sweep: context deadline exceeded") != 1 {
-			t.Fatalf("stderr sweep diagnostics = %q, want the live-owner deadline-valued failure reported exactly once", out)
-		}
-		if got := wrapped.listCount(); got != 4 {
-			t.Fatalf("storage lists = %d, want recovery, the initial pass, one deadline-failed pass, and one later pass: no immediate retry", got)
-		}
-	})
-}
-
-// TestMaintenanceCanceledValuedFailureReportsWhileTheOwnerIsLive is the
-// cancellation sibling of the live-owner deadline row under the selected
-// policy: a context-cancellation-valued storage failure while the
-// Runtime-owned context is still alive is an ordinary pass failure, reaches
-// the retained stderr diagnostic exactly once, and leaves the later-tick
-// cadence intact.
-func TestMaintenanceCanceledValuedFailureReportsWhileTheOwnerIsLive(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
-		wrapped := newSweepStore(store)
-		ticks := make(chan time.Time)
-		opts := e.options(e.storagePlugin(wrapped))
-		opts.sweepTicks = ticks
-		r, err := open(context.Background(), opts)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
-		created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
-		stderr := captureSweepStderr(t)
-		wrapped.armFailOnce(context.Canceled)
-		tick := created.State.LastActivity.Add(100 * time.Hour)
-		sendTick(t, ticks, tick) // this pass lists, fails with the cancellation identity, and reports
-		sendTick(t, ticks, tick) // the rendezvous proves the canceled-valued pass converged; this pass sweeps again
-		waitWritten(t, wrapped)  // the later tick committed the archive
-		if rec, err := readSweptSession(t, r, created.Identity.SessionID); err != nil || rec.State.Lifecycle != harness.LifecycleArchived {
-			t.Fatalf("Session after the later tick = %+v err %v, want the canceled-valued pass to leave no lasting damage", rec, err)
-		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-		if out := stderr(); strings.Count(out, "lightcode: sweep: context canceled") != 1 {
-			t.Fatalf("stderr sweep diagnostics = %q, want the live-owner cancellation-valued failure reported exactly once", out)
-		}
-		if got := wrapped.listCount(); got != 4 {
-			t.Fatalf("storage lists = %d, want recovery, the initial pass, one cancellation-failed pass, and one later pass: no immediate retry", got)
-		}
-	})
+	for _, tc := range []struct {
+		name    string
+		failure error
+	}{
+		{"ordinary", errors.New("test sweep store listing failure")},
+		{"deadline", context.DeadlineExceeded},
+		{"canceled", context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+				e := newOwnerEnv(t)
+				writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+				wrapped := newSweepStore(store)
+				ticks := make(chan time.Time)
+				opts := e.options(e.storagePlugin(wrapped))
+				opts.sweepTicks = ticks
+				r, err := open(context.Background(), opts)
+				if err != nil {
+					t.Fatalf("open: %v", err)
+				}
+				created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
+				if err != nil {
+					t.Fatalf("createSession: %v", err)
+				}
+				stderr := captureSweepStderr(t)
+				wrapped.armFailOnce(tc.failure)
+				tick := created.State.LastActivity.Add(100 * time.Hour)
+				sendTick(t, ticks, tick) // this pass lists, fails, and reports
+				sendTick(t, ticks, tick) // the rendezvous proves the failed pass converged; this pass sweeps again
+				waitWritten(t, wrapped)  // the later tick committed the archive
+				if rec, err := readSweptSession(t, r, created.Identity.SessionID); err != nil || rec.State.Lifecycle != harness.LifecycleArchived {
+					t.Fatalf("Session after the later tick = %+v err %v, want the failed pass to leave no lasting damage", rec, err)
+				}
+				if err := r.Close(context.Background()); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+				out := stderr()
+				if n := strings.Count(out, "lightcode: sweep: "+tc.failure.Error()); n != 1 {
+					t.Fatalf("stderr sweep diagnostics = %d in %q, want the failed pass reported exactly once", n, out)
+				}
+				if got := wrapped.listCount(); got != 4 {
+					t.Fatalf("storage lists = %d, want recovery, the initial pass, one failing pass, and one later pass: no immediate retry", got)
+				}
+			})
+		})
+	}
 }
 
 // TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown proves the
