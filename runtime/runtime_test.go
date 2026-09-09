@@ -1149,7 +1149,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 			select {
 			case err := <-reloadDone:
 				if !errors.Is(err, ErrClosed) {
-					t.Fatalf("admitted Reload under shutdown = %v, want ErrClosed: the owner-first cancellation rule held", err)
+					t.Fatalf("admitted Reload under shutdown = %v, want ErrClosed: a live caller on a done owner still reports closure", err)
 				}
 			default:
 				t.Fatal("Close returned before the admitted Reload returned")
@@ -1280,6 +1280,11 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 			}
 			if _, err := r.Reload(context.Background()); !errors.Is(err, ErrClosed) {
 				t.Fatalf("Reload after Close = %v, want ErrClosed", err)
+			}
+			callerCtx, cancelCaller := context.WithCancel(context.Background())
+			cancelCaller()
+			if _, err := r.Reload(callerCtx); !errors.Is(err, ErrClosed) {
+				t.Fatalf("Reload after Close with a canceled caller = %v, want ErrClosed: admission rejects before the caller check", err)
 			}
 			if _, err := r.createSession(context.Background(), e.dataDir, "solo"); !errors.Is(err, ErrClosed) {
 				t.Fatalf("createSession after Close = %v, want ErrClosed", err)

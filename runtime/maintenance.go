@@ -49,14 +49,15 @@ func (r *Runtime) startMaintenance(ticks <-chan time.Time, stopTicker func()) {
 // sweep, converts each positive day count into its checked 24-hour
 // threshold and leaves a nonpositive count at zero so the Harness disables
 // only that transition, and calls Harness.Sweep with the explicit time on
-// the Runtime-owned context through the ordinary admitted-call gate. A
-// non-cancellation failure reports through the retained stderr diagnostic
-// and waits for the next tick: no special event, startup failure, or
-// immediate retry. The shutdown-time gate rejection and owned-context
-// cancellation are shutdown, not pass failures: a plain cancellation always
-// qualifies, and a deadline error only while the owned context is actually
-// done, so a service failure carrying the deadline identity against a live
-// owner remains a reported pass failure.
+// the Runtime-owned context through the ordinary admitted-call gate. The
+// diagnostic decision is sampled once after the pass returns: a failure
+// while the owned context is live is reported through the retained stderr
+// diagnostic unless the admission gate returned ErrClosed, and once shutdown
+// is observed the pass stays quiet, accepting that an unrelated failure
+// concurrent with shutdown may go unlogged. A context-valued source error
+// against a live owner is an ordinary failure too. Later cancellation never
+// retracts a report the check already admitted. No special event, startup
+// failure, or immediate retry follows a failed pass.
 func (r *Runtime) runSweepPass(ctx context.Context, now time.Time) {
 	sessions := r.config.current().sessions
 	if !sessions.AutoArchive {
@@ -69,8 +70,7 @@ func (r *Runtime) runSweepPass(ctx context.Context, now time.Time) {
 	err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 		return h.Sweep(ctx, policy, now)
 	})
-	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrClosed) &&
-		!(errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil) {
+	if err != nil && ctx.Err() == nil && !errors.Is(err, ErrClosed) {
 		fmt.Fprintf(os.Stderr, "lightcode: sweep: %v\n", err)
 	}
 }

@@ -139,15 +139,11 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	obs := newObservation()
 	configService := newConfigurationService(work, c, catalog.NewLoader(home, nil), configPath, obs)
 	if _, err := configService.publish(work); err != nil {
-		// The service's owner-first cancellation rule reports its own bare
-		// ErrClosed sentinel value, but no owner is closed yet during
-		// construction: exactly that value with a canceled constructor
-		// context returns the context's own error. Every other failure,
-		// including a source error that wraps ErrClosed, keeps its identity
-		// unchanged.
-		if err == ErrClosed && ctx.Err() != nil {
-			return unlock(ctx.Err())
-		}
+		// Initial publication supplies the owned context as both caller and
+		// owner, so its caller-first checkpoints report a canceled
+		// constructor's own context error directly, while every independent
+		// failure — including a source error that wraps ErrClosed — keeps
+		// its identity unchanged.
 		return unlock(err)
 	}
 

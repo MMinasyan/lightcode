@@ -54,14 +54,15 @@ func captureSweepStderr(t *testing.T) func() string {
 // error, and parks the next transaction on a test release.
 type sweepStore struct {
 	harness.Storage
-	mu       sync.Mutex
-	lists    int
-	failErr  error
-	failLeft int
-	blocked  bool
-	release  chan struct{}
-	arrived  chan struct{}
-	written  chan struct{}
+	mu         sync.Mutex
+	lists      int
+	failErr    error
+	failLeft   int
+	blocked    bool
+	releaseErr error
+	release    chan struct{}
+	arrived    chan struct{}
+	written    chan struct{}
 }
 
 func newSweepStore(base harness.Storage) *sweepStore {
@@ -110,6 +111,17 @@ func (s *sweepStore) armBlock() {
 	s.mu.Unlock()
 }
 
+// armFailAfterRelease parks the next transaction until releaseBlock and then
+// fails it with err without reaching the base store, modelling a genuine
+// storage failure that converges whenever the test releases it.
+func (s *sweepStore) armFailAfterRelease(err error) {
+	s.mu.Lock()
+	s.blocked = true
+	s.releaseErr = err
+	s.release = make(chan struct{})
+	s.mu.Unlock()
+}
+
 func (s *sweepStore) releaseBlock() {
 	s.mu.Lock()
 	if s.blocked {
@@ -121,7 +133,8 @@ func (s *sweepStore) releaseBlock() {
 
 func (s *sweepStore) Transact(ctx context.Context, fn func(harness.Transaction) error) error {
 	s.mu.Lock()
-	park, release := s.blocked, s.release
+	park, release, releaseErr := s.blocked, s.release, s.releaseErr
+	s.releaseErr = nil
 	s.mu.Unlock()
 	if park {
 		select {
@@ -129,6 +142,9 @@ func (s *sweepStore) Transact(ctx context.Context, fn func(harness.Transaction) 
 		default:
 		}
 		<-release
+		if releaseErr != nil {
+			return releaseErr
+		}
 	}
 	wrote := false
 	err := s.Storage.Transact(ctx, func(tx harness.Transaction) error {
@@ -487,6 +503,49 @@ func TestMaintenanceDeadlineValuedFailureReportsWhileTheOwnerIsLive(t *testing.T
 	})
 }
 
+// TestMaintenanceCanceledValuedFailureReportsWhileTheOwnerIsLive is the
+// cancellation sibling of the live-owner deadline row under the selected
+// policy: a context-cancellation-valued storage failure while the
+// Runtime-owned context is still alive is an ordinary pass failure, reaches
+// the retained stderr diagnostic exactly once, and leaves the later-tick
+// cadence intact.
+func TestMaintenanceCanceledValuedFailureReportsWhileTheOwnerIsLive(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		wrapped := newSweepStore(store)
+		ticks := make(chan time.Time)
+		opts := e.options(e.storagePlugin(wrapped))
+		opts.sweepTicks = ticks
+		r, err := open(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
+		if err != nil {
+			t.Fatalf("createSession: %v", err)
+		}
+		stderr := captureSweepStderr(t)
+		wrapped.armFailOnce(context.Canceled)
+		tick := created.State.LastActivity.Add(100 * time.Hour)
+		sendTick(t, ticks, tick) // this pass lists, fails with the cancellation identity, and reports
+		sendTick(t, ticks, tick) // the rendezvous proves the canceled-valued pass converged; this pass sweeps again
+		waitWritten(t, wrapped)  // the later tick committed the archive
+		if rec, err := readSweptSession(t, r, created.Identity.SessionID); err != nil || rec.State.Lifecycle != harness.LifecycleArchived {
+			t.Fatalf("Session after the later tick = %+v err %v, want the canceled-valued pass to leave no lasting damage", rec, err)
+		}
+		if err := r.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if out := stderr(); strings.Count(out, "lightcode: sweep: context canceled") != 1 {
+			t.Fatalf("stderr sweep diagnostics = %q, want the live-owner cancellation-valued failure reported exactly once", out)
+		}
+		if got := wrapped.listCount(); got != 4 {
+			t.Fatalf("storage lists = %d, want recovery, the initial pass, one cancellation-failed pass, and one later pass: no immediate retry", got)
+		}
+	})
+}
+
 // TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown proves the
 // shutdown join for maintenance: neither Close nor pure Runtime-context
 // cancellation converges while a sweep pass sits inside a storage
@@ -600,6 +659,87 @@ func TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown(t *testing.
 			}
 			e.assertLockReleased(t)
 		})
+	})
+}
+
+// TestMaintenanceUnrelatedFailureIsQuietOnceShutdownIsObserved proves the
+// accepted race of the selected policy: an ordinary, non-cancellation pass
+// failure that converges while the owned context is already done stays quiet
+// in exchange for reporting every failure while running. The pass is joined
+// by the shutdown like the cancellation rows, and the failing transaction
+// never reaches the base store.
+func TestMaintenanceUnrelatedFailureIsQuietOnceShutdownIsObserved(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		wrapped := newSweepStore(store)
+		ticks := make(chan time.Time)
+		opts := e.options(e.storagePlugin(wrapped))
+		opts.sweepTicks = ticks
+		r, err := open(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
+		if err != nil {
+			t.Fatalf("createSession: %v", err)
+		}
+		stderr := captureSweepStderr(t)
+		unrelated := errors.New("test unrelated store failure")
+		wrapped.armFailAfterRelease(unrelated)
+		sendTick(t, ticks, created.State.LastActivity.Add(100*time.Hour))
+		select {
+		case <-wrapped.arrived:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the sweep pass never entered the parked transaction")
+		}
+		r.cancelWork()
+		select {
+		case <-r.shutdownDone:
+			t.Fatal("shutdown converged while a sweep pass was blocked inside a storage transaction")
+		case <-time.After(200 * time.Millisecond):
+		}
+		wrapped.releaseBlock()
+		select {
+		case <-r.shutdownDone:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the shutdown never joined the released sweep pass")
+		}
+		if err := r.Close(context.Background()); err != nil {
+			t.Fatalf("Close = %v, want the joined shutdown to succeed with the pass error kept out of the owner result", err)
+		}
+		if out := stderr(); strings.Contains(out, "lightcode: sweep:") {
+			t.Fatalf("the shutdown-observed unrelated failure reported to stderr: %q, want silence once shutdown is observed", out)
+		}
+		e.assertLockReleased(t)
+	})
+}
+
+// TestMaintenanceGateRejectionIsQuiet proves the ErrClosed arm of the
+// decision on its own: an admitted pass call made against the closed Runtime
+// with a live caller context is rejected by the admission gate before the
+// store is touched and emits no diagnostic.
+func TestMaintenanceGateRejectionIsQuiet(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		wrapped := newSweepStore(store)
+		r, err := e.open(context.Background(), e.storagePlugin(wrapped))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		if err := r.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		stderr := captureSweepStderr(t)
+		before := wrapped.listCount()
+		r.runSweepPass(context.Background(), time.Now())
+		if got := wrapped.listCount(); got != before {
+			t.Fatalf("storage lists = %d, want the gate rejection to leave the store untouched (was %d)", got, before)
+		}
+		if out := stderr(); strings.Contains(out, "lightcode: sweep:") {
+			t.Fatalf("the gate-rejected pass reported to stderr: %q, want ErrClosed quiet", out)
+		}
 	})
 }
 

@@ -120,9 +120,9 @@ func (s *configurationService) publish(ctx context.Context) (*configuration, err
 		s.buildMu.Unlock()
 		return nil, err
 	}
-	// Immediately before the atomic Store, owner and caller cancellation are
-	// checked once more. A publication that wins this check may finish despite
-	// later cancellation; shutdown joins it.
+	// Immediately before the atomic Store, caller and owner cancellation are
+	// checked once more under the caller-first rule. A publication that wins
+	// this check may finish despite later cancellation; shutdown joins it.
 	if err := s.canceled(ctx); err != nil {
 		s.buildMu.Unlock()
 		return nil, err
@@ -134,14 +134,17 @@ func (s *configurationService) publish(ctx context.Context) (*configuration, err
 	return candidate, nil
 }
 
-// canceled applies the owner-first cancellation rule: owner cancellation ends
-// admission and reports ErrClosed, and caller cancellation reports its own
-// context error.
+// canceled applies the caller-first cancellation rule: a done caller context
+// reports its own error even when the owner is done too; otherwise a done
+// owner ends admission with ErrClosed, and a live caller and owner pass.
 func (s *configurationService) canceled(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.owner.Err() != nil {
 		return ErrClosed
 	}
-	return ctx.Err()
+	return nil
 }
 
 // build reads and interprets exactly one input set: the main and agents bytes

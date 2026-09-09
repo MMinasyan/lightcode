@@ -409,8 +409,10 @@ func TestConfigurationServiceCancellationBetweenValidatorsStopsTheRest(t *testin
 // TestConfigurationServiceChecksCancellationBeforePublication proves the
 // checks around the serialized build: a pre-canceled caller returns without
 // waiting or reading inputs, owner cancellation reports ErrClosed without
-// publication, and a cancellation observed after the last validator is
-// reported immediately before the atomic Store.
+// publication, a cancellation observed after the last validator is reported
+// immediately before the atomic Store without a revision or event, and a
+// caller done together with the owner still reports its own context error
+// under the caller-first checkpoints.
 func TestConfigurationServiceChecksCancellationBeforePublication(t *testing.T) {
 	t.Run("caller canceled before waiting", func(t *testing.T) {
 		h := newServiceHarness(t)
@@ -444,12 +446,59 @@ func TestConfigurationServiceChecksCancellationBeforePublication(t *testing.T) {
 			cancel()
 			return nil
 		}))
+		sub, err := svc.obs.subscribe(4)
+		if err != nil {
+			t.Fatalf("subscribe: %v", err)
+		}
+		t.Cleanup(sub.Close)
 		candidate, err := svc.publish(ctx)
 		if candidate != nil || !errors.Is(err, context.Canceled) {
 			t.Fatalf("publish = (%v, %v), want the Store check to reject the completed candidate", candidate, err)
 		}
 		if svc.current() != nil {
 			t.Fatal("the Store check published anyway")
+		}
+		select {
+		case event, ok := <-sub.Events():
+			if ok {
+				t.Fatalf("the canceled publication emitted %+v, want event silence", event)
+			}
+			t.Fatal("the subscription closed around the canceled publication, want silence with the subscription open")
+		default:
+		}
+	})
+	t.Run("caller and owner both done reports the caller error", func(t *testing.T) {
+		owner, cancelOwner := context.WithCancel(context.Background())
+		caller, cancelCaller := context.WithCancel(context.Background())
+		h := newServiceHarness(t)
+		svc := h.service(owner, servicePlugin("alpha", &h.opens, nil))
+		sub, err := svc.obs.subscribe(4)
+		if err != nil {
+			t.Fatalf("subscribe: %v", err)
+		}
+		t.Cleanup(sub.Close)
+		cancelOwner()
+		cancelCaller()
+		candidate, err := svc.publish(caller)
+		if candidate != nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("both-done publish = (%v, %v), want the caller's own context error from the caller-first checkpoint", candidate, err)
+		}
+		if errors.Is(err, ErrClosed) {
+			t.Fatalf("both-done publish = %v, want the caller error, not the owner-lifecycle identity", err)
+		}
+		select {
+		case event, ok := <-sub.Events():
+			if ok {
+				t.Fatalf("the canceled publication emitted %+v, want event silence", event)
+			}
+			t.Fatal("the subscription closed around the canceled publication, want silence with the subscription open")
+		default:
+		}
+		if svc.current() != nil {
+			t.Fatal("a canceled publication stored a snapshot")
+		}
+		if _, err := os.Stat(h.configPath); !os.IsNotExist(err) {
+			t.Fatalf("a both-done publish started input reads: %v", err)
 		}
 	})
 	t.Run("owner canceled after the last validator", func(t *testing.T) {
