@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
@@ -306,7 +307,7 @@ func TestCompositionConstructsDependenciesFirstInStableOrder(t *testing.T) {
 	if got := trace.all(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("construction order = %q, want %q", got, want)
 	}
-	if err := sc.close(context.Background()); err != nil {
+	if err := sc.close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 	want = append(want, "close:ties", "close:late", "close:early")
@@ -534,7 +535,7 @@ func openGuardFixture(t *testing.T, owner context.Context) *guardFixture {
 		}},
 		Plugin{ID: "cons", Scope: ScopeWorkspace, Requires: []CapabilitySpec{Spec[greeter]("dep.g")}, Provides: []CapabilitySpec{Spec[int]("cons.out")}, Open: func(_ context.Context, _ ScopeInfo, deps Bindings) (Instance, error) {
 			f.consDeps = deps
-			return Instance{Values: map[string]any{"cons.out": 7}, Close: func() error { f.trace.add("close:cons"); return nil }}, nil
+			return Instance{Values: map[string]any{"cons.out": 7}, Close: func() error { f.trace.add("close:cons"); return errCloser }}, nil
 		}},
 	)
 	f.rt = mustOpenScope(t, c, owner, runtimeScopeInfo(), nil)
@@ -575,7 +576,7 @@ func TestScopeGuardOwnsAdmittedCallsThroughClose(t *testing.T) {
 		f := openGuardFixture(t, context.Background())
 		gctx, released, done := startBlockedCall(t, f)
 		closeResult := make(chan error, 1)
-		go func() { closeResult <- f.ws.close(context.Background()) }()
+		go func() { closeResult <- f.ws.close() }()
 		select {
 		case <-gctx.Done():
 		case <-time.After(2 * time.Second):
@@ -591,8 +592,9 @@ func TestScopeGuardOwnsAdmittedCallsThroughClose(t *testing.T) {
 		}
 		close(released)
 		<-done
-		if err := <-closeResult; err != nil {
-			t.Fatalf("close: %v", err)
+		firstErr := <-closeResult
+		if !errors.Is(firstErr, errCloser) {
+			t.Fatalf("close = %v, want the retained cleanup error", firstErr)
 		}
 		want := []string{"call-start", "greet:HI", "call-end", "close:cons"}
 		if got := f.trace.all(); !reflect.DeepEqual(got, want) {
@@ -607,37 +609,57 @@ func TestScopeGuardOwnsAdmittedCallsThroughClose(t *testing.T) {
 		if _, err := Bind[greeter](f.rt.bindings, "dep.g"); err != nil {
 			t.Errorf("binding from the still-open supplying scope: %v", err)
 		}
-		if err := f.ws.close(context.Background()); err != nil {
-			t.Errorf("repeated close: %v, want the shared result", err)
+		if err := f.ws.close(); err != firstErr {
+			t.Errorf("repeated close: %v, want the retained shared result", err)
 		}
-		if err := f.rt.close(context.Background()); err != nil {
+		if err := f.rt.close(); err != nil {
 			t.Errorf("runtime close: %v", err)
 		}
 	})
 
-	t.Run("canceled close waiter leaves the shared cleanup running", func(t *testing.T) {
-		f := openGuardFixture(t, context.Background())
-		gctx, released, done := startBlockedCall(t, f)
-		closeResult := make(chan error, 1)
-		go func() { closeResult <- f.ws.close(context.Background()) }()
-		<-gctx.Done()
-		waiterCtx, cancel := context.WithCancel(context.Background())
-		cancel()
-		if err := f.ws.close(waiterCtx); !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled close waiter = %v, want its own context error", err)
-		}
-		close(released)
-		<-done
-		if err := <-closeResult; err != nil {
-			t.Fatalf("shared cleanup failed: %v", err)
-		}
-		want := []string{"call-start", "greet:HI", "call-end", "close:cons"}
-		if got := f.trace.all(); !reflect.DeepEqual(got, want) {
-			t.Fatalf("guard trace = %q, want %q", got, want)
-		}
-		if err := f.ws.close(context.Background()); err != nil {
-			t.Fatalf("close after the abandoned wait: %v", err)
-		}
+	t.Run("private close callers retain the completed cleanup result", func(t *testing.T) {
+		synctest.Test(t, func(tt *testing.T) {
+			f := openGuardFixture(tt, context.Background())
+			_, released, done := startBlockedCall(tt, f)
+			letGo := func() {
+				if released != nil {
+					close(released)
+					released = nil
+				}
+			}
+			defer letGo() // held work can unwind even when an assertion fails
+			first := make(chan error, 1)
+			go func() { first <- f.ws.close() }()
+			// Quiescence: the admitted call is durably blocked on the
+			// fixture's release channel, so the first close can only have
+			// reached its join of that call.
+			synctest.Wait()
+			select {
+			case err := <-first:
+				tt.Fatalf("first close completed without joining the admitted call: %v", err)
+			default:
+			}
+			// A second caller may wait on Once's mutex, which synctest does
+			// not treat as durably blocked. Release the call before joining
+			// the results; this checks retention, not overlap inside Once.
+			second := make(chan error, 1)
+			go func() { second <- f.ws.close() }()
+			letGo()
+			<-done
+			firstErr := <-first
+			if !errors.Is(firstErr, errCloser) {
+				tt.Fatalf("first close = %v, want the retained cleanup error", firstErr)
+			}
+			// The joined caller returns the same completed result, and the
+			// exact trace proves one join and one dispose.
+			if err := <-second; err != firstErr {
+				tt.Fatalf("joined close = %v, want the same completed result", err)
+			}
+			want := []string{"call-start", "greet:HI", "call-end", "close:cons"}
+			if got := f.trace.all(); !reflect.DeepEqual(got, want) {
+				tt.Fatalf("guard trace = %q, want %q", got, want)
+			}
+		})
 	})
 
 	t.Run("owner cancellation before admission makes the scope unavailable", func(t *testing.T) {
@@ -657,11 +679,9 @@ func TestScopeGuardOwnsAdmittedCallsThroughClose(t *testing.T) {
 			t.Errorf("Bind from an owner-canceled ancestor supplying scope: %v, want ErrClosed", err)
 		}
 		// Rejected admissions registered no work, so closure joins and
-		// disposes without waiting on any call.
-		joinedCtx, cancelJoin := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancelJoin()
-		if err := f.ws.close(joinedCtx); err != nil {
-			t.Errorf("close after rejected admissions: %v, want prompt completion with no registered work", err)
+		// disposes synchronously with no registered call to wait on.
+		if err := f.ws.close(); !errors.Is(err, errCloser) {
+			t.Errorf("close after rejected admissions: %v, want prompt completion with the shared cleanup error", err)
 		}
 	})
 }
@@ -872,29 +892,38 @@ func TestWorkspaceScopeAttemptsAreSharedPerKey(t *testing.T) {
 }
 
 func TestWorkspaceScopesShutdownJoinsConstructionAndDisposesSorted(t *testing.T) {
-	t.Run("canceled waiter still joins the in-flight construction", func(t *testing.T) {
-		f := newWorkspaceFixture(t)
-		_, entered := f.hold("/ws/j")
-		resJ := f.getAsync(context.Background(), "/ws/j")
-		<-entered
-		waiterCtx, cancel := context.WithCancel(context.Background())
-		cancel()
-		if err := f.w.shutdown(waiterCtx); !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled shutdown waiter: %v", err)
-		}
-		if _, err := f.w.get(context.Background(), workspaceScopeInfo("/ws/new")); !errors.Is(err, ErrClosed) {
-			t.Fatalf("get after shutdown admission closed: %v, want ErrClosed", err)
-		}
-		f.stopOwner()
-		if r := <-resJ; !errors.Is(r.err, context.Canceled) || r.sc != nil {
-			t.Fatalf("held construction after owner cancellation: %v %p", r.err, r.sc)
-		}
-		if err := f.w.shutdown(context.Background()); err != nil {
-			t.Fatalf("joined shutdown: %v", err)
-		}
-		if got := f.trace.all(); slices.Contains(got, "close:/ws/j") {
-			t.Fatalf("an unpublished construction was disposed: %q", got)
-		}
+	t.Run("shutdown joins the in-flight construction before returning", func(t *testing.T) {
+		synctest.Test(t, func(tt *testing.T) {
+			f := newWorkspaceFixture(tt)
+			_, entered := f.hold("/ws/j")
+			resJ := f.getAsync(context.Background(), "/ws/j")
+			<-entered
+			shutdownResult := make(chan error, 1)
+			go func() { shutdownResult <- f.w.shutdown() }()
+			// The held factory gate, the construction waiter and the
+			// shutdown's construction join are all durable blocks, so
+			// quiescence here can only mean the shutdown has reached its
+			// join — and it must not have returned yet.
+			synctest.Wait()
+			select {
+			case err := <-shutdownResult:
+				tt.Fatalf("shutdown returned before the in-flight construction converged: %v", err)
+			default:
+			}
+			f.stopOwner()
+			if r := <-resJ; !errors.Is(r.err, context.Canceled) || r.sc != nil {
+				tt.Fatalf("held construction after owner cancellation: %v %p", r.err, r.sc)
+			}
+			if err := <-shutdownResult; err != nil {
+				tt.Fatalf("joined shutdown: %v", err)
+			}
+			if _, err := f.w.get(context.Background(), workspaceScopeInfo("/ws/new")); !errors.Is(err, ErrClosed) {
+				tt.Fatalf("get after shutdown admission closed: %v, want ErrClosed", err)
+			}
+			if got := f.trace.all(); slices.Contains(got, "close:/ws/j") {
+				tt.Fatalf("an unpublished construction was disposed: %q", got)
+			}
+		})
 	})
 
 	t.Run("live workspaces close in sorted order and errors join", func(t *testing.T) {
@@ -904,7 +933,7 @@ func TestWorkspaceScopesShutdownJoinsConstructionAndDisposesSorted(t *testing.T)
 				t.Fatalf("get %s: %v", key, err)
 			}
 		}
-		err := f.w.shutdown(context.Background())
+		err := f.w.shutdown()
 		if !errors.Is(err, errWorkspaceClo) {
 			t.Fatalf("shutdown error = %v, want the joined closer failures", err)
 		}
@@ -913,7 +942,7 @@ func TestWorkspaceScopesShutdownJoinsConstructionAndDisposesSorted(t *testing.T)
 		if first < 0 || second < 0 || first > second {
 			t.Fatalf("workspace close order = %q, want /ws/1 before /ws/2", got)
 		}
-		if err2 := f.w.shutdown(context.Background()); !errors.Is(err2, errWorkspaceClo) {
+		if err2 := f.w.shutdown(); !errors.Is(err2, errWorkspaceClo) {
 			t.Fatalf("repeated shutdown: %v, want the same shared result", err2)
 		}
 		if _, err := f.w.get(context.Background(), workspaceScopeInfo("/ws/1")); !errors.Is(err, ErrClosed) {

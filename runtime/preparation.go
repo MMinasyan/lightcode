@@ -174,13 +174,13 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	agentInfo.Kind = ScopeAgent
 	agentScope, err := p.composition.openScope(ctx, agentInfo, []*scope{p.runtime, workspaceScope, operation})
 	if err != nil {
-		return harness.Execution{}, errors.Join(err, operation.close(context.Background()))
+		return harness.Execution{}, errors.Join(err, operation.close())
 	}
 	unwind := func(cause error, release func()) (harness.Execution, error) {
 		if release != nil {
 			release()
 		}
-		return harness.Execution{}, errors.Join(cause, agentScope.close(context.Background()), operation.close(context.Background()))
+		return harness.Execution{}, errors.Join(cause, agentScope.close(), operation.close())
 	}
 	callCtx, release, err := agentScope.enter(ctx)
 	if err != nil {
@@ -204,7 +204,7 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 		Tool:  execution.Tool,
 		Close: func() error {
 			release()
-			return errors.Join(agentScope.close(context.Background()), operation.close(context.Background()))
+			return errors.Join(agentScope.close(), operation.close())
 		},
 	}, nil
 }

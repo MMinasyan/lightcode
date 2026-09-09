@@ -402,7 +402,6 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 		ctx:      scopeCtx,
 		cancel:   cancel,
 		storages: make(map[string]any),
-		disposed: make(chan struct{}),
 	}
 	if len(ancestors) > 0 {
 		sc.obs = ancestors[0].obs
@@ -537,7 +536,6 @@ type scope struct {
 	wg     sync.WaitGroup
 
 	closeOnce sync.Once
-	disposed  chan struct{}
 	closeErr  error
 }
 
@@ -584,12 +582,12 @@ func (s *scope) enter(ctx context.Context) (context.Context, func(), error) {
 	}, nil
 }
 
-// close closes admission, cancels the scope context, and starts the one
-// shared cleanup that joins admitted work and then disposes instances,
-// attempting all closers and joining their errors. The argument bounds only
-// this caller's wait; every caller joins the same result and no guard can
-// enter once closure has begun.
-func (s *scope) close(ctx context.Context) error {
+// close closes admission, cancels the scope context, and runs the common
+// scope cleanup — join admitted work, then dispose instances, attempting all
+// closers and joining their errors — synchronously. The sync.Once keeps one
+// cleanup: concurrent and repeated callers block until it completes and
+// return its retained result. No guard can enter once closure has begun.
+func (s *scope) close() error {
 	s.closeOnce.Do(func() {
 		commit := func() {
 			s.mu.Lock()
@@ -603,19 +601,9 @@ func (s *scope) close(ctx context.Context) error {
 		} else {
 			commit()
 		}
-		s.cancel()
-		go func() {
-			s.wg.Wait()
-			s.closeErr = s.dispose()
-			close(s.disposed)
-		}()
+		s.closeErr = s.cleanup()
 	})
-	select {
-	case <-s.disposed:
-		return s.closeErr
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return s.closeErr
 }
 
 // cleanup is the common scope cleanup used by both construction rollback and
@@ -667,7 +655,6 @@ type workspaceScopes struct {
 	building sync.WaitGroup
 
 	shutOnce sync.Once
-	shutDone chan struct{}
 	shutErr  error
 }
 
@@ -679,7 +666,6 @@ func newWorkspaceScopes(owner context.Context, c *composition, ancestors []*scop
 		obs:       obs,
 		live:      make(map[string]*scope),
 		attempts:  make(map[string]*workspaceAttempt),
-		shutDone:  make(chan struct{}),
 	}
 }
 
@@ -746,37 +732,30 @@ func (w *workspaceScopes) build(key string, info ScopeInfo, attempt *workspaceAt
 
 // shutdown closes registry admission, joins in-flight construction as
 // Runtime-owned work, and then closes every live Workspace scope in sorted
-// path order. The argument bounds only this caller's wait.
-func (w *workspaceScopes) shutdown(ctx context.Context) error {
+// path order. The sync.Once keeps one shutdown: concurrent and repeated
+// callers block until it completes and return its retained joined result.
+func (w *workspaceScopes) shutdown() error {
 	w.mu.Lock()
 	w.closed = true
 	w.mu.Unlock()
 	w.shutOnce.Do(func() {
-		go func() {
-			w.building.Wait()
-			w.mu.Lock()
-			keys := make([]string, 0, len(w.live))
-			for key := range w.live {
-				keys = append(keys, key)
-			}
-			slices.Sort(keys)
-			live := make([]*scope, len(keys))
-			for i, key := range keys {
-				live[i] = w.live[key]
-			}
-			w.mu.Unlock()
-			var errs []error
-			for _, sc := range live {
-				errs = append(errs, sc.close(context.Background()))
-			}
-			w.shutErr = errors.Join(errs...)
-			close(w.shutDone)
-		}()
+		w.building.Wait()
+		w.mu.Lock()
+		keys := make([]string, 0, len(w.live))
+		for key := range w.live {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		live := make([]*scope, len(keys))
+		for i, key := range keys {
+			live[i] = w.live[key]
+		}
+		w.mu.Unlock()
+		var errs []error
+		for _, sc := range live {
+			errs = append(errs, sc.close())
+		}
+		w.shutErr = errors.Join(errs...)
 	})
-	select {
-	case <-w.shutDone:
-		return w.shutErr
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return w.shutErr
 }

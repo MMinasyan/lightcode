@@ -470,6 +470,31 @@ func TestConfigurationServiceChecksCancellationBeforePublication(t *testing.T) {
 	})
 }
 
+// firstCheckContext is a waiter-check rendezvous: the first Err call captures
+// the wrapped context's current result, signals that the check ran, and
+// blocks until released before returning the captured result, so the first
+// check cannot consume a cancellation issued after the signal. Every later
+// Err call delegates to the wrapped context. Both calls arrive from the one
+// publish goroutine.
+type firstCheckContext struct {
+	context.Context
+	checked     chan struct{}
+	release     chan struct{}
+	intercepted bool
+	captured    error
+}
+
+func (c *firstCheckContext) Err() error {
+	if !c.intercepted {
+		c.intercepted = true
+		c.captured = c.Context.Err()
+		close(c.checked)
+		<-c.release
+		return c.captured
+	}
+	return c.Context.Err()
+}
+
 // TestConfigurationServiceSerializesBuildsAndRejectsCanceledWaiters proves
 // one build mutex: a second caller waits for the active builder, its
 // cancellation while waiting returns its own error without starting another
@@ -546,13 +571,21 @@ func TestConfigurationServiceSerializesBuildsAndRejectsCanceledWaiters(t *testin
 	}
 
 	waitCtx, cancelWait := context.WithCancel(context.Background())
+	// The waiter's context intercepts its first cancellation check: it
+	// captures the current result, signals that the check ran, and blocks
+	// until released. The active builder still holds the mutex while the
+	// waiter passes that first check, so cancellation issued between the
+	// signal and the release can only be observed by the post-lock check;
+	// the hidden input proves any build that skips it never starts.
+	waiter := &firstCheckContext{Context: waitCtx, checked: make(chan struct{}), release: make(chan struct{})}
 	waiting := make(chan result, 1)
 	go func() {
-		cfg, err := svc.publish(waitCtx)
+		cfg, err := svc.publish(waiter)
 		waiting <- result{cfg, err}
 	}()
-	time.Sleep(20 * time.Millisecond)
+	<-waiter.checked
 	cancelWait()
+	close(waiter.release)
 	close(gate)
 
 	first := <-buildA

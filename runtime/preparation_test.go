@@ -1351,9 +1351,7 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 				done <- err
 			}()
 			<-e.prepared()
-			wait, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			if err := e.runtime.close(wait); err != nil {
+			if err := e.runtime.close(); err != nil {
 				t.Fatalf("runtime close: %v", err)
 			}
 			close(hold)

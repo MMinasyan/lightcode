@@ -370,10 +370,10 @@ func (r *Runtime) joinShutdown() error {
 	if err := r.harness.Wait(context.Background()); err != nil {
 		errs = append(errs, err)
 	}
-	if err := r.workspaces.shutdown(context.Background()); err != nil {
+	if err := r.workspaces.shutdown(); err != nil {
 		errs = append(errs, err)
 	}
-	if err := r.runtimeScope.close(context.Background()); err != nil {
+	if err := r.runtimeScope.close(); err != nil {
 		errs = append(errs, err)
 	}
 	r.obs.closeAll()

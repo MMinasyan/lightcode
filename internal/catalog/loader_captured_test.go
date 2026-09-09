@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -104,10 +103,10 @@ func TestLoaderLoadCapturedCancellationSkipsPublicationWithoutUndoingWrites(t *t
 	}))
 	t.Cleanup(okServer.Close)
 
-	// The stale candidate's fetch runs against a test-only listener that
-	// accepts and never answers, so the caller cancellation lands exactly
-	// while that fetch is in flight: the fetch aborts, and the observed
-	// cancellation is reported before any cache writer starts.
+	// The stale candidate's fetch runs against a test-only server that
+	// receives the request and never answers, so the caller cancellation
+	// lands exactly while that fetch is in flight: the fetch aborts, and the
+	// observed cancellation is reported before any cache writer starts.
 	staleBaseURL, stalled := stallTransport(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -149,46 +148,31 @@ func TestLoaderLoadCapturedCancellationSkipsPublicationWithoutUndoingWrites(t *t
 	}
 }
 
-// stallTransport starts a test-only listener that accepts connections and
-// never answers them. It returns the listener's base URL and a channel that
-// receives exactly one signal when the first request connection arrives.
+// stallTransport starts a test-only HTTP server whose handler signals the
+// first request's arrival and then holds the request open until the client
+// cancels it or the fixture's cleanup releases it. Cleanup releases before
+// Server.Close, so a failed assertion cannot leave Close waiting on a live
+// handler. It returns the server's base URL and a channel that receives
+// exactly one signal when the first request arrives.
 func stallTransport(t *testing.T) (string, chan struct{}) {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("stall listener: %v", err)
-	}
 	stalled := make(chan struct{}, 1)
-	accepted := make(chan net.Conn, 64)
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			select {
-			case accepted <- conn:
-			default:
-				_ = conn.Close()
-			}
-			select {
-			case stalled <- struct{}{}:
-			default:
-			}
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case stalled <- struct{}{}:
+		default:
 		}
-	}()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
 	t.Cleanup(func() {
-		_ = listener.Close()
-		for {
-			select {
-			case conn := <-accepted:
-				_ = conn.Close()
-			default:
-				return
-			}
-		}
+		close(release)
+		server.Close()
 	})
-	return "http://" + listener.Addr().String(), stalled
+	return server.URL, stalled
 }
 
 func TestLoaderLoadCapturedFailedFetchKeepsWarningAndAttempt(t *testing.T) {
