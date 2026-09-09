@@ -905,6 +905,18 @@ func TestCodecRejectsInvalidValues(t *testing.T) {
 			_, err := encodeExecutionCapture(v)
 			return err
 		}},
+		{"capture duplicate capability name", func() error {
+			v := testCapture()
+			v.Capabilities = []string{"cap-a", "cap-b", "cap-a"}
+			_, err := encodeExecutionCapture(v)
+			return err
+		}},
+		{"capture empty capability name", func() error {
+			v := testCapture()
+			v.Capabilities = []string{""}
+			_, err := encodeExecutionCapture(v)
+			return err
+		}},
 		{"tool active effect with mismatched reservation", func() error {
 			v := validOperationRecord()
 			v.State.ActiveEffect = &ActiveEffect{Kind: EffectTool, ResultEntryID: hexID(3), ToolCallID: "call-1"}
@@ -1042,5 +1054,77 @@ func TestIDShapes(t *testing.T) {
 	}
 	if err := validateOperationIdentity("any opaque caller identity", "operation id"); err != nil {
 		t.Fatalf("opaque operation id rejected: %v", err)
+	}
+}
+
+// TestExecutionCaptureCapabilities pins the durable capability selection: an
+// empty selection encodes by omission; omission and the empty array both
+// decode to none while null is invalid; present names must be nonempty and
+// unique and keep the selected order; and a historical capture carrying
+// plugin-defined names decodes without any plugin definition.
+func TestExecutionCaptureCapabilities(t *testing.T) {
+	encode := func(t *testing.T, capabilities []string) json.RawMessage {
+		t.Helper()
+		v := testCapture()
+		v.Capabilities = capabilities
+		raw, err := encodeExecutionCapture(v)
+		if err != nil {
+			t.Fatalf("encodeExecutionCapture: %v", err)
+		}
+		return raw
+	}
+
+	for _, empty := range [][]string{nil, {}} {
+		obj, err := decodePayloadObject(encode(t, empty))
+		if err != nil {
+			t.Fatalf("decodePayloadObject: %v", err)
+		}
+		if _, present := obj["capabilities"]; present {
+			t.Fatalf("empty capability selection %#v leaked the capabilities member", empty)
+		}
+	}
+
+	ordered := []string{"retired-plugin.capability", "cap-mid", "cap-last"}
+	obj, err := decodePayloadObject(encode(t, ordered))
+	if err != nil {
+		t.Fatalf("decodePayloadObject: %v", err)
+	}
+	if got := string(obj["capabilities"]); got != `["retired-plugin.capability","cap-mid","cap-last"]` {
+		t.Fatalf("encoded capabilities member = %s", got)
+	}
+	decoded, err := decodeExecutionCapture(obj)
+	if err != nil {
+		t.Fatalf("historical capture without plugin definitions must decode: %v", err)
+	}
+	if len(decoded.Capabilities) != 3 || decoded.Capabilities[0] != "retired-plugin.capability" ||
+		decoded.Capabilities[1] != "cap-mid" || decoded.Capabilities[2] != "cap-last" {
+		t.Fatalf("decoded capabilities = %q, want the selected order", decoded.Capabilities)
+	}
+	decoded.Capabilities[0] = "tampered"
+	again, err := decodeExecutionCapture(obj)
+	if err != nil || again.Capabilities[0] != "retired-plugin.capability" {
+		t.Fatalf("decoded capabilities alias the payload bytes: %q, %v", again.Capabilities, err)
+	}
+
+	captureWith := func(capabilities string) map[string]json.RawMessage {
+		members, err := decodePayloadObject(encode(t, nil))
+		if err != nil {
+			t.Fatalf("decodePayloadObject: %v", err)
+		}
+		if capabilities != "" {
+			members["capabilities"] = json.RawMessage(capabilities)
+		}
+		return members
+	}
+	if got, err := decodeExecutionCapture(captureWith("")); err != nil || got.Capabilities != nil {
+		t.Fatalf("omitted capabilities = %q, %v, want none", got.Capabilities, err)
+	}
+	if got, err := decodeExecutionCapture(captureWith("[]")); err != nil || got.Capabilities != nil {
+		t.Fatalf("empty-array capabilities = %q, %v, want none", got.Capabilities, err)
+	}
+	for _, bad := range []string{"null", `["cap-a","cap-a"]`, `[""]`, `[5]`, `"cap-a"`, `["cap-a",null]`} {
+		if got, err := decodeExecutionCapture(captureWith(bad)); err == nil {
+			t.Fatalf("capabilities %s decoded to %q, want rejection", bad, got.Capabilities)
+		}
 	}
 }

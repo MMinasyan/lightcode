@@ -21,12 +21,14 @@ var StandardTools = []string{
 }
 
 // Definition is the on-disk agent type shape. Pointer fields distinguish
-// omitted fields from explicit zero values for inheritance.
+// omitted fields from explicit zero values for inheritance. Capabilities is
+// target-only: the legacy Parse ignores it.
 type Definition struct {
 	Model        string    `json:"model,omitempty"`
 	SystemPrompt string    `json:"system_prompt,omitempty"`
 	Prompt       *string   `json:"prompt,omitempty"`
 	Tools        *[]string `json:"tools,omitempty"`
+	Capabilities *[]string `json:"capabilities"`
 	LSP          *bool     `json:"lsp,omitempty"`
 	Readonly     *bool     `json:"readonly,omitempty"`
 	WriteDir     *string   `json:"write_dir,omitempty"`
@@ -41,6 +43,7 @@ type Resolved struct {
 	SystemPrompt string
 	Prompt       string
 	Tools        []string
+	Capabilities []string
 	LSP          bool
 	Readonly     bool
 	WriteDir     string

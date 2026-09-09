@@ -197,8 +197,7 @@ func TestSubmitRoutesIdleAndActive(t *testing.T) {
 	store := emptyStore(t)
 	script := newModelScript()
 	script.gate = make(chan struct{})
-	prepared := validPrepared()
-	prepared.Model = script.model
+	prepared := modelPrepared(script.model)
 	h, cancel := newCancelableHarness(t, store, prepared, nil)
 	defer cancel()
 	session := createSession(t, h)
@@ -248,8 +247,7 @@ func TestSteeringDrainsAtModelBoundaryInFIFOOrder(t *testing.T) {
 	script := newModelScript()
 	gate := make(chan struct{})
 	script.gate = gate
-	prepared := validPrepared()
-	prepared.Model = script.model
+	prepared := modelPrepared(script.model)
 	h, cancel := newCancelableHarness(t, store, prepared, nil)
 	defer cancel()
 	session := createSession(t, h)
@@ -305,8 +303,7 @@ func TestSteeringContinuationAcrossOutputShapes(t *testing.T) {
 			script := newModelScript(tc.settle)
 			gate := make(chan struct{})
 			script.gate = gate
-			prepared := validPrepared()
-			prepared.Model = script.model
+			prepared := modelPrepared(script.model)
 			h, cancel := newCancelableHarness(t, store, prepared, nil)
 			defer cancel()
 			session := createSession(t, h)
@@ -355,8 +352,7 @@ func TestPostTerminalQueuedDrain(t *testing.T) {
 	script := newModelScript()
 	gate := make(chan struct{})
 	script.gate = gate
-	prepared := validPrepared()
-	prepared.Model = script.model
+	prepared := modelPrepared(script.model)
 	h, cancel := newCancelableHarness(t, store, prepared, nil)
 	defer cancel()
 	session := createSession(t, h)
@@ -401,8 +397,7 @@ func TestBufferedItemFailureIsFinal(t *testing.T) {
 		script := newModelScript()
 		gate := make(chan struct{})
 		script.gate = gate
-		prepared := validPrepared()
-		prepared.Model = script.model
+		prepared := modelPrepared(script.model)
 		calls := 0
 		h, cancel := newCancelableHarness(t, store, prepared, func(_ context.Context, _ PreparationRequest) (PreparedExecution, error) {
 			calls++
@@ -448,8 +443,7 @@ func TestBufferedItemFailureIsFinal(t *testing.T) {
 		script := newModelScript()
 		gate := make(chan struct{})
 		script.gate = gate
-		prepared := validPrepared()
-		prepared.Model = script.model
+		prepared := modelPrepared(script.model)
 		h, cancel := newCancelableHarness(t, store, prepared, nil)
 		defer cancel()
 		session := createSession(t, h)
@@ -494,8 +488,7 @@ func TestBufferedItemFailureIsFinal(t *testing.T) {
 		)
 		gate := make(chan struct{})
 		script.gate = gate
-		prepared := validPrepared()
-		prepared.Model = script.model
+		prepared := modelPrepared(script.model)
 		h, cancel := newCancelableHarness(t, store, prepared, nil)
 		defer cancel()
 		session := createSession(t, h)
@@ -537,7 +530,6 @@ func TestFinalBoundarySerialization(t *testing.T) {
 	t.Run("regular input at the boundary continues through steering", func(t *testing.T) {
 		store := emptyStore(t)
 		script := newModelScript()
-		prepared := validPrepared()
 		var (
 			h       *Harness
 			session string
@@ -553,7 +545,7 @@ func TestFinalBoundarySerialization(t *testing.T) {
 			}
 			return inner(ctx, req, assemble)
 		}
-		prepared.Model = script.model
+		prepared := modelPrepared(script.model)
 		h, cancel := newCancelableHarness(t, store, prepared, nil)
 		defer cancel()
 		session = createSession(t, h)
@@ -577,7 +569,6 @@ func TestFinalBoundarySerialization(t *testing.T) {
 	t.Run("queued input at the boundary drains after the terminal", func(t *testing.T) {
 		store := emptyStore(t)
 		script := newModelScript()
-		prepared := validPrepared()
 		var (
 			h       *Harness
 			session string
@@ -593,7 +584,7 @@ func TestFinalBoundarySerialization(t *testing.T) {
 			}
 			return inner(ctx, req, assemble)
 		}
-		prepared.Model = script.model
+		prepared := modelPrepared(script.model)
 		h, cancel := newCancelableHarness(t, store, prepared, nil)
 		defer cancel()
 		session = createSession(t, h)
@@ -621,8 +612,7 @@ func TestAgentTypeChangeDuringBlockedEffect(t *testing.T) {
 	script := newModelScript()
 	gate := make(chan struct{})
 	script.gate = gate
-	prepared := validPrepared()
-	prepared.Model = script.model
+	prepared := modelPrepared(script.model)
 	var (
 		prepareMu   sync.Mutex
 		prepareReqs []PreparationRequest
@@ -676,8 +666,7 @@ func TestWaitConvergence(t *testing.T) {
 		script := newModelScript()
 		gate := make(chan struct{})
 		script.gate = gate
-		prepared := validPrepared()
-		prepared.Model = script.model
+		prepared := modelPrepared(script.model)
 		h, cancel := newCancelableHarness(t, store, prepared, nil)
 		session := createSession(t, h)
 		watch := watchSettlements(store)
@@ -747,15 +736,16 @@ func TestWaitConvergence(t *testing.T) {
 		script.gate = modelGate
 		toolGate := make(chan struct{})
 		toolArrived := make(chan struct{}, 1)
-		prepared := validPrepared()
-		prepared.Model = script.model
-		prepared.Tool = func(context.Context, model.ToolCall) PreparedTool {
+		exec := validExecution()
+		exec.Model = script.model
+		exec.Tool = func(context.Context, model.ToolCall) PreparedTool {
 			toolArrived <- struct{}{}
 			<-toolGate
 			return PreparedTool{Execute: func(context.Context) model.ToolResult {
 				return model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "ran"}
 			}}
 		}
+		prepared := preparedExecuting(exec)
 		h, cancel := newCancelableHarness(t, store, prepared, nil)
 		session := createSession(t, h)
 		watch := watchSettlements(store)
@@ -785,8 +775,7 @@ func TestWaitConvergence(t *testing.T) {
 	t.Run("the first storage failure that stopped admitted work is retained", func(t *testing.T) {
 		store := emptyStore(t)
 		script := newModelScript()
-		prepared := validPrepared()
-		prepared.Model = script.model
+		prepared := modelPrepared(script.model)
 		h, cancel := newCancelableHarness(t, store, prepared, nil)
 		defer cancel()
 		replaces := 0
@@ -827,6 +816,65 @@ func TestWaitConvergence(t *testing.T) {
 			t.Fatalf("stopped operation = %q, want the last committed running state for recovery", rec.State.Status)
 		}
 	})
+
+	t.Run("a failed terminal publication and a failed cleanup are both retained and joined", func(t *testing.T) {
+		store := emptyStore(t)
+		script := newModelScript()
+		firstErr := fmt.Errorf("settlement storage failure: %w", ErrStorage)
+		cleanupErr := errors.New("first execution cleanup failure")
+		laterCleanupErr := errors.New("later execution cleanup failure")
+		closedA := make(chan struct{}, 1)
+		closedB := make(chan struct{}, 1)
+		open := func(_ context.Context, adm OperationAdmission) (Execution, error) {
+			exec := validExecution()
+			exec.Model = script.model
+			if adm.OperationID == "op-a" {
+				exec.Close = func() error { closedA <- struct{}{}; return cleanupErr }
+			} else {
+				exec.Close = func() error { closedB <- struct{}{}; return laterCleanupErr }
+			}
+			return exec, nil
+		}
+		prepared := PreparedExecution{Capture: testCapture(), Open: open}
+		h, cancel := newCancelableHarness(t, store, prepared, nil)
+		defer cancel()
+		replaces := 0
+		store.txHook = func(step string) error {
+			if step != "replace_register" {
+				return nil
+			}
+			replaces++
+			if replaces == 5 { // Session A's outer terminal settlement fails
+				return firstErr
+			}
+			return nil
+		}
+		sessionA := createSession(t, h)
+		if _, err := submitText(t, h, sessionA, "op-a", MessageModeRegular, "hello"); err != nil {
+			t.Fatalf("first submit: %v", err)
+		}
+		<-closedA // the cleanup ran after the failed terminal-settlement attempt
+		sessionB := createSession(t, h)
+		if _, err := submitText(t, h, sessionB, "op-b", MessageModeRegular, "hello"); err != nil {
+			t.Fatalf("second submit: %v", err)
+		}
+		<-closedB
+
+		cancel()
+		err := h.Wait(context.Background())
+		if !errors.Is(err, firstErr) || !errors.Is(err, cleanupErr) {
+			t.Fatalf("Wait = %v, want the join of the retained storage failure and the retained cleanup failure", err)
+		}
+		if errors.Is(err, laterCleanupErr) {
+			t.Fatalf("Wait = %v, want the first retained cleanup failure not replaced by a later one", err)
+		}
+		if rec := settledOperation(t, store, sessionA, "op-a"); rec.State.Status != OperationRunning {
+			t.Fatalf("A stopped operation = %q, want the last committed running state for recovery", rec.State.Status)
+		}
+		if rec := settledOperation(t, store, sessionB, "op-b"); rec.State.Status != OperationSuccess {
+			t.Fatalf("B operation = %q, want the failed cleanup to leave the settled terminal unchanged", rec.State.Status)
+		}
+	})
 }
 
 // TestWaitDiscardsBuffersOfStuckSessions proves the lifetime row's loss axis
@@ -837,8 +885,7 @@ func TestWaitConvergence(t *testing.T) {
 func TestWaitDiscardsBuffersOfStuckSessions(t *testing.T) {
 	store := emptyStore(t)
 	script := newModelScript()
-	prepared := validPrepared()
-	prepared.Model = script.model
+	prepared := modelPrepared(script.model)
 	h, cancel := newCancelableHarness(t, store, prepared, nil)
 	session := createSession(t, h)
 	replaces := 0
@@ -905,8 +952,7 @@ func TestHarnessLossDiscardsBuffers(t *testing.T) {
 	script := newModelScript()
 	gate := make(chan struct{})
 	script.gate = gate
-	prepared := validPrepared()
-	prepared.Model = script.model
+	prepared := modelPrepared(script.model)
 	h, cancel := newCancelableHarness(t, store, prepared, nil)
 	session := createSession(t, h)
 	watch := watchSettlements(store)
@@ -950,8 +996,7 @@ func TestSubmitCancellationGate(t *testing.T) {
 		script := newModelScript()
 		gate := make(chan struct{})
 		script.gate = gate
-		prepared := validPrepared()
-		prepared.Model = script.model
+		prepared := modelPrepared(script.model)
 		h, cancel := newCancelableHarness(t, store, prepared, nil)
 		defer cancel()
 		session := createSession(t, h)
@@ -1002,8 +1047,7 @@ func TestSubmitCancellationGate(t *testing.T) {
 		script := newModelScript()
 		gate := make(chan struct{})
 		script.gate = gate
-		prepared := validPrepared()
-		prepared.Model = script.model
+		prepared := modelPrepared(script.model)
 		h, cancel := newCancelableHarness(t, store, prepared, nil)
 		defer cancel()
 		session := createSession(t, h)
@@ -1104,15 +1148,16 @@ func TestSessionsExecuteConcurrently(t *testing.T) {
 	firstGate := make(chan struct{})
 	first.gate = firstGate
 	second := newModelScript()
-	prepared := validPrepared()
+	exec := validExecution()
 	firstModel, secondModel := first.model, second.model
-	prepared.Model = func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+	exec.Model = func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 		texts := textsOf(req)
 		if texts[len(texts)-1] == "first" {
 			return firstModel(ctx, req, assemble)
 		}
 		return secondModel(ctx, req, assemble)
 	}
+	prepared := preparedExecuting(exec)
 	h, cancel := newCancelableHarness(t, store, prepared, nil)
 	defer cancel()
 	sessionA := createSession(t, h)

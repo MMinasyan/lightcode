@@ -222,3 +222,78 @@ func TestParseRejectsOldShapes(t *testing.T) {
 		})
 	}
 }
+
+func TestParseSessionsSharedPolicy(t *testing.T) {
+	for _, row := range []struct {
+		name string
+		data string
+		want SessionConfig
+	}{
+		{name: "absent", data: "", want: SessionConfig{AutoArchive: true, ArchiveAfterDays: 7, DeleteAfterArchiveDays: 7}},
+		{name: "null", data: "null", want: SessionConfig{AutoArchive: true, ArchiveAfterDays: 7, DeleteAfterArchiveDays: 7}},
+		{name: "empty object", data: "{}", want: SessionConfig{AutoArchive: true, ArchiveAfterDays: 7, DeleteAfterArchiveDays: 7}},
+		{name: "partial keeps defaults", data: `{"auto_archive":false}`, want: SessionConfig{AutoArchive: false, ArchiveAfterDays: 7, DeleteAfterArchiveDays: 7}},
+		{name: "explicit", data: `{"auto_archive":true,"archive_after_days":30,"delete_after_archive_days":60}`, want: SessionConfig{AutoArchive: true, ArchiveAfterDays: 30, DeleteAfterArchiveDays: 60}},
+		{name: "nonpositive retained", data: `{"archive_after_days":0,"delete_after_archive_days":-5}`, want: SessionConfig{AutoArchive: true, ArchiveAfterDays: 0, DeleteAfterArchiveDays: -5}},
+		{name: "boundary days", data: `{"archive_after_days":106751}`, want: SessionConfig{AutoArchive: true, ArchiveAfterDays: 106751, DeleteAfterArchiveDays: 7}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			var data []byte
+			if row.data != "" {
+				data = []byte(row.data)
+			}
+			got, err := ParseSessions(data)
+			if err != nil {
+				t.Fatalf("ParseSessions(%s): %v", row.data, err)
+			}
+			if got != row.want {
+				t.Fatalf("ParseSessions(%s) = %+v, want %+v", row.data, got, row.want)
+			}
+		})
+	}
+
+	for _, bad := range []string{
+		`{"auto_archive":`, `{"archive_after_days":106752}`, `{"delete_after_archive_days":9223372036854775807}`,
+		`[]`, `"7"`, `5`,
+	} {
+		if got, err := ParseSessions([]byte(bad)); err == nil {
+			t.Fatalf("ParseSessions(%s) = %+v, want rejection", bad, got)
+		}
+	}
+}
+
+func TestParseSessionsSharesTheLegacyParseImplementation(t *testing.T) {
+	for _, doc := range []string{
+		`{"providers":{}}`,
+		`{"providers":{},"sessions":null}`,
+		`{"providers":{},"sessions":{}}`,
+		`{"providers":{},"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":2}}`,
+		`{"providers":{},"sessions":{"archive_after_days":-3}}`,
+	} {
+		cfg, err := Parse([]byte(doc))
+		if err != nil {
+			t.Fatalf("Parse(%s): %v", doc, err)
+		}
+		var members map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(doc), &members); err != nil {
+			t.Fatal(err)
+		}
+		want, err := ParseSessions(members["sessions"])
+		if err != nil {
+			t.Fatalf("ParseSessions for %s: %v", doc, err)
+		}
+		if cfg.Sessions != want {
+			t.Fatalf("Parse(%s) sessions = %+v, ParseSessions = %+v", doc, cfg.Sessions, want)
+		}
+	}
+	// The legacy document path stays best-effort: the overflowed policy is
+	// retained without failing the whole Parse, while ParseSessions rejects
+	// the same section for candidates that must fail closed.
+	cfg, err := Parse([]byte(`{"providers":{},"sessions":{"archive_after_days":106752}}`))
+	if err != nil {
+		t.Fatalf("legacy Parse of overflowed days: %v", err)
+	}
+	if cfg.Sessions.ArchiveAfterDays != 106752 {
+		t.Fatalf("legacy sessions = %+v, want the decoded value retained", cfg.Sessions)
+	}
+}

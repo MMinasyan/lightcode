@@ -1411,11 +1411,13 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 		Model                 json.RawMessage   `json:"model"`
 		SystemPrompt          string            `json:"system_prompt"`
 		Tools                 []json.RawMessage `json:"tools"`
+		Capabilities          []string          `json:"capabilities,omitempty"`
 	}{
 		ConfigurationRevision: v.ConfigurationRevision,
 		Model:                 modelRaw,
 		SystemPrompt:          v.SystemPrompt,
 		Tools:                 tools,
+		Capabilities:          v.Capabilities,
 	})
 	if err != nil {
 		return nil, err
@@ -1556,9 +1558,9 @@ func validateOperationAdmission(v OperationAdmission) error {
 }
 
 // decodeExecutionCapture reads the durable capture with exact keys, unique
-// tool names, and preserved tool order.
+// tool names, and preserved tool and capability order.
 func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, error) {
-	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "system_prompt", "tools"); err != nil {
+	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "system_prompt", "tools", "capabilities"); err != nil {
 		return ExecutionCapture{}, err
 	}
 	revision, err := stringMember(obj, "configuration_revision", true)
@@ -1589,6 +1591,20 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 		}
 		v.Tools = append(v.Tools, tool)
 	}
+	capabilitiesRaw, err := arrayMember(obj, "capabilities", false)
+	if err != nil {
+		return ExecutionCapture{}, err
+	}
+	for i, raw := range capabilitiesRaw {
+		var name string
+		if err := json.Unmarshal(raw, &name); err != nil {
+			return ExecutionCapture{}, fmt.Errorf("capabilities[%d]: %w", i, err)
+		}
+		v.Capabilities = append(v.Capabilities, name)
+	}
+	if len(v.Capabilities) == 0 { // omission and the empty array both mean none
+		v.Capabilities = nil
+	}
 	if err := validateExecutionCapture(v); err != nil {
 		return ExecutionCapture{}, err
 	}
@@ -1596,8 +1612,11 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 }
 
 // validateExecutionCapture enforces the closed capture shape: non-empty
-// stable revision, complete model identity, and unique tool names in
-// preserved order through the landed request constructor.
+// stable revision, complete model identity, unique tool names in preserved
+// order through the landed request constructor, and non-empty unique
+// capability IDs in preserved order. Capability names are checked for shape
+// only: no plugin definition is consulted, so a historical capture stays
+// readable when plugins change.
 func validateExecutionCapture(v ExecutionCapture) error {
 	if v.ConfigurationRevision == "" {
 		return errors.New("configuration_revision must be non-empty")
@@ -1607,6 +1626,16 @@ func validateExecutionCapture(v ExecutionCapture) error {
 	}
 	if _, err := model.NewRequest(model.Request{Tools: v.Tools}); err != nil {
 		return err
+	}
+	seen := make(map[string]bool, len(v.Capabilities))
+	for i, capability := range v.Capabilities {
+		if capability == "" {
+			return fmt.Errorf("capabilities[%d]: name must be non-empty", i)
+		}
+		if seen[capability] {
+			return fmt.Errorf("capabilities[%d]: duplicate name %q", i, capability)
+		}
+		seen[capability] = true
 	}
 	return nil
 }

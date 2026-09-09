@@ -1035,10 +1035,22 @@ func (h *Harness) commitToolResult(ctx context.Context, c *coordinator, operatio
 	return result, nil
 }
 
-// execute is the private agent.Run composition of one admitted execution: the
-// three Agent boundaries run over the coordinator's validated state on the
-// Harness context, then the outer terminal settlement converges the durable
-// state with the run's outcome.
+// execute is the private agent.Run composition of one admitted execution:
+// after the commit it invokes the preparation's opener exactly once with the
+// execution context and the owned committed admission, runs the Agent over
+// the opened effects, then the outer terminal settlement converges the
+// durable state with the run's outcome, and a non-nil resource cleanup runs
+// once after that settlement attempt — before the slot releases or the next
+// buffered delivery starts. The Agent's expected model and advertised tools
+// come from an independent capture retained before the opener runs, so an
+// opener mutating its admission input locally never changes what is
+// advertised after admission. An opener error resolves through the ordinary
+// terminal settlement: cancellation interrupts, a storage failure retains the
+// running state for recovery, and any other error fails. A canceled
+// execution skips an unstarted opener. A successful invalid Execution has
+// its non-nil Close invoked before rejection, and no Agent runs with invalid
+// effects. A cleanup failure never rewrites the terminal Operation; it is
+// retained for Wait alongside the first storage failure.
 func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedExecution) error {
 	c.mu.Lock()
 	op, ok := c.graph.Operation(operationID)
@@ -1047,25 +1059,44 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		c.mu.Unlock()
 		return fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
 	}
-	capture := op.Admission.Execution
+	admission := ownOperationRecord(op).Admission
+	agentCapture := ownCapture(admission.Execution)
 	c.mu.Unlock()
+	if err := h.ctx.Err(); err != nil { // the execution is already canceled: the opener never starts
+		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{}, err)
+	}
+	exec, err := prepared.Open(h.ctx, admission)
+	if err != nil {
+		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{}, err)
+	}
+	if exec.Model == nil || exec.Tool == nil {
+		if exec.Close != nil {
+			h.recordCleanupFailure(exec.Close())
+		}
+		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{},
+			invalidInput("opened execution requires non-nil model and tool functions"))
+	}
+	if exec.Close != nil {
+		defer func() { h.recordCleanupFailure(exec.Close()) }()
+	}
 	res, err := agent.Run(h.ctx, agent.Invocation{
-		ExpectedModel: capture.Model,
-		Tools:         capture.Tools,
+		ExpectedModel: agentCapture.Model,
+		Tools:         agentCapture.Tools,
 		Context:       h.contextSource(c, operationID),
-		ModelEffect:   h.modelEffect(c, operationID, prepared.Model),
-		ToolEffect:    h.toolEffect(c, operationID, prepared.Tool),
+		ModelEffect:   h.modelEffect(c, operationID, exec.Model),
+		ToolEffect:    h.toolEffect(c, operationID, exec.Tool),
 	})
 	return h.settleAgentTerminal(c, operationID, res, err)
 }
 
 // settleAgentTerminal is the outer terminal settlement: terminal settlement
-// after agent.Run reuses the common terminal helper only when the Operation is
-// still running, because model-effect-originated terminals already settled
-// durably inside their own result transactions. A non-storage callback or
-// Agent protocol error settles failure with the error's own text; an Agent
-// terminal result preserves its non-empty detail. A committed running/intent
-// state left by a publication failure stays for recovery.
+// after opening or running the Agent reuses the common terminal helper only
+// when the Operation is still running, because model-effect-originated
+// terminals already settled durably inside their own result transactions. A
+// non-storage callback or Agent protocol error settles failure with the
+// error's own text; an Agent terminal result preserves its non-empty detail.
+// A committed running/intent state left by a publication failure stays for
+// recovery.
 func (h *Harness) settleAgentTerminal(c *coordinator, operationID string, res agent.TerminalResult, runErr error) error {
 	c.mu.Lock()
 	op, ok := c.graph.Operation(operationID)

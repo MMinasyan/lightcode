@@ -13,9 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/permission"
@@ -121,6 +123,60 @@ func defaultSessionConfig() SessionConfig {
 	}
 }
 
+// maxSweepDays is the largest positive day count whose 24-hour duration
+// conversion still fits an int64 nanosecond time.Duration.
+const maxSweepDays = math.MaxInt64 / int64(24*time.Hour)
+
+// ParseSessions decodes the raw JSON bytes of one config document's
+// sessions section into the sweep policy. Absent (nil) or null input, and
+// absent fields within an object, keep the defaults true/7/7. Malformed
+// input, a non-object section, or a positive day count whose 24-hour
+// duration conversion overflows is rejected with an error.
+func ParseSessions(data []byte) (SessionConfig, error) {
+	var raw *rawSessionConfig
+	if len(bytes.TrimSpace(data)) > 0 {
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return defaultSessionConfig(), err
+		}
+	}
+	return sessionsFromRaw(raw)
+}
+
+// sessionsFromRaw applies the defaults and the fields present in one
+// decoded sessions section. It is the shared session implementation used by
+// both the whole-document Parse and ParseSessions.
+func sessionsFromRaw(raw *rawSessionConfig) (SessionConfig, error) {
+	c := defaultSessionConfig()
+	if raw != nil {
+		if raw.AutoArchive != nil {
+			c.AutoArchive = *raw.AutoArchive
+		}
+		if raw.ArchiveAfterDays != nil {
+			c.ArchiveAfterDays = *raw.ArchiveAfterDays
+		}
+		if raw.DeleteAfterArchiveDays != nil {
+			c.DeleteAfterArchiveDays = *raw.DeleteAfterArchiveDays
+		}
+	}
+	if err := checkSweepDays(c.ArchiveAfterDays, "archive_after_days"); err != nil {
+		return c, err
+	}
+	if err := checkSweepDays(c.DeleteAfterArchiveDays, "delete_after_archive_days"); err != nil {
+		return c, err
+	}
+	return c, nil
+}
+
+// checkSweepDays rejects a positive day count whose 24-hour duration
+// conversion overflows; a nonpositive value disables its transition and
+// needs no conversion.
+func checkSweepDays(days int, field string) error {
+	if days <= 0 || int64(days) <= maxSweepDays {
+		return nil
+	}
+	return fmt.Errorf("sessions.%s: %d days overflows the 24-hour duration conversion", field, days)
+}
+
 type rawCompactionConfig struct {
 	Enabled      *bool    `json:"enabled"`
 	ThresholdPct *float64 `json:"threshold_pct"`
@@ -182,18 +238,7 @@ func Parse(data []byte) (*Config, error) {
 	}
 	_ = json.Unmarshal(data, &raw)
 
-	c.Sessions = defaultSessionConfig()
-	if raw.Sessions != nil {
-		if raw.Sessions.AutoArchive != nil {
-			c.Sessions.AutoArchive = *raw.Sessions.AutoArchive
-		}
-		if raw.Sessions.ArchiveAfterDays != nil {
-			c.Sessions.ArchiveAfterDays = *raw.Sessions.ArchiveAfterDays
-		}
-		if raw.Sessions.DeleteAfterArchiveDays != nil {
-			c.Sessions.DeleteAfterArchiveDays = *raw.Sessions.DeleteAfterArchiveDays
-		}
-	}
+	c.Sessions, _ = sessionsFromRaw(raw.Sessions)
 
 	c.Compaction = defaultCompactionConfig()
 	if raw.Compaction != nil {

@@ -20,10 +20,7 @@ import (
 func newEffectHarness(t *testing.T, modelFn agent.ModelEffect) (*Harness, *graphStorage, *coordinator, string) {
 	t.Helper()
 	store := emptyStore(t)
-	prepared := validPrepared()
-	if modelFn != nil {
-		prepared.Model = modelFn
-	}
+	prepared := modelPrepared(modelFn)
 	h := newTestHarness(t, store, func(context.Context, PreparationRequest) (PreparedExecution, error) {
 		return prepared, nil
 	})
@@ -1208,16 +1205,13 @@ func (s *toolSpy) dispatched() []string {
 	return append([]string{}, s.order...)
 }
 
-// newExecutionHarness admits one running Operation ("op-1") under a cancelable
-// Harness context with both prepared effect functions, returning the pieces
-// the execution fixtures need.
-func newExecutionHarness(t *testing.T, modelFn agent.ModelEffect, toolFn func(context.Context, model.ToolCall) PreparedTool) (*Harness, *graphStorage, *coordinator, string, PreparedExecution, context.CancelFunc) {
+// newOpenerHarness admits one running Operation ("op-1") under a cancelable
+// Harness context whose preparation returns the given opener, returning the
+// pieces the execution fixtures need.
+func newOpenerHarness(t *testing.T, open func(context.Context, OperationAdmission) (Execution, error)) (*Harness, *graphStorage, *coordinator, string, PreparedExecution, context.CancelFunc) {
 	t.Helper()
-	if toolFn == nil {
-		t.Fatalf("execution fixtures require a prepared tool function")
-	}
 	store := emptyStore(t)
-	prepared := PreparedExecution{Capture: testCapture(), Model: modelFn, Tool: toolFn}
+	prepared := PreparedExecution{Capture: testCapture(), Open: open}
 	hctx, cancel := context.WithCancel(context.Background())
 	h, err := New(hctx, Dependencies{Storage: store, Prepare: func(context.Context, PreparationRequest) (PreparedExecution, error) {
 		return prepared, nil
@@ -1237,6 +1231,19 @@ func newExecutionHarness(t *testing.T, modelFn agent.ModelEffect, toolFn func(co
 		t.Fatalf("coordinator: %v", err)
 	}
 	return h, store, c, session.Identity.SessionID, prepared, cancel
+}
+
+// newExecutionHarness admits one running Operation ("op-1") under a cancelable
+// Harness context with both prepared effect functions, returning the pieces
+// the execution fixtures need.
+func newExecutionHarness(t *testing.T, modelFn agent.ModelEffect, toolFn func(context.Context, model.ToolCall) PreparedTool) (*Harness, *graphStorage, *coordinator, string, PreparedExecution, context.CancelFunc) {
+	t.Helper()
+	if toolFn == nil {
+		t.Fatalf("execution fixtures require a prepared tool function")
+	}
+	return newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
+		return Execution{Model: modelFn, Tool: toolFn}, nil
+	})
 }
 
 // invokeModelEffectCtx drives one model effect with an explicit context.
@@ -1330,6 +1337,207 @@ func TestExecuteSuccessSettlesOuterTerminal(t *testing.T) {
 	}
 	if settlements != 1 {
 		t.Fatalf("%d settlement entries, want exactly one", settlements)
+	}
+}
+
+// TestExecuteOpensOnceWithCommittedAdmission proves the opener row: execute
+// invokes the preparation's opener exactly once on the execution context with
+// the owned committed admission carrying the prepared capture, then runs the
+// Agent over the opened effects.
+func TestExecuteOpensOnceWithCommittedAdmission(t *testing.T) {
+	type openRecord struct {
+		ctx context.Context
+		adm OperationAdmission
+	}
+	var opens []openRecord
+	modelFn := modelAssemblingOnce(agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()})
+	spy := &toolSpy{}
+	h, _, c, sessionID, prepared, _ := newOpenerHarness(t, func(ctx context.Context, adm OperationAdmission) (Execution, error) {
+		opens = append(opens, openRecord{ctx: ctx, adm: adm})
+		return Execution{Model: modelFn, Tool: spy.tool}, nil
+	})
+	if err := h.execute(c, testOpID, prepared); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(opens) != 1 {
+		t.Fatalf("%d opener calls, want exactly one per execution", len(opens))
+	}
+	if opens[0].ctx != h.ctx {
+		t.Fatalf("opener ran on a foreign context, want the execution context")
+	}
+	adm := opens[0].adm
+	if adm.SessionID != sessionID || adm.OperationID != testOpID || adm.AgentType != "coder" {
+		t.Fatalf("opener admission = %+v, want the owned committed admission", adm)
+	}
+	if !reflect.DeepEqual(adm.Execution, testCapture()) {
+		t.Fatalf("opener capture = %+v, want the prepared capture", adm.Execution)
+	}
+	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	if err != nil {
+		t.Fatalf("ReadOperation: %v", err)
+	}
+	if rec.State.Status != OperationSuccess {
+		t.Fatalf("operation status = %s, want the Agent run over the opened effects", rec.State.Status)
+	}
+}
+
+// TestExecuteCanceledBeforeOpenSkipsOpener proves the canceled-execution row:
+// an execution whose context is already lost never starts the opener and
+// settles the terminal interruption.
+func TestExecuteCanceledBeforeOpenSkipsOpener(t *testing.T) {
+	opens := 0
+	h, store, c, sessionID, prepared, cancel := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
+		opens++
+		return Execution{Model: modelAssemblingOnce(agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}), Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }}, nil
+	})
+	cancel() // the execution context is lost before the opener could start
+	if err := h.execute(c, testOpID, prepared); !errors.Is(err, context.Canceled) {
+		t.Fatalf("execute = %v, want the context error", err)
+	}
+	if opens != 0 {
+		t.Fatalf("opener calls = %d, want a canceled execution to skip the unstarted opener", opens)
+	}
+	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	if err != nil {
+		t.Fatalf("ReadOperation: %v", err)
+	}
+	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
+		t.Fatalf("operation state = %+v, want terminal interruption", rec.State)
+	}
+	requireSessionCleared(t, h, sessionID)
+	if _, err := validateFixture(t, store, sessionID); err != nil {
+		t.Fatalf("graph after the skipped opener: %v", err)
+	}
+}
+
+// TestExecuteOpenerErrorSettlesOrdinaryTerminals proves the opening-error
+// rows: an ordinary opener error settles failure with the error's own text
+// and a storage-class opener error retains the running state for recovery —
+// in both cases the Agent never runs, and the opener owned any provisional
+// cleanup, not the Harness.
+func TestExecuteOpenerErrorSettlesOrdinaryTerminals(t *testing.T) {
+	t.Run("ordinary opener error settles failure", func(t *testing.T) {
+		openErr := errors.New("open broke")
+		modelRuns := 0
+		h, store, c, sessionID, prepared, _ := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
+			return Execution{
+				Model: func(context.Context, model.Request, agent.AssemblyCallback) (agent.ModelSettlement, error) {
+					modelRuns++
+					return agent.ModelSettlement{}, nil
+				},
+				Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
+			}, openErr
+		})
+		if err := h.execute(c, testOpID, prepared); err != openErr {
+			t.Fatalf("execute = %v, want the exact opener error", err)
+		}
+		if modelRuns != 0 {
+			t.Fatalf("model effect ran %d times after a failed open, want zero", modelRuns)
+		}
+		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+		if err != nil {
+			t.Fatalf("ReadOperation: %v", err)
+		}
+		if rec.State.Status != OperationFailure || rec.State.Terminal == nil || rec.State.Terminal.Detail != "open broke" {
+			t.Fatalf("operation state = %+v, want terminal failure with the opener error text", rec.State)
+		}
+		requireSessionCleared(t, h, sessionID)
+		if _, err := validateFixture(t, store, sessionID); err != nil {
+			t.Fatalf("graph after the opening failure: %v", err)
+		}
+	})
+
+	t.Run("storage opener error retains running state", func(t *testing.T) {
+		storageErr := fmt.Errorf("opener storage failure: %w", ErrStorage)
+		h, _, c, sessionID, prepared, _ := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
+			return Execution{}, storageErr
+		})
+		if err := h.execute(c, testOpID, prepared); err != storageErr {
+			t.Fatalf("execute = %v, want the exact storage-class error", err)
+		}
+		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+		if err != nil {
+			t.Fatalf("ReadOperation: %v", err)
+		}
+		if rec.State.Status != OperationRunning {
+			t.Fatalf("operation status = %s, want the committed running state preserved for recovery", rec.State.Status)
+		}
+		session, err := h.ReadSession(context.Background(), sessionID)
+		if err != nil {
+			t.Fatalf("ReadSession: %v", err)
+		}
+		if session.State.CurrentOperationID != testOpID {
+			t.Fatalf("session current operation = %q, want the running Operation still current", session.State.CurrentOperationID)
+		}
+	})
+}
+
+// TestExecuteInvalidOpenedExecutionClosesBeforeRejection proves the
+// invalid-success row: a successful Open with a nil Model or a nil Tool has
+// its non-nil Close invoked exactly once before the rejection — while the
+// Operation is still running — never runs the Agent, and settles failure
+// through the ordinary terminal settlement.
+func TestExecuteInvalidOpenedExecutionClosesBeforeRejection(t *testing.T) {
+	for _, name := range []string{"nil model", "nil tool"} {
+		t.Run(name, func(t *testing.T) {
+			var h *Harness
+			closes := 0
+			var statusDuringClose OperationState
+			modelRuns := 0
+			open := func(_ context.Context, adm OperationAdmission) (Execution, error) {
+				exec := Execution{
+					Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
+				}
+				if name == "nil model" {
+					exec.Model = nil
+				} else {
+					exec.Model = func(context.Context, model.Request, agent.AssemblyCallback) (agent.ModelSettlement, error) {
+						modelRuns++
+						return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+					}
+					exec.Tool = nil
+				}
+				exec.Close = func() error {
+					closes++
+					rec, err := h.ReadOperation(context.Background(), adm.SessionID, adm.OperationID)
+					if err != nil {
+						t.Errorf("read operation from the rejection closer: %v", err)
+					}
+					statusDuringClose = rec.State.Status
+					return nil
+				}
+				return exec, nil
+			}
+			var store *graphStorage
+			var c *coordinator
+			var sessionID string
+			var prepared PreparedExecution
+			h, store, c, sessionID, prepared, _ = newOpenerHarness(t, open)
+			err := h.execute(c, testOpID, prepared)
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("execute = %v, want the invalid-execution rejection", err)
+			}
+			if modelRuns != 0 {
+				t.Fatalf("model effect ran %d times with an invalid execution, want zero: no Agent runs with invalid effects", modelRuns)
+			}
+			if closes != 1 {
+				t.Fatalf("Close calls = %d, want exactly one for an invalid successful Execution", closes)
+			}
+			if statusDuringClose != OperationRunning {
+				t.Fatalf("close observed status %s, want the rejection published only after the cleanup", statusDuringClose)
+			}
+			settled, readErr := h.ReadOperation(context.Background(), sessionID, testOpID)
+			if readErr != nil {
+				t.Fatalf("ReadOperation: %v", readErr)
+			}
+			if settled.State.Status != OperationFailure || settled.State.Terminal == nil || settled.State.Terminal.Detail != err.Error() {
+				t.Fatalf("operation state = %+v, want terminal failure with the rejection text %q", settled.State, err)
+			}
+			requireSessionCleared(t, h, sessionID)
+			if _, err := validateFixture(t, store, sessionID); err != nil {
+				t.Fatalf("graph after the rejected execution: %v", err)
+			}
+		})
 	}
 }
 
