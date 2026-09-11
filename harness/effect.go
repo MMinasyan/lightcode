@@ -750,6 +750,17 @@ func invalidToolResult(callID string) model.ToolResult {
 	return model.ToolResult{CallID: callID, Status: model.ResultError, Content: invalidToolResultContent}
 }
 
+// ownedToolMetadata returns the owned metadata accepted at the commit
+// boundary through the one shared durable predicate: a candidate whose
+// durable encoding is malformed, null, or beyond the bound is dropped while
+// the result still commits. The Harness never interprets the accepted bytes.
+func ownedToolMetadata(raw json.RawMessage) json.RawMessage {
+	if !durableToolMetadata(raw) {
+		return nil
+	}
+	return model.CloneRaw(raw)
+}
+
 // interruptedToolResult is the ordinary interrupted-before-execution result.
 func interruptedToolResult(callID string) model.ToolResult {
 	return model.ToolResult{CallID: callID, Status: model.ResultInterrupted, Content: interruptedToolResultContent}
@@ -787,16 +798,16 @@ func (h *Harness) toolEffect(c *coordinator, operationID string, prepared func(c
 		}
 		settleCtx := context.WithoutCancel(h.ctx)
 		if ctx.Err() != nil { // execution cancellation prevents later preparation: interrupted-before-execution
-			return h.commitToolResult(settleCtx, c, operationID, pending, interruptedToolResult(call.ID), false)
+			return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: interruptedToolResult(call.ID)}, false)
 		}
 		plan := prepared(ctx, call)
 		if !validToolPlan(plan) {
-			return h.commitToolResult(settleCtx, c, operationID, pending, invalidToolResult(call.ID), false)
+			return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: invalidToolResult(call.ID)}, false)
 		}
 		if plan.Immediate != nil {
 			outcome := *plan.Immediate
-			if _, err := model.NewToolResult(outcome); err != nil || outcome.CallID != call.ID {
-				outcome = invalidToolResult(call.ID)
+			if _, err := model.NewToolResult(outcome.Result); err != nil || outcome.Result.CallID != call.ID {
+				outcome = ToolOutcome{Result: invalidToolResult(call.ID)}
 			}
 			return h.commitToolResult(settleCtx, c, operationID, pending, outcome, false)
 		}
@@ -805,16 +816,16 @@ func (h *Harness) toolEffect(c *coordinator, operationID string, prepared func(c
 			// cancellation outcome: interrupted-before-execution, never a
 			// cancellation-shaped error out of an active effect.
 			if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && ctx.Err() != nil {
-				return h.commitToolResult(settleCtx, c, operationID, pending, interruptedToolResult(call.ID), false)
+				return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: interruptedToolResult(call.ID)}, false)
 			}
 			return model.ToolResult{}, err
 		}
 		if ctx.Err() != nil { // cancellation before start commits interrupted-before-execution
-			return h.commitToolResult(settleCtx, c, operationID, pending, interruptedToolResult(call.ID), true)
+			return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: interruptedToolResult(call.ID)}, true)
 		}
 		outcome := plan.Execute(ctx)
-		if _, err := model.NewToolResult(outcome); err != nil || outcome.CallID != call.ID {
-			outcome = invalidToolResult(call.ID)
+		if _, err := model.NewToolResult(outcome.Result); err != nil || outcome.Result.CallID != call.ID {
+			outcome = ToolOutcome{Result: invalidToolResult(call.ID)}
 		}
 		// the real outcome wins a cancellation race: the settlement transaction
 		// runs without cancellation and publishes what the execution produced
@@ -903,9 +914,12 @@ func (h *Harness) beginToolEffect(ctx context.Context, c *coordinator, operation
 // commitToolResult commits the one terminal result of a settled call through
 // the ordinary tool-result transition: the result entry under the call's
 // reserved identity, the cleared active effect, and the complete next
-// Operation state in one transaction. Immediate plans commit without an
-// effect intent; executor-backed plans commit behind theirs.
-func (h *Harness) commitToolResult(ctx context.Context, c *coordinator, operationID string, pending PendingToolCall, result model.ToolResult, fromIntent bool) (model.ToolResult, error) {
+// Operation state in one transaction. The outcome's metadata is committed
+// only when it is one well-formed JSON value within the durable bound;
+// invalid or oversized metadata is dropped while the result still commits.
+// Immediate plans commit without an effect intent; executor-backed plans
+// commit behind theirs.
+func (h *Harness) commitToolResult(ctx context.Context, c *coordinator, operationID string, pending PendingToolCall, outcome ToolOutcome, fromIntent bool) (model.ToolResult, error) {
 	c.mu.Lock()
 	op, ok := c.graph.Operation(operationID)
 	if !ok {
@@ -975,8 +989,9 @@ func (h *Harness) commitToolResult(ctx context.Context, c *coordinator, operatio
 			OperationID:    operationID,
 			AssistantEntry: reservation.AssistantEntry,
 			ToolCallID:     pending.CallID,
-			Status:         result.Status,
-			Content:        result.Content,
+			Status:         outcome.Result.Status,
+			Content:        outcome.Result.Content,
+			Metadata:       ownedToolMetadata(outcome.Metadata),
 		}
 		payload, err := encodeToolResultEntry(entry)
 		if err != nil {
@@ -1032,7 +1047,7 @@ func (h *Harness) commitToolResult(ctx context.Context, c *coordinator, operatio
 	c.graph.replaceOperation(operationID, updated)
 	c.graph.Session = committedSess
 	c.mu.Unlock()
-	return result, nil
+	return outcome.Result, nil
 }
 
 // execute is the private agent.Run composition of one admitted execution:

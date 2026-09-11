@@ -187,7 +187,7 @@ func newPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, 
 			return harness.Execution{
 				Model: modelFn,
 				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 				},
 			}, nil
 		},
@@ -503,7 +503,7 @@ func scriptPrepared(script *scriptModel) harness.PreparedExecution {
 			return harness.Execution{
 				Model: script.effect,
 				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 				},
 			}, nil
 		},
@@ -1238,7 +1238,7 @@ func TestPublicOpenerInputMutationKeepsAdmittedExecution(t *testing.T) {
 							return harness.Execution{
 								Model: script.effect,
 								Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-									return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+									return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 								},
 								Close: func() error { // runs after the terminal settlement commits
 									select {
@@ -1591,25 +1591,25 @@ func TestPublicOrderedToolCallsSettle(t *testing.T) {
 						toolOrder = append(toolOrder, call.ID)
 						toolMu.Unlock()
 						if call.ID == "call-1" { // executor-backed: intent before execution, one result after
-							return harness.PreparedTool{Execute: func(context.Context) model.ToolResult {
+							return harness.PreparedTool{Execute: func(context.Context) harness.ToolOutcome {
 								reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterOperation, OperationID: "op-1"})
 								if err != nil {
 									t.Errorf("read operation register during execution: %v", err)
-									return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}
+									return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
 								}
 								var wire opRegisterWire
 								if err := json.Unmarshal(reg.Payload, &wire); err != nil {
 									t.Errorf("decode operation register during execution: %v", err)
-									return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}
+									return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
 								}
 								if wire.State.ActiveEffect == nil || wire.State.ActiveEffect.Kind != "tool" ||
 									wire.State.ActiveEffect.ToolCallID != "call-1" || wire.State.ActiveEffect.ResultEntryID == "" {
 									t.Errorf("tool intent during execution = %+v, want the committed call-1 intent with a reserved result", wire.State.ActiveEffect)
 								}
-								return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}
+								return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
 							}}
 						}
-						return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "immediate call-2"}} // no effect intent
+						return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "immediate call-2"}}} // no effect intent
 					},
 				}, nil
 			},
@@ -1651,6 +1651,111 @@ func TestPublicOrderedToolCallsSettle(t *testing.T) {
 		defer toolMu.Unlock()
 		if len(toolOrder) != 2 || toolOrder[0] != "call-1" || toolOrder[1] != "call-2" {
 			t.Fatalf("dispatch order = %v, want the completed calls in published order", toolOrder)
+		}
+	})
+}
+
+// TestPublicToolMetadataPersistsOpaqueAcrossStores proves the durable metadata
+// boundary through the public surface over both storage implementations:
+// a tool's well-formed bounded metadata commits byte-identical into its
+// tool_result payload, an executor returning malformed metadata still commits
+// its result without the member, a raw value within the bound whose durable
+// HTML-escaped encoding exceeds it is dropped while its result still commits,
+// the model-visible projection carries only each committed result's content,
+// and a restarted Harness revalidates both payloads.
+func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		const preview = `{"kind":"editpreview","files":["a.go"]}`
+		// exactly 1 MiB of raw bytes, but every '<' encodes as \u003c in the
+		// durable payload, expanding it far past the bound.
+		const durableBound = 1 << 20
+		expanded := json.RawMessage(`"` + strings.Repeat("<", durableBound-2) + `"`)
+		if len(expanded) != durableBound {
+			t.Fatalf("fixture raw size = %d, want exactly the durable bound", len(expanded))
+		}
+		script := newScriptModel(
+			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompletedWithCalls("call-1", "call-2", "call-3")},
+			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},
+		)
+		f := newPublicFixture(t, store, script, nil)
+		f.prepareHook = func(_ int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
+			return harness.PreparedExecution{
+				Capture: publicCapture(),
+				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+					return harness.Execution{
+						Model: script.effect,
+						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+							switch call.ID {
+							case "call-2": // malformed metadata: dropped, the result still commits
+								return harness.PreparedTool{Immediate: &harness.ToolOutcome{
+									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "no preview"},
+									Metadata: json.RawMessage(`{broken`),
+								}}
+							case "call-3": // durable-oversized after escaping: dropped, no transaction failure
+								return harness.PreparedTool{Immediate: &harness.ToolOutcome{
+									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "expanded metadata"},
+									Metadata: expanded,
+								}}
+							}
+							return harness.PreparedTool{Execute: func(context.Context) harness.ToolOutcome {
+								return harness.ToolOutcome{
+									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
+									Metadata: json.RawMessage(preview),
+								}
+							}}
+						},
+					}, nil
+				},
+			}, nil
+		}
+		session := createSession(t, f.h)
+		if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+		<-script.arrived // the turn that published the calls
+		<-script.arrived // the completion turn: all three results projected before it
+		if got := texts(script.seen()[1]); len(got) != 6 || got[3] != "ran call-1" || got[4] != "no preview" || got[5] != "expanded metadata" {
+			t.Fatalf("projection = %v, want the committed contents only", got)
+		}
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+
+		results := map[string]map[string]json.RawMessage{}
+		for _, entry := range recoverEntries(t, store, session) {
+			if entry.Kind != harness.EntryToolResult {
+				continue
+			}
+			var wire map[string]json.RawMessage
+			if err := json.Unmarshal(entry.Payload, &wire); err != nil {
+				t.Fatalf("decode tool result payload: %v", err)
+			}
+			var callID string
+			if err := json.Unmarshal(wire["tool_call_id"], &callID); err != nil {
+				t.Fatalf("decode tool call id: %v", err)
+			}
+			results[callID] = wire
+		}
+		if string(results["call-1"]["metadata"]) != preview {
+			t.Fatalf("call-1 metadata = %s, want the committed bytes verbatim", results["call-1"]["metadata"])
+		}
+		if _, present := results["call-2"]["metadata"]; present {
+			t.Fatalf("call-2 carries malformed metadata %s, want it dropped while the result committed", results["call-2"]["metadata"])
+		}
+		if string(results["call-2"]["content"]) != `"no preview"` {
+			t.Fatalf("call-2 payload = %s, want the settled result alongside the dropped metadata", results["call-2"]["content"])
+		}
+		if _, present := results["call-3"]["metadata"]; present {
+			t.Fatalf("call-3 carries durable-oversized metadata, want it dropped while the result committed")
+		}
+		if string(results["call-3"]["content"]) != `"expanded metadata"` {
+			t.Fatalf("call-3 payload = %s, want the settled result committed past the metadata drop", results["call-3"]["content"])
+		}
+
+		// a restarted Harness revalidates every committed payload: the durable
+		// states prove no transaction failed and the Session stayed sound.
+		if err := harness.Recover(context.Background(), store); err != nil {
+			t.Fatalf("Recover: %v", err)
 		}
 	})
 }
@@ -4134,6 +4239,31 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 		}
 	}
 
+	// The tool_result metadata member inventory: persisted values that
+	// violate the durable member rules — a null member (the schema-valid
+	// representation of malformed metadata: absence encodes by omission,
+	// never null) and a member beyond the bound — isolate their Session at
+	// the current supported version while a valid sibling stays usable.
+	metadataMutations := []struct {
+		name     string
+		metadata json.RawMessage
+	}{
+		{"null member", json.RawMessage(`null`)},
+		{"raw bytes over the bound", json.RawMessage(`"` + strings.Repeat("x", 1+(1<<20)) + `"`)},
+	}
+	for _, mutation := range metadataMutations {
+		rows = append(rows, corruptSiblingRow{
+			name: "tool_result metadata wire: " + mutation.name,
+			seed: seedCorruptSiblingWithResult,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				entry := snapEntryOf(snap, harness.EntryToolResult)
+				entry.Payload = editPayloadObject(t, entry.Payload, func(obj map[string]json.RawMessage) {
+					obj["metadata"] = mutation.metadata
+				})
+			},
+		})
+	}
+
 	// The register-wire inventory: rejected session- and operation-register
 	// payload mutations on the plain running graph.
 	sessionWireMutations := []struct {
@@ -4374,7 +4504,7 @@ func racePrepared(f *publicFixture) harness.PreparedExecution {
 			return harness.Execution{
 				Model: f.model.effect,
 				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 				},
 			}, nil
 		},
@@ -4424,7 +4554,12 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 					return harness.Execution{
 						Model: script.effect,
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
+							// the copied tool result carries tool-owned metadata
+							// that the fork must preserve verbatim
+							return harness.PreparedTool{Immediate: &harness.ToolOutcome{
+								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
+								Metadata: json.RawMessage(`{"kind":"copyprobe","n":[1]}`),
+							}}
 						},
 					}, nil
 				},
@@ -4579,7 +4714,8 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 				SessionID string `json:"session_id"`
 				EntryID   string `json:"entry_id"`
 			} `json:"assistant_entry"`
-			ToolCallID string `json:"tool_call_id"`
+			ToolCallID string          `json:"tool_call_id"`
+			Metadata   json.RawMessage `json:"metadata"`
 		}
 		if err := json.Unmarshal(entries[2].Payload, &copiedResult); err != nil {
 			t.Fatalf("decode copied tool result: %v", err)
@@ -4587,6 +4723,9 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		if copiedResult.AssistantEntry.SessionID != dest || copiedResult.AssistantEntry.EntryID != entries[1].ID ||
 			copiedResult.ToolCallID != "call-1" {
 			t.Fatalf("copied result reference = %+v, want it rewritten inside the copied prefix", copiedResult.AssistantEntry)
+		}
+		if string(copiedResult.Metadata) != `{"kind":"copyprobe","n":[1]}` {
+			t.Fatalf("copied result metadata = %s, want the source metadata preserved verbatim", copiedResult.Metadata)
 		}
 		var copiedSignal struct {
 			RelatedOperation struct {
@@ -5307,7 +5446,7 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 					return harness.Execution{
 						Model: script.effect,
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 						},
 						Close: func() error {
 							rec, err := f.h.ReadOperation(ctx, adm.SessionID, adm.OperationID)

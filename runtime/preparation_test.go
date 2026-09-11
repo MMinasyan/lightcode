@@ -417,7 +417,7 @@ func (e *prepEnv) opener(_ context.Context, adm harness.OperationAdmission, sel 
 	execution := harness.Execution{
 		Model: e.model(sel),
 		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}
+			return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}}
 		},
 	}
 	if invalid {

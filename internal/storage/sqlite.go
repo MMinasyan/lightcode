@@ -29,8 +29,10 @@ const (
 	sqliteDriverName = "sqlite3"
 
 	// sqliteSchemaVersion is the only accepted schema version; it is stamped
-	// into PRAGMA user_version at initialization and checked at open.
-	sqliteSchemaVersion = 1
+	// into PRAGMA user_version at initialization and checked at open. Version
+	// 2 is the durable tool-result metadata member; the SQL tables are
+	// unchanged.
+	sqliteSchemaVersion = 2
 
 	// sqlitePoolDSN configures every physical connection of the long-lived
 	// pool: write-ahead logging, full synchronous durability, immediate
@@ -84,8 +86,9 @@ type sqliteSchemaObject struct {
 	ddl  string
 }
 
-// sqliteCanonicalSchema is the complete user-defined object set of schema
-// version 1: the two canonical strict tables and one explicit partial index.
+// sqliteCanonicalSchema is the complete user-defined object set of the
+// canonical schema: the two canonical strict tables and one explicit partial
+// index.
 // The entries primary key supplies the ordered-read index; parent
 // session-register existence is checked by the storage operations, so no
 // third table or trigger exists.
@@ -105,7 +108,8 @@ func sqliteDSN(path string, params string) string {
 
 // OpenSQLite opens the production SQLite implementation at an explicit
 // caller-supplied path. A missing or zero-length file is initialized with the
-// canonical schema version 1; an existing non-empty file is first validated
+// canonical schema and current version; an existing non-empty file is first
+// validated
 // through a short-lived read-only connection and only the exact canonical
 // schema is accepted. Only after initialization or validation succeeds is the
 // long-lived configured pool created. No migration, repair, compatibility
@@ -183,7 +187,7 @@ func initSQLiteSchema(path string) error {
 // metadata when required to inspect current -wal state; that read metadata may
 // remain, but validation does not write database or WAL bytes, change
 // persistent journal mode, migrate, repair, or open the configured writable
-// pool before acceptance. It accepts only schema version 1 whose complete
+// pool before acceptance. It accepts only the current schema version whose complete
 // user-defined sqlite_schema object set and definitions match the canonical
 // schema; SQLite-generated autoindexes carry no sql text and are implied by
 // the canonical tables. Any other version, or any missing, changed, or

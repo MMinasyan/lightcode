@@ -271,7 +271,9 @@ type assistantEntry struct {
 }
 
 // toolResultEntry is one settled tool result answering a published call by
-// its reserved identity.
+// its reserved identity. Metadata is the tool-owned raw-JSON member the
+// Harness preserves opaquely within its well-formedness and size bound; it is
+// absent on synthetic results and never reaches the model-visible result.
 type toolResultEntry struct {
 	SessionID      string                 `json:"session_id"`
 	EntryID        string                 `json:"entry_id"`
@@ -280,6 +282,7 @@ type toolResultEntry struct {
 	ToolCallID     string                 `json:"tool_call_id"`
 	Status         model.ToolResultStatus `json:"status"`
 	Content        string                 `json:"content"`
+	Metadata       json.RawMessage        `json:"metadata,omitempty"`
 }
 
 // signalEntry is one durable control signal. Its related source Operation is

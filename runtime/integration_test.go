@@ -144,7 +144,7 @@ func (p *combinedPrep) opener(_ context.Context, adm harness.OperationAdmission,
 			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &out}, nil
 		},
 		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}
+			return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}}
 		},
 		Close: func() error {
 			signalBuffered(p.cleanups)

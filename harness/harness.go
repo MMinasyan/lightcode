@@ -56,12 +56,21 @@ type Execution struct {
 	Close func() error
 }
 
-// PreparedTool is one tool plan: exactly one immediate result or executor,
+// ToolOutcome is one owned tool plan's complete outcome: the model-visible
+// result returned to the Agent, plus optional raw-JSON metadata whose
+// semantics belong to the producing tool. The Harness validates only
+// well-formedness and the durable size bound and never interprets the value.
+type ToolOutcome struct {
+	Result   model.ToolResult
+	Metadata json.RawMessage // optional, bounded, well-formed; semantics owned by the tool
+}
+
+// PreparedTool is one tool plan: exactly one immediate outcome or executor,
 // with normalized arguments that are nil or one valid JSON value.
 type PreparedTool struct {
 	NormalizedArguments json.RawMessage
-	Immediate           *model.ToolResult
-	Execute             func(context.Context) model.ToolResult
+	Immediate           *ToolOutcome
+	Execute             func(context.Context) ToolOutcome
 }
 
 // CreateSessionRequest is the input of one root Session creation.

@@ -435,7 +435,7 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 							return agent.ModelSettlement{}, errors.New("seeded execution released after the test converged")
 						},
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}
+							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}}
 						},
 					}, nil
 				},

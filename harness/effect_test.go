@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -1196,7 +1197,7 @@ func (s *toolSpy) tool(_ context.Context, call model.ToolCall) PreparedTool {
 	if s.plan != nil {
 		return s.plan(context.Background(), call)
 	}
-	return PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}
+	return PreparedTool{Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 }
 
 func (s *toolSpy) dispatched() []string {
@@ -1560,7 +1561,7 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 		}
 	}
 	success := func(_ context.Context, call model.ToolCall) PreparedTool {
-		return PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}
+		return PreparedTool{Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	}
 	cases := []struct {
 		name         string
@@ -1577,8 +1578,8 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 		{
 			name: "executor plan commits intent then one validated outcome",
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
-				return PreparedTool{Execute: func(context.Context) model.ToolResult {
-					return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}
+				return PreparedTool{Execute: func(context.Context) ToolOutcome {
+					return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
 				}}
 			},
 			want:         model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "ran"},
@@ -1601,8 +1602,8 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 		{
 			name: "returned outcome answering another call maps to the validation error",
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
-				return PreparedTool{Execute: func(context.Context) model.ToolResult {
-					return model.ToolResult{CallID: "other-call", Status: model.ResultSuccess, Content: "ran"}
+				return PreparedTool{Execute: func(context.Context) ToolOutcome {
+					return ToolOutcome{Result: model.ToolResult{CallID: "other-call", Status: model.ResultSuccess, Content: "ran"}}
 				}}
 			},
 			want:         model.ToolResult{CallID: "call-1", Status: model.ResultError, Content: invalidToolResultContent},
@@ -1652,6 +1653,84 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 			}
 			if rec.State.Status != OperationRunning || rec.State.ActiveEffect != nil || len(rec.State.PendingToolCalls) != 0 {
 				t.Fatalf("operation state = %+v, want running with the effect cleared and the call resolved", rec.State)
+			}
+		})
+	}
+}
+
+// TestToolOutcomeMetadataRules proves the tool-owned metadata boundary at the
+// shared result commit: one well-formed value whose durable encoding fits the
+// bound is committed verbatim while only the Result reaches the Agent, null
+// and empty are treated as absent, and malformed or durable-bound-exceeding
+// metadata is dropped while the result still commits. The shape matrix runs
+// once through the executor transition; the immediate transition routes one
+// drop-while-committing case, proving both callers reach the same shared
+// boundary.
+func TestToolOutcomeMetadataRules(t *testing.T) {
+	cases := []struct {
+		name      string
+		metadata  json.RawMessage
+		stored    string // expected committed metadata bytes; "" means the member stays absent
+		immediate bool   // route through the immediate plan instead of the executor
+	}{
+		{name: "object metadata commits", metadata: json.RawMessage(`{"kind":"editpreview","files":["a.go"]}`), stored: `{"kind":"editpreview","files":["a.go"]}`},
+		{name: "scalar metadata commits", metadata: json.RawMessage(`42`), stored: `42`},
+		{name: "HTML characters persist in the escaped durable encoding", metadata: json.RawMessage(`"<"`), stored: `"\u003c"`},
+		{name: "metadata exactly at the durable bound commits", metadata: json.RawMessage(`"` + strings.Repeat("x", maxToolMetadataBytes-2) + `"`), stored: `"` + strings.Repeat("x", maxToolMetadataBytes-2) + `"`},
+		{name: "durable encoding one byte over the bound is dropped and the result commits", metadata: json.RawMessage(`"` + strings.Repeat("x", maxToolMetadataBytes-1) + `"`), stored: ""},
+		// The two-representation regression: the raw value is exactly at the
+		// bound, but HTML-escaping expands its durable encoding far past it,
+		// so the metadata drops while the result still commits.
+		{name: "raw at the bound but durable-oversized after escaping is dropped and the result commits", metadata: json.RawMessage(`"` + strings.Repeat("<", maxToolMetadataBytes-2) + `"`), stored: ""},
+		{name: "malformed metadata is dropped and the result commits", metadata: json.RawMessage(`{broken`), stored: ""},
+		{name: "null metadata is absent", metadata: json.RawMessage(`null`), stored: ""},
+		{name: "empty metadata is absent", metadata: json.RawMessage{}, stored: ""},
+		{name: "immediate plan drops malformed metadata while the result commits", metadata: json.RawMessage(`{broken`), stored: "", immediate: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, store, c, sessionID := newEffectHarness(t, nil)
+			publishCalls(t, h, c, sessionID, testToolCall("call-1"))
+			plan := func(_ context.Context, call model.ToolCall) PreparedTool {
+				outcome := ToolOutcome{
+					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"},
+					Metadata: tc.metadata,
+				}
+				if tc.immediate {
+					return PreparedTool{Immediate: &outcome}
+				}
+				return PreparedTool{Execute: func(context.Context) ToolOutcome { return outcome }}
+			}
+			got, err := h.toolEffect(c, testOpID, plan)(context.Background(), testToolCall("call-1"))
+			if err != nil {
+				t.Fatalf("tool effect: %v", err)
+			}
+			want := model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "ran"}
+			if got != want {
+				t.Fatalf("agent-facing result = %+v, want only the plain Result", got)
+			}
+			graph, err := validateFixture(t, store, sessionID)
+			if err != nil {
+				t.Fatalf("graph after the tool effect: %v", err)
+			}
+			var result *toolResultEntry
+			for i := range graph.Entries {
+				if graph.Entries[i].ToolResult != nil {
+					result = graph.Entries[i].ToolResult
+				}
+			}
+			if result == nil {
+				t.Fatalf("no tool result committed, want the result to survive any metadata decision")
+			}
+			if result.Status != model.ResultSuccess || result.Content != "ran" {
+				t.Fatalf("committed result = %+v, want the settled result", result)
+			}
+			if tc.stored == "" {
+				if len(result.Metadata) != 0 {
+					t.Fatalf("committed metadata = %s, want absent", result.Metadata)
+				}
+			} else if string(result.Metadata) != tc.stored {
+				t.Fatalf("committed metadata = %q..., want %q...", result.Metadata[:min(len(result.Metadata), 20)], tc.stored[:min(len(tc.stored), 20)])
 			}
 		})
 	}
@@ -1723,9 +1802,9 @@ func TestToolEffectRealOutcomeWinsCancellationRace(t *testing.T) {
 		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
 	}
 	toolFn := func(_ context.Context, call model.ToolCall) PreparedTool {
-		return PreparedTool{Execute: func(ctx context.Context) model.ToolResult {
+		return PreparedTool{Execute: func(ctx context.Context) ToolOutcome {
 			cancel() // the execution context dies during the concrete execution
-			return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}
+			return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
 		}}
 	}
 	h, store, c, sessionID, prepared, harnessCancel := newExecutionHarness(t, modelFn, toolFn)
@@ -1770,8 +1849,8 @@ func TestToolOriginatedInterruptionSettlesUnstartedCalls(t *testing.T) {
 		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
 	}
 	toolFn := func(_ context.Context, call model.ToolCall) PreparedTool {
-		return PreparedTool{Execute: func(context.Context) model.ToolResult {
-			return model.ToolResult{CallID: call.ID, Status: model.ResultInterrupted, Content: "stopped by the tool"}
+		return PreparedTool{Execute: func(context.Context) ToolOutcome {
+			return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultInterrupted, Content: "stopped by the tool"}}
 		}}
 	}
 	spy := &toolSpy{plan: toolFn}
@@ -1826,7 +1905,7 @@ func TestExecuteBetweenEffectCancellationSettlesInterruption(t *testing.T) {
 		return agent.ModelSettlement{Disposition: agent.DispoContinue, Output: erroredOutputWith()}, nil
 	}
 	h, store, c, sessionID, prepared, harnessCancel := newExecutionHarness(t, modelFn, func(_ context.Context, call model.ToolCall) PreparedTool {
-		return PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}
+		return PreparedTool{Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	})
 	cancel = harnessCancel
 	if err := h.execute(c, testOpID, prepared); err != nil {
@@ -1856,7 +1935,7 @@ func TestExecuteCapSettlesFailure(t *testing.T) {
 		return agent.ModelSettlement{Disposition: agent.DispoContinue, Output: erroredOutputWith()}, nil
 	}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, func(_ context.Context, call model.ToolCall) PreparedTool {
-		return PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}
+		return PreparedTool{Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	})
 	if err := h.execute(c, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
@@ -1925,7 +2004,7 @@ func TestToolResultAdoptsIntoView(t *testing.T) {
 	publishCalls(t, h, c, sessionID, testToolCall("call-1"), testToolCall("call-2"))
 	source := h.contextSource(c, testOpID)
 	immediate := func(_ context.Context, call model.ToolCall) PreparedTool {
-		return PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran " + call.ID}}
+		return PreparedTool{Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran " + call.ID}}}
 	}
 	if _, err := h.toolEffect(c, testOpID, immediate)(context.Background(), testToolCall("call-1")); err != nil {
 		t.Fatalf("first tool effect: %v", err)
@@ -2199,7 +2278,9 @@ func TestModelEffectIntentCancellationSettlesInterruption(t *testing.T) {
 // TestToolEffectIntentCancellationSettlesInterrupted proves a tool intent
 // transaction aborted by cancellation settles the call's
 // interrupted-before-execution result: the batch stops and the terminal helper
-// interrupts every remaining unstarted call.
+// interrupts every remaining unstarted call. Both synthetic results carry no
+// metadata member even though the executor plan would have produced
+// well-formed bounded metadata.
 func TestToolEffectIntentCancellationSettlesInterrupted(t *testing.T) {
 	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 		if err := assembleCompleted(assemble); err != nil {
@@ -2208,8 +2289,11 @@ func TestToolEffectIntentCancellationSettlesInterrupted(t *testing.T) {
 		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"), testToolCall("call-2"))}, nil
 	}
 	toolFn := func(_ context.Context, call model.ToolCall) PreparedTool {
-		return PreparedTool{Execute: func(context.Context) model.ToolResult {
-			return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}
+		return PreparedTool{Execute: func(context.Context) ToolOutcome {
+			return ToolOutcome{
+				Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"},
+				Metadata: json.RawMessage(`{"preview":true}`),
+			}
 		}}
 	}
 	var cancel context.CancelFunc
@@ -2244,6 +2328,11 @@ func TestToolEffectIntentCancellationSettlesInterrupted(t *testing.T) {
 	}
 	if got := byCall["call-2"]; got.Status != model.ResultInterrupted || got.Content != interruptedToolResultContent {
 		t.Fatalf("call-2 result = %+v, want the terminal helper's interrupted result", got)
+	}
+	for call, got := range byCall {
+		if len(got.Metadata) != 0 {
+			t.Fatalf("%s result carries metadata %s, want none on synthetic results", call, got.Metadata)
+		}
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 	if err != nil {

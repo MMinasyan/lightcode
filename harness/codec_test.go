@@ -724,6 +724,97 @@ func TestToolCallNormalizedArgumentsNullRejected(t *testing.T) {
 	}
 }
 
+// TestToolResultMetadataRules proves the durable metadata member of one
+// tool-result payload: one well-formed bounded value round-trips byte-
+// identical into an owned copy, absence encodes by omission, and null,
+// malformed, or oversized values fail their encode with the invalid-input
+// class.
+func TestToolResultMetadataRules(t *testing.T) {
+	valid := json.RawMessage(`{"kind":"editpreview","n":[1,2]}`)
+	v := validToolResultEntry(testOpID)
+	v.Metadata = valid
+	raw, err := encodeToolResultEntry(v)
+	if err != nil {
+		t.Fatalf("encode metadata: %v", err)
+	}
+	if _, present := wireObject(t, raw)["metadata"]; !present {
+		t.Fatalf("encoded payload %s carries no metadata member", raw)
+	}
+	env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryToolResult, Payload: raw}
+	decoded, err := decodeToolResultEntry(env)
+	if err != nil {
+		t.Fatalf("decode metadata: %v", err)
+	}
+	if string(decoded.Metadata) != string(valid) {
+		t.Fatalf("metadata round-tripped as %s, want the stored bytes verbatim", decoded.Metadata)
+	}
+	decoded.Metadata[0] = '[' // mutating the decoded copy must not touch stored state
+	again, err := decodeToolResultEntry(env)
+	if err != nil {
+		t.Fatalf("second decode: %v", err)
+	}
+	if string(again.Metadata) != string(valid) {
+		t.Fatalf("metadata after mutating a decoded copy = %s, want the stored bytes", again.Metadata)
+	}
+
+	// Absence encodes by omission: no metadata member appears at all.
+	bare, err := encodeToolResultEntry(validToolResultEntry(testOpID))
+	if err != nil {
+		t.Fatalf("encode result without metadata: %v", err)
+	}
+	if _, present := wireObject(t, bare)["metadata"]; present {
+		t.Fatalf("metadata-less payload encodes the member: %s", bare)
+	}
+
+	rejected := []struct {
+		name     string
+		metadata json.RawMessage
+	}{
+		{"null metadata", json.RawMessage(`null`)},
+		{"malformed metadata", json.RawMessage(`{broken`)},
+		{"oversized metadata", json.RawMessage(`"` + strings.Repeat("x", maxToolMetadataBytes) + `"`)},
+		{"raw-at-bound metadata whose HTML-escaped durable encoding exceeds the bound", json.RawMessage(`"` + strings.Repeat("<", maxToolMetadataBytes-2) + `"`)},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			v := validToolResultEntry(testOpID)
+			v.Metadata = tc.metadata
+			if _, err := encodeToolResultEntry(v); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("encode error = %v, want the ErrInvalid class", err)
+			}
+		})
+	}
+
+	// A persisted payload that violates the member rules stays undecodable:
+	// null and oversized members are rejected, while a value exactly at the
+	// bound decodes.
+	rawValid := raw
+	if _, err := decodeToolResultEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryToolResult, Payload: rawValid}); err != nil {
+		t.Fatalf("re-decode: %v", err)
+	}
+	for _, tc := range []struct {
+		name     string
+		metadata json.RawMessage
+	}{
+		{"null", json.RawMessage(`null`)},
+		{"oversized", json.RawMessage(`"` + strings.Repeat("x", maxToolMetadataBytes+1) + `"`)},
+		{"at the bound", json.RawMessage(`"` + strings.Repeat("x", maxToolMetadataBytes-2) + `"`)},
+	} {
+		env := env
+		env.Payload = setKey(raw, "metadata", tc.metadata)
+		_, err := decodeToolResultEntry(env)
+		if tc.name == "at the bound" {
+			if err != nil {
+				t.Fatalf("metadata exactly at the bound rejected: %v", err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatalf("persisted %s metadata decoded, want rejection", tc.name)
+		}
+	}
+}
+
 // TestCodecRejectsInvalidValues proves validate-before-encoding: every
 // invalid durable value fails its encode with the invalid-input class, and
 // the unsupported kinds use it before persistence while their stored records
