@@ -125,17 +125,23 @@ type UsageTotals struct {
 // ExecutionCapture is the complete non-secret configuration required to
 // interpret one Operation: the stable configuration revision, the complete
 // model identity, the system prompt, the advertised tool definitions in
-// preserved order, and the selected capability names in preserved order.
-// Capability names are validated for shape only: no plugin is loaded to
-// read a historical capture. No resolved secret, callback, plugin value,
-// permission representation, retry policy, or arbitrary plugin JSON is
-// durable.
+// preserved order, the selected capability names in preserved order, and the
+// Agent definition's permission capability constraints. Readonly and WriteDir
+// are the configured lexical constraint copied from the one Harness-selected
+// definition; WriteDir is already trimmed at projection and stays unchanged in
+// the capture. The captured ConfigurationRevision also identifies the
+// governing permission policy; no rules are durable. Capability names are
+// validated for shape only: no plugin is loaded to read a historical capture.
+// No resolved secret, callback, plugin value, permission representation,
+// retry policy, or arbitrary plugin JSON is durable.
 type ExecutionCapture struct {
 	ConfigurationRevision string                 `json:"configuration_revision"`
 	Model                 model.ModelRef         `json:"model"`
 	SystemPrompt          string                 `json:"system_prompt"`
 	Tools                 []model.ToolDefinition `json:"tools"`
 	Capabilities          []string               `json:"capabilities,omitempty"`
+	Readonly              bool                   `json:"readonly"`
+	WriteDir              string                 `json:"write_dir"`
 }
 
 // SessionIdentity is the immutable identity section of one Session register.

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
@@ -94,8 +95,10 @@ func newConfiguration(generation uint64, doc capturedConfigDocument, built catal
 }
 
 // agentTypes projects the snapshot's resolved definitions onto the Harness:
-// public model identity, owned slices, and the complete roster with no
-// internal package type reaching the view.
+// public model identity, owned slices, the permission capability constraints
+// with WriteDir trimmed once (preserving the legacy whitespace-as-unset
+// behavior: no environment expansion, no new path syntax), and the complete
+// roster with no internal package type reaching the view.
 func (c *configuration) agentTypes() []harness.AgentType {
 	out := make([]harness.AgentType, 0, len(c.definitions))
 	for _, def := range c.definitions {
@@ -103,6 +106,8 @@ func (c *configuration) agentTypes() []harness.AgentType {
 			Name:         def.Name,
 			SystemPrompt: def.SystemPrompt,
 			Prompt:       def.Prompt,
+			Readonly:     def.Readonly,
+			WriteDir:     strings.TrimSpace(def.WriteDir),
 		}
 		if def.Model != "" {
 			if ref, err := model.Parse(def.Model); err == nil {

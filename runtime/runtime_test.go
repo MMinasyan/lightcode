@@ -224,6 +224,7 @@ func (p *controlledPrep) open(_ context.Context, adm harness.OperationAdmission,
 	gate := p.modelGate
 	p.mu.Unlock()
 	return harness.Execution{
+		NormalizeTool: runtimeNormalize,
 		Model: func(ctx context.Context, _ model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 			select {
 			case p.modelArrived <- struct{}{}:
@@ -471,6 +472,7 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 				Capture: harness.ExecutionCapture{ConfigurationRevision: "1", Model: prepModelRef, SystemPrompt: "seeded"},
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 					return harness.Execution{
+						NormalizeTool: runtimeNormalize,
 						Model: func(ctx context.Context, _ model.Request, _ agent.AssemblyCallback) (agent.ModelSettlement, error) {
 							select {
 							case arrived <- struct{}{}:

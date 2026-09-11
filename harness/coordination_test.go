@@ -741,7 +741,7 @@ func TestWaitConvergence(t *testing.T) {
 		exec.Tool = func(context.Context, model.ToolCall) PreparedTool {
 			toolArrived <- struct{}{}
 			<-toolGate
-			return PreparedTool{Execute: func(context.Context) ToolOutcome {
+			return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
 				return ToolOutcome{Result: model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "ran"}}
 			}}
 		}

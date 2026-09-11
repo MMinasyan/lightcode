@@ -119,6 +119,7 @@ func (p *combinedPrep) opener(_ context.Context, adm harness.OperationAdmission,
 	p.mu.Unlock()
 	p.events.add("open:" + adm.OperationID)
 	return harness.Execution{
+		NormalizeTool: runtimeNormalize,
 		Model: func(ctx context.Context, _ model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 			if worker, err := Bind[combinedWorker](sel.bindings, "dep.worker"); err == nil {
 				p.events.add("work:" + worker.Work(sel.invocation))

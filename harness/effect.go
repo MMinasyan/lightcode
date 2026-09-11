@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/model"
@@ -19,6 +21,14 @@ const interruptedToolResultContent = "Tool call interrupted."
 // validation-error result an invalid prepared plan or invalid returned outcome
 // maps onto.
 const invalidToolResultContent = "Tool call failed internal validation."
+
+// permissionDeniedToolResultContent is the contract-fixed model-visible
+// content of every Harness policy denial.
+const permissionDeniedToolResultContent = "Permission denied."
+
+// maxToolDiagnosticBytes bounds one Harness-produced validation diagnostic
+// carried in a tool-result content.
+const maxToolDiagnosticBytes = 512
 
 // executionInterruptedDetail is the diagnostic detail of the terminal
 // interruption the Harness settles when execution cancellation stops a
@@ -51,8 +61,14 @@ type modelResult struct {
 // intent and reserved result identity, invokes the prepared function outside
 // locks and storage transactions behind the privately tracked assembly
 // callback, validates the settlement once, and commits the result and complete
-// next Operation state before returning the committed settlement.
-func (h *Harness) modelEffect(c *coordinator, operationID string, prepared agent.ModelEffect) agent.ModelEffect {
+// next Operation state before returning the committed settlement. Before the
+// assistant entry commits, every advertised completed call is normalized
+// through the execution's pure callback outside storage transactions and
+// owning locks.
+func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution, capture ExecutionCapture) agent.ModelEffect {
+	prepared := exec.Model
+	normalize := exec.NormalizeTool
+	advertised := advertisedToolNames(capture)
 	return func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 		intent, err := h.beginModelEffect(ctx, c, operationID)
 		if err != nil {
@@ -140,7 +156,7 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, prepared agent
 				}
 			}
 		}
-		assistant, reported, err := newAssistantEntry(intent.sessionID, operationID, intent.resultID, owned.Output)
+		assistant, reported, err := newAssistantEntry(intent.sessionID, operationID, intent.resultID, owned.Output, normalize, advertised)
 		if err != nil {
 			return agent.ModelSettlement{}, err
 		}
@@ -678,12 +694,53 @@ func newSignalEntry(tx Transaction, sessionID, operationID string, kind SignalKi
 	return &adopted, nil
 }
 
+// advertisedToolNames returns the committed advertised tool-name set of one
+// capture: the single advertisement authority of the model and tool
+// boundaries.
+func advertisedToolNames(capture ExecutionCapture) map[string]bool {
+	names := make(map[string]bool, len(capture.Tools))
+	for _, tool := range capture.Tools {
+		names[tool.Name] = true
+	}
+	return names
+}
+
+// normalizeCallArguments runs one NormalizeTool invocation at the Harness
+// boundary: the callback receives an owned copy of the completed call and
+// must return exactly one complete JSON object, whose bytes the Harness
+// returns as a fresh owned copy. A callback error or a malformed result is a
+// per-call validation failure.
+func normalizeCallArguments(normalize func(model.ToolCall) (json.RawMessage, error), call model.ToolCall) (json.RawMessage, error) {
+	owned, err := model.NewToolCall(call)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := normalize(owned)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := decodePayloadObject(raw); err != nil {
+		return nil, fmt.Errorf("%w: normalization result is not one complete JSON object", errMalformedNormalization)
+	}
+	return model.CloneRaw(raw), nil
+}
+
+// errMalformedNormalization marks a NormalizeTool result whose shape is not
+// one complete JSON object: the existing internal-validation tool error
+// class, not a plugin-defined status or a cancellation instruction.
+var errMalformedNormalization = errors.New("malformed normalization")
+
 // newAssistantEntry builds one assistant entry from one validated model
 // output under the given entry identity, reserving one result identity per
 // completed call. An output without an eligible model-visible payload writes
 // no assistant entry and returns its reported usage for the consuming
-// settlement entry instead.
-func newAssistantEntry(sessionID, operationID, entryID string, out *model.Output) (*assistantEntry, *UsageCount, error) {
+// settlement entry instead. Before the entry commits, every advertised
+// completed call is normalized through the execution's pure callback: its
+// successful owned object populates the nested call's normalized_arguments
+// member; a failed or malformed normalization, and every unknown or
+// unadvertised name, leave the member absent while the original raw argument
+// bytes are always retained.
+func newAssistantEntry(sessionID, operationID, entryID string, out *model.Output, normalize func(model.ToolCall) (json.RawMessage, error), advertised map[string]bool) (*assistantEntry, *UsageCount, error) {
 	if out == nil {
 		return nil, nil, nil
 	}
@@ -714,6 +771,11 @@ func newAssistantEntry(sessionID, operationID, entryID string, out *model.Output
 				ArgumentsBase64: base64.StdEncoding.EncodeToString(call.Arguments),
 				Extra:           call.Extra,
 			}
+			if advertised[call.Name] {
+				if normalized, err := normalizeCallArguments(normalize, call); err == nil {
+					record.NormalizedArguments = normalized
+				}
+			}
 			entry.ToolCalls = append(entry.ToolCalls, record)
 		}
 	}
@@ -732,16 +794,77 @@ func newAssistantEntry(sessionID, operationID, entryID string, out *model.Output
 }
 
 // validToolPlan reports whether one prepared plan has the contract shape:
-// exactly one immediate result or executor, and normalized arguments that are
-// nil or one valid JSON value.
+// exactly one immediate result or executor.
 func validToolPlan(p PreparedTool) bool {
-	if (p.Immediate == nil) == (p.Execute == nil) { // both or neither
+	return (p.Immediate == nil) != (p.Execute == nil)
+}
+
+// authorizationRequired reports whether one shape-valid plan may produce an
+// effect and therefore requires successfully evaluated declarations: an
+// executor-backed plan or an immediate success. Immediate error, denied and
+// interrupted outcomes need no target declaration.
+func authorizationRequired(p PreparedTool) bool {
+	if p.Execute != nil {
+		return true
+	}
+	return p.Immediate.Result.Status == model.ResultSuccess
+}
+
+// toolCallAllowed decides one prepared plan at the Harness permission
+// boundary: every declared pair must be a nonempty permission/target pair;
+// file.read/file.write targets must be canonical and their prepared canonical
+// Workspace root must be a required canonical that is nonempty, absolute and
+// lexically clean; a readonly Agent with no configured write_dir denies every
+// file.write pair; any configured write_dir confines every file.write pair to
+// the prepared canonical write directory through Rel containment
+// independently of permission allow, requiring its canonical root as a second
+// required canonical; and only a plan whose every declared pair allows under
+// the fixed evaluator against the prepared canonical Workspace root is
+// allowed.
+func toolCallAllowed(policy PermissionPolicy, capture ExecutionCapture, plan PreparedTool) bool {
+	if len(plan.Permissions) == 0 {
 		return false
 	}
-	if len(p.NormalizedArguments) > 0 && !json.Valid(p.NormalizedArguments) {
+	var hasFile, hasWrite bool
+	for _, req := range plan.Permissions {
+		if req.Permission == "" || req.Target == "" {
+			return false
+		}
+		switch req.Permission {
+		case permissionFileRead:
+			hasFile = true
+		case permissionFileWrite:
+			hasFile, hasWrite = true, true
+		}
+		if (req.Permission == permissionFileRead || req.Permission == permissionFileWrite) && !canonicalPathValue(req.Target) {
+			return false
+		}
+	}
+	if hasFile && !canonicalPathValue(plan.CanonicalWorkspace) {
 		return false
 	}
-	return true
+	if hasWrite {
+		if capture.Readonly && capture.WriteDir == "" {
+			return false
+		}
+		if capture.WriteDir != "" {
+			if !canonicalPathValue(plan.CanonicalWriteDir) {
+				return false
+			}
+			for _, req := range plan.Permissions {
+				if req.Permission == permissionFileWrite && !containsPath(plan.CanonicalWriteDir, req.Target) {
+					return false
+				}
+			}
+		}
+	}
+	return policy.callAllowed(plan.CanonicalWorkspace, plan.Permissions)
+}
+
+// canonicalPathValue reports whether one prepared canonical target or root is
+// a nonempty, absolute, lexically clean path.
+func canonicalPathValue(p string) bool {
+	return p != "" && filepath.IsAbs(p) && filepath.Clean(p) == p
 }
 
 // invalidToolResult is the ordinary validation-error result an invalid plan or
@@ -766,33 +889,95 @@ func interruptedToolResult(callID string) model.ToolResult {
 	return model.ToolResult{CallID: callID, Status: model.ResultInterrupted, Content: interruptedToolResultContent}
 }
 
-// pendingToolCall resolves one published call's pending reservation from the
-// coordinator's validated view.
-func pendingToolCall(c *coordinator, operationID, callID string) (PendingToolCall, error) {
+// pendingToolCallRecord resolves one published call's pending reservation and
+// its committed assistant tool-call record from the coordinator's validated
+// view: the boundary consumes the durable record, never call data from model
+// JSON.
+func pendingToolCallRecord(c *coordinator, operationID, callID string) (PendingToolCall, toolCallRecord, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	op, ok := c.graph.Operation(operationID)
 	if !ok {
-		return PendingToolCall{}, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, c.graph.Session.Identity.SessionID)
+		return PendingToolCall{}, toolCallRecord{}, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, c.graph.Session.Identity.SessionID)
 	}
-	for _, pending := range op.State.PendingToolCalls {
-		if pending.CallID == callID {
-			return pending, nil
+	var pending PendingToolCall
+	found := false
+	for _, candidate := range op.State.PendingToolCalls {
+		if candidate.CallID == callID {
+			pending, found = candidate, true
+			break
 		}
 	}
-	return PendingToolCall{}, invalidInput("operation %q has no pending call %q; every call settles exactly once", operationID, callID)
+	if !found {
+		return PendingToolCall{}, toolCallRecord{}, invalidInput("operation %q has no pending call %q; every call settles exactly once", operationID, callID)
+	}
+	for _, entry := range c.graph.Entries {
+		if entry.Envelope.ID != pending.AssistantEntry.EntryID || entry.Assistant == nil {
+			continue
+		}
+		for _, record := range entry.Assistant.ToolCalls {
+			if record.ID == callID {
+				return pending, record, nil
+			}
+		}
+	}
+	return PendingToolCall{}, toolCallRecord{}, invalidInput("operation %q pending call %q has no committed assistant record", operationID, callID)
 }
 
-// toolEffect encloses one concrete tool execution in the Harness effect
-// boundary: it resolves the call's reserved result identity, prepares the plan
-// outside locks, and commits exactly one terminal result through the ordinary
-// tool-result transition. An immediate plan commits without an effect intent;
-// an executor-backed plan commits intent, executes once behind the
-// cancellation-before-start gate, and commits one validated outcome — a
-// returned real outcome wins a cancellation race.
-func (h *Harness) toolEffect(c *coordinator, operationID string, prepared func(context.Context, model.ToolCall) PreparedTool) agent.ToolEffect {
+// unavailableToolResult is the ordinary unavailable-tool error result the
+// advertisement gate settles for a name outside the committed advertised set.
+func unavailableToolResult(callID, name string) model.ToolResult {
+	return model.ToolResult{CallID: callID, Status: model.ResultError, Content: fmt.Sprintf("Tool %q is not available.", name)}
+}
+
+// permissionDeniedToolResult is the ordinary policy-denial result settled for
+// the original call under its reserved identity: no effect began and no tool
+// active intent was written.
+func permissionDeniedToolResult(callID string) model.ToolResult {
+	return model.ToolResult{CallID: callID, Status: model.ResultDenied, Content: permissionDeniedToolResultContent}
+}
+
+// validationToolResult is the immediate validation-error result for an
+// invalid model argument: status error carrying the callback's own bounded
+// useful diagnostic.
+func validationToolResult(callID string, cause error) model.ToolResult {
+	content := boundedToolDiagnostic(cause)
+	if content == "" {
+		content = invalidToolResultContent
+	}
+	return model.ToolResult{CallID: callID, Status: model.ResultError, Content: content}
+}
+
+// boundedToolDiagnostic renders one Harness-produced validation diagnostic
+// within the durable diagnostic bound.
+func boundedToolDiagnostic(cause error) string {
+	msg := cause.Error()
+	if len(msg) > maxToolDiagnosticBytes {
+		msg = strings.ToValidUTF8(msg[:maxToolDiagnosticBytes], "")
+	}
+	return msg
+}
+
+// toolEffect encloses one concrete tool execution in the shared Harness tool
+// boundary. In order: it resolves the call's pending reservation and committed
+// assistant record, and pre-start cancellation wins before anything else; the
+// advertisement gate rejects names outside the committed advertised tool set
+// with the ordinary unavailable-tool error before any preparer runs; the
+// original assistant's committed normalized arguments are the selected input,
+// and only an invalid unhooked original is normalized again to obtain its
+// useful validation diagnostic. It then prepares the plan outside locks,
+// rejects invalid plan shapes with the existing internal-validation error, and
+// evaluates every declaration through the fixed boundary — including
+// immediate-success plans — before beginToolEffect. A denial settles only that
+// original call with status denied and no metadata, no concrete effect and no
+// tool active intent; later calls still run. An allowed executor commits
+// intent, executes once behind the cancellation-before-start gate, and commits
+// one validated outcome — a returned real outcome wins a cancellation race.
+func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution, capture ExecutionCapture) agent.ToolEffect {
+	prepared := exec.Tool
+	advertised := advertisedToolNames(capture)
 	return func(ctx context.Context, call model.ToolCall) (model.ToolResult, error) {
-		pending, err := pendingToolCall(c, operationID, call.ID)
+		pending, record, err := pendingToolCallRecord(c, operationID, call.ID)
 		if err != nil {
 			return model.ToolResult{}, err
 		}
@@ -800,9 +985,40 @@ func (h *Harness) toolEffect(c *coordinator, operationID string, prepared func(c
 		if ctx.Err() != nil { // execution cancellation prevents later preparation: interrupted-before-execution
 			return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: interruptedToolResult(call.ID)}, false)
 		}
-		plan := prepared(ctx, call)
+		if !advertised[record.Name] { // the one advertisement gate, ahead of every hook and preparer
+			return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: unavailableToolResult(call.ID, record.Name)}, false)
+		}
+		// The selected normalized value is the original assistant's committed
+		// successful result, already validated and owned; it is never
+		// re-normalized. Only an absent (invalid) original is normalized again,
+		// solely to obtain its useful validation diagnostic.
+		selected := record.NormalizedArguments
+		if len(selected) == 0 {
+			raw, derr := base64.StdEncoding.DecodeString(record.ArgumentsBase64)
+			if derr != nil { // a non-canonical durable record is corruption, not empty arguments
+				return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: invalidToolResult(call.ID)}, false)
+			}
+			normalized, nerr := normalizeCallArguments(exec.NormalizeTool, model.ToolCall{ID: record.ID, Name: record.Name, Arguments: raw, Extra: record.Extra})
+			if nerr != nil {
+				if errors.Is(nerr, errMalformedNormalization) { // a malformed callback outcome stays the internal-validation error
+					return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: invalidToolResult(call.ID)}, false)
+				}
+				return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: validationToolResult(call.ID, nerr)}, false)
+			}
+			selected = normalized
+		}
+		// The preparer receives an owned copy of the selected normalized call
+		// and nothing else.
+		normalizedCall, err := model.NewToolCall(model.ToolCall{ID: record.ID, Name: record.Name, Arguments: selected, Extra: record.Extra})
+		if err != nil {
+			return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: invalidToolResult(call.ID)}, false)
+		}
+		plan := prepared(ctx, normalizedCall)
 		if !validToolPlan(plan) {
 			return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: invalidToolResult(call.ID)}, false)
+		}
+		if authorizationRequired(plan) && !toolCallAllowed(exec.Permissions, capture, plan) {
+			return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: permissionDeniedToolResult(call.ID)}, false)
 		}
 		if plan.Immediate != nil {
 			outcome := *plan.Immediate
@@ -1084,12 +1300,12 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 	if err != nil {
 		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{}, err)
 	}
-	if exec.Model == nil || exec.Tool == nil {
+	if exec.Model == nil || exec.Tool == nil || exec.NormalizeTool == nil {
 		if exec.Close != nil {
 			h.recordCleanupFailure(exec.Close())
 		}
 		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{},
-			invalidInput("opened execution requires non-nil model and tool functions"))
+			invalidInput("opened execution requires non-nil model, tool and normalization functions"))
 	}
 	if exec.Close != nil {
 		defer func() { h.recordCleanupFailure(exec.Close()) }()
@@ -1098,8 +1314,8 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		ExpectedModel: agentCapture.Model,
 		Tools:         agentCapture.Tools,
 		Context:       h.contextSource(c, operationID),
-		ModelEffect:   h.modelEffect(c, operationID, exec.Model),
-		ToolEffect:    h.toolEffect(c, operationID, exec.Tool),
+		ModelEffect:   h.modelEffect(c, operationID, exec, agentCapture),
+		ToolEffect:    h.toolEffect(c, operationID, exec, agentCapture),
 	})
 	return h.settleAgentTerminal(c, operationID, res, err)
 }

@@ -36,6 +36,16 @@ var (
 
 var prepModelRef = model.ModelRef{Provider: "prov", Model: "m"}
 
+// runtimeNormalize is the fixtures' required pure normalizer: it accepts
+// exactly one non-null JSON object and returns its compact encoding.
+func runtimeNormalize(call model.ToolCall) (json.RawMessage, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {
+		return nil, errors.New("arguments must be one non-null JSON object")
+	}
+	return json.Marshal(obj)
+}
+
 func prepConfigDocument(tag string) string {
 	return `{
   "providers": {
@@ -62,6 +72,7 @@ const prepAgentsDocument = `{
   "dup": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo", "echo", "read"], "capabilities": ["hook.second", "cap.other"]},
   "wide": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo", "read"], "capabilities": ["hook.first", "cap.shared", "hook.second"]},
   "deep": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "op.native", "ag.native"]},
+  "locked": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "readonly": true, "write_dir": "  /tmp/pad  "},
   "ghostly": {"system_prompt": "simple", "tools": ["echo"]},
   "shallow": {"model": "prov/zero", "system_prompt": "simple", "tools": ["echo"]}
 }`
@@ -224,6 +235,12 @@ type prepEnv struct {
 	cleanupErr      error
 	modelGate       chan struct{}
 	modelArrived    chan struct{}
+
+	// opener and model are the execution-construction injection points, both
+	// defaulted in newPrepEnv; a test that needs custom open behavior or model
+	// output swaps them before admitting.
+	opener openExecution
+	model  func(selection) agent.ModelEffect
 }
 
 func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
@@ -245,6 +262,73 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 		c.SystemPrompt += "|second"
 		return c
 	}}
+	e.opener = func(_ context.Context, adm harness.OperationAdmission, sel selection) (harness.Execution, error) {
+		e.mu.Lock()
+		openErr, invalid, noCleanup, cleanupErr := e.openErr, e.invalidOpen, e.noCleanup, e.cleanupErr
+		e.openAdmissions = append(e.openAdmissions, adm)
+		e.openSels = append(e.openSels, sel)
+		e.mu.Unlock()
+		if openErr != nil {
+			e.events.add("open-fail")
+			return harness.Execution{}, openErr
+		}
+		e.events.add("open:" + adm.OperationID)
+		execution := harness.Execution{
+			Model:         e.model(sel),
+			NormalizeTool: runtimeNormalize,
+			Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+				return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}}
+			},
+		}
+		if invalid {
+			execution.Model = nil
+		}
+		if !noCleanup {
+			execution.Close = func() error {
+				e.events.add("exec-cleanup")
+				select {
+				case e.turns <- struct{}{}:
+				default:
+				}
+				e.mu.Lock()
+				err := cleanupErr
+				e.mu.Unlock()
+				return err
+			}
+		}
+		return execution, nil
+	}
+	e.model = func(sel selection) agent.ModelEffect {
+		return func(ctx context.Context, _ model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+			e.events.add("model")
+			if _, ok := sel.bindings.entries["cap.shared"]; ok {
+				worker, err := Bind[greeter](sel.bindings, "cap.shared")
+				if err != nil {
+					return agent.ModelSettlement{}, err
+				}
+				e.events.add("greet:" + worker.Greet())
+			}
+			select {
+			case e.modelArrived <- struct{}{}:
+			default:
+			}
+			e.mu.Lock()
+			gate := e.modelGate
+			e.mu.Unlock()
+			if gate != nil {
+				select {
+				case <-gate:
+				case <-ctx.Done():
+					return agent.ModelSettlement{}, ctx.Err()
+				}
+			}
+			out, err := assemble(prepModelRef, &prepStream{})
+			if err != nil {
+				return agent.ModelSettlement{}, err
+			}
+			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &out}, nil
+		}
+	}
 	owner, cancel := context.WithCancel(context.Background())
 	e.ownerCancel = cancel
 	e.comp = mustComposition(t, e.plugins()...)
@@ -371,6 +455,8 @@ func (e *prepEnv) supply(ctx context.Context, req harness.PreparationRequest, se
 		SystemPrompt:          "prompt-" + req.Session.AgentType,
 		Tools:                 captureTools(sel.agent.Tools),
 		Capabilities:          append([]string(nil), sel.agent.Capabilities...),
+		Readonly:              sel.agent.Readonly,
+		WriteDir:              sel.agent.WriteDir,
 	}
 	if mutateSelection != nil {
 		mutateSelection(sel, &capture)
@@ -401,74 +487,6 @@ func captureTools(names []string) []model.ToolDefinition {
 		})
 	}
 	return out
-}
-
-func (e *prepEnv) opener(_ context.Context, adm harness.OperationAdmission, sel selection) (harness.Execution, error) {
-	e.mu.Lock()
-	openErr, invalid, noCleanup, cleanupErr := e.openErr, e.invalidOpen, e.noCleanup, e.cleanupErr
-	e.openAdmissions = append(e.openAdmissions, adm)
-	e.openSels = append(e.openSels, sel)
-	e.mu.Unlock()
-	if openErr != nil {
-		e.events.add("open-fail")
-		return harness.Execution{}, openErr
-	}
-	e.events.add("open:" + adm.OperationID)
-	execution := harness.Execution{
-		Model: e.model(sel),
-		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}}
-		},
-	}
-	if invalid {
-		execution.Model = nil
-	}
-	if !noCleanup {
-		execution.Close = func() error {
-			e.events.add("exec-cleanup")
-			select {
-			case e.turns <- struct{}{}:
-			default:
-			}
-			e.mu.Lock()
-			err := cleanupErr
-			e.mu.Unlock()
-			return err
-		}
-	}
-	return execution, nil
-}
-
-func (e *prepEnv) model(sel selection) agent.ModelEffect {
-	return func(ctx context.Context, _ model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		e.events.add("model")
-		if _, ok := sel.bindings.entries["cap.shared"]; ok {
-			worker, err := Bind[greeter](sel.bindings, "cap.shared")
-			if err != nil {
-				return agent.ModelSettlement{}, err
-			}
-			e.events.add("greet:" + worker.Greet())
-		}
-		select {
-		case e.modelArrived <- struct{}{}:
-		default:
-		}
-		e.mu.Lock()
-		gate := e.modelGate
-		e.mu.Unlock()
-		if gate != nil {
-			select {
-			case <-gate:
-			case <-ctx.Done():
-				return agent.ModelSettlement{}, ctx.Err()
-			}
-		}
-		out, err := assemble(prepModelRef, &prepStream{})
-		if err != nil {
-			return agent.ModelSettlement{}, err
-		}
-		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &out}, nil
-	}
 }
 
 // --- fixture control helpers ---
@@ -886,6 +904,12 @@ func runReloadOrdering(t *testing.T, store harness.Storage, kind string) {
 		}
 	}
 	<-e.prepared()
+	// The reload varies the selected definition's permission constraints, so
+	// the revision-2 capture differs from the revision-1 one on both members.
+	reloadAgents := strings.Replace(prepAgentsDocument,
+		`"dual": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "cap.shared"]}`,
+		`"dual": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "cap.shared"], "readonly": true, "write_dir": "/tmp/reload"}`, 1)
+	writeServiceFile(t, agents.PathForConfig(e.sh.configPath), reloadAgents)
 	if _, err := e.svc.publish(context.Background()); err != nil {
 		t.Fatalf("reload publish: %v", err)
 	}
@@ -899,9 +923,13 @@ func runReloadOrdering(t *testing.T, store harness.Storage, kind string) {
 	}
 	e.mu.Unlock()
 	// The in-flight admission committed on revision 1 and opened with the
-	// same captured revision.
-	if got := e.admissionAt(1).Execution.ConfigurationRevision; got != "1" {
+	// same captured revision and constraints.
+	inFlight := e.admissionAt(1).Execution
+	if got := inFlight.ConfigurationRevision; got != "1" {
 		t.Fatalf("overlapping-reload admission committed revision %q, want the captured 1", got)
+	}
+	if inFlight.Readonly || inFlight.WriteDir != "" {
+		t.Fatalf("reloaded constraints leaked into the committed capture: readonly=%v write_dir=%q, want the captured false \"\"", inFlight.Readonly, inFlight.WriteDir)
 	}
 	if rev := e.selectionAt(1).invocation.Revision(); rev != "1" {
 		t.Fatalf("overlapping-reload preparation selection revision = %q, want 1", rev)
@@ -910,11 +938,15 @@ func runReloadOrdering(t *testing.T, store harness.Storage, kind string) {
 		t.Fatalf("overlapping-reload opener selection revision = %q, want the retained 1", rev)
 	}
 
-	// The next capture uses revision 2.
+	// The next capture uses revision 2 and the reloaded constraints.
 	e.admitOrBuffer(session, "op-next", "next")
 	e.awaitCleanups(3)
-	if got := e.admissionAt(2).Execution.ConfigurationRevision; got != "2" {
+	next := e.admissionAt(2).Execution
+	if got := next.ConfigurationRevision; got != "2" {
 		t.Fatalf("next admission revision = %q, want 2", got)
+	}
+	if !next.Readonly || next.WriteDir != "/tmp/reload" {
+		t.Fatalf("next admission constraints = readonly %v write_dir %q, want the reloaded true \"/tmp/reload\"", next.Readonly, next.WriteDir)
 	}
 	if err := e.converge(); err != nil {
 		t.Fatalf("Wait: %v", err)
@@ -1077,6 +1109,26 @@ func TestPreparationRejectsAdmissionAtTheBoundary(t *testing.T) {
 			want: harness.ErrInvalid, wantPrepars: 1, mismatch: true,
 		},
 		{
+			name: "capture contradicts the selected definition's readonly constraint", agentType: "solo",
+			arm: func(e *prepEnv) {
+				e.mutateCapture = func(c harness.ExecutionCapture) harness.ExecutionCapture {
+					c.Readonly = true
+					return c
+				}
+			},
+			want: harness.ErrInvalid, wantPrepars: 1, mismatch: true,
+		},
+		{
+			name: "capture contradicts the selected definition's write_dir", agentType: "solo",
+			arm: func(e *prepEnv) {
+				e.mutateCapture = func(c harness.ExecutionCapture) harness.ExecutionCapture {
+					c.WriteDir = "/tmp/elsewhere"
+					return c
+				}
+			},
+			want: harness.ErrInvalid, wantPrepars: 1, mismatch: true,
+		},
+		{
 			name: "nil opener prevents admission", agentType: "solo",
 			arm:         func(e *prepEnv) { e.nilOpener = true },
 			want:        harness.ErrInvalid,
@@ -1151,6 +1203,20 @@ func oneShotCapabilitySelectionMutation(e *prepEnv) {
 	}
 }
 
+// oneShotCaptureMismatch arms one first-use-only capture mutation for the
+// delivered-capture mismatch cases.
+func oneShotCaptureMismatch(edit func(*harness.ExecutionCapture)) func(*prepEnv) {
+	return func(e *prepEnv) {
+		var left int32 = 1
+		e.mutateCapture = func(c harness.ExecutionCapture) harness.ExecutionCapture {
+			if atomic.CompareAndSwapInt32(&left, 1, 0) {
+				edit(&c)
+			}
+			return c
+		}
+	}
+}
+
 // TestPreparationSelectionMismatchOnDrainedAndForkDelivery proves on both
 // stores that the queued-drain and Fork admission paths enforce the same
 // selection agreement: a mismatching delivered capture is rejected with no
@@ -1164,6 +1230,8 @@ func TestPreparationSelectionMismatchOnDrainedAndForkDelivery(t *testing.T) {
 	}{
 		{"capture", oneShotEmptySelection},
 		{"callback selection", oneShotCapabilitySelectionMutation},
+		{"capture readonly", oneShotCaptureMismatch(func(c *harness.ExecutionCapture) { c.Readonly = true })},
+		{"capture write_dir", oneShotCaptureMismatch(func(c *harness.ExecutionCapture) { c.WriteDir = "/tmp/elsewhere" })},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Run("rejected queued delivery adds nothing and the next still admits", func(t *testing.T) {
@@ -1299,6 +1367,14 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 			}},
 			{"capabilities", func(c harness.ExecutionCapture) harness.ExecutionCapture {
 				c.Capabilities = []string{"hook.first"}
+				return c
+			}},
+			{"readonly", func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				c.Readonly = !c.Readonly
+				return c
+			}},
+			{"write_dir", func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				c.WriteDir = "/tmp/hook-elsewhere"
 				return c
 			}},
 		}
@@ -1695,5 +1771,180 @@ func TestPreparationExecutionLifetimeAndCleanup(t *testing.T) {
 				t.Fatalf("Wait error = %v, want the retained cleanup failure", err)
 			}
 		})
+	})
+}
+
+// TestPreparationCapturesPermissionConstraints proves the durable permission
+// capability capture through the real Harness: the Runtime projection trims
+// write_dir once and the admitted capture carries the one definition's
+// readonly and trimmed write_dir values through commit. The reload axis on
+// these constraint members is proven by the reload-ordering suite.
+func TestPreparationCapturesPermissionConstraints(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newPrepEnv(t, store)
+		t.Cleanup(func() { e.converge() })
+		session := e.session("locked")
+		e.admit(session, "op-1", "one")
+		e.awaitCleanups(1)
+		op, err := e.h.ReadOperation(context.Background(), session, "op-1")
+		if err != nil {
+			t.Fatalf("ReadOperation: %v", err)
+		}
+		if !op.Admission.Execution.Readonly || op.Admission.Execution.WriteDir != "/tmp/pad" {
+			t.Fatalf("committed constraints = %v %q, want the definition's readonly true and once-trimmed %q",
+				op.Admission.Execution.Readonly, op.Admission.Execution.WriteDir, "/tmp/pad")
+		}
+	})
+}
+
+// TestPreparationForwardsCapturedPolicyAndNormalizer proves the opened
+// execution's permission capture and required normalizer reach the shared
+// Harness boundary through Runtime's forwarding on both stores: the
+// advertised call's normalization commits at the assistant producer and runs
+// exactly once, the opened policy denies the declared file.write pair so the
+// call settles the fixed denial without starting the concrete effect, the
+// denial is visible in the next model projection, and the Operation still
+// reaches terminal success.
+func TestPreparationForwardsCapturedPolicyAndNormalizer(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newPrepEnv(t, store)
+		t.Cleanup(func() { e.converge() })
+		var mu sync.Mutex
+		var normalized, executed int
+		var requests []model.Request
+		turn := []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: json.RawMessage(` {"x": 1} `)}}
+		e.model = func(selection) agent.ModelEffect {
+			return func(_ context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+				mu.Lock()
+				requests = append(requests, req)
+				next := turn
+				turn = nil
+				mu.Unlock()
+				out, err := assemble(prepModelRef, &prepStream{})
+				if err != nil {
+					return agent.ModelSettlement{}, err
+				}
+				if len(next) > 0 {
+					return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &model.Output{
+						Status: model.OutputCompleted,
+						Source: prepModelRef,
+						Message: &model.Message{
+							Role:      model.RoleAssistant,
+							Source:    prepModelRef,
+							Content:   []model.ContentPart{{Kind: model.PartText, Text: "done"}},
+							ToolCalls: next,
+						},
+						Usage: &model.Usage{InputTokens: 1, OutputTokens: 1},
+					}}, nil
+				}
+				return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &out}, nil
+			}
+		}
+		e.opener = func(_ context.Context, _ harness.OperationAdmission, sel selection) (harness.Execution, error) {
+			execution := harness.Execution{
+				Model: e.model(sel),
+				NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
+					mu.Lock()
+					normalized++
+					mu.Unlock()
+					return runtimeNormalize(call)
+				},
+				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+					return harness.PreparedTool{
+						Permissions:        []harness.PermissionRequest{{Permission: "file.write", Target: "/w/a.txt"}},
+						CanonicalWorkspace: "/w",
+						Execute: func(context.Context) harness.ToolOutcome {
+							mu.Lock()
+							executed++
+							mu.Unlock()
+							return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
+						},
+					}
+				},
+				Permissions: harness.ResolvePermissionPolicy(json.RawMessage(`{"rules":[{"permission":"file.write","target":"*","access":"deny"}]}`), nil),
+			}
+			execution.Close = func() error {
+				e.events.add("exec-cleanup")
+				select {
+				case e.turns <- struct{}{}:
+				default:
+				}
+				return nil
+			}
+			return execution, nil
+		}
+		session := e.session("solo")
+		e.admit(session, "op-1", "one")
+		e.awaitCleanups(1)
+		op, err := e.h.ReadOperation(context.Background(), session, "op-1")
+		if err != nil || op.State.Status != harness.OperationSuccess {
+			t.Fatalf("operation = %+v err %v, want terminal success after the denial settled its call", op, err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if executed != 0 {
+			t.Fatalf("concrete effects started = %d, want none for the denied call", executed)
+		}
+		if normalized != 1 {
+			t.Fatalf("normalizations = %d, want the committed value consumed without a second pass", normalized)
+		}
+		entries, err := store.ReadEntries(context.Background(), session, 0)
+		if err != nil {
+			t.Fatalf("ReadEntries: %v", err)
+		}
+		var denial bool
+		published := 0
+		for _, entry := range entries {
+			if entry.Kind != harness.EntryAssistant && entry.Kind != harness.EntryToolResult {
+				continue
+			}
+			var obj map[string]json.RawMessage
+			if err := json.Unmarshal(entry.Payload, &obj); err != nil {
+				t.Fatalf("decode %s payload: %v", entry.ID, err)
+			}
+			switch entry.Kind {
+			case harness.EntryAssistant:
+				var calls []struct {
+					ID                  string          `json:"id"`
+					NormalizedArguments json.RawMessage `json:"normalized_arguments"`
+				}
+				if err := json.Unmarshal(obj["tool_calls"], &calls); err != nil {
+					t.Fatalf("assistant tool calls: %v", err)
+				}
+				if len(calls) == 0 {
+					continue // the continuation turn's text-only assistant
+				}
+				published++
+				if len(calls) != 1 || calls[0].ID != "call-1" {
+					t.Fatalf("assistant tool calls = %s, want the one published call", obj["tool_calls"])
+				}
+				if string(calls[0].NormalizedArguments) != `{"x":1}` {
+					t.Fatalf("committed normalized_arguments = %s, want the producer's compacted object", calls[0].NormalizedArguments)
+				}
+			case harness.EntryToolResult:
+				if string(obj["status"]) != `"denied"` || string(obj["content"]) != `"Permission denied."` {
+					t.Fatalf("tool result = %s, want the fixed denial", entry.Payload)
+				}
+				if _, present := obj["metadata"]; present {
+					t.Fatalf("denied result carries a metadata member")
+				}
+				denial = true
+			}
+		}
+		if published != 1 || !denial {
+			t.Fatalf("committed entries: %d publishing assistants and denial=%v, want 1 and true", published, denial)
+		}
+		if len(requests) != 2 {
+			t.Fatalf("%d model requests, want the continuation after the settled call", len(requests))
+		}
+		var projected string
+		for _, msg := range requests[1].Messages {
+			if msg.Role == model.RoleTool {
+				projected = msg.TextContent()
+			}
+		}
+		if projected != "Permission denied." {
+			t.Fatalf("second projection carried tool message %q, want the committed denial", projected)
+		}
 	})
 }

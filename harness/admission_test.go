@@ -97,14 +97,15 @@ func newTestHarness(t *testing.T, store Storage, prepare func(context.Context, P
 
 // validExecution returns the fixtures' execution: a model function that never
 // returns, so an auto-started execution keeps its Operation current without
-// settling it, and a tool function returning an empty plan. Admission
-// fixtures observe a stable running state.
+// settling it, a tool function returning an empty plan, and the required pure
+// normalizer. Admission fixtures observe a stable running state.
 func validExecution() Execution {
 	return Execution{
 		Model: func(context.Context, model.Request, agent.AssemblyCallback) (agent.ModelSettlement, error) {
 			select {} // the fixture owns the admitted Operation's state assertions
 		},
-		Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
+		Tool:          func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
+		NormalizeTool: objectNormalize,
 	}
 }
 

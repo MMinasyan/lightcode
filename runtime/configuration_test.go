@@ -223,6 +223,42 @@ func TestConfigurationAgentTypesProjection(t *testing.T) {
 	if wantCaps := []string{"cap-b", "cap-a"}; !reflect.DeepEqual(plan.Capabilities, wantCaps) {
 		t.Fatalf("plan capabilities = %q, want the selected order", plan.Capabilities)
 	}
+	if !plan.Readonly || plan.WriteDir != "/tmp/plan" {
+		t.Fatalf("plan permission constraints = %v %q, want the definition's readonly true and its write_dir", plan.Readonly, plan.WriteDir)
+	}
+	primaryView, err := harness.ResolveAgentType("primary", types)
+	if err != nil {
+		t.Fatalf("ResolveAgentType(primary): %v", err)
+	}
+	if primaryView.Readonly || primaryView.WriteDir != "" {
+		t.Fatalf("primary permission constraints = %v %q, want the unset defaults", primaryView.Readonly, primaryView.WriteDir)
+	}
+
+	// WriteDir is trimmed exactly once at projection, preserving the legacy
+	// whitespace-as-unset behavior: padded paths arrive clean and a
+	// whitespace-only path arrives as unset.
+	padded, err := assembleConfiguration(4, testConfigDocument, strings.Replace(testAgentsDocument, `"write_dir": "/tmp/plan"`, `"write_dir": "  /tmp/plan  "`, 1), testCapabilities())
+	if err != nil {
+		t.Fatalf("padded configuration: %v", err)
+	}
+	paddedPlan, err := harness.ResolveAgentType("plan", padded.agentTypes())
+	if err != nil {
+		t.Fatalf("ResolveAgentType(padded plan): %v", err)
+	}
+	if paddedPlan.WriteDir != "/tmp/plan" {
+		t.Fatalf("padded write_dir projected as %q, want the once-trimmed path", paddedPlan.WriteDir)
+	}
+	blank, err := assembleConfiguration(5, testConfigDocument, strings.Replace(testAgentsDocument, `"write_dir": "/tmp/plan"`, `"write_dir": "   "`, 1), testCapabilities())
+	if err != nil {
+		t.Fatalf("blank write_dir configuration: %v", err)
+	}
+	blankPlan, err := harness.ResolveAgentType("plan", blank.agentTypes())
+	if err != nil {
+		t.Fatalf("ResolveAgentType(blank plan): %v", err)
+	}
+	if blankPlan.WriteDir != "" {
+		t.Fatalf("whitespace-only write_dir projected as %q, want unset", blankPlan.WriteDir)
+	}
 
 	// Two Agent types selected from one projection keep their own views:
 	// explore inherits primary's tools with no capability selection of its

@@ -535,7 +535,7 @@ func TestRegisterPayloadRejectsInvalidWire(t *testing.T) {
 		{"miscased key", renameKey(opRaw, "admission", "Admission")},
 		{"null admission", setKey(opRaw, "admission", json.RawMessage(`null`))},
 		{"wrong state container", setKey(opRaw, "state", json.RawMessage(`[]`))},
-		{"operation mismatch", setKey(opRaw, "admission", json.RawMessage(`{"session_id":"`+testSessionID+`","operation_id":"ghost","request_kind":"message","admitted_entry":{"session_id":"`+testSessionID+`","entry_id":"`+hexID(1)+`"},"agent_type":"coder","execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},"system_prompt":"system","tools":[]},"admitted_at":"2026-01-02T03:04:05.123456789Z"}`))},
+		{"operation mismatch", setKey(opRaw, "admission", json.RawMessage(`{"session_id":"`+testSessionID+`","operation_id":"ghost","request_kind":"message","admitted_entry":{"session_id":"`+testSessionID+`","entry_id":"`+hexID(1)+`"},"agent_type":"coder","execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},"system_prompt":"system","tools":[],"readonly":false,"write_dir":""},"admitted_at":"2026-01-02T03:04:05.123456789Z"}`))},
 	}
 	for _, m := range opMutations {
 		t.Run("operation/"+m.name, func(t *testing.T) {
@@ -721,6 +721,57 @@ func TestToolCallNormalizedArgumentsNullRejected(t *testing.T) {
 	}
 	if string(decoded.ToolCalls[0].NormalizedArguments) != `{"x":1}` {
 		t.Fatalf("normalized_arguments round-tripped as %s", decoded.ToolCalls[0].NormalizedArguments)
+	}
+}
+
+// TestToolCallNormalizedArgumentsObjectOnly proves the normalized_arguments
+// member is one complete JSON object on both codec sides: a persisted
+// non-object member (an array representative — every wrong kind fails the
+// same object check) is rejected by decode, so it surfaces as Session
+// corruption and never reaches the tool boundary as executable input, and
+// rejected by encode with the invalid-input class. The explicit null case is
+// shared with TestToolCallNormalizedArgumentsNullRejected.
+func TestToolCallNormalizedArgumentsObjectOnly(t *testing.T) {
+	const wrong = `[1,2]`
+	entry := validAssistantEntry(testOpID)
+	call := validToolCallRecord()
+	call.NormalizedArguments = json.RawMessage(wrong)
+	entry.ToolCalls = []toolCallRecord{call}
+	if _, err := encodeAssistantEntry(entry); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("encode normalized_arguments %s = %v, want the ErrInvalid class", wrong, err)
+	}
+
+	// decode side: rewrite one valid encoded payload's member to the wrong
+	// kind and prove decode rejects it.
+	valid := validAssistantEntry(testOpID)
+	vcall := validToolCallRecord()
+	vcall.NormalizedArguments = json.RawMessage(`{"x":1}`)
+	valid.ToolCalls = []toolCallRecord{vcall}
+	raw, err := encodeAssistantEntry(valid)
+	if err != nil {
+		t.Fatalf("encode valid assistant: %v", err)
+	}
+	obj := map[string]json.RawMessage{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("encoded payload is not an object: %v", err)
+	}
+	items := []map[string]json.RawMessage{}
+	if err := json.Unmarshal(obj["tool_calls"], &items); err != nil || len(items) != 1 {
+		t.Fatalf("encoded tool_calls = %s (%v)", obj["tool_calls"], err)
+	}
+	items[0]["normalized_arguments"] = json.RawMessage(wrong)
+	edited, err := json.Marshal(items)
+	if err != nil {
+		t.Fatalf("marshal edited tool_calls: %v", err)
+	}
+	obj["tool_calls"] = edited
+	out, err := json.Marshal(obj)
+	if err != nil {
+		t.Fatalf("marshal edited payload: %v", err)
+	}
+	env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: out}
+	if _, err := decodeAssistantEntry(env); err == nil {
+		t.Fatalf("decode normalized_arguments %s must fail", wrong)
 	}
 }
 
@@ -1217,5 +1268,64 @@ func TestExecutionCaptureCapabilities(t *testing.T) {
 		if got, err := decodeExecutionCapture(captureWith(bad)); err == nil {
 			t.Fatalf("capabilities %s decoded to %q, want rejection", bad, got.Capabilities)
 		}
+	}
+}
+
+// TestExecutionCapturePermissionMembers pins the durable permission capability
+// members: readonly and write_dir are required members encoded always,
+// including their false and empty values, they round-trip unchanged, and a
+// capture missing either member, carrying null, or with a wrong-typed member
+// is invalid.
+func TestExecutionCapturePermissionMembers(t *testing.T) {
+	encode := func(t *testing.T, v ExecutionCapture) map[string]json.RawMessage {
+		t.Helper()
+		raw, err := encodeExecutionCapture(v)
+		if err != nil {
+			t.Fatalf("encodeExecutionCapture: %v", err)
+		}
+		members, err := decodePayloadObject(raw)
+		if err != nil {
+			t.Fatalf("decodePayloadObject: %v", err)
+		}
+		return members
+	}
+
+	explicit := encode(t, testCapture())
+	if got := string(explicit["readonly"]); got != "false" {
+		t.Fatalf("encoded readonly member = %s, want the explicit false", got)
+	}
+	if got := string(explicit["write_dir"]); got != `""` {
+		t.Fatalf("encoded write_dir member = %s, want the explicit empty string", got)
+	}
+
+	v := testCapture()
+	v.Readonly = true
+	v.WriteDir = "/w/sub"
+	decoded, err := decodeExecutionCapture(encode(t, v))
+	if err != nil {
+		t.Fatalf("decodeExecutionCapture: %v", err)
+	}
+	if decoded.Readonly != true || decoded.WriteDir != "/w/sub" {
+		t.Fatalf("round-tripped members = %v %q, want true and %q", decoded.Readonly, decoded.WriteDir, "/w/sub")
+	}
+
+	for _, mutation := range []struct {
+		name    string
+		members func(map[string]json.RawMessage)
+	}{
+		{"missing readonly", func(m map[string]json.RawMessage) { delete(m, "readonly") }},
+		{"missing write_dir", func(m map[string]json.RawMessage) { delete(m, "write_dir") }},
+		{"null readonly", func(m map[string]json.RawMessage) { m["readonly"] = json.RawMessage("null") }},
+		{"null write_dir", func(m map[string]json.RawMessage) { m["write_dir"] = json.RawMessage("null") }},
+		{"string readonly", func(m map[string]json.RawMessage) { m["readonly"] = json.RawMessage(`"true"`) }},
+		{"number write_dir", func(m map[string]json.RawMessage) { m["write_dir"] = json.RawMessage(`5`) }},
+	} {
+		t.Run(mutation.name, func(t *testing.T) {
+			members := encode(t, v)
+			mutation.members(members)
+			if got, err := decodeExecutionCapture(members); err == nil {
+				t.Fatalf("capture decoded to %+v, want rejection", got)
+			}
+		})
 	}
 }

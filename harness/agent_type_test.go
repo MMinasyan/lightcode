@@ -16,6 +16,8 @@ func testAgentTypes() []AgentType {
 			Prompt:       "primary prompt",
 			Tools:        []string{"read_file", "write_file", "read_file"},
 			Capabilities: []string{"cap-b", "cap-a"},
+			Readonly:     true,
+			WriteDir:     "/w/sub",
 		},
 		{
 			Name:         "explore",
@@ -55,7 +57,7 @@ func TestResolveAgentTypeSelectsExactName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveAgentType(explore): %v", err)
 	}
-	if other.Model != (model.ModelRef{}) || other.Capabilities != nil {
+	if other.Model != (model.ModelRef{}) || other.Capabilities != nil || other.Readonly || other.WriteDir != "" {
 		t.Fatalf("two Agent types share selection state: %+v", other)
 	}
 

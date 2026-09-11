@@ -1,7 +1,6 @@
 package harness
 
 import (
-	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -299,11 +298,8 @@ func validateToolCallRecord(c toolCallRecord) error {
 		return errors.New("tool call extra values must be complete valid JSON")
 	}
 	if len(c.NormalizedArguments) > 0 {
-		if !json.Valid(c.NormalizedArguments) {
-			return errors.New("tool call normalized_arguments must be valid JSON")
-		}
-		if trimmed := bytes.TrimSpace(c.NormalizedArguments); bytes.Equal(trimmed, []byte("null")) {
-			return errors.New("tool call normalized_arguments must not be null")
+		if _, err := decodePayloadObject(c.NormalizedArguments); err != nil {
+			return fmt.Errorf("tool call normalized_arguments must be one complete JSON object: %v", err)
 		}
 	}
 	return validateHexID(c.ResultEntryID, "tool call reserved result entry id")
@@ -1445,12 +1441,16 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 		SystemPrompt          string            `json:"system_prompt"`
 		Tools                 []json.RawMessage `json:"tools"`
 		Capabilities          []string          `json:"capabilities,omitempty"`
+		Readonly              bool              `json:"readonly"`
+		WriteDir              string            `json:"write_dir"`
 	}{
 		ConfigurationRevision: v.ConfigurationRevision,
 		Model:                 modelRaw,
 		SystemPrompt:          v.SystemPrompt,
 		Tools:                 tools,
 		Capabilities:          v.Capabilities,
+		Readonly:              v.Readonly,
+		WriteDir:              v.WriteDir,
 	})
 	if err != nil {
 		return nil, err
@@ -1591,9 +1591,10 @@ func validateOperationAdmission(v OperationAdmission) error {
 }
 
 // decodeExecutionCapture reads the durable capture with exact keys, unique
-// tool names, and preserved tool and capability order.
+// tool names, and preserved tool and capability order. The permission
+// capability members are required, including their false and empty values.
 func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, error) {
-	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "system_prompt", "tools", "capabilities"); err != nil {
+	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "system_prompt", "tools", "capabilities", "readonly", "write_dir"); err != nil {
 		return ExecutionCapture{}, err
 	}
 	revision, err := stringMember(obj, "configuration_revision", true)
@@ -1616,7 +1617,15 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 	if err != nil {
 		return ExecutionCapture{}, err
 	}
-	v := ExecutionCapture{ConfigurationRevision: revision, Model: ref, SystemPrompt: systemPrompt}
+	readonly, err := boolMember(obj, "readonly", true)
+	if err != nil {
+		return ExecutionCapture{}, err
+	}
+	writeDir, err := stringMember(obj, "write_dir", true)
+	if err != nil {
+		return ExecutionCapture{}, err
+	}
+	v := ExecutionCapture{ConfigurationRevision: revision, Model: ref, SystemPrompt: systemPrompt, Readonly: readonly, WriteDir: writeDir}
 	for i, raw := range toolsRaw {
 		tool, err := decodeToolDefinition(raw)
 		if err != nil {

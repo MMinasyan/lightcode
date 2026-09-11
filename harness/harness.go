@@ -46,14 +46,24 @@ type PreparedExecution struct {
 }
 
 // Execution is one opened execution: the two process-local effect functions
-// the Harness drives, plus the cleanup of any external resources backing
-// them. A successful Model and Tool must be non-nil; Close is optional when
-// the concrete execution needs no external disposal. The opener owns
-// provisional cleanup on error.
+// the Harness drives, the Operation's resolved automatic permission policy,
+// the required pure argument-normalization callback, plus the cleanup of any
+// external resources backing them. A successful Model, Tool and NormalizeTool
+// must be non-nil; Close is optional when the concrete execution needs no
+// external disposal. The opener owns provisional cleanup on error.
 type Execution struct {
 	Model agent.ModelEffect
 	Tool  func(context.Context, model.ToolCall) PreparedTool
-	Close func() error
+	// Permissions is the automatic policy resolved for this Operation from the
+	// same immutable configuration revision its capture records. The zero
+	// PermissionPolicy is the built-in policy.
+	Permissions PermissionPolicy
+	// NormalizeTool is pure, terminating argument validation and defaulting
+	// with no filesystem, service, permission or effect I/O. It receives an
+	// owned call and returns one owned JSON object preserving unrelated
+	// accepted fields; its error is a per-call validation failure.
+	NormalizeTool func(model.ToolCall) (json.RawMessage, error)
+	Close         func() error
 }
 
 // ToolOutcome is one owned tool plan's complete outcome: the model-visible
@@ -65,12 +75,19 @@ type ToolOutcome struct {
 	Metadata json.RawMessage // optional, bounded, well-formed; semantics owned by the tool
 }
 
-// PreparedTool is one tool plan: exactly one immediate outcome or executor,
-// with normalized arguments that are nil or one valid JSON value.
+// PreparedTool is one immutable prepared call: exactly one immediate outcome
+// or executor, its declared permission/target pairs, and the canonical
+// bindings permission evaluation and concrete I/O consume. Normalized
+// arguments are Harness-supplied input, never a second value the preparer
+// replaces. Execution and immediate-success plans require a nonempty list of
+// nonempty permission/target pairs; immediate error, denied and interrupted
+// outcomes need no successful target declaration.
 type PreparedTool struct {
-	NormalizedArguments json.RawMessage
-	Immediate           *ToolOutcome
-	Execute             func(context.Context) ToolOutcome
+	Permissions        []PermissionRequest
+	CanonicalWorkspace string
+	CanonicalWriteDir  string
+	Immediate          *ToolOutcome
+	Execute            func(context.Context) ToolOutcome
 }
 
 // CreateSessionRequest is the input of one root Session creation.

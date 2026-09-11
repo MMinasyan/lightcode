@@ -38,11 +38,11 @@ type selection struct {
 
 // PreparationHook is one pure preparation capability: it may replace the
 // captured system prompt and tool definitions, but never the captured model,
-// revision or capability IDs, and it may not add tool names outside the
-// original capture. Hooks read their own settings through the Invocation,
-// start no effects, and hold no resource: a hook provider must therefore be
-// Runtime- or Workspace-scoped. Harness owns no hook fields and no hook
-// dispatcher.
+// revision, capability IDs, or permission capability constraints, and it may
+// not add tool names outside the original capture. Hooks read their own
+// settings through the Invocation, start no effects, and hold no resource: a
+// hook provider must therefore be Runtime- or Workspace-scoped. Harness owns
+// no hook fields and no hook dispatcher.
 type PreparationHook interface {
 	Prepare(context.Context, Invocation, harness.ExecutionCapture) (harness.ExecutionCapture, error)
 }
@@ -203,8 +203,10 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 		agentScope.closers = append(agentScope.closers, execution.Close)
 	}
 	return harness.Execution{
-		Model: execution.Model,
-		Tool:  execution.Tool,
+		Model:         execution.Model,
+		Tool:          execution.Tool,
+		Permissions:   execution.Permissions,
+		NormalizeTool: execution.NormalizeTool,
 		Close: func() error {
 			release()
 			return errors.Join(agentScope.close(), operation.close())
@@ -228,9 +230,11 @@ func requireCatalogModel(snapshot *configuration, ref model.ModelRef) error {
 }
 
 // validateCaptureSelection checks the prepared capture's model and revision
-// against the selected view and its capability names against the Agent's full
-// selected names in the same order; nil and empty selections compare equal.
-// Harness remains the final capture and admission validator.
+// against the selected view, its capability names against the Agent's full
+// selected names in the same order, and its permission capability members
+// against the one Harness-selected Agent definition before any hook runs; nil
+// and empty selections compare equal. Harness remains the final capture and
+// admission validator.
 func validateCaptureSelection(capture harness.ExecutionCapture, sel selection) error {
 	if capture.Model != sel.agent.Model {
 		return fmt.Errorf("capture model %s is not the selected model %s: %w", capture.Model.String(), sel.agent.Model.String(), harness.ErrInvalid)
@@ -240,6 +244,12 @@ func validateCaptureSelection(capture harness.ExecutionCapture, sel selection) e
 	}
 	if !slices.Equal(capture.Capabilities, sel.agent.Capabilities) {
 		return fmt.Errorf("capture capabilities %q are not the selected capabilities %q: %w", capture.Capabilities, sel.agent.Capabilities, harness.ErrInvalid)
+	}
+	if capture.Readonly != sel.agent.Readonly {
+		return fmt.Errorf("capture readonly %v is not the selected definition's %v: %w", capture.Readonly, sel.agent.Readonly, harness.ErrInvalid)
+	}
+	if capture.WriteDir != sel.agent.WriteDir {
+		return fmt.Errorf("capture write dir %q is not the selected definition's %q: %w", capture.WriteDir, sel.agent.WriteDir, harness.ErrInvalid)
 	}
 	return nil
 }
@@ -306,8 +316,9 @@ func ownExecutionCapture(capture harness.ExecutionCapture) (harness.ExecutionCap
 }
 
 // validateHookedCapture revalidates, after each hook and before the next,
-// that only the system prompt and tool definitions changed: the identity
-// stays intact and no tool name outside the original capture appears.
+// that only the system prompt and tool definitions changed: the identity and
+// the permission capability members stay intact and no tool name outside the
+// original capture appears.
 func validateHookedCapture(base, next harness.ExecutionCapture) error {
 	if next.Model != base.Model {
 		return fmt.Errorf("preparation hook changed the captured model: %w", harness.ErrInvalid)
@@ -317,6 +328,12 @@ func validateHookedCapture(base, next harness.ExecutionCapture) error {
 	}
 	if !slices.Equal(next.Capabilities, base.Capabilities) {
 		return fmt.Errorf("preparation hook changed the captured capability IDs: %w", harness.ErrInvalid)
+	}
+	if next.Readonly != base.Readonly {
+		return fmt.Errorf("preparation hook changed the captured readonly constraint: %w", harness.ErrInvalid)
+	}
+	if next.WriteDir != base.WriteDir {
+		return fmt.Errorf("preparation hook changed the captured write dir constraint: %w", harness.ErrInvalid)
 	}
 	original := make(map[string]bool, len(base.Tools))
 	for _, tool := range base.Tools {

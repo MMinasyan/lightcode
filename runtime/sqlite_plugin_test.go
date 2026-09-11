@@ -425,6 +425,13 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 				},
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 					return harness.Execution{
+						NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
+							var obj map[string]json.RawMessage
+							if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {
+								return nil, errors.New("arguments must be one non-null JSON object")
+							}
+							return json.Marshal(obj)
+						},
 						Model: func(ctx context.Context, _ model.Request, _ agent.AssemblyCallback) (agent.ModelSettlement, error) {
 							executions.Add(1)
 							select {
