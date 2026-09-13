@@ -1675,15 +1675,22 @@ func TestPublicOrderedToolCallsSettle(t *testing.T) {
 
 // TestPublicToolMetadataPersistsOpaqueAcrossStores proves the durable metadata
 // boundary through the public surface over both storage implementations:
-// a tool's well-formed bounded metadata commits byte-identical into its
-// tool_result payload, an executor returning malformed metadata still commits
-// its result without the member, a raw value within the bound whose durable
-// HTML-escaped encoding exceeds it is dropped while its result still commits,
-// the model-visible projection carries only each committed result's content,
-// and a restarted Harness revalidates both payloads.
+// a tool's metadata commits as its encoded durable bytes — even a raw value
+// over the bound whose compacted encoding fits, before and after a
+// restarted Harness revalidates the payloads — an executor returning
+// malformed metadata still commits its result without the member, a raw
+// value within the bound whose durable HTML-escaped encoding exceeds it is
+// dropped while its result still commits, the model-visible projection
+// carries only each committed result's content, and recovery revalidates
+// both payloads.
 func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
-		const preview = `{"kind":"editpreview","files":["a.go"]}`
+		// the accepted executor returns the formatted fixture prefixed with
+		// 1 MiB of ordinary spaces: raw over the bound, but its compacted,
+		// HTML-escaped durable encoding is the short literal below it.
+		const formatted = `{ "n" : [1, 1.0, 1e0, 9007199254740993], "s" : "<>&" }`
+		const encoded = `{"n":[1,1.0,1e0,9007199254740993],"s":"\u003c\u003e\u0026"}`
+		rawOverBound := json.RawMessage(strings.Repeat(" ", 1<<20) + formatted)
 		// exactly 1 MiB of raw bytes, but every '<' encodes as \u003c in the
 		// durable payload, expanding it far past the bound.
 		const durableBound = 1 << 20
@@ -1719,7 +1726,7 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 							return harness.PreparedTool{Permissions: publicPermission, Execute: func(context.Context) harness.ToolOutcome {
 								return harness.ToolOutcome{
 									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
-									Metadata: json.RawMessage(preview),
+									Metadata: rawOverBound,
 								}
 							}}
 						},
@@ -1740,23 +1747,27 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 			t.Fatalf("Wait: %v", err)
 		}
 
-		results := map[string]map[string]json.RawMessage{}
-		for _, entry := range recoverEntries(t, store, session) {
-			if entry.Kind != harness.EntryToolResult {
-				continue
+		readResults := func() map[string]map[string]json.RawMessage {
+			results := map[string]map[string]json.RawMessage{}
+			for _, entry := range recoverEntries(t, store, session) {
+				if entry.Kind != harness.EntryToolResult {
+					continue
+				}
+				var wire map[string]json.RawMessage
+				if err := json.Unmarshal(entry.Payload, &wire); err != nil {
+					t.Fatalf("decode tool result payload: %v", err)
+				}
+				var callID string
+				if err := json.Unmarshal(wire["tool_call_id"], &callID); err != nil {
+					t.Fatalf("decode tool call id: %v", err)
+				}
+				results[callID] = wire
 			}
-			var wire map[string]json.RawMessage
-			if err := json.Unmarshal(entry.Payload, &wire); err != nil {
-				t.Fatalf("decode tool result payload: %v", err)
-			}
-			var callID string
-			if err := json.Unmarshal(wire["tool_call_id"], &callID); err != nil {
-				t.Fatalf("decode tool call id: %v", err)
-			}
-			results[callID] = wire
+			return results
 		}
-		if string(results["call-1"]["metadata"]) != preview {
-			t.Fatalf("call-1 metadata = %s, want the committed bytes verbatim", results["call-1"]["metadata"])
+		results := readResults()
+		if string(results["call-1"]["metadata"]) != encoded {
+			t.Fatalf("call-1 metadata = %s, want the committed encoded bytes verbatim", results["call-1"]["metadata"])
 		}
 		if _, present := results["call-2"]["metadata"]; present {
 			t.Fatalf("call-2 carries malformed metadata %s, want it dropped while the result committed", results["call-2"]["metadata"])
@@ -1772,9 +1783,14 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 		}
 
 		// a restarted Harness revalidates every committed payload: the durable
-		// states prove no transaction failed and the Session stayed sound.
+		// states prove no transaction failed and the Session stayed sound,
+		// and the committed encoded member survives recovery unchanged.
 		if err := harness.Recover(context.Background(), store); err != nil {
 			t.Fatalf("Recover: %v", err)
+		}
+		results = readResults()
+		if string(results["call-1"]["metadata"]) != encoded {
+			t.Fatalf("call-1 metadata after Recover = %s, want the committed encoded bytes verbatim", results["call-1"]["metadata"])
 		}
 	})
 }
@@ -5005,11 +5021,12 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 						Model:         script.effect,
 						NormalizeTool: publicNormalize,
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							// the copied tool result carries tool-owned metadata
-							// that the fork must preserve verbatim
+							// the copied tool result carries tool-owned
+							// formatted metadata that the fork must preserve
+							// in its encoded durable form
 							return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
 								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
-								Metadata: json.RawMessage(`{"kind":"copyprobe","n":[1]}`),
+								Metadata: json.RawMessage(`{ "n" : [1, 1.0, 1e0, 9007199254740993], "s" : "<>&" }`),
 							}}
 						},
 					}, nil
@@ -5179,8 +5196,8 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 			copiedResult.ToolCallID != "call-1" {
 			t.Fatalf("copied result reference = %+v, want it rewritten inside the copied prefix", copiedResult.AssistantEntry)
 		}
-		if string(copiedResult.Metadata) != `{"kind":"copyprobe","n":[1]}` {
-			t.Fatalf("copied result metadata = %s, want the source metadata preserved verbatim", copiedResult.Metadata)
+		if string(copiedResult.Metadata) != `{"n":[1,1.0,1e0,9007199254740993],"s":"\u003c\u003e\u0026"}` {
+			t.Fatalf("copied result metadata = %s, want the source's encoded metadata preserved verbatim", copiedResult.Metadata)
 		}
 		var copiedSignal struct {
 			RelatedOperation struct {

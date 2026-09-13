@@ -1050,6 +1050,28 @@ func TestToolResultMetadataRules(t *testing.T) {
 	}
 }
 
+// TestOwnedToolMetadataEncodedForm proves the shared owning helper returns
+// the exact durable encoding json.Marshal produces for the raw input —
+// whitespace compacts, HTML characters escape, numeric lexemes stay exact —
+// never a clone of the caller's raw bytes: the caller's buffer stays
+// unchanged and the returned bytes are independent of it.
+func TestOwnedToolMetadataEncodedForm(t *testing.T) {
+	const input = `{ "n" : [1, 1.0, 1e0, 9007199254740993], "s" : "<>&" }`
+	const want = `{"n":[1,1.0,1e0,9007199254740993],"s":"\u003c\u003e\u0026"}`
+	raw := json.RawMessage(input)
+	got := ownedToolMetadata(raw)
+	if string(got) != want {
+		t.Fatalf("owned metadata = %s, want the durable encoded bytes %s", got, want)
+	}
+	if string(raw) != input {
+		t.Fatalf("caller input changed to %s, want it unchanged", raw)
+	}
+	raw[1] = 'x' // mutating the caller's buffer cannot alter the returned bytes
+	if string(got) != want {
+		t.Fatalf("owned metadata after mutating the caller = %s, want the independent encoded bytes %s", got, want)
+	}
+}
+
 // TestCodecRejectsInvalidValues proves validate-before-encoding: every
 // invalid durable value fails its encode with the invalid-input class, and
 // the unsupported kinds use it before persistence while their stored records

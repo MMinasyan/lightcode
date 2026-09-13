@@ -553,19 +553,23 @@ func assistantPayloadEligible(v assistantEntry) bool {
 // plugin-owned semantics of the value.
 const maxToolMetadataBytes = 1 << 20 // 1 MiB
 
-// durableToolMetadata is the one shared metadata predicate: it reports
-// whether one candidate is acceptable as the durable tool_result metadata
+// ownedToolMetadata is the one shared metadata mechanism: it returns the
+// owned bytes json.Marshal produces for one candidate tool_result metadata
 // member — one complete well-formed non-null JSON value whose durable
 // encoding (the compacted, HTML-escaped bytes json.Marshal produces for a
-// json.RawMessage) stays within the bound. Empty and null are absent, never
-// stored. The bound applies to the persisted representation, not to the
-// caller's raw input.
-func durableToolMetadata(raw json.RawMessage) bool {
+// json.RawMessage) stays within the bound. Empty, malformed, null, or
+// oversized input returns nil. The bound applies to the persisted
+// representation, not to the caller's raw input, and the returned buffer
+// never aliases the caller.
+func ownedToolMetadata(raw json.RawMessage) json.RawMessage {
 	if len(raw) == 0 {
-		return false
+		return nil
 	}
 	encoded, err := json.Marshal(raw)
-	return err == nil && string(encoded) != "null" && len(encoded) <= maxToolMetadataBytes
+	if err != nil || string(encoded) == "null" || len(encoded) > maxToolMetadataBytes {
+		return nil
+	}
+	return encoded
 }
 
 // encodeToolResultEntry renders one tool-result entry payload.
@@ -678,8 +682,8 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 
 // validateToolResultEntry enforces the closed tool-result shape: durable
 // identities, non-empty original call id, the landed Agent result rules
-// re-enforced through the landed constructor, and a metadata member accepted
-// by the one shared durable predicate.
+// re-enforced through the landed constructor, and a present metadata member
+// accepted by the one shared owning helper; omitted metadata stays valid.
 func validateToolResultEntry(v toolResultEntry) error {
 	if err := validateHexID(v.SessionID, "session id"); err != nil {
 		return err
@@ -695,10 +699,8 @@ func validateToolResultEntry(v toolResultEntry) error {
 	if _, err := model.NewToolResult(model.ToolResult{CallID: v.ToolCallID, Status: v.Status, Content: v.Content}); err != nil {
 		return err
 	}
-	if len(v.Metadata) > 0 {
-		if !durableToolMetadata(v.Metadata) {
-			return fmt.Errorf("tool result metadata must be one well-formed non-null JSON value within the %d byte durable bound", maxToolMetadataBytes)
-		}
+	if len(v.Metadata) > 0 && len(ownedToolMetadata(v.Metadata)) == 0 {
+		return fmt.Errorf("tool result metadata must be one well-formed non-null JSON value within the %d byte durable bound", maxToolMetadataBytes)
 	}
 	return nil
 }

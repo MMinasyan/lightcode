@@ -903,17 +903,6 @@ func invalidToolResult(callID string) model.ToolResult {
 	return model.ToolResult{CallID: callID, Status: model.ResultError, Content: invalidToolResultContent}
 }
 
-// ownedToolMetadata returns the owned metadata accepted at the commit
-// boundary through the one shared durable predicate: a candidate whose
-// durable encoding is malformed, null, or beyond the bound is dropped while
-// the result still commits. The Harness never interprets the accepted bytes.
-func ownedToolMetadata(raw json.RawMessage) json.RawMessage {
-	if !durableToolMetadata(raw) {
-		return nil
-	}
-	return model.CloneRaw(raw)
-}
-
 // interruptedToolResult is the ordinary interrupted-before-execution result.
 func interruptedToolResult(callID string) model.ToolResult {
 	return model.ToolResult{CallID: callID, Status: model.ResultInterrupted, Content: interruptedToolResultContent}
