@@ -69,6 +69,7 @@ type EffectKind string
 const (
 	EffectModel EffectKind = "model"
 	EffectTool  EffectKind = "tool"
+	EffectHook  EffectKind = "hook"
 )
 
 // SignalKind is the closed kind of one durable signal entry. The signal kind
@@ -188,12 +189,15 @@ type OperationAdmission struct {
 }
 
 // ActiveEffect names the one in-flight effect of a running Operation and the
-// entry reserved for its result. A model effect omits the tool-call ID; a
-// tool effect requires it and addresses the matching first pending call.
+// entry reserved for its result. A model effect omits the tool-call and hook
+// IDs; a tool effect requires the tool-call ID and addresses the matching
+// first pending call; a hook effect requires both the hook ID and the
+// tool-call ID of the first pending call it runs for.
 type ActiveEffect struct {
 	Kind          EffectKind `json:"kind"`
 	ResultEntryID string     `json:"result_entry_id"`
 	ToolCallID    string     `json:"tool_call_id,omitempty"`
+	HookID        string     `json:"hook_id,omitempty"`
 }
 
 // PendingToolCall is one unresolved published tool call: the assistant entry
@@ -289,6 +293,32 @@ type toolResultEntry struct {
 	Status         model.ToolResultStatus `json:"status"`
 	Content        string                 `json:"content"`
 	Metadata       json.RawMessage        `json:"metadata,omitempty"`
+}
+
+// hookResultStatus is the closed status of one settled argument-hook
+// execution.
+type hookResultStatus string
+
+const (
+	hookSucceeded   hookResultStatus = "success"
+	hookFailed      hookResultStatus = "error"
+	hookInterrupted hookResultStatus = "interrupted"
+)
+
+// hookResultEntry is one settled argument-hook execution: the independent
+// immutable historical evidence of one hook's outcome for one tool call,
+// under the executing effect's own reserved identity — never a conversation
+// message. Success carries the one normalized replacement object and no
+// error; every other status carries a non-empty error and no arguments.
+type hookResultEntry struct {
+	SessionID   string           `json:"session_id"`
+	EntryID     string           `json:"entry_id"`
+	OperationID string           `json:"operation_id"`
+	HookID      string           `json:"hook_id"`
+	ToolCallID  string           `json:"tool_call_id"`
+	Status      hookResultStatus `json:"status"`
+	Arguments   json.RawMessage  `json:"arguments,omitempty"`
+	Error       string           `json:"error,omitempty"`
 }
 
 // signalEntry is one durable control signal. Its related source Operation is

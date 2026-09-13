@@ -532,6 +532,36 @@ func commitTerminalSettlement(tx Transaction, sessionID, operationID string, cur
 		}
 	}
 
+	// One interrupted hook_result under an active hook effect's reserved
+	// identity: recovery settles an unfinished hook without replaying or
+	// resuming it, before the interrupted tool results commit.
+	if currentOp.State.ActiveEffect != nil && currentOp.State.ActiveEffect.Kind == EffectHook {
+		hook := hookResultEntry{
+			SessionID:   sessionID,
+			EntryID:     currentOp.State.ActiveEffect.ResultEntryID,
+			OperationID: operationID,
+			HookID:      currentOp.State.ActiveEffect.HookID,
+			ToolCallID:  currentOp.State.ActiveEffect.ToolCallID,
+			Status:      hookInterrupted,
+			Error:       recoveryInterruptedDetail,
+		}
+		payload, err := encodeHookResultEntry(hook)
+		if err != nil {
+			return OperationRecord{}, SessionRecord{}, nil, err
+		}
+		adopted, err := insertAndAdopt(tx, sessionID, EntryDraft{
+			SessionID:   sessionID,
+			ID:          hook.EntryID,
+			OperationID: operationID,
+			Kind:        EntryHookResult,
+			Payload:     payload,
+		})
+		if err != nil {
+			return OperationRecord{}, SessionRecord{}, nil, err
+		}
+		newEntries = append(newEntries, adopted)
+	}
+
 	// One interrupted result under every remaining committed tool-result
 	// identity whose call will not execute.
 	remaining := append(append([]PendingToolCall{}, currentOp.State.PendingToolCalls...), pending...)
@@ -962,17 +992,20 @@ func boundedToolDiagnostic(cause error) string {
 // boundary. In order: it resolves the call's pending reservation and committed
 // assistant record, and pre-start cancellation wins before anything else; the
 // advertisement gate rejects names outside the committed advertised tool set
-// with the ordinary unavailable-tool error before any preparer runs; the
-// original assistant's committed normalized arguments are the selected input,
-// and only an invalid unhooked original is normalized again to obtain its
-// useful validation diagnostic. It then prepares the plan outside locks,
-// rejects invalid plan shapes with the existing internal-validation error, and
-// evaluates every declaration through the fixed boundary — including
-// immediate-success plans — before beginToolEffect. A denial settles only that
-// original call with status denied and no metadata, no concrete effect and no
-// tool active intent; later calls still run. An allowed executor commits
-// intent, executes once behind the cancellation-before-start gate, and commits
-// one validated outcome — a returned real outcome wins a cancellation race.
+// with the ordinary unavailable-tool error before any hook or preparer runs;
+// the selected argument hooks then run in configured order, each as its own
+// settled effect, and a settled hook chain hands the final committed value on;
+// without hooks (or for an unhooked call) the original assistant's committed
+// normalized arguments are the selected input, and only an invalid unhooked
+// original is normalized again to obtain its useful validation diagnostic. It
+// then prepares the plan outside locks, rejects invalid plan shapes with the
+// existing internal-validation error, and evaluates every declaration through
+// the fixed boundary — including immediate-success plans — before
+// beginToolEffect. A denial settles only that original call with status denied
+// and no metadata, no concrete effect and no tool active intent; later calls
+// still run. An allowed executor commits intent, executes once behind the
+// cancellation-before-start gate, and commits one validated outcome — a
+// returned real outcome wins a cancellation race.
 func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution, capture ExecutionCapture) agent.ToolEffect {
 	prepared := exec.Tool
 	advertised := advertisedToolNames(capture)
@@ -988,12 +1021,23 @@ func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution,
 		if !advertised[record.Name] { // the one advertisement gate, ahead of every hook and preparer
 			return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: unavailableToolResult(call.ID, record.Name)}, false)
 		}
-		// The selected normalized value is the original assistant's committed
-		// successful result, already validated and owned; it is never
-		// re-normalized. Only an absent (invalid) original is normalized again,
-		// solely to obtain its useful validation diagnostic.
+		// The selected normalized value feeding preparation: the final
+		// committed hook replacement when hooks ran, otherwise the original
+		// assistant's committed successful result. Both were already validated
+		// and owned; neither is ever re-normalized. Only an absent (invalid)
+		// unhooked original is normalized again, solely to obtain its useful
+		// validation diagnostic.
 		selected := record.NormalizedArguments
-		if len(selected) == 0 {
+		if len(exec.ToolHooks) > 0 {
+			final, settled, herr := h.runArgumentHooks(ctx, settleCtx, c, operationID, pending, record, exec)
+			if herr != nil {
+				return model.ToolResult{}, herr
+			}
+			if settled != nil { // the hook chain settled the call itself; remaining hooks are skipped and later calls continue
+				return *settled, nil
+			}
+			selected = final
+		} else if len(selected) == 0 {
 			raw, derr := base64.StdEncoding.DecodeString(record.ArgumentsBase64)
 			if derr != nil { // a non-canonical durable record is corruption, not empty arguments
 				return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: invalidToolResult(call.ID)}, false)
@@ -1266,6 +1310,343 @@ func (h *Harness) commitToolResult(ctx context.Context, c *coordinator, operatio
 	return outcome.Result, nil
 }
 
+// runArgumentHooks settles one call's selected argument-hook chain before
+// concrete preparation: each hook runs as its own effect in configured order,
+// the first receiving the original raw call arguments and every later one the
+// preceding committed replacement. Each successful replacement is validated
+// and normalized exactly once and its committed consequence returned to the
+// synchronous continuation; a failed or interrupted hook settles the tool
+// call itself (remaining hooks are skipped, later calls continue). It returns
+// the final committed value, or the committed tool result when the chain
+// settled the call, or the error a failed intent/result transaction leaves
+// for normal recovery.
+func (h *Harness) runArgumentHooks(ctx, settleCtx context.Context, c *coordinator, operationID string, pending PendingToolCall, record toolCallRecord, exec Execution) (json.RawMessage, *model.ToolResult, error) {
+	raw, err := base64.StdEncoding.DecodeString(record.ArgumentsBase64)
+	if err != nil { // a non-canonical durable record is corruption, not empty arguments
+		settled, serr := h.settleHooklessInvalid(settleCtx, c, operationID, pending)
+		return nil, settled, serr
+	}
+	current := raw
+	for _, hook := range exec.ToolHooks {
+		committed, settled, hookErr := h.runOneHook(ctx, settleCtx, c, operationID, pending, record, hook, exec.NormalizeTool, current)
+		if hookErr != nil || settled != nil {
+			return nil, settled, hookErr
+		}
+		current = committed
+	}
+	return current, nil, nil
+}
+
+// runOneHook settles one argument hook as its own Operation effect: it
+// commits the hook active-effect intent with a fresh reserved result
+// identity, runs the hook outside locks and transactions, and commits the
+// validated consequence — a successful normalized replacement (a real result
+// even when cancellation arrives before its commit), a hook error, or an
+// interruption under the classification fixed for every hook.
+func (h *Harness) runOneHook(ctx, settleCtx context.Context, c *coordinator, operationID string, pending PendingToolCall, record toolCallRecord, hook ToolArgumentsHook, normalize func(model.ToolCall) (json.RawMessage, error), current json.RawMessage) (json.RawMessage, *model.ToolResult, error) {
+	resultID, err := h.beginHookEffect(ctx, c, operationID, pending.CallID, hook.ID)
+	if err != nil {
+		// An intent transaction aborted by cancellation committed no
+		// reservation, so no hook result exists: the call settles the existing
+		// interrupted-before-execution result through the ordinary no-intent
+		// transition, preserving earlier real hook results and preventing
+		// later starts.
+		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && ctx.Err() != nil {
+			outcome := ToolOutcome{Result: interruptedToolResult(pending.CallID)}
+			if _, terr := h.commitToolResult(settleCtx, c, operationID, pending, outcome, false); terr != nil {
+				return nil, nil, terr
+			}
+			return nil, &outcome.Result, nil
+		}
+		return nil, nil, err
+	}
+	if ctx.Err() != nil { // cancellation between the committed intent and Run: interrupted hook, no replay
+		settled, serr := h.settleHookInterruption(settleCtx, c, operationID, pending, hook.ID, resultID)
+		return nil, settled, serr
+	}
+	owned, err := model.NewToolCall(model.ToolCall{ID: record.ID, Name: record.Name, Arguments: current, Extra: record.Extra})
+	if err != nil { // the committed record's identity fields are validated; never reachable for a valid graph
+		settled, serr := h.settleHookError(settleCtx, c, operationID, pending, hook.ID, resultID, invalidToolResult(record.ID))
+		return nil, settled, serr
+	}
+	replacement, runErr := hook.Run(ctx, owned)
+	if runErr != nil {
+		// For Run's error return, a cancellation-shaped error with a done
+		// execution context is interruption; every other returned error is a
+		// hook error — no per-hook error policies.
+		if (errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)) && ctx.Err() != nil {
+			settled, serr := h.settleHookInterruption(settleCtx, c, operationID, pending, hook.ID, resultID)
+			return nil, settled, serr
+		}
+		settled, serr := h.settleHookError(settleCtx, c, operationID, pending, hook.ID, resultID, validationToolResult(record.ID, runErr))
+		return nil, settled, serr
+	}
+	if _, serr := decodePayloadObject(replacement); serr != nil { // an invalid returned value is a hook error of the malformed class
+		settled, derr := h.settleHookError(settleCtx, c, operationID, pending, hook.ID, resultID, invalidToolResult(record.ID))
+		return nil, settled, derr
+	}
+	// Normalize/default the replacement exactly once before committing the
+	// successful hook consequence.
+	normalized, nerr := normalizeCallArguments(normalize, model.ToolCall{ID: record.ID, Name: record.Name, Arguments: replacement, Extra: record.Extra})
+	if nerr != nil {
+		if errors.Is(nerr, errMalformedNormalization) {
+			settled, serr := h.settleHookError(settleCtx, c, operationID, pending, hook.ID, resultID, invalidToolResult(record.ID))
+			return nil, settled, serr
+		}
+		settled, serr := h.settleHookError(settleCtx, c, operationID, pending, hook.ID, resultID, validationToolResult(record.ID, nerr))
+		return nil, settled, serr
+	}
+	// The successful normalized output is a real result even if cancellation
+	// arrives before its commit: the settlement transaction runs without
+	// cancellation.
+	committed, cerr := h.commitHookResult(settleCtx, c, operationID, pending, hook.ID, resultID, hookResultEntry{Status: hookSucceeded, Arguments: normalized})
+	if cerr != nil {
+		return nil, nil, cerr
+	}
+	return committed, nil, nil
+}
+
+// settleHooklessInvalid settles the call's fixed internal-validation result
+// through the ordinary no-intent transition, for shapes that never ran a hook.
+func (h *Harness) settleHooklessInvalid(ctx context.Context, c *coordinator, operationID string, pending PendingToolCall) (*model.ToolResult, error) {
+	result := invalidToolResult(pending.CallID)
+	if _, err := h.commitToolResult(ctx, c, operationID, pending, ToolOutcome{Result: result}, false); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// settleHookInterruption commits the interrupted hook_result under the
+// effect's reserved identity and settles the pending call interrupted through
+// the existing interruption helpers; the Operation's terminal interruption
+// settles through the ordinary run settlement. No hook or tool replays.
+func (h *Harness) settleHookInterruption(ctx context.Context, c *coordinator, operationID string, pending PendingToolCall, hookID, resultID string) (*model.ToolResult, error) {
+	if _, err := h.commitHookResult(ctx, c, operationID, pending, hookID, resultID, hookResultEntry{Status: hookInterrupted, Error: executionInterruptedDetail}); err != nil {
+		return nil, err
+	}
+	result := interruptedToolResult(pending.CallID)
+	if _, err := h.commitToolResult(ctx, c, operationID, pending, ToolOutcome{Result: result}, false); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// settleHookError commits the error hook_result under the effect's reserved
+// identity and then the ordinary error result for the tool call. Both carry
+// the result's already-bounded, nonempty diagnostic.
+func (h *Harness) settleHookError(ctx context.Context, c *coordinator, operationID string, pending PendingToolCall, hookID, resultID string, outcome model.ToolResult) (*model.ToolResult, error) {
+	if _, err := h.commitHookResult(ctx, c, operationID, pending, hookID, resultID, hookResultEntry{Status: hookFailed, Error: outcome.Content}); err != nil {
+		return nil, err
+	}
+	if _, err := h.commitToolResult(ctx, c, operationID, pending, ToolOutcome{Result: outcome}, false); err != nil {
+		return nil, err
+	}
+	return &outcome, nil
+}
+
+// beginHookEffect commits the one active-effect intent of a hook execution:
+// it reserves a fresh result entry identity and records the hook active
+// effect addressing the first pending call. Effects never nest, so any
+// committed intent of another effect rejects.
+func (h *Harness) beginHookEffect(ctx context.Context, c *coordinator, operationID, callID, hookID string) (string, error) {
+	c.mu.Lock()
+	op, ok := c.graph.Operation(operationID)
+	if !ok {
+		sessionID := c.graph.Session.Identity.SessionID
+		c.mu.Unlock()
+		return "", fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+	}
+	if op.State.Status != OperationRunning {
+		c.mu.Unlock()
+		return "", invalidInput("operation %q is %s; a hook effect requires a running Operation", operationID, op.State.Status)
+	}
+	if op.State.ActiveEffect != nil {
+		c.mu.Unlock()
+		return "", invalidInput("operation %q already carries an active effect; effects never nest", operationID)
+	}
+	if len(op.State.PendingToolCalls) == 0 || op.State.PendingToolCalls[0].CallID != callID {
+		c.mu.Unlock()
+		return "", invalidInput("operation %q does not pending-start with call %q; a hook effect addresses the first pending call", operationID, callID)
+	}
+	resultID, err := newHexID()
+	if err != nil {
+		c.mu.Unlock()
+		return "", fmt.Errorf("%w: %v", ErrStorage, err)
+	}
+	sessionID := op.Admission.SessionID
+	var updated OperationRecord
+	err = h.deps.Storage.Transact(ctx, func(tx Transaction) error {
+		key := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: operationID}
+		reg, err := tx.ReadRegister(key)
+		if err != nil {
+			return err
+		}
+		current, err := decodeOperationRegister(reg)
+		if err != nil {
+			return corruptSession(sessionID, "operation register %q: %v", operationID, err)
+		}
+		// a violated semantic precondition outranks the conflict class
+		if current.State.Status != OperationRunning {
+			return invalidInput("operation %q is %s; a hook effect requires a running Operation", operationID, current.State.Status)
+		}
+		if current.State.ActiveEffect != nil {
+			return invalidInput("operation %q already carries an active effect; effects never nest", operationID)
+		}
+		if len(current.State.PendingToolCalls) == 0 || current.State.PendingToolCalls[0].CallID != callID {
+			return invalidInput("operation %q does not pending-start with call %q; a hook effect addresses the first pending call", operationID, callID)
+		}
+		if reg.Revision != op.Revision {
+			return fmt.Errorf("%w: operation %q revision %d changed concurrently to %d", errRevisionRace, operationID, op.Revision, reg.Revision)
+		}
+		next := current
+		next.State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: resultID, ToolCallID: callID, HookID: hookID}
+		payload, err := encodeOperationRegister(next)
+		if err != nil {
+			return err
+		}
+		replaced, err := tx.ReplaceRegister(key, reg.Revision, payload)
+		if err != nil {
+			return err
+		}
+		updated = next
+		updated.Revision = replaced.Revision
+		return nil
+	})
+	if err != nil {
+		h.markCorrupt(sessionID, err)
+		c.mu.Unlock()
+		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+			if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
+				return "", rerr
+			}
+		}
+		return "", err
+	}
+	c.graph.replaceOperation(operationID, updated)
+	c.mu.Unlock()
+	return resultID, nil
+}
+
+// commitHookResult commits one settled hook execution's result transaction:
+// the hook_result entry under the effect's reserved identity plus the cleared
+// active effect with the first call still pending, atomically. On success it
+// returns the committed arguments as the codec-owned copy of the exact stored
+// bytes — the one consequence the synchronous continuation consumes; every
+// failure returns no consequence and leaves the committed running intent for
+// normal recovery.
+func (h *Harness) commitHookResult(ctx context.Context, c *coordinator, operationID string, pending PendingToolCall, hookID, resultID string, res hookResultEntry) (json.RawMessage, error) {
+	c.mu.Lock()
+	op, ok := c.graph.Operation(operationID)
+	if !ok {
+		sessionID := c.graph.Session.Identity.SessionID
+		c.mu.Unlock()
+		return nil, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+	}
+	sessionID := op.Admission.SessionID
+	viewSession := c.graph.Session
+	var (
+		updated       OperationRecord
+		committedSess SessionRecord
+		newEntries    []graphEntry
+		committed     json.RawMessage
+	)
+	err := h.deps.Storage.Transact(ctx, func(tx Transaction) error {
+		sessionKey := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
+		sreg, err := tx.ReadRegister(sessionKey)
+		if err != nil {
+			return err
+		}
+		currentSession, err := decodeSessionRegister(sreg)
+		if err != nil {
+			return corruptSession(sessionID, "session register: %v", err)
+		}
+		opKey := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: operationID}
+		oreg, err := tx.ReadRegister(opKey)
+		if err != nil {
+			return err
+		}
+		currentOp, err := decodeOperationRegister(oreg)
+		if err != nil {
+			return corruptSession(sessionID, "operation register %q: %v", operationID, err)
+		}
+		// violated semantic preconditions outrank the conflict class
+		if currentOp.State.Status != OperationRunning {
+			return invalidInput("operation %q is %s; a hook result requires a running Operation", operationID, currentOp.State.Status)
+		}
+		if currentOp.State.ActiveEffect == nil || currentOp.State.ActiveEffect.Kind != EffectHook ||
+			currentOp.State.ActiveEffect.HookID != hookID ||
+			currentOp.State.ActiveEffect.ToolCallID != pending.CallID ||
+			currentOp.State.ActiveEffect.ResultEntryID != resultID {
+			return invalidInput("operation %q carries no committed hook effect intent for hook %q and call %q", operationID, hookID, pending.CallID)
+		}
+		if sreg.Revision != viewSession.Revision {
+			return fmt.Errorf("%w: session %q revision %d changed concurrently to %d", errRevisionRace, sessionID, viewSession.Revision, sreg.Revision)
+		}
+		if oreg.Revision != op.Revision {
+			return fmt.Errorf("%w: operation %q revision %d changed concurrently to %d", errRevisionRace, operationID, op.Revision, oreg.Revision)
+		}
+		res.SessionID = sessionID
+		res.EntryID = resultID
+		res.OperationID = operationID
+		res.HookID = hookID
+		res.ToolCallID = pending.CallID
+		payload, err := encodeHookResultEntry(res)
+		if err != nil {
+			return err
+		}
+		adopted, err := insertAndAdopt(tx, sessionID, EntryDraft{
+			SessionID:   sessionID,
+			ID:          res.EntryID,
+			OperationID: operationID,
+			Kind:        EntryHookResult,
+			Payload:     payload,
+		})
+		if err != nil {
+			return err
+		}
+		newEntries = append(newEntries, adopted)
+		committed = model.CloneRaw(adopted.HookResult.Arguments) // the codec-owned stored bytes, cloned once for the continuation
+		next := currentOp
+		next.State.ActiveEffect = nil
+		opPayload, err := encodeOperationRegister(next)
+		if err != nil {
+			return err
+		}
+		replaced, err := tx.ReplaceRegister(opKey, oreg.Revision, opPayload)
+		if err != nil {
+			return err
+		}
+		next.Revision = replaced.Revision
+		committedSess = SessionRecord{Identity: currentSession.Identity, State: currentSession.State}
+		sessionPayload, err := encodeSessionRegister(committedSess)
+		if err != nil {
+			return err
+		}
+		replacedSession, err := tx.ReplaceRegister(sessionKey, sreg.Revision, sessionPayload)
+		if err != nil {
+			return err
+		}
+		committedSess.Revision = replacedSession.Revision
+		updated = next
+		return nil
+	})
+	if err != nil {
+		h.markCorrupt(sessionID, err)
+		c.mu.Unlock()
+		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+			if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
+				return nil, rerr
+			}
+		}
+		return nil, err
+	}
+	c.graph.Entries = append(c.graph.Entries, newEntries...)
+	c.graph.replaceOperation(operationID, updated)
+	c.graph.Session = committedSess
+	c.mu.Unlock()
+	return committed, nil
+}
+
 // execute is the private agent.Run composition of one admitted execution:
 // after the commit it invokes the preparation's opener exactly once with the
 // execution context and the owned committed admission, runs the Agent over
@@ -1306,6 +1687,17 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		}
 		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{},
 			invalidInput("opened execution requires non-nil model, tool and normalization functions"))
+	}
+	seenHooks := make(map[string]bool, len(exec.ToolHooks))
+	for _, hook := range exec.ToolHooks {
+		if hook.ID == "" || hook.Run == nil || seenHooks[hook.ID] {
+			if exec.Close != nil {
+				h.recordCleanupFailure(exec.Close())
+			}
+			return h.settleAgentTerminal(c, operationID, agent.TerminalResult{},
+				invalidInput("opened execution requires a non-empty unique ID and a non-nil run function for every argument hook"))
+		}
+		seenHooks[hook.ID] = true
 	}
 	if exec.Close != nil {
 		defer func() { h.recordCleanupFailure(exec.Close()) }()

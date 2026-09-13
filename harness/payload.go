@@ -703,6 +703,128 @@ func validateToolResultEntry(v toolResultEntry) error {
 	return nil
 }
 
+// encodeHookResultEntry renders one hook-result entry payload directly from
+// the validated tagged value.
+func encodeHookResultEntry(v hookResultEntry) (json.RawMessage, error) {
+	if err := validateHookResultEntry(v); err != nil {
+		return nil, invalidInput("hook result entry: %v", err)
+	}
+	return json.Marshal(v)
+}
+
+// decodeHookResultEntry reads one hook-result entry payload and enforces its
+// agreement with the addressed envelope identity. A hook result is never
+// independently copied: its owning Operation identity is required.
+func decodeHookResultEntry(env Entry) (hookResultEntry, error) {
+	if err := decodeEntryEnvelope(env); err != nil {
+		return hookResultEntry{}, err
+	}
+	obj, err := decodePayloadObject(env.Payload)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "hook_id", "tool_call_id", "status", "arguments", "error"); err != nil {
+		return hookResultEntry{}, err
+	}
+	sessionID, err := stringMember(obj, "session_id", true)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	entryID, err := stringMember(obj, "entry_id", true)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	operationID, err := stringMember(obj, "operation_id", true)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	hookID, err := stringMember(obj, "hook_id", true)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	toolCallID, err := stringMember(obj, "tool_call_id", true)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	status, err := stringMember(obj, "status", true)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	arguments, err := rawJSONMember(obj, "arguments", false)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	errorText, err := optionalNonEmptyString(obj, "error")
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	if sessionID != env.SessionID {
+		return hookResultEntry{}, fmt.Errorf("payload session id %q does not agree with the envelope", sessionID)
+	}
+	if entryID != env.ID {
+		return hookResultEntry{}, fmt.Errorf("payload entry id %q does not agree with the envelope", entryID)
+	}
+	if operationID != env.OperationID {
+		return hookResultEntry{}, fmt.Errorf("payload operation id %q does not agree with the envelope", operationID)
+	}
+	v := hookResultEntry{
+		SessionID:   sessionID,
+		EntryID:     entryID,
+		OperationID: operationID,
+		HookID:      hookID,
+		ToolCallID:  toolCallID,
+		Status:      hookResultStatus(status),
+		Arguments:   arguments,
+		Error:       errorText,
+	}
+	if err := validateHookResultEntry(v); err != nil {
+		return hookResultEntry{}, err
+	}
+	return v, nil
+}
+
+// validateHookResultEntry enforces the closed hook-result shape: durable
+// identities with a required owning Operation, non-empty hook and call
+// identities, the closed status enum, and the status-owned member rules —
+// success carries exactly one complete JSON object and no error, while error
+// and interrupted carry a non-empty error and no arguments.
+func validateHookResultEntry(v hookResultEntry) error {
+	if err := validateHexID(v.SessionID, "session id"); err != nil {
+		return err
+	}
+	if err := validateHexID(v.EntryID, "entry id"); err != nil {
+		return err
+	}
+	if err := validateOperationIdentity(v.OperationID, "operation id"); err != nil {
+		return err
+	}
+	if v.HookID == "" {
+		return errors.New("hook id must be non-empty")
+	}
+	if err := validateOperationIdentity(v.ToolCallID, "hook result tool call id"); err != nil {
+		return err
+	}
+	switch v.Status {
+	case hookSucceeded:
+		if v.Error != "" {
+			return errors.New("successful hook result must not carry an error")
+		}
+		if _, err := decodePayloadObject(v.Arguments); err != nil {
+			return fmt.Errorf("successful hook result arguments must be one complete JSON object: %v", err)
+		}
+	case hookFailed, hookInterrupted:
+		if v.Error == "" {
+			return fmt.Errorf("%s hook result requires a non-empty error", v.Status)
+		}
+		if len(v.Arguments) > 0 {
+			return fmt.Errorf("%s hook result must not carry arguments", v.Status)
+		}
+	default:
+		return fmt.Errorf("hook result status %q is not one of success, error or interrupted", v.Status)
+	}
+	return nil
+}
+
 // encodeSignalEntry renders one signal entry payload directly from the
 // validated tagged value; its related-operation identity was validated as
 // part of that value.
@@ -1812,7 +1934,7 @@ func decodeOperationState(obj map[string]json.RawMessage) (OperationCurrentState
 
 // decodeActiveEffect reads one active effect with exact keys.
 func decodeActiveEffect(obj map[string]json.RawMessage) (ActiveEffect, error) {
-	if err := rejectUnknownMembers(obj, "kind", "result_entry_id", "tool_call_id"); err != nil {
+	if err := rejectUnknownMembers(obj, "kind", "result_entry_id", "tool_call_id", "hook_id"); err != nil {
 		return ActiveEffect{}, err
 	}
 	kind, err := stringMember(obj, "kind", true)
@@ -1827,7 +1949,11 @@ func decodeActiveEffect(obj map[string]json.RawMessage) (ActiveEffect, error) {
 	if err != nil {
 		return ActiveEffect{}, err
 	}
-	v := ActiveEffect{Kind: EffectKind(kind), ResultEntryID: resultEntryID, ToolCallID: toolCallID}
+	hookID, err := optionalNonEmptyString(obj, "hook_id")
+	if err != nil {
+		return ActiveEffect{}, err
+	}
+	v := ActiveEffect{Kind: EffectKind(kind), ResultEntryID: resultEntryID, ToolCallID: toolCallID, HookID: hookID}
 	if err := validateHexID(v.ResultEntryID, "active effect result entry id"); err != nil {
 		return ActiveEffect{}, err
 	}
@@ -1948,9 +2074,15 @@ func validateOperationState(v OperationCurrentState) error {
 			if v.ActiveEffect.ToolCallID != "" {
 				return errors.New("model active effect omits the tool call id")
 			}
+			if v.ActiveEffect.HookID != "" {
+				return errors.New("model active effect omits the hook id")
+			}
 		case EffectTool:
 			if v.ActiveEffect.ToolCallID == "" {
 				return errors.New("tool active effect requires its tool call id")
+			}
+			if v.ActiveEffect.HookID != "" {
+				return errors.New("tool active effect omits the hook id")
 			}
 			if len(v.PendingToolCalls) == 0 || v.ActiveEffect.ToolCallID != v.PendingToolCalls[0].CallID {
 				return errors.New("tool active effect must address the matching first pending call")
@@ -1958,8 +2090,18 @@ func validateOperationState(v OperationCurrentState) error {
 			if v.ActiveEffect.ResultEntryID != v.PendingToolCalls[0].ResultEntryID {
 				return errors.New("tool active effect must reserve the first pending call's result identity")
 			}
+		case EffectHook:
+			if v.ActiveEffect.ToolCallID == "" {
+				return errors.New("hook active effect requires its tool call id")
+			}
+			if v.ActiveEffect.HookID == "" {
+				return errors.New("hook active effect requires its hook id")
+			}
+			if len(v.PendingToolCalls) == 0 || v.ActiveEffect.ToolCallID != v.PendingToolCalls[0].CallID {
+				return errors.New("hook active effect must address the matching first pending call")
+			}
 		default:
-			return fmt.Errorf("active effect kind %q is not one of model or tool", v.ActiveEffect.Kind)
+			return fmt.Errorf("active effect kind %q is not one of model, tool or hook", v.ActiveEffect.Kind)
 		}
 	}
 	seenCalls := make(map[string]bool, len(v.PendingToolCalls))

@@ -146,6 +146,24 @@ func validSettlementEntry() operationSettlementEntry {
 	}
 }
 
+func validHookResultEntry(status hookResultStatus) hookResultEntry {
+	v := hookResultEntry{
+		SessionID:   testSessionID,
+		EntryID:     testEntryID,
+		OperationID: testOpID,
+		HookID:      "cap.hook.one",
+		ToolCallID:  "call-1",
+		Status:      status,
+	}
+	switch status {
+	case hookSucceeded:
+		v.Arguments = json.RawMessage(`{"x":1}`)
+	default:
+		v.Error = "hook broke"
+	}
+	return v
+}
+
 // --- wire mutation helpers --------------------------------------------------
 
 func wireObject(t *testing.T, raw json.RawMessage) map[string]json.RawMessage {
@@ -243,6 +261,22 @@ func TestEntryPayloadRoundTrip(t *testing.T) {
 			decode: func(env Entry) error { _, err := decodeSignalEntry(env); return err },
 		},
 		{
+			name: "hook_result success",
+			env:  Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryHookResult, Sequence: 1, CommittedAt: testTime},
+			encode: func() (json.RawMessage, error) {
+				return encodeHookResultEntry(validHookResultEntry(hookSucceeded))
+			},
+			decode: func(env Entry) error { _, err := decodeHookResultEntry(env); return err },
+		},
+		{
+			name: "hook_result interrupted",
+			env:  Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryHookResult, Sequence: 1, CommittedAt: testTime},
+			encode: func() (json.RawMessage, error) {
+				return encodeHookResultEntry(validHookResultEntry(hookInterrupted))
+			},
+			decode: func(env Entry) error { _, err := decodeHookResultEntry(env); return err },
+		},
+		{
 			name: "operation_settlement",
 			env:  Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryOperationSettlement, Sequence: 1, CommittedAt: testTime},
 			encode: func() (json.RawMessage, error) {
@@ -310,6 +344,13 @@ func TestEntryPayloadRejectsInvalidWire(t *testing.T) {
 			wrongValue: json.RawMessage(`[]`),
 			payload:    func() (json.RawMessage, error) { return encodeSignalEntry(validSignalEntry(testOpID)) },
 			decode:     func(env Entry) error { _, err := decodeSignalEntry(env); return err },
+		},
+		{
+			name:       "hook_result",
+			container:  "status",
+			wrongValue: json.RawMessage(`[]`),
+			payload:    func() (json.RawMessage, error) { return encodeHookResultEntry(validHookResultEntry(hookSucceeded)) },
+			decode:     func(env Entry) error { _, err := decodeHookResultEntry(env); return err },
 		},
 		{
 			name:       "operation_settlement",
@@ -388,6 +429,149 @@ func TestEntryPayloadOperationlessRules(t *testing.T) {
 	env.Payload = forced
 	if _, err := decodeAssistantEntry(env); err == nil {
 		t.Fatalf("operationless assistant with stored usage must be rejected")
+	}
+}
+
+// TestHookResultStatusRules proves the hook-result status-owned member rules:
+// success requires exactly one complete JSON object argument and forbids an
+// error; error and interrupted require a non-empty error and forbid
+// arguments; unknown statuses reject; and a hook result without an owning
+// Operation identity rejects.
+func TestHookResultStatusRules(t *testing.T) {
+	t.Run("success rules", func(t *testing.T) {
+		if _, err := encodeHookResultEntry(validHookResultEntry(hookSucceeded)); err != nil {
+			t.Fatalf("encode valid success: %v", err)
+		}
+		nonObject := validHookResultEntry(hookSucceeded)
+		nonObject.Arguments = json.RawMessage(`[1,2]`)
+		if _, err := encodeHookResultEntry(nonObject); err == nil {
+			t.Fatalf("array arguments must reject")
+		}
+		nullArguments := validHookResultEntry(hookSucceeded)
+		nullArguments.Arguments = json.RawMessage(`null`)
+		if _, err := encodeHookResultEntry(nullArguments); err == nil {
+			t.Fatalf("null arguments must reject")
+		}
+		withError := validHookResultEntry(hookSucceeded)
+		withError.Error = "boom"
+		if _, err := encodeHookResultEntry(withError); err == nil {
+			t.Fatalf("success with an error must reject")
+		}
+	})
+	t.Run("failure and interruption rules", func(t *testing.T) {
+		for _, status := range []hookResultStatus{hookFailed, hookInterrupted} {
+			if _, err := encodeHookResultEntry(validHookResultEntry(status)); err != nil {
+				t.Fatalf("encode valid %s: %v", status, err)
+			}
+			empty := validHookResultEntry(status)
+			empty.Error = ""
+			if _, err := encodeHookResultEntry(empty); err == nil {
+				t.Fatalf("%s without an error must reject", status)
+			}
+			withArguments := validHookResultEntry(status)
+			withArguments.Arguments = json.RawMessage(`{}`)
+			if _, err := encodeHookResultEntry(withArguments); err == nil {
+				t.Fatalf("%s with arguments must reject", status)
+			}
+		}
+	})
+	t.Run("unknown status", func(t *testing.T) {
+		if _, err := encodeHookResultEntry(validHookResultEntry("ok")); err == nil {
+			t.Fatalf("unknown status must reject")
+		}
+	})
+	t.Run("decode-side rejections", func(t *testing.T) {
+		raw, err := encodeHookResultEntry(validHookResultEntry(hookSucceeded))
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		for _, mutation := range []struct {
+			name    string
+			payload json.RawMessage
+		}{
+			{"empty hook id", setKey(raw, "hook_id", json.RawMessage(`""`))},
+			{"missing hook id", setKey(raw, "hook_id", nil)},
+			{"empty call id", setKey(raw, "tool_call_id", json.RawMessage(`""`))},
+			{"missing operation", setKey(raw, "operation_id", nil)},
+			{"arguments swapped onto failure", func() json.RawMessage {
+				failed := validHookResultEntry(hookFailed)
+				failedRaw, err := encodeHookResultEntry(failed)
+				if err != nil {
+					t.Fatalf("encode failed: %v", err)
+				}
+				return setKey(failedRaw, "arguments", json.RawMessage(`{}`))
+			}()},
+		} {
+			t.Run(mutation.name, func(t *testing.T) {
+				env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryHookResult, Sequence: 1, CommittedAt: testTime, Payload: mutation.payload}
+				if _, err := decodeHookResultEntry(env); err == nil {
+					t.Fatalf("expected rejection")
+				}
+			})
+		}
+	})
+}
+
+// TestHookActiveEffectCodecRules proves the active-effect codec rules: a hook
+// effect requires its hook ID and the matching first pending call, while the
+// model and tool effects forbid a hook ID.
+func TestHookActiveEffectCodecRules(t *testing.T) {
+	op := validOperationRecord()
+	assistant := validAssistantEntry(testOpID)
+	call := validToolCallRecord()
+	call.ResultEntryID = testResultID
+	assistant.ToolCalls = []toolCallRecord{call}
+	op.State.PendingToolCalls = []PendingToolCall{{
+		AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: testEntryID},
+		CallID:         "call-1",
+		ResultEntryID:  testResultID,
+	}}
+
+	valid := op
+	valid.State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one"}
+	if _, err := encodeOperationRegister(valid); err != nil {
+		t.Fatalf("encode valid hook effect: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		effect  ActiveEffect
+		wantErr string
+	}{
+		{"hook effect without a hook id", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1"}, "hook active effect requires its hook id"},
+		{"hook effect without a tool call id", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), HookID: "cap.hook.one"}, "hook active effect requires its tool call id"},
+		{"hook effect on a non-pending call", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-9", HookID: "cap.hook.one"}, "hook active effect must address the matching first pending call"},
+		{"model effect with a hook id", ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(9), HookID: "cap.hook.one"}, "model active effect omits the hook id"},
+		{"tool effect with a hook id", ActiveEffect{Kind: EffectTool, ResultEntryID: testResultID, ToolCallID: "call-1", HookID: "cap.hook.one"}, "tool active effect omits the hook id"},
+		{"unknown kind", ActiveEffect{Kind: "widget", ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one"}, `active effect kind "widget" is not one of model, tool or hook`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := op
+			bad.State.ActiveEffect = &tc.effect
+			if _, err := encodeOperationRegister(bad); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("encode = %v, want %q", err, tc.wantErr)
+			}
+			// decode-side: the persisted active_effect member with the same
+			// shape rejects through decodeOperationRegister; a null hook_id
+			// member (absence encodes by omission) rejects too.
+			raw, err := encodeOperationRegister(op)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			effectJSON, merr := json.Marshal(tc.effect)
+			if merr != nil {
+				t.Fatalf("marshal effect: %v", merr)
+			}
+			if tc.name == "hook effect without a hook id" {
+				effectJSON = json.RawMessage(`{"kind":"hook","result_entry_id":"` + hexID(9) + `","tool_call_id":"call-1","hook_id":null}`)
+			}
+			stateObj := mustState(t, raw)
+			patchedState := setKey(stateObj, "active_effect", effectJSON)
+			full := setKey(raw, "state", patchedState)
+			if _, err := decodeOperationRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: full}); err == nil {
+				t.Fatalf("expected rejection of %s", tc.name)
+			}
+		})
 	}
 }
 

@@ -3067,6 +3067,7 @@ type recoverOpState struct {
 		Kind          string `json:"kind"`
 		ResultEntryID string `json:"result_entry_id"`
 		ToolCallID    string `json:"tool_call_id"`
+		HookID        string `json:"hook_id"`
 	} `json:"active_effect"`
 	PendingToolCalls []struct {
 		CallID        string `json:"call_id"`
@@ -3230,8 +3231,8 @@ func seedRunningOperationShape(t *testing.T, store harness.Storage, activeEffect
 	if activeEffect == "model" && len(calls) > 0 {
 		t.Fatalf("a model effect admits no pending calls")
 	}
-	if activeEffect == "tool" && len(calls) == 0 {
-		t.Fatalf("a tool effect requires a first pending call")
+	if (activeEffect == "tool" || activeEffect == "hook") && len(calls) == 0 {
+		t.Fatalf("a %s effect requires a first pending call", activeEffect)
 	}
 	sessionID = newRawSessionID(t)
 	entryID, assistantID := newRawSessionID(t), newRawSessionID(t)
@@ -3248,6 +3249,9 @@ func seedRunningOperationShape(t *testing.T, store harness.Storage, activeEffect
 		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"model","result_entry_id":%q}`, modelReserved)
 	case "tool":
 		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"tool","result_entry_id":%q,"tool_call_id":%q}`, reserved[0], calls[0])
+	case "hook":
+		modelReserved = newRawSessionID(t) // the hook effect's own reserved result identity
+		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"hook","result_entry_id":%q,"tool_call_id":%q,"hook_id":"cap.hook.one"}`, modelReserved, calls[0])
 	}
 	pendingJSON := `,"pending_tool_calls":[]` // required member; empty arrays are non-null
 	if len(calls) > 0 {
@@ -3396,6 +3400,13 @@ func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, op
 		case harness.EntryToolResult:
 			if entry.ID != wantInterruptedResultIDs[i] {
 				t.Fatalf("interrupted result %d = %s, want the reserved identity %s", i, entry.ID, wantInterruptedResultIDs[i])
+			}
+			var wire struct {
+				Status  model.ToolResultStatus `json:"status"`
+				Content string                 `json:"content"`
+			}
+			if err := json.Unmarshal(entry.Payload, &wire); err != nil || wire.Status != model.ResultInterrupted || wire.Content != "Tool call interrupted." {
+				t.Fatalf("interrupted tool payload = %s, want the ordinary interrupted result", entry.Payload)
 			}
 		case harness.EntryOperationSettlement:
 			if entry.ID != settlementID {
@@ -3568,6 +3579,22 @@ func rawSignalPayload(sessionID, entryID, operationID string) string {
 		sessionID, entryID, operationID, sessionID, operationID)
 }
 
+// rawHookResultPayload builds one settled success hook-result entry payload
+// for one hook execution of the given call.
+func rawHookResultPayload(sessionID, entryID, operationID, hookID, callID string) string {
+	return fmt.Sprintf(
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"tool_call_id":%q,"status":"success","arguments":{"x":1}}`,
+		sessionID, entryID, operationID, hookID, callID)
+}
+
+// rawFailedHookResultPayload builds one settled failed or interrupted
+// hook-result entry payload carrying a non-empty error and no arguments.
+func rawFailedHookResultPayload(sessionID, entryID, operationID, hookID, callID, status, errText string) string {
+	return fmt.Sprintf(
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"tool_call_id":%q,"status":%q,"error":%q}`,
+		sessionID, entryID, operationID, hookID, callID, status, errText)
+}
+
 // rawSettlementPayload builds one successful settlement entry payload.
 func rawSettlementPayload(sessionID, entryID, operationID string) string {
 	return fmt.Sprintf(
@@ -3665,6 +3692,58 @@ func seedCorruptSiblingWithSignal(t *testing.T, store harness.Storage) string {
 	insertRawEntry(t, store, sessionID, signalID, "op-1", harness.EntrySignal, rawSignalPayload(sessionID, signalID, "op-1"))
 	insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "op-1"}, rawRunningOperationPayload(sessionID, "op-1", entryID))
 	return sessionID
+}
+
+// seedCorruptSiblingTwoCalls seeds the valid target graph with two published
+// calls left pending in publication order.
+func seedCorruptSiblingTwoCalls(t *testing.T, store harness.Storage) string {
+	t.Helper()
+	sessionID, _, _ := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1", "call-2"})
+	return sessionID
+}
+
+// seedCorruptSiblingHookResult seeds the valid target graph whose single
+// published call carries one settled success hook result between its
+// publishing assistant and the still-pending state.
+func seedCorruptSiblingHookResult(t *testing.T, store harness.Storage) string {
+	t.Helper()
+	sessionID, _, _ := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1"})
+	entries, err := store.ReadEntries(context.Background(), sessionID, 0)
+	if err != nil {
+		t.Fatalf("read seeded entries: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Kind == harness.EntryAssistant {
+			hookID := newRawSessionID(t)
+			insertRawEntry(t, store, sessionID, hookID, "op-1", harness.EntryHookResult,
+				rawHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1"))
+			return sessionID
+		}
+	}
+	t.Fatalf("seeded graph carries no assistant entry")
+	return ""
+}
+
+// seedCorruptSiblingFailedHook seeds the valid target graph whose single
+// published call carries one settled failed hook result between its
+// publishing assistant and the still-pending state.
+func seedCorruptSiblingFailedHook(t *testing.T, store harness.Storage) string {
+	t.Helper()
+	sessionID, _, _ := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1"})
+	entries, err := store.ReadEntries(context.Background(), sessionID, 0)
+	if err != nil {
+		t.Fatalf("read seeded entries: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Kind == harness.EntryAssistant {
+			hookID := newRawSessionID(t)
+			insertRawEntry(t, store, sessionID, hookID, "op-1", harness.EntryHookResult,
+				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "hook broke"))
+			return sessionID
+		}
+	}
+	t.Fatalf("seeded graph carries no assistant entry")
+	return ""
 }
 
 // seedCorruptSiblingSettled seeds the valid target graph of a successfully
@@ -4117,6 +4196,185 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 			},
 		},
 		{
+			name: "validator: hook result before its publishing assistant",
+			seed: seedCorruptSiblingPendingCall,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := newRawSessionID(t)
+				snap.entries = append(snap.entries, harness.Entry{
+					SessionID: sessionID, ID: hook, Sequence: 2, OperationID: "op-1",
+					Kind: harness.EntryHookResult, Payload: json.RawMessage(rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.one", "call-1")),
+				})
+			},
+		},
+		{
+			name: "validator: hook result after its call's terminal tool result",
+			seed: seedCorruptSiblingWithResult,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult,
+					rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.one", "call-1"))
+			},
+		},
+		{
+			name: "validator: duplicate hook result for one call",
+			seed: seedCorruptSiblingHookResult,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult,
+					rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.one", "call-1"))
+			},
+		},
+		{
+			name: "validator: hook result answers unpublished call",
+			seed: seedCorruptSiblingRunning,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult,
+					rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.one", "call-9"))
+			},
+		},
+		{
+			name: "validator: active hook effect repeats a settled hook",
+			seed: seedCorruptSiblingHookResult,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one"}`, corruptSiblingOtherEntry))
+				})
+			},
+		},
+		{
+			name: "validator: hook result after a failed hook for the same call",
+			seed: seedCorruptSiblingFailedHook,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult,
+					rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.two", "call-1"))
+			},
+		},
+		{
+			name: "validator: active hook effect after a failed hook",
+			seed: seedCorruptSiblingFailedHook,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.two"}`, corruptSiblingOtherEntry))
+				})
+			},
+		},
+		{
+			name: "validator: active tool effect after a failed hook",
+			seed: seedCorruptSiblingFailedHook,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"tool","result_entry_id":%q,"tool_call_id":"call-1"}`, snapReservedResultID(t, snap)))
+				})
+			},
+		},
+		{
+			name: "validator: interrupted hook with an error tool result",
+			seed: seedCorruptSiblingFailedHook,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := snapEntryOf(snap, harness.EntryHookResult)
+				hook.Payload = editPayloadObject(t, hook.Payload, func(obj map[string]json.RawMessage) {
+					obj["status"] = json.RawMessage(`"interrupted"`)
+				})
+				assistant := snapEntryOf(snap, harness.EntryAssistant)
+				reserved := snapReservedResultID(t, snap)
+				failed := editPayloadObject(t, json.RawMessage(rawToolResultPayload(sessionID, reserved, "op-1", assistant.ID, "call-1")), func(obj map[string]json.RawMessage) {
+					obj["status"] = json.RawMessage(`"error"`)
+					obj["content"] = json.RawMessage(`"hook broke"`)
+				})
+				snapAppendEntry(snap, sessionID, reserved, "op-1", harness.EntryToolResult, string(failed))
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["pending_tool_calls"] = json.RawMessage(`[]`)
+				})
+			},
+		},
+		{
+			name: "validator: error hook with a success tool result",
+			seed: seedCorruptSiblingFailedHook,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				assistant := snapEntryOf(snap, harness.EntryAssistant)
+				reserved := snapReservedResultID(t, snap)
+				snapAppendEntry(snap, sessionID, reserved, "op-1", harness.EntryToolResult,
+					rawToolResultPayload(sessionID, reserved, "op-1", assistant.ID, "call-1"))
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["pending_tool_calls"] = json.RawMessage(`[]`)
+				})
+			},
+		},
+		{
+			name: "validator: hook for a later call while an earlier call is unresolved",
+			seed: seedCorruptSiblingTwoCalls,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hookID := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hookID, "op-1", harness.EntryHookResult,
+					rawHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-2"))
+			},
+		},
+		{
+			name: "validator: hook for a later call before the earlier call's result",
+			seed: seedCorruptSiblingTwoCalls,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult,
+					rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.one", "call-2"))
+				assistant := snapEntryOf(snap, harness.EntryAssistant)
+				var wire struct {
+					ToolCalls []struct {
+						ID            string `json:"id"`
+						ResultEntryID string `json:"result_entry_id"`
+					} `json:"tool_calls"`
+				}
+				if err := json.Unmarshal(assistant.Payload, &wire); err != nil || len(wire.ToolCalls) != 2 {
+					t.Fatalf("seeded assistant has no two published calls: %v", err)
+				}
+				snapAppendEntry(snap, sessionID, wire.ToolCalls[0].ResultEntryID, "op-1", harness.EntryToolResult,
+					rawToolResultPayload(sessionID, wire.ToolCalls[0].ResultEntryID, "op-1", assistant.ID, "call-1"))
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["pending_tool_calls"] = json.RawMessage(fmt.Sprintf(
+						`[{"assistant_entry":{"session_id":%q,"entry_id":%q},"call_id":"call-2","result_entry_id":%q}]`,
+						sessionID, assistant.ID, wire.ToolCalls[1].ResultEntryID))
+				})
+			},
+		},
+		{
+			name: "validator: hook active effect reserves a pending tool-result identity",
+			seed: seedCorruptSiblingPendingCall,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				reserved := snapReservedResultID(t, snap)
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one"}`, reserved))
+				})
+			},
+		},
+		{
+			name: "validator: hook active effect reserves an already committed entry",
+			seed: seedCorruptSiblingPendingCall,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				input := snapEntryOf(snap, harness.EntryInput)
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one"}`, input.ID))
+				})
+			},
+		},
+		{
 			name: "validator: stored compaction record",
 			seed: seedCorruptSiblingRunning,
 			mutate: func(t *testing.T, snap *sessionSnapshot) {
@@ -4327,6 +4585,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 		{name: "assistant", seed: seedCorruptSiblingPendingCall, kind: harness.EntryAssistant, container: "source", wrong: `"prov/gpt-x"`},
 		{name: "tool_result", seed: seedCorruptSiblingWithResult, kind: harness.EntryToolResult, container: "assistant_entry", wrong: `"x"`},
 		{name: "signal", seed: seedCorruptSiblingWithSignal, kind: harness.EntrySignal, container: "related_operation", wrong: `[]`},
+		{name: "hook_result", seed: seedCorruptSiblingHookResult, kind: harness.EntryHookResult, container: "status", wrong: `[]`},
 		{name: "operation_settlement", seed: seedCorruptSiblingSettled, kind: harness.EntryOperationSettlement, container: "usage", wrong: `0`},
 	}
 	wireMutations := []struct {
@@ -5719,5 +5978,126 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 		if opens[2].SessionID != res.Session.Identity.SessionID {
 			t.Fatalf("fork open names session %q, want the destination", opens[2].SessionID)
 		}
+	})
+}
+
+// TestPublicRecoverHookShapes proves the two hook recovery transitions over
+// memory and temporary SQLite using the same public storage fixtures as the
+// plain recovery shapes: an active hook effect's recovery atomically commits
+// its reserved interrupted hook result, the pending calls' interrupted tool
+// results, and the Operation/Session settlement in one transaction — a failed
+// recovery publication rolls the whole transaction back — while a running
+// quiet gap preserves settled hook evidence and commits the interrupted tool
+// result without replaying the hook. Recovery runs before any Harness exists;
+// a Harness constructed afterwards materializes the repaired state, and a
+// second recovery run writes nothing.
+func TestPublicRecoverHookShapes(t *testing.T) {
+	t.Run("active hook effect settles its reserved interrupted result", func(t *testing.T) {
+		eachStore(t, func(t *testing.T, store harness.Storage) {
+			ctx := context.Background()
+			sessionID, hookReserved, pending := seedRunningOperationShape(t, store, "hook", "op-1", []string{"call-1"})
+			state := recoverOpStateAt(t, store, sessionID, "op-1")
+			if state.ActiveEffect == nil || state.ActiveEffect.Kind != "hook" ||
+				state.ActiveEffect.ResultEntryID != hookReserved || state.ActiveEffect.HookID != "cap.hook.one" ||
+				state.ActiveEffect.ToolCallID != "call-1" {
+				t.Fatalf("seeded operation = %+v, want the committed hook effect intent", state)
+			}
+
+			pre := recoverEntries(t, store, sessionID)
+			if err := harness.Recover(ctx, store); err != nil {
+				t.Fatalf("recover: %v", err)
+			}
+			// Recovery adds its reserved hook result before the ordinary
+			// interrupted-tool, signal and settlement tail.
+			entries := recoverEntries(t, store, sessionID)
+			if len(entries) <= len(pre) {
+				t.Fatal("recovery committed no hook result")
+			}
+			hook := entries[len(pre)]
+			if hook.Kind != harness.EntryHookResult || hook.ID != hookReserved {
+				t.Fatalf("recovery commit %s is %s, want the interrupted hook result under the reserved identity %s", hook.ID, hook.Kind, hookReserved)
+			}
+			var hookWire struct {
+				HookID     string `json:"hook_id"`
+				ToolCallID string `json:"tool_call_id"`
+				Status     string `json:"status"`
+				Error      string `json:"error"`
+			}
+			if err := json.Unmarshal(hook.Payload, &hookWire); err != nil {
+				t.Fatalf("decode hook result: %v", err)
+			}
+			if hookWire.HookID != "cap.hook.one" || hookWire.ToolCallID != "call-1" || hookWire.Status != "interrupted" ||
+				hookWire.Error != recoveredInterruptionDetail {
+				t.Fatalf("interrupted hook result = %+v, want the recovery-settled interrupted evidence", hookWire)
+			}
+			assertRecoveredOperation(t, store, sessionID, "op-1", append(pre, hook), "", pending)
+			assertRecoverIdempotent(t, store, sessionID, "op-1")
+
+			h := harnessOver(t, store)
+			if _, err := h.ReadOperation(ctx, sessionID, "op-1"); err != nil {
+				t.Fatalf("repaired operation does not materialize: %v", err)
+			}
+		})
+	})
+
+	t.Run("quiet gap preserves settled hook evidence without replay", func(t *testing.T) {
+		eachStore(t, func(t *testing.T, store harness.Storage) {
+			ctx := context.Background()
+			sessionID, _, pending := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1"})
+			hookID := newRawSessionID(t)
+			insertRawEntry(t, store, sessionID, hookID, "op-1", harness.EntryHookResult,
+				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "hook broke"))
+
+			pre := recoverEntries(t, store, sessionID)
+			if err := harness.Recover(ctx, store); err != nil {
+				t.Fatalf("recover: %v", err)
+			}
+			assertRecoveredOperation(t, store, sessionID, "op-1", pre, "", pending)
+			assertRecoverIdempotent(t, store, sessionID, "op-1")
+
+			h := harnessOver(t, store)
+			if _, err := h.ReadOperation(ctx, sessionID, "op-1"); err != nil {
+				t.Fatalf("repaired operation does not materialize: %v", err)
+			}
+		})
+	})
+
+	t.Run("failed recovery publication rolls back", func(t *testing.T) {
+		eachStore(t, func(t *testing.T, store harness.Storage) {
+			ctx := context.Background()
+			targetID, hookReserved, _ := seedRunningOperationShape(t, store, "hook", "op-1", []string{"call-1"})
+			before := snapshotSession(t, store, targetID)
+
+			// The probe performs the target's first recovery register
+			// replacement for real, then fails the transaction: every recovery
+			// commit must roll back together.
+			probed := &rollbackProbeStore{Storage: store, failReplace: true}
+			if err := harness.Recover(ctx, probed); !errors.Is(err, errInjectedRollback) {
+				t.Fatalf("recover with the injected publication failure = %v, want the injected rollback", err)
+			}
+			assertSessionUnchanged(t, store, targetID, before)
+
+			if err := harness.Recover(ctx, store); err != nil {
+				t.Fatalf("second recover: %v", err)
+			}
+			state := recoverOpStateAt(t, store, targetID, "op-1")
+			if state.Status != "interruption" || state.ActiveEffect != nil || state.Terminal == nil {
+				t.Fatalf("recovered state = %+v, want the terminal interruption", state)
+			}
+			entries := recoverEntries(t, store, targetID)
+			hookResults := 0
+			for _, entry := range entries {
+				if entry.Kind == harness.EntryHookResult {
+					hookResults++
+					if entry.ID != hookReserved {
+						t.Fatalf("hook result = %+v, want it under the reserved identity", entry)
+					}
+				}
+			}
+			if hookResults != 1 {
+				t.Fatalf("%d hook results after the retried recovery, want exactly the reserved interrupted one", hookResults)
+			}
+			assertRecoverIdempotent(t, store, targetID, "op-1")
+		})
 	})
 }

@@ -45,12 +45,25 @@ type PreparedExecution struct {
 	Open    func(context.Context, OperationAdmission) (Execution, error)
 }
 
+// ToolArgumentsHook is one effectful argument hook: before a concrete tool
+// call prepares, it may rewrite the call's raw argument bytes. Its successful
+// replacement must be exactly one JSON object the execution's normalizer
+// accepts; it can never replace the call identity, tool name, or another
+// call's arguments. Every execution is a Harness-settled Operation effect
+// with durable hook_result evidence. Run receives owned call data.
+type ToolArgumentsHook struct {
+	ID  string
+	Run func(context.Context, model.ToolCall) (json.RawMessage, error)
+}
+
 // Execution is one opened execution: the two process-local effect functions
 // the Harness drives, the Operation's resolved automatic permission policy,
-// the required pure argument-normalization callback, plus the cleanup of any
-// external resources backing them. A successful Model, Tool and NormalizeTool
-// must be non-nil; Close is optional when the concrete execution needs no
-// external disposal. The opener owns provisional cleanup on error.
+// the required pure argument-normalization callback, the selected argument
+// hooks, plus the cleanup of any external resources backing them. A
+// successful Model, Tool and NormalizeTool must be non-nil, and every ToolHooks
+// entry requires a non-empty unique ID and a non-nil Run; Close is optional
+// when the concrete execution needs no external disposal. The opener owns
+// provisional cleanup on error.
 type Execution struct {
 	Model agent.ModelEffect
 	Tool  func(context.Context, model.ToolCall) PreparedTool
@@ -63,7 +76,12 @@ type Execution struct {
 	// owned call and returns one owned JSON object preserving unrelated
 	// accepted fields; its error is a per-call validation failure.
 	NormalizeTool func(model.ToolCall) (json.RawMessage, error)
-	Close         func() error
+	// ToolHooks are the selected argument hooks in configured order. Each runs
+	// as its own effect after the advertisement gate and before concrete
+	// preparation; the first receives the original raw call arguments, every
+	// later one the preceding committed replacement.
+	ToolHooks []ToolArgumentsHook
+	Close     func() error
 }
 
 // ToolOutcome is one owned tool plan's complete outcome: the model-visible

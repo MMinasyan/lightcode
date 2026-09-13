@@ -195,7 +195,7 @@ func sqliteFixtureDatabase(t *testing.T, path string, ddl []string, version int)
 }
 
 // TestSQLiteSchemaInitialization proves a missing path is initialized with the
-// complete canonical schema in one shot: version 3, exactly the two canonical
+// complete canonical schema in one shot: version 4, exactly the two canonical
 // tables and the one explicit index, only the autoindexes implied by those
 // tables, a well-formed image, no sidecars after close, and no partial file
 // when initialization fails.
@@ -213,8 +213,8 @@ func TestSQLiteSchemaInitialization(t *testing.T) {
 	}
 
 	var version int
-	if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil || version != 3 {
-		t.Fatalf("PRAGMA user_version = %d (error %v), want 3", version, err)
+	if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil || version != 4 {
+		t.Fatalf("PRAGMA user_version = %d (error %v), want 4", version, err)
 	}
 
 	objects := map[string]string{}
@@ -298,8 +298,8 @@ func TestSQLiteSchemaInitialization(t *testing.T) {
 		t.Fatalf("OpenSQLite zero-length file: %v", err)
 	}
 	var emptyVersion int
-	if err := emptyStore.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&emptyVersion); err != nil || emptyVersion != 3 {
-		t.Errorf("zero-length file user_version = %d (error %v), want 3", emptyVersion, err)
+	if err := emptyStore.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&emptyVersion); err != nil || emptyVersion != 4 {
+		t.Errorf("zero-length file user_version = %d (error %v), want 4", emptyVersion, err)
 	}
 	if err := emptyStore.Close(); err != nil {
 		t.Fatalf("close zero-length store: %v", err)
@@ -314,8 +314,8 @@ func TestSQLiteSchemaInitialization(t *testing.T) {
 		t.Fatalf("OpenSQLite reserved URI path: %v", err)
 	}
 	var reservedVersion int
-	if err := reservedStore.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&reservedVersion); err != nil || reservedVersion != 3 {
-		t.Errorf("reserved-path user_version = %d (error %v), want 3", reservedVersion, err)
+	if err := reservedStore.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&reservedVersion); err != nil || reservedVersion != 4 {
+		t.Errorf("reserved-path user_version = %d (error %v), want 4", reservedVersion, err)
 	}
 	if err := reservedStore.Close(); err != nil {
 		t.Fatalf("close reserved-path store: %v", err)
@@ -454,8 +454,8 @@ func TestSQLiteRejectsNonEmptyVersionZero(t *testing.T) {
 	if !errors.As(err, &incompatible) {
 		t.Fatalf("error = %T, want *harness.IncompatibleSchemaError", err)
 	}
-	if incompatible.Found != 0 || incompatible.Supported != 3 {
-		t.Errorf("recovered %+v, want found 0 supported 3", incompatible)
+	if incompatible.Found != 0 || incompatible.Supported != 4 {
+		t.Errorf("recovered %+v, want found 0 supported 4", incompatible)
 	}
 	if store != nil {
 		t.Error("rejected database returned a store")
@@ -467,13 +467,13 @@ func TestSQLiteRejectsNonEmptyVersionZero(t *testing.T) {
 }
 
 // TestSQLiteRejectsPriorVersion proves a database left at the prior schema
-// version 2 — the pre-capture-members shape with the unchanged canonical tables — is
-// rejected through the read-only open phase with the incompatible class
-// before recovery ever sees the store, leaving the file byte-identical with
-// no sidecars.
+// version 3 — the pre-hook-result-payload shape with the unchanged canonical
+// tables — is rejected through the read-only open phase with the incompatible
+// class before recovery ever sees the store, leaving the file byte-identical
+// with no sidecars.
 func TestSQLiteRejectsPriorVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "prior.db")
-	sqliteFixtureDatabase(t, path, []string{sqliteEntriesDDL, sqliteRegistersDDL, sqliteOperationIndexDDL}, 2)
+	sqliteFixtureDatabase(t, path, []string{sqliteEntriesDDL, sqliteRegistersDDL, sqliteOperationIndexDDL}, 3)
 	before := sqliteFileDigest(t, path)
 
 	store, err := OpenSQLite(path)
@@ -481,8 +481,8 @@ func TestSQLiteRejectsPriorVersion(t *testing.T) {
 		t.Fatalf("error = %v, want ErrIncompatible", err)
 	}
 	var incompatible *harness.IncompatibleSchemaError
-	if !errors.As(err, &incompatible) || incompatible.Found != 2 || incompatible.Supported != 3 {
-		t.Errorf("recovered %+v, want found 2 supported 3", incompatible)
+	if !errors.As(err, &incompatible) || incompatible.Found != 3 || incompatible.Supported != 4 {
+		t.Errorf("recovered %+v, want found 3 supported 4", incompatible)
 	}
 	if store != nil {
 		t.Error("rejected prior-version database returned a store")
@@ -494,11 +494,11 @@ func TestSQLiteRejectsPriorVersion(t *testing.T) {
 }
 
 // TestSQLiteRejectsUnsupportedVersion proves a database with a future schema
-// version beyond the accepted 3 is rejected without any file or sidecar
+// version beyond the accepted 4 is rejected without any file or sidecar
 // change.
 func TestSQLiteRejectsUnsupportedVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "future.db")
-	sqliteFixtureDatabase(t, path, []string{sqliteEntriesDDL, sqliteRegistersDDL, sqliteOperationIndexDDL}, 4)
+	sqliteFixtureDatabase(t, path, []string{sqliteEntriesDDL, sqliteRegistersDDL, sqliteOperationIndexDDL}, 5)
 	before := sqliteFileDigest(t, path)
 
 	_, err := OpenSQLite(path)
@@ -506,16 +506,16 @@ func TestSQLiteRejectsUnsupportedVersion(t *testing.T) {
 		t.Fatalf("error = %v, want ErrIncompatible", err)
 	}
 	var incompatible *harness.IncompatibleSchemaError
-	if !errors.As(err, &incompatible) || incompatible.Found != 4 || incompatible.Supported != 3 {
-		t.Errorf("recovered %+v, want found 4 supported 3", incompatible)
+	if !errors.As(err, &incompatible) || incompatible.Found != 5 || incompatible.Supported != 4 {
+		t.Errorf("recovered %+v, want found 5 supported 4", incompatible)
 	}
 	if after := sqliteFileDigest(t, path); after != before {
-		t.Error("rejected version-4 database file changed")
+		t.Error("rejected version-5 database file changed")
 	}
 	sqliteAssertNoSidecars(t, path)
 
-	// Unsupported hot-WAL sibling: version 4 lives only in an uncheckpointed
-	// WAL beside a checkpointed version 3 main file, with no SHM file — the
+	// Unsupported hot-WAL sibling: version 5 lives only in an uncheckpointed
+	// WAL beside a checkpointed version 4 main file, with no SHM file — the
 	// crashed-writer state. Read-only validation must see the WAL-carried
 	// version and reject the copy while leaving the database and WAL bytes
 	// unchanged; a SQLite-owned -shm WAL index may appear and remain.
@@ -524,13 +524,13 @@ func TestSQLiteRejectsUnsupportedVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open WAL source: %v", err)
 	}
-	if _, err := live.Exec(`PRAGMA user_version = 3`); err != nil {
+	if _, err := live.Exec(`PRAGMA user_version = 4`); err != nil {
 		t.Fatalf("checkpointed version: %v", err)
 	}
 	if _, err := live.Exec(`PRAGMA wal_checkpoint(FULL)`); err != nil {
-		t.Fatalf("checkpoint version 3: %v", err)
+		t.Fatalf("checkpoint version 4: %v", err)
 	}
-	if _, err := live.Exec(`PRAGMA user_version = 4`); err != nil {
+	if _, err := live.Exec(`PRAGMA user_version = 5`); err != nil {
 		t.Fatalf("hot version: %v", err)
 	}
 	mainBytes, err := os.ReadFile(source)
@@ -559,8 +559,8 @@ func TestSQLiteRejectsUnsupportedVersion(t *testing.T) {
 		t.Fatalf("error = %v, want ErrIncompatible", err)
 	}
 	var walIncompatible *harness.IncompatibleSchemaError
-	if !errors.As(err, &walIncompatible) || walIncompatible.Found != 4 || walIncompatible.Supported != 3 {
-		t.Errorf("recovered %+v, want the WAL-carried version found 4 supported 3", walIncompatible)
+	if !errors.As(err, &walIncompatible) || walIncompatible.Found != 5 || walIncompatible.Supported != 4 {
+		t.Errorf("recovered %+v, want the WAL-carried version found 5 supported 4", walIncompatible)
 	}
 	if crashedStore != nil {
 		t.Error("rejected WAL-mode database returned a store")
@@ -602,7 +602,7 @@ ON registers(operation_id) WHERE kind = 'operation'`
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "schema.db")
-			sqliteFixtureDatabase(t, path, ddl, 3)
+			sqliteFixtureDatabase(t, path, ddl, 4)
 			store, err := OpenSQLite(path)
 			if !errors.Is(err, harness.ErrIncompatible) {
 				t.Fatalf("error = %v, want ErrIncompatible", err)
@@ -611,8 +611,8 @@ ON registers(operation_id) WHERE kind = 'operation'`
 			if !errors.As(err, &incompatible) {
 				t.Fatalf("error = %T, want *harness.IncompatibleSchemaError", err)
 			}
-			if incompatible.Found != 3 || incompatible.Supported != 3 {
-				t.Errorf("recovered %+v, want found 3 supported 3", incompatible)
+			if incompatible.Found != 4 || incompatible.Supported != 4 {
+				t.Errorf("recovered %+v, want found 4 supported 4", incompatible)
 			}
 			if store != nil {
 				t.Error("rejected database returned a store")
@@ -695,7 +695,7 @@ func TestSQLitePersistenceAcrossCloseReopen(t *testing.T) {
 		sqliteEntriesDDL,
 		sqliteRegistersDDL,
 		sqliteOperationIndexDDL,
-		`PRAGMA user_version = 3`,
+		`PRAGMA user_version = 4`,
 		`INSERT INTO registers (session_id, kind, operation_id, revision, payload) VALUES ('s1', 'session', '', 1, '{"session":"s1"}')`,
 		`INSERT INTO entries (session_id, sequence, entry_id, operation_id, kind, committed_at_ns, payload) VALUES ('s1', 1, 'e1', '', 'input', 1700000000000000000, '{"entry":"e1"}')`,
 	} {

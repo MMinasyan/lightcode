@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -50,6 +51,21 @@ type PreparationHook interface {
 // preparationHookType is the declared-type test one selected capability must
 // satisfy to be bound and invoked as a preparation hook.
 var preparationHookType = reflect.TypeFor[PreparationHook]()
+
+// ToolArgumentsHook is one effectful argument-repair capability: before a
+// concrete tool call prepares, it may rewrite the call's raw argument bytes.
+// Its successful replacement must be exactly one JSON object the execution's
+// normalizer accepts; it can never replace the call identity, tool name, or
+// another call's arguments. Each execution is a Harness-settled Operation
+// effect with durable evidence; the hook itself receives owned call data and
+// the same captured Invocation, and any of the four scopes may supply one.
+type ToolArgumentsHook interface {
+	BeforeTool(context.Context, Invocation, model.ToolCall) (json.RawMessage, error)
+}
+
+// toolArgumentsHookType is the declared-type test one selected capability
+// must satisfy to be bound and invoked as an argument hook.
+var toolArgumentsHookType = reflect.TypeFor[ToolArgumentsHook]()
 
 // preparation supplies the existing Harness preparation contract for every
 // admission producer: root, queued delivery and Fork all bind through the one
@@ -193,6 +209,10 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	if err != nil {
 		return unwind(err, release)
 	}
+	hooks, err := bindToolArgumentHooks(agent.Capabilities, bindings, Invocation{snapshot: snapshot})
+	if err != nil {
+		return unwind(err, release)
+	}
 	execution, err := opener(callCtx, admission, selection{agent: agent, bindings: bindings, invocation: Invocation{snapshot: snapshot}})
 	if err != nil {
 		return unwind(err, release)
@@ -207,11 +227,37 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 		Tool:          execution.Tool,
 		Permissions:   execution.Permissions,
 		NormalizeTool: execution.NormalizeTool,
+		ToolHooks:     hooks,
 		Close: func() error {
 			release()
 			return errors.Join(agentScope.close(), operation.close())
 		},
 	}, nil
+}
+
+// bindToolArgumentHooks binds, in the Agent's selected capability order and
+// only after all execution scopes opened, every selected binding whose
+// declared type implements ToolArgumentsHook — from any supplying scope. IDs
+// are the capability IDs, and each hook receives the same captured Invocation.
+func bindToolArgumentHooks(selected []string, bindings Bindings, invocation Invocation) ([]harness.ToolArgumentsHook, error) {
+	var hooks []harness.ToolArgumentsHook
+	for _, id := range selected {
+		entry, ok := bindings.entries[id]
+		if !ok || !entry.declared.Implements(toolArgumentsHookType) {
+			continue
+		}
+		hook, err := Bind[ToolArgumentsHook](bindings, id)
+		if err != nil {
+			return nil, err
+		}
+		hooks = append(hooks, harness.ToolArgumentsHook{
+			ID: id,
+			Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
+				return hook.BeforeTool(ctx, invocation, call)
+			},
+		})
+	}
+	return hooks, nil
 }
 
 // requireCatalogModel admits only a selected model that resolves in the
