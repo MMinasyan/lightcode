@@ -14,6 +14,7 @@ import (
 	"testing/synctest"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/model"
 )
 
 // Composition fixtures: capability contracts and services defined here, not
@@ -1027,5 +1028,167 @@ func TestAcceptSettingsAppliesTheNoSettingsRule(t *testing.T) {
 	}
 	if string(caller) != `{"a":"12345"}` {
 		t.Fatalf("caller bytes after validator scratch = %s, want unchanged", caller)
+	}
+}
+
+// noopTool is a concrete Tool implementation for declaration tests; no
+// factory needs to run for its declaration metadata to exist.
+type noopTool struct{}
+
+func (noopTool) Normalize(ToolContext, model.ToolCall) (json.RawMessage, error) { return nil, nil }
+
+func (noopTool) Prepare(context.Context, ToolContext, model.ToolCall) harness.PreparedTool {
+	return harness.PreparedTool{}
+}
+
+// staticToolDescription returns a pure describe function for one declared
+// tool ID, carrying a minimal valid definition under that same name.
+func staticToolDescription(id string) func(Invocation, ToolConstraints) (ToolDescription, error) {
+	return func(Invocation, ToolConstraints) (ToolDescription, error) {
+		return ToolDescription{Definition: model.ToolDefinition{Name: id, Parameters: json.RawMessage(`{}`)}}, nil
+	}
+}
+
+// countingOpen returns a plugin Open that counts factory runs.
+func countingOpen(counter *int) func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+	return func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		*counter++
+		return Instance{}, nil
+	}
+}
+
+// TestCompositionRejectsToolDeclarationWithoutDescription proves the Tool
+// Provides row: a declaration carrying the Tool interface type without its
+// pure description function — via the bare Spec[Tool] provides form or a nil
+// ToolSpec function — rejects the whole set before any factory runs, while
+// the same interface stays an ordinary Requires declaration: with a valid
+// ToolSpec provider the Requires-only set composes.
+func TestCompositionRejectsToolDeclarationWithoutDescription(t *testing.T) {
+	noop := func(context.Context, ScopeInfo, Bindings) (Instance, error) { return Instance{}, nil }
+	for _, row := range []struct {
+		name    string
+		plugins []Plugin
+	}{
+		{"Spec[Tool] provides", []Plugin{{ID: "tools", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[Tool]("tool.x")}, Open: noop}}},
+		{"ToolSpec with a nil function", []Plugin{{ID: "tools", Scope: ScopeRuntime, Provides: []CapabilitySpec{ToolSpec("tool.x", nil)}, Open: noop}}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			if _, err := newComposition(row.plugins); !errors.Is(err, ErrComposition) {
+				t.Fatalf("newComposition error = %v, want ErrComposition", err)
+			}
+		})
+	}
+	// The ordinary sibling: requiring the Tool interface is the ordinary
+	// Requires declaration. The consumer's own export is a non-tool type, so
+	// the missing-description guard stays isolated to the rejection rows.
+	consumer := Plugin{ID: "consumer", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter]("consumer.greet")},
+		Requires: []CapabilitySpec{Spec[Tool]("tool.x")},
+		Open: func(_ context.Context, _ ScopeInfo, bindings Bindings) (Instance, error) {
+			if _, err := Bind[Tool](bindings, "tool.x"); err != nil {
+				return Instance{}, err
+			}
+			return Instance{Values: map[string]any{"consumer.greet": loudGreeter{word: "hi"}}}, nil
+		}}
+	provider := Plugin{ID: "tools", Scope: ScopeRuntime,
+		Provides: []CapabilitySpec{ToolSpec("tool.x", staticToolDescription("tool.x"))}, Open: noop}
+	if _, err := newComposition([]Plugin{provider, consumer}); err != nil {
+		t.Fatalf("Requires-side composition error = %v, want the ordinary Requires declaration to compose", err)
+	}
+}
+
+// TestToolDeclarationsComposeAtAllScopes proves a tool provider may use any
+// of the four scopes and its declaration ID joins the tool universe in
+// registration order without running any factory.
+func TestToolDeclarationsComposeAtAllScopes(t *testing.T) {
+	describe := func(Invocation, ToolConstraints) (ToolDescription, error) {
+		return ToolDescription{}, nil
+	}
+	var opened int
+	open := countingOpen(&opened)
+	plugins := make([]Plugin, 0, 4)
+	wantIDs := make([]string, 0, 4)
+	for kind, id := range map[ScopeKind]string{
+		ScopeRuntime:   "tool.rt",
+		ScopeWorkspace: "tool.ws",
+		ScopeOperation: "tool.op",
+		ScopeAgent:     "tool.ag",
+	} {
+		plugins = append(plugins, Plugin{ID: "p-" + string(kind), Scope: kind,
+			Provides: []CapabilitySpec{ToolSpec(id, describe)}, Open: open})
+		wantIDs = append(wantIDs, id)
+	}
+	c := mustComposition(t, plugins...)
+	for kind := range map[ScopeKind]string{
+		ScopeRuntime: "", ScopeWorkspace: "", ScopeOperation: "", ScopeAgent: "",
+	} {
+		if got := len(c.plan[kind]); got != 1 {
+			t.Fatalf("%s plan holds %d plugins, want 1", kind, got)
+		}
+	}
+	slices.Sort(wantIDs)
+	gotIDs := append([]string(nil), c.toolIDs...)
+	slices.Sort(gotIDs)
+	if !slices.Equal(gotIDs, wantIDs) {
+		t.Fatalf("tool universe = %v, want every declared tool ID %v", gotIDs, wantIDs)
+	}
+	if opened != 0 {
+		t.Fatalf("%d factories ran during declaration validation", opened)
+	}
+}
+
+// TestToolSpecDescribeValidatesAndCopies proves the recorded description
+// contract: the describe function receives the same Invocation and
+// constraints unchanged, its returned definition is validated and copied
+// with the ID/name match enforced, its error propagates, and the returned
+// bytes are owned by the caller.
+func TestToolSpecDescribeValidatesAndCopies(t *testing.T) {
+	var gotInvocation Invocation
+	var gotConstraints ToolConstraints
+	source := model.ToolDefinition{Name: "tool.x", Description: "reads", Parameters: json.RawMessage(`{"a":1}`)}
+	describe := func(invocation Invocation, constraints ToolConstraints) (ToolDescription, error) {
+		gotInvocation, gotConstraints = invocation, constraints
+		return ToolDescription{Definition: source, Available: true, DefaultHidden: true}, nil
+	}
+	spec := ToolSpec("tool.x", describe)
+
+	wantInvocation := Invocation{}
+	wantConstraints := ToolConstraints{Readonly: true, WriteDir: "/w"}
+	description, err := spec.describe(wantInvocation, wantConstraints)
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	if gotInvocation.Revision() != wantInvocation.Revision() || gotConstraints != wantConstraints {
+		t.Fatalf("describe inputs = (%q, %+v), want the supplied invocation and constraints echoed", gotInvocation.Revision(), gotConstraints)
+	}
+	if !description.Available || !description.DefaultHidden || description.Definition.Description != "reads" || description.Definition.Name != "tool.x" {
+		t.Fatalf("description = %+v, want the flags and validated definition passed through", description)
+	}
+	// The returned definition is an owned copy in both directions.
+	source.Parameters = json.RawMessage(`{"a":2}`)
+	if string(description.Definition.Parameters) != `{"a":1}` {
+		t.Fatalf("returned parameters = %s, want the copied bytes", description.Definition.Parameters)
+	}
+	description.Definition.Parameters = json.RawMessage(`{"a":3}`)
+	if string(source.Parameters) != `{"a":2}` {
+		t.Fatalf("source parameters = %s, want the returned copy owned by the caller", source.Parameters)
+	}
+
+	mismatch := ToolSpec("tool.y", func(Invocation, ToolConstraints) (ToolDescription, error) {
+		return ToolDescription{Definition: model.ToolDefinition{Name: "other", Parameters: json.RawMessage(`{}`)}}, nil
+	})
+	if _, err := mismatch.describe(Invocation{}, ToolConstraints{}); err == nil || !strings.Contains(err.Error(), "tool.y") {
+		t.Fatalf("mismatched describe error = %v, want the ID/name match rejection", err)
+	}
+	invalid := ToolSpec("tool.x", func(Invocation, ToolConstraints) (ToolDescription, error) {
+		return ToolDescription{Definition: model.ToolDefinition{Name: "tool.x", Parameters: json.RawMessage(`[1]`)}}, nil
+	})
+	if _, err := invalid.describe(Invocation{}, ToolConstraints{}); err == nil {
+		t.Fatal("invalid parameters accepted by the recorded description")
+	}
+	failing := ToolSpec("tool.x", func(Invocation, ToolConstraints) (ToolDescription, error) {
+		return ToolDescription{}, errValidator
+	})
+	if _, err := failing.describe(Invocation{}, ToolConstraints{}); !errors.Is(err, errValidator) {
+		t.Fatalf("describe failure = %v, want the source error", err)
 	}
 }

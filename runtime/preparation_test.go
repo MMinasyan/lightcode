@@ -400,7 +400,7 @@ func (e *prepEnv) plugins() []Plugin {
 		{
 			ID:       "hooks",
 			Scope:    ScopeRuntime,
-			Provides: []CapabilitySpec{Spec[PreparationHook]("hook.first"), Spec[PreparationHook]("hook.second"), Spec[ToolArgumentsHook]("arg.runtime")},
+			Provides: []CapabilitySpec{Spec[PreparationHook]("hook.first"), Spec[PreparationHook]("hook.second"), Spec[ToolArgumentsHook]("arg.runtime"), ToolSpec("echo", staticToolDescription("echo")), ToolSpec("read", staticToolDescription("read"))},
 			ValidateConfig: func(raw json.RawMessage) error {
 				var settings struct {
 					Tag string `json:"tag"`
@@ -412,7 +412,7 @@ func (e *prepEnv) plugins() []Plugin {
 			},
 			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 				e.hookOpens.Add(1)
-				return Instance{Values: map[string]any{"hook.first": e.hooks[0], "hook.second": e.hooks[1], "arg.runtime": e.argHooks[0]}}, nil
+				return Instance{Values: map[string]any{"hook.first": e.hooks[0], "hook.second": e.hooks[1], "arg.runtime": e.argHooks[0], "echo": noopTool{}, "read": noopTool{}}}, nil
 			},
 		},
 		{

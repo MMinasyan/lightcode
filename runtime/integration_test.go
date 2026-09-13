@@ -39,8 +39,8 @@ func integratedConfigDocument(tag, label string) string {
 // is not in the ordinary capability universe, so the definition drops and the
 // type is unknown at admission — raw storage is never exported into execution.
 const integratedAgentsDocument = `{
-  "integrated": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "dep.worker"]},
-  "leaky": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["session_store"]}
+  "integrated": {"model": "prov/m", "system_prompt": "simple", "capabilities": ["hook.first", "dep.worker"]},
+  "leaky": {"model": "prov/m", "system_prompt": "simple", "capabilities": ["session_store"]}
 }`
 
 type combinedBase struct{}

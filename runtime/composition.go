@@ -66,10 +66,13 @@ type ScopeInfo struct {
 }
 
 // CapabilitySpec pairs one capability lookup ID with its Go type. The ID is
-// the only lookup key; type metadata never leaves the declaration.
+// the only lookup key; type metadata never leaves the declaration. A spec
+// declared as exactly the Tool interface additionally carries its pure
+// description function, recorded by ToolSpec and mandatory there.
 type CapabilitySpec struct {
-	id  string
-	typ reflect.Type
+	id       string
+	typ      reflect.Type
+	describe func(Invocation, ToolConstraints) (ToolDescription, error)
 }
 
 // Spec declares the capability contract named id for the Go type T. It serves
@@ -209,11 +212,13 @@ type coreExportDecl struct {
 // composition is the validated static plugin set: an owned declaration copy,
 // per-scope construction plans in stable topological order (registration
 // order breaks ties), the ordinary capability universe excluding Core
-// storage exports, and the storage export declarations.
+// storage exports, the tool-declaration universe feeding the agent parser,
+// and the storage export declarations.
 type composition struct {
 	plugins       []Plugin
 	plan          map[ScopeKind][]Plugin
 	capabilityIDs []string
+	toolIDs       []string
 	coreExports   []coreExportDecl
 }
 
@@ -222,8 +227,9 @@ type composition struct {
 // at least one provider, unique nonempty export IDs globally and unique
 // nonempty dependency IDs per plugin, assignable provider types,
 // lifetime-compatible PreparationHook declarations (Runtime or Workspace
-// scope only), same-or-longer-lived dependency scopes, and an acyclic
-// dependency graph. An ordinary dependency on an ID reserved by a Core
+// scope only), Tool declarations carrying their description functions, and
+// same-or-longer-lived dependency scopes and an acyclic dependency graph. An
+// ordinary dependency on an ID reserved by a Core
 // storage export is a plain missing binding and is rejected.
 func newComposition(plugins []Plugin) (*composition, error) {
 	owned := make([]Plugin, len(plugins))
@@ -242,6 +248,7 @@ func newComposition(plugins []Plugin) (*composition, error) {
 	ordinary := make(map[string]exportSource)
 	seenPluginIDs := make(map[string]bool)
 	var capabilityIDs []string
+	var toolIDs []string
 	var coreExports []coreExportDecl
 	for i, p := range owned {
 		if p.ID == "" {
@@ -274,6 +281,9 @@ func newComposition(plugins []Plugin) (*composition, error) {
 			if prov.id == "" {
 				return nil, fmt.Errorf("plugin %q: empty provided capability ID: %w", p.ID, ErrComposition)
 			}
+			if prov.typ == toolType && prov.describe == nil {
+				return nil, fmt.Errorf("plugin %q: capability %q declared as Tool lacks its description function: %w", p.ID, prov.id, ErrComposition)
+			}
 			if src, dup := all[prov.id]; dup {
 				return nil, fmt.Errorf("plugin %q: capability %q already exported by %q: %w", p.ID, prov.id, owned[src.plugin].ID, ErrComposition)
 			}
@@ -286,6 +296,9 @@ func newComposition(plugins []Plugin) (*composition, error) {
 			} else {
 				ordinary[prov.id] = exportSource{plugin: i, spec: prov}
 				capabilityIDs = append(capabilityIDs, prov.id)
+				if prov.typ == toolType {
+					toolIDs = append(toolIDs, prov.id)
+				}
 			}
 		}
 	}
@@ -355,6 +368,7 @@ func newComposition(plugins []Plugin) (*composition, error) {
 		plugins:       owned,
 		plan:          plan,
 		capabilityIDs: capabilityIDs,
+		toolIDs:       toolIDs,
 		coreExports:   coreExports,
 	}, nil
 }

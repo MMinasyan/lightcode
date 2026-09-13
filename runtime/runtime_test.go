@@ -32,7 +32,7 @@ const ownerConfigDocument = `{"providers":{"prov":{"transport":{"base_url":"http
 
 const ownerGatedConfigDocument = `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"plugins":{"gate":{}}}`
 
-const ownerAgentsDocument = `{"solo":{"model":"prov/m","system_prompt":"simple","tools":["echo"]}}`
+const ownerAgentsDocument = `{"solo":{"model":"prov/m","system_prompt":"simple"}}`
 
 type ownerEnv struct {
 	t              *testing.T

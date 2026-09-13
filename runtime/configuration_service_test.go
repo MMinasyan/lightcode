@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,7 +17,10 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/model"
 )
 
 // serviceHarness roots one configurationService test at a scratch HOME and a
@@ -793,5 +797,210 @@ func TestConfigurationServiceRestartsGenerationWithFreshCaptures(t *testing.T) {
 	}
 	if (Invocation{snapshot: before}).Revision() != "1" || snapshotModelName(before, "prov", "m") != "One" {
 		t.Fatal("the old-lifetime capture changed after the restart")
+	}
+}
+
+const captureGlobalAllow = `{"rules":[{"permission":"file.write","target":"*","access":"allow"}]}`
+
+func captureConfigDoc() string {
+	return `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"One","context_window":100}}}},"permissions":` + captureGlobalAllow + `}`
+}
+
+// TestConfigurationServiceCapturesWorkspacePermissions proves the
+// permission-inventory rows over startup and reload: a missing inventory is
+// the fresh-install absent case, a present readable file is captured and
+// resolved against the captured global member, files added, changed or
+// removed later require Reload, the earlier revision keeps its complete old
+// capture, an unreadable file is absent policy for its Workspace alone, a
+// malformed file is built-in fallback without failing publication, and a
+// failed inventory enumeration leaves the whole Workspace level absent.
+func TestConfigurationServiceCapturesWorkspacePermissions(t *testing.T) {
+	h := newServiceHarness(t)
+	t.Setenv("HOME", h.home)
+	writeServiceFile(t, h.configPath, captureConfigDoc())
+	svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, nil))
+
+	var builtin harness.PermissionPolicy
+	globalOnly := harness.ResolvePermissionPolicy(json.RawMessage(captureGlobalAllow), nil)
+
+	// Startup on a fresh machine: no projects inventory, the Workspace level
+	// absent and the captured global member deciding.
+	first, err := svc.publish(context.Background())
+	if err != nil {
+		t.Fatalf("fresh-install publish: %v", err)
+	}
+	if got := first.permissionPolicy("/ws"); !reflect.DeepEqual(got, globalOnly) {
+		t.Fatalf("fresh-install policy = %#v, want the global-only capture", got)
+	}
+
+	// A later file requires Reload: the old revision is untouched and the
+	// reload resolves the workspace rule over the captured global member.
+	dirID, err := config.WorkspacePermissionDirID("/ws")
+	if err != nil {
+		t.Fatalf("WorkspacePermissionDirID: %v", err)
+	}
+	permissionPath := filepath.Join(h.home, ".lightcode", "projects", dirID, "permissions.json")
+	writeServiceFile(t, permissionPath, `{"rules":[{"permission":"file.write","target":"*","access":"deny"}]}`)
+	if got := first.permissionPolicy("/ws"); !reflect.DeepEqual(got, globalOnly) {
+		t.Fatalf("policy changed without Reload: %#v", got)
+	}
+	second, err := svc.publish(context.Background())
+	if err != nil {
+		t.Fatalf("reload with the added file: %v", err)
+	}
+	want := harness.ResolvePermissionPolicy(json.RawMessage(captureGlobalAllow), json.RawMessage(`{"rules":[{"permission":"file.write","target":"*","access":"deny"}]}`))
+	if got := second.permissionPolicy("/ws"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("reloaded policy = %#v, want the workspace deny over the global allow", got)
+	}
+	if got := first.permissionPolicy("/ws"); !reflect.DeepEqual(got, globalOnly) {
+		t.Fatalf("the old revision's capture changed after Reload: %#v", got)
+	}
+
+	// An unreadable file is absent policy for that Workspace alone; the
+	// global member still decides and publication succeeds.
+	if err := os.Chmod(permissionPath, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(permissionPath, 0o600) })
+	third, err := svc.publish(context.Background())
+	if err != nil {
+		t.Fatalf("reload with the unreadable file: %v", err)
+	}
+	if got := third.permissionPolicy("/ws"); !reflect.DeepEqual(got, globalOnly) {
+		t.Fatalf("unreadable-file policy = %#v, want the global-only level", got)
+	}
+	if got := second.permissionPolicy("/ws"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("the unreadable file changed the prior revision: %#v", got)
+	}
+	// A successfully read malformed file keeps publication and follows the
+	// built-in fallback posture for that Workspace, discarding both user
+	// levels there.
+	if err := os.Chmod(permissionPath, 0o600); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	writeServiceFile(t, permissionPath, `NOT JSON`)
+	fourth, err := svc.publish(context.Background())
+	if err != nil {
+		t.Fatalf("reload with the malformed file: %v", err)
+	}
+	if got := fourth.permissionPolicy("/ws"); !reflect.DeepEqual(got, builtin) {
+		t.Fatalf("malformed-file policy = %#v, want the built-in fallback", got)
+	}
+
+	// A failed enumeration of the inventory directory leaves the whole
+	// Workspace policy level absent for the revision, uniformly, without
+	// failing publication.
+	if err := os.Chmod(filepath.Join(h.home, ".lightcode", "projects"), 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(h.home, ".lightcode", "projects"), 0o700) })
+	fifth, err := svc.publish(context.Background())
+	if err != nil {
+		t.Fatalf("reload with the unreadable inventory: %v", err)
+	}
+	if got := fifth.permissionPolicy("/ws"); !reflect.DeepEqual(got, globalOnly) {
+		t.Fatalf("failed-enumeration policy = %#v, want the uniform absent Workspace level", got)
+	}
+	if got := fifth.permissionPolicy("/elsewhere"); !reflect.DeepEqual(got, globalOnly) {
+		t.Fatalf("other-workspace policy under a failed enumeration = %#v, want the uniform absent level", got)
+	}
+
+	// A file removed again is absent policy at the reload that observes it.
+	if err := os.Chmod(filepath.Join(h.home, ".lightcode", "projects"), 0o700); err != nil {
+		t.Fatalf("restore inventory: %v", err)
+	}
+	if err := os.Remove(permissionPath); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	sixth, err := svc.publish(context.Background())
+	if err != nil {
+		t.Fatalf("reload with the removed file: %v", err)
+	}
+	if got := sixth.permissionPolicy("/ws"); !reflect.DeepEqual(got, globalOnly) {
+		t.Fatalf("removed-file policy = %#v, want the absent Workspace level", got)
+	}
+	if got := fifth.permissionPolicy("/ws"); !reflect.DeepEqual(got, globalOnly) {
+		t.Fatalf("the removed file changed the prior revision: %#v", got)
+	}
+}
+
+// TestConfigurationServiceUnreadableMainDocumentFailsPublication proves the
+// global policy source follows the existing publication-failure path: an
+// unreadable main configuration document rejects the whole candidate and
+// publishes nothing.
+func TestConfigurationServiceUnreadableMainDocumentFailsPublication(t *testing.T) {
+	h := newServiceHarness(t)
+	writeServiceFile(t, h.configPath, providerConfigFile("One"))
+	svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, nil))
+	if _, err := svc.publish(context.Background()); err != nil {
+		t.Fatalf("initial publish: %v", err)
+	}
+	if err := os.Remove(h.configPath); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := os.Mkdir(h.configPath, 0o700); err != nil {
+		t.Fatalf("block: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(h.configPath)
+	})
+	candidate, err := svc.publish(context.Background())
+	if candidate != nil || !errors.Is(err, ErrConfiguration) {
+		t.Fatalf("publish = (%v, %v), want the unreadable document to fail publication", candidate, err)
+	}
+	if !strings.Contains(err.Error(), "read main configuration") {
+		t.Fatalf("error = %v, want the retained source path", err)
+	}
+}
+
+// TestConfigurationServiceToolDeclarationsStayDeclarative proves the
+// description/factory boundary: a Tool provider's compiled declaration feeds
+// the agent parser's tool universe and its description function and factory
+// both stay untouched by configuration publication.
+func TestConfigurationServiceToolDeclarationsStayDeclarative(t *testing.T) {
+	h := newServiceHarness(t)
+	writeServiceFile(t, h.configPath, providerConfigFile("One"))
+	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), `{"worker":{"tools":["tool.x"]}}`)
+	describeCalled := false
+	toolPlugin := Plugin{
+		ID:    "tools",
+		Scope: ScopeRuntime,
+		Provides: []CapabilitySpec{ToolSpec("tool.x", func(Invocation, ToolConstraints) (ToolDescription, error) {
+			describeCalled = true
+			return ToolDescription{Definition: model.ToolDefinition{Name: "tool.x", Parameters: json.RawMessage(`{}`)}}, nil
+		})},
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+			h.opens.Add(1)
+			return Instance{Values: map[string]any{"tool.x": noopTool{}}}, nil
+		},
+	}
+	svc := h.service(context.Background(), toolPlugin)
+	snapshot, err := svc.publish(context.Background())
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	// The declared tool ID validated the configured reference and produced no
+	// warning.
+	found, _ := hasDefinition(snapshot, "worker")
+	if !found || len(snapshot.agentWarnings) != 0 {
+		t.Fatalf("worker retained = %v with warnings %+v, want the declared tool to validate cleanly", found, snapshot.agentWarnings)
+	}
+	// An undeclared reference drops the definition with the retained warning.
+	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), `{"worker":{"tools":["ghost_tool"]}}`)
+	snapshot, err = svc.publish(context.Background())
+	if err != nil {
+		t.Fatalf("publish with the unknown tool: %v", err)
+	}
+	if found, _ := hasDefinition(snapshot, "worker"); found {
+		t.Fatal("the unknown tool name did not drop its definition")
+	}
+	if len(snapshot.agentWarnings) != 1 || snapshot.agentWarnings[0].Kind != "invalid_agent_type" || !strings.Contains(snapshot.agentWarnings[0].Message, "ghost_tool") {
+		t.Fatalf("warnings = %+v, want the retained invalid-agent drop naming ghost_tool", snapshot.agentWarnings)
+	}
+	if describeCalled {
+		t.Fatal("configuration publication ran the description function")
+	}
+	if h.opens.Load() != 0 {
+		t.Fatalf("%d factories ran during configuration publication", h.opens.Load())
 	}
 }

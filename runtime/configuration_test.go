@@ -10,6 +10,7 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -44,6 +45,9 @@ const testAgentsDocument = `{
 
 func testCapabilities() []string { return []string{"cap-a", "cap-b"} }
 
+// testToolUniverse is the compiled tool universe of the test documents.
+func testToolUniverse() []string { return []string{"plan_tool", "read_file"} }
+
 // assembleConfiguration drives the factored snapshot entries exactly as a
 // caller with one captured document set does: decode once, assemble the
 // captured providers with the pure build, then hand both to newConfiguration.
@@ -52,7 +56,7 @@ func assembleConfiguration(generation uint64, configData, agentsData string, cap
 	if err != nil {
 		return nil, err
 	}
-	return newConfiguration(generation, doc, catalog.Build(catalog.BuildInputs{UserRaw: doc.Providers}), []byte(agentsData), capabilityIDs)
+	return newConfiguration(generation, doc, catalog.Build(catalog.BuildInputs{UserRaw: doc.Providers}), []byte(agentsData), capabilityIDs, testToolUniverse(), nil)
 }
 
 func testSnapshot(t *testing.T) *configuration {
@@ -100,7 +104,7 @@ func TestNewConfigurationSnapshot(t *testing.T) {
 		t.Fatalf("plugin threshold = %#v, want the exact json.Number preserved", pluginFields["threshold"])
 	}
 
-	reference, err := agents.ParseWithCapabilities([]byte(testAgentsDocument), testCapabilities())
+	reference, err := agents.ParseWithCapabilities([]byte(testAgentsDocument), testCapabilities(), testToolUniverse(), nil)
 	if err != nil {
 		t.Fatalf("reference ParseWithCapabilities: %v", err)
 	}
@@ -262,13 +266,14 @@ func TestConfigurationAgentTypesProjection(t *testing.T) {
 
 	// Two Agent types selected from one projection keep their own views:
 	// explore inherits primary's tools with no capability selection of its
-	// own, so declared-but-unselected IDs never appear in it.
+	// own, so declared-but-unselected IDs never appear in it. The inherited
+	// default tools are intersected with the compiled tool universe.
 	explore, err := harness.ResolveAgentType("explore", types)
 	if err != nil {
 		t.Fatalf("ResolveAgentType(explore): %v", err)
 	}
-	if explore.Model != plan.Model || explore.Capabilities != nil || len(explore.Tools) != len(agents.StandardTools) {
-		t.Fatalf("explore view = %+v, want the inherited model and an empty selection", explore)
+	if explore.Model != plan.Model || explore.Capabilities != nil || !reflect.DeepEqual(explore.Tools, []string{"read_file"}) {
+		t.Fatalf("explore view = %+v, want the inherited model, an empty selection and the intersected default tools", explore)
 	}
 	if _, err := harness.ResolveAgentType("not-loaded", types); !errors.Is(err, harness.ErrInvalid) {
 		t.Fatalf("unknown selection = %v, want ErrInvalid", err)
@@ -284,5 +289,59 @@ func TestConfigurationAgentTypesProjection(t *testing.T) {
 	}
 	if again.Tools[0] != "plan_tool" || again.Capabilities[0] != "cap-b" {
 		t.Fatalf("projection aliases the snapshot storage: %+v", again)
+	}
+}
+
+// TestConfigurationPermissionCapture proves the captured permission inputs:
+// the raw global member and the Workspace bytes keyed by directory ID resolve
+// through the same revision, an unknown Workspace resolves global-only, a
+// malformed block follows the built-in fallback posture without failing the
+// candidate, and the retained legacy interactive member is malformed target
+// policy.
+func TestConfigurationPermissionCapture(t *testing.T) {
+	const globalAllow = `{"rules":[{"permission":"file.write","target":"*","access":"allow"}]}`
+	const workspaceDeny = `{"rules":[{"permission":"file.write","target":"*","access":"deny"}]}`
+	const globalDoc = `{"providers":{"prov":{"transport":{"base_url":"https://api.prov.test/v1","api_key_env":""},"models":{"m":{"name":"M","context_window":100}}}},"permissions":` + globalAllow + `}`
+
+	snapshot, err := assembleConfiguration(2, globalDoc, `{"agent":{"model":"prov/m"}}`, nil)
+	if err != nil {
+		t.Fatalf("newConfiguration: %v", err)
+	}
+	if string(snapshot.permissions) != globalAllow {
+		t.Fatalf("captured global member = %q, want the raw bytes unchanged", snapshot.permissions)
+	}
+	wsID, err := config.WorkspacePermissionDirID("/ws")
+	if err != nil {
+		t.Fatalf("WorkspacePermissionDirID: %v", err)
+	}
+	snapshot.workspacePermissions = map[string]json.RawMessage{wsID: json.RawMessage(workspaceDeny)}
+
+	// The Workspace rule decides over the global rule from the same capture.
+	want := harness.ResolvePermissionPolicy(json.RawMessage(globalAllow), json.RawMessage(workspaceDeny))
+	if got := snapshot.permissionPolicy("/ws"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("workspace policy = %#v, want the resolved workspace-over-global capture", got)
+	}
+	// An unknown Workspace resolves global-only.
+	globalOnly := harness.ResolvePermissionPolicy(json.RawMessage(globalAllow), nil)
+	if got := snapshot.permissionPolicy("/other"); !reflect.DeepEqual(got, globalOnly) {
+		t.Fatalf("unknown-workspace policy = %#v, want the global-only capture", got)
+	}
+	// A malformed Workspace block discards both user levels for that
+	// Workspace's resolutions: built-in fallback despite the valid global
+	// member.
+	snapshot.workspacePermissions = map[string]json.RawMessage{wsID: json.RawMessage(`{"rules":5}`)}
+	var builtin harness.PermissionPolicy
+	if got := snapshot.permissionPolicy("/ws"); !reflect.DeepEqual(got, builtin) {
+		t.Fatalf("malformed-workspace policy = %#v, want the built-in fallback", got)
+	}
+	if got := snapshot.permissionPolicy("/other"); !reflect.DeepEqual(got, globalOnly) {
+		t.Fatalf("other-workspace policy after the malformed sibling = %#v, want the untouched global capture", got)
+	}
+
+	// The retained legacy interactive permissions shape is not migrated: it
+	// is malformed target policy, and the candidate still builds.
+	legacy := testSnapshot(t)
+	if got := legacy.permissionPolicy("/ws"); !reflect.DeepEqual(got, builtin) {
+		t.Fatalf("legacy-member policy = %#v, want the built-in fallback", got)
 	}
 }
