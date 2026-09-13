@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/storage"
@@ -176,7 +175,6 @@ func (h *recordHook) blockUntilCanceled(started chan struct{}) {
 	h.blockSignal = started
 }
 
-// prepStream is one fake accepted model stream yielding a completed text turn.
 // recordArgumentHook is one declared ToolArgumentsHook capability: it records
 // every received call's argument bytes and Invocation revision and answers
 // with its fixed replacement.
@@ -205,21 +203,37 @@ func (h *recordArgumentHook) received() ([]string, []string) {
 	return append([]string{}, h.seen...), append([]string{}, h.revs...)
 }
 
-// prepStream is one fake accepted model stream yielding a completed text
-// response, for the preparation fixtures' real assembly callback.
-type prepStream struct{ i int }
+// prepStream is one fake accepted model stream yielding a completed text turn
+// with the given optional tool calls, for the preparation fixtures.
+type prepStream struct {
+	calls []model.ToolCall
+	i     int
+}
 
 func (s *prepStream) Recv() (model.StreamDelta, error) {
 	if s.i > 0 {
 		return model.StreamDelta{}, io.EOF
 	}
 	s.i++
-	return model.StreamDelta{
+	d := model.StreamDelta{
 		HasChoice:        true,
 		Role:             "assistant",
 		ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "done"}},
 		FinishReason:     "stop",
-	}, nil
+	}
+	if len(s.calls) > 0 { // tool-call turns establish through the tool_calls finish reason
+		d.FinishReason = "tool_calls"
+		for i, call := range s.calls {
+			position := i
+			d.ToolFragments = append(d.ToolFragments, model.ToolCallFragment{
+				Position:         &position,
+				ID:               call.ID,
+				Name:             call.Name,
+				ArgumentFragment: string(call.Arguments),
+			})
+		}
+	}
+	return d, nil
 }
 
 func (s *prepStream) Close() error { return nil }
@@ -272,7 +286,7 @@ type prepEnv struct {
 	// defaulted in newPrepEnv; a test that needs custom open behavior or model
 	// output swaps them before admitting.
 	opener openExecution
-	model  func(selection) agent.ModelEffect
+	model  func(selection) func(context.Context, model.Request) (model.Stream, error)
 }
 
 func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
@@ -333,13 +347,13 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 		}
 		return execution, nil
 	}
-	e.model = func(sel selection) agent.ModelEffect {
-		return func(ctx context.Context, _ model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+	e.model = func(sel selection) func(context.Context, model.Request) (model.Stream, error) {
+		return func(ctx context.Context, _ model.Request) (model.Stream, error) {
 			e.events.add("model")
 			if _, ok := sel.bindings.entries["cap.shared"]; ok {
 				worker, err := Bind[greeter](sel.bindings, "cap.shared")
 				if err != nil {
-					return agent.ModelSettlement{}, err
+					return nil, err
 				}
 				e.events.add("greet:" + worker.Greet())
 			}
@@ -354,14 +368,10 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 				select {
 				case <-gate:
 				case <-ctx.Done():
-					return agent.ModelSettlement{}, ctx.Err()
+					return nil, ctx.Err()
 				}
 			}
-			out, err := assemble(prepModelRef, &prepStream{})
-			if err != nil {
-				return agent.ModelSettlement{}, err
-			}
-			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &out}, nil
+			return &prepStream{}, nil
 		}
 	}
 	owner, cancel := context.WithCancel(context.Background())
@@ -1849,31 +1859,17 @@ func TestPreparationForwardsCapturedPolicyAndNormalizer(t *testing.T) {
 		var normalized, executed int
 		var requests []model.Request
 		turn := []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: json.RawMessage(` {"x": 1} `)}}
-		e.model = func(selection) agent.ModelEffect {
-			return func(_ context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		e.model = func(selection) func(context.Context, model.Request) (model.Stream, error) {
+			return func(_ context.Context, req model.Request) (model.Stream, error) {
 				mu.Lock()
 				requests = append(requests, req)
 				next := turn
 				turn = nil
 				mu.Unlock()
-				out, err := assemble(prepModelRef, &prepStream{})
-				if err != nil {
-					return agent.ModelSettlement{}, err
-				}
 				if len(next) > 0 {
-					return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &model.Output{
-						Status: model.OutputCompleted,
-						Source: prepModelRef,
-						Message: &model.Message{
-							Role:      model.RoleAssistant,
-							Source:    prepModelRef,
-							Content:   []model.ContentPart{{Kind: model.PartText, Text: "done"}},
-							ToolCalls: next,
-						},
-						Usage: &model.Usage{InputTokens: 1, OutputTokens: 1},
-					}}, nil
+					return &prepStream{calls: next}, nil
 				}
-				return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &out}, nil
+				return &prepStream{}, nil
 			}
 		}
 		e.opener = func(_ context.Context, _ harness.OperationAdmission, sel selection) (harness.Execution, error) {
@@ -1985,6 +1981,54 @@ func TestPreparationForwardsCapturedPolicyAndNormalizer(t *testing.T) {
 	})
 }
 
+// TestPreparationForwardsRetryPolicyToOpenedExecution proves the scope
+// wrapper forwards the opener's Retry policy into the opened Execution: the
+// supplied non-nil policy is the one the opened execution consults for the
+// failed physical attempt. A func value copied verbatim invokes as the same
+// closure, so the recorded call is the identity proof.
+func TestPreparationForwardsRetryPolicyToOpenedExecution(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newPrepEnv(t, store)
+		t.Cleanup(func() { e.converge() })
+		policyCalled := make(chan struct{}, 1) // one invocation is the identity proof for the verbatim-copied func field
+		policy := func(error, int) (time.Duration, bool) {
+			select {
+			case policyCalled <- struct{}{}:
+			default:
+			}
+			return 0, false
+		}
+		e.model = func(selection) func(context.Context, model.Request) (model.Stream, error) {
+			return func(context.Context, model.Request) (model.Stream, error) {
+				return nil, errors.New("model down") // one nonretryable pre-acceptance failure
+			}
+		}
+		baseOpener := e.opener
+		e.opener = func(ctx context.Context, adm harness.OperationAdmission, sel selection) (harness.Execution, error) {
+			execution, err := baseOpener(ctx, adm, sel)
+			if err != nil {
+				return harness.Execution{}, err
+			}
+			execution.Retry = policy // must reach the opened execution through the scope wrapper
+			return execution, nil
+		}
+		session := e.session("solo")
+		e.admit(session, "op-1", "hello")
+		select {
+		case <-policyCalled: // the opened execution consulted the supplied policy: no convergence race
+		case <-time.After(10 * time.Second):
+			t.Fatal("the retry policy never ran: the opened execution did not receive the supplied policy")
+		}
+		if err := e.converge(); err != nil {
+			t.Fatalf("converge: %v", err)
+		}
+		rec, err := e.h.ReadOperation(context.Background(), session, "op-1")
+		if err != nil || rec.State.Status != harness.OperationFailure || rec.State.Terminal == nil || rec.State.Terminal.Detail != "model down" {
+			t.Fatalf("operation = %+v err %v, want terminal failure with the attempt's diagnostic", rec, err)
+		}
+	})
+}
+
 // TestPreparationForwardsToolArgumentHooksAcrossScopes proves the argument
 // hook row through the real Runtime, Harness and Agent on both stores: the
 // selected argument hooks bind in configured order after all execution scopes
@@ -2003,27 +2047,14 @@ func TestPreparationForwardsToolArgumentHooksAcrossScopes(t *testing.T) {
 		var executed int
 		var toolInput []string
 		turn := []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: json.RawMessage(` [not json `)}}
-		e.model = func(selection) agent.ModelEffect {
-			return func(_ context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		e.model = func(selection) func(context.Context, model.Request) (model.Stream, error) {
+			return func(_ context.Context, _ model.Request) (model.Stream, error) {
 				next := turn
 				turn = nil
-				out, err := assemble(prepModelRef, &prepStream{})
-				if err != nil {
-					return agent.ModelSettlement{}, err
-				}
 				if len(next) > 0 {
-					return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &model.Output{
-						Status: model.OutputCompleted,
-						Source: prepModelRef,
-						Message: &model.Message{
-							Role:      model.RoleAssistant,
-							Source:    prepModelRef,
-							Content:   []model.ContentPart{{Kind: model.PartText, Text: "done"}},
-							ToolCalls: next,
-						},
-					}}, nil
+					return &prepStream{calls: next}, nil
 				}
-				return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &out}, nil
+				return &prepStream{}, nil
 			}
 		}
 		e.opener = func(_ context.Context, _ harness.OperationAdmission, sel selection) (harness.Execution, error) {

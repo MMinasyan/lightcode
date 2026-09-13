@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/plugins/sqlite"
 	"github.com/MMinasyan/lightcode/internal/storage"
@@ -432,14 +431,14 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 							}
 							return json.Marshal(obj)
 						},
-						Model: func(ctx context.Context, _ model.Request, _ agent.AssemblyCallback) (agent.ModelSettlement, error) {
+						Model: func(context.Context, model.Request) (model.Stream, error) {
 							executions.Add(1)
 							select {
 							case arrived <- struct{}{}:
 							default:
 							}
 							<-release
-							return agent.ModelSettlement{}, errors.New("seeded execution released after the test converged")
+							return nil, errors.New("seeded execution released after the test converged")
 						},
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}}

@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/model"
@@ -58,17 +61,21 @@ type modelResult struct {
 
 // modelEffect encloses one complete invocation of the prepared model function
 // in one logical model-effect intent/result pair: it commits the active-effect
-// intent and reserved result identity, invokes the prepared function outside
-// locks and storage transactions behind the privately tracked assembly
-// callback, validates the settlement once, and commits the result and complete
-// next Operation state before returning the committed settlement. Before the
-// assistant entry commits, every advertised completed call is normalized
-// through the execution's pure callback outside storage transactions and
-// owning locks.
+// intent, makes the physical attempts with their retry classification and
+// backoff, invokes the assembly callback exactly once after a stream is
+// accepted, derives the settlement from the assembled output, validates it,
+// and commits the result and complete next Operation state before returning
+// the committed settlement. Before the assistant entry commits, every
+// advertised completed call is normalized through the execution's pure
+// callback outside storage transactions and owning locks.
 func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution, capture ExecutionCapture) agent.ModelEffect {
-	prepared := exec.Model
+	attempt := exec.Model
 	normalize := exec.NormalizeTool
 	advertised := advertisedToolNames(capture)
+	retry := exec.Retry
+	if retry == nil {
+		retry = standardRetryPolicy
+	}
 	return func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 		intent, err := h.beginModelEffect(ctx, c, operationID)
 		if err != nil {
@@ -90,15 +97,7 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 		// between the committed intent and the callback settles the Operation
 		// as terminal interruption without ever starting the callback.
 		if ctx.Err() != nil {
-			settleCtx := context.WithoutCancel(h.ctx)
-			committed := agent.ModelSettlement{Disposition: agent.DispoInterruption, Detail: executionInterruptedDetail}
-			if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{
-				terminal: OperationInterruption,
-				detail:   executionInterruptedDetail,
-			}); err != nil {
-				return agent.ModelSettlement{}, err
-			}
-			return committed, nil
+			return h.interruptModelEffect(c, operationID, intent)
 		}
 		// Result and terminal transactions run without cancellation so an
 		// already-produced result or required terminal settlement publishes.
@@ -112,38 +111,58 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 			}
 			return agent.ModelSettlement{}, cause
 		}
-		calls := 0
-		var callbackErr error
-		tracked := func(source model.ModelRef, stream model.Stream) (model.Output, error) {
-			calls++
-			out, err := assemble(source, stream)
-			if err != nil && callbackErr == nil {
-				callbackErr = err // any callback error stays fatal even when the prepared function ignores it
+		// The one attempt loop lives inside the committed intent: every
+		// failed attempt is classified by the retry policy, waits run behind
+		// the cancellation checks, and an accepted stream never re-enters
+		// retry — assembly owns it, including closure.
+		var output model.Output
+		for failed := 1; ; failed++ {
+			if err := ctx.Err(); err != nil { // observed cancellation before an attempt interrupts; no output and no assembly call
+				return h.interruptModelEffect(c, operationID, intent)
 			}
-			return out, err
+			stream, attemptErr := attempt(ctx, req)
+			if attemptErr == nil && stream != nil {
+				output, attemptErr = assemble(intent.expected, stream) // exactly one assembly after acceptance
+				if attemptErr != nil {
+					return settle(attemptErr)
+				}
+				break
+			}
+			if attemptErr == nil || stream != nil { // exactly one stream or one error must be returned; a supplied stream closes before the boundary failure
+				if stream != nil {
+					_ = stream.Close()
+				}
+				return settle(&agent.ProtocolError{Boundary: "model", Detail: "physical model request returned neither exactly one stream nor one error"})
+			}
+			// An attempt failure observed under a done execution context
+			// settles the interruption outcome before any classification:
+			// regardless of the attempt error's shape or the retry policy's
+			// answer, pre-acceptance cancellation is an interruption with no
+			// output and no assembly call.
+			if ctx.Err() != nil {
+				return h.interruptModelEffect(c, operationID, intent)
+			}
+			delay, again := retry(attemptErr, failed)
+			if !again || delay < 0 {
+				committed := agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: attemptErr.Error()}
+				if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{
+					terminal: OperationFailure,
+					detail:   attemptErr.Error(),
+				}); err != nil {
+					return agent.ModelSettlement{}, err
+				}
+				return committed, nil
+			}
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done(): // cancellation during backoff interrupts; no attempt starts
+				return h.interruptModelEffect(c, operationID, intent)
+			}
 		}
-		set, effectErr := prepared(ctx, req, tracked)
-		if effectErr != nil {
-			return settle(effectErr)
-		}
-		if callbackErr != nil {
-			return settle(callbackErr)
-		}
-		if set.Output != nil && calls != 1 {
-			return settle(&agent.ProtocolError{Boundary: "model", Detail: fmt.Sprintf("settlement carries an output from %d assembly callback invocations, exactly one successful call is required", calls)})
-		}
-		if set.Output == nil && calls != 0 {
-			return settle(&agent.ProtocolError{Boundary: "model", Detail: fmt.Sprintf("settlement carries no output but the assembly callback ran %d times, zero are required", calls)})
-		}
+		set := derivedSettlement(output)
 		owned, err := agent.ValidateModelSettlement(intent.expected, set)
 		if err != nil {
 			return settle(err)
-		}
-		// Only the wrapper's own steering decision may produce a
-		// completed-output continue, and only for waiting steering; a prepared
-		// callback returning that combination is invalid.
-		if owned.Disposition == agent.DispoContinue && owned.Output != nil && owned.Output.Status == model.OutputCompleted {
-			return settle(&agent.ProtocolError{Boundary: "model", Detail: "prepared model callback returned a completed-output continue; only the Harness-owned steering decision may produce it"})
 		}
 		// A completed call whose identity the Operation already published can
 		// never commit: one published call is one settlement unit, and a
@@ -189,6 +208,83 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 		}
 		return owned, nil
 	}
+}
+
+// interruptModelEffect settles one committed model effect intent as the fixed
+// terminal interruption after observed execution cancellation before stream
+// acceptance: no output, no assembly call, and the committed settlement
+// returned with a nil error.
+func (h *Harness) interruptModelEffect(c *coordinator, operationID string, intent modelEffectIntent) (agent.ModelSettlement, error) {
+	settleCtx := context.WithoutCancel(h.ctx)
+	committed := agent.ModelSettlement{Disposition: agent.DispoInterruption, Detail: executionInterruptedDetail}
+	if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{
+		terminal: OperationInterruption,
+		detail:   executionInterruptedDetail,
+	}); err != nil {
+		return agent.ModelSettlement{}, err
+	}
+	return committed, nil
+}
+
+// derivedSettlement maps one assembled output onto the closed disposition
+// table: completed is ready, interrupted interrupts with its own detail, an
+// errored output retaining a partial payload continues, and a payload-less
+// errored output fails with its detail.
+func derivedSettlement(out model.Output) agent.ModelSettlement {
+	switch out.Status {
+	case model.OutputCompleted:
+		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &out}
+	case model.OutputInterrupted:
+		return agent.ModelSettlement{Disposition: agent.DispoInterruption, Output: &out, Detail: out.Detail}
+	default:
+		if outputCarriesPayload(out) {
+			return agent.ModelSettlement{Disposition: agent.DispoContinue, Output: &out}
+		}
+		return agent.ModelSettlement{Disposition: agent.DispoFailure, Output: &out, Detail: out.Detail}
+	}
+}
+
+// outputCarriesPayload reports whether one finalized output retains a
+// model-visible payload, mirroring the model package's finalized payload
+// predicate: a non-empty refusal, tool calls, one non-empty finalized content
+// part, or one finalized non-null message extra.
+func outputCarriesPayload(out model.Output) bool {
+	if out.Message == nil {
+		return false
+	}
+	if out.Message.Refusal != "" || len(out.Message.ToolCalls) > 0 {
+		return true
+	}
+	for _, part := range out.Message.Content {
+		if part.Text != "" || part.URL != "" || part.OpaqueWireType != "" || len(part.Extra.Finalize()) > 0 {
+			return true
+		}
+	}
+	return len(out.Message.Extra.Finalize()) > 0
+}
+
+// standardRetryPolicy is the nil-Retry classifier: HTTP 429 and 5xx failures,
+// errors wrapping net.OpError, and pre-response io.EOF/io.ErrUnexpectedEOF
+// permit retries 1..3 at 2s/4s/8s; every other failure stops.
+func standardRetryPolicy(cause error, failed int) (time.Duration, bool) {
+	if failed > 3 || !retryableTransportFailure(cause) {
+		return 0, false
+	}
+	return 2 * time.Duration(1<<(failed-1)) * time.Second, true
+}
+
+// retryableTransportFailure classifies one failed physical attempt under the
+// standard policy's fixed transport-failure classes.
+func retryableTransportFailure(cause error) bool {
+	var status *model.HTTPStatusError
+	if errors.As(cause, &status) {
+		return status.StatusCode == 429 || (status.StatusCode >= 500 && status.StatusCode <= 599)
+	}
+	var op *net.OpError
+	if errors.As(cause, &op) {
+		return true
+	}
+	return errors.Is(cause, io.EOF) || errors.Is(cause, io.ErrUnexpectedEOF)
 }
 
 // publishedCallIDs returns the tool call IDs the Operation's committed

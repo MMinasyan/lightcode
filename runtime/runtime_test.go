@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/storage"
@@ -225,7 +224,7 @@ func (p *controlledPrep) open(_ context.Context, adm harness.OperationAdmission,
 	p.mu.Unlock()
 	return harness.Execution{
 		NormalizeTool: runtimeNormalize,
-		Model: func(ctx context.Context, _ model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		Model: func(ctx context.Context, _ model.Request) (model.Stream, error) {
 			select {
 			case p.modelArrived <- struct{}{}:
 			default:
@@ -234,14 +233,10 @@ func (p *controlledPrep) open(_ context.Context, adm harness.OperationAdmission,
 				select {
 				case <-gate:
 				case <-ctx.Done():
-					return agent.ModelSettlement{}, ctx.Err()
+					return nil, ctx.Err()
 				}
 			}
-			out, err := assemble(sel.agent.Model, &prepStream{})
-			if err != nil {
-				return agent.ModelSettlement{}, err
-			}
-			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &out}, nil
+			return &prepStream{}, nil
 		},
 		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 			return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}}
@@ -473,13 +468,13 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 					return harness.Execution{
 						NormalizeTool: runtimeNormalize,
-						Model: func(ctx context.Context, _ model.Request, _ agent.AssemblyCallback) (agent.ModelSettlement, error) {
+						Model: func(context.Context, model.Request) (model.Stream, error) {
 							select {
 							case arrived <- struct{}{}:
 							default:
 							}
 							<-release
-							return agent.ModelSettlement{}, errors.New("seeded execution released after the test converged")
+							return nil, errors.New("seeded execution released after the test converged")
 						},
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}}

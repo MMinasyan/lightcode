@@ -26,7 +26,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/model"
@@ -62,42 +61,111 @@ func publicNormalize(call model.ToolCall) (json.RawMessage, error) {
 // effect-producing fixture plans: command.run allows any target.
 var publicPermission = []harness.PermissionRequest{{Permission: "command.run", Target: "fixture"}}
 
-// publicStream is one fake accepted model stream yielding a completed text
-// response, for the suite's real assembly callback.
-type publicStream struct{ i int }
+// publicTurnStream is one fake accepted model stream assembling to the
+// fixture completed turn: text "done", the given ordered calls, and the
+// fixture usage reported last.
+func publicTurnStream(calls ...string) *publicScriptStream {
+	return publicUsageTurnStream(model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2}, calls...)
+}
 
-func (s *publicStream) Recv() (model.StreamDelta, error) {
-	if s.i > 0 {
-		return model.StreamDelta{}, io.EOF
-	}
-	s.i++
-	return model.StreamDelta{
+// publicUsageTurnStream is publicTurnStream carrying a specific usage count.
+func publicUsageTurnStream(usage model.Usage, calls ...string) *publicScriptStream {
+	d := model.StreamDelta{
 		HasChoice:        true,
 		Role:             "assistant",
 		ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "done"}},
 		FinishReason:     "stop",
-	}, nil
+	}
+	if len(calls) > 0 {
+		d.FinishReason = "tool_calls"
+		for i, id := range calls {
+			position := i
+			d.ToolFragments = append(d.ToolFragments, model.ToolCallFragment{
+				Position:         &position,
+				ID:               id,
+				Name:             "echo",
+				ArgumentFragment: `{"x":1}`,
+			})
+		}
+	}
+	return &publicScriptStream{deltas: []model.StreamDelta{d, {Usage: &usage}}}
 }
 
-func (s *publicStream) Close() error { return nil }
+// publicScriptStream is one fake accepted model stream: scripted deltas in
+// order, then either its read failure or io.EOF. A non-nil onExhausted hook
+// runs on the read after the last delta, before the report.
+type publicScriptStream struct {
+	deltas      []model.StreamDelta
+	err         error // non-EOF read failure yielded after the deltas when non-nil
+	i           int
+	onExhausted func()
+}
 
-// scriptModel is the scripted model effect of the suite: it records every
-// projected request, signals each arrival, optionally parks every invocation
-// until its gate closes, assembles once behind every output-bearing
-// settlement, and answers from a scripted settlement list.
+func (s *publicScriptStream) Recv() (model.StreamDelta, error) {
+	if s.i >= len(s.deltas) {
+		if s.onExhausted != nil {
+			s.onExhausted()
+		}
+		if s.err != nil {
+			s.i++
+			return model.StreamDelta{}, s.err
+		}
+		return model.StreamDelta{}, io.EOF
+	}
+	d := s.deltas[s.i]
+	s.i++
+	return d, nil
+}
+
+// publicPartialTurnStream is one accepted stream whose assembly errors while
+// retaining the "partial" text: the fixture errored continuation turn.
+func publicPartialTurnStream() *publicScriptStream {
+	return &publicScriptStream{
+		deltas: []model.StreamDelta{
+			{HasChoice: true, Role: "assistant", ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "partial"}}},
+			{Usage: &model.Usage{InputTokens: 5, OutputTokens: 7}},
+		},
+		err: errors.New("provider failure"),
+	}
+}
+
+func (s *publicScriptStream) Close() error { return nil }
+
+// publicAttempt is one scripted physical attempt: the stream of the accepted
+// attempt, or its pre-acceptance failure whose text becomes the settled
+// terminal detail.
+type publicAttempt struct {
+	stream model.Stream
+	err    error
+}
+
+// publicTurn scripts one accepted stream assembling to the fixture completed
+// turn with the given calls.
+func publicTurn(calls ...string) publicAttempt {
+	return publicAttempt{stream: publicTurnStream(calls...)}
+}
+
+// publicFail scripts one pre-acceptance attempt failure.
+func publicFail(detail string) publicAttempt {
+	return publicAttempt{err: errors.New(detail)}
+}
+
+// scriptModel is the scripted physical model request of the suite: it records
+// every projected request, signals each arrival, optionally parks every
+// invocation until its gate closes, and answers from a scripted attempt list.
 type scriptModel struct {
-	mu          sync.Mutex
-	requests    []model.Request
-	arrived     chan struct{}
-	gate        chan struct{}
-	settlements []agent.ModelSettlement
+	mu       sync.Mutex
+	requests []model.Request
+	arrived  chan struct{}
+	gate     chan struct{}
+	attempts []publicAttempt
 }
 
-func newScriptModel(settlements ...agent.ModelSettlement) *scriptModel {
-	return &scriptModel{arrived: make(chan struct{}, 16), settlements: settlements}
+func newScriptModel(attempts ...publicAttempt) *scriptModel {
+	return &scriptModel{arrived: make(chan struct{}, 16), attempts: attempts}
 }
 
-func (s *scriptModel) effect(_ context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+func (s *scriptModel) effect(_ context.Context, req model.Request) (model.Stream, error) {
 	s.mu.Lock()
 	s.requests = append(s.requests, req)
 	gate := s.gate
@@ -106,19 +174,14 @@ func (s *scriptModel) effect(_ context.Context, req model.Request, assemble agen
 	if gate != nil {
 		<-gate
 	}
-	var set agent.ModelSettlement
-	if len(s.settlements) > 0 {
-		set = s.settlements[0]
-		s.settlements = s.settlements[1:]
+	var next publicAttempt
+	if len(s.attempts) > 0 {
+		next = s.attempts[0]
+		s.attempts = s.attempts[1:]
 	} else {
-		set = agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)}
+		next = publicTurn()
 	}
-	if set.Output != nil { // an output-bearing settlement requires exactly one assembly
-		if _, err := assemble(publicModelRef, &publicStream{}); err != nil {
-			return agent.ModelSettlement{}, err
-		}
-	}
-	return set, nil
+	return next.stream, next.err
 }
 
 func (s *scriptModel) seen() []model.Request {
@@ -152,19 +215,6 @@ func (s *scriptModel) releaseGate() {
 	}
 }
 
-func publicCompleted(usage *model.Usage) *model.Output {
-	return &model.Output{
-		Status: model.OutputCompleted,
-		Source: publicModelRef,
-		Message: &model.Message{
-			Role:    model.RoleAssistant,
-			Source:  publicModelRef,
-			Content: []model.ContentPart{{Kind: model.PartText, Text: "done"}},
-		},
-		Usage: usage,
-	}
-}
-
 // publicFixture wires one Harness over the given store with a scripted
 // preparation callback: every admission receives the fixture's prepared
 // execution (or the per-call prepare hook's result) and signals the
@@ -189,7 +239,7 @@ type publicFixture struct {
 	prepareHook func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error)
 }
 
-func newPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, modelFn agent.ModelEffect) *publicFixture {
+func newPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, modelFn func(context.Context, model.Request) (model.Stream, error)) *publicFixture {
 	t.Helper()
 	if modelFn == nil {
 		modelFn = script.effect
@@ -264,6 +314,27 @@ func converge(t *testing.T, f *publicFixture) error {
 	return f.h.Wait(context.Background())
 }
 
+// awaitTerminal polls one Operation until its terminal settlement commits,
+// bounding the wait: a failing attempt's settlement must not race the
+// convergence cancellation the surrounding assertions rely on.
+func awaitTerminal(t *testing.T, h *harness.Harness, session, operation string) harness.OperationRecord {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		rec, err := h.ReadOperation(context.Background(), session, operation)
+		if err != nil {
+			t.Fatalf("ReadOperation: %v", err)
+		}
+		if rec.State.Terminal != nil {
+			return rec
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("operation %s never settled within the wait bound", operation)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // eachStore runs one fixture against memory and a temporary SQLite store.
 func eachStore(t *testing.T, run func(t *testing.T, store harness.Storage)) {
 	t.Helper()
@@ -290,8 +361,8 @@ func eachStore(t *testing.T, run func(t *testing.T, store harness.Storage)) {
 func TestPublicTurnLifecycle(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		script := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(&model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2})},
-			agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "second turn failed"},
+			publicAttempt{stream: publicUsageTurnStream(model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2})},
+			publicFail("second turn failed"),
 		)
 		script.gate = make(chan struct{})
 		f := newPublicFixture(t, store, script, nil)
@@ -440,8 +511,8 @@ func TestPublicIdempotency(t *testing.T) {
 
 		t.Run("reuse after delete", func(t *testing.T) {
 			script := newScriptModel(
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "source turn settled"}, // model-originated terminal before the drain
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "reused turn settled"}, // durable regardless of later cancellation
+				publicFail("source turn settled"), // model-originated terminal before the drain
+				publicFail("reused turn settled"), // durable regardless of later cancellation
 			)
 			gate := make(chan struct{})
 			script.gate = gate
@@ -481,7 +552,8 @@ func TestPublicIdempotency(t *testing.T) {
 			if err != nil || res.Disposition != harness.DispositionAdmitted || res.Operation == nil {
 				t.Fatalf("reuse after delete = %+v err %v, want admitted in another session", res, err)
 			}
-			<-script.arrived // the reused ID's Operation reached its model boundary
+			<-script.arrived                        // the reused ID's Operation reached its model boundary
+			awaitTerminal(t, f.h, other, "reuse-1") // the settlement commits before the convergence cancellation
 			if err := converge(t, f); err != nil {
 				t.Fatalf("Wait: %v", err)
 			}
@@ -754,8 +826,8 @@ func TestPublicSubmitCanceledWaiterPublishesNothing(t *testing.T) {
 func TestPublicAgentTypeChange(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		script := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},    // op-1 succeeds
-			agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "drained turn failed"}, // op-2 fails
+			publicTurn(),                      // op-1 succeeds
+			publicFail("drained turn failed"), // op-2 fails
 		)
 		script.gate = make(chan struct{})
 		f := newPublicFixture(t, store, script, nil)
@@ -923,7 +995,7 @@ func assertNothingAdmitted(t *testing.T, store harness.Storage, sessionID, opera
 // identity is globally unique across the store, so each seed passes its own.
 func seedIdleSource(t *testing.T, store harness.Storage, operationID string) string {
 	t.Helper()
-	script := newScriptModel(agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)})
+	script := newScriptModel(publicTurn())
 	f := newPublicFixture(t, store, script, nil)
 	source := createSession(t, f.h)
 	if _, err := submit(t, f.h, source, operationID, harness.MessageModeRegular, "hello"); err != nil {
@@ -1137,7 +1209,7 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 
 		t.Run("post-commit caller cancellation returns the committed admission", func(t *testing.T) {
 			probe := &publicationCancelStore{Storage: store}
-			script := newScriptModel(agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "committed turn"}) // model-originated terminal, durable regardless of later cancellation
+			script := newScriptModel(publicFail("committed turn")) // model-originated terminal, durable regardless of later cancellation
 			f := newPublicFixture(t, probe, script, nil)
 			defer f.close()
 			session := createSession(t, f.h)
@@ -1152,7 +1224,8 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			if caller.Err() == nil {
 				t.Fatalf("the caller context was not canceled after the commit")
 			}
-			<-script.arrived // the admitted execution reached its model boundary; its terminal commits in the effect's own transaction
+			<-script.arrived                       // the admitted execution reached its model boundary; its terminal commits in the effect's own transaction
+			awaitTerminal(t, f.h, session, "op-c") // the settlement commits before the convergence cancellation
 			if err := converge(t, f); err != nil {
 				t.Fatalf("Wait: %v", err)
 			}
@@ -1167,7 +1240,7 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			boundary := forkEntryOf(t, store, source, harness.EntryInput, "seed-op-2").ID
 
 			probe := &publicationCancelStore{Storage: store}
-			script := newScriptModel(agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)})
+			script := newScriptModel(publicTurn())
 			f := newPublicFixture(t, probe, script, nil)
 			defer f.close()
 			caller, cancelCaller := context.WithCancel(ctx)
@@ -1317,8 +1390,8 @@ func TestPublicBufferedItemFailure(t *testing.T) {
 	t.Run("failed preparation drops the item and proceeds", func(t *testing.T) {
 		eachStore(t, func(t *testing.T, store harness.Storage) {
 			script := newScriptModel(
-				agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},  // op-1 succeeds
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "next item settled"}, // q2 settles through its own terminal
+				publicTurn(),                    // op-1 succeeds
+				publicFail("next item settled"), // q2 settles through its own terminal
 			)
 			gate := make(chan struct{})
 			script.gate = gate
@@ -1365,9 +1438,9 @@ func TestPublicBufferedItemFailure(t *testing.T) {
 	t.Run("failed delivered operation proceeds to the next item", func(t *testing.T) {
 		eachStore(t, func(t *testing.T, store harness.Storage) {
 			script := newScriptModel(
-				agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},   // op-1 succeeds
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "queued turn failed"}, // q1 fails
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "next item settled"},  // q2 settles through its own terminal
+				publicTurn(),                     // op-1 succeeds
+				publicFail("queued turn failed"), // q1 fails
+				publicFail("next item settled"),  // q2 settles through its own terminal
 			)
 			gate := make(chan struct{})
 			script.gate = gate
@@ -1418,8 +1491,8 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 	t.Run("regular input at the boundary continues the operation", func(t *testing.T) {
 		eachStore(t, func(t *testing.T, store harness.Storage) {
 			script := newScriptModel(
-				agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)}, // the boundary result commits; steering continues it
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "boundary settled"}, // model-originated terminal
+				publicTurn(),                   // the boundary result commits; steering continues it
+				publicFail("boundary settled"), // model-originated terminal
 			)
 			var (
 				f       *publicFixture
@@ -1427,14 +1500,14 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 				first   = true
 			)
 			inner := script.effect
-			boundary := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+			boundary := func(ctx context.Context, req model.Request) (model.Stream, error) {
 				if first { // submit at the model-result boundary, before the settlement returns
 					first = false
 					if _, err := submit(t, f.h, session, "op-2", harness.MessageModeRegular, "at-boundary"); err != nil {
 						t.Errorf("boundary submit: %v", err)
 					}
 				}
-				return inner(ctx, req, assemble)
+				return inner(ctx, req)
 			}
 			f = newPublicFixture(t, store, script, boundary)
 			defer f.close()
@@ -1465,8 +1538,8 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 	t.Run("queued input at the boundary drains after the terminal", func(t *testing.T) {
 		eachStore(t, func(t *testing.T, store harness.Storage) {
 			script := newScriptModel(
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "first settled"},        // model-originated terminal before the drain
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "boundary turn failed"}, // the drained item's own terminal
+				publicFail("first settled"),        // model-originated terminal before the drain
+				publicFail("boundary turn failed"), // the drained item's own terminal
 			)
 			var (
 				f       *publicFixture
@@ -1474,14 +1547,14 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 				first   = true
 			)
 			inner := script.effect
-			boundary := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+			boundary := func(ctx context.Context, req model.Request) (model.Stream, error) {
 				if first { // defer one queued message at the final model-result boundary
 					first = false
 					if _, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "at-boundary"); err != nil {
 						t.Errorf("boundary submit: %v", err)
 					}
 				}
-				return inner(ctx, req, assemble)
+				return inner(ctx, req)
 			}
 			f = newPublicFixture(t, store, script, boundary)
 			defer f.close()
@@ -1516,20 +1589,20 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 func TestPublicSessionsExecuteConcurrently(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		parked := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "first session settled"}, // model-originated terminal: durable regardless of later cancellation
+			publicFail("first session settled"), // model-originated terminal: durable regardless of later cancellation
 		)
 		gate := make(chan struct{})
 		parked.gate = gate
 		finished := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "second session settled"}, // model-originated terminal: durable regardless of later cancellation
+			publicFail("second session settled"), // model-originated terminal: durable regardless of later cancellation
 		)
 		parkedEffect, finishedEffect := parked.effect, finished.effect
-		route := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		route := func(ctx context.Context, req model.Request) (model.Stream, error) {
 			got := texts(req)
 			if got[len(got)-1] == "first" {
-				return parkedEffect(ctx, req, assemble)
+				return parkedEffect(ctx, req)
 			}
-			return finishedEffect(ctx, req, assemble)
+			return finishedEffect(ctx, req)
 		}
 		f := newPublicFixture(t, store, parked, route)
 		defer f.close()
@@ -1545,9 +1618,11 @@ func TestPublicSessionsExecuteConcurrently(t *testing.T) {
 		if _, err := submit(t, f.h, sessionB, "op-b", harness.MessageModeRegular, "second"); err != nil {
 			t.Fatalf("second session submit: %v", err)
 		}
-		<-f.prepare          // the second Session was admitted while the first is parked
-		<-finished.arrived   // and reached its model boundary before the first one resumed
-		parked.releaseGate() // the first Session settles through its own model-originated terminal
+		<-f.prepare                             // the second Session was admitted while the first is parked
+		<-finished.arrived                      // and reached its model boundary before the first one resumed
+		parked.releaseGate()                    // the first Session settles through its own model-originated terminal
+		awaitTerminal(t, f.h, sessionA, "op-a") // both failing attempts' settlements commit
+		awaitTerminal(t, f.h, sessionB, "op-b") // before the convergence cancellation can race either
 		if err := converge(t, f); err != nil {
 			t.Fatalf("Wait: %v", err)
 		}
@@ -1587,9 +1662,9 @@ type opRegisterWire struct {
 func TestPublicOrderedToolCallsSettle(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		script := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompletedWithCalls("call-1", "call-2")}, // the turn publishes two ordered calls
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},                         // the turn completes after the results
-			agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "drained turn settled"},                     // the drained item's own terminal
+			publicTurn("call-1", "call-2"),     // the turn publishes two ordered calls
+			publicTurn(),                       // the turn completes after the results
+			publicFail("drained turn settled"), // the drained item's own terminal
 		)
 		f := newPublicFixture(t, store, script, nil)
 		defer f.close()
@@ -1699,8 +1774,8 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 			t.Fatalf("fixture raw size = %d, want exactly the durable bound", len(expanded))
 		}
 		script := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompletedWithCalls("call-1", "call-2", "call-3")},
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},
+			publicTurn("call-1", "call-2", "call-3"),
+			publicTurn(),
 		)
 		f := newPublicFixture(t, store, script, nil)
 		f.prepareHook = func(_ int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
@@ -1810,8 +1885,8 @@ func TestPublicPreparedPermissionBoundarySurvivesRestart(t *testing.T) {
 		capture.Readonly = true
 		capture.WriteDir = "/w/sub"
 		script := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompletedWithCalls("call-1", "call-2")},
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},
+			publicTurn("call-1", "call-2"),
+			publicTurn(),
 		)
 		f := newPublicFixture(t, store, script, nil)
 		defer f.close()
@@ -1921,25 +1996,6 @@ func TestPublicPreparedPermissionBoundarySurvivesRestart(t *testing.T) {
 			t.Fatalf("capture after recovery = %+v err %v, want the same durable constraints", after.Admission.Execution, err)
 		}
 	})
-}
-
-// publicCompletedWithCalls builds one valid completed output carrying the
-// given ordered tool calls.
-func publicCompletedWithCalls(calls ...string) *model.Output {
-	toolCalls := make([]model.ToolCall, 0, len(calls))
-	for _, id := range calls {
-		toolCalls = append(toolCalls, model.ToolCall{ID: id, Name: "echo", Arguments: json.RawMessage(`{"x":1}`)})
-	}
-	return &model.Output{
-		Status: model.OutputCompleted,
-		Source: publicModelRef,
-		Message: &model.Message{
-			Role:      model.RoleAssistant,
-			Source:    publicModelRef,
-			Content:   []model.ContentPart{{Kind: model.PartText, Text: "done"}},
-			ToolCalls: toolCalls,
-		},
-	}
 }
 
 // sessionRegister returns the raw durable Session register of one Session.
@@ -5007,10 +5063,11 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
 		script := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompletedWithCalls("call-1")},                                                                              // turn 1 publishes a call
-			agent.ModelSettlement{Disposition: agent.DispoInterruption, Detail: "walkaway", Output: publicCompleted(&model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2})}, // turn 1 settles as an interruption terminal with a signal
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},                                                                                            // op-2 completes
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},                                                                                            // op-3 completes
+			publicTurn("call-1"),                             // turn 1 publishes a call
+			publicAttempt{stream: publicPartialTurnStream()}, // turn 2 continues from the errored partial with the continuation signal
+			publicFail("source turn terminal"),               // turn 3 settles op-1's model-originated terminal
+			publicTurn(),                                     // op-2 completes
+			publicTurn(),                                     // op-3 completes
 		)
 		f := newPublicFixture(t, store, script, nil)
 		f.prepareHook = func(_ int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
@@ -5039,7 +5096,8 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 			t.Fatalf("first submit: %v", err)
 		}
 		<-script.arrived // the published call
-		<-script.arrived // the interruption turn
+		<-script.arrived // the continued partial turn
+		<-script.arrived // the terminal turn
 		if _, err := f.h.Submit(ctx, harness.SubmitRequest{
 			SessionID:   source,
 			OperationID: "op-2",
@@ -5070,7 +5128,7 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 
 		// the fork's own turn settles through its model-originated terminal,
 		// durable inside the effect transaction regardless of later cancellation
-		forkScript := newScriptModel(agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "fork turn settled"})
+		forkScript := newScriptModel(publicFail("fork turn settled"))
 		forkScript.gate = make(chan struct{})
 		f2 := newPublicFixture(t, store, forkScript, nil)
 		defer f2.close()
@@ -5104,11 +5162,12 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 
 		<-forkScript.arrived // the destination execution reached its model boundary
 		if got := texts(forkScript.seen()[0]); len(got) != 7 ||
-			got[0] != "system" || got[1] != "hello" || got[2] != "done" || got[3] != "ran call-1" || got[4] != "done" ||
-			got[5] != "<system-signal>Operation interrupted.</system-signal>" || got[6] != "fork input" {
+			got[0] != "system" || got[1] != "hello" || got[2] != "done" || got[3] != "ran call-1" || got[4] != "partial" ||
+			got[5] != "<system-signal>The previous model response failed after partial output. Continue from the retained response.</system-signal>" || got[6] != "fork input" {
 			t.Fatalf("fork projection = %v, want the copied prefix before the fork input", got)
 		}
 		forkScript.releaseGate()
+		awaitTerminal(t, f2.h, dest, "fork-1") // the fork turn's settlement commits before the convergence cancellation
 		if err := converge(t, f2); err != nil {
 			t.Fatalf("Wait: %v", err)
 		}

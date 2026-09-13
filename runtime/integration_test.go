@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/model"
@@ -120,7 +119,7 @@ func (p *combinedPrep) opener(_ context.Context, adm harness.OperationAdmission,
 	p.events.add("open:" + adm.OperationID)
 	return harness.Execution{
 		NormalizeTool: runtimeNormalize,
-		Model: func(ctx context.Context, _ model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		Model: func(ctx context.Context, _ model.Request) (model.Stream, error) {
 			if worker, err := Bind[combinedWorker](sel.bindings, "dep.worker"); err == nil {
 				p.events.add("work:" + worker.Work(sel.invocation))
 			}
@@ -133,16 +132,12 @@ func (p *combinedPrep) opener(_ context.Context, adm harness.OperationAdmission,
 					if hold != nil {
 						<-hold
 					}
-					// The agent contract: an active model effect settles its
-					// own observed cancellation as an interruption disposition.
-					return agent.ModelSettlement{Disposition: agent.DispoInterruption, Detail: "agent interrupted"}, nil
+					// A canceled physical request under the dead execution
+					// context settles the Harness-owned interruption.
+					return nil, ctx.Err()
 				}
 			}
-			out, err := assemble(sel.agent.Model, &prepStream{})
-			if err != nil {
-				return agent.ModelSettlement{}, err
-			}
-			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &out}, nil
+			return &prepStream{}, nil
 		},
 		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 			return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}}

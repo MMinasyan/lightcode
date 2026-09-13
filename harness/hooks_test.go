@@ -9,7 +9,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -78,10 +77,10 @@ func newHookHarness(t *testing.T, exec Execution) (*Harness, *graphStorage, *coo
 // that execution's own normalizer.
 func publishHookCalls(t *testing.T, h *Harness, c *coordinator, exec Execution, calls ...model.ToolCall) {
 	t.Helper()
-	exec.Model = modelAssemblingOnce(agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(calls...)})
-	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, testCapture()), func(model.ModelRef, model.Stream) (model.Output, error) {
-		return model.Output{}, nil
-	}); err != nil {
+	exec.Model = func(context.Context, model.Request) (model.Stream, error) {
+		return completedTurnStream(calls...), nil
+	}
+	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, testCapture()), nil); err != nil {
 		t.Fatalf("model effect: %v", err)
 	}
 }
@@ -723,7 +722,10 @@ func TestToolArgumentHookInvalidOpenedExecutionRejectsHooks(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, _, c, sessionID, prepared, _ := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
-				return Execution{Model: modelReturning(agent.ModelSettlement{Disposition: agent.DispoReady}), Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }, NormalizeTool: objectNormalize, ToolHooks: tc.hooks, Close: func() error {
+				modelFn := func(context.Context, model.Request) (model.Stream, error) {
+					return completedTurnStream(), nil
+				}
+				return Execution{Model: modelFn, Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }, NormalizeTool: objectNormalize, ToolHooks: tc.hooks, Close: func() error {
 					closed++
 					return nil
 				}}, nil

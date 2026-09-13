@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -101,7 +100,7 @@ func newTestHarness(t *testing.T, store Storage, prepare func(context.Context, P
 // normalizer. Admission fixtures observe a stable running state.
 func validExecution() Execution {
 	return Execution{
-		Model: func(context.Context, model.Request, agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		Model: func(context.Context, model.Request) (model.Stream, error) {
 			select {} // the fixture owns the admitted Operation's state assertions
 		},
 		Tool:          func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
@@ -119,8 +118,8 @@ func preparedExecuting(exec Execution) PreparedExecution {
 }
 
 // modelPrepared returns the fixtures' prepared execution whose opener yields
-// the given model function over the default tool function.
-func modelPrepared(modelFn agent.ModelEffect) PreparedExecution {
+// the given physical model request function over the default tool function.
+func modelPrepared(modelFn func(context.Context, model.Request) (model.Stream, error)) PreparedExecution {
 	exec := validExecution()
 	if modelFn != nil {
 		exec.Model = modelFn

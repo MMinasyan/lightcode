@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -56,16 +55,30 @@ type ToolArgumentsHook struct {
 	Run func(context.Context, model.ToolCall) (json.RawMessage, error)
 }
 
-// Execution is one opened execution: the two process-local effect functions
-// the Harness drives, the Operation's resolved automatic permission policy,
-// the required pure argument-normalization callback, the selected argument
-// hooks, plus the cleanup of any external resources backing them. A
-// successful Model, Tool and NormalizeTool must be non-nil, and every ToolHooks
-// entry requires a non-empty unique ID and a non-nil Run; Close is optional
-// when the concrete execution needs no external disposal. The opener owns
-// provisional cleanup on error.
+// RetryPolicy decides one failed physical model attempt: it receives the
+// attempt's failure and the 1-based number of the attempt that just failed
+// (1 for the initial attempt), and returns the nonnegative delay before the
+// next attempt plus whether to retry at all. A false result or a negative
+// delay ends the effect with that failure; the Harness owns every wait.
+type RetryPolicy func(error, int) (time.Duration, bool)
+
+// Execution is one opened execution: the physical model-request callback the
+// Harness retries and assembles, the tool effect function, the Operation's
+// resolved automatic permission policy, the required pure
+// argument-normalization callback, the selected argument hooks, plus the
+// cleanup of any external resources backing them. A successful Model, Tool
+// and NormalizeTool must be non-nil, and every ToolHooks entry requires a
+// non-empty unique ID and a non-nil Run; a nil Retry selects the private
+// standard retry classifier; Close is optional when the concrete execution
+// needs no external disposal. The opener owns provisional cleanup on error.
 type Execution struct {
-	Model agent.ModelEffect
+	// Model is the one physical model-request callback. Each invocation makes
+	// exactly one physical attempt and returns its accepted stream or that
+	// attempt's failure; retry, assembly and settlement are Harness-owned.
+	Model func(context.Context, model.Request) (model.Stream, error)
+	// Retry classifies one failed physical attempt for the next-attempt
+	// decision. Nil selects the private standard classifier.
+	Retry RetryPolicy
 	Tool  func(context.Context, model.ToolCall) PreparedTool
 	// Permissions is the automatic policy resolved for this Operation from the
 	// same immutable configuration revision its capture records. The zero

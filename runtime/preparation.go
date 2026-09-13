@@ -224,6 +224,7 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	}
 	return harness.Execution{
 		Model:         execution.Model,
+		Retry:         execution.Retry,
 		Tool:          execution.Tool,
 		Permissions:   execution.Permissions,
 		NormalizeTool: execution.NormalizeTool,

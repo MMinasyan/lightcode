@@ -17,8 +17,9 @@ import (
 )
 
 // newEffectHarness admits one running Operation ("op-1") with the given
-// prepared model function and returns the pieces the effect fixtures need.
-func newEffectHarness(t *testing.T, modelFn agent.ModelEffect) (*Harness, *graphStorage, *coordinator, string) {
+// prepared physical model request function and returns the pieces the effect
+// fixtures need.
+func newEffectHarness(t *testing.T, modelFn func(context.Context, model.Request) (model.Stream, error)) (*Harness, *graphStorage, *coordinator, string) {
 	t.Helper()
 	store := emptyStore(t)
 	prepared := modelPrepared(modelFn)
@@ -39,26 +40,8 @@ func newEffectHarness(t *testing.T, modelFn agent.ModelEffect) (*Harness, *graph
 	return h, store, c, session.Identity.SessionID
 }
 
-// modelReturning ignores the assembly callback and returns one fixed
-// settlement, the shape of a prepared model function that never assembles.
-func modelReturning(set agent.ModelSettlement) agent.ModelEffect {
-	return func(context.Context, model.Request, agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		return set, nil
-	}
-}
-
-// modelAssemblingOnce invokes the assembly callback exactly once over a fake
-// completed stream, ignoring its outcome, and returns one fixed settlement.
-func modelAssemblingOnce(set agent.ModelSettlement) agent.ModelEffect {
-	return func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		if err := assembleCompleted(assemble); err != nil {
-			return agent.ModelSettlement{}, err
-		}
-		return set, nil
-	}
-}
-
-// invokeModelEffect drives one model effect with a validated request.
+// invokeModelEffect drives one model effect with a validated request; a nil
+// assemble callback runs the real Agent assembly.
 func invokeModelEffect(t *testing.T, me agent.ModelEffect, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 	t.Helper()
 	req, err := model.NewRequest(model.Request{
@@ -68,37 +51,12 @@ func invokeModelEffect(t *testing.T, me agent.ModelEffect, assemble agent.Assemb
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
+	if assemble == nil {
+		assemble = func(source model.ModelRef, stream model.Stream) (model.Output, error) {
+			return agent.Assemble(context.Background(), source, stream)
+		}
+	}
 	return me(context.Background(), req, assemble)
-}
-
-// completedOutputWith builds one valid completed output of the expected model.
-func completedOutputWith(calls ...model.ToolCall) *model.Output {
-	return &model.Output{
-		Status: model.OutputCompleted,
-		Source: testModelRef(),
-		Message: &model.Message{
-			Role:      model.RoleAssistant,
-			Source:    testModelRef(),
-			Content:   admissionContent("done"),
-			ToolCalls: calls,
-		},
-		Usage: &model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2},
-	}
-}
-
-// erroredOutputWith builds one valid errored output retaining a text payload.
-func erroredOutputWith() *model.Output {
-	return &model.Output{
-		Status: model.OutputErrored,
-		Source: testModelRef(),
-		Message: &model.Message{
-			Role:    model.RoleAssistant,
-			Source:  testModelRef(),
-			Content: admissionContent("partial"),
-		},
-		Detail: "provider failure",
-		Usage:  &model.Usage{InputTokens: 5, OutputTokens: 7},
-	}
 }
 
 func testToolCall(id string) model.ToolCall {
@@ -121,107 +79,98 @@ func objectNormalize(call model.ToolCall) (json.RawMessage, error) {
 var fixturePermission = []PermissionRequest{{Permission: permissionCommandRun, Target: "fixture"}}
 
 // effectExecution supplies the normalizer every opened execution requires.
-func effectExecution(modelFn agent.ModelEffect, toolFn func(context.Context, model.ToolCall) PreparedTool) Execution {
+func effectExecution(modelFn func(context.Context, model.Request) (model.Stream, error), toolFn func(context.Context, model.ToolCall) PreparedTool) Execution {
 	return Execution{Model: modelFn, Tool: toolFn, NormalizeTool: objectNormalize}
 }
 
-// requireTerminalFailure asserts the durable shape of one model-effect
-// protocol failure: the Operation settled as failure, no model result entry
-// was published, and the settlement detail is the error text.
-func requireTerminalFailure(t *testing.T, h *Harness, store *graphStorage, sessionID string, wantErr error) {
-	t.Helper()
-	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("post-failure graph: %v", err)
-	}
-	for _, entry := range graph.Entries {
-		if entry.Assistant != nil {
-			t.Fatalf("assistant entry %s published after a callback-protocol failure", entry.Envelope.ID)
-		}
-		if entry.Signal != nil {
-			t.Fatalf("signal entry %s published after a callback-protocol failure", entry.Envelope.ID)
-		}
-	}
-	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationFailure {
-		t.Fatalf("operation status = %s, want failure", rec.State.Status)
-	}
-	if rec.State.ActiveEffect != nil {
-		t.Fatalf("settled operation keeps an active effect %+v", rec.State.ActiveEffect)
-	}
-	if rec.State.Terminal == nil || rec.State.Terminal.Detail != wantErr.Error() {
-		t.Fatalf("terminal detail = %+v, want the protocol error text %q", rec.State.Terminal, wantErr.Error())
-	}
-	session, err := h.ReadSession(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("ReadSession: %v", err)
-	}
-	if session.State.CurrentOperationID != "" {
-		t.Fatalf("current operation %q survived a terminal settlement", session.State.CurrentOperationID)
-	}
+// scriptStream is one fake accepted model stream: it yields the scripted
+// deltas in order, then either its read failure or io.EOF, counting Close
+// calls so tests pin exactly-once close of the accepted stream. A non-nil
+// onExhausted hook runs on the read after the last delta, before the EOF or
+// read-failure report.
+type scriptStream struct {
+	deltas      []model.StreamDelta
+	err         error // non-EOF read failure yielded after the deltas when non-nil
+	i           int
+	closes      int
+	onExhausted func()
 }
 
-// TestModelEffectCallbackProtocolFailures proves the private assembly-callback
-// discipline: a protocol failure behind a settlement is fatal, publishes no
-// model result, and settles the Operation as failure through the common
-// terminal helper.
-func TestModelEffectCallbackProtocolFailures(t *testing.T) {
-	cases := []struct {
-		name     string
-		modelFn  agent.ModelEffect
-		assemble agent.AssemblyCallback
-	}{
-		{
-			name:    "output settlement with no assembly callback call",
-			modelFn: modelReturning(agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}),
-			assemble: func(model.ModelRef, model.Stream) (model.Output, error) {
-				return model.Output{}, errors.New("assembly callback must not run")
-			},
-		},
-		{
-			name:     "outputless settlement after one assembly callback call",
-			modelFn:  modelAssemblingOnce(agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "model failure"}),
-			assemble: func(model.ModelRef, model.Stream) (model.Output, error) { return model.Output{}, nil },
-		},
-		{
-			name: "assembly callback error stays fatal when the prepared function ignores it",
-			modelFn: func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-				_, _ = assemble(testModelRef(), nil) // the callback failed; the settlement below ignores that
-				return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
-			},
-			assemble: func(model.ModelRef, model.Stream) (model.Output, error) {
-				return model.Output{}, errors.New("assembler broke")
-			},
-		},
-		{
-			name:     "settlement fails settlement validation",
-			modelFn:  modelReturning(agent.ModelSettlement{Disposition: agent.DispoFailure, Output: completedOutputWith()}),
-			assemble: func(model.ModelRef, model.Stream) (model.Output, error) { return model.Output{}, nil },
-		},
-		{
-			name: "repeated assembly callback behind an output settlement",
-			modelFn: func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-				_, _ = assemble(testModelRef(), nil)
-				_, _ = assemble(testModelRef(), nil)
-				return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
-			},
-			assemble: func(model.ModelRef, model.Stream) (model.Output, error) { return model.Output{}, nil },
-		},
+func (s *scriptStream) Recv() (model.StreamDelta, error) {
+	if s.i >= len(s.deltas) {
+		if s.onExhausted != nil {
+			s.onExhausted()
+		}
+		if s.err != nil {
+			s.i++
+			return model.StreamDelta{}, s.err
+		}
+		return model.StreamDelta{}, io.EOF
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			h, store, c, sessionID := newEffectHarness(t, tc.modelFn)
-			me := h.modelEffect(c, testOpID, effectExecution(tc.modelFn, nil), testCapture())
-			set, err := invokeModelEffect(t, me, tc.assemble)
-			if err == nil {
-				t.Fatalf("model effect settled %+v, want a protocol error", set)
-			}
-			requireTerminalFailure(t, h, store, sessionID, err)
+	d := s.deltas[s.i]
+	s.i++
+	return d, nil
+}
+
+func (s *scriptStream) Close() error { s.closes++; return nil }
+
+// streamOf builds one accepted stream yielding the deltas then EOF.
+func streamOf(deltas ...model.StreamDelta) *scriptStream {
+	return &scriptStream{deltas: deltas}
+}
+
+// failStream builds one accepted stream yielding the deltas then the read
+// failure; assembly classifies the failed read.
+func failStream(err error, deltas ...model.StreamDelta) *scriptStream {
+	return &scriptStream{deltas: deltas, err: err}
+}
+
+// turnDelta builds one assistant delta carrying the given text and tool calls
+// plus their finish reason, the one content delta of the fixture turns.
+func turnDelta(finish, text string, calls ...model.ToolCall) model.StreamDelta {
+	d := model.StreamDelta{
+		HasChoice: true,
+		Role:      "assistant",
+		ContentFragments: []model.ContentFragment{{
+			Position: 0,
+			Kind:     model.PartText,
+			Text:     text,
+		}},
+		FinishReason: finish,
+	}
+	for i, call := range calls {
+		position := i
+		d.ToolFragments = append(d.ToolFragments, model.ToolCallFragment{
+			Position:         &position,
+			ID:               call.ID,
+			Name:             call.Name,
+			ArgumentFragment: string(call.Arguments),
 		})
 	}
+	return d
+}
+
+// usageDelta carries only trailing usage.
+func usageDelta(u model.Usage) model.StreamDelta {
+	return model.StreamDelta{Usage: &u}
+}
+
+// completedTurnStream assembles to the fixture completed output: text "done"
+// plus the given calls, with the fixture usage reported.
+func completedTurnStream(calls ...model.ToolCall) *scriptStream {
+	finish := "stop"
+	if len(calls) > 0 {
+		finish = "tool_calls"
+	}
+	return streamOf(turnDelta(finish, "done", calls...), usageDelta(model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2}))
+}
+
+// erroredTurnStream assembles to the fixture errored partial: text "partial"
+// with the fixture usage, then the read failure — an accepted stream whose
+// assembly errors while retaining the partial.
+func erroredTurnStream() *scriptStream {
+	return failStream(errors.New("provider failure"),
+		turnDelta("", "partial"), usageDelta(model.Usage{InputTokens: 5, OutputTokens: 7}))
 }
 
 // TestModelEffectReadyRemainsRunning proves the ready transition: the
@@ -234,32 +183,29 @@ func TestModelEffectReadyRemainsRunning(t *testing.T) {
 		sessionID  string
 		reservedID string
 	)
-	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		reg, err := store.ReadRegister(ctx, RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID})
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		reg, err := store.ReadRegister(context.Background(), RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID})
 		if err != nil {
-			return agent.ModelSettlement{}, err
+			return nil, err
 		}
 		op, err := decodeOperationRegister(reg)
 		if err != nil {
-			return agent.ModelSettlement{}, err
+			return nil, err
 		}
 		if op.State.ActiveEffect == nil || op.State.ActiveEffect.Kind != EffectModel {
-			return agent.ModelSettlement{}, errors.New("no model effect intent is durable while the effect runs")
+			return nil, errors.New("no model effect intent is durable while the effect runs")
 		}
 		reservedID = op.State.ActiveEffect.ResultEntryID
-		if _, err := assemble(testModelRef(), nil); err != nil {
-			return agent.ModelSettlement{}, err
-		}
-		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"), testToolCall("call-2"))}, nil
+		return completedTurnStream(testToolCall("call-1"), testToolCall("call-2")), nil
 	}
 	h, st, c, sid := newEffectHarness(t, modelFn)
 	store, sessionID = st, sid
 
 	calls := 0
 	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
-	set, err := invokeModelEffect(t, me, func(model.ModelRef, model.Stream) (model.Output, error) {
+	set, err := invokeModelEffect(t, me, func(source model.ModelRef, stream model.Stream) (model.Output, error) {
 		calls++
-		return model.Output{Status: model.OutputCompleted, Source: testModelRef()}, nil
+		return agent.Assemble(context.Background(), source, stream)
 	})
 	if err != nil {
 		t.Fatalf("model effect: %v", err)
@@ -353,11 +299,11 @@ func TestModelEffectReadyRemainsRunning(t *testing.T) {
 // the retained partial assistant commits with the fixed continuation signal
 // and the Operation stays running.
 func TestModelEffectContinueRemainsRunning(t *testing.T) {
-	modelFn := modelAssemblingOnce(agent.ModelSettlement{Disposition: agent.DispoContinue, Output: erroredOutputWith()})
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		return erroredTurnStream(), nil
+	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
-	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), func(model.ModelRef, model.Stream) (model.Output, error) {
-		return model.Output{}, nil
-	})
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil)
 	if err != nil {
 		t.Fatalf("model effect: %v", err)
 	}
@@ -404,35 +350,39 @@ func TestModelEffectContinueRemainsRunning(t *testing.T) {
 	}
 }
 
-// TestModelEffectTerminalSettlement proves the model-originated failure and
-// interruption dispositions: each terminally settles in the one result
-// transaction, preserving any produced assistant payload, interrupting every
-// unstarted call of a completed output, and consuming the effect's reserved
-// identity when no assistant payload exists.
+// TestModelEffectTerminalSettlement proves the model-derived failure and
+// interruption settlements: each terminally settles in the one result
+// transaction, preserving any produced assistant payload and consuming the
+// effect's reserved identity when no assistant payload exists.
 func TestModelEffectTerminalSettlement(t *testing.T) {
-	t.Run("failure retains the partial assistant", func(t *testing.T) {
+	t.Run("interruption retains the partial assistant", func(t *testing.T) {
 		var (
 			store      *graphStorage
 			sessionID  string
 			reservedID string
 		)
-		modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		ctx, cancel := context.WithCancel(context.Background())
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
 			reservedID = readReservedIntent(t, store, sessionID)
-			_, _ = assemble(testModelRef(), nil)
-			return agent.ModelSettlement{Disposition: agent.DispoFailure, Output: erroredOutputWith(), Detail: "model failure"}, nil
+			// the read failure is observed under the canceled execution
+			// context after the partial arrived: assembly classifies the
+			// accepted stream's output as interrupted, preserving the partial
+			s := failStream(errors.New("model failure"), turnDelta("", "partial"))
+			s.onExhausted = cancel
+			return s, nil
 		}
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
-		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), noopAssemble)
+		set, err := invokeModelEffectCtx(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), ctx, nil)
 		if err != nil {
 			t.Fatalf("model effect: %v", err)
 		}
-		if set.Disposition != agent.DispoFailure {
-			t.Fatalf("settlement disposition %q, want failure", set.Disposition)
+		if set.Disposition != agent.DispoInterruption {
+			t.Fatalf("settlement disposition %q, want interruption", set.Disposition)
 		}
 		graph, err := validateFixture(t, store, sessionID)
 		if err != nil {
-			t.Fatalf("post-failure graph: %v", err)
+			t.Fatalf("post-interruption graph: %v", err)
 		}
 		var assistant *assistantEntry
 		for i := range graph.Entries {
@@ -448,25 +398,29 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadOperation: %v", err)
 		}
-		if rec.State.Status != OperationFailure || rec.State.Terminal == nil || rec.State.Terminal.Detail != "model failure" {
-			t.Fatalf("operation state = %+v, want terminal failure with the settlement detail", rec.State)
+		if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != "stream interrupted: context canceled" {
+			t.Fatalf("operation state = %+v, want terminal interruption with the assembly's detail", rec.State)
 		}
 	})
 
-	t.Run("failure without an assistant payload settles under the reserved identity", func(t *testing.T) {
+	t.Run("nonretryable invocation failure settles under the reserved identity without an assistant payload", func(t *testing.T) {
 		var (
 			store      *graphStorage
 			sessionID  string
 			reservedID string
 		)
-		modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
 			reservedID = readReservedIntent(t, store, sessionID)
-			return agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "model failure"}, nil
+			return nil, errors.New("model failure")
 		}
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), noopAssemble); err != nil {
+		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil)
+		if err != nil {
 			t.Fatalf("model effect: %v", err)
+		}
+		if set.Disposition != agent.DispoFailure || set.Detail != "model failure" {
+			t.Fatalf("settlement = %+v, want the committed failure with its diagnostic", set)
 		}
 		graph, err := validateFixture(t, store, sessionID)
 		if err != nil {
@@ -483,87 +437,25 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 		requireSessionCleared(t, h, sessionID)
 	})
 
-	t.Run("interruption of a completed output with calls", func(t *testing.T) {
-		var (
-			store      *graphStorage
-			sessionID  string
-			reservedID string
-		)
-		modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-			reservedID = readReservedIntent(t, store, sessionID)
-			_, _ = assemble(testModelRef(), nil)
-			return agent.ModelSettlement{Disposition: agent.DispoInterruption, Output: completedOutputWith(testToolCall("call-1"), testToolCall("call-2")), Detail: "stopped mid-run"}, nil
+	t.Run("cancellation before an attempt settles without output", func(t *testing.T) {
+		attempts := 0
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
+			attempts++
+			return nil, nil
 		}
-		h, st, c, sid := newEffectHarness(t, modelFn)
-		store, sessionID = st, sid
-		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), noopAssemble)
+		h, store, c, sessionID := newEffectHarness(t, modelFn)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // the execution context dies before any attempt could start
+		me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
+		set, err := invokeModelEffectCtx(t, me, ctx, nil)
 		if err != nil {
 			t.Fatalf("model effect: %v", err)
 		}
-		if set.Disposition != agent.DispoInterruption {
-			t.Fatalf("settlement disposition %q, want interruption", set.Disposition)
+		if set.Disposition != agent.DispoInterruption || set.Detail != executionInterruptedDetail {
+			t.Fatalf("settlement = %+v, want the committed interruption settlement", set)
 		}
-		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("post-interruption graph: %v", err)
-		}
-		var assistant *assistantEntry
-		results, signals, settlements := 0, 0, 0
-		for i := range graph.Entries {
-			entry := graph.Entries[i]
-			switch {
-			case entry.Assistant != nil:
-				assistant = entry.Assistant
-			case entry.ToolResult != nil:
-				results++
-				if entry.ToolResult.Status != model.ResultInterrupted || entry.ToolResult.Content != interruptedToolResultContent {
-					t.Fatalf("tool result = %+v, want the fixed interrupted result", entry.ToolResult)
-				}
-			case entry.Signal != nil:
-				signals++
-				if entry.Signal.Signal != SignalInterruption || entry.Signal.Content != signalInterruptionContent {
-					t.Fatalf("signal = %+v, want the fixed interruption signal", entry.Signal)
-				}
-			case entry.Settlement != nil:
-				settlements++
-				if entry.Envelope.ID == reservedID {
-					t.Fatalf("settlement entry %s reused the identity consumed by the assistant", entry.Envelope.ID)
-				}
-			}
-		}
-		if assistant == nil || assistant.EntryID != reservedID || len(assistant.ToolCalls) != 2 {
-			t.Fatalf("assistant entry %v does not consume %s with two calls", assistant, reservedID)
-		}
-		if results != 2 || signals != 1 || settlements != 1 {
-			t.Fatalf("committed %d interrupted results, %d signals, %d settlements, want 2/1/1", results, signals, settlements)
-		}
-		requireSessionCleared(t, h, sessionID)
-		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != "stopped mid-run" {
-			t.Fatalf("operation state = %+v, want terminal interruption", rec.State)
-		}
-		if len(rec.State.PendingToolCalls) != 0 || rec.State.ActiveEffect != nil {
-			t.Fatalf("operation state = %+v, want no pending calls or active effect", rec.State)
-		}
-	})
-
-	t.Run("interruption without output settles under the reserved identity", func(t *testing.T) {
-		var (
-			store      *graphStorage
-			sessionID  string
-			reservedID string
-		)
-		modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-			reservedID = readReservedIntent(t, store, sessionID)
-			return agent.ModelSettlement{Disposition: agent.DispoInterruption, Detail: "stopped"}, nil
-		}
-		h, st, c, sid := newEffectHarness(t, modelFn)
-		store, sessionID = st, sid
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), noopAssemble); err != nil {
-			t.Fatalf("model effect: %v", err)
+		if attempts != 0 {
+			t.Fatalf("physical attempts = %d, want zero after observed cancellation", attempts)
 		}
 		graph, err := validateFixture(t, store, sessionID)
 		if err != nil {
@@ -580,9 +472,6 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 				signals++
 			case entry.Settlement != nil:
 				settlements++
-				if entry.Envelope.ID != reservedID {
-					t.Fatalf("settlement entry %s does not consume the reserved identity %s", entry.Envelope.ID, reservedID)
-				}
 			}
 		}
 		if signals != 1 || settlements != 1 {
@@ -597,23 +486,22 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 // already-published call ID is a protocol violation that settles terminal
 // failure instead of committing a corrupt graph.
 func TestModelEffectRepeatedCallIDSettlesFailure(t *testing.T) {
-	settlements := []agent.ModelSettlement{
-		{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"))},
-		{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"))},
+	turns := []model.Stream{
+		completedTurnStream(testToolCall("call-1")),
+		completedTurnStream(testToolCall("call-1")),
 	}
-	turns := 0
-	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		_, _ = assemble(testModelRef(), nil)
-		set := settlements[turns]
-		turns++
-		return set, nil
+	turn := 0
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		s := turns[turn]
+		turn++
+		return s, nil
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
 	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
-	if _, err := invokeModelEffect(t, me, noopAssemble); err != nil {
+	if _, err := invokeModelEffect(t, me, nil); err != nil {
 		t.Fatalf("first effect: %v", err)
 	}
-	_, err := invokeModelEffect(t, me, noopAssemble)
+	_, err := invokeModelEffect(t, me, nil)
 	if err == nil {
 		t.Fatalf("second effect settled, want the repeated-call protocol violation")
 	}
@@ -645,18 +533,11 @@ func TestModelEffectRepeatedCallIDSettlesFailure(t *testing.T) {
 // that reported usage without an eligible payload lands that usage on the
 // settlement entry and both totals.
 func TestModelEffectTerminalNoOutputUsageOnSettlement(t *testing.T) {
-	payloadless := &model.Output{
-		Status: model.OutputErrored,
-		Source: testModelRef(),
-		Detail: "empty failure",
-		Usage:  &model.Usage{InputTokens: 4, CachedInputTokens: 2, OutputTokens: 6},
-	}
-	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		_, _ = assemble(testModelRef(), nil)
-		return agent.ModelSettlement{Disposition: agent.DispoFailure, Output: payloadless, Detail: "model failure"}, nil
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		return failStream(errors.New("empty failure"), usageDelta(model.Usage{InputTokens: 4, CachedInputTokens: 2, OutputTokens: 6})), nil
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
-	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), noopAssemble); err != nil {
+	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err != nil {
 		t.Fatalf("model effect: %v", err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
@@ -691,12 +572,6 @@ func TestModelEffectTerminalNoOutputUsageOnSettlement(t *testing.T) {
 	}
 }
 
-// noopAssemble is an assembly callback that must never run; only the
-// outputless, call-free settlements use it.
-func noopAssemble(model.ModelRef, model.Stream) (model.Output, error) {
-	return model.Output{}, nil
-}
-
 // readReservedIntent reads the active model effect's reserved result identity
 // from durable state. It runs inside a prepared model function, between the
 // committed intent and the result transaction.
@@ -729,7 +604,7 @@ func requireSessionCleared(t *testing.T, h *Harness, sessionID string) {
 	}
 }
 
-// TestModelEffectPublicationFailureLeavesIntentState proves the result
+// TestModelEffectPublicationFailureLeavesIntentState proves the model result
 // transaction's atomicity: an injected failure at any producer step rolls the
 // whole settlement back, leaving the committed running/intent state for
 // recovery and publishing nothing.
@@ -739,15 +614,12 @@ func TestModelEffectPublicationFailureLeavesIntentState(t *testing.T) {
 		nth  int
 	}{
 		{"insert_entry", 1},     // the assistant entry
-		{"insert_entry", 3},     // the second interrupted tool result
-		{"insert_entry", 5},     // the settlement entry
 		{"replace_register", 2}, // the result transaction's Operation register
 		{"replace_register", 3}, // the result transaction's Session register
 	} {
 		t.Run(fmt.Sprintf("publication failure at %s #%d", fail.step, fail.nth), func(t *testing.T) {
-			modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-				_, _ = assemble(testModelRef(), nil)
-				return agent.ModelSettlement{Disposition: agent.DispoInterruption, Output: completedOutputWith(testToolCall("call-1"), testToolCall("call-2")), Detail: "stopped"}, nil
+			modelFn := func(context.Context, model.Request) (model.Stream, error) {
+				return completedTurnStream(testToolCall("call-1"), testToolCall("call-2")), nil
 			}
 			h, store, c, sessionID := newEffectHarness(t, modelFn)
 			count := 0
@@ -761,7 +633,7 @@ func TestModelEffectPublicationFailureLeavesIntentState(t *testing.T) {
 				}
 				return nil
 			}
-			if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), noopAssemble); err == nil {
+			if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err == nil {
 				t.Fatalf("model effect succeeded past an injected %s failure", fail.step)
 			}
 			graph, err := validateFixture(t, store, sessionID)
@@ -973,13 +845,12 @@ func foreignEffectRace(t *testing.T, store *graphStorage, sessionID, operationID
 // observes the foreign state instead of the stale view.
 func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 	t.Run("intent transaction", func(t *testing.T) {
-		modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-			_, _ = assemble(testModelRef(), nil)
-			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
+			return completedTurnStream(), nil
 		}
 		h, store, c, sessionID := newEffectHarness(t, modelFn)
 		foreignEffectRace(t, store, sessionID, testOpID, "foreign")
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), noopAssemble); !errors.Is(err, ErrConflict) {
+		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); !errors.Is(err, ErrConflict) {
 			t.Fatalf("intent over a foreign revision = %v, want the revision-race conflict", err)
 		}
 		if session, err := h.ReadSession(context.Background(), sessionID); err != nil || session.State.CurrentAgentType != "foreign" {
@@ -991,14 +862,13 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 			store     *graphStorage
 			sessionID string
 		)
-		modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
 			foreignEffectRace(t, store, sessionID, testOpID, "foreign") // between the committed intent and the result transaction
-			_, _ = assemble(testModelRef(), nil)
-			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+			return completedTurnStream(), nil
 		}
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), noopAssemble); !errors.Is(err, ErrConflict) {
+		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); !errors.Is(err, ErrConflict) {
 			t.Fatalf("result over a foreign revision = %v, want the revision-race conflict", err)
 		}
 		if session, err := h.ReadSession(context.Background(), sessionID); err != nil || session.State.CurrentAgentType != "foreign" {
@@ -1015,23 +885,6 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 			t.Fatalf("session after the race = %+v (%v), want the foreign agent type", session, err)
 		}
 	})
-}
-
-// TestModelEffectCompletedContinueSettlesFailure proves the plan's rule that
-// only the wrapper's own steering decision may produce a completed-output
-// continue: a prepared callback returning that combination settles terminal
-// failure and publishes no model result.
-func TestModelEffectCompletedContinueSettlesFailure(t *testing.T) {
-	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		_, _ = assemble(testModelRef(), nil)
-		return agent.ModelSettlement{Disposition: agent.DispoContinue, Output: completedOutputWith()}, nil
-	}
-	h, store, c, sessionID := newEffectHarness(t, modelFn)
-	_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), noopAssemble)
-	if err == nil {
-		t.Fatalf("completed-output continue settled, want a protocol error")
-	}
-	requireTerminalFailure(t, h, store, sessionID, err)
 }
 
 // archiveSettledSession moves one open Session with no running Operation to
@@ -1079,9 +932,11 @@ func archiveSettledSession(t *testing.T, c *coordinator, store *graphStorage, se
 // steering target.
 func TestSteeringInputPreconditions(t *testing.T) {
 	t.Run("steering after terminal settlement", func(t *testing.T) {
-		modelFn := modelReturning(agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "model failure"})
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
+			return nil, errors.New("model failure")
+		}
 		h, store, c, sessionID := newEffectHarness(t, modelFn)
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), noopAssemble); err != nil {
+		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err != nil {
 			t.Fatalf("terminal effect: %v", err)
 		}
 		before, err := validateFixture(t, store, sessionID)
@@ -1100,9 +955,11 @@ func TestSteeringInputPreconditions(t *testing.T) {
 		}
 	})
 	t.Run("steering on an archived session", func(t *testing.T) {
-		modelFn := modelReturning(agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "model failure"})
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
+			return nil, errors.New("model failure")
+		}
 		h, store, c, sessionID := newEffectHarness(t, modelFn)
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), noopAssemble); err != nil {
+		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err != nil {
 			t.Fatalf("terminal effect: %v", err)
 		}
 		archiveSettledSession(t, c, store, sessionID)
@@ -1172,8 +1029,11 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 	t.Run("intent over a foreign terminal operation", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
 		foreignTerminalSettle(t, store, sessionID, testOpID)
-		me := h.modelEffect(c, testOpID, effectExecution(modelReturning(agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}), nil), testCapture())
-		if _, err := invokeModelEffect(t, me, noopAssemble); !errors.Is(err, ErrInvalid) {
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
+			return completedTurnStream(), nil
+		}
+		me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
+		if _, err := invokeModelEffect(t, me, nil); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("intent over a foreign terminal operation = %v, want ErrInvalid", err)
 		}
 	})
@@ -1182,14 +1042,13 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 			store     *graphStorage
 			sessionID string
 		)
-		modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
 			foreignTerminalSettle(t, store, sessionID, testOpID) // between the committed intent and the result transaction
-			_, _ = assemble(testModelRef(), nil)
-			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+			return completedTurnStream(), nil
 		}
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), noopAssemble); !errors.Is(err, ErrInvalid) {
+		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("result over a foreign terminal operation = %v, want ErrInvalid", err)
 		}
 	})
@@ -1257,7 +1116,7 @@ func newOpenerHarness(t *testing.T, open func(context.Context, OperationAdmissio
 // newExecutionHarness admits one running Operation ("op-1") under a cancelable
 // Harness context with both prepared effect functions, returning the pieces
 // the execution fixtures need.
-func newExecutionHarness(t *testing.T, modelFn agent.ModelEffect, toolFn func(context.Context, model.ToolCall) PreparedTool) (*Harness, *graphStorage, *coordinator, string, PreparedExecution, context.CancelFunc) {
+func newExecutionHarness(t *testing.T, modelFn func(context.Context, model.Request) (model.Stream, error), toolFn func(context.Context, model.ToolCall) PreparedTool) (*Harness, *graphStorage, *coordinator, string, PreparedExecution, context.CancelFunc) {
 	t.Helper()
 	if toolFn == nil {
 		t.Fatalf("execution fixtures require a prepared tool function")
@@ -1267,7 +1126,8 @@ func newExecutionHarness(t *testing.T, modelFn agent.ModelEffect, toolFn func(co
 	})
 }
 
-// invokeModelEffectCtx drives one model effect with an explicit context.
+// invokeModelEffectCtx drives one model effect with an explicit context; a nil
+// assemble callback runs the real Agent assembly.
 func invokeModelEffectCtx(t *testing.T, me agent.ModelEffect, ctx context.Context, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 	t.Helper()
 	req, err := model.NewRequest(model.Request{
@@ -1277,19 +1137,23 @@ func invokeModelEffectCtx(t *testing.T, me agent.ModelEffect, ctx context.Contex
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
+	if assemble == nil {
+		assemble = func(source model.ModelRef, stream model.Stream) (model.Output, error) {
+			return agent.Assemble(ctx, source, stream)
+		}
+	}
 	return me(ctx, req, assemble)
 }
 
 // TestModelEffectGateSkipsCallbackOnCancellation proves execution cancellation
 // stops new callbacks: a context dying between the committed intent and the
-// prepared callback settles the Operation as terminal interruption without
+// physical request settles the Operation as terminal interruption without
 // ever starting the callback.
 func TestModelEffectGateSkipsCallbackOnCancellation(t *testing.T) {
 	invoked := 0
-	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
 		invoked++
-		_, _ = assemble(testModelRef(), nil)
-		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+		return completedTurnStream(), nil
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1300,9 +1164,7 @@ func TestModelEffectGateSkipsCallbackOnCancellation(t *testing.T) {
 		return nil
 	}
 	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
-	set, err := invokeModelEffectCtx(t, me, ctx, func(model.ModelRef, model.Stream) (model.Output, error) {
-		return model.Output{}, nil
-	})
+	set, err := invokeModelEffectCtx(t, me, ctx, nil)
 	if err != nil {
 		t.Fatalf("model effect: %v", err)
 	}
@@ -1329,7 +1191,9 @@ func TestModelEffectGateSkipsCallbackOnCancellation(t *testing.T) {
 // composition and the outer terminal settlement: a clean run settles success
 // through the common terminal helper with no detail.
 func TestExecuteSuccessSettlesOuterTerminal(t *testing.T) {
-	modelFn := modelAssemblingOnce(agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()})
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		return completedTurnStream(), nil
+	}
 	spy := &toolSpy{}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
 	if err := h.execute(c, testOpID, prepared); err != nil {
@@ -1371,7 +1235,9 @@ func TestExecuteOpensOnceWithCommittedAdmission(t *testing.T) {
 		adm OperationAdmission
 	}
 	var opens []openRecord
-	modelFn := modelAssemblingOnce(agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()})
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		return completedTurnStream(), nil
+	}
 	spy := &toolSpy{}
 	h, _, c, sessionID, prepared, _ := newOpenerHarness(t, func(ctx context.Context, adm OperationAdmission) (Execution, error) {
 		opens = append(opens, openRecord{ctx: ctx, adm: adm})
@@ -1409,7 +1275,10 @@ func TestExecuteCanceledBeforeOpenSkipsOpener(t *testing.T) {
 	opens := 0
 	h, store, c, sessionID, prepared, cancel := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
 		opens++
-		return effectExecution(modelAssemblingOnce(agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}), func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }), nil
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
+			return completedTurnStream(), nil
+		}
+		return effectExecution(modelFn, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }), nil
 	})
 	cancel() // the execution context is lost before the opener could start
 	if err := h.execute(c, testOpID, prepared); !errors.Is(err, context.Canceled) {
@@ -1442,9 +1311,9 @@ func TestExecuteOpenerErrorSettlesOrdinaryTerminals(t *testing.T) {
 		modelRuns := 0
 		h, store, c, sessionID, prepared, _ := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
 			return Execution{
-				Model: func(context.Context, model.Request, agent.AssemblyCallback) (agent.ModelSettlement, error) {
+				Model: func(context.Context, model.Request) (model.Stream, error) {
 					modelRuns++
-					return agent.ModelSettlement{}, nil
+					return nil, nil
 				},
 				Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
 			}, openErr
@@ -1506,9 +1375,9 @@ func TestExecuteInvalidOpenedExecutionClosesBeforeRejection(t *testing.T) {
 			var statusDuringClose OperationState
 			modelRuns := 0
 			open := func(_ context.Context, adm OperationAdmission) (Execution, error) {
-				exec := effectExecution(func(context.Context, model.Request, agent.AssemblyCallback) (agent.ModelSettlement, error) {
+				exec := effectExecution(func(context.Context, model.Request) (model.Stream, error) {
 					modelRuns++
-					return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+					return completedTurnStream(), nil
 				}, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} })
 				switch name {
 				case "nil model":
@@ -1573,13 +1442,10 @@ func TestExecuteInvalidOpenedExecutionClosesBeforeRejection(t *testing.T) {
 func TestToolEffectPlansAndOutcomes(t *testing.T) {
 	publishCalls := func(t *testing.T, h *Harness, c *coordinator, sessionID string) {
 		t.Helper()
-		modelFn := modelAssemblingOnce(agent.ModelSettlement{
-			Disposition: agent.DispoReady,
-			Output:      completedOutputWith(testToolCall("call-1")),
-		})
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), func(model.ModelRef, model.Stream) (model.Output, error) {
-			return model.Output{}, nil
-		}); err != nil {
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
+			return completedTurnStream(testToolCall("call-1")), nil
+		}
+		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err != nil {
 			t.Fatalf("model effect: %v", err)
 		}
 	}
@@ -2141,16 +2007,13 @@ func TestToolEffectAdvertisementGate(t *testing.T) {
 		normalized++
 		return objectNormalize(call)
 	}
-	modelFn := modelAssemblingOnce(agent.ModelSettlement{
-		Disposition: agent.DispoReady,
-		Output: completedOutputWith(
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		return completedTurnStream(
 			model.ToolCall{ID: "call-1", Name: "ghost", Arguments: json.RawMessage(`{"x":1}`)},
 			testToolCall("call-2"),
-		),
-	})
-	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), func(model.ModelRef, model.Stream) (model.Output, error) {
-		return model.Output{}, nil
-	}); err != nil {
+		), nil
+	}
+	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), nil); err != nil {
 		t.Fatalf("model effect: %v", err)
 	}
 	if normalized != 1 {
@@ -2195,10 +2058,10 @@ func TestToolEffectAdvertisementGate(t *testing.T) {
 func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 	publishWithNormalize := func(t *testing.T, h *Harness, c *coordinator, normalize func(model.ToolCall) (json.RawMessage, error), calls ...model.ToolCall) {
 		t.Helper()
-		modelFn := modelAssemblingOnce(agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(calls...)})
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), func(model.ModelRef, model.Stream) (model.Output, error) {
-			return model.Output{}, nil
-		}); err != nil {
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
+			return completedTurnStream(calls...), nil
+		}
+		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), nil); err != nil {
 			t.Fatalf("model effect: %v", err)
 		}
 	}
@@ -2499,15 +2362,12 @@ func TestToolOutcomeMetadataRules(t *testing.T) {
 // result, and the run continues to the outer success settlement.
 func TestExecuteOrderedBatchSettlesExactlyOnce(t *testing.T) {
 	turn := 0
-	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		if err := assembleCompleted(assemble); err != nil {
-			return agent.ModelSettlement{}, err
-		}
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
 		turn++
 		if turn == 1 {
-			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"), testToolCall("call-2"))}, nil
+			return completedTurnStream(testToolCall("call-1"), testToolCall("call-2")), nil
 		}
-		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+		return completedTurnStream(), nil
 	}
 	spy := &toolSpy{}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
@@ -2549,15 +2409,12 @@ func TestExecuteOrderedBatchSettlesExactlyOnce(t *testing.T) {
 func TestToolEffectRealOutcomeWinsCancellationRace(t *testing.T) {
 	var cancel context.CancelFunc
 	turn := 0
-	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		if err := assembleCompleted(assemble); err != nil {
-			return agent.ModelSettlement{}, err
-		}
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
 		turn++
 		if turn == 1 {
-			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"))}, nil
+			return completedTurnStream(testToolCall("call-1")), nil
 		}
-		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+		return completedTurnStream(), nil
 	}
 	toolFn := func(_ context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Execute: func(ctx context.Context) ToolOutcome {
@@ -2596,15 +2453,12 @@ func TestToolEffectRealOutcomeWinsCancellationRace(t *testing.T) {
 // interrupted result through the common terminal helper.
 func TestToolOriginatedInterruptionSettlesUnstartedCalls(t *testing.T) {
 	turn := 0
-	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		if err := assembleCompleted(assemble); err != nil {
-			return agent.ModelSettlement{}, err
-		}
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
 		turn++
 		if turn == 1 {
-			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"), testToolCall("call-2"))}, nil
+			return completedTurnStream(testToolCall("call-1"), testToolCall("call-2")), nil
 		}
-		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+		return completedTurnStream(), nil
 	}
 	toolFn := func(_ context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
@@ -2652,15 +2506,15 @@ func TestToolOriginatedInterruptionSettlesUnstartedCalls(t *testing.T) {
 func TestExecuteBetweenEffectCancellationSettlesInterruption(t *testing.T) {
 	turn := 0
 	var cancel context.CancelFunc
-	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		if err := assembleCompleted(assemble); err != nil {
-			return agent.ModelSettlement{}, err
-		}
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
 		turn++
 		if turn == 2 {
-			cancel() // the execution context dies between the first and second effect
+			// the execution context dies when assembly closes the accepted
+			// stream: the ready result still commits without cancellation
+			// and the run's next checkpoint settles the interruption
+			return &cancelOnCloseStream{scriptStream: completedTurnStream(), cancel: cancel}, nil
 		}
-		return agent.ModelSettlement{Disposition: agent.DispoContinue, Output: erroredOutputWith()}, nil
+		return erroredTurnStream(), nil
 	}
 	h, store, c, sessionID, prepared, harnessCancel := newExecutionHarness(t, modelFn, func(_ context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
@@ -2686,11 +2540,8 @@ func TestExecuteBetweenEffectCancellationSettlesInterruption(t *testing.T) {
 // the outer path: the Operation settles failure with the Agent's cap detail
 // after the last settled continuation.
 func TestExecuteCapSettlesFailure(t *testing.T) {
-	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		if err := assembleCompleted(assemble); err != nil {
-			return agent.ModelSettlement{}, err
-		}
-		return agent.ModelSettlement{Disposition: agent.DispoContinue, Output: erroredOutputWith()}, nil
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		return erroredTurnStream(), nil
 	}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, func(_ context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
@@ -2724,33 +2575,17 @@ func TestExecuteCapSettlesFailure(t *testing.T) {
 	requireSessionCleared(t, h, sessionID)
 }
 
-// completedStream is a fake accepted model stream yielding one completed text
-// response, for composition fixtures driving the real Agent assembly callback.
-type completedStream struct {
-	i int
+// cancelOnCloseStream cancels the execution context when the assembly closes
+// the consumed stream: after consumption but before the result commit, whose
+// transaction runs without cancellation.
+type cancelOnCloseStream struct {
+	*scriptStream
+	cancel context.CancelFunc
 }
 
-func (s *completedStream) Recv() (model.StreamDelta, error) {
-	if s.i > 0 {
-		return model.StreamDelta{}, io.EOF
-	}
-	s.i++
-	return model.StreamDelta{
-		HasChoice:        true,
-		Role:             "assistant",
-		ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "done"}},
-		FinishReason:     "stop",
-	}, nil
-}
-
-func (s *completedStream) Close() error { return nil }
-
-// assembleCompleted runs the real assembly callback over one fake completed
-// stream; every output-bearing settlement of the composition fixtures needs
-// exactly one successful assembly behind it.
-func assembleCompleted(assemble agent.AssemblyCallback) error {
-	_, err := assemble(testModelRef(), &completedStream{})
-	return err
+func (s *cancelOnCloseStream) Close() error {
+	s.cancel()
+	return s.scriptStream.Close()
 }
 
 // TestToolResultAdoptsIntoView proves a committed tool result adopts into the
@@ -2797,10 +2632,10 @@ func TestToolResultAdoptsIntoView(t *testing.T) {
 // pending, for direct tool-effect fixtures.
 func publishCalls(t *testing.T, h *Harness, c *coordinator, sessionID string, calls ...model.ToolCall) {
 	t.Helper()
-	modelFn := modelAssemblingOnce(agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(calls...)})
-	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), func(model.ModelRef, model.Stream) (model.Output, error) {
-		return model.Output{}, nil
-	}); err != nil {
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		return completedTurnStream(calls...), nil
+	}
+	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err != nil {
 		t.Fatalf("model effect: %v", err)
 	}
 }
@@ -2812,7 +2647,9 @@ func publishCalls(t *testing.T, h *Harness, c *coordinator, sessionID string, ca
 // interruption detail; anything else settles failure with the error's text.
 func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 	t.Run("storage failure leaves the running state for recovery", func(t *testing.T) {
-		modelFn := modelAssemblingOnce(agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"))})
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
+			return completedTurnStream(testToolCall("call-1")), nil
+		}
 		spy := &toolSpy{}
 		h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
 		replaces := 0
@@ -2958,19 +2795,16 @@ func TestAssistantEntryOriginalNormalizationCommitsAtProducer(t *testing.T) {
 		}
 		return objectNormalize(call)
 	}
-	modelFn := modelAssemblingOnce(agent.ModelSettlement{
-		Disposition: agent.DispoReady,
-		Output: completedOutputWith(
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		return completedTurnStream(
 			model.ToolCall{ID: "call-1", Name: "echo", Arguments: valid},
 			model.ToolCall{ID: "call-2", Name: "echo", Arguments: malformed},
 			model.ToolCall{ID: "call-3", Name: "echo", Arguments: json.RawMessage(`{"x":1}`)},
 			model.ToolCall{ID: "call-4", Name: "ghost", Arguments: json.RawMessage(`{"x":1}`)},
-		),
-	})
+		), nil
+	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
-	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), func(model.ModelRef, model.Stream) (model.Output, error) {
-		return model.Output{}, nil
-	}); err != nil {
+	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), nil); err != nil {
 		t.Fatalf("model effect: %v", err)
 	}
 	if normalized != 3 {
@@ -3012,11 +2846,8 @@ func TestAssistantEntryOriginalNormalizationCommitsAtProducer(t *testing.T) {
 // transaction aborted by cancellation settles the cancellation outcome: the
 // run ends in the fixed terminal interruption, never in a boundary violation.
 func TestModelEffectIntentCancellationSettlesInterruption(t *testing.T) {
-	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		if err := assembleCompleted(assemble); err != nil {
-			return agent.ModelSettlement{}, err
-		}
-		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, nil
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		return completedTurnStream(), nil
 	}
 	spy := &toolSpy{}
 	var cancel context.CancelFunc
@@ -3062,11 +2893,8 @@ func TestModelEffectIntentCancellationSettlesInterruption(t *testing.T) {
 // metadata member even though the executor plan would have produced
 // well-formed bounded metadata.
 func TestToolEffectIntentCancellationSettlesInterrupted(t *testing.T) {
-	modelFn := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		if err := assembleCompleted(assemble); err != nil {
-			return agent.ModelSettlement{}, err
-		}
-		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"), testToolCall("call-2"))}, nil
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		return completedTurnStream(testToolCall("call-1"), testToolCall("call-2")), nil
 	}
 	toolFn := func(_ context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {

@@ -9,7 +9,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -57,9 +56,9 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 			}},
 		}
 		script := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompletedWithCalls("call-1")}, // the turn publishes the call
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},               // the turn completes after the result
-			agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "drained turn settled"},           // the drained item's own terminal
+			publicTurn("call-1"),               // the turn publishes the call
+			publicTurn(),                       // the turn completes after the result
+			publicFail("drained turn settled"), // the drained item's own terminal
 		)
 		f := newPublicFixture(t, store, script, nil)
 		f.prepareHook = func(_ int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
@@ -178,7 +177,7 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 		// asserted present in the source prefix and absent from the fork.
 		boundary := forkEntryOf(t, store, session, harness.EntryInput, "op-2")
 		before := snapshotSession(t, store, session)
-		forkScript := newScriptModel(agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "fork turn settled"})
+		forkScript := newScriptModel(publicFail("fork turn settled"))
 		f2 := newPublicFixture(t, store, forkScript, nil)
 		defer f2.close()
 		res, err := f2.h.Fork(ctx, harness.ForkRequest{SourceSessionID: session, BoundaryEntryID: boundary.ID, OperationID: "fork-1", Content: []model.ContentPart{{Kind: model.PartText, Text: "fork input"}}})
