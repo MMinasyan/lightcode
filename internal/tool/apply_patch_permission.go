@@ -2,20 +2,15 @@ package tool
 
 import "github.com/MMinasyan/lightcode/internal/permission"
 
-func applyPatchPermissionPlanWithOptions(check CheckFunc, workspaceRoot string, params map[string]any, opts CapabilityOptions) (targets []applyPatchTarget, perPath []permission.Decision, aggregate permission.Decision, err error) {
-	_, targets, err = resolveApplyPatchTargetsWithOptions(workspaceRoot, params, opts)
-	if err != nil || len(targets) == 0 {
-		return nil, nil, permission.DecisionAsk, err
-	}
+// planApplyPatchPermissions evaluates the check per canonical target and
+// aggregates the decisions: Deny is sticky, Ask never promotes to Allow.
+func planApplyPatchPermissions(check CheckFunc, targets []applyPatchTarget) permission.Decision {
 	if check == nil {
-		return targets, nil, permission.DecisionAsk, nil
+		return permission.DecisionAsk
 	}
-	perPath = make([]permission.Decision, len(targets))
-	aggregate = permission.DecisionAllow
-	for i, target := range targets {
-		d := check("apply_patch", target.CanonicalPath)
-		perPath[i] = d
-		switch d {
+	aggregate := permission.DecisionAllow
+	for _, target := range targets {
+		switch check("apply_patch", target.CanonicalPath) {
 		case permission.DecisionDeny:
 			// Deny is sticky: any Deny in any path denies the whole patch
 			// regardless of what other paths decide.
@@ -29,5 +24,5 @@ func applyPatchPermissionPlanWithOptions(check CheckFunc, workspaceRoot string, 
 			}
 		}
 	}
-	return targets, perPath, aggregate, nil
+	return aggregate
 }

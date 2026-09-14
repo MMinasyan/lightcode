@@ -38,7 +38,7 @@ type hunkLocation struct {
 }
 
 type hunkPatternLine struct {
-	kind lineKind
+	kind LineKind
 	text string
 }
 
@@ -71,8 +71,8 @@ func locateHunk(lines []string, h hunk, path string, cursor int) (hunkLocation, 
 func patternFromHunk(h hunk) []hunkPatternLine {
 	out := make([]hunkPatternLine, 0, len(h.lines))
 	for _, hl := range h.lines {
-		if hl.kind == lineContext || hl.kind == lineRemove {
-			out = append(out, hunkPatternLine{kind: hl.kind, text: hl.text})
+		if hl.Kind == LineContext || hl.Kind == LineRemove {
+			out = append(out, hunkPatternLine{kind: hl.Kind, text: hl.Text})
 		}
 	}
 	return out
@@ -117,7 +117,7 @@ func locateSeq(lines []string, pattern []hunkPatternLine, path string, cursor in
 	// End-of-file empty-line retry: if the pattern's last line is empty,
 	// drop it and retry. This handles the common case of a file with no
 	// trailing newline whose pattern's trailing context line is blank.
-	if last := pattern[len(pattern)-1]; last.kind == lineContext && last.text == "" {
+	if last := pattern[len(pattern)-1]; last.kind == LineContext && last.text == "" {
 		trimmed := pattern[:len(pattern)-1]
 		maxStartTrim := len(lines) - len(trimmed)
 		if maxStartTrim >= c {

@@ -449,12 +449,18 @@ func TestModelSuppliedCanonicalPathParamIsIgnored(t *testing.T) {
 	if got := PermissionCheckArg("read_file", params); got != realPath {
 		t.Fatalf("PermissionCheckArg = %q, want real path %q", got, realPath)
 	}
-	got, err := fileSecurityPath(params, realPath)
-	if err != nil {
-		t.Fatalf("fileSecurityPath error = %v", err)
+	// A model-supplied string under the private key can never satisfy the
+	// typed binding: the approved-binding extraction ignores it, and
+	// normalization strips it before execution.
+	if binding := approvedBindingFromParams(params); binding.canonical != "" {
+		t.Fatalf("approvedBindingFromParams = %q, want the spoofed string ignored", binding.canonical)
 	}
-	if got != realPath {
-		t.Fatalf("fileSecurityPath = %q, want real path %q", got, realPath)
+	clean, err := NormalizeReadArgs(params, 500)
+	if err != nil {
+		t.Fatalf("NormalizeReadArgs error = %v", err)
+	}
+	if _, forged := clean[canonicalPathParam]; forged {
+		t.Fatal("normalization retained the model-supplied private canonical path field")
 	}
 }
 
@@ -589,43 +595,35 @@ func denyIfAsked(t *testing.T) AskFunc {
 // be preceded within 3 lines by a comment containing "re-resolve canonical"
 // so the defense-in-depth intent is documented at each call site and a
 // future refactor cannot silently elide the re-resolution.
+// TestPR11Closure_FileSecurityPathDoubleValidationCommented pins the
+// double canonical validation for read/write/edit through the shared
+// preparation bodies: the binding is compared at preparation
+// (bindCanonicalTarget) and the bound call is revalidated before content
+// access and again after snapshot capture (bound.revalidate).
 func TestPR11Closure_FileSecurityPathDoubleValidationCommented(t *testing.T) {
 	_, file, _, _ := runtime.Caller(0)
 	dir := filepath.Dir(file)
-	totalSites := 0
-	for _, src := range []string{"write_file.go", "edit_file.go"} {
-		path := filepath.Join(dir, src)
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
+	path := filepath.Join(dir, "prepare.go")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(data), "\n")
+	bindingSites := 0
+	closureSites := 0
+	for _, line := range lines {
+		if strings.Contains(line, "canonicalChangedError(approvedCanonical") || strings.Contains(line, "canonicalChangedError(boundCanonical") {
+			bindingSites++
 		}
-		lines := strings.Split(string(data), "\n")
-		var callSites []int
-		for i, line := range lines {
-			if strings.Contains(line, "fileSecurityPathAtRoot(") {
-				callSites = append(callSites, i)
-			}
-		}
-		if len(callSites) != 2 {
-			t.Errorf("%s: expected 2 fileSecurityPath call sites, got %d", src, len(callSites))
-			continue
-		}
-		totalSites += len(callSites)
-		for _, idx := range callSites {
-			commented := false
-			for j := idx - 3; j < idx && j >= 0; j++ {
-				if strings.Contains(lines[j], "re-resolve canonical") {
-					commented = true
-					break
-				}
-			}
-			if !commented {
-				t.Errorf("fileSecurityPath at %s:%d lacks // re-resolve canonical comment in preceding 3 lines: %q",
-					src, idx+1, strings.TrimSpace(lines[idx]))
-			}
+		if strings.Contains(line, "bound.revalidate()") {
+			closureSites++
 		}
 	}
-	if totalSites != 4 {
-		t.Fatalf("expected 4 fileSecurityPath call sites total across write_file.go + edit_file.go, got %d", totalSites)
+	// 2 binding comparisons (bindCanonicalTarget + revalidateTarget);
+	// 5 closure revalidations (read/write/edit closures + write/edit
+	// post-snapshot bookkeeping).
+	if bindingSites != 2 || closureSites != 5 {
+		t.Fatalf("prepare.go: expected 2 binding-comparison and 5 closure-revalidation sites, got %d and %d",
+			bindingSites, closureSites)
 	}
 }

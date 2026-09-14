@@ -199,16 +199,12 @@ func (w *WriteFile) ParametersSchema() map[string]any {
 	}
 }
 
-type writeResult struct {
-	Result string
-}
-
 func (w *WriteFile) Execute(_ context.Context, params map[string]any) (string, error) {
-	res, err := writeFileExecCommon(params, w.tracker, w.cfg, w.workspaceRoot)
+	prepared, err := prepareWriteCall(w.workspaceRoot, nil, w.tracker, params)
 	if err != nil {
 		return "", err
 	}
-	return res.Result, nil
+	return prepared.Execute(context.Background())
 }
 
 // WriteFileWithSnapshot wraps WriteFile so that every successful write
@@ -238,94 +234,15 @@ func (*WriteFileWithSnapshot) ParametersSchema() map[string]any {
 }
 
 func (w *WriteFileWithSnapshot) Execute(_ context.Context, params map[string]any) (string, error) {
-	path, _ := params["path"].(string)
-	if path == "" {
-		return "", fmt.Errorf("write_file: path is required")
-	}
-	displayAbsPath, err := fileDisplayAbsPathAtRoot(w.workspaceRoot, path)
+	prepared, err := prepareWriteCall(w.workspaceRoot, w.store, w.tracker, params)
 	if err != nil {
-		return "", fmt.Errorf("write_file: resolve path: %w", err)
-	}
-	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
-	securityPath, err := fileSecurityPathAtRoot(w.workspaceRoot, params, path)
-	if err != nil {
-		return "", fmt.Errorf("write_file: resolve path: %w", err)
-	}
-	if err := preflightWriteSnapshotTarget(securityPath, w.tracker); err != nil {
 		return "", err
 	}
-	// The write path revalidates the approved target after snapshotting; if
-	// that pre-mutation validation fails, release only this tool's snapshot claim.
-	snapshot, err := snapshotFileForMutation(w.store, w.store.CurrentTurn(), displayAbsPath, securityPath)
-	if err != nil {
-		return "", fmt.Errorf("write_file: snapshot: %w", err)
-	}
-	defer releaseSnapshotMutation(snapshot)
-	res, mutationStarted, err := writeFileExecCommonForSnapshot(params, w.tracker, w.cfg, w.workspaceRoot)
-	if err != nil {
-		if !mutationStarted {
-			if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
-				return "", fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
-			}
-		} else {
-			err = retainFailedMutatedSnapshot(snapshot, securityPath, err)
-		}
-		return "", err
-	}
-	content, _ := params["content"].(string)
-	if err := recordMutatedSnapshotContent(snapshot, []byte(content)); err != nil {
-		retainMutatedSnapshot(snapshot)
-		return "", fmt.Errorf("write_file: record snapshot identity: %w", err)
-	}
-	retainMutatedSnapshot(snapshot)
-	return res.Result, nil
+	return prepared.Execute(context.Background())
 }
 
-// writeFileExecCommon is the shared implementation.
-func writeFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) (*writeResult, error) {
-	res, _, err := writeFileExecCommonForSnapshot(params, tracker, cfg, workspaceRoot)
-	return res, err
-}
-
-func writeFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) (*writeResult, bool, error) {
-	path, _ := params["path"].(string)
-	if path == "" {
-		return nil, false, fmt.Errorf("write_file: path is required")
-	}
-	content, _ := params["content"].(string)
-
-	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
-	absPath, err := fileSecurityPathAtRoot(workspaceRoot, params, path)
-	if err != nil {
-		return nil, false, fmt.Errorf("write_file: resolve path: %w", err)
-	}
-
-	f, openedExisting, mutationStarted, err := openWriteTargetForMutation(absPath, tracker)
-	if err != nil {
-		return nil, mutationStarted, fmt.Errorf("write_file: %w", err)
-	}
-	defer f.Close()
-
-	if openedExisting {
-		mutationStarted = true
-	}
-	if err := f.Truncate(0); err != nil {
-		return nil, mutationStarted, fmt.Errorf("write_file: truncate: %w", err)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, mutationStarted, fmt.Errorf("write_file: seek: %w", err)
-	}
-	if _, err := f.Write([]byte(content)); err != nil {
-		return nil, mutationStarted, fmt.Errorf("write_file: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		return nil, mutationStarted, fmt.Errorf("write_file: sync: %w", err)
-	}
-
-	return &writeResult{
-		Result: fmt.Sprintf("Wrote %s.", path),
-	}, mutationStarted, nil
-}
+// openWriteTargetForMutation opens the canonical write target through the
+// shared safefs primitives.
 
 func openWriteTargetForMutation(absPath string, tracker *FileTracker) (mutationFile, bool, bool, error) {
 	return openWriteTargetForMutationFunc(absPath, tracker)

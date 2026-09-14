@@ -17,6 +17,10 @@ func OpenExisting(path string, flag int) (*os.File, error) {
 	return nil, unsupported(path)
 }
 
+func OpenDirectory(path string) (*os.File, error) {
+	return nil, unsupported(path)
+}
+
 func OpenForWrite(path string, perm os.FileMode) (*os.File, bool, error) {
 	return nil, false, unsupported(path)
 }

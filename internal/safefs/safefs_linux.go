@@ -38,6 +38,35 @@ func OpenExisting(path string, flag int) (*os.File, error) {
 	return os.NewFile(uintptr(fd), path), nil
 }
 
+// OpenDirectory opens path as a directory without following any symlink in
+// the parent components or the final leaf, reusing the no-follow traversal
+// of openParent plus a no-follow leaf open. It supports "/" and ordinary
+// directories and performs no regular-file hardlink checks; the descriptor
+// backs authorized directory listings only.
+func OpenDirectory(path string) (*os.File, error) {
+	clean := filepath.Clean(path)
+	if !filepath.IsAbs(clean) {
+		return nil, fmt.Errorf("safefs: path must be absolute: %s", path)
+	}
+	if clean == string(filepath.Separator) {
+		fd, err := unix.Open(clean, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return nil, &os.PathError{Op: "open", Path: clean, Err: err}
+		}
+		return os.NewFile(uintptr(fd), path), nil
+	}
+	parent, base, err := openParent(clean, false, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer closeFD(parent)
+	fd, err := unix.Openat(parent, base, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "openat", Path: path, Err: err}
+	}
+	return os.NewFile(uintptr(fd), path), nil
+}
+
 // OpenForWrite opens an existing regular file for replacement or creates a
 // missing leaf. Missing parent directories are created through checked
 // no-follow traversal. The returned bool reports whether the file existed.

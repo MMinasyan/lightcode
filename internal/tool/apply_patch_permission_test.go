@@ -24,12 +24,13 @@ func TestApplyPatchFilesAtRootListsAllTouchedPaths(t *testing.T) {
 	params := map[string]any{
 		"input": "*** Begin Patch\n*** Add File: a.txt\n+x\n*** Update File: b.txt\n@@\n-x\n+y\n*** Delete File: c.txt\n*** Update File: d.txt\n*** Move to: e.txt\n@@\n-x\n+y\n*** End Patch",
 	}
-	// Exercise the live helper: the shared target plan that PermWrapped.Execute
-	// uses for apply_patch permission checks, with the same display-file
-	// projection the affected-file lists are built from.
-	targets, _, _, err := applyPatchPermissionPlanWithOptions(nil, dir, params, CapabilityOptions{})
+	// Exercise the production planner: target resolution plus the aggregate
+	// decision PermWrapped.Execute uses for apply_patch permission checks,
+	// with the same display-file projection the affected-file lists are
+	// built from.
+	_, targets, err := resolveApplyPatchTargetsWithOptions(dir, params, CapabilityOptions{})
 	if err != nil {
-		t.Fatalf("applyPatchPermissionPlanWithOptions err = %v", err)
+		t.Fatalf("resolveApplyPatchTargetsWithOptions err = %v", err)
 	}
 	paths := applyPatchDisplayFiles(targets)
 	want := []string{
@@ -55,20 +56,12 @@ func TestApplyPatchPermissionDecisionAggregate(t *testing.T) {
 	params := map[string]any{
 		"input": "*** Begin Patch\n*** Add File: a.txt\n+x\n*** Update File: b.txt\n@@\n-x\n+y\n*** End Patch",
 	}
-	_, perPath, agg, err := applyPatchPermissionPlanWithOptions(allowAll, dir, params, CapabilityOptions{})
+	_, targets, err := resolveApplyPatchTargetsWithOptions(dir, params, CapabilityOptions{})
 	if err != nil {
-		t.Fatalf("plan err = %v", err)
+		t.Fatalf("resolve err = %v", err)
 	}
-	if agg != permission.DecisionAllow {
+	if agg := planApplyPatchPermissions(allowAll, targets); agg != permission.DecisionAllow {
 		t.Fatalf("agg = %v, want Allow", agg)
-	}
-	if len(perPath) != 2 {
-		t.Fatalf("perPath len = %d, want 2", len(perPath))
-	}
-	for i, d := range perPath {
-		if d != permission.DecisionAllow {
-			t.Fatalf("perPath[%d] = %v, want Allow", i, d)
-		}
 	}
 }
 
@@ -81,18 +74,19 @@ func TestApplyPatchPermissionDecisionAnyDenyDeniesAll(t *testing.T) {
 	params := map[string]any{
 		"input": "*** Begin Patch\n*** Add File: a.txt\n+x\n*** Update File: b.txt\n@@\n-x\n+y\n*** End Patch",
 	}
-	_, perPath, agg, err := applyPatchPermissionPlanWithOptions(check, dir, params, CapabilityOptions{})
+	_, targets, err := resolveApplyPatchTargetsWithOptions(dir, params, CapabilityOptions{})
 	if err != nil {
-		t.Fatalf("plan err = %v", err)
+		t.Fatalf("resolve err = %v", err)
 	}
-	if agg != permission.DecisionDeny {
+	if agg := planApplyPatchPermissions(check, targets); agg != permission.DecisionDeny {
 		t.Fatalf("agg = %v, want Deny (any-deny denies whole patch)", agg)
 	}
-	if perPath[0] != permission.DecisionAllow {
-		t.Fatalf("perPath[0] = %v, want Allow (a.txt is allowed)", perPath[0])
+	// The allowed target alone stays Allow; the denied one alone is Deny.
+	if agg := planApplyPatchPermissions(check, targets[:1]); agg != permission.DecisionAllow {
+		t.Fatalf("agg = %v, want Allow (a.txt is allowed)", agg)
 	}
-	if perPath[1] != permission.DecisionDeny {
-		t.Fatalf("perPath[1] = %v, want Deny (b.txt is denied)", perPath[1])
+	if agg := planApplyPatchPermissions(check, targets[1:]); agg != permission.DecisionDeny {
+		t.Fatalf("agg = %v, want Deny (b.txt is denied)", agg)
 	}
 }
 
@@ -105,11 +99,11 @@ func TestApplyPatchPermissionDecisionAllAllowExceptOneAskIsAsk(t *testing.T) {
 	params := map[string]any{
 		"input": "*** Begin Patch\n*** Add File: a.txt\n+x\n*** Update File: b.txt\n@@\n-x\n+y\n*** End Patch",
 	}
-	_, _, agg, err := applyPatchPermissionPlanWithOptions(check, dir, params, CapabilityOptions{})
+	_, targets, err := resolveApplyPatchTargetsWithOptions(dir, params, CapabilityOptions{})
 	if err != nil {
-		t.Fatalf("plan err = %v", err)
+		t.Fatalf("resolve err = %v", err)
 	}
-	if agg != permission.DecisionAsk {
+	if agg := planApplyPatchPermissions(check, targets); agg != permission.DecisionAsk {
 		t.Fatalf("agg = %v, want Ask (one path needs ask, none denied)", agg)
 	}
 }
@@ -131,11 +125,11 @@ func TestApplyPatchPermissionDecisionDenyPreservedThroughLaterAsk(t *testing.T) 
 	params := map[string]any{
 		"input": "*** Begin Patch\n*** Add File: b.txt\n+x\n*** Update File: a.txt\n@@\n-x\n+y\n*** Update File: .env\n@@\n-SECRET=1\n+SECRET=2\n*** End Patch",
 	}
-	_, _, agg, err := applyPatchPermissionPlanWithOptions(check, dir, params, CapabilityOptions{})
+	_, targets, err := resolveApplyPatchTargetsWithOptions(dir, params, CapabilityOptions{})
 	if err != nil {
-		t.Fatalf("plan err = %v", err)
+		t.Fatalf("resolve err = %v", err)
 	}
-	if agg != permission.DecisionDeny {
+	if agg := planApplyPatchPermissions(check, targets); agg != permission.DecisionDeny {
 		t.Fatalf("agg = %v, want Deny (deny must be sticky across later Ask)", agg)
 	}
 }
@@ -149,33 +143,34 @@ func TestApplyPatchPermissionDecisionMoveDestIncluded(t *testing.T) {
 	params := map[string]any{
 		"input": "*** Begin Patch\n*** Update File: old.go\n*** Move to: new.go\n@@\n-x\n+y\n*** End Patch",
 	}
-	targets, perPath, agg, err := applyPatchPermissionPlanWithOptions(check, dir, params, CapabilityOptions{})
+	_, targets, err := resolveApplyPatchTargetsWithOptions(dir, params, CapabilityOptions{})
 	if err != nil {
-		t.Fatalf("plan err = %v", err)
+		t.Fatalf("resolve err = %v", err)
 	}
 	paths := applyPatchDisplayFiles(targets)
-	if agg != permission.DecisionDeny {
+	if agg := planApplyPatchPermissions(check, targets); agg != permission.DecisionDeny {
 		t.Fatalf("agg = %v, want Deny (move dest denied)", agg)
 	}
 	if len(paths) != 2 || paths[1] != filepath.Join(dir, "new.go") {
 		t.Fatalf("paths = %v, want [old.go new.go]", paths)
 	}
-	if perPath[1] != permission.DecisionDeny {
-		t.Fatalf("perPath[1] = %v, want Deny (move dest)", perPath[1])
+	if agg := planApplyPatchPermissions(check, targets[1:]); agg != permission.DecisionDeny {
+		t.Fatalf("agg = %v, want Deny (move dest)", agg)
 	}
 }
 
 func TestApplyPatchPermissionDecisionMalformedPatchIsAsk(t *testing.T) {
 	dir := t.TempDir()
-	targets, _, agg, err := applyPatchPermissionPlanWithOptions(nil, dir, map[string]any{"input": "garbage"}, CapabilityOptions{})
+	_, targets, err := resolveApplyPatchTargetsWithOptions(dir, map[string]any{"input": "garbage"}, CapabilityOptions{})
 	if err == nil {
-		t.Fatalf("plan err = nil, want parse error for malformed patch")
+		t.Fatalf("resolve err = nil, want parse error for malformed patch")
 	}
-	if agg != permission.DecisionAsk {
+	if targets != nil {
+		t.Fatalf("targets = %v, want nil for malformed patch", targets)
+	}
+	// A nil check (no planner input) resolves to the Ask aggregate.
+	if agg := planApplyPatchPermissions(nil, nil); agg != permission.DecisionAsk {
 		t.Fatalf("agg = %v, want Ask for malformed patch", agg)
-	}
-	if paths := applyPatchDisplayFiles(targets); paths != nil {
-		t.Fatalf("paths = %v, want nil for malformed patch", paths)
 	}
 }
 

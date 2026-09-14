@@ -7,7 +7,7 @@ import (
 
 func TestLocateExactMatch(t *testing.T) {
 	lines := []string{"foo", "bar", "baz"}
-	h := hunk{lines: []hunkLine{{kind: lineContext, text: "bar"}}}
+	h := hunk{lines: []HunkLine{{Kind: LineContext, Text: "bar"}}}
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
 		t.Fatalf("locate err = %v", err)
@@ -19,7 +19,7 @@ func TestLocateExactMatch(t *testing.T) {
 
 func TestLocateForwardScan(t *testing.T) {
 	lines := []string{"foo", "bar", "foo", "bar"}
-	h := hunk{lines: []hunkLine{{kind: lineContext, text: "foo"}, {kind: lineContext, text: "bar"}}}
+	h := hunk{lines: []HunkLine{{Kind: LineContext, Text: "foo"}, {Kind: LineContext, Text: "bar"}}}
 
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
@@ -40,7 +40,7 @@ func TestLocateForwardScan(t *testing.T) {
 
 func TestLocateLevel2TrailingWhitespace(t *testing.T) {
 	lines := []string{"foo   ", "bar", "baz"}
-	h := hunk{lines: []hunkLine{{kind: lineContext, text: "foo"}}}
+	h := hunk{lines: []HunkLine{{Kind: LineContext, Text: "foo"}}}
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
 		t.Fatalf("locate err = %v", err)
@@ -52,7 +52,7 @@ func TestLocateLevel2TrailingWhitespace(t *testing.T) {
 
 func TestLocateLevel3LeadingAndTrailingWhitespace(t *testing.T) {
 	lines := []string{"  foo  ", "bar", "baz"}
-	h := hunk{lines: []hunkLine{{kind: lineContext, text: "foo"}}}
+	h := hunk{lines: []HunkLine{{Kind: LineContext, Text: "foo"}}}
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
 		t.Fatalf("locate err = %v", err)
@@ -64,7 +64,7 @@ func TestLocateLevel3LeadingAndTrailingWhitespace(t *testing.T) {
 
 func TestLocateLevel4UnicodeDashes(t *testing.T) {
 	lines := []string{"foo\u2014bar", "baz"} // em-dash
-	h := hunk{lines: []hunkLine{{kind: lineContext, text: "foo-bar"}}}
+	h := hunk{lines: []HunkLine{{Kind: LineContext, Text: "foo-bar"}}}
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
 		t.Fatalf("locate err = %v", err)
@@ -76,7 +76,7 @@ func TestLocateLevel4UnicodeDashes(t *testing.T) {
 
 func TestLocateLevel4UnicodeQuotes(t *testing.T) {
 	lines := []string{"say \u201Chello\u201D", "baz"} // curly double quotes
-	h := hunk{lines: []hunkLine{{kind: lineContext, text: "say \"hello\""}}}
+	h := hunk{lines: []HunkLine{{Kind: LineContext, Text: "say \"hello\""}}}
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
 		t.Fatalf("locate err = %v", err)
@@ -89,7 +89,7 @@ func TestLocateLevel4UnicodeQuotes(t *testing.T) {
 func TestLocateLevel4ExoticSpaces(t *testing.T) {
 	// non-breaking space (U+00A0) on each side
 	lines := []string{"\u00A0foo\u00A0", "bar"}
-	h := hunk{lines: []hunkLine{{kind: lineContext, text: "foo"}}}
+	h := hunk{lines: []HunkLine{{Kind: LineContext, Text: "foo"}}}
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
 		t.Fatalf("locate err = %v", err)
@@ -103,7 +103,7 @@ func TestLocateLowerLevelBeatsHigher(t *testing.T) {
 	// Level 1 matches at position 0 ("foo"); level-2 fuzzy match at position 2.
 	// First hit wins → start = 0.
 	lines := []string{"foo", "bar", "foo   "}
-	h := hunk{lines: []hunkLine{{kind: lineContext, text: "foo"}}}
+	h := hunk{lines: []HunkLine{{Kind: LineContext, Text: "foo"}}}
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
 		t.Fatalf("locate err = %v", err)
@@ -117,7 +117,7 @@ func TestLocateAnchorAdvancesCursor(t *testing.T) {
 	lines := []string{"foo", "anchor", "bar", "baz"}
 	h := hunk{
 		anchor: "anchor",
-		lines:  []hunkLine{{kind: lineContext, text: "bar"}},
+		lines:  []HunkLine{{Kind: LineContext, Text: "bar"}},
 	}
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
@@ -133,7 +133,7 @@ func TestLocateAnchorDoesNotNarrowRegion(t *testing.T) {
 	lines := []string{"anchor", "skip1", "skip2", "skip3", "match"}
 	h := hunk{
 		anchor: "anchor",
-		lines:  []hunkLine{{kind: lineContext, text: "match"}},
+		lines:  []HunkLine{{Kind: LineContext, Text: "match"}},
 	}
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
@@ -148,7 +148,7 @@ func TestLocateAnchorFoundViaFuzzyLadder(t *testing.T) {
 	lines := []string{"anchor   ", "match"}
 	h := hunk{
 		anchor: "anchor",
-		lines:  []hunkLine{{kind: lineContext, text: "match"}},
+		lines:  []HunkLine{{Kind: LineContext, Text: "match"}},
 	}
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
@@ -164,10 +164,10 @@ func TestLocateEOFTrailingEmptyRetry(t *testing.T) {
 	// Pattern's last context line is empty. Without the EOF retry the
 	// pattern would not match; the retry drops the trailing "" and finds it.
 	lines := []string{"foo", "bar"}
-	h := hunk{lines: []hunkLine{
-		{kind: lineContext, text: "foo"},
-		{kind: lineContext, text: "bar"},
-		{kind: lineContext, text: ""},
+	h := hunk{lines: []HunkLine{
+		{Kind: LineContext, Text: "foo"},
+		{Kind: LineContext, Text: "bar"},
+		{Kind: LineContext, Text: ""},
 	}}
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
@@ -187,9 +187,9 @@ func TestLocateEOFTrailingEmptyRetry(t *testing.T) {
 
 func TestLocateEOFTrailingEmptyRetryDoesNotMatchBeforeEOF(t *testing.T) {
 	lines := []string{"alpha", "beta", "charlie"}
-	h := hunk{lines: []hunkLine{
-		{kind: lineContext, text: "alpha"},
-		{kind: lineRemove, text: ""},
+	h := hunk{lines: []HunkLine{
+		{Kind: LineContext, Text: "alpha"},
+		{Kind: LineRemove, Text: ""},
 	}}
 	_, err := locate(lines, h, "p", 0)
 	if err == nil {
@@ -204,10 +204,10 @@ func TestLocateNoEOFTrailingEmptyWhenFileHasIt(t *testing.T) {
 	// File has a trailing newline; pattern's last context line is empty;
 	// the empty matches lines[2]="". The full pattern matches without retry.
 	lines := []string{"foo", "bar", ""}
-	h := hunk{lines: []hunkLine{
-		{kind: lineContext, text: "foo"},
-		{kind: lineContext, text: "bar"},
-		{kind: lineContext, text: ""},
+	h := hunk{lines: []HunkLine{
+		{Kind: LineContext, Text: "foo"},
+		{Kind: LineContext, Text: "bar"},
+		{Kind: LineContext, Text: ""},
 	}}
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
@@ -227,7 +227,7 @@ func TestLocateNoEOFTrailingEmptyWhenFileHasIt(t *testing.T) {
 
 func TestLocatePatternNotFound(t *testing.T) {
 	lines := []string{"foo", "bar"}
-	h := hunk{lines: []hunkLine{{kind: lineContext, text: "missing"}}}
+	h := hunk{lines: []HunkLine{{Kind: LineContext, Text: "missing"}}}
 	_, err := locate(lines, h, "p", 0)
 	if err == nil {
 		t.Fatal("locate err = nil, want non-nil")
@@ -241,7 +241,7 @@ func TestLocateAnchorNotFound(t *testing.T) {
 	lines := []string{"foo", "bar"}
 	h := hunk{
 		anchor: "missing",
-		lines:  []hunkLine{{kind: lineContext, text: "foo"}},
+		lines:  []HunkLine{{Kind: LineContext, Text: "foo"}},
 	}
 	_, err := locate(lines, h, "p", 0)
 	if err == nil {
@@ -256,11 +256,11 @@ func TestLocateMixedContextAndRemove(t *testing.T) {
 	// Pattern is built from context + remove lines only (add lines excluded).
 	// The file's current state carries the lines the patch will remove.
 	lines := []string{"alpha", "BEFORE", "beta"}
-	h := hunk{lines: []hunkLine{
-		{kind: lineContext, text: "alpha"},
-		{kind: lineRemove, text: "BEFORE"},
-		{kind: lineAdd, text: "REPLACEMENT"}, // not in pattern
-		{kind: lineContext, text: "beta"},
+	h := hunk{lines: []HunkLine{
+		{Kind: LineContext, Text: "alpha"},
+		{Kind: LineRemove, Text: "BEFORE"},
+		{Kind: LineAdd, Text: "REPLACEMENT"}, // not in pattern
+		{Kind: LineContext, Text: "beta"},
 	}}
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
@@ -274,7 +274,7 @@ func TestLocateMixedContextAndRemove(t *testing.T) {
 func TestLocateNoContextOrRemove(t *testing.T) {
 	// Hunk with only add lines: no pattern to match; return the cursor.
 	lines := []string{"foo", "bar"}
-	h := hunk{lines: []hunkLine{{kind: lineAdd, text: "anything"}}}
+	h := hunk{lines: []HunkLine{{Kind: LineAdd, Text: "anything"}}}
 	start, err := locate(lines, h, "p", 0)
 	if err != nil {
 		t.Fatalf("locate err = %v", err)
@@ -287,7 +287,7 @@ func TestLocateNoContextOrRemove(t *testing.T) {
 func TestLocateCursorClamped(t *testing.T) {
 	// Negative cursor clamps to 0; cursor past end clamps to len.
 	lines := []string{"foo", "bar"}
-	h := hunk{lines: []hunkLine{{kind: lineContext, text: "foo"}}}
+	h := hunk{lines: []HunkLine{{Kind: LineContext, Text: "foo"}}}
 
 	start, err := locate(lines, h, "p", -5)
 	if err != nil {
