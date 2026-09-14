@@ -98,23 +98,18 @@ type Store struct {
 	// the rest of the session in clearLocked, so a Store that moves to another
 	// session restarts from disk.
 	highWaterTurn int
-	snapshotTx    map[string]*snapshotTxState
-	mutationLock  map[string]*snapshotMutationLock
+
+	// code owns the code-only snapshot state (snapshot root, capture
+	// references, mutation locks, first/last-write identities) for the
+	// active session; code operations are delegated to it. Nil while no
+	// session is open.
+	code *CodeStore
 
 	// claim is the cross-process exclusion held while this process drives the
 	// session. It is acquired before a mutating load or new-session
 	// publication and released on Close. Nil for stores with no project
 	// context (legacy/test stores that never drive across processes).
 	claim *atomicfs.Lock
-}
-
-type snapshotTxState struct {
-	refs int
-}
-
-type snapshotMutationLock struct {
-	mu   sync.Mutex
-	refs int
 }
 
 // NewForSessionsRoot returns a Store rooted at an explicit sessions
@@ -255,17 +250,23 @@ func (s *Store) PrepareStagedNewSession(projectRoot string) (*Store, error) {
 	// The returned store mirrors the active session with its paths rooted at
 	// staging, where the candidate's files actually live. It carries no claim:
 	// this store holds the claim until Close, matching the single-call behavior.
+	stagingDir := filepath.Join(stagingRoot, s.sessionID)
+	code, err := OpenCodeStore(stagingDir)
+	if err != nil {
+		return nil, cleanupStagingRoot(stagingRoot, err)
+	}
 	return &Store{
 		root:         stagingRoot,
 		projectsRoot: s.projectsRoot,
 		projectID:    s.projectID,
 		active:       true,
-		dir:          filepath.Join(stagingRoot, s.sessionID),
-		snapshotsDir: filepath.Join(stagingRoot, s.sessionID, "snapshots"),
-		turnsDir:     filepath.Join(stagingRoot, s.sessionID, "turns"),
+		dir:          stagingDir,
+		snapshotsDir: filepath.Join(stagingDir, "snapshots"),
+		turnsDir:     filepath.Join(stagingDir, "turns"),
 		sessionID:    s.sessionID,
 		projectRoot:  s.projectRoot,
 		projectHash:  s.projectHash,
+		code:         code,
 	}, nil
 }
 
@@ -375,6 +376,10 @@ func (s *Store) beginNewSessionAtLocked(projectRoot, parentSessionID, createRoot
 		}
 	}
 	dir := filepath.Join(s.root, sessionID)
+	code, err := OpenCodeStore(dir)
+	if err != nil {
+		return err
+	}
 	s.active = true
 	s.dir = dir
 	s.snapshotsDir = filepath.Join(dir, "snapshots")
@@ -383,6 +388,7 @@ func (s *Store) beginNewSessionAtLocked(projectRoot, parentSessionID, createRoot
 	s.projectRoot = absProject
 	s.projectHash = meta.ProjectHash
 	s.currentTurn = 0
+	s.code = code
 	return nil
 }
 
@@ -419,6 +425,10 @@ func (s *Store) LoadSession(id string) (err error) {
 			return fmt.Errorf("snapshot: ensure %s: %w", p, err)
 		}
 	}
+	code, err := OpenCodeStore(dir)
+	if err != nil {
+		return err
+	}
 	s.active = true
 	s.dir = dir
 	s.snapshotsDir = snapshotsDir
@@ -426,6 +436,7 @@ func (s *Store) LoadSession(id string) (err error) {
 	s.sessionID = id
 	s.projectRoot = meta.ProjectPath
 	s.projectHash = meta.ProjectHash
+	s.code = code
 	// Drop any turn dirs that did not reach their complete marker.
 	s.discardIncompleteTurnsLocked()
 	s.currentTurn = s.highestCompleteTurnLocked()
@@ -483,6 +494,9 @@ func (s *Store) relocateActiveSessionPathsLocked(finalSessionsRoot string) {
 	s.dir = filepath.Join(finalSessionsRoot, s.sessionID)
 	s.snapshotsDir = filepath.Join(s.dir, "snapshots")
 	s.turnsDir = filepath.Join(s.dir, "turns")
+	if s.code != nil {
+		s.code.rebind(s.snapshotsDir)
+	}
 }
 
 // Detach releases the store's claim and resets it to the no-session state
@@ -511,8 +525,10 @@ func (s *Store) clearLocked() {
 	s.projectHash = ""
 	s.currentTurn = 0
 	s.highWaterTurn = 0
-	s.snapshotTx = nil
-	s.mutationLock = nil
+	if s.code != nil {
+		s.code.reset()
+		s.code = nil
+	}
 }
 
 // Active reports whether a session is currently open.
@@ -639,103 +655,24 @@ func (s *Store) SnapshotResolvedEntry(turn int, originalPath, canonicalPath stri
 	if !s.active {
 		return "", false, ErrNoSession
 	}
-	snapshotsDir := s.snapshotsDir
-	if turn < 1 {
-		return "", false, fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
-	}
-	realPath, err := filepath.EvalSymlinks(canonicalPath)
-	if err != nil {
-		realPath = canonicalPath
-	}
-	if info, err := os.Lstat(canonicalPath); err == nil {
-		if !info.Mode().IsRegular() {
-			return "", false, fmt.Errorf("snapshot: non-regular file target: %s (mode %s)", canonicalPath, info.Mode())
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", false, fmt.Errorf("snapshot: stat %s: %w", canonicalPath, err)
-	}
-	pathHash := hashString(realPath)
-	entryDir := filepath.Join(snapshotsDir, strconv.Itoa(turn), pathHash)
-	metaPath := filepath.Join(entryDir, "meta.json")
-	if _, err := os.Stat(metaPath); err == nil {
-		if state := s.snapshotTxStateLocked(turn, pathHash, false); state != nil {
-			state.refs++
-		}
-		return pathHash, false, nil
-	}
-	if err := os.MkdirAll(entryDir, 0o700); err != nil {
-		return pathHash, false, fmt.Errorf("snapshot: mkdir %s: %w", entryDir, err)
-	}
-	created := false
-	defer func() {
-		if !created {
-			_ = os.RemoveAll(entryDir)
-		}
-	}()
-	existed := true
-	file, openErr := safefs.OpenExisting(canonicalPath, os.O_RDONLY|unix.O_NONBLOCK)
-	if openErr != nil {
-		if !errors.Is(openErr, os.ErrNotExist) {
-			return pathHash, false, fmt.Errorf("snapshot: open %s: %w", canonicalPath, openErr)
-		}
-		existed = false
-	}
-	if existed {
-		defer file.Close()
-		info, err := file.Stat()
-		if err != nil {
-			return pathHash, false, fmt.Errorf("snapshot: stat %s: %w", canonicalPath, err)
-		}
-		if !info.Mode().IsRegular() {
-			return pathHash, false, fmt.Errorf("snapshot: non-regular file target: %s (mode %s)", canonicalPath, info.Mode())
-		}
-	}
-	if existed {
-		if err := copyFromFile(file, filepath.Join(entryDir, "original")); err != nil {
-			return pathHash, false, fmt.Errorf("snapshot: copy %s: %w", canonicalPath, err)
-		}
-	}
-	meta := SnapshotMeta{OriginalPath: originalPath, CanonicalPath: realPath, Existed: existed}
-	if err := writeJSON(metaPath, meta); err != nil {
-		return pathHash, false, fmt.Errorf("snapshot: write meta: %w", err)
-	}
-	created = true
-	state := s.snapshotTxStateLocked(turn, pathHash, true)
-	state.refs++
-	return pathHash, true, nil
+	return s.code.SnapshotResolvedEntry(turn, originalPath, canonicalPath)
 }
 
 // DiscardSnapshotEntry releases a pre-mutation snapshot user. The entry is
 // removed only if no concurrent user retained it or still depends on it.
 func (s *Store) DiscardSnapshotEntry(turn int, entryID string) error {
-	if turn < 1 {
-		return fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
+	if err := validateSnapshotTurn(turn); err != nil {
+		return err
 	}
-	if !isLegacyEntryID(entryID) {
-		return fmt.Errorf("snapshot: invalid entry id %q", entryID)
+	if err := validateSnapshotEntryID(entryID); err != nil {
+		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.active {
 		return ErrNoSession
 	}
-	key := snapshotTxKey(turn, entryID)
-	state := s.snapshotTx[key]
-	if state == nil {
-		return nil
-	}
-	if state.refs > 0 {
-		state.refs--
-	}
-	if state.refs > 0 {
-		return nil
-	}
-	delete(s.snapshotTx, key)
-	entryDir := filepath.Join(s.snapshotsDir, strconv.Itoa(turn), entryID)
-	if err := os.RemoveAll(entryDir); err != nil {
-		return fmt.Errorf("snapshot: discard %s: %w", entryDir, err)
-	}
-	return nil
+	return s.code.DiscardSnapshotEntry(turn, entryID)
 }
 
 // RetainSnapshotEntry keeps a snapshot entry once any user starts mutating.
@@ -745,57 +682,27 @@ func (s *Store) RetainSnapshotEntry(turn int, entryID string) {
 	if !s.active {
 		return
 	}
-	key := snapshotTxKey(turn, entryID)
-	state := s.snapshotTx[key]
-	if state == nil {
-		return
-	}
-	delete(s.snapshotTx, key)
+	s.code.RetainSnapshotEntry(turn, entryID)
 }
 
 // LockSnapshotMutation serializes same-session mutations for one snapshot
 // entry. Callers hold the returned release function until the disk mutation
 // and last-write identity record have both completed.
 func (s *Store) LockSnapshotMutation(turn int, entryID string) (func(), error) {
-	if turn < 1 {
-		return nil, fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
+	if err := validateSnapshotTurn(turn); err != nil {
+		return nil, err
 	}
-	if !isLegacyEntryID(entryID) {
-		return nil, fmt.Errorf("snapshot: invalid entry id %q", entryID)
+	if err := validateSnapshotEntryID(entryID); err != nil {
+		return nil, err
 	}
 	s.mu.Lock()
 	if !s.active {
 		s.mu.Unlock()
 		return nil, ErrNoSession
 	}
-	key := snapshotTxKey(turn, entryID)
-	if s.mutationLock == nil {
-		s.mutationLock = make(map[string]*snapshotMutationLock)
-	}
-	lock := s.mutationLock[key]
-	if lock == nil {
-		lock = &snapshotMutationLock{}
-		s.mutationLock[key] = lock
-	}
-	lock.refs++
+	code := s.code
 	s.mu.Unlock()
-
-	lock.mu.Lock()
-	released := false
-	return func() {
-		if released {
-			return
-		}
-		released = true
-		lock.mu.Unlock()
-
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		lock.refs--
-		if lock.refs == 0 && s.mutationLock[key] == lock {
-			delete(s.mutationLock, key)
-		}
-	}, nil
+	return code.LockSnapshotMutation(turn, entryID)
 }
 
 // RecordSnapshotContent records the content produced by a successful mutation.
@@ -809,47 +716,18 @@ func (s *Store) RecordSnapshotAbsence(turn int, entryID string) error {
 }
 
 func (s *Store) recordSnapshotIdentity(turn int, entryID string, identity SnapshotContentIdentity) error {
-	if turn < 1 {
-		return fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
+	if err := validateSnapshotTurn(turn); err != nil {
+		return err
 	}
-	if !isLegacyEntryID(entryID) {
-		return fmt.Errorf("snapshot: invalid entry id %q", entryID)
+	if err := validateSnapshotEntryID(entryID); err != nil {
+		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.active {
 		return ErrNoSession
 	}
-	metaPath := filepath.Join(s.snapshotsDir, strconv.Itoa(turn), entryID, "meta.json")
-	var meta SnapshotMeta
-	if err := readJSON(metaPath, &meta); err != nil {
-		return err
-	}
-	meta.LastWrite = &identity
-	if err := writeJSON(metaPath, meta); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *Store) snapshotTxStateLocked(turn int, entryID string, create bool) *snapshotTxState {
-	key := snapshotTxKey(turn, entryID)
-	if s.snapshotTx == nil {
-		if !create {
-			return nil
-		}
-		s.snapshotTx = make(map[string]*snapshotTxState)
-	}
-	state := s.snapshotTx[key]
-	if state == nil && create {
-		state = &snapshotTxState{}
-		s.snapshotTx[key] = state
-	}
-	return state
-}
-
-func snapshotTxKey(turn int, entryID string) string {
-	return strconv.Itoa(turn) + "/" + entryID
+	return s.code.recordSnapshotIdentity(turn, entryID, identity)
 }
 
 // AppendMessage appends one serialized message (one JSON object + \n)
@@ -1084,30 +962,9 @@ func (s *Store) ListTurns() ([]TurnEntry, error) {
 		s.mu.Unlock()
 		return nil, ErrNoSession
 	}
-	snapshotsDir := s.snapshotsDir
+	code := s.code
 	s.mu.Unlock()
-	turns := readIntDirs(snapshotsDir)
-	var entries []TurnEntry
-	for _, turn := range turns {
-		turnDir := filepath.Join(snapshotsDir, strconv.Itoa(turn))
-		dirEntries, err := os.ReadDir(turnDir)
-		if err != nil {
-			return entries, fmt.Errorf("snapshot: read turn %d: %w", turn, err)
-		}
-		var files []SnapshotMeta
-		for _, de := range dirEntries {
-			if !de.IsDir() {
-				continue
-			}
-			var meta SnapshotMeta
-			if err := readJSON(filepath.Join(turnDir, de.Name(), "meta.json"), &meta); err != nil {
-				continue
-			}
-			files = append(files, meta)
-		}
-		entries = append(entries, TurnEntry{Turn: turn, Files: files})
-	}
-	return entries, nil
+	return code.ListTurns()
 }
 
 // RevertCode restores every file snapshotted in turns > toTurn to its
@@ -1119,9 +976,6 @@ func (s *Store) RevertCode(toTurn int) (RevertResult, error) {
 	if !s.active {
 		return RevertResult{}, ErrNoSession
 	}
-	if toTurn < 0 {
-		toTurn = 0
-	}
 	// Record the highest turn number this session has issued before any
 	// removal: the walk deletes snapshot turn dirs, so allocation from disk
 	// alone would reissue numbers the session already used. The mark is raised,
@@ -1129,27 +983,7 @@ func (s *Store) RevertCode(toTurn int) (RevertResult, error) {
 	if m := s.maxTurnLocked(); m > s.highWaterTurn {
 		s.highWaterTurn = m
 	}
-	turns := readIntDirs(s.snapshotsDir)
-	var result RevertResult
-	skippedEntries := make(map[string]struct{})
-	reportedSkippedEntries := make(map[string]struct{})
-	for i := len(turns) - 1; i >= 0; i-- {
-		turn := turns[i]
-		if turn <= toTurn {
-			break
-		}
-		turnDir := filepath.Join(s.snapshotsDir, strconv.Itoa(turn))
-		turnResult, err := revertOneTurn(turnDir, skippedEntries, reportedSkippedEntries)
-		result.Restored = append(result.Restored, turnResult.Restored...)
-		result.Skipped = append(result.Skipped, turnResult.Skipped...)
-		if err != nil {
-			return result, fmt.Errorf("snapshot: revert turn %d: %w", turn, err)
-		}
-		if err := os.Remove(turnDir); err != nil && !errors.Is(err, os.ErrNotExist) && !isDirNotEmpty(err) {
-			return result, fmt.Errorf("snapshot: remove %s: %w", turnDir, err)
-		}
-	}
-	return result, nil
+	return s.code.RevertCode(toTurn)
 }
 
 // ForkInto copies turns 1..toTurn (both snapshots and messages) from the
