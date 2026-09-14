@@ -16,7 +16,9 @@ import (
 )
 
 type Options struct {
-	HomeDir      string
+	// Directory is the exact spill directory: every private and visible
+	// spill file is created under it.
+	Directory    string
 	SpillPrefix  string
 	MaxBytes     int
 	MaxLineChars int
@@ -210,7 +212,7 @@ func (c *Capture) writeSpill(s *streamState, p []byte) {
 }
 
 func (c *Capture) spillDir() string {
-	return filepath.Join(c.opts.HomeDir, ".lightcode")
+	return c.opts.Directory
 }
 
 func (c *Capture) newPrivateSpill(stream string) (string, *os.File, error) {

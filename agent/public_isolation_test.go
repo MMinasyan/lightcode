@@ -49,21 +49,22 @@ func TestPublicFoundationDependencyIsolation(t *testing.T) {
 // checkTrackedGoFile applies the dependency baseline to one tracked production file.
 func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []string {
 	const (
-		modelPkg    = publicModule + "/model"
-		agentPkg    = publicModule + "/agent"
-		harnessPkg  = publicModule + "/harness"
-		storagePkg  = publicModule + "/internal/storage"
-		runtimePkg  = publicModule + "/runtime"
-		configPkg   = publicModule + "/internal/config"
-		toolPkg     = publicModule + "/internal/tool"
-		snapshotPkg = publicModule + "/internal/snapshot"
-		editprePkg  = publicModule + "/internal/editpreview"
-		pathutilPkg = publicModule + "/internal/pathutil"
-		agentsPkg   = publicModule + "/internal/agents"
-		catalogPkg  = publicModule + "/internal/catalog"
-		atomicfsPkg = publicModule + "/internal/atomicfs"
-		legacyAgent = publicModule + "/internal/agent"
-		pluginsPkg  = publicModule + "/internal/plugins"
+		modelPkg      = publicModule + "/model"
+		agentPkg      = publicModule + "/agent"
+		harnessPkg    = publicModule + "/harness"
+		storagePkg    = publicModule + "/internal/storage"
+		runtimePkg    = publicModule + "/runtime"
+		configPkg     = publicModule + "/internal/config"
+		toolPkg       = publicModule + "/internal/tool"
+		snapshotPkg   = publicModule + "/internal/snapshot"
+		editprePkg    = publicModule + "/internal/editpreview"
+		pathutilPkg   = publicModule + "/internal/pathutil"
+		agentsPkg     = publicModule + "/internal/agents"
+		catalogPkg    = publicModule + "/internal/catalog"
+		atomicfsPkg   = publicModule + "/internal/atomicfs"
+		legacyAgent   = publicModule + "/internal/agent"
+		pluginsPkg    = publicModule + "/internal/plugins"
+		shellparsePkg = publicModule + "/internal/shellparse"
 	)
 	var problems []string
 	dir := path.Dir(rel)
@@ -103,8 +104,9 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 			}
 		case "internal/plugins/tools":
 			if imp != runtimePkg && imp != harnessPkg && imp != modelPkg && imp != configPkg &&
-				imp != toolPkg && imp != snapshotPkg && imp != editprePkg && imp != pathutilPkg && !std[imp] {
-				problems = append(problems, rel+": internal/plugins/tools imports "+imp+"; the native tools plugin may import only the standard library, "+runtimePkg+", "+harnessPkg+", "+modelPkg+", and the retained "+toolPkg+", "+snapshotPkg+", "+editprePkg+", "+configPkg+", and "+pathutilPkg+" helpers")
+				imp != toolPkg && imp != snapshotPkg && imp != editprePkg && imp != pathutilPkg &&
+				imp != shellparsePkg && !std[imp] {
+				problems = append(problems, rel+": internal/plugins/tools imports "+imp+"; the native tools plugin may import only the standard library, "+runtimePkg+", "+harnessPkg+", "+modelPkg+", and the retained "+toolPkg+", "+snapshotPkg+", "+editprePkg+", "+configPkg+", "+pathutilPkg+", and "+shellparsePkg+" helpers")
 			}
 		default:
 			if imp == modelPkg || imp == agentPkg || imp == harnessPkg || imp == storagePkg || imp == sqliteDriverPkg ||
@@ -165,16 +167,17 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 			t.Errorf("internal/plugins/sqlite importing %q: %d problems, want 1: %v", imp, len(problems), problems)
 		}
 	}
-	// The native tools plugin declares the four file tools over the public
-	// runtime and harness contracts, the public model types, and the retained
-	// shared file-preparation, snapshot, preview, config, and path helpers it
-	// composes; the legacy owner, the driver, storage, and sibling plugins
-	// never enter it.
+	// The native tools plugin declares the four file tools plus run_command
+	// and sleep over the public runtime and harness contracts, the public
+	// model types, and the retained shared file-preparation, snapshot,
+	// preview, config, path, and shell-parse helpers it composes; the legacy
+	// owner, the driver, storage, and sibling plugins never enter it.
 	if problems := checkTrackedGoFile("internal/plugins/tools/x.go", []string{
 		"bytes", "context", "encoding/json", "errors", "fmt", "io", "math", "path/filepath", "strings", "time",
 		publicModule + "/model", publicModule + "/harness", publicModule + "/runtime",
 		publicModule + "/internal/config", publicModule + "/internal/tool", publicModule + "/internal/snapshot",
 		publicModule + "/internal/editpreview", publicModule + "/internal/pathutil",
+		publicModule + "/internal/shellparse",
 	}, std); len(problems) != 0 {
 		t.Errorf("allowed internal/plugins/tools imports flagged: %v", problems)
 	}

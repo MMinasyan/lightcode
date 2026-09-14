@@ -22,6 +22,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
+	"github.com/MMinasyan/lightcode/internal/shellparse"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/tool"
 	"github.com/MMinasyan/lightcode/model"
@@ -31,8 +32,10 @@ import (
 const (
 	pluginID = "tools"
 
-	permissionFileRead  = "file.read"
-	permissionFileWrite = "file.write"
+	permissionFileRead   = "file.read"
+	permissionFileWrite  = "file.write"
+	permissionCommandRun = "command.run"
+	permissionSleep      = "sleep"
 
 	// deniedToolResultContent is the contract-fixed model-visible content of
 	// every failed canonical preparation, mirroring the Harness policy denial.
@@ -461,6 +464,185 @@ func (t patchTool) Prepare(_ context.Context, tc runtime.ToolContext, call model
 	})
 }
 
+// runCommandTool is the run_command export: always available; the calling
+// Agent's readonly constraint selects the implementation. The readonly
+// variant authorizes and executes the read-only allowlist's rewritten
+// command with the captured default timeout — a model timeout override is
+// ignored, and write_dir never grants unrestricted command execution. The
+// unconstrained variant decomposes conclusive simple commands into one
+// command.run target per complete segment, falls back to one complete
+// target for everything else, and always executes through the shell. There
+// is no background path: normalization rejects any supplied background
+// member, and the description never advertises one.
+type runCommandTool struct{ inst *instance }
+
+func (runCommandTool) describe(in runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
+	if _, err := decodeSettings(in.Config(pluginID)); err != nil {
+		return runtime.ToolDescription{}, err
+	}
+	return runtime.ToolDescription{
+		Definition: model.ToolDefinition{
+			Name:        "run_command",
+			Description: runCommandDescription,
+			Parameters:  json.RawMessage(runCommandParameters),
+		},
+		Available: true,
+	}, nil
+}
+
+func (t runCommandTool) Normalize(tc runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
+	s, err := t.inst.settings(tc.Invocation)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeCallArguments(call, func(args map[string]any) (map[string]any, error) {
+		return tool.NormalizeRunCommandArgs(args, s.CommandTimeout)
+	})
+}
+
+func (t runCommandTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
+	s, err := t.inst.settings(tc.Invocation)
+	if err != nil {
+		return immediateError(call.ID, err)
+	}
+	// Preparation accepts only the committed normalized arguments: one
+	// strict decode-and-pass, never a second normalization.
+	args, err := decodeCallArguments(call.Arguments)
+	if err != nil {
+		return immediateError(call.ID, err)
+	}
+	command, _ := args["command"].(string)
+	timeoutSec := s.CommandTimeout
+	var targets []string
+	if tc.Constraints.Readonly {
+		// The readonly path retains the trim-and-reject first: empty and
+		// all-blank input settles the fixed rejection like any other
+		// non-allowlisted command, never echoing the raw form.
+		rewritten, err := tool.ReadOnlyCommand(command)
+		if err != nil {
+			return immediateError(call.ID, errors.New(tool.ReadOnlyRunCommandRejected))
+		}
+		targets = []string{rewritten}
+		command = rewritten
+	} else {
+		if command == "" {
+			return immediateError(call.ID, errors.New("run_command: command is required"))
+		}
+		if v, ok := args["timeout"].(json.Number); ok {
+			if n, err := v.Int64(); err == nil {
+				timeoutSec = int(n)
+			}
+		}
+		if segments, ok := shellparse.ParseSimple(command); ok {
+			for _, segment := range segments {
+				targets = append(targets, segment.Text)
+			}
+		}
+		if len(targets) == 0 {
+			// One complete-command fallback: the input with only leading
+			// ASCII blanks/newlines removed, or the complete original input
+			// when nothing remains. The exact text is both target and the
+			// script the shell runs.
+			fallback := strings.TrimLeft(command, " \t\n")
+			if fallback == "" {
+				fallback = command
+			}
+			targets = []string{fallback}
+			command = fallback
+		}
+	}
+	pairs := make([]harness.PermissionRequest, 0, len(targets))
+	for _, target := range targets {
+		pairs = append(pairs, harness.PermissionRequest{Permission: permissionCommandRun, Target: target})
+	}
+	spillDir := filepath.Join(t.inst.dataDir, "code", tc.AdmittedEntry.SessionID, "output")
+	return harness.PreparedTool{
+		Permissions: pairs,
+		Execute: func(ctx context.Context) harness.ToolOutcome {
+			return commandOutcome(ctx, call.ID, command, tc.Workspace, timeoutSec, s, spillDir)
+		},
+	}
+}
+
+// commandOutcome runs one prepared foreground command through the shared
+// runner and maps the retained outcomes onto the model-visible result: a
+// completed run settles as success or — for a nonzero exit — the same
+// ExitError output the legacy engine reports as an error; a configured
+// timeout settles as an error result with the retained timeout text; a
+// parent-context cancellation or deadline settles as an interrupted result
+// with the retained cancellation text.
+func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec int, s settings, spillDir string) harness.ToolOutcome {
+	result, err := tool.RunForegroundCommand(ctx, command, dir, timeoutSec, s.MaxOutputBytes, s.ReadLineMaxChars, spillDir)
+	var exitErr *tool.ExitError
+	if errors.As(err, &exitErr) {
+		status := model.ResultError
+		if exitErr.ExitCode == -1 && ctx.Err() != nil {
+			status = model.ResultInterrupted
+		}
+		return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: status, Content: exitErr.Output}}
+	}
+	if err != nil {
+		return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: err.Error()}}
+	}
+	return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultSuccess, Content: result}}
+}
+
+// sleepTool is the sleep export: normalization clamps to integer seconds
+// 1..300, the fixed target * is the one the built-in policy allows, and
+// execution observes cancellation as an interrupted result.
+type sleepTool struct{ inst *instance }
+
+func (sleepTool) describe(in runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
+	if _, err := decodeSettings(in.Config(pluginID)); err != nil {
+		return runtime.ToolDescription{}, err
+	}
+	return runtime.ToolDescription{
+		Definition: model.ToolDefinition{
+			Name:        "sleep",
+			Description: sleepDescription,
+			Parameters:  json.RawMessage(sleepParameters),
+		},
+		Available: true,
+	}, nil
+}
+
+func (t sleepTool) Normalize(tc runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
+	if _, err := t.inst.settings(tc.Invocation); err != nil {
+		return nil, err
+	}
+	return normalizeCallArguments(call, tool.NormalizeSleepArgs)
+}
+
+func (t sleepTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
+	if _, err := t.inst.settings(tc.Invocation); err != nil {
+		return immediateError(call.ID, err)
+	}
+	args, err := decodeCallArguments(call.Arguments)
+	if err != nil {
+		return immediateError(call.ID, err)
+	}
+	seconds := 1.0
+	if v, ok := args["seconds"].(json.Number); ok {
+		if n, err := v.Int64(); err == nil {
+			seconds = float64(n)
+		}
+	}
+	return harness.PreparedTool{
+		Permissions: []harness.PermissionRequest{{Permission: permissionSleep, Target: "*"}},
+		Execute: func(ctx context.Context) harness.ToolOutcome {
+			result, err := tool.Sleep{}.Execute(ctx, map[string]any{"seconds": seconds})
+			if err != nil {
+				status := model.ResultError
+				if ctx.Err() != nil {
+					status = model.ResultInterrupted
+				}
+				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: status, Content: err.Error()}}
+			}
+			return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: result}}
+		},
+	}
+}
+
 // mutationDescription is the shared mutation-tool description: the write
 // tools are unavailable only to a readonly Agent without a configured write
 // dir — with a nonempty write dir the Harness confines every write to it, so
@@ -481,10 +663,11 @@ func mutationDescription(name, description, parameters string, defaultHidden boo
 	}, nil
 }
 
-// Plugin returns the Runtime-scoped plugin whose four exports are the native
-// file tools. It has no dependencies. ValidateConfig validates the owned
-// plugins.tools section; Open captures the owner data root the mutating
-// calls derive their code groups from.
+// Plugin returns the Runtime-scoped plugin whose six exports are the native
+// file tools plus the foreground command and sleep tools. It has no
+// dependencies. ValidateConfig validates the owned plugins.tools section;
+// Open captures the owner data root the mutating calls derive their code
+// groups from and the command spills their output directory from.
 func Plugin() runtime.Plugin {
 	return runtime.Plugin{
 		ID:    pluginID,
@@ -494,6 +677,8 @@ func Plugin() runtime.Plugin {
 			runtime.ToolSpec("write_file", writeTool{}.describe),
 			runtime.ToolSpec("edit_file", editTool{}.describe),
 			runtime.ToolSpec("apply_patch", patchTool{}.describe),
+			runtime.ToolSpec("run_command", runCommandTool{}.describe),
+			runtime.ToolSpec("sleep", sleepTool{}.describe),
 		},
 		ValidateConfig: func(raw json.RawMessage) error {
 			_, err := decodeSettings(raw)
@@ -516,5 +701,7 @@ func open(ctx context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runt
 		"write_file":  writeTool{inst},
 		"edit_file":   editTool{inst},
 		"apply_patch": patchTool{inst},
+		"run_command": runCommandTool{inst},
+		"sleep":       sleepTool{inst},
 	}}, nil
 }

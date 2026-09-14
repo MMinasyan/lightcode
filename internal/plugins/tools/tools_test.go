@@ -34,18 +34,18 @@ func openTools(t *testing.T, dataDir string) map[string]runtime.Tool {
 	if p.ID != "tools" || p.Scope != runtime.ScopeRuntime || p.ValidateConfig == nil || p.Open == nil || len(p.Requires) != 0 {
 		t.Fatalf("plugin declaration = %+v, want the Runtime-scoped tools plugin with a validator and no dependencies", p)
 	}
-	if len(p.Provides) != 4 {
-		t.Fatalf("plugin declares %d exports, want the four file tools", len(p.Provides))
+	if len(p.Provides) != 6 {
+		t.Fatalf("plugin declares %d exports, want the four file tools plus run_command and sleep", len(p.Provides))
 	}
 	inst, err := p.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dataDir}, runtime.Bindings{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if len(inst.Values) != 4 || inst.Close != nil {
-		t.Fatalf("instance = %d exports with a non-nil Close, want exactly the four tools and no closer", len(inst.Values))
+	if len(inst.Values) != 6 || inst.Close != nil {
+		t.Fatalf("instance = %d exports with a non-nil Close, want exactly the six tools and no closer", len(inst.Values))
 	}
-	byID := make(map[string]runtime.Tool, 4)
-	for _, id := range []string{"read_file", "write_file", "edit_file", "apply_patch"} {
+	byID := make(map[string]runtime.Tool, 6)
+	for _, id := range []string{"read_file", "write_file", "edit_file", "apply_patch", "run_command", "sleep"} {
 		value, ok := inst.Values[id]
 		if !ok {
 			t.Fatalf("instance is missing the declared export %q", id)
@@ -144,6 +144,8 @@ func TestDescribeAvailabilityAndDefinitions(t *testing.T) {
 		"write_file":  writeTool{}.describe,
 		"edit_file":   editTool{}.describe,
 		"apply_patch": patchTool{}.describe,
+		"run_command": runCommandTool{}.describe,
+		"sleep":       sleepTool{}.describe,
 	}
 
 	cases := []struct {
@@ -151,9 +153,9 @@ func TestDescribeAvailabilityAndDefinitions(t *testing.T) {
 		constraints runtime.ToolConstraints
 		available   map[string]bool
 	}{
-		{"unconstrained agent", runtime.ToolConstraints{}, map[string]bool{"read_file": true, "write_file": true, "edit_file": true, "apply_patch": true}},
-		{"readonly without write dir", runtime.ToolConstraints{Readonly: true}, map[string]bool{"read_file": true, "write_file": false, "edit_file": false, "apply_patch": false}},
-		{"readonly with write dir", runtime.ToolConstraints{Readonly: true, WriteDir: "/w"}, map[string]bool{"read_file": true, "write_file": true, "edit_file": true, "apply_patch": true}},
+		{"unconstrained agent", runtime.ToolConstraints{}, map[string]bool{"read_file": true, "write_file": true, "edit_file": true, "apply_patch": true, "run_command": true, "sleep": true}},
+		{"readonly without write dir", runtime.ToolConstraints{Readonly: true}, map[string]bool{"read_file": true, "write_file": false, "edit_file": false, "apply_patch": false, "run_command": true, "sleep": true}},
+		{"readonly with write dir", runtime.ToolConstraints{Readonly: true, WriteDir: "/w"}, map[string]bool{"read_file": true, "write_file": true, "edit_file": true, "apply_patch": true, "run_command": true, "sleep": true}},
 	}
 	for _, tc := range cases {
 		for name, want := range tc.available {
@@ -234,7 +236,7 @@ func TestNormalizeArguments(t *testing.T) {
 	})
 	t.Run("malformed, null and trailing argument bytes are validation errors", func(t *testing.T) {
 		for _, args := range []string{``, `not json`, `null`, `[1]`, `{"path":"a"} trailing`, `"str"`} {
-			for _, name := range []string{"read_file", "write_file", "edit_file", "apply_patch"} {
+			for _, name := range []string{"read_file", "write_file", "edit_file", "apply_patch", "run_command", "sleep"} {
 				if _, err := normalize(t, byID[name], tc, name, args); err == nil {
 					t.Errorf("%s normalized %q, want rejection", name, args)
 				}

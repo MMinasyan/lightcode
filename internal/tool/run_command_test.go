@@ -2,9 +2,13 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -381,8 +385,7 @@ func TestRunCommandTerminateProcessUsesExistingWaitChannel(t *testing.T) {
 		close(waitDone)
 	}()
 
-	tool := NewRunCommand(config.ToolsConfig{}, t.TempDir(), nil)
-	tool.terminateProcess(cmd, waitDone)
+	terminateProcess(cmd, waitDone)
 
 	select {
 	case <-done:
@@ -410,6 +413,193 @@ func (m *recordingProcessManager) Start(command string, timeoutSec int) (string,
 
 func (m *recordingProcessManager) ActiveIDs() []string {
 	return append([]string(nil), m.activeIDs...)
+}
+
+// The classification oracles below drive the shared foreground body's
+// completed-versus-late cases deterministically through the Wait-returned
+// seam: a blocking child under a cancellable context, and a waitCommand
+// replacement that releases the Wait-returned point at a chosen moment.
+
+// TestRunForegroundCommandCancellationWhileRunningIsDeterministic cancels
+// the parent while the wait is seam-blocked: the classification must be the
+// parent cause (cancellation), not whichever wait channel later fires.
+func TestRunForegroundCommandCancellationWhileRunningIsDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	release := make(chan struct{})
+	origWait := waitCommand
+	waitCommand = func(cmd *exec.Cmd) error {
+		<-release
+		return origWait(cmd)
+	}
+	defer func() { waitCommand = origWait }()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := RunForegroundCommand(ctx, "sleep 5", dir, 60, 0, 0, filepath.Join(dir, ".lightcode"))
+		errCh <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	close(release)
+
+	select {
+	case err := <-errCh:
+		var exitErr *ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode != -1 || exitErr.Output != "command cancelled" {
+			t.Fatalf("err = %v, want the exact cancellation ExitError", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled command did not return")
+	}
+}
+
+// TestRunForegroundCommandCompletedBeatsLateEvents completes the real wait
+// through the seam, holds the outcome until the late event is live, and
+// releases it into the runner's late branch: the already-finished command
+// must keep its real result under both a late deadline and a late
+// cancellation, whatever the wait channels raced.
+func TestRunForegroundCommandCompletedBeatsLateEvents(t *testing.T) {
+	t.Run("late deadline", func(t *testing.T) {
+		dir := t.TempDir()
+		origWait := waitCommand
+		waitCommand = func(cmd *exec.Cmd) error {
+			err := origWait(cmd)                // the real child finishes; its output is captured
+			time.Sleep(1200 * time.Millisecond) // hold the result past the 1s deadline
+			return err
+		}
+		defer func() { waitCommand = origWait }()
+
+		result, err := RunForegroundCommand(context.Background(), "printf ok", dir, 1, 0, 0, filepath.Join(dir, ".lightcode"))
+		if err != nil || result != "ok" {
+			t.Fatalf("result = (%q, %v), want the already-finished real result", result, err)
+		}
+	})
+
+	t.Run("late cancellation", func(t *testing.T) {
+		dir := t.TempDir()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		origWait := waitCommand
+		waitCommand = func(cmd *exec.Cmd) error {
+			err := origWait(cmd)               // the real child finishes; its output is captured
+			time.Sleep(300 * time.Millisecond) // hold the result while the cancellation fires
+			return err
+		}
+		defer func() { waitCommand = origWait }()
+
+		errCh := make(chan error, 1)
+		resCh := make(chan string, 1)
+		go func() {
+			result, err := RunForegroundCommand(ctx, "printf ok", dir, 0, 0, 0, filepath.Join(dir, ".lightcode"))
+			resCh <- result
+			errCh <- err
+		}()
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+		select {
+		case result := <-resCh:
+			if err := <-errCh; err != nil || result != "ok" {
+				t.Fatalf("result = (%q, %v), want the already-finished real result", result, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("completed command did not return")
+		}
+	})
+}
+
+// TestRunForegroundCommandTimeoutOverflowRejectedBeforeLaunch proves the
+// overflow guard converts nothing and launches nothing.
+func TestRunForegroundCommandTimeoutOverflowRejectedBeforeLaunch(t *testing.T) {
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "overflow-launched")
+
+	_, err := RunForegroundCommand(context.Background(), "touch "+probe, dir, int(math.MaxInt64/int64(time.Second))+1, 0, 0, filepath.Join(dir, ".lightcode"))
+	if err == nil || !strings.Contains(err.Error(), "overflows the seconds-to-duration conversion") {
+		t.Fatalf("err = %v, want the overflow rejection", err)
+	}
+	if _, statErr := os.Stat(probe); !os.IsNotExist(statErr) {
+		t.Fatalf("command launched despite the overflow rejection")
+	}
+}
+
+// TestRunForegroundCommandParentDeadlineIsCancellation pins that a
+// parent-context deadline — as opposed to the run's own configured timeout —
+// classifies as cancellation.
+func TestRunForegroundCommandParentDeadlineIsCancellation(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(1*time.Second))
+	defer cancel()
+
+	_, err := RunForegroundCommand(ctx, "sleep 5", dir, 0, 0, 0, filepath.Join(dir, ".lightcode"))
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode != -1 || !strings.HasPrefix(exitErr.Output, "command cancelled") {
+		t.Fatalf("err = %v, want the cancellation classification for a parent deadline", err)
+	}
+}
+
+func TestNormalizeRunCommandArgs(t *testing.T) {
+	decode := func(t *testing.T, raw string) map[string]any {
+		t.Helper()
+		decoder := json.NewDecoder(strings.NewReader(raw))
+		decoder.UseNumber()
+		var args map[string]any
+		if err := decoder.Decode(&args); err != nil {
+			t.Fatalf("decode %s: %v", raw, err)
+		}
+		return args
+	}
+	assertNormalized := func(t *testing.T, raw string, wantTimeout int) {
+		t.Helper()
+		normalized, err := NormalizeRunCommandArgs(decode(t, raw), 120)
+		if err != nil {
+			t.Fatalf("NormalizeRunCommandArgs(%s) = %v, want accepted", raw, err)
+		}
+		if normalized["command"] != "ls" {
+			t.Fatalf("command = %v, want ls", normalized["command"])
+		}
+		if got, ok := normalized["timeout"].(json.Number); !ok || got.String() != strconv.Itoa(wantTimeout) {
+			t.Fatalf("timeout = %v, want the canonical lexeme %d", normalized["timeout"], wantTimeout)
+		}
+	}
+
+	assertNormalized(t, `{"command":"ls"}`, 120)
+	assertNormalized(t, `{"command":"ls","timeout":5}`, 5)
+	assertNormalized(t, `{"command":"ls","timeout":0}`, 120)
+	assertNormalized(t, `{"command":"ls","timeout":-3}`, 120)
+	assertNormalized(t, `{"command":"ls","timeout":1.0}`, 1)
+	// The exact positive seconds-to-duration bound is accepted, one over is not.
+	assertNormalized(t, `{"command":"ls","timeout":9223372036}`, 9223372036)
+
+	for _, raw := range []string{
+		`{}`,
+		`{"command":""}`,
+		`{"command":null}`,
+		`{"command":5}`,
+		`{"command":"ls","timeout":1.5}`,
+		`{"command":"ls","timeout":"5"}`,
+		`{"command":"ls","timeout":true}`,
+		`{"command":"ls","timeout":null}`,
+		`{"command":"ls","timeout":9223372036854775808}`,
+		`{"command":"ls","timeout":9223372037}`,
+		`{"command":"ls","background":null}`,
+		`{"command":"ls","background":false}`,
+	} {
+		if _, err := NormalizeRunCommandArgs(decode(t, raw), 120); err == nil {
+			t.Errorf("NormalizeRunCommandArgs(%s) accepted, want rejection", raw)
+		}
+	}
+
+	normalized, err := NormalizeRunCommandArgs(decode(t, `{"command":"ls","_lightcode_receipt":"x"}`), 120)
+	if err != nil {
+		t.Fatalf("private-field strip: %v", err)
+	}
+	if _, ok := normalized["_lightcode_receipt"]; ok {
+		t.Fatal("normalized arguments retained a private field")
+	}
 }
 
 func extractSpillPath(t *testing.T, result string) string {

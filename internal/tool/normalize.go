@@ -3,9 +3,11 @@ package tool
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // normalizeIntArg validates one consumed integer argument from its exact
@@ -113,6 +115,59 @@ func NormalizeReadArgs(args map[string]any, defaultLimit int) (map[string]any, e
 		clean["limit"] = canonicalInt(limit)
 	} else {
 		clean["limit"] = canonicalInt(defaultLimit)
+	}
+	return clean, nil
+}
+
+// NormalizeRunCommandArgs performs target run_command argument normalization:
+// private `_lightcode_` fields are stripped, the required command must be a
+// nonempty string, and a supplied background member of any JSON value —
+// including null — is rejected because the target has no background path.
+// The optional timeout is a strict consumed integer bounded by the
+// seconds-to-duration conversion; an absent or sub-one value keeps the
+// configured default, while a present null is rejected. The normalized form
+// carries the effective timeout as its canonical-integer lexeme.
+func NormalizeRunCommandArgs(args map[string]any, defaultTimeout int) (map[string]any, error) {
+	clean := stripPrivateArgs(args)
+	command, _ := clean["command"].(string)
+	if command == "" {
+		return nil, fmt.Errorf("run_command: command is required")
+	}
+	if _, present := clean["background"]; present {
+		return nil, fmt.Errorf("run_command: background execution is not supported")
+	}
+	timeout := defaultTimeout
+	if _, present := clean["timeout"]; present {
+		v, err := normalizeIntArg(clean, "run_command", "timeout")
+		if err != nil {
+			return nil, err
+		}
+		if int64(v) > int64(math.MaxInt64/time.Second) {
+			return nil, fmt.Errorf("run_command: timeout is too large")
+		}
+		if v >= 1 {
+			timeout = v
+		}
+	}
+	clean["timeout"] = canonicalInt(timeout)
+	return clean, nil
+}
+
+// NormalizeSleepArgs performs target sleep argument normalization: private
+// `_lightcode_` fields are stripped and a present seconds must be a strict
+// integer before the retained 1..300 clamp applies; an absent seconds keeps
+// the retained default of 1. The normalized form carries the clamped value
+// as its canonical-integer lexeme.
+func NormalizeSleepArgs(args map[string]any) (map[string]any, error) {
+	clean := stripPrivateArgs(args)
+	if _, present := clean["seconds"]; present {
+		v, err := normalizeIntArg(clean, "sleep", "seconds")
+		if err != nil {
+			return nil, err
+		}
+		clean["seconds"] = canonicalInt(normalizeSleepSeconds(v))
+	} else {
+		clean["seconds"] = canonicalInt(1)
 	}
 	return clean, nil
 }

@@ -11,7 +11,7 @@ import (
 
 func TestCaptureBelowCapExactOutputNoSpill(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{HomeDir: home, SpillPrefix: "cmd_output_", MaxBytes: 1024, MaxLineChars: 80})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 1024, MaxLineChars: 80})
 	defer c.Close()
 
 	_, _ = c.Stdout().Write([]byte("hello\n"))
@@ -25,7 +25,7 @@ func TestCaptureBelowCapExactOutputNoSpill(t *testing.T) {
 
 func TestCaptureManyLinesAboveCapSpillsFullOutput(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{HomeDir: home, SpillPrefix: "cmd_output_", MaxBytes: 40, MaxLineChars: 80})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 40, MaxLineChars: 80})
 	defer c.Close()
 	full := numberedLines(25)
 	_, _ = c.Stdout().Write([]byte(full))
@@ -52,7 +52,7 @@ func TestCaptureManyLinesAboveCapSpillsFullOutput(t *testing.T) {
 
 func TestCaptureFewLongLinesAboveCapTruncatesAndSpills(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{HomeDir: home, SpillPrefix: "cmd_output_", MaxBytes: 10, MaxLineChars: 5})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 10, MaxLineChars: 5})
 	defer c.Close()
 	full := "abcdefg\n1234567\n"
 	_, _ = c.Stdout().Write([]byte(full))
@@ -72,7 +72,7 @@ func TestCaptureFewLongLinesAboveCapTruncatesAndSpills(t *testing.T) {
 
 func TestCaptureSharedBudgetAcrossStdoutAndStderr(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{HomeDir: home, SpillPrefix: "cmd_output_", MaxBytes: 6, MaxLineChars: 80})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 6, MaxLineChars: 80})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte("abcd"))
 	_, _ = c.Stderr().Write([]byte("efgh"))
@@ -96,7 +96,7 @@ func TestCaptureSharedBudgetAcrossStdoutAndStderr(t *testing.T) {
 
 func TestCaptureCrossingWriteUsesSingleBudget(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{HomeDir: home, SpillPrefix: "cmd_output_", MaxBytes: 5, MaxLineChars: 80})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 5, MaxLineChars: 80})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte("abcdef"))
 	_, _ = c.Stderr().Write([]byte("ghij"))
@@ -115,7 +115,7 @@ func TestCaptureCrossingWriteUsesSingleBudget(t *testing.T) {
 
 func TestCaptureDisabledCapReturnsFullOutputNoSpill(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{HomeDir: home, SpillPrefix: "cmd_output_", MaxBytes: 0, MaxLineChars: 3})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 0, MaxLineChars: 3})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte("abcdefg\n"))
 	_, _ = c.Stderr().Write([]byte("1234567\n"))
@@ -128,7 +128,7 @@ func TestCaptureDisabledCapReturnsFullOutputNoSpill(t *testing.T) {
 
 func TestCaptureRepeatedFormatReusesSpillPath(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{HomeDir: home, SpillPrefix: "cmd_output_", MaxBytes: 5, MaxLineChars: 80})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 5, MaxLineChars: 80})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte("first\nsecond\nthird\n"))
 
@@ -144,7 +144,7 @@ func TestCaptureRepeatedFormatReusesSpillPath(t *testing.T) {
 
 func TestCaptureFinalSpillFailureReturnsExplicitMarker(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{HomeDir: home, SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 80})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 80})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte("abcdefghi"))
 	if err := os.Chmod(filepath.Join(home, ".lightcode"), 0o500); err != nil {
@@ -166,7 +166,7 @@ func TestCapturePrivateSpillFailureStaysBounded(t *testing.T) {
 	if err := os.WriteFile(homeFile, []byte("not a dir"), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	c := NewCapture(Options{HomeDir: homeFile, SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 4})
+	c := NewCapture(Options{Directory: filepath.Join(homeFile, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 4})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte("abcdefghijklmnopqrstuvwxyz"))
 
@@ -181,7 +181,7 @@ func TestCapturePrivateSpillFailureStaysBounded(t *testing.T) {
 
 func TestCaptureVeryLongLineTruncatedWithoutFullRetention(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{HomeDir: home, SpillPrefix: "cmd_output_", MaxBytes: 8, MaxLineChars: 5})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 8, MaxLineChars: 5})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte(strings.Repeat("x", 10000)))
 
@@ -196,7 +196,7 @@ func TestCaptureVeryLongLineTruncatedWithoutFullRetention(t *testing.T) {
 
 func TestCaptureConcurrentWritersAndFormat(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{HomeDir: home, SpillPrefix: "cmd_output_", MaxBytes: 64, MaxLineChars: 20})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 64, MaxLineChars: 20})
 	defer c.Close()
 
 	var wg sync.WaitGroup
@@ -220,7 +220,7 @@ func TestCaptureConcurrentWritersAndFormat(t *testing.T) {
 func TestCaptureConcurrentFormatAndClose(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		home := t.TempDir()
-		c := NewCapture(Options{HomeDir: home, SpillPrefix: "cmd_output_", MaxBytes: 16, MaxLineChars: 20})
+		c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 16, MaxLineChars: 20})
 		_, _ = c.Stdout().Write([]byte(strings.Repeat("line\n", 1000)))
 
 		start := make(chan struct{})
@@ -244,7 +244,7 @@ func TestCaptureConcurrentFormatAndClose(t *testing.T) {
 func TestCaptureCloseDeletesUnreturnedVisibleSpillAndKeepsReturned(t *testing.T) {
 	t.Run("unreturned", func(t *testing.T) {
 		home := t.TempDir()
-		c := NewCapture(Options{HomeDir: home, SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 80})
+		c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 80})
 		_, _ = c.Stdout().Write([]byte("abcdefghi"))
 		c.Format()
 		c.mu.Lock()
@@ -259,7 +259,7 @@ func TestCaptureCloseDeletesUnreturnedVisibleSpillAndKeepsReturned(t *testing.T)
 
 	t.Run("returned", func(t *testing.T) {
 		home := t.TempDir()
-		c := NewCapture(Options{HomeDir: home, SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 80})
+		c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 80})
 		_, _ = c.Stdout().Write([]byte("abcdefghi"))
 		path := extractSpillPath(t, c.Format())
 		c.Close()

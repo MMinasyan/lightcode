@@ -94,3 +94,36 @@ const applyPatchParameters = `{
   },
   "required": ["input"]
 }`
+
+const runCommandDescription = `Executes a shell command and returns combined stdout and stderr.
+- Each call starts a fresh shell in the project root. Environment variables, aliases, and working directory do not persist between calls. Use "cd /path && command" if you need a different working directory.
+- Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use <EDIT FILE OR WRITE FILE>.`
+
+const runCommandParameters = `{
+  "type": "object",
+  "properties": {
+    "command": {
+      "type": "string",
+      "description": "The shell command to execute."
+    },
+    "timeout": {
+      "type": "integer",
+      "description": "Timeout in seconds for this command. Overrides the default."
+    }
+  },
+  "required": ["command"]
+}`
+
+const sleepDescription = `Wait for a specified number of seconds before continuing.
+- Use this to pause before checking the results of an earlier command, or while waiting for servers, builds, or file watchers to initialize.`
+
+const sleepParameters = `{
+  "type": "object",
+  "properties": {
+    "seconds": {
+      "type": "integer",
+      "description": "Number of seconds to wait (max 300)."
+    }
+  },
+  "required": ["seconds"]
+}`
