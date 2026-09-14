@@ -220,6 +220,11 @@ type composition struct {
 	capabilityIDs []string
 	toolIDs       []string
 	coreExports   []coreExportDecl
+
+	// modelAdaptation is the single export ID declared as exactly
+	// ModelAdaptation, or empty when the composition declares none. More than
+	// one is ambiguous and rejected before construction.
+	modelAdaptation string
 }
 
 // newComposition validates the complete selected plugin set before any
@@ -227,7 +232,8 @@ type composition struct {
 // at least one provider, unique nonempty export IDs globally and unique
 // nonempty dependency IDs per plugin, assignable provider types,
 // lifetime-compatible PreparationHook declarations (Runtime or Workspace
-// scope only), Tool declarations carrying their description functions, and
+// scope only), Tool declarations carrying their description functions, at
+// most one ModelAdaptation export and it Runtime scoped, and
 // same-or-longer-lived dependency scopes and an acyclic dependency graph. An
 // ordinary dependency on an ID reserved by a Core
 // storage export is a plain missing binding and is rejected.
@@ -250,6 +256,7 @@ func newComposition(plugins []Plugin) (*composition, error) {
 	var capabilityIDs []string
 	var toolIDs []string
 	var coreExports []coreExportDecl
+	var adaptationExports []string
 	for i, p := range owned {
 		if p.ID == "" {
 			return nil, fmt.Errorf("plugin %d: empty plugin ID: %w", i, ErrComposition)
@@ -291,6 +298,9 @@ func newComposition(plugins []Plugin) (*composition, error) {
 			if prov.typ.Implements(preparationHookType) && p.Scope != ScopeRuntime && p.Scope != ScopeWorkspace {
 				return nil, fmt.Errorf("plugin %q (%s): capability %q declared as %s implements PreparationHook and requires Runtime or Workspace scope: %w", p.ID, p.Scope, prov.id, prov.typ, ErrComposition)
 			}
+			if prov.typ == modelAdaptationType && p.Scope != ScopeRuntime {
+				return nil, fmt.Errorf("plugin %q (%s): capability %q declared as %s requires Runtime scope: %w", p.ID, p.Scope, prov.id, prov.typ, ErrComposition)
+			}
 			if prov.typ == storageType {
 				coreExports = append(coreExports, coreExportDecl{plugin: p.ID, scope: p.Scope, id: prov.id})
 			} else {
@@ -299,8 +309,14 @@ func newComposition(plugins []Plugin) (*composition, error) {
 				if prov.typ == toolType {
 					toolIDs = append(toolIDs, prov.id)
 				}
+				if prov.typ == modelAdaptationType {
+					adaptationExports = append(adaptationExports, prov.id)
+				}
 			}
 		}
+	}
+	if len(adaptationExports) > 1 {
+		return nil, fmt.Errorf("%d exports are declared as %s: %w", len(adaptationExports), modelAdaptationType, ErrComposition)
 	}
 	for _, p := range owned {
 		for _, req := range p.Requires {
@@ -364,12 +380,17 @@ func newComposition(plugins []Plugin) (*composition, error) {
 		p := owned[i]
 		plan[p.Scope] = append(plan[p.Scope], p)
 	}
+	modelAdaptation := ""
+	if len(adaptationExports) == 1 {
+		modelAdaptation = adaptationExports[0]
+	}
 	return &composition{
-		plugins:       owned,
-		plan:          plan,
-		capabilityIDs: capabilityIDs,
-		toolIDs:       toolIDs,
-		coreExports:   coreExports,
+		plugins:         owned,
+		plan:            plan,
+		capabilityIDs:   capabilityIDs,
+		toolIDs:         toolIDs,
+		coreExports:     coreExports,
+		modelAdaptation: modelAdaptation,
 	}, nil
 }
 

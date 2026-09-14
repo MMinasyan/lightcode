@@ -56,7 +56,7 @@ func assembleConfiguration(generation uint64, configData, agentsData string, cap
 	if err != nil {
 		return nil, err
 	}
-	return newConfiguration(generation, doc, catalog.Build(catalog.BuildInputs{UserRaw: doc.Providers}), []byte(agentsData), capabilityIDs, testToolUniverse(), nil)
+	return newConfiguration(generation, doc, catalog.Build(catalog.BuildInputs{UserRaw: doc.Providers}), []byte(agentsData), capabilityIDs, testToolUniverse(), nil, nil)
 }
 
 func testSnapshot(t *testing.T) *configuration {

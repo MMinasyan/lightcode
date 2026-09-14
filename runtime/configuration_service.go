@@ -59,6 +59,11 @@ type configurationService struct {
 	capabilityIDs []string
 	toolIDs       []string
 
+	// defaultCapabilityIDs is empty, or the single composed ModelAdaptation
+	// export ID installed on the built-in primary definition before ordinary
+	// inheritance. No plugin callback supplies it.
+	defaultCapabilityIDs []string
+
 	owner context.Context
 	obs   *observation
 
@@ -77,16 +82,21 @@ func newConfigurationService(owner context.Context, c *composition, loader *cata
 	for _, p := range c.plugins {
 		pluginIDs[p.ID] = true
 	}
+	defaultCapabilityIDs := []string(nil)
+	if c.modelAdaptation != "" {
+		defaultCapabilityIDs = []string{c.modelAdaptation}
+	}
 	return &configurationService{
-		loader:        loader,
-		configPath:    configPath,
-		agentsPath:    agents.PathForConfig(configPath),
-		plugins:       c.plugins,
-		pluginIDs:     pluginIDs,
-		capabilityIDs: c.capabilityIDs,
-		toolIDs:       c.toolIDs,
-		owner:         owner,
-		obs:           obs,
+		loader:               loader,
+		configPath:           configPath,
+		agentsPath:           agents.PathForConfig(configPath),
+		plugins:              c.plugins,
+		pluginIDs:            pluginIDs,
+		capabilityIDs:        c.capabilityIDs,
+		toolIDs:              c.toolIDs,
+		defaultCapabilityIDs: defaultCapabilityIDs,
+		owner:                owner,
+		obs:                  obs,
 	}
 }
 
@@ -180,7 +190,7 @@ func (s *configurationService) build(ctx context.Context, generation uint64) (*c
 		}
 		return nil, configurationFailure(err)
 	}
-	snapshot, err := newConfiguration(generation, doc, built, agentsData, s.capabilityIDs, s.toolIDs, captureWorkspacePermissions())
+	snapshot, err := newConfiguration(generation, doc, built, agentsData, s.capabilityIDs, s.toolIDs, s.defaultCapabilityIDs, captureWorkspacePermissions())
 	if err != nil {
 		return nil, configurationFailure(err)
 	}

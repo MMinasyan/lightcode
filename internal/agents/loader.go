@@ -64,10 +64,11 @@ func Parse(data []byte) (*Config, error) {
 // validated against the supplied compiled tool declarations: an unknown
 // explicit custom tool name drops that definition with the retained warning,
 // duplicates remain valid input, and default and inherited tool lists are
-// intersected with the compiled universe. defaultCapabilityIDs is the
-// default capability selection seam: the current caller supplies empty
-// defaults and a later composition phase derives them, so it is accepted and
-// forwarded unused today.
+// intersected with the compiled universe. defaultCapabilityIDs is the default
+// capability selection seam: a non-empty list is installed as the built-in
+// primary definition's capabilities before user overlays and inheritance, so
+// ordinary inheritance propagates it and explicit selections override or
+// clear it; a nil or empty list leaves the built-ins with an empty default.
 func ParseWithCapabilities(data []byte, capabilityIDs, toolIDs, defaultCapabilityIDs []string) (*Config, error) {
 	declared := make(map[string]struct{}, len(capabilityIDs))
 	for _, id := range capabilityIDs {
@@ -90,6 +91,11 @@ func parse(data []byte, declaredCapabilities, declaredTools map[string]struct{},
 	}
 
 	cfg := &Config{defs: copyBuiltins()}
+	if len(defaultCapabilityIDs) > 0 {
+		primary := cfg.defs["primary"]
+		primary.Capabilities = toolsPtr(append([]string(nil), defaultCapabilityIDs...))
+		cfg.defs["primary"] = primary
+	}
 	names := make([]string, 0, len(user))
 	for name := range user {
 		names = append(names, name)

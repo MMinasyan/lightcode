@@ -31,7 +31,7 @@ func ConfiguredInvocationForTest(sections map[string]string) (Invocation, error)
 	for id, section := range sections {
 		plugins[id] = json.RawMessage(section)
 	}
-	snapshot, err := newConfiguration(1, capturedConfigDocument{Plugins: plugins}, catalog.BuildResult{}, []byte("{}"), nil, nil, nil)
+	snapshot, err := newConfiguration(1, capturedConfigDocument{Plugins: plugins}, catalog.BuildResult{}, []byte("{}"), nil, nil, nil, nil)
 	if err != nil {
 		return Invocation{}, err
 	}

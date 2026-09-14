@@ -78,15 +78,16 @@ func decodeCapturedConfig(configData []byte) (capturedConfigDocument, error) {
 // captured agent-definition bytes, and the captured Workspace permission
 // bytes: it calls ParseSessions and agents.ParseWithCapabilities against the
 // supplied ordinary visible export IDs and the compiled tool universe, with
-// empty capability defaults until a later composition phase derives them, and
+// the default capability selection derived from the composition (empty, or
+// the single composed ModelAdaptation export ID), and
 // carries the given publication generation. Plugin-section validation belongs
 // to the publisher, not here.
-func newConfiguration(generation uint64, doc capturedConfigDocument, built catalog.BuildResult, agentsData []byte, capabilityIDs, toolIDs []string, workspacePermissions map[string]json.RawMessage) (*configuration, error) {
+func newConfiguration(generation uint64, doc capturedConfigDocument, built catalog.BuildResult, agentsData []byte, capabilityIDs, toolIDs, defaultCapabilityIDs []string, workspacePermissions map[string]json.RawMessage) (*configuration, error) {
 	sessions, err := config.ParseSessions(doc.Sessions)
 	if err != nil {
 		return nil, fmt.Errorf("captured configuration sessions: %w", err)
 	}
-	definitions, err := agents.ParseWithCapabilities(agentsData, capabilityIDs, toolIDs, nil)
+	definitions, err := agents.ParseWithCapabilities(agentsData, capabilityIDs, toolIDs, defaultCapabilityIDs)
 	if err != nil {
 		return nil, fmt.Errorf("decode captured agent definitions: %w", err)
 	}

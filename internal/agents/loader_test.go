@@ -408,7 +408,8 @@ func TestParseWithCapabilitiesSelection(t *testing.T) {
 		t.Fatalf("plan capabilities = %q, want the selected order", plan.Capabilities)
 	}
 	// A custom type inherits through secondary and primary; the built-ins
-	// keep their locked fields and an empty capability default.
+	// keep their locked fields and an empty capability default because this
+	// caller supplies no default list.
 	for _, name := range []string{"sweeper", "plain", "secondary"} {
 		resolved, err := cfg.Resolve(name)
 		if err != nil {
@@ -590,5 +591,74 @@ func TestParseWithCapabilitiesIntersectsDefaultTools(t *testing.T) {
 	}
 	if len(nonePrimary.Tools) != 0 {
 		t.Fatalf("primary tools under an empty universe = %q, want none fabricated", nonePrimary.Tools)
+	}
+}
+
+func TestParseWithCapabilitiesDefaultProjection(t *testing.T) {
+	cfg, err := ParseWithCapabilities([]byte(`{
+	  "plan": {"capabilities": ["cap-a"]},
+	  "sweeper": {"capabilities": []},
+	  "plain": {},
+	  "model_a": {"model": "prov/a"},
+	  "model_b": {"model": "prov/b"}
+	}`), []string{"cap-a", "cap-b", "model_adaptation"}, []string{"read_file"}, []string{"model_adaptation"})
+	if err != nil {
+		t.Fatalf("ParseWithCapabilities: %v", err)
+	}
+	// The default list installs on the built-in primary definition alone;
+	// ordinary inheritance propagates it through secondary to customs.
+	want := []string{"model_adaptation"}
+	primary, err := cfg.Resolve("primary")
+	if err != nil {
+		t.Fatalf("Resolve(primary): %v", err)
+	}
+	if !reflect.DeepEqual(primary.Capabilities, want) {
+		t.Fatalf("primary capabilities = %q, want the default %q", primary.Capabilities, want)
+	}
+	for _, name := range []string{"secondary", "explore", "review", "compact", "plain", "model_a", "model_b"} {
+		resolved, err := cfg.Resolve(name)
+		if err != nil {
+			t.Fatalf("Resolve(%s): %v", name, err)
+		}
+		if !reflect.DeepEqual(resolved.Capabilities, want) {
+			t.Fatalf("%s capabilities = %q, want the inherited default %q", name, resolved.Capabilities, want)
+		}
+	}
+	// An explicit selection overrides the default and an explicit empty list
+	// clears it.
+	plan, err := cfg.Resolve("plan")
+	if err != nil {
+		t.Fatalf("Resolve(plan): %v", err)
+	}
+	if want := []string{"cap-a"}; !reflect.DeepEqual(plan.Capabilities, want) {
+		t.Fatalf("plan capabilities = %q, want the explicit selection %q", plan.Capabilities, want)
+	}
+	sweeper, err := cfg.Resolve("sweeper")
+	if err != nil {
+		t.Fatalf("Resolve(sweeper): %v", err)
+	}
+	if sweeper.Capabilities != nil {
+		t.Fatalf("sweeper capabilities = %q, want the explicit empty clear", sweeper.Capabilities)
+	}
+}
+
+func TestParseWithCapabilitiesEmptyDefaultsLeaveBaseline(t *testing.T) {
+	const doc = `{"plain": {}}`
+	nilDefaults, err := ParseWithCapabilities([]byte(doc), []string{"cap-a"}, nil, nil)
+	if err != nil {
+		t.Fatalf("ParseWithCapabilities(nil defaults): %v", err)
+	}
+	emptyDefaults, err := ParseWithCapabilities([]byte(doc), []string{"cap-a"}, nil, []string{})
+	if err != nil {
+		t.Fatalf("ParseWithCapabilities(empty defaults): %v", err)
+	}
+	if !reflect.DeepEqual(nilDefaults.All(), emptyDefaults.All()) {
+		t.Fatal("an empty default list changed the resolved definitions")
+	}
+	// Both stay byte-identical to the built-ins' empty capability default.
+	for _, resolved := range nilDefaults.All() {
+		if resolved.Capabilities != nil {
+			t.Fatalf("%s capabilities = %q, want the empty default", resolved.Name, resolved.Capabilities)
+		}
 	}
 }
