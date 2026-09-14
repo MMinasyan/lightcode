@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/lsp/jsonrpc"
 	"github.com/MMinasyan/lightcode/internal/lsp/protocol"
 	"github.com/MMinasyan/lightcode/internal/lsp/server"
+	"github.com/MMinasyan/lightcode/internal/safefs"
 )
 
 const (
@@ -37,6 +39,11 @@ type instance struct {
 	def         *server.Definition
 	projectRoot string
 	home        string
+	// lifetime is the context this instance was started under: every restart
+	// derives its bounded start context from it, so an owner whose lifetime
+	// is canceled loses the instance's serviceability instead of
+	// resurrecting the server from a Background context.
+	lifetime context.Context
 
 	mu        sync.Mutex
 	state     int
@@ -54,11 +61,12 @@ type instance struct {
 	onCrash func(name string)
 }
 
-func newInstance(def *server.Definition, projectRoot, home string, onCrash func(string)) *instance {
+func newInstance(def *server.Definition, projectRoot, home string, lifetime context.Context, onCrash func(string)) *instance {
 	return &instance{
 		def:         def,
 		projectRoot: projectRoot,
 		home:        home,
+		lifetime:    lifetime,
 		diagnostics: make(map[string][]protocol.Diagnostic),
 		openedVer:   make(map[string]int),
 		readyCh:     make(chan struct{}),
@@ -374,7 +382,7 @@ func (inst *instance) watchProcess(cmd *exec.Cmd, procDone chan struct{}) {
 	inst.setTerminalLocked(stateIdle)
 	inst.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(inst.lifetime, 60*time.Second)
 	defer cancel()
 	if _, err := inst.start(ctx); err != nil {
 		// The restart attempt failed; start() already ended it by returning
@@ -410,8 +418,9 @@ func (inst *instance) waitReady(ctx context.Context) error {
 
 	// Idle or shutdown: start a fresh launch. The start context is decoupled
 	// from the caller so cancelling this wait does not abort the launch for
-	// other callers, and bounded like the crash-restart path.
-	startCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// other callers, and bounded like the crash-restart path — both restart
+	// derivations come from the instance's lifetime, never Background.
+	startCtx, cancel := context.WithTimeout(inst.lifetime, 60*time.Second)
 	defer cancel()
 	ch, err := inst.start(startCtx)
 	if err != nil {
@@ -473,7 +482,35 @@ func (inst *instance) call(ctx context.Context, method string, params any) (json
 	return result, nil
 }
 
+// openFile opens one document with the legacy read path (os.ReadFile).
 func (inst *instance) openFile(ctx context.Context, absPath string) error {
+	return inst.openFileWith(ctx, absPath, os.ReadFile)
+}
+
+// readCanonicalFile reads path through safefs.OpenExisting and its returned
+// descriptor: the no-follow open refuses a replaced symlink leaf and
+// non-regular or hardlinked files, so no substituted content can ever be
+// sent to the server.
+func readCanonicalFile(path string) ([]byte, error) {
+	f, err := safefs.OpenExisting(path, os.O_RDONLY)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+// openFileCanonical opens one document through the canonical read path; it
+// shares the terminal admission check and the didOpen/didChange sync with
+// openFile and differs only in the content reader.
+func (inst *instance) openFileCanonical(ctx context.Context, absPath string) error {
+	return inst.openFileWith(ctx, absPath, readCanonicalFile)
+}
+
+// openFileWith is the one document-sync body: the terminal admission check
+// for the retained instance handle, the content read through the supplied
+// reader, and the didOpen/didChange versioned sync.
+func (inst *instance) openFileWith(ctx context.Context, absPath string, read func(string) ([]byte, error)) error {
 	inst.mu.Lock()
 	ver := inst.openedVer[absPath]
 	rpc := inst.rpc
@@ -488,7 +525,7 @@ func (inst *instance) openFile(ctx context.Context, absPath string) error {
 		return fmt.Errorf("%s is unavailable", inst.def.Name)
 	}
 
-	content, err := os.ReadFile(absPath)
+	content, err := read(absPath)
 	if err != nil {
 		return err
 	}

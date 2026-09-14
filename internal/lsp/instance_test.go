@@ -10,7 +10,7 @@ import (
 )
 
 func TestInstanceDiagnosticsAndReadyNotification(t *testing.T) {
-	inst := newInstance(&server.Definition{Name: "fake"}, t.TempDir(), t.TempDir(), nil)
+	inst := newInstance(&server.Definition{Name: "fake"}, t.TempDir(), t.TempDir(), context.Background(), nil)
 	// A readiness notification only ever arrives from a launch that is under
 	// way, so the instance must already be starting.
 	inst.mu.Lock()
@@ -42,7 +42,7 @@ func TestInstanceDiagnosticsAndReadyNotification(t *testing.T) {
 }
 
 func TestInstanceWaitReadyCanceledWhenStarting(t *testing.T) {
-	inst := newInstance(&server.Definition{Name: "fake"}, t.TempDir(), t.TempDir(), nil)
+	inst := newInstance(&server.Definition{Name: "fake"}, t.TempDir(), t.TempDir(), context.Background(), nil)
 	// A launch is already under way; waiting on it must observe the caller's
 	// cancellation rather than anything else.
 	inst.mu.Lock()

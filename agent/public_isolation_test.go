@@ -67,6 +67,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 		legacyAgent   = publicModule + "/internal/agent"
 		pluginsPkg    = publicModule + "/internal/plugins"
 		shellparsePkg = publicModule + "/internal/shellparse"
+		lspPkg        = publicModule + "/internal/lsp"
 	)
 	var problems []string
 	dir := path.Dir(rel)
@@ -113,6 +114,11 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 		case "internal/plugins/adaptation":
 			if imp != runtimePkg && imp != modelPkg && imp != adaptationPkg && !std[imp] {
 				problems = append(problems, rel+": internal/plugins/adaptation imports "+imp+"; the adaptation plugin may import only the standard library, "+runtimePkg+", "+modelPkg+", and "+adaptationPkg)
+			}
+		case "internal/plugins/lsp":
+			if imp != runtimePkg && imp != harnessPkg && imp != modelPkg && imp != lspPkg &&
+				imp != snapshotPkg && imp != pathutilPkg && !std[imp] {
+				problems = append(problems, rel+": internal/plugins/lsp imports "+imp+"; the LSP plugin may import only the standard library, "+runtimePkg+", "+harnessPkg+", "+modelPkg+", and the retained "+lspPkg+", "+snapshotPkg+", and "+pathutilPkg+" helpers")
 			}
 		default:
 			if imp == modelPkg || imp == agentPkg || imp == harnessPkg || imp == storagePkg || imp == sqliteDriverPkg ||
@@ -204,6 +210,22 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 			t.Errorf("internal/plugins/adaptation importing %q: %d problems, want 1: %v", imp, len(problems), problems)
 		}
 	}
+	// The LSP plugin declares the diagnostics and workspace_symbol tools over
+	// the public runtime, harness, and model contracts and the retained
+	// internal/lsp, snapshot, and path helpers it composes; the legacy owner,
+	// the legacy tools, storage, the driver, and sibling plugins never enter it.
+	if problems := checkTrackedGoFile("internal/plugins/lsp/x.go", []string{
+		"context", "encoding/json", "errors", "os", "path/filepath", "strings", "sync",
+		publicModule + "/model", publicModule + "/harness", publicModule + "/runtime",
+		publicModule + "/internal/lsp", publicModule + "/internal/snapshot", publicModule + "/internal/pathutil",
+	}, std); len(problems) != 0 {
+		t.Errorf("allowed internal/plugins/lsp imports flagged: %v", problems)
+	}
+	for _, imp := range []string{publicModule + "/agent", publicModule + "/internal/agent", publicModule + "/internal/storage", sqliteDriverPkg, publicModule + "/internal/tool", publicModule + "/internal/prompt", publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tools", publicModule + "/internal/plugins/adaptation", publicModule + "/internal/plugins"} {
+		if problems := checkTrackedGoFile("internal/plugins/lsp/x.go", []string{imp}, std); len(problems) != 1 {
+			t.Errorf("internal/plugins/lsp importing %q: %d problems, want 1: %v", imp, len(problems), problems)
+		}
+	}
 	// The runtime target layer consumes the public model and harness
 	// contracts and the retained internal configuration helpers only; the
 	// legacy owner, durable storage, concrete plugins, the public agent
@@ -252,7 +274,7 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 func TestDependencyRulesCheckEveryTrackedDirectory(t *testing.T) {
 	std := standardLibraryImports(t)
 	for _, rel := range []string{".hidden/pkg/x.go", "_scaffold/pkg/x.go", "frontend/bindata.go", "node_modules/pkg/x.go", "vendor/pkg/x.go", "main.go", "internal/anything/x.go"} {
-		for _, imp := range []string{publicModule + "/model", publicModule + "/agent", publicModule + "/harness", publicModule + "/internal/storage", publicModule + "/runtime", publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tools", publicModule + "/internal/plugins/adaptation", sqliteDriverPkg} {
+		for _, imp := range []string{publicModule + "/model", publicModule + "/agent", publicModule + "/harness", publicModule + "/internal/storage", publicModule + "/runtime", publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tools", publicModule + "/internal/plugins/adaptation", publicModule + "/internal/plugins/lsp", sqliteDriverPkg} {
 			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
 				t.Errorf("tracked %q importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
 			}

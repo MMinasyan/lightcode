@@ -35,10 +35,20 @@ func (c *Client) WorkspaceSymbol(ctx context.Context, query string) (string, err
 
 	for _, inst := range instances {
 		if err := inst.waitReady(ctx); err != nil {
+			// An observed caller cancellation returns the symbols collected
+			// so far with the cancellation error instead of swallowing it;
+			// an unavailable server without cancellation keeps its ordinary
+			// omission.
+			if ctx.Err() != nil {
+				return formatSymbols(all), ctx.Err()
+			}
 			continue
 		}
 		result, err := inst.call(ctx, "workspace/symbol", params)
 		if err != nil {
+			if ctx.Err() != nil {
+				return formatSymbols(all), ctx.Err()
+			}
 			continue
 		}
 		var syms []protocol.SymbolInformation
@@ -58,7 +68,12 @@ func (c *Client) WorkspaceSymbol(ctx context.Context, query string) (string, err
 	if len(all) == 0 {
 		return "No symbols found.", nil
 	}
+	return formatSymbols(all), nil
+}
 
+// formatSymbols is the shared symbol formatting: the 20-symbol cap and the
+// retained showing-count line.
+func formatSymbols(all []protocol.SymbolInformation) string {
 	cap := 20
 	total := len(all)
 	if len(all) > cap {
@@ -78,10 +93,31 @@ func (c *Client) WorkspaceSymbol(ctx context.Context, query string) (string, err
 	if total > cap {
 		fmt.Fprintf(&b, "\nShowing %d of %d total.", cap, total)
 	}
-	return strings.TrimRight(b.String(), "\n"), nil
+	return strings.TrimRight(b.String(), "\n")
 }
 
+// diagOpener opens one path's document for the sync: the legacy reader reads
+// with os.ReadFile, the canonical reader through safefs.
+type diagOpener func(ctx context.Context, inst *instance, path string) error
+
 func (c *Client) GetDiagnostics(ctx context.Context, paths []string) (string, error) {
+	return c.getDiagnostics(ctx, paths, func(ctx context.Context, inst *instance, path string) error {
+		return inst.openFile(ctx, path)
+	})
+}
+
+// GetDiagnosticsCanonical shares the query/formatting/sync body with
+// GetDiagnostics and differs only in the per-file content read: the no-follow
+// safefs open refuses a replaced symlink leaf and non-regular or hardlinked
+// files, and no substituted content is ever sent — a failed read reports the
+// retained could-not-check line.
+func (c *Client) GetDiagnosticsCanonical(ctx context.Context, paths []string) (string, error) {
+	return c.getDiagnostics(ctx, paths, func(ctx context.Context, inst *instance, path string) error {
+		return inst.openFileCanonical(ctx, path)
+	})
+}
+
+func (c *Client) getDiagnostics(ctx context.Context, paths []string, open diagOpener) (string, error) {
 	type serverPaths struct {
 		inst  *instance
 		paths []string
@@ -110,22 +146,26 @@ func (c *Client) GetDiagnostics(ctx context.Context, paths []string) (string, er
 			continue
 		}
 		for _, p := range g.paths {
-			if err := g.inst.openFile(ctx, p); err != nil {
+			if err := open(ctx, g.inst, p); err != nil {
 				openErrors = append(openErrors, fmt.Sprintf("%s: %v", p, err))
 			}
 		}
-	}
-
-	select {
-	case <-time.After(500 * time.Millisecond):
-	case <-ctx.Done():
-		return "", ctx.Err()
 	}
 
 	var b strings.Builder
 	for _, e := range openErrors {
 		fmt.Fprintf(&b, "%s (could not check)\n", e)
 	}
+
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-ctx.Done():
+		// The observed caller cancellation returns the could-not-check
+		// content accumulated so far with the cancellation error instead of
+		// swallowing it.
+		return strings.TrimRight(b.String(), "\n"), ctx.Err()
+	}
+
 	totalErrors := 0
 	for _, g := range groups {
 		for _, p := range g.paths {

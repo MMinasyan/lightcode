@@ -108,6 +108,13 @@ while True:
 `
 
 func newFakeServerInstance(t *testing.T, log, failMarker string, initDelay, readyDelay float64, crash, stubborn string) *instance {
+	return newFakeServerInstanceWithLifetime(t, log, failMarker, initDelay, readyDelay, crash, stubborn, context.Background())
+}
+
+// newFakeServerInstanceWithLifetime is the same helper with the instance's
+// restart lifetime under the test's control: restarts derive their bounded
+// start context from it.
+func newFakeServerInstanceWithLifetime(t *testing.T, log, failMarker string, initDelay, readyDelay float64, crash, stubborn string, lifetime context.Context) *instance {
 	t.Helper()
 	home := t.TempDir()
 	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", "fake")
@@ -129,7 +136,7 @@ func newFakeServerInstance(t *testing.T, log, failMarker string, initDelay, read
 			crash,
 			stubborn,
 		},
-	}, t.TempDir(), home, nil)
+	}, t.TempDir(), home, lifetime, nil)
 	t.Cleanup(func() { inst.shutdown() })
 	return inst
 }
@@ -446,7 +453,7 @@ func TestStartAfterPermanentCloseSelfReaps(t *testing.T) {
 		Name:    "fake",
 		Command: "fake-lsp",
 		Args:    []string{log, "", "0", "0", "", "1"},
-	}, t.TempDir(), home, nil)
+	}, t.TempDir(), home, context.Background(), nil)
 	t.Cleanup(func() { inst.shutdown() })
 
 	// Count every instance-owned process wait through the seam.

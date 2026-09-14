@@ -30,7 +30,7 @@ func TestManagerForFileAndAllInstances(t *testing.T) {
 	}
 
 	def := server.ForExtension(".go")
-	inst := newInstance(def, m.projectRoot, m.home, nil)
+	inst := newInstance(def, m.projectRoot, m.home, context.Background(), nil)
 	m.instances[def.Name] = inst
 	if got := m.ForFile("main.go"); got != inst {
 		t.Fatalf("ForFile(main.go) = %+v, want inserted instance", got)
@@ -44,7 +44,7 @@ func TestManagerForFileAndAllInstances(t *testing.T) {
 func TestManagerConcurrentHandlersAndInstances(t *testing.T) {
 	m := NewManager(t.TempDir(), t.TempDir())
 	def := server.ForExtension(".go")
-	inst := newInstance(def, m.projectRoot, m.home, nil)
+	inst := newInstance(def, m.projectRoot, m.home, context.Background(), nil)
 	m.mu.Lock()
 	m.instances[def.Name] = inst
 	m.mu.Unlock()
@@ -223,7 +223,7 @@ func TestStartServerAfterClosedSkipsInstall(t *testing.T) {
 		Name:    "missing",
 		Command: "missing-lsp",
 		Args:    []string{},
-		Install: func(cacheDir string) error {
+		Install: func(ctx context.Context, cacheDir string) error {
 			installed = true
 			return nil
 		},
