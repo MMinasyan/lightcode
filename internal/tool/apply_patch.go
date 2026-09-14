@@ -75,10 +75,14 @@ func (a *ApplyPatch) DisplayMetadata(_ context.Context, _ json.RawMessage, _ str
 	previews := a.applyPreview
 	a.applyPreview = nil
 	a.applyPreviewMu.Unlock()
-	return applyPatchPreviewMetadata(previews)
+	return ApplyPatchPreviewMetadata(previews)
 }
 
-func applyPatchPreviewMetadata(previews []AppliedFilePreview) map[string]any {
+// ApplyPatchPreviewMetadata converts captured per-file previews into the
+// public edit_preview_files metadata map (nil when there are no previews).
+// It is the single metadata implementation shared by the legacy
+// DisplayMetadata path and the target tools plugin.
+func ApplyPatchPreviewMetadata(previews []AppliedFilePreview) map[string]any {
 	if len(previews) == 0 {
 		return nil
 	}

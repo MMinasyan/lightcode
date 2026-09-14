@@ -8,10 +8,10 @@ import (
 	"strings"
 )
 
-// normalizeIntArg converts one consumed integer argument to an int from its
-// exact json.Number lexeme. It accepts mathematically integral numbers that
-// fit the consuming Go integer — including 1.0/1e0 spellings and integers
-// beyond float64 precision — without float64 rounding, and rejects
+// normalizeIntArg validates one consumed integer argument from its exact
+// json.Number lexeme to a Go int. It accepts mathematically integral numbers
+// that fit the consuming Go integer — including 1.0/1e0 spellings and
+// integers beyond float64 precision — without float64 rounding, and rejects
 // fractions, wrong types and overflow before the value reaches duration or
 // index arithmetic. Absent and null arguments are handled by callers, which
 // apply the retained defaults.
@@ -22,6 +22,13 @@ func normalizeIntArg(args map[string]any, tool, key string) (int, error) {
 	}
 	return jsonNumberToInt(string(n), tool, key)
 }
+
+// canonicalInt is the canonical-integer json.Number lexeme of one validated
+// integer: the one shared normalization representation for consumed
+// integers. Strict and lenient normalization both emit it, marshaling
+// preserves the exact lexeme, and preparation parses it back to int at its
+// point of use.
+func canonicalInt(i int) json.Number { return json.Number(strconv.Itoa(i)) }
 
 // jsonNumberToInt parses the exact JSON number lexeme without float64
 // rounding: plain integers via strconv, every other spelling via exact
@@ -91,9 +98,9 @@ func NormalizeReadArgs(args map[string]any, defaultLimit int) (map[string]any, e
 		if offset < 1 {
 			offset = 1
 		}
-		clean["offset"] = offset
+		clean["offset"] = canonicalInt(offset)
 	} else {
-		clean["offset"] = 1
+		clean["offset"] = canonicalInt(1)
 	}
 	if _, present := clean["limit"]; present {
 		limit, err := normalizeIntArg(clean, "read_file", "limit")
@@ -103,9 +110,9 @@ func NormalizeReadArgs(args map[string]any, defaultLimit int) (map[string]any, e
 		if limit < 1 {
 			limit = defaultLimit
 		}
-		clean["limit"] = limit
+		clean["limit"] = canonicalInt(limit)
 	} else {
-		clean["limit"] = defaultLimit
+		clean["limit"] = canonicalInt(defaultLimit)
 	}
 	return clean, nil
 }
@@ -176,7 +183,8 @@ func NormalizePatchArgs(args map[string]any) (map[string]any, error) {
 // argument parsing: float64 offsets/limits truncate and nonpositive values
 // take the retained clamps; wrong-typed values keep their retained
 // defaults. It feeds the same shared preparation/execution bodies as the
-// strict target normalization.
+// strict target normalization and emits the same canonical-integer
+// json.Number representation for consumed integers.
 func normalizeReadArgsLegacy(args map[string]any, defaultLimit int) (map[string]any, error) {
 	clean := stripPrivateArgs(args)
 	path, _ := clean["path"].(string)
@@ -190,7 +198,7 @@ func normalizeReadArgsLegacy(args map[string]any, defaultLimit int) (map[string]
 	if offset < 1 {
 		offset = 1
 	}
-	clean["offset"] = offset
+	clean["offset"] = canonicalInt(offset)
 	limit := defaultLimit
 	if v, ok := clean["limit"].(float64); ok {
 		limit = int(v)
@@ -198,7 +206,7 @@ func normalizeReadArgsLegacy(args map[string]any, defaultLimit int) (map[string]
 	if limit < 1 {
 		limit = defaultLimit
 	}
-	clean["limit"] = limit
+	clean["limit"] = canonicalInt(limit)
 	return clean, nil
 }
 

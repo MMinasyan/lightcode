@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -35,8 +36,8 @@ func TestPrepareReadBindsParentDirectoryOnlyWhenLeafMissing(t *testing.T) {
 	if prepared.Targets[0].CanonicalPath != existing {
 		t.Fatalf("canonical target = %q, want %q", prepared.Targets[0].CanonicalPath, existing)
 	}
-	if prepared.Args["offset"] != 1 || prepared.Args["limit"] != 500 {
-		t.Fatalf("normalized args = %+v, want default offset/limit 1/500", prepared.Args)
+	if prepared.Args["offset"] != json.Number("1") || prepared.Args["limit"] != json.Number("500") {
+		t.Fatalf("normalized args = %+v, want default offset/limit as canonical integers 1/500", prepared.Args)
 	}
 
 	// Missing leaf: the parent directory is bound as a second declared
@@ -127,6 +128,35 @@ func TestSuggestFromBoundDirectoryReadsThroughNoFollowDescriptor(t *testing.T) {
 	got = suggestFromBoundDirectory(parent, filepath.Join(realNames, "confg.json"))
 	if got != "read_file: file not found: "+filepath.Join(realNames, "confg.json") {
 		t.Fatalf("suggestions = %q, want plain not-found without redirected suggestions", got)
+	}
+}
+
+// TestConsumedIntAtUse pins the point-of-use consumption of the canonical
+// integer representation: validated lexemes parse to their int, and every
+// non-canonical value class — absent, non-json.Number, non-integer lexeme,
+// platform-int overflow — reads as zero without erroring, because
+// normalization owns every rejection.
+func TestConsumedIntAtUse(t *testing.T) {
+	cases := []struct {
+		name string
+		args map[string]any
+		key  string
+		want int
+	}{
+		{"canonical integer lexeme", map[string]any{"offset": json.Number("3")}, "offset", 3},
+		{"negative lexeme", map[string]any{"offset": json.Number("-2")}, "offset", -2},
+		{"absent key", map[string]any{}, "offset", 0},
+		{"non-json.Number value", map[string]any{"offset": float64(3)}, "offset", 0},
+		{"null value", map[string]any{"offset": nil}, "offset", 0},
+		{"non-integer lexeme", map[string]any{"offset": json.Number("x")}, "offset", 0},
+		{"platform-int overflow", map[string]any{"offset": json.Number("99999999999999999999")}, "offset", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := consumedIntAtUse(tc.args, tc.key); got != tc.want {
+				t.Fatalf("consumedIntAtUse = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -234,8 +264,17 @@ func TestNormalizeReadArgsStrictIntegers(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NormalizeReadArgs error = %v", err)
 			}
-			if args["offset"] != tc.wantOff || args["limit"] != tc.wantLimit {
-				t.Fatalf("normalized offset/limit = %v/%v, want %d/%d", args["offset"], args["limit"], tc.wantOff, tc.wantLimit)
+			// Consumed integers normalize to their canonical-integer
+			// json.Number lexemes — compared against the literal expected
+			// lexeme, not through the producer: 2.0 becomes "2", 1e0
+			// becomes "1", and a 601-digit integral spelling becomes "1".
+			offsetNumber, ok := args["offset"].(json.Number)
+			if !ok || string(offsetNumber) != strconv.Itoa(tc.wantOff) {
+				t.Fatalf("normalized offset = %v (%T), want canonical integer lexeme %q", args["offset"], args["offset"], strconv.Itoa(tc.wantOff))
+			}
+			limitNumber, ok := args["limit"].(json.Number)
+			if !ok || string(limitNumber) != strconv.Itoa(tc.wantLimit) {
+				t.Fatalf("normalized limit = %v (%T), want canonical integer lexeme %q", args["limit"], args["limit"], strconv.Itoa(tc.wantLimit))
 			}
 		})
 	}

@@ -1,6 +1,11 @@
 package runtime
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+
+	"github.com/MMinasyan/lightcode/internal/catalog"
+)
 
 // OpenForTest is the test-build composition bridge used by the external
 // runtime_test integration tests to assemble the actual plugin set without a
@@ -14,4 +19,21 @@ func OpenForTest(ctx context.Context, dataDir, configPath string, plugins []Plug
 		Plugins:    plugins,
 		prepare:    newControlledPrep().prepare,
 	})
+}
+
+// ConfiguredInvocationForTest builds one configured Invocation whose
+// captured snapshot carries the given per-plugin sections, for the external
+// tests that exercise a plugin's real Invocation.Config channel — outside
+// this package only the zero Invocation is constructible. It is absent from
+// production builds.
+func ConfiguredInvocationForTest(sections map[string]string) (Invocation, error) {
+	plugins := make(map[string]json.RawMessage, len(sections))
+	for id, section := range sections {
+		plugins[id] = json.RawMessage(section)
+	}
+	snapshot, err := newConfiguration(1, capturedConfigDocument{Plugins: plugins}, catalog.BuildResult{}, []byte("{}"), nil, nil, nil)
+	if err != nil {
+		return Invocation{}, err
+	}
+	return Invocation{snapshot: snapshot}, nil
 }

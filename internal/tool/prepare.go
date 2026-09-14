@@ -2,11 +2,13 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
@@ -60,6 +62,23 @@ type PreparedPatchCall struct {
 type readTarget struct {
 	displayPath   string
 	canonicalPath string
+}
+
+// consumedIntAtUse parses one canonical-integer json.Number argument to int
+// at its point of use. Normalization owns every default, clamp and
+// validation; this consumption accepts only the normalized input, and any
+// other value reads as zero — the same fallback the previous typed
+// assertion applied to un-normalized input. Atoi is ParseInt with the
+// platform-int bit size, so every error class — syntax and platform-int
+// overflow alike, the latter carrying a clamped extremum that must be
+// discarded — reads as zero.
+func consumedIntAtUse(args map[string]any, key string) int {
+	n, _ := args[key].(json.Number)
+	v, err := strconv.Atoi(string(n))
+	if err != nil {
+		return 0
+	}
+	return v
 }
 
 // approvedBinding is the canonical witness carried from authorization: the
@@ -258,9 +277,6 @@ func prepareRead(root string, cfg config.ToolsConfig, tracker *FileTracker, args
 		targets = append(targets, PreparedTarget{CanonicalPath: parent.canonicalPath})
 	}
 
-	offset, _ := args["offset"].(int)
-	limit, _ := args["limit"].(int)
-
 	execute := func(_ context.Context) (string, error) {
 		if err := bound.revalidate(); err != nil {
 			return "", fmt.Errorf("read_file: resolve path: %w", err)
@@ -294,6 +310,12 @@ func prepareRead(root string, cfg config.ToolsConfig, tracker *FileTracker, args
 			return "", fmt.Errorf("read_file: %w", err)
 		}
 		identity := FileIdentityFromFileInfoAndData(info, data)
+
+		// The canonical-integer json.Number arguments parse at their point
+		// of use: preparation bound targets only and performs no
+		// validation or defaulting here.
+		offset := consumedIntAtUse(args, "offset")
+		limit := consumedIntAtUse(args, "limit")
 
 		// Deduplication check.
 		if tracker != nil {
