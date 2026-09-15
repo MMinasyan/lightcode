@@ -1047,8 +1047,7 @@ func TestProductionReadonlyAdvertisement(t *testing.T) {
 // TestProductionTransportConversion pins the catalog-to-transport conversion
 // on one published snapshot: effective role and streamed usage, sidecar
 // layers with raw numbers, the effective protocol metadata, the
-// same-provider source-family map, the retained wire-debug opt-in, and the
-// replay-policy behavior the converted input feeds.
+// same-provider source-family map, and the retained wire-debug opt-in.
 func TestProductionTransportConversion(t *testing.T) {
 	sh := newServiceHarness(t)
 	writeServiceFile(t, sh.configPath, conversionConfigDocument())

@@ -267,19 +267,34 @@ func assembledPlugins(e *ownerEnv, store harness.Storage, hook *recordHook, ws *
 // directly from the store, the only reader that works after the owner closed.
 func operationRegisterStatus(t *testing.T, store harness.Storage, sessionID, operationID string) harness.OperationState {
 	t.Helper()
+	status, _ := operationRegisterTerminal(t, store, sessionID, operationID)
+	return status
+}
+
+// operationRegisterTerminal reads one Operation's register once and returns
+// its status and terminal detail, failing the test on read or decode error.
+func operationRegisterTerminal(t *testing.T, store harness.Storage, sessionID, operationID string) (harness.OperationState, string) {
+	t.Helper()
 	reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID})
 	if err != nil {
 		t.Fatalf("ReadRegister(%s): %v", operationID, err)
 	}
 	var wire struct {
 		State struct {
-			Status harness.OperationState `json:"status"`
+			Status   harness.OperationState `json:"status"`
+			Terminal *struct {
+				Detail string `json:"detail"`
+			} `json:"terminal"`
 		} `json:"state"`
 	}
 	if err := json.Unmarshal(reg.Payload, &wire); err != nil {
 		t.Fatalf("decode operation register payload: %v", err)
 	}
-	return wire.State.Status
+	var detail string
+	if wire.State.Terminal != nil {
+		detail = wire.State.Terminal.Detail
+	}
+	return wire.State.Status, detail
 }
 
 // awaitOperation polls one Operation's register until it reaches the wanted

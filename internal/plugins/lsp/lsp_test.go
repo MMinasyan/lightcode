@@ -204,7 +204,15 @@ func markerWorkspace(t *testing.T) string {
 // group records it: DataDir/code/<session>/<group>/snapshots/1/<e>/meta.json.
 func seedGroup(t *testing.T, dataDir, sessionID, groupID, canonical string) {
 	t.Helper()
-	entry := filepath.Join(dataDir, "code", sessionID, groupID, "snapshots", "1", "e")
+	seedEntry(t, dataDir, sessionID, groupID, "e", canonical)
+}
+
+// seedEntry writes one changed-file metadata entry with the given entry name
+// under the group's first turn: original_path from the canonical leaf,
+// canonical_path verbatim, existed true.
+func seedEntry(t *testing.T, dataDir, sessionID, groupID, entryName, canonical string) {
+	t.Helper()
+	entry := filepath.Join(dataDir, "code", sessionID, groupID, "snapshots", "1", entryName)
 	if err := os.MkdirAll(entry, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -968,5 +976,43 @@ func TestContentCap(t *testing.T) {
 	outcome = toolOutcome("c", context.Background(), strings.Repeat("s", 20000), nil)
 	if outcome.Result.Status != model.ResultSuccess || len(outcome.Result.Content) != 15360 {
 		t.Fatalf("success cap = %+v (%d bytes), want the capped content", outcome.Result, len(outcome.Result.Content))
+	}
+}
+
+// TestDiagnosticsBulkReadFailuresStayBounded proves the bulk-failure row: a
+// session group with ~1000 unreadable canonical paths (dangling symlink
+// leaves) settles success with could-not-check lines capped at the 15360-byte
+// bound by the truncation marker — bounded partial output under bulk failure.
+func TestDiagnosticsBulkReadFailuresStayBounded(t *testing.T) {
+	fakeHome, _ := fakeServerHome(t, 0)
+	spy := &managerSpy{}
+	spy.install(t, fakeHome)
+	dataDir := t.TempDir()
+	diag, _ := pluginUnderTest(t, dataDir)
+	workspace := markerWorkspace(t)
+
+	const count = 1000
+	for i := 0; i < count; i++ {
+		leaf := filepath.Join(workspace, fmt.Sprintf("leaf%04d.go", i))
+		if err := os.Symlink(filepath.Join(workspace, "missing-target.go"), leaf); err != nil {
+			t.Fatal(err)
+		}
+		seedEntry(t, dataDir, pluginSessionID, groupOne, fmt.Sprintf("e%04d", i), leaf)
+	}
+
+	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
+	outcome := prepared.Execute(context.Background())
+	if outcome.Result.Status != model.ResultSuccess {
+		t.Fatalf("bulk-failure diagnostics = %+v, want success", outcome.Result)
+	}
+	content := outcome.Result.Content
+	if len(content) > 15360 {
+		t.Fatalf("bulk-failure content = %d bytes, want the 15360 cap", len(content))
+	}
+	if !strings.HasSuffix(content, "\n[Output truncated]") {
+		t.Fatalf("bulk-failure content tail = %q, want the truncation marker", content[len(content)-60:])
+	}
+	if !strings.Contains(content, "(could not check)") {
+		t.Fatalf("bulk-failure content = %.120s, want could-not-check lines", content)
 	}
 }

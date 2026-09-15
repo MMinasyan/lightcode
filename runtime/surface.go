@@ -14,8 +14,8 @@ import (
 // surface: the Runtime's once-resolved home, the preparation's Workspace and
 // session-start environment, the selected definition's prompt fields, the
 // captured Invocation and hard constraints, the composition's tool specs in
-// declaration order, the bound ModelAdaptation (nil when unselected), and the
-// active model ref.
+// the agent's selection order after first-occurrence dedupe, the bound
+// ModelAdaptation (nil when unselected), and the active model ref.
 type surfaceRequest struct {
 	home         string
 	workspace    string
@@ -36,7 +36,8 @@ type surfaceRequest struct {
 // pure input (containers copied, no second matcher), the prompt assembles
 // through the shared Service with every retained invariant (none skips rules
 // and adaptation; simple and full share the one assembly), and the advertised
-// surface walks the tool specs in declaration order: eligible tools minus the
+// surface walks the tool specs in the agent's selection order after
+// first-occurrence dedupe: eligible tools minus the
 // excluded names (exclusion always wins over inclusion), minus default-hidden
 // tools unless included — an include can never revive a tool the hard
 // constraints made ineligible. Every advertised description renders through

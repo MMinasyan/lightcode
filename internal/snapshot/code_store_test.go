@@ -109,3 +109,106 @@ func TestCodeStoreArtifactOnlyGroupReopenAndRestore(t *testing.T) {
 		t.Fatalf("snapshots dir after restore = %v, want empty", after)
 	}
 }
+
+// TestCodeStoreTwoGroupsRestoreIndependently proves the one-disk-group-per-
+// Operation ownership boundary: two groups under one session's code dir each
+// hold their own captured preimage, restoring one group through a fresh
+// OpenCodeStore handle restores only its own preimage and leaves the other
+// group's snapshot tree untouched, and the second group restores
+// independently afterward.
+func TestCodeStoreTwoGroupsRestoreIndependently(t *testing.T) {
+	sessionCodeDir := t.TempDir()
+	groupADir := filepath.Join(sessionCodeDir, "entry-a")
+	groupBDir := filepath.Join(sessionCodeDir, "entry-b")
+	projectDir := t.TempDir()
+	fileA := filepath.Join(projectDir, "a.txt")
+	fileB := filepath.Join(projectDir, "b.txt")
+	originalA, originalB := []byte("a original\n"), []byte("b original\n")
+	if err := os.WriteFile(fileA, originalA, 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	if err := os.WriteFile(fileB, originalB, 0o644); err != nil {
+		t.Fatalf("write b.txt: %v", err)
+	}
+
+	// Each operation's group captures its own target's preimage; each
+	// mutation records its post-write identity.
+	capture := func(groupDir, target string, mutated []byte) {
+		t.Helper()
+		code, err := OpenCodeStore(groupDir)
+		if err != nil {
+			t.Fatalf("OpenCodeStore(%s): %v", groupDir, err)
+		}
+		entryID, created, err := code.SnapshotResolvedEntry(1, target, target)
+		if err != nil || !created {
+			t.Fatalf("SnapshotResolvedEntry(%s) = (%v, %v), want one created entry", groupDir, entryID, err)
+		}
+		code.RetainSnapshotEntry(1, entryID)
+		if err := os.WriteFile(target, mutated, 0o644); err != nil {
+			t.Fatalf("mutate %s: %v", target, err)
+		}
+		if err := code.RecordSnapshotContent(1, entryID, mutated); err != nil {
+			t.Fatalf("RecordSnapshotContent(%s): %v", groupDir, err)
+		}
+	}
+	mutatedA, mutatedB := []byte("a mutated\n"), []byte("b mutated\n")
+	capture(groupADir, fileA, mutatedA)
+	capture(groupBDir, fileB, mutatedB)
+
+	// Restoring group A through a fresh handle: only A's preimage returns,
+	// B's file stays mutated and B's snapshot tree stays intact.
+	restoreA, err := OpenCodeStore(groupADir)
+	if err != nil {
+		t.Fatalf("reopen group A: %v", err)
+	}
+	resultA, err := restoreA.RevertCode(0)
+	if err != nil {
+		t.Fatalf("RevertCode(A): %v", err)
+	}
+	if len(resultA.Restored) != 1 || resultA.Restored[0] != fileA || len(resultA.Skipped) != 0 {
+		t.Fatalf("RevertCode(A) = %+v, want exactly %s restored", resultA, fileA)
+	}
+	gotA, err := os.ReadFile(fileA)
+	if err != nil || string(gotA) != string(originalA) {
+		t.Fatalf("a.txt after restore A = (%q, %v), want the original bytes", gotA, err)
+	}
+	gotB, err := os.ReadFile(fileB)
+	if err != nil || string(gotB) != string(mutatedB) {
+		t.Fatalf("b.txt after restore A = (%q, %v), want it untouched at the mutated bytes", gotB, err)
+	}
+	turnsB, err := mustOpenCodeStore(t, groupBDir).ListTurns()
+	if err != nil || len(turnsB) != 1 || len(turnsB[0].Files) != 1 {
+		t.Fatalf("group B turns after restore A = %+v err %v, want the snapshot tree intact", turnsB, err)
+	}
+	turnsA, err := mustOpenCodeStore(t, groupADir).ListTurns()
+	if err != nil || len(turnsA) != 0 {
+		t.Fatalf("group A turns after restore A = %+v err %v, want the restored turn dirs removed", turnsA, err)
+	}
+
+	// Restoring group B independently restores its own preimage.
+	restoreB, err := OpenCodeStore(groupBDir)
+	if err != nil {
+		t.Fatalf("reopen group B: %v", err)
+	}
+	resultB, err := restoreB.RevertCode(0)
+	if err != nil {
+		t.Fatalf("RevertCode(B): %v", err)
+	}
+	if len(resultB.Restored) != 1 || resultB.Restored[0] != fileB || len(resultB.Skipped) != 0 {
+		t.Fatalf("RevertCode(B) = %+v, want exactly %s restored", resultB, fileB)
+	}
+	gotB, err = os.ReadFile(fileB)
+	if err != nil || string(gotB) != string(originalB) {
+		t.Fatalf("b.txt after restore B = (%q, %v), want the original bytes", gotB, err)
+	}
+}
+
+// mustOpenCodeStore opens one code group, failing the test on error.
+func mustOpenCodeStore(t *testing.T, groupDir string) *CodeStore {
+	t.Helper()
+	code, err := OpenCodeStore(groupDir)
+	if err != nil {
+		t.Fatalf("OpenCodeStore(%s): %v", groupDir, err)
+	}
+	return code
+}
