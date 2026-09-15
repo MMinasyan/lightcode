@@ -693,14 +693,20 @@ func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
 // returns from the call. Sweep deletion uses the same post-commit coordinator
 // invalidation as DeleteSession. It publishes no per-Session status, starts no
 // ticker, reads no configuration, and emits no event.
-func (h *Harness) Sweep(ctx context.Context, policy SweepPolicy, now time.Time) error {
+//
+// Sweep returns every committed deleted Session identity, including successes
+// collected before a stopping error, in unspecified order; corrupt and
+// malformed rows contribute none. A rejected zero time or a listing failure
+// returns no identities.
+func (h *Harness) Sweep(ctx context.Context, policy SweepPolicy, now time.Time) ([]string, error) {
 	if now.IsZero() {
-		return invalidInput("sweep time must not be zero")
+		return nil, invalidInput("sweep time must not be zero")
 	}
 	ids, err := h.deps.Storage.ListSessionIDs(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var deletedIDs []string
 	for _, sessionID := range ids {
 		if err := validateHexID(sessionID, "session id"); err != nil { // a listed identity violating the durable shape is a corrupt row: left unchanged, the pass continues
 			continue
@@ -708,18 +714,22 @@ func (h *Harness) Sweep(ctx context.Context, policy SweepPolicy, now time.Time) 
 		c, err := h.coordinatorFor(ctx, sessionID)
 		if err != nil {
 			if !isCorruption(err) { // a corrupt Session is left unchanged; every other error stops the sweep
-				return err
+				return deletedIDs, err
 			}
 			continue
 		}
-		if err := h.sweepOne(ctx, c, sessionID, policy, now); err != nil {
+		deleted, err := h.sweepOne(ctx, c, sessionID, policy, now)
+		if err != nil {
 			if !isCorruption(err) { // corruption discovered under the cached view leaves the Session unchanged
-				return err
+				return deletedIDs, err
 			}
 			continue
+		}
+		if deleted {
+			deletedIDs = append(deletedIDs, sessionID)
 		}
 	}
-	return nil
+	return deletedIDs, nil
 }
 
 // sweepOne handles one Sweep Session through the coordinator: it waits for an
@@ -730,11 +740,13 @@ func (h *Harness) Sweep(ctx context.Context, policy SweepPolicy, now time.Time) 
 // deletion for an archived Session past its threshold. A running or
 // process-locally buffered Session is left unchanged. Deletion uses the same
 // post-commit coordinator invalidation as DeleteSession; archiving adopts the
-// committed record and clears the buffers under the same hold.
-func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string, policy SweepPolicy, now time.Time) error {
+// committed record and clears the buffers under the same hold. It reports
+// whether the deletion transition committed: the flag is true only after the
+// deleting transaction and its post-commit adoption succeeded.
+func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string, policy SweepPolicy, now time.Time) (bool, error) {
 	for {
 		if err := c.waitIdle(ctx); err != nil {
-			return err
+			return false, err
 		}
 		c.mu.Lock()
 		if c.reserved != nil { // a reservation was taken between the wait and the lock
@@ -743,11 +755,11 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 		}
 		if c.gone { // a deletion committed while this call waited or relocked
 			c.mu.Unlock()
-			return notFoundSession(sessionID)
+			return false, notFoundSession(sessionID)
 		}
 		if c.run != nil || len(c.steering) > 0 || len(c.queued) > 0 { // running or process-locally buffered: left unchanged
 			c.mu.Unlock()
-			return nil
+			return false, nil
 		}
 		var (
 			archived   SessionRecord
@@ -804,20 +816,20 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 		if err != nil {
 			h.markCorrupt(sessionID, err)
 			c.mu.Unlock()
-			return err
+			return false, err
 		}
 		if deleted { // the same post-commit coordinator invalidation as DeleteSession, under this hold
 			c.invalidate()
 			c.mu.Unlock()
 			h.removeCoordinator(sessionID)
-			return nil
+			return true, nil
 		}
 		if didArchive {
 			c.graph.Session = archived
 			c.steering, c.queued = nil, nil // like ArchiveSession: the buffers clear only after the commit
 		}
 		c.mu.Unlock()
-		return nil
+		return false, nil
 	}
 }
 

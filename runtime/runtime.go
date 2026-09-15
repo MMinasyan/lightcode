@@ -52,6 +52,7 @@ type Runtime struct {
 	runtimeScope *scope
 	workspaces   *workspaceScopes
 	harness      *harness.Harness
+	dataDir      string
 
 	// mu guards only the admission transition below; it is never held across
 	// any call, wait, or I/O.
@@ -186,6 +187,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		runtimeScope: runtimeScope,
 		workspaces:   workspaces,
 		harness:      h,
+		dataDir:      dataDir,
 		shutdownDone: make(chan struct{}),
 	}
 	sweepTicks, stopSweepTicker := options.sweepTicks, func() {}
@@ -305,6 +307,31 @@ func (r *Runtime) createSession(ctx context.Context, workspace, agentType string
 		return harness.SessionRecord{}, err
 	}
 	return record, nil
+}
+
+// deleteSession is the private canonical Session deletion: the whole body
+// runs inside one admitted call, so shutdown joins the deletion and its
+// cleanup together. After Harness.DeleteSession commits — or reports the
+// Session already absent for a valid identity, the same idempotent result —
+// the Session's artifact tree is removed once. Any other Harness error
+// (invalid input, corruption, revision races, a closed admission) returns
+// as-is and authorizes no cleanup.
+func (r *Runtime) deleteSession(ctx context.Context, sessionID string) error {
+	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		err := h.DeleteSession(ctx, sessionID)
+		if err != nil && !errors.Is(err, harness.ErrNotFound) {
+			return err
+		}
+		return r.removeSessionCode(sessionID)
+	})
+}
+
+// removeSessionCode removes one Session's artifact tree under the normalized
+// data directory — its snapshots and command spills. It removes nothing else:
+// not sibling Sessions' trees, not other data-directory content. A missing
+// directory is already clean.
+func (r *Runtime) removeSessionCode(sessionID string) error {
+	return os.RemoveAll(filepath.Join(r.dataDir, "code", sessionID))
 }
 
 // Reload publishes the next configuration revision through the admitted-call

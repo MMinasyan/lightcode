@@ -51,18 +51,20 @@ func captureSweepStderr(t *testing.T) func() string {
 
 // sweepStore wraps the Core storage for the scheduler cases: it counts
 // ListSessionIDs calls, fails the next armed number of them with a chosen
-// error, and parks the next transaction on a test release.
+// error, parks the next transaction on a test release, and can fail one named
+// Session's deletion after its real effect.
 type sweepStore struct {
 	harness.Storage
-	mu         sync.Mutex
-	lists      int
-	failErr    error
-	failLeft   int
-	blocked    bool
-	releaseErr error
-	release    chan struct{}
-	arrived    chan struct{}
-	written    chan struct{}
+	mu           sync.Mutex
+	lists        int
+	failErr      error
+	failLeft     int
+	blocked      bool
+	releaseErr   error
+	release      chan struct{}
+	arrived      chan struct{}
+	written      chan struct{}
+	deleteTarget string
 }
 
 func newSweepStore(base harness.Storage) *sweepStore {
@@ -100,6 +102,27 @@ func (s *sweepStore) armFailOnce(err error) {
 	s.failErr = err
 	s.failLeft = 1
 	s.mu.Unlock()
+}
+
+// armDeleteTarget arms exactly the next transaction deleting the target
+// Session to perform its real mutation and then fail, so the surrounding
+// transaction rolls back a completed mutation.
+func (s *sweepStore) armDeleteTarget(target string) {
+	s.mu.Lock()
+	s.deleteTarget = target
+	s.mu.Unlock()
+}
+
+// takeDeleteTarget reports whether the armed deletion target matches this
+// identity and disarms it when it does.
+func (s *sweepStore) takeDeleteTarget(sessionID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deleteTarget != "" && sessionID == s.deleteTarget {
+		s.deleteTarget = ""
+		return true
+	}
+	return false
 }
 
 // armBlock parks the next transaction until releaseBlock, signalling arrival
@@ -148,7 +171,7 @@ func (s *sweepStore) Transact(ctx context.Context, fn func(harness.Transaction) 
 	}
 	wrote := false
 	err := s.Storage.Transact(ctx, func(tx harness.Transaction) error {
-		return fn(&writeSpy{Transaction: tx, wrote: &wrote})
+		return fn(&writeSpy{Transaction: tx, wrote: &wrote, store: s})
 	})
 	if err == nil && wrote {
 		select {
@@ -159,10 +182,12 @@ func (s *sweepStore) Transact(ctx context.Context, fn func(harness.Transaction) 
 	return err
 }
 
-// writeSpy reports whether one transaction performed a register mutation.
+// writeSpy reports whether one transaction performed a register mutation and
+// fires the store's armed deletion target after its real effect.
 type writeSpy struct {
 	harness.Transaction
 	wrote *bool
+	store *sweepStore
 }
 
 func (w *writeSpy) ReplaceRegister(key harness.RegisterKey, expected int64, payload json.RawMessage) (harness.Register, error) {
@@ -177,6 +202,9 @@ func (w *writeSpy) DeleteSession(sessionID string) error {
 	err := w.Transaction.DeleteSession(sessionID)
 	if err == nil {
 		*w.wrote = true
+		if w.store.takeDeleteTarget(sessionID) {
+			return errSweepRollback
+		}
 	}
 	return err
 }
@@ -807,6 +835,536 @@ func TestMaintenanceNonpositiveThresholdsDisableTheirTransitions(t *testing.T) {
 		}
 		if got := wrapped.listCount(); got != 2 {
 			t.Fatalf("storage lists after Close = %d, want no pass beyond the initial one", got)
+		}
+	})
+}
+
+// errSweepRollback is the sentinel the sweep store returns from the armed
+// Session's deletion after performing its real effect, so the surrounding
+// transaction rolls back a completed mutation.
+var errSweepRollback = errors.New("runtime_test: injected post-mutation deletion failure")
+
+// targetedBlockStore wraps one store: once armed with a target, the target
+// Session's deletion parks inside its transaction until releaseBlock,
+// signalling arrival from inside the park before the real deletion runs.
+type targetedBlockStore struct {
+	harness.Storage
+	mu      sync.Mutex
+	target  string
+	release chan struct{}
+	arrived chan struct{}
+}
+
+func newTargetedBlockStore(base harness.Storage) *targetedBlockStore {
+	return &targetedBlockStore{Storage: base, arrived: make(chan struct{}, 1)}
+}
+
+// block arms the park for one Session identity.
+func (s *targetedBlockStore) block(target string) {
+	s.mu.Lock()
+	s.target = target
+	s.release = make(chan struct{})
+	s.mu.Unlock()
+}
+
+func (s *targetedBlockStore) releaseBlock() {
+	s.mu.Lock()
+	release := s.release
+	s.target = ""
+	s.mu.Unlock()
+	if release != nil {
+		close(release)
+	}
+}
+
+func (s *targetedBlockStore) Transact(ctx context.Context, fn func(harness.Transaction) error) error {
+	return s.Storage.Transact(ctx, func(tx harness.Transaction) error {
+		return fn(&targetedBlockTransaction{Transaction: tx, store: s})
+	})
+}
+
+// targetedBlockTransaction forwards every transaction call and parks the
+// target Session's deletion before its real effect.
+type targetedBlockTransaction struct {
+	harness.Transaction
+	store *targetedBlockStore
+}
+
+func (t *targetedBlockTransaction) DeleteSession(sessionID string) error {
+	t.store.mu.Lock()
+	target, release := t.store.target, t.store.release
+	t.store.mu.Unlock()
+	if sessionID == target {
+		select {
+		case t.store.arrived <- struct{}{}:
+		default:
+		}
+		<-release
+	}
+	return t.Transaction.DeleteSession(sessionID)
+}
+
+// seedStaleArchivedSession creates one idle Session through a standalone
+// harness on the shared store and rewrites its durable state to archived with
+// an old archived_at, so the automatic sweep is eligible to delete it before
+// the owner exists.
+func seedStaleArchivedSession(t *testing.T, store harness.Storage, workspace string, stale time.Duration) string {
+	t.Helper()
+	id := seedStaleSession(t, store, workspace, stale)
+	rewriteSessionRegister(t, store, id, func(state map[string]json.RawMessage) {
+		state["lifecycle"] = json.RawMessage(`"archived"`)
+		state["archived_at"] = mustSweepJSON(t, time.Now().UTC().Add(-stale))
+	})
+	return id
+}
+
+// plantSessionCode creates one Session's artifact tree under DataDir/code —
+// a snapshot group directory and an output spill file — and returns its root.
+func plantSessionCode(t *testing.T, dataDir, sessionID string) string {
+	t.Helper()
+	root := filepath.Join(dataDir, "code", sessionID)
+	if err := os.MkdirAll(filepath.Join(root, "snapshots", "op-1"), 0o755); err != nil {
+		t.Fatalf("plant snapshot group: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "snapshots", "op-1", "snapshot.txt"), []byte("snapshot"), 0o644); err != nil {
+		t.Fatalf("plant snapshot: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "output"), 0o755); err != nil {
+		t.Fatalf("plant output directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "output", "spill.txt"), []byte("spill"), 0o644); err != nil {
+		t.Fatalf("plant spill: %v", err)
+	}
+	return root
+}
+
+// mustNotExist asserts one filesystem path is absent.
+func mustNotExist(t *testing.T, path, what string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("%s = err %v, want it removed", what, err)
+	}
+}
+
+// mustExist asserts one filesystem path is present.
+func mustExist(t *testing.T, path, what string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("%s = err %v, want it present", what, err)
+	}
+}
+
+// TestPrivateDeleteSessionCleansArtifacts proves the direct deletion row: an
+// archived Session's deletion removes its whole artifact tree and nothing
+// else; the repeated delete and an unknown valid identity return the same
+// idempotent cleanup success; a deletion with no artifact directory at all is
+// already clean; and invalid or uncommitted deletions authorize no cleanup.
+func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		ctx := context.Background()
+		r, err := e.open(ctx, e.storagePlugin(store))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		archive := func(sessionID string) {
+			t.Helper()
+			if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+				_, err := h.ArchiveSession(ctx, sessionID)
+				return err
+			}); err != nil {
+				t.Fatalf("archive %s: %v", sessionID, err)
+			}
+		}
+
+		archived, err := r.createSession(ctx, filepath.Join(e.dataDir, "ws"), "solo")
+		if err != nil {
+			t.Fatalf("createSession: %v", err)
+		}
+		archivedID := archived.Identity.SessionID
+		archive(archivedID)
+		archivedCode := plantSessionCode(t, e.dataDir, archivedID)
+
+		sibling, err := r.createSession(ctx, filepath.Join(e.dataDir, "sibling"), "solo")
+		if err != nil {
+			t.Fatalf("create sibling: %v", err)
+		}
+		siblingCode := plantSessionCode(t, e.dataDir, sibling.Identity.SessionID)
+		unrelated := filepath.Join(e.dataDir, "unrelated.txt")
+		if err := os.WriteFile(unrelated, []byte("keep"), 0o644); err != nil {
+			t.Fatalf("plant unrelated content: %v", err)
+		}
+
+		if err := r.deleteSession(ctx, archivedID); err != nil {
+			t.Fatalf("deleteSession of an archived session: %v", err)
+		}
+		mustNotExist(t, archivedCode, "the deleted session's artifact tree")
+		mustExist(t, siblingCode, "the sibling session's artifact tree")
+		mustExist(t, unrelated, "unrelated data-directory content")
+		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+			_, err := h.ReadSession(ctx, archivedID)
+			return err
+		}); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("read after delete = err %v, want ErrNotFound", err)
+		}
+
+		// the repeated delete is the same idempotent result with no artifacts left to clean
+		if err := r.deleteSession(ctx, archivedID); err != nil {
+			t.Fatalf("repeated deleteSession = err %v, want the idempotent cleanup success", err)
+		}
+
+		// canonical deletion with no artifact directory at all is already clean
+		bare, err := r.createSession(ctx, filepath.Join(e.dataDir, "bare"), "solo")
+		if err != nil {
+			t.Fatalf("create for the missing-artifacts row: %v", err)
+		}
+		archive(bare.Identity.SessionID)
+		if err := r.deleteSession(ctx, bare.Identity.SessionID); err != nil {
+			t.Fatalf("deleteSession with no artifact directory = err %v, want nil", err)
+		}
+
+		// an unknown valid identity with planted artifacts still cleans them
+		const ghost = "0123456789abcdef0123456789abcdef" // valid hex identity, never registered
+		ghostCode := plantSessionCode(t, e.dataDir, ghost)
+		if err := r.deleteSession(ctx, ghost); err != nil {
+			t.Fatalf("deleteSession of an unknown valid identity = err %v, want the cleanup success", err)
+		}
+		mustNotExist(t, ghostCode, "the unknown identity's artifacts")
+
+		// invalid and uncommitted deletions remove nothing
+		open, err := r.createSession(ctx, filepath.Join(e.dataDir, "open"), "solo")
+		if err != nil {
+			t.Fatalf("create open: %v", err)
+		}
+		openCode := plantSessionCode(t, e.dataDir, open.Identity.SessionID)
+		if err := r.deleteSession(ctx, open.Identity.SessionID); !errors.Is(err, harness.ErrInvalid) {
+			t.Fatalf("deleteSession of an open session = err %v, want ErrInvalid", err)
+		}
+		mustExist(t, openCode, "the open session's artifacts after the rejected delete")
+		if err := r.deleteSession(ctx, "not-a-session-id"); !errors.Is(err, harness.ErrInvalid) {
+			t.Fatalf("deleteSession of a malformed identity = err %v, want ErrInvalid", err)
+		}
+		mustExist(t, siblingCode, "the sibling session's artifacts after the malformed delete")
+
+		if err := r.Close(ctx); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
+}
+
+// TestPrivateDeleteSessionJoinsShutdown proves the direct path's admission
+// join: the deletion parks inside its transaction with the admission held,
+// shutdown neither converges nor closes the Core store while parked, and
+// after the release the committed deletion's cleanup completes inside the
+// same admission before Close returns.
+func TestPrivateDeleteSessionJoinsShutdown(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		ctx := context.Background()
+		blocked := newTargetedBlockStore(store)
+		r, err := open(ctx, e.options(e.storagePlugin(blocked)))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		archived, err := r.createSession(ctx, filepath.Join(e.dataDir, "ws"), "solo")
+		if err != nil {
+			t.Fatalf("createSession: %v", err)
+		}
+		id := archived.Identity.SessionID
+		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+			_, err := h.ArchiveSession(ctx, id)
+			return err
+		}); err != nil {
+			t.Fatalf("archive: %v", err)
+		}
+		code := plantSessionCode(t, e.dataDir, id)
+
+		blocked.block(id)
+		done := make(chan error, 1)
+		go func() { done <- r.deleteSession(ctx, id) }()
+		select {
+		case <-blocked.arrived:
+		case <-time.After(10 * time.Second):
+			t.Fatal("deleteSession never parked in the target deletion")
+		}
+		mustExist(t, code, "the artifact tree before the deletion commits") // the cleanup follows the commit, never precedes it
+
+		closeDone := make(chan struct{})
+		go func() { defer close(closeDone); _ = r.Close(ctx) }()
+		select {
+		case <-closeDone:
+			t.Fatal("shutdown converged while the direct deletion's admission was still held")
+		case <-time.After(200 * time.Millisecond):
+		}
+		if events := eventNames(e.events.all()); slices.Contains(events, "close:core") {
+			t.Fatal("the Core storage closed while the direct deletion was still admitted")
+		}
+
+		blocked.releaseBlock()
+		if err := <-done; err != nil {
+			t.Fatalf("deleteSession after the release: %v", err)
+		}
+		<-closeDone
+		mustNotExist(t, code, "the artifact tree after the joined deletion")
+		if _, err := blocked.ReadRegister(ctx, harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("deleted session register = err %v, want ErrNotFound", err)
+		}
+		if err := r.Close(ctx); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
+}
+
+// TestPrivateDeleteSessionReturnsCleanupErrors proves the direct path's
+// cleanup-error half: when the artifact removal fails, deleteSession returns
+// the removal error naming the blocked path while the committed deletion
+// stays committed — never rolled back or recreated.
+func TestPrivateDeleteSessionReturnsCleanupErrors(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		ctx := context.Background()
+		r, err := e.open(ctx, e.storagePlugin(store))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		archived, err := r.createSession(ctx, filepath.Join(e.dataDir, "ws"), "solo")
+		if err != nil {
+			t.Fatalf("createSession: %v", err)
+		}
+		id := archived.Identity.SessionID
+		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+			_, err := h.ArchiveSession(ctx, id)
+			return err
+		}); err != nil {
+			t.Fatalf("archive: %v", err)
+		}
+		code := plantSessionCode(t, e.dataDir, id)
+		codeRoot := filepath.Join(e.dataDir, "code")
+		if os.Geteuid() == 0 {
+			t.Skip("directory permissions do not block writes as root")
+		}
+		if err := os.Chmod(codeRoot, 0o555); err != nil { // denies the removal of the Session's tree: the cleanup fails
+			t.Fatalf("chmod the code root: %v", err)
+		}
+		t.Cleanup(func() { os.Chmod(codeRoot, 0o755) })
+
+		delErr := r.deleteSession(ctx, id)
+		if delErr == nil || !strings.Contains(delErr.Error(), code) {
+			t.Fatalf("deleteSession with a failing cleanup = err %v, want the removal error naming the blocked tree", delErr)
+		}
+		if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("register after the failed cleanup = err %v, want it gone: the deletion stays committed", err)
+		}
+
+		if err := r.Close(ctx); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
+}
+
+// TestMaintenanceSweepCleansCommittedSessions proves the partial-sweep row
+// through the startup pass: the first Session's committed deletion cleans its
+// artifacts even though the second Session's rolled-back delete stops the
+// pass with an error, the second Session's artifacts remain, and the one
+// retained diagnostic line reports the pass failure.
+func TestMaintenanceSweepCleansCommittedSessions(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		a := seedStaleArchivedSession(t, store, filepath.Join(e.dataDir, "a"), 100*time.Hour)
+		b := seedStaleArchivedSession(t, store, filepath.Join(e.dataDir, "b"), 100*time.Hour)
+		first, second := a, b // the pass enumerates sorted identities: the rollback targets the second
+		if first > second {
+			first, second = second, first
+		}
+		firstCode := plantSessionCode(t, e.dataDir, first)
+		secondCode := plantSessionCode(t, e.dataDir, second)
+		codeKeep := filepath.Join(e.dataDir, "code", "keep.txt")
+		if err := os.WriteFile(codeKeep, []byte("keep"), 0o644); err != nil {
+			t.Fatalf("plant code-root content: %v", err)
+		}
+
+		wrapped := newSweepStore(store)
+		wrapped.armDeleteTarget(second)
+		stderr := captureSweepStderr(t)
+		r, err := open(context.Background(), e.options(e.storagePlugin(wrapped)))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+
+		mustNotExist(t, firstCode, "the committed deletion's artifacts despite the stopping pass error")
+		mustExist(t, secondCode, "the rolled-back deletion's artifacts")
+		mustExist(t, codeKeep, "unrelated code-root content")
+		if _, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: first, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("committed deletion's register = err %v, want ErrNotFound", err)
+		}
+		readSweepRegister(t, wrapped, second) // the rolled-back deletion left the Session present
+
+		out := stderr()
+		if n := strings.Count(out, "lightcode: sweep: "+errSweepRollback.Error()); n != 1 {
+			t.Fatalf("stderr sweep diagnostics = %d in %q, want one line reporting the stopping pass error", n, out)
+		}
+		if err := r.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
+}
+
+// TestMaintenanceSweepJoinsPassAndCleanupErrorsInOneDiagnostic proves the
+// single-diagnostic row: a stopping pass error and a failing cleanup are
+// joined into ONE retained stderr line — the prefix appears exactly once and
+// the line carries both errors.
+func TestMaintenanceSweepJoinsPassAndCleanupErrorsInOneDiagnostic(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		a := seedStaleArchivedSession(t, store, filepath.Join(e.dataDir, "a"), 100*time.Hour)
+		b := seedStaleArchivedSession(t, store, filepath.Join(e.dataDir, "b"), 100*time.Hour)
+		first, second := a, b // the pass enumerates sorted identities: the rollback targets the second
+		if first > second {
+			first, second = second, first
+		}
+		firstCode := plantSessionCode(t, e.dataDir, first)
+		plantSessionCode(t, e.dataDir, second)
+		if os.Geteuid() == 0 {
+			t.Skip("directory permissions do not block writes as root")
+		}
+		codeRoot := filepath.Join(e.dataDir, "code")
+		if err := os.Chmod(codeRoot, 0o555); err != nil { // denies the committed deletion's cleanup
+			t.Fatalf("chmod the code root: %v", err)
+		}
+		t.Cleanup(func() { os.Chmod(codeRoot, 0o755) })
+
+		wrapped := newSweepStore(store)
+		wrapped.armDeleteTarget(second)
+		stderr := captureSweepStderr(t)
+		r, err := open(context.Background(), e.options(e.storagePlugin(wrapped)))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+
+		out := stderr()
+		if n := strings.Count(out, "lightcode: sweep:"); n != 1 {
+			t.Fatalf("stderr sweep diagnostics = %d in %q, want exactly one line for the whole pass", n, out)
+		}
+		if !strings.Contains(out, errSweepRollback.Error()) || !strings.Contains(out, firstCode) {
+			t.Fatalf("stderr sweep diagnostic %q, want it to carry both the stopping pass error and the failing cleanup", out)
+		}
+		if err := r.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
+}
+
+// TestMaintenanceSweepReportsCleanupErrorsAndAttemptsEveryID proves the
+// cleanup-error row: both committed deletions are cleaned up — one failing,
+// one succeeding — the failure is reported through the one retained
+// diagnostic line, and neither committed deletion is rolled back or rerun.
+func TestMaintenanceSweepReportsCleanupErrorsAndAttemptsEveryID(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		a := seedStaleArchivedSession(t, store, filepath.Join(e.dataDir, "a"), 100*time.Hour)
+		b := seedStaleArchivedSession(t, store, filepath.Join(e.dataDir, "b"), 100*time.Hour)
+		aCode := plantSessionCode(t, e.dataDir, a)
+		bCode := plantSessionCode(t, e.dataDir, b)
+		if os.Geteuid() == 0 {
+			t.Skip("directory permissions do not block writes as root")
+		}
+		blocked := filepath.Join(aCode, "snapshots") // denies the removal of its contents: the cleanup of a fails
+		if err := os.Chmod(blocked, 0o555); err != nil {
+			t.Fatalf("chmod the blocked directory: %v", err)
+		}
+		t.Cleanup(func() { os.Chmod(blocked, 0o755) })
+
+		stderr := captureSweepStderr(t)
+		r, err := open(context.Background(), e.options(e.storagePlugin(store)))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+
+		for _, id := range []string{a, b} { // committed deletions are never rolled back
+			if _, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
+				t.Fatalf("committed deletion of %s = err %v, want the register gone despite the cleanup failure", id, err)
+			}
+		}
+		mustExist(t, filepath.Join(aCode, "snapshots", "op-1"), "the failing cleanup's blocked directory")
+		mustNotExist(t, bCode, "the succeeding cleanup's artifact tree")
+
+		out := stderr()
+		if n := strings.Count(out, "lightcode: sweep:"); n != 1 {
+			t.Fatalf("stderr sweep diagnostics = %d in %q, want one line for the whole pass", n, out)
+		}
+		if !strings.Contains(out, filepath.Join(aCode, "snapshots")) {
+			t.Fatalf("stderr sweep diagnostic %q, want it to report the failing cleanup's path", out)
+		}
+		if err := r.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
+}
+
+// TestMaintenanceShutdownJoinsSweepCleanup proves the shutdown row for
+// cleanup: with the first Session's deletion committed, the pass parks inside
+// the second Session's deletion and shutdown waits without converging and
+// without closing the Core store; after the release, the committed first
+// deletion's cleanup completes inside the joined admission before Close
+// returns.
+func TestMaintenanceShutdownJoinsSweepCleanup(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":1}`))
+		a := seedStaleArchivedSession(t, store, filepath.Join(e.dataDir, "a"), 100*time.Hour)
+		b := seedStaleArchivedSession(t, store, filepath.Join(e.dataDir, "b"), 100*time.Hour)
+		first, second := a, b // the pass enumerates sorted identities: the park targets the second
+		if first > second {
+			first, second = second, first
+		}
+		firstCode := plantSessionCode(t, e.dataDir, first)
+		plantSessionCode(t, e.dataDir, second)
+
+		blocked := newTargetedBlockStore(store)
+		ticks := make(chan time.Time)
+		opts := e.options(e.storagePlugin(blocked))
+		opts.sweepTicks = ticks
+		r, err := open(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		if _, err := r.Reload(context.Background()); err != nil {
+			t.Fatalf("Reload: %v", err)
+		}
+
+		blocked.block(second)
+		sendTick(t, ticks, time.Now().Add(2*time.Hour)) // the pass deletes first, then parks in second's deletion
+		select {
+		case <-blocked.arrived:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the sweep pass never parked in the target deletion")
+		}
+		mustExist(t, firstCode, "the committed deletion's artifacts before the pass's cleanup")
+
+		done := make(chan struct{})
+		go func() { defer close(done); _ = r.Close(context.Background()) }()
+		select {
+		case <-done:
+			t.Fatal("shutdown converged while the pass's cleanup admission was still held")
+		case <-time.After(200 * time.Millisecond):
+		}
+		if events := eventNames(e.events.all()); slices.Contains(events, "close:core") {
+			t.Fatal("the Core storage closed while the sweep cleanup was still admitted")
+		}
+
+		blocked.releaseBlock()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the shutdown never joined the released pass")
+		}
+		mustNotExist(t, firstCode, "the committed deletion's artifacts after the joined pass")
+		if err := r.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
 		}
 	})
 }

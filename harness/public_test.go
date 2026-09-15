@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2216,7 +2217,7 @@ func TestPublicSweepArchiveBoundary(t *testing.T) {
 
 		boundary := first.State.LastActivity.Add(policy.ArchiveAfter)
 		before := sessionRegister(t, store, session)
-		if err := f.h.Sweep(ctx, policy, boundary); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, boundary); err != nil {
 			t.Fatalf("sweep at the boundary: %v", err)
 		}
 		still, err := f.h.ReadSession(ctx, session)
@@ -2229,7 +2230,7 @@ func TestPublicSweepArchiveBoundary(t *testing.T) {
 		}
 
 		past := boundary.Add(time.Nanosecond)
-		if err := f.h.Sweep(ctx, policy, past); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, past); err != nil {
 			t.Fatalf("sweep past the boundary: %v", err)
 		}
 		archived, err := f.h.ReadSession(ctx, session)
@@ -2267,7 +2268,7 @@ func TestPublicSweepDeleteBoundary(t *testing.T) {
 
 		boundary := archived.State.ArchivedAt.Add(policy.DeleteAfterArchive)
 		before := sessionRegister(t, store, session)
-		if err := f.h.Sweep(ctx, policy, boundary); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, boundary); err != nil {
 			t.Fatalf("sweep at the delete boundary: %v", err)
 		}
 		if _, err := f.h.ReadSession(ctx, session); err != nil {
@@ -2278,7 +2279,7 @@ func TestPublicSweepDeleteBoundary(t *testing.T) {
 			t.Fatalf("no-op delete-boundary sweep changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
 		}
 
-		if err := f.h.Sweep(ctx, policy, boundary.Add(time.Nanosecond)); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, boundary.Add(time.Nanosecond)); err != nil {
 			t.Fatalf("sweep past the delete boundary: %v", err)
 		}
 		key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
@@ -2324,7 +2325,7 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read archived: %v", err)
 			}
-			if err := f.h.Sweep(ctx, harness.SweepPolicy{}, farPast(beforeOpen.State.LastActivity)); err != nil {
+			if _, err := f.h.Sweep(ctx, harness.SweepPolicy{}, farPast(beforeOpen.State.LastActivity)); err != nil {
 				t.Fatalf("sweep with disabled thresholds: %v", err)
 			}
 			afterOpen, err := f.h.ReadSession(ctx, open)
@@ -2350,7 +2351,7 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 				t.Fatalf("read open: %v", err)
 			}
 			policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour}
-			if err := f.h.Sweep(ctx, policy, farPast(beforeOpen.State.LastActivity)); err != nil {
+			if _, err := f.h.Sweep(ctx, policy, farPast(beforeOpen.State.LastActivity)); err != nil {
 				t.Fatalf("sweep: %v", err)
 			}
 			sweptOpen, err := f.h.ReadSession(ctx, open)
@@ -2379,7 +2380,7 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 			}
 			policy := harness.SweepPolicy{DeleteAfterArchive: 12 * time.Hour}
 			now := beforeOpen.State.LastActivity.Add(100 * time.Hour)
-			if err := f.h.Sweep(ctx, policy, now); err != nil {
+			if _, err := f.h.Sweep(ctx, policy, now); err != nil {
 				t.Fatalf("sweep: %v", err)
 			}
 			stillOpen, err := f.h.ReadSession(ctx, open)
@@ -2426,7 +2427,7 @@ func TestPublicSweepRunningLeftUnchanged(t *testing.T) {
 		before := sessionRegister(t, store, session)
 
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
-		if err := f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour)); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour)); err != nil {
 			t.Fatalf("sweep of a running session: %v", err)
 		}
 		still, err := f.h.ReadSession(ctx, session)
@@ -2498,7 +2499,7 @@ func TestPublicSweepCorruptSibling(t *testing.T) {
 			t.Fatalf("read valid sibling: %v", err)
 		}
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
-		if err := f.h.Sweep(ctx, policy, validBefore.State.LastActivity.Add(100*time.Hour)); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, validBefore.State.LastActivity.Add(100*time.Hour)); err != nil {
 			t.Fatalf("sweep with a corrupt sibling = %v, want the corruption left in place and the pass completed", err)
 		}
 
@@ -2608,11 +2609,41 @@ func TestPublicSweepZeroTime(t *testing.T) {
 		createSession(t, f.h) // a listed Session exists: any storage read would be observable
 
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
-		if err := f.h.Sweep(context.Background(), policy, time.Time{}); !errors.Is(err, harness.ErrInvalid) {
-			t.Fatalf("sweep with a zero time = err %v, want ErrInvalid", err)
+		ids, err := f.h.Sweep(context.Background(), policy, time.Time{})
+		if !errors.Is(err, harness.ErrInvalid) || ids != nil {
+			t.Fatalf("sweep with a zero time = ids %v err %v, want ErrInvalid and no identities", ids, err)
 		}
 		if counting.lists != 0 {
 			t.Fatalf("zero-time sweep performed %d ListSessionIDs reads, want none before the rejection", counting.lists)
+		}
+	})
+}
+
+// failingListStore wraps one store and fails every ListSessionIDs with a
+// chosen error.
+type failingListStore struct {
+	harness.Storage
+	err error
+}
+
+func (s *failingListStore) ListSessionIDs(context.Context) ([]string, error) {
+	return nil, s.err
+}
+
+// TestPublicSweepListFailureReturnsNoIdentities proves the sweep's
+// listing-failure branch: the storage error returns with no identities.
+func TestPublicSweepListFailureReturnsNoIdentities(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		failing := errors.New("harness_test: injected listing failure")
+		f := newPublicFixture(t, &failingListStore{Storage: store, err: failing}, newScriptModel(), nil)
+		defer f.close()
+
+		ids, err := f.h.Sweep(context.Background(), harness.SweepPolicy{ArchiveAfter: time.Hour}, time.Now())
+		if !errors.Is(err, failing) {
+			t.Fatalf("sweep with a failing listing = err %v, want the injected listing failure", err)
+		}
+		if ids != nil {
+			t.Fatalf("sweep with a failing listing = ids %v, want no identities", ids)
 		}
 	})
 }
@@ -2670,7 +2701,10 @@ func TestPublicSweepWaitsForBlockedPreparation(t *testing.T) {
 
 		sweepDone := make(chan error, 1)
 		policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
-		go func() { sweepDone <- f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour)) }()
+		go func() {
+			_, err := f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour))
+			sweepDone <- err
+		}()
 		<-counting.listed // the sweep enumerated and is waiting for the idle reservation
 
 		close(releasePrep) // the preparation completes: the admission commits and the Session becomes running
@@ -2738,13 +2772,15 @@ var errInjectedRollback = errors.New("harness_test: injected post-mutation trans
 // failure: while armed, the next ReplaceRegister (or DeleteSession, or the
 // counted InsertRegister) call inside a transaction performs its real
 // mutation and then returns the sentinel, so the surrounding transaction
-// rolls back after mutating.
+// rolls back after mutating. An empty target arms the probe against every
+// identity; a set target arms it only against that Session's deletion.
 type rollbackProbeStore struct {
 	harness.Storage
 	failReplace      bool
 	failDelete       bool
 	failInsert       bool
 	insertsUntilFail int
+	target           string
 }
 
 func (s *rollbackProbeStore) Transact(ctx context.Context, fn func(harness.Transaction) error) error {
@@ -2771,7 +2807,7 @@ func (t *rollbackProbeTransaction) ReplaceRegister(key harness.RegisterKey, expe
 
 func (t *rollbackProbeTransaction) DeleteSession(sessionID string) error {
 	err := t.Transaction.DeleteSession(sessionID)
-	if err == nil && t.probe.failDelete {
+	if err == nil && t.probe.failDelete && (t.probe.target == "" || sessionID == t.probe.target) {
 		t.probe.failDelete = false
 		return errInjectedRollback
 	}
@@ -2967,12 +3003,12 @@ func rollbackSweepArchiveCase(t *testing.T, store harness.Storage) {
 	policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
 	now := first.State.LastActivity.Add(100 * time.Hour)
 	probe.failReplace = true
-	if err := f.h.Sweep(ctx, policy, now); !errors.Is(err, errInjectedRollback) {
+	if _, err := f.h.Sweep(ctx, policy, now); !errors.Is(err, errInjectedRollback) {
 		t.Fatalf("sweep with injected post-mutation failure = err %v, want the pass to stop and return it", err)
 	}
 	assertRollback(t, store, f.h, session, before, first)
 
-	if err := f.h.Sweep(ctx, policy, now); err != nil {
+	if _, err := f.h.Sweep(ctx, policy, now); err != nil {
 		t.Fatalf("sweep after rollback: %v", err)
 	}
 	archived, err := f.h.ReadSession(ctx, session)
@@ -2999,12 +3035,12 @@ func rollbackSweepDeleteCase(t *testing.T, store harness.Storage) {
 	policy := harness.SweepPolicy{DeleteAfterArchive: time.Hour}
 	now := archived.State.ArchivedAt.Add(100 * time.Hour)
 	probe.failDelete = true
-	if err := f.h.Sweep(ctx, policy, now); !errors.Is(err, errInjectedRollback) {
+	if _, err := f.h.Sweep(ctx, policy, now); !errors.Is(err, errInjectedRollback) {
 		t.Fatalf("sweep with injected post-mutation failure = err %v, want the pass to stop and return it", err)
 	}
 	assertRollback(t, store, f.h, session, before, archived)
 
-	if err := f.h.Sweep(ctx, policy, now); err != nil {
+	if _, err := f.h.Sweep(ctx, policy, now); err != nil {
 		t.Fatalf("sweep after rollback: %v", err)
 	}
 	key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
@@ -3039,7 +3075,7 @@ func TestPublicSweepMalformedRowSibling(t *testing.T) {
 		}
 
 		policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
-		if err := f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour)); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour)); err != nil {
 			t.Fatalf("sweep with a malformed row = %v, want the row left unchanged and the pass completed", err)
 		}
 
@@ -3063,6 +3099,204 @@ func TestPublicSweepMalformedRowSibling(t *testing.T) {
 		}
 		if !listed {
 			t.Fatalf("malformed row disappeared from the listing after the sweep")
+		}
+	})
+}
+
+// TestPublicSweepReturnsCommittedDeletedIDs proves the sweep return contract:
+// a pass with both transitions disabled returns no identities, a deleting
+// pass returns exactly the committed deleted identities, malformed rows
+// contribute none, and the next pass over the emptied registry returns none.
+func TestPublicSweepReturnsCommittedDeletedIDs(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		f := newPublicFixture(t, store, newScriptModel(), nil)
+		defer f.close()
+		first := createSession(t, f.h)
+		second := createSession(t, f.h)
+		archivedFirst, err := f.h.ArchiveSession(ctx, first)
+		if err != nil {
+			t.Fatalf("archive first: %v", err)
+		}
+		if _, err := f.h.ArchiveSession(ctx, second); err != nil {
+			t.Fatalf("archive second: %v", err)
+		}
+		const malformed = "corrupt-id" // a listed row violating the durable shape contributes no identity
+		if err := store.Transact(ctx, func(tx harness.Transaction) error {
+			_, err := tx.InsertRegister(harness.RegisterDraft{
+				Key:     harness.RegisterKey{SessionID: malformed, Kind: harness.RegisterSession},
+				Payload: json.RawMessage(`{}`),
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("plant the malformed row: %v", err)
+		}
+
+		if ids, err := f.h.Sweep(ctx, harness.SweepPolicy{}, archivedFirst.State.ArchivedAt.Add(time.Hour)); err != nil || len(ids) != 0 {
+			t.Fatalf("pass with both transitions disabled = ids %v err %v, want no identities", ids, err)
+		}
+		policy := harness.SweepPolicy{DeleteAfterArchive: time.Hour}
+		ids, err := f.h.Sweep(ctx, policy, archivedFirst.State.ArchivedAt.Add(2*time.Hour))
+		if err != nil {
+			t.Fatalf("deleting sweep: %v", err)
+		}
+		want := []string{first, second}
+		if !slices.Equal(slices.Sorted(slices.Values(ids)), slices.Sorted(slices.Values(want))) { // the result order is unspecified
+			t.Fatalf("deleting sweep = ids %v, want exactly the committed deleted identities %v", ids, want)
+		}
+		if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: malformed, Kind: harness.RegisterSession}); err != nil {
+			t.Fatalf("malformed row after the deleting sweep: %v", err)
+		}
+
+		if ids, err := f.h.Sweep(ctx, policy, archivedFirst.State.ArchivedAt.Add(3*time.Hour)); err != nil || len(ids) != 0 {
+			t.Fatalf("pass over the emptied registry = ids %v err %v, want no identities", ids, err)
+		}
+	})
+}
+
+// TestPublicSweepKeepsCommittedIDsBeforeAStoppingError proves the partial
+// return: the first Session's deletion commits, the second's delete
+// transaction rolls back post-mutation and stops the pass, and the returned
+// identities keep the success collected before the error.
+func TestPublicSweepKeepsCommittedIDsBeforeAStoppingError(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		a := seedArchivedSession(t, store)
+		b := seedArchivedSession(t, store)
+		first, second := a, b // the pass enumerates sorted identities: the rollback targets the second
+		if first > second {
+			first, second = second, first
+		}
+		f := newPublicFixture(t, &rollbackProbeStore{Storage: store, failDelete: true, target: second}, newScriptModel(), nil)
+		defer f.close()
+
+		ids, err := f.h.Sweep(ctx, harness.SweepPolicy{DeleteAfterArchive: time.Hour}, time.Now().Add(2*time.Hour))
+		if !errors.Is(err, errInjectedRollback) {
+			t.Fatalf("sweep past the rolled-back delete = err %v, want the injected rollback to stop the pass", err)
+		}
+		if !slices.Equal(ids, []string{first}) {
+			t.Fatalf("sweep = ids %v, want the success committed before the stopping error: [%s]", ids, first)
+		}
+		if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: second, Kind: harness.RegisterSession}); err != nil {
+			t.Fatalf("rolled-back session register: %v, want it still present", err)
+		}
+	})
+}
+
+// errInjectedMaterialization is the plain non-corruption sentinel the
+// failing materialization store returns for its named identity.
+var errInjectedMaterialization = errors.New("harness_test: injected materialization failure")
+
+// failingMaterializationStore wraps one store: the named Session's register
+// read fails with the plain sentinel, so its first materialization fails;
+// everything else delegates.
+type failingMaterializationStore struct {
+	harness.Storage
+	session string
+}
+
+func (s *failingMaterializationStore) ReadRegisters(ctx context.Context, sessionID string) ([]harness.Register, error) {
+	if sessionID == s.session {
+		return nil, errInjectedMaterialization
+	}
+	return s.Storage.ReadRegisters(ctx, sessionID)
+}
+
+// TestPublicSweepKeepsCommittedIDsBeforeAMaterializationFailure proves the
+// materialization stop site: the first identity's deletion commits, the
+// second identity's materialization fails with a plain non-corruption error
+// and stops the pass, and the returned identities keep the success collected
+// before the stop.
+func TestPublicSweepKeepsCommittedIDsBeforeAMaterializationFailure(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		a := seedArchivedSession(t, store)
+		b := seedArchivedSession(t, store)
+		first, second := a, b // the pass enumerates sorted identities: the failure targets the second
+		if first > second {
+			first, second = second, first
+		}
+		f := newPublicFixture(t, &failingMaterializationStore{Storage: store, session: second}, newScriptModel(), nil)
+		defer f.close()
+
+		ids, err := f.h.Sweep(ctx, harness.SweepPolicy{DeleteAfterArchive: time.Hour}, time.Now().Add(2*time.Hour))
+		if !errors.Is(err, errInjectedMaterialization) {
+			t.Fatalf("sweep past the failed materialization = err %v, want the injected failure to stop the pass", err)
+		}
+		if !slices.Equal(ids, []string{first}) {
+			t.Fatalf("sweep = ids %v, want the success committed before the stopping materialization failure: [%s]", ids, first)
+		}
+		if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: first, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("committed deletion's register = err %v, want ErrNotFound", err)
+		}
+		if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: second, Kind: harness.RegisterSession}); err != nil {
+			t.Fatalf("unmaterialized session register: %v, want it still present", err)
+		}
+	})
+}
+
+// TestPublicSweepCorruptRowsContributeNoIdentities proves the corrupt-row
+// return half at both corruption continue sites: a row corrupt before its
+// materialization and a row whose cached view turns corrupt under the sweep
+// transaction each contribute no identity and leave the pass running — the
+// deletion-eligible sibling's committed identity is the only one returned.
+func TestPublicSweepCorruptRowsContributeNoIdentities(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		f := newPublicFixture(t, store, newScriptModel(), nil)
+		defer f.close()
+
+		// a row corrupt before its materialization: the pass's own
+		// coordinator materialization discovers the corruption
+		var buf [16]byte
+		if _, err := rand.Read(buf[:]); err != nil {
+			t.Fatalf("random session id: %v", err)
+		}
+		preCorrupt := hex.EncodeToString(buf[:])
+		if err := store.Transact(ctx, func(tx harness.Transaction) error {
+			_, err := tx.InsertRegister(harness.RegisterDraft{
+				Key:     harness.RegisterKey{SessionID: preCorrupt, Kind: harness.RegisterSession},
+				Payload: json.RawMessage(`{}`),
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("plant the corrupt row: %v", err)
+		}
+
+		// a row whose cached view turns corrupt under the sweep transaction
+		cached := createSession(t, f.h)
+		if _, err := f.h.ReadSession(ctx, cached); err != nil {
+			t.Fatalf("materialize the cached row: %v", err)
+		}
+		key := harness.RegisterKey{SessionID: cached, Kind: harness.RegisterSession}
+		reg := sessionRegister(t, store, cached)
+		if err := store.Transact(ctx, func(tx harness.Transaction) error {
+			_, err := tx.ReplaceRegister(key, reg.Revision, json.RawMessage(`{}`))
+			return err
+		}); err != nil {
+			t.Fatalf("corrupt the cached row: %v", err)
+		}
+
+		sibling := createSession(t, f.h)
+		archived, err := f.h.ArchiveSession(ctx, sibling)
+		if err != nil {
+			t.Fatalf("archive the sibling: %v", err)
+		}
+
+		ids, err := f.h.Sweep(ctx, harness.SweepPolicy{DeleteAfterArchive: time.Hour}, archived.State.ArchivedAt.Add(2*time.Hour))
+		if err != nil {
+			t.Fatalf("sweep with corrupt rows = %v, want the corruption left in place and the pass completed", err)
+		}
+		if !slices.Equal(ids, []string{sibling}) {
+			t.Fatalf("sweep = ids %v, want exactly the committed deleted sibling [%s]", ids, sibling)
+		}
+		for _, id := range []string{preCorrupt, cached} { // the corrupt rows are left unchanged
+			if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); err != nil {
+				t.Fatalf("corrupt row %s after the sweep: %v, want it left in place", id, err)
+			}
+		}
+		if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: sibling, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("committed deletion's register = err %v, want ErrNotFound", err)
 		}
 	})
 }
