@@ -523,6 +523,21 @@ func registerInstance(p Plugin, values map[string]any, sc *scope, resolved, own 
 	return nil
 }
 
+// toolSpec resolves one tool ID to its composed declaration. Agent tool
+// lists are validated against the composed tool universe, so a miss cannot
+// occur in a published selection; the returned spec is the one declaration
+// the ID globally names.
+func (c *composition) toolSpec(id string) (CapabilitySpec, bool) {
+	for _, p := range c.plugins {
+		for _, spec := range p.Provides {
+			if spec.id == id && spec.typ == toolType {
+				return spec, true
+			}
+		}
+	}
+	return CapabilitySpec{}, false
+}
+
 // selectCapabilities builds an Agent's selected view from the same resolved
 // scope instances, containing only the selected ordinary exports. Unknown or
 // Core-storage IDs are not in the capability universe and are rejected; the

@@ -38,6 +38,10 @@ type serviceHarness struct {
 func newServiceHarness(t *testing.T) *serviceHarness {
 	t.Helper()
 	h := &serviceHarness{t: t, home: t.TempDir(), dataDir: t.TempDir()}
+	// One isolated HOME for every harness consumer: the publisher's
+	// Workspace-permission capture resolves the home-based projects
+	// directory, so no test here ever reads the real user HOME.
+	t.Setenv("HOME", h.home)
 	h.configPath = filepath.Join(h.dataDir, "config.json")
 	h.loader = catalog.NewLoader(h.home, staticBundledFS())
 	return h
@@ -816,7 +820,6 @@ func captureConfigDoc() string {
 // failed inventory enumeration leaves the whole Workspace level absent.
 func TestConfigurationServiceCapturesWorkspacePermissions(t *testing.T) {
 	h := newServiceHarness(t)
-	t.Setenv("HOME", h.home)
 	writeServiceFile(t, h.configPath, captureConfigDoc())
 	svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, nil))
 

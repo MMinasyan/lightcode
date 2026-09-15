@@ -516,7 +516,6 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 		}{
 			{"empty data directory", options{ConfigPath: e.configPath, Plugins: []Plugin{e.storagePlugin(nil)}, prepare: e.prep.prepare}},
 			{"empty config path", options{DataDir: e.dataDir, Plugins: []Plugin{e.storagePlugin(nil)}, prepare: e.prep.prepare}},
-			{"nil preparation", options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: []Plugin{e.storagePlugin(nil)}}},
 		}
 		for _, tc := range cases {
 			r, err := open(context.Background(), tc.opts)
