@@ -290,11 +290,19 @@ func (t chainWriteTool) Prepare(_ context.Context, tc ToolContext, call model.To
 	if err != nil {
 		return chainImmediateDenied(call.ID)
 	}
+	writeDirCanonical := ""
+	if tc.Constraints.WriteDir != "" {
+		resolvedWriteDir, err := pathutil.ResolveFilePathFrom(tc.Workspace, tc.Constraints.WriteDir)
+		if err != nil {
+			return chainImmediateDenied(call.ID)
+		}
+		writeDirCanonical = resolvedWriteDir.CanonicalPath
+	}
 	group, err := snapshot.OpenCodeStore(filepath.Join(t.dataDir, "code", tc.AdmittedEntry.SessionID, tc.AdmittedEntry.EntryID))
 	if err != nil {
 		return chainImmediateDenied(call.ID)
 	}
-	prepared, err := tool.PrepareWriteCall(tc.Workspace, tool.CapabilityOptions{WriteDir: tc.Constraints.WriteDir}, chainCodeGroup{group}, args)
+	prepared, err := tool.PrepareWriteCall(tc.Workspace, resolved.CanonicalPath, writeDirCanonical, tool.CapabilityOptions{WriteDir: tc.Constraints.WriteDir}, chainCodeGroup{group}, args)
 	if err != nil {
 		return chainImmediateDenied(call.ID)
 	}
@@ -355,11 +363,19 @@ func (t chainPatchTool) Prepare(_ context.Context, tc ToolContext, call model.To
 	if err != nil {
 		return chainImmediateDenied(call.ID)
 	}
+	writeDirCanonical := ""
+	if tc.Constraints.WriteDir != "" {
+		resolvedWriteDir, err := pathutil.ResolveFilePathFrom(tc.Workspace, tc.Constraints.WriteDir)
+		if err != nil {
+			return chainImmediateDenied(call.ID)
+		}
+		writeDirCanonical = resolvedWriteDir.CanonicalPath
+	}
 	group, err := snapshot.OpenCodeStore(filepath.Join(t.dataDir, "code", tc.AdmittedEntry.SessionID, tc.AdmittedEntry.EntryID))
 	if err != nil {
 		return chainImmediateDenied(call.ID)
 	}
-	prepared, err := tool.PreparePatchCall(tc.Workspace, tool.CapabilityOptions{WriteDir: tc.Constraints.WriteDir}, chainCodeGroup{group}, args)
+	prepared, err := tool.PreparePatchCall(tc.Workspace, resolved.CanonicalPath, writeDirCanonical, tool.CapabilityOptions{WriteDir: tc.Constraints.WriteDir}, chainCodeGroup{group}, args)
 	if err != nil {
 		return chainImmediateDenied(call.ID)
 	}

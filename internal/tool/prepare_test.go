@@ -26,7 +26,7 @@ func TestPrepareReadBindsParentDirectoryOnlyWhenLeafMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeReadArgs error = %v", err)
 	}
-	prepared, err := PrepareReadCall(root, config.ToolsConfig{ReadMaxLines: 500}, args)
+	prepared, err := PrepareReadCall(root, "", config.ToolsConfig{ReadMaxLines: 500}, args)
 	if err != nil {
 		t.Fatalf("PrepareReadCall error = %v", err)
 	}
@@ -46,7 +46,7 @@ func TestPrepareReadBindsParentDirectoryOnlyWhenLeafMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeReadArgs error = %v", err)
 	}
-	prepared, err = PrepareReadCall(root, config.ToolsConfig{ReadMaxLines: 500}, args)
+	prepared, err = PrepareReadCall(root, "", config.ToolsConfig{ReadMaxLines: 500}, args)
 	if err != nil {
 		t.Fatalf("PrepareReadCall error = %v", err)
 	}
@@ -72,7 +72,7 @@ func TestPrepareReadDisappearedLeafReturnsPlainNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeReadArgs error = %v", err)
 	}
-	prepared, err := PrepareReadCall(root, config.ToolsConfig{ReadMaxLines: 500}, args)
+	prepared, err := PrepareReadCall(root, "", config.ToolsConfig{ReadMaxLines: 500}, args)
 	if err != nil {
 		t.Fatalf("PrepareReadCall error = %v", err)
 	}
@@ -468,7 +468,7 @@ func TestPrepareReadRevalidatesRepointedWorkspaceRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeReadArgs error = %v", err)
 	}
-	prepared, err := PrepareReadCall(root, config.ToolsConfig{ReadMaxLines: 500}, args)
+	prepared, err := PrepareReadCall(root, "", config.ToolsConfig{ReadMaxLines: 500}, args)
 	if err != nil {
 		t.Fatalf("PrepareReadCall error = %v", err)
 	}
@@ -483,7 +483,7 @@ func TestPrepareReadRevalidatesRepointedWorkspaceRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeReadArgs error = %v", err)
 	}
-	prepared, err = PrepareReadCall(root, config.ToolsConfig{ReadMaxLines: 500}, args)
+	prepared, err = PrepareReadCall(root, "", config.ToolsConfig{ReadMaxLines: 500}, args)
 	if err != nil {
 		t.Fatalf("PrepareReadCall error = %v", err)
 	}
@@ -522,7 +522,7 @@ func TestPrepareWriteRevalidatesRepointedWorkspaceRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeWriteArgs error = %v", err)
 	}
-	prepared, err := PrepareWriteCall(root, CapabilityOptions{}, store, args)
+	prepared, err := PrepareWriteCall(root, "", "", CapabilityOptions{}, store, args)
 	if err != nil {
 		t.Fatalf("PrepareWriteCall error = %v", err)
 	}
@@ -565,7 +565,11 @@ func TestPreparePatchRevalidatesRepointedWorkspaceRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizePatchArgs error = %v", err)
 	}
-	prepared, err := PreparePatchCall(root, CapabilityOptions{}, store, args)
+	rootCanonical, err := bindWorkspaceRoot(root)
+	if err != nil {
+		t.Fatalf("bindWorkspaceRoot error = %v", err)
+	}
+	prepared, err := PreparePatchCall(root, rootCanonical, "", CapabilityOptions{}, store, args)
 	if err != nil {
 		t.Fatalf("PreparePatchCall error = %v", err)
 	}
@@ -591,7 +595,7 @@ func TestPrepareTargetNilTrackerRepeatedReadsReturnContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeReadArgs error = %v", err)
 	}
-	prepared, err := PrepareReadCall(dir, config.ToolsConfig{ReadMaxLines: 500}, args)
+	prepared, err := PrepareReadCall(dir, "", config.ToolsConfig{ReadMaxLines: 500}, args)
 	if err != nil {
 		t.Fatalf("PrepareReadCall error = %v", err)
 	}
@@ -620,7 +624,7 @@ func TestPrepareReadTargetsExpressParentAllowDeny(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NormalizeReadArgs error = %v", err)
 		}
-		prepared, err := PrepareReadCall(dir, config.ToolsConfig{ReadMaxLines: 500}, args)
+		prepared, err := PrepareReadCall(dir, "", config.ToolsConfig{ReadMaxLines: 500}, args)
 		if err != nil {
 			t.Fatalf("PrepareReadCall error = %v", err)
 		}
@@ -651,7 +655,7 @@ func TestPrepareReadTargetsExpressParentAllowDeny(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NormalizeReadArgs error = %v", err)
 		}
-		prepared, err := PrepareReadCall(dir, config.ToolsConfig{ReadMaxLines: 500}, args)
+		prepared, err := PrepareReadCall(dir, "", config.ToolsConfig{ReadMaxLines: 500}, args)
 		if err != nil {
 			t.Fatalf("PrepareReadCall error = %v", err)
 		}
@@ -682,7 +686,7 @@ func TestPreparedEditAndWritePaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeWriteArgs error = %v", err)
 	}
-	prepared, err := PrepareWriteCall(dir, CapabilityOptions{}, store, args)
+	prepared, err := PrepareWriteCall(dir, "", "", CapabilityOptions{}, store, args)
 	if err != nil {
 		t.Fatalf("PrepareWriteCall error = %v", err)
 	}
@@ -699,7 +703,7 @@ func TestPreparedEditAndWritePaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeEditArgs error = %v", err)
 	}
-	editPrepared, err := PrepareEditCall(dir, CapabilityOptions{}, store, editArgs)
+	editPrepared, err := PrepareEditCall(dir, "", "", CapabilityOptions{}, store, editArgs)
 	if err != nil {
 		t.Fatalf("PrepareEditCall error = %v", err)
 	}
@@ -717,7 +721,7 @@ func TestPreparedEditAndWritePaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeEditArgs error = %v", err)
 	}
-	missingPrepared, err := PrepareEditCall(dir, CapabilityOptions{}, store, missing)
+	missingPrepared, err := PrepareEditCall(dir, "", "", CapabilityOptions{}, store, missing)
 	if err != nil {
 		t.Fatalf("PrepareEditCall error = %v", err)
 	}
@@ -733,7 +737,7 @@ func TestPreparedEditAndWritePaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeWriteArgs error = %v", err)
 	}
-	nestedPrepared, err := PrepareWriteCall(dir, CapabilityOptions{}, store, nestedArgs)
+	nestedPrepared, err := PrepareWriteCall(dir, "", "", CapabilityOptions{}, store, nestedArgs)
 	if err != nil {
 		t.Fatalf("PrepareWriteCall error = %v", err)
 	}
@@ -775,7 +779,7 @@ func TestPrepareWriteAndEditRevalidateAfterSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeWriteArgs error = %v", err)
 	}
-	prepared, err := PrepareWriteCall(dir, CapabilityOptions{}, store, args)
+	prepared, err := PrepareWriteCall(dir, "", "", CapabilityOptions{}, store, args)
 	if err != nil {
 		t.Fatalf("PrepareWriteCall error = %v", err)
 	}
@@ -806,7 +810,7 @@ func TestPrepareWriteAndEditRevalidateAfterSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeEditArgs error = %v", err)
 	}
-	editPrepared, err := PrepareEditCall(dir, CapabilityOptions{}, store2, editArgs)
+	editPrepared, err := PrepareEditCall(dir, "", "", CapabilityOptions{}, store2, editArgs)
 	if err != nil {
 		t.Fatalf("PrepareEditCall error = %v", err)
 	}
@@ -859,7 +863,7 @@ func TestPrepareWriteAndEditDiscardSnapshotClaimOnPostSnapshotRevalidationFailur
 	if err != nil {
 		t.Fatalf("NormalizeWriteArgs error = %v", err)
 	}
-	prepared, err := PrepareWriteCall(dir, CapabilityOptions{}, store, args)
+	prepared, err := PrepareWriteCall(dir, "", "", CapabilityOptions{}, store, args)
 	if err != nil {
 		t.Fatalf("PrepareWriteCall error = %v", err)
 	}
@@ -883,7 +887,7 @@ func TestPrepareWriteAndEditDiscardSnapshotClaimOnPostSnapshotRevalidationFailur
 	if err != nil {
 		t.Fatalf("NormalizeEditArgs error = %v", err)
 	}
-	editPrepared, err := PrepareEditCall(dir, CapabilityOptions{}, store2, editArgs)
+	editPrepared, err := PrepareEditCall(dir, "", "", CapabilityOptions{}, store2, editArgs)
 	if err != nil {
 		t.Fatalf("PrepareEditCall error = %v", err)
 	}
@@ -906,7 +910,7 @@ func TestPreparePatchExecutesParsedPatchWithoutReparse(t *testing.T) {
 	input := applyPatchInput(t, "*** Update File: a.txt\n@@\n-hi\n+bye")
 
 	args := map[string]any{"input": input}
-	prepared, err := PreparePatchCall(dir, CapabilityOptions{}, store, args)
+	prepared, err := PreparePatchCall(dir, "", "", CapabilityOptions{}, store, args)
 	if err != nil {
 		t.Fatalf("PreparePatchCall error = %v", err)
 	}
@@ -949,7 +953,7 @@ func TestPreparePatchClosureRevalidatesRepointedTarget(t *testing.T) {
 	store := &applyPatchStore{turn: 1}
 	input := applyPatchInput(t, "*** Update File: link.txt\n@@\n-hi\n+bye")
 
-	prepared, err := PreparePatchCall(dir, CapabilityOptions{}, store, map[string]any{"input": input})
+	prepared, err := PreparePatchCall(dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
 	if err != nil {
 		t.Fatalf("PreparePatchCall error = %v", err)
 	}
@@ -991,7 +995,7 @@ func TestPreparePatchPartialFailureReportsCommittedFiles(t *testing.T) {
 	}
 	input := applyPatchInput(t, "*** Update File: first.txt\n@@\n-one\n+ONE\n*** Update File: second.txt\n@@\n-two\n+TWO")
 
-	prepared, err := PreparePatchCall(dir, CapabilityOptions{}, store, map[string]any{"input": input})
+	prepared, err := PreparePatchCall(dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
 	if err != nil {
 		t.Fatalf("PreparePatchCall error = %v", err)
 	}
@@ -1029,7 +1033,7 @@ func TestPrepareWriteRevalidatesWriteDirWitness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeWriteArgs error = %v", err)
 	}
-	prepared, err := PrepareWriteCall(root, CapabilityOptions{WriteDir: wd}, store, args)
+	prepared, err := PrepareWriteCall(root, "", "", CapabilityOptions{WriteDir: wd}, store, args)
 	if err != nil {
 		t.Fatalf("PrepareWriteCall error = %v", err)
 	}
@@ -1046,7 +1050,7 @@ func TestPrepareWriteRevalidatesWriteDirWitness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeWriteArgs error = %v", err)
 	}
-	prepared, err = PrepareWriteCall(root, CapabilityOptions{WriteDir: wd}, store, args)
+	prepared, err = PrepareWriteCall(root, "", "", CapabilityOptions{WriteDir: wd}, store, args)
 	if err != nil {
 		t.Fatalf("PrepareWriteCall error = %v", err)
 	}
@@ -1079,7 +1083,7 @@ func TestPrepareWriteRevalidatesWriteDirWitness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeWriteArgs error = %v", err)
 	}
-	prepared, err = PrepareWriteCall(root, CapabilityOptions{WriteDir: wd}, store, args)
+	prepared, err = PrepareWriteCall(root, "", "", CapabilityOptions{WriteDir: wd}, store, args)
 	if err != nil {
 		t.Fatalf("PrepareWriteCall error = %v", err)
 	}
@@ -1119,7 +1123,7 @@ func TestNormalizePatchArgsStrictInputType(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizePatchArgs error = %v, want missing input tolerated at normalization", err)
 	}
-	if _, err := PreparePatchCall(t.TempDir(), CapabilityOptions{}, &applyPatchStore{turn: 1}, args); err == nil || !strings.Contains(err.Error(), "input is empty") {
+	if _, err := PreparePatchCall(t.TempDir(), "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, args); err == nil || !strings.Contains(err.Error(), "input is empty") {
 		t.Fatalf("PreparePatchCall error = %v, want patch-syntax error", err)
 	}
 }
@@ -1181,7 +1185,15 @@ func TestPreparePatchRevalidatesWriteDirWitness(t *testing.T) {
 	t.Run("prepared_closure", func(t *testing.T) {
 		f := newPatchWriteDirWitnessFixture(t)
 		store := &applyPatchStore{turn: 1}
-		prepared, err := PreparePatchCall(f.root, CapabilityOptions{WriteDir: f.wd}, store, map[string]any{"input": patchWriteDirWitnessInput(t, f.target)})
+		rootCanonical, err := bindWorkspaceRoot(f.root)
+		if err != nil {
+			t.Fatalf("bindWorkspaceRoot error = %v", err)
+		}
+		writeDirCanonical, err := bindWriteDir(f.root, "apply_patch", f.wd)
+		if err != nil {
+			t.Fatalf("bindWriteDir error = %v", err)
+		}
+		prepared, err := PreparePatchCall(f.root, rootCanonical, writeDirCanonical, CapabilityOptions{WriteDir: f.wd}, store, map[string]any{"input": patchWriteDirWitnessInput(t, f.target)})
 		if err != nil {
 			t.Fatalf("PreparePatchCall error = %v", err)
 		}
@@ -1222,6 +1234,14 @@ func TestPreparePatchRejectsOutsideWriteDirAtPreparation(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(inside, "a.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	rootCanonical, err := bindWorkspaceRoot(root)
+	if err != nil {
+		t.Fatalf("bindWorkspaceRoot error = %v", err)
+	}
+	writeDirCanonical, err := bindWriteDir(root, "apply_patch", inside)
+	if err != nil {
+		t.Fatalf("bindWriteDir error = %v", err)
+	}
 	outside := filepath.Join(root, "out")
 	if err := os.Mkdir(outside, 0o755); err != nil {
 		t.Fatal(err)
@@ -1237,7 +1257,7 @@ func TestPreparePatchRejectsOutsideWriteDirAtPreparation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizePatchArgs error = %v", err)
 	}
-	prepared, err := PreparePatchCall(root, CapabilityOptions{WriteDir: inside}, &applyPatchStore{turn: 1}, args)
+	prepared, err := PreparePatchCall(root, rootCanonical, writeDirCanonical, CapabilityOptions{WriteDir: inside}, &applyPatchStore{turn: 1}, args)
 	if err == nil || !strings.Contains(err.Error(), "outside write_dir") {
 		t.Fatalf("PreparePatchCall error = %v, want outside-write_dir rejection at preparation", err)
 	}
@@ -1254,7 +1274,7 @@ func TestPreparePatchRejectsOutsideWriteDirAtPreparation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizePatchArgs error = %v", err)
 	}
-	if _, err := PreparePatchCall(root, CapabilityOptions{WriteDir: inside}, &applyPatchStore{turn: 1}, args); err == nil || !strings.Contains(err.Error(), "outside write_dir") {
+	if _, err := PreparePatchCall(root, rootCanonical, writeDirCanonical, CapabilityOptions{WriteDir: inside}, &applyPatchStore{turn: 1}, args); err == nil || !strings.Contains(err.Error(), "outside write_dir") {
 		t.Fatalf("PreparePatchCall error = %v, want outside-write_dir source rejection at preparation", err)
 	}
 
@@ -1264,7 +1284,7 @@ func TestPreparePatchRejectsOutsideWriteDirAtPreparation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizePatchArgs error = %v", err)
 	}
-	prepared, err = PreparePatchCall(root, CapabilityOptions{WriteDir: inside}, &applyPatchStore{turn: 1}, args)
+	prepared, err = PreparePatchCall(root, rootCanonical, writeDirCanonical, CapabilityOptions{WriteDir: inside}, &applyPatchStore{turn: 1}, args)
 	if err != nil {
 		t.Fatalf("PreparePatchCall error = %v, want inside-write_dir patch prepared", err)
 	}

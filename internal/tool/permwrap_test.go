@@ -612,7 +612,7 @@ func TestPR11Closure_FileSecurityPathDoubleValidationCommented(t *testing.T) {
 	bindingSites := 0
 	closureSites := 0
 	for _, line := range lines {
-		if strings.Contains(line, "canonicalChangedError(approvedCanonical") || strings.Contains(line, "canonicalChangedError(boundCanonical") {
+		if strings.Contains(line, "canonicalChangedError(approved.canonical") || strings.Contains(line, "canonicalChangedError(boundCanonical") {
 			bindingSites++
 		}
 		if strings.Contains(line, "bound.revalidate()") {

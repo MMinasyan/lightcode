@@ -754,3 +754,102 @@ func TestExecutedReadFailsUnderWorkspaceRootChange(t *testing.T) {
 		t.Fatalf("result = %+v, want the changed-root failure without substituted content", outcome.Result)
 	}
 }
+
+// bindingChangePatchInput builds one add-file patch call over the given path
+// for the binding-witness oracle.
+func bindingChangePatchInput(t *testing.T, path string) string {
+	t.Helper()
+	raw, err := json.Marshal(map[string]string{"input": "*** Begin Patch\n*** Add File: " + path + "\n+new\n*** End Patch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+// TestPrepareBindingSurvivesCanonicalPathsRepoint proves the one-binding
+// contract at the plugin boundary: the canonical Workspace root and write-dir
+// boundary the plugin resolves for containment are the same witnesses the
+// shared preparation binds, so repointing either symlink between the plugin's
+// resolutions and the shared preparation fails the execution with the
+// changed-binding error instead of executing under the repointed tree. One
+// cell per entry and bound slot: read binds the root; write, edit and
+// apply_patch bind the root and the write-dir.
+func TestPrepareBindingSurvivesCanonicalPathsRepoint(t *testing.T) {
+	cells := []struct {
+		name          string
+		toolID        string
+		args          string
+		slot          string // "root" repoints the workspace symlink, "write_dir" the write-dir symlink
+		content       string // planted in the repointed-to directory when nonempty
+		boundWriteDir bool   // the failure must name the pre-flip canonical write-dir as the bound value, not the empty-witness form
+	}{
+		{"read_file revalidates the root witness", "read_file", `{"path":"target.txt"}`, "root", "substituted\n", false},
+		{"write_file revalidates the root witness", "write_file", `{"path":"target.txt","content":"after"}`, "root", "", false},
+		{"write_file revalidates the write-dir witness", "write_file", `{"path":"wd/target.txt","content":"after"}`, "write_dir", "", false},
+		{"edit_file revalidates the root witness", "edit_file", `{"path":"target.txt","old_string":"beta","new_string":"BETA"}`, "root", "beta\n", false},
+		{"edit_file revalidates the write-dir witness", "edit_file", `{"path":"wd/target.txt","old_string":"beta","new_string":"BETA"}`, "write_dir", "beta\n", false},
+		{"apply_patch revalidates the root witness", "apply_patch", bindingChangePatchInput(t, "target.txt"), "root", "", false},
+		{"apply_patch revalidates the write-dir witness", "apply_patch", bindingChangePatchInput(t, "wd/target.txt"), "write_dir", "", true},
+	}
+	for _, cell := range cells {
+		cell := cell
+		t.Run(cell.name, func(t *testing.T) {
+			byID := openTools(t, t.TempDir())
+			var workspace, link, flipTo, preFlipWriteDir string
+			var constraints runtime.ToolConstraints
+			if cell.slot == "root" {
+				realA, realB := t.TempDir(), t.TempDir()
+				flipTo = realB
+				link = filepath.Join(t.TempDir(), "w")
+				workspace = link
+				if err := os.Symlink(realA, link); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				workspace = t.TempDir()
+				wdA, wdB := t.TempDir(), t.TempDir()
+				flipTo = wdB
+				preFlipWriteDir = wdA
+				link = filepath.Join(workspace, "wd")
+				if err := os.Symlink(wdA, link); err != nil {
+					t.Fatal(err)
+				}
+				constraints = runtime.ToolConstraints{WriteDir: "wd"}
+			}
+			if cell.content != "" {
+				if err := os.WriteFile(filepath.Join(flipTo, "target.txt"), []byte(cell.content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The seam repoints the symlink on its return: after the plugin's
+			// canonical resolutions, before the shared preparation binds.
+			orig := canonicalPathsFn
+			canonicalPathsFn = func(root, writeDir string) (string, string, error) {
+				w, b, err := orig(root, writeDir)
+				if err != nil {
+					return w, b, err
+				}
+				if err := os.Remove(link); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(flipTo, link); err != nil {
+					t.Fatal(err)
+				}
+				return w, b, err
+			}
+			defer func() { canonicalPathsFn = orig }()
+			plan := prepare(t, byID[cell.toolID], callToolContext(workspace, constraints), cell.toolID, cell.args)
+			outcome := plan.Execute(context.Background())
+			if outcome.Result.Status != model.ResultError || !strings.Contains(outcome.Result.Content, "changed") {
+				t.Fatalf("result = %+v, want the changed-binding failure without substitution", outcome.Result)
+			}
+			// The patch path threads the write-dir witness directly, so a
+			// dropped witness would fail with the empty-witness form
+			// ("changed from  to ..."); the real changed-binding error names
+			// the pre-flip canonical write-dir as the bound value.
+			if cell.boundWriteDir && !strings.Contains(outcome.Result.Content, preFlipWriteDir) {
+				t.Fatalf("result = %+v, want the changed-binding error naming the bound write-dir %q", outcome.Result, preFlipWriteDir)
+			}
+		})
+	}
+}

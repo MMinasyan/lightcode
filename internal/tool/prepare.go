@@ -83,13 +83,15 @@ func consumedIntAtUse(args map[string]any, key string) int {
 // approvedBinding is the canonical witness carried from authorization: the
 // approved canonical target path and the lexical write-dir witness (empty
 // when the call reaches preparation without a binding, e.g. direct legacy
-// Execute calls), plus the canonical Workspace root witness bound at
-// authorization so inner preparation compares against it instead of
-// re-binding a fresh root after approval.
+// Execute calls), plus the canonical Workspace root witness and the
+// canonical write-dir boundary bound at authorization so inner preparation
+// compares against them instead of re-binding fresh ones after approval;
+// an empty witness falls back to the legacy re-bind from its lexical input.
 type approvedBinding struct {
-	canonical     string
-	writeDir      string
-	rootCanonical string
+	canonical         string
+	writeDir          string
+	rootCanonical     string
+	writeDirCanonical string
 }
 
 func approvedBindingFromParams(params map[string]any) approvedBinding {
@@ -122,8 +124,10 @@ func bindWriteDir(root, toolName, writeDir string) (string, error) {
 
 // bindCanonicalTarget resolves one call's display path from the bound root,
 // refuses any canonical change against the approved witness, applies the
-// write-dir check, and binds the canonical write-dir boundary.
-func bindCanonicalTarget(root, toolName, path, approvedCanonical, writeDir string) (canonicalBinding, error) {
+// write-dir check, and binds the canonical write-dir boundary — the
+// authorization-time witness when bound, else a fresh resolution from the
+// lexical witness (the legacy receipt flow).
+func bindCanonicalTarget(root, toolName, path string, approved approvedBinding) (canonicalBinding, error) {
 	displayAbs, err := fileDisplayAbsPathAtRoot(root, path)
 	if err != nil {
 		return canonicalBinding{}, fmt.Errorf("%s: resolve path: %w", toolName, err)
@@ -132,15 +136,18 @@ func bindCanonicalTarget(root, toolName, path, approvedCanonical, writeDir strin
 	if err != nil {
 		return canonicalBinding{}, fmt.Errorf("%s: resolve path: %w", toolName, err)
 	}
-	if approvedCanonical != "" && resolved.CanonicalPath != approvedCanonical {
-		return canonicalBinding{}, fmt.Errorf("%s: resolve path: %w", toolName, canonicalChangedError(approvedCanonical, resolved.CanonicalPath))
+	if approved.canonical != "" && resolved.CanonicalPath != approved.canonical {
+		return canonicalBinding{}, fmt.Errorf("%s: resolve path: %w", toolName, canonicalChangedError(approved.canonical, resolved.CanonicalPath))
 	}
-	if err := checkWriteDirTarget(root, toolName, resolved.CanonicalPath, CapabilityOptions{WriteDir: writeDir}); err != nil {
+	if err := checkWriteDirTarget(root, toolName, resolved.CanonicalPath, CapabilityOptions{WriteDir: approved.writeDir}); err != nil {
 		return canonicalBinding{}, err
 	}
-	writeDirCanonical, err := bindWriteDir(root, toolName, writeDir)
-	if err != nil {
-		return canonicalBinding{}, err
+	writeDirCanonical := approved.writeDirCanonical
+	if writeDirCanonical == "" {
+		writeDirCanonical, err = bindWriteDir(root, toolName, approved.writeDir)
+		if err != nil {
+			return canonicalBinding{}, err
+		}
 	}
 	return canonicalBinding{displayAbs: displayAbs, canonical: resolved.CanonicalPath, writeDirCanonical: writeDirCanonical, leafExists: resolved.LeafExists}, nil
 }
@@ -256,7 +263,7 @@ func prepareRead(root string, cfg config.ToolsConfig, tracker *FileTracker, args
 			return nil, fmt.Errorf("read_file: resolve path: %w", err)
 		}
 	}
-	binding, err := bindCanonicalTarget(root, "read_file", path, approved.canonical, approved.writeDir)
+	binding, err := bindCanonicalTarget(root, "read_file", path, approved)
 	if err != nil {
 		return nil, err
 	}
@@ -359,12 +366,15 @@ func prepareRead(root string, cfg config.ToolsConfig, tracker *FileTracker, args
 }
 
 // PrepareReadCall is the exported preparation entry for target callers.
-// The caller supplies already-normalized arguments (NormalizeReadArgs);
-// target reads run on the nil-tracker path and always return the bounded
-// requested content. Preparation binds the canonical file target plus the
-// parent directory when the leaf is missing.
-func PrepareReadCall(root string, cfg config.ToolsConfig, args map[string]any) (*PreparedCall, error) {
-	return prepareRead(root, cfg, nil, args, approvedBinding{})
+// The caller supplies already-normalized arguments (NormalizeReadArgs) and
+// the canonical Workspace root witness bound at authorization, which
+// preparation binds instead of re-resolving the lexical root; the lexical
+// root remains the re-resolution input. Target reads run on the
+// nil-tracker path and always return the bounded requested content.
+// Preparation binds the canonical file target plus the parent directory
+// when the leaf is missing.
+func PrepareReadCall(root, rootCanonical string, cfg config.ToolsConfig, args map[string]any) (*PreparedCall, error) {
+	return prepareRead(root, cfg, nil, args, approvedBinding{rootCanonical: rootCanonical})
 }
 
 // suggestFromBoundDirectory lists the bound parent directory through its
@@ -421,7 +431,7 @@ func prepareWrite(root string, store SnapshotStore, tracker *FileTracker, args m
 			return nil, fmt.Errorf("write_file: resolve path: %w", err)
 		}
 	}
-	binding, err := bindCanonicalTarget(root, "write_file", path, approved.canonical, approved.writeDir)
+	binding, err := bindCanonicalTarget(root, "write_file", path, approved)
 	if err != nil {
 		return nil, err
 	}
@@ -521,10 +531,13 @@ func writeWithSnapshotBookkeeping(bound boundCall, store SnapshotStore, tracker 
 }
 
 // PrepareWriteCall is the exported preparation entry for target callers.
-// The caller supplies already-normalized arguments (NormalizeWriteArgs)
-// and the hard write-dir constraint.
-func PrepareWriteCall(root string, opts CapabilityOptions, store SnapshotStore, args map[string]any) (*PreparedCall, error) {
-	return prepareWrite(root, store, nil, args, approvedBinding{writeDir: opts.WriteDir})
+// The caller supplies already-normalized arguments (NormalizeWriteArgs),
+// the hard write-dir constraint, and the canonical Workspace root and
+// write-dir witnesses bound at authorization, which preparation binds
+// instead of re-resolving them; the lexical root and write-dir remain the
+// re-resolution inputs.
+func PrepareWriteCall(root, rootCanonical, writeDirCanonical string, opts CapabilityOptions, store SnapshotStore, args map[string]any) (*PreparedCall, error) {
+	return prepareWrite(root, store, nil, args, approvedBinding{rootCanonical: rootCanonical, writeDir: opts.WriteDir, writeDirCanonical: writeDirCanonical})
 }
 
 // prepareEditCall is the legacy edit_file entry: retained lenient argument
@@ -557,7 +570,7 @@ func prepareEdit(root string, store SnapshotStore, tracker *FileTracker, args ma
 			return nil, fmt.Errorf("edit_file: resolve path: %w", err)
 		}
 	}
-	binding, err := bindCanonicalTarget(root, "edit_file", path, approved.canonical, approved.writeDir)
+	binding, err := bindCanonicalTarget(root, "edit_file", path, approved)
 	if err != nil {
 		return nil, err
 	}
@@ -691,10 +704,13 @@ func editWithSnapshotBookkeeping(bound boundCall, store SnapshotStore, tracker *
 }
 
 // PrepareEditCall is the exported preparation entry for target callers.
-// The caller supplies already-normalized arguments (NormalizeEditArgs) and
-// the hard write-dir constraint.
-func PrepareEditCall(root string, opts CapabilityOptions, store SnapshotStore, args map[string]any) (*PreparedCall, error) {
-	return prepareEdit(root, store, nil, args, approvedBinding{writeDir: opts.WriteDir})
+// The caller supplies already-normalized arguments (NormalizeEditArgs),
+// the hard write-dir constraint, and the canonical Workspace root and
+// write-dir witnesses bound at authorization, which preparation binds
+// instead of re-resolving them; the lexical root and write-dir remain the
+// re-resolution inputs.
+func PrepareEditCall(root, rootCanonical, writeDirCanonical string, opts CapabilityOptions, store SnapshotStore, args map[string]any) (*PreparedCall, error) {
+	return prepareEdit(root, store, nil, args, approvedBinding{rootCanonical: rootCanonical, writeDir: opts.WriteDir, writeDirCanonical: writeDirCanonical})
 }
 
 // preparePatchCall is the legacy apply_patch entry. With an approval
@@ -743,24 +759,19 @@ func preparePatchFromArgs(root string, args map[string]any, writeDir string) (*p
 }
 
 // PreparePatchCall is the exported preparation entry for target callers.
-// The caller supplies already-normalized arguments (NormalizePatchArgs) and
-// the hard write-dir constraint, which preparation applies so every patch
-// source/destination outside write_dir is rejected before authorization.
-// The returned call's execution closure consumes the patch parsed here — no
-// redecode or reparse — revalidates the bound root, the canonical write-dir
-// boundary and every target before content access, and returns the
-// structured result carrying the model-visible summary and the captured
-// preview data.
-func PreparePatchCall(root string, opts CapabilityOptions, store SnapshotStore, args map[string]any) (*PreparedPatchCall, error) {
+// The caller supplies already-normalized arguments (NormalizePatchArgs),
+// the hard write-dir constraint, and the canonical Workspace root and
+// write-dir witnesses bound at authorization, which replace the internal
+// resolutions: the execution closure revalidates against these witnesses,
+// re-resolving the lexical root and write-dir. Preparation applies the
+// write-dir constraint so every patch source/destination outside write_dir
+// is rejected before authorization. The returned call's execution closure
+// consumes the patch parsed here — no redecode or reparse — revalidates the
+// bound root, the canonical write-dir boundary and every target before
+// content access, and returns the structured result carrying the
+// model-visible summary and the captured preview data.
+func PreparePatchCall(root, rootCanonical, writeDirCanonical string, opts CapabilityOptions, store SnapshotStore, args map[string]any) (*PreparedPatchCall, error) {
 	p, targets, err := preparePatchFromArgs(root, args, opts.WriteDir)
-	if err != nil {
-		return nil, err
-	}
-	rootCanonical, err := bindWorkspaceRoot(root)
-	if err != nil {
-		return nil, fmt.Errorf("apply_patch: resolve workspace root: %w", err)
-	}
-	writeDirCanonical, err := bindWriteDir(root, "apply_patch", opts.WriteDir)
 	if err != nil {
 		return nil, err
 	}

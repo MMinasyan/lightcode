@@ -214,6 +214,12 @@ func canonicalPaths(root, writeDir string) (workspace, boundary string, err erro
 	return workspace, writeResolved.CanonicalPath, nil
 }
 
+// canonicalPathsFn is the one seam over preparation canonicalization: both
+// containment inputs route through it, so tests flip a symlink between the
+// plugin's resolutions and the shared preparation's binding. Nil-free in
+// production; it simply delegates to canonicalPaths.
+var canonicalPathsFn = canonicalPaths
+
 func permissionPairs(permission string, targets []tool.PreparedTarget) []harness.PermissionRequest {
 	pairs := make([]harness.PermissionRequest, 0, len(targets))
 	for _, target := range targets {
@@ -316,11 +322,11 @@ func (t readTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.
 	if err != nil {
 		return immediateError(call.ID, err)
 	}
-	workspace, writeDirCanonical, err := canonicalPaths(tc.Workspace, tc.Constraints.WriteDir)
+	workspace, writeDirCanonical, err := canonicalPathsFn(tc.Workspace, tc.Constraints.WriteDir)
 	if err != nil {
 		return immediateDenied(call.ID)
 	}
-	prepared, err := tool.PrepareReadCall(tc.Workspace, s.toolsConfig(), args)
+	prepared, err := tool.PrepareReadCall(tc.Workspace, workspace, s.toolsConfig(), args)
 	if err != nil {
 		return immediateDenied(call.ID)
 	}
@@ -347,7 +353,7 @@ type mutationPrepared struct {
 // code group, and the assembled executor plan with its file.write pairs.
 // The per-tool callback runs the shared preparation and wraps the outcome;
 // its error is a failed canonical preparation.
-func (in *instance) prepareMutation(tc runtime.ToolContext, call model.ToolCall, run func(root string, opts tool.CapabilityOptions, group codeGroupStore, args map[string]any) (mutationPrepared, error)) harness.PreparedTool {
+func (in *instance) prepareMutation(tc runtime.ToolContext, call model.ToolCall, run func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group codeGroupStore, args map[string]any) (mutationPrepared, error)) harness.PreparedTool {
 	if _, err := in.settings(tc.Invocation); err != nil {
 		return immediateError(call.ID, err)
 	}
@@ -355,7 +361,7 @@ func (in *instance) prepareMutation(tc runtime.ToolContext, call model.ToolCall,
 	if err != nil {
 		return immediateError(call.ID, err)
 	}
-	workspace, writeDirCanonical, err := canonicalPaths(tc.Workspace, tc.Constraints.WriteDir)
+	workspace, writeDirCanonical, err := canonicalPathsFn(tc.Workspace, tc.Constraints.WriteDir)
 	if err != nil {
 		return immediateDenied(call.ID)
 	}
@@ -363,7 +369,7 @@ func (in *instance) prepareMutation(tc runtime.ToolContext, call model.ToolCall,
 	if err != nil {
 		return immediateDenied(call.ID)
 	}
-	prepared, err := run(tc.Workspace, tool.CapabilityOptions{WriteDir: tc.Constraints.WriteDir}, group, args)
+	prepared, err := run(tc.Workspace, workspace, writeDirCanonical, tool.CapabilityOptions{WriteDir: tc.Constraints.WriteDir}, group, args)
 	if err != nil {
 		return immediateDenied(call.ID)
 	}
@@ -390,8 +396,8 @@ func (t writeTool) Normalize(tc runtime.ToolContext, call model.ToolCall) (json.
 }
 
 func (t writeTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
-	return t.inst.prepareMutation(tc, call, func(root string, opts tool.CapabilityOptions, group codeGroupStore, args map[string]any) (mutationPrepared, error) {
-		prepared, err := tool.PrepareWriteCall(root, opts, group, args)
+	return t.inst.prepareMutation(tc, call, func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group codeGroupStore, args map[string]any) (mutationPrepared, error) {
+		prepared, err := tool.PrepareWriteCall(root, rootCanonical, writeDirCanonical, opts, group, args)
 		if err != nil {
 			return mutationPrepared{}, err
 		}
@@ -420,8 +426,8 @@ func (t editTool) Normalize(tc runtime.ToolContext, call model.ToolCall) (json.R
 }
 
 func (t editTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
-	return t.inst.prepareMutation(tc, call, func(root string, opts tool.CapabilityOptions, group codeGroupStore, args map[string]any) (mutationPrepared, error) {
-		prepared, err := tool.PrepareEditCall(root, opts, group, args)
+	return t.inst.prepareMutation(tc, call, func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group codeGroupStore, args map[string]any) (mutationPrepared, error) {
+		prepared, err := tool.PrepareEditCall(root, rootCanonical, writeDirCanonical, opts, group, args)
 		if err != nil {
 			return mutationPrepared{}, err
 		}
@@ -450,8 +456,8 @@ func (t patchTool) Normalize(tc runtime.ToolContext, call model.ToolCall) (json.
 }
 
 func (t patchTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
-	return t.inst.prepareMutation(tc, call, func(root string, opts tool.CapabilityOptions, group codeGroupStore, args map[string]any) (mutationPrepared, error) {
-		prepared, err := tool.PreparePatchCall(root, opts, group, args)
+	return t.inst.prepareMutation(tc, call, func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group codeGroupStore, args map[string]any) (mutationPrepared, error) {
+		prepared, err := tool.PreparePatchCall(root, rootCanonical, writeDirCanonical, opts, group, args)
 		if err != nil {
 			return mutationPrepared{}, err
 		}
