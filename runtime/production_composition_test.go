@@ -449,7 +449,8 @@ func (t chainCommandTool) Prepare(_ context.Context, tc ToolContext, call model.
 			result, execErr := tool.RunForegroundCommand(ctx, rewritten, tc.Workspace, 120, 15360, 5000, spillDir)
 			if execErr != nil {
 				status := model.ResultError
-				if ctx.Err() != nil {
+				var exitErr *tool.ExitError
+				if errors.As(execErr, &exitErr) && exitErr.Cancelled {
 					status = model.ResultInterrupted
 				}
 				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: status, Content: execErr.Error()}}

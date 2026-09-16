@@ -220,6 +220,12 @@ func canonicalPaths(root, writeDir string) (workspace, boundary string, err erro
 // production; it simply delegates to canonicalPaths.
 var canonicalPathsFn = canonicalPaths
 
+// runForegroundCommandFn is the one seam over the shared foreground runner:
+// commandOutcome routes through it, so tests drive the runner's settled
+// ExitError shapes with a context cancelled after the runner returns.
+// Nil-free in production; it simply delegates to tool.RunForegroundCommand.
+var runForegroundCommandFn = tool.RunForegroundCommand
+
 func permissionPairs(permission string, targets []tool.PreparedTarget) []harness.PermissionRequest {
 	pairs := make([]harness.PermissionRequest, 0, len(targets))
 	for _, target := range targets {
@@ -574,15 +580,17 @@ func (t runCommandTool) Prepare(_ context.Context, tc runtime.ToolContext, call 
 // runner and maps the retained outcomes onto the model-visible result: a
 // completed run settles as success or — for a nonzero exit — the same
 // ExitError output the legacy engine reports as an error; a configured
-// timeout settles as an error result with the retained timeout text; a
-// parent-context cancellation or deadline settles as an interrupted result
-// with the retained cancellation text.
+// timeout settles as an error result with the retained timeout text; the
+// runner's delivered-cause cancellation settles as an interrupted result
+// with the retained cancellation text. The classification reads the cause
+// the runner flagged on the error, never the context after the runner has
+// settled the real result.
 func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec int, s settings, spillDir string) harness.ToolOutcome {
-	result, err := tool.RunForegroundCommand(ctx, command, dir, timeoutSec, s.MaxOutputBytes, s.ReadLineMaxChars, spillDir)
+	result, err := runForegroundCommandFn(ctx, command, dir, timeoutSec, s.MaxOutputBytes, s.ReadLineMaxChars, spillDir)
 	var exitErr *tool.ExitError
 	if errors.As(err, &exitErr) {
 		status := model.ResultError
-		if exitErr.ExitCode == -1 && ctx.Err() != nil {
+		if exitErr.Cancelled {
 			status = model.ResultInterrupted
 		}
 		return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: status, Content: exitErr.Output}}

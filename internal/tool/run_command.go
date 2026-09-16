@@ -212,8 +212,9 @@ func RunForegroundCommand(ctx context.Context, command, dir string, timeoutSec, 
 						output += "\n" + body
 					}
 					return body, &ExitError{
-						Output:   output,
-						ExitCode: -1,
+						Output:    output,
+						ExitCode:  -1,
+						Cancelled: true,
 					}
 				}
 				return body, &ExitError{

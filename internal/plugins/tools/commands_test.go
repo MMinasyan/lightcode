@@ -317,6 +317,44 @@ func TestRunCommandExecuteOutcomes(t *testing.T) {
 	})
 }
 
+// TestCommandOutcomeClassifiesByDeliveredCause pins the causal settlement of
+// the runner's settled ExitError shapes: the classification reads the
+// delivered cause carried on the error, never the context after the runner
+// has settled the real result. The seam cancels the context inside the seam
+// after the runner returns — the exact post-settlement window.
+func TestCommandOutcomeClassifiesByDeliveredCause(t *testing.T) {
+	orig := runForegroundCommandFn
+	defer func() { runForegroundCommandFn = orig }()
+
+	t.Run("external-signal death keeps its real result after the context cancels", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runForegroundCommandFn = func(ctx context.Context, command, dir string, timeoutSec, maxBytes, maxLineChars int, spillDir string) (string, error) {
+			result, err := orig(ctx, command, dir, timeoutSec, maxBytes, maxLineChars, spillDir)
+			cancel()
+			return result, err
+		}
+		outcome := commandOutcome(ctx, "call-1", "kill -TERM $$", "", 0, defaultSettings(), t.TempDir())
+		if outcome.Result.Status != model.ResultError || outcome.Result.Content != "Error: Exit code -1\n" {
+			t.Fatalf("result = (%v, %q), want the real signal-death result as an error", outcome.Result.Status, outcome.Result.Content)
+		}
+	})
+
+	t.Run("own timeout keeps its real result after the context cancels", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runForegroundCommandFn = func(ctx context.Context, command, dir string, timeoutSec, maxBytes, maxLineChars int, spillDir string) (string, error) {
+			result, err := orig(ctx, command, dir, timeoutSec, maxBytes, maxLineChars, spillDir)
+			cancel()
+			return result, err
+		}
+		outcome := commandOutcome(ctx, "call-2", "sleep 5", "", 1, defaultSettings(), t.TempDir())
+		if outcome.Result.Status != model.ResultError || !strings.HasPrefix(outcome.Result.Content, "Error: Exit code -1 (timeout)\n") {
+			t.Fatalf("result = (%v, %q), want the retained timeout text as an error result", outcome.Result.Status, outcome.Result.Content)
+		}
+	})
+}
+
 func TestSleepTool(t *testing.T) {
 	byID := openTools(t, t.TempDir())
 	tc := callToolContext(t.TempDir(), runtime.ToolConstraints{})
