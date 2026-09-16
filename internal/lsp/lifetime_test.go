@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/lsp/server"
+	"golang.org/x/sys/unix"
 )
 
 func TestManagerInstallThreadsContext(t *testing.T) {
@@ -270,6 +271,50 @@ func TestGetDiagnosticsCanonicalRefusesReplacedSymlink(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "didOpen") && !strings.Contains(string(data), "didChange") {
 		t.Fatalf("legacy read never synced the symlinked document (result %q)", legacy)
+	}
+}
+
+// TestGetDiagnosticsCanonicalWriterlessFIFOIsCouldNotCheck pins the
+// non-blocking leaf open on the canonical read: a writerless FIFO leaf
+// cannot block the openat — the no-follow open settles immediately, the
+// read fails, and the retained could-not-check line reports it.
+func TestGetDiagnosticsCanonicalWriterlessFIFOIsCouldNotCheck(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "launches.log")
+	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
+	if err := inst.waitReady(context.Background()); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	m := NewManager(t.TempDir(), t.TempDir())
+	def := server.ForExtension(".go")
+	m.mu.Lock()
+	m.instances[def.Name] = inst
+	m.mu.Unlock()
+
+	fifo := filepath.Join(t.TempDir(), "fifo.go")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+
+	type outcome struct {
+		content string
+		err     error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		client := NewClient(m)
+		content, err := client.GetDiagnosticsCanonical(context.Background(), []string{fifo})
+		done <- outcome{content, err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("GetDiagnosticsCanonical: %v", got.err)
+		}
+		if !strings.Contains(got.content, "(could not check)") {
+			t.Fatalf("GetDiagnosticsCanonical writerless FIFO = %q, want the could-not-check line", got.content)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GetDiagnosticsCanonical blocked on the writerless FIFO leaf; want the could-not-check line")
 	}
 }
 

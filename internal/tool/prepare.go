@@ -13,7 +13,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/safefs"
-	"golang.org/x/sys/unix"
 )
 
 // PreparedTarget is one canonical target bound during preparation. The
@@ -284,7 +283,7 @@ func prepareRead(root string, cfg config.ToolsConfig, tracker *FileTracker, args
 		if _, err := ensureRegularExistingTarget(binding.canonical); err != nil {
 			return "", fmt.Errorf("read_file: %w", err)
 		}
-		f, err := safefs.OpenExisting(binding.canonical, os.O_RDONLY|unix.O_NONBLOCK)
+		f, err := safefs.OpenExisting(binding.canonical, os.O_RDONLY)
 		if err != nil {
 			if os.IsNotExist(err) {
 				// Suggestions run only when preparation observed the leaf

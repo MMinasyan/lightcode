@@ -9,7 +9,6 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/safefs"
-	"golang.org/x/sys/unix"
 )
 
 // applyPatchApplyAtRoot is the params-map entry the legacy wrapper uses: it
@@ -617,11 +616,11 @@ func buildPartialSummary(committed []appliedOp) string {
 }
 
 // readFileBytes reads the entire file at canonicalPath with O_NOFOLLOW and
-// O_NONBLOCK and returns the raw bytes. Used by the Update/Move path to
+// returns the raw bytes. Used by the Update/Move path to
 // read the file's current content; raw bytes (including \r) ride through
 // unchanged.
 func readFileBytes(canonicalPath string) ([]byte, error) {
-	f, err := safefs.OpenExisting(canonicalPath, os.O_RDONLY|unix.O_NONBLOCK)
+	f, err := safefs.OpenExisting(canonicalPath, os.O_RDONLY)
 	if err != nil {
 		return nil, err
 	}

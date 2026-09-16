@@ -27,7 +27,9 @@ func OpenExisting(path string, flag int) (*os.File, error) {
 		return nil, err
 	}
 	defer closeFD(parent)
-	fd, err := unix.Openat(parent, base, flag|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	// O_NONBLOCK is a no-op on regular files and prevents a writerless FIFO
+	// leaf from blocking the openat; requireRegularFD then rejects it.
+	fd, err := unix.Openat(parent, base, flag|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, &os.PathError{Op: "openat", Path: path, Err: err}
 	}
