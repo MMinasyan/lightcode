@@ -9,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -51,6 +52,34 @@ func TestOpenForWriteCreatesParentsAndRefusesSymlinkParent(t *testing.T) {
 	if err == nil {
 		f.Close()
 		t.Fatal("OpenForWrite succeeded through symlink parent")
+	}
+}
+
+// A writerless FIFO must not block the leaf openat: the O_NONBLOCK open
+// settles immediately and requireRegularFD rejects the leaf.
+func TestOpenExistingWriterlessFIFORejectedWithoutBlocking(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fifo")
+	if err := unix.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		f, err := OpenExisting(path, os.O_RDONLY)
+		if err == nil {
+			f.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("OpenExisting succeeded on writerless FIFO leaf")
+		}
+		if !errors.Is(err, ErrNonRegular) {
+			t.Fatalf("OpenExisting writerless FIFO err = %v, want ErrNonRegular", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OpenExisting blocked on writerless FIFO; want immediate ErrNonRegular")
 	}
 }
 

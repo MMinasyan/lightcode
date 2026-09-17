@@ -49,15 +49,19 @@ func (r *Runtime) startMaintenance(ticks <-chan time.Time, stopTicker func()) {
 // sweep, converts each positive day count into its checked 24-hour
 // threshold and leaves a nonpositive count at zero so the Harness disables
 // only that transition, and calls Harness.Sweep with the explicit time on
-// the Runtime-owned context through the ordinary admitted-call gate. The
-// diagnostic decision is sampled once after the pass returns: a failure
-// while the owned context is live is reported through the retained stderr
-// diagnostic unless the admission gate returned ErrClosed, and once shutdown
-// is observed the pass stays quiet, accepting that an unrelated failure
-// concurrent with shutdown may go unlogged. A context-valued source error
-// against a live owner is an ordinary failure too. Later cancellation never
-// retracts a report the check already admitted. No special event, startup
-// failure, or immediate retry follows a failed pass.
+// the Runtime-owned context through the ordinary admitted-call gate. Every
+// committed deleted identity's artifact tree is removed inside the same
+// admission — including successes collected before a pass failure — and
+// cleanup failures join the pass result, so one diagnostic reports
+// everything. The diagnostic decision is sampled once after the pass
+// returns: a failure while the owned context is live is reported through the
+// retained stderr diagnostic unless the admission gate returned ErrClosed,
+// and once shutdown is observed the pass stays quiet, accepting that an
+// unrelated failure concurrent with shutdown may go unlogged. A
+// context-valued source error against a live owner is an ordinary failure
+// too. Later cancellation never retracts a report the check already
+// admitted. No special event, startup failure, or immediate retry follows a
+// failed pass, and a failed cleanup never re-runs the committed deletion.
 func (r *Runtime) runSweepPass(ctx context.Context, now time.Time) {
 	sessions := r.config.current().sessions
 	if !sessions.AutoArchive {
@@ -68,7 +72,14 @@ func (r *Runtime) runSweepPass(ctx context.Context, now time.Time) {
 		DeleteAfterArchive: sweepThreshold(sessions.DeleteAfterArchiveDays),
 	}
 	err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		return h.Sweep(ctx, policy, now)
+		ids, passErr := h.Sweep(ctx, policy, now)
+		var cleanErrs []error
+		for _, id := range ids {
+			if err := r.removeSessionCode(id); err != nil {
+				cleanErrs = append(cleanErrs, err)
+			}
+		}
+		return errors.Join(append([]error{passErr}, cleanErrs...)...)
 	})
 	if err != nil && ctx.Err() == nil && !errors.Is(err, ErrClosed) {
 		fmt.Fprintf(os.Stderr, "lightcode: sweep: %v\n", err)

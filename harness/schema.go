@@ -69,6 +69,7 @@ type EffectKind string
 const (
 	EffectModel EffectKind = "model"
 	EffectTool  EffectKind = "tool"
+	EffectHook  EffectKind = "hook"
 )
 
 // SignalKind is the closed kind of one durable signal entry. The signal kind
@@ -125,17 +126,23 @@ type UsageTotals struct {
 // ExecutionCapture is the complete non-secret configuration required to
 // interpret one Operation: the stable configuration revision, the complete
 // model identity, the system prompt, the advertised tool definitions in
-// preserved order, and the selected capability names in preserved order.
-// Capability names are validated for shape only: no plugin is loaded to
-// read a historical capture. No resolved secret, callback, plugin value,
-// permission representation, retry policy, or arbitrary plugin JSON is
-// durable.
+// preserved order, the selected capability names in preserved order, and the
+// Agent definition's permission capability constraints. Readonly and WriteDir
+// are the configured lexical constraint copied from the one Harness-selected
+// definition; WriteDir is already trimmed at projection and stays unchanged in
+// the capture. The captured ConfigurationRevision also identifies the
+// governing permission policy; no rules are durable. Capability names are
+// validated for shape only: no plugin is loaded to read a historical capture.
+// No resolved secret, callback, plugin value, permission representation,
+// retry policy, or arbitrary plugin JSON is durable.
 type ExecutionCapture struct {
 	ConfigurationRevision string                 `json:"configuration_revision"`
 	Model                 model.ModelRef         `json:"model"`
 	SystemPrompt          string                 `json:"system_prompt"`
 	Tools                 []model.ToolDefinition `json:"tools"`
 	Capabilities          []string               `json:"capabilities,omitempty"`
+	Readonly              bool                   `json:"readonly"`
+	WriteDir              string                 `json:"write_dir"`
 }
 
 // SessionIdentity is the immutable identity section of one Session register.
@@ -182,12 +189,15 @@ type OperationAdmission struct {
 }
 
 // ActiveEffect names the one in-flight effect of a running Operation and the
-// entry reserved for its result. A model effect omits the tool-call ID; a
-// tool effect requires it and addresses the matching first pending call.
+// entry reserved for its result. A model effect omits the tool-call and hook
+// IDs; a tool effect requires the tool-call ID and addresses the matching
+// first pending call; a hook effect requires both the hook ID and the
+// tool-call ID of the first pending call it runs for.
 type ActiveEffect struct {
 	Kind          EffectKind `json:"kind"`
 	ResultEntryID string     `json:"result_entry_id"`
 	ToolCallID    string     `json:"tool_call_id,omitempty"`
+	HookID        string     `json:"hook_id,omitempty"`
 }
 
 // PendingToolCall is one unresolved published tool call: the assistant entry
@@ -271,7 +281,9 @@ type assistantEntry struct {
 }
 
 // toolResultEntry is one settled tool result answering a published call by
-// its reserved identity.
+// its reserved identity. Metadata is the tool-owned raw-JSON member the
+// Harness preserves opaquely within its well-formedness and size bound; it is
+// absent on synthetic results and never reaches the model-visible result.
 type toolResultEntry struct {
 	SessionID      string                 `json:"session_id"`
 	EntryID        string                 `json:"entry_id"`
@@ -280,6 +292,33 @@ type toolResultEntry struct {
 	ToolCallID     string                 `json:"tool_call_id"`
 	Status         model.ToolResultStatus `json:"status"`
 	Content        string                 `json:"content"`
+	Metadata       json.RawMessage        `json:"metadata,omitempty"`
+}
+
+// hookResultStatus is the closed status of one settled argument-hook
+// execution.
+type hookResultStatus string
+
+const (
+	hookSucceeded   hookResultStatus = "success"
+	hookFailed      hookResultStatus = "error"
+	hookInterrupted hookResultStatus = "interrupted"
+)
+
+// hookResultEntry is one settled argument-hook execution: the independent
+// immutable historical evidence of one hook's outcome for one tool call,
+// under the executing effect's own reserved identity — never a conversation
+// message. Success carries the one normalized replacement object and no
+// error; every other status carries a non-empty error and no arguments.
+type hookResultEntry struct {
+	SessionID   string           `json:"session_id"`
+	EntryID     string           `json:"entry_id"`
+	OperationID string           `json:"operation_id"`
+	HookID      string           `json:"hook_id"`
+	ToolCallID  string           `json:"tool_call_id"`
+	Status      hookResultStatus `json:"status"`
+	Arguments   json.RawMessage  `json:"arguments,omitempty"`
+	Error       string           `json:"error,omitempty"`
 }
 
 // signalEntry is one durable control signal. Its related source Operation is

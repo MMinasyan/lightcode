@@ -146,6 +146,24 @@ func validSettlementEntry() operationSettlementEntry {
 	}
 }
 
+func validHookResultEntry(status hookResultStatus) hookResultEntry {
+	v := hookResultEntry{
+		SessionID:   testSessionID,
+		EntryID:     testEntryID,
+		OperationID: testOpID,
+		HookID:      "cap.hook.one",
+		ToolCallID:  "call-1",
+		Status:      status,
+	}
+	switch status {
+	case hookSucceeded:
+		v.Arguments = json.RawMessage(`{"x":1}`)
+	default:
+		v.Error = "hook broke"
+	}
+	return v
+}
+
 // --- wire mutation helpers --------------------------------------------------
 
 func wireObject(t *testing.T, raw json.RawMessage) map[string]json.RawMessage {
@@ -243,6 +261,22 @@ func TestEntryPayloadRoundTrip(t *testing.T) {
 			decode: func(env Entry) error { _, err := decodeSignalEntry(env); return err },
 		},
 		{
+			name: "hook_result success",
+			env:  Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryHookResult, Sequence: 1, CommittedAt: testTime},
+			encode: func() (json.RawMessage, error) {
+				return encodeHookResultEntry(validHookResultEntry(hookSucceeded))
+			},
+			decode: func(env Entry) error { _, err := decodeHookResultEntry(env); return err },
+		},
+		{
+			name: "hook_result interrupted",
+			env:  Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryHookResult, Sequence: 1, CommittedAt: testTime},
+			encode: func() (json.RawMessage, error) {
+				return encodeHookResultEntry(validHookResultEntry(hookInterrupted))
+			},
+			decode: func(env Entry) error { _, err := decodeHookResultEntry(env); return err },
+		},
+		{
 			name: "operation_settlement",
 			env:  Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryOperationSettlement, Sequence: 1, CommittedAt: testTime},
 			encode: func() (json.RawMessage, error) {
@@ -310,6 +344,13 @@ func TestEntryPayloadRejectsInvalidWire(t *testing.T) {
 			wrongValue: json.RawMessage(`[]`),
 			payload:    func() (json.RawMessage, error) { return encodeSignalEntry(validSignalEntry(testOpID)) },
 			decode:     func(env Entry) error { _, err := decodeSignalEntry(env); return err },
+		},
+		{
+			name:       "hook_result",
+			container:  "status",
+			wrongValue: json.RawMessage(`[]`),
+			payload:    func() (json.RawMessage, error) { return encodeHookResultEntry(validHookResultEntry(hookSucceeded)) },
+			decode:     func(env Entry) error { _, err := decodeHookResultEntry(env); return err },
 		},
 		{
 			name:       "operation_settlement",
@@ -388,6 +429,149 @@ func TestEntryPayloadOperationlessRules(t *testing.T) {
 	env.Payload = forced
 	if _, err := decodeAssistantEntry(env); err == nil {
 		t.Fatalf("operationless assistant with stored usage must be rejected")
+	}
+}
+
+// TestHookResultStatusRules proves the hook-result status-owned member rules:
+// success requires exactly one complete JSON object argument and forbids an
+// error; error and interrupted require a non-empty error and forbid
+// arguments; unknown statuses reject; and a hook result without an owning
+// Operation identity rejects.
+func TestHookResultStatusRules(t *testing.T) {
+	t.Run("success rules", func(t *testing.T) {
+		if _, err := encodeHookResultEntry(validHookResultEntry(hookSucceeded)); err != nil {
+			t.Fatalf("encode valid success: %v", err)
+		}
+		nonObject := validHookResultEntry(hookSucceeded)
+		nonObject.Arguments = json.RawMessage(`[1,2]`)
+		if _, err := encodeHookResultEntry(nonObject); err == nil {
+			t.Fatalf("array arguments must reject")
+		}
+		nullArguments := validHookResultEntry(hookSucceeded)
+		nullArguments.Arguments = json.RawMessage(`null`)
+		if _, err := encodeHookResultEntry(nullArguments); err == nil {
+			t.Fatalf("null arguments must reject")
+		}
+		withError := validHookResultEntry(hookSucceeded)
+		withError.Error = "boom"
+		if _, err := encodeHookResultEntry(withError); err == nil {
+			t.Fatalf("success with an error must reject")
+		}
+	})
+	t.Run("failure and interruption rules", func(t *testing.T) {
+		for _, status := range []hookResultStatus{hookFailed, hookInterrupted} {
+			if _, err := encodeHookResultEntry(validHookResultEntry(status)); err != nil {
+				t.Fatalf("encode valid %s: %v", status, err)
+			}
+			empty := validHookResultEntry(status)
+			empty.Error = ""
+			if _, err := encodeHookResultEntry(empty); err == nil {
+				t.Fatalf("%s without an error must reject", status)
+			}
+			withArguments := validHookResultEntry(status)
+			withArguments.Arguments = json.RawMessage(`{}`)
+			if _, err := encodeHookResultEntry(withArguments); err == nil {
+				t.Fatalf("%s with arguments must reject", status)
+			}
+		}
+	})
+	t.Run("unknown status", func(t *testing.T) {
+		if _, err := encodeHookResultEntry(validHookResultEntry("ok")); err == nil {
+			t.Fatalf("unknown status must reject")
+		}
+	})
+	t.Run("decode-side rejections", func(t *testing.T) {
+		raw, err := encodeHookResultEntry(validHookResultEntry(hookSucceeded))
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		for _, mutation := range []struct {
+			name    string
+			payload json.RawMessage
+		}{
+			{"empty hook id", setKey(raw, "hook_id", json.RawMessage(`""`))},
+			{"missing hook id", setKey(raw, "hook_id", nil)},
+			{"empty call id", setKey(raw, "tool_call_id", json.RawMessage(`""`))},
+			{"missing operation", setKey(raw, "operation_id", nil)},
+			{"arguments swapped onto failure", func() json.RawMessage {
+				failed := validHookResultEntry(hookFailed)
+				failedRaw, err := encodeHookResultEntry(failed)
+				if err != nil {
+					t.Fatalf("encode failed: %v", err)
+				}
+				return setKey(failedRaw, "arguments", json.RawMessage(`{}`))
+			}()},
+		} {
+			t.Run(mutation.name, func(t *testing.T) {
+				env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryHookResult, Sequence: 1, CommittedAt: testTime, Payload: mutation.payload}
+				if _, err := decodeHookResultEntry(env); err == nil {
+					t.Fatalf("expected rejection")
+				}
+			})
+		}
+	})
+}
+
+// TestHookActiveEffectCodecRules proves the active-effect codec rules: a hook
+// effect requires its hook ID and the matching first pending call, while the
+// model and tool effects forbid a hook ID.
+func TestHookActiveEffectCodecRules(t *testing.T) {
+	op := validOperationRecord()
+	assistant := validAssistantEntry(testOpID)
+	call := validToolCallRecord()
+	call.ResultEntryID = testResultID
+	assistant.ToolCalls = []toolCallRecord{call}
+	op.State.PendingToolCalls = []PendingToolCall{{
+		AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: testEntryID},
+		CallID:         "call-1",
+		ResultEntryID:  testResultID,
+	}}
+
+	valid := op
+	valid.State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one"}
+	if _, err := encodeOperationRegister(valid); err != nil {
+		t.Fatalf("encode valid hook effect: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		effect  ActiveEffect
+		wantErr string
+	}{
+		{"hook effect without a hook id", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1"}, "hook active effect requires its hook id"},
+		{"hook effect without a tool call id", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), HookID: "cap.hook.one"}, "hook active effect requires its tool call id"},
+		{"hook effect on a non-pending call", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-9", HookID: "cap.hook.one"}, "hook active effect must address the matching first pending call"},
+		{"model effect with a hook id", ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(9), HookID: "cap.hook.one"}, "model active effect omits the hook id"},
+		{"tool effect with a hook id", ActiveEffect{Kind: EffectTool, ResultEntryID: testResultID, ToolCallID: "call-1", HookID: "cap.hook.one"}, "tool active effect omits the hook id"},
+		{"unknown kind", ActiveEffect{Kind: "widget", ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one"}, `active effect kind "widget" is not one of model, tool or hook`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := op
+			bad.State.ActiveEffect = &tc.effect
+			if _, err := encodeOperationRegister(bad); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("encode = %v, want %q", err, tc.wantErr)
+			}
+			// decode-side: the persisted active_effect member with the same
+			// shape rejects through decodeOperationRegister; a null hook_id
+			// member (absence encodes by omission) rejects too.
+			raw, err := encodeOperationRegister(op)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			effectJSON, merr := json.Marshal(tc.effect)
+			if merr != nil {
+				t.Fatalf("marshal effect: %v", merr)
+			}
+			if tc.name == "hook effect without a hook id" {
+				effectJSON = json.RawMessage(`{"kind":"hook","result_entry_id":"` + hexID(9) + `","tool_call_id":"call-1","hook_id":null}`)
+			}
+			stateObj := mustState(t, raw)
+			patchedState := setKey(stateObj, "active_effect", effectJSON)
+			full := setKey(raw, "state", patchedState)
+			if _, err := decodeOperationRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: full}); err == nil {
+				t.Fatalf("expected rejection of %s", tc.name)
+			}
+		})
 	}
 }
 
@@ -535,7 +719,7 @@ func TestRegisterPayloadRejectsInvalidWire(t *testing.T) {
 		{"miscased key", renameKey(opRaw, "admission", "Admission")},
 		{"null admission", setKey(opRaw, "admission", json.RawMessage(`null`))},
 		{"wrong state container", setKey(opRaw, "state", json.RawMessage(`[]`))},
-		{"operation mismatch", setKey(opRaw, "admission", json.RawMessage(`{"session_id":"`+testSessionID+`","operation_id":"ghost","request_kind":"message","admitted_entry":{"session_id":"`+testSessionID+`","entry_id":"`+hexID(1)+`"},"agent_type":"coder","execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},"system_prompt":"system","tools":[]},"admitted_at":"2026-01-02T03:04:05.123456789Z"}`))},
+		{"operation mismatch", setKey(opRaw, "admission", json.RawMessage(`{"session_id":"`+testSessionID+`","operation_id":"ghost","request_kind":"message","admitted_entry":{"session_id":"`+testSessionID+`","entry_id":"`+hexID(1)+`"},"agent_type":"coder","execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},"system_prompt":"system","tools":[],"readonly":false,"write_dir":""},"admitted_at":"2026-01-02T03:04:05.123456789Z"}`))},
 	}
 	for _, m := range opMutations {
 		t.Run("operation/"+m.name, func(t *testing.T) {
@@ -721,6 +905,170 @@ func TestToolCallNormalizedArgumentsNullRejected(t *testing.T) {
 	}
 	if string(decoded.ToolCalls[0].NormalizedArguments) != `{"x":1}` {
 		t.Fatalf("normalized_arguments round-tripped as %s", decoded.ToolCalls[0].NormalizedArguments)
+	}
+}
+
+// TestToolCallNormalizedArgumentsObjectOnly proves the normalized_arguments
+// member is one complete JSON object on both codec sides: a persisted
+// non-object member (an array representative — every wrong kind fails the
+// same object check) is rejected by decode, so it surfaces as Session
+// corruption and never reaches the tool boundary as executable input, and
+// rejected by encode with the invalid-input class. The explicit null case is
+// shared with TestToolCallNormalizedArgumentsNullRejected.
+func TestToolCallNormalizedArgumentsObjectOnly(t *testing.T) {
+	const wrong = `[1,2]`
+	entry := validAssistantEntry(testOpID)
+	call := validToolCallRecord()
+	call.NormalizedArguments = json.RawMessage(wrong)
+	entry.ToolCalls = []toolCallRecord{call}
+	if _, err := encodeAssistantEntry(entry); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("encode normalized_arguments %s = %v, want the ErrInvalid class", wrong, err)
+	}
+
+	// decode side: rewrite one valid encoded payload's member to the wrong
+	// kind and prove decode rejects it.
+	valid := validAssistantEntry(testOpID)
+	vcall := validToolCallRecord()
+	vcall.NormalizedArguments = json.RawMessage(`{"x":1}`)
+	valid.ToolCalls = []toolCallRecord{vcall}
+	raw, err := encodeAssistantEntry(valid)
+	if err != nil {
+		t.Fatalf("encode valid assistant: %v", err)
+	}
+	obj := map[string]json.RawMessage{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("encoded payload is not an object: %v", err)
+	}
+	items := []map[string]json.RawMessage{}
+	if err := json.Unmarshal(obj["tool_calls"], &items); err != nil || len(items) != 1 {
+		t.Fatalf("encoded tool_calls = %s (%v)", obj["tool_calls"], err)
+	}
+	items[0]["normalized_arguments"] = json.RawMessage(wrong)
+	edited, err := json.Marshal(items)
+	if err != nil {
+		t.Fatalf("marshal edited tool_calls: %v", err)
+	}
+	obj["tool_calls"] = edited
+	out, err := json.Marshal(obj)
+	if err != nil {
+		t.Fatalf("marshal edited payload: %v", err)
+	}
+	env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: out}
+	if _, err := decodeAssistantEntry(env); err == nil {
+		t.Fatalf("decode normalized_arguments %s must fail", wrong)
+	}
+}
+
+// TestToolResultMetadataRules proves the durable metadata member of one
+// tool-result payload: one well-formed bounded value round-trips byte-
+// identical into an owned copy, absence encodes by omission, and null,
+// malformed, or oversized values fail their encode with the invalid-input
+// class.
+func TestToolResultMetadataRules(t *testing.T) {
+	valid := json.RawMessage(`{"kind":"editpreview","n":[1,2]}`)
+	v := validToolResultEntry(testOpID)
+	v.Metadata = valid
+	raw, err := encodeToolResultEntry(v)
+	if err != nil {
+		t.Fatalf("encode metadata: %v", err)
+	}
+	if _, present := wireObject(t, raw)["metadata"]; !present {
+		t.Fatalf("encoded payload %s carries no metadata member", raw)
+	}
+	env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryToolResult, Payload: raw}
+	decoded, err := decodeToolResultEntry(env)
+	if err != nil {
+		t.Fatalf("decode metadata: %v", err)
+	}
+	if string(decoded.Metadata) != string(valid) {
+		t.Fatalf("metadata round-tripped as %s, want the stored bytes verbatim", decoded.Metadata)
+	}
+	decoded.Metadata[0] = '[' // mutating the decoded copy must not touch stored state
+	again, err := decodeToolResultEntry(env)
+	if err != nil {
+		t.Fatalf("second decode: %v", err)
+	}
+	if string(again.Metadata) != string(valid) {
+		t.Fatalf("metadata after mutating a decoded copy = %s, want the stored bytes", again.Metadata)
+	}
+
+	// Absence encodes by omission: no metadata member appears at all.
+	bare, err := encodeToolResultEntry(validToolResultEntry(testOpID))
+	if err != nil {
+		t.Fatalf("encode result without metadata: %v", err)
+	}
+	if _, present := wireObject(t, bare)["metadata"]; present {
+		t.Fatalf("metadata-less payload encodes the member: %s", bare)
+	}
+
+	rejected := []struct {
+		name     string
+		metadata json.RawMessage
+	}{
+		{"null metadata", json.RawMessage(`null`)},
+		{"malformed metadata", json.RawMessage(`{broken`)},
+		{"oversized metadata", json.RawMessage(`"` + strings.Repeat("x", maxToolMetadataBytes) + `"`)},
+		{"raw-at-bound metadata whose HTML-escaped durable encoding exceeds the bound", json.RawMessage(`"` + strings.Repeat("<", maxToolMetadataBytes-2) + `"`)},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			v := validToolResultEntry(testOpID)
+			v.Metadata = tc.metadata
+			if _, err := encodeToolResultEntry(v); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("encode error = %v, want the ErrInvalid class", err)
+			}
+		})
+	}
+
+	// A persisted payload that violates the member rules stays undecodable:
+	// null and oversized members are rejected, while a value exactly at the
+	// bound decodes.
+	rawValid := raw
+	if _, err := decodeToolResultEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryToolResult, Payload: rawValid}); err != nil {
+		t.Fatalf("re-decode: %v", err)
+	}
+	for _, tc := range []struct {
+		name     string
+		metadata json.RawMessage
+	}{
+		{"null", json.RawMessage(`null`)},
+		{"oversized", json.RawMessage(`"` + strings.Repeat("x", maxToolMetadataBytes+1) + `"`)},
+		{"at the bound", json.RawMessage(`"` + strings.Repeat("x", maxToolMetadataBytes-2) + `"`)},
+	} {
+		env := env
+		env.Payload = setKey(raw, "metadata", tc.metadata)
+		_, err := decodeToolResultEntry(env)
+		if tc.name == "at the bound" {
+			if err != nil {
+				t.Fatalf("metadata exactly at the bound rejected: %v", err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatalf("persisted %s metadata decoded, want rejection", tc.name)
+		}
+	}
+}
+
+// TestOwnedToolMetadataEncodedForm proves the shared owning helper returns
+// the exact durable encoding json.Marshal produces for the raw input —
+// whitespace compacts, HTML characters escape, numeric lexemes stay exact —
+// never a clone of the caller's raw bytes: the caller's buffer stays
+// unchanged and the returned bytes are independent of it.
+func TestOwnedToolMetadataEncodedForm(t *testing.T) {
+	const input = `{ "n" : [1, 1.0, 1e0, 9007199254740993], "s" : "<>&" }`
+	const want = `{"n":[1,1.0,1e0,9007199254740993],"s":"\u003c\u003e\u0026"}`
+	raw := json.RawMessage(input)
+	got := ownedToolMetadata(raw)
+	if string(got) != want {
+		t.Fatalf("owned metadata = %s, want the durable encoded bytes %s", got, want)
+	}
+	if string(raw) != input {
+		t.Fatalf("caller input changed to %s, want it unchanged", raw)
+	}
+	raw[1] = 'x' // mutating the caller's buffer cannot alter the returned bytes
+	if string(got) != want {
+		t.Fatalf("owned metadata after mutating the caller = %s, want the independent encoded bytes %s", got, want)
 	}
 }
 
@@ -1126,5 +1474,64 @@ func TestExecutionCaptureCapabilities(t *testing.T) {
 		if got, err := decodeExecutionCapture(captureWith(bad)); err == nil {
 			t.Fatalf("capabilities %s decoded to %q, want rejection", bad, got.Capabilities)
 		}
+	}
+}
+
+// TestExecutionCapturePermissionMembers pins the durable permission capability
+// members: readonly and write_dir are required members encoded always,
+// including their false and empty values, they round-trip unchanged, and a
+// capture missing either member, carrying null, or with a wrong-typed member
+// is invalid.
+func TestExecutionCapturePermissionMembers(t *testing.T) {
+	encode := func(t *testing.T, v ExecutionCapture) map[string]json.RawMessage {
+		t.Helper()
+		raw, err := encodeExecutionCapture(v)
+		if err != nil {
+			t.Fatalf("encodeExecutionCapture: %v", err)
+		}
+		members, err := decodePayloadObject(raw)
+		if err != nil {
+			t.Fatalf("decodePayloadObject: %v", err)
+		}
+		return members
+	}
+
+	explicit := encode(t, testCapture())
+	if got := string(explicit["readonly"]); got != "false" {
+		t.Fatalf("encoded readonly member = %s, want the explicit false", got)
+	}
+	if got := string(explicit["write_dir"]); got != `""` {
+		t.Fatalf("encoded write_dir member = %s, want the explicit empty string", got)
+	}
+
+	v := testCapture()
+	v.Readonly = true
+	v.WriteDir = "/w/sub"
+	decoded, err := decodeExecutionCapture(encode(t, v))
+	if err != nil {
+		t.Fatalf("decodeExecutionCapture: %v", err)
+	}
+	if decoded.Readonly != true || decoded.WriteDir != "/w/sub" {
+		t.Fatalf("round-tripped members = %v %q, want true and %q", decoded.Readonly, decoded.WriteDir, "/w/sub")
+	}
+
+	for _, mutation := range []struct {
+		name    string
+		members func(map[string]json.RawMessage)
+	}{
+		{"missing readonly", func(m map[string]json.RawMessage) { delete(m, "readonly") }},
+		{"missing write_dir", func(m map[string]json.RawMessage) { delete(m, "write_dir") }},
+		{"null readonly", func(m map[string]json.RawMessage) { m["readonly"] = json.RawMessage("null") }},
+		{"null write_dir", func(m map[string]json.RawMessage) { m["write_dir"] = json.RawMessage("null") }},
+		{"string readonly", func(m map[string]json.RawMessage) { m["readonly"] = json.RawMessage(`"true"`) }},
+		{"number write_dir", func(m map[string]json.RawMessage) { m["write_dir"] = json.RawMessage(`5`) }},
+	} {
+		t.Run(mutation.name, func(t *testing.T) {
+			members := encode(t, v)
+			mutation.members(members)
+			if got, err := decodeExecutionCapture(members); err == nil {
+				t.Fatalf("capture decoded to %+v, want rejection", got)
+			}
+		})
 	}
 }

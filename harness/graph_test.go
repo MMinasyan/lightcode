@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MMinasyan/lightcode/model"
 )
 
 // graphStorage is the private Storage substitute for the validator and
@@ -282,6 +284,7 @@ type testEntry struct {
 	assistant   *assistantEntry
 	toolResult  *toolResultEntry
 	signal      *signalEntry
+	hookResult  *hookResultEntry
 	settlement  *operationSettlementEntry
 	rawOverride json.RawMessage
 }
@@ -339,6 +342,10 @@ func (g *testGraph) storage(t *testing.T) *graphStorage {
 			env.Payload = raw
 		case entry.signal != nil:
 			raw, err := encodeSignalEntry(*entry.signal)
+			mustEncode(t, err)
+			env.Payload = raw
+		case entry.hookResult != nil:
+			raw, err := encodeHookResultEntry(*entry.hookResult)
 			mustEncode(t, err)
 			env.Payload = raw
 		case entry.settlement != nil:
@@ -547,6 +554,98 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 		}
 		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
 			t.Fatalf("valid fork prefix rejected: %v", err)
+		}
+	})
+
+	t.Run("settled hook results", func(t *testing.T) {
+		fixture := validTestGraph()
+		assistant := validAssistantEntry(testOpID)
+		assistant.EntryID = hexID(2)
+		call := validToolCallRecord()
+		call.ResultEntryID = hexID(4)
+		assistant.ToolCalls = []toolCallRecord{call}
+		fixture.entries[1].assistant = &assistant
+		op := &fixture.ops[0]
+		op.State.PendingToolCalls = []PendingToolCall{{
+			AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+			CallID:         "call-1",
+			ResultEntryID:  hexID(4),
+		}}
+		first := hookResultEntry{
+			SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID,
+			HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookSucceeded,
+			Arguments: json.RawMessage(`{"x":1}`),
+		}
+		second := hookResultEntry{
+			SessionID: testSessionID, EntryID: hexID(5), OperationID: testOpID,
+			HookID: "cap.hook.two", ToolCallID: "call-1", Status: hookFailed,
+			Error: "hook broke",
+		}
+		fixture.entries = append(fixture.entries,
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &first},
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 5, CommittedAt: testTime}, hookResult: &second},
+		)
+		view, err := validateFixture(t, fixture.storage(t), testSessionID)
+		if err != nil {
+			t.Fatalf("valid hook-result shape rejected: %v", err)
+		}
+		if len(view.Entries) != 4 || view.Entries[2].HookResult == nil || view.Entries[3].HookResult == nil {
+			t.Fatalf("typed view lost the hook results: %+v", view.Entries)
+		}
+	})
+
+	t.Run("running hook effect", func(t *testing.T) {
+		fixture := validTestGraph()
+		assistant := validAssistantEntry(testOpID)
+		assistant.EntryID = hexID(2)
+		call := validToolCallRecord()
+		call.ResultEntryID = hexID(3)
+		assistant.ToolCalls = []toolCallRecord{call}
+		fixture.entries[1].assistant = &assistant
+		op := &fixture.ops[0]
+		op.State.PendingToolCalls = []PendingToolCall{{
+			AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+			CallID:         "call-1",
+			ResultEntryID:  hexID(3),
+		}}
+		op.State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one"}
+		view, err := validateFixture(t, fixture.storage(t), testSessionID)
+		if err != nil {
+			t.Fatalf("valid hook-effect shape rejected: %v", err)
+		}
+		if view.Operations[0].State.ActiveEffect == nil || view.Operations[0].State.ActiveEffect.Kind != EffectHook {
+			t.Fatalf("typed view lost the active hook effect")
+		}
+	})
+
+	t.Run("distinct hook identities containing separators", func(t *testing.T) {
+		fixture := validTestGraph()
+		assistant := validAssistantEntry(testOpID)
+		assistant.EntryID = hexID(2)
+		callOne, callTwo := validToolCallRecord(), validToolCallRecord()
+		callOne.ID, callTwo.ID = "c", "b\x00c"
+		callOne.Ordinal, callTwo.Ordinal = 0, 1
+		callOne.ResultEntryID, callTwo.ResultEntryID = hexID(4), hexID(5)
+		assistant.ToolCalls = []toolCallRecord{callOne, callTwo}
+		fixture.entries[1].assistant = &assistant
+		// Legal sequential history: the first call settles before the second
+		// call's hook runs, so the second call stays the only pending one.
+		fixture.ops[0].State.PendingToolCalls = []PendingToolCall{
+			{AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)}, CallID: "b\x00c", ResultEntryID: hexID(5)},
+		}
+		one := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "a\x00b", ToolCallID: "c", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+		two := hookResultEntry{SessionID: testSessionID, EntryID: hexID(6), OperationID: testOpID, HookID: "a", ToolCallID: "b\x00c", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+		firstResult := validToolResultEntry(testOpID)
+		firstResult.EntryID = hexID(4)
+		firstResult.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
+		firstResult.ToolCallID = "c"
+		fixture.entries = append(fixture.entries,
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &one},
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryToolResult, Sequence: 4, CommittedAt: testTime}, toolResult: &firstResult},
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(6), OperationID: testOpID, Kind: EntryHookResult, Sequence: 6, CommittedAt: testTime}, hookResult: &two},
+		)
+		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+			t.Fatalf("distinct hook identities whose joined forms collide rejected: %v", err)
 		}
 	})
 }
@@ -986,6 +1085,252 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			fixture.entries = []testEntry{
 				{env: Entry{SessionID: testSessionID, ID: hexID(1), Kind: EntryAssistant, Sequence: 1, CommittedAt: testTime}, rawOverride: withUsage},
 			}
+		}},
+		{"hook result before its publishing assistant", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(4)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{{
+				AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+				CallID:         "call-1",
+				ResultEntryID:  hexID(4),
+			}}
+			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 2, CommittedAt: testTime}, hookResult: &hook,
+			})
+		}},
+		{"hook result after its call's terminal tool result", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(3)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{{
+				AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+				CallID:         "call-1",
+				ResultEntryID:  hexID(3),
+			}}
+			result := validToolResultEntry(testOpID)
+			result.EntryID = hexID(3)
+			result.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 4, CommittedAt: testTime}, toolResult: &result,
+			})
+			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(5), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 5, CommittedAt: testTime}, hookResult: &hook,
+			})
+		}},
+		{"duplicate hook result for one call", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(4)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{{
+				AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+				CallID:         "call-1",
+				ResultEntryID:  hexID(4),
+			}}
+			first := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			second := hookResultEntry{SessionID: testSessionID, EntryID: hexID(5), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			fixture.entries = append(fixture.entries,
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &first},
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 5, CommittedAt: testTime}, hookResult: &second},
+			)
+		}},
+		{"active hook effect repeats a settled hook", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(3)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{{
+				AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+				CallID:         "call-1",
+				ResultEntryID:  hexID(3),
+			}}
+			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryHookResult, Sequence: 4, CommittedAt: testTime}, hookResult: &hook,
+			})
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one"}
+		}},
+		{"hook result answers unpublished call", func(t *testing.T, fixture *testGraph) {
+			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-9", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &hook,
+			})
+		}},
+		{"hook for a later call while an earlier call is unresolved", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			callOne, callTwo := validToolCallRecord(), validToolCallRecord()
+			callOne.ID, callTwo.ID = "call-1", "call-2"
+			callOne.Ordinal, callTwo.Ordinal = 0, 1
+			callOne.ResultEntryID, callTwo.ResultEntryID = hexID(4), hexID(5)
+			assistant.ToolCalls = []toolCallRecord{callOne, callTwo}
+			fixture.entries[1].assistant = &assistant
+			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{
+				{AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)}, CallID: "call-1", ResultEntryID: hexID(4)},
+				{AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)}, CallID: "call-2", ResultEntryID: hexID(5)},
+			}
+			later := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-2", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &later,
+			})
+		}},
+		{"hook for a later call before the earlier call's result", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			callOne, callTwo := validToolCallRecord(), validToolCallRecord()
+			callOne.ID, callTwo.ID = "call-1", "call-2"
+			callOne.Ordinal, callTwo.Ordinal = 0, 1
+			callOne.ResultEntryID, callTwo.ResultEntryID = hexID(4), hexID(5)
+			assistant.ToolCalls = []toolCallRecord{callOne, callTwo}
+			fixture.entries[1].assistant = &assistant
+			// The first call's result is committed only after the second
+			// call's hook — the pending list is consistent, so the historical
+			// first-pending ordering is the violated invariant.
+			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{
+				{AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)}, CallID: "call-2", ResultEntryID: hexID(5)},
+			}
+			later := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-2", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			lateResult := validToolResultEntry(testOpID)
+			lateResult.EntryID = hexID(4)
+			lateResult.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
+			fixture.entries = append(fixture.entries,
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &later},
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryToolResult, Sequence: 6, CommittedAt: testTime}, toolResult: &lateResult},
+			)
+		}},
+		{"hook active effect reserves a committed entry", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(3)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{{
+				AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+				CallID:         "call-1",
+				ResultEntryID:  hexID(3),
+			}}
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(1), ToolCallID: "call-1", HookID: "cap.hook.one"}
+		}},
+		{"hook active effect reserves a tool call reservation", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(3)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{{
+				AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+				CallID:         "call-1",
+				ResultEntryID:  hexID(3),
+			}}
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(3), ToolCallID: "call-1", HookID: "cap.hook.one"}
+		}},
+		{"hook result after a failed hook for the same call", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(4)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{{
+				AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+				CallID:         "call-1",
+				ResultEntryID:  hexID(4),
+			}}
+			failed := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookFailed, Error: "hook broke"}
+			later := hookResultEntry{SessionID: testSessionID, EntryID: hexID(5), OperationID: testOpID, HookID: "cap.hook.two", ToolCallID: "call-1", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			fixture.entries = append(fixture.entries,
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &failed},
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 5, CommittedAt: testTime}, hookResult: &later},
+			)
+		}},
+		{"active hook effect after a failed hook", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(3)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{{
+				AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+				CallID:         "call-1",
+				ResultEntryID:  hexID(3),
+			}}
+			failed := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookFailed, Error: "hook broke"}
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryHookResult, Sequence: 4, CommittedAt: testTime}, hookResult: &failed,
+			})
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.two"}
+		}},
+		{"active tool effect after a failed hook", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(3)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{{
+				AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+				CallID:         "call-1",
+				ResultEntryID:  hexID(3),
+			}}
+			failed := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookFailed, Error: "hook broke"}
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryHookResult, Sequence: 4, CommittedAt: testTime}, hookResult: &failed,
+			})
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectTool, ResultEntryID: hexID(3), ToolCallID: "call-1"}
+		}},
+		{"interrupted hook with an error tool result", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(3)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookInterrupted, Error: "agent interrupted"}
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryHookResult, Sequence: 4, CommittedAt: testTime}, hookResult: &hook,
+			})
+			result := validToolResultEntry(testOpID)
+			result.EntryID = hexID(3)
+			result.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
+			result.Status = model.ResultError
+			result.Content = "hook broke"
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 5, CommittedAt: testTime}, toolResult: &result,
+			})
+		}},
+		{"error hook with a success tool result", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(3)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			failed := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookFailed, Error: "hook broke"}
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryHookResult, Sequence: 4, CommittedAt: testTime}, hookResult: &failed,
+			})
+			result := validToolResultEntry(testOpID)
+			result.EntryID = hexID(3)
+			result.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 5, CommittedAt: testTime}, toolResult: &result,
+			})
 		}},
 	}
 	for _, tc := range corruptions {

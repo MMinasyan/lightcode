@@ -51,10 +51,10 @@ func TestParsePatchAddFile(t *testing.T) {
 	if len(op.hunks) != 2 {
 		t.Fatalf("hunks = %d, want 2 (one per + line)", len(op.hunks))
 	}
-	if op.hunks[0].lines[0].kind != lineAdd || op.hunks[0].lines[0].text != "hello" {
+	if op.hunks[0].lines[0].Kind != lineAdd || op.hunks[0].lines[0].Text != "hello" {
 		t.Fatalf("hunks[0] = %+v, want add/hello", op.hunks[0])
 	}
-	if op.hunks[1].lines[0].kind != lineAdd || op.hunks[1].lines[0].text != "world" {
+	if op.hunks[1].lines[0].Kind != lineAdd || op.hunks[1].lines[0].Text != "world" {
 		t.Fatalf("hunks[1] = %+v, want add/world", op.hunks[1])
 	}
 }
@@ -71,7 +71,7 @@ func TestParsePatchAddFileEmptyContentLine(t *testing.T) {
 	if len(p.ops[0].hunks) != 3 {
 		t.Fatalf("hunks = %d, want 3", len(p.ops[0].hunks))
 	}
-	if got := p.ops[0].hunks[1].lines[0].text; got != "" {
+	if got := p.ops[0].hunks[1].lines[0].Text; got != "" {
 		t.Fatalf("hunks[1] text = %q, want empty (a bare + line is an empty content line)", got)
 	}
 }
@@ -103,10 +103,10 @@ func TestParsePatchUpdateFile(t *testing.T) {
 		t.Fatalf("hunk anchor = %q, want func Foo", h.anchor)
 	}
 	want := []hunkLine{
-		{kind: lineContext, text: "ctx"},
-		{kind: lineRemove, text: "old"},
-		{kind: lineAdd, text: "new"},
-		{kind: lineContext, text: "ctx2"},
+		{Kind: lineContext, Text: "ctx"},
+		{Kind: lineRemove, Text: "old"},
+		{Kind: lineAdd, Text: "new"},
+		{Kind: lineContext, Text: "ctx2"},
 	}
 	if len(h.lines) != len(want) {
 		t.Fatalf("hunk lines = %d, want %d", len(h.lines), len(want))
@@ -219,11 +219,11 @@ func TestParsePatchPreservesPrefixCharactersInContent(t *testing.T) {
 	}
 	want := []string{"++counter", "--option", " indented"}
 	for i, h := range p.ops[0].hunks {
-		if h.lines[0].kind != lineAdd {
-			t.Fatalf("hunks[%d] kind = %d, want lineAdd", i, h.lines[0].kind)
+		if h.lines[0].Kind != lineAdd {
+			t.Fatalf("hunks[%d] kind = %d, want lineAdd", i, h.lines[0].Kind)
 		}
-		if h.lines[0].text != want[i] {
-			t.Fatalf("hunks[%d] text = %q, want %q", i, h.lines[0].text, want[i])
+		if h.lines[0].Text != want[i] {
+			t.Fatalf("hunks[%d] text = %q, want %q", i, h.lines[0].Text, want[i])
 		}
 	}
 }
@@ -237,10 +237,10 @@ func TestParsePatchPreservesRawCR(t *testing.T) {
 	if len(p.ops[0].hunks) != 2 {
 		t.Fatalf("hunks = %d, want 2", len(p.ops[0].hunks))
 	}
-	if got := p.ops[0].hunks[0].lines[0].text; got != "line1\r" {
+	if got := p.ops[0].hunks[0].lines[0].Text; got != "line1\r" {
 		t.Fatalf("hunks[0] text = %q, want %q (\\r must ride inside the line)", got, "line1\r")
 	}
-	if got := p.ops[0].hunks[1].lines[0].text; got != "line2\r" {
+	if got := p.ops[0].hunks[1].lines[0].Text; got != "line2\r" {
 		t.Fatalf("hunks[1] text = %q, want %q", got, "line2\r")
 	}
 }
@@ -257,8 +257,8 @@ func TestParsePatchPreservesCRInUpdateHunk(t *testing.T) {
 		t.Fatalf("hunk lines = %d, want %d", len(h.lines), len(want))
 	}
 	for i, l := range h.lines {
-		if l.text != want[i] {
-			t.Fatalf("hunk lines[%d] text = %q, want %q", i, l.text, want[i])
+		if l.Text != want[i] {
+			t.Fatalf("hunk lines[%d] text = %q, want %q", i, l.Text, want[i])
 		}
 	}
 }

@@ -84,7 +84,7 @@ func (m *Manager) startServer(ctx context.Context, def *server.Definition) {
 	}
 	binary := server.ResolveBinary(m.home, def)
 	if binary == "" {
-		if err := m.install(def); err != nil {
+		if err := m.install(ctx, def); err != nil {
 			m.emitWarning("lsp_install_failed",
 				fmt.Sprintf("Failed to install %s language server: %v", def.Name, err))
 			m.emitSignal(fmt.Sprintf("The %s language server could not be installed (%v). "+
@@ -101,7 +101,7 @@ func (m *Manager) startServer(ctx context.Context, def *server.Definition) {
 		}
 	}
 
-	inst := newInstance(def, m.projectRoot, m.home, func(name string) {
+	inst := newInstance(def, m.projectRoot, m.home, ctx, func(name string) {
 		m.emitWarning("lsp_server_unavailable",
 			fmt.Sprintf("Language server %s has crashed repeatedly and is unavailable.", name))
 		m.emitSignal(fmt.Sprintf("The %s language server is unavailable due to repeated crashes. "+
@@ -192,7 +192,7 @@ func (m *Manager) ShutdownAll() {
 	}
 }
 
-func (m *Manager) install(def *server.Definition) error {
+func (m *Manager) install(ctx context.Context, def *server.Definition) error {
 	if def.Install == nil {
 		return fmt.Errorf("%s must be installed via your system package manager (apt, dnf, pacman, brew, etc.)", def.Name)
 	}
@@ -200,7 +200,7 @@ func (m *Manager) install(def *server.Definition) error {
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		return err
 	}
-	return def.Install(cacheDir)
+	return def.Install(ctx, cacheDir)
 }
 
 func (m *Manager) emitWarning(kind, message string) {

@@ -19,6 +19,10 @@ var ErrDenied = errors.New("denied by user")
 type ExitError struct {
 	Output   string
 	ExitCode int
+	// Cancelled marks the runner's delivered-cause cancellation: the parent
+	// cause killed the run before it could settle. Own timeouts and signal
+	// deaths the runner merely observed stay unflagged.
+	Cancelled bool
 }
 
 func (e *ExitError) Error() string { return e.Output }

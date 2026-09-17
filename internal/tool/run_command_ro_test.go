@@ -187,7 +187,7 @@ func TestReadOnlyRunCommandRejectsUnsafeCommands(t *testing.T) {
 	for _, command := range tests {
 		t.Run(command, func(t *testing.T) {
 			_, err := tool.Execute(context.Background(), map[string]any{"command": command})
-			if err == nil || err.Error() != readOnlyRunCommandRejected {
+			if err == nil || err.Error() != ReadOnlyRunCommandRejected {
 				t.Fatalf("Execute(%q) error = %v, want read-only rejection", command, err)
 			}
 		})
@@ -201,7 +201,7 @@ func TestReadOnlyRunCommandRejectsWithoutEchoingCommand(t *testing.T) {
 	if err == nil {
 		t.Fatal("Execute succeeded, want rejection")
 	}
-	if err.Error() != readOnlyRunCommandRejected {
+	if err.Error() != ReadOnlyRunCommandRejected {
 		t.Fatalf("Execute error = %q, want decision text", err.Error())
 	}
 	if strings.Contains(err.Error(), "very-specific-rejected-command") {

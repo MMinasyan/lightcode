@@ -16,6 +16,7 @@ type graphEntry struct {
 	Assistant  *assistantEntry
 	ToolResult *toolResultEntry
 	Signal     *signalEntry
+	HookResult *hookResultEntry
 	Settlement *operationSettlementEntry
 }
 
@@ -120,8 +121,8 @@ func validateSessionGraph(ctx context.Context, store Storage, sessionID string) 
 }
 
 // decodeGraphEntry decodes one entry envelope according to its kind. The
-// landed hook_result and compaction kinds have no valid Phase 3 payload, so a
-// stored record of either kind is corruption; unknown kinds are too.
+// landed compaction kind has no valid Phase 3 payload, so a stored record of
+// that kind is corruption; unknown kinds are too.
 func decodeGraphEntry(sessionID string, env Entry) (graphEntry, error) {
 	entry := graphEntry{Envelope: env}
 	var err error
@@ -146,12 +147,17 @@ func decodeGraphEntry(sessionID string, env Entry) (graphEntry, error) {
 		if v, err = decodeSignalEntry(env); err == nil {
 			entry.Signal = &v
 		}
+	case EntryHookResult:
+		var v hookResultEntry
+		if v, err = decodeHookResultEntry(env); err == nil {
+			entry.HookResult = &v
+		}
 	case EntryOperationSettlement:
 		var v operationSettlementEntry
 		if v, err = decodeOperationSettlementEntry(env); err == nil {
 			entry.Settlement = &v
 		}
-	case EntryHookResult, EntryCompaction:
+	case EntryCompaction:
 		return graphEntry{}, corruptSession(sessionID, "entry %s: kind %q has no durable payload in this phase", env.ID, env.Kind)
 	default:
 		return graphEntry{}, corruptSession(sessionID, "entry %s: unknown kind %q", env.ID, env.Kind)
@@ -302,6 +308,14 @@ type publishedReservation struct {
 	operationID      string
 }
 
+// hookExecution is one comparable hook-execution identity: the hook ID and
+// the tool call it executed for. A two-string key keeps legal identifier
+// contents from ever colliding.
+type hookExecution struct {
+	hookID string
+	callID string
+}
+
 // collectReservations builds the one session-wide reservation index from
 // every committed assistant entry, owned or copied: two calls reserving one
 // result identity anywhere in the Session is corruption. Per-operation
@@ -447,6 +461,10 @@ func (v *graphValidation) validateOperation(op *OperationRecord) error {
 	if err != nil {
 		return err
 	}
+	settledHooks, hookStatus, err := v.collectHookResults(opID, published)
+	if err != nil {
+		return err
+	}
 
 	if op.State.Status == OperationRunning {
 		if err := v.validatePendingCalls(opID, published, resultCount, op.State.PendingToolCalls); err != nil {
@@ -457,20 +475,39 @@ func (v *graphValidation) validateOperation(op *OperationRecord) error {
 				return v.corrupt("running operation %q carries settlement entry %s", opID, entry.Envelope.ID)
 			}
 		}
-		// A model active effect reserves its result entry identity: it must
-		// stay free in the session-wide reservation index (a model effect
-		// reserving a tool call's reserved result ID is corruption) and name
-		// no committed entry, because the model result — or the consuming
-		// settlement — commits under it later. A tool effect needs no check
-		// here: the codec forces its reservation to equal the first pending
-		// call's reservation, which the assistant record already indexed.
-		if op.State.ActiveEffect != nil && op.State.ActiveEffect.Kind == EffectModel {
-			reserved := op.State.ActiveEffect.ResultEntryID
-			if prior, clash := v.reservations[reserved]; clash {
-				return v.corrupt("model active effect of operation %q reserves result identity %q already reserved by call %q of assistant entry %s", opID, reserved, prior.callID, prior.assistantEntryID)
+		// A model or hook active effect reserves a fresh result entry
+		// identity: it must stay free in the session-wide reservation index
+		// (an effect reserving a tool call's reserved result ID is
+		// corruption) and name no committed entry, because the effect's
+		// result — or the consuming settlement — commits under it later. A
+		// tool effect needs no check here: the codec forces its reservation
+		// to equal the first pending call's reservation, which the assistant
+		// record already indexed. A hook active effect additionally must not
+		// repeat an already-settled hook execution of the same call: the
+		// fresh reservation does not make a second execution valid. And no
+		// active hook or tool effect may address a call whose hook chain
+		// already failed: a failed or interrupted hook settles that call, so
+		// the concrete effect never starts.
+		if op.State.ActiveEffect != nil {
+			if op.State.ActiveEffect.Kind == EffectModel || op.State.ActiveEffect.Kind == EffectHook {
+				reserved := op.State.ActiveEffect.ResultEntryID
+				if prior, clash := v.reservations[reserved]; clash {
+					return v.corrupt("active effect of operation %q reserves result identity %q already reserved by call %q of assistant entry %s", opID, reserved, prior.callID, prior.assistantEntryID)
+				}
+				if committed, clash := v.entryByID[reserved]; clash {
+					return v.corrupt("active effect of operation %q reserves committed entry %s of kind %s", opID, committed.Envelope.ID, committed.Envelope.Kind)
+				}
+				if op.State.ActiveEffect.Kind == EffectHook {
+					execution := hookExecution{hookID: op.State.ActiveEffect.HookID, callID: op.State.ActiveEffect.ToolCallID}
+					if _, repeat := settledHooks[execution]; repeat {
+						return v.corrupt("active hook effect of operation %q repeats hook %q's settled execution of call %q", opID, execution.hookID, execution.callID)
+					}
+				}
 			}
-			if committed, clash := v.entryByID[reserved]; clash {
-				return v.corrupt("model active effect of operation %q reserves committed entry %s of kind %s", opID, committed.Envelope.ID, committed.Envelope.Kind)
+			if op.State.ActiveEffect.Kind == EffectHook || op.State.ActiveEffect.Kind == EffectTool {
+				if status, ok := hookStatus[op.State.ActiveEffect.ToolCallID]; ok && status != hookSucceeded {
+					return v.corrupt("active %s effect of operation %q addresses call %q after its failed hook", op.State.ActiveEffect.Kind, opID, op.State.ActiveEffect.ToolCallID)
+				}
 			}
 		}
 	} else {
@@ -566,6 +603,88 @@ func (v *graphValidation) collectToolResults(opID string, published []publishedC
 		counts[entry.ToolResult.ToolCallID]++
 	}
 	return counts, nil
+}
+
+// collectHookResults verifies every committed hook result of one operation:
+// it must execute a call published by that operation's assistant entries,
+// follow its publishing assistant entry, precede the call's terminal tool
+// result when one is present, and not repeat a settled hook identity for the
+// same call. Once a hook fails or is interrupted, no later hook result and no
+// active hook or tool effect may address that call, and the call's terminal
+// tool result — when one is present — must match the settled hook consequence:
+// an interrupted hook permits only the interrupted result, while a failed hook
+// permits the error or interrupted result (cancellation or recovery settles
+// the interrupted one); a running quiet gap before tool settlement stays valid
+// and recoverable. It returns the settled hook-execution set and each
+// executed call's last hook status for the active-effect checks.
+func (v *graphValidation) collectHookResults(opID string, published []publishedCall) (map[hookExecution]bool, map[string]hookResultStatus, error) {
+	byCall := make(map[string]*publishedCall, len(published))
+	for i := range published {
+		byCall[published[i].callID] = &published[i]
+	}
+	settled := make(map[hookExecution]bool, len(published))
+	lastStatus := make(map[string]hookResultStatus, len(published))
+	for _, entry := range v.graph.Entries {
+		if entry.Envelope.OperationID != opID || entry.HookResult == nil {
+			continue
+		}
+		call, ok := byCall[entry.HookResult.ToolCallID]
+		if !ok {
+			return nil, nil, v.corrupt("hook result %s executes unpublished call %q", entry.Envelope.ID, entry.HookResult.ToolCallID)
+		}
+		publisher, ok := v.entryByID[call.assistantEntryID]
+		if !ok || entry.Envelope.Sequence <= publisher.Envelope.Sequence {
+			return nil, nil, v.corrupt("hook result %s for call %q does not follow its publishing assistant entry %s", entry.Envelope.ID, call.callID, call.assistantEntryID)
+		}
+		if committed, ok := v.entryByID[call.reservedResultID]; ok && entry.Envelope.Sequence >= committed.Envelope.Sequence {
+			return nil, nil, v.corrupt("hook result %s for call %q follows that call's terminal tool result %s", entry.Envelope.ID, call.callID, committed.Envelope.ID)
+		}
+		// Historical first-pending ordering: a hook runs only while its call
+		// is the first pending call, so every earlier published call's
+		// terminal result must already be committed before this hook's
+		// sequence.
+		for _, earlier := range published {
+			if earlier.callID == call.callID {
+				break
+			}
+			committed, ok := v.entryByID[earlier.reservedResultID]
+			if !ok || committed.Envelope.Sequence >= entry.Envelope.Sequence {
+				return nil, nil, v.corrupt("hook result %s for call %q runs before the terminal result of earlier call %q", entry.Envelope.ID, call.callID, earlier.callID)
+			}
+		}
+		if failed := lastStatus[call.callID]; failed != "" && failed != hookSucceeded {
+			return nil, nil, v.corrupt("hook result %s executes call %q after that call's %s hook result", entry.Envelope.ID, call.callID, failed)
+		}
+		execution := hookExecution{hookID: entry.HookResult.HookID, callID: call.callID}
+		if settled[execution] {
+			return nil, nil, v.corrupt("hook %q executed call %q of operation %q twice", execution.hookID, execution.callID, opID)
+		}
+		settled[execution] = true
+		lastStatus[call.callID] = entry.HookResult.Status
+	}
+	// The tool result of a call whose hook chain failed must match the settled
+	// hook consequence; its absence is the valid running quiet gap recovery
+	// interrupts.
+	for callID, status := range lastStatus {
+		if status == hookSucceeded {
+			continue
+		}
+		committed, ok := v.entryByID[byCall[callID].reservedResultID]
+		if !ok || committed.ToolResult == nil {
+			continue
+		}
+		switch status {
+		case hookInterrupted:
+			if committed.ToolResult.Status != model.ResultInterrupted {
+				return nil, nil, v.corrupt("call %q of operation %q settled %s after its interrupted hook result", callID, opID, committed.ToolResult.Status)
+			}
+		case hookFailed:
+			if committed.ToolResult.Status != model.ResultError && committed.ToolResult.Status != model.ResultInterrupted {
+				return nil, nil, v.corrupt("call %q of operation %q settled %s after its failed hook result", callID, opID, committed.ToolResult.Status)
+			}
+		}
+	}
+	return settled, lastStatus, nil
 }
 
 // validatePendingCalls verifies that a running operation's pending list is

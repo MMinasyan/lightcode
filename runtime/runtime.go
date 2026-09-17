@@ -22,12 +22,36 @@ import (
 // state and invokes no factory.
 var ErrOwned = errors.New("runtime: data directory owned by another Runtime")
 
+// Options are the public construction inputs of one managed Runtime: the
+// sole data root, the main configuration path, and the complete plugin set —
+// builtin.Plugins() for the shipped registration, an ordinary custom slice
+// for a custom build.
+type Options struct {
+	DataDir    string
+	ConfigPath string
+	Plugins    []Plugin
+}
+
+// Open constructs the complete managed Runtime with concrete production
+// preparation and returns the published owner. It delegates to the private
+// lifecycle implementation, which owns every retained property: explicit
+// paths, ownership-before-I/O, config publication, recovery-before-execution,
+// one admitted-call gate, and the joined shutdown.
+func Open(ctx context.Context, opts Options) (*Runtime, error) {
+	return open(ctx, options{
+		DataDir:    opts.DataDir,
+		ConfigPath: opts.ConfigPath,
+		Plugins:    opts.Plugins,
+	})
+}
+
 // options are the private construction inputs of one managed Runtime. DataDir
 // is the sole data root: runtime.lock and the storage backend's own files
 // derive from it, while agents.json stays beside ConfigPath. Dotenv and the
 // discovery cache keep their home-based paths: neither option relocates them
 // nor changes owner identity. prepare is the controlled preparation function
-// supplied by every caller until concrete production preparation lands.
+// supplied by tests; a nil prepare selects the concrete production
+// preparation.
 // sweepTicks optionally replaces the automatic sweep scheduler's owned
 // hourly ticker with a controlled tick stream whose sends carry each pass's
 // explicit time; the zero value keeps the production time.Ticker.
@@ -52,6 +76,7 @@ type Runtime struct {
 	runtimeScope *scope
 	workspaces   *workspaceScopes
 	harness      *harness.Harness
+	dataDir      string
 
 	// mu guards only the admission transition below; it is never held across
 	// any call, wait, or I/O.
@@ -65,7 +90,7 @@ type Runtime struct {
 }
 
 // open constructs the complete owner and publishes nothing until it has
-// finished. It requires nonempty paths and a non-nil prepare, normalizes both
+// finished. It requires nonempty paths, normalizes both
 // paths once with filepath.Abs, and validates the context before any
 // initialization. Startup order is fixed: validate declarations (definitions
 // and capability declarations, including exactly one Runtime-scoped export
@@ -95,9 +120,6 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	}
 	if options.ConfigPath == "" {
 		return nil, errors.New("runtime: options.ConfigPath must be non-empty")
-	}
-	if options.prepare == nil {
-		return nil, errors.New("runtime: options.prepare must be non-nil")
 	}
 	dataDir, err := filepath.Abs(options.DataDir)
 	if err != nil {
@@ -171,7 +193,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	workspaces := newWorkspaceScopes(work, c, []*scope{runtimeScope}, obs)
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: storage,
-		Prepare: newPreparation(configService, c, runtimeScope, workspaces, options.prepare).bind(),
+		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, options.prepare).bind(),
 	})
 	if err != nil {
 		return unwind(err)
@@ -186,6 +208,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		runtimeScope: runtimeScope,
 		workspaces:   workspaces,
 		harness:      h,
+		dataDir:      dataDir,
 		shutdownDone: make(chan struct{}),
 	}
 	sweepTicks, stopSweepTicker := options.sweepTicks, func() {}
@@ -305,6 +328,31 @@ func (r *Runtime) createSession(ctx context.Context, workspace, agentType string
 		return harness.SessionRecord{}, err
 	}
 	return record, nil
+}
+
+// deleteSession is the private canonical Session deletion: the whole body
+// runs inside one admitted call, so shutdown joins the deletion and its
+// cleanup together. After Harness.DeleteSession commits — or reports the
+// Session already absent for a valid identity, the same idempotent result —
+// the Session's artifact tree is removed once. Any other Harness error
+// (invalid input, corruption, revision races, a closed admission) returns
+// as-is and authorizes no cleanup.
+func (r *Runtime) deleteSession(ctx context.Context, sessionID string) error {
+	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		err := h.DeleteSession(ctx, sessionID)
+		if err != nil && !errors.Is(err, harness.ErrNotFound) {
+			return err
+		}
+		return r.removeSessionCode(sessionID)
+	})
+}
+
+// removeSessionCode removes one Session's artifact tree under the normalized
+// data directory — its snapshots and command spills. It removes nothing else:
+// not sibling Sessions' trees, not other data-directory content. A missing
+// directory is already clean.
+func (r *Runtime) removeSessionCode(sessionID string) error {
+	return os.RemoveAll(filepath.Join(r.dataDir, "code", sessionID))
 }
 
 // Reload publishes the next configuration revision through the admitted-call

@@ -8,30 +8,60 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// modelScript is the scripted model effect of the coordination fixtures: it
-// records every projected request, signals each arrival, optionally parks
-// every invocation until its gate closes, assembles once behind every
-// output-bearing settlement, and answers from a scripted settlement list.
-type modelScript struct {
-	mu          sync.Mutex
-	requests    []model.Request
-	arrived     chan struct{}
-	gate        chan struct{}
-	settlements []agent.ModelSettlement
-	model       agent.ModelEffect
+// modelAttempt is one scripted physical attempt: the stream of the accepted
+// attempt, or its pre-acceptance failure.
+type modelAttempt struct {
+	stream model.Stream
+	err    error
 }
 
-func newModelScript(settlements ...agent.ModelSettlement) *modelScript {
-	s := &modelScript{arrived: make(chan struct{}, 16), settlements: settlements}
+// turn scripts one accepted stream assembling to the fixture completed turn
+// with the given calls.
+func turn(calls ...model.ToolCall) modelAttempt {
+	return modelAttempt{stream: completedTurnStream(calls...)}
+}
+
+// partialTurn scripts one accepted stream assembling to the fixture errored
+// partial: text "partial" with usage, then the read failure.
+func partialTurn() modelAttempt {
+	return modelAttempt{stream: erroredTurnStream()}
+}
+
+// payloadlessTurn scripts one accepted stream whose assembly errors with no
+// retained payload.
+func payloadlessTurn() modelAttempt {
+	return modelAttempt{stream: failStream(errors.New("provider failure"))}
+}
+
+// fail scripts one pre-acceptance attempt failure; its text becomes the
+// settled terminal detail.
+func fail(detail string) modelAttempt {
+	return modelAttempt{err: errors.New(detail)}
+}
+
+// modelScript is the scripted physical model request of the coordination
+// fixtures: it records every projected request, signals each arrival,
+// optionally parks every invocation until its gate closes, and answers from a
+// scripted attempt list.
+type modelScript struct {
+	mu       sync.Mutex
+	requests []model.Request
+	arrived  chan struct{}
+	gate     chan struct{}
+	attempts []modelAttempt
+	model    func(context.Context, model.Request) (model.Stream, error)
+}
+
+func newModelScript(attempts ...modelAttempt) *modelScript {
+	s := &modelScript{arrived: make(chan struct{}, 16), attempts: attempts}
 	s.model = s.invoke
 	return s
 }
 
-func (s *modelScript) invoke(_ context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+func (s *modelScript) invoke(_ context.Context, req model.Request) (model.Stream, error) {
 	s.mu.Lock()
 	s.requests = append(s.requests, req)
 	gate := s.gate
@@ -40,19 +70,14 @@ func (s *modelScript) invoke(_ context.Context, req model.Request, assemble agen
 	if gate != nil {
 		<-gate
 	}
-	var set agent.ModelSettlement
-	if len(s.settlements) > 0 {
-		set = s.settlements[0]
-		s.settlements = s.settlements[1:]
+	var next modelAttempt
+	if len(s.attempts) > 0 {
+		next = s.attempts[0]
+		s.attempts = s.attempts[1:]
 	} else {
-		set = agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}
+		next = turn()
 	}
-	if set.Output != nil { // an output-bearing settlement requires exactly one assembly
-		if err := assembleCompleted(assemble); err != nil {
-			return agent.ModelSettlement{}, err
-		}
-	}
-	return set, nil
+	return next.stream, next.err
 }
 
 func (s *modelScript) seen() []model.Request {
@@ -287,20 +312,18 @@ func TestSteeringDrainsAtModelBoundaryInFIFOOrder(t *testing.T) {
 func TestSteeringContinuationAcrossOutputShapes(t *testing.T) {
 	cases := []struct {
 		name    string
-		settle  agent.ModelSettlement
+		attempt modelAttempt
 		wantEnd OperationState
 	}{
-		{"completed output without calls", agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()}, OperationSuccess},
-		{"completed output with calls", agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith(testToolCall("call-1"))}, OperationSuccess},
-		{"errored output with payload", agent.ModelSettlement{Disposition: agent.DispoContinue, Output: erroredOutputWith()}, OperationSuccess},
-		{"errored output without payload", agent.ModelSettlement{Disposition: agent.DispoContinue, Output: &model.Output{
-			Status: model.OutputErrored, Source: testModelRef(), Detail: "provider failure",
-		}}, OperationFailure},
+		{"completed output without calls", turn(), OperationSuccess},
+		{"completed output with calls", turn(testToolCall("call-1")), OperationSuccess},
+		{"errored output with payload", partialTurn(), OperationSuccess},
+		{"errored output without payload", payloadlessTurn(), OperationFailure},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			store := emptyStore(t)
-			script := newModelScript(tc.settle)
+			script := newModelScript(tc.attempt)
 			gate := make(chan struct{})
 			script.gate = gate
 			prepared := modelPrepared(script.model)
@@ -482,9 +505,9 @@ func TestBufferedItemFailureIsFinal(t *testing.T) {
 	t.Run("failed delivered operation proceeds to the next item", func(t *testing.T) {
 		store := emptyStore(t)
 		script := newModelScript(
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()},  // turn-1
-			agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "queued turn failed"}, // q1 fails
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: completedOutputWith()},  // q2 succeeds
+			turn(),                     // turn-1
+			fail("queued turn failed"), // q1 fails
+			turn(),                     // q2 succeeds
 		)
 		gate := make(chan struct{})
 		script.gate = gate
@@ -536,14 +559,14 @@ func TestFinalBoundarySerialization(t *testing.T) {
 			first   = true
 		)
 		inner := script.model
-		script.model = func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		script.model = func(ctx context.Context, req model.Request) (model.Stream, error) {
 			if first { // submit at the model-result boundary, before the settlement returns
 				first = false
 				if _, err := submitText(t, h, session, "boundary", MessageModeRegular, "at-boundary"); err != nil {
 					t.Errorf("boundary submit: %v", err)
 				}
 			}
-			return inner(ctx, req, assemble)
+			return inner(ctx, req)
 		}
 		prepared := modelPrepared(script.model)
 		h, cancel := newCancelableHarness(t, store, prepared, nil)
@@ -575,14 +598,14 @@ func TestFinalBoundarySerialization(t *testing.T) {
 			first   = true
 		)
 		inner := script.model
-		script.model = func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		script.model = func(ctx context.Context, req model.Request) (model.Stream, error) {
 			if first { // defer one queued message at the final model-result boundary
 				first = false
 				if _, err := submitText(t, h, session, "turn-2", MessageModeQueued, "at-boundary"); err != nil {
 					t.Errorf("boundary submit: %v", err)
 				}
 			}
-			return inner(ctx, req, assemble)
+			return inner(ctx, req)
 		}
 		prepared := modelPrepared(script.model)
 		h, cancel := newCancelableHarness(t, store, prepared, nil)
@@ -728,10 +751,7 @@ func TestWaitConvergence(t *testing.T) {
 
 	t.Run("blocked tool settles before Wait returns", func(t *testing.T) {
 		store := emptyStore(t)
-		script := newModelScript(agent.ModelSettlement{
-			Disposition: agent.DispoReady,
-			Output:      completedOutputWith(testToolCall("call-1")),
-		})
+		script := newModelScript(turn(testToolCall("call-1")))
 		modelGate := make(chan struct{})
 		script.gate = modelGate
 		toolGate := make(chan struct{})
@@ -741,8 +761,8 @@ func TestWaitConvergence(t *testing.T) {
 		exec.Tool = func(context.Context, model.ToolCall) PreparedTool {
 			toolArrived <- struct{}{}
 			<-toolGate
-			return PreparedTool{Execute: func(context.Context) model.ToolResult {
-				return model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "ran"}
+			return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
+				return ToolOutcome{Result: model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "ran"}}
 			}}
 		}
 		prepared := preparedExecuting(exec)
@@ -1150,12 +1170,12 @@ func TestSessionsExecuteConcurrently(t *testing.T) {
 	second := newModelScript()
 	exec := validExecution()
 	firstModel, secondModel := first.model, second.model
-	exec.Model = func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+	exec.Model = func(ctx context.Context, req model.Request) (model.Stream, error) {
 		texts := textsOf(req)
 		if texts[len(texts)-1] == "first" {
-			return firstModel(ctx, req, assemble)
+			return firstModel(ctx, req)
 		}
-		return secondModel(ctx, req, assemble)
+		return secondModel(ctx, req)
 	}
 	prepared := preparedExecuting(exec)
 	h, cancel := newCancelableHarness(t, store, prepared, nil)

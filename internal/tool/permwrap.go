@@ -11,8 +11,15 @@ import (
 
 const canonicalPathParam = "_lightcode_canonical_path"
 
+// canonicalPathValue is the harness-internal binding transport: the
+// approved canonical target path, the lexical write-dir witness and the
+// canonical Workspace root witness bound during authorization. Model-
+// supplied string values can never satisfy the type assertion and are
+// stripped by argument normalization.
 type canonicalPathValue struct {
-	path string
+	path     string
+	writeDir string
+	root     string
 }
 
 func (canonicalPathValue) String() string {
@@ -63,22 +70,36 @@ func (p *PermWrapped) WrappedTool() Tool                { return p.inner }
 func (p *PermWrapped) Execute(ctx context.Context, params map[string]any) (string, error) {
 	// apply_patch has no path param and one approval covers the whole patch.
 	// The shared target plan drives permission checks, prompt fields, and the
-	// internal approval receipt used during execution.
+	// internal approval receipt used during execution; the patch is parsed
+	// once here and rides the receipt into execution.
 	if p.inner.Name() == "apply_patch" {
-		targets, _, agg, err := applyPatchPermissionPlanWithOptions(p.check, p.workspaceRoot, params, p.options)
+		parsed, targets, err := resolveApplyPatchTargetsWithOptions(p.workspaceRoot, params, p.options)
 		if err != nil {
 			return "", err
 		}
-		switch agg {
+		// The canonical Workspace root and the canonical write-dir boundary
+		// are bound at authorization and ride the receipt, so inner
+		// preparation after approval compares against these witnesses
+		// instead of re-binding fresh ones.
+		rootCanonical, err := bindWorkspaceRoot(p.workspaceRoot)
+		if err != nil {
+			return "", fmt.Errorf("apply_patch: resolve workspace root: %w", err)
+		}
+		writeDirCanonical, err := bindWriteDir(p.workspaceRoot, "apply_patch", p.options.WriteDir)
+		if err != nil {
+			return "", err
+		}
+		aggregate := planApplyPatchPermissions(p.check, targets)
+		switch aggregate {
 		case permission.DecisionAllow:
-			return p.inner.Execute(ctx, withApplyPatchReceipt(params, targets))
+			return p.inner.Execute(ctx, withApplyPatchReceipt(params, targets, parsed, p.options.WriteDir, writeDirCanonical, rootCanonical))
 		case permission.DecisionDeny:
 			return "", ErrDenied
 		default:
 			if p.ask != nil {
 				req := applyPatchAskRequest(targets)
 				if permissionAllows(p.ask(ctx, req)) {
-					return p.inner.Execute(ctx, withApplyPatchReceipt(params, targets))
+					return p.inner.Execute(ctx, withApplyPatchReceipt(params, targets, parsed, p.options.WriteDir, writeDirCanonical, rootCanonical))
 				}
 			}
 			return "", ErrDenied
@@ -222,12 +243,24 @@ func resolveFileToolParamsAtRootWithOptions(root, toolName string, params map[st
 	if err := checkWriteDirTarget(root, toolName, resolved.CanonicalPath, opts); err != nil {
 		return nil, err
 	}
-	return withCanonicalPathParam(cleanParams, resolved.CanonicalPath), nil
+	rootCanonical, err := bindWorkspaceRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	return withCanonicalPathWitness(cleanParams, resolved.CanonicalPath, opts.WriteDir, rootCanonical), nil
 }
 
 func withCanonicalPathParam(params map[string]any, canonicalPath string) map[string]any {
+	return withCanonicalPathWitness(params, canonicalPath, "", "")
+}
+
+// withCanonicalPathWitness injects the binding transport: the approved
+// canonical target, the lexical write-dir witness and the canonical
+// Workspace root witness bound during authorization, which the shared
+// execution closure revalidates.
+func withCanonicalPathWitness(params map[string]any, canonicalPath, writeDir, rootCanonical string) map[string]any {
 	next := withoutCanonicalPathParam(params)
-	next[canonicalPathParam] = canonicalPathValue{path: canonicalPath}
+	next[canonicalPathParam] = canonicalPathValue{path: canonicalPath, writeDir: writeDir, root: rootCanonical}
 	return next
 }
 
@@ -245,28 +278,6 @@ func withoutCanonicalPathParam(params map[string]any) map[string]any {
 func canonicalPathFromParams(params map[string]any) string {
 	canonicalPath, _ := params[canonicalPathParam].(canonicalPathValue)
 	return canonicalPath.path
-}
-
-func fileSecurityPath(params map[string]any, path string) (string, error) {
-	return fileSecurityPathAtRoot("", params, path)
-}
-
-func fileSecurityPathAtRoot(root string, params map[string]any, path string) (string, error) {
-	if canonicalPath := canonicalPathFromParams(params); canonicalPath != "" {
-		resolved, err := pathutil.ResolveFilePathFrom(root, path)
-		if err != nil {
-			return "", err
-		}
-		if resolved.CanonicalPath != canonicalPath {
-			return "", fmt.Errorf("approved canonical path changed from %s to %s", canonicalPath, resolved.CanonicalPath)
-		}
-		return canonicalPath, nil
-	}
-	resolved, err := pathutil.ResolveFilePathFrom(root, path)
-	if err != nil {
-		return "", err
-	}
-	return resolved.CanonicalPath, nil
 }
 
 func fileDisplayAbsPath(path string) (string, error) {

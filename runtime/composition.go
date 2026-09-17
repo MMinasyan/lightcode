@@ -66,10 +66,13 @@ type ScopeInfo struct {
 }
 
 // CapabilitySpec pairs one capability lookup ID with its Go type. The ID is
-// the only lookup key; type metadata never leaves the declaration.
+// the only lookup key; type metadata never leaves the declaration. A spec
+// declared as exactly the Tool interface additionally carries its pure
+// description function, recorded by ToolSpec and mandatory there.
 type CapabilitySpec struct {
-	id  string
-	typ reflect.Type
+	id       string
+	typ      reflect.Type
+	describe func(Invocation, ToolConstraints) (ToolDescription, error)
 }
 
 // Spec declares the capability contract named id for the Go type T. It serves
@@ -209,12 +212,19 @@ type coreExportDecl struct {
 // composition is the validated static plugin set: an owned declaration copy,
 // per-scope construction plans in stable topological order (registration
 // order breaks ties), the ordinary capability universe excluding Core
-// storage exports, and the storage export declarations.
+// storage exports, the tool-declaration universe feeding the agent parser,
+// and the storage export declarations.
 type composition struct {
 	plugins       []Plugin
 	plan          map[ScopeKind][]Plugin
 	capabilityIDs []string
+	toolIDs       []string
 	coreExports   []coreExportDecl
+
+	// modelAdaptation is the single export ID declared as exactly
+	// ModelAdaptation, or empty when the composition declares none. More than
+	// one is ambiguous and rejected before construction.
+	modelAdaptation string
 }
 
 // newComposition validates the complete selected plugin set before any
@@ -222,8 +232,10 @@ type composition struct {
 // at least one provider, unique nonempty export IDs globally and unique
 // nonempty dependency IDs per plugin, assignable provider types,
 // lifetime-compatible PreparationHook declarations (Runtime or Workspace
-// scope only), same-or-longer-lived dependency scopes, and an acyclic
-// dependency graph. An ordinary dependency on an ID reserved by a Core
+// scope only), Tool declarations carrying their description functions, at
+// most one ModelAdaptation export and it Runtime scoped, and
+// same-or-longer-lived dependency scopes and an acyclic dependency graph. An
+// ordinary dependency on an ID reserved by a Core
 // storage export is a plain missing binding and is rejected.
 func newComposition(plugins []Plugin) (*composition, error) {
 	owned := make([]Plugin, len(plugins))
@@ -242,7 +254,9 @@ func newComposition(plugins []Plugin) (*composition, error) {
 	ordinary := make(map[string]exportSource)
 	seenPluginIDs := make(map[string]bool)
 	var capabilityIDs []string
+	var toolIDs []string
 	var coreExports []coreExportDecl
+	var adaptationExports []string
 	for i, p := range owned {
 		if p.ID == "" {
 			return nil, fmt.Errorf("plugin %d: empty plugin ID: %w", i, ErrComposition)
@@ -274,6 +288,9 @@ func newComposition(plugins []Plugin) (*composition, error) {
 			if prov.id == "" {
 				return nil, fmt.Errorf("plugin %q: empty provided capability ID: %w", p.ID, ErrComposition)
 			}
+			if prov.typ == toolType && prov.describe == nil {
+				return nil, fmt.Errorf("plugin %q: capability %q declared as Tool lacks its description function: %w", p.ID, prov.id, ErrComposition)
+			}
 			if src, dup := all[prov.id]; dup {
 				return nil, fmt.Errorf("plugin %q: capability %q already exported by %q: %w", p.ID, prov.id, owned[src.plugin].ID, ErrComposition)
 			}
@@ -281,13 +298,25 @@ func newComposition(plugins []Plugin) (*composition, error) {
 			if prov.typ.Implements(preparationHookType) && p.Scope != ScopeRuntime && p.Scope != ScopeWorkspace {
 				return nil, fmt.Errorf("plugin %q (%s): capability %q declared as %s implements PreparationHook and requires Runtime or Workspace scope: %w", p.ID, p.Scope, prov.id, prov.typ, ErrComposition)
 			}
+			if prov.typ == modelAdaptationType && p.Scope != ScopeRuntime {
+				return nil, fmt.Errorf("plugin %q (%s): capability %q declared as %s requires Runtime scope: %w", p.ID, p.Scope, prov.id, prov.typ, ErrComposition)
+			}
 			if prov.typ == storageType {
 				coreExports = append(coreExports, coreExportDecl{plugin: p.ID, scope: p.Scope, id: prov.id})
 			} else {
 				ordinary[prov.id] = exportSource{plugin: i, spec: prov}
 				capabilityIDs = append(capabilityIDs, prov.id)
+				if prov.typ == toolType {
+					toolIDs = append(toolIDs, prov.id)
+				}
+				if prov.typ == modelAdaptationType {
+					adaptationExports = append(adaptationExports, prov.id)
+				}
 			}
 		}
+	}
+	if len(adaptationExports) > 1 {
+		return nil, fmt.Errorf("%d exports are declared as %s: %w", len(adaptationExports), modelAdaptationType, ErrComposition)
 	}
 	for _, p := range owned {
 		for _, req := range p.Requires {
@@ -351,11 +380,17 @@ func newComposition(plugins []Plugin) (*composition, error) {
 		p := owned[i]
 		plan[p.Scope] = append(plan[p.Scope], p)
 	}
+	modelAdaptation := ""
+	if len(adaptationExports) == 1 {
+		modelAdaptation = adaptationExports[0]
+	}
 	return &composition{
-		plugins:       owned,
-		plan:          plan,
-		capabilityIDs: capabilityIDs,
-		coreExports:   coreExports,
+		plugins:         owned,
+		plan:            plan,
+		capabilityIDs:   capabilityIDs,
+		toolIDs:         toolIDs,
+		coreExports:     coreExports,
+		modelAdaptation: modelAdaptation,
 	}, nil
 }
 
@@ -486,6 +521,21 @@ func registerInstance(p Plugin, values map[string]any, sc *scope, resolved, own 
 		}
 	}
 	return nil
+}
+
+// toolSpec resolves one tool ID to its composed declaration. Agent tool
+// lists are validated against the composed tool universe, so a miss cannot
+// occur in a published selection; the returned spec is the one declaration
+// the ID globally names.
+func (c *composition) toolSpec(id string) (CapabilitySpec, bool) {
+	for _, p := range c.plugins {
+		for _, spec := range p.Provides {
+			if spec.id == id && spec.typ == toolType {
+				return spec, true
+			}
+		}
+	}
+	return CapabilitySpec{}, false
 }
 
 // selectCapabilities builds an Agent's selected view from the same resolved

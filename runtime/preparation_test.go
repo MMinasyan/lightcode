@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/storage"
@@ -35,6 +34,16 @@ var (
 )
 
 var prepModelRef = model.ModelRef{Provider: "prov", Model: "m"}
+
+// runtimeNormalize is the fixtures' required pure normalizer: it accepts
+// exactly one non-null JSON object and returns its compact encoding.
+func runtimeNormalize(call model.ToolCall) (json.RawMessage, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {
+		return nil, errors.New("arguments must be one non-null JSON object")
+	}
+	return json.Marshal(obj)
+}
 
 func prepConfigDocument(tag string) string {
 	return `{
@@ -62,6 +71,8 @@ const prepAgentsDocument = `{
   "dup": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo", "echo", "read"], "capabilities": ["hook.second", "cap.other"]},
   "wide": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo", "read"], "capabilities": ["hook.first", "cap.shared", "hook.second"]},
   "deep": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "op.native", "ag.native"]},
+  "hooky": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "arg.runtime", "arg.workspace", "op.native", "arg.operation", "ag.native", "arg.agent"]},
+  "locked": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "readonly": true, "write_dir": "  /tmp/pad  "},
   "ghostly": {"system_prompt": "simple", "tools": ["echo"]},
   "shallow": {"model": "prov/zero", "system_prompt": "simple", "tools": ["echo"]}
 }`
@@ -164,20 +175,65 @@ func (h *recordHook) blockUntilCanceled(started chan struct{}) {
 	h.blockSignal = started
 }
 
-// prepStream is one fake accepted model stream yielding a completed text turn.
-type prepStream struct{ i int }
+// recordArgumentHook is one declared ToolArgumentsHook capability: it records
+// every received call's argument bytes and Invocation revision and answers
+// with its fixed replacement.
+type recordArgumentHook struct {
+	replace json.RawMessage
+
+	mu   sync.Mutex
+	seen []string
+	revs []string
+}
+
+func (h *recordArgumentHook) BeforeTool(ctx context.Context, in Invocation, call model.ToolCall) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	h.mu.Lock()
+	h.seen = append(h.seen, string(call.Arguments))
+	h.revs = append(h.revs, in.Revision())
+	h.mu.Unlock()
+	return h.replace, nil
+}
+
+func (h *recordArgumentHook) received() ([]string, []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string{}, h.seen...), append([]string{}, h.revs...)
+}
+
+// prepStream is one fake accepted model stream yielding a completed text turn
+// with the given optional tool calls, for the preparation fixtures.
+type prepStream struct {
+	calls []model.ToolCall
+	i     int
+}
 
 func (s *prepStream) Recv() (model.StreamDelta, error) {
 	if s.i > 0 {
 		return model.StreamDelta{}, io.EOF
 	}
 	s.i++
-	return model.StreamDelta{
+	d := model.StreamDelta{
 		HasChoice:        true,
 		Role:             "assistant",
 		ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "done"}},
 		FinishReason:     "stop",
-	}, nil
+	}
+	if len(s.calls) > 0 { // tool-call turns establish through the tool_calls finish reason
+		d.FinishReason = "tool_calls"
+		for i, call := range s.calls {
+			position := i
+			d.ToolFragments = append(d.ToolFragments, model.ToolCallFragment{
+				Position:         &position,
+				ID:               call.ID,
+				Name:             call.Name,
+				ArgumentFragment: string(call.Arguments),
+			})
+		}
+	}
+	return d, nil
 }
 
 func (s *prepStream) Close() error { return nil }
@@ -196,6 +252,7 @@ type prepEnv struct {
 	h         *harness.Harness
 	events    *traceLog
 	hooks     [2]*recordHook
+	argHooks  [4]*recordArgumentHook // runtime, workspace, operation, agent scopes
 
 	hookOpens, capOpens, opOpens, agOpens atomic.Int64
 
@@ -224,6 +281,12 @@ type prepEnv struct {
 	cleanupErr      error
 	modelGate       chan struct{}
 	modelArrived    chan struct{}
+
+	// opener and model are the execution-construction injection points, both
+	// defaulted in newPrepEnv; a test that needs custom open behavior or model
+	// output swaps them before admitting.
+	opener openExecution
+	model  func(selection) func(context.Context, model.Request) (model.Stream, error)
 }
 
 func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
@@ -245,6 +308,72 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 		c.SystemPrompt += "|second"
 		return c
 	}}
+	for i, name := range []string{"arg.runtime", "arg.workspace", "arg.operation", "arg.agent"} {
+		e.argHooks[i] = &recordArgumentHook{replace: json.RawMessage(`{"repaired":"` + name + `"}`)}
+	}
+	e.opener = func(_ context.Context, adm harness.OperationAdmission, sel selection) (harness.Execution, error) {
+		e.mu.Lock()
+		openErr, invalid, noCleanup, cleanupErr := e.openErr, e.invalidOpen, e.noCleanup, e.cleanupErr
+		e.openAdmissions = append(e.openAdmissions, adm)
+		e.openSels = append(e.openSels, sel)
+		e.mu.Unlock()
+		if openErr != nil {
+			e.events.add("open-fail")
+			return harness.Execution{}, openErr
+		}
+		e.events.add("open:" + adm.OperationID)
+		execution := harness.Execution{
+			Model:         e.model(sel),
+			NormalizeTool: runtimeNormalize,
+			Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+				return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}}
+			},
+		}
+		if invalid {
+			execution.Model = nil
+		}
+		if !noCleanup {
+			execution.Close = func() error {
+				e.events.add("exec-cleanup")
+				select {
+				case e.turns <- struct{}{}:
+				default:
+				}
+				e.mu.Lock()
+				err := cleanupErr
+				e.mu.Unlock()
+				return err
+			}
+		}
+		return execution, nil
+	}
+	e.model = func(sel selection) func(context.Context, model.Request) (model.Stream, error) {
+		return func(ctx context.Context, _ model.Request) (model.Stream, error) {
+			e.events.add("model")
+			if _, ok := sel.bindings.entries["cap.shared"]; ok {
+				worker, err := Bind[greeter](sel.bindings, "cap.shared")
+				if err != nil {
+					return nil, err
+				}
+				e.events.add("greet:" + worker.Greet())
+			}
+			select {
+			case e.modelArrived <- struct{}{}:
+			default:
+			}
+			e.mu.Lock()
+			gate := e.modelGate
+			e.mu.Unlock()
+			if gate != nil {
+				select {
+				case <-gate:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return &prepStream{}, nil
+		}
+	}
 	owner, cancel := context.WithCancel(context.Background())
 	e.ownerCancel = cancel
 	e.comp = mustComposition(t, e.plugins()...)
@@ -257,7 +386,7 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 	}
 	h, err := harness.New(owner, harness.Dependencies{
 		Storage: store,
-		Prepare: newPreparation(e.svc, e.comp, e.runtime, e.ws, e.supply).bind(),
+		Prepare: newPreparation(e.svc, e.comp, e.runtime, e.ws, sh.home, e.supply).bind(),
 	})
 	if err != nil {
 		t.Fatalf("harness.New: %v", err)
@@ -271,7 +400,7 @@ func (e *prepEnv) plugins() []Plugin {
 		{
 			ID:       "hooks",
 			Scope:    ScopeRuntime,
-			Provides: []CapabilitySpec{Spec[PreparationHook]("hook.first"), Spec[PreparationHook]("hook.second")},
+			Provides: []CapabilitySpec{Spec[PreparationHook]("hook.first"), Spec[PreparationHook]("hook.second"), Spec[ToolArgumentsHook]("arg.runtime"), ToolSpec("echo", staticToolDescription("echo")), ToolSpec("read", staticToolDescription("read"))},
 			ValidateConfig: func(raw json.RawMessage) error {
 				var settings struct {
 					Tag string `json:"tag"`
@@ -283,30 +412,31 @@ func (e *prepEnv) plugins() []Plugin {
 			},
 			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 				e.hookOpens.Add(1)
-				return Instance{Values: map[string]any{"hook.first": e.hooks[0], "hook.second": e.hooks[1]}}, nil
+				return Instance{Values: map[string]any{"hook.first": e.hooks[0], "hook.second": e.hooks[1], "arg.runtime": e.argHooks[0], "echo": noopTool{}, "read": noopTool{}}}, nil
 			},
 		},
 		{
 			ID:       "caps",
 			Scope:    ScopeWorkspace,
-			Provides: []CapabilitySpec{Spec[greeter]("cap.shared"), Spec[greeter]("cap.other")},
+			Provides: []CapabilitySpec{Spec[greeter]("cap.shared"), Spec[greeter]("cap.other"), Spec[ToolArgumentsHook]("arg.workspace")},
 			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 				e.capOpens.Add(1)
 				return Instance{Values: map[string]any{
-					"cap.shared": loudGreeter{word: "shared"},
-					"cap.other":  loudGreeter{word: "other"},
+					"cap.shared":    loudGreeter{word: "shared"},
+					"cap.other":     loudGreeter{word: "other"},
+					"arg.workspace": e.argHooks[1],
 				}}, nil
 			},
 		},
 		{
 			ID:       "ops",
 			Scope:    ScopeOperation,
-			Provides: []CapabilitySpec{Spec[greeter]("op.native")},
+			Provides: []CapabilitySpec{Spec[greeter]("op.native"), Spec[ToolArgumentsHook]("arg.operation")},
 			Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
 				e.opOpens.Add(1)
 				e.events.add("op-open:" + info.OperationID)
 				return Instance{
-					Values: map[string]any{"op.native": loudGreeter{word: "op"}},
+					Values: map[string]any{"op.native": loudGreeter{word: "op"}, "arg.operation": e.argHooks[2]},
 					Close: func() error {
 						e.events.add("op-close")
 						select {
@@ -321,12 +451,12 @@ func (e *prepEnv) plugins() []Plugin {
 		{
 			ID:       "ags",
 			Scope:    ScopeAgent,
-			Provides: []CapabilitySpec{Spec[greeter]("ag.native")},
+			Provides: []CapabilitySpec{Spec[greeter]("ag.native"), Spec[ToolArgumentsHook]("arg.agent")},
 			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 				e.agOpens.Add(1)
 				e.events.add("ag-open")
 				return Instance{
-					Values: map[string]any{"ag.native": loudGreeter{word: "ag"}},
+					Values: map[string]any{"ag.native": loudGreeter{word: "ag"}, "arg.agent": e.argHooks[3]},
 					Close:  func() error { e.events.add("ag-close"); return nil },
 				}, nil
 			},
@@ -371,6 +501,8 @@ func (e *prepEnv) supply(ctx context.Context, req harness.PreparationRequest, se
 		SystemPrompt:          "prompt-" + req.Session.AgentType,
 		Tools:                 captureTools(sel.agent.Tools),
 		Capabilities:          append([]string(nil), sel.agent.Capabilities...),
+		Readonly:              sel.agent.Readonly,
+		WriteDir:              sel.agent.WriteDir,
 	}
 	if mutateSelection != nil {
 		mutateSelection(sel, &capture)
@@ -401,74 +533,6 @@ func captureTools(names []string) []model.ToolDefinition {
 		})
 	}
 	return out
-}
-
-func (e *prepEnv) opener(_ context.Context, adm harness.OperationAdmission, sel selection) (harness.Execution, error) {
-	e.mu.Lock()
-	openErr, invalid, noCleanup, cleanupErr := e.openErr, e.invalidOpen, e.noCleanup, e.cleanupErr
-	e.openAdmissions = append(e.openAdmissions, adm)
-	e.openSels = append(e.openSels, sel)
-	e.mu.Unlock()
-	if openErr != nil {
-		e.events.add("open-fail")
-		return harness.Execution{}, openErr
-	}
-	e.events.add("open:" + adm.OperationID)
-	execution := harness.Execution{
-		Model: e.model(sel),
-		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}
-		},
-	}
-	if invalid {
-		execution.Model = nil
-	}
-	if !noCleanup {
-		execution.Close = func() error {
-			e.events.add("exec-cleanup")
-			select {
-			case e.turns <- struct{}{}:
-			default:
-			}
-			e.mu.Lock()
-			err := cleanupErr
-			e.mu.Unlock()
-			return err
-		}
-	}
-	return execution, nil
-}
-
-func (e *prepEnv) model(sel selection) agent.ModelEffect {
-	return func(ctx context.Context, _ model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		e.events.add("model")
-		if _, ok := sel.bindings.entries["cap.shared"]; ok {
-			worker, err := Bind[greeter](sel.bindings, "cap.shared")
-			if err != nil {
-				return agent.ModelSettlement{}, err
-			}
-			e.events.add("greet:" + worker.Greet())
-		}
-		select {
-		case e.modelArrived <- struct{}{}:
-		default:
-		}
-		e.mu.Lock()
-		gate := e.modelGate
-		e.mu.Unlock()
-		if gate != nil {
-			select {
-			case <-gate:
-			case <-ctx.Done():
-				return agent.ModelSettlement{}, ctx.Err()
-			}
-		}
-		out, err := assemble(prepModelRef, &prepStream{})
-		if err != nil {
-			return agent.ModelSettlement{}, err
-		}
-		return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &out}, nil
-	}
 }
 
 // --- fixture control helpers ---
@@ -886,6 +950,12 @@ func runReloadOrdering(t *testing.T, store harness.Storage, kind string) {
 		}
 	}
 	<-e.prepared()
+	// The reload varies the selected definition's permission constraints, so
+	// the revision-2 capture differs from the revision-1 one on both members.
+	reloadAgents := strings.Replace(prepAgentsDocument,
+		`"dual": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "cap.shared"]}`,
+		`"dual": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "cap.shared"], "readonly": true, "write_dir": "/tmp/reload"}`, 1)
+	writeServiceFile(t, agents.PathForConfig(e.sh.configPath), reloadAgents)
 	if _, err := e.svc.publish(context.Background()); err != nil {
 		t.Fatalf("reload publish: %v", err)
 	}
@@ -899,9 +969,13 @@ func runReloadOrdering(t *testing.T, store harness.Storage, kind string) {
 	}
 	e.mu.Unlock()
 	// The in-flight admission committed on revision 1 and opened with the
-	// same captured revision.
-	if got := e.admissionAt(1).Execution.ConfigurationRevision; got != "1" {
+	// same captured revision and constraints.
+	inFlight := e.admissionAt(1).Execution
+	if got := inFlight.ConfigurationRevision; got != "1" {
 		t.Fatalf("overlapping-reload admission committed revision %q, want the captured 1", got)
+	}
+	if inFlight.Readonly || inFlight.WriteDir != "" {
+		t.Fatalf("reloaded constraints leaked into the committed capture: readonly=%v write_dir=%q, want the captured false \"\"", inFlight.Readonly, inFlight.WriteDir)
 	}
 	if rev := e.selectionAt(1).invocation.Revision(); rev != "1" {
 		t.Fatalf("overlapping-reload preparation selection revision = %q, want 1", rev)
@@ -910,11 +984,15 @@ func runReloadOrdering(t *testing.T, store harness.Storage, kind string) {
 		t.Fatalf("overlapping-reload opener selection revision = %q, want the retained 1", rev)
 	}
 
-	// The next capture uses revision 2.
+	// The next capture uses revision 2 and the reloaded constraints.
 	e.admitOrBuffer(session, "op-next", "next")
 	e.awaitCleanups(3)
-	if got := e.admissionAt(2).Execution.ConfigurationRevision; got != "2" {
+	next := e.admissionAt(2).Execution
+	if got := next.ConfigurationRevision; got != "2" {
 		t.Fatalf("next admission revision = %q, want 2", got)
+	}
+	if !next.Readonly || next.WriteDir != "/tmp/reload" {
+		t.Fatalf("next admission constraints = readonly %v write_dir %q, want the reloaded true \"/tmp/reload\"", next.Readonly, next.WriteDir)
 	}
 	if err := e.converge(); err != nil {
 		t.Fatalf("Wait: %v", err)
@@ -1077,6 +1155,26 @@ func TestPreparationRejectsAdmissionAtTheBoundary(t *testing.T) {
 			want: harness.ErrInvalid, wantPrepars: 1, mismatch: true,
 		},
 		{
+			name: "capture contradicts the selected definition's readonly constraint", agentType: "solo",
+			arm: func(e *prepEnv) {
+				e.mutateCapture = func(c harness.ExecutionCapture) harness.ExecutionCapture {
+					c.Readonly = true
+					return c
+				}
+			},
+			want: harness.ErrInvalid, wantPrepars: 1, mismatch: true,
+		},
+		{
+			name: "capture contradicts the selected definition's write_dir", agentType: "solo",
+			arm: func(e *prepEnv) {
+				e.mutateCapture = func(c harness.ExecutionCapture) harness.ExecutionCapture {
+					c.WriteDir = "/tmp/elsewhere"
+					return c
+				}
+			},
+			want: harness.ErrInvalid, wantPrepars: 1, mismatch: true,
+		},
+		{
 			name: "nil opener prevents admission", agentType: "solo",
 			arm:         func(e *prepEnv) { e.nilOpener = true },
 			want:        harness.ErrInvalid,
@@ -1151,6 +1249,20 @@ func oneShotCapabilitySelectionMutation(e *prepEnv) {
 	}
 }
 
+// oneShotCaptureMismatch arms one first-use-only capture mutation for the
+// delivered-capture mismatch cases.
+func oneShotCaptureMismatch(edit func(*harness.ExecutionCapture)) func(*prepEnv) {
+	return func(e *prepEnv) {
+		var left int32 = 1
+		e.mutateCapture = func(c harness.ExecutionCapture) harness.ExecutionCapture {
+			if atomic.CompareAndSwapInt32(&left, 1, 0) {
+				edit(&c)
+			}
+			return c
+		}
+	}
+}
+
 // TestPreparationSelectionMismatchOnDrainedAndForkDelivery proves on both
 // stores that the queued-drain and Fork admission paths enforce the same
 // selection agreement: a mismatching delivered capture is rejected with no
@@ -1164,6 +1276,8 @@ func TestPreparationSelectionMismatchOnDrainedAndForkDelivery(t *testing.T) {
 	}{
 		{"capture", oneShotEmptySelection},
 		{"callback selection", oneShotCapabilitySelectionMutation},
+		{"capture readonly", oneShotCaptureMismatch(func(c *harness.ExecutionCapture) { c.Readonly = true })},
+		{"capture write_dir", oneShotCaptureMismatch(func(c *harness.ExecutionCapture) { c.WriteDir = "/tmp/elsewhere" })},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Run("rejected queued delivery adds nothing and the next still admits", func(t *testing.T) {
@@ -1299,6 +1413,14 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 			}},
 			{"capabilities", func(c harness.ExecutionCapture) harness.ExecutionCapture {
 				c.Capabilities = []string{"hook.first"}
+				return c
+			}},
+			{"readonly", func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				c.Readonly = !c.Readonly
+				return c
+			}},
+			{"write_dir", func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				c.WriteDir = "/tmp/hook-elsewhere"
 				return c
 			}},
 		}
@@ -1695,5 +1817,350 @@ func TestPreparationExecutionLifetimeAndCleanup(t *testing.T) {
 				t.Fatalf("Wait error = %v, want the retained cleanup failure", err)
 			}
 		})
+	})
+}
+
+// TestPreparationCapturesPermissionConstraints proves the durable permission
+// capability capture through the real Harness: the Runtime projection trims
+// write_dir once and the admitted capture carries the one definition's
+// readonly and trimmed write_dir values through commit. The reload axis on
+// these constraint members is proven by the reload-ordering suite.
+func TestPreparationCapturesPermissionConstraints(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newPrepEnv(t, store)
+		t.Cleanup(func() { e.converge() })
+		session := e.session("locked")
+		e.admit(session, "op-1", "one")
+		e.awaitCleanups(1)
+		op, err := e.h.ReadOperation(context.Background(), session, "op-1")
+		if err != nil {
+			t.Fatalf("ReadOperation: %v", err)
+		}
+		if !op.Admission.Execution.Readonly || op.Admission.Execution.WriteDir != "/tmp/pad" {
+			t.Fatalf("committed constraints = %v %q, want the definition's readonly true and once-trimmed %q",
+				op.Admission.Execution.Readonly, op.Admission.Execution.WriteDir, "/tmp/pad")
+		}
+	})
+}
+
+// TestPreparationForwardsCapturedPolicyAndNormalizer proves the opened
+// execution's permission capture and required normalizer reach the shared
+// Harness boundary through Runtime's forwarding on both stores: the
+// advertised call's normalization commits at the assistant producer and runs
+// exactly once, the opened policy denies the declared file.write pair so the
+// call settles the fixed denial without starting the concrete effect, the
+// denial is visible in the next model projection, and the Operation still
+// reaches terminal success.
+func TestPreparationForwardsCapturedPolicyAndNormalizer(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newPrepEnv(t, store)
+		t.Cleanup(func() { e.converge() })
+		var mu sync.Mutex
+		var normalized, executed int
+		var requests []model.Request
+		turn := []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: json.RawMessage(` {"x": 1} `)}}
+		e.model = func(selection) func(context.Context, model.Request) (model.Stream, error) {
+			return func(_ context.Context, req model.Request) (model.Stream, error) {
+				mu.Lock()
+				requests = append(requests, req)
+				next := turn
+				turn = nil
+				mu.Unlock()
+				if len(next) > 0 {
+					return &prepStream{calls: next}, nil
+				}
+				return &prepStream{}, nil
+			}
+		}
+		e.opener = func(_ context.Context, _ harness.OperationAdmission, sel selection) (harness.Execution, error) {
+			execution := harness.Execution{
+				Model: e.model(sel),
+				NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
+					mu.Lock()
+					normalized++
+					mu.Unlock()
+					return runtimeNormalize(call)
+				},
+				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+					return harness.PreparedTool{
+						Permissions:        []harness.PermissionRequest{{Permission: "file.write", Target: "/w/a.txt"}},
+						CanonicalWorkspace: "/w",
+						Execute: func(context.Context) harness.ToolOutcome {
+							mu.Lock()
+							executed++
+							mu.Unlock()
+							return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
+						},
+					}
+				},
+				Permissions: harness.ResolvePermissionPolicy(json.RawMessage(`{"rules":[{"permission":"file.write","target":"*","access":"deny"}]}`), nil),
+			}
+			execution.Close = func() error {
+				e.events.add("exec-cleanup")
+				select {
+				case e.turns <- struct{}{}:
+				default:
+				}
+				return nil
+			}
+			return execution, nil
+		}
+		session := e.session("solo")
+		e.admit(session, "op-1", "one")
+		e.awaitCleanups(1)
+		op, err := e.h.ReadOperation(context.Background(), session, "op-1")
+		if err != nil || op.State.Status != harness.OperationSuccess {
+			t.Fatalf("operation = %+v err %v, want terminal success after the denial settled its call", op, err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if executed != 0 {
+			t.Fatalf("concrete effects started = %d, want none for the denied call", executed)
+		}
+		if normalized != 1 {
+			t.Fatalf("normalizations = %d, want the committed value consumed without a second pass", normalized)
+		}
+		entries, err := store.ReadEntries(context.Background(), session, 0)
+		if err != nil {
+			t.Fatalf("ReadEntries: %v", err)
+		}
+		var denial bool
+		published := 0
+		for _, entry := range entries {
+			if entry.Kind != harness.EntryAssistant && entry.Kind != harness.EntryToolResult {
+				continue
+			}
+			var obj map[string]json.RawMessage
+			if err := json.Unmarshal(entry.Payload, &obj); err != nil {
+				t.Fatalf("decode %s payload: %v", entry.ID, err)
+			}
+			switch entry.Kind {
+			case harness.EntryAssistant:
+				var calls []struct {
+					ID                  string          `json:"id"`
+					NormalizedArguments json.RawMessage `json:"normalized_arguments"`
+				}
+				if err := json.Unmarshal(obj["tool_calls"], &calls); err != nil {
+					t.Fatalf("assistant tool calls: %v", err)
+				}
+				if len(calls) == 0 {
+					continue // the continuation turn's text-only assistant
+				}
+				published++
+				if len(calls) != 1 || calls[0].ID != "call-1" {
+					t.Fatalf("assistant tool calls = %s, want the one published call", obj["tool_calls"])
+				}
+				if string(calls[0].NormalizedArguments) != `{"x":1}` {
+					t.Fatalf("committed normalized_arguments = %s, want the producer's compacted object", calls[0].NormalizedArguments)
+				}
+			case harness.EntryToolResult:
+				if string(obj["status"]) != `"denied"` || string(obj["content"]) != `"Permission denied."` {
+					t.Fatalf("tool result = %s, want the fixed denial", entry.Payload)
+				}
+				if _, present := obj["metadata"]; present {
+					t.Fatalf("denied result carries a metadata member")
+				}
+				denial = true
+			}
+		}
+		if published != 1 || !denial {
+			t.Fatalf("committed entries: %d publishing assistants and denial=%v, want 1 and true", published, denial)
+		}
+		if len(requests) != 2 {
+			t.Fatalf("%d model requests, want the continuation after the settled call", len(requests))
+		}
+		var projected string
+		for _, msg := range requests[1].Messages {
+			if msg.Role == model.RoleTool {
+				projected = msg.TextContent()
+			}
+		}
+		if projected != "Permission denied." {
+			t.Fatalf("second projection carried tool message %q, want the committed denial", projected)
+		}
+	})
+}
+
+// TestPreparationForwardsRetryPolicyToOpenedExecution proves the scope
+// wrapper forwards the opener's Retry policy into the opened Execution: the
+// supplied non-nil policy is the one the opened execution consults for the
+// failed physical attempt. A func value copied verbatim invokes as the same
+// closure, so the recorded call is the identity proof.
+func TestPreparationForwardsRetryPolicyToOpenedExecution(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newPrepEnv(t, store)
+		t.Cleanup(func() { e.converge() })
+		policyCalled := make(chan struct{}, 1) // one invocation is the identity proof for the verbatim-copied func field
+		policy := func(error, int) (time.Duration, bool) {
+			select {
+			case policyCalled <- struct{}{}:
+			default:
+			}
+			return 0, false
+		}
+		e.model = func(selection) func(context.Context, model.Request) (model.Stream, error) {
+			return func(context.Context, model.Request) (model.Stream, error) {
+				return nil, errors.New("model down") // one nonretryable pre-acceptance failure
+			}
+		}
+		baseOpener := e.opener
+		e.opener = func(ctx context.Context, adm harness.OperationAdmission, sel selection) (harness.Execution, error) {
+			execution, err := baseOpener(ctx, adm, sel)
+			if err != nil {
+				return harness.Execution{}, err
+			}
+			execution.Retry = policy // must reach the opened execution through the scope wrapper
+			return execution, nil
+		}
+		session := e.session("solo")
+		e.admit(session, "op-1", "hello")
+		select {
+		case <-policyCalled: // the opened execution consulted the supplied policy: no convergence race
+		case <-time.After(10 * time.Second):
+			t.Fatal("the retry policy never ran: the opened execution did not receive the supplied policy")
+		}
+		if err := e.converge(); err != nil {
+			t.Fatalf("converge: %v", err)
+		}
+		rec, err := e.h.ReadOperation(context.Background(), session, "op-1")
+		if err != nil || rec.State.Status != harness.OperationFailure || rec.State.Terminal == nil || rec.State.Terminal.Detail != "model down" {
+			t.Fatalf("operation = %+v err %v, want terminal failure with the attempt's diagnostic", rec, err)
+		}
+	})
+}
+
+// TestPreparationForwardsToolArgumentHooksAcrossScopes proves the argument
+// hook row through the real Runtime, Harness and Agent on both stores: the
+// selected argument hooks bind in configured order after all execution scopes
+// open, from any of the four scopes, with capability IDs as the durable hook
+// identities and the captured Invocation reaching every hook; a pure
+// preparation hook in the same capability list never binds as an argument
+// hook; the first hook receives the invalid raw arguments and repairs them;
+// every replacement commits as its own durable hook_result effect; the final
+// committed value reaches the concrete tool byte-identically; and the
+// Operation settles success.
+func TestPreparationForwardsToolArgumentHooksAcrossScopes(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newPrepEnv(t, store)
+		t.Cleanup(func() { e.converge() })
+		var mu sync.Mutex
+		var executed int
+		var toolInput []string
+		turn := []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: json.RawMessage(` [not json `)}}
+		e.model = func(selection) func(context.Context, model.Request) (model.Stream, error) {
+			return func(_ context.Context, _ model.Request) (model.Stream, error) {
+				next := turn
+				turn = nil
+				if len(next) > 0 {
+					return &prepStream{calls: next}, nil
+				}
+				return &prepStream{}, nil
+			}
+		}
+		e.opener = func(_ context.Context, _ harness.OperationAdmission, sel selection) (harness.Execution, error) {
+			execution := harness.Execution{
+				Model:         e.model(sel),
+				NormalizeTool: runtimeNormalize,
+				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+					mu.Lock()
+					executed++
+					toolInput = append(toolInput, string(call.Arguments))
+					mu.Unlock()
+					return harness.PreparedTool{Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "fixture"}}, Immediate: &harness.ToolOutcome{
+						Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"},
+					}}
+				},
+			}
+			execution.Close = func() error {
+				select {
+				case e.turns <- struct{}{}:
+				default:
+				}
+				return nil
+			}
+			return execution, nil
+		}
+
+		session := e.session("hooky")
+		e.admit(session, "op-1", "one")
+		e.awaitCleanups(1)
+		op, err := e.h.ReadOperation(context.Background(), session, "op-1")
+		if err != nil || op.State.Status != harness.OperationSuccess {
+			t.Fatalf("operation = %+v err %v, want terminal success after the hook chain", op, err)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if executed != 1 || len(toolInput) != 1 || toolInput[0] != `{"repaired":"arg.agent"}` {
+			t.Fatalf("concrete tool ran %d times on %q, want once with the final committed replacement", executed, toolInput)
+		}
+
+		// The committed hook evidence: one success hook_result per argument
+		// hook in configured order, under the capability IDs, each repairing
+		// from its received bytes.
+		entries, err := store.ReadEntries(context.Background(), session, 0)
+		if err != nil {
+			t.Fatalf("ReadEntries: %v", err)
+		}
+		type hookWire struct {
+			HookID     string          `json:"hook_id"`
+			ToolCallID string          `json:"tool_call_id"`
+			Status     string          `json:"status"`
+			Arguments  json.RawMessage `json:"arguments"`
+		}
+		var hookResults []hookWire
+		for _, entry := range entries {
+			if entry.Kind != harness.EntryHookResult {
+				continue
+			}
+			var wire hookWire
+			if err := json.Unmarshal(entry.Payload, &wire); err != nil {
+				t.Fatalf("decode hook result: %v", err)
+			}
+			hookResults = append(hookResults, wire)
+		}
+		wantIDs := []string{"arg.runtime", "arg.workspace", "arg.operation", "arg.agent"}
+		if len(hookResults) != len(wantIDs) {
+			t.Fatalf("committed hook results = %+v, want one per argument hook", hookResults)
+		}
+		for i, want := range wantIDs {
+			got := hookResults[i]
+			if got.HookID != want || got.ToolCallID != "call-1" || got.Status != "success" {
+				t.Fatalf("hook result %d = %+v, want hook %q succeeding for call-1", i, got, want)
+			}
+		}
+		if string(hookResults[3].Arguments) != `{"repaired":"arg.agent"}` {
+			t.Fatalf("last committed arguments = %s, want the final hook's replacement", hookResults[3].Arguments)
+		}
+
+		// The chain: the first hook received the invalid raw arguments, every
+		// later one the preceding hook's committed replacement; the captured
+		// Invocation revision reached every hook.
+		for i, hook := range e.argHooks {
+			seen, revs := hook.received()
+			if len(seen) != 1 {
+				t.Fatalf("hook %d ran %d times, want once", i, len(seen))
+			}
+			if i > 0 && seen[0] != string(hookResults[i-1].Arguments) {
+				t.Fatalf("hook %d received %q, want the preceding committed replacement %q", i, seen[0], hookResults[i-1].Arguments)
+			}
+			if revs[0] == "" {
+				t.Fatalf("hook %d received an empty Invocation revision", i)
+			}
+		}
+		if first, _ := e.argHooks[0].received(); first[0] != ` [not json ` {
+			t.Fatalf("first hook received %q, want the invalid raw arguments", first)
+		}
+
+		// The pure preparation hook in the same capability list ran at
+		// preparation and never bound as an argument hook.
+		if len(e.hooks[0].calls()) == 0 {
+			t.Fatalf("preparation hook never ran")
+		}
+		for _, result := range hookResults {
+			if result.HookID == "hook.first" {
+				t.Fatalf("preparation hook bound as an argument hook")
+			}
+		}
 	})
 }

@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -45,23 +44,81 @@ type PreparedExecution struct {
 	Open    func(context.Context, OperationAdmission) (Execution, error)
 }
 
-// Execution is one opened execution: the two process-local effect functions
-// the Harness drives, plus the cleanup of any external resources backing
-// them. A successful Model and Tool must be non-nil; Close is optional when
-// the concrete execution needs no external disposal. The opener owns
-// provisional cleanup on error.
-type Execution struct {
-	Model agent.ModelEffect
-	Tool  func(context.Context, model.ToolCall) PreparedTool
-	Close func() error
+// ToolArgumentsHook is one effectful argument hook: before a concrete tool
+// call prepares, it may rewrite the call's raw argument bytes. Its successful
+// replacement must be exactly one JSON object the execution's normalizer
+// accepts; it can never replace the call identity, tool name, or another
+// call's arguments. Every execution is a Harness-settled Operation effect
+// with durable hook_result evidence. Run receives owned call data.
+type ToolArgumentsHook struct {
+	ID  string
+	Run func(context.Context, model.ToolCall) (json.RawMessage, error)
 }
 
-// PreparedTool is one tool plan: exactly one immediate result or executor,
-// with normalized arguments that are nil or one valid JSON value.
+// RetryPolicy decides one failed physical model attempt: it receives the
+// attempt's failure and the 1-based number of the attempt that just failed
+// (1 for the initial attempt), and returns the nonnegative delay before the
+// next attempt plus whether to retry at all. A false result or a negative
+// delay ends the effect with that failure; the Harness owns every wait.
+type RetryPolicy func(error, int) (time.Duration, bool)
+
+// Execution is one opened execution: the physical model-request callback the
+// Harness retries and assembles, the tool effect function, the Operation's
+// resolved automatic permission policy, the required pure
+// argument-normalization callback, the selected argument hooks, plus the
+// cleanup of any external resources backing them. A successful Model, Tool
+// and NormalizeTool must be non-nil, and every ToolHooks entry requires a
+// non-empty unique ID and a non-nil Run; a nil Retry selects the private
+// standard retry classifier; Close is optional when the concrete execution
+// needs no external disposal. The opener owns provisional cleanup on error.
+type Execution struct {
+	// Model is the one physical model-request callback. Each invocation makes
+	// exactly one physical attempt and returns its accepted stream or that
+	// attempt's failure; retry, assembly and settlement are Harness-owned.
+	Model func(context.Context, model.Request) (model.Stream, error)
+	// Retry classifies one failed physical attempt for the next-attempt
+	// decision. Nil selects the private standard classifier.
+	Retry RetryPolicy
+	Tool  func(context.Context, model.ToolCall) PreparedTool
+	// Permissions is the automatic policy resolved for this Operation from the
+	// same immutable configuration revision its capture records. The zero
+	// PermissionPolicy is the built-in policy.
+	Permissions PermissionPolicy
+	// NormalizeTool is pure, terminating argument validation and defaulting
+	// with no filesystem, service, permission or effect I/O. It receives an
+	// owned call and returns one owned JSON object preserving unrelated
+	// accepted fields; its error is a per-call validation failure.
+	NormalizeTool func(model.ToolCall) (json.RawMessage, error)
+	// ToolHooks are the selected argument hooks in configured order. Each runs
+	// as its own effect after the advertisement gate and before concrete
+	// preparation; the first receives the original raw call arguments, every
+	// later one the preceding committed replacement.
+	ToolHooks []ToolArgumentsHook
+	Close     func() error
+}
+
+// ToolOutcome is one owned tool plan's complete outcome: the model-visible
+// result returned to the Agent, plus optional raw-JSON metadata whose
+// semantics belong to the producing tool. The Harness validates only
+// well-formedness and the durable size bound and never interprets the value.
+type ToolOutcome struct {
+	Result   model.ToolResult
+	Metadata json.RawMessage // optional, bounded, well-formed; semantics owned by the tool
+}
+
+// PreparedTool is one immutable prepared call: exactly one immediate outcome
+// or executor, its declared permission/target pairs, and the canonical
+// bindings permission evaluation and concrete I/O consume. Normalized
+// arguments are Harness-supplied input, never a second value the preparer
+// replaces. Execution and immediate-success plans require a nonempty list of
+// nonempty permission/target pairs; immediate error, denied and interrupted
+// outcomes need no successful target declaration.
 type PreparedTool struct {
-	NormalizedArguments json.RawMessage
-	Immediate           *model.ToolResult
-	Execute             func(context.Context) model.ToolResult
+	Permissions        []PermissionRequest
+	CanonicalWorkspace string
+	CanonicalWriteDir  string
+	Immediate          *ToolOutcome
+	Execute            func(context.Context) ToolOutcome
 }
 
 // CreateSessionRequest is the input of one root Session creation.
@@ -636,14 +693,20 @@ func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
 // returns from the call. Sweep deletion uses the same post-commit coordinator
 // invalidation as DeleteSession. It publishes no per-Session status, starts no
 // ticker, reads no configuration, and emits no event.
-func (h *Harness) Sweep(ctx context.Context, policy SweepPolicy, now time.Time) error {
+//
+// Sweep returns every committed deleted Session identity, including successes
+// collected before a stopping error, in unspecified order; corrupt and
+// malformed rows contribute none. A rejected zero time or a listing failure
+// returns no identities.
+func (h *Harness) Sweep(ctx context.Context, policy SweepPolicy, now time.Time) ([]string, error) {
 	if now.IsZero() {
-		return invalidInput("sweep time must not be zero")
+		return nil, invalidInput("sweep time must not be zero")
 	}
 	ids, err := h.deps.Storage.ListSessionIDs(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var deletedIDs []string
 	for _, sessionID := range ids {
 		if err := validateHexID(sessionID, "session id"); err != nil { // a listed identity violating the durable shape is a corrupt row: left unchanged, the pass continues
 			continue
@@ -651,18 +714,22 @@ func (h *Harness) Sweep(ctx context.Context, policy SweepPolicy, now time.Time) 
 		c, err := h.coordinatorFor(ctx, sessionID)
 		if err != nil {
 			if !isCorruption(err) { // a corrupt Session is left unchanged; every other error stops the sweep
-				return err
+				return deletedIDs, err
 			}
 			continue
 		}
-		if err := h.sweepOne(ctx, c, sessionID, policy, now); err != nil {
+		deleted, err := h.sweepOne(ctx, c, sessionID, policy, now)
+		if err != nil {
 			if !isCorruption(err) { // corruption discovered under the cached view leaves the Session unchanged
-				return err
+				return deletedIDs, err
 			}
 			continue
+		}
+		if deleted {
+			deletedIDs = append(deletedIDs, sessionID)
 		}
 	}
-	return nil
+	return deletedIDs, nil
 }
 
 // sweepOne handles one Sweep Session through the coordinator: it waits for an
@@ -673,11 +740,13 @@ func (h *Harness) Sweep(ctx context.Context, policy SweepPolicy, now time.Time) 
 // deletion for an archived Session past its threshold. A running or
 // process-locally buffered Session is left unchanged. Deletion uses the same
 // post-commit coordinator invalidation as DeleteSession; archiving adopts the
-// committed record and clears the buffers under the same hold.
-func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string, policy SweepPolicy, now time.Time) error {
+// committed record and clears the buffers under the same hold. It reports
+// whether the deletion transition committed: the flag is true only after the
+// deleting transaction and its post-commit adoption succeeded.
+func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string, policy SweepPolicy, now time.Time) (bool, error) {
 	for {
 		if err := c.waitIdle(ctx); err != nil {
-			return err
+			return false, err
 		}
 		c.mu.Lock()
 		if c.reserved != nil { // a reservation was taken between the wait and the lock
@@ -686,11 +755,11 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 		}
 		if c.gone { // a deletion committed while this call waited or relocked
 			c.mu.Unlock()
-			return notFoundSession(sessionID)
+			return false, notFoundSession(sessionID)
 		}
 		if c.run != nil || len(c.steering) > 0 || len(c.queued) > 0 { // running or process-locally buffered: left unchanged
 			c.mu.Unlock()
-			return nil
+			return false, nil
 		}
 		var (
 			archived   SessionRecord
@@ -747,20 +816,20 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 		if err != nil {
 			h.markCorrupt(sessionID, err)
 			c.mu.Unlock()
-			return err
+			return false, err
 		}
 		if deleted { // the same post-commit coordinator invalidation as DeleteSession, under this hold
 			c.invalidate()
 			c.mu.Unlock()
 			h.removeCoordinator(sessionID)
-			return nil
+			return true, nil
 		}
 		if didArchive {
 			c.graph.Session = archived
 			c.steering, c.queued = nil, nil // like ArchiveSession: the buffers clear only after the commit
 		}
 		c.mu.Unlock()
-		return nil
+		return false, nil
 	}
 }
 

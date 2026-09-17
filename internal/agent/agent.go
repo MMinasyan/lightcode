@@ -1097,7 +1097,7 @@ func New(c Config) (*Agent, error) {
 	}
 
 	procMgr := process.NewManagerAtRoot(c.Cfg.Tools.MaxBackgroundProcesses, cmdoutput.Options{
-		HomeDir:      c.Home,
+		Directory:    filepath.Join(c.Home, ".lightcode"),
 		SpillPrefix:  "proc_output_",
 		MaxBytes:     c.Cfg.Tools.MaxOutputBytes,
 		MaxLineChars: c.Cfg.Tools.ReadLineMaxChars,
@@ -3965,7 +3965,7 @@ func (a *Agent) applyReloadStateLocked(cfg *config.Config, agentTypes *agentcfg.
 	a.catalog = modelCatalog
 	if a.procMgr != nil {
 		a.procMgr.SetLimits(cfg.Tools.MaxBackgroundProcesses, cmdoutput.Options{
-			HomeDir:      a.home,
+			Directory:    filepath.Join(a.home, ".lightcode"),
 			SpillPrefix:  "proc_output_",
 			MaxBytes:     cfg.Tools.MaxOutputBytes,
 			MaxLineChars: cfg.Tools.ReadLineMaxChars,

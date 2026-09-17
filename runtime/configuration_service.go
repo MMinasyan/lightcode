@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/config"
 )
 
 // ErrConfiguration reports a complete candidate failure: nothing was
@@ -55,6 +57,12 @@ type configurationService struct {
 	plugins       []Plugin
 	pluginIDs     map[string]bool
 	capabilityIDs []string
+	toolIDs       []string
+
+	// defaultCapabilityIDs is empty, or the single composed ModelAdaptation
+	// export ID installed on the built-in primary definition before ordinary
+	// inheritance. No plugin callback supplies it.
+	defaultCapabilityIDs []string
 
 	owner context.Context
 	obs   *observation
@@ -74,15 +82,21 @@ func newConfigurationService(owner context.Context, c *composition, loader *cata
 	for _, p := range c.plugins {
 		pluginIDs[p.ID] = true
 	}
+	defaultCapabilityIDs := []string(nil)
+	if c.modelAdaptation != "" {
+		defaultCapabilityIDs = []string{c.modelAdaptation}
+	}
 	return &configurationService{
-		loader:        loader,
-		configPath:    configPath,
-		agentsPath:    agents.PathForConfig(configPath),
-		plugins:       c.plugins,
-		pluginIDs:     pluginIDs,
-		capabilityIDs: c.capabilityIDs,
-		owner:         owner,
-		obs:           obs,
+		loader:               loader,
+		configPath:           configPath,
+		agentsPath:           agents.PathForConfig(configPath),
+		plugins:              c.plugins,
+		pluginIDs:            pluginIDs,
+		capabilityIDs:        c.capabilityIDs,
+		toolIDs:              c.toolIDs,
+		defaultCapabilityIDs: defaultCapabilityIDs,
+		owner:                owner,
+		obs:                  obs,
 	}
 }
 
@@ -151,9 +165,11 @@ func (s *configurationService) canceled(ctx context.Context) error {
 // are captured once (preserving the first-run skeletons), the captured
 // providers layer is delegated to Loader.LoadCaptured so provider assembly
 // and every cost protection use that one read, sessions and agent definitions
-// are parsed against the ordinary visible export IDs, and the plugin section
-// is validated against the owned declarations. Nothing is published until the
-// complete candidate survives all of it.
+// are parsed against the ordinary visible export IDs and the compiled tool
+// universe, the Workspace permission inventory is enumerated once into the
+// candidate, and the plugin section is validated against the owned
+// declarations. Nothing is published until the complete candidate survives
+// all of it.
 func (s *configurationService) build(ctx context.Context, generation uint64) (*configuration, error) {
 	configData, err := captureConfiguredFile(s.configPath, mainConfigSkeleton)
 	if err != nil {
@@ -174,7 +190,7 @@ func (s *configurationService) build(ctx context.Context, generation uint64) (*c
 		}
 		return nil, configurationFailure(err)
 	}
-	snapshot, err := newConfiguration(generation, doc, built, agentsData, s.capabilityIDs)
+	snapshot, err := newConfiguration(generation, doc, built, agentsData, s.capabilityIDs, s.toolIDs, s.defaultCapabilityIDs, captureWorkspacePermissions())
 	if err != nil {
 		return nil, configurationFailure(err)
 	}
@@ -182,6 +198,39 @@ func (s *configurationService) build(ctx context.Context, generation uint64) (*c
 		return nil, err
 	}
 	return snapshot, nil
+}
+
+// captureWorkspacePermissions enumerates the home-based per-Workspace
+// permission inventory during one configuration build and captures each
+// present readable permissions.json's raw bytes keyed by its directory ID. A
+// missing directory is the fresh-install absent case and a failed enumeration
+// leaves the whole Workspace policy level absent for this revision; a missing
+// or unreadable file inside the inventory is absent policy for that Workspace
+// alone. A successfully read malformed file is captured unchanged —
+// resolution determines validity from the raw bytes. No enumeration failure
+// fails publication, and nothing here reads project records, meta.json, or
+// locks.
+func captureWorkspacePermissions() map[string]json.RawMessage {
+	root, err := config.ProjectsDir()
+	if err != nil {
+		return nil
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	captured := make(map[string]json.RawMessage, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(root, entry.Name(), "permissions.json"))
+		if err != nil {
+			continue
+		}
+		captured[entry.Name()] = data
+	}
+	return captured
 }
 
 // validatePlugins checks the captured plugins section against the compiled

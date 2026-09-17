@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/internal/plugins/sqlite"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/model"
@@ -425,17 +425,24 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 				},
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 					return harness.Execution{
-						Model: func(ctx context.Context, _ model.Request, _ agent.AssemblyCallback) (agent.ModelSettlement, error) {
+						NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
+							var obj map[string]json.RawMessage
+							if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {
+								return nil, errors.New("arguments must be one non-null JSON object")
+							}
+							return json.Marshal(obj)
+						},
+						Model: func(context.Context, model.Request) (model.Stream, error) {
 							executions.Add(1)
 							select {
 							case arrived <- struct{}{}:
 							default:
 							}
 							<-release
-							return agent.ModelSettlement{}, errors.New("seeded execution released after the test converged")
+							return nil, errors.New("seeded execution released after the test converged")
 						},
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}
+							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}}
 						},
 					}, nil
 				},
@@ -576,5 +583,28 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 	}
 	if err := again.Close(ctx); err != nil {
 		t.Fatalf("Close after reacquire: %v", err)
+	}
+}
+
+// TestBuiltinRegistrationComposes proves the shipped registration set — the
+// SQLite storage plugin, the native tools, the bundled adaptation, and the
+// LSP tools — composes through the real construction path: the complete
+// declared set opens over the real plugin's database, reload publishes, and
+// shutdown converges leaving exactly the plugin-owned files.
+func TestBuiltinRegistrationComposes(t *testing.T) {
+	ctx := context.Background()
+	e := newComposeEnv(t)
+	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, builtin.Plugins())
+	if err != nil {
+		t.Fatalf("OpenForTest: %v", err)
+	}
+	if revision, err := r.Reload(ctx); err != nil || revision != "2" {
+		t.Fatalf("Reload = (%q, %v), want 2", revision, err)
+	}
+	if err := r.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := sortedNames(t, e.dataDir); !slices.Equal(got, []string{"lightcode.db", "runtime.lock"}) {
+		t.Fatalf("data root after shutdown = %v, want exactly the real SQLite plugin's files", got)
 	}
 }

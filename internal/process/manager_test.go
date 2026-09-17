@@ -326,7 +326,7 @@ func TestManagerSetLimitsConcurrentWithStartForSession(t *testing.T) {
 func TestManagerLargeBackgroundOutputSpillsAndReadReusesPath(t *testing.T) {
 	home := t.TempDir()
 	m := NewManager(1, cmdoutput.Options{
-		HomeDir:      home,
+		Directory:    filepath.Join(home, ".lightcode"),
 		SpillPrefix:  "proc_output_",
 		MaxBytes:     100,
 		MaxLineChars: 80,
@@ -432,7 +432,7 @@ func TestManagerReadWhileExitHandlerPendingReturnsFinalOutput(t *testing.T) {
 func TestManagerWithoutExitHandlerDoesNotKeepUnreferencedSpill(t *testing.T) {
 	home := t.TempDir()
 	m := NewManager(1, cmdoutput.Options{
-		HomeDir:      home,
+		Directory:    filepath.Join(home, ".lightcode"),
 		SpillPrefix:  "proc_output_",
 		MaxBytes:     8,
 		MaxLineChars: 80,
@@ -448,7 +448,7 @@ func TestManagerWithoutExitHandlerDoesNotKeepUnreferencedSpill(t *testing.T) {
 func TestManagerDroppedExitHandlerDoesNotKeepUnreferencedSpill(t *testing.T) {
 	home := t.TempDir()
 	m := NewManager(1, cmdoutput.Options{
-		HomeDir:      home,
+		Directory:    filepath.Join(home, ".lightcode"),
 		SpillPrefix:  "proc_output_",
 		MaxBytes:     8,
 		MaxLineChars: 80,
@@ -531,7 +531,7 @@ func TestManagerEmptyRunningReadMarker(t *testing.T) {
 func TestManagerConcurrentWaitWritesAndReads(t *testing.T) {
 	home := t.TempDir()
 	m := NewManager(1, cmdoutput.Options{
-		HomeDir:      home,
+		Directory:    filepath.Join(home, ".lightcode"),
 		SpillPrefix:  "proc_output_",
 		MaxBytes:     128,
 		MaxLineChars: 80,

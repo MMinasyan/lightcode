@@ -20,13 +20,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/model"
@@ -48,42 +48,125 @@ func publicCapture() harness.ExecutionCapture {
 	}
 }
 
-// publicStream is one fake accepted model stream yielding a completed text
-// response, for the suite's real assembly callback.
-type publicStream struct{ i int }
-
-func (s *publicStream) Recv() (model.StreamDelta, error) {
-	if s.i > 0 {
-		return model.StreamDelta{}, io.EOF
+// publicNormalize is the suite's required pure normalizer: it accepts exactly
+// one non-null JSON object and returns its compact encoding.
+func publicNormalize(call model.ToolCall) (json.RawMessage, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {
+		return nil, errors.New("arguments must be one non-null JSON object")
 	}
-	s.i++
-	return model.StreamDelta{
+	return json.Marshal(obj)
+}
+
+// publicPermission is one built-in-allowed declaration for the suite's
+// effect-producing fixture plans: command.run allows any target.
+var publicPermission = []harness.PermissionRequest{{Permission: "command.run", Target: "fixture"}}
+
+// publicTurnStream is one fake accepted model stream assembling to the
+// fixture completed turn: text "done", the given ordered calls, and the
+// fixture usage reported last.
+func publicTurnStream(calls ...string) *publicScriptStream {
+	return publicUsageTurnStream(model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2}, calls...)
+}
+
+// publicUsageTurnStream is publicTurnStream carrying a specific usage count.
+func publicUsageTurnStream(usage model.Usage, calls ...string) *publicScriptStream {
+	d := model.StreamDelta{
 		HasChoice:        true,
 		Role:             "assistant",
 		ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "done"}},
 		FinishReason:     "stop",
-	}, nil
+	}
+	if len(calls) > 0 {
+		d.FinishReason = "tool_calls"
+		for i, id := range calls {
+			position := i
+			d.ToolFragments = append(d.ToolFragments, model.ToolCallFragment{
+				Position:         &position,
+				ID:               id,
+				Name:             "echo",
+				ArgumentFragment: `{"x":1}`,
+			})
+		}
+	}
+	return &publicScriptStream{deltas: []model.StreamDelta{d, {Usage: &usage}}}
 }
 
-func (s *publicStream) Close() error { return nil }
+// publicScriptStream is one fake accepted model stream: scripted deltas in
+// order, then either its read failure or io.EOF. A non-nil onExhausted hook
+// runs on the read after the last delta, before the report.
+type publicScriptStream struct {
+	deltas      []model.StreamDelta
+	err         error // non-EOF read failure yielded after the deltas when non-nil
+	i           int
+	onExhausted func()
+}
 
-// scriptModel is the scripted model effect of the suite: it records every
-// projected request, signals each arrival, optionally parks every invocation
-// until its gate closes, assembles once behind every output-bearing
-// settlement, and answers from a scripted settlement list.
+func (s *publicScriptStream) Recv() (model.StreamDelta, error) {
+	if s.i >= len(s.deltas) {
+		if s.onExhausted != nil {
+			s.onExhausted()
+		}
+		if s.err != nil {
+			s.i++
+			return model.StreamDelta{}, s.err
+		}
+		return model.StreamDelta{}, io.EOF
+	}
+	d := s.deltas[s.i]
+	s.i++
+	return d, nil
+}
+
+// publicPartialTurnStream is one accepted stream whose assembly errors while
+// retaining the "partial" text: the fixture errored continuation turn.
+func publicPartialTurnStream() *publicScriptStream {
+	return &publicScriptStream{
+		deltas: []model.StreamDelta{
+			{HasChoice: true, Role: "assistant", ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "partial"}}},
+			{Usage: &model.Usage{InputTokens: 5, OutputTokens: 7}},
+		},
+		err: errors.New("provider failure"),
+	}
+}
+
+func (s *publicScriptStream) Close() error { return nil }
+
+// publicAttempt is one scripted physical attempt: the stream of the accepted
+// attempt, or its pre-acceptance failure whose text becomes the settled
+// terminal detail.
+type publicAttempt struct {
+	stream model.Stream
+	err    error
+}
+
+// publicTurn scripts one accepted stream assembling to the fixture completed
+// turn with the given calls.
+func publicTurn(calls ...string) publicAttempt {
+	return publicAttempt{stream: publicTurnStream(calls...)}
+}
+
+// publicFail scripts one pre-acceptance attempt failure.
+func publicFail(detail string) publicAttempt {
+	return publicAttempt{err: errors.New(detail)}
+}
+
+// scriptModel is the scripted physical model request of the suite: it records
+// every projected request, signals each arrival, optionally parks every
+// invocation until its gate closes, and answers from a scripted attempt list.
 type scriptModel struct {
-	mu          sync.Mutex
-	requests    []model.Request
-	arrived     chan struct{}
-	gate        chan struct{}
-	settlements []agent.ModelSettlement
+	mu       sync.Mutex
+	requests []model.Request
+	arrived  chan struct{}
+	gate     chan struct{}
+	attempts []publicAttempt
 }
 
-func newScriptModel(settlements ...agent.ModelSettlement) *scriptModel {
-	return &scriptModel{arrived: make(chan struct{}, 16), settlements: settlements}
+func newScriptModel(attempts ...publicAttempt) *scriptModel {
+	return &scriptModel{arrived: make(chan struct{}, 16), attempts: attempts}
 }
 
-func (s *scriptModel) effect(_ context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+func (s *scriptModel) effect(_ context.Context, req model.Request) (model.Stream, error) {
 	s.mu.Lock()
 	s.requests = append(s.requests, req)
 	gate := s.gate
@@ -92,19 +175,14 @@ func (s *scriptModel) effect(_ context.Context, req model.Request, assemble agen
 	if gate != nil {
 		<-gate
 	}
-	var set agent.ModelSettlement
-	if len(s.settlements) > 0 {
-		set = s.settlements[0]
-		s.settlements = s.settlements[1:]
+	var next publicAttempt
+	if len(s.attempts) > 0 {
+		next = s.attempts[0]
+		s.attempts = s.attempts[1:]
 	} else {
-		set = agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)}
+		next = publicTurn()
 	}
-	if set.Output != nil { // an output-bearing settlement requires exactly one assembly
-		if _, err := assemble(publicModelRef, &publicStream{}); err != nil {
-			return agent.ModelSettlement{}, err
-		}
-	}
-	return set, nil
+	return next.stream, next.err
 }
 
 func (s *scriptModel) seen() []model.Request {
@@ -138,19 +216,6 @@ func (s *scriptModel) releaseGate() {
 	}
 }
 
-func publicCompleted(usage *model.Usage) *model.Output {
-	return &model.Output{
-		Status: model.OutputCompleted,
-		Source: publicModelRef,
-		Message: &model.Message{
-			Role:    model.RoleAssistant,
-			Source:  publicModelRef,
-			Content: []model.ContentPart{{Kind: model.PartText, Text: "done"}},
-		},
-		Usage: usage,
-	}
-}
-
 // publicFixture wires one Harness over the given store with a scripted
 // preparation callback: every admission receives the fixture's prepared
 // execution (or the per-call prepare hook's result) and signals the
@@ -175,7 +240,7 @@ type publicFixture struct {
 	prepareHook func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error)
 }
 
-func newPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, modelFn agent.ModelEffect) *publicFixture {
+func newPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, modelFn func(context.Context, model.Request) (model.Stream, error)) *publicFixture {
 	t.Helper()
 	if modelFn == nil {
 		modelFn = script.effect
@@ -185,9 +250,10 @@ func newPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, 
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 			return harness.Execution{
-				Model: modelFn,
+				Model:         modelFn,
+				NormalizeTool: publicNormalize,
 				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 				},
 			}, nil
 		},
@@ -249,6 +315,27 @@ func converge(t *testing.T, f *publicFixture) error {
 	return f.h.Wait(context.Background())
 }
 
+// awaitTerminal polls one Operation until its terminal settlement commits,
+// bounding the wait: a failing attempt's settlement must not race the
+// convergence cancellation the surrounding assertions rely on.
+func awaitTerminal(t *testing.T, h *harness.Harness, session, operation string) harness.OperationRecord {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		rec, err := h.ReadOperation(context.Background(), session, operation)
+		if err != nil {
+			t.Fatalf("ReadOperation: %v", err)
+		}
+		if rec.State.Terminal != nil {
+			return rec
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("operation %s never settled within the wait bound", operation)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // eachStore runs one fixture against memory and a temporary SQLite store.
 func eachStore(t *testing.T, run func(t *testing.T, store harness.Storage)) {
 	t.Helper()
@@ -275,8 +362,8 @@ func eachStore(t *testing.T, run func(t *testing.T, store harness.Storage)) {
 func TestPublicTurnLifecycle(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		script := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(&model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2})},
-			agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "second turn failed"},
+			publicAttempt{stream: publicUsageTurnStream(model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2})},
+			publicFail("second turn failed"),
 		)
 		script.gate = make(chan struct{})
 		f := newPublicFixture(t, store, script, nil)
@@ -425,8 +512,8 @@ func TestPublicIdempotency(t *testing.T) {
 
 		t.Run("reuse after delete", func(t *testing.T) {
 			script := newScriptModel(
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "source turn settled"}, // model-originated terminal before the drain
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "reused turn settled"}, // durable regardless of later cancellation
+				publicFail("source turn settled"), // model-originated terminal before the drain
+				publicFail("reused turn settled"), // durable regardless of later cancellation
 			)
 			gate := make(chan struct{})
 			script.gate = gate
@@ -466,7 +553,8 @@ func TestPublicIdempotency(t *testing.T) {
 			if err != nil || res.Disposition != harness.DispositionAdmitted || res.Operation == nil {
 				t.Fatalf("reuse after delete = %+v err %v, want admitted in another session", res, err)
 			}
-			<-script.arrived // the reused ID's Operation reached its model boundary
+			<-script.arrived                        // the reused ID's Operation reached its model boundary
+			awaitTerminal(t, f.h, other, "reuse-1") // the settlement commits before the convergence cancellation
 			if err := converge(t, f); err != nil {
 				t.Fatalf("Wait: %v", err)
 			}
@@ -501,9 +589,10 @@ func scriptPrepared(script *scriptModel) harness.PreparedExecution {
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 			return harness.Execution{
-				Model: script.effect,
+				Model:         script.effect,
+				NormalizeTool: publicNormalize,
 				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 				},
 			}, nil
 		},
@@ -738,8 +827,8 @@ func TestPublicSubmitCanceledWaiterPublishesNothing(t *testing.T) {
 func TestPublicAgentTypeChange(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		script := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},    // op-1 succeeds
-			agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "drained turn failed"}, // op-2 fails
+			publicTurn(),                      // op-1 succeeds
+			publicFail("drained turn failed"), // op-2 fails
 		)
 		script.gate = make(chan struct{})
 		f := newPublicFixture(t, store, script, nil)
@@ -907,7 +996,7 @@ func assertNothingAdmitted(t *testing.T, store harness.Storage, sessionID, opera
 // identity is globally unique across the store, so each seed passes its own.
 func seedIdleSource(t *testing.T, store harness.Storage, operationID string) string {
 	t.Helper()
-	script := newScriptModel(agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)})
+	script := newScriptModel(publicTurn())
 	f := newPublicFixture(t, store, script, nil)
 	source := createSession(t, f.h)
 	if _, err := submit(t, f.h, source, operationID, harness.MessageModeRegular, "hello"); err != nil {
@@ -1121,7 +1210,7 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 
 		t.Run("post-commit caller cancellation returns the committed admission", func(t *testing.T) {
 			probe := &publicationCancelStore{Storage: store}
-			script := newScriptModel(agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "committed turn"}) // model-originated terminal, durable regardless of later cancellation
+			script := newScriptModel(publicFail("committed turn")) // model-originated terminal, durable regardless of later cancellation
 			f := newPublicFixture(t, probe, script, nil)
 			defer f.close()
 			session := createSession(t, f.h)
@@ -1136,7 +1225,8 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			if caller.Err() == nil {
 				t.Fatalf("the caller context was not canceled after the commit")
 			}
-			<-script.arrived // the admitted execution reached its model boundary; its terminal commits in the effect's own transaction
+			<-script.arrived                       // the admitted execution reached its model boundary; its terminal commits in the effect's own transaction
+			awaitTerminal(t, f.h, session, "op-c") // the settlement commits before the convergence cancellation
 			if err := converge(t, f); err != nil {
 				t.Fatalf("Wait: %v", err)
 			}
@@ -1151,7 +1241,7 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			boundary := forkEntryOf(t, store, source, harness.EntryInput, "seed-op-2").ID
 
 			probe := &publicationCancelStore{Storage: store}
-			script := newScriptModel(agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)})
+			script := newScriptModel(publicTurn())
 			f := newPublicFixture(t, probe, script, nil)
 			defer f.close()
 			caller, cancelCaller := context.WithCancel(ctx)
@@ -1236,9 +1326,10 @@ func TestPublicOpenerInputMutationKeepsAdmittedExecution(t *testing.T) {
 								adm.Execution.Capabilities[0] = "dropped"
 							}
 							return harness.Execution{
-								Model: script.effect,
+								Model:         script.effect,
+								NormalizeTool: publicNormalize,
 								Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-									return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+									return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 								},
 								Close: func() error { // runs after the terminal settlement commits
 									select {
@@ -1300,8 +1391,8 @@ func TestPublicBufferedItemFailure(t *testing.T) {
 	t.Run("failed preparation drops the item and proceeds", func(t *testing.T) {
 		eachStore(t, func(t *testing.T, store harness.Storage) {
 			script := newScriptModel(
-				agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},  // op-1 succeeds
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "next item settled"}, // q2 settles through its own terminal
+				publicTurn(),                    // op-1 succeeds
+				publicFail("next item settled"), // q2 settles through its own terminal
 			)
 			gate := make(chan struct{})
 			script.gate = gate
@@ -1348,9 +1439,9 @@ func TestPublicBufferedItemFailure(t *testing.T) {
 	t.Run("failed delivered operation proceeds to the next item", func(t *testing.T) {
 		eachStore(t, func(t *testing.T, store harness.Storage) {
 			script := newScriptModel(
-				agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},   // op-1 succeeds
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "queued turn failed"}, // q1 fails
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "next item settled"},  // q2 settles through its own terminal
+				publicTurn(),                     // op-1 succeeds
+				publicFail("queued turn failed"), // q1 fails
+				publicFail("next item settled"),  // q2 settles through its own terminal
 			)
 			gate := make(chan struct{})
 			script.gate = gate
@@ -1401,8 +1492,8 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 	t.Run("regular input at the boundary continues the operation", func(t *testing.T) {
 		eachStore(t, func(t *testing.T, store harness.Storage) {
 			script := newScriptModel(
-				agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)}, // the boundary result commits; steering continues it
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "boundary settled"}, // model-originated terminal
+				publicTurn(),                   // the boundary result commits; steering continues it
+				publicFail("boundary settled"), // model-originated terminal
 			)
 			var (
 				f       *publicFixture
@@ -1410,14 +1501,14 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 				first   = true
 			)
 			inner := script.effect
-			boundary := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+			boundary := func(ctx context.Context, req model.Request) (model.Stream, error) {
 				if first { // submit at the model-result boundary, before the settlement returns
 					first = false
 					if _, err := submit(t, f.h, session, "op-2", harness.MessageModeRegular, "at-boundary"); err != nil {
 						t.Errorf("boundary submit: %v", err)
 					}
 				}
-				return inner(ctx, req, assemble)
+				return inner(ctx, req)
 			}
 			f = newPublicFixture(t, store, script, boundary)
 			defer f.close()
@@ -1448,8 +1539,8 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 	t.Run("queued input at the boundary drains after the terminal", func(t *testing.T) {
 		eachStore(t, func(t *testing.T, store harness.Storage) {
 			script := newScriptModel(
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "first settled"},        // model-originated terminal before the drain
-				agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "boundary turn failed"}, // the drained item's own terminal
+				publicFail("first settled"),        // model-originated terminal before the drain
+				publicFail("boundary turn failed"), // the drained item's own terminal
 			)
 			var (
 				f       *publicFixture
@@ -1457,14 +1548,14 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 				first   = true
 			)
 			inner := script.effect
-			boundary := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+			boundary := func(ctx context.Context, req model.Request) (model.Stream, error) {
 				if first { // defer one queued message at the final model-result boundary
 					first = false
 					if _, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "at-boundary"); err != nil {
 						t.Errorf("boundary submit: %v", err)
 					}
 				}
-				return inner(ctx, req, assemble)
+				return inner(ctx, req)
 			}
 			f = newPublicFixture(t, store, script, boundary)
 			defer f.close()
@@ -1499,20 +1590,20 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 func TestPublicSessionsExecuteConcurrently(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		parked := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "first session settled"}, // model-originated terminal: durable regardless of later cancellation
+			publicFail("first session settled"), // model-originated terminal: durable regardless of later cancellation
 		)
 		gate := make(chan struct{})
 		parked.gate = gate
 		finished := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "second session settled"}, // model-originated terminal: durable regardless of later cancellation
+			publicFail("second session settled"), // model-originated terminal: durable regardless of later cancellation
 		)
 		parkedEffect, finishedEffect := parked.effect, finished.effect
-		route := func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		route := func(ctx context.Context, req model.Request) (model.Stream, error) {
 			got := texts(req)
 			if got[len(got)-1] == "first" {
-				return parkedEffect(ctx, req, assemble)
+				return parkedEffect(ctx, req)
 			}
-			return finishedEffect(ctx, req, assemble)
+			return finishedEffect(ctx, req)
 		}
 		f := newPublicFixture(t, store, parked, route)
 		defer f.close()
@@ -1528,9 +1619,11 @@ func TestPublicSessionsExecuteConcurrently(t *testing.T) {
 		if _, err := submit(t, f.h, sessionB, "op-b", harness.MessageModeRegular, "second"); err != nil {
 			t.Fatalf("second session submit: %v", err)
 		}
-		<-f.prepare          // the second Session was admitted while the first is parked
-		<-finished.arrived   // and reached its model boundary before the first one resumed
-		parked.releaseGate() // the first Session settles through its own model-originated terminal
+		<-f.prepare                             // the second Session was admitted while the first is parked
+		<-finished.arrived                      // and reached its model boundary before the first one resumed
+		parked.releaseGate()                    // the first Session settles through its own model-originated terminal
+		awaitTerminal(t, f.h, sessionA, "op-a") // both failing attempts' settlements commit
+		awaitTerminal(t, f.h, sessionB, "op-b") // before the convergence cancellation can race either
 		if err := converge(t, f); err != nil {
 			t.Fatalf("Wait: %v", err)
 		}
@@ -1570,9 +1663,9 @@ type opRegisterWire struct {
 func TestPublicOrderedToolCallsSettle(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		script := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompletedWithCalls("call-1", "call-2")}, // the turn publishes two ordered calls
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},                         // the turn completes after the results
-			agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "drained turn settled"},                     // the drained item's own terminal
+			publicTurn("call-1", "call-2"),     // the turn publishes two ordered calls
+			publicTurn(),                       // the turn completes after the results
+			publicFail("drained turn settled"), // the drained item's own terminal
 		)
 		f := newPublicFixture(t, store, script, nil)
 		defer f.close()
@@ -1585,31 +1678,32 @@ func TestPublicOrderedToolCallsSettle(t *testing.T) {
 			Capture: publicCapture(),
 			Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 				return harness.Execution{
-					Model: script.effect,
+					Model:         script.effect,
+					NormalizeTool: publicNormalize,
 					Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 						toolMu.Lock()
 						toolOrder = append(toolOrder, call.ID)
 						toolMu.Unlock()
 						if call.ID == "call-1" { // executor-backed: intent before execution, one result after
-							return harness.PreparedTool{Execute: func(context.Context) model.ToolResult {
+							return harness.PreparedTool{Permissions: publicPermission, Execute: func(context.Context) harness.ToolOutcome {
 								reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterOperation, OperationID: "op-1"})
 								if err != nil {
 									t.Errorf("read operation register during execution: %v", err)
-									return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}
+									return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
 								}
 								var wire opRegisterWire
 								if err := json.Unmarshal(reg.Payload, &wire); err != nil {
 									t.Errorf("decode operation register during execution: %v", err)
-									return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}
+									return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
 								}
 								if wire.State.ActiveEffect == nil || wire.State.ActiveEffect.Kind != "tool" ||
 									wire.State.ActiveEffect.ToolCallID != "call-1" || wire.State.ActiveEffect.ResultEntryID == "" {
 									t.Errorf("tool intent during execution = %+v, want the committed call-1 intent with a reserved result", wire.State.ActiveEffect)
 								}
-								return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}
+								return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
 							}}
 						}
-						return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "immediate call-2"}} // no effect intent
+						return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "immediate call-2"}}} // no effect intent
 					},
 				}, nil
 			},
@@ -1655,23 +1749,254 @@ func TestPublicOrderedToolCallsSettle(t *testing.T) {
 	})
 }
 
-// publicCompletedWithCalls builds one valid completed output carrying the
-// given ordered tool calls.
-func publicCompletedWithCalls(calls ...string) *model.Output {
-	toolCalls := make([]model.ToolCall, 0, len(calls))
-	for _, id := range calls {
-		toolCalls = append(toolCalls, model.ToolCall{ID: id, Name: "echo", Arguments: json.RawMessage(`{"x":1}`)})
-	}
-	return &model.Output{
-		Status: model.OutputCompleted,
-		Source: publicModelRef,
-		Message: &model.Message{
-			Role:      model.RoleAssistant,
-			Source:    publicModelRef,
-			Content:   []model.ContentPart{{Kind: model.PartText, Text: "done"}},
-			ToolCalls: toolCalls,
-		},
-	}
+// TestPublicToolMetadataPersistsOpaqueAcrossStores proves the durable metadata
+// boundary through the public surface over both storage implementations:
+// a tool's metadata commits as its encoded durable bytes — even a raw value
+// over the bound whose compacted encoding fits, before and after a
+// restarted Harness revalidates the payloads — an executor returning
+// malformed metadata still commits its result without the member, a raw
+// value within the bound whose durable HTML-escaped encoding exceeds it is
+// dropped while its result still commits, the model-visible projection
+// carries only each committed result's content, and recovery revalidates
+// both payloads.
+func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		// the accepted executor returns the formatted fixture prefixed with
+		// 1 MiB of ordinary spaces: raw over the bound, but its compacted,
+		// HTML-escaped durable encoding is the short literal below it.
+		const formatted = `{ "n" : [1, 1.0, 1e0, 9007199254740993], "s" : "<>&" }`
+		const encoded = `{"n":[1,1.0,1e0,9007199254740993],"s":"\u003c\u003e\u0026"}`
+		rawOverBound := json.RawMessage(strings.Repeat(" ", 1<<20) + formatted)
+		// exactly 1 MiB of raw bytes, but every '<' encodes as \u003c in the
+		// durable payload, expanding it far past the bound.
+		const durableBound = 1 << 20
+		expanded := json.RawMessage(`"` + strings.Repeat("<", durableBound-2) + `"`)
+		if len(expanded) != durableBound {
+			t.Fatalf("fixture raw size = %d, want exactly the durable bound", len(expanded))
+		}
+		script := newScriptModel(
+			publicTurn("call-1", "call-2", "call-3"),
+			publicTurn(),
+		)
+		f := newPublicFixture(t, store, script, nil)
+		f.prepareHook = func(_ int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
+			return harness.PreparedExecution{
+				Capture: publicCapture(),
+				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+					return harness.Execution{
+						Model:         script.effect,
+						NormalizeTool: publicNormalize,
+						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+							switch call.ID {
+							case "call-2": // malformed metadata: dropped, the result still commits
+								return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
+									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "no preview"},
+									Metadata: json.RawMessage(`{broken`),
+								}}
+							case "call-3": // durable-oversized after escaping: dropped, no transaction failure
+								return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
+									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "expanded metadata"},
+									Metadata: expanded,
+								}}
+							}
+							return harness.PreparedTool{Permissions: publicPermission, Execute: func(context.Context) harness.ToolOutcome {
+								return harness.ToolOutcome{
+									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
+									Metadata: rawOverBound,
+								}
+							}}
+						},
+					}, nil
+				},
+			}, nil
+		}
+		session := createSession(t, f.h)
+		if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+		<-script.arrived // the turn that published the calls
+		<-script.arrived // the completion turn: all three results projected before it
+		if got := texts(script.seen()[1]); len(got) != 6 || got[3] != "ran call-1" || got[4] != "no preview" || got[5] != "expanded metadata" {
+			t.Fatalf("projection = %v, want the committed contents only", got)
+		}
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+
+		readResults := func() map[string]map[string]json.RawMessage {
+			results := map[string]map[string]json.RawMessage{}
+			for _, entry := range recoverEntries(t, store, session) {
+				if entry.Kind != harness.EntryToolResult {
+					continue
+				}
+				var wire map[string]json.RawMessage
+				if err := json.Unmarshal(entry.Payload, &wire); err != nil {
+					t.Fatalf("decode tool result payload: %v", err)
+				}
+				var callID string
+				if err := json.Unmarshal(wire["tool_call_id"], &callID); err != nil {
+					t.Fatalf("decode tool call id: %v", err)
+				}
+				results[callID] = wire
+			}
+			return results
+		}
+		results := readResults()
+		if string(results["call-1"]["metadata"]) != encoded {
+			t.Fatalf("call-1 metadata = %s, want the committed encoded bytes verbatim", results["call-1"]["metadata"])
+		}
+		if _, present := results["call-2"]["metadata"]; present {
+			t.Fatalf("call-2 carries malformed metadata %s, want it dropped while the result committed", results["call-2"]["metadata"])
+		}
+		if string(results["call-2"]["content"]) != `"no preview"` {
+			t.Fatalf("call-2 payload = %s, want the settled result alongside the dropped metadata", results["call-2"]["content"])
+		}
+		if _, present := results["call-3"]["metadata"]; present {
+			t.Fatalf("call-3 carries durable-oversized metadata, want it dropped while the result committed")
+		}
+		if string(results["call-3"]["content"]) != `"expanded metadata"` {
+			t.Fatalf("call-3 payload = %s, want the settled result committed past the metadata drop", results["call-3"]["content"])
+		}
+
+		// a restarted Harness revalidates every committed payload: the durable
+		// states prove no transaction failed and the Session stayed sound,
+		// and the committed encoded member survives recovery unchanged.
+		if err := harness.Recover(context.Background(), store); err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+		results = readResults()
+		if string(results["call-1"]["metadata"]) != encoded {
+			t.Fatalf("call-1 metadata after Recover = %s, want the committed encoded bytes verbatim", results["call-1"]["metadata"])
+		}
+	})
+}
+
+// TestPublicPreparedPermissionBoundarySurvivesRestart proves the prepared
+// permission boundary through the public surface on both stores: the
+// committed capture
+// carries the durable permission capability members; the advertised call's
+// original normalization commits at the assistant producer and the allowed
+// executor consumes those committed bytes; an immediate-success plan that
+// omits its declarations is denied through the public path with the fixed
+// bounded content and no metadata; and recovery revalidates the whole result
+// with the capture and normalization unchanged.
+func TestPublicPreparedPermissionBoundarySurvivesRestart(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		capture := publicCapture()
+		capture.Readonly = true
+		capture.WriteDir = "/w/sub"
+		script := newScriptModel(
+			publicTurn("call-1", "call-2"),
+			publicTurn(),
+		)
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		var consumed json.RawMessage
+		var executions int
+		f.prepareHook = func(_ int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
+			return harness.PreparedExecution{
+				Capture: capture,
+				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+					return harness.Execution{
+						Model:         script.effect,
+						NormalizeTool: publicNormalize,
+						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+							if call.ID == "call-2" { // the exit-condition omission through the public path
+								return harness.PreparedTool{Immediate: &harness.ToolOutcome{
+									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "undeclared success"},
+									Metadata: json.RawMessage(`{"would":"leak"}`),
+								}}
+							}
+							return harness.PreparedTool{
+								Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "fixture"}},
+								Execute: func(context.Context) harness.ToolOutcome {
+									executions++
+									consumed = call.Arguments
+									return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
+								},
+							}
+						},
+					}, nil
+				},
+			}, nil
+		}
+		session := createSession(t, f.h)
+		if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+		<-script.arrived // the turn publishing both calls
+		<-script.arrived // the continuation after the settled calls
+		if err := converge(t, f); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		if executions != 1 {
+			t.Fatalf("concrete effects started = %d, want only the declared call", executions)
+		}
+		if string(consumed) != `{"x":1}` {
+			t.Fatalf("executor saw arguments %s, want the committed normalized bytes", consumed)
+		}
+		rec, err := f.h.ReadOperation(context.Background(), session, "op-1")
+		if err != nil {
+			t.Fatalf("ReadOperation: %v", err)
+		}
+		if !rec.Admission.Execution.Readonly || rec.Admission.Execution.WriteDir != "/w/sub" {
+			t.Fatalf("committed capture = %v %q, want the durable permission capability members",
+				rec.Admission.Execution.Readonly, rec.Admission.Execution.WriteDir)
+		}
+		var normalized, denial, settled int
+		for _, entry := range recoverEntries(t, store, session) {
+			var wire map[string]json.RawMessage
+			if err := json.Unmarshal(entry.Payload, &wire); err != nil {
+				t.Fatalf("decode %s payload: %v", entry.ID, err)
+			}
+			switch entry.Kind {
+			case harness.EntryAssistant:
+				var calls []struct {
+					ID                  string          `json:"id"`
+					NormalizedArguments json.RawMessage `json:"normalized_arguments"`
+				}
+				if err := json.Unmarshal(wire["tool_calls"], &calls); err != nil {
+					t.Fatalf("decode assistant tool calls: %v", err)
+				}
+				for _, call := range calls {
+					if string(call.NormalizedArguments) != `{"x":1}` {
+						t.Fatalf("%s normalized_arguments = %s, want the producer's committed object", call.ID, call.NormalizedArguments)
+					}
+					normalized++
+				}
+			case harness.EntryToolResult:
+				settled++
+				var callID, status string
+				if err := json.Unmarshal(wire["tool_call_id"], &callID); err != nil {
+					t.Fatalf("decode tool call id: %v", err)
+				}
+				if err := json.Unmarshal(wire["status"], &status); err != nil {
+					t.Fatalf("decode status: %v", err)
+				}
+				if callID == "call-2" {
+					denial++
+					if status != "denied" || string(wire["content"]) != `"Permission denied."` {
+						t.Fatalf("call-2 result = %s, want the fixed public denial", entry.Payload)
+					}
+					if _, present := wire["metadata"]; present {
+						t.Fatalf("denied call-2 carries a metadata member")
+					}
+				} else if status != "success" {
+					t.Fatalf("call-1 result = %s, want the allowed execution", entry.Payload)
+				}
+			}
+		}
+		if normalized != 2 || denial != 1 || settled != 2 {
+			t.Fatalf("committed shape = %d normalized calls, %d denials, %d results, want 2/1/2", normalized, denial, settled)
+		}
+		if err := harness.Recover(context.Background(), store); err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+		after, err := f.h.ReadOperation(context.Background(), session, "op-1")
+		if err != nil || after.Admission.Execution.WriteDir != "/w/sub" || !after.Admission.Execution.Readonly {
+			t.Fatalf("capture after recovery = %+v err %v, want the same durable constraints", after.Admission.Execution, err)
+		}
+	})
 }
 
 // sessionRegister returns the raw durable Session register of one Session.
@@ -1892,7 +2217,7 @@ func TestPublicSweepArchiveBoundary(t *testing.T) {
 
 		boundary := first.State.LastActivity.Add(policy.ArchiveAfter)
 		before := sessionRegister(t, store, session)
-		if err := f.h.Sweep(ctx, policy, boundary); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, boundary); err != nil {
 			t.Fatalf("sweep at the boundary: %v", err)
 		}
 		still, err := f.h.ReadSession(ctx, session)
@@ -1905,7 +2230,7 @@ func TestPublicSweepArchiveBoundary(t *testing.T) {
 		}
 
 		past := boundary.Add(time.Nanosecond)
-		if err := f.h.Sweep(ctx, policy, past); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, past); err != nil {
 			t.Fatalf("sweep past the boundary: %v", err)
 		}
 		archived, err := f.h.ReadSession(ctx, session)
@@ -1943,7 +2268,7 @@ func TestPublicSweepDeleteBoundary(t *testing.T) {
 
 		boundary := archived.State.ArchivedAt.Add(policy.DeleteAfterArchive)
 		before := sessionRegister(t, store, session)
-		if err := f.h.Sweep(ctx, policy, boundary); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, boundary); err != nil {
 			t.Fatalf("sweep at the delete boundary: %v", err)
 		}
 		if _, err := f.h.ReadSession(ctx, session); err != nil {
@@ -1954,7 +2279,7 @@ func TestPublicSweepDeleteBoundary(t *testing.T) {
 			t.Fatalf("no-op delete-boundary sweep changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
 		}
 
-		if err := f.h.Sweep(ctx, policy, boundary.Add(time.Nanosecond)); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, boundary.Add(time.Nanosecond)); err != nil {
 			t.Fatalf("sweep past the delete boundary: %v", err)
 		}
 		key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
@@ -2000,7 +2325,7 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read archived: %v", err)
 			}
-			if err := f.h.Sweep(ctx, harness.SweepPolicy{}, farPast(beforeOpen.State.LastActivity)); err != nil {
+			if _, err := f.h.Sweep(ctx, harness.SweepPolicy{}, farPast(beforeOpen.State.LastActivity)); err != nil {
 				t.Fatalf("sweep with disabled thresholds: %v", err)
 			}
 			afterOpen, err := f.h.ReadSession(ctx, open)
@@ -2026,7 +2351,7 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 				t.Fatalf("read open: %v", err)
 			}
 			policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour}
-			if err := f.h.Sweep(ctx, policy, farPast(beforeOpen.State.LastActivity)); err != nil {
+			if _, err := f.h.Sweep(ctx, policy, farPast(beforeOpen.State.LastActivity)); err != nil {
 				t.Fatalf("sweep: %v", err)
 			}
 			sweptOpen, err := f.h.ReadSession(ctx, open)
@@ -2055,7 +2380,7 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 			}
 			policy := harness.SweepPolicy{DeleteAfterArchive: 12 * time.Hour}
 			now := beforeOpen.State.LastActivity.Add(100 * time.Hour)
-			if err := f.h.Sweep(ctx, policy, now); err != nil {
+			if _, err := f.h.Sweep(ctx, policy, now); err != nil {
 				t.Fatalf("sweep: %v", err)
 			}
 			stillOpen, err := f.h.ReadSession(ctx, open)
@@ -2102,7 +2427,7 @@ func TestPublicSweepRunningLeftUnchanged(t *testing.T) {
 		before := sessionRegister(t, store, session)
 
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
-		if err := f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour)); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour)); err != nil {
 			t.Fatalf("sweep of a running session: %v", err)
 		}
 		still, err := f.h.ReadSession(ctx, session)
@@ -2174,7 +2499,7 @@ func TestPublicSweepCorruptSibling(t *testing.T) {
 			t.Fatalf("read valid sibling: %v", err)
 		}
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
-		if err := f.h.Sweep(ctx, policy, validBefore.State.LastActivity.Add(100*time.Hour)); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, validBefore.State.LastActivity.Add(100*time.Hour)); err != nil {
 			t.Fatalf("sweep with a corrupt sibling = %v, want the corruption left in place and the pass completed", err)
 		}
 
@@ -2284,11 +2609,41 @@ func TestPublicSweepZeroTime(t *testing.T) {
 		createSession(t, f.h) // a listed Session exists: any storage read would be observable
 
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
-		if err := f.h.Sweep(context.Background(), policy, time.Time{}); !errors.Is(err, harness.ErrInvalid) {
-			t.Fatalf("sweep with a zero time = err %v, want ErrInvalid", err)
+		ids, err := f.h.Sweep(context.Background(), policy, time.Time{})
+		if !errors.Is(err, harness.ErrInvalid) || ids != nil {
+			t.Fatalf("sweep with a zero time = ids %v err %v, want ErrInvalid and no identities", ids, err)
 		}
 		if counting.lists != 0 {
 			t.Fatalf("zero-time sweep performed %d ListSessionIDs reads, want none before the rejection", counting.lists)
+		}
+	})
+}
+
+// failingListStore wraps one store and fails every ListSessionIDs with a
+// chosen error.
+type failingListStore struct {
+	harness.Storage
+	err error
+}
+
+func (s *failingListStore) ListSessionIDs(context.Context) ([]string, error) {
+	return nil, s.err
+}
+
+// TestPublicSweepListFailureReturnsNoIdentities proves the sweep's
+// listing-failure branch: the storage error returns with no identities.
+func TestPublicSweepListFailureReturnsNoIdentities(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		failing := errors.New("harness_test: injected listing failure")
+		f := newPublicFixture(t, &failingListStore{Storage: store, err: failing}, newScriptModel(), nil)
+		defer f.close()
+
+		ids, err := f.h.Sweep(context.Background(), harness.SweepPolicy{ArchiveAfter: time.Hour}, time.Now())
+		if !errors.Is(err, failing) {
+			t.Fatalf("sweep with a failing listing = err %v, want the injected listing failure", err)
+		}
+		if ids != nil {
+			t.Fatalf("sweep with a failing listing = ids %v, want no identities", ids)
 		}
 	})
 }
@@ -2346,7 +2701,10 @@ func TestPublicSweepWaitsForBlockedPreparation(t *testing.T) {
 
 		sweepDone := make(chan error, 1)
 		policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
-		go func() { sweepDone <- f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour)) }()
+		go func() {
+			_, err := f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour))
+			sweepDone <- err
+		}()
 		<-counting.listed // the sweep enumerated and is waiting for the idle reservation
 
 		close(releasePrep) // the preparation completes: the admission commits and the Session becomes running
@@ -2414,13 +2772,15 @@ var errInjectedRollback = errors.New("harness_test: injected post-mutation trans
 // failure: while armed, the next ReplaceRegister (or DeleteSession, or the
 // counted InsertRegister) call inside a transaction performs its real
 // mutation and then returns the sentinel, so the surrounding transaction
-// rolls back after mutating.
+// rolls back after mutating. An empty target arms the probe against every
+// identity; a set target arms it only against that Session's deletion.
 type rollbackProbeStore struct {
 	harness.Storage
 	failReplace      bool
 	failDelete       bool
 	failInsert       bool
 	insertsUntilFail int
+	target           string
 }
 
 func (s *rollbackProbeStore) Transact(ctx context.Context, fn func(harness.Transaction) error) error {
@@ -2447,7 +2807,7 @@ func (t *rollbackProbeTransaction) ReplaceRegister(key harness.RegisterKey, expe
 
 func (t *rollbackProbeTransaction) DeleteSession(sessionID string) error {
 	err := t.Transaction.DeleteSession(sessionID)
-	if err == nil && t.probe.failDelete {
+	if err == nil && t.probe.failDelete && (t.probe.target == "" || sessionID == t.probe.target) {
 		t.probe.failDelete = false
 		return errInjectedRollback
 	}
@@ -2643,12 +3003,12 @@ func rollbackSweepArchiveCase(t *testing.T, store harness.Storage) {
 	policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
 	now := first.State.LastActivity.Add(100 * time.Hour)
 	probe.failReplace = true
-	if err := f.h.Sweep(ctx, policy, now); !errors.Is(err, errInjectedRollback) {
+	if _, err := f.h.Sweep(ctx, policy, now); !errors.Is(err, errInjectedRollback) {
 		t.Fatalf("sweep with injected post-mutation failure = err %v, want the pass to stop and return it", err)
 	}
 	assertRollback(t, store, f.h, session, before, first)
 
-	if err := f.h.Sweep(ctx, policy, now); err != nil {
+	if _, err := f.h.Sweep(ctx, policy, now); err != nil {
 		t.Fatalf("sweep after rollback: %v", err)
 	}
 	archived, err := f.h.ReadSession(ctx, session)
@@ -2675,12 +3035,12 @@ func rollbackSweepDeleteCase(t *testing.T, store harness.Storage) {
 	policy := harness.SweepPolicy{DeleteAfterArchive: time.Hour}
 	now := archived.State.ArchivedAt.Add(100 * time.Hour)
 	probe.failDelete = true
-	if err := f.h.Sweep(ctx, policy, now); !errors.Is(err, errInjectedRollback) {
+	if _, err := f.h.Sweep(ctx, policy, now); !errors.Is(err, errInjectedRollback) {
 		t.Fatalf("sweep with injected post-mutation failure = err %v, want the pass to stop and return it", err)
 	}
 	assertRollback(t, store, f.h, session, before, archived)
 
-	if err := f.h.Sweep(ctx, policy, now); err != nil {
+	if _, err := f.h.Sweep(ctx, policy, now); err != nil {
 		t.Fatalf("sweep after rollback: %v", err)
 	}
 	key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
@@ -2715,7 +3075,7 @@ func TestPublicSweepMalformedRowSibling(t *testing.T) {
 		}
 
 		policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
-		if err := f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour)); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour)); err != nil {
 			t.Fatalf("sweep with a malformed row = %v, want the row left unchanged and the pass completed", err)
 		}
 
@@ -2739,6 +3099,204 @@ func TestPublicSweepMalformedRowSibling(t *testing.T) {
 		}
 		if !listed {
 			t.Fatalf("malformed row disappeared from the listing after the sweep")
+		}
+	})
+}
+
+// TestPublicSweepReturnsCommittedDeletedIDs proves the sweep return contract:
+// a pass with both transitions disabled returns no identities, a deleting
+// pass returns exactly the committed deleted identities, malformed rows
+// contribute none, and the next pass over the emptied registry returns none.
+func TestPublicSweepReturnsCommittedDeletedIDs(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		f := newPublicFixture(t, store, newScriptModel(), nil)
+		defer f.close()
+		first := createSession(t, f.h)
+		second := createSession(t, f.h)
+		archivedFirst, err := f.h.ArchiveSession(ctx, first)
+		if err != nil {
+			t.Fatalf("archive first: %v", err)
+		}
+		if _, err := f.h.ArchiveSession(ctx, second); err != nil {
+			t.Fatalf("archive second: %v", err)
+		}
+		const malformed = "corrupt-id" // a listed row violating the durable shape contributes no identity
+		if err := store.Transact(ctx, func(tx harness.Transaction) error {
+			_, err := tx.InsertRegister(harness.RegisterDraft{
+				Key:     harness.RegisterKey{SessionID: malformed, Kind: harness.RegisterSession},
+				Payload: json.RawMessage(`{}`),
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("plant the malformed row: %v", err)
+		}
+
+		if ids, err := f.h.Sweep(ctx, harness.SweepPolicy{}, archivedFirst.State.ArchivedAt.Add(time.Hour)); err != nil || len(ids) != 0 {
+			t.Fatalf("pass with both transitions disabled = ids %v err %v, want no identities", ids, err)
+		}
+		policy := harness.SweepPolicy{DeleteAfterArchive: time.Hour}
+		ids, err := f.h.Sweep(ctx, policy, archivedFirst.State.ArchivedAt.Add(2*time.Hour))
+		if err != nil {
+			t.Fatalf("deleting sweep: %v", err)
+		}
+		want := []string{first, second}
+		if !slices.Equal(slices.Sorted(slices.Values(ids)), slices.Sorted(slices.Values(want))) { // the result order is unspecified
+			t.Fatalf("deleting sweep = ids %v, want exactly the committed deleted identities %v", ids, want)
+		}
+		if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: malformed, Kind: harness.RegisterSession}); err != nil {
+			t.Fatalf("malformed row after the deleting sweep: %v", err)
+		}
+
+		if ids, err := f.h.Sweep(ctx, policy, archivedFirst.State.ArchivedAt.Add(3*time.Hour)); err != nil || len(ids) != 0 {
+			t.Fatalf("pass over the emptied registry = ids %v err %v, want no identities", ids, err)
+		}
+	})
+}
+
+// TestPublicSweepKeepsCommittedIDsBeforeAStoppingError proves the partial
+// return: the first Session's deletion commits, the second's delete
+// transaction rolls back post-mutation and stops the pass, and the returned
+// identities keep the success collected before the error.
+func TestPublicSweepKeepsCommittedIDsBeforeAStoppingError(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		a := seedArchivedSession(t, store)
+		b := seedArchivedSession(t, store)
+		first, second := a, b // the pass enumerates sorted identities: the rollback targets the second
+		if first > second {
+			first, second = second, first
+		}
+		f := newPublicFixture(t, &rollbackProbeStore{Storage: store, failDelete: true, target: second}, newScriptModel(), nil)
+		defer f.close()
+
+		ids, err := f.h.Sweep(ctx, harness.SweepPolicy{DeleteAfterArchive: time.Hour}, time.Now().Add(2*time.Hour))
+		if !errors.Is(err, errInjectedRollback) {
+			t.Fatalf("sweep past the rolled-back delete = err %v, want the injected rollback to stop the pass", err)
+		}
+		if !slices.Equal(ids, []string{first}) {
+			t.Fatalf("sweep = ids %v, want the success committed before the stopping error: [%s]", ids, first)
+		}
+		if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: second, Kind: harness.RegisterSession}); err != nil {
+			t.Fatalf("rolled-back session register: %v, want it still present", err)
+		}
+	})
+}
+
+// errInjectedMaterialization is the plain non-corruption sentinel the
+// failing materialization store returns for its named identity.
+var errInjectedMaterialization = errors.New("harness_test: injected materialization failure")
+
+// failingMaterializationStore wraps one store: the named Session's register
+// read fails with the plain sentinel, so its first materialization fails;
+// everything else delegates.
+type failingMaterializationStore struct {
+	harness.Storage
+	session string
+}
+
+func (s *failingMaterializationStore) ReadRegisters(ctx context.Context, sessionID string) ([]harness.Register, error) {
+	if sessionID == s.session {
+		return nil, errInjectedMaterialization
+	}
+	return s.Storage.ReadRegisters(ctx, sessionID)
+}
+
+// TestPublicSweepKeepsCommittedIDsBeforeAMaterializationFailure proves the
+// materialization stop site: the first identity's deletion commits, the
+// second identity's materialization fails with a plain non-corruption error
+// and stops the pass, and the returned identities keep the success collected
+// before the stop.
+func TestPublicSweepKeepsCommittedIDsBeforeAMaterializationFailure(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		a := seedArchivedSession(t, store)
+		b := seedArchivedSession(t, store)
+		first, second := a, b // the pass enumerates sorted identities: the failure targets the second
+		if first > second {
+			first, second = second, first
+		}
+		f := newPublicFixture(t, &failingMaterializationStore{Storage: store, session: second}, newScriptModel(), nil)
+		defer f.close()
+
+		ids, err := f.h.Sweep(ctx, harness.SweepPolicy{DeleteAfterArchive: time.Hour}, time.Now().Add(2*time.Hour))
+		if !errors.Is(err, errInjectedMaterialization) {
+			t.Fatalf("sweep past the failed materialization = err %v, want the injected failure to stop the pass", err)
+		}
+		if !slices.Equal(ids, []string{first}) {
+			t.Fatalf("sweep = ids %v, want the success committed before the stopping materialization failure: [%s]", ids, first)
+		}
+		if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: first, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("committed deletion's register = err %v, want ErrNotFound", err)
+		}
+		if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: second, Kind: harness.RegisterSession}); err != nil {
+			t.Fatalf("unmaterialized session register: %v, want it still present", err)
+		}
+	})
+}
+
+// TestPublicSweepCorruptRowsContributeNoIdentities proves the corrupt-row
+// return half at both corruption continue sites: a row corrupt before its
+// materialization and a row whose cached view turns corrupt under the sweep
+// transaction each contribute no identity and leave the pass running — the
+// deletion-eligible sibling's committed identity is the only one returned.
+func TestPublicSweepCorruptRowsContributeNoIdentities(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		f := newPublicFixture(t, store, newScriptModel(), nil)
+		defer f.close()
+
+		// a row corrupt before its materialization: the pass's own
+		// coordinator materialization discovers the corruption
+		var buf [16]byte
+		if _, err := rand.Read(buf[:]); err != nil {
+			t.Fatalf("random session id: %v", err)
+		}
+		preCorrupt := hex.EncodeToString(buf[:])
+		if err := store.Transact(ctx, func(tx harness.Transaction) error {
+			_, err := tx.InsertRegister(harness.RegisterDraft{
+				Key:     harness.RegisterKey{SessionID: preCorrupt, Kind: harness.RegisterSession},
+				Payload: json.RawMessage(`{}`),
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("plant the corrupt row: %v", err)
+		}
+
+		// a row whose cached view turns corrupt under the sweep transaction
+		cached := createSession(t, f.h)
+		if _, err := f.h.ReadSession(ctx, cached); err != nil {
+			t.Fatalf("materialize the cached row: %v", err)
+		}
+		key := harness.RegisterKey{SessionID: cached, Kind: harness.RegisterSession}
+		reg := sessionRegister(t, store, cached)
+		if err := store.Transact(ctx, func(tx harness.Transaction) error {
+			_, err := tx.ReplaceRegister(key, reg.Revision, json.RawMessage(`{}`))
+			return err
+		}); err != nil {
+			t.Fatalf("corrupt the cached row: %v", err)
+		}
+
+		sibling := createSession(t, f.h)
+		archived, err := f.h.ArchiveSession(ctx, sibling)
+		if err != nil {
+			t.Fatalf("archive the sibling: %v", err)
+		}
+
+		ids, err := f.h.Sweep(ctx, harness.SweepPolicy{DeleteAfterArchive: time.Hour}, archived.State.ArchivedAt.Add(2*time.Hour))
+		if err != nil {
+			t.Fatalf("sweep with corrupt rows = %v, want the corruption left in place and the pass completed", err)
+		}
+		if !slices.Equal(ids, []string{sibling}) {
+			t.Fatalf("sweep = ids %v, want exactly the committed deleted sibling [%s]", ids, sibling)
+		}
+		for _, id := range []string{preCorrupt, cached} { // the corrupt rows are left unchanged
+			if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); err != nil {
+				t.Fatalf("corrupt row %s after the sweep: %v, want it left in place", id, err)
+			}
+		}
+		if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: sibling, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("committed deletion's register = err %v, want ErrNotFound", err)
 		}
 	})
 }
@@ -2815,6 +3373,7 @@ type recoverOpState struct {
 		Kind          string `json:"kind"`
 		ResultEntryID string `json:"result_entry_id"`
 		ToolCallID    string `json:"tool_call_id"`
+		HookID        string `json:"hook_id"`
 	} `json:"active_effect"`
 	PendingToolCalls []struct {
 		CallID        string `json:"call_id"`
@@ -2937,7 +3496,7 @@ func rawAdmission(sessionID, operationID, entryID string) string {
 		`{"session_id":%q,"operation_id":%q,"request_kind":"message",`+
 			`"admitted_entry":{"session_id":%q,"entry_id":%q},"agent_type":"coder",`+
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
-			`"system_prompt":"system","tools":[%s]},"admitted_at":%q}`,
+			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":""},"admitted_at":%q}`,
 		sessionID, operationID, sessionID, entryID, rawToolDefinition, now)
 }
 
@@ -2978,8 +3537,8 @@ func seedRunningOperationShape(t *testing.T, store harness.Storage, activeEffect
 	if activeEffect == "model" && len(calls) > 0 {
 		t.Fatalf("a model effect admits no pending calls")
 	}
-	if activeEffect == "tool" && len(calls) == 0 {
-		t.Fatalf("a tool effect requires a first pending call")
+	if (activeEffect == "tool" || activeEffect == "hook") && len(calls) == 0 {
+		t.Fatalf("a %s effect requires a first pending call", activeEffect)
 	}
 	sessionID = newRawSessionID(t)
 	entryID, assistantID := newRawSessionID(t), newRawSessionID(t)
@@ -2996,6 +3555,9 @@ func seedRunningOperationShape(t *testing.T, store harness.Storage, activeEffect
 		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"model","result_entry_id":%q}`, modelReserved)
 	case "tool":
 		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"tool","result_entry_id":%q,"tool_call_id":%q}`, reserved[0], calls[0])
+	case "hook":
+		modelReserved = newRawSessionID(t) // the hook effect's own reserved result identity
+		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"hook","result_entry_id":%q,"tool_call_id":%q,"hook_id":"cap.hook.one"}`, modelReserved, calls[0])
 	}
 	pendingJSON := `,"pending_tool_calls":[]` // required member; empty arrays are non-null
 	if len(calls) > 0 {
@@ -3144,6 +3706,13 @@ func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, op
 		case harness.EntryToolResult:
 			if entry.ID != wantInterruptedResultIDs[i] {
 				t.Fatalf("interrupted result %d = %s, want the reserved identity %s", i, entry.ID, wantInterruptedResultIDs[i])
+			}
+			var wire struct {
+				Status  model.ToolResultStatus `json:"status"`
+				Content string                 `json:"content"`
+			}
+			if err := json.Unmarshal(entry.Payload, &wire); err != nil || wire.Status != model.ResultInterrupted || wire.Content != "Tool call interrupted." {
+				t.Fatalf("interrupted tool payload = %s, want the ordinary interrupted result", entry.Payload)
 			}
 		case harness.EntryOperationSettlement:
 			if entry.ID != settlementID {
@@ -3316,6 +3885,22 @@ func rawSignalPayload(sessionID, entryID, operationID string) string {
 		sessionID, entryID, operationID, sessionID, operationID)
 }
 
+// rawHookResultPayload builds one settled success hook-result entry payload
+// for one hook execution of the given call.
+func rawHookResultPayload(sessionID, entryID, operationID, hookID, callID string) string {
+	return fmt.Sprintf(
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"tool_call_id":%q,"status":"success","arguments":{"x":1}}`,
+		sessionID, entryID, operationID, hookID, callID)
+}
+
+// rawFailedHookResultPayload builds one settled failed or interrupted
+// hook-result entry payload carrying a non-empty error and no arguments.
+func rawFailedHookResultPayload(sessionID, entryID, operationID, hookID, callID, status, errText string) string {
+	return fmt.Sprintf(
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"tool_call_id":%q,"status":%q,"error":%q}`,
+		sessionID, entryID, operationID, hookID, callID, status, errText)
+}
+
 // rawSettlementPayload builds one successful settlement entry payload.
 func rawSettlementPayload(sessionID, entryID, operationID string) string {
 	return fmt.Sprintf(
@@ -3413,6 +3998,58 @@ func seedCorruptSiblingWithSignal(t *testing.T, store harness.Storage) string {
 	insertRawEntry(t, store, sessionID, signalID, "op-1", harness.EntrySignal, rawSignalPayload(sessionID, signalID, "op-1"))
 	insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "op-1"}, rawRunningOperationPayload(sessionID, "op-1", entryID))
 	return sessionID
+}
+
+// seedCorruptSiblingTwoCalls seeds the valid target graph with two published
+// calls left pending in publication order.
+func seedCorruptSiblingTwoCalls(t *testing.T, store harness.Storage) string {
+	t.Helper()
+	sessionID, _, _ := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1", "call-2"})
+	return sessionID
+}
+
+// seedCorruptSiblingHookResult seeds the valid target graph whose single
+// published call carries one settled success hook result between its
+// publishing assistant and the still-pending state.
+func seedCorruptSiblingHookResult(t *testing.T, store harness.Storage) string {
+	t.Helper()
+	sessionID, _, _ := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1"})
+	entries, err := store.ReadEntries(context.Background(), sessionID, 0)
+	if err != nil {
+		t.Fatalf("read seeded entries: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Kind == harness.EntryAssistant {
+			hookID := newRawSessionID(t)
+			insertRawEntry(t, store, sessionID, hookID, "op-1", harness.EntryHookResult,
+				rawHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1"))
+			return sessionID
+		}
+	}
+	t.Fatalf("seeded graph carries no assistant entry")
+	return ""
+}
+
+// seedCorruptSiblingFailedHook seeds the valid target graph whose single
+// published call carries one settled failed hook result between its
+// publishing assistant and the still-pending state.
+func seedCorruptSiblingFailedHook(t *testing.T, store harness.Storage) string {
+	t.Helper()
+	sessionID, _, _ := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1"})
+	entries, err := store.ReadEntries(context.Background(), sessionID, 0)
+	if err != nil {
+		t.Fatalf("read seeded entries: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Kind == harness.EntryAssistant {
+			hookID := newRawSessionID(t)
+			insertRawEntry(t, store, sessionID, hookID, "op-1", harness.EntryHookResult,
+				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "hook broke"))
+			return sessionID
+		}
+	}
+	t.Fatalf("seeded graph carries no assistant entry")
+	return ""
 }
 
 // seedCorruptSiblingSettled seeds the valid target graph of a successfully
@@ -3865,6 +4502,185 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 			},
 		},
 		{
+			name: "validator: hook result before its publishing assistant",
+			seed: seedCorruptSiblingPendingCall,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := newRawSessionID(t)
+				snap.entries = append(snap.entries, harness.Entry{
+					SessionID: sessionID, ID: hook, Sequence: 2, OperationID: "op-1",
+					Kind: harness.EntryHookResult, Payload: json.RawMessage(rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.one", "call-1")),
+				})
+			},
+		},
+		{
+			name: "validator: hook result after its call's terminal tool result",
+			seed: seedCorruptSiblingWithResult,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult,
+					rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.one", "call-1"))
+			},
+		},
+		{
+			name: "validator: duplicate hook result for one call",
+			seed: seedCorruptSiblingHookResult,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult,
+					rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.one", "call-1"))
+			},
+		},
+		{
+			name: "validator: hook result answers unpublished call",
+			seed: seedCorruptSiblingRunning,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult,
+					rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.one", "call-9"))
+			},
+		},
+		{
+			name: "validator: active hook effect repeats a settled hook",
+			seed: seedCorruptSiblingHookResult,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one"}`, corruptSiblingOtherEntry))
+				})
+			},
+		},
+		{
+			name: "validator: hook result after a failed hook for the same call",
+			seed: seedCorruptSiblingFailedHook,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult,
+					rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.two", "call-1"))
+			},
+		},
+		{
+			name: "validator: active hook effect after a failed hook",
+			seed: seedCorruptSiblingFailedHook,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.two"}`, corruptSiblingOtherEntry))
+				})
+			},
+		},
+		{
+			name: "validator: active tool effect after a failed hook",
+			seed: seedCorruptSiblingFailedHook,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"tool","result_entry_id":%q,"tool_call_id":"call-1"}`, snapReservedResultID(t, snap)))
+				})
+			},
+		},
+		{
+			name: "validator: interrupted hook with an error tool result",
+			seed: seedCorruptSiblingFailedHook,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := snapEntryOf(snap, harness.EntryHookResult)
+				hook.Payload = editPayloadObject(t, hook.Payload, func(obj map[string]json.RawMessage) {
+					obj["status"] = json.RawMessage(`"interrupted"`)
+				})
+				assistant := snapEntryOf(snap, harness.EntryAssistant)
+				reserved := snapReservedResultID(t, snap)
+				failed := editPayloadObject(t, json.RawMessage(rawToolResultPayload(sessionID, reserved, "op-1", assistant.ID, "call-1")), func(obj map[string]json.RawMessage) {
+					obj["status"] = json.RawMessage(`"error"`)
+					obj["content"] = json.RawMessage(`"hook broke"`)
+				})
+				snapAppendEntry(snap, sessionID, reserved, "op-1", harness.EntryToolResult, string(failed))
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["pending_tool_calls"] = json.RawMessage(`[]`)
+				})
+			},
+		},
+		{
+			name: "validator: error hook with a success tool result",
+			seed: seedCorruptSiblingFailedHook,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				assistant := snapEntryOf(snap, harness.EntryAssistant)
+				reserved := snapReservedResultID(t, snap)
+				snapAppendEntry(snap, sessionID, reserved, "op-1", harness.EntryToolResult,
+					rawToolResultPayload(sessionID, reserved, "op-1", assistant.ID, "call-1"))
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["pending_tool_calls"] = json.RawMessage(`[]`)
+				})
+			},
+		},
+		{
+			name: "validator: hook for a later call while an earlier call is unresolved",
+			seed: seedCorruptSiblingTwoCalls,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hookID := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hookID, "op-1", harness.EntryHookResult,
+					rawHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-2"))
+			},
+		},
+		{
+			name: "validator: hook for a later call before the earlier call's result",
+			seed: seedCorruptSiblingTwoCalls,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult,
+					rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.one", "call-2"))
+				assistant := snapEntryOf(snap, harness.EntryAssistant)
+				var wire struct {
+					ToolCalls []struct {
+						ID            string `json:"id"`
+						ResultEntryID string `json:"result_entry_id"`
+					} `json:"tool_calls"`
+				}
+				if err := json.Unmarshal(assistant.Payload, &wire); err != nil || len(wire.ToolCalls) != 2 {
+					t.Fatalf("seeded assistant has no two published calls: %v", err)
+				}
+				snapAppendEntry(snap, sessionID, wire.ToolCalls[0].ResultEntryID, "op-1", harness.EntryToolResult,
+					rawToolResultPayload(sessionID, wire.ToolCalls[0].ResultEntryID, "op-1", assistant.ID, "call-1"))
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["pending_tool_calls"] = json.RawMessage(fmt.Sprintf(
+						`[{"assistant_entry":{"session_id":%q,"entry_id":%q},"call_id":"call-2","result_entry_id":%q}]`,
+						sessionID, assistant.ID, wire.ToolCalls[1].ResultEntryID))
+				})
+			},
+		},
+		{
+			name: "validator: hook active effect reserves a pending tool-result identity",
+			seed: seedCorruptSiblingPendingCall,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				reserved := snapReservedResultID(t, snap)
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one"}`, reserved))
+				})
+			},
+		},
+		{
+			name: "validator: hook active effect reserves an already committed entry",
+			seed: seedCorruptSiblingPendingCall,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				input := snapEntryOf(snap, harness.EntryInput)
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one"}`, input.ID))
+				})
+			},
+		},
+		{
 			name: "validator: stored compaction record",
 			seed: seedCorruptSiblingRunning,
 			mutate: func(t *testing.T, snap *sessionSnapshot) {
@@ -4075,6 +4891,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 		{name: "assistant", seed: seedCorruptSiblingPendingCall, kind: harness.EntryAssistant, container: "source", wrong: `"prov/gpt-x"`},
 		{name: "tool_result", seed: seedCorruptSiblingWithResult, kind: harness.EntryToolResult, container: "assistant_entry", wrong: `"x"`},
 		{name: "signal", seed: seedCorruptSiblingWithSignal, kind: harness.EntrySignal, container: "related_operation", wrong: `[]`},
+		{name: "hook_result", seed: seedCorruptSiblingHookResult, kind: harness.EntryHookResult, container: "status", wrong: `[]`},
 		{name: "operation_settlement", seed: seedCorruptSiblingSettled, kind: harness.EntryOperationSettlement, container: "usage", wrong: `0`},
 	}
 	wireMutations := []struct {
@@ -4132,6 +4949,57 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				},
 			})
 		}
+	}
+
+	// The tool_result metadata member inventory: persisted values that
+	// violate the durable member rules — a null member (the schema-valid
+	// representation of malformed metadata: absence encodes by omission,
+	// never null) and a member beyond the bound — isolate their Session at
+	// the current supported version while a valid sibling stays usable.
+	metadataMutations := []struct {
+		name     string
+		metadata json.RawMessage
+	}{
+		{"null member", json.RawMessage(`null`)},
+		{"raw bytes over the bound", json.RawMessage(`"` + strings.Repeat("x", 1+(1<<20)) + `"`)},
+	}
+	for _, mutation := range metadataMutations {
+		rows = append(rows, corruptSiblingRow{
+			name: "tool_result metadata wire: " + mutation.name,
+			seed: seedCorruptSiblingWithResult,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				entry := snapEntryOf(snap, harness.EntryToolResult)
+				entry.Payload = editPayloadObject(t, entry.Payload, func(obj map[string]json.RawMessage) {
+					obj["metadata"] = mutation.metadata
+				})
+			},
+		})
+	}
+
+	// The assistant normalized_arguments member inventory: the producer only
+	// ever writes one complete JSON object, so a persisted non-object member
+	// (an array representative — every wrong kind fails the same object check)
+	// is codec corruption: it isolates its Session at decode and can never
+	// reach the tool boundary as executable input.
+	normalizedKinds := []struct {
+		name  string
+		wrong json.RawMessage
+	}{
+		{"array kind", json.RawMessage(`[1,2]`)},
+	}
+	for _, mutation := range normalizedKinds {
+		rows = append(rows, corruptSiblingRow{
+			name: "assistant normalized_arguments wire: " + mutation.name,
+			seed: seedCorruptSiblingPendingCall,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				entry := snapEntryOf(snap, harness.EntryAssistant)
+				entry.Payload = editPayloadObject(t, entry.Payload, func(obj map[string]json.RawMessage) {
+					obj["tool_calls"] = editJSONArray(t, obj["tool_calls"], func(items []map[string]json.RawMessage) {
+						items[0]["normalized_arguments"] = mutation.wrong
+					})
+				})
+			},
+		})
 	}
 
 	// The register-wire inventory: rejected session- and operation-register
@@ -4225,6 +5093,23 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 			},
 		})
 	}
+
+	// A malformed persisted execution-capture permission member isolates its
+	// Session with the typed corruption error while a valid sibling stays
+	// usable. The codec table owns the missing/null/wrong-type shape
+	// enumeration for both members; this row proves the recovery routing.
+	rows = append(rows, corruptSiblingRow{
+		name: "operation admission execution wire: malformed readonly",
+		seed: seedCorruptSiblingRunning,
+		mutate: func(t *testing.T, snap *sessionSnapshot) {
+			reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+			reg.Payload = editOperationAdmission(t, reg.Payload, func(admission map[string]json.RawMessage) {
+				admission["execution"] = editPayloadObject(t, admission["execution"], func(exec map[string]json.RawMessage) {
+					exec["readonly"] = json.RawMessage(`"true"`)
+				})
+			})
+		},
+	})
 
 	for _, row := range rows {
 		row := row
@@ -4372,9 +5257,10 @@ func racePrepared(f *publicFixture) harness.PreparedExecution {
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 			f.opens.Add(1)
 			return harness.Execution{
-				Model: f.model.effect,
+				Model:         f.model.effect,
+				NormalizeTool: publicNormalize,
 				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 				},
 			}, nil
 		},
@@ -4411,10 +5297,11 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
 		script := newScriptModel(
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompletedWithCalls("call-1")},                                                                              // turn 1 publishes a call
-			agent.ModelSettlement{Disposition: agent.DispoInterruption, Detail: "walkaway", Output: publicCompleted(&model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2})}, // turn 1 settles as an interruption terminal with a signal
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},                                                                                            // op-2 completes
-			agent.ModelSettlement{Disposition: agent.DispoReady, Output: publicCompleted(nil)},                                                                                            // op-3 completes
+			publicTurn("call-1"),                             // turn 1 publishes a call
+			publicAttempt{stream: publicPartialTurnStream()}, // turn 2 continues from the errored partial with the continuation signal
+			publicFail("source turn terminal"),               // turn 3 settles op-1's model-originated terminal
+			publicTurn(),                                     // op-2 completes
+			publicTurn(),                                     // op-3 completes
 		)
 		f := newPublicFixture(t, store, script, nil)
 		f.prepareHook = func(_ int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
@@ -4422,9 +5309,16 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 				Capture: publicCapture(),
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 					return harness.Execution{
-						Model: script.effect,
+						Model:         script.effect,
+						NormalizeTool: publicNormalize,
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
+							// the copied tool result carries tool-owned
+							// formatted metadata that the fork must preserve
+							// in its encoded durable form
+							return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
+								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
+								Metadata: json.RawMessage(`{ "n" : [1, 1.0, 1e0, 9007199254740993], "s" : "<>&" }`),
+							}}
 						},
 					}, nil
 				},
@@ -4436,7 +5330,8 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 			t.Fatalf("first submit: %v", err)
 		}
 		<-script.arrived // the published call
-		<-script.arrived // the interruption turn
+		<-script.arrived // the continued partial turn
+		<-script.arrived // the terminal turn
 		if _, err := f.h.Submit(ctx, harness.SubmitRequest{
 			SessionID:   source,
 			OperationID: "op-2",
@@ -4467,7 +5362,7 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 
 		// the fork's own turn settles through its model-originated terminal,
 		// durable inside the effect transaction regardless of later cancellation
-		forkScript := newScriptModel(agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: "fork turn settled"})
+		forkScript := newScriptModel(publicFail("fork turn settled"))
 		forkScript.gate = make(chan struct{})
 		f2 := newPublicFixture(t, store, forkScript, nil)
 		defer f2.close()
@@ -4501,11 +5396,12 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 
 		<-forkScript.arrived // the destination execution reached its model boundary
 		if got := texts(forkScript.seen()[0]); len(got) != 7 ||
-			got[0] != "system" || got[1] != "hello" || got[2] != "done" || got[3] != "ran call-1" || got[4] != "done" ||
-			got[5] != "<system-signal>Operation interrupted.</system-signal>" || got[6] != "fork input" {
+			got[0] != "system" || got[1] != "hello" || got[2] != "done" || got[3] != "ran call-1" || got[4] != "partial" ||
+			got[5] != "<system-signal>The previous model response failed after partial output. Continue from the retained response.</system-signal>" || got[6] != "fork input" {
 			t.Fatalf("fork projection = %v, want the copied prefix before the fork input", got)
 		}
 		forkScript.releaseGate()
+		awaitTerminal(t, f2.h, dest, "fork-1") // the fork turn's settlement commits before the convergence cancellation
 		if err := converge(t, f2); err != nil {
 			t.Fatalf("Wait: %v", err)
 		}
@@ -4559,8 +5455,9 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		}
 		var copiedAssistant struct {
 			ToolCalls []struct {
-				ID            string `json:"id"`
-				ResultEntryID string `json:"result_entry_id"`
+				ID                  string          `json:"id"`
+				ResultEntryID       string          `json:"result_entry_id"`
+				NormalizedArguments json.RawMessage `json:"normalized_arguments"`
 			} `json:"tool_calls"`
 			Usage *struct{} `json:"usage"`
 		}
@@ -4574,12 +5471,16 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 			copiedAssistant.ToolCalls[0].ResultEntryID != entries[2].ID {
 			t.Fatalf("copied call reservation = %+v, want it rewritten to the copied result entry %s", copiedAssistant.ToolCalls, entries[2].ID)
 		}
+		if string(copiedAssistant.ToolCalls[0].NormalizedArguments) != `{"x":1}` {
+			t.Fatalf("copied assistant normalized arguments = %s, want the source's committed normalization preserved verbatim", copiedAssistant.ToolCalls[0].NormalizedArguments)
+		}
 		var copiedResult struct {
 			AssistantEntry struct {
 				SessionID string `json:"session_id"`
 				EntryID   string `json:"entry_id"`
 			} `json:"assistant_entry"`
-			ToolCallID string `json:"tool_call_id"`
+			ToolCallID string          `json:"tool_call_id"`
+			Metadata   json.RawMessage `json:"metadata"`
 		}
 		if err := json.Unmarshal(entries[2].Payload, &copiedResult); err != nil {
 			t.Fatalf("decode copied tool result: %v", err)
@@ -4587,6 +5488,9 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		if copiedResult.AssistantEntry.SessionID != dest || copiedResult.AssistantEntry.EntryID != entries[1].ID ||
 			copiedResult.ToolCallID != "call-1" {
 			t.Fatalf("copied result reference = %+v, want it rewritten inside the copied prefix", copiedResult.AssistantEntry)
+		}
+		if string(copiedResult.Metadata) != `{"n":[1,1.0,1e0,9007199254740993],"s":"\u003c\u003e\u0026"}` {
+			t.Fatalf("copied result metadata = %s, want the source's encoded metadata preserved verbatim", copiedResult.Metadata)
 		}
 		var copiedSignal struct {
 			RelatedOperation struct {
@@ -5305,9 +6209,10 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 					openMu.Unlock()
 					events <- "open:" + adm.OperationID
 					return harness.Execution{
-						Model: script.effect,
+						Model:         script.effect,
+						NormalizeTool: publicNormalize,
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}
+							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 						},
 						Close: func() error {
 							rec, err := f.h.ReadOperation(ctx, adm.SessionID, adm.OperationID)
@@ -5383,5 +6288,126 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 		if opens[2].SessionID != res.Session.Identity.SessionID {
 			t.Fatalf("fork open names session %q, want the destination", opens[2].SessionID)
 		}
+	})
+}
+
+// TestPublicRecoverHookShapes proves the two hook recovery transitions over
+// memory and temporary SQLite using the same public storage fixtures as the
+// plain recovery shapes: an active hook effect's recovery atomically commits
+// its reserved interrupted hook result, the pending calls' interrupted tool
+// results, and the Operation/Session settlement in one transaction — a failed
+// recovery publication rolls the whole transaction back — while a running
+// quiet gap preserves settled hook evidence and commits the interrupted tool
+// result without replaying the hook. Recovery runs before any Harness exists;
+// a Harness constructed afterwards materializes the repaired state, and a
+// second recovery run writes nothing.
+func TestPublicRecoverHookShapes(t *testing.T) {
+	t.Run("active hook effect settles its reserved interrupted result", func(t *testing.T) {
+		eachStore(t, func(t *testing.T, store harness.Storage) {
+			ctx := context.Background()
+			sessionID, hookReserved, pending := seedRunningOperationShape(t, store, "hook", "op-1", []string{"call-1"})
+			state := recoverOpStateAt(t, store, sessionID, "op-1")
+			if state.ActiveEffect == nil || state.ActiveEffect.Kind != "hook" ||
+				state.ActiveEffect.ResultEntryID != hookReserved || state.ActiveEffect.HookID != "cap.hook.one" ||
+				state.ActiveEffect.ToolCallID != "call-1" {
+				t.Fatalf("seeded operation = %+v, want the committed hook effect intent", state)
+			}
+
+			pre := recoverEntries(t, store, sessionID)
+			if err := harness.Recover(ctx, store); err != nil {
+				t.Fatalf("recover: %v", err)
+			}
+			// Recovery adds its reserved hook result before the ordinary
+			// interrupted-tool, signal and settlement tail.
+			entries := recoverEntries(t, store, sessionID)
+			if len(entries) <= len(pre) {
+				t.Fatal("recovery committed no hook result")
+			}
+			hook := entries[len(pre)]
+			if hook.Kind != harness.EntryHookResult || hook.ID != hookReserved {
+				t.Fatalf("recovery commit %s is %s, want the interrupted hook result under the reserved identity %s", hook.ID, hook.Kind, hookReserved)
+			}
+			var hookWire struct {
+				HookID     string `json:"hook_id"`
+				ToolCallID string `json:"tool_call_id"`
+				Status     string `json:"status"`
+				Error      string `json:"error"`
+			}
+			if err := json.Unmarshal(hook.Payload, &hookWire); err != nil {
+				t.Fatalf("decode hook result: %v", err)
+			}
+			if hookWire.HookID != "cap.hook.one" || hookWire.ToolCallID != "call-1" || hookWire.Status != "interrupted" ||
+				hookWire.Error != recoveredInterruptionDetail {
+				t.Fatalf("interrupted hook result = %+v, want the recovery-settled interrupted evidence", hookWire)
+			}
+			assertRecoveredOperation(t, store, sessionID, "op-1", append(pre, hook), "", pending)
+			assertRecoverIdempotent(t, store, sessionID, "op-1")
+
+			h := harnessOver(t, store)
+			if _, err := h.ReadOperation(ctx, sessionID, "op-1"); err != nil {
+				t.Fatalf("repaired operation does not materialize: %v", err)
+			}
+		})
+	})
+
+	t.Run("quiet gap preserves settled hook evidence without replay", func(t *testing.T) {
+		eachStore(t, func(t *testing.T, store harness.Storage) {
+			ctx := context.Background()
+			sessionID, _, pending := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1"})
+			hookID := newRawSessionID(t)
+			insertRawEntry(t, store, sessionID, hookID, "op-1", harness.EntryHookResult,
+				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "hook broke"))
+
+			pre := recoverEntries(t, store, sessionID)
+			if err := harness.Recover(ctx, store); err != nil {
+				t.Fatalf("recover: %v", err)
+			}
+			assertRecoveredOperation(t, store, sessionID, "op-1", pre, "", pending)
+			assertRecoverIdempotent(t, store, sessionID, "op-1")
+
+			h := harnessOver(t, store)
+			if _, err := h.ReadOperation(ctx, sessionID, "op-1"); err != nil {
+				t.Fatalf("repaired operation does not materialize: %v", err)
+			}
+		})
+	})
+
+	t.Run("failed recovery publication rolls back", func(t *testing.T) {
+		eachStore(t, func(t *testing.T, store harness.Storage) {
+			ctx := context.Background()
+			targetID, hookReserved, _ := seedRunningOperationShape(t, store, "hook", "op-1", []string{"call-1"})
+			before := snapshotSession(t, store, targetID)
+
+			// The probe performs the target's first recovery register
+			// replacement for real, then fails the transaction: every recovery
+			// commit must roll back together.
+			probed := &rollbackProbeStore{Storage: store, failReplace: true}
+			if err := harness.Recover(ctx, probed); !errors.Is(err, errInjectedRollback) {
+				t.Fatalf("recover with the injected publication failure = %v, want the injected rollback", err)
+			}
+			assertSessionUnchanged(t, store, targetID, before)
+
+			if err := harness.Recover(ctx, store); err != nil {
+				t.Fatalf("second recover: %v", err)
+			}
+			state := recoverOpStateAt(t, store, targetID, "op-1")
+			if state.Status != "interruption" || state.ActiveEffect != nil || state.Terminal == nil {
+				t.Fatalf("recovered state = %+v, want the terminal interruption", state)
+			}
+			entries := recoverEntries(t, store, targetID)
+			hookResults := 0
+			for _, entry := range entries {
+				if entry.Kind == harness.EntryHookResult {
+					hookResults++
+					if entry.ID != hookReserved {
+						t.Fatalf("hook result = %+v, want it under the reserved identity", entry)
+					}
+				}
+			}
+			if hookResults != 1 {
+				t.Fatalf("%d hook results after the retried recovery, want exactly the reserved interrupted one", hookResults)
+			}
+			assertRecoverIdempotent(t, store, targetID, "op-1")
+		})
 	})
 }

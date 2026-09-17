@@ -4,16 +4,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/safefs"
-	"golang.org/x/sys/unix"
 )
 
 // ReadFile implements the read_file tool with line-numbered output,
@@ -68,102 +64,18 @@ func (r *ReadFile) ParametersSchema() map[string]any {
 }
 
 func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, error) {
-	path, _ := params["path"].(string)
-	if path == "" {
-		return "", fmt.Errorf("read_file: path is required")
-	}
-
-	offset := 1
-	if v, ok := params["offset"].(float64); ok {
-		offset = int(v)
-	}
-	if offset < 1 {
-		offset = 1
-	}
-
-	limit := r.cfg.ReadMaxLines
-	if v, ok := params["limit"].(float64); ok {
-		limit = int(v)
-	}
-	if limit < 1 {
-		limit = r.cfg.ReadMaxLines
-	}
-
-	displayAbsPath, err := fileDisplayAbsPathAtRoot(r.workspaceRoot, path)
+	prepared, err := prepareReadCall(r.workspaceRoot, r.cfg, r.tracker, params)
 	if err != nil {
-		return "", fmt.Errorf("read_file: resolve path: %w", err)
+		return "", err
 	}
-	absPath, err := fileSecurityPathAtRoot(r.workspaceRoot, params, path)
-	if err != nil {
-		return "", fmt.Errorf("read_file: resolve path: %w", err)
-	}
-
-	if _, err := ensureRegularExistingTarget(absPath); err != nil {
-		return "", fmt.Errorf("read_file: %w", err)
-	}
-
-	f, err := safefs.OpenExisting(absPath, os.O_RDONLY|unix.O_NONBLOCK)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return r.fileNotFound(displayAbsPath), nil
-		}
-		return "", fmt.Errorf("read_file: %w", err)
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return "", fmt.Errorf("read_file: stat: %w", err)
-	}
-	if err := ensureRegularFileInfo(absPath, info); err != nil {
-		return "", fmt.Errorf("read_file: %w", err)
-	}
-
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return "", fmt.Errorf("read_file: %w", err)
-	}
-	identity := FileIdentityFromFileInfoAndData(info, data)
-
-	// Deduplication check.
-	if r.tracker != nil {
-		if dup, _ := r.tracker.IsDuplicateIdentity(absPath, offset, limit, identity); dup {
-			r.tracker.TrackIdentity(absPath, offset, limit, identity)
-			return "File unchanged since last read. The content from the earlier read in this conversation is still current.", nil
-		}
-	}
-
-	// Binary detection.
-	if isBinary(data) {
-		return "", fmt.Errorf("read_file: %s appears to be a binary file", path)
-	}
-
-	// Track the read for mtime enforcement.
-	if r.tracker != nil {
-		r.tracker.TrackIdentity(absPath, offset, limit, identity)
-	}
-
-	result, totalLines := r.formatOutput(data, offset, limit)
-
-	// Footer for truncated files.
-	if offset > 1 || limit < totalLines {
-		lastLine := offset + limit - 1
-		if lastLine > totalLines {
-			lastLine = totalLines
-		}
-		if result != "" {
-			result += "\n"
-		}
-		if offset == 1 && limit < totalLines {
-			result += fmt.Sprintf("(Showing lines 1-%d of %d. Use offset=%d to continue.)", lastLine, totalLines, lastLine+1)
-		} else if offset > 1 {
-			result += fmt.Sprintf("(Showing lines %d-%d of %d.)", offset, lastLine, totalLines)
-		}
-	}
-
-	return result, nil
+	return prepared.Execute(context.Background())
 }
 
-func (r *ReadFile) formatOutput(data []byte, offset, limit int) (string, int) {
+// formatReadOutput renders the line-numbered window for the requested
+// offset/limit. Read windows are clamped to the remaining lines before any
+// addition, so individually valid large integers cannot overflow the
+// formatting or footer arithmetic.
+func formatReadOutput(data []byte, offset, limit, byteCap, charCap int) (string, int) {
 	lines := splitLines(data)
 	totalLen := len(lines)
 
@@ -171,14 +83,13 @@ func (r *ReadFile) formatOutput(data []byte, offset, limit int) (string, int) {
 	if start >= totalLen {
 		return "", totalLen
 	}
-	end := start + limit
-	if end > totalLen {
-		end = totalLen
+	remaining := totalLen - start
+	end := totalLen
+	if limit < remaining {
+		end = start + limit
 	}
 
 	var buf bytes.Buffer
-	byteCap := r.cfg.MaxOutputBytes
-	charCap := r.cfg.ReadLineMaxChars
 	byteUsed := 0
 
 	for i := start; i < end; i++ {
@@ -212,22 +123,19 @@ func (r *ReadFile) formatOutput(data []byte, offset, limit int) (string, int) {
 	return result, totalLen
 }
 
-func (r *ReadFile) fileNotFound(absPath string) string {
-	dir := filepath.Dir(absPath)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Sprintf("read_file: file not found: %s", absPath)
-	}
+// fileSuggestion is one scored candidate name for a missing file.
+type fileSuggestion struct {
+	name  string
+	score int // Levenshtein distance
+}
 
-	baseName := filepath.Base(absPath)
+// scoreFileSuggestions consumes a directory listing sorted by name (as
+// os.ReadDir returns it) and returns the nearest matches for the missing
+// base name: deduplicated, nearest distance first, at most three.
+func scoreFileSuggestions(entries []os.DirEntry, baseName string) []fileSuggestion {
 	baseStem := stripExt(baseName)
 
-	type candidate struct {
-		name  string
-		score int // Levenshtein distance
-	}
-	var candidates []candidate
-
+	var candidates []fileSuggestion
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -237,24 +145,23 @@ func (r *ReadFile) fileNotFound(absPath string) string {
 
 		// Common prefix ratio check.
 		if commonPrefixRatio(stem, baseStem) >= 0.6 {
-			dist := levenshteinDist(name, baseName)
-			candidates = append(candidates, candidate{name, dist})
+			candidates = append(candidates, fileSuggestion{name, levenshteinDist(name, baseName)})
 			continue
 		}
 		// Levenshtein distance check.
 		dist := levenshteinDist(name, baseName)
 		if dist <= 2 {
-			candidates = append(candidates, candidate{name, dist})
+			candidates = append(candidates, fileSuggestion{name, dist})
 		}
 	}
 
 	if len(candidates) == 0 {
-		return fmt.Sprintf("read_file: file not found: %s", absPath)
+		return nil
 	}
 
 	// Dedup and sort.
 	seen := make(map[string]bool)
-	var unique []candidate
+	var unique []fileSuggestion
 	for _, c := range candidates {
 		if !seen[c.name] {
 			seen[c.name] = true
@@ -267,12 +174,17 @@ func (r *ReadFile) fileNotFound(absPath string) string {
 	if len(unique) > 3 {
 		unique = unique[:3]
 	}
+	return unique
+}
 
+// formatFileSuggestions renders the not-found message and the suggestion
+// list for the supplied entries.
+func formatFileSuggestions(notFoundPath, dirName string, suggestions []fileSuggestion) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("read_file: file not found: %s\n", absPath))
+	sb.WriteString(fmt.Sprintf("read_file: file not found: %s\n", notFoundPath))
 	sb.WriteString("Did you mean:\n")
-	for _, c := range unique {
-		sb.WriteString(fmt.Sprintf("  %s/%s\n", filepath.Base(dir), c.name))
+	for _, c := range suggestions {
+		sb.WriteString(fmt.Sprintf("  %s/%s\n", dirName, c.name))
 	}
 	return strings.TrimSuffix(sb.String(), "\n")
 }

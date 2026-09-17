@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,7 +17,10 @@ type Definition struct {
 	Extensions []string
 	Markers    []string
 	LanguageID string
-	Install    func(cacheDir string) error
+	// Install installs the server binary into its cache directory. The
+	// context is the owner's lifetime: cancellation kills the install and
+	// returns the cancellation error.
+	Install func(ctx context.Context, cacheDir string) error
 }
 
 var definitions = []Definition{
@@ -27,12 +31,12 @@ var definitions = []Definition{
 		Extensions: []string{".go"},
 		Markers:    []string{"go.mod"},
 		LanguageID: "go",
-		Install: func(cacheDir string) error {
-			cmd := exec.Command("go", "install", "golang.org/x/tools/gopls@latest")
+		Install: func(ctx context.Context, cacheDir string) error {
+			cmd := exec.CommandContext(ctx, "go", "install", "golang.org/x/tools/gopls@latest")
 			cmd.Env = append(os.Environ(), "GOBIN="+cacheDir)
 			cmd.Stdout = nil
 			cmd.Stderr = nil
-			return runWithTimeout(cmd, 5*time.Minute)
+			return runWithTimeout(ctx, cmd, 5*time.Minute)
 		},
 	},
 	{
@@ -42,11 +46,11 @@ var definitions = []Definition{
 		Extensions: []string{".py"},
 		Markers:    []string{"pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", ".python-version"},
 		LanguageID: "python",
-		Install: func(cacheDir string) error {
-			cmd := exec.Command("npm", "install", "--prefix", cacheDir, "pyright")
+		Install: func(ctx context.Context, cacheDir string) error {
+			cmd := exec.CommandContext(ctx, "npm", "install", "--prefix", cacheDir, "pyright")
 			cmd.Stdout = nil
 			cmd.Stderr = nil
-			return runWithTimeout(cmd, 5*time.Minute)
+			return runWithTimeout(ctx, cmd, 5*time.Minute)
 		},
 	},
 	{
@@ -56,11 +60,11 @@ var definitions = []Definition{
 		Extensions: []string{".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"},
 		Markers:    []string{"tsconfig.json", "jsconfig.json", "package.json"},
 		LanguageID: "typescript",
-		Install: func(cacheDir string) error {
-			cmd := exec.Command("npm", "install", "--prefix", cacheDir, "typescript", "typescript-language-server")
+		Install: func(ctx context.Context, cacheDir string) error {
+			cmd := exec.CommandContext(ctx, "npm", "install", "--prefix", cacheDir, "typescript", "typescript-language-server")
 			cmd.Stdout = nil
 			cmd.Stderr = nil
-			return runWithTimeout(cmd, 5*time.Minute)
+			return runWithTimeout(ctx, cmd, 5*time.Minute)
 		},
 	},
 	{
@@ -70,14 +74,14 @@ var definitions = []Definition{
 		Extensions: []string{".rs"},
 		Markers:    []string{"Cargo.toml"},
 		LanguageID: "rust",
-		Install: func(cacheDir string) error {
-			cmd := exec.Command("rustup", "component", "add", "rust-analyzer")
+		Install: func(ctx context.Context, cacheDir string) error {
+			cmd := exec.CommandContext(ctx, "rustup", "component", "add", "rust-analyzer")
 			cmd.Stdout = nil
 			cmd.Stderr = nil
-			if err := runWithTimeout(cmd, 5*time.Minute); err != nil {
+			if err := runWithTimeout(ctx, cmd, 5*time.Minute); err != nil {
 				return err
 			}
-			which := exec.Command("rustup", "which", "rust-analyzer")
+			which := exec.CommandContext(ctx, "rustup", "which", "rust-analyzer")
 			out, err := which.Output()
 			if err != nil {
 				return fmt.Errorf("locate rust-analyzer: %w", err)
@@ -105,11 +109,11 @@ var definitions = []Definition{
 		Extensions: []string{".cs"},
 		Markers:    []string{".sln", ".csproj"},
 		LanguageID: "csharp",
-		Install: func(cacheDir string) error {
-			cmd := exec.Command("dotnet", "tool", "install", "--tool-path", cacheDir, "csharp-ls")
+		Install: func(ctx context.Context, cacheDir string) error {
+			cmd := exec.CommandContext(ctx, "dotnet", "tool", "install", "--tool-path", cacheDir, "csharp-ls")
 			cmd.Stdout = nil
 			cmd.Stderr = nil
-			return runWithTimeout(cmd, 5*time.Minute)
+			return runWithTimeout(ctx, cmd, 5*time.Minute)
 		},
 	},
 }
@@ -166,7 +170,13 @@ func ResolveBinary(home string, def *Definition) string {
 	return ""
 }
 
-func runWithTimeout(cmd *exec.Cmd, timeout time.Duration) error {
+// runWithTimeout runs cmd under a five-minute-class wall-clock timeout
+// derived from ctx: the timeout still bounds the install when the owner
+// outlives it, and cancellation of the parent kills the process, reaps it,
+// and returns the cancellation error.
+func runWithTimeout(ctx context.Context, cmd *exec.Cmd, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -175,8 +185,9 @@ func runWithTimeout(cmd *exec.Cmd, timeout time.Duration) error {
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(timeout):
+	case <-ctx.Done():
 		_ = cmd.Process.Kill()
-		return fmt.Errorf("install timed out after %v", timeout)
+		<-done
+		return ctx.Err()
 	}
 }

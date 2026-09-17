@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/storage"
@@ -33,7 +32,7 @@ const ownerConfigDocument = `{"providers":{"prov":{"transport":{"base_url":"http
 
 const ownerGatedConfigDocument = `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"plugins":{"gate":{}}}`
 
-const ownerAgentsDocument = `{"solo":{"model":"prov/m","system_prompt":"simple","tools":["echo"]}}`
+const ownerAgentsDocument = `{"solo":{"model":"prov/m","system_prompt":"simple"}}`
 
 type ownerEnv struct {
 	t              *testing.T
@@ -224,7 +223,8 @@ func (p *controlledPrep) open(_ context.Context, adm harness.OperationAdmission,
 	gate := p.modelGate
 	p.mu.Unlock()
 	return harness.Execution{
-		Model: func(ctx context.Context, _ model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		NormalizeTool: runtimeNormalize,
+		Model: func(ctx context.Context, _ model.Request) (model.Stream, error) {
 			select {
 			case p.modelArrived <- struct{}{}:
 			default:
@@ -233,17 +233,13 @@ func (p *controlledPrep) open(_ context.Context, adm harness.OperationAdmission,
 				select {
 				case <-gate:
 				case <-ctx.Done():
-					return agent.ModelSettlement{}, ctx.Err()
+					return nil, ctx.Err()
 				}
 			}
-			out, err := assemble(sel.agent.Model, &prepStream{})
-			if err != nil {
-				return agent.ModelSettlement{}, err
-			}
-			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &out}, nil
+			return &prepStream{}, nil
 		},
 		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}
+			return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}}
 		},
 		Close: func() error {
 			select {
@@ -471,16 +467,17 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 				Capture: harness.ExecutionCapture{ConfigurationRevision: "1", Model: prepModelRef, SystemPrompt: "seeded"},
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 					return harness.Execution{
-						Model: func(ctx context.Context, _ model.Request, _ agent.AssemblyCallback) (agent.ModelSettlement, error) {
+						NormalizeTool: runtimeNormalize,
+						Model: func(context.Context, model.Request) (model.Stream, error) {
 							select {
 							case arrived <- struct{}{}:
 							default:
 							}
 							<-release
-							return agent.ModelSettlement{}, errors.New("seeded execution released after the test converged")
+							return nil, errors.New("seeded execution released after the test converged")
 						},
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							return harness.PreparedTool{Immediate: &model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}
+							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}}
 						},
 					}, nil
 				},
@@ -519,7 +516,6 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 		}{
 			{"empty data directory", options{ConfigPath: e.configPath, Plugins: []Plugin{e.storagePlugin(nil)}, prepare: e.prep.prepare}},
 			{"empty config path", options{DataDir: e.dataDir, Plugins: []Plugin{e.storagePlugin(nil)}, prepare: e.prep.prepare}},
-			{"nil preparation", options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: []Plugin{e.storagePlugin(nil)}}},
 		}
 		for _, tc := range cases {
 			r, err := open(context.Background(), tc.opts)

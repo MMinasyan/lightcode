@@ -96,6 +96,20 @@ func int64Member(obj map[string]json.RawMessage, key string, required bool) (int
 	return n, nil
 }
 
+// boolMember reads one boolean member, rejecting null and every non-boolean
+// value.
+func boolMember(obj map[string]json.RawMessage, key string, required bool) (bool, error) {
+	raw, err := member(obj, key, required)
+	if err != nil || raw == nil {
+		return false, err
+	}
+	var b bool
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return false, fmt.Errorf("member %q must be a JSON boolean: %w", key, err)
+	}
+	return b, nil
+}
+
 // objectMember returns one required-or-optional object member decoded with
 // the same strictness as a top-level payload object.
 func objectMember(obj map[string]json.RawMessage, key string, required bool) (map[string]json.RawMessage, error) {

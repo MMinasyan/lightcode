@@ -33,6 +33,9 @@ type applyPatchStore struct {
 	// (used to simulate a mid-write failure at the second op).
 	failOnCall int
 	errFail    error
+	// discards records every DiscardSnapshotEntry call (entry IDs) so tests
+	// can observe the discard-before-mutation snapshot behavior.
+	discards []string
 }
 
 func (s *applyPatchStore) Snapshot(turn int, absPath string) error {
@@ -69,7 +72,8 @@ func (s *applyPatchStore) SnapshotResolvedEntry(turn int, originalPath, canonica
 	return canonicalPath, true, nil
 }
 
-func (s *applyPatchStore) DiscardSnapshotEntry(int, string) error {
+func (s *applyPatchStore) DiscardSnapshotEntry(_ int, entryID string) error {
+	s.discards = append(s.discards, entryID)
 	return nil
 }
 
@@ -226,9 +230,9 @@ func TestApplyPatchSyntheticEOFContextDoesNotCreateTrailingNewline(t *testing.T)
 	if len(lines) != 3 {
 		t.Fatalf("preview lines = %#v, want context/remove/add only", lines)
 	}
-	if lines[0].kind != lineContext || lines[0].text != "foo" ||
-		lines[1].kind != lineRemove || lines[1].text != "bar" ||
-		lines[2].kind != lineAdd || lines[2].text != "baz" {
+	if lines[0].Kind != lineContext || lines[0].Text != "foo" ||
+		lines[1].Kind != lineRemove || lines[1].Text != "bar" ||
+		lines[2].Kind != lineAdd || lines[2].Text != "baz" {
 		t.Fatalf("preview lines = %#v, want synthetic EOF context omitted", lines)
 	}
 }
@@ -274,7 +278,7 @@ func TestApplyPatchRealEOFContextPreservesTrailingNewline(t *testing.T) {
 		t.Fatalf("previews = %#v, want one hunk", previews)
 	}
 	lines := previews[0].Hunks[0].Lines
-	if len(lines) != 4 || lines[3].kind != lineContext || lines[3].text != "" {
+	if len(lines) != 4 || lines[3].Kind != lineContext || lines[3].Text != "" {
 		t.Fatalf("preview lines = %#v, want real EOF context retained", lines)
 	}
 }

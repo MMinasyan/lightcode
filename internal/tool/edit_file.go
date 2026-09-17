@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 
@@ -74,7 +73,11 @@ type editResult struct {
 }
 
 func (e *EditFile) Execute(_ context.Context, params map[string]any) (string, error) {
-	return e.editFileExec(params)
+	prepared, err := prepareEditCall(e.workspaceRoot, nil, e.tracker, params)
+	if err != nil {
+		return "", err
+	}
+	return prepared.Execute(context.Background())
 }
 
 func (e *EditFile) DisplayMetadata(_ context.Context, args json.RawMessage, result string) map[string]any {
@@ -112,46 +115,11 @@ func (*EditFileWithSnapshot) DisplayMetadata(_ context.Context, args json.RawMes
 }
 
 func (e *EditFileWithSnapshot) Execute(_ context.Context, params map[string]any) (string, error) {
-	path, _ := params["path"].(string)
-	if path == "" {
-		return "", fmt.Errorf("edit_file: path is required")
-	}
-	displayAbsPath, err := fileDisplayAbsPathAtRoot(e.workspaceRoot, path)
+	prepared, err := prepareEditCall(e.workspaceRoot, e.store, e.tracker, params)
 	if err != nil {
-		return "", fmt.Errorf("edit_file: resolve path: %w", err)
-	}
-	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
-	securityPath, err := fileSecurityPathAtRoot(e.workspaceRoot, params, path)
-	if err != nil {
-		return "", fmt.Errorf("edit_file: resolve path: %w", err)
-	}
-	if err := preflightEditSnapshotTarget(securityPath, e.tracker); err != nil {
 		return "", err
 	}
-	// The edit path revalidates and applies the textual match after snapshotting;
-	// if that fails before truncation, release only this tool's snapshot claim.
-	snapshot, err := snapshotFileForMutation(e.store, e.store.CurrentTurn(), displayAbsPath, securityPath)
-	if err != nil {
-		return "", fmt.Errorf("edit_file: snapshot: %w", err)
-	}
-	defer releaseSnapshotMutation(snapshot)
-	res, mutationStarted, err := editFileExecCommonForSnapshot(params, e.tracker, e.cfg, e.workspaceRoot)
-	if err != nil {
-		if !mutationStarted {
-			if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
-				return "", fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
-			}
-		} else {
-			err = retainFailedMutatedSnapshot(snapshot, securityPath, err)
-		}
-		return "", err
-	}
-	if err := recordMutatedSnapshotContent(snapshot, []byte(res.UpdatedContent)); err != nil {
-		retainMutatedSnapshot(snapshot)
-		return "", fmt.Errorf("edit_file: record snapshot identity: %w", err)
-	}
-	retainMutatedSnapshot(snapshot)
-	return res.Result, nil
+	return prepared.Execute(context.Background())
 }
 
 func editMetadataFromArgs(args json.RawMessage, result string) map[string]any {
@@ -159,14 +127,6 @@ func editMetadataFromArgs(args json.RawMessage, result string) map[string]any {
 		return nil
 	}
 	return editpreview.MetadataFromArgs(string(args), result)
-}
-
-func (e *EditFile) editFileExec(params map[string]any) (string, error) {
-	res, err := editFileExecCommon(params, e.tracker, e.cfg, e.workspaceRoot)
-	if err != nil {
-		return "", err
-	}
-	return res.Result, nil
 }
 
 func preflightEditSnapshotTarget(absPath string, _ *FileTracker) error {
@@ -186,84 +146,6 @@ func preflightEditSnapshotTarget(absPath string, _ *FileTracker) error {
 		return fmt.Errorf("edit_file: %w", err)
 	}
 	return nil
-}
-
-// editFileExecCommon is the shared implementation.
-func editFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) (*editResult, error) {
-	res, _, err := editFileExecCommonForSnapshot(params, tracker, cfg, workspaceRoot)
-	return res, err
-}
-
-func editFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) (*editResult, bool, error) {
-	path, _ := params["path"].(string)
-	if path == "" {
-		return nil, false, fmt.Errorf("edit_file: path is required")
-	}
-	oldString, _ := params["old_string"].(string)
-	newString, _ := params["new_string"].(string)
-	replaceAll, _ := params["replace_all"].(bool)
-
-	if oldString == "" {
-		return nil, false, fmt.Errorf("edit_file: old_string must not be empty")
-	}
-	if oldString == newString {
-		return nil, false, fmt.Errorf("edit_file: old_string and new_string are identical")
-	}
-
-	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
-	absPath, err := fileSecurityPathAtRoot(workspaceRoot, params, path)
-	if err != nil {
-		return nil, false, fmt.Errorf("edit_file: resolve path: %w", err)
-	}
-
-	if _, err := ensureRegularExistingTarget(absPath); err != nil {
-		return nil, false, fmt.Errorf("edit_file: %w", err)
-	}
-
-	f, err := openExistingMutationFile(absPath, os.O_RDWR)
-	if err != nil {
-		return nil, false, fmt.Errorf("edit_file: %w", err)
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, false, fmt.Errorf("edit_file: stat: %w", err)
-	}
-	if err := ensureRegularFileInfo(absPath, info); err != nil {
-		return nil, false, fmt.Errorf("edit_file: %w", err)
-	}
-
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return nil, false, fmt.Errorf("edit_file: %w", err)
-	}
-	content := string(data)
-
-	res, err := ApplyEdit(content, oldString, newString, replaceAll, path)
-	if err != nil {
-		return nil, false, err
-	}
-
-	mutationStarted := true
-	if err := f.Truncate(0); err != nil {
-		return nil, mutationStarted, fmt.Errorf("edit_file: truncate: %w", err)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, mutationStarted, fmt.Errorf("edit_file: seek: %w", err)
-	}
-	if _, err := f.Write([]byte(res.UpdatedContent)); err != nil {
-		return nil, mutationStarted, fmt.Errorf("edit_file: write: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		return nil, mutationStarted, fmt.Errorf("edit_file: sync: %w", err)
-	}
-
-	return &editResult{
-		Result:         res.Summary,
-		UpdatedContent: res.UpdatedContent,
-		LineRanges:     res.LineRanges,
-		Count:          res.Count,
-	}, mutationStarted, nil
 }
 
 // EditBufferResult holds the result of an edit applied to a string buffer.

@@ -54,9 +54,10 @@ func (h *Harness) contextSource(c *coordinator, operationID string) agent.Contex
 }
 
 // projectEntry maps one committed entry to its one model message under the
-// kind-to-message mapping. An operation settlement produces no model message;
-// the hook_result and compaction kinds have no valid Phase 3 payload and never
-// materialize.
+// kind-to-message mapping. An operation settlement and a hook result produce
+// no model message — hook results are execution evidence, never conversation
+// messages — and the compaction kind has no valid payload and never
+// materializes.
 func projectEntry(entry graphEntry) (model.Message, bool, error) {
 	switch {
 	case entry.Input != nil:

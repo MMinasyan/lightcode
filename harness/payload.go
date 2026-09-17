@@ -1,7 +1,6 @@
 package harness
 
 import (
-	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -299,11 +298,8 @@ func validateToolCallRecord(c toolCallRecord) error {
 		return errors.New("tool call extra values must be complete valid JSON")
 	}
 	if len(c.NormalizedArguments) > 0 {
-		if !json.Valid(c.NormalizedArguments) {
-			return errors.New("tool call normalized_arguments must be valid JSON")
-		}
-		if trimmed := bytes.TrimSpace(c.NormalizedArguments); bytes.Equal(trimmed, []byte("null")) {
-			return errors.New("tool call normalized_arguments must not be null")
+		if _, err := decodePayloadObject(c.NormalizedArguments); err != nil {
+			return fmt.Errorf("tool call normalized_arguments must be one complete JSON object: %v", err)
 		}
 	}
 	return validateHexID(c.ResultEntryID, "tool call reserved result entry id")
@@ -552,6 +548,30 @@ func assistantPayloadEligible(v assistantEntry) bool {
 	return v.Status == model.OutputCompleted && len(v.ToolCalls) > 0
 }
 
+// maxToolMetadataBytes is the durable bound of one tool-result metadata
+// value: the Harness enforces well-formedness and this size only, never the
+// plugin-owned semantics of the value.
+const maxToolMetadataBytes = 1 << 20 // 1 MiB
+
+// ownedToolMetadata is the one shared metadata mechanism: it returns the
+// owned bytes json.Marshal produces for one candidate tool_result metadata
+// member — one complete well-formed non-null JSON value whose durable
+// encoding (the compacted, HTML-escaped bytes json.Marshal produces for a
+// json.RawMessage) stays within the bound. Empty, malformed, null, or
+// oversized input returns nil. The bound applies to the persisted
+// representation, not to the caller's raw input, and the returned buffer
+// never aliases the caller.
+func ownedToolMetadata(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil || string(encoded) == "null" || len(encoded) > maxToolMetadataBytes {
+		return nil
+	}
+	return encoded
+}
+
 // encodeToolResultEntry renders one tool-result entry payload.
 func encodeToolResultEntry(v toolResultEntry) (json.RawMessage, error) {
 	if err := validateToolResultEntry(v); err != nil {
@@ -569,6 +589,7 @@ func encodeToolResultEntry(v toolResultEntry) (json.RawMessage, error) {
 		ToolCallID     string          `json:"tool_call_id"`
 		Status         string          `json:"status"`
 		Content        string          `json:"content"`
+		Metadata       json.RawMessage `json:"metadata,omitempty"`
 	}{
 		SessionID:      v.SessionID,
 		EntryID:        v.EntryID,
@@ -577,6 +598,7 @@ func encodeToolResultEntry(v toolResultEntry) (json.RawMessage, error) {
 		ToolCallID:     v.ToolCallID,
 		Status:         string(v.Status),
 		Content:        v.Content,
+		Metadata:       v.Metadata,
 	})
 	if err != nil {
 		return nil, err
@@ -594,7 +616,7 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 	if err != nil {
 		return toolResultEntry{}, err
 	}
-	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "assistant_entry", "tool_call_id", "status", "content"); err != nil {
+	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "assistant_entry", "tool_call_id", "status", "content", "metadata"); err != nil {
 		return toolResultEntry{}, err
 	}
 	sessionID, err := stringMember(obj, "session_id", true)
@@ -606,6 +628,10 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 		return toolResultEntry{}, err
 	}
 	operationID, err := optionalNonEmptyString(obj, "operation_id")
+	if err != nil {
+		return toolResultEntry{}, err
+	}
+	metadata, err := rawJSONMember(obj, "metadata", false)
 	if err != nil {
 		return toolResultEntry{}, err
 	}
@@ -646,6 +672,7 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 		ToolCallID:     toolCallID,
 		Status:         model.ToolResultStatus(status),
 		Content:        content,
+		Metadata:       metadata,
 	}
 	if err := validateToolResultEntry(v); err != nil {
 		return toolResultEntry{}, err
@@ -654,8 +681,9 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 }
 
 // validateToolResultEntry enforces the closed tool-result shape: durable
-// identities, non-empty original call id, and the landed Agent result rules
-// re-enforced through the landed constructor.
+// identities, non-empty original call id, the landed Agent result rules
+// re-enforced through the landed constructor, and a present metadata member
+// accepted by the one shared owning helper; omitted metadata stays valid.
 func validateToolResultEntry(v toolResultEntry) error {
 	if err := validateHexID(v.SessionID, "session id"); err != nil {
 		return err
@@ -670,6 +698,131 @@ func validateToolResultEntry(v toolResultEntry) error {
 	}
 	if _, err := model.NewToolResult(model.ToolResult{CallID: v.ToolCallID, Status: v.Status, Content: v.Content}); err != nil {
 		return err
+	}
+	if len(v.Metadata) > 0 && len(ownedToolMetadata(v.Metadata)) == 0 {
+		return fmt.Errorf("tool result metadata must be one well-formed non-null JSON value within the %d byte durable bound", maxToolMetadataBytes)
+	}
+	return nil
+}
+
+// encodeHookResultEntry renders one hook-result entry payload directly from
+// the validated tagged value.
+func encodeHookResultEntry(v hookResultEntry) (json.RawMessage, error) {
+	if err := validateHookResultEntry(v); err != nil {
+		return nil, invalidInput("hook result entry: %v", err)
+	}
+	return json.Marshal(v)
+}
+
+// decodeHookResultEntry reads one hook-result entry payload and enforces its
+// agreement with the addressed envelope identity. A hook result is never
+// independently copied: its owning Operation identity is required.
+func decodeHookResultEntry(env Entry) (hookResultEntry, error) {
+	if err := decodeEntryEnvelope(env); err != nil {
+		return hookResultEntry{}, err
+	}
+	obj, err := decodePayloadObject(env.Payload)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "hook_id", "tool_call_id", "status", "arguments", "error"); err != nil {
+		return hookResultEntry{}, err
+	}
+	sessionID, err := stringMember(obj, "session_id", true)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	entryID, err := stringMember(obj, "entry_id", true)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	operationID, err := stringMember(obj, "operation_id", true)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	hookID, err := stringMember(obj, "hook_id", true)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	toolCallID, err := stringMember(obj, "tool_call_id", true)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	status, err := stringMember(obj, "status", true)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	arguments, err := rawJSONMember(obj, "arguments", false)
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	errorText, err := optionalNonEmptyString(obj, "error")
+	if err != nil {
+		return hookResultEntry{}, err
+	}
+	if sessionID != env.SessionID {
+		return hookResultEntry{}, fmt.Errorf("payload session id %q does not agree with the envelope", sessionID)
+	}
+	if entryID != env.ID {
+		return hookResultEntry{}, fmt.Errorf("payload entry id %q does not agree with the envelope", entryID)
+	}
+	if operationID != env.OperationID {
+		return hookResultEntry{}, fmt.Errorf("payload operation id %q does not agree with the envelope", operationID)
+	}
+	v := hookResultEntry{
+		SessionID:   sessionID,
+		EntryID:     entryID,
+		OperationID: operationID,
+		HookID:      hookID,
+		ToolCallID:  toolCallID,
+		Status:      hookResultStatus(status),
+		Arguments:   arguments,
+		Error:       errorText,
+	}
+	if err := validateHookResultEntry(v); err != nil {
+		return hookResultEntry{}, err
+	}
+	return v, nil
+}
+
+// validateHookResultEntry enforces the closed hook-result shape: durable
+// identities with a required owning Operation, non-empty hook and call
+// identities, the closed status enum, and the status-owned member rules —
+// success carries exactly one complete JSON object and no error, while error
+// and interrupted carry a non-empty error and no arguments.
+func validateHookResultEntry(v hookResultEntry) error {
+	if err := validateHexID(v.SessionID, "session id"); err != nil {
+		return err
+	}
+	if err := validateHexID(v.EntryID, "entry id"); err != nil {
+		return err
+	}
+	if err := validateOperationIdentity(v.OperationID, "operation id"); err != nil {
+		return err
+	}
+	if v.HookID == "" {
+		return errors.New("hook id must be non-empty")
+	}
+	if err := validateOperationIdentity(v.ToolCallID, "hook result tool call id"); err != nil {
+		return err
+	}
+	switch v.Status {
+	case hookSucceeded:
+		if v.Error != "" {
+			return errors.New("successful hook result must not carry an error")
+		}
+		if _, err := decodePayloadObject(v.Arguments); err != nil {
+			return fmt.Errorf("successful hook result arguments must be one complete JSON object: %v", err)
+		}
+	case hookFailed, hookInterrupted:
+		if v.Error == "" {
+			return fmt.Errorf("%s hook result requires a non-empty error", v.Status)
+		}
+		if len(v.Arguments) > 0 {
+			return fmt.Errorf("%s hook result must not carry arguments", v.Status)
+		}
+	default:
+		return fmt.Errorf("hook result status %q is not one of success, error or interrupted", v.Status)
 	}
 	return nil
 }
@@ -1412,12 +1565,16 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 		SystemPrompt          string            `json:"system_prompt"`
 		Tools                 []json.RawMessage `json:"tools"`
 		Capabilities          []string          `json:"capabilities,omitempty"`
+		Readonly              bool              `json:"readonly"`
+		WriteDir              string            `json:"write_dir"`
 	}{
 		ConfigurationRevision: v.ConfigurationRevision,
 		Model:                 modelRaw,
 		SystemPrompt:          v.SystemPrompt,
 		Tools:                 tools,
 		Capabilities:          v.Capabilities,
+		Readonly:              v.Readonly,
+		WriteDir:              v.WriteDir,
 	})
 	if err != nil {
 		return nil, err
@@ -1558,9 +1715,10 @@ func validateOperationAdmission(v OperationAdmission) error {
 }
 
 // decodeExecutionCapture reads the durable capture with exact keys, unique
-// tool names, and preserved tool and capability order.
+// tool names, and preserved tool and capability order. The permission
+// capability members are required, including their false and empty values.
 func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, error) {
-	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "system_prompt", "tools", "capabilities"); err != nil {
+	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "system_prompt", "tools", "capabilities", "readonly", "write_dir"); err != nil {
 		return ExecutionCapture{}, err
 	}
 	revision, err := stringMember(obj, "configuration_revision", true)
@@ -1583,7 +1741,15 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 	if err != nil {
 		return ExecutionCapture{}, err
 	}
-	v := ExecutionCapture{ConfigurationRevision: revision, Model: ref, SystemPrompt: systemPrompt}
+	readonly, err := boolMember(obj, "readonly", true)
+	if err != nil {
+		return ExecutionCapture{}, err
+	}
+	writeDir, err := stringMember(obj, "write_dir", true)
+	if err != nil {
+		return ExecutionCapture{}, err
+	}
+	v := ExecutionCapture{ConfigurationRevision: revision, Model: ref, SystemPrompt: systemPrompt, Readonly: readonly, WriteDir: writeDir}
 	for i, raw := range toolsRaw {
 		tool, err := decodeToolDefinition(raw)
 		if err != nil {
@@ -1770,7 +1936,7 @@ func decodeOperationState(obj map[string]json.RawMessage) (OperationCurrentState
 
 // decodeActiveEffect reads one active effect with exact keys.
 func decodeActiveEffect(obj map[string]json.RawMessage) (ActiveEffect, error) {
-	if err := rejectUnknownMembers(obj, "kind", "result_entry_id", "tool_call_id"); err != nil {
+	if err := rejectUnknownMembers(obj, "kind", "result_entry_id", "tool_call_id", "hook_id"); err != nil {
 		return ActiveEffect{}, err
 	}
 	kind, err := stringMember(obj, "kind", true)
@@ -1785,7 +1951,11 @@ func decodeActiveEffect(obj map[string]json.RawMessage) (ActiveEffect, error) {
 	if err != nil {
 		return ActiveEffect{}, err
 	}
-	v := ActiveEffect{Kind: EffectKind(kind), ResultEntryID: resultEntryID, ToolCallID: toolCallID}
+	hookID, err := optionalNonEmptyString(obj, "hook_id")
+	if err != nil {
+		return ActiveEffect{}, err
+	}
+	v := ActiveEffect{Kind: EffectKind(kind), ResultEntryID: resultEntryID, ToolCallID: toolCallID, HookID: hookID}
 	if err := validateHexID(v.ResultEntryID, "active effect result entry id"); err != nil {
 		return ActiveEffect{}, err
 	}
@@ -1906,9 +2076,15 @@ func validateOperationState(v OperationCurrentState) error {
 			if v.ActiveEffect.ToolCallID != "" {
 				return errors.New("model active effect omits the tool call id")
 			}
+			if v.ActiveEffect.HookID != "" {
+				return errors.New("model active effect omits the hook id")
+			}
 		case EffectTool:
 			if v.ActiveEffect.ToolCallID == "" {
 				return errors.New("tool active effect requires its tool call id")
+			}
+			if v.ActiveEffect.HookID != "" {
+				return errors.New("tool active effect omits the hook id")
 			}
 			if len(v.PendingToolCalls) == 0 || v.ActiveEffect.ToolCallID != v.PendingToolCalls[0].CallID {
 				return errors.New("tool active effect must address the matching first pending call")
@@ -1916,8 +2092,18 @@ func validateOperationState(v OperationCurrentState) error {
 			if v.ActiveEffect.ResultEntryID != v.PendingToolCalls[0].ResultEntryID {
 				return errors.New("tool active effect must reserve the first pending call's result identity")
 			}
+		case EffectHook:
+			if v.ActiveEffect.ToolCallID == "" {
+				return errors.New("hook active effect requires its tool call id")
+			}
+			if v.ActiveEffect.HookID == "" {
+				return errors.New("hook active effect requires its hook id")
+			}
+			if len(v.PendingToolCalls) == 0 || v.ActiveEffect.ToolCallID != v.PendingToolCalls[0].CallID {
+				return errors.New("hook active effect must address the matching first pending call")
+			}
 		default:
-			return fmt.Errorf("active effect kind %q is not one of model or tool", v.ActiveEffect.Kind)
+			return fmt.Errorf("active effect kind %q is not one of model, tool or hook", v.ActiveEffect.Kind)
 		}
 	}
 	seenCalls := make(map[string]bool, len(v.PendingToolCalls))

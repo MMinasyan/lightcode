@@ -38,7 +38,7 @@ type ApplyPatch struct {
 	workspaceRoot string
 
 	applyPreviewMu sync.Mutex
-	applyPreview   []appliedFilePreview
+	applyPreview   []AppliedFilePreview
 }
 
 func NewApplyPatchWithSnapshot(store SnapshotStore, tracker *FileTracker, cfg config.ToolsConfig) *ApplyPatch {
@@ -75,10 +75,14 @@ func (a *ApplyPatch) DisplayMetadata(_ context.Context, _ json.RawMessage, _ str
 	previews := a.applyPreview
 	a.applyPreview = nil
 	a.applyPreviewMu.Unlock()
-	return applyPatchPreviewMetadata(previews)
+	return ApplyPatchPreviewMetadata(previews)
 }
 
-func applyPatchPreviewMetadata(previews []appliedFilePreview) map[string]any {
+// ApplyPatchPreviewMetadata converts captured per-file previews into the
+// public edit_preview_files metadata map (nil when there are no previews).
+// It is the single metadata implementation shared by the legacy
+// DisplayMetadata path and the target tools plugin.
+func ApplyPatchPreviewMetadata(previews []AppliedFilePreview) map[string]any {
 	if len(previews) == 0 {
 		return nil
 	}
@@ -96,7 +100,7 @@ func applyPatchPreviewMetadata(previews []appliedFilePreview) map[string]any {
 // lines with StartLine as the 1-based anchor; Delete / Move source
 // produces no hunks (just the D tag, which the renderer uses as a
 // header).
-func appliedPreviewToFileEntry(p appliedFilePreview) editpreview.FileEntry {
+func appliedPreviewToFileEntry(p AppliedFilePreview) editpreview.FileEntry {
 	return editpreview.FileEntry{
 		Path:    p.Path,
 		Op:      p.Op,
@@ -104,7 +108,7 @@ func appliedPreviewToFileEntry(p appliedFilePreview) editpreview.FileEntry {
 	}
 }
 
-func buildPreviewFromCaptured(p appliedFilePreview) editpreview.Preview {
+func buildPreviewFromCaptured(p AppliedFilePreview) editpreview.Preview {
 	if len(p.Hunks) == 0 {
 		if p.Op != "A" {
 			return editpreview.Preview{}
@@ -127,21 +131,21 @@ func buildPreviewFromCaptured(p appliedFilePreview) editpreview.Preview {
 		oldLine := h.StartLine
 		newLine := h.StartLine
 		for _, l := range h.Lines {
-			switch l.kind {
+			switch l.Kind {
 			case lineContext:
 				rows = append(rows, editpreview.Row{
-					Kind: editpreview.KindContext, OldLine: oldLine, NewLine: newLine, Text: l.text,
+					Kind: editpreview.KindContext, OldLine: oldLine, NewLine: newLine, Text: l.Text,
 				})
 				oldLine++
 				newLine++
 			case lineRemove:
 				rows = append(rows, editpreview.Row{
-					Kind: editpreview.KindRemove, OldLine: oldLine, Text: l.text,
+					Kind: editpreview.KindRemove, OldLine: oldLine, Text: l.Text,
 				})
 				oldLine++
 			case lineAdd:
 				rows = append(rows, editpreview.Row{
-					Kind: editpreview.KindAdd, NewLine: newLine, Text: l.text,
+					Kind: editpreview.KindAdd, NewLine: newLine, Text: l.Text,
 				})
 				newLine++
 			}
@@ -152,7 +156,7 @@ func buildPreviewFromCaptured(p appliedFilePreview) editpreview.Preview {
 }
 
 func (a *ApplyPatch) Execute(ctx context.Context, params map[string]any) (string, error) {
-	result, previews, err := applyPatchApplyAtRoot(ctx, a.workspaceRoot, a.store, a.tracker, params)
+	result, previews, err := applyPatchApplyAtRoot(a.workspaceRoot, a.store, a.tracker, params)
 	if err != nil {
 		// Clear any partial stash so a later tool call cannot read a
 		// stale preview.
@@ -169,7 +173,7 @@ func (a *ApplyPatch) Execute(ctx context.Context, params map[string]any) (string
 
 // takeApplyPreview returns the most recent apply's per-file previews and
 // clears the stash. Used by DisplayMetadata and tests.
-func (a *ApplyPatch) takeApplyPreview() []appliedFilePreview {
+func (a *ApplyPatch) takeApplyPreview() []AppliedFilePreview {
 	a.applyPreviewMu.Lock()
 	defer a.applyPreviewMu.Unlock()
 	p := a.applyPreview

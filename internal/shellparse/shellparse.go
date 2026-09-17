@@ -34,6 +34,35 @@ func Parse(command string) ([]Segment, error) {
 	return p.segments, nil
 }
 
+// ParseSimple recognizes the restricted simple-command grammar: complete
+// simple commands — a command word followed by literal words, joined by
+// ; newline && || | or |& — and nothing else. Comments, command-position
+// reserved words, assignment prefixes, parentheses/braces, expansions and
+// substitutions, heredocs/here-strings and every redirection are outside
+// the grammar. It shares the existing scanner in a private restricted mode;
+// legacy Parse keeps its behavior.
+//
+// ok reports that the whole input belongs to the grammar. Segment.Text
+// preserves source-token boundaries: only unquoted separating blanks are
+// trimmed, never quoted or escaped trailing whitespace. Any input outside
+// the grammar — or without at least one command — returns no segments, so
+// no partial segment list ever escapes.
+func ParseSimple(command string) ([]Segment, bool) {
+	p := parser{runes: []rune(command), restricted: true, firstWordStart: -1, lastWordEnd: -1}
+	if err := p.scan(); err != nil {
+		return nil, false
+	}
+	if p.simpleRejected || len(p.segments) == 0 {
+		return nil, false
+	}
+	switch last := p.segments[len(p.segments)-1].Separator; last {
+	case "", ";", "\n":
+	default:
+		return nil, false // dangling &&, ||, | or |& at end of input
+	}
+	return p.segments, true
+}
+
 type parser struct {
 	runes []rune
 
@@ -45,6 +74,16 @@ type parser struct {
 	inSingle bool
 	inDouble bool
 	hadArg   bool
+
+	// Restricted-mode state. restricted selects the grammar; simpleRejected
+	// marks input outside it and is never reset within one scan. The word
+	// indices are byte offsets into raw: firstWordStart/lastWordEnd bound
+	// the segment's source-faithful Text.
+	restricted     bool
+	simpleRejected bool
+	firstWordStart int
+	lastWordEnd    int
+	firstWordDone  bool
 }
 
 func (p *parser) scan() error {
@@ -52,7 +91,7 @@ func (p *parser) scan() error {
 		r := p.runes[i]
 
 		if p.inSingle {
-			p.raw.WriteRune(r)
+			p.writeWordRune(r)
 			if r == '\'' {
 				p.inSingle = false
 				p.hadArg = true
@@ -65,10 +104,14 @@ func (p *parser) scan() error {
 
 		if p.inDouble {
 			if r == '\\' {
+				if p.restricted && i+1 < len(p.runes) && p.runes[i+1] == '\r' {
+					p.simpleRejected = true
+					continue
+				}
 				if p.skipLineContinuation(&i) {
 					continue
 				}
-				p.raw.WriteRune(r)
+				p.writeWordRune(r)
 				if i+1 >= len(p.runes) {
 					p.arg.WriteRune(r)
 					p.hadArg = true
@@ -77,7 +120,7 @@ func (p *parser) scan() error {
 				next := p.runes[i+1]
 				if isDoubleQuoteEscapedRune(next) {
 					i++
-					p.raw.WriteRune(next)
+					p.writeWordRune(next)
 					p.arg.WriteRune(next)
 					p.hadArg = true
 					continue
@@ -89,12 +132,20 @@ func (p *parser) scan() error {
 
 			switch r {
 			case '"':
-				p.raw.WriteRune(r)
+				p.writeWordRune(r)
 				p.inDouble = false
 				p.hadArg = true
 			case '`':
+				if p.restricted {
+					p.simpleRejected = true
+					continue
+				}
 				return fmt.Errorf("backtick command substitution not allowed")
 			case '$':
+				if p.restricted {
+					p.simpleRejected = true
+					continue
+				}
 				p.raw.WriteRune(r)
 				if i+1 < len(p.runes) && p.runes[i+1] == '(' {
 					return fmt.Errorf("$() command substitution not allowed")
@@ -103,10 +154,15 @@ func (p *parser) scan() error {
 				p.arg.WriteRune(r)
 				p.hadArg = true
 			default:
-				p.raw.WriteRune(r)
+				p.writeWordRune(r)
 				p.arg.WriteRune(r)
 				p.hadArg = true
 			}
+			continue
+		}
+
+		if p.restricted {
+			p.scanRestrictedRune(&i)
 			continue
 		}
 
@@ -191,6 +247,17 @@ func (p *parser) scan() error {
 }
 
 func (p *parser) emitArg() {
+	if p.restricted && p.hadArg && !p.firstWordDone {
+		// The open word is the segment's first: its raw source spans from
+		// firstWordStart to the current raw end, so quote or escape
+		// provenance in the source disqualifies the reserved and assignment
+		// spellings.
+		word := p.raw.String()[p.firstWordStart:]
+		p.firstWordDone = true
+		if reservedCommandWords[word] || isAssignmentPrefix(word) {
+			p.simpleRejected = true
+		}
+	}
 	if !p.hadArg {
 		return
 	}
@@ -200,6 +267,10 @@ func (p *parser) emitArg() {
 }
 
 func (p *parser) emitSegment(separator string) {
+	if p.restricted {
+		p.emitSegmentRestricted(separator)
+		return
+	}
 	text := strings.TrimSpace(p.raw.String())
 	if text != "" || len(p.segment.Argv) > 0 || len(p.segment.Redirections) > 0 || separator != "" {
 		p.segment.Text = text
@@ -211,6 +282,166 @@ func (p *parser) emitSegment(separator string) {
 	p.raw.Reset()
 	p.arg.Reset()
 	p.hadArg = false
+}
+
+// emitSegmentRestricted closes one segment under the restricted grammar.
+// Its Text is the source span from the segment's first word character to
+// its last — only unquoted separating blanks are trimmed. A blank segment
+// is ignored when separated by a newline (blank line) or the end of input,
+// and outside the grammar otherwise (empty semicolon or conditional/pipeline
+// command).
+func (p *parser) emitSegmentRestricted(separator string) {
+	text := ""
+	if p.firstWordStart >= 0 {
+		raw := p.raw.String()
+		text = raw[p.firstWordStart:p.lastWordEnd]
+	}
+	if text != "" {
+		p.segment.Text = text
+		p.segment.Normalized = strings.Join(p.segment.Argv, " ")
+		p.segment.Separator = separator
+		p.segments = append(p.segments, p.segment)
+	} else if separator != "\n" && separator != "" {
+		p.simpleRejected = true
+	}
+	p.segment = Segment{}
+	p.raw.Reset()
+	p.arg.Reset()
+	p.hadArg = false
+	p.firstWordStart = -1
+	p.lastWordEnd = -1
+	p.firstWordDone = false
+}
+
+// writeWordRune writes one word rune to the segment source, tracking word
+// boundaries in restricted mode so Segment.Text can be cut from the source
+// without trimming quoted or escaped content.
+func (p *parser) writeWordRune(r rune) {
+	if p.restricted {
+		if p.firstWordStart < 0 {
+			p.firstWordStart = p.raw.Len()
+		}
+	}
+	p.raw.WriteRune(r)
+	if p.restricted {
+		p.lastWordEnd = p.raw.Len()
+	}
+}
+
+// scanRestrictedRune consumes one unquoted rune under the restricted
+// simple-command grammar, marking anything outside it via simpleRejected.
+// Recognized shell whitespace is ASCII-only: space and tab separate words,
+// newline separates commands, and carriage return or other Unicode
+// whitespace uses fallback. Any unquoted redirection operator, comment
+// start, parenthesis/brace, reserved syntax or expansion marks the input
+// out of the grammar without partial parsing.
+func (p *parser) scanRestrictedRune(i *int) {
+	r := p.runes[*i]
+	switch {
+	case r == '\\':
+		if *i+1 >= len(p.runes) {
+			p.simpleRejected = true // trailing lone backslash
+			return
+		}
+		next := p.runes[*i+1]
+		switch next {
+		case '\n':
+			*i++ // line continuation keeps the current word open
+		case '\r':
+			p.simpleRejected = true
+		default:
+			p.writeWordRune(r)
+			p.writeWordRune(next)
+			p.arg.WriteRune(next)
+			p.hadArg = true
+			*i++
+		}
+	case r == '\'' || r == '"':
+		p.writeWordRune(r)
+		if r == '\'' {
+			p.inSingle = true
+		} else {
+			p.inDouble = true
+		}
+		p.hadArg = true
+	case r == ' ' || r == '\t':
+		p.emitArg()
+		p.raw.WriteRune(r)
+	case r == '\n':
+		p.emitArg()
+		p.emitSegment("\n")
+	case unicode.IsSpace(r):
+		p.simpleRejected = true // carriage return and other Unicode whitespace
+	case r == '#':
+		if p.hadArg {
+			// Mid-word # is an ordinary word character.
+			p.writeWordRune(r)
+			p.arg.WriteRune(r)
+			p.hadArg = true
+		} else {
+			p.simpleRejected = true // comment start
+		}
+	case r == ';':
+		p.emitArg()
+		p.emitSegment(";")
+	case r == '(' || r == ')' || r == '{' || r == '}':
+		p.simpleRejected = true
+	case r == '<' || r == '>':
+		p.simpleRejected = true // any unquoted redirection
+	case r == '&' && *i+1 < len(p.runes) && p.runes[*i+1] == '&':
+		p.emitArg()
+		*i++
+		p.emitSegment("&&")
+	case r == '&':
+		p.simpleRejected = true // bare & is never conclusive
+	case r == '|':
+		p.emitArg()
+		separator := "|"
+		if *i+1 < len(p.runes) && (p.runes[*i+1] == '|' || p.runes[*i+1] == '&') {
+			separator += string(p.runes[*i+1])
+			*i++
+		}
+		p.emitSegment(separator)
+	case r == '`' || r == '$' || r == '*' || r == '?' || r == '[':
+		p.simpleRejected = true // substitution or expansion
+	case r == '~' && !p.hadArg:
+		p.simpleRejected = true // tilde expansion
+	default:
+		p.writeWordRune(r)
+		p.arg.WriteRune(r)
+		p.hadArg = true
+	}
+}
+
+// reservedCommandWords are the shell reserved words that fall outside the
+// restricted grammar when they form an unquoted command word. The check
+// runs on the word's raw source, so quoted or escaped spellings — which the
+// shell reads as ordinary command names — stay inside the grammar.
+var reservedCommandWords = map[string]bool{
+	"if": true, "then": true, "elif": true, "else": true, "fi": true,
+	"for": true, "while": true, "until": true, "do": true, "done": true,
+	"case": true, "esac": true, "in": true, "function": true,
+	"select": true, "coproc": true, "time": true, "!": true,
+}
+
+// isAssignmentPrefix reports whether a raw command word is a variable
+// assignment prefix (NAME=...) at command position: an unquoted identifier
+// followed by an unquoted =. A quote anywhere inside the identifier-or-equals
+// prefix breaks the form, leaving an ordinary command word.
+func isAssignmentPrefix(word string) bool {
+	for i := 0; i < len(word); i++ {
+		c := word[i]
+		if c == '=' {
+			return i > 0
+		}
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c == '_':
+		case i > 0 && c >= '0' && c <= '9':
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 func (p *parser) consumeRedirection(i int) (int, error) {

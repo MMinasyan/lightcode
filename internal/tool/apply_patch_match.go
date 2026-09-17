@@ -71,8 +71,8 @@ func locateHunk(lines []string, h hunk, path string, cursor int) (hunkLocation, 
 func patternFromHunk(h hunk) []hunkPatternLine {
 	out := make([]hunkPatternLine, 0, len(h.lines))
 	for _, hl := range h.lines {
-		if hl.kind == lineContext || hl.kind == lineRemove {
-			out = append(out, hunkPatternLine{kind: hl.kind, text: hl.text})
+		if hl.Kind == lineContext || hl.Kind == lineRemove {
+			out = append(out, hunkPatternLine{kind: hl.Kind, text: hl.Text})
 		}
 	}
 	return out
