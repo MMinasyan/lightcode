@@ -651,8 +651,8 @@ func TestPrepareReadTargetsExpressParentAllowDeny(t *testing.T) {
 		if len(prepared.Targets) != 2 {
 			t.Fatalf("targets = %+v, want file plus parent directory", prepared.Targets)
 		}
-		// The Step-9 conversion checks every target; a parent denial must
-		// refuse the call before execution, so no enumeration runs.
+		// Every prepared target is checked; a parent denial must refuse
+		// the call before execution, so no enumeration runs.
 		allowed := true
 		for _, target := range prepared.Targets {
 			if target.CanonicalPath == dir {

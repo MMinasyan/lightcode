@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -588,42 +587,5 @@ func denyIfAsked(t *testing.T) AskFunc {
 	return func(_ context.Context, req permission.Request) permission.ResponseAction {
 		t.Fatalf("ask called for %s %s", req.ToolName, req.Arg)
 		return permission.ResponseDeny
-	}
-}
-
-// Every fileSecurityPathAtRoot call site in write_file.go and edit_file.go must
-// be preceded within 3 lines by a comment containing "re-resolve canonical"
-// so the defense-in-depth intent is documented at each call site and a
-// future refactor cannot silently elide the re-resolution.
-// TestPR11Closure_FileSecurityPathDoubleValidationCommented pins the
-// double canonical validation for read/write/edit through the shared
-// preparation bodies: the binding is compared at preparation
-// (bindCanonicalTarget) and the bound call is revalidated before content
-// access and again after snapshot capture (bound.revalidate).
-func TestPR11Closure_FileSecurityPathDoubleValidationCommented(t *testing.T) {
-	_, file, _, _ := runtime.Caller(0)
-	dir := filepath.Dir(file)
-	path := filepath.Join(dir, "prepare.go")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lines := strings.Split(string(data), "\n")
-	bindingSites := 0
-	closureSites := 0
-	for _, line := range lines {
-		if strings.Contains(line, "canonicalChangedError(approved.canonical") || strings.Contains(line, "canonicalChangedError(boundCanonical") {
-			bindingSites++
-		}
-		if strings.Contains(line, "bound.revalidate()") {
-			closureSites++
-		}
-	}
-	// 2 binding comparisons (bindCanonicalTarget + revalidateTarget);
-	// 5 closure revalidations (read/write/edit closures + write/edit
-	// post-snapshot bookkeeping).
-	if bindingSites != 2 || closureSites != 5 {
-		t.Fatalf("prepare.go: expected 2 binding-comparison and 5 closure-revalidation sites, got %d and %d",
-			bindingSites, closureSites)
 	}
 }

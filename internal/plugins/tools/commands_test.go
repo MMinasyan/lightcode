@@ -440,6 +440,9 @@ func TestSleepTool(t *testing.T) {
 // commands are distinguishable by observable effect, not output shape.
 func TestReadOnlyRunCommandExecutesRewriteSuppressingGitContentHelpers(t *testing.T) {
 	repo := t.TempDir()
+	// Isolate HOME so user-level git configuration (signing, hooks,
+	// templates) cannot leak into or break the fixture.
+	t.Setenv("HOME", t.TempDir())
 	runGit := func(args ...string) {
 		t.Helper()
 		cmd := exec.Command("git", args...)

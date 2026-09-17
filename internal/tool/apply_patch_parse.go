@@ -36,25 +36,23 @@ const (
 	opDelete
 )
 
-type LineKind int
+type lineKind int
 
 const (
-	LineContext LineKind = iota
-	LineAdd
-	LineRemove
+	lineContext lineKind = iota
+	lineAdd
+	lineRemove
 )
 
-// HunkLine is one classified V4A hunk line: its kind and raw text,
-// exported at the internal/tool boundary so target plugins can consume the
-// classified patch data the preview converters use.
-type HunkLine struct {
-	Kind LineKind
+// hunkLine is one classified V4A hunk line: its kind and raw text.
+type hunkLine struct {
+	Kind lineKind
 	Text string
 }
 
 type hunk struct {
 	anchor string
-	lines  []HunkLine
+	lines  []hunkLine
 }
 
 type fileOp struct {
@@ -115,7 +113,7 @@ func parsePatch(input string) (*patch, error) {
 				if !strings.HasPrefix(b, "+") {
 					return nil, fmt.Errorf("%w: %q", errApplyPatchAddBody, b)
 				}
-				op.hunks = append(op.hunks, hunk{lines: []HunkLine{{Kind: LineAdd, Text: b[1:]}}})
+				op.hunks = append(op.hunks, hunk{lines: []hunkLine{{Kind: lineAdd, Text: b[1:]}}})
 				i++
 			}
 			if len(op.hunks) == 0 {
@@ -172,11 +170,11 @@ func parsePatch(input string) (*patch, error) {
 					}
 					switch b[0] {
 					case ' ':
-						h.lines = append(h.lines, HunkLine{Kind: LineContext, Text: b[1:]})
+						h.lines = append(h.lines, hunkLine{Kind: lineContext, Text: b[1:]})
 					case '-':
-						h.lines = append(h.lines, HunkLine{Kind: LineRemove, Text: b[1:]})
+						h.lines = append(h.lines, hunkLine{Kind: lineRemove, Text: b[1:]})
 					case '+':
-						h.lines = append(h.lines, HunkLine{Kind: LineAdd, Text: b[1:]})
+						h.lines = append(h.lines, hunkLine{Kind: lineAdd, Text: b[1:]})
 					default:
 						return nil, fmt.Errorf("%w: %q", errApplyPatchHunkLine, b)
 					}

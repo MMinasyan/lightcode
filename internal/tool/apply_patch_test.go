@@ -230,9 +230,9 @@ func TestApplyPatchSyntheticEOFContextDoesNotCreateTrailingNewline(t *testing.T)
 	if len(lines) != 3 {
 		t.Fatalf("preview lines = %#v, want context/remove/add only", lines)
 	}
-	if lines[0].Kind != LineContext || lines[0].Text != "foo" ||
-		lines[1].Kind != LineRemove || lines[1].Text != "bar" ||
-		lines[2].Kind != LineAdd || lines[2].Text != "baz" {
+	if lines[0].Kind != lineContext || lines[0].Text != "foo" ||
+		lines[1].Kind != lineRemove || lines[1].Text != "bar" ||
+		lines[2].Kind != lineAdd || lines[2].Text != "baz" {
 		t.Fatalf("preview lines = %#v, want synthetic EOF context omitted", lines)
 	}
 }
@@ -278,7 +278,7 @@ func TestApplyPatchRealEOFContextPreservesTrailingNewline(t *testing.T) {
 		t.Fatalf("previews = %#v, want one hunk", previews)
 	}
 	lines := previews[0].Hunks[0].Lines
-	if len(lines) != 4 || lines[3].Kind != LineContext || lines[3].Text != "" {
+	if len(lines) != 4 || lines[3].Kind != lineContext || lines[3].Text != "" {
 		t.Fatalf("preview lines = %#v, want real EOF context retained", lines)
 	}
 }

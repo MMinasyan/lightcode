@@ -51,10 +51,10 @@ func TestParsePatchAddFile(t *testing.T) {
 	if len(op.hunks) != 2 {
 		t.Fatalf("hunks = %d, want 2 (one per + line)", len(op.hunks))
 	}
-	if op.hunks[0].lines[0].Kind != LineAdd || op.hunks[0].lines[0].Text != "hello" {
+	if op.hunks[0].lines[0].Kind != lineAdd || op.hunks[0].lines[0].Text != "hello" {
 		t.Fatalf("hunks[0] = %+v, want add/hello", op.hunks[0])
 	}
-	if op.hunks[1].lines[0].Kind != LineAdd || op.hunks[1].lines[0].Text != "world" {
+	if op.hunks[1].lines[0].Kind != lineAdd || op.hunks[1].lines[0].Text != "world" {
 		t.Fatalf("hunks[1] = %+v, want add/world", op.hunks[1])
 	}
 }
@@ -102,11 +102,11 @@ func TestParsePatchUpdateFile(t *testing.T) {
 	if h.anchor != "func Foo" {
 		t.Fatalf("hunk anchor = %q, want func Foo", h.anchor)
 	}
-	want := []HunkLine{
-		{Kind: LineContext, Text: "ctx"},
-		{Kind: LineRemove, Text: "old"},
-		{Kind: LineAdd, Text: "new"},
-		{Kind: LineContext, Text: "ctx2"},
+	want := []hunkLine{
+		{Kind: lineContext, Text: "ctx"},
+		{Kind: lineRemove, Text: "old"},
+		{Kind: lineAdd, Text: "new"},
+		{Kind: lineContext, Text: "ctx2"},
 	}
 	if len(h.lines) != len(want) {
 		t.Fatalf("hunk lines = %d, want %d", len(h.lines), len(want))
@@ -219,8 +219,8 @@ func TestParsePatchPreservesPrefixCharactersInContent(t *testing.T) {
 	}
 	want := []string{"++counter", "--option", " indented"}
 	for i, h := range p.ops[0].hunks {
-		if h.lines[0].Kind != LineAdd {
-			t.Fatalf("hunks[%d] kind = %d, want LineAdd", i, h.lines[0].Kind)
+		if h.lines[0].Kind != lineAdd {
+			t.Fatalf("hunks[%d] kind = %d, want lineAdd", i, h.lines[0].Kind)
 		}
 		if h.lines[0].Text != want[i] {
 			t.Fatalf("hunks[%d] text = %q, want %q", i, h.lines[0].Text, want[i])

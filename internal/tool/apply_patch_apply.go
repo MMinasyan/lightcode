@@ -118,7 +118,7 @@ type AppliedHunkPreview struct {
 	// overwrites, Delete removes, Move unlinks). The Old / New
 	// fields are kept for any future consumer that wants the
 	// pre-flattened split.
-	Lines []HunkLine
+	Lines []hunkLine
 }
 
 type applyPlan struct {
@@ -275,7 +275,7 @@ func computeUpdatedContent(canonicalPath string, op fileOp) (preContent []byte, 
 
 func hunkHasMatchLines(h hunk) bool {
 	for _, line := range h.lines {
-		if line.Kind == LineContext || line.Kind == LineRemove {
+		if line.Kind == lineContext || line.Kind == lineRemove {
 			return true
 		}
 	}
@@ -317,19 +317,19 @@ func applyHunk(fileLines []string, h hunk, path string, cursor int) ([]string, i
 func hunkPatternLines(h hunk) []string {
 	out := make([]string, 0, len(h.lines))
 	for _, hl := range h.lines {
-		if hl.Kind == LineContext || hl.Kind == LineRemove {
+		if hl.Kind == lineContext || hl.Kind == lineRemove {
 			out = append(out, hl.Text)
 		}
 	}
 	return out
 }
 
-func hunkTransformPreservingMatchedContext(h hunk, matchedLines []string, syntheticTrailingEmpty bool, path string, patternLines []string) (oldLines, newLines []string, lines []HunkLine, err error) {
-	lines = make([]HunkLine, 0, len(h.lines))
+func hunkTransformPreservingMatchedContext(h hunk, matchedLines []string, syntheticTrailingEmpty bool, path string, patternLines []string) (oldLines, newLines []string, lines []hunkLine, err error) {
+	lines = make([]hunkLine, 0, len(h.lines))
 	matchIdx := 0
 	for _, hl := range h.lines {
 		switch hl.Kind {
-		case LineContext:
+		case lineContext:
 			if matchIdx >= len(matchedLines) && syntheticTrailingEmpty && hl.Text == "" {
 				continue
 			}
@@ -339,9 +339,9 @@ func hunkTransformPreservingMatchedContext(h hunk, matchedLines []string, synthe
 			}
 			oldLines = append(oldLines, text)
 			newLines = append(newLines, text)
-			lines = append(lines, HunkLine{Kind: LineContext, Text: text})
+			lines = append(lines, hunkLine{Kind: lineContext, Text: text})
 			matchIdx++
-		case LineRemove:
+		case lineRemove:
 			if matchIdx >= len(matchedLines) {
 				return nil, nil, nil, fmt.Errorf("Failed to find expected lines in %s:\n%s", path, strings.Join(patternLines, "\n"))
 			}
@@ -350,9 +350,9 @@ func hunkTransformPreservingMatchedContext(h hunk, matchedLines []string, synthe
 				text = matchedLines[matchIdx]
 			}
 			oldLines = append(oldLines, text)
-			lines = append(lines, HunkLine{Kind: LineRemove, Text: text})
+			lines = append(lines, hunkLine{Kind: lineRemove, Text: text})
 			matchIdx++
-		case LineAdd:
+		case lineAdd:
 			newLines = append(newLines, hl.Text)
 			lines = append(lines, hl)
 		}

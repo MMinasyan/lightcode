@@ -132,18 +132,18 @@ func buildPreviewFromCaptured(p AppliedFilePreview) editpreview.Preview {
 		newLine := h.StartLine
 		for _, l := range h.Lines {
 			switch l.Kind {
-			case LineContext:
+			case lineContext:
 				rows = append(rows, editpreview.Row{
 					Kind: editpreview.KindContext, OldLine: oldLine, NewLine: newLine, Text: l.Text,
 				})
 				oldLine++
 				newLine++
-			case LineRemove:
+			case lineRemove:
 				rows = append(rows, editpreview.Row{
 					Kind: editpreview.KindRemove, OldLine: oldLine, Text: l.Text,
 				})
 				oldLine++
-			case LineAdd:
+			case lineAdd:
 				rows = append(rows, editpreview.Row{
 					Kind: editpreview.KindAdd, NewLine: newLine, Text: l.Text,
 				})
