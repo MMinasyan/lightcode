@@ -437,7 +437,9 @@ func TestParseWithCapabilitiesSelection(t *testing.T) {
 }
 
 func TestParseWithCapabilitiesRejectsEmptyToolNames(t *testing.T) {
-	cfg, err := ParseWithCapabilities([]byte(`{"bad": {"tools": ["ok", ""]}}`), nil, nil, nil)
+	// A list containing only the empty name: the empty-name rule is the
+	// only one that can fire.
+	cfg, err := ParseWithCapabilities([]byte(`{"bad": {"tools": [""]}}`), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("ParseWithCapabilities: %v", err)
 	}
@@ -447,6 +449,9 @@ func TestParseWithCapabilitiesRejectsEmptyToolNames(t *testing.T) {
 	warnings := cfg.Warnings()
 	if len(warnings) != 1 || warnings[0].Kind != "invalid_agent_type" {
 		t.Fatalf("warnings = %#v, want one invalid_agent_type drop", warnings)
+	}
+	if warnings[0].Message != "tool name is empty" {
+		t.Fatalf("warning message = %q, want the empty-tool-name rejection text", warnings[0].Message)
 	}
 }
 

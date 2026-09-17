@@ -188,14 +188,20 @@ func TestListChangedFilesDeduplicatesAndSortsAcrossGroups(t *testing.T) {
 func TestListChangedFilesTurnErrorDiscardsResult(t *testing.T) {
 	dataDir := t.TempDir()
 	sessionDir := filepath.Join(dataDir, "code", listTestSession)
+
+	// An earlier readable group contributes a path.
+	seedListGroup(t, dataDir, listTestSession, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", map[int][]SnapshotMeta{
+		1: {SnapshotMeta{OriginalPath: "/e", CanonicalPath: "/kept.go"}},
+	})
+
+	// A later group's turn is unreadable: ListTurns fails with its partial
+	// entries, and the complete result — including the earlier group's
+	// path — must be discarded.
 	turnDir := filepath.Join(sessionDir, "ffffffffffffffffffffffffffffffff", "snapshots", "1", "e")
 	if err := os.MkdirAll(turnDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	writeMeta(t, filepath.Join(turnDir, "meta.json"), SnapshotMeta{OriginalPath: "/x", CanonicalPath: "/x.go"})
-
-	// An unreadable turn directory makes ListTurns fail with its partial
-	// entries; the complete result must be discarded.
 	if err := os.Chmod(filepath.Join(sessionDir, "ffffffffffffffffffffffffffffffff", "snapshots", "1"), 0o000); err != nil {
 		t.Fatal(err)
 	}

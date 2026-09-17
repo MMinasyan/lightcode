@@ -367,15 +367,30 @@ func TestNormalizeArgsStripsPrivateFieldsAndRetainsUnrelated(t *testing.T) {
 }
 
 func TestReadFileClampsHugeWindowsToRemainingLines(t *testing.T) {
-	path := readFileTestFile(t, "lines.txt", "one\ntwo\nthree")
-	tool := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, nil)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "lines.txt"), []byte("one\ntwo\nthree"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootCanonical, err := bindWorkspaceRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// A limit of MaxInt must not overflow end/last-line arithmetic: the
-	// window clamps to the remaining lines.
-	result, err := tool.Execute(context.Background(), map[string]any{
-		"path":  path,
+	// A MaxInt64 limit must not overflow end/last-line arithmetic: the
+	// window clamps to the remaining lines. The strict normalizer
+	// genuinely consumes the MaxInt64 lexeme.
+	args, err := NormalizeReadArgs(map[string]any{
+		"path":  "lines.txt",
 		"limit": json.Number("9223372036854775807"),
-	})
+	}, 500)
+	if err != nil {
+		t.Fatalf("NormalizeReadArgs error = %v", err)
+	}
+	prepared, err := PrepareReadCall(root, rootCanonical, config.ToolsConfig{ReadMaxLines: 500}, args)
+	if err != nil {
+		t.Fatalf("PrepareReadCall error = %v", err)
+	}
+	result, err := prepared.Execute(context.Background())
 	if err != nil {
 		t.Fatalf("Execute error = %v", err)
 	}
@@ -386,11 +401,19 @@ func TestReadFileClampsHugeWindowsToRemainingLines(t *testing.T) {
 
 	// Same clamp from a mid-file offset: neither the window end nor the
 	// footer's offset+limit-1 may overflow.
-	result, err = tool.Execute(context.Background(), map[string]any{
-		"path":   path,
-		"offset": float64(2),
+	args, err = NormalizeReadArgs(map[string]any{
+		"path":   "lines.txt",
+		"offset": json.Number("2"),
 		"limit":  json.Number("9223372036854775807"),
-	})
+	}, 500)
+	if err != nil {
+		t.Fatalf("NormalizeReadArgs error = %v", err)
+	}
+	prepared, err = PrepareReadCall(root, rootCanonical, config.ToolsConfig{ReadMaxLines: 500}, args)
+	if err != nil {
+		t.Fatalf("PrepareReadCall error = %v", err)
+	}
+	result, err = prepared.Execute(context.Background())
 	if err != nil {
 		t.Fatalf("Execute error = %v", err)
 	}
@@ -745,80 +768,6 @@ func TestPreparedEditAndWritePaths(t *testing.T) {
 		t.Fatalf("Execute error = %v, want required parent creation", err)
 	}
 	assertFileContent(t, nested, "made")
-}
-
-func TestPrepareWriteAndEditRevalidateAfterSnapshot(t *testing.T) {
-	dir := t.TempDir()
-	real1 := filepath.Join(dir, "real1.txt")
-	real2 := filepath.Join(dir, "real2.txt")
-	for _, p := range []string{real1, real2} {
-		if err := os.WriteFile(p, []byte("before"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	link := filepath.Join(dir, "link.txt")
-	if err := os.Symlink(real1, link); err != nil {
-		t.Fatal(err)
-	}
-
-	// The snapshot hook flips the approved symlink after capture, exactly
-	// in the snapshot-to-mutation window: the post-snapshot revalidation
-	// must refuse the changed canonical target before any bytes move.
-	store := &applyPatchStore{turn: 1, onSnapshot: func(call int) {
-		if call == 1 {
-			if err := os.Remove(link); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Symlink(real2, link); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}}
-
-	args, err := NormalizeWriteArgs(map[string]any{"path": link, "content": "after"})
-	if err != nil {
-		t.Fatalf("NormalizeWriteArgs error = %v", err)
-	}
-	prepared, err := PrepareWriteCall(dir, "", "", CapabilityOptions{}, store, args)
-	if err != nil {
-		t.Fatalf("PrepareWriteCall error = %v", err)
-	}
-	if _, err := prepared.Execute(context.Background()); err == nil || !strings.Contains(err.Error(), "approved canonical path changed") {
-		t.Fatalf("write Execute error = %v, want post-snapshot canonical change refusal", err)
-	}
-	assertFileContent(t, real1, "before")
-	assertFileContent(t, real2, "before")
-
-	// Same window for the edit path.
-	if err := os.Remove(link); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(real1, link); err != nil {
-		t.Fatal(err)
-	}
-	store2 := &applyPatchStore{turn: 1, onSnapshot: func(call int) {
-		if call == 1 {
-			if err := os.Remove(link); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Symlink(real2, link); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}}
-	editArgs, err := NormalizeEditArgs(map[string]any{"path": link, "old_string": "before", "new_string": "after"})
-	if err != nil {
-		t.Fatalf("NormalizeEditArgs error = %v", err)
-	}
-	editPrepared, err := PrepareEditCall(dir, "", "", CapabilityOptions{}, store2, editArgs)
-	if err != nil {
-		t.Fatalf("PrepareEditCall error = %v", err)
-	}
-	if _, err := editPrepared.Execute(context.Background()); err == nil || !strings.Contains(err.Error(), "approved canonical path changed") {
-		t.Fatalf("edit Execute error = %v, want post-snapshot canonical change refusal", err)
-	}
-	assertFileContent(t, real1, "before")
-	assertFileContent(t, real2, "before")
 }
 
 // TestPrepareWriteAndEditDiscardSnapshotClaimOnPostSnapshotRevalidationFailure

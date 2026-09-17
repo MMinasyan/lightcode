@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -429,4 +430,86 @@ func TestSleepTool(t *testing.T) {
 			t.Fatal("cancelled sleep did not return")
 		}
 	})
+}
+
+// TestReadOnlyRunCommandExecutesRewriteSuppressingGitContentHelpers drives
+// the shipped plugin's readonly run_command over a git repository whose
+// configured content helpers (diff.external and the secret textconv driver)
+// append to a marker file. The rewritten command suppresses both, so a
+// successful execution must never create the marker — raw and rewritten
+// commands are distinguishable by observable effect, not output shape.
+func TestReadOnlyRunCommandExecutesRewriteSuppressingGitContentHelpers(t *testing.T) {
+	repo := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	runGit("init")
+	runGit("config", "user.email", "test@example.invalid")
+	runGit("config", "user.name", "Test User")
+
+	marker := filepath.Join(repo, "helper-ran")
+	textconv := filepath.Join(repo, "textconv.sh")
+	external := filepath.Join(repo, "external.sh")
+	writeScript := func(path, content string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeScript(textconv, fmt.Sprintf("#!/bin/sh\nprintf textconv >> %q\ncat \"$1\"\n", marker))
+	writeScript(external, fmt.Sprintf("#!/bin/sh\nprintf external >> %q\nexit 0\n", marker))
+
+	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("*.secret diff=secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "file.secret"), []byte("one\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "initial")
+	runGit("config", "diff.secret.textconv", textconv)
+	runGit("config", "diff.external", external)
+	if err := os.WriteFile(filepath.Join(repo, "file.secret"), []byte("two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "file.secret")
+	runGit("commit", "-m", "second")
+	if err := os.WriteFile(filepath.Join(repo, "file.secret"), []byte("three\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	byID := openTools(t, t.TempDir())
+	for _, command := range []string{
+		"git diff -- file.secret",
+		"git log -p -1 -- file.secret",
+		"git show HEAD -- file.secret",
+		"git show HEAD:file.secret",
+		"git blame -- file.secret",
+	} {
+		t.Run(command, func(t *testing.T) {
+			_ = os.Remove(marker)
+			plan := prepare(t, byID["run_command"], callToolContext(repo, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"`+command+`"}`)
+			if len(plan.Permissions) != 1 || plan.Permissions[0].Permission != "command.run" {
+				t.Fatalf("pairs = %+v, want one command.run pair", plan.Permissions)
+			}
+			if target := plan.Permissions[0].Target; !strings.HasPrefix(target, "git --no-pager --no-optional-locks") {
+				t.Fatalf("target = %q, want the rewritten read-only git command", target)
+			}
+			outcome := plan.Execute(context.Background())
+			if outcome.Result.Status != model.ResultSuccess {
+				t.Fatalf("result = %+v, want the rewritten command to succeed", outcome.Result)
+			}
+			if _, err := os.Stat(marker); err == nil {
+				data, _ := os.ReadFile(marker)
+				t.Fatalf("executed the raw command instead of the rewrite: helper marker = %q", data)
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("marker read error = %v", err)
+			}
+		})
+	}
 }
