@@ -84,8 +84,21 @@ type instance struct {
 	home    string
 	dataDir string
 
-	mu         sync.Mutex
-	closed     bool
+	mu     sync.Mutex
+	closed bool
+
+	// workspaces is keyed by the canonical root (symlinks resolved) rather
+	// than the lexical workspace path, so a directory and its symlink alias
+	// share one manager entry. This is deliberate: per-call binding
+	// revalidation computes both compared values fresh and never consults
+	// the entry, so lexical keying would let a retargeted workspace pass
+	// revalidation and be served by the stale, old-tree entry. The
+	// canonical key makes the lookup itself the staleness detector — a
+	// miss after a retarget creates a correctly rooted new entry, while
+	// the old entry's servers retire on the 30-minute idle timer and the
+	// entry object persists until plugin close. Keying by the lexical path
+	// instead requires deliberately replacing entries on binding change,
+	// not a one-line key swap.
 	workspaces map[string]*workspaceEntry
 }
 
