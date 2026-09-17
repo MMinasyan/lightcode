@@ -1,11 +1,8 @@
 package harness
 
 import (
-	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -262,12 +259,8 @@ func parsePermissionLevel(raw json.RawMessage) (permissionLevel, bool) {
 	if len(raw) == 0 {
 		return permissionLevel{}, true
 	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	var fields map[string]json.RawMessage
-	if err := dec.Decode(&fields); err != nil || fields == nil {
-		return permissionLevel{}, false
-	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+	fields, err := decodePayloadObject(raw)
+	if err != nil {
 		return permissionLevel{}, false
 	}
 	var level permissionLevel
@@ -304,30 +297,23 @@ func parsePermissionLevel(raw json.RawMessage) (permissionLevel, bool) {
 // with exactly the required nonempty string fields "permission", "target",
 // and "access".
 func parsePermissionRules(raw json.RawMessage) ([]permissionRule, bool) {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	if sep, err := dec.Token(); err != nil || sep != json.Delim('[') {
+	var encoded []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &encoded); err != nil || encoded == nil {
 		return nil, false
 	}
 	var rules []permissionRule
-	for dec.More() {
-		rule, ok := parsePermissionRule(dec)
+	for _, fields := range encoded {
+		rule, ok := parsePermissionRule(fields)
 		if !ok {
 			return nil, false
 		}
 		rules = append(rules, rule)
 	}
-	if sep, err := dec.Token(); err != nil || sep != json.Delim(']') {
-		return nil, false
-	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, false
-	}
 	return rules, true
 }
 
-func parsePermissionRule(dec *json.Decoder) (permissionRule, bool) {
-	var fields map[string]json.RawMessage
-	if err := dec.Decode(&fields); err != nil || len(fields) != 3 {
+func parsePermissionRule(fields map[string]json.RawMessage) (permissionRule, bool) {
+	if len(fields) != 3 {
 		return permissionRule{}, false
 	}
 	permission, ok := requiredRuleString(fields, "permission")

@@ -36,9 +36,6 @@ func TestPrepareReadBindsParentDirectoryOnlyWhenLeafMissing(t *testing.T) {
 	if prepared.Targets[0].CanonicalPath != existing {
 		t.Fatalf("canonical target = %q, want %q", prepared.Targets[0].CanonicalPath, existing)
 	}
-	if prepared.Args["offset"] != json.Number("1") || prepared.Args["limit"] != json.Number("500") {
-		t.Fatalf("normalized args = %+v, want default offset/limit as canonical integers 1/500", prepared.Args)
-	}
 
 	// Missing leaf: the parent directory is bound as a second declared
 	// file.read target for the authorized suggestion listing.
@@ -281,17 +278,17 @@ func TestNormalizeReadArgsStrictIntegers(t *testing.T) {
 }
 
 func TestNormalizeWriteEditArgsStrictConsumedFields(t *testing.T) {
-	if _, err := NormalizeWriteArgs(map[string]any{"path": "a.txt", "content": 123}); err == nil || !strings.Contains(err.Error(), "content must be a string") {
-		t.Fatalf("NormalizeWriteArgs error = %v, want content type error", err)
+	if _, err := NormalizeWriteArgs(map[string]any{"path": "a.txt", "content": 123}); err == nil || !strings.Contains(err.Error(), "content is required") {
+		t.Fatalf("NormalizeWriteArgs error = %v, want content required error", err)
 	}
 	if _, err := NormalizeWriteArgs(map[string]any{"path": "a.txt"}); err == nil || !strings.Contains(err.Error(), "content is required") {
 		t.Fatalf("NormalizeWriteArgs error = %v, want content required error", err)
 	}
-	if _, err := NormalizeEditArgs(map[string]any{"path": "a.txt", "old_string": 1, "new_string": "x"}); err == nil || !strings.Contains(err.Error(), "old_string must be a string") {
-		t.Fatalf("NormalizeEditArgs error = %v, want old_string type error", err)
+	if _, err := NormalizeEditArgs(map[string]any{"path": "a.txt", "old_string": 1, "new_string": "x"}); err == nil || !strings.Contains(err.Error(), "old_string is required") {
+		t.Fatalf("NormalizeEditArgs error = %v, want old_string required error", err)
 	}
-	if _, err := NormalizeEditArgs(map[string]any{"path": "a.txt", "old_string": "x", "new_string": true}); err == nil || !strings.Contains(err.Error(), "new_string must be a string") {
-		t.Fatalf("NormalizeEditArgs error = %v, want new_string type error", err)
+	if _, err := NormalizeEditArgs(map[string]any{"path": "a.txt", "old_string": "x", "new_string": true}); err == nil || !strings.Contains(err.Error(), "new_string is required") {
+		t.Fatalf("NormalizeEditArgs error = %v, want new_string required error", err)
 	}
 	if _, err := NormalizeEditArgs(map[string]any{"path": "a.txt", "old_string": "x", "new_string": "y", "replace_all": "yes"}); err == nil || !strings.Contains(err.Error(), "replace_all must be a boolean") {
 		t.Fatalf("NormalizeEditArgs error = %v, want replace_all type error", err)

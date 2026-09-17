@@ -174,28 +174,25 @@ func NormalizeSleepArgs(args map[string]any) (map[string]any, error) {
 
 // NormalizeWriteArgs performs target write_file argument normalization:
 // private `_lightcode_` fields are stripped and the schema-required path
-// and content are strictly typed — wrong-typed fields are
-// argument-validation errors, never silent coercion.
+// and content must be strings — an absent, null or wrong-typed required
+// field is the same argument-validation error, never silent coercion.
 func NormalizeWriteArgs(args map[string]any) (map[string]any, error) {
 	clean := stripPrivateArgs(args)
 	path, _ := clean["path"].(string)
 	if path == "" {
 		return nil, fmt.Errorf("write_file: path is required")
 	}
-	content, present := clean["content"]
-	if !present || content == nil {
+	if _, ok := clean["content"].(string); !ok {
 		return nil, fmt.Errorf("write_file: content is required")
-	}
-	if _, ok := content.(string); !ok {
-		return nil, fmt.Errorf("write_file: content must be a string")
 	}
 	return clean, nil
 }
 
 // NormalizeEditArgs performs target edit_file argument normalization:
 // private `_lightcode_` fields are stripped and the schema-required fields
-// are strictly typed — wrong-typed fields are argument-validation errors,
-// never silent coercion. replace_all keeps its schema default when absent.
+// must be strings — an absent, null or wrong-typed required field is the
+// same argument-validation error, never silent coercion. replace_all keeps
+// its schema default when absent.
 func NormalizeEditArgs(args map[string]any) (map[string]any, error) {
 	clean := stripPrivateArgs(args)
 	path, _ := clean["path"].(string)
@@ -203,12 +200,8 @@ func NormalizeEditArgs(args map[string]any) (map[string]any, error) {
 		return nil, fmt.Errorf("edit_file: path is required")
 	}
 	for _, key := range []string{"old_string", "new_string"} {
-		v, present := clean[key]
-		if !present || v == nil {
+		if _, ok := clean[key].(string); !ok {
 			return nil, fmt.Errorf("edit_file: %s is required", key)
-		}
-		if _, ok := v.(string); !ok {
-			return nil, fmt.Errorf("edit_file: %s must be a string", key)
 		}
 	}
 	if v, present := clean["replace_all"]; present {

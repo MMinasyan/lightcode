@@ -622,12 +622,6 @@ func (v *graphValidation) collectHookResults(opID string, published []publishedC
 	for i := range published {
 		byCall[published[i].callID] = &published[i]
 	}
-	resultSeq := make(map[string]int64, len(published))
-	for _, entry := range v.graph.Entries {
-		if entry.Envelope.OperationID == opID && entry.ToolResult != nil && resultSeq[entry.ToolResult.ToolCallID] == 0 {
-			resultSeq[entry.ToolResult.ToolCallID] = entry.Envelope.Sequence
-		}
-	}
 	settled := make(map[hookExecution]bool, len(published))
 	lastStatus := make(map[string]hookResultStatus, len(published))
 	for _, entry := range v.graph.Entries {
@@ -642,8 +636,8 @@ func (v *graphValidation) collectHookResults(opID string, published []publishedC
 		if !ok || entry.Envelope.Sequence <= publisher.Envelope.Sequence {
 			return nil, nil, v.corrupt("hook result %s for call %q does not follow its publishing assistant entry %s", entry.Envelope.ID, call.callID, call.assistantEntryID)
 		}
-		if seq := resultSeq[call.callID]; seq != 0 && entry.Envelope.Sequence >= seq {
-			return nil, nil, v.corrupt("hook result %s for call %q follows that call's terminal tool result %s", entry.Envelope.ID, call.callID, v.entryByID[call.reservedResultID].Envelope.ID)
+		if committed, ok := v.entryByID[call.reservedResultID]; ok && entry.Envelope.Sequence >= committed.Envelope.Sequence {
+			return nil, nil, v.corrupt("hook result %s for call %q follows that call's terminal tool result %s", entry.Envelope.ID, call.callID, committed.Envelope.ID)
 		}
 		// Historical first-pending ordering: a hook runs only while its call
 		// is the first pending call, so every earlier published call's
@@ -653,8 +647,8 @@ func (v *graphValidation) collectHookResults(opID string, published []publishedC
 			if earlier.callID == call.callID {
 				break
 			}
-			seq := resultSeq[earlier.callID]
-			if seq == 0 || seq >= entry.Envelope.Sequence {
+			committed, ok := v.entryByID[earlier.reservedResultID]
+			if !ok || committed.Envelope.Sequence >= entry.Envelope.Sequence {
 				return nil, nil, v.corrupt("hook result %s for call %q runs before the terminal result of earlier call %q", entry.Envelope.ID, call.callID, earlier.callID)
 			}
 		}

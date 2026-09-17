@@ -293,10 +293,7 @@ func normalizeCallArguments(call model.ToolCall, normalize func(map[string]any) 
 // nil-tracker read path that always returns the bounded requested content.
 type readTool struct{ inst *instance }
 
-func (readTool) describe(in runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
-	if _, err := decodeSettings(in.Config(pluginID)); err != nil {
-		return runtime.ToolDescription{}, err
-	}
+func (readTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
 	return runtime.ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "read_file",
@@ -353,16 +350,13 @@ type mutationPrepared struct {
 	execute func(context.Context) harness.ToolOutcome
 }
 
-// prepareMutation is the one shared mutation-Prepare body: the plugin
-// settings validation, the strict decode-and-pass of the committed
-// normalized arguments, the canonical root/write-dir binding, the per-call
+// prepareMutation is the one shared mutation-Prepare body: the strict
+// decode-and-pass of the committed normalized arguments, the canonical
+// root/write-dir binding, the per-call
 // code group, and the assembled executor plan with its file.write pairs.
 // The per-tool callback runs the shared preparation and wraps the outcome;
 // its error is a failed canonical preparation.
 func (in *instance) prepareMutation(tc runtime.ToolContext, call model.ToolCall, run func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group codeGroupStore, args map[string]any) (mutationPrepared, error)) harness.PreparedTool {
-	if _, err := in.settings(tc.Invocation); err != nil {
-		return immediateError(call.ID, err)
-	}
 	args, err := decodeCallArguments(call.Arguments)
 	if err != nil {
 		return immediateError(call.ID, err)
@@ -390,14 +384,11 @@ func (in *instance) prepareMutation(tc runtime.ToolContext, call model.ToolCall,
 // writeTool is the write_file export.
 type writeTool struct{ inst *instance }
 
-func (t writeTool) describe(in runtime.Invocation, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
-	return mutationDescription("write_file", writeFileDescription, writeFileParameters, false, in, constraints)
+func (t writeTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
+	return mutationDescription("write_file", writeFileDescription, writeFileParameters, false, constraints)
 }
 
-func (t writeTool) Normalize(tc runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	if _, err := t.inst.settings(tc.Invocation); err != nil {
-		return nil, err
-	}
+func (writeTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizeWriteArgs)
 }
 
@@ -420,14 +411,11 @@ func (t writeTool) Prepare(_ context.Context, tc runtime.ToolContext, call model
 // diff built from the committed normalized arguments and the result.
 type editTool struct{ inst *instance }
 
-func (t editTool) describe(in runtime.Invocation, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
-	return mutationDescription("edit_file", editFileDescription, editFileParameters, false, in, constraints)
+func (t editTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
+	return mutationDescription("edit_file", editFileDescription, editFileParameters, false, constraints)
 }
 
-func (t editTool) Normalize(tc runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	if _, err := t.inst.settings(tc.Invocation); err != nil {
-		return nil, err
-	}
+func (editTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizeEditArgs)
 }
 
@@ -450,14 +438,11 @@ func (t editTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.
 // counterpart, so only model adaptations that include it can see it.
 type patchTool struct{ inst *instance }
 
-func (t patchTool) describe(in runtime.Invocation, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
-	return mutationDescription("apply_patch", applyPatchDescription, applyPatchParameters, true, in, constraints)
+func (t patchTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
+	return mutationDescription("apply_patch", applyPatchDescription, applyPatchParameters, true, constraints)
 }
 
-func (t patchTool) Normalize(tc runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	if _, err := t.inst.settings(tc.Invocation); err != nil {
-		return nil, err
-	}
+func (patchTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizePatchArgs)
 }
 
@@ -488,10 +473,7 @@ func (t patchTool) Prepare(_ context.Context, tc runtime.ToolContext, call model
 // member, and the description never advertises one.
 type runCommandTool struct{ inst *instance }
 
-func (runCommandTool) describe(in runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
-	if _, err := decodeSettings(in.Config(pluginID)); err != nil {
-		return runtime.ToolDescription{}, err
-	}
+func (runCommandTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
 	return runtime.ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "run_command",
@@ -604,12 +586,9 @@ func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec
 // sleepTool is the sleep export: normalization clamps to integer seconds
 // 1..300, the fixed target * is the one the built-in policy allows, and
 // execution observes cancellation as an interrupted result.
-type sleepTool struct{ inst *instance }
+type sleepTool struct{}
 
-func (sleepTool) describe(in runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
-	if _, err := decodeSettings(in.Config(pluginID)); err != nil {
-		return runtime.ToolDescription{}, err
-	}
+func (sleepTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
 	return runtime.ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "sleep",
@@ -620,17 +599,11 @@ func (sleepTool) describe(in runtime.Invocation, _ runtime.ToolConstraints) (run
 	}, nil
 }
 
-func (t sleepTool) Normalize(tc runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	if _, err := t.inst.settings(tc.Invocation); err != nil {
-		return nil, err
-	}
+func (sleepTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizeSleepArgs)
 }
 
-func (t sleepTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
-	if _, err := t.inst.settings(tc.Invocation); err != nil {
-		return immediateError(call.ID, err)
-	}
+func (sleepTool) Prepare(_ context.Context, _ runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
 	args, err := decodeCallArguments(call.Arguments)
 	if err != nil {
 		return immediateError(call.ID, err)
@@ -660,12 +633,9 @@ func (t sleepTool) Prepare(_ context.Context, tc runtime.ToolContext, call model
 // mutationDescription is the shared mutation-tool description: the write
 // tools are unavailable only to a readonly Agent without a configured write
 // dir — with a nonempty write dir the Harness confines every write to it, so
-// the tool stays available. The description consumes the captured Invocation
-// and the hard constraints only; no execution instance is constructed.
-func mutationDescription(name, description, parameters string, defaultHidden bool, in runtime.Invocation, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
-	if _, err := decodeSettings(in.Config(pluginID)); err != nil {
-		return runtime.ToolDescription{}, err
-	}
+// the tool stays available. The description consumes the hard constraints
+// only; no execution instance is constructed.
+func mutationDescription(name, description, parameters string, defaultHidden bool, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
 	return runtime.ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        name,
@@ -703,8 +673,8 @@ func Plugin() runtime.Plugin {
 }
 
 // open checks the scope context and captures the scope identity's owner data
-// root. Every tool value shares that one instance; no per-Session state is
-// created here.
+// root. Five of the six tool values share that one instance (sleep needs no
+// instance state); no per-Session state is created here.
 func open(ctx context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
 	if err := ctx.Err(); err != nil {
 		return runtime.Instance{}, err
@@ -716,6 +686,6 @@ func open(ctx context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runt
 		"edit_file":   editTool{inst},
 		"apply_patch": patchTool{inst},
 		"run_command": runCommandTool{inst},
-		"sleep":       sleepTool{inst},
+		"sleep":       sleepTool{},
 	}}, nil
 }

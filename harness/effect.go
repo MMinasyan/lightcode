@@ -1086,7 +1086,7 @@ func boundedToolDiagnostic(cause error) string {
 // then prepares the plan outside locks, rejects invalid plan shapes with the
 // existing internal-validation error, and evaluates every declaration through
 // the fixed boundary — including immediate-success plans — before
-// beginToolEffect. A denial settles only that original call with status denied
+// beginPendingCallEffect. A denial settles only that original call with status denied
 // and no metadata, no concrete effect and no tool active intent; later calls
 // still run. An allowed executor commits intent, executes once behind the
 // cancellation-before-start gate, and commits one validated outcome — a
@@ -1156,7 +1156,7 @@ func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution,
 			}
 			return h.commitToolResult(settleCtx, c, operationID, pending, outcome, false)
 		}
-		if _, err := h.beginToolEffect(ctx, c, operationID, call.ID); err != nil {
+		if _, err := h.beginPendingCallEffect(ctx, c, operationID, call.ID, EffectTool, ""); err != nil {
 			// An intent transaction aborted by cancellation settles the
 			// cancellation outcome: interrupted-before-execution, never a
 			// cancellation-shaped error out of an active effect.
@@ -1178,10 +1178,13 @@ func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution,
 	}
 }
 
-// beginToolEffect commits the one active-effect intent of an executor-backed
-// tool effect: the intent addresses the first pending call and reserves its
-// result identity.
-func (h *Harness) beginToolEffect(ctx context.Context, c *coordinator, operationID, callID string) (string, error) {
+// beginPendingCallEffect commits the one active-effect intent of a
+// pending-call effect: the intent addresses the first pending call and
+// reserves its result identity — the call's reserved identity for a tool
+// effect, a fresh allocation for a hook — recording the active effect with
+// the effect kind and, for hooks, the hook identity. Effects never nest, so
+// any committed intent of another effect rejects.
+func (h *Harness) beginPendingCallEffect(ctx context.Context, c *coordinator, operationID, callID string, kind EffectKind, hookID string) (string, error) {
 	c.mu.Lock()
 	op, ok := c.graph.Operation(operationID)
 	if !ok {
@@ -1191,7 +1194,7 @@ func (h *Harness) beginToolEffect(ctx context.Context, c *coordinator, operation
 	}
 	if op.State.Status != OperationRunning {
 		c.mu.Unlock()
-		return "", invalidInput("operation %q is %s; a tool effect requires a running Operation", operationID, op.State.Status)
+		return "", invalidInput("operation %q is %s; a %s effect requires a running Operation", operationID, op.State.Status, kind)
 	}
 	if op.State.ActiveEffect != nil {
 		c.mu.Unlock()
@@ -1199,9 +1202,17 @@ func (h *Harness) beginToolEffect(ctx context.Context, c *coordinator, operation
 	}
 	if len(op.State.PendingToolCalls) == 0 || op.State.PendingToolCalls[0].CallID != callID {
 		c.mu.Unlock()
-		return "", invalidInput("operation %q does not pending-start with call %q; a tool effect addresses the first pending call", operationID, callID)
+		return "", invalidInput("operation %q does not pending-start with call %q; a %s effect addresses the first pending call", operationID, callID, kind)
 	}
 	resultID := op.State.PendingToolCalls[0].ResultEntryID
+	if kind == EffectHook {
+		fresh, err := newHexID()
+		if err != nil {
+			c.mu.Unlock()
+			return "", fmt.Errorf("%w: %v", ErrStorage, err)
+		}
+		resultID = fresh
+	}
 	sessionID := op.Admission.SessionID
 	var updated OperationRecord
 	err := h.deps.Storage.Transact(ctx, func(tx Transaction) error {
@@ -1216,19 +1227,19 @@ func (h *Harness) beginToolEffect(ctx context.Context, c *coordinator, operation
 		}
 		// a violated semantic precondition outranks the conflict class
 		if current.State.Status != OperationRunning {
-			return invalidInput("operation %q is %s; a tool effect requires a running Operation", operationID, current.State.Status)
+			return invalidInput("operation %q is %s; a %s effect requires a running Operation", operationID, current.State.Status, kind)
 		}
 		if current.State.ActiveEffect != nil {
 			return invalidInput("operation %q already carries an active effect; effects never nest", operationID)
 		}
 		if len(current.State.PendingToolCalls) == 0 || current.State.PendingToolCalls[0].CallID != callID {
-			return invalidInput("operation %q does not pending-start with call %q; a tool effect addresses the first pending call", operationID, callID)
+			return invalidInput("operation %q does not pending-start with call %q; a %s effect addresses the first pending call", operationID, callID, kind)
 		}
 		if reg.Revision != op.Revision {
 			return fmt.Errorf("%w: operation %q revision %d changed concurrently to %d", errRevisionRace, operationID, op.Revision, reg.Revision)
 		}
 		next := current
-		next.State.ActiveEffect = &ActiveEffect{Kind: EffectTool, ResultEntryID: resultID, ToolCallID: callID}
+		next.State.ActiveEffect = &ActiveEffect{Kind: kind, ResultEntryID: resultID, ToolCallID: callID, HookID: hookID}
 		payload, err := encodeOperationRegister(next)
 		if err != nil {
 			return err
@@ -1429,7 +1440,7 @@ func (h *Harness) runArgumentHooks(ctx, settleCtx context.Context, c *coordinato
 // even when cancellation arrives before its commit), a hook error, or an
 // interruption under the classification fixed for every hook.
 func (h *Harness) runOneHook(ctx, settleCtx context.Context, c *coordinator, operationID string, pending PendingToolCall, record toolCallRecord, hook ToolArgumentsHook, normalize func(model.ToolCall) (json.RawMessage, error), current json.RawMessage) (json.RawMessage, *model.ToolResult, error) {
-	resultID, err := h.beginHookEffect(ctx, c, operationID, pending.CallID, hook.ID)
+	resultID, err := h.beginPendingCallEffect(ctx, c, operationID, pending.CallID, EffectHook, hook.ID)
 	if err != nil {
 		// An intent transaction aborted by cancellation committed no
 		// reservation, so no hook result exists: the call settles the existing
@@ -1527,89 +1538,6 @@ func (h *Harness) settleHookError(ctx context.Context, c *coordinator, operation
 		return nil, err
 	}
 	return &outcome, nil
-}
-
-// beginHookEffect commits the one active-effect intent of a hook execution:
-// it reserves a fresh result entry identity and records the hook active
-// effect addressing the first pending call. Effects never nest, so any
-// committed intent of another effect rejects.
-func (h *Harness) beginHookEffect(ctx context.Context, c *coordinator, operationID, callID, hookID string) (string, error) {
-	c.mu.Lock()
-	op, ok := c.graph.Operation(operationID)
-	if !ok {
-		sessionID := c.graph.Session.Identity.SessionID
-		c.mu.Unlock()
-		return "", fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
-	}
-	if op.State.Status != OperationRunning {
-		c.mu.Unlock()
-		return "", invalidInput("operation %q is %s; a hook effect requires a running Operation", operationID, op.State.Status)
-	}
-	if op.State.ActiveEffect != nil {
-		c.mu.Unlock()
-		return "", invalidInput("operation %q already carries an active effect; effects never nest", operationID)
-	}
-	if len(op.State.PendingToolCalls) == 0 || op.State.PendingToolCalls[0].CallID != callID {
-		c.mu.Unlock()
-		return "", invalidInput("operation %q does not pending-start with call %q; a hook effect addresses the first pending call", operationID, callID)
-	}
-	resultID, err := newHexID()
-	if err != nil {
-		c.mu.Unlock()
-		return "", fmt.Errorf("%w: %v", ErrStorage, err)
-	}
-	sessionID := op.Admission.SessionID
-	var updated OperationRecord
-	err = h.deps.Storage.Transact(ctx, func(tx Transaction) error {
-		key := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: operationID}
-		reg, err := tx.ReadRegister(key)
-		if err != nil {
-			return err
-		}
-		current, err := decodeOperationRegister(reg)
-		if err != nil {
-			return corruptSession(sessionID, "operation register %q: %v", operationID, err)
-		}
-		// a violated semantic precondition outranks the conflict class
-		if current.State.Status != OperationRunning {
-			return invalidInput("operation %q is %s; a hook effect requires a running Operation", operationID, current.State.Status)
-		}
-		if current.State.ActiveEffect != nil {
-			return invalidInput("operation %q already carries an active effect; effects never nest", operationID)
-		}
-		if len(current.State.PendingToolCalls) == 0 || current.State.PendingToolCalls[0].CallID != callID {
-			return invalidInput("operation %q does not pending-start with call %q; a hook effect addresses the first pending call", operationID, callID)
-		}
-		if reg.Revision != op.Revision {
-			return fmt.Errorf("%w: operation %q revision %d changed concurrently to %d", errRevisionRace, operationID, op.Revision, reg.Revision)
-		}
-		next := current
-		next.State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: resultID, ToolCallID: callID, HookID: hookID}
-		payload, err := encodeOperationRegister(next)
-		if err != nil {
-			return err
-		}
-		replaced, err := tx.ReplaceRegister(key, reg.Revision, payload)
-		if err != nil {
-			return err
-		}
-		updated = next
-		updated.Revision = replaced.Revision
-		return nil
-	})
-	if err != nil {
-		h.markCorrupt(sessionID, err)
-		c.mu.Unlock()
-		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
-			if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
-				return "", rerr
-			}
-		}
-		return "", err
-	}
-	c.graph.replaceOperation(operationID, updated)
-	c.mu.Unlock()
-	return resultID, nil
 }
 
 // commitHookResult commits one settled hook execution's result transaction:

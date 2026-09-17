@@ -24,15 +24,14 @@ type PreparedTarget struct {
 }
 
 // PreparedCall is the shared preparation output for one read/write/edit
-// call: the normalized public arguments, every declared canonical target in
-// declaration order, and one execution closure. Preparation performs only
+// call: every declared canonical target in declaration order, and one
+// execution closure. Preparation performs only
 // path/stat/canonicalization and pure parsing; content reads, precondition
 // checks, snapshot capture and mutation run inside Execute. The closure
 // revalidates the bound canonical Workspace root, write-dir and every
 // target before content access and never silently substitutes a changed
 // canonical path.
 type PreparedCall struct {
-	Args    map[string]any
 	Targets []PreparedTarget
 	Execute func(context.Context) (string, error)
 }
@@ -51,7 +50,6 @@ type PreparedPatchResult struct {
 // redecode or reparse — and revalidates the bound root and every target
 // before content access.
 type PreparedPatchCall struct {
-	Args    map[string]any
 	Targets []PreparedTarget
 	Execute func(context.Context) (PreparedPatchResult, error)
 }
@@ -362,7 +360,7 @@ func prepareRead(root string, cfg config.ToolsConfig, tracker *FileTracker, args
 		return result, nil
 	}
 
-	return &PreparedCall{Args: args, Targets: targets, Execute: execute}, nil
+	return &PreparedCall{Targets: targets, Execute: execute}, nil
 }
 
 // PrepareReadCall is the exported preparation entry for target callers.
@@ -453,7 +451,6 @@ func prepareWrite(root string, store SnapshotStore, tracker *FileTracker, args m
 	}
 
 	return &PreparedCall{
-		Args:    args,
 		Targets: []PreparedTarget{{CanonicalPath: binding.canonical}},
 		Execute: execute,
 	}, nil
@@ -595,7 +592,6 @@ func prepareEdit(root string, store SnapshotStore, tracker *FileTracker, args ma
 	}
 
 	return &PreparedCall{
-		Args:    args,
 		Targets: []PreparedTarget{{CanonicalPath: binding.canonical}},
 		Execute: execute,
 	}, nil
@@ -784,5 +780,5 @@ func PreparePatchCall(root, rootCanonical, writeDirCanonical string, opts Capabi
 		result, previews, err := executeParsedPatch(root, rootCanonical, store, nil, p, targets, writeDir, writeDirCanonical)
 		return PreparedPatchResult{Result: result, Previews: previews}, err
 	}
-	return &PreparedPatchCall{Args: args, Targets: displayTargets, Execute: execute}, nil
+	return &PreparedPatchCall{Targets: displayTargets, Execute: execute}, nil
 }
