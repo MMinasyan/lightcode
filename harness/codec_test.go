@@ -132,8 +132,20 @@ func validSignalEntry(operationID string) signalEntry {
 		EntryID:          testEntryID,
 		OperationID:      operationID,
 		Signal:           SignalInterruption,
-		RelatedOperation: operationRef{SessionID: testSessionID, OperationID: testOpID},
+		RelatedOperation: &operationRef{SessionID: testSessionID, OperationID: testOpID},
 		Content:          signalInterruptionContent,
+	}
+}
+
+// validBackgroundCompletionEntry returns one valid operationless
+// background_completion signal entry recording a child member's completion.
+func validBackgroundCompletionEntry() signalEntry {
+	return signalEntry{
+		SessionID:     testSessionID,
+		EntryID:       testEntryID,
+		Signal:        SignalBackgroundCompletion,
+		RelatedMember: &relatedMember{Kind: "child", ID: otherSession()},
+		Content:       "Task completed.",
 	}
 }
 
@@ -1531,6 +1543,228 @@ func TestExecutionCapturePermissionMembers(t *testing.T) {
 			mutation.members(members)
 			if got, err := decodeExecutionCapture(members); err == nil {
 				t.Fatalf("capture decoded to %+v, want rejection", got)
+			}
+		})
+	}
+}
+
+// TestSessionIdentityParentLineage proves the child lineage member's wire
+// shape: parent_session_id encodes by omission, round-trips on a child, is
+// absent on a root and on a fork, and every invalid shape is rejected on both
+// the encode and decode paths with the existing classes.
+func TestSessionIdentityParentLineage(t *testing.T) {
+	child := validSessionRecord()
+	child.Identity.ParentSessionID = otherSession()
+	childRaw, err := encodeSessionRegister(child)
+	if err != nil {
+		t.Fatalf("encode child identity: %v", err)
+	}
+	if !strings.Contains(string(childRaw), `"parent_session_id":"`+otherSession()+`"`) {
+		t.Fatalf("child identity payload lacks parent_session_id: %s", childRaw)
+	}
+	decoded, err := decodeSessionRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterSession}, Payload: childRaw})
+	if err != nil {
+		t.Fatalf("decode child identity: %v", err)
+	}
+	if decoded.Identity.ParentSessionID != otherSession() {
+		t.Fatalf("decoded parent session id = %q, want %q", decoded.Identity.ParentSessionID, otherSession())
+	}
+
+	rootRaw, err := encodeSessionRegister(validSessionRecord())
+	if err != nil {
+		t.Fatalf("encode root identity: %v", err)
+	}
+	if strings.Contains(string(rootRaw), "parent_session_id") {
+		t.Fatalf("root identity carries parent_session_id: %s", rootRaw)
+	}
+
+	fork := validSessionRecord()
+	fork.Identity.SourceSessionID = otherSession()
+	fork.Identity.SourceBoundaryEntryID = otherEntry()
+	forkRaw, err := encodeSessionRegister(fork)
+	if err != nil {
+		t.Fatalf("encode fork identity: %v", err)
+	}
+	if strings.Contains(string(forkRaw), "parent_session_id") {
+		t.Fatalf("fork identity carries parent_session_id: %s", forkRaw)
+	}
+	if _, err := decodeSessionRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterSession}, Payload: forkRaw}); err != nil {
+		t.Fatalf("decode fork identity: %v", err)
+	}
+
+	// Encode-side rejections use the existing invalid-input class.
+	encodeRejections := []struct {
+		name  string
+		value SessionIdentity
+	}{
+		{"non-hex parent", SessionIdentity{SessionID: testSessionID, Workspace: "/tmp/works", CreatedAt: testTime, ParentSessionID: "not-hex"}},
+		{"parent with fork lineage", SessionIdentity{SessionID: testSessionID, Workspace: "/tmp/works", CreatedAt: testTime, ParentSessionID: otherSession(), SourceSessionID: otherSession(), SourceBoundaryEntryID: otherEntry()}},
+		{"parent with source session only", SessionIdentity{SessionID: testSessionID, Workspace: "/tmp/works", CreatedAt: testTime, ParentSessionID: otherSession(), SourceSessionID: otherSession()}},
+		{"parent with boundary only", SessionIdentity{SessionID: testSessionID, Workspace: "/tmp/works", CreatedAt: testTime, ParentSessionID: otherSession(), SourceBoundaryEntryID: otherEntry()}},
+	}
+	for _, tc := range encodeRejections {
+		t.Run("encode/"+tc.name, func(t *testing.T) {
+			if _, err := encodeSessionIdentity(tc.value); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("error = %v, want ErrInvalid", err)
+			}
+		})
+	}
+
+	// Decode-side wire rejections on the child identity object.
+	decodeRejections := []struct {
+		name   string
+		mutate func(map[string]json.RawMessage)
+	}{
+		{"empty parent", func(m map[string]json.RawMessage) { m["parent_session_id"] = json.RawMessage(`""`) }},
+		{"null parent", func(m map[string]json.RawMessage) { m["parent_session_id"] = json.RawMessage(`null`) }},
+		{"wrong container parent", func(m map[string]json.RawMessage) { m["parent_session_id"] = json.RawMessage(`5`) }},
+		{"non-hex parent", func(m map[string]json.RawMessage) {
+			m["parent_session_id"] = json.RawMessage(`"0123456789abcdef0123456789abcdef0"`)
+		}},
+		{"uppercase parent", func(m map[string]json.RawMessage) {
+			m["parent_session_id"] = json.RawMessage(`"` + strings.Repeat("F", 32) + `"`)
+		}},
+		{"parent with source session", func(m map[string]json.RawMessage) {
+			m["source_session_id"] = json.RawMessage(`"` + otherSession() + `"`)
+		}},
+		{"parent with boundary", func(m map[string]json.RawMessage) {
+			m["source_boundary_entry_id"] = json.RawMessage(`"` + otherEntry() + `"`)
+		}},
+		{"parent with fork lineage", func(m map[string]json.RawMessage) {
+			m["source_session_id"] = json.RawMessage(`"` + otherSession() + `"`)
+			m["source_boundary_entry_id"] = json.RawMessage(`"` + otherEntry() + `"`)
+		}},
+	}
+	for _, tc := range decodeRejections {
+		t.Run("decode/"+tc.name, func(t *testing.T) {
+			obj, err := objectMember(wireObject(t, childRaw), "identity", true)
+			if err != nil {
+				t.Fatalf("identity member: %v", err)
+			}
+			tc.mutate(obj)
+			if _, err := decodeSessionIdentity(obj); err == nil {
+				t.Fatalf("expected rejection")
+			}
+		})
+	}
+}
+
+// TestBackgroundCompletionSignalRules proves the background_completion
+// subtype's correlation rule: related_member is required with a valid kind and
+// a kind-shaped id, related_operation and an owning Operation identity are
+// forbidden, content is producer-bounded non-empty, the fixed kinds reject a
+// related_member, and every invalid shape is rejected on both the encode and
+// decode paths.
+func TestBackgroundCompletionSignalRules(t *testing.T) {
+	childID := otherSession()
+	jobID := "0a1b2c3d"
+
+	raw, err := encodeSignalEntry(validBackgroundCompletionEntry())
+	if err != nil {
+		t.Fatalf("encode child completion: %v", err)
+	}
+	env := Entry{SessionID: testSessionID, ID: testEntryID, Kind: EntrySignal, Sequence: 1, CommittedAt: testTime}
+	env.Payload = raw
+	decoded, err := decodeSignalEntry(env)
+	if err != nil {
+		t.Fatalf("decode child completion: %v", err)
+	}
+	if decoded.OperationID != "" || decoded.RelatedOperation != nil {
+		t.Fatalf("completion signal is not operationless: %+v", decoded)
+	}
+	if decoded.RelatedMember == nil || decoded.RelatedMember.Kind != "child" || decoded.RelatedMember.ID != childID {
+		t.Fatalf("decoded related member = %+v, want child %q", decoded.RelatedMember, childID)
+	}
+	if _, present := wireObject(t, raw)["related_operation"]; present {
+		t.Fatalf("completion signal carries related_operation: %s", raw)
+	}
+
+	jobRaw, err := encodeSignalEntry(func() signalEntry {
+		v := validBackgroundCompletionEntry()
+		v.RelatedMember = &relatedMember{Kind: "job", ID: jobID}
+		return v
+	}())
+	if err != nil {
+		t.Fatalf("encode job completion: %v", err)
+	}
+	env.Payload = jobRaw
+	if _, err := decodeSignalEntry(env); err != nil {
+		t.Fatalf("decode job completion: %v", err)
+	}
+
+	// The fixed kinds reject a related_member member.
+	fixedRaw, err := encodeSignalEntry(validSignalEntry(testOpID))
+	if err != nil {
+		t.Fatalf("encode fixed signal: %v", err)
+	}
+	fixedEnv := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntrySignal, Sequence: 1, CommittedAt: testTime}
+	fixedEnv.Payload = setKey(fixedRaw, "related_member", json.RawMessage(`{"kind":"child","id":"`+childID+`"}`))
+	if _, err := decodeSignalEntry(fixedEnv); err == nil {
+		t.Fatalf("fixed signal with related_member must be rejected")
+	}
+
+	// Encode-side rejections on the subtype value.
+	encodeRejections := []struct {
+		name  string
+		value signalEntry
+	}{
+		{"missing related member", func() signalEntry { v := validBackgroundCompletionEntry(); v.RelatedMember = nil; return v }()},
+		{"wrong kind", func() signalEntry { v := validBackgroundCompletionEntry(); v.RelatedMember.Kind = "team"; return v }()},
+		{"empty id", func() signalEntry { v := validBackgroundCompletionEntry(); v.RelatedMember.ID = ""; return v }()},
+		{"non-hex child id", func() signalEntry { v := validBackgroundCompletionEntry(); v.RelatedMember.ID = "ghost"; return v }()},
+		{"job-length child id", func() signalEntry { v := validBackgroundCompletionEntry(); v.RelatedMember.ID = jobID; return v }()},
+		{"child-length job id", func() signalEntry {
+			v := validBackgroundCompletionEntry()
+			v.RelatedMember = &relatedMember{Kind: "job", ID: childID}
+			return v
+		}()},
+		{"uppercase job id", func() signalEntry {
+			v := validBackgroundCompletionEntry()
+			v.RelatedMember = &relatedMember{Kind: "job", ID: "0A1B2C3D"}
+			return v
+		}()},
+		{"related operation present", func() signalEntry {
+			v := validBackgroundCompletionEntry()
+			v.RelatedOperation = &operationRef{SessionID: testSessionID, OperationID: testOpID}
+			return v
+		}()},
+		{"operation owned", func() signalEntry { v := validBackgroundCompletionEntry(); v.OperationID = testOpID; return v }()},
+		{"empty content", func() signalEntry { v := validBackgroundCompletionEntry(); v.Content = ""; return v }()},
+	}
+	for _, tc := range encodeRejections {
+		t.Run("encode/"+tc.name, func(t *testing.T) {
+			if _, err := encodeSignalEntry(tc.value); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("error = %v, want ErrInvalid", err)
+			}
+		})
+	}
+
+	// Decode-side wire rejections.
+	relatedMemberWire := func(kind, id string) string {
+		return fmt.Sprintf(`{"kind":%q,"id":%q}`, kind, id)
+	}
+	decodeRejections := []struct {
+		name    string
+		payload json.RawMessage
+	}{
+		{"null related member", setKey(raw, "related_member", json.RawMessage(`null`))},
+		{"wrong container related member", setKey(raw, "related_member", json.RawMessage(`[]`))},
+		{"wrong kind", setKey(raw, "related_member", json.RawMessage(relatedMemberWire("team", childID)))},
+		{"missing id", setKey(raw, "related_member", json.RawMessage(`{"kind":"child"}`))},
+		{"empty id", setKey(raw, "related_member", json.RawMessage(relatedMemberWire("child", "")))},
+		{"non-hex child id", setKey(raw, "related_member", json.RawMessage(relatedMemberWire("child", "ghost")))},
+		{"job-length child id", setKey(raw, "related_member", json.RawMessage(relatedMemberWire("child", jobID)))},
+		{"child-length job id", setKey(raw, "related_member", json.RawMessage(relatedMemberWire("job", childID)))},
+		{"unknown member inside related member", setKey(raw, "related_member", json.RawMessage(`{"kind":"child","id":"`+childID+`","bogus":1}`))},
+		{"related operation present", setKey(raw, "related_operation", json.RawMessage(`{"session_id":"`+testSessionID+`","operation_id":"`+testOpID+`"}`))},
+		{"operation owned", setKey(raw, "operation_id", json.RawMessage(`"`+testOpID+`"`))},
+		{"empty content", setKey(raw, "content", json.RawMessage(`""`))},
+	}
+	for _, tc := range decodeRejections {
+		t.Run("decode/"+tc.name, func(t *testing.T) {
+			env.Payload = tc.payload
+			if _, err := decodeSignalEntry(env); err == nil {
+				t.Fatalf("expected rejection")
 			}
 		})
 	}

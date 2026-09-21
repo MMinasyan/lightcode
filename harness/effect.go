@@ -800,7 +800,7 @@ func newSignalEntry(tx Transaction, sessionID, operationID string, kind SignalKi
 		EntryID:          entryID,
 		OperationID:      operationID,
 		Signal:           kind,
-		RelatedOperation: operationRef{SessionID: sessionID, OperationID: operationID},
+		RelatedOperation: &operationRef{SessionID: sessionID, OperationID: operationID},
 		Content:          signalContent(kind),
 	}
 	payload, err := encodeSignalEntry(entry)
