@@ -109,7 +109,7 @@ func (h *Harness) Fork(ctx context.Context, req ForkRequest) (ForkResult, error)
 		return ForkResult{}, publicationError(ctx, txErr)
 	}
 
-	dest := &coordinator{graph: &sessionGraph{Session: commit.session, Operations: []OperationRecord{commit.operation}, Entries: commit.entries}}
+	dest := &coordinator{graph: &sessionGraph{Session: commit.session, Operations: []OperationRecord{commit.operation}, Entries: commit.entries}, bgState: bgOpen}
 	h.mu.Lock()
 	h.sessions[destID] = dest
 	h.mu.Unlock()

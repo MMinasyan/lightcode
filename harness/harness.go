@@ -13,12 +13,20 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
+// JobStopper is the job-stop seam: the Harness cannot import plugin packages,
+// so the interface is declared at its consumer. Nil is legal; StartJob rejects
+// job admission without one (managed shutdown stops every Job).
+type JobStopper interface {
+	StopJob(sessionID, jobID string)
+}
+
 // Dependencies are the construction inputs of one Harness: the durable
 // Storage and the single preparation callback shared by every admission
 // producer.
 type Dependencies struct {
 	Storage Storage
 	Prepare func(context.Context, PreparationRequest) (PreparedExecution, error)
+	Jobs    JobStopper
 }
 
 // PreparationSession is the revision-free owned Session view one preparation
@@ -208,6 +216,12 @@ type coordinator struct {
 	queued   []*pendingMessage // queued input waiting for the next Agent turn end
 	run      *activeExecution  // non-nil while one execution is in flight
 
+	group             *backgroundGroup // nil until the first member
+	bgState           bgState          // starts as bgOpen at every construction site; the zero value is never observed
+	stop              *stopInterval
+	pendingCompletion *launchInfo
+	interruptOp       string
+
 	gone bool // set by the post-commit deletion invalidation: every holder of the coordinator gets ErrNotFound from then on
 }
 
@@ -262,7 +276,7 @@ func (h *Harness) CreateSession(ctx context.Context, req CreateSessionRequest) (
 		return SessionRecord{}, err
 	}
 	h.mu.Lock()
-	h.sessions[sessionID] = &coordinator{graph: &sessionGraph{Session: record}}
+	h.sessions[sessionID] = &coordinator{graph: &sessionGraph{Session: record}, bgState: bgOpen}
 	h.mu.Unlock()
 	return ownSessionRecord(record), nil
 }
@@ -904,7 +918,7 @@ func (h *Harness) coordinatorFor(ctx context.Context, sessionID string) (*coordi
 		}
 		c = h.sessions[sessionID]
 		if c == nil {
-			c = &coordinator{graph: graph}
+			c = &coordinator{graph: graph, bgState: bgOpen}
 			h.sessions[sessionID] = c
 		}
 		corru := c.corru
