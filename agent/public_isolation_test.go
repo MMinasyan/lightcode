@@ -113,8 +113,8 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 		case "internal/plugins/tools":
 			if imp != runtimePkg && imp != harnessPkg && imp != modelPkg && imp != configPkg &&
 				imp != toolPkg && imp != snapshotPkg && imp != editprePkg && imp != pathutilPkg &&
-				imp != shellparsePkg && !std[imp] {
-				problems = append(problems, rel+": internal/plugins/tools imports "+imp+"; the native tools plugin may import only the standard library, "+runtimePkg+", "+harnessPkg+", "+modelPkg+", and the retained "+toolPkg+", "+snapshotPkg+", "+editprePkg+", "+configPkg+", "+pathutilPkg+", and "+shellparsePkg+" helpers")
+				imp != shellparsePkg && imp != jobsPkg && !std[imp] {
+				problems = append(problems, rel+": internal/plugins/tools imports "+imp+"; the native tools plugin may import only the standard library, "+runtimePkg+", "+harnessPkg+", "+modelPkg+", "+jobsPkg+", and the retained "+toolPkg+", "+snapshotPkg+", "+editprePkg+", "+configPkg+", "+pathutilPkg+", and "+shellparsePkg+" helpers")
 			}
 		case "internal/plugins/adaptation":
 			if imp != runtimePkg && imp != modelPkg && imp != adaptationPkg && !std[imp] {
@@ -193,17 +193,18 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 			t.Errorf("internal/plugins/sqlite importing %q: %d problems, want 1: %v", imp, len(problems), problems)
 		}
 	}
-	// The native tools plugin declares the four file tools plus run_command
-	// and sleep over the public runtime and harness contracts, the public
-	// model types, and the retained shared file-preparation, snapshot,
-	// preview, config, path, and shell-parse helpers it composes; the legacy
-	// owner, the driver, storage, and sibling plugins never enter it.
+	// The native tools plugin declares the four file tools plus run_command,
+	// process, and sleep over the public runtime and harness contracts, the
+	// public model types, the jobs capability it requires, and the retained
+	// shared file-preparation, snapshot, preview, config, path, and
+	// shell-parse helpers it composes; the legacy owner, the driver, storage,
+	// and the other sibling plugins never enter it.
 	if problems := checkTrackedGoFile("internal/plugins/tools/x.go", []string{
 		"bytes", "context", "encoding/json", "errors", "fmt", "io", "math", "path/filepath", "strings", "time",
 		publicModule + "/model", publicModule + "/harness", publicModule + "/runtime",
 		publicModule + "/internal/config", publicModule + "/internal/tool", publicModule + "/internal/snapshot",
 		publicModule + "/internal/editpreview", publicModule + "/internal/pathutil",
-		publicModule + "/internal/shellparse",
+		publicModule + "/internal/shellparse", publicModule + "/plugins/jobs",
 	}, std); len(problems) != 0 {
 		t.Errorf("allowed internal/plugins/tools imports flagged: %v", problems)
 	}

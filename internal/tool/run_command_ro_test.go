@@ -33,7 +33,7 @@ func TestReadOnlyRunCommandAllowsBackgroundParam(t *testing.T) {
 
 func TestReadOnlyRunCommandDescriptionMatchesDecisionText(t *testing.T) {
 	tool := NewReadOnlyRunCommand(NewRunCommand(config.ToolsConfig{}, t.TempDir(), nil))
-	if got := tool.Description(); got != readOnlyRunCommandDescription {
+	if got := tool.Description(); got != ReadOnlyRunCommandDescription {
 		t.Fatalf("Description = %q, want decision text", got)
 	}
 }

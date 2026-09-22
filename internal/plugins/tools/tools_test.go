@@ -3,13 +3,14 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/tool"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -18,7 +19,9 @@ import (
 // Invocation is constructible, so Normalize/Prepare here exercise the
 // defaults path; configuration-bearing behavior is covered by
 // ValidateConfig directly and by the runtime-composed tests in the runtime
-// package.
+// package. These tests never open the plugin — the tools plugin requires the
+// jobs capability, whose binding only the composed Runtime scope constructs —
+// so the concrete tool values are built from one instance directly.
 
 // testEntry is a valid-looking Harness admitted-input identity.
 const (
@@ -26,44 +29,19 @@ const (
 	testEntryID   = "fedcba9876543210fedcba9876543210"
 )
 
-// openTools opens the real plugin over a fresh data root and returns its
-// tool exports by declared ID.
-func openTools(t *testing.T, dataDir string) map[string]runtime.Tool {
-	t.Helper()
-	return openToolsWithKeys(t, dataDir, nil)
-}
-
-// openToolsWithKeys is openTools over a scope carrying the given managed
-// env key names.
-func openToolsWithKeys(t *testing.T, dataDir string, managedKeys []string) map[string]runtime.Tool {
-	t.Helper()
-	p := Plugin()
-	if p.ID != "tools" || p.Scope != runtime.ScopeRuntime || p.ValidateConfig == nil || p.Open == nil || len(p.Requires) != 0 {
-		t.Fatalf("plugin declaration = %+v, want the Runtime-scoped tools plugin with a validator and no dependencies", p)
+// directTools constructs the plugin's tool exports from one instance the
+// way open publishes them, without opening the plugin.
+func directTools(dataDir string, managedKeys []string) map[string]runtime.Tool {
+	inst := &instance{dataDir: dataDir, managedKeys: managedKeys}
+	return map[string]runtime.Tool{
+		"read_file":   readTool{inst},
+		"write_file":  writeTool{inst},
+		"edit_file":   editTool{inst},
+		"apply_patch": patchTool{inst},
+		"run_command": runCommandTool{inst},
+		"process":     processTool{inst},
+		"sleep":       sleepTool{},
 	}
-	if len(p.Provides) != 6 {
-		t.Fatalf("plugin declares %d exports, want the four file tools plus run_command and sleep", len(p.Provides))
-	}
-	inst, err := p.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dataDir, ManagedEnvKeys: managedKeys}, runtime.Bindings{})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	if len(inst.Values) != 6 || inst.Close != nil {
-		t.Fatalf("instance = %d exports with a non-nil Close, want exactly the six tools and no closer", len(inst.Values))
-	}
-	byID := make(map[string]runtime.Tool, 6)
-	for _, id := range []string{"read_file", "write_file", "edit_file", "apply_patch", "run_command", "sleep"} {
-		value, ok := inst.Values[id]
-		if !ok {
-			t.Fatalf("instance is missing the declared export %q", id)
-		}
-		tool, ok := value.(runtime.Tool)
-		if !ok {
-			t.Fatalf("export %q supplies %T, not a runtime.Tool", id, value)
-		}
-		byID[id] = tool
-	}
-	return byID
 }
 
 // callToolContext is the ToolContext the direct tests prepare with: a real
@@ -144,14 +122,15 @@ func TestValidateConfigSettings(t *testing.T) {
 
 func TestDescribeAvailabilityAndDefinitions(t *testing.T) {
 	// The describe functions are static method values needing no instance;
-	// the plugin declaration/instance assertions run in every test that
-	// opens the real plugin (normalize, prepare shapes, execute effects).
+	// the composed open contract is asserted in the runtime package's
+	// composed tools suite.
 	describe := map[string]func(runtime.Invocation, runtime.ToolConstraints, harness.SessionIdentity) (runtime.ToolDescription, error){
 		"read_file":   readTool{}.describe,
 		"write_file":  writeTool{}.describe,
 		"edit_file":   editTool{}.describe,
 		"apply_patch": patchTool{}.describe,
 		"run_command": runCommandTool{}.describe,
+		"process":     processTool{}.describe,
 		"sleep":       sleepTool{}.describe,
 	}
 
@@ -160,9 +139,9 @@ func TestDescribeAvailabilityAndDefinitions(t *testing.T) {
 		constraints runtime.ToolConstraints
 		available   map[string]bool
 	}{
-		{"unconstrained agent", runtime.ToolConstraints{}, map[string]bool{"read_file": true, "write_file": true, "edit_file": true, "apply_patch": true, "run_command": true, "sleep": true}},
-		{"readonly without write dir", runtime.ToolConstraints{Readonly: true}, map[string]bool{"read_file": true, "write_file": false, "edit_file": false, "apply_patch": false, "run_command": true, "sleep": true}},
-		{"readonly with write dir", runtime.ToolConstraints{Readonly: true, WriteDir: "/w"}, map[string]bool{"read_file": true, "write_file": true, "edit_file": true, "apply_patch": true, "run_command": true, "sleep": true}},
+		{"unconstrained agent", runtime.ToolConstraints{}, map[string]bool{"read_file": true, "write_file": true, "edit_file": true, "apply_patch": true, "run_command": true, "process": true, "sleep": true}},
+		{"readonly without write dir", runtime.ToolConstraints{Readonly: true}, map[string]bool{"read_file": true, "write_file": false, "edit_file": false, "apply_patch": false, "run_command": true, "process": true, "sleep": true}},
+		{"readonly with write dir", runtime.ToolConstraints{Readonly: true, WriteDir: "/w"}, map[string]bool{"read_file": true, "write_file": true, "edit_file": true, "apply_patch": true, "run_command": true, "process": true, "sleep": true}},
 	}
 	for _, tc := range cases {
 		for name, want := range tc.available {
@@ -187,8 +166,73 @@ func TestDescribeAvailabilityAndDefinitions(t *testing.T) {
 	}
 }
 
+// assertJSONEqual compares two JSON payloads by their decoded value.
+func assertJSONEqual(t *testing.T, got json.RawMessage, want any) {
+	t.Helper()
+	wantRaw, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal retained schema: %v", err)
+	}
+	var gotValue, wantValue any
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		t.Fatalf("decode described schema %s: %v", got, err)
+	}
+	if err := json.Unmarshal(wantRaw, &wantValue); err != nil {
+		t.Fatalf("decode retained schema %s: %v", wantRaw, err)
+	}
+	if !reflect.DeepEqual(gotValue, wantValue) {
+		t.Errorf("described schema = %s, want the retained schema %s", got, wantRaw)
+	}
+}
+
+// TestRunCommandDescriptionsAndSchemasMatchRetained pins both run_command
+// surfaces to the retained texts: the ordinary Agent receives the complete
+// legacy description with the background bullets and the readonly Agent
+// receives the retained readonly description; both share the retained schema.
+func TestRunCommandDescriptionsAndSchemasMatchRetained(t *testing.T) {
+	legacy := &tool.RunCommand{}
+	ordinary, err := runCommandTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
+	if err != nil {
+		t.Fatalf("describe ordinary: %v", err)
+	}
+	if ordinary.Definition.Description != legacy.Description() {
+		t.Errorf("ordinary description = %q, want the retained legacy description %q", ordinary.Definition.Description, legacy.Description())
+	}
+	assertJSONEqual(t, ordinary.Definition.Parameters, legacy.ParametersSchema())
+
+	readonly, err := runCommandTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{Readonly: true}, harness.SessionIdentity{})
+	if err != nil {
+		t.Fatalf("describe readonly: %v", err)
+	}
+	if readonly.Definition.Description != tool.ReadOnlyRunCommandDescription {
+		t.Errorf("readonly description = %q, want the retained readonly description", readonly.Definition.Description)
+	}
+	legacyReadonly := tool.NewReadOnlyRunCommand(legacy)
+	assertJSONEqual(t, readonly.Definition.Parameters, legacyReadonly.ParametersSchema())
+	if !ordinary.Available || !readonly.Available {
+		t.Errorf("availability ordinary/readonly = %v/%v, want both available", ordinary.Available, readonly.Available)
+	}
+}
+
+// TestProcessDescriptionAndSchemaMatchRetained pins the process tool's
+// model-visible surface to the retained legacy description and schema.
+func TestProcessDescriptionAndSchemaMatchRetained(t *testing.T) {
+	legacy := &tool.ProcessTool{}
+	got, err := processTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
+	if err != nil {
+		t.Fatalf("describe process: %v", err)
+	}
+	if got.Definition.Description != legacy.Description() {
+		t.Errorf("process description = %q, want the retained legacy description %q", got.Definition.Description, legacy.Description())
+	}
+	assertJSONEqual(t, got.Definition.Parameters, legacy.ParametersSchema())
+	if got.Definition.Name != "process" || !got.Available || got.DefaultHidden {
+		t.Errorf("process definition = %+v, want name process, available, not hidden", got)
+	}
+}
+
 func TestNormalizeArguments(t *testing.T) {
-	byID := openTools(t, t.TempDir())
+	byID := directTools(t.TempDir(), nil)
 	tc := callToolContext(t.TempDir(), runtime.ToolConstraints{})
 
 	t.Run("read_file applies defaults and strips private fields", func(t *testing.T) {
@@ -241,525 +285,41 @@ func TestNormalizeArguments(t *testing.T) {
 			}
 		}
 	})
+	t.Run("process requires string action and id members when present", func(t *testing.T) {
+		for _, args := range []string{
+			`{"action":5}`,
+			`{"action":null}`,
+			`{"action":"read","id":5}`,
+			`{"action":"list","id":true}`,
+		} {
+			if _, err := normalize(t, byID["process"], tc, "process", args); err == nil {
+				t.Errorf("process normalized %s, want rejection", args)
+			}
+		}
+		raw, err := normalize(t, byID["process"], tc, "process", `{"action":"read","id":"deadbeef","_lightcode_receipt":"x","note":"kept"}`)
+		if err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		var normalized map[string]any
+		if err := json.Unmarshal(raw, &normalized); err != nil {
+			t.Fatalf("normalized bytes: %v", err)
+		}
+		if normalized["action"] != "read" || normalized["id"] != "deadbeef" || normalized["note"] != "kept" {
+			t.Fatalf("normalized = %s, want the members preserved", raw)
+		}
+		if _, ok := normalized["_lightcode_receipt"]; ok {
+			t.Fatal("normalized arguments retained a private field")
+		}
+	})
 	t.Run("malformed, null and trailing argument bytes are validation errors", func(t *testing.T) {
 		for _, args := range []string{``, `not json`, `null`, `[1]`, `{"path":"a"} trailing`, `"str"`} {
-			for _, name := range []string{"read_file", "write_file", "edit_file", "apply_patch", "run_command", "sleep"} {
+			for _, name := range []string{"read_file", "write_file", "edit_file", "apply_patch", "run_command", "process", "sleep"} {
 				if _, err := normalize(t, byID[name], tc, name, args); err == nil {
 					t.Errorf("%s normalized %q, want rejection", name, args)
 				}
 			}
 		}
 	})
-}
-
-func TestPrepareShapesAndCanonicals(t *testing.T) {
-	byID := openTools(t, t.TempDir())
-
-	t.Run("read_file binds canonical targets with file.read pairs", func(t *testing.T) {
-		ws := t.TempDir()
-		if err := os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("hello\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		plan := prepare(t, byID["read_file"], callToolContext(ws, runtime.ToolConstraints{}), "read_file", `{"path":"notes.txt"}`)
-		if plan.Immediate != nil || plan.Execute == nil {
-			t.Fatalf("plan = %+v, want one executor", plan)
-		}
-		if len(plan.Permissions) != 1 || plan.Permissions[0].Permission != "file.read" {
-			t.Fatalf("permissions = %+v, want one file.read pair", plan.Permissions)
-		}
-		if plan.Permissions[0].Target != filepath.Join(ws, "notes.txt") {
-			t.Fatalf("target = %q, want the canonical file path", plan.Permissions[0].Target)
-		}
-		if plan.CanonicalWorkspace != ws || plan.CanonicalWriteDir != "" {
-			t.Fatalf("canonicals = %q/%q, want the workspace and an empty write dir", plan.CanonicalWorkspace, plan.CanonicalWriteDir)
-		}
-	})
-	t.Run("read_file of a missing leaf declares the parent directory too", func(t *testing.T) {
-		ws := t.TempDir()
-		plan := prepare(t, byID["read_file"], callToolContext(ws, runtime.ToolConstraints{}), "read_file", `{"path":"ghost.txt"}`)
-		if len(plan.Permissions) != 2 {
-			t.Fatalf("permissions = %+v, want the file and parent-directory file.read pairs", plan.Permissions)
-		}
-		for _, pair := range plan.Permissions {
-			if pair.Permission != "file.read" || pair.Target == "" {
-				t.Fatalf("pair = %+v, want a nonempty canonical file.read pair", pair)
-			}
-		}
-	})
-	t.Run("canonical workspace resolves symlinks and stays lexically fixed", func(t *testing.T) {
-		real := t.TempDir()
-		link := filepath.Join(t.TempDir(), "link")
-		if err := os.Symlink(real, link); err != nil {
-			t.Fatal(err)
-		}
-		plan := prepare(t, byID["read_file"], callToolContext(link, runtime.ToolConstraints{}), "read_file", `{"path":"a.txt"}`)
-		if plan.CanonicalWorkspace != real {
-			t.Fatalf("CanonicalWorkspace = %q, want the symlink-resolved %q", plan.CanonicalWorkspace, real)
-		}
-	})
-	t.Run("write_file declares file.write and the canonical write-dir boundary", func(t *testing.T) {
-		ws := t.TempDir()
-		if err := os.MkdirAll(filepath.Join(ws, "wd"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		constraints := runtime.ToolConstraints{WriteDir: "wd"}
-		plan := prepare(t, byID["write_file"], callToolContext(ws, constraints), "write_file", `{"path":"wd/out.txt","content":"x"}`)
-		if plan.Immediate != nil || plan.Execute == nil {
-			t.Fatalf("plan = %+v, want one executor", plan)
-		}
-		if len(plan.Permissions) != 1 || plan.Permissions[0].Permission != "file.write" {
-			t.Fatalf("permissions = %+v, want one file.write pair", plan.Permissions)
-		}
-		wantBoundary := filepath.Join(ws, "wd")
-		if plan.CanonicalWriteDir != wantBoundary || plan.CanonicalWorkspace != ws {
-			t.Fatalf("canonicals = %q/%q, want %q/%q", plan.CanonicalWorkspace, plan.CanonicalWriteDir, ws, wantBoundary)
-		}
-	})
-	t.Run("apply_patch declares every source and destination in declaration order", func(t *testing.T) {
-		ws := t.TempDir()
-		for name, content := range map[string]string{"b.txt": "old\n", "c.txt": "gone\n", "d.txt": "d\n"} {
-			if err := os.WriteFile(filepath.Join(ws, name), []byte(content), 0o644); err != nil {
-				t.Fatal(err)
-			}
-		}
-		patch := "*** Begin Patch\n*** Add File: a.txt\n+new\n*** Update File: b.txt\n@@\n-old\n+new\n*** Delete File: c.txt\n*** Update File: d.txt\n*** Move to: e.txt\n*** End Patch"
-		input, err := json.Marshal(map[string]string{"input": patch})
-		if err != nil {
-			t.Fatal(err)
-		}
-		plan := prepare(t, byID["apply_patch"], callToolContext(ws, runtime.ToolConstraints{}), "apply_patch", string(input))
-		want := []string{"a.txt", "b.txt", "c.txt", "d.txt", "e.txt"}
-		if len(plan.Permissions) != len(want) {
-			t.Fatalf("permissions = %+v, want %d file.write pairs in declaration order", plan.Permissions, len(want))
-		}
-		for i, name := range want {
-			pair := plan.Permissions[i]
-			if pair.Permission != "file.write" || pair.Target != filepath.Join(ws, name) {
-				t.Fatalf("pair %d = %+v, want file.write on %s", i, pair, name)
-			}
-		}
-	})
-	t.Run("undecodable arguments in Prepare map to the immediate validation error", func(t *testing.T) {
-		ws := t.TempDir()
-		plan := prepare(t, byID["read_file"], callToolContext(ws, runtime.ToolConstraints{}), "read_file", `{"path":`)
-		if plan.Execute != nil || plan.Immediate == nil {
-			t.Fatalf("plan = %+v, want one immediate outcome", plan)
-		}
-		outcome := *plan.Immediate
-		if outcome.Result.Status != model.ResultError || outcome.Result.CallID != "call-1" || outcome.Result.Content == "" {
-			t.Fatalf("immediate = %+v, want the bounded validation error for the original call", outcome)
-		}
-	})
-	t.Run("prepare normalizes once: it never re-runs argument normalization", func(t *testing.T) {
-		ws := t.TempDir()
-		if err := os.WriteFile(filepath.Join(ws, "f.txt"), []byte("one\ntwo\nthree"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		tool := byID["read_file"]
-		// The committed normalized arguments are authoritative: a strict
-		// "1e0" spelling canonicalizes once at normalization, and
-		// preparation consumes the byte-identical committed value and reads
-		// exactly line 1 with the canonical integer window.
-		committed, err := normalize(t, tool, callToolContext(ws, runtime.ToolConstraints{}), "read_file", `{"path":"f.txt","offset":1e0,"limit":1.0}`)
-		if err != nil {
-			t.Fatalf("Normalize: %v", err)
-		}
-		if string(committed) != `{"limit":1,"offset":1,"path":"f.txt"}` {
-			t.Fatalf("committed normalized arguments = %s, want the canonical integers once", committed)
-		}
-		plan := prepare(t, tool, callToolContext(ws, runtime.ToolConstraints{}), "read_file", string(committed))
-		outcome := plan.Execute(context.Background())
-		if outcome.Result.Status != model.ResultSuccess || !strings.HasPrefix(outcome.Result.Content, "1\tone\n") || !strings.Contains(outcome.Result.Content, "(Showing lines 1-1 of 3. Use offset=2 to continue.)") {
-			t.Fatalf("result = %+v, want the canonical 1/1 window through preparation", outcome.Result)
-		}
-		// Preparation performs no validation or defaulting of its own: an
-		// un-normalized fraction handed directly to Prepare is not a second
-		// normalization error — preparation binds targets and parses the
-		// canonical lexeme only at its point of use.
-		plan = prepare(t, tool, callToolContext(ws, runtime.ToolConstraints{}), "read_file", `{"path":"f.txt","offset":2.5}`)
-		if plan.Immediate != nil || plan.Execute == nil {
-			t.Fatalf("plan = %+v, want one executor: Prepare runs no second normalization", plan)
-		}
-	})
-	t.Run("failed canonical preparation maps to the immediate denial", func(t *testing.T) {
-		ws := t.TempDir()
-		loop := filepath.Join(ws, "loop")
-		if err := os.Symlink("loop", loop); err != nil {
-			t.Fatal(err)
-		}
-		plan := prepare(t, byID["write_file"], callToolContext(ws, runtime.ToolConstraints{WriteDir: "loop"}), "write_file", `{"path":"out.txt","content":"x"}`)
-		if plan.Execute != nil || plan.Immediate == nil {
-			t.Fatalf("plan = %+v, want one immediate outcome", plan)
-		}
-		outcome := *plan.Immediate
-		if outcome.Result.Status != model.ResultDenied || outcome.Result.Content != "Permission denied." {
-			t.Fatalf("immediate = %+v, want the fixed denial", outcome)
-		}
-	})
-	t.Run("a write target outside the write dir is denied at preparation", func(t *testing.T) {
-		ws := t.TempDir()
-		if err := os.MkdirAll(filepath.Join(ws, "wd"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		plan := prepare(t, byID["edit_file"], callToolContext(ws, runtime.ToolConstraints{WriteDir: "wd"}), "edit_file", `{"path":"outside.txt","old_string":"a","new_string":"b"}`)
-		if plan.Execute != nil || plan.Immediate == nil || plan.Immediate.Result.Status != model.ResultDenied {
-			t.Fatalf("plan = %+v, want the preparation denial", plan)
-		}
-	})
-}
-
-func TestExecuteFileEffects(t *testing.T) {
-	dataDir := t.TempDir()
-	byID := openTools(t, dataDir)
-
-	t.Run("read_file returns bounded numbered content and no metadata", func(t *testing.T) {
-		ws := t.TempDir()
-		if err := os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("one\ntwo\nthree\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		plan := prepare(t, byID["read_file"], callToolContext(ws, runtime.ToolConstraints{}), "read_file", `{"path":"notes.txt","offset":2,"limit":2}`)
-		outcome := plan.Execute(context.Background())
-		if outcome.Result.Status != model.ResultSuccess || outcome.Result.CallID != "call-1" {
-			t.Fatalf("result = %+v, want success for call-1", outcome.Result)
-		}
-		if !strings.Contains(outcome.Result.Content, "2\ttwo") || !strings.Contains(outcome.Result.Content, "3\tthree") {
-			t.Fatalf("content = %q, want the numbered requested window", outcome.Result.Content)
-		}
-		if outcome.Metadata != nil {
-			t.Fatalf("metadata = %s, want none for read_file", outcome.Metadata)
-		}
-	})
-	t.Run("read_file of a missing file returns the suggestion outcome", func(t *testing.T) {
-		ws := t.TempDir()
-		if err := os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("x\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		plan := prepare(t, byID["read_file"], callToolContext(ws, runtime.ToolConstraints{}), "read_file", `{"path":"notes.tx"}`)
-		outcome := plan.Execute(context.Background())
-		if outcome.Result.Status != model.ResultSuccess || !strings.Contains(outcome.Result.Content, "not found") {
-			t.Fatalf("result = %+v, want the bounded not-found suggestions outcome", outcome)
-		}
-	})
-	t.Run("write_file creates parents, writes the file and captures the preimage group", func(t *testing.T) {
-		dataDir := t.TempDir()
-		byID := openTools(t, dataDir)
-		ws := t.TempDir()
-		plan := prepare(t, byID["write_file"], callToolContext(ws, runtime.ToolConstraints{}), "write_file", `{"path":"sub/dir/new.txt","content":"body"}`)
-		outcome := plan.Execute(context.Background())
-		if outcome.Result.Status != model.ResultSuccess || !strings.Contains(outcome.Result.Content, "Wrote") {
-			t.Fatalf("result = %+v, want the write success", outcome.Result)
-		}
-		data, err := os.ReadFile(filepath.Join(ws, "sub", "dir", "new.txt"))
-		if err != nil || string(data) != "body" {
-			t.Fatalf("written file = (%q, %v), want the new content", data, err)
-		}
-		if outcome.Metadata != nil {
-			t.Fatalf("metadata = %s, want none for write_file", outcome.Metadata)
-		}
-		// The preimage group lives at DataDir/code/<SessionID>/<EntryID>/snapshots/1/.
-		turnDir := filepath.Join(groupDir(dataDir, testSessionID, testEntryID), "snapshots", "1")
-		entries, err := os.ReadDir(turnDir)
-		if err != nil || len(entries) != 1 {
-			t.Fatalf("group turn dir = (%d entries, %v), want one snapshot entry", len(entries), err)
-		}
-		meta, err := os.ReadFile(filepath.Join(turnDir, entries[0].Name(), "meta.json"))
-		if err != nil {
-			t.Fatalf("snapshot meta: %v", err)
-		}
-		var wire struct {
-			OriginalPath string `json:"original_path"`
-			Existed      bool   `json:"existed"`
-		}
-		if err := json.Unmarshal(meta, &wire); err != nil {
-			t.Fatalf("decode meta: %v", err)
-		}
-		if wire.Existed || !strings.HasSuffix(wire.OriginalPath, "new.txt") {
-			t.Fatalf("meta = %s, want the new-file preimage of the declared target", meta)
-		}
-	})
-	t.Run("edit_file mutates the file and emits the edit_preview metadata shape", func(t *testing.T) {
-		ws := t.TempDir()
-		if err := os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("alpha\nbeta\ngamma\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		plan := prepare(t, byID["edit_file"], callToolContext(ws, runtime.ToolConstraints{}), "edit_file", `{"path":"notes.txt","old_string":"beta","new_string":"BETA"}`)
-		outcome := plan.Execute(context.Background())
-		if outcome.Result.Status != model.ResultSuccess || !strings.Contains(outcome.Result.Content, "lines 2") {
-			t.Fatalf("result = %+v, want the edit summary", outcome.Result)
-		}
-		data, err := os.ReadFile(filepath.Join(ws, "notes.txt"))
-		if err != nil || string(data) != "alpha\nBETA\ngamma\n" {
-			t.Fatalf("edited file = (%q, %v), want the replacement", data, err)
-		}
-		if outcome.Metadata == nil {
-			t.Fatal("edit_file emitted no metadata")
-		}
-		var metadata struct {
-			EditPreview *struct {
-				Hunks []struct {
-					Rows []struct {
-						Kind string `json:"kind"`
-						Text string `json:"text"`
-					} `json:"rows"`
-				} `json:"hunks"`
-			} `json:"edit_preview"`
-		}
-		if err := json.Unmarshal(outcome.Metadata, &metadata); err != nil {
-			t.Fatalf("metadata %s is not the documented shape: %v", outcome.Metadata, err)
-		}
-		if metadata.EditPreview == nil || len(metadata.EditPreview.Hunks) != 1 || len(metadata.EditPreview.Hunks[0].Rows) != 2 {
-			t.Fatalf("metadata = %s, want one hunk with the remove/add diff rows", outcome.Metadata)
-		}
-	})
-	t.Run("apply_patch applies add update move delete and emits the per-file preview shape", func(t *testing.T) {
-		ws := t.TempDir()
-		for name, content := range map[string]string{"b.txt": "old\n", "c.txt": "gone\n", "d.txt": "d\n"} {
-			if err := os.WriteFile(filepath.Join(ws, name), []byte(content), 0o644); err != nil {
-				t.Fatal(err)
-			}
-		}
-		patch := "*** Begin Patch\n*** Add File: a.txt\n+new\n*** Update File: b.txt\n@@\n-old\n+new\n*** Delete File: c.txt\n*** Update File: d.txt\n*** Move to: e.txt\n*** End Patch"
-		input, err := json.Marshal(map[string]string{"input": patch})
-		if err != nil {
-			t.Fatal(err)
-		}
-		plan := prepare(t, byID["apply_patch"], callToolContext(ws, runtime.ToolConstraints{}), "apply_patch", string(input))
-		outcome := plan.Execute(context.Background())
-		if outcome.Result.Status != model.ResultSuccess || !strings.Contains(outcome.Result.Content, "Success. Updated the following files:") {
-			t.Fatalf("result = %+v, want the patch success summary", outcome.Result)
-		}
-		if _, err := os.Stat(filepath.Join(ws, "a.txt")); err != nil {
-			t.Fatalf("added file missing: %v", err)
-		}
-		data, err := os.ReadFile(filepath.Join(ws, "b.txt"))
-		if err != nil || string(data) != "new\n" {
-			t.Fatalf("updated file = (%q, %v), want the replacement", data, err)
-		}
-		if _, err := os.Stat(filepath.Join(ws, "c.txt")); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("deleted file stat = %v, want gone", err)
-		}
-		if _, err := os.Stat(filepath.Join(ws, "d.txt")); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("move source stat = %v, want gone", err)
-		}
-		if data, err := os.ReadFile(filepath.Join(ws, "e.txt")); err != nil || string(data) != "d\n" {
-			t.Fatalf("move destination = (%q, %v), want the renamed content", data, err)
-		}
-		if outcome.Metadata == nil {
-			t.Fatal("apply_patch emitted no metadata")
-		}
-		var metadata struct {
-			Files []struct {
-				Path string `json:"path"`
-				Op   string `json:"op"`
-			} `json:"edit_preview_files"`
-		}
-		if err := json.Unmarshal(outcome.Metadata, &metadata); err != nil {
-			t.Fatalf("metadata %s is not the documented shape: %v", outcome.Metadata, err)
-		}
-		var ops []string
-		for _, f := range metadata.Files {
-			ops = append(ops, f.Path+"="+f.Op)
-		}
-		// The engine emits the move destination (M) before its source (D).
-		if strings.Join(ops, ",") != "a.txt=A,b.txt=M,c.txt=D,e.txt=M,d.txt=D" {
-			t.Fatalf("previews = %v, want the full A/M/D list with content retained", ops)
-		}
-	})
-	t.Run("successive calls of one operation share the disk group through fresh handles", func(t *testing.T) {
-		dataDir := t.TempDir()
-		byID := openTools(t, dataDir)
-		ws := t.TempDir()
-		first := prepare(t, byID["write_file"], callToolContext(ws, runtime.ToolConstraints{}), "write_file", `{"path":"one.txt","content":"1"}`)
-		if outcome := first.Execute(context.Background()); outcome.Result.Status != model.ResultSuccess {
-			t.Fatalf("first write = %+v", outcome.Result)
-		}
-		second := prepare(t, byID["write_file"], callToolContext(ws, runtime.ToolConstraints{}), "write_file", `{"path":"two.txt","content":"2"}`)
-		if outcome := second.Execute(context.Background()); outcome.Result.Status != model.ResultSuccess {
-			t.Fatalf("second write = %+v", outcome.Result)
-		}
-		turnDir := filepath.Join(groupDir(dataDir, testSessionID, testEntryID), "snapshots", "1")
-		entries, err := os.ReadDir(turnDir)
-		if err != nil || len(entries) != 2 {
-			t.Fatalf("group turn dir = (%d entries, %v), want both calls' preimages in the one group", len(entries), err)
-		}
-	})
-	t.Run("another operation's admitted input opens its own group", func(t *testing.T) {
-		dataDir := t.TempDir()
-		byID := openTools(t, dataDir)
-		ws := t.TempDir()
-		tc := callToolContext(ws, runtime.ToolConstraints{})
-		tc.AdmittedEntry = harness.EntryRef{SessionID: testSessionID, EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
-		plan := prepare(t, byID["write_file"], tc, "write_file", `{"path":"other.txt","content":"x"}`)
-		if outcome := plan.Execute(context.Background()); outcome.Result.Status != model.ResultSuccess {
-			t.Fatalf("write = %+v", outcome.Result)
-		}
-		turnDir := filepath.Join(groupDir(dataDir, testSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "snapshots", "1")
-		if entries, err := os.ReadDir(turnDir); err != nil || len(entries) != 1 {
-			t.Fatalf("other group turn dir = (%d entries, %v), want exactly one entry", len(entries), err)
-		}
-	})
-	t.Run("a readonly agent with a write dir writes inside the boundary", func(t *testing.T) {
-		ws := t.TempDir()
-		if err := os.MkdirAll(filepath.Join(ws, "wd"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		tc := callToolContext(ws, runtime.ToolConstraints{Readonly: true, WriteDir: "wd"})
-		plan := prepare(t, byID["write_file"], tc, "write_file", `{"path":"wd/allowed.txt","content":"x"}`)
-		outcome := plan.Execute(context.Background())
-		if outcome.Result.Status != model.ResultSuccess {
-			t.Fatalf("write = %+v, want success inside the write dir", outcome.Result)
-		}
-	})
-	t.Run("executed patch failures surface as error outcomes", func(t *testing.T) {
-		ws := t.TempDir()
-		if err := os.WriteFile(filepath.Join(ws, "b.txt"), []byte("different\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		patch := "*** Begin Patch\n*** Update File: b.txt\n@@\n-old\n+new\n*** End Patch"
-		input, err := json.Marshal(map[string]string{"input": patch})
-		if err != nil {
-			t.Fatal(err)
-		}
-		plan := prepare(t, byID["apply_patch"], callToolContext(ws, runtime.ToolConstraints{}), "apply_patch", string(input))
-		outcome := plan.Execute(context.Background())
-		if outcome.Result.Status != model.ResultError || outcome.Result.Content == "" {
-			t.Fatalf("result = %+v, want the failed-hunk error outcome", outcome.Result)
-		}
-	})
-}
-
-// TestFailedCallRetainsEarlierSnapshot proves the failed-call retention
-// sibling at the plugin boundary: a failed mutating call in the SAME
-// Operation's code group — reopened through a fresh handle per call —
-// discards only its own pre-mutation claim and never the earlier
-// successful call's retained preimage.
-func TestFailedCallRetainsEarlierSnapshot(t *testing.T) {
-	dataDir := t.TempDir()
-	byID := openTools(t, dataDir)
-	ws := t.TempDir()
-	tc := callToolContext(ws, runtime.ToolConstraints{})
-	if err := os.WriteFile(filepath.Join(ws, "a.txt"), []byte("alpha\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(ws, "b.txt"), []byte("beta\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// First call: a successful write retains its preimage in the group.
-	first := prepare(t, byID["write_file"], tc, "write_file", `{"path":"a.txt","content":"ALPHA\n"}`)
-	if outcome := first.Execute(context.Background()); outcome.Result.Status != model.ResultSuccess {
-		t.Fatalf("first write = %+v, want success", outcome.Result)
-	}
-
-	// Second call: a failing edit in the same group — the shared body
-	// captures b.txt's preimage, fails before any mutation, and discards
-	// its own claim through the same fresh-handle group.
-	second := prepare(t, byID["edit_file"], tc, "edit_file", `{"path":"b.txt","old_string":"missing","new_string":"x"}`)
-	if outcome := second.Execute(context.Background()); outcome.Result.Status != model.ResultError {
-		t.Fatalf("failing edit = %+v, want the error outcome", outcome.Result)
-	}
-
-	// The first call's retained preimage survives on disk; the failing
-	// call discarded its own claim, so the turn holds exactly that one
-	// entry.
-	turnDir := filepath.Join(groupDir(dataDir, testSessionID, testEntryID), "snapshots", "1")
-	entries, err := os.ReadDir(turnDir)
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("group turn dir = (%d entries, %v), want only the first call's retained preimage", len(entries), err)
-	}
-	metaData, err := os.ReadFile(filepath.Join(turnDir, entries[0].Name(), "meta.json"))
-	if err != nil {
-		t.Fatalf("snapshot meta: %v", err)
-	}
-	var meta struct {
-		OriginalPath string `json:"original_path"`
-	}
-	if err := json.Unmarshal(metaData, &meta); err != nil {
-		t.Fatalf("decode meta: %v", err)
-	}
-	if !strings.HasSuffix(meta.OriginalPath, "a.txt") {
-		t.Fatalf("retained entry = %q, want the first call's a.txt preimage", meta.OriginalPath)
-	}
-	preimage, err := os.ReadFile(filepath.Join(turnDir, entries[0].Name(), "original"))
-	if err != nil || string(preimage) != "alpha\n" {
-		t.Fatalf("retained preimage = (%q, %v), want the first call's content", preimage, err)
-	}
-	if data, err := os.ReadFile(filepath.Join(ws, "a.txt")); err != nil || string(data) != "ALPHA\n" {
-		t.Fatalf("written file = (%q, %v), want the first call's mutation intact", data, err)
-	}
-}
-
-// TestExecutedPlanRejectsPostAuthorizationBindingChange proves the R5
-// recovery sibling at the plugin boundary: a prepared canonical target whose
-// binding changes between preparation and execution fails without
-// substituting a changed path and without mutating through the repointed
-// leaf.
-func TestExecutedPlanRejectsPostAuthorizationBindingChange(t *testing.T) {
-	dataDir := t.TempDir()
-	byID := openTools(t, dataDir)
-	ws := t.TempDir()
-	real := filepath.Join(ws, "real.txt")
-	if err := os.WriteFile(real, []byte("before\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	link := filepath.Join(ws, "alias.txt")
-	if err := os.Symlink(real, link); err != nil {
-		t.Fatal(err)
-	}
-	plan := prepare(t, byID["write_file"], callToolContext(ws, runtime.ToolConstraints{}), "write_file", `{"path":"alias.txt","content":"after"}`)
-	// Repoint the alias at a different leaf after authorization.
-	other := filepath.Join(ws, "other.txt")
-	if err := os.WriteFile(other, []byte("do not touch\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(link); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(other, link); err != nil {
-		t.Fatal(err)
-	}
-	outcome := plan.Execute(context.Background())
-	if outcome.Result.Status != model.ResultError || !strings.Contains(outcome.Result.Content, "resolve path") {
-		t.Fatalf("result = %+v, want the binding-change error", outcome.Result)
-	}
-	data, err := os.ReadFile(other)
-	if err != nil || string(data) != "do not touch\n" {
-		t.Fatalf("repointed leaf = (%q, %v), want it unmutated", data, err)
-	}
-	if _, err := os.Stat(filepath.Join(dataDir, "code")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("failed pre-mutation call left %s: %v", filepath.Join(dataDir, "code"), err)
-	}
-}
-
-// TestExecutedReadFailsUnderWorkspaceRootChange proves the closure
-// revalidates the bound canonical Workspace root: repointing the root
-// symlink after preparation fails the execution without reading the
-// substituted tree.
-func TestExecutedReadFailsUnderWorkspaceRootChange(t *testing.T) {
-	byID := openTools(t, t.TempDir())
-	real := t.TempDir()
-	if err := os.WriteFile(filepath.Join(real, "notes.txt"), []byte("real\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	link := filepath.Join(t.TempDir(), "ws-link")
-	if err := os.Symlink(real, link); err != nil {
-		t.Fatal(err)
-	}
-	plan := prepare(t, byID["read_file"], callToolContext(link, runtime.ToolConstraints{}), "read_file", `{"path":"notes.txt"}`)
-	if err := os.Remove(link); err != nil {
-		t.Fatal(err)
-	}
-	other := t.TempDir()
-	if err := os.WriteFile(filepath.Join(other, "notes.txt"), []byte("substituted\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(other, link); err != nil {
-		t.Fatal(err)
-	}
-	outcome := plan.Execute(context.Background())
-	if outcome.Result.Status != model.ResultError || strings.Contains(outcome.Result.Content, "substituted") {
-		t.Fatalf("result = %+v, want the changed-root failure without substituted content", outcome.Result)
-	}
 }
 
 // bindingChangePatchInput builds one add-file patch call over the given path
@@ -777,9 +337,9 @@ func bindingChangePatchInput(t *testing.T, path string) string {
 // contract at the plugin boundary: the canonical Workspace root and write-dir
 // boundary the plugin resolves for containment are the same witnesses the
 // shared preparation binds, so repointing either symlink between the plugin's
-// resolutions and the shared preparation fails the execution with the
-// changed-binding error instead of executing under the repointed tree. One
-// cell per entry and bound slot: read binds the root; write, edit and
+// resolutions and the shared preparation's binding fails the execution with
+// the changed-binding error instead of executing under the repointed tree.
+// One cell per entry and bound slot: read binds the root; write, edit and
 // apply_patch bind the root and the write-dir.
 func TestPrepareBindingSurvivesCanonicalPathsRepoint(t *testing.T) {
 	cells := []struct {
@@ -792,7 +352,7 @@ func TestPrepareBindingSurvivesCanonicalPathsRepoint(t *testing.T) {
 	}{
 		{"read_file revalidates the root witness", "read_file", `{"path":"target.txt"}`, "root", "substituted\n", false},
 		{"write_file revalidates the root witness", "write_file", `{"path":"target.txt","content":"after"}`, "root", "", false},
-		{"write_file revalidates the write-dir witness", "write_file", `{"path":"wd/target.txt","content":"after"}`, "write_dir", "", false},
+		{"write_file revalidates the write-dir witness", "write_file", `{"path":"wd/target.txt","content":"x"}`, "write_dir", "", false},
 		{"edit_file revalidates the root witness", "edit_file", `{"path":"target.txt","old_string":"beta","new_string":"BETA"}`, "root", "beta\n", false},
 		{"edit_file revalidates the write-dir witness", "edit_file", `{"path":"wd/target.txt","old_string":"beta","new_string":"BETA"}`, "write_dir", "beta\n", false},
 		{"apply_patch revalidates the root witness", "apply_patch", bindingChangePatchInput(t, "target.txt"), "root", "", false},
@@ -801,7 +361,7 @@ func TestPrepareBindingSurvivesCanonicalPathsRepoint(t *testing.T) {
 	for _, cell := range cells {
 		cell := cell
 		t.Run(cell.name, func(t *testing.T) {
-			byID := openTools(t, t.TempDir())
+			byID := directTools(t.TempDir(), nil)
 			var workspace, link, flipTo, preFlipWriteDir string
 			var constraints runtime.ToolConstraints
 			if cell.slot == "root" {

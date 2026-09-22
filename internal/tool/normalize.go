@@ -121,22 +121,34 @@ func NormalizeReadArgs(args map[string]any, defaultLimit int) (map[string]any, e
 
 // NormalizeRunCommandArgs performs target run_command argument normalization:
 // private `_lightcode_` fields are stripped, the required command must be a
-// nonempty string, and a supplied background member of any JSON value —
-// including null — is rejected because the target has no background path.
-// The optional timeout is a strict consumed integer bounded by the
-// seconds-to-duration conversion; an absent or sub-one value keeps the
-// configured default, while a present null is rejected. The normalized form
-// carries the effective timeout as its canonical-integer lexeme.
+// nonempty string, and a supplied background member must be a boolean — an
+// absent member is written as false and present booleans are preserved, while
+// null or any non-boolean is rejected as an argument-validation error. A
+// background run normalizes an absent or sub-one timeout to 0; the foreground
+// keeps the retained default for an absent or sub-one value. The optional
+// timeout is a strict consumed integer bounded by the seconds-to-duration
+// conversion; a present null is rejected. The normalized form carries the
+// effective timeout as its canonical-integer lexeme.
 func NormalizeRunCommandArgs(args map[string]any, defaultTimeout int) (map[string]any, error) {
 	clean := stripPrivateArgs(args)
 	command, _ := clean["command"].(string)
 	if command == "" {
 		return nil, fmt.Errorf("run_command: command is required")
 	}
-	if _, present := clean["background"]; present {
-		return nil, fmt.Errorf("run_command: background execution is not supported")
+	background := false
+	if v, present := clean["background"]; present {
+		b, ok := v.(bool)
+		if !ok {
+			return nil, fmt.Errorf("run_command: background must be a boolean")
+		}
+		background = b
+	} else {
+		clean["background"] = background
 	}
 	timeout := defaultTimeout
+	if background {
+		timeout = 0
+	}
 	if _, present := clean["timeout"]; present {
 		v, err := normalizeIntArg(clean, "run_command", "timeout")
 		if err != nil {

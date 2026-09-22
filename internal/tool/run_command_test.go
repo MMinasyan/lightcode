@@ -585,11 +585,48 @@ func TestNormalizeRunCommandArgs(t *testing.T) {
 		`{"command":"ls","timeout":null}`,
 		`{"command":"ls","timeout":9223372036854775808}`,
 		`{"command":"ls","timeout":9223372037}`,
-		`{"command":"ls","background":null}`,
-		`{"command":"ls","background":false}`,
 	} {
 		if _, err := NormalizeRunCommandArgs(decode(t, raw), 120); err == nil {
 			t.Errorf("NormalizeRunCommandArgs(%s) accepted, want rejection", raw)
+		}
+	}
+	for _, raw := range []string{
+		`{"command":"ls","background":null}`,
+		`{"command":"ls","background":0}`,
+		`{"command":"ls","background":"later"}`,
+	} {
+		if _, err := NormalizeRunCommandArgs(decode(t, raw), 120); err == nil || err.Error() != "run_command: background must be a boolean" {
+			t.Errorf("NormalizeRunCommandArgs(%s) = %v, want the boolean-consumption error", raw, err)
+		}
+	}
+
+	// Present background booleans are preserved, an absent one is written as
+	// false, and the background timeout rule (absent/sub-one -> 0) applies
+	// only when background is true.
+	backgroundCases := []struct {
+		raw            string
+		wantBackground bool
+		wantTimeout    int
+	}{
+		{`{"command":"ls"}`, false, 120},
+		{`{"command":"ls","background":false}`, false, 120},
+		{`{"command":"ls","background":false,"timeout":5}`, false, 5},
+		{`{"command":"ls","background":true}`, true, 0},
+		{`{"command":"ls","background":true,"timeout":0}`, true, 0},
+		{`{"command":"ls","background":true,"timeout":-3}`, true, 0},
+		{`{"command":"ls","background":true,"timeout":5}`, true, 5},
+	}
+	for _, tc := range backgroundCases {
+		normalized, err := NormalizeRunCommandArgs(decode(t, tc.raw), 120)
+		if err != nil {
+			t.Errorf("NormalizeRunCommandArgs(%s) = %v, want accepted", tc.raw, err)
+			continue
+		}
+		if got, ok := normalized["background"].(bool); !ok || got != tc.wantBackground {
+			t.Errorf("NormalizeRunCommandArgs(%s) background = %v, want %v", tc.raw, normalized["background"], tc.wantBackground)
+		}
+		if got, ok := normalized["timeout"].(json.Number); !ok || got.String() != strconv.Itoa(tc.wantTimeout) {
+			t.Errorf("NormalizeRunCommandArgs(%s) timeout = %v, want the canonical lexeme %d", tc.raw, normalized["timeout"], tc.wantTimeout)
 		}
 	}
 
