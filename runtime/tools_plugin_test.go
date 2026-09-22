@@ -157,15 +157,20 @@ func fakeJobsPlugin(j *fakeJobs) runtime.Plugin {
 }
 
 // openToolsComposed opens the real tools plugin through the composed scope —
-// the runtime constructs the jobs binding in-package — and returns its tool
-// exports plus every bound capability value.
-func openToolsComposed(t *testing.T, dataDir string, managedKeys []string, jobsPlugin runtime.Plugin) (map[string]runtime.Tool, map[string]any) {
+// the runtime constructs the jobs binding in-package — with one optional
+// extra plugin composed in the same scope (the zero Plugin composes none),
+// and returns its tool exports plus every bound capability value.
+func openToolsComposed(t *testing.T, dataDir string, managedKeys []string, jobsPlugin, extra runtime.Plugin) (map[string]runtime.Tool, map[string]any) {
 	t.Helper()
+	plugins := []runtime.Plugin{jobsPlugin, tools.Plugin()}
+	if extra.ID != "" {
+		plugins = append(plugins, extra)
+	}
 	values, closeScope, err := runtime.ComposeScopeForTest(context.Background(), runtime.ScopeInfo{
 		Kind:           runtime.ScopeRuntime,
 		DataDir:        dataDir,
 		ManagedEnvKeys: managedKeys,
-	}, []runtime.Plugin{jobsPlugin, tools.Plugin()})
+	}, plugins)
 	if err != nil {
 		t.Fatalf("compose tools plugin: %v", err)
 	}
@@ -187,13 +192,13 @@ func openToolsComposed(t *testing.T, dataDir string, managedKeys []string, jobsP
 
 func openTools(t *testing.T, dataDir string) map[string]runtime.Tool {
 	t.Helper()
-	byID, _ := openToolsComposed(t, dataDir, nil, fakeJobsPlugin(&fakeJobs{}))
+	byID, _ := openToolsComposed(t, dataDir, nil, fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
 	return byID
 }
 
 func openToolsWithKeys(t *testing.T, dataDir string, managedKeys []string) map[string]runtime.Tool {
 	t.Helper()
-	byID, _ := openToolsComposed(t, dataDir, managedKeys, fakeJobsPlugin(&fakeJobs{}))
+	byID, _ := openToolsComposed(t, dataDir, managedKeys, fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
 	return byID
 }
 
@@ -213,7 +218,7 @@ func TestComposedToolsPluginContract(t *testing.T) {
 	if _, _, err := runtime.ComposeScopeForTest(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, []runtime.Plugin{tools.Plugin()}); err == nil || !strings.Contains(err.Error(), `"jobs"`) {
 		t.Fatalf("open without a jobs provider = %v, want the unresolved jobs dependency error", err)
 	}
-	byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(&fakeJobs{}))
+	byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
 	if len(byID) != 7 {
 		t.Fatalf("composed open returned %d tools, want all seven", len(byID))
 	}
@@ -384,6 +389,11 @@ type toolsHarnessOpts struct {
 	background  runtime.BackgroundServices
 	invocation  runtime.Invocation
 	managedKeys []string
+	// extraPlugin, when non-empty, composes beside the tools plugin in the
+	// same scope, and extraToolID is additionally bound as a tool export —
+	// the fixture's seam for a caller-owned plugin's tool.
+	extraPlugin runtime.Plugin
+	extraToolID string
 }
 
 // toolsHarness is one real Harness over real temporary SQLite whose
@@ -422,7 +432,18 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 	if jobsPlugin.ID == "" {
 		jobsPlugin = fakeJobsPlugin(&fakeJobs{})
 	}
-	byID, values := openToolsComposed(t, dataDir, opts.managedKeys, jobsPlugin)
+	byID, values := openToolsComposed(t, dataDir, opts.managedKeys, jobsPlugin, opts.extraPlugin)
+	if opts.extraToolID != "" {
+		value, ok := values[opts.extraToolID]
+		if !ok {
+			t.Fatalf("composition is missing the extra tool export %q", opts.extraToolID)
+		}
+		toolValue, ok := value.(runtime.Tool)
+		if !ok {
+			t.Fatalf("export %q supplies %T, not a runtime.Tool", opts.extraToolID, value)
+		}
+		byID[opts.extraToolID] = toolValue
+	}
 	advertise := opts.advertise
 	if advertise == nil {
 		advertise = []string{"read_file", "write_file", "edit_file", "apply_patch"}
@@ -1613,7 +1634,7 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 
 	t.Run("handoff rejection renders through the wrapper and aborts the reservation", func(t *testing.T) {
 		fake := &fakeJobs{}
-		byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake))
+		byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake), runtime.Plugin{})
 		tc := callToolContext(ws, runtime.ToolConstraints{})
 		tc.Background = &scriptBackground{startErr: errors.New("background group is closed or stopping")}
 		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
@@ -1637,7 +1658,7 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 
 	t.Run("spawn failure renders through the wrapper and aborts the reservation", func(t *testing.T) {
 		fake := &fakeJobs{startErr: errors.New("spawn boom")}
-		byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake))
+		byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake), runtime.Plugin{})
 		tc := callToolContext(ws, runtime.ToolConstraints{})
 		tc.Background = &scriptBackground{}
 		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
@@ -1655,7 +1676,7 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 
 	t.Run("reserve failure renders through the wrapper without an abort", func(t *testing.T) {
 		fake := &fakeJobs{reserveErr: errors.New("process: manager is closed")}
-		byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake))
+		byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake), runtime.Plugin{})
 		tc := callToolContext(ws, runtime.ToolConstraints{})
 		tc.Background = &scriptBackground{}
 		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
@@ -1678,7 +1699,7 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 // sub-one becomes 0, and the immediate result is the retained template.
 func TestReadOnlyBackgroundStartRewritesAndHonorsTimeout(t *testing.T) {
 	fake := &fakeJobs{live: []string{"b0b0b0b0", "11111111"}}
-	byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake))
+	byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake), runtime.Plugin{})
 	ws := t.TempDir()
 	tc := callToolContext(ws, runtime.ToolConstraints{Readonly: true})
 	tc.Background = &scriptBackground{}
@@ -1724,7 +1745,7 @@ func TestBackgroundJobEnvironmentScrubsManagedKey(t *testing.T) {
 	t.Setenv("LIGHTCODE_BG_UNLISTED", "visible-value")
 	t.Setenv("LIGHTCODE_BG_MANAGED", "managed-secret")
 	dataDir := t.TempDir()
-	byID, values := openToolsComposed(t, dataDir, []string{"LIGHTCODE_BG_MANAGED"}, jobs.Plugin())
+	byID, values := openToolsComposed(t, dataDir, []string{"LIGHTCODE_BG_MANAGED"}, jobs.Plugin(), runtime.Plugin{})
 	jobsInst, ok := values["jobs"].(jobs.Jobs)
 	if !ok {
 		t.Fatalf("values[\"jobs\"] supplies %T, not jobs.Jobs", values["jobs"])
@@ -1893,7 +1914,7 @@ func reserveAndStart(t *testing.T, jobsInst jobs.Jobs, workspace, command string
 // owner-scoped canonical targets and the capability's unknown-ID text for
 // well-shaped unknown and foreign identities.
 func TestProcessToolReturnsRetainedActionResults(t *testing.T) {
-	byID, values := openToolsComposed(t, t.TempDir(), nil, jobs.Plugin())
+	byID, values := openToolsComposed(t, t.TempDir(), nil, jobs.Plugin(), runtime.Plugin{})
 	jobsInst, ok := values["jobs"].(jobs.Jobs)
 	if !ok {
 		t.Fatalf("values[\"jobs\"] supplies %T, not jobs.Jobs", values["jobs"])
@@ -2007,7 +2028,7 @@ func TestProcessToolReturnsRetainedActionResults(t *testing.T) {
 // no capability call — never permission-denied status.
 func TestProcessToolValidationIsImmediateError(t *testing.T) {
 	fake := &fakeJobs{}
-	byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake))
+	byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake), runtime.Plugin{})
 	process := byID["process"]
 	ws := t.TempDir()
 	cases := []struct {

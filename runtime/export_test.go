@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 )
 
@@ -62,4 +63,12 @@ func ComposeScopeForTest(ctx context.Context, info ScopeInfo, plugins []Plugin) 
 		values[id] = entry.value
 	}
 	return values, sc.close, nil
+}
+
+// DescribeToolForTest invokes one declared tool spec's recorded description
+// function for the external tests that exercise a real plugin's describe
+// closure — outside this package only the zero Invocation is constructible.
+// It is absent from production builds.
+func DescribeToolForTest(spec CapabilitySpec, inv Invocation, constraints ToolConstraints, identity harness.SessionIdentity) (ToolDescription, error) {
+	return spec.describe(inv, constraints, identity)
 }

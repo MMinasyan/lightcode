@@ -185,6 +185,16 @@ func (in Invocation) Config(pluginID string) json.RawMessage {
 	return append(json.RawMessage(nil), raw...)
 }
 
+// AgentTypes returns the captured snapshot's owned roster projection of the
+// loaded Agent definitions, preserving the snapshot's ordering. The zero
+// Invocation returns an empty roster.
+func (in Invocation) AgentTypes() []harness.AgentType {
+	if in.snapshot == nil {
+		return nil
+	}
+	return in.snapshot.agentTypes()
+}
+
 // acceptSettings applies one declaration's configuration rule: a plugin with
 // a nil ValidateConfig accepts only absent configuration or the empty
 // object, and any other input document is rejected instead of silently

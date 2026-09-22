@@ -20,7 +20,7 @@ const publicModule = "github.com/MMinasyan/lightcode"
 // the SQLite driver is confined to internal/storage.
 const sqliteDriverPkg = "github.com/mattn/go-sqlite3"
 
-// TestPublicFoundationDependencyIsolation enforces the pre-cutover dependency baseline over the authoritative complete set of Git-tracked non-test Go files: the model package imports only the standard library; the agent package imports only the standard library and the public model package; the harness package is direct-test-only and imports only the standard library plus the public model and agent packages; internal/storage is direct-test-only, imports only the standard library plus the public harness contract plus the SQLite driver it implements the contract with, and stays one package without backend subpackages; the runtime package is direct-test-only and imports only the standard library plus the public model and harness packages plus the retained internal config, agents, catalog, atomicfs, prompt, and adaptation helpers, never internal/agent, internal/storage, any concrete plugin under internal/plugins, or the SQLite driver; the internal/plugins/sqlite plugin imports only the standard library plus the public runtime and harness contracts and the internal/storage backend it declares; the internal/plugins/adaptation plugin imports only the standard library plus the public runtime and model contracts and the internal/adaptation binding table it resolves; the plugins/jobs package imports only the standard library plus the public runtime and harness contracts and the internal/cmdoutput capture helper it composes, and stays one package without subpackages; the internal/plugins/builtin package imports only the standard library plus the public runtime contract and the five sibling plugins it registers; and every other tracked production file imports none of these packages, not the SQLite driver, not the target runtime or its concrete plugins — including the public plugins/ tree — whatever its directory name is. Test files are exempt in every directory — external-package test files are exactly where direct and composition tests of the new packages live — and untracked or ignored files never gate the guard. When a later phase adds a new target package that must consume model, agent, or harness, it extends the allowlist for its own package only; existing root and internal/ production packages stay forbidden until their owning cutover or deletion phase.
+// TestPublicFoundationDependencyIsolation enforces the pre-cutover dependency baseline over the authoritative complete set of Git-tracked non-test Go files: the model package imports only the standard library; the agent package imports only the standard library and the public model package; the harness package is direct-test-only and imports only the standard library plus the public model and agent packages; internal/storage is direct-test-only, imports only the standard library plus the public harness contract plus the SQLite driver it implements the contract with, and stays one package without backend subpackages; the runtime package is direct-test-only and imports only the standard library plus the public model and harness packages plus the retained internal config, agents, catalog, atomicfs, prompt, and adaptation helpers, never internal/agent, internal/storage, any concrete plugin under internal/plugins, or the SQLite driver; the internal/plugins/sqlite plugin imports only the standard library plus the public runtime and harness contracts and the internal/storage backend it declares; the internal/plugins/adaptation plugin imports only the standard library plus the public runtime and model contracts and the internal/adaptation binding table it resolves; the plugins/jobs package imports only the standard library plus the public runtime and harness contracts and the internal/cmdoutput capture helper it composes, and stays one package without subpackages; the internal/plugins/tasks plugin imports only the standard library plus the public model, harness, and runtime contracts; the internal/plugins/builtin package imports only the standard library plus the public runtime contract and the six sibling plugins it registers; and every other tracked production file imports none of these packages, not the SQLite driver, not the target runtime or its concrete plugins — including the public plugins/ tree — whatever its directory name is. Test files are exempt in every directory — external-package test files are exactly where direct and composition tests of the new packages live — and untracked or ignored files never gate the guard. When a later phase adds a new target package that must consume model, agent, or harness, it extends the allowlist for its own package only; existing root and internal/ production packages stay forbidden until their owning cutover or deletion phase.
 func TestPublicFoundationDependencyIsolation(t *testing.T) {
 	root := moduleRoot(t)
 	std := standardLibraryImports(t)
@@ -70,6 +70,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 		lspPkg        = publicModule + "/internal/lsp"
 		cmdoutputPkg  = publicModule + "/internal/cmdoutput"
 		jobsPkg       = publicModule + "/plugins/jobs"
+		tasksPkg      = publicModule + "/internal/plugins/tasks"
 	)
 	var problems []string
 	dir := path.Dir(rel)
@@ -129,9 +130,13 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 			if imp != harnessPkg && imp != runtimePkg && imp != cmdoutputPkg && !std[imp] {
 				problems = append(problems, rel+": plugins/jobs imports "+imp+"; the jobs plugin may import only the standard library, "+harnessPkg+", "+runtimePkg+", and "+cmdoutputPkg)
 			}
+		case "internal/plugins/tasks":
+			if imp != modelPkg && imp != harnessPkg && imp != runtimePkg && !std[imp] {
+				problems = append(problems, rel+": internal/plugins/tasks imports "+imp+"; the child-session tool plugin may import only the standard library, "+modelPkg+", "+harnessPkg+", and "+runtimePkg)
+			}
 		case "internal/plugins/builtin":
-			if imp != runtimePkg && imp != pluginsPkg+"/sqlite" && imp != pluginsPkg+"/tools" && imp != pluginsPkg+"/adaptation" && imp != pluginsPkg+"/lsp" && imp != jobsPkg && !std[imp] {
-				problems = append(problems, rel+": internal/plugins/builtin imports "+imp+"; the shipped registration set may import only the standard library, "+runtimePkg+", and the five sibling plugins it registers")
+			if imp != runtimePkg && imp != pluginsPkg+"/sqlite" && imp != pluginsPkg+"/tools" && imp != pluginsPkg+"/adaptation" && imp != pluginsPkg+"/lsp" && imp != jobsPkg && imp != tasksPkg && !std[imp] {
+				problems = append(problems, rel+": internal/plugins/builtin imports "+imp+"; the shipped registration set may import only the standard library, "+runtimePkg+", and the six sibling plugins it registers")
 			}
 		default:
 			if imp == modelPkg || imp == agentPkg || imp == harnessPkg || imp == storagePkg || imp == sqliteDriverPkg ||
@@ -262,6 +267,25 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 			t.Errorf("plugins/jobs importing %q: %d problems, want 1: %v", imp, len(problems), problems)
 		}
 	}
+	// The child-session tool plugin declares the task tool over the public
+	// model, harness, and runtime contracts; the legacy owner, the agents
+	// loader, storage, the driver, and sibling plugins never enter it.
+	if problems := checkTrackedGoFile("internal/plugins/tasks/x.go", []string{
+		"encoding/json", "fmt",
+		publicModule + "/model", publicModule + "/harness", publicModule + "/runtime",
+	}, std); len(problems) != 0 {
+		t.Errorf("allowed internal/plugins/tasks imports flagged: %v", problems)
+	}
+	for _, imp := range []string{
+		publicModule + "/agent", publicModule + "/internal/agent", publicModule + "/internal/agents",
+		publicModule + "/internal/tool", publicModule + "/internal/storage", sqliteDriverPkg,
+		publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins",
+		publicModule + "/plugins/jobs",
+	} {
+		if problems := checkTrackedGoFile("internal/plugins/tasks/x.go", []string{imp}, std); len(problems) != 1 {
+			t.Errorf("internal/plugins/tasks importing %q: %d problems, want 1: %v", imp, len(problems), problems)
+		}
+	}
 	// The runtime target layer consumes the public model and harness
 	// contracts and the retained internal configuration helpers only; the
 	// legacy owner, durable storage, concrete plugins, the public agent
@@ -283,13 +307,13 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 		}
 	}
 	// The shipped registration set imports exactly the runtime contract and
-	// the five sibling plugins it registers; every sibling helper, the legacy
+	// the six sibling plugins it registers; every sibling helper, the legacy
 	// owner, storage, the driver, and the public agent package never enter it.
 	if problems := checkTrackedGoFile("internal/plugins/builtin/x.go", []string{
 		"context", publicModule + "/runtime",
 		publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tools",
 		publicModule + "/internal/plugins/adaptation", publicModule + "/internal/plugins/lsp",
-		publicModule + "/plugins/jobs",
+		publicModule + "/plugins/jobs", publicModule + "/internal/plugins/tasks",
 	}, std); len(problems) != 0 {
 		t.Errorf("allowed internal/plugins/builtin imports flagged: %v", problems)
 	}

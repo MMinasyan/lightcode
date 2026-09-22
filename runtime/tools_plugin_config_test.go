@@ -22,7 +22,7 @@ import (
 // outside the runtime package only the zero Invocation is constructible.
 func TestToolsPluginConsumesConfiguredValues(t *testing.T) {
 	ctx := context.Background()
-	byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(&fakeJobs{}))
+	byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
 	value, ok := byID["read_file"]
 	if !ok {
 		t.Fatal("plugin instance exports no read_file")

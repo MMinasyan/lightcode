@@ -230,12 +230,18 @@ func TestConfigurationAgentTypesProjection(t *testing.T) {
 	if !plan.Readonly || plan.WriteDir != "/tmp/plan" {
 		t.Fatalf("plan permission constraints = %v %q, want the definition's readonly true and its write_dir", plan.Readonly, plan.WriteDir)
 	}
+	if !plan.Subagent || plan.Description != "planner" {
+		t.Fatalf("plan roster fields = subagent %v description %q, want the definition's subagent flag and description", plan.Subagent, plan.Description)
+	}
 	primaryView, err := harness.ResolveAgentType("primary", types)
 	if err != nil {
 		t.Fatalf("ResolveAgentType(primary): %v", err)
 	}
 	if primaryView.Readonly || primaryView.WriteDir != "" {
 		t.Fatalf("primary permission constraints = %v %q, want the unset defaults", primaryView.Readonly, primaryView.WriteDir)
+	}
+	if primaryView.Subagent || primaryView.Description != "" {
+		t.Fatalf("primary roster fields = subagent %v description %q, want the unset defaults", primaryView.Subagent, primaryView.Description)
 	}
 
 	// WriteDir is trimmed exactly once at projection, preserving the legacy
@@ -289,6 +295,49 @@ func TestConfigurationAgentTypesProjection(t *testing.T) {
 	}
 	if again.Tools[0] != "plan_tool" || again.Capabilities[0] != "cap-b" {
 		t.Fatalf("projection aliases the snapshot storage: %+v", again)
+	}
+}
+
+// TestInvocationAgentTypesReturnsOwnedRoster proves the public roster view:
+// the snapshot's ordering and the projected subagent fields reach the caller,
+// the zero Invocation carries an empty roster, and a caller's mutation of the
+// returned value never reaches the configuration snapshot.
+func TestInvocationAgentTypesReturnsOwnedRoster(t *testing.T) {
+	inv := Invocation{snapshot: testSnapshot(t)}
+
+	roster := inv.AgentTypes()
+	want := []string{"primary", "secondary", "explore", "review", "compact", "plan"}
+	got := make([]string, len(roster))
+	for i, at := range roster {
+		got[i] = at.Name
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("roster order = %q, want %q", got, want)
+	}
+	if plan := roster[len(roster)-1]; !plan.Subagent || plan.Description != "planner" {
+		t.Fatalf("plan roster entry = %+v, want the projected subagent fields", plan)
+	}
+
+	// A caller's mutation — of an entry's own slices and of the returned
+	// slice itself — never reaches the snapshot.
+	if len(roster[0].Tools) == 0 {
+		t.Fatalf("primary tools = %v, want a projected list to mutate", roster[0].Tools)
+	}
+	roster[0].Tools[0] = "tampered"
+	clear(roster)
+
+	again := inv.AgentTypes()
+	if len(again) != len(want) {
+		t.Fatalf("second roster length = %d, want %d", len(again), len(want))
+	}
+	if again[0].Tools[0] != "read_file" {
+		t.Fatalf("second roster = %+v, want the pristine snapshot projection", again[0])
+	}
+	if plan := again[len(again)-1]; !plan.Subagent || plan.Description != "planner" {
+		t.Fatalf("second plan entry = %+v, want the projected subagent fields", plan)
+	}
+	if empty := (Invocation{}).AgentTypes(); len(empty) != 0 {
+		t.Fatalf("zero Invocation roster = %v, want empty", empty)
 	}
 }
 
