@@ -1400,24 +1400,27 @@ func (h *Harness) rematerialize(ctx context.Context, c *coordinator, sessionID s
 // startExecution installs the coordinator's active execution and starts the
 // Agent composition on the Harness context after the admission commit. The
 // execution slot releases, and the post-terminal buffer drain completes,
-// before the execution's done channel closes.
+// before the execution's done channel closes. After execute, the storage
+// failure latch, and the drain have returned, the tail clears the run slot
+// only when it is still this run — a drain-installed successor owns the slot
+// and defers the recursive completion check to its own retirement — then runs
+// the child completion settlement for this operation before closing done.
 func (h *Harness) startExecution(c *coordinator, operationID string, prepared PreparedExecution) {
 	run := &activeExecution{done: make(chan struct{})}
 	c.mu.Lock()
 	c.run = run
 	c.mu.Unlock()
 	go func() {
-		defer func() {
-			c.mu.Lock()
-			if c.run == run { // a buffered drain may have installed the next execution already
-				c.run = nil
-			}
-			c.mu.Unlock()
-			close(run.done)
-		}()
 		err := h.execute(c, operationID, prepared)
 		h.recordStorageFailure(err)
 		h.drainBuffers(c, run)
+		c.mu.Lock()
+		if c.run == run { // a buffered drain may have installed the next execution already
+			c.run = nil
+		}
+		c.mu.Unlock()
+		h.childCompletionSettled(c, operationID)
+		close(run.done)
 	}()
 }
 
