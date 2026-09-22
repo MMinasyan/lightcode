@@ -125,7 +125,7 @@ func parkPlugin(park *parkingHook) Plugin {
 // target, and an executor performing the real file effect in the Workspace.
 type fileWriteTool struct{}
 
-func (t fileWriteTool) describe(_ Invocation, constraints ToolConstraints) (ToolDescription, error) {
+func (t fileWriteTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	definition, err := model.NewToolDefinition(model.ToolDefinition{
 		Name:        "prod_write",
 		Description: "writes one file in the workspace",
@@ -172,7 +172,7 @@ func (t fileWriteTool) Prepare(_ context.Context, tc ToolContext, call model.Too
 // executor returns the file content.
 type fileReadTool struct{}
 
-func (t fileReadTool) describe(Invocation, ToolConstraints) (ToolDescription, error) {
+func (t fileReadTool) describe(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 	definition, err := model.NewToolDefinition(model.ToolDefinition{
 		Name:        "prod_read",
 		Description: "reads one file in the workspace",
@@ -217,7 +217,7 @@ func (t fileReadTool) Prepare(_ context.Context, tc ToolContext, call model.Tool
 // argv (no shell), so the settled result is deterministic.
 type commandTool struct{}
 
-func (t commandTool) describe(Invocation, ToolConstraints) (ToolDescription, error) {
+func (t commandTool) describe(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 	definition, err := model.NewToolDefinition(model.ToolDefinition{
 		Name:        "run_command",
 		Description: "echoes one token",

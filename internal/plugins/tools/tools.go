@@ -296,7 +296,7 @@ func normalizeCallArguments(call model.ToolCall, normalize func(map[string]any) 
 // nil-tracker read path that always returns the bounded requested content.
 type readTool struct{ inst *instance }
 
-func (readTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
+func (readTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
 	return runtime.ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "read_file",
@@ -387,7 +387,7 @@ func (in *instance) prepareMutation(tc runtime.ToolContext, call model.ToolCall,
 // writeTool is the write_file export.
 type writeTool struct{ inst *instance }
 
-func (t writeTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
+func (t writeTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
 	return mutationDescription("write_file", writeFileDescription, writeFileParameters, false, constraints)
 }
 
@@ -414,7 +414,7 @@ func (t writeTool) Prepare(_ context.Context, tc runtime.ToolContext, call model
 // diff built from the committed normalized arguments and the result.
 type editTool struct{ inst *instance }
 
-func (t editTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
+func (t editTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
 	return mutationDescription("edit_file", editFileDescription, editFileParameters, false, constraints)
 }
 
@@ -441,7 +441,7 @@ func (t editTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.
 // counterpart, so only model adaptations that include it can see it.
 type patchTool struct{ inst *instance }
 
-func (t patchTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
+func (t patchTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
 	return mutationDescription("apply_patch", applyPatchDescription, applyPatchParameters, true, constraints)
 }
 
@@ -476,7 +476,7 @@ func (t patchTool) Prepare(_ context.Context, tc runtime.ToolContext, call model
 // member, and the description never advertises one.
 type runCommandTool struct{ inst *instance }
 
-func (runCommandTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
+func (runCommandTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
 	return runtime.ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "run_command",
@@ -592,7 +592,7 @@ func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec
 // execution observes cancellation as an interrupted result.
 type sleepTool struct{}
 
-func (sleepTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
+func (sleepTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
 	return runtime.ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "sleep",

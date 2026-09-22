@@ -97,15 +97,15 @@ type Tool interface {
 // instance is constructed to obtain the declaration's metadata. A nil
 // description function records a declaration lacking one, which composition
 // rejects.
-func ToolSpec(id string, describe func(Invocation, ToolConstraints) (ToolDescription, error)) CapabilitySpec {
+func ToolSpec(id string, describe func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error)) CapabilitySpec {
 	if describe == nil {
 		return CapabilitySpec{id: id, typ: toolType}
 	}
 	return CapabilitySpec{
 		id:  id,
 		typ: toolType,
-		describe: func(invocation Invocation, constraints ToolConstraints) (ToolDescription, error) {
-			description, err := describe(invocation, constraints)
+		describe: func(invocation Invocation, constraints ToolConstraints, identity harness.SessionIdentity) (ToolDescription, error) {
+			description, err := describe(invocation, constraints, identity)
 			if err != nil {
 				return ToolDescription{}, err
 			}

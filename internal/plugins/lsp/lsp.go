@@ -329,7 +329,7 @@ func (in *instance) execute(callID string, tc runtime.ToolContext, canonicalRoot
 // through the canonical read path.
 type diagnosticsTool struct{ inst *instance }
 
-func (diagnosticsTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
+func (diagnosticsTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
 	return runtime.ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "diagnostics",
@@ -378,7 +378,7 @@ func filterInsideRoot(paths []string, canonicalRoot string) []string {
 // schema and outcomes over the shared detection.
 type workspaceSymbolTool struct{ inst *instance }
 
-func (workspaceSymbolTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
+func (workspaceSymbolTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
 	return runtime.ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "workspace_symbol",

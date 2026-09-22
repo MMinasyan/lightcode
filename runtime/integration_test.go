@@ -132,7 +132,7 @@ type probeTool struct {
 	events *traceLog
 }
 
-func (t probeTool) describe(Invocation, ToolConstraints) (ToolDescription, error) {
+func (t probeTool) describe(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 	definition, err := model.NewToolDefinition(model.ToolDefinition{
 		Name:        "probe",
 		Description: "records one dependency invocation",

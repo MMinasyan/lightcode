@@ -346,6 +346,7 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 		promptBody:   sel.agent.Prompt,
 		invocation:   sel.invocation,
 		constraints:  ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
+		identity:     req.Session.Identity,
 		toolSpecs:    specs,
 		adaptation:   adaptation,
 		modelRef:     sel.agent.Model,

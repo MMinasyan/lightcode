@@ -99,7 +99,7 @@ type backgroundProbeTool struct {
 	probe *backgroundProbe
 }
 
-func (t backgroundProbeTool) describe(Invocation, ToolConstraints) (ToolDescription, error) {
+func (t backgroundProbeTool) describe(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 	definition, err := model.NewToolDefinition(model.ToolDefinition{
 		Name:        "bg_probe",
 		Description: "records the prepared call's background services",

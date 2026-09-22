@@ -77,7 +77,7 @@ type ScopeInfo struct {
 type CapabilitySpec struct {
 	id       string
 	typ      reflect.Type
-	describe func(Invocation, ToolConstraints) (ToolDescription, error)
+	describe func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error)
 }
 
 // Spec declares the capability contract named id for the Go type T. It serves

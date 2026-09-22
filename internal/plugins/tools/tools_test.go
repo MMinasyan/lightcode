@@ -146,7 +146,7 @@ func TestDescribeAvailabilityAndDefinitions(t *testing.T) {
 	// The describe functions are static method values needing no instance;
 	// the plugin declaration/instance assertions run in every test that
 	// opens the real plugin (normalize, prepare shapes, execute effects).
-	describe := map[string]func(runtime.Invocation, runtime.ToolConstraints) (runtime.ToolDescription, error){
+	describe := map[string]func(runtime.Invocation, runtime.ToolConstraints, harness.SessionIdentity) (runtime.ToolDescription, error){
 		"read_file":   readTool{}.describe,
 		"write_file":  writeTool{}.describe,
 		"edit_file":   editTool{}.describe,
@@ -166,7 +166,7 @@ func TestDescribeAvailabilityAndDefinitions(t *testing.T) {
 	}
 	for _, tc := range cases {
 		for name, want := range tc.available {
-			got, err := describe[name](runtime.Invocation{}, tc.constraints)
+			got, err := describe[name](runtime.Invocation{}, tc.constraints, harness.SessionIdentity{})
 			if err != nil {
 				t.Fatalf("%s: describe %s: %v", tc.name, name, err)
 			}

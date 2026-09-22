@@ -1043,8 +1043,8 @@ func (noopTool) Prepare(context.Context, ToolContext, model.ToolCall) harness.Pr
 
 // staticToolDescription returns a pure describe function for one declared
 // tool ID, carrying a minimal valid definition under that same name.
-func staticToolDescription(id string) func(Invocation, ToolConstraints) (ToolDescription, error) {
-	return func(Invocation, ToolConstraints) (ToolDescription, error) {
+func staticToolDescription(id string) func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
+	return func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 		return ToolDescription{Definition: model.ToolDefinition{Name: id, Parameters: json.RawMessage(`{}`)}}, nil
 	}
 }
@@ -1100,7 +1100,7 @@ func TestCompositionRejectsToolDeclarationWithoutDescription(t *testing.T) {
 // of the four scopes and its declaration ID joins the tool universe in
 // registration order without running any factory.
 func TestToolDeclarationsComposeAtAllScopes(t *testing.T) {
-	describe := func(Invocation, ToolConstraints) (ToolDescription, error) {
+	describe := func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 		return ToolDescription{}, nil
 	}
 	var opened int
@@ -1145,7 +1145,7 @@ func TestToolSpecDescribeValidatesAndCopies(t *testing.T) {
 	var gotInvocation Invocation
 	var gotConstraints ToolConstraints
 	source := model.ToolDefinition{Name: "tool.x", Description: "reads", Parameters: json.RawMessage(`{"a":1}`)}
-	describe := func(invocation Invocation, constraints ToolConstraints) (ToolDescription, error) {
+	describe := func(invocation Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 		gotInvocation, gotConstraints = invocation, constraints
 		return ToolDescription{Definition: source, Available: true, DefaultHidden: true}, nil
 	}
@@ -1153,7 +1153,7 @@ func TestToolSpecDescribeValidatesAndCopies(t *testing.T) {
 
 	wantInvocation := Invocation{}
 	wantConstraints := ToolConstraints{Readonly: true, WriteDir: "/w"}
-	description, err := spec.describe(wantInvocation, wantConstraints)
+	description, err := spec.describe(wantInvocation, wantConstraints, harness.SessionIdentity{})
 	if err != nil {
 		t.Fatalf("describe: %v", err)
 	}
@@ -1173,22 +1173,22 @@ func TestToolSpecDescribeValidatesAndCopies(t *testing.T) {
 		t.Fatalf("source parameters = %s, want the returned copy owned by the caller", source.Parameters)
 	}
 
-	mismatch := ToolSpec("tool.y", func(Invocation, ToolConstraints) (ToolDescription, error) {
+	mismatch := ToolSpec("tool.y", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 		return ToolDescription{Definition: model.ToolDefinition{Name: "other", Parameters: json.RawMessage(`{}`)}}, nil
 	})
-	if _, err := mismatch.describe(Invocation{}, ToolConstraints{}); err == nil || !strings.Contains(err.Error(), "tool.y") {
+	if _, err := mismatch.describe(Invocation{}, ToolConstraints{}, harness.SessionIdentity{}); err == nil || !strings.Contains(err.Error(), "tool.y") {
 		t.Fatalf("mismatched describe error = %v, want the ID/name match rejection", err)
 	}
-	invalid := ToolSpec("tool.x", func(Invocation, ToolConstraints) (ToolDescription, error) {
+	invalid := ToolSpec("tool.x", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 		return ToolDescription{Definition: model.ToolDefinition{Name: "tool.x", Parameters: json.RawMessage(`[1]`)}}, nil
 	})
-	if _, err := invalid.describe(Invocation{}, ToolConstraints{}); err == nil {
+	if _, err := invalid.describe(Invocation{}, ToolConstraints{}, harness.SessionIdentity{}); err == nil {
 		t.Fatal("invalid parameters accepted by the recorded description")
 	}
-	failing := ToolSpec("tool.x", func(Invocation, ToolConstraints) (ToolDescription, error) {
+	failing := ToolSpec("tool.x", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 		return ToolDescription{}, errValidator
 	})
-	if _, err := failing.describe(Invocation{}, ToolConstraints{}); !errors.Is(err, errValidator) {
+	if _, err := failing.describe(Invocation{}, ToolConstraints{}, harness.SessionIdentity{}); !errors.Is(err, errValidator) {
 		t.Fatalf("describe failure = %v, want the source error", err)
 	}
 }

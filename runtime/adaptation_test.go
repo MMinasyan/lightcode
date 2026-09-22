@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/prompt"
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -153,7 +154,7 @@ func TestConfigurationServiceProjectsDefaultCapabilities(t *testing.T) {
 // function behind the same validation production declarations use.
 
 func staticToolSpec(id, description string, available, hidden bool) CapabilitySpec {
-	return ToolSpec(id, func(Invocation, ToolConstraints) (ToolDescription, error) {
+	return ToolSpec(id, func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 		return toolDescriptionFor(id, description, available, hidden)
 	})
 }
@@ -161,14 +162,23 @@ func staticToolSpec(id, description string, available, hidden bool) CapabilitySp
 // mutationToolSpec mirrors the native mutation-tool descriptions: available
 // unless the hard constraints make it ineligible.
 func mutationToolSpec(id string, hidden bool) CapabilitySpec {
-	return ToolSpec(id, func(_ Invocation, constraints ToolConstraints) (ToolDescription, error) {
+	return ToolSpec(id, func(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 		return toolDescriptionFor(id, id+" description", !constraints.Readonly || constraints.WriteDir != "", hidden)
 	})
 }
 
 func failingToolSpec(id string) CapabilitySpec {
-	return ToolSpec(id, func(Invocation, ToolConstraints) (ToolDescription, error) {
+	return ToolSpec(id, func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 		return ToolDescription{}, errors.New(id + " describe failure")
+	})
+}
+
+// lineageToolSpec declares a tool available only on a root Session: its
+// description function receives the preparation session identity and gates
+// availability on the parent lineage.
+func lineageToolSpec(id string) CapabilitySpec {
+	return ToolSpec(id, func(_ Invocation, _ ToolConstraints, identity harness.SessionIdentity) (ToolDescription, error) {
+		return toolDescriptionFor(id, id+" description", identity.ParentSessionID == "", false)
 	})
 }
 
@@ -466,6 +476,35 @@ func TestComposeSurfaceZeroSessionStartSamplesComposeTime(t *testing.T) {
 	}
 	if !strings.Contains(result.Prompt, "Session started: 2026-01-02 03:04:05 UTC") {
 		t.Fatalf("the explicit session start did not render verbatim: %q", result.Prompt)
+	}
+}
+
+// TestComposeSurfaceExcludesLineageUnavailableTools proves the lineage
+// description input: the composed surface passes the session identity to
+// every description function, so a spec that reports unavailable for a
+// child is excluded from the child's advertised surface while the same spec
+// stays on a root's, and the always-available sibling is advertised on both.
+func TestComposeSurfaceExcludesLineageUnavailableTools(t *testing.T) {
+	req := baseSurfaceRequest(t)
+	req.identity = harness.SessionIdentity{SessionID: "root-session"}
+	req.toolSpecs = append(req.toolSpecs, lineageToolSpec("task"))
+
+	_, root, err := composeSurface(req)
+	if err != nil {
+		t.Fatalf("root composeSurface: %v", err)
+	}
+	if names := advertisedNames(root); !reflect.DeepEqual(names, []string{"read_file", "task"}) {
+		t.Fatalf("root advertisement = %q, want the lineage-gated tool present alongside its sibling", names)
+	}
+
+	childReq := req
+	childReq.identity = harness.SessionIdentity{SessionID: "child-session", ParentSessionID: "root-session"}
+	_, child, err := composeSurface(childReq)
+	if err != nil {
+		t.Fatalf("child composeSurface: %v", err)
+	}
+	if names := advertisedNames(child); !reflect.DeepEqual(names, []string{"read_file"}) {
+		t.Fatalf("child advertisement = %q, want the lineage-gated tool excluded", names)
 	}
 }
 
