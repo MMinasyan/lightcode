@@ -305,15 +305,21 @@ func TestRunCommandExecuteOutcomes(t *testing.T) {
 		}
 	})
 
-	t.Run("the inherited environment and workspace cwd are retained", func(t *testing.T) {
+	t.Run("the managed key is scrubbed while an unlisted key and the workspace cwd remain", func(t *testing.T) {
 		t.Setenv("LIGHTCODE_TOOLS_PLUGIN_TEST", "env-value")
-		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"printf '%s' \"$LIGHTCODE_TOOLS_PLUGIN_TEST\"; pwd"}`)
+		t.Setenv("LIGHTCODE_TOOLS_PLUGIN_MANAGED", "managed-secret")
+		runCommand := openToolsWithKeys(t, dataDir, []string{"LIGHTCODE_TOOLS_PLUGIN_MANAGED"})["run_command"]
+		plan := prepare(t, runCommand, tc, "run_command", `{"command":"printf '%s|%s' \"$LIGHTCODE_TOOLS_PLUGIN_TEST\" \"$LIGHTCODE_TOOLS_PLUGIN_MANAGED\"; pwd"}`)
 		outcome := plan.Execute(context.Background())
 		if outcome.Result.Status != model.ResultSuccess {
 			t.Fatalf("result = %+v, want success", outcome.Result)
 		}
-		if !strings.Contains(outcome.Result.Content, "env-value") || !strings.Contains(outcome.Result.Content, ws) {
-			t.Fatalf("result = %q, want the inherited env value and the workspace cwd", outcome.Result.Content)
+		content := outcome.Result.Content
+		if !strings.Contains(content, "env-value|") || strings.Contains(content, "managed-secret") {
+			t.Fatalf("result = %q, want the unlisted key visible and the managed key scrubbed", content)
+		}
+		if !strings.Contains(content, ws) {
+			t.Fatalf("result = %q, want the workspace cwd", content)
 		}
 	})
 }
@@ -330,12 +336,12 @@ func TestCommandOutcomeClassifiesByDeliveredCause(t *testing.T) {
 	t.Run("external-signal death keeps its real result after the context cancels", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		runForegroundCommandFn = func(ctx context.Context, command, dir string, timeoutSec, maxBytes, maxLineChars int, spillDir string) (string, error) {
-			result, err := orig(ctx, command, dir, timeoutSec, maxBytes, maxLineChars, spillDir)
+		runForegroundCommandFn = func(ctx context.Context, command, dir string, timeoutSec, maxBytes, maxLineChars int, spillDir string, env []string) (string, error) {
+			result, err := orig(ctx, command, dir, timeoutSec, maxBytes, maxLineChars, spillDir, env)
 			cancel()
 			return result, err
 		}
-		outcome := commandOutcome(ctx, "call-1", "kill -TERM $$", "", 0, defaultSettings(), t.TempDir())
+		outcome := commandOutcome(ctx, "call-1", "kill -TERM $$", "", 0, defaultSettings(), t.TempDir(), nil)
 		if outcome.Result.Status != model.ResultError || outcome.Result.Content != "Error: Exit code -1\n" {
 			t.Fatalf("result = (%v, %q), want the real signal-death result as an error", outcome.Result.Status, outcome.Result.Content)
 		}
@@ -344,12 +350,12 @@ func TestCommandOutcomeClassifiesByDeliveredCause(t *testing.T) {
 	t.Run("own timeout keeps its real result after the context cancels", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		runForegroundCommandFn = func(ctx context.Context, command, dir string, timeoutSec, maxBytes, maxLineChars int, spillDir string) (string, error) {
-			result, err := orig(ctx, command, dir, timeoutSec, maxBytes, maxLineChars, spillDir)
+		runForegroundCommandFn = func(ctx context.Context, command, dir string, timeoutSec, maxBytes, maxLineChars int, spillDir string, env []string) (string, error) {
+			result, err := orig(ctx, command, dir, timeoutSec, maxBytes, maxLineChars, spillDir, env)
 			cancel()
 			return result, err
 		}
-		outcome := commandOutcome(ctx, "call-2", "sleep 5", "", 1, defaultSettings(), t.TempDir())
+		outcome := commandOutcome(ctx, "call-2", "sleep 5", "", 1, defaultSettings(), t.TempDir(), nil)
 		if outcome.Result.Status != model.ResultError || !strings.HasPrefix(outcome.Result.Content, "Error: Exit code -1 (timeout)\n") {
 			t.Fatalf("result = (%v, %q), want the retained timeout text as an error result", outcome.Result.Status, outcome.Result.Content)
 		}

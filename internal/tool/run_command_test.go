@@ -438,7 +438,7 @@ func TestRunForegroundCommandCancellationWhileRunningIsDeterministic(t *testing.
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := RunForegroundCommand(ctx, "sleep 5", dir, 60, 0, 0, filepath.Join(dir, ".lightcode"))
+		_, err := RunForegroundCommand(ctx, "sleep 5", dir, 60, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
 		errCh <- err
 	}()
 
@@ -473,7 +473,7 @@ func TestRunForegroundCommandCompletedBeatsLateEvents(t *testing.T) {
 		}
 		defer func() { waitCommand = origWait }()
 
-		result, err := RunForegroundCommand(context.Background(), "printf ok", dir, 1, 0, 0, filepath.Join(dir, ".lightcode"))
+		result, err := RunForegroundCommand(context.Background(), "printf ok", dir, 1, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
 		if err != nil || result != "ok" {
 			t.Fatalf("result = (%q, %v), want the already-finished real result", result, err)
 		}
@@ -494,7 +494,7 @@ func TestRunForegroundCommandCompletedBeatsLateEvents(t *testing.T) {
 		errCh := make(chan error, 1)
 		resCh := make(chan string, 1)
 		go func() {
-			result, err := RunForegroundCommand(ctx, "printf ok", dir, 0, 0, 0, filepath.Join(dir, ".lightcode"))
+			result, err := RunForegroundCommand(ctx, "printf ok", dir, 0, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
 			resCh <- result
 			errCh <- err
 		}()
@@ -517,7 +517,7 @@ func TestRunForegroundCommandTimeoutOverflowRejectedBeforeLaunch(t *testing.T) {
 	dir := t.TempDir()
 	probe := filepath.Join(dir, "overflow-launched")
 
-	_, err := RunForegroundCommand(context.Background(), "touch "+probe, dir, int(math.MaxInt64/int64(time.Second))+1, 0, 0, filepath.Join(dir, ".lightcode"))
+	_, err := RunForegroundCommand(context.Background(), "touch "+probe, dir, int(math.MaxInt64/int64(time.Second))+1, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
 	if err == nil || !strings.Contains(err.Error(), "overflows the seconds-to-duration conversion") {
 		t.Fatalf("err = %v, want the overflow rejection", err)
 	}
@@ -534,7 +534,7 @@ func TestRunForegroundCommandParentDeadlineIsCancellation(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(1*time.Second))
 	defer cancel()
 
-	_, err := RunForegroundCommand(ctx, "sleep 5", dir, 0, 0, 0, filepath.Join(dir, ".lightcode"))
+	_, err := RunForegroundCommand(ctx, "sleep 5", dir, 0, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
 	var exitErr *ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode != -1 || !strings.HasPrefix(exitErr.Output, "command cancelled") {
 		t.Fatalf("err = %v, want the cancellation classification for a parent deadline", err)

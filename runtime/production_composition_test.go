@@ -446,7 +446,7 @@ func (t chainCommandTool) Prepare(_ context.Context, tc ToolContext, call model.
 	return harness.PreparedTool{
 		Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: rewritten}},
 		Execute: func(ctx context.Context) harness.ToolOutcome {
-			result, execErr := tool.RunForegroundCommand(ctx, rewritten, tc.Workspace, 120, 15360, 5000, spillDir)
+			result, execErr := tool.RunForegroundCommand(ctx, rewritten, tc.Workspace, 120, 15360, 5000, spillDir, os.Environ())
 			if execErr != nil {
 				status := model.ResultError
 				var exitErr *tool.ExitError

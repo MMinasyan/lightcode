@@ -30,6 +30,13 @@ const (
 // tool exports by declared ID.
 func openTools(t *testing.T, dataDir string) map[string]runtime.Tool {
 	t.Helper()
+	return openToolsWithKeys(t, dataDir, nil)
+}
+
+// openToolsWithKeys is openTools over a scope carrying the given managed
+// env key names.
+func openToolsWithKeys(t *testing.T, dataDir string, managedKeys []string) map[string]runtime.Tool {
+	t.Helper()
 	p := Plugin()
 	if p.ID != "tools" || p.Scope != runtime.ScopeRuntime || p.ValidateConfig == nil || p.Open == nil || len(p.Requires) != 0 {
 		t.Fatalf("plugin declaration = %+v, want the Runtime-scoped tools plugin with a validator and no dependencies", p)
@@ -37,7 +44,7 @@ func openTools(t *testing.T, dataDir string) map[string]runtime.Tool {
 	if len(p.Provides) != 6 {
 		t.Fatalf("plugin declares %d exports, want the four file tools plus run_command and sleep", len(p.Provides))
 	}
-	inst, err := p.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dataDir}, runtime.Bindings{})
+	inst, err := p.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dataDir, ManagedEnvKeys: managedKeys}, runtime.Bindings{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

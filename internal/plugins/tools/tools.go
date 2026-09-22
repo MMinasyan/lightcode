@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -99,13 +100,15 @@ func (s settings) toolsConfig() config.ToolsConfig {
 	}
 }
 
-// instance is one Open's constructed state: the owner data root captured from
-// the scope identity. It keeps no Session-indexed state, no handle tags, no
-// cached read records and no reset or eviction hooks: every mutating call
-// opens its code group fresh from the calling Operation's admitted-input
-// identity and drops it afterward.
+// instance is one Open's constructed state: the owner data root and the
+// managed env key names captured from the scope identity. It keeps no
+// Session-indexed state, no handle tags, no cached read records and no
+// reset or eviction hooks: every mutating call opens its code group fresh
+// from the calling Operation's admitted-input identity and drops it
+// afterward.
 type instance struct {
-	dataDir string
+	dataDir     string
+	managedKeys []string
 }
 
 func (in *instance) settings(inv runtime.Invocation) (settings, error) {
@@ -553,13 +556,14 @@ func (t runCommandTool) Prepare(_ context.Context, tc runtime.ToolContext, call 
 	return harness.PreparedTool{
 		Permissions: pairs,
 		Execute: func(ctx context.Context) harness.ToolOutcome {
-			return commandOutcome(ctx, call.ID, command, tc.Workspace, timeoutSec, s, spillDir)
+			return commandOutcome(ctx, call.ID, command, tc.Workspace, timeoutSec, s, spillDir, t.inst.managedKeys)
 		},
 	}
 }
 
 // commandOutcome runs one prepared foreground command through the shared
-// runner and maps the retained outcomes onto the model-visible result: a
+// runner over the environment scrubbed of the instance's managed keys and
+// maps the retained outcomes onto the model-visible result: a
 // completed run settles as success or — for a nonzero exit — the same
 // ExitError output the legacy engine reports as an error; a configured
 // timeout settles as an error result with the retained timeout text; the
@@ -567,8 +571,8 @@ func (t runCommandTool) Prepare(_ context.Context, tc runtime.ToolContext, call 
 // with the retained cancellation text. The classification reads the cause
 // the runner flagged on the error, never the context after the runner has
 // settled the real result.
-func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec int, s settings, spillDir string) harness.ToolOutcome {
-	result, err := runForegroundCommandFn(ctx, command, dir, timeoutSec, s.MaxOutputBytes, s.ReadLineMaxChars, spillDir)
+func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec int, s settings, spillDir string, managedKeys []string) harness.ToolOutcome {
+	result, err := runForegroundCommandFn(ctx, command, dir, timeoutSec, s.MaxOutputBytes, s.ReadLineMaxChars, spillDir, config.EnvWithoutKeys(os.Environ(), managedKeys))
 	var exitErr *tool.ExitError
 	if errors.As(err, &exitErr) {
 		status := model.ResultError
@@ -651,7 +655,8 @@ func mutationDescription(name, description, parameters string, defaultHidden boo
 // file tools plus the foreground command and sleep tools. It has no
 // dependencies. ValidateConfig validates the owned plugins.tools section;
 // Open captures the owner data root the mutating calls derive their code
-// groups from and the command spills their output directory from.
+// groups from and the command spills their output directory from, and the
+// managed env key names the command path scrubs from its environment.
 func Plugin() runtime.Plugin {
 	return runtime.Plugin{
 		ID:    pluginID,
@@ -673,13 +678,14 @@ func Plugin() runtime.Plugin {
 }
 
 // open checks the scope context and captures the scope identity's owner data
-// root. Five of the six tool values share that one instance (sleep needs no
-// instance state); no per-Session state is created here.
+// root and managed env key names. Five of the six tool values share that one
+// instance (sleep needs no instance state); no per-Session state is created
+// here.
 func open(ctx context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
 	if err := ctx.Err(); err != nil {
 		return runtime.Instance{}, err
 	}
-	inst := &instance{dataDir: info.DataDir}
+	inst := &instance{dataDir: info.DataDir, managedKeys: info.ManagedEnvKeys}
 	return runtime.Instance{Values: map[string]any{
 		"read_file":   readTool{inst},
 		"write_file":  writeTool{inst},
