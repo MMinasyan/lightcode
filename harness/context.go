@@ -113,12 +113,19 @@ func signalProjectedText(content string) string {
 // FIFO order, each item receives its one scheduled delivery attempt through
 // the active-Operation input transition. A failed attempt is final for the
 // item and the drain proceeds to the next buffered message. Harness-context
-// loss discards both buffers without delivery attempts.
+// loss discards both buffers without delivery attempts. A canceled boundary
+// context stops the drain before popping another item: an already-popped item
+// still commits on the Harness context despite the execution interruption,
+// and unpopped items remain for the post-terminal drain.
 func (h *Harness) drainSteering(ctx context.Context, c *coordinator, operationID string) {
 	for {
 		c.mu.Lock()
 		if h.ctx.Err() != nil { // Harness loss discards both buffers
 			c.steering, c.queued = nil, nil
+			c.mu.Unlock()
+			return
+		}
+		if ctx.Err() != nil { // a canceled boundary context leaves unpopped items for the post-terminal drain
 			c.mu.Unlock()
 			return
 		}
@@ -129,10 +136,39 @@ func (h *Harness) drainSteering(ctx context.Context, c *coordinator, operationID
 		item := c.steering[0]
 		c.steering = c.steering[1:]
 		c.mu.Unlock()
-		if err := h.commitSteeringInput(ctx, c, operationID, item.origin, item.content); err != nil {
+		if err := h.commitSteeringInput(h.ctx, c, operationID, item.origin, item.content); err != nil {
 			_ = err // one failed delivery attempt is final for the item; the next proceeds
 		}
 	}
+}
+
+// Interrupt interrupts one Session's execution, keyed on the durable state:
+// an idle Session — no current Operation — returns nil. Otherwise both
+// interrupt vehicles fire: the installed execution's context is canceled, and
+// the not-yet-started executions' marker is set to the durable current
+// Operation. The marker is consumed at execute's entry when it matches that
+// operation — a marker for a running operation is inert — and canceling a
+// retiring predecessor is a harmless no-op. Buffers are never discarded by an
+// interrupt: already-popped steering commits on the Harness context and
+// unpopped items drain after the interrupted Operation's terminal.
+func (h *Harness) Interrupt(ctx context.Context, sessionID string) error {
+	c, err := h.coordinatorFor(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	operationID := c.graph.Session.State.CurrentOperationID
+	if operationID == "" {
+		c.mu.Unlock()
+		return nil
+	}
+	c.interruptOp = operationID
+	run := c.run
+	c.mu.Unlock()
+	if run != nil {
+		run.cancel()
+	}
+	return nil
 }
 
 // commitSteeringInput is the steering-input helper: it commits one waiting

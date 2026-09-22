@@ -197,9 +197,13 @@ type pendingMessage struct {
 
 // activeExecution is the one in-flight execution of a coordinator: installed
 // after the admission commit and released only after the terminal settlement
-// and the post-terminal buffer drain have converged.
+// and the post-terminal buffer drain have converged. Its execution context is
+// a child of the Harness context; Interrupt cancels it and the retirement
+// tail cancels it once after the drain.
 type activeExecution struct {
-	done chan struct{} // closed when the execution goroutine finishes
+	done    chan struct{}      // closed when the execution goroutine finishes
+	execCtx context.Context    // the execution context driving the opener, the Agent run, and every effect attempt
+	cancel  context.CancelFunc // cancels execCtx; idempotent, so a retiring predecessor's cancel is a harmless no-op
 }
 
 // coordinator is the one per-Session authority: the validated Session view,
@@ -1397,21 +1401,23 @@ func (h *Harness) rematerialize(ctx context.Context, c *coordinator, sessionID s
 	return nil
 }
 
-// startExecution installs the coordinator's active execution and starts the
-// Agent composition on the Harness context after the admission commit. The
-// execution slot releases, and the post-terminal buffer drain completes,
-// before the execution's done channel closes. After execute, the storage
-// failure latch, and the drain have returned, the tail clears the run slot
-// only when it is still this run — a drain-installed successor owns the slot
-// and defers the recursive completion check to its own retirement — then runs
-// the child completion settlement for this operation before closing done.
+// startExecution installs the coordinator's active execution with its own
+// execution context — a child of the Harness context — and starts the Agent
+// composition on it after the admission commit. Interrupt cancels that
+// context; the execution slot releases, and the post-terminal buffer drain
+// completes, before the execution's done channel closes. After execute, the
+// storage failure latch, and the drain have returned, the tail clears the run
+// slot only when it is still this run — a drain-installed successor owns the
+// slot and a distinct context — then cancels the execution context, runs the
+// child completion settlement for this operation, and closes done.
 func (h *Harness) startExecution(c *coordinator, operationID string, prepared PreparedExecution) {
-	run := &activeExecution{done: make(chan struct{})}
+	execCtx, cancel := context.WithCancel(h.ctx)
+	run := &activeExecution{done: make(chan struct{}), execCtx: execCtx, cancel: cancel}
 	c.mu.Lock()
 	c.run = run
 	c.mu.Unlock()
 	go func() {
-		err := h.execute(c, operationID, prepared)
+		err := h.execute(c, operationID, prepared, run.execCtx)
 		h.recordStorageFailure(err)
 		h.drainBuffers(c, run)
 		c.mu.Lock()
@@ -1419,6 +1425,7 @@ func (h *Harness) startExecution(c *coordinator, operationID string, prepared Pr
 			c.run = nil
 		}
 		c.mu.Unlock()
+		cancel() // the context dies only after the drain: a drain-installed successor owns a distinct context
 		h.childCompletionSettled(c, operationID)
 		close(run.done)
 	}()
