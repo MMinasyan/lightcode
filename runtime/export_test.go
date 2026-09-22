@@ -37,3 +37,9 @@ func ConfiguredInvocationForTest(sections map[string]string) (Invocation, error)
 	}
 	return Invocation{snapshot: snapshot}, nil
 }
+
+// EqualEventForTest exposes the field-wise Event comparison to the external
+// runtime_test package. It is absent from production builds.
+func EqualEventForTest(a, b Event) bool {
+	return equalEvent(a, b)
+}

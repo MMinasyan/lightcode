@@ -63,6 +63,11 @@ type ScopeInfo struct {
 	Workspace   string
 	SessionID   string
 	OperationID string
+
+	// ManagedEnvKeys names the env keys the Runtime injected from
+	// ~/.lightcode/.env; the Runtime scope carries them, narrower scopes
+	// carry none.
+	ManagedEnvKeys []string
 }
 
 // CapabilitySpec pairs one capability lookup ID with its Go type. The ID is

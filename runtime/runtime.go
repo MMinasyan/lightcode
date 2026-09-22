@@ -154,7 +154,8 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		return nil, errors.Join(cause, lock.Release())
 	}
 
-	if _, err := config.LoadDotEnv(); err != nil {
+	managedEnv, err := config.LoadDotEnv()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: .env: %v\n", err)
 	}
 
@@ -169,7 +170,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		return unlock(err)
 	}
 
-	runtimeScope, err := c.openScope(work, ScopeInfo{Kind: ScopeRuntime, DataDir: dataDir}, nil)
+	runtimeScope, err := c.openScope(work, ScopeInfo{Kind: ScopeRuntime, DataDir: dataDir, ManagedEnvKeys: managedEnv.ManagedKeys()}, nil)
 	if err != nil {
 		return unlock(err)
 	}

@@ -1565,3 +1565,41 @@ func TestRuntimeRecoveryRepairsBeforeExecution(t *testing.T) {
 		}
 	})
 }
+
+// A Runtime-scoped plugin's Open observes the names of the env keys the
+// Runtime injected from its .env file in its ScopeInfo.
+func TestRuntimeScopeInfoCarriesManagedEnvKeys(t *testing.T) {
+	e := newOwnerEnv(t)
+	key := "LIGHTCODE_TEST_RUNTIME_MANAGED_KEYS"
+	t.Setenv(key, "")
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(e.home, ".lightcode")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(key+"=injected\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	observer := Plugin{
+		ID:       "scope_env_observer",
+		Scope:    ScopeRuntime,
+		Provides: []CapabilitySpec{Spec[any]("scope_env_observer.cap")},
+		Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
+			got = info.ManagedEnvKeys
+			return Instance{Values: map[string]any{"scope_env_observer.cap": "observer"}}, nil
+		},
+	}
+	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()), observer)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := r.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !slices.Contains(got, key) {
+		t.Fatalf("ScopeInfo.ManagedEnvKeys = %v, want to contain %s", got, key)
+	}
+}

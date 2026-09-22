@@ -587,7 +587,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			scopeEvent(EventScopeClosed, ScopeRuntime, ""),
 		}
 		got := append(observed, drainClosed(t, healthy)...)
-		if !slices.Equal(got, want) {
+		if !slices.EqualFunc(got, want, equalEvent) {
 			t.Fatalf("healthy subscriber events = %+v, want the complete committed sequence %+v", got, want)
 		}
 

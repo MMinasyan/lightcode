@@ -574,7 +574,7 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 		{Kind: runtime.EventConfiguration, ConfigurationRevision: "3"},
 		{Kind: runtime.EventScopeClosed, Scope: runtime.ScopeInfo{Kind: runtime.ScopeRuntime}},
 	}
-	if !slices.Equal(observed, want) {
+	if !slices.EqualFunc(observed, want, runtime.EqualEventForTest) {
 		t.Fatalf("healthy subscriber events = %+v, want the observed revisions plus the Runtime closure in publication order %+v", observed, want)
 	}
 	again, err := e.openComposed(ctx)
