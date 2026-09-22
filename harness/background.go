@@ -520,6 +520,171 @@ func (h *Harness) claimFinishBackgroundMember(c *coordinator, completionID strin
 	}
 }
 
+// liveBackground reports whether one Session's background ownership group
+// holds live members. Claimed members count — they remain in the group until
+// finished — so the gate covers an in-flight settlement exactly like Stop's
+// snapshot does.
+func liveBackground(c *coordinator) bool {
+	return c.group != nil && len(c.group.members) > 0
+}
+
+// Stop stops one Session's background ownership group. A root stop stops
+// every captured member, waits for their convergence, and reopens the group;
+// a child stop permanently closes the child by lineage: it discards the
+// child's buffers, interrupts its work, and waits for its members and its
+// parent-membership completion. A racing member is either included in the
+// snapshot or settles without starting — the stopping and closed states
+// reject every start that loses the race. A concurrent stop joins the first
+// one's interval and returns its stored error. Member-stop errors are
+// collected during the stop and returned only after convergence; no
+// state-owning lock is ever held while waiting, and no error skips a wait.
+func (h *Harness) Stop(ctx context.Context, sessionID string) error {
+	c, err := h.coordinatorFor(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	if c.stop != nil { // a concurrent stop owns the interval: join it and return its stored error
+		interval := c.stop
+		c.mu.Unlock()
+		<-interval.done // err is written before done closes
+		return interval.err
+	}
+	parentID := c.graph.Session.Identity.ParentSessionID
+	isChild := parentID != ""
+	interval := &stopInterval{done: make(chan struct{})}
+	var (
+		reservation chan struct{}
+		run         *activeExecution
+		members     []*backgroundMember
+	)
+	if isChild { // the lineage closure is permanent: the buffers go, the pending completion stays
+		c.bgState = bgClosed
+		c.steering, c.queued = nil, nil
+		reservation = c.reserved
+		run = c.run
+	} else {
+		if !liveBackground(c) {
+			c.mu.Unlock()
+			return nil
+		}
+		c.bgState = bgStopping
+	}
+	if c.group != nil {
+		for _, m := range c.group.members {
+			members = append(members, m)
+		}
+	}
+	c.stop = interval
+	c.mu.Unlock()
+
+	var (
+		runs       []*activeExecution
+		membership chan struct{}
+		errs       []error
+	)
+	if isChild {
+		// The parent membership, registered before this child's publication,
+		// covers the initial launch window where the child has neither a
+		// reservation nor an installed run.
+		h.mu.Lock()
+		parent := h.sessions[parentID]
+		h.mu.Unlock()
+		if parent != nil {
+			parent.mu.Lock()
+			if parent.group != nil {
+				for _, m := range parent.group.members {
+					if m.kind == memberChild && m.id == sessionID {
+						membership = m.done
+					}
+				}
+			}
+			parent.mu.Unlock()
+		}
+		if run != nil { // outside every lock: the cancel reaches the installed execution
+			run.cancel()
+			runs = append(runs, run)
+		}
+		if reservation != nil { // ordinary admission holds the reservation through installation
+			<-reservation
+			c.mu.Lock()
+			installed := c.run
+			c.mu.Unlock()
+			if installed != nil && installed != run { // at most two candidates: this is the other one
+				installed.cancel()
+				runs = append(runs, installed)
+			}
+		}
+	}
+
+	// Stop the snapshot members. The stopping and closed states reject every
+	// start that races the snapshot, so no member outside it can appear.
+	for _, m := range members {
+		switch m.kind {
+		case memberChild:
+			err := h.Stop(ctx, m.id)
+			if errors.Is(err, ErrNotFound) {
+				continue // before the child register's publication there is nothing to stop
+			}
+			if err != nil {
+				errs = append(errs, err)
+				if isCorruption(err) { // the unavailable coordinator prevents natural delivery
+					h.claimFinishBackgroundMember(c, m.completionID)
+				}
+			}
+		case memberJob:
+			if h.deps.Jobs == nil { // unreachable: a live job member implies StartJob succeeded with a stopper
+				errs = append(errs, invalidInput("no job stopper configured"))
+				continue
+			}
+			h.deps.Jobs.StopJob(sessionID, m.id) // waits for reaping; the ordinary callback owns the completion
+		}
+	}
+
+	// Convergence waits: every snapshot member, every captured run, and — for
+	// a child — the parent membership that closes only after the child's
+	// terminal delivery or failed-attempt cleanup.
+	for _, m := range members {
+		<-m.done
+	}
+	for _, r := range runs {
+		<-r.done
+	}
+	if membership != nil {
+		<-membership
+	}
+
+	c.mu.Lock()
+	if !isChild && c.bgState == bgStopping {
+		c.bgState = bgOpen // a root's closure lasts only the stop; a child's stays
+	}
+	interval.err = errors.Join(errs...)
+	close(interval.done)
+	c.stop = nil
+	c.mu.Unlock()
+	return interval.err
+}
+
+// StopAll stops every cached Session's background ownership group and joins
+// the collected errors. It is idempotent: a stopped root with no live members
+// and a permanently closed child both stop again as no-ops.
+func (h *Harness) StopAll(ctx context.Context) error {
+	h.mu.Lock()
+	ids := make([]string, 0, len(h.sessions))
+	for id := range h.sessions {
+		ids = append(ids, id)
+	}
+	h.mu.Unlock()
+	var errs []error
+	for _, id := range ids {
+		if err := h.Stop(ctx, id); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // StartJob starts one background job on one Session's ownership group: it
 // validates the job identity, the required job-stop dependency, and the spawn
 // callback before resolution, admits a job member (the Jobs capability owns

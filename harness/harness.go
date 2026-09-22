@@ -445,6 +445,10 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 		c.mu.Unlock()
 		return SubmitResult{}, invalidInput("session %q is archived; admission requires an open Session", req.SessionID)
 	}
+	if c.bgState == bgClosed { // a permanently closed background group rejects agent work beside the lifecycle gate
+		c.mu.Unlock()
+		return SubmitResult{}, invalidInput("session is closed to agent work")
+	}
 	if err := ctx.Err(); err != nil { // the routing gate: cancellation observed here publishes nothing
 		c.mu.Unlock()
 		return SubmitResult{}, err
@@ -592,6 +596,10 @@ func (h *Harness) ArchiveSession(ctx context.Context, sessionID string) (Session
 			result := ownSessionRecord(c.graph.Session)
 			c.mu.Unlock()
 			return result, nil
+		}
+		if liveBackground(c) { // claimed members count: they remain until finished
+			c.mu.Unlock()
+			return SessionRecord{}, invalidInput("session has live background work; stop it first")
 		}
 		expected := c.graph.Session.Revision
 		now := time.Now().UTC() // the one sampled archive time
@@ -775,7 +783,7 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 			c.mu.Unlock()
 			return false, notFoundSession(sessionID)
 		}
-		if c.run != nil || len(c.steering) > 0 || len(c.queued) > 0 { // running or process-locally buffered: left unchanged
+		if c.run != nil || len(c.steering) > 0 || len(c.queued) > 0 || liveBackground(c) { // running, buffered, or live background work: left unchanged
 			c.mu.Unlock()
 			return false, nil
 		}
@@ -1122,6 +1130,10 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 	if c.graph.Session.State.Lifecycle != LifecycleOpen {
 		c.mu.Unlock()
 		return OperationRecord{}, nil, "", invalidInput("session %q is archived; admission requires an open Session", req.SessionID)
+	}
+	if c.bgState == bgClosed { // a permanently closed background group rejects agent work beside the lifecycle gate
+		c.mu.Unlock()
+		return OperationRecord{}, nil, "", invalidInput("session is closed to agent work")
 	}
 	if c.graph.Session.State.CurrentOperationID != "" {
 		running := c.graph.Session.State.CurrentOperationID
