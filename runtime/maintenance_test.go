@@ -790,8 +790,19 @@ func TestMaintenancePassSweepsValidSiblingsAroundCorruption(t *testing.T) {
 		if rec, err := readSweptSession(t, r, valid.Identity.SessionID); err != nil || rec.State.Lifecycle != harness.LifecycleArchived {
 			t.Fatalf("valid sibling after the sweep = %+v err %v, want it archived", rec, err)
 		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
+		// Shutdown still converges — Close returns, joining the latched
+		// corruption of the planted corrupt Session as reporting, not as a
+		// failure to converge.
+		err = r.Close(context.Background())
+		if err == nil {
+			t.Fatal("Close = nil, want the joined corruption error for the planted corrupt Session")
+		}
+		if !errors.Is(err, harness.ErrCorrupt) {
+			t.Fatalf("Close error = %v, want the corruption-class error", err)
+		}
+		var corrupt *harness.CorruptionError
+		if !errors.As(err, &corrupt) || corrupt.SessionID != corrupted.Identity.SessionID {
+			t.Fatalf("Close error = %v, want CorruptionError for session %s", err, corrupted.Identity.SessionID)
 		}
 		if after := readSweepRegister(t, wrapped, corrupted.Identity.SessionID); after.Revision != bad.Revision || !bytes.Equal(after.Payload, bad.Payload) {
 			t.Fatalf("the sweep changed the corrupt register (%d -> %d), want it left in place", bad.Revision, after.Revision)

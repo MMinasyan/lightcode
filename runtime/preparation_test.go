@@ -386,7 +386,7 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 	}
 	h, err := harness.New(owner, harness.Dependencies{
 		Storage: store,
-		Prepare: newPreparation(e.svc, e.comp, e.runtime, e.ws, sh.home, e.supply).bind(),
+		Prepare: newPreparation(e.svc, e.comp, e.runtime, e.ws, sh.home, nil, e.supply).bind(),
 	})
 	if err != nil {
 		t.Fatalf("harness.New: %v", err)

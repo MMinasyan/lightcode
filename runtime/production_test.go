@@ -1062,7 +1062,7 @@ func TestProductionTransportConversion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	p := newPreparation(svc, c, runtimeScope, newWorkspaceScopes(owner, c, []*scope{runtimeScope}, obs), sh.home, nil)
+	p := newPreparation(svc, c, runtimeScope, newWorkspaceScopes(owner, c, []*scope{runtimeScope}, obs), sh.home, nil, nil)
 	ref := model.ModelRef{Provider: "prov", Model: "m"}
 	provider, entry, err := snapshot.catalog.Lookup(catalog.ModelRef{Provider: ref.Provider, Model: ref.Model})
 	if err != nil {

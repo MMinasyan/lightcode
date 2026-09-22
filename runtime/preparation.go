@@ -88,20 +88,23 @@ type preparation struct {
 	runtime     *scope
 	workspaces  *workspaceScopes
 	home        string
+	background  BackgroundServices
 	prepare     prepare
 }
 
 // newPreparation wires the binder to the published configuration, the
 // composition with its constructed Runtime scope and Workspace registry, the
-// once-resolved home, and the controlled preparation function; nil selects
-// the concrete production preparation.
-func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, prepare prepare) *preparation {
+// once-resolved home, the background services bridge armed after harness.New
+// returns, and the controlled preparation function; nil selects the concrete
+// production preparation.
+func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, background BackgroundServices, prepare prepare) *preparation {
 	return &preparation{
 		config:      config,
 		composition: c,
 		runtime:     runtime,
 		workspaces:  workspaces,
 		home:        home,
+		background:  background,
 		prepare:     prepare,
 	}
 }
@@ -519,6 +522,7 @@ func (p *preparation) concreteOpener(transport *model.Transport, policy harness.
 			AdmittedEntry: admission.AdmittedEntry,
 			Invocation:    sel.invocation,
 			Constraints:   ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
+			Background:    p.background,
 		}
 		return harness.Execution{
 			Model: func(ctx context.Context, req model.Request) (model.Stream, error) {

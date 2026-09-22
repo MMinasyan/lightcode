@@ -206,9 +206,11 @@ func acceptSettings(plugin Plugin, raw json.RawMessage) error {
 	return fmt.Errorf("plugin %q declares no settings validator but received configuration: %w", plugin.ID, ErrComposition)
 }
 
-// coreExportDecl records one export declared as exactly harness.Storage so
-// the Runtime can later identify the private Core storage binding by type.
-type coreExportDecl struct {
+// typedExportDecl records one export declared as exactly a
+// Harness-recognized interface type — harness.Storage's private Core binding
+// or the harness.JobStopper job-stop seam — so the Runtime can identify it by
+// declared type rather than by ID or value assertion.
+type typedExportDecl struct {
 	plugin string
 	scope  ScopeKind
 	id     string
@@ -218,13 +220,14 @@ type coreExportDecl struct {
 // per-scope construction plans in stable topological order (registration
 // order breaks ties), the ordinary capability universe excluding Core
 // storage exports, the tool-declaration universe feeding the agent parser,
-// and the storage export declarations.
+// the storage export declarations, and the job-stop seam declarations.
 type composition struct {
 	plugins       []Plugin
 	plan          map[ScopeKind][]Plugin
 	capabilityIDs []string
 	toolIDs       []string
-	coreExports   []coreExportDecl
+	coreExports   []typedExportDecl
+	jobStoppers   []typedExportDecl
 
 	// modelAdaptation is the single export ID declared as exactly
 	// ModelAdaptation, or empty when the composition declares none. More than
@@ -255,12 +258,14 @@ func newComposition(plugins []Plugin) (*composition, error) {
 		spec   CapabilitySpec
 	}
 	storageType := reflect.TypeFor[harness.Storage]()
+	jobStopperType := reflect.TypeFor[harness.JobStopper]()
 	all := make(map[string]exportSource)
 	ordinary := make(map[string]exportSource)
 	seenPluginIDs := make(map[string]bool)
 	var capabilityIDs []string
 	var toolIDs []string
-	var coreExports []coreExportDecl
+	var coreExports []typedExportDecl
+	var jobStoppers []typedExportDecl
 	var adaptationExports []string
 	for i, p := range owned {
 		if p.ID == "" {
@@ -307,7 +312,7 @@ func newComposition(plugins []Plugin) (*composition, error) {
 				return nil, fmt.Errorf("plugin %q (%s): capability %q declared as %s requires Runtime scope: %w", p.ID, p.Scope, prov.id, prov.typ, ErrComposition)
 			}
 			if prov.typ == storageType {
-				coreExports = append(coreExports, coreExportDecl{plugin: p.ID, scope: p.Scope, id: prov.id})
+				coreExports = append(coreExports, typedExportDecl{plugin: p.ID, scope: p.Scope, id: prov.id})
 			} else {
 				ordinary[prov.id] = exportSource{plugin: i, spec: prov}
 				capabilityIDs = append(capabilityIDs, prov.id)
@@ -316,6 +321,9 @@ func newComposition(plugins []Plugin) (*composition, error) {
 				}
 				if prov.typ == modelAdaptationType {
 					adaptationExports = append(adaptationExports, prov.id)
+				}
+				if prov.typ == jobStopperType {
+					jobStoppers = append(jobStoppers, typedExportDecl{plugin: p.ID, scope: p.Scope, id: prov.id})
 				}
 			}
 		}
@@ -395,6 +403,7 @@ func newComposition(plugins []Plugin) (*composition, error) {
 		capabilityIDs:   capabilityIDs,
 		toolIDs:         toolIDs,
 		coreExports:     coreExports,
+		jobStoppers:     jobStoppers,
 		modelAdaptation: modelAdaptation,
 	}, nil
 }
