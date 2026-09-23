@@ -332,11 +332,23 @@ func TestManagerLargeBackgroundOutputSpillsAndReadReusesPath(t *testing.T) {
 		MaxLineChars: 80,
 	})
 	fullOutput := numberedLines(25)
+	exitCh := make(chan struct{}, 1)
+	m.SetExitHandler(func(ExitEvent) { exitCh <- struct{}{} })
 	id, err := m.Start("cat <<'EOF'\n"+fullOutput+"EOF\nsleep 2", 0)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer func() { _ = m.Kill(id) }()
+	// Joined exit: the exit handler runs after the child is reaped and its
+	// output copy has finished, so nothing can write the spill file during
+	// TempDir removal.
+	defer func() {
+		_ = m.Kill(id)
+		select {
+		case <-exitCh:
+		case <-time.After(10 * time.Second):
+			t.Error("exit handler not called after Kill")
+		}
+	}()
 
 	first := waitForReadContaining(t, m, id, "saved to:")
 	second, err := m.Read(id)

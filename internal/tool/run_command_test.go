@@ -483,9 +483,14 @@ func TestRunForegroundCommandCompletedBeatsLateEvents(t *testing.T) {
 		dir := t.TempDir()
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
+		reaped := make(chan struct{})
 		origWait := waitCommand
 		waitCommand = func(cmd *exec.Cmd) error {
-			err := origWait(cmd)               // the real child finishes; its output is captured
+			err := origWait(cmd) // the real child finishes; its output is captured
+			// Completion rendezvous: the child is fully reaped before the
+			// hold, so a cancellation fired after this point can only observe
+			// an already-gone process group.
+			close(reaped)
 			time.Sleep(300 * time.Millisecond) // hold the result while the cancellation fires
 			return err
 		}
@@ -498,7 +503,11 @@ func TestRunForegroundCommandCompletedBeatsLateEvents(t *testing.T) {
 			resCh <- result
 			errCh <- err
 		}()
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-reaped:
+		case <-time.After(5 * time.Second):
+			t.Fatal("command did not complete before the cancellation")
+		}
 		cancel()
 		select {
 		case result := <-resCh:
