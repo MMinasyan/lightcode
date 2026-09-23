@@ -84,8 +84,8 @@ func TestRestartDerivesFromInstanceLifetime(t *testing.T) {
 		t.Fatal("the restart became ready under a canceled lifetime")
 	}
 	// A canceled-lifetime start spawns the child and kills it microsecond
-	// later, so whether its "started" line lands is scheduling-dependent
-	// (production fix deferred); 2 launches with no server is legitimate.
+	// later, so whether its "started" line lands is scheduling-dependent;
+	// 2 launches with no server is legitimate.
 	if n := countLaunches(log); n != 1 && n != 2 {
 		t.Fatalf("server launches logged = %d, want 1 or 2: the restart under the canceled lifetime never served", n)
 	}
