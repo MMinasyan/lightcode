@@ -457,27 +457,39 @@ func TestScopeConstructionFailuresRollBackWithoutPublishing(t *testing.T) {
 	}
 }
 
-func TestScopeAcceptsZeroTypedAndCoreStorageValues(t *testing.T) {
+func TestScopeAcceptsZeroTypedAndCoreSeamValues(t *testing.T) {
 	c := mustComposition(t,
-		Plugin{ID: "ok", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[int]("ok.n"), Spec[counted]("ok.c"), Spec[harness.Storage]("ok.store")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"ok.n": 0, "ok.c": (*counterService)(nil), "ok.store": stubCoreStorage{}}}, nil
+		Plugin{ID: "ok", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[int]("ok.n"), Spec[counted]("ok.c"), Spec[harness.Storage]("ok.store"), Spec[harness.JobStopper]("ok.stop")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+			return Instance{Values: map[string]any{"ok.n": 0, "ok.c": (*counterService)(nil), "ok.store": stubCoreStorage{}, "ok.stop": (*stubStopper)(nil)}}, nil
 		}},
 	)
 	if len(c.capabilityIDs) != 2 || c.capabilityIDs[0] != "ok.n" || c.capabilityIDs[1] != "ok.c" {
-		t.Fatalf("capability universe = %q, want the ordinary IDs without the Core storage export", c.capabilityIDs)
+		t.Fatalf("capability universe = %q, want the ordinary IDs without the Core seam exports", c.capabilityIDs)
 	}
 	if len(c.coreExports) != 1 || c.coreExports[0].id != "ok.store" || c.coreExports[0].plugin != "ok" || c.coreExports[0].scope != ScopeRuntime {
 		t.Fatalf("Core storage declarations = %+v, want the one Runtime export", c.coreExports)
+	}
+	if len(c.jobStoppers) != 1 || c.jobStoppers[0].id != "ok.stop" || c.jobStoppers[0].plugin != "ok" || c.jobStoppers[0].scope != ScopeRuntime {
+		t.Fatalf("job-stop declarations = %+v, want the one Runtime export", c.jobStoppers)
 	}
 	sc := mustOpenScope(t, c, context.Background(), runtimeScopeInfo(), nil)
 	if _, ok := sc.storages["ok.store"].(stubCoreStorage); !ok {
 		t.Fatalf("Core storage resolution = %#v, want the supplied stub", sc.storages)
 	}
+	if _, ok := sc.jobStoppers["ok.stop"]; !ok {
+		t.Fatalf("job-stop resolution = %#v, want the supplied value", sc.jobStoppers)
+	}
 	if _, leaked := sc.bindings.entries["ok.store"]; leaked {
 		t.Fatalf("Core storage export leaked into ordinary bindings")
 	}
+	if _, leaked := sc.bindings.entries["ok.stop"]; leaked {
+		t.Fatalf("job-stop export leaked into ordinary bindings")
+	}
 	if _, err := selectCapabilities([]*scope{sc}, []string{"ok.store"}); !errors.Is(err, ErrComposition) {
 		t.Errorf("selecting the Core storage export: %v, want ErrComposition", err)
+	}
+	if _, err := selectCapabilities([]*scope{sc}, []string{"ok.stop"}); !errors.Is(err, ErrComposition) {
+		t.Errorf("selecting the job-stop export: %v, want ErrComposition", err)
 	}
 	if _, err := selectCapabilities([]*scope{sc}, []string{"ok.n", "ok.c"}); err != nil {
 		t.Errorf("selecting ordinary exports: %v", err)

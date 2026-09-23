@@ -283,10 +283,10 @@ func isTypedNil(v any) bool {
 // jobStopper resolves the optional Harness job-stop seam over the Runtime
 // scope: composition recorded every export declared exactly as
 // harness.JobStopper, zero leaves the seam nil, and the single
-// Runtime-scoped export binds after the coreStorage-shape typed-nil check —
-// multiple or narrower-scoped exports fail composition. It runs after the
-// Runtime scope's bindings commit and before Harness construction, so a
-// failure never publishes a Harness.
+// Runtime-scoped export resolves from the scope's private Core seam values
+// after the coreStorage-shape typed-nil check — multiple or narrower-scoped
+// exports fail composition. It runs after the Runtime scope's bindings commit
+// and before Harness construction, so a failure never publishes a Harness.
 func jobStopper(c *composition, runtimeScope *scope) (harness.JobStopper, error) {
 	switch {
 	case len(c.jobStoppers) == 0:
@@ -296,7 +296,7 @@ func jobStopper(c *composition, runtimeScope *scope) (harness.JobStopper, error)
 	case c.jobStoppers[0].scope != ScopeRuntime:
 		return nil, fmt.Errorf("job stopper export %q is %s-scoped: %w", c.jobStoppers[0].id, c.jobStoppers[0].scope, ErrComposition)
 	}
-	stopper := runtimeScope.bindings.entries[c.jobStoppers[0].id].value.(harness.JobStopper)
+	stopper := runtimeScope.jobStoppers[c.jobStoppers[0].id].(harness.JobStopper)
 	if isTypedNil(stopper) {
 		return nil, fmt.Errorf("job stopper export %q supplies a typed-nil harness.JobStopper: %w", c.jobStoppers[0].id, ErrComposition)
 	}

@@ -47,8 +47,10 @@ func EqualEventForTest(a, b Event) bool {
 
 // ComposeScopeForTest opens the given plugins as one Runtime scope through
 // the composition machinery — every dependency binding is constructed
-// in-package — and returns the bound capability values by ID together with
-// the scope disposal. It is absent from production builds.
+// in-package — and returns the bound capability values by ID (ordinary
+// bindings plus the private Core seam values a Harness consumer wires, such
+// as the job stopper) together with the scope disposal. It is absent from
+// production builds.
 func ComposeScopeForTest(ctx context.Context, info ScopeInfo, plugins []Plugin) (map[string]any, func() error, error) {
 	c, err := newComposition(plugins)
 	if err != nil {
@@ -58,9 +60,12 @@ func ComposeScopeForTest(ctx context.Context, info ScopeInfo, plugins []Plugin) 
 	if err != nil {
 		return nil, nil, err
 	}
-	values := make(map[string]any, len(sc.bindings.entries))
+	values := make(map[string]any, len(sc.bindings.entries)+len(sc.jobStoppers))
 	for id, entry := range sc.bindings.entries {
 		values[id] = entry.value
+	}
+	for id, value := range sc.jobStoppers {
+		values[id] = value
 	}
 	return values, sc.close, nil
 }
