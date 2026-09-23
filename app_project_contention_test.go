@@ -1,6 +1,8 @@
 package main
 
 import (
+	"time"
+
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
@@ -33,6 +34,7 @@ func TestWailsProjectContentionProductionPaths(t *testing.T) {
 	app.started = true
 	app.setCurrentSessionID(sourceID)
 	app.seedPresented(sourceID)
+	t.Cleanup(func() { app.shutdown(context.Background()) })
 	if err := os.WriteFile(filepath.Join(svc.ProjectRoot(), "visible.txt"), []byte("source"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -43,12 +45,34 @@ func TestWailsProjectContentionProductionPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	start := time.Now()
-	if _, err = app.SessionList("active"); err != nil || time.Since(start) > time.Second {
-		t.Fatalf("present Wails SessionList = %v after %v", err, time.Since(start))
+	// The reads must complete while another process holds the identity lock:
+	// completion is the positive fact and the failsafe turns a blocking
+	// regression into a failure, with no machine-speed latency oracle.
+	listDone := make(chan error, 1)
+	go func() {
+		_, err := app.SessionList("active")
+		listDone <- err
+	}()
+	select {
+	case err := <-listDone:
+		if err != nil {
+			t.Fatalf("present Wails SessionList = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SessionList blocked on the held identity lock")
 	}
-	if _, err = app.ProjectCurrent(); err != nil || time.Since(start) > time.Second {
-		t.Fatalf("present Wails ProjectCurrent = %v after %v", err, time.Since(start))
+	currentDone := make(chan error, 1)
+	go func() {
+		_, err := app.ProjectCurrent()
+		currentDone <- err
+	}()
+	select {
+	case err := <-currentDone:
+		if err != nil {
+			t.Fatalf("present Wails ProjectCurrent = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ProjectCurrent blocked on the held identity lock")
 	}
 	if result, readErr := app.ReadFileContent(sourceID, "visible.txt"); readErr != nil || result.Content != "source" {
 		t.Fatalf("present Wails ReadFileContent = %q, %v", result.Content, readErr)
@@ -88,7 +112,6 @@ func TestWailsProjectContentionProductionPaths(t *testing.T) {
 	if sessions, listErr := svc.SessionListForProjectPath(other, "active"); listErr == nil && len(sessions) != 0 {
 		t.Fatalf("contended existing destination published %d sessions", len(sessions))
 	}
-	app.shutdown(context.Background())
 }
 
 func TestWailsStartupProjectBusyThenSessionNewRetries(t *testing.T) {
@@ -100,6 +123,7 @@ func TestWailsStartupProjectBusyThenSessionNewRetries(t *testing.T) {
 	app := newTestApp(svc)
 	app.emitFn = func(string, any) {}
 	app.titleFn = func(string) {}
+	t.Cleanup(func() { app.shutdown(context.Background()) })
 	output := captureStderrForAppTest(t, func() { app.startup(context.Background()) })
 	if app.currentSessionID() != "" {
 		t.Fatalf("busy startup selected session %q", app.currentSessionID())
@@ -113,7 +137,6 @@ func TestWailsStartupProjectBusyThenSessionNewRetries(t *testing.T) {
 	if err := app.SessionNew(); err != nil {
 		t.Fatalf("SessionNew after project holder release: %v", err)
 	}
-	app.shutdown(context.Background())
 }
 
 func captureStderrForAppTest(t *testing.T, fn func()) string {

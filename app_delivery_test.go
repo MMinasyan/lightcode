@@ -219,6 +219,7 @@ func TestWailsStartupRealCommittedCreationAdoptsWithoutBoundary(t *testing.T) {
 	}
 	t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
 	app.startup(context.Background())
+	t.Cleanup(func() { app.shutdown(context.Background()) })
 	if app.currentSessionID() == "" {
 		t.Fatal("startup did not adopt committed destination")
 	}
@@ -707,8 +708,12 @@ func TestWailsDeliveryDropsTitleAfterClose(t *testing.T) {
 		t.Fatal("closeDelivery did not return")
 	}
 
-	close(release)                     // unblock the emit; the drainer reaches the title step
-	time.Sleep(100 * time.Millisecond) // give it a chance to (wrongly) apply the title
+	close(release) // unblock the emit; the drainer reaches the title step
+	select {
+	case <-a.deliveryDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainer did not exit after close")
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -785,8 +790,12 @@ func TestWailsDeliveryCloseAbandonsBlockedEmit(t *testing.T) {
 		t.Fatal("closeDelivery did not return; blocked drainer not abandoned")
 	}
 
-	close(release)                     // unblock the drainer
-	time.Sleep(100 * time.Millisecond) // give it a chance to (wrongly) emit the queued frame
+	close(release) // unblock the drainer
+	select {
+	case <-a.deliveryDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainer did not exit after close")
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -893,6 +902,7 @@ func TestWailsOrderedDeliveryContract(t *testing.T) {
 		app := &App{svc: ag, agent: ag}
 		app.emitFn = func(string, any) {}
 		app.startup(context.Background())
+		t.Cleanup(func() { app.shutdown(context.Background()) })
 		id := app.currentSessionID()
 		if id == "" {
 			t.Fatal("startup did not establish a current session")
@@ -928,6 +938,7 @@ func TestWailsTurnActionFrameCarriesFailedRevertWarning(t *testing.T) {
 	log := &wailsFrameLog{}
 	app.emitFn = log.append
 	app.startup(context.Background())
+	t.Cleanup(func() { app.shutdown(context.Background()) })
 
 	sourceID := app.currentSessionID()
 	if sourceID == "" {
@@ -1018,6 +1029,7 @@ func TestWailsCodeRevertStaysNoticeOnly(t *testing.T) {
 	log := &wailsFrameLog{}
 	app.emitFn = log.append
 	app.startup(context.Background())
+	t.Cleanup(func() { app.shutdown(context.Background()) })
 	seedAppCompleteTurns(t, ag, 1)
 	path := filepath.Join(ag.ProjectRoot(), "created.txt")
 	entryID, _, err := ag.Store().SnapshotResolvedEntry(1, path, path)
@@ -1068,6 +1080,7 @@ func TestWailsForgedRevertHistoryFailsWithoutFrame(t *testing.T) {
 	log := &wailsFrameLog{}
 	app.emitFn = log.append
 	app.startup(context.Background())
+	t.Cleanup(func() { app.shutdown(context.Background()) })
 	id := seedAppCompleteTurns(t, ag, 3)
 
 	// Settle every seed-derived delivery first (the last appended turn is the
@@ -1109,13 +1122,18 @@ func TestWailsForgedRevertHistoryFailsWithoutFrame(t *testing.T) {
 		t.Fatalf("error = %q, want the owner's unknown-action rejection", err)
 	}
 
-	time.Sleep(15 * time.Millisecond) // let any (forbidden) enqueue drain through the drainer
+	// A sentinel frame joins the drainer's FIFO: the unknown action's own frame,
+	// if one had been enqueued, was appended before this probe, so once the probe
+	// lands every earlier queue position has been emitted or rejected. Nothing may
+	// sit between the baseline and the sentinel.
+	app.emitFrame("revert_probe", nil)
+	waitForWailsFrame(t, log, "revert_probe")
+	probeIdx := wailsFrameIndex(t, log, "revert_probe")
 	log.mu.Lock()
-	n := len(log.frames)
-	frames := append([]wailsTestFrame(nil), log.frames[baseline:]...)
+	frames := append([]wailsTestFrame(nil), log.frames[baseline:probeIdx]...)
 	log.mu.Unlock()
-	if n != baseline {
-		t.Fatalf("forged action delivered %d frame(s): %#v; nothing of any kind may be published for an unknown action", n-baseline, frames)
+	if probeIdx != baseline {
+		t.Fatalf("forged action delivered %d frame(s): %#v; nothing of any kind may be published for an unknown action", probeIdx-baseline, frames)
 	}
 
 	msgs, err := ag.SessionMessagesFor(id)
@@ -2247,6 +2265,9 @@ func wailsPermissionPendingApp(t *testing.T) (*App, string, string, *wailsFrameL
 	log := &wailsFrameLog{}
 	app.emitFn = log.append
 	app.startup(context.Background())
+	// Registered after startup so LIFO runs it before the TempDir removals from
+	// newAppTestAgentAt: the turn goroutine must finish writing before cleanup.
+	t.Cleanup(func() { app.shutdown(context.Background()) })
 
 	id := app.currentSessionID()
 	if id == "" {
