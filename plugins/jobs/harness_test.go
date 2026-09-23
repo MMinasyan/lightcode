@@ -61,7 +61,7 @@ func TestStopJobReaperBarrierAndHarnessStopDelivery(t *testing.T) {
 	callbackGate := make(chan struct{})
 	deliveryErr := make(chan error, 1)
 	if err := h.StartJob(context.Background(), sid, jobID, func(_ context.Context, completionID string) error {
-		return j.Start(context.Background(), StartRequest{
+		return j.Start(StartRequest{
 			JobID: jobID, SessionID: sid, Workspace: t.TempDir(),
 			Command: "sleep 30", Env: os.Environ(),
 			OnExit: func(ExitResult) {

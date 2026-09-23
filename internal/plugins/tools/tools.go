@@ -597,8 +597,8 @@ func (t runCommandTool) backgroundOutcome(ctx context.Context, callID, command s
 	if err != nil {
 		return backgroundStartOutcome(callID, err)
 	}
-	err = tc.Background.StartJob(ctx, sessionID, jobID, func(ctx context.Context, completionID string) error {
-		return jobsInst.Start(ctx, jobs.StartRequest{
+	err = tc.Background.StartJob(ctx, sessionID, jobID, func(_ context.Context, completionID string) error {
+		return jobsInst.Start(jobs.StartRequest{
 			JobID:      jobID,
 			SessionID:  sessionID,
 			Workspace:  tc.Workspace,

@@ -82,7 +82,7 @@ func armTestReaper(t *testing.T, inst *instance) (release func()) {
 // start runs one reserved start, failing the test on error.
 func start(t *testing.T, j *instance, req StartRequest) string {
 	t.Helper()
-	if err := j.Start(context.Background(), req); err != nil {
+	if err := j.Start(req); err != nil {
 		t.Fatalf("Start(%q): %v", req.Command, err)
 	}
 	return req.JobID
@@ -173,7 +173,7 @@ func TestStartReadKillListLiveRetainedTexts(t *testing.T) {
 	}
 	// A second Start over an already-running record fails the retained
 	// unknown-ID check and leaves the record in place.
-	if err := j.Start(context.Background(), StartRequest{JobID: emptyID, SessionID: sid, Command: "printf hijack", Env: os.Environ()}); err == nil || err.Error() != unknownIDText(emptyID) {
+	if err := j.Start(StartRequest{JobID: emptyID, SessionID: sid, Command: "printf hijack", Env: os.Environ()}); err == nil || err.Error() != unknownIDText(emptyID) {
 		t.Fatalf("Start over a running record = %v, want %q", err, unknownIDText(emptyID))
 	}
 	if got := j.Live(sid); !slices.Equal(got, []string{emptyID}) {
@@ -217,7 +217,7 @@ func TestStartReadKillListLiveRetainedTexts(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("the gated exit callback did not run")
 	}
-	if err := j.Start(context.Background(), StartRequest{JobID: gatedID, SessionID: sid, Command: "printf x", Env: os.Environ()}); err == nil || err.Error() != unknownIDText(gatedID) {
+	if err := j.Start(StartRequest{JobID: gatedID, SessionID: sid, Command: "printf x", Env: os.Environ()}); err == nil || err.Error() != unknownIDText(gatedID) {
 		t.Fatalf("Start over an exited record = %v, want %q", err, unknownIDText(gatedID))
 	}
 	exitedLine := j.List(sid)
@@ -404,7 +404,7 @@ func TestStartRejectedAtSessionLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reserve: %v", err)
 	}
-	err = j.Start(context.Background(), StartRequest{
+	err = j.Start(StartRequest{
 		JobID: blockedID, SessionID: first, Command: "sleep 30", Env: os.Environ(), Config: cfg,
 		OnExit: func(r ExitResult) { blockedExit <- r },
 	})
@@ -414,7 +414,7 @@ func TestStartRejectedAtSessionLimit(t *testing.T) {
 	}
 	// The limit failure consumed the reservation: the same identity fails the
 	// retained unknown-ID error.
-	err = j.Start(context.Background(), StartRequest{
+	err = j.Start(StartRequest{
 		JobID: blockedID, SessionID: first, Command: "sleep 30", Env: os.Environ(), Config: cfg,
 	})
 	if err == nil || err.Error() != unknownIDText(blockedID) {
@@ -515,14 +515,14 @@ func TestStartInvalidConfigConsumesReservation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Reserve: %v", err)
 		}
-		err = j.Start(context.Background(), StartRequest{
+		err = j.Start(StartRequest{
 			JobID: id, SessionID: "session-bad-config", Command: "printf x", Env: os.Environ(),
 			Config: []byte(row.config),
 		})
 		if err == nil || !strings.HasPrefix(err.Error(), row.want) {
 			t.Fatalf("Start with Config %s = %v, want prefix %q", row.config, err, row.want)
 		}
-		err = j.Start(context.Background(), StartRequest{
+		err = j.Start(StartRequest{
 			JobID: id, SessionID: "session-bad-config", Command: "printf x", Env: os.Environ(),
 			Config: []byte(row.config),
 		})
@@ -548,7 +548,7 @@ func TestReserveAbortThenStartFailsUnknownID(t *testing.T) {
 	j.Abort(id)
 	j.Abort(id)         // idempotent
 	j.Abort("00000000") // absent stays a no-op
-	err = j.Start(context.Background(), StartRequest{JobID: id, SessionID: sid, Command: "printf x", Env: os.Environ()})
+	err = j.Start(StartRequest{JobID: id, SessionID: sid, Command: "printf x", Env: os.Environ()})
 	if err == nil || err.Error() != unknownIDText(id) {
 		t.Fatalf("Start after Abort = %v, want %q", err, unknownIDText(id))
 	}
@@ -589,7 +589,7 @@ func TestStopJobAcrossStates(t *testing.T) {
 	if _, ok := stateOf(j, reservedID); ok {
 		t.Fatal("StopJob left the reservation in place")
 	}
-	err = j.Start(context.Background(), StartRequest{JobID: reservedID, SessionID: sid, Command: "printf x", Env: os.Environ()})
+	err = j.Start(StartRequest{JobID: reservedID, SessionID: sid, Command: "printf x", Env: os.Environ()})
 	if err == nil || err.Error() != unknownIDText(reservedID) {
 		t.Fatalf("Start after StopJob removed the reservation = %v, want %q", err, unknownIDText(reservedID))
 	}
@@ -850,7 +850,7 @@ func TestCloseKillsStraysAndGatesCallbacks(t *testing.T) {
 	if _, err := j.Reserve(); err == nil || err.Error() != "process: manager is closed" {
 		t.Fatalf("Reserve after Close = %v, want the retained closed error", err)
 	}
-	err := j.Start(context.Background(), StartRequest{JobID: "deadbeef", SessionID: sid, Command: "printf x", Env: os.Environ()})
+	err := j.Start(StartRequest{JobID: "deadbeef", SessionID: sid, Command: "printf x", Env: os.Environ()})
 	if err == nil || err.Error() != "process: manager is closed" {
 		t.Fatalf("Start after Close = %v, want the retained closed error", err)
 	}

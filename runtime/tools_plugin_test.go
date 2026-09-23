@@ -121,7 +121,7 @@ func (f *fakeJobs) Reserve() (string, error) {
 
 func (f *fakeJobs) Abort(jobID string) { f.aborted = append(f.aborted, jobID) }
 
-func (f *fakeJobs) Start(_ context.Context, req jobs.StartRequest) error {
+func (f *fakeJobs) Start(req jobs.StartRequest) error {
 	f.started = append(f.started, req)
 	return f.startErr
 }
@@ -1904,7 +1904,7 @@ func reserveAndStart(t *testing.T, jobsInst jobs.Jobs, workspace, command string
 	if err != nil {
 		t.Fatalf("Reserve: %v", err)
 	}
-	if err := jobsInst.Start(context.Background(), jobs.StartRequest{
+	if err := jobsInst.Start(jobs.StartRequest{
 		JobID:     id,
 		SessionID: testSessionID,
 		Workspace: workspace,

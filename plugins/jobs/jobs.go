@@ -77,9 +77,9 @@ type StartRequest struct {
 // per-Session start/read/kill/list/live over background processes, and the
 // total StopJob (also exported separately as the Harness job-stop seam).
 type Jobs interface {
-	Reserve() (string, error) // mint an 8-hex job ID (crypto/rand, the newProcessID shape) and register it reserved
-	Abort(jobID string)       // resolve a reservation that will not start; idempotent
-	Start(ctx context.Context, req StartRequest) error
+	Reserve() (string, error)     // mint an 8-hex job ID (crypto/rand, the newProcessID shape) and register it reserved
+	Abort(jobID string)           // resolve a reservation that will not start; idempotent
+	Start(req StartRequest) error // start the reserved job; only its timeout or an explicit stop ends the process
 	Read(sessionID, jobID string) (string, error)
 	Kill(sessionID, jobID string) error
 	List(sessionID string) string
@@ -225,9 +225,9 @@ func (j *instance) Abort(jobID string) {
 // the identified reserved record when it is one. The capability mutex spans
 // the closed, reserved-record, config, and limit checks through cmd.Start and
 // the running registration, so a child is either registered before a close or
-// never starts after it. The process is not bound to the caller context: only
+// never starts after it. The process is not cancellable through its start: only
 // its timeout or an explicit stop ends it.
-func (j *instance) Start(_ context.Context, req StartRequest) error {
+func (j *instance) Start(req StartRequest) error {
 	j.mu.Lock()
 	if j.closed {
 		j.mu.Unlock()
