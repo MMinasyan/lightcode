@@ -394,6 +394,7 @@ func TestPublicTurnLifecycle(t *testing.T) {
 		if got := texts(script.seen()[1]); got[0] != "system" || got[1] != "hello" || got[2] != "done" || got[3] != "queued-1" {
 			t.Fatalf("second projection = %v, want the first turn's committed history before the queued input", got)
 		}
+		awaitTerminal(t, f.h, session, "op-2") // the settlement commits before the convergence cancellation
 		if err := converge(t, f); err != nil {
 			t.Fatalf("Wait: %v", err)
 		}
@@ -1422,6 +1423,7 @@ func TestPublicBufferedItemFailure(t *testing.T) {
 
 			<-f.prepare // the failed item was dropped and the next one admitted
 			<-script.arrived
+			awaitTerminal(t, f.h, session, "op-3") // the settlement commits before the convergence cancellation
 			if err := converge(t, f); err != nil {
 				t.Fatalf("Wait: %v", err)
 			}
@@ -1466,6 +1468,7 @@ func TestPublicBufferedItemFailure(t *testing.T) {
 			<-script.arrived
 			<-f.prepare // q1's failed terminal let the drain admit the next item
 			<-script.arrived
+			awaitTerminal(t, f.h, session, "op-3") // the settlement commits before the convergence cancellation
 			if err := converge(t, f); err != nil {
 				t.Fatalf("Wait: %v", err)
 			}
@@ -1522,6 +1525,7 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 			if got := texts(script.seen()[1]); got[0] != "system" || got[1] != "hello" || got[2] != "done" || got[3] != "at-boundary" {
 				t.Fatalf("continuation projection = %v, want the boundary steering in the same Operation", got)
 			}
+			awaitTerminal(t, f.h, session, "op-1") // the settlement commits before the convergence cancellation
 			if err := converge(t, f); err != nil {
 				t.Fatalf("Wait: %v", err)
 			}
@@ -1567,6 +1571,7 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 			<-script.arrived
 			<-f.prepare // the drain admitted the boundary item after the terminal commit
 			<-script.arrived
+			awaitTerminal(t, f.h, session, "op-2") // the settlement commits before the convergence cancellation
 			if err := converge(t, f); err != nil {
 				t.Fatalf("Wait: %v", err)
 			}
