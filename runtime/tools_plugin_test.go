@@ -389,6 +389,9 @@ type toolsHarnessOpts struct {
 	background  runtime.BackgroundServices
 	invocation  runtime.Invocation
 	managedKeys []string
+	// store, when non-nil, is the durable store behind the fixture's
+	// Harness; the zero value opens a temporary SQLite store.
+	store harness.Storage
 	// extraPlugin, when non-empty, composes beside the tools plugin in the
 	// same scope, and extraToolID is additionally bound as a tool export —
 	// the fixture's seam for a caller-owned plugin's tool.
@@ -396,7 +399,7 @@ type toolsHarnessOpts struct {
 	extraToolID string
 }
 
-// toolsHarness is one real Harness over real temporary SQLite whose
+// toolsHarness is one real Harness over one durable store whose
 // execution's normalization and preparation callbacks are the real plugin
 // tool values, wired with the admitted identity and the durable capture's
 // constraints exactly as production preparation wires them.
@@ -405,7 +408,7 @@ type toolsHarness struct {
 	h         *harness.Harness
 	dataDir   string
 	workspace string
-	store     *storage.SQLite
+	store     harness.Storage
 
 	mu        sync.Mutex
 	admission harness.EntryRef
@@ -422,11 +425,15 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 	dataDir := t.TempDir()
 	workspace := t.TempDir()
 
-	store, err := storage.OpenSQLite(filepath.Join(dataDir, "lightcode.db"))
-	if err != nil {
-		t.Fatalf("OpenSQLite: %v", err)
+	store := opts.store
+	if store == nil {
+		opened, err := storage.OpenSQLite(filepath.Join(dataDir, "lightcode.db"))
+		if err != nil {
+			t.Fatalf("OpenSQLite: %v", err)
+		}
+		t.Cleanup(func() { _ = opened.Close() })
+		store = opened
 	}
-	t.Cleanup(func() { _ = store.Close() })
 
 	jobsPlugin := opts.jobsPlugin
 	if jobsPlugin.ID == "" {

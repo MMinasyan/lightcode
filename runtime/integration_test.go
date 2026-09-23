@@ -314,7 +314,11 @@ func awaitOperation(t *testing.T, r *Runtime, sessionID, operationID string, wan
 			return rec
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("operation %q never settled to %v (read error %v, status %v)", operationID, want, err, rec.State.Status)
+			var detail string
+			if rec.State.Terminal != nil {
+				detail = rec.State.Terminal.Detail
+			}
+			t.Fatalf("operation %q never settled to %v (read error %v, status %v, detail %q)", operationID, want, err, rec.State.Status, detail)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
