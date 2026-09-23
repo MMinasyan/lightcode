@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -771,24 +770,37 @@ func TestStopConcurrentCallersJoinSameError(t *testing.T) {
 	}
 
 	// The first stop owns the interval and parks at the gated job. The two
-	// joiners signal entry immediately before their Stop calls while that
-	// interval is provably open; the rendezvous receives both entries, then
-	// the gate releases — the joiners have the owner's whole convergence,
-	// including the stopper's completion delivery, as their runway to join
-	// the interval, and cannot return before the owner converges.
+	// joiners call Stop against the provably open interval; the rendezvous
+	// polls the interval's observed joiner count under the coordinator lock
+	// until both are parked inside it, and only then the gate releases: the
+	// joiners cannot return before the owner converges, and an early
+	// returning or never joining caller is caught by the count.
 	ownerDone := make(chan error, 1)
 	go func() { ownerDone <- h.Stop(context.Background(), testSessionID) }()
-	awaitStopInterval(t, cachedCoordinator(t, h, testSessionID), ownerDone)
-	joinerEntered := make(chan struct{}, 2)
+	c = cachedCoordinator(t, h, testSessionID)
+	awaitStopInterval(t, c, ownerDone)
 	joinerDone := make(chan error, 2)
 	for i := 0; i < 2; i++ {
 		go func() {
-			joinerEntered <- struct{}{}
 			joinerDone <- h.Stop(context.Background(), testSessionID)
 		}()
 	}
-	<-joinerEntered
-	<-joinerEntered
+	joinDeadline := time.Now().Add(5 * time.Second)
+	for {
+		c.mu.Lock()
+		joined := 0
+		if c.stop != nil {
+			joined = c.stop.joiners
+		}
+		c.mu.Unlock()
+		if joined >= 2 {
+			break
+		}
+		if time.Now().After(joinDeadline) {
+			t.Fatalf("the Stop joiners never joined the live interval (joined=%d)", joined)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 
 	close(gate) // the job finishes: the owner collects the child error and stores it
 	err = stopResult(t, ownerDone)
@@ -983,11 +995,11 @@ func TestStopHeldPreparationRegistersAfterReopen(t *testing.T) {
 	var (
 		hold    = make(chan struct{}) // parks the launch's preparation before any registration
 		release = make(chan struct{})
-		preps   atomic.Int32
+		arrived = make(chan struct{}, 1) // the child's preparation entering the stub
 	)
 	prepare := func(ctx context.Context, req PreparationRequest) (PreparedExecution, error) {
-		preps.Add(1)
 		if req.Session.Identity.ParentSessionID != "" { // the launch's preparation parks; the root's does not
+			arrived <- struct{}{}
 			<-hold
 			return modelPrepared(quickModel()), nil
 		}
@@ -1023,15 +1035,10 @@ func TestStopHeldPreparationRegistersAfterReopen(t *testing.T) {
 		_, err := h.LaunchChildSession(context.Background(), launchRequestFor(root))
 		launchDone <- err
 	}()
-	// The launch's preparation has entered the stub and parks on hold before
-	// any registration: the root's submit prepared once, so the count reaching
-	// 2 is the child's preparation arriving.
-	prepareDeadline := time.Now().Add(5 * time.Second)
-	for preps.Load() < 2 {
-		if time.Now().After(prepareDeadline) {
-			t.Fatal("the launch's preparation never entered")
-		}
-		time.Sleep(2 * time.Millisecond)
+	select { // the launch's preparation entered the stub and parks on hold before any registration
+	case <-arrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the launch's preparation never entered")
 	}
 
 	close(gate) // the stop completes and reopens; the kill-completion steers without a register write

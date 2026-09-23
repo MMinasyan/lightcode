@@ -48,10 +48,13 @@ type launchInfo struct {
 }
 
 // stopInterval is one stop's join handle: err is written before done closes
-// (the workspaceAttempt pattern, runtime/composition.go:673-677).
+// (the workspaceAttempt pattern, runtime/composition.go:673-677). joiners
+// counts the callers observed joining under the coordinator lock, so a test
+// can rendezvous on every joiner being parked before it releases the owner.
 type stopInterval struct {
-	done chan struct{}
-	err  error
+	done    chan struct{}
+	err     error
+	joiners int
 }
 
 // admitBackgroundMember registers one background member on the Session's
@@ -547,6 +550,7 @@ func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 	c.mu.Lock()
 	if c.stop != nil { // a concurrent stop owns the interval: join it and return its stored error
 		interval := c.stop
+		interval.joiners++
 		c.mu.Unlock()
 		<-interval.done // err is written before done closes
 		return interval.err
