@@ -26,7 +26,7 @@ import (
 // the unavailable one (the retained partial-server behavior).
 func TestMixedDetectionReturnsAvailableServerContent(t *testing.T) {
 	fakeHome, requests := fakeServerHome(t, 0)
-	pyrightLog := plantServer(t, fakeHome, "pyright", "pyright-langserver", 0, "1")
+	pyrightLog := plantServer(t, fakeHome, "pyright", "pyright-langserver", 0, "1", "")
 	spy := &managerSpy{}
 	spy.install(t, fakeHome)
 	dataDir := t.TempDir()

@@ -30,15 +30,18 @@ import (
 
 // fakeServerTemplate is a minimal LSP server over stdio that logs every
 // launch and request as "method uri" lines. {{LOG}} is the log path, {{DELAY}}
-// the initialize delay in seconds (holds detection), and {{CRASH}} a crash
+// the initialize delay in seconds (holds detection), {{CRASH}} a crash
 // mode ("1" exits after initialize, before readiness — the crash loop drives
-// the instance into the terminal failed state).
+// the instance into the terminal failed state), and {{HOLD}} a file path
+// that parks the initialize handler (after logging the request, before
+// responding) until the file exists.
 const fakeServerTemplate = `#!/usr/bin/env python3
-import json, sys, time
+import json, os, sys, time
 
 log = "{{LOG}}"
 init_delay = {{DELAY}}
 crash = "{{CRASH}}"
+hold = "{{HOLD}}"
 
 def send(obj):
     data = json.dumps(obj, separators=(",", ":")).encode()
@@ -71,6 +74,8 @@ while True:
     with open(log, "a") as f:
         f.write(entry + "\n")
     if method == "initialize":
+        while hold and not os.path.exists(hold):
+            time.sleep(0.01)
         if init_delay:
             time.sleep(init_delay)
         send({"jsonrpc": "2.0", "id": body["id"], "result": {"capabilities": {}}})
@@ -138,14 +143,14 @@ func (s *managerSpy) home() string {
 func fakeServerHome(t *testing.T, initDelay float64) (home, requests string) {
 	t.Helper()
 	home = t.TempDir()
-	requests = plantServer(t, home, "gopls", "gopls", initDelay, "")
+	requests = plantServer(t, home, "gopls", "gopls", initDelay, "", "")
 	return home, requests
 }
 
 // plantServer plants one fake server binary at the definition's cache
 // directory (home/.cache/lightcode/lsp/<dirName>/<binaryName>) and returns
 // its request-log path.
-func plantServer(t *testing.T, home, dirName, binaryName string, initDelay float64, crash string) string {
+func plantServer(t *testing.T, home, dirName, binaryName string, initDelay float64, crash, hold string) string {
 	t.Helper()
 	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", dirName)
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
@@ -155,6 +160,7 @@ func plantServer(t *testing.T, home, dirName, binaryName string, initDelay float
 	script := strings.ReplaceAll(fakeServerTemplate, "{{LOG}}", requests)
 	script = strings.ReplaceAll(script, "{{DELAY}}", fmt.Sprintf("%g", initDelay))
 	script = strings.ReplaceAll(script, "{{CRASH}}", crash)
+	script = strings.ReplaceAll(script, "{{HOLD}}", hold)
 	if err := os.WriteFile(filepath.Join(cacheDir, binaryName), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +501,9 @@ func TestDetectionUnderCanceledRuntimeYieldsNoUsableServers(t *testing.T) {
 // finish before shutting the managers down, and every server the detection
 // started is torn down.
 func TestCloseJoinsInFlightDetection(t *testing.T) {
-	fakeHome, requests := fakeServerHome(t, 0.4)
+	fakeHome := t.TempDir()
+	hold := filepath.Join(t.TempDir(), "release")
+	requests := plantServer(t, fakeHome, "gopls", "gopls", 0, "", hold)
 	spy := &managerSpy{}
 	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
@@ -508,27 +516,41 @@ func TestCloseJoinsInFlightDetection(t *testing.T) {
 	}
 	symbol := inst.Values["workspace_symbol"].(runtime.Tool)
 
-	// Start detection as a first authorized use and wait until its server
-	// process is launched: detection is now provably in flight (the 0.4s
-	// initialize delay holds it).
+	// Start detection as a first authorized use and wait until its initialize
+	// handler has logged the request and parked on the hold file: detection is
+	// provably in flight and cannot complete until the test releases it.
 	useCtx, cancelUse := context.WithCancel(context.Background())
 	defer cancelUse()
 	prepared := symbol.Prepare(useCtx, runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"x"}`))
 	go prepared.Execute(useCtx)
-	waitForLog(t, requests, "started", 1)
+	waitForLog(t, requests, "initialize", 1)
 
-	// Close while detection is in flight: it must join before returning.
-	start := time.Now()
-	if err := inst.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	// Close must join the parked detection: a joining Close cannot return
+	// while its join target is parked, so this window is structurally held —
+	// an abandoning Close returns early and is caught by it.
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- inst.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned while the in-flight detection was still parked: %v", err)
+	case <-time.After(200 * time.Millisecond):
 	}
-	if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
-		t.Fatalf("Close returned after %s; it must join the in-flight detection (init delay 0.4s)", elapsed)
+
+	// Release the park: the detection completes and the joined Close returns.
+	if err := os.WriteFile(hold, []byte("go"), 0o644); err != nil {
+		t.Fatalf("release the parked detection: %v", err)
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return after the detection completed")
 	}
 	if n := spy.count(); n != 1 {
 		t.Fatalf("workspace managers constructed = %d, want 1", n)
 	}
-	waitForLog(t, requests, "initialize", 1)
 }
 
 // TestDeniedAndPreparedCallsStartNothing: preparation of both tools, and a
