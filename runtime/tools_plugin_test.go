@@ -673,20 +673,13 @@ func TestComposedToolsHarnessRecovery(t *testing.T) {
 	ctx := context.Background()
 	arrived := make(chan struct{}, 1)
 	release := make(chan struct{})
-	modelFn := func(ctx context.Context, _ model.Request) (model.Stream, error) {
+	modelFn := func(_ context.Context, _ model.Request) (model.Stream, error) {
 		select {
 		case arrived <- struct{}{}:
 		default:
 		}
-		// Park on the release or the execution context: harness cancellation
-		// in cleanup must unblock the parked goroutine instead of letting it
-		// write into a closed store.
-		select {
-		case <-release:
-			return nil, errors.New("released after convergence")
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+		<-release
+		return nil, errors.New("released after convergence")
 	}
 	th := newToolsHarness(t, modelFn)
 	session := th.createSession()
