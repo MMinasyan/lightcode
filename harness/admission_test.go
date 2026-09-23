@@ -1480,12 +1480,15 @@ func TestOwnCaptureOwnsCapabilitySelection(t *testing.T) {
 
 // TestAdmittedOperationCarriesRegisterRevision proves the admitted Operation
 // record carries the revision storage assigned to its register at insert, in
-// both the returned value and the coordinator view a later read observes.
+// both the returned value and the coordinator view a later read observes. The
+// admission goes through the reserved path without an auto-started execution:
+// a started Agent replaces the register at its first effect commit, and the
+// view assertion must not race that write.
 func TestAdmittedOperationCarriesRegisterRevision(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
 
-	rec, disposition := mustAdmit(t, h, testSessionID, testOpID, admissionContent("hello"))
+	rec, disposition := mustAdmitWithoutExecution(t, h, testSessionID, testOpID, admissionContent("hello"))
 	if disposition != DispositionAdmitted {
 		t.Fatalf("disposition = %q, want admitted", disposition)
 	}
