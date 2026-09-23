@@ -607,7 +607,7 @@ func (t runCommandTool) backgroundOutcome(ctx context.Context, callID, command s
 			Env:        config.EnvWithoutKeys(os.Environ(), t.inst.managedKeys),
 			Config:     tc.Invocation.Config("jobs"),
 			OnExit: func(er jobs.ExitResult) {
-				tc.Background.DeliverCompletion(context.Background(), sessionID, completionID, legacyCompletionText(er))
+				_ = tc.Background.DeliverCompletion(context.Background(), sessionID, completionID, legacyCompletionText(er)) // terminal for the job's completion; the exit callback has nowhere to propagate
 			},
 		})
 	})

@@ -400,7 +400,7 @@ func (h *Harness) childCompletionSettled(c *coordinator, settledOperationID stri
 	c.pendingCompletion = nil
 	content := childCompletionContent(c.graph, info.outputLimit)
 	c.mu.Unlock()
-	h.DeliverBackgroundCompletion(h.ctx, parentID, info.completionID, content)
+	_ = h.DeliverBackgroundCompletion(h.ctx, parentID, info.completionID, content) // terminal for the pending item; nothing to propagate
 }
 
 // abandonChildCompletion releases one pending completion's process-local
