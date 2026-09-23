@@ -43,7 +43,9 @@ var dangerousReadOnlyFlags = []string{
 	"--textconv",
 }
 
-const readOnlyRunCommandDescription = `Executes a read-only shell command and returns combined stdout and stderr.
+// ReadOnlyRunCommandDescription is the retained read-only run_command
+// description: allowlist/rejected syntax and background bullets.
+const ReadOnlyRunCommandDescription = `Executes a read-only shell command and returns combined stdout and stderr.
 - Only a fixed allowlist of read-only commands runs; anything outside it is rejected, even when harmless. Allowed: ls, cat, grep, find, head, tail, wc, stat, which, pwd, echo, printf, rg, and read-only git (status, log, diff, show, blame, rev-parse). Output redirection (>, >>), command substitution ($(...) or backticks), and write/exec flags (e.g. --output, -exec) are rejected.
 - Each call starts a fresh shell in the project root. Environment variables, aliases, and working directory do not persist between calls. Use "cd /path && command" if you need a different working directory.
 - Foreground commands use the default timeout. Background commands run until they exit, are killed, or reach an explicit timeout parameter.
@@ -65,7 +67,7 @@ func NewReadOnlyRunCommand(inner *RunCommand) *ReadOnlyRunCommand {
 
 func (*ReadOnlyRunCommand) Name() string { return "run_command" }
 func (*ReadOnlyRunCommand) Description() string {
-	return readOnlyRunCommandDescription
+	return ReadOnlyRunCommandDescription
 }
 func (r *ReadOnlyRunCommand) ParametersSchema() map[string]any {
 	return r.inner.ParametersSchema()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -121,7 +122,7 @@ func (r *RunCommand) runBackground(ctx context.Context, command string, timeoutS
 
 func (r *RunCommand) runForeground(ctx context.Context, command string, timeoutSec int) (string, error) {
 	return RunForegroundCommand(ctx, command, r.workspaceRoot, timeoutSec,
-		r.cfg.MaxOutputBytes, r.cfg.ReadLineMaxChars, filepath.Join(r.homeDir, ".lightcode"))
+		r.cfg.MaxOutputBytes, r.cfg.ReadLineMaxChars, filepath.Join(r.homeDir, ".lightcode"), os.Environ())
 }
 
 // waitCommand is the one cmd.Wait seam for foreground commands: the
@@ -132,7 +133,7 @@ var waitCommand = func(cmd *exec.Cmd) error { return cmd.Wait() }
 
 // RunForegroundCommand is the one foreground execution body shared by the
 // legacy run_command tool and the target tools plugin. It runs command
-// through "sh -c" with the inherited environment in dir (empty means the
+// through "sh -c" with the given environment in dir (empty means the
 // current directory), captures combined output within the given limits,
 // spills overflow into spillDir, and converges the process group with
 // SIGTERM/500ms/SIGKILL. timeoutSec at most zero disables the timeout;
@@ -142,7 +143,7 @@ var waitCommand = func(cmd *exec.Cmd) error { return cmd.Wait() }
 // Wait-returned command keeps its real result, a timeout exists only when a
 // timeout was configured and its own timer fired, and a parent-context
 // deadline or cancellation is always cancellation.
-func RunForegroundCommand(ctx context.Context, command, dir string, timeoutSec, maxBytes, maxLineChars int, spillDir string) (string, error) {
+func RunForegroundCommand(ctx context.Context, command, dir string, timeoutSec, maxBytes, maxLineChars int, spillDir string, env []string) (string, error) {
 	parent := ctx
 	if timeoutSec > 0 {
 		if int64(timeoutSec) > int64(math.MaxInt64/time.Second) {
@@ -154,6 +155,7 @@ func RunForegroundCommand(ctx context.Context, command, dir string, timeoutSec, 
 	}
 
 	cmd := exec.Command("sh", "-c", command)
+	cmd.Env = env
 	if dir != "" {
 		cmd.Dir = dir
 	}

@@ -367,10 +367,12 @@ func (v *graphValidation) validateReservations() error {
 	return nil
 }
 
-// validateForkPrefixOwnership verifies the copied-prefix shape: a root
-// Session carries no operationless entries, and in a fork every operationless
-// entry precedes every operation-owned entry, so the copied prefix stays a
-// strict sequence prefix.
+// validateForkPrefixOwnership verifies the copied-prefix shape: a non-fork
+// Session carries no operationless entries except background_completion
+// signals (child-lineage completion history, allowed on every Session and
+// exempt from prefix ordering), and in a fork every other operationless entry
+// precedes every operation-owned entry, so the copied prefix stays a strict
+// sequence prefix.
 func (v *graphValidation) validateForkPrefixOwnership() error {
 	fork := v.graph.Session.Identity.SourceSessionID != ""
 	var maxCopiedSeq, minOwnedSeq int64
@@ -380,6 +382,9 @@ func (v *graphValidation) validateForkPrefixOwnership() error {
 			if minOwnedID == "" || entry.Envelope.Sequence < minOwnedSeq {
 				minOwnedSeq, minOwnedID = entry.Envelope.Sequence, entry.Envelope.ID
 			}
+			continue
+		}
+		if entry.Signal != nil && entry.Signal.Signal == SignalBackgroundCompletion {
 			continue
 		}
 		if !fork {

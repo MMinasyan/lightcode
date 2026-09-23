@@ -74,6 +74,9 @@ func buildAgent() (*agent.Agent, error) {
 	managedEnv, err := config.LoadDotEnv()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: .env: %v\n", err)
+		// A dotenv failure keeps the legacy Agent on nil managed state, so
+		// an already-injected key keeps its key-source classification.
+		managedEnv = nil
 	}
 
 	level := slog.LevelWarn

@@ -968,7 +968,7 @@ func TestConfigurationServiceToolDeclarationsStayDeclarative(t *testing.T) {
 	toolPlugin := Plugin{
 		ID:    "tools",
 		Scope: ScopeRuntime,
-		Provides: []CapabilitySpec{ToolSpec("tool.x", func(Invocation, ToolConstraints) (ToolDescription, error) {
+		Provides: []CapabilitySpec{ToolSpec("tool.x", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 			describeCalled = true
 			return ToolDescription{Definition: model.ToolDefinition{Name: "tool.x", Parameters: json.RawMessage(`{}`)}}, nil
 		})},

@@ -288,6 +288,35 @@ func TestResolvePermissionPolicyBuiltins(t *testing.T) {
 	})
 }
 
+func TestBuiltInAllowsChildLaunchAndProcessOwn(t *testing.T) {
+	builtIn := ResolvePermissionPolicy(nil, nil)
+	concrete := []struct {
+		permission string
+		target     string
+	}{
+		{permissionChildLaunch, "0123456789abcdef0123456789abcdef"},
+		{permissionProcessOwn, "a1b2c3d4"},
+	}
+	for _, req := range concrete {
+		t.Run("built-in "+req.permission+" of "+req.target, func(t *testing.T) {
+			if !builtIn.evaluate("/w", PermissionRequest{req.permission, req.target}) {
+				t.Errorf("built-in %s of %q denied, want allow", req.permission, req.target)
+			}
+		})
+	}
+	denied := ResolvePermissionPolicy(nil, json.RawMessage(levelJSON(rulesJSON(
+		ruleJSON(permissionChildLaunch, "*", permissionAccessDeny),
+		ruleJSON(permissionProcessOwn, "*", permissionAccessDeny),
+	))))
+	for _, req := range concrete {
+		t.Run("user deny decides "+req.permission+" of "+req.target, func(t *testing.T) {
+			if denied.evaluate("/w", PermissionRequest{req.permission, req.target}) {
+				t.Errorf("user deny did not decide %s of %q: allowed, want deny", req.permission, req.target)
+			}
+		})
+	}
+}
+
 func TestPermissionGlobMatcher(t *testing.T) {
 	globs := []struct {
 		name    string

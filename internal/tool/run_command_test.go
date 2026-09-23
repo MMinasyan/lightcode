@@ -438,7 +438,7 @@ func TestRunForegroundCommandCancellationWhileRunningIsDeterministic(t *testing.
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := RunForegroundCommand(ctx, "sleep 5", dir, 60, 0, 0, filepath.Join(dir, ".lightcode"))
+		_, err := RunForegroundCommand(ctx, "sleep 5", dir, 60, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
 		errCh <- err
 	}()
 
@@ -473,7 +473,7 @@ func TestRunForegroundCommandCompletedBeatsLateEvents(t *testing.T) {
 		}
 		defer func() { waitCommand = origWait }()
 
-		result, err := RunForegroundCommand(context.Background(), "printf ok", dir, 1, 0, 0, filepath.Join(dir, ".lightcode"))
+		result, err := RunForegroundCommand(context.Background(), "printf ok", dir, 1, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
 		if err != nil || result != "ok" {
 			t.Fatalf("result = (%q, %v), want the already-finished real result", result, err)
 		}
@@ -494,7 +494,7 @@ func TestRunForegroundCommandCompletedBeatsLateEvents(t *testing.T) {
 		errCh := make(chan error, 1)
 		resCh := make(chan string, 1)
 		go func() {
-			result, err := RunForegroundCommand(ctx, "printf ok", dir, 0, 0, 0, filepath.Join(dir, ".lightcode"))
+			result, err := RunForegroundCommand(ctx, "printf ok", dir, 0, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
 			resCh <- result
 			errCh <- err
 		}()
@@ -517,7 +517,7 @@ func TestRunForegroundCommandTimeoutOverflowRejectedBeforeLaunch(t *testing.T) {
 	dir := t.TempDir()
 	probe := filepath.Join(dir, "overflow-launched")
 
-	_, err := RunForegroundCommand(context.Background(), "touch "+probe, dir, int(math.MaxInt64/int64(time.Second))+1, 0, 0, filepath.Join(dir, ".lightcode"))
+	_, err := RunForegroundCommand(context.Background(), "touch "+probe, dir, int(math.MaxInt64/int64(time.Second))+1, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
 	if err == nil || !strings.Contains(err.Error(), "overflows the seconds-to-duration conversion") {
 		t.Fatalf("err = %v, want the overflow rejection", err)
 	}
@@ -534,7 +534,7 @@ func TestRunForegroundCommandParentDeadlineIsCancellation(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(1*time.Second))
 	defer cancel()
 
-	_, err := RunForegroundCommand(ctx, "sleep 5", dir, 0, 0, 0, filepath.Join(dir, ".lightcode"))
+	_, err := RunForegroundCommand(ctx, "sleep 5", dir, 0, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
 	var exitErr *ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode != -1 || !strings.HasPrefix(exitErr.Output, "command cancelled") {
 		t.Fatalf("err = %v, want the cancellation classification for a parent deadline", err)
@@ -585,11 +585,48 @@ func TestNormalizeRunCommandArgs(t *testing.T) {
 		`{"command":"ls","timeout":null}`,
 		`{"command":"ls","timeout":9223372036854775808}`,
 		`{"command":"ls","timeout":9223372037}`,
-		`{"command":"ls","background":null}`,
-		`{"command":"ls","background":false}`,
 	} {
 		if _, err := NormalizeRunCommandArgs(decode(t, raw), 120); err == nil {
 			t.Errorf("NormalizeRunCommandArgs(%s) accepted, want rejection", raw)
+		}
+	}
+	for _, raw := range []string{
+		`{"command":"ls","background":null}`,
+		`{"command":"ls","background":0}`,
+		`{"command":"ls","background":"later"}`,
+	} {
+		if _, err := NormalizeRunCommandArgs(decode(t, raw), 120); err == nil || err.Error() != "run_command: background must be a boolean" {
+			t.Errorf("NormalizeRunCommandArgs(%s) = %v, want the boolean-consumption error", raw, err)
+		}
+	}
+
+	// Present background booleans are preserved, an absent one is written as
+	// false, and the background timeout rule (absent/sub-one -> 0) applies
+	// only when background is true.
+	backgroundCases := []struct {
+		raw            string
+		wantBackground bool
+		wantTimeout    int
+	}{
+		{`{"command":"ls"}`, false, 120},
+		{`{"command":"ls","background":false}`, false, 120},
+		{`{"command":"ls","background":false,"timeout":5}`, false, 5},
+		{`{"command":"ls","background":true}`, true, 0},
+		{`{"command":"ls","background":true,"timeout":0}`, true, 0},
+		{`{"command":"ls","background":true,"timeout":-3}`, true, 0},
+		{`{"command":"ls","background":true,"timeout":5}`, true, 5},
+	}
+	for _, tc := range backgroundCases {
+		normalized, err := NormalizeRunCommandArgs(decode(t, tc.raw), 120)
+		if err != nil {
+			t.Errorf("NormalizeRunCommandArgs(%s) = %v, want accepted", tc.raw, err)
+			continue
+		}
+		if got, ok := normalized["background"].(bool); !ok || got != tc.wantBackground {
+			t.Errorf("NormalizeRunCommandArgs(%s) background = %v, want %v", tc.raw, normalized["background"], tc.wantBackground)
+		}
+		if got, ok := normalized["timeout"].(json.Number); !ok || got.String() != strconv.Itoa(tc.wantTimeout) {
+			t.Errorf("NormalizeRunCommandArgs(%s) timeout = %v, want the canonical lexeme %d", tc.raw, normalized["timeout"], tc.wantTimeout)
 		}
 	}
 

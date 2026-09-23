@@ -19,6 +19,20 @@ import (
 
 const obsWorkspace = "/ws"
 
+// equalEvent compares two Events field-for-field: every comparable field with
+// == and the slice-typed ManagedEnvKeys with slices.Equal, since the slice
+// keeps Event non-comparable.
+func equalEvent(a, b Event) bool {
+	return a.Kind == b.Kind &&
+		a.ConfigurationRevision == b.ConfigurationRevision &&
+		a.Scope.Kind == b.Scope.Kind &&
+		a.Scope.DataDir == b.Scope.DataDir &&
+		a.Scope.Workspace == b.Scope.Workspace &&
+		a.Scope.SessionID == b.Scope.SessionID &&
+		a.Scope.OperationID == b.Scope.OperationID &&
+		slices.Equal(a.Scope.ManagedEnvKeys, b.Scope.ManagedEnvKeys)
+}
+
 func nextEvent(t *testing.T, sub *Subscription) (Event, bool) {
 	t.Helper()
 	select {
@@ -109,7 +123,7 @@ func TestRuntimeObservationPublishesCommittedTransitionsInOrder(t *testing.T) {
 		{Kind: EventScopeClosed, Scope: ScopeInfo{Kind: ScopeRuntime}},
 	}
 	got := drainClosed(t, sub)
-	if !slices.Equal(got, want) {
+	if !slices.EqualFunc(got, want, equalEvent) {
 		t.Fatalf("events = %+v, want configuration revisions and scope open/close in publication order %+v", got, want)
 	}
 }
@@ -189,7 +203,7 @@ func TestObservationPausedPublisherOrdersTheNextPublication(t *testing.T) {
 		}
 		second, ok := nextEvent(t, sub)
 		wantSecond := Event{Kind: EventScopeOpened, Scope: ScopeInfo{Kind: ScopeWorkspace, Workspace: "/ws-paused"}}
-		if !ok || second != wantSecond {
+		if !ok || !equalEvent(second, wantSecond) {
 			t.Fatalf("second event = %+v (ok=%v), want %+v", second, ok, wantSecond)
 		}
 	})
@@ -443,7 +457,7 @@ func TestObservationSubscriberLossDoesNotAffectExecution(t *testing.T) {
 			{Kind: EventScopeClosed, Scope: ScopeInfo{Kind: ScopeRuntime}},
 		}
 		got := drainClosed(t, healthy)
-		if !slices.Equal(got, want) {
+		if !slices.EqualFunc(got, want, equalEvent) {
 			t.Fatalf("healthy subscriber events = %+v, want reload events during active execution plus every committed closure in shutdown order, with the pre-subscription opens unreplayed: %+v", got, want)
 		}
 	})

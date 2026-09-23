@@ -79,6 +79,11 @@ type SignalKind string
 const (
 	SignalInterruption             SignalKind = "interruption"
 	SignalModelFailureContinuation SignalKind = "model_failure_continuation"
+
+	// SignalBackgroundCompletion records one background member's completion.
+	// Its content is the producer-bounded completion text, not a fixed
+	// contract string, and its envelope is always operationless.
+	SignalBackgroundCompletion SignalKind = "background_completion"
 )
 
 // Fixed signal contents, one per signal kind. The model-visible wording of a
@@ -146,13 +151,15 @@ type ExecutionCapture struct {
 }
 
 // SessionIdentity is the immutable identity section of one Session register.
-// A root omits both source-lineage fields; a fork requires both.
+// A root omits every lineage field; a fork requires both source fields; a
+// child carries parent_session_id and neither source field.
 type SessionIdentity struct {
 	SessionID             string    `json:"session_id"`
 	Workspace             string    `json:"workspace"`
 	CreatedAt             time.Time `json:"created_at"`
 	SourceSessionID       string    `json:"source_session_id,omitempty"`
 	SourceBoundaryEntryID string    `json:"source_boundary_entry_id,omitempty"`
+	ParentSessionID       string    `json:"parent_session_id,omitempty"`
 }
 
 // SessionState is the mutable state section of one Session register.
@@ -321,16 +328,26 @@ type hookResultEntry struct {
 	Error       string           `json:"error,omitempty"`
 }
 
+// relatedMember addresses the background member whose completion one
+// background_completion signal records. It is informational history, never
+// resolved across Sessions.
+type relatedMember struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+}
+
 // signalEntry is one durable control signal. Its related source Operation is
 // typed history: informational in a copied fork prefix, resolving inside the
-// owning Session otherwise.
+// owning Session otherwise. A background_completion signal instead carries a
+// related background member and no Operation at all.
 type signalEntry struct {
-	SessionID        string       `json:"session_id"`
-	EntryID          string       `json:"entry_id"`
-	OperationID      string       `json:"operation_id,omitempty"`
-	Signal           SignalKind   `json:"signal"`
-	RelatedOperation operationRef `json:"related_operation"`
-	Content          string       `json:"content"`
+	SessionID        string         `json:"session_id"`
+	EntryID          string         `json:"entry_id"`
+	OperationID      string         `json:"operation_id,omitempty"`
+	Signal           SignalKind     `json:"signal"`
+	RelatedOperation *operationRef  `json:"related_operation,omitempty"`
+	RelatedMember    *relatedMember `json:"related_member,omitempty"`
+	Content          string         `json:"content"`
 }
 
 // operationSettlementEntry publishes one terminal Operation outcome. It is

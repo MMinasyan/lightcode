@@ -17,6 +17,8 @@ const (
 	permissionCommandRun       = "command.run"
 	permissionWorkspaceInspect = "workspace.inspect"
 	permissionSleep            = "sleep"
+	permissionChildLaunch      = "child.launch"
+	permissionProcessOwn       = "process.own"
 
 	permissionAccessAllow = "allow"
 	permissionAccessDeny  = "deny"
@@ -158,6 +160,8 @@ func buildBuiltinRules() []builtinRule {
 		builtinRule{permission: permissionCommandRun, matches: anyTarget, allow: true},
 		builtinRule{permission: permissionWorkspaceInspect, matches: equalsWorkspaceRoot, allow: true},
 		builtinRule{permission: permissionSleep, matches: equalsFixedTarget, allow: true},
+		builtinRule{permission: permissionChildLaunch, matches: anyTarget, allow: true},
+		builtinRule{permission: permissionProcessOwn, matches: anyTarget, allow: true},
 	)
 }
 

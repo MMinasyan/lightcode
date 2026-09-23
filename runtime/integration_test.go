@@ -132,7 +132,7 @@ type probeTool struct {
 	events *traceLog
 }
 
-func (t probeTool) describe(Invocation, ToolConstraints) (ToolDescription, error) {
+func (t probeTool) describe(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 	definition, err := model.NewToolDefinition(model.ToolDefinition{
 		Name:        "probe",
 		Description: "records one dependency invocation",
@@ -314,7 +314,11 @@ func awaitOperation(t *testing.T, r *Runtime, sessionID, operationID string, wan
 			return rec
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("operation %q never settled to %v (read error %v, status %v)", operationID, want, err, rec.State.Status)
+			var detail string
+			if rec.State.Terminal != nil {
+				detail = rec.State.Terminal.Detail
+			}
+			t.Fatalf("operation %q never settled to %v (read error %v, status %v, detail %q)", operationID, want, err, rec.State.Status, detail)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -587,7 +591,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			scopeEvent(EventScopeClosed, ScopeRuntime, ""),
 		}
 		got := append(observed, drainClosed(t, healthy)...)
-		if !slices.Equal(got, want) {
+		if !slices.EqualFunc(got, want, equalEvent) {
 			t.Fatalf("healthy subscriber events = %+v, want the complete committed sequence %+v", got, want)
 		}
 

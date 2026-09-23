@@ -226,6 +226,22 @@ func validateOperationIdentity(s, what string) error {
 	return nil
 }
 
+// validateJobID enforces the durable background-job identity shape: exactly 8
+// lowercase hexadecimal characters. The two background member id namespaces
+// are fixed by their minters.
+func validateJobID(s, what string) error {
+	if len(s) != 8 {
+		return fmt.Errorf("%s %q is not 8 hexadecimal characters", what, s)
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return fmt.Errorf("%s %q is not lowercase hexadecimal", what, s)
+		}
+	}
+	return nil
+}
+
 // validExtraValues reports whether every Extra value is complete valid JSON;
 // empty values are absent data, never stored content.
 func validExtraValues(e model.Extra) bool {

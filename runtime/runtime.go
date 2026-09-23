@@ -98,8 +98,9 @@ type Runtime struct {
 // process-lifetime lock at <DataDir>/runtime.lock, load the managed dotenv and
 // publish the initial configuration snapshot, construct the complete Runtime
 // scope in the composition's stable topological order, obtain the private Core
-// storage export, run restart recovery against it, and construct the Harness
-// with the bound preparation. The storage factory initializes its backend
+// storage export and the optional job-stop seam, run restart recovery against
+// the storage, and construct the Harness with the bound preparation and seam.
+// The storage factory initializes its backend
 // under the held ownership; other factories receive no canonical Storage.
 // The automatic sweep's owned ticker loop is then registered as Runtime work
 // and one initial pass runs, both before the completed-owner publication.
@@ -154,7 +155,8 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		return nil, errors.Join(cause, lock.Release())
 	}
 
-	if _, err := config.LoadDotEnv(); err != nil {
+	managedEnv, err := config.LoadDotEnv()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: .env: %v\n", err)
 	}
 
@@ -169,7 +171,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		return unlock(err)
 	}
 
-	runtimeScope, err := c.openScope(work, ScopeInfo{Kind: ScopeRuntime, DataDir: dataDir}, nil)
+	runtimeScope, err := c.openScope(work, ScopeInfo{Kind: ScopeRuntime, DataDir: dataDir, ManagedEnvKeys: managedEnv.ManagedKeys()}, nil)
 	if err != nil {
 		return unlock(err)
 	}
@@ -186,18 +188,28 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	if err != nil {
 		return unwind(err)
 	}
+	jobs, err := jobStopper(c, runtimeScope)
+	if err != nil {
+		return unwind(err)
+	}
 	if err := harness.Recover(work, storage); err != nil {
 		return unwind(err)
 	}
 
 	workspaces := newWorkspaceScopes(work, c, []*scope{runtimeScope}, obs)
+	background := &backgroundBridge{}
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: storage,
-		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, options.prepare).bind(),
+		Jobs:    jobs,
+		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, options.prepare).bind(),
 	})
 	if err != nil {
 		return unwind(err)
 	}
+	// Armed before publication: harness.New performed no I/O and the first
+	// Prepare requires the admission gate, so no caller can observe the
+	// unarmed bridge.
+	background.h = h
 
 	r := &Runtime{
 		lock:         lock,
@@ -250,13 +262,45 @@ func coreStorage(runtimeScope *scope) (harness.Storage, error) {
 	if !ok {
 		return nil, fmt.Errorf("Core storage export supplies %T, not harness.Storage: %w", value, ErrComposition)
 	}
-	if rv := reflect.ValueOf(storage); rv.Kind() == reflect.Pointer || rv.Kind() == reflect.Map ||
-		rv.Kind() == reflect.Slice || rv.Kind() == reflect.Chan || rv.Kind() == reflect.Func || rv.Kind() == reflect.UnsafePointer {
-		if rv.IsNil() {
-			return nil, fmt.Errorf("Core storage export supplies a typed-nil harness.Storage: %w", ErrComposition)
-		}
+	if isTypedNil(storage) {
+		return nil, fmt.Errorf("Core storage export supplies a typed-nil harness.Storage: %w", ErrComposition)
 	}
 	return storage, nil
+}
+
+// isTypedNil reports whether v's dynamic value is a nil of a nil-able kind:
+// the one typed-nil shape shared by the private Harness seam bindings.
+func isTypedNil(v any) bool {
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func, reflect.UnsafePointer:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
+// jobStopper resolves the optional Harness job-stop seam over the Runtime
+// scope: composition recorded every export declared exactly as
+// harness.JobStopper, zero leaves the seam nil, and the single
+// Runtime-scoped export resolves from the scope's private Core seam values
+// after the coreStorage-shape typed-nil check — multiple or narrower-scoped
+// exports fail composition. It runs after the Runtime scope's bindings commit
+// and before Harness construction, so a failure never publishes a Harness.
+func jobStopper(c *composition, runtimeScope *scope) (harness.JobStopper, error) {
+	switch {
+	case len(c.jobStoppers) == 0:
+		return nil, nil
+	case len(c.jobStoppers) > 1:
+		return nil, fmt.Errorf("%d exports are declared as harness.JobStopper: %w", len(c.jobStoppers), ErrComposition)
+	case c.jobStoppers[0].scope != ScopeRuntime:
+		return nil, fmt.Errorf("job stopper export %q is %s-scoped: %w", c.jobStoppers[0].id, c.jobStoppers[0].scope, ErrComposition)
+	}
+	stopper := runtimeScope.jobStoppers[c.jobStoppers[0].id].(harness.JobStopper)
+	if isTypedNil(stopper) {
+		return nil, fmt.Errorf("job stopper export %q supplies a typed-nil harness.JobStopper: %w", c.jobStoppers[0].id, ErrComposition)
+	}
+	return stopper, nil
 }
 
 // publishOwner registers the constructor context's cancellation watcher and
@@ -400,9 +444,11 @@ func (r *Runtime) beginShutdown() {
 	})
 }
 
-// joinShutdown converges the owner: it joins admitted Runtime work, then the
-// Harness after its context cancellation has settled every in-flight
-// preparation, execution, and required terminal commit, then closes every
+// joinShutdown converges the owner: it joins admitted Runtime work, stops
+// every background ownership group so live members deliver and finish while
+// the capabilities and storage are still open, then joins the Harness after
+// its context cancellation has settled every in-flight preparation,
+// execution, and required terminal commit, then closes every
 // live Workspace scope in sorted path order and the Runtime scope in reverse
 // dependency order, closes every passive subscription once those cleanup
 // events have been published, and releases the lock as the final ownership
@@ -411,6 +457,9 @@ func (r *Runtime) beginShutdown() {
 func (r *Runtime) joinShutdown() error {
 	var errs []error
 	r.calls.Wait()
+	if err := r.harness.StopAll(context.Background()); err != nil {
+		errs = append(errs, err)
+	}
 	if err := r.harness.Wait(context.Background()); err != nil {
 		errs = append(errs, err)
 	}

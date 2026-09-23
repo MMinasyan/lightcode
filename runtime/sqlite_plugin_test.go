@@ -574,7 +574,7 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 		{Kind: runtime.EventConfiguration, ConfigurationRevision: "3"},
 		{Kind: runtime.EventScopeClosed, Scope: runtime.ScopeInfo{Kind: runtime.ScopeRuntime}},
 	}
-	if !slices.Equal(observed, want) {
+	if !slices.EqualFunc(observed, want, runtime.EqualEventForTest) {
 		t.Fatalf("healthy subscriber events = %+v, want the observed revisions plus the Runtime closure in publication order %+v", observed, want)
 	}
 	again, err := e.openComposed(ctx)
@@ -587,10 +587,11 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 }
 
 // TestBuiltinRegistrationComposes proves the shipped registration set — the
-// SQLite storage plugin, the native tools, the bundled adaptation, and the
-// LSP tools — composes through the real construction path: the complete
-// declared set opens over the real plugin's database, reload publishes, and
-// shutdown converges leaving exactly the plugin-owned files.
+// SQLite storage plugin, the native tools, the bundled adaptation, the LSP
+// tools, and the background jobs plugin — composes through the real
+// construction path: the complete declared set opens over the real plugin's
+// database, reload publishes, and shutdown converges leaving exactly the
+// plugin-owned files.
 func TestBuiltinRegistrationComposes(t *testing.T) {
 	ctx := context.Background()
 	e := newComposeEnv(t)

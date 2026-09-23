@@ -5,6 +5,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/adaptation"
 	"github.com/MMinasyan/lightcode/internal/prompt"
 	"github.com/MMinasyan/lightcode/model"
@@ -13,9 +14,10 @@ import (
 // surfaceRequest is the captured pure input of one composed prompt and tool
 // surface: the Runtime's once-resolved home, the preparation's Workspace and
 // session-start environment, the selected definition's prompt fields, the
-// captured Invocation and hard constraints, the composition's tool specs in
-// the agent's selection order after first-occurrence dedupe, the bound
-// ModelAdaptation (nil when unselected), and the active model ref.
+// captured Invocation, hard constraints, and session identity, the
+// composition's tool specs in the agent's selection order after
+// first-occurrence dedupe, the bound ModelAdaptation (nil when unselected),
+// and the active model ref.
 type surfaceRequest struct {
 	home         string
 	workspace    string
@@ -24,6 +26,7 @@ type surfaceRequest struct {
 	promptBody   string
 	invocation   Invocation
 	constraints  ToolConstraints
+	identity     harness.SessionIdentity
 	toolSpecs    []CapabilitySpec
 	adaptation   ModelAdaptation
 	modelRef     model.ModelRef
@@ -69,7 +72,7 @@ func composeSurface(req surfaceRequest) (prompt.Result, []model.ToolDefinition, 
 
 	advertised := make([]model.ToolDefinition, 0, len(req.toolSpecs))
 	for _, spec := range req.toolSpecs {
-		description, err := spec.describe(req.invocation, req.constraints)
+		description, err := spec.describe(req.invocation, req.constraints, req.identity)
 		if err != nil {
 			return prompt.Result{}, nil, err
 		}

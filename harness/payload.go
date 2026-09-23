@@ -847,7 +847,7 @@ func decodeSignalEntry(env Entry) (signalEntry, error) {
 	if err != nil {
 		return signalEntry{}, err
 	}
-	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "signal", "related_operation", "content"); err != nil {
+	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "signal", "related_operation", "related_member", "content"); err != nil {
 		return signalEntry{}, err
 	}
 	sessionID, err := stringMember(obj, "session_id", true)
@@ -866,13 +866,36 @@ func decodeSignalEntry(env Entry) (signalEntry, error) {
 	if err != nil {
 		return signalEntry{}, err
 	}
-	relatedObj, err := objectMember(obj, "related_operation", true)
+	relatedOperationObj, err := objectMember(obj, "related_operation", false)
 	if err != nil {
 		return signalEntry{}, err
 	}
-	related, err := decodeOperationRef(relatedObj)
+	var related *operationRef
+	if relatedOperationObj != nil {
+		ref, err := decodeOperationRef(relatedOperationObj)
+		if err != nil {
+			return signalEntry{}, fmt.Errorf("member %q: %w", "related_operation", err)
+		}
+		related = &ref
+	}
+	relatedMemberObj, err := objectMember(obj, "related_member", false)
 	if err != nil {
-		return signalEntry{}, fmt.Errorf("member %q: %w", "related_operation", err)
+		return signalEntry{}, err
+	}
+	var member *relatedMember
+	if relatedMemberObj != nil {
+		if err := rejectUnknownMembers(relatedMemberObj, "kind", "id"); err != nil {
+			return signalEntry{}, fmt.Errorf("member %q: %w", "related_member", err)
+		}
+		kind, err := stringMember(relatedMemberObj, "kind", true)
+		if err != nil {
+			return signalEntry{}, fmt.Errorf("member %q: %w", "related_member", err)
+		}
+		id, err := stringMember(relatedMemberObj, "id", true)
+		if err != nil {
+			return signalEntry{}, fmt.Errorf("member %q: %w", "related_member", err)
+		}
+		member = &relatedMember{Kind: kind, ID: id}
 	}
 	content, err := stringMember(obj, "content", true)
 	if err != nil {
@@ -893,6 +916,7 @@ func decodeSignalEntry(env Entry) (signalEntry, error) {
 		OperationID:      operationID,
 		Signal:           SignalKind(signal),
 		RelatedOperation: related,
+		RelatedMember:    member,
 		Content:          content,
 	}
 	if err := validateSignalEntry(v); err != nil {
@@ -901,8 +925,11 @@ func decodeSignalEntry(env Entry) (signalEntry, error) {
 	return v, nil
 }
 
-// validateSignalEntry enforces the closed signal shape: closed kind and the
-// contract-fixed content for that kind.
+// validateSignalEntry enforces the closed signal shape: the closed kind, the
+// kind's correlation rule, and the contract-fixed content for the fixed
+// kinds. A background_completion signal is always operationless and carries
+// its related background member instead; its content is bounded by the
+// producer, never re-validated here beyond non-emptiness.
 func validateSignalEntry(v signalEntry) error {
 	if err := validateHexID(v.SessionID, "session id"); err != nil {
 		return err
@@ -917,16 +944,48 @@ func validateSignalEntry(v signalEntry) error {
 	}
 	switch v.Signal {
 	case SignalInterruption, SignalModelFailureContinuation:
+		if v.RelatedMember != nil {
+			return fmt.Errorf("signal kind %s must not carry related_member", v.Signal)
+		}
+		if v.RelatedOperation == nil {
+			return fmt.Errorf("signal kind %s requires related_operation", v.Signal)
+		}
+		if want := signalContent(v.Signal); v.Content != want {
+			return fmt.Errorf("signal content %q is not the fixed content of kind %s", v.Content, v.Signal)
+		}
+		if err := validateHexID(v.RelatedOperation.SessionID, "related operation session id"); err != nil {
+			return err
+		}
+		return validateOperationIdentity(v.RelatedOperation.OperationID, "related operation id")
+	case SignalBackgroundCompletion:
+		if v.OperationID != "" {
+			return fmt.Errorf("background_completion signal must not carry an operation identity")
+		}
+		if v.RelatedOperation != nil {
+			return fmt.Errorf("background_completion signal must not carry related_operation")
+		}
+		if v.RelatedMember == nil {
+			return fmt.Errorf("background_completion signal requires related_member")
+		}
+		switch v.RelatedMember.Kind {
+		case "child":
+			if err := validateHexID(v.RelatedMember.ID, "related member id"); err != nil {
+				return err
+			}
+		case "job":
+			if err := validateJobID(v.RelatedMember.ID, "related member id"); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("related member kind %q is not one of child or job", v.RelatedMember.Kind)
+		}
+		if v.Content == "" {
+			return errors.New("background_completion signal requires non-empty content")
+		}
+		return nil
 	default:
-		return fmt.Errorf("signal kind %q is not one of interruption or model_failure_continuation", v.Signal)
+		return fmt.Errorf("signal kind %q is not one of interruption, model_failure_continuation or background_completion", v.Signal)
 	}
-	if want := signalContent(v.Signal); v.Content != want {
-		return fmt.Errorf("signal content %q is not the fixed content of kind %s", v.Content, v.Signal)
-	}
-	if err := validateHexID(v.RelatedOperation.SessionID, "related operation session id"); err != nil {
-		return err
-	}
-	return validateOperationIdentity(v.RelatedOperation.OperationID, "related operation id")
 }
 
 // encodeOperationSettlementEntry renders one operation-settlement entry
@@ -1228,12 +1287,14 @@ func encodeSessionIdentity(v SessionIdentity) (json.RawMessage, error) {
 		CreatedAt             string `json:"created_at"`
 		SourceSessionID       string `json:"source_session_id,omitempty"`
 		SourceBoundaryEntryID string `json:"source_boundary_entry_id,omitempty"`
+		ParentSessionID       string `json:"parent_session_id,omitempty"`
 	}{
 		SessionID:             v.SessionID,
 		Workspace:             v.Workspace,
 		CreatedAt:             createdAt,
 		SourceSessionID:       v.SourceSessionID,
 		SourceBoundaryEntryID: v.SourceBoundaryEntryID,
+		ParentSessionID:       v.ParentSessionID,
 	})
 	if err != nil {
 		return nil, err
@@ -1326,7 +1387,7 @@ func decodeSessionRegister(reg Register) (SessionRecord, error) {
 
 // decodeSessionIdentity reads the identity section with exact keys.
 func decodeSessionIdentity(obj map[string]json.RawMessage) (SessionIdentity, error) {
-	if err := rejectUnknownMembers(obj, "session_id", "workspace", "created_at", "source_session_id", "source_boundary_entry_id"); err != nil {
+	if err := rejectUnknownMembers(obj, "session_id", "workspace", "created_at", "source_session_id", "source_boundary_entry_id", "parent_session_id"); err != nil {
 		return SessionIdentity{}, err
 	}
 	sessionID, err := stringMember(obj, "session_id", true)
@@ -1349,6 +1410,10 @@ func decodeSessionIdentity(obj map[string]json.RawMessage) (SessionIdentity, err
 	if err != nil {
 		return SessionIdentity{}, err
 	}
+	parentSessionID, err := optionalNonEmptyString(obj, "parent_session_id")
+	if err != nil {
+		return SessionIdentity{}, err
+	}
 	stamped, err := decodeTime(createdAt)
 	if err != nil {
 		return SessionIdentity{}, fmt.Errorf("member %q: %w", "created_at", err)
@@ -1359,6 +1424,7 @@ func decodeSessionIdentity(obj map[string]json.RawMessage) (SessionIdentity, err
 		CreatedAt:             stamped,
 		SourceSessionID:       sourceSessionID,
 		SourceBoundaryEntryID: sourceBoundaryEntryID,
+		ParentSessionID:       parentSessionID,
 	}
 	if err := validateSessionIdentity(v); err != nil {
 		return SessionIdentity{}, err
@@ -1367,8 +1433,9 @@ func decodeSessionIdentity(obj map[string]json.RawMessage) (SessionIdentity, err
 }
 
 // validateSessionIdentity enforces the closed identity shape: durable
-// identities, caller-normalized workspace, and the root/fork lineage rule
-// (a root omits both source fields; a fork requires both).
+// identities, caller-normalized workspace, the root/fork lineage rule (a root
+// omits both source fields; a fork requires both), and the child lineage rule
+// (parent_session_id is exclusive with both source fields).
 func validateSessionIdentity(v SessionIdentity) error {
 	if err := validateHexID(v.SessionID, "session id"); err != nil {
 		return err
@@ -1387,6 +1454,14 @@ func validateSessionIdentity(v SessionIdentity) error {
 			return err
 		}
 		if err := validateHexID(v.SourceBoundaryEntryID, "source boundary entry id"); err != nil {
+			return err
+		}
+	}
+	if v.ParentSessionID != "" {
+		if v.SourceSessionID != "" || v.SourceBoundaryEntryID != "" {
+			return errors.New("parent_session_id is mutually exclusive with source_session_id and source_boundary_entry_id")
+		}
+		if err := validateHexID(v.ParentSessionID, "parent session id"); err != nil {
 			return err
 		}
 	}

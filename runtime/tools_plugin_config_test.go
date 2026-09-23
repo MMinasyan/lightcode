@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/plugins/tools"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -23,19 +22,12 @@ import (
 // outside the runtime package only the zero Invocation is constructible.
 func TestToolsPluginConsumesConfiguredValues(t *testing.T) {
 	ctx := context.Background()
-	p := tools.Plugin()
-	inst, err := p.Open(ctx, runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, runtime.Bindings{})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	value, ok := inst.Values["read_file"]
+	byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
+	value, ok := byID["read_file"]
 	if !ok {
 		t.Fatal("plugin instance exports no read_file")
 	}
-	readTool, ok := value.(runtime.Tool)
-	if !ok {
-		t.Fatalf("export supplies %T, not a Tool", value)
-	}
+	readTool := value
 	call := func(t *testing.T, args string) model.ToolCall {
 		t.Helper()
 		completed, err := model.NewToolCall(model.ToolCall{ID: "call-1", Name: "read_file", Arguments: json.RawMessage(args)})

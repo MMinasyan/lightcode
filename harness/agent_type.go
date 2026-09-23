@@ -16,8 +16,9 @@ const (
 
 // AgentType is the Harness view of one loaded Agent definition: the name,
 // model identity, prompt fields, configured tool names in loaded order
-// (duplicates retained), selected capability IDs in selected order, and the
-// permission capability constraints copied by the Runtime projection.
+// (duplicates retained), selected capability IDs in selected order, the
+// permission capability constraints copied by the Runtime projection, and the
+// subagent eligibility and roster description copied by the same projection.
 // WriteDir is the configured lexical constraint, already trimmed once at
 // projection; it is not a Workspace identity. The caller supplies the
 // definitions; resolving selects one by exact name and never loads a plugin,
@@ -31,6 +32,8 @@ type AgentType struct {
 	Capabilities []string
 	Readonly     bool
 	WriteDir     string
+	Subagent     bool
+	Description  string
 }
 
 // ResolveAgentType returns an owned copy of the exactly-named AgentType from

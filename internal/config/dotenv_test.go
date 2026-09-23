@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -959,4 +960,68 @@ func TestDotEnvWritesReportLockReleaseFailure(t *testing.T) {
 			t.Fatalf("remove stderr = %q, want the one exact release diagnostic", out)
 		}
 	})
+}
+
+func TestEnvWithoutKeys(t *testing.T) {
+	t.Run("managed name filtered case-sensitively", func(t *testing.T) {
+		env := []string{"MANAGED_KEY=1", "managed_key=2", "PATH=/bin"}
+		got := EnvWithoutKeys(env, []string{"MANAGED_KEY"})
+		want := []string{"managed_key=2", "PATH=/bin"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("EnvWithoutKeys = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("external name retained", func(t *testing.T) {
+		env := []string{"EXTERNAL_TOKEN=abc", "MANAGED_TOKEN=xyz"}
+		got := EnvWithoutKeys(env, []string{"MANAGED_TOKEN"})
+		want := []string{"EXTERNAL_TOKEN=abc"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("EnvWithoutKeys = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("nil inputs", func(t *testing.T) {
+		if got := EnvWithoutKeys(nil, nil); len(got) != 0 {
+			t.Fatalf("EnvWithoutKeys(nil, nil) = %v, want empty", got)
+		}
+		env := []string{"A=1", "B=2"}
+		if got := EnvWithoutKeys(env, nil); !slices.Equal(got, env) {
+			t.Fatalf("EnvWithoutKeys(env, nil) = %v, want %v", got, env)
+		}
+		if got := EnvWithoutKeys(nil, []string{"A"}); len(got) != 0 {
+			t.Fatalf("EnvWithoutKeys(nil, keys) = %v, want empty", got)
+		}
+	})
+}
+
+// A scanner error after valid lines must not discard the keys already
+// injected: the partial managed set still covers them.
+func TestLoadDotEnvScannerErrorReturnsPartialManagedSet(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".lightcode")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	key := envKeyForTest(t, "SCANNER_PARTIAL")
+	path := filepath.Join(dir, ".env")
+	body := key + "=injected\nHUGE=" + strings.Repeat("A", bufio.MaxScanTokenSize+1) + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := LoadDotEnv()
+	if err == nil {
+		t.Fatal("LoadDotEnv: want scanner error from the oversized line, got nil")
+	}
+	if m == nil {
+		t.Fatal("LoadDotEnv: want a partial managed set alongside the scanner error, got nil")
+	}
+	if got := os.Getenv(key); got != "injected" {
+		t.Fatalf("env %s = %q, want the value injected before the scanner error", key, got)
+	}
+	if keys := m.ManagedKeys(); !slices.Contains(keys, key) {
+		t.Fatalf("ManagedKeys = %v, want to contain %s", keys, key)
+	}
 }

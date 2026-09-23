@@ -257,7 +257,7 @@ func (s chainCodeGroup) Snapshot(turn int, absPath string) error {
 // write_file export.
 type chainWriteTool struct{ dataDir string }
 
-func (chainWriteTool) describe(_ Invocation, constraints ToolConstraints) (ToolDescription, error) {
+func (chainWriteTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	definition, err := model.NewToolDefinition(model.ToolDefinition{
 		Name:        "prod_write",
 		Description: "writes one file in the workspace",
@@ -330,7 +330,7 @@ func (t chainWriteTool) Prepare(_ context.Context, tc ToolContext, call model.To
 // export.
 type chainPatchTool struct{ dataDir string }
 
-func (chainPatchTool) describe(_ Invocation, constraints ToolConstraints) (ToolDescription, error) {
+func (chainPatchTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	definition, err := model.NewToolDefinition(model.ToolDefinition{
 		Name:        "apply_patch",
 		Description: "edits, creates, deletes, or renames files using the V4A patch format",
@@ -408,7 +408,7 @@ func (t chainPatchTool) Prepare(_ context.Context, tc ToolContext, call model.To
 // Workspace — mirroring the shipped plugin's readonly command path.
 type chainCommandTool struct{ dataDir string }
 
-func (chainCommandTool) describe(Invocation, ToolConstraints) (ToolDescription, error) {
+func (chainCommandTool) describe(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 	definition, err := model.NewToolDefinition(model.ToolDefinition{
 		Name:        "run_command",
 		Description: "executes one command",
@@ -446,7 +446,7 @@ func (t chainCommandTool) Prepare(_ context.Context, tc ToolContext, call model.
 	return harness.PreparedTool{
 		Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: rewritten}},
 		Execute: func(ctx context.Context) harness.ToolOutcome {
-			result, execErr := tool.RunForegroundCommand(ctx, rewritten, tc.Workspace, 120, 15360, 5000, spillDir)
+			result, execErr := tool.RunForegroundCommand(ctx, rewritten, tc.Workspace, 120, 15360, 5000, spillDir, os.Environ())
 			if execErr != nil {
 				status := model.ResultError
 				var exitErr *tool.ExitError
@@ -480,7 +480,7 @@ type inertTool struct {
 	defThide bool
 }
 
-func (t inertTool) describe(Invocation, ToolConstraints) (ToolDescription, error) {
+func (t inertTool) describe(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 	definition, err := model.NewToolDefinition(model.ToolDefinition{
 		Name:        t.name,
 		Description: "inert " + t.name,

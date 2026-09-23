@@ -63,6 +63,11 @@ type ScopeInfo struct {
 	Workspace   string
 	SessionID   string
 	OperationID string
+
+	// ManagedEnvKeys names the env keys the Runtime injected from
+	// ~/.lightcode/.env; the Runtime scope carries them, narrower scopes
+	// carry none.
+	ManagedEnvKeys []string
 }
 
 // CapabilitySpec pairs one capability lookup ID with its Go type. The ID is
@@ -72,7 +77,7 @@ type ScopeInfo struct {
 type CapabilitySpec struct {
 	id       string
 	typ      reflect.Type
-	describe func(Invocation, ToolConstraints) (ToolDescription, error)
+	describe func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error)
 }
 
 // Spec declares the capability contract named id for the Go type T. It serves
@@ -99,10 +104,11 @@ type Instance struct {
 // of its owned input: no I/O, background work, waits, or retained input. A
 // nil ValidateConfig means the plugin has no settings, so only absent
 // configuration or the empty object is accepted, never arbitrary ignored
-// JSON. An export declared with exactly the harness.Storage type is the
-// private Core storage binding, identified by type rather than a reserved
-// ID; it stays in the same declaration, instance, and disposal machinery but
-// is omitted from ordinary Bindings and the capability universe.
+// JSON. An export declared with exactly the harness.Storage or
+// harness.JobStopper type is a private Core seam binding, identified by type
+// rather than a reserved ID; it stays in the same declaration, instance, and
+// disposal machinery but is omitted from ordinary Bindings and the capability
+// universe.
 type Plugin struct {
 	ID             string
 	Scope          ScopeKind
@@ -180,6 +186,16 @@ func (in Invocation) Config(pluginID string) json.RawMessage {
 	return append(json.RawMessage(nil), raw...)
 }
 
+// AgentTypes returns the captured snapshot's owned roster projection of the
+// loaded Agent definitions, preserving the snapshot's ordering. The zero
+// Invocation returns an empty roster.
+func (in Invocation) AgentTypes() []harness.AgentType {
+	if in.snapshot == nil {
+		return nil
+	}
+	return in.snapshot.agentTypes()
+}
+
 // acceptSettings applies one declaration's configuration rule: a plugin with
 // a nil ValidateConfig accepts only absent configuration or the empty
 // object, and any other input document is rejected instead of silently
@@ -201,9 +217,11 @@ func acceptSettings(plugin Plugin, raw json.RawMessage) error {
 	return fmt.Errorf("plugin %q declares no settings validator but received configuration: %w", plugin.ID, ErrComposition)
 }
 
-// coreExportDecl records one export declared as exactly harness.Storage so
-// the Runtime can later identify the private Core storage binding by type.
-type coreExportDecl struct {
+// typedExportDecl records one export declared as exactly a
+// Harness-recognized interface type — harness.Storage's private Core binding
+// or the harness.JobStopper job-stop seam — so the Runtime can identify it by
+// declared type rather than by ID or value assertion.
+type typedExportDecl struct {
 	plugin string
 	scope  ScopeKind
 	id     string
@@ -213,13 +231,14 @@ type coreExportDecl struct {
 // per-scope construction plans in stable topological order (registration
 // order breaks ties), the ordinary capability universe excluding Core
 // storage exports, the tool-declaration universe feeding the agent parser,
-// and the storage export declarations.
+// the storage export declarations, and the job-stop seam declarations.
 type composition struct {
 	plugins       []Plugin
 	plan          map[ScopeKind][]Plugin
 	capabilityIDs []string
 	toolIDs       []string
-	coreExports   []coreExportDecl
+	coreExports   []typedExportDecl
+	jobStoppers   []typedExportDecl
 
 	// modelAdaptation is the single export ID declared as exactly
 	// ModelAdaptation, or empty when the composition declares none. More than
@@ -250,12 +269,14 @@ func newComposition(plugins []Plugin) (*composition, error) {
 		spec   CapabilitySpec
 	}
 	storageType := reflect.TypeFor[harness.Storage]()
+	jobStopperType := reflect.TypeFor[harness.JobStopper]()
 	all := make(map[string]exportSource)
 	ordinary := make(map[string]exportSource)
 	seenPluginIDs := make(map[string]bool)
 	var capabilityIDs []string
 	var toolIDs []string
-	var coreExports []coreExportDecl
+	var coreExports []typedExportDecl
+	var jobStoppers []typedExportDecl
 	var adaptationExports []string
 	for i, p := range owned {
 		if p.ID == "" {
@@ -302,7 +323,9 @@ func newComposition(plugins []Plugin) (*composition, error) {
 				return nil, fmt.Errorf("plugin %q (%s): capability %q declared as %s requires Runtime scope: %w", p.ID, p.Scope, prov.id, prov.typ, ErrComposition)
 			}
 			if prov.typ == storageType {
-				coreExports = append(coreExports, coreExportDecl{plugin: p.ID, scope: p.Scope, id: prov.id})
+				coreExports = append(coreExports, typedExportDecl{plugin: p.ID, scope: p.Scope, id: prov.id})
+			} else if prov.typ == jobStopperType {
+				jobStoppers = append(jobStoppers, typedExportDecl{plugin: p.ID, scope: p.Scope, id: prov.id})
 			} else {
 				ordinary[prov.id] = exportSource{plugin: i, spec: prov}
 				capabilityIDs = append(capabilityIDs, prov.id)
@@ -390,6 +413,7 @@ func newComposition(plugins []Plugin) (*composition, error) {
 		capabilityIDs:   capabilityIDs,
 		toolIDs:         toolIDs,
 		coreExports:     coreExports,
+		jobStoppers:     jobStoppers,
 		modelAdaptation: modelAdaptation,
 	}, nil
 }
@@ -433,10 +457,11 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 	}
 	scopeCtx, cancel := context.WithCancel(ctx)
 	sc := &scope{
-		info:     info,
-		ctx:      scopeCtx,
-		cancel:   cancel,
-		storages: make(map[string]any),
+		info:        info,
+		ctx:         scopeCtx,
+		cancel:      cancel,
+		storages:    make(map[string]any),
+		jobStoppers: make(map[string]any),
 	}
 	if len(ancestors) > 0 {
 		sc.obs = ancestors[0].obs
@@ -501,6 +526,7 @@ func registerInstance(p Plugin, values map[string]any, sc *scope, resolved, own 
 		}
 	}
 	storageType := reflect.TypeFor[harness.Storage]()
+	jobStopperType := reflect.TypeFor[harness.JobStopper]()
 	for id, spec := range declared {
 		value, ok := values[id]
 		if !ok {
@@ -514,6 +540,8 @@ func registerInstance(p Plugin, values map[string]any, sc *scope, resolved, own 
 		}
 		if spec.typ == storageType {
 			sc.storages[id] = value
+		} else if spec.typ == jobStopperType {
+			sc.jobStoppers[id] = value
 		} else {
 			entry := bindingEntry{declared: spec.typ, value: value, from: sc}
 			own[id] = entry
@@ -577,9 +605,10 @@ type scope struct {
 	// ancestor; scopes constructed before the owner exists keep it nil.
 	obs *observation
 
-	bindings Bindings
-	storages map[string]any
-	closers  []func() error
+	bindings    Bindings
+	storages    map[string]any
+	jobStoppers map[string]any
+	closers     []func() error
 
 	mu     sync.Mutex
 	closed bool

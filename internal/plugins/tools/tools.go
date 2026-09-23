@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/tool"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/plugins/jobs"
 	"github.com/MMinasyan/lightcode/runtime"
 )
 
@@ -36,6 +38,7 @@ const (
 	permissionFileWrite  = "file.write"
 	permissionCommandRun = "command.run"
 	permissionSleep      = "sleep"
+	permissionProcessOwn = "process.own"
 
 	// deniedToolResultContent is the contract-fixed model-visible content of
 	// every failed canonical preparation, mirroring the Harness policy denial.
@@ -99,13 +102,17 @@ func (s settings) toolsConfig() config.ToolsConfig {
 	}
 }
 
-// instance is one Open's constructed state: the owner data root captured from
-// the scope identity. It keeps no Session-indexed state, no handle tags, no
-// cached read records and no reset or eviction hooks: every mutating call
-// opens its code group fresh from the calling Operation's admitted-input
-// identity and drops it afterward.
+// instance is one Open's constructed state: the owner data root, the managed
+// env key names captured from the scope identity, and the jobs capability
+// the background command and process paths call. It keeps no
+// Session-indexed state, no handle tags, no cached read records and no
+// reset or eviction hooks: every mutating call opens its code group fresh
+// from the calling Operation's admitted-input identity and drops it
+// afterward.
 type instance struct {
-	dataDir string
+	dataDir     string
+	managedKeys []string
+	jobs        jobs.Jobs
 }
 
 func (in *instance) settings(inv runtime.Invocation) (settings, error) {
@@ -293,7 +300,7 @@ func normalizeCallArguments(call model.ToolCall, normalize func(map[string]any) 
 // nil-tracker read path that always returns the bounded requested content.
 type readTool struct{ inst *instance }
 
-func (readTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
+func (readTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
 	return runtime.ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "read_file",
@@ -384,7 +391,7 @@ func (in *instance) prepareMutation(tc runtime.ToolContext, call model.ToolCall,
 // writeTool is the write_file export.
 type writeTool struct{ inst *instance }
 
-func (t writeTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
+func (t writeTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
 	return mutationDescription("write_file", writeFileDescription, writeFileParameters, false, constraints)
 }
 
@@ -411,7 +418,7 @@ func (t writeTool) Prepare(_ context.Context, tc runtime.ToolContext, call model
 // diff built from the committed normalized arguments and the result.
 type editTool struct{ inst *instance }
 
-func (t editTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
+func (t editTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
 	return mutationDescription("edit_file", editFileDescription, editFileParameters, false, constraints)
 }
 
@@ -438,7 +445,7 @@ func (t editTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.
 // counterpart, so only model adaptations that include it can see it.
 type patchTool struct{ inst *instance }
 
-func (t patchTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
+func (t patchTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
 	return mutationDescription("apply_patch", applyPatchDescription, applyPatchParameters, true, constraints)
 }
 
@@ -464,20 +471,26 @@ func (t patchTool) Prepare(_ context.Context, tc runtime.ToolContext, call model
 // runCommandTool is the run_command export: always available; the calling
 // Agent's readonly constraint selects the implementation. The readonly
 // variant authorizes and executes the read-only allowlist's rewritten
-// command with the captured default timeout — a model timeout override is
-// ignored, and write_dir never grants unrestricted command execution. The
-// unconstrained variant decomposes conclusive simple commands into one
-// command.run target per complete segment, falls back to one complete
-// target for everything else, and always executes through the shell. There
-// is no background path: normalization rejects any supplied background
-// member, and the description never advertises one.
+// command; its foreground path keeps the captured default timeout — a model
+// timeout override is ignored — while a background start forwards a model
+// timeout >= 1 (absent/sub-one becomes 0), and write_dir never grants
+// unrestricted command execution. The unconstrained variant decomposes
+// conclusive simple commands into one command.run target per complete
+// segment, falls back to one complete target for everything else, and always
+// executes through the shell. background=true starts a job through the
+// background bridge and returns the retained immediate text; every start
+// failure renders through the one wrapper.
 type runCommandTool struct{ inst *instance }
 
-func (runCommandTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
+func (runCommandTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
+	description := runCommandDescription
+	if constraints.Readonly {
+		description = tool.ReadOnlyRunCommandDescription
+	}
 	return runtime.ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "run_command",
-			Description: runCommandDescription,
+			Description: description,
 			Parameters:  json.RawMessage(runCommandParameters),
 		},
 		Available: true,
@@ -545,6 +558,17 @@ func (t runCommandTool) Prepare(_ context.Context, tc runtime.ToolContext, call 
 			command = fallback
 		}
 	}
+	// The converged tail: the resolved command and targets declare the one
+	// shared permission set, and background=true swaps the execute body for
+	// the job-start path (the model timeout forwards when >= 1; absent or
+	// sub-one becomes 0).
+	background, _ := args["background"].(bool)
+	backgroundTimeoutSec := 0
+	if v, ok := args["timeout"].(json.Number); ok {
+		if n, err := v.Int64(); err == nil && n >= 1 {
+			backgroundTimeoutSec = int(n)
+		}
+	}
 	pairs := make([]harness.PermissionRequest, 0, len(targets))
 	for _, target := range targets {
 		pairs = append(pairs, harness.PermissionRequest{Permission: permissionCommandRun, Target: target})
@@ -553,13 +577,102 @@ func (t runCommandTool) Prepare(_ context.Context, tc runtime.ToolContext, call 
 	return harness.PreparedTool{
 		Permissions: pairs,
 		Execute: func(ctx context.Context) harness.ToolOutcome {
-			return commandOutcome(ctx, call.ID, command, tc.Workspace, timeoutSec, s, spillDir)
+			if background {
+				return t.backgroundOutcome(ctx, call.ID, command, backgroundTimeoutSec, tc)
+			}
+			return commandOutcome(ctx, call.ID, command, tc.Workspace, timeoutSec, s, spillDir, t.inst.managedKeys)
 		},
 	}
 }
 
+// backgroundOutcome starts one background job for the prepared call: it
+// reserves the identity, hands the spawn to the background bridge, aborts
+// the reservation when the bridge rejects the start, and returns the
+// retained immediate template on success. Every start failure — reserve,
+// handoff, or spawn — renders through the one legacy wrapper.
+func (t runCommandTool) backgroundOutcome(ctx context.Context, callID, command string, timeoutSec int, tc runtime.ToolContext) harness.ToolOutcome {
+	jobsInst := t.inst.jobs
+	sessionID := tc.AdmittedEntry.SessionID
+	jobID, err := jobsInst.Reserve()
+	if err != nil {
+		return backgroundStartOutcome(callID, err)
+	}
+	err = tc.Background.StartJob(ctx, sessionID, jobID, func(_ context.Context, completionID string) error {
+		return jobsInst.Start(jobs.StartRequest{
+			JobID:      jobID,
+			SessionID:  sessionID,
+			Workspace:  tc.Workspace,
+			Command:    command,
+			TimeoutSec: timeoutSec,
+			Env:        config.EnvWithoutKeys(os.Environ(), t.inst.managedKeys),
+			Config:     tc.Invocation.Config("jobs"),
+			OnExit: func(er jobs.ExitResult) {
+				_ = tc.Background.DeliverCompletion(context.Background(), sessionID, completionID, legacyCompletionText(er)) // terminal for the job's completion; the exit callback has nowhere to propagate
+			},
+		})
+	})
+	if err != nil {
+		jobsInst.Abort(jobID) // idempotent: removes the reservation if it still exists
+		return backgroundStartOutcome(callID, err)
+	}
+	return harness.ToolOutcome{Result: model.ToolResult{
+		CallID: callID,
+		Status: model.ResultSuccess,
+		Content: fmt.Sprintf("Command running in the background with ID: `%s`. You will be notified when it finishes. If your next steps do not depend on its output, continue with them; otherwise use sleep to wait and process to read the output.\nRunning in the background: `%s`.",
+			jobID, strings.Join(jobsInst.Live(sessionID), ", ")),
+	}}
+}
+
+// backgroundStartOutcome renders one background start failure through the
+// single legacy wrapper.
+func backgroundStartOutcome(callID string, err error) harness.ToolOutcome {
+	return harness.ToolOutcome{Result: model.ToolResult{
+		CallID:  callID,
+		Status:  model.ResultError,
+		Content: fmt.Errorf("run_command: background start: %w", err).Error(),
+	}}
+}
+
+// legacyCompletionText composes one job's terminal completion in the
+// retained legacy form: `completed` for an empty reason, `(No output)` for
+// empty output, and the whole string capped at the job's own
+// max_output_bytes — the same bound capture uses — keeping the longest
+// complete UTF-8 prefix that fits the trailing marker.
+func legacyCompletionText(er jobs.ExitResult) string {
+	reason := er.Reason
+	if reason == "" {
+		reason = "completed"
+	}
+	output := er.Output
+	if output == "" {
+		output = "(No output)"
+	}
+	return truncateCompletionText(
+		fmt.Sprintf("Background process %s (%q) finished: %s, exit code %d.\nOutput:\n%s", er.ID, er.Command, reason, er.ExitCode, output),
+		er.MaxOutputBytes)
+}
+
+// truncateCompletionText caps one rendered completion at the limit in UTF-8
+// bytes, retaining the longest complete-character prefix that fits the
+// trailing marker.
+func truncateCompletionText(text string, limit int) string {
+	const marker = "\n[truncated]"
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	max := limit - len(marker)
+	if max < 0 {
+		max = 0
+	}
+	for max > 0 && text[max]&0xC0 == 0x80 { // back off to a complete-character boundary
+		max--
+	}
+	return text[:max] + marker
+}
+
 // commandOutcome runs one prepared foreground command through the shared
-// runner and maps the retained outcomes onto the model-visible result: a
+// runner over the environment scrubbed of the instance's managed keys and
+// maps the retained outcomes onto the model-visible result: a
 // completed run settles as success or — for a nonzero exit — the same
 // ExitError output the legacy engine reports as an error; a configured
 // timeout settles as an error result with the retained timeout text; the
@@ -567,8 +680,8 @@ func (t runCommandTool) Prepare(_ context.Context, tc runtime.ToolContext, call 
 // with the retained cancellation text. The classification reads the cause
 // the runner flagged on the error, never the context after the runner has
 // settled the real result.
-func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec int, s settings, spillDir string) harness.ToolOutcome {
-	result, err := runForegroundCommandFn(ctx, command, dir, timeoutSec, s.MaxOutputBytes, s.ReadLineMaxChars, spillDir)
+func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec int, s settings, spillDir string, managedKeys []string) harness.ToolOutcome {
+	result, err := runForegroundCommandFn(ctx, command, dir, timeoutSec, s.MaxOutputBytes, s.ReadLineMaxChars, spillDir, config.EnvWithoutKeys(os.Environ(), managedKeys))
 	var exitErr *tool.ExitError
 	if errors.As(err, &exitErr) {
 		status := model.ResultError
@@ -588,7 +701,7 @@ func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec
 // execution observes cancellation as an interrupted result.
 type sleepTool struct{}
 
-func (sleepTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints) (runtime.ToolDescription, error) {
+func (sleepTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
 	return runtime.ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "sleep",
@@ -630,6 +743,106 @@ func (sleepTool) Prepare(_ context.Context, _ runtime.ToolContext, call model.To
 	}
 }
 
+// processTool is the process export: always available; it maps the retained
+// read/kill/list actions onto the jobs capability under the owner-scoped
+// canonical target <session-id>/<job-id> (read/kill) or the fixed target *
+// (list).
+type processTool struct{ inst *instance }
+
+func (processTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
+	return runtime.ToolDescription{
+		Definition: model.ToolDefinition{
+			Name:        "process",
+			Description: processDescription,
+			Parameters:  json.RawMessage(processParameters),
+		},
+		Available: true,
+	}, nil
+}
+
+func (processTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
+	return normalizeCallArguments(call, normalizeProcessArgs)
+}
+
+func (t processTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
+	args, err := decodeCallArguments(call.Arguments)
+	if err != nil {
+		return immediateError(call.ID, err)
+	}
+	action, _ := args["action"].(string)
+	sessionID := tc.AdmittedEntry.SessionID
+	switch action {
+	case "read", "kill":
+		id, _ := args["id"].(string)
+		if id == "" {
+			return immediateError(call.ID, fmt.Errorf("process: id is required for %s", action))
+		}
+		if !isJobID(id) {
+			return immediateError(call.ID, fmt.Errorf("process: no process with ID %q", id))
+		}
+		target := sessionID + "/" + id
+		return harness.PreparedTool{
+			Permissions: []harness.PermissionRequest{{Permission: permissionProcessOwn, Target: target}},
+			Execute: func(_ context.Context) harness.ToolOutcome {
+				if action == "read" {
+					output, err := t.inst.jobs.Read(sessionID, id)
+					if err != nil {
+						return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
+					}
+					return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: output}}
+				}
+				if err := t.inst.jobs.Kill(sessionID, id); err != nil {
+					return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
+				}
+				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: fmt.Sprintf("Process %s terminated.", id)}}
+			},
+		}
+	case "list":
+		return harness.PreparedTool{
+			Permissions: []harness.PermissionRequest{{Permission: permissionProcessOwn, Target: "*"}},
+			Execute: func(_ context.Context) harness.ToolOutcome {
+				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: t.inst.jobs.List(sessionID)}}
+			},
+		}
+	default:
+		return immediateError(call.ID, fmt.Errorf("process: unknown action %q", action))
+	}
+}
+
+// normalizeProcessArgs is the process tool's member validator: private
+// `_lightcode_` fields are stripped, a present action or id must be a
+// string, and every other member is preserved; Prepare owns the semantics.
+func normalizeProcessArgs(args map[string]any) (map[string]any, error) {
+	clean := make(map[string]any, len(args))
+	for key, value := range args {
+		if strings.HasPrefix(key, "_lightcode_") {
+			continue
+		}
+		if key == "action" || key == "id" {
+			if _, ok := value.(string); !ok {
+				return nil, fmt.Errorf("process: %s must be a string", key)
+			}
+		}
+		clean[key] = value
+	}
+	return clean, nil
+}
+
+// isJobID reports whether id is inside the jobs capability's
+// 8-lowercase-hex identity namespace.
+func isJobID(id string) bool {
+	if len(id) != 8 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // mutationDescription is the shared mutation-tool description: the write
 // tools are unavailable only to a readonly Agent without a configured write
 // dir — with a nonempty write dir the Harness confines every write to it, so
@@ -647,11 +860,15 @@ func mutationDescription(name, description, parameters string, defaultHidden boo
 	}, nil
 }
 
-// Plugin returns the Runtime-scoped plugin whose six exports are the native
-// file tools plus the foreground command and sleep tools. It has no
-// dependencies. ValidateConfig validates the owned plugins.tools section;
-// Open captures the owner data root the mutating calls derive their code
-// groups from and the command spills their output directory from.
+// Plugin returns the Runtime-scoped plugin whose seven exports are the native
+// file tools plus the foreground/background command, process, and sleep
+// tools. It requires the jobs capability and binds it strictly — there is no
+// degraded mode without it. ValidateConfig validates the owned
+// plugins.tools section; Open captures the owner data root the mutating
+// calls derive their code groups from and the command spills their output
+// directory from, the managed env key names the command path scrubs from
+// its environment, and the bound jobs capability the background and process
+// paths call.
 func Plugin() runtime.Plugin {
 	return runtime.Plugin{
 		ID:    pluginID,
@@ -662,7 +879,11 @@ func Plugin() runtime.Plugin {
 			runtime.ToolSpec("edit_file", editTool{}.describe),
 			runtime.ToolSpec("apply_patch", patchTool{}.describe),
 			runtime.ToolSpec("run_command", runCommandTool{}.describe),
+			runtime.ToolSpec("process", processTool{}.describe),
 			runtime.ToolSpec("sleep", sleepTool{}.describe),
+		},
+		Requires: []runtime.CapabilitySpec{
+			runtime.Spec[jobs.Jobs]("jobs"),
 		},
 		ValidateConfig: func(raw json.RawMessage) error {
 			_, err := decodeSettings(raw)
@@ -672,20 +893,26 @@ func Plugin() runtime.Plugin {
 	}
 }
 
-// open checks the scope context and captures the scope identity's owner data
-// root. Five of the six tool values share that one instance (sleep needs no
-// instance state); no per-Session state is created here.
-func open(ctx context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
+// open checks the scope context, binds the declared jobs capability
+// strictly, and captures the scope identity's owner data root and managed
+// env key names. Six of the seven tool values share that one instance
+// (sleep needs no instance state); no per-Session state is created here.
+func open(ctx context.Context, info runtime.ScopeInfo, bindings runtime.Bindings) (runtime.Instance, error) {
 	if err := ctx.Err(); err != nil {
 		return runtime.Instance{}, err
 	}
-	inst := &instance{dataDir: info.DataDir}
+	jobsInst, err := runtime.Bind[jobs.Jobs](bindings, "jobs")
+	if err != nil {
+		return runtime.Instance{}, err
+	}
+	inst := &instance{dataDir: info.DataDir, managedKeys: info.ManagedEnvKeys, jobs: jobsInst}
 	return runtime.Instance{Values: map[string]any{
 		"read_file":   readTool{inst},
 		"write_file":  writeTool{inst},
 		"edit_file":   editTool{inst},
 		"apply_patch": patchTool{inst},
 		"run_command": runCommandTool{inst},
+		"process":     processTool{inst},
 		"sleep":       sleepTool{},
 	}}, nil
 }

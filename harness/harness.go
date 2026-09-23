@@ -13,12 +13,20 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
+// JobStopper is the job-stop seam: the Harness cannot import plugin packages,
+// so the interface is declared at its consumer. Nil is legal; StartJob rejects
+// job admission without one (managed shutdown stops every Job).
+type JobStopper interface {
+	StopJob(sessionID, jobID string)
+}
+
 // Dependencies are the construction inputs of one Harness: the durable
 // Storage and the single preparation callback shared by every admission
 // producer.
 type Dependencies struct {
 	Storage Storage
 	Prepare func(context.Context, PreparationRequest) (PreparedExecution, error)
+	Jobs    JobStopper
 }
 
 // PreparationSession is the revision-free owned Session view one preparation
@@ -189,9 +197,13 @@ type pendingMessage struct {
 
 // activeExecution is the one in-flight execution of a coordinator: installed
 // after the admission commit and released only after the terminal settlement
-// and the post-terminal buffer drain have converged.
+// and the post-terminal buffer drain have converged. Its execution context is
+// a child of the Harness context; Interrupt cancels it and the retirement
+// tail cancels it once after the drain.
 type activeExecution struct {
-	done chan struct{} // closed when the execution goroutine finishes
+	done    chan struct{}      // closed when the execution goroutine finishes
+	execCtx context.Context    // the execution context driving the opener, the Agent run, and every effect attempt
+	cancel  context.CancelFunc // cancels execCtx; idempotent, so a retiring predecessor's cancel is a harmless no-op
 }
 
 // coordinator is the one per-Session authority: the validated Session view,
@@ -207,6 +219,12 @@ type coordinator struct {
 	steering []*pendingMessage // regular input waiting for the next model boundary
 	queued   []*pendingMessage // queued input waiting for the next Agent turn end
 	run      *activeExecution  // non-nil while one execution is in flight
+
+	group             *backgroundGroup // nil until the first member
+	bgState           bgState          // starts as bgOpen at every construction site; the zero value is never observed
+	stop              *stopInterval
+	pendingCompletion *launchInfo
+	interruptOp       string
 
 	gone bool // set by the post-commit deletion invalidation: every holder of the coordinator gets ErrNotFound from then on
 }
@@ -262,7 +280,7 @@ func (h *Harness) CreateSession(ctx context.Context, req CreateSessionRequest) (
 		return SessionRecord{}, err
 	}
 	h.mu.Lock()
-	h.sessions[sessionID] = &coordinator{graph: &sessionGraph{Session: record}}
+	h.sessions[sessionID] = &coordinator{graph: &sessionGraph{Session: record}, bgState: bgOpen}
 	h.mu.Unlock()
 	return ownSessionRecord(record), nil
 }
@@ -427,6 +445,10 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 		c.mu.Unlock()
 		return SubmitResult{}, invalidInput("session %q is archived; admission requires an open Session", req.SessionID)
 	}
+	if c.bgState == bgClosed { // a permanently closed background group rejects agent work beside the lifecycle gate
+		c.mu.Unlock()
+		return SubmitResult{}, invalidInput("session is closed to agent work")
+	}
 	if err := ctx.Err(); err != nil { // the routing gate: cancellation observed here publishes nothing
 		c.mu.Unlock()
 		return SubmitResult{}, err
@@ -574,6 +596,10 @@ func (h *Harness) ArchiveSession(ctx context.Context, sessionID string) (Session
 			result := ownSessionRecord(c.graph.Session)
 			c.mu.Unlock()
 			return result, nil
+		}
+		if liveBackground(c) { // claimed members count: they remain until finished
+			c.mu.Unlock()
+			return SessionRecord{}, invalidInput("session has live background work; stop it first")
 		}
 		expected := c.graph.Session.Revision
 		now := time.Now().UTC() // the one sampled archive time
@@ -757,7 +783,7 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 			c.mu.Unlock()
 			return false, notFoundSession(sessionID)
 		}
-		if c.run != nil || len(c.steering) > 0 || len(c.queued) > 0 { // running or process-locally buffered: left unchanged
+		if c.run != nil || len(c.steering) > 0 || len(c.queued) > 0 || liveBackground(c) { // running, buffered, or live background work: left unchanged
 			c.mu.Unlock()
 			return false, nil
 		}
@@ -904,7 +930,7 @@ func (h *Harness) coordinatorFor(ctx context.Context, sessionID string) (*coordi
 		}
 		c = h.sessions[sessionID]
 		if c == nil {
-			c = &coordinator{graph: graph}
+			c = &coordinator{graph: graph, bgState: bgOpen}
 			h.sessions[sessionID] = c
 		}
 		corru := c.corru
@@ -1104,6 +1130,10 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 	if c.graph.Session.State.Lifecycle != LifecycleOpen {
 		c.mu.Unlock()
 		return OperationRecord{}, nil, "", invalidInput("session %q is archived; admission requires an open Session", req.SessionID)
+	}
+	if c.bgState == bgClosed { // a permanently closed background group rejects agent work beside the lifecycle gate
+		c.mu.Unlock()
+		return OperationRecord{}, nil, "", invalidInput("session is closed to agent work")
 	}
 	if c.graph.Session.State.CurrentOperationID != "" {
 		running := c.graph.Session.State.CurrentOperationID
@@ -1383,27 +1413,33 @@ func (h *Harness) rematerialize(ctx context.Context, c *coordinator, sessionID s
 	return nil
 }
 
-// startExecution installs the coordinator's active execution and starts the
-// Agent composition on the Harness context after the admission commit. The
-// execution slot releases, and the post-terminal buffer drain completes,
-// before the execution's done channel closes.
+// startExecution installs the coordinator's active execution with its own
+// execution context — a child of the Harness context — and starts the Agent
+// composition on it after the admission commit. Interrupt cancels that
+// context; the execution slot releases, and the post-terminal buffer drain
+// completes, before the execution's done channel closes. After execute, the
+// storage failure latch, and the drain have returned, the tail clears the run
+// slot only when it is still this run — a drain-installed successor owns the
+// slot and a distinct context — then cancels the execution context, runs the
+// child completion settlement for this operation, and closes done.
 func (h *Harness) startExecution(c *coordinator, operationID string, prepared PreparedExecution) {
-	run := &activeExecution{done: make(chan struct{})}
+	execCtx, cancel := context.WithCancel(h.ctx)
+	run := &activeExecution{done: make(chan struct{}), execCtx: execCtx, cancel: cancel}
 	c.mu.Lock()
 	c.run = run
 	c.mu.Unlock()
 	go func() {
-		defer func() {
-			c.mu.Lock()
-			if c.run == run { // a buffered drain may have installed the next execution already
-				c.run = nil
-			}
-			c.mu.Unlock()
-			close(run.done)
-		}()
-		err := h.execute(c, operationID, prepared)
+		err := h.execute(c, operationID, prepared, run.execCtx)
 		h.recordStorageFailure(err)
 		h.drainBuffers(c, run)
+		c.mu.Lock()
+		if c.run == run { // a buffered drain may have installed the next execution already
+			c.run = nil
+		}
+		c.mu.Unlock()
+		cancel() // the context dies only after the drain: a drain-installed successor owns a distinct context
+		h.childCompletionSettled(c, operationID)
+		close(run.done)
 	}()
 }
 

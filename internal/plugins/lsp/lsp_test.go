@@ -888,7 +888,7 @@ func TestNormalizeContracts(t *testing.T) {
 // TestDescriptionsAndPreparationShape: the updated diagnostics description,
 // the verbatim workspace_symbol schema, and the one workspace.inspect pair.
 func TestDescriptionsAndPreparationShape(t *testing.T) {
-	diagDesc, err := diagnosticsTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{})
+	diagDesc, err := diagnosticsTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
 	if err != nil {
 		t.Fatalf("diagnostics describe: %v", err)
 	}
@@ -899,7 +899,7 @@ func TestDescriptionsAndPreparationShape(t *testing.T) {
 		t.Fatalf("diagnostics definition = %+v", diagDesc.Definition)
 	}
 
-	symbolDesc, err := workspaceSymbolTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{})
+	symbolDesc, err := workspaceSymbolTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
 	if err != nil {
 		t.Fatalf("workspace_symbol describe: %v", err)
 	}

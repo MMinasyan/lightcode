@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -545,7 +546,7 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 		copiedResult.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
 		copiedSignal := validSignalEntry("")
 		copiedSignal.EntryID = hexID(4)
-		copiedSignal.RelatedOperation = operationRef{SessionID: otherSession(), OperationID: "source-op"}
+		copiedSignal.RelatedOperation = &operationRef{SessionID: otherSession(), OperationID: "source-op"}
 		fixture.entries = []testEntry{
 			{env: Entry{SessionID: testSessionID, ID: hexID(1), Kind: EntryInput, Sequence: 1, CommittedAt: testTime}, input: &copiedInput},
 			{env: Entry{SessionID: testSessionID, ID: hexID(2), Kind: EntryAssistant, Sequence: 2, CommittedAt: testTime}, assistant: &copiedAssistant},
@@ -1459,7 +1460,7 @@ func TestGraphValidatorForkReferenceRules(t *testing.T) {
 		copiedAssistant.EntryID = hexID(2)
 		copiedSignal := validSignalEntry("")
 		copiedSignal.EntryID = hexID(3)
-		copiedSignal.RelatedOperation = operationRef{SessionID: otherSession(), OperationID: "source-op"}
+		copiedSignal.RelatedOperation = &operationRef{SessionID: otherSession(), OperationID: "source-op"}
 		fork.entries = []testEntry{
 			{env: Entry{SessionID: testSessionID, ID: hexID(1), Kind: EntryInput, Sequence: 1, CommittedAt: testTime}, input: &copiedInput},
 			{env: Entry{SessionID: testSessionID, ID: hexID(2), Kind: EntryAssistant, Sequence: 2, CommittedAt: testTime}, assistant: &copiedAssistant},
@@ -1539,7 +1540,7 @@ func TestGraphValidatorForkReferenceRules(t *testing.T) {
 		fixture := validTestGraph()
 		owned := validSignalEntry(testOpID)
 		owned.EntryID = hexID(3)
-		owned.RelatedOperation = operationRef{SessionID: testSessionID, OperationID: "ghost"}
+		owned.RelatedOperation = &operationRef{SessionID: testSessionID, OperationID: "ghost"}
 		fixture.entries = append(fixture.entries, testEntry{
 			env:    Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntrySignal, Sequence: 3, CommittedAt: testTime},
 			signal: &owned,
@@ -1548,6 +1549,63 @@ func TestGraphValidatorForkReferenceRules(t *testing.T) {
 			_, err := validateFixture(t, fixture.storage(t), testSessionID)
 			return err
 		}())
+	})
+}
+
+// TestGraphValidatorBackgroundCompletionOwnership proves the fork-prefix
+// ownership exception: every non-fork Session — root or child — may carry
+// operationless background_completion entries, in a fork such entries are
+// exempt from prefix ordering, and every other operationless entry keeps the
+// existing rules.
+func TestGraphValidatorBackgroundCompletionOwnership(t *testing.T) {
+	completion := func(entryID string, sequence int64) testEntry {
+		sig := validBackgroundCompletionEntry()
+		sig.EntryID = entryID
+		return testEntry{env: Entry{SessionID: testSessionID, ID: entryID, Kind: EntrySignal, Sequence: sequence, CommittedAt: testTime}, signal: &sig}
+	}
+
+	t.Run("root with operationless completion validates", func(t *testing.T) {
+		fixture := &testGraph{session: validSessionRecord()}
+		fixture.entries = []testEntry{completion(hexID(9), 1)}
+		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+			t.Fatalf("root with operationless completion rejected: %v", err)
+		}
+	})
+
+	t.Run("child with operationless completion validates", func(t *testing.T) {
+		fixture := &testGraph{session: validSessionRecord()}
+		fixture.session.Identity.ParentSessionID = otherSession()
+		fixture.entries = []testEntry{completion(hexID(9), 1)}
+		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+			t.Fatalf("child with operationless completion rejected: %v", err)
+		}
+	})
+
+	t.Run("fork completion exempt from prefix ordering", func(t *testing.T) {
+		fixture := validTestGraph()
+		fixture.session.Identity.SourceSessionID = otherSession()
+		fixture.session.Identity.SourceBoundaryEntryID = otherEntry()
+		fixture.entries = append(fixture.entries, completion(hexID(9), 3))
+		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+			t.Fatalf("fork completion after an owned entry rejected: %v", err)
+		}
+	})
+
+	t.Run("operationless fixed-kind signal on a child corrupts", func(t *testing.T) {
+		fixture := &testGraph{session: validSessionRecord()}
+		fixture.session.Identity.ParentSessionID = otherSession()
+		copied := validSignalEntry("")
+		copied.EntryID = hexID(9)
+		fixture.entries = []testEntry{
+			{env: Entry{SessionID: testSessionID, ID: hexID(9), Kind: EntrySignal, Sequence: 1, CommittedAt: testTime}, signal: &copied},
+		}
+		corrupt := wantCorruption(t, func() error {
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			return err
+		}())
+		if !strings.Contains(corrupt.Detail, "root Session carries independently copied entry") {
+			t.Fatalf("corruption detail = %q, want the copied-entry rule", corrupt.Detail)
+		}
 	})
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 )
 
@@ -36,4 +37,43 @@ func ConfiguredInvocationForTest(sections map[string]string) (Invocation, error)
 		return Invocation{}, err
 	}
 	return Invocation{snapshot: snapshot}, nil
+}
+
+// EqualEventForTest exposes the field-wise Event comparison to the external
+// runtime_test package. It is absent from production builds.
+func EqualEventForTest(a, b Event) bool {
+	return equalEvent(a, b)
+}
+
+// ComposeScopeForTest opens the given plugins as one Runtime scope through
+// the composition machinery — every dependency binding is constructed
+// in-package — and returns the bound capability values by ID (ordinary
+// bindings plus the private Core seam values a Harness consumer wires, such
+// as the job stopper) together with the scope disposal. It is absent from
+// production builds.
+func ComposeScopeForTest(ctx context.Context, info ScopeInfo, plugins []Plugin) (map[string]any, func() error, error) {
+	c, err := newComposition(plugins)
+	if err != nil {
+		return nil, nil, err
+	}
+	sc, err := c.openScope(ctx, info, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	values := make(map[string]any, len(sc.bindings.entries)+len(sc.jobStoppers))
+	for id, entry := range sc.bindings.entries {
+		values[id] = entry.value
+	}
+	for id, value := range sc.jobStoppers {
+		values[id] = value
+	}
+	return values, sc.close, nil
+}
+
+// DescribeToolForTest invokes one declared tool spec's recorded description
+// function for the external tests that exercise a real plugin's describe
+// closure — outside this package only the zero Invocation is constructible.
+// It is absent from production builds.
+func DescribeToolForTest(spec CapabilitySpec, inv Invocation, constraints ToolConstraints, identity harness.SessionIdentity) (ToolDescription, error) {
+	return spec.describe(inv, constraints, identity)
 }

@@ -145,7 +145,7 @@ func (w *settleWatch) settlements() int {
 // newCancelableHarness returns a Harness over a cancelable context whose
 // preparation returns the given prepared execution, or the override callback's
 // result when one is supplied.
-func newCancelableHarness(t *testing.T, store *graphStorage, prepared PreparedExecution, prepare func(context.Context, PreparationRequest) (PreparedExecution, error)) (*Harness, context.CancelFunc) {
+func newCancelableHarness(t *testing.T, store Storage, prepared PreparedExecution, prepare func(context.Context, PreparationRequest) (PreparedExecution, error)) (*Harness, context.CancelFunc) {
 	t.Helper()
 	if prepare == nil {
 		prepare = func(context.Context, PreparationRequest) (PreparedExecution, error) { return prepared, nil }

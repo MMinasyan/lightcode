@@ -35,15 +35,49 @@ type ToolDescription struct {
 	DefaultHidden bool
 }
 
+// BackgroundServices is the background-work surface a prepared call carries:
+// child launch, job start, and completion delivery over the Runtime's public
+// Harness methods. The Runtime's implementation is the armed backgroundBridge
+// injected by the production opener; the zero ToolContext carries none.
+type BackgroundServices interface {
+	LaunchChild(ctx context.Context, req harness.LaunchChildRequest) (harness.LaunchChildResult, error)
+	StartJob(ctx context.Context, sessionID, jobID string, spawn func(ctx context.Context, completionID string) error) error
+	DeliverCompletion(ctx context.Context, sessionID, completionID, content string) error
+}
+
+// backgroundBridge is the BackgroundServices implementation: a small struct
+// holding the Runtime's Harness. It is created before harness.New, threaded
+// into the preparation, and armed with the constructed Harness before the
+// owner is published. No synchronization: harness.New performs no I/O and the
+// first Prepare requires the admission gate, so no caller can observe the
+// unarmed bridge.
+type backgroundBridge struct {
+	h *harness.Harness
+}
+
+func (b *backgroundBridge) LaunchChild(ctx context.Context, req harness.LaunchChildRequest) (harness.LaunchChildResult, error) {
+	return b.h.LaunchChildSession(ctx, req)
+}
+
+func (b *backgroundBridge) StartJob(ctx context.Context, sessionID, jobID string, spawn func(ctx context.Context, completionID string) error) error {
+	return b.h.StartJob(ctx, sessionID, jobID, spawn)
+}
+
+func (b *backgroundBridge) DeliverCompletion(ctx context.Context, sessionID, completionID, content string) error {
+	return b.h.DeliverBackgroundCompletion(ctx, sessionID, completionID, content)
+}
+
 // ToolContext carries what one tool call needs beyond the call itself: the
 // Workspace, the calling Operation's admitted-input identity, the captured
-// Invocation, and the selected Agent's hard constraints. It exposes neither
-// the complete admission register nor file/command-specific numeric fields.
+// Invocation, the selected Agent's hard constraints, and the armed background
+// services bridge. It exposes neither the complete admission register nor
+// file/command-specific numeric fields.
 type ToolContext struct {
 	Workspace     string
 	AdmittedEntry harness.EntryRef
 	Invocation    Invocation
 	Constraints   ToolConstraints
+	Background    BackgroundServices
 }
 
 // Tool is one concrete tool capability: pure terminating argument
@@ -63,15 +97,15 @@ type Tool interface {
 // instance is constructed to obtain the declaration's metadata. A nil
 // description function records a declaration lacking one, which composition
 // rejects.
-func ToolSpec(id string, describe func(Invocation, ToolConstraints) (ToolDescription, error)) CapabilitySpec {
+func ToolSpec(id string, describe func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error)) CapabilitySpec {
 	if describe == nil {
 		return CapabilitySpec{id: id, typ: toolType}
 	}
 	return CapabilitySpec{
 		id:  id,
 		typ: toolType,
-		describe: func(invocation Invocation, constraints ToolConstraints) (ToolDescription, error) {
-			description, err := describe(invocation, constraints)
+		describe: func(invocation Invocation, constraints ToolConstraints, identity harness.SessionIdentity) (ToolDescription, error) {
+			description, err := describe(invocation, constraints, identity)
 			if err != nil {
 				return ToolDescription{}, err
 			}

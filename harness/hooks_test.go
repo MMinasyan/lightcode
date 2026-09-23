@@ -730,7 +730,7 @@ func TestToolArgumentHookInvalidOpenedExecutionRejectsHooks(t *testing.T) {
 					return nil
 				}}, nil
 			})
-			if err := h.execute(c, testOpID, prepared); err == nil {
+			if err := h.execute(c, testOpID, prepared, h.ctx); err == nil {
 				t.Fatalf("execute = nil, want the invalid-hook rejection")
 			}
 			if closed != 1 {

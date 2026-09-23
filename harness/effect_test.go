@@ -1196,7 +1196,7 @@ func TestExecuteSuccessSettlesOuterTerminal(t *testing.T) {
 	}
 	spy := &toolSpy{}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
-	if err := h.execute(c, testOpID, prepared); err != nil {
+	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -1243,7 +1243,7 @@ func TestExecuteOpensOnceWithCommittedAdmission(t *testing.T) {
 		opens = append(opens, openRecord{ctx: ctx, adm: adm})
 		return effectExecution(modelFn, spy.tool), nil
 	})
-	if err := h.execute(c, testOpID, prepared); err != nil {
+	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	if len(opens) != 1 {
@@ -1281,7 +1281,7 @@ func TestExecuteCanceledBeforeOpenSkipsOpener(t *testing.T) {
 		return effectExecution(modelFn, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }), nil
 	})
 	cancel() // the execution context is lost before the opener could start
-	if err := h.execute(c, testOpID, prepared); !errors.Is(err, context.Canceled) {
+	if err := h.execute(c, testOpID, prepared, h.ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("execute = %v, want the context error", err)
 	}
 	if opens != 0 {
@@ -1318,7 +1318,7 @@ func TestExecuteOpenerErrorSettlesOrdinaryTerminals(t *testing.T) {
 				Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
 			}, openErr
 		})
-		if err := h.execute(c, testOpID, prepared); err != openErr {
+		if err := h.execute(c, testOpID, prepared, h.ctx); err != openErr {
 			t.Fatalf("execute = %v, want the exact opener error", err)
 		}
 		if modelRuns != 0 {
@@ -1342,7 +1342,7 @@ func TestExecuteOpenerErrorSettlesOrdinaryTerminals(t *testing.T) {
 		h, _, c, sessionID, prepared, _ := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
 			return Execution{}, storageErr
 		})
-		if err := h.execute(c, testOpID, prepared); err != storageErr {
+		if err := h.execute(c, testOpID, prepared, h.ctx); err != storageErr {
 			t.Fatalf("execute = %v, want the exact storage-class error", err)
 		}
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -1403,7 +1403,7 @@ func TestExecuteInvalidOpenedExecutionClosesBeforeRejection(t *testing.T) {
 			var sessionID string
 			var prepared PreparedExecution
 			h, store, c, sessionID, prepared, _ = newOpenerHarness(t, open)
-			err := h.execute(c, testOpID, prepared)
+			err := h.execute(c, testOpID, prepared, h.ctx)
 			if !errors.Is(err, ErrInvalid) {
 				t.Fatalf("execute = %v, want the invalid-execution rejection", err)
 			}
@@ -2371,7 +2371,7 @@ func TestExecuteOrderedBatchSettlesExactlyOnce(t *testing.T) {
 	}
 	spy := &toolSpy{}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
-	if err := h.execute(c, testOpID, prepared); err != nil {
+	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	if got := spy.dispatched(); len(got) != 2 || got[0] != "call-1" || got[1] != "call-2" {
@@ -2424,7 +2424,7 @@ func TestToolEffectRealOutcomeWinsCancellationRace(t *testing.T) {
 	}
 	h, store, c, sessionID, prepared, harnessCancel := newExecutionHarness(t, modelFn, toolFn)
 	cancel = harnessCancel
-	if err := h.execute(c, testOpID, prepared); err != nil {
+	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
@@ -2467,7 +2467,7 @@ func TestToolOriginatedInterruptionSettlesUnstartedCalls(t *testing.T) {
 	}
 	spy := &toolSpy{plan: toolFn}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
-	if err := h.execute(c, testOpID, prepared); err != nil {
+	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	if got := spy.dispatched(); len(got) != 1 || got[0] != "call-1" {
@@ -2520,7 +2520,7 @@ func TestExecuteBetweenEffectCancellationSettlesInterruption(t *testing.T) {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	})
 	cancel = harnessCancel
-	if err := h.execute(c, testOpID, prepared); err != nil {
+	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -2546,7 +2546,7 @@ func TestExecuteCapSettlesFailure(t *testing.T) {
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, func(_ context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	})
-	if err := h.execute(c, testOpID, prepared); err != nil {
+	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -2662,7 +2662,7 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 			}
 			return nil
 		}
-		err := h.execute(c, testOpID, prepared)
+		err := h.execute(c, testOpID, prepared, h.ctx)
 		if !errors.Is(err, ErrStorage) {
 			t.Fatalf("execute = %v, want the injected storage failure", err)
 		}
@@ -2864,7 +2864,7 @@ func TestModelEffectIntentCancellationSettlesInterruption(t *testing.T) {
 		}
 		return nil
 	}
-	if err := h.execute(c, testOpID, prepared); err != nil {
+	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -2918,7 +2918,7 @@ func TestToolEffectIntentCancellationSettlesInterrupted(t *testing.T) {
 		}
 		return nil
 	}
-	if err := h.execute(c, testOpID, prepared); err != nil {
+	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	graph, err := validateFixture(t, store, sessionID)

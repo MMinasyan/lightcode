@@ -97,6 +97,8 @@ const applyPatchParameters = `{
 
 const runCommandDescription = `Executes a shell command and returns combined stdout and stderr.
 - Each call starts a fresh shell in the project root. Environment variables, aliases, and working directory do not persist between calls. Use "cd /path && command" if you need a different working directory.
+- Foreground commands use the default timeout. Background commands run until they exit, are killed, or reach an explicit timeout parameter.
+- For commands that may run for a long time, keep producing output, wait on external state, and are not needed before your next step, set background=true. It returns immediately with a process ID. You will be notified when it finishes. To read output while it is still running, use sleep to wait, then process to read the output. To kill it, use process. Do not use background=true for commands that will probably finish in a few seconds.
 - Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use <EDIT FILE OR WRITE FILE>.`
 
 const runCommandParameters = `{
@@ -109,9 +111,33 @@ const runCommandParameters = `{
     "timeout": {
       "type": "integer",
       "description": "Timeout in seconds for this command. Overrides the default."
+    },
+    "background": {
+      "type": "boolean",
+      "description": "If true, run the command in the background and return immediately with a process ID."
     }
   },
   "required": ["command"]
+}`
+
+const processDescription = "Manage background processes started by run_command with background=true.\n" +
+	"\t- Use action \"read\" with id to read the output of a running background process.\n" +
+	"\t- Use action \"kill\" with id to terminate a background process.\n" +
+	"\t- Use action \"list\" to list background processes in the current session and their status."
+
+const processParameters = `{
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "description": "Action to perform: \"read\" to get output, \"kill\" to terminate, \"list\" to list processes in the current session."
+    },
+    "id": {
+      "type": "string",
+      "description": "Process ID returned by run_command with background=true."
+    }
+  },
+  "required": ["action"]
 }`
 
 const sleepDescription = `Wait for a specified number of seconds before continuing.

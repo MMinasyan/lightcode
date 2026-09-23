@@ -315,9 +315,30 @@ func LoadDotEnv() (*ManagedEnv, error) {
 		m.managed[key] = struct{}{}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
+		return m, fmt.Errorf("read %s: %w", path, err)
 	}
 	return m, nil
+}
+
+// EnvWithoutKeys returns env with every entry whose name is in keys removed.
+// Order otherwise preserved; nil keys returns env unchanged.
+func EnvWithoutKeys(env []string, keys []string) []string {
+	if len(keys) == 0 {
+		return env
+	}
+	drop := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		drop[k] = struct{}{}
+	}
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		name, _, _ := strings.Cut(entry, "=")
+		if _, ok := drop[name]; ok {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // ReadDotEnvKeys reads the .env file at path and returns the key names it

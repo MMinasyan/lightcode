@@ -800,7 +800,7 @@ func newSignalEntry(tx Transaction, sessionID, operationID string, kind SignalKi
 		EntryID:          entryID,
 		OperationID:      operationID,
 		Signal:           kind,
-		RelatedOperation: operationRef{SessionID: sessionID, OperationID: operationID},
+		RelatedOperation: &operationRef{SessionID: sessionID, OperationID: operationID},
 		Content:          signalContent(kind),
 	}
 	payload, err := encodeSignalEntry(entry)
@@ -1666,7 +1666,10 @@ func (h *Harness) commitHookResult(ctx context.Context, c *coordinator, operatio
 // the opened effects, then the outer terminal settlement converges the
 // durable state with the run's outcome, and a non-nil resource cleanup runs
 // once after that settlement attempt — before the slot releases or the next
-// buffered delivery starts. The Agent's expected model and advertised tools
+// buffered delivery starts. The execution context is the installed run's
+// execCtx: Interrupt cancels it, and closure or a consumed interrupt marker
+// settles the durable Operation as interruption at entry. The Agent's
+// expected model and advertised tools
 // come from an independent capture retained before the opener runs, so an
 // opener mutating its admission input locally never changes what is
 // advertised after admission. An opener error resolves through the ordinary
@@ -1676,7 +1679,7 @@ func (h *Harness) commitHookResult(ctx context.Context, c *coordinator, operatio
 // its non-nil Close invoked before rejection, and no Agent runs with invalid
 // effects. A cleanup failure never rewrites the terminal Operation; it is
 // retained for Wait alongside the first storage failure.
-func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedExecution) error {
+func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedExecution, execCtx context.Context) error {
 	c.mu.Lock()
 	op, ok := c.graph.Operation(operationID)
 	if !ok {
@@ -1686,11 +1689,19 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 	}
 	admission := ownOperationRecord(op).Admission
 	agentCapture := ownCapture(admission.Execution)
+	guard := c.bgState == bgClosed || c.interruptOp == operationID
+	if c.interruptOp == operationID {
+		c.interruptOp = "" // consumed: the marker reaches exactly the execution it names
+	}
 	c.mu.Unlock()
-	if err := h.ctx.Err(); err != nil { // the execution is already canceled: the opener never starts
+	if guard || h.ctx.Err() != nil { // the entry guard joins the harness-loss early return: the opener never starts
+		err := h.ctx.Err()
+		if err == nil {
+			err = context.Canceled
+		}
 		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{}, err)
 	}
-	exec, err := prepared.Open(h.ctx, admission)
+	exec, err := prepared.Open(execCtx, admission)
 	if err != nil {
 		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{}, err)
 	}
@@ -1715,7 +1726,7 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 	if exec.Close != nil {
 		defer func() { h.recordCleanupFailure(exec.Close()) }()
 	}
-	res, err := agent.Run(h.ctx, agent.Invocation{
+	res, err := agent.Run(execCtx, agent.Invocation{
 		ExpectedModel: agentCapture.Model,
 		Tools:         agentCapture.Tools,
 		Context:       h.contextSource(c, operationID),
