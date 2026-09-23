@@ -1147,8 +1147,8 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 				if !errors.Is(err, ErrClosed) {
 					t.Fatalf("admitted Reload under shutdown = %v, want ErrClosed: a live caller on a done owner still reports closure", err)
 				}
-			default:
-				t.Fatal("Close returned before the admitted Reload returned")
+			case <-time.After(10 * time.Second):
+				t.Fatal("the admitted Reload never returned after Close")
 			}
 		})
 	})

@@ -673,18 +673,32 @@ func TestComposedToolsHarnessRecovery(t *testing.T) {
 	ctx := context.Background()
 	arrived := make(chan struct{}, 1)
 	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
-	modelFn := func(_ context.Context, _ model.Request) (model.Stream, error) {
+	modelFn := func(ctx context.Context, _ model.Request) (model.Stream, error) {
 		select {
 		case arrived <- struct{}{}:
 		default:
 		}
-		<-release
-		return nil, errors.New("released after convergence")
+		// Park on the release or the execution context: harness cancellation
+		// in cleanup must unblock the parked goroutine instead of letting it
+		// write into a closed store.
+		select {
+		case <-release:
+			return nil, errors.New("released after convergence")
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	th := newToolsHarness(t, modelFn)
 	session := th.createSession()
 	th.submit(session, "op-1", "park")
+	// Unpark the model before the fixture's cancellation and store close
+	// run: registered after the fixture's own cleanups, LIFO runs this one
+	// first, so the released goroutine wakes against an open store. It
+	// performs no durable writes after release — recovery already settled
+	// the operation, so every settle attempt is rejected at the
+	// terminal-status precondition before the transaction writes, the
+	// buffers are empty, and the ctx.Done branch bounds the goroutine's exit.
+	t.Cleanup(func() { close(release) })
 
 	select {
 	case <-arrived:
