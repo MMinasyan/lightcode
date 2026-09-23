@@ -813,7 +813,9 @@ func TestDiscoverCustomProviderDoesNotHoldRuntimeLockDuringFetch(t *testing.T) {
 	// Prove the runtime lock is released during the network fetch: a slow
 	// discovery server must not block a concurrent ProviderList call.
 	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
 		<-gate
 		_, _ = w.Write([]byte(`{"data":[{"id":"m","context_window":1000}]}`))
 	}))
@@ -828,8 +830,13 @@ func TestDiscoverCustomProviderDoesNotHoldRuntimeLockDuringFetch(t *testing.T) {
 		done <- err
 	}()
 
-	// Give the goroutine time to enter the network call.
-	time.Sleep(50 * time.Millisecond)
+	// Rendezvous: the fetch handler is entered (and parked on the gate) before
+	// the concurrent ProviderList probe.
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("discovery fetch never reached the server")
+	}
 
 	// ProviderList must return promptly even while discovery is in flight.
 	listDone := make(chan struct{})

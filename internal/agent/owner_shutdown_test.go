@@ -398,5 +398,18 @@ func TestOwnerShutdownContractMatrix(t *testing.T) {
 			_ = lock.Release()
 			t.Fatal("session claim released although the turn join timed out")
 		}
+
+		// The abandoned turn's durable unwind must finish before the subtest
+		// tears down its TempDir.
+		wgDone := make(chan struct{})
+		go func() {
+			rt.turnWG.Wait()
+			close(wgDone)
+		}()
+		select {
+		case <-wgDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("abandoned turn never released its wait-group count")
+		}
 	})
 }

@@ -1440,7 +1440,8 @@ func newCatalogBackedTestAgentForRoot(t *testing.T, home, projectRoot string) *A
 
 func TestStaleIdsClearedOnClose(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); a.ShutdownOwner() })
 	a.Init(ctx)
 
 	firstID, err := a.NewSession("", "primary")
@@ -1477,7 +1478,8 @@ func TestStaleIdsClearedOnClose(t *testing.T) {
 
 func TestBackgroundWakeStartsNonCurrentSession(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); a.ShutdownOwner() })
 	a.Init(ctx)
 
 	firstID, err := a.NewSession("", "primary")
@@ -1770,7 +1772,8 @@ func TestQueueDrainsAllFromOneNudge(t *testing.T) {
 
 func TestQueueDrainPullsRuntimeConfigForNonCurrentSession(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); a.ShutdownOwner() })
 	a.Init(ctx)
 
 	firstID, err := a.NewSession("", "primary")
@@ -1818,7 +1821,8 @@ func TestQueueDrainPullsRuntimeConfigForNonCurrentSession(t *testing.T) {
 
 func TestSessionListExcludesChildren(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); a.ShutdownOwner() })
 	a.Init(ctx)
 
 	parentID, err := a.NewSession("", "primary")
@@ -1918,7 +1922,8 @@ func TestOpenArchiveDeleteRejectChildren(t *testing.T) {
 
 func TestMutationsRejectDuringTransition(t *testing.T) {
 	a := newCatalogBackedTestAgent(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); a.ShutdownOwner() })
 	a.Init(ctx)
 
 	id, err := a.NewSession("", "primary")

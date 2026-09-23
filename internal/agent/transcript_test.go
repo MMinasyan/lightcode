@@ -3175,6 +3175,12 @@ func TestPreseedRefusedFinalLaunchReleasesExactAdds(t *testing.T) {
 	// test observes the wait-group.
 	requeueParked := make(chan struct{})
 	releaseRequeue := make(chan struct{})
+	var releaseOnce sync.Once
+	// Release on every exit path: a mid-test Fatal must not leave the drain
+	// goroutine parked inside the requeue while it holds rt.mu, or the
+	// cleanup's ShutdownOwner would hang on the join.
+	release := func() { releaseOnce.Do(func() { close(releaseRequeue) }) }
+	defer release()
 	var parkOnce sync.Once
 	a.SetEventHandler(func(ev Event) {
 		if ev.Kind == EventQueueChanged && len(ev.Queue) > 0 {
@@ -3223,7 +3229,7 @@ func TestPreseedRefusedFinalLaunchReleasesExactAdds(t *testing.T) {
 		// Expected: the preseed Add is still owned.
 	}
 
-	close(releaseRequeue)
+	release()
 	select {
 	case <-drainDone:
 	case <-time.After(10 * time.Second):
