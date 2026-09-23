@@ -110,13 +110,29 @@ func (g *launchGate) Transact(ctx context.Context, fn func(Transaction) error) e
 	return err
 }
 
-// assertStopBlocked proves a Stop call has not returned yet.
-func assertStopBlocked(t *testing.T, done <-chan error) {
+// awaitStopInterval proves a Stop call is held inside its stop interval: the
+// interval is installed under the coordinator lock after the snapshot and is
+// cleared only at the return, so finding it open with the call's result still
+// absent observes the blocking state itself — never a timing window.
+func awaitStopInterval(t *testing.T, c *coordinator, done <-chan error) {
 	t.Helper()
-	select {
-	case err := <-done:
-		t.Fatalf("Stop returned before convergence: %v", err)
-	case <-time.After(200 * time.Millisecond):
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case err := <-done:
+			t.Fatalf("Stop returned before convergence: %v", err)
+		default:
+		}
+		c.mu.Lock()
+		waiting := c.stop != nil
+		c.mu.Unlock()
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Stop never entered its stop interval")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 
@@ -463,9 +479,13 @@ func TestStopGatedLaunchRunsClosedEntryPath(t *testing.T) {
 		t.Fatalf("the committed child register is missing")
 	}
 
+	childC, err := h.coordinatorFor(context.Background(), childID)
+	if err != nil {
+		t.Fatalf("coordinatorFor(child): %v", err)
+	}
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- h.Stop(context.Background(), childID) }()
-	assertStopBlocked(t, stopDone) // the parent membership holds the stop
+	awaitStopInterval(t, childC, stopDone) // the parent membership holds the stop
 
 	close(gate.readRelease)
 	if err := stopResult(t, stopDone); err != nil {
@@ -495,7 +515,6 @@ func TestStopGatedLaunchRunsClosedEntryPath(t *testing.T) {
 	if len(storedSignals(t, store, testSessionID)) != 0 {
 		t.Fatalf("parent signals = %+v, want the idle parent's admission delivery, not a signal", storedSignals(t, store, testSessionID))
 	}
-	childC := cachedCoordinator(t, h, childID)
 	childC.mu.Lock()
 	closed := childC.bgState == bgClosed
 	childC.mu.Unlock()
@@ -546,9 +565,13 @@ func TestStopRacingStartSettlesWithoutStarting(t *testing.T) {
 		t.Fatalf("the committed child register is missing")
 	}
 
+	childC, err := h.coordinatorFor(context.Background(), childID)
+	if err != nil {
+		t.Fatalf("coordinatorFor(child): %v", err)
+	}
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- h.Stop(context.Background(), childID) }()
-	assertStopBlocked(t, stopDone) // the parent membership holds the stop
+	awaitStopInterval(t, childC, stopDone) // the parent membership holds the stop
 
 	close(gate.txRelease)
 	if err := stopResult(t, stopDone); err != nil {
@@ -606,7 +629,7 @@ func TestStopChildJoinsReservationAndRun(t *testing.T) {
 
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- h.Stop(context.Background(), completionChildID) }()
-	assertStopBlocked(t, stopDone) // the held reservation holds the stop
+	awaitStopInterval(t, childC, stopDone) // the held reservation holds the stop
 
 	h.startExecution(childC, "op-2", *prepared) // the ordinary admission installs before releasing
 	release()
@@ -667,7 +690,7 @@ func TestStopChildWaitsForLiveJobDelivery(t *testing.T) {
 
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- h.Stop(context.Background(), child) }()
-	assertStopBlocked(t, stopDone)
+	awaitStopInterval(t, cachedCoordinator(t, h, child), stopDone)
 	if signals := storedSignals(t, store, root); len(signals) != 0 {
 		t.Fatalf("parent signals while the job is live = %d, want none", len(signals))
 	}
@@ -746,17 +769,24 @@ func TestStopConcurrentCallersJoinSameError(t *testing.T) {
 		t.Fatalf("StartJob: %v", err)
 	}
 
-	// The first stop owns the interval and parks at the gated job; the other
-	// callers join it and cannot return before it converges.
+	// The first stop owns the interval and parks at the gated job. The two
+	// joiners signal entry immediately before their Stop calls while that
+	// interval is provably open; the rendezvous receives both entries, then
+	// the gate releases — the joiners have joined and cannot return before
+	// the owner converges.
 	ownerDone := make(chan error, 1)
 	go func() { ownerDone <- h.Stop(context.Background(), testSessionID) }()
-	assertStopBlocked(t, ownerDone)
+	awaitStopInterval(t, cachedCoordinator(t, h, testSessionID), ownerDone)
+	joinerEntered := make(chan struct{}, 2)
 	joinerDone := make(chan error, 2)
 	for i := 0; i < 2; i++ {
-		go func() { joinerDone <- h.Stop(context.Background(), testSessionID) }()
+		go func() {
+			joinerEntered <- struct{}{}
+			joinerDone <- h.Stop(context.Background(), testSessionID)
+		}()
 	}
-	assertStopBlocked(t, joinerDone)
-	assertStopBlocked(t, ownerDone)
+	<-joinerEntered
+	<-joinerEntered
 
 	close(gate) // the job finishes: the owner collects the child error and stores it
 	err = stopResult(t, ownerDone)
@@ -834,7 +864,7 @@ func TestStopReportsChildErrorAndWaitsForNaturalDelivery(t *testing.T) {
 		store.mu.Unlock()
 		stopDone := make(chan error, 1)
 		go func() { stopDone <- h.Stop(context.Background(), testSessionID) }()
-		assertStopBlocked(t, stopDone)
+		awaitStopInterval(t, c, stopDone)
 		c.mu.Lock()
 		claimed := member.claimed
 		c.mu.Unlock()
@@ -896,7 +926,7 @@ func TestStopRootRejectsStartWhileStopping(t *testing.T) {
 
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- h.Stop(context.Background(), root) }()
-	assertStopBlocked(t, stopDone) // the parked kill-completion holds the stop
+	awaitStopInterval(t, cachedCoordinator(t, h, root), stopDone) // the parked kill-completion holds the stop
 
 	spawns := 0
 	if err := h.StartJob(context.Background(), root, "feedface", func(context.Context, string) error {
@@ -982,7 +1012,7 @@ func TestStopHeldPreparationRegistersAfterReopen(t *testing.T) {
 
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- h.Stop(context.Background(), root) }()
-	assertStopBlocked(t, stopDone)
+	awaitStopInterval(t, cachedCoordinator(t, h, root), stopDone)
 
 	launchDone := make(chan error, 1)
 	go func() {

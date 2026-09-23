@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -657,20 +656,12 @@ func TestConcurrentClosedDeliveriesSerialize(t *testing.T) {
 	}
 	closeBackgroundMode(c)
 
-	var (
-		mu       sync.Mutex
-		arrivals int
-	)
+	arrived := make(chan struct{}, 2)
 	gate := make(chan struct{})
 	store.entryHook = func(draft EntryDraft) error {
 		if draft.Kind == EntrySignal {
-			mu.Lock()
-			arrivals++
-			first := arrivals == 1
-			mu.Unlock()
-			if first {
-				<-gate
-			}
+			arrived <- struct{}{}
+			<-gate
 		}
 		return nil
 	}
@@ -683,27 +674,13 @@ func TestConcurrentClosedDeliveriesSerialize(t *testing.T) {
 		resB <- h.DeliverBackgroundCompletion(context.Background(), session, memberB.completionID, "from job")
 	}()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		mu.Lock()
-		n := arrivals
-		mu.Unlock()
-		if n >= 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no closed transaction reached storage")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	time.Sleep(50 * time.Millisecond) // an unserialized second delivery would have reached storage
-	mu.Lock()
-	n := arrivals
-	mu.Unlock()
-	if n != 1 {
-		t.Fatalf("second closed delivery entered storage while the first held the coordinator: %d arrivals", n)
+	<-arrived           // the first delivery's transaction parks inside storage
+	if c.mu.TryLock() { // the serialization proof: the parked transaction holds the coordinator lock the second delivery must take before it can reach storage
+		c.mu.Unlock()
+		t.Fatalf("the closed delivery released the coordinator before its transaction committed")
 	}
 	close(gate)
+	<-arrived // the second delivery's transaction enters storage only after the release
 
 	if err := <-resA; err != nil {
 		t.Fatalf("child delivery: %v", err)
