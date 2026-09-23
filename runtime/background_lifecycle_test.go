@@ -268,21 +268,6 @@ func requestText(req model.Request) string {
 
 // --- the armed background bridge ---
 
-// lifecycleBridge is the test BackgroundServices over the composed Runtime's
-// live Harness, assigned once after the owner opens exactly like the
-// production bridge.
-type lifecycleBridge struct {
-	h *harness.Harness
-}
-
-func (b *lifecycleBridge) LaunchChild(ctx context.Context, req harness.LaunchChildRequest) (harness.LaunchChildResult, error) {
-	return b.h.LaunchChildSession(ctx, req)
-}
-
-func (b *lifecycleBridge) DeliverCompletion(ctx context.Context, sessionID, completionID, content string) error {
-	return b.h.DeliverBackgroundCompletion(ctx, sessionID, completionID, content)
-}
-
 // --- the fixture ---
 
 // bgLifecycle is one composed Runtime over the controlled preparation with
@@ -291,7 +276,7 @@ type bgLifecycle struct {
 	t      *testing.T
 	e      *ownerEnv
 	prep   *scriptedPrep
-	bridge *lifecycleBridge
+	bridge *backgroundBridge
 	r      *Runtime
 }
 
@@ -305,7 +290,7 @@ func openBackgroundLifecycle(t *testing.T, store harness.Storage, stopper harnes
 	e := newOwnerEnv(t)
 	writeServiceFile(t, agents.PathForConfig(e.configPath), lifecycleAgentsDocument)
 	prep := newScriptedPrep()
-	bridge := &lifecycleBridge{}
+	bridge := &backgroundBridge{}
 	opts := options{
 		DataDir:    e.dataDir,
 		ConfigPath: e.configPath,
