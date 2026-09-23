@@ -1109,7 +1109,6 @@ func TestWailsForgedRevertHistoryFailsWithoutFrame(t *testing.T) {
 		}
 		log.mu.Unlock()
 	}
-	time.Sleep(20 * time.Millisecond) // quiesce: near-simultaneous seed frames land before the baseline
 	log.mu.Lock()
 	baseline := len(log.frames)
 	log.mu.Unlock()
