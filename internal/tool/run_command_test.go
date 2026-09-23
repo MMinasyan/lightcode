@@ -429,8 +429,10 @@ func TestRunForegroundCommandCancellationWhileRunningIsDeterministic(t *testing.
 	defer cancel()
 
 	release := make(chan struct{})
+	entered := make(chan struct{})
 	origWait := waitCommand
 	waitCommand = func(cmd *exec.Cmd) error {
+		close(entered) // the wait seam is live: the cancellation below fires while it holds the result
 		<-release
 		return origWait(cmd)
 	}
@@ -442,7 +444,11 @@ func TestRunForegroundCommandCancellationWhileRunningIsDeterministic(t *testing.
 		errCh <- err
 	}()
 
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the command never reached its wait")
+	}
 	cancel()
 	close(release)
 
@@ -484,14 +490,16 @@ func TestRunForegroundCommandCompletedBeatsLateEvents(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		reaped := make(chan struct{})
+		release := make(chan struct{})
 		origWait := waitCommand
 		waitCommand = func(cmd *exec.Cmd) error {
 			err := origWait(cmd) // the real child finishes; its output is captured
-			// Completion rendezvous: the child is fully reaped before the
-			// hold, so a cancellation fired after this point can only observe
-			// an already-gone process group.
+			// Completion rendezvous: the child is fully reaped and the held
+			// result is released only after the cancellation below has fired,
+			// so the classification observes an already-gone process group
+			// by ordering, not by a timing margin.
 			close(reaped)
-			time.Sleep(300 * time.Millisecond) // hold the result while the cancellation fires
+			<-release
 			return err
 		}
 		defer func() { waitCommand = origWait }()
@@ -509,6 +517,7 @@ func TestRunForegroundCommandCompletedBeatsLateEvents(t *testing.T) {
 			t.Fatal("command did not complete before the cancellation")
 		}
 		cancel()
+		close(release) // release the held result only after the cancellation has fired
 		select {
 		case result := <-resCh:
 			if err := <-errCh; err != nil || result != "ok" {
