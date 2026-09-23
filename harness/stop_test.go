@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -772,8 +773,9 @@ func TestStopConcurrentCallersJoinSameError(t *testing.T) {
 	// The first stop owns the interval and parks at the gated job. The two
 	// joiners signal entry immediately before their Stop calls while that
 	// interval is provably open; the rendezvous receives both entries, then
-	// the gate releases — the joiners have joined and cannot return before
-	// the owner converges.
+	// the gate releases — the joiners have the owner's whole convergence,
+	// including the stopper's completion delivery, as their runway to join
+	// the interval, and cannot return before the owner converges.
 	ownerDone := make(chan error, 1)
 	go func() { ownerDone <- h.Stop(context.Background(), testSessionID) }()
 	awaitStopInterval(t, cachedCoordinator(t, h, testSessionID), ownerDone)
@@ -981,8 +983,10 @@ func TestStopHeldPreparationRegistersAfterReopen(t *testing.T) {
 	var (
 		hold    = make(chan struct{}) // parks the launch's preparation before any registration
 		release = make(chan struct{})
+		preps   atomic.Int32
 	)
 	prepare := func(ctx context.Context, req PreparationRequest) (PreparedExecution, error) {
+		preps.Add(1)
 		if req.Session.Identity.ParentSessionID != "" { // the launch's preparation parks; the root's does not
 			<-hold
 			return modelPrepared(quickModel()), nil
@@ -1019,10 +1023,15 @@ func TestStopHeldPreparationRegistersAfterReopen(t *testing.T) {
 		_, err := h.LaunchChildSession(context.Background(), launchRequestFor(root))
 		launchDone <- err
 	}()
-	select { // the preparation is held before any registration
-	case err := <-launchDone:
-		t.Fatalf("the held launch returned early: %v", err)
-	case <-time.After(200 * time.Millisecond):
+	// The launch's preparation has entered the stub and parks on hold before
+	// any registration: the root's submit prepared once, so the count reaching
+	// 2 is the child's preparation arriving.
+	prepareDeadline := time.Now().Add(5 * time.Second)
+	for preps.Load() < 2 {
+		if time.Now().After(prepareDeadline) {
+			t.Fatal("the launch's preparation never entered")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 
 	close(gate) // the stop completes and reopens; the kill-completion steers without a register write

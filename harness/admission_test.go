@@ -87,10 +87,14 @@ func newTestHarness(t *testing.T, store Storage, prepare func(context.Context, P
 			return PreparedExecution{}, errors.New("no preparation configured for this test")
 		}
 	}
-	h, err := New(context.Background(), Dependencies{Storage: store, Prepare: prepare})
+	ctx, cancel := context.WithCancel(context.Background())
+	h, err := New(ctx, Dependencies{Storage: store, Prepare: prepare})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	// Convergence cleanup: parked model executions fail their context checks
+	// and return instead of outliving the test.
+	t.Cleanup(cancel)
 	return h
 }
 

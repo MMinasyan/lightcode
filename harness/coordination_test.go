@@ -222,6 +222,7 @@ func TestSubmitRoutesIdleAndActive(t *testing.T) {
 	store := emptyStore(t)
 	script := newModelScript()
 	script.gate = make(chan struct{})
+	t.Cleanup(func() { close(script.gate) }) // release the parked model before the test returns
 	prepared := modelPrepared(script.model)
 	h, cancel := newCancelableHarness(t, store, prepared, nil)
 	defer cancel()
