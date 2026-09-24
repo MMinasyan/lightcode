@@ -436,26 +436,30 @@ func TestEmitBlocksOnFullChannelForTranscriptEvents(t *testing.T) {
 		GenericSystemSignalDisplay,
 	}
 	for _, kind := range transcriptKinds {
-		ch <- Event{Kind: Warning, Result: "filler"}
+		ch <- Event{Kind: Warning, Result: "filler"} // the channel is provably full: a blocking emit must park in its send
 		done := make(chan struct{})
 		go func(k EventKind) {
 			lp.emit(Event{Kind: k, Result: "transcript"})
 			close(done)
 		}(kind)
+		<-ch // the one drain unblocks the parked send; a drop returns early instead
 		select {
 		case <-done:
 			t.Fatalf("emit(%v) returned while channel full — transcript event was dropped instead of blocking", kind)
-		case <-time.After(20 * time.Millisecond):
+		default:
 		}
-		<-ch
 		select {
 		case <-done:
 		case <-time.After(time.Second):
 			t.Fatalf("emit(%v) did not unblock after channel drained", kind)
 		}
-		got := <-ch
-		if got.Kind != kind || got.Result != "transcript" {
-			t.Fatalf("delivered event = %#v, want kind %v", got, kind)
+		select {
+		case got := <-ch:
+			if got.Kind != kind || got.Result != "transcript" {
+				t.Fatalf("delivered event = %#v, want kind %v", got, kind)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("emit(%v) unblocked but delivered no event — the transcript was dropped", kind)
 		}
 	}
 	if lp.droppedEvents != 0 {
