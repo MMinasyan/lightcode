@@ -287,6 +287,7 @@ type testEntry struct {
 	signal      *signalEntry
 	hookResult  *hookResultEntry
 	settlement  *operationSettlementEntry
+	compaction  *compactionEntry
 	rawOverride json.RawMessage
 }
 
@@ -351,6 +352,10 @@ func (g *testGraph) storage(t *testing.T) *graphStorage {
 			env.Payload = raw
 		case entry.settlement != nil:
 			raw, err := encodeOperationSettlementEntry(*entry.settlement)
+			mustEncode(t, err)
+			env.Payload = raw
+		case entry.compaction != nil:
+			raw, err := encodeCompactionEntry(*entry.compaction)
 			mustEncode(t, err)
 			env.Payload = raw
 		default:
@@ -1632,3 +1637,376 @@ func TestGraphViewCarriesEnvelopeMetadata(t *testing.T) {
 
 // Compile-time proof the fixture storage implements the landed read side.
 var _ Storage = (*graphStorage)(nil)
+
+// TestGraphValidatorCompactionRules proves the compaction-entry validation
+// rules: a committed compaction entry with the projection state validates,
+// dangling projections and boundary references corrupt, no per-Operation
+// compaction count exists, copied prefix entries validate on a fork while a
+// root Session rejects them, and the decoded view carries the typed payload.
+func TestGraphValidatorCompactionRules(t *testing.T) {
+	compactionAt := func(entryID, boundaryID, operationID string, sequence int64) testEntry {
+		v := validCompactionEntry(operationID)
+		v.EntryID = entryID
+		v.BoundaryEntryID = boundaryID
+		return testEntry{
+			env:        Entry{SessionID: testSessionID, ID: entryID, OperationID: operationID, Kind: EntryCompaction, Sequence: sequence, CommittedAt: testTime},
+			compaction: &v,
+		}
+	}
+
+	t.Run("committed compaction entry with projection state validates", func(t *testing.T) {
+		fixture := validTestGraph()
+		fixture.entries = append(fixture.entries, compactionAt(hexID(3), hexID(2), testOpID, 3))
+		fixture.session.State.CompactionEntryID = hexID(3)
+		view, err := validateFixture(t, fixture.storage(t), testSessionID)
+		if err != nil {
+			t.Fatalf("valid compaction shape rejected: %v", err)
+		}
+		if len(view.Entries) != 3 || view.Entries[2].Compaction == nil {
+			t.Fatalf("decoded view does not carry the compaction payload")
+		}
+		if view.Entries[2].Compaction.BoundaryEntryID != hexID(2) {
+			t.Fatalf("decoded boundary %q, want %q", view.Entries[2].Compaction.BoundaryEntryID, hexID(2))
+		}
+	})
+
+	t.Run("dangling projection reference corrupts", func(t *testing.T) {
+		fixture := validTestGraph()
+		fixture.session.State.CompactionEntryID = otherEntry()
+		corrupt := wantCorruption(t, func() error {
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			return err
+		}())
+		if !strings.Contains(corrupt.Detail, "compaction") {
+			t.Fatalf("corruption detail = %q, want the compaction rule", corrupt.Detail)
+		}
+	})
+
+	t.Run("projection naming a non-compaction entry corrupts", func(t *testing.T) {
+		fixture := validTestGraph()
+		fixture.session.State.CompactionEntryID = hexID(2)
+		wantCorruption(t, func() error {
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			return err
+		}())
+	})
+
+	t.Run("boundary naming no in-session entry corrupts", func(t *testing.T) {
+		fixture := validTestGraph()
+		fixture.entries = append(fixture.entries, compactionAt(hexID(3), otherEntry(), testOpID, 3))
+		wantCorruption(t, func() error {
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			return err
+		}())
+	})
+
+	t.Run("boundary at the compaction sequence corrupts", func(t *testing.T) {
+		fixture := validTestGraph()
+		fixture.entries = append(fixture.entries, compactionAt(hexID(3), hexID(3), testOpID, 3))
+		wantCorruption(t, func() error {
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			return err
+		}())
+	})
+
+	t.Run("boundary after the compaction sequence corrupts", func(t *testing.T) {
+		fixture := validTestGraph()
+		signal := validSignalEntry(testOpID)
+		signal.EntryID = hexID(4)
+		fixture.entries = append(fixture.entries,
+			compactionAt(hexID(3), hexID(4), testOpID, 3),
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntrySignal, Sequence: 4, CommittedAt: testTime}, signal: &signal},
+		)
+		wantCorruption(t, func() error {
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			return err
+		}())
+	})
+
+	t.Run("two compaction entries of one operation validate", func(t *testing.T) {
+		fixture := validTestGraph()
+		fixture.entries = append(fixture.entries,
+			compactionAt(hexID(3), hexID(2), testOpID, 3),
+			compactionAt(hexID(4), hexID(3), testOpID, 4),
+		)
+		fixture.session.State.CompactionEntryID = hexID(4)
+		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+			t.Fatalf("two same-operation compaction entries rejected: %v", err)
+		}
+	})
+
+	t.Run("compaction entries of different operations validate", func(t *testing.T) {
+		fixture := &testGraph{
+			session: validSessionRecord(),
+			ops: func() []OperationRecord {
+				first := validOperationRecord()
+				stamped := testTime
+				first.State.Status = OperationSuccess
+				first.State.SettledAt = &stamped
+				first.State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(4)}}
+				second := validOperationRecord()
+				second.Admission.OperationID = "op-2"
+				second.Admission.AdmittedEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(5)}
+				return []OperationRecord{first, second}
+			}(),
+		}
+		fixture.session.State.CurrentOperationID = "op-2"
+		fixture.session.State.CompactionEntryID = hexID(6)
+		input := validInputEntry(testOpID)
+		input.EntryID = hexID(1)
+		assistant := validAssistantEntry(testOpID)
+		assistant.EntryID = hexID(2)
+		settlement := validSettlementEntry()
+		settlement.EntryID = hexID(4)
+		secondInput := validInputEntry("op-2")
+		secondInput.EntryID = hexID(5)
+		fixture.entries = []testEntry{
+			{env: Entry{SessionID: testSessionID, ID: hexID(1), OperationID: testOpID, Kind: EntryInput, Sequence: 1, CommittedAt: testTime}, input: &input},
+			{env: Entry{SessionID: testSessionID, ID: hexID(2), OperationID: testOpID, Kind: EntryAssistant, Sequence: 2, CommittedAt: testTime}, assistant: &assistant},
+			compactionAt(hexID(3), hexID(2), testOpID, 3),
+			{env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryOperationSettlement, Sequence: 4, CommittedAt: testTime}, settlement: &settlement},
+			{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: "op-2", Kind: EntryInput, Sequence: 5, CommittedAt: testTime}, input: &secondInput},
+			compactionAt(hexID(6), hexID(5), "op-2", 6),
+		}
+		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+			t.Fatalf("two different-operation compaction entries rejected: %v", err)
+		}
+	})
+
+	t.Run("copied compaction entry validates in a fork prefix", func(t *testing.T) {
+		fixture := &testGraph{session: validSessionRecord()}
+		fixture.session.Identity.SourceSessionID = otherSession()
+		fixture.session.Identity.SourceBoundaryEntryID = otherEntry()
+		copiedAssistant := validAssistantEntry("")
+		copiedAssistant.EntryID = hexID(2)
+		fixture.entries = []testEntry{
+			{env: Entry{SessionID: testSessionID, ID: hexID(1), Kind: EntryInput, Sequence: 1, CommittedAt: testTime}, input: func() *inputEntry { v := validInputEntry(""); v.EntryID = hexID(1); return &v }()},
+			{env: Entry{SessionID: testSessionID, ID: hexID(2), Kind: EntryAssistant, Sequence: 2, CommittedAt: testTime}, assistant: &copiedAssistant},
+			compactionAt(hexID(3), hexID(2), "", 3),
+		}
+		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+			t.Fatalf("copied compaction prefix rejected: %v", err)
+		}
+	})
+
+	t.Run("root session rejects an operationless compaction entry", func(t *testing.T) {
+		fixture := &testGraph{session: validSessionRecord()}
+		fixture.entries = []testEntry{compactionAt(hexID(3), hexID(2), "", 1)}
+		corrupt := wantCorruption(t, func() error {
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			return err
+		}())
+		if !strings.Contains(corrupt.Detail, "root Session carries independently copied entry") {
+			t.Fatalf("corruption detail = %q, want the copied-entry rule", corrupt.Detail)
+		}
+	})
+}
+
+// TestGraphValidatorCompactionUsage proves the usage accounting: a compaction
+// entry's usage joins the recomputed Operation and Session totals, and a
+// copied fork-prefix compaction entry carries none.
+func TestGraphValidatorCompactionUsage(t *testing.T) {
+	otherRef := model.ModelRef{Provider: "other", Model: "m2"}
+
+	t.Run("compaction usage joins the totals", func(t *testing.T) {
+		assistantUsage := UsageCount{InputTokens: 1, CachedInputTokens: 2, OutputTokens: 3}
+		compactionUsage := UsageCount{InputTokens: 4, CachedInputTokens: 5, OutputTokens: 6}
+		fixture := validTestGraph()
+		assistant := validAssistantEntry(testOpID)
+		assistant.EntryID = hexID(2)
+		assistant.Usage = &assistantUsage
+		fixture.entries[1].assistant = &assistant
+		compaction := validCompactionEntry(testOpID)
+		compaction.EntryID = hexID(3)
+		compaction.BoundaryEntryID = hexID(2)
+		compaction.Model = otherRef
+		compaction.Usage = &compactionUsage
+		fixture.entries = append(fixture.entries, testEntry{
+			env:        Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime},
+			compaction: &compaction,
+		})
+		merged, err := addUsageTotals(
+			UsageTotals{ByModel: []ModelUsage{{Model: testModelRef(), Usage: assistantUsage}}},
+			UsageTotals{ByModel: []ModelUsage{{Model: otherRef, Usage: compactionUsage}}},
+		)
+		if err != nil {
+			t.Fatalf("merge: %v", err)
+		}
+		fixture.ops[0].State.Usage = merged
+		fixture.session.State.Usage = merged
+		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+			t.Fatalf("valid compaction usage rejected: %v", err)
+		}
+	})
+
+	t.Run("compaction usage missing from the totals corrupts", func(t *testing.T) {
+		fixture := validTestGraph()
+		compaction := validCompactionEntry(testOpID)
+		compaction.EntryID = hexID(3)
+		compaction.BoundaryEntryID = hexID(2)
+		compaction.Model = otherRef
+		compaction.Usage = testUsage(5)
+		fixture.entries = append(fixture.entries, testEntry{
+			env:        Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime},
+			compaction: &compaction,
+		})
+		wantCorruption(t, func() error {
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			return err
+		}())
+	})
+}
+
+// TestForkCopyCompactionEntries proves the fork copy of compaction entries:
+// fresh identities, cleared operation ownership and usage, the boundary
+// rewritten into the copied prefix, the revision kept, the destination
+// projection field naming the last copied compaction entry, an empty field
+// for a prefix without compaction entries, and an unchanged source.
+func TestForkCopyCompactionEntries(t *testing.T) {
+	const destID = "ffffffffffffffffffffffffffffffff"
+	const forkOpID = "fork-op-1"
+	boundaryID := hexID(5)
+
+	buildSource := func(t *testing.T, withCompaction bool) *testGraph {
+		t.Helper()
+		fixture := validTestGraph()
+		if withCompaction {
+			first := validCompactionEntry(testOpID)
+			first.EntryID = hexID(3)
+			first.BoundaryEntryID = hexID(2)
+			first.Usage = testUsage(5)
+			fixture.entries = append(fixture.entries, testEntry{
+				env:        Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime},
+				compaction: &first,
+			})
+			second := validCompactionEntry(testOpID)
+			second.EntryID = hexID(4)
+			second.BoundaryEntryID = hexID(3)
+			second.Summary = "Second summary."
+			fixture.entries = append(fixture.entries, testEntry{
+				env:        Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryCompaction, Sequence: 4, CommittedAt: testTime},
+				compaction: &second,
+			})
+		}
+		boundary := validInputEntry(testOpID)
+		boundary.EntryID = boundaryID
+		fixture.entries = append(fixture.entries, testEntry{
+			env:   Entry{SessionID: testSessionID, ID: boundaryID, OperationID: testOpID, Kind: EntryInput, Sequence: 5, CommittedAt: testTime},
+			input: &boundary,
+		})
+		return fixture
+	}
+
+	runFork := func(t *testing.T, fixture *testGraph) *forkCommit {
+		t.Helper()
+		store := fixture.storage(t)
+		h := newTestHarness(t, store, nil)
+		var commit forkCommit
+		err := store.Transact(context.Background(), func(tx Transaction) error {
+			return h.forkTransaction(tx, destID, fixture.session, ForkRequest{
+				SourceSessionID: testSessionID,
+				BoundaryEntryID: boundaryID,
+				OperationID:     forkOpID,
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "continue"}},
+			}, nil, testCapture(), &commit)
+		})
+		if err != nil {
+			t.Fatalf("forkTransaction: %v", err)
+		}
+		return &commit
+	}
+
+	t.Run("copied compaction entries and projection field", func(t *testing.T) {
+		commit := runFork(t, buildSource(t, true))
+
+		var copiedAssistantID string
+		var copiedCompactions []*compactionEntry
+		var copiedCompactionIDs []string
+		for i := range commit.entries {
+			entry := commit.entries[i]
+			switch {
+			case entry.Assistant != nil:
+				copiedAssistantID = entry.Envelope.ID
+			case entry.Compaction != nil:
+				copiedCompactions = append(copiedCompactions, entry.Compaction)
+				copiedCompactionIDs = append(copiedCompactionIDs, entry.Envelope.ID)
+			}
+		}
+		if len(copiedCompactions) != 2 {
+			t.Fatalf("copied %d compaction entries, want 2", len(copiedCompactions))
+		}
+		if copiedCompactionIDs[0] == hexID(3) || copiedCompactionIDs[1] == hexID(4) {
+			t.Fatalf("copied compaction identities %v are not both fresh", copiedCompactionIDs)
+		}
+		for i, v := range copiedCompactions {
+			if v.SessionID != destID || v.EntryID != copiedCompactionIDs[i] {
+				t.Fatalf("copied compaction identity %s/%s, want destination identities", v.SessionID, v.EntryID)
+			}
+			if v.OperationID != "" {
+				t.Fatalf("copied compaction carries operation ownership %q", v.OperationID)
+			}
+			if v.Usage != nil {
+				t.Fatalf("copied compaction carries source usage %+v", *v.Usage)
+			}
+			if v.Model != testModelRef() {
+				t.Fatalf("copied model %+v did not survive", v.Model)
+			}
+			if v.ConfigurationRevision != "rev-1" {
+				t.Fatalf("copied configuration revision %q did not survive", v.ConfigurationRevision)
+			}
+		}
+		if copiedCompactions[0].Summary != "Summary of the earlier conversation." || copiedCompactions[1].Summary != "Second summary." {
+			t.Fatalf("copied summaries %q and %q did not survive", copiedCompactions[0].Summary, copiedCompactions[1].Summary)
+		}
+		if copiedCompactions[0].BoundaryEntryID != copiedAssistantID {
+			t.Fatalf("first copied boundary %q, want the copied assistant %q", copiedCompactions[0].BoundaryEntryID, copiedAssistantID)
+		}
+		if copiedCompactions[1].BoundaryEntryID != copiedCompactionIDs[0] {
+			t.Fatalf("second copied boundary %q, want the first copied compaction entry %q", copiedCompactions[1].BoundaryEntryID, copiedCompactionIDs[0])
+		}
+		if commit.session.State.CompactionEntryID != copiedCompactionIDs[1] {
+			t.Fatalf("destination CompactionEntryID = %q, want the last copied compaction entry %q", commit.session.State.CompactionEntryID, copiedCompactionIDs[1])
+		}
+	})
+
+	t.Run("prefix without compaction entries yields an empty field", func(t *testing.T) {
+		commit := runFork(t, buildSource(t, false))
+		for _, entry := range commit.entries {
+			if entry.Compaction != nil {
+				t.Fatalf("prefix without compaction entries copied one")
+			}
+		}
+		if commit.session.State.CompactionEntryID != "" {
+			t.Fatalf("destination CompactionEntryID = %q, want empty", commit.session.State.CompactionEntryID)
+		}
+	})
+
+	t.Run("source session is unchanged", func(t *testing.T) {
+		fixture := buildSource(t, true)
+		store := fixture.storage(t)
+		before, err := store.ReadEntries(context.Background(), testSessionID, 0)
+		if err != nil {
+			t.Fatalf("read source entries: %v", err)
+		}
+		runFork(t, fixture)
+		after, err := store.ReadEntries(context.Background(), testSessionID, 0)
+		if err != nil {
+			t.Fatalf("read source entries: %v", err)
+		}
+		if len(after) != len(before) {
+			t.Fatalf("source entry count changed: %d, want %d", len(after), len(before))
+		}
+		for i := range before {
+			if after[i].ID != before[i].ID || string(after[i].Payload) != string(before[i].Payload) {
+				t.Fatalf("source entry %d changed", i)
+			}
+		}
+		reg, err := store.ReadRegister(context.Background(), RegisterKey{SessionID: testSessionID, Kind: RegisterSession})
+		if err != nil {
+			t.Fatalf("read source register: %v", err)
+		}
+		if reg.Revision != fixture.session.Revision {
+			t.Fatalf("source register revision = %d, want %d", reg.Revision, fixture.session.Revision)
+		}
+	})
+}

@@ -164,12 +164,15 @@ type SessionIdentity struct {
 
 // SessionState is the mutable state section of one Session register.
 // CurrentOperationID, when present, names the Session's one running
-// Operation. ArchivedAt is present exactly when the lifecycle is archived.
+// Operation. CompactionEntryID, when present, names the in-session compaction
+// entry whose summary defines the model-visible context. ArchivedAt is
+// present exactly when the lifecycle is archived.
 type SessionState struct {
 	Lifecycle          SessionLifecycle `json:"lifecycle"`
 	ArchivedAt         *time.Time       `json:"archived_at,omitempty"`
 	CurrentAgentType   string           `json:"current_agent_type"`
 	CurrentOperationID string           `json:"current_operation_id,omitempty"`
+	CompactionEntryID  string           `json:"compaction_entry_id,omitempty"`
 	Usage              UsageTotals      `json:"usage"`
 	LastActivity       time.Time        `json:"last_activity"`
 }
@@ -246,7 +249,7 @@ type OperationRecord struct {
 	State     OperationCurrentState
 }
 
-// The six entry-payload structs below are private codec values, not public
+// The entry-payload structs below are private codec values, not public
 // API. Every payload repeats the envelope Session and entry identity; normal
 // entries repeat their owning Operation identity, while independently copied
 // fork-prefix entries omit it.
@@ -361,4 +364,20 @@ type operationSettlementEntry struct {
 	Detail      string          `json:"detail,omitempty"`
 	Model       *model.ModelRef `json:"model,omitempty"`
 	Usage       *UsageCount     `json:"usage,omitempty"`
+}
+
+// compactionEntry is one immutable compaction commit: the rolling summary of
+// everything up to its boundary entry, the compact model identity that
+// produced it, the governing configuration revision, and the commit's
+// reported usage when present. Independently copied fork-prefix entries omit
+// the owning Operation identity and carry no source usage.
+type compactionEntry struct {
+	SessionID             string         `json:"session_id"`
+	EntryID               string         `json:"entry_id"`
+	OperationID           string         `json:"operation_id,omitempty"`
+	Summary               string         `json:"summary"`
+	BoundaryEntryID       string         `json:"boundary_entry_id"`
+	Model                 model.ModelRef `json:"model"`
+	ConfigurationRevision string         `json:"configuration_revision"`
+	Usage                 *UsageCount    `json:"usage,omitempty"`
 }

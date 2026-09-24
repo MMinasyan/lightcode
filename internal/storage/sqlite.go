@@ -30,9 +30,9 @@ const (
 
 	// sqliteSchemaVersion is the only accepted schema version; it is stamped
 	// into PRAGMA user_version at initialization and checked at open. Version
-	// 5 is the child lineage and background_completion signal payload; the
-	// SQL tables are unchanged.
-	sqliteSchemaVersion = 5
+	// 6 is the compaction entry payload and projection state; the SQL tables
+	// are unchanged.
+	sqliteSchemaVersion = 6
 
 	// sqlitePoolDSN configures every physical connection of the long-lived
 	// pool: write-ahead logging, full synchronous durability, immediate

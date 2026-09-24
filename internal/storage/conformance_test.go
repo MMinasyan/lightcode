@@ -67,6 +67,7 @@ func runConformance(t *testing.T, b conformanceBackend) {
 		{"sequence exhaustion", confSequenceExhaustion},
 		{"revision exhaustion", confRevisionExhaustion},
 		{"corruption result", confCorruption},
+		{"compaction entry payload round-trip", confCompactionPayloadRoundTrip},
 		{"session deletion", confSessionDeletion},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1381,6 +1382,49 @@ func confCorruption(t *testing.T, b conformanceBackend) {
 			t.Errorf("keeper after reopen: %d entries (error %v)", len(entries), err)
 		}
 	}
+}
+
+// confCompactionPayloadRoundTrip proves the compaction entry kind round-trips
+// its opaque payload byte-exactly on every backend, in both the operation-owned
+// and the independently copied operationless shape, across a durable reopen
+// where the backend supports one.
+func confCompactionPayloadRoundTrip(t *testing.T, b conformanceBackend) {
+	ctx := context.Background()
+	store := b.newStore(t)
+	confCreateSession(t, ctx, store, "s1")
+
+	owned := `{"session_id":"s1","entry_id":"c1","operation_id":"op-1","summary":"Summary of the earlier conversation.",` +
+		`"boundary_entry_id":"e1","model":{"provider":"prov","model":"gpt-x"},"configuration_revision":"rev-1",` +
+		`"usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":6}}`
+	copied := `{"session_id":"s1","entry_id":"c2","summary":"Summary of the earlier conversation.",` +
+		`"boundary_entry_id":"e1","model":{"provider":"prov","model":"gpt-x"},"configuration_revision":"rev-1"}`
+
+	confTxn(t, ctx, store, func(txn harness.Transaction) error {
+		if _, err := txn.InsertEntry(harness.EntryDraft{SessionID: "s1", ID: "c1", OperationID: "op-1", Kind: harness.EntryCompaction, Payload: rawJSON(owned)}); err != nil {
+			return err
+		}
+		_, err := txn.InsertEntry(harness.EntryDraft{SessionID: "s1", ID: "c2", Kind: harness.EntryCompaction, Payload: rawJSON(copied)})
+		return err
+	})
+
+	if b.reopen != nil {
+		store = b.reopen(t, store)
+	}
+	entries, err := store.ReadEntries(ctx, "s1", 0)
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("ReadEntries returned %d entries, want 2", len(entries))
+	}
+	if entries[0].ID != "c1" || entries[0].Kind != harness.EntryCompaction || entries[0].OperationID != "op-1" {
+		t.Errorf("owned compaction envelope = %+v", entries[0])
+	}
+	confPayloadEqual(t, entries[0].Payload, owned)
+	if entries[1].ID != "c2" || entries[1].Kind != harness.EntryCompaction || entries[1].OperationID != "" {
+		t.Errorf("copied compaction envelope = %+v", entries[1])
+	}
+	confPayloadEqual(t, entries[1].Payload, copied)
 }
 
 // confSessionDeletion covers the removal primitive: one transaction removes

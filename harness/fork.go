@@ -190,13 +190,14 @@ func (h *Harness) forkExisting(ctx context.Context, req ForkRequest) (ForkResult
 // source identity and revision, requires the selected boundary to be a
 // user-origin input entry, creates the destination Session with source
 // Workspace/current Agent type and source/boundary lineage, copies only the
-// strict-before-boundary input, assistant, tool_result, and signal entries
-// under new identities — clearing source Operation ownership and usage and
-// rewriting copied references, with copied signal source Operations
-// informational only — excludes Operation settlements and every source
-// Operation register, and runs the shared in-transaction destination
-// admission producer with a fixed user origin and the freshly prepared
-// capture. First-writer resolution stays with the Fork caller.
+// strict-before-boundary input, assistant, tool_result, signal, and
+// compaction entries under new identities — clearing source Operation
+// ownership and usage and rewriting copied references, with copied signal
+// source Operations informational only — excludes Operation settlements and
+// every source Operation register, points the destination projection at the
+// last copied compaction entry, and runs the shared in-transaction
+// destination admission producer with a fixed user origin and the freshly
+// prepared capture. First-writer resolution stays with the Fork caller.
 func (h *Harness) forkTransaction(tx Transaction, destID string, view SessionRecord, req ForkRequest, content []model.ContentPart, capture ExecutionCapture, out *forkCommit) error {
 	sreg, err := tx.ReadRegister(RegisterKey{SessionID: req.SourceSessionID, Kind: RegisterSession})
 	if err != nil {
@@ -266,6 +267,7 @@ func (h *Harness) forkTransaction(tx Transaction, destID string, view SessionRec
 	entryIDs := make(map[string]string)  // source entry id -> destination entry id
 	resultIDs := make(map[string]string) // reserved source result id -> destination result id
 	var copied []graphEntry
+	var lastCompactionEntryID string
 	for _, env := range entries {
 		if env.Sequence >= boundarySeq {
 			break // entries are ascending: nothing from the boundary on is copied
@@ -280,8 +282,12 @@ func (h *Harness) forkTransaction(tx Transaction, destID string, view SessionRec
 		}
 		if adopted != nil {
 			copied = append(copied, *adopted)
+			if adopted.Compaction != nil {
+				lastCompactionEntryID = adopted.Envelope.ID
+			}
 		}
 	}
+	dest.State.CompactionEntryID = lastCompactionEntryID
 
 	record, committed, entry, perr := produceAdmission(tx, dest, capture, admissionRequest{
 		SessionID:   destID,
@@ -370,6 +376,23 @@ func copyForkEntry(tx Transaction, destID, sourceID string, decoded graphEntry, 
 			return nil, err
 		}
 		draft = EntryDraft{SessionID: destID, ID: newID, Kind: EntrySignal, Payload: payload}
+	case decoded.Compaction != nil:
+		newID, err := newHexID()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrStorage, err)
+		}
+		copied := *decoded.Compaction
+		copied.SessionID, copied.EntryID, copied.OperationID = destID, newID, ""
+		copied.Usage = nil // copied prefix entries carry no source usage
+		// the boundary reference is rewritten when its target is in the copied prefix
+		if published, ok := entryIDs[copied.BoundaryEntryID]; ok {
+			copied.BoundaryEntryID = published
+		}
+		payload, err := encodeCompactionEntry(copied)
+		if err != nil {
+			return nil, err
+		}
+		draft = EntryDraft{SessionID: destID, ID: newID, Kind: EntryCompaction, Payload: payload}
 	default:
 		return nil, nil // Operation settlements and every other kind are excluded
 	}

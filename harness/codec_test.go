@@ -158,6 +158,18 @@ func validSettlementEntry() operationSettlementEntry {
 	}
 }
 
+func validCompactionEntry(operationID string) compactionEntry {
+	return compactionEntry{
+		SessionID:             testSessionID,
+		EntryID:               testEntryID,
+		OperationID:           operationID,
+		Summary:               "Summary of the earlier conversation.",
+		BoundaryEntryID:       hexID(2),
+		Model:                 testModelRef(),
+		ConfigurationRevision: "rev-1",
+	}
+}
+
 func validHookResultEntry(status hookResultStatus) hookResultEntry {
 	v := hookResultEntry{
 		SessionID:   testSessionID,
@@ -209,6 +221,19 @@ func renameKey(raw json.RawMessage, from, to string) json.RawMessage {
 		delete(obj, from)
 		obj[to] = v
 	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+func dropKey(raw json.RawMessage, key string) json.RawMessage {
+	obj := map[string]json.RawMessage{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		panic(err)
+	}
+	delete(obj, key)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		panic(err)
@@ -296,6 +321,24 @@ func TestEntryPayloadRoundTrip(t *testing.T) {
 			},
 			decode: func(env Entry) error { _, err := decodeOperationSettlementEntry(env); return err },
 		},
+		{
+			name: "compaction",
+			env:  Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryCompaction, Sequence: 1, CommittedAt: testTime},
+			encode: func() (json.RawMessage, error) {
+				v := validCompactionEntry(testOpID)
+				v.Usage = testUsage(3)
+				return encodeCompactionEntry(v)
+			},
+			decode: func(env Entry) error { _, err := decodeCompactionEntry(env); return err },
+		},
+		{
+			name: "compaction operationless fork copy",
+			env:  Entry{SessionID: testSessionID, ID: testEntryID, Kind: EntryCompaction, Sequence: 1, CommittedAt: testTime},
+			encode: func() (json.RawMessage, error) {
+				return encodeCompactionEntry(validCompactionEntry(""))
+			},
+			decode: func(env Entry) error { _, err := decodeCompactionEntry(env); return err },
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -379,6 +422,17 @@ func TestEntryPayloadRejectsInvalidWire(t *testing.T) {
 			},
 			decode: func(env Entry) error { _, err := decodeOperationSettlementEntry(env); return err },
 		},
+		{
+			name:       "compaction",
+			container:  "model",
+			wrongValue: json.RawMessage(`"prov/gpt-x"`),
+			payload: func() (json.RawMessage, error) {
+				v := validCompactionEntry(testOpID)
+				v.Usage = testUsage(1)
+				return encodeCompactionEntry(v)
+			},
+			decode: func(env Entry) error { _, err := decodeCompactionEntry(env); return err },
+		},
 	}
 	for _, kind := range kinds {
 		t.Run(kind.name, func(t *testing.T) {
@@ -387,8 +441,11 @@ func TestEntryPayloadRejectsInvalidWire(t *testing.T) {
 				t.Fatalf("encode valid: %v", err)
 			}
 			base := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Sequence: 1, CommittedAt: testTime}
-			if kind.name == "operation_settlement" {
+			switch kind.name {
+			case "operation_settlement":
 				base.Kind = EntryOperationSettlement
+			case "compaction":
+				base.Kind = EntryCompaction
 			}
 			mutations := []struct {
 				name    string
@@ -1768,4 +1825,225 @@ func TestBackgroundCompletionSignalRules(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCompactionEntryPayloadRules proves the compaction entry payload's
+// closed shape: required members with exact keys, the optional operation
+// identity and usage members, the fork-prefix usage rule, and the value
+// rules enforced on both codec sides.
+func TestCompactionEntryPayloadRules(t *testing.T) {
+	t.Run("round trips owned with and without usage", func(t *testing.T) {
+		for _, withUsage := range []bool{false, true} {
+			v := validCompactionEntry(testOpID)
+			if withUsage {
+				v.Usage = &UsageCount{InputTokens: 11, CachedInputTokens: 4, OutputTokens: 7}
+			}
+			raw, err := encodeCompactionEntry(v)
+			if err != nil {
+				t.Fatalf("encode (usage %v): %v", withUsage, err)
+			}
+			env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryCompaction, Sequence: 1, CommittedAt: testTime, Payload: raw}
+			got, err := decodeCompactionEntry(env)
+			if err != nil {
+				t.Fatalf("decode (usage %v): %v", withUsage, err)
+			}
+			if (got.Usage == nil) != (v.Usage == nil) {
+				t.Fatalf("decoded usage presence %+v, want %+v", got.Usage, v.Usage)
+			}
+			if withUsage && *got.Usage != *v.Usage {
+				t.Fatalf("decoded usage %+v, want %+v", *got.Usage, *v.Usage)
+			}
+			got.Usage = v.Usage // pointer identity is irrelevant; the counts compared above
+			if got != v {
+				t.Fatalf("decoded %+v, want %+v", got, v)
+			}
+			again, err := encodeCompactionEntry(got)
+			if err != nil {
+				t.Fatalf("re-encode (usage %v): %v", withUsage, err)
+			}
+			if string(again) != string(raw) {
+				t.Fatalf("re-encoded bytes %s, want %s", again, raw)
+			}
+		}
+	})
+
+	t.Run("round trips operationless fork copy", func(t *testing.T) {
+		raw, err := encodeCompactionEntry(validCompactionEntry(""))
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		env := Entry{SessionID: testSessionID, ID: testEntryID, Kind: EntryCompaction, Sequence: 1, CommittedAt: testTime, Payload: raw}
+		got, err := decodeCompactionEntry(env)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.OperationID != "" || got.Usage != nil {
+			t.Fatalf("operationless decode = %+v", got)
+		}
+	})
+
+	t.Run("encode rejects invalid values", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			mutate func(*compactionEntry)
+		}{
+			{"non-hex session id", func(v *compactionEntry) { v.SessionID = "ghost" }},
+			{"non-hex entry id", func(v *compactionEntry) { v.EntryID = "ghost" }},
+			{"non-hex boundary entry id", func(v *compactionEntry) { v.BoundaryEntryID = "ghost" }},
+			{"empty summary", func(v *compactionEntry) { v.Summary = "" }},
+			{"empty boundary entry id", func(v *compactionEntry) { v.BoundaryEntryID = "" }},
+			{"incomplete model", func(v *compactionEntry) { v.Model = model.ModelRef{Provider: "prov"} }},
+			{"empty configuration revision", func(v *compactionEntry) { v.ConfigurationRevision = "" }},
+			{"operationless with usage", func(v *compactionEntry) { v.OperationID = ""; v.Usage = testUsage(1) }},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				v := validCompactionEntry(testOpID)
+				tc.mutate(&v)
+				_, err := encodeCompactionEntry(v)
+				if err == nil {
+					t.Fatalf("expected rejection")
+				}
+				if !errors.Is(err, ErrInvalid) {
+					t.Fatalf("error %v is not ErrInvalid", err)
+				}
+			})
+		}
+	})
+
+	t.Run("decode rejects invalid wire", func(t *testing.T) {
+		raw, err := encodeCompactionEntry(validCompactionEntry(testOpID))
+		if err != nil {
+			t.Fatalf("encode valid: %v", err)
+		}
+		env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryCompaction, Sequence: 1, CommittedAt: testTime}
+		rejections := []struct {
+			name    string
+			payload json.RawMessage
+		}{
+			{"missing summary", dropKey(raw, "summary")},
+			{"empty summary", setKey(raw, "summary", json.RawMessage(`""`))},
+			{"null summary", setKey(raw, "summary", json.RawMessage(`null`))},
+			{"missing boundary entry id", dropKey(raw, "boundary_entry_id")},
+			{"empty boundary entry id", setKey(raw, "boundary_entry_id", json.RawMessage(`""`))},
+			{"null boundary entry id", setKey(raw, "boundary_entry_id", json.RawMessage(`null`))},
+			{"non-hex boundary entry id", setKey(raw, "boundary_entry_id", json.RawMessage(`"zz"`))},
+			{"missing model", dropKey(raw, "model")},
+			{"null model", setKey(raw, "model", json.RawMessage(`null`))},
+			{"incomplete model", setKey(raw, "model", json.RawMessage(`{"provider":"prov"}`))},
+			{"missing configuration revision", dropKey(raw, "configuration_revision")},
+			{"empty configuration revision", setKey(raw, "configuration_revision", json.RawMessage(`""`))},
+			{"null configuration revision", setKey(raw, "configuration_revision", json.RawMessage(`null`))},
+			{"null operation id", setKey(raw, "operation_id", json.RawMessage(`null`))},
+			{"empty operation id", setKey(raw, "operation_id", json.RawMessage(`""`))},
+			{"missing entry id", dropKey(raw, "entry_id")},
+			{"null usage", setKey(raw, "usage", json.RawMessage(`null`))},
+			{"wrong container usage", setKey(raw, "usage", json.RawMessage(`0`))},
+			{"incomplete usage", setKey(raw, "usage", json.RawMessage(`{"input_tokens":1}`))},
+		}
+		for _, tc := range rejections {
+			t.Run(tc.name, func(t *testing.T) {
+				env.Payload = tc.payload
+				if _, err := decodeCompactionEntry(env); err == nil {
+					t.Fatalf("expected rejection")
+				}
+			})
+		}
+	})
+
+	t.Run("operationless with stored usage is rejected", func(t *testing.T) {
+		env := Entry{SessionID: testSessionID, ID: testEntryID, Kind: EntryCompaction, Sequence: 1, CommittedAt: testTime}
+		raw, err := encodeCompactionEntry(validCompactionEntry(""))
+		if err != nil {
+			t.Fatalf("encode operationless: %v", err)
+		}
+		env.Payload = setKey(raw, "usage", json.RawMessage(`{"input_tokens":1,"cached_input_tokens":0,"output_tokens":0}`))
+		if _, err := decodeCompactionEntry(env); err == nil {
+			t.Fatalf("operationless compaction with stored usage must be rejected")
+		}
+	})
+}
+
+// TestSessionStateCompactionEntryIDRules proves the Session state's optional
+// compaction_entry_id member: omission-encoded, hex-validated when present,
+// and rejected as null, empty, or a non-hex string on both codec sides.
+func TestSessionStateCompactionEntryIDRules(t *testing.T) {
+	t.Run("round trips with the field set", func(t *testing.T) {
+		rec := validSessionRecord()
+		rec.State.CompactionEntryID = hexID(3)
+		raw, err := encodeSessionRegister(rec)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		reg := Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterSession}, Revision: 1, Payload: raw}
+		got, err := decodeSessionRegister(reg)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.State.CompactionEntryID != hexID(3) {
+			t.Fatalf("decoded CompactionEntryID %q, want %q", got.State.CompactionEntryID, hexID(3))
+		}
+	})
+
+	t.Run("omits the member when empty", func(t *testing.T) {
+		raw, err := encodeSessionRegister(validSessionRecord())
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		state := wireObject(t, mustState(t, raw))
+		if _, present := state["compaction_entry_id"]; present {
+			t.Fatalf("empty CompactionEntryID must encode by omission")
+		}
+	})
+
+	patchState := func(t *testing.T, mutate func(obj map[string]json.RawMessage)) json.RawMessage {
+		t.Helper()
+		raw, err := encodeSessionRegister(validSessionRecord())
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		obj := wireObject(t, raw)
+		state, err := decodePayloadObject(mustState(t, raw))
+		if err != nil {
+			t.Fatalf("decode state: %v", err)
+		}
+		mutate(state)
+		patchedState, err := json.Marshal(state)
+		if err != nil {
+			t.Fatalf("marshal state: %v", err)
+		}
+		obj["state"] = patchedState
+		patched, err := json.Marshal(obj)
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+		return patched
+	}
+
+	t.Run("decode rejections", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			mutate func(obj map[string]json.RawMessage)
+		}{
+			{"non-hex id", func(obj map[string]json.RawMessage) { obj["compaction_entry_id"] = json.RawMessage(`"ghost"`) }},
+			{"empty id", func(obj map[string]json.RawMessage) { obj["compaction_entry_id"] = json.RawMessage(`""`) }},
+			{"null id", func(obj map[string]json.RawMessage) { obj["compaction_entry_id"] = json.RawMessage(`null`) }},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				reg := Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterSession}, Revision: 1, Payload: patchState(t, tc.mutate)}
+				if _, err := decodeSessionRegister(reg); err == nil {
+					t.Fatalf("expected rejection")
+				}
+			})
+		}
+	})
+
+	t.Run("encode rejections", func(t *testing.T) {
+		rec := validSessionRecord()
+		rec.State.CompactionEntryID = "ghost"
+		if _, err := encodeSessionRegister(rec); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("error %v, want ErrInvalid", err)
+		}
+	})
 }

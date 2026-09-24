@@ -1139,6 +1139,152 @@ func validateOperationSettlementEntry(v operationSettlementEntry) error {
 	return nil
 }
 
+// encodeCompactionEntry renders one compaction entry payload.
+func encodeCompactionEntry(v compactionEntry) (json.RawMessage, error) {
+	if err := validateCompactionEntry(v); err != nil {
+		return nil, invalidInput("compaction entry: %v", err)
+	}
+	modelRaw, err := encodeModelRef(v.Model)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(struct {
+		SessionID             string          `json:"session_id"`
+		EntryID               string          `json:"entry_id"`
+		OperationID           string          `json:"operation_id,omitempty"`
+		Summary               string          `json:"summary"`
+		BoundaryEntryID       string          `json:"boundary_entry_id"`
+		Model                 json.RawMessage `json:"model"`
+		ConfigurationRevision string          `json:"configuration_revision"`
+		Usage                 *UsageCount     `json:"usage,omitempty"`
+	}{
+		SessionID:             v.SessionID,
+		EntryID:               v.EntryID,
+		OperationID:           v.OperationID,
+		Summary:               v.Summary,
+		BoundaryEntryID:       v.BoundaryEntryID,
+		Model:                 modelRaw,
+		ConfigurationRevision: v.ConfigurationRevision,
+		Usage:                 v.Usage,
+	})
+}
+
+// decodeCompactionEntry reads one compaction entry payload and enforces its
+// agreement with the addressed envelope identity.
+func decodeCompactionEntry(env Entry) (compactionEntry, error) {
+	if err := decodeEntryEnvelope(env); err != nil {
+		return compactionEntry{}, err
+	}
+	obj, err := decodePayloadObject(env.Payload)
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "summary", "boundary_entry_id", "model", "configuration_revision", "usage"); err != nil {
+		return compactionEntry{}, err
+	}
+	sessionID, err := stringMember(obj, "session_id", true)
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	entryID, err := stringMember(obj, "entry_id", true)
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	operationID, err := optionalNonEmptyString(obj, "operation_id")
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	summary, err := stringMember(obj, "summary", true)
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	boundaryEntryID, err := stringMember(obj, "boundary_entry_id", true)
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	modelObj, err := objectMember(obj, "model", true)
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	source, err := decodeModelRef(modelObj)
+	if err != nil {
+		return compactionEntry{}, fmt.Errorf("member %q: %w", "model", err)
+	}
+	configurationRevision, err := stringMember(obj, "configuration_revision", true)
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	var usage *UsageCount
+	if _, present := obj["usage"]; present {
+		usageObj, err := objectMember(obj, "usage", true)
+		if err != nil {
+			return compactionEntry{}, err
+		}
+		counts, err := decodeUsageCount(usageObj)
+		if err != nil {
+			return compactionEntry{}, fmt.Errorf("member %q: %w", "usage", err)
+		}
+		usage = &counts
+	}
+	if sessionID != env.SessionID {
+		return compactionEntry{}, fmt.Errorf("payload session id %q does not agree with the envelope", sessionID)
+	}
+	if entryID != env.ID {
+		return compactionEntry{}, fmt.Errorf("payload entry id %q does not agree with the envelope", entryID)
+	}
+	if operationID != env.OperationID {
+		return compactionEntry{}, fmt.Errorf("payload operation id %q does not agree with the envelope", operationID)
+	}
+	v := compactionEntry{
+		SessionID:             sessionID,
+		EntryID:               entryID,
+		OperationID:           operationID,
+		Summary:               summary,
+		BoundaryEntryID:       boundaryEntryID,
+		Model:                 source,
+		ConfigurationRevision: configurationRevision,
+		Usage:                 usage,
+	}
+	if err := validateCompactionEntry(v); err != nil {
+		return compactionEntry{}, err
+	}
+	return v, nil
+}
+
+// validateCompactionEntry enforces the closed compaction shape: durable
+// identities, the owning Operation identity when present, a non-empty
+// summary, a non-empty durable boundary reference, a complete model identity,
+// a non-empty stable configuration revision, and no usage on an
+// operationless independently copied entry.
+func validateCompactionEntry(v compactionEntry) error {
+	if err := validateHexID(v.SessionID, "session id"); err != nil {
+		return err
+	}
+	if err := validateHexID(v.EntryID, "entry id"); err != nil {
+		return err
+	}
+	if v.OperationID != "" {
+		if err := validateOperationIdentity(v.OperationID, "operation id"); err != nil {
+			return err
+		}
+	} else if v.Usage != nil {
+		return errors.New("independently copied fork-prefix compaction entry carries no source usage")
+	}
+	if v.Summary == "" {
+		return errors.New("summary must be non-empty")
+	}
+	if err := validateHexID(v.BoundaryEntryID, "boundary entry id"); err != nil {
+		return err
+	}
+	if v.Model.Provider == "" || v.Model.Model == "" {
+		return fmt.Errorf("model %q must be a complete model identity", v.Model.String())
+	}
+	if v.ConfigurationRevision == "" {
+		return errors.New("configuration_revision must be non-empty")
+	}
+	return nil
+}
+
 // encodeUsageCountWire renders one usage count with all three signed counts
 // present.
 func encodeUsageCountWire(u UsageCount) (json.RawMessage, error) {
@@ -1328,6 +1474,7 @@ func encodeSessionState(v SessionState) (json.RawMessage, error) {
 		ArchivedAt         *string         `json:"archived_at,omitempty"`
 		CurrentAgentType   string          `json:"current_agent_type"`
 		CurrentOperationID string          `json:"current_operation_id,omitempty"`
+		CompactionEntryID  string          `json:"compaction_entry_id,omitempty"`
 		Usage              json.RawMessage `json:"usage"`
 		LastActivity       string          `json:"last_activity"`
 	}{
@@ -1335,6 +1482,7 @@ func encodeSessionState(v SessionState) (json.RawMessage, error) {
 		ArchivedAt:         archivedAt,
 		CurrentAgentType:   v.CurrentAgentType,
 		CurrentOperationID: v.CurrentOperationID,
+		CompactionEntryID:  v.CompactionEntryID,
 		Usage:              usage,
 		LastActivity:       lastActivity,
 	})
@@ -1470,7 +1618,7 @@ func validateSessionIdentity(v SessionIdentity) error {
 
 // decodeSessionState reads the state section with exact keys.
 func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
-	if err := rejectUnknownMembers(obj, "lifecycle", "archived_at", "current_agent_type", "current_operation_id", "usage", "last_activity"); err != nil {
+	if err := rejectUnknownMembers(obj, "lifecycle", "archived_at", "current_agent_type", "current_operation_id", "compaction_entry_id", "usage", "last_activity"); err != nil {
 		return SessionState{}, err
 	}
 	lifecycle, err := stringMember(obj, "lifecycle", true)
@@ -1482,6 +1630,10 @@ func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
 		return SessionState{}, err
 	}
 	currentOperationID, err := optionalNonEmptyString(obj, "current_operation_id")
+	if err != nil {
+		return SessionState{}, err
+	}
+	compactionEntryID, err := optionalNonEmptyString(obj, "compaction_entry_id")
 	if err != nil {
 		return SessionState{}, err
 	}
@@ -1505,6 +1657,7 @@ func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
 		Lifecycle:          SessionLifecycle(lifecycle),
 		CurrentAgentType:   currentAgentType,
 		CurrentOperationID: currentOperationID,
+		CompactionEntryID:  compactionEntryID,
 		Usage:              usage,
 		LastActivity:       lastStamped,
 	}
@@ -1526,8 +1679,9 @@ func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
 }
 
 // validateSessionState enforces the closed state shape: closed lifecycle with
-// archived_at present exactly when archived, non-empty Agent type, and a
-// non-empty current Operation identity when present.
+// archived_at present exactly when archived, non-empty Agent type, a
+// non-empty current Operation identity when present, and a hex-validated
+// compaction entry reference when present.
 func validateSessionState(v SessionState) error {
 	switch v.Lifecycle {
 	case LifecycleOpen, LifecycleArchived:
@@ -1545,6 +1699,11 @@ func validateSessionState(v SessionState) error {
 	}
 	if v.CurrentOperationID != "" {
 		if err := validateOperationIdentity(v.CurrentOperationID, "current operation id"); err != nil {
+			return err
+		}
+	}
+	if v.CompactionEntryID != "" {
+		if err := validateHexID(v.CompactionEntryID, "compaction entry id"); err != nil {
 			return err
 		}
 	}
