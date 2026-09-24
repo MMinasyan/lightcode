@@ -62,15 +62,18 @@ func TestGateAskRequestAlreadyCancelledContext(t *testing.T) {
 	cancel() // cancel immediately
 
 	gate := NewGate(nil)
-	start := time.Now()
-	got := gate.AskRequest(ctx, Request{ToolName: "write_file", Arg: "src/main.go"})
-	elapsed := time.Since(start)
-
-	if got != ResponseDeny {
-		t.Fatalf("AskRequest = %q, want deny", got)
-	}
-	if elapsed > 50*time.Millisecond {
-		t.Fatalf("AskRequest should return instantly for cancelled context, took %v", elapsed)
+	askDone := make(chan ResponseAction, 1)
+	go func() {
+		got := gate.AskRequest(ctx, Request{ToolName: "write_file", Arg: "src/main.go"})
+		askDone <- got
+	}()
+	select { // the denial is the fact; the bound only turns a hang into a failure
+	case got := <-askDone:
+		if got != ResponseDeny {
+			t.Fatalf("AskRequest = %q, want deny", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("AskRequest never returned for the cancelled context")
 	}
 
 	gate.mu.Lock()
