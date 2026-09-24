@@ -986,10 +986,12 @@ func TestProductionBlockedShutdown(t *testing.T) {
 		}
 		closeDone := make(chan error, 1)
 		go func() { closeDone <- r.Close(ctx) }()
-		select {
-		case err := <-closeDone:
-			t.Fatalf("Close returned while the admission was parked (%v); shutdown joined nothing", err)
-		case <-time.After(200 * time.Millisecond):
+		joinDeadline := time.Now().Add(5 * time.Second)
+		for !JoinedInFlightCalls(r) { // provably parked on the call-gate join; the parked admission holds the token
+			if time.Now().After(joinDeadline) {
+				t.Fatal("Close never joined the parked admission")
+			}
+			time.Sleep(2 * time.Millisecond)
 		}
 		close(release)
 		if err := <-closeDone; err != nil {

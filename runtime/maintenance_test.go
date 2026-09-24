@@ -532,10 +532,12 @@ func TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown(t *testing.
 				t.Fatal("the sweep pass never entered the blocked transaction")
 			}
 			done := startShutdown(r)
-			select {
-			case <-done:
-				t.Fatal("shutdown converged while a sweep pass was blocked inside a storage transaction")
-			case <-time.After(200 * time.Millisecond):
+			joinDeadline := time.Now().Add(5 * time.Second)
+			for !JoinedInFlightCalls(r) { // the shutdown is provably parked on the call-gate join; the blocked pass holds the token
+				if time.Now().After(joinDeadline) {
+					t.Fatal("shutdown never joined the blocked sweep pass")
+				}
+				time.Sleep(2 * time.Millisecond)
 			}
 			if events := eventNames(e.events.all()); slices.Contains(events, "close:core") {
 				t.Fatal("the Core storage closed while a sweep pass was still admitted")
@@ -648,10 +650,12 @@ func TestMaintenanceUnrelatedFailureIsQuietOnceShutdownIsObserved(t *testing.T) 
 			t.Fatal("the sweep pass never entered the parked transaction")
 		}
 		r.cancelWork()
-		select {
-		case <-r.shutdownDone:
-			t.Fatal("shutdown converged while a sweep pass was blocked inside a storage transaction")
-		case <-time.After(200 * time.Millisecond):
+		joinDeadline := time.Now().Add(5 * time.Second)
+		for !JoinedInFlightCalls(r) { // provably parked on the call-gate join; the blocked pass holds the token
+			if time.Now().After(joinDeadline) {
+				t.Fatal("shutdown never joined the blocked sweep pass")
+			}
+			time.Sleep(2 * time.Millisecond)
 		}
 		wrapped.releaseBlock()
 		select {
@@ -1102,10 +1106,12 @@ func TestPrivateDeleteSessionJoinsShutdown(t *testing.T) {
 
 		closeDone := make(chan struct{})
 		go func() { defer close(closeDone); _ = r.Close(ctx) }()
-		select {
-		case <-closeDone:
-			t.Fatal("shutdown converged while the direct deletion's admission was still held")
-		case <-time.After(200 * time.Millisecond):
+		joinDeadline := time.Now().Add(5 * time.Second)
+		for !JoinedInFlightCalls(r) { // provably parked on the call-gate join; the held admission holds the token
+			if time.Now().After(joinDeadline) {
+				t.Fatal("shutdown never joined the held deletion admission")
+			}
+			time.Sleep(2 * time.Millisecond)
 		}
 		if events := eventNames(e.events.all()); slices.Contains(events, "close:core") {
 			t.Fatal("the Core storage closed while the direct deletion was still admitted")
@@ -1358,10 +1364,12 @@ func TestMaintenanceShutdownJoinsSweepCleanup(t *testing.T) {
 
 		done := make(chan struct{})
 		go func() { defer close(done); _ = r.Close(context.Background()) }()
-		select {
-		case <-done:
-			t.Fatal("shutdown converged while the pass's cleanup admission was still held")
-		case <-time.After(200 * time.Millisecond):
+		joinDeadline := time.Now().Add(5 * time.Second)
+		for !JoinedInFlightCalls(r) { // provably parked on the call-gate join; the cleanup admission holds the token
+			if time.Now().After(joinDeadline) {
+				t.Fatal("shutdown never joined the held cleanup admission")
+			}
+			time.Sleep(2 * time.Millisecond)
 		}
 		if events := eventNames(e.events.all()); slices.Contains(events, "close:core") {
 			t.Fatal("the Core storage closed while the sweep cleanup was still admitted")

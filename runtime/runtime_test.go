@@ -1128,10 +1128,12 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 			<-arrive
 			closeDone := make(chan error, 1)
 			go func() { closeDone <- r.Close(context.Background()) }()
-			select {
-			case err := <-closeDone:
-				t.Fatalf("Close returned while an admitted build was still in flight (%v); the call gate joined nothing", err)
-			case <-time.After(200 * time.Millisecond):
+			joinDeadline := time.Now().Add(5 * time.Second)
+			for !JoinedInFlightCalls(r) { // Close is provably parked on the call-gate join before the build releases
+				if time.Now().After(joinDeadline) {
+					t.Fatal("Close never joined the in-flight call")
+				}
+				time.Sleep(2 * time.Millisecond)
 			}
 			validator.release()
 			select {

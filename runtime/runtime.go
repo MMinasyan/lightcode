@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
@@ -83,6 +84,11 @@ type Runtime struct {
 	mu     sync.Mutex
 	closed bool
 	calls  sync.WaitGroup
+
+	// joinedCalls records that shutdown reached the in-flight-call join.
+	// Nothing in production reads it; it is the observation point that lets
+	// a test rendezvous on the join before releasing the call it blocks on.
+	joinedCalls atomic.Bool
 
 	shutdownOnce sync.Once
 	shutdownDone chan struct{}
@@ -456,6 +462,7 @@ func (r *Runtime) beginShutdown() {
 // state-owning mutex is held across any of it.
 func (r *Runtime) joinShutdown() error {
 	var errs []error
+	r.joinedCalls.Store(true)
 	r.calls.Wait()
 	if err := r.harness.StopAll(context.Background()); err != nil {
 		errs = append(errs, err)

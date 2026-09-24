@@ -77,3 +77,11 @@ func ComposeScopeForTest(ctx context.Context, info ScopeInfo, plugins []Plugin) 
 func DescribeToolForTest(spec CapabilitySpec, inv Invocation, constraints ToolConstraints, identity harness.SessionIdentity) (ToolDescription, error) {
 	return spec.describe(inv, constraints, identity)
 }
+
+// JoinedInFlightCalls reports whether shutdown has reached its in-flight-call
+// join. It exposes the inert observation point for the external lifecycle
+// tests: a test releases its parked call only after the join is provably
+// reached, instead of timing an absence window.
+func JoinedInFlightCalls(r *Runtime) bool {
+	return r.joinedCalls.Load()
+}

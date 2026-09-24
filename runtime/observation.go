@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"sync/atomic"
+
 	"context"
 	"errors"
 	"sync"
@@ -65,6 +67,12 @@ type observation struct {
 	mu     sync.Mutex
 	subs   map[*Subscription]struct{}
 	closed bool
+
+	// sections counts the publish sections currently between entry and
+	// return. Nothing in production reads it; a paused section makes the
+	// count the positive observation point proving a second publisher is
+	// blocked inside the section, for tests.
+	sections atomic.Int32
 }
 
 func newObservation() *observation {
@@ -75,6 +83,8 @@ func newObservation() *observation {
 // state's short publication, or nil when the caller's state is already
 // committed and only the event's place in the order must be fixed.
 func (o *observation) publish(commit func(), event Event) {
+	o.sections.Add(1)
+	defer o.sections.Add(-1)
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if commit != nil {

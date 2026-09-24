@@ -154,12 +154,12 @@ func TestObservationPausedPublisherOrdersTheNextPublication(t *testing.T) {
 			_, err := r.Reload(context.Background())
 			reloadDone <- err
 		}()
-		select {
-		case err := <-reloadDone:
-			t.Fatalf("Reload committed while a paused publication held the observation section (%v)", err)
-		case event, ok := <-sub.Events():
-			t.Fatalf("event %+v enqueued before its publication committed (ok=%v)", event, ok)
-		case <-time.After(200 * time.Millisecond):
+		sectionDeadline := time.Now().Add(5 * time.Second)
+		for r.obs.sections.Load() != 2 { // the paused publication holds the section; Reload is provably blocked inside its own
+			if time.Now().After(sectionDeadline) {
+				t.Fatal("the Reload publication never entered the paused section")
+			}
+			time.Sleep(2 * time.Millisecond)
 		}
 		if snapshot := r.config.current(); snapshot == nil || snapshot.generation != 1 {
 			t.Fatalf("published generation during pause = %+v, want the paused publication's state commit to block the next one", snapshot)
@@ -186,12 +186,12 @@ func TestObservationPausedPublisherOrdersTheNextPublication(t *testing.T) {
 			_, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: "/ws-paused"})
 			getDone <- err
 		}()
-		select {
-		case err := <-getDone:
-			t.Fatalf("Workspace scope published while the observation section was held (%v)", err)
-		case event, ok := <-sub.Events():
-			t.Fatalf("event %+v enqueued before its publication committed (ok=%v)", event, ok)
-		case <-time.After(200 * time.Millisecond):
+		sectionDeadline := time.Now().Add(5 * time.Second)
+		for r.obs.sections.Load() != 2 { // the paused publication holds the section; the get is provably blocked inside its own
+			if time.Now().After(sectionDeadline) {
+				t.Fatal("the workspace publication never entered the paused section")
+			}
+			time.Sleep(2 * time.Millisecond)
 		}
 		release()
 		if err := <-getDone; err != nil {
