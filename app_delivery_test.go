@@ -2247,6 +2247,7 @@ func wailsPermissionPendingApp(t *testing.T) (*App, string, string, *wailsFrameL
 	log := &wailsFrameLog{}
 	app.emitFn = log.append
 	app.startup(context.Background())
+	t.Cleanup(func() { app.shutdown(context.Background()) })
 
 	id := app.currentSessionID()
 	if id == "" {

@@ -40,6 +40,14 @@ func newProviderManagementAgent(t *testing.T, cfg string) *Agent {
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
+	// Persisted managed keys live in the process env, which outlives this
+	// test's temp home; unset them so the next run does not classify them
+	// as externally set.
+	t.Cleanup(func() {
+		for _, key := range a.ManagedEnv().ManagedKeys() {
+			_ = os.Unsetenv(key)
+		}
+	})
 	return a
 }
 
