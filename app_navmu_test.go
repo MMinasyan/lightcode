@@ -216,9 +216,8 @@ func TestNavCloseWinsNavMuRejects(t *testing.T) {
 	submitErr := make(chan error, 1)
 	go func() { _, err := app.Submit("hi"); submitErr <- err }()
 
-	time.Sleep(50 * time.Millisecond) // let Submit reach navMu and block
 	app.navClosed = true
-	app.navMu.Unlock()
+	app.navMu.Unlock() // the parked Submit provably sees navClosed: it cannot pass the closed check while the test holds navMu
 
 	select {
 	case err := <-submitErr:
