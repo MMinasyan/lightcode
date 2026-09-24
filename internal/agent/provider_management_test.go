@@ -40,6 +40,16 @@ func newProviderManagementAgent(t *testing.T, cfg string) *Agent {
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
+	// Connecting persists managed keys into the process env, and the temp
+	// home dies with the test: without clearing the footprint here, a later
+	// iteration or test in the same process would see this agent's keys as
+	// externally-set and classify them as external. Restore the process env
+	// to pre-test state so every iteration sees the same world.
+	t.Cleanup(func() {
+		for _, key := range a.env.ManagedKeys() {
+			_ = os.Unsetenv(key)
+		}
+	})
 	return a
 }
 
