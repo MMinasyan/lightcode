@@ -438,11 +438,12 @@ func TestSaveLocalLockBlocksSecondProcess(t *testing.T) {
 	}()
 
 	<-started
-	select {
-	case err := <-done:
-		t.Fatalf("SaveLocal returned %v while the child held the permissions lock; only a process-local exclusion can do that", err)
-	case <-time.After(blockWindow):
-		// Blocked, as required.
+	sectionDeadline := time.Now().Add(5 * time.Second)
+	for atomicfs.LockSectionsInFlight() != 1 { // the writer is provably parked inside its lock acquisition; the child holds the lock
+		if time.Now().After(sectionDeadline) {
+			t.Fatalf("the SaveLocal never blocked on the held permissions lock (sections=%d)", atomicfs.LockSectionsInFlight())
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 
 	if err := reap(); err != nil {

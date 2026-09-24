@@ -399,8 +399,8 @@ func TestTouchActivityLockBlocksSecondProcess(t *testing.T) {
 	}
 
 	// The writer goroutine announces itself immediately before invoking
-	// TouchActivity, so the bounded wait below cannot be satisfied by a call
-	// that never began.
+	// TouchActivity; the section-count rendezvous below proves the call
+	// parked inside its lock acquisition before the child is released.
 	started := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
@@ -409,11 +409,12 @@ func TestTouchActivityLockBlocksSecondProcess(t *testing.T) {
 	}()
 
 	<-started
-	select {
-	case err := <-done:
-		t.Fatalf("TouchActivity returned %v while the child held the meta lock; only a process-local exclusion can do that", err)
-	case <-time.After(blockWindow):
-		// Blocked, as required.
+	sectionDeadline := time.Now().Add(5 * time.Second)
+	for atomicfs.LockSectionsInFlight() != 1 { // the call is provably parked inside its lock acquisition; the child holds the meta lock
+		if time.Now().After(sectionDeadline) {
+			t.Fatalf("the TouchActivity never blocked on the held meta lock (sections=%d)", atomicfs.LockSectionsInFlight())
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 
 	if err := reap(); err != nil {

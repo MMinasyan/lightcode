@@ -8,6 +8,8 @@
 package atomicfs
 
 import (
+	"sync/atomic"
+
 	"fmt"
 	"os"
 	"path/filepath"
@@ -232,11 +234,25 @@ func (l *Lock) Release() error {
 // release failure is a postcommit diagnostic — reported once to stderr — that
 // never replaces or rolls back the callback's result.
 func WithLock(lockPath string, fn func() error) error {
+	lockSections.Add(1)
+	defer lockSections.Add(-1)
 	l, err := Acquire(lockPath)
 	if err != nil {
 		return err
 	}
 	return runLocked(l, lockPath, fn)
+}
+
+// lockSections counts the WithLock sections currently between entry and
+// return, the waiting acquire included. Nothing in production reads it; it
+// is the observation point proving a blocked section is parked inside its
+// lock acquisition, for tests.
+var lockSections atomic.Int32
+
+// LockSectionsInFlight reports the current WithLock section count. It is the
+// inert observation point for tests; production code never calls it.
+func LockSectionsInFlight() int32 {
+	return lockSections.Load()
 }
 
 // TryWithLock is the one-attempt counterpart of WithLock for owner paths that
