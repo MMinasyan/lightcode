@@ -365,3 +365,174 @@ func (h *Harness) settleCompactionFailure(c *coordinator, operationID string, te
 	}
 	return cause
 }
+
+// commitCompaction commits the one atomic compaction transaction: the
+// immutable compaction entry, the Session register's projection field, and
+// the usage totals on the Operation and Session registers — plus, on the
+// manual shape, the dedicated Operation's success settlement — all inside one
+// transaction on the cancellation-free Harness context. The entry's boundary
+// is the highest-sequence projectable entry of the cached graph, read under
+// the coordinator lock the commit holds across the transaction and uses to
+// apply the committed records afterward; both call sites are entry-stable
+// between the frozen snapshot and this commit, so the commit-time boundary is
+// the freeze-time one. The usage contribution lands keyed by the compact
+// model on the entry and both register totals in the same transaction. A
+// failed transaction leaves every previous value durable and settles the
+// quiet running Operation through the direct terminal settlement carrying
+// the commit error and the accumulated usage keyed by the compact model.
+func (h *Harness) commitCompaction(c *coordinator, operationID string, capture ExecutionCapture, summary string, usage *UsageCount, manual bool) error {
+	c.mu.Lock()
+	viewOp, ok := c.graph.Operation(operationID)
+	if !ok {
+		sessionID := c.graph.Session.Identity.SessionID
+		c.mu.Unlock()
+		return fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+	}
+	sessionID := viewOp.Admission.SessionID
+	viewSession := c.graph.Session
+
+	var (
+		committedOp   OperationRecord
+		committedSess SessionRecord
+		newEntries    []graphEntry
+	)
+	err := h.deps.Storage.Transact(context.WithoutCancel(h.ctx), func(tx Transaction) error {
+		// The boundary: the last projectable entry of the cached graph, the
+		// frozen snapshot's last message.
+		boundary := ""
+		for i := range c.graph.Entries {
+			e := c.graph.Entries[i]
+			if e.Input != nil || e.Assistant != nil || e.ToolResult != nil || e.Signal != nil {
+				boundary = e.Envelope.ID
+			}
+		}
+		sessionKey := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
+		sreg, err := tx.ReadRegister(sessionKey)
+		if err != nil {
+			return err
+		}
+		currentSession, err := decodeSessionRegister(sreg)
+		if err != nil {
+			return corruptSession(sessionID, "session register: %v", err)
+		}
+		opKey := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: operationID}
+		oreg, err := tx.ReadRegister(opKey)
+		if err != nil {
+			return err
+		}
+		currentOp, err := decodeOperationRegister(oreg)
+		if err != nil {
+			return corruptSession(sessionID, "operation register %q: %v", operationID, err)
+		}
+		// a violated semantic precondition outranks the conflict class
+		if currentOp.State.Status != OperationRunning {
+			return invalidInput("operation %q is %s; compaction commits to a running Operation", operationID, currentOp.State.Status)
+		}
+		if sreg.Revision != viewSession.Revision {
+			return fmt.Errorf("%w: session %q revision %d changed concurrently to %d", errRevisionRace, sessionID, viewSession.Revision, sreg.Revision)
+		}
+		if oreg.Revision != viewOp.Revision {
+			return fmt.Errorf("%w: operation %q revision %d changed concurrently to %d", errRevisionRace, operationID, viewOp.Revision, oreg.Revision)
+		}
+
+		entryID, err := newHexID()
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrStorage, err)
+		}
+		payload, err := encodeCompactionEntry(compactionEntry{
+			SessionID:             sessionID,
+			EntryID:               entryID,
+			OperationID:           operationID,
+			Summary:               summary,
+			BoundaryEntryID:       boundary,
+			Model:                 capture.Compact.Model,
+			ConfigurationRevision: capture.ConfigurationRevision,
+			Usage:                 usage,
+		})
+		if err != nil {
+			return err
+		}
+		adopted, err := insertAndAdopt(tx, sessionID, EntryDraft{
+			SessionID:   sessionID,
+			ID:          entryID,
+			OperationID: operationID,
+			Kind:        EntryCompaction,
+			Payload:     payload,
+		})
+		if err != nil {
+			return err
+		}
+		newEntries = append(newEntries, adopted)
+
+		// The orchestration's accumulated total lands keyed by the compact
+		// model on the entry and both register totals.
+		var contribution UsageTotals
+		if usage != nil {
+			contribution = UsageTotals{ByModel: []ModelUsage{{Model: capture.Compact.Model, Usage: *usage}}}
+		}
+		opUsage, err := addUsageTotals(currentOp.State.Usage, contribution)
+		if err != nil {
+			return err
+		}
+		sessionUsage, err := addUsageTotals(currentSession.State.Usage, contribution)
+		if err != nil {
+			return err
+		}
+
+		nextOp := currentOp
+		nextOp.State.Usage = opUsage
+		opPayload, err := encodeOperationRegister(nextOp)
+		if err != nil {
+			return err
+		}
+		replaced, err := tx.ReplaceRegister(opKey, oreg.Revision, opPayload)
+		if err != nil {
+			return err
+		}
+		nextOp.Revision = replaced.Revision
+
+		nextSess := currentSession
+		nextSess.State.CompactionEntryID = entryID
+		nextSess.State.Usage = sessionUsage
+		committedSess = SessionRecord{Identity: currentSession.Identity, State: nextSess.State}
+		sessionPayload, err := encodeSessionRegister(committedSess)
+		if err != nil {
+			return err
+		}
+		replacedSession, err := tx.ReplaceRegister(sessionKey, sreg.Revision, sessionPayload)
+		if err != nil {
+			return err
+		}
+		committedSess.Revision = replacedSession.Revision
+
+		// The manual shape settles the dedicated Operation as success inside
+		// the same transaction; the settlement itself carries no usage
+		// because the compaction part already added the totals.
+		if manual {
+			settledOp, settledSess, settledEntries, err := commitTerminalSettlement(tx, sessionID, operationID, committedSess, nextOp, replacedSession.Revision, replaced.Revision, OperationSuccess, "", nil, model.ModelRef{}, nil)
+			if err != nil {
+				return err
+			}
+			nextOp = settledOp
+			committedSess = settledSess
+			newEntries = append(newEntries, settledEntries...)
+		}
+		committedOp = nextOp
+		return nil
+	})
+	if err != nil {
+		h.markCorrupt(sessionID, err)
+		c.mu.Unlock()
+		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+			if rerr := h.rematerialize(context.WithoutCancel(h.ctx), c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
+				return rerr
+			}
+		}
+		return h.settleCompactionFailure(c, operationID, OperationFailure, err, capture, usage)
+	}
+	c.graph.Entries = append(c.graph.Entries, newEntries...)
+	c.graph.replaceOperation(operationID, committedOp)
+	c.graph.Session = committedSess
+	c.mu.Unlock()
+	return nil
+}

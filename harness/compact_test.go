@@ -922,3 +922,358 @@ func TestCompactionPieceBudgetArithmetic(t *testing.T) {
 		t.Fatalf("message-form estimate %d, want the plain-text estimate plus the per-message overhead", messageForm)
 	}
 }
+
+// compactedEntryOf returns the one compaction entry of the validated graph.
+func compactedEntryOf(t *testing.T, graph *sessionGraph) *compactionEntry {
+	t.Helper()
+	var found *compactionEntry
+	for i := range graph.Entries {
+		if graph.Entries[i].Compaction != nil {
+			if found != nil {
+				t.Fatalf("graph carries more than one compaction entry")
+			}
+			found = graph.Entries[i].Compaction
+		}
+	}
+	if found == nil {
+		t.Fatalf("graph carries no compaction entry")
+	}
+	return found
+}
+
+// operationStateOf returns the state of the named Operation in the validated
+// graph.
+func operationStateOf(t *testing.T, graph *sessionGraph, operationID string) OperationCurrentState {
+	t.Helper()
+	for i := range graph.Operations {
+		if graph.Operations[i].Admission.OperationID == operationID {
+			return graph.Operations[i].State
+		}
+	}
+	t.Fatalf("graph carries no Operation %q", operationID)
+	return OperationCurrentState{}
+}
+
+// TestCommitCompactionAutomaticCommitsAtomically proves the automatic shape:
+// the compaction entry, the Session register's projection field, and both
+// register usage totals land in one transaction while the Operation keeps
+// running; validateUsage agrees and the projection flips to the summary.
+func TestCommitCompactionAutomaticCommitsAtomically(t *testing.T) {
+	h, store, c, sessionID := newEffectHarness(t, nil)
+	opKey := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID}
+	sessionKey := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
+	opRevision := registerRevision(t, store, sessionID, opKey)
+	sessionRevision := registerRevision(t, store, sessionID, sessionKey)
+	beforeEntries, _ := storedSessionState(store, sessionID)
+
+	usage := &UsageCount{InputTokens: 7, CachedInputTokens: 3, OutputTokens: 4}
+	if err := h.commitCompaction(c, testOpID, testCapture(), "summary one", usage, false); err != nil {
+		t.Fatalf("commitCompaction: %v", err)
+	}
+
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("post-commit graph: %v", err)
+	}
+	comp := compactedEntryOf(t, graph)
+	if comp.OperationID != testOpID || comp.Summary != "summary one" {
+		t.Fatalf("compaction entry = %+v, want the Operation-owned committed summary", comp)
+	}
+	if comp.BoundaryEntryID != graph.Entries[0].Envelope.ID {
+		t.Fatalf("boundary %q, want the last projectable entry %q", comp.BoundaryEntryID, graph.Entries[0].Envelope.ID)
+	}
+	if comp.Model != testCompactCapture().Model || comp.ConfigurationRevision != "rev-1" {
+		t.Fatalf("compaction entry identity = %+v rev %q, want the compact model and the capture's revision", comp.Model, comp.ConfigurationRevision)
+	}
+	if comp.Usage == nil || *comp.Usage != *usage {
+		t.Fatalf("compaction entry usage = %+v, want the orchestration's accumulated total", comp.Usage)
+	}
+	if graph.Session.State.CompactionEntryID != comp.EntryID {
+		t.Fatalf("compaction_entry_id %q, want the new entry %q", graph.Session.State.CompactionEntryID, comp.EntryID)
+	}
+
+	// The Operation continues: running, current, quiet, with no settlement.
+	if graph.Session.State.CurrentOperationID != testOpID {
+		t.Fatalf("current Operation %q, want the continuing %q", graph.Session.State.CurrentOperationID, testOpID)
+	}
+	state := operationStateOf(t, graph, testOpID)
+	if state.Status != OperationRunning || state.ActiveEffect != nil {
+		t.Fatalf("operation state = %+v, want running and quiet", state)
+	}
+	for i := range graph.Entries {
+		if graph.Entries[i].Settlement != nil {
+			t.Fatalf("settlement entry committed on the automatic path")
+		}
+	}
+
+	// Both register totals carry the accumulated usage keyed by the compact
+	// model.
+	want := UsageTotals{ByModel: []ModelUsage{{Model: testCompactCapture().Model, Usage: *usage}}}
+	if !usageTotalsEqual(state.Usage, want) {
+		t.Fatalf("operation usage = %+v, want %+v", state.Usage, want)
+	}
+	if !usageTotalsEqual(graph.Session.State.Usage, want) {
+		t.Fatalf("session usage = %+v, want %+v", graph.Session.State.Usage, want)
+	}
+
+	// One transaction: one new entry, each register advanced once.
+	afterEntries, _ := storedSessionState(store, sessionID)
+	if len(afterEntries) != len(beforeEntries)+1 {
+		t.Fatalf("entry count %d, want %d (exactly the compaction entry)", len(afterEntries), len(beforeEntries)+1)
+	}
+	if got := registerRevision(t, store, sessionID, opKey); got != opRevision+1 {
+		t.Fatalf("operation register revision %d, want %d", got, opRevision+1)
+	}
+	if got := registerRevision(t, store, sessionID, sessionKey); got != sessionRevision+1 {
+		t.Fatalf("session register revision %d, want %d", got, sessionRevision+1)
+	}
+
+	// The projection flips to the summary message.
+	after, err := h.projectContext(c, testOpID)
+	if err != nil {
+		t.Fatalf("projectContext: %v", err)
+	}
+	if len(after) != 2 {
+		t.Fatalf("projection messages = %d, want the system message and the summary", len(after))
+	}
+	if after[1].Role != model.RoleAssistant || after[1].Source != testCompactCapture().Model {
+		t.Fatalf("summary message = %+v, want an assistant message sourced by the compact model", after[1])
+	}
+	if got := after[1].TextContent(); got != "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]" {
+		t.Fatalf("summary message text %q, want the verbatim framing around the committed summary", got)
+	}
+}
+
+// TestCommitCompactionManualSettlesInTheSameTransaction proves the manual
+// shape: the automatic members land, then the dedicated Operation settles as
+// success in the same transaction — settlement entry, terminal Operation
+// register, cleared current Operation — with the settlement itself carrying
+// no usage.
+func TestCommitCompactionManualSettlesInTheSameTransaction(t *testing.T) {
+	h, store, c, sessionID := newEffectHarness(t, nil)
+	opKey := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID}
+	sessionKey := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
+	opRevision := registerRevision(t, store, sessionID, opKey)
+	sessionRevision := registerRevision(t, store, sessionID, sessionKey)
+	beforeEntries, _ := storedSessionState(store, sessionID)
+
+	usage := &UsageCount{InputTokens: 6, CachedInputTokens: 1, OutputTokens: 2}
+	if err := h.commitCompaction(c, testOpID, testCapture(), "manual summary", usage, true); err != nil {
+		t.Fatalf("commitCompaction: %v", err)
+	}
+
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("post-commit graph: %v", err)
+	}
+	comp := compactedEntryOf(t, graph)
+	if comp.Summary != "manual summary" || comp.BoundaryEntryID != graph.Entries[0].Envelope.ID {
+		t.Fatalf("compaction entry = %+v, want the committed summary at the projectable boundary", comp)
+	}
+	settlement := settlementEntryOf(t, graph)
+	if settlement.Status != OperationSuccess || settlement.Detail != "" {
+		t.Fatalf("settlement entry = %+v, want the success terminal with no detail", settlement)
+	}
+	if settlement.Model != nil || settlement.Usage != nil {
+		t.Fatalf("settlement entry = %+v, want no usage on the settlement itself", settlement)
+	}
+	state := operationStateOf(t, graph, testOpID)
+	if state.Status != OperationSuccess || state.Terminal == nil || state.Terminal.SettlementEntry.EntryID != settlement.EntryID {
+		t.Fatalf("operation state = %+v, want the success terminal naming the settlement entry", state)
+	}
+	if graph.Session.State.CurrentOperationID != "" {
+		t.Fatalf("current Operation %q, want it cleared", graph.Session.State.CurrentOperationID)
+	}
+	if graph.Session.State.CompactionEntryID != comp.EntryID {
+		t.Fatalf("compaction_entry_id %q, want the new entry %q", graph.Session.State.CompactionEntryID, comp.EntryID)
+	}
+
+	// The usage landed through the compaction part: both totals carry it
+	// keyed by the compact model.
+	want := UsageTotals{ByModel: []ModelUsage{{Model: testCompactCapture().Model, Usage: *usage}}}
+	if !usageTotalsEqual(state.Usage, want) {
+		t.Fatalf("operation usage = %+v, want %+v", state.Usage, want)
+	}
+	if !usageTotalsEqual(graph.Session.State.Usage, want) {
+		t.Fatalf("session usage = %+v, want %+v", graph.Session.State.Usage, want)
+	}
+
+	// One transaction: the entry and the settlement are the only new
+	// entries, and each register advanced once per write inside it.
+	afterEntries, _ := storedSessionState(store, sessionID)
+	if len(afterEntries) != len(beforeEntries)+2 {
+		t.Fatalf("entry count %d, want %d (the compaction entry and the settlement)", len(afterEntries), len(beforeEntries)+2)
+	}
+	if got := registerRevision(t, store, sessionID, opKey); got != opRevision+2 {
+		t.Fatalf("operation register revision %d, want %d", got, opRevision+2)
+	}
+	if got := registerRevision(t, store, sessionID, sessionKey); got != sessionRevision+2 {
+		t.Fatalf("session register revision %d, want %d", got, sessionRevision+2)
+	}
+
+	// The projection flips to the summary message.
+	after, err := h.projectContext(c, testOpID)
+	if err != nil {
+		t.Fatalf("projectContext: %v", err)
+	}
+	if len(after) != 2 || after[1].Role != model.RoleAssistant || after[1].TextContent() != "[Previous conversation summary]\n\nmanual summary\n\n[End of summary. Continue from here.]" {
+		t.Fatalf("projection = %+v, want the system message and the committed summary", after)
+	}
+}
+
+// TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent proves the
+// failure contract: an injected transaction failure commits nothing of the
+// compaction — the previous projection stays current — and the commit's own
+// failure settles the quiet running Operation through the direct terminal
+// settlement carrying the commit error and the accumulated usage keyed by the
+// compact model.
+func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T) {
+	t.Run("a persistently failing store leaves every durable value unchanged", func(t *testing.T) {
+		h, store, c, sessionID := newEffectHarness(t, nil)
+		opKey := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID}
+		sessionKey := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
+		opRevision := registerRevision(t, store, sessionID, opKey)
+		sessionRevision := registerRevision(t, store, sessionID, sessionKey)
+		beforeEntries, _ := storedSessionState(store, sessionID)
+		before, err := h.projectContext(c, testOpID)
+		if err != nil {
+			t.Fatalf("projectContext: %v", err)
+		}
+		store.txHook = func(string) error { return errors.New("injected storage failure") }
+
+		if err := h.commitCompaction(c, testOpID, testCapture(), "summary", nil, false); err == nil {
+			t.Fatalf("commitCompaction succeeded past an injected failure")
+		}
+
+		graph, err := validateFixture(t, store, sessionID)
+		if err != nil {
+			t.Fatalf("post-failure graph: %v", err)
+		}
+		afterEntries, _ := storedSessionState(store, sessionID)
+		if len(afterEntries) != len(beforeEntries) {
+			t.Fatalf("entry count %d, want the unchanged %d", len(afterEntries), len(beforeEntries))
+		}
+		if got := registerRevision(t, store, sessionID, opKey); got != opRevision {
+			t.Fatalf("operation register revision %d, want the unchanged %d", got, opRevision)
+		}
+		if got := registerRevision(t, store, sessionID, sessionKey); got != sessionRevision {
+			t.Fatalf("session register revision %d, want the unchanged %d", got, sessionRevision)
+		}
+		if graph.Session.State.CompactionEntryID != "" {
+			t.Fatalf("compaction_entry_id %q, want it empty", graph.Session.State.CompactionEntryID)
+		}
+		state := operationStateOf(t, graph, testOpID)
+		if state.Status != OperationRunning {
+			t.Fatalf("operation state = %+v, want still running", state)
+		}
+		after, err := h.projectContext(c, testOpID)
+		if err != nil {
+			t.Fatalf("projectContext: %v", err)
+		}
+		if !reflect.DeepEqual(before, after) {
+			t.Fatalf("projection changed through a failed commit:\nbefore %+v\nafter  %+v", before, after)
+		}
+	})
+
+	t.Run("a one-shot commit failure settles the accumulated usage", func(t *testing.T) {
+		h, store, c, sessionID := newEffectHarness(t, nil)
+		before, err := h.projectContext(c, testOpID)
+		if err != nil {
+			t.Fatalf("projectContext: %v", err)
+		}
+		injected := errors.New("injected commit failure")
+		seen := false
+		store.txHook = func(step string) error {
+			if step == "insert_entry" && !seen {
+				seen = true
+				return injected
+			}
+			return nil
+		}
+		usage := &UsageCount{InputTokens: 7, CachedInputTokens: 3, OutputTokens: 4}
+
+		err = h.commitCompaction(c, testOpID, testCapture(), "summary", usage, false)
+		if err == nil || !strings.Contains(err.Error(), "injected commit failure") {
+			t.Fatalf("error %v, want the injected commit failure", err)
+		}
+
+		graph, err := validateFixture(t, store, sessionID)
+		if err != nil {
+			t.Fatalf("post-failure graph: %v", err)
+		}
+		for i := range graph.Entries {
+			if graph.Entries[i].Compaction != nil {
+				t.Fatalf("compaction entry committed on a failed transaction")
+			}
+		}
+		if graph.Session.State.CompactionEntryID != "" {
+			t.Fatalf("compaction_entry_id %q, want it empty", graph.Session.State.CompactionEntryID)
+		}
+		settlement := settlementEntryOf(t, graph)
+		if settlement.Status != OperationFailure || !strings.Contains(settlement.Detail, "injected commit failure") {
+			t.Fatalf("settlement entry = %+v, want the commit failure terminal", settlement)
+		}
+		if settlement.Model == nil || *settlement.Model != testCompactCapture().Model {
+			t.Fatalf("settlement model = %+v, want the compact model identity", settlement.Model)
+		}
+		if settlement.Usage == nil || *settlement.Usage != *usage {
+			t.Fatalf("settlement usage = %+v, want the accumulated total", settlement.Usage)
+		}
+		after, err := h.projectContext(c, testOpID)
+		if err != nil {
+			t.Fatalf("projectContext: %v", err)
+		}
+		if !reflect.DeepEqual(before, after) {
+			t.Fatalf("projection changed through a failed commit:\nbefore %+v\nafter  %+v", before, after)
+		}
+	})
+
+	t.Run("the manual settlement shares the commit transaction", func(t *testing.T) {
+		h, store, c, sessionID := newEffectHarness(t, nil)
+		before, err := h.projectContext(c, testOpID)
+		if err != nil {
+			t.Fatalf("projectContext: %v", err)
+		}
+		injected := errors.New("injected settlement failure")
+		inserts := 0
+		store.txHook = func(step string) error {
+			if step == "insert_entry" {
+				inserts++
+				if inserts == 2 { // the settlement entry's insertion inside the commit transaction
+					return injected
+				}
+			}
+			return nil
+		}
+
+		err = h.commitCompaction(c, testOpID, testCapture(), "summary", nil, true)
+		if err == nil || !strings.Contains(err.Error(), "injected settlement failure") {
+			t.Fatalf("error %v, want the injected settlement failure", err)
+		}
+
+		graph, err := validateFixture(t, store, sessionID)
+		if err != nil {
+			t.Fatalf("post-failure graph: %v", err)
+		}
+		for i := range graph.Entries {
+			if graph.Entries[i].Compaction != nil {
+				t.Fatalf("compaction entry survived the failed shared transaction")
+			}
+		}
+		if graph.Session.State.CompactionEntryID != "" {
+			t.Fatalf("compaction_entry_id %q, want it empty", graph.Session.State.CompactionEntryID)
+		}
+		// The commit's own failure settlement stands alone.
+		settlement := settlementEntryOf(t, graph)
+		if settlement.Status != OperationFailure || !strings.Contains(settlement.Detail, "injected settlement failure") {
+			t.Fatalf("settlement entry = %+v, want the commit failure terminal", settlement)
+		}
+		after, err := h.projectContext(c, testOpID)
+		if err != nil {
+			t.Fatalf("projectContext: %v", err)
+		}
+		if !reflect.DeepEqual(before, after) {
+			t.Fatalf("projection changed through a failed commit:\nbefore %+v\nafter  %+v", before, after)
+		}
+	})
+}
