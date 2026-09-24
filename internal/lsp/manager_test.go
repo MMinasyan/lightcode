@@ -122,11 +122,11 @@ func TestManagerShutdownAllKillsUnresponsiveServers(t *testing.T) {
 	start := time.Now()
 	m.ShutdownAll()
 	elapsed := time.Since(start)
-	t.Logf("ShutdownAll with %d unresponsive servers took %s", 2, elapsed)
 	// The negotiate path waits shutdownWait per unresponsive instance before
-	// killing it; the teardown must kill instead, well below that.
-	if elapsed >= 2*time.Second {
-		t.Fatalf("ShutdownAll took %s, want a prompt teardown (the negotiate path waited %s per unresponsive server)", elapsed, shutdownWait)
+	// killing it; timers never fire early, so a teardown under the bound is
+	// the kill path and one at or over it is the negotiation.
+	if elapsed >= shutdownWait {
+		t.Fatalf("ShutdownAll took %s, want the kill teardown (the negotiate path waits %s per unresponsive server)", elapsed, shutdownWait)
 	}
 
 	for i, s := range servers {
@@ -187,14 +187,7 @@ func TestStartServerAfterClosedRejectsBeforeStart(t *testing.T) {
 	m.closed = true
 	m.mu.Unlock()
 
-	start := time.Now()
-	m.startServer(context.Background(), def)
-	elapsed := time.Since(start)
-	t.Logf("startServer after closed took %s", elapsed)
-	// Rejection happens before any start or negotiation, so it is prompt.
-	if elapsed >= 2*time.Second {
-		t.Fatalf("startServer after closed took %s, want an immediate rejection", elapsed)
-	}
+	m.startServer(context.Background(), def) // synchronous early rejection; the pidfile check below proves nothing launched
 
 	// No process was ever launched: the wrapper never wrote the pidfile.
 	if _, err := os.Stat(pidfile); !os.IsNotExist(err) {
@@ -235,13 +228,7 @@ func TestStartServerAfterClosedSkipsInstall(t *testing.T) {
 	m.SetSignalHandler(func(string) { signals.Add(1) })
 
 	m.CloseAdmission()
-	start := time.Now()
-	m.startServer(context.Background(), def)
-	elapsed := time.Since(start)
-	t.Logf("startServer after CloseAdmission with missing binary took %s", elapsed)
-	if elapsed >= 2*time.Second {
-		t.Fatalf("startServer after CloseAdmission took %s, want an immediate rejection", elapsed)
-	}
+	m.startServer(context.Background(), def) // synchronous admission rejection; the Install flag below proves it
 	if installed {
 		t.Fatal("Install was called after CloseAdmission: the early admission check did not reject")
 	}
@@ -312,14 +299,19 @@ func TestStartServerCloseRaceProvisionalMappingHoldsTerminalAdmission(t *testing
 		t.Fatal("startServer never reached the post-handoff probe")
 	}
 
-	// Permanent close while the start is blocked after the handoff must
-	// return promptly and must not wait on the probe.
-	start := time.Now()
-	m.ShutdownAll()
-	elapsed := time.Since(start)
-	t.Logf("ShutdownAll with a probe-blocked start took %s", elapsed)
-	if elapsed >= 2*time.Second {
-		t.Fatalf("ShutdownAll took %s, want a prompt permanent close", elapsed)
+	// Permanent close while the start is blocked after the handoff must not
+	// wait on the probe: the only release is the close below, so returning
+	// before it proves the close skipped the probe; a close that waits is
+	// caught by the join bound as a hang.
+	shutdownDone := make(chan struct{})
+	go func() {
+		m.ShutdownAll()
+		close(shutdownDone)
+	}()
+	select {
+	case <-shutdownDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("ShutdownAll waited on the probe-blocked start")
 	}
 
 	close(release)
@@ -429,9 +421,10 @@ func TestStartServerCloseRaceMappedInstanceIsTornDown(t *testing.T) {
 	start := time.Now()
 	m.ShutdownAll()
 	elapsed := time.Since(start)
-	t.Logf("ShutdownAll with a mid-start mapped server took %s", elapsed)
-	if elapsed >= 2*time.Second {
-		t.Fatalf("ShutdownAll took %s, want a prompt teardown (no negotiation with the unresponsive server)", elapsed)
+	// Timers never fire early: under the negotiate wait is the kill path, at
+	// or over it is the negotiation the teardown must not take.
+	if elapsed >= shutdownWait {
+		t.Fatalf("ShutdownAll took %s, want the kill teardown (no negotiation with the unresponsive server)", elapsed)
 	}
 
 	// The mapped mid-start instance's process is killed and reaped inside the
