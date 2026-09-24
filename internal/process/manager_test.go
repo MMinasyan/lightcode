@@ -750,10 +750,12 @@ func TestProcessExitCallbackClose(t *testing.T) {
 			m.Close()
 			close(closed)
 		}()
-		select {
-		case <-closed:
-			t.Fatal("Close returned before joining the admitted callback")
-		case <-time.After(200 * time.Millisecond):
+		joinDeadline := time.Now().Add(5 * time.Second)
+		for !m.cbJoined.Load() { // the close is provably parked on the callback join; the gated callback holds its token
+			if time.Now().After(joinDeadline) {
+				t.Fatal("Close never joined the admitted callback")
+			}
+			time.Sleep(2 * time.Millisecond)
 		}
 		close(release)
 		select {

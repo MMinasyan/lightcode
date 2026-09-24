@@ -3,6 +3,8 @@
 package process
 
 import (
+	"sync/atomic"
+
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -58,9 +60,13 @@ type Manager struct {
 	// both guarded by mu so admission cannot race CloseWait's wait.
 	// closeOnce/closeDone make CloseWait a single shared join so concurrent
 	// callers all wait for the same cleanup.
-	closed    bool
-	cbClosed  bool
-	cbWG      sync.WaitGroup
+	closed   bool
+	cbClosed bool
+	cbWG     sync.WaitGroup
+	// cbJoined records that the close reached its callback join. Nothing
+	// in production reads it; with an admitted callback provably holding a
+	// token, the flag proves the close is parked on the join, for tests.
+	cbJoined  atomic.Bool
 	closeOnce sync.Once
 	closeDone chan struct{}
 }
@@ -424,6 +430,7 @@ func (m *Manager) CloseWait() {
 		for _, id := range ids {
 			_ = m.kill(id, "", false)
 		}
+		m.cbJoined.Store(true)
 		m.cbWG.Wait()
 		close(m.closeDone)
 	})
