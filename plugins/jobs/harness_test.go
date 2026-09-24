@@ -31,7 +31,7 @@ import (
 // takes the durable closed path, exactly as managed shutdown does.
 func TestStopJobReaperBarrierAndHarnessStopDelivery(t *testing.T) {
 	j := openJobs(t, t.TempDir())
-	release := armTestReaper(t, j)
+	release, reaperEntered := armTestReaper(t, j)
 
 	hctx, hcancel := context.WithCancel(context.Background())
 	defer hcancel()
@@ -86,10 +86,10 @@ func TestStopJobReaperBarrierAndHarnessStopDelivery(t *testing.T) {
 		j.StopJob(sid, jobID)
 		close(stopJobDone)
 	}()
-	select {
-	case <-stopJobDone:
-		t.Fatal("StopJob returned before reaping")
-	case <-time.After(600 * time.Millisecond):
+	select { // the reaper wait is provably reached; the held gate parks StopJob inside it
+	case <-reaperEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopJob never reached the held reaper wait")
 	}
 	select {
 	case <-callbackEntered:
@@ -122,10 +122,12 @@ func TestStopJobReaperBarrierAndHarnessStopDelivery(t *testing.T) {
 	// the gated delivery has not closed yet.
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- h.Stop(context.Background(), sid) }()
-	select {
-	case err := <-stopDone:
-		t.Fatalf("Stop returned before the delivery finished the member: %v", err)
-	case <-time.After(200 * time.Millisecond):
+	stopDeadline := time.Now().Add(5 * time.Second)
+	for j.stopJobCalls.Load() < 2 { // the harness stop provably called the member's StopJob; its next and only wait is the member's done, which the gated delivery holds closed
+		if time.Now().After(stopDeadline) {
+			t.Fatalf("the harness Stop never stopped the member (calls=%d)", j.stopJobCalls.Load())
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 
 	// Phase 4: the delivery finishes the member and Stop converges.

@@ -9,6 +9,8 @@
 package jobs
 
 import (
+	"sync/atomic"
+
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -171,11 +173,18 @@ func (r *jobRecord) claimKilledLocked() {
 // the closed flag, and the work group covering every exit/timeout goroutine
 // (and therefore every admitted callback and all capture/record cleanup).
 type instance struct {
-	mu      sync.Mutex
-	jobs    map[string]*jobRecord
-	closed  bool
-	wg      sync.WaitGroup
-	dataDir string
+	mu     sync.Mutex
+	jobs   map[string]*jobRecord
+	closed bool
+	wg     sync.WaitGroup
+
+	// joinedCallbacks records that Close reached its exit-callback join;
+	// stopJobCalls counts StopJob invocations. Nothing in production reads
+	// either: they are the observation points letting tests rendezvous on the
+	// joins before releasing the parked party.
+	joinedCallbacks atomic.Bool
+	stopJobCalls    atomic.Int32
+	dataDir         string
 }
 
 var _ Jobs = (*instance)(nil)
@@ -460,6 +469,7 @@ func (j *instance) Kill(sessionID, jobID string) error {
 // the ordinary exit callback then delivers the stopped result. Exited,
 // absent, or foreign identities return.
 func (j *instance) StopJob(sessionID, jobID string) {
+	j.stopJobCalls.Add(1)
 	j.mu.Lock()
 	rec, ok := j.jobs[jobID]
 	if !ok {
@@ -580,6 +590,7 @@ func (j *instance) Close() error {
 	for _, job := range running {
 		reapGroup(job.pid, job.done)
 	}
+	j.joinedCallbacks.Store(true)
 	j.wg.Wait()
 
 	j.mu.Lock()

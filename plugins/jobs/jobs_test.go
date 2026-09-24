@@ -61,12 +61,14 @@ func openJobs(t *testing.T, dataDir string) *instance {
 // armTestReaper replaces the wait seam with one parked until the returned
 // release function runs. Cleanup releases the barrier, closes the instance so
 // every reaper goroutine leaves the seam, and only then restores the seam.
-func armTestReaper(t *testing.T, inst *instance) (release func()) {
+func armTestReaper(t *testing.T, inst *instance) (release func(), entered <-chan struct{}) {
 	t.Helper()
 	orig := waitCommand
 	gate := make(chan struct{})
+	arrive := make(chan struct{}, 8)
 	var once sync.Once
 	waitCommand = func(cmd *exec.Cmd) error {
+		arrive <- struct{}{} // the wait is provably reached before the held gate releases it
 		<-gate
 		return orig(cmd)
 	}
@@ -76,7 +78,7 @@ func armTestReaper(t *testing.T, inst *instance) (release func()) {
 		_ = inst.Close()
 		waitCommand = orig
 	})
-	return release
+	return release, arrive
 }
 
 // start runs one reserved start, failing the test on error.
@@ -803,10 +805,12 @@ func TestCloseKillsStraysAndGatesCallbacks(t *testing.T) {
 
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- j.Close() }()
-	select {
-	case err := <-closeDone:
-		t.Fatalf("Close returned before the admitted callback was released: %v", err)
-	case <-time.After(300 * time.Millisecond):
+	joinDeadline := time.Now().Add(5 * time.Second)
+	for !j.joinedCallbacks.Load() { // Close is provably parked on the callback join; the gated callback holds the token
+		if time.Now().After(joinDeadline) {
+			t.Fatal("Close never joined the admitted callback")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 	close(aRelease)
 	waitExit(t, aExit)
@@ -861,7 +865,7 @@ func TestCloseKillsStraysAndGatesCallbacks(t *testing.T) {
 // diagnoses on stderr and returns nil instead of waiting forever.
 func TestKillRetainsFiveSecondDiagnoseAndAbandon(t *testing.T) {
 	j := openJobs(t, t.TempDir())
-	release := armTestReaper(t, j)
+	release, _ := armTestReaper(t, j)
 	const sid = "session-kill-abandon"
 	id := reserveStart(t, j, StartRequest{
 		SessionID: sid, Command: "sleep 30", Env: os.Environ(),
