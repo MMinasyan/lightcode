@@ -39,12 +39,20 @@ func publicCapture() harness.ExecutionCapture {
 	return harness.ExecutionCapture{
 		ConfigurationRevision: "rev-1",
 		Model:                 publicModelRef,
+		ContextWindow:         4096,
+		OutputReserve:         2048,
 		SystemPrompt:          "system",
 		Tools: []model.ToolDefinition{{
 			Name:        "echo",
 			Description: "echoes",
 			Parameters:  json.RawMessage(`{"type":"object"}`),
 		}},
+		Compact: harness.CompactCapture{
+			Model:         publicModelRef,
+			ContextWindow: 4096,
+			OutputReserve: 2048,
+			SystemPrompt:  "summarize",
+		},
 	}
 }
 
@@ -251,6 +259,7 @@ func newPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, 
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 			return harness.Execution{
 				Model:         modelFn,
+				CompactModel:  modelFn,
 				NormalizeTool: publicNormalize,
 				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
@@ -591,6 +600,7 @@ func scriptPrepared(script *scriptModel) harness.PreparedExecution {
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 			return harness.Execution{
 				Model:         script.effect,
+				CompactModel:  script.effect,
 				NormalizeTool: publicNormalize,
 				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
@@ -1328,6 +1338,7 @@ func TestPublicOpenerInputMutationKeepsAdmittedExecution(t *testing.T) {
 							}
 							return harness.Execution{
 								Model:         script.effect,
+								CompactModel:  script.effect,
 								NormalizeTool: publicNormalize,
 								Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 									return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
@@ -1684,6 +1695,7 @@ func TestPublicOrderedToolCallsSettle(t *testing.T) {
 			Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 				return harness.Execution{
 					Model:         script.effect,
+					CompactModel:  script.effect,
 					NormalizeTool: publicNormalize,
 					Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 						toolMu.Lock()
@@ -1790,6 +1802,7 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 					return harness.Execution{
 						Model:         script.effect,
+						CompactModel:  script.effect,
 						NormalizeTool: publicNormalize,
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 							switch call.ID {
@@ -1904,6 +1917,7 @@ func TestPublicPreparedPermissionBoundarySurvivesRestart(t *testing.T) {
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 					return harness.Execution{
 						Model:         script.effect,
+						CompactModel:  script.effect,
 						NormalizeTool: publicNormalize,
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 							if call.ID == "call-2" { // the exit-condition omission through the public path
@@ -3501,7 +3515,9 @@ func rawAdmission(sessionID, operationID, entryID string) string {
 		`{"session_id":%q,"operation_id":%q,"request_kind":"message",`+
 			`"admitted_entry":{"session_id":%q,"entry_id":%q},"agent_type":"coder",`+
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
-			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":""},"admitted_at":%q}`,
+			`"context_window":4096,"output_reserve":2048,`+
+			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":"",`+
+			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"context_window":2048,"output_reserve":1024,"system_prompt":"summarize"}},"admitted_at":%q}`,
 		sessionID, operationID, sessionID, entryID, rawToolDefinition, now)
 }
 
@@ -5263,6 +5279,7 @@ func racePrepared(f *publicFixture) harness.PreparedExecution {
 			f.opens.Add(1)
 			return harness.Execution{
 				Model:         f.model.effect,
+				CompactModel:  f.model.effect,
 				NormalizeTool: publicNormalize,
 				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
@@ -5315,6 +5332,7 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 					return harness.Execution{
 						Model:         script.effect,
+						CompactModel:  script.effect,
 						NormalizeTool: publicNormalize,
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 							// the copied tool result carries tool-owned
@@ -6215,6 +6233,7 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 					events <- "open:" + adm.OperationID
 					return harness.Execution{
 						Model:         script.effect,
+						CompactModel:  script.effect,
 						NormalizeTool: publicNormalize,
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}

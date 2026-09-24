@@ -1705,12 +1705,12 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 	if err != nil {
 		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{}, err)
 	}
-	if exec.Model == nil || exec.Tool == nil || exec.NormalizeTool == nil {
+	if exec.Model == nil || exec.CompactModel == nil || exec.Tool == nil || exec.NormalizeTool == nil {
 		if exec.Close != nil {
 			h.recordCleanupFailure(exec.Close())
 		}
 		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{},
-			invalidInput("opened execution requires non-nil model, tool and normalization functions"))
+			invalidInput("opened execution requires non-nil model, compact model, tool and normalization functions"))
 	}
 	seenHooks := make(map[string]bool, len(exec.ToolHooks))
 	for _, hook := range exec.ToolHooks {

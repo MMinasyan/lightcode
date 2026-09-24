@@ -103,6 +103,9 @@ func validExecution() Execution {
 		Model: func(context.Context, model.Request) (model.Stream, error) {
 			select {} // the fixture owns the admitted Operation's state assertions
 		},
+		CompactModel: func(context.Context, model.Request) (model.Stream, error) {
+			select {}
+		},
 		Tool:          func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
 		NormalizeTool: objectNormalize,
 	}

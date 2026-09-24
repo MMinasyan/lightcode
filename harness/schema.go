@@ -131,8 +131,10 @@ type UsageTotals struct {
 // ExecutionCapture is the complete non-secret configuration required to
 // interpret one Operation: the stable configuration revision, the complete
 // model identity, the system prompt, the advertised tool definitions in
-// preserved order, the selected capability names in preserved order, and the
-// Agent definition's permission capability constraints. Readonly and WriteDir
+// preserved order, the selected capability names in preserved order, the
+// Agent definition's permission capability constraints, and the compaction
+// configuration — the conversation context window, the output reserve, and
+// the effective compact model's selection. Readonly and WriteDir
 // are the configured lexical constraint copied from the one Harness-selected
 // definition; WriteDir is already trimmed at projection and stays unchanged in
 // the capture. The captured ConfigurationRevision also identifies the
@@ -143,11 +145,25 @@ type UsageTotals struct {
 type ExecutionCapture struct {
 	ConfigurationRevision string                 `json:"configuration_revision"`
 	Model                 model.ModelRef         `json:"model"`
+	ContextWindow         int                    `json:"context_window"`
+	OutputReserve         int                    `json:"output_reserve"`
 	SystemPrompt          string                 `json:"system_prompt"`
 	Tools                 []model.ToolDefinition `json:"tools"`
 	Capabilities          []string               `json:"capabilities,omitempty"`
 	Readonly              bool                   `json:"readonly"`
 	WriteDir              string                 `json:"write_dir"`
+	Compact               CompactCapture         `json:"compact"`
+}
+
+// CompactCapture is the effective compaction configuration of one capture:
+// the model the compaction summarizer runs on, its context window and output
+// reserve under the same fallback rules as the conversation model, and the
+// compact type's system prompt. Fully comparable.
+type CompactCapture struct {
+	Model         model.ModelRef `json:"model"`
+	ContextWindow int            `json:"context_window"`
+	OutputReserve int            `json:"output_reserve"`
+	SystemPrompt  string         `json:"system_prompt"`
 }
 
 // SessionIdentity is the immutable identity section of one Session register.

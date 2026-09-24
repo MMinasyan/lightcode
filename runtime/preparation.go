@@ -248,6 +248,7 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	}
 	return harness.Execution{
 		Model:         execution.Model,
+		CompactModel:  execution.CompactModel,
 		Retry:         execution.Retry,
 		Tool:          execution.Tool,
 		Permissions:   execution.Permissions,
@@ -330,6 +331,47 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 	if err != nil {
 		return harness.ExecutionCapture{}, nil, err
 	}
+	// The compact configuration rides the same one-revision snapshot: the
+	// resolved compact Agent type carries the selection's model and prompt.
+	// Its resolution failure is an admission failure — the compact builtin is
+	// always present and no retained prompt source exists to fall back to.
+	compactType, err := harness.ResolveAgentType("compact", snapshot.agentTypes())
+	if err != nil {
+		return harness.ExecutionCapture{}, nil, fmt.Errorf("compact agent type: %w", err)
+	}
+	// The effective compact model is one fallback chain ending at the
+	// conversation model: the compact type's model — when it names a
+	// different model at all — must resolve in the catalog, build a transport
+	// over a resolved credential; otherwise the conversation model and its
+	// transport are kept. The recorded compact configuration is always the
+	// final effective model's.
+	compactRef := sel.agent.Model
+	compactWindow := entry.ContextWindow
+	compactReserve := outputReserve(entry.MaxOutputTokens)
+	compactTransport := transport
+	if !compactType.Model.IsZero() && compactType.Model != sel.agent.Model {
+		compactProvider, compactEntry, lookupErr := snapshot.catalog.Lookup(catalog.ModelRef{Provider: compactType.Model.Provider, Model: compactType.Model.Model})
+		if lookupErr == nil {
+			keyMissing := false
+			compactKey := ""
+			if env := compactProvider.Transport.APIKeyEnv; env != "" {
+				compactKey = os.Getenv(env)
+				keyMissing = compactKey == ""
+			}
+			if !keyMissing {
+				built, buildErr := p.concreteTransport(compactProvider, compactEntry, compactType.Model, compactKey)
+				if buildErr == nil {
+					compactRef = compactType.Model
+					compactWindow = compactEntry.ContextWindow
+					if compactWindow <= 0 { // the retained window fallback: the conversation model's window
+						compactWindow = entry.ContextWindow
+					}
+					compactReserve = outputReserve(compactEntry.MaxOutputTokens)
+					compactTransport = built
+				}
+			}
+		}
+	}
 	adaptation, err := p.boundAdaptation(sel)
 	if err != nil {
 		return harness.ExecutionCapture{}, nil, err
@@ -357,15 +399,32 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 	capture := harness.ExecutionCapture{
 		ConfigurationRevision: sel.invocation.Revision(),
 		Model:                 sel.agent.Model,
+		ContextWindow:         entry.ContextWindow,
+		OutputReserve:         outputReserve(entry.MaxOutputTokens),
 		SystemPrompt:          result.Prompt,
 		Tools:                 tools,
 		Capabilities:          slices.Clone(sel.agent.Capabilities),
 		Readonly:              sel.agent.Readonly,
 		WriteDir:              sel.agent.WriteDir,
+		Compact: harness.CompactCapture{
+			Model:         compactRef,
+			ContextWindow: compactWindow,
+			OutputReserve: compactReserve,
+			SystemPrompt:  compactType.Prompt,
+		},
 	}
 	workspace := req.Session.Identity.Workspace
 	policy := snapshot.permissionPolicy(workspace)
-	return capture, p.concreteOpener(transport, policy, workspace, tools), nil
+	return capture, p.concreteOpener(transport, compactTransport, policy, workspace, tools), nil
+}
+
+// outputReserve applies the retained reserve rule: the catalog entry's
+// MaxOutputTokens when positive, else the fixed 131072 reserve.
+func outputReserve(maxOutputTokens int) int {
+	if maxOutputTokens > 0 {
+		return maxOutputTokens
+	}
+	return 131072
 }
 
 // boundAdaptation binds the composition's single ModelAdaptation export from
@@ -504,11 +563,14 @@ func wireDebugDir(home string) string {
 // tool name from the execution-view bindings over all four scopes, owns one
 // ToolContext carrying the prepare-time Workspace, the calling Operation's
 // admitted-input identity, the captured Invocation and the validated hard
-// constraints, and returns the execution whose model callback makes exactly
-// one physical attempt over the captured transport. The shared advertisement
+// constraints, and returns the execution whose model callbacks each make
+// exactly one physical attempt — Model over the conversation transport and
+// CompactModel over the effective compact transport, the same construction
+// over the one shared transport when the compact model is the conversation
+// model. The shared advertisement
 // gate rejects unknown names before dispatch; retry classification, selected
 // argument hooks, and scope disposal belong to the shared machinery.
-func (p *preparation) concreteOpener(transport *model.Transport, policy harness.PermissionPolicy, workspace string, advertised []model.ToolDefinition) openExecution {
+func (p *preparation) concreteOpener(transport, compactTransport *model.Transport, policy harness.PermissionPolicy, workspace string, advertised []model.ToolDefinition) openExecution {
 	return func(_ context.Context, admission harness.OperationAdmission, sel selection) (harness.Execution, error) {
 		table := make(map[string]Tool, len(advertised))
 		for _, definition := range advertised {
@@ -528,6 +590,10 @@ func (p *preparation) concreteOpener(transport *model.Transport, policy harness.
 		return harness.Execution{
 			Model: func(ctx context.Context, req model.Request) (model.Stream, error) {
 				stream, _, err := transport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
+				return stream, err
+			},
+			CompactModel: func(ctx context.Context, req model.Request) (model.Stream, error) {
+				stream, _, err := compactTransport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
 				return stream, err
 			},
 			// A nil Retry selects the standard classifier.
@@ -635,6 +701,15 @@ func ownExecutionCapture(capture harness.ExecutionCapture) (harness.ExecutionCap
 func validateHookedCapture(base, next harness.ExecutionCapture) error {
 	if next.Model != base.Model {
 		return fmt.Errorf("preparation hook changed the captured model: %w", harness.ErrInvalid)
+	}
+	if next.ContextWindow != base.ContextWindow {
+		return fmt.Errorf("preparation hook changed the captured context window: %w", harness.ErrInvalid)
+	}
+	if next.OutputReserve != base.OutputReserve {
+		return fmt.Errorf("preparation hook changed the captured output reserve: %w", harness.ErrInvalid)
+	}
+	if next.Compact != base.Compact {
+		return fmt.Errorf("preparation hook changed the captured compact configuration: %w", harness.ErrInvalid)
 	}
 	if next.ConfigurationRevision != base.ConfigurationRevision {
 		return fmt.Errorf("preparation hook changed the captured revision: %w", harness.ErrInvalid)

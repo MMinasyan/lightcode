@@ -725,7 +725,7 @@ func TestToolArgumentHookInvalidOpenedExecutionRejectsHooks(t *testing.T) {
 				modelFn := func(context.Context, model.Request) (model.Stream, error) {
 					return completedTurnStream(), nil
 				}
-				return Execution{Model: modelFn, Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }, NormalizeTool: objectNormalize, ToolHooks: tc.hooks, Close: func() error {
+				return Execution{Model: modelFn, CompactModel: modelFn, Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }, NormalizeTool: objectNormalize, ToolHooks: tc.hooks, Close: func() error {
 					closed++
 					return nil
 				}}, nil

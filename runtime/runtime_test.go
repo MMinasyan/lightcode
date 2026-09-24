@@ -211,8 +211,16 @@ func (p *controlledPrep) prepare(_ context.Context, req harness.PreparationReque
 	capture := harness.ExecutionCapture{
 		ConfigurationRevision: sel.invocation.Revision(),
 		Model:                 sel.agent.Model,
+		ContextWindow:         4096,
+		OutputReserve:         2048,
 		SystemPrompt:          "prompt-" + req.Session.AgentType,
 		Tools:                 captureTools(sel.agent.Tools),
+		Compact: harness.CompactCapture{
+			Model:         sel.agent.Model,
+			ContextWindow: 2048,
+			OutputReserve: 1024,
+			SystemPrompt:  "summarize",
+		},
 	}
 	return capture, p.open, nil
 }
@@ -222,22 +230,24 @@ func (p *controlledPrep) open(_ context.Context, adm harness.OperationAdmission,
 	p.openCalls++
 	gate := p.modelGate
 	p.mu.Unlock()
+	modelFn := func(ctx context.Context, _ model.Request) (model.Stream, error) {
+		select {
+		case p.modelArrived <- struct{}{}:
+		default:
+		}
+		if gate != nil {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return &prepStream{}, nil
+	}
 	return harness.Execution{
 		NormalizeTool: runtimeNormalize,
-		Model: func(ctx context.Context, _ model.Request) (model.Stream, error) {
-			select {
-			case p.modelArrived <- struct{}{}:
-			default:
-			}
-			if gate != nil {
-				select {
-				case <-gate:
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-			}
-			return &prepStream{}, nil
-		},
+		Model:         modelFn,
+		CompactModel:  modelFn,
 		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 			return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}}
 		},
@@ -464,18 +474,21 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 		Storage: store,
 		Prepare: func(context.Context, harness.PreparationRequest) (harness.PreparedExecution, error) {
 			return harness.PreparedExecution{
-				Capture: harness.ExecutionCapture{ConfigurationRevision: "1", Model: prepModelRef, SystemPrompt: "seeded"},
+				Capture: harness.ExecutionCapture{ConfigurationRevision: "1", Model: prepModelRef, ContextWindow: 4096, OutputReserve: 2048, SystemPrompt: "seeded",
+					Compact: harness.CompactCapture{Model: prepModelRef, ContextWindow: 2048, OutputReserve: 1024, SystemPrompt: "summarize"}},
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+					modelFn := func(context.Context, model.Request) (model.Stream, error) {
+						select {
+						case arrived <- struct{}{}:
+						default:
+						}
+						<-release
+						return nil, errors.New("seeded execution released after the test converged")
+					}
 					return harness.Execution{
 						NormalizeTool: runtimeNormalize,
-						Model: func(context.Context, model.Request) (model.Stream, error) {
-							select {
-							case arrived <- struct{}{}:
-							default:
-							}
-							<-release
-							return nil, errors.New("seeded execution released after the test converged")
-						},
+						Model:         modelFn,
+						CompactModel:  modelFn,
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}}
 						},

@@ -374,8 +374,16 @@ func toolsCapture(names []string) harness.ExecutionCapture {
 	return harness.ExecutionCapture{
 		ConfigurationRevision: "1",
 		Model:                 model.ModelRef{Provider: "prov", Model: "m"},
+		ContextWindow:         4096,
+		OutputReserve:         2048,
 		SystemPrompt:          "composed tools",
 		Tools:                 definitions,
+		Compact: harness.CompactCapture{
+			Model:         model.ModelRef{Provider: "prov", Model: "m"},
+			ContextWindow: 2048,
+			OutputReserve: 1024,
+			SystemPrompt:  "summarize",
+		},
 	}
 }
 
@@ -475,8 +483,9 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 						Background:    opts.background,
 					}
 					return harness.Execution{
-						Model:       modelFn,
-						Permissions: opts.permissions,
+						Model:        modelFn,
+						CompactModel: modelFn,
+						Permissions:  opts.permissions,
 						NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
 							tool, ok := byID[call.Name]
 							if !ok {

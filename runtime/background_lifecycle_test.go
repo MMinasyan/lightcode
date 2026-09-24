@@ -177,8 +177,16 @@ func (p *scriptedPrep) prepare(_ context.Context, req harness.PreparationRequest
 	capture := harness.ExecutionCapture{
 		ConfigurationRevision: sel.invocation.Revision(),
 		Model:                 sel.agent.Model,
+		ContextWindow:         4096,
+		OutputReserve:         2048,
 		SystemPrompt:          "prompt-" + req.Session.AgentType,
 		Tools:                 captureTools(advertise),
+		Compact: harness.CompactCapture{
+			Model:         sel.agent.Model,
+			ContextWindow: 2048,
+			OutputReserve: 1024,
+			SystemPrompt:  "summarize",
+		},
 	}
 	return capture, p.opener(script), nil
 }
@@ -190,17 +198,19 @@ func (p *scriptedPrep) opener(script *lifecycleScript) openExecution {
 				return harness.Execution{}, err
 			}
 		}
+		modelFn := func(mctx context.Context, req model.Request) (model.Stream, error) {
+			p.mu.Lock()
+			p.modelCalls[admission.SessionID]++
+			attempt := p.modelCalls[admission.SessionID]
+			p.mu.Unlock()
+			if script == nil || script.model == nil {
+				return lifecycleTextTurn("done"), nil
+			}
+			return script.model(mctx, admission.SessionID, attempt, req)
+		}
 		return harness.Execution{
-			Model: func(mctx context.Context, req model.Request) (model.Stream, error) {
-				p.mu.Lock()
-				p.modelCalls[admission.SessionID]++
-				attempt := p.modelCalls[admission.SessionID]
-				p.mu.Unlock()
-				if script == nil || script.model == nil {
-					return lifecycleTextTurn("done"), nil
-				}
-				return script.model(mctx, admission.SessionID, attempt, req)
-			},
+			Model:        modelFn,
+			CompactModel: modelFn,
 			Tool: func(tctx context.Context, call model.ToolCall) harness.PreparedTool {
 				if script == nil || script.tool == nil {
 					return harness.PreparedTool{
@@ -2199,7 +2209,9 @@ func seedLifecycleChild(t *testing.T, store harness.Storage, parentID, childID, 
 		`{"session_id":%q,"operation_id":%q,"request_kind":"message",`+
 			`"admitted_entry":{"session_id":%q,"entry_id":%q},"agent_type":"worker",`+
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
-			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":""},"admitted_at":%q}`,
+			`"context_window":4096,"output_reserve":2048,`+
+			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":"",`+
+			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"context_window":2048,"output_reserve":1024,"system_prompt":"summarize"}},"admitted_at":%q}`,
 		childID, operationID, childID, entryID, lifecycleSeedToolDefinition, now)
 	operationPayload := fmt.Sprintf(
 		`{"admission":%s,"state":{"status":"running","started_at":%q,"pending_tool_calls":[],"usage":{"by_model":[]}}}`,

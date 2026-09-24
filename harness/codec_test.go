@@ -33,12 +33,24 @@ func testToolDefinition() model.ToolDefinition {
 	return model.ToolDefinition{Name: "echo", Description: "echoes", Parameters: json.RawMessage(`{"type":"object"}`)}
 }
 
+func testCompactCapture() CompactCapture {
+	return CompactCapture{
+		Model:         model.ModelRef{Provider: "cprov", Model: "compact-x"},
+		ContextWindow: 2048,
+		OutputReserve: 1024,
+		SystemPrompt:  "summarize",
+	}
+}
+
 func testCapture() ExecutionCapture {
 	return ExecutionCapture{
 		ConfigurationRevision: "rev-1",
 		Model:                 testModelRef(),
+		ContextWindow:         4096,
+		OutputReserve:         2048,
 		SystemPrompt:          "system",
 		Tools:                 []model.ToolDefinition{testToolDefinition()},
+		Compact:               testCompactCapture(),
 	}
 }
 
@@ -788,7 +800,7 @@ func TestRegisterPayloadRejectsInvalidWire(t *testing.T) {
 		{"miscased key", renameKey(opRaw, "admission", "Admission")},
 		{"null admission", setKey(opRaw, "admission", json.RawMessage(`null`))},
 		{"wrong state container", setKey(opRaw, "state", json.RawMessage(`[]`))},
-		{"operation mismatch", setKey(opRaw, "admission", json.RawMessage(`{"session_id":"`+testSessionID+`","operation_id":"ghost","request_kind":"message","admitted_entry":{"session_id":"`+testSessionID+`","entry_id":"`+hexID(1)+`"},"agent_type":"coder","execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},"system_prompt":"system","tools":[],"readonly":false,"write_dir":""},"admitted_at":"2026-01-02T03:04:05.123456789Z"}`))},
+		{"operation mismatch", setKey(opRaw, "admission", json.RawMessage(`{"session_id":"`+testSessionID+`","operation_id":"ghost","request_kind":"message","admitted_entry":{"session_id":"`+testSessionID+`","entry_id":"`+hexID(1)+`"},"agent_type":"coder","execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},"context_window":4096,"output_reserve":2048,"system_prompt":"system","tools":[],"readonly":false,"write_dir":"","compact":{"model":{"provider":"cprov","model":"compact-x"},"context_window":2048,"output_reserve":1024,"system_prompt":"summarize"}},"admitted_at":"2026-01-02T03:04:05.123456789Z"}`))},
 	}
 	for _, m := range opMutations {
 		t.Run("operation/"+m.name, func(t *testing.T) {
@@ -1600,6 +1612,156 @@ func TestExecutionCapturePermissionMembers(t *testing.T) {
 			mutation.members(members)
 			if got, err := decodeExecutionCapture(members); err == nil {
 				t.Fatalf("capture decoded to %+v, want rejection", got)
+			}
+		})
+	}
+}
+
+// TestExecutionCaptureCompactionMembers pins the durable compaction
+// configuration members: context_window, output_reserve and compact are
+// required members encoded always, the nested compact object carries exactly
+// the model, context_window, output_reserve and system_prompt keys with the
+// model in the durable two-field form, everything round-trips unchanged, and
+// a capture missing a member, carrying a non-positive window or reserve, an
+// incomplete compact model identity, or an empty compact prompt is invalid on
+// both the encode and decode paths.
+func TestExecutionCaptureCompactionMembers(t *testing.T) {
+	encode := func(t *testing.T, v ExecutionCapture) map[string]json.RawMessage {
+		t.Helper()
+		raw, err := encodeExecutionCapture(v)
+		if err != nil {
+			t.Fatalf("encodeExecutionCapture: %v", err)
+		}
+		members, err := decodePayloadObject(raw)
+		if err != nil {
+			t.Fatalf("decodePayloadObject: %v", err)
+		}
+		return members
+	}
+
+	members := encode(t, testCapture())
+	if got := string(members["context_window"]); got != "4096" {
+		t.Fatalf("encoded context_window member = %s, want 4096", got)
+	}
+	if got := string(members["output_reserve"]); got != "2048" {
+		t.Fatalf("encoded output_reserve member = %s, want 2048", got)
+	}
+	compactObj, err := decodePayloadObject(members["compact"])
+	if err != nil {
+		t.Fatalf("decodePayloadObject(compact): %v", err)
+	}
+	if err := rejectUnknownMembers(compactObj, "model", "context_window", "output_reserve", "system_prompt"); err != nil {
+		t.Fatalf("encoded compact object carries unexpected members: %v", err)
+	}
+	for _, key := range []string{"model", "context_window", "output_reserve", "system_prompt"} {
+		if _, present := compactObj[key]; !present {
+			t.Fatalf("encoded compact object misses the %q member", key)
+		}
+	}
+	if got := string(compactObj["context_window"]); got != "2048" {
+		t.Fatalf("encoded compact context_window member = %s, want 2048", got)
+	}
+	if got := string(compactObj["output_reserve"]); got != "1024" {
+		t.Fatalf("encoded compact output_reserve member = %s, want 1024", got)
+	}
+	compactModelObj, err := decodePayloadObject(compactObj["model"])
+	if err != nil {
+		t.Fatalf("decodePayloadObject(compact.model): %v", err)
+	}
+	compactModel, err := decodeModelRef(compactModelObj)
+	if err != nil {
+		t.Fatalf("encoded compact model is not a durable model reference: %v", err)
+	}
+	if compactModel != (model.ModelRef{Provider: "cprov", Model: "compact-x"}) {
+		t.Fatalf("encoded compact model = %s, want cprov/compact-x", compactModel.String())
+	}
+
+	decoded, err := decodeExecutionCapture(members)
+	if err != nil {
+		t.Fatalf("decodeExecutionCapture: %v", err)
+	}
+	if decoded.ContextWindow != 4096 || decoded.OutputReserve != 2048 {
+		t.Fatalf("round-tripped windows = %d %d, want 4096 and 2048", decoded.ContextWindow, decoded.OutputReserve)
+	}
+	if decoded.Compact != testCompactCapture() {
+		t.Fatalf("round-tripped compact = %+v, want %+v", decoded.Compact, testCompactCapture())
+	}
+
+	for _, mutation := range []struct {
+		name   string
+		mutate func(*ExecutionCapture)
+	}{
+		{"zero context window", func(v *ExecutionCapture) { v.ContextWindow = 0 }},
+		{"negative context window", func(v *ExecutionCapture) { v.ContextWindow = -5 }},
+		{"zero output reserve", func(v *ExecutionCapture) { v.OutputReserve = 0 }},
+		{"negative output reserve", func(v *ExecutionCapture) { v.OutputReserve = -1 }},
+		{"empty compact model", func(v *ExecutionCapture) { v.Compact.Model = model.ModelRef{} }},
+		{"incomplete compact model", func(v *ExecutionCapture) { v.Compact.Model = model.ModelRef{Provider: "cprov"} }},
+		{"zero compact window", func(v *ExecutionCapture) { v.Compact.ContextWindow = 0 }},
+		{"negative compact window", func(v *ExecutionCapture) { v.Compact.ContextWindow = -2 }},
+		{"zero compact reserve", func(v *ExecutionCapture) { v.Compact.OutputReserve = 0 }},
+		{"negative compact reserve", func(v *ExecutionCapture) { v.Compact.OutputReserve = -3 }},
+		{"empty compact prompt", func(v *ExecutionCapture) { v.Compact.SystemPrompt = "" }},
+	} {
+		t.Run(mutation.name, func(t *testing.T) {
+			v := testCapture()
+			mutation.mutate(&v)
+			if _, err := encodeExecutionCapture(v); err == nil {
+				t.Fatalf("capture with %s encoded, want rejection", mutation.name)
+			}
+		})
+	}
+
+	for _, missing := range []string{"context_window", "output_reserve", "compact"} {
+		m := encode(t, testCapture())
+		delete(m, missing)
+		if got, err := decodeExecutionCapture(m); err == nil {
+			t.Fatalf("capture missing %q decoded to %+v, want rejection", missing, got)
+		}
+	}
+	for _, mutation := range []struct {
+		name  string
+		mutat func(map[string]json.RawMessage)
+	}{
+		{"null context window", func(m map[string]json.RawMessage) { m["context_window"] = json.RawMessage("null") }},
+		{"string context window", func(m map[string]json.RawMessage) { m["context_window"] = json.RawMessage(`"4096"`) }},
+		{"null compact", func(m map[string]json.RawMessage) { m["compact"] = json.RawMessage("null") }},
+		{"string compact", func(m map[string]json.RawMessage) { m["compact"] = json.RawMessage(`"c"`) }},
+	} {
+		m := encode(t, testCapture())
+		mutation.mutat(m)
+		if got, err := decodeExecutionCapture(m); err == nil {
+			t.Fatalf("capture with %s decoded to %+v, want rejection", mutation.name, got)
+		}
+	}
+
+	compactMutations := []struct {
+		name  string
+		mutat func(map[string]json.RawMessage)
+	}{
+		{"missing compact model", func(m map[string]json.RawMessage) { delete(m, "model") }},
+		{"null compact model", func(m map[string]json.RawMessage) { m["model"] = json.RawMessage("null") }},
+		{"string compact model", func(m map[string]json.RawMessage) { m["model"] = json.RawMessage(`"cprov/compact-x"`) }},
+		{"unknown compact member", func(m map[string]json.RawMessage) { m["extra"] = json.RawMessage(`1`) }},
+		{"missing compact prompt", func(m map[string]json.RawMessage) { delete(m, "system_prompt") }},
+		{"null compact prompt", func(m map[string]json.RawMessage) { m["system_prompt"] = json.RawMessage("null") }},
+		{"missing compact window", func(m map[string]json.RawMessage) { delete(m, "context_window") }},
+	}
+	for _, mutation := range compactMutations {
+		t.Run("wire "+mutation.name, func(t *testing.T) {
+			m := encode(t, testCapture())
+			obj, err := decodePayloadObject(m["compact"])
+			if err != nil {
+				t.Fatalf("decodePayloadObject: %v", err)
+			}
+			mutation.mutat(obj)
+			raw, err := json.Marshal(obj)
+			if err != nil {
+				t.Fatalf("marshal compact: %v", err)
+			}
+			m["compact"] = raw
+			if got, err := decodeExecutionCapture(m); err == nil {
+				t.Fatalf("capture with %s decoded to %+v, want rejection", mutation.name, got)
 			}
 		})
 	}

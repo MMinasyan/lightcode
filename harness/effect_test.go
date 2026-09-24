@@ -80,7 +80,7 @@ var fixturePermission = []PermissionRequest{{Permission: permissionCommandRun, T
 
 // effectExecution supplies the normalizer every opened execution requires.
 func effectExecution(modelFn func(context.Context, model.Request) (model.Stream, error), toolFn func(context.Context, model.ToolCall) PreparedTool) Execution {
-	return Execution{Model: modelFn, Tool: toolFn, NormalizeTool: objectNormalize}
+	return Execution{Model: modelFn, CompactModel: modelFn, Tool: toolFn, NormalizeTool: objectNormalize}
 }
 
 // scriptStream is one fake accepted model stream: it yields the scripted
@@ -1732,46 +1732,46 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		},
 		{
 			name:        "a relative canonical write root is denied",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
 			policy:      allowAllWrites,
 			plan:        filePlanRoots("/w", "sub", PermissionRequest{Permission: permissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: permissionDeniedToolResultContent, wantDenied: true,
 		},
 		{
 			name:        "a lexically unclean canonical write root is denied",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
 			policy:      allowAllWrites,
 			plan:        filePlanRoots("/w", "/w/sub/../sub", PermissionRequest{Permission: permissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: permissionDeniedToolResultContent, wantDenied: true,
 		},
 		{
 			name:        "readonly without write_dir denies file.write",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
+			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
 			plan:        filePlan(PermissionRequest{Permission: permissionFileWrite, Target: "/w/a.txt"}),
 			wantContent: permissionDeniedToolResultContent, wantDenied: true,
 		},
 		{
 			name:        "readonly without write_dir still allows file.read",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
+			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
 			plan:        filePlan(PermissionRequest{Permission: permissionFileRead, Target: "/w/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "write_dir confines file.write inside it",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
 			plan:        filePlan(PermissionRequest{Permission: permissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "write_dir denies file.write outside it even when policy allows",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
 			policy:      allowAllWrites,
 			plan:        filePlan(PermissionRequest{Permission: permissionFileWrite, Target: "/w/other.txt"}),
 			wantContent: permissionDeniedToolResultContent, wantDenied: true,
 		},
 		{
 			name:    "configured write_dir without a canonical prepared write root is denied",
-			capture: ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture: ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
 			policy:  allowAllWrites,
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{
@@ -1786,20 +1786,20 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		},
 		{
 			name:        "readonly with write_dir allows confined writes",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true, WriteDir: "/w/sub"},
+			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true, WriteDir: "/w/sub"},
 			policy:      allowAllWrites,
 			plan:        filePlan(PermissionRequest{Permission: permissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "write_dir does not lift the built-in sensitive-basename denial",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
 			plan:        filePlan(PermissionRequest{Permission: permissionFileWrite, Target: "/w/sub/.env"}),
 			wantContent: permissionDeniedToolResultContent, wantDenied: true,
 		},
 		{
 			name:        "an explicit user rule overrides the sensitive denial inside write_dir",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
 			policy:      allowAllWrites,
 			plan:        filePlan(PermissionRequest{Permission: permissionFileWrite, Target: "/w/sub/.env"}),
 			wantContent: "ran", wantExecuted: true,
@@ -1858,7 +1858,7 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		},
 		{
 			name:    "immediate success denied by the boundary carries no result content",
-			capture: ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
+			capture: ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{
 					Permissions:        []PermissionRequest{{Permission: permissionFileWrite, Target: "/w/a.txt"}},

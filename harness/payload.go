@@ -1785,6 +1785,24 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
+	compactModelRaw, err := encodeModelRef(v.Compact.Model)
+	if err != nil {
+		return nil, err
+	}
+	compactRaw, err := json.Marshal(struct {
+		Model         json.RawMessage `json:"model"`
+		ContextWindow int             `json:"context_window"`
+		OutputReserve int             `json:"output_reserve"`
+		SystemPrompt  string          `json:"system_prompt"`
+	}{
+		Model:         compactModelRaw,
+		ContextWindow: v.Compact.ContextWindow,
+		OutputReserve: v.Compact.OutputReserve,
+		SystemPrompt:  v.Compact.SystemPrompt,
+	})
+	if err != nil {
+		return nil, err
+	}
 	tools := make([]json.RawMessage, 0, len(v.Tools))
 	for _, tool := range v.Tools {
 		raw, err := encodeToolDefinition(tool)
@@ -1796,19 +1814,25 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 	wire, err := json.Marshal(struct {
 		ConfigurationRevision string            `json:"configuration_revision"`
 		Model                 json.RawMessage   `json:"model"`
+		ContextWindow         int               `json:"context_window"`
+		OutputReserve         int               `json:"output_reserve"`
 		SystemPrompt          string            `json:"system_prompt"`
 		Tools                 []json.RawMessage `json:"tools"`
 		Capabilities          []string          `json:"capabilities,omitempty"`
 		Readonly              bool              `json:"readonly"`
 		WriteDir              string            `json:"write_dir"`
+		Compact               json.RawMessage   `json:"compact"`
 	}{
 		ConfigurationRevision: v.ConfigurationRevision,
 		Model:                 modelRaw,
+		ContextWindow:         v.ContextWindow,
+		OutputReserve:         v.OutputReserve,
 		SystemPrompt:          v.SystemPrompt,
 		Tools:                 tools,
 		Capabilities:          v.Capabilities,
 		Readonly:              v.Readonly,
 		WriteDir:              v.WriteDir,
+		Compact:               compactRaw,
 	})
 	if err != nil {
 		return nil, err
@@ -1952,7 +1976,7 @@ func validateOperationAdmission(v OperationAdmission) error {
 // tool names, and preserved tool and capability order. The permission
 // capability members are required, including their false and empty values.
 func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, error) {
-	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "system_prompt", "tools", "capabilities", "readonly", "write_dir"); err != nil {
+	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "context_window", "output_reserve", "system_prompt", "tools", "capabilities", "readonly", "write_dir", "compact"); err != nil {
 		return ExecutionCapture{}, err
 	}
 	revision, err := stringMember(obj, "configuration_revision", true)
@@ -1966,6 +1990,14 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 	ref, err := decodeModelRef(modelObj)
 	if err != nil {
 		return ExecutionCapture{}, fmt.Errorf("member %q: %w", "model", err)
+	}
+	contextWindow, err := int64Member(obj, "context_window", true)
+	if err != nil {
+		return ExecutionCapture{}, err
+	}
+	outputReserve, err := int64Member(obj, "output_reserve", true)
+	if err != nil {
+		return ExecutionCapture{}, err
 	}
 	systemPrompt, err := stringMember(obj, "system_prompt", true)
 	if err != nil {
@@ -1983,7 +2015,24 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 	if err != nil {
 		return ExecutionCapture{}, err
 	}
-	v := ExecutionCapture{ConfigurationRevision: revision, Model: ref, SystemPrompt: systemPrompt, Readonly: readonly, WriteDir: writeDir}
+	compactObj, err := objectMember(obj, "compact", true)
+	if err != nil {
+		return ExecutionCapture{}, err
+	}
+	compact, err := decodeCompactCapture(compactObj)
+	if err != nil {
+		return ExecutionCapture{}, fmt.Errorf("member %q: %w", "compact", err)
+	}
+	v := ExecutionCapture{
+		ConfigurationRevision: revision,
+		Model:                 ref,
+		ContextWindow:         int(contextWindow),
+		OutputReserve:         int(outputReserve),
+		SystemPrompt:          systemPrompt,
+		Readonly:              readonly,
+		WriteDir:              writeDir,
+		Compact:               compact,
+	}
 	for i, raw := range toolsRaw {
 		tool, err := decodeToolDefinition(raw)
 		if err != nil {
@@ -2011,18 +2060,59 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 	return v, nil
 }
 
+// decodeCompactCapture reads the durable compaction configuration's exact
+// keys: the durable two-field model identity, window, reserve, and system
+// prompt. Their values are validated by the enclosing capture validation.
+func decodeCompactCapture(obj map[string]json.RawMessage) (CompactCapture, error) {
+	if err := rejectUnknownMembers(obj, "model", "context_window", "output_reserve", "system_prompt"); err != nil {
+		return CompactCapture{}, err
+	}
+	modelObj, err := objectMember(obj, "model", true)
+	if err != nil {
+		return CompactCapture{}, err
+	}
+	ref, err := decodeModelRef(modelObj)
+	if err != nil {
+		return CompactCapture{}, fmt.Errorf("member %q: %w", "model", err)
+	}
+	contextWindow, err := int64Member(obj, "context_window", true)
+	if err != nil {
+		return CompactCapture{}, err
+	}
+	outputReserve, err := int64Member(obj, "output_reserve", true)
+	if err != nil {
+		return CompactCapture{}, err
+	}
+	systemPrompt, err := stringMember(obj, "system_prompt", true)
+	if err != nil {
+		return CompactCapture{}, err
+	}
+	v := CompactCapture{Model: ref, ContextWindow: int(contextWindow), OutputReserve: int(outputReserve), SystemPrompt: systemPrompt}
+	return v, nil
+}
+
 // validateExecutionCapture enforces the closed capture shape: non-empty
-// stable revision, complete model identity, unique tool names in preserved
-// order through the landed request constructor, and non-empty unique
-// capability IDs in preserved order. Capability names are checked for shape
-// only: no plugin definition is consulted, so a historical capture stays
-// readable when plugins change.
+// stable revision, complete model identity, positive conversation window and
+// output reserve, a complete valid compaction configuration, unique tool
+// names in preserved order through the landed request constructor, and
+// non-empty unique capability IDs in preserved order. Capability names are
+// checked for shape only: no plugin definition is consulted, so a historical
+// capture stays readable when plugins change.
 func validateExecutionCapture(v ExecutionCapture) error {
 	if v.ConfigurationRevision == "" {
 		return errors.New("configuration_revision must be non-empty")
 	}
 	if v.Model.Provider == "" || v.Model.Model == "" {
 		return fmt.Errorf("model %q must be a complete model identity", v.Model.String())
+	}
+	if v.ContextWindow <= 0 {
+		return fmt.Errorf("context_window %d must be positive", v.ContextWindow)
+	}
+	if v.OutputReserve <= 0 {
+		return fmt.Errorf("output_reserve %d must be positive", v.OutputReserve)
+	}
+	if err := validateCompactCapture(v.Compact); err != nil {
+		return fmt.Errorf("compact: %w", err)
 	}
 	if _, err := model.NewRequest(model.Request{Tools: v.Tools}); err != nil {
 		return err
@@ -2036,6 +2126,25 @@ func validateExecutionCapture(v ExecutionCapture) error {
 			return fmt.Errorf("capabilities[%d]: duplicate name %q", i, capability)
 		}
 		seen[capability] = true
+	}
+	return nil
+}
+
+// validateCompactCapture enforces the compaction configuration's closed
+// shape: a complete model identity, positive window and reserve, and a
+// non-empty compact system prompt.
+func validateCompactCapture(v CompactCapture) error {
+	if v.Model.Provider == "" || v.Model.Model == "" {
+		return fmt.Errorf("model %q must be a complete model identity", v.Model.String())
+	}
+	if v.ContextWindow <= 0 {
+		return fmt.Errorf("context_window %d must be positive", v.ContextWindow)
+	}
+	if v.OutputReserve <= 0 {
+		return fmt.Errorf("output_reserve %d must be positive", v.OutputReserve)
+	}
+	if v.SystemPrompt == "" {
+		return errors.New("system_prompt must be non-empty")
 	}
 	return nil
 }

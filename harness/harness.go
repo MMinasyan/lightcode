@@ -84,6 +84,11 @@ type Execution struct {
 	// exactly one physical attempt and returns its accepted stream or that
 	// attempt's failure; retry, assembly and settlement are Harness-owned.
 	Model func(context.Context, model.Request) (model.Stream, error)
+	// CompactModel is the physical model-request callback for the compaction
+	// summarizer, built over the effective compact model's transport from the
+	// same configuration revision the capture records. Each invocation makes
+	// exactly one physical attempt, like Model.
+	CompactModel func(context.Context, model.Request) (model.Stream, error)
 	// Retry classifies one failed physical attempt for the next-attempt
 	// decision. Nil selects the private standard classifier.
 	Retry RetryPolicy
