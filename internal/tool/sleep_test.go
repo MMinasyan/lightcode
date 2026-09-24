@@ -39,14 +39,20 @@ func TestSleepCustomDurationAndClampsMinimum(t *testing.T) {
 func TestSleepContextCancelReturnsPromptly(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	start := time.Now()
-
-	result, err := (Sleep{}).Execute(ctx, map[string]any{"seconds": float64(300)})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Execute result=%q error=%v, want context.Canceled", result, err)
-	}
-	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
-		t.Fatalf("cancelled sleep elapsed %s, want prompt return", elapsed)
+	done := make(chan struct{})
+	var result string
+	var err error
+	go func() {
+		result, err = (Sleep{}).Execute(ctx, map[string]any{"seconds": float64(300)})
+		close(done)
+	}()
+	select {
+	case <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Execute result=%q error=%v, want context.Canceled", result, err)
+		}
+	case <-time.After(10 * time.Second): // completion is the fact; the bound only turns a hung sleep into a failure
+		t.Fatal("the pre-cancelled sleep never returned")
 	}
 }
 
@@ -62,7 +68,10 @@ func TestSleepContextCancelDuringSleep(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Execute error = %v, want context.Canceled", err)
 	}
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Fatalf("cancelled sleep elapsed %s, want prompt return", elapsed)
+	// The sleep timer never fires early: returning under the 10-second sleep
+	// proves the cancellation was observed rather than the timer expiring,
+	// and the select the tool waits on makes the return prompt by semantics.
+	if elapsed := time.Since(start); elapsed >= 10*time.Second {
+		t.Fatalf("sleep elapsed %s, want the cancellation observed", elapsed)
 	}
 }

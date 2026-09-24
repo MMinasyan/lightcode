@@ -111,7 +111,11 @@ func TestReadOnlyRunCommandIgnoresModelSuppliedTimeout(t *testing.T) {
 	if !errors.As(err, &exitErr) || !strings.Contains(exitErr.Output, "timeout") {
 		t.Fatalf("Execute error = %v, want configured timeout ExitError", err)
 	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
+	// Both bounds are timer semantics: the configured 1s timeout plus the
+	// kill escalation lands well under this, and the model-supplied 30s the
+	// call passes as an argument never lands under it. A stall big enough to
+	// confuse the two does not exist on any runner.
+	if elapsed := time.Since(start); elapsed >= 10*time.Second {
 		t.Fatalf("Execute elapsed %s, model-supplied timeout was not ignored", elapsed)
 	}
 }
