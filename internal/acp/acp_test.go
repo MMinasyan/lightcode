@@ -678,10 +678,24 @@ func TestACPShutdownJoinsAdmittedDispatchResponse(t *testing.T) {
 		close(teardownDone)
 	}()
 
+	closedDeadline := time.Now().Add(5 * time.Second)
+	closed := false
+	for !closed { // the teardown provably closed dispatch; its Wait is structurally parked on the test-held token
+		r.dispatchMu.Lock()
+		closed = r.dispatchClosed
+		r.dispatchMu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(closedDeadline) {
+			t.Fatal("the teardown never closed dispatch")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	select {
 	case <-teardownDone:
 		t.Fatal("shutdown joined before the admitted dispatch finished")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 
 	r.processLine(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`))
@@ -719,10 +733,24 @@ func TestACPShutdownJoinsAdmittedDispatchParseError(t *testing.T) {
 		close(teardownDone)
 	}()
 
+	closedDeadline := time.Now().Add(5 * time.Second)
+	closed := false
+	for !closed { // the teardown provably closed dispatch; its Wait is structurally parked on the test-held token
+		r.dispatchMu.Lock()
+		closed = r.dispatchClosed
+		r.dispatchMu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(closedDeadline) {
+			t.Fatal("the teardown never closed dispatch")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	select {
 	case <-teardownDone:
 		t.Fatal("shutdown joined before the admitted parse-error finished")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 
 	r.processLine(context.Background(), []byte(`{not json`))
