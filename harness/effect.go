@@ -51,12 +51,15 @@ type modelEffectIntent struct {
 // fixed continuation signal when the disposition continues, the terminal
 // classification when the effect settles the Operation, and the terminal
 // no-output model usage when a reported usage has no assistant entry to ride.
+// The usage model is the intent's expected identity while an intent is live;
+// without one the result declares its own usage model.
 type modelResult struct {
-	assistant *assistantEntry // nil when no eligible assistant payload exists
-	signal    SignalKind      // empty unless the disposition continues
-	terminal  OperationState  // empty for ready/continue; failure or interruption otherwise
-	detail    string          // terminal detail; empty for ready/continue
-	usage     *UsageCount     // terminal no-output usage; nil when the assistant entry carries it or none was reported
+	assistant  *assistantEntry // nil when no eligible assistant payload exists
+	signal     SignalKind      // empty unless the disposition continues
+	terminal   OperationState  // empty for ready/continue; failure or interruption otherwise
+	detail     string          // terminal detail; empty for ready/continue
+	usage      *UsageCount     // terminal no-output usage; nil when the assistant entry carries it or none was reported
+	usageModel model.ModelRef  // the terminal no-output usage model when no intent is live; zero otherwise
 }
 
 // modelEffect encloses one complete invocation of the prepared model function
@@ -97,7 +100,7 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 		// between the committed intent and the callback settles the Operation
 		// as terminal interruption without ever starting the callback.
 		if ctx.Err() != nil {
-			return h.interruptModelEffect(c, operationID, intent)
+			return h.interruptModelEffect(c, operationID, intent, nil)
 		}
 		// Result and terminal transactions run without cancellation so an
 		// already-produced result or required terminal settlement publishes.
@@ -118,7 +121,7 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 		var output model.Output
 		for failed := 1; ; failed++ {
 			if err := ctx.Err(); err != nil { // observed cancellation before an attempt interrupts; no output and no assembly call
-				return h.interruptModelEffect(c, operationID, intent)
+				return h.interruptModelEffect(c, operationID, intent, nil)
 			}
 			stream, attemptErr := attempt(ctx, req)
 			if attemptErr == nil && stream != nil {
@@ -140,7 +143,7 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 			// answer, pre-acceptance cancellation is an interruption with no
 			// output and no assembly call.
 			if ctx.Err() != nil {
-				return h.interruptModelEffect(c, operationID, intent)
+				return h.interruptModelEffect(c, operationID, intent, nil)
 			}
 			delay, again := retry(attemptErr, failed)
 			if !again || delay < 0 {
@@ -156,7 +159,7 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done(): // cancellation during backoff interrupts; no attempt starts
-				return h.interruptModelEffect(c, operationID, intent)
+				return h.interruptModelEffect(c, operationID, intent, nil)
 			}
 		}
 		set := derivedSettlement(output)
@@ -213,13 +216,14 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 // interruptModelEffect settles one committed model effect intent as the fixed
 // terminal interruption after observed execution cancellation before stream
 // acceptance: no output, no assembly call, and the committed settlement
-// returned with a nil error.
-func (h *Harness) interruptModelEffect(c *coordinator, operationID string, intent modelEffectIntent) (agent.ModelSettlement, error) {
+// returned with a nil error. The given usage rides the settlement entry.
+func (h *Harness) interruptModelEffect(c *coordinator, operationID string, intent modelEffectIntent, usage *UsageCount) (agent.ModelSettlement, error) {
 	settleCtx := context.WithoutCancel(h.ctx)
 	committed := agent.ModelSettlement{Disposition: agent.DispoInterruption, Detail: executionInterruptedDetail}
 	if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{
 		terminal: OperationInterruption,
 		detail:   executionInterruptedDetail,
+		usage:    usage,
 	}); err != nil {
 		return agent.ModelSettlement{}, err
 	}
@@ -451,7 +455,9 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 		// A terminal result runs the common terminal helper on this
 		// transaction's own decoded records.
 		if res.terminal != "" {
-			var usageModel model.ModelRef
+			// The usage model is the live intent's expected identity; a
+			// quiet direct settlement declares its own.
+			usageModel := res.usageModel
 			if intent != nil {
 				usageModel = intent.expected
 			}
