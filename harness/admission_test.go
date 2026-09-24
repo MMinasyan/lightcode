@@ -1485,7 +1485,7 @@ func TestAdmittedOperationCarriesRegisterRevision(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
 
-	rec, disposition := mustAdmit(t, h, testSessionID, testOpID, admissionContent("hello"))
+	rec, disposition := mustAdmitWithoutExecution(t, h, testSessionID, testOpID, admissionContent("hello"))
 	if disposition != DispositionAdmitted {
 		t.Fatalf("disposition = %q, want admitted", disposition)
 	}
