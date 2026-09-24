@@ -530,10 +530,31 @@ func TestCloseJoinsInFlightDetection(t *testing.T) {
 	// an abandoning Close returns early and is caught by it.
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- inst.Close() }()
+	wt, ok := symbol.(workspaceSymbolTool)
+	if !ok {
+		t.Fatalf("workspace_symbol tool = %T, want *workspaceSymbolTool", symbol)
+	}
+	joinDeadline := time.Now().Add(5 * time.Second)
+	var joined int32
+	for {
+		wt.inst.mu.Lock()
+		joined = 0
+		for _, entry := range wt.inst.workspaces {
+			joined += entry.closeJoins.Load()
+		}
+		wt.inst.mu.Unlock()
+		if joined >= 1 { // Close is provably parked on the detection's join; the parked handler holds it open
+			break
+		}
+		if time.Now().After(joinDeadline) {
+			t.Fatal("Close never joined the in-flight detection")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	select {
 	case err := <-closeDone:
 		t.Fatalf("Close returned while the in-flight detection was still parked: %v", err)
-	case <-time.After(200 * time.Millisecond):
+	default:
 	}
 
 	// Release the park: the detection completes and the joined Close returns.

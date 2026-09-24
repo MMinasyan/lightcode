@@ -7,6 +7,8 @@
 package lsp
 
 import (
+	"sync/atomic"
+
 	"bytes"
 	"context"
 	"encoding/json"
@@ -73,6 +75,11 @@ var newManager = lsp.NewManager
 type workspaceEntry struct {
 	manager *lsp.Manager
 	done    chan struct{}
+
+	// closeJoins counts how far Close walked its entry joins. Nothing in
+	// production reads it; with the detection provably parked, the count is
+	// the observation point proving Close reached and blocks on the join.
+	closeJoins atomic.Int32
 }
 
 // instance is one Open's constructed state: the runtime lifetime context,
@@ -158,6 +165,7 @@ func (in *instance) close() error {
 		entry.manager.CloseAdmission()
 	}
 	for _, entry := range entries {
+		entry.closeJoins.Add(1)
 		<-entry.done
 	}
 	for _, entry := range entries {
