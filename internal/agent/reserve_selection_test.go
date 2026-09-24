@@ -160,9 +160,8 @@ func TestReserveSelectionSourceBlocksOwnerProgressUntilRelease(t *testing.T) {
 
 	// Neither the queue drain nor the signal scheduler can claim the source
 	// while it is reserved, even when nudged.
-	a.ensureRuntime().tryDrainQueue(ctx)
+	a.ensureRuntime().tryDrainQueue(ctx) // the refusals are synchronous: any start the nudges could trigger is in the capture by their return
 	a.ensureRuntime().tryStartSignalTurn(ctx)
-	time.Sleep(50 * time.Millisecond)
 	if got := countTurnStartsForSession(cap.snapshot(), id); got != 0 {
 		t.Fatalf("reserved source started %d turns under manual nudges", got)
 	}

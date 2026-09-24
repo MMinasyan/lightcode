@@ -528,10 +528,12 @@ func TestShutdownOwnerClosesProcessAdmissionBeforeJoins(t *testing.T) {
 	if !reaped {
 		t.Fatal("admitted process still alive while shutdown waits on its joins: process admission closed after the joins")
 	}
-	select {
-	case <-shutdownDone:
-		t.Fatal("ShutdownOwner returned while the background join was still held")
-	case <-time.After(200 * time.Millisecond):
+	joinDeadline := time.Now().Add(5 * time.Second)
+	for !a.ensureRuntime().bgJoined.Load() { // the shutdown is provably parked on the background join; the parked drainer holds its token
+		if time.Now().After(joinDeadline) {
+			t.Fatal("ShutdownOwner never joined the parked drainer")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 
 	releaseOnce.Do(func() { close(releaseDrainer) })

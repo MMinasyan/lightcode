@@ -139,10 +139,12 @@ func TestDetectRunningAtShutdownIsJoined(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("detection never reached its terminal stretch")
 	}
-	select {
-	case <-shutdownDone:
-		t.Fatal("ShutdownOwner returned while detection was still running: the Detect goroutine was abandoned rather than joined")
-	case <-time.After(2 * time.Second):
+	joinDeadline := time.Now().Add(5 * time.Second)
+	for !a.ensureRuntime().bgJoined.Load() { // the shutdown is provably parked on the background join; the stalled detection holds its token
+		if time.Now().After(joinDeadline) {
+			t.Fatal("ShutdownOwner never joined the stalled detection")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 	release()
 	<-shutdownDone

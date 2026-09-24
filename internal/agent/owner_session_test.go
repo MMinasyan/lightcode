@@ -1616,8 +1616,7 @@ func TestWakeDeferredByQueue(t *testing.T) {
 	unit.lp.AddPendingSignal(loop.PendingSignal{Wake: true, Persist: true, Payload: "wake after queue"})
 	a.ensureRuntime().mu.Unlock()
 
-	a.ensureRuntime().tryStartSignalTurn(ctx)
-	time.Sleep(50 * time.Millisecond)
+	a.ensureRuntime().tryStartSignalTurn(ctx) // the refusal is synchronous: any start the nudge could trigger is in the capture by its return
 	if got := countTurnStartsForSession(cap.snapshot(), sessionID); got != 0 {
 		t.Fatalf("signal scheduler started %d turns while queue was pending", got)
 	}
@@ -1701,11 +1700,11 @@ func TestTaggedEventDedupByParent(t *testing.T) {
 		second.seenSessions = nil
 	}
 	a.ensureRuntime().mu.Unlock()
-	a.dispatchTaggedEvent(tev)
+	a.dispatchTaggedEvent(tev) // the dispatch and its dedup decision are synchronous
 	select {
 	case ev := <-starts:
 		t.Fatalf("duplicate subagent_start after backend-current dedup reset: %+v", ev)
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
 
 	noParent := tev
@@ -1715,7 +1714,7 @@ func TestTaggedEventDedupByParent(t *testing.T) {
 	select {
 	case ev := <-starts:
 		t.Fatalf("subagent_start emitted without parent session id: %+v", ev)
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
 }
 

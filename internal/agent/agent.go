@@ -2358,6 +2358,7 @@ func (a *Agent) CompactNowForSession(ctx context.Context, sessionID string) erro
 	}
 	unit.busy = true
 	rt.turnWG.Add(1)
+	rt.turnAdds.Add(1)
 	compactCtx, cancel := context.WithCancel(rt.workCtx())
 	unit.turnCancel = cancel
 	unit.turnCtx = compactCtx
@@ -2372,6 +2373,7 @@ func (a *Agent) CompactNowForSession(ctx context.Context, sessionID string) erro
 		cancel()
 		rt.nudgeQueueDrainer()
 		rt.nudgeSignalScheduler()
+		rt.turnAdds.Add(-1)
 		rt.turnWG.Done()
 	}()
 
@@ -3015,6 +3017,7 @@ func (rt *runtime) claimTurnLocked(ctx context.Context, unit *session) (context.
 	// join can never miss a turn between claim and launch. launchTurn's goroutine
 	// calls Done.
 	rt.turnWG.Add(1)
+	rt.turnAdds.Add(1)
 	turnCtx, cancel := context.WithCancel(rt.workCtx())
 	unit.turnCancel = cancel
 	unit.turnCtx = turnCtx
@@ -3191,6 +3194,7 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 		unit.busy = true
 		unit.seenSessions = nil
 		rt.turnWG.Add(1)
+		rt.turnAdds.Add(1)
 		turnCtx, cancel := context.WithCancel(ctx)
 		unit.turnCancel = cancel
 		unit.turnCtx = turnCtx
@@ -3268,6 +3272,7 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 				if launched == 0 {
 					cancel()
 				}
+				rt.turnAdds.Add(-1)
 				rt.turnWG.Done()
 			}()
 			// Preseed every item but the last as a user-only turn, unlocked:
@@ -3339,6 +3344,7 @@ func (rt *runtime) tryDrainQueue(ctx context.Context) {
 			// startClaimedTurnLocked — or the launched turn's goroutine — is
 			// its only releaser.
 			rt.turnWG.Add(1)
+			rt.turnAdds.Add(1)
 			launched, launchErr = rt.startClaimedTurnLocked(unit, turnCtx, cancel, []string{contents[len(contents)-1]}, nil)
 			rt.mu.Unlock()
 			if launchErr != nil {
@@ -3441,6 +3447,7 @@ func (rt *runtime) startClaimedTurnLocked(unit *session, turnCtx context.Context
 		if cancel != nil {
 			cancel()
 		}
+		rt.turnAdds.Add(-1)
 		rt.turnWG.Done()
 		return 0, err
 	}
@@ -3539,6 +3546,7 @@ func (rt *runtime) launchCommittedTurn(unit *session, turnCtx context.Context, c
 			// pending, matching the queue drainer's unconditional nudge.
 			rt.nudgeQueueDrainer()
 			rt.nudgeSignalScheduler()
+			rt.turnAdds.Add(-1)
 			rt.turnWG.Done()
 		}()
 
@@ -4366,6 +4374,7 @@ func (a *Agent) ShutdownOwner() bool {
 		// the kill/reap and turn joins, so in-flight turn teardown never waits
 		// on it.
 		a.fireShutdownBarrierHook()
+		rt.closePublishing.Store(true)
 		releaseLifecycle := a.lockLifecycle()
 		rt.mu.Lock()
 		rt.closed = true
@@ -4434,6 +4443,7 @@ func (a *Agent) ShutdownOwner() bool {
 		if rt.ownerCancel != nil {
 			rt.ownerCancel()
 		}
+		rt.bgJoined.Store(true)
 		bgDrained := waitGroupOrTimeout(&rt.bgWG, shutdownJoinTimeout)
 		if !bgDrained {
 			fmt.Fprintf(os.Stderr, "lightcode: owner shutdown abandoned background workers after %s\n", shutdownJoinTimeout)

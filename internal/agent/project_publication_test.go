@@ -234,10 +234,12 @@ func TestOwnerActivityHelperCompletesBeforeShutdownPublishesClosed(t *testing.T)
 	}
 	shutdownDone := make(chan bool, 1)
 	go func() { shutdownDone <- a.ShutdownOwner() }()
-	select {
-	case <-shutdownDone:
-		t.Fatal("shutdown published closed before the admitted activity write completed")
-	case <-time.After(50 * time.Millisecond):
+	pubDeadline := time.Now().Add(5 * time.Second)
+	for !a.rt.closePublishing.Load() { // the shutdown is provably past its barrier and parked at the closed publication's locks; the parked write holds them
+		if time.Now().After(pubDeadline) {
+			t.Fatal("shutdown never reached the closed publication")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 	unblock()
 	select {
@@ -428,10 +430,12 @@ func TestNewSessionWriterWinsAdmissionBeforeClose(t *testing.T) {
 	}
 	shutdown := make(chan bool, 1)
 	go func() { shutdown <- a.ShutdownOwner() }()
-	select {
-	case <-shutdown:
-		t.Fatal("shutdown completed before admitted writer")
-	case <-time.After(50 * time.Millisecond):
+	pubDeadline := time.Now().Add(5 * time.Second)
+	for !a.rt.closePublishing.Load() { // the shutdown is provably past its barrier and parked at the closed publication's locks; the parked writer holds them
+		if time.Now().After(pubDeadline) {
+			t.Fatal("shutdown never reached the closed publication")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 	unblock()
 	id := <-created

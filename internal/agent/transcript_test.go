@@ -3222,11 +3222,12 @@ func TestPreseedRefusedFinalLaunchReleasesExactAdds(t *testing.T) {
 		rt.turnWG.Wait()
 		close(wgDone)
 	}()
-	select {
-	case <-wgDone:
-		t.Fatal("preseed Add was released before the closure defer ran")
-	case <-time.After(200 * time.Millisecond):
-		// Expected: the preseed Add is still owned.
+	addDeadline := time.Now().Add(5 * time.Second)
+	for rt.turnAdds.Load() != 1 { // the preseed Add is provably outstanding: the wait cannot complete, and an early release drops the count where the poll catches it
+		if time.Now().After(addDeadline) {
+			t.Fatalf("the outstanding turn additions = %d, want the held preseed Add", rt.turnAdds.Load())
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 
 	release()

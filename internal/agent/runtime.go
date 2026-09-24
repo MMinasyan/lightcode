@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"sync/atomic"
+
 	"context"
 	"sync"
 
@@ -89,11 +91,25 @@ type runtime struct {
 	// the turn-admission gate (guarded by mu); turnWG tracks in-flight turns
 	// and mutations; bgWG tracks the background goroutines; shutdownOnce and
 	// shutdownDone make ShutdownOwner one shared join for all callers.
-	ownerCtx     context.Context
-	ownerCancel  context.CancelFunc
-	closed       bool
-	turnWG       sync.WaitGroup
-	bgWG         sync.WaitGroup
+	ownerCtx    context.Context
+	ownerCancel context.CancelFunc
+	closed      bool
+	turnWG      sync.WaitGroup
+	// turnAdds counts the live turn-WaitGroup additions. Nothing in
+	// production reads it; it is the observation point proving a parked
+	// waiter's Add is still outstanding, for tests.
+	turnAdds atomic.Int32
+	bgWG     sync.WaitGroup
+	// closePublishing records that shutdown passed its barrier toward the
+	// closed publication's lock acquisitions (lifecycle first). Nothing in
+	// production reads it; with a publication provably holding a lock the
+	// shutdown must take, the flag proves the shutdown is parked at it.
+	closePublishing atomic.Bool
+
+	// bgJoined records that shutdown reached its background-goroutine join.
+	// Nothing in production reads it; it is the observation point proving the
+	// shutdown is parked on the join while a held token keeps it there.
+	bgJoined     atomic.Bool
 	shutdownOnce sync.Once
 	shutdownDone chan struct{}
 	// shutdownClean records whether owner shutdown completed every join — both

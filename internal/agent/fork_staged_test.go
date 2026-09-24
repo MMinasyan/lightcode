@@ -701,7 +701,7 @@ func TestForkPostRenameCleanupFailureReportsStderr(t *testing.T) {
 	if _, err := a.SubmitToSession(ctx, sourceID, "during post-rename"); err == nil {
 		t.Fatal("submit admitted while the fork was parked after the rename")
 	}
-	time.Sleep(50 * time.Millisecond)
+	// The refusal is synchronous: no drain or signal ran, so no turn_start can exist in the capture
 	for _, ev := range cap.snapshot() {
 		if ev.Kind == EventTurnStart {
 			t.Fatalf("a turn_start was delivered while the fork was parked after the rename: %#v", ev)
