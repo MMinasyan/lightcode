@@ -463,18 +463,26 @@ func (v *graphValidation) validateEntryReferences() error {
 
 // validateOperation verifies one Operation's admission reference, tool-call
 // exactly-once accounting, terminal/settlement agreement, and usage totals.
+// The request kind selects the admitted-input rule: a message Operation
+// requires its self-owned input entry, a compact Operation requires none.
 func (v *graphValidation) validateOperation(op *OperationRecord) error {
 	opID := op.Admission.OperationID
 
-	admitted, ok := v.entryByID[op.Admission.AdmittedEntry.EntryID]
-	if op.Admission.AdmittedEntry.SessionID != v.sessionID || !ok {
-		return v.corrupt("operation %q admits missing input entry %q", opID, op.Admission.AdmittedEntry.EntryID)
-	}
-	if admitted.Envelope.Kind != EntryInput {
-		return v.corrupt("operation %q admits entry %q of kind %s, not input", opID, admitted.Envelope.ID, admitted.Envelope.Kind)
-	}
-	if admitted.Envelope.OperationID != opID {
-		return v.corrupt("operation %q admits entry %s owned by operation %q, not itself", opID, admitted.Envelope.ID, admitted.Envelope.OperationID)
+	if op.Admission.RequestKind == RequestKindCompact {
+		if op.Admission.AdmittedEntry != (EntryRef{}) {
+			return v.corrupt("compact operation %q carries an admitted input entry %q", opID, op.Admission.AdmittedEntry.EntryID)
+		}
+	} else {
+		admitted, ok := v.entryByID[op.Admission.AdmittedEntry.EntryID]
+		if op.Admission.AdmittedEntry.SessionID != v.sessionID || !ok {
+			return v.corrupt("operation %q admits missing input entry %q", opID, op.Admission.AdmittedEntry.EntryID)
+		}
+		if admitted.Envelope.Kind != EntryInput {
+			return v.corrupt("operation %q admits entry %q of kind %s, not input", opID, admitted.Envelope.ID, admitted.Envelope.Kind)
+		}
+		if admitted.Envelope.OperationID != opID {
+			return v.corrupt("operation %q admits entry %s owned by operation %q, not itself", opID, admitted.Envelope.ID, admitted.Envelope.OperationID)
+		}
 	}
 
 	published, err := v.collectPublishedCalls(opID)

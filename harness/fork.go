@@ -89,7 +89,7 @@ func (h *Harness) Fork(ctx context.Context, req ForkRequest) (ForkResult, error)
 	prepared, capture, prepCtx, cleanup, err := h.prepareExecution(ctx, PreparationSession{
 		Identity:  SessionIdentity{SessionID: destID, Workspace: view.Identity.Workspace},
 		AgentType: view.State.CurrentAgentType,
-	})
+	}, RequestKindMessage)
 	if err != nil {
 		return ForkResult{}, err
 	}
@@ -292,6 +292,7 @@ func (h *Harness) forkTransaction(tx Transaction, destID string, view SessionRec
 	record, committed, entry, perr := produceAdmission(tx, dest, capture, admissionRequest{
 		SessionID:   destID,
 		OperationID: req.OperationID,
+		Kind:        RequestKindMessage,
 		Origin:      InputOriginUser,
 		Content:     content,
 	})

@@ -22,6 +22,7 @@ type RequestKind string
 
 const (
 	RequestKindMessage RequestKind = "message"
+	RequestKindCompact RequestKind = "compact"
 )
 
 // InputOrigin is the closed origin of one admitted input entry.

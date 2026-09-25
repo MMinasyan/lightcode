@@ -1736,14 +1736,19 @@ func encodeOperationRegister(rec OperationRecord) (json.RawMessage, error) {
 }
 
 // encodeOperationAdmission validates and renders the immutable admission
-// section.
+// section. The message kind renders its admitted entry; the compact kind
+// admits no input entry and omits the member.
 func encodeOperationAdmission(v OperationAdmission) (json.RawMessage, error) {
 	if err := validateOperationAdmission(v); err != nil {
 		return nil, invalidInput("operation admission: %v", err)
 	}
-	admittedEntry, err := encodeEntryRef(v.AdmittedEntry)
-	if err != nil {
-		return nil, err
+	var admittedEntry json.RawMessage
+	if v.RequestKind == RequestKindMessage {
+		rendered, err := encodeEntryRef(v.AdmittedEntry)
+		if err != nil {
+			return nil, err
+		}
+		admittedEntry = rendered
 	}
 	execution, err := encodeExecutionCapture(v.Execution)
 	if err != nil {
@@ -1757,7 +1762,7 @@ func encodeOperationAdmission(v OperationAdmission) (json.RawMessage, error) {
 		SessionID     string          `json:"session_id"`
 		OperationID   string          `json:"operation_id"`
 		RequestKind   string          `json:"request_kind"`
-		AdmittedEntry json.RawMessage `json:"admitted_entry"`
+		AdmittedEntry json.RawMessage `json:"admitted_entry,omitempty"`
 		AgentType     string          `json:"agent_type"`
 		Execution     json.RawMessage `json:"execution"`
 		AdmittedAt    string          `json:"admitted_at"`
@@ -1901,13 +1906,23 @@ func decodeOperationAdmission(obj map[string]json.RawMessage) (OperationAdmissio
 	if err != nil {
 		return OperationAdmission{}, err
 	}
-	admittedObj, err := objectMember(obj, "admitted_entry", true)
-	if err != nil {
-		return OperationAdmission{}, err
-	}
-	admittedEntry, err := decodeEntryRef(admittedObj)
-	if err != nil {
-		return OperationAdmission{}, fmt.Errorf("member %q: %w", "admitted_entry", err)
+	// The message kind requires its present, validated admitted entry; the
+	// compact kind admits no input entry and requires the member absent.
+	var admittedEntry EntryRef
+	switch RequestKind(requestKind) {
+	case RequestKindMessage:
+		admittedObj, err := objectMember(obj, "admitted_entry", true)
+		if err != nil {
+			return OperationAdmission{}, err
+		}
+		admittedEntry, err = decodeEntryRef(admittedObj)
+		if err != nil {
+			return OperationAdmission{}, fmt.Errorf("member %q: %w", "admitted_entry", err)
+		}
+	case RequestKindCompact:
+		if _, present := obj["admitted_entry"]; present {
+			return OperationAdmission{}, fmt.Errorf("member %q must be absent for request kind %q", "admitted_entry", requestKind)
+		}
 	}
 	agentType, err := stringMember(obj, "agent_type", true)
 	if err != nil {
@@ -1945,8 +1960,8 @@ func decodeOperationAdmission(obj map[string]json.RawMessage) (OperationAdmissio
 }
 
 // validateOperationAdmission enforces the closed admission shape: durable
-// identities, the single message request kind, non-empty Agent type, and a
-// complete valid capture.
+// identities, the message or compact request kind, the kind's admitted-entry
+// rule, non-empty Agent type, and a complete valid capture.
 func validateOperationAdmission(v OperationAdmission) error {
 	if err := validateHexID(v.SessionID, "session id"); err != nil {
 		return err
@@ -1954,14 +1969,20 @@ func validateOperationAdmission(v OperationAdmission) error {
 	if err := validateOperationIdentity(v.OperationID, "operation id"); err != nil {
 		return err
 	}
-	if v.RequestKind != RequestKindMessage {
-		return fmt.Errorf("request kind %q is not %q", v.RequestKind, RequestKindMessage)
-	}
-	if err := validateHexID(v.AdmittedEntry.SessionID, "admitted entry session id"); err != nil {
-		return err
-	}
-	if err := validateHexID(v.AdmittedEntry.EntryID, "admitted entry id"); err != nil {
-		return err
+	switch v.RequestKind {
+	case RequestKindMessage:
+		if err := validateHexID(v.AdmittedEntry.SessionID, "admitted entry session id"); err != nil {
+			return err
+		}
+		if err := validateHexID(v.AdmittedEntry.EntryID, "admitted entry id"); err != nil {
+			return err
+		}
+	case RequestKindCompact:
+		if v.AdmittedEntry != (EntryRef{}) {
+			return errors.New("compact operation admission carries an admitted entry")
+		}
+	default:
+		return fmt.Errorf("request kind %q is not one of %q or %q", v.RequestKind, RequestKindMessage, RequestKindCompact)
 	}
 	if v.AgentType == "" {
 		return errors.New("agent_type must be non-empty")

@@ -1767,6 +1767,30 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 	if exec.Close != nil {
 		defer func() { h.recordCleanupFailure(exec.Close()) }()
 	}
+	// A compact Operation wires no conversation Agent invocation: it projects
+	// the pure conversation snapshot — the projected messages minus the
+	// leading system message, with no compact input to exclude — runs the
+	// orchestration over it, and commits the manual compaction whose one
+	// transaction also settles the Operation's success. Every orchestration
+	// failure or interruption has already settled the terminal durably with
+	// the accumulated usage (a piece failure inside its own effect, any other
+	// failure through the direct terminal settlement), and only an actually
+	// empty conversation fails with the retained detail.
+	if admission.RequestKind == RequestKindCompact {
+		messages, err := h.projectContext(c, operationID)
+		if err != nil {
+			return err
+		}
+		snapshot := messages
+		if len(snapshot) > 0 && snapshot[0].Role == model.RoleSystem {
+			snapshot = snapshot[1:]
+		}
+		summary, usage, err := h.runCompaction(execCtx, c, operationID, exec, agentCapture, snapshot)
+		if err != nil {
+			return err
+		}
+		return h.commitCompaction(c, operationID, agentCapture, summary, usage, true)
+	}
 	res, err := agent.Run(execCtx, agent.Invocation{
 		ExpectedModel: agentCapture.Model,
 		Tools:         agentCapture.Tools,
