@@ -239,7 +239,7 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 	if jobA == "" {
 		t.Fatalf("A immediate result = %q carries no job identity", immediate)
 	}
-	th.submit(sessionA, "op-a2", "limit a")
+	th.submitAllowBuffered(sessionA, "op-a2", "limit a")
 	th.awaitSettled(sessionA, "op-a2")
 	resultsA = th.readToolResults(sessionA)
 	wantLimit := "run_command: background start: process: background process limit reached (1/1). Kill existing processes or wait for them to exit"
@@ -256,7 +256,7 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 	if jobB == "" || jobB == jobA {
 		t.Fatalf("B immediate result = %q carries no distinct job identity", immediateB)
 	}
-	th.submit(sessionB, "op-b2", "list b")
+	th.submitAllowBuffered(sessionB, "op-b2", "list b")
 	th.awaitSettled(sessionB, "op-b2")
 	resultsB = th.readToolResults(sessionB)
 	listB := resultsB["call-b-list"].Content
@@ -281,7 +281,7 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 	if listAfter := resultsB["call-b-list-again"].Content; !strings.Contains(listAfter, jobB) || !strings.Contains(listAfter, "(running for") {
 		t.Fatalf("B list after A's stop = %q, want B's job %s still running", listAfter, jobB)
 	}
-	th.submit(sessionB, "op-b4", "read b")
+	th.submitAllowBuffered(sessionB, "op-b4", "read b")
 	rec := th.awaitSettled(sessionB, "op-b4")
 	if rec.State.Status != harness.OperationSuccess {
 		t.Fatalf("op-b4 settled %q: %+v", rec.State.Status, rec.State)
@@ -295,7 +295,7 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 	}
 
 	// A's killed job left no records behind.
-	th.submit(sessionA, "op-a3", "list a")
+	th.submitAllowBuffered(sessionA, "op-a3", "list a")
 	th.awaitSettled(sessionA, "op-a3")
 	resultsA = th.readToolResults(sessionA)
 	if got := resultsA["call-a-list"].Content; got != "No background processes." {

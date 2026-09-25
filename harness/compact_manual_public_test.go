@@ -201,10 +201,7 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 		idleHistory(t, f, session)
 		conversationCalls := len(conversation.seen())
 
-		res, err := f.h.Compact(context.Background(), harness.CompactRequest{SessionID: session, OperationID: "c-1"})
-		if err != nil {
-			t.Fatalf("Compact: %v", err)
-		}
+		res := compactWhenIdle(t, f.h, session, "c-1")
 		if res.Admission.RequestKind != harness.RequestKindCompact || res.Admission.AdmittedEntry != (harness.EntryRef{}) {
 			t.Fatalf("admission = %+v, want the compact kind with no admitted entry", res.Admission)
 		}
@@ -380,9 +377,7 @@ func TestPublicManualCompactSnapshotShape(t *testing.T) {
 		session := createSession(t, f.h)
 		idleHistory(t, f, session)
 
-		if _, err := f.h.Compact(context.Background(), harness.CompactRequest{SessionID: session, OperationID: "c-1"}); err != nil {
-			t.Fatalf("first Compact: %v", err)
-		}
+		compactWhenIdle(t, f.h, session, "c-1")
 		awaitTerminal(t, f.h, session, "c-1")
 
 		// A summary-only Session: the second compaction's input is the
@@ -493,7 +488,22 @@ func TestPublicManualCompactSubmitAfterAdmissionStaysBuffered(t *testing.T) {
 		compact.gate = gate
 		compactErr := make(chan error, 1)
 		go func() {
-			_, err := f.h.Compact(context.Background(), harness.CompactRequest{SessionID: session, OperationID: "c-1"})
+			// The guarded retry: a pre-reservation idle-guard rejection
+			// creates nothing, so retrying it is clean, and the result sent
+			// on the channel is always the admission's real outcome — a
+			// transient rejection never goes unread.
+			deadline := time.Now().Add(10 * time.Second)
+			var err error
+			for {
+				_, err = f.h.Compact(context.Background(), harness.CompactRequest{SessionID: session, OperationID: "c-1"})
+				if err == nil || !strings.Contains(err.Error(), "is not idle; admission requires an idle Session") {
+					break
+				}
+				if time.Now().After(deadline) {
+					break // the last idle-guard rejection is the reported outcome
+				}
+				time.Sleep(time.Millisecond)
+			}
 			compactErr <- err
 		}()
 		<-compact.arrived // the request arrived: the snapshot is already frozen

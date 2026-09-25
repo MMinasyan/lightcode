@@ -539,6 +539,52 @@ func (th *toolsHarness) submit(sessionID, operationID, text string) {
 	}
 }
 
+// submitAllowBuffered submits one message tolerating the buffered
+// dispositions: the retiring-run window of a just-settled Operation routes
+// the admission to the steering or queued buffer, and the post-terminal
+// drain delivers it, so the caller's immediately following awaitSettled
+// converges both paths. Only a Submit error — or a disposition outside the
+// admitted-and-buffered set — is fatal. A buffered disposition creates the
+// operation's register asynchronously — the retiring run's drain admits the
+// item after the submit returns — so the helper converges before returning:
+// it polls the register treating not-found as not-yet-converged within the
+// same bounded deadline awaitSettled uses, so the immediately-following
+// awaitSettled never first-polls the legal transient. An admitted
+// disposition creates the register synchronously and needs no polling; a
+// drain drop has no other admission to race and surfaces through the
+// deadline expiry.
+func (th *toolsHarness) submitAllowBuffered(sessionID, operationID, text string) {
+	th.t.Helper()
+	res, err := th.h.Submit(context.Background(), harness.SubmitRequest{
+		SessionID: sessionID, OperationID: operationID, Origin: harness.InputOriginUser,
+		Content: []model.ContentPart{{Kind: model.PartText, Text: text}}, Mode: harness.MessageModeRegular,
+	})
+	if err != nil {
+		th.t.Fatalf("Submit(%s): %v", operationID, err)
+	}
+	switch res.Disposition {
+	case harness.DispositionAdmitted:
+		return
+	case harness.DispositionSteering, harness.DispositionQueued:
+	default:
+		th.t.Fatalf("Submit(%s) = %+v, want an admitted or buffered disposition", operationID, res)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		_, err := th.h.ReadOperation(context.Background(), sessionID, operationID)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, harness.ErrNotFound) {
+			th.t.Fatalf("ReadOperation(%s): %v", operationID, err)
+		}
+		if time.Now().After(deadline) {
+			th.t.Fatalf("operation %q stayed unadmitted within the wait bound", operationID)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // awaitSettled waits for the operation's terminal settlement and returns it.
 func (th *toolsHarness) awaitSettled(sessionID, operationID string) harness.OperationRecord {
 	th.t.Helper()
