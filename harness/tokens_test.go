@@ -130,11 +130,23 @@ func TestEstimateTokensSystemPromptPlainText(t *testing.T) {
 // TestEstimateTokensCharsFallbackThroughSeam forces the encoder acquisition to
 // fail through the in-package seam and pins the characters/3 fallback: the
 // same accumulated text (system prompt, message texts, tool call names and
-// arguments) divided by three.
+// arguments) divided by three. The cached encoder is reset under the getter's
+// mutex before the override so the override is consulted, and the cleanup
+// restores both the seam and the cache, so the forced failure poisons no
+// other test.
 func TestEstimateTokensCharsFallbackThroughSeam(t *testing.T) {
-	original := encodingFor
-	encodingFor = func(string) (*tiktoken.Tiktoken, error) { return nil, errors.New("unavailable") }
-	t.Cleanup(func() { encodingFor = original })
+	original := loadEncoding
+	cachedEncoderMu.Lock()
+	originalEncoder := cachedEncoder
+	cachedEncoder = nil
+	cachedEncoderMu.Unlock()
+	loadEncoding = func() (*tiktoken.Tiktoken, error) { return nil, errors.New("unavailable") }
+	t.Cleanup(func() {
+		loadEncoding = original
+		cachedEncoderMu.Lock()
+		cachedEncoder = originalEncoder
+		cachedEncoderMu.Unlock()
+	})
 
 	prompt := "abcdef" // 6 chars
 	messages := []model.Message{

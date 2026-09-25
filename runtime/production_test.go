@@ -43,7 +43,7 @@ func productionConfigDocument(endpoint, tag string) string {
       "discovery": false,
       "extra_body": {"provider_side": "provider-value", "provider_number": 9007199254740993},
       "models": {
-        "m": {"name": "M", "context_window": 4096, "usage_in_stream": true,
+        "m": {"name": "M", "context_window": 262144, "usage_in_stream": true,
               "extra_body": {"model_side": "model-value"},
               "protocol_metadata": {"family": "fam", "must_preserve": ["proto_keep"], "drop": ["drop_me"]}}
       }
@@ -51,7 +51,7 @@ func productionConfigDocument(endpoint, tag string) string {
     "open": {
       "transport": {"base_url": "` + endpoint + `", "api_key_env": ""},
       "discovery": false,
-      "models": {"km": {"name": "K", "context_window": 4096}}
+      "models": {"km": {"name": "K", "context_window": 262144}}
     }
   },
   "plugins": {"hooks": {"tag": "` + tag + `"}}

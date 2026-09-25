@@ -298,10 +298,13 @@ func TestRunCompactionMultiPieceConsumesEveryMessageOnce(t *testing.T) {
 
 // TestCompactModelEffectSettlements proves the effect contract: attempts run
 // through the compact transport under the retry policy, a piece failure
-// settles the terminal with the accumulated usage keyed by the compact model,
-// an interrupted effect settles through the existing terminal path, and a
-// refusal-only output fails the piece with no retry. The ready settlement's
-// durable shape is pinned by the one-budget orchestration test.
+// settles the terminal with the accumulated usage keyed by the compact model
+// and carries the errored assembly on the failure row, an interrupted effect
+// settles through the existing terminal path with no output before any
+// assembly, and a textless completed output settles ready with its output —
+// the orchestration validates the summary text after the settlement. The
+// ready settlement's durable shape is pinned by the one-budget orchestration
+// test.
 func TestCompactModelEffectSettlements(t *testing.T) {
 	compactRef := testCompactCapture().Model
 
@@ -366,6 +369,9 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 		if set.Disposition != agent.DispoFailure || set.Detail == "" || !strings.Contains(set.Detail, "provider failure") {
 			t.Fatalf("settlement = %+v, want failure carrying the piece failure detail", set)
 		}
+		if set.Output == nil || set.Output.Status != model.OutputErrored {
+			t.Fatalf("settlement output = %+v, want the errored assembly carried on the failure row", set.Output)
+		}
 		graph, err := validateFixture(t, store, sessionID)
 		if err != nil {
 			t.Fatalf("post-settlement graph: %v", err)
@@ -408,6 +414,9 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 		if set.Disposition != agent.DispoInterruption || set.Detail != executionInterruptedDetail {
 			t.Fatalf("settlement = %+v, want the fixed interruption settlement", set)
 		}
+		if set.Output != nil {
+			t.Fatalf("settlement output = %+v, want none on the pre-assembly cancellation", set.Output)
+		}
 		graph, err := validateFixture(t, store, sessionID)
 		if err != nil {
 			t.Fatalf("post-settlement graph: %v", err)
@@ -427,8 +436,8 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 		}
 	})
 
-	t.Run("refusal-only output fails the piece with no retry", func(t *testing.T) {
-		h, store, c, sessionID := newEffectHarness(t, nil)
+	t.Run("refusal-only completed output settles ready with the carried output", func(t *testing.T) {
+		h, _, c, _ := newEffectHarness(t, nil)
 		spy := &retrySpy{limit: 3}
 		refusal := turnDelta("stop", "")
 		refusal.RefusalFragment = "no"
@@ -438,8 +447,7 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 			return streamOf(refusal, usageDelta(model.Usage{InputTokens: 2, OutputTokens: 1})), nil
 		}
 		exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, Retry: spy.retry, NormalizeTool: objectNormalize}
-		accum := &usageAccumulator{}
-		me := h.compactModelEffect(c, testOpID, exec, testCapture(), accum)
+		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &usageAccumulator{})
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("piece")}}})
 		if err != nil {
 			t.Fatalf("request: %v", err)
@@ -450,25 +458,11 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 		if err != nil {
 			t.Fatalf("compact model effect: %v", err)
 		}
-		if set.Disposition != agent.DispoFailure || set.Detail != "compaction summary is empty" || set.Output != nil {
-			t.Fatalf("settlement = %+v, want the empty-summary failure with no output", set)
+		if set.Disposition != agent.DispoReady || set.Output == nil || set.Output.Status != model.OutputCompleted {
+			t.Fatalf("settlement = %+v, want the ready settlement carrying the completed output", set)
 		}
 		if calls != 1 {
 			t.Fatalf("compact transport calls = %d, want exactly one attempt and no retry", calls)
-		}
-		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("post-settlement graph: %v", err)
-		}
-		settlement := settlementEntryOf(t, graph)
-		if settlement.Status != OperationFailure || settlement.Detail != "compaction summary is empty" {
-			t.Fatalf("settlement entry = %+v, want the empty-summary failure terminal", settlement)
-		}
-		if settlement.Model == nil || *settlement.Model != compactRef {
-			t.Fatalf("settlement model = %+v, want the compact model identity", settlement.Model)
-		}
-		if settlement.Usage == nil || *settlement.Usage != (UsageCount{InputTokens: 2, OutputTokens: 1}) {
-			t.Fatalf("settlement usage = %+v, want the reported counts", settlement.Usage)
 		}
 	})
 }
@@ -894,6 +888,99 @@ func TestRunCompactionEmptySnapshotFailsNothingToCompact(t *testing.T) {
 	}
 	if settlement.Model != nil || settlement.Usage != nil {
 		t.Fatalf("settlement entry = %+v, want no usage on the never-run compaction", settlement)
+	}
+	for i := range graph.Entries {
+		if graph.Entries[i].Compaction != nil {
+			t.Fatalf("compaction entry committed on a failure path")
+		}
+	}
+}
+
+// TestRunCompactionErroredPieceCarriesOutputThroughTheRun proves the carried
+// output through a real agent.Run: an errored piece with a retained payload
+// settles its terminal inside its own effect and the returned failure
+// settlement carries the errored output, satisfying the run's callback gate —
+// the run returns the piece's own failure detail, never a settlement-shape
+// boundary violation about an outputless settlement.
+func TestRunCompactionErroredPieceCarriesOutputThroughTheRun(t *testing.T) {
+	h, store, c, sessionID := newEffectHarness(t, nil)
+	compact := func(ctx context.Context, req model.Request) (model.Stream, error) {
+		return erroredTurnStream(), nil // text "partial" with usage, then the read failure
+	}
+	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, Retry: (&retrySpy{limit: 0}).retry, NormalizeTool: objectNormalize}
+	summary, usage, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), compactSnapshotMessages())
+	if err == nil || !strings.Contains(err.Error(), "provider failure") {
+		t.Fatalf("error %v, want the piece's own failure detail, not a settlement-shape boundary violation", err)
+	}
+	if summary != "" {
+		t.Fatalf("summary %q, want none on the failed piece", summary)
+	}
+	if usage == nil || *usage != (UsageCount{InputTokens: 5, OutputTokens: 7}) {
+		t.Fatalf("usage = %+v, want the errored piece's reported counts", usage)
+	}
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("post-settlement graph: %v", err)
+	}
+	settlement := settlementEntryOf(t, graph)
+	if settlement.Status != OperationFailure || !strings.Contains(settlement.Detail, "provider failure") {
+		t.Fatalf("settlement entry = %+v, want the failure terminal", settlement)
+	}
+	if settlement.Model == nil || *settlement.Model != testCompactCapture().Model {
+		t.Fatalf("settlement model = %+v, want the compact model identity", settlement.Model)
+	}
+	if settlement.Usage == nil || *settlement.Usage != (UsageCount{InputTokens: 5, OutputTokens: 7}) {
+		t.Fatalf("settlement usage = %+v, want the accumulated counts", settlement.Usage)
+	}
+	for i := range graph.Entries {
+		if graph.Entries[i].Compaction != nil {
+			t.Fatalf("compaction entry committed on a failure path")
+		}
+	}
+}
+
+// TestRunCompactionEmptyPieceSummaryFailsWithTheRetainedDetail proves the
+// relocated textless-completed rule: the effect settles a textless completed
+// piece ready, and the orchestration fails the empty summary after the run —
+// the direct settlement carries the retained detail and the accumulated
+// usage, exactly one model call runs with no retry and no next piece, and no
+// compaction entry commits.
+func TestRunCompactionEmptyPieceSummaryFailsWithTheRetainedDetail(t *testing.T) {
+	h, store, c, sessionID := newEffectHarness(t, nil)
+	refusal := turnDelta("stop", "")
+	refusal.RefusalFragment = "no"
+	calls := 0
+	compact := func(ctx context.Context, req model.Request) (model.Stream, error) {
+		calls++
+		return streamOf(refusal, usageDelta(model.Usage{InputTokens: 2, OutputTokens: 1})), nil
+	}
+	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
+	summary, usage, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), compactSnapshotMessages())
+	if err == nil || err.Error() != "compaction summary is empty" {
+		t.Fatalf("error %v, want the retained empty-summary detail", err)
+	}
+	if summary != "" {
+		t.Fatalf("summary %q, want none on the failed piece", summary)
+	}
+	if usage == nil || *usage != (UsageCount{InputTokens: 2, OutputTokens: 1}) {
+		t.Fatalf("usage = %+v, want the piece's reported counts", usage)
+	}
+	if calls != 1 {
+		t.Fatalf("compact transport calls = %d, want exactly one with no retry and no next piece", calls)
+	}
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("post-failure graph: %v", err)
+	}
+	settlement := settlementEntryOf(t, graph)
+	if settlement.Status != OperationFailure || settlement.Detail != "compaction summary is empty" {
+		t.Fatalf("settlement entry = %+v, want the empty-summary failure terminal", settlement)
+	}
+	if settlement.Model == nil || *settlement.Model != testCompactCapture().Model {
+		t.Fatalf("settlement model = %+v, want the compact model identity", settlement.Model)
+	}
+	if settlement.Usage == nil || *settlement.Usage != (UsageCount{InputTokens: 2, OutputTokens: 1}) {
+		t.Fatalf("settlement usage = %+v, want the accumulated counts", settlement.Usage)
 	}
 	for i := range graph.Entries {
 		if graph.Entries[i].Compaction != nil {

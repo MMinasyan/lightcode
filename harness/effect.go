@@ -80,6 +80,41 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 		retry = standardRetryPolicy
 	}
 	return func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		// The compaction trigger sits before every model boundary, before any
+		// intent commits: a request whose messages plus the output reserve
+		// exceed the conversation window compacts first. The request's
+		// messages already carry the projected system message, so the
+		// estimate covers the complete request; the frozen snapshot is the
+		// projected conversation minus the leading system message. The
+		// orchestration and the automatic commit run to completion, then the
+		// request is rebuilt in full from the pure projection without
+		// draining steering again — steering that arrived during the
+		// orchestration stays buffered for the next model boundary. Every
+		// orchestration or commit failure has already settled the terminal
+		// durably (a piece failure inside its own effect, any other failure
+		// through the direct terminal settlement), and the effect returns the
+		// failure settlement: the request whose checkpoint failed is never
+		// sent, with no retry and no uncompacted fallback. The compact model
+		// effect performs no trigger check — the structural recursion guard
+		// keeps the compact Agent outside Session compaction.
+		if estimateTokens("", req.Messages)+capture.OutputReserve > capture.ContextWindow {
+			snapshot := req.Messages
+			if len(snapshot) > 0 && snapshot[0].Role == model.RoleSystem {
+				snapshot = snapshot[1:]
+			}
+			summary, usage, err := h.runCompaction(ctx, c, operationID, exec, capture, snapshot)
+			if err != nil {
+				return agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: err.Error()}, nil
+			}
+			if err := h.commitCompaction(c, operationID, capture, summary, usage, false); err != nil {
+				return agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: err.Error()}, nil
+			}
+			messages, err := h.projectContext(c, operationID)
+			if err != nil {
+				return agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: err.Error()}, nil
+			}
+			req.Messages = messages
+		}
 		intent, err := h.beginModelEffect(ctx, c, operationID)
 		if err != nil {
 			// An intent transaction aborted by cancellation settles the

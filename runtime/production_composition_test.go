@@ -56,7 +56,7 @@ func chainPlainConfigDocument(endpoint string) string {
     "prov": {
       "transport": {"base_url": "` + endpoint + `", "api_key_env": "PRODUCTION_TEST_KEY"},
       "discovery": false,
-      "models": {"gpt-5.5": {"name": "G", "context_window": 4096}}
+      "models": {"gpt-5.5": {"name": "G", "context_window": 262144}}
     }
   },
   "plugins": {"hooks": {"tag": "T1"}}
@@ -71,7 +71,7 @@ func chainCommandConfigDocument(endpoint string) string {
     "prov": {
       "transport": {"base_url": "` + endpoint + `", "api_key_env": "PRODUCTION_TEST_KEY"},
       "discovery": false,
-      "models": {"m": {"name": "M", "context_window": 4096}}
+      "models": {"m": {"name": "M", "context_window": 262144}}
     }
   }
 }`
@@ -103,8 +103,8 @@ func chainModelsConfigDocument(endpoint string) string {
       "transport": {"base_url": "` + endpoint + `", "api_key_env": ""},
       "discovery": false,
       "models": {
-        "gpt-5.5": {"name": "G", "context_window": 4096},
-        "vanilla": {"name": "V", "context_window": 4096}
+        "gpt-5.5": {"name": "G", "context_window": 262144},
+        "vanilla": {"name": "V", "context_window": 262144}
       }
     }
   }
