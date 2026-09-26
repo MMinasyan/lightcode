@@ -368,6 +368,28 @@ func (h *Harness) settleCompactionFailure(c *coordinator, operationID string, te
 	return cause
 }
 
+// compactionFailureSettlement converts one compaction-trigger failure into
+// the model effect's return shape by the Operation's durable state — the
+// settled outcome's single discriminator. An Operation already settled (a
+// piece failure settled inside its own effect, or any other failure settled
+// through the direct terminal settlement) keeps the failure settlement with a
+// nil error: the request whose checkpoint failed is never sent, with no
+// retry and no uncompacted fallback. A still-running or absent Operation —
+// the failure left the committed running state for recovery — returns the raw
+// error with no settlement, exactly the conversation effect's own
+// publication-failure shape, so the run, the outer settlement, the
+// storage-failure latch, and Wait handle it verbatim.
+func compactionFailureSettlement(c *coordinator, operationID string, err error) (agent.ModelSettlement, error) {
+	c.mu.Lock()
+	op, ok := c.graph.Operation(operationID)
+	running := !ok || op.State.Status == OperationRunning
+	c.mu.Unlock()
+	if running {
+		return agent.ModelSettlement{}, err
+	}
+	return agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: err.Error()}, nil
+}
+
 // commitCompaction commits the one atomic compaction transaction: the
 // immutable compaction entry, the Session register's projection field, and
 // the usage totals on the Operation and Session registers — plus, on the

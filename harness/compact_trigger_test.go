@@ -1,15 +1,18 @@
 // Contract coverage for the conversation model effect's compaction trigger:
 // an overflowing request compacts before it is sent and proceeds against the
 // new projection, a fitting request is untouched, a failed checkpoint fails
-// the Operation with the request unsent, steering submitted during the
-// orchestration stays buffered for the next model boundary, a later overflow
-// in the same Operation compacts again, and compact piece requests never
-// trigger compaction.
+// the Operation with the request unsent, a storage failure that leaves the
+// Operation running propagates as the raw effect error to the storage-failure
+// latch and Wait — over a live piece intent and over the quiet direct
+// settlement — steering submitted during the orchestration stays buffered for
+// the next model boundary, a later overflow in the same Operation compacts
+// again, and compact piece requests never trigger compaction.
 package harness
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -49,6 +52,21 @@ func triggerCapture(t *testing.T, req model.Request, overflow bool) ExecutionCap
 	} else {
 		capture.ContextWindow = threshold
 	}
+	return capture
+}
+
+// overflowingTriggerCapture sizes the conversation window through the
+// triggerCapture arithmetic over the deterministic projection of one admitted
+// text input — the captured system message plus the one input message — so
+// the projected request overflows the trigger's estimate-plus-reserve
+// threshold by one.
+func overflowingTriggerCapture(input string) ExecutionCapture {
+	capture := testCapture()
+	projected := []model.Message{
+		{Role: model.RoleSystem, Content: []model.ContentPart{{Kind: model.PartText, Text: capture.SystemPrompt}}},
+		{Role: model.RoleUser, Content: admissionContent(input)},
+	}
+	capture.ContextWindow = estimateTokens("", projected) + capture.OutputReserve - 1
 	return capture
 }
 
@@ -477,5 +495,169 @@ func TestModelEffectCompactRequestNeverTriggers(t *testing.T) {
 	comp := compactedEntryOf(t, graph) // exactly one compaction entry
 	if comp.OperationID != testOpID || comp.Summary != "summary one" {
 		t.Fatalf("compaction entry = %+v, want the Operation-owned committed summary", comp)
+	}
+}
+
+// TestModelEffectCompactTriggerStorageFailurePropagatesUnsettled proves the
+// unsettled row: a storage failure at a piece's ready result commit — the
+// piece intent stays live, the failure left the Operation running for
+// recovery — returns from the trigger as the raw storage error with no
+// settlement shape, and the Operation keeps its committed running/intent
+// state with no entry beyond the admitted input.
+func TestModelEffectCompactTriggerStorageFailurePropagatesUnsettled(t *testing.T) {
+	h, store, c, sessionID := newEffectHarness(t, nil)
+	req := projectedTriggerRequest(t, h, c)
+	capture := triggerCapture(t, req, true)
+	injected := fmt.Errorf("piece result commit storage failure: %w", ErrStorage)
+	replaces := 0
+	store.txHook = func(step string) error {
+		if step != "replace_register" {
+			return nil
+		}
+		replaces++
+		if replaces == 2 { // #1 the piece intent, #2/#3 the ready result commit
+			return injected
+		}
+		return nil
+	}
+	exec := Execution{
+		Model: forbiddenConversationModel(t),
+		CompactModel: func(ctx context.Context, r model.Request) (model.Stream, error) {
+			return summaryStream("summary one", model.Usage{}), nil
+		},
+		NormalizeTool: objectNormalize,
+	}
+	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
+	if !errors.Is(err, injected) {
+		t.Fatalf("model effect = %v, want the raw storage error returned unsettled", err)
+	}
+	if !reflect.DeepEqual(set, agent.ModelSettlement{}) {
+		t.Fatalf("settlement = %+v, want no settlement shape behind the raw error", set)
+	}
+	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	if err != nil {
+		t.Fatalf("ReadOperation: %v", err)
+	}
+	if rec.State.Status != OperationRunning || rec.State.ActiveEffect == nil {
+		t.Fatalf("operation state = %+v, want the committed running/intent state for recovery", rec.State)
+	}
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("graph: %v", err)
+	}
+	if len(graph.Entries) != 1 { // only the admitted input: the failed ready commit rolled back
+		t.Fatalf("entries = %d, want only the admitted input after the rollback", len(graph.Entries))
+	}
+}
+
+// TestCompactTriggerUnsettledStorageFailureReachesWait proves the full latch
+// row over a live piece intent: a storage failure at the piece's ready result
+// commit — the intent stays live, the Operation running — propagates as the
+// raw effect error through the run and the outer settlement, is latched as
+// the storage failure that stopped admitted work, and Wait reports it while
+// the Operation keeps its committed running/intent state for recovery.
+func TestCompactTriggerUnsettledStorageFailureReachesWait(t *testing.T) {
+	store := emptyStore(t)
+	capture := overflowingTriggerCapture("hello")
+	injected := fmt.Errorf("piece result commit storage failure: %w", ErrStorage)
+	fired := make(chan struct{}, 1)
+	exec := Execution{
+		Model: forbiddenConversationModel(t),
+		CompactModel: func(ctx context.Context, r model.Request) (model.Stream, error) {
+			// The intent's replace_register has already committed when the
+			// transport runs; the next replace_register is the piece result
+			// commit's operation-register write.
+			store.txHook = func(step string) error {
+				if step != "replace_register" {
+					return nil
+				}
+				store.txHook = nil // one-shot
+				fired <- struct{}{}
+				return injected
+			}
+			return summaryStream("summary one", model.Usage{}), nil
+		},
+		Tool:          func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
+		NormalizeTool: objectNormalize,
+	}
+	prepared := PreparedExecution{
+		Capture: capture,
+		Open:    func(context.Context, OperationAdmission) (Execution, error) { return exec, nil },
+	}
+	h, cancel := newCancelableHarness(t, store, prepared, nil)
+	defer cancel()
+	session := createSession(t, h)
+	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	<-fired // the piece's ready result commit failed at its operation-register write
+	cancel()
+	if err := h.Wait(context.Background()); !errors.Is(err, injected) {
+		t.Fatalf("Wait = %v, want the injected storage error reported over the running Operation", err)
+	}
+	rec := settledOperation(t, store, session, "op-1")
+	if rec.State.Status != OperationRunning || rec.State.ActiveEffect == nil {
+		t.Fatalf("operation state = %+v, want the running state with its live intent for recovery", rec.State)
+	}
+}
+
+// TestCompactTriggerQuietSettlementStorageFailureReachesWait proves the quiet
+// row: the textless piece settles ready and clears the effect, and the
+// direct empty-summary settlement's storage failure — the Operation quiet and
+// running — propagates as the raw effect error, takes the outer settlement's
+// no-compensating-write branch, is latched, and Wait reports it with the
+// Operation left running and quiet for recovery and no settlement entry
+// committed.
+func TestCompactTriggerQuietSettlementStorageFailureReachesWait(t *testing.T) {
+	store := emptyStore(t)
+	capture := overflowingTriggerCapture("hello")
+	injected := fmt.Errorf("direct settlement storage failure: %w", ErrStorage)
+	fired := make(chan struct{}, 1)
+	refusal := turnDelta("stop", "")
+	refusal.RefusalFragment = "no"
+	exec := Execution{
+		Model: forbiddenConversationModel(t),
+		CompactModel: func(ctx context.Context, r model.Request) (model.Stream, error) {
+			// The piece's ready settlement only replaces registers; the first
+			// insert_entry of the trigger invocation is the direct
+			// settlement's settlement entry.
+			store.txHook = func(step string) error {
+				if step != "insert_entry" {
+					return nil
+				}
+				store.txHook = nil // one-shot
+				fired <- struct{}{}
+				return injected
+			}
+			return streamOf(refusal, usageDelta(model.Usage{InputTokens: 2, OutputTokens: 1})), nil
+		},
+		Tool:          func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
+		NormalizeTool: objectNormalize,
+	}
+	prepared := PreparedExecution{
+		Capture: capture,
+		Open:    func(context.Context, OperationAdmission) (Execution, error) { return exec, nil },
+	}
+	h, cancel := newCancelableHarness(t, store, prepared, nil)
+	defer cancel()
+	session := createSession(t, h)
+	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	<-fired // the direct settlement failed at its settlement entry insert
+	cancel()
+	if err := h.Wait(context.Background()); !errors.Is(err, injected) {
+		t.Fatalf("Wait = %v, want the injected storage error reported over the running quiet Operation", err)
+	}
+	rec := settledOperation(t, store, session, "op-1")
+	if rec.State.Status != OperationRunning || rec.State.ActiveEffect != nil {
+		t.Fatalf("operation state = %+v, want the running quiet state for recovery", rec.State)
+	}
+	graph, err := validateFixture(t, store, session)
+	if err != nil {
+		t.Fatalf("graph: %v", err)
+	}
+	if len(graph.Entries) != 1 { // only the admitted input: no settlement and no compaction entry committed
+		t.Fatalf("entries = %d, want only the admitted input with no settlement entry", len(graph.Entries))
 	}
 }

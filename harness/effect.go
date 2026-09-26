@@ -90,11 +90,14 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 		// request is rebuilt in full from the pure projection without
 		// draining steering again — steering that arrived during the
 		// orchestration stays buffered for the next model boundary. Every
-		// orchestration or commit failure has already settled the terminal
-		// durably (a piece failure inside its own effect, any other failure
-		// through the direct terminal settlement), and the effect returns the
-		// failure settlement: the request whose checkpoint failed is never
-		// sent, with no retry and no uncompacted fallback. The compact model
+		// orchestration or commit failure converts through the settled-state
+		// discriminator: one whose terminal already settled durably (a piece
+		// failure inside its own effect, any other failure through the
+		// direct terminal settlement) keeps the failure settlement — the
+		// request whose checkpoint failed is never sent, with no retry and
+		// no uncompacted fallback — while a failure that left the Operation
+		// running returns its raw error exactly like the conversation
+		// effect's own publication failures, for recovery. The compact model
 		// effect performs no trigger check — the structural recursion guard
 		// keeps the compact Agent outside Session compaction.
 		if estimateTokens("", req.Messages)+capture.OutputReserve > capture.ContextWindow {
@@ -104,14 +107,14 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 			}
 			summary, usage, err := h.runCompaction(ctx, c, operationID, exec, capture, snapshot)
 			if err != nil {
-				return agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: err.Error()}, nil
+				return compactionFailureSettlement(c, operationID, err)
 			}
 			if err := h.commitCompaction(c, operationID, capture, summary, usage, false); err != nil {
-				return agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: err.Error()}, nil
+				return compactionFailureSettlement(c, operationID, err)
 			}
 			messages, err := h.projectContext(c, operationID)
 			if err != nil {
-				return agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: err.Error()}, nil
+				return compactionFailureSettlement(c, operationID, err)
 			}
 			req.Messages = messages
 		}
