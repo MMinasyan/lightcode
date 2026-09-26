@@ -363,9 +363,6 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 				if buildErr == nil {
 					compactRef = compactType.Model
 					compactWindow = compactEntry.ContextWindow
-					if compactWindow <= 0 { // the retained window fallback: the conversation model's window
-						compactWindow = entry.ContextWindow
-					}
 					compactReserve = outputReserve(compactEntry.MaxOutputTokens)
 					compactTransport = built
 				}

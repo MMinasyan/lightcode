@@ -188,10 +188,8 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 			wantCompReserve: 131072,
 		},
 		{
-			// catalog.Lookup rejects a non-positive window as an incomplete
-			// model, so the retained window fallback fires only defensively:
-			// the observable behavior for such a compact model is the
-			// conversation-model default.
+			// catalog.Lookup rejects the zero-window model, so the
+			// conversation-model default applies.
 			name:            "compact entry with no positive window falls back",
 			agentsDoc:       agentsWithCompact(`{"model": "prov/mzero"}`),
 			agent:           "solo",
