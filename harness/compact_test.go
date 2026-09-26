@@ -1010,6 +1010,46 @@ func TestCompactionPieceBudgetArithmetic(t *testing.T) {
 	}
 }
 
+// TestCompactionBoundaryRows pins the pure boundary helper: the covered
+// source is the frozen snapshot minus the prior summary message, counted
+// from the prior compaction's own boundary target — every projectable kind
+// derives the covered last message, an entry raced between the boundary
+// target and the named compaction counts against the target's sequence, and
+// the summary-only re-compaction names the prior compaction entry itself.
+// The rows build minimal typed graphEntry values: an envelope with the
+// sequence and the one non-nil payload pointer the kind needs.
+func TestCompactionBoundaryRows(t *testing.T) {
+	input := graphEntry{Envelope: Entry{ID: "in-1", Sequence: 1}, Input: &inputEntry{}}
+	assistant := graphEntry{Envelope: Entry{ID: "as-1", Sequence: 2}, Assistant: &assistantEntry{}}
+	toolResult := graphEntry{Envelope: Entry{ID: "tr-1", Sequence: 3}, ToolResult: &toolResultEntry{}}
+	signal := graphEntry{Envelope: Entry{ID: "sg-1", Sequence: 4}, Signal: &signalEntry{}}
+
+	t.Run("every projectable kind derives the covered last message", func(t *testing.T) {
+		for _, covered := range []graphEntry{input, assistant, toolResult, signal} {
+			if got := compactionBoundary([]graphEntry{covered}, "", 1); got != covered.Envelope.ID {
+				t.Fatalf("boundary over the %s row = %q, want the covered entry %q", covered.Envelope.Kind, got, covered.Envelope.ID)
+			}
+		}
+	})
+
+	t.Run("an entry between the boundary target and the named compaction counts", func(t *testing.T) {
+		compaction := graphEntry{Envelope: Entry{ID: "co-1", Sequence: 5}, Compaction: &compactionEntry{BoundaryEntryID: assistant.Envelope.ID}}
+		// The frozen snapshot carried the prior summary and the raced
+		// signal: the boundary is the first entry after the target's
+		// sequence, not the first after the named entry's own.
+		if got := compactionBoundary([]graphEntry{input, assistant, signal, compaction}, compaction.Envelope.ID, 2); got != signal.Envelope.ID {
+			t.Fatalf("boundary = %q, want the raced signal %q counted after the boundary target", got, signal.Envelope.ID)
+		}
+	})
+
+	t.Run("the summary-only re-compaction names the prior compaction entry", func(t *testing.T) {
+		compaction := graphEntry{Envelope: Entry{ID: "co-1", Sequence: 3}, Compaction: &compactionEntry{BoundaryEntryID: assistant.Envelope.ID}}
+		if got := compactionBoundary([]graphEntry{input, assistant, compaction}, compaction.Envelope.ID, 1); got != compaction.Envelope.ID {
+			t.Fatalf("boundary = %q, want the named compaction entry itself", got)
+		}
+	})
+}
+
 // compactedEntryOf returns the one compaction entry of the validated graph.
 func compactedEntryOf(t *testing.T, graph *sessionGraph) *compactionEntry {
 	t.Helper()
@@ -1054,7 +1094,9 @@ func TestCommitCompactionAutomaticCommitsAtomically(t *testing.T) {
 	beforeEntries, _ := storedSessionState(store, sessionID)
 
 	usage := &UsageCount{InputTokens: 7, CachedInputTokens: 3, OutputTokens: 4}
-	if err := h.commitCompaction(c, testOpID, testCapture(), "summary one", usage, false); err != nil {
+	// snapshotLen 1: the fresh fixture's frozen snapshot carries the one
+	// admitted input message.
+	if err := h.commitCompaction(c, testOpID, testCapture(), "summary one", 1, usage, false); err != nil {
 		t.Fatalf("commitCompaction: %v", err)
 	}
 
@@ -1145,7 +1187,9 @@ func TestCommitCompactionManualSettlesInTheSameTransaction(t *testing.T) {
 	beforeEntries, _ := storedSessionState(store, sessionID)
 
 	usage := &UsageCount{InputTokens: 6, CachedInputTokens: 1, OutputTokens: 2}
-	if err := h.commitCompaction(c, testOpID, testCapture(), "manual summary", usage, true); err != nil {
+	// snapshotLen 1: the fresh fixture's frozen snapshot carries the one
+	// admitted input message.
+	if err := h.commitCompaction(c, testOpID, testCapture(), "manual summary", 1, usage, true); err != nil {
 		t.Fatalf("commitCompaction: %v", err)
 	}
 
@@ -1228,7 +1272,7 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 		}
 		store.txHook = func(string) error { return errors.New("injected storage failure") }
 
-		if err := h.commitCompaction(c, testOpID, testCapture(), "summary", nil, false); err == nil {
+		if err := h.commitCompaction(c, testOpID, testCapture(), "summary", 1, nil, false); err == nil {
 			t.Fatalf("commitCompaction succeeded past an injected failure")
 		}
 
@@ -1279,7 +1323,7 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 		}
 		usage := &UsageCount{InputTokens: 7, CachedInputTokens: 3, OutputTokens: 4}
 
-		err = h.commitCompaction(c, testOpID, testCapture(), "summary", usage, false)
+		err = h.commitCompaction(c, testOpID, testCapture(), "summary", 1, usage, false)
 		if err == nil || !strings.Contains(err.Error(), "injected commit failure") {
 			t.Fatalf("error %v, want the injected commit failure", err)
 		}
@@ -1333,7 +1377,7 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 			return nil
 		}
 
-		err = h.commitCompaction(c, testOpID, testCapture(), "summary", nil, true)
+		err = h.commitCompaction(c, testOpID, testCapture(), "summary", 1, nil, true)
 		if err == nil || !strings.Contains(err.Error(), "injected settlement failure") {
 			t.Fatalf("error %v, want the injected settlement failure", err)
 		}

@@ -27,9 +27,10 @@ func (h *Harness) contextSource(c *coordinator, operationID string) agent.Contex
 // touching steering or queued buffers. When the Session register's
 // CompactionEntryID is set, the projection is the system message, one
 // assistant summary message built from the named compaction entry's payload,
-// and the entries after the named entry's sequence in order — the named
-// entry and every entry at or before its sequence never project as messages.
-// With the field empty the full history projects.
+// and the entries after the sequence of the boundary entry that the named
+// entry's payload records — the named entry and every entry at or before that
+// boundary never project as messages. With the field empty the full history
+// projects.
 func (h *Harness) projectContext(c *coordinator, operationID string) ([]model.Message, error) {
 	c.mu.Lock()
 	sessionID := c.graph.Session.Identity.SessionID
@@ -74,6 +75,16 @@ func (h *Harness) projectContext(c *coordinator, operationID string) ([]model.Me
 				return nil, err
 			}
 			messages = append(messages, msg)
+			// the cutoff is the boundary the payload records — one further
+			// lookup in the same entries slice; the validator guarantees the
+			// target is in-session, and a miss keeps the named entry's own
+			// sequence
+			for j := range entries {
+				if entries[j].Envelope.ID == entries[i].Compaction.BoundaryEntryID {
+					boundarySequence = entries[j].Envelope.Sequence
+					break
+				}
+			}
 			break
 		}
 	}

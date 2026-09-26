@@ -109,7 +109,7 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 			if err != nil {
 				return compactionFailureSettlement(c, operationID, err)
 			}
-			if err := h.commitCompaction(c, operationID, capture, summary, usage, false); err != nil {
+			if err := h.commitCompaction(c, operationID, capture, summary, len(snapshot), usage, false); err != nil {
 				return compactionFailureSettlement(c, operationID, err)
 			}
 			messages, err := h.projectContext(c, operationID)
@@ -1792,7 +1792,7 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		if err != nil {
 			return err
 		}
-		return h.commitCompaction(c, operationID, agentCapture, summary, usage, true)
+		return h.commitCompaction(c, operationID, agentCapture, summary, len(snapshot), usage, true)
 	}
 	res, err := agent.Run(execCtx, agent.Invocation{
 		ExpectedModel: agentCapture.Model,

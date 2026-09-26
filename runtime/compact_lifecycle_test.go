@@ -1643,6 +1643,19 @@ func TestCompactLifecycleManualCompaction(t *testing.T) {
 				gated.armPostCommit(2)
 				return compactSummaryTurn("manual summary", model.Usage{InputTokens: 7, OutputTokens: 3}), nil
 			})
+			// The freeze-time last projectable entry — the run turn's
+			// assistant — captured from the session's entries before the
+			// manual compaction freezes its snapshot.
+			var freezeBoundary string
+			for _, entry := range f.entries(s) {
+				switch entry.Kind {
+				case harness.EntryInput, harness.EntryAssistant, harness.EntryToolResult, harness.EntrySignal:
+					freezeBoundary = entry.ID
+				}
+			}
+			if freezeBoundary == "" {
+				t.Fatalf("no projectable entry before the manual compaction")
+			}
 			rec := f.compactIdle(s, "compact-op-1")
 			if rec.Admission.RequestKind != harness.RequestKindCompact {
 				t.Fatalf("admission kind = %q, want compact", rec.Admission.RequestKind)
@@ -1717,6 +1730,9 @@ func TestCompactLifecycleManualCompaction(t *testing.T) {
 			entry := entries[0]
 			if entry.OperationID != "compact-op-1" || entry.Summary != "manual summary" {
 				t.Fatalf("compaction entry = %+v, want the caller-generated Operation's commit", entry)
+			}
+			if entry.BoundaryEntryID != freezeBoundary {
+				t.Fatalf("committed boundary %q, want the freeze-time last projectable entry %q", entry.BoundaryEntryID, freezeBoundary)
 			}
 			if entry.Usage == nil || *entry.Usage != (harness.UsageCount{InputTokens: 7, OutputTokens: 3}) {
 				t.Fatalf("compaction entry usage = %+v, want the piece's reported counts", entry.Usage)

@@ -390,21 +390,78 @@ func compactionFailureSettlement(c *coordinator, operationID string, err error) 
 	return agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: err.Error()}, nil
 }
 
+// compactionBoundary names the last entry one frozen compaction snapshot
+// covered: the need-th projectable entry strictly after the prior
+// compaction's own boundary target, where need is the snapshot length minus
+// the prior summary message the snapshot carries as its first covered message.
+// Without a named prior compaction the count runs from the graph's start; a
+// summary-only re-compaction (the snapshot is the prior summary alone) names
+// the prior compaction entry itself, a valid compaction-kind boundary. Both
+// lookups cannot miss on a validating graph — the register names an
+// in-session compaction entry and every compaction boundary names an
+// in-session entry strictly before it — so a miss degrades to the same count
+// over the named entry's own sequence, or over the graph's start when the
+// named entry itself is absent. A count shortfall returns the empty boundary:
+// unreachable when the snapshot derives from the same graph's projectable
+// entries, and the payload's hex rule rejects it inside the commit
+// transaction as the ordinary failure.
+func compactionBoundary(entries []graphEntry, namedCompactionID string, snapshotLen int) string {
+	cutoff := int64(-1)
+	summaryCount := 0
+	if namedCompactionID != "" {
+		for i := range entries {
+			if entries[i].Envelope.ID != namedCompactionID || entries[i].Compaction == nil {
+				continue
+			}
+			boundarySequence := entries[i].Envelope.Sequence
+			for j := range entries {
+				if entries[j].Envelope.ID == entries[i].Compaction.BoundaryEntryID {
+					boundarySequence = entries[j].Envelope.Sequence
+					break
+				}
+			}
+			cutoff = boundarySequence
+			summaryCount = 1
+			break
+		}
+	}
+	need := snapshotLen - summaryCount
+	if need == 0 {
+		return namedCompactionID
+	}
+	count := 0
+	for i := range entries {
+		e := entries[i]
+		if e.Input == nil && e.Assistant == nil && e.ToolResult == nil && e.Signal == nil {
+			continue
+		}
+		if e.Envelope.Sequence <= cutoff {
+			continue
+		}
+		count++
+		if count == need {
+			return e.Envelope.ID
+		}
+	}
+	return ""
+}
+
 // commitCompaction commits the one atomic compaction transaction: the
 // immutable compaction entry, the Session register's projection field, and
 // the usage totals on the Operation and Session registers — plus, on the
 // manual shape, the dedicated Operation's success settlement — all inside one
 // transaction on the cancellation-free Harness context. The entry's boundary
-// is the highest-sequence projectable entry of the cached graph, read under
-// the coordinator lock the commit holds across the transaction and uses to
-// apply the committed records afterward; both call sites are entry-stable
-// between the frozen snapshot and this commit, so the commit-time boundary is
-// the freeze-time one. The usage contribution lands keyed by the compact
+// names the last entry the frozen snapshot covered — the snapshotLen-th
+// projectable entry after the prior compaction's own boundary target, derived
+// under the coordinator lock the commit holds across the transaction from the
+// cached graph and the pre-commit register — so an entry appended after the
+// freeze, whose sequence is strictly higher than every freeze-time entry, can
+// never be named as covered. The usage contribution lands keyed by the compact
 // model on the entry and both register totals in the same transaction. A
 // failed transaction leaves every previous value durable and settles the
 // quiet running Operation through the direct terminal settlement carrying
 // the commit error and the accumulated usage keyed by the compact model.
-func (h *Harness) commitCompaction(c *coordinator, operationID string, capture ExecutionCapture, summary string, usage *UsageCount, manual bool) error {
+func (h *Harness) commitCompaction(c *coordinator, operationID string, capture ExecutionCapture, summary string, snapshotLen int, usage *UsageCount, manual bool) error {
 	c.mu.Lock()
 	viewOp, ok := c.graph.Operation(operationID)
 	if !ok {
@@ -414,6 +471,7 @@ func (h *Harness) commitCompaction(c *coordinator, operationID string, capture E
 	}
 	sessionID := viewOp.Admission.SessionID
 	viewSession := c.graph.Session
+	namedCompactionID := viewSession.State.CompactionEntryID
 
 	var (
 		committedOp   OperationRecord
@@ -421,15 +479,8 @@ func (h *Harness) commitCompaction(c *coordinator, operationID string, capture E
 		newEntries    []graphEntry
 	)
 	err := h.deps.Storage.Transact(context.WithoutCancel(h.ctx), func(tx Transaction) error {
-		// The boundary: the last projectable entry of the cached graph, the
-		// frozen snapshot's last message.
-		boundary := ""
-		for i := range c.graph.Entries {
-			e := c.graph.Entries[i]
-			if e.Input != nil || e.Assistant != nil || e.ToolResult != nil || e.Signal != nil {
-				boundary = e.Envelope.ID
-			}
-		}
+		// The boundary: the last entry the frozen snapshot covered.
+		boundary := compactionBoundary(c.graph.Entries, namedCompactionID, snapshotLen)
 		sessionKey := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
 		sreg, err := tx.ReadRegister(sessionKey)
 		if err != nil {

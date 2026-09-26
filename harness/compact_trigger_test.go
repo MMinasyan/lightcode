@@ -6,7 +6,9 @@
 // latch and Wait — over a live piece intent and over the quiet direct
 // settlement — steering submitted during the orchestration stays buffered for
 // the next model boundary, a later overflow in the same Operation compacts
-// again, and compact piece requests never trigger compaction.
+// again, the committed boundary covers exactly the frozen snapshot so an entry
+// appended between the freeze and the commit still projects, and compact piece
+// requests never trigger compaction.
 package harness
 
 import (
@@ -659,5 +661,100 @@ func TestCompactTriggerQuietSettlementStorageFailureReachesWait(t *testing.T) {
 	}
 	if len(graph.Entries) != 1 { // only the admitted input: no settlement and no compaction entry committed
 		t.Fatalf("entries = %d, want only the admitted input with no settlement entry", len(graph.Entries))
+	}
+}
+
+// TestModelEffectCompactBoundaryExcludesPostFreezeAppends proves the frozen
+// boundary against the live interleave: a background completion delivered
+// while the trigger's piece attempt is parked appends an entry after the
+// frozen snapshot, and the committed boundary still names the freeze-time
+// last projectable entry, so the appended signal projects after the summary
+// instead of being named as covered and hidden.
+func TestModelEffectCompactBoundaryExcludesPostFreezeAppends(t *testing.T) {
+	h, store, c, sessionID := newEffectHarness(t, nil)
+	req := projectedTriggerRequest(t, h, c)
+	capture := triggerCapture(t, req, true)
+	arrived := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var sent []model.Request
+	exec := Execution{
+		Model: func(ctx context.Context, r model.Request) (model.Stream, error) {
+			sent = append(sent, r)
+			return completedTurnStream(), nil
+		},
+		CompactModel: func(ctx context.Context, r model.Request) (model.Stream, error) {
+			arrived <- struct{}{}
+			<-release // the park: the freeze is past, the commit has not run
+			return summaryStream("summary one", model.Usage{}), nil
+		},
+		NormalizeTool: objectNormalize,
+	}
+	type invocation struct {
+		set agent.ModelSettlement
+		err error
+	}
+	done := make(chan invocation, 1)
+	go func() { // a synchronous call would deadlock on the park
+		set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
+		done <- invocation{set: set, err: err}
+	}()
+	<-arrived
+	// Admission precedes the close: a closed group rejects admission, and
+	// the closed group makes the delivery commit the durable signal
+	// regardless of the running Operation.
+	member, err := admitLocked(h, c, memberChild, completionChildID, 0)
+	if err != nil {
+		t.Fatalf("admission: %v", err)
+	}
+	closeBackgroundMode(c)
+	if err := h.DeliverBackgroundCompletion(context.Background(), sessionID, member.completionID, "Task completed."); err != nil {
+		t.Fatalf("closed delivery: %v", err)
+	}
+	signals := storedSignals(t, store, sessionID)
+	if len(signals) != 1 {
+		t.Fatalf("durable background_completion signals = %d, want the one closed-path completion", len(signals))
+	}
+	if signals[0].OperationID != "" || signals[0].RelatedMember == nil || signals[0].RelatedMember.Kind != "child" ||
+		signals[0].RelatedMember.ID != completionChildID || signals[0].Content != "Task completed." {
+		t.Fatalf("committed signal = %+v, want the operationless child-member completion", signals[0])
+	}
+	close(release)
+	out := <-done
+	if out.err != nil {
+		t.Fatalf("model effect: %v", out.err)
+	}
+	if out.set.Disposition != agent.DispoReady {
+		t.Fatalf("settlement disposition %q, want ready after the rebuilt request", out.set.Disposition)
+	}
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("graph: %v", err)
+	}
+	comp := compactedEntryOf(t, graph)
+	if comp.BoundaryEntryID != graph.Entries[0].Envelope.ID {
+		t.Fatalf("boundary %q, want the freeze-time last projectable entry %q", comp.BoundaryEntryID, graph.Entries[0].Envelope.ID)
+	}
+	// The rebuilt request carried the appended signal after the summary.
+	if len(sent) != 1 {
+		t.Fatalf("conversation transport calls = %d, want exactly the rebuilt request", len(sent))
+	}
+	sentMsgs := sent[0].Messages
+	if len(sentMsgs) != 3 || sentMsgs[0].Role != model.RoleSystem ||
+		sentMsgs[1].Role != model.RoleAssistant || sentMsgs[1].Source != testCompactCapture().Model ||
+		sentMsgs[2].Role != model.RoleUser || sentMsgs[2].TextContent() != "<system-signal>Task completed.</system-signal>" {
+		t.Fatalf("rebuilt request = %+v, want the system message, the summary, and the wrapped post-freeze signal", sentMsgs)
+	}
+	// The post-commit projection keeps the signal visible after the
+	// summary, ahead of the turn the settled request committed.
+	after, err := h.projectContext(c, testOpID)
+	if err != nil {
+		t.Fatalf("projectContext: %v", err)
+	}
+	if len(after) != 4 || after[0].Role != model.RoleSystem ||
+		after[1].Role != model.RoleAssistant || after[1].Source != testCompactCapture().Model ||
+		after[1].TextContent() != "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]" ||
+		after[2].Role != model.RoleUser || after[2].TextContent() != "<system-signal>Task completed.</system-signal>" ||
+		after[3].Role != model.RoleAssistant || after[3].TextContent() != "done" {
+		t.Fatalf("post-commit projection = %+v, want the system message, the summary, the wrapped post-freeze signal, and the settled turn", after)
 	}
 }

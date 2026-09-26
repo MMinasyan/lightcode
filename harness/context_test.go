@@ -162,6 +162,67 @@ func TestContextSourceTwoSequentialCompactions(t *testing.T) {
 	assertProjectionEqual(t, got, want)
 }
 
+// projectionSignal returns one operationless background_completion signal
+// fixture entry with the given identity and sequence — the exact shape a
+// closed-path completion commits.
+func projectionSignal(entryID string, sequence int64) testEntry {
+	v := validBackgroundCompletionEntry()
+	v.EntryID = entryID
+	return testEntry{
+		env:    Entry{SessionID: testSessionID, ID: entryID, Kind: EntrySignal, Sequence: sequence, CommittedAt: testTime},
+		signal: &v,
+	}
+}
+
+// TestContextSourceProjectsEntriesAfterTheBoundary proves the frozen-boundary
+// projection rule: the named compaction entry's summary projects, then exactly
+// the entries after the sequence of the boundary entry its payload records —
+// an entry committed between the boundary target and the compaction entry
+// still projects — and a compaction-kind boundary target hides every message
+// kind, leaving the summary alone.
+func TestContextSourceProjectsEntriesAfterTheBoundary(t *testing.T) {
+	t.Run("the entry between the boundary target and the compaction projects", func(t *testing.T) {
+		fixture := validTestGraph()
+		fixture.entries = append(fixture.entries,
+			projectionSignal(hexID(3), 3),
+			projectionCompaction(hexID(4), hexID(2), 4),
+			projectionInput(hexID(5), "later", 5),
+		)
+		fixture.session.State.CompactionEntryID = hexID(4)
+		h, c := newProjectionFixture(t, fixture)
+
+		got := projectionMessages(t, h, c)
+		want := []model.Message{
+			mustSystemMessage(t, "system"),
+			wantSummaryMessage(t, *fixture.entries[3].compaction),
+			mustInputMessage(t, "<system-signal>Task completed.</system-signal>"),
+			mustInputMessage(t, "later"),
+		}
+		assertProjectionEqual(t, got, want)
+	})
+
+	t.Run("a compaction-kind boundary target projects only the summary", func(t *testing.T) {
+		fixture := validTestGraph()
+		fixture.entries = append(fixture.entries,
+			projectionCompaction(hexID(3), hexID(2), 3),
+			projectionCompaction(hexID(4), hexID(3), 4),
+		)
+		fixture.session.State.CompactionEntryID = hexID(4)
+		second := *fixture.entries[3].compaction
+		second.Summary = "Second summary."
+		second.Model = model.ModelRef{Provider: "other", Model: "sum-2"}
+		fixture.entries[3].compaction = &second
+		h, c := newProjectionFixture(t, fixture)
+
+		got := projectionMessages(t, h, c)
+		want := []model.Message{
+			mustSystemMessage(t, "system"),
+			wantSummaryMessage(t, second),
+		}
+		assertProjectionEqual(t, got, want)
+	})
+}
+
 // mustSystemMessage builds the expected system message for the text.
 func mustSystemMessage(t *testing.T, text string) model.Message {
 	t.Helper()
