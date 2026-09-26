@@ -666,9 +666,9 @@ func (w compactWireTotals) countFor(provider, name string) (harness.UsageCount, 
 	return harness.UsageCount{}, false
 }
 
-// compactSessionRegisterState reads one Session register's projection field
-// and usage totals straight from the store.
-func compactSessionRegisterState(t *testing.T, store harness.Storage, sessionID string) (string, compactWireTotals) {
+// compactSessionRegisterState reads one Session register's current
+// Operation, projection field, and usage totals straight from the store.
+func compactSessionRegisterState(t *testing.T, store harness.Storage, sessionID string) (currentOperationID, compactionEntryID string, usage compactWireTotals) {
 	t.Helper()
 	reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession})
 	if err != nil {
@@ -676,14 +676,15 @@ func compactSessionRegisterState(t *testing.T, store harness.Storage, sessionID 
 	}
 	var wire struct {
 		State struct {
-			CompactionEntryID string            `json:"compaction_entry_id"`
-			Usage             compactWireTotals `json:"usage"`
+			CurrentOperationID string            `json:"current_operation_id"`
+			CompactionEntryID  string            `json:"compaction_entry_id"`
+			Usage              compactWireTotals `json:"usage"`
 		} `json:"state"`
 	}
 	if err := json.Unmarshal(reg.Payload, &wire); err != nil {
 		t.Fatalf("decode session register: %v", err)
 	}
-	return wire.State.CompactionEntryID, wire.State.Usage
+	return wire.State.CurrentOperationID, wire.State.CompactionEntryID, wire.State.Usage
 }
 
 // compactOperationRegisterState reads one Operation register's status and
@@ -745,7 +746,8 @@ func (r *compactRequestRecords) at(i int) model.Request {
 // the composed Runtime: a fitting request sends uncompacted; an overflowing
 // request compacts first and sends against the summary projection with the
 // usage attributed; a later overflow in the same Operation commits a second
-// entry; and no passive event fires across a compaction.
+// entry; an automatic compaction in a launched child Session runs through the
+// same shared path; and no passive event fires across a compaction.
 func TestCompactLifecycleTriggerRows(t *testing.T) {
 	t.Run("fitting request sends uncompacted", func(t *testing.T) {
 		eachPrepStore(t, func(t *testing.T, store harness.Storage) {
@@ -907,7 +909,7 @@ func TestCompactLifecycleTriggerRows(t *testing.T) {
 			if parkedEntry.BoundaryEntryID != boundary {
 				t.Fatalf("parked boundary %q != the last pre-commit entry %q", parkedEntry.BoundaryEntryID, boundary)
 			}
-			parkedCompactionID, parkedSessionUsage := compactSessionRegisterState(t, store, s)
+			_, parkedCompactionID, parkedSessionUsage := compactSessionRegisterState(t, store, s)
 			if parkedCompactionID != parkedEntry.EntryID {
 				t.Fatalf("parked compaction_entry_id = %q, want the committed entry %q", parkedCompactionID, parkedEntry.EntryID)
 			}
@@ -1135,6 +1137,79 @@ func TestCompactLifecycleTriggerRows(t *testing.T) {
 			if got := f.readSession(s).State.CompactionEntryID; got != entries[1].EntryID {
 				t.Fatalf("compaction_entry_id = %q, want the newest entry %q", got, entries[1].EntryID)
 			}
+			if err := f.r.Close(ctx); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+		})
+	})
+
+	t.Run("an automatic compaction in a launched child session", func(t *testing.T) {
+		eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+			ctx := context.Background()
+			f := openCompactLifecycle(t, store)
+			parent := f.session("child-parent")
+			var childID string
+			err := f.r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+				res, err := h.LaunchChildSession(ctx, harness.LaunchChildRequest{
+					ParentSessionID: parent,
+					AgentType:       "worker",
+					Content:         []model.ContentPart{{Kind: model.PartText, Text: "child task"}},
+					OperationID:     "op-1",
+					MaxConcurrent:   5,
+					OutputLimit:     4096,
+				})
+				if err != nil {
+					return err
+				}
+				childID = res.ChildSessionID
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("LaunchChildSession: %v", err)
+			}
+			awaitOperation(t, f.r, childID, "op-1", harness.OperationSuccess)
+
+			// The child's next request overflows: the window is sized over
+			// the child's projected messages with the huge input.
+			huge := compactTextWithTokens("word ", 20000)
+			childMessages := []model.Message{
+				sysMessageText("compact-sys"),
+				userMessageText("child task"),
+				assistantMessageText("done"),
+				userMessageText(huge),
+			}
+			f.setCapture(compactWindowFor(childMessages, 64, true), 64, "compact-sys", harness.CompactCapture{
+				Model: compactConversationRef, ContextWindow: 1 << 20, OutputReserve: 1024, SystemPrompt: "summarize",
+			})
+			var sent compactRequestRecords
+			f.setConvScript(childID, func(_ context.Context, req model.Request) (model.Stream, error) {
+				sent.add(req)
+				return lifecycleTextTurn("done again"), nil
+			})
+			f.setCompactScript(childID, func(_ context.Context, req model.Request) (model.Stream, error) {
+				return compactSummaryTurn("child summary", model.Usage{InputTokens: 1, OutputTokens: 1}), nil
+			})
+			f.submit(childID, "op-2", huge)
+			awaitOperation(t, f.r, childID, "op-2", harness.OperationSuccess)
+
+			// The child Session carries exactly one compaction entry with
+			// the register's projection field naming it.
+			entries := compactCompactionEntriesOf(t, store, childID)
+			if len(entries) != 1 {
+				t.Fatalf("child compaction entries = %+v, want exactly one", entries)
+			}
+			id, rerr := compactionIDOf(store, childID)
+			if rerr != nil || id != entries[0].EntryID {
+				t.Fatalf("child compaction_entry_id = (%q, %v), want the committed entry %q", id, rerr, entries[0].EntryID)
+			}
+			// The conversation transport saw the post-summary request.
+			if sent.count() != 1 {
+				t.Fatalf("conversation transport calls = %d, want the post-summary request's one call", sent.count())
+			}
+			assertCompactShapes(t, compactShapesOf(sent.at(0).Messages), []compactMessageShape{
+				{role: "system", text: "compact-sys"},
+				{role: "assistant", text: "[Previous conversation summary]\n\nchild summary\n\n[End of summary. Continue from here.]", source: compactConversationRef},
+			})
 			if err := f.r.Close(ctx); err != nil {
 				t.Fatalf("Close: %v", err)
 			}
@@ -1688,7 +1763,7 @@ func TestCompactLifecycleManualCompaction(t *testing.T) {
 			if parkedEntryID == "" || parkedEntry.OperationID != "compact-op-1" || parkedEntry.Summary != "manual summary" {
 				t.Fatalf("parked compaction entry = (%q, %+v), want the manual commit's entry", parkedEntryID, parkedEntry)
 			}
-			parkedCompactionID, parkedSessionUsage := compactSessionRegisterState(t, store, s)
+			_, parkedCompactionID, parkedSessionUsage := compactSessionRegisterState(t, store, s)
 			if parkedCompactionID != parkedEntryID {
 				t.Fatalf("parked compaction_entry_id = %q, want the committed entry %q", parkedCompactionID, parkedEntryID)
 			}
@@ -2012,6 +2087,65 @@ func TestCompactLifecycleManualCompaction(t *testing.T) {
 			}
 			if !lateCommitted {
 				t.Fatalf("committed inputs = %+v, want the late message under its own post-terminal admission", inputs)
+			}
+			if err := f.r.Close(ctx); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+		})
+	})
+
+	t.Run("a live interrupt of a manual compact leaves the previous projection current", func(t *testing.T) {
+		eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+			ctx := context.Background()
+			f := openCompactLifecycle(t, store)
+			s := f.session("manual-interrupt")
+			f.submit(s, "op-1", "hello manual")
+			awaitOperation(t, f.r, s, "op-1", harness.OperationSuccess)
+
+			// The prior compaction: one manual compact through the
+			// fixture's default compact script.
+			f.compactIdle(s, "compact-1")
+			awaitOperation(t, f.r, s, "compact-1", harness.OperationSuccess)
+			prior := compactCompactionEntriesOf(t, store, s)
+			if len(prior) != 1 {
+				t.Fatalf("prior compaction entries = %d, want the one seeded commit", len(prior))
+			}
+			priorID := prior[0].EntryID
+
+			// The compact script is bound to the parked version before the
+			// second admission: the seeding compact has already settled, so
+			// the binding is deterministic.
+			parked := make(chan struct{}, 1)
+			f.setCompactScript(s, func(scriptCtx context.Context, req model.Request) (model.Stream, error) {
+				select {
+				case parked <- struct{}{}:
+				default:
+				}
+				<-scriptCtx.Done()
+				return nil, scriptCtx.Err()
+			})
+			f.compactIdle(s, "compact-2")
+			<-parked
+			if err := f.r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+				return h.Interrupt(ctx, s)
+			}); err != nil {
+				t.Fatalf("Interrupt: %v", err)
+			}
+			awaitOperation(t, f.r, s, "compact-2", harness.OperationInterruption)
+
+			// Exactly the prior compaction entry survives — no new entry
+			// committed — and the register still names the prior summary
+			// with the session's current Operation cleared.
+			ids := compactCompactionEntriesOf(t, store, s)
+			if len(ids) != 1 || ids[0].EntryID != priorID {
+				t.Fatalf("compaction entries = %+v, want only the prior entry %q", ids, priorID)
+			}
+			currentOp, compactionID, _ := compactSessionRegisterState(t, store, s)
+			if compactionID != priorID {
+				t.Fatalf("compaction_entry_id = %q, want the prior summary %q still current", compactionID, priorID)
+			}
+			if currentOp != "" {
+				t.Fatalf("current_operation_id = %q, want the interrupted compact Operation cleared", currentOp)
 			}
 			if err := f.r.Close(ctx); err != nil {
 				t.Fatalf("Close: %v", err)
