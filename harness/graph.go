@@ -18,6 +18,7 @@ type graphEntry struct {
 	Signal     *signalEntry
 	HookResult *hookResultEntry
 	Settlement *operationSettlementEntry
+	Compaction *compactionEntry
 }
 
 // sessionGraph is the owned decoded view of one Session: the Session record,
@@ -120,9 +121,8 @@ func validateSessionGraph(ctx context.Context, store Storage, sessionID string) 
 	return graph, nil
 }
 
-// decodeGraphEntry decodes one entry envelope according to its kind. The
-// landed compaction kind has no valid Phase 3 payload, so a stored record of
-// that kind is corruption; unknown kinds are too.
+// decodeGraphEntry decodes one entry envelope according to its kind. Unknown
+// kinds are corruption.
 func decodeGraphEntry(sessionID string, env Entry) (graphEntry, error) {
 	entry := graphEntry{Envelope: env}
 	var err error
@@ -158,7 +158,10 @@ func decodeGraphEntry(sessionID string, env Entry) (graphEntry, error) {
 			entry.Settlement = &v
 		}
 	case EntryCompaction:
-		return graphEntry{}, corruptSession(sessionID, "entry %s: kind %q has no durable payload in this phase", env.ID, env.Kind)
+		var v compactionEntry
+		if v, err = decodeCompactionEntry(env); err == nil {
+			entry.Compaction = &v
+		}
 	default:
 		return graphEntry{}, corruptSession(sessionID, "entry %s: unknown kind %q", env.ID, env.Kind)
 	}
@@ -257,7 +260,8 @@ func (v *graphValidation) run() error {
 
 // validateSessionState verifies the current-Operation agreement rules: at
 // most one running Operation, exact agreement with the Session's current
-// identity, and no running Operation in an archived Session.
+// identity, no running Operation in an archived Session, and a projection
+// reference naming an in-session compaction entry when present.
 func (v *graphValidation) validateSessionState() error {
 	var running []string
 	for id, op := range v.opsByID {
@@ -282,6 +286,12 @@ func (v *graphValidation) validateSessionState() error {
 	}
 	if session.State.Lifecycle == LifecycleArchived && len(running) > 0 {
 		return v.corrupt("running Operation %q in an archived Session", running[0])
+	}
+	if session.State.CompactionEntryID != "" {
+		compaction, ok := v.entryByID[session.State.CompactionEntryID]
+		if !ok || compaction.Compaction == nil {
+			return v.corrupt("compaction_entry_id %q names no in-session compaction entry", session.State.CompactionEntryID)
+		}
 	}
 	return nil
 }
@@ -402,8 +412,9 @@ func (v *graphValidation) validateForkPrefixOwnership() error {
 
 // validateEntryReferences verifies the reference rules that fall outside one
 // Operation's accounting: a copied fork-prefix tool result resolves inside
-// the copied prefix, and an owned signal's related Operation resolves inside
-// the owning Session while a copied signal's informational history may not.
+// the copied prefix, an owned signal's related Operation resolves inside the
+// owning Session while a copied signal's informational history may not, and
+// a compaction entry's boundary names an in-session entry strictly before it.
 func (v *graphValidation) validateEntryReferences() error {
 	for _, entry := range v.graph.Entries {
 		switch {
@@ -437,6 +448,14 @@ func (v *graphValidation) validateEntryReferences() error {
 			if _, ok := v.opsByID[related.OperationID]; !ok {
 				return v.corrupt("signal entry %s references missing related operation %q", entry.Envelope.ID, related.OperationID)
 			}
+		case entry.Compaction != nil:
+			boundary, ok := v.entryByID[entry.Compaction.BoundaryEntryID]
+			if !ok {
+				return v.corrupt("compaction entry %s names boundary entry %q outside the Session", entry.Envelope.ID, entry.Compaction.BoundaryEntryID)
+			}
+			if boundary.Envelope.Sequence >= entry.Envelope.Sequence {
+				return v.corrupt("compaction entry %s names boundary entry %s at or after its own sequence", entry.Envelope.ID, boundary.Envelope.ID)
+			}
 		}
 	}
 	return nil
@@ -444,18 +463,26 @@ func (v *graphValidation) validateEntryReferences() error {
 
 // validateOperation verifies one Operation's admission reference, tool-call
 // exactly-once accounting, terminal/settlement agreement, and usage totals.
+// The request kind selects the admitted-input rule: a message Operation
+// requires its self-owned input entry, a compact Operation requires none.
 func (v *graphValidation) validateOperation(op *OperationRecord) error {
 	opID := op.Admission.OperationID
 
-	admitted, ok := v.entryByID[op.Admission.AdmittedEntry.EntryID]
-	if op.Admission.AdmittedEntry.SessionID != v.sessionID || !ok {
-		return v.corrupt("operation %q admits missing input entry %q", opID, op.Admission.AdmittedEntry.EntryID)
-	}
-	if admitted.Envelope.Kind != EntryInput {
-		return v.corrupt("operation %q admits entry %q of kind %s, not input", opID, admitted.Envelope.ID, admitted.Envelope.Kind)
-	}
-	if admitted.Envelope.OperationID != opID {
-		return v.corrupt("operation %q admits entry %s owned by operation %q, not itself", opID, admitted.Envelope.ID, admitted.Envelope.OperationID)
+	if op.Admission.RequestKind == RequestKindCompact {
+		if op.Admission.AdmittedEntry != (EntryRef{}) {
+			return v.corrupt("compact operation %q carries an admitted input entry %q", opID, op.Admission.AdmittedEntry.EntryID)
+		}
+	} else {
+		admitted, ok := v.entryByID[op.Admission.AdmittedEntry.EntryID]
+		if op.Admission.AdmittedEntry.SessionID != v.sessionID || !ok {
+			return v.corrupt("operation %q admits missing input entry %q", opID, op.Admission.AdmittedEntry.EntryID)
+		}
+		if admitted.Envelope.Kind != EntryInput {
+			return v.corrupt("operation %q admits entry %q of kind %s, not input", opID, admitted.Envelope.ID, admitted.Envelope.Kind)
+		}
+		if admitted.Envelope.OperationID != opID {
+			return v.corrupt("operation %q admits entry %s owned by operation %q, not itself", opID, admitted.Envelope.ID, admitted.Envelope.OperationID)
+		}
 	}
 
 	published, err := v.collectPublishedCalls(opID)
@@ -719,8 +746,9 @@ func (v *graphValidation) validatePendingCalls(opID string, published []publishe
 }
 
 // validateUsage recomputes Operation and Session totals from the
-// usage-bearing producer entries — assistant usages plus terminal
-// no-output-settlement usage pairs — and requires exact agreement.
+// usage-bearing producer entries — assistant usages, terminal
+// no-output-settlement usage pairs, and committed compaction usage — and
+// requires exact agreement.
 func (v *graphValidation) validateUsage() error {
 	sessionUsage := UsageTotals{}
 	perOperation := make(map[string]UsageTotals, len(v.graph.Operations))
@@ -733,6 +761,8 @@ func (v *graphValidation) validateUsage() error {
 			ref, counts, bears = entry.Assistant.Source, *entry.Assistant.Usage, true
 		case entry.Settlement != nil && entry.Settlement.Usage != nil:
 			ref, counts, bears = *entry.Settlement.Model, *entry.Settlement.Usage, true
+		case entry.Compaction != nil && entry.Compaction.Usage != nil:
+			ref, counts, bears = entry.Compaction.Model, *entry.Compaction.Usage, true
 		}
 		if !bears {
 			continue

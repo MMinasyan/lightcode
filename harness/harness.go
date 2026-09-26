@@ -84,6 +84,11 @@ type Execution struct {
 	// exactly one physical attempt and returns its accepted stream or that
 	// attempt's failure; retry, assembly and settlement are Harness-owned.
 	Model func(context.Context, model.Request) (model.Stream, error)
+	// CompactModel is the physical model-request callback for the compaction
+	// summarizer, built over the effective compact model's transport from the
+	// same configuration revision the capture records. Each invocation makes
+	// exactly one physical attempt, like Model.
+	CompactModel func(context.Context, model.Request) (model.Stream, error)
 	// Retry classifies one failed physical attempt for the next-attempt
 	// decision. Nil selects the private standard classifier.
 	Retry RetryPolicy
@@ -149,6 +154,14 @@ type SubmitRequest struct {
 type SubmitResult struct {
 	Disposition SubmitDisposition
 	Operation   *OperationRecord
+}
+
+// CompactRequest is the input of one public manual compaction: the
+// caller-generated stable Operation identity supplies admission and
+// idempotency.
+type CompactRequest struct {
+	SessionID   string
+	OperationID string
 }
 
 // SweepPolicy is the explicit-time lifecycle thresholds of one Sweep call: an
@@ -437,6 +450,10 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 		return SubmitResult{}, notFoundSession(req.SessionID)
 	}
 	if rec, ok := c.graph.Operation(req.OperationID); ok { // existing resolves before routing
+		if rec.Admission.RequestKind != RequestKindMessage { // a compact Operation's identity rejects message reuse
+			c.mu.Unlock()
+			return SubmitResult{}, invalidInput("operation %q already exists in session %q with a different request kind", req.OperationID, req.SessionID)
+		}
 		first := ownOperationRecord(rec)
 		c.mu.Unlock()
 		return SubmitResult{Disposition: DispositionExisting, Operation: &first}, nil
@@ -476,6 +493,7 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 	rec, prepared, disposition, err := h.admitReserved(ctx, c, admissionRequest{
 		SessionID:   req.SessionID,
 		OperationID: req.OperationID,
+		Kind:        RequestKindMessage,
 		Origin:      req.Origin,
 		Content:     content,
 	})
@@ -486,6 +504,76 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 		h.startExecution(c, rec.Admission.OperationID, *prepared)
 	}
 	return SubmitResult{Disposition: disposition, Operation: &rec}, nil
+}
+
+// Compact compacts one idle Session manually under a dedicated Operation: the
+// caller-generated stable Operation ID supplies normal admission and
+// idempotency without any applicable input entry or synthetic user message.
+// The method follows the admit shape, never Submit's: an existing same-Session
+// Operation of the compact kind resolves before the idle check, without
+// running preparation or compaction again; otherwise the Session must be
+// truly idle — no current Operation, no installed run, and both the steering
+// and queued buffers empty — checked before and again under the admission
+// reservation, so Compact cannot overtake a pending drain in the
+// terminal-to-retirement window or work admitted while it waited. Everything
+// outside this one valid set is rejected: Compact never queues or steers and
+// never enters either buffer. On success the reserved body prepares and
+// publishes the compact kind and the execution installs before the
+// reservation releases; a Submit arriving afterward follows its ordinary
+// active routing, and manual compaction does not drain or consume that
+// pending message.
+func (h *Harness) Compact(ctx context.Context, req CompactRequest) (OperationRecord, error) {
+	if err := validateOperationIdentity(req.OperationID, "operation id"); err != nil {
+		return OperationRecord{}, invalidInput("operation id: %v", err)
+	}
+	c, err := h.coordinatorFor(ctx, req.SessionID)
+	if err != nil {
+		return OperationRecord{}, err
+	}
+	// resolve-or-guard runs before the reservation and again under it: the
+	// existing same-kind resolution precedes the idle guard on both passes.
+	resolve := func() (OperationRecord, bool, error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.gone { // a deletion committed after materialization
+			return OperationRecord{}, false, notFoundSession(req.SessionID)
+		}
+		if rec, ok := c.graph.Operation(req.OperationID); ok {
+			if rec.Admission.RequestKind != RequestKindCompact { // a different request kind's use of the identity is invalid
+				return OperationRecord{}, false, invalidInput("operation %q already exists in session %q with a different request kind", req.OperationID, req.SessionID)
+			}
+			return ownOperationRecord(rec), true, nil
+		}
+		if c.graph.Session.State.CurrentOperationID != "" || c.run != nil || len(c.steering) > 0 || len(c.queued) > 0 {
+			return OperationRecord{}, false, invalidInput("session %q is not idle; admission requires an idle Session", req.SessionID)
+		}
+		return OperationRecord{}, false, nil
+	}
+	rec, existing, err := resolve()
+	if err != nil || existing {
+		return rec, err
+	}
+	release, err := c.reserve(ctx)
+	if err != nil {
+		return OperationRecord{}, err
+	}
+	defer release()
+	rec, existing, err = resolve() // the re-evaluation under the reservation
+	if err != nil || existing {
+		return rec, err
+	}
+	admitted, prepared, _, err := h.admitReserved(ctx, c, admissionRequest{
+		SessionID:   req.SessionID,
+		OperationID: req.OperationID,
+		Kind:        RequestKindCompact,
+	})
+	if err != nil {
+		return OperationRecord{}, err
+	}
+	if prepared != nil { // install the execution before the deferred release runs
+		h.startExecution(c, admitted.Admission.OperationID, *prepared)
+	}
+	return admitted, nil
 }
 
 // ReopenSession reopens one archived Session: it changes the lifecycle to
@@ -1026,6 +1114,7 @@ func (c *coordinator) waitIdle(ctx context.Context) error {
 type admissionRequest struct {
 	SessionID   string
 	OperationID string
+	Kind        RequestKind
 	Origin      InputOrigin
 	Content     []model.ContentPart
 }
@@ -1083,6 +1172,9 @@ func (h *Harness) admit(ctx context.Context, req admissionRequest) (OperationRec
 	}
 	if rec, ok := c.graph.Operation(req.OperationID); ok {
 		c.mu.Unlock()
+		if rec.Admission.RequestKind != req.Kind { // a different request kind's use of the identity is invalid
+			return OperationRecord{}, "", invalidInput("operation %q already exists in session %q with a different request kind", req.OperationID, req.SessionID)
+		}
 		return ownOperationRecord(rec), DispositionExisting, nil
 	}
 	if c.graph.Session.State.Lifecycle != LifecycleOpen {
@@ -1125,6 +1217,9 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 	}
 	if rec, ok := c.graph.Operation(req.OperationID); ok { // the prior reservation holder admitted it
 		c.mu.Unlock()
+		if rec.Admission.RequestKind != req.Kind { // a different request kind's use of the identity is invalid
+			return OperationRecord{}, nil, "", invalidInput("operation %q already exists in session %q with a different request kind", req.OperationID, req.SessionID)
+		}
 		return ownOperationRecord(rec), nil, DispositionExisting, nil
 	}
 	if c.graph.Session.State.Lifecycle != LifecycleOpen {
@@ -1146,7 +1241,7 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 	prepared, capture, prepCtx, cleanup, err := h.prepareExecution(ctx, PreparationSession{
 		Identity:  view.Identity,
 		AgentType: view.State.CurrentAgentType,
-	})
+	}, req.Kind)
 	if err != nil {
 		return OperationRecord{}, nil, "", err
 	}
@@ -1174,7 +1269,7 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 // already cleaned up; on success the caller keeps it live through publication
 // and runs the cleanup when publication returns. Caller or Harness
 // cancellation before or after preparation publishes nothing.
-func (h *Harness) prepareExecution(ctx context.Context, session PreparationSession) (PreparedExecution, ExecutionCapture, context.Context, context.CancelFunc, error) {
+func (h *Harness) prepareExecution(ctx context.Context, session PreparationSession, kind RequestKind) (PreparedExecution, ExecutionCapture, context.Context, context.CancelFunc, error) {
 	prepCtx, cancel := context.WithCancel(h.ctx)
 	stop := context.AfterFunc(ctx, cancel)
 	cleanup := func() {
@@ -1191,7 +1286,7 @@ func (h *Harness) prepareExecution(ctx context.Context, session PreparationSessi
 	}
 	prepared, prepErr := h.deps.Prepare(prepCtx, PreparationRequest{
 		Session:     session,
-		RequestKind: RequestKindMessage,
+		RequestKind: kind,
 	})
 	if prepErr != nil {
 		cleanup()
@@ -1264,6 +1359,9 @@ func (h *Harness) publishAdmission(ctx context.Context, c *coordinator, view Ses
 				return err
 			}
 			if found {
+				if rec.Admission.RequestKind != req.Kind { // a different request kind's use of the identity is invalid
+					return invalidInput("operation %q already exists in session %q with a different request kind", req.OperationID, req.SessionID)
+				}
 				published, existing = rec, true
 				return errAdmissionExisting
 			}
@@ -1284,7 +1382,10 @@ func (h *Harness) publishAdmission(ctx context.Context, c *coordinator, view Ses
 					return rerr
 				}
 				if found {
-					foreign = true
+					foreign = true                             // the conflicting identity is durable: refresh the stale view on any rejection
+					if rec.Admission.RequestKind != req.Kind { // a different request kind's use of the identity is invalid
+						return invalidInput("operation %q already exists in session %q with a different request kind", req.OperationID, req.SessionID)
+					}
 					published, existing = rec, true
 					return errAdmissionExisting
 				}
@@ -1313,7 +1414,9 @@ func (h *Harness) publishAdmission(ctx context.Context, c *coordinator, view Ses
 		return OperationRecord{}, false, err
 	}
 	c.mu.Lock()
-	c.graph.Entries = append(c.graph.Entries, newEntry)
+	if newEntry.Envelope.ID != "" { // a compact admission publishes no input entry
+		c.graph.Entries = append(c.graph.Entries, newEntry)
+	}
 	c.graph.Operations = append(c.graph.Operations, published)
 	c.graph.Session = newSession
 	c.mu.Unlock()
@@ -1321,14 +1424,61 @@ func (h *Harness) publishAdmission(ctx context.Context, c *coordinator, view Ses
 }
 
 // produceAdmission is the shared in-transaction destination admission
-// producer, used by normal admission and Fork alike: it inserts the input
-// entry and the running Operation register for one destination Session
-// record held at its current revision, and sets the Session current
-// Operation. First-writer resolution stays with the caller: an insertion
-// conflict returns the raw storage conflict for the caller to resolve —
-// the same-Session Operation read for normal admission, the exact
-// idempotency lookup for Fork.
+// producer, used by normal admission, compact admission, and Fork alike: it
+// inserts the input entry and the running Operation register for one
+// destination Session record held at its current revision, and sets the
+// Session current Operation. A compact admission inserts no input entry and
+// samples one UTC time for the admission, start, and last-activity stamps.
+// First-writer resolution stays with the caller: an insertion conflict
+// returns the raw storage conflict for the caller to resolve — the
+// same-Session Operation read for normal admission, the exact idempotency
+// lookup for Fork.
 func produceAdmission(tx Transaction, session SessionRecord, capture ExecutionCapture, req admissionRequest) (OperationRecord, SessionRecord, graphEntry, error) {
+	if req.Kind == RequestKindCompact {
+		now := time.Now().UTC()
+		record := OperationRecord{
+			Admission: OperationAdmission{
+				SessionID:   req.SessionID,
+				OperationID: req.OperationID,
+				RequestKind: req.Kind,
+				AgentType:   session.State.CurrentAgentType,
+				Execution:   capture,
+				AdmittedAt:  now,
+			},
+			State: OperationCurrentState{
+				Status:           OperationRunning,
+				StartedAt:        now,
+				PendingToolCalls: []PendingToolCall{},
+				Usage:            UsageTotals{},
+			},
+		}
+		opPayload, err := encodeOperationRegister(record)
+		if err != nil {
+			return OperationRecord{}, SessionRecord{}, graphEntry{}, err
+		}
+		registered, err := tx.InsertRegister(RegisterDraft{
+			Key:     RegisterKey{SessionID: req.SessionID, Kind: RegisterOperation, OperationID: req.OperationID},
+			Payload: opPayload,
+		})
+		if err != nil {
+			return OperationRecord{}, SessionRecord{}, graphEntry{}, err
+		}
+		record.Revision = registered.Revision
+		state := session.State
+		state.CurrentOperationID = req.OperationID
+		state.LastActivity = now
+		committed := SessionRecord{Identity: session.Identity, State: state}
+		sessionPayload, err := encodeSessionRegister(committed)
+		if err != nil {
+			return OperationRecord{}, SessionRecord{}, graphEntry{}, err
+		}
+		replaced, err := tx.ReplaceRegister(RegisterKey{SessionID: req.SessionID, Kind: RegisterSession}, session.Revision, sessionPayload)
+		if err != nil {
+			return OperationRecord{}, SessionRecord{}, graphEntry{}, err
+		}
+		committed.Revision = replaced.Revision
+		return record, committed, graphEntry{}, nil
+	}
 	entryID, err := newHexID()
 	if err != nil {
 		return OperationRecord{}, SessionRecord{}, graphEntry{}, fmt.Errorf("%w: %v", ErrStorage, err)
@@ -1358,7 +1508,7 @@ func produceAdmission(tx Transaction, session SessionRecord, capture ExecutionCa
 		Admission: OperationAdmission{
 			SessionID:     req.SessionID,
 			OperationID:   req.OperationID,
-			RequestKind:   RequestKindMessage,
+			RequestKind:   req.Kind,
 			AdmittedEntry: EntryRef{SessionID: req.SessionID, EntryID: entryID},
 			AgentType:     session.State.CurrentAgentType,
 			Execution:     capture,
@@ -1489,6 +1639,7 @@ func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 		rec, prepared, disposition, err := h.admitReserved(h.ctx, c, admissionRequest{
 			SessionID:   sessionID,
 			OperationID: item.operationID,
+			Kind:        RequestKindMessage,
 			Origin:      item.origin,
 			Content:     item.content,
 		})

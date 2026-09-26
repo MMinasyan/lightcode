@@ -620,6 +620,7 @@ func TestStopChildJoinsReservationAndRun(t *testing.T) {
 	rec, prepared, _, err := h.admitReserved(context.Background(), childC, admissionRequest{
 		SessionID:   completionChildID,
 		OperationID: "op-2",
+		Kind:        RequestKindMessage,
 		Origin:      InputOriginUser,
 		Content:     admissionContent("later"),
 	})

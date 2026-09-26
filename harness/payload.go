@@ -1139,6 +1139,152 @@ func validateOperationSettlementEntry(v operationSettlementEntry) error {
 	return nil
 }
 
+// encodeCompactionEntry renders one compaction entry payload.
+func encodeCompactionEntry(v compactionEntry) (json.RawMessage, error) {
+	if err := validateCompactionEntry(v); err != nil {
+		return nil, invalidInput("compaction entry: %v", err)
+	}
+	modelRaw, err := encodeModelRef(v.Model)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(struct {
+		SessionID             string          `json:"session_id"`
+		EntryID               string          `json:"entry_id"`
+		OperationID           string          `json:"operation_id,omitempty"`
+		Summary               string          `json:"summary"`
+		BoundaryEntryID       string          `json:"boundary_entry_id"`
+		Model                 json.RawMessage `json:"model"`
+		ConfigurationRevision string          `json:"configuration_revision"`
+		Usage                 *UsageCount     `json:"usage,omitempty"`
+	}{
+		SessionID:             v.SessionID,
+		EntryID:               v.EntryID,
+		OperationID:           v.OperationID,
+		Summary:               v.Summary,
+		BoundaryEntryID:       v.BoundaryEntryID,
+		Model:                 modelRaw,
+		ConfigurationRevision: v.ConfigurationRevision,
+		Usage:                 v.Usage,
+	})
+}
+
+// decodeCompactionEntry reads one compaction entry payload and enforces its
+// agreement with the addressed envelope identity.
+func decodeCompactionEntry(env Entry) (compactionEntry, error) {
+	if err := decodeEntryEnvelope(env); err != nil {
+		return compactionEntry{}, err
+	}
+	obj, err := decodePayloadObject(env.Payload)
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "summary", "boundary_entry_id", "model", "configuration_revision", "usage"); err != nil {
+		return compactionEntry{}, err
+	}
+	sessionID, err := stringMember(obj, "session_id", true)
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	entryID, err := stringMember(obj, "entry_id", true)
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	operationID, err := optionalNonEmptyString(obj, "operation_id")
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	summary, err := stringMember(obj, "summary", true)
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	boundaryEntryID, err := stringMember(obj, "boundary_entry_id", true)
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	modelObj, err := objectMember(obj, "model", true)
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	source, err := decodeModelRef(modelObj)
+	if err != nil {
+		return compactionEntry{}, fmt.Errorf("member %q: %w", "model", err)
+	}
+	configurationRevision, err := stringMember(obj, "configuration_revision", true)
+	if err != nil {
+		return compactionEntry{}, err
+	}
+	var usage *UsageCount
+	if _, present := obj["usage"]; present {
+		usageObj, err := objectMember(obj, "usage", true)
+		if err != nil {
+			return compactionEntry{}, err
+		}
+		counts, err := decodeUsageCount(usageObj)
+		if err != nil {
+			return compactionEntry{}, fmt.Errorf("member %q: %w", "usage", err)
+		}
+		usage = &counts
+	}
+	if sessionID != env.SessionID {
+		return compactionEntry{}, fmt.Errorf("payload session id %q does not agree with the envelope", sessionID)
+	}
+	if entryID != env.ID {
+		return compactionEntry{}, fmt.Errorf("payload entry id %q does not agree with the envelope", entryID)
+	}
+	if operationID != env.OperationID {
+		return compactionEntry{}, fmt.Errorf("payload operation id %q does not agree with the envelope", operationID)
+	}
+	v := compactionEntry{
+		SessionID:             sessionID,
+		EntryID:               entryID,
+		OperationID:           operationID,
+		Summary:               summary,
+		BoundaryEntryID:       boundaryEntryID,
+		Model:                 source,
+		ConfigurationRevision: configurationRevision,
+		Usage:                 usage,
+	}
+	if err := validateCompactionEntry(v); err != nil {
+		return compactionEntry{}, err
+	}
+	return v, nil
+}
+
+// validateCompactionEntry enforces the closed compaction shape: durable
+// identities, the owning Operation identity when present, a non-empty
+// summary, a non-empty durable boundary reference, a complete model identity,
+// a non-empty stable configuration revision, and no usage on an
+// operationless independently copied entry.
+func validateCompactionEntry(v compactionEntry) error {
+	if err := validateHexID(v.SessionID, "session id"); err != nil {
+		return err
+	}
+	if err := validateHexID(v.EntryID, "entry id"); err != nil {
+		return err
+	}
+	if v.OperationID != "" {
+		if err := validateOperationIdentity(v.OperationID, "operation id"); err != nil {
+			return err
+		}
+	} else if v.Usage != nil {
+		return errors.New("independently copied fork-prefix compaction entry carries no source usage")
+	}
+	if v.Summary == "" {
+		return errors.New("summary must be non-empty")
+	}
+	if err := validateHexID(v.BoundaryEntryID, "boundary entry id"); err != nil {
+		return err
+	}
+	if v.Model.Provider == "" || v.Model.Model == "" {
+		return fmt.Errorf("model %q must be a complete model identity", v.Model.String())
+	}
+	if v.ConfigurationRevision == "" {
+		return errors.New("configuration_revision must be non-empty")
+	}
+	return nil
+}
+
 // encodeUsageCountWire renders one usage count with all three signed counts
 // present.
 func encodeUsageCountWire(u UsageCount) (json.RawMessage, error) {
@@ -1328,6 +1474,7 @@ func encodeSessionState(v SessionState) (json.RawMessage, error) {
 		ArchivedAt         *string         `json:"archived_at,omitempty"`
 		CurrentAgentType   string          `json:"current_agent_type"`
 		CurrentOperationID string          `json:"current_operation_id,omitempty"`
+		CompactionEntryID  string          `json:"compaction_entry_id,omitempty"`
 		Usage              json.RawMessage `json:"usage"`
 		LastActivity       string          `json:"last_activity"`
 	}{
@@ -1335,6 +1482,7 @@ func encodeSessionState(v SessionState) (json.RawMessage, error) {
 		ArchivedAt:         archivedAt,
 		CurrentAgentType:   v.CurrentAgentType,
 		CurrentOperationID: v.CurrentOperationID,
+		CompactionEntryID:  v.CompactionEntryID,
 		Usage:              usage,
 		LastActivity:       lastActivity,
 	})
@@ -1470,7 +1618,7 @@ func validateSessionIdentity(v SessionIdentity) error {
 
 // decodeSessionState reads the state section with exact keys.
 func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
-	if err := rejectUnknownMembers(obj, "lifecycle", "archived_at", "current_agent_type", "current_operation_id", "usage", "last_activity"); err != nil {
+	if err := rejectUnknownMembers(obj, "lifecycle", "archived_at", "current_agent_type", "current_operation_id", "compaction_entry_id", "usage", "last_activity"); err != nil {
 		return SessionState{}, err
 	}
 	lifecycle, err := stringMember(obj, "lifecycle", true)
@@ -1482,6 +1630,10 @@ func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
 		return SessionState{}, err
 	}
 	currentOperationID, err := optionalNonEmptyString(obj, "current_operation_id")
+	if err != nil {
+		return SessionState{}, err
+	}
+	compactionEntryID, err := optionalNonEmptyString(obj, "compaction_entry_id")
 	if err != nil {
 		return SessionState{}, err
 	}
@@ -1505,6 +1657,7 @@ func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
 		Lifecycle:          SessionLifecycle(lifecycle),
 		CurrentAgentType:   currentAgentType,
 		CurrentOperationID: currentOperationID,
+		CompactionEntryID:  compactionEntryID,
 		Usage:              usage,
 		LastActivity:       lastStamped,
 	}
@@ -1526,8 +1679,9 @@ func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
 }
 
 // validateSessionState enforces the closed state shape: closed lifecycle with
-// archived_at present exactly when archived, non-empty Agent type, and a
-// non-empty current Operation identity when present.
+// archived_at present exactly when archived, non-empty Agent type, a
+// non-empty current Operation identity when present, and a hex-validated
+// compaction entry reference when present.
 func validateSessionState(v SessionState) error {
 	switch v.Lifecycle {
 	case LifecycleOpen, LifecycleArchived:
@@ -1545,6 +1699,11 @@ func validateSessionState(v SessionState) error {
 	}
 	if v.CurrentOperationID != "" {
 		if err := validateOperationIdentity(v.CurrentOperationID, "current operation id"); err != nil {
+			return err
+		}
+	}
+	if v.CompactionEntryID != "" {
+		if err := validateHexID(v.CompactionEntryID, "compaction entry id"); err != nil {
 			return err
 		}
 	}
@@ -1577,14 +1736,19 @@ func encodeOperationRegister(rec OperationRecord) (json.RawMessage, error) {
 }
 
 // encodeOperationAdmission validates and renders the immutable admission
-// section.
+// section. The message kind renders its admitted entry; the compact kind
+// admits no input entry and omits the member.
 func encodeOperationAdmission(v OperationAdmission) (json.RawMessage, error) {
 	if err := validateOperationAdmission(v); err != nil {
 		return nil, invalidInput("operation admission: %v", err)
 	}
-	admittedEntry, err := encodeEntryRef(v.AdmittedEntry)
-	if err != nil {
-		return nil, err
+	var admittedEntry json.RawMessage
+	if v.RequestKind == RequestKindMessage {
+		rendered, err := encodeEntryRef(v.AdmittedEntry)
+		if err != nil {
+			return nil, err
+		}
+		admittedEntry = rendered
 	}
 	execution, err := encodeExecutionCapture(v.Execution)
 	if err != nil {
@@ -1598,7 +1762,7 @@ func encodeOperationAdmission(v OperationAdmission) (json.RawMessage, error) {
 		SessionID     string          `json:"session_id"`
 		OperationID   string          `json:"operation_id"`
 		RequestKind   string          `json:"request_kind"`
-		AdmittedEntry json.RawMessage `json:"admitted_entry"`
+		AdmittedEntry json.RawMessage `json:"admitted_entry,omitempty"`
 		AgentType     string          `json:"agent_type"`
 		Execution     json.RawMessage `json:"execution"`
 		AdmittedAt    string          `json:"admitted_at"`
@@ -1626,6 +1790,24 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
+	compactModelRaw, err := encodeModelRef(v.Compact.Model)
+	if err != nil {
+		return nil, err
+	}
+	compactRaw, err := json.Marshal(struct {
+		Model         json.RawMessage `json:"model"`
+		ContextWindow int             `json:"context_window"`
+		OutputReserve int             `json:"output_reserve"`
+		SystemPrompt  string          `json:"system_prompt"`
+	}{
+		Model:         compactModelRaw,
+		ContextWindow: v.Compact.ContextWindow,
+		OutputReserve: v.Compact.OutputReserve,
+		SystemPrompt:  v.Compact.SystemPrompt,
+	})
+	if err != nil {
+		return nil, err
+	}
 	tools := make([]json.RawMessage, 0, len(v.Tools))
 	for _, tool := range v.Tools {
 		raw, err := encodeToolDefinition(tool)
@@ -1637,19 +1819,25 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 	wire, err := json.Marshal(struct {
 		ConfigurationRevision string            `json:"configuration_revision"`
 		Model                 json.RawMessage   `json:"model"`
+		ContextWindow         int               `json:"context_window"`
+		OutputReserve         int               `json:"output_reserve"`
 		SystemPrompt          string            `json:"system_prompt"`
 		Tools                 []json.RawMessage `json:"tools"`
 		Capabilities          []string          `json:"capabilities,omitempty"`
 		Readonly              bool              `json:"readonly"`
 		WriteDir              string            `json:"write_dir"`
+		Compact               json.RawMessage   `json:"compact"`
 	}{
 		ConfigurationRevision: v.ConfigurationRevision,
 		Model:                 modelRaw,
+		ContextWindow:         v.ContextWindow,
+		OutputReserve:         v.OutputReserve,
 		SystemPrompt:          v.SystemPrompt,
 		Tools:                 tools,
 		Capabilities:          v.Capabilities,
 		Readonly:              v.Readonly,
 		WriteDir:              v.WriteDir,
+		Compact:               compactRaw,
 	})
 	if err != nil {
 		return nil, err
@@ -1718,13 +1906,23 @@ func decodeOperationAdmission(obj map[string]json.RawMessage) (OperationAdmissio
 	if err != nil {
 		return OperationAdmission{}, err
 	}
-	admittedObj, err := objectMember(obj, "admitted_entry", true)
-	if err != nil {
-		return OperationAdmission{}, err
-	}
-	admittedEntry, err := decodeEntryRef(admittedObj)
-	if err != nil {
-		return OperationAdmission{}, fmt.Errorf("member %q: %w", "admitted_entry", err)
+	// The message kind requires its present, validated admitted entry; the
+	// compact kind admits no input entry and requires the member absent.
+	var admittedEntry EntryRef
+	switch RequestKind(requestKind) {
+	case RequestKindMessage:
+		admittedObj, err := objectMember(obj, "admitted_entry", true)
+		if err != nil {
+			return OperationAdmission{}, err
+		}
+		admittedEntry, err = decodeEntryRef(admittedObj)
+		if err != nil {
+			return OperationAdmission{}, fmt.Errorf("member %q: %w", "admitted_entry", err)
+		}
+	case RequestKindCompact:
+		if _, present := obj["admitted_entry"]; present {
+			return OperationAdmission{}, fmt.Errorf("member %q must be absent for request kind %q", "admitted_entry", requestKind)
+		}
 	}
 	agentType, err := stringMember(obj, "agent_type", true)
 	if err != nil {
@@ -1762,8 +1960,8 @@ func decodeOperationAdmission(obj map[string]json.RawMessage) (OperationAdmissio
 }
 
 // validateOperationAdmission enforces the closed admission shape: durable
-// identities, the single message request kind, non-empty Agent type, and a
-// complete valid capture.
+// identities, the message or compact request kind, the kind's admitted-entry
+// rule, non-empty Agent type, and a complete valid capture.
 func validateOperationAdmission(v OperationAdmission) error {
 	if err := validateHexID(v.SessionID, "session id"); err != nil {
 		return err
@@ -1771,14 +1969,20 @@ func validateOperationAdmission(v OperationAdmission) error {
 	if err := validateOperationIdentity(v.OperationID, "operation id"); err != nil {
 		return err
 	}
-	if v.RequestKind != RequestKindMessage {
-		return fmt.Errorf("request kind %q is not %q", v.RequestKind, RequestKindMessage)
-	}
-	if err := validateHexID(v.AdmittedEntry.SessionID, "admitted entry session id"); err != nil {
-		return err
-	}
-	if err := validateHexID(v.AdmittedEntry.EntryID, "admitted entry id"); err != nil {
-		return err
+	switch v.RequestKind {
+	case RequestKindMessage:
+		if err := validateHexID(v.AdmittedEntry.SessionID, "admitted entry session id"); err != nil {
+			return err
+		}
+		if err := validateHexID(v.AdmittedEntry.EntryID, "admitted entry id"); err != nil {
+			return err
+		}
+	case RequestKindCompact:
+		if v.AdmittedEntry != (EntryRef{}) {
+			return errors.New("compact operation admission carries an admitted entry")
+		}
+	default:
+		return fmt.Errorf("request kind %q is not one of %q or %q", v.RequestKind, RequestKindMessage, RequestKindCompact)
 	}
 	if v.AgentType == "" {
 		return errors.New("agent_type must be non-empty")
@@ -1793,7 +1997,7 @@ func validateOperationAdmission(v OperationAdmission) error {
 // tool names, and preserved tool and capability order. The permission
 // capability members are required, including their false and empty values.
 func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, error) {
-	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "system_prompt", "tools", "capabilities", "readonly", "write_dir"); err != nil {
+	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "context_window", "output_reserve", "system_prompt", "tools", "capabilities", "readonly", "write_dir", "compact"); err != nil {
 		return ExecutionCapture{}, err
 	}
 	revision, err := stringMember(obj, "configuration_revision", true)
@@ -1807,6 +2011,14 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 	ref, err := decodeModelRef(modelObj)
 	if err != nil {
 		return ExecutionCapture{}, fmt.Errorf("member %q: %w", "model", err)
+	}
+	contextWindow, err := int64Member(obj, "context_window", true)
+	if err != nil {
+		return ExecutionCapture{}, err
+	}
+	outputReserve, err := int64Member(obj, "output_reserve", true)
+	if err != nil {
+		return ExecutionCapture{}, err
 	}
 	systemPrompt, err := stringMember(obj, "system_prompt", true)
 	if err != nil {
@@ -1824,7 +2036,24 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 	if err != nil {
 		return ExecutionCapture{}, err
 	}
-	v := ExecutionCapture{ConfigurationRevision: revision, Model: ref, SystemPrompt: systemPrompt, Readonly: readonly, WriteDir: writeDir}
+	compactObj, err := objectMember(obj, "compact", true)
+	if err != nil {
+		return ExecutionCapture{}, err
+	}
+	compact, err := decodeCompactCapture(compactObj)
+	if err != nil {
+		return ExecutionCapture{}, fmt.Errorf("member %q: %w", "compact", err)
+	}
+	v := ExecutionCapture{
+		ConfigurationRevision: revision,
+		Model:                 ref,
+		ContextWindow:         int(contextWindow),
+		OutputReserve:         int(outputReserve),
+		SystemPrompt:          systemPrompt,
+		Readonly:              readonly,
+		WriteDir:              writeDir,
+		Compact:               compact,
+	}
 	for i, raw := range toolsRaw {
 		tool, err := decodeToolDefinition(raw)
 		if err != nil {
@@ -1852,18 +2081,59 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 	return v, nil
 }
 
+// decodeCompactCapture reads the durable compaction configuration's exact
+// keys: the durable two-field model identity, window, reserve, and system
+// prompt. Their values are validated by the enclosing capture validation.
+func decodeCompactCapture(obj map[string]json.RawMessage) (CompactCapture, error) {
+	if err := rejectUnknownMembers(obj, "model", "context_window", "output_reserve", "system_prompt"); err != nil {
+		return CompactCapture{}, err
+	}
+	modelObj, err := objectMember(obj, "model", true)
+	if err != nil {
+		return CompactCapture{}, err
+	}
+	ref, err := decodeModelRef(modelObj)
+	if err != nil {
+		return CompactCapture{}, fmt.Errorf("member %q: %w", "model", err)
+	}
+	contextWindow, err := int64Member(obj, "context_window", true)
+	if err != nil {
+		return CompactCapture{}, err
+	}
+	outputReserve, err := int64Member(obj, "output_reserve", true)
+	if err != nil {
+		return CompactCapture{}, err
+	}
+	systemPrompt, err := stringMember(obj, "system_prompt", true)
+	if err != nil {
+		return CompactCapture{}, err
+	}
+	v := CompactCapture{Model: ref, ContextWindow: int(contextWindow), OutputReserve: int(outputReserve), SystemPrompt: systemPrompt}
+	return v, nil
+}
+
 // validateExecutionCapture enforces the closed capture shape: non-empty
-// stable revision, complete model identity, unique tool names in preserved
-// order through the landed request constructor, and non-empty unique
-// capability IDs in preserved order. Capability names are checked for shape
-// only: no plugin definition is consulted, so a historical capture stays
-// readable when plugins change.
+// stable revision, complete model identity, positive conversation window and
+// output reserve, a complete valid compaction configuration, unique tool
+// names in preserved order through the landed request constructor, and
+// non-empty unique capability IDs in preserved order. Capability names are
+// checked for shape only: no plugin definition is consulted, so a historical
+// capture stays readable when plugins change.
 func validateExecutionCapture(v ExecutionCapture) error {
 	if v.ConfigurationRevision == "" {
 		return errors.New("configuration_revision must be non-empty")
 	}
 	if v.Model.Provider == "" || v.Model.Model == "" {
 		return fmt.Errorf("model %q must be a complete model identity", v.Model.String())
+	}
+	if v.ContextWindow <= 0 {
+		return fmt.Errorf("context_window %d must be positive", v.ContextWindow)
+	}
+	if v.OutputReserve <= 0 {
+		return fmt.Errorf("output_reserve %d must be positive", v.OutputReserve)
+	}
+	if err := validateCompactCapture(v.Compact); err != nil {
+		return fmt.Errorf("compact: %w", err)
 	}
 	if _, err := model.NewRequest(model.Request{Tools: v.Tools}); err != nil {
 		return err
@@ -1877,6 +2147,25 @@ func validateExecutionCapture(v ExecutionCapture) error {
 			return fmt.Errorf("capabilities[%d]: duplicate name %q", i, capability)
 		}
 		seen[capability] = true
+	}
+	return nil
+}
+
+// validateCompactCapture enforces the compaction configuration's closed
+// shape: a complete model identity, positive window and reserve, and a
+// non-empty compact system prompt.
+func validateCompactCapture(v CompactCapture) error {
+	if v.Model.Provider == "" || v.Model.Model == "" {
+		return fmt.Errorf("model %q must be a complete model identity", v.Model.String())
+	}
+	if v.ContextWindow <= 0 {
+		return fmt.Errorf("context_window %d must be positive", v.ContextWindow)
+	}
+	if v.OutputReserve <= 0 {
+		return fmt.Errorf("output_reserve %d must be positive", v.OutputReserve)
+	}
+	if v.SystemPrompt == "" {
+		return errors.New("system_prompt must be non-empty")
 	}
 	return nil
 }

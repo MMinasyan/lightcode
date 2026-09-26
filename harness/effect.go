@@ -51,12 +51,15 @@ type modelEffectIntent struct {
 // fixed continuation signal when the disposition continues, the terminal
 // classification when the effect settles the Operation, and the terminal
 // no-output model usage when a reported usage has no assistant entry to ride.
+// The usage model is the intent's expected identity while an intent is live;
+// without one the result declares its own usage model.
 type modelResult struct {
-	assistant *assistantEntry // nil when no eligible assistant payload exists
-	signal    SignalKind      // empty unless the disposition continues
-	terminal  OperationState  // empty for ready/continue; failure or interruption otherwise
-	detail    string          // terminal detail; empty for ready/continue
-	usage     *UsageCount     // terminal no-output usage; nil when the assistant entry carries it or none was reported
+	assistant  *assistantEntry // nil when no eligible assistant payload exists
+	signal     SignalKind      // empty unless the disposition continues
+	terminal   OperationState  // empty for ready/continue; failure or interruption otherwise
+	detail     string          // terminal detail; empty for ready/continue
+	usage      *UsageCount     // terminal no-output usage; nil when the assistant entry carries it or none was reported
+	usageModel model.ModelRef  // the terminal no-output usage model when no intent is live; zero otherwise
 }
 
 // modelEffect encloses one complete invocation of the prepared model function
@@ -77,6 +80,44 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 		retry = standardRetryPolicy
 	}
 	return func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		// The compaction trigger sits before every model boundary, before any
+		// intent commits: a request whose messages plus the output reserve
+		// exceed the conversation window compacts first. The request's
+		// messages already carry the projected system message, so the
+		// estimate covers the complete request; the frozen snapshot is the
+		// projected conversation minus the leading system message. The
+		// orchestration and the automatic commit run to completion, then the
+		// request is rebuilt in full from the pure projection without
+		// draining steering again — steering that arrived during the
+		// orchestration stays buffered for the next model boundary. Every
+		// orchestration or commit failure converts through the settled-state
+		// discriminator: one whose terminal already settled durably (a piece
+		// failure inside its own effect, any other failure through the
+		// direct terminal settlement) keeps the failure settlement — the
+		// request whose checkpoint failed is never sent, with no retry and
+		// no uncompacted fallback — while a failure that left the Operation
+		// running returns its raw error exactly like the conversation
+		// effect's own publication failures, for recovery. The compact model
+		// effect performs no trigger check — the structural recursion guard
+		// keeps the compact Agent outside Session compaction.
+		if estimateTokens("", req.Messages)+capture.OutputReserve > capture.ContextWindow {
+			snapshot := req.Messages
+			if len(snapshot) > 0 && snapshot[0].Role == model.RoleSystem {
+				snapshot = snapshot[1:]
+			}
+			summary, usage, err := h.runCompaction(ctx, c, operationID, exec, capture, snapshot)
+			if err != nil {
+				return compactionFailureSettlement(c, operationID, err)
+			}
+			if err := h.commitCompaction(c, operationID, capture, summary, len(snapshot), usage, false); err != nil {
+				return compactionFailureSettlement(c, operationID, err)
+			}
+			messages, err := h.projectContext(c, operationID)
+			if err != nil {
+				return compactionFailureSettlement(c, operationID, err)
+			}
+			req.Messages = messages
+		}
 		intent, err := h.beginModelEffect(ctx, c, operationID)
 		if err != nil {
 			// An intent transaction aborted by cancellation settles the
@@ -97,7 +138,7 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 		// between the committed intent and the callback settles the Operation
 		// as terminal interruption without ever starting the callback.
 		if ctx.Err() != nil {
-			return h.interruptModelEffect(c, operationID, intent)
+			return h.interruptModelEffect(c, operationID, intent, nil)
 		}
 		// Result and terminal transactions run without cancellation so an
 		// already-produced result or required terminal settlement publishes.
@@ -118,7 +159,7 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 		var output model.Output
 		for failed := 1; ; failed++ {
 			if err := ctx.Err(); err != nil { // observed cancellation before an attempt interrupts; no output and no assembly call
-				return h.interruptModelEffect(c, operationID, intent)
+				return h.interruptModelEffect(c, operationID, intent, nil)
 			}
 			stream, attemptErr := attempt(ctx, req)
 			if attemptErr == nil && stream != nil {
@@ -140,7 +181,7 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 			// answer, pre-acceptance cancellation is an interruption with no
 			// output and no assembly call.
 			if ctx.Err() != nil {
-				return h.interruptModelEffect(c, operationID, intent)
+				return h.interruptModelEffect(c, operationID, intent, nil)
 			}
 			delay, again := retry(attemptErr, failed)
 			if !again || delay < 0 {
@@ -156,7 +197,7 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done(): // cancellation during backoff interrupts; no attempt starts
-				return h.interruptModelEffect(c, operationID, intent)
+				return h.interruptModelEffect(c, operationID, intent, nil)
 			}
 		}
 		set := derivedSettlement(output)
@@ -213,13 +254,14 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 // interruptModelEffect settles one committed model effect intent as the fixed
 // terminal interruption after observed execution cancellation before stream
 // acceptance: no output, no assembly call, and the committed settlement
-// returned with a nil error.
-func (h *Harness) interruptModelEffect(c *coordinator, operationID string, intent modelEffectIntent) (agent.ModelSettlement, error) {
+// returned with a nil error. The given usage rides the settlement entry.
+func (h *Harness) interruptModelEffect(c *coordinator, operationID string, intent modelEffectIntent, usage *UsageCount) (agent.ModelSettlement, error) {
 	settleCtx := context.WithoutCancel(h.ctx)
 	committed := agent.ModelSettlement{Disposition: agent.DispoInterruption, Detail: executionInterruptedDetail}
 	if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{
 		terminal: OperationInterruption,
 		detail:   executionInterruptedDetail,
+		usage:    usage,
 	}); err != nil {
 		return agent.ModelSettlement{}, err
 	}
@@ -451,7 +493,9 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 		// A terminal result runs the common terminal helper on this
 		// transaction's own decoded records.
 		if res.terminal != "" {
-			var usageModel model.ModelRef
+			// The usage model is the live intent's expected identity; a
+			// quiet direct settlement declares its own.
+			usageModel := res.usageModel
 			if intent != nil {
 				usageModel = intent.expected
 			}
@@ -1705,12 +1749,12 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 	if err != nil {
 		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{}, err)
 	}
-	if exec.Model == nil || exec.Tool == nil || exec.NormalizeTool == nil {
+	if exec.Model == nil || exec.CompactModel == nil || exec.Tool == nil || exec.NormalizeTool == nil {
 		if exec.Close != nil {
 			h.recordCleanupFailure(exec.Close())
 		}
 		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{},
-			invalidInput("opened execution requires non-nil model, tool and normalization functions"))
+			invalidInput("opened execution requires non-nil model, compact model, tool and normalization functions"))
 	}
 	seenHooks := make(map[string]bool, len(exec.ToolHooks))
 	for _, hook := range exec.ToolHooks {
@@ -1725,6 +1769,30 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 	}
 	if exec.Close != nil {
 		defer func() { h.recordCleanupFailure(exec.Close()) }()
+	}
+	// A compact Operation wires no conversation Agent invocation: it projects
+	// the pure conversation snapshot — the projected messages minus the
+	// leading system message, with no compact input to exclude — runs the
+	// orchestration over it, and commits the manual compaction whose one
+	// transaction also settles the Operation's success. Every orchestration
+	// failure or interruption has already settled the terminal durably with
+	// the accumulated usage (a piece failure inside its own effect, any other
+	// failure through the direct terminal settlement), and only an actually
+	// empty conversation fails with the retained detail.
+	if admission.RequestKind == RequestKindCompact {
+		messages, err := h.projectContext(c, operationID)
+		if err != nil {
+			return err
+		}
+		snapshot := messages
+		if len(snapshot) > 0 && snapshot[0].Role == model.RoleSystem {
+			snapshot = snapshot[1:]
+		}
+		summary, usage, err := h.runCompaction(execCtx, c, operationID, exec, agentCapture, snapshot)
+		if err != nil {
+			return err
+		}
+		return h.commitCompaction(c, operationID, agentCapture, summary, len(snapshot), usage, true)
 	}
 	res, err := agent.Run(execCtx, agent.Invocation{
 		ExpectedModel: agentCapture.Model,

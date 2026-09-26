@@ -421,9 +421,26 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 				Capture: harness.ExecutionCapture{
 					ConfigurationRevision: "1",
 					Model:                 model.ModelRef{Provider: "prov", Model: "m"},
+					ContextWindow:         4096,
+					OutputReserve:         2048,
 					SystemPrompt:          "seeded",
+					Compact: harness.CompactCapture{
+						Model:         model.ModelRef{Provider: "prov", Model: "m"},
+						ContextWindow: 2048,
+						OutputReserve: 1024,
+						SystemPrompt:  "summarize",
+					},
 				},
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+					modelFn := func(context.Context, model.Request) (model.Stream, error) {
+						executions.Add(1)
+						select {
+						case arrived <- struct{}{}:
+						default:
+						}
+						<-release
+						return nil, errors.New("seeded execution released after the test converged")
+					}
 					return harness.Execution{
 						NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
 							var obj map[string]json.RawMessage
@@ -432,15 +449,8 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 							}
 							return json.Marshal(obj)
 						},
-						Model: func(context.Context, model.Request) (model.Stream, error) {
-							executions.Add(1)
-							select {
-							case arrived <- struct{}{}:
-							default:
-							}
-							<-release
-							return nil, errors.New("seeded execution released after the test converged")
-						},
+						Model:        modelFn,
+						CompactModel: modelFn,
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}}
 						},

@@ -67,6 +67,7 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 					return harness.Execution{
 						Model:         script.effect,
+						CompactModel:  script.effect,
 						NormalizeTool: hookNormalize,
 						ToolHooks:     hooks,
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {

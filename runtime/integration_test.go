@@ -32,7 +32,7 @@ func assembledConfigDocument(endpoint, tag, label string) string {
     "prov": {
       "transport": {"base_url": "` + endpoint + `", "api_key_env": "ASSEMBLED_TEST_KEY"},
       "discovery": false,
-      "models": {"m": {"name": "M", "context_window": 4096}}
+      "models": {"m": {"name": "M", "context_window": 262144}}
     }
   },
   "plugins": {"hooks": {"tag": "` + tag + `"}, "depper": {"label": "` + label + `"}}

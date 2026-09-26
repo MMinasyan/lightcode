@@ -22,6 +22,7 @@ type RequestKind string
 
 const (
 	RequestKindMessage RequestKind = "message"
+	RequestKindCompact RequestKind = "compact"
 )
 
 // InputOrigin is the closed origin of one admitted input entry.
@@ -131,8 +132,10 @@ type UsageTotals struct {
 // ExecutionCapture is the complete non-secret configuration required to
 // interpret one Operation: the stable configuration revision, the complete
 // model identity, the system prompt, the advertised tool definitions in
-// preserved order, the selected capability names in preserved order, and the
-// Agent definition's permission capability constraints. Readonly and WriteDir
+// preserved order, the selected capability names in preserved order, the
+// Agent definition's permission capability constraints, and the compaction
+// configuration — the conversation context window, the output reserve, and
+// the effective compact model's selection. Readonly and WriteDir
 // are the configured lexical constraint copied from the one Harness-selected
 // definition; WriteDir is already trimmed at projection and stays unchanged in
 // the capture. The captured ConfigurationRevision also identifies the
@@ -143,11 +146,25 @@ type UsageTotals struct {
 type ExecutionCapture struct {
 	ConfigurationRevision string                 `json:"configuration_revision"`
 	Model                 model.ModelRef         `json:"model"`
+	ContextWindow         int                    `json:"context_window"`
+	OutputReserve         int                    `json:"output_reserve"`
 	SystemPrompt          string                 `json:"system_prompt"`
 	Tools                 []model.ToolDefinition `json:"tools"`
 	Capabilities          []string               `json:"capabilities,omitempty"`
 	Readonly              bool                   `json:"readonly"`
 	WriteDir              string                 `json:"write_dir"`
+	Compact               CompactCapture         `json:"compact"`
+}
+
+// CompactCapture is the effective compaction configuration of one capture:
+// the model the compaction summarizer runs on, its context window and output
+// reserve under the same fallback rules as the conversation model, and the
+// compact type's system prompt. Fully comparable.
+type CompactCapture struct {
+	Model         model.ModelRef `json:"model"`
+	ContextWindow int            `json:"context_window"`
+	OutputReserve int            `json:"output_reserve"`
+	SystemPrompt  string         `json:"system_prompt"`
 }
 
 // SessionIdentity is the immutable identity section of one Session register.
@@ -164,12 +181,15 @@ type SessionIdentity struct {
 
 // SessionState is the mutable state section of one Session register.
 // CurrentOperationID, when present, names the Session's one running
-// Operation. ArchivedAt is present exactly when the lifecycle is archived.
+// Operation. CompactionEntryID, when present, names the in-session compaction
+// entry whose summary defines the model-visible context. ArchivedAt is
+// present exactly when the lifecycle is archived.
 type SessionState struct {
 	Lifecycle          SessionLifecycle `json:"lifecycle"`
 	ArchivedAt         *time.Time       `json:"archived_at,omitempty"`
 	CurrentAgentType   string           `json:"current_agent_type"`
 	CurrentOperationID string           `json:"current_operation_id,omitempty"`
+	CompactionEntryID  string           `json:"compaction_entry_id,omitempty"`
 	Usage              UsageTotals      `json:"usage"`
 	LastActivity       time.Time        `json:"last_activity"`
 }
@@ -246,7 +266,7 @@ type OperationRecord struct {
 	State     OperationCurrentState
 }
 
-// The six entry-payload structs below are private codec values, not public
+// The entry-payload structs below are private codec values, not public
 // API. Every payload repeats the envelope Session and entry identity; normal
 // entries repeat their owning Operation identity, while independently copied
 // fork-prefix entries omit it.
@@ -361,4 +381,20 @@ type operationSettlementEntry struct {
 	Detail      string          `json:"detail,omitempty"`
 	Model       *model.ModelRef `json:"model,omitempty"`
 	Usage       *UsageCount     `json:"usage,omitempty"`
+}
+
+// compactionEntry is one immutable compaction commit: the rolling summary of
+// everything up to its boundary entry, the compact model identity that
+// produced it, the governing configuration revision, and the commit's
+// reported usage when present. Independently copied fork-prefix entries omit
+// the owning Operation identity and carry no source usage.
+type compactionEntry struct {
+	SessionID             string         `json:"session_id"`
+	EntryID               string         `json:"entry_id"`
+	OperationID           string         `json:"operation_id,omitempty"`
+	Summary               string         `json:"summary"`
+	BoundaryEntryID       string         `json:"boundary_entry_id"`
+	Model                 model.ModelRef `json:"model"`
+	ConfigurationRevision string         `json:"configuration_revision"`
+	Usage                 *UsageCount    `json:"usage,omitempty"`
 }

@@ -324,6 +324,7 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 		e.events.add("open:" + adm.OperationID)
 		execution := harness.Execution{
 			Model:         e.model(sel),
+			CompactModel:  e.model(sel),
 			NormalizeTool: runtimeNormalize,
 			Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 				return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}}
@@ -498,11 +499,19 @@ func (e *prepEnv) supply(ctx context.Context, req harness.PreparationRequest, se
 	capture := harness.ExecutionCapture{
 		ConfigurationRevision: sel.invocation.Revision(),
 		Model:                 sel.agent.Model,
+		ContextWindow:         4096,
+		OutputReserve:         2048,
 		SystemPrompt:          "prompt-" + req.Session.AgentType,
 		Tools:                 captureTools(sel.agent.Tools),
 		Capabilities:          append([]string(nil), sel.agent.Capabilities...),
 		Readonly:              sel.agent.Readonly,
 		WriteDir:              sel.agent.WriteDir,
+		Compact: harness.CompactCapture{
+			Model:         sel.agent.Model,
+			ContextWindow: 2048,
+			OutputReserve: 1024,
+			SystemPrompt:  "summarize",
+		},
 	}
 	if mutateSelection != nil {
 		mutateSelection(sel, &capture)
@@ -1874,7 +1883,8 @@ func TestPreparationForwardsCapturedPolicyAndNormalizer(t *testing.T) {
 		}
 		e.opener = func(_ context.Context, _ harness.OperationAdmission, sel selection) (harness.Execution, error) {
 			execution := harness.Execution{
-				Model: e.model(sel),
+				Model:        e.model(sel),
+				CompactModel: e.model(sel),
 				NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
 					mu.Lock()
 					normalized++
@@ -2060,6 +2070,7 @@ func TestPreparationForwardsToolArgumentHooksAcrossScopes(t *testing.T) {
 		e.opener = func(_ context.Context, _ harness.OperationAdmission, sel selection) (harness.Execution, error) {
 			execution := harness.Execution{
 				Model:         e.model(sel),
+				CompactModel:  e.model(sel),
 				NormalizeTool: runtimeNormalize,
 				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 					mu.Lock()

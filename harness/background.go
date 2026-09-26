@@ -248,6 +248,7 @@ func (h *Harness) deliverIdleCompletion(c *coordinator, member *backgroundMember
 	rec, prepared, _, err := h.admitReserved(h.ctx, c, admissionRequest{
 		SessionID:   sessionID,
 		OperationID: member.completionID,
+		Kind:        RequestKindMessage,
 		Origin:      InputOriginRuntime,
 		Content:     parts,
 	})
@@ -796,7 +797,7 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 	prepared, capture, prepCtx, cleanup, err := h.prepareExecution(ctx, PreparationSession{
 		Identity:  childIdentity,
 		AgentType: req.AgentType,
-	})
+	}, RequestKindMessage)
 	if err != nil {
 		return LaunchChildResult{}, err
 	}
@@ -886,6 +887,7 @@ func (h *Harness) launchTransaction(tx Transaction, view SessionRecord, req Laun
 	_, _, _, perr := produceAdmission(tx, child, capture, admissionRequest{
 		SessionID:   child.Identity.SessionID,
 		OperationID: req.OperationID,
+		Kind:        RequestKindMessage,
 		Origin:      InputOriginPlugin,
 		Content:     content,
 	})

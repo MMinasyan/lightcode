@@ -18,46 +18,96 @@ import (
 func (h *Harness) contextSource(c *coordinator, operationID string) agent.ContextSource {
 	return func(ctx context.Context) ([]model.Message, error) {
 		h.drainSteering(ctx, c, operationID)
-		c.mu.Lock()
-		op, ok := c.graph.Operation(operationID)
-		if !ok {
-			sessionID := c.graph.Session.Identity.SessionID
-			c.mu.Unlock()
-			return nil, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
-		}
-		entries := c.graph.Entries
-		systemPrompt := op.Admission.Execution.SystemPrompt
-		c.mu.Unlock()
+		return h.projectContext(c, operationID)
+	}
+}
 
-		messages := make([]model.Message, 0, len(entries)+1)
-		if systemPrompt != "" {
+// projectContext is the pure projection body: it snapshots the cached graph
+// under the coordinator lock, releases it, and builds the messages without
+// touching steering or queued buffers. When the Session register's
+// CompactionEntryID is set, the projection is the system message, one
+// assistant summary message built from the named compaction entry's payload,
+// and the entries after the sequence of the boundary entry that the named
+// entry's payload records — the named entry and every entry at or before that
+// boundary never project as messages. With the field empty the full history
+// projects.
+func (h *Harness) projectContext(c *coordinator, operationID string) ([]model.Message, error) {
+	c.mu.Lock()
+	sessionID := c.graph.Session.Identity.SessionID
+	op, ok := c.graph.Operation(operationID)
+	if !ok {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+	}
+	entries := c.graph.Entries
+	systemPrompt := op.Admission.Execution.SystemPrompt
+	compactionID := c.graph.Session.State.CompactionEntryID
+	c.mu.Unlock()
+
+	messages := make([]model.Message, 0, len(entries)+1)
+	if systemPrompt != "" {
+		msg, err := model.NewMessage(model.Message{
+			Role:    model.RoleSystem,
+			Content: []model.ContentPart{{Kind: model.PartText, Text: systemPrompt}},
+		})
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, msg)
+	}
+	// boundarySequence at or before which no entry projects; -1 means no
+	// compaction boundary and the full history projects.
+	boundarySequence := int64(-1)
+	if compactionID != "" {
+		// the graph validator requires a non-empty CompactionEntryID to name
+		// an in-session compaction entry, so the lookup cannot miss
+		for i := range entries {
+			if entries[i].Envelope.ID != compactionID {
+				continue
+			}
+			boundarySequence = entries[i].Envelope.Sequence
 			msg, err := model.NewMessage(model.Message{
-				Role:    model.RoleSystem,
-				Content: []model.ContentPart{{Kind: model.PartText, Text: systemPrompt}},
+				Role:    model.RoleAssistant,
+				Source:  entries[i].Compaction.Model,
+				Content: []model.ContentPart{{Kind: model.PartText, Text: "[Previous conversation summary]\n\n" + entries[i].Compaction.Summary + "\n\n[End of summary. Continue from here.]"}},
 			})
 			if err != nil {
 				return nil, err
 			}
 			messages = append(messages, msg)
-		}
-		for _, entry := range entries {
-			msg, ok, err := projectEntry(entry)
-			if err != nil {
-				return nil, err
+			// the cutoff is the boundary the payload records — one further
+			// lookup in the same entries slice; the validator guarantees the
+			// target is in-session, and a miss keeps the named entry's own
+			// sequence
+			for j := range entries {
+				if entries[j].Envelope.ID == entries[i].Compaction.BoundaryEntryID {
+					boundarySequence = entries[j].Envelope.Sequence
+					break
+				}
 			}
-			if ok {
-				messages = append(messages, msg)
-			}
+			break
 		}
-		return messages, nil
 	}
+	for _, entry := range entries {
+		if entry.Envelope.Sequence <= boundarySequence {
+			continue
+		}
+		msg, ok, err := projectEntry(entry)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			messages = append(messages, msg)
+		}
+	}
+	return messages, nil
 }
 
 // projectEntry maps one committed entry to its one model message under the
 // kind-to-message mapping. An operation settlement and a hook result produce
 // no model message — hook results are execution evidence, never conversation
-// messages — and the compaction kind has no valid payload and never
-// materializes.
+// messages — and a compaction entry never materializes either: the register's
+// CompactionEntryID carries its summary into the projection instead.
 func projectEntry(entry graphEntry) (model.Message, bool, error) {
 	switch {
 	case entry.Input != nil:

@@ -374,8 +374,16 @@ func toolsCapture(names []string) harness.ExecutionCapture {
 	return harness.ExecutionCapture{
 		ConfigurationRevision: "1",
 		Model:                 model.ModelRef{Provider: "prov", Model: "m"},
+		ContextWindow:         4096,
+		OutputReserve:         2048,
 		SystemPrompt:          "composed tools",
 		Tools:                 definitions,
+		Compact: harness.CompactCapture{
+			Model:         model.ModelRef{Provider: "prov", Model: "m"},
+			ContextWindow: 2048,
+			OutputReserve: 1024,
+			SystemPrompt:  "summarize",
+		},
 	}
 }
 
@@ -475,8 +483,9 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 						Background:    opts.background,
 					}
 					return harness.Execution{
-						Model:       modelFn,
-						Permissions: opts.permissions,
+						Model:        modelFn,
+						CompactModel: modelFn,
+						Permissions:  opts.permissions,
 						NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
 							tool, ok := byID[call.Name]
 							if !ok {
@@ -527,6 +536,52 @@ func (th *toolsHarness) submit(sessionID, operationID, text string) {
 	})
 	if err != nil || res.Disposition != harness.DispositionAdmitted {
 		th.t.Fatalf("Submit = (%+v, %v), want admission", res, err)
+	}
+}
+
+// submitAllowBuffered submits one message tolerating the buffered
+// dispositions: the retiring-run window of a just-settled Operation routes
+// the admission to the steering or queued buffer, and the post-terminal
+// drain delivers it, so the caller's immediately following awaitSettled
+// converges both paths. Only a Submit error — or a disposition outside the
+// admitted-and-buffered set — is fatal. A buffered disposition creates the
+// operation's register asynchronously — the retiring run's drain admits the
+// item after the submit returns — so the helper converges before returning:
+// it polls the register treating not-found as not-yet-converged within the
+// same bounded deadline awaitSettled uses, so the immediately-following
+// awaitSettled never first-polls the legal transient. An admitted
+// disposition creates the register synchronously and needs no polling; a
+// drain drop has no other admission to race and surfaces through the
+// deadline expiry.
+func (th *toolsHarness) submitAllowBuffered(sessionID, operationID, text string) {
+	th.t.Helper()
+	res, err := th.h.Submit(context.Background(), harness.SubmitRequest{
+		SessionID: sessionID, OperationID: operationID, Origin: harness.InputOriginUser,
+		Content: []model.ContentPart{{Kind: model.PartText, Text: text}}, Mode: harness.MessageModeRegular,
+	})
+	if err != nil {
+		th.t.Fatalf("Submit(%s): %v", operationID, err)
+	}
+	switch res.Disposition {
+	case harness.DispositionAdmitted:
+		return
+	case harness.DispositionSteering, harness.DispositionQueued:
+	default:
+		th.t.Fatalf("Submit(%s) = %+v, want an admitted or buffered disposition", operationID, res)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		_, err := th.h.ReadOperation(context.Background(), sessionID, operationID)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, harness.ErrNotFound) {
+			th.t.Fatalf("ReadOperation(%s): %v", operationID, err)
+		}
+		if time.Now().After(deadline) {
+			th.t.Fatalf("operation %q stayed unadmitted within the wait bound", operationID)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
