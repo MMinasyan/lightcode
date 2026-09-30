@@ -90,6 +90,7 @@ func (h *Harness) admitBackgroundMember(c *coordinator, kind memberKind, id stri
 	}
 	m := &backgroundMember{kind: kind, id: id, completionID: completionID, done: make(chan struct{})}
 	c.group.members[completionID] = m
+	c.bumpLocalRevision() // the member admission is a coordinator-local publication
 	return m, nil
 }
 
@@ -121,6 +122,7 @@ func (h *Harness) finishBackgroundMember(c *coordinator, m *backgroundMember) {
 		if _, ok := c.group.members[m.completionID]; ok {
 			delete(c.group.members, m.completionID)
 			close(m.done)
+			c.bumpLocalRevision() // the member finish is a coordinator-local publication
 		}
 	}
 	c.mu.Unlock()
@@ -147,6 +149,7 @@ func backgroundDeliveryPriority(h *Harness, c *coordinator, item *pendingMessage
 	}
 	if c.graph.Session.State.CurrentOperationID != "" || c.run != nil {
 		c.steering = append(c.steering, item)
+		c.bumpLocalRevision() // the completion enqueue is a coordinator-local publication
 		return bgDeliverSteering
 	}
 	return bgDeliverIdle
@@ -561,6 +564,9 @@ func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 		members     []*backgroundMember
 	)
 	if isChild { // the lineage closure is permanent: the buffers go, the pending completion stays
+		if c.bgState != bgClosed || len(c.steering) > 0 || len(c.queued) > 0 {
+			c.bumpLocalRevision() // one publication: the permanent closure and its buffer discard
+		}
 		c.bgState = bgClosed
 		c.steering, c.queued = nil, nil
 		reservation = c.reserved
@@ -571,6 +577,7 @@ func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 			return nil
 		}
 		c.bgState = bgStopping
+		c.bumpLocalRevision() // the root's stopping publication
 	}
 	if c.group != nil {
 		for _, m := range c.group.members {
@@ -658,7 +665,8 @@ func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 
 	c.mu.Lock()
 	if !isChild && c.bgState == bgStopping {
-		c.bgState = bgOpen // a root's closure lasts only the stop; a child's stays
+		c.bgState = bgOpen    // a root's closure lasts only the stop; a child's stays
+		c.bumpLocalRevision() // the root's reopen publication
 	}
 	interval.err = errors.Join(errs...)
 	close(interval.done)

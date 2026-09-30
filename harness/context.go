@@ -171,7 +171,7 @@ func (h *Harness) drainSteering(ctx context.Context, c *coordinator, operationID
 	for {
 		c.mu.Lock()
 		if h.ctx.Err() != nil { // Harness loss discards both buffers
-			c.steering, c.queued = nil, nil
+			c.discardBuffers()
 			c.mu.Unlock()
 			return
 		}
@@ -185,6 +185,7 @@ func (h *Harness) drainSteering(ctx context.Context, c *coordinator, operationID
 		}
 		item := c.steering[0]
 		c.steering = c.steering[1:]
+		c.bumpLocalRevision() // the pop is a coordinator-local publication; the durable delivery follows in its own hold
 		c.mu.Unlock()
 		if err := h.commitSteeringInput(h.ctx, c, operationID, item.origin, item.content); err != nil {
 			_ = err // one failed delivery attempt is final for the item; the next proceeds

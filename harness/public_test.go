@@ -249,6 +249,12 @@ type publicFixture struct {
 }
 
 func newPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, modelFn func(context.Context, model.Request) (model.Stream, error)) *publicFixture {
+	return newPublicFixtureWithJobs(t, store, nil, script, modelFn)
+}
+
+// newPublicFixtureWithJobs is the fixture's core builder: the same scripted
+// preparation over a Harness whose optional Jobs seam is installed.
+func newPublicFixtureWithJobs(t *testing.T, store harness.Storage, stopper harness.JobStopper, script *scriptModel, modelFn func(context.Context, model.Request) (model.Stream, error)) *publicFixture {
 	t.Helper()
 	if modelFn == nil {
 		modelFn = script.effect
@@ -280,7 +286,7 @@ func newPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, 
 			return hook(call, req)
 		}
 		return prepared, nil
-	}})
+	}, Jobs: stopper})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

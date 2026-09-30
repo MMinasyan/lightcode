@@ -240,6 +240,13 @@ type coordinator struct {
 	interruptOp       string
 
 	gone bool // set by the post-commit deletion invalidation: every holder of the coordinator gets ErrNotFound from then on
+
+	// localRev counts coordinator-local publications that do not adopt a newer
+	// Session register: pending FIFO changes, background membership and group
+	// state, and the reservation/run slots ExecutionBusy reads. Every increment
+	// happens under mu inside the same critical section as the publication it
+	// counts, so a snapshot taken under one hold observes one publication.
+	localRev uint64
 }
 
 // New constructs one Harness over the given dependencies. It requires a live
@@ -483,6 +490,7 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 		} else {
 			c.steering = append(c.steering, item)
 		}
+		c.bumpLocalRevision() // the buffer enqueue is a coordinator-local publication
 		c.mu.Unlock()
 		return SubmitResult{Disposition: disposition}, nil
 	}
@@ -947,6 +955,27 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 	}
 }
 
+// bumpLocalRevision advances the coordinator-local revision under the
+// caller-held coordinator mutex. It counts one publication: a publication
+// combining several changes in one hold advances the counter exactly once,
+// and a publication that adopts a newer Session register is instead covered
+// by the register's durable revision.
+func (c *coordinator) bumpLocalRevision() {
+	c.localRev++
+}
+
+// discardBuffers clears both process-local FIFOs under the caller-held
+// coordinator mutex, advancing the local revision when the discard changed
+// any buffered item. Lifecycle and sweep clears ride their newer Session
+// register and the deletion invalidation clears an absent coordinator, so
+// neither goes through here.
+func (c *coordinator) discardBuffers() {
+	if len(c.steering) > 0 || len(c.queued) > 0 {
+		c.localRev++
+	}
+	c.steering, c.queued = nil, nil
+}
+
 // invalidate marks one coordinator absent under the caller-held coordinator
 // mutex: it clears the process-local buffers and sets the gone flag in the
 // same critical section as the deletion commit's adoption, so no holder can
@@ -1068,6 +1097,7 @@ func (c *coordinator) reserve(ctx context.Context) (func(), error) {
 		c.mu.Lock()
 		if c.reserved == nil {
 			c.reserved = make(chan struct{})
+			c.bumpLocalRevision() // the reservation is an ExecutionBusy publication
 			c.mu.Unlock()
 			return c.releaseReservation, nil
 		}
@@ -1086,6 +1116,7 @@ func (c *coordinator) releaseReservation() {
 	if c.reserved != nil {
 		close(c.reserved)
 		c.reserved = nil
+		c.bumpLocalRevision() // the release is an ExecutionBusy publication
 	}
 	c.mu.Unlock()
 }
@@ -1577,6 +1608,7 @@ func (h *Harness) startExecution(c *coordinator, operationID string, prepared Pr
 	run := &activeExecution{done: make(chan struct{}), execCtx: execCtx, cancel: cancel}
 	c.mu.Lock()
 	c.run = run
+	c.bumpLocalRevision() // the run slot's installation is an ExecutionBusy publication
 	c.mu.Unlock()
 	go func() {
 		err := h.execute(c, operationID, prepared, run.execCtx)
@@ -1585,6 +1617,7 @@ func (h *Harness) startExecution(c *coordinator, operationID string, prepared Pr
 		c.mu.Lock()
 		if c.run == run { // a buffered drain may have installed the next execution already
 			c.run = nil
+			c.bumpLocalRevision()
 		}
 		c.mu.Unlock()
 		cancel() // the context dies only after the drain: a drain-installed successor owns a distinct context
@@ -1614,7 +1647,7 @@ func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 	for {
 		c.mu.Lock()
 		if h.ctx.Err() != nil { // Harness loss discards both buffers
-			c.steering, c.queued = nil, nil
+			c.discardBuffers()
 			c.mu.Unlock()
 			return
 		}
@@ -1631,10 +1664,12 @@ func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 		default: // the FIFO scan is empty: retire this run's slot in the same critical section
 			if c.run == run { // never clear a replacement run
 				c.run = nil
+				c.bumpLocalRevision()
 			}
 			c.mu.Unlock()
 			return
 		}
+		c.bumpLocalRevision() // the pop is a coordinator-local publication; the delivery attempt happens outside this hold
 		c.mu.Unlock()
 		rec, prepared, disposition, err := h.admitReserved(h.ctx, c, admissionRequest{
 			SessionID:   sessionID,
@@ -1735,7 +1770,7 @@ func (h *Harness) Wait(ctx context.Context) error {
 			if c.reserved != nil || c.run != nil {
 				busy = true
 			}
-			c.steering, c.queued = nil, nil // Harness loss discards both buffers on every coordinator
+			c.discardBuffers() // Harness loss discards both buffers on every coordinator
 			c.mu.Unlock()
 		}
 		if !busy {
